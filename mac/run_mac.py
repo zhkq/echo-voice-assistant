@@ -38,16 +38,44 @@ _config.DEFAULT_MIGRATIONS.pop("panelOpenMode", None)
 _orig_seed_defaults = _config.Settings.seed_defaults
 
 
+def _runtime_available(engine):
+    """mac 上该转写引擎的运行时是否已安装（whisper 走 faster_whisper，精简依赖自带）。"""
+    import importlib.util
+    pkg = {"sensevoice": "funasr", "qwen3asr": "funasr",
+           "sherpa": "sherpa_onnx"}.get(str(engine or "").lower())
+    if not pkg:
+        return True
+    try:
+        return importlib.util.find_spec(pkg) is not None
+    except Exception:
+        return False
+
+
 def _mac_seed_defaults(self):
     _orig_seed_defaults(self)
+    dirty = False
     try:
         cur = _config.db.get_setting("panelOpenMode")
         if cur is not None and str(cur).lower() not in ("sidebar", "browser"):
             _config.db.set_setting("panelOpenMode", "browser")
-            self._cache = None        # 丢弃缓存，让后续 settings.get() 重新读库
+            dirty = True
             print(f"[mac] panelOpenMode {cur!r} → 'browser'")
     except Exception as e:
         print(f"[mac] panelOpenMode 纠正失败: {e}")
+    # 从别处继承来的库里 sttModel/meetingSttModel 可能是 sensevoice/qwen3asr，
+    # 但 mac 精简依赖不含 funasr → 会静默转写失败。运行时缺失就回退到 whisper。
+    for key, fallback in (("sttModel", "base"), ("meetingSttModel", "small")):
+        try:
+            cur = _config.db.get_setting(key)
+            if cur and not _runtime_available(cur):
+                _config.db.set_setting(key, fallback)
+                dirty = True
+                print(f"[mac] {key} {cur!r} 的运行时未安装 → {fallback!r}"
+                      "（装好 funasr 后可在设置里切回）")
+        except Exception as e:
+            print(f"[mac] {key} 纠正失败: {e}")
+    if dirty:
+        self._cache = None            # 丢弃缓存，让后续 settings.get() 重新读库
 
 
 _config.Settings.seed_defaults = _mac_seed_defaults
