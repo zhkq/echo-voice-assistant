@@ -37,6 +37,18 @@ header .btns { margin-left:auto; display:flex; gap:8px; flex-wrap:wrap; }
 .col-head { display:flex; align-items:center; gap:10px; padding:8px 16px; color:var(--muted);
   font-size:13px; border-bottom:1px solid var(--border); flex-shrink:0; flex-wrap:wrap; }
 .col-head strong { color:var(--text); }
+/* ---------- 纪要编辑 ---------- */
+#summaryBox .sm-bar { display:flex; align-items:center; gap:8px; margin:0 0 10px; padding-bottom:8px;
+  border-bottom:1px solid var(--border); }
+#summaryBox .sm-tip { color:var(--muted); font-size:12px; }
+#summaryBox .sm-bar .grow { flex:1; }
+#summaryBox .sm-editor { width:100%; min-height:52vh; resize:vertical; background:var(--card2);
+  color:var(--text); border:1px solid var(--accent); border-radius:8px; padding:12px;
+  font-family:Consolas,"Microsoft YaHei",monospace; font-size:13px; line-height:1.7; outline:none; }
+header .t-edit { background:none; border:1px solid var(--border); border-radius:6px; color:var(--muted);
+  cursor:pointer; padding:1px 6px; font-size:12px; }
+header .t-edit:hover { color:var(--accent); border-color:var(--accent); }
+header .t-edit[hidden] { display:none; }
 /* ---------- 文档页签（转写/纪要） ---------- */
 .doc-tabs { display:flex; gap:4px; padding:8px 16px 0; flex-shrink:0; border-bottom:1px solid var(--border); }
 .doc-tabs .tab-sm { background:none; border:none; color:var(--muted); cursor:pointer; padding:7px 16px;
@@ -171,6 +183,7 @@ input[type=range].seek::-webkit-slider-thumb { -webkit-appearance:none; width:15
 <body>
 <header>
   <span class="t" id="title">会议详情</span>
+  <button class="t-edit" id="btnTitleEdit" title="改会议名称（同步列表与归档）" hidden>✏️</button>
   <span class="sub" id="meta"></span>
   <div class="btns">
     <input id="summaryExtra" class="input" style="width:220px" placeholder="重新生成纪要的追加要求（可选）">
@@ -262,6 +275,46 @@ const post = (p, body) => api(p, { method: "POST", body: JSON.stringify(body || 
 
 function toast(msg) { const s = $("#pStatus"); s.textContent = msg; setTimeout(() => { if (s.textContent === msg) s.textContent = ""; }, 4000); }
 
+/* ---------- 会议名编辑（顶栏标题） ---------- */
+// 会议名 = meetings.title（列表/顶栏）+ topics.md 的「标题」（归档/分段）；后端一次写两处。
+function editTitle() {
+  const el = $("#title");
+  if (!M || el.dataset.editing) return;
+  const old = el.textContent;
+  el.dataset.editing = "1";
+  $("#btnTitleEdit").hidden = true;
+  el.innerHTML = '<input class="input" id="titleInput" style="width:min(420px,48vw);font-size:15px">' +
+    '<button class="btn sm primary" id="titleSave">保存</button>' +
+    '<button class="btn sm" id="titleCancel">取消</button>';
+  const inp = $("#titleInput");
+  inp.value = M.title || M.name || "";
+  inp.focus(); inp.select();
+  const cancel = () => { el.dataset.editing = ""; el.textContent = old; syncTitleEditBtn(); };
+  $("#titleSave").addEventListener("click", async () => {
+    const v = inp.value.trim();
+    try {
+      const r = await post(`/api/meetings/${MID}/title`, { title: v });
+      if (!r.ok) { toast(r.message || "改名失败"); return; }
+      M.title = r.title;
+      el.textContent = r.title || M.name;     // 清空则回落时间戳文件名（与列表一致）
+      toast(r.message || "会议名称已保存");
+    } catch (e) { toast("改名失败：" + e.message); el.textContent = old; }
+    el.dataset.editing = "";
+    syncTitleEditBtn();
+  });
+  $("#titleCancel").addEventListener("click", cancel);
+  inp.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") { e.preventDefault(); $("#titleSave").click(); }
+    else if (e.key === "Escape") { e.preventDefault(); cancel(); }
+  });
+}
+/** 顶栏铅笔按钮：加载出会议、且当前不在编辑态时才显示。 */
+function syncTitleEditBtn() {
+  const btn = $("#btnTitleEdit");
+  if (!btn) return;
+  btn.hidden = !M || !!$("#title").dataset.editing;
+}
+
 /* ---------- 数据 ---------- */
 let M = null;            // 会议详情
 const qs = new URLSearchParams(location.search);
@@ -272,7 +325,13 @@ async function load() {
   M = await api("/api/meetings/" + MID);
   $("#title").textContent = M.title || M.name;
   const st = { recording:"录音中", transcribing:"转写中", transcribed:"已转写", error:"错误", interrupted:"已中断" };
-  $("#meta").textContent = `开始 ${M.started_at || ""} · ${fmtHM(M.duration_seconds)} · ${M.segments||0} 段 · ${st[M.status]||M.status}`;
+  // 详情接口的 segments 是分段数组（app/api.py 用 build_segments 覆盖），不是数字，取长度才是段数；
+  // 数组为空（历史会议转写行已不在库、仅剩 transcript.md 文件）时回落数据库里的段数。
+  const segCount = Array.isArray(M.segments)
+    ? (M.segments.length || M.segment_count || 0)
+    : (M.segments || 0);
+  $("#meta").textContent = `开始 ${M.started_at || ""} · ${fmtHM(M.duration_seconds)} 分钟 · ${segCount} 段 · ${st[M.status]||M.status}`;
+  syncTitleEditBtn();
   buildTimeline();
   $("#pDur").textContent = fmtTimeH(_totalDur);
   $("#pSeek").max = Math.floor(_totalDur || 0);
@@ -280,10 +339,11 @@ async function load() {
   renderTopics();
   renderColHead();
 }
-window.addEventListener("DOMContentLoaded", load);
+window.addEventListener("DOMContentLoaded", () => { bindSummaryEdit(); load(); });
 
 /* ---------- 纪要页签 ---------- */
 let _summaryLoaded = false;
+let _summaryRaw = null;   // 纪要 markdown 原文（编辑入口用它，避免再次请求）
 
 /** 行内格式：转义后转加粗/斜体/行内代码。 */
 function mdInline(s) {
@@ -348,26 +408,94 @@ function mdToHtml(md) {
   return out.join("");
 }
 
+/** 纪要页签 HTML：工具栏（编辑入口/状态）+ 只读预览容器。renderSummary 只重画 #smPreview。 */
+function summaryShell() {
+  return `<div class="sm-bar">
+      <button class="btn sm" id="smEdit" title="人工编辑纪要正文（markdown），改完点保存">✏️ 编辑纪要</button>
+      <span class="grow"></span>
+      <span class="sm-tip" id="smTip"></span>
+    </div>
+    <div id="smPreview"></div>`;
+}
+
 async function renderSummary() {
   const box = $("#summaryBox");
+  if (!$("#smPreview")) box.innerHTML = summaryShell();
+  const pv = $("#smPreview");
   try {
     const r = await api(`/api/meetings/${M.id}/file?kind=summary`);
-    if (!r.exists || !r.content.trim()) {
-      box.innerHTML = '<div class="empty">暂无纪要，点击顶部"重新生成纪要"生成</div>';
+    _summaryRaw = r.content || "";
+    if (!r.exists || !_summaryRaw.trim()) {
+      pv.innerHTML = '<div class="empty">暂无纪要，点击顶部"重新生成纪要"生成，或用「✏️ 编辑纪要」手写</div>';
       return;
     }
-    box.innerHTML = mdToHtml(r.content);
+    pv.innerHTML = mdToHtml(_summaryRaw);
     // 渲染 mermaid 图表（pre.mermaid 元素），并支持点击放大/滚轮缩放
     try {
-      if (window.mermaid && box.querySelector("pre.mermaid")) {
+      if (window.mermaid && pv.querySelector("pre.mermaid")) {
         mermaid.initialize({ startOnLoad: false, theme: "dark", securityLevel: "strict" });
-        await mermaid.run({ nodes: box.querySelectorAll("pre.mermaid") });
-        bindMermaidZoom(box);
+        await mermaid.run({ nodes: pv.querySelectorAll("pre.mermaid") });
+        bindMermaidZoom(pv);
       }
     } catch (e) { /* 图表渲染失败不影响纪要文本 */ }
   } catch (e) {
-    box.innerHTML = '<div class="empty">加载纪要失败</div>';
+    pv.innerHTML = '<div class="empty">加载纪要失败</div>';
   }
+}
+
+/* ---------- 纪要编辑（人工改 summary.md） ---------- */
+async function enterSummaryEdit() {
+  const box = $("#summaryBox");
+  if (!$("#smPreview")) box.innerHTML = summaryShell();
+  if (_summaryRaw === null) {                 // 直接点编辑也要拿到原文
+    try {
+      const r = await api(`/api/meetings/${M.id}/file?kind=summary`);
+      _summaryRaw = r.content || "";
+    } catch (e) { _summaryRaw = ""; }
+  }
+  box.innerHTML = `<div class="sm-bar">
+      <button class="btn sm primary" id="smSave">保存</button>
+      <button class="btn sm" id="smCancel">取消</button>
+      <span class="grow"></span>
+      <span class="sm-tip">markdown 原文 · Ctrl+S 保存 · Esc 取消 · 重新生成纪要会覆盖这里的修改</span>
+    </div>
+    <textarea class="sm-editor" id="smEditor" spellcheck="false"></textarea>`;
+  const ta = $("#smEditor");
+  ta.value = _summaryRaw || "";
+  ta.focus();
+  ta.setSelectionRange(ta.value.length, ta.value.length);
+  $("#smSave").addEventListener("click", () => saveSummaryEdit(ta.value));
+  $("#smCancel").addEventListener("click", exitSummaryEdit);
+  ta.addEventListener("keydown", (e) => {
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s") { e.preventDefault(); saveSummaryEdit(ta.value); }
+    else if (e.key === "Escape") { e.preventDefault(); exitSummaryEdit(); }
+  });
+}
+
+async function saveSummaryEdit(text) {
+  if (!text.trim()) { toast("纪要内容为空，未保存"); return; }
+  try {
+    const r = await post(`/api/meetings/${MID}/summary`, { content: text });
+    toast(r.message || (r.ok ? "纪要已保存" : "保存失败"));
+    if (r.ok) {
+      _summaryRaw = text.replace(/\r\n/g, "\n").trim() + "\n";
+      $("#summaryBox").innerHTML = summaryShell();
+      await renderSummary();
+      toast("纪要已保存");
+    }
+  } catch (e) { toast("保存失败：" + e.message); }
+}
+
+async function exitSummaryEdit() {
+  const had = !!(_summaryRaw && _summaryRaw.trim());
+  $("#summaryBox").innerHTML = summaryShell();
+  await renderSummary();
+  if (had) toast("已取消编辑");
+}
+
+function bindSummaryEdit() {
+  const bar = $("#summaryBox");
+  bar.addEventListener("click", (e) => { if (e.target && e.target.id === "smEdit") enterSummaryEdit(); });
 }
 
 /* mermaid 图表：点击放大查看，放大层内滚轮缩放、拖动平移、Esc/点击关闭 */
@@ -707,6 +835,7 @@ $("#btnRetranscribe").addEventListener("click", async () => {
 });
 $("#btnRegenSummary").addEventListener("click", async () => {
   try {
+    if ($("#smEditor")) exitSummaryEdit();      // 编辑态下重新生成：先放弃未保存的修改，避免困惑
     const r = await post(`/api/meetings/${MID}/summary/regenerate`, { extra: $("#summaryExtra").value });
     toast(r.message); $("#summaryExtra").value = "";
     // 纪要/分段重新生成后，刷新纪要页签与右侧主题分段
@@ -716,6 +845,7 @@ $("#btnRegenSummary").addEventListener("click", async () => {
   } catch (e) { toast("失败：" + e.message); }
 });
 $("#btnClose").addEventListener("click", () => window.close());
+$("#btnTitleEdit").addEventListener("click", editTitle);
 
 /* ---------- 离线 HTML 导出 ---------- */
 async function downloadOfflineHtml() {

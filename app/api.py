@@ -98,6 +98,16 @@ class SummaryRegenIn(BaseModel):
     extra: str = ""
 
 
+class SummarySaveIn(BaseModel):
+    """人工编辑纪要正文（面板纪要页签「编辑」→ 保存）。"""
+    content: str
+
+
+class MeetingTitleIn(BaseModel):
+    """人工改会议名；空串＝清空自定义命名，回落时间戳文件名。"""
+    title: str = ""
+
+
 class CleanShortIn(BaseModel):
     max_minutes: float = 2
 
@@ -587,6 +597,11 @@ def get_meeting(mid: int, _auth=Depends(optional_auth)):
     detail = meeting.get_meeting_detail(mid)
     if not detail:
         raise HTTPException(status_code=404, detail="会议不存在")
+    # DB 里的 segments 是**段数**（整数，转写时写入）；前端详情还要按段渲染，
+    # 所以这里用分段数组覆盖它。但直接覆盖会把段数弄丢：历史会议转写行已不在库
+    # （只剩 transcript.md 文件）时 build_segments 返回空数组，面板就会显示「0 段」。
+    # 因此先把原段数搬到 segment_count 再覆盖（2026-09-16）。
+    detail["segment_count"] = detail.get("segments") or 0
     detail["segments"] = meeting.build_segments(mid)
     folder = os.path.join(meeting.MEETINGS_DIR, detail["name"])
     detail["hasSegments"] = os.path.isfile(os.path.join(folder, "topics.md"))
@@ -743,6 +758,24 @@ def meeting_file(mid: int, kind: str = "transcript", _auth=Depends(optional_auth
             sec = (f"# 会议摘要\n\n{abstract}\n\n---\n\n{minutes}" if abstract else minutes)
             return {"exists": True, "content": sec}
     return {"exists": True, "content": content}
+
+
+@router.post("/meetings/{mid}/summary")
+def meeting_summary_save(mid: int, body: SummarySaveIn, _auth=Depends(optional_auth)):
+    """人工编辑纪要正文 → 写回会议目录的 summary.md（面板纪要页签「编辑」）。
+
+    只改正文：标题/摘要/分段仍在 topics.md（标题见 POST /meetings/{mid}/title）。
+    业务性失败按本文件约定走 200 + ok=false（空内容、会议不存在等）。
+    """
+    ok, msg = meeting.save_summary(mid, body.content)
+    return {"ok": ok, "message": msg}
+
+
+@router.post("/meetings/{mid}/title")
+def meeting_title_save(mid: int, body: MeetingTitleIn, _auth=Depends(optional_auth)):
+    """人工改会议名：meetings.title + topics.md 的「标题」一起写，避免两处不一致。"""
+    ok, title, msg = meeting.update_meeting_title(mid, body.title)
+    return {"ok": ok, "title": title, "message": msg}
 
 
 # ---------------------------------------------------------------- 声纹库（常用联系人）

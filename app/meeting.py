@@ -1307,6 +1307,68 @@ def push_meeting_to_worklog(meeting_id, archive_hint=""):
         meeting, note_path, archive_hint=archive_hint,
         date_str=_meeting_date(meeting), hour=_meeting_hour(meeting))
 
+
+def save_summary(meeting_id, content):
+    """人工改写的纪要正文写回 summary.md（面板纪要页签的「编辑」）。
+
+    与 request_summary 同一条落盘路径：summary.md 是纯 markdown 纪要，
+    前端 mdToHtml 直接渲染，归档/离线导出也读它。
+    注意：整场「重新生成纪要」会覆盖这里的人工修改（前端保存时已提示）。
+
+    返回 (ok, msg)。空内容被拒绝——归档与「写工作日志」都按「有纪要」判定，
+    清空等于把这场会议的纪要弄丢，要删请用 DELETE /api/meetings/{id}。
+    """
+    meeting = db.get_meeting(meeting_id)
+    if not meeting:
+        return False, "会议不存在"
+    text = (content or "").replace("\r\n", "\n").strip()
+    if not text:
+        return False, "纪要内容为空，未保存"
+    folder = os.path.join(MEETINGS_DIR, meeting["name"])
+    if not os.path.isdir(folder):
+        return False, "会议目录不存在"
+    try:
+        with open(os.path.join(folder, "summary.md"), "w", encoding="utf-8") as f:
+            f.write(text + "\n")
+    except OSError as e:
+        return False, f"写入失败: {e}"
+    db.add_log("info", "meeting", f"会议 {_meeting_title(meeting)} 纪要已人工编辑保存（{len(text)} 字）")
+    return True, "纪要已保存"
+
+
+def update_meeting_title(meeting_id, title):
+    """人工改会议名：同时写 meetings.title 与 topics.md 的「标题」。
+
+    两处都要写——面板列表/顶栏读数据库，工作日志「会议纪要：<名称>」与归档
+    读 topics.md 元数据；只改一处会出现"标题不一致"。
+
+    返回 (ok, title, msg)；标题为空视为清空自定义命名，回落到 m.name。
+    """
+    meeting = db.get_meeting(meeting_id)
+    if not meeting:
+        return False, "", "会议不存在"
+    name = (title or "").strip()[:40]     # 与自动命名同一口径（见 _spawn_summary_waiter 的 title[:40]）
+    try:
+        db.update_meeting(meeting_id, title=name)
+    except Exception as e:
+        return False, "", f"保存会议名称失败: {e}"
+    # topics.md 同步只影响归档/分段展示，失败不回滚数据库（面板已有新名字）
+    folder = os.path.join(MEETINGS_DIR, meeting["name"])
+    path = os.path.join(folder, "topics.md")
+    if os.path.isfile(path):
+        try:
+            with open(path, encoding="utf-8") as f:
+                obj = _try_load_json(f.read())
+            if isinstance(obj, dict):
+                obj["标题"] = name
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(json.dumps(obj, ensure_ascii=False, indent=2) + "\n")
+        except Exception as e:
+            db.add_log("warn", "meeting", f"topics.md 标题同步失败（数据库已更新）: {e}")
+    db.add_log("info", "meeting", f"会议已改名：{name or meeting['name']}")
+    return True, name, "会议名称已保存" if name else "已清空自定义名称"
+
+
 def request_summary(meeting_id, folder=None):
     """请 DSH 生成整场会议纪要（纯 markdown，可含 Mermaid 图表），
     后台线程等待回复并写入 summary.md。标题/简介/摘要/分段由第二次调用
