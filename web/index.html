@@ -22,6 +22,7 @@
     <button class="tab" data-view="meetings">会议</button>
     <button class="tab" data-view="boot">启动</button>
     <button class="tab" data-view="failover">模型路由</button>
+    <button class="tab" data-view="models">模型</button>
   </nav>
 </header>
 
@@ -201,6 +202,22 @@
       <div class="card-body">
         <div class="rt-stats" id="rtStats"></div>
       </div>
+    </div>
+  </section>
+
+  <!-- ============ 模型：按「功能」组织（选择 + 就绪 + 获取），与设置页解耦 ============ -->
+  <section id="view-models" class="view hidden">
+    <div class="card">
+      <div class="card-title"><span class="ic">🧠</span>模型
+        <span class="muted" id="modelOvSummary">—</span>
+        <span class="spacer"></span>
+        <button class="btn" id="btnModelDownloadMissing" title="下载所有缺失且可从上游获取的模型">一键下载缺失</button>
+      </div>
+      <div class="model-ov" id="modelOverview"></div>
+    </div>
+    <div class="model-cards" id="modelCards"></div>
+    <div class="muted model-foot">
+      路径是代码约定，改了加载器就找不到模型，所以原样展示。「已选但未就绪」会标红并给「去安装/去下载」。
     </div>
   </section>
 </main>
