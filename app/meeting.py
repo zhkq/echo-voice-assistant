@@ -357,8 +357,7 @@ def _fallback_sv_rows(sv, wmodel, seg_path, seg_idx, seg_min, cfg):
     """回退路径：whisper 时间戳骨架 + SenseVoice 文本字符级对齐切句（保留句级时间戳）。"""
     wsegs = []
     try:
-        out, _info = wmodel.transcribe(seg_path, language=cfg.get("sttLanguage", "zh"),
-                                       vad_filter=True, beam_size=5)
+        out, _info = stt_mod.transcribe_whisper(wmodel, seg_path, cfg.get("sttLanguage", "zh"))
         wsegs = [(s.start, s.end, s.text.strip()) for s in out]
     except Exception as e:
         print("whisper 时间戳骨架失败:", e, file=sys.stderr)
@@ -426,6 +425,27 @@ def _transcribe_impl(folder):
             print("说话人分离模块不可用，跳过:", e, file=sys.stderr)
             diarize = False
 
+    # 声纹识别（常用联系人，issue #6）：库里已有联系人样本时启用。
+    # vp_names 整场累计「说话人N → 联系人名」（取相似度最高的一次），
+    # vp_merges 记录同一联系人被分成多簇时的合并（大编号并进小编号）。
+    vp_matcher = None
+    vp_names = {}
+    vp_merges = {}
+    # 声纹判定统计：整场汇总成一行日志 —— 既避免"静默不认人"（真实故障看不出来），
+    # 也是校准阈值/间隔的依据（最高相似度 + 未命中原因分布）。
+    vp_stats = {"tried": 0, "hit": 0, "best": 0.0, "best_name": "", "miss": {}}
+    if diarize:
+        try:
+            from app import voiceprint
+            if voiceprint.enabled():
+                vp_matcher = voiceprint.load_matcher()
+                if vp_matcher:
+                    db.add_log("debug", "voiceprint",
+                               f"{meeting_name}：声纹库已加载"
+                               f"（{db.count_voiceprint_contacts()} 位联系人）")
+        except Exception as e:
+            db.add_log("warn", "voiceprint", f"声纹库不可用，跳过自动识别：{e}")
+
     # 文本优先引擎（SenseVoice / Qwen3-ASR）：Qwen3-ASR 用 ForcedAligner 原生句子+时间戳；
     # SenseVoice 用 whisper 时间戳骨架 + 字符级对齐切句（保留句级时间戳）
     use_sv = cfg.get("sttModel") in ("sensevoice", "qwen3asr")
@@ -463,8 +483,7 @@ def _transcribe_impl(folder):
                 seg_rows = _fallback_sv_rows(sv, wmodel, seg_path, seg_idx, seg_min, cfg)
         else:
             try:
-                out, _info = wmodel.transcribe(seg_path, language=cfg.get("sttLanguage", "zh"),
-                                               vad_filter=True, beam_size=5)
+                out, _info = stt_mod.transcribe_whisper(wmodel, seg_path, cfg.get("sttLanguage", "zh"))
                 seg_rows = [(seg_idx, s.start, s.end, s.text.strip()) for s in out]
             except Exception as e:
                 print("转写失败:", e, file=sys.stderr)
@@ -484,6 +503,38 @@ def _transcribe_impl(folder):
                     speaker_names[key] = disp
                 turns = [(s, e, key_map[spk]) for s, e, spk in turns_raw]
                 seg_rows = _assign_speakers(seg_rows, turns)
+                # 声纹识别：本段每个说话人找常用联系人，整场累计（取相似度最高的一次）
+                if vp_matcher is not None:
+                    try:
+                        from app import voiceprint
+                        for disp, m in voiceprint.identify(embs, labels, label_map,
+                                                           vp_matcher).items():
+                            vp_stats["tried"] += 1
+                            if float(m["sim"]) > vp_stats["best"]:
+                                vp_stats["best"] = float(m["sim"])
+                                vp_stats["best_name"] = m.get("name") or ""
+                            if not m["ok"]:
+                                r = m.get("reason") or "?"
+                                vp_stats["miss"][r] = vp_stats["miss"].get(r, 0) + 1
+                                continue
+                            vp_stats["hit"] += 1
+                            old = vp_names.get(disp)
+                            if old is None:
+                                db.add_log("info", "voiceprint",
+                                           f"{meeting_name} 第{i}段：{disp} → {m['name']}"
+                                           f"（相似度 {m['sim']:.2f}，次优 {m['runner']:.2f}）")
+                            if old is None or m["sim"] > old[1]:
+                                vp_names[disp] = (m["name"], m["sim"])
+                        if vp_names:
+                            # 同人合并 + 把联系人名写进本场显示名（用户手改过的名字
+                            # 由 replace_speakers 的「已有名优先」逻辑保留，不会被顶掉）
+                            vp_merges = voiceprint.duplicate_merges(
+                                {d: v[0] for d, v in vp_names.items()})
+                            for disp, (nm, _sim) in vp_names.items():
+                                tgt = vp_merges.get(disp, disp)
+                                speaker_names["S" + re.sub(r"\D", "", tgt)] = nm
+                    except Exception as e:
+                        db.add_log("warn", "voiceprint", f"声纹识别失败（跳过本段）：{e}")
             except Exception as e:
                 print("说话人分离失败:", e, file=sys.stderr)
         else:
@@ -493,6 +544,44 @@ def _transcribe_impl(folder):
         meta.setdefault("transcribed", []).append(seg)
         with open(os.path.join(folder, "meta.json"), "w", encoding="utf-8") as f:
             json.dump(meta, f, ensure_ascii=False, indent=2)
+
+    # 声纹识别产物：① 同人说话人键合并（行改标到保留键）；② 留存各说话人平均声纹
+    remap = ({"S" + re.sub(r"\D", "", d): "S" + re.sub(r"\D", "", t)
+              for d, t in vp_merges.items()} if vp_merges else {})
+    if vp_merges:
+        db_rows = [(seg, s, e, remap.get(spk, spk), txt) for seg, s, e, spk, txt in db_rows]
+        db.add_log("info", "voiceprint",
+                   f"{meeting_name}：声纹识别合并同人说话人 {len(vp_merges)} 组"
+                   f"（{'，'.join(f'{k}→{v}' for k, v in remap.items())}）")
+    if diarize and registry is not None:
+        try:
+            from app import voiceprint
+            # 声纹是生物特征：功能关闭时不留存任何样本（默认就是关，见 config.py 注释）。
+            # 关闭态的代价：该场会议之后点「识别本场」需要重新转写（届时再开也一样）。
+            if voiceprint.enabled():
+                emb_map = {}
+                for disp, (vec, cnt) in registry.snapshot().items():
+                    key = "S" + re.sub(r"\D", "", disp)
+                    if remap.get(key, key) != key:
+                        # 该键已被并进别的说话人（行里已经没有它）：别再留"幽灵样本"，
+                        # 否则声纹库里会出现指向不存在说话人的条目。
+                        continue
+                    blob, dim = voiceprint.pack(vec)
+                    emb_map[key] = (blob, dim, cnt)
+                if emb_map:
+                    db.replace_speaker_embeddings(meeting_id, emb_map)
+        except Exception as e:
+            db.add_log("warn", "voiceprint", f"留存说话人声纹样本失败：{e}")
+
+    if vp_stats["tried"]:
+        # 整场一行汇总：认了没认、最高相似度多少、为什么没认 —— 校准阈值就看这行
+        near = f"，最高相似度 {vp_stats['best']:.2f}"
+        if vp_stats["best_name"]:
+            near += f"（最接近「{vp_stats['best_name']}」）"
+        miss_txt = "，".join(f"{k}×{v}" for k, v in sorted(vp_stats["miss"].items())) or "无"
+        db.add_log("info", "voiceprint",
+                   f"{meeting_name}：声纹判定 {vp_stats['tried']} 次，命中 {vp_stats['hit']} 次"
+                   f"{near}；未命中：{miss_txt}（阈值/间隔可在 设置 → 会议 调整）")
 
     _set_progress(meeting_id, phase="整理结果", seg_index=seg_total, seg_total=seg_total,
                   percent=100, detail="写入数据库与导出转写文件")
@@ -608,6 +697,21 @@ def build_segments(meeting_id):
             "lines": seg_lines,
         })
     return out
+
+
+# ---------------------------------------------------------------- 声纹（常用联系人）
+
+def recognize_meeting_speakers(meeting_id):
+    """用声纹库给本场重新认人（面板「说话人管理 → 声纹识别」）。
+
+    只用转写时留存的声纹样本，不重新分离、不重新转写；识别到联系人后
+    改写说话人名并重导出 transcript.md。返回 voiceprint.recognize_meeting 的结果。
+    """
+    from app import voiceprint
+    res = voiceprint.recognize_meeting(meeting_id)
+    if res.get("renamed") or res.get("merged"):
+        export_transcript(meeting_id)
+    return res
 
 
 # ---------------------------------------------------------------- 纪要

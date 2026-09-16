@@ -211,6 +211,16 @@ main { max-width: 1200px; margin: 12px auto; padding: 0 14px; }
   padding: 10px 12px; cursor: pointer;
 }
 .cmd-item:hover { border-color: var(--accent); }
+/* 仪表盘上这两条可点（跳历史），给个更明确的悬停反馈 */
+.cmd-item.clickable:hover { background: var(--card); }
+/* 长回复：先给 300 字预览，超出时展开全文（issue #2） */
+.cmd-item .reply-toggle {
+  display: inline-block; margin-top: 2px; color: var(--accent);
+  font-size: 12px; text-decoration: none; cursor: pointer; opacity: .85;
+}
+.cmd-item .reply-toggle:hover { opacity: 1; text-decoration: underline; }
+/* 从仪表盘点过来的那一条：亮一圈，视线好落位 */
+.cmd-item.cmd-focus { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent); }
 .cmd-item .head { display: flex; gap: 8px; align-items: center; }
 .cmd-item .text { margin: 6px 0; font-size: 13.5px; }
 .cmd-item .reply { color: var(--muted); font-size: 12.5px; white-space: pre-wrap; }

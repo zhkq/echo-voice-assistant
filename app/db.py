@@ -17,6 +17,8 @@
   dsh_sessions      ECHO 登记的 DSH 会话（命令会话/纪要会话/聊天会话）
   meetings          会议（一场一行，文件夹/时长/状态/转写配置）
   speakers          会议说话人（可改名/合并，UNIQUE(meeting_id,label)）
+  speaker_embeddings 会议说话人的平均声纹（转写时留存；改名入库/「识别本场」据此）
+  voiceprints       常用联系人声纹库（联系人名 + 说话人嵌入样本）
   lines             转写行（句级时间戳、说话人、修订标记；kind 预留扩展）
   summary_runs      纪要生成记录（可追加要求重新生成）
   component_states  组件运行状态快照（面板轮询展示）
@@ -34,8 +36,6 @@ import threading
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(os.path.dirname(BASE_DIR), "data")
 DB_FILE = os.path.join(DATA_DIR, "echo.db")
-
-SCHEMA_VERSION = 2
 
 
 def _hash_token(token: str) -> str:
@@ -222,6 +222,36 @@ MIGRATIONS = [
       workspace_id TEXT DEFAULT '',           -- 所属 DSH 工作区 id（归档/诊断用）
       created_at   TEXT DEFAULT (datetime('now','localtime')),
       last_used_at TEXT DEFAULT ''
+    );
+    """),
+    # 4: 常用联系人声纹（issue #6：会议转写已有说话人分离+重命名，再让 ECHO 记住联系人）。
+    #    voiceprints        —— 声纹库：联系人名 + 一条说话人嵌入样本。
+    #                          meeting_name/source_label 记录样本来源，是**弱关联**：
+    #                          删除历史会议不连带删声纹库（否则清理旧会议＝丢联系人），
+    #                          但要删某条样本可以按 id 删；同一会议同一说话人只留最新一条。
+    #    speaker_embeddings —— 每场会议各说话人的平均嵌入：转写时留存，
+    #                          改名为联系人时据此入库，「识别本场」也用它（不必重新分离）。
+    (4, """
+    CREATE TABLE IF NOT EXISTS voiceprints (
+      id           INTEGER PRIMARY KEY AUTOINCREMENT,
+      name         TEXT NOT NULL,              -- 联系人名（如 张总）
+      embedding    BLOB NOT NULL,              -- 归一化后的说话人嵌入（float32）
+      dim          INTEGER DEFAULT 256,
+      meeting_name TEXT DEFAULT '',            -- 来源会议文件夹名（弱关联）
+      source_label TEXT DEFAULT '',            -- 来源会议内的说话人标签（S1/S2…）
+      created_at   TEXT DEFAULT (datetime('now','localtime')),
+      updated_at   TEXT DEFAULT ''
+    );
+    CREATE INDEX IF NOT EXISTS idx_voiceprints_name ON voiceprints(name);
+
+    CREATE TABLE IF NOT EXISTS speaker_embeddings (
+      meeting_id INTEGER NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
+      label      TEXT NOT NULL,                -- S1/S2…
+      embedding  BLOB NOT NULL,                -- 该说话人在本场的平均嵌入（float32，已归一化）
+      dim        INTEGER DEFAULT 256,
+      segments   INTEGER DEFAULT 0,            -- 参与聚合的音频片段数
+      updated_at TEXT DEFAULT '',
+      PRIMARY KEY (meeting_id, label)
     );
     """),
 ]
@@ -522,11 +552,16 @@ def set_meeting_status_by_name(name, status):
 
 
 def clear_meeting_lines(meeting_id):
-    """清空说话人+转写行（重新转写前调用；保留纪要记录）。"""
+    """清空说话人+转写行（重新转写前调用；保留纪要记录）。
+
+    说话人声纹样本一并清掉：重新转写会重新分离、说话人编号可能整体变化，
+    旧样本留着会让「识别本场」认错人（转写结束会写入本轮的新样本）。
+    """
     with _write_lock:
         conn = get_conn()
         try:
             conn.execute("DELETE FROM speakers WHERE meeting_id=?", (meeting_id,))
+            conn.execute("DELETE FROM speaker_embeddings WHERE meeting_id=?", (meeting_id,))
             conn.execute("DELETE FROM lines WHERE meeting_id=?", (meeting_id,))
             conn.commit()
         finally:
@@ -581,6 +616,106 @@ def cleanup_empty_speakers(meeting_id):
              (SELECT DISTINCT speaker_label FROM lines
               WHERE meeting_id=? AND speaker_label != '')""",
           (meeting_id, meeting_id))
+
+
+# ------------------------------------------------------- speaker_embeddings
+# 每场会议各说话人的平均声纹（pyannote/ wespeaker 256 维嵌入，转写时留存）。
+# 用途：① 改名为联系人时据此把样本存进声纹库；② 「识别本场」不重新分离也能认人。
+
+def replace_speaker_embeddings(meeting_id, mapping):
+    """整场替换说话人声纹：mapping {label: (blob, dim, segments)}。
+
+    整场替换（而不是 upsert）：重新转写时说话人编号可能整体变化，
+    残留旧样本会让「识别本场」用错人。
+    """
+    with _write_lock:
+        conn = get_conn()
+        try:
+            conn.execute("DELETE FROM speaker_embeddings WHERE meeting_id=?", (meeting_id,))
+            for label, (blob, dim, segments) in (mapping or {}).items():
+                conn.execute(
+                    "INSERT INTO speaker_embeddings(meeting_id,label,embedding,dim,segments,updated_at) "
+                    "VALUES(?,?,?,?,?,datetime('now','localtime'))",
+                    (meeting_id, label, blob, int(dim), int(segments)))
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def get_speaker_embeddings(meeting_id):
+    """{label: {label,dim,segments,embedding}}（embedding 为 BLOB，解码在 voiceprint 层）。"""
+    rows = _query("SELECT label,embedding,dim,segments FROM speaker_embeddings "
+                  "WHERE meeting_id=? ORDER BY label", (meeting_id,))
+    return {r["label"]: r for r in rows}
+
+
+def get_speaker_embedding(meeting_id, label):
+    return _query_one("SELECT * FROM speaker_embeddings WHERE meeting_id=? AND label=?",
+                      (meeting_id, label))
+
+
+# ---------------------------------------------------------------- voiceprints
+# 常用联系人声纹库：会议里把说话人改名为联系人后，把声音存成样本；
+# 新会议转写时按余弦相似度自动把说话人认成联系人（匹配逻辑在 app/voiceprint.py）。
+
+def replace_voiceprint_sample(name, embedding, dim=256, meeting_name="", source_label=""):
+    """写入一条声纹样本；同一会议同一说话人先删旧样本再写。
+
+    这样「改错名再改回来」不会留下旧名字的脏样本（一个人一场会议只对应一个名字）；
+    换一场会议则各算一条样本，样本越多识别越稳。
+    """
+    with _write_lock:
+        conn = get_conn()
+        try:
+            if meeting_name and source_label:
+                conn.execute("DELETE FROM voiceprints WHERE meeting_name=? AND source_label=?",
+                             (meeting_name, source_label))
+            conn.execute(
+                "INSERT INTO voiceprints(name,embedding,dim,meeting_name,source_label,updated_at) "
+                "VALUES(?,?,?,?,?,datetime('now','localtime'))",
+                (str(name).strip(), embedding, int(dim), meeting_name, source_label))
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def list_voiceprints(with_embedding=False):
+    cols = ("id,name,embedding,dim,meeting_name,source_label,created_at,updated_at"
+            if with_embedding else
+            "id,name,dim,meeting_name,source_label,created_at,updated_at")
+    return _query(f"SELECT {cols} FROM voiceprints ORDER BY id")
+
+
+def get_voiceprint_samples():
+    """匹配用：全部样本（含 BLOB）。"""
+    return _query("SELECT id,name,embedding,dim,meeting_name FROM voiceprints ORDER BY id")
+
+
+def get_voiceprint(vid):
+    return _query_one("SELECT * FROM voiceprints WHERE id=?", (vid,))
+
+
+def count_voiceprints(name=None):
+    if name is None:
+        return _query_one("SELECT COUNT(*) AS n FROM voiceprints")["n"]
+    return _query_one("SELECT COUNT(*) AS n FROM voiceprints WHERE name=?",
+                      (str(name).strip(),))["n"]
+
+
+def count_voiceprint_contacts():
+    return _query_one("SELECT COUNT(DISTINCT name) AS n FROM voiceprints")["n"]
+
+
+def delete_voiceprint(vid):
+    _exec("DELETE FROM voiceprints WHERE id=?", (vid,))
+
+
+def delete_voiceprints_by_name(name):
+    _exec("DELETE FROM voiceprints WHERE name=?", (str(name).strip(),))
+
+
+# 注：曾有 delete_voiceprints_by_source(meeting_name, source_label)——无调用方，已于 2026-09-15 删除。
+# 删会议保留声纹库是刻意的设计（弱关联），所以不需要它。
 
 
 # ---------------------------------------------------------------- lines

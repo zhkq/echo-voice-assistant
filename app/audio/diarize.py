@@ -212,3 +212,12 @@ class SpeakerRegistry:
                 self._counts.append(1)
                 mapping[labels[i]] = "说话人%d" % len(self._centroids)
         return mapping
+
+    def snapshot(self):
+        """各说话人的质心快照：{显示名("说话人N"): (质心, 参与片段数)}。
+
+        转写结束时调用：把整场的平均声纹留存进 speaker_embeddings 表，
+        供「改名为联系人 → 入库声纹」「识别本场」使用（见 app/voiceprint.py）。
+        """
+        return {f"说话人{i + 1}": (np.asarray(c, dtype=np.float32), int(self._counts[i]))
+                for i, c in enumerate(self._centroids)}

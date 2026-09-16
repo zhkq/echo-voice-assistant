@@ -190,7 +190,8 @@ CATALOG = [
 for _n in ("tiny", "base", "small", "medium", "large-v3"):
     CATALOG.append(dict(
         id=f"whisper-{_n}", group="转写引擎", name=f"Whisper {_n}",
-        purpose="faster-whisper 档位" + ("（默认 whisper 档）" if _n == "small" else ""),
+        purpose=("faster-whisper 档位" + ("（默认 whisper 档）" if _n == "small" else "")
+                 + "；中文可能输出繁体（训练语料偏繁体），需要简体请改用 SenseVoice / Qwen3-ASR"),
         size=WHISPER_SIZES[_n],
         target=f"models/faster-whisper/{_n}/（须含 model.bin）或 HF 缓存 models/hub/models--Systran--faster-whisper-{_n}/",
         source="auto", ref=f"Systran/faster-whisper-{_n}",

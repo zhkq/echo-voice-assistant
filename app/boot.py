@@ -364,7 +364,15 @@ def _start_diarize(report):
     except Exception:
         ok = False
     if ok:
-        report(status="online", detail="pyannote 就绪", progress=1.0)
+        detail = "pyannote 就绪"
+        try:      # 顺带报一下常用联系人声纹库（有样本时才显示）
+            from app import voiceprint
+            st = voiceprint.library_stats()
+            if st["samples"]:
+                detail += f" · 声纹库 {st['contacts']} 人/{st['samples']} 条"
+        except Exception:
+            pass
+        report(status="online", detail=detail, progress=1.0)
     else:
         report(status="disabled", detail="模型缺失（设置 → 模型 → 说话人分离）", progress=0.0)
 

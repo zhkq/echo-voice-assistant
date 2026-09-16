@@ -76,6 +76,11 @@ powershell -File scripts\start.ps1 -Background   # 后台启动（无窗口）
 | 说话人分离（pyannote） | ~31 MB | **自行获取**：上游是 HF gated 模型（需同意条款），拿到后按面板给的路径放好 |
 | 唤醒词 KWS | ~39 MB | **自行获取**：从 sherpa-onnx 的 KWS 模型放成面板给的四个文件名 |
 
+> ⚠️ **Whisper 系列（`tiny`…`large-v3`）的中文输出可能带繁体字**：它的中文训练语料以繁体为主，
+> 和"语言设成 zh"无关。ECHO 已用简体提示词诱导，并且**命令 / 会议 / 对外 API 三条路径参数一致**
+> （2026-09-15 issue #2：会议路径此前漏了提示词）。仍遇到繁体就把引擎换成 `sensevoice`（默认）
+> 或 `qwen3asr`。
+
 内网环境连不上外网时：把另一台机器上已经就绪的 `models/` 目录（或 ModelScope 缓存
 `~/.cache/modelscope/models`）按同样的相对路径拷过来即可。
 

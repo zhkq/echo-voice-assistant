@@ -106,8 +106,11 @@ DEFAULTS = {
                             description="sensevoice 最快（中文短命令），qwen3asr 更准（需下载模型），sherpa 流式，whisper 模型按名",
                             value_type="str",
                             options=["sensevoice", "qwen3asr", "sherpa", "tiny", "base", "small", "medium", "large"]),
-    "sttLanguage":     dict(value="zh", grp="voice", label="命令语言", description="转写语言代码",
-                            value_type="str"),
+    "sttLanguage":     dict(value="zh", grp="voice", label="转写语言",
+                            description="命令与会议共用的转写语言：zh/en/ja/ko/yue，或 auto 自动识别。"
+                                        "填全名（如 Chinese）会自动纠正；非法值回退 zh（Whisper 只认 ISO 码，"
+                                        "填错会让转写结果变空）",
+                            value_type="str", options=["zh", "en", "ja", "ko", "yue", "auto"]),
     "triggerKeys":     dict(value=["vol_up"], grp="voice", label="媒体键触发",
                             description="耳机/键盘媒体键作为说话快捷键（vol_up/play_pause/next/prev）",
                             value_type="list", options=["vol_up", "vol_down", "play_pause", "next", "prev"]),
@@ -206,6 +209,28 @@ DEFAULTS = {
                                 description="删除会议时是否同时删除音频", value_type="bool"),
     "meetingDiarize":   dict(value=False, grp="meeting", label="区分说话人",
                              description="本地 pyannote 分离（CPU 下较慢）", value_type="bool"),
+    # ---------- 常用联系人声纹（issue #6）：改名入库 → 新会议自动认人 ----------
+    # 样本是说话人嵌入（256 维），只存本机 data/echo.db；不做云端、不出网。
+    # 【默认关闭】声纹属于生物特征数据：收集与自动认人都必须由用户显式开启（opt-in）。
+    # 注意：不要用 DEFAULT_MIGRATIONS 做 True→False 的翻转 —— 那套机制每次启动都会比对
+    # 「旧默认值」，用户一旦主动开启就会被下一次启动翻回去；改默认值 + 让用户自己开即可。
+    "voiceprintEnabled": dict(value=False, grp="meeting", label="声纹识别常用联系人",
+                              description="默认关闭。开启后会议转写会用声纹库自动识别已入库的联系人，"
+                                          "把「说话人N」直接标成联系人名（需先开启「区分说话人」，"
+                                          "且联系人有已入库的声纹样本）；关闭时不留存任何声纹样本",
+                              value_type="bool"),
+    "voiceprintAutoEnroll": dict(value=False, grp="meeting", label="改名时自动入库声纹",
+                                 description="默认关闭。开启后在会议里把说话人改名为联系人时，"
+                                             "自动把该说话人本场的声音存成声纹样本（声纹库属生物特征数据，"
+                                             "样本可在会议页「说话人管理」里查看/删除）",
+                                 value_type="bool"),
+    "voiceprintThreshold": dict(value=0.65, grp="meeting", label="声纹匹配阈值",
+                                description="余弦相似度下限（0~1）：越高越不容易认错人、也越容易漏认。"
+                                            "默认 0.65 偏保守；先看日志（source=voiceprint）里的实际相似度再调",
+                                value_type="float"),
+    "voiceprintMargin": dict(value=0.05, grp="meeting", label="声纹歧义间隔",
+                             description="候选联系人与次优的最小差距：差距过小视为认不准，不自动命名",
+                             value_type="float"),
     "meetingWorkspace": dict(value="{ECHO}/data/meetings", grp="meeting",
                              label="会议纪要工作区",
                              description="一场会议一个 DSH 会话（纪要/分段/归档共用），下一场新建；"

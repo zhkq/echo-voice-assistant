@@ -571,7 +571,8 @@ async function refreshDashboard() {
     renderCaptureBtn(st.busy ? st.busyPhase || "running" : null);
     // 近期命令（2026-09-12 用户要求：仪表盘只保留 2 条，把纵向空间让给会议录音卡）
     const cmds = await api("/api/commands?limit=2");
-    renderCmdList($("#recentCmds"), cmds.items, false);
+    // 点击任意一条 → 跳到「历史」页签并定位到这条的完整详情（issue #2）
+    renderCmdList($("#recentCmds"), cmds.items, false, { click: "history" });
     // 近期会议（最近 5 条）
     const meets = await api("/api/meetings?limit=5");
     renderMeetingItems($("#recentMeetings"), meets.items);
@@ -635,23 +636,81 @@ const STATUS_TEXT = { online: "在线", offline: "离线", active: "工作中", 
   pending: "排队中", recording: "录音中", transcribed: "已完成", interrupted: "已中断",
   starting: "启动中" };
 
-function renderCmdList(el, items, withReply) {
+/* 历史回复先给这么多字的预览，超出可展开全文（issue #2：以前硬截 300 字、后面看不到） */
+const REPLY_PREVIEW = 300;
+
+function renderCmdList(el, items, withReply, opts = {}) {
   if (!items.length) {
     el.innerHTML = `<div class="empty">暂无命令</div>`;
     return;
   }
+  const jump = opts.click === "history";
   el.innerHTML = items.map((c) => {
     const stCls = ["done", "sent", "running"].includes(c.status) ? c.status
       : (c.status === "failed" ? "error" : "idle");
-    return `<div class="cmd-item">
+    const reply = (withReply && c.reply) ? String(c.reply) : "";
+    const long = reply.length > REPLY_PREVIEW;
+    return `<div class="cmd-item${jump ? " clickable" : ""}" data-id="${c.id}"${
+      jump ? ` title="点击查看这条指令的完整历史"` : ""}>
       <div class="head"><span class="badge ${stCls}">${STATUS_TEXT[c.status] || c.status}</span>
         <span class="muted" style="font-size:12px">${esc(c.source)}</span>
         <span class="time">${esc(c.ts || "")}</span></div>
       <div class="text">${esc(c.text)}</div>
-      ${withReply && c.reply ? `<div class="reply">↳ ${esc(c.reply.slice(0, 300))}</div>` : ""}
+      ${reply ? `<div class="reply">↳ <span class="reply-short">${esc(reply.slice(0, REPLY_PREVIEW))}</span>${
+        long ? `<span class="reply-full hidden">${esc(reply)}</span>` : ""}</div>` : ""}
+      ${long ? `<a class="reply-toggle" data-expand data-len="${reply.length}">展开全文（${reply.length} 字）</a>` : ""}
       ${c.error ? `<div class="reply" style="color:var(--red)">⚠ ${esc(c.error)}</div>` : ""}
     </div>`;
   }).join("");
+
+  $$("[data-expand]", el).forEach((a) => a.addEventListener("click", (e) => {
+    e.preventDefault();
+    e.stopPropagation();   // 别被算成"整条点击"（仪表盘上整条是跳转）
+    toggleReply(a);
+  }));
+  if (jump) {
+    $$(".cmd-item", el).forEach((it) =>
+      it.addEventListener("click", () => openCmdInHistory(it.dataset.id)));
+  } else {
+    // 历史页：整条也可点，等价于点"展开全文/收起"（只对长回复有反应）
+    $$(".cmd-item", el).forEach((it) => it.addEventListener("click", () => {
+      const link = it.querySelector("[data-expand]");
+      if (link) toggleReply(link);
+    }));
+  }
+}
+
+/** 展开/收起某条历史的回复全文；force=true 时只展开。 */
+function toggleReply(link, force) {
+  const item = link.closest(".cmd-item");
+  if (!item) return;
+  const expand = force === true ? true : !item.classList.contains("expanded");
+  item.classList.toggle("expanded", expand);
+  const short = item.querySelector(".reply-short");
+  const full = item.querySelector(".reply-full");
+  if (short) short.classList.toggle("hidden", expand);
+  if (full) full.classList.toggle("hidden", !expand);
+  link.textContent = expand ? "收起" : `展开全文（${link.dataset.len || ""} 字）`;
+}
+
+/* ================= 仪表盘 → 历史某一条 ================= */
+
+let _focusCmdId = null;   // 跨页签传参：loadHistory() 渲染完成后据此定位
+
+function openCmdInHistory(id) {
+  _focusCmdId = String(id);
+  switchView("history");          // 内部会调用 loadHistory()
+}
+
+/** 定位 + 高亮某条历史；长回复顺手展开，保证落到的就是"完整详情"。 */
+function focusCmd(id) {
+  const item = $(`#historyList .cmd-item[data-id="${id}"]`);
+  if (!item) return;
+  item.scrollIntoView({ block: "center", behavior: "smooth" });
+  const toggle = item.querySelector("[data-expand]");
+  if (toggle && !item.classList.contains("expanded")) toggleReply(toggle, true);
+  item.classList.add("cmd-focus");
+  setTimeout(() => item.classList.remove("cmd-focus"), 2600);
 }
 
 /* ================= 命令目标（工作区/对话） ================= */
@@ -1168,6 +1227,9 @@ async function loadHistory() {
   try {
     const r = await api("/api/commands?limit=200");
     renderCmdList($("#historyList"), r.items, true);
+    const id = _focusCmdId;     // 从仪表盘点过来的那条：等渲染完再定位+展开
+    _focusCmdId = null;
+    if (id) focusCmd(id);
   } catch (e) { toast("加载历史失败：" + e.message); }
 }
 $("#btnClearCmds").addEventListener("click", async () => {

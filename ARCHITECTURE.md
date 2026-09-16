@@ -68,6 +68,8 @@ DSH 自己做不到。详见 [dsh-failover/README.md](dsh-failover/README.md)。
 | `dsh_sessions` | DSH 会话登记 | `kind` 唯一：`command`（命令）、`summary`（纪要） |
 | `meetings` | 会议 | 状态机 `recording→transcribing→done/error`；存转写配置快照 |
 | `speakers` | 会议说话人 | `UNIQUE(meeting_id,label)`，可改名/合并 |
+| `speaker_embeddings` | 会议说话人平均声纹 | 转写时留存（`(meeting_id,label)` 主键）；改名入库与「识别本场」的数据源 |
+| `voiceprints` | 常用联系人声纹库 | 联系人名 + 嵌入样本；与会议**弱关联**（删会议不清库），同场同人只留最新一条 |
 | `lines` | 转写行 | 句级时间戳（段内相对秒）；`kind` 预留（speech/note/action…） |
 | `summary_runs` | 纪要生成记录 | 可追加要求重新生成，留档 |
 | `component_states` | 组件状态 | 面板轮询数据源，DB 持久化上次状态 |
@@ -102,6 +104,10 @@ SQLite 单库：事务、索引、查询、迁移一应俱全，个人单机规�
 - 录音：`MeetingRecorder` 线程，按 `meetingSegmentMinutes` 自动分段写 `data/meetings/<时间戳>/NN.wav`，实时电平回调。
 - 转写：whisper（`meetingSttModel`）或 SenseVoice（whisper 取时间戳骨架 + 字符级对齐切句）。
 - 说话人分离：pyannote 全离线（`models/pyannote`），`SpeakerRegistry` 跨片段保持身份，可改名/合并。
+- 声纹识别（常用联系人）：转写时留存每个说话人的平均嵌入（`speaker_embeddings`）；
+  把说话人**改名成联系人**即把样本存进声纹库（`voiceprints`，可关）；下一次会议转写时
+  逐段与库做余弦匹配，过「阈值 + 与次优的间隔」两道门才自动命名（宁缺毋滥），
+  同一联系人被分离成多簇时自动合并；已有会议可用「识别本场」重跑（不重新分离）。
 - 纪要：导出 `transcript.md` → DSH `summary` 会话生成 → `summary.md`；可追加要求重新生成。
 - 未来扩展：`lines.kind` 支持把句子标记为待办/决议；新增"生成汇报稿/行动项清单"等只需
   增加 DSH 侧 prompt 模板 + 面板按钮，数据模型无需变更。
@@ -139,6 +145,7 @@ SQLite 单库：事务、索引、查询、迁移一应俱全，个人单机规�
 | `app/audio/recorder.py` | 命令录音 + 会议录音线程 |
 | `app/audio/wake.py` | KWS 唤醒线程 |
 | `app/audio/diarize.py` | pyannote 说话人分离 |
+| `app/voiceprint.py` | 常用联系人声纹库（采样入库 / 余弦匹配 / 库管理） |
 | `app/hotkey.py` | ctypes 热键/媒体键钩子 |
 | `app/runtime.py` | 监听器生命周期（按配置拉起/热重载） |
 | `app/boot.py` | 启动编排器（组件注册表/状态机/分阶段调度/重试启停） |

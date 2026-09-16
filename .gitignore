@@ -57,3 +57,6 @@ desktop.ini
 sidebar/bin/
 sidebar/obj/
 mac/sidebar/build/
+
+# ---- 依赖锁文件：本仓库的依赖来源是 requirements.txt + pyproject.toml ----
+uv.lock

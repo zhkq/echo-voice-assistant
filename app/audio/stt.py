@@ -26,8 +26,56 @@ os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "0")
 MODEL_ALIASES = {"large": "large-v3"}
 WHISPER_MODELS = {"tiny", "base", "small", "medium", "large", "large-v3"}
 
-# Qwen3-ASR 语言提示（funasr/qwen-asr 需要全称，如 "Chinese"）
-_LANG_MAP = {"zh": "Chinese", "zh-cn": "Chinese", "en": "English"}
+# ---------------------------------------------------------------- 语言
+# 「同一个设置喂两家引擎」原来是个坑（2026-09-15 issue #2）：
+#   * faster-whisper 只认 ISO-639-1 小写码（zh/en/ja…）——**不认**全名、大写或 "auto"，
+#     填错会抛 ValueError，而调用方把异常吞成"转写结果为空"，界面上只看到没文字；
+#   * funasr / qwen-asr 要全名（Chinese/English…），"auto" 等价于不传（自动识别）。
+# 现在统一成一张别名表：whisper 侧走 normalize_lang()，funasr 侧走 _LANG_MAP。
+_LANG_ALIASES = {
+    "zh": ("zh", "Chinese"), "zh-cn": ("zh", "Chinese"), "zh-hans": ("zh", "Chinese"),
+    "cn": ("zh", "Chinese"), "chinese": ("zh", "Chinese"), "中文": ("zh", "Chinese"),
+    "en": ("en", "English"), "english": ("en", "English"), "英文": ("en", "English"),
+    "ja": ("ja", "Japanese"), "jp": ("ja", "Japanese"), "japanese": ("ja", "Japanese"),
+    "ko": ("ko", "Korean"), "korean": ("ko", "Korean"),
+    "yue": ("yue", "Cantonese"), "cantonese": ("yue", "Cantonese"), "粤语": ("yue", "Cantonese"),
+}
+
+# Qwen3-ASR / funasr 的语言提示（需要全称，如 "Chinese"；取不到 = 自动识别）
+_LANG_MAP = {alias: full for alias, (_iso, full) in _LANG_ALIASES.items()}
+
+# Whisper 的中文训练语料以繁体为主，不给提示词时容易输出繁体字（issue #2）。
+# 命令 / 会议 / 对外 API 三条路径共用下面这个入口，避免再出现"命令有提示词、会议没有"。
+WHISPER_INITIAL_PROMPT = "以下是普通话的日常对话片段。"
+
+
+def normalize_lang(lang, default="zh"):
+    """把设置里的语言值收敛成 faster-whisper 认的 ISO 码；`auto`/空 → None（自动识别）。
+
+    非法值不再直接抛给 whisper（那会让整段转写静默变成空），而是回退 `default` 并留一行
+    可查的日志。接受：ISO 码（zh/en/ja…）、全名（Chinese/English…）、`auto`。
+    """
+    s = str(lang if lang is not None else "").strip().lower()
+    if s in ("auto", "", "none", "null"):
+        return None
+    if s in _LANG_ALIASES:
+        return _LANG_ALIASES[s][0]
+    if 2 <= len(s) <= 3 and s.isalpha():
+        return s          # 疑似 ISO 码：交给 whisper 自己校验（它支持 99 种语言）
+    print(f"[stt] 语言设置 {lang!r} 不是有效语言码，已回退 {default}"
+          f"（可用：zh/en/ja/ko/yue 或 auto）", file=sys.stderr)
+    return default
+
+
+def transcribe_whisper(model, wav, lang="zh"):
+    """faster-whisper 的唯一调用入口，返回 (segments, info)。
+
+    统一 language / vad_filter / beam_size / initial_prompt —— 这几个参数以前在
+    `app/meeting.py` 里被各自复制过一份，且漏了 initial_prompt（会议转写出繁体字的成因）。
+    """
+    return model.transcribe(
+        wav, language=normalize_lang(lang), vad_filter=True, beam_size=5,
+        initial_prompt=WHISPER_INITIAL_PROMPT)
 
 # ---------------------------------------------------------------- 设备解析
 
@@ -355,9 +403,7 @@ def transcribe(wav, engine="sensevoice", model="small", lang="zh", device="auto"
     # faster-whisper
     try:
         wm = _get_whisper(model, device)
-        segments, _info = wm.transcribe(
-            wav, language=lang, vad_filter=True, beam_size=5,
-            initial_prompt="以下是普通话的日常对话片段。")
+        segments, _info = transcribe_whisper(wm, wav, lang)
         text = "".join(seg.text for seg in segments).strip()
         return " ".join(text.split())
     except Exception as e:

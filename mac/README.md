@@ -13,7 +13,7 @@
 | 功能 | Mac | 说明 |
 |---|---|---|
 | 打开控制面板 | ✅ | 原生浮动框，或浏览器打开 `http://127.0.0.1:8970`（默认端口；改过见 ECHO 的 `data/echo-port.txt`） |
-| 录音转文字 | ✅ | 默认 Whisper（可换 sherpa 等） |
+| 录音转文字 | ✅ | 默认 Whisper（可换 sherpa 等）；**Whisper 的中文可能输出繁体**（训练语料偏繁体），需要简体就换成 SenseVoice / Qwen3-ASR |
 | 会议录音 + 纪要 | ✅ | 需要接 DSH 才能自动生成纪要 |
 | 语音合成（朗读） | ✅ | 在线 edge-tts；离线兜底用 macOS `say` |
 | 桌面通知 | ✅ | 通知中心（`osascript`），首次会申请通知权限 |

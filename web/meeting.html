@@ -130,11 +130,25 @@ input[type=range].seek::-webkit-slider-thumb { -webkit-appearance:none; width:15
 .spk-panel { background:var(--card); border:1px solid var(--border); border-radius:12px; width:min(560px,92vw);
   max-height:80vh; overflow-y:auto; padding:16px; }
 .spk-panel h3 { margin-bottom:12px; font-size:15px; }
-.spk-row { display:flex; align-items:center; gap:10px; margin-bottom:8px; }
+.spk-row { display:flex; align-items:center; gap:10px; margin-bottom:8px; flex-wrap:wrap; }
 .spk-row .chip { color:#fff; border-radius:6px; padding:2px 10px; font-size:12px; font-weight:600; min-width:40px; text-align:center; }
-.spk-row input { flex:1; }
-.spk-row select { flex:1; }
+.spk-row input { flex:1; min-width:120px; }
+.spk-row select { flex:1; min-width:110px; }
 .spk-row .merge-btn { flex-shrink:0; }
+.btn.sm { padding:4px 10px; font-size:12.5px; }
+
+/* ---------- 常用联系人声纹库 ---------- */
+.vp-block { margin-top:14px; border-top:1px solid var(--border); padding-top:10px; }
+.vp-head { display:flex; align-items:center; gap:8px; margin-bottom:6px; flex-wrap:wrap; }
+.vp-head b { font-size:14px; }
+.vp-meta { color:var(--muted); font-size:12px; }
+.vp-head .btn { margin-left:auto; }
+.vp-tip { color:var(--muted); font-size:12px; line-height:1.6; margin-bottom:8px; }
+.vp-row { display:flex; align-items:center; gap:8px; padding:3px 0; font-size:12.5px; }
+.vp-row .vp-name { font-weight:600; flex-shrink:0; max-width:120px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.vp-row .vp-src { color:var(--muted); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.vp-row .btn { margin-left:auto; flex-shrink:0; }
+.vp-empty { color:var(--muted); font-size:12.5px; }
 
 /* ---------- 工作日志专题选择浮层 ---------- */
 #wlOverlay { position:fixed; inset:0; background:rgba(0,0,0,.5); display:none; align-items:center; justify-content:center; z-index:60; }
@@ -206,6 +220,14 @@ input[type=range].seek::-webkit-slider-thumb { -webkit-appearance:none; width:15
   <div class="spk-panel">
     <h3>说话人管理 <span class="p-time" style="font-size:12px">（改名 / 合并，保存后自动同步转写）</span></h3>
     <div id="spkList"></div>
+    <div class="vp-block">
+      <div class="vp-head"><b>常用联系人声纹库</b><span class="vp-meta" id="vpMeta"></span>
+        <button class="btn sm" id="vpRecognize" title="用声纹库识别本场说话人（直接用转写时留存的样本，不重新转写）">🎙 识别本场</button>
+      </div>
+      <div class="vp-tip">把说话人<b>改名成联系人</b>即自动入库（需开启「区分说话人」与自动入库）；
+        下次会议听到同一个人的声音，会自动把 TA 标成联系人名。样本只存本机数据库，可在这里删除。</div>
+      <div id="vpList"></div>
+    </div>
     <div style="display:flex; gap:8px; margin-top:12px; justify-content:flex-end">
       <button class="btn" id="spkClose">关闭</button>
     </div>
@@ -822,7 +844,7 @@ $("#wlConfirm").addEventListener("click", async () => {
   } catch (e) { toast("失败：" + e.message); }
 });
 
-/* ---------- 说话人管理 ---------- */
+/* ---------- 说话人管理（改名 / 合并 / 声纹） ---------- */
 const names = () => { const n = {}; (M.speakers||[]).forEach(s => n[s.label] = s.name); return n; };
 $("#btnSpeakers").addEventListener("click", () => {
   const list = M.speakers || [];
@@ -832,26 +854,80 @@ $("#btnSpeakers").addEventListener("click", () => {
     return `<div class="spk-row">
       <span class="chip" style="background:${spkColor(s.label)}">${esc(s.label)}</span>
       <input class="input" value="${esc(s.name)}" data-label="${esc(s.label)}" placeholder="显示名">
+      <button class="btn sm" data-enroll="${esc(s.label)}" title="把本场这个说话人的声音存进声纹库（用左边的名字）">声纹入库</button>
       <select class="input" data-merge="${esc(s.label)}"><option value="">合并到…</option>${others}</select>
       <button class="btn merge-btn" data-from="${esc(s.label)}">合并</button>
     </div>`;
   }).join("") || '<div class="empty">无说话人数据</div>';
   $("#spkOverlay").classList.add("show");
+  loadVp();
   $$("#spkList input").forEach(inp => inp.addEventListener("change", async () => {
-    try { await post(`/api/meetings/${M.id}/speaker/rename`, { label: inp.dataset.label, name: inp.value }); toast("已改名"); load(); }
-    catch (e) { toast("失败：" + e.message); }
+    try {
+      const r = await post(`/api/meetings/${M.id}/speaker/rename`, { label: inp.dataset.label, name: inp.value });
+      toast(r.message ? "已改名 · " + r.message : "已改名");
+      load(); loadVp();
+    } catch (e) { toast("失败：" + e.message); }
+  }));
+  $$("#spkList [data-enroll]").forEach(btn => btn.addEventListener("click", async () => {
+    const inp = document.querySelector(`#spkList input[data-label="${btn.dataset.enroll}"]`);
+    const nm = ((inp && inp.value) || "").trim();
+    if (!nm) { toast("先在左边填联系人名，再点声纹入库"); return; }
+    try {
+      const r = await post("/api/voiceprints/enroll", { meeting_id: M.id, label: btn.dataset.enroll, name: nm });
+      toast(r.message || (r.ok ? "已入库" : "入库失败"));
+      loadVp();
+    } catch (e) { toast("失败：" + e.message); }
   }));
   $$("#spkList .merge-btn").forEach(btn => btn.addEventListener("click", async () => {
     const sel = document.querySelector(`[data-merge="${btn.dataset.from}"]`);
     if (!sel.value) { toast("请选择合并目标"); return; }
     try {
       await post(`/api/meetings/${M.id}/speaker/merge`, { source: btn.dataset.from, target: sel.value });
-      toast("已合并"); $("#spkOverlay").classList.remove("show"); load();
+      toast("已合并"); $("#spkOverlay").classList.remove("show"); load(); loadVp();
     } catch (e) { toast("失败：" + e.message); }
   }));
 });
 $("#spkClose").addEventListener("click", () => $("#spkOverlay").classList.remove("show"));
 $("#spkOverlay").addEventListener("click", (e) => { if (e.target.id === "spkOverlay") $("#spkOverlay").classList.remove("show"); });
+
+/* ---------- 常用联系人声纹库（列表 / 删除 / 识别本场） ---------- */
+let _vp = null;
+
+async function loadVp() {
+  try { _vp = await api("/api/voiceprints"); renderVp(); }
+  catch (e) { /* 读不到时静默：说话人管理的改名/合并不受影响 */ }
+}
+
+function renderVp() {
+  const box = $("#vpList");
+  if (!box) return;
+  const v = _vp || { items: [], contacts: 0, total: 0, threshold: 0 };
+  $("#vpMeta").textContent = `${v.contacts || 0} 人 · ${v.total || 0} 条样本` +
+    (v.enabled === false ? " · 识别已关闭（设置→会议）" : ` · 阈值 ${v.threshold}`);
+  const rows = [];
+  (v.items || []).forEach(it => (it.samples || []).forEach(sm => rows.push(`
+    <div class="vp-row">
+      <span class="vp-name">${esc(it.name)}</span>
+      <span class="vp-src" title="${esc((sm.meeting_name || "") + " / " + (sm.source_label || ""))}">${esc(sm.meeting_name || "")} / ${esc(sm.source_label || "")}</span>
+      <button class="btn sm" data-vdel="${sm.id}" title="删除这条样本（会议转写内容不受影响）">✕</button>
+    </div>`)));
+  box.innerHTML = rows.join("") || '<div class="vp-empty">（声纹库为空：把上面的说话人改名成联系人即可入库）</div>';
+  $$("#vpList [data-vdel]").forEach(b => b.addEventListener("click", async () => {
+    try {
+      const r = await api("/api/voiceprints/" + b.dataset.vdel, { method: "DELETE" });
+      toast(r.message || "已删除"); loadVp();
+    } catch (e) { toast("失败：" + e.message); }
+  }));
+}
+
+$("#vpRecognize").addEventListener("click", async () => {
+  try {
+    const r = await post(`/api/meetings/${M.id}/speaker/recognize`, {});
+    toast(r.message || (r.ok ? "识别完成" : "未识别"));
+    if (r.ok) load();
+    loadVp();
+  } catch (e) { toast("失败：" + e.message); }
+});
 </script>
 </body>
 </html>
