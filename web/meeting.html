@@ -147,6 +147,10 @@ input[type=range].seek::-webkit-slider-thumb { -webkit-appearance:none; width:15
 .spk-row input { flex:1; min-width:120px; }
 .spk-row select { flex:1; min-width:110px; }
 .spk-row .merge-btn { flex-shrink:0; }
+/* 浮层内的操作反馈：底部播放条的提示会被整屏遮罩挡住，所以在浮层里单独显示一行 */
+.spk-msg { display:none; margin:-6px 0 10px; padding:6px 10px; border-radius:8px; font-size:12.5px;
+  line-height:1.5; background:var(--card2); border:1px solid var(--border); color:var(--text); }
+.spk-msg:not(:empty) { display:block; }
 .btn.sm { padding:4px 10px; font-size:12.5px; }
 
 /* ---------- 常用联系人声纹库 ---------- */
@@ -232,13 +236,16 @@ input[type=range].seek::-webkit-slider-thumb { -webkit-appearance:none; width:15
 <div id="spkOverlay">
   <div class="spk-panel">
     <h3>说话人管理 <span class="p-time" style="font-size:12px">（改名 / 合并，保存后自动同步转写）</span></h3>
+    <div class="spk-msg" id="spkMsg" data-testid="spk-msg" role="status" aria-live="polite"></div>
     <div id="spkList"></div>
     <div class="vp-block">
       <div class="vp-head"><b>常用联系人声纹库</b><span class="vp-meta" id="vpMeta"></span>
         <button class="btn sm" id="vpRecognize" title="用声纹库识别本场说话人（直接用转写时留存的样本，不重新转写）">🎙 识别本场</button>
       </div>
       <div class="vp-tip">把说话人<b>改名成联系人</b>即自动入库（需开启「区分说话人」与自动入库）；
-        下次会议听到同一个人的声音，会自动把 TA 标成联系人名。样本只存本机数据库，可在这里删除。</div>
+        下次会议听到同一个人的声音，会自动把 TA 标成联系人名。样本只存本机数据库，可在这里删除。<br>
+        点「声纹入库」用的是<b>本场转写时留存</b>的样本：该场转写前没开「区分说话人」或
+        「声纹识别常用联系人」时，本场没有样本可用 —— 回列表点「重新转写」即可补齐。</div>
       <div id="vpList"></div>
     </div>
     <div style="display:flex; gap:8px; margin-top:12px; justify-content:flex-end">
@@ -273,7 +280,19 @@ async function api(path, opts = {}) {
 }
 const post = (p, body) => api(p, { method: "POST", body: JSON.stringify(body || {}) });
 
-function toast(msg) { const s = $("#pStatus"); s.textContent = msg; setTimeout(() => { if (s.textContent === msg) s.textContent = ""; }, 4000); }
+// 页面底部播放条在浮层（说话人管理 / 归档）之下：浮层打开时提示会被整屏遮罩挡住，
+// 看起来就是「点了按钮没反应」。所以浮层打开时把提示显示在浮层自己标题栏那一行里。
+function setStatus(msg) { const s = $("#pStatus"); if (s) s.textContent = msg; }
+window.toast = function (msg) {
+  if ($("#spkOverlay.show") || $("#wlOverlay.show")) {
+    setStatus(msg);
+    $("#spkMsg").textContent = msg;
+    setTimeout(() => { if ($("#spkMsg").textContent === msg) $("#spkMsg").textContent = ""; }, 6000);
+    return;
+  }
+  setStatus(msg);
+  setTimeout(() => { if ($("#pStatus").textContent === msg) $("#pStatus").textContent = ""; }, 4000);
+};
 
 /* ---------- 会议名编辑（顶栏标题） ---------- */
 // 会议名 = meetings.title（列表/顶栏）+ topics.md 的「标题」（归档/分段）；后端一次写两处。
@@ -1032,8 +1051,14 @@ function renderVp() {
   const box = $("#vpList");
   if (!box) return;
   const v = _vp || { items: [], contacts: 0, total: 0, threshold: 0 };
-  $("#vpMeta").textContent = `${v.contacts || 0} 人 · ${v.total || 0} 条样本` +
-    (v.enabled === false ? " · 识别已关闭（设置→会议）" : ` · 阈值 ${v.threshold}`);
+  // 「声纹入库」能不能点成功，取决于本场转写时有没有留存样本：那必须同时开启
+  // 「区分说话人」和「声纹识别常用联系人」（默认关闭）。这里把状态摆在明面上，
+  // 免得用户点了按钮只看到一句失败提示、不知道该去哪儿开。
+  let meta = `${v.contacts || 0} 人 · ${v.total || 0} 条样本`;
+  if (v.enabled === false) meta += " · 声纹识别已关闭（设置 → 会议 → 声纹识别常用联系人）";
+  else if (!v.total) meta += " · 尚无样本：本场需在转写前开启「区分说话人」+「声纹识别常用联系人」";
+  else meta += ` · 阈值 ${v.threshold}`;
+  $("#vpMeta").textContent = meta;
   const rows = [];
   (v.items || []).forEach(it => (it.samples || []).forEach(sm => rows.push(`
     <div class="vp-row">
