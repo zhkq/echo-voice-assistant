@@ -25,12 +25,12 @@ class PyannoteInstallTests(unittest.TestCase):
                 path = root / directory / filename
                 path.parent.mkdir(parents=True, exist_ok=True)
             with patch.object(modelinfo, "MODELS_DIR", folder):
-                self.assertFalse(modelinfo._ready_pyannote())
+                self.assertFalse(modelinfo.ready_pyannote())
                 for _, directory, filename in installer.ASSETS:
                     (root / directory / filename).write_bytes(b"test model")
-                self.assertTrue(modelinfo._ready_pyannote())
+                self.assertTrue(modelinfo.ready_pyannote())
                 (root / installer.ASSETS[-1][1] / installer.ASSETS[-1][2]).write_bytes(b"")
-                self.assertFalse(modelinfo._ready_pyannote())
+                self.assertFalse(modelinfo.ready_pyannote())
 
     def test_no_token_stops_before_network(self):
         with patch("huggingface_hub.get_token", return_value=None), \

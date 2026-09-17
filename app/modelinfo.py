@@ -127,8 +127,11 @@ def _ready_kws():
     return all(os.path.isfile(os.path.join(d, n)) for n in need)
 
 
-def _ready_pyannote():
-    """空目录不能代表模型已下载；校验加载器需要的实际文件。"""
+def ready_pyannote():
+    """空目录不能代表模型已下载；校验加载器需要的实际文件。
+
+    公开函数：boot 的「说话人分离」就绪判定直接用它（别再调 _ready_* 私有名）。
+    """
     from scripts.install_pyannote import ASSETS
     return all(os.path.isfile(os.path.join(MODELS_DIR, "pyannote", folder, filename))
                and os.path.getsize(os.path.join(MODELS_DIR, "pyannote", folder, filename)) > 0
@@ -222,7 +225,7 @@ _PROBES = {
     "sensevoice": _ready_sensevoice,
     "qwen3asr": lambda: _ready_qwen("Qwen/Qwen3-ASR-0.6B") and _ready_qwen("Qwen/Qwen3-ForcedAligner-0.6B"),
     "sherpa": _ready_sherpa,
-    "pyannote": _ready_pyannote,
+    "pyannote": ready_pyannote,
     "kws": _ready_kws,
 }
 

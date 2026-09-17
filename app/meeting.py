@@ -185,7 +185,7 @@ def stop_meeting():
         if not segs:
             # 没录到任何音频：直接标 error，不再假装"转写中"（否则永远卡住，
             # 因为转写拿到 0 分段会立刻返回）。见 2026-09-16 的设备打开失败。
-            err = (recorder.error or "没有录到音频") if recorder else "没有录到音频"
+            err = (recorder.error if recorder else "") or "录音过程没有产生任何音频分段"
             if meeting:
                 db.update_meeting(meeting["id"], ended_at=meta["end"],
                                   duration_seconds=0, segments=0, status="error")

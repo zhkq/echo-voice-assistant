@@ -73,7 +73,7 @@ function switchView(name) {
   $(`#view-${name}`).classList.remove("hidden");
   $$(".tab").forEach((t) => t.classList.toggle("active", t.dataset.view === name));
   if (name === "dashboard") { refreshDashboard(); loadTargets(); }
-  if (name === "settings") { loadSettings(); loadModelList(); }
+  if (name === "settings") { loadSettings(); }
   if (name === "history") loadHistory();
   if (name === "meetings") { loadMeetings(); refreshMeetingHeader(); }
   if (name === "boot") { loadBoot(); loadBootLogs(); }
@@ -1000,7 +1000,9 @@ async function loadSettings() {
     _settingsCache = r.settings;
     _agentsCache = r.agents || [];
     const groups = {};
-    r.settings.filter((s) => !MODEL_KEYS.has(s.key))
+    // 模型相关项正常由「模型」页签承载；该页签加载失败时（_modelsTabOk=false）回退显示，
+    // 免得唯一入口挂掉时连转写引擎都改不回来。
+    r.settings.filter((s) => !(_modelsTabOk && MODEL_KEYS.has(s.key)))
       .forEach((s) => { (groups[s.grp] = groups[s.grp] || []).push(s); });
     // 「智能体」分组的配置项都是 hidden（不进 settings），这里补一个空分组占位
     if (!groups.agent) groups.agent = [];
@@ -1009,7 +1011,11 @@ async function loadSettings() {
     const extra = Object.keys(groups).filter((g) => !SET_GROUP_ORDER.includes(g));
     const collapsed = _collapsedGroups();
     const form = $("#settingsForm");
-    form.innerHTML = [...known, ...extra].map((g) => {
+    // 模型项被移走后设置页要给一句指路；页签挂掉时反过来提示它们仍在本页
+    const modelHintRow = _modelsTabOk
+      ? `<div class="muted" style="margin:0 0 10px">转写引擎 / 计算设备 / 唤醒 / 声纹 / 说话人分离已移到顶部「模型」页签（按功能选择，带就绪状态与获取入口）。</div>`
+      : `<div class="mcard-warn" style="margin:0 0 10px">「模型」页签加载失败，模型相关设置暂时保留在本页；页签恢复后会自动收起。</div>`;
+    form.innerHTML = modelHintRow + [...known, ...extra].map((g) => {
       const items = groups[g];
       const isCollapsed = collapsed.has(g);
       const no = g === "agent" ? (_agentsCache.filter((a) => a.active).length || 0) : items.length;
@@ -1127,88 +1133,10 @@ $("#btnRestartEcho").addEventListener("click", async (e) => {
   }
 });
 
-/* ---------------- 设置 → 模型：清单 + 下载 ----------------
-   清单来自 /api/models（app/modelinfo.py）：显示名可随便起，但"落地路径"是代码约定、
-   改了加载器就找不到模型，所以路径在界面上原样展示、不翻译。
-   pyannote 仅提供可复制的下载命令；source=copy 的模型保留拷贝说明。 */
-let _modelJobs = {};
-let _modelPoll = null;
-
+/* ---------------- 模型清单小工具 ---------------- */
 function fmtMb(mb) {
   if (!mb) return "0 MB";
   return mb >= 1024 ? (mb / 1024).toFixed(1) + " GB" : mb + " MB";
-}
-
-function renderModelList(items, jobs) {
-  const el = $("#modelList");
-  if (!el) return;
-  _modelJobs = (jobs && jobs.items) || {};
-  const ready = items.filter((m) => m.ready).length;
-  $("#modelSummary").textContent = `已就绪 ${ready}/${items.length}`;
-  el.innerHTML = items.map((m) => {
-    const job = _modelJobs[m.id] || {};
-    const running = job.status === "running";
-    const failed = job.status === "failed";
-    const downloadable = m.source !== "copy" && m.downloadable !== false;
-    const badge = running ? `<span class="badge running">下载中 ${job.percent || 0}%</span>`
-      : (m.ready ? `<span class="badge online">${m.id === "pyannote" ? "模型已下载" : "已就绪"}</span>` : `<span class="badge idle">未安装</span>`);
-    const size = `${m.size}${m.local_mb ? `（本地 ${fmtMb(m.local_mb)}）` : ""}`;
-    const btns = [];
-    if (downloadable) {
-      btns.push(`<button class="btn mini" data-dl="${esc(m.id)}" data-force="${m.ready ? "1" : "0"}" `
-        + `${running || (_modelJobs.__active && !failed) ? "disabled" : ""}>`
-        + (running ? `下载中 ${job.percent || 0}%` : (failed ? "重试" : (m.ready ? "重新下载" : esc(m.download_label || "下载")))) + `</button>`);
-    }
-    if (m.cmd) btns.push(`<button class="btn mini" data-copy="${esc(m.cmd)}">${esc(m.cmd_label || "复制命令")}</button>`);
-    for (const link of (m.links || [])) {
-      if (link.url.startsWith("https://huggingface.co/"))
-        btns.push(`<a class="btn mini" href="${esc(link.url)}" target="_blank" rel="noopener noreferrer">${esc(link.label)}</a>`);
-    }
-    if (m.source === "copy") btns.push(`<button class="btn mini" data-copy="${esc(m.target)}">复制目标路径</button>`);
-    return `<div class="model-row${m.ready ? " ok" : ""}">
-      <div class="m-head"><span class="m-name">${esc(m.name)}</span>${badge}</div>
-      <div class="m-meta">${esc(m.purpose)} · ${esc(size)}</div>
-      <div class="m-path" title="落地路径（代码约定，不要改名）">${esc(m.target)}</div>
-      <div class="m-how">${esc(m.how)}</div>
-      ${m.cmd_label === "复制下载命令" ? `<details class="m-how"><summary>查看下载命令</summary><pre style="white-space:pre-wrap;overflow-wrap:anywhere;user-select:text">${esc(m.cmd)}</pre></details>` : ""}
-      ${running ? `<div class="m-bar"><i style="width:${Math.max(3, job.percent || 0)}%"></i></div>` : ""}
-      ${failed ? `<div class="m-how" style="color:var(--red)">${esc(job.message || "下载失败")}</div>` : ""}
-      <div class="m-actions">${btns.join("")}</div>
-    </div>`;
-  }).join("");
-
-  $$("#modelList [data-dl]").forEach((b) => b.addEventListener("click", async () => {
-    b.disabled = true;
-    try {
-      const r = await post("/api/models/download", { id: b.dataset.dl, force: b.dataset.force === "1" });
-      toast(r.message);
-    } catch (e) { toast("下载请求失败：" + e.message); }
-    loadModelList();
-  }));
-  $$("#modelList [data-copy]").forEach((b) => b.addEventListener("click", async () => {
-    try { await navigator.clipboard.writeText(b.dataset.copy); toast("已复制"); }
-    catch (e) { toast("复制失败，请手动选择文本"); }
-  }));
-}
-
-async function loadModelList() {
-  const el = $("#modelList");
-  if (!el) return;
-  try {
-    const r = await api("/api/models");
-    renderModelList(r.items || [], r.jobs || {});
-    // 有任务在跑就持续刷新进度，跑完自动停
-    const active = r.jobs && r.jobs.active;
-    if (active && !_modelPoll) {
-      _modelPoll = setInterval(loadModelList, 1500);
-    } else if (!active && _modelPoll) {
-      clearInterval(_modelPoll);
-      _modelPoll = null;
-      loadSettings();          // 下载完成后模型下拉的状态也可能变
-    }
-  } catch (e) {
-    el.innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`;
-  }
 }
 
 /* ================= 模型（按功能组织：选择 + 就绪 + 获取） =================
@@ -1218,9 +1146,13 @@ async function loadModelList() {
    目的：一眼看清"每个功能用哪个模型、装没装、装在哪"，并当场切换/获取，
    避免"选了却跑不起来"（就绪会标红 + 给去下载/复制命令）。 */
 let _modelsCache = [];        // /api/models items
+let _modelJobsCache = {};     // /api/models → jobs.items（下载进度/失败原因）
 let _vpCache = null;          // /api/voiceprints
 let _sttCache = null;         // /api/stt/status
 let _modelViewPoll = null;
+// 「模型」页签是否健康：ok 时设置页收起那 9 个模型项，加载失败时回退到设置页显示
+// （否则页签一出错，界面上就再没有入口改回转写引擎/设备了）
+let _modelsTabOk = true;
 
 const _ENGINE_MODEL_ID = { sensevoice: "sensevoice", qwen3asr: "qwen3asr", sherpa: "sherpa" };
 
@@ -1250,16 +1182,20 @@ function friendlyOption(key, v) {
 
 function modelBadge(text, kind) { return `<span class="mcard-badge ${kind}">${esc(text)}</span>`; }
 
-/** 模型卡片的「获取」按钮组：下载 / 复制命令 / 复制目标路径。 */
+/** 模型卡片的「获取」按钮组：下载 / 复制命令 / 复制目标路径 / 官方链接。 */
 function modelActions(m) {
   if (!m) return "";
   const btns = [];
   if (m.downloadable !== false && m.source !== "copy") {
     btns.push(`<button class="btn mini" data-msdl="${esc(m.id)}" data-force="${m.ready ? "1" : "0"}">` +
-      (m.ready ? "重新下载" : esc(m.download_label || "下载")) + `</button>`);
+      (m.ready ? "重新下载" : "下载") + `</button>`);
   }
   if (m.cmd) btns.push(`<button class="btn mini" data-mcopy="${esc(m.cmd)}">${esc(m.cmd_label || "复制命令")}</button>`);
   if (m.source === "copy") btns.push(`<button class="btn mini" data-mcopy="${esc(m.target)}">复制目标路径</button>`);
+  for (const link of (m.links || [])) {
+    if (String(link.url || "").startsWith("https://huggingface.co/"))
+      btns.push(`<a class="btn mini" href="${esc(link.url)}" target="_blank" rel="noopener noreferrer">${esc(link.label)}</a>`);
+  }
   return btns.join("");
 }
 
@@ -1347,7 +1283,11 @@ function renderModelCard(f) {
   } else {
     const m = modelById(f.catalogId);
     const st = _loadState(f);
-    if (st.kind === "ok") { badge = modelBadge("✅ 已就绪", "ok"); cls = " ok"; }
+    const job = (m && _modelJobsCache[m.id]) || {};
+    const running = job.status === "running";
+    const failed = job.status === "failed";
+    if (running) { badge = modelBadge(`下载中 ${job.percent || 0}%`, "warn"); cls = " warn"; }
+    else if (st.kind === "ok") { badge = modelBadge("✅ 已就绪", "ok"); cls = " ok"; }
     else if (st.kind === "miss") { badge = modelBadge("⚠ 未就绪", "miss"); cls = " bad"; }
     else if (st.kind === "warn") { badge = modelBadge("⬇ 未安装", "warn"); cls = " warn"; }
     else { badge = modelBadge("未启用", "idle"); }
@@ -1358,8 +1298,18 @@ function renderModelCard(f) {
     }
     const warn = (st.kind === "miss")
       ? `<div class="mcard-warn">⚠ 所选模型未就绪，现在用它转写会失败</div>` : "";
-    const meta = m ? `<div class="mcard-meta">${esc(m.size)} · 落地 <code>${esc(m.target)}</code></div>` : "";
-    body = control + warn + meta + `<div class="mcard-act">${modelActions(m)}</div>`;
+    const failMsg = failed
+      ? `<div class="mcard-warn">下载失败：${esc(job.message || "未知原因")}</div>` : "";
+    // 本地占用 + 落地路径（路径是代码约定，原样展示不翻译）
+    const meta = m ? `<div class="mcard-meta">${esc(m.size)}` +
+      `${m.local_mb ? `（本地 ${fmtMb(m.local_mb)}）` : ""} · 落地 <code>${esc(m.target)}</code></div>` : "";
+    const how = (m && m.how) ? `<div class="mcard-meta">${esc(m.how)}</div>` : "";
+    const bar = running ? `<div class="m-bar"><i style="width:${Math.max(3, job.percent || 0)}%"></i></div>` : "";
+    // pyannote 这类"复制命令自行执行"的，保留可展开的完整命令（旧「设置 → 模型」有，别丢）
+    const rawCmd = (m && m.cmd_label === "复制下载命令" && m.cmd)
+      ? `<details class="mcard-meta"><summary>查看下载命令</summary><pre style="white-space:pre-wrap;overflow-wrap:anywhere;user-select:text">${esc(m.cmd)}</pre></details>` : "";
+    body = control + warn + failMsg + meta + how + bar + rawCmd +
+      `<div class="mcard-act">${modelActions(m)}</div>`;
   }
 
   return `<div class="mcard${cls}">
@@ -1389,6 +1339,8 @@ function bindModelCards() {
     } catch (err) { toast("更新失败：" + err.message); }
   });
   host.addEventListener("click", async (e) => {
+    const rl = e.target.closest("[data-mreload]");
+    if (rl) { loadModels(); return; }
     const dl = e.target.closest("[data-msdl]");
     if (dl) {
       dl.disabled = true;
@@ -1410,6 +1362,7 @@ function bindModelCards() {
 async function loadModels() {
   const host = $("#modelCards");
   if (!host) return;
+  const wasOk = _modelsTabOk;
   try {
     const [setRes, modelsRes, sttRes, vpRes] = await Promise.all([
       api("/api/settings"),
@@ -1419,8 +1372,10 @@ async function loadModels() {
     ]);
     _settingsCache = setRes.settings || _settingsCache;
     _modelsCache = modelsRes.items || [];
+    _modelJobsCache = (modelsRes.jobs && modelsRes.jobs.items) || {};
     _sttCache = sttRes;
     _vpCache = vpRes;
+    _modelsTabOk = true;
     const fns = modelFunctions();
     renderModelOverview(fns);
     host.innerHTML = fns.map(renderModelCard).join("");
@@ -1428,8 +1383,19 @@ async function loadModels() {
     const active = modelsRes.jobs && modelsRes.jobs.active;
     if (active && !_modelViewPoll) _modelViewPoll = setInterval(loadModels, 1500);
     else if (!active && _modelViewPoll) { clearInterval(_modelViewPoll); _modelViewPoll = null; }
+    if (!wasOk) loadSettings();        // 页签恢复：设置页里回退显示的那些项可以收起来了
   } catch (e) {
-    host.innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`;
+    host.innerHTML = `<div class="mcard bad">
+      <div class="mcard-head"><div class="mcard-ic">⚠</div>
+        <div class="mcard-title">模型清单加载失败</div>${modelBadge("不可用", "miss")}</div>
+      <div class="mcard-body">
+        <div class="mcard-warn">${esc(e.message)}</div>
+        <div class="mcard-meta">模型相关设置已暂时回到「设置」页签，先在那儿改也可以；这里恢复后会自动收起。</div>
+        <div class="mcard-act"><button class="btn mini" data-mreload="1">重试</button></div>
+      </div></div>`;
+    bindModelCards();
+    _modelsTabOk = false;
+    if (wasOk) { try { loadSettings(); } catch (_) { /* 忽略 */ } }
   }
 }
 
@@ -1538,6 +1504,10 @@ function meetingBadgeCls(status) {
   return "idle";
 }
 
+/* 会议状态文案：error 在会议语境里是「录音失败（没录到音频）」，比通用的「错误」更能说明问题 */
+const MEETING_STATUS_TEXT = { recording: "录音中", transcribing: "转写中", transcribed: "已转写",
+  error: "录音失败", interrupted: "已中断" };
+
 function renderMeetingItems(el, items) {
   if (!items.length) {
     el.innerHTML = `<div class="empty">暂无会议记录</div>`;
@@ -1560,12 +1530,17 @@ function renderMeetingItems(el, items) {
     // 显示出来反而重复——开始时间已经在下面的 m-meta 里了（2026-09-12 起）。
     const nameHtml = `<div class="m-name">${esc(shortTitle || m.name)}</div>`;
     const hasSummary = m.has_summary ? `<span class="m-summary-tag" title="已生成会议纪要">📄</span>` : "";
+    // 录音失败（PR #11 起会明确标 error）：给一句能行动的说明，而不是只有「错误」两个字
+    const errHint = m.status === "error"
+      ? `<div class="m-meta" style="color:var(--red)">没录到音频：麦克风没打开（被占用/权限）或全程无声；换设备后重试，详见 启动 → 日志</div>`
+      : "";
     return `<div class="meeting-item" data-id="${m.id}">
-      <span class="badge ${meetingBadgeCls(m.status)}">${STATUS_TEXT[m.status] || m.status}</span>
+      <span class="badge ${meetingBadgeCls(m.status)}">${MEETING_STATUS_TEXT[m.status] || STATUS_TEXT[m.status] || m.status}</span>
       <div class="grow">
         ${nameHtml}
         <div class="m-meta">${esc(started)} · ${fmtHM(dur)} · ${m.segments || 0} 段 ${hasSummary}</div>
         ${txHtml}
+        ${errHint}
       </div>
     </div>`;
   }).join("");

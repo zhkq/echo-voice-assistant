@@ -360,8 +360,10 @@ def _start_diarize(report):
     """说话人分离：复用 modelinfo 的校验（模型文件齐全才算就绪，空目录不算）。"""
     try:
         from app import modelinfo
-        ok = modelinfo._ready_pyannote()
-    except Exception:
+        ok = modelinfo.ready_pyannote()
+    except Exception as e:
+        # 校验本身出错（依赖/路径异常）不能静默当成"模型缺失"，否则用户只看到"缺失"没法排查
+        _log("diarize", "warn", f"说话人分离就绪校验失败: {e}")
         ok = False
     if ok:
         detail = "pyannote 就绪"
