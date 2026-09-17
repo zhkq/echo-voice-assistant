@@ -5,7 +5,8 @@
   触发（热键/媒体键/唤醒/面板/API/skill）
     → 提示音开始 → 录音（静音自动停） → 提示音停录
     → 本地转写 → 剥离唤醒前缀 → 会议意图分类（开始/结束录音）
-    → 语音复述确认 → 发送到 DSH 专用会话（queue 模式）
+    → 语音复述确认 → 发送到目标 DSH 会话（面板「命令目标」选中的工作区/会话；
+      没选就是 ECHO 默认命令会话，queue 模式）
     → 轮询会话历史等最终回复 → 生成语音简报朗读 → 写命令历史
 
 并发控制：同一时刻只允许一个命令流（busy 标志）。
@@ -31,6 +32,11 @@ _busy = threading.Lock()
 _busy_owner = {"name": None, "phase": None}
 # 收音阶段的实时电平（0~1），由 record_command 的 level_cb 更新，面板据此画波形
 _capture_level = {"value": 0.0}
+
+# 等 DSH 回复的上限（秒）。2026-09-17 之前是 90 秒：语音问"查一下/解释一下"这类
+# 需要读代码的问题时，DSH 还在作答就被判超时，回复被丢掉（命令状态仍是 done，
+# 但 reply/brief 为空、也没有语音简报）。放宽到 300 秒。
+REPLY_TIMEOUT_S = 300
 
 
 def set_phase(phase):
@@ -328,12 +334,15 @@ def _capture_worker(source):
             _handle_meeting_intent(text, intent, source)
             return
 
-        # 语音复述确认（简短复述要做什么，播完再发送）
+        # 语音路径的目标 = 面板「命令目标」下拉保存的选择（没选就是默认命令会话）
+        target = _configured_command_target(get_client())
+
+        # 语音复述确认（简短复述要做什么 + 目标，播完再发送）
         if cfg.get("voiceConfirm", True):
             confirm = _build_confirm(text)
-            tts_mod.speak(confirm, cfg.get("ttsEngine", "auto"), timeout=15)
+            tts_mod.speak(confirm + _target_hint(*target), cfg.get("ttsEngine", "auto"), timeout=15)
 
-        _dispatch(text, source)
+        _dispatch(text, source, *target)
     finally:
         _release_busy()
 
@@ -342,7 +351,7 @@ def send_text(text, source="web", workspace=None, session_id=None):
     """直接发送文本命令（面板/API/skill 入口；不录音）。返回 (ok, message)。
 
     workspace/session_id 用于指定命令发送目标（工作区/具体对话）；
-    都不给时保持默认行为（ECHO 固定命令会话）。
+    都不给时沿用面板「命令目标」下拉保存的设置，没设置才回到 ECHO 默认命令会话。
     """
     if not _set_busy(source):
         return False, "已有命令流进行中，请稍候"
@@ -353,10 +362,52 @@ def send_text(text, source="web", workspace=None, session_id=None):
         _release_busy()
 
 
+def _configured_command_target(client):
+    """读取「命令目标」设置（面板仪表盘那两个下拉会自动写入）。
+
+    返回 (workspace, session_id)；都没配置时返回 (None, None) → 走默认命令会话。
+    只对 DSH 后端生效（CodeBuddy CLI 之类没有"工作区/会话"概念）。
+    配置的会话若已被归档/删除 → 丢掉会话，回退到"该工作区自动"。
+    """
+    if not hasattr(client, "list_sessions"):
+        return None, None
+    ws = str(settings.get("commandTargetWorkspace", "") or "").strip()
+    sid = str(settings.get("commandTargetSession", "") or "").strip()
+    if sid:
+        try:
+            known = {it.get("sessionId") for it in client.list_sessions()}
+        except Exception:
+            known = None
+        if known is not None and sid not in known:
+            db.add_log("warn", "assistant",
+                       f"命令目标会话已不存在（{sid}），本次回退到「该工作区自动」")
+            sid = ""
+    return (ws or None), (sid or None)
+
+
+def _target_hint(workspace=None, session_id=None):
+    """语音复述确认时附带的目标提示（只在配置了目标时才念）。
+
+    入参用 _configured_command_target() 校验后的结果，避免"会话已失效"时念错。
+    """
+    ws = str(workspace or "").strip()
+    sid = str(session_id or "").strip()
+    if not (ws or sid):
+        return ""
+    name = os.path.basename(ws.rstrip("\\/")) if ws else ""
+    if sid:
+        return f"，发到「{name}」的指定会话" if name else "，发到指定会话"
+    return f"，发到「{name}」"
+
+
 def _dispatch(text, source, workspace=None, session_id=None):
     """发送到 DSH + 等回复 + 简报 + 历史。"""
     cfg = settings
     set_phase("running")   # 已进入"发给 DSH 等回复"阶段（打字命令直接从这一步开始）
+    client = get_client()
+    # 语音路径（媒体键/唤醒/麦克风按钮）不带目标 → 沿用面板「命令目标」下拉保存的选择
+    if not workspace and not session_id:
+        workspace, session_id = _configured_command_target(client)
     cmd_id = db.add_command(text, source=source, status="pending",
                             meta={"workspace": workspace, "session_id": session_id} if (workspace or session_id) else None)
     db.add_event("command_received", {"id": cmd_id, "text": text, "source": source})
@@ -364,7 +415,6 @@ def _dispatch(text, source, workspace=None, session_id=None):
                + (f" → 工作区={workspace}" if workspace else "")
                + (f" → 会话={session_id}" if session_id else ""))
 
-    client = get_client()
     if not client.ping():
         db.update_command(cmd_id, status="failed", error="DSH 未运行")
         db.add_log("error", "assistant", "DSH 未运行，命令未发送")
@@ -417,7 +467,7 @@ def _dispatch(text, source, workspace=None, session_id=None):
         notify("ECHO", f"已发送: {text}")
 
     # 等回复 + 语音简报
-    reply, _done = client.wait_for_reply(sid, timeout=90, poll=0.5)
+    reply, _done = client.wait_for_reply(sid, timeout=REPLY_TIMEOUT_S, poll=0.5)
     duration = int((time.time() - t0) * 1000)
     if reply:
         brief = brief_text(reply, max_chars=int(cfg.get("maxBriefChars", 200)))
@@ -429,7 +479,7 @@ def _dispatch(text, source, workspace=None, session_id=None):
             tts_mod.speak_async(brief, cfg.get("ttsEngine", "auto"))
         return True
     db.update_command(cmd_id, status="done", reply="", brief="", duration_ms=duration)
-    db.add_log("warn", "assistant", "90 秒内未收到助手回复")
+    db.add_log("warn", "assistant", f"{REPLY_TIMEOUT_S} 秒内未收到助手回复")
     return True
 
 

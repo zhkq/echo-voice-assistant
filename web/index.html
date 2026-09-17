@@ -41,8 +41,8 @@
           <button class="btn" id="btnCapture">🎤 说话</button>
         </div>
         <div class="target-row">
-          <select id="wsSelect" class="ctl" title="命令发送到哪个工作区"></select>
-          <select id="sessSelect" class="ctl" title="命令发送到哪个对话"></select>
+          <select id="wsSelect" class="ctl" title="命令发送到哪个工作区（选中即保存；语音命令也用这个目标）"></select>
+          <select id="sessSelect" class="ctl" title="命令发送到哪个对话（选中即保存；留空=该工作区最近对话/新建）"></select>
         </div>
         <div class="cmd-list" id="recentCmds"></div>
       </div>
@@ -163,10 +163,6 @@
         <span class="boot-live" id="bootLive">—</span>
       </div>
       <div id="bootLogs" class="boot-log"></div>
-    </div>
-    <div class="card">
-      <div class="card-title">守护进程关键事件 <span class="muted" style="font-size:12px">(echo-host · 自动刷新 · 刷屏信息已过滤)</span></div>
-      <div id="guardLogs" class="boot-log"></div>
     </div>
   </section>
 

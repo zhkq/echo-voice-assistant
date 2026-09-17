@@ -36,6 +36,9 @@ ECHO 自己**不做推理**，只负责录音、转写、编排、面板与播�
 - **转写与语音识别全本地**：命令与会议转写、唤醒词、说话人分离都在本机跑，音频文件不出网
   （需要出网的是"交给大模型"和"默认的在线语音合成"，见上表）。
 - **指令只要一句结论**：提示词要求模型先给极简结论再给详情，语音只念结论，详情留在会话里。
+- **语音也能指定"发给谁"**：面板仪表盘的「命令目标」两个下拉（工作区 / 具体对话）**选中即保存**，
+  之后媒体键、语音唤醒、面板麦克风按钮说话都发到那个目标（语音复述会念出目标，如"发到「临时」"）；
+  留空 = 回到 ECHO 默认命令会话（按空闲轮换）。等回复上限 300 秒（`app/assistant.py:REPLY_TIMEOUT_S`）。
 - **会议纪要**：分段录音、按需/常驻双转写引擎、说话人分离（pyannote）、纪要归档可委派给你自己的技能。
 - **常用联系人声纹（默认关闭）**：在会议里把说话人**改名成联系人**（如「张总」）即自动入库；下次会议听到同一个人的
   声音会自动把 TA 标成联系人名，同一个人被分离成两簇时自动合并。**声纹属生物特征数据，默认不开**：
@@ -119,10 +122,10 @@ echo-voice-assistant/
 ├── models/         本地模型（不入 git；用面板下载或自行拷贝）
 ├── data/           echo.db、录音、历史、日志（不入 git）
 ├── assets/         提示音等资源
-├── plugin/         DSH Desktop 宿主插件源码（echo-host：拉起/守护 ECHO；右缘边条见 sidebar/）
+├── plugin/         （已退役，留档）DSH Desktop 宿主插件 echo-host 源码；右缘边条见 sidebar/
 ├── sidebar/        右缘折叠条/边条宿主（.NET 7 WinForms + WebView2，echo-sidebar.exe）
 ├── dsh-failover/   模型路由（默认本机 8899，可被 config.json 的 port 覆盖）：多个上游组成「模型组」，DSH 侧只认 ECHO AUTO
-├── scripts/        setup / start / stop / 自启 / 插件部署 / 一键安装向导
+├── scripts/        setup / start / stop / 自启 / 一键安装向导
 ├── docs/           部署指南、新机器部署指南、纪要归档说明、PowerShell 编码经验
 └── .dsh/skills/    DSH 技能（随仓库提供 meeting-record；其余按需自建）
 ```
@@ -195,58 +198,33 @@ powershell -File scripts\install-qwen3asr.ps1   # 装依赖(qwen-asr) + 下载�
 装好后在 设置 → 会议 → 会议转写模型 选择 `qwen3asr`（命令引擎 `sttModel` 也可选）。
 模型经 modelscope 缓存加载（`~/.cache/modelscope`，无中文路径兼容问题）。
 
-## DSH Desktop 宿主插件（echo-host）
+## DSH Desktop 宿主插件（echo-host）—— 已退役（2026-09-17）
 
-`plugin/echo-host/` 是挂到 DSH Desktop 上的 Cordis 插件，随 DSH Desktop 启动：
+早先 `plugin/echo-host/` 是一个挂到 DSH Desktop 上的 Cordis 插件，负责"随 DSH 启动拉起/守护 ECHO"。
+**现已退役**：源码留档在 `plugin/`，没有任何东西会加载它。完整说明见 `plugin/README.md`。
 
-- 自动拉起 / 守护 ECHO Python 服务，崩溃自动重启；**DSH Desktop 退出时不停止 ECHO**
-  （ECHO 常常是独立启动的，早先"随 DSH 一起关"导致一重启 DSH 服务就没了）。
-  端口不写死：`ECHO_PORT` → `~/.dsh/settings.yaml` 的 `serverPort` 注释行 → 默认 8970；
-  权威来源是 ECHO 启动时写出的 `data\echo-port.txt`（本机因端口保留段冲突用的是 18060）。
-- 仪表盘热键 `Ctrl+Shift+E`：由 **ECHO 服务进程自己注册**（`app/hotkey.py` 的 `RegisterHotKey`，
-  与 `Ctrl+Alt+C` 同一套机制）。按一下按 `panelOpenMode` 行事：默认 `sidebar` 切换
-  **右缘边条**（`sidebar/echo-sidebar.exe`，.NET 7 + WebView2，单实例、经命名管道 toggle，
-  由 ECHO 服务拉起）；`app`=Chromium 应用窗口；`browser`=默认浏览器。
-- 插件侧的 Electron 边条窗口/热键在 **DSH Desktop 2.0.9 上不可用**（`app.asar.unpacked` 里动态
-  import 到的 `electron` 只有 `net/systemPreferences`，没有 `app/BrowserWindow/screen/globalShortcut`，
-  2026-09-12 实测，见插件文件日志）：插件仍会探测一次并记日志，探测失败即降级为 no-op，
-  边条由 ECHO 自带的 .NET 边条进程负责。
+退役原因：
 
-面板热键/打开方式可在 面板 → 设置 → **语音命令** 里改：`panelHotkey`（默认 `Ctrl+Shift+E`，
+- 插件位置在 DSH Desktop 2.0.9+ 只能拿到 Electron 的**工具/渲染进程变体**（`own=[net,systemPreferences]`，
+  没有 `app/BrowserWindow/screen/globalShortcut`），开不了边条窗口；`Ctrl+Shift+E` 边条一直由
+  ECHO 自己的 .NET 侧栏（`sidebar/echo-sidebar.exe`）+ `app/hotkey.py` 的 `RegisterHotKey` 负责。
+- 注册行指向 `<DSH 安装目录>\resources\app.asar.unpacked\`，而 DSH 每次升级都重建该目录 → 插件
+  两次"静默消失"（2026-09-12 升级后；2026-09-17 连续 5 次 `ERR_MODULE_NOT_FOUND`）。
+- 插件的端口来源没跟上 ECHO 的迁移：它读 `~/.dsh/settings.yaml` 的 `serverPort` 注释行、回退 8970，
+  而权威来源是 `data\echo-port.txt`（当晚实际 18060），于是探活/守护实际是空转。
+- DSH 2.0.11 已有正式插件体系（profile 内 `node_modules` 装包 + 插件市场/设置页清单），
+  继续往安装目录写文件已是遗留打法。
+
+现在这些事由谁做：启动文件夹 → `scripts\echo-startup.vbs` → `scripts\startup.ps1`（自带守护重启）、
+手动 `scripts\start.ps1`、桌面快捷方式 `scripts\launch-desktop.ps1`；端口一律以 `data\echo-port.txt` 为准。
+
+> 若将来确实需要"DSH 启动时顺带守护 ECHO"，按 2.0.11 的插件体系做成 profile 本地包
+> （`~/.dsh/profiles/<active>/node_modules/`，按包名注册），**不要**照旧往 `app.asar.unpacked` 里写。
+
+面板热键/打开方式仍可在 面板 → 设置 → **语音命令** 里改：`panelHotkey`（默认 `Ctrl+Shift+E`，
 支持 `Ctrl+Shift+Space`、`Ctrl+Alt+F1` 等）、`panelOpenMode`（`sidebar`=右缘边条（默认）/
 `app`=Chromium 应用窗口 / `browser`=默认浏览器）。热键由 ECHO 注册，改完只重启 ECHO 即可
 （不用动 DSH）。
-
-**部署（源码改动后必须重跑）**：
-
-```powershell
-powershell -File scripts\install-echo-host-plugin.ps1            # 部署 + 自检
-powershell -File scripts\install-echo-host-plugin.ps1 -Quiet     # 启动时自愈（无输出）
-powershell -File scripts\install-echo-host-plugin.ps1 -Uninstall # 卸载
-```
-
-脚本把源码复制到 `<DSH 安装目录>\resources\app.asar.unpacked\echo-host\`，并在 **Profile 补丁层**
-`%USERPROFILE%\.dsh\profiles\<活动 profile>\cordis.patch.yml` 里维护注册行（标记块
-`# >>> echo-host plugin ... >>>`，`id: echo-host` + 指向部署副本的 `file:///` URL），最后用 DSH
-自带 loader 代码**离线校验**（补丁能否解析、行是否进树、入口文件是否存在、模块能否 import），
-校验不过即报错退出，避免"下次启动才炸"。
-
-> ⚠ **要写到哪个 profile？** Desktop 只用它**当前活动**的那个 Profile。安装脚本自动读取
-> `%APPDATA%\DSH Desktop\profile-selection\state.json` 的 `active` 字段，然后为活动 profile 与
-> `desktop` 两个 profile 各写一份注册行，避免切 profile 丢插件。
-> 手工排查时先确认这个字段，别再默认往 `desktop` 里写。
-
-> ⚠ **DSH Desktop 2.0.9 不再读取 `app.asar.unpacked\cordis.patch.yml`**（2.0.5 会读）。2026-09-12
-> 从 2.0.5 升到 2.0.9 后插件"静默消失"，就是补丁放在那个目录里、Loader 实时清单中一行都没有。
-> 现在注册行放在 Profile 补丁层（Desktop 的组合顺序：bundle 层 → Profile 层 → 机器层
-> `~\.dsh\cordis.patch.yml`）。
->
-> ⚠ **Profile 补丁层只在 DSH Desktop 启动时组合**：部署后必须**重启 DSH Desktop** 才生效。
-> `scripts\launch-desktop.ps1`（桌面快捷方式）与 `scripts\start.ps1`（开机自启）每次启动都会自动
-> 补装（自愈），所以 DSH 升级后启动一次 ECHO 即可；也可手动重跑上面的部署命令。
->
-> ⚠ 该补丁文件里**不要写非 ASCII 注释**：Windows PowerShell 5.1 会把无 BOM 的 UTF-8 当 ANSI 读，
-> 读回时会把行读串、YAML 直接坏掉（本工具只写 ASCII 注释，并在写入前用 yaml 解析器校验）。
 
 ## 与 DSH Desktop 的关系
 
@@ -254,8 +232,8 @@ powershell -File scripts\install-echo-host-plugin.ps1 -Uninstall # 卸载
 ECHO 通过 JSON-RPC 风格接口与会话交互，把技能（skills）能力直接借过来——所以"整理成表格""查一下天气"
 这类任务不需要在 ECHO 里再实现一遍。
 
-插件 `plugin/echo-host/` 是可选的：它让 DSH 启动时顺带守护 ECHO，并在 DSH 升级后自动重装；
-ECHO 也可以完全脱离 DSH 独立启动（转写、会议、面板都不依赖它），只把"执行"这一步留白。
+ECHO 可以完全脱离 DSH 独立启动（转写、会议、面板都不依赖它），只把"执行"这一步留白；
+早先那个让 DSH 顺带守护 ECHO 的插件已退役（见上节），ECHO 的启动/守护由 `scripts\startup.ps1` 负责。
 
 ## 常用 API（面板/手机 App/技能共用）
 
@@ -263,7 +241,8 @@ ECHO 也可以完全脱离 DSH 独立启动（转写、会议、面板都不依�
 |---|---|
 | `GET /api/status` | 组件状态 + DSH + 会议 + 忙闲 + 转写引擎加载状态 |
 | `GET/PUT /api/settings` | 配置读写（入库，带分组/类型元数据） |
-| `POST /api/assistant/command` | 发送文本命令 `{text, source}` |
+| `POST /api/assistant/command` | 发送文本命令 `{text, source, workspace?, session_id?}`（后两个不给就用面板保存的「命令目标」） |
+| `GET /api/dsh/targets` | 命令目标下拉的数据源：DSH 工作区列表 + 会话列表 |
 | `POST /api/assistant/capture` | 触发一次录音命令流 |
 | `POST /api/models/download` | 下载指定模型（`GET /api/models` 看清单与进度） |
 | `POST /api/system/restart` | 重启 ECHO 服务 |

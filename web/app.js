@@ -76,7 +76,7 @@ function switchView(name) {
   if (name === "settings") { loadSettings(); loadModelList(); }
   if (name === "history") loadHistory();
   if (name === "meetings") { loadMeetings(); refreshMeetingHeader(); }
-  if (name === "boot") { loadBoot(); loadBootLogs(); loadGuardLogs(); }
+  if (name === "boot") { loadBoot(); loadBootLogs(); }
   if (name === "failover") loadRouter();
 }
 $$(".tab").forEach((t) => t.addEventListener("click", () => switchView(t.dataset.view)));
@@ -721,35 +721,60 @@ function shortName(p) {
   return parts[parts.length - 1] || p;
 }
 
-async function loadTargets() {
+/** 从 /api/settings 返回的列表里取值。 */
+function settingFrom(list, key) {
+  const row = (list || []).find((s) => s.key === key);
+  return row && row.value != null ? String(row.value) : "";
+}
+
+/** 命令目标一次选中即持久化：语音（媒体键/唤醒/麦克风）与打字命令共用它。 */
+async function saveCommandTarget() {
+  const t = currentTarget();
   try {
-    _targets = await api("/api/dsh/targets");
+    await api("/api/settings", { method: "PUT", body: JSON.stringify({ values: {
+      commandTargetWorkspace: t.workspace || "",
+      commandTargetSession: t.session_id || "",
+    } }) });
+  } catch (e) { toast("命令目标保存失败：" + e.message); }
+}
+
+async function loadTargets() {
+  let savedWs = "", savedSid = "";
+  try {
+    const [t, s] = await Promise.all([api("/api/dsh/targets"), api("/api/settings")]);
+    _targets = t;
+    savedWs = settingFrom(s.settings, "commandTargetWorkspace");
+    savedSid = settingFrom(s.settings, "commandTargetSession");
   } catch (e) {
     _targets = { workspaces: [], sessions: [] };
   }
   const ws = $("#wsSelect");
   if (!ws) return;
-  const prevWs = ws.dataset.val || "";
+  const prevWs = ws.dataset.val || savedWs || "";
   ws.innerHTML = `<option value="">默认（ECHO 固定会话）</option>` +
     _targets.workspaces.map((w) =>
       `<option value="${esc(w)}">${esc(shortName(w))}</option>`).join("");
-  ws.dataset.val = prevWs || ws.value || "";
-  renderSessSelect();
+  // 保存的工作区若已不存在（移除/改名）→ 退回默认项
+  ws.value = [...ws.options].some((o) => o.value === prevWs) ? prevWs : "";
+  ws.dataset.val = ws.value;
+  renderSessSelect(savedSid);
 }
 
-function renderSessSelect() {
+function renderSessSelect(wantSid) {
   const wsSel = $("#wsSelect");
   const ss = $("#sessSelect");
   if (!wsSel || !ss) return;
   const ws = wsSel.value;
   const list = ws ? (_targets.sessions || []).filter((s) => s.cwd === ws) : [];
-  const prev = ss.dataset.val || "";
+  const prev = (wantSid !== undefined ? wantSid : (ss.dataset.val || "")) || "";
   ss.innerHTML = `<option value="">自动（该工作区最近对话 / 新建）</option>` +
     list.map((s) =>
       `<option value="${esc(s.sessionId)}">${esc(s.title || shortName(s.sessionId))}${s.running ? " ●" : ""}</option>`).join("");
-  ss.dataset.val = prev || ss.value || "";
+  ss.value = [...ss.options].some((o) => o.value === prev) ? prev : "";
+  ss.dataset.val = ss.value;
 }
-$("#wsSelect").addEventListener("change", renderSessSelect);
+$("#wsSelect").addEventListener("change", () => { renderSessSelect(); saveCommandTarget(); });
+$("#sessSelect").addEventListener("change", saveCommandTarget);
 
 function currentTarget() {
   const ws = $("#wsSelect").value || "";
@@ -1474,18 +1499,6 @@ async function loadBootLogs() {
   } catch (e) { /* ignore */ }
 }
 
-async function loadGuardLogs() {
-  try {
-    const r = await api("/api/logs?source=guard&limit=60");
-    const el = $("#guardLogs");
-    const items = r.items || [];
-    el.innerHTML = items.length
-      ? items.map((l) => `<div class="boot-log-line"><span class="muted">${esc(l.ts || "")}</span> <span class="lv-${l.level}">${esc(l.message || "")}</span></div>`).join("")
-      : `<div class="empty">暂无守护进程关键事件（echo-host 尚未上报）</div>`;
-    el.scrollTop = 0;
-  } catch (e) { /* ignore */ }
-}
-
 // PWA：注册 Service Worker（可安装为独立窗口应用）
 if ("serviceWorker" in navigator) {
   window.addEventListener("load", () => {
@@ -1497,7 +1510,7 @@ switchView("dashboard");
 setInterval(() => {
   const v = $(".tab.active");
   if (v && v.dataset.view === "dashboard") refreshDashboard();
-  else if (v && v.dataset.view === "boot") { loadBoot(); loadBootLogs(); loadGuardLogs(); }
+  else if (v && v.dataset.view === "boot") { loadBoot(); loadBootLogs(); }
   else if (v && v.dataset.view === "failover" && !_rtDirty && !_rtBusy()) loadRouter();
 }, 2000);
 // 转写进度轮询（会议列表进度条）

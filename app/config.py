@@ -93,6 +93,17 @@ DEFAULTS = {
                                          "从而归入侧栏对应分组（例如你自己的「日常交互」）。"
                                          "留空 = 建在 ECHO 根目录（侧栏显示为未分组）",
                              value_type="str"),
+    "commandTargetWorkspace": dict(value="", grp="general", label="命令目标工作区（面板同步）",
+                                   description="面板仪表盘「命令目标」下拉里选中的工作区。选中后，"
+                                               "语音命令（媒体键/热键/唤醒/麦克风按钮）与打字命令都发到这里，"
+                                               "不再使用上面那个会轮换的默认命令会话。"
+                                               "由面板下拉自动写入，一般不用手改；留空 = 回到默认会话",
+                                   value_type="str"),
+    "commandTargetSession": dict(value="", grp="general", label="命令目标会话（面板同步）",
+                                 description="面板选中的具体对话：填了就直接发给它（不轮换、也不自动挑最近会话）。"
+                                             "会话被归档/删除后自动回退到「该工作区自动」。"
+                                             "由面板下拉自动写入，一般不用手改",
+                                 value_type="str"),
     "userLocation":    dict(value="北京", grp="general", label="用户所在地",
                             description="发给 DSH 命令时附带的地理位置（天气/时间等问答需要）",
                             value_type="str"),
