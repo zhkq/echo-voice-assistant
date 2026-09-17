@@ -505,13 +505,20 @@ input[type="range"].seek::-moz-range-thumb { width: 13px; height: 13px; border-r
   box-shadow: 0 4px 20px rgba(0,0,0,.4);
 }
 
-/* ---------- 历史 / 会议整页：占满视口高度 ---------- */
-#view-history .card, #view-meetings .card { margin-bottom: 0; }
+/* ---------- 历史 / 会议整页：占满视口高度 ----------
+   原来写死 height: calc(100vh - 180px)：这个 180px 是拍脑袋的，窄窗口/顶栏换行时对不上，
+   结果卡片底边之下留一条空白（用户 2026-09-17：指令历史和会议下方都有一个空行、高度不合适）。
+   改成 flex 高度链，列表正好填满"顶栏以下、卡片以内"的剩余空间，不再依赖任何魔法数。 */
+body { display: flex; flex-direction: column; min-height: 100vh; }
+main { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
+#view-history:not(.hidden), #view-meetings:not(.hidden) {
+  display: flex; flex-direction: column; flex: 1 1 auto; min-height: 0;
+}
+#view-history .card, #view-meetings .card {
+  flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; margin-bottom: 0;
+}
 #historyList, #meetingList {
-  max-height: none;
-  height: calc(100vh - 180px);
-  min-height: 360px;
-  overflow-y: auto;
+  flex: 1 1 auto; min-height: 0; height: auto; max-height: none; overflow-y: auto;
 }
 
 /* ---------- 启动页 ---------- */
