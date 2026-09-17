@@ -19,6 +19,24 @@ body {
   font-size: 14px;
 }
 
+/* ---------- 滚动条 ----------
+   面板是深色的，Windows 默认滚动条又宽又亮、还带上下箭头，压在卡片右缘很突兀
+   （2026-09-17 用户：命令历史的滚动条有点难看）。统一收成"细窄 + 深色半透明 + 透明轨道"。
+
+   实测（Edge/Chromium headless 对比渲染）：
+     * 走 ::-webkit-scrollbar 伪元素时拇指更粗、更抢眼；
+     * 只用标准属性 scrollbar-width/scrollbar-color 是最细的一档（Firefox 同理）；
+     * 两端的箭头按钮是浏览器原生滚动条自带的，CSS 压不掉（::-webkit-scrollbar-button
+       的 display:none 在这个版本无效，它已被新的 Fluent 滚动条忽略），
+       所以只能靠"细窄 + 压暗 + 轨道透明"把它弱化到不刺眼。 */
+* { scrollbar-width: thin; scrollbar-color: rgba(104,116,155,.75) transparent; }
+
+/* 长列表：滚动槽位固定，避免"有滚动条/没滚动条"时内容左右跳 */
+#historyList, #meetingList, .boot-log, .paras, .seg-list, .lines, .sess-text,
+.modal-body, .settings-form { scrollbar-gutter: stable; }
+/* 历史/会议整页列表与文字留一点间距，滚动条不贴着卡片边框 */
+#historyList, #meetingList { padding-right: 6px; }
+
 /* ---------- 顶栏 ---------- */
 .topbar {
   display: flex; align-items: center; gap: 20px;
@@ -225,6 +243,14 @@ main { max-width: 1200px; margin: 12px auto; padding: 0 14px; }
 .cmd-item .text { margin: 6px 0; font-size: 13.5px; }
 .cmd-item .reply { color: var(--muted); font-size: 12.5px; white-space: pre-wrap; }
 .cmd-item .time { color: var(--muted); font-size: 12px; margin-left: auto; }
+/* 窄窗口（边条约 420px）下，回复里的长 URL / 长会话标题会把历史列表撑出横向滚动条
+   （2026-09-17 实测：480px 宽时列表底部出现横向条）。这里让文本可在任意位置断行，
+   并让 flex 子项允许收缩，从根上不产生横向溢出。 */
+.cmd-item { min-width: 0; }
+.cmd-item .text, .cmd-item .reply { overflow-wrap: anywhere; }
+.cmd-sess { min-width: 0; }
+.cmd-sess .sess-title { flex: 1 1 auto; min-width: 0; }
+.sess-head { overflow-wrap: anywhere; }
 
 /* 命令 → DSH 会话：会话行 + 就地展开的会话内容（DSH 侧没有按会话直达的 URL） */
 .cmd-sess { display: flex; align-items: center; gap: 8px; margin-top: 6px; font-size: 12.5px; }
