@@ -42,16 +42,28 @@ body {
   display: flex; align-items: center; gap: 20px;
   padding: 12px 20px; background: var(--card);
   border-bottom: 1px solid var(--border); position: sticky; top: 0; z-index: 10;
+  flex-wrap: wrap;          /* 窄面板（侧栏最窄 320px）里顶栏必须能换行：7 个页签放不下时
+                               会把整页撑宽 → 出现整页横向滚动条（2026-09-17 实测 topbar +80、
+                               tabs +85，进而 html +288） */
 }
 .brand { font-size: 20px; font-weight: 700; color: var(--accent); letter-spacing: 1px; }
 .brand .sub { font-size: 12px; color: var(--muted); font-weight: 400; margin-left: 8px; }
-.tabs { display: flex; gap: 4px; }
+.tabs { display: flex; gap: 4px; flex-wrap: wrap; row-gap: 4px; }
 .tab {
   background: none; border: none; color: var(--muted); cursor: pointer;
   padding: 8px 16px; border-radius: 8px; font-size: 14px;
 }
 .tab:hover { color: var(--text); background: var(--card2); }
 .tab.active { color: var(--accent); background: var(--card2); font-weight: 600; }
+/* 窄面板：顶栏收紧、副标题让位、页签缩小换行 */
+@media (max-width: 560px) {
+  .topbar { gap: 8px; padding: 8px 10px; }
+  .brand { font-size: 17px; }
+  .brand .sub { display: none; }
+  .tab { padding: 5px 9px; font-size: 13px; }
+}
+/* 兜底：任何残留的横向溢出都不该变成整页滚动条（长内容已在上文按需换行） */
+html, body { overflow-x: hidden; }
 /* 顶栏原来右上角有个"运行 1时20分 · 空闲"的常驻状态（用户 2026-09-12 要求去掉）。
    连接不上 ECHO 时仍然要能一眼看出来：只加红色标记，正常状态下完全不出现、不占位。 */
 body.echo-offline .topbar { border-bottom-color: var(--red); }
