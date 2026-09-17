@@ -357,9 +357,12 @@ def _start_meeting(report):
 
 
 def _start_diarize(report):
-    import os
-    base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    ok = os.path.isdir(os.path.join(base, "models", "pyannote"))
+    """说话人分离：复用 modelinfo 的校验（模型文件齐全才算就绪，空目录不算）。"""
+    try:
+        from app import modelinfo
+        ok = modelinfo._ready_pyannote()
+    except Exception:
+        ok = False
     if ok:
         detail = "pyannote 就绪"
         try:      # 顺带报一下常用联系人声纹库（有样本时才显示）
@@ -371,7 +374,7 @@ def _start_diarize(report):
             pass
         report(status="online", detail=detail, progress=1.0)
     else:
-        report(status="disabled", detail="模型缺失", progress=0.0)
+        report(status="disabled", detail="模型缺失（设置 → 模型 → 说话人分离）", progress=0.0)
 
 
 # 已加载 STT 引擎 key（stt-cmd / stt-meeting），供卸载与状态判断

@@ -177,11 +177,20 @@ class MeetingRecorder:
         self.level = 0.0
         self.segments = []
         self.started_at = None
+        # 录音线程是否已成功打开输入流 / 失败原因（供 start 后同步校验，
+        # 避免"麦打不开但界面显示录音中、最后留下空会议"）
+        self.error = None
+        self._started = threading.Event()
 
     def start(self):
         self.started_at = time.time()
         self.thread = threading.Thread(target=self._loop, daemon=True)
         self.thread.start()
+
+    def wait_started(self, timeout=5.0):
+        """等录音线程真正打开输入流；成功返回 True，打不开（或超时）返回 False。"""
+        self._started.wait(timeout)
+        return self._started.is_set() and not self.error
 
     def stop(self):
         self.stop_event.set()
@@ -194,6 +203,7 @@ class MeetingRecorder:
         seg_idx = 0
         try:
             with _open_input(self.device_id) as stream:
+                self._started.set()          # 输入流已打开：通知 start_meeting 校验通过
                 while not self.stop_event.is_set():
                     data, _ = stream.read(int(SAMPLE_RATE * 0.2))
                     a = data.astype(np.float32) / 32768.0
@@ -216,4 +226,6 @@ class MeetingRecorder:
                 _write_wav(os.path.join(self.folder, name), buf)
                 self.segments.append(name)
         except Exception as e:
+            self.error = str(e)
+            self._started.set()              # 打不开：唤醒等待者，让它拿到 error
             print(f"[meeting] 录音线程异常: {e}")

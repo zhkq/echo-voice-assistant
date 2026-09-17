@@ -145,6 +145,16 @@ def start_meeting():
         )
         recorder.start()
 
+        # 同步校验输入流是否真的打开：打不开就当场失败，避免界面显示"录音中"
+        # 却一条音频都没录到（2026-09-16 空会议就是设备打不开后线程静默退出）。
+        if not recorder.wait_started(timeout=6):
+            err = recorder.error or "打开麦克风超时（设备被占用或权限不足）"
+            recorder.stop()
+            db.update_meeting(meeting_id, status="error")
+            _state.update(active=False, folder=None, recorder=None, level=0.0, error=err)
+            db.add_log("error", "meeting", f"开始录音失败（{os.path.basename(folder)}）：{err}")
+            return False, f"无法开始录音：{err}"
+
         _state.update(active=True, folder=folder, recorder=recorder,
                       started_at=meta["start"], error="")
         db.add_event("meeting_started", {"meeting": os.path.basename(folder), "id": meeting_id})
@@ -172,6 +182,19 @@ def stop_meeting():
         _state["folder"] = None
 
         meeting = db.get_meeting_by_name(os.path.basename(folder))
+        if not segs:
+            # 没录到任何音频：直接标 error，不再假装"转写中"（否则永远卡住，
+            # 因为转写拿到 0 分段会立刻返回）。见 2026-09-16 的设备打开失败。
+            err = (recorder.error or "没有录到音频") if recorder else "没有录到音频"
+            if meeting:
+                db.update_meeting(meeting["id"], ended_at=meta["end"],
+                                  duration_seconds=0, segments=0, status="error")
+            _state.update(error=err)
+            db.add_event("meeting_stopped", {"meeting": os.path.basename(folder), "error": err})
+            db.add_log("error", "meeting",
+                       f"录音结束但无音频（{os.path.basename(folder)}）：{err}")
+            return False, f"没有录到音频：{err}"
+
         if meeting:
             db.update_meeting(meeting["id"], ended_at=meta["end"],
                               duration_seconds=meta["durationSeconds"],
@@ -369,10 +392,14 @@ def _transcribe_impl(folder):
     }
     segs = sorted(meta.get("segments", []) or
                   [f for f in os.listdir(folder) if re.match(r"^\d+\.wav$", f)])
-    if not segs:
-        return
     meeting_name = os.path.basename(folder)
     meeting = db.get_meeting_by_name(meeting_name)
+    if not segs:
+        # 兜底：没有音频无法转写，状态不能停在 transcribing（会永远卡住）
+        if meeting:
+            db.update_meeting(meeting["id"], status="error")
+            db.add_log("error", "meeting", f"没有音频分段，无法转写：{meeting_name}")
+        return
     if not meeting:
         return
     meeting_id = meeting["id"]
