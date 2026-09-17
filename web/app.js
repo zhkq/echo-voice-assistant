@@ -661,6 +661,12 @@ function renderCmdList(el, items, withReply, opts = {}) {
         long ? `<span class="reply-full hidden">${esc(reply)}</span>` : ""}</div>` : ""}
       ${long ? `<a class="reply-toggle" data-expand data-len="${reply.length}">展开全文（${reply.length} 字）</a>` : ""}
       ${c.error ? `<div class="reply" style="color:var(--red)">⚠ ${esc(c.error)}</div>` : ""}
+      ${(opts.sessions && c.session_id) ? `<div class="cmd-sess">
+        <a class="sess-open" data-sess="${c.id}">看会话 ▸</a>
+        <span class="muted sess-title" title="${esc(c.session_id)}">${esc(sessionLabel(c.session_id))}</span>
+        <a class="sess-copy" data-sesscopy="${esc(c.session_id)}" title="复制会话 ID（DSH 里搜不到会话时用）">⧉</a>
+      </div>
+      <div class="sess-body hidden" data-sessbody="${c.id}"></div>` : ""}
     </div>`;
   }).join("");
 
@@ -669,6 +675,19 @@ function renderCmdList(el, items, withReply, opts = {}) {
     e.stopPropagation();   // 别被算成"整条点击"（仪表盘上整条是跳转）
     toggleReply(a);
   }));
+  if (opts.sessions) {
+    $$("[data-sess]", el).forEach((a) => a.addEventListener("click", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      toggleCommandSession(a.dataset.sess);
+    }));
+    $$("[data-sesscopy]", el).forEach((a) => a.addEventListener("click", async (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      try { await navigator.clipboard.writeText(a.dataset.sesscopy); toast("已复制会话 ID"); }
+      catch (err) { toast("复制失败，请手动选择"); }
+    }));
+  }
   if (jump) {
     $$(".cmd-item", el).forEach((it) =>
       it.addEventListener("click", () => openCmdInHistory(it.dataset.id)));
@@ -1478,10 +1497,68 @@ $("#btnSettingsSave").addEventListener("click", async () => {
 });
 
 /* ================= 历史 ================= */
+
+/* 命令 → DSH 会话：DSH 的 Web UI 没有"按会话直达"的 URL（实测前端不解析任何 URL 参数，
+   也没有自定义协议），所以跳不过去；改成在 ECHO 里就地看——标题来自 /api/dsh/targets，
+   内容按需读 /api/commands/{id}/session（后端用签名 Cookie 走 session/page）。 */
+let _sessionInfo = {};
+
+async function loadSessionInfo() {
+  try {
+    const r = await api("/api/dsh/targets");
+    const map = {};
+    for (const s of (r.sessions || [])) map[s.sessionId] = { title: s.title || "", cwd: s.cwd || "" };
+    _sessionInfo = map;
+  } catch (e) { /* 拿不到就只显示 ID，不影响历史本身 */ }
+  return _sessionInfo;
+}
+
+function sessionLabel(sid) {
+  const info = _sessionInfo[sid];
+  const title = (info && info.title) || "";
+  return title ? `会话：${title}` : `会话：${String(sid || "").slice(0, 20)}…`;
+}
+
+/** 展开/收起某条命令对应的 DSH 会话内容（按需拉取，拉过就缓存）。 */
+async function toggleCommandSession(cmdId) {
+  const body = $(`[data-sessbody="${cmdId}"]`);
+  if (!body) return;
+  const link = $(`[data-sess="${cmdId}"]`);
+  const opening = body.classList.contains("hidden");
+  body.classList.toggle("hidden", !opening);
+  if (link) link.textContent = opening ? "收起会话 ▾" : "看会话 ▸";
+  if (!opening || body.dataset.loaded) return;
+  body.innerHTML = `<div class="empty">读取会话中…</div>`;
+  try {
+    const r = await api(`/api/commands/${cmdId}/session?limit=12`);
+    body.dataset.loaded = "1";
+    body.innerHTML = renderSessionMessages(r);
+  } catch (e) {
+    body.innerHTML = `<div class="empty">读取失败：${esc(e.message)}</div>`;
+  }
+}
+
+function renderSessionMessages(r) {
+  if (!r.session_id) return `<div class="empty">${esc(r.message || "这条命令没有关联会话")}</div>`;
+  const head = `<div class="sess-head">${esc(r.title || "(无标题会话)")}` +
+    `${r.cwd ? " · " + esc(r.cwd) : ""}${r.running ? " · 正在执行" : ""}` +
+    `${r.exists === false ? " · 会话已不存在（可能已归档/删除）" : ""}` +
+    ` · ${r.anchored ? "已定位到这条指令" : "未定位到这条指令，显示会话最近消息"}</div>`;
+  if (!r.messages.length) {
+    return head + `<div class="empty">${esc(r.error || "这个会话里还没有可显示的消息")}</div>`;
+  }
+  const items = r.messages.map((m) => {
+    const who = m.role === "user" ? "你" : "助手";
+    return `<div class="sess-msg ${m.role === "user" ? "su" : "sa"}">` +
+      `<span class="sess-who">${who}</span><div class="sess-text">${esc(m.text)}</div></div>`;
+  }).join("");
+  return head + items + `<div class="muted sess-foot">只显示最近的文本消息（工具调用/步骤已省略）</div>`;
+}
+
 async function loadHistory() {
   try {
-    const r = await api("/api/commands?limit=200");
-    renderCmdList($("#historyList"), r.items, true);
+    const [r] = await Promise.all([api("/api/commands?limit=200"), loadSessionInfo()]);
+    renderCmdList($("#historyList"), r.items, true, { sessions: true });
     const id = _focusCmdId;     // 从仪表盘点过来的那条：等渲染完再定位+展开
     _focusCmdId = null;
     if (id) focusCmd(id);

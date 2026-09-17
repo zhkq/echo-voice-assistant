@@ -400,6 +400,20 @@ def _target_hint(workspace=None, session_id=None):
     return f"，发到「{name}」"
 
 
+# 发给 DSH 时附加的两行提示（见 build_env_context / build_reply_requirement）。
+# 面板「命令历史 → 看会话」回看原文时要摘掉，否则每次指令都拖着一行环境信息 + 一段要求。
+_INJECT_PREFIXES = ("【环境信息】", "【回复要求】")
+
+
+def strip_injections(text):
+    """去掉 ECHO 自己附加的环境信息行与极简回复要求行（只删整行，用户原话不动）。"""
+    if not text:
+        return ""
+    lines = [ln for ln in str(text).splitlines()
+             if not ln.lstrip().startswith(_INJECT_PREFIXES)]
+    return "\n".join(lines).strip()
+
+
 def _dispatch(text, source, workspace=None, session_id=None):
     """发送到 DSH + 等回复 + 简报 + 历史。"""
     cfg = settings

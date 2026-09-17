@@ -225,6 +225,22 @@ main { max-width: 1200px; margin: 12px auto; padding: 0 14px; }
 .cmd-item .text { margin: 6px 0; font-size: 13.5px; }
 .cmd-item .reply { color: var(--muted); font-size: 12.5px; white-space: pre-wrap; }
 .cmd-item .time { color: var(--muted); font-size: 12px; margin-left: auto; }
+
+/* 命令 → DSH 会话：会话行 + 就地展开的会话内容（DSH 侧没有按会话直达的 URL） */
+.cmd-sess { display: flex; align-items: center; gap: 8px; margin-top: 6px; font-size: 12.5px; }
+.cmd-sess .sess-open { color: var(--accent); cursor: pointer; white-space: nowrap; }
+.cmd-sess .sess-open:hover { text-decoration: underline; }
+.cmd-sess .sess-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cmd-sess .sess-copy { color: var(--muted); cursor: pointer; }
+.cmd-sess .sess-copy:hover { color: var(--text); }
+.sess-body { margin-top: 8px; border-left: 2px solid var(--border); padding-left: 10px; }
+.sess-head { color: var(--muted); font-size: 12px; margin-bottom: 6px; }
+.sess-msg { display: flex; gap: 8px; padding: 5px 0; border-top: 1px dashed var(--border); }
+.sess-msg .sess-who { flex: 0 0 34px; color: var(--muted); font-size: 12px; }
+.sess-msg.su .sess-who { color: var(--accent); }
+.sess-msg .sess-text { flex: 1 1 auto; font-size: 12.5px; white-space: pre-wrap;
+  overflow-wrap: anywhere; max-height: 260px; overflow-y: auto; }
+.sess-foot { font-size: 11.5px; margin-top: 6px; }
 .empty { color: var(--muted); text-align: center; padding: 30px 0; }
 
 /* ---------- 模型清单（设置 → 模型） ----------

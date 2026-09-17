@@ -390,6 +390,69 @@ def del_commands(_auth=Depends(optional_auth)):
     return {"ok": True}
 
 
+@router.get("/commands/{cmd_id}/session")
+def get_command_session(cmd_id: int, limit: int = 12, _auth=Depends(optional_auth)):
+    """某条命令落在了哪个 DSH 会话，以及该会话最近几轮对话（面板「历史 → 看会话」）。
+
+    为什么由 ECHO 读：DSH 的 Web UI 没有"按会话直达"的 URL（实测前端 bundle 不解析
+    任何 URL 查询/哈希参数，也没有自定义协议），跳不过去；而 ECHO 有签名 Cookie 的
+    RPC 通道，能直接把会话内容取回来渲染。
+    """
+    row = db.get_command(cmd_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="命令不存在")
+    sid = (row.get("session_id") or "").strip()
+    if not sid:
+        return {"ok": True, "session_id": "", "messages": [], "title": "", "cwd": "",
+                "exists": False, "running": False,
+                "message": "这条命令没有关联会话（发送失败，或当时没拿到会话）"}
+
+    from app.dsh import get_client, DshError
+    from app.assistant import strip_injections
+
+    client = get_client()
+    info, err = {}, ""
+    try:
+        for it in client.list_sessions_for():
+            if it.get("sessionId") == sid:
+                info = it
+                break
+    except DshError as e:
+        err = str(e)
+    except Exception as e:                     # 非 DSH 后端 / 网络异常都不该 500
+        err = str(e)
+
+    msgs, anchored = [], False
+    try:
+        n = max(1, min(int(limit or 12), 50))
+        if hasattr(client, "recent_messages"):
+            # 带上命令原文 → 定位到"这一轮"，而不是永远看会话尾部
+            res = client.recent_messages(sid, limit=n, anchor_text=row.get("text") or "")
+            if isinstance(res, dict):
+                msgs = res.get("messages") or []
+                anchored = bool(res.get("anchored"))
+            else:
+                msgs = res or []
+        else:
+            err = err or "当前智能体不支持读取会话内容"
+    except DshError as e:
+        err = str(e)
+    except Exception as e:
+        err = str(e)
+
+    out = []
+    for m in msgs:
+        text = m.get("text") or ""
+        # 用户那侧带着 ECHO 附加的环境信息与回复要求，回看时摘掉
+        if m.get("role") == "user":
+            text = strip_injections(text)
+        out.append({"role": m.get("role") or "user", "seq": m.get("seq"), "text": text})
+    return {"ok": not err, "session_id": sid,
+            "title": info.get("title") or "", "cwd": info.get("cwd") or "",
+            "exists": bool(info), "running": bool(info.get("running")),
+            "messages": out, "error": err, "anchored": anchored}
+
+
 # ---------------------------------------------------------------- 会话
 @router.get("/sessions")
 def get_sessions(_auth=Depends(optional_auth)):

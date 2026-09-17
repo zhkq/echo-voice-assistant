@@ -362,6 +362,58 @@ class DshAgent(AgentAdapter):
         records = (res.get("value") or {}).get("records", []) or []
         return [{"event": r.get("event") or {}} for r in records]
 
+    def recent_messages(self, session_id, limit=12, anchor_text=None, max_events=600):
+        """取会话里的 user/assistant 文本消息（工具调用/步骤事件忽略）。
+
+        用途：面板「命令历史 → 看会话」——DSH 的 Web UI 没有按会话直达的 URL
+        （前端 bundle 不解析任何 URL 参数），只能由 ECHO 用带签名 Cookie 的 RPC 读出来渲染。
+
+        anchor_text：传命令原文时，定位到该指令那一轮（user 消息里含这段文本），
+        从那里往后取 limit 条——同一会话里多条指令各有各的上下文，而不是都看会话尾部。
+        找不到就退回"最近 limit 条"。
+
+        返回 {"messages": [{"role","seq","text"}, ...], "anchored": bool, "scanned": int}
+        """
+        try:
+            events = self.history(session_id, max_messages=max_events)
+        except DshError:
+            raise
+        except Exception:
+            return {"messages": [], "anchored": False, "scanned": 0}
+        out = []
+        for ev in events:
+            obj = ev.get("event") or {}
+            etype = obj.get("type")
+            if etype not in ("user/message", "assistant/message"):
+                continue
+            data = obj.get("data") or {}
+            # 新版 data 直接是 message；旧版包一层 {"message": {...}}（与 wait_for_reply 同规则）
+            msg = data.get("message") if isinstance(data.get("message"), dict) else data
+            if not isinstance(msg, dict):
+                continue
+            role = msg.get("role") or ("assistant" if etype.startswith("assistant") else "user")
+            texts = [c.get("text", "") for c in (msg.get("content") or [])
+                     if isinstance(c, dict) and c.get("type") == "text" and c.get("text")]
+            text = "".join(texts).strip()
+            if not text:
+                continue
+            out.append({"role": role, "seq": obj.get("seq"), "text": text})
+        n = max(1, int(limit))
+        key = (anchor_text or "").strip()
+        if key:
+            # 同一条指令可能发过多次，取最后一次出现的位置；窗口到"下一个用户消息"为止，
+            # 这样看到的正好是这条指令那一轮（用户提问 + 助手的回复），不把下一轮混进来
+            for i in range(len(out) - 1, -1, -1):
+                if out[i]["role"] == "user" and key in out[i]["text"]:
+                    end = len(out)
+                    for j in range(i + 1, len(out)):
+                        if out[j]["role"] == "user":
+                            end = j
+                            break
+                    return {"messages": out[i:min(end, i + n)], "anchored": True,
+                            "scanned": len(out)}
+        return {"messages": out[-n:], "anchored": False, "scanned": len(out)}
+
     def prompt(self, session_id, text, mode="queue"):
         args = {
             "request": {
