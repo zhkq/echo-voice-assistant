@@ -78,6 +78,7 @@ function switchView(name) {
   if (name === "meetings") { loadMeetings(); refreshMeetingHeader(); }
   if (name === "boot") { loadBoot(); loadBootLogs(); }
   if (name === "failover") loadRouter();
+  if (name === "models") loadModels();
 }
 $$(".tab").forEach((t) => t.addEventListener("click", () => switchView(t.dataset.view)));
 
@@ -851,6 +852,14 @@ let _settingsCache = [];
 const SET_GROUP_ORDER = ["agent", "general", "voice", "wake", "meeting", "worklog", "router", "panel", "dsh"];
 const SET_GROUP_NAMES = { agent: "智能体", general: "通用", voice: "语音命令", wake: "唤醒词",
   meeting: "会议", worklog: "纪要归档", router: "模型路由", panel: "面板", dsh: "DSH 服务" };
+
+/* 模型相关配置项：从「设置」页移出，统一由「模型」页签承载（前端过滤，后端 grp 不动）。
+   见下方「模型」视图：按功能展示 选择 + 就绪 + 获取。 */
+const MODEL_KEYS = new Set([
+  "sttModel", "meetingSttModel", "device",
+  "wakeEngine", "meetingDiarize",
+  "voiceprintEnabled", "voiceprintAutoEnroll", "voiceprintThreshold", "voiceprintMargin",
+]);
 /* 默认展开；用户折叠过的分组记在 localStorage，刷新/重开面板后保持 */
 const SET_COLLAPSE_KEY = "echo.settings.collapsedGroups";
 
@@ -991,7 +1000,8 @@ async function loadSettings() {
     _settingsCache = r.settings;
     _agentsCache = r.agents || [];
     const groups = {};
-    r.settings.forEach((s) => { (groups[s.grp] = groups[s.grp] || []).push(s); });
+    r.settings.filter((s) => !MODEL_KEYS.has(s.key))
+      .forEach((s) => { (groups[s.grp] = groups[s.grp] || []).push(s); });
     // 「智能体」分组的配置项都是 hidden（不进 settings），这里补一个空分组占位
     if (!groups.agent) groups.agent = [];
     // 已知分组按业务相关性排序，未知分组排到末尾（保持出现顺序）
@@ -1200,6 +1210,260 @@ async function loadModelList() {
     el.innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`;
   }
 }
+
+/* ================= 模型（按功能组织：选择 + 就绪 + 获取） =================
+   配置来自 /api/settings（MODEL_KEYS 那批），就绪/获取来自 /api/models
+   （app/modelinfo.py，含 ready/target/size/how/cmd），声纹来自 /api/voiceprints，
+   已加载引擎来自 /api/stt/status。
+   目的：一眼看清"每个功能用哪个模型、装没装、装在哪"，并当场切换/获取，
+   避免"选了却跑不起来"（就绪会标红 + 给去下载/复制命令）。 */
+let _modelsCache = [];        // /api/models items
+let _vpCache = null;          // /api/voiceprints
+let _sttCache = null;         // /api/stt/status
+let _modelViewPoll = null;
+
+const _ENGINE_MODEL_ID = { sensevoice: "sensevoice", qwen3asr: "qwen3asr", sherpa: "sherpa" };
+
+/** 引擎值 → 模型清单 id（whisper 档位前缀 whisper-；large → large-v3）。 */
+function engineModelId(engine) {
+  const e = String(engine || "").toLowerCase();
+  if (_ENGINE_MODEL_ID[e]) return _ENGINE_MODEL_ID[e];
+  if (["tiny", "base", "small", "medium", "large"].includes(e)) {
+    return "whisper-" + (e === "large" ? "large-v3" : e);
+  }
+  return "";
+}
+function modelById(id) { return _modelsCache.find((m) => m.id === id) || null; }
+function settingByKey(k) { return _settingsCache.find((s) => s.key === k) || null; }
+
+/** 下拉里显示的人话名字（值仍是原样，避免改配置口径）。 */
+function friendlyOption(key, v) {
+  const s = String(v);
+  if (key === "sttModel" || key === "meetingSttModel") {
+    return { sensevoice: "SenseVoice 中文短命令", qwen3asr: "Qwen3-ASR 0.6B",
+      sherpa: "sherpa 流式（中英）" }[s] || ("Whisper " + s);
+  }
+  if (key === "device") return { auto: "自动（有 GPU 就用）", cpu: "CPU", cuda: "CUDA（GPU）" }[s] || s;
+  if (key === "wakeEngine") return { sherpa: "sherpa KWS", openwakeword: "openWakeWord" }[s] || s;
+  return s;
+}
+
+function modelBadge(text, kind) { return `<span class="mcard-badge ${kind}">${esc(text)}</span>`; }
+
+/** 模型卡片的「获取」按钮组：下载 / 复制命令 / 复制目标路径。 */
+function modelActions(m) {
+  if (!m) return "";
+  const btns = [];
+  if (m.downloadable !== false && m.source !== "copy") {
+    btns.push(`<button class="btn mini" data-msdl="${esc(m.id)}" data-force="${m.ready ? "1" : "0"}">` +
+      (m.ready ? "重新下载" : esc(m.download_label || "下载")) + `</button>`);
+  }
+  if (m.cmd) btns.push(`<button class="btn mini" data-mcopy="${esc(m.cmd)}">${esc(m.cmd_label || "复制命令")}</button>`);
+  if (m.source === "copy") btns.push(`<button class="btn mini" data-mcopy="${esc(m.target)}">复制目标路径</button>`);
+  return btns.join("");
+}
+
+function _selectHtml(key, options, value) {
+  return `<select class="ctl" data-mset="${esc(key)}">` +
+    (options || []).map((o) => `<option value="${esc(o)}" ${String(o) === String(value) ? "selected" : ""}>` +
+      `${esc(friendlyOption(key, o))}</option>`).join("") + `</select>`;
+}
+
+/** 六个功能卡片的数据模型。 */
+function modelFunctions() {
+  const stt = settingByKey("sttModel");
+  const mstt = settingByKey("meetingSttModel");
+  const wake = settingByKey("wakeEngine");
+  const dev = settingByKey("device");
+  const diar = settingByKey("meetingDiarize");
+  return [
+    { id: "stt", icon: "🎤", name: "命令转写", settingKey: "sttModel", options: stt && stt.options,
+      value: stt && stt.value, catalogId: engineModelId(stt && stt.value) },
+    { id: "mstt", icon: "📝", name: "会议转写", settingKey: "meetingSttModel", options: mstt && mstt.options,
+      value: mstt && mstt.value, catalogId: engineModelId(mstt && mstt.value) },
+    { id: "wake", icon: "🔔", name: "唤醒", settingKey: "wakeEngine", options: wake && wake.options,
+      value: wake && wake.value, catalogId: "kws" },
+    { id: "diar", icon: "👥", name: "说话人分离", toggleKey: "meetingDiarize",
+      value: !!(diar && diar.value), catalogId: "pyannote" },
+    { id: "vp", icon: "🧬", name: "声纹", special: "voiceprint" },
+    { id: "dev", icon: "💻", name: "计算设备", settingKey: "device", options: dev && dev.options,
+      value: dev && dev.value, special: "device" },
+  ];
+}
+
+/* 状态：ok=就绪 / miss=红色（转写引擎缺依赖，会失败）/ warn=黄色（可选模型未装）/ idle=未启用 */
+function _loadState(f) {
+  if (f.special === "device") return { kind: "ok", text: "就绪" };
+  if (f.special === "voiceprint") {
+    const on = !!(settingByKey("voiceprintEnabled") || {}).value;
+    return { kind: on ? "ok" : "idle", text: on ? "已开启" : "未开启" };
+  }
+  const m = modelById(f.catalogId);
+  if (!m) return { kind: "idle", text: "—" };
+  if (m.ready) return { kind: "ok", text: "就绪" };
+  const critical = f.id === "stt" || f.id === "mstt";   // 转写引擎缺失会直接导致失败
+  return critical ? { kind: "miss", text: "未就绪" } : { kind: "warn", text: "未安装" };
+}
+
+function renderModelOverview(fns) {
+  const host = $("#modelOverview");
+  if (!host) return;
+  let ready = 0, total = 0;
+  host.innerHTML = fns.map((f) => {
+    const s = _loadState(f);
+    if (f.catalogId) { total++; if (s.kind === "ok") ready++; }
+    const dot = { ok: "green", miss: "red", warn: "yellow" }[s.kind] || "idle";
+    return `<span class="ov-item"><span class="dot d-${dot}"></span>${esc(f.name)} <b>${esc(s.text)}</b></span>`;
+  }).join("");
+  const sum = $("#modelOvSummary");
+  if (sum) sum.textContent = `模型就绪 ${ready}/${total}`;
+}
+
+/** 单张功能卡。 */
+function renderModelCard(f) {
+  let badge = "", cls = "", body = "";
+
+  if (f.special === "voiceprint") {
+    const on = !!(settingByKey("voiceprintEnabled") || {}).value;
+    const auto = !!(settingByKey("voiceprintAutoEnroll") || {}).value;
+    const thr = settingByKey("voiceprintThreshold");
+    const mar = settingByKey("voiceprintMargin");
+    const count = (_vpCache && Array.isArray(_vpCache.items)) ? _vpCache.items.length : 0;
+    badge = modelBadge(on ? "已开启" : "未开启", on ? "ok" : "idle");
+    body = `<label class="mcard-sw"><input type="checkbox" data-mbool="voiceprintEnabled" ${on ? "checked" : ""}><span>启用声纹识别</span></label>
+      <label class="mcard-sw"><input type="checkbox" data-mbool="voiceprintAutoEnroll" ${auto ? "checked" : ""}><span>改名时自动入库</span></label>
+      <div class="mcard-nums">
+        <label>匹配阈值<input type="number" step="0.01" class="ctl" data-mnum="voiceprintThreshold" value="${esc(thr ? thr.value : 0.65)}"></label>
+        <label>歧义间隔<input type="number" step="0.01" class="ctl" data-mnum="voiceprintMargin" value="${esc(mar ? mar.value : 0.05)}"></label>
+      </div>
+      <div class="mcard-meta">声纹库：<b>${count}</b> 位联系人（在会议详情里把说话人改名成联系人即入库）</div>`;
+  } else if (f.special === "device") {
+    const stt = _sttCache || {};
+    badge = modelBadge("✅ " + esc(f.value || stt.device || "—"), "ok");
+    const loaded = (stt.loaded || []).map((e) => e.key || `${e.engine}:${e.model}`).join("、");
+    body = _selectHtml(f.settingKey, f.options, f.value) +
+      `<div class="mcard-meta">用于全部转写/分离${loaded ? " · 已加载 " + esc(loaded) : ""}` +
+      `${stt.cuda ? " · CUDA 可用" : " · 本机无 CUDA"}</div>`;
+  } else {
+    const m = modelById(f.catalogId);
+    const st = _loadState(f);
+    if (st.kind === "ok") { badge = modelBadge("✅ 已就绪", "ok"); cls = " ok"; }
+    else if (st.kind === "miss") { badge = modelBadge("⚠ 未就绪", "miss"); cls = " bad"; }
+    else if (st.kind === "warn") { badge = modelBadge("⬇ 未安装", "warn"); cls = " warn"; }
+    else { badge = modelBadge("未启用", "idle"); }
+    let control = "";
+    if (f.settingKey) control = _selectHtml(f.settingKey, f.options, f.value);
+    if (f.toggleKey) {
+      control += `<label class="mcard-sw"><input type="checkbox" data-mbool="${esc(f.toggleKey)}" ${f.value ? "checked" : ""}><span>启用（录音时区分说话人）</span></label>`;
+    }
+    const warn = (st.kind === "miss")
+      ? `<div class="mcard-warn">⚠ 所选模型未就绪，现在用它转写会失败</div>` : "";
+    const meta = m ? `<div class="mcard-meta">${esc(m.size)} · 落地 <code>${esc(m.target)}</code></div>` : "";
+    body = control + warn + meta + `<div class="mcard-act">${modelActions(m)}</div>`;
+  }
+
+  return `<div class="mcard${cls}">
+    <div class="mcard-head"><div class="mcard-ic">${f.icon}</div>
+      <div class="mcard-title">${esc(f.name)}</div>${badge}</div>
+    <div class="mcard-body">${body}</div>
+  </div>`;
+}
+
+function bindModelCards() {
+  const host = $("#modelCards");
+  if (!host || host.dataset.bound) return;
+  host.dataset.bound = "1";
+  host.addEventListener("change", async (e) => {
+    const el = e.target;
+    let key, val;
+    if (el.dataset.mset) { key = el.dataset.mset; val = el.value; }
+    else if (el.dataset.mbool) { key = el.dataset.mbool; val = el.checked; }
+    else if (el.dataset.mnum) { key = el.dataset.mnum; val = parseFloat(el.value) || 0; }
+    else return;
+    try {
+      await api("/api/settings", { method: "PUT", body: JSON.stringify({ values: { [key]: val } }) });
+      toast("已更新");
+      const r = await api("/api/settings");
+      _settingsCache = r.settings || _settingsCache;
+      loadModels();
+    } catch (err) { toast("更新失败：" + err.message); }
+  });
+  host.addEventListener("click", async (e) => {
+    const dl = e.target.closest("[data-msdl]");
+    if (dl) {
+      dl.disabled = true;
+      try {
+        const r = await post("/api/models/download", { id: dl.dataset.msdl, force: dl.dataset.force === "1" });
+        toast(r.message || "已开始下载");
+      } catch (err) { toast("下载失败：" + err.message); }
+      loadModels();
+      return;
+    }
+    const cp = e.target.closest("[data-mcopy]");
+    if (cp) {
+      try { await navigator.clipboard.writeText(cp.dataset.mcopy); toast("已复制"); }
+      catch (err) { toast("复制失败，请手动选择"); }
+    }
+  });
+}
+
+async function loadModels() {
+  const host = $("#modelCards");
+  if (!host) return;
+  try {
+    const [setRes, modelsRes, sttRes, vpRes] = await Promise.all([
+      api("/api/settings"),
+      api("/api/models"),
+      api("/api/stt/status").catch(() => null),
+      api("/api/voiceprints").catch(() => null),
+    ]);
+    _settingsCache = setRes.settings || _settingsCache;
+    _modelsCache = modelsRes.items || [];
+    _sttCache = sttRes;
+    _vpCache = vpRes;
+    const fns = modelFunctions();
+    renderModelOverview(fns);
+    host.innerHTML = fns.map(renderModelCard).join("");
+    bindModelCards();
+    const active = modelsRes.jobs && modelsRes.jobs.active;
+    if (active && !_modelViewPoll) _modelViewPoll = setInterval(loadModels, 1500);
+    else if (!active && _modelViewPoll) { clearInterval(_modelViewPoll); _modelViewPoll = null; }
+  } catch (e) {
+    host.innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`;
+  }
+}
+
+/** 等某个模型下载任务结束（或超时），用于「一键下载缺失」串行排队。 */
+function _waitModelJob(id, timeoutMs) {
+  return new Promise((resolve) => {
+    const t0 = Date.now();
+    const t = setInterval(async () => {
+      let done = false;
+      try {
+        const r = await api("/api/models");
+        _modelsCache = r.items || _modelsCache;
+        const job = (r.jobs && r.jobs.items || {})[id];
+        done = !(r.jobs && r.jobs.active) || (job && job.status !== "running");
+      } catch (e) { /* 继续等 */ }
+      if (done || Date.now() - t0 > (timeoutMs || 1800000)) { clearInterval(t); resolve(); }
+    }, 1500);
+  });
+}
+
+async function downloadMissingModels() {
+  const missing = _modelsCache.filter((m) => !m.ready && m.downloadable !== false && m.source !== "copy");
+  if (!missing.length) { toast("没有需要下载的模型"); return; }
+  toast(`开始下载 ${missing.length} 个模型…`);
+  for (const m of missing) {
+    try { await post("/api/models/download", { id: m.id, force: false }); } catch (e) { /* 继续下一个 */ }
+    await _waitModelJob(m.id);
+  }
+  toast("缺失模型下载完成");
+  loadModels();
+}
+
+const _btnDlMissing = $("#btnModelDownloadMissing");
+if (_btnDlMissing) _btnDlMissing.addEventListener("click", () => downloadMissingModels());
 
 function renderSettingRow(s) {
   const id = "set-" + s.key;
@@ -1506,7 +1770,17 @@ if ("serviceWorker" in navigator) {
   });
 }
 initRouterUI();
-switchView("dashboard");
+/* 折叠条（rail.html）点「模型」时经同源 localStorage 传来的落地页签意图；
+   主面板展开会重新加载本页，所以在这里消费一次即清掉。 */
+const _VIEWS = ["dashboard", "settings", "history", "meetings", "boot", "failover", "models"];
+let _bootView = "dashboard";
+try {
+  const q = new URLSearchParams(location.search).get("view");
+  const want = q || localStorage.getItem("echo.gotoView");
+  if (localStorage.getItem("echo.gotoView")) localStorage.removeItem("echo.gotoView");
+  if (want && _VIEWS.includes(want)) _bootView = want;
+} catch (e) { /* 忽略 */ }
+switchView(_bootView);
 setInterval(() => {
   const v = $(".tab.active");
   if (v && v.dataset.view === "dashboard") refreshDashboard();

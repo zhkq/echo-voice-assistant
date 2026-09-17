@@ -144,6 +144,8 @@
 
   <button class="btn" id="btnSay" title="按压说话（快捷键同 Ctrl+Alt+C）">说话</button>
 
+  <button class="btn" id="btnModels" title="展开面板并打开「模型」页签">模型</button>
+
   <div class="bottom">
     <div class="sep"></div>
     <!-- 状态区（用户 2026-09-12 指定顺序，从上到下）：DSH → 模型路由 → ECHO 状态 → 在线时长。
@@ -372,6 +374,18 @@
   // 而主面板启动即 switchView("dashboard")，所以展开后落在仪表盘页签。
   // 走同一条 WebView2 桥，不依赖 ECHO 服务（服务没起也能展开，面板自己显示"不可达"）。
   btnExpand.addEventListener("click", () => {
+    const wv = window.chrome && window.chrome.webview;
+    if (wv && typeof wv.postMessage === "function") {
+      wv.postMessage("rail-expand");
+      return;
+    }
+    toast("仅在折叠条中可展开");
+  });
+
+  // 「模型」按钮：先让主面板展开后落在「模型」页签（同源 localStorage 传意图），再通知宿主展开。
+  const btnModels = document.getElementById("btnModels");
+  btnModels.addEventListener("click", () => {
+    try { localStorage.setItem("echo.gotoView", "models"); } catch (e) { /* 忽略 */ }
     const wv = window.chrome && window.chrome.webview;
     if (wv && typeof wv.postMessage === "function") {
       wv.postMessage("rail-expand");
