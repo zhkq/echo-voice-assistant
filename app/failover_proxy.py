@@ -7,8 +7,9 @@
   venv 的 pythonw 拉起；
 - 之后每 30 秒复查一次，路由中途退出会自动拉回。
 
-ECHO 本身由 DSH Desktop 的 echo-host 插件 15 秒守护，因此本守护随 ECHO
-一起借力：ECHO 活着 → 路由就绪。避免路由挂掉后 ECHO AUTO 模型调用全部失败。
+ECHO 本身由 scripts\startup.ps1 的守护循环保证常驻（登录自启 + 崩溃重启），
+因此本守护随 ECHO 一起借力：ECHO 活着 → 路由就绪。避免路由挂掉后 ECHO AUTO
+模型调用全部失败。
 """
 import json
 import os

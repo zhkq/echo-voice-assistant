@@ -17,14 +17,12 @@
 > **路径尽量全英文**：`D:\ECHO` ✅ ／ `D:\学习\ECHO` ❌。
 > 少数原生依赖（nagisa/dynet、部分 funasr 组件）读不了非 ASCII 路径。
 > 若必须放在中文路径下：另建一个 ASCII 目录联接（junction）指向该 venv，并把解释器路径写进**两个**
-> 环境变量——`ECHO_PYTHON`（所有脚本都优先使用它，见 `scripts\*.ps1`）和 `ECHO_PYTHONW`
-> （DSH 的 echo-host 插件用它拉起服务；只设 `ECHO_PYTHON` 不够，因为插件走的是 `pythonw`）：
+> 环境变量——`ECHO_PYTHON`（所有脚本都优先使用它，见 `scripts\*.ps1`；启动脚本由它推导 `pythonw`）：
 > ```powershell
 > New-Item -ItemType Junction -Path C:\echo-venv -Target <你的ECHO目录>\venv
 > setx ECHO_PYTHON  C:\echo-venv\Scripts\python.exe
-> setx ECHO_PYTHONW C:\echo-venv\Scripts\pythonw.exe
 > ```
-> **两个变量都必须写「联接路径」（ASCII）**，不要写成 `<你的ECHO目录>\venv\Scripts\...` 的真实中文路径；
+> **必须写「联接路径」（ASCII）**，不要写成 `<你的ECHO目录>\venv\Scripts\...` 的真实中文路径；
 > 否则会议转写选 `qwen3asr` 时会在加载引擎处失败，报错只有一句
 > `RuntimeError: Could not read model from ...\nagisa\data\nagisa_v001.model`
 > （2026-09-15 迁移事故就是这个原因：仓库仍是中文路径，但解释器从 junction 换成了仓库内 venv）。
@@ -88,16 +86,10 @@ powershell -File scripts\start.ps1 -Background   # 后台启动（无窗口）
 
 1. 安装并启动 DSH Desktop，在其设置里**放开本机访问**（ECHO 默认连 `http://127.0.0.1:43120`）。
 2. 面板 → 启动 → `DSH 执行引擎` 应为在线；不在线可点「启动」/「重试」。
-3. 想让 DSH 启动时顺便守护 ECHO（并在 DSH 升级后自动重装插件）：
-
-```powershell
-powershell -File scripts\install-echo-host-plugin.ps1          # 部署 + 自检
-powershell -File scripts\install-echo-host-plugin.ps1 -Uninstall
-```
-
-部署脚本会把 `plugin/echo-host/` 拷到 `<DSH 安装目录>\resources\app.asar.unpacked\echo-host\`，
-写一份 `echo-root.txt`（插件据此找到本仓库），并在 DSH 的**活动 Profile** 补丁层
-`%USERPROFILE%\.dsh\profiles\<active>\cordis.patch.yml` 里维护注册行。改完源码要重跑，并**重启 DSH** 才生效。
+3. ~~想让 DSH 启动时顺便守护 ECHO（并在 DSH 升级后自动重装插件）~~ —— **该插件已于 2026-09-17 退役**
+   （原因与清理范围见 `plugin/README.md`）。ECHO 的启动/守护改由自己负责：登录自启走
+   `scripts\echo-startup.vbs` → `scripts\startup.ps1`，手动启动走 `scripts\start.ps1`，
+   桌面快捷方式走 `scripts\launch-desktop.ps1`；面板端口一律读 `data\echo-port.txt`。
 
 ## 5. 右缘边条（可选）
 

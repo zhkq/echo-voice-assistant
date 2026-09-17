@@ -1,12 +1,10 @@
 # startup.ps1 - logon entry point for ECHO (Startup shortcut runs this).
 #
 # Goal: ECHO must come up on its own at every logon and must NOT depend on DSH
-# Desktop or on the echo-host plugin. A DSH Desktop upgrade then never requires
-# restarting ECHO: if the plugin registration is lost, only the optional sidebar
-# is affected, and the self-heal below restores it silently.
+# Desktop. A DSH Desktop upgrade then never affects ECHO.
 #
 # What it does, in order:
-#   1. self-heal the DSH plugin registration (idempotent, quiet, best-effort)
+#   1. (retired 2026-09-17) DSH plugin self-heal - removed with the echo-host plugin
 #   2. start ECHO if its port (ECHO_PORT / data\echo-port.txt) is not listening
 #   3. supervise: restart ECHO whenever it stops listening (resident loop)
 #
@@ -52,16 +50,9 @@ function SupLog([string]$message) {
 
 SupLog "===== startup.ps1 begin (restartDelay=${RestartDelaySeconds}s, consoleHidden=$($script:hiddenConsole)) ====="
 
-# ---- 1. DSH plugin registration self-heal (idempotent, never blocks ECHO) ----
-$installer = Join-Path $PSScriptRoot 'install-echo-host-plugin.ps1'
-if (Test-Path $installer) {
-    try {
-        & powershell -NoProfile -ExecutionPolicy Bypass -File $installer -Quiet
-        SupLog ("plugin self-heal exit=" + $LASTEXITCODE)
-    } catch {
-        SupLog "plugin self-heal threw: $_"
-    }
-}
+# ---- 1. (retired 2026-09-17) DSH plugin registration self-heal ----
+# The echo-host DSH plugin is retired; nothing to heal. ECHO's own autostart is
+# this script (see the Startup shortcut -> scripts\echo-startup.vbs).
 
 # ---- 2/3. resolve pythonw and keep ECHO alive ----
 $py = Join-Path $root 'venv\Scripts\python.exe'

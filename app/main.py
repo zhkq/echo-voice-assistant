@@ -151,8 +151,8 @@ def main():
     import uvicorn
     db.init()
     port = int(settings.get("serverPort", 8970))
-    # 防重复实例：若端口已被其他 ECHO 实例监听（echo-host 守护误判后拉起的
-    # 重复实例、手动重复启动等），本进程为冗余 —— 尽早退出，避免：
+    # 防重复实例：若端口已被其他 ECHO 实例监听（手动重复启动、自启与桌面快捷方式
+    # 撞车等），本进程为冗余 —— 尽早退出，避免：
     #   1) 抢占端口失败白加载模型（GPU/CPU 浪费）；
     #   2) 启动恢复把活实例正在录的会议误标为 interrupted。
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)

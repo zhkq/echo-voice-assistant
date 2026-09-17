@@ -45,20 +45,10 @@ Write-Host '[4/4] 初始化数据库...'
 & $py -c "import app.db, app.config; app.db.init(); app.config.settings.seed_defaults(); print('DB OK:', app.db.DB_FILE)"
 if ($LASTEXITCODE -ne 0) { Write-Host '[!] 数据库初始化失败' -ForegroundColor Red; exit 1 }
 
-# 5. Deploy the DSH Desktop host plugin (echo-host): auto-starts/guards ECHO and
-#    provides the Ctrl+Shift+E right-edge dashboard sidebar. Best-effort: a
-#    machine without DSH Desktop installed still gets a working ECHO panel.
-$installer = Join-Path $PSScriptRoot 'install-echo-host-plugin.ps1'
-if (Test-Path $installer) {
-    Write-Host '[5/5] Deploying the DSH Desktop host plugin (echo-host) ...'
-    try {
-        & powershell -NoProfile -ExecutionPolicy Bypass -File $installer -Quiet
-        if ($LASTEXITCODE -eq 0) { Write-Host '[5/5] echo-host plugin deployed' -ForegroundColor Green }
-        else { Write-Host '[!] echo-host plugin deployment failed (ECHO panel still works standalone)' -ForegroundColor Yellow }
-    } catch {
-        Write-Host "[!] echo-host plugin deployment threw: $_" -ForegroundColor Yellow
-    }
-}
+# 5. (retired 2026-09-17) The DSH Desktop host plugin (echo-host) is no longer
+#    deployed. ECHO starts through scripts\start.ps1 / scripts\startup.ps1 (its own
+#    autostart) and the Ctrl+Shift+E dashboard is ECHO's own .NET sidebar.
+#    Details: plugin/README.md
 
 Write-Host ''
 Write-Host '完成！启动:  scripts\start.ps1   （面板地址见 data\echo-port.txt）' -ForegroundColor Green

@@ -20,11 +20,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
 
-# Best-effort self-heal of the DSH Desktop plugin deployment (idempotent, quiet).
-$installer = Join-Path $PSScriptRoot 'install-echo-host-plugin.ps1'
-if (Test-Path $installer) {
-    try { & powershell -NoProfile -ExecutionPolicy Bypass -File $installer -Quiet } catch { }
-}
+# (retired 2026-09-17) The DSH Desktop host plugin (echo-host) is gone - see plugin/README.md.
 
 $py = Join-Path $root 'venv\Scripts\python.exe'
 # Prefer the ASCII junction (works around tools that cannot read non-ASCII paths).

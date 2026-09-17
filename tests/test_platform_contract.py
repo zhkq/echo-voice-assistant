@@ -3,7 +3,7 @@
 
 背景（2026-09-15 定的约定）
 --------------------------
-ECHO 的主平台是 Windows：热键、边条、PowerShell 启动链、DSH echo-host 插件全是
+ECHO 的主平台是 Windows：热键、边条、PowerShell 启动链全是
 Windows 实现。macOS 支持走 `mac/run_mac.py` 独立入口 —— 它在 `import app.main`
 **之前**把 `hotkey_mac` / `mac_runtime` 塞进 `sys.modules`、覆盖 `app.config.DEFAULTS`
 并给 TTS/通知打补丁，所以 `app/` 一行都不用改。

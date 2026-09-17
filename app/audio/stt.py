@@ -219,7 +219,7 @@ def _ascii_path_hint(exc):
 
     nagisa → dyNet 用窄字符 fopen 读模型文件，路径含中文时甩出来的只有一句
     "Could not read model from ...\\nagisa\\data\\nagisa_v001.model"，很难一眼看出是路径问题
-    （2026-09-15 事故：迁移后 ECHO_PYTHON/ECHO_PYTHONW 被指向中文路径下的 venv，
+    （2026-09-15 事故：迁移后 ECHO_PYTHON 被指向中文路径下的 venv，
     qwen3asr 每场会议都在这里炸，只剩 wav 没有转写）。
     命中时把修复方向直接附在异常后，见 docs/DEPLOY.md「路径尽量全英文」。
     """
@@ -234,8 +234,8 @@ def _ascii_path_hint(exc):
     except Exception:
         return ""
     return ("\n[stt] 根因：解释器/站点包位于非 ASCII 路径，nagisa(dyNet) 读不了这类路径下的模型文件。"
-            "请用指向 venv 的 ASCII 目录联接（junction）解释器启动 ECHO，并设置 ECHO_PYTHON 与 "
-            "ECHO_PYTHONW（DSH 的 echo-host 插件用后者拉起服务），详见 docs/DEPLOY.md。")
+            "请用指向 venv 的 ASCII 目录联接（junction）解释器启动 ECHO，并设置 ECHO_PYTHON，"
+            "详见 docs/DEPLOY.md。")
 
 
 def _get_qwen3asr(device="auto", model_name="Qwen/Qwen3-ASR-0.6B", forced_aligner=None):

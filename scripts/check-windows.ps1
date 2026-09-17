@@ -1,7 +1,7 @@
 # check-windows.ps1 - Windows smoke gate for ECHO (compile + import + contract + tests).
 #
 # WHY THIS EXISTS (2026-09-15): ECHO's primary platform is Windows (hotkey / sidebar /
-# PowerShell launchers / the DSH echo-host plugin), while the repo also carries macOS
+# PowerShell launchers), while the repo also carries macOS
 # support that lives in mac/ and is injected through its own entry point. Nothing used to
 # check that a change keeps the Windows path alive: a PR touching only "shared" files
 # (removed imports, a new path helper, SQLite write locking) can silently break Windows

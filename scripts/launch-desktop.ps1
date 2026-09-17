@@ -72,19 +72,13 @@ function Show-Error($text) {
 }
 Log "===== launch-desktop: start ECHO ====="
 
-# ---------- 0. self-heal the DSH Desktop plugin deployment ----------
-# DSH rebuilds <install>\resources\app.asar.unpacked on every upgrade and keeps its
-# own profile state; the echo-host registration lives in the active profile's patch
-# layer, so re-run the idempotent installer on every launch (it verifies the
-# composition with DSH's own loader and exits non-zero when that fails).
-$installer = Join-Path $PSScriptRoot 'install-echo-host-plugin.ps1'
-if (Test-Path $installer) {
-    try {
-        & powershell -NoProfile -ExecutionPolicy Bypass -File $installer -Quiet
-        if ($LASTEXITCODE -eq 0) { Log "echo-host plugin deployment OK" }
-        else { Log "echo-host plugin deployment FAILED (exit $LASTEXITCODE)" }
-    } catch { Log "echo-host plugin deployment threw: $_" }
-}
+# ---------- 0. (retired) DSH Desktop host plugin ----------
+# The echo-host DSH plugin was retired on 2026-09-17: DSH Desktop 2.0.9+ no longer
+# exposes the Electron main-process API to plugins (no sidebar window), DSH 2.0.11
+# ships its own profile plugin system, and the registration inside
+# <install>\resources\app.asar.unpacked was wiped by every upgrade. ECHO is started
+# by this script / scripts\startup.ps1 and its own autostart instead.
+# Details: plugin/README.md
 
 Add-Type -AssemblyName System.Windows.Forms | Out-Null
 

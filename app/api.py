@@ -134,17 +134,6 @@ class KeyCreateIn(BaseModel):
     name: str = "mobile"
 
 
-class GuardLogIn(BaseModel):
-    """echo-host 守护进程关键事件上报（面板「守护进程关键事件」栏数据源）。
-
-    支持单条 {level, message} 或批量 {events: [{level, message}, ...]}。
-    正常刷屏信息（ECHO stderr 转发、健康检查等）由 echo-host 侧过滤，不上报。
-    """
-    level: str = "info"
-    message: str = ""
-    events: list[dict] | None = None
-
-
 # ---------------------------------------------------------------- 状态与配置
 @router.get("/status")
 def api_status(_auth=Depends(optional_auth)):
@@ -930,31 +919,6 @@ def boot_component_stop(cid: str, _auth=Depends(optional_auth)):
 @router.get("/logs")
 def get_logs(limit: int = 200, level: str = "", source: str = "", _auth=Depends(optional_auth)):
     return {"items": db.list_logs(limit=min(limit, 1000), level=level, source=source)}
-
-
-@router.post("/guard/log")
-def guard_log(body: GuardLogIn, _auth=Depends(optional_auth)):
-    """接收 echo-host 守护进程的关键事件并入库（source=guard）。
-
-    仅本机 echo-host 调用；面板「启动」页签的「守护进程关键事件」栏
-    通过 GET /api/logs?source=guard 读取。
-    """
-    allowed = {"info", "warn", "error"}
-    items = body.events if body.events is not None else [
-        {"level": body.level, "message": body.message}]
-    n = 0
-    for it in items:
-        if not isinstance(it, dict):
-            continue
-        msg = str(it.get("message", "")).strip()
-        if not msg:
-            continue
-        lv = str(it.get("level", "info")).lower()
-        if lv not in allowed:
-            lv = "info"
-        db.add_log(lv, "guard", msg)
-        n += 1
-    return {"ok": True, "count": n}
 
 
 @router.get("/events")
