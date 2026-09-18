@@ -223,8 +223,22 @@ $zipName = "ECHO-$Profile-$Version-$stamp.zip"
 $zipPath = Join-Path $OutDir $zipName
 Say "compressing to $zipPath"
 Add-Type -AssemblyName System.IO.Compression.FileSystem
-[System.IO.Compression.ZipFile]::CreateFromDirectory(
-    $stage, $zipPath, [System.IO.Compression.CompressionLevel]::Optimal, $false)
+Add-Type -AssemblyName System.IO.Compression        # ZipArchiveMode / ZipArchive live here
+# Build the archive entry by entry instead of ZipFile.CreateFromDirectory: on Windows
+# the latter writes BACKSLASH entry names (mac\setup_mac.sh), and some macOS tools
+# (Finder, plain unzip) then create a file literally named "mac\setup_mac.sh"
+# instead of the directory. The zip spec wants forward slashes, and this package is
+# meant to be opened on a Mac.
+$zip = [System.IO.Compression.ZipFile]::Open($zipPath, [System.IO.Compression.ZipArchiveMode]::Create)
+try {
+    foreach ($f in (Get-ChildItem $stage -Recurse -File -Force | Sort-Object FullName)) {
+        $rel = $f.FullName.Substring($stage.Length + 1).Replace('\', '/')
+        [void][System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
+            $zip, $f.FullName, $rel, [System.IO.Compression.CompressionLevel]::Optimal)
+    }
+} finally {
+    $zip.Dispose()
+}
 
 # ---------------------------------------------------------------- verify output
 Say 'verifying the produced zip...'
