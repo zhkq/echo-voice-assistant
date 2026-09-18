@@ -24,7 +24,11 @@ def _open_input(device_id=-1, blocksize=0):
     依次尝试：指定设备 → 系统默认输入 → 遍历全部输入设备；
     只要「能打开」就用（不做环境电平筛选——蓝牙耳机麦克风静音时
     电平极低是正常的，误判会跳过用户实际使用的设备）。
-    排除系统默认输出设备（避免录到输出导致全零）。
+
+    默认输入用 device=None 交给 PortAudio 选，**不要**用 sd.default.device
+    的下标硬取：该 pair 是 (输入, 输出)，早期代码误取 [1]（输出设备）当输入，
+    还会把真正的默认输入排除掉，于是去开虚拟/接力设备（Oray、iPhone 麦克风），
+    在 macOS 上可能把 CoreAudio HAL 卡死。见 app/audio/wake.py 同样结论。
     """
     import sounddevice as sd
 
@@ -32,28 +36,18 @@ def _open_input(device_id=-1, blocksize=0):
         return sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="int16",
                               device=idx, blocksize=blocksize or 0)
 
-    out_default = None
-    try:
-        out_default = sd.default.device[0] if isinstance(sd.default.device, (list, tuple)) else None
-    except Exception:
-        pass
-
     candidates = []
     if device_id is not None and device_id >= 0:
         candidates.append(device_id)
-    try:
-        in_default = sd.default.device[1] if isinstance(sd.default.device, (list, tuple)) else None
-        if in_default is not None:
-            candidates.append(in_default)
-    except Exception:
-        pass
+    else:
+        candidates.append(None)  # 系统默认输入
     for d in sd.query_devices():
         if d["max_input_channels"] > 0:
             candidates.append(d["index"])
 
     seen = set()
     for idx in candidates:
-        if idx in seen or idx == out_default:
+        if idx in seen:
             continue
         seen.add(idx)
         try:
@@ -73,7 +67,7 @@ def list_input_devices():
 def default_input_device():
     import sounddevice as sd
     try:
-        return sd.default.device[1]
+        return sd.default.device[0]  # pair=(输入, 输出)，[0] 才是默认输入
     except Exception:
         return None
 
