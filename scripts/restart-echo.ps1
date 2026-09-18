@@ -1,4 +1,4 @@
-# restart-echo.ps1 - restart the ECHO service (stop, wait for the port to free, start).
+﻿# restart-echo.ps1 - restart the ECHO service (stop, wait for the port to free, start).
 #
 # WHO CALLS THIS: ECHO itself, from POST /api/system/restart -> app/runtime.py:restart_echo().
 # The API process cannot stop and restart itself, so it launches this script DETACHED

@@ -1,4 +1,4 @@
-# startup.ps1 - logon entry point for ECHO (Startup shortcut runs this).
+﻿# startup.ps1 - logon entry point for ECHO (Startup shortcut runs this).
 #
 # Goal: ECHO must come up on its own at every logon and must NOT depend on DSH
 # Desktop. A DSH Desktop upgrade then never affects ECHO.

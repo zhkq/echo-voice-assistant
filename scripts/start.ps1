@@ -1,4 +1,4 @@
-# start.ps1 - start the ECHO service.
+﻿# start.ps1 - start the ECHO service.
 #   foreground : powershell -File scripts\start.ps1
 #   background : powershell -File scripts\start.ps1 -Background
 #   supervised : powershell -File scripts\start.ps1 -Background -Supervise
