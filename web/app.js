@@ -1013,6 +1013,60 @@ $("#settingsForm").addEventListener("click", async (e) => {
   if (a) toast(a.available ? `${a.displayName} 可用` : `${a.displayName} 不可用：${a.reason || ""}`);
 });
 
+/* ---- 组件清单（2.0 / P2、D22、D23）----
+   数据来自 /api/components（组件内核），按 kind 分组展示：就绪状态、体积、获取方式；
+   不适用于本平台的组件（如 mac 上的 CUDA）**显示但标注原因**，不隐藏（D24）。 */
+async function renderComponentsCard(host) {
+  let data = null;
+  try {
+    data = await api("/api/components?includeBlocked=true");
+  } catch (e) {
+    host.innerHTML = `<div class="set-group"><div class="set-group-title">
+      <span class="set-arrow">▶</span><span>组件</span></div>
+      <div class="set-group-body muted">读取失败：${esc(e.message)}</div></div>`;
+    return;
+  }
+  const KIND_NAMES = { runtime: "运行时", accel: "加速", stt: "转写引擎", diarize: "说话人分离",
+                       wake: "唤醒", tts: "语音合成", agent: "智能体" };
+  const items = data.items || [];
+  const usable = items.filter((i) => i.applicable);
+  const ready = usable.filter((i) => i.ready === true);
+  const totalMb = usable.reduce((n, i) => n + (i.size_mb || 0), 0);
+  const badge = (i) => {
+    if (!i.applicable) return `<span class="muted">不适用</span>`;
+    if (i.ready === true) return `<span style="color:var(--ok,#3a3)">已就绪</span>`;
+    if (i.ready === false) return `<span class="muted">未安装</span>`;
+    return `<span class="muted">未知</span>`;
+  };
+  const rows = usable.map((i) => `<tr>
+      <td>${esc(KIND_NAMES[i.kind] || i.kind)}</td>
+      <td>${esc(i.name || i.id)}${i.required ? "（必装）" : ""}</td>
+      <td>${badge(i)}</td>
+      <td>${i.size_mb == null ? "-" : i.size_mb + " MB"}</td>
+      <td class="muted" style="font-size:12px">${esc(i.how || i.source || "")}</td>
+    </tr>`).join("");
+  const blocked = items.filter((i) => !i.applicable)
+    .map((i) => `<li>${esc(i.name || i.id)}：${esc(i.blockedReason || "不适用")}</li>`).join("");
+  host.innerHTML = `<div class="set-group" data-grp="components">
+    <div class="set-group-title" role="button" tabindex="0" aria-expanded="true">
+      <span class="set-arrow">▶</span><span>组件</span>
+      <span class="set-count">${ready.length}/${usable.length}</span>
+    </div>
+    <div class="set-group-body">
+      <div class="muted" style="margin:0 0 8px;font-size:12px">
+        平台 ${esc(data.platform)}${data.osVersion ? " " + esc(data.osVersion) : ""} ·
+        全部装齐约 ${totalMb} MB · 已就绪 ${ready.length} 个，未装 ${usable.length - ready.length} 个。
+        主包只含核心代码，模型与引擎按需安装（向导会逐项问）。
+      </div>
+      <table class="muted" style="width:100%;font-size:12px">
+        <thead><tr><th>类别</th><th>组件</th><th>状态</th><th>体积</th><th>获取方式</th></tr></thead>
+        <tbody>${rows}</tbody></table>
+      ${blocked ? `<div class="muted" style="margin-top:8px;font-size:12px">
+        本平台不适用（显示但不可选）：<ul style="margin:4px 0 0 18px">${blocked}</ul></div>` : ""}
+    </div>
+  </div>`;
+}
+
 /* ---- 环境体检 + 迁移已有会议（2.0 / P1、D20、D21） ----
    只读展示四类根（ECHO/DATA/MEETINGS/MODELS）的存在、可写性与磁盘余量，并提供
    "迁移已有会议"。迁移的用法刻意设计成两步：**先改上面的「会议目录」并保存，再点迁移**——
@@ -1128,7 +1182,11 @@ async function loadSettings() {
       envHost.id = "envCheckHost";
       form.appendChild(envHost);
       renderEnvCheck(envHost);
-    } catch (e) { /* 体检卡片失败不能拖垮设置页 */ }
+      const compHost = document.createElement("div");
+      compHost.id = "componentsHost";
+      form.appendChild(compHost);
+      renderComponentsCard(compHost);
+    } catch (e) { /* 体检/组件卡片失败不能拖垮设置页 */ }
     _syncSettingsCollapseAll();     // 重绘后让顶部双箭头跟着当前折叠状态
   } catch (e) { toast("加载设置失败：" + e.message); }
 }
