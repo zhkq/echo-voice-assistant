@@ -1,0 +1,119 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 945" width="1200" height="945" font-family="'Microsoft YaHei','PingFang SC','Hiragino Sans GB','Noto Sans CJK SC',sans-serif">
+  <rect x="0" y="0" width="1200" height="945" fill="#ffffff"/>
+
+  <!-- 标题 -->
+  <text x="40" y="42" font-size="21" font-weight="bold" fill="#1a202c">ECHO 交付分层：主包 与 可选组件</text>
+  <text x="40" y="68" font-size="13" fill="#4a5568">主包只有代码（≈10–20 MB）；运行时、全部模型与推理引擎都在组件里 —— 用户按机器与环境挑</text>
+  <text x="1160" y="68" font-size="11.5" fill="#718096" text-anchor="end">实线框 = 交付物　|　橙 = 必装　|　绿 = 可选　|　灰 = 运行期数据</text>
+
+  <!-- ===================== ① 主包 ===================== -->
+  <rect x="40" y="92" width="1120" height="180" rx="10" fill="#eef4fc" stroke="#2b6cb0" stroke-width="1.6"/>
+  <text x="62" y="120" font-size="15" font-weight="bold" fill="#1a365d">① 主包　ECHO-主包-&lt;平台&gt;-&lt;版本&gt;.zip</text>
+  <text x="1138" y="120" font-size="13.5" font-weight="bold" fill="#2b6cb0" text-anchor="end">≈ 10–20 MB（可走邮件传递）</text>
+
+  <rect x="60" y="134" width="190" height="58" rx="6" fill="#ffffff" stroke="#90b4dd"/>
+  <text x="74" y="156" font-size="12.5" font-weight="bold" fill="#2b6cb0">app/</text>
+  <text x="74" y="176" font-size="11" fill="#4a5568">后端代码（后端与业务）</text>
+
+  <rect x="262" y="134" width="200" height="58" rx="6" fill="#ffffff" stroke="#90b4dd"/>
+  <text x="276" y="156" font-size="12.5" font-weight="bold" fill="#2b6cb0">web/ + sidebar/</text>
+  <text x="276" y="176" font-size="11" fill="#4a5568">面板 SPA · 右缘边条</text>
+
+  <rect x="474" y="134" width="260" height="58" rx="6" fill="#ffffff" stroke="#90b4dd"/>
+  <text x="488" y="156" font-size="12.5" font-weight="bold" fill="#2b6cb0">providers/</text>
+  <text x="488" y="176" font-size="11" fill="#4a5568">多上游派发路由（原 dsh-failover）</text>
+
+  <rect x="746" y="134" width="150" height="58" rx="6" fill="#ffffff" stroke="#90b4dd"/>
+  <text x="760" y="156" font-size="12.5" font-weight="bold" fill="#2b6cb0">env/</text>
+  <text x="760" y="176" font-size="11" fill="#4a5568">环境体检</text>
+
+  <rect x="908" y="134" width="212" height="58" rx="6" fill="#ffffff" stroke="#90b4dd"/>
+  <text x="922" y="156" font-size="12.5" font-weight="bold" fill="#2b6cb0">components/</text>
+  <text x="922" y="176" font-size="11" fill="#4a5568">组件管理器 + manifest 清单</text>
+
+  <rect x="60" y="200" width="1060" height="42" rx="6" fill="#ffffff" stroke="#90b4dd"/>
+  <text x="74" y="226" font-size="11.5" fill="#2d3748">启动器：install.bat / install.ps1（Windows）　·　已公证 .app（macOS）　→　环境检测与准备 → 装 runtime-core → 拉起面板</text>
+
+  <text x="62" y="262" font-size="12.5" font-weight="bold" fill="#c53030">× 不含运行时　　× 不含任何模型　　× 不含 DSH 内核（Desktop 与 dsh CLI 都不在）</text>
+
+  <!-- 箭头 ① -->
+  <line x1="600" y1="272" x2="600" y2="308" stroke="#2b6cb0" stroke-width="2"/>
+  <polygon points="600,316 595,306 605,306" fill="#2b6cb0"/>
+  <text x="614" y="298" font-size="11.5" fill="#2b6cb0">① 启动器安装组件：在线拉取（PyPI / ModelScope / hf-mirror）或指定离线组件包</text>
+
+  <!-- ===================== ② 组件层 ===================== -->
+  <rect x="40" y="324" width="1120" height="306" rx="10" fill="#f2fbf5" stroke="#2f855a" stroke-width="1.6"/>
+  <text x="62" y="352" font-size="15" font-weight="bold" fill="#22543d">② 可选组件（清单驱动；安装器与面板「组件」页共用同一套逻辑）</text>
+  <text x="1138" y="352" font-size="12" fill="#2f855a" text-anchor="end">按 OS + arch 分发</text>
+
+  <!-- runtime-core 必装 -->
+  <rect x="60" y="368" width="300" height="170" rx="8" fill="#fff7e6" stroke="#c05621" stroke-width="1.8"/>
+  <text x="76" y="392" font-size="14" font-weight="bold" fill="#7b341e">runtime-core</text>
+  <text x="344" y="392" font-size="12" font-weight="bold" fill="#c05621" text-anchor="end">必装 · 不可取消</text>
+  <text x="76" y="416" font-size="11.5" fill="#7b341e">自带可重定位 CPython + Web/API 基础依赖</text>
+  <text x="76" y="436" font-size="11.5" fill="#7b341e">≈100 MB 下载 / ≈250 MB 安装（含 PortAudio）</text>
+  <text x="76" y="456" font-size="11.5" fill="#7b341e">不需要系统预装 Python、不需修 pyvenv.cfg</text>
+  <line x1="76" y1="472" x2="344" y2="472" stroke="#f6ad55" stroke-width="1"/>
+  <text x="76" y="492" font-size="11.5" font-weight="bold" fill="#c05621">缺它 → 服务起不来、面板打不开</text>
+  <text x="76" y="512" font-size="11" fill="#975a16">所有其它组件都依赖它</text>
+
+  <!-- 转写引擎 -->
+  <rect x="376" y="368" width="240" height="170" rx="8" fill="#ffffff" stroke="#9ae6b4"/>
+  <text x="392" y="392" font-size="13" font-weight="bold" fill="#22543d">转写引擎</text>
+  <text x="392" y="416" font-size="11.5" fill="#2d3748">stt-sherpa　　　189 MB</text>
+  <text x="392" y="436" font-size="11.5" fill="#2d3748">stt-whisper-base　141 MB</text>
+  <text x="392" y="456" font-size="11.5" fill="#2d3748">stt-sensevoice　 896 MB</text>
+  <text x="392" y="476" font-size="11.5" fill="#2d3748">stt-qwen3asr　　3.6 GB</text>
+  <text x="392" y="502" font-size="11" fill="#718096">命令引擎与会议引擎可分别选</text>
+  <text x="392" y="520" font-size="11" fill="#718096">不装 → 本地转写不可用</text>
+
+  <!-- 可选功能 -->
+  <rect x="628" y="368" width="240" height="170" rx="8" fill="#ffffff" stroke="#9ae6b4"/>
+  <text x="644" y="392" font-size="13" font-weight="bold" fill="#22543d">可选功能</text>
+  <text x="644" y="416" font-size="11.5" fill="#2d3748">wake-kws　　　　40 MB</text>
+  <text x="644" y="436" font-size="11.5" fill="#2d3748">diarize-pyannote　gated</text>
+  <text x="644" y="456" font-size="11.5" fill="#2d3748">accel-cuda　　 2–3 GB</text>
+  <text x="644" y="476" font-size="11.5" fill="#2d3748">stt-remote　　　指向远程</text>
+  <text x="644" y="502" font-size="11" fill="#718096">pyannote 需自行同意授权，</text>
+  <text x="644" y="520" font-size="11" fill="#718096">不随包分发；CUDA 仅 win/linux</text>
+
+  <!-- 服务与 Agent -->
+  <rect x="880" y="368" width="240" height="170" rx="8" fill="#ffffff" stroke="#9ae6b4"/>
+  <text x="896" y="392" font-size="13" font-weight="bold" fill="#22543d">服务与 Agent</text>
+  <text x="896" y="416" font-size="11.5" fill="#2d3748">tts-online　　　edge-tts 等</text>
+  <text x="896" y="436" font-size="11.5" fill="#2d3748">agent-dsh　　　 72 MB wheel</text>
+  <text x="896" y="456" font-size="11.5" fill="#2d3748">agent-codebuddy 探测既有 CLI</text>
+  <text x="896" y="476" font-size="11.5" fill="#2d3748">（LLM 直连服务 = 配置项）</text>
+  <text x="896" y="502" font-size="11" fill="#718096">含标准 dsh CLI + Node 运行时（非 Desktop）</text>
+  <text x="896" y="520" font-size="11" fill="#718096">带 web profile：想要 GUI 不必装 Desktop</text>
+
+  <!-- 底部说明band -->
+  <rect x="60" y="552" width="1060" height="60" rx="6" fill="#ffffff" stroke="#9ae6b4"/>
+  <text x="74" y="574" font-size="11.5" fill="#2d3748">已随系统、无需安装：Windows SAPI · macOS say · WebView2（缺失时边条自动降级为浏览器面板）</text>
+  <text x="74" y="598" font-size="11.5" fill="#2d3748">依赖关系：全部组件都依赖 runtime-core；其余组件互不依赖，可任意取舍、随时补装或卸载</text>
+
+  <!-- 箭头 ② -->
+  <line x1="600" y1="630" x2="600" y2="662" stroke="#2f855a" stroke-width="2"/>
+  <polygon points="600,670 595,660 605,660" fill="#2f855a"/>
+  <text x="614" y="654" font-size="11.5" fill="#2f855a">② 组件与数据落位（mac 上必须在 .app 之外，否则破坏公证签名封条）</text>
+
+  <!-- ===================== ③ 数据区 ===================== -->
+  <rect x="40" y="678" width="1120" height="132" rx="10" fill="#f7f8fa" stroke="#718096" stroke-width="1.6"/>
+  <text x="62" y="704" font-size="15" font-weight="bold" fill="#2d3748">③ 数据区（可写；与包解耦，升级只换主包）</text>
+  <text x="76" y="730" font-size="12" fill="#2d3748">Windows　　{安装目录}\data · \models · \components</text>
+  <text x="76" y="754" font-size="12" fill="#2d3748">macOS　　　~/Library/Application Support/ECHO/{data, models, components, runtime-core, dsh-home}</text>
+  <text x="76" y="780" font-size="11.5" fill="#4a5568">会议目录 / 笔记库 / 模型目录均可由用户指定（D20）；echo.db 永不跟随网络盘</text>
+
+  <!-- ===================== 底部两个说明 ===================== -->
+  <rect x="40" y="826" width="680" height="102" rx="10" fill="#fffaf0" stroke="#d69e2e" stroke-width="1.5"/>
+  <text x="60" y="852" font-size="13.5" font-weight="bold" fill="#744210">不装 agent-dsh 时（能力边界）</text>
+  <text x="60" y="876" font-size="11.5" fill="#744210">✔　语音链路 · 本地转写 · 会议录音与转写 · 面板 · 离线播报 · 右缘边条</text>
+  <text x="60" y="896" font-size="11.5" fill="#744210">✔　纪要生成（只要配了直连 OpenAI 兼容服务 —— 不需要 DSH）</text>
+  <text x="60" y="916" font-size="11.5" font-weight="bold" fill="#c05621">✘　技能调用 · 工具执行 · 归档到笔记库</text>
+
+  <rect x="740" y="826" width="420" height="102" rx="10" fill="#fff5f5" stroke="#c53030" stroke-width="1.5" stroke-dasharray="6 4"/>
+  <text x="760" y="852" font-size="13.5" font-weight="bold" fill="#9b2c2c">不进交付链（虚线）</text>
+  <text x="760" y="876" font-size="11.5" fill="#9b2c2c">DSH Desktop（655 MB Electron 壳）</text>
+  <text x="760" y="896" font-size="11.5" fill="#9b2c2c">→ 想要 GUI 手动对话，自行安装即可</text>
+  <text x="760" y="916" font-size="11.5" fill="#9b2c2c">→ ECHO 只依赖 agent-dsh 这个 72 MB 组件</text>
+</svg>

@@ -1,0 +1,89 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 890" width="1200" height="890" font-family="'Microsoft YaHei','PingFang SC','Hiragino Sans GB','Noto Sans CJK SC',sans-serif">
+  <rect x="0" y="0" width="1200" height="890" fill="#ffffff"/>
+
+  <text x="40" y="42" font-size="21" font-weight="bold" fill="#1a202c">Windows 与 macOS：哪里一样、哪里不一样</text>
+  <text x="40" y="68" font-size="13" fill="#4a5568">分层结构完全一致（同一份 app/ 与 web/、同一份组件清单、同一套向导）；差在外壳、落位、权限与签名</text>
+  <text x="1160" y="68" font-size="11.5" fill="#718096" text-anchor="end">蓝 = Windows　|　紫 = macOS　|　灰底 = 完全相同的部分</text>
+
+  <!-- 列头 -->
+  <rect x="56" y="80" width="536" height="24" rx="4" fill="#ebf4ff" stroke="#90b4dd"/>
+  <text x="72" y="97" font-size="12.5" font-weight="bold" fill="#2b6cb0">Windows（win-x64）</text>
+  <rect x="608" y="80" width="536" height="24" rx="4" fill="#faf5ff" stroke="#b794f4"/>
+  <text x="624" y="97" font-size="12.5" font-weight="bold" fill="#553c9a">macOS（macos-arm64 / macos-x64）</text>
+
+  <!-- ============ A 主包形态 ============ -->
+  <rect x="40" y="112" width="1120" height="140" rx="8" fill="#f7f8fa" stroke="#e2e8f0"/>
+  <text x="56" y="136" font-size="13" font-weight="bold" fill="#2d3748">A　主包的形态</text>
+
+  <rect x="56" y="148" width="536" height="88" rx="6" fill="#ffffff" stroke="#90b4dd"/>
+  <text x="72" y="170" font-size="12.5" font-weight="bold" fill="#2b6cb0">压缩包 + 安装脚本（免安装、可便携）</text>
+  <text x="72" y="192" font-size="11.5" fill="#2d3748">ECHO-主包-win-x64-&lt;版本&gt;.zip　≈10–20 MB</text>
+  <text x="72" y="214" font-size="11.5" fill="#2d3748">install.bat / install.ps1　→　解压到 D:\ECHO（目录可任意搬）</text>
+
+  <rect x="608" y="148" width="536" height="88" rx="6" fill="#ffffff" stroke="#b794f4"/>
+  <text x="624" y="170" font-size="12.5" font-weight="bold" fill="#553c9a">已签名 + 已公证的 .dmg（内含 .app）</text>
+  <text x="624" y="192" font-size="11.5" fill="#2d3748">ECHO-&lt;版本&gt;.dmg　≈10–20 MB（含 Swift 边条宿主）</text>
+  <text x="624" y="214" font-size="11.5" fill="#2d3748">双击挂载 → 拖入「应用程序」；不会出现"无法验证开发者"</text>
+
+  <!-- ============ B 组件落位 ============ -->
+  <rect x="40" y="264" width="1120" height="124" rx="8" fill="#f7f8fa" stroke="#e2e8f0"/>
+  <text x="56" y="288" font-size="13" font-weight="bold" fill="#2d3748">B　组件装到哪</text>
+
+  <rect x="56" y="300" width="536" height="72" rx="6" fill="#ffffff" stroke="#90b4dd"/>
+  <text x="72" y="322" font-size="12.5" font-weight="bold" fill="#2b6cb0">位置自由</text>
+  <text x="72" y="344" font-size="11.5" fill="#2d3748">{安装目录}\components\　或直接进 runtime\Lib\site-packages</text>
+  <text x="72" y="364" font-size="11.5" fill="#718096">没有签名封条约束</text>
+
+  <rect x="608" y="300" width="536" height="72" rx="6" fill="#fffaf0" stroke="#d69e2e"/>
+  <text x="624" y="322" font-size="12.5" font-weight="bold" fill="#744210">必须在 .app 之外（硬约束）</text>
+  <text x="624" y="344" font-size="11.5" fill="#2d3748">~/Library/Application Support/ECHO/components/</text>
+  <text x="624" y="364" font-size="11.5" fill="#718096">写进 bundle 会破坏公证封条；runtime 用 overlay 加载</text>
+
+  <!-- ============ C 数据区 ============ -->
+  <rect x="40" y="400" width="1120" height="124" rx="8" fill="#f7f8fa" stroke="#e2e8f0"/>
+  <text x="56" y="424" font-size="13" font-weight="bold" fill="#2d3748">C　数据区（echo.db · 会议 · 模型 · dsh-home）</text>
+
+  <rect x="56" y="436" width="536" height="72" rx="6" fill="#ffffff" stroke="#90b4dd"/>
+  <text x="72" y="458" font-size="12.5" font-weight="bold" fill="#2b6cb0">在程序目录内（便携）</text>
+  <text x="72" y="480" font-size="11.5" fill="#2d3748">{安装目录}\data · \models · \components</text>
+  <text x="72" y="500" font-size="11.5" fill="#718096">整目录拷走即迁移（D18）</text>
+
+  <rect x="608" y="436" width="536" height="72" rx="6" fill="#ffffff" stroke="#b794f4"/>
+  <text x="624" y="458" font-size="12.5" font-weight="bold" fill="#553c9a">在用户目录（/Applications 只读）</text>
+  <text x="624" y="480" font-size="11.5" fill="#2d3748">~/Library/Application Support/ECHO/{data, models, dsh-home}</text>
+  <text x="624" y="500" font-size="11.5" fill="#718096">升级只替换 .app，数据天然不受影响（D18）</text>
+
+  <!-- ============ D 边条与宿主 ============ -->
+  <rect x="40" y="536" width="1120" height="140" rx="8" fill="#f7f8fa" stroke="#e2e8f0"/>
+  <text x="56" y="560" font-size="13" font-weight="bold" fill="#2d3748">D　右缘边条与常驻宿主</text>
+
+  <rect x="56" y="572" width="536" height="88" rx="6" fill="#ffffff" stroke="#90b4dd"/>
+  <text x="72" y="594" font-size="12.5" font-weight="bold" fill="#2b6cb0">.NET 7 WinForms + WebView2</text>
+  <text x="72" y="616" font-size="11.5" fill="#2d3748">随主包；需要 .NET 运行时；缺 WebView2 则降级为浏览器面板</text>
+  <text x="72" y="638" font-size="11.5" fill="#2d3748">热键由 ECHO 主进程注册（ctypes，无需额外系统授权）</text>
+  <text x="72" y="656" font-size="11" fill="#718096">没有"常驻宿主"这个概念</text>
+
+  <rect x="608" y="572" width="536" height="88" rx="6" fill="#ffffff" stroke="#b794f4"/>
+  <text x="624" y="594" font-size="12.5" font-weight="bold" fill="#553c9a">Swift AppKit + WKWebView 的 .app（独立签名 + 公证）</text>
+  <text x="624" y="616" font-size="11.5" fill="#2d3748">同一个 .app 兼任常驻宿主：持有全局热键与 TCC 授权（D19）</text>
+  <text x="624" y="638" font-size="11.5" fill="#2d3748">热键走 Carbon RegisterEventHotKey → 不需要辅助功能授权（D16）</text>
+  <text x="624" y="656" font-size="11" fill="#718096">收起面板也不丢热键</text>
+
+  <!-- ============ 完全相同 ============ -->
+  <rect x="40" y="688" width="1120" height="88" rx="8" fill="#f0fff4" stroke="#9ae6b4" stroke-width="1.6"/>
+  <text x="56" y="712" font-size="13" font-weight="bold" fill="#22543d">完全相同的部分（这是"一份代码两平台"的落点）</text>
+  <text x="72" y="736" font-size="11.5" fill="#2d3748">同一份 app/ 与 web/ 代码　·　同一份组件清单 manifest　·　同一套引导向导（面板内 Web UI，两平台复用）</text>
+  <text x="72" y="758" font-size="11.5" fill="#2d3748">同样的组件与体积　·　同样的能力边界：不装 agent-dsh 时纪要靠直连 LLM 仍可用，只有技能 / 工具 / 归档不可用</text>
+  <text x="72" y="776" font-size="11" fill="#718096">运行时不需要系统 Python、不需要预装 Node —— 两平台一致</text>
+
+  <!-- ============ 平台前提与专属 ============ -->
+  <rect x="40" y="788" width="536" height="76" rx="8" fill="#ebf4ff" stroke="#90b4dd"/>
+  <text x="56" y="810" font-size="12.5" font-weight="bold" fill="#1a365d">Windows 前提与专属</text>
+  <text x="56" y="830" font-size="11.5" fill="#2d3748">Windows 10 / 11 x64　·　VC++ 2015-2022 x64 运行库</text>
+  <text x="56" y="850" font-size="11.5" fill="#2d3748">accel-cuda 仅此平台可用　·　win-arm64 无 agent-dsh wheel</text>
+
+  <rect x="608" y="788" width="536" height="76" rx="8" fill="#faf5ff" stroke="#b794f4"/>
+  <text x="624" y="810" font-size="12.5" font-weight="bold" fill="#44337a">macOS 前提与专属</text>
+  <text x="624" y="830" font-size="11.5" fill="#2d3748">macOS 14.0+（D15）　·　首次需授予麦克风权限（TCC）</text>
+  <text x="624" y="850" font-size="11.5" fill="#2d3748">无 CUDA（device=cpu）　·　不需要 Homebrew / Xcode CLT</text>
+</svg>
