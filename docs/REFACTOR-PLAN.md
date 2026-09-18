@@ -1145,7 +1145,7 @@ ECHO 是常驻服务，Python 按需 import —— **在运行中的服务下面
 ```json
 { "current": "dev", "autoStopOthers": false,
   "instances": { "stable": { "root": "C:\\echo1.0" },
-                 "dev":    { "root": "C:\\...\\ECHO-public" } } }
+                 "dev":    { "root": "C:\\echo-dev" } } }
 ```
 
 `scripts/` 下的分工：
@@ -1257,29 +1257,45 @@ powershell -File scripts\switch-instance.ps1 -InstallAutostart
 2. ✅ 版本号收敛到单一来源 + `/api/status` 暴露版本 + `main` 打 **`v1.0.0`** 并发首个 Release（§13.3）；
 3. ✅ README 拆两段 + 三类人分流；并据 §13.4 决定**公开仓库不再提供整包**（§13.5）；
 4. ✅ 建 `2.0-dev`，本文档已提交进 `main`；**实例快速切换**（一个守护 + 一个开关）已实现并实测（§13.6.1）；
-5. ✅ 冻结稳定安装到 ASCII 路径 **`C:\echo1.0`** 并装上根守护自启（2026-09-18，见下）；
+5. ✅ 冻结稳定安装到 **`C:\echo1.0`**、开发树迁到 **`C:\echo-dev`**，并装上根守护自启（2026-09-18，见下）；
 6. ⬜ 打包脚本（`-Profile internal/public` + 构建期硬校验）与内网整包重做——**尚未做**。
 
-#### 已执行的冻结（2026-09-18 22:40）
+#### 已执行的冻结与搬迁（2026-09-18）
 
 | 项 | 结果 |
 |---|---|
-| 稳定版位置 | **`C:\echo1.0`**（纯 ASCII，不再需要 `.echo-venv` junction） |
+| 稳定版位置 | **`C:\echo1.0`** |
+| 开发版位置 | **`C:\echo-dev`**（原 `C:\Users\zhkq\Desktop\学习\ECHO-public`） |
 | 自启 | 启动文件夹的 `ECHO startup.lnk` 已重指向 `C:\echo1.0\scripts\echo-switch-startup.vbs` → 根守护；开机由 `current` 决定起哪个 |
-| 代码 | `robocopy`（排除 `data/models/venv/.git`）|
-| venv / models | **各自物理复制一份**（不共用 junction）——稳定版完全自足；给 2.0 装依赖不会污染它 |
-| 真实数据 | `data/`（3.42 GB、39 场会议）**搬到** `C:\echo1.0\data`；开发树改为空数据目录 |
+| 代码 / venv / models | **各自物理一份，不共用 junction**——两个树完全自足；给 2.0 装依赖不会污染稳定版 |
+| 真实数据 | `data/`（3.42 GB、39 场会议）**搬到** `C:\echo1.0\data`；开发树为空库 |
 | 复制耗时 | 约 20 GB / **48 秒**（同盘、`/MT:32`） |
 | 数据核对 | 搬迁后完全一致：meetings 39 / lines 16745 / commands 81 / speakers 195 / voiceprints 4 / schema_version 4 |
-| 解释器 | 稳定版进程用的是 `C:\echo1.0\venv\Scripts\pythonw.exe`（自己树内）——`ECHO_PYTHON` 规则改动生效 |
+| 两树端口 | **都是 18060**——错开执行，所以不必维护两套端口；技能/脚本按 `data\echo-port.txt` 找服务的逻辑完全不用改 |
 
-**开发树（`…\ECHO-public`）现在的状态**：代码与稳定版同源（皆为 v1.0.0），
-`data/` 为空库，`venv/`+`models/` 仍是它自己那份。要测 2.0 的**库迁移**，
-先把稳定版的库复制一份过去（**不要**指向真库）：
+**迁到 ASCII 路径之后，本地那套"绕中文路径"的手段全部退休**：
+
+- `ECHO_PYTHON`（用户环境变量）**已删除**；
+- `~/.echo-venv` junction（指向旧中文路径）**已删除**；
+- `scripts/start.ps1` / `startup.ps1` 的解释器规则改为：**只有本树路径含非 ASCII 时才借用
+  `ECHO_PYTHON`**（这正是它存在的唯一理由）。两棵树现在都是 ASCII，各用自己 `venv\`。
+  这条规则对将来把 ECHO 装在中文目录的同事仍然必要，所以保留。
+
+**开发树（`C:\echo-dev`）现在的状态**：代码与稳定版同源（皆为 v1.0.0），空库，
+`venv\`+`models\` 是自己那份。要测 2.0 的**库迁移**，先把稳定版的库复制一份过去
+（**不要**指向真库）：
 
 ```powershell
-robocopy C:\echo1.0\data "…\ECHO-public\data" echo.db
+robocopy C:\echo1.0\data C:\echo-dev\data echo.db
 ```
+
+> 迁移当天踩到的两个坑，已修在 `echo-instance-lib.ps1` 里（见提交信息）：
+> ① 边条是用 **`--url=http://127.0.0.1:<port>/`** 启动的，早先却按 `--port N` 匹配，
+> 于是停实例时漏掉边条、它锁着旧目录导致搬迁半途失败；
+> ② 切换脚本与根守护会**同时**拉起同一个实例的守护（切换窗口内两者都看到"实例已停"），
+> 现在 `Start-EchoInstance` 会先检查该树的守护是否已在运行。
+> 另外进程识别加了**进程类型**判据（`python*` / `powershell -File`），
+> 否则一段"命令行文本里提到这些路径"的诊断脚本会把实例数算多。
 
 
 ---

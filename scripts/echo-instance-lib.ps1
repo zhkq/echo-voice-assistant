@@ -114,9 +114,17 @@ function Get-EchoInstanceProcs([string]$root, $procs) {
     foreach ($p in $procs) {
         if (-not $p.CommandLine) { continue }
         $cl = $p.CommandLine.ToLower()
+        $nm = if ($p.Name) { $p.Name.ToLower() } else { '' }
         $kind = ''
-        if ($cl -like "*$r\scripts\startup.ps1*")       { $kind = 'supervisor' }
-        elseif ($cl -like "*$r\dsh-failover\proxy.py*") { $kind = 'router' }
+        # Match on process TYPE as well as path: a diagnostic shell whose command
+        # TEXT merely mentions these paths must not be counted as an instance
+        # (that mistake inflated "how many are running" more than once).
+        if ($nm -match '^python' -and $cl -like "*$r\dsh-failover\proxy.py*") {
+            $kind = 'router'
+        } elseif ($nm -match '^(powershell|pwsh)' -and $cl -like '*-file*' -and
+                  $cl -like "*$r\scripts\startup.ps1*") {
+            $kind = 'supervisor'
+        }
         if ($kind) {
             $role = if (Test-VenvLauncherStub $p) { 'stub' } else { 'real' }
             $hit += [pscustomobject]@{ PID = $p.ProcessId; Kind = $kind; Role = $role; CommandLine = $p.CommandLine }
@@ -136,11 +144,18 @@ function Get-EchoInstanceProcs([string]$root, $procs) {
     return $hit
 }
 
-function Get-EchoSidebars([int]$port, $procs) {
-    if ($port -le 0) { return @() }
+# The sidebar is launched as:
+#   <root>\sidebar\bin\Release\...\echo-sidebar.exe --url=http://127.0.0.1:<port>/ --width=450
+# NOTE it takes --url, NOT --port - an earlier matcher looked for "--port <n>" and
+# therefore never matched, which left a stray sidebar holding the old tree's exe
+# open and blocking a directory move. Match by EXECUTABLE PATH so a sidebar that
+# belongs to another tree is never touched.
+function Get-EchoSidebars([string]$root, $procs) {
+    $r = $root.TrimEnd('\').ToLower()
+    if (-not $r) { return @() }
     return @($procs | Where-Object {
         $_.Name -like 'echo-sidebar*' -and $_.CommandLine -and
-        $_.CommandLine -match "--port\s+$port(\s|$)"
+        $_.CommandLine.ToLower() -like "*$r\sidebar\*"
     } | ForEach-Object { [pscustomobject]@{ PID = $_.ProcessId; Kind = 'sidebar'; CommandLine = $_.CommandLine } })
 }
 
@@ -173,7 +188,7 @@ function Stop-EchoInstance {
     )
     $procs = Get-EchoProcSnapshot
     $port = Get-EchoPortFromFile $Root
-    $targets = @(Get-EchoInstanceProcs $Root $procs) + @(Get-EchoSidebars $port $procs)
+    $targets = @(Get-EchoInstanceProcs $Root $procs) + @(Get-EchoSidebars $Root $procs)
     if ($targets.Count -eq 0) { return $true }
 
     if (-not $SkipMeetingCheck -and (Test-EchoMeetingActive $port)) {
@@ -209,7 +224,15 @@ function Start-EchoInstance {
     if (-not (Test-Path $Root)) { & $Log "  ERROR: $Name root not found: $Root"; return 0 }
     $vbs = Join-Path $Root 'scripts\echo-startup.vbs'
     $sup = Join-Path $Root 'scripts\startup.ps1'
-    if (Test-Path $vbs) {
+    # Skip launching if this install's own supervisor is ALREADY running. Both the
+    # root supervisor and switch-instance.ps1 call this function, and during a
+    # switch there is a window in which both see the instance as down - spawning
+    # twice left two watchdog loops racing (2026-09-18 observed).
+    $existing = @(Get-EchoInstanceProcs $Root (Get-EchoProcSnapshot) |
+                  Where-Object { $_.Kind -eq 'supervisor' })
+    if ($existing.Count -gt 0) {
+        & $Log "  $Name supervisor already running (pid $($existing[0].PID)) - not launching another"
+    } elseif (Test-Path $vbs) {
         & $Log "  launch $Name supervisor (hidden) via echo-startup.vbs"
         if (-not $DryRun) { Start-Process wscript.exe -ArgumentList "`"$vbs`"" -WorkingDirectory $Root }
     } elseif (Test-Path $sup) {
