@@ -29,6 +29,7 @@ param(
     [switch]$Status,
     [switch]$Init,
     [switch]$InstallAutostart,
+    [switch]$SyncTooling,
     [switch]$DryRun,
     [switch]$Force,
     [string]$Config = '',
@@ -111,6 +112,50 @@ if ($InstallAutostart) {
     exit 0
 }
 
+# --------------------------------------------------- sync tooling
+# The two installs are INDEPENDENT physical copies, so a fix to the operational
+# scripts (this file, echo-instance-lib.ps1, echo-supervisor.ps1, startup.ps1,
+# start.ps1, ...) does NOT reach the other tree by itself. That matters because
+# the frozen tree's own scripts\startup.ps1 IS the watchdog that runs there.
+#
+# Direction: FROM the tree this script lives in, unless -Use names another one.
+# Do NOT default to config.current - that is the instance that is RUNNING, not
+# the tree you are developing in (getting this backwards once reverted the dev
+# tree's tooling to the frozen copy).
+# Only scripts\*.ps1 / *.cmd are copied; app\ and web\ are never touched, so a
+# frozen install stays frozen.
+if ($SyncTooling) {
+    $fromRoot = $repoRoot
+    if ($Use) { $fromRoot = Get-EchoInstanceRoot $cfg $Use }
+    if (-not (Test-Path $fromRoot)) { Fail "source root not found: $fromRoot"; exit 1 }
+    $srcDir = Join-Path $fromRoot 'scripts'
+    Say "  sync tooling from: $fromRoot"
+    foreach ($n in $names) {
+        $toRoot = Get-EchoInstanceRoot $cfg $n
+        if ((Test-Path $toRoot) -and
+            ((Resolve-Path $toRoot).Path -eq (Resolve-Path $fromRoot).Path)) { continue }
+        if (-not (Test-Path $toRoot)) { Warn2 "$n : root missing, skipped"; continue }
+        $dstDir = Join-Path $toRoot 'scripts'
+        foreach ($pat in @('*.ps1', '*.cmd')) {
+            Get-ChildItem (Join-Path $srcDir $pat) -File -ErrorAction SilentlyContinue | ForEach-Object {
+                $dst = Join-Path $dstDir $_.Name
+                $same = (Test-Path $dst) -and
+                        ((Get-FileHash $_.FullName).Hash -eq (Get-FileHash $dst).Hash)
+                if ($same) { Say "    $n : $($_.Name) unchanged" }
+                else {
+                    Say "    $n : copy $($_.Name)"
+                    if (-not $DryRun) { Copy-Item $_.FullName $dst -Force }
+                }
+            }
+        }
+    }
+    Say ''
+    Warn2 "restart the other install's watchdog for startup.ps1 changes to take effect:"
+    Say  "      switch-instance.ps1 <name>"
+    Say ''
+    exit 0
+}
+
 # --------------------------------------------------- status
 function Show-Status {
     Say ''
@@ -186,9 +231,32 @@ foreach ($n in $names) {
 }
 
 # 3) make sure the target is up
+# IMPORTANT: decide by "does the TARGET TREE own the running ECHO", not by the
+# port alone - both installs share the same port (18060) in this serial setup, so
+# a port probe reports "already running" while the OTHER install is the one
+# serving. That bug made a dry run claim dev was up while stable held the port,
+# and would silently skip starting the target after a half-finished stop.
 $port = Get-EchoPortFromFile $targetRoot
-if (Test-EchoPortListening $port) {
-    Ok "$target already running on port $port"
+$tprocs = @(Get-EchoInstanceProcs $targetRoot (Get-EchoProcSnapshot) | Where-Object { $_.Kind -eq 'echo' })
+if ($tprocs.Count -gt 0 -and (Test-EchoPortListening $port)) {
+    Ok "$target already running on port $port (pid $($tprocs[0].PID))"
+} elseif ($tprocs.Count -gt 0) {
+    Ok "$target is already running (pid $($tprocs[0].PID)) - waiting for port $port"
+    for ($i = 0; $i -lt $WaitSeconds; $i++) {
+        Start-Sleep -Seconds 1
+        if (Test-EchoPortListening $port) { break }
+    }
+    if (Test-EchoPortListening $port) { Ok "$target is up on port $port" }
+    else { Fail "$target never became reachable on port $port"; exit 1 }
+} elseif (Test-EchoPortListening $port) {
+    if ($DryRun) {
+        Say "  [dry] port $port is currently served by another instance; the stop above would free it"
+        Say "  [dry] would start $target"
+    } else {
+        Fail "$target is NOT running, but port $port is already served by something else."
+        Say  "    stop it first (switch-instance.ps1 -Status), then retry."
+        exit 1
+    }
 } else {
     Say "  start $target"
     $startLog = { param($m) Say $m }

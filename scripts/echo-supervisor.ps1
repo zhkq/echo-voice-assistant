@@ -80,16 +80,29 @@ function Invoke-Pass {
     $procs = Get-EchoProcSnapshot
     $port = Get-EchoPortFromFile $root
     $listening = Test-EchoPortListening $port
+    $mine = @(Get-EchoInstanceProcs $root $procs | Where-Object { $_.Kind -eq 'echo' })
+    $owned = ($mine.Count -gt 0)
 
-    # 1) keep the ACTIVE instance up
-    if ($listening) {
-        $ec = @($procs | Where-Object { $_.ProcessId -eq (Get-EchoPidFileValue $root) }).Count
+    # 1) keep the ACTIVE instance up.
+    # Decide by OWNERSHIP, not by the port alone: both installs use the same port
+    # (18060) in this serial setup, so "something is listening" does NOT mean the
+    # active instance is the thing listening.
+    if ($owned -and $listening) {
         $rp = @(Get-EchoInstanceProcs $root $procs | Where-Object { $_.Kind -eq 'router' -and $_.Role -ne 'stub' }).Count
         $sp = @(Get-EchoInstanceProcs $root $procs | Where-Object { $_.Kind -eq 'supervisor' }).Count
-        SupLog "active '$desired' healthy on port $port (echo=$ec router=$rp supervisor=$sp)"
-    } elseif (Test-EchoInstanceAlive $root $procs) {
-        SupLog "active '$desired' is booting (pid alive, port $port not ready yet)"
+        SupLog "active '$desired' healthy on port $port (echo=1 router=$rp supervisor=$sp)"
+    } elseif ($owned) {
+        SupLog "active '$desired' is booting (pid $($mine[0].PID), port $port not ready yet)"
+    } elseif ($listening) {
+        # The port is served by an instance that is NOT the active one. Starting
+        # ours would only fight for the port, so just say so (rate-limited).
+        if (-not $script:WarnedPort) {
+            $script:WarnedPort = $true
+            SupLog "port $port is served by another instance, but active is '$desired'." 'WARN'
+            SupLog "  run: switch-instance.ps1 $desired   (or switch back)" 'WARN'
+        }
     } else {
+        $script:WarnedPort = $false
         SupLog "active '$desired' is down - starting"
         $p = Start-EchoInstance -Root $root -Name $desired -WaitSeconds $WaitSeconds -DryRun:$DryRun `
                                 -Log { param($m) SupLog $m }

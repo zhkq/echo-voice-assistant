@@ -117,12 +117,16 @@ function Get-EchoInstanceProcs([string]$root, $procs) {
         $nm = if ($p.Name) { $p.Name.ToLower() } else { '' }
         $kind = ''
         # Match on process TYPE as well as path: a diagnostic shell whose command
-        # TEXT merely mentions these paths must not be counted as an instance
-        # (that mistake inflated "how many are running" more than once).
-        if ($nm -match '^python' -and $cl -like "*$r\dsh-failover\proxy.py*") {
+        # TEXT merely mentions these paths must not be counted - and must not be
+        # KILLED (a diagnostic script that also grepped for startup.ps1 killed
+        # itself here on 2026-09-18). Real watchdogs are started with -File, and
+        # `-Command` is how an interactive/diagnostic shell arrives.
+        if ($nm -match '^python' -and $cl -like "*$r\dsh-failover\proxy.py*" -and
+            $p.ProcessId -ne $PID) {
             $kind = 'router'
-        } elseif ($nm -match '^(powershell|pwsh)' -and $cl -like '*-file*' -and
-                  $cl -like "*$r\scripts\startup.ps1*") {
+        } elseif ($nm -match '^(powershell|pwsh)' -and $cl -notlike '*-command*' -and
+                  $cl -like '*-file*' -and $cl -like "*$r\scripts\startup.ps1*" -and
+                  $p.ProcessId -ne $PID) {
             $kind = 'supervisor'
         }
         if ($kind) {

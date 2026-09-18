@@ -50,6 +50,25 @@ function SupLog([string]$message) {
 
 SupLog "===== startup.ps1 begin (restartDelay=${RestartDelaySeconds}s, consoleHidden=$($script:hiddenConsole)) ====="
 
+# ---- 0. single-instance guard for the WATCHDOG itself ----
+# Both the root supervisor (echo-supervisor.ps1) and scripts\switch-instance.ps1
+# call Start-EchoInstance. In the window where both see this install as "down"
+# they can each spawn a watchdog, leaving two loops racing for the same port
+# (observed 2026-09-18). A check-then-launch guard cannot close that window; a
+# kernel mutex can - the second watchdog fails to create it and exits at once.
+# Released automatically when this process ends.
+$sha = [System.Security.Cryptography.SHA1]::Create()
+$hex = [System.BitConverter]::ToString(
+    $sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($root.ToLower()))).Replace('-', '')
+$mtxName = 'Local\ECHO-watchdog-' + $hex.Substring(0, 16)
+$createdNew = $false
+$script:WatchdogMutex = New-Object System.Threading.Mutex($true, $mtxName, [ref]$createdNew)
+if (-not $createdNew) {
+    SupLog "another watchdog for this install is already running - exiting"
+    exit 0
+}
+SupLog "watchdog mutex acquired ($mtxName)"
+
 # ---- 1. (retired 2026-09-17) DSH plugin registration self-heal ----
 # The echo-host DSH plugin is retired; nothing to heal. ECHO's own autostart is
 # this script (see the Startup shortcut -> scripts\echo-startup.vbs).
