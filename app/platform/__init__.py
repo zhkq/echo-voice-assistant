@@ -49,3 +49,42 @@ def dangerous_prefixes() -> list:
         return list(fn()) if callable(fn) else []
     except Exception:
         return []
+
+
+# ---------------------------------------------------------------- 清单用的平台标记
+# 组件清单（components/*.json 与 app/components.py 的内置清单）要声明"支持哪些平台"，
+# 但**不能**在 app/ 的其它地方写出平台特征串（D12 契约）。所以清单统一用中立标记
+# （win32 / macos / linux），由本模块负责翻译与版本探测——平台分支只留在接缝里。
+MANIFEST_NAMES = {"win32": "win32", "darwin": "macos", "linux": "linux"}
+MANIFEST_TO_INTERNAL = {v: k for k, v in MANIFEST_NAMES.items()}
+
+
+def manifest_name(name: str = "") -> str:
+    """内部平台名（= ``current()`` 的取值）→ 清单标记。已是标记则原样返回。"""
+    if not name:
+        return MANIFEST_NAMES.get(current(), current())
+    if name in MANIFEST_TO_INTERNAL:
+        return name
+    return MANIFEST_NAMES.get(name, name)
+
+
+def internal_name(token: str) -> str:
+    """清单标记 → 内部平台名（``macos`` → ``darwin``）。"""
+    return MANIFEST_TO_INTERNAL.get(token, token)
+
+
+def os_version(name: str = "") -> tuple:
+    """系统版本（用于清单的 ``min_os``）。取不到返回空元组 = 不做版本限制。
+
+    ``name`` 收内部平台名；不给则当前平台。
+    """
+    n = name or current()
+    try:
+        import platform as _p
+        if n == "darwin":
+            return tuple(int(x) for x in _p.mac_ver()[0].split(".")[:3] if x.isdigit())
+        if n == "win32":
+            return tuple(int(x) for x in _p.version().split(".")[:3] if x.isdigit())
+    except Exception:
+        pass
+    return ()

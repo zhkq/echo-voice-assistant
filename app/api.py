@@ -881,6 +881,22 @@ def api_paths_migrate_meetings(body: MigrateMeetingsIn, _auth=Depends(optional_a
                                       dry_run=bool(body.dryRun))
 
 
+# ---------------------------------------------------------------- 组件清单（2.0 / P2、D22、D23）
+# 与 1.x 的 /api/models **并存**：老的模型面板与技能继续用 /api/models，新的「组件」页签用这里。
+
+@router.get("/components")
+def api_components(platform: str = "", includeBlocked: bool = False,
+                   _auth=Depends(optional_auth)):
+    """组件清单：平台过滤后的组件 + 就绪状态（面板「组件」页签的数据面）。
+
+    ``platform`` 可覆盖（默认当前平台，便于预览/测试其他平台）；
+    ``includeBlocked=true`` 时把不适用于本平台的组件也带回来并给出 ``blockedReason``
+    —— D24 要求向导里"显示但禁用并说明原因"，不隐藏。
+    """
+    from app import components
+    return components.catalog(platform=platform or None, include_blocked=bool(includeBlocked))
+
+
 # ---------------------------------------------------------------- 声纹库（常用联系人）
 # 会议里把说话人改名为联系人即自动入库（voiceprintAutoEnroll）；
 # 库里的样本可在面板「说话人管理」查看/删除，这里是对应的 REST 入口。
