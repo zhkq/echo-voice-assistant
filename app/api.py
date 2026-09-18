@@ -840,6 +840,47 @@ def meeting_title_save(mid: int, body: MeetingTitleIn, _auth=Depends(optional_au
     return {"ok": ok, "title": title, "message": msg}
 
 
+# ---------------------------------------------------------------- 存储路径（2.0 / P1、D20、D21）
+# 面板「环境体检」页的数据面 + 「迁移已有会议」动作。
+# 语义与 /api/models 等既有端点一致：业务性失败走 HTTP 200 + {"ok": false, "error"/"message"}。
+
+@router.get("/paths/env")
+def api_paths_env(_auth=Depends(optional_auth)):
+    """环境体检：四类根、存在性/可写性、磁盘余量、当前端口、会议目录计数。
+
+    任何一项取不到都不抛异常——配置坏掉时这个页面恰恰最需要能打开。
+    """
+    from app import pathadmin
+    return pathadmin.env_report()
+
+
+class MigrateMeetingsIn(BaseModel):
+    #: 目标目录。留空 = 用配置里的 meetingsDir。
+    target: str = ""
+    #: 源目录。留空 = 当前生效的会议目录。
+    #: 面板改配置时应当**显式传旧值**——改完配置后"当前目录"已经是新目录了，
+    #: 那时再迁移会得到"无需迁移"（这是正确且安全的回答，但用户想搬的其实是旧目录）。
+    source: str = ""
+    dryRun: bool = False
+
+
+@router.post("/paths/migrate-meetings")
+def api_paths_migrate_meetings(body: MigrateMeetingsIn, _auth=Depends(optional_auth)):
+    """把已有会议搬到 ``target``：只搬会议目录格式的目录，目标同名则跳过不覆盖。
+
+    ``dryRun=true`` 只报告不动手（面板先用它给用户看"会搬哪些、跳过哪些"）。
+    """
+    from app import pathadmin, paths
+    target = (body.target or "").strip()
+    if not target:
+        if not paths.active_roots()["meetingsConfigured"]:
+            return {"ok": False, "error": "没有指定目标目录，配置里也没有设置 meetingsDir",
+                    "source": "", "target": "", "moved": [], "skipped": [], "failed": [], "others": []}
+        target = paths.meetings_root()
+    return pathadmin.migrate_meetings(target, source=(body.source or "").strip() or None,
+                                      dry_run=bool(body.dryRun))
+
+
 # ---------------------------------------------------------------- 声纹库（常用联系人）
 # 会议里把说话人改名为联系人即自动入库（voiceprintAutoEnroll）；
 # 库里的样本可在面板「说话人管理」查看/删除，这里是对应的 REST 入口。
