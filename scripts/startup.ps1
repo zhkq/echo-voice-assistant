@@ -1,4 +1,4 @@
-﻿# startup.ps1 - logon entry point for ECHO (Startup shortcut runs this).
+# startup.ps1 - logon entry point for ECHO (Startup shortcut runs this).
 #
 # Goal: ECHO must come up on its own at every logon and must NOT depend on DSH
 # Desktop. A DSH Desktop upgrade then never affects ECHO.
@@ -56,8 +56,13 @@ SupLog "===== startup.ps1 begin (restartDelay=${RestartDelaySeconds}s, consoleHi
 
 # ---- 2/3. resolve pythonw and keep ECHO alive ----
 $py = Join-Path $root 'venv\Scripts\python.exe'
-$pyAlt = $env:ECHO_PYTHON   # 可选：非 ASCII 路径下的解释器覆盖，见 docs/DEPLOY.md
-if ($pyAlt -and (Test-Path $pyAlt)) { $py = $pyAlt }
+# ECHO_PYTHON exists for ONE reason: a tree whose own path is non-ASCII cannot let
+# funasr/nagisa read model files through it, so it points at an ASCII junction of
+# the venv. A tree whose path is ALREADY ASCII must not borrow it - otherwise a
+# frozen stable install (e.g. C:\echo1.0) silently runs on the dev tree's venv,
+# and installing dependencies for 2.0 would contaminate the stable install.
+$pyAlt = $env:ECHO_PYTHON
+if ($pyAlt -and (Test-Path $pyAlt) -and ($root -match '[^\x20-\x7E]')) { $py = $pyAlt }
 if (-not (Test-Path $py)) { SupLog "venv missing - cannot start ECHO: $py"; exit 1 }
 $pyw = $py -replace 'python\.exe$', 'pythonw.exe'
 if (-not (Test-Path $pyw)) { SupLog "pythonw missing: $pyw"; exit 1 }

@@ -1,4 +1,4 @@
-﻿# start.ps1 - start the ECHO service.
+# start.ps1 - start the ECHO service.
 #   foreground : powershell -File scripts\start.ps1
 #   background : powershell -File scripts\start.ps1 -Background
 #   supervised : powershell -File scripts\start.ps1 -Background -Supervise
@@ -23,9 +23,13 @@ $root = Split-Path $PSScriptRoot -Parent
 # (retired 2026-09-17) The DSH Desktop host plugin (echo-host) is gone - see plugin/README.md.
 
 $py = Join-Path $root 'venv\Scripts\python.exe'
-# Prefer the ASCII junction (works around tools that cannot read non-ASCII paths).
-$pyAlt = $env:ECHO_PYTHON   # 可选：非 ASCII 路径下的解释器覆盖，见 docs/DEPLOY.md
-if ($pyAlt -and (Test-Path $pyAlt)) { $py = $pyAlt }
+# ECHO_PYTHON exists for ONE reason: a tree whose own path is non-ASCII cannot let
+# funasr/nagisa read model files through it, so it points at an ASCII junction of
+# the venv. A tree whose path is ALREADY ASCII must not borrow it - otherwise a
+# frozen stable install (e.g. C:\echo1.0) silently runs on the dev tree's venv,
+# and installing dependencies for 2.0 would contaminate the stable install.
+$pyAlt = $env:ECHO_PYTHON
+if ($pyAlt -and (Test-Path $pyAlt) -and ($root -match '[^\x20-\x7E]')) { $py = $pyAlt }
 if (-not (Test-Path $py)) { Write-Host 'venv missing - run scripts\setup.ps1 first' -ForegroundColor Red; exit 1 }
 
 $logDir = Join-Path $root 'data\logs'
@@ -77,7 +81,7 @@ function Start-EchoOnce([switch]$Quiet) {
     $p = Start-Process -FilePath $pyw -ArgumentList @('-m', 'app.main') `
         -WorkingDirectory $root -RedirectStandardOutput $outLog `
         -RedirectStandardError $errLog -PassThru
-    if (-not $Quiet) { Write-Host "ECHO started in background (PID $($p.Id))  panel: 见 data\echo-port.txt" }
+    if (-not $Quiet) { Write-Host "ECHO started in background (PID $($p.Id))  panel port: see data\echo-port.txt" }
     return $p
 }
 
