@@ -150,12 +150,33 @@ app = create_app()
 def main():
     import socket
     import uvicorn
+    from app import single_instance
+
+    # 防重复实例（第 1 道、权威判定）：内核级单实例锁。
+    # 为什么不用端口探测当权威：探测与 uvicorn 真正 bind 之间有竞态窗口，
+    # 两个实例同时启动会双双重入 —— 2026-09-18 实测 18060 上有一个在服务、
+    # 另一个不监听却活着，还在后台加载 SenseVoice（CPU 空转）。锁由内核持有、
+    # 进程退出即释放，没有竞态也没有残留。详见 app/single_instance.py。
+    _lock_ok, _lock_detail = single_instance.acquire("echo", db.DATA_DIR)
+    if not _lock_ok:
+        # 拒绝路径必须"又短又不出错"：不碰数据库、不做任何可能阻塞的事。
+        # 2026-09-18 实测教训：这里若调用 db.init()/db.add_log()，在另一个实例
+        # 正持着 SQLite 写锁时本进程会**卡住不退**，于是又留下一个"活着但不监听"
+        # 的僵尸（CPU 0、内存 6MB）。诊断信息走 stdout，由守护脚本的重定向收走。
+        print(f"检测到另一个 ECHO 实例已在运行（{_lock_detail}），本实例退出", flush=True)
+        sys.exit(0)
+
+    # 尽早写 pid：让守护脚本（scripts\startup.ps1）能区分"正在启动"与"没在跑"，
+    # 从而不会在 ECHO 加载模型的那几十秒里再拉起一个。
+    try:
+        manager.echo_write_pid()
+    except Exception:
+        pass
+
     db.init()
     port = int(settings.get("serverPort", 8970))
-    # 防重复实例：若端口已被其他 ECHO 实例监听（手动重复启动、自启与桌面快捷方式
-    # 撞车等），本进程为冗余 —— 尽早退出，避免：
-    #   1) 抢占端口失败白加载模型（GPU/CPU 浪费）；
-    #   2) 启动恢复把活实例正在录的会议误标为 interrupted。
+    # 防重复实例（第 2 道、兜底）：端口是否已被监听。锁只能挡住"也用这把锁的实例"，
+    # 挡不住老版本进程或别的程序占着端口，所以这一层保留 —— 但它是兜底，不是权威。
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.settimeout(0.5)
     try:
@@ -163,12 +184,7 @@ def main():
     finally:
         s.close()
     if occupied:
-        print(f"检测到端口 {port} 已被其他 ECHO 实例占用，本实例退出（重复实例）")
-        try:
-            db.add_log("warn", "server",
-                       f"启动中止：端口 {port} 已被其他 ECHO 实例占用（重复实例）")
-        except Exception:
-            pass
+        print(f"检测到端口 {port} 已被其他 ECHO 实例占用，本实例退出（重复实例）", flush=True)
         sys.exit(0)
     # 把实际监听端口写到 data\echo-port.txt：外部脚本（launch-desktop.ps1 等）
     # 与 DSH 插件据此定位服务，从而不必把端口写死在多处。

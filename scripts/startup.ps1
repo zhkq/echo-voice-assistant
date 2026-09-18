@@ -94,8 +94,27 @@ function Test-EchoPort([int]$port = 8970) {
     finally { $c.Dispose() }
 }
 
-# ECHO has its own anti-duplicate guard (it exits when the port is taken), so this
-# probe-then-start dance can never race with a live instance.
+# ECHO writes data\echo.pid as soon as it takes its single-instance lock, i.e.
+# BEFORE it loads models. During that window the port is not listening yet, so a
+# port-only probe would spawn a second instance. Checking the pid closes it.
+# 2026-09-18: the live host had exactly two such leftovers (one serving, one
+# alive-but-not-listening and still loading SenseVoice in the background).
+function Test-EchoAlive {
+    $pidFile = Join-Path $root 'data\echo.pid'
+    if (-not (Test-Path $pidFile)) { return $false }
+    $p = Get-Content $pidFile -Raw -ErrorAction SilentlyContinue
+    if ($null -eq $p) { return $false }
+    $p = $p.Trim()
+    if ($p -notmatch '^[0-9]+$') { return $false }
+    $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$p" -ErrorAction SilentlyContinue
+    if (-not $proc) { return $false }
+    # Guard against pid reuse: only accept a process that is really ECHO.
+    if ($proc.CommandLine -notmatch 'app\.main') { return $false }
+    return $true
+}
+
+# ECHO has its own single-instance lock (see app\single_instance.py) plus a port
+# check, so this probe-then-start dance can no longer race with a live instance.
 function Start-EchoOnce {
     $p = Start-Process -FilePath $pyw -ArgumentList @('-m', 'app.main') `
         -WorkingDirectory $root -RedirectStandardOutput $outLog `
@@ -107,11 +126,18 @@ $echoPort = Resolve-EchoPort $root
 SupLog "resolved ECHO port=$echoPort"
 
 if (Test-EchoPort $echoPort) { SupLog "ECHO already listening on $echoPort" }
+elseif (Test-EchoAlive) { SupLog "ECHO process is alive but not listening yet (booting)" }
 else { SupLog "ECHO not listening at logon - starting" }
 
 while ($true) {
     if (Test-EchoPort $echoPort) { Start-Sleep -Seconds 15; continue }
-    SupLog "ECHO not listening - starting"
+    if (Test-EchoAlive) {
+        # Booting (loading models) - do NOT start a second instance.
+        SupLog "ECHO alive but port not ready - waiting"
+        Start-Sleep -Seconds 3
+        continue
+    }
+    SupLog "ECHO not running - starting"
     try {
         $p = Start-EchoOnce
         SupLog "started pid=$($p.Id)"
@@ -123,7 +149,11 @@ while ($true) {
         if (Test-EchoPort $echoPort) { break }
     }
     if (-not (Test-EchoPort $echoPort)) {
-        SupLog "still not listening after 30s - retry in ${RestartDelaySeconds}s"
-        Start-Sleep -Seconds $RestartDelaySeconds
+        if (Test-EchoAlive) {
+            SupLog "still booting after 30s - keep waiting"
+        } else {
+            SupLog "still not listening after 30s - retry in ${RestartDelaySeconds}s"
+            Start-Sleep -Seconds $RestartDelaySeconds
+        }
     }
 }

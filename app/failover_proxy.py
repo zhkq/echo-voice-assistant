@@ -25,10 +25,12 @@ import urllib.request
 PROXY_DEFAULT_PORT = 8899
 GUARD_INTERVAL = 30.0        # 守护复查间隔（秒）
 READY_WAIT_MAX = 6.0         # 拉起后等待健康检查的最长时间（秒）
+LAUNCH_COOLDOWN = 45.0       # 两次拉起之间的最小间隔（秒），见 ensure_running
 
 _lock = threading.Lock()
 _guard = None                # 守护线程
 _stop_evt = None
+_last_launch = 0.0           # 上次拉起时刻（单调时钟），用于冷却
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PROXY_SCRIPT = os.path.join(BASE_DIR, "dsh-failover", "proxy.py")
@@ -67,9 +69,22 @@ def _pythonw():
 
 
 def ensure_running():
-    """探测模型路由，不在则拉起。幂等。返回 (ok, detail)。"""
+    """探测模型路由，不在则拉起。幂等。返回 (ok, detail)。
+
+    两个细节都是为了不再产生"活着但不监听"的僵尸路由（2026-09-18 实测到过）：
+
+    * 拉起前有**冷却**：路由启动要读配置、连上游探测，几秒内 `/health` 还不通。
+      原来每个 30s 复查周期都会再 Popen 一次，等于每半分钟制造一个重复进程；
+    * 真正防重复靠 `dsh-failover/proxy.py` 里的**内核级单实例锁**（重复实例在
+      uvicorn 之前就退出），本函数只是不再无谓地反复去抢。
+    """
+    global _last_launch
     if proxy_online():
         return True, "模型路由已在运行"
+    now = time.monotonic()
+    if now - _last_launch < LAUNCH_COOLDOWN:
+        return True, "模型路由刚拉起过，等待就绪（冷却 %.0fs）" % (
+            LAUNCH_COOLDOWN - (now - _last_launch))
     script = PROXY_SCRIPT
     if not os.path.isfile(script):
         return False, "模型路由脚本缺失: %s" % script
@@ -81,6 +96,7 @@ def ensure_running():
     pyw = _pythonw()
     out = os.path.join(LOG_DIR, "proxy-echo.log")
     err = os.path.join(LOG_DIR, "proxy-echo.err.log")
+    _last_launch = now          # 先记时刻：即使 Popen 抛异常也要进冷却，避免风暴
     try:
         with open(out, "a", encoding="utf-8") as fo, open(err, "a", encoding="utf-8") as fe:
             subprocess.Popen(

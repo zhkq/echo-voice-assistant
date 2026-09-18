@@ -757,6 +757,17 @@ def main():
 
     import uvicorn
 
+    # 单实例：本进程历史上被两个启动方同时拉起过（启动文件夹的「ECHO 模型路由」快捷方式
+    # 与 ECHO 的 boot 组件）——结果一个 bind 成功，另一个不监听却活着占资源。
+    # 用内核级锁串行化：重复实例在这里立即退出，不再走到 uvicorn。
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from app.single_instance import acquire as _acquire_single_instance
+    _ok, _detail = _acquire_single_instance(
+        "echo-router", os.path.dirname(os.path.abspath(__file__)))
+    if not _ok:
+        print(f"检测到另一个模型路由实例已在运行（{_detail}），本实例退出", flush=True)
+        return
+
     app, _client = create_app(cfg)
     uvicorn.run(app, host=cfg.host, port=cfg.port, log_level="info")
 
