@@ -60,3 +60,6 @@ mac/sidebar/build/
 
 # ---- 依赖锁文件：本仓库的依赖来源是 requirements.txt + pyproject.toml ----
 uv.lock
+
+# ---- 由 scripts/install-desktop-shortcut.ps1 从 web/icon-512.png 生成 ----
+assets/echo.ico

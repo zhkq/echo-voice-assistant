@@ -21,9 +21,38 @@ $lnk.TargetPath = 'powershell.exe'
 $lnk.Arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$target`""
 $lnk.WorkingDirectory = $root
 $lnk.Description = 'ECHO 个人助理：一键启动（后台）+ 自动拉起 DSH + 打开面板'
-# 图标：优先 python.exe，兜底默认
-$icon = Join-Path $root 'venv\Scripts\python.exe'
-if (Test-Path $icon) { $lnk.IconLocation = "$icon,0" }
+# 图标：用 ECHO 自己的图标（从 web\icon-512.png 生成 assets\echo.ico）。
+# 不提交 .ico 到仓库：它是可复现的派生物，每次运行本脚本重新生成即可。
+# 这样桌面上的几个 ECHO 快捷方式一眼可辨，而不是都顶着通用 Python 图标。
+function Get-EchoIcon([string]$Root) {
+    $ico = Join-Path $Root 'assets\echo.ico'
+    $png = Join-Path $Root 'web\icon-512.png'
+    if (-not (Test-Path $png)) { return '' }
+    if ((Test-Path $ico) -and ((Get-Item $ico).LastWriteTime -ge (Get-Item $png).LastWriteTime)) {
+        return $ico
+    }
+    try {
+        Add-Type -AssemblyName System.Drawing
+        $dir = Split-Path $ico -Parent
+        if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+        $img = [System.Drawing.Image]::FromFile($png)
+        $bmp = New-Object System.Drawing.Bitmap 64, 64
+        $g = [System.Drawing.Graphics]::FromImage($bmp)
+        $g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+        $g.DrawImage($img, 0, 0, 64, 64)
+        $g.Dispose()
+        $icon = [System.Drawing.Icon]::FromHandle($bmp.GetHicon())
+        $fs = [System.IO.File]::Create($ico)
+        $icon.Save($fs); $fs.Close()
+        $img.Dispose(); $bmp.Dispose()
+        return $ico
+    } catch {
+        Write-Host "（图标生成失败，用默认图标：$_）"
+        return ''
+    }
+}
+$icon = Get-EchoIcon $root
+if ($icon) { $lnk.IconLocation = "$icon,0" }
 else { $lnk.IconLocation = "$env:SystemRoot\System32\shell32.dll,220" }
 $lnk.Save()
 Write-Host "已创建桌面快捷方式: $lnkPath"
