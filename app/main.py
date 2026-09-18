@@ -38,6 +38,7 @@ from fastapi import FastAPI
 from fastapi.responses import FileResponse
 
 import app.db as db
+from app import __version__ as ECHO_VERSION
 from app.config import settings
 from app import manager, runtime, services
 from app.api import router
@@ -98,7 +99,7 @@ async def lifespan(app: FastAPI):
 
 
 def create_app():
-    app = FastAPI(title="ECHO 个人助理", version="0.1.0", lifespan=lifespan)
+    app = FastAPI(title="ECHO 个人助理", version=ECHO_VERSION, lifespan=lifespan)
 
     # 本地 API 来源守卫（2026-09-13 安全审计 CRITICAL-1）：
     # CORS 收紧到回环来源 + Host/Origin 中间件拒绝非回环请求（同时封 DNS Rebinding）。

@@ -1,5 +1,10 @@
 # ECHO — Windows 语音助手 + 会议纪要
 
+> **当前稳定版本：v1.0.0**（tag [`v1.0.0`](../../releases/tag/v1.0.0)）
+> · `main` 分支始终是稳定线，可放心 clone
+> · 下一代（核心+组件分层交付、双平台一等公民）正在 `2.0-dev` 分支开发，**请勿从该分支安装**
+> · 版本规划见 [docs/REFACTOR-PLAN.md](docs/REFACTOR-PLAN.md)
+
 Windows 上的一体化个人语音助手：**全局热键/唤醒词 → 本地转写 → 交给大模型执行 → 语音播报结论**，
 外加**会议录音 → 转写 → 说话人分离 → 自动生成纪要**，以及一个原生 SPA 控制面板。
 
@@ -15,6 +20,18 @@ ECHO 自己**不做推理**，只负责录音、转写、编排、面板与播�
 控制面板 → 组件状态与启停 / 设置 / 历史 / 会议管理 / 模型清单与下载
 模型路由 → 多个上游组成「模型组」按通道号顺序派发（DSH 侧只认 ECHO AUTO）
 ```
+
+## 先看这里：你属于哪一类？
+
+| 你是 | 走哪条路 | 入口 |
+|---|---|---|
+| **想直接用它**（同事 / 日常使用） | **交付包**，不用碰 git、不用装 Python | [→ 稳定版安装](#稳定版安装使用者) |
+| **想看代码 / 提 PR** | `git clone`（默认分支 `main` = 稳定版） | [→ 从源码运行](#从源码运行开发者) |
+| **只要某一版的源码** | Release 里的源码归档，可精确定版 | [github.com/NeoBigZhou/echo-voice-assistant/releases](../../releases) |
+
+> 仓库**不含模型权重**（`models/` 已 gitignore），且首次安装要拉约 7 GB 依赖。
+> 所以**普通使用者请走交付包**，从源码跑适合开发者。
+
 
 ## 本地 / 联网（重要：哪些数据会出网）
 
@@ -70,24 +87,19 @@ ECHO 自己**不做推理**，只负责录音、转写、编排、面板与播�
 | 模型路由 | 本机 OpenAI 兼容代理（`dsh-failover/`，默认 `127.0.0.1:8899`，可被 `config.json` 的 `port` 覆盖）：多上游派发 + 探测 + 熔断 |
 | 执行层 | DeepSeek Harness Desktop 2.x 本地 API（默认 `http://127.0.0.1:43120`） |
 
-## 快速开始
+## 稳定版安装（使用者）
 
-```powershell
-git clone https://github.com/zhkq/echo-voice-assistant.git
-cd echo-voice-assistant
+**推荐路线：用交付包，不需要 git、不需要预装 Python。**
 
-python -m venv venv
-.\venv\Scripts\python.exe -m pip install -r requirements.txt
-# 有 NVIDIA 显卡时（可选，转写提速明显）：
-#   .\venv\Scripts\python.exe -m pip install torch --index-url https://download.pytorch.org/whl/cu128
+1. **拿到交付包**。仓库不含模型权重，整包约 8.8 GB，因此它不放在 Release 里
+   （GitHub Release 单个文件上限 2 GiB）。获取方式见
+   **[Releases 页面](../../releases/latest)** 的说明，或直接找维护者（内网共享盘 / 网盘）。
+2. 把交付包 zip 与 `install.bat`、`install.ps1` 放在**同一个文件夹**里。
+3. **双击 `install.bat`**，按提示走完 8 步：环境/磁盘检查 → 找 zip → 选安装目录 →
+   解压 → venv 初始化建库 → 自检 → 快捷方式 + 开机自启 → DSH 检测。
 
-powershell -File scripts\setup.ps1              # 校验 venv/依赖/模型 + 建库（一次性）
-powershell -File scripts\start.ps1 -Background  # 后台启动
-powershell -File scripts\start-all.ps1          # 或：一键（含 DSH 检查）
-# 打开面板：http://127.0.0.1:<端口>（默认 8970；实际端口见 data\echo-port.txt）
-```
-
-开机自启：`powershell -File scripts\install-autostart.ps1`（卸载加 `-Remove`）。
+   装完会自动建议下一步（建议把安装目录放在**纯英文路径**，如 `D:\ECHO`）。
+4. 打开面板：`http://127.0.0.1:<端口>`（实际端口见安装目录下的 `data\echo-port.txt`）。
 
 首次使用建议：
 
@@ -96,12 +108,12 @@ powershell -File scripts\start-all.ps1          # 或：一键（含 DSH 检查�
 3. 面板 → **启动**：查看各组件状态，缺什么点什么（DSH 执行引擎需要另行安装 DSH Desktop）；
 4. 想在 DSH 里用**模型路由**：面板 → **模型路由** 页签配置通道，再到 DSH 把模型选成 `ECHO AUTO`。
 
-更细的安装、显卡、非 ASCII 路径、开机自启、边条编译、插件部署见 **[docs/DEPLOY.md](docs/DEPLOY.md)**；
-逐项核对清单见 **[docs/新机器部署指南.md](docs/新机器部署指南.md)**。
+逐项核对清单见 **[docs/新机器部署指南.md](docs/新机器部署指南.md)**；
+排错、显卡、非 ASCII 路径、开机自启、边条编译见 **[docs/DEPLOY.md](docs/DEPLOY.md)**。
 
-### macOS（精简支持）
+### macOS
 
-macOS 使用独立入口，以原生 AppKit / WKWebView 浮动框替代 Windows 边条：
+macOS 交付包走同一套流程，使用独立入口，以原生 AppKit / WKWebView 浮动框替代 Windows 边条：
 
 ```bash
 mac/setup_mac.sh
@@ -112,6 +124,35 @@ mac/start_mac.sh
 浮动框可运行 `bash mac/build_sidebar.sh` 构建（需要 Apple Command Line Tools）；
 旧用户在设置里将 `panelOpenMode` 改为 `sidebar` 后，重启 ECHO 即可随服务启动。
 限制和权限设置见 **[mac/README.md](mac/README.md)**。
+
+## 从源码运行（开发者）
+
+```powershell
+git clone https://github.com/NeoBigZhou/echo-voice-assistant.git
+cd echo-voice-assistant
+git checkout v1.0.0          # 可选：锁定到某个稳定版（不切 = main，同样是稳定线）
+
+python -m venv venv
+.\venv\Scripts\python.exe -m pip install -r requirements.txt
+# 有 NVIDIA 显卡时（可选，转写提速明显）：
+#   .\venv\Scripts\python.exe -m pip install torch --index-url https://download.pytorch.org/whl/cu128
+
+powershell -File scripts\setup.ps1              # 校验 venv/依赖/模型 + 建库（一次性）
+powershell -File scripts\start.ps1 -Background  # 后台启动
+powershell -File scripts\start-all.ps1          # 或：一键（含 DSH 检查）
+# 打开面板：http://127.0.0.1:<端口>（默认 8970；实际端口见 data\echo-port.txt）
+
+# 开发自检（推送前也会自动跑）：编译 + 导入冒烟 + 跨平台契约 + 全部单测 + ruff
+powershell -File scripts\check-windows.ps1
+```
+
+开机自启：`powershell -File scripts\install-autostart.ps1`（卸载加 `-Remove`）。
+模型仍需自行获取（面板 → 设置 → 模型），仓库不含权重。
+
+> **注意**：`main` 是稳定线；`2.0-dev` 是下一代开发分支，**不要从它安装**。
+> 版本号唯一权威来源是 `app/__init__.py:__version__`（`tests/test_version.py` 兜住一致性），
+> 发版流程见 [docs/REFACTOR-PLAN.md §13](docs/REFACTOR-PLAN.md)。
+
 
 ## 目录结构
 

@@ -11,6 +11,7 @@ from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Uploa
 from pydantic import BaseModel
 
 import app.db as db
+from app import __version__ as _ECHO_VERSION
 from app.config import settings
 from app import assistant, manager, meeting, runtime, services, worklog
 from app.audio import recorder
@@ -19,6 +20,15 @@ from app.audio import tts as tts_mod
 from app.pathutil import safe_under as _safe_under
 
 router = APIRouter(prefix="/api")
+
+
+def _echo_version():
+    """ECHO 版本号（唯一权威来源是 app/__init__.py:__version__）。
+
+    以前这里和 app/main.py 各写一份字面量，发版时对不上号 —— 面板显示的版本
+    与 tag / 交付包名不一致，报障时无法确认用户跑的是哪一版。见 REFACTOR-PLAN §13.3。
+    """
+    return _ECHO_VERSION
 
 
 # ---------------------------------------------------------------- 音频转 16k wav（外部转写用）
@@ -156,7 +166,7 @@ def api_status(_auth=Depends(optional_auth)):
         # 命令流当前阶段（listening/transcribing/running）：面板据此给"说话"按钮做动效
         "busyPhase": assistant._busy_owner.get("phase"),
         "uptime": services.uptime(),
-        "version": "0.1.0",
+        "version": _echo_version(),
     }
 
 
