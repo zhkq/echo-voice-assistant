@@ -1257,8 +1257,30 @@ powershell -File scripts\switch-instance.ps1 -InstallAutostart
 2. ✅ 版本号收敛到单一来源 + `/api/status` 暴露版本 + `main` 打 **`v1.0.0`** 并发首个 Release（§13.3）；
 3. ✅ README 拆两段 + 三类人分流；并据 §13.4 决定**公开仓库不再提供整包**（§13.5）；
 4. ✅ 建 `2.0-dev`，本文档已提交进 `main`；**实例快速切换**（一个守护 + 一个开关）已实现并实测（§13.6.1）；
-5. ⬜ 冻结稳定安装到 ASCII 路径（如 `C:\echo1.0`）并 `switch-instance.ps1 -InstallAutostart`——**尚未做**；
+5. ✅ 冻结稳定安装到 ASCII 路径 **`C:\echo1.0`** 并装上根守护自启（2026-09-18，见下）；
 6. ⬜ 打包脚本（`-Profile internal/public` + 构建期硬校验）与内网整包重做——**尚未做**。
+
+#### 已执行的冻结（2026-09-18 22:40）
+
+| 项 | 结果 |
+|---|---|
+| 稳定版位置 | **`C:\echo1.0`**（纯 ASCII，不再需要 `.echo-venv` junction） |
+| 自启 | 启动文件夹的 `ECHO startup.lnk` 已重指向 `C:\echo1.0\scripts\echo-switch-startup.vbs` → 根守护；开机由 `current` 决定起哪个 |
+| 代码 | `robocopy`（排除 `data/models/venv/.git`）|
+| venv / models | **各自物理复制一份**（不共用 junction）——稳定版完全自足；给 2.0 装依赖不会污染它 |
+| 真实数据 | `data/`（3.42 GB、39 场会议）**搬到** `C:\echo1.0\data`；开发树改为空数据目录 |
+| 复制耗时 | 约 20 GB / **48 秒**（同盘、`/MT:32`） |
+| 数据核对 | 搬迁后完全一致：meetings 39 / lines 16745 / commands 81 / speakers 195 / voiceprints 4 / schema_version 4 |
+| 解释器 | 稳定版进程用的是 `C:\echo1.0\venv\Scripts\pythonw.exe`（自己树内）——`ECHO_PYTHON` 规则改动生效 |
+
+**开发树（`…\ECHO-public`）现在的状态**：代码与稳定版同源（皆为 v1.0.0），
+`data/` 为空库，`venv/`+`models/` 仍是它自己那份。要测 2.0 的**库迁移**，
+先把稳定版的库复制一份过去（**不要**指向真库）：
+
+```powershell
+robocopy C:\echo1.0\data "…\ECHO-public\data" echo.db
+```
+
 
 ---
 
