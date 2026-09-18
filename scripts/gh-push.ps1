@@ -39,7 +39,7 @@ $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
 Set-Location $root
 
-$repoUrl = 'https://github.com/NeoBigZhou/echo-voice-assistant.git'
+$repoUrl = 'https://github.com/zhkq/echo-voice-assistant.git'
 
 # GitHub front IPs (they rotate - always probe, never trust a remembered one).
 # Ordered roughly by how good they historically are from CN networks, but the probe re-sorts.

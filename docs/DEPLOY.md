@@ -1,7 +1,7 @@
 # 部署指南（Windows）
 
 从零把 ECHO 跑起来。全程只需要 Windows 10/11 + Python；**执行指令 / 生成纪要**这一步需要另外装
-[DSH Desktop](https://github.com/NeoBigZhou)（可选，不装也能用转写、会议、面板）。
+**DSH Desktop**（可选，不装也能用转写、会议、面板）。
 
 ---
 
@@ -31,7 +31,7 @@
 ## 1. 取代码 + 建 venv
 
 ```powershell
-git clone https://github.com/NeoBigZhou/echo-voice-assistant.git
+git clone https://github.com/zhkq/echo-voice-assistant.git
 cd echo-voice-assistant
 
 python -m venv venv

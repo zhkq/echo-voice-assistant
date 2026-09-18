@@ -3,7 +3,7 @@
 Windows 上的一体化个人语音助手：**全局热键/唤醒词 → 本地转写 → 交给大模型执行 → 语音播报结论**，
 外加**会议录音 → 转写 → 说话人分离 → 自动生成纪要**，以及一个原生 SPA 控制面板。
 
-LLM 执行层由 [DeepSeek Harness Desktop](https://github.com/NeoBigZhou)（DSH Desktop）本地 API 承担。
+LLM 执行层由 **DeepSeek Harness Desktop（DSH Desktop）** 本地 API 承担。
 ECHO 自己**不做推理**，只负责录音、转写、编排、面板与播报——**所以"本地"指的是 ECHO 这一侧**：
 转写与语音识别全在本机，但**纪要与指令执行的文本会离开这台机器**（发给 DSH 配置的模型服务），
 **语音合成默认用的是微软在线服务**。逐项见下面「本地 / 联网」一节。
@@ -73,7 +73,7 @@ ECHO 自己**不做推理**，只负责录音、转写、编排、面板与播�
 ## 快速开始
 
 ```powershell
-git clone https://github.com/NeoBigZhou/echo-voice-assistant.git
+git clone https://github.com/zhkq/echo-voice-assistant.git
 cd echo-voice-assistant
 
 python -m venv venv
