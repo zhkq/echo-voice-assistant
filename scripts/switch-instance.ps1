@@ -17,6 +17,8 @@
 #   powershell -File scripts\switch-instance.ps1 dev -DryRun
 #   powershell -File scripts\switch-instance.ps1 dev -Force   # ignore active meeting
 #   powershell -File scripts\switch-instance.ps1 -InstallAutostart
+#   powershell -File scripts\switch-instance.ps1 -BootDefault stable
+#   powershell -File scripts\switch-instance.ps1 -BootDefault none   # clear it
 #
 # Refuses to switch while the running instance is recording a meeting
 # (unless -Force) - a hard kill would lose that recording.
@@ -32,6 +34,7 @@ param(
     [switch]$SyncTooling,
     [switch]$DryRun,
     [switch]$Force,
+    [string]$BootDefault = '',
     [string]$Config = '',
     [int]$WaitSeconds = 90
 )
@@ -69,6 +72,31 @@ if (-not $cfg) {
     exit 1
 }
 $names = Get-EchoInstanceNames $cfg
+
+# --------------------------------------------------- boot default
+# `bootDefault` = the instance the supervisor snaps `current` back to on its
+# FIRST pass after logon, i.e. "every boot comes up on this one". The value
+# 'none'/'off' clears it, so the switch survives a reboot again.
+if ($PSBoundParameters.ContainsKey('BootDefault')) {
+    $val = [string]$BootDefault
+    if (@('', 'none', 'off') -contains $val.ToLower()) {
+        $cfg | Add-Member -NotePropertyName bootDefault -NotePropertyValue '' -Force
+        if (-not $DryRun) { Save-EchoInstanceConfig $script:CfgPath $cfg }
+        Ok 'bootDefault cleared - the switch survives a reboot again'
+    } else {
+        if ($names -notcontains $val) {
+            Fail "no such instance '$val' (configured: $($names -join ', '))"
+            Write-Host ''
+            exit 1
+        }
+        $cfg | Add-Member -NotePropertyName bootDefault -NotePropertyValue $val -Force
+        if (-not $DryRun) { Save-EchoInstanceConfig $script:CfgPath $cfg }
+        Ok "bootDefault = $val"
+        Say "    on every logon the supervisor snaps current back to '$val'"
+    }
+    Write-Host ''
+    exit 0
+}
 
 # --------------------------------------------------- repoint autostart
 if ($InstallAutostart) {
@@ -161,6 +189,9 @@ function Show-Status {
     Say ''
     Say ("  config: {0}" -f $script:CfgPath)
     Say ("  autoStopOthers: {0}" -f $cfg.autoStopOthers)
+    $boot = ''
+    if ($cfg.PSObject.Properties.Name -contains 'bootDefault') { $boot = [string]$cfg.bootDefault }
+    Say ("  bootDefault:   {0}" -f $(if ($boot) { "$boot  (snapped back on the first pass after logon)" } else { '(off - the switch survives a reboot)' }))
     Say ''
     Say ("  {0} {1,-8} {2,-9} {3,-6} {4,-12} {5}" -f ' ', 'NAME', 'ROOT', 'ECHO', 'PORT', 'SUP/ROUTER')
     $procs = Get-EchoProcSnapshot

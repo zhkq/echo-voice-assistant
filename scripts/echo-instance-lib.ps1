@@ -17,6 +17,13 @@ function Get-EchoRepoRoot { return (Split-Path $PSScriptRoot -Parent) }
 # --------------------------------------------------------------- config
 # {
 #   "current": "dev",                 <- which instance SHOULD be running
+#   "bootDefault": "stable",          <- optional. The autostart launches the
+#                                        supervisor once per logon, and its FIRST
+#                                        pass snaps `current` back to this name.
+#                                        "" (or missing) = off, i.e. whatever you
+#                                        switched to last survives the reboot.
+#                                        Later passes never touch the switch, so
+#                                        a mid-session switch to dev still works.
 #   "autoStopOthers": false,          <- true = supervisor kills the other one
 #   "instances": {
 #     "stable": { "root": "C:\\echo1.0" },
@@ -26,6 +33,7 @@ function Get-EchoRepoRoot { return (Split-Path $PSScriptRoot -Parent) }
 function New-EchoInstanceTemplate([string]$repoRoot) {
     $tpl = [ordered]@{
         current         = 'dev'
+        bootDefault     = ''
         autoStopOthers  = $false
         instances       = [ordered]@{
             stable = [ordered]@{ root = 'C:\echo1.0' }

@@ -10,6 +10,12 @@
 #   2. reports the INACTIVE one if it is running
 #   3. optionally kills the inactive one   (autoStopOthers = true)
 #
+# It also honours `bootDefault`: the autostart starts this script once per logon,
+# so its FIRST pass is "just booted" - if bootDefault names an instance, the
+# switch is snapped back to it there. That is how "always come up on the
+# released install" is expressed, while switching to dev mid-session still
+# works (later passes never write the switch).
+#
 # Why one supervisor: with one per install, switching must not forget to stop
 # the other supervisor, or it revives the instance you just stopped within
 # ~15s - and you silently end up with two.
@@ -45,6 +51,7 @@ $ErrorActionPreference = 'Continue'
 $script:CfgPath = if ($Config) { $Config } else { $script:ConfigPathDefault }
 $script:LogPath = Join-Path $env:USERPROFILE '.echo-supervisor.log'
 $script:WarnedOthers = @{}
+$script:FirstPass = $true
 
 function SupLog([string]$m, [string]$level = 'INFO') {
     $line = "[{0}] [{1}] {2}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $level, $m
@@ -64,6 +71,26 @@ function Invoke-Pass {
     if (-not $cfg) {
         SupLog "no config at $($script:CfgPath) - run: switch-instance.ps1 -Init" 'ERROR'
         return $true
+    }
+    # --- bootDefault: FIRST pass only (that pass IS the logon launch) -------
+    # Deliberately not applied on later passes: switching to dev mid-session has
+    # to survive until the machine is rebooted.
+    $boot = ''
+    if ($cfg.PSObject.Properties.Name -contains 'bootDefault') { $boot = [string]$cfg.bootDefault }
+    if ($script:FirstPass -and $boot) {
+        $bootNames = Get-EchoInstanceNames $cfg
+        if ($bootNames -notcontains $boot) {
+            SupLog "config.bootDefault='$boot' is not a configured instance ($($bootNames -join ', ')) - ignored" 'WARN'
+        } elseif ([string]$cfg.current -ne $boot) {
+            if ($DryRun) {
+                SupLog "[dry] bootDefault: would reset current '$([string]$cfg.current)' -> '$boot'"
+            } else {
+                $was = [string]$cfg.current
+                $cfg | Add-Member -NotePropertyName current -NotePropertyValue $boot -Force
+                Save-EchoInstanceConfig $script:CfgPath $cfg
+                SupLog "bootDefault: reset current '$was' -> '$boot' (first pass after logon)" 'OK'
+            }
+        }
     }
     $desired = [string]$cfg.current
     $names = Get-EchoInstanceNames $cfg
@@ -132,6 +159,7 @@ function Invoke-Pass {
         $kroot = Get-EchoInstanceRoot $cfg $k
         if (@(Get-EchoInstanceProcs $kroot $procs).Count -eq 0) { $script:WarnedOthers.Remove($k) }
     }
+    $script:FirstPass = $false
     return $true
 }
 
