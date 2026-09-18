@@ -59,12 +59,13 @@ def load() -> dict:
 
 
 def _save(cfg: dict) -> tuple:
-    """备份 + 原子写 config.json。"""
+    """备份 + 原子写 config.json（备份只保留最近 BACKUP_KEEP 份）。"""
     try:
         CONFIG.parent.mkdir(parents=True, exist_ok=True)
         if CONFIG.is_file():
             shutil.copy2(CONFIG, CONFIG.with_name(
                 CONFIG.name + ".bak-" + time.strftime("%Y%m%d-%H%M%S")))
+            llm_router.prune_backups(CONFIG, ".bak-")
         tmp = CONFIG.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         tmp.replace(CONFIG)

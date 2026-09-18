@@ -13,8 +13,9 @@ provider 路由集合变化会原子重新注册——新增/删除一条路由�
   3. 在 `~/.dsh/.credentials.yaml` 的 `refs` 下确保有 `ECHO_ROUTER_TOKEN`
      （路由自己的令牌，DSH 请求会带上它；组内成员的真实密钥只由 ECHO 持有）。
 
-写文件一律先备份；有 ruamel.yaml 就往返写入（保留用户注释与顺序），没有就退回
-纯文本插入（只动自己那一段）。任何异常都不抛出——boot 阶段不能因为注册失败而挂掉。
+写文件一律先备份（同名备份只保留最近 `BACKUP_KEEP` 份，见 `prune_backups`）；
+有 ruamel.yaml 就往返写入（保留用户注释与顺序），没有就退回纯文本插入（只动自己那一段）。
+任何异常都不抛出——boot 阶段不能因为注册失败而挂掉。
 """
 from __future__ import annotations
 
@@ -129,10 +130,36 @@ def _write_credentials_token(token: str) -> tuple:
 
 
 # ---------------------------------------------------------------- settings.yaml
+# 写盘前先留一份同名备份，但必须限量：不清理的话 ~/.dsh 会被
+# settings.yaml.bak-echo-auto-* 淹掉（2026-09-18 实测累积到 100 份；其中还有一份
+# .credentials.yaml.bak-echo-auto-* 长期保留着内网网关令牌的旧明文副本）。
+# 备份后缀是 %Y%m%d-%H%M%S，但历史上存在 .bak-maxtokens-* 这类人工命名，
+# 所以按 mtime 排序而不是按文件名，只保留最近 BACKUP_KEEP 份。
+BACKUP_KEEP = 5
+
+
+def prune_backups(path: Path, prefix: str) -> None:
+    """把 `<path><prefix>*` 的历史备份裁剪到最近 BACKUP_KEEP 份。永不抛异常。"""
+    try:
+        old = sorted(
+            (p for p in path.parent.glob(path.name + prefix + "*") if p.is_file()),
+            key=lambda p: p.stat().st_mtime,
+        )
+        if len(old) > BACKUP_KEEP:
+            for p in old[:len(old) - BACKUP_KEEP]:
+                try:
+                    p.unlink()
+                except OSError:
+                    pass
+    except Exception:
+        pass
+
+
 def _backup(path: Path) -> None:
     try:
         if path.is_file():
             shutil.copy2(path, path.with_name(path.name + ".bak-echo-auto-" + time.strftime("%Y%m%d-%H%M%S")))
+            prune_backups(path, ".bak-echo-auto-")
     except Exception:
         pass
 
