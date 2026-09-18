@@ -25,56 +25,21 @@ ECHO 自己**不做推理**，只负责录音、转写、编排、面板与播�
 
 | 你是 | 走哪条路 | 入口 |
 |---|---|---|
-| **想直接用它**（同事 / 日常使用） | **交付包**，不用碰 git、不用装 Python | [→ 稳定版安装](#稳定版安装使用者) |
-| **想看代码 / 提 PR** | `git clone`（默认分支 `main` = 稳定版） | [→ 从源码运行](#从源码运行开发者) |
-| **只要某一版的源码** | Release 里的源码归档，可精确定版 | [github.com/NeoBigZhou/echo-voice-assistant/releases](../../releases) |
+| **想自己跑起来 / 看代码 / 提 PR** | `git clone`，默认分支 `main` 就是稳定版 | [→ 从源码运行](#从源码运行) |
+| **只要某一版的源码** | Release 里的源码归档，可精确定版 | [Releases](../../releases) |
 
-> 仓库**不含模型权重**（`models/` 已 gitignore），且首次安装要拉约 7 GB 依赖。
-> 所以**普通使用者请走交付包**，从源码跑适合开发者。
+> **本仓库只提供从源码安装。** 仓库不含模型权重（`models/` 已 gitignore），
+> 首次安装需拉约 7 GB 依赖（Windows + NVIDIA 显卡时更多）；模型在装好后从
+> 面板 → **设置 → 模型** 下载（走 ModelScope / hf-mirror 镜像）。
+>
+> **面向内部同事的"整包"交付流程不在本仓库。** 整包内含预置 venv 与已下载的模型权重，
+> 其中部分模型有单独的授权条款、不适合公开分发；同事请向维护者索取内部说明。
 
 
-## 稳定版安装（使用者）
-
-**推荐路线：用交付包，不需要 git、不需要预装 Python。**
-
-1. **拿到交付包**。仓库不含模型权重，整包约 8.8 GB，因此它不放在 Release 里
-   （GitHub Release 单个文件上限 2 GiB）。获取方式见
-   **[Releases 页面](../../releases/latest)** 的说明，或直接找维护者（内网共享盘 / 网盘）。
-2. 把交付包 zip 与 `install.bat`、`install.ps1` 放在**同一个文件夹**里。
-3. **双击 `install.bat`**，按提示走完 8 步：环境/磁盘检查 → 找 zip → 选安装目录 →
-   解压 → venv 初始化建库 → 自检 → 快捷方式 + 开机自启 → DSH 检测。
-
-   装完会自动建议下一步（建议把安装目录放在**纯英文路径**，如 `D:\ECHO`）。
-4. 打开面板：`http://127.0.0.1:<端口>`（实际端口见安装目录下的 `data\echo-port.txt`）。
-
-首次使用建议：
-
-1. 面板 → **设置 → 模型**：点一下把 `SenseVoice`（默认转写引擎，约 896MB）下载好；
-2. 面板 → **设置 → 语音命令**：确认热键（默认 `Ctrl+Alt+C` 说话、`Ctrl+Shift+E` 面板）；
-3. 面板 → **启动**：查看各组件状态，缺什么点什么（DSH 执行引擎需要另行安装 DSH Desktop）；
-4. 想在 DSH 里用**模型路由**：面板 → **模型路由** 页签配置通道，再到 DSH 把模型选成 `ECHO AUTO`。
-
-逐项核对清单见 **[docs/新机器部署指南.md](docs/新机器部署指南.md)**；
-排错、显卡、非 ASCII 路径、开机自启、边条编译见 **[docs/DEPLOY.md](docs/DEPLOY.md)**。
-
-### macOS
-
-macOS 交付包走同一套流程，使用独立入口，以原生 AppKit / WKWebView 浮动框替代 Windows 边条：
-
-```bash
-mac/setup_mac.sh
-mac/start_mac.sh
-```
-
-支持右缘浮动框、面板、录音转写、会议、桌面通知与 macOS `say` 离线播报；全局热键需要可选依赖 `pynput`。
-浮动框可运行 `bash mac/build_sidebar.sh` 构建（需要 Apple Command Line Tools）；
-旧用户在设置里将 `panelOpenMode` 改为 `sidebar` 后，重启 ECHO 即可随服务启动。
-限制和权限设置见 **[mac/README.md](mac/README.md)**。
-
-## 从源码运行（开发者）
+## 从源码运行
 
 ```powershell
-git clone https://github.com/NeoBigZhou/echo-voice-assistant.git
+git clone https://github.com/zhkq/echo-voice-assistant.git
 cd echo-voice-assistant
 git checkout v1.0.0          # 可选：锁定到某个稳定版（不切 = main，同样是稳定线）
 
@@ -94,6 +59,29 @@ powershell -File scripts\check-windows.ps1
 
 开机自启：`powershell -File scripts\install-autostart.ps1`（卸载加 `-Remove`）。
 模型仍需自行获取（面板 → 设置 → 模型），仓库不含权重。
+
+首次使用建议：
+
+1. 面板 → **设置 → 模型**：把 `SenseVoice`（默认转写引擎，约 896 MB）下载好；
+2. 面板 → **设置 → 语音命令**：确认热键（默认 `Ctrl+Alt+C` 说话、`Ctrl+Shift+E` 面板）；
+3. 面板 → **启动**：查看各组件状态，缺什么点什么（DSH 执行引擎需要另行安装 DSH Desktop）；
+4. 想在 DSH 里用**模型路由**：面板 → **模型路由** 页签配置通道，再到 DSH 把模型选成 `ECHO AUTO`。
+
+排错、显卡、非 ASCII 路径、开机自启、边条编译见 **[docs/DEPLOY.md](docs/DEPLOY.md)**。
+
+### macOS（从源码）
+
+macOS 走独立入口，以原生 AppKit / WKWebView 浮动框替代 Windows 边条：
+
+```bash
+mac/setup_mac.sh
+mac/start_mac.sh
+```
+
+支持右缘浮动框、面板、录音转写、会议、桌面通知与 macOS `say` 离线播报；全局热键需要可选依赖 `pynput`。
+浮动框可运行 `bash mac/build_sidebar.sh` 构建（需要 Apple Command Line Tools）；
+旧用户在设置里将 `panelOpenMode` 改为 `sidebar` 后，重启 ECHO 即可随服务启动。
+限制和权限设置见 **[mac/README.md](mac/README.md)**。
 
 > **注意**：`main` 是稳定线；`2.0-dev` 是下一代开发分支，**不要从它安装**。
 > 版本号唯一权威来源是 `app/__init__.py:__version__`（`tests/test_version.py` 兜住一致性），
@@ -167,7 +155,7 @@ echo-voice-assistant/
 ├── sidebar/        右缘折叠条/边条宿主（.NET 7 WinForms + WebView2，echo-sidebar.exe）
 ├── dsh-failover/   模型路由（默认本机 8899，可被 config.json 的 port 覆盖）：多个上游组成「模型组」，DSH 侧只认 ECHO AUTO
 ├── scripts/        setup / start / stop / 自启 / 一键安装向导
-├── docs/           部署指南、新机器部署指南、纪要归档说明、PowerShell 编码经验
+├── docs/           部署指南、跨平台约定、纪要归档说明、PowerShell 编码经验
 └── .dsh/skills/    DSH 技能（随仓库提供 meeting-record；其余按需自建）
 ```
 
