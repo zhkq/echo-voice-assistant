@@ -27,7 +27,7 @@
 | 项 | 实测值 | 出处 |
 |---|---|---|
 | venv | 7.09 GB（CUDA torch 为主） | 本机 `venv` |
-| `models/` | 13.2 GB（pyannote 5.2G / faster-whisper 5.0G / hub 1.8G / sensevoice 896M / sherpa 189M / kws 40M） | 实测 |
+| `models/` | 13.2 GB（实测时 pyannote 5.2G 里含 5.0G 冗余副本 / faster-whisper 5.0G / hub 1.8G / sensevoice 896M / sherpa 189M / kws 40M）；**2026-09-19 清掉冗余后 pyannote 只剩 0.2G，合计约 8.2 GB** | 实测 |
 | DSH Desktop | 655 MB（Electron，`dsh-plugin-desktop` 2.0.11） | `resources/app/package.json` |
 | 交付包 | ≈8.8 GB / 6 万文件，解压 5–20 分钟 | 内网整包说明（原 `docs/新机器部署指南.md`，2026-09-18 已移出公开仓库） |
 | 模型入库 | `git ls-files models` = **0 条**（`models/` 已 gitignore） | git |
@@ -837,6 +837,12 @@ r.events             # → 面板"看会话"
 **S12 决定 D22 能否做到"连运行时也外挂"**——它是本轮新增要求里唯一可能推翻主包体积目标的项。
 **S9/S10 决定 mac 交付是否卡在签名与热键上**——两条都涉及原生代码，建议在 P3 之前先各花半天验证。
 
+> **2026-09-19 现状：手头没有 macOS 14+ 机器。** 因此 **S7、S9、S10、S12 全部记为"未验证风险"**，
+> 它们是 mac 一侧的地基（能否验证 / 公证链 / Carbon 热键免授权 / 外挂运行时的 TCC 归属）。
+> 后果要说在前面：**P3 与 P4 的 mac 验收标准目前拿不到证据**，P4 的"mac 包在干净机器上双击即开"
+> 只能标为待验证。这不是可以靠写代码绕过的项——在拿到机器之前，mac 侧的产出只能保证"按契约写对"，
+> 不能保证"跑得起来"。拿到机器后**先补这四项，再继续 P3 之后的 mac 工作**。
+
 ---
 
 ## 10. 分期路线
@@ -861,6 +867,17 @@ r.events             # → 面板"看会话"
   组件安装位置，必须在出包这一期就打通，不能拖到发布期；
 - **P6 排在 P5 之后**：P5 的直连 provider 让"纪要"先摆脱 agent 依赖，
   P6 再补 TOOLS/SKILLS 能力，两期之间系统始终可用。
+
+**P0 收尾状态（2026-09-19）**
+
+| P0 项 | 状态 |
+|---|---|
+| `llm_router` 备份限流（`BACKUP_KEEP=5` + `prune_backups`） | ✅ 已完成（`3ab5183`，同时清掉 154 个历史 `.bak`，其中一个含内网令牌明文副本） |
+| 清 5 GB 冗余模型副本 | ✅ 已完成（`models/pyannote/faster-whisper-*` 两棵树各 5.0 GB，逐文件哈希确认与 `models/faster-whisper/` 全等后删除，共回收 9.78 GB） |
+| 删 `data/history/` 遗留目录 | ✅ 已完成（空目录；此前误判的 7 处代码引用是 DSH capability 与面板命令历史，与此无关） |
+| 修文档与仓库不一致（kws/pyannote 不在库里） | ✅ 已消解：说错话的是原《新机器部署指南》，它已移出公开仓库（备份在 `D:\ECHO-transfer\internal-docs\`） |
+| 给"业务路径写死 DSH"加测试兜住 | ✅ 已完成（`tests/test_dsh_home_coupling.py`：白名单 4 个文件、总数上限 8，并钉住 `DSH_HOME` 覆盖点） |
+| 附加：打包脚本 + 构建期硬校验 | ✅ 已完成（`scripts/build-package.ps1`，见 §13.9 第 6 项） |
 
 ---
 
@@ -1258,7 +1275,7 @@ powershell -File scripts\switch-instance.ps1 -InstallAutostart
 3. ✅ README 拆两段 + 三类人分流；并据 §13.4 决定**公开仓库不再提供整包**（§13.5）；
 4. ✅ 建 `2.0-dev`，本文档已提交进 `main`；**实例快速切换**（一个守护 + 一个开关）已实现并实测（§13.6.1）；
 5. ✅ 冻结稳定安装到 **`C:\echo1.0`**、开发树迁到 **`C:\echo-dev`**，并装上根守护自启（2026-09-18，见下）；
-6. ⬜ 打包脚本（`-Profile internal/public` + 构建期硬校验）与内网整包重做——**尚未做**。
+6. ✅ 打包脚本 `scripts/build-package.ps1`（`-Profile public/internal` + 构建期硬校验 + 产物复检 + `BUILD-INFO.txt` / `SHA256SUMS.txt`），2026-09-19；内网整包按需现打，不再长期留存（旧的那份 5.81 GB 整包已删除，只留清单 `ECHO-交付包-20260914.manifest.txt`）。
 
 #### 已执行的冻结与搬迁（2026-09-18）
 
