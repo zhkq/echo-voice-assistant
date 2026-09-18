@@ -1137,6 +1137,61 @@ ECHO 是常驻服务，Python 按需 import —— **在运行中的服务下面
 
 **回滚**：稳定安装目录全程不动，出问题把快捷方式指回即可；保留 1.x 交付包 + tag。
 
+#### 13.6.1 快速切换：一个守护 + 一个开关（2026-09-18 实现）
+
+两份安装（冻结的稳定版 / 开发版）由 `%USERPROFILE%\.echo-instances.json` 描述，
+**`current` 字段就是开关**：
+
+```json
+{ "current": "dev", "autoStopOthers": false,
+  "instances": { "stable": { "root": "C:\\echo1.0" },
+                 "dev":    { "root": "C:\\...\\ECHO-public" } } }
+```
+
+`scripts/` 下的分工：
+
+| 脚本 | 角色 |
+|---|---|
+| `echo-instance-lib.ps1` | 共享库：配置读写 / 进程发现 / 启停（被下面两个 dot-source） |
+| `echo-supervisor.ps1` | **常驻守护**：按 `current` 保持该实例在线；另一实例在跑时**告警**（`autoStopOthers=true` 才动手停它） |
+| `switch-instance.ps1` | 一次性切换：写开关 → 停其它 → 起目标；另有 `-Status` / `-Init` / `-Toggle` / `-InstallAutostart` |
+
+**为什么由守护按开关调度，而不是让切换脚本自己搞定**：
+
+- **重启后自动正确**——自启指向守护，开机后由开关决定起哪一个；
+- **崩溃后自动恢复**——活动实例挂了，守护下一轮（默认 5s）拉起；
+- **不会漏杀另一个守护**——只有一份守护，不存在"两个循环互相复活"的死结
+  （这正是"每个安装各一个守护"方案的坑：切换时必须记得把对方的守护也停掉，
+  否则它会在 ~15s 内把刚停掉的实例复活，你就在不知情的情况下跑着两个）。
+
+**为什么 `autoStopOthers` 默认关**：一个会杀掉"不是它启动的东西"的守护，很容易让人
+以为"ECHO 老是莫名死掉"。默认只告警并打印停止命令；要严格单实例再显式打开。
+
+**实测（2026-09-18）**：
+
+- 杀掉活动实例及其守护 → 守护一轮内识别为 down 并拉起，**10 秒后报端口就绪**；
+- `switch-instance.ps1 dev` → 写开关、报告已在运行、退出 0；
+- `switch-instance.ps1 stable`（root 尚不存在）→ 明确拒绝、退出 1。
+
+**典型用法**：
+
+```powershell
+powershell -File scripts\switch-instance.ps1 -Init       # 生成配置（按需改 root 路径）
+powershell -File scripts\switch-instance.ps1 -Status     # 谁在跑、谁是当前
+powershell -File scripts\switch-instance.ps1 stable      # 切到冻结版
+powershell -File scripts\switch-instance.ps1 -Toggle     # 一键翻到另一个（适合做成快捷方式）
+
+# 把自启从"每个安装各一个守护"改成"一个守护按开关调度"
+powershell -File scripts\switch-instance.ps1 -InstallAutostart
+```
+
+**安全**：切换前会查活动实例是否**正在录音**，是则拒绝（除非 `-Force`）——
+硬杀会丢掉那场会议。
+
+> 注意：`switch-instance.ps1` 仍会启动目标实例自带的 `scripts\startup.ps1`（它负责
+> "这一个"的崩溃重启），所以是两层：**根守护决定"哪个"**，安装自身守护负责"别死"。
+> 两层都在 `Get-EchoInstanceProcs` 的识别范围内，切走时会被一起停掉。
+
 ### 13.7 单实例与守护（含一次**误诊纠正**，2026-09-18）
 
 #### 纠正：不是"两个实例"，是 venv 启动器桩
@@ -1201,8 +1256,8 @@ ECHO 是常驻服务，Python 按需 import —— **在运行中的服务下面
 1. ✅ 单实例锁 + 守护脚本识别"正在启动" + 路由锁与冷却（§13.7）；
 2. ✅ 版本号收敛到单一来源 + `/api/status` 暴露版本 + `main` 打 **`v1.0.0`** 并发首个 Release（§13.3）；
 3. ✅ README 拆两段 + 三类人分流；并据 §13.4 决定**公开仓库不再提供整包**（§13.5）；
-4. ✅ 建 `2.0-dev`，本文档已提交进 `main`；
-5. ⬜ 冻结稳定安装到 ASCII 路径，日常自用切过去（§13.6）——**尚未做**；
+4. ✅ 建 `2.0-dev`，本文档已提交进 `main`；**实例快速切换**（一个守护 + 一个开关）已实现并实测（§13.6.1）；
+5. ⬜ 冻结稳定安装到 ASCII 路径（如 `C:\echo1.0`）并 `switch-instance.ps1 -InstallAutostart`——**尚未做**；
 6. ⬜ 打包脚本（`-Profile internal/public` + 构建期硬校验）与内网整包重做——**尚未做**。
 
 ---
