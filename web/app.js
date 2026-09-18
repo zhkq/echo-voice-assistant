@@ -79,6 +79,7 @@ function switchView(name) {
   if (name === "boot") { loadBoot(); loadBootLogs(); }
   if (name === "failover") loadRouter();
   if (name === "models") loadModels();
+  if (name === "components") loadComponents();
 }
 $$(".tab").forEach((t) => t.addEventListener("click", () => switchView(t.dataset.view)));
 
@@ -1013,6 +1014,13 @@ $("#settingsForm").addEventListener("click", async (e) => {
   if (a) toast(a.available ? `${a.displayName} 可用` : `${a.displayName} 不可用：${a.reason || ""}`);
 });
 
+/* 「组件」页签的入口（switchView 分发到这里）。渲染逻辑复用自包含的卡片渲染器，
+   所以页签与（曾经的）设置页卡片能共用一份实现。 */
+function loadComponents() {
+  const host = $("#componentsHost");
+  if (host) renderComponentsCard(host);
+}
+
 /* ---- 组件清单（2.0 / P2、D22、D23）----
    数据来自 /api/components（组件内核），按 kind 分组展示：就绪状态、体积、获取方式；
    不适用于本平台的组件（如 mac 上的 CUDA）**显示但标注原因**，不隐藏（D24）。 */
@@ -1182,11 +1190,7 @@ async function loadSettings() {
       envHost.id = "envCheckHost";
       form.appendChild(envHost);
       renderEnvCheck(envHost);
-      const compHost = document.createElement("div");
-      compHost.id = "componentsHost";
-      form.appendChild(compHost);
-      renderComponentsCard(compHost);
-    } catch (e) { /* 体检/组件卡片失败不能拖垮设置页 */ }
+    } catch (e) { /* 体检卡片失败不能拖垮设置页 */ }
     _syncSettingsCollapseAll();     // 重绘后让顶部双箭头跟着当前折叠状态
   } catch (e) { toast("加载设置失败：" + e.message); }
 }
@@ -1960,7 +1964,7 @@ if ("serviceWorker" in navigator) {
 initRouterUI();
 /* 折叠条（rail.html）点「模型」时经同源 localStorage 传来的落地页签意图；
    主面板展开会重新加载本页，所以在这里消费一次即清掉。 */
-const _VIEWS = ["dashboard", "settings", "history", "meetings", "boot", "failover", "models"];
+const _VIEWS = ["dashboard", "settings", "history", "meetings", "boot", "failover", "models", "components"];
 let _bootView = "dashboard";
 try {
   const q = new URLSearchParams(location.search).get("view");
