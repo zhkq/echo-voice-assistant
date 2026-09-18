@@ -1,0 +1,75 @@
+#!/bin/sh
+# pre-push: block a push when a commit being pushed would publish a non-noreply
+# email address.
+#
+# WHY
+#   GitHub's own "Block command line pushes that expose my email" lives only in
+#   the web UI (Settings -> Emails): the REST API has no endpoint for it, and
+#   the gh token does not carry the `user` scope either. This hook is the local
+#   equivalent, and it is versioned with the repo so every clone can enable it.
+#
+#   Concretely: this repository's history contains 3 commits authored with a
+#   real address (accepted, not rewritten). Anything pushed from now on must
+#   use the GitHub noreply form, so the address never grows further.
+#
+# USAGE
+#   sh .githooks/pre-push --install     # copy into .git/hooks/pre-push
+#   git push --no-verify                # deliberate bypass (same as pre-commit)
+#
+# ASCII-ONLY on purpose: this file is executed by Git for Windows' sh, and a
+# BOM-less non-ASCII byte would be read as the local ANSI code page.
+
+set -u
+
+# Allowed: GitHub's noreply forms (both the id+login and the legacy form)
+ALLOW_RE='(@users\.noreply\.github\.com|^noreply@github\.com)$'
+ZERO='0000000000000000000000000000000000000000'
+
+if [ "${1:-}" = "--install" ]; then
+    hookdir=$(git rev-parse --git-dir)/hooks
+    mkdir -p "$hookdir"
+    cp "$0" "$hookdir/pre-push"
+    chmod +x "$hookdir/pre-push"
+    echo "installed pre-push hook: $hookdir/pre-push"
+    exit 0
+fi
+
+remote="${1:-origin}"
+bad=""
+
+while read -r local_ref local_sha remote_ref remote_sha; do
+    # Defensive: tolerate a CRLF line ending (a CR would otherwise glue itself to
+    # remote_sha and turn the revision range into garbage, which fails silently).
+    local_sha=$(printf '%s' "${local_sha:-}" | tr -d '\r')
+    remote_sha=$(printf '%s' "${remote_sha:-}" | tr -d '\r')
+    [ -z "$local_sha" ] && continue
+    [ "$local_sha" = "$ZERO" ] && continue          # deleting a branch
+    if [ -z "$remote_sha" ] || [ "$remote_sha" = "$ZERO" ]; then
+        range="$local_sha --not --remotes"          # new branch: only the new part
+    else
+        range="$remote_sha..$local_sha"
+    fi
+    for c in $(git rev-list $range 2>/dev/null); do
+        # shellcheck disable=SC2046
+        for e in $(git log -1 --format='%ae%n%ce' "$c" 2>/dev/null | sort -u); do
+            if ! printf '%s' "$e" | grep -Eq "$ALLOW_RE"; then
+                bad="$bad
+    $(git log -1 --format='%h  %ae' "$c")"
+            fi
+        done
+    done
+done
+
+if [ -n "$bad" ]; then
+    echo ""
+    echo "[x] push blocked: these commits would publish a non-noreply email address:"
+    printf '%s\n' "$bad"
+    echo ""
+    echo "  Rewrite them with the noreply identity, e.g.:"
+    echo "      git commit --amend --author=\"zhkq <7867198+zhkq@users.noreply.github.com>\""
+    echo "  Or, if it is deliberate: git push --no-verify"
+    echo ""
+    exit 1
+fi
+
+exit 0
