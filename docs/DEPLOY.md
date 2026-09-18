@@ -111,6 +111,8 @@ dotnet build sidebar\echo-sidebar.csproj -c Release
 | 热键没反应 | 面板 → 启动 → `热键/媒体键` 状态；热键由 ECHO 服务注册，改完设置需重启 ECHO |
 | `.ps1` 脚本报"字符串缺少终止符" | 脚本被存成了**无 BOM 的 UTF-8 且含非 ASCII**，PowerShell 5.1 按 ANSI 读就会坏。本仓库脚本一律纯 ASCII 或带 BOM，见 [powershell-编码与脚本经验.md](powershell-编码与脚本经验.md) |
 | 面板显示"连接失败" | ECHO 没起来 / 端口被占。看 `data\logs\echo-server.log.err`，或 `scripts\restart-echo.ps1` |
+| 任务管理器里看到**两个** `pythonw.exe -m app.main`（或两个 `proxy.py`），其中一个不监听端口 | **通常不是重复实例**。Windows 上 venv 的 `venv\Scripts\python*.exe` 是**启动器桩**（约 250 KB），它会拉起真实解释器（约 90 KB）作为子进程并等它退出 —— 所以**每次启动都显示两个 PID**。判据：真实例内存 GB 级 / 有 CPU 占用 / `data\echo-port.txt` 的端口在它手上；桩只有几 MB、CPU 接近 0。要确认是几个实例，看 `data\logs\echo-server.log` 里 `ECHO 服务启动` 出现几次，或 `data\echo.pid` 里记的 PID。真正的重复实例现在会被内核级单实例锁（`app/single_instance.py`）在**加载模型之前**拒绝并立即退出 |
+| 面板显示的版本与 tag / 交付包对不上 | 版本号唯一权威来源是 `app/__init__.py:__version__`（`tests/test_version.py` 兜住一致性）。改版本时四处要同步：该文件、`pyproject.toml`、README 顶部 |
 
 ## 7. 安全：本机 API 只允许本机访问
 
