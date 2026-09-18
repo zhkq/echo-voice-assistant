@@ -855,6 +855,8 @@ r.events             # → 面板"看会话"
 | **S4** | ⚠️ 分化 | **经 ECHO 自己的路由通过**：`base_url=http://127.0.0.1:18061/v1` + `model=echo-auto` + `api_key=ECHO_ROUTER_TOKEN`，2.3 s 返回 → **D25 成立**：agent 后端**不需要**自己那套 provider 管道，ECHO 路由就能提供内网网关 + 故障转移 + 凭据处置。**直连内网网关失败**：`failure.code=TRANSPORT`，5 次重试后 `turn/end` 报错 —— 与"网关要求 `userId` 头、缺失即断连"相符，但**未确证**（见待查） |
 | **S5** | ✅ 通过 | 全程 `~/.dsh` 时间戳未变、13 个既有 session 完好；隔离 home 自建 `profiles/ sessions/ storages/` |
 | **S13** | ⚠️ 部分 | **存储层成立**：web profile 的 `session-persistence-jsonl` 根同样是 `dshHomePath('sessions')`，与 `sdk` 同一个库。**并发无锁冲突成立**：两个 SDK 进程并行使用同一 home，各 2.6 s 双双成功、会话各自落盘。**但 `dsh --profile web` 起不来**：插件树无法解析 `@deepseek-ai/dsh-session-title-llm`（`--dump-config` 正常，一启动就失败）→ **官方 0.1.5rc1 的打包缺陷** |
+| **S11** | ✅ 通过 | **引擎不依赖 ASCII 路径**，因此 `meetingsDir` **不需要**强制 ASCII。证据：SenseVoice 与 Qwen3-ASR 在同一次运行内，ASCII 路径与中文路径的输出**逐字节相同**（sha 一致）；whisper 在 18 MB / 约 10 分钟音频上各跑 3 次——ASCII 2293/2170/2243 字、中文 2389/2414/2196 字，两边都稳定有输出（逐次不同属引擎自身非确定性）。⚠️ **方法学教训见下**：第一次单次 A/B 得出的是相反结论 |
+| **S8** | ⬜ 未做 | 安排在 P3 之前（用 `app/platform/` 骨架替换 `sys.modules` 注入后跑 Windows 全量冒烟） |
 
 **⚠️ 对 D26 的影响（重要）**：`dsh --profile web` 这条路径在当前 RC 上**不可用**。P6 的两条会话
 路径里，**"面板内嵌会话视图"（消费 `RunResult.events`）是可靠的那条**；"ECHO 自带 web 实例"
@@ -866,6 +868,18 @@ r.events             # → 面板"看会话"
 - `sdk` profile 的组合树（`--dump-config`）里**没有 `dsh-mcp-client` 行**，与 §3.1 表里"技能面全在"的记载不符。若 2.0 要用 MCP，需先确认安装/启用方式，**不能假定它在**。
 - 运行时是 SEA 快照：`node_modules` 不在磁盘上，**无法用"查目录"的方式排查插件缺失**，只能看运行时自身的解析错误。
 - S7 / S9 / S10 / S12 未验证（无 macOS 机器，见上文）。
+
+**⚠️ 方法学教训（S11 用两次自相矛盾的结论换来的，务必记住）**
+
+路径类 / 引擎类 spike **必须多次重复 + 用足够长的音频 + 关注"是否为空"而不是单次文本**。
+S11 第一次跑（23 秒短音频，各 1 次）得到"whisper 在中文目录下返回空"，第二次跑**完全反过来**
+（"ASCII 路径返回空"）——因为 whisper 对短音频输出本就不稳定，单次 A/B 只是在采样噪声。
+换成 10 分钟音频 + 每边 3 次之后，结论才稳定下来。
+
+**另据 `app/audio/stt.py` 实测到一个真实缺陷**（与路径无关，但同一轮发现）：每个引擎分支都
+`except Exception → print(stderr) → return ""`，把"这段没说话"和"引擎挂了"混为一谈。whisper 对
+短音频会**无异常、无 stderr、直接返回空串**，调用方无法区分 → 可能静默产出空纪要。
+建议在 P5（provider 抽象）里一并处理：**空结果要显式上报**。
 
 ---
 

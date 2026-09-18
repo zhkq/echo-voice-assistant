@@ -12,7 +12,8 @@ Windows 实现。macOS 支持走 `mac/run_mac.py` 独立入口 —— 它在 `im
 Windows 上就悄悄退化，而没有任何东西会红。本文件把它变成可执行断言：
 
   1. `app/`、`scripts/` 不得 import `mac` / `hotkey_mac` / `mac_runtime` / `notify_mac` / `tts_mac`;
-  2. `app/` 里不得出现 `darwin` 分支（非 Windows 实现只放 mac/）;
+  2. 平台差异只允许出现在 `app/platform/<os>/` 里（2.0 / D12；1.x 的规则是
+     "`app/` 里不得出现 `darwin`"，改成接缝目录后规则更清晰，没有变松）;
   3. 共享 `app/config.py` 的默认值必须是 Windows 值（Mac 覆盖只允许发生在 mac/ 入口）;
   4. Windows 上真实 import `app.main` 后不得加载任何 mac 模块;
   5. mac 入口必须仍然是"注入式"的（存在且使用 sys.modules / DEFAULTS）。
@@ -61,16 +62,35 @@ class SharedCodeIsMacFree(unittest.TestCase):
             bad, [],
             "app/ 与 scripts/ 不得引用 mac 专用模块（Mac 支持必须走 mac/ 独立入口）：\n" + "\n".join(bad))
 
-    def test_app_has_no_darwin_branch(self):
+    def test_platform_seams_live_only_in_app_platform(self):
+        """D12：平台差异只允许出现在 ``app/platform/<os>/`` 里。
+
+        1.x 的规则是"``app/`` 里不得出现 ``darwin``"（Mac 支持靠 ``mac/`` 注入进
+        ``sys.modules``）。2.0 起改成"平台专有实现必须收在 ``app/platform/<os>/``"——
+        因为 ``app/platform/<os>/env.py`` 正是 P1 的交付物（D10/D12/D18），而声明式平台
+        默认值（D11）必须有地方放。规则没有变松，只是把"唯一合法位置"从 ``mac/``
+        扩到 ``app/platform/``，并额外要求这个接缝目录真实存在。
+        """
+        platform_dir = os.path.join(ROOT, "app", "platform")
+        self.assertTrue(os.path.isdir(platform_dir),
+                        "app/platform/ 必须存在（D10 的平台接缝）")
+        for name in ("win32", "darwin", "linux"):
+            self.assertTrue(
+                os.path.isfile(os.path.join(platform_dir, name, "env.py")),
+                "app/platform/%s/env.py 必须存在（每个平台的默认值入口）" % name)
         bad = []
         for path in _py_files("app"):
+            rel = os.path.relpath(path, ROOT)
+            if rel.replace("\\", "/").startswith("app/platform/"):
+                continue                      # 接缝目录：平台分支本来就该在这里
             for i, code in _import_lines(path):
                 if "darwin" in code.lower():
-                    bad.append("%s:%d: %s" % (os.path.relpath(path, ROOT), i, code))
+                    bad.append("%s:%d: %s" % (rel, i, code))
         self.assertEqual(
             bad, [],
-            "app/ 里不得出现 darwin 分支：非 Windows 实现只能放 mac/，"
-            "跨平台差异用 os.name 判断并在两个平台各自验证：\n" + "\n".join(bad))
+            "平台差异只允许出现在 app/platform/<os>/ 里（D12）；"
+            "app/ 的其它模块请通过 app.platform 取平台默认值，不要自己写平台分支：\n"
+            + "\n".join(bad))
 
 
 class SharedDefaultsStayWindows(unittest.TestCase):
