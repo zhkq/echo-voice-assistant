@@ -139,14 +139,23 @@ def models_root() -> str:
 
 
 def active_roots() -> dict:
-    """当前生效的四类根 + 配置里是不是用户指定的。面板"环境体检"页与诊断用它。"""
+    """当前生效的四类根 + 配置里是不是用户指定的。面板"环境体检"页与诊断用它。
+
+    **任何一项取不到都不抛异常**：配置坏掉时，体检页恰恰是最需要能打开的那个页面。
+    """
+    def safe(fn, default=""):
+        try:
+            return fn()
+        except Exception:
+            return default
+
     return {
-        "echo": echo_root(),
-        "data": data_root(),
-        "meetings": meetings_root(),
-        "models": models_root(),
-        "meetingsConfigured": bool(_settings_get("meetingsDir")),
-        "modelsConfigured": bool(_settings_get("modelsDir")),
+        "echo": safe(echo_root),
+        "data": safe(data_root),
+        "meetings": safe(meetings_root),
+        "models": safe(models_root),
+        "meetingsConfigured": bool(safe(lambda: _settings_get("meetingsDir"))),
+        "modelsConfigured": bool(safe(lambda: _settings_get("modelsDir"))),
     }
 
 
