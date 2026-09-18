@@ -866,10 +866,10 @@ $("#gotoMeetings").addEventListener("click", (e) => { e.preventDefault(); switch
 let _settingsCache = [];
 
 /* 分组展示顺序 = 业务相关性（与后端 grp 取值解耦，后端不因展示顺序而改动）：
-   智能体(决定谁干活) → 通用(基础) → 语音命令(主用法) → 唤醒词 → 会议 → 纪要归档
-   → 模型路由 → 面板(界面) → DSH(底层接入) */
-const SET_GROUP_ORDER = ["agent", "general", "voice", "wake", "meeting", "worklog", "router", "panel", "dsh"];
-const SET_GROUP_NAMES = { agent: "智能体", general: "通用", voice: "语音命令", wake: "唤醒词",
+   智能体(决定谁干活) → 通用(基础) → 存储路径(2.0：会议/模型目录可配) → 语音命令(主用法)
+   → 唤醒词 → 会议 → 纪要归档 → 模型路由 → 面板(界面) → DSH(底层接入) */
+const SET_GROUP_ORDER = ["agent", "general", "paths", "voice", "wake", "meeting", "worklog", "router", "panel", "dsh"];
+const SET_GROUP_NAMES = { agent: "智能体", general: "通用", paths: "存储路径", voice: "语音命令", wake: "唤醒词",
   meeting: "会议", worklog: "纪要归档", router: "模型路由", panel: "面板", dsh: "DSH 服务" };
 
 /* 模型相关配置项：从「设置」页移出，统一由「模型」页签承载（前端过滤，后端 grp 不动）。

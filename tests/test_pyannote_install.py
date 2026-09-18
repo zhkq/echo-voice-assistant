@@ -24,7 +24,7 @@ class PyannoteInstallTests(unittest.TestCase):
             for _, directory, filename in installer.ASSETS:
                 path = root / directory / filename
                 path.parent.mkdir(parents=True, exist_ok=True)
-            with patch.object(modelinfo, "MODELS_DIR", folder):
+            with patch.object(modelinfo, "models_dir", lambda: folder):
                 self.assertFalse(modelinfo.ready_pyannote())
                 for _, directory, filename in installer.ASSETS:
                     (root / directory / filename).write_bytes(b"test model")

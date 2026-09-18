@@ -34,6 +34,11 @@ import sqlite3
 import threading
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# 数据根：1.x 的形态（安装目录下的 data/）。D18 要求把它做成"分平台"，但那会牵动
+# tests/test_voiceprint.py 与 tests/test_api_voiceprints.py 里"直接给模块属性赋值"的
+# 既有隔离手法，属于 P3 的活（连同 mac 的布局迁移一起做）。这里先保持常量，
+# **不要**改用模块 __getattr__：模块级 __getattr__ 对"模块内部函数里的裸名字"无效
+# （PEP 562 只管属性访问），会造成一片 NameError。
 DATA_DIR = os.path.join(os.path.dirname(BASE_DIR), "data")
 DB_FILE = os.path.join(DATA_DIR, "echo.db")
 

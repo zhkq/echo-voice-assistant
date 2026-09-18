@@ -15,6 +15,9 @@ import os
 from app.dsh import get_client
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# 数据根相关：与 db.py 同样的理由——D18 的"分平台数据根"是 P3 的活，且现有测试用
+# "直接给模块属性赋值"来隔离数据目录，所以这里保持常量（不要用模块 __getattr__，
+# PEP 562 对模块内部裸名字无效）。
 DATA_DIR = os.path.join(BASE_DIR, "data")
 DSH_PID_FILE = os.path.join(DATA_DIR, "dsh.pid")
 ECHO_PID_FILE = os.path.join(DATA_DIR, "echo.pid")

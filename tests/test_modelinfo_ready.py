@@ -16,7 +16,7 @@ class SenseVoiceReadyTests(unittest.TestCase):
 
     def _patched(self, root, available):
         return (
-            patch.object(modelinfo, "MODELS_DIR", root),
+            patch.object(modelinfo, "models_dir", lambda: root),
             patch.object(modelinfo, "_ms_dir", return_value=str(Path(root) / "cache-miss")),
             patch.object(modelinfo, "_pkg_available", side_effect=available),
         )

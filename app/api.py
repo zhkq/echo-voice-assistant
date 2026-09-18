@@ -649,7 +649,7 @@ def get_meetings(limit: int = 100, offset: int = 0, _auth=Depends(optional_auth)
     items = db.list_meetings(limit=min(limit, 500), offset=max(offset, 0))
     # 补充 has_summary 等轻量展示字段（列表信息展示优化，2026-09-10）
     for it in items:
-        folder = os.path.join(meeting.MEETINGS_DIR, it["name"])
+        folder = os.path.join(meeting.meetings_dir(), it["name"])
         it["has_summary"] = os.path.isfile(os.path.join(folder, "summary.md"))
     return {"items": items}
 
@@ -665,7 +665,7 @@ def get_meeting(mid: int, _auth=Depends(optional_auth)):
     # 因此先把原段数搬到 segment_count 再覆盖（2026-09-16）。
     detail["segment_count"] = detail.get("segments") or 0
     detail["segments"] = meeting.build_segments(mid)
-    folder = os.path.join(meeting.MEETINGS_DIR, detail["name"])
+    folder = os.path.join(meeting.meetings_dir(), detail["name"])
     detail["hasSegments"] = os.path.isfile(os.path.join(folder, "topics.md"))
     return detail
 
@@ -680,7 +680,7 @@ def meeting_audio(mid: int, seg: int = 1, _auth=Depends(optional_auth)):
     m = db.get_meeting(mid)
     if not m:
         raise HTTPException(status_code=404, detail="会议不存在")
-    path = _safe_under(meeting.MEETINGS_DIR, _meeting_dirname(m["name"]), f"{seg:02d}.wav")
+    path = _safe_under(meeting.meetings_dir(), _meeting_dirname(m["name"]), f"{seg:02d}.wav")
     if not path or not os.path.isfile(path):
         raise HTTPException(status_code=404, detail="音频段不存在")
     from fastapi.responses import FileResponse
@@ -804,7 +804,7 @@ def meeting_file(mid: int, kind: str = "transcript", _auth=Depends(optional_auth
     m = db.get_meeting(mid)
     if not m:
         raise HTTPException(status_code=404, detail="会议不存在")
-    path = _safe_under(meeting.MEETINGS_DIR, _meeting_dirname(m["name"]), f"{kind}.md")
+    path = _safe_under(meeting.meetings_dir(), _meeting_dirname(m["name"]), f"{kind}.md")
     if not path:
         raise HTTPException(status_code=400, detail="非法路径")
     if not os.path.isfile(path):

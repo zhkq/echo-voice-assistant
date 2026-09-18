@@ -18,8 +18,21 @@ import sys
 import threading
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-MODELS_DIR = os.path.join(BASE_DIR, "models")
-os.environ.setdefault("HF_HOME", MODELS_DIR)
+
+
+def models_dir() -> str:
+    """当前生效的模型目录（用户可在面板里改，见 D20/D21）。
+
+    为什么是函数而不是常量：模型目录要能随配置变化，而"模块级 __getattr__"对模块内部
+    的裸名字无效（PEP 562 只管属性访问），所以内部引用一律调用本函数。
+    """
+    from app import paths
+    return paths.models_root()
+
+
+# HF_HOME 只能在 import 时定一次（HF 库自己读环境变量、没有每次调用的入口），
+# 这里取一次快照；真正读模型文件时一律走 models_dir()，跟随用户改配置。
+os.environ.setdefault("HF_HOME", models_dir())
 os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "0")
 
@@ -97,7 +110,7 @@ def resolve_device(choice="auto"):
 
 def _whisper_dir(model_name):
     name = MODEL_ALIASES.get(model_name, model_name)
-    d = os.path.join(MODELS_DIR, "faster-whisper", name)
+    d = os.path.join(models_dir(), "faster-whisper", name)
     return d if os.path.isfile(os.path.join(d, "model.bin")) else ""
 
 
@@ -107,7 +120,7 @@ def _sensevoice_dir():
     注意：funasr 在 Windows 上无法加载含非 ASCII 字符（如中文）的本地路径，
     遇到这种情况返回 ""，让调用方走模型名（iic/SenseVoiceSmall，落 modelscope 缓存）。
     """
-    root = os.path.join(MODELS_DIR, "sensevoice")
+    root = os.path.join(models_dir(), "sensevoice")
     if not os.path.isdir(root):
         return ""
     for dirpath, _dirs, files in os.walk(root):
@@ -121,7 +134,7 @@ def _sensevoice_dir():
 
 
 def _sherpa_files():
-    d = os.path.join(MODELS_DIR, "sherpa-onnx-streaming")
+    d = os.path.join(models_dir(), "sherpa-onnx-streaming")
     if not os.path.isdir(d):
         return None
     enc = next((f for f in os.listdir(d) if f.startswith("encoder") and f.endswith(".onnx")), "")
@@ -199,7 +212,7 @@ def _get_sherpa():
             return _ENGINES[key]
         files = _sherpa_files()
         if not files:
-            raise RuntimeError("sherpa 流式模型未就绪: " + os.path.join(MODELS_DIR, "sherpa-onnx-streaming"))
+            raise RuntimeError("sherpa 流式模型未就绪: " + os.path.join(models_dir(), "sherpa-onnx-streaming"))
         import sherpa_onnx
         enc, dec, joi, tok = files
         recognizer = sherpa_onnx.OnlineRecognizer.from_transducer(

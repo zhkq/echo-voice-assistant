@@ -28,10 +28,39 @@ from app.audio import tts as tts_mod
 from app import services
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-MEETINGS_DIR = os.path.join(BASE_DIR, "data", "meetings")
 SAMPLE_RATE = 16000
 
-os.makedirs(MEETINGS_DIR, exist_ok=True)
+
+# ---------------------------------------------------------------- 路径（2.0 / D20、D21）
+# 1.x 里这是 import 期常量（`BASE_DIR/data/meetings`），用户改不了；2.0 起由配置项
+# `meetingsDir` 决定（D20），且**每次调用都重新解析**（D21）。
+#
+# 为什么是函数而不是"模块级 __getattr__ + 常量名"：PEP 562 的模块 __getattr__ 只在
+# **属性访问**（`meeting.meetings_dir()`）时生效，模块内部函数里的**裸名字**不会走它，
+# 会直接 NameError。所以内部的 17 处引用统一改成调用 `meetings_dir()`，
+# 跨模块的 `meeting.meetings_dir()` 也一并改成函数调用——不留兼容别名，
+# 免得"有的地方跟着配置走、有的地方是 import 快照"这种半成品状态。
+def meetings_dir() -> str:
+    """当前生效的会议目录（用户可在面板里改，改了立刻生效）。"""
+    from app import paths
+    return paths.meetings_root()
+
+
+def ensure_meetings_dir() -> str:
+    """确保会议目录存在并返回它。录制/写纪要前调用（路径可能随时被用户改）。"""
+    root = meetings_dir()
+    try:
+        os.makedirs(root, exist_ok=True)
+    except OSError:
+        pass
+    return root
+
+
+# 保持 1.x"导入后目录就已存在"的行为；配置坏掉时不能因此炸掉 import。
+try:
+    ensure_meetings_dir()
+except Exception:
+    pass
 
 # ---------------------------------------------------------------- 状态
 
@@ -115,7 +144,7 @@ def start_meeting():
             return False, "会议录音已在进行中"
         cfg = settings
         now = datetime.datetime.now()
-        folder = os.path.join(MEETINGS_DIR, now.strftime("%Y-%m-%d_%H-%M-%S"))
+        folder = os.path.join(meetings_dir(), now.strftime("%Y-%m-%d_%H-%M-%S"))
         os.makedirs(folder, exist_ok=True)
 
         meta = {
@@ -607,7 +636,7 @@ def export_transcript(meeting_id, folder=None):
         meeting = db.get_meeting(meeting_id)
         if not meeting:
             return
-        folder = os.path.join(MEETINGS_DIR, meeting["name"])
+        folder = os.path.join(meetings_dir(), meeting["name"])
     meeting = db.get_meeting(meeting_id) or {}
     speakers = {s["label"]: s["name"] for s in db.get_speakers(meeting_id)}
     lines = db.get_lines(meeting_id)
@@ -670,7 +699,7 @@ def build_segments(meeting_id):
     meeting = db.get_meeting(meeting_id)
     if not meeting:
         return []
-    folder = os.path.join(MEETINGS_DIR, meeting["name"])
+    folder = os.path.join(meetings_dir(), meeting["name"])
     seg_dur = _seg_duration_map(folder)
     lines = db.get_lines(meeting_id)
     by_seg = {}
@@ -1286,7 +1315,7 @@ def _refresh_archived_note(meeting_id):
         meeting = db.get_meeting(meeting_id)
         if not meeting:
             return
-        folder = os.path.join(MEETINGS_DIR, meeting["name"])
+        folder = os.path.join(meetings_dir(), meeting["name"])
         _s, _seg, _tr = _meeting_parts(folder)
         full_text = _meeting_full_text(_s, _seg, _tr)
         # 只有源里确实有实质纪要才重写，避免用更空的内容覆盖更全的
@@ -1315,7 +1344,7 @@ def push_meeting_to_worklog(meeting_id, archive_hint=""):
     meeting = db.get_meeting(meeting_id)
     if not meeting:
         return False, "会议不存在"
-    folder = os.path.join(MEETINGS_DIR, meeting["name"])
+    folder = os.path.join(meetings_dir(), meeting["name"])
     content = open(os.path.join(folder, "summary.md"), encoding="utf-8").read() \
         if os.path.isfile(os.path.join(folder, "summary.md")) else ""
     _summary, _segments, _transcript = _meeting_parts(folder)
@@ -1351,7 +1380,7 @@ def save_summary(meeting_id, content):
     text = (content or "").replace("\r\n", "\n").strip()
     if not text:
         return False, "纪要内容为空，未保存"
-    folder = os.path.join(MEETINGS_DIR, meeting["name"])
+    folder = os.path.join(meetings_dir(), meeting["name"])
     if not os.path.isdir(folder):
         return False, "会议目录不存在"
     try:
@@ -1380,7 +1409,7 @@ def update_meeting_title(meeting_id, title):
     except Exception as e:
         return False, "", f"保存会议名称失败: {e}"
     # topics.md 同步只影响归档/分段展示，失败不回滚数据库（面板已有新名字）
-    folder = os.path.join(MEETINGS_DIR, meeting["name"])
+    folder = os.path.join(meetings_dir(), meeting["name"])
     path = os.path.join(folder, "topics.md")
     if os.path.isfile(path):
         try:
@@ -1402,7 +1431,7 @@ def request_summary(meeting_id, folder=None):
     （request_topic_segments）以 JSON 提供，供列表/日志/前端使用。"""
     if folder is None:
         meeting = db.get_meeting(meeting_id)
-        folder = os.path.join(MEETINGS_DIR, meeting["name"])
+        folder = os.path.join(meetings_dir(), meeting["name"])
     meeting = db.get_meeting(meeting_id)
     transcript = os.path.join(folder, "transcript.md").replace("\\", "/")
     text = (f"任务：基于会议转写文件生成会议纪要（markdown 格式）。\n"
@@ -1444,7 +1473,7 @@ def request_topic_segments(meeting_id, folder=None):
     """
     if folder is None:
         meeting = db.get_meeting(meeting_id)
-        folder = os.path.join(MEETINGS_DIR, meeting["name"])
+        folder = os.path.join(meetings_dir(), meeting["name"])
     meeting = db.get_meeting(meeting_id)
     transcript = os.path.join(folder, "transcript.md").replace("\\", "/")
     text = (f"任务：通读会议转写全文，输出本次会议的结构化元数据 JSON"
@@ -1572,7 +1601,7 @@ def regenerate_summary(meeting_id, extra_prompt=""):
     meeting = db.get_meeting(meeting_id)
     if not meeting:
         return False, "会议不存在"
-    folder = os.path.join(MEETINGS_DIR, meeting["name"])
+    folder = os.path.join(meetings_dir(), meeting["name"])
     if not os.path.isfile(os.path.join(folder, "transcript.md")):
         return False, "转写文件不存在，无法生成纪要"
     run_id = db.add_summary_run(meeting_id, extra_prompt)
@@ -1593,7 +1622,7 @@ def retranscribe_meeting(meeting_id):
     if not meeting:
         return False, "会议不存在"
     name = meeting["name"]
-    folder = os.path.join(MEETINGS_DIR, name)
+    folder = os.path.join(meetings_dir(), name)
     segs = [f for f in os.listdir(folder) if re.match(r"^\d+\.wav$", f)] if os.path.isdir(folder) else []
     if not segs:
         return False, "该会议没有音频片段，无法转写"
@@ -1621,7 +1650,7 @@ def get_meeting_detail(meeting_id):
     meeting = db.get_meeting(meeting_id)
     if not meeting:
         return None
-    folder = os.path.join(MEETINGS_DIR, meeting["name"])
+    folder = os.path.join(meetings_dir(), meeting["name"])
     return {
         **meeting,
         "folder": folder,
@@ -1644,7 +1673,7 @@ def delete_meeting(meeting_id):
     keep_audio = settings.get("meetingKeepRawAudio", True)
     if not keep_audio:
         import shutil
-        folder = os.path.join(MEETINGS_DIR, name)
+        folder = os.path.join(meetings_dir(), name)
         if os.path.isdir(folder):
             shutil.rmtree(folder, ignore_errors=True)
     # 注意顺序：_drop_summary_session 需要用会议名去查映射表，若先删了会议记录
@@ -1669,7 +1698,7 @@ def clean_short_meetings(max_seconds=120):
         name = m["name"]
         if _state["active"] and os.path.basename(_state["folder"] or "") == name:
             continue   # 正在录音，跳过
-        folder = os.path.join(MEETINGS_DIR, name)
+        folder = os.path.join(meetings_dir(), name)
         if os.path.isdir(folder):
             shutil.rmtree(folder, ignore_errors=True)
         # 同 delete_meeting：先清会话映射（需要会议名），再删会议记录

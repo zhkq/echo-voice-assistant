@@ -200,5 +200,63 @@ class PreflightTests(unittest.TestCase):
             paths._settings_get = saved
 
 
+class ConfigurableRootTests(unittest.TestCase):
+    """两个"用户可指定的根"必须**每次访问都跟着配置走**（D20/D21）。
+
+    1.x 里 `MEETINGS_DIR` / `MODELS_DIR` 是 import 期常量，
+    用户改不了；2.0 改成函数。如果哪天有人把它改回常量，这一组会红。
+
+    注意 `db.DATA_DIR` 是**故意**保持常量的：数据根不是用户可配置项（D18 的分平台
+    留到 P3，连同 mac 的布局迁移一起做），而且现有测试直接用"给模块属性赋值"来隔离
+    数据目录。所以这里不测它。
+    """
+
+    def setUp(self):
+        self._get = paths._settings_get
+
+    def tearDown(self):
+        paths._settings_get = self._get
+
+    def test_meetings_dir_follows_config(self):
+        import app.meeting as meeting
+        tmp = tempfile.mkdtemp(prefix="echo-meet-")
+        paths._settings_get = lambda name: tmp if name == "meetingsDir" else ""
+        self.assertEqual(meeting.meetings_dir(), os.path.normpath(tmp))
+        self.assertEqual(meeting.ensure_meetings_dir(), os.path.normpath(tmp))
+        # 切回默认后必须立刻跟着变（import 期常量做不到这件事）
+        paths._settings_get = lambda name: ""
+        self.assertEqual(meeting.meetings_dir(), os.path.join(paths.data_root(), "meetings"))
+
+    def test_stt_and_modelinfo_models_dir_follow_config(self):
+        import app.audio.stt as stt
+        import app.modelinfo as mi
+        tmp = tempfile.mkdtemp(prefix="echo-models-")
+        paths._settings_get = lambda name: tmp if name == "modelsDir" else ""
+        self.assertEqual(stt.models_dir(), os.path.normpath(tmp))
+        self.assertEqual(mi.models_dir(), os.path.normpath(tmp))
+        paths._settings_get = lambda name: ""
+        self.assertEqual(stt.models_dir(), os.path.join(paths.echo_root(), "models"))
+
+    def test_no_module_level_path_constants_left_for_configurable_roots(self):
+        """这两个根不能再以模块常量形式出现（半成品状态比没做更危险）。"""
+        for rel, name in (("meeting.py", "MEETINGS_DIR"),
+                          ("audio/stt.py", "MODELS_DIR"),
+                          ("modelinfo.py", "MODELS_DIR")):
+            p = os.path.join(paths.echo_root(), "app", rel)
+            with open(p, encoding="utf-8") as fh:
+                lines = [ln for ln in fh.read().splitlines()]
+            bad = [i for i, ln in enumerate(lines, 1)
+                   if ln.strip().startswith(name + " =")]
+            self.assertEqual(bad, [], "%s 里不应再有模块级 %s 常量（行 %s）" % (rel, name, bad))
+
+    def test_paths_config_items_are_declared(self):
+        """两个新配置项必须在 DEFAULTS 里，且默认值为空（留空 = 用平台默认）。"""
+        from app import config
+        for key in ("meetingsDir", "modelsDir"):
+            self.assertIn(key, config.DEFAULTS, "%s 必须登记进 DEFAULTS" % key)
+            self.assertEqual(config.DEFAULTS[key]["value"], "")
+            self.assertEqual(config.DEFAULTS[key]["grp"], "paths")
+
+
 if __name__ == "__main__":
     unittest.main()

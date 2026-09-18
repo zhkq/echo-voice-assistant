@@ -25,6 +25,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import app.db as db  # noqa: E402
 from app import meeting as meeting_mod  # noqa: E402
+from app import paths as paths_mod  # noqa: E402
 from app import voiceprint as vp  # noqa: E402
 from app.config import settings  # noqa: E402
 
@@ -40,11 +41,13 @@ class ApiVoiceprintTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls._tmp = tempfile.mkdtemp(prefix="echo-vp-api-")
-        cls._old = (db.DATA_DIR, db.DB_FILE, meeting_mod.MEETINGS_DIR)
+        # 2.0 起会议目录不再是模块常量（D20/D21，用户可配），所以隔离要打在
+        # app.paths 的解析函数上，而不是给 meeting 模块赋属性（那样已经无效）。
+        cls._old = (db.DATA_DIR, db.DB_FILE, paths_mod.meetings_root)
         db.DATA_DIR = cls._tmp
         db.DB_FILE = os.path.join(cls._tmp, "test.db")
-        meeting_mod.MEETINGS_DIR = os.path.join(cls._tmp, "meetings")
-        os.makedirs(meeting_mod.MEETINGS_DIR, exist_ok=True)
+        paths_mod.meetings_root = lambda: os.path.join(cls._tmp, "meetings")
+        os.makedirs(meeting_mod.meetings_dir(), exist_ok=True)
         db.init()
         # 声纹默认是关闭的（opt-in，生物特征数据，见 app/config.py）：这些用例假设已开启，
         # 就显式打开 —— 别依赖默认值，否则默认值一改测试就跟着变红。
@@ -60,7 +63,7 @@ class ApiVoiceprintTest(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        db.DATA_DIR, db.DB_FILE, meeting_mod.MEETINGS_DIR = cls._old
+        db.DATA_DIR, db.DB_FILE, paths_mod.meetings_root = cls._old
         shutil.rmtree(cls._tmp, ignore_errors=True)
 
     def setUp(self):
@@ -70,7 +73,7 @@ class ApiVoiceprintTest(unittest.TestCase):
 
     def _meeting(self, name, speakers, emb_map):
         mid = db.create_meeting(name, started_at="2026-09-15 10:00:00")
-        os.makedirs(os.path.join(meeting_mod.MEETINGS_DIR, name), exist_ok=True)
+        os.makedirs(os.path.join(meeting_mod.meetings_dir(), name), exist_ok=True)
         db.replace_speakers(mid, {s: s.replace("S", "说话人") for s in speakers})
         db.replace_speaker_embeddings(
             mid, {s: (*vp.pack(v), 2) for s, v in emb_map.items()})
@@ -134,7 +137,7 @@ class ApiVoiceprintTest(unittest.TestCase):
         rows = {s["label"]: s["name"] for s in db.get_speakers(mid)}
         self.assertEqual(rows, {"S1": "张总", "S2": "说话人2"})
         # 识别后 re-export transcript.md，里面带联系人名
-        path = os.path.join(meeting_mod.MEETINGS_DIR, "m4", "transcript.md")
+        path = os.path.join(meeting_mod.meetings_dir(), "m4", "transcript.md")
         self.assertTrue(os.path.isfile(path))
         with open(path, encoding="utf-8") as f:
             self.assertIn("张总", f.read())

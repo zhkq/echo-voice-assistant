@@ -104,6 +104,19 @@ DEFAULTS = {
                                              "会话被归档/删除后自动回退到「该工作区自动」。"
                                              "由面板下拉自动写入，一般不用手改",
                                  value_type="str"),
+    # ---------- 存储路径（2.0 / D20、D21）----------
+    # 留空 = 用默认值；默认值由 app/paths.py 解析（分平台，见 app/platform/<os>/env.py）。
+    # 这里存的是"用户指定值"而不是解析后的绝对路径——占位符让同一份配置在任何机器都能用。
+    "meetingsDir":     dict(value="", grp="paths", label="会议目录",
+                            description="会议录音与纪要的存放目录。留空 = {DATA}/meetings。"
+                                        "支持 {ECHO}/{DATA} 占位符与 ~。"
+                                        "改后旧会议仍留在原目录，需要用面板里的「迁移已有会议」搬过来",
+                            value_type="str"),
+    "modelsDir":       dict(value="", grp="paths", label="模型目录",
+                            description="模型权重（whisper / SenseVoice / 唤醒词 / pyannote…）的存放目录。"
+                                        "留空 = {ECHO}/models。支持 {ECHO}/{DATA} 占位符与 ~。"
+                                        "改后需重新下载模型，或自行把原目录拷过去",
+                            value_type="str"),
     "userLocation":    dict(value="北京", grp="general", label="用户所在地",
                             description="发给 DSH 命令时附带的地理位置（天气/时间等问答需要）",
                             value_type="str"),

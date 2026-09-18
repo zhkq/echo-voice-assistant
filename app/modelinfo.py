@@ -27,7 +27,12 @@ os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 os.environ.setdefault("MODELSCOPE_DISABLE_PROGRESS_BAR", "1")
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-MODELS_DIR = os.path.join(BASE_DIR, "models")
+
+
+def models_dir() -> str:
+    """当前生效的模型目录（用户可在面板里改，见 D20/D21）。"""
+    from app import paths
+    return paths.models_root()
 MS_CACHE = os.path.join(os.path.expanduser("~"), ".cache", "modelscope", "models")
 
 WHISPER_SIZES = {"tiny": "~75 MB", "base": "~141 MB", "small": "~464 MB",
@@ -71,8 +76,8 @@ def _pkg_available(name):
 
 def _sensevoice_model_dir():
     """本地 models/sensevoice（含多层 snapshots）或 ModelScope 缓存，返回落地目录或 None。"""
-    if _first_stem_dir_with_files(os.path.join(MODELS_DIR, "sensevoice"), ["model."]):
-        return os.path.join(MODELS_DIR, "sensevoice")
+    if _first_stem_dir_with_files(os.path.join(models_dir(), "sensevoice"), ["model."]):
+        return os.path.join(models_dir(), "sensevoice")
     if os.path.isdir(_ms_dir("iic/SenseVoiceSmall")):
         return _ms_dir("iic/SenseVoiceSmall")
     return None
@@ -89,14 +94,14 @@ def _ready_sensevoice():
 
 def _whisper_hub_dir(name):
     """HF 缓存目录（面板点下载落这里；stt 按名字加载时也读这个缓存）。"""
-    return os.path.join(MODELS_DIR, "hub", f"models--Systran--faster-whisper-{name}")
+    return os.path.join(models_dir(), "hub", f"models--Systran--faster-whisper-{name}")
 
 
 def _ready_whisper(name):
     """两种落地都算就绪：
        ① stt._whisper_dir() 认的本地目录 models/faster-whisper/<档>/model.bin；
        ② HF 缓存 models/hub/models--Systran--faster-whisper-<档>/snapshots/*/model.bin（面板下载的产物）。"""
-    if os.path.isfile(os.path.join(MODELS_DIR, "faster-whisper", name, "model.bin")):
+    if os.path.isfile(os.path.join(models_dir(), "faster-whisper", name, "model.bin")):
         return True
     hub = _whisper_hub_dir(name)
     for _root, _dirs, files in os.walk(hub) if os.path.isdir(hub) else ():
@@ -107,7 +112,7 @@ def _ready_whisper(name):
 
 def _ready_sherpa():
     """stt._sherpa_files(): encoder*/decoder*/joiner*.onnx + tokens.txt 同时存在。"""
-    d = os.path.join(MODELS_DIR, "sherpa-onnx-streaming")
+    d = os.path.join(models_dir(), "sherpa-onnx-streaming")
     if not os.path.isdir(d):
         return False
     files = os.listdir(d)
@@ -119,7 +124,7 @@ def _ready_sherpa():
 
 def _ready_kws():
     """wake.py 里写死的四个文件名。"""
-    d = os.path.join(MODELS_DIR, "wakeword", "kws-zh-en-3m")
+    d = os.path.join(models_dir(), "wakeword", "kws-zh-en-3m")
     need = ["encoder-epoch-13-avg-2-chunk-8-left-64.int8.onnx",
             "decoder-epoch-13-avg-2-chunk-8-left-64.onnx",
             "joiner-epoch-13-avg-2-chunk-8-left-64.int8.onnx",
@@ -133,8 +138,8 @@ def ready_pyannote():
     公开函数：boot 的「说话人分离」就绪判定直接用它（别再调 _ready_* 私有名）。
     """
     from scripts.install_pyannote import ASSETS
-    return all(os.path.isfile(os.path.join(MODELS_DIR, "pyannote", folder, filename))
-               and os.path.getsize(os.path.join(MODELS_DIR, "pyannote", folder, filename)) > 0
+    return all(os.path.isfile(os.path.join(models_dir(), "pyannote", folder, filename))
+               and os.path.getsize(os.path.join(models_dir(), "pyannote", folder, filename)) > 0
                for _, folder, filename in ASSETS)
 
 
@@ -238,14 +243,14 @@ def _target_path(entry):
     if i == "qwen3asr":
         return _ms_dir("Qwen/Qwen3-ASR-0.6B")
     if i == "sherpa":
-        return os.path.join(MODELS_DIR, "sherpa-onnx-streaming")
+        return os.path.join(models_dir(), "sherpa-onnx-streaming")
     if i == "pyannote":
-        return os.path.join(MODELS_DIR, "pyannote")
+        return os.path.join(models_dir(), "pyannote")
     if i == "kws":
-        return os.path.join(MODELS_DIR, "wakeword", "kws-zh-en-3m")
+        return os.path.join(models_dir(), "wakeword", "kws-zh-en-3m")
     if i.startswith("whisper-"):
         tier = i.split("-", 1)[1]
-        local = os.path.join(MODELS_DIR, "faster-whisper", tier)
+        local = os.path.join(models_dir(), "faster-whisper", tier)
         return local if os.path.isdir(local) else _whisper_hub_dir(tier)
     return ""
 
@@ -255,7 +260,7 @@ def _measure_paths(entry):
     否则会把同目录下的 faster-whisper-* 冗余副本（5GB）也算进去。"""
     i = entry["id"]
     if i == "pyannote":
-        p = os.path.join(MODELS_DIR, "pyannote")
+        p = os.path.join(models_dir(), "pyannote")
         return [os.path.join(p, n) for n in ("pyannote-segmentation-3.0-local",
                                              "pyannote-wespeaker-local",
                                              "pyannote-plda-local")]
@@ -302,9 +307,9 @@ def _watch_paths(mid):
                 os.path.join(MS_CACHE, "Qwen--Qwen3-ForcedAligner-0.6B")]
     if mid.startswith("whisper-"):
         tier = mid.split("-", 1)[1]
-        return [os.path.join(MODELS_DIR, "hub", f"models--Systran--faster-whisper-{tier}")]
+        return [os.path.join(models_dir(), "hub", f"models--Systran--faster-whisper-{tier}")]
     if mid == "sherpa":
-        return [os.path.join(MODELS_DIR, "sherpa-onnx-streaming")]
+        return [os.path.join(models_dir(), "sherpa-onnx-streaming")]
     return []
 
 
@@ -360,7 +365,7 @@ def _download_worker(entry):
             # 只拉代码认的那几个文件名，直接落到目标目录（local_dir），省掉 400MB 的 fp32 与测试音频
             from huggingface_hub import snapshot_download
             snapshot_download(entry["ref"],
-                              local_dir=os.path.join(MODELS_DIR, "sherpa-onnx-streaming"),
+                              local_dir=os.path.join(models_dir(), "sherpa-onnx-streaming"),
                               allow_patterns=entry.get("allow") or None)
         _JOBS[mid].update(status="done", percent=100,
                           message="下载完成", done_at=time.strftime("%H:%M:%S"),
