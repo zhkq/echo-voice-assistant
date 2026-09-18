@@ -40,7 +40,7 @@ from fastapi.responses import FileResponse
 import app.db as db
 from app import __version__ as ECHO_VERSION
 from app.config import settings
-from app import manager, runtime, services
+from app import manager, ports, runtime, services
 from app.api import router
 from app.pathutil import safe_under
 
@@ -174,28 +174,27 @@ def main():
         pass
 
     db.init()
-    port = int(settings.get("serverPort", 8970))
-    # 防重复实例（第 2 道、兜底）：端口是否已被监听。锁只能挡住"也用这把锁的实例"，
+    preferred = int(settings.get("serverPort", 8970))
+    # 防重复实例（第 2 道、兜底）：端口上已经有东西在监听。锁只能挡住"也用这把锁的实例"，
     # 挡不住老版本进程或别的程序占着端口，所以这一层保留 —— 但它是兜底，不是权威。
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.settimeout(0.5)
-    try:
-        occupied = s.connect_ex(("127.0.0.1", port)) == 0
-    finally:
-        s.close()
-    if occupied:
-        print(f"检测到端口 {port} 已被其他 ECHO 实例占用，本实例退出（重复实例）", flush=True)
+    # 注意：这里**只**判"有人在听"，不判"能不能 bind"（后者见下一段的自动让位）。
+    if ports.listening("127.0.0.1", preferred):
+        print(f"检测到端口 {preferred} 已被其他 ECHO 实例占用，本实例退出（重复实例）", flush=True)
         sys.exit(0)
-    # 把实际监听端口写到 data\echo-port.txt：外部脚本（launch-desktop.ps1 等）
-    # 与 DSH 插件据此定位服务，从而不必把端口写死在多处。
-    # 为什么需要：Windows 动态端口段（默认 1024-15000）会被 Hyper-V/WSL 划为保留段
-    # 且每次重启漂移，落在其中的端口 bind 会失败（Errno 13），届时必须改 serverPort。
-    try:
-        port_file = os.path.join(db.DATA_DIR, "echo-port.txt")
-        with open(port_file, "w", encoding="ascii") as f:
-            f.write(str(port))
-    except Exception as e:
-        print(f"[warn] 写入 echo-port.txt 失败: {e}")
+    # 端口可能落在 Windows 保留段里：Hyper-V/WSL 会划走动态端口段，且每次重启漂移，
+    # bind 报的是 Errno 13（没有权限）而不是"已占用"。这种情况必须自动让位——
+    # 否则表现为"进程活着但端口没监听"，从外面完全看不出原因（2026-09-14 的事故）。
+    port, note = ports.pick(preferred)
+    if not port:
+        print(f"[fail] 无法分配监听端口：{note}", flush=True)
+        sys.exit(1)
+    if note:
+        print(f"[warn] {note}（原配置 serverPort={preferred}）", flush=True)
+    # 把**实际**监听端口写到 data\echo-port.txt：外部脚本（launch-desktop.ps1 等）
+    # 与 DSH 插件据此定位服务，从而不必把端口写死在多处。端口一旦让位，这里必须跟着更新，
+    # 否则脚本会去找旧端口。
+    if not ports.write_port_file(db.DATA_DIR, port):
+        print("[warn] 写入 echo-port.txt 失败", flush=True)
     print(f"ECHO 服务启动: http://127.0.0.1:{port}")
     uvicorn.run(app, host="127.0.0.1", port=port, log_level="info")
 
