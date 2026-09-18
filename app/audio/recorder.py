@@ -17,6 +17,20 @@ import numpy as np
 
 SAMPLE_RATE = 16000
 
+# 名字里带这些词的，基本都是"虚拟 / 映射 / 回环 / 汇总"设备：**兜底遍历**时不主动去开它们。
+# 为什么：macOS 上打开这类设备可能把 CoreAudio HAL 卡死（issue #15：麦克风永久超时 + CPU 400%），
+# Windows 上则常见"录到静音或系统声音"（本机 idx0 就是「Microsoft 声音映射器」）。
+# 注意：只过滤兜底遍历；用户显式指定的设备、以及系统默认输入都不受此限制。
+_VIRTUAL_HINTS = ("声音映射器", "sound mapper", "映射器", "立体声混音", "stereo mix",
+                  "virtual", "虚拟", "voicemeeter", "vb-audio", "cable", "loopback",
+                  "blackhole", "soundflower", "aggregate", "汇总", "oray")
+
+
+def _is_virtual_device(name):
+    """按设备名粗判虚拟/映射/回环/汇总设备（只用于兜底遍历的跳过）。"""
+    low = (name or "").lower()
+    return any(h in low for h in _VIRTUAL_HINTS)
+
 
 def _open_input(device_id=-1, blocksize=0):
     """打开可用的输入流。
@@ -29,6 +43,9 @@ def _open_input(device_id=-1, blocksize=0):
     的下标硬取：该 pair 是 (输入, 输出)，早期代码误取 [1]（输出设备）当输入，
     还会把真正的默认输入排除掉，于是去开虚拟/接力设备（Oray、iPhone 麦克风），
     在 macOS 上可能把 CoreAudio HAL 卡死。见 app/audio/wake.py 同样结论。
+
+    兜底遍历会跳过虚拟/映射/回环设备（见 _VIRTUAL_HINTS）：issue #15 就是被这类设备
+    卡死的；显式指定与系统默认两条路径不跳过（尊重用户/系统的选择）。
     """
     import sounddevice as sd
 
@@ -38,12 +55,20 @@ def _open_input(device_id=-1, blocksize=0):
 
     candidates = []
     if device_id is not None and device_id >= 0:
-        candidates.append(device_id)
+        candidates.append(device_id)          # 显式指定：即使是虚拟设备也照用
     else:
-        candidates.append(None)  # 系统默认输入
+        candidates.append(None)               # 系统默认输入（尊重系统设置）
+    skipped_virtual = []
     for d in sd.query_devices():
-        if d["max_input_channels"] > 0:
-            candidates.append(d["index"])
+        if d["max_input_channels"] <= 0:
+            continue
+        if _is_virtual_device(d.get("name")):
+            skipped_virtual.append(d["index"])
+            continue
+        candidates.append(d["index"])
+    if skipped_virtual:
+        _log_record(-1, 0.0, False,
+                    f"兜底遍历跳过 {len(skipped_virtual)} 个虚拟/映射设备: {skipped_virtual[:6]}")
 
     seen = set()
     for idx in candidates:
@@ -55,6 +80,9 @@ def _open_input(device_id=-1, blocksize=0):
         except Exception as e:
             _log_record(idx, 0, False, f"设备打开失败: {str(e)[:60]}")
             continue
+    if skipped_virtual:
+        raise RuntimeError(
+            f"没有可用的输入设备（已跳过 {len(skipped_virtual)} 个虚拟/映射设备：{skipped_virtual[:4]}）")
     raise RuntimeError("没有可用的输入设备")
 
 
