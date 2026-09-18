@@ -1013,6 +1013,77 @@ $("#settingsForm").addEventListener("click", async (e) => {
   if (a) toast(a.available ? `${a.displayName} 可用` : `${a.displayName} 不可用：${a.reason || ""}`);
 });
 
+/* ---- 环境体检 + 迁移已有会议（2.0 / P1、D20、D21） ----
+   只读展示四类根（ECHO/DATA/MEETINGS/MODELS）的存在、可写性与磁盘余量，并提供
+   "迁移已有会议"。迁移的用法刻意设计成两步：**先改上面的「会议目录」并保存，再点迁移**——
+   卡片在渲染时记下"当时的会议目录"作为 source，因为配置一旦保存，"当前目录"就已经是新值了，
+   不显式传旧值的话服务端只能回答"无需迁移"（正确但不是用户想要的）。 */
+async function renderEnvCheck(host) {
+  host.innerHTML = `<div class="set-group" data-grp="envcheck">
+    <div class="set-group-title" role="button" tabindex="0" aria-expanded="true">
+      <span class="set-arrow">▶</span><span>环境体检</span><span class="set-count" id="envCheckCount">…</span>
+    </div>
+    <div class="set-group-body"><div id="envCheckBody" class="muted">读取中…</div></div>
+  </div>`;
+  let oldPath = null;                       // 渲染时的会议目录 = 迁移的源
+  const post = (url, body) => fetch(url, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+  }).then((r) => r.json());
+
+  async function migrate() {
+    const btn = $("#envMigrateBtn");
+    if (btn) { btn.disabled = true; btn.textContent = "迁移中…"; }
+    try {
+      const dry = await post("/api/paths/migrate-meetings", { source: oldPath || "", dryRun: true });
+      if (!dry.ok) { toast("无法迁移：" + (dry.error || "未知原因")); return; }
+      const plan = `源：${dry.source}\n目标：${dry.target}\n将迁移 ${dry.moved.length} 个会议目录\n` +
+        `跳过（目标已存在）${dry.skipped.length} 个\n不动（非会议目录）${(dry.others || []).length} 个` +
+        (dry.moved.length ? `\n\n${dry.moved.slice(0, 8).join("\n")}${dry.moved.length > 8 ? "\n…" : ""}` : "");
+      if (!dry.moved.length) { toast("没有需要迁移的会议目录（目标里可能已经搬过了）"); return; }
+      if (!window.confirm(plan + "\n\n现在开始迁移？")) return;
+      const done = await post("/api/paths/migrate-meetings", { source: oldPath || "", dryRun: false });
+      if (done.ok) { toast(`已迁移 ${done.moved.length} 个会议目录`); refresh(); }
+      else { toast("迁移未完成：" + (done.error || "未知原因")); }
+    } catch (e) { toast("迁移失败：" + e.message); }
+    finally { if (btn) { btn.disabled = false; btn.textContent = "迁移已有会议"; } }
+  }
+
+  async function refresh() {
+    try {
+      const d = await api("/api/paths/env");
+      const rows = (d.roots || []).map((r) => `<tr>
+        <td>${esc(r.name)}</td>
+        <td style="word-break:break-all">${esc(r.path || "(无法解析)")}</td>
+        <td>${r.exists ? "有" : "无"}</td>
+        <td>${r.writable ? "可写" : "<b>不可写</b>"}</td>
+        <td>${r.freeGB == null ? "-" : r.freeGB + " GB"}</td>
+        <td>${esc(r.note || "")}</td></tr>`).join("");
+      const meet = (d.roots || []).find((r) => r.name === "MEETINGS");
+      if (oldPath === null) oldPath = meet ? (meet.path || "") : "";
+      const cfg = d.configured || {};
+      $("#envCheckBody").innerHTML = `
+        <table class="muted" style="width:100%;font-size:12px">
+          <thead><tr><th>根</th><th>路径</th><th>存在</th><th>写入</th><th>可用</th><th>备注</th></tr></thead>
+          <tbody>${rows}</tbody></table>
+        <div class="muted" style="margin:8px 0;font-size:12px">
+          会议目录 ${d.meetingDirs} 个 · 面板端口 ${d.port || "-"} ·
+          会议目录为自定义：${cfg.meetings ? "是" : "否"} · 模型目录为自定义：${cfg.models ? "是" : "否"}
+        </div>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <button type="button" id="envMigrateBtn">迁移已有会议</button>
+          <span class="muted" style="font-size:12px">
+            用法：先把上面的「会议目录」改成新路径并**保存**，再点这里搬旧会议（先列出计划，确认后才动手）。
+          </span>
+        </div>`;
+      $("#envCheckCount").textContent = (d.roots || []).length;
+      $("#envMigrateBtn").addEventListener("click", migrate);
+    } catch (e) {
+      $("#envCheckBody").textContent = "读取失败：" + e.message;
+    }
+  }
+  refresh();
+}
+
 async function loadSettings() {
   try {
     const r = await api("/api/settings");
@@ -1051,6 +1122,13 @@ async function loadSettings() {
       </div>`;
     }).join("");
     renderAgentTable();
+    // 环境体检卡片（2.0 / P1）：四类根 + 一键迁移已有会议
+    try {
+      const envHost = document.createElement("div");
+      envHost.id = "envCheckHost";
+      form.appendChild(envHost);
+      renderEnvCheck(envHost);
+    } catch (e) { /* 体检卡片失败不能拖垮设置页 */ }
     _syncSettingsCollapseAll();     // 重绘后让顶部双箭头跟着当前折叠状态
   } catch (e) { toast("加载设置失败：" + e.message); }
 }
