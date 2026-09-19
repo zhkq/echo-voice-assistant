@@ -294,9 +294,94 @@ def repeat_one_beep(name, times=3, gap=3.0):
     print("  result: %d/%d heard" % (heard, times))
 
 
+def ab_one_file(name, gap=2.5):
+    """同一个文件、三条播放通路 A/B/C 对照 —— 用来把"文件问题"与"通路问题"分开。
+
+    起因：`done.wav` 3/3 次都听不到，而 `play_beep()` 返回 True（winsound 接受了）。
+    频率 700 Hz、峰值与其它四个相同，所以既不是"太短"也不像"格式坏"。必须换通路比对：
+
+      A. 接缝（Windows = winsound 异步）—— **ECHO 提示音现在走的这条**
+      B. sounddevice（soundfile 解码 + sd.play）—— **语音简报走的这条，已知能听到**
+      C. 接缝 + 前面垫 200ms 静音（测试"启动延迟吃掉开头"这个假设）
+
+    判据：
+      * B 听到、A 听不到 -> 是 winsound 这条通路对这个文件有问题 -> 提示音改走 sounddevice
+      * C 听到、A 听不到 -> 是"开头若干毫秒被吃掉" -> 给提示音前置静音即可
+      * A/B/C 都听不到   -> 文件/设备路由问题（换文件或查音量路由）
+    """
+    hr("AB. same file, three playback paths: %s.wav" % name)
+    import shutil
+    import tempfile
+    src = os.path.join(ROOT, "assets", "beeps", name + ".wav")
+    if not os.path.isfile(src):
+        print("  missing: %s" % src)
+        return
+    try:
+        from app.audio import tts
+        from app import platform as echo_platform
+    except Exception:
+        traceback.print_exc()
+        return
+
+    # 先热身（winsound 播 ok 两次），让设备处于工作状态
+    print("  warm-up: play_beep('ok') x2")
+    for _ in range(2):
+        tts.play_beep("ok")
+        time.sleep(1.5)
+    pause("warm-up done. Press ENTER to start A/B/C")
+
+    print("")
+    print("  >>> A. via the SEAM (winsound async) - what ECHO beeps use now")
+    print("      play_beep(%r) = %r" % (name, tts.play_beep(name)))
+    time.sleep(gap)
+    ask_heard("%s via A=seam/winsound" % name)
+
+    print("")
+    print("  >>> B. via sounddevice - what the VOICE BRIEF uses (known to work)")
+    print("      _play_media_file() = %r" % tts._play_media_file(src))
+    time.sleep(gap)
+    ask_heard("%s via B=sounddevice" % name)
+
+    print("")
+    print("  >>> C. via the SEAM but with 200ms of leading silence")
+    tmpdir = tempfile.mkdtemp(prefix="echo-beep-pad-")
+    try:
+        import numpy as np
+        import soundfile as sf
+        data, sr = sf.read(src, dtype="float32")
+        pad = np.zeros(int(sr * 0.2), dtype="float32")
+        padded = os.path.join(tmpdir, name + "-padded.wav")
+        sf.write(padded, np.concatenate([pad, data]), sr, subtype="PCM_16")
+        print("      seam(padded) = %r" % echo_platform.play_wav_async(padded))
+        time.sleep(gap)
+        ask_heard("%s via C=seam+200ms silence" % name)
+    except Exception:
+        traceback.print_exc()
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def main():
-    # 单曲重复模式：probe-tts.bat --beep done --times 3
+    # A/B/C 对照模式：probe-tts.bat --ab done
     argv = sys.argv[1:]
+    if "--ab" in argv:
+        idx = argv.index("--ab")
+        name = argv[idx + 1] if len(argv) > idx + 1 else "done"
+        log_path = os.path.join(ROOT, "data", "logs", "probe-tts-last.txt")
+        tee = _Tee(log_path)
+        if tee.fh:
+            sys.stdout = tee
+        print("ECHO audio probe - A/B/C path comparison (dev tree)")
+        print("root   : %s" % ROOT)
+        print("log    : %s" % log_path)
+        ab_one_file(name)
+        hr("SUMMARY (paste this back)")
+        for label, heard in RESULTS:
+            print("  %-34s %s" % (label, "HEARD" if heard else "NOT heard"))
+        print("")
+        print("DONE-PROBE-TTS")
+        return
+    # 单曲重复模式：probe-tts.bat --beep done --times 3
     if "--beep" in argv:
         name = argv[argv.index("--beep") + 1] if len(argv) > argv.index("--beep") + 1 else "done"
         times = 3
