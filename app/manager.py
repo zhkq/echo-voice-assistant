@@ -23,7 +23,6 @@ DATA_DIR = _paths.data_root()
 DSH_PID_FILE = os.path.join(DATA_DIR, "dsh.pid")
 ECHO_PID_FILE = os.path.join(DATA_DIR, "echo.pid")
 
-CREATE_NO_WINDOW = 0x08000000
 
 
 def dsh_ready():

@@ -313,14 +313,16 @@ def note_stt_loaded(cid, key):
 def _start_tts(report):
     from app.config import settings
     from app.audio import tts
+    from app import platform as echo_platform
     eng = settings.get("ttsEngine", "auto")
     online = tts.probe_online()
+    offline = echo_platform.offline_tts_display()
     if eng == "sapi":
-        detail = "离线 · Windows 慧慧"
+        detail = "离线 · %s" % offline
     elif eng == "edge-tts":
-        detail = "在线 · edge-tts" if online else "在线(不可达，将回退 SAPI)"
+        detail = "在线 · edge-tts" if online else "在线(不可达，将回退 %s)" % offline
     else:
-        detail = "在线 · edge-tts" if online else "离线 · Windows 慧慧（在线不可达）"
+        detail = "在线 · edge-tts" if online else "离线 · %s（在线不可达）" % offline
     report(status="online", detail=detail, progress=1.0)
 
 

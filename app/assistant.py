@@ -225,23 +225,18 @@ def brief_text(reply, max_chars=200):
 # ---------------------------------------------------------------- 通知
 
 def notify(title, text):
-    """Windows 气球通知（后台线程，不阻塞）。"""
+    """桌面通知（后台线程，不阻塞）。实现是平台差异，收在接缝里：
+
+    Windows = PowerShell NotifyIcon 气泡；macOS = ``osascript display notification``。
+    """
+    from app import platform as echo_platform
+
     def _run():
-        import subprocess
-        ps = (
-            "Add-Type -AssemblyName System.Windows.Forms; "
-            "$n = New-Object System.Windows.Forms.NotifyIcon; "
-            "$n.Icon = [System.Drawing.SystemIcons]::Information; "
-            "$n.Visible = $true; $n.BalloonTipTitle = $title; "
-            "$n.BalloonTipText = $text; $n.ShowBalloonTip(5000); "
-            "Start-Sleep -Milliseconds 600; $n.Dispose()"
-        ).replace("$title", "'" + title.replace("'", "''") + "'") \
-         .replace("$text", "'" + text.replace("'", "''") + "'")
         try:
-            subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
-                           timeout=8, creationflags=0x08000000)
+            echo_platform.notify(str(title), str(text))
         except Exception:
             pass
+
     threading.Thread(target=_run, daemon=True).start()
 
 

@@ -75,6 +75,37 @@ class PlatformDifferencesStayInTheSeam(unittest.TestCase):
             "platform.system() 分支：\n" + "\n".join(bad))
 
 
+class RuntimeReplacementStaysInTheSeam(unittest.TestCase):
+    """运行时替换（Windows API / 专有命令 / 硬编码子进程 flags）也必须收在接缝里。
+
+    这三条规则是 P3 剩余搬迁的验收面：早先的清点器只扫路径与平台分支，
+    于是"清点清零"被误读成"D12 收口完毕"（见 docs/P3-收口施工方案.md §10 诚实边界）。
+    """
+
+    def test_no_windows_api_outside_app_platform(self):
+        bad = _violations("WINDOWS_API")
+        self.assertEqual(
+            bad, [],
+            "Windows API（windll / winsound / tasklist / 钩子常量…）只允许出现在 "
+            "app/platform/<os>/；业务代码请通过 app.platform 的运行时原语：\n"
+            + "\n".join(bad))
+
+    def test_no_windows_shell_commands_outside_app_platform(self):
+        bad = _violations("WINDOWS_SHELL")
+        self.assertEqual(
+            bad, [],
+            "Windows 专有命令（powershell / cmd）只允许出现在 app/platform/<os>/ "
+            "或声明式平台默认值里；业务代码请用 console_shell_argv() 之类的原语：\n"
+            + "\n".join(bad))
+
+    def test_no_hardcoded_creationflags_outside_app_platform(self):
+        bad = _violations("HARDCODED_FLAGS")
+        self.assertEqual(
+            bad, [],
+            "子进程 flags 不许硬编码；用 no_window_creationflags() / "
+            "detach_gui_kwargs() / detach_console_kwargs()：\n" + "\n".join(bad))
+
+
 class WhitelistStaysMinimal(unittest.TestCase):
     def test_allowlist_is_only_platform_and_paths(self):
         self.assertEqual(
@@ -93,7 +124,13 @@ class EveryPlatformImplementsThePrimitives(unittest.TestCase):
     PRIMITIVES = ("display_name", "no_window_creationflags", "chromium_candidates",
                   "agent_cli_candidates", "tcp_excluded_port_range_output",
                   "hf_executable", "shell_script",
-                  "acquire_named_lock", "named_lock_held", "release_named_lock")
+                  "acquire_named_lock", "named_lock_held", "release_named_lock",
+                  # P3 剩余搬迁新增的运行时原语（子进程 / 进程查询 / 打开窗口 /
+                  # 提示音 / 离线 TTS / 通知 / 边条候选）
+                  "detach_gui_kwargs", "detach_console_kwargs", "console_shell_argv",
+                  "process_running", "shell_open", "play_wav_async",
+                  "offline_tts_speak", "offline_tts_label", "offline_tts_display",
+                  "notify", "sidebar_candidates")
 
     def test_all_platform_env_modules_expose_every_primitive(self):
         import importlib
@@ -106,6 +143,21 @@ class EveryPlatformImplementsThePrimitives(unittest.TestCase):
                     missing.append("%s.%s" % (name, fn))
         self.assertEqual(missing, [],
                          "每个平台的 env.py 都要实现同一组接缝原语：\n" + "\n".join(missing))
+
+    def test_every_platform_has_a_hotkey_implementation(self):
+        """三平台都要有全局热键实现模块（macOS/Linux 走 POSIX 共享实现）。
+
+        本机没有 mac，所以只能静态断言"模块存在 + 接口齐"；真正的可用性属
+        S10（免授权 Carbon 宿主）与 mac 实测。
+        """
+        import importlib
+
+        missing = []
+        for name in ("win32", "darwin", "linux"):
+            mod = importlib.import_module("app.platform.%s.hotkey" % name)
+            if not callable(getattr(mod, "HotkeyListener", None)):
+                missing.append("%s.HotkeyListener" % name)
+        self.assertEqual(missing, [], "三平台都要有热键实现：\n" + "\n".join(missing))
 
 
 class ScannerSelfTest(unittest.TestCase):
@@ -146,6 +198,29 @@ class ScannerSelfTest(unittest.TestCase):
 
     def test_ignores_docstring_prose(self):
         self.assertEqual(self._rules('"""example C:\\Windows in prose"""\n'), [])
+
+    # ---- 运行时替换（P3 剩余搬迁的三条规则）----
+
+    def test_flags_windows_api_call(self):
+        self.assertIn("WINDOWS_API", self._rules("import winsound\nwinsound.PlaySound('x', 0)\n"))
+        self.assertIn("WINDOWS_API", self._rules("import ctypes\nctypes.windll.user32\n"))
+        self.assertIn("WINDOWS_API", self._rules('X = ["tasklist", "/NH"]\n'))
+
+    def test_flags_hardcoded_creationflags(self):
+        self.assertIn("HARDCODED_FLAGS",
+                      self._rules("import subprocess\nsubprocess.Popen([], creationflags=0x08000000)\n"))
+        self.assertIn("HARDCODED_FLAGS",
+                      self._rules("import subprocess\nsubprocess.Popen([], creationflags=8)\n"))
+
+    def test_flags_windows_shell_command(self):
+        self.assertIn("WINDOWS_SHELL",
+                      self._rules('X = ["powershell", "-NoProfile"]\n'))
+        self.assertIn("WINDOWS_SHELL", self._rules('X = "cmd /c start http://x"\n'))
+
+    def test_ignores_windows_api_names_in_prose(self):
+        # 文档里解释"为什么不用 winsound"不该算违规（注释与文档串被剥掉）
+        self.assertEqual(self._rules('# winsound.PlaySound 的老问题\ndef f():\n    return 1\n'), [])
+        self.assertEqual(self._rules('"""powershell 的历史原因"""\n'), [])
 
 
 if __name__ == "__main__":

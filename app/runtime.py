@@ -28,12 +28,12 @@ BASE_DIR = paths.echo_root()
 
 
 def sidebar_exe_path():
-    """边条可执行文件（ECHO\\sidebar 编译产物）。找不到返回 None。"""
-    for rel in (
-        os.path.join("sidebar", "bin", "Release", "net7.0-windows", "win-x64", "echo-sidebar.exe"),
-        os.path.join("sidebar", "bin", "Debug", "net7.0-windows", "win-x64", "echo-sidebar.exe"),
-    ):
-        path = os.path.join(BASE_DIR, rel)
+    """边条可执行文件（ECHO\\sidebar 编译产物）。找不到返回 None。
+
+    候选路径是平台差异，由接缝给（Windows = ``sidebar/bin/<cfg>/net7.0-windows/...``；
+    macOS/Linux 目前返回空表 —— 原生边条宿主属 P3 未完成部分，调用方会回落到整窗）。
+    """
+    for path in echo_platform.sidebar_candidates(BASE_DIR):
         if os.path.isfile(path):
             return path
     return None
@@ -45,15 +45,14 @@ def _sidebar_running() -> bool:
     为什么需要它：echo-sidebar.exe 是单实例应用，**再起一个实例 = 给已有实例发 toggle**。
     自动显示（ECHO 每次启动都会跑一遍）如果盲目起进程，就会把用户已经展开的面板反复收起。
     所以先查进程：在跑就什么都不做。
+
+    查进程的方式（``tasklist`` / ``pgrep``）由接缝负责，本模块不再关心平台命令。
     """
+    exe = sidebar_exe_path()
+    name = os.path.basename(exe) if exe else "echo-sidebar.exe"
     try:
-        out = subprocess.run(
-            ["tasklist", "/FI", "IMAGENAME eq echo-sidebar.exe", "/NH"],
-            capture_output=True, text=True, timeout=5,
-            creationflags=0x08000000,      # CREATE_NO_WINDOW
-        ).stdout or ""
-        return "echo-sidebar.exe" in out
-    except Exception as e:
+        return echo_platform.process_running(name)
+    except Exception as e:                       # 接缝承诺不抛；这里只兜底
         print(f"[hotkey] 查询边条进程失败（按未运行处理）: {e}")
         return False
 
@@ -67,8 +66,9 @@ def _spawn_sidebar(collapsed: bool = False):
     args = [exe, f"--url=http://127.0.0.1:{port}/", "--width=450"]
     if collapsed:
         args.append("--collapsed")
-    flags = 0x00000008 | 0x00000200   # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
-    subprocess.Popen(args, cwd=os.path.dirname(exe), creationflags=flags, close_fds=True)
+    # 脱离父进程组：ECHO 重启/被杀之后边条要活下来。flags 的平台差异在接缝里。
+    subprocess.Popen(args, cwd=os.path.dirname(exe), close_fds=True,
+                     **echo_platform.detach_gui_kwargs())
     return True
 
 
@@ -123,9 +123,8 @@ def restart_echo():
     """重启 ECHO 服务本身（面板「设置 → 服务」里的按钮）。
 
     自我重启的关键：处理这个 HTTP 请求的进程马上要自杀，所以真正干活的必须是
-    **脱离进程组的独立进程**——用 DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP 起
-    scripts/restart-echo.ps1（停 → 等端口释放 → 起），本进程立刻返回，
-    面板随后轮询 /api/status 直到服务回来。
+    **脱离进程组的独立进程**——起 ``scripts/restart-echo.ps1``（停 → 等端口释放 → 起），
+    本进程立刻返回，面板随后轮询 /api/status 直到服务回来。
     与 toggle_sidebar 用的是同一套脱离方式（边条就是这么在 ECHO 重启后活下来的）。
     真正的停/起逻辑只有一份，在 stop.ps1 / start.ps1 里。
     """
@@ -133,24 +132,24 @@ def restart_echo():
     if not os.path.isfile(script):
         return False, "找不到 scripts\\restart-echo.ps1"
     try:
-        # 不能用 DETACHED_PROCESS：powershell.exe 是**控制台**程序，脱离控制台启动会静默退出
-        # （2026-09-12 实测：flags=0x8 / 0x208 时进程 returncode=0，但脚本一行都没执行、输出全空；
-        #  边条能用 DETACHED_PROCESS 是因为 echo-sidebar.exe 是 GUI 程序）。
-        # 这里用 CREATE_NEW_PROCESS_GROUP 让它独立于父进程组（不随 ECHO 的进程组一起被处理），
-        # CREATE_NO_WINDOW 保证不弹控制台窗口；std 全部重定向到文件，既静默又便于排错。
-        flags = 0x00000200 | 0x08000000   # CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
+        # flags 的平台差异（Windows=CREATE_NEW_PROCESS_GROUP|CREATE_NO_WINDOW、POSIX=setsid）
+        # 与"用什么 shell 跑脚本"都在接缝里。
+        # 注意 Windows 上**不能**用 DETACHED_PROCESS：powershell.exe 是控制台程序，脱离
+        # 控制台启动会静默退出（2026-09-12 实测：returncode=0 但脚本一行都没执行）；
+        # 边条能用 DETACHED_PROCESS 是因为 echo-sidebar.exe 是 GUI 程序。
+        flags = echo_platform.detach_console_kwargs()
         log_dir = os.path.join(BASE_DIR, "data", "logs")
         os.makedirs(log_dir, exist_ok=True)
         # helper 自己的 stdout/stderr 落文件（不能用 DEVNULL：一旦它启动失败就什么都看不到）
         out_path = os.path.join(log_dir, "restart-helper.out")
         err_path = os.path.join(log_dir, "restart-helper.err")
-        argv = ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script]
+        argv = echo_platform.console_shell_argv(script)
         # 关键：脱离进程组，否则本进程被杀时 helper 会一起死（它要在我们死后继续干活）
         proc = subprocess.Popen(
-            argv, cwd=BASE_DIR, creationflags=flags, close_fds=True,
+            argv, cwd=BASE_DIR, close_fds=True,
             stdin=subprocess.DEVNULL,
             stdout=open(out_path, "ab"), stderr=open(err_path, "ab"),
-        )
+            **flags)
         print(f"[runtime] 已请求重启 ECHO：helper pid={proc.pid} argv={argv} cwd={BASE_DIR}")
         return True, "正在重启 ECHO（约 5~15 秒，面板会自动重连）"
     except Exception as e:
@@ -162,8 +161,8 @@ def open_panel_window():
     """打开 ECHO 仪表盘窗口（panelOpenMode=app/browser 时的整窗模式）。
 
     优先用 Chromium 系浏览器的 --app 模式开独立窗口（等同 PWA，无地址栏）；
-    找不到就退回默认浏览器。用 ShellExecuteW 走系统 shell，非阻塞、不弹控制台。
-    1.5 秒内重复触发会被忽略（防手抖连按开一堆窗口）。
+    找不到就退回默认浏览器。走系统 shell（Windows=ShellExecuteW、macOS=open、
+    Linux=xdg-open），非阻塞、不弹控制台。1.5 秒内重复触发会被忽略（防手抖连按开一堆窗口）。
     """
     global _panel_last_open
     now = time.time()
@@ -183,22 +182,15 @@ def open_panel_window():
                 exe = path
                 break
     try:
-        import ctypes
-        if exe:
-            # ShellExecuteW(hwnd, op, file, params, dir, show)
-            ctypes.windll.shell32.ShellExecuteW(None, "open", exe, f'--app={url}', None, 1)
-        else:
-            ctypes.windll.shell32.ShellExecuteW(None, "open", url, None, None, 1)
-        print(f"[hotkey] 打开仪表盘: {url}（{'app 窗口' if exe else '默认浏览器'}）")
-        return True
+        ok = echo_platform.shell_open(exe, f"--app={url}") if exe else echo_platform.shell_open(url)
+        if ok:
+            print(f"[hotkey] 打开仪表盘: {url}（{'app 窗口' if exe else '默认浏览器'}）")
+            return True
+        print(f"[hotkey] 打开仪表盘失败（{url}）")
+        return False
     except Exception as e:
         print(f"[hotkey] 打开仪表盘失败: {e}")
-        try:
-            subprocess.Popen(["cmd", "/c", "start", "", url], shell=False)
-            return True
-        except Exception as e2:
-            print(f"[hotkey] 回退打开也失败: {e2}")
-            return False
+        return False
 
 
 def _hotkey_cb(source, detail):

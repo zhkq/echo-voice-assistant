@@ -20,6 +20,7 @@ import tempfile
 import time
 
 from app import paths
+from app import platform as echo_platform
 
 # 提示音 wav 随**代码**走（assets/ 是安装目录的一部分），所以取安装根而不是数据根；
 # 来源统一由路径层给（含 ECHO_ROOT 覆盖），本模块不再自己推导。
@@ -32,15 +33,16 @@ _lock = threading.Lock()
 
 
 def play_beep(name):
-    """播放 assets/beeps/<name>.wav（start/done/ok/err…）。"""
+    """播放 assets/beeps/<name>.wav（start/done/ok/err…）。
+
+    播放实现是平台差异（Windows=winsound 异步、macOS=afplay），收在接缝里。
+    ⚠️ §30.2：Windows 上用户实测听不到提示音，探针跑完再决定是否换 sounddevice ——
+    换实现只需动 ``app/platform/win32/env.py::play_wav_async()`` 一处。
+    """
     wav = os.path.join(BEEPS_DIR, name + ".wav")
     if not os.path.isfile(wav):
         return
-    try:
-        import winsound
-        winsound.PlaySound(wav, winsound.SND_FILENAME | winsound.SND_ASYNC)
-    except Exception:
-        pass
+    echo_platform.play_wav_async(wav)
 
 
 def _play_wav_data(data, sr):
@@ -64,7 +66,7 @@ def _play_media_file(path):
     try:
         out = path + ".wav"
         subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", path, out],
-                       timeout=30, creationflags=0x08000000)
+                       timeout=30, creationflags=echo_platform.no_window_creationflags())
         if os.path.isfile(out):
             import soundfile as sf
             data, sr = sf.read(out, dtype="float32")
@@ -103,129 +105,35 @@ def _speak_edge(text, timeout=30):
             pass
 
 
-# ---- 常驻 SAPI（避免每句话都新起 powershell 子进程的 ~1s 开销）----
-_sapi_lock = threading.Lock()
-_sapi_proc = None
-_sapi_q = None
-
-_SAPI_PS = (
-    "Add-Type -AssemblyName System.Speech; "
-    "[Console]::InputEncoding = New-Object System.Text.UTF8Encoding($false); "
-    "[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false); "
-    "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
-    "$zh = @($s.GetInstalledVoices() | Where-Object { $_.Enabled -and "
-    "$_.VoiceInfo.Culture.Name -like 'zh*' })[0]; "
-    "if ($zh) { $s.SelectVoice($zh.VoiceInfo.Name) }; "
-    "$s.Rate = 1; "
-    "while (($line = [Console]::In.ReadLine()) -ne $null) { "
-    "$s.Speak($line); [Console]::Out.WriteLine('ACK'); [Console]::Out.Flush() }"
-)
-
-
-def _sapi_reader(proc, q):
-    try:
-        for line in proc.stdout:
-            q.put(line.strip())
-    except Exception:
-        pass
-
-
-def _sapi_kill():
-    global _sapi_proc
-    p = _sapi_proc
-    _sapi_proc = None
-    if p is not None:
-        try:
-            p.kill()
-        except Exception:
-            pass
-
-
-atexit.register(_sapi_kill)
-
-
-def _sapi_ensure():
-    global _sapi_proc, _sapi_q
-    if _sapi_proc is not None and _sapi_proc.poll() is None:
-        return _sapi_proc, _sapi_q
-    import queue
-    proc = subprocess.Popen(
-        ["powershell", "-NoProfile", "-NonInteractive", "-Command", _SAPI_PS],
-        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-        text=True, encoding="utf-8", creationflags=0x08000000)
-    q = queue.Queue()
-    threading.Thread(target=_sapi_reader, args=(proc, q), daemon=True).start()
-    _sapi_proc, _sapi_q = proc, q
-    return proc, q
-
-
-def _speak_sapi_persistent(text):
-    with _sapi_lock:
-        try:
-            proc, q = _sapi_ensure()
-            proc.stdin.write(text + "\n")
-            proc.stdin.flush()
-            try:
-                q.get(timeout=60)   # 收到 ACK 表示朗读完成
-                return True
-            except Exception:
-                _sapi_kill()
-                return False
-        except Exception:
-            _sapi_kill()
-            return False
-
-
-def _speak_sapi_once(text):
-    """一次性 PowerShell SAPI（常驻进程失败时的兜底）。"""
-    ps = (
-        "Add-Type -AssemblyName System.Speech; "
-        "[Console]::InputEncoding = New-Object System.Text.UTF8Encoding($false); "
-        "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
-        "$zh = @($s.GetInstalledVoices() | Where-Object { $_.Enabled -and "
-        "$_.VoiceInfo.Culture.Name -like 'zh*' })[0]; "
-        "if ($zh) { $s.SelectVoice($zh.VoiceInfo.Name) }; "
-        "$s.Rate = 1; $s.Speak([Console]::In.ReadToEnd()); $s.Dispose()"
-    )
-    try:
-        p = subprocess.Popen(
-            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
-            stdin=subprocess.PIPE, creationflags=0x08000000)
-        p.communicate(text.encode("utf-8"), timeout=60)
-        return p.returncode == 0
-    except Exception:
-        return False
-
-
-def _speak_sapi(text):
-    """Windows 离线 SAPI（中文语音）：常驻进程优先，失败回退一次性子进程。
-
-    注意编码：stdin 以 UTF-8 传递，PowerShell 里显式设置 InputEncoding=UTF8，
-    否则中文会被按 GBK 解码成乱码（现象：英文正常、中文乱码）。
-    """
-    if _speak_sapi_persistent(text):
-        return True
-    return _speak_sapi_once(text)
+# ---- 离线 TTS（Windows=SAPI / macOS=say）----
+# 实现整段收在接缝里（P3 剩余搬迁）：常驻子进程、编码、Voice 探测都是平台专有细节。
+def _speak_offline(text):
+    """离线朗读；失败返回 False（永不抛）。"""
+    return echo_platform.offline_tts_speak(text)
 
 
 def speak(text, engine="auto", timeout=60):
-    """朗读文本（阻塞，最长 timeout 秒）。engine: auto|edge-tts|sapi|off"""
+    """朗读文本（阻塞，最长 timeout 秒）。engine: auto|edge-tts|sapi|off
+
+    注意 ``sapi`` 这个引擎名是 1.x 的配置值（库里可能存着），在 macOS 上它会走到
+    接缝的离线实现（``say``）—— 命名保持不变以免动配置兼容性。
+    """
     global _edge_broken
     if not text:
         return False
     if engine == "off":
         return False
     if engine == "sapi" or (engine == "auto" and _edge_broken):
-        return _speak_sapi(text)
+        return _speak_offline(text)
     if engine == "auto" and probe_online() is False:
-        # 在线 TTS 探针不可用 → 直接本地 SAPI（跳过 edge 等待，保证效率）
-        return _speak_sapi(text)
+        # 在线 TTS 探针不可用 → 直接本地离线合成（跳过 edge 等待，保证效率）
+        return _speak_offline(text)
     ok = _speak_edge(text, timeout)
     if ok:
         return True
     _edge_broken = True
     if engine != "edge-tts":
-        return _speak_sapi(text)
+        return _speak_offline(text)
     return False
 
 
@@ -264,11 +172,16 @@ def probe_online(force=False):
 
 
 def tts_online_status():
-    """面板状态用：返回 {'online': bool|None, 'engine': 'edge-tts'|'sapi', 'detail': str}"""
+    """面板状态用：返回 {'online': bool, 'engine': str, 'detail': str}
+
+    ``engine`` 在 Windows 上仍是 ``sapi``（与 1.x 相同）；离线实现的名字由接缝给，
+    macOS 上会是 ``say``。
+    """
     ok = probe_online()
     if ok is True:
         return {"online": True, "engine": "edge-tts", "detail": "edge-tts 在线"}
-    return {"online": False, "engine": "sapi", "detail": "sapi 本地（在线不可用）"}
+    return {"online": False, "engine": "sapi",
+            "detail": "%s 本地（在线不可用）" % echo_platform.offline_tts_label()}
 
 
 def speak_async(text, engine="auto"):

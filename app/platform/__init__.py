@@ -94,6 +94,98 @@ def tcp_excluded_port_range_output() -> str:
     return str(fn()) if callable(fn) else ""
 
 
+# ---------------------------------------------------------------- 运行时替换（P3 剩余搬迁）
+# 这一组把 app/ 里最后一批"Windows 专有实现"收进接缝：子进程 flags、进程查询、
+# 打开窗口、提示音、离线 TTS、桌面通知、边条可执行文件候选。业务代码只调这里，
+# 于是 Windows 与 macOS 的差异只存在于 app/platform/<os>/ 下（D12）。
+
+def detach_gui_kwargs() -> dict:
+    """让 **GUI** 子进程脱离父进程组（边条进程）。缺实现时退化为空 dict。"""
+    fn = _platform_fn("detach_gui_kwargs")
+    return dict(fn()) if callable(fn) else {}
+
+
+def detach_console_kwargs() -> dict:
+    """控制台 helper 脱离父进程组（自我重启脚本）。缺实现时退化为空 dict。"""
+    fn = _platform_fn("detach_console_kwargs")
+    return dict(fn()) if callable(fn) else {}
+
+
+def console_shell_argv(script: str):
+    """起一个控制台脚本的 argv（Windows=PowerShell / POSIX=/bin/sh）。"""
+    fn = _platform_fn("console_shell_argv")
+    return list(fn(script)) if callable(fn) else []
+
+
+def process_running(image_name: str) -> bool:
+    """按名字查进程（边条是否已在运行）。查不到 = False，永不抛。"""
+    fn = _platform_fn("process_running")
+    return bool(fn(image_name)) if callable(fn) else False
+
+
+def shell_open(target: str, params: str = "") -> bool:
+    """用系统 shell 打开 URL / 可执行文件（非阻塞）。"""
+    fn = _platform_fn("shell_open")
+    return bool(fn(target, params)) if callable(fn) else False
+
+
+def play_wav_async(path: str) -> bool:
+    """异步播放一个 wav 文件（提示音）。"""
+    fn = _platform_fn("play_wav_async")
+    return bool(fn(path)) if callable(fn) else False
+
+
+def offline_tts_speak(text: str, timeout: int = 60) -> bool:
+    """离线朗读（Windows=SAPI / macOS=say）。"""
+    fn = _platform_fn("offline_tts_speak")
+    return bool(fn(text, timeout)) if callable(fn) else False
+
+
+def offline_tts_label() -> str:
+    """离线 TTS 的引擎短名（进状态文案：Windows=`sapi`、macOS=`say`）。"""
+    fn = _platform_fn("offline_tts_label")
+    return str(fn()) if callable(fn) else "sapi"
+
+
+def offline_tts_display() -> str:
+    """离线 TTS 的可读名字（面板文案，如 `Windows 慧慧`）。"""
+    fn = _platform_fn("offline_tts_display")
+    return str(fn()) if callable(fn) else "SAPI"
+
+
+def notify(title: str, text: str) -> bool:
+    """桌面通知（Windows=气泡 / macOS=osascript）。"""
+    fn = _platform_fn("notify")
+    return bool(fn(title, text)) if callable(fn) else False
+
+
+def sidebar_candidates(install_root: str):
+    """边条（右缘面板宿主）可执行文件候选；返回空列表 = 该平台没有原生边条，
+    调用方应回落到"打开整窗"。"""
+    fn = _platform_fn("sidebar_candidates")
+    return list(fn(install_root)) if callable(fn) else []
+
+
+def hotkey_impl():
+    """当前平台的全局热键实现模块（``HotkeyListener`` + 常量）。
+
+    Windows = ``app/platform/win32/hotkey.py``（ctypes + 低级键盘钩子）；
+    macOS/Linux = ``app/platform/_posix_hotkey.py``（pynput）。
+    ``app/hotkey.py`` 是门面，业务代码只 import 那个门面。
+    """
+    return importlib.import_module("app.platform.%s.hotkey" % current())
+
+
+def model_install_command(name: str, fallback: str = "") -> str:
+    """某个模型的一键安装命令（平台专有脚本；本平台没有就返回 ``fallback``）。
+
+    声明式放在 ``PLATFORM_DEFAULTS["modelInstallCommands"]`` 里（D11 的用法），
+    这样"面板上贴给用户跑的那条命令"也不会把平台特征串漏回业务代码。
+    """
+    table = defaults().get("modelInstallCommands") or {}
+    return str(table.get(name) or fallback)
+
+
 def hf_executable(install_root: str) -> str:
     """venv 里的 hf 命令行入口。"""
     fn = _platform_fn("hf_executable")

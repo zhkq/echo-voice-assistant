@@ -14,6 +14,11 @@ NAME = "win32"
 #: 系统数据根：与 1.x 一致，就在安装目录下（老用户升级后 data 不用搬）
 PLATFORM_DEFAULTS = {
     "dataDir": "{ECHO}/data",
+    #: 模型的一键安装命令（面板直接贴给用户跑）。macOS/Linux 上没有对应脚本 → 不提供，
+    #: 调用方回落成 pip 说明。
+    "modelInstallCommands": {
+        "qwen3asr": "powershell -ExecutionPolicy Bypass -File scripts\\install-qwen3asr.ps1",
+    },
 }
 
 
@@ -42,6 +47,143 @@ def no_window_creationflags() -> int:
     """起控制台子进程时抑制黑窗的 creationflags。"""
     import subprocess
     return getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+
+
+def detach_gui_kwargs() -> dict:
+    """让 GUI 子进程脱离父进程组（边条：``echo-sidebar.exe``）。
+
+    ``DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP``：ECHO 重启/被杀时边条要活下来。
+    注意它只适合 **GUI** 程序——控制台程序脱离控制台会静默退出（1.x 实测），
+    控制台 helper 用 ``detach_console_kwargs()``。
+    """
+    import subprocess
+    flags = (getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+             | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200))
+    return {"creationflags": flags}
+
+
+def detach_console_kwargs() -> dict:
+    """控制台 helper：独立于父进程组，但不脱离控制台（``CREATE_NO_WINDOW`` 保静默）。"""
+    import subprocess
+    flags = (getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+             | no_window_creationflags())
+    return {"creationflags": flags}
+
+
+def console_shell_argv(script: str):
+    """起一个控制台脚本的 argv（Windows = PowerShell）。"""
+    return ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script]
+
+
+def process_running(image_name: str) -> bool:
+    """按镜像名查进程（``tasklist``）。查不到/命令失败一律 False（永不抛）。
+
+    用于"边条是否已在运行"：``echo-sidebar.exe`` 是单实例应用，再起一个等于给它发
+    toggle，会把用户展开的面板收起来。
+    """
+    import subprocess
+    try:
+        out = subprocess.run(
+            ["tasklist", "/FI", "IMAGENAME eq %s" % image_name, "/NH"],
+            capture_output=True, text=True, timeout=5,
+            creationflags=no_window_creationflags()).stdout or ""
+        return image_name.lower() in out.lower()
+    except Exception:
+        return False
+
+
+# ------------------------------------------------------------------ 打开窗口 / 提示音 / 离线 TTS
+
+def shell_open(target: str, params: str = "") -> bool:
+    """用系统 shell 打开 URL 或可执行文件（``ShellExecuteW("open", …)``）。
+
+    非阻塞、不弹控制台；``params`` 非空时带上（Chromium ``--app=<url>``）。
+    ShellExecute 失败时退回 ``cmd /c start``（1.x 的兜底，行为保持不变）。
+    """
+    try:
+        import ctypes
+        ctypes.windll.shell32.ShellExecuteW(None, "open", target, params or None, None, 1)
+        return True
+    except Exception:
+        pass
+    try:
+        import subprocess
+        subprocess.Popen(["cmd", "/c", "start", "", target], shell=False)
+        return True
+    except Exception:
+        return False
+
+
+def play_wav_async(path: str) -> bool:
+    """异步播放 wav（提示音）。``winsound`` 是 Windows 自带、不占线程。
+
+    ⚠️ 已知问题（§30.2，挂起中）：用户实测**听不到提示音**，而同一批 wav 用
+    sounddevice 播是能听到的 —— 怀疑就是这条 ``winsound`` 老 waveOut 通路。
+    探针 `scripts/probe-tts.bat`（在稳定树里）跑完再决定是否改用 sounddevice；
+    在那之前**保持行为不变**，只把它收进接缝（这样换实现只动这一处）。
+    """
+    import os
+    if not os.path.isfile(path):
+        return False
+    try:
+        import winsound
+        winsound.PlaySound(path, winsound.SND_FILENAME | winsound.SND_ASYNC)
+        return True
+    except Exception:
+        return False
+
+
+def offline_tts_speak(text: str, timeout: int = 60) -> bool:
+    """离线朗读（SAPI / System.Speech）。"""
+    try:
+        from app.platform.win32 import sapi
+        return bool(sapi.speak(text, timeout))
+    except Exception:
+        return False
+
+
+def offline_tts_label() -> str:
+    """离线 TTS 的引擎短名（= 1.x 配置里的 `sapi`，状态文案用）。"""
+    return "sapi"
+
+
+def offline_tts_display() -> str:
+    """离线 TTS 的可读名字（与 1.x 面板文案逐字一致）。"""
+    try:
+        from app.platform.win32 import sapi
+        return str(sapi.label())
+    except Exception:
+        return "Windows SAPI"
+
+
+def notify(title: str, text: str) -> bool:
+    """桌面通知（PowerShell NotifyIcon 气泡，Windows 专有）。异步、不阻塞。"""
+    import subprocess
+    ps = (
+        "Add-Type -AssemblyName System.Windows.Forms; "
+        "$n = New-Object System.Windows.Forms.NotifyIcon; "
+        "$n.Icon = [System.Drawing.SystemIcons]::Information; "
+        "$n.Visible = $true; $n.BalloonTipTitle = $title; "
+        "$n.BalloonTipText = $text; $n.ShowBalloonTip(5000); "
+        "Start-Sleep -Milliseconds 600; $n.Dispose()"
+    ).replace("$title", "'" + title.replace("'", "''") + "'") \
+     .replace("$text", "'" + text.replace("'", "''") + "'")
+    try:
+        subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+                       timeout=8, creationflags=no_window_creationflags())
+        return True
+    except Exception:
+        return False
+
+
+def sidebar_candidates(install_root: str):
+    """边条可执行文件候选（Release 优先，Debug 兜底）。调用方判存在。"""
+    return [
+        os.path.join(install_root, "sidebar", "bin", "Release", "net7.0-windows",
+                     "win-x64", "echo-sidebar.exe"),
+        os.path.join(install_root, "sidebar", "bin", "Debug", "net7.0-windows",
+                     "win-x64", "echo-sidebar.exe"),
+    ]
 
 
 # ------------------------------------------------------------------ 浏览器 / CLI 候选

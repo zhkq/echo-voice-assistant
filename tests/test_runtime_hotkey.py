@@ -15,8 +15,9 @@ ShellExecute/creationflags）搬进 `app/platform/<os>/` 接缝。搬之前必�
   4. `runtime._hotkey_cb` 的分派矩阵 + 边条的启动参数/跳过原因 + 打开面板的去抖；
   5. `runtime.start/stop_hotkey|wake` 的幂等与状态上报。
 
-⚠️ `app/hotkey.py` 目前是 **Windows 实现**（模块级 `ctypes.windll`），非 Windows 上
-导入即失败；P3 搬进接缝后这些用例的导入路径要跟着改（那时应该按平台分支实现）。
+⚠️ P3 搬迁后：Windows 实现在 ``app/platform/win32/hotkey.py``，``app/hotkey.py`` 变成
+**门面**（按平台转发）。本文件里带 ``skip_without_hotkey`` 的用例针对 Windows 实现
+（ctypes 钩子那套），非 Windows 上整组跳过；门面本身另有一组用例（``FacadeTests``）。
 """
 import os
 import shutil
@@ -30,15 +31,16 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import app.db as db                                         # noqa: E402
 from app import runtime                                     # noqa: E402
+from app import hotkey as hotkey_facade                     # noqa: E402
 from app.config import DEFAULTS, settings                   # noqa: E402
 
-try:                       # 非 Windows：ctypes.windll 不存在，整组跳过
-    from app import hotkey
+try:                       # 非 Windows：ctypes.windll 不存在，Windows 实现整组跳过
+    from app.platform.win32 import hotkey
 except Exception:          # pragma: no cover - 平台差异
     hotkey = None
 
 skip_without_hotkey = unittest.skipIf(
-    hotkey is None, "app/hotkey.py 是 Windows 实现（P3 会搬进 app/platform/ 接缝）")
+    hotkey is None, "Windows 热键实现在 app/platform/win32/hotkey.py（非 Windows 跳过）")
 
 
 class _FakeUser32:
@@ -67,6 +69,58 @@ def _patch_settings_get(mapping, default=None):
             return mapping[key]
         return dflt if dflt is not None else (default.get(key) if default else None)
     return patch.object(settings, "get", side_effect=_get)
+
+
+class FacadeTests(unittest.TestCase):
+    """`app/hotkey.py` 是门面：必须转发到当前平台的实现（P3 契约）。"""
+
+    def test_facade_points_at_the_platform_implementation(self):
+        from app import platform as echo_platform
+        impl = echo_platform.hotkey_impl()
+        self.assertIs(hotkey_facade.impl, impl)
+        self.assertIs(hotkey_facade.HotkeyListener, impl.HotkeyListener)
+
+    def test_facade_is_importable_on_every_platform(self):
+        """门面不许在 import 期就依赖 Windows（这是 1.x 的结构性缺陷）。"""
+        self.assertTrue(callable(hotkey_facade.HotkeyListener))
+        self.assertTrue(callable(hotkey_facade.parse_hotkey_combo))
+
+    @unittest.skipUnless(hotkey is not None, "仅在 Windows 上比较 Windows 实现")
+    def test_windows_facade_matches_the_implementation(self):
+        self.assertIs(hotkey_facade.parse_hotkey_combo, hotkey.parse_hotkey_combo)
+        self.assertEqual(hotkey_facade.MEDIA_KEYS, hotkey.MEDIA_KEYS)
+        self.assertEqual(hotkey_facade.NAMED_KEYS, hotkey.NAMED_KEYS)
+
+    def test_facade_does_not_leak_windows_only_constants(self):
+        """门面只暴露跨平台数据面：Windows 的键码/消息常量不许出现在这里。
+
+        （守卫测试 test_path_seam 的 WINDOWS_API 规则会拦；这条是行为侧的对照。）
+        """
+        for name in ("MOD_NOREPEAT", "WM_KEYDOWN", "KBDLLHOOKSTRUCT", "user32"):
+            with self.subTest(name=name):
+                self.assertFalse(hasattr(hotkey_facade, name))
+
+    def test_seam_resolves_a_different_implementation_per_platform(self):
+        """S8 的实测形态：不再靠 sys.modules 注入，接缝自己按平台选实现。
+
+        在 Windows 上把 `echo_platform.current()` 换成 darwin/linux 后，
+        `hotkey_impl()` 必须给出 POSIX 实现（pynput 的 HotkeyListener）——这正是
+        P3 要替换掉的 ``mac/run_mac.py`` 注入式入口所做的事，现在由接缝承担。
+        """
+        from unittest.mock import patch as _patch
+
+        from app import platform as echo_platform
+        from app.platform import _posix_hotkey
+
+        win_impl = echo_platform.hotkey_impl()
+        self.assertTrue(win_impl.__name__.endswith("win32.hotkey"),
+                        "Windows 上应解析到 win32 实现，实际 %s" % win_impl.__name__)
+        for name in ("darwin", "linux"):
+            with self.subTest(platform=name):
+                with _patch.object(echo_platform, "current", lambda n=name: n):
+                    impl = echo_platform.hotkey_impl()
+                    self.assertTrue(impl.__name__.endswith("%s.hotkey" % name))
+                    self.assertIs(impl.HotkeyListener, _posix_hotkey.HotkeyListener)
 
 
 @skip_without_hotkey

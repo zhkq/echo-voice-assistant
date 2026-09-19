@@ -20,6 +20,7 @@ import time
 import urllib.request
 
 from app import paths
+from app import platform as echo_platform
 
 # 路由端口以 dsh-failover/config.json 的 "port" 为准（代理进程自己也是读它）。
 # 2026-09-14 起不再写死：Windows 动态端口段（默认 1024-15000）会被 Hyper-V/WSL
@@ -107,7 +108,7 @@ def ensure_running():
                 cwd=os.path.dirname(script),
                 stdout=fo,
                 stderr=fe,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                creationflags=echo_platform.no_window_creationflags(),
             )
     except Exception as e:
         return False, "拉起模型路由失败: %s" % e

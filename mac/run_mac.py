@@ -81,7 +81,10 @@ def _mac_seed_defaults(self):
 _config.Settings.seed_defaults = _mac_seed_defaults
 
 # ---- 2) 注入 Mac 版 runtime / hotkey（必须在 import app.main 之前）----
-# 注意顺序：先注册 app.hotkey，再 import mac_runtime（它顶部会 from app.hotkey import）
+# ⚠️ P3 之后 hotkey 这条注入**已经多余**：`app/hotkey.py` 现在是门面，
+# `app.platform.hotkey_impl()` 会自己按平台选实现（macOS → app/platform/_posix_hotkey.py），
+# `mac/hotkey_mac.py` 也已经是那个实现的薄壳。保留这一行只是过渡期保险（两条路等价）。
+# 真正还要注入的是 runtime（mac 的边条/唤醒宿主属 D19，未完成）。
 import hotkey_mac  # noqa: E402
 
 sys.modules["app.hotkey"] = hotkey_mac

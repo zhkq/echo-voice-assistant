@@ -46,6 +46,68 @@ def no_window_creationflags() -> int:
     return 0
 
 
+# ------------------------------------------------------------------ 运行时替换（P3）
+# ⚠️ 未在 macOS 上实测（缺机器，见 REFACTOR-PLAN §9.1 的 S7/S9/S10）：契约与 Windows
+# 一致、永不抛异常；能不能真跑起来要等实测。
+
+def detach_gui_kwargs() -> dict:
+    return _posix.detach_kwargs()
+
+
+def detach_console_kwargs() -> dict:
+    return _posix.detach_kwargs()
+
+
+def console_shell_argv(script: str):
+    return _posix.console_shell_argv(script)
+
+
+def process_running(image_name: str) -> bool:
+    return _posix.process_running(image_name)
+
+
+def shell_open(target: str, params: str = "") -> bool:
+    return _posix.shell_open(target, params, opener=("open",))
+
+
+def play_wav_async(path: str) -> bool:
+    """提示音：macOS 自带 ``afplay``。"""
+    return _posix.play_wav_async(path, players=(("afplay",),))
+
+
+def offline_tts_speak(text: str, timeout: int = 60) -> bool:
+    """离线 TTS：macOS 自带 ``say``（中文音色取决于系统已装语音）。"""
+    return _posix.offline_tts_speak(text, timeout, engines=(("say",),))
+
+
+def offline_tts_label() -> str:
+    """引擎短名（进状态文案；Windows 那边是 `sapi`）。"""
+    return "say"
+
+
+def offline_tts_display() -> str:
+    return "macOS say"
+
+
+def notify(title: str, text: str) -> bool:
+    """桌面通知：``osascript display notification``。"""
+    import subprocess
+    esc = lambda s: str(s).replace("\\", "\\\\").replace('"', '\\"')   # noqa: E731
+    script = 'display notification "%s" with title "%s"' % (esc(text), esc(title))
+    try:
+        subprocess.Popen(["osascript", "-e", script], close_fds=True,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except Exception:
+        return False
+
+
+def sidebar_candidates(install_root: str):
+    """mac 原生边条宿主属于 P3 未完成部分（D19 常驻 helper），暂不提供候选：
+    返回空表会让调用方回落到"打开整窗面板"（``shell_open``），功能可用。"""
+    return []
+
+
 def agent_cli_candidates():
     """CodeBuddy CLI 的内置候选：本平台没有，返回空表。"""
     return []

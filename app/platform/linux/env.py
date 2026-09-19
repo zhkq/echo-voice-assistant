@@ -45,6 +45,64 @@ def no_window_creationflags() -> int:
     return 0
 
 
+# ------------------------------------------------------------------ 运行时替换（P3）
+# Linux 不是当前交付目标，但接缝要齐（守卫测试会断言三个平台实现同一组原语）。
+
+def detach_gui_kwargs() -> dict:
+    return _posix.detach_kwargs()
+
+
+def detach_console_kwargs() -> dict:
+    return _posix.detach_kwargs()
+
+
+def console_shell_argv(script: str):
+    return _posix.console_shell_argv(script)
+
+
+def process_running(image_name: str) -> bool:
+    return _posix.process_running(image_name)
+
+
+def shell_open(target: str, params: str = "") -> bool:
+    return _posix.shell_open(target, params, opener=("xdg-open",))
+
+
+def play_wav_async(path: str) -> bool:
+    """提示音：桌面环境里 paplay/aplay 不一定都装了，逐个试。"""
+    return _posix.play_wav_async(path, players=(("paplay",), ("aplay",), ("ffplay", "-nodisp", "-autoexit")))
+
+
+def offline_tts_speak(text: str, timeout: int = 60) -> bool:
+    return _posix.offline_tts_speak(
+        text, timeout, engines=(("spd-say",), ("espeak-ng",), ("espeak",)))
+
+
+def offline_tts_label() -> str:
+    """引擎短名（进状态文案；Windows 那边是 `sapi`）。"""
+    return "espeak"
+
+
+def offline_tts_display() -> str:
+    return "eSpeak / spd-say"
+
+
+def notify(title: str, text: str) -> bool:
+    """桌面通知：尽量用 ``notify-send``。"""
+    import subprocess
+    try:
+        subprocess.Popen(["notify-send", str(title), str(text)], close_fds=True,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except Exception:
+        return False
+
+
+def sidebar_candidates(install_root: str):
+    """Linux 上没有原生边条宿主，调用方回落到"打开整窗"。"""
+    return []
+
+
 def agent_cli_candidates():
     """CodeBuddy CLI 的内置候选：本平台没有，返回空表。"""
     return []

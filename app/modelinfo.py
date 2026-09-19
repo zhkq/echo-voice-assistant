@@ -21,6 +21,7 @@ import threading
 import time
 
 from app import paths
+from app import platform as echo_platform
 
 # 安装根由路径层给（含 ECHO_ROOT 覆盖）；下面的 HF_HOME 也用它，所以先定义。
 BASE_DIR = paths.echo_root()
@@ -184,7 +185,12 @@ CATALOG = [
          target="ModelScope 缓存 Qwen/Qwen3-ASR-0.6B + Qwen/Qwen3-ForcedAligner-0.6B",
          source="script", ref="Qwen/Qwen3-ASR-0.6B",
          how="跑安装脚本（会先装 qwen-asr/transformers 依赖，再从 ModelScope 下模型）：",
-         cmd="powershell -ExecutionPolicy Bypass -File scripts\\install-qwen3asr.ps1"),
+         # 一键安装命令是平台专有的（Windows 是 .ps1，macOS 没有对应脚本 → 回落成 pip 说明），
+         # 由接缝给（D12：业务代码不写平台命令）。
+         cmd=echo_platform.model_install_command(
+             "qwen3asr",
+             "pip install qwen-asr transformers && python -c 'from modelscope import "
+             "snapshot_download; snapshot_download(\"Qwen/Qwen3-ASR-0.6B\")'")),
 
     dict(id="sherpa", group="转写引擎", name="sherpa-onnx 流式 zipformer（中英）",
          purpose="流式转写；唤醒词功能也用它", size="~189 MB",

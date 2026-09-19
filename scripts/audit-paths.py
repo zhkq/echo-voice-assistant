@@ -41,6 +41,9 @@ RULES = {
     "PATH_DERIVATION": "derives a root itself instead of asking app/paths.py",
     "DRIVE_LITERAL": "absolute drive path in a string literal",
     "PLATFORM_TOKEN": "platform branch/token outside app/platform/",
+    "WINDOWS_API": "Windows API call outside app/platform/ (D12 runtime replacement)",
+    "WINDOWS_SHELL": "hardcoded Windows shell/command outside app/platform/",
+    "HARDCODED_FLAGS": "hardcoded subprocess creationflags outside app/platform/",
 }
 
 #: prefix -> rules that are acceptable there ("*" = every rule)
@@ -66,6 +69,23 @@ PLATFORM_ATTR_RES = (
     re.compile(r"\bsys\s*\.\s*platform\b"),
     re.compile(r"\bplatform\s*\.\s*(?:system|platform)\b"),
 )
+#: Windows API / 常量的标识符（**代码通道**：注释与文档串不算）。
+#: 这一组是 P3 剩余工作量：清点器早先只扫路径与平台分支，扫不到"运行时替换"，
+#: 于是"清点清零"被误读成"D12 收口完毕"（见 docs/P3-收口施工方案.md §10 的诚实边界）。
+WINDOWS_API_TOKENS = (
+    "windll", "winsound", "winreg", "msvcrt", "shell32",
+    "tasklist", "CREATE_NO_WINDOW", "DETACHED_PROCESS", "CREATE_NEW_PROCESS_GROUP",
+    "ShellExecute", "RegisterHotKey", "UnregisterHotKey", "SetWindowsHookEx",
+    "UnhookWindowsHookEx", "CallNextHookEx", "GetMessageW", "PostThreadMessageW",
+    "KBDLLHOOKSTRUCT", "WH_KEYBOARD_LL", "WM_HOTKEY", "MOD_NOREPEAT",
+)
+#: 硬编码的子进程 flags（十六进制或十进制字面量）。
+HARDCODED_FLAGS_RE = re.compile(r"creationflags\s*=\s*(?:0[xX][0-9A-Fa-f]+|\d+)")
+#: Windows 专有**命令**：通常以字符串形式出现在 argv 里（``["tasklist", …]``），
+#: 所以代码通道看不到，必须单独在字符串通道扫。
+WINDOWS_COMMAND_TOKENS = ("tasklist", "netsh", "wmic")
+#: Windows 专有的 shell / 命令（macOS 上是 /bin/sh、osascript 等，由接缝给）。
+WINDOWS_SHELL_TOKENS = ("powershell", "cmd /c", "cmd.exe")
 DERIVE_NAMES = ("dirname", "abspath", "__file__")
 
 SKIP_DIRS = {"__pycache__", ".git", "node_modules"}
@@ -147,6 +167,20 @@ def scan_file(path):
                 if re.search(r"\b%s\b" % re.escape(name), code, re.IGNORECASE):
                     hits.append(("PLATFORM_TOKEN", ln, text))
                     break
+        # Windows API / 硬编码 flags / Windows shell（代码通道）
+        said_api = False
+        for name in WINDOWS_API_TOKENS:
+            if re.search(r"\b%s\b" % re.escape(name), code):
+                hits.append(("WINDOWS_API", ln, text))
+                said_api = True
+                break
+        if HARDCODED_FLAGS_RE.search(code):
+            hits.append(("HARDCODED_FLAGS", ln, text))
+        if not said_api:
+            for name in WINDOWS_SHELL_TOKENS:
+                if re.search(re.escape(name), code, re.IGNORECASE):
+                    hits.append(("WINDOWS_SHELL", ln, text))
+                    break
 
     for ln, vals in sorted(string_lines.items()):
         for val in vals:
@@ -157,15 +191,31 @@ def scan_file(path):
             # ``{platform.system()}`` 在代码通道里是隐身字符串——必须在这里扫，
             # 否则 app/services.py:23 这种展示型分支会被漏掉。
             q = min([i for i, ch in enumerate(val) if ch in "\"'"] or [len(val)])
+            said_platform = False
             if "f" in val[:q].lower() and any(rx.search(val) for rx in PLATFORM_ATTR_RES):
                 hits.append(("PLATFORM_TOKEN", ln, val.strip()[:90]))
-                continue
-            # env-var platform tokens live INSIDE strings (e.g. "%LOCALAPPDATA%"),
-            # so they have to be looked for here - the code pass blanks strings.
-            for name in PLATFORM_NAMES:
+                said_platform = True
+            if not said_platform:
+                # env-var platform tokens live INSIDE strings (e.g. "%LOCALAPPDATA%"),
+                # so they have to be looked for here - the code pass blanks strings.
+                for name in PLATFORM_NAMES:
+                    if re.search(r"\b%s\b" % re.escape(name), val, re.IGNORECASE):
+                        hits.append(("PLATFORM_TOKEN", ln, val.strip()[:90]))
+                        said_platform = True
+                        break
+            # Windows 专有**命令**经常以字符串形式出现在 argv 里（["tasklist", …]）
+            said_command = False
+            for name in WINDOWS_COMMAND_TOKENS:
                 if re.search(r"\b%s\b" % re.escape(name), val, re.IGNORECASE):
-                    hits.append(("PLATFORM_TOKEN", ln, val.strip()[:90]))
+                    hits.append(("WINDOWS_API", ln, val.strip()[:90]))
+                    said_command = True
                     break
+            if not said_command:
+                # Windows 专有 shell（["powershell", …]）
+                for name in WINDOWS_SHELL_TOKENS:
+                    if re.search(re.escape(name), val, re.IGNORECASE):
+                        hits.append(("WINDOWS_SHELL", ln, val.strip()[:90]))
+                        break
 
     return hits
 
