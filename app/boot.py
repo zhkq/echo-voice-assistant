@@ -220,10 +220,28 @@ def _start_dsh(report):
     report(status="online", detail=msg, progress=1.0)
 
 
+def _agent_dsh_available():
+    """装了 `agent-dsh` 才算"有 DSH 可注册"（D25）。返回 ``(ok, reason)``。
+
+    为什么要这道闸（D25）：把模型组写进 `~/.dsh/settings.yaml` + `.credentials.yaml`
+    是**给 agent 用的**——没装 agent 时写了没人读，还会平白在用户家里建/改配置文件。
+    而**路由本身照常运行**：它是 ECHO 的 LLM provider（`echo-auto`），不是 agent 的附属
+    （纪要/命令可以直接经它直连上游，这条已在 P5 打通）。
+    手动"注册到 DSH"的按钮不受此限制 —— D25 说的是自动那一半。
+    """
+    try:
+        from app import agents
+        if "dsh" not in agents.names():
+            return False, "未安装 agent-dsh（内置适配器未注册）"
+        return agents.get_agent("dsh").available()
+    except Exception as e:
+        return False, "检测 agent-dsh 失败：%s" % e
+
+
 def _start_failover(report):
-    """确保 DSH 模型路由(8899) 在运行，启动 30s 守护线程，并把模型组注册进 DSH。"""
+    """确保模型路由在运行并起守护线程；**装了 agent-dsh 时**才顺带注册进 DSH（D25）。"""
     from app import failover_proxy
-    report(detail="探测 8899…", progress=0.2)
+    report(detail="探测路由端口…", progress=0.2)
     ok, detail = failover_proxy.start_guard()
     if not ok:
         report(status="failed", detail=detail, error=detail)
@@ -233,6 +251,14 @@ def _start_failover(report):
     from app.config import settings as _s
     if not _s.get("routerAutoRegister", True):
         report(status="online", detail=f"{detail} · 已按设置跳过 ECHO AUTO 注册", progress=1.0)
+        return
+    agent_ok, agent_why = _agent_dsh_available()
+    if not agent_ok:
+        # D25：没装 agent 就不动 DSH 的配置文件；路由照常可用
+        report(status="online",
+               detail=f"{detail} · 未注册进 DSH（{agent_why}）· 路由本身可用",
+               progress=1.0)
+        db.add_log("info", "boot", f"跳过 ECHO AUTO 注册：{agent_why}")
         return
     try:
         from app import llm_router

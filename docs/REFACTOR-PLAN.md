@@ -1460,6 +1460,15 @@ import 时就把缓存路径算死）。落点：`app/main.py` 的 lifespan 里 
   抽象与注册表、本地适配器、以及 **D25 的落点**（多上游派发路由作为 LLM provider `echo-auto`）、
   三个选择项配置（`providerAsr/Llm/Tts`）与只读接口 `GET /api/providers`。在线服务预设、
   凭据管理（`secret` 元数据 + 不回显）、纪要走 `active("llm")` 仍待做。
+- **P5 验收点已达成（2026-09-19，第 2–4 切片）**：在线服务预设 + 凭据管理（密钥只进库、
+  接口永不回显）、在线 `openai-llm`/`openai-asr` provider、**纪要接通 `active("llm")`**
+  （agent 不可用时自动直连 LLM，"不装 agent 也能出纪要"）、**会议转写接 `active("asr")`**
+  （显式配 `providerAsr` 才走，走时**不加载本地模型**）、`stt.transcribe_ex()` 把
+  "空结果/失败"显式化（§19 发现③）。详见 PROGRESS §39–§41。
+- **D25 行为要求已落地（2026-09-19，第 5 切片）**：ECHO AUTO 自动注册进 DSH 改为
+  **仅在装了 `agent-dsh` 时执行**（没装就不碰 `~/.dsh/settings.yaml`，而路由本身照常可用；
+  手动注册按钮不受限）。**仍未做**：`dsh-failover/` 的**物理搬迁**（迁进 `app/providers/`）——
+  取舍与四条具体理由见 PROGRESS §42，安排与 P4 的组件布局一起做。面板 provider 选择界面也未做。
 - **注意**：清点清零 ≠ D12 收口完毕。`app/platform/` 里仍留着一批**未在 mac 上实测**的
   实现（`say`/`afplay`/`open`/pynput 授权）；D11 的"配置默认值声明式化"（如 `ttsEngine`
   候选按平台给）也还没做。
