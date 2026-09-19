@@ -479,6 +479,20 @@ class OptionAndPanelWiringTests(unittest.TestCase):
         self.assertIn('CAP_KINDS = ["asr", "llm", "tts"]', js)
         self.assertIn("capCompsOf", js, "组件按 kind 归到对应能力卡里")
 
+    def test_capability_card_shows_status_only_once(self):
+        """能力卡的状态只显示一次（2026-09-19 用户看截图指出：下拉下面的附属、两种实现都是重复）。
+
+        * 状态并进下拉选项文字（`capOptLabel`：名字 + 出网/本地 · 就绪）；
+        * 不再有"当前 XXX · 已就绪"这种附属行，也不再有单列一遍"两种实现"的列表
+          （那两处与下拉选项、顶部概览条是同一份信息的第 2/3 份拷贝）。
+        """
+        js = _read(os.path.join("web", "app.js"))
+        for token in ("function capOptLabel", "function capTtsOptionLabel"):
+            self.assertIn(token, js, "状态要并进下拉选项里")
+        self.assertNotIn("当前 <b>", js, "下拉下面不该再挂一行「当前 XXX」")
+        self.assertNotIn("cap-prov-state", js, "不该再单列一遍各实现的状态")
+        self.assertNotIn("cap-prov-row", js, "下拉行不再需要标签行容器")
+
     def test_agent_switch_also_enables_the_product(self):
         """智能体开关即单选：选中时要把该产品的启用开关一起打开，避免自相矛盾。"""
         js = _read(os.path.join("web", "app.js"))

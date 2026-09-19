@@ -1068,10 +1068,8 @@ const CAP_META = {
   llm: { icon: "🧠", title: "语言模型", note: "生成纪要；配了它，不装智能体也能出纪要" },
   tts: { icon: "🔊", title: "语音合成", note: "朗读复述确认、语音简报与提示语；off = 完全不朗读" },
 };
-const CAP_TTS_LABEL = {
-  auto: "自动（优先 edge-tts，失败回退离线）", "edge-tts": "edge-tts（微软在线 · 出网）",
-  off: "关闭朗读",
-};
+// 注：TTS 候选项的显示名由 capTtsOptionLabel() 现算（名字 + 出网/就绪），
+// 不在这里维护一份静态映射 —— 静态映射拿不到运行时的就绪状态，就会逼出第二行状态文字。
 
 /** 某类能力的可装组件（本平台适用的）。 */
 function capCompsOf(kind) {
@@ -1170,29 +1168,59 @@ function capPresets(kind) {
     `内网网关的地址属单位内部信息，需自己填。</div></div>`;
 }
 
-/** 「用哪个实现」区块：下拉（选中即生效）+ 就绪 + 出网标注 + 在线服务的地址/模型/密钥。 */
+/** 下拉里那一项的显示名：名字 + （出网/本地 · 就绪）。
+
+    状态**只在这一处说**：下面再挂一行"当前 XXX · 已就绪"是纯重复
+    （2026-09-19 用户看着截图直接指出："下拉框下面的附属没有意义"）。
+    选中的那一项在收起状态下就是一行文字，用户照样看得见状态。
+ */
+function capOptLabel(name, p) {
+  if (!p) return name;
+  const bits = [p.egress ? "出网" : "本地"];
+  if (p.ready === true) bits.push("已就绪");
+  else if (p.ready === false) bits.push("未就绪");
+  return `${name}（${bits.join(" · ")}）`;
+}
+
+/** TTS 的候选项显示名。TTS 选的是 `ttsEngine`（不是 provider id），所以名字要自己拼：
+    "离线引擎"这一档带上本机离线实现的名字，状态也带出来（否则它会没有任何状态显示）。 */
+function capTtsOptionLabel(engine, provs) {
+  const edge = provs.find((p) => p.id === "edge-tts");
+  const offline = provs.find((p) => p.id !== "edge-tts");
+  if (engine === "off") return "关闭朗读（不出声）";
+  if (engine === "edge-tts") return capOptLabel("edge-tts（微软在线）", edge);
+  if (engine === "auto") {
+    return (edge && edge.ready === false)
+      ? "自动（edge-tts 未就绪 → 走离线）"
+      : "自动（优先 edge-tts，失败回退离线）";
+  }
+  return capOptLabel(`本机离线合成（${engine}）`, offline);
+}
+
+/** 「用哪个实现」区块：下拉（选中即生效）+ 出网标注 + 在线服务的地址/模型/密钥。
+
+    刻意只留这两样：下拉本身已经带了「出网/本地 · 就绪」，再补一行"当前 …"、
+    或再列一遍"两种实现"，都是同一份状态的第三、第四份拷贝（用户实测反馈）。
+ */
 function capProviderBlock(kind) {
   const provs = ((_capCache.prov || {}).providers || []).filter((p) => p.kind === kind);
   if (!provs.length) return "";
   const isTts = kind === "tts";
   const cur = isTts ? null : (provs.find((p) => p.active) || provs[0]);
   let select = "";
-  let currentLine = "";
   if (isTts) {
     // TTS 的"用哪个"就是 ttsEngine（含 off）：选项从设置元数据来，避免再造一个开关
     const meta = settingByKey("ttsEngine");
     const opts = (meta && meta.options) || [];
-    select = `<select class="ctl" data-tts-engine="1">` + opts.map((o) =>
-      `<option value="${esc(o)}" ${String(o) === String(meta && meta.value) ? "selected" : ""}>` +
-      `${esc(CAP_TTS_LABEL[o] || o)}</option>`).join("") + `</select>`;
-    currentLine = `<span class="muted" style="font-size:12px">当前 <b>${esc(capTtsCurrentName())}</b></span>`;
+    select = `<select class="ctl" data-tts-engine="1" title="朗读用哪个实现" aria-label="朗读用哪个实现">` +
+      opts.map((o) =>
+        `<option value="${esc(o)}" ${String(o) === String(meta && meta.value) ? "selected" : ""}>` +
+        `${esc(capTtsOptionLabel(o, provs))}</option>`).join("") + `</select>`;
   } else {
-    select = `<select class="ctl" data-provider-kind="${esc(kind)}">` + provs.map((p) =>
-      `<option value="${esc(p.id)}" ${p.active ? "selected" : ""}>${esc(p.name)}` +
-      `（${p.egress ? "出网" : "本地"}${p.ready === false ? " · 未就绪" : ""}）</option>`).join("") + `</select>`;
-    const rdy = cur.ready === true ? `<span style="color:var(--ok,#3a3)">已就绪</span>`
-      : cur.ready === false ? `<span class="muted">未就绪</span>` : `<span class="muted">未知</span>`;
-    currentLine = `<span class="muted" style="font-size:12px">当前 <b>${esc(cur.name)}</b> · ${rdy}</span>`;
+    select = `<select class="ctl" data-provider-kind="${esc(kind)}" title="用哪个实现" aria-label="用哪个实现">` +
+      provs.map((p) =>
+        `<option value="${esc(p.id)}" ${p.active ? "selected" : ""}>` +
+        `${esc(capOptLabel(p.name, p))}</option>`).join("") + `</select>`;
   }
   let egress;
   if (isTts) {
@@ -1206,10 +1234,7 @@ function capProviderBlock(kind) {
       ? `<div class="desc" style="color:var(--warn,#c80)">⚠ 数据会出网：${esc(cur.egress_note || "")}</div>`
       : `<div class="desc muted">数据不出本机</div>`;
   }
-  return `<div class="cap-prov">
-      <div class="cap-prov-row"><span class="cap-label">用哪个实现</span>${select}${currentLine}</div>
-      ${egress}${capOnlineBlock(kind, cur)}
-    </div>`;
+  return `<div class="cap-prov">${select}${egress}${capOnlineBlock(kind, cur)}</div>`;
 }
 
 /** 选中在线实现时就地展开它需要的地址/模型/密钥（+ 预设 + 保存）。 */
@@ -1248,18 +1273,11 @@ function capKindCard(kind) {
   let body = capProviderBlock(kind);
   if (kind === "asr") body += capAsrLocal();
   if (kind === "llm") {
-    body += `<div class="muted" style="font-size:12px;margin-top:6px">
-      `+`ECHO AUTO（多上游派发）的成员与优先级在「模型路由」页签里配；
-      这里只选"用哪个实现"和在线服务的地址/模型/密钥。</div>
-      <div class="mcard-act"><button type="button" class="btn mini" data-goto="failover">去模型路由</button></div>`;
+    // 只留一个入口按钮：成员与优先级的说明已经在下拉下面那行「会出网」里说过了
+    body += `<div class="mcard-act"><button type="button" class="btn mini" data-goto="failover">去模型路由</button></div>`;
   }
-  if (kind === "tts") {
-    body += `<div class="cap-sub">两种实现</div>` +
-      ((_capCache.prov || {}).providers || []).filter((p) => p.kind === "tts").map((p) =>
-        `<div class="cap-prov-state"><b>${esc(p.name)}</b>` +
-        `<span class="muted" style="font-size:12px">${p.egress ? "会出网" : "不出本机"} · ` +
-        `${p.ready === true ? "已就绪" : p.ready === false ? "未就绪" : "未知"}</span></div>`).join("");
-  }
+  // TTS 不再单列「两种实现」：那两行的状态与下拉选项里的（出网/本地 · 就绪）是同一份信息，
+  // 顶部概览条也已经各给了一个点 + 名字（2026-09-19 用户实测反馈：重复）。
   return `<div class="mcard">
     <div class="mcard-head"><div class="mcard-ic">${meta.icon}</div>
       <div class="mcard-title">${esc(meta.title)}</div></div>
