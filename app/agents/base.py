@@ -11,7 +11,7 @@ ECHO 的业务侧（assistant / meeting / worklog）只依赖本接口的 4 个�
   * 不支持的能力不要抛异常，忽略即可（例如某后端不支持指定工作区）。
   * 会话 id 由后端决定；不区分会话的后端可以返回常量。
 """
-import os
+from app import paths
 
 
 class AgentError(Exception):
@@ -93,4 +93,4 @@ class AgentAdapter:
 
 
 # ECHO 工作区（工作区会话在此目录下创建，GUI 会话列表中归属清晰）
-ECHO_WORKSPACE = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+ECHO_WORKSPACE = paths.echo_root()

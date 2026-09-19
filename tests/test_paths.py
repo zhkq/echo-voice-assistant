@@ -386,5 +386,34 @@ class EchoRootOverrideTests(unittest.TestCase):
             self.assertEqual(bad, [], "%s 里仍有自己推导的 BASE_DIR：%s" % (rel, bad))
 
 
+class ModelSubdirsFollowModelsDir(unittest.TestCase):
+    """``wake`` 的 KWS 目录与 ``diarize`` 的四个 pyannote 目录必须跟随 modelsDir。
+
+    这两处在 2.0 之前是模块级常量（``{ECHO}/models/…``）：用户改了 modelsDir 也不
+    生效，而 ``config.py`` 里 modelsDir 的说明明确承诺"唤醒词 / pyannote"随它走
+    （D20/D21）——所以这是**真 bug**，不是纯一致性。断言的是"请求时解析"，
+    因此直接替换 ``paths._settings_get`` 模拟配置，不依赖真实 settings。
+    """
+
+    def test_model_subdirs_follow_models_dir(self):
+        from app.audio import diarize, wake
+
+        tmp = tempfile.mkdtemp(prefix="echo-models-")
+        old = paths._settings_get
+        paths._settings_get = lambda name: tmp if name == "modelsDir" else ""
+        try:
+            self.assertEqual(wake.kws_model_dir(),
+                             os.path.join(tmp, "wakeword", "kws-zh-en-3m"))
+            self.assertEqual(diarize.pyannote_dir(), os.path.join(tmp, "pyannote"))
+            self.assertEqual(diarize.segmentation_dir(),
+                             os.path.join(tmp, "pyannote", "pyannote-segmentation-3.0-local"))
+            self.assertEqual(diarize.embedding_dir(),
+                             os.path.join(tmp, "pyannote", "pyannote-wespeaker-local"))
+            self.assertEqual(diarize.plda_dir(),
+                             os.path.join(tmp, "pyannote", "pyannote-plda-local", "plda"))
+        finally:
+            paths._settings_get = old
+
+
 if __name__ == "__main__":
     unittest.main()

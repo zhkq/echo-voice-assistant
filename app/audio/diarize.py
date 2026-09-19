@@ -14,6 +14,8 @@ import os
 import threading
 import wave
 
+from app import paths
+
 import numpy as np
 
 # GPU 加固：确保 ctranslate2 先于 torch 加载，避免 CUDA 动态库冲突（WinError 127）
@@ -22,11 +24,25 @@ try:
 except Exception:
     pass
 
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-PYANNOTE_DIR = os.path.join(BASE_DIR, "models", "pyannote")
-SEG_DIR = os.path.join(PYANNOTE_DIR, "pyannote-segmentation-3.0-local")
-EMB_DIR = os.path.join(PYANNOTE_DIR, "pyannote-wespeaker-local")
-PLDA_DIR = os.path.join(PYANNOTE_DIR, "pyannote-plda-local", "plda")
+def pyannote_dir() -> str:
+    """pyannote 权重根：**跟随 modelsDir**（D20/D21）。
+
+    原来是 ``{ECHO}/models/pyannote`` 的模块级常量，用户改 modelsDir 后不生效
+    （config 里 modelsDir 的说明明确点名了 pyannote）。用函数以便请求时解析。
+    """
+    return os.path.join(paths.models_root(), "pyannote")
+
+
+def segmentation_dir() -> str:
+    return os.path.join(pyannote_dir(), "pyannote-segmentation-3.0-local")
+
+
+def embedding_dir() -> str:
+    return os.path.join(pyannote_dir(), "pyannote-wespeaker-local")
+
+
+def plda_dir() -> str:
+    return os.path.join(pyannote_dir(), "pyannote-plda-local", "plda")
 
 # pyannote 4.x speaker-diarization-3.1 默认超参（centroid 聚类）
 HYPERPARAMS = {
@@ -110,13 +126,13 @@ def _load_pipeline():
         from pyannote.audio import Model
         from pyannote.audio.pipelines.speaker_diarization import SpeakerDiarization
         map_location = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-        seg = Model.from_pretrained(SEG_DIR, strict=False, map_location=map_location)
-        emb = Model.from_pretrained(EMB_DIR, strict=False, map_location=map_location)
+        seg = Model.from_pretrained(segmentation_dir(), strict=False, map_location=map_location)
+        emb = Model.from_pretrained(embedding_dir(), strict=False, map_location=map_location)
         pipe = SpeakerDiarization(
             segmentation=seg,
             embedding=emb,
             clustering="AgglomerativeClustering",
-            plda={"checkpoint": PLDA_DIR, "subfolder": None},
+            plda={"checkpoint": plda_dir(), "subfolder": None},
         )
         pipe.instantiate(HYPERPARAMS)
         if map_location.type == "cuda":

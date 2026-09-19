@@ -30,6 +30,8 @@ import hashlib
 import os
 import threading
 
+from app import paths
+
 _LOCK = threading.Lock()
 _HELD = {}          # name -> 句柄（Windows: HANDLE(int) / POSIX: fd）
 
@@ -146,8 +148,7 @@ def acquire(name="echo", data_dir=None):
     ok=True 时锁由本进程持有，直到进程退出或显式 release()。同一进程重复 acquire
     同一把锁会返回 False（不会自己跟自己抢成功），便于测试与防御性调用。
     """
-    data_dir = data_dir or os.path.join(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
+    data_dir = data_dir or paths.data_root()
     lid = _lock_id(name, data_dir)
     with _LOCK:
         if name in _HELD:
@@ -177,8 +178,7 @@ def release(name="echo"):
 
 def is_held(name="echo", data_dir=None):
     """该锁当前**是否存在**（含本进程自己持有）。只探测，不获取。"""
-    data_dir = data_dir or os.path.join(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
+    data_dir = data_dir or paths.data_root()
     if os.name == "nt":
         return _win_held(_lock_id(name, data_dir))
     return _posix_held(_lock_file(data_dir, name))

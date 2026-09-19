@@ -14,10 +14,21 @@ import threading
 import time
 from collections import deque
 
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-KWS_MODEL_DIR = os.path.join(BASE_DIR, "models", "wakeword", "kws-zh-en-3m")
+from app import paths
+
 SR = 16000
 BLOCK = 1280  # 80ms
+
+
+def kws_model_dir() -> str:
+    """KWS 权重目录：**跟随 modelsDir**（D20/D21）。
+
+    原来这里是 ``{ECHO}/models/wakeword/kws-zh-en-3m`` 的**模块级常量**——用户把
+    modelsDir 指到别处时，唤醒词仍去安装目录找，与 config 里 modelsDir 的承诺
+    （"whisper / SenseVoice / 唤醒词 / pyannote…"）不符，是真 bug。
+    用函数不用常量，理由同 ``audio/stt.py::models_dir()``：请求时解析。
+    """
+    return os.path.join(paths.models_root(), "wakeword", "kws-zh-en-3m")
 
 
 def _norm(s):
@@ -186,12 +197,13 @@ class WakeListener(threading.Thread):
         # 2) KWS
         import sherpa_onnx
         import tempfile as _tf
-        enc = os.path.join(KWS_MODEL_DIR, "encoder-epoch-13-avg-2-chunk-8-left-64.int8.onnx")
-        dec = os.path.join(KWS_MODEL_DIR, "decoder-epoch-13-avg-2-chunk-8-left-64.onnx")
-        joi = os.path.join(KWS_MODEL_DIR, "joiner-epoch-13-avg-2-chunk-8-left-64.int8.onnx")
-        tok = os.path.join(KWS_MODEL_DIR, "tokens.txt")
+        kws_dir = kws_model_dir()
+        enc = os.path.join(kws_dir, "encoder-epoch-13-avg-2-chunk-8-left-64.int8.onnx")
+        dec = os.path.join(kws_dir, "decoder-epoch-13-avg-2-chunk-8-left-64.onnx")
+        joi = os.path.join(kws_dir, "joiner-epoch-13-avg-2-chunk-8-left-64.int8.onnx")
+        tok = os.path.join(kws_dir, "tokens.txt")
         if not all(os.path.isfile(p) for p in (enc, dec, joi, tok)):
-            raise FileNotFoundError(f"KWS 模型未就绪: {KWS_MODEL_DIR}")
+            raise FileNotFoundError(f"KWS 模型未就绪: {kws_dir}")
         kw_lines = self._keywords()
         _fd, kwfile = _tf.mkstemp(suffix=".keywords.txt", text=True)
         try:

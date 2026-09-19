@@ -19,6 +19,8 @@ import threading
 import time
 import urllib.request
 
+from app import paths
+
 # 路由端口以 dsh-failover/config.json 的 "port" 为准（代理进程自己也是读它）。
 # 2026-09-14 起不再写死：Windows 动态端口段（默认 1024-15000）会被 Hyper-V/WSL
 # 划为保留段且每次重启漂移，落在其中的端口 bind 会失败（Errno 13）。
@@ -32,7 +34,8 @@ _guard = None                # 守护线程
 _stop_evt = None
 _last_launch = 0.0           # 上次拉起时刻（单调时钟），用于冷却
 
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# 安装根只由 app/paths.py 推导（D29）；dsh-failover/ 是安装目录下的代码资产。
+BASE_DIR = paths.echo_root()
 PROXY_SCRIPT = os.path.join(BASE_DIR, "dsh-failover", "proxy.py")
 PROXY_CONFIG = os.path.join(BASE_DIR, "dsh-failover", "config.json")
 LOG_DIR = os.path.join(BASE_DIR, "dsh-failover", "logs")

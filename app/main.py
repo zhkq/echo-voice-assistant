@@ -11,6 +11,8 @@ import threading
 import time
 from contextlib import asynccontextmanager
 
+from app import paths
+
 # 输出被 -RedirectStandardOutput 重定向到文件后默认是块缓冲，
 # 导致 print 日志迟迟不落盘。改成行缓冲，日志即时可见。
 try:
@@ -24,8 +26,9 @@ except Exception:
 # （原生库内部崩溃可能不触发，但能覆盖大部分 Python→原生调用栈场景。）
 try:
     import faulthandler
-    _FH_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    _FH_PATH = os.path.join(_FH_DIR, "data", "logs", "faulthandler.log")
+    # 日志属于**数据根**（D18）：Windows 下 = {ECHO}/data（与 1.x 同址，老用户无感），
+    # macOS 下 = ~/Library/Application Support/ECHO（不能写进 .app 里）。
+    _FH_PATH = os.path.join(paths.data_root(), "logs", "faulthandler.log")
     os.makedirs(os.path.dirname(_FH_PATH), exist_ok=True)
     with open(_FH_PATH, "a", encoding="utf-8") as _fh:
         _fh.write(f"\n===== ECHO 启动 {__import__('datetime').datetime.now()} =====\n")
