@@ -1706,10 +1706,16 @@ function renderSettingRow(s) {
     // 密钥（P5 凭据管理）：服务端在出口把它遮成空串，所以这里**必须**是密码框 + 空值，
     // 并明确"留空 = 不改"；要清空走旁边的「清除」按钮（送 __clear__ 哨兵）。
     // 否则整批保存会把空串当新值，把用户的密钥静默清掉。
-    ctl = `<input type="password" class="ctl" id="${id}" data-key="${s.key}" data-secret="1"
-             value="" autocomplete="new-password"
-             placeholder="${s.hasValue ? "已配置（留空 = 不改）" : "未配置"}">
-           <button class="btn-mini" data-clear-secret="${s.key}">清除</button>`;
+    // 输入框与「清除」必须同一行：`.set-row` 是纵向布局，所以要自己套一层 flex。
+    // （2026-09-19 用户实测反馈：原来的按钮掉到了输入框下面、还渲染成一个大白块。）
+    ctl = `<div style="display:flex;gap:6px;align-items:center">
+             <input type="password" class="ctl" id="${id}" data-key="${s.key}" data-secret="1"
+               value="" autocomplete="new-password" style="flex:1"
+               placeholder="${s.hasValue ? "已配置（留空 = 不改）" : "未配置"}">
+             <button type="button" class="btn" data-clear-secret="${s.key}"
+               style="flex:0 0 auto;padding:2px 8px;font-size:12px"
+               title="清空这个密钥">清除</button>
+           </div>`;
   } else if (s.value_type === "bool") {
     ctl = `<input type="checkbox" class="ctl" id="${id}" data-key="${s.key}" ${s.value ? "checked" : ""}>`;
   } else if (s.options && s.options.length) {
