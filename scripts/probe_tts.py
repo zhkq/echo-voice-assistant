@@ -37,6 +37,51 @@ BEEPS = ("start", "done", "ok", "ok2", "err")
 RESULTS = []
 
 
+class _Tee:
+    """把 stdout 同时写到日志文件 —— 结果不用手抄，直接读文件。
+
+    起因：用户跑完探针后要"贴回结果"，窗口一关就没了。落盘之后任何人（包括自动化）
+    都能直接读 `data/logs/probe-tts-last.txt`，不必依赖人工复制。
+    """
+
+    def __init__(self, path):
+        self.path = path
+        self.fh = None
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            self.fh = open(path, "w", encoding="utf-8")
+        except Exception:
+            self.fh = None
+
+    def write(self, text):
+        try:
+            sys.__stdout__.write(text)
+        except Exception:
+            pass
+        if self.fh:
+            try:
+                self.fh.write(text)
+                self.fh.flush()
+            except Exception:
+                pass
+        return len(text)
+
+    def flush(self):
+        for stream in (sys.__stdout__, self.fh):
+            try:
+                if stream:
+                    stream.flush()
+            except Exception:
+                pass
+
+    def close(self):
+        try:
+            if self.fh:
+                self.fh.close()
+        except Exception:
+            pass
+
+
 def hr(title):
     print("")
     print("=" * 70)
@@ -218,12 +263,18 @@ def speak_section(title, text, engine, note=""):
 
 
 def main():
+    log_path = os.path.join(ROOT, "data", "logs", "probe-tts-last.txt")
+    tee = _Tee(log_path)
+    if tee.fh:
+        sys.stdout = tee
     print("ECHO audio probe (dev tree)")
     print("root   : %s" % ROOT)
     print("python : %s" % sys.executable)
+    print("log    : %s%s" % (log_path, "" if tee.fh else "  (could not open - not logged!)"))
     print("")
     print("This probe plays ONE sound at a time and asks y/n after EACH one,")
-    print("then prints a summary table at the end - paste that table back.")
+    print("then prints a summary table at the end. Everything is also written to")
+    print("the log file above, so the results survive closing this window.")
 
     show_settings()
     pause()
@@ -262,6 +313,8 @@ def main():
     hr("SUMMARY (paste this back)")
     for label, heard in RESULTS:
         print("  %-46s %s" % (label, "HEARD" if heard else "NOT heard"))
+    print("")
+    print("log file: %s" % log_path)
 
     hr("how to read the result")
     print("  * beeps: ALL heard            -> beep path fine (earlier 'no beeps' = environment)")
