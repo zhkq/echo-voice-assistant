@@ -68,13 +68,4 @@
     会议文件目录                 meetingsDir                str    = 
     模型目录                   modelsDir                  str    = 
 
-模型路由（router）  —— 7 项
-    启动时注册到 DSH             routerAutoRegister         bool   = True
-    模型组显示名                 routerDisplayName          str    = ECHO AUTO
-    健康探测间隔秒                routerProbeInterval        int    = 45
-    成员首字节超时秒               routerFirstByteTimeout     float  = 20.0
-    成员连接超时秒                routerConnectTimeout       float  = 1.5
-    熔断连续失败次数               routerBreakerThreshold     int    = 2
-    熔断冷却秒                  routerBreakerCooldown      int    = 30
-
-可见项合计：59（含智能体表格 1 块 + 能力 provider 卡片 1 块）
+可见项合计：52（另有：智能体表格、能力 provider 卡片、「能力」页签的实现选择、「模型路由」页签的 LLM 与路由参数）

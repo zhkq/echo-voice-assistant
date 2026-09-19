@@ -3,17 +3,20 @@
 
 为什么需要它
 ------------
-设置页的分组/顺序/可见性是三处约定叠出来的：
+设置页的分组/顺序/可见性是几处约定叠出来的：
   1. `app/config.py:DEFAULTS` 的 grp 与声明顺序（后端元数据，`order` 字段）；
   2. `web/app.js` 的 `SET_GROUP_ORDER` / `SET_GROUP_NAMES`（分组标题与先后）；
-  3. `web/app.js` 的 `MODEL_KEYS`（被「模型」页签接管的 9 项，要从表单里过滤掉）。
+  3. `web/app.js` 的 `SET_SUB_ORDER` / `SET_SUB_NAMES`（二级小节）；
+  4. `web/app.js` 的 `MODEL_KEYS` / `ROUTER_KEYS`（被「能力」页签与「模型路由」页签
+     接管的项，要从表单里过滤掉 —— 对应页签挂掉时会回退显示）。
 改完分组想确认"用户到底看到什么"，开浏览器点一遍是最慢的办法；这个脚本用**同一份
 元数据 + 同一套排序/过滤规则**把它打印出来（临时库，不碰真实 data/）。
 
 用法
 ----
-    python scripts/preview-settings-menu.py                # 正常情况（模型页签可用）
-    python scripts/preview-settings-menu.py --models-fail   # 模型页签挂了 → 模型组回退显示
+    python scripts/preview-settings-menu.py                  # 正常情况（两个页签都可用）
+    python scripts/preview-settings-menu.py --models-fail    # 能力页签挂了 → 模型组回退显示
+    python scripts/preview-settings-menu.py --router-fail    # 模型路由页签挂了 → 路由参数回退显示
     python scripts/preview-settings-menu.py --out docs/settings-menu.txt
 """
 from __future__ import annotations
@@ -29,7 +32,7 @@ sys.path.insert(0, ROOT)
 
 
 def _panel_group_tables():
-    """从 web/app.js 抓面板的分组表 / 二级小节表 / MODEL_KEYS（正则抓取，不执行 JS）。"""
+    """从 web/app.js 抓面板的分组表 / 小节表 / 两个"页签承载"的键集合（正则抓取，不执行 JS）。"""
     with open(os.path.join(ROOT, "web", "app.js"), encoding="utf-8") as fh:
         js = fh.read()
     order = re.search(r"const SET_GROUP_ORDER = \[(.*?)\];", js, re.S)
@@ -37,16 +40,18 @@ def _panel_group_tables():
     sub_order = re.search(r"const SET_SUB_ORDER = \[(.*?)\];", js, re.S)
     sub_names = re.search(r"const SET_SUB_NAMES = \{(.*?)\};", js, re.S)
     model_keys = re.search(r"const MODEL_KEYS = new Set\(\[(.*?)\]\);", js, re.S)
-    if not (order and names and sub_order and sub_names and model_keys):
+    router_keys = re.search(r"const ROUTER_KEYS = new Set\(\[(.*?)\]\);", js, re.S)
+    if not (order and names and sub_order and sub_names and model_keys and router_keys):
         raise SystemExit("web/app.js 里的分组表被改得认不出来了")
     return (re.findall(r'"([a-z]+)"', order.group(1)),
             dict(re.findall(r'([a-z]+):\s*"([^"]+)"', names.group(1))),
             re.findall(r'"([a-z]+)"', sub_order.group(1)),
             dict(re.findall(r'([a-z]+):\s*"([^"]+)"', sub_names.group(1))),
-            set(re.findall(r'"(\w+)"', model_keys.group(1))))
+            set(re.findall(r'"(\w+)"', model_keys.group(1))),
+            set(re.findall(r'"(\w+)"', router_keys.group(1))))
 
 
-def rows(models_tab_ok=True):
+def rows(models_tab_ok=True, router_tab_ok=True):
     """面板 loadSettings() 拿到的行（含它做的过滤与排序）。"""
     import app.db as db
     from app.config import settings
@@ -66,8 +71,10 @@ def rows(models_tab_ok=True):
         db.DATA_DIR, db.DB_FILE = old
         shutil.rmtree(tmp, ignore_errors=True)
 
-    *_tables, model_keys = _panel_group_tables()
-    out = [s for s in data if not (models_tab_ok and s["key"] in model_keys)]
+    *_tables, model_keys, router_keys = _panel_group_tables()
+    out = [s for s in data
+           if not (models_tab_ok and s["key"] in model_keys)
+           and not (router_tab_ok and s["key"] in router_keys)]
     # 与 web/app.js 的 loadSettings() 完全一致：先按 order，再按 key
     out.sort(key=lambda s: (s.get("order", 10 ** 6), s["key"]))
     return out
@@ -92,9 +99,9 @@ def _item_line(s, indent="    "):
                ("  [" + ",".join(flags) + "]") if flags else ""))
 
 
-def render(models_tab_ok=True):
-    order, names, sub_order, sub_names, _model_keys = _panel_group_tables()
-    data = rows(models_tab_ok)
+def render(models_tab_ok=True, router_tab_ok=True):
+    order, names, sub_order, sub_names, _model_keys, _router_keys = _panel_group_tables()
+    data = rows(models_tab_ok, router_tab_ok)
     groups = {}
     for s in data:
         groups.setdefault(s["grp"], []).append(s)
@@ -118,7 +125,8 @@ def render(models_tab_ok=True):
             lines += [_item_line(s, indent="      ") for s in by_sub[k]]
         lines += [_item_line(s) for s in items if not s.get("sub")]
         lines.append("")
-    lines.append("可见项合计：%d（含智能体表格 1 块 + 能力 provider 卡片 1 块）" % len(data))
+    lines.append("可见项合计：%d（另有：智能体表格、能力 provider 卡片、"
+                 "「能力」页签的实现选择、「模型路由」页签的 LLM 与路由参数）" % len(data))
     return "\n".join(lines)
 
 
@@ -126,7 +134,8 @@ def main(argv):
     out_path = ""
     if "--out" in argv:
         out_path = argv[argv.index("--out") + 1]
-    text = render(models_tab_ok="--models-fail" not in argv)
+    text = render(models_tab_ok="--models-fail" not in argv,
+                  router_tab_ok="--router-fail" not in argv)
     if out_path:
         with open(os.path.join(ROOT, out_path) if not os.path.isabs(out_path) else out_path,
                   "w", encoding="utf-8") as fh:

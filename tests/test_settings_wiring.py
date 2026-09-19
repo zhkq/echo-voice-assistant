@@ -530,6 +530,33 @@ class OptionAndPanelWiringTests(unittest.TestCase):
         self.assertNotIn("⚠ 数据会出网", js)
         self.assertNotIn("数据不出本机", js)
 
+    def test_router_settings_keys_match_the_router_group(self):
+        """`ROUTER_KEYS`（被「模型路由」页签接管的键）必须与 `grp="router"` 一一对应。"""
+        js = _read(os.path.join("web", "app.js"))
+        m = re.search(r"const ROUTER_KEYS = new Set\(\[(.*?)\]\);", js, re.S)
+        self.assertIsNotNone(m, "app.js 里应有 ROUTER_KEYS")
+        declared = set(re.findall(r'"(\w+)"', m.group(1)))
+        want = {k for k, meta in DEFAULTS.items()
+                if meta.get("grp") == "router" and not meta.get("deprecated")}
+        self.assertEqual(declared, want, "路由参数集合与 config 的 router 组漂移了")
+
+    def test_router_settings_live_in_the_model_router_tab(self):
+        """「设置 → 模型路由」那一组整合进顶部「模型路由」页签（2026-09-19 用户要求）。"""
+        js = _read(os.path.join("web", "app.js"))
+        html = _read(os.path.join("web", "index.html"))
+        for token in ('id="rtSetHost"', 'id="rtSetSave"'):
+            self.assertIn(token, html, "index.html 缺少 %s" % token)
+        self.assertLess(html.index('id="view-failover"'), html.index('id="rtSetHost"'),
+                        "路由参数要在「模型路由」页签里")
+        self.assertIn("async function loadRouterSettings", js)
+        self.assertIn("loadRouterSettings();", js.split("async function loadRouter()")[1][:900],
+                      "切到模型路由页签时要渲染路由参数")
+        self.assertIn("rows.map(renderSettingRow)", js, "复用设置页的行渲染（样式一致）")
+        self.assertIn("_rtTabOk && ROUTER_KEYS.has(s.key)", js,
+                      "设置页要把路由参数过滤掉（回退条件由 _rtTabOk 管）")
+        self.assertIn("routerHintRow", js, "设置页要给一句指路")
+        self.assertIn("async function ensureSettings", js, "两个页签共用一份设置数据")
+
     def test_agent_switch_also_enables_the_product(self):
         """智能体开关即单选：选中时要把该产品的启用开关一起打开，避免自相矛盾。"""
         js = _read(os.path.join("web", "app.js"))

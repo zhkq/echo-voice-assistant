@@ -381,8 +381,79 @@ async function loadRouter() {
     renderRouterHead();
     renderRouterMembers();
     renderRouterCandidates();
+    loadRouterSettings();      // 路由参数（原「设置 → 模型路由」那一组）
   } catch (e) { toast("加载模型路由失败：" + e.message); }
   loadRouterLlm();      // 语言模型那一块（用哪个实现 + 在线服务）也在这个页签里
+}
+
+/** 读一次设置（`_settingsCache`）。两个页签都要用（能力页签 / 模型路由页签），
+ *  所以做成"没有才拉"的共享入口 —— 各拉一遍还会出现"一处改了另一处是旧值"。 */
+async function ensureSettings(force) {
+  if (!force && _settingsCache.length) return _settingsCache;
+  const r = await api("/api/settings");
+  _settingsCache = r.settings || [];
+  _agentsCache = r.agents || _agentsCache;
+  return _settingsCache;
+}
+
+/** 路由参数卡（原「设置 → 模型路由」那一组 7 项）。
+ *
+ *  2026-09-19 用户实测："设置中的模型路由标签整合到模型路由中" —— 这些项只有和本页的
+ *  成员/优先级放一起才看得懂（"注册到 DSH"、"模型组显示名"本来就是这一页在用的东西）。
+ *  渲染直接复用设置页的 renderSettingRow()（同样的标签/控件/说明样式），
+ *  保存走本卡的按钮（只收集本卡内的 data-key）。
+ */
+let _rtTabOk = true;
+
+async function loadRouterSettings() {
+  const host = $("#rtSetHost");
+  if (!host) return;
+  const wasOk = _rtTabOk;
+  try {
+    const rows = (await ensureSettings()).filter((s) => ROUTER_KEYS.has(s.key));
+    rows.sort((a, b) => ((a.order ?? 1e6) - (b.order ?? 1e6))
+      || String(a.key).localeCompare(String(b.key)));
+    host.innerHTML = rows.map(renderSettingRow).join("")
+      || `<div class="muted" style="font-size:12px">没有可显示的路由参数。</div>`;
+    _rtTabOk = true;
+    const btn = $("#rtSetSave");
+    if (btn && !btn.dataset.bound) {
+      btn.dataset.bound = "1";
+      btn.addEventListener("click", saveRouterSettings);
+    }
+    if (!wasOk) loadSettings();      // 页签恢复：设置页里回退显示的那一组可以收起来了
+  } catch (e) {
+    host.innerHTML = `<div class="muted" style="font-size:12px">读取失败：${esc(e.message)}</div>`;
+    _rtTabOk = false;
+    if (wasOk) { try { loadSettings(); } catch (_) { /* 忽略 */ } }
+  }
+}
+
+/** 保存路由参数：只收本卡里的字段（设置页那套按钮与本卡互不影响）。 */
+async function saveRouterSettings() {
+  const values = {};
+  $$("#rtSetHost [data-key]").forEach((el) => {
+    const key = el.dataset.key;
+    const meta = _settingsCache.find((s) => s.key === key);
+    if (!meta) return;
+    if (meta.value_type === "bool") values[key] = el.checked;
+    else if (meta.value_type === "list") values[key] = el.value.split(/[,，]/).map((x) => x.trim()).filter(Boolean);
+    else if (meta.value_type === "int") values[key] = parseInt(el.value, 10) || 0;
+    else if (meta.value_type === "float") values[key] = parseFloat(el.value) || 0;
+    else values[key] = el.value;
+  });
+  if (!Object.keys(values).length) { toast("没有需要保存的项"); return; }
+  const state = $("#rtSetState");
+  try {
+    // 后端在 PUT 里会把路由项同步写到 dsh-failover/config.json 并热重载（见 api.put_settings）
+    await api("/api/settings", { method: "PUT", body: JSON.stringify({ values }) });
+    toast("已保存 " + Object.keys(values).length + " 项路由参数");
+    if (state) state.textContent = "已保存并热重载";
+    await loadRouterSettings();
+  } catch (err) {
+    toast("保存失败：" + err.message);
+    if (state) state.textContent = "保存失败";
+  }
 }
 
 async function saveRouter() {
@@ -891,6 +962,15 @@ const MODEL_KEYS = new Set([
   "sttModel", "meetingSttModel", "device", "ttsEngine",
   "wakeEngine", "meetingDiarize",
   "voiceprintEnabled", "voiceprintAutoEnroll", "voiceprintThreshold", "voiceprintMargin",
+]);
+/* 路由参数：同样从「设置」页移出，由顶部「模型路由」页签承载（前端过滤，后端 grp 不动）。
+   为什么：这些项只有和那一页的成员/优先级放一起才看得懂（"注册到 DSH"、"模型组显示名"
+   本来就是那个页签在用的东西）；2026-09-19 用户实测："设置中的模型路由标签整合到模型路由中"。
+   键盘值：与 config.DEFAULTS 里 grp="router" 的项一一对应（tests 里钉住，防漂移）。 */
+const ROUTER_KEYS = new Set([
+  "routerAutoRegister", "routerDisplayName", "routerProbeInterval",
+  "routerFirstByteTimeout", "routerConnectTimeout",
+  "routerBreakerThreshold", "routerBreakerCooldown",
 ]);
 /* 默认展开；用户折叠过的分组/小节记在 localStorage，刷新/重开面板后保持。
    两级各一份状态：`echo.settings.collapsedGroups`（一级）、`...collapsedSubs`（二级）。 */
@@ -1460,8 +1540,7 @@ async function loadRouterLlm() {
   if (!host) return;
   try {
     await ensureProviderData(true);
-    const r = await api("/api/settings");
-    _settingsCache = r.settings || _settingsCache;
+    await ensureSettings(true);
     host.innerHTML = capProviderBlock("llm");
     bindRouterLlm(host);
   } catch (e) {
@@ -1671,11 +1750,12 @@ async function loadSettings() {
     _settingsCache = r.settings;
     _agentsCache = r.agents || [];
     const groups = {};
-    // 模型/引擎/朗读实现相关项正常由顶部「能力」页签承载；该页签加载失败时（_capTabOk=false）
-    // 回退显示，免得唯一入口挂掉时连转写引擎都改不回来。
+    // 「能力」页签承载的项（用哪个实现）与「模型路由」页签承载的项（路由参数），都从这里过滤掉；
+    // **对应页签加载失败时回退显示**（_capTabOk / _rtTabOk = false），免得唯一入口挂掉时改不回来。
     // 组内顺序用后端给的 `order`（= DEFAULTS 声明顺序）：/api/settings 是按 (grp, key)
     // 字母序来的，直接渲染会把"三个提示音开关"这类编排打散（见 config.SETTING_ORDER）。
-    const rows = r.settings.filter((s) => !(_capTabOk && MODEL_KEYS.has(s.key)));
+    const rows = r.settings.filter((s) =>
+      !(_capTabOk && MODEL_KEYS.has(s.key)) && !(_rtTabOk && ROUTER_KEYS.has(s.key)));
     rows.sort((a, b) => ((a.order ?? 1e6) - (b.order ?? 1e6))
       || String(a.key).localeCompare(String(b.key)));
     rows.forEach((s) => { (groups[s.grp] = groups[s.grp] || []).push(s); });
@@ -1686,12 +1766,16 @@ async function loadSettings() {
     const extra = Object.keys(groups).filter((g) => !SET_GROUP_ORDER.includes(g));
     const collapsed = _collapsedGroups();
     const form = $("#settingsForm");
-    // 模型/引擎项被移走后设置页要给一句指路；能力页签挂掉时反过来提示它们仍在本页
+    // 被移走的项要给一句指路；对应页签挂掉时反过来提示它们仍在本页
     const modelHintRow = _capTabOk
       ? `<div class="muted" style="margin:0 0 10px">转写引擎 / 朗读实现 / 计算设备 / 唤醒 / 声纹 / 说话人分离，
           以及在线服务的地址与密钥，都已移到顶部「<b>能力</b>」页签（用哪个实现 + 装没装，一处看全）。</div>`
       : `<div class="mcard-warn" style="margin:0 0 10px">「能力」页签加载失败，模型与在线服务相关设置暂时保留在本页；页签恢复后会自动收起。</div>`;
-    form.innerHTML = modelHintRow + [...known, ...extra].map((g) => {
+    const routerHintRow = _rtTabOk
+      ? `<div class="muted" style="margin:0 0 10px">路由参数（注册 / 显示名 / 探测与熔断）已移到顶部
+          「<b>模型路由</b>」页签，和成员、优先级放在一起。</div>`
+      : `<div class="mcard-warn" style="margin:0 0 10px">「模型路由」页签加载失败，路由参数暂时保留在本页；页签恢复后会自动收起。</div>`;
+    form.innerHTML = modelHintRow + routerHintRow + [...known, ...extra].map((g) => {
       const items = groups[g];
       const isCollapsed = collapsed.has(g);
       const no = g === "agent" ? (_agentsCache.filter((a) => a.active).length || 0) : items.length;
