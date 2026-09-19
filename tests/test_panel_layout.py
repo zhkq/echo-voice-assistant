@@ -70,6 +70,41 @@ class PanelLayoutContractTests(unittest.TestCase):
         self._assert_has(".cap-pick", "min-width: 0")
         self._assert_has(".cap-prov", "min-width: 0")
 
+    def test_collapsible_cards_have_styles(self):
+        """可折叠卡片（路由参数等）：折叠时藏 body、箭头转向。"""
+        self._assert_has(".card.collapsible.collapsed > .card-body", "display: none")
+        self._assert_has(".card.collapsible.collapsed > .card-title .set-arrow",
+                         "transform: rotate(0deg)")
+
+
+class CollapsibleCardWiringTests(unittest.TestCase):
+    """可折叠卡片的接线（2026-09-19 用户要求："路由参数增加折叠"）。"""
+
+    @classmethod
+    def setUpClass(cls):
+        with open(os.path.join(_ROOT, "web", "index.html"), encoding="utf-8") as fh:
+            cls.html = fh.read()
+        with open(os.path.join(_ROOT, "web", "app.js"), encoding="utf-8") as fh:
+            cls.js = fh.read()
+
+    def test_router_params_card_is_collapsible(self):
+        self.assertIn('class="card collapsible"', self.html)
+        self.assertIn('data-collapse-id="router-params"', self.html)
+        m = re.search(r'<div class="card collapsible"[^>]*data-collapse-id="router-params">(.*?)<div class="card-body">',
+                      self.html, re.S)
+        self.assertIsNotNone(m, "找不到路由参数卡的标题块")
+        self.assertIn('class="set-arrow"', m.group(1), "标题里要有折叠箭头（与设置页分组同一套视觉）")
+
+    def test_toggle_is_wired_with_persistence(self):
+        for token in ("function toggleCollapsibleCard", "function applyCollapsedCards",
+                      "function _collapsedCards", "echo.panel.collapsedCards"):
+            with self.subTest(token=token):
+                self.assertIn(token, self.js)
+        self.assertIn("applyCollapsedCards();", self.js, "页面加载时要应用上次的折叠状态")
+        self.assertIn("_cardTitleOf(e.target)", self.js, "点击/回车都要能切换")
+        # 只认"直接子标题"：别把卡片内部嵌套的其它标题（设置页分组）也当成卡片折叠开关
+        self.assertIn(".card.collapsible > .card-title", self.js)
+
 
 if __name__ == "__main__":
     unittest.main()

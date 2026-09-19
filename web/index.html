@@ -193,8 +193,10 @@
         </div>
       </div>
     </div>
-    <div class="card">
-      <div class="card-title"><span class="ic">⚙️</span>路由参数
+    <!-- 可折叠卡片：class="collapsible" + data-collapse-id，点标题折叠/展开，
+         状态记在 localStorage（见 app.js 的 toggleCollapsibleCard）。 -->
+    <div class="card collapsible" id="rtSetCard" data-collapse-id="router-params">
+      <div class="card-title"><span class="set-arrow">▶</span><span class="ic">⚙️</span>路由参数
         <span class="spacer"></span>
         <span class="muted" style="font-size:12px">改完点「保存」；标注需重启的项要重启路由进程</span>
       </div>

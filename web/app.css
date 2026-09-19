@@ -119,6 +119,18 @@ body { min-width: 0; }
   font-size: .82em; line-height: 1; font-family: Georgia, "Times New Roman", serif;
 }
 .card-title .spacer { flex: 1; }
+/* ---------- 可折叠卡片（第一个用户：「模型路由 → 路由参数」）----------
+   给 `.card` 加 class="collapsible" + data-collapse-id 即可；
+   点标题（或聚焦后回车/空格）折叠，状态由 app.js 记在 localStorage。 */
+.card.collapsible > .card-title { cursor: pointer; user-select: none; }
+.card.collapsible > .card-title:hover { filter: brightness(1.12); }
+.card.collapsible > .card-title .set-arrow {
+  font-size: 10px; width: 12px; flex-shrink: 0;
+  transition: transform .15s; transform: rotate(90deg);
+}
+.card.collapsible.collapsed > .card-title .set-arrow { transform: rotate(0deg); }
+.card.collapsible.collapsed > .card-body { display: none; }
+.card.collapsible.collapsed { padding-bottom: 6px; }   /* 折叠后别留一大截空白 */
 .card-title .more {
   margin-left: auto; color: var(--accent); font-size: 12px;
   text-decoration: none; cursor: pointer; opacity: .85;

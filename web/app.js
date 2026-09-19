@@ -82,6 +82,61 @@ function switchView(name) {
 }
 $$(".tab").forEach((t) => t.addEventListener("click", () => switchView(t.dataset.view)));
 
+/* ---------------- 可折叠卡片 ----------------
+   给 `.card` 加 class="collapsible" 与 data-collapse-id，标题点一下就能折叠/展开，
+   状态记在 localStorage（跨刷新/重开保持）。第一个用它是「模型路由 → 路由参数」
+   （2026-09-19 用户要求："路由参数增加折叠"——7 项静置在那里太长，但又不常改）。
+   与设置页的分组折叠是**两套存储**：一个记分组、一个记卡片，互不影响。 */
+const CARD_COLLAPSE_KEY = "echo.panel.collapsedCards";
+
+function _collapsedCards() {
+  try { return new Set(JSON.parse(localStorage.getItem(CARD_COLLAPSE_KEY) || "[]")); }
+  catch (e) { return new Set(); }
+}
+function _saveCollapsedCards(set) {
+  try { localStorage.setItem(CARD_COLLAPSE_KEY, JSON.stringify([...set])); } catch (e) { /* 忽略 */ }
+}
+function _cardTitleOf(el) {
+  // 只认"直接子标题"：卡片里嵌套的其它标题（如设置页分组）不该触发卡片折叠
+  const t = el.closest(".card.collapsible > .card-title");
+  return t || null;
+}
+function toggleCollapsibleCard(card) {
+  if (!card) return;
+  const id = card.dataset.collapseId || card.id;
+  if (!id) return;
+  const nowCollapsed = card.classList.toggle("collapsed");
+  const title = card.querySelector(":scope > .card-title");
+  if (title) title.setAttribute("aria-expanded", String(!nowCollapsed));
+  const collapsed = _collapsedCards();
+  if (nowCollapsed) collapsed.add(id); else collapsed.delete(id);
+  _saveCollapsedCards(collapsed);
+}
+/** 应用已保存的折叠状态（页面加载时调一次；DOM 是静态的，之后靠委托点击）。 */
+function applyCollapsedCards() {
+  const collapsed = _collapsedCards();
+  $$(".card.collapsible").forEach((card) => {
+    const id = card.dataset.collapseId || card.id;
+    const isCollapsed = collapsed.has(id);
+    card.classList.toggle("collapsed", isCollapsed);
+    const title = card.querySelector(":scope > .card-title");
+    if (title) {
+      title.setAttribute("role", "button");
+      title.setAttribute("tabindex", "0");
+      title.setAttribute("aria-expanded", String(!isCollapsed));
+    }
+  });
+}
+document.addEventListener("click", (e) => {
+  const title = _cardTitleOf(e.target);
+  if (title) toggleCollapsibleCard(title.parentElement);
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key !== "Enter" && e.key !== " ") return;
+  const title = _cardTitleOf(e.target);
+  if (title) { e.preventDefault(); toggleCollapsibleCard(title.parentElement); }
+});
+
 /* ================= 仪表盘 ================= */
 let _levelTimer = null;   // 录音电平轮询
 
@@ -2583,6 +2638,7 @@ try {
   if (want && _VIEWS.includes(want)) _bootView = want;
 } catch (e) { /* 忽略 */ }
 switchView(_bootView);
+applyCollapsedCards();      // 应用上次的卡片折叠状态（「模型路由 → 路由参数」等）
 
 /* ---------------- 自动刷新：间隔取自设置 panelAutoRefresh ----------------
    2026-09-19 审计发现这个设置项在面板上摆着却没人读（判定 DEAD），这里把它接上：
