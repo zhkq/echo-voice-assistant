@@ -1426,33 +1426,172 @@ def update_meeting_title(meeting_id, title):
     return True, name, "会议名称已保存" if name else "已清空自定义名称"
 
 
-def request_summary(meeting_id, folder=None):
-    """请 DSH 生成整场会议纪要（纯 markdown，可含 Mermaid 图表），
-    后台线程等待回复并写入 summary.md。标题/简介/摘要/分段由第二次调用
-    （request_topic_segments）以 JSON 提供，供列表/日志/前端使用。"""
+#: 纪要的**格式要求**（两条路共用：agent 路径与直连 LLM 路径）。
+#: 放在这里而不是各写一遍 —— Mermaid 的坑是实测踩出来的（PROGRESS §27 那批），
+#: 复制一份就等于将来只修好一条路。
+_SUMMARY_REQUIREMENTS = (
+    "要求：生成完整纪要：**会议背景/议题 → 各议题关键讨论与结论 → 待办事项及责任人**。\n"
+    "**尽量用 Mermaid 图表表达结构与流程**：如 flowchart 表达分工/流程、"
+    "timeline 表达时间线/进度、sequenceDiagram 表达协作时序；Mermaid 代码用 "
+    "```mermaid 代码块标注。\n"
+    "**Mermaid 规范**：flowchart/graph 中节点文本与连线标签若含括号等符号，"
+    "必须用双引号包裹文本（如 CY[\"初验(出验)证书\"]、|\"中验(待签)\"|），"
+    "否则图表无法渲染；文本内不要出现未闭合引号。\n"
+    "**timeline 专项规范**（2026-09-12 实测：这两点写错整张图直接报错）："
+    "1) 标题必须写成 `title: 文本`（冒号不可省）；"
+    "2) **周期文本里不能含冒号**——timeline 用 `:` 分隔「周期 : 事件」，"
+    "所以时间戳要写成点号形式 `00.00.12 : 发起试音`（或 `00-00-12`），"
+    "不要写 `00:00:12 : 发起试音`。"
+)
+
+#: 直连 LLM 时内联的转写文本上限（字符）。超了要**明说被截断**，不能悄悄丢内容。
+_PROVIDER_TRANSCRIPT_LIMIT = 120000
+
+
+def _llm_provider_for_summary():
+    """纪要要走直连 LLM 时用的 provider 实例；取不到返回 ``(None, 原因)``（P5）。"""
+    from app import providers as providers_mod
+    try:
+        pid, inst = providers_mod.active("llm")
+    except Exception as e:
+        return None, "没有可用的 LLM provider（%s）" % e
+    return inst, pid
+
+
+def direct_llm_decision():
+    """纪要是否走**直连 LLM provider**？返回 ``(bool, 原因)``。
+
+    判据（顺序即优先级）：
+      1. 用户显式选了 `providerLlm`（非空）→ 就按他选的走（哪怕 agent 也在）；
+      2. 否则：**agent 用不了**（DSH 未就绪）而 LLM provider 就绪 → 走直连 —— 这正是
+         P5 的承诺："不装 agent 也能出纪要"；
+      3. 其它情况保持原样（agent 路径），老用户行为零变化。
+
+    只读判断，不做任何副作用；探测失败一律按"不走直连"处理（宁可退回老路）。
+    """
+    from app.config import settings
+    chosen = str(settings.get("providerLlm", "") or "").strip()
+    if chosen:
+        inst, pid = _llm_provider_for_summary()
+        if inst is None:
+            return False, "配置的 LLM provider 不可用（%s）" % pid
+        return True, "按设置使用 LLM provider %s" % chosen
+    try:
+        from app import manager
+        agent_ok = bool(manager.dsh_ready())
+    except Exception:
+        agent_ok = False
+    if agent_ok:
+        return False, "agent 可用（DSH 就绪）"
+    inst, pid = _llm_provider_for_summary()
+    if inst is None:
+        return False, "agent 不可用且没有可用的 LLM provider"
+    return True, "agent 不可用（DSH 未就绪），改用 LLM provider %s" % pid
+
+
+def _provider_summary_text(folder):
+    """把整场会议的转写**内联**成一段文本（直连 LLM 没有文件读取能力）。
+
+    用 `_meeting_parts()` 汇总；超长时截断并**在文末显式说明**（不能让模型以为这就是全部）。
+    """
+    try:
+        summary_src, topics_src, transcript_src = _meeting_parts(folder)
+        text = _meeting_full_text(summary_src, topics_src, transcript_src)
+    except Exception as e:
+        raise RuntimeError("读取会议材料失败：%s" % e) from None
+    text = (text or "").strip()
+    if not text:
+        raise RuntimeError("会议目录里没有可用的转写文本（transcript.md 为空或缺失）")
+    if len(text) > _PROVIDER_TRANSCRIPT_LIMIT:
+        original_len = len(text)
+        text = text[:_PROVIDER_TRANSCRIPT_LIMIT] + (
+            "\n\n【注意】以上内容因长度限制被截断（原文 %d 字），"
+            "纪要需基于已给出的部分，并在开头注明「材料被截断」。" % original_len)
+    return text
+
+
+def _spawn_provider_summary(meeting_id, folder, out_name="summary.md", extra=""):
+    """后台线程：把转写内联交给 LLM provider，写成纪要文件（P5）。
+
+    与 agent 路径共用同一套**落盘纪律**：回复过短或疑似占位话就**不回写**
+    （保留已有文件），失败写 warn 日志 —— 宁可留空让人重试，也不要把占位当纪要存下来。
+    """
+    def _run():
+        with _MEETING_LOCKS_LOCK:
+            lock = _MEETING_LOCKS.setdefault(meeting_id, threading.Lock())
+        with lock:
+            try:
+                inst, pid = _llm_provider_for_summary()
+                if inst is None:
+                    db.add_log("error", "meeting", "直连纪要失败：%s" % pid)
+                    return
+                text = _provider_summary_text(folder)
+                prompt = ("以下是会议转写（按片段组织，行内带[绝对时间戳]）：\n\n" + text +
+                          "\n\n" + _SUMMARY_REQUIREMENTS + "\n"
+                          "**输出约束：只输出纪要 markdown 全文**，不要寒暄、不要解释过程。")
+                if extra:
+                    prompt += "\n\n追加要求：%s" % extra
+                db.add_log("info", "meeting",
+                           f"已请求纪要（provider={pid}，{os.path.basename(folder)}）")
+                reply = inst.chat([{"role": "system", "content": "你是会议纪要助手。"},
+                                   {"role": "user", "content": prompt}], timeout=300)
+                path = os.path.join(folder, out_name)
+                had_old = os.path.isfile(path)
+                old = ""
+                if had_old:
+                    try:
+                        old = open(path, encoding="utf-8").read().strip()
+                    except OSError:
+                        old = ""
+                if not (reply and len(reply.strip()) > 10):
+                    db.add_log("warn", "meeting", "纪要 provider 回复过短，本次不回写")
+                    return
+                if _looks_placeholder(reply):
+                    db.add_log("warn", "meeting",
+                               "纪要 provider 回复疑似占位/意图话（非实质纪要），本次不回写"
+                               f"{'，保留原文件' if had_old and len(old) > 30 else '（无旧有效内容）'}")
+                    return
+                with open(path, "w", encoding="utf-8") as fh:
+                    fh.write(reply)
+                db.add_log("info", "meeting",
+                           f"纪要已生成（provider={pid}）：{os.path.basename(path)}")
+            except Exception as e:
+                # 直连路径的失败必须留痕：否则面板上表现为"点了没反应"（1.x 的老毛病）
+                db.add_log("error", "meeting", f"直连纪要失败：{e}")
+    threading.Thread(target=_run, daemon=True, name="summary-provider").start()
+
+
+def request_summary(meeting_id, folder=None, extra=""):
+    """生成整场会议纪要（纯 markdown，可含 Mermaid 图表），后台线程写 summary.md。
+
+    两条路（P5 起）：
+      * **agent 路径**（默认）：把 transcript.md 的**路径**交给 DSH，由它用 read 工具读并撰写；
+      * **直连 LLM 路径**：没有可用 agent（或用户显式选了 `providerLlm`）时，把转写**内联**
+        喂给 LLM provider —— 这样"不装 agent 也能出纪要"（P5 的验收点）。
+    标题/简介/摘要/分段由第二次调用（request_topic_segments）以 JSON 提供。
+
+    ``extra`` = 追加要求（面板「重新生成」里填的那种）。**两条路都必须带上它** ——
+    2026-09-19 修：以前 `regenerate_summary` 把它记进 summary_runs 却没往下传，
+    等于"追加要求"从来没生效过。
+    """
     if folder is None:
         meeting = db.get_meeting(meeting_id)
         folder = os.path.join(meetings_dir(), meeting["name"])
     meeting = db.get_meeting(meeting_id)
+    use_direct, why = direct_llm_decision()
+    if use_direct:
+        db.add_log("info", "meeting", "纪要走直连 LLM：%s" % why)
+        _spawn_provider_summary(meeting_id, folder, extra=extra)
+        return True
     transcript = os.path.join(folder, "transcript.md").replace("\\", "/")
     text = (f"任务：基于会议转写文件生成会议纪要（markdown 格式）。\n"
             f"步骤：1) 用 read 工具读取文件 \"{transcript}\"（已按片段组织，"
             f"每片有 \"## 第 N 段 [起-止]\" 标题，行内带[绝对时间戳]）。\n"
-            f"2) 生成完整纪要：**会议背景/议题 → 各议题关键讨论与结论 → "
-            f"待办事项及责任人**。\n"
-            f"**尽量用 Mermaid 图表表达结构与流程**：如 flowchart 表达分工/流程、"
-            f"timeline 表达时间线/进度、sequenceDiagram 表达协作时序；Mermaid 代码用 "
-            f"```mermaid 代码块标注。\n"
-            f"**Mermaid 规范**：flowchart/graph 中节点文本与连线标签若含括号等符号，"
-            f"必须用双引号包裹文本（如 CY[\"初验(出验)证书\"]、|\"中验(待签)\"|），"
-            f"否则图表无法渲染；文本内不要出现未闭合引号。\n"
-            f"**timeline 专项规范**（2026-09-12 实测：这两点写错整张图直接报错）："
-            f"1) 标题必须写成 `title: 文本`（冒号不可省）；"
-            f"2) **周期文本里不能含冒号**——timeline 用 `:` 分隔「周期 : 事件」，"
-            f"所以时间戳要写成点号形式 `00.00.12 : 发起试音`（或 `00-00-12`），"
-            f"不要写 `00:00:12 : 发起试音`。\n"
+            f"2) " + _SUMMARY_REQUIREMENTS + "\n"
             f"**输出约束：你只能在最终回复中输出纪要全文（markdown），"
             f"这是唯一的交付方式。严禁调用 write 或任何写文件工具。**")
+    if extra:
+        text += "\n\n追加要求：%s" % extra
     _spawn_summary_waiter(meeting_id, folder, "summary.md", text, "纪要")
     return True
 
@@ -1607,14 +1746,16 @@ def regenerate_summary(meeting_id, extra_prompt=""):
         return False, "转写文件不存在，无法生成纪要"
     run_id = db.add_summary_run(meeting_id, extra_prompt)
     if extra_prompt:
-        # 追加要求时只重生成整场纪要（带要求），议题分段保持
-        ok = request_summary(meeting_id, folder)
+        # 追加要求时只重生成整场纪要（带要求），议题分段保持。
+        # 2026-09-19 修：以前没把 extra_prompt 传下去 —— 那个"追加要求"框填了也没用。
+        ok = request_summary(meeting_id, folder, extra=extra_prompt)
     else:
         ok1 = request_summary(meeting_id, folder)
         ok2 = request_topic_segments(meeting_id, folder)
         ok = ok1 and ok2
     db.finish_summary_run(run_id, "done" if ok else "failed")
-    return ok, "已发送纪要+议题分段生成请求" if ok else "发送请求失败（DSH 可能未运行）"
+    return ok, ("已发送纪要+议题分段生成请求" if ok
+                else "发送请求失败（agent 与 LLM provider 都不可用？）")
 
 
 def retranscribe_meeting(meeting_id):
