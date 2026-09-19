@@ -13,13 +13,14 @@ import app.assistant as assistant
 from app.audio.wake import WakeListener
 from app.config import settings
 from app.hotkey import HotkeyListener
-from app import services
+from app import paths, services
 
 _hotkey = None
 _wake = None
 _lock = threading.Lock()
 _panel_last_open = 0.0
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# 安装根由路径层给（含 ECHO_ROOT 覆盖）。
+BASE_DIR = paths.echo_root()
 
 # 打开仪表盘用的 Chromium 系浏览器候选（--app 独立窗口，无地址栏）
 _CHROMIUM_CANDIDATES = [

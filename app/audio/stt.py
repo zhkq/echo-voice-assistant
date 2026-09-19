@@ -17,7 +17,10 @@ import re
 import sys
 import threading
 
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from app import paths
+
+# 安装根由路径层给（含 ECHO_ROOT 覆盖）；模型目录一律走 models_dir()（D20/D21）。
+BASE_DIR = paths.echo_root()
 
 
 def models_dir() -> str:

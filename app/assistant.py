@@ -17,14 +17,17 @@ import threading
 import time
 
 import app.db as db
+from app import paths
 from app.config import settings
 from app.dsh import get_client, DshError
 from app.audio import stt as stt_mod
 from app.audio import tts as tts_mod
 from app.audio.recorder import record_command
 
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-CAPTURES_DIR = os.path.join(BASE_DIR, "data", "captures")
+BASE_DIR = paths.echo_root()
+# 录音落盘目录走**数据根**（不是安装目录下的 data/）：macOS 的数据根是
+# ~/Library/Application Support/ECHO，往 .app 里写是 D18 明确不允许的。
+CAPTURES_DIR = os.path.join(paths.data_root(), "captures")
 
 _busy = threading.Lock()
 # name：谁占着（web/hotkey/rail/skill…）；phase：做到哪一步了，给面板做按钮动效用

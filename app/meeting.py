@@ -21,13 +21,14 @@ import time
 import app.db as db
 from app.config import settings
 from app.dsh import get_client
-from app import worklog
+from app import paths, worklog
 from app.audio.recorder import MeetingRecorder
 from app.audio import stt as stt_mod
 from app.audio import tts as tts_mod
 from app import services
 
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# 安装根由路径层给（含 ECHO_ROOT 覆盖）；会议目录一律走 meetings_dir()（D20/D21）。
+BASE_DIR = paths.echo_root()
 SAMPLE_RATE = 16000
 
 

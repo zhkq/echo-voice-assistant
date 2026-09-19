@@ -40,11 +40,12 @@ from fastapi.responses import FileResponse
 import app.db as db
 from app import __version__ as ECHO_VERSION
 from app.config import settings
-from app import manager, ports, runtime, services
+from app import manager, paths, ports, runtime, services
 from app.api import router
 from app.pathutil import safe_under
 
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# 安装根由路径层给（含 ECHO_ROOT 覆盖）；web/ 是代码资产，跟安装根走。
+BASE_DIR = paths.echo_root()
 WEB_DIR = os.path.join(BASE_DIR, "web")
 
 

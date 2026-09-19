@@ -27,7 +27,10 @@ import shutil
 import time
 from pathlib import Path
 
-BASE_DIR = Path(__file__).resolve().parent.parent
+from app import paths
+
+# 安装根由路径层给（含 ECHO_ROOT 覆盖）；这里保留 Path 形态，后续用 `/` 拼路径。
+BASE_DIR = Path(paths.echo_root())
 ROUTER_CONFIG = BASE_DIR / "dsh-failover" / "config.json"
 ROUTER_HOST = "127.0.0.1"
 # 路由监听端口由 dsh-failover/config.json 的 "port" 决定（默认见 ROUTER_DEFAULT_PORT）。

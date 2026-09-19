@@ -21,12 +21,21 @@ import shlex
 import threading
 import time
 
+from app import paths
+
+# 安装根由路径层给（含 ECHO_ROOT 覆盖）；下面的 HF_HOME 也用它，所以先定义。
+BASE_DIR = paths.echo_root()
+
 # 和 stt.py 用同一套缓存约定：HF 落 models/hub（走国内镜像），ModelScope 落 ~/.cache/modelscope
-os.environ.setdefault("HF_HOME", os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "models"))
+#
+# 已知偏差（P3 / D21 尚未收口，方案见 docs/2.0-PROGRESS.md §28.4、§28.5）：下面这行把
+# HF_HOME 钉在**安装目录**下的 models，不跟随用户可配的 modelsDir（stt.py 那一份走
+# models_dir()），而且两者都只在 import 时生效一次 —— 谁先被 import 谁说了算。修法是启动
+# 阶段（db.init + seed_defaults 之后）统一按 paths.models_root() 设一次。需要门禁在场：
+# HF_HOME 指错会让 huggingface 找不到已下好的权重并**重新下载**。
+os.environ.setdefault("HF_HOME", os.path.join(BASE_DIR, "models"))
 os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 os.environ.setdefault("MODELSCOPE_DISABLE_PROGRESS_BAR", "1")
-
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def models_dir() -> str:

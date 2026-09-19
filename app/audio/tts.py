@@ -19,7 +19,11 @@ import threading
 import tempfile
 import time
 
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from app import paths
+
+# 提示音 wav 随**代码**走（assets/ 是安装目录的一部分），所以取安装根而不是数据根；
+# 来源统一由路径层给（含 ECHO_ROOT 覆盖），本模块不再自己推导。
+BASE_DIR = paths.echo_root()
 BEEPS_DIR = os.path.join(BASE_DIR, "assets", "beeps")
 
 _EDGE_VOICE = "zh-CN-XiaoxiaoNeural"
