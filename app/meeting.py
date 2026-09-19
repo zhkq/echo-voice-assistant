@@ -409,20 +409,14 @@ def _fallback_sv_rows(sv, wmodel, seg_path, seg_idx, seg_min, cfg):
 def _active_asr_provider():
     """会议转写是否走 provider（P5）。**只有用户显式配了 `providerAsr` 才返回实例**。
 
-    为什么不做"本地引擎不可用就自动切在线"：转写引擎换了会同时改变**准确率、耗时与费用**，
-    而且在线转写会把**整段音频**传出去 —— 这种事必须由用户显式选择（出网标注也写在
-    spec 里让他看见）。默认（providerAsr 为空）= 完全沿用原路径，老用户零变化。
+    判据本身在 `app.providers.asr_if_configured()`（命令口述转写也用它 —— 同一条规则
+    只写一份）。这里只做日志与"不可用就回落本地引擎"的包装。
     """
-    from app.config import settings
-    try:
-        chosen = str(settings.get("providerAsr", "") or "").strip()
-        if not chosen:
-            return None
-        from app import providers as providers_mod
-        return providers_mod.create("asr", chosen)
-    except Exception as e:
-        db.add_log("warn", "meeting", "providerAsr 指向的 provider 不可用（%s），本次走本地引擎" % e)
-        return None
+    from app import providers as providers_mod
+    inst, why = providers_mod.asr_if_configured()
+    if inst is None and "未配置" not in why:
+        db.add_log("warn", "meeting", why)
+    return inst
 
 
 def _asr_provider_id():

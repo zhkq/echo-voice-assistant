@@ -272,6 +272,42 @@ def capture(source="hotkey"):
     return True
 
 
+def _transcribe_command(wav, cfg):
+    """命令转写：显式配了 `providerAsr` 就走 provider（P5），否则走本地引擎。
+
+    返回 ``(text, note)``：`note` 说明"走了谁 / 为什么没有文本"，供调用方写日志
+    （§19 发现③：空结果不许与"引擎挂了"混成一个空串）。
+
+    为什么抽成函数：命令口述与会议转写必须用**同一条判据**
+    （`providers.asr_if_configured()`，只写一份），而且抽出来才能不开麦克风就测它。
+    """
+    from app import providers as providers_mod
+    provider, why = providers_mod.asr_if_configured()
+    if provider is not None:
+        try:
+            out = provider.transcribe(wav, lang=cfg.get("sttLanguage", "zh"))
+            text = " ".join((out.get("text") or "").split())
+            note = "provider=%s" % why
+            if out.get("reason"):
+                note += " reason=%s" % out["reason"]
+            return text, note
+        except Exception as e:
+            return "", "provider=%s 失败：%s" % (why, e)
+    engine = cfg.get("sttModel", "sensevoice")
+    stt_engine, stt_model = "whisper", engine
+    if engine == "sensevoice":
+        stt_engine = "sensevoice"
+    elif engine == "sherpa":
+        stt_engine = "sherpa"
+    try:
+        text = stt_mod.transcribe(wav, engine=stt_engine, model=stt_model,
+                                  lang=cfg.get("sttLanguage", "zh"),
+                                  device=cfg.get("device", "auto"))
+    except Exception as e:
+        return "", "engine=%s 失败：%s" % (stt_engine, e)
+    return " ".join((text or "").split()), "engine=%s" % stt_engine
+
+
 def _capture_worker(source):
     cfg = settings
     try:
@@ -305,21 +341,12 @@ def _capture_worker(source):
             return
         db.add_log("info", "assistant", f"录音完成: {os.path.basename(wav)}")
 
-        engine = cfg.get("sttModel", "sensevoice")
-        stt_engine, stt_model = "whisper", engine
-        if engine == "sensevoice":
-            stt_engine = "sensevoice"
-        elif engine == "sherpa":
-            stt_engine = "sherpa"
-        text = stt_mod.transcribe(wav, engine=stt_engine, model=stt_model,
-                                  lang=cfg.get("sttLanguage", "zh"),
-                                  device=cfg.get("device", "auto"))
-        text = " ".join(text.split())
+        text, note = _transcribe_command(wav, cfg)
         if not text:
-            db.add_log("warn", "assistant", f"转写为空 (engine={stt_engine})")
+            db.add_log("warn", "assistant", f"转写为空（{note}）")
             tts_mod.play_beep("err")
             return
-        db.add_log("info", "assistant", f"识别: {text[:60]}")
+        db.add_log("info", "assistant", f"识别: {text[:60]}（{note}）")
         print(f"[assistant] 识别: {text}")
 
         # 剥离唤醒前缀

@@ -153,6 +153,26 @@ def active(kind):
     return active_id(kind), create(kind, active_id(kind))
 
 
+def asr_if_configured():
+    """**用户显式配了 `providerAsr`** 时返回 ``(实例, id)``，否则 ``(None, 原因)``。
+
+    为什么把判据放在这里：会议转写与命令口述两条路都要"配了才走 provider"这同一条规则 ——
+    各写一份必然会分叉（一处改了另一处忘了）。也刻意**不做**"本地引擎不可用就自动切在线"：
+    换引擎同时改变准确率/耗时/费用，而且在线转写会把音频传出去，必须由用户显式选择。
+    """
+    try:
+        from app.config import settings
+        chosen = str(settings.get("providerAsr", "") or "").strip()
+    except Exception as e:
+        return None, "读配置失败：%s" % e
+    if not chosen:
+        return None, "未配置 providerAsr（用本地引擎）"
+    try:
+        return create("asr", chosen), chosen
+    except Exception as e:
+        return None, "providerAsr=%s 不可用（%s），本次走本地引擎" % (chosen, e)
+
+
 def readiness(kind, pid=None):
     """就绪状态：``True`` / ``False`` / ``None``（无法判定）。永不抛异常。"""
     pid = pid or active_id(kind)

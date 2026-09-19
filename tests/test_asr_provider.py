@@ -213,5 +213,66 @@ class TranscribeImplWiringTests(unittest.TestCase):
                         "空结果要与'引擎挂了'区分开且留痕：%s" % self.logs)
 
 
+class CommandTranscribeTests(unittest.TestCase):
+    """命令口述转写也走 provider（P5）：判据与会议转写**同一份**（providers.asr_if_configured）。"""
+
+    def setUp(self):
+        self.logs = []
+        from app import assistant
+        self.assistant = assistant
+        p = patch.object(assistant.db, "add_log",
+                         lambda level, source, msg: self.logs.append((level, msg)))
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_uses_provider_when_configured(self):
+        fake = _FakeAsr(text="打开浏览器")
+        with patch("app.providers.asr_if_configured", lambda: (fake, "openai-asr")), \
+                patch.object(self.assistant.stt_mod, "transcribe",
+                             side_effect=AssertionError("配了 provider 就不该调本地引擎")):
+            text, note = self.assistant._transcribe_command("a.wav", {"sttLanguage": "zh"})
+        self.assertEqual(text, "打开浏览器")
+        self.assertIn("provider=openai-asr", note)
+        self.assertEqual(fake.calls[0][1], "zh")
+
+    def test_provider_error_returns_note_not_exception(self):
+        fake = _FakeAsr(error=RuntimeError("openai-asr: HTTP 401 密钥无效"))
+        with patch("app.providers.asr_if_configured", lambda: (fake, "openai-asr")):
+            text, note = self.assistant._transcribe_command("a.wav", {})
+        self.assertEqual(text, "")
+        self.assertIn("401", note, "失败原因要能带到日志里")
+
+    def test_provider_empty_result_keeps_the_reason(self):
+        fake = _FakeAsr(text="", reason="empty-or-unknown")
+        with patch("app.providers.asr_if_configured", lambda: (fake, "openai-asr")):
+            text, note = self.assistant._transcribe_command("a.wav", {})
+        self.assertEqual(text, "")
+        self.assertIn("reason=empty-or-unknown", note)
+
+    def test_local_path_used_when_not_configured(self):
+        seen = {}
+
+        def fake_transcribe(wav, engine, model, lang, device):
+            seen.update(engine=engine, model=model, lang=lang, device=device)
+            return "  你好   世界 "
+
+        with patch("app.providers.asr_if_configured", lambda: (None, "未配置 providerAsr（用本地引擎）")), \
+                patch.object(self.assistant.stt_mod, "transcribe", fake_transcribe):
+            text, note = self.assistant._transcribe_command(
+                "a.wav", {"sttModel": "sensevoice", "device": "cuda", "sttLanguage": "zh"})
+        self.assertEqual(text, "你好 世界", "空白要归一化（老行为）")
+        self.assertEqual(seen["engine"], "sensevoice")
+        self.assertEqual(seen["device"], "cuda")
+        self.assertIn("engine=sensevoice", note)
+
+    def test_local_engine_failure_is_also_reported(self):
+        with patch("app.providers.asr_if_configured", lambda: (None, "未配置")), \
+                patch.object(self.assistant.stt_mod, "transcribe",
+                             side_effect=RuntimeError("CUDA out of memory")):
+            text, note = self.assistant._transcribe_command("a.wav", {"sttModel": "whisper"})
+        self.assertEqual(text, "")
+        self.assertIn("CUDA out of memory", note)
+
+
 if __name__ == "__main__":
     unittest.main()
