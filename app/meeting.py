@@ -1099,7 +1099,9 @@ def _meeting_parts(folder):
     def _read(name):
         p = os.path.join(folder, name)
         try:
-            return open(p, encoding="utf-8").read().strip()
+            # with 块：不然大会议反复读会留下一堆未关闭句柄（门禁输出里的 ResourceWarning）
+            with open(p, encoding="utf-8") as fh:
+                return fh.read().strip()
         except OSError:
             return ""
     return _read("summary.md"), _read("topics.md"), _read("transcript.md")

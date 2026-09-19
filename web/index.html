@@ -105,6 +105,11 @@
       </div>
       <div id="settingsForm" class="settings-form"></div>
     </div>
+    <!-- 能力 provider（P5）：ASR / LLM / TTS 各选一个实现，带出网标注与在线服务预设。
+         自包含卡片：读取失败只影响本卡片，不拖垮设置页。 -->
+    <div class="card">
+      <div id="providersHost"></div>
+    </div>
     <!-- 服务运维：重启 ECHO 本身（独立进程执行，面板自动重连） -->
     <div class="card">
       <div class="card-title">🔧 服务

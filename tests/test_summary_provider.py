@@ -147,8 +147,10 @@ class MaterialTests(unittest.TestCase):
         """两条路共用同一份格式要求（Mermaid 的坑只修一处）。"""
         self.assertIn("Mermaid", meeting._SUMMARY_REQUIREMENTS)
         self.assertIn("timeline", meeting._SUMMARY_REQUIREMENTS)
-        src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                                "app", "meeting.py"), encoding="utf-8").read()
+        src_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                "app", "meeting.py")
+        with open(src_path, encoding="utf-8") as fh:
+            src = fh.read()
         self.assertEqual(src.count("timeline 专项规范"), 1,
                          "格式要求只能定义一次（各写一遍 = 将来只修好一条路）")
 
@@ -173,7 +175,8 @@ class SpawnTests(unittest.TestCase):
     def test_writes_summary_and_logs_success(self):
         fake = _FakeLlm()
         self.assertTrue(self._run(fake), "纪要应该落盘")
-        body = open(os.path.join(self.folder, "summary.md"), encoding="utf-8").read()
+        with open(os.path.join(self.folder, "summary.md"), encoding="utf-8") as fh:
+            body = fh.read()
         self.assertIn("议题一", body)
         prompt = fake.calls[0]["messages"][1]["content"]
         self.assertIn("今天讨论验收流程", prompt)
@@ -198,8 +201,9 @@ class SpawnTests(unittest.TestCase):
             fh.write("## 旧纪要\n\n- 有效内容，不能被占位话覆盖")
         fake = _FakeLlm(reply="我先读一下文件。")
         self._run(fake)
-        self.assertIn("旧纪要", open(path, encoding="utf-8").read(),
-                      "坏回复不能覆盖已有纪要")
+        with open(path, encoding="utf-8") as fh:
+            kept = fh.read()
+        self.assertIn("旧纪要", kept, "坏回复不能覆盖已有纪要")
 
     def test_provider_error_is_logged_not_swallowed(self):
         fake = _FakeLlm(error=RuntimeError("openai-llm: HTTP 401 密钥无效"))

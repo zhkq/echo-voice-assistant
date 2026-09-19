@@ -73,7 +73,7 @@ function switchView(name) {
   $(`#view-${name}`).classList.remove("hidden");
   $$(".tab").forEach((t) => t.classList.toggle("active", t.dataset.view === name));
   if (name === "dashboard") { refreshDashboard(); loadTargets(); }
-  if (name === "settings") { loadSettings(); }
+  if (name === "settings") { loadSettings(); loadProviders(); }
   if (name === "history") loadHistory();
   if (name === "meetings") { loadMeetings(); refreshMeetingHeader(); }
   if (name === "boot") { loadBoot(); loadBootLogs(); }
@@ -871,7 +871,8 @@ let _settingsCache = [];
    → 唤醒词 → 会议 → 纪要归档 → 模型路由 → 面板(界面) → DSH(底层接入) */
 const SET_GROUP_ORDER = ["agent", "general", "paths", "voice", "wake", "meeting", "worklog", "router", "panel", "dsh"];
 const SET_GROUP_NAMES = { agent: "智能体", general: "通用", paths: "存储路径", voice: "语音命令", wake: "唤醒词",
-  meeting: "会议", worklog: "纪要归档", router: "模型路由", panel: "面板", dsh: "DSH 服务" };
+  meeting: "会议", worklog: "纪要归档", router: "模型路由", panel: "面板", dsh: "DSH 服务",
+  provider: "能力 provider（在线服务与密钥）" };
 
 /* 模型相关配置项：从「设置」页移出，统一由「模型」页签承载（前端过滤，后端 grp 不动）。
    见下方「模型」视图：按功能展示 选择 + 就绪 + 获取。 */
@@ -1012,6 +1013,114 @@ $("#settingsForm").addEventListener("click", async (e) => {
   renderAgentTable();
   const a = _agentsCache.find((x) => x.name === btn.dataset.agentProbe);
   if (a) toast(a.available ? `${a.displayName} 可用` : `${a.displayName} 不可用：${a.reason || ""}`);
+});
+
+/* ---- 能力 provider（P5 / D25）：ASR / LLM / TTS 各选一个实现 ----
+   数据面：GET /api/providers（谁在生效、是否出网、就绪与否）+
+           GET /api/providers/presets（在线服务公开预设，一键填地址与模型名）。
+   与「组件」页签的分工：组件 = 装什么（模型/引擎/运行时），provider = 用哪个（含在线服务）。
+   自包含：整个渲染包在 try/catch 里，失败只影响本卡片（设置页照常可用）。 */
+
+function loadProviders() {
+  const host = $("#providersHost");
+  if (host) renderProvidersCard(host);
+}
+
+async function renderProvidersCard(host) {
+  host.innerHTML = `<div class="set-group"><div class="set-group-title">
+    <span class="set-arrow">▶</span><span>能力 provider</span></div>
+    <div class="set-group-body muted">读取中…</div></div>`;
+  let data = null, presets = { presets: [] };
+  try {
+    data = await api("/api/providers?ready=true");
+    try { presets = await api("/api/providers/presets"); } catch (e) { presets = { presets: [] }; }
+  } catch (e) {
+    host.innerHTML = `<div class="set-group"><div class="set-group-title">
+      <span class="set-arrow">▶</span><span>能力 provider</span></div>
+      <div class="set-group-body muted">读取失败：${esc(e.message)}</div></div>`;
+    return;
+  }
+  const all = data.providers || [];
+  const kinds = data.kinds || [];
+  const byKind = (k) => all.filter((p) => p.kind === k);
+  const readyBadge = (p) => {
+    if (p.ready === true) return `<span style="color:var(--ok,#3a3)">已就绪</span>`;
+    if (p.ready === false) return `<span class="muted">未就绪</span>`;
+    return `<span class="muted">未知</span>`;
+  };
+  let html = `<div class="set-group-title" style="padding:0 0 6px 0">
+      <span>能力 provider</span>
+      <span class="spacer"></span>
+      <span class="muted" style="font-size:12px">选"用哪个"；装什么见「组件」页签</span>
+    </div>`;
+  for (const k of kinds) {
+    const items = byKind(k.id);
+    if (!items.length) continue;
+    const opts = items.map((p) => {
+      const flags = [p.egress ? "出网" : "本地", p.ready === false ? "未就绪" : ""].filter(Boolean).join("·");
+      return `<option value="${esc(p.id)}" ${p.active ? "selected" : ""}>${esc(p.name)}（${esc(flags)}）</option>`;
+    }).join("");
+    const cur = items.find((p) => p.active) || items[0];
+    const egressLine = cur && cur.egress
+      ? `<div class="desc" style="color:var(--warn,#c80)">⚠ 数据会出网：${esc(cur.egress_note || "")}</div>`
+      : `<div class="desc muted">数据不出本机</div>`;
+    html += `<div class="set-row">
+      <label for="prov-${esc(k.id)}">${esc(k.label)}</label>
+      <select class="ctl" id="prov-${esc(k.id)}" data-provider-kind="${esc(k.id)}">${opts}</select>
+      <div class="desc">当前：<b>${esc(cur ? cur.name : "-")}</b> · ${cur ? readyBadge(cur) : ""}</div>
+      ${egressLine}
+    </div>`;
+  }
+  // 在线服务预设：一键把公开的地址与模型名填进对应的配置项（密钥仍要自己填）
+  const fills = (presets.presets || []);
+  if (fills.length) {
+    html += `<div class="set-row"><label>在线服务预设</label><div style="display:flex;flex-wrap:wrap;gap:6px">` +
+      fills.map((p, i) => `<button class="btn-mini" data-preset-index="${i}"
+        title="${esc(p.note || "")}">${esc(p.name)}</button>`).join("") +
+      `</div><div class="desc">点一下把<b>地址与模型名</b>填进下面的配置（密钥请手动填，接口永不回显）；` +
+      `内网网关的地址属单位内部信息，需自己填。</div></div>`;
+    host.dataset.presets = JSON.stringify(fills);
+  }
+  html += `<div class="desc muted" style="padding:4px 0">改完下面「能力 provider」分组里的配置后点上方<b>保存</b>。</div>`;
+  host.innerHTML = `<div class="set-group"><div class="set-group-body">${html}</div></div>`;
+}
+
+/* 选 provider：立即写配置（与"命令目标"下拉同一种交互：选中即持久化） */
+document.addEventListener("change", async (e) => {
+  const kind = e.target && e.target.dataset ? e.target.dataset.providerKind : "";
+  if (!kind) return;
+  const key = "provider" + kind.charAt(0).toUpperCase() + kind.slice(1);
+  try {
+    await api("/api/settings", { method: "PUT", body: JSON.stringify({ values: { [key]: e.target.value } }) });
+    toast("已切换到：" + e.target.value);
+    await loadSettings();
+    loadProviders();
+  } catch (err) { toast("切换失败：" + err.message); }
+});
+
+/* 在线服务预设：填入地址/模型名（密钥不动） */
+document.addEventListener("click", async (e) => {
+  const idx = e.target && e.target.dataset ? e.target.dataset.presetIndex : "";
+  if (idx === "" || idx == null) return;
+  const host = $("#providersHost");
+  let list = [];
+  try { list = JSON.parse(host.dataset.presets || "[]"); } catch (err) { list = []; }
+  const p = list[Number(idx)];
+  if (!p) return;
+  const prefix = p.kind === "asr" ? "providerAsr" : "providerLlm";
+  const values = {};
+  if (p.base_url) values[prefix + "BaseUrl"] = p.base_url;
+  if (p.model) values[prefix + "Model"] = p.model;
+  if (!Object.keys(values).length) {
+    toast("这个预设需要你自己填地址（见下方配置）");
+    return;
+  }
+  try {
+    await api("/api/settings", { method: "PUT", body: JSON.stringify({ values }) });
+    toast("已填入地址与模型名，请补密钥后保存");
+    await loadSettings();
+    loadProviders();
+  } catch (err) { toast("填入失败：" + err.message); }
 });
 
 /* 「组件」页签的入口（switchView 分发到这里）。渲染逻辑复用自包含的卡片渲染器，

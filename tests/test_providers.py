@@ -610,5 +610,60 @@ class PresetTests(unittest.TestCase):
         self.assertIn("presets", r.json())
 
 
+class PanelWiringTests(unittest.TestCase):
+    """面板接线守卫（P5）。
+
+    面板 JS 在本仓库没有单测基础设施（只跑 `node --check`），所以用"源码断言"把
+    **接线必须存在**这件事钉住 —— 否则将来重构设置页很容易把这张卡片变成孤儿：
+    端点还在、函数还在，但没人调用，用户看不到任何 provider 选择界面。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, "web", "app.js"), encoding="utf-8") as fh:
+            cls.js = fh.read()
+        with open(os.path.join(root, "web", "index.html"), encoding="utf-8") as fh:
+            cls.html = fh.read()
+
+    def test_card_renderer_exists_and_uses_both_endpoints(self):
+        self.assertIn("function renderProvidersCard", self.js)
+        self.assertIn("/api/providers?ready=true", self.js)
+        self.assertIn("/api/providers/presets", self.js)
+
+    def test_card_is_mounted_in_the_settings_view_and_loaded(self):
+        self.assertIn('id="providersHost"', self.html)
+        # 挂载点必须在设置页里（在 view-settings 之后）
+        self.assertLess(self.html.index('id="view-settings"'), self.html.index('id="providersHost"'),
+                        "provider 卡片应在设置页内")
+        self.assertIn("function loadProviders()", self.js)
+        self.assertIn('if (name === "settings") { loadSettings(); loadProviders(); }', self.js,
+                      "切到设置页时必须加载 provider 卡片（否则卡片永远空白）")
+
+    def test_group_label_exists_for_the_provider_settings(self):
+        """设置页按 grp 分组显示；没有标签的话新分组会显示成裸英文 key。"""
+        self.assertIn("provider:", self.js)
+        self.assertIn("能力 provider", self.js)
+
+    def test_provider_settings_keys_are_visible_to_the_form(self):
+        """面板渲染的是 settings.all()：这些键必须在 DEFAULTS 里且没被 hidden/deprecated。"""
+        from app.config import DEFAULTS
+        for key in ("providerAsr", "providerLlm", "providerTts",
+                    "providerLlmBaseUrl", "providerLlmApiKey", "providerLlmModel",
+                    "providerAsrBaseUrl", "providerAsrApiKey", "providerAsrModel"):
+            with self.subTest(key=key):
+                meta = DEFAULTS.get(key)
+                self.assertIsNotNone(meta, "%s 必须存在（面板要渲染它）" % key)
+                self.assertFalse(meta.get("hidden"), "%s 不能被隐藏" % key)
+                self.assertFalse(meta.get("deprecated"), "%s 不能是弃用项" % key)
+                self.assertEqual(meta["grp"], "provider")
+
+    def test_secret_rows_render_as_password_inputs(self):
+        """密钥行必须是密码框且默认空值（配服务端的"空串=不改"那道闸）。"""
+        self.assertIn('type="password"', self.js)
+        self.assertIn("data-secret", self.js)
+        self.assertIn("data-clear-secret", self.js, "要有显式清除入口（哨兵值那条路）")
+
+
 if __name__ == "__main__":
     unittest.main()
