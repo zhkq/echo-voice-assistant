@@ -371,8 +371,8 @@ class EchoRootOverrideTests(unittest.TestCase):
         """已收口的模块：不许再有 ``BASE_DIR = ...dirname...(__file__)`` 那一行，且必须
         从路径层取根。这一行就是"每个模块各推一遍安装根"的指纹。
 
-        清单随收口增长；等 ``scripts/audit-paths.py`` 的清单清零后，这里换成"扫 app/ 全部
-        文件、白名单只留 paths.py"的正式守卫（那才是 P3 要交付的守卫测试）。
+        全量正式守卫已落在 ``tests/test_path_seam.py``（扫 app/ 全部，白名单只留
+        app/paths.py 与 app/platform/）；本用例保留为这 11 个模块的定点回归。
         """
         converted = ("config.py", "db.py", "manager.py", "assistant.py", "audio/tts.py",
                      "main.py", "meeting.py", "audio/stt.py", "runtime.py", "modelinfo.py",
