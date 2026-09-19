@@ -604,8 +604,8 @@ class OptionAndPanelWiringTests(unittest.TestCase):
         """pip 类组件的动作叫「下载命令」，复制的是后端拼好的整条命令（用户 2026-09-19 指定）。"""
         js = _read(os.path.join("web", "app.js"))
         block = js.split("function capCompActions")[1].split("\n}")[0]
-        self.assertIn(">下载命令</button>", block)
-        self.assertNotIn(">复制说明</button>", block, "标签已改名为「下载命令」")
+        self.assertIn('c.command_label || "下载命令"', block, "标签默认就是「下载命令」")
+        self.assertNotIn(">复制说明</button>", block, "标签已改名")
         self.assertIn('data-mcopy="${esc(c.command)}"', block,
                       "复制的是后端给的 command（带解释器路径），不是 how 说明")
         self.assertIn("cmd 与 PowerShell 都行，在哪个目录执行都行", block,
@@ -619,6 +619,13 @@ class OptionAndPanelWiringTests(unittest.TestCase):
         m = re.search(r"\.cap-engine-row label\s*\{([^}]*)\}", css)
         self.assertIsNotNone(m)
         self.assertIn("white-space: nowrap", m.group(1))
+
+    def test_command_button_label_comes_from_the_manifest(self):
+        """「下载命令 / 复制启动命令」的标签由清单给（独立 harness 那条是"启动命令"）。"""
+        js = _read(os.path.join("web", "app.js"))
+        block = js.split("function capCompActions")[1].split("\n}")[0]
+        self.assertIn("c.command_label", block)
+        self.assertIn('c.command_label || "下载命令"', block, "缺省仍是「下载命令」")
 
     def test_secret_agent_key_gets_a_password_field(self):
         """智能体展开区里的密钥（harness 访问 token）要能填 —— 密码框 + 留空 = 不改。

@@ -237,11 +237,14 @@ def _start_harness(report):
             report(status="disabled" if ok else "failed",
                    detail="未选中，已收尾：%s" % msg if ok else msg)
             return
+        harness_proc.sync_status()
         report(status="disabled", detail="未选中（设置 → 智能体 → 独立 DeepSeek Harness）",
                progress=0.0)
         return
     report(detail="拉起独立 harness…", progress=0.2)
     ok, msg = harness_proc.ensure_running()
+    # 无论成功/失败/接手都要把状态行写实，别让它停在"启动中"
+    harness_proc.sync_status()
     if not ok:
         report(status="failed", detail=msg, error=msg)
         return

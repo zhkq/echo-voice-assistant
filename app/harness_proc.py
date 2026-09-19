@@ -411,3 +411,17 @@ def status_detail():
     if requested():
         return "idle", "已配置为随 ECHO 启动，但当前没在监听 %s" % base_url()
     return "disabled", "未启用（选中「独立 harness」时才会启动）"
+
+
+def sync_status():
+    """把当前状态写进组件状态表（启动页/仪表盘读它）。
+
+    为什么要显式同步：进程可能是**上一次 ECHO 拉起的**（这次只是接手），那条路径不会走
+    `_read_output`（只在真正 Popen 时启动），状态行就会一直停在"启动中"。
+    """
+    try:
+        status, detail = status_detail()
+        services.report_harness(status, detail)
+        return status, detail
+    except Exception:
+        return "unknown", ""

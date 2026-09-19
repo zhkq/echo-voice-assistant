@@ -72,9 +72,23 @@ def _builtin() -> List[dict]:
         dict(id="agent-dsh", kind="agent", name="DSH Desktop（本机服务）", optional=True, required=False,
              purpose="ECHO 通过本机 HTTP JSON-RPC 使用 DSH（会话 / 纪要 / 模型注册）；不需要 Python SDK",
              size_mb=0, platforms=["win32", "macos", "linux"], min_os={"macos": "14.0"},
-             detect={"setting": "dshBaseUrl"},
+             detect={"setting": "dshBaseUrl"}, service=True,
              source="manual",
              how="装 DSH Desktop 客户端并让它保持运行即可；地址见 设置 → 智能体 → DSH 服务地址"),
+        # 2026-09-19 用户要求："运行环境哪里要增加独立 DSH" —— 上面那条是桌面客户端，
+        # 这条是**独立发行版**（npm @deepseek-ai/dsh）：同样只需"服务在跑"，
+        # 但多一条路 —— ECHO 能把它作为自己的子进程随自己拉起（选中该智能体即可）。
+        dict(id="agent-harness", kind="agent", name="独立 DeepSeek Harness（本机服务）",
+             optional=True, required=False,
+             purpose="npm 包 @deepseek-ai/dsh 的 web 服务；不装 DSH Desktop 也能用它干活",
+             size_mb=0, platforms=["win32", "macos", "linux"], min_os={},
+             detect={"setting": "harnessPort"},          # 端口（或地址）通不通 = 就绪
+             service=True,
+             source="manual",
+             command="npx -y @deepseek-ai/dsh web --port 43199 --no-open",
+             command_label="复制启动命令",
+             how="在 设置 → 智能体 里选中「独立 DeepSeek Harness」，ECHO 会自动拉起它；"
+                 "也可以自己跑右边这条命令（需要本机 Node / npx）"),
         dict(id="accel-cuda", kind="accel", name="CUDA 加速", optional=True, required=False,
              purpose="让转写/说话人分离跑在 N 卡上（3 倍以上速度）",
              size_mb=2500, platforms=["win32", "linux"], min_os={},   # mac 上不出现
@@ -193,8 +207,9 @@ def _detect(item: dict) -> Optional[bool]:
     同一份权重原来有两套判据（组件清单写死路径、modelinfo 各写一个 ready 函数），
     两边一旦分叉就会出现"组件说已装、模型说没装"。现在模型类组件只有一个判据来源。
 
-    **``{"setting": key}``** 用于"本机服务"类组件（DSH Desktop）：把配置里的地址当 URL 探一下 ——
-    这样它就绪判据跟 ECHO 实际连的地址一致，配置改了判据跟着变。
+    **``{"setting": key}``** 用于"本机服务"类组件（DSH Desktop / 独立 harness）：把配置里的值
+    当服务地址探一下 —— 这样它就绪判据跟 ECHO 实际连的地址一致，配置改了判据跟着变。
+    值可以是完整 URL，也可以只是**端口号**（独立 harness 存的是 `harnessPort`）。
     """
     from app import paths
 
@@ -209,9 +224,15 @@ def _detect(item: dict) -> Optional[bool]:
     if d.get("setting"):
         try:
             from app.config import settings as _s
-            url = str(_s.get(d["setting"], "") or "").strip()
+            raw = str(_s.get(d["setting"], "") or "").strip()
         except Exception:
             return None
+        # 只给端口（如 43199）时补成 http://127.0.0.1:<port>
+        url = ""
+        if raw.isdigit():
+            url = "http://127.0.0.1:%s" % raw
+        elif raw:
+            url = raw if "://" in raw else "http://%s" % raw
         return _probe_url(url) if url else None
     checks: List[bool] = []
     if d.get("path") or d.get("any"):
@@ -313,7 +334,9 @@ def catalog(*, platform: Optional[str] = None, os_version: Optional[Tuple[int, .
         row["applicable"] = ok
         row["blockedReason"] = why
         row["required"] = bool(item.get("required")) or item["id"] in REQUIRED_IDS
-        row["command"] = _install_command(item)
+        # 清单里可以自带 command（如独立 harness 的启动命令）；没有 pkg/requirements 时别把它清空
+        row["command"] = _install_command(item) or str(item.get("command") or "")
+        row["command_label"] = str(item.get("command_label") or "下载命令")
         try:
             row["ready"] = _detect(item)
         except Exception:

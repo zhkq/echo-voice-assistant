@@ -1248,6 +1248,8 @@ function capCompBadge(c) {
   const job = (m && _modelJobsCache[m.id]) || {};
   if (job.status === "running") return modelBadge(`下载中 ${Math.round(job.percent || 0)}%`, "warn");
   if (c.ready === true) return modelBadge("✅ 已就绪", "ok");
+  // 「本机服务」（DSH Desktop / 独立 harness）不是"没装"，是"没在跑" —— 措辞要准
+  if (c.service) return modelBadge(c.ready === false ? "⏹ 未运行" : "未知", "warn");
   if (c.ready === false) return modelBadge(c.model_id ? "⬇ 未安装" : "未安装", "warn");
   return modelBadge("未知", "idle");
 }
@@ -1270,9 +1272,11 @@ function capCompActions(c) {
   }
   const btns = [];
   if (c.command) {
+    // 标签由清单给：pip 类 = 「下载命令」；独立 harness = 「复制启动命令」
+    const label = c.command_label || "下载命令";
     btns.push(`<button type="button" class="btn mini" data-mcopy="${esc(c.command)}"
       title="复制后粘进终端执行（cmd 与 PowerShell 都行，在哪个目录执行都行）：&#10;${esc(c.command)}"
-      >下载命令</button>`);
+      >${esc(label)}</button>`);
   }
   if (c.ref) btns.push(`<span class="muted" style="font-size:12px">${esc(c.ref)}</span>`);
   return btns.join(" ");
@@ -1551,7 +1555,8 @@ function renderCapEnv() {
       ${capCompTable(comps, [])}
       <div class="muted" style="margin-top:6px;font-size:12px">
         这些是本机依赖与服务：pip 类的点「下载命令」复制到剪贴板后自己执行（命令里带的是本机解释器，
-        在哪个目录、用 cmd 还是 PowerShell 都行）；服务类（如 DSH Desktop）装客户端并保持运行即可。
+        在哪个目录、用 cmd 还是 PowerShell 都行）；服务类（DSH Desktop）装客户端并保持运行即可，
+        独立 harness 则可以由 ECHO 随自己拉起（设置 → 智能体）。
       </div>
       ${blockedHtml}
     </div>
