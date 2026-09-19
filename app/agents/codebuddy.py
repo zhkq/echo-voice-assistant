@@ -27,8 +27,7 @@ import time
 
 from app.config import settings
 from app.agents.base import AgentAdapter, AgentError, ECHO_WORKSPACE
-
-CREATE_NO_WINDOW = 0x08000000
+from app import platform as echo_platform
 
 # 认证失效的识别串（实测原文）
 AUTH_HINT = "Authentication required"
@@ -56,19 +55,8 @@ def _candidate_paths():
         hit = shutil.which(exe)
         if hit:
             out.append(hit)
-    # ③ WorkBuddy 内置（本机实测路径）
-    local = os.environ.get("LOCALAPPDATA", "")
-    if local:
-        out.append(os.path.join(local, "Programs", "WorkBuddy", "resources",
-                                "app.asar.unpacked", "cli", "bin", "codebuddy"))
-        # 版本目录可能变化，兜底 glob
-        out.extend(glob.glob(os.path.join(
-            local, "Programs", "WorkBuddy", "resources", "app.asar.unpacked",
-            "cli", "bin", "codebuddy*")))
-    # ④ CodeBuddy IDE 自带
-    for base in filter(None, (local, os.environ.get("PROGRAMFILES", ""))):
-        out.extend(glob.glob(os.path.join(
-            base, "*CodeBuddy*", "**", "cli", "bin", "codebuddy"), recursive=True))
+    # ③④ 平台专有的内置安装位置（Windows：WorkBuddy 内置 / CodeBuddy IDE 自带）
+    out.extend(echo_platform.agent_cli_candidates())
     # 去重保序
     seen, uniq = set(), []
     for p in out:
@@ -130,7 +118,7 @@ def _run_headless(cli, node, prompt, timeout, cwd=None, resume_sid=""):
     try:
         p = subprocess.run(cmd, cwd=cwd or ECHO_WORKSPACE, env=env,
                            capture_output=True, timeout=timeout,
-                           creationflags=CREATE_NO_WINDOW if os.name == "nt" else 0)
+                           creationflags=echo_platform.no_window_creationflags())
     except subprocess.TimeoutExpired:
         raise AgentError(f"CodeBuddy CLI 超过 {timeout}s 未返回（可用 --max-turns 或缩短任务）")
     except OSError as e:
@@ -226,7 +214,7 @@ class CodeBuddyAgent(AgentAdapter):
         # 重活：真跑一次 --version，能确认 CLI 可执行
         try:
             p = subprocess.run([node, cli, "--version"], capture_output=True, timeout=60,
-                               creationflags=CREATE_NO_WINDOW if os.name == "nt" else 0)
+                               creationflags=echo_platform.no_window_creationflags())
             ver = p.stdout.decode("utf-8", "replace").strip()
             if p.returncode != 0 or not ver:
                 return False, f"CLI 无法执行（exit={p.returncode}）：{ver[:120]}"

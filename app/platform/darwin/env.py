@@ -1,13 +1,16 @@
 # -*- coding: utf-8 -*-
-"""macOS 平台环境默认值（D18）。
+"""macOS 平台环境默认值 + 平台原语（D18、D12）。
 
 系统数据放 ``~/Library/Application Support/ECHO``：``.app`` 内部不可写、也不该写，
 而且签名封条不允许往 bundle 里塞运行时数据。
 
 注意：mac 侧还有一层"注入式入口"（``mac/run_mac.py``）负责热键/边条/TTS 等运行时替换，
-那是 P3 才收拢的；本文件目前只提供环境默认值。
+那是 P3 才收拢的；本文件负责"环境默认值 + 平台原语"，业务代码只通过
+``app/platform/__init__.py`` 取用。
 """
 import os
+
+from app.platform import _posix
 
 NAME = "darwin"
 
@@ -23,3 +26,61 @@ def dangerous_prefixes():
         ("/Applications", "不能放在应用程序目录下"),
         ("/usr", "不能放在系统目录下"),
     ]
+
+
+def display_name() -> str:
+    """状态文案里的系统名（与 ``platform.system()`` 在 macOS 上的取值一致）。"""
+    return "Darwin"
+
+
+def chromium_candidates():
+    return [
+        "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        "/Applications/Chromium.app/Contents/MacOS/Chromium",
+    ]
+
+# ------------------------------------------------------------------ 展示 / 子进程
+
+def no_window_creationflags() -> int:
+    return 0
+
+
+def agent_cli_candidates():
+    """CodeBuddy CLI 的内置候选：本平台没有，返回空表。"""
+    return []
+
+
+def tcp_excluded_port_range_output() -> str:
+    """本平台没有 Windows 那套 TCP 保留端口段，返回空串。"""
+    return ""
+
+
+# ------------------------------------------------------------------ HuggingFace 下载脚本
+
+def hf_executable(install_root: str) -> str:
+    return os.path.join(install_root, "venv", "bin", "hf")
+
+
+def shell_script(hf: str, jobs) -> str:
+    """把若干条 argv 渲染成 POSIX sh 下载脚本。"""
+    import shlex
+    lines = []
+    for argv in jobs:
+        lines.append("HF_ENDPOINT=https://huggingface.co HF_HUB_OFFLINE=0 "
+                     + shlex.join([str(x) for x in argv]))
+    return " &&\n".join(lines)
+
+
+# ------------------------------------------------------------------ 单实例锁（flock）
+
+def acquire_named_lock(lock_id, lock_path):
+    return _posix.acquire(lock_path)
+
+
+def named_lock_held(lock_id, lock_path) -> bool:
+    return _posix.held(lock_path)
+
+
+def release_named_lock(handle):
+    return _posix.release(handle)

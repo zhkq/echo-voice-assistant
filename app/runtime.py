@@ -14,6 +14,7 @@ from app.audio.wake import WakeListener
 from app.config import settings
 from app.hotkey import HotkeyListener
 from app import paths, services
+from app import platform as echo_platform
 
 _hotkey = None
 _wake = None
@@ -22,15 +23,8 @@ _panel_last_open = 0.0
 # 安装根由路径层给（含 ECHO_ROOT 覆盖）。
 BASE_DIR = paths.echo_root()
 
-# 打开仪表盘用的 Chromium 系浏览器候选（--app 独立窗口，无地址栏）
-_CHROMIUM_CANDIDATES = [
-    r"$PROGRAMFILES(X86)\Microsoft\Edge\Application\msedge.exe",
-    r"$PROGRAMFILES\Microsoft\Edge\Application\msedge.exe",
-    r"$LOCALAPPDATA\Microsoft\Edge\Application\msedge.exe",
-    r"$PROGRAMFILES\Google\Chrome\Application\chrome.exe",
-    r"$PROGRAMFILES(X86)\Google\Chrome\Application\chrome.exe",
-    r"$LOCALAPPDATA\Google\Chrome\Application\chrome.exe",
-]
+# 打开仪表盘用的 Chromium 系浏览器候选（--app 独立窗口，无地址栏）。
+# 候选列表是平台差异，由接缝给（Windows 下 = Edge/Chrome 的常见安装位置）。
 
 
 def sidebar_exe_path():
@@ -183,7 +177,7 @@ def open_panel_window():
 
     exe = None
     if mode == "app":
-        for cand in _CHROMIUM_CANDIDATES:
+        for cand in echo_platform.chromium_candidates():
             path = os.path.expandvars(cand)
             if os.path.isfile(path):
                 exe = path

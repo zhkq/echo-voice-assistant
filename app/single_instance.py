@@ -16,6 +16,9 @@
 POSIX 是 `flock` 的文件锁（fd 关闭时释放）。所以既没有竞态窗口，也不会留下
 需要人工清理的陈旧锁文件。
 
+平台原语在 `app/platform/<os>/env.py` 里（D12：业务代码不得自己写 `os.name` 分支）：
+Windows 走命名互斥量，Linux/macOS 走 `app/platform/_posix.py` 的 flock。
+
 用法
 ----
     from app.single_instance import acquire
@@ -31,12 +34,10 @@ import os
 import threading
 
 from app import paths
+from app import platform as echo_platform
 
 _LOCK = threading.Lock()
 _HELD = {}          # name -> 句柄（Windows: HANDLE(int) / POSIX: fd）
-
-ERROR_ALREADY_EXISTS = 183
-SYNCHRONIZE = 0x00100000
 
 
 def _lock_id(name, data_dir):
@@ -48,97 +49,6 @@ def _lock_id(name, data_dir):
 
 def _lock_file(data_dir, name):
     return os.path.join(data_dir, "%s.lock" % name)
-
-
-# ---------------------------------------------------------------- Windows
-def _win_kernel32():
-    import ctypes
-    from ctypes import wintypes
-    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    k32.CreateMutexW.restype = wintypes.HANDLE
-    k32.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
-    k32.OpenMutexW.restype = wintypes.HANDLE
-    k32.OpenMutexW.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR]
-    k32.CloseHandle.argtypes = [wintypes.HANDLE]
-    return k32
-
-
-def _win_acquire(lid):
-    import ctypes
-    k32 = _win_kernel32()
-    handle = k32.CreateMutexW(None, True, "Local\\" + lid)
-    err = ctypes.get_last_error()      # 必须紧跟调用读取
-    if not handle:
-        return None, "CreateMutexW 失败（err=%s）" % err
-    if err == ERROR_ALREADY_EXISTS:
-        k32.CloseHandle(handle)
-        return None, "已有同名实例在运行（%s）" % lid
-    return handle, lid
-
-
-def _win_held(lid):
-    k32 = _win_kernel32()
-    handle = k32.OpenMutexW(SYNCHRONIZE, False, "Local\\" + lid)
-    if handle:
-        k32.CloseHandle(handle)
-        return True
-    return False
-
-
-def _win_release(handle):
-    _win_kernel32().CloseHandle(handle)
-
-
-# ---------------------------------------------------------------- POSIX
-def _posix_acquire(path):
-    import fcntl
-    try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-    except OSError:
-        pass
-    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        os.close(fd)
-        return None, "已有同名实例在运行（%s）" % path
-    try:                       # 写入 pid 便于排查（锁本身不依赖文件内容）
-        os.ftruncate(fd, 0)
-        os.write(fd, str(os.getpid()).encode("ascii"))
-    except OSError:
-        pass
-    return fd, path
-
-
-def _posix_held(path):
-    import fcntl
-    if not os.path.isfile(path):
-        return False
-    try:
-        fd = os.open(path, os.O_RDWR)
-    except OSError:
-        return False
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        return True            # 别人持着
-    else:
-        fcntl.flock(fd, fcntl.LOCK_UN)
-        return False
-    finally:
-        os.close(fd)
-
-
-def _posix_release(fd):
-    try:
-        import fcntl
-        fcntl.flock(fd, fcntl.LOCK_UN)
-    except Exception:
-        pass
-    try:
-        os.close(fd)
-    except OSError:
-        pass
 
 
 # ---------------------------------------------------------------- 对外接口
@@ -153,10 +63,7 @@ def acquire(name="echo", data_dir=None):
     with _LOCK:
         if name in _HELD:
             return False, "本进程已持有该锁（%s）" % lid
-        if os.name == "nt":
-            handle, detail = _win_acquire(lid)
-        else:
-            handle, detail = _posix_acquire(_lock_file(data_dir, name))
+        handle, detail = echo_platform.acquire_named_lock(lid, _lock_file(data_dir, name))
         if handle is None:
             return False, detail
         _HELD[name] = handle
@@ -169,16 +76,12 @@ def release(name="echo"):
         handle = _HELD.pop(name, None)
     if handle is None:
         return False
-    if os.name == "nt":
-        _win_release(handle)
-    else:
-        _posix_release(handle)
+    echo_platform.release_named_lock(handle)
     return True
 
 
 def is_held(name="echo", data_dir=None):
     """该锁当前**是否存在**（含本进程自己持有）。只探测，不获取。"""
     data_dir = data_dir or paths.data_root()
-    if os.name == "nt":
-        return _win_held(_lock_id(name, data_dir))
-    return _posix_held(_lock_file(data_dir, name))
+    return echo_platform.named_lock_held(_lock_id(name, data_dir),
+                                         _lock_file(data_dir, name))

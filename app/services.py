@@ -7,10 +7,10 @@ meeting/diarize）上报 status/detail，内存实时 + DB 持久化（重启后
 status 取值约定：online|offline|active|idle|error|disabled|unknown
 """
 import os
-import platform
 import time
 
 import app.db as db
+from app import platform as echo_platform
 
 COMPONENT_ORDER = ["server", "dsh", "stt", "tts", "wake", "hotkey", "meeting", "diarize"]
 
@@ -20,7 +20,7 @@ def _set(name, status, detail="", pid=0):
 
 
 def report_server(pid=None):
-    _set("server", "online", f"ECHO {_version()} · {platform.system()}",
+    _set("server", "online", f"ECHO {_version()} · {echo_platform.display_name()}",
          pid or os.getpid())
 
 

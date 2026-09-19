@@ -17,7 +17,6 @@ ModelScope 缓存固定在 ~/.cache/modelscope/models（funasr 不认识中文�
 """
 import importlib.util
 import os
-import shlex
 import threading
 import time
 
@@ -154,21 +153,14 @@ def ready_pyannote():
 
 def _pyannote_command():
     from scripts.install_pyannote import ASSETS
-    hf = os.path.join(BASE_DIR, "venv", "Scripts" if os.name == "nt" else "bin",
-                      "hf.exe" if os.name == "nt" else "hf")
-    lines = []
-    if os.name == "nt":
-        lines.append("$env:HF_ENDPOINT = 'https://huggingface.co'")
-        lines.append("$env:HF_HUB_OFFLINE = '0'")
+    from app import platform as echo_platform
+
+    hf = echo_platform.hf_executable(BASE_DIR)
+    jobs = []
     for repo, folder, filename in ASSETS:
-        args = [hf, "download", repo, filename, "--local-dir",
-                os.path.join(models_dir(), "pyannote", folder)]
-        if os.name == "nt":
-            lines.append("& " + " ".join("'" + p.replace("'", "''") + "'" for p in args))
-            lines.append("if ($LASTEXITCODE -ne 0) { throw '模型下载失败，请检查授权与网络' }")
-        else:
-            lines.append("HF_ENDPOINT=https://huggingface.co HF_HUB_OFFLINE=0 " + shlex.join(args))
-    return "\n".join(lines) if os.name == "nt" else " &&\n".join(lines)
+        jobs.append([hf, "download", repo, filename, "--local-dir",
+                     os.path.join(models_dir(), "pyannote", folder)])
+    return echo_platform.shell_script(hf, jobs)
 
 
 def _ready_qwen(model_id):

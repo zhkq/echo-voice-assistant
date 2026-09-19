@@ -28,11 +28,11 @@ from __future__ import annotations
 import os
 import re
 import socket
-import subprocess
-import sys
 import tempfile
 import time
 from typing import List, Optional, Tuple
+
+from app import platform as echo_platform
 
 PORT_FILE_NAME = "echo-port.txt"
 
@@ -62,19 +62,9 @@ def excluded_ranges(refresh: bool = False) -> List[Tuple[int, int]]:
     now = time.time()
     if not refresh and _cache["ranges"] is not None and now - _cache["at"] < _CACHE_TTL:
         return list(_cache["ranges"])
-    ranges: List[Tuple[int, int]] = []
-    if os.name == "nt":
-        try:
-            proc = subprocess.run(
-                ["netsh", "int", "ipv4", "show", "excludedportrange", "protocol=tcp"],
-                capture_output=True, text=True, timeout=10,
-                # netsh 的输出是**本地代码页**（中文系统上是 GBK），按 UTF-8 解会炸在
-                # reader 线程里。这里只关心数字，所以容错解码即可。
-                encoding="utf-8", errors="replace",
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-            ranges = parse_excluded(proc.stdout)
-        except Exception:
-            ranges = []
+    # 命令与平台差异由接缝负责（Windows 跑 netsh；其它平台返回空串）；
+    # 解析留在这里 —— parse_excluded() 的语义有单测钉住。
+    ranges = parse_excluded(echo_platform.tcp_excluded_port_range_output())
     _cache.update(at=now, ranges=ranges)
     return list(ranges)
 
