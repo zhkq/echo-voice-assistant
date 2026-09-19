@@ -856,7 +856,7 @@ r.events             # → 面板"看会话"
 | **S5** | ✅ 通过 | 全程 `~/.dsh` 时间戳未变、13 个既有 session 完好；隔离 home 自建 `profiles/ sessions/ storages/` |
 | **S13** | ⚠️ 部分 | **存储层成立**：web profile 的 `session-persistence-jsonl` 根同样是 `dshHomePath('sessions')`，与 `sdk` 同一个库。**并发无锁冲突成立**：两个 SDK 进程并行使用同一 home，各 2.6 s 双双成功、会话各自落盘。**但 `dsh --profile web` 起不来**：插件树无法解析 `@deepseek-ai/dsh-session-title-llm`（`--dump-config` 正常，一启动就失败）→ **官方 0.1.5rc1 的打包缺陷** |
 | **S11** | ✅ 通过 | **引擎不依赖 ASCII 路径**，因此 `meetingsDir` **不需要**强制 ASCII。证据：SenseVoice 与 Qwen3-ASR 在同一次运行内，ASCII 路径与中文路径的输出**逐字节相同**（sha 一致）；whisper 在 18 MB / 约 10 分钟音频上各跑 3 次——ASCII 2293/2170/2243 字、中文 2389/2414/2196 字，两边都稳定有输出（逐次不同属引擎自身非确定性）。⚠️ **方法学教训见下**：第一次单次 A/B 得出的是相反结论 |
-| **S8** | ⬜ 未做 | 安排在 P3 之前（用 `app/platform/` 骨架替换 `sys.modules` 注入后跑 Windows 全量冒烟） |
+| **S8** | ⬜ 未做（仅完成可行性评估） | 安排在 P3 之前（用 `app/platform/` 骨架替换 `sys.modules` 注入后跑 Windows 全量冒烟）。**可行性评估已完成**：见 `docs/2.0-PROGRESS.md` 第十九节——平台专有信号已逐类盘点（`sys.platform` 2 / `os.name==nt` 12 / Windows API 导入 13 / `LOCALAPPDATA` 类 10 / SAPI 45 / WebView2 10），且 mac 五个模块在 Windows 上全部可导入 → 结论是"接缝可行性问题基本消除，剩下的纯是 P3 搬迁工作量"。但**判定标准里的实测（骨架替换 `sys.modules` 注入后跑冒烟）仍未做**，故 S8 本身仍记 ⬜ |
 
 **⚠️ 对 D26 的影响（重要）**：`dsh --profile web` 这条路径在当前 RC 上**不可用**。P6 的两条会话
 路径里，**"面板内嵌会话视图"（消费 `RunResult.events`）是可靠的那条**；"ECHO 自带 web 实例"
@@ -1364,3 +1364,42 @@ robocopy C:\echo1.0\data C:\echo-dev\data echo.db
 - **不把可选组件装进已公证的 `.app`**（会破坏签名封条，见 §5.7）。
 - **不为兼容 14 以下 macOS 做分支**（D15 把地板统一在 14.0）。
 - **不为了手机访问把服务绑到 `0.0.0.0`**（保持回环 + 反向代理 + Bearer，见 `DEPLOY.md` §7）。
+
+
+---
+
+## 15. P3 追加决定（D27–D30，2026-09-19）
+
+> 起因：用户提出"系统安装位置应该是个配置项，系统内部用相对路径"。P1 已交付路径层
+> （`app/paths.py`，见 §10），本轮把"**安装根怎么配**、**守卫怎么落地**"定死。
+> 施工步骤、提交切分与验收顺序见 `docs/P3-收口施工方案.md`。
+
+**D27 · 安装根只做环境变量覆盖，不做面板配置项。**
+`app/paths.py::echo_root()` 默认由 `__file__` 推导（代码在哪，根就在哪），可用 `ECHO_ROOT`
+环境变量覆盖（打包分发：程序目录只读、数据放别处；多实例/测试也用它）。**不提供面板配置项**：
+安装根配错的后果是全盘静默跑偏（模型找不到、数据写错地方、门禁测的不是这棵树）——
+`scripts/startup.ps1` 里"某棵树悄悄用了另一棵树的 venv"就是这类事故。用户可配的只有**数据类**
+目录：`ECHO_DATA`（数据根）、`meetingsDir`、`modelsDir`（D20）。
+
+**D28 · 路径占位符只有一个来源。**
+`{ECHO}` / `{DATA}` 必须由路径层解析（`app/config.py::expand_path()` 已改成**调用时**问
+`paths.echo_root()` / `paths.data_root()`）。各写一遍的后果很实在：设了 `ECHO_ROOT` 时配置展开
+与路径层指向不同的树（split-brain）；`{DATA}` 写死 `join(ECHO_ROOT, "data")` 会让 macOS 的数据根
+落进 `.app`（违反 D18）。
+
+**D29 · 安装根的推导只允许出现在 `app/paths.py`；守卫测试按"清单先行"落地。**
+- 其它模块一律调 `paths.echo_root()` / `data_root()` / `meetings_root()` / `models_root()`，
+  不许自己 `dirname(...__file__)`；录音、上传这类**数据**落盘必须走**数据根**
+  （P3 已修 `app/assistant.py` 的 `CAPTURES_DIR`：原写法在 macOS 上会写进 `.app`）。
+- 守卫测试**不先写**：先由 `scripts/audit-paths.py` 出清单 → 收口 → 清零 → 再提升为
+  `tests/test_path_seam.py`（形态照 `tests/test_platform_contract.py` 的
+  `_py_files()` / `_import_lines()` / `bad` 列表范式）。"红着的守卫测试留在树上"比不写更糟。
+- `PLATFORM_TOKEN` **分级**：展示类保留（如 `services.py` 拼 `platform.system()` 状态文案），
+  分支类搬进 `app/platform/<os>/`（D12）。清点结果按此 triage，不机械清零。
+
+**D30 · HF 缓存根在启动阶段定一次。**
+`HF_HOME` 必须赶在**任何 HF 代码被 import 之前**设好（`huggingface_hub.constants` 在自身
+import 时就把缓存路径算死）。落点：`app/main.py` 的 lifespan 里 `settings.seed_defaults()`
+之后、`boot.setup()` 之前，来源 `paths.models_root()`；**只在用户显式配置了 `modelsDir` 时
+才覆盖**，保证默认安装零行为变化（避免"HF_HOME 改错 → 权重重新下载"）。现有两处
+`setdefault`（`app/audio/stt.py`、`app/modelinfo.py`）退化为更早的兜底值。

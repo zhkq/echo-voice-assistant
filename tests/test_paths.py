@@ -258,5 +258,133 @@ class ConfigurableRootTests(unittest.TestCase):
             self.assertEqual(config.DEFAULTS[key]["grp"], "paths")
 
 
+class EchoRootOverrideTests(unittest.TestCase):
+    """安装根（``{ECHO}``）的推导与覆盖（P3 第一步）。
+
+    默认必须由 ``__file__`` 推导——"代码在哪，根就在哪"是全系统内部一律相对根书写的
+    前提；``ECHO_ROOT`` 只做**环境变量**覆盖（打包分发 / 多实例 / 测试），刻意不做成
+    面板配置项：安装根配错 = 全盘静默跑偏（模型找不到、数据写错地方、门禁测的不是
+    这棵树）。用户该配的是数据类目录：``ECHO_DATA`` / ``meetingsDir`` / ``modelsDir``。
+    """
+
+    def setUp(self):
+        self._root = os.environ.get("ECHO_ROOT")
+        self._data = os.environ.get("ECHO_DATA")
+        self._get = paths._settings_get
+        paths._settings_get = lambda name: ""
+
+    def tearDown(self):
+        for key, saved in (("ECHO_ROOT", self._root), ("ECHO_DATA", self._data)):
+            if saved is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = saved
+        paths._settings_get = self._get
+
+    def test_default_derived_from_module_file(self):
+        os.environ.pop("ECHO_ROOT", None)
+        expected = os.path.dirname(os.path.dirname(os.path.abspath(paths.__file__)))
+        self.assertEqual(os.path.normpath(paths.echo_root()), os.path.normpath(expected))
+
+    def test_env_override_wins_and_roots_follow(self):
+        tmp = tempfile.mkdtemp(prefix="echo-root-")
+        os.environ["ECHO_ROOT"] = tmp
+        os.environ.pop("ECHO_DATA", None)
+        try:
+            self.assertEqual(os.path.normpath(paths.echo_root()), os.path.normpath(tmp))
+            # 相对路径补全以覆盖后的根为基准
+            self.assertEqual(paths.resolve("models"),
+                             os.path.normpath(os.path.join(tmp, "models")))
+            # 没单独指定 ECHO_DATA 时，数据根跟着安装根走（Windows 默认 {ECHO}/data）
+            self.assertEqual(os.path.normpath(paths.data_root()),
+                             os.path.normpath(os.path.join(tmp, "data")))
+            # 显式 ECHO_DATA 依然优先
+            other = tempfile.mkdtemp(prefix="echo-data-")
+            os.environ["ECHO_DATA"] = other
+            self.assertEqual(os.path.normpath(paths.data_root()), os.path.normpath(other))
+        finally:
+            os.environ.pop("ECHO_ROOT", None)
+            os.environ.pop("ECHO_DATA", None)
+
+    def test_config_placeholders_go_through_the_paths_layer(self):
+        """``config.expand_path()`` 的 {ECHO}/{DATA} 必须与路径层同一个来源。
+
+        各推一遍的后果很实在：设了 ECHO_ROOT 时 {ECHO} 指向老树、paths 指向新树
+        （split-brain）；{DATA} 写成 ``join(ECHO_ROOT, "data")`` 则 macOS 会把数据根
+        算进 .app 里，而 D18 要求写到 ``~/Library/Application Support/ECHO``。
+        """
+        from app import config
+        os.environ.pop("ECHO_DATA", None)
+        try:
+            tmp = tempfile.mkdtemp(prefix="echo-root-")
+            os.environ["ECHO_ROOT"] = tmp
+            self.assertEqual(os.path.normpath(config.expand_path("{ECHO}/models")),
+                             os.path.normpath(os.path.join(tmp, "models")))
+            other = tempfile.mkdtemp(prefix="echo-data-")
+            os.environ["ECHO_DATA"] = other
+            self.assertEqual(os.path.normpath(config.expand_path("{DATA}/meetings")),
+                             os.path.normpath(os.path.join(other, "meetings")))
+        finally:
+            os.environ.pop("ECHO_ROOT", None)
+            os.environ.pop("ECHO_DATA", None)
+        # 老行为不能变：非字符串、无占位符一律原样返回
+        self.assertEqual(config.expand_path(""), "")
+        self.assertIsNone(config.expand_path(None))
+
+    def test_data_root_is_resolved_by_the_paths_layer(self):
+        """``db.py`` / ``manager.py`` 的数据根必须来自 paths 层，不许各推导一遍。
+
+        为什么用源码断言而不是断言运行期值：现有测试用"给模块属性赋值"来隔离数据
+        目录（值会被别的用例改过），断言运行期常量会变成顺序相关的假红。半成品状态
+        比没做更危险，所以把"安装根/数据根的推导只有一处"钉在源码上。
+        """
+        for rel in ("db.py", "manager.py"):
+            p = os.path.join(paths.echo_root(), "app", rel)
+            with open(p, encoding="utf-8") as fh:
+                src = fh.read()
+            self.assertIn("paths.data_root()", src, "%s 应通过路径层取数据根" % rel)
+            for bad in ('os.path.join(BASE_DIR, "data")',
+                        'os.path.dirname(BASE_DIR), "data"'):
+                self.assertNotIn(bad, src, "%s 里不应再自己推导数据根（%s）" % (rel, bad))
+
+    def test_captures_and_beeps_roots_come_from_the_layer(self):
+        """录音落盘走**数据根**、提示音 wav 走**安装根**：两处都不许自己推导。
+
+        这两个是"根用错"的典型：录音写进安装目录 → macOS 上落进 .app（D18 不允许）；
+        提示音 wav 是代码资产，跟着安装根走才对（数据根搬走它也得还在）。
+        同样用源码断言，理由见上一个用例。
+        """
+        checks = (
+            ("assistant.py", "paths.data_root()",
+             ('os.path.join(BASE_DIR, "data", "captures")',)),
+            ("audio/tts.py", "paths.echo_root()",
+             ("os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))",)),
+        )
+        for rel, must, must_not in checks:
+            with open(os.path.join(paths.echo_root(), "app", rel), encoding="utf-8") as fh:
+                src = fh.read()
+            self.assertIn(must, src, "%s 应通过路径层取根" % rel)
+            for bad in must_not:
+                self.assertNotIn(bad, src, "%s 里不应再自己推导（%s）" % (rel, bad))
+
+    def test_converted_modules_take_the_install_root_from_the_layer(self):
+        """已收口的模块：不许再有 ``BASE_DIR = ...dirname...(__file__)`` 那一行，且必须
+        从路径层取根。这一行就是"每个模块各推一遍安装根"的指纹。
+
+        清单随收口增长；等 ``scripts/audit-paths.py`` 的清单清零后，这里换成"扫 app/ 全部
+        文件、白名单只留 paths.py"的正式守卫（那才是 P3 要交付的守卫测试）。
+        """
+        converted = ("config.py", "db.py", "manager.py", "assistant.py", "audio/tts.py",
+                     "main.py", "meeting.py", "audio/stt.py", "runtime.py", "modelinfo.py",
+                     "llm_router.py")
+        for rel in converted:
+            with open(os.path.join(paths.echo_root(), "app", rel), encoding="utf-8") as fh:
+                src = fh.read()
+            self.assertIn("paths.echo_root()", src, "%s 应从路径层取安装根" % rel)
+            bad = [ln.strip() for ln in src.splitlines()
+                   if "BASE_DIR" in ln and "dirname" in ln]
+            self.assertEqual(bad, [], "%s 里仍有自己推导的 BASE_DIR：%s" % (rel, bad))
+
+
 if __name__ == "__main__":
     unittest.main()
