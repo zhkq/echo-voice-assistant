@@ -50,7 +50,12 @@ _SESSION_STORE = os.path.expanduser(r"~\.dsh\storages\session_projcache\sessions
 # ---------------------------------------------------------------- 配置
 
 def enabled():
-    """归档总开关（未启用/未配置笔记库时，面板不提供写工作日志）。"""
+    """归档总开关（未启用/未配置笔记库时，面板不提供写工作日志）。
+
+    唯一的开/关入口。历史上还有一个 `worklogMode`（skill/off）表达同一个"不归档"，
+    属重复项，2026-09-19 已弃用并折叠进来（老配置 worklogMode=off 会在启动时
+    把本开关置为 False，见 config.DEPRECATION_MIGRATIONS）。
+    """
     return bool(settings.get("worklogEnabled", False))
 
 
@@ -59,17 +64,10 @@ def vault_root():
     return (settings.get("worklogVaultRoot", "") or "").strip()
 
 
-def mode():
-    """归档方式：skill=委派归档技能；off=不归档。"""
-    return (settings.get("worklogMode", "skill") or "skill").strip()
-
-
 def ready():
     """是否具备归档条件，返回 (ok, 原因)。"""
     if not enabled():
         return False, "纪要归档未启用（设置 → 纪要归档 → 启用纪要归档）"
-    if mode() == "off":
-        return False, "归档方式为「不归档」"
     vault = vault_root()
     if not vault:
         return False, "未配置笔记库根目录（设置 → 纪要归档 → 笔记库根目录）"

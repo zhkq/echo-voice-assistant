@@ -171,11 +171,15 @@ echo-voice-assistant/
 | `sttLanguage` | 转写语言（命令与会议共用）：`zh`（默认）/ `en` / `ja` / `ko` / `yue` / `auto`（自动识别）。Whisper 只认 ISO 码，填全名（如 `Chinese`）会自动纠正，非法值回退 `zh` |
 | `wakeHotkey` / `fallbackHotkey` / `panelHotkey` | 说话 / 备用 / 面板热键 |
 | `panelOpenMode` | `sidebar`（右缘边条）/ `app` / `browser` |
-| `ttsEngine` | `auto` / `edge-tts` / `sapi` / `off` |
+| `ttsEngine` | 朗读用哪个实现（**唯一开关**）：`auto` / `edge-tts`（在线，文本出网）/ `sapi`（macOS 是 `say`）/ `off`。面板「设置 → 朗读与反馈」里改 |
 | `minimalReply*` | 「先结论、后详情」的提示词与字数上限 |
-| `worklogEnabled` / `worklogVaultRoot` / `worklogMode` | 纪要归档：把归档委派给你自己的技能（见 [docs/worklog.md](docs/worklog.md)） |
+| `worklogEnabled` / `worklogVaultRoot` | 纪要归档：把归档委派给你自己的技能（见 [docs/worklog.md](docs/worklog.md)） |
 | `voiceprintEnabled` / `voiceprintAutoEnroll` / `voiceprintThreshold` / `voiceprintMargin` | 常用联系人声纹（**默认关闭**，生物特征数据）：转写时自动认人 / 改名自动入库 / 匹配阈值 / 歧义间隔 |
 | `apiAuthEnabled` | 开启后除 `/api/status` 外都需要 `Authorization: Bearer <token>` |
+
+> 设置项的完整清单（含"谁在读它"的审计结论、分组与重复项收敛记录）见
+> [docs/settings-audit.md](docs/settings-audit.md) 与 [docs/settings-重设计方案.md](docs/settings-重设计方案.md)。
+> `worklogMode` 与 `providerTts` 是已弃用的重复开关（值会在启动时自动搬到仍生效的那一项）。
 
 > ⚠️ **Whisper 系列的中文可能输出繁体字**（它的中文训练语料以繁体为主，与语言参数无关）：
 > ECHO 已用简体提示词诱导，且命令 / 会议 / 对外 API 三条路径一致（2026-09-15 修）；
@@ -224,7 +228,7 @@ ECHO 自带一个**本机模型路由**（`dsh-failover/proxy.py`，只监听回
 powershell -File scripts\install-qwen3asr.ps1   # 装依赖(qwen-asr) + 下载模型(~1.5GB)
 ```
 
-装好后在 设置 → 会议 → 会议转写模型 选择 `qwen3asr`（命令引擎 `sttModel` 也可选）。
+装好后在 顶部「模型」页签 → 会议转写引擎 选择 `qwen3asr`（命令转写引擎 `sttModel` 也可选）。
 模型经 modelscope 缓存加载（`~/.cache/modelscope`，无中文路径兼容问题）。
 
 ## DSH Desktop 宿主插件（echo-host）—— 已退役（2026-09-17）

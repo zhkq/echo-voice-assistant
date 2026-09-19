@@ -20,11 +20,13 @@ ECHO 在归档环节**不做任何归档决策**。它只负责三件事：
 
 | 设置项 | 默认 | 说明 |
 |---|---|---|
-| `worklogEnabled` | 关 | 总开关。关闭时「归档会议纪要」按钮直接提示不可用 |
+| `worklogEnabled` | 关 | 总开关（**唯一的开关**）。关闭时「归档会议纪要」按钮直接提示不可用 |
 | `worklogEnsureSessionAccess` | 开 | 归档前把 DSH **新建会话**的默认权限校正为全盘访问（笔记库在会话工作区之外，权限不足会被沙箱拦下）；关闭后只告警不修改 |
-| `worklogVaultRoot` | 空 | 笔记库根目录（纪要归档的目标）。仅在没有会议会话可复用时才用它新建兜底会话 |
-| `worklogMode` | `skill` | `skill`=委派归档技能（推荐）；`off`=不归档 |
 | `worklogPrompt` | 内置模板 | 送入 DSH 的提示词模板，可改 |
+
+> ⛔ `worklogMode`（`skill`/`off`）已**弃用**（2026-09-19）：它与 `worklogEnabled` 表达同一个
+> 「不归档」，属重复开关，只保留总开关。老配置里选过 `off` 的，启动时会自动把
+> `worklogEnabled` 置为关（见 `app/config.py` 的 `DEPRECATION_MIGRATIONS`），行为不变。
 
 条件不满足时，`GET /api/worklog/status` 会返回 `ready=false` 和一条
 **可操作的**原因（例如"未配置笔记库根目录"），面板据此提示而不是静默失败。

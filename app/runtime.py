@@ -10,7 +10,7 @@ import threading
 import time
 
 import app.assistant as assistant
-from app.audio.wake import WakeListener
+from app.audio.wake import WakeListener, engine_label as wake_engine_label
 from app.config import settings
 from app.hotkey import HotkeyListener
 from app import paths, services
@@ -249,7 +249,7 @@ def start_wake():
             return True, "唤醒监听已在运行"
         _wake = WakeListener(settings.get, on_wake=_wake_cb)
         _wake.start()
-        services.report_wake("online", "sherpa KWS")
+        services.report_wake("online", wake_engine_label())
         return True, "唤醒监听已启动"
 
 

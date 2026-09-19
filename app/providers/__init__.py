@@ -23,7 +23,7 @@ P5 要把这三类能力收成**同一种形状**：一个 provider = 一段"能
 * 注册表只存**元数据 + 构造器**，不 import 重依赖：`app/audio/stt.py` 会拉 torch/funasr，
   只能在真正调用时 import（见 `providers/local.py` 的方法内部）。
 * `catalog()` 只输出**可安全展示**的信息（不含任何凭据）——面板/接口直接用。
-* "当前生效的 provider"由配置项决定（`providerAsr` / `providerLlm` / `providerTts`），
+* "当前生效的 provider"由配置项决定（`providerAsr` / `providerLlm`；TTS 由 `ttsEngine` 派生），
   缺省回落到该 kind 的默认实现；找不到或没就绪时明确返回原因，不静默降级。
 """
 from __future__ import annotations
@@ -131,12 +131,50 @@ def default_id(kind):
     return items[0]["id"] if items else ""
 
 
+def tts_engine():
+    """TTS 的选择值（`ttsEngine`）—— 朗读「用哪个」只有这一个开关。
+
+    2026-09-19 收口：`providerTts` 与 `ttsEngine` 曾是同一个选择的两个入口（重复项），
+    而且会互相打架（配了 providerTts 时 `ttsEngine=off` 关不掉朗读）。现在 TTS 的
+    "本地 / 在线 / 关闭"全部由 `ttsEngine` 表达（auto | edge-tts | 本平台离线引擎 | off），
+    provider 层只负责**列出与探测**实现（`catalog()` 用），不再参与选择。
+    """
+    try:
+        from app.config import settings
+        return str(settings.get("ttsEngine", "auto") or "auto").strip().lower()
+    except Exception:
+        return "auto"
+
+
+#: ttsEngine 取值 -> 对应 provider id；`off` = 关闭朗读（不选任何实现）
+_TTS_ENGINE_TO_PROVIDER = {"edge-tts": "edge-tts", "off": ""}
+
+
+def _tts_active_id():
+    """TTS 当前实现（给 `catalog()` 标 active 用）：按 ttsEngine 派生，不探测网络。
+
+    `auto` 标**注册表默认实现**（离线朗读）：auto 的实际落点要看运行时（能连上
+    speech.platform.bing.com 就先走 edge-tts，否则离线），而离线实现永远可用，
+    所以"名义上的当前实现"取它；面板的状态行会按就绪探测把真实落点显示出来。
+    """
+    engine = tts_engine()
+    if engine in _TTS_ENGINE_TO_PROVIDER:
+        return _TTS_ENGINE_TO_PROVIDER[engine] or default_id("tts")
+    if engine == "auto":
+        return default_id("tts")
+    return "local-tts"          # 本平台离线引擎（sapi / say / espeak）
+
+
 def active_id(kind):
     """当前生效的 provider id：配置项 > 默认实现。
 
-    配置项名 = ``provider<Kind>``（`providerAsr` / `providerLlm` / `providerTts`）。
+    * `asr` / `llm`：配置项 ``provider<Kind>``（`providerAsr` / `providerLlm`）；
+    * `tts`：由 ``ttsEngine`` 派生（见 `tts_engine` 的说明）——没有第二份配置。
+
     配置为空或指向不存在的 id 时回落默认，**并把原因带上**（见 `active`）。
     """
+    if kind == "tts":
+        return _tts_active_id() or default_id("tts")
     configured = ""
     try:
         from app.config import settings
@@ -171,6 +209,30 @@ def asr_if_configured():
         return create("asr", chosen), chosen
     except Exception as e:
         return None, "providerAsr=%s 不可用（%s），本次走本地引擎" % (chosen, e)
+
+
+def speak_text(text, timeout=60):
+    """朗读文本：唯一入口，按 `ttsEngine` 走 `app/audio/tts.speak`。
+
+    2026-09-19 收口（用户实测发现 `providerTts` 与 `ttsEngine` 重复且互相打架）：
+    选择一个 TTS 实现的开关只剩 `ttsEngine` 一个 —— `off` 关闭朗读、`edge-tts` 走微软在线、
+    本平台离线引擎走系统合成、`auto` 优先在线失败回退离线。provider 注册表仍列出
+    edge-tts / 离线朗读并各自报就绪状态（面板据此显示"当前实现 + 会不会出网"），
+    但**不再由它决定用哪个**。失败不抛异常（朗读失败不该影响主流程），只把原因打出来。
+    """
+    try:
+        from app.audio import tts
+        return bool(tts.speak(text, tts_engine(), timeout))
+    except Exception as e:
+        print("[providers] 朗读失败：%s" % e)
+        return False
+
+
+def speak_async(text, timeout=60):
+    """后台线程朗读（面板/助手用它，不阻塞调用方）。"""
+    import threading
+    threading.Thread(target=speak_text, args=(text, timeout), daemon=True,
+                     name="providers-tts").start()
 
 
 def readiness(kind, pid=None):

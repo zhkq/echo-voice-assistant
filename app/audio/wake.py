@@ -31,6 +31,21 @@ def kws_model_dir() -> str:
     return os.path.join(paths.models_root(), "wakeword", "kws-zh-en-3m")
 
 
+#: `wakeEngine` 取值 -> 日志/面板里显示的名字（与 config.py 的 options 一一对应）
+ENGINE_LABELS = {"sherpa": "sherpa 流式 ASR", "kws": "KWS 关键词 spotting"}
+
+
+def engine_label(value=None):
+    """当前唤醒实现的人话名字；未给值时读配置，未知取值按实现里的默认（sherpa）算。"""
+    if value is None:
+        try:
+            from app.config import settings as _s
+            value = _s.get("wakeEngine", "sherpa")
+        except Exception:
+            value = "sherpa"
+    return ENGINE_LABELS.get(str(value or "").strip().lower(), ENGINE_LABELS["sherpa"])
+
+
 def _norm(s):
     """归一化识别文本：小写、去空白标点（保留中日韩/字母数字）。"""
     s = (s or "").lower()
@@ -178,7 +193,36 @@ class WakeListener(threading.Thread):
         return parts
 
     def _make_detector(self):
-        """优先流式 ASR（文字匹配），模型缺失时回退 KWS。"""
+        """按 `wakeEngine` 选唤醒实现（`sherpa` 流式 ASR 文字匹配 / `kws` 关键词 spotting）。
+
+        2026-09-19 审计发现：`wakeEngine` 这个设置项**面板上能选、后端从没读过**
+        （判定 PANEL-ONLY），而且选项里的 `openwakeword` 从来没有实现过。现在两者都修：
+        选项改成真实存在的两种实现，后端按它选路；历史配置里存着 `openwakeword`
+        之类的未知值时按默认（sherpa 优先、失败回退 KWS）走，不会因为一个配置值起不来。
+        """
+        mode = str(self.settings_get("wakeEngine", "sherpa") or "sherpa").strip().lower()
+        if mode == "kws":
+            print("[wake] wakeEngine=kws：只用关键词 spotting", flush=True)
+            return self._make_kws_detector()
+        if mode not in ("sherpa", "stream", "auto"):
+            print(f"[wake] wakeEngine={mode!r} 不是已知实现，按默认 sherpa 处理", flush=True)
+        # 默认：流式 ASR 文字匹配，模型缺失时回退 KWS
+        try:
+            return self._make_stream_detector()
+        except Exception as e:
+            print(f"[wake] 流式 ASR 不可用: {e}，回退 KWS", flush=True)
+        return self._make_kws_detector()
+
+    def _make_stream_detector(self):
+        """流式 ASR（sherpa-onnx zipformer）：识别文字再与唤醒词匹配。"""
+        kw_texts = self._kw_texts()
+        from app.audio import stt
+        rec = stt._get_sherpa()
+        print(f"[wake] 流式 ASR 唤醒就绪，唤醒词={kw_texts}", flush=True)
+        return _StreamDetector(rec, kw_texts)
+
+    def _kw_texts(self):
+        """唤醒词 + 别名（去空白、去空项）。"""
         kw_texts = [str(k).strip() for k in
                     (self.settings_get("wakeKeywords", ["小尼小尼"]) or ["小尼小尼"])]
         kw_texts += [str(k).strip() for k in
@@ -186,15 +230,10 @@ class WakeListener(threading.Thread):
         kw_texts = [k for k in kw_texts if k]
         if not kw_texts:
             raise ValueError("唤醒词为空")
-        # 1) 流式 ASR
-        try:
-            from app.audio import stt
-            rec = stt._get_sherpa()
-            print(f"[wake] 流式 ASR 唤醒就绪，唤醒词={kw_texts}", flush=True)
-            return _StreamDetector(rec, kw_texts)
-        except Exception as e:
-            print(f"[wake] 流式 ASR 不可用: {e}，回退 KWS", flush=True)
-        # 2) KWS
+        return kw_texts
+
+    def _make_kws_detector(self):
+        """KWS（sherpa-onnx KeywordSpotter）：直接用唤醒词做关键词 spotting。"""
         import sherpa_onnx
         import tempfile as _tf
         kws_dir = kws_model_dir()

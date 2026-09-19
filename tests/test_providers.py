@@ -349,14 +349,31 @@ class SecretHandlingTests(unittest.TestCase):
                 self.assertEqual(DEFAULTS[key]["grp"], "provider")
                 self.assertTrue(DEFAULTS[key]["label"])
 
-    def test_settings_all_masks_secrets(self):
+    def _config_endpoint(self):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        from app.api import router
+        app = FastAPI()
+        app.include_router(router)
+        return TestClient(app)
+
+    def _cfg_row(self, key):
+        rows = self._config_endpoint().get("/api/providers/config").json()["settings"]
+        return {r["key"]: r for r in rows}[key]
+
+    def test_generic_form_no_longer_carries_the_secrets(self):
+        """这九个键是 hidden 的：通用设置表单里**看不到**它们（统一由卡片承载）。"""
         settings.update({"providerLlmApiKey": self.SECRET})
-        row = {r["key"]: r for r in settings.all() if r["key"] == "providerLlmApiKey"}
-        self.assertIn("providerLlmApiKey", row, "密钥项仍要出现在面板里（否则没法改）")
-        r = row["providerLlmApiKey"]
-        self.assertEqual(r["value"], "", "面板值必须是空的")
+        keys = {r["key"] for r in settings.all()}
+        for key in ("providerLlmApiKey", "providerAsrApiKey", "providerAsrBaseUrl"):
+            self.assertNotIn(key, keys, "通用表单不该再出现 provider 配置（两套界面）")
+
+    def test_config_endpoint_masks_secrets(self):
+        settings.update({"providerLlmApiKey": self.SECRET})
+        r = self._cfg_row("providerLlmApiKey")
+        self.assertEqual(r["value"], "", "卡片拿到的必须是空的")
         self.assertTrue(r["secret"])
-        self.assertTrue(r["hasValue"], "要告诉界面库里其实有值")
+        self.assertTrue(r["hasValue"], "要告诉卡片库里其实有值")
 
     def test_settings_get_still_returns_the_real_value(self):
         """provider 组装请求头时用的是真值 —— 遮罩只发生在出口。"""
@@ -365,8 +382,7 @@ class SecretHandlingTests(unittest.TestCase):
 
     def test_empty_secret_reports_has_value_false(self):
         settings.update({"providerLlmApiKey": ""})
-        r = {x["key"]: x for x in settings.all()}["providerLlmApiKey"]
-        self.assertFalse(r["hasValue"])
+        self.assertFalse(self._cfg_row("providerLlmApiKey")["hasValue"])
 
     # ---- 防误清空（2026-09-19 发现的数据丢失风险）----
     def test_empty_string_never_clears_a_secret(self):
@@ -390,14 +406,25 @@ class SecretHandlingTests(unittest.TestCase):
         settings.update({"providerLlmApiKey": self.SECRET})
         settings.update({"providerLlmApiKey": CLEAR_SECRET})
         self.assertEqual(settings.get("providerLlmApiKey"), "")
-        r = {x["key"]: x for x in settings.all()}["providerLlmApiKey"]
-        self.assertFalse(r["hasValue"])
+        self.assertFalse(self._cfg_row("providerLlmApiKey")["hasValue"])
 
     def test_non_secret_keys_still_accept_empty(self):
         """闸只对 secret 生效：普通项（如 meetingsDir）空串仍是合法值。"""
         settings.update({"meetingsDir": "D:\\会议"})
         settings.update({"meetingsDir": ""})
         self.assertEqual(settings.get("meetingsDir"), "")
+
+    def test_api_settings_never_returns_the_secret(self):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        from app.api import router
+        settings.update({"providerLlmApiKey": self.SECRET})
+        app = FastAPI()
+        app.include_router(router)
+        client = TestClient(app)
+        self.assertNotIn(self.SECRET, client.get("/api/settings").text)
+        self.assertNotIn(self.SECRET, client.get("/api/providers/config").text,
+                         "卡片端点回显了密钥！")
 
     def test_api_put_with_masked_values_does_not_wipe(self):
         """端到端：面板那套请求（含空密钥）打过来，密钥必须还在。"""
@@ -408,27 +435,13 @@ class SecretHandlingTests(unittest.TestCase):
         app = FastAPI()
         app.include_router(router)
         client = TestClient(app)
-        listed = client.get("/api/settings").json()["settings"]
-        payload = {r["key"]: r["value"] for r in listed}
+        payload = {r["key"]: r["value"] for r in client.get("/api/settings").json()["settings"]}
+        payload["providerLlmApiKey"] = ""                 # 遮罩后的空串（最危险的那个）
         payload["userLocation"] = "北京"
         r = client.put("/api/settings", json={"values": payload})
         self.assertEqual(r.status_code, 200, r.text)
         self.assertEqual(settings.get("providerLlmApiKey"), self.SECRET,
                          "整批保存后密钥被清掉了 —— 这正是要防的事故")
-
-    def test_api_settings_never_returns_the_secret(self):
-        from fastapi import FastAPI
-        from fastapi.testclient import TestClient
-        from app.api import router
-        settings.update({"providerLlmApiKey": self.SECRET})
-        app = FastAPI()
-        app.include_router(router)
-        r = TestClient(app).get("/api/settings")
-        self.assertEqual(r.status_code, 200)
-        self.assertNotIn(self.SECRET, r.text, "接口回显了密钥！")
-        item = [x for x in r.json()["settings"] if x["key"] == "providerLlmApiKey"][0]
-        self.assertEqual(item["value"], "")
-        self.assertTrue(item["hasValue"])
 
     def test_secret_never_reaches_the_provider_catalog(self):
         settings.update({"providerLlmApiKey": self.SECRET})
@@ -626,10 +639,11 @@ class PanelWiringTests(unittest.TestCase):
         with open(os.path.join(root, "web", "index.html"), encoding="utf-8") as fh:
             cls.html = fh.read()
 
-    def test_card_renderer_exists_and_uses_both_endpoints(self):
+    def test_card_renderer_exists_and_uses_all_three_endpoints(self):
         self.assertIn("function renderProvidersCard", self.js)
         self.assertIn("/api/providers?ready=true", self.js)
         self.assertIn("/api/providers/presets", self.js)
+        self.assertIn("/api/providers/config", self.js)
 
     def test_card_is_mounted_in_the_settings_view_and_loaded(self):
         self.assertIn('id="providersHost"', self.html)
@@ -640,29 +654,129 @@ class PanelWiringTests(unittest.TestCase):
         self.assertIn('if (name === "settings") { loadSettings(); loadProviders(); }', self.js,
                       "切到设置页时必须加载 provider 卡片（否则卡片永远空白）")
 
-    def test_group_label_exists_for_the_provider_settings(self):
-        """设置页按 grp 分组显示；没有标签的话新分组会显示成裸英文 key。"""
-        self.assertIn("provider:", self.js)
-        self.assertIn("能力 provider", self.js)
+    def test_card_owns_the_editing_ui(self):
+        """用户实测指出「同一个功能两套界面」→ 配置项 hidden、编辑搬进卡片。"""
+        self.assertIn("btnProviderSave", self.js, "卡片要有自己的保存按钮")
+        self.assertIn("保存在线服务设置", self.js)
+        self.assertIn("data-provider-kind", self.js)
 
-    def test_provider_settings_keys_are_visible_to_the_form(self):
-        """面板渲染的是 settings.all()：这些键必须在 DEFAULTS 里且没被 hidden/deprecated。"""
+    def test_provider_settings_are_hidden_from_the_generic_form(self):
+        """这九个键**不再**出现在通用设置表单里（否则又变成两套界面）。"""
         from app.config import DEFAULTS
-        for key in ("providerAsr", "providerLlm", "providerTts",
+        for key in ("providerAsr", "providerLlm",
                     "providerLlmBaseUrl", "providerLlmApiKey", "providerLlmModel",
                     "providerAsrBaseUrl", "providerAsrApiKey", "providerAsrModel"):
             with self.subTest(key=key):
                 meta = DEFAULTS.get(key)
-                self.assertIsNotNone(meta, "%s 必须存在（面板要渲染它）" % key)
-                self.assertFalse(meta.get("hidden"), "%s 不能被隐藏" % key)
-                self.assertFalse(meta.get("deprecated"), "%s 不能是弃用项" % key)
+                self.assertIsNotNone(meta, "%s 必须存在" % key)
+                self.assertTrue(meta.get("hidden"),
+                                "%s 应由「能力 provider」卡片承载，不出现在通用表单" % key)
                 self.assertEqual(meta["grp"], "provider")
+                self.assertTrue(meta["label"] and meta["description"])
+        # providerTts 更进一步：与 ttsEngine 重复 → 已弃用（既不出现在表单，也不出现在卡片）
+        self.assertTrue(DEFAULTS["providerTts"].get("deprecated"))
+
+    def test_provider_config_endpoint_serves_them_masked(self):
+        """卡片要靠这个端点拿到值；密钥仍是遮罩过的；TTS 那格只给只读的 ttsEngine。"""
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        from app.api import router
+        app = FastAPI()
+        app.include_router(router)
+        r = TestClient(app).get("/api/providers/config")
+        self.assertEqual(r.status_code, 200, r.text)
+        rows = {s["key"]: s for s in r.json()["settings"]}
+        for key in ("providerAsr", "providerLlm", "providerLlmBaseUrl",
+                    "providerLlmApiKey", "providerAsrApiKey"):
+            self.assertIn(key, rows)
+        self.assertTrue(rows["providerLlmApiKey"]["secret"])
+        self.assertEqual(rows["providerLlmApiKey"]["value"], "")
+        self.assertIn("hasValue", rows["providerLlmApiKey"])
+        self.assertNotIn("sk-", json.dumps(r.json()))
+        # TTS：ttsEngine 以"只读"随卡片下发（卡片只显示当前实现，编辑仍在设置里）
+        self.assertIn("ttsEngine", rows)
+        self.assertTrue(rows["ttsEngine"]["read_only"])
+        self.assertTrue(rows["ttsEngine"]["platform_options"],
+                        "要带本平台候选项（macOS 的离线引擎是 say 而不是 sapi）")
+        self.assertNotIn("providerTts", rows, "弃用项不该再出现在卡片数据里")
 
     def test_secret_rows_render_as_password_inputs(self):
         """密钥行必须是密码框且默认空值（配服务端的"空串=不改"那道闸）。"""
         self.assertIn('type="password"', self.js)
         self.assertIn("data-secret", self.js)
         self.assertIn("data-clear-secret", self.js, "要有显式清除入口（哨兵值那条路）")
+
+
+class TtsProviderWiringTests(unittest.TestCase):
+    """TTS 只有一个开关：`ttsEngine`（2026-09-19 设置收敛）。
+
+    背景：`providerTts`（卡片上的 TTS 下拉）与 `ttsEngine`（设置里的语音合成引擎）曾是
+    同一个选择的两个入口，而且会互相打架 —— 配了 providerTts 时 `ttsEngine=off` 关不掉朗读。
+    现在 providerTts 已弃用，朗读统一由 `ttsEngine` 决定，`providers.speak_text()` 仍是唯一门面。
+    """
+
+    def setUp(self):
+        from app import providers as P
+        self.P = P
+
+    def test_speak_text_follows_tts_engine(self):
+        seen = {}
+
+        def fake_speak(text, engine="auto", timeout=60):
+            seen.update(text=text, engine=engine, timeout=timeout)
+            return True
+
+        with patch("app.config.settings.get",
+                   lambda k, d=None: "edge-tts" if k == "ttsEngine" else d), \
+                patch("app.audio.tts.speak", fake_speak):
+            out = self.P.speak_text("你好", timeout=5)
+        self.assertTrue(out)
+        self.assertEqual(seen, {"text": "你好", "engine": "edge-tts", "timeout": 5})
+
+    def test_off_means_offline_path_is_still_asked_to_stay_silent(self):
+        """`ttsEngine=off` 必须真的把"关"传下去（旧实现会被 providerTts 覆盖掉）。"""
+        seen = {}
+
+        def fake_speak(text, engine="auto", timeout=60):
+            seen.update(engine=engine)
+            return engine != "off"
+
+        with patch("app.config.settings.get",
+                   lambda k, d=None: "off" if k == "ttsEngine" else d), \
+                patch("app.audio.tts.speak", fake_speak):
+            out = self.P.speak_text("你好")
+        self.assertEqual(seen["engine"], "off")
+        self.assertFalse(out, "off = 不朗读")
+
+    def test_provider_tts_is_deprecated_and_not_read(self):
+        from app.config import DEFAULTS, DEPRECATION_MIGRATIONS
+        self.assertTrue(DEFAULTS["providerTts"].get("deprecated"),
+                        "providerTts 与 ttsEngine 重复，应已弃用")
+        self.assertIn("providerTts", DEPRECATION_MIGRATIONS,
+                      "弃用要带值迁移：用户选过的 edge-tts / local-tts 要搬到 ttsEngine")
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, "app", "providers", "__init__.py"), encoding="utf-8") as fh:
+            src = fh.read()
+        code = "\n".join(ln for ln in src.splitlines() if not ln.strip().startswith("#"))
+        self.assertNotIn('settings.get("providerTts"', code,
+                         "providerTts 不能再参与朗读决策（只留 ttsEngine 一个开关）")
+
+    def test_speak_failure_returns_false_not_exception(self):
+        with patch("app.config.settings.get", lambda k, d=None: ""), \
+                patch("app.audio.tts.speak", side_effect=RuntimeError("device gone")):
+            self.assertFalse(self.P.speak_text("你好"))
+
+    def test_callers_go_through_the_facade(self):
+        """朗读的三个调用点（助手复述/简报/提示语、面板试听）都要走门面。"""
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, "app", "assistant.py"), encoding="utf-8") as fh:
+            src = fh.read()
+        self.assertNotIn("tts_mod.speak", src, "助手里不该再直接调 tts.speak（绕过朗读门面）")
+        self.assertIn("providers_mod.speak_text", src)
+        self.assertIn("providers_mod.speak_async", src)
+        with open(os.path.join(root, "app", "api.py"), encoding="utf-8") as fh:
+            api_src = fh.read()
+        self.assertIn("providers_mod.speak_async", api_src, "面板「语音测试」也要走门面")
 
 
 if __name__ == "__main__":

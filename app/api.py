@@ -926,6 +926,43 @@ def api_provider_presets(_auth=Depends(optional_auth)):
     return presets_mod.catalog()
 
 
+@router.get("/providers/config")
+def api_provider_config(_auth=Depends(optional_auth)):
+    """provider 相关的配置项（给面板「能力 provider」卡片编辑用）。
+
+    这些键在 `DEFAULTS` 里标了 `hidden=True` —— 即**不再出现在通用设置表单**里：
+    "同一个功能两套界面"是用户在实测里直接指出的设计问题（2026-09-19），
+    所以统一由卡片承载，这里把它们单独取出来，**沿用同一套凭据遮罩**
+    （secret → value 置空 + hasValue，真实值永不出接口）。
+
+    额外带上 `ttsEngine`（只读展示用）：TTS 的"本地/在线/关闭"与它本来就是同一个开关，
+    卡片不再放第二个下拉（`providerTts` 已弃用并折叠进 ttsEngine，见 config.DEPRECATION_MIGRATIONS）。
+    """
+    from app.config import CARD_CONFIG_KEYS, DEFAULTS, _effective_options
+    from app.config import settings as _s
+    rows = []
+    for key, meta in DEFAULTS.items():
+        if meta.get("deprecated"):
+            continue
+        if meta.get("grp") != "provider" and key not in CARD_CONFIG_KEYS:
+            continue
+        value = _s.get(key, meta["value"])
+        row = {"key": key, "grp": meta["grp"], "label": meta["label"],
+               "description": meta["description"], "value_type": meta["value_type"],
+               "options": list(meta.get("options", [])),
+               # 平台声明的候选项优先（D11：macOS 的离线朗读是 say 不是 sapi）
+               "platform_options": list(_effective_options(key, meta)),
+               "read_only": key in CARD_CONFIG_KEYS and meta.get("grp") != "provider"}
+        if meta.get("secret"):
+            row["secret"] = True
+            row["hasValue"] = bool(str(value or "").strip())
+            row["value"] = ""
+        else:
+            row["value"] = value
+        rows.append(row)
+    return {"settings": rows, "group": "provider"}
+
+
 # ---------------------------------------------------------------- 声纹库（常用联系人）
 # 会议里把说话人改名为联系人即自动入库（voiceprintAutoEnroll）；
 # 库里的样本可在面板「说话人管理」查看/删除，这里是对应的 REST 入口。
@@ -1033,9 +1070,9 @@ def control_stt_unload(_auth=Depends(optional_auth)):
 
 @router.post("/control/tts/test")
 def control_tts_test(_auth=Depends(optional_auth)):
-    """语音合成测试播报。"""
-    tts_mod.speak_async("你好，我是 ECHO 语音助手，当前语音合成正常。",
-                        settings.get("ttsEngine", "auto"))
+    """语音合成测试播报。走 provider 门面（P5）：按 ttsEngine 选择实现后朗读。"""
+    from app import providers as providers_mod
+    providers_mod.speak_async("你好，我是 ECHO 语音助手，当前语音合成正常。")
     return {"ok": True, "message": "已开始测试播报"}
 
 

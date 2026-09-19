@@ -2,18 +2,26 @@
 """config.py — ECHO 配置管理（存储于 SQLite settings 表）
 
 所有配置以"键值 + 面板元数据"的形式入库，面板据此动态渲染表单：
-  grp        分组（general/voice/meeting/dsh/panel）
+  grp        分组（见下方 DEFAULTS 的分节注释：panel/command/paths/voice/beep/speech/
+             wake/meeting/worklog/router + 卡片承载的 agent/provider/model）
   value_type str|int|float|bool|json|list  → 决定输入控件
   options    JSON 候选值列表 → 下拉/多选
-  deprecated True = 已弃用，面板不再展示（见下）
+  hidden     True = 由面板的自定义 UI 承载（智能体表格 / 能力 provider 卡片），
+             不进通用表单；值仍可读写（接口单独取）
+  deprecated True = 已弃用（重复项或失效项），面板不再展示，写入被拒收（见下）
 
 首次启动调用 seed_defaults() 写入默认值（INSERT OR IGNORE，不覆盖已有配置）。
 读取用 get()/all()，写入用 update()（批量）。
 
 已弃用项（deprecated=True）：
   仍保留在 DEFAULTS 与库中，保证老配置可读、迁移可比对、get() 兼容；
-  但 all() 会把它们从面板数据里剔除，因此设置窗口不再出现。
+  但 all() 会把它们从面板数据里剔除（设置窗口不再出现），update() 直接拒收
+  （写它不会有任何效果，静默接受只会造出"改了没反应"的假象）。
+  老值表达的用户意图由 DEPRECATION_MIGRATIONS 在启动时搬到仍生效的那一项上。
   确认某个已弃用项彻底无人引用后，才可从 DEFAULTS 删除。
+
+设置项与分组的完整审计（谁定义/谁读/谁写）见 `scripts/audit-settings.py` 与
+`docs/settings-audit.md`；接线回归测试见 `tests/test_settings_wiring.py`。
 """
 import os
 
@@ -130,30 +138,38 @@ _WORKLOG_PROMPT_V1 = (
     "4) 完成后只回复一句话说明归档结果（写到哪个文件）。")
 
 
+#: 由「能力 provider」卡片**附带展示**的非 provider 组配置项。
+# 为什么要有这个名单：`ttsEngine` 与已弃用的 `providerTts` 是同一个选择（朗读用哪个），
+# 卡片需要把它取来显示"当前实现 / 是否出网 / 就绪"，但**不**在卡片里提供第二个编辑入口
+# （两处设置互相打架正是 2026-09-19 那次收口要解决的问题）→ 接口给 `read_only=True`，
+# 面板据此渲染成只读行 + 指路文案。
+CARD_CONFIG_KEYS = ("ttsEngine",)
+
+
 # key -> dict(value, grp, label, description, value_type, options, deprecated?)
 # deprecated=True 的项不进入设置窗口（all() 会过滤），仅保留兼容读取。
 DEFAULTS = {
-    # ---------- 通用 ----------
-    "dshBaseUrl":      dict(value="http://127.0.0.1:43120", grp="general", label="DSH 服务地址",
+    # ---------- 面板 / 服务（ECHO 自己的运行参数：端口、鉴权、界面行为）----------
+    "dshBaseUrl":      dict(value="http://127.0.0.1:43120", grp="panel", label="DSH 服务地址",
                             description="DSH Desktop 2.x 的 Web 服务地址（GUI 与 API 同端口，默认 43120）", value_type="str"),
-    "serverPort":      dict(value=8970, grp="general", label="ECHO 面板端口",
+    "serverPort":      dict(value=8970, grp="panel", label="ECHO 面板端口",
                             description="控制面板与 API 的监听端口（8890 曾被系统保留段占用，改用 8970）", value_type="int"),
-    "commandIdleRotateHours": dict(value=4, grp="general", label="命令会话空闲轮换小时",
-                                   description="默认命令会话空闲超过 N 小时且新指令未要求延续上一话题时，"
-                                               "自动轮换新会话（0=关闭；会话不在默认工作区时会强制轮换一次）",
-                                   value_type="float"),
-    "commandWorkspace": dict(value="", grp="general", label="命令会话工作区",
+    "commandWorkspace": dict(value="", grp="command", label="命令会话工作区",
                              description="默认命令会话建在这个目录对应的 DSH 工作区里，"
                                          "从而归入侧栏对应分组（例如你自己的「日常交互」）。"
                                          "留空 = 建在 ECHO 根目录（侧栏显示为未分组）",
                              value_type="str"),
-    "commandTargetWorkspace": dict(value="", grp="general", label="命令目标工作区（面板同步）",
+    "commandIdleRotateHours": dict(value=4, grp="command", label="命令会话空闲轮换小时",
+                                   description="默认命令会话空闲超过 N 小时且新指令未要求延续上一话题时，"
+                                               "自动轮换新会话（0=关闭；会话不在默认工作区时会强制轮换一次）",
+                                   value_type="float"),
+    "commandTargetWorkspace": dict(value="", grp="command", label="命令目标工作区（面板同步）",
                                    description="面板仪表盘「命令目标」下拉里选中的工作区。选中后，"
                                                "语音命令（媒体键/热键/唤醒/麦克风按钮）与打字命令都发到这里，"
                                                "不再使用上面那个会轮换的默认命令会话。"
                                                "由面板下拉自动写入，一般不用手改；留空 = 回到默认会话",
                                    value_type="str"),
-    "commandTargetSession": dict(value="", grp="general", label="命令目标会话（面板同步）",
+    "commandTargetSession": dict(value="", grp="command", label="命令目标会话（面板同步）",
                                  description="面板选中的具体对话：填了就直接发给它（不轮换、也不自动挑最近会话）。"
                                              "会话被归档/删除后自动回退到「该工作区自动」。"
                                              "由面板下拉自动写入，一般不用手改",
@@ -161,26 +177,30 @@ DEFAULTS = {
     # ---------- 存储路径（2.0 / D20、D21）----------
     # 留空 = 用默认值；默认值由 app/paths.py 解析（分平台，见 app/platform/<os>/env.py）。
     # 这里存的是"用户指定值"而不是解析后的绝对路径——占位符让同一份配置在任何机器都能用。
-    "meetingsDir":     dict(value="", grp="paths", label="会议目录",
-                            description="会议录音与纪要的存放目录。留空 = {DATA}/meetings。"
+    "meetingsDir":     dict(value="", grp="paths", label="会议文件目录",
+                            description="会议录音与纪要**文件**的存放目录。留空 = {DATA}/meetings。"
                                         "支持 {ECHO}/{DATA} 占位符与 ~。"
-                                        "改后旧会议仍留在原目录，需要用面板里的「迁移已有会议」搬过来",
+                                        "改后旧会议仍留在原目录，需要用面板里的「迁移已有会议」搬过来。"
+                                        "（与「会议 → 会议会话工作区」不同：那一个是 DSH 会话登记到哪个工作区）",
                             value_type="str"),
     "modelsDir":       dict(value="", grp="paths", label="模型目录",
                             description="模型权重（whisper / SenseVoice / 唤醒词 / pyannote…）的存放目录。"
                                         "留空 = {ECHO}/models。支持 {ECHO}/{DATA} 占位符与 ~。"
                                         "改后需重新下载模型，或自行把原目录拷过去",
                             value_type="str"),
-    "userLocation":    dict(value="北京", grp="general", label="用户所在地",
+    "userLocation":    dict(value="北京", grp="command", label="用户所在地",
                             description="发给 DSH 命令时附带的地理位置（天气/时间等问答需要）",
                             value_type="str"),
-    "sendEnvContext":  dict(value=True, grp="general", label="发送环境上下文",
+    "sendEnvContext":  dict(value=True, grp="command", label="发送环境上下文",
                             description="命令前附加当前时间与所在地，让 DSH 对'今天/明天/本地'有概念",
                             value_type="bool"),
-    "device":          dict(value="auto", grp="general", label="计算设备",
+    # device / sttModel / wakeEngine / meetingSttModel / meetingDiarize / voiceprint*
+    # 都归 grp="model"：它们正常由面板顶部「模型」页签承载（带就绪状态与获取入口），
+    # 这里的元数据是给"页签加载失败时回退显示"用的（见 web/app.js 的 MODEL_KEYS）。
+    "device":          dict(value="auto", grp="model", label="计算设备",
                             description="auto=cuda 优先，失败回退 CPU",
                             value_type="str", options=["auto", "cpu", "cuda"]),
-    "sttModel":        dict(value="sensevoice", grp="voice", label="命令转写引擎",
+    "sttModel":        dict(value="sensevoice", grp="model", label="命令转写引擎",
                             description="sensevoice 最快（中文短命令），qwen3asr 更准（需下载模型），sherpa 流式，whisper 模型按名",
                             value_type="str",
                             options=["sensevoice", "qwen3asr", "sherpa", "tiny", "base", "small", "medium", "large"]),
@@ -200,16 +220,16 @@ DEFAULTS = {
     # 2026-09-12 实测 DSH Desktop 2.0.9 里插件（ESM 动态 import）取不到 electron 的
     # app/BrowserWindow/screen（只有 net/systemPreferences），插件侧的 globalShortcut
     # 不可用，因此把"打开仪表盘"的热键落在 ECHO 进程里。
-    "panelHotkey":     dict(value="Ctrl+Shift+E", grp="voice", label="仪表盘热键",
+    "panelHotkey":     dict(value="Ctrl+Shift+E", grp="panel", label="仪表盘热键",
                             description="全局热键切换 ECHO 仪表盘（由 ECHO 服务进程注册）", value_type="str"),
-    "panelOpenMode":   dict(value="sidebar", grp="voice", label="仪表盘打开方式",
+    "panelOpenMode":   dict(value="sidebar", grp="panel", label="仪表盘打开方式",
                             description="sidebar=右缘边条（无边框/置顶/铺满高度，与升级前一致）；app=Chromium 应用窗口；browser=默认浏览器",
                             value_type="str", options=["sidebar", "app", "browser"]),
-    "panelAutoStart":  dict(value=True, grp="voice", label="启动时自动显示折叠条",
+    "panelAutoStart":  dict(value=True, grp="panel", label="启动时自动显示折叠条",
                             description="ECHO 启动后自动在屏幕右缘显示折叠条（仅当「仪表盘打开方式」= sidebar 时生效）；"
                                         "已在运行则不打扰（不会把已展开的面板收起来）",
                             value_type="bool"),
-    "panelStartCollapsed": dict(value=True, grp="voice", label="自动显示时收起为折叠条",
+    "panelStartCollapsed": dict(value=True, grp="panel", label="自动显示时收起为折叠条",
                                 description="True=启动后显示 64px 折叠条（点箭头/热键展开）；False=直接展开面板",
                                 value_type="bool"),
     "silenceThreshold": dict(value=0.012, grp="voice", label="静音阈值",
@@ -224,33 +244,40 @@ DEFAULTS = {
                             description="-1=系统默认麦克风", value_type="int"),
     "consumeMediaKey": dict(value=True, grp="voice", label="拦截媒体键",
                             description="触发后不向系统透传媒体键", value_type="bool"),
-    "beepOnStart":     dict(value=True, grp="voice", label="开始提示音", description="开始录音时播放提示音",
+    "beepOnStart":     dict(value=True, grp="beep", label="开始提示音", description="开始录音时播放提示音",
                             value_type="bool"),
-    "beepOnDone":      dict(value=True, grp="voice", label="停录提示音", description="停止录音时播放提示音",
+    "beepOnDone":      dict(value=True, grp="beep", label="停录提示音", description="停止录音时播放提示音",
                             value_type="bool"),
-    "beepOnSend":      dict(value=True, grp="voice", label="发送提示音", description="命令发送成功提示音",
+    "beepOnSend":      dict(value=True, grp="beep", label="发送提示音", description="命令发送成功提示音",
                             value_type="bool"),
-    "voiceConfirm":    dict(value=True, grp="voice", label="语音复述确认",
-                            description="发送前朗读一遍识别到的命令", value_type="bool"),
-    "voiceBrief":      dict(value=True, grp="voice", label="语音简报",
-                            description="任务完成后朗读精简结果", value_type="bool"),
-    "ttsEngine":       dict(value="auto", grp="voice", label="语音合成引擎",
-                            description="auto=优先 edge-tts（★微软在线：播报文本会发往微软，需访问 speech.platform.bing.com），失败才降级 Windows SAPI（全离线，音色略差）",
-                            value_type="str", options=["auto", "edge-tts", "sapi", "off"]),
-    "notifyOnSend":    dict(value=True, grp="voice", label="桌面通知",
+    "notifyOnSend":    dict(value=True, grp="beep", label="桌面通知",
                             description="发送成功后弹系统通知", value_type="bool"),
-    "maxBriefChars":   dict(value=200, grp="voice", label="简报最大字数",
+    # ---------- 朗读与反馈（语音合成 + 播报哪些内容）----------
+    # ttsEngine 是朗读"用哪个实现"的**唯一**开关：auto / edge-tts（微软在线）/ 本平台离线引擎 / off。
+    # 历史上有第二个开关 providerTts（能力 provider 卡片上的 TTS 下拉），两者重复且会互相打架
+    # （配了 providerTts 时 ttsEngine=off 关不掉朗读）→ 2026-09-19 弃用 providerTts。
+    "ttsEngine":       dict(value="auto", grp="speech", label="语音合成引擎",
+                            description="朗读与提示语用哪个实现，四选一："
+                                        "auto=优先 edge-tts（★微软在线，文本会发往 speech.platform.bing.com），"
+                                        "不可用时降级本机离线合成；edge-tts=只走在线；"
+                                        "离线引擎（Windows SAPI / macOS say）=全离线、音色略差；off=关闭朗读",
+                            value_type="str", options=["auto", "edge-tts", "sapi", "off"]),
+    "voiceConfirm":    dict(value=True, grp="speech", label="语音复述确认",
+                            description="发送前朗读一遍识别到的命令", value_type="bool"),
+    "voiceBrief":      dict(value=True, grp="speech", label="语音简报",
+                            description="任务完成后朗读精简结果", value_type="bool"),
+    "maxBriefChars":   dict(value=200, grp="speech", label="简报最大字数",
                             description="语音简报文本长度上限", value_type="int"),
     # ---------- 极简回复（2026-09-12 用户要求）----------
     # 命令末尾附一段"先给极简结论、再换行给详情"的要求：
     # 语音只朗读结论那一段（assistant.conclusion_only），详情留在回复/会话里给人看。
-    "minimalReply":    dict(value=True, grp="voice", label="要求极简回复",
+    "minimalReply":    dict(value=True, grp="speech", label="要求极简回复",
                             description="在命令末尾附一句要求：先给极简结论，再换行写详情（语音只读结论）",
                             value_type="bool"),
-    "minimalReplyChars": dict(value=60, grp="voice", label="极简回复字数上限",
+    "minimalReplyChars": dict(value=60, grp="speech", label="极简回复字数上限",
                               description="写进要求的长度约束（口语一句话约 30~60 字）", value_type="int"),
     "minimalReplyHint": dict(value=_MINIMAL_REPLY_HINT_V2,
-                             grp="voice", label="极简回复要求文案",
+                             grp="speech", label="极简回复要求文案",
                              description="拼在命令末尾；{chars} 会替换成上面的字数上限",
                              value_type="str"),
     # ---------- 唤醒词 ----------
@@ -258,9 +285,10 @@ DEFAULTS = {
                             description="说唤醒词免按键唤起（唤醒词见下方配置）", value_type="bool"),
     "wakePaused":      dict(value=True, grp="wake", label="唤醒暂停（勿扰）",
                             description="来电/会议期间临时关闭唤醒", value_type="bool"),
-    "wakeEngine":      dict(value="sherpa", grp="wake", label="唤醒引擎",
-                            description="sherpa-onnx KWS（离线，关键词直接指定）",
-                            value_type="str", options=["sherpa", "openwakeword"]),
+    "wakeEngine":      dict(value="sherpa", grp="model", label="唤醒方式",
+                            description="sherpa=流式识别出文字再匹配唤醒词（推荐，模型缺失时自动回退 KWS）；"
+                                        "kws=关键词 spotting（只认唤醒词本身，更省 CPU）",
+                            value_type="str", options=["sherpa", "kws"]),
     "wakeKeywords":    dict(value=["回声回声"], grp="wake", label="唤醒词",
                             description="支持多个，逗号分隔", value_type="list"),
     "wakeAliases":     dict(value=[], grp="wake", label="唤醒词别名（误听容错）",
@@ -275,7 +303,7 @@ DEFAULTS = {
     "wakeSilenceFloor": dict(value=60, grp="wake", label="静音门控",
                              description="低于此音量不送入唤醒模型（省电防误触发）", value_type="int"),
     # ---------- 会议 ----------
-    "meetingSttModel":  dict(value="sensevoice", grp="meeting", label="会议转写模型",
+    "meetingSttModel":  dict(value="sensevoice", grp="model", label="会议转写引擎",
                              description="sensevoice 最快（中文会议推荐）；small/medium/large 是 whisper；qwen3asr 最准但慢约 20 倍（GPU rtf≈0.45）",
                              value_type="str",
                              options=["sensevoice", "qwen3asr", "small", "medium", "large"]),
@@ -285,35 +313,37 @@ DEFAULTS = {
                                  description="转写完成后自动请 DSH 生成纪要（★转写全文会发给 DSH 配置的模型服务：内网网关即贵单位内网，公网 API 即模型厂商）", value_type="bool"),
     "meetingKeepRawAudio": dict(value=True, grp="meeting", label="保留原始音频",
                                 description="删除会议时是否同时删除音频", value_type="bool"),
-    "meetingDiarize":   dict(value=False, grp="meeting", label="区分说话人",
+    "meetingDiarize":   dict(value=False, grp="model", label="区分说话人",
                              description="本地 pyannote 分离（CPU 下较慢）", value_type="bool"),
     # ---------- 常用联系人声纹（issue #6）：改名入库 → 新会议自动认人 ----------
     # 样本是说话人嵌入（256 维），只存本机 data/echo.db；不做云端、不出网。
     # 【默认关闭】声纹属于生物特征数据：收集与自动认人都必须由用户显式开启（opt-in）。
     # 注意：不要用 DEFAULT_MIGRATIONS 做 True→False 的翻转 —— 那套机制每次启动都会比对
     # 「旧默认值」，用户一旦主动开启就会被下一次启动翻回去；改默认值 + 让用户自己开即可。
-    "voiceprintEnabled": dict(value=False, grp="meeting", label="声纹识别常用联系人",
+    "voiceprintEnabled": dict(value=False, grp="model", label="声纹识别常用联系人",
                               description="默认关闭。开启后会议转写会用声纹库自动识别已入库的联系人，"
                                           "把「说话人N」直接标成联系人名（需先开启「区分说话人」，"
                                           "且联系人有已入库的声纹样本）；关闭时不留存任何声纹样本",
                               value_type="bool"),
-    "voiceprintAutoEnroll": dict(value=False, grp="meeting", label="改名时自动入库声纹",
+    "voiceprintAutoEnroll": dict(value=False, grp="model", label="改名时自动入库声纹",
                                  description="默认关闭。开启后在会议里把说话人改名为联系人时，"
                                              "自动把该说话人本场的声音存成声纹样本（声纹库属生物特征数据，"
                                              "样本可在会议页「说话人管理」里查看/删除）",
                                  value_type="bool"),
-    "voiceprintThreshold": dict(value=0.65, grp="meeting", label="声纹匹配阈值",
+    "voiceprintThreshold": dict(value=0.65, grp="model", label="声纹匹配阈值",
                                 description="余弦相似度下限（0~1）：越高越不容易认错人、也越容易漏认。"
                                             "默认 0.65 偏保守；先看日志（source=voiceprint）里的实际相似度再调",
                                 value_type="float"),
-    "voiceprintMargin": dict(value=0.05, grp="meeting", label="声纹歧义间隔",
+    "voiceprintMargin": dict(value=0.05, grp="model", label="声纹歧义间隔",
                              description="候选联系人与次优的最小差距：差距过小视为认不准，不自动命名",
                              value_type="float"),
     "meetingWorkspace": dict(value="{ECHO}/data/meetings", grp="meeting",
-                             label="会议纪要工作区",
+                             label="会议会话工作区",
                              description="一场会议一个 DSH 会话（纪要/分段/归档共用），下一场新建；"
                                          "这些会话都会登记进这个目录对应的 DSH 工作区，"
                                          "从而归入侧栏的「会议工作区」分组。"
+                                         "注意与「存储路径 → 会议目录」的区别：那一个是录音/纪要"
+                                         "**文件**放哪，这一项是 DSH **会话**登记到哪个工作区。"
                                          "{ECHO} = ECHO 根目录；留空 = 用固定的纪要会话（不分组）",
                              value_type="str"),
     # ---------- 纪要归档（工作日志 / 笔记库）----------
@@ -332,8 +362,9 @@ DEFAULTS = {
                              description="纪要归档的目标根目录（如 Obsidian 库路径）。同时作为归档 DSH 会话的工作区",
                              value_type="str"),
     "worklogMode": dict(value="skill", grp="worklog", label="归档方式",
-                        description="skill=委派 DSH 调用你自己的归档技能（推荐，可完全自定义归档规则）；off=不归档",
-                        value_type="str", options=["skill", "off"]),
+                        description="已弃用：与「启用纪要归档」是同一个开关的两个入口（重复项），"
+                                    "2026-09-19 起只保留总开关 worklogEnabled",
+                        value_type="str", options=["skill", "off"], deprecated=True),
     "worklogPrompt": dict(value=_WORKLOG_PROMPT_V1, grp="worklog", label="归档提示词模板",
                           description="送入 DSH 的归档命令模板；占位符：{vault} {title} {started_at} "
                                       "{duration} {speakers} {date} {hour} {md_path} {archive_hint} {meeting_id}",
@@ -371,50 +402,58 @@ DEFAULTS = {
     # ---------- 能力 provider（P5 / D25：ASR / LLM / TTS 各选一个）----------
     # 留空 = 用该 kind 的默认实现（本地转写引擎 / ECHO AUTO 多上游路由 / 本平台离线朗读）。
     # 可选项是**运行时**注册出来的（见 GET /api/providers），所以这里不写死 options。
-    "providerAsr": dict(value="", grp="provider", label="转写 provider",
+    "providerAsr": dict(value="", grp="provider", label="转写 provider", hidden=True,
                         description="留空 = 默认的本地转写引擎。在下方「能力 provider」卡片里选，"
                                     "或在这里填 provider id（见 GET /api/providers）",
                         value_type="str"),
-    "providerLlm": dict(value="", grp="provider", label="语言模型 provider",
+    "providerLlm": dict(value="", grp="provider", label="语言模型 provider", hidden=True,
                         description="留空 = ECHO AUTO（多上游派发路由）。配了它，纪要不依赖 agent 也能生成；"
                                     "在下方「能力 provider」卡片里选",
                         value_type="str"),
-    "providerTts": dict(value="", grp="provider", label="朗读 provider",
-                        description="留空 = 默认的离线朗读；选 edge-tts 则被朗读的文本会出网"
-                                    "（出网说明见下方「能力 provider」卡片）",
+    "providerTts": dict(value="", grp="provider", label="朗读 provider", hidden=True,
+                        deprecated=True,
+                        description="已弃用：朗读「用哪个」就是 ttsEngine（自动 / edge-tts / "
+                                    "本平台离线引擎 / 关闭），两处开关会互相打架"
+                                    "（配了 providerTts 时 ttsEngine=off 关不掉朗读）。"
+                                    "2026-09-19 起只保留 ttsEngine；本项的值已自动搬到 ttsEngine",
                         value_type="str"),
     # ---- 在线服务预设（P5）：一个 OpenAI 兼容端点 + 一把密钥 ----
     # 这三项就是"配一个在线 LLM"的全部输入；配好把 providerLlm 指向 openai-llm 即生效。
     # 内网网关地址**不写进仓库**（属单位内部信息，见 REFACTOR-PLAN §13.4）：
     # 面板给"内网网关"预设时留空 base_url，让用户自己填。
-    "providerLlmBaseUrl": dict(value="", grp="provider", label="在线 LLM 地址",
+    "providerLlmBaseUrl": dict(value="", grp="provider", label="在线 LLM 地址", hidden=True,
                                description="OpenAI 兼容端点的根地址，例如 https://api.deepseek.com/v1"
                                            "（内网网关填单位自己的地址；留空 = 不用在线 LLM）。"
                                            "可用下方「能力 provider」卡片的预设一键填入",
                                value_type="str"),
-    "providerLlmApiKey": dict(value="", grp="provider", label="在线 LLM 密钥",
+    "providerLlmApiKey": dict(value="", grp="provider", label="在线 LLM 密钥", hidden=True,
                               description="只保存在本机数据库；接口（含面板）永不回显。"
                                           "留空 = 不改；要清空请点「清除」。数据去向见「在线 LLM 地址」",
                               value_type="str", secret=True),
-    "providerLlmModel": dict(value="", grp="provider", label="在线 LLM 模型名",
+    "providerLlmModel": dict(value="", grp="provider", label="在线 LLM 模型名", hidden=True,
                              description="留空 = 用服务端默认（如 deepseek-chat / gpt-4o-mini）",
                              value_type="str"),
-    "providerAsrBaseUrl": dict(value="", grp="provider", label="在线转写地址",
+    "providerAsrBaseUrl": dict(value="", grp="provider", label="在线转写地址", hidden=True,
                                description="OpenAI 兼容的 /audio/transcriptions 根地址"
                                            "（例如 https://api.openai.com/v1）；留空 = 不用在线转写",
                                value_type="str"),
-    "providerAsrApiKey": dict(value="", grp="provider", label="在线转写密钥",
+    "providerAsrApiKey": dict(value="", grp="provider", label="在线转写密钥", hidden=True,
                               description="只保存在本机数据库；接口永不回显。留空 = 不改；要清空请点「清除」。"
                                           "注意：会议音频会整段上传到该服务",
                               value_type="str", secret=True),
-    "providerAsrModel": dict(value="", grp="provider", label="在线转写模型名",
+    "providerAsrModel": dict(value="", grp="provider", label="在线转写模型名", hidden=True,
                              description="留空 = whisper-1（OpenAI 兼容服务的默认转写模型）",
                              value_type="str"),
-    # ---------- 面板 ----------
+    # ---------- 面板 / 服务 ----------
     "panelAutoRefresh": dict(value=3, grp="panel", label="面板自动刷新秒",
-                             description="仪表盘轮询间隔（0=关闭）", value_type="int"),
-    "apiAuthEnabled":   dict(value=False, grp="panel", label="API 鉴权",
-                             description="外部触点（手机 App）启用 Bearer Token 校验",
+                             description="仪表盘 / 启动页 / 模型路由页的自动刷新间隔（秒）；"
+                                         "0 = 不自动刷新（切页或手动点刷新时才更新）。"
+                                         "会议转写进度条不受此项影响（它需要一直更新）",
+                             value_type="int"),
+    "apiAuthEnabled":   dict(value=False, grp="panel", label="API 鉴权（手机 App）",
+                             description="开启后**所有**接口都要求 Bearer 令牌 —— 包括本地面板，"
+                                         "而面板不带令牌，因此开启后面板会连不上，只能带令牌"
+                                         "或直接改库关掉。仅在外网访问/手机 App 场景下开启",
                              value_type="bool"),
     # ---------- 模型路由（ECHO AUTO）----------
     # 路由进程把 dsh-failover/config.json 里的 groups 转成 DSH 里的可选模型；
@@ -446,6 +485,12 @@ DEFAULTS = {
                                   value_type="int"),
 }
 
+#: 面板渲染顺序 = 上面 DEFAULTS 的声明顺序（分组内也按它排）。
+# 为什么必须显式给：`db.all_settings()` 是按 (grp, key) **字母序**返回的（库层的稳定排序），
+# 直接拿它渲染会让"相关项挨在一起"的编排失效（例如三个提示音开关会被 maxRecordMs 之类的
+# 键隔开）。这里把声明顺序作为 `order` 字段随行发给面板，由面板排序 —— 库层保持简单。
+SETTING_ORDER = {key: index for index, key in enumerate(DEFAULTS)}
+
 # 默认值迁移：早期版本把某个默认值当作"用户已设置"写进了库（seed_defaults 不覆盖已有
 # value），此后改 DEFAULTS 就不生效了。这里登记"旧默认值 → 采用新默认值"：
 # 只有当前值仍等于旧默认值时才改写，用户手动改过的一律不动。
@@ -460,6 +505,35 @@ DEFAULT_MIGRATIONS = {
     # 才能把每场会议的会话登记进「会议工作区」。仅当用户从没改过（仍为空）才改写。
     "meetingWorkspace": ("", "{ECHO}/data/meetings"),
 }
+
+# 弃用项的值迁移：某个配置键被**弃用**（重复/失效）时，把"它当初表达的用户意图"
+# 搬到仍然生效的那一项上，只在值等于触发值时才搬（用户自己在库里改过的一律不动）。
+#   形状：被弃用键 -> ((触发值, 目标键, 目标值), ...)   —— 一个键可以有多条取值规则
+# 放在 seed_defaults() 里跑：与 DEFAULT_MIGRATIONS 同一时机（每次启动比对一次，
+# 搬完触发值就不成立，天然幂等）。
+#: 目标值里的占位符：搬到"本平台的离线朗读引擎"（win=sapi / mac=say / linux=espeak）
+OFFLINE_TTS_PLACEHOLDER = "{offline-tts}"
+
+DEPRECATION_MIGRATIONS = {
+    # 2026-09-19：worklogMode=off 与 worklogEnabled 是同一个"不归档"的两个开关（重复项），
+    # 只保留总开关；老配置里选过「不归档」的，把总开关一起关掉 → 行为完全不变。
+    "worklogMode": (("off", "worklogEnabled", False),),
+    # 2026-09-19：providerTts 与 ttsEngine 重复（且会互相打架：配了 providerTts 时
+    # ttsEngine=off 关不掉朗读）。把用户当初选的"本地/在线"意图搬到 ttsEngine ——
+    # 选 edge-tts 的原样搬；选本地离线朗读的搬到本平台离线引擎（绝不搬成 auto：
+    # auto 会优先走微软在线，等于把"我不想出网"的意图反过来）。
+    "providerTts": (("edge-tts", "ttsEngine", "edge-tts"),
+                    ("local-tts", "ttsEngine", OFFLINE_TTS_PLACEHOLDER)),
+}
+
+
+def _offline_tts_engine():
+    """本平台 ttsEngine 候选项里的"离线引擎"取值（win=sapi / mac=say / linux=espeak）。"""
+    opts = [str(o) for o in _effective_options("ttsEngine", DEFAULTS["ttsEngine"])]
+    for o in opts:
+        if o not in ("auto", "edge-tts", "off"):
+            return o
+    return "sapi"
 
 
 class Settings:
@@ -477,7 +551,7 @@ class Settings:
         return self._cache
 
     def seed_defaults(self):
-        """首次启动写入默认值 + 同步元数据（不覆盖已有 value）。"""
+        """首次启动写入默认值 + 同步元数据（不覆盖已有 value）+ 跑两类值迁移。"""
         for key, meta in DEFAULTS.items():
             value = _effective_default(key, meta)          # 平台声明优先（D11）
             options = _effective_options(key, meta)
@@ -497,7 +571,33 @@ class Settings:
                         db.set_setting(key, new_value, grp=meta["grp"], label=meta["label"],
                                        description=meta["description"], value_type=meta["value_type"],
                                        options=options)
+                # 弃用项的值迁移（把"已弃用开关"表达的意图搬到还在生效的那一项上）
+                self._migrate_deprecated(key)
         self._cache = None
+
+    def _migrate_deprecated(self, key):
+        """把已弃用键的取值翻译成仍生效键的取值（见 DEPRECATION_MIGRATIONS）。
+
+        只在"当前值 == 触发值"时搬一次；搬完触发条件不再成立，所以每次启动跑都安全。
+        目标键用 `db.upsert_settings`（保留既有元数据），搬动用 add_log 留痕——
+        用户看到"归档总开关被关掉"时能查到是这次配置收敛造成的，不是 bug。
+        """
+        rules = DEPRECATION_MIGRATIONS.get(key)
+        if not rules:
+            return
+        current = db.get_setting(key)
+        for trigger, target, target_value in rules:
+            if str(current if current is not None else "").strip().lower() != trigger:
+                continue
+            if target_value == OFFLINE_TTS_PLACEHOLDER:
+                target_value = _offline_tts_engine()
+            db.upsert_settings({target: target_value})
+            try:
+                db.add_log("info", "config",
+                           "%s 已弃用（当前值 %s）→ %s 已自动设为 %s"
+                           % (key, trigger, target, target_value))
+            except Exception:
+                pass
 
     def get(self, key, default=None):
         cache = self._load()
@@ -515,6 +615,9 @@ class Settings:
           * hidden=True     —— 由面板自定义 UI 承载的配置（例如「智能体」分组
                                改由智能体表格渲染，就不再作为普通表单行出现）。
 
+        每行带 `order`（= DEFAULTS 里的声明顺序）：库层返回的是 (grp, key) 字母序，
+        光靠它无法表达"三个提示音开关要挨在一起"这类编排，面板据此字段排序。
+
         **密钥（``secret=True``）在这里被遮掉**（P5 凭据管理）：这一层是所有出口的必经之路
         （`/api/settings`、面板、将来的手机端），所以在源头遮一次，而不是指望每个消费方
         都记得处理。遮法：``value`` 一律置空 + ``hasValue`` 告诉界面"库里其实有值"，
@@ -527,8 +630,9 @@ class Settings:
             meta = DEFAULTS.get(r["key"], {})
             if meta.get("deprecated") or meta.get("hidden"):
                 continue
+            r = dict(r)
+            r["order"] = SETTING_ORDER.get(r["key"], len(DEFAULTS))
             if meta.get("secret"):
-                r = dict(r)
                 r["hasValue"] = bool(str(r.get("value") or "").strip())
                 r["value"] = ""
                 r["secret"] = True
@@ -547,11 +651,18 @@ class Settings:
         所以这里定死一条契约：
           * 空串（或纯空白）= **不改**（跳过，计入 `skipped`）；
           * 要清空必须显式送 ``CLEAR_SECRET``（面板的「清除」按钮就是这么做的）。
+
+        **已弃用项直接拒收**（2026-09-19 设置收敛）：deprecated=True 的键还留在 DEFAULTS 里只是
+        为了兼容读取与迁移比对，写它不会有任何效果 —— 静默接受会造出"设置界面里没有、
+        但改了却没反应"的假象，所以这里显式跳过。用户仍可用 `reset()` 把它恢复成默认值。
         """
         cleaned = {}
         skipped = []
         for k, v in mapping.items():
             if k not in DEFAULTS:
+                continue
+            if DEFAULTS[k].get("deprecated"):
+                skipped.append(k)              # 已弃用：不再生效，拒收
                 continue
             vt = DEFAULTS[k]["value_type"]
             try:

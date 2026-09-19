@@ -18,6 +18,7 @@ import time
 
 import app.db as db
 from app import paths
+from app import providers as providers_mod
 from app.config import settings
 from app.dsh import get_client, DshError
 from app.audio import stt as stt_mod
@@ -365,7 +366,7 @@ def _capture_worker(source):
         # 语音复述确认（简短复述要做什么 + 目标，播完再发送）
         if cfg.get("voiceConfirm", True):
             confirm = _build_confirm(text)
-            tts_mod.speak(confirm + _target_hint(*target), cfg.get("ttsEngine", "auto"), timeout=15)
+            providers_mod.speak_text(confirm + _target_hint(*target), timeout=15)
 
         _dispatch(text, source, *target)
     finally:
@@ -515,7 +516,7 @@ def _dispatch(text, source, workspace=None, session_id=None):
         db.add_log("info", "assistant", f"完成({duration}ms)，简报: {brief[:80]}")
         db.add_event("command_done", {"id": cmd_id})
         if cfg.get("voiceBrief", True) and brief:
-            tts_mod.speak_async(brief, cfg.get("ttsEngine", "auto"))
+            providers_mod.speak_async(brief)
         return True
     db.update_command(cmd_id, status="done", reply="", brief="", duration_ms=duration)
     db.add_log("warn", "assistant", f"{REPLY_TIMEOUT_S} 秒内未收到助手回复")
@@ -536,6 +537,6 @@ def _handle_meeting_intent(text, intent, source):
     db.update_command(cmd_id, reply=msg)
     db.add_log("info", "assistant", f"会议命令[{intent}]: {msg}")
     if ok and intent == "start":
-        tts_mod.speak_async("开始录音", settings.get("ttsEngine", "auto"))
+        providers_mod.speak_async("开始录音")
     elif ok and intent == "stop":
-        tts_mod.speak_async("录音已结束", settings.get("ttsEngine", "auto"))
+        providers_mod.speak_async("录音已结束")

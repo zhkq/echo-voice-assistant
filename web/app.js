@@ -867,12 +867,15 @@ $("#gotoMeetings").addEventListener("click", (e) => { e.preventDefault(); switch
 let _settingsCache = [];
 
 /* 分组展示顺序 = 业务相关性（与后端 grp 取值解耦，后端不因展示顺序而改动）：
-   智能体(决定谁干活) → 通用(基础) → 存储路径(2.0：会议/模型目录可配) → 语音命令(主用法)
-   → 唤醒词 → 会议 → 纪要归档 → 模型路由 → 面板(界面) → DSH(底层接入) */
-const SET_GROUP_ORDER = ["agent", "general", "paths", "voice", "wake", "meeting", "worklog", "router", "panel", "dsh"];
-const SET_GROUP_NAMES = { agent: "智能体", general: "通用", paths: "存储路径", voice: "语音命令", wake: "唤醒词",
-  meeting: "会议", worklog: "纪要归档", router: "模型路由", panel: "面板", dsh: "DSH 服务",
-  provider: "能力 provider（在线服务与密钥）" };
+   智能体(决定谁干活) → 语音命令(主用法) → 唤醒词 → 提示音与通知 → 朗读与反馈
+   → 会议 → 纪要归档 → 命令与会话(进阶) → 面板与服务 → 存储路径 → 模型路由。
+   `model` 只在「模型」页签加载失败时出现（那 9 项回退到设置页）。 */
+const SET_GROUP_ORDER = ["agent", "model", "voice", "wake", "beep", "speech", "meeting",
+  "worklog", "command", "panel", "paths", "router", "dsh"];
+const SET_GROUP_NAMES = { agent: "智能体", model: "模型与引擎", voice: "语音命令",
+  wake: "唤醒词", beep: "提示音与通知", speech: "朗读与反馈", meeting: "会议",
+  worklog: "纪要归档", command: "命令与会话", panel: "面板与服务", paths: "存储路径",
+  router: "模型路由", dsh: "DSH 服务" };
 
 /* 模型相关配置项：从「设置」页移出，统一由「模型」页签承载（前端过滤，后端 grp 不动）。
    见下方「模型」视图：按功能展示 选择 + 就绪 + 获取。 */
@@ -984,9 +987,15 @@ $("#settingsForm").addEventListener("change", async (e) => {
     const name = toggle.dataset.agentToggle;
     const cur = _agentsCache.find((a) => a.active);
     if (cur && cur.name === name) return;                 // 点的就是当前项
+    /* 选中即启用：产品自带的"启用开关"（如 agentCodebuddyEnabled）一并打开。
+       否则会出现"开关已选中、状态却是未启用"的自相矛盾 —— 两个开关表达同一件事，
+       面板只留一个入口（2026-09-19 设置去重）。 */
+    const target = _agentsCache.find((a) => a.name === name);
+    const values = { agentBackend: name };
+    if (target && target.configKey) values[target.configKey] = true;
     try {
       await api("/api/settings", { method: "PUT",
-        body: JSON.stringify({ values: { agentBackend: name } }) });
+        body: JSON.stringify({ values }) });
       await loadAgents(false);
       renderAgentTable();                                 // 重绘：其余开关自动回弹
       const now = _agentsCache.find((a) => a.active);
@@ -1030,10 +1039,13 @@ async function renderProvidersCard(host) {
   host.innerHTML = `<div class="set-group"><div class="set-group-title">
     <span class="set-arrow">▶</span><span>能力 provider</span></div>
     <div class="set-group-body muted">读取中…</div></div>`;
-  let data = null, presets = { presets: [] };
+  let data = null, presets = { presets: [] }, cfg = { settings: [] };
   try {
     data = await api("/api/providers?ready=true");
     try { presets = await api("/api/providers/presets"); } catch (e) { presets = { presets: [] }; }
+    // 地址/模型/密钥也由本卡片承载（这些键在通用设置表单里是 hidden 的：
+    // 同一个功能两套界面是用户实测指出的设计问题，2026-09-19）
+    cfg = await api("/api/providers/config");
   } catch (e) {
     host.innerHTML = `<div class="set-group"><div class="set-group-title">
       <span class="set-arrow">▶</span><span>能力 provider</span></div>
@@ -1043,19 +1055,79 @@ async function renderProvidersCard(host) {
   const all = data.providers || [];
   const kinds = data.kinds || [];
   const byKind = (k) => all.filter((p) => p.kind === k);
+  const cfgOf = (key) => (cfg.settings || []).find((s) => s.key === key) || null;
   const readyBadge = (p) => {
     if (p.ready === true) return `<span style="color:var(--ok,#3a3)">已就绪</span>`;
     if (p.ready === false) return `<span class="muted">未就绪</span>`;
     return `<span class="muted">未知</span>`;
   };
+  // 只有在线 provider 才需要地址/模型/密钥；本地实现没有这些字段
+  const ONLINE_KINDS = { asr: { prefix: "providerAsr", on: "openai-asr" },
+                         llm: { prefix: "providerLlm", on: "openai-llm" } };
+  const field = (key, type) => {
+    const s = cfgOf(key);
+    if (!s) return "";
+    const id = "prov-" + key;
+    if (s.secret) {
+      return `<div class="set-row" style="margin:0">
+        <label for="${id}">${esc(s.label)}</label>
+        <div style="display:flex;gap:6px;align-items:center">
+          <input type="password" class="ctl" id="${id}" data-key="${key}" data-secret="1" style="flex:1"
+            value="" autocomplete="new-password"
+            placeholder="${s.hasValue ? "已配置（留空 = 不改）" : "未配置"}">
+          <button type="button" class="btn" data-clear-secret="${key}"
+            style="flex:0 0 auto;padding:2px 8px;font-size:12px" title="清空这个密钥">清除</button>
+        </div>
+      </div>`;
+    }
+    return `<div class="set-row" style="margin:0">
+      <label for="${id}">${esc(s.label)}</label>
+      <input class="ctl" id="${id}" data-key="${key}" type="${type || "text"}" value="${esc(s.value || "")}">
+      <div class="desc">${esc(s.description || "")}</div>
+    </div>`;
+  };
   let html = `<div class="set-group-title" style="padding:0 0 6px 0">
       <span>能力 provider</span>
       <span class="spacer"></span>
-      <span class="muted" style="font-size:12px">选「用哪个」；「装什么」见「组件」页签</span>
+      <span class="muted" style="font-size:12px">选「用哪个」并填在线服务的地址与密钥；「装什么」见「组件」页签</span>
     </div>`;
+  /* TTS 这一格**只显示状态、不放第二个下拉**：朗读"用哪个实现"就是设置里的
+     「语音合成引擎」（auto / edge-tts / 本平台离线引擎 / off）。卡片再给一个下拉
+     等于同一个功能两套界面，而且两个开关会互相打架（providerTts 已因此弃用，
+     2026-09-19）。这里按 ttsEngine + 就绪状态报出"当前实现"，并指路到设置里改。 */
+  const ttsStatusRow = (items, meta) => {
+    const engine = String((meta && meta.value) || "auto");
+    const edge = items.find((p) => p.id === "edge-tts") || null;
+    const offline = items.find((p) => p.id !== "edge-tts") || null;
+    let cur = null, note = "";
+    if (engine === "off") {
+      note = "已关闭朗读：复述确认、语音简报、提示语都不会出声";
+    } else if (engine === "edge-tts") {
+      cur = edge; note = "固定走微软在线合成（文本出网）";
+    } else if (engine === "auto") {
+      cur = (edge && edge.ready === true) ? edge : offline;
+      note = "自动：优先 edge-tts，不可用时回退本机离线合成";
+    } else {
+      cur = offline; note = `固定走本机离线合成（${engine}）`;
+    }
+    const name = cur ? cur.name : "已关闭";
+    const egress = (cur && cur.egress)
+      ? `<div class="desc" style="color:var(--warn,#c80)">⚠ 数据会出网：${esc(cur.egress_note || "")}</div>`
+      : `<div class="desc muted">数据不出本机</div>`;
+    return `<div class="set-row">
+      <label>${esc((meta && meta.label) || "语音合成引擎")}</label>
+      <div style="display:flex;align-items:center;gap:8px">
+        <b>${esc(name)}</b><span class="muted" style="font-size:12px">${cur ? readyBadge(cur) : ""}</span>
+      </div>
+      <div class="desc">${esc(note)}</div>
+      ${egress}
+      <div class="desc">切换请到「设置 → 朗读与反馈 → 语音合成引擎」（同一个开关，这里不重复放）</div>
+    </div>`;
+  };
   for (const k of kinds) {
     const items = byKind(k.id);
     if (!items.length) continue;
+    if (k.id === "tts") { html += ttsStatusRow(items, cfgOf("ttsEngine")); continue; }
     const opts = items.map((p) => {
       const flags = [p.egress ? "出网" : "本地", p.ready === false ? "未就绪" : ""].filter(Boolean).join("·");
       return `<option value="${esc(p.id)}" ${p.active ? "selected" : ""}>${esc(p.name)}（${esc(flags)}）</option>`;
@@ -1067,23 +1139,55 @@ async function renderProvidersCard(host) {
     html += `<div class="set-row">
       <label for="prov-${esc(k.id)}">${esc(k.label)}</label>
       <select class="ctl" id="prov-${esc(k.id)}" data-provider-kind="${esc(k.id)}">${opts}</select>
-      <div class="desc">当前：<b>${esc(cur ? cur.name : "-")}</b> · ${cur ? readyBadge(cur) : ""}</div>
+      <div class="desc">当前：<b>${esc(cur ? cur.name : "-")}</b> · ${cur ? readyBadge(cur) : ""}（选中即生效）</div>
       ${egressLine}
     </div>`;
+    // 选中的是在线实现时，就地展开它需要的地址/模型/密钥
+    const online = ONLINE_KINDS[k.id];
+    if (online && cur && cur.id === online.on) {
+      html += `<div style="border-left:3px solid var(--line,#333);padding-left:10px;margin:2px 0 10px 6px">
+        ${field(online.prefix + "BaseUrl")}
+        ${field(online.prefix + "Model")}
+        ${field(online.prefix + "ApiKey")}
+      </div>`;
+    }
   }
-  // 在线服务预设：一键把公开的地址与模型名填进对应的配置项（密钥仍要自己填）
+  // 在线服务预设：一键把公开的地址与模型名填进上面的字段（密钥仍要自己填）
   const fills = (presets.presets || []);
   if (fills.length) {
     html += `<div class="set-row"><label>在线服务预设</label><div style="display:flex;flex-wrap:wrap;gap:6px">` +
-      fills.map((p, i) => `<button class="btn-mini" data-preset-index="${i}"
-        title="${esc(p.note || "")}">${esc(p.name)}</button>`).join("") +
-      `</div><div class="desc">点一下把<b>地址与模型名</b>填进下面的配置（密钥请手动填，接口永不回显）；` +
+      fills.map((p, i) => `<button type="button" class="btn" data-preset-index="${i}"
+        style="padding:3px 10px;font-size:12px" title="${esc(p.note || "")}">${esc(p.name)}</button>`).join("") +
+      `</div><div class="desc">点一下把<b>地址与模型名</b>填进对应字段；密钥请手动填（接口永不回显）；` +
       `内网网关的地址属单位内部信息，需自己填。</div></div>`;
     host.dataset.presets = JSON.stringify(fills);
   }
-  html += `<div class="desc muted" style="padding:4px 0">地址/密钥在上方「能力 provider」分组里填（密钥留空 = 不改），` +
-    `填完点最上面的<b>保存</b>生效。</div>`;
+  html += `<div style="display:flex;gap:8px;align-items:center;padding-top:4px">
+      <button type="button" class="btn" id="btnProviderSave">保存在线服务设置</button>
+      <span class="muted" style="font-size:12px">密钥留空 = 不改；下拉选择是选中即生效</span>
+    </div>`;
   host.innerHTML = `<div class="set-group"><div class="set-group-body">${html}</div></div>`;
+
+  const save = $("#btnProviderSave");
+  if (save) save.addEventListener("click", async () => {
+    const values = {};
+    $$("#providersHost [data-key]").forEach((el) => {
+      const key = el.dataset.key;
+      const meta = cfgOf(key);
+      if (!meta) return;
+      if (meta.secret) {                       // 密钥：只提交这轮真的输入了新值的
+        if (el.value && el.value.trim()) values[key] = el.value;
+        return;
+      }
+      values[key] = el.value;
+    });
+    if (!Object.keys(values).length) { toast("没有需要保存的改动"); return; }
+    try {
+      await api("/api/settings", { method: "PUT", body: JSON.stringify({ values }) });
+      toast("已保存 " + Object.keys(values).length + " 项");
+      loadProviders();
+    } catch (err) { toast("保存失败：" + err.message); }
+  });
 }
 
 /* 选 provider：立即写配置（与"命令目标"下拉同一种交互：选中即持久化） */
@@ -1099,7 +1203,8 @@ document.addEventListener("change", async (e) => {
   } catch (err) { toast("切换失败：" + err.message); }
 });
 
-/* 在线服务预设：填入地址/模型名（密钥不动） */
+/* 在线服务预设：把公开的地址/模型名**填进卡片里的字段**（不直接保存，让用户过一眼再点保存）；
+   若对应的在线 provider 还没被选中，先把下拉切过去（否则字段没渲染出来）。 */
 document.addEventListener("click", async (e) => {
   const idx = e.target && e.target.dataset ? e.target.dataset.presetIndex : "";
   if (idx === "" || idx == null) return;
@@ -1108,20 +1213,22 @@ document.addEventListener("click", async (e) => {
   try { list = JSON.parse(host.dataset.presets || "[]"); } catch (err) { list = []; }
   const p = list[Number(idx)];
   if (!p) return;
-  const prefix = p.kind === "asr" ? "providerAsr" : "providerLlm";
-  const values = {};
-  if (p.base_url) values[prefix + "BaseUrl"] = p.base_url;
-  if (p.model) values[prefix + "Model"] = p.model;
-  if (!Object.keys(values).length) {
-    toast("这个预设需要你自己填地址（见下方配置）");
-    return;
+  const kind = p.kind === "asr" ? "asr" : "llm";
+  const prefix = kind === "asr" ? "providerAsr" : "providerLlm";
+  const onlineId = kind === "asr" ? "openai-asr" : "openai-llm";
+  const kindKey = kind === "asr" ? "providerAsr" : "providerLlm";
+  const fieldEl = (key) => $(`#providersHost [data-key="${key}"]`);
+  // 没有地址的预设（内网网关）只提示，不填
+  if (!p.base_url && !p.model) { toast("这个预设需要你自己填地址（属单位内部信息）"); return; }
+  if (!fieldEl(prefix + "BaseUrl")) {          // 在线 provider 未选中 → 先切过去
+    try {
+      await api("/api/settings", { method: "PUT", body: JSON.stringify({ values: { [kindKey]: onlineId } }) });
+    } catch (err) { toast("切换 provider 失败：" + err.message); return; }
+    await renderProvidersCard(host);
   }
-  try {
-    await api("/api/settings", { method: "PUT", body: JSON.stringify({ values }) });
-    toast("已填入地址与模型名，请补密钥后保存");
-    await loadSettings();
-    loadProviders();
-  } catch (err) { toast("填入失败：" + err.message); }
+  if (p.base_url && fieldEl(prefix + "BaseUrl")) fieldEl(prefix + "BaseUrl").value = p.base_url;
+  if (p.model && fieldEl(prefix + "Model")) fieldEl(prefix + "Model").value = p.model;
+  toast("已填入地址与模型名，请补密钥后点「保存在线服务设置」");
 });
 
 /* 「组件」页签的入口（switchView 分发到这里）。渲染逻辑复用自包含的卡片渲染器，
@@ -1264,8 +1371,12 @@ async function loadSettings() {
     const groups = {};
     // 模型相关项正常由「模型」页签承载；该页签加载失败时（_modelsTabOk=false）回退显示，
     // 免得唯一入口挂掉时连转写引擎都改不回来。
-    r.settings.filter((s) => !(_modelsTabOk && MODEL_KEYS.has(s.key)))
-      .forEach((s) => { (groups[s.grp] = groups[s.grp] || []).push(s); });
+    // 组内顺序用后端给的 `order`（= DEFAULTS 声明顺序）：/api/settings 是按 (grp, key)
+    // 字母序来的，直接渲染会把"三个提示音开关"这类编排打散（见 config.SETTING_ORDER）。
+    const rows = r.settings.filter((s) => !(_modelsTabOk && MODEL_KEYS.has(s.key)));
+    rows.sort((a, b) => ((a.order ?? 1e6) - (b.order ?? 1e6))
+      || String(a.key).localeCompare(String(b.key)));
+    rows.forEach((s) => { (groups[s.grp] = groups[s.grp] || []).push(s); });
     // 「智能体」分组的配置项都是 hidden（不进 settings），这里补一个空分组占位
     if (!groups.agent) groups.agent = [];
     // 已知分组按业务相关性排序，未知分组排到末尾（保持出现顺序）
@@ -1445,7 +1556,7 @@ function friendlyOption(key, v) {
       sherpa: "sherpa 流式（中英）" }[s] || ("Whisper " + s);
   }
   if (key === "device") return { auto: "自动（有 GPU 就用）", cpu: "CPU", cuda: "CUDA（GPU）" }[s] || s;
-  if (key === "wakeEngine") return { sherpa: "sherpa KWS", openwakeword: "openWakeWord" }[s] || s;
+  if (key === "wakeEngine") return { sherpa: "sherpa 流式识别", kws: "KWS 关键词 spotting" }[s] || s;
   return s;
 }
 
@@ -1767,6 +1878,15 @@ $("#btnSettingsSave").addEventListener("click", async () => {
     else if (meta.value_type === "float") values[key] = parseFloat(el.value) || 0;
     else values[key] = el.value;
   });
+  // apiAuthEnabled 是"双刃"开关：打开后**所有**接口（含本地面板）都要 Bearer 令牌，
+  // 而面板不带令牌 → 一开就连不上、也没法再关回来。所以强制二次确认（2026-09-19 设置审计）。
+  const authRow = _settingsCache.find((s) => s.key === "apiAuthEnabled");
+  if (authRow && !authRow.value && values.apiAuthEnabled === true) {
+    const go = window.confirm("开启「API 鉴权」后，所有接口——包括本地面板——都需要 Bearer 令牌。\n"
+      + "本地面板不带令牌：开启后会立即连不上，也不能再从这里关掉（只能带令牌或直接改配置库）。\n\n"
+      + "只有在外网访问/手机 App 场景下才需要开启。确定开启？");
+    if (!go) delete values.apiAuthEnabled;
+  }
   // 智能体展开区里改过的字段（不在表单行里，单独并进来）
   Object.keys(_agentDirty).forEach((k) => { values[k] = _agentDirty[k]; });
   try {
@@ -2115,11 +2235,44 @@ try {
   if (want && _VIEWS.includes(want)) _bootView = want;
 } catch (e) { /* 忽略 */ }
 switchView(_bootView);
+
+/* ---------------- 自动刷新：间隔取自设置 panelAutoRefresh ----------------
+   2026-09-19 审计发现这个设置项在面板上摆着却没人读（判定 DEAD），这里把它接上：
+   仪表盘/启动页/模型路由页的轮询间隔 = 该项（秒），0 = 不自动刷新。
+   1 秒一跳只是"对表"用的最小步进，真正刷不刷由 _panelRefreshDue() 判定。
+   注意：会议列表的转写进度条不受此项影响（那是进度指示，停掉就看不到进度了）。 */
+const _PANEL_TICK_MS = 1000;
+let _panelRefreshAt = 0;
+function _panelRefreshSeconds() {
+  const s = settingByKey("panelAutoRefresh");
+  const n = Number(s ? s.value : 3);          // 设置还没拉到：按默认 3 秒
+  return Number.isFinite(n) && n > 0 ? n : 0;  // 0/负数/非法 = 关闭自动刷新
+}
+function _panelRefreshDue() {
+  const sec = _panelRefreshSeconds();
+  if (!sec) return false;
+  const now = Date.now();
+  if (now - _panelRefreshAt < sec * 1000) return false;
+  _panelRefreshAt = now;
+  return true;
+}
+/* 启动时先取一次设置元数据：仪表盘轮询在进设置页之前就开始了，
+   只等 loadSettings() 会一直按默认间隔跑（用户改了也不生效）。 */
+async function loadPanelPrefs() {
+  if (_settingsCache.length) return;
+  try {
+    const r = await api("/api/settings");
+    _settingsCache = r.settings || [];
+  } catch (e) { /* 取不到就按默认 3 秒，不影响其它功能 */ }
+}
+loadPanelPrefs();
+
 setInterval(() => {
+  if (!_panelRefreshDue()) return;
   const v = $(".tab.active");
   if (v && v.dataset.view === "dashboard") refreshDashboard();
   else if (v && v.dataset.view === "boot") { loadBoot(); loadBootLogs(); }
   else if (v && v.dataset.view === "failover" && !_rtDirty && !_rtBusy()) loadRouter();
-}, 2000);
+}, _PANEL_TICK_MS);
 // 转写进度轮询（会议列表进度条）
 setInterval(pollTranscribe, 2000);

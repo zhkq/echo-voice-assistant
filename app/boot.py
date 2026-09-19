@@ -356,13 +356,14 @@ def _start_tts(report):
 
 def _start_wake(report):
     from app.config import settings
+    from app.audio.wake import engine_label
     from app import runtime
     if not settings.get("wakeEnabled", False):
         report(status="disabled", detail="未启用", progress=0.0)
         return
     ok, msg = runtime.start_wake()
     if ok:
-        report(status="online", detail="sherpa KWS", progress=1.0)
+        report(status="online", detail=engine_label(), progress=1.0)
     else:
         report(status="failed", detail=msg, error=msg)
 
