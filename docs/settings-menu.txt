@@ -55,8 +55,7 @@
 笔记库根目录：{vault}
 会议标题…
 
-面板与服务（panel）  —— 8 项
-    DSH 服务地址               dshBaseUrl                 str    = http://127.0.0.1:43120
+面板与服务（panel）  —— 7 项
     ECHO 面板端口              serverPort                 int    = 8970
     仪表盘热键                  panelHotkey                str    = Ctrl+Shift+E
     仪表盘打开方式                panelOpenMode              str    = sidebar
@@ -78,4 +77,4 @@
     熔断连续失败次数               routerBreakerThreshold     int    = 2
     熔断冷却秒                  routerBreakerCooldown      int    = 30
 
-可见项合计：60（含智能体表格 1 块 + 能力 provider 卡片 1 块）
+可见项合计：59（含智能体表格 1 块 + 能力 provider 卡片 1 块）

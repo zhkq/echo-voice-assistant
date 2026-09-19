@@ -150,8 +150,10 @@ CARD_CONFIG_KEYS = ("ttsEngine",)
 # deprecated=True 的项不进入设置窗口（all() 会过滤），仅保留兼容读取。
 DEFAULTS = {
     # ---------- 面板 / 服务（ECHO 自己的运行参数：端口、鉴权、界面行为）----------
-    "dshBaseUrl":      dict(value="http://127.0.0.1:43120", grp="panel", label="DSH 服务地址",
-                            description="DSH Desktop 2.x 的 Web 服务地址（GUI 与 API 同端口，默认 43120）", value_type="str"),
+    # 注：`dshBaseUrl` 不在这里 —— 它是"DSH 这个智能体"的参数，归 <agent> 组并标 hidden
+    # （见文件末尾 agent 分组那几行），由智能体表格的展开区编辑，
+    # 值经 GET /api/agents 的 settings 字段下发。
+    # 2026-09-19 用户实测："下面的 dsh 没必要吧，或者把端口挪上去"。
     "serverPort":      dict(value=8970, grp="panel", label="ECHO 面板端口",
                             description="控制面板与 API 的监听端口（8890 曾被系统保留段占用，改用 8970）", value_type="int"),
     # ---------- 语音命令 → 命令与会话（二级子分组，见 grp/sub 的说明）----------
@@ -389,8 +391,13 @@ DEFAULTS = {
     # 本分组的展示完全由面板的"智能体表格"接管（见 web/app.js renderAgentTable）：
     #   * agentBackend = 当前选中哪个产品（单选语义由表格的互斥开关维护），
     #                    仍由注册表 active_name() 读取，但不作为表单行展示；
-    #   * agentCustomPath = CLI 类产品的可执行文件路径，在表格展开区里渲染。
-    # 三者都 hidden=True：不进 /api/settings 的 settings 列表，只走 agents 字段与本行内联。
+    #   * agentCustomPath = CLI 类产品的可执行文件路径，在表格展开区里渲染；
+    #   * dshBaseUrl = DSH 的服务地址，同样在 DSH 那一行的展开区里渲染
+    #     （2026-09-19 从「面板与服务」挪上来：摊在那儿用户不知道它跟谁有关）。
+    # 这些都 hidden=True：不进 /api/settings 的 settings 列表，只走 agents 字段与本行内联。
+    "dshBaseUrl":      dict(value="http://127.0.0.1:43120", grp="agent", label="DSH 服务地址",
+                            description="DSH Desktop 2.x 的 Web 服务地址（GUI 与 API 同端口，默认 43120）",
+                            value_type="str", hidden=True),
     "agentBackend": dict(value="dsh", grp="agent", label="执行智能体",
                          description="ECHO 把命令与会议纪要交给哪个智能体执行；"
                                      "在面板的智能体表格里切换。默认 DSH",

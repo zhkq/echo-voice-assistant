@@ -119,6 +119,8 @@ class DshAgent(AgentAdapter):
     vendor = "DeepSeek Harness"
     description = "DSH Desktop 2.x 本机 JSON-RPC（GUI 与 API 同端口，默认 43120）"
     config_key = ""                       # DSH 是默认后端，不设启用开关
+    #: DSH 自己的配置项：服务地址（面板在智能体表格的展开区里编辑，不再占设置页分组）
+    settings_keys = ("dshBaseUrl",)
     capabilities = ("workspace", "session", "cancel", "history")
 
     def __init__(self, base_url=None):

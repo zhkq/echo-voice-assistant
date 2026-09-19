@@ -163,8 +163,35 @@ def active_agent():
 
 # ------------------------------------------------------------------ 面板数据
 
+def agent_settings(cls):
+    """某个智能体自己的配置项（面板在它的展开区里渲染）。
+
+    为什么走这条路而不是 /api/settings：这些键在 `config.DEFAULTS` 里标了 ``hidden``
+    （不占设置页分组 —— "DSH 服务地址"摊在「面板与服务」里，用户根本不知道它跟谁有关，
+    2026-09-19 用户实测原话："下面的 dsh 没必要吧，或者把端口挪上去"），
+    于是 `settings.all()` 不下发它们，面板就需要另一条路读到当前值。
+    只回**非密钥**项：密钥永远不出接口（这个名单里也不该有密钥）。
+    """
+    from app.config import DEFAULTS, _effective_options
+    from app.config import settings as _s
+    rows = []
+    for key in getattr(cls, "settings_keys", ()) or ():
+        meta = DEFAULTS.get(key)
+        if not meta or meta.get("secret"):
+            continue
+        rows.append({
+            "key": key,
+            "label": meta["label"],
+            "description": meta["description"],
+            "value_type": meta["value_type"],
+            "options": list(_effective_options(key, meta)),
+            "value": _s.get(key, meta["value"]),
+        })
+    return rows
+
+
 def list_agents(probe=False):
-    """面板用：每个智能体的元信息 + 启用态 + 可用性。"""
+    """面板用：每个智能体的元信息 + 启用态 + 可用性 + 它自己的配置项。"""
     active = None
     try:
         active = active_name()
@@ -178,6 +205,7 @@ def list_agents(probe=False):
             "vendor": getattr(cls, "vendor", ""),
             "description": getattr(cls, "description", ""),
             "configKey": getattr(cls, "config_key", ""),
+            "settings": agent_settings(cls),
             "capabilities": list(getattr(cls, "capabilities", ())),
             "enabled": is_enabled(cls.name),
             "active": cls.name == active,

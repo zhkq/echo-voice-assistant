@@ -188,6 +188,9 @@ class CodeBuddyAgent(AgentAdapter):
     description = ("CodeBuddy Code CLI 无头模式（-p）。WorkBuddy 桌面端内置同一引擎；"
                    "每次调用一个独立进程，直接拿到最终回复")
     config_key = "agentCodebuddyEnabled"
+    #: 它自己的配置项：CLI 路径（面板在展开区里编辑；原来靠 settingsValue() 取，
+    #  而那个键是 hidden 的、/api/settings 根本不下发 → 一直是空框，属隐藏 bug）
+    settings_keys = ("agentCustomPath",)
     capabilities = ("workspace", "session", "cancel")
 
     def __init__(self):

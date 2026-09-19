@@ -949,7 +949,13 @@ function renderAgentTable() {
     <div class="agent-detail" id="agentDetail">${agentDetailHtml()}</div>`;
 }
 
-/** 当前选中智能体的展开设置内容。 */
+/** 当前选中智能体的展开设置内容。
+ *
+ *  它自己的配置项来自 `/api/agents` 的 `settings` 字段（后端按适配器的 `settings_keys` 组装）——
+ *  这些键在设置页里是 hidden 的：把"DSH 服务地址"摊在「面板与服务」里，用户根本不知道它跟谁有关
+ *  （2026-09-19 实测反馈："下面的 dsh 没必要吧，或者把端口挪上去"）。现在它们长在对应智能体的
+ *  展开区里，与"检测"、状态说明同处一地。
+ */
 function agentDetailHtml() {
   const cur = _agentsCache.find((a) => a.active);
   if (!cur) {
@@ -957,17 +963,26 @@ function agentDetailHtml() {
   }
   const probeBtn = `<button type="button" class="btn" data-agent-probe="${esc(cur.name)}"
       title="重新探测该智能体是否可用">检测</button>`;
-  const fields = [];
-  if (cur.name === "codebuddy") {
-    const v = _agentDirty.agentCustomPath !== undefined
-      ? _agentDirty.agentCustomPath : (settingsValue("agentCustomPath") || "");
-    fields.push(`<div class="agent-field">
-      <label for="agent-custom-path">CLI 路径</label>
-      <input class="ctl" id="agent-custom-path" data-agent-field="agentCustomPath"
-             value="${esc(v)}" placeholder="留空 = 自动探测（PATH → WorkBuddy 内置目录）">
-      <div class="desc">仅当自动探测失败时才需要手填可执行文件路径</div>
-    </div>`);
-  }
+  const fields = (cur.settings || []).map((s) => {
+    const id = "agent-set-" + s.key;
+    const cur_val = _agentDirty[s.key] !== undefined ? _agentDirty[s.key] : s.value;
+    let ctl;
+    if (s.value_type === "bool") {
+      ctl = `<input type="checkbox" class="ctl" id="${id}" data-agent-field="${esc(s.key)}"
+               ${cur_val ? "checked" : ""}>`;
+    } else if (s.options && s.options.length) {
+      ctl = `<select class="ctl" id="${id}" data-agent-field="${esc(s.key)}">` +
+        s.options.map((o) => `<option value="${esc(o)}" ${String(o) === String(cur_val) ? "selected" : ""}>` +
+          `${esc(o)}</option>`).join("") + `</select>`;
+    } else {
+      ctl = `<input class="ctl" id="${id}" data-agent-field="${esc(s.key)}" value="${esc(cur_val || "")}">`;
+    }
+    return `<div class="agent-field">
+      <label for="${id}">${esc(s.label)}</label>
+      ${ctl}
+      <div class="desc">${esc(s.description || "")}</div>
+    </div>`;
+  });
   const note = cur.reason
     ? `<div class="agent-detail-msg ${cur.available ? "ok" : "warn"}">${
         cur.available ? "✅ " : "⚠ "}${esc(cur.reason)}</div>`
@@ -981,12 +996,6 @@ function agentDetailHtml() {
     </div>
     <div class="agent-detail-desc">${esc(cur.description || "")}</div>
     ${fields.join("")}${note}${warn}`;
-}
-
-/** 取某个配置项的当前值（展开区输入框回填用）。 */
-function settingsValue(key) {
-  const s = _settingsCache.find((x) => x.key === key);
-  return s ? s.value : "";
 }
 
 /** 拉取智能体可用性；probe=true 时做重探测（会真的执行 CLI 探测）。 */
