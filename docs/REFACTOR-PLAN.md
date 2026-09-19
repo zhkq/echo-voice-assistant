@@ -1306,6 +1306,34 @@ powershell -File scripts\switch-instance.ps1 -InstallAutostart
 4. **配置兼容测试**——库里用户显式改过的值，不得被 2.0 的 `PLATFORM_DEFAULTS` 覆盖。
 5. `scripts/check-windows.ps1` 作为提交门槛（已有）+ 加 mac CI（D12）。
 
+**落地状态（2026-09-19 "安全网轮"，第 1–4 项已完成并进门禁：206 → 352 个单测）**
+
+| 项 | 落地文件 | 用例 | 钉住了什么 |
+|---|---|---|---|
+| 1 API 契约 | `tests/test_api_contract.py` | 21 | `/api/meeting/start\|stop\|status` 的方法/结构/失败语义（200+`ok:false`）、`data\echo-port.txt` 的位置与读写语义、**SKILL.md 与路由/端口层交叉核对**（文档漂移即红） |
+| 2 characterization | `tests/test_runtime_hotkey.py`、`tests/test_boot_state.py`、`tests/test_security.py`（补 `_safe_under` 边界） | 45 + 32 + 6 | 热键解析/注册/钩子派发与拦截；`runtime._hotkey_cb` 分派矩阵、边条启动参数与跳过原因、面板去抖；boot 状态机与手动启停；`_safe_under` 的 base/空段/跨盘符边界（recorder 设备选择已有 `test_recorder_device_choice.py`） |
+| 3 真实数据夹具 | `tests/fixtures/echo-1x-structure.json`（**只有结构，无一行数据**）+ `tests/test_db_upgrade.py` | 16 | 代码建库与真实 1.x 库**逐列相同**；v1→v4 迁移不丢数据、明文 API 密钥迁移后仍是同一把钥匙；声纹 BLOB 往返。真库验证走 `ECHO_REAL_DB` **opt-in**（对副本只读比对） |
+| 4 配置兼容 | `tests/test_config_compat.py` | 27 | 用户显式改过的值不被 `seed_defaults()`/2.0 新默认值覆盖；`DEFAULT_MIGRATIONS` 只在"仍等于旧默认值"时改写；`False`/list/int 往返不丢；弃用项仍可读但不上面板 |
+| 5 门禁 | `scripts/check-windows.ps1`（五项 PASS） | — | mac CI 仍属 P3（D12） |
+
+**这轮测试当场抓出的两个小缺陷（都已修）**——都属于"静默失灵"：
+
+- `hotkey.parse_hotkey_combo`：`"+V"` / `"Meta+V"` 原本会解析成 mods 只剩
+  `MOD_NOREPEAT` 的**全局裸键 V**（`RegisterHotKey` 装上去会把系统里所有 V 键吞掉），
+  而单独写 `"V"` 早被 `len(parts)<2` 拒掉 —— 判据现在统一：没识别到修饰键 = 无效；
+- `boot.register`：重复 register 同一 id 会重复进 `_ORDER`，`snapshot()` 把组件列两遍、
+  `summary.total` 翻倍（P3 之后若加热重载就会踩到），现已幂等。
+
+**仍缺 / 已知边界**：
+
+- 真库 opt-in 用例默认 **skip**（4 个）：需要本机有一份 `echo.db` 副本并设 `ECHO_REAL_DB`，
+  见 `tests/test_db_upgrade.py` 头部命令。本轮已在本机实测通过
+  （39 会议 / 16745 转写行 / 195 说话人 / **4 声纹样本** / 226 说话人嵌入，升级前后完全一致）。
+- **为什么夹具只存结构**：真库含会议转写全文与声纹（生物特征），**绝不入库**；
+  结构快照（表/列/index/schema_version）足以看住"改列没迁移"这类分叉。
+- 安全网只覆盖"行为契约"，**不覆盖** P3 要搬的 Windows API 语义（钩子/ShellExecute/
+  creationflags 等）—— 那些靠本文件钉住的**调用形状** + 搬迁后逐项对照。
+
 ### 13.9 执行顺序
 
 1. ✅ 单实例锁 + 守护脚本识别"正在启动" + 路由锁与冷却（§13.7）；
