@@ -856,7 +856,7 @@ r.events             # → 面板"看会话"
 | **S5** | ✅ 通过 | 全程 `~/.dsh` 时间戳未变、13 个既有 session 完好；隔离 home 自建 `profiles/ sessions/ storages/` |
 | **S13** | ⚠️ 部分 | **存储层成立**：web profile 的 `session-persistence-jsonl` 根同样是 `dshHomePath('sessions')`，与 `sdk` 同一个库。**并发无锁冲突成立**：两个 SDK 进程并行使用同一 home，各 2.6 s 双双成功、会话各自落盘。**但 `dsh --profile web` 起不来**：插件树无法解析 `@deepseek-ai/dsh-session-title-llm`（`--dump-config` 正常，一启动就失败）→ **官方 0.1.5rc1 的打包缺陷** |
 | **S11** | ✅ 通过 | **引擎不依赖 ASCII 路径**，因此 `meetingsDir` **不需要**强制 ASCII。证据：SenseVoice 与 Qwen3-ASR 在同一次运行内，ASCII 路径与中文路径的输出**逐字节相同**（sha 一致）；whisper 在 18 MB / 约 10 分钟音频上各跑 3 次——ASCII 2293/2170/2243 字、中文 2389/2414/2196 字，两边都稳定有输出（逐次不同属引擎自身非确定性）。⚠️ **方法学教训见下**：第一次单次 A/B 得出的是相反结论 |
-| **S8** | ⬜ 未做（仅完成可行性评估） | 安排在 P3 之前（用 `app/platform/` 骨架替换 `sys.modules` 注入后跑 Windows 全量冒烟）。**可行性评估已完成**：见 `docs/2.0-PROGRESS.md` 第十九节——平台专有信号已逐类盘点（`sys.platform` 2 / `os.name==nt` 12 / Windows API 导入 13 / `LOCALAPPDATA` 类 10 / SAPI 45 / WebView2 10），且 mac 五个模块在 Windows 上全部可导入 → 结论是"接缝可行性问题基本消除，剩下的纯是 P3 搬迁工作量"。但**判定标准里的实测（骨架替换 `sys.modules` 注入后跑冒烟）仍未做**，故 S8 本身仍记 ⬜ |
+| **S8** | ⚠️ 部分（2026-09-19 二轮后：接缝已能承载运行时替换） | 安排在 P3 之前（用 `app/platform/` 骨架替换 `sys.modules` 注入后跑 Windows 全量冒烟）。**可行性评估**见 `docs/2.0-PROGRESS.md` 第十九节（平台专有信号逐类盘点、mac 五模块在 Windows 全部可导入）。**实测进展**：热键实现在 `app/platform/<os>/hotkey.py` 落地后，不再需要 `sys.modules` 注入 —— `tests/test_runtime_hotkey.py::FacadeTests` 把 `echo_platform.current()` 切到 `darwin`/`linux`，`hotkey_impl()` 即解析到 POSIX 实现；Windows 全量冒烟（364 单测）通过。**仍差**：`mac/run_mac.py` 依旧注入 `app.runtime`（mac 边条/唤醒宿主 = D19 未做），所以"骨架完全替换注入"这一步没有走完，故记 ⚠️ 而非 ✅ |
 
 **⚠️ 对 D26 的影响（重要）**：`dsh --profile web` 这条路径在当前 RC 上**不可用**。P6 的两条会话
 路径里，**"面板内嵌会话视图"（消费 `RunResult.events`）是可靠的那条**；"ECHO 自带 web 实例"
@@ -1441,7 +1441,14 @@ import 时就把缓存路径算死）。落点：`app/main.py` 的 lifespan 里 
   这样展示类不必在白名单里开口子，守卫可以对整个 `app/` 严格。
 - **D30 已实现**：`app/main.py` 的 lifespan 在 `seed_defaults()` 后、`boot.setup()` 前按
   `paths.hf_home()` 设 `HF_HOME`（未配 `modelsDir` 时不动）；两处 `setdefault` 保留为兜底。
-- **S8 仍未做**：第十九节的可行性评估只覆盖"盘点与导入冒烟"，判定标准里的骨架替换实测未做，
-  故 §9.1 那一行保持 ⬜ 并已补注（原来两处记载看起来矛盾）。
-- **注意**：清点清零 ≠ D12 收口完毕。`audit-paths.py` 不扫 Windows API 调用与
-  `tasklist`/硬编码 flags 这类"运行时替换"，那部分仍是 P3 的后续工作量。
+- **运行时替换已收口（2026-09-19 二轮）**：`audit-paths.py` 补了 `WINDOWS_API` /
+  `WINDOWS_SHELL` / `HARDCODED_FLAGS` 三条规则后，把 `app/hotkey.py`（整个 Windows 实现）、
+  `audio/tts.py` 的 `winsound`+SAPI、`assistant.py` 的通知、`runtime.py` 的
+  `tasklist`/flags/`ShellExecute`/边条路径、`modelinfo.py` 的安装命令全部搬进
+  `app/platform/`；`--check` 六条规则全零，364 单测通过。明细见
+  `docs/P3-收口施工方案.md` §11。
+- **S8 进展**：接缝已能按平台选实现（新增用例把 `current()` 切到 darwin/linux 即验证），
+  但 `mac/run_mac.py` 仍注入 `app.runtime`（D19 的 mac 常驻宿主未做）→ 记 ⚠️ 部分完成。
+- **注意**：清点清零 ≠ D12 收口完毕。`app/platform/` 里仍留着一批**未在 mac 上实测**的
+  实现（`say`/`afplay`/`open`/pynput 授权）；D11 的"配置默认值声明式化"（如 `ttsEngine`
+  候选按平台给）也还没做。
