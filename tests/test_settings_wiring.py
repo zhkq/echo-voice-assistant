@@ -493,6 +493,20 @@ class OptionAndPanelWiringTests(unittest.TestCase):
         self.assertNotIn("cap-prov-state", js, "不该再单列一遍各实现的状态")
         self.assertNotIn("cap-prov-row", js, "下拉行不再需要标签行容器")
 
+    def test_egress_warning_is_an_icon_with_a_tooltip(self):
+        """出网提醒＝黄色三角图标 + 悬停 title（2026-09-19 用户要求：别占一整行）。"""
+        js = _read(os.path.join("web", "app.js"))
+        css = _read(os.path.join("web", "app.css"))
+        self.assertIn("function capEgress(", js, "出网判断要单独成函数（图标与文案共用一份判据）")
+        self.assertIn("function capEgressIcon(", js)
+        self.assertIn('class="cap-egress"', js)
+        self.assertIn('title="${esc(tip)}"', js, "说明文字要进 title（悬停浮出）")
+        self.assertIn(".cap-egress", css, "图标样式（含 cursor:help）")
+        self.assertIn("cursor: help", css)
+        # 原来那种占一整行的 "⚠ 数据会出网：…" 与 "数据不出本机" 都不该再作为行渲染
+        self.assertNotIn("⚠ 数据会出网", js)
+        self.assertNotIn("数据不出本机", js)
+
     def test_agent_switch_also_enables_the_product(self):
         """智能体开关即单选：选中时要把该产品的启用开关一起打开，避免自相矛盾。"""
         js = _read(os.path.join("web", "app.js"))

@@ -1197,10 +1197,44 @@ function capTtsOptionLabel(engine, provs) {
   return capOptLabel(`本机离线合成（${engine}）`, offline);
 }
 
-/** 「用哪个实现」区块：下拉（选中即生效）+ 出网标注 + 在线服务的地址/模型/密钥。
+/** 当前选中的实现会不会出网：``{on, note}``（note = "发什么、给谁"）。
+    判断只有这一处：卡片上那个黄色三角图标由它决定，弹不弹、说什么都在这里。 */
+function capEgress(kind) {
+  const provs = ((_capCache.prov || {}).providers || []).filter((p) => p.kind === kind);
+  if (kind === "tts") {
+    const engine = String((settingByKey("ttsEngine") || {}).value || "auto");
+    const edge = provs.find((p) => p.id === "edge-tts");
+    const on = engine === "edge-tts" || (engine === "auto" && edge && edge.ready !== false);
+    return { on: !!on, note: (edge && edge.egress_note) || "被朗读的文本会发送到微软合成语音" };
+  }
+  const cur = provs.find((p) => p.active) || provs[0];
+  return cur && cur.egress ? { on: true, note: cur.egress_note || "" } : { on: false, note: "" };
+}
 
-    刻意只留这两样：下拉本身已经带了「出网/本地 · 就绪」，再补一行"当前 …"、
-    或再列一遍"两种实现"，都是同一份状态的第三、第四份拷贝（用户实测反馈）。
+/** 出网提醒：黄色三角叹号图标，鼠标悬停用原生 title 浮出说明。
+ *
+ *  2026-09-19 用户要求："数据出网提醒改成找合适位置显示黄色三角叹号的标，鼠标放上去浮动显示提示内容"
+ *  —— 原来它占一整行（一行"数据会出网：…"），三张卡各一行，卡片被撑长；而且这句话只在
+ *  选中的实现确实会出网时才成立。现在收成一个图标，放在"用哪个实现"下拉的右边（贴着它所指的对象），
+ *  说明进 title（与面板其它 30 多处提示同一套做法）。**不出网时什么都不显示**（选项里已写"本地"）。
+ */
+function capEgressIcon(kind) {
+  const e = capEgress(kind);
+  if (!e.on) return "";
+  const tip = "数据会出网：" + (e.note || "内容会发到外部服务");
+  return `<span class="cap-egress" title="${esc(tip)}" aria-label="${esc(tip)}" role="img">
+      <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">
+        <path d="M12 2.6 22.4 21H1.6Z" fill="#f5b301" stroke="#8a6a00" stroke-width="1.2"
+              stroke-linejoin="round"/>
+        <path d="M12 9.2v5.4" stroke="#4a3800" stroke-width="2.1" stroke-linecap="round"/>
+        <circle cx="12" cy="17.8" r="1.25" fill="#4a3800"/>
+      </svg></span>`;
+}
+
+/** 「用哪个实现」区块：下拉（选中即生效）+ 出网图标 + 在线服务的地址/模型/密钥。
+ *
+ *  刻意只留这些：下拉自带「出网/本地 · 就绪」，再补一行"当前 …"、或再列一遍"两种实现"，
+ *  都是同一份状态的第三、第四份拷贝（用户实测反馈）；出网说明也从一整行收成三角图标。
  */
 function capProviderBlock(kind) {
   const provs = ((_capCache.prov || {}).providers || []).filter((p) => p.kind === kind);
@@ -1222,19 +1256,10 @@ function capProviderBlock(kind) {
         `<option value="${esc(p.id)}" ${p.active ? "selected" : ""}>` +
         `${esc(capOptLabel(p.name, p))}</option>`).join("") + `</select>`;
   }
-  let egress;
-  if (isTts) {
-    const engine = String((settingByKey("ttsEngine") || {}).value || "auto");
-    const edge = provs.find((p) => p.id === "edge-tts");
-    egress = (engine === "edge-tts" || (engine === "auto" && edge && edge.ready !== false))
-      ? `<div class="desc" style="color:var(--warn,#c80)">⚠ 数据会出网：${esc((edge && edge.egress_note) || "被朗读的文本会发送到微软合成语音")}</div>`
-      : `<div class="desc muted">数据不出本机</div>`;
-  } else {
-    egress = cur.egress
-      ? `<div class="desc" style="color:var(--warn,#c80)">⚠ 数据会出网：${esc(cur.egress_note || "")}</div>`
-      : `<div class="desc muted">数据不出本机</div>`;
-  }
-  return `<div class="cap-prov">${select}${egress}${capOnlineBlock(kind, cur)}</div>`;
+  return `<div class="cap-prov">
+      <div class="cap-pick">${select}${capEgressIcon(kind)}</div>
+      ${capOnlineBlock(kind, cur)}
+    </div>`;
 }
 
 /** 选中在线实现时就地展开它需要的地址/模型/密钥（+ 预设 + 保存）。 */

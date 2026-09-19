@@ -369,10 +369,14 @@ main { max-width: 1200px; margin: 12px auto; padding: 0 14px; }
 .set-row input[type="checkbox"] { width: 18px; height: 18px; accent-color: var(--accent); }
 
 /* ---------- 能力页签（2026-09-19 合并 模型/组件/provider 三处） ---------- */
-/* 一张能力卡里：一个下拉（选项自带"出网/本地 · 就绪"）+ 出网说明 + 在线服务字段 + 组件表。
-   刻意不给下拉再挂"当前实现"之类的附属行 —— 同一份状态只显示一次（用户实测反馈）。 */
+/* 一张能力卡里：一个下拉（选项自带"出网/本地 · 就绪"）+ 出网三角图标 + 在线服务字段 + 组件表。
+   刻意不给下拉再挂"当前实现"之类的附属行 —— 同一份状态只显示一次（用户实测反馈）；
+   出网说明收成下拉右边的黄色三角，悬停看 title。 */
 .cap-prov { margin: 2px 0 8px; }
+.cap-pick { display: flex; align-items: center; gap: 8px; }
 .cap-prov .ctl { width: 100%; max-width: 420px; }
+.cap-egress { display: inline-flex; align-items: center; flex-shrink: 0; cursor: help; }
+.cap-egress svg { display: block; filter: drop-shadow(0 0 2px rgba(245, 179, 1, .5)); }
 .cap-online { border-left: 3px solid var(--border); padding-left: 10px; margin: 6px 0 4px 6px; }
 .cap-sub {
   margin: 10px 0 4px; font-size: 12px; color: var(--muted); font-weight: 600;
