@@ -273,7 +273,7 @@ class WakeListener(threading.Thread):
             print(f"[wake] 唤醒监听崩溃: {e}", flush=True)
 
     def _run_impl(self):
-        import sounddevice as sd
+        from app.audio.mic import input_stream, MicrophoneBusy
         import numpy as np
 
         detector = self._make_detector()
@@ -305,10 +305,13 @@ class WakeListener(threading.Thread):
                 time.sleep(0.5)
                 continue
             try:
-                with sd.InputStream(samplerate=SR, channels=1, dtype="int16",
-                                    device=device, blocksize=BLOCK) as mic:
+                fire = False
+                with input_stream(device if device is not None else -1,
+                                  blocksize=BLOCK, background=True) as mic:
                     print(f"[wake] 麦克风就绪 (device={mic.device})", flush=True)
                     while not self._stop_flag.is_set():
+                        if self.settings_get("wakePaused", True):
+                            break
                         x, _ = mic.read(BLOCK)
                         x = x.reshape(-1)
                         rms = float(np.sqrt((x.astype(np.float32) ** 2).mean()))
@@ -334,13 +337,19 @@ class WakeListener(threading.Thread):
                             continue
                         last_fire = now
                         print("[wake] 唤醒词命中 -> 触发命令录音")
-                        try:
-                            self.on_wake()
-                        except Exception as e:
-                            print(f"[wake] 回调异常: {e}")
+                        fire = True
+                        break
+                # Release the input stream before starting command capture.
+                if fire and not self._stop_flag.is_set():
+                    try:
+                        self.on_wake()
+                    except Exception as e:
+                        print(f"[wake] 回调异常: {e}")
+            except MicrophoneBusy:
+                self._stop_flag.wait(0.2)
             except Exception as e:
                 print(f"[wake] 麦克风监听中断，3 秒后重连: {e}")
-                time.sleep(3)
+                self._stop_flag.wait(3)
 
 
 def _to_kws_pinyin(text):

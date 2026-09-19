@@ -14,6 +14,10 @@ import sys
 # ---- 路径：项目根目录 + mac/ 目录都放进 sys.path ----
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MAC_DIR = os.path.join(BASE_DIR, "mac")
+# Preserve existing source-checkout installations across the 2.0 path migration.
+# Explicit ECHO_DATA always wins; fresh installations use the platform default.
+if not os.environ.get("ECHO_DATA") and os.path.isfile(os.path.join(BASE_DIR, "data", "echo.db")):
+    os.environ["ECHO_DATA"] = os.path.join(BASE_DIR, "data")
 for p in (BASE_DIR, MAC_DIR):
     if p not in sys.path:
         sys.path.insert(0, p)

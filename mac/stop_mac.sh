@@ -3,6 +3,10 @@
 DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$DIR"
 
+if [ -z "${ECHO_DATA:-}" ] && [ -f "$DIR/data/echo.db" ]; then
+  export ECHO_DATA="$DIR/data"
+fi
+
 PID_FILE="data/echo-mac.pid"
 PORT="$(./venv/bin/python -c "from app.config import settings; print(int(settings.get('serverPort', 8970)))" 2>/dev/null || echo 8970)"
 

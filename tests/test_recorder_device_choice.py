@@ -48,10 +48,28 @@ def _fake_sd(devices, fail=None, default=(1, 4)):
 
 class MicChoiceTests(unittest.TestCase):
     def setUp(self):
+        platform = patch.object(recorder.echo_platform, "isolates_audio_capture",
+                                return_value=False)
+        platform.start()
+        self.addCleanup(platform.stop)
         # _log_record 会写 DB logs 表，测试里不要污染真实库
         self._patch_log = patch.object(recorder, "_log_record", lambda *a, **k: None)
         self._patch_log.start()
         self.addCleanup(self._patch_log.stop)
+
+    def test_mac_does_not_probe_other_devices_on_default_failure(self):
+        sd = _fake_sd([(1, "iPhone microphone", 1), (2, "Built-in", 1)], fail={None})
+        with patch.object(recorder.echo_platform, "isolates_audio_capture", return_value=True), \
+                patch.dict(sys.modules, {"sounddevice": sd}):
+            with self.assertRaisesRegex(RuntimeError, "未自动尝试"):
+                recorder._open_input(-1)
+        self.assertEqual(sd.attempts, [None])
+
+    def test_default_success_does_not_enumerate_devices(self):
+        sd = _fake_sd([])
+        sd.query_devices = lambda: self.fail("must not enumerate")
+        with patch.dict(sys.modules, {"sounddevice": sd}):
+            recorder._open_input(-1)
 
     def test_default_input_first(self):
         sd = _fake_sd([(0, "Microsoft 声音映射器 - Input", 2),

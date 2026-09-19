@@ -7,6 +7,7 @@ from unittest.mock import patch
 import numpy as np
 
 from app.audio import recorder
+from app.audio import mic
 
 
 class _FakeStream:
@@ -25,7 +26,7 @@ class _FakeStream:
 class MeetingRecorderStartupTests(unittest.TestCase):
     def test_wait_started_true_when_stream_opens(self):
         with tempfile.TemporaryDirectory() as tmp:
-            with patch.object(recorder, "_open_input", return_value=_FakeStream()):
+            with patch.object(mic, "_new_stream", return_value=_FakeStream()):
                 rec = recorder.MeetingRecorder(tmp, device_id=1)
                 rec.start()
                 try:
@@ -39,7 +40,7 @@ class MeetingRecorderStartupTests(unittest.TestCase):
             raise RuntimeError("没有可用的输入设备")
 
         with tempfile.TemporaryDirectory() as tmp:
-            with patch.object(recorder, "_open_input", side_effect=boom):
+            with patch.object(mic, "_new_stream", side_effect=boom):
                 rec = recorder.MeetingRecorder(tmp, device_id=0)
                 rec.start()
                 self.assertFalse(rec.wait_started(timeout=2))
@@ -50,7 +51,7 @@ class MeetingRecorderStartupTests(unittest.TestCase):
             raise RuntimeError("设备打开失败")
 
         with tempfile.TemporaryDirectory() as tmp:
-            with patch.object(recorder, "_open_input", side_effect=boom):
+            with patch.object(mic, "_new_stream", side_effect=boom):
                 rec = recorder.MeetingRecorder(tmp, device_id=0)
                 rec.start()
                 rec.wait_started(timeout=2)

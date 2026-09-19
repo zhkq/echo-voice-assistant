@@ -5,6 +5,10 @@ set -e
 DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$DIR"
 
+if [ -z "${ECHO_DATA:-}" ] && [ -f "$DIR/data/echo.db" ]; then
+  export ECHO_DATA="$DIR/data"
+fi
+
 if [ ! -x ./venv/bin/python ]; then
   echo "尚未初始化环境，请先运行： mac/setup_mac.sh"
   exit 1

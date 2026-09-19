@@ -76,6 +76,17 @@ def no_window_creationflags() -> int:
     return int(fn()) if callable(fn) else 0
 
 
+def isolates_audio_capture() -> bool:
+    """音频采集是否必须隔离到可回收的子进程。
+
+    macOS 的 CoreAudio 可能被虚拟/接力设备（Oray、iPhone 麦克风…）锁死，锁死后
+    进程内无法自愈、开麦永久超时并空转占满 CPU（issue #15）。所以 darwin 上采集
+    放进独立子进程，卡住可以直接 kill 释放设备；Windows/Linux 直接在进程内采集。
+    这是平台分支，按 D12 只允许存在于接缝里。
+    """
+    return current() == "darwin"
+
+
 def chromium_candidates():
     """Chromium 系浏览器可执行文件候选（调用方自行 expandvars / 判存在）。"""
     fn = _platform_fn("chromium_candidates")

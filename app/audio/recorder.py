@@ -6,7 +6,7 @@
   MeetingRecorder       会议录音线程：持续录，按 segment_minutes 自动分段，
                         实时输出音量电平（供面板波形）
 
-录音期间任何异常都会抛给调用方；麦克风不可用时不阻塞（返回 None）。
+命令录音失败返回 False；会议录音失败保存已收到的音频并记录 error。
 """
 import os
 import threading
@@ -14,6 +14,8 @@ import time
 import wave
 
 import numpy as np
+from app import platform as echo_platform
+from app.audio.mic import input_stream
 
 SAMPLE_RATE = 16000
 
@@ -23,7 +25,8 @@ SAMPLE_RATE = 16000
 # 注意：只过滤兜底遍历；用户显式指定的设备、以及系统默认输入都不受此限制。
 _VIRTUAL_HINTS = ("声音映射器", "sound mapper", "映射器", "立体声混音", "stereo mix",
                   "virtual", "虚拟", "voicemeeter", "vb-audio", "cable", "loopback",
-                  "blackhole", "soundflower", "aggregate", "汇总", "oray")
+                  "blackhole", "soundflower", "aggregate", "汇总", "oray",
+                  "iphone", "continuity", "接力")
 
 
 def _is_virtual_device(name):
@@ -35,7 +38,8 @@ def _is_virtual_device(name):
 def _open_input(device_id=-1, blocksize=0):
     """打开可用的输入流。
 
-    依次尝试：指定设备 → 系统默认输入 → 遍历全部输入设备；
+    macOS 只尝试指定设备或系统默认输入，不遍历其它设备。
+    其它平台在首选失败后遍历非虚拟输入设备；
     只要「能打开」就用（不做环境电平筛选——蓝牙耳机麦克风静音时
     电平极低是正常的，误判会跳过用户实际使用的设备）。
 
@@ -52,6 +56,16 @@ def _open_input(device_id=-1, blocksize=0):
     def _try_open(idx):
         return sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="int16",
                               device=idx, blocksize=blocksize or 0)
+
+    # macOS must never probe unrelated devices automatically: even opening a
+    # Continuity/virtual device can wedge CoreAudio. Explicit choices still work.
+    first = device_id if device_id is not None and device_id >= 0 else None
+    try:
+        return _try_open(first)
+    except Exception as exc:
+        if echo_platform.isolates_audio_capture():
+            raise RuntimeError("无法打开所选麦克风，请在系统设置中检查输入设备和权限；"
+                               "未自动尝试其他设备：" + str(exc)) from exc
 
     candidates = []
     if device_id is not None and device_id >= 0:
@@ -70,7 +84,7 @@ def _open_input(device_id=-1, blocksize=0):
         _log_record(-1, 0.0, False,
                     f"兜底遍历跳过 {len(skipped_virtual)} 个虚拟/映射设备: {skipped_virtual[:6]}")
 
-    seen = set()
+    seen = {first}
     for idx in candidates:
         if idx in seen:
             continue
@@ -127,7 +141,7 @@ def record_command(out_path, max_ms=30000, silence_threshold=0.012,
     max_rms = 0.0
     device_used = None
     try:
-        with _open_input(device_id) as stream:
+        with input_stream(device_id) as stream:
             device_used = stream.device
             while True:
                 if stop_event is not None and stop_event.is_set():
@@ -214,20 +228,38 @@ class MeetingRecorder:
         self._started.wait(timeout)
         return self._started.is_set() and not self.error
 
-    def stop(self):
+    def stop(self, timeout=8):
         self.stop_event.set()
         if self.thread:
-            self.thread.join(timeout=8)
+            self.thread.join(timeout=timeout)
+            return not self.thread.is_alive()
+        return True
 
     def _loop(self):
         seg_samples = int(self.segment_minutes * 60 * SAMPLE_RATE)
-        buf = []
         seg_idx = 0
+        writer = None
+        audio_file = None
+        samples = 0
+
+        def close_segment():
+            nonlocal writer, audio_file
+            try:
+                if writer is not None:
+                    writer.close()
+            finally:
+                writer = None
+                if audio_file is not None:
+                    audio_file.close()
+                    audio_file = None
+
         try:
-            with _open_input(self.device_id) as stream:
+            with input_stream(self.device_id) as stream:
                 self._started.set()          # 输入流已打开：通知 start_meeting 校验通过
                 while not self.stop_event.is_set():
-                    data, _ = stream.read(int(SAMPLE_RATE * 0.2))
+                    data, overflow = stream.read(int(SAMPLE_RATE * 0.2))
+                    if overflow:
+                        _log_record(stream.device, 0, True, "音频输入溢出，部分采样可能丢失")
                     a = data.astype(np.float32) / 32768.0
                     self.level = min(1.0, float(np.sqrt(np.mean(a * a))) * 30.0)
                     if self.level_cb:
@@ -235,19 +267,31 @@ class MeetingRecorder:
                             self.level_cb(self.level)
                         except Exception:
                             pass
-                    buf.append(data)
-                    if sum(len(x) for x in buf) >= seg_samples:
+                    if writer is None:
                         seg_idx += 1
                         name = f"{seg_idx:02d}.wav"
-                        _write_wav(os.path.join(self.folder, name), buf)
+                        audio_file = open(os.path.join(self.folder, name), "wb")
+                        writer = wave.open(audio_file, "wb")
+                        writer.setnchannels(1)
+                        writer.setsampwidth(2)
+                        writer.setframerate(SAMPLE_RATE)
+                        samples = 0
+                    # Each block updates the WAV header, avoiding a whole segment
+                    # held only in memory. Finalize before closing the device.
+                    writer.writeframes(np.ascontiguousarray(data).tobytes())
+                    audio_file.flush()
+                    if name not in self.segments:
                         self.segments.append(name)
-                        buf = []
-            if buf and sum(len(x) for x in buf) > int(0.5 * SAMPLE_RATE):
-                seg_idx += 1
-                name = f"{seg_idx:02d}.wav"
-                _write_wav(os.path.join(self.folder, name), buf)
-                self.segments.append(name)
+                    samples += len(data)
+                    if samples >= seg_samples:
+                        close_segment()
         except Exception as e:
             self.error = str(e)
             self._started.set()              # 打不开：唤醒等待者，让它拿到 error
             print(f"[meeting] 录音线程异常: {e}")
+        finally:
+            try:
+                close_segment()
+            except Exception as exc:
+                self.error = self.error or f"音频保存失败：{exc}"
+            self.level = 0.0

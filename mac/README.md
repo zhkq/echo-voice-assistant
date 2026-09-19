@@ -131,6 +131,16 @@ venv/bin/pip install pyannote.audio  # 会议说话人分离（会拉 torch，�
 - 重启日志：`data/logs/restart-mac.out` / `.err`
 - 端口被占：`mac/stop_mac.sh` 会清理默认端口（8970；以 ECHO 的 `data/echo-port.txt` 为准）上的残留进程
 
+### 麦克风异常保护
+
+- macOS 的打开、读取、关闭音频操作在独立 Python 子进程中运行；打开或读取超过 5 秒无响应会报错，并回收该子进程，避免将 CoreAudio 的锁留在主服务内。
+- Mac 只使用明确选择的设备或系统默认输入，不再自动遍历其它麦克风。失败时请检查系统输入设置、麦克风权限和设备连接。
+- 会议、命令录音和麦克风测试共享占用保护；语音唤醒会让出设备，不能同时开启多个录音流。
+- 会议音频按采样块写入 WAV；设备断开时保留已经写入的内容，并将会议标记为“已中断”，可手动重新转写。磁盘写入失败、断电或系统音频服务故障仍不能保证无损恢复。
+- 仍提示无法释放设备时，先停止其它音频应用，再重启 ECHO；不要连续点击开麦。重启会中断正在进行的任务。
+
+硬件无关回归测试：`venv/bin/python -m pytest -q tests/test_mic_reliability.py tests/test_recorder_startup.py tests/test_recorder_device_choice.py`。
+
 ## 与 Windows 版的关系
 
 Windows 版原样保留，不受影响。两边共用同一份 `app/` 代码，只有

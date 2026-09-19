@@ -248,9 +248,8 @@ def is_busy():
 
 
 def _set_busy(name):
-    if _busy.locked():
+    if not _busy.acquire(blocking=False):
         return False
-    _busy.acquire()
     _busy_owner["name"] = name
     return True
 

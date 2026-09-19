@@ -1099,10 +1099,10 @@ def control_tts_test(_auth=Depends(optional_auth)):
 
 @router.post("/control/mic/test")
 def control_mic_test(_auth=Depends(optional_auth)):
-    """麦克风测试：在服务进程内打开录音 1 秒，返回设备与电平（诊断用）。"""
+    """麦克风测试：统一占用保护；macOS 音频操作在可超时回收的子进程内。"""
     import numpy as np
     try:
-        with recorder._open_input(int(settings.get("inputDeviceId", -1))) as stream:
+        with recorder.input_stream(int(settings.get("inputDeviceId", -1))) as stream:
             data, _ = stream.read(int(16000 * 1.0))
             rms = float(np.sqrt(np.mean((data.astype(np.float32) / 32768.0) ** 2)))
             return {"ok": True, "device": stream.device, "rms": round(rms, 4)}
