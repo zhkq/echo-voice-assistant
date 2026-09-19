@@ -368,6 +368,54 @@ class SecretHandlingTests(unittest.TestCase):
         r = {x["key"]: x for x in settings.all()}["providerLlmApiKey"]
         self.assertFalse(r["hasValue"])
 
+    # ---- 防误清空（2026-09-19 发现的数据丢失风险）----
+    def test_empty_string_never_clears_a_secret(self):
+        """面板"整批保存"会把遮罩后的空串回传 —— 那**不能**当成"清空密钥"。"""
+        settings.update({"providerLlmApiKey": self.SECRET})
+        settings.update({"providerLlmApiKey": ""})
+        self.assertEqual(settings.get("providerLlmApiKey"), self.SECRET,
+                         "空串 = 不改（否则用户一保存设置，密钥就静默没了）")
+        settings.update({"providerLlmApiKey": "   "})
+        self.assertEqual(settings.get("providerLlmApiKey"), self.SECRET)
+
+    def test_panel_like_bulk_save_keeps_the_secret(self):
+        """模拟面板：把 settings.all() 里所有项原样回传（密钥是空串）→ 密钥必须还在。"""
+        settings.update({"providerLlmApiKey": self.SECRET})
+        echoed = {r["key"]: r["value"] for r in settings.all()}
+        settings.update(echoed)
+        self.assertEqual(settings.get("providerLlmApiKey"), self.SECRET)
+
+    def test_clear_sentinel_is_the_only_way_to_wipe(self):
+        from app.config import CLEAR_SECRET
+        settings.update({"providerLlmApiKey": self.SECRET})
+        settings.update({"providerLlmApiKey": CLEAR_SECRET})
+        self.assertEqual(settings.get("providerLlmApiKey"), "")
+        r = {x["key"]: x for x in settings.all()}["providerLlmApiKey"]
+        self.assertFalse(r["hasValue"])
+
+    def test_non_secret_keys_still_accept_empty(self):
+        """闸只对 secret 生效：普通项（如 meetingsDir）空串仍是合法值。"""
+        settings.update({"meetingsDir": "D:\\会议"})
+        settings.update({"meetingsDir": ""})
+        self.assertEqual(settings.get("meetingsDir"), "")
+
+    def test_api_put_with_masked_values_does_not_wipe(self):
+        """端到端：面板那套请求（含空密钥）打过来，密钥必须还在。"""
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        from app.api import router
+        settings.update({"providerLlmApiKey": self.SECRET})
+        app = FastAPI()
+        app.include_router(router)
+        client = TestClient(app)
+        listed = client.get("/api/settings").json()["settings"]
+        payload = {r["key"]: r["value"] for r in listed}
+        payload["userLocation"] = "北京"
+        r = client.put("/api/settings", json={"values": payload})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(settings.get("providerLlmApiKey"), self.SECRET,
+                         "整批保存后密钥被清掉了 —— 这正是要防的事故")
+
     def test_api_settings_never_returns_the_secret(self):
         from fastapi import FastAPI
         from fastapi.testclient import TestClient

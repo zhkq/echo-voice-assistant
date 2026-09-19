@@ -51,8 +51,13 @@ def expand_path(value):
     return os.path.normpath(out)
 
 
-# ---- 平台声明的配置默认值 / 候选项（D11）------------------------------------
-# 为什么要有这两个函数：平台差异不只体现在"环境默认值"（paths.py 用的 dataDir），
+#: 清空密钥用的哨兵值（`Settings.update()` 认它；面板「清除」按钮送它）。
+#: 为什么需要哨兵：`secret=True` 的项出口一律被遮成空串，空串只能解释成"不改"，
+#: 否则面板整批回传就会把密钥静默清掉（2026-09-19 发现的数据丢失风险）。
+CLEAR_SECRET = "__clear__"
+
+
+# ---- 平台声明的配置默认值 / 候选项（D11）------------------------------------# 为什么要有这两个函数：平台差异不只体现在"环境默认值"（paths.py 用的 dataDir），
 # 也体现在**配置项本身**上——macOS 没有 CUDA（device 该默认 cpu）、离线朗读是 say
 # 而不是 SAPI（ttsEngine 候选项不同）、精简依赖不含 funasr（sttModel 默认要落在 whisper）。
 # 这些原先散在 `mac/run_mac.py` 的"注入式覆盖 DEFAULTS"里；现在**声明式**放在各平台
@@ -531,8 +536,16 @@ class Settings:
         return [k for k, meta in DEFAULTS.items() if meta.get("deprecated")]
 
     def update(self, mapping):
-        """批量更新配置（校验 key 存在；类型按 value_type 强转）。"""
+        """批量更新配置（校验 key 存在；类型按 value_type 强转）。
+
+        **密钥的防误清空**（2026-09-19，P5 凭据管理）：`secret=True` 的项在出口一律被遮成空串
+        （见 `all()`），于是"面板整批回传"会把空串当成新值 → **用户的密钥被静默清掉**。
+        所以这里定死一条契约：
+          * 空串（或纯空白）= **不改**（跳过，计入 `skipped`）；
+          * 要清空必须显式送 ``CLEAR_SECRET``（面板的「清除」按钮就是这么做的）。
+        """
         cleaned = {}
+        skipped = []
         for k, v in mapping.items():
             if k not in DEFAULTS:
                 continue
@@ -548,6 +561,12 @@ class Settings:
                     v = v if isinstance(v, list) else [x.strip() for x in str(v).split(",") if x.strip()]
             except Exception:
                 continue
+            if DEFAULTS[k].get("secret"):
+                if isinstance(v, str) and v.strip() == CLEAR_SECRET:
+                    v = ""
+                elif not str(v or "").strip():
+                    skipped.append(k)          # 空 = 不改（防面板整批回传把密钥清掉）
+                    continue
             cleaned[k] = v
         if cleaned:
             db.upsert_settings(cleaned)

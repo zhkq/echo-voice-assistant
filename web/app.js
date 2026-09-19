@@ -1593,7 +1593,15 @@ if (_btnDlMissing) _btnDlMissing.addEventListener("click", () => downloadMissing
 function renderSettingRow(s) {
   const id = "set-" + s.key;
   let ctl = "";
-  if (s.value_type === "bool") {
+  if (s.secret) {
+    // 密钥（P5 凭据管理）：服务端在出口把它遮成空串，所以这里**必须**是密码框 + 空值，
+    // 并明确"留空 = 不改"；要清空走旁边的「清除」按钮（送 __clear__ 哨兵）。
+    // 否则整批保存会把空串当新值，把用户的密钥静默清掉。
+    ctl = `<input type="password" class="ctl" id="${id}" data-key="${s.key}" data-secret="1"
+             value="" autocomplete="new-password"
+             placeholder="${s.hasValue ? "已配置（留空 = 不改）" : "未配置"}">
+           <button class="btn-mini" data-clear-secret="${s.key}">清除</button>`;
+  } else if (s.value_type === "bool") {
     ctl = `<input type="checkbox" class="ctl" id="${id}" data-key="${s.key}" ${s.value ? "checked" : ""}>`;
   } else if (s.options && s.options.length) {
     ctl = `<select class="ctl" id="${id}" data-key="${s.key}">` +
@@ -1613,12 +1621,30 @@ function renderSettingRow(s) {
   </div>`;
 }
 
+/** 密钥「清除」：显式送哨兵值，服务端才真的清空（空串 = 不改）。 */
+document.addEventListener("click", async (e) => {
+  const key = e.target && e.target.dataset ? e.target.dataset.clearSecret : "";
+  if (!key) return;
+  if (!window.confirm("确定清空这个密钥？清空后依赖它的在线服务会不可用。")) return;
+  try {
+    await api("/api/settings", { method: "PUT", body: JSON.stringify({ values: { [key]: "__clear__" } }) });
+    toast("已清空");
+    await loadSettings();
+  } catch (err) { toast("清空失败：" + err.message); }
+});
+
 $("#btnSettingsSave").addEventListener("click", async () => {
   const values = {};
   $$("#settingsForm [data-key]").forEach((el) => {
     const key = el.dataset.key;
     const meta = _settingsCache.find((s) => s.key === key);
     if (!meta) return;
+    if (meta.secret) {
+      // 密钥：**只在这轮真的输入了新值时才提交**（空 = 不改）。
+      // 服务端另有同样的闸（空串不改、清除走 __clear__），这里是第一道。
+      if (el.value && el.value.trim()) values[key] = el.value;
+      return;
+    }
     if (meta.value_type === "bool") values[key] = el.checked;
     else if (meta.value_type === "list") values[key] = el.value.split(/[,，]/).map(s => s.trim()).filter(Boolean);
     else if (meta.value_type === "int") values[key] = parseInt(el.value, 10) || 0;
