@@ -1403,3 +1403,17 @@ import 时就把缓存路径算死）。落点：`app/main.py` 的 lifespan 里 
 之后、`boot.setup()` 之前，来源 `paths.models_root()`；**只在用户显式配置了 `modelsDir` 时
 才覆盖**，保证默认安装零行为变化（避免"HF_HOME 改错 → 权重重新下载"）。现有两处
 `setdefault`（`app/audio/stt.py`、`app/modelinfo.py`）退化为更早的兜底值。
+
+**落地状态（2026-09-19 收口轮，详见 `docs/2.0-PROGRESS.md` 第三十一节 + `docs/P3-收口施工方案.md` §10）**
+
+- **D27 / D28 / D29 已实现**：`scripts/audit-paths.py --check` 退 0，白名单只剩
+  `app/platform/` 与 `app/paths.py`；守卫落在 `tests/test_path_seam.py`。
+- **D29 的一处澄清**：`PLATFORM_TOKEN` 的"展示类保留"最终做成**行为保留、token 收进接缝**
+  —— `app/services.py` 不再直接 `platform.system()`，而是调 `app.platform.display_name()`。
+  这样展示类不必在白名单里开口子，守卫可以对整个 `app/` 严格。
+- **D30 已实现**：`app/main.py` 的 lifespan 在 `seed_defaults()` 后、`boot.setup()` 前按
+  `paths.hf_home()` 设 `HF_HOME`（未配 `modelsDir` 时不动）；两处 `setdefault` 保留为兜底。
+- **S8 仍未做**：第十九节的可行性评估只覆盖"盘点与导入冒烟"，判定标准里的骨架替换实测未做，
+  故 §9.1 那一行保持 ⬜ 并已补注（原来两处记载看起来矛盾）。
+- **注意**：清点清零 ≠ D12 收口完毕。`audit-paths.py` 不扫 Windows API 调用与
+  `tasklist`/硬编码 flags 这类"运行时替换"，那部分仍是 P3 的后续工作量。
