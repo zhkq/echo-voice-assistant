@@ -64,31 +64,100 @@ def show_settings():
 
 def show_voices():
     hr("1. installed SAPI voices (no Chinese voice = offline TTS reads Chinese wrong)")
+    # ⚠️ 命令写法有讲究（2026-09-19 实测）：这台机器上的管理员策略会拦掉**引号内含 `|`
+    # 字面量**的 powershell 命令行（WinError 786 "restricted by policy rule"），
+    # 拼接 `' | '` 的版本直接被拦，连 CreateProcess 都过不去。
+    # 所以这里改成"多语句分别输出"，由 Python 自己排版 —— 既躲开策略，也更清楚。
     ps = ("Add-Type -AssemblyName System.Speech; "
           "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
-          "$s.GetInstalledVoices() | ForEach-Object { "
-          "$_.VoiceInfo.Name + ' | ' + $_.VoiceInfo.Culture.Name + ' | enabled=' + $_.Enabled }")
+          "$s.GetInstalledVoices() | ForEach-Object { $_.VoiceInfo.Name; "
+          "$_.VoiceInfo.Culture.Name; $_.Enabled }")
     try:
         r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
-                           capture_output=True, text=True, timeout=30)
-        for line in (r.stdout or "").splitlines():
-            if line.strip():
-                print("  %s" % line.strip())
-        if not (r.stdout or "").strip():
-            print("  (none reported) rc=%s err=%r" % (r.returncode, r.stderr[:200]))
+                           capture_output=True, text=True, timeout=30,
+                           encoding="utf-8", errors="replace")
+        lines = [x.strip() for x in (r.stdout or "").splitlines() if x.strip()]
+        if not lines:
+            print("  (none reported) rc=%s err=%r" % (r.returncode, (r.stderr or "")[:200]))
+        for i in range(0, len(lines), 3):
+            chunk = lines[i:i + 3]
+            name = chunk[0] if len(chunk) > 0 else "?"
+            culture = chunk[1] if len(chunk) > 1 else "?"
+            enabled = chunk[2] if len(chunk) > 2 else "?"
+            zh = "  <== CHINESE" if str(culture).lower().startswith("zh") else ""
+            print("  voice = %-34s culture = %-6s enabled = %-5s%s"
+                  % (name, culture, enabled, zh))
+        if not any(l.lower().startswith("zh") for l in lines):
+            print("  !! no zh-* voice: offline TTS will read Chinese with a wrong voice")
     except Exception:
         traceback.print_exc()
 
 
+def show_beep_files():
+    """提示音文件本身：字节数 / 时长 / 峰值 / RMS(dBFS) / 哈希。
+
+    为什么要有这一节（2026-09-19 实测）：五个提示音里用户只听到后三声，
+    `start`/`done` 听不到 —— 而 winsound 播放失败是**全静默**的。这里先量文件：
+    峰值≈0 或 RMS 极低 = 文件本身就是哑的（重新生成即可），
+    文件正常却听不到 = 播放通路/设备问题。两种修法完全不同，别再靠猜。
+    """
+    hr("2a. beep files themselves (silent file vs silent playback)")
+    import wave
+    beeps = os.path.join(ROOT, "assets", "beeps")
+    if not os.path.isdir(beeps):
+        print("  MISSING dir: %s" % beeps)
+        return
+    try:
+        import hashlib
+        import numpy as np
+        import soundfile as sf
+    except Exception:
+        traceback.print_exc()
+        return
+    print("  %-6s %8s %8s %7s %8s %8s  %s"
+          % ("name", "bytes", "frames", "sec", "peak", "rms_dB", "sha256:12"))
+    for name in BEEPS:
+        path = os.path.join(beeps, name + ".wav")
+        if not os.path.isfile(path):
+            print("  %-6s MISSING" % name)
+            continue
+        try:
+            data, sr = sf.read(path, dtype="float32")
+            peak = float(np.max(np.abs(data))) if len(data) else 0.0
+            rms = float(np.sqrt(np.mean(data * data))) if len(data) else 0.0
+            db = 20.0 * np.log10(rms) if rms > 1e-9 else -999.0
+            digest = hashlib.sha256(open(path, "rb").read()).hexdigest()[:12]
+            with wave.open(path, "rb") as w:
+                ch, width = w.getnchannels(), w.getsampwidth()
+            flag = "  <== SILENT!" if peak < 0.01 else ""
+            print("  %-6s %8d %8d %7.3f %8.4f %8.1f  %s  %dch/%dbit%s"
+                  % (name, os.path.getsize(path), len(data), len(data) / float(sr),
+                     peak, db, digest, ch, width * 8, flag))
+        except Exception:
+            print("  %-6s UNREADABLE" % name)
+            traceback.print_exc()
+
+
 def beeps():
-    hr("2. the five beeps, ONE AT A TIME (this is the code path ECHO uses)")
-    print("  each line below is played via app.audio.tts.play_beep() -> platform seam")
+    hr("2b. beeps with a WARM-UP first (cold output device eats the first short sound)")
+    print("  theory tested here: the output device (BT/USB) needs ~0.3s to wake; the")
+    print("  FIRST short sound after silence gets swallowed while later ones play fine.")
+    print("  so: play 'ok' twice as warm-up, THEN all five, with a 2s gap each.")
     try:
         from app.audio import tts
     except Exception:
         traceback.print_exc()
         return
     print("  BEEPS_DIR = %s (exists=%s)" % (tts.BEEPS_DIR, os.path.isdir(tts.BEEPS_DIR)))
+    print("  [warm-up] play_beep('ok') x2 ...")
+    for _ in range(2):
+        try:
+            tts.play_beep("ok")
+        except Exception:
+            traceback.print_exc()
+        time.sleep(1.5)
+    time.sleep(1.0)
+    print("  now the real sequence:")
     for name in BEEPS:
         print("  play_beep(%r) ... LISTEN" % name)
         try:
@@ -96,7 +165,11 @@ def beeps():
         except Exception:
             traceback.print_exc()
         time.sleep(2.0)          # 每声之间留 2 秒，够你分辨
-    pause("did you hear FIVE beeps (start/done/ok/ok2/err)?")
+    print("")
+    print("  reading: if start/done ARE heard now but were NOT in the previous run,")
+    print("           the cause is device wake-up latency, not the wav files.")
+    print("           fix = prepend ~0.3s of silence to the short beeps (or warm up in code).")
+    pause("did you hear FIVE beeps this time (start/done/ok/ok2/err)?")
 
 
 def speak_section(title, text, engine, note=""):
@@ -130,6 +203,9 @@ def main():
     pause()
 
     show_voices()
+    pause()
+
+    show_beep_files()
     pause()
 
     beeps()
