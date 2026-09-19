@@ -11,8 +11,8 @@
 
 路径约定的出处（改名会让加载器找不到模型）：
   app/audio/stt.py      _sensevoice_dir() / _whisper_dir() / _sherpa_files() / _resolve_ms_cache()
-  app/audio/wake.py     KWS_MODEL_DIR + 四个写死的文件名
-  app/audio/diarize.py  PYANNOTE_DIR / SEG_DIR / EMB_DIR / PLDA_DIR
+  app/audio/wake.py     kws_model_dir() + 四个写死的文件名
+  app/audio/diarize.py  pyannote_dir() / segmentation_dir() / embedding_dir() / plda_dir()
 ModelScope 缓存固定在 ~/.cache/modelscope/models（funasr 不认识中文路径，所以不放仓库里）。
 """
 import importlib.util
@@ -28,11 +28,11 @@ BASE_DIR = paths.echo_root()
 
 # 和 stt.py 用同一套缓存约定：HF 落 models/hub（走国内镜像），ModelScope 落 ~/.cache/modelscope
 #
-# 已知偏差（P3 / D21 尚未收口，方案见 docs/2.0-PROGRESS.md §28.4、§28.5）：下面这行把
-# HF_HOME 钉在**安装目录**下的 models，不跟随用户可配的 modelsDir（stt.py 那一份走
-# models_dir()），而且两者都只在 import 时生效一次 —— 谁先被 import 谁说了算。修法是启动
-# 阶段（db.init + seed_defaults 之后）统一按 paths.models_root() 设一次。需要门禁在场：
-# HF_HOME 指错会让 huggingface 找不到已下好的权重并**重新下载**。
+# 下面这行是**早期兜底值**（默认安装下 = {ECHO}/models，与 paths.models_root() 相同）。
+# 权威值由启动阶段按 D30 设定：app/main.py 的 lifespan 在 seed_defaults() 之后、
+# boot.setup() 之前，用户**显式配置了 modelsDir** 时用 paths.hf_home() 覆盖它。
+# 保留 setdefault 的原因：huggingface_hub 在自己被 import 时就算死缓存路径，而这个模块
+# 可能早于 lifespan 被 import；兜底保证“没走到 lifespan 也不至于没有 HF_HOME”。
 os.environ.setdefault("HF_HOME", os.path.join(BASE_DIR, "models"))
 os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 os.environ.setdefault("MODELSCOPE_DISABLE_PROGRESS_BAR", "1")
@@ -162,7 +162,7 @@ def _pyannote_command():
         lines.append("$env:HF_HUB_OFFLINE = '0'")
     for repo, folder, filename in ASSETS:
         args = [hf, "download", repo, filename, "--local-dir",
-                os.path.join(BASE_DIR, "models", "pyannote", folder)]
+                os.path.join(models_dir(), "pyannote", folder)]
         if os.name == "nt":
             lines.append("& " + " ".join("'" + p.replace("'", "''") + "'" for p in args))
             lines.append("if ($LASTEXITCODE -ne 0) { throw '模型下载失败，请检查授权与网络' }")

@@ -151,6 +151,18 @@ def models_root() -> str:
     return resolved or os.path.join(echo_root(), "models")
 
 
+def hf_home() -> str:
+    """HuggingFace 缓存根（D30）。用户**显式配置**了 modelsDir 时返回 ``models_root()``，
+    否则返回空串。
+
+    **空串是刻意的“无操作”信号**：默认安装下 HF_HOME 已经是 ``{ECHO}/models``，与
+    ``models_root()`` 逐字相同，覆盖它没有收益；而 HF 缓存根一旦指错，huggingface
+    会找不到已下好的权重并**重新下载**（几 GB）。所以只有用户真的把 modelsDir 配到
+    别处时才覆盖（D30：保证默认安装零行为变化）。
+    """
+    return models_root() if _settings_get("modelsDir") else ""
+
+
 def active_roots() -> dict:
     """当前生效的四类根 + 配置里是不是用户指定的。面板"环境体检"页与诊断用它。
 

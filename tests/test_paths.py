@@ -415,5 +415,34 @@ class ModelSubdirsFollowModelsDir(unittest.TestCase):
             paths._settings_get = old
 
 
+class HuggingFaceHomeTests(unittest.TestCase):
+    """HF_HOME 的落点约定（D30）：只有用户显式配置了 modelsDir 才覆盖。
+
+    默认安装下不覆盖 = 零行为变化（HF_HOME 已经是 {ECHO}/models）；一旦覆盖错，
+    huggingface 会找不到已下好的权重并**重新下载**，所以这条语义必须钉住。
+    """
+
+    def test_hf_home_is_a_noop_unless_models_dir_is_configured(self):
+        old = paths._settings_get
+        paths._settings_get = lambda name: ""
+        try:
+            self.assertEqual(paths.hf_home(), "", "未配置 modelsDir 时不得改 HF_HOME")
+        finally:
+            paths._settings_get = old
+
+    def test_hf_home_follows_a_configured_models_dir(self):
+        from app.audio import stt
+
+        tmp = tempfile.mkdtemp(prefix="echo-hf-")
+        old = paths._settings_get
+        paths._settings_get = lambda name: tmp if name == "modelsDir" else ""
+        try:
+            self.assertEqual(paths.hf_home(), os.path.normpath(tmp))
+            # modelinfo / stt 与路径层必须得到**同一个**缓存根（消灭“谁先 import 谁生效”）
+            self.assertEqual(stt.models_dir(), paths.hf_home())
+        finally:
+            paths._settings_get = old
+
+
 if __name__ == "__main__":
     unittest.main()

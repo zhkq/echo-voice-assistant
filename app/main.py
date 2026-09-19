@@ -57,6 +57,15 @@ async def lifespan(app: FastAPI):
     # ---- 阶段 0：只做轻量初始化，面板立即可用 ----
     db.init()
     settings.seed_defaults()
+
+    # D30：HF_HOME 必须赶在**任何** huggingface_hub 代码之前定一次——
+    # huggingface_hub 在它自己被 import 时就把缓存路径算死了，之后再改环境变量无效。
+    # 落点在 seed_defaults() 之后、boot.setup() 之前；只在用户显式配置了 modelsDir
+    # 时才覆盖（paths.hf_home() 返回空串表示“不动”，见该函数与 D30）。
+    _hf_home = paths.hf_home()
+    if _hf_home:
+        os.environ["HF_HOME"] = _hf_home
+
     manager.echo_write_pid()
     services.report_server()
 
