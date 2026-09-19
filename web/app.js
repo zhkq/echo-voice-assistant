@@ -1246,7 +1246,9 @@ function capCompBadge(c) {
   return modelBadge("未知", "idle");
 }
 
-/** 组件行的「获取」动作：能下载就给下载（走 /api/models/download），否则给复制说明。 */
+/** 组件行的「获取」动作：模型类的能下载就给「下载」按钮（走 /api/models/download）；
+ *  pip 类的（运行时 / 加速 / 智能体后端）给「下载命令」—— 把 `how` 里的安装命令复制到剪贴板。
+ *  标签按用户 2026-09-19 的要求叫「下载命令」（不再叫"复制说明"）；完整命令进 title。 */
 function capCompActions(c) {
   const m = c.model_id ? modelById(c.model_id) : null;
   if (m) {
@@ -1259,7 +1261,7 @@ function capCompActions(c) {
   const btns = [];
   if (c.how) {
     btns.push(`<button type="button" class="btn mini" data-mcopy="${esc(c.how)}"
-      title="${esc(c.how)}">复制说明</button>`);
+      title="复制下载/安装命令到剪贴板：${esc(c.how)}">下载命令</button>`);
   }
   if (c.ref) btns.push(`<span class="muted" style="font-size:12px">${esc(c.ref)}</span>`);
   return btns.join(" ");
@@ -1532,7 +1534,7 @@ function renderCapEnv() {
     <div class="card-body">
       ${capCompTable(comps, [])}
       <div class="muted" style="margin-top:6px;font-size:12px">
-        这些是 pip 装的运行时/加速库，面板不代下：点「复制说明」拿到命令后自己执行。
+        这些是 pip 装的运行时/加速库，面板不代下：点「下载命令」复制到剪贴板后自己执行。
       </div>
       ${blockedHtml}
     </div>

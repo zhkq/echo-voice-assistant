@@ -600,6 +600,14 @@ class OptionAndPanelWiringTests(unittest.TestCase):
         self.assertIn(".act-link {", css)
         self.assertIn(".act-link:hover", css)
 
+    def test_pip_components_offer_a_download_command_button(self):
+        """pip 类组件（运行时/加速/智能体后端）的动作叫「下载命令」（用户 2026-09-19 指定）。"""
+        js = _read(os.path.join("web", "app.js"))
+        block = js.split("function capCompActions")[1].split("\n}")[0]
+        self.assertIn(">下载命令</button>", block)
+        self.assertNotIn(">复制说明</button>", block, "标签已改名为「下载命令」")
+        self.assertIn("复制下载/安装命令到剪贴板", block, "完整命令进 title")
+
     def test_engine_labels_do_not_wrap_vertically(self):
         """「命令转写 / 会议转写」在窄边条里被压成竖排两行 → 加 nowrap + 窄屏各占一行。"""
         css = _read(os.path.join("web", "app.css"))
