@@ -1,6 +1,6 @@
 #!/bin/sh
-# pre-push: block a push when a commit being pushed would publish a non-noreply
-# email address.
+# pre-push: block a push when a commit being pushed would publish an unexpected
+# author/committer identity.
 #
 # WHY
 #   GitHub's own "Block command line pushes that expose my email" lives only in
@@ -10,7 +10,15 @@
 #
 #   Concretely: this repository's history contains 3 commits authored with a
 #   real address (accepted, not rewritten). Anything pushed from now on must
-#   use the GitHub noreply form, so the address never grows further.
+#   use one of the addresses listed in ALLOWED_EMAILS below.
+#
+#   WHY AN ALLOWLIST AND NOT "any noreply form" (2026-09-19, real incident):
+#   the first version of this hook accepted ANY *@users.noreply.github.com
+#   address. An agent then committed 14 commits as
+#   `zhkq <1635558+zhkq@users.noreply.github.com>` -- syntactically perfect,
+#   but the numeric id belonged to a DIFFERENT account (`daynater`), because
+#   GitHub attributes noreply addresses by that id. The commits showed up under
+#   a stranger's name. A regex cannot catch that; only a fixed list can.
 #
 # USAGE
 #   sh .githooks/pre-push --install     # copy into .git/hooks/pre-push
@@ -21,9 +29,19 @@
 
 set -u
 
-# Allowed: GitHub's noreply forms (both the id+login and the legacy form)
-ALLOW_RE='(@users\.noreply\.github\.com|^noreply@github\.com)$'
+# Allowed identities: the GitHub noreply addresses of this project's accounts.
+# Format is GitHub's "<account-id>+<login>@users.noreply.github.com"; the ID
+# must match the account, otherwise the commit is attributed to someone else.
+ALLOWED_EMAILS="
+7867198+zhkq@users.noreply.github.com
+238434853+NeoBigZhou@users.noreply.github.com
+noreply@github.com
+"
 ZERO='0000000000000000000000000000000000000000'
+
+is_allowed() {
+    printf '%s\n' "$ALLOWED_EMAILS" | grep -Fxq -- "$1"
+}
 
 if [ "${1:-}" = "--install" ]; then
     hookdir=$(git rev-parse --git-dir)/hooks
@@ -52,7 +70,7 @@ while read -r local_ref local_sha remote_ref remote_sha; do
     for c in $(git rev-list $range 2>/dev/null); do
         # shellcheck disable=SC2046
         for e in $(git log -1 --format='%ae%n%ce' "$c" 2>/dev/null | sort -u); do
-            if ! printf '%s' "$e" | grep -Eq "$ALLOW_RE"; then
+            if ! is_allowed "$e"; then
                 bad="$bad
     $(git log -1 --format='%h  %ae' "$c")"
             fi
@@ -62,10 +80,12 @@ done
 
 if [ -n "$bad" ]; then
     echo ""
-    echo "[x] push blocked: these commits would publish a non-noreply email address:"
+    echo "[x] push blocked: these commits use an identity that is not on the allowlist:"
     printf '%s\n' "$bad"
     echo ""
-    echo "  Rewrite them with the noreply identity, e.g.:"
+    echo "  Allowed:"
+    printf '%s\n' "$ALLOWED_EMAILS" | sed 's/^/      /'
+    echo "  Fix them, e.g.:"
     echo "      git commit --amend --author=\"zhkq <7867198+zhkq@users.noreply.github.com>\""
     echo "  Or, if it is deliberate: git push --no-verify"
     echo ""
