@@ -13,7 +13,10 @@
 """
 import json
 import os
+import re
+import shutil
 import sys
+import tempfile
 import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -21,10 +24,32 @@ from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import app.db as db                                          # noqa: E402
 from app import providers as P                              # noqa: E402
-from app.providers import router as router_mod              # noqa: E402
+from app.config import settings                              # noqa: E402
+from app.providers import openai as online_mod               # noqa: E402
+from app.providers import presets as presets_mod             # noqa: E402
+from app.providers import router as router_mod               # noqa: E402
 from app.providers.local import (LocalAsrProvider, LocalTtsProvider,   # noqa: E402
                                  EdgeTtsProvider)
+
+#: 凭据类**字段名**（不是值）。清单里可以出现"哪个配置项喂给哪个 provider"
+#: （那是名字，如 details.settings=["providerLlmApiKey"]），但**不许有字段专门装密钥**。
+CRED_KEY_RE = re.compile(r"(api[_-]?key|token|secret|password|passwd|authorization)", re.I)
+
+
+class _NoCredentialFields:
+    """Mixin：递归检查结构里有没有凭据类字段名（值是否泄漏由 SecretHandlingTests 单独测）。"""
+
+    def assertNoCredentialFields(self, obj, path="catalog"):
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                self.assertNotRegex(str(k), CRED_KEY_RE,
+                                    "%s 里出现了凭据字段名：%s" % (path, k))
+                self.assertNoCredentialFields(v, "%s.%s" % (path, k))
+        elif isinstance(obj, list):
+            for i, v in enumerate(obj):
+                self.assertNoCredentialFields(v, "%s[%d]" % (path, i))
 
 
 class RegistryShapeTests(unittest.TestCase):
@@ -79,7 +104,7 @@ class RegistryShapeTests(unittest.TestCase):
         self.assertIn("local-asr", str(cm.exception), "报错要列出可选项，便于排查")
 
 
-class ActiveSelectionTests(unittest.TestCase):
+class ActiveSelectionTests(_NoCredentialFields, unittest.TestCase):
     def test_default_is_used_when_config_is_empty(self):
         with patch("app.config.settings.get", lambda k, d=None: ""):
             self.assertEqual(P.active_id("asr"), "local-asr")
@@ -116,10 +141,8 @@ class ActiveSelectionTests(unittest.TestCase):
         self.assertTrue(by_id["edge-tts"]["egress"])
         self.assertTrue(by_id["local-asr"]["active"])
         self.assertFalse(by_id["edge-tts"]["active"])
-        # 清单里不许出现任何疑似凭据字段
-        blob = json.dumps(cat, ensure_ascii=False).lower()
-        for bad in ("token", "api_key", "apikey", "secret", "password"):
-            self.assertNotIn(bad, blob, "provider 清单里不该出现凭据字段：%s" % bad)
+        # 清单里不许有"专门装密钥"的字段（配置项名字允许出现：面板要知道哪个配置喂给谁）
+        self.assertNoCredentialFields(cat)
 
 
 class LocalAdapterTests(unittest.TestCase):
@@ -261,7 +284,7 @@ class EchoAutoLlmProviderTests(unittest.TestCase):
         self.assertNotIn("SUPER-SECRET-TOKEN", cat)
 
 
-class ProviderApiTests(unittest.TestCase):
+class ProviderApiTests(_NoCredentialFields, unittest.TestCase):
     """`GET /api/providers`：面板要用的只读清单（默认不探测）。"""
 
     @classmethod
@@ -278,9 +301,7 @@ class ProviderApiTests(unittest.TestCase):
         self.assertEqual(r.status_code, 200, r.text)
         data = r.json()
         self.assertEqual([k["id"] for k in data["kinds"]], list(P.KINDS))
-        blob = json.dumps(data, ensure_ascii=False).lower()
-        for bad in ("token", "api_key", "secret", "password"):
-            self.assertNotIn(bad, blob)
+        self.assertNoCredentialFields(data, "api/providers")
         by_id = {p["id"]: p for p in data["providers"]}
         self.assertTrue(by_id["edge-tts"]["egress"])
         self.assertFalse(by_id["local-tts"]["egress"])
@@ -294,6 +315,251 @@ class ProviderApiTests(unittest.TestCase):
         with patch("app.providers.readiness", lambda kind, pid=None: True):
             data = self.client.get("/api/providers?ready=true").json()
         self.assertTrue(all(p["ready"] is True for p in data["providers"]))
+
+
+class SecretHandlingTests(unittest.TestCase):
+    """凭据管理（P5）：密钥只进库、**永不从接口出去**，但 provider 内部要拿得到真值。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp(prefix="echo-provider-secret-")
+        cls._old = (db.DATA_DIR, db.DB_FILE)
+
+    @classmethod
+    def tearDownClass(cls):
+        db.DATA_DIR, db.DB_FILE = cls._old
+        settings._cache = None
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def setUp(self):
+        db.DATA_DIR = self.tmp
+        db.DB_FILE = os.path.join(self.tmp, "%s.db" % self._testMethodName)
+        db.init()
+        settings.seed_defaults()
+        settings._cache = None
+        self.addCleanup(setattr, settings, "_cache", None)
+
+    SECRET = "sk-super-secret-value-123"
+
+    def test_secret_keys_are_declared_with_metadata(self):
+        from app.config import DEFAULTS
+        for key in ("providerLlmApiKey", "providerAsrApiKey"):
+            with self.subTest(key=key):
+                self.assertTrue(DEFAULTS[key].get("secret"), "%s 必须标 secret" % key)
+                self.assertEqual(DEFAULTS[key]["grp"], "provider")
+                self.assertTrue(DEFAULTS[key]["label"])
+
+    def test_settings_all_masks_secrets(self):
+        settings.update({"providerLlmApiKey": self.SECRET})
+        row = {r["key"]: r for r in settings.all() if r["key"] == "providerLlmApiKey"}
+        self.assertIn("providerLlmApiKey", row, "密钥项仍要出现在面板里（否则没法改）")
+        r = row["providerLlmApiKey"]
+        self.assertEqual(r["value"], "", "面板值必须是空的")
+        self.assertTrue(r["secret"])
+        self.assertTrue(r["hasValue"], "要告诉界面库里其实有值")
+
+    def test_settings_get_still_returns_the_real_value(self):
+        """provider 组装请求头时用的是真值 —— 遮罩只发生在出口。"""
+        settings.update({"providerLlmApiKey": self.SECRET})
+        self.assertEqual(settings.get("providerLlmApiKey"), self.SECRET)
+
+    def test_empty_secret_reports_has_value_false(self):
+        settings.update({"providerLlmApiKey": ""})
+        r = {x["key"]: x for x in settings.all()}["providerLlmApiKey"]
+        self.assertFalse(r["hasValue"])
+
+    def test_api_settings_never_returns_the_secret(self):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        from app.api import router
+        settings.update({"providerLlmApiKey": self.SECRET})
+        app = FastAPI()
+        app.include_router(router)
+        r = TestClient(app).get("/api/settings")
+        self.assertEqual(r.status_code, 200)
+        self.assertNotIn(self.SECRET, r.text, "接口回显了密钥！")
+        item = [x for x in r.json()["settings"] if x["key"] == "providerLlmApiKey"][0]
+        self.assertEqual(item["value"], "")
+        self.assertTrue(item["hasValue"])
+
+    def test_secret_never_reaches_the_provider_catalog(self):
+        settings.update({"providerLlmApiKey": self.SECRET})
+        self.assertNotIn(self.SECRET, json.dumps(P.catalog(ready=False), ensure_ascii=False))
+
+
+class _StubOpenAI(BaseHTTPRequestHandler):
+    """假的 OpenAI 兼容服务：同时应付 chat/completions 与 audio/transcriptions。"""
+
+    reply = {"choices": [{"message": {"content": "纪要正文"}}]}
+    asr_reply = {"text": "转写文本"}
+    status = 200
+    seen = []
+
+    def do_POST(self):                                   # noqa: N802
+        length = int(self.headers.get("Content-Length") or 0)
+        body = self.rfile.read(length)
+        _StubOpenAI.seen.append({
+            "path": self.path,
+            "ctype": self.headers.get("Content-Type") or "",
+            "auth": self.headers.get("Authorization"),
+            "body": body,
+        })
+        payload = json.dumps(_StubOpenAI.asr_reply if "transcriptions" in self.path
+                             else _StubOpenAI.reply).encode("utf-8")
+        self.send_response(_StubOpenAI.status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, *a):
+        pass
+
+
+class OnlineProviderTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.srv = HTTPServer(("127.0.0.1", 0), _StubOpenAI)
+        cls.base = "http://127.0.0.1:%d/v1" % cls.srv.server_address[1]
+        threading.Thread(target=cls.srv.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.srv.shutdown()
+        cls.srv.server_close()
+
+    def setUp(self):
+        _StubOpenAI.seen = []
+        _StubOpenAI.status = 200
+        _StubOpenAI.reply = {"choices": [{"message": {"content": "纪要正文"}}]}
+        _StubOpenAI.asr_reply = {"text": "转写文本"}
+        self.cfg = {"providerLlmBaseUrl": self.base, "providerLlmApiKey": "k-llm",
+                    "providerLlmModel": "deepseek-chat",
+                    "providerAsrBaseUrl": self.base, "providerAsrApiKey": "k-asr",
+                    "providerAsrModel": ""}
+        self.patcher = patch("app.config.settings.get",
+                             lambda k, d=None: self.cfg.get(k, d))
+        self.patcher.start()
+        self.addCleanup(self.patcher.stop)
+
+    def test_llm_chat_uses_config_and_returns_content(self):
+        out = online_mod.OpenAICompatLlmProvider().chat([{"role": "user", "content": "写纪要"}])
+        self.assertEqual(out, "纪要正文")
+        sent = _StubOpenAI.seen[0]
+        self.assertEqual(sent["path"], "/v1/chat/completions")
+        self.assertEqual(sent["auth"], "Bearer k-llm")
+        self.assertIn(b"deepseek-chat", sent["body"])
+
+    def test_llm_ready_reflects_configuration(self):
+        self.assertTrue(online_mod.OpenAICompatLlmProvider().ready())
+        self.cfg["providerLlmBaseUrl"] = ""
+        self.assertFalse(online_mod.OpenAICompatLlmProvider().ready())
+
+    def test_llm_without_base_url_gives_a_clear_error(self):
+        self.cfg["providerLlmBaseUrl"] = ""
+        with self.assertRaises(RuntimeError) as cm:
+            online_mod.OpenAICompatLlmProvider().chat([{"role": "user", "content": "x"}])
+        self.assertIn("在线 LLM 地址", str(cm.exception))
+
+    def test_llm_http_error_raises(self):
+        _StubOpenAI.status = 401
+        with self.assertRaises(RuntimeError) as cm:
+            online_mod.OpenAICompatLlmProvider().chat([{"role": "user", "content": "x"}])
+        self.assertIn("401", str(cm.exception))
+
+    def test_asr_uploads_multipart_with_model_and_language(self):
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as fh:
+            fh.write(b"RIFF....WAVE")
+            wav = fh.name
+        self.addCleanup(os.remove, wav)
+        out = online_mod.OpenAICompatAsrProvider().transcribe(wav, lang="zh")
+        self.assertEqual(out["text"], "转写文本")
+        self.assertEqual(out["engine"], "openai-asr")
+        self.assertEqual(out["model"], "whisper-1", "模型名留空时用默认 whisper-1")
+        sent = _StubOpenAI.seen[0]
+        self.assertEqual(sent["path"], "/v1/audio/transcriptions")
+        self.assertIn("multipart/form-data; boundary=", sent["ctype"])
+        self.assertIn(b'name="model"', sent["body"])
+        self.assertIn(b"whisper-1", sent["body"])
+        self.assertIn(b'name="language"', sent["body"])
+        self.assertIn(b"RIFF....WAVE", sent["body"], "音频本体要真的上传")
+        self.assertEqual(sent["auth"], "Bearer k-asr")
+
+    def test_asr_empty_result_carries_a_reason(self):
+        _StubOpenAI.asr_reply = {"text": ""}
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as fh:
+            fh.write(b"RIFF")
+            wav = fh.name
+        self.addCleanup(os.remove, wav)
+        out = online_mod.OpenAICompatAsrProvider().transcribe(wav)
+        self.assertEqual(out["text"], "")
+        self.assertEqual(out["reason"], "empty-or-unknown")
+
+    def test_asr_missing_file_is_reported(self):
+        with self.assertRaises(RuntimeError) as cm:
+            online_mod.OpenAICompatAsrProvider().transcribe("no-such-file.wav")
+        self.assertIn("不存在", str(cm.exception))
+
+    def test_asr_unconfigured_is_reported(self):
+        self.cfg["providerAsrBaseUrl"] = ""
+        with self.assertRaises(RuntimeError) as cm:
+            online_mod.OpenAICompatAsrProvider().transcribe(__file__)
+        self.assertIn("在线转写地址", str(cm.exception))
+
+    def test_asr_http_error_raises(self):
+        _StubOpenAI.status = 500
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as fh:
+            fh.write(b"RIFF")
+            wav = fh.name
+        self.addCleanup(os.remove, wav)
+        with self.assertRaises(RuntimeError) as cm:
+            online_mod.OpenAICompatAsrProvider().transcribe(wav)
+        self.assertIn("500", str(cm.exception))
+
+    def test_online_providers_are_registered_and_labelled(self):
+        for kind, pid in (("llm", "openai-llm"), ("asr", "openai-asr")):
+            with self.subTest(provider=pid):
+                spec = P.describe(kind, pid)
+                self.assertTrue(spec["egress"])
+                self.assertTrue(spec["egress_note"])
+                self.assertEqual(spec["source"], "online")
+
+    def test_asr_egress_note_mentions_audio_upload(self):
+        """最容易忽略的出网：会议音频是**整段**上传的，必须写明。"""
+        self.assertIn("音频", P.describe("asr", "openai-asr")["egress_note"])
+
+    def test_active_llm_can_be_pointed_at_the_online_provider(self):
+        self.cfg["providerLlm"] = "openai-llm"
+        self.assertEqual(P.active_id("llm"), "openai-llm")
+
+
+class PresetTests(unittest.TestCase):
+    def test_presets_are_public_only(self):
+        data = presets_mod.catalog()
+        blob = json.dumps(data, ensure_ascii=False)
+        for bad in ("sk-", "api_key", "apikey", "token", "secret"):
+            self.assertNotIn(bad, blob.lower(), "预设里不该出现凭据类字样")
+        for p in data["presets"]:
+            with self.subTest(preset=p["id"]):
+                self.assertTrue(p["note"], "每条预设都要有出网说明")
+                if p["base_url"]:
+                    self.assertTrue(p["base_url"].startswith("https://"),
+                                    "公开预设只放 https 公网地址（内网地址不写进仓库）")
+
+    def test_intranet_preset_leaves_the_url_for_the_user(self):
+        p = presets_mod.find("intranet-gateway")
+        self.assertIsNotNone(p)
+        self.assertEqual(p["base_url"], "", "内网地址属内部信息，必须留空让用户填")
+
+    def test_presets_endpoint_is_read_only_and_secret_free(self):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        from app.api import router
+        app = FastAPI()
+        app.include_router(router)
+        r = TestClient(app).get("/api/providers/presets")
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertIn("presets", r.json())
 
 
 if __name__ == "__main__":

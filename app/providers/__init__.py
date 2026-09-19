@@ -187,11 +187,12 @@ def catalog(ready=True):
 # 所以这里只是"登记"，不会拖慢启动。每个模块登记失败都不该拖垮注册表
 # （面板至少要能列出"清单为空"，而不是整个服务起不来）。
 from app.providers import local as _local          # noqa: E402,F401
+from app.providers import openai as _openai        # noqa: E402,F401
 from app.providers import router as _router        # noqa: E402,F401
 
 
 def _register_builtin():
-    for mod in (_local, _router):
+    for mod in (_local, _openai, _router):
         try:
             mod.register_builtin()
         except Exception as e:                      # pragma: no cover - 防御性

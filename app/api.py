@@ -915,6 +915,17 @@ def api_providers(ready: bool = False, _auth=Depends(optional_auth)):
     return providers_mod.catalog(ready=bool(ready))
 
 
+@router.get("/providers/presets")
+def api_provider_presets(_auth=Depends(optional_auth)):
+    """在线服务预设（面板"一键填入"用）。
+
+    **只有公开信息**：厂商公开地址与常见模型名。不含密钥、不含单位内网地址
+    （"内网网关"那条 base_url 留空，由用户按部署文档填）。
+    """
+    from app.providers import presets as presets_mod
+    return presets_mod.catalog()
+
+
 # ---------------------------------------------------------------- 声纹库（常用联系人）
 # 会议里把说话人改名为联系人即自动入库（voiceprintAutoEnroll）；
 # 库里的样本可在面板「说话人管理」查看/删除，这里是对应的 REST 入口。

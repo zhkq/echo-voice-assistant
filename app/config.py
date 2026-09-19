@@ -375,6 +375,32 @@ DEFAULTS = {
     "providerTts": dict(value="", grp="provider", label="朗读 provider",
                         description="留空 = 默认的离线朗读；选 edge-tts 则文本会出网（见 /api/providers 的出网标注）",
                         value_type="str"),
+    # ---- 在线服务预设（P5）：一个 OpenAI 兼容端点 + 一把密钥 ----
+    # 这三项就是"配一个在线 LLM"的全部输入；配好把 providerLlm 指向 openai-llm 即生效。
+    # 内网网关地址**不写进仓库**（属单位内部信息，见 REFACTOR-PLAN §13.4）：
+    # 面板给"内网网关"预设时留空 base_url，让用户自己填。
+    "providerLlmBaseUrl": dict(value="", grp="provider", label="在线 LLM 地址",
+                               description="OpenAI 兼容端点的根地址，例如 https://api.deepseek.com/v1"
+                                           "（内网网关填单位自己的地址；留空 = 不用在线 LLM）",
+                               value_type="str"),
+    "providerLlmApiKey": dict(value="", grp="provider", label="在线 LLM 密钥",
+                              description="只保存在本机数据库；接口（含面板）**永不回显**，"
+                                          "留空 = 明文清空。数据出网去向见「在线 LLM 地址」",
+                              value_type="str", secret=True),
+    "providerLlmModel": dict(value="", grp="provider", label="在线 LLM 模型名",
+                             description="留空 = 用服务端默认（如 deepseek-chat / gpt-4o-mini）",
+                             value_type="str"),
+    "providerAsrBaseUrl": dict(value="", grp="provider", label="在线转写地址",
+                               description="OpenAI 兼容的 /audio/transcriptions 根地址"
+                                           "（例如 https://api.openai.com/v1）；留空 = 不用在线转写",
+                               value_type="str"),
+    "providerAsrApiKey": dict(value="", grp="provider", label="在线转写密钥",
+                              description="只保存在本机数据库；接口**永不回显**，留空 = 明文清空。"
+                                          "注意：会议音频会整段上传到该服务",
+                              value_type="str", secret=True),
+    "providerAsrModel": dict(value="", grp="provider", label="在线转写模型名",
+                             description="留空 = whisper-1（OpenAI 兼容服务的默认转写模型）",
+                             value_type="str"),
     # ---------- 面板 ----------
     "panelAutoRefresh": dict(value=3, grp="panel", label="面板自动刷新秒",
                              description="仪表盘轮询间隔（0=关闭）", value_type="int"),
@@ -479,6 +505,12 @@ class Settings:
           * deprecated=True —— 已弃用的历史配置；
           * hidden=True     —— 由面板自定义 UI 承载的配置（例如「智能体」分组
                                改由智能体表格渲染，就不再作为普通表单行出现）。
+
+        **密钥（``secret=True``）在这里被遮掉**（P5 凭据管理）：这一层是所有出口的必经之路
+        （`/api/settings`、面板、将来的手机端），所以在源头遮一次，而不是指望每个消费方
+        都记得处理。遮法：``value`` 一律置空 + ``hasValue`` 告诉界面"库里其实有值"，
+        ``secret`` 让界面渲染成密码框。真实值只有 `Settings.get()`（进程内）能拿到 ——
+        供 provider 组装请求头用。
         """
         rows = db.all_settings()
         out = []
@@ -486,6 +518,11 @@ class Settings:
             meta = DEFAULTS.get(r["key"], {})
             if meta.get("deprecated") or meta.get("hidden"):
                 continue
+            if meta.get("secret"):
+                r = dict(r)
+                r["hasValue"] = bool(str(r.get("value") or "").strip())
+                r["value"] = ""
+                r["secret"] = True
             out.append(r)
         return out
 
