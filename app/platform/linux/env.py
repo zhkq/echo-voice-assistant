@@ -13,6 +13,12 @@ PLATFORM_DEFAULTS = {
     "dataDir": os.path.join(
         os.environ.get("XDG_DATA_HOME") or os.path.join(os.path.expanduser("~"), ".local", "share"),
         "ECHO"),
+    # ---- 配置项的默认值与候选项（D11）----
+    # Linux 不是交付目标，但接缝要齐：离线朗读走 spd-say/espeak（不是 SAPI）；
+    # device 保持不覆盖（Linux 机器可能有 NVIDIA GPU，"auto" 语义正确）。
+    "settingOptions": {
+        "ttsEngine": ["auto", "edge-tts", "espeak", "off"],
+    },
 }
 
 

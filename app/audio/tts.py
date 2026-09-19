@@ -135,18 +135,36 @@ def _speak_offline(text):
     return echo_platform.offline_tts_speak(text)
 
 
-def speak(text, engine="auto", timeout=60):
-    """朗读文本（阻塞，最长 timeout 秒）。engine: auto|edge-tts|sapi|off
+def _offline_engine_ids():
+    """"离线引擎"的配置值集合。
 
-    注意 ``sapi`` 这个引擎名是 1.x 的配置值（库里可能存着），在 macOS 上它会走到
-    接缝的离线实现（``say``）—— 命名保持不变以免动配置兼容性。
+    ``sapi`` 是 1.x 的配置值（Windows 的 System.Speech），库里可能存着，必须继续认；
+    macOS/Linux 的离线引擎 id 由接缝给（``say`` / ``espeak``），面板下拉里出现的也是它。
+    所以判断"用户选了离线引擎"要同时认这两个来源，否则在 mac 上选 say 会先走一遍在线合成。
+    """
+    ids = {"sapi"}
+    try:
+        label = str(echo_platform.offline_tts_label() or "").strip()
+        if label:
+            ids.add(label)
+    except Exception:
+        pass
+    return ids
+
+
+def speak(text, engine="auto", timeout=60):
+    """朗读文本（阻塞，最长 timeout 秒）。engine: auto|edge-tts|<离线引擎>|off
+
+    ``<离线引擎>`` = Windows ``sapi`` / macOS ``say`` / Linux ``espeak``（由接缝给），
+    命名保持不变以免动配置兼容性。
     """
     global _edge_broken
     if not text:
         return False
     if engine == "off":
         return False
-    if engine == "sapi" or (engine == "auto" and _edge_broken):
+    offline = _offline_engine_ids()
+    if engine in offline or (engine == "auto" and _edge_broken):
         return _speak_offline(text)
     if engine == "auto" and probe_online() is False:
         # 在线 TTS 探针不可用 → 直接本地离线合成（跳过 edge 等待，保证效率）
@@ -203,7 +221,7 @@ def tts_online_status():
     ok = probe_online()
     if ok is True:
         return {"online": True, "engine": "edge-tts", "detail": "edge-tts 在线"}
-    return {"online": False, "engine": "sapi",
+    return {"online": False, "engine": echo_platform.offline_tts_label(),
             "detail": "%s 本地（在线不可用）" % echo_platform.offline_tts_label()}
 
 

@@ -50,6 +50,45 @@ def expand_path(value):
                 .replace("{DATA}", paths.data_root()))
     return os.path.normpath(out)
 
+
+# ---- 平台声明的配置默认值 / 候选项（D11）------------------------------------
+# 为什么要有这两个函数：平台差异不只体现在"环境默认值"（paths.py 用的 dataDir），
+# 也体现在**配置项本身**上——macOS 没有 CUDA（device 该默认 cpu）、离线朗读是 say
+# 而不是 SAPI（ttsEngine 候选项不同）、精简依赖不含 funasr（sttModel 默认要落在 whisper）。
+# 这些原先散在 `mac/run_mac.py` 的"注入式覆盖 DEFAULTS"里；现在**声明式**放在各平台
+# `env.py` 的 PLATFORM_DEFAULTS，由本模块消费。
+#
+# 关键约定：**平台没声明 = 用 DEFAULTS 里的 Windows 基准值**。所以 Windows 行为零变化，
+# 而别的平台只需在自己的 env.py 里加一行，不必改共享代码、也不必在入口处 monkeypatch。
+def platform_default(key, fallback=None):
+    """该平台声明的默认值；没声明返回 ``fallback``。"""
+    try:
+        from app import platform as echo_platform
+        value = echo_platform.setting_default(key)
+    except Exception:
+        value = None
+    return fallback if value is None else value
+
+
+def platform_options(key, fallback=None):
+    """该平台声明的候选项（面板下拉用）；没声明返回 ``fallback``。"""
+    try:
+        from app import platform as echo_platform
+        opts = echo_platform.setting_options(key)
+    except Exception:
+        opts = None
+    return fallback if opts is None else opts
+
+
+def _effective_default(key, meta):
+    """某个配置项在当前平台上的实际默认值。"""
+    return platform_default(key, meta["value"])
+
+
+def _effective_options(key, meta):
+    """某个配置项在当前平台上的实际候选项。"""
+    return platform_options(key, meta.get("options", []))
+
 # ---- 极简回复要求文案（两个版本都保留：V1 是已落库的旧默认值，用于迁移比对）----
 # V1：只回极简结论、详情留在会话里。
 _MINIMAL_REPLY_HINT_V1 = (
@@ -386,21 +425,23 @@ class Settings:
         if self._cache is None:
             self._cache = {}
             for k, meta in DEFAULTS.items():
-                self._cache[k] = expand_path(db.get_setting(k, meta["value"]))
+                # 库里没有该键时，回落值是**本平台**的默认值（D11）
+                self._cache[k] = expand_path(db.get_setting(k, _effective_default(k, meta)))
         return self._cache
 
     def seed_defaults(self):
         """首次启动写入默认值 + 同步元数据（不覆盖已有 value）。"""
         for key, meta in DEFAULTS.items():
+            value = _effective_default(key, meta)          # 平台声明优先（D11）
+            options = _effective_options(key, meta)
             if db.get_setting(key) is None:
-                db.set_setting(key, meta["value"], grp=meta["grp"], label=meta["label"],
+                db.set_setting(key, value, grp=meta["grp"], label=meta["label"],
                                description=meta["description"], value_type=meta["value_type"],
-                               options=meta.get("options", []))
+                               options=options)
             else:
                 # 已有值：仅同步面板元数据（分组/说明/选项），保留用户 value
                 db.sync_setting_meta(key, meta["grp"], meta["label"],
-                                     meta["description"], meta["value_type"],
-                                     meta.get("options", []))
+                                     meta["description"], meta["value_type"], options)
                 # 旧默认值迁移（只在值仍等于旧默认时改写）
                 migration = DEFAULT_MIGRATIONS.get(key)
                 if migration:
@@ -408,7 +449,7 @@ class Settings:
                     if db.get_setting(key) == old_value:
                         db.set_setting(key, new_value, grp=meta["grp"], label=meta["label"],
                                        description=meta["description"], value_type=meta["value_type"],
-                                       options=meta.get("options", []))
+                                       options=options)
         self._cache = None
 
     def get(self, key, default=None):
@@ -465,19 +506,21 @@ class Settings:
         return cleaned
 
     def reset(self, key=None):
-        """恢复默认值（单个或全部）。"""
+        """恢复默认值（单个或全部）。默认值取**本平台**声明的那个（D11）。"""
         if key:
             if key in DEFAULTS:
-                db.set_setting(key, DEFAULTS[key]["value"], grp=DEFAULTS[key]["grp"],
-                               label=DEFAULTS[key]["label"], description=DEFAULTS[key]["description"],
-                               value_type=DEFAULTS[key]["value_type"],
-                               options=DEFAULTS[key].get("options", []))
+                meta = DEFAULTS[key]
+                db.set_setting(key, _effective_default(key, meta), grp=meta["grp"],
+                               label=meta["label"], description=meta["description"],
+                               value_type=meta["value_type"],
+                               options=_effective_options(key, meta))
         else:
             self.seed_defaults()
             for key, meta in DEFAULTS.items():
-                db.set_setting(key, meta["value"], grp=meta["grp"], label=meta["label"],
-                               description=meta["description"], value_type=meta["value_type"],
-                               options=meta.get("options", []))
+                db.set_setting(key, _effective_default(key, meta), grp=meta["grp"],
+                               label=meta["label"], description=meta["description"],
+                               value_type=meta["value_type"],
+                               options=_effective_options(key, meta))
         self._cache = None
 
 

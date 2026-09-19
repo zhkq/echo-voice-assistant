@@ -16,6 +16,21 @@ NAME = "darwin"
 
 PLATFORM_DEFAULTS = {
     "dataDir": os.path.join(os.path.expanduser("~"), "Library", "Application Support", "ECHO"),
+    # ---- 配置项的默认值与候选项（D11）----
+    # 这些值原来散在 ``mac/run_mac.py`` 的"注入式覆盖 DEFAULTS"里（D17 要收掉的那类），
+    # 现改为声明式，由 app/config.py 在 seed/reset/get 时消费（Windows 行为不受影响）。
+    "settingDefaults": {
+        # Mac 没有 CUDA：别让 "auto" 给人一种"会挑到 cuda"的错觉
+        "device": "cpu",
+        # mac 的精简依赖（mac/requirements-mac.txt）不含 funasr → 默认必须落在 whisper 档，
+        # 否则 sensevoice/qwen3asr 会静默转写失败
+        "sttModel": "base",
+        "meetingSttModel": "small",
+    },
+    "settingOptions": {
+        # 离线朗读在 macOS 上是 say，不是 Windows 的 SAPI
+        "ttsEngine": ["auto", "edge-tts", "say", "off"],
+    },
 }
 
 

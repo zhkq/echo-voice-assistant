@@ -19,6 +19,11 @@ for p in (BASE_DIR, MAC_DIR):
         sys.path.insert(0, p)
 
 # ---- 1) 先把 Mac 版配置默认值改好（seed_defaults 之前生效）----
+# ⚠️ P3 / D11 之后，下面 sttModel / meetingSttModel / device 三行**已经冗余**：
+# 同样的值现在声明式写在 `app/platform/darwin/env.py::PLATFORM_DEFAULTS["settingDefaults"]`，
+# 由 app/config.py 在 seed/reset/get 时消费（这样"平台默认值"不再需要入口 monkeypatch）。
+# 保留是因为这个入口在过渡期仍是 mac 的唯一启动方式（D17 要收掉它，属 P3 的 mac 半边，
+# 需要 mac 开发机）；两条路目前等价，不会互相打架。
 import app.config as _config  # noqa: E402
 
 # macOS 独立原生宿主；保留用户显式选择的浏览器模式。

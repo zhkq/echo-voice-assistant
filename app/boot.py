@@ -317,7 +317,9 @@ def _start_tts(report):
     eng = settings.get("ttsEngine", "auto")
     online = tts.probe_online()
     offline = echo_platform.offline_tts_display()
-    if eng == "sapi":
+    # 离线引擎的配置值按平台不同（Windows=sapi / macOS=say / Linux=espeak）
+    offline_ids = {"sapi", str(echo_platform.offline_tts_label() or "")}
+    if eng in offline_ids:
         detail = "离线 · %s" % offline
     elif eng == "edge-tts":
         detail = "在线 · edge-tts" if online else "在线(不可达，将回退 %s)" % offline

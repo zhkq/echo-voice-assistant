@@ -19,6 +19,12 @@ PLATFORM_DEFAULTS = {
     "modelInstallCommands": {
         "qwen3asr": "powershell -ExecutionPolicy Bypass -File scripts\\install-qwen3asr.ps1",
     },
+    # ---- 配置项的默认值与候选项（D11）----
+    # Windows 是基准平台：这里声明的值与 config.DEFAULTS 一致（显式写出来是为了
+    # 三个平台一眼可比，而不是靠"Windows 没声明所以用基准"来推断）。
+    "settingOptions": {
+        "ttsEngine": ["auto", "edge-tts", "sapi", "off"],
+    },
 }
 
 

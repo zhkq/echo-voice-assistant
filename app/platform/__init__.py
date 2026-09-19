@@ -186,6 +186,28 @@ def model_install_command(name: str, fallback: str = "") -> str:
     return str(table.get(name) or fallback)
 
 
+# ---------------------------------------------------------------- 配置默认值（D11）
+# 平台差异不只体现在"环境默认值"上，也体现在**配置项的默认值与候选项**上：
+#   * macOS 没有 CUDA → device 默认应为 cpu，不该让用户看到"auto 会挑 cuda"的假象；
+#   * macOS 的离线朗读是 say，不是 Windows 的 SAPI → ttsEngine 候选项里不该出现 sapi；
+#   * macOS 精简依赖不含 funasr → sttModel 默认要落在 whisper 档，否则静默转写失败。
+# 这些以前散在 ``mac/run_mac.py`` 的"注入式覆盖 DEFAULTS"里（D17 要收掉的那类）；
+# 现在改成**声明式**放在各平台 env.py 的 PLATFORM_DEFAULTS 里，由 app/config.py 消费。
+# 声明缺失 = 用 ``config.DEFAULTS`` 里的 Windows 基准值，所以 Windows 行为零变化。
+
+def setting_default(key: str):
+    """该平台为某个配置项声明的默认值；没声明返回 ``None``（= 用 Windows 基准值）。"""
+    table = defaults().get("settingDefaults") or {}
+    return table.get(key)
+
+
+def setting_options(key: str):
+    """该平台为某个配置项声明的候选项（面板下拉用）；没声明返回 ``None``。"""
+    table = defaults().get("settingOptions") or {}
+    opts = table.get(key)
+    return list(opts) if opts else None
+
+
 def hf_executable(install_root: str) -> str:
     """venv 里的 hf 命令行入口。"""
     fn = _platform_fn("hf_executable")
