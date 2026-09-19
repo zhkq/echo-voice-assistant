@@ -145,19 +145,46 @@ class EveryPlatformImplementsThePrimitives(unittest.TestCase):
                          "每个平台的 env.py 都要实现同一组接缝原语：\n" + "\n".join(missing))
 
     def test_every_platform_has_a_hotkey_implementation(self):
-        """三平台都要有全局热键实现模块（macOS/Linux 走 POSIX 共享实现）。
+        """三平台都要有全局热键实现（macOS/Linux 走 POSIX 共享实现）。
 
-        本机没有 mac，所以只能静态断言"模块存在 + 接口齐"；真正的可用性属
-        S10（免授权 Carbon 宿主）与 mac 实测。
+        分两层断言，**必须都能在三平台 CI 上跑**：
+          * 静态：三个平台都要有 ``hotkey.py`` 文件（不依赖能否导入）；
+          * 动态：**能导入的才导入** —— ``app/platform/win32/hotkey.py`` 在模块级就用
+            ``ctypes.windll``，非 Windows 上导入即 AttributeError（本身没错，它是
+            Windows 实现）。macOS 上真跑这条时，导入 win32 实现属于测试自己的问题，
+            不是产品缺陷。
+
+        真正的可用性属 S10（免授权 Carbon 宿主）与 mac 实测；这里只保证接口与文件齐。
         """
         import importlib
 
         missing = []
         for name in ("win32", "darwin", "linux"):
+            path = os.path.join(ROOT, "app", "platform", name, "hotkey.py")
+            if not os.path.isfile(path):
+                missing.append("app/platform/%s/hotkey.py（文件缺失）" % name)
+                continue
+            if name == "win32" and os.name != "nt":
+                continue                      # Windows 实现：非 Windows 导入不了，跳过动态检查
             mod = importlib.import_module("app.platform.%s.hotkey" % name)
             if not callable(getattr(mod, "HotkeyListener", None)):
-                missing.append("%s.HotkeyListener" % name)
+                missing.append("%s.HotkeyListener（接口缺失）" % name)
         self.assertEqual(missing, [], "三平台都要有热键实现：\n" + "\n".join(missing))
+
+    def test_hotkey_facade_imports_on_every_platform(self):
+        """``app/hotkey.py`` 是门面，**任何平台都必须能 import**。
+
+        这正是 1.x 的结构性缺陷：那时 ``app/hotkey.py`` 自己就是 Windows 实现
+        （模块级 ctypes.windll），非 Windows 上导入即失败，只能靠 ``mac/run_mac.py``
+        往 ``sys.modules`` 里塞替身。门面化之后，导入面与平台实现解耦 ——
+        这条断言就是那个承诺的可执行版本（三平台 CI 都会跑到）。
+        """
+        import app.hotkey as facade
+        from app import platform as echo_platform
+
+        self.assertIs(facade.impl, echo_platform.hotkey_impl())
+        self.assertIs(facade.HotkeyListener, echo_platform.hotkey_impl().HotkeyListener)
+        self.assertTrue(callable(facade.parse_hotkey_combo))
 
 
 class ScannerSelfTest(unittest.TestCase):

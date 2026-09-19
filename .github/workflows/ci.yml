@@ -1,14 +1,20 @@
 # CI for ECHO.
 #
-# Design (2026-09-15):
-#   * Windows is the primary platform, so the *contract* job runs on BOTH ubuntu and
-#     windows: it needs no heavy dependencies (stdlib + ruff only) and catches the
-#     failure class that used to slip through by hand: undefined names left behind by
-#     removed imports (ruff F821) plus syntax errors (E9), and any change that drags
-#     macOS-only code into app/ (tests/test_platform_contract.py).
+# Design (2026-09-15, extended 2026-09-19 with macOS):
+#   * The *contract* job runs on ALL THREE platforms: it needs no heavy dependencies
+#     (stdlib + ruff only) and catches the failure class that used to slip through by
+#     hand: undefined names left behind by removed imports (ruff F821) plus syntax
+#     errors (E9), platform code dragged into app/ (tests/test_platform_contract.py),
+#     and the platform seam breaking on a platform we do not develop on
+#     (tests/test_path_seam.py + tests/test_paths.py).
+#     macOS is in the matrix precisely because nobody here develops on one: without
+#     this job, a Windows-only import at module level (the 1.x defect that forced the
+#     `sys.modules` injection hack) would only be discovered by a human on a Mac.
 #   * The full Windows smoke (real deps: torch / funasr / soundfile …) is heavy, so it
 #     is opt-in: manual dispatch or the weekly schedule. Locally the same thing is
 #     scripts/check-windows.ps1, which gh-push.ps1 runs before every push.
+#     A macOS full smoke is NOT here yet: it needs the mac dependency set
+#     (mac/requirements-mac.txt) plus a runner with the right Python; tracked in P3/P4.
 name: CI
 
 on:
@@ -26,7 +32,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
 
@@ -47,6 +53,10 @@ jobs:
 
       - name: Cross-platform contract tests
         run: python -m unittest -q tests.test_platform_contract
+
+      - name: Platform seam + path layer guards
+        # 纯标准库：不需要 torch 之类重依赖，所以三平台都能跑
+        run: python -m unittest -q tests.test_path_seam tests.test_paths
 
   windows-smoke:
     name: windows smoke (full deps)

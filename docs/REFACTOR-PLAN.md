@@ -1307,7 +1307,6 @@ powershell -File scripts\switch-instance.ps1 -InstallAutostart
 5. `scripts/check-windows.ps1` 作为提交门槛（已有）+ 加 mac CI（D12）。
 
 **落地状态（2026-09-19 "安全网轮"，第 1–4 项已完成并进门禁：206 → 352 个单测）**
-
 | 项 | 落地文件 | 用例 | 钉住了什么 |
 |---|---|---|---|
 | 1 API 契约 | `tests/test_api_contract.py` | 21 | `/api/meeting/start\|stop\|status` 的方法/结构/失败语义（200+`ok:false`）、`data\echo-port.txt` 的位置与读写语义、**SKILL.md 与路由/端口层交叉核对**（文档漂移即红） |
@@ -1449,6 +1448,11 @@ import 时就把缓存路径算死）。落点：`app/main.py` 的 lifespan 里 
   `docs/P3-收口施工方案.md` §11。
 - **S8 进展**：接缝已能按平台选实现（新增用例把 `current()` 切到 darwin/linux 即验证），
   但 `mac/run_mac.py` 仍注入 `app.runtime`（D19 的 mac 常驻宿主未做）→ 记 ⚠️ 部分完成。
+- **D12 的三平台 CI 已落地（2026-09-19）**：`ci.yml` 的 `static` 矩阵加入 `macos-latest`，
+  并新增一步 `tests/test_path_seam.py + tests/test_paths.py`（纯标准库）。mac 进矩阵的意义
+  在于：我们没人用 mac 开发，而"业务代码里出现平台专有 import"这类问题以前只能等人在 mac 上撞见
+  （1.x 的 `app/hotkey.py` 就是例子）。mac 的**全量**冒烟（装 `mac/requirements-mac.txt`）
+  仍未进 CI，属 P3/P4。
 - **注意**：清点清零 ≠ D12 收口完毕。`app/platform/` 里仍留着一批**未在 mac 上实测**的
   实现（`say`/`afplay`/`open`/pynput 授权）；D11 的"配置默认值声明式化"（如 `ttsEngine`
   候选按平台给）也还没做。
