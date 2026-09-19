@@ -74,6 +74,11 @@ def parse_hotkey_combo(combo):
 
     支持单个字母/数字（A-Z、0-9）与命名键（F1-F12、Space、Enter、Esc 等）——
     RegisterHotKey 接到的是虚拟键码，Shift 不必换算成不同 vk（vk 用基础键即可）。
+
+    修饰键必须是**认识的一个或多个**（2026-09-19 安全网修正）：原实现把不认识的
+    修饰键静默忽略，于是 `"+V"` / `"Meta+V"` 会解析成 mods 只剩 MOD_NOREPEAT 的
+    "全局裸键 V" —— RegisterHotKey 装上去会把用户系统里**所有** V 键都吞掉，
+    而单写 `"V"` 早就被 len(parts)<2 拒掉了。判据现在一致：没有识别到修饰键 = 无效。
     """
     if not combo:
         return None
@@ -98,6 +103,10 @@ def parse_hotkey_combo(combo):
             mods |= MOD_SHIFT
         elif ml == "win":
             mods |= MOD_WIN
+        else:
+            return None      # 空修饰键 / 拼错的修饰键：拒绝，不退化成全局裸键
+    if not mods:
+        return None
     return mods | MOD_NOREPEAT, vk
 
 

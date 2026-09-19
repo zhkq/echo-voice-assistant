@@ -40,6 +40,12 @@ def _log(cid, level, msg):
 
 def register(cid, label, icon, start_fn=None, stop_fn=None, can_start=True,
              can_stop=False, deps=(), kind="service", status="pending"):
+    """登记组件。
+
+    幂等（2026-09-19 安全网）：重复 register 同一个 id 只覆盖定义、**不重复入列**。
+    原来每次都往 `_ORDER` 追加，于是 setup() 被调用两次（测试里很常见，未来热重载
+    也可能）时 snapshot() 会把同一个组件列两遍、summary.total 也跟着翻倍。
+    """
     with _LOCK:
         _COMPONENTS[cid] = {
             "id": cid, "label": label, "icon": icon,
@@ -49,7 +55,8 @@ def register(cid, label, icon, start_fn=None, stop_fn=None, can_start=True,
             "deps": list(deps), "kind": kind,
             "_start_fn": start_fn, "_stop_fn": stop_fn,
         }
-        _ORDER.append(cid)
+        if cid not in _ORDER:
+            _ORDER.append(cid)
 
 
 def set_phase(p):
