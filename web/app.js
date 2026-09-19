@@ -1051,7 +1051,7 @@ async function renderProvidersCard(host) {
   let html = `<div class="set-group-title" style="padding:0 0 6px 0">
       <span>能力 provider</span>
       <span class="spacer"></span>
-      <span class="muted" style="font-size:12px">选"用哪个"；装什么见「组件」页签</span>
+      <span class="muted" style="font-size:12px">选「用哪个」；「装什么」见「组件」页签</span>
     </div>`;
   for (const k of kinds) {
     const items = byKind(k.id);
@@ -1081,7 +1081,8 @@ async function renderProvidersCard(host) {
       `内网网关的地址属单位内部信息，需自己填。</div></div>`;
     host.dataset.presets = JSON.stringify(fills);
   }
-  html += `<div class="desc muted" style="padding:4px 0">改完下面「能力 provider」分组里的配置后点上方<b>保存</b>。</div>`;
+  html += `<div class="desc muted" style="padding:4px 0">地址/密钥在上方「能力 provider」分组里填（密钥留空 = 不改），` +
+    `填完点最上面的<b>保存</b>生效。</div>`;
   host.innerHTML = `<div class="set-group"><div class="set-group-body">${html}</div></div>`;
 }
 
