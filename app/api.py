@@ -897,6 +897,24 @@ def api_components(platform: str = "", includeBlocked: bool = False,
     return components.catalog(platform=platform or None, include_blocked=bool(includeBlocked))
 
 
+# ---------------------------------------------------------------- 能力 provider（P5 / D25）
+# ASR / LLM / TTS 三类能力的统一清单：谁在生效、是不是要出网（egress）、就绪与否。
+# 与 /api/components 的分工：**components = 装什么**（模型/引擎/运行时的安装与就绪），
+# **providers = 用哪个**（能干活的能力实现，含在线服务）。P5 的"配一个在线 LLM 就能出纪要"
+# 就是靠 providerLlm 选择 ECHO AUTO 实现的。
+
+@router.get("/providers")
+def api_providers(ready: bool = False, _auth=Depends(optional_auth)):
+    """provider 清单（默认不探测，只列清单；``ready=true`` 时才做就绪探测）。
+
+    就绪探测会碰网络（例如 edge-tts 的在线探针）与依赖（funasr 之类），所以默认关掉 ——
+    面板按需传 ``ready=true``，避免每次打开设置页都打一次外网。
+    **响应里不含任何凭据**（令牌只留在进程内，见 app/providers/router.py 的说明）。
+    """
+    from app import providers as providers_mod
+    return providers_mod.catalog(ready=bool(ready))
+
+
 # ---------------------------------------------------------------- 声纹库（常用联系人）
 # 会议里把说话人改名为联系人即自动入库（voiceprintAutoEnroll）；
 # 库里的样本可在面板「说话人管理」查看/删除，这里是对应的 REST 入口。

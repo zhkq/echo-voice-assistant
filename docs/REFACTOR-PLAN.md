@@ -1453,6 +1453,13 @@ import 时就把缓存路径算死）。落点：`app/main.py` 的 lifespan 里 
   在于：我们没人用 mac 开发，而"业务代码里出现平台专有 import"这类问题以前只能等人在 mac 上撞见
   （1.x 的 `app/hotkey.py` 就是例子）。mac 的**全量**冒烟（装 `mac/requirements-mac.txt`）
   仍未进 CI，属 P3/P4。
+- **D11 已落地（2026-09-19）**：配置项的默认值/候选项改成**平台声明式**
+  （`PLATFORM_DEFAULTS["settingDefaults"/"settingOptions"]`，`config.py` 在 seed/reset/读回落值/
+  面板候选项四处消费）；mac 上 `device=cpu`、`sttModel=base`、`ttsEngine` 给 `say` 而不是 `sapi`。
+- **P5 已开工（2026-09-19，第一切片）**：`app/providers/` —— ASR/LLM/TTS 三类 provider 的
+  抽象与注册表、本地适配器、以及 **D25 的落点**（多上游派发路由作为 LLM provider `echo-auto`）、
+  三个选择项配置（`providerAsr/Llm/Tts`）与只读接口 `GET /api/providers`。在线服务预设、
+  凭据管理（`secret` 元数据 + 不回显）、纪要走 `active("llm")` 仍待做。
 - **注意**：清点清零 ≠ D12 收口完毕。`app/platform/` 里仍留着一批**未在 mac 上实测**的
   实现（`say`/`afplay`/`open`/pynput 授权）；D11 的"配置默认值声明式化"（如 `ttsEngine`
   候选按平台给）也还没做。

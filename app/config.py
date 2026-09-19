@@ -363,6 +363,18 @@ DEFAULTS = {
                             description="可执行文件路径；留空 = 自动探测"
                                         "（PATH → WorkBuddy 内置目录）。仅在自动探测失败时需要填",
                             value_type="str", hidden=True),
+    # ---------- 能力 provider（P5 / D25：ASR / LLM / TTS 各选一个）----------
+    # 留空 = 用该 kind 的默认实现（本地转写引擎 / ECHO AUTO 多上游路由 / 本平台离线朗读）。
+    # 可选项是**运行时**注册出来的（见 GET /api/providers），所以这里不写死 options。
+    "providerAsr": dict(value="", grp="provider", label="转写 provider",
+                        description="留空 = 默认的本地转写引擎。可选值见 GET /api/providers（面板「组件」页）",
+                        value_type="str"),
+    "providerLlm": dict(value="", grp="provider", label="语言模型 provider",
+                        description="留空 = ECHO AUTO（多上游派发路由）。配了它，纪要不依赖 agent 也能生成",
+                        value_type="str"),
+    "providerTts": dict(value="", grp="provider", label="朗读 provider",
+                        description="留空 = 默认的离线朗读；选 edge-tts 则文本会出网（见 /api/providers 的出网标注）",
+                        value_type="str"),
     # ---------- 面板 ----------
     "panelAutoRefresh": dict(value=3, grp="panel", label="面板自动刷新秒",
                              description="仪表盘轮询间隔（0=关闭）", value_type="int"),
