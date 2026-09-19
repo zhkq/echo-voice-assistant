@@ -100,23 +100,89 @@ class BeepFilesTests(unittest.TestCase):
                 self.assertGreater(peak, 0.05, "%s 峰值太低，会被当成没声音" % name)
                 self.assertLess(peak, 0.99, "%s 削顶了" % name)
 
-    def test_shortest_beep_is_not_below_the_known_latency_floor(self):
-        """`done.wav` 只有 90 ms，是实测**唯一**会被吞掉的一声。
+    def test_no_beep_is_shorter_than_200ms(self):
+        """所有提示音都不得短于 200 ms（2026-09-19 之后的硬底线）。
 
-        这条测试是**记录现状并加护栏**：任何一声短于 120 ms 都会被这条老通路
-        （MME/waveOut）的启动延迟吃掉。要改短必须同时改这个断言 —— 逼人看一眼注释。
+        来历：`done.wav` 原来是 **700 Hz / 90 ms**，用户实测**三条通路全都听不到**
+        （winsound 接缝 / sounddevice / 垫 200ms 静音），而 120 ms 以上的 start/ok/ok2/err
+        都听得到；文件格式与电平与其它四个逐项相同。用户拍板"换个提示音、时间更长一点"
+        -> 已用 `scripts/make_beeps.py --write done` 重生成（880→660 Hz、0.29 s、峰值 0.150）。
+
+        这条断言就是那次事故的护栏：提示音是**给耳朵用的反馈**，宁可长一点、
+        也不能短到听不见。要改短必须同时改这里与 docs/2.0-PROGRESS §34。
         """
         import soundfile as sf
-        shortest = None
+        shortest = []
         for name in self.BEEPS:
             data, sr = sf.read(os.path.join(tts.BEEPS_DIR, name + ".wav"), dtype="float32")
             dur = len(data) / float(sr)
-            if shortest is None or dur < shortest[1]:
-                shortest = (name, dur)
-        self.assertEqual(shortest[0], "done")
-        self.assertLess(shortest[1], 0.12,
-                        "done.wav 已不短于 120ms：若真是它被吞，说明原因不是时长，"
-                        "请更新本条测试与 docs 里的结论")
+            shortest.append((name, round(dur, 3)))
+            with self.subTest(name=name):
+                self.assertGreaterEqual(dur, 0.20,
+                                        "%s.wav 只有 %.3fs，短提示音实测会被听漏" % (name, dur))
+        print("beep durations: %s" % shortest)
+
+    def test_done_beep_is_the_new_two_tone(self):
+        """`done` 是"停止录音"的反馈，必须是那个可复现的下行两音（不许被换回 90ms 短音）。"""
+        import numpy as np
+        import soundfile as sf
+        data, sr = sf.read(os.path.join(tts.BEEPS_DIR, "done.wav"), dtype="float32")
+        dur = len(data) / float(sr)
+        self.assertGreaterEqual(dur, 0.25, "done 应为两音约 0.29s，实际 %.3fs" % dur)
+        for i, (lo, hi, want) in enumerate([(0, int(sr * 0.13), 880),
+                                            (int(sr * 0.16), int(sr * 0.29), 660)]):
+            seg = data[lo:hi] * np.hanning(len(data[lo:hi]))
+            freqs = np.fft.rfftfreq(len(seg), 1.0 / sr)
+            peak = freqs[int(np.argmax(np.abs(np.fft.rfft(seg))))]
+            with self.subTest(tone=i + 1):
+                self.assertLess(abs(peak - want), 25,
+                                "第%d个音应为 %dHz 附近，实测 %.0fHz" % (i + 1, want, peak))
+
+    def test_all_five_are_reproducible_from_the_generator(self):
+        """`scripts/make_beeps.py` 是**全部五个**提示音的权威来源（2026-09-19 起）。
+
+        参数表与实际文件一旦分叉（有人手改 wav、或改了参数忘了重生成），这条就红。
+        旧波形（90ms 的 done 等）在 git 历史里可取回。
+        """
+        import importlib.util
+        import soundfile as sf
+        spec_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                 "scripts", "make_beeps.py")
+        spec = importlib.util.spec_from_file_location("echo_make_beeps", spec_path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        self.assertEqual(set(mod.GENERATED), set(self.BEEPS),
+                         "五个提示音都应由生成脚本产出")
+        for name in self.BEEPS:
+            with self.subTest(name=name):
+                want = mod.synth(mod.SPECS[name])
+                got, sr = sf.read(os.path.join(tts.BEEPS_DIR, name + ".wav"), dtype="float32")
+                self.assertEqual(sr, mod.SR)
+                self.assertLessEqual(abs(len(got) - len(want)), 16,
+                                     "%s.wav 与参数表长度不符（是不是手改过？）" % name)
+
+
+class BeepOkPairTests(unittest.TestCase):
+    """`beep_ok()`：ok → ok2 两连音，间隔必须够第一个音播完。"""
+
+    def test_pair_plays_in_order_with_enough_gap(self):
+        calls = []
+        sleeps = []
+        with patch.object(tts, "play_beep", lambda n: calls.append(n)), \
+                patch.object(tts.time, "sleep", lambda s: sleeps.append(s)):
+            tts.beep_ok()
+        self.assertEqual(calls, ["ok", "ok2"])
+        self.assertEqual(len(sleeps), 1)
+        self.assertGreaterEqual(sleeps[0], 0.20,
+                                "间隔太短会把第一个音截断（异步通路下一次调用会打断上一次）")
+
+    def test_gap_follows_the_file_length(self):
+        with patch.object(tts, "_beep_seconds", return_value=0.5):
+            calls, sleeps = [], []
+            with patch.object(tts, "play_beep", lambda n: calls.append(n)), \
+                    patch.object(tts.time, "sleep", lambda s: sleeps.append(s)):
+                tts.beep_ok()
+        self.assertAlmostEqual(sleeps[0], 0.54, places=2)
 
 
 if __name__ == "__main__":

@@ -213,7 +213,22 @@ def speak_async(text, engine="auto"):
 
 
 def beep_ok():
+    """「已发送」确认音：ok → ok2 两连音。
+
+    注意间隔：异步播放通路里**下一次 PlaySound 会打断上一次**，所以间隔必须 ≥ 第一个音的
+    时长，否则 ok 会被 ok2 拦腰截断（原来固定 0.08s，而提示音加长到 0.22s 之后就是把
+    ok 切掉了 3/4）。现在按"文件实际时长 + 余量"来等。
+    """
     play_beep("ok")
-    import time
-    time.sleep(0.08)
+    time.sleep(_beep_seconds("ok") + 0.04)
     play_beep("ok2")
+
+
+def _beep_seconds(name, default=0.22):
+    """提示音时长（读文件头；读不到就用默认值）。"""
+    try:
+        import wave
+        with wave.open(os.path.join(BEEPS_DIR, name + ".wav"), "rb") as w:
+            return w.getnframes() / float(w.getframerate())
+    except Exception:
+        return default
