@@ -502,7 +502,9 @@ class DshAgent(AgentAdapter):
             「日常交互」）——这时轮换一次，让新会话出现在正确的工作区分组下。
         commandIdleRotateHours=0 或空 时关闭按空闲轮换（工作区不匹配仍会轮换）。
         """
-        row = db.get_session("command")
+        # 只认本后端建的会话（2026-09-19）：切到独立 harness 后，绝不能拿着 Desktop 的
+        # session_id 去发命令 —— 那正是"配置了独立 dsh 但命令还是发到 desktop"的原因。
+        row = db.get_session("command", agent=self.name)
         sid = (row or {}).get("session_id") or ""
         want_ws = (settings.get("commandWorkspace", "") or "").strip()
         idle_h = None
@@ -532,7 +534,7 @@ class DshAgent(AgentAdapter):
         if sid and (misplaced or idle_rotate):
             new_sid = self._new_default_session(want_ws)
             if new_sid:
-                db.upsert_session("command", new_sid, "命令会话")
+                db.upsert_session("command", new_sid, "命令会话", agent=self.name)
                 if idle_rotate and not misplaced:
                     db.add_log("info", "assistant",
                                f"默认命令会话空闲 {idle_h:.1f}h（阈值 {rotate_hours:g}h）"
@@ -541,19 +543,22 @@ class DshAgent(AgentAdapter):
         if not sid:
             sid = self._new_default_session(want_ws)
             if sid:
-                db.upsert_session("command", sid, "命令会话")
+                db.upsert_session("command", sid, "命令会话", agent=self.name)
         db.touch_session("command")  # 记录本次使用时间，作为下次轮换依据
         return sid
 
     def ensure_session(self, kind, name=""):
-        """取回（无则创建）指定用途的 DSH 会话：command / summary。"""
-        row = db.get_session(kind)
+        """取回（无则创建）指定用途的会话：command / summary。
+
+        `agent=self.name` 让"换后端"自动失效旧会话（见 db.get_session 的说明）。
+        """
+        row = db.get_session(kind, agent=self.name)
         if row and row.get("session_id"):
             return row["session_id"]
         ws = (settings.get("commandWorkspace", "") or "").strip() if kind == "command" else ""
         sid = self._new_default_session(ws)
         if sid:
-            db.upsert_session(kind, sid, name or kind)
+            db.upsert_session(kind, sid, name or kind, agent=self.name)
         return sid
 
     def wait_for_reply(self, session_id, timeout=90, poll=0.5):

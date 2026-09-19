@@ -855,7 +855,7 @@ def _summary_session(client, meeting_id):
     if sid:
         return sid
 
-    row = db.get_meeting_session(meeting_id)
+    row = db.get_meeting_session(meeting_id, agent=getattr(client, "name", ""))
     if row and row.get("session_id"):
         sid = row["session_id"]
         with _MEETING_SESSIONS_LOCK:
@@ -883,7 +883,8 @@ def _summary_session(client, meeting_id):
         with _MEETING_SESSIONS_LOCK:
             _MEETING_SESSIONS[meeting_id] = sid
         try:
-            db.upsert_meeting_session(meeting_id, sid, workspace_id)
+            db.upsert_meeting_session(meeting_id, sid, workspace_id,
+                                      agent=getattr(client, "name", ""))
         except Exception as e:
             db.add_log("warn", "meeting", f"会议会话映射落库失败：{e}")
         db.add_log("info", "meeting",

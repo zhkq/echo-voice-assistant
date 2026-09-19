@@ -335,15 +335,24 @@ def post_command(body: CommandIn, _auth=Depends(optional_auth)):
 
 @router.get("/dsh/targets")
 def get_dsh_targets(_auth=Depends(optional_auth)):
-    """命令发送目标：工作区列表 + 会话列表（供前端下拉选择）。"""
+    """命令发送目标：工作区列表 + 会话列表（供前端下拉选择）。
+
+    数据源是**当前选中的智能体**（2026-09-19 修正：原来是固定 DSH Desktop，于是面板里
+    选了独立 harness，下拉还列着桌面版的会话）。取不到时**不报 5xx**：面板要能照常显示
+    「默认」选项并把原因说出来（例如独立 harness 还没起来 / 没填 token）。
+    """
     from app.dsh import get_client, DshError
-    client = get_client()
     try:
+        client = get_client()
+        agent = getattr(client, "name", "")
         workspaces = client.list_workspaces()
         sessions = client.list_sessions_for()
     except DshError as e:
-        raise HTTPException(status_code=503, detail=str(e))
-    return {"workspaces": workspaces, "sessions": sessions}
+        return {"workspaces": [], "sessions": [], "agent": agent if "agent" in dir() else "",
+                "note": str(e)}
+    except Exception as e:                       # 兜底：未知异常也只降级，不让下拉炸掉
+        return {"workspaces": [], "sessions": [], "agent": "", "note": str(e)}
+    return {"workspaces": workspaces, "sessions": sessions, "agent": agent}
 
 
 @router.post("/assistant/capture")

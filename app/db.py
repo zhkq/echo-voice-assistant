@@ -261,10 +261,37 @@ MIGRATIONS = [
       PRIMARY KEY (meeting_id, label)
     );
     """),
+    (5, """
+    -- 会话归属哪个智能体后端（2026-09-19）：dsh_sessions 里那条命令/纪要会话是**在某个
+    -- 后端上创建的**（DSH Desktop / 独立 harness / CodeBuddy）。切换后端后旧 session_id
+    -- 在新后端上并不存在，必须当"没有会话"重新建 —— 否则命令会带着旧 id 发出去
+    -- （用户实测："我配置了独立 dsh 但是命令还是发到了 desktop"）。
+    ALTER TABLE dsh_sessions ADD COLUMN agent TEXT DEFAULT '';
+    ALTER TABLE meeting_sessions ADD COLUMN agent TEXT DEFAULT '';
+    """),
 ]
 
+def _migrate_session_owner(conn):
+    """v5：给已经存在的会话登记归属后端。
+
+    2026-09-19 之前 `app/dsh.get_client()` **固定**返回 DSH Desktop 适配器，
+    所以库里那几条 command/summary/meeting 会话一定是桌面版建的 → 补成 'dsh'。
+    不补的话 `agent` 是空串，会被当成"归属未知、可以复用"，切到独立 harness 后
+    又拿着桌面版的 session_id 去发（就是用户遇到的那个 bug）。
+    """
+    for table, col in (("dsh_sessions", "agent"), ("meeting_sessions", "agent")):
+        try:
+            cols = {row[1] for row in conn.execute("PRAGMA table_info(%s)" % table).fetchall()}
+            if col not in cols:
+                continue
+            conn.execute("UPDATE %s SET %s='dsh' WHERE %s IS NULL OR %s=''"
+                         % (table, col, col, col))
+        except Exception:
+            pass
+
+
 # 需要 Python 参与的迁移：版本号 → callable(conn)，在对应版本的 SQL 之后执行
-PY_MIGRATIONS = {2: _migrate_api_keys_hash}
+PY_MIGRATIONS = {2: _migrate_api_keys_hash, 5: _migrate_session_owner}
 
 
 # ---------------------------------------------------------------- 连接管理
@@ -335,6 +362,11 @@ def init():
                         "INSERT INTO meta(key,value) VALUES('schema_version',?) "
                         "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                         (str(version),))
+            conn.commit()
+            # 会话归属的自愈回填：v5 迁移会做一次，但**已经到 v5 的库**（例如先跑了 SQL 那半
+            # 步的开发库）不会再触发 → 这里无条件跑一遍。函数本身幂等、两张表都只有几行，
+            # 而且"owner 为空 = 早于独立 harness 存在 = 一定是桌面版建的"这个推理永远成立。
+            _migrate_session_owner(conn)
             conn.commit()
         finally:
             conn.close()
@@ -463,17 +495,31 @@ def clear_commands():
 
 # ---------------------------------------------------------------- dsh_sessions
 
-def upsert_session(kind, session_id, name=""):
-    """每个 kind 至多一条（command/summary）。chat 会话不入此表。"""
+def upsert_session(kind, session_id, name="", agent=""):
+    """每个 kind 至多一条（command/summary）。chat 会话不入此表。
+
+    `agent` 记下这条会话是**在哪个后端**上建的（换后端就得重新建，见 schema v5）。
+    """
     _exec(
-        "INSERT INTO dsh_sessions(name,kind,session_id) VALUES(?,?,?) "
+        "INSERT INTO dsh_sessions(name,kind,session_id,agent) VALUES(?,?,?,?) "
         "ON CONFLICT(kind) DO UPDATE SET session_id=excluded.session_id, name=excluded.name, "
-        "last_used_at=datetime('now','localtime')",
-        (name, kind, session_id))
+        "agent=excluded.agent, last_used_at=datetime('now','localtime')",
+        (name, kind, session_id, agent))
 
 
-def get_session(kind):
-    return _query_one("SELECT * FROM dsh_sessions WHERE kind=?", (kind,))
+def get_session(kind, agent=None):
+    """取登记的命令/纪要会话。
+
+    传了 `agent` 时，只认**同一个后端**建的会话：后端名对不上就返回 None（调用方会新建），
+    这样"切到独立 harness 后第一条命令"不会拿着 Desktop 的 session_id 去发。
+    """
+    row = _query_one("SELECT * FROM dsh_sessions WHERE kind=?", (kind,))
+    if row is None or not agent:
+        return row
+    owner = (dict(row).get("agent") or "").strip()
+    if owner and owner != agent:
+        return None
+    return row
 
 
 def list_sessions():
@@ -487,17 +533,26 @@ def touch_session(kind):
 # ------------------------------------------------------- meeting_sessions
 # 一场会议一个 DSH 会话（纪要/分段/语义分段/归档共用），下一场会议新建。
 
-def upsert_meeting_session(meeting_id, session_id, workspace_id=""):
+def upsert_meeting_session(meeting_id, session_id, workspace_id="", agent=""):
+    """一场会议一个会话；`agent` 记下它建在哪个后端上（换后端即失效，同 dsh_sessions）。"""
     _exec(
-        "INSERT INTO meeting_sessions(meeting_id,session_id,workspace_id,last_used_at) "
-        "VALUES(?,?,?,datetime('now','localtime')) "
+        "INSERT INTO meeting_sessions(meeting_id,session_id,workspace_id,agent,last_used_at) "
+        "VALUES(?,?,?,?,datetime('now','localtime')) "
         "ON CONFLICT(meeting_id) DO UPDATE SET session_id=excluded.session_id, "
-        "workspace_id=excluded.workspace_id, last_used_at=datetime('now','localtime')",
-        (meeting_id, session_id, workspace_id))
+        "workspace_id=excluded.workspace_id, agent=excluded.agent, "
+        "last_used_at=datetime('now','localtime')",
+        (meeting_id, session_id, workspace_id, agent))
 
 
-def get_meeting_session(meeting_id):
-    return _query_one("SELECT * FROM meeting_sessions WHERE meeting_id=?", (meeting_id,))
+def get_meeting_session(meeting_id, agent=None):
+    """取本场会议的会话；传 `agent` 时只认同一后端的（对不上就当没有，调用方会新建）。"""
+    row = _query_one("SELECT * FROM meeting_sessions WHERE meeting_id=?", (meeting_id,))
+    if row is None or not agent:
+        return row
+    owner = (dict(row).get("agent") or "").strip()
+    if owner and owner != agent:
+        return None
+    return row
 
 
 def touch_meeting_session(meeting_id):

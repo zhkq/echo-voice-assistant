@@ -391,5 +391,137 @@ class HarnessBootTests(unittest.TestCase):
         self.assertIn("测试", seen.get("detail", ""))
 
 
+class ClientFollowsSelectionTests(unittest.TestCase):
+    """命令/纪要必须发给**当前选中的**智能体（2026-09-19 用户实测反馈：
+
+    "我配置了独立 dsh 但是命令还是发到了 desktop" —— 原因是 `app/dsh.get_client()`
+    固定返回 DSH Desktop 适配器，而命令路径（assistant/meeting/worklog）都用它。
+    另一个同样致命的暗坑：`dsh_sessions` 里存着**旧后端**的 session_id，
+    切过去以后命令会带着那个 id 发（新后端根本没这个会话）→ 会话要按后端归属。
+    """
+
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.mkdtemp(prefix="echo-agent-owner-")
+        self._old = (db.DATA_DIR, db.DB_FILE)
+        db.DATA_DIR = self.tmp
+        db.DB_FILE = os.path.join(self.tmp, "test.db")
+        db.init()
+        settings.seed_defaults()
+        from app import agents
+        agents.reset()
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        from app import agents
+        agents.reset()
+        db.DATA_DIR, db.DB_FILE = self._old
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_get_client_follows_the_selected_agent(self):
+        from app.agents import dsh_agent as _dsh_mod
+        from app.agents import harness_agent as _harness_mod
+        from app.dsh import get_client, get_desktop_client
+
+        def fake_get(key, default=None):
+            if key == "agentBackend":
+                return "harness"
+            if key == "agentHarnessEnabled":
+                return True
+            return default
+
+        from app import agents
+        with patch("app.config.settings.get", fake_get), \
+                patch.object(_harness_mod.HarnessAgent, "available",
+                             lambda self, probe=False: (True, "")), \
+                patch.object(_dsh_mod.DshAgent, "available",
+                             lambda self, probe=False: (True, "")):
+            agents.reset()
+            self.assertEqual(get_client().name, "harness",
+                             "选了独立 harness，命令就该发给它")
+        # 桌面版进程管理仍要指名 DSH（与用户选谁无关）
+        self.assertEqual(get_desktop_client().name, "dsh")
+
+    def test_session_is_invalidated_when_backend_changes(self):
+        """同一个 kind 的会话属于另一个后端时 → 当没有会话。"""
+        db.upsert_session("command", "session-from-desktop", "命令会话", agent="dsh")
+        self.assertIsNotNone(db.get_session("command"))
+        self.assertIsNotNone(db.get_session("command", agent="dsh"))
+        self.assertIsNone(db.get_session("command", agent="harness"),
+                          "换后端后不能复用旧 session_id")
+
+    def test_new_session_records_its_owner(self):
+        db.upsert_session("command", "session-x", "命令会话", agent="harness")
+        row = dict(db.get_session("command"))
+        self.assertEqual(row["agent"], "harness")
+        self.assertEqual(row["session_id"], "session-x")
+
+    def test_ensure_session_creates_a_new_one_for_the_new_backend(self):
+        """端到端语义：库里是 Desktop 的会话 → 切到 harness 后要**新建**一个。"""
+        from app.agents.harness_agent import HarnessAgent
+        db.upsert_session("command", "session-desktop", "命令会话", agent="dsh")
+        a = HarnessAgent()
+        created = {"n": 0}
+
+        def fake_new(self, ws):
+            created["n"] += 1
+            return "session-harness"
+
+        with patch.object(HarnessAgent, "_new_default_session", fake_new):
+            sid = a.ensure_command_session("测试一下")
+        self.assertEqual(sid, "session-harness")
+        self.assertEqual(created["n"], 1, "必须新建，而不是沿用 Desktop 的会话")
+        row = dict(db.get_session("command"))
+        self.assertEqual(row["agent"], "harness")
+        self.assertEqual(row["session_id"], "session-harness")
+
+    def test_meeting_session_is_also_owner_scoped(self):
+        db.upsert_meeting_session(7, "m-session", "ws-1", agent="dsh")
+        self.assertIsNotNone(db.get_meeting_session(7, agent="dsh"))
+        self.assertIsNone(db.get_meeting_session(7, agent="harness"))
+        self.assertIsNotNone(db.get_meeting_session(7), "不传 agent 时保持旧语义（归档要用）")
+
+    def test_targets_endpoint_follows_agent_and_degrades(self):
+        """命令目标下拉的数据源也要跟着选中的智能体；取不到时降级而不是 5xx。"""
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        from app.api import router
+
+        app = FastAPI()
+        app.include_router(router)
+        client = TestClient(app)
+
+        class _Fake:
+            name = "harness"
+
+            def list_workspaces(self):
+                return [{"workspaceId": "w1", "title": "T"}]
+
+            def list_sessions_for(self):
+                return [{"sessionId": "s1"}]
+
+        with patch("app.dsh.get_client", lambda: _Fake()):
+            body = client.get("/api/dsh/targets").json()
+        self.assertEqual(body["agent"], "harness")
+        self.assertEqual(len(body["workspaces"]), 1)
+
+        class _Boom:
+            name = "harness"
+
+            def list_workspaces(self):
+                from app.agents.dsh_agent import DshError
+                raise DshError("没有 harness 访问 token")
+
+            def list_sessions_for(self):
+                return []
+
+        with patch("app.dsh.get_client", lambda: _Boom()):
+            resp = client.get("/api/dsh/targets")
+        self.assertEqual(resp.status_code, 200, "取不到目标不该让下拉炸掉")
+        body = resp.json()
+        self.assertEqual(body["workspaces"], [])
+        self.assertIn("token", body["note"])
+
+
 if __name__ == "__main__":
     unittest.main()

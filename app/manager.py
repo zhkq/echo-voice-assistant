@@ -26,9 +26,14 @@ ECHO_PID_FILE = os.path.join(DATA_DIR, "echo.pid")
 
 
 def dsh_ready():
-    """DSH Desktop API 是否可访问（两层认证通过才算）。"""
+    """DSH **Desktop** API 是否可访问（两层认证通过才算）。
+
+    这里刻意指名桌面版适配器（`get_desktop_client()`）：本函数回答的是"桌面版这个进程
+    在不在"，与用户当前选了哪个智能体无关（选独立 harness 时也该照实报告桌面版状态）。
+    """
     try:
-        return get_client().ping()
+        from app.dsh import get_desktop_client
+        return get_desktop_client().ping()
     except Exception:
         return False
 

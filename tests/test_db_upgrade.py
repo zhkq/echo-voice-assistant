@@ -44,6 +44,29 @@ FIXTURE = os.path.join(ROOT, "tests", "fixtures", "echo-1x-structure.json")
 #: 1.x 最后一个 schema 版本（= 真库里的 meta.schema_version）
 V1X_SCHEMA_VERSION = 4
 
+#: 代码当前的 schema 版本（跟着 MIGRATIONS 走，别写死 —— 2.0 会继续加版本）
+CURRENT_SCHEMA_VERSION = max(v for v, _ in db.MIGRATIONS)
+
+#: 1.x **之后有意新增**的列（每次加列都要在这里登记：哪张表 + 哪个列 + 为什么）。
+#: 结构快照测试的用意是"抓到手滑改旧表"，不是"永远不许演进" —— 所以有意的演进登记在案，
+#: 其余任何列/表的分叉仍然会红。
+#:   * dsh_sessions.agent / meeting_sessions.agent（v5，2026-09-19）：会话归属哪个智能体后端，
+#:     换后端（DSH Desktop ↔ 独立 harness ↔ CodeBuddy）后旧会话必须失效 —— 详见 app/db.py
+#:     的 _migrate_session_owner 与 PROGRESS §47。
+POST_1X_COLUMNS = {
+    ("dsh_sessions", "agent"),
+    ("meeting_sessions", "agent"),
+}
+
+
+def _without_post_1x_columns(tables):
+    """把"1.x 之后有意新增的列"从结构里摘掉，剩下的应当与 1.x 真库逐列相同。"""
+    out = {}
+    for table, cols in tables.items():
+        drop = {col for (t, col) in POST_1X_COLUMNS if t == table}
+        out[table] = [c for c in cols if c[0] not in drop]
+    return out
+
 
 # ---------------------------------------------------------------- 结构抓取
 
@@ -121,14 +144,22 @@ class SchemaSnapshotTests(_TempDbTestCase):
     def test_fresh_database_matches_the_real_1x_structure(self):
         db.init()
         actual = capture_structure(self.db_file)
-        self.assertEqual(actual["tables"], self.expected["tables"],
-                         "表/列定义与真实 1.x 库分叉了（要 append 迁移，别改旧表）")
+        # 有意新增的列先摘掉再比；同时要求它们**确实存在**（免得登记表烂掉）
+        for table, col in sorted(POST_1X_COLUMNS):
+            self.assertIn(col, [c[0] for c in actual["tables"].get(table, [])],
+                          "登记了 %s.%s 是 1.x 之后新增的列，但代码里没有它" % (table, col))
+        self.assertEqual(_without_post_1x_columns(actual["tables"]), self.expected["tables"],
+                         "表/列定义与真实 1.x 库分叉了（要 append 迁移，别改旧表；"
+                         "确实是有意新增的列就登记到 POST_1X_COLUMNS）")
         self.assertEqual(actual["indexes"], self.expected["indexes"])
 
     def test_schema_version_matches(self):
         db.init()
-        self.assertEqual(capture_structure(self.db_file)["schema_version"],
-                         self.expected["schema_version"])
+        fresh = capture_structure(self.db_file)["schema_version"]
+        self.assertEqual(int(fresh), CURRENT_SCHEMA_VERSION,
+                         "新建库应当是代码当前版本（%d）" % CURRENT_SCHEMA_VERSION)
+        self.assertLessEqual(int(self.expected["schema_version"]), int(fresh),
+                             "1.x 夹具的版本不该比代码还新")
 
 
 # ---------------------------------------------------------------- ② 升级路径
@@ -196,10 +227,13 @@ class V1UpgradeTests(_TempDbTestCase):
             ver = conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]
         finally:
             conn.close()
-        self.assertEqual(int(ver), V1X_SCHEMA_VERSION)
+        self.assertEqual(int(ver), CURRENT_SCHEMA_VERSION,
+                         "老库要升到代码当前版本")
         with open(FIXTURE, encoding="utf-8") as fh:
             expected_tables = json.load(fh)["tables"]
-        self.assertEqual(capture_structure(self.db_file)["tables"], expected_tables)
+        self.assertEqual(_without_post_1x_columns(capture_structure(self.db_file)["tables"]),
+                         expected_tables,
+                         "升级后的表结构与 1.x 逐列相同（有意新增的列除外）")
 
     def test_old_rows_survive_the_migration(self):
         mid = self._build_v1_database()
