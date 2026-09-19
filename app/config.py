@@ -419,7 +419,7 @@ DEFAULTS = {
                                 value_type="bool", hidden=True),
     "harnessHome": dict(value="", grp="agent", label="harness 数据目录（DSH_HOME）",
                         description="独立 harness 的家目录；留空 = {DATA}/harness。"
-                                    "**故意与 Desktop 的家目录分开**（各用各的），"
+                                    "刻意与 Desktop 的家目录分开（各用各的），"
                                     "两边的会话与设置互不干扰",
                         value_type="str", hidden=True),
     "harnessPort": dict(value=43199, grp="agent", label="harness 端口",
@@ -431,7 +431,9 @@ DEFAULTS = {
                                        "Node/npx 不在 PATH 里时，这里填 npx 全路径",
                            value_type="str", hidden=True),
     "harnessToken": dict(value="", grp="agent", label="harness 访问 token",
-                         description="只有当你**自己**启动了 harness 时才需要填（ECHO 自己拉起时自动获取）",
+                         description="只有当你自己启动了 harness（终端里跑 npx @deepseek-ai/dsh web）"
+                                     "才需要填它打印出来的 token；ECHO 自己拉起时会自动获取。"
+                                     "留空 = 不改动已配置的值",
                          value_type="str", hidden=True, secret=True),
     # ---------- 能力 provider（P5 / D25：ASR / LLM / TTS 各选一个）----------
     # 留空 = 用该 kind 的默认实现（本地转写引擎 / ECHO AUTO 多上游路由 / 本平台离线朗读）。

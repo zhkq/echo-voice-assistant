@@ -167,26 +167,33 @@ def active_agent():
 def agent_settings(cls):
     """某个智能体自己的配置项（面板在它的展开区里渲染）。
 
-    为什么走这条路而不是 /api/settings：这些键在 `config.DEFAULTS` 里标了 ``hidden``
+    为什么不走 /api/settings：这些键在 `config.DEFAULTS` 里标了 ``hidden``
     （不占设置页分组 —— "DSH 服务地址"摊在「面板与服务」里，用户根本不知道它跟谁有关，
     2026-09-19 用户实测原话："下面的 dsh 没必要吧，或者把端口挪上去"），
     于是 `settings.all()` 不下发它们，面板就需要另一条路读到当前值。
-    只回**非密钥**项：密钥永远不出接口（这个名单里也不该有密钥）。
+
+    **密钥**（`harnessToken` 这种）也在这里出现，但**只给"配没配"**（``secret=True`` +
+    ``hasValue``），值永不出接口（面板渲染成密码框，留空 = 不改；清空用 `__clear__`）。
+    2026-09-19 补：原来这类键被整个跳过，于是提示语让人"把 token 填到「harness 访问 token」里"
+    而面板上根本没有那一栏 —— 用户实测问"我在哪里配置 key"才发现的。
     """
     from app.config import DEFAULTS, _effective_options
     from app.config import settings as _s
     rows = []
     for key in getattr(cls, "settings_keys", ()) or ():
         meta = DEFAULTS.get(key)
-        if not meta or meta.get("secret"):
+        if not meta:
             continue
+        secret = bool(meta.get("secret"))
         rows.append({
             "key": key,
             "label": meta["label"],
             "description": meta["description"],
             "value_type": meta["value_type"],
-            "options": list(_effective_options(key, meta)),
-            "value": _s.get(key, meta["value"]),
+            "options": [] if secret else list(_effective_options(key, meta)),
+            "secret": secret,
+            "hasValue": bool(str(_s.get(key, "") or "").strip()) if secret else False,
+            "value": "" if secret else _s.get(key, meta["value"]),
         })
     return rows
 

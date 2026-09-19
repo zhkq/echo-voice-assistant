@@ -229,7 +229,12 @@ class HarnessAgentRegistryTests(unittest.TestCase):
         keys = {s["key"] for s in h["settings"]}
         self.assertIn("harnessCommand", keys)
         self.assertIn("harnessPort", keys)
-        self.assertNotIn("harnessToken", keys, "密钥不该经接口下发")
+        # 密钥行要下发（面板得有那一栏让用户填），但只报"配没配"，值永不出接口
+        token_row = [s for s in h["settings"] if s["key"] == "harnessToken"]
+        self.assertEqual(len(token_row), 1, "token 行应在，供面板渲染密码框")
+        self.assertTrue(token_row[0].get("secret"))
+        self.assertEqual(token_row[0].get("value"), "")
+        self.assertIn("hasValue", token_row[0])
 
     def test_config_keys_are_agent_group_and_hidden(self):
         for key in ("agentHarnessEnabled", "harnessHome", "harnessPort",

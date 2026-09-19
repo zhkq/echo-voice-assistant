@@ -1105,7 +1105,13 @@ function agentDetailHtml() {
     const id = "agent-set-" + s.key;
     const cur_val = _agentDirty[s.key] !== undefined ? _agentDirty[s.key] : s.value;
     let ctl;
-    if (s.value_type === "bool") {
+    if (s.secret) {
+      // 密钥：只显示"配没配"，值永不下发（后端也不回显）→ 密码框 + 留空 = 不改
+      // （2026-09-19 用户实测问"我在哪里配置 key"：这类键原来被整条跳过，面板上没处填）
+      ctl = `<input type="password" class="ctl" id="${id}" data-agent-field="${esc(s.key)}"
+               data-secret="1" value="" autocomplete="new-password"
+               placeholder="${s.hasValue ? "已配置（留空 = 不改）" : "未配置"}">`;
+    } else if (s.value_type === "bool") {
       ctl = `<input type="checkbox" class="ctl" id="${id}" data-agent-field="${esc(s.key)}"
                ${cur_val ? "checked" : ""}>`;
     } else if (s.options && s.options.length) {

@@ -620,6 +620,19 @@ class OptionAndPanelWiringTests(unittest.TestCase):
         self.assertIsNotNone(m)
         self.assertIn("white-space: nowrap", m.group(1))
 
+    def test_secret_agent_key_gets_a_password_field(self):
+        """智能体展开区里的密钥（harness 访问 token）要能填 —— 密码框 + 留空 = 不改。
+
+        2026-09-19 用户实测问"我在哪里配置 key"：提示语让人填 token，面板上却没那一栏。
+        """
+        js = _read(os.path.join("web", "app.js"))
+        block = js.split("function agentDetailHtml")[1].split("\nfunction ")[0]
+        self.assertIn("if (s.secret)", block, "密钥行要有单独分支")
+        self.assertIn('type="password"', block)
+        self.assertIn('data-secret="1"', block)
+        self.assertIn("已配置（留空 = 不改）", block, "占位符要说清留空不改")
+        self.assertIn("未配置", block)
+
     def test_agent_switch_also_enables_the_product(self):
         """智能体开关即单选：选中时要把该产品的启用开关一起打开，避免自相矛盾。"""
         js = _read(os.path.join("web", "app.js"))
