@@ -470,14 +470,37 @@ class OptionAndPanelWiringTests(unittest.TestCase):
         self.assertNotIn("providerTts", js, "弃用项不该被面板引用")
 
     def test_capability_page_covers_every_capability_kind(self):
-        """能力页签要按"能力种类"渲染，并且每类都能看到实现与组件两件事。"""
+        """能力页签按"能力种类"渲染，并且每类都能看到实现与组件两件事。"""
         js = _read(os.path.join("web", "app.js"))
         for token in ("const CAP_KINDS", "capKindCard", "capProviderBlock", "capCompTable",
                       "renderCapEnv", "function loadCapabilities"):
             with self.subTest(token=token):
                 self.assertIn(token, js)
-        self.assertIn('CAP_KINDS = ["asr", "llm", "tts"]', js)
+        self.assertIn('CAP_KINDS = ["asr", "tts"]', js,
+                      "能力页签只放转写与朗读；语言模型在「模型路由」页签里")
         self.assertIn("capCompsOf", js, "组件按 kind 归到对应能力卡里")
+
+    def test_language_model_block_lives_in_the_model_router_tab(self):
+        """语言模型（用哪个实现 + 在线服务）整合到「模型路由」页签（2026-09-19 用户要求）。
+
+        理由：LLM 的"用哪个实现"和路由的上游配置是同一件事 —— ECHO AUTO 的成员本来就在
+        那个页签里配，分两处只会互相找不着。
+        """
+        js = _read(os.path.join("web", "app.js"))
+        html = _read(os.path.join("web", "index.html"))
+        self.assertIn('id="rtLlmHost"', html)
+        self.assertLess(html.index('id="view-failover"'), html.index('id="rtLlmHost"'),
+                        "语言模型块要在「模型路由」页签里")
+        self.assertLess(html.index('id="rtLlmHost"'), html.index('id="rtBadge"'),
+                        "它排在通道设置之前（先选用哪个，再配通道）")
+        self.assertIn("function loadRouterLlm", js)
+        self.assertIn('capProviderBlock("llm")', js, "复用同一套渲染（状态/出网图标/在线服务字段）")
+        self.assertIn("loadRouterLlm();", js.split("async function loadRouter()")[1][:1200],
+                      "切到模型路由页签时要一并渲染语言模型块")
+        self.assertNotIn('title: "语言模型"', js, "能力页签不该再有语言模型卡")
+        # 两个页签共用同一份 provider 数据（不许各拉一遍），改完实现只刷当前那一页
+        self.assertIn("function ensureProviderData", js)
+        self.assertIn("refreshAfterProviderChange", js)
 
     def test_capability_card_shows_status_only_once(self):
         """能力卡的状态只显示一次（2026-09-19 用户看截图指出：下拉下面的附属、两种实现都是重复）。

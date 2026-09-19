@@ -382,6 +382,7 @@ async function loadRouter() {
     renderRouterMembers();
     renderRouterCandidates();
   } catch (e) { toast("加载模型路由失败：" + e.message); }
+  loadRouterLlm();      // 语言模型那一块（用哪个实现 + 在线服务）也在这个页签里
 }
 
 async function saveRouter() {
@@ -1062,10 +1063,12 @@ $("#settingsForm").addEventListener("click", async (e) => {
 let _capCache = { comps: null, prov: null, cfg: null, presets: null };
 let _capPoll = null;
 
-const CAP_KINDS = ["asr", "llm", "tts"];
+/* 能力页签上的能力种类。**语言模型不在其中**：它的"用哪个实现"与路由的上游配置是同一件事
+   （ECHO AUTO 的成员就在「模型路由」里配），2026-09-19 用户要求整合到「模型路由」页签去。 */
+const CAP_KINDS = ["asr", "tts"];
+// CAP_META 只描述能力页签上的卡片；语言模型那块渲染在「模型路由」页签里（见 loadRouterLlm）
 const CAP_META = {
   asr: { icon: "🎤", title: "语音转写", note: "命令口述与会议录音都走它；本地引擎与在线服务二选一" },
-  llm: { icon: "🧠", title: "语言模型", note: "生成纪要；配了它，不装智能体也能出纪要" },
   tts: { icon: "🔊", title: "语音合成", note: "朗读复述确认、语音简报与提示语；off = 完全不朗读" },
 };
 // 注：TTS 候选项的显示名由 capTtsOptionLabel() 现算（名字 + 出网/就绪），
@@ -1427,6 +1430,69 @@ function bindCapCards() {
   });
 }
 
+/** 读取"用哪个实现"需要的三份数据（provider 清单 / 在线服务字段 / 预设）。
+ *
+ *  能力页签与「模型路由」页签（语言模型那一块）共用同一份缓存 —— 两处各拉一遍不仅浪费，
+ *  还会出现"一处改了另一处还是旧状态"。`force=true` 时强制刷新。 */
+async function ensureProviderData(force) {
+  if (!force && _capCache.prov) return _capCache;
+  const [provRes, cfgRes, presetRes] = await Promise.all([
+    api("/api/providers?ready=true"),
+    api("/api/providers/config").catch(() => ({ settings: [] })),
+    api("/api/providers/presets").catch(() => ({ presets: [] })),
+  ]);
+  _capCache = Object.assign({}, _capCache, { prov: provRes, cfg: cfgRes, presets: presetRes });
+  return _capCache;
+}
+
+/** 语言模型那块（渲染在「模型路由」页签里）：用哪个实现 + 在线服务地址/模型/密钥。 */
+async function loadRouterLlm() {
+  const host = $("#rtLlmHost");
+  if (!host) return;
+  try {
+    await ensureProviderData(true);
+    const r = await api("/api/settings");
+    _settingsCache = r.settings || _settingsCache;
+    host.innerHTML = capProviderBlock("llm");
+    bindRouterLlm(host);
+  } catch (e) {
+    host.innerHTML = `<div class="muted" style="font-size:12px">读取失败：${esc(e.message)}</div>`;
+  }
+}
+
+/** 语言模型块的事件绑定（一次性，重绘不用重绑）。 */
+function bindRouterLlm(host) {
+  if (host.dataset.bound) return;
+  host.dataset.bound = "1";
+  host.addEventListener("click", async (e) => {
+    const save = e.target.closest("[data-cap-save]");
+    if (!save) return;
+    const values = {};
+    $$("#rtLlmHost [data-key]").forEach((el) => {
+      const key = el.dataset.key;
+      const meta = (((_capCache.cfg || {}).settings) || []).find((x) => x.key === key);
+      if (!meta) return;
+      if (meta.secret) { if (el.value && el.value.trim()) values[key] = el.value; return; }
+      values[key] = el.value;
+    });
+    if (!Object.keys(values).length) { toast("没有需要保存的改动"); return; }
+    try {
+      await api("/api/settings", { method: "PUT", body: JSON.stringify({ values }) });
+      toast("已保存 " + Object.keys(values).length + " 项");
+      loadRouterLlm();
+    } catch (err) { toast("保存失败：" + err.message); }
+  });
+}
+
+/** 某个"用哪个实现"选择变化后，刷新**当前正在看的**那一页（两个页签各有一块）。 */
+function refreshAfterProviderChange() {
+  const tab = $(".tab.active");
+  const view = tab && tab.dataset ? tab.dataset.view : "";
+  if (view === "failover") { loadRouter(); return; }   // loadRouter 内部会顺带刷语言模型块
+  if (view === "capabilities") { loadCapabilities(); return; }
+  loadSettings();
+}
+
 /* 选 provider：立即写配置（与"命令目标"下拉同一种交互：选中即持久化）。
    TTS 不走这里：它的开关是 ttsEngine（见 bindCapCards 的 data-tts-engine）。 */
 document.addEventListener("change", async (e) => {
@@ -1436,8 +1502,9 @@ document.addEventListener("change", async (e) => {
   try {
     await api("/api/settings", { method: "PUT", body: JSON.stringify({ values: { [key]: e.target.value } }) });
     toast("已切换到：" + e.target.value);
-    await loadSettings();
-    loadCapabilities();
+    const r = await api("/api/settings");
+    _settingsCache = r.settings || _settingsCache;
+    refreshAfterProviderChange();
   } catch (err) { toast("切换失败：" + err.message); }
 });
 
@@ -1449,13 +1516,15 @@ async function capApplyPreset(idx) {
   const kind = p.kind === "asr" ? "asr" : "llm";
   const prefix = kind === "asr" ? "providerAsr" : "providerLlm";
   const onlineId = kind === "asr" ? "openai-asr" : "openai-llm";
-  const fieldEl = (key) => $(`#view-capabilities [data-key="${key}"]`);
+  // 语言模型那块在「模型路由」页签里，语音转写在「能力」页签里 —— 按当前页签找字段
+  const scope = ($(".tab.active") || {}).dataset?.view === "failover" ? "#rtLlmHost" : "#view-capabilities";
+  const fieldEl = (key) => $(`${scope} [data-key="${key}"]`);
   if (!p.base_url && !p.model) { toast("这个预设需要你自己填地址（属单位内部信息）"); return; }
   if (!fieldEl(prefix + "BaseUrl")) {                 // 在线实现未选中 → 先切过去
     try {
       await api("/api/settings", { method: "PUT", body: JSON.stringify({ values: { [prefix]: onlineId } }) });
     } catch (err) { toast("切换 provider 失败：" + err.message); return; }
-    await loadCapabilities();
+    await refreshAfterProviderChange();
   }
   if (p.base_url && fieldEl(prefix + "BaseUrl")) fieldEl(prefix + "BaseUrl").value = p.base_url;
   if (p.model && fieldEl(prefix + "Model")) fieldEl(prefix + "Model").value = p.model;
@@ -1468,20 +1537,18 @@ async function loadCapabilities() {
   if (!host) return;
   const wasOk = _capTabOk;
   try {
-    const [setRes, modelsRes, compRes, provRes, cfgRes, presetRes, sttRes, vpRes] = await Promise.all([
+    const [setRes, modelsRes, compRes, sttRes, vpRes] = await Promise.all([
       api("/api/settings"),
       api("/api/models"),
       api("/api/components?includeBlocked=true"),
-      api("/api/providers?ready=true"),
-      api("/api/providers/config").catch(() => ({ settings: [] })),
-      api("/api/providers/presets").catch(() => ({ presets: [] })),
       api("/api/stt/status").catch(() => null),
       api("/api/voiceprints").catch(() => null),
     ]);
+    await ensureProviderData(true);
+    _capCache.comps = compRes;
     _settingsCache = setRes.settings || _settingsCache;
     _modelsCache = modelsRes.items || [];
     _modelJobsCache = (modelsRes.jobs && modelsRes.jobs.items) || {};
-    _capCache = { comps: compRes, prov: provRes, cfg: cfgRes, presets: presetRes };
     _sttCache = sttRes;
     _vpCache = vpRes;
     _capTabOk = true;

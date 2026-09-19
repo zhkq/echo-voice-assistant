@@ -161,6 +161,15 @@
   <!-- ============ 模型路由：通道设置 + 派发情况（两张独立卡片，2026-09-13 拆分） ============ -->
   <section id="view-failover" class="view hidden">
     <div class="card">
+      <div class="card-title"><span class="ic">🧠</span>语言模型（用哪个实现）
+        <span class="spacer"></span>
+        <span class="muted" id="rtLlmHint">生成纪要靠它；不装智能体也能出纪要</span>
+      </div>
+      <div class="card-body">
+        <div id="rtLlmHost" class="cap-prov"></div>
+      </div>
+    </div>
+    <div class="card">
       <div class="card-title"><span class="ic">🛰️</span>通道设置
         <span class="badge idle" id="rtBadge">检查中…</span>
         <span class="spacer"></span>
@@ -192,11 +201,13 @@
     </div>
   </section>
 
-  <!-- ============ 能力：合并原「模型」「组件」两个页签 + 设置页的「能力 provider」卡片 ============
+  <!-- ============ 能力：原「模型」「组件」两个页签 + 设置页的「能力 provider」卡片合并而来 ============
        每个能力只在这一处出现：先「用哪个实现」（本地引擎 / 在线服务 / 关闭），
-       再「装没装、怎么装」（组件就绪 + 下载/复制命令/官方链接 + 出网标注）。
+       再「装没装、怎么装」（组件就绪 + 下载/复制命令/官方链接）。
        2026-09-19 用户指出三处设计重叠（模型页签 / 组件页签 / 设置里的 provider 卡片）
-       都只在讲"这台机器上每个功能由什么实现、装好了没"，故合并成一个一级页签。 -->
+       都只在讲"这台机器上每个功能由什么实现、装好了没"，故合并成一个一级页签。
+       语言模型（LLM）不在这里：它的"用哪个实现"与路由的上游配置是同一件事
+       （ECHO AUTO 的成员就在「模型路由」里配），2026-09-19 用户要求整合过去。 -->
   <section id="view-capabilities" class="view hidden">
     <div class="card">
       <div class="card-title"><span class="ic">🧩</span>能力
