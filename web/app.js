@@ -1246,9 +1246,13 @@ function capCompBadge(c) {
   return modelBadge("未知", "idle");
 }
 
-/** 组件行的「获取」动作：模型类的能下载就给「下载」按钮（走 /api/models/download）；
- *  pip 类的（运行时 / 加速 / 智能体后端）给「下载命令」—— 把 `how` 里的安装命令复制到剪贴板。
- *  标签按用户 2026-09-19 的要求叫「下载命令」（不再叫"复制说明"）；完整命令进 title。 */
+/** 组件行的「获取」动作。
+ *  * 模型类（有 model_id）：走 /api/models 的「下载 / 重新下载」等；
+ *  * pip 类（有 command）：给「下载命令」——复制的是**后端拼好的、带本机解释器路径**的命令。
+ *    为什么必须带解释器：裸 `pip install x` 会装到 PATH 上第一个 Python 里，
+ *    ECHO 自己的 venv 看不到 → 面板永远显示"未安装"（用户实测问过"装哪个环境/哪个目录"）；
+ *  * 其它（如 DSH Desktop 这种"装客户端"的）：不给按钮，说明放在行的 meta 里。
+ */
 function capCompActions(c) {
   const m = c.model_id ? modelById(c.model_id) : null;
   if (m) {
@@ -1259,9 +1263,10 @@ function capCompActions(c) {
     return modelActions(m);
   }
   const btns = [];
-  if (c.how) {
-    btns.push(`<button type="button" class="btn mini" data-mcopy="${esc(c.how)}"
-      title="复制下载/安装命令到剪贴板：${esc(c.how)}">下载命令</button>`);
+  if (c.command) {
+    btns.push(`<button type="button" class="btn mini" data-mcopy="${esc(c.command)}"
+      title="复制后粘进终端执行（cmd 与 PowerShell 都行，在哪个目录执行都行）：&#10;${esc(c.command)}"
+      >下载命令</button>`);
   }
   if (c.ref) btns.push(`<span class="muted" style="font-size:12px">${esc(c.ref)}</span>`);
   return btns.join(" ");
@@ -1281,7 +1286,11 @@ function capCompTable(comps, currentIds) {
   const cur = new Set((currentIds || []).filter(Boolean));
   const rows = comps.map((c) => {
     const isCur = cur.has(c.model_id);
+    // 体积为 0/未知（如"本机服务"类）时不显示 "0 MB"
     const meta = [c.size_mb ? c.size_mb + " MB" : "", c.purpose || ""].filter(Boolean).join(" · ");
+    // 非模型组件把 how 也显示出来：它们的动作按钮可能没有（如 DSH 只装客户端），
+    // 说明不能只藏在按钮的复制内容里（用户实测问过"这条命令该在哪执行"）。
+    const how = (!c.model_id && c.how) ? `<div class="cap-comp-meta">${esc(c.how)}</div>` : "";
     return `<div class="cap-comp${isCur ? " cur" : ""}">
       <div class="cap-comp-main">
         ${isCur ? `<span class="cap-cur">▶ 当前</span>` : ""}
@@ -1289,6 +1298,7 @@ function capCompTable(comps, currentIds) {
         <span class="cap-comp-badge">${capCompBadge(c)}</span>
       </div>
       <div class="cap-comp-meta">${esc(meta)}</div>
+      ${how}
       <div class="cap-comp-acts">${capCompActions(c)}</div>
     </div>`;
   }).join("");
@@ -1534,7 +1544,8 @@ function renderCapEnv() {
     <div class="card-body">
       ${capCompTable(comps, [])}
       <div class="muted" style="margin-top:6px;font-size:12px">
-        这些是 pip 装的运行时/加速库，面板不代下：点「下载命令」复制到剪贴板后自己执行。
+        这些是本机依赖与服务：pip 类的点「下载命令」复制到剪贴板后自己执行（命令里带的是本机解释器，
+        在哪个目录、用 cmd 还是 PowerShell 都行）；服务类（如 DSH Desktop）装客户端并保持运行即可。
       </div>
       ${blockedHtml}
     </div>

@@ -65,6 +65,101 @@ class ManifestTests(unittest.TestCase):
         self.assertIn("custom-thing", items)
 
 
+class InstallCommandTests(unittest.TestCase):
+    """pip 类组件的「下载命令」必须**可直接粘贴执行**（2026-09-19 用户实测提问）。
+
+    用户问："`pip install deepseek-harness-sdk…` 这条我应该在哪个目录执行，cmd 还是 PowerShell？"
+    两处都答错了：
+      * 那个包**在 PyPI 上已经不存在**（同名新包 `deepseek-harness` 是另一个项目：DeepSeek V4
+        的 API 客户端，与 DSH 桌面端无关），而且 ECHO 用的是 DSH Desktop 的本机 HTTP JSON-RPC，
+        **不需要任何 Python SDK** → 该组件改成"本机服务"，就绪判据 = 配置里的 dshBaseUrl 通不通；
+      * 裸 `pip install x` 会装到 PATH 上第一个 Python 里，ECHO 自己的 venv 看不到 →
+        命令必须带**本机解释器全路径**（cwd 无所谓，pip 不看目录）。
+    """
+
+    def test_install_command_uses_the_current_interpreter(self):
+        cat = {i["id"]: i for i in components.catalog(include_blocked=True)["items"]}
+        cmd = cat["runtime-core"]["command"]
+        self.assertIn("-m pip install", cmd)
+        self.assertIn("requirements.txt", cmd)
+        self.assertNotIn("pythonw.exe", cmd.lower(),
+                         "不许用 pythonw（无控制台）跑 pip：看不到输出、像是卡住")
+
+    def test_pythonw_is_swapped_for_python(self):
+        """ECHO 服务跑在 pythonw.exe 下（无控制台）：命令必须换成同目录的 python.exe。
+
+        否则用户复制到终端执行会"什么都不显示、像卡住"（实测：面板原样吐出 sys.executable）。
+        """
+        from unittest.mock import patch
+        fake = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+        with patch.object(sys, "executable", fake):
+            cmd = components._install_command({"pkg": "some-pkg"})
+        self.assertNotIn("pythonw.exe", cmd.lower())
+        self.assertIn("python.exe", cmd.lower())
+
+    def test_manual_components_get_no_command(self):
+        """装客户端/自己动手的组件（DSH Desktop、CUDA）不给命令 —— 免得复制一条跑不通的。"""
+        cat = {i["id"]: i for i in components.catalog(include_blocked=True)["items"]}
+        self.assertEqual(cat["agent-dsh"]["command"], "")
+        self.assertEqual(cat["accel-cuda"]["command"], "")
+
+    def test_the_nonexistent_sdk_package_is_not_advertised_anywhere(self):
+        """`deepseek-harness-sdk` 已从 PyPI 下线 —— 不许再作为"要装的包"出现在清单或面板里。
+
+        只查**会展示/会被复制**的地方（清单字段、web/、scripts/）：
+        代码注释里解释"它为什么被删掉"是允许的（`app/components.py` 就写着这段更正）。
+        """
+        bad = []
+        for item in components.load_manifests():
+            if "deepseek-harness-sdk" in json.dumps(item, ensure_ascii=False):
+                bad.append("manifest:%s" % item["id"])
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        for sub in ("web", "scripts"):
+            for dirpath, dirnames, filenames in os.walk(os.path.join(root, sub)):
+                dirnames[:] = [d for d in dirnames if d != "__pycache__"]
+                for fn in filenames:
+                    if not fn.endswith((".js", ".html", ".ps1", ".sh")):
+                        continue
+                    p = os.path.join(dirpath, fn)
+                    with open(p, encoding="utf-8", errors="replace") as fh:
+                        if "deepseek-harness-sdk" in fh.read():
+                            bad.append(os.path.relpath(p, root))
+        self.assertEqual(bad, [], "仍在宣传一个不存在的包：%s" % bad)
+
+    def test_dsh_component_probes_the_configured_service(self):
+        """DSH 那条不是"装什么"，而是"服务在不在"：判据取配置里的 dshBaseUrl。"""
+        items = {i["id"]: i for i in components.load_manifests()}
+        self.assertEqual(items["agent-dsh"]["detect"], {"setting": "dshBaseUrl"})
+        self.assertEqual(items["agent-dsh"]["source"], "manual")
+        self.assertNotIn("deepseek_harness", json.dumps(items["agent-dsh"]))
+
+    def test_setting_probe_reports_ready_for_a_live_local_server(self):
+        import http.server
+        import threading
+        from unittest.mock import patch
+
+        class _H(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):                      # noqa: N802
+                self.send_response(200)
+                self.end_headers()
+
+            def log_message(self, *a):             # 静音
+                pass
+
+        srv = http.server.HTTPServer(("127.0.0.1", 0), _H)
+        port = srv.server_address[1]
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            with patch("app.config.settings.get",
+                       lambda k, d=None: "http://127.0.0.1:%d" % port if k == "dshBaseUrl" else d):
+                self.assertIs(components._detect({"detect": {"setting": "dshBaseUrl"}}), True)
+            with patch("app.config.settings.get",
+                       lambda k, d=None: "http://127.0.0.1:1" if k == "dshBaseUrl" else d):
+                self.assertIs(components._detect({"detect": {"setting": "dshBaseUrl"}}), False)
+        finally:
+            srv.shutdown()
+
+
 class PlatformFilterTests(unittest.TestCase):
     def test_accel_cuda_does_not_appear_on_macos(self):
         data = components.catalog(platform="macos")

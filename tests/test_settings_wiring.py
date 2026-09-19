@@ -601,12 +601,17 @@ class OptionAndPanelWiringTests(unittest.TestCase):
         self.assertIn(".act-link:hover", css)
 
     def test_pip_components_offer_a_download_command_button(self):
-        """pip 类组件（运行时/加速/智能体后端）的动作叫「下载命令」（用户 2026-09-19 指定）。"""
+        """pip 类组件的动作叫「下载命令」，复制的是后端拼好的整条命令（用户 2026-09-19 指定）。"""
         js = _read(os.path.join("web", "app.js"))
         block = js.split("function capCompActions")[1].split("\n}")[0]
         self.assertIn(">下载命令</button>", block)
         self.assertNotIn(">复制说明</button>", block, "标签已改名为「下载命令」")
-        self.assertIn("复制下载/安装命令到剪贴板", block, "完整命令进 title")
+        self.assertIn('data-mcopy="${esc(c.command)}"', block,
+                      "复制的是后端给的 command（带解释器路径），不是 how 说明")
+        self.assertIn("cmd 与 PowerShell 都行，在哪个目录执行都行", block,
+                      "悬停要说清在哪执行、用哪个终端")
+        # 没有 command 的组件（如 DSH 只装客户端）不给按钮 → how 必须在行里显示出来
+        self.assertIn("c.how", js.split("function capCompTable")[1].split("\n}")[0])
 
     def test_engine_labels_do_not_wrap_vertically(self):
         """「命令转写 / 会议转写」在窄边条里被压成竖排两行 → 加 nowrap + 窄屏各占一行。"""

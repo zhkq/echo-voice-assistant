@@ -45,11 +45,14 @@ def _builtin() -> List[dict]:
       platforms             支持的系统（app.platform.current() 的取值）
       min_os                各平台最低版本，如 {"macos": "14.0"}
       optional/required     required 的首装必装（D23）
-      detect                就绪探测规则：{"path"|"any"|"python"|"exe"}
+      detect                就绪探测规则：{"path"|"any"|"python"|"exe"|"setting"}
                             有 ``model_id`` 时**不用它** —— 直接问 `modelinfo`（见 `_detect`）
+                            有 ``setting`` 时把它读成 URL 做一次短超时探测（本机服务类组件）
       model_id              对应的模型清单 id（`app/modelinfo.py`）：有它就能在面板里
                             直接下载/复制命令（`/api/models/download` 认这个 id），
                             也保证"装没装"只有一个判据（2026-09-19 合并「模型/组件」时加的）
+      pkg / requirements    需要 pip 装的东西（二选一）：`catalog()` 会用**当前解释器**
+                            拼出一条可直接粘贴执行的命令（见 `_install_command`）
       source/how            获取方式（在线优先、离线兜底，D2）
       deps                  依赖的组件 id
     """
@@ -58,17 +61,25 @@ def _builtin() -> List[dict]:
              purpose="Python 运行时依赖（faster-whisper / funasr / sherpa-onnx / numpy…）",
              size_mb=100, platforms=["win32", "macos", "linux"], min_os={},
              detect={"python": "faster_whisper", "any": ["funasr", "sherpa_onnx"]},
-             source="pypi", how="安装器准备：pip install -r requirements.txt（离线包可预置）"),
-        dict(id="agent-dsh", kind="agent", name="DSH 智能体后端", optional=True, required=False,
-             purpose="用官方 Python SDK 驱动技能（纪要生成、归档、自定义 skill）",
-             size_mb=265, platforms=["win32", "macos", "linux"], min_os={"macos": "14.0"},
-             detect={"python": "deepseek_harness"},
-             source="pypi", how="pip install deepseek-harness-sdk（自带运行时，不需要系统 Node）"),
+             source="pypi", requirements=True,
+             how="装 ECHO 的依赖清单（命令已带上本机解释器路径，粘到终端即可）"),
+        # 2026-09-19 更正：这条原来写的是「pip install deepseek-harness-sdk（265 MB）」，源自
+        # REFACTOR-PLAN 的 S1 试跑。**现在那个包在 PyPI 上已经不存在了**（同名新包
+        # `deepseek-harness` 是另一个项目：DeepSeek V4 的 API 客户端，与 DSH 桌面端无关），
+        # 而且 ECHO 2.0 **根本不用 SDK** —— `app/agents/dsh_agent.py` 用标准库 urllib 直连
+        # DSH Desktop 的本机 HTTP JSON-RPC（`dshBaseUrl`，默认 127.0.0.1:43120）。
+        # 于是这条改成"本机服务"：装桌面客户端并保持运行即可，就绪判据 = 那个地址通不通。
+        dict(id="agent-dsh", kind="agent", name="DSH Desktop（本机服务）", optional=True, required=False,
+             purpose="ECHO 通过本机 HTTP JSON-RPC 使用 DSH（会话 / 纪要 / 模型注册）；不需要 Python SDK",
+             size_mb=0, platforms=["win32", "macos", "linux"], min_os={"macos": "14.0"},
+             detect={"setting": "dshBaseUrl"},
+             source="manual",
+             how="装 DSH Desktop 客户端并让它保持运行即可；地址见 设置 → 智能体 → DSH 服务地址"),
         dict(id="accel-cuda", kind="accel", name="CUDA 加速", optional=True, required=False,
              purpose="让转写/说话人分离跑在 N 卡上（3 倍以上速度）",
              size_mb=2500, platforms=["win32", "linux"], min_os={},   # mac 上不出现
              detect={"python": "torch", "exe": None},
-             source="pypi", how="按显卡驱动安装 torch 的 CUDA 版；无 N 卡不要装"),
+             source="pypi", how="按显卡驱动安装 torch 的 CUDA 版（面板不代装）；无 N 卡不要装"),
         dict(id="stt-sensevoice", kind="stt", name="SenseVoice 中文短命令", optional=True, required=False,
              purpose="语音命令与会议转写的默认引擎（自带标点）",
              size_mb=896, platforms=["win32", "macos", "linux"], min_os={},
@@ -162,12 +173,28 @@ def _ver_tuple_has(have, need) -> bool:
 
 # ---------------------------------------------------------------- 就绪探测
 
+def _probe_url(url: str, timeout: float = 0.8) -> bool:
+    """本机服务是否在监听：任何 HTTP 响应（含 401/404）都算"活着"，连不上才算没装。"""
+    import urllib.error
+    import urllib.request
+    try:
+        urllib.request.urlopen(url, timeout=timeout).close()
+        return True
+    except urllib.error.HTTPError:
+        return True          # 有响应 = 服务在跑（只是这个路径没权限/不存在）
+    except Exception:
+        return False
+
+
 def _detect(item: dict) -> Optional[bool]:
     """按清单里的 ``detect`` 判断本机是否已具备。返回 True/False/None（无法判定）。
 
     **有 ``model_id`` 的组件直接问 `modelinfo`**（2026-09-19 合并「模型/组件」两个页签时定的）：
     同一份权重原来有两套判据（组件清单写死路径、modelinfo 各写一个 ready 函数），
     两边一旦分叉就会出现"组件说已装、模型说没装"。现在模型类组件只有一个判据来源。
+
+    **``{"setting": key}``** 用于"本机服务"类组件（DSH Desktop）：把配置里的地址当 URL 探一下 ——
+    这样它就绪判据跟 ECHO 实际连的地址一致，配置改了判据跟着变。
     """
     from app import paths
 
@@ -179,6 +206,13 @@ def _detect(item: dict) -> Optional[bool]:
         except Exception:
             return None
     d = item.get("detect") or {}
+    if d.get("setting"):
+        try:
+            from app.config import settings as _s
+            url = str(_s.get(d["setting"], "") or "").strip()
+        except Exception:
+            return None
+        return _probe_url(url) if url else None
     checks: List[bool] = []
     if d.get("path") or d.get("any"):
         models = paths.models_root()
@@ -228,9 +262,44 @@ def load_manifests(root: Optional[str] = None) -> List[dict]:
     return [items[k] for k in sorted(items)]
 
 
+def _install_command(item: dict) -> str:
+    """给需要 pip 的组件拼一条**可直接粘贴执行**的命令（用当前解释器）。
+
+    为什么带上解释器全路径：用户实测问过"这条命令我应该在哪个目录执行、cmd 还是 PowerShell"——
+    pip 不关心当前目录（在哪儿跑都一样），真正会出错的是**用哪个解释器**：
+    裸 `pip install x` 会装到 PATH 上第一个 Python 里，ECHO 自己的 venv 根本看不到，
+    于是面板永远显示"未安装"。所以命令一律写成 `<本机解释器> -m pip install …`。
+    路径含空格时加引号（此时 PowerShell 还需要在前面加 `&`，写在 how 里提醒）。
+    """
+    if not (item.get("pkg") or item.get("requirements")):
+        return ""
+    from app import paths
+    py = ""
+    try:
+        import sys
+        py = sys.executable or ""
+    except Exception:
+        py = ""
+    if not py:
+        return ""
+    # ECHO 服务自己是 pythonw.exe（无控制台）——拿它跑 pip 会看不到任何输出、像是卡住。
+    # 同一目录下的 python.exe 才是该用的那个（实测：面板会把 sys.executable 原样吐出来）。
+    if os.path.basename(py).lower() == "pythonw.exe":
+        cand = os.path.join(os.path.dirname(py), "python.exe")
+        if os.path.isfile(cand):
+            py = cand
+    py_arg = '"%s"' % py if " " in py else py
+    if item.get("pkg"):
+        tail = str(item["pkg"])
+    else:
+        req = os.path.join(paths.echo_root(), "requirements.txt")
+        tail = '-r "%s"' % req
+    return "%s -m pip install %s" % (py_arg, tail)
+
+
 def catalog(*, platform: Optional[str] = None, os_version: Optional[Tuple[int, ...]] = None,
             root: Optional[str] = None, include_blocked: bool = False) -> dict:
-    """完整组件清单 + 平台适用性 + 就绪状态（面板「组件」页签的数据面）。"""
+    """完整组件清单 + 平台适用性 + 就绪状态 + 可执行安装命令（面板「能力」页签的数据面）。"""
     from app import platform as plat
 
     p = platform or plat.current()
@@ -244,6 +313,7 @@ def catalog(*, platform: Optional[str] = None, os_version: Optional[Tuple[int, .
         row["applicable"] = ok
         row["blockedReason"] = why
         row["required"] = bool(item.get("required")) or item["id"] in REQUIRED_IDS
+        row["command"] = _install_command(item)
         try:
             row["ready"] = _detect(item)
         except Exception:

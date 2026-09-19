@@ -112,6 +112,14 @@ Cordis plugin"，内置同一份 `@deepseek-ai/dsh@0.1.5-rc.2`；`@deepseek-ai/d
 
 **发布形态**（PyPI）：
 
+> ⚠️ **2026-09-19 更正**：下面这两个包**现在在 PyPI 上已经查不到了**（`pip index versions
+> deepseek-harness-sdk` → No matching distribution）。同名新包
+> [`deepseek-harness`](https://pypi.org/project/deepseek-harness/)（0.3.x，21 KB）是**另一个项目**
+> —— DeepSeek V4 的 API 客户端，与 DSH 桌面端/CLI 无关，别再照着名字装。
+> 另外 ECHO 2.0 的 DSH 接入是**本机 HTTP JSON-RPC**（`app/agents/dsh_agent.py`，标准库 urllib），
+> 全仓没有 `import deepseek_harness` —— 所以这条"装 SDK"的路线**不需要**，
+> 组件清单里那条也已改成"本机服务"（判据 = `dshBaseUrl` 通不通）。详见 PROGRESS §46 第 12 条。
+
 - [`deepseek-harness-sdk`](https://pypi.org/project/deepseek-harness-sdk/)（0.1.5rc1，MIT，Python ≥3.10）
 - [`deepseek-harness-runtime-bin`](https://pypi.org/project/deepseek-harness-runtime-bin/)（同版本，
   把 `dsh` CLI 与闭源 Node 依赖树打成原生可执行文件；仅发布 wheel）
