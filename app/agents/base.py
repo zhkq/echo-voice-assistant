@@ -32,6 +32,8 @@ class AgentAdapter:
     #  值经 GET /api/agents 的 settings 字段下发（与启用开关同一路）。
     settings_keys = ()
     capabilities = ()      # 能力集合，如 ("workspace", "preset", "session")
+    #: 它自带 Web 界面吗（有的话面板在仪表盘「超级助理」名字后给一个打开它的图标）
+    web_ui = False
 
     # ---- 生命周期 -----------------------------------------------------------
     def available(self, probe=False):

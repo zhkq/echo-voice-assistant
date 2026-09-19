@@ -662,6 +662,8 @@ $$("[data-goto-link='failover']").forEach((a) =>
 
 async function refreshDashboard() {
   refreshFailoverCard();            // 模型路由小卡片（独立容错，不阻塞主刷新）
+  // 智能体 Web 界面小图标（独立 harness）：跟着仪表盘刷新一起更新，失败不阻塞
+  refreshAgentsForDashboard().catch(() => {});
   try {
     const st = await api("/api/status");
     document.body.classList.remove("echo-offline");   // 顶栏去掉常驻状态后，靠这个红标表示"连不上"
@@ -1147,9 +1149,44 @@ async function loadAgents(probe = false) {
   try {
     const r = await api("/api/agents" + (probe ? "?probe=1" : ""));
     _agentsCache = r.agents || [];
+    refreshAgentWebIcon();
     return r;
   } catch (e) { return null; }
 }
+
+/** 仪表盘「超级助理」名字后的小图标：当前智能体自带 Web 界面时才出现。
+ *
+ *  2026-09-19 用户要求："我选了独立 dsh 之后，在仪表盘超级助理名称后面增加一个小图标，
+ *  让我点了之后能打开浏览器展示独立 dsh 的 web 端"。
+ *  点击**不**在前端拼 URL —— harness 的 URL 里带 token（密钥），拼在前端等于把它写进
+ *  浏览器历史；改成让服务端拼好并直接调系统浏览器（POST /api/harness/browser）。 */
+function refreshAgentWebIcon() {
+  const btn = $("#agentWebOpen");
+  if (!btn) return;
+  const cur = (_agentsCache || []).find((a) => a.active);
+  const show = !!(cur && cur.webUi);
+  btn.classList.toggle("hidden", !show);
+  if (show) {
+    btn.title = `在浏览器里打开「${cur.displayName}」的 Web 界面`;
+  }
+}
+
+async function refreshAgentsForDashboard() {
+  await loadAgents(false);
+}
+
+$("#agentWebOpen")?.addEventListener("click", async (e) => {
+  const btn = e.currentTarget;
+  btn.disabled = true;
+  try {
+    const r = await api("/api/harness/browser", { method: "POST" });
+    toast(r.message || (r.ok ? "已在浏览器打开" : "打开失败"));
+  } catch (err) {
+    toast("打开失败：" + err.message);
+  } finally {
+    btn.disabled = false;
+  }
+});
 
 /* ---------------- 设置 → 智能体：开关即单选，切换立即保存 ---------------- */
 $("#settingsForm").addEventListener("change", async (e) => {

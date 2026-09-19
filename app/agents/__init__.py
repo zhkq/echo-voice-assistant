@@ -215,6 +215,7 @@ def list_agents(probe=False):
             "configKey": getattr(cls, "config_key", ""),
             "settings": agent_settings(cls),
             "capabilities": list(getattr(cls, "capabilities", ())),
+            "webUi": bool(getattr(cls, "web_ui", False)),
             "enabled": is_enabled(cls.name),
             "active": cls.name == active,
             "available": False,

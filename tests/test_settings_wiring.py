@@ -620,6 +620,27 @@ class OptionAndPanelWiringTests(unittest.TestCase):
         self.assertIsNotNone(m)
         self.assertIn("white-space: nowrap", m.group(1))
 
+    def test_dashboard_agent_web_icon(self):
+        """仪表盘「超级助理」名字后的小图标：只在当前智能体自带 Web 界面时出现；
+
+        点击由**服务端**打开浏览器（token 不下发到页面）。
+        2026-09-19 用户要求："我选了独立 dsh 之后…增加一个小图标让我点了之后能打开浏览器"。
+        """
+        html = _read(os.path.join("web", "index.html"))
+        m = re.search(r'<button[^>]*id="agentWebOpen"[^>]*>', html, re.S)
+        self.assertIsNotNone(m, "仪表盘标题里要有这个按钮")
+        self.assertIn("hidden", m.group(0), "默认隐藏，靠 JS 按当前智能体显示")
+        self.assertLess(html.index('id="agentWebOpen"'), html.index('id="cmdLevel"'),
+                        "它要挨着「超级助理」标题，不是塞在别处")
+        js = _read(os.path.join("web", "app.js"))
+        self.assertIn("function refreshAgentWebIcon", js)
+        self.assertIn("cur.webUi", js, "按后端给的 webUi 标记显示")
+        self.assertIn('"/api/harness/browser", { method: "POST" }', js,
+                      "点击走服务端打开（前端不拼带 token 的 URL）")
+        self.assertNotIn("?token=", js, "前端不许出现带 token 的 URL 拼接")
+        css = _read(os.path.join("web", "app.css"))
+        self.assertIn(".agent-web-open", css)
+
     def test_command_button_label_comes_from_the_manifest(self):
         """「下载命令 / 复制启动命令」的标签由清单给（独立 harness 那条是"启动命令"）。"""
         js = _read(os.path.join("web", "app.js"))

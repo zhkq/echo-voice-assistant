@@ -316,6 +316,41 @@ def get_agents(probe: bool = False, _auth=Depends(optional_auth)):
     }
 
 
+@router.post("/harness/browser")
+def post_harness_browser(_auth=Depends(optional_auth)):
+    """在浏览器里打开独立 harness 的 Web 界面（仪表盘「超级助理」名字后那个小图标）。
+
+    为什么由**服务端**打开、而不是把 URL 交给页面：harness 的登录靠启动时那条带
+    `?token=…` 的 URL，token 是密钥 —— 经接口下发等于把它写进浏览器历史和前端内存。
+    这里服务端拼好 URL 直接调系统 shell，响应只回**不含 token** 的地址供提示。
+    """
+    from app import harness_proc
+    from app import platform as echo_platform
+    if not harness_proc.online():
+        if not harness_proc.requested():
+            return {"ok": False,
+                    "message": "独立 harness 没在运行：在 设置 → 智能体 里选中"
+                               "「独立 DeepSeek Harness」，ECHO 会自动拉起它"}
+        return {"ok": False, "message": "独立 harness 没在监听 %s（看 data/logs/harness.log）"
+                                        % harness_proc.base_url()}
+    tok = harness_proc.token()
+    note = ""
+    if not tok:
+        # 手里没有 token（例如实例是上一轮 ECHO 拉起的）→ 让它重启一次换一枚新的：
+        # 浏览器必须带 token 才能真正进界面（我们那枚密钥 Cookie 给不了浏览器）。
+        tok, note = harness_proc.ensure_token()
+    if not harness_proc.online():
+        return {"ok": False, "message": "独立 harness 没在监听 %s（%s）"
+                                        % (harness_proc.base_url(), note or "看 data/logs/harness.log")}
+    url = harness_proc.base_url() + ("/?token=%s" % tok if tok else "/")
+    if not echo_platform.shell_open(url):
+        return {"ok": False, "message": "打开浏览器失败（%s）" % harness_proc.base_url()}
+    msg = "已在浏览器打开 %s" % harness_proc.base_url()
+    if not tok:
+        msg += "（没拿到登录 token：%s）" % (note or "建议在设置里填一次")
+    return {"ok": True, "url": harness_proc.base_url(), "message": msg}
+
+
 @router.post("/settings/reset")
 def reset_settings(key: str = "", _auth=Depends(optional_auth)):
     settings.reset(key or None)

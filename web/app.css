@@ -136,6 +136,18 @@ body { min-width: 0; }
 .card.collapsible.collapsed > .card-body,
 .mcard.collapsible.collapsed > .mcard-body { display: none; }
 .card.collapsible.collapsed { padding-bottom: 6px; }   /* 折叠后别留一大截空白 */
+/* 仪表盘「超级助理」名字后的小图标：当前智能体自带 Web 界面时才出现（独立 harness）。
+   点它由服务端打开浏览器（token 不下发到页面），所以这里只是个普通按钮。 */
+.agent-web-open {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 22px; height: 22px; padding: 0; margin-left: 2px; flex-shrink: 0;
+  background: var(--card2); color: var(--text);
+  border: 1px solid var(--border); border-radius: 6px;
+  cursor: pointer; font-size: 12px; line-height: 1;
+}
+.agent-web-open:hover { border-color: var(--accent); filter: brightness(1.15); }
+.agent-web-open:disabled { opacity: .5; cursor: default; }
+.agent-web-open span { pointer-events: none; }
 .collapsible.collapsed > .card-title,
 .collapsible.collapsed > .mcard-head { margin-bottom: 0; }
 .card-title .more {

@@ -39,6 +39,7 @@ class HarnessAgent(DshAgent):
     #: 它自己的配置项（面板在展开区里编辑）；token 是 secret，不会经接口回显
     settings_keys = ("harnessCommand", "harnessHome", "harnessPort", "harnessToken")
     capabilities = ("workspace", "session", "cancel", "history")
+    web_ui = True          # 它有 Web 界面 → 仪表盘上给一个"用浏览器打开它"的小图标
 
     def __init__(self, base_url=None):
         super().__init__(base_url or harness_proc.base_url())

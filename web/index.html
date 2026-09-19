@@ -33,6 +33,10 @@
       <!-- 命令模块：控制 + 目标选择 + 近期历史 -->
       <div class="card span-2" id="cmdCard">
         <div class="card-title"><span class="ic sbadge" title="超级助理"><b>S</b></span>超级助理
+          <!-- 智能体自带 Web 界面时（目前是独立 DeepSeek Harness）在名字后给一个小图标；
+               点了由**服务端**打开浏览器 —— token 不下发到页面（见 api.py /harness/browser）。 -->
+          <button type="button" class="agent-web-open hidden" id="agentWebOpen"
+                  title="在浏览器里打开它的 Web 界面"><span>🌐</span></button>
           <div class="mic-level hidden" id="cmdLevel" title="语音命令收音电平"><i></i><i></i><i></i><i></i><i></i></div>
           <a class="more" id="gotoHistory" href="#">全部 ›</a>
         </div>
