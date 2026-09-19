@@ -406,6 +406,54 @@ def _fallback_sv_rows(sv, wmodel, seg_path, seg_idx, seg_min, cfg):
     return [(seg_idx, st, en, txt) for st, en, txt in sentences]
 
 
+def _active_asr_provider():
+    """会议转写是否走 provider（P5）。**只有用户显式配了 `providerAsr` 才返回实例**。
+
+    为什么不做"本地引擎不可用就自动切在线"：转写引擎换了会同时改变**准确率、耗时与费用**，
+    而且在线转写会把**整段音频**传出去 —— 这种事必须由用户显式选择（出网标注也写在
+    spec 里让他看见）。默认（providerAsr 为空）= 完全沿用原路径，老用户零变化。
+    """
+    from app.config import settings
+    try:
+        chosen = str(settings.get("providerAsr", "") or "").strip()
+        if not chosen:
+            return None
+        from app import providers as providers_mod
+        return providers_mod.create("asr", chosen)
+    except Exception as e:
+        db.add_log("warn", "meeting", "providerAsr 指向的 provider 不可用（%s），本次走本地引擎" % e)
+        return None
+
+
+def _asr_provider_id():
+    from app.config import settings
+    return str(settings.get("providerAsr", "") or "").strip()
+
+
+def _split_provider_text(text, seg_dur):
+    """把外部转写返回的整段文本按句切分，并按字数在段时长内均摊时间。
+
+    外部/在线 ASR 只给整段文本（没有词级时间戳）。整段一行会让面板的"逐句跳转"失去意义，
+    所以按中文句末标点切句、按字数比例分配起止时间 —— 时间不精确，但**顺序与位置对**，
+    且明写在注释里（不假装它是精确时间戳）。
+    """
+    import re as _re
+    text = (text or "").strip()
+    if not text:
+        return []
+    parts = [p for p in _re.split(r"(?<=[。！？!?；;])", text) if p and p.strip()]
+    if not parts:
+        parts = [text]
+    total_chars = sum(len(p) for p in parts) or 1
+    out = []
+    t = 0.0
+    for p in parts:
+        dur = max(float(seg_dur) * len(p) / total_chars, 0.05)
+        out.append((round(t, 2), round(t + dur, 2), p.strip()))
+        t += dur
+    return out
+
+
 def _transcribe_impl(folder):
     meta = _load_json(os.path.join(folder, "meta.json"), {})
     # 重新转写用「当前设置」，meta.json 快照仅作兜底（录音时的配置可能已过期）
@@ -482,7 +530,12 @@ def _transcribe_impl(folder):
     sv_kind = cfg.get("sttModel")
     wmodel = None
     sv = None
-    if use_sv:
+    asr_provider = _active_asr_provider()          # P5：显式配了 providerAsr 才走在线/外部转写
+    if asr_provider is not None:
+        # 走 provider 时**不加载本地引擎**（省显存/省时间；也正是"没有 GPU 也能转写"的意义）
+        db.add_log("info", "meeting", "本场转写走 provider（不加载本地模型）：%s"
+                   % _asr_provider_id())
+    elif use_sv:
         wmodel = stt_mod._get_whisper("small", cfg.get("sttDevice", "auto"))
         if sv_kind == "qwen3asr":
             sv = stt_mod._get_qwen3asr(cfg.get("sttDevice", "auto"),
@@ -500,7 +553,24 @@ def _transcribe_impl(folder):
         _set_progress(meeting_id, phase="转写中", seg_index=i, seg_total=seg_total,
                       percent=percent, detail=f"第 {i}/{seg_total} 段 · {cfg.get('sttModel', '')}")
         seg_rows = []
-        if use_sv:
+        if asr_provider is not None:
+            # P5：外部/在线转写。没有词级时间戳，所以服务端返回的文本在本段时长内
+            # 按句切分、按字数均摊时间（比"整段一行"更接近本地引擎的输出形状）。
+            try:
+                out = asr_provider.transcribe(seg_path, lang=cfg.get("sttLanguage", "zh"))
+                text = (out.get("text") or "").strip()
+                if text:
+                    seg_rows = [(seg_idx, st, en, txt) for st, en, txt in
+                                _split_provider_text(text, _wav_seconds(seg_path) or seg_min * 60.0)]
+                else:
+                    # 空结果**显式留痕**：区分"这段没人说话"与"provider 出错"（§19 发现③）
+                    why = out.get("reason") or "empty"
+                    db.add_log("warn", "meeting",
+                               f"{meeting_name} 第{i}段转写为空（{why}）——本段不写行")
+            except Exception as e:
+                db.add_log("error", "meeting",
+                           f"{meeting_name} 第{i}段转写失败（provider）：{e}")
+        elif use_sv:
             # Qwen3-ASR：优先用 ForcedAligner 原生时间戳（自然句子），失败回退 whisper 骨架对齐
             if sv_kind == "qwen3asr":
                 lang_hint = stt_mod._LANG_MAP.get(str(cfg.get("sttLanguage", "zh")).lower(), None)

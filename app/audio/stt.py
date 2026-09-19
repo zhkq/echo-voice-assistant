@@ -360,20 +360,40 @@ def _qwen3asr_sentences(m, wav, lang_hint):
         return "", []
 
 def transcribe(wav, engine="sensevoice", model="small", lang="zh", device="auto"):
-    """转写单个 wav，返回文本（失败返回空串并打印 stderr）。"""
+    """转写单个 wav，返回文本（**兼容签名**：失败/空结果都返回空串）。
+
+    要区分"没人说话"和"引擎挂了"请用 `transcribe_ex()` —— 见那里的说明（PROGRESS §19 发现③）。
+    """
+    return transcribe_ex(wav, engine, model, lang, device)["text"]
+
+
+#: transcribe_ex() 的 status 取值
+TRANSCRIBE_OK = "ok"           # 拿到文本
+TRANSCRIBE_EMPTY = "empty"     # 引擎正常但没内容（可能是这段真没人说话）
+TRANSCRIBE_ERROR = "error"     # 引擎抛异常（依赖缺失、显存不足、模型损坏…）
+TRANSCRIBE_MISSING = "missing"  # 文件不存在
+
+
+def transcribe_ex(wav, engine="sensevoice", model="small", lang="zh", device="auto"):
+    """转写单个 wav，返回 ``{"text", "status", "detail"}``。
+
+    为什么要有它（2026-09-19，PROGRESS §19 发现③）：原来的 `transcribe()` 每个分支都
+    `except → print(stderr) → return ""`，于是**"这段没人说话"和"引擎挂了"完全一样** ——
+    实测 whisper 对一段 23 秒静音音频会无异常、无 stderr、直接返回空串，调用方据此
+    可能静默产出空纪要。本函数把区别显式化，`transcribe()` 保持原行为（返回 text）。
+    """
     if not os.path.isfile(wav):
-        return ""
+        return {"text": "", "status": TRANSCRIBE_MISSING, "detail": "文件不存在: %s" % wav}
 
     if engine == "sensevoice":
         try:
             sv = _get_sensevoice(device)
             res = sv.generate(input=wav, cache={}, language="auto", use_itn=True, batch_size_s=60)
-            if not res:
-                return ""
-            return _clean_sv_text(res[0].get("text", ""))
+            text = _clean_sv_text(res[0].get("text", "")) if res else ""
+            return _result(text, "SenseVoice")
         except Exception as e:
             print(f"[stt] SenseVoice 转写失败: {e}", file=sys.stderr)
-            return ""
+            return {"text": "", "status": TRANSCRIBE_ERROR, "detail": "SenseVoice: %s" % e}
 
     if engine == "sherpa":
         try:
@@ -392,10 +412,11 @@ def transcribe(wav, engine="sensevoice", model="small", lang="zh", device="auto"
                 while rec.is_ready(stream):
                     rec.decode_stream(stream)
             r = rec.get_result(stream)
-            return (r if isinstance(r, str) else r.text).strip()
+            text = (r if isinstance(r, str) else r.text).strip()
+            return _result(text, "sherpa")
         except Exception as e:
             print(f"[stt] sherpa 转写失败: {e}", file=sys.stderr)
-            return ""
+            return {"text": "", "status": TRANSCRIBE_ERROR, "detail": "sherpa: %s" % e}
 
     if engine == "qwen3asr":
         try:
@@ -409,22 +430,30 @@ def transcribe(wav, engine="sensevoice", model="small", lang="zh", device="auto"
             m = _get_qwen3asr(device, qwen_model)
             lang_hint = _LANG_MAP.get(str(lang).lower(), None)
             res = m.generate(input=wav, language=lang_hint)
-            if not res:
-                return ""
-            return " ".join((res[0].get("text") or "").split())
+            text = " ".join((res[0].get("text") or "").split()) if res else ""
+            return _result(text, "Qwen3-ASR")
         except Exception as e:
             print(f"[stt] Qwen3-ASR 转写失败: {e}", file=sys.stderr)
-            return ""
+            return {"text": "", "status": TRANSCRIBE_ERROR, "detail": "Qwen3-ASR: %s" % e}
 
     # faster-whisper
     try:
         wm = _get_whisper(model, device)
         segments, _info = transcribe_whisper(wm, wav, lang)
-        text = "".join(seg.text for seg in segments).strip()
-        return " ".join(text.split())
+        text = " ".join("".join(seg.text for seg in segments).split())
+        return _result(text, "whisper")
     except Exception as e:
         print(f"[stt] whisper 转写失败: {e}", file=sys.stderr)
-        return ""
+        return {"text": "", "status": TRANSCRIBE_ERROR, "detail": "whisper: %s" % e}
+
+
+def _result(text, who):
+    """统一成型：空文本 = EMPTY（引擎没报错，但没内容），非空 = OK。"""
+    text = (text or "").strip()
+    if text:
+        return {"text": text, "status": TRANSCRIBE_OK, "detail": ""}
+    return {"text": "", "status": TRANSCRIBE_EMPTY,
+            "detail": "%s 返回空结果（可能是这段没有语音，也可能引擎内部静默失败）" % who}
 
 
 def reset_engines():
