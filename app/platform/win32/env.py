@@ -98,6 +98,44 @@ def process_running(image_name: str) -> bool:
         return False
 
 
+def kill_process_tree(pid: int) -> bool:
+    """杀掉整棵进程树（``taskkill /T /F``）。
+
+    独立 harness 的启动链是 ``cmd → node(npx-cli) → cmd → node(dsh)`` 四层：
+    只 ``terminate()`` 最外层，端口照样被占着（2026-09-19 实测）。
+    """
+    import subprocess
+    if pid <= 0:
+        return False
+    try:
+        subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       timeout=15, creationflags=no_window_creationflags())
+        return True
+    except Exception:
+        return False
+
+
+def listening_pid(port: int) -> int:
+    """谁在监听本机某端口（``netstat -ano``）；找不到 = 0。"""
+    import subprocess
+    try:
+        out = subprocess.run(["netstat", "-ano", "-p", "tcp"],
+                             capture_output=True, text=True, timeout=10,
+                             creationflags=no_window_creationflags()).stdout or ""
+    except Exception:
+        return 0
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) >= 5 and parts[0].upper() == "TCP" and parts[3].upper() == "LISTENING":
+            if parts[1].endswith(":" + str(port)):
+                try:
+                    return int(parts[4])
+                except ValueError:
+                    continue
+    return 0
+
+
 # ------------------------------------------------------------------ 打开窗口 / 提示音 / 离线 TTS
 
 def shell_open(target: str, params: str = "") -> bool:

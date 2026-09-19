@@ -401,7 +401,7 @@ DEFAULTS = {
     "agentBackend": dict(value="dsh", grp="agent", label="执行智能体",
                          description="ECHO 把命令与会议纪要交给哪个智能体执行；"
                                      "在面板的智能体表格里切换。默认 DSH",
-                         value_type="str", options=["dsh", "codebuddy"], hidden=True),
+                         value_type="str", options=["dsh", "codebuddy", "harness"], hidden=True),
     "agentCodebuddyEnabled": dict(value=True, grp="agent", label="启用 CodeBuddy Code",
                                   description="腾讯 CodeBuddy Code（WorkBuddy 内置同一引擎）",
                                   value_type="bool", agent_key="codebuddy", hidden=True),
@@ -409,6 +409,30 @@ DEFAULTS = {
                             description="可执行文件路径；留空 = 自动探测"
                                         "（PATH → WorkBuddy 内置目录）。仅在自动探测失败时需要填",
                             value_type="str", hidden=True),
+    # ---- 独立 DeepSeek Harness（npm @deepseek-ai/dsh）：随 ECHO 一起启动的那个 agent ----
+    # 与 DSH Desktop 只差两点：**谁提供 web 服务**（npm 包 vs 桌面客户端）、**鉴权**
+    # （启动时打印的 token → Cookie vs 逆向签名 Cookie）；/api 接口面完全相同（2026-09-19 实测）。
+    # 详见 app/harness_proc.py 与 docs/独立harness接入.md。
+    "agentHarnessEnabled": dict(value=False, grp="agent", label="启用独立 DeepSeek Harness",
+                                description="本项与「执行智能体」都指向它时，ECHO 才把独立 harness "
+                                            "作为子进程拉起（切走即停）；需要本机 Node / npx",
+                                value_type="bool", hidden=True),
+    "harnessHome": dict(value="", grp="agent", label="harness 数据目录（DSH_HOME）",
+                        description="独立 harness 的家目录；留空 = {DATA}/harness。"
+                                    "**故意与 Desktop 的家目录分开**（各用各的），"
+                                    "两边的会话与设置互不干扰",
+                        value_type="str", hidden=True),
+    "harnessPort": dict(value=43199, grp="agent", label="harness 端口",
+                        description="独立 harness 的监听端口（默认 43199，刻意避开 Desktop 的 43120，"
+                                    "两者可同时运行）",
+                        value_type="int", hidden=True),
+    "harnessCommand": dict(value="npx -y @deepseek-ai/dsh web", grp="agent", label="harness 启动命令",
+                           description="拉起独立 harness 的命令（--port / --no-open 由 ECHO 追加）。"
+                                       "Node/npx 不在 PATH 里时，这里填 npx 全路径",
+                           value_type="str", hidden=True),
+    "harnessToken": dict(value="", grp="agent", label="harness 访问 token",
+                         description="只有当你**自己**启动了 harness 时才需要填（ECHO 自己拉起时自动获取）",
+                         value_type="str", hidden=True, secret=True),
     # ---------- 能力 provider（P5 / D25：ASR / LLM / TTS 各选一个）----------
     # 留空 = 用该 kind 的默认实现（本地转写引擎 / ECHO AUTO 多上游路由 / 本平台离线朗读）。
     # 可选项是**运行时**注册出来的（见 GET /api/providers），所以这里不写死 options。

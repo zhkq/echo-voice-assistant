@@ -40,9 +40,23 @@ class AgentSettingsOwnershipTests(unittest.TestCase):
                 meta = DEFAULTS[key]
                 self.assertTrue(meta.get("hidden"),
                                 "%s 应由智能体展开区承载（hidden），不该出现在设置页分组里" % key)
-                self.assertFalse(meta.get("secret"), "%s 是密钥，不该走这条接口" % key)
                 self.assertEqual(meta["grp"], "agent",
                                  "%s 归属智能体分组（面板用 grp=agent 做回退判断）" % key)
+
+    def test_secret_keys_are_declared_but_never_served(self):
+        """`harnessToken` 这类密钥可以写在 settings_keys 里（适配器要用它连服务），
+        但 `agent_settings()` 必须把它挡在接口之外 —— 面板永远看不到明文。"""
+        from app import agents
+        secrets = [(k, o) for k, o in _owner_map().items() if DEFAULTS[k].get("secret")]
+        self.assertTrue(secrets, "至少要有一个密钥项被这条用例覆盖到（harnessToken）")
+        for key, owners in secrets:
+            with self.subTest(key=key):
+                self.assertTrue(any(key in (getattr(cls, "settings_keys", ()) or ())
+                                    for cls in agents.specs()),
+                                "%s 应由某个适配器声明" % key)
+                for cls in agents.specs():
+                    keys = {s["key"] for s in agents.agent_settings(cls)}
+                    self.assertNotIn(key, keys, "%s 是密钥，不该经 /api/agents 下发" % key)
 
     def test_no_key_is_claimed_by_two_agents(self):
         for key, owners in _owner_map().items():

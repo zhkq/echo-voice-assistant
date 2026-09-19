@@ -1,0 +1,395 @@
+# -*- coding: utf-8 -*-
+"""独立 DeepSeek Harness 适配器与进程管理的测试（2026-09-19）
+
+用户要求："在智能体那里增加一个新的 agent 类型，然后随着 echo 一起启动"。
+
+实测背景（docs/独立harness接入.md）：
+  * 独立发行版是 npm 包 `@deepseek-ai/dsh`（0.1.5-rc.2，与 DSH Desktop 自带的 dsh 同版本）；
+  * `dsh web --port N --no-open` 起的就是 Desktop 那套 web profile —— `/api` 接口面完全一致
+    （session/* workspace/* settings/*），ECHO 现有请求体原封不动可用；
+  * 鉴权不同：Desktop 校验"逆向出来的签名 Cookie"，独立 harness 用启动时打印的 token
+    访问一次 `/?token=…` 换 Cookie。
+
+本文件用一个假 harness（ThreadingHTTPServer）钉住这条链路：
+  登录换 Cookie、登录失败的人话原因、401 自动重登重试、可用性判据、以及"随 ECHO 启动"
+  的进程管理（幂等 / 冷却 / token 解析 / 只停自己起的）。
+"""
+import json
+import os
+import shutil
+import sys
+import threading
+import time
+import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from unittest.mock import patch
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import app.db as db                                              # noqa: E402
+from app import harness_proc                                     # noqa: E402
+from app.config import DEFAULTS, settings                         # noqa: E402
+
+TOKEN = "probe-token-1234"
+COOKIE_NAME = "dsh-auth-TESTSERVER"
+COOKIE_VALUE = "v1.test.cookie"
+
+
+class _HarnessStub(BaseHTTPRequestHandler):
+    """最小假 harness：`/?token=` 换 Cookie；`/api/*` 校验 Cookie 并回 JSON-RPC 信封。"""
+
+    server_version = "fake-harness/0.1"
+    state = {"logins": 0, "expire_next": False, "rpc": [], "gets": []}
+
+    def log_message(self, *a):
+        pass
+
+    def _json(self, code, obj):
+        body = json.dumps(obj).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):                                            # noqa: N802
+        if self.path.startswith("/?token="):
+            tok = self.path.split("token=", 1)[1]
+            if tok != TOKEN:
+                self._json(403, {"error": "bad token"})
+                return
+            _HarnessStub.state["logins"] += 1
+            # 真实 harness 就是这么答的：**303 + Set-Cookie，Location: /**
+            # （跟去 / 就丢了这枚 Cookie → 401；见 harness_agent._login 的注释）
+            self.send_response(303)
+            self.send_header("Location", "/")
+            self.send_header("Set-Cookie", "%s=%s; Path=/; HttpOnly" % (COOKIE_NAME, COOKIE_VALUE))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        # 探活用：任何响应都算"在监听"；这里也用来证明"登录没有跟跳转"
+        _HarnessStub.state["gets"].append(self.path)
+        self._json(401, {"error": "unauthorized"})
+
+    def do_POST(self):                                           # noqa: N802
+        if not self.path.startswith("/api/"):
+            self._json(404, {"error": "not found"})
+            return
+        cookie = self.headers.get("Cookie") or ""
+        if _HarnessStub.state["expire_next"] or (COOKIE_NAME + "=" + COOKIE_VALUE) not in cookie:
+            _HarnessStub.state["expire_next"] = False
+            self._json(401, {"error": "unauthorized"})
+            return
+        n = int(self.headers.get("Content-Length") or 0)
+        req = json.loads(self.rfile.read(n).decode("utf-8")) if n else {}
+        method = req.get("method", "")
+        _HarnessStub.state["rpc"].append(method)
+        self._json(200, {"type": "server-response", "rpcId": req.get("rpcId"),
+                         "result": {"ok": True, "value": {"items": []}}})
+
+
+class _Base(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.srv = ThreadingHTTPServer(("127.0.0.1", 0), _HarnessStub)
+        cls.port = cls.srv.server_address[1]
+        threading.Thread(target=cls.srv.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.srv.shutdown()
+
+    def setUp(self):
+        _HarnessStub.state.update(logins=0, expire_next=False, rpc=[], gets=[])
+        harness_proc.set_token("")
+        self._ports = patch.object(harness_proc, "port", lambda: self.port)
+        self._ports.start()
+        self.addCleanup(self._ports.stop)
+        self._tok = patch.object(harness_proc, "token", lambda: TOKEN)
+        self._tok.start()
+        self.addCleanup(self._tok.stop)
+
+
+class HarnessAuthTests(_Base):
+    def _agent(self):
+        from app.agents.harness_agent import HarnessAgent
+        a = HarnessAgent(base_url="http://127.0.0.1:%d" % self.port)
+        a._cookie, a._cookie_ts = None, 0.0
+        return a
+
+    def test_login_exchanges_token_for_cookie(self):
+        a = self._agent()
+        cookie = a._cookie_header()
+        self.assertTrue(cookie.startswith(COOKIE_NAME + "="), cookie)
+        self.assertEqual(_HarnessStub.state["logins"], 1)
+
+    def test_login_303_is_not_followed(self):
+        """harness 的登录响应是 303（Set-Cookie 只在 303 上）。
+
+        跟跳转就会丢掉 Cookie 并撞 401 —— 这正是最初那个"token 明明对却报 401"的坑，
+        所以这里把"没有请求过 /"钉住。
+        """
+        a = self._agent()
+        a._cookie_header()
+        self.assertNotIn("/", _HarnessStub.state["gets"],
+                         "登录不该跟随 303 跳到 /（会丢 Set-Cookie）")
+
+    def test_rpc_works_after_login(self):
+        a = self._agent()
+        res = a.rpc("session/list", {"_request": {}}, timeout=5)
+        self.assertIsInstance(res, dict)
+        self.assertEqual(_HarnessStub.state["rpc"], ["session/list"])
+
+    def test_401_triggers_relogin_and_retry(self):
+        """cookie 过期不该让一次命令白跑：401 → 重登一次 → 成功。"""
+        a = self._agent()
+        a._cookie_header()                       # 先登录一次
+        _HarnessStub.state["expire_next"] = True  # 下一次 RPC 假装 cookie 过期
+        res = a.rpc("session/create", {"request": {}}, timeout=5)
+        self.assertIsInstance(res, dict)
+        self.assertEqual(_HarnessStub.state["logins"], 2, "应当重登了一次")
+        self.assertEqual(_HarnessStub.state["rpc"], ["session/create"])
+
+    def test_bad_token_gives_a_human_reason(self):
+        with patch.object(harness_proc, "token", lambda: "wrong-token"):
+            a = self._agent()
+            with self.assertRaises(Exception) as cm:
+                a._cookie_header()
+        self.assertIn("token", str(cm.exception))
+
+    def test_missing_token_tells_you_what_to_do(self):
+        with patch.object(harness_proc, "token", lambda: ""):
+            a = self._agent()
+            with self.assertRaises(Exception) as cm:
+                a._cookie_header()
+        msg = str(cm.exception)
+        self.assertIn("选中", msg, "要告诉用户怎么让它有 token")
+
+    def test_available_reports_live_service(self):
+        a = self._agent()
+        ok, why = a.available()
+        self.assertTrue(ok, why)
+        self.assertIn(str(self.port), why)
+
+    def _dead_agent(self):
+        """指向一个没人监听的端口（模拟"harness 没在跑"）。"""
+        import socket
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        dead = s.getsockname()[1]
+        s.close()
+        from app.agents.harness_agent import HarnessAgent
+        a = HarnessAgent(base_url="http://127.0.0.1:%d" % dead)
+        a._cookie, a._cookie_ts = None, 0.0
+        return a
+
+    def test_available_explains_when_not_running(self):
+        with patch.object(harness_proc, "online", lambda timeout=1.0: False), \
+                patch.object(harness_proc, "requested", lambda: False):
+            ok, why = self._dead_agent().available()
+        self.assertFalse(ok)
+        self.assertIn("没在运行", why)
+        self.assertIn("选为当前智能体", why, "要给出可操作的做法")
+
+    def test_available_explains_after_being_requested(self):
+        with patch.object(harness_proc, "online", lambda timeout=1.0: False), \
+                patch.object(harness_proc, "requested", lambda: True):
+            ok, why = self._dead_agent().available()
+        self.assertFalse(ok)
+        self.assertIn("harness.log", why, "要指向日志，并提示 npx 全路径这个常见坑")
+
+
+class HarnessAgentRegistryTests(unittest.TestCase):
+    """注册表/面板数据：新 agent 出现、配置项到位、token 不回显。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = None
+        cls._old = (db.DATA_DIR, db.DB_FILE)
+        import tempfile
+        cls.tmp = tempfile.mkdtemp(prefix="echo-harness-")
+        db.DATA_DIR = cls.tmp
+        db.DB_FILE = os.path.join(cls.tmp, "test.db")
+        db.init()
+        settings.seed_defaults()
+
+    @classmethod
+    def tearDownClass(cls):
+        db.DATA_DIR, db.DB_FILE = cls._old
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def test_harness_is_registered_and_listed(self):
+        from app import agents
+        self.assertIn("harness", agents.names())
+        got = {a["name"]: a for a in agents.list_agents()}
+        h = got["harness"]
+        self.assertTrue(h["displayName"])
+        self.assertFalse(h["enabled"], "默认不启用（选了才随 ECHO 启动）")
+        keys = {s["key"] for s in h["settings"]}
+        self.assertIn("harnessCommand", keys)
+        self.assertIn("harnessPort", keys)
+        self.assertNotIn("harnessToken", keys, "密钥不该经接口下发")
+
+    def test_config_keys_are_agent_group_and_hidden(self):
+        for key in ("agentHarnessEnabled", "harnessHome", "harnessPort",
+                    "harnessCommand", "harnessToken"):
+            with self.subTest(key=key):
+                meta = DEFAULTS[key]
+                self.assertEqual(meta["grp"], "agent")
+                self.assertTrue(meta.get("hidden"))
+        self.assertTrue(DEFAULTS["harnessToken"].get("secret"))
+        self.assertIn("harness", DEFAULTS["agentBackend"]["options"])
+
+
+class HarnessProcTests(unittest.TestCase):
+    """进程管理：随 ECHO 启动的判据、幂等、token 解析、只停自己起的。"""
+
+    def setUp(self):
+        harness_proc.set_token("")
+        harness_proc._proc, harness_proc._proc_pid = None, 0
+        harness_proc._last_launch = 0.0
+
+    def test_requested_needs_both_selection_and_switch(self):
+        """判定是"与"：切走就停（否则 node 会一直挂着 —— 实测踩过）。"""
+        def fake(**kw):
+            return lambda k, d=None: kw.get(k, d)
+        # 选中 + 开关开 → 起
+        with patch("app.config.settings.get",
+                   fake(agentBackend="harness", agentHarnessEnabled=True)):
+            self.assertTrue(harness_proc.requested())
+        # 切走（开关还开着）→ 停
+        with patch("app.config.settings.get",
+                   fake(agentBackend="dsh", agentHarnessEnabled=True)):
+            self.assertFalse(harness_proc.requested())
+        # 选中但被关掉 → 停
+        with patch("app.config.settings.get",
+                   fake(agentBackend="harness", agentHarnessEnabled=False)):
+            self.assertFalse(harness_proc.requested())
+
+    def test_online_true_for_any_http_response(self):
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), _HarnessStub)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            with patch.object(harness_proc, "port", lambda: srv.server_address[1]):
+                self.assertTrue(harness_proc.online())
+        finally:
+            srv.shutdown()
+
+    def test_ensure_running_is_idempotent_when_online(self):
+        with patch.object(harness_proc, "online", lambda timeout=1.0: True), \
+                patch("subprocess.Popen") as popen:
+            ok, msg = harness_proc.ensure_running()
+        self.assertTrue(ok)
+        self.assertIn("已在运行", msg)
+        popen.assert_not_called()
+
+    def test_ensure_running_reports_missing_npx(self):
+        with patch.object(harness_proc, "online", lambda timeout=1.0: False), \
+                patch.object(harness_proc, "command", lambda: "definitely-not-a-real-npx web"), \
+                patch("shutil.which", lambda name: None):
+            ok, msg = harness_proc.ensure_running()
+        self.assertFalse(ok)
+        self.assertIn("Node", msg, "要说清需要 Node / npx")
+
+    def test_token_is_parsed_from_child_output(self):
+        line = "dsh web: http://127.0.0.1:43199/?token=%s" % TOKEN
+        m = harness_proc.TOKEN_RE.search(line)
+        self.assertIsNotNone(m)
+        self.assertEqual(m.group(1), TOKEN)
+
+    def test_stop_does_nothing_for_foreign_instances(self):
+        with patch.object(harness_proc, "_load_pid", lambda: 0):
+            ok, msg = harness_proc.stop()
+        self.assertTrue(ok)
+        self.assertIn("未做处理", msg)
+
+    def test_stop_kills_the_adopted_instance(self):
+        """ECHO 重启后接手别人起的实例（pid 文件还在）→ 切走时必须能停掉它。
+
+        实测踩过：只认内存里的 `_proc` 时，切到 DSH 后 43199 一直挂着。
+        """
+        state = {"killed": []}
+
+        def fake_kill(pid):
+            state["killed"].append(pid)
+
+        with patch.object(harness_proc, "_load_pid", lambda: 4242), \
+                patch.object(harness_proc, "online",
+                             lambda timeout=1.0: not state["killed"]), \
+                patch.object(harness_proc, "_kill_tree", fake_kill), \
+                patch.object(harness_proc, "_listener_pid", lambda p: 4242), \
+                patch.object(harness_proc, "_clear_pid", lambda: None):
+            ok, msg = harness_proc.stop()
+        self.assertTrue(ok, msg)
+        self.assertIn(4242, state["killed"], "要按 pid 文件杀掉那个实例")
+        self.assertIn("已停止", msg)
+
+    def test_reserved_ports_are_refused(self):
+        """不许占 Desktop 的 43120 / ECHO 自己的 18060 —— 占了就是互相打架。"""
+        for p in (43120, 18060):
+            with self.subTest(port=p):
+                with patch.object(harness_proc, "port", lambda p=p: p):
+                    self.assertTrue(harness_proc.port_conflict())
+                    ok, msg = harness_proc.ensure_running()
+                    self.assertFalse(ok)
+                    self.assertIn("端口", msg)
+
+    def test_status_detail_speaks_plainly(self):
+        with patch.object(harness_proc, "online", lambda timeout=1.0: False), \
+                patch.object(harness_proc, "requested", lambda: False):
+            status, detail = harness_proc.status_detail()
+        self.assertEqual(status, "disabled")
+        self.assertIn("未启用", detail)
+
+    def test_home_is_separate_from_desktop(self):
+        """独立 harness 的 DSH_HOME 不能是 Desktop 的 ~/.dsh（否则两边抢同一份会话）。"""
+        h = harness_proc.home()
+        self.assertTrue(h)
+        self.assertNotIn(os.path.join(".dsh", ""), h + os.sep)
+
+
+class HarnessBootTests(unittest.TestCase):
+    """随 ECHO 启动：boot 里有这个组件；没选中时不拉起。"""
+
+    def test_boot_registers_the_harness_component(self):
+        from app import boot
+        boot.setup()
+        ids = [c["id"] for c in boot.snapshot()["components"]]
+        self.assertIn("harness", ids)
+        c = [x for x in boot.snapshot()["components"] if x["id"] == "harness"][0]
+        self.assertTrue(c["can_start"])
+        self.assertTrue(c["can_stop"], "ECHO 自己起的进程要能停")
+
+    def test_start_step_skips_when_not_requested(self):
+        from app import boot
+        seen = {}
+        with patch.object(harness_proc, "requested", lambda: False), \
+                patch.object(harness_proc, "_load_pid", lambda: 0), \
+                patch.object(harness_proc, "started_by_echo", lambda: False):
+            boot._start_harness(lambda **kw: seen.update(kw))
+        self.assertEqual(seen.get("status"), "disabled")
+
+    def test_start_step_cleans_up_a_leftover_when_not_requested(self):
+        """没选中但上次是我们起的 → 启动时收尾（自愈，免得 node 一直挂着）。"""
+        from app import boot
+        seen = {}
+        with patch.object(harness_proc, "requested", lambda: False), \
+                patch.object(harness_proc, "_load_pid", lambda: 4242), \
+                patch.object(harness_proc, "stop", lambda: (True, "已停止独立 harness")):
+            boot._start_harness(lambda **kw: seen.update(kw))
+        self.assertEqual(seen.get("status"), "disabled")
+        self.assertIn("收尾", seen.get("detail", ""))
+
+    def test_start_step_launches_when_requested(self):
+        from app import boot
+        seen = {}
+        with patch.object(harness_proc, "requested", lambda: True), \
+                patch.object(harness_proc, "ensure_running", lambda: (True, "已启动(测试)")):
+            boot._start_harness(lambda **kw: seen.update(kw))
+        self.assertEqual(seen.get("status"), "online")
+        self.assertIn("测试", seen.get("detail", ""))
+
+
+if __name__ == "__main__":
+    unittest.main()

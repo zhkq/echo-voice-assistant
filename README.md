@@ -129,6 +129,8 @@ mac/start_mac.sh
   出网提醒是悬停看说明的黄色三角。语言模型的"用哪个实现"在「模型路由」页签里
   （与上游通道配置本来就是同一件事）。2026-09-19 由原「模型」「组件」两个页签 + 设置页的
   provider 卡片合并而来（见 [docs/能力页签重设计.md](docs/能力页签重设计.md)）。
+- **可插拔的智能体后端**：DSH Desktop / 独立 DeepSeek Harness（随 ECHO 一起启动，不必装桌面端）
+  / CodeBuddy，在 设置 → 智能体 里一键切换（见下文「与 DSH 的关系」）。
 - **可被其他应用调用**：本地 REST API（转写、TTS、会议、设置），面板与手机 App 共用同一入口。
 
 ## 技术栈
@@ -263,13 +265,20 @@ powershell -File scripts\install-qwen3asr.ps1   # 装依赖(qwen-asr) + 下载�
 `app`=Chromium 应用窗口 / `browser`=默认浏览器）。热键由 ECHO 注册，改完只重启 ECHO 即可
 （不用动 DSH）。
 
-## 与 DSH Desktop 的关系
+## 与 DSH 的关系（两种接法，任选一种）
 
-「执行指令 / 生成纪要」这一步需要 DSH Desktop（本地 API，默认 43120 端口，需在 DSH 里放开本机访问）。
-ECHO 通过 JSON-RPC 风格接口与会话交互，把技能（skills）能力直接借过来——所以"整理成表格""查一下天气"
-这类任务不需要在 ECHO 里再实现一遍。
+「执行指令 / 生成纪要」这一步需要一个**智能体后端**。ECHO 支持三种，在 设置 → 智能体 里切换：
 
-ECHO 可以完全脱离 DSH 独立启动（转写、会议、面板都不依赖它），只把"执行"这一步留白；
+| 智能体 | 需要什么 | 说明 |
+|---|---|---|
+| **DSH Desktop** | 装并运行桌面客户端（本地 API 默认 43120，需在 DSH 里放开本机访问） | 默认。ECHO 通过 JSON-RPC 风格接口与会话交互，把技能（skills）能力直接借过来 |
+| **独立 DeepSeek Harness** | 本机有 Node.js；**不用装桌面客户端** | ECHO 把 npm 包 `@deepseek-ai/dsh` 作为**子进程**随自己一起拉起（默认端口 43199，家目录 `{DATA}/harness`，与桌面版完全分开），切换走即停。接口面与桌面版一致，只有鉴权换成启动时打印的 token。详见 [`docs/独立harness接入.md`](docs/独立harness接入.md) |
+| **CodeBuddy Code** | 装 WorkBuddy / CodeBuddy CLI | 另一条完全独立的后端 |
+
+另外：**纪要也可以完全不走智能体** —— 设置 → 模型路由 里把语言模型指到 ECHO AUTO（多上游派发）
+或任一 OpenAI 兼容端点即可（P5/D25），此时"整理成表格""查一下天气"这类任务由该模型直接完成。
+
+ECHO 可以完全脱离智能体独立启动（转写、会议、面板都不依赖它），只把"执行"这一步留白；
 早先那个让 DSH 顺带守护 ECHO 的插件已退役（见上节），ECHO 的启动/守护由 `scripts\startup.ps1` 负责。
 
 ## 常用 API（面板/手机 App/技能共用）

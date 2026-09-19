@@ -172,6 +172,8 @@ def _run_boot():
     set_phase("booting")
     # 阶段 1：轻量组件（秒级）并行 —— 模型路由先确保起来，DSH 随时可能被调用
     _spawn(["failover", "dsh", "tts", "hotkey", "meeting", "diarize"])
+    # 阶段 1b：独立 harness（选了它才真拉起来；没选就是一行 disabled，不等它）
+    _spawn(["harness"])
     # 阶段 2：重组件（模型加载）并行 —— 命令转写常驻；会议转写按需不在此启动
     _spawn(["stt-cmd", "wake"])
     # 等所有非按需组件 settle
@@ -218,6 +220,37 @@ def _start_dsh(report):
         report(status="failed", detail=msg, error=msg)
         return
     report(status="online", detail=msg, progress=1.0)
+
+
+def _start_harness(report):
+    """独立 DeepSeek Harness（npm @deepseek-ai/dsh）：选了它才随 ECHO 启动。
+
+    2026-09-19 加：用户要求"在智能体那里增加一个新的 agent 类型，然后随着 echo 一起启动"。
+    实测它与 DSH Desktop 的 /api 接口面完全一致，只是鉴权换成"token → Cookie"，
+    家目录独立（默认 {DATA}/harness），端口默认 43199（与 Desktop 的 43120 并存）。
+    """
+    from app import harness_proc
+    if not harness_proc.requested():
+        # 自愈：上次是我们起的、这次没被选中 → 顺手收掉（否则切回 DSH 后 node 一直挂着）
+        if harness_proc._load_pid() or harness_proc.started_by_echo():
+            ok, msg = harness_proc.stop()
+            report(status="disabled" if ok else "failed",
+                   detail="未选中，已收尾：%s" % msg if ok else msg)
+            return
+        report(status="disabled", detail="未选中（设置 → 智能体 → 独立 DeepSeek Harness）",
+               progress=0.0)
+        return
+    report(detail="拉起独立 harness…", progress=0.2)
+    ok, msg = harness_proc.ensure_running()
+    if not ok:
+        report(status="failed", detail=msg, error=msg)
+        return
+    report(status="online", detail=msg, progress=1.0)
+
+
+def _stop_harness():
+    from app import harness_proc
+    harness_proc.stop()
 
 
 def _agent_dsh_available():
@@ -429,6 +462,8 @@ def setup():
              can_stop=False)
     register("failover", "模型路由（ECHO AUTO）", "🛰️", start_fn=_start_failover,
              can_start=True, can_stop=False)
+    register("harness", "独立 DeepSeek Harness", "🧩", start_fn=_start_harness,
+             stop_fn=_stop_harness, can_start=True, can_stop=True)
     register("stt-cmd", "命令转写引擎（常驻）", "🎤", start_fn=_start_stt_cmd,
              stop_fn=_stop_stt_cmd, can_start=True, can_stop=True)
     register("stt-meeting", "会议转写引擎（按需）", "📝", start_fn=_start_stt_meeting,

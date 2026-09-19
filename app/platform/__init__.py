@@ -123,6 +123,22 @@ def process_running(image_name: str) -> bool:
     return bool(fn(image_name)) if callable(fn) else False
 
 
+def kill_process_tree(pid: int) -> bool:
+    """杀掉整棵进程树（独立 harness 的 npx 会套 cmd→node→cmd→node，只杀最外层不够）。
+
+    平台差异收在这里：Windows 用 ``taskkill /T /F``，POSIX 用进程组 SIGTERM。
+    永不抛；返回"是否执行了杀动作"。
+    """
+    fn = _platform_fn("kill_process_tree")
+    return bool(fn(int(pid))) if callable(fn) else False
+
+
+def listening_pid(port: int) -> int:
+    """谁在监听本机某个 TCP 端口（找不到 = 0）。用于"端口还在被占"时补一刀。"""
+    fn = _platform_fn("listening_pid")
+    return int(fn(int(port))) if callable(fn) else 0
+
+
 def shell_open(target: str, params: str = "") -> bool:
     """用系统 shell 打开 URL / 可执行文件（非阻塞）。"""
     fn = _platform_fn("shell_open")

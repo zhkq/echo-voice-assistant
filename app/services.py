@@ -12,7 +12,7 @@ import time
 import app.db as db
 from app import platform as echo_platform
 
-COMPONENT_ORDER = ["server", "dsh", "stt", "tts", "wake", "hotkey", "meeting", "diarize"]
+COMPONENT_ORDER = ["server", "dsh", "harness", "stt", "tts", "wake", "hotkey", "meeting", "diarize"]
 
 
 def _set(name, status, detail="", pid=0):
@@ -26,6 +26,11 @@ def report_server(pid=None):
 
 def report_dsh(status, detail=""):
     _set("dsh", status, detail)
+
+
+def report_harness(status, detail=""):
+    """独立 DeepSeek Harness（@deepseek-ai/dsh，随 ECHO 启动的那个）的状态。"""
+    _set("harness", status, detail)
 
 
 def report_stt(status, detail=""):

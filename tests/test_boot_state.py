@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """启动状态机的 characterization 测试（§13.8 安全网第 2 项，P3 前置）
 
 `app/boot.py` 是"面板先可用、其余组件后台分阶段拉起"的编排器，状态机是
@@ -100,20 +100,21 @@ class RegistrationAndSnapshotTests(_BootStateTestCase):
         boot.setup()
         snap = boot.snapshot()
         self.assertEqual([c["id"] for c in snap["components"]],
-                         ["server", "dsh", "failover", "stt-cmd", "stt-meeting",
+                         ["server", "dsh", "failover", "harness", "stt-cmd", "stt-meeting",
                           "tts", "wake", "hotkey", "meeting", "diarize"])
         by_id = {c["id"]: c for c in snap["components"]}
         self.assertEqual(by_id["server"]["status"], "online", "面板服务阶段 0 就已就绪")
         self.assertFalse(by_id["server"]["can_start"])
         self.assertEqual(by_id["stt-meeting"]["status"], "idle", "会议引擎按需加载")
         self.assertEqual(by_id["stt-meeting"]["kind"], "model")
-        for cid in ("hotkey", "wake", "stt-cmd", "stt-meeting"):
+        for cid in ("hotkey", "wake", "stt-cmd", "stt-meeting", "harness"):
             self.assertTrue(by_id[cid]["can_stop"], "%s 应可手动停止" % cid)
+        self.assertTrue(by_id["harness"]["can_start"], "独立 harness 可手动拉起")
 
     def test_setup_twice_does_not_duplicate(self):
         boot.setup()
         boot.setup()
-        self.assertEqual(boot.snapshot()["summary"]["total"], 10)
+        self.assertEqual(boot.snapshot()["summary"]["total"], 11)
 
 
 class ReportTests(_BootStateTestCase):

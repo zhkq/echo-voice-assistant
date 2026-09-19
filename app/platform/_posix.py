@@ -88,6 +88,38 @@ def process_running(image_name: str) -> bool:
         return False
 
 
+def kill_process_tree(pid: int) -> bool:
+    """杀进程组（独立 harness 的 npx 会套多层 shell，只杀最外层不够）。"""
+    import os
+    import signal
+    if pid <= 0:
+        return False
+    try:
+        os.killpg(os.getpgid(pid), signal.SIGTERM)
+        return True
+    except Exception:
+        try:
+            os.kill(pid, signal.SIGTERM)
+            return True
+        except Exception:
+            return False
+
+
+def listening_pid(port: int) -> int:
+    """谁在监听本机某端口（``lsof`` 优先，退化 ``ss``）。找不到 = 0。"""
+    import subprocess
+    for cmd in (["lsof", "-nP", "-iTCP:%d" % port, "-sTCP:LISTEN", "-t"],
+                ["ss", "-lptn", "sport = :%d" % port]):
+        try:
+            out = subprocess.run(cmd, capture_output=True, text=True, timeout=8).stdout or ""
+        except Exception:
+            continue
+        for tok in out.replace(",", " ").split():
+            if tok.isdigit() and int(tok) > 0:
+                return int(tok)
+    return 0
+
+
 def console_shell_argv(script: str):
     """起一个控制台脚本的 argv（POSIX = ``/bin/sh``）。"""
     return ["/bin/sh", script]

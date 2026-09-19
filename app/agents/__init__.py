@@ -60,6 +60,7 @@ def _autoload():
     """导入内置适配器模块，各自在导入期调用 register()。"""
     from app.agents import dsh_agent      # noqa: F401
     from app.agents import codebuddy      # noqa: F401
+    from app.agents import harness_agent  # noqa: F401  独立 harness（随 ECHO 启动）
 
 
 def specs():

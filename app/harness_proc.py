@@ -1,0 +1,413 @@
+# -*- coding: utf-8 -*-
+"""harness_proc.py — 独立 DeepSeek Harness 的进程管理（随 ECHO 启动）
+
+背景（2026-09-19 实测，见 docs/独立harness接入.md）
+--------------------------------------------------
+官方**独立发行版**是 npm 包 `@deepseek-ai/dsh`（实测 0.1.5-rc.2，与 DSH Desktop 自带
+那个 `dsh` **同版本**）。`dsh web --port N --no-open` 起的就是 Desktop 那套 **web profile**：
+同一个 `/api` JSON-RPC 接口面（`session/*`、`workspace/*`、`settings/*`）——
+隔离实测（独立 DSH_HOME + 空闲端口 43199）`session/list`、`session/create`、
+`workspace/create` 全部通过，**ECHO 现有请求体原封不动就能用**。
+
+与 Desktop 唯一的差别是**鉴权**：
+  * Desktop：`/api` 校验签名 Cookie（密钥在 `~/.dsh/.credentials.yaml`，ECHO 自铸 HMAC）；
+  * 独立 harness：启动时打印一条 `dsh web: http://…/?token=<token>`，
+    用它访问一次 `/?token=…` 就换到一枚 `dsh-auth-…` Cookie，之后照常调 `/api/*`。
+
+本模块负责把 harness 当作 **ECHO 的子进程** 拉起/探活/停止，并把 token 交给适配器：
+  * 幂等：先探活，已在跑（用户自己起的、或上次留下的）就不重复起；
+  * 冷却：避免每个复查周期都 Popen 一次（与 failover_proxy 同一套教训）；
+  * token：从子进程 stdout 解析出来，存进程内 + 落一份到 ``data/logs/harness-token.txt``
+    （下次 ECHO 重启时若发现同一实例还在跑，可以复用它，免得再起一个）；
+  * 只停 ECHO 自己起的那个（记住 pid），不动用户手工启动的实例；
+  * 默认**不随 ECHO 启动**：只有把 `agentBackend` 选成 harness（或 `agentHarnessEnabled`
+    打开）时才拉起 —— 选了 DSH Desktop 的人不该平白多一个 node 进程。
+"""
+from __future__ import annotations
+
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import threading
+import time
+import urllib.request
+
+from app import paths, services
+from app.config import settings
+
+#: 默认端口：避开 DSH Desktop 的 43120（两者可以同时在跑，互不干扰）
+DEFAULT_PORT = 43199
+#: 默认启动命令（可配置；用户 Node 不在 PATH 时在这里填全路径）
+DEFAULT_COMMAND = "npx -y @deepseek-ai/dsh web"
+LAUNCH_COOLDOWN = 20.0        # 拉起后多久内不再重复拉（秒）
+READY_TIMEOUT = 60.0          # 等它就绪的上限（首次会 pnpm 装插件，可能久一点）
+TOKEN_RE = re.compile(r"[?&]token=([A-Za-z0-9._~+/=-]+)")
+
+_lock = threading.Lock()
+_proc = None                  # ECHO 拉起的子进程（仅用于 stop 时判断"是不是我们起的"）
+_proc_pid = 0
+_token = ""                   # 从 stdout 解析到的 token（进程内）
+_last_launch = 0.0
+_reader = None
+
+
+# ---------------------------------------------------------------- 基本量
+
+def port():
+    try:
+        return int(settings.get("harnessPort", DEFAULT_PORT) or DEFAULT_PORT)
+    except Exception:
+        return DEFAULT_PORT
+
+
+def base_url():
+    return "http://127.0.0.1:%d" % port()
+
+
+def home():
+    """harness 自己的 DSH_HOME（独立于 Desktop 那边，避免两边抢同一份会话/设置）。
+
+    注意：这里刻意**不**去读 Desktop 的家目录常量 —— 本模块只认 `harnessHome` 配置
+    （留空 = `{DATA}/harness`）。上面那句"独立"就是这个意思：谁也别改谁。
+    """
+    raw = str(settings.get("harnessHome", "") or "").strip()
+    from app.config import expand_path
+    if raw:
+        return expand_path(raw)
+    return os.path.join(paths.data_root(), "harness")
+
+
+def command():
+    return str(settings.get("harnessCommand", DEFAULT_COMMAND) or DEFAULT_COMMAND).strip()
+
+
+def requested():
+    """是否**应该**由 ECHO 把 harness 跑起来：既选中了它、又没被关掉。
+
+    判定用"与"而不是"或"（2026-09-19 实测踩过）：面板"选中智能体"会把
+    `agentHarnessEnabled` 一起打开，切走时只改 `agentBackend`。若用"或"，切回 DSH 后
+    node 进程会一直挂着（实测：切到 dsh 后 43199 仍在监听），启动页看着像没生效。
+    进程跟着**选择**走，和模型路由那种"常驻服务"不是一回事。
+    """
+    try:
+        if str(settings.get("agentBackend", "") or "").strip() != "harness":
+            return False
+        return bool(settings.get("agentHarnessEnabled", False))
+    except Exception:
+        return False
+
+
+def token():
+    """当前 token：进程内捕获的 > 上次落盘的（服务重启、实例还活着的情形）> 用户手填的。"""
+    if _token:
+        return _token
+    saved = load_saved_token()          # ECHO 自己重启后，harness 往往还在跑
+    if saved:
+        return saved
+    try:
+        return str(settings.get("harnessToken", "") or "").strip()
+    except Exception:
+        return ""
+
+
+def set_token(value):
+    """外部（适配器/测试）注入 token。"""
+    global _token
+    _token = str(value or "").strip()
+    return _token
+
+
+def online(timeout=1.0):
+    """harness 在监听吗（任何 HTTP 响应都算，含 401）—— 不发 token，纯探活。"""
+    try:
+        urllib.request.urlopen(base_url() + "/", timeout=timeout).close()
+        return True
+    except urllib.error.HTTPError:
+        return True
+    except Exception:
+        return False
+
+
+def started_by_echo():
+    return bool(_proc_pid and _proc is not None and _proc.poll() is None)
+
+
+# ---------------------------------------------------------------- 启动 / 停止
+
+def _argv():
+    """把配置里的命令拆成 argv，并把第一段解析成真路径（Windows 上 npx 是 .cmd）。
+
+    `shutil.which` 会按 PATHEXT 找，所以默认的 `npx` 在 Windows 上会解析成 npx.CMD ——
+    否则 Popen 直接报 FileNotFoundError（这是"用户装了 Node 却起不来"的常见坑）。
+    """
+    try:
+        parts = shlex.split(command(), posix=False)
+    except Exception:
+        parts = command().split()
+    parts = [p.strip('"') for p in parts if p.strip()]
+    if not parts:
+        return []
+    exe = shutil.which(parts[0]) or parts[0]
+    return [exe] + parts[1:]
+
+
+def _read_output(proc):
+    """后台读子进程输出：写日志 + 抓 token。"""
+    global _token
+    log_dir = os.path.join(paths.data_root(), "logs")
+    try:
+        os.makedirs(log_dir, exist_ok=True)
+    except Exception:
+        pass
+    log_path = os.path.join(log_dir, "harness.log")
+    try:
+        fh = open(log_path, "a", encoding="utf-8", errors="replace")
+    except Exception:
+        fh = None
+    try:
+        for raw in iter(proc.stdout.readline, b""):
+            line = raw.decode("utf-8", "replace").rstrip()
+            if fh:
+                try:
+                    fh.write(line + "\n")
+                    fh.flush()
+                except Exception:
+                    pass
+            m = TOKEN_RE.search(line)
+            if m and not _token:
+                _token = m.group(1)
+                _persist_token(_token)
+                services.report_harness("online", "独立 harness（%s）" % base_url())
+    except Exception:
+        pass
+    finally:
+        if fh:
+            try:
+                fh.close()
+            except Exception:
+                pass
+
+
+def _persist_token(value):
+    """token 落一份到 data/logs（服务重启后若实例还在跑，可复用，不必再起一个）。"""
+    try:
+        p = os.path.join(paths.data_root(), "logs", "harness-token.txt")
+        with open(p, "w", encoding="utf-8") as fh:
+            fh.write(value)
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------- 归属（pid）记录
+#
+# 为什么要落盘：ECHO 重启后 harness 往往还在跑，新进程会**接手**这个实例（不再重复拉起）。
+# 但"接手"之后如果只认内存里的 `_proc`，切走时就会说"不是我起的"而拒绝停止 ——
+# 实测踩过：切到 DSH 后 43199 仍挂着。所以把"是我们拉起的"这件事记到 pid 文件里。
+
+def _pid_path():
+    return os.path.join(paths.data_root(), "logs", "harness.pid")
+
+
+def _persist_pid(pid):
+    try:
+        with open(_pid_path(), "w", encoding="utf-8") as fh:
+            fh.write(str(pid))
+    except Exception:
+        pass
+
+
+def _load_pid():
+    try:
+        with open(_pid_path(), "r", encoding="utf-8") as fh:
+            return int((fh.read() or "0").strip() or 0)
+    except Exception:
+        return 0
+
+
+def _clear_pid():
+    try:
+        os.remove(_pid_path())
+    except Exception:
+        pass
+
+
+#: 这两个端口属于 ECHO 自己与 DSH Desktop，harness 不许占（占了就会互相打架）
+RESERVED_PORTS = {43120, 18060}
+
+
+def port_conflict():
+    """端口是不是撞了 Desktop / ECHO 自己？返回一句人话（正常返回空串）。"""
+    if port() in RESERVED_PORTS:
+        return ("harness 端口 %d 被 DSH Desktop（43120）或 ECHO 自己（18060）占用，"
+                "请换成别的端口（默认 43199）" % port())
+    return ""
+
+
+def load_saved_token():
+    """读回上次落盘的 token（进程内为空时用）。"""
+    global _token
+    if _token:
+        return _token
+    try:
+        p = os.path.join(paths.data_root(), "logs", "harness-token.txt")
+        with open(p, "r", encoding="utf-8") as fh:
+            _token = fh.read().strip()
+    except Exception:
+        _token = ""
+    return _token
+
+
+def forget_token():
+    """丢掉一个用不了的 token（文件里的 + 进程内的），下次重拉时会重新捕获。"""
+    global _token
+    _token = ""
+    try:
+        os.remove(os.path.join(paths.data_root(), "logs", "harness-token.txt"))
+    except Exception:
+        pass
+
+
+def ensure_running():
+    """确保 harness 在跑。幂等。返回 ``(ok, detail)``。
+
+    并发安全：boot 的启动步骤与「切换智能体」的联动可能几乎同时调进来，
+    所以"探活 → 决定是否 Popen"这段必须**串行**（否则会拉起两个实例 ——
+    实测过：43199 与 43206 两个 node 同时在跑）。
+    """
+    global _proc, _proc_pid, _last_launch
+    conflict = port_conflict()
+    if conflict:
+        return False, conflict
+    with _lock:
+        if online():
+            return True, "独立 harness 已在运行（%s）" % base_url()
+        now = time.monotonic()
+        if now - _last_launch < LAUNCH_COOLDOWN:
+            return True, "独立 harness 刚拉起过，等待就绪（冷却 %.0fs）" % (
+                LAUNCH_COOLDOWN - (now - _last_launch))
+        argv = _argv()
+        if not argv:
+            return False, "harness 启动命令为空（设置 → 智能体 → 启动命令）"
+        exe = argv[0]
+        if not (os.path.isabs(exe) and os.path.isfile(exe)) and not shutil.which(exe):
+            return False, ("找不到 %s：需要本机有 Node.js（npx）。装了但不在 PATH 里时，"
+                           "把「启动命令」改成本机 npx 的全路径" % exe)
+        dsh_home = home()
+        try:
+            os.makedirs(dsh_home, exist_ok=True)
+        except Exception:
+            pass
+        env = dict(os.environ)
+        env["DSH_HOME"] = dsh_home                      # 独立家目录：不碰 Desktop 的家
+        full = argv + ["--port", str(port()), "--no-open"]
+        flags = {}
+        try:
+            from app import platform as echo_platform
+            flags = echo_platform.detach_console_kwargs()   # 无控制台窗口（同 failover/边条）
+        except Exception:
+            flags = {}
+        _last_launch = now
+        try:
+            proc = subprocess.Popen(
+                full, cwd=dsh_home, env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                close_fds=True, **flags)
+        except Exception as e:
+            return False, "拉起独立 harness 失败：%s（命令：%s）" % (e, " ".join(full))
+        _proc, _proc_pid = proc, proc.pid
+        _persist_pid(proc.pid)          # 落盘：ECHO 重启后仍认得"这是我们起的"
+    # 锁外等就绪（首次会 pnpm 装插件，几十秒；持有锁会挡住并发调用者）
+    try:
+        services.report_harness("starting", "启动中：%s" % " ".join(full[:3]))
+    except Exception:
+        pass
+    threading.Thread(target=_read_output, args=(proc,), daemon=True,
+                     name="harness-log").start()
+    deadline = time.monotonic() + READY_TIMEOUT
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            return False, ("独立 harness 启动后立即退出（code=%s）——命令或环境有问题，"
+                           "详见 data/logs/harness.log" % proc.returncode)
+        if online():
+            return True, "独立 harness 已启动（%s）" % base_url()
+        time.sleep(0.5)
+    return True, "独立 harness 启动中（%s，首次要装插件，可能要一会儿）" % base_url()
+
+
+def _kill_tree(pid):
+    """杀掉整棵进程树（平台差异在 app/platform 接缝里：Windows=taskkill /T）。"""
+    if pid <= 0:
+        return
+    try:
+        from app import platform as echo_platform
+        echo_platform.kill_process_tree(pid)
+    except Exception:
+        pass
+
+
+def _listener_pid(want_port):
+    """谁在监听 want_port（平台差异同样收在接缝里）。找不到返回 0。"""
+    try:
+        from app import platform as echo_platform
+        return echo_platform.listening_pid(want_port)
+    except Exception:
+        return 0
+
+
+def stop():
+    """停止 **ECHO 自己起的** harness（用户手工起的实例不动）。返回 ``(ok, detail)``。
+
+    归属判据（两道，任一成立即认为是我们起的）：
+      * 本进程 Popen 过的（`_proc_pid`）；
+      * 上次 ECHO 落盘的 pid 文件（服务重启后接手的情形）—— 否则会出现
+        "切走了但端口还挂着"，实测踩过。
+    收尾动作：先杀整棵树（npx 会套 cmd→node→cmd→node，只 terminate 最外层等于没杀），
+    再用"谁在监听本端口"兜底补一刀 —— 但**只在端口确实归我们管**时才动它。
+    """
+    global _proc, _proc_pid
+    proc, pid = _proc, _proc_pid
+    recorded = bool(pid) or bool(_load_pid())
+    if not recorded:
+        _proc, _proc_pid = None, 0
+        return True, "独立 harness 不是本进程起的，未做处理"
+    if proc is not None and proc.poll() is None:
+        _kill_tree(pid or proc.pid)
+        try:
+            proc.wait(timeout=8)
+        except Exception:
+            pass
+    elif pid:
+        _kill_tree(pid)
+    # 兜底：wrapper 早退了、真正的 node 还在监听
+    deadline = time.monotonic() + 6
+    while time.monotonic() < deadline and online(timeout=0.6):
+        time.sleep(0.4)
+    if online(timeout=0.6):
+        lpid = _listener_pid(port())
+        if lpid and lpid != os.getpid():
+            _kill_tree(lpid)
+            time.sleep(1.0)
+    _proc, _proc_pid = None, 0
+    _clear_pid()
+    forget_token()
+    still = online(timeout=0.6)
+    try:
+        services.report_harness("offline" if not still else "online",
+                                "已停止" if not still else "停止失败：端口仍在监听")
+    except Exception:
+        pass
+    return (not still), ("已停止独立 harness" if not still else
+                         "停止失败：%s 仍在监听（可能需要手动结束该进程）" % base_url())
+
+
+def status_detail():
+    """给面板/日志用的一句话状态。"""
+    if online():
+        return "online", "独立 harness 运行中（%s，token %s）" % (
+            base_url(), "已获取" if token() else "未获取")
+    if requested():
+        return "idle", "已配置为随 ECHO 启动，但当前没在监听 %s" % base_url()
+    return "disabled", "未启用（选中「独立 harness」时才会启动）"

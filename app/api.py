@@ -279,12 +279,24 @@ def put_settings(body: SettingsIn, _auth=Depends(optional_auth)):
         if not ok:
             raise HTTPException(status_code=400, detail=f"路由配置未能应用：{detail}")
     # 智能体相关项：清实例缓存，让新选择/新路径立即生效
-    if any(k.startswith("agent") for k in updated):
+    if any(k.startswith("agent") or k.startswith("harness") for k in updated):
         try:
             from app import agents
             agents.reset()
         except Exception:
             pass
+        # 独立 harness 随选随起/随走随停（只停 ECHO 自己起的那个，用户手起的实例不动）
+        try:
+            from app import harness_proc
+            if harness_proc.requested():
+                ok, msg = harness_proc.ensure_running()
+                if not ok:
+                    # 不抛 400：选择已经生效，只是服务没起来 —— 面板的「检测」会显示原因
+                    print("[api] 拉起独立 harness 未成功: %s" % msg)
+            else:
+                harness_proc.stop()
+        except Exception as e:
+            print("[api] harness 联动失败: %s" % e)
     return {"ok": True, "updated": updated}
 
 

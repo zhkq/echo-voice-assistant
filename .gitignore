@@ -66,3 +66,7 @@ dist/
 
 # ---- 由 scripts/install-desktop-shortcut.ps1 从 web/icon-512.png 生成 ----
 assets/echo.ico
+
+# 独立 harness 的临时家目录（探测/试跑时会在 cwd 下生成，含 node_modules）
+__probe__/
+
