@@ -557,6 +557,42 @@ class OptionAndPanelWiringTests(unittest.TestCase):
         self.assertIn("routerHintRow", js, "设置页要给一句指路")
         self.assertIn("async function ensureSettings", js, "两个页签共用一份设置数据")
 
+    def test_component_list_is_rows_not_a_cramped_table(self):
+        """组件清单用逐条行、按钮文字短（2026-09-19 用户："布局不太好看，按钮字太多"）。
+
+        表格在窄边条里会把「用途」列压成竖排汉字、按钮也竖着排；行式布局下：
+        名称+状态一行、体积+用途一行、动作一行（宽屏时动作挪到右侧）。
+        """
+        js = _read(os.path.join("web", "app.js"))
+        css = _read(os.path.join("web", "app.css"))
+        self.assertIn('class="cap-comps"', js)
+        self.assertIn('class="cap-comp', js)
+        self.assertNotIn("cap-table", js, "不该再渲染表格")
+        self.assertNotIn(".cap-table", css, "表格样式应已删除（避免死样式）")
+        for token in (".cap-comps", ".cap-comp-main", ".cap-comp-meta", ".cap-comp-acts"):
+            with self.subTest(token=token):
+                self.assertIn(token, css)
+        self.assertIn(".cap-comp-acts .btn { white-space: nowrap; }", css,
+                      "按钮不许竖排（窄边条实测会被挤成一列字）")
+
+    def test_model_action_labels_stay_short(self):
+        """按钮文字要短（完整含义进 title）——「重新下载/复制下载命令/复制目标路径」都太长。"""
+        js = _read(os.path.join("web", "app.js"))
+        block = js.split("function modelActions")[1].split("\n}")[0]
+        for label in (">下载</button>", ">复制命令</button>", ">复制路径</button>", ">链接</a>"):
+            with self.subTest(label=label):
+                self.assertIn(label, block)
+        for gone in ("重新下载</button>", "复制目标路径</button>", "复制下载命令</button>"):
+            with self.subTest(label=gone):
+                self.assertNotIn(gone, block, "长按钮文字应改成短标签 + title")
+
+    def test_engine_labels_do_not_wrap_vertically(self):
+        """「命令转写 / 会议转写」在窄边条里被压成竖排两行 → 加 nowrap + 窄屏各占一行。"""
+        css = _read(os.path.join("web", "app.css"))
+        m = re.search(r"\.cap-engine-row label\s*\{([^}]*)\}", css)
+        self.assertIsNotNone(m)
+        self.assertIn("white-space: nowrap", m.group(1))
+
     def test_agent_switch_also_enables_the_product(self):
         """智能体开关即单选：选中时要把该产品的启用开关一起打开，避免自相矛盾。"""
         js = _read(os.path.join("web", "app.js"))

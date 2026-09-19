@@ -1243,7 +1243,7 @@ function capCompBadge(c) {
   return modelBadge("未知", "idle");
 }
 
-/** 组件表的「获取」格：能下载就给下载按钮（走 /api/models/download），否则给复制说明。 */
+/** 组件行的「获取」动作：能下载就给下载（走 /api/models/download），否则给复制说明。 */
 function capCompActions(c) {
   const m = c.model_id ? modelById(c.model_id) : null;
   if (m) {
@@ -1254,25 +1254,40 @@ function capCompActions(c) {
     return modelActions(m);
   }
   const btns = [];
-  if (c.how) btns.push(`<button type="button" class="btn mini" data-mcopy="${esc(c.how)}">复制安装说明</button>`);
+  if (c.how) {
+    btns.push(`<button type="button" class="btn mini" data-mcopy="${esc(c.how)}"
+      title="${esc(c.how)}">复制说明</button>`);
+  }
   if (c.ref) btns.push(`<span class="muted" style="font-size:12px">${esc(c.ref)}</span>`);
   return btns.join(" ");
 }
 
-/** 组件表：能力卡里的"装没装 / 怎么装"。`currentIds` 命中的行标「当前使用」。 */
+/** 组件清单：能力卡里的"装没装 / 怎么装"。`currentIds` 命中的行标「当前使用」。
+ *
+ *  2026-09-19 从**表格**改成**逐条行**（用户实测："这个内容布局不太好看，按钮字太多"）：
+ *  窄边条里表格的「用途」列被压成一列竖排的汉字、按钮也竖着排。改成行之后：
+ *    第一行 = 名称 + 状态徽标（当前用的标「▶ 当前」）
+ *    第二行 = 体积 · 用途（说明整行展开，不再逐字换行）
+ *    第三行 = 动作按钮（自动换行，不挤）
+ *  宽屏（≥861px）下用 CSS 网格把动作挪到右侧，视觉上仍是紧凑两栏。
+ */
 function capCompTable(comps, currentIds) {
   if (!comps.length) return `<div class="muted" style="font-size:12px">本平台没有可装的组件。</div>`;
   const cur = new Set((currentIds || []).filter(Boolean));
-  const rows = comps.map((c) => `<tr class="${cur.has(c.model_id) ? "cap-cur-row" : ""}">
-      <td>${cur.has(c.model_id) ? "<b>▶ 当前</b> " : ""}${esc(c.name || c.id)}</td>
-      <td>${capCompBadge(c)}</td>
-      <td class="muted">${c.size_mb ? c.size_mb + " MB" : "-"}</td>
-      <td class="muted" style="font-size:12px">${esc(c.purpose || "")}</td>
-      <td>${capCompActions(c)}</td>
-    </tr>`).join("");
-  return `<table class="cap-table"><thead><tr>
-      <th>组件</th><th>状态</th><th>体积</th><th>用途</th><th>获取</th>
-    </tr></thead><tbody>${rows}</tbody></table>`;
+  const rows = comps.map((c) => {
+    const isCur = cur.has(c.model_id);
+    const meta = [c.size_mb ? c.size_mb + " MB" : "", c.purpose || ""].filter(Boolean).join(" · ");
+    return `<div class="cap-comp${isCur ? " cur" : ""}">
+      <div class="cap-comp-main">
+        ${isCur ? `<span class="cap-cur">▶ 当前</span>` : ""}
+        <span class="cap-comp-name">${esc(c.name || c.id)}</span>
+        <span class="cap-comp-badge">${capCompBadge(c)}</span>
+      </div>
+      <div class="cap-comp-meta">${esc(meta)}</div>
+      <div class="cap-comp-acts">${capCompActions(c)}</div>
+    </div>`;
+  }).join("");
+  return `<div class="cap-comps">${rows}</div>`;
 }
 
 /** 在线服务的一个字段（地址/模型名/密钥）。密钥沿用服务端遮罩：空 = 不改。 */
@@ -2058,19 +2073,31 @@ function friendlyOption(key, v) {
 
 function modelBadge(text, kind) { return `<span class="mcard-badge ${kind}">${esc(text)}</span>`; }
 
-/** 模型卡片的「获取」按钮组：下载 / 复制命令 / 复制目标路径 / 官方链接。 */
+/** 模型卡片的「获取」按钮组：下载 / 复制命令 / 复制路径 / 官方链接。
+ *
+ *  按钮文字一律**短**（用户 2026-09-19 实测："按钮字太多"，窄边条里"重新下载"被挤成竖排）：
+ *  完整含义进 title —— 「下载」（已装的写"重新下载（覆盖现有文件）"）、
+ *  「复制命令」/「复制路径」（cmd_label 再长也压成这两个词）、链接保留厂商给的短标签。
+ */
 function modelActions(m) {
   if (!m) return "";
   const btns = [];
   if (m.downloadable !== false && m.source !== "copy") {
-    btns.push(`<button class="btn mini" data-msdl="${esc(m.id)}" data-force="${m.ready ? "1" : "0"}">` +
-      (m.ready ? "重新下载" : "下载") + `</button>`);
+    btns.push(`<button class="btn mini" data-msdl="${esc(m.id)}" data-force="${m.ready ? "1" : "0"}"
+      title="${m.ready ? "重新下载（覆盖现有文件）" : "从上游下载到本机"}">下载</button>`);
   }
-  if (m.cmd) btns.push(`<button class="btn mini" data-mcopy="${esc(m.cmd)}">${esc(m.cmd_label || "复制命令")}</button>`);
-  if (m.source === "copy") btns.push(`<button class="btn mini" data-mcopy="${esc(m.target)}">复制目标路径</button>`);
+  if (m.cmd) {
+    btns.push(`<button class="btn mini" data-mcopy="${esc(m.cmd)}"
+      title="${esc(m.cmd_label || "复制下载命令")}">复制命令</button>`);
+  }
+  if (m.source === "copy") {
+    btns.push(`<button class="btn mini" data-mcopy="${esc(m.target)}"
+      title="复制落地路径：${esc(m.target)}">复制路径</button>`);
+  }
   for (const link of (m.links || [])) {
     if (String(link.url || "").startsWith("https://huggingface.co/"))
-      btns.push(`<a class="btn mini" href="${esc(link.url)}" target="_blank" rel="noopener noreferrer">${esc(link.label)}</a>`);
+      btns.push(`<a class="btn mini" href="${esc(link.url)}" target="_blank" rel="noopener noreferrer"
+        title="${esc(link.label || "官方页面")}">链接</a>`);
   }
   return btns.join("");
 }
