@@ -49,14 +49,23 @@ ALLOWED = [
     ("app/paths.py", "PATH_DERIVATION"),
 ]
 
-DRIVE_RE = re.compile(r"[A-Za-z]:[\\/]")
+#: 真正的盘符绝对路径；负向后顾排除 http:// / https:// 这类 scheme（"p:/" 会误中）。
+DRIVE_RE = re.compile(r"(?<![A-Za-z0-9_])[A-Za-z]:[\\/]")
 #: tokens that mean "this module is branching on the platform"
+#: 注意 win32 / macos / linux 是**清单中立标记**（见 app/platform/__init__.py
+#: 「清单用的平台标记」），清单里写它们不算平台分支，所以不在此列。
 PLATFORM_NAMES = {
-    "darwin", "win32", "cygwin", "msys",
+    "darwin", "cygwin", "msys",
     "LOCALAPPDATA", "APPDATA", "ProgramFiles", "ProgramFiles(x86)",
     "SystemRoot", "windir",
 }
-PLATFORM_ATTRS = ("os.name", "sys.platform", "platform.system", "platform.platform")
+#: 属性式平台判定。tokenize 会在 "." 两侧加空格（"os . name"），
+#: 所以必须用容忍空白的正则，不能拿 "os.name" 直接做子串匹配。
+PLATFORM_ATTR_RES = (
+    re.compile(r"\bos\s*\.\s*name\b"),
+    re.compile(r"\bsys\s*\.\s*platform\b"),
+    re.compile(r"\bplatform\s*\.\s*(?:system|platform)\b"),
+)
 DERIVE_NAMES = ("dirname", "abspath", "__file__")
 
 SKIP_DIRS = {"__pycache__", ".git", "node_modules"}
@@ -115,23 +124,27 @@ def scan_file(path):
             code_lines[ln] = code_lines.get(ln, "") + ' "" '
         else:
             code_lines[ln] = code_lines.get(ln, "") + " " + tok.string
-        if tok.type not in (tokenize.NL, tokenize.NEWLINE, tokenize.INDENT,
-                            tokenize.DEDENT, tokenize.ENCODING):
+        # 必须把 NEWLINE/INDENT/DEDENT 也记进来：否则 `def f():` 之后缩进里的
+        # 第一个字符串（docstring）会被当成表达式字符串，docstring 里的
+        # `C:\example` 之类就会误报（本工具最初就有这个洞）。
+        if tok.type != tokenize.ENCODING:
             prev_meaningful = tok.type
 
     for ln, code in sorted(code_lines.items()):
         text = code.strip()
-        # 三种"自己推根"的写法都要抓：
-        #   os.path.dirname(...__file__) / os.path.abspath(__file__)
-        #   pathlib: Path(__file__).resolve().parent...   ← 最初漏了这条（llm_router.py 就是）
-        if "__file__" in code and ("dirname" in code or "abspath" in code
-                                   or "parent" in code or "resolve(" in code):
+        # tokenize 会在 "." 两侧插空格（``os . path``），检测前先去掉点周围空白，
+        # 这样 (a) 负向后顾能识别 ``X.__file__``（不是本模块的 __file__）；
+        # (b) ``Path(__file__).resolve().parent`` 这类 pathlib 写法能一次抓全。
+        compact = re.sub(r"\s*\.\s*", ".", code)
+        # 只抓**裸** __file__：``speechbrain.__file__`` 是第三方包自身位置，与安装根无关。
+        if re.search(r"(?<![\w.])__file__", compact) and any(
+                k in compact for k in ("dirname", "abspath", "parent", "resolve(")):
             hits.append(("PATH_DERIVATION", ln, text))
-        if any(attr in code for attr in PLATFORM_ATTRS):
+        if any(rx.search(compact) for rx in PLATFORM_ATTR_RES):
             hits.append(("PLATFORM_TOKEN", ln, text))
         else:
             for name in PLATFORM_NAMES:
-                if re.search(r"\b%s\b" % re.escape(name), code):
+                if re.search(r"\b%s\b" % re.escape(name), code, re.IGNORECASE):
                     hits.append(("PLATFORM_TOKEN", ln, text))
                     break
 
@@ -140,10 +153,17 @@ def scan_file(path):
             if DRIVE_RE.search(val):
                 hits.append(("DRIVE_LITERAL", ln, val.strip()[:90]))
                 continue
+            # Python 3.11 把 f-string 当**一个** STRING token，里面的
+            # ``{platform.system()}`` 在代码通道里是隐身字符串——必须在这里扫，
+            # 否则 app/services.py:23 这种展示型分支会被漏掉。
+            q = min([i for i, ch in enumerate(val) if ch in "\"'"] or [len(val)])
+            if "f" in val[:q].lower() and any(rx.search(val) for rx in PLATFORM_ATTR_RES):
+                hits.append(("PLATFORM_TOKEN", ln, val.strip()[:90]))
+                continue
             # env-var platform tokens live INSIDE strings (e.g. "%LOCALAPPDATA%"),
             # so they have to be looked for here - the code pass blanks strings.
             for name in PLATFORM_NAMES:
-                if re.search(r"\b%s\b" % re.escape(name), val):
+                if re.search(r"\b%s\b" % re.escape(name), val, re.IGNORECASE):
                     hits.append(("PLATFORM_TOKEN", ln, val.strip()[:90]))
                     break
 
