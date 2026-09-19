@@ -262,7 +262,64 @@ def speak_section(title, text, engine, note=""):
     ask_heard("%s (%s)" % (title.split(".", 1)[-1].strip(), engine))
 
 
+def repeat_one_beep(name, times=3, gap=3.0):
+    """单曲重复 N 次：用来把"某个提示音偶尔被吞"定性。
+
+    为什么要重复：`done.wav` 只有 90 ms，一次没听到既可能是"用户没注意"，
+    也可能是"这条通路就是吞短的"。重复 3 次、每次单独问 y/n，就能分开：
+    * 3/3 都没听到 -> 确定性失败（改文件：给短提示音前置静音 / 加长）
+    * 1~2 次听到   -> 偶发（设备/时序），修法偏向"预热"
+    """
+    hr("R. repeat one beep: %s x%d (gap %.0fs, one y/n per play)" % (name, times, gap))
+    try:
+        from app.audio import tts
+    except Exception:
+        traceback.print_exc()
+        return
+    print("  warm-up: play 'ok' twice without questions")
+    for _ in range(2):
+        tts.play_beep("ok")
+        time.sleep(1.5)
+    time.sleep(1.0)
+    pause("warm-up done. Press ENTER to start")
+    for i in range(1, times + 1):
+        print("")
+        print("  >>> %s  play #%d of %d" % (name, i, times))
+        played = tts.play_beep(name)
+        print("      play_beep() returned %r  (False = 根本没播出去)" % played)
+        time.sleep(gap)
+        ask_heard("%s #%d" % (name, i))
+    heard = sum(1 for label, ok in RESULTS if label.startswith(name) and ok)
+    print("")
+    print("  result: %d/%d heard" % (heard, times))
+
+
 def main():
+    # 单曲重复模式：probe-tts.bat --beep done --times 3
+    argv = sys.argv[1:]
+    if "--beep" in argv:
+        name = argv[argv.index("--beep") + 1] if len(argv) > argv.index("--beep") + 1 else "done"
+        times = 3
+        if "--times" in argv:
+            try:
+                times = int(argv[argv.index("--times") + 1])
+            except Exception:
+                times = 3
+        log_path = os.path.join(ROOT, "data", "logs", "probe-tts-last.txt")
+        tee = _Tee(log_path)
+        if tee.fh:
+            sys.stdout = tee
+        print("ECHO audio probe - repeat mode (dev tree)")
+        print("root   : %s" % ROOT)
+        print("log    : %s" % log_path)
+        repeat_one_beep(name, times)
+        hr("SUMMARY (paste this back)")
+        for label, heard in RESULTS:
+            print("  %-24s %s" % (label, "HEARD" if heard else "NOT heard"))
+        print("")
+        print("DONE-PROBE-TTS")
+        return
+
     log_path = os.path.join(ROOT, "data", "logs", "probe-tts-last.txt")
     tee = _Tee(log_path)
     if tee.fh:

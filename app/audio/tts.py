@@ -1,16 +1,18 @@
 # -*- coding: utf-8 -*-
-"""tts.py — ECHO 语音合成与提示音（Windows）
+"""tts.py — ECHO 语音合成与提示音（跨平台；平台专有实现收在 app/platform/）
 
-引擎：
+引擎（名称沿用 1.x 的配置值，不动配置兼容性）：
   edge-tts  微软在线合成（自然女声），需能访问 speech.platform.bing.com
-  sapi      Windows 自带 System.Speech（离线，中文语音）
-  auto      优先 edge-tts，失败自动降级 sapi
+  sapi      离线合成：Windows = System.Speech（中文音色），macOS = say
+  auto      优先 edge-tts，失败自动降级离线引擎
   off       不播报
 
 播放：edge-tts 产出 mp3 → soundfile 解码（libsndfile 内置 mp3 支持），
       失败回退 ffmpeg 转 wav；最终用 sounddevice 播放（不依赖控制台）。
 
-提示音：assets/beeps/*.wav，winsound 异步播放。
+提示音：assets/beeps/*.wav，播放实现由平台接缝给（Windows = winsound 异步播放）。
+  实测记录（2026-09-19）：五个提示音文件都正常；但 **90 ms 的 done.wav 会被这条
+  老通路（MME/waveOut）吞掉**，而 120 ms 以上的都能听到 —— 详见 docs/2.0-PROGRESS §34。
 """
 import atexit
 import os
@@ -33,16 +35,37 @@ _lock = threading.Lock()
 
 
 def play_beep(name):
-    """播放 assets/beeps/<name>.wav（start/done/ok/err…）。
+    """播放 assets/beeps/<name>.wav（start/done/ok/err…）。返回是否**成功播出**。
 
     播放实现是平台差异（Windows=winsound 异步、macOS=afplay），收在接缝里。
-    ⚠️ §30.2：Windows 上用户实测听不到提示音，探针跑完再决定是否换 sounddevice ——
-    换实现只需动 ``app/platform/win32/env.py::play_wav_async()`` 一处。
+
+    ⚠️ 2026-09-19 起不再静默：原实现"文件不存在直接 return、异常 pass"，
+    表现和"设备没声音"完全一样，导致"提示音到底响没响"查了两天。现在：
+      * 文件不存在 / 播放失败（接缝返回 False）都写一条 ``debug`` 日志（source=tts）；
+      * 返回值透出给调用方（探针据此区分"播了没响"与"根本没播"）。
+    仍然**不抛异常** —— 提示音永远不该影响录音主流程。
     """
     wav = os.path.join(BEEPS_DIR, name + ".wav")
     if not os.path.isfile(wav):
-        return
-    echo_platform.play_wav_async(wav)
+        _log_beep(name, wav, "文件不存在")
+        return False
+    try:
+        ok = bool(echo_platform.play_wav_async(wav))
+    except Exception as e:
+        _log_beep(name, wav, "播放异常: %s" % e)
+        return False
+    if not ok:
+        _log_beep(name, wav, "播放失败（接缝返回 False）")
+    return ok
+
+
+def _log_beep(name, path, why):
+    """提示音诊断日志（写 DB logs 表；失败也无所谓）。"""
+    try:
+        import app.db as db
+        db.add_log("debug", "tts", "提示音 %s：%s（%s）" % (name, why, path))
+    except Exception:
+        pass
 
 
 def _play_wav_data(data, sr):
