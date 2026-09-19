@@ -71,8 +71,15 @@ body.echo-offline .brand { color: var(--red); }
 
 /* ---------- 布局 ---------- */
 /* 2026-09-12：外边距整体收紧（原 20px 上下 + 14px 卡间距在窄边条里显得空） */
-main { max-width: 1200px; margin: 12px auto; padding: 0 14px; }
-.view { animation: fade .2s ease; }
+/* 2026-09-19：`main` 必须给**确定宽度**（width: 100%）+ 可收缩（min-width: 0）。
+   原因：`body` 在窄边条样式里是 flex 列容器，而 `main` 带 `margin: 0 auto` ——
+   交叉轴上的 auto 外边距会让 `align-self: stretch` 失效，于是 main 的宽度退化成
+   **max-content**（实测 508px），384px 的边条里整页右侧被裁掉、下拉/按钮全部出血
+   （模型路由页实测：main=508、四张卡片各 498、body.scrollWidth=508）。
+   给了 width:100% 之后 auto 外边距没有可吸收的自由空间，main = 容器宽，一切归一。*/
+main { max-width: 1200px; width: 100%; margin: 12px auto; padding: 0 14px; min-width: 0; }
+body { min-width: 0; }
+.view { animation: fade .2s ease; min-width: 0; }
 @keyframes fade { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; } }
 .hidden { display: none !important; }
 
@@ -84,11 +91,18 @@ main { max-width: 1200px; margin: 12px auto; padding: 0 14px; }
 .card {
   background: var(--card); border: 1px solid var(--border);
   border-radius: var(--radius); padding: 14px; margin-bottom: 10px;
+  min-width: 0;      /* 卡片是 main 的 flex 子项：不加这条时 min-width:auto 会被内容顶住，
+                        整页被撑宽（2026-09-19 模型路由页实测 bodyScrollW=508 / 视口 384） */
 }
 .card-title {
   font-weight: 600; font-size: 15px; margin-bottom: 10px;
   display: flex; align-items: center; gap: 8px; line-height: 1.4;
+  /* 标题行必须能换行 + 能缩：窄边条里"标题 + 长说明"排在 same 一行会把整页顶宽
+     （长说明换行到第二行、标题文字允许被压缩/省略） */
+  flex-wrap: wrap; min-width: 0;
 }
+.card-title > * { min-width: 0; }
+.card-title .muted { overflow-wrap: anywhere; }
 .card-title .ic { font-size: 15px; }
 /* "超级助理"卡片的 S 盾徽章（用户 2026-09-12 想要超人图标；Unicode 没有官方超人 emoji）。
    蓝底 + 金边 + 白 S，纯 CSS，随字号缩放：外层方块转 45°，内层 S 反向转回来摆正。 */
@@ -372,9 +386,9 @@ main { max-width: 1200px; margin: 12px auto; padding: 0 14px; }
 /* 一张能力卡里：一个下拉（选项自带"出网/本地 · 就绪"）+ 出网三角图标 + 在线服务字段 + 组件表。
    刻意不给下拉再挂"当前实现"之类的附属行 —— 同一份状态只显示一次（用户实测反馈）；
    出网说明收成下拉右边的黄色三角，悬停看 title。 */
-.cap-prov { margin: 2px 0 8px; }
-.cap-pick { display: flex; align-items: center; gap: 8px; }
-.cap-prov .ctl { width: 100%; max-width: 420px; }
+.cap-prov { margin: 2px 0 8px; min-width: 0; }
+.cap-pick { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.cap-prov .ctl { width: 100%; max-width: 100%; min-width: 0; }
 .cap-egress { display: inline-flex; align-items: center; flex-shrink: 0; cursor: help; }
 .cap-egress svg { display: block; filter: drop-shadow(0 0 2px rgba(245, 179, 1, .5)); }
 .cap-online { border-left: 3px solid var(--border); padding-left: 10px; margin: 6px 0 4px 6px; }
@@ -440,6 +454,14 @@ main { max-width: 1200px; margin: 12px auto; padding: 0 14px; }
 .agent-detail-msg.warn { color: var(--yellow); }
 select.ctl, input.ctl { background: var(--card2); color: var(--text); border: 1px solid var(--border);
   border-radius: 8px; padding: 6px 10px; font-size: 13px; outline: none; }
+/* 下拉/输入框永远不该把容器顶宽：`<select>` 的 min-content 是"最宽的那个选项文字"，
+   默认 min-width:auto 会让它拒绝收缩（窄边条里就是整页横向溢出的元凶，
+   2026-09-19 模型路由页实测）。允许收缩 + 省略号收尾。 */
+select.ctl, input.ctl { min-width: 0; max-width: 100%; }
+select.ctl { text-overflow: ellipsis; }
+/* 兜底：flex/grid 容器一律允许收缩（各自的子项自己再设 width） */
+.settings-form, .set-row, .set-group-body, .set-sub-body, .mcard, .mcard-body,
+.rt-list, .rt-row, .rt-add, .agent-field, .cap-online, #rtSetHost, #rtLlmHost { min-width: 0; }
 
 /* ---------- 会议 ---------- */
 .meeting-list { display: flex; flex-direction: column; gap: 8px; max-height: 300px; overflow-y: auto; }
