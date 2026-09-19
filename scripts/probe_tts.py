@@ -1,20 +1,24 @@
 # -*- coding: utf-8 -*-
-"""probe_tts.py — ECHO 音频自检（**逐节按回车**，专治"几个音挤在一起分不清"）
+"""probe_tts.py — ECHO 音频自检（**每一声单独播、单独确认**，最后自动汇总）
 
-为什么要重写一份（2026-09-19）
-------------------------------
-1.0 那份探针把 4b/4c/5/6 连着播，间隔太短 —— 用户实测反馈"听到两个提示音，但分不清
-是哪两节"。所以这里每一节都**等你按回车**再继续，且每节只做一件事。
+为什么要这么写（2026-09-19 实测反馈，两轮）
+------------------------------------------
+1.0 那份探针把 4b/4c/5/6 连着播 —— 用户："听到两个提示音，但分不清是哪两节"。
+本探针第一版改成"每节按回车"，用户又反馈："热身两声后加个回车确认，后面每声后面都
+单独加确认，不然不知道播的是哪个"。
+所以现在：**先热身 2 声（不带提问）→ 回车 → 每一首都单独播、播完立刻问 y/n**，
+最后打印一张结果表 —— 你只要把表贴回来即可，不用记。
 
 另有两处补齐：
-  * 1.0 那份第 6 节朗读的是**英文**（`ECHO audio check, engine …`），而 ECHO 的语音简报
-    是**中文**；中文才是真正会出问题的那条路（SAPI 的 InputEncoding 历史上踩过
-    "英文正常、中文乱码"）。本探针中文/英文都测。
-  * 打印已安装的 SAPI 语音列表：如果系统里没有中文语音，"离线朗读"会拿英文音色念中文，
-    这本身就是答案（不用再猜）。
+  * 1.0 那份第 6 节朗读的是**英文**，而 ECHO 的语音简报是**中文**；中文才是历史上
+    真出过问题的路（SAPI InputEncoding：英文正常、中文乱码）。本探针两者都测。
+  * 打印已安装 SAPI 音色：没有 zh-* 音色时"离线朗读"会拿英文音色念中文，这本身就是答案。
 
-怎么跑：双击同目录的 `probe-tts.bat`（窗口会留住输出）。
-输出刻意保持**纯 ASCII**：中文只出现在"被朗读的文本"里，避免 GBK 控制台把提示语搞乱。
+⚠️ 命令写法有讲究：这台机器上的管理员策略会拦掉**引号内含 `|` 字面量**的 powershell
+命令行（WinError 786 "restricted by policy rule"）。所以下面一律用"多语句分别输出、
+由 Python 排版"的写法（ECHO 生产代码本身不含这种写法，实测通过）。
+
+怎么跑：双击同目录的 `probe-tts.bat`。输出刻意保持**纯 ASCII**。
 """
 import os
 import subprocess
@@ -29,6 +33,9 @@ ZH_TEXT = "回声音频自检，中文朗读第二句，一二三四五。"
 EN_TEXT = "ECHO audio check, English line."
 BEEPS = ("start", "done", "ok", "ok2", "err")
 
+#: 结果汇总：(标签, 是否听到)。最后统一打印，方便整段贴回。
+RESULTS = []
+
 
 def hr(title):
     print("")
@@ -42,6 +49,18 @@ def pause(msg="press ENTER for the next section..."):
         input("  --> %s " % msg)
     except EOFError:
         time.sleep(1.0)
+
+
+def ask_heard(label):
+    """问"这一声听到了吗"，返回 True/False（默认没听到，回车即否）。"""
+    try:
+        ans = input("      did you HEAR [%s]?  y = yes / ENTER = no : " % label)
+    except EOFError:
+        ans = ""
+    heard = str(ans).strip().lower() in ("y", "yes", "1")
+    RESULTS.append((label, heard))
+    print("      recorded: %s = %s" % (label, "HEARD" if heard else "NOT heard"))
+    return heard
 
 
 def show_settings():
@@ -63,11 +82,8 @@ def show_settings():
 
 
 def show_voices():
-    hr("1. installed SAPI voices (no Chinese voice = offline TTS reads Chinese wrong)")
-    # ⚠️ 命令写法有讲究（2026-09-19 实测）：这台机器上的管理员策略会拦掉**引号内含 `|`
-    # 字面量**的 powershell 命令行（WinError 786 "restricted by policy rule"），
-    # 拼接 `' | '` 的版本直接被拦，连 CreateProcess 都过不去。
-    # 所以这里改成"多语句分别输出"，由 Python 自己排版 —— 既躲开策略，也更清楚。
+    hr("1. installed SAPI voices (no zh-* voice = offline TTS reads Chinese wrong)")
+    # 见文件头：引号内含 "|" 的命令行会被管理员策略拦，所以这里分语句输出。
     ps = ("Add-Type -AssemblyName System.Speech; "
           "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
           "$s.GetInstalledVoices() | ForEach-Object { $_.VoiceInfo.Name; "
@@ -79,11 +95,9 @@ def show_voices():
         lines = [x.strip() for x in (r.stdout or "").splitlines() if x.strip()]
         if not lines:
             print("  (none reported) rc=%s err=%r" % (r.returncode, (r.stderr or "")[:200]))
+            return
         for i in range(0, len(lines), 3):
-            chunk = lines[i:i + 3]
-            name = chunk[0] if len(chunk) > 0 else "?"
-            culture = chunk[1] if len(chunk) > 1 else "?"
-            enabled = chunk[2] if len(chunk) > 2 else "?"
+            name, culture, enabled = (lines[i:i + 3] + ["?", "?"])[:3]
             zh = "  <== CHINESE" if str(culture).lower().startswith("zh") else ""
             print("  voice = %-34s culture = %-6s enabled = %-5s%s"
                   % (name, culture, enabled, zh))
@@ -96,10 +110,10 @@ def show_voices():
 def show_beep_files():
     """提示音文件本身：字节数 / 时长 / 峰值 / RMS(dBFS) / 哈希。
 
-    为什么要有这一节（2026-09-19 实测）：五个提示音里用户只听到后三声，
-    `start`/`done` 听不到 —— 而 winsound 播放失败是**全静默**的。这里先量文件：
-    峰值≈0 或 RMS 极低 = 文件本身就是哑的（重新生成即可），
-    文件正常却听不到 = 播放通路/设备问题。两种修法完全不同，别再靠猜。
+    为什么要有这一节：五个提示音里用户只听到后三声 —— 而 winsound 的失败是**全静默**的。
+    先量文件：峰值≈0 或 RMS 极低 = 文件哑了（重新生成即可）；文件正常却听不到 =
+    播放时机/设备问题。两种修法完全不同，别靠猜。
+    （实测结论：五个文件都正常，且 start.wav 与 ok.wav 是同一段波形。）
     """
     hr("2a. beep files themselves (silent file vs silent playback)")
     import wave
@@ -138,38 +152,50 @@ def show_beep_files():
             traceback.print_exc()
 
 
+def _beep_sequence(play, ask, warmup=2, gap=2.0):
+    """逐声播 + 逐声确认（逻辑独立出来，便于不开声地自测）。
+
+    play(name) 播放；ask(label) 返回 bool。返回 [(name, heard), ...]。
+    """
+    if warmup:
+        print("  [warm-up] playing 'ok' x%d WITHOUT questions (wakes the output device)" % warmup)
+        for _ in range(warmup):
+            play("ok")
+            time.sleep(1.5)
+        time.sleep(1.0)
+        # 纯回车确认（不计入结果）：用户要求"热身两声后加个回车确认"
+        pause("warm-up done. Press ENTER to start the real sequence (5 beeps, one by one)")
+    out = []
+    for i, name in enumerate(BEEPS, 1):
+        print("")
+        print("  >>> now playing #%d of %d: %s" % (i, len(BEEPS), name))
+        play(name)
+        time.sleep(gap)
+        out.append((name, ask(name)))
+    return out
+
+
 def beeps():
-    hr("2b. beeps with a WARM-UP first (cold output device eats the first short sound)")
-    print("  theory tested here: the output device (BT/USB) needs ~0.3s to wake; the")
-    print("  FIRST short sound after silence gets swallowed while later ones play fine.")
-    print("  so: play 'ok' twice as warm-up, THEN all five, with a 2s gap each.")
+    hr("2b. the five beeps: ONE AT A TIME, each with its own y/n confirmation")
+    print("  order: %s" % " -> ".join(BEEPS))
+    print("  rule : answer y only if you heard THAT one (ENTER = not heard)")
     try:
         from app.audio import tts
     except Exception:
         traceback.print_exc()
         return
     print("  BEEPS_DIR = %s (exists=%s)" % (tts.BEEPS_DIR, os.path.isdir(tts.BEEPS_DIR)))
-    print("  [warm-up] play_beep('ok') x2 ...")
-    for _ in range(2):
-        try:
-            tts.play_beep("ok")
-        except Exception:
-            traceback.print_exc()
-        time.sleep(1.5)
-    time.sleep(1.0)
-    print("  now the real sequence:")
-    for name in BEEPS:
-        print("  play_beep(%r) ... LISTEN" % name)
-        try:
-            tts.play_beep(name)
-        except Exception:
-            traceback.print_exc()
-        time.sleep(2.0)          # 每声之间留 2 秒，够你分辨
+    res = _beep_sequence(lambda n: tts.play_beep(n), ask_heard)
+    heard = [n for n, ok in res if ok]
+    missed = [n for n, ok in res if not ok]
     print("")
-    print("  reading: if start/done ARE heard now but were NOT in the previous run,")
-    print("           the cause is device wake-up latency, not the wav files.")
-    print("           fix = prepend ~0.3s of silence to the short beeps (or warm up in code).")
-    pause("did you hear FIVE beeps this time (start/done/ok/ok2/err)?")
+    print("  beep result: heard=%s missed=%s" % (heard or "none", missed or "none"))
+    if missed and len(missed) < len(BEEPS):
+        print("  -> PARTIAL: some play, some do not (timing/device, not files)")
+    elif missed:
+        print("  -> NONE heard: playback path or device is dead")
+    else:
+        print("  -> ALL heard: beep path is fine")
 
 
 def speak_section(title, text, engine, note=""):
@@ -188,7 +214,7 @@ def speak_section(title, text, engine, note=""):
         print("  speak() -> %r   (%.1fs)" % (ok, time.time() - t0))
     except Exception:
         traceback.print_exc()
-    pause("what did you hear? (clear Chinese / garbled / nothing / English accent)")
+    ask_heard("%s (%s)" % (title.split(".", 1)[-1].strip(), engine))
 
 
 def main():
@@ -196,8 +222,8 @@ def main():
     print("root   : %s" % ROOT)
     print("python : %s" % sys.executable)
     print("")
-    print("This probe waits for ENTER between sections on purpose:")
-    print("the previous version fired everything back-to-back and was impossible to judge.")
+    print("This probe plays ONE sound at a time and asks y/n after EACH one,")
+    print("then prints a summary table at the end - paste that table back.")
 
     show_settings()
     pause()
@@ -216,8 +242,7 @@ def main():
 
     speak_section("4. CHINESE via edge-tts (online; the preferred engine)",
                   ZH_TEXT, "edge-tts",
-                  "expect: natural Mandarin. Silence here = network/edge-tts problem "
-                  "(check probe_online below).")
+                  "expect: natural Mandarin. Silence = network/edge-tts problem.")
 
     hr("5. online probe + CHINESE via auto (what ECHO actually uses)")
     try:
@@ -230,17 +255,20 @@ def main():
         print("  speak(engine=auto) -> %r   (%.1fs)" % (ok, time.time() - t0))
     except Exception:
         traceback.print_exc()
-    pause("did the auto path read the Chinese sentence?")
+    ask_heard("CHINESE via auto")
 
-    hr("6. control: ENGLISH via sapi (should sound like a normal English voice)")
-    speak_section("6b. ENGLISH via sapi", EN_TEXT, "sapi")
+    speak_section("6. control: ENGLISH via sapi", EN_TEXT, "sapi")
+
+    hr("SUMMARY (paste this back)")
+    for label, heard in RESULTS:
+        print("  %-46s %s" % (label, "HEARD" if heard else "NOT heard"))
 
     hr("how to read the result")
-    print("  * five separate beeps heard  -> beep path is fine (earlier 'no beeps' = environment)")
-    print("  * section 3 garbled          -> SAPI encoding/voice problem")
-    print("  * section 4 silent           -> edge-tts/network (see probe_online in section 5)")
-    print("  * section 5 silent but 3 ok  -> auto path's engine choice/probe is the problem")
-    print("  * paste this whole window back; every failure branch prints a traceback")
+    print("  * beeps: ALL heard            -> beep path fine (earlier 'no beeps' = environment)")
+    print("  * beeps: first ones missed    -> output device wake-up; fix = warm up / lead-in silence")
+    print("  * section 3 garbled/wrong tone-> SAPI voice/encoding (zh voice list is in section 1)")
+    print("  * section 4 silent            -> edge-tts/network (see probe_online in section 5)")
+    print("  * section 5 silent but 3 ok   -> the auto path's engine choice is the problem")
     print("")
     print("DONE-PROBE-TTS")
 
