@@ -1476,3 +1476,11 @@ import 时就把缓存路径算死）。落点：`app/main.py` 的 lifespan 里 
 - **注意**：清点清零 ≠ D12 收口完毕。`app/platform/` 里仍留着一批**未在 mac 上实测**的
   实现（`say`/`afplay`/`open`/pynput 授权）；D11 的"配置默认值声明式化"（如 `ttsEngine`
   候选按平台给）也还没做。
+- **设置菜单重设计已落地（2026-09-19）**：用户提出"分组/失效/重复要重新设计，并验证设置
+  是否被代码正常读取"→ 先做清点工具再改：`scripts/audit-settings.py`（谁定义/谁写/**谁读**，
+  `--check` 拦死项与未确认项）+ `tests/test_settings_wiring.py`（86 项往返读写、分组合法性、
+  候选项有实现、弃用与值迁移）。修掉 1 个 DEAD（`panelAutoRefresh`）与 1 个 PANEL-ONLY
+  （`wakeEngine`，并删掉从未实现的幽灵选项 `openwakeword`）；收敛 4 组重复开关
+  （`providerTts`→`ttsEngine`、`worklogMode=off`→`worklogEnabled`、智能体"选中即启用"、
+  转写/会议引擎命名对齐）；分组重排为 10 组 + 智能体表格，组内顺序由新增的 `order` 字段下发。
+  方案与清理记录见 `docs/settings-重设计方案.md` 与 PROGRESS §45。
