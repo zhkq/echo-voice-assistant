@@ -39,7 +39,12 @@ class ManifestTests(unittest.TestCase):
             self.assertIn(i.get("kind"), components.KINDS, i)
             self.assertTrue(i.get("name"), i)
             self.assertIsInstance(i.get("platforms"), list)
-            self.assertIsInstance(i.get("detect"), dict)
+            # 就绪判据：模型类组件走 model_id（问 modelinfo，单一判据），
+            # 运行时类组件走自己声明的 detect 规则（2026-09-19）
+            self.assertTrue(isinstance(i.get("detect"), dict) or i.get("model_id"),
+                            "既没有 detect 规则也没有 model_id：%s" % i.get("id"))
+            if i.get("model_id"):
+                self.assertIsInstance(i["model_id"], str)
 
     def test_required_set(self):
         items = {i["id"]: i for i in components.load_manifests()}

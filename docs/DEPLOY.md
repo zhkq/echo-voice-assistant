@@ -106,8 +106,8 @@ dotnet build sidebar\echo-sidebar.csproj -c Release
 | 症状 | 原因 / 处理 |
 |---|---|
 | `Fatal Python error: init_fs_encoding` | venv 是从别的机器拷来的，`pyvenv.cfg` 的 `home` 指向不存在的 Python。跑 `scripts\new-machine-setup.ps1` |
-| 启动时提示"模型缺失" | 见第 3 节；面板 → 设置 → 模型 里看每个模型的落地路径 |
-| 转写很慢 | 装了 CUDA 版 torch 吗？面板 → 启动 → `命令转写引擎` 的详情会显示 `cuda:0` 还是 CPU |
+| 启动时提示"模型缺失" | 见第 3 节；面板 →「能力」页签 → 对应能力的组件表里有落地路径与下载入口 |
+| 转写很慢 | 装了 CUDA 版 torch 吗？面板 →「能力」页签 → 计算设备卡会显示当前用 `cuda:0` 还是 CPU |
 | 热键没反应 | 面板 → 启动 → `热键/媒体键` 状态；热键由 ECHO 服务注册，改完设置需重启 ECHO |
 | `.ps1` 脚本报"字符串缺少终止符" | 脚本被存成了**无 BOM 的 UTF-8 且含非 ASCII**，PowerShell 5.1 按 ANSI 读就会坏。本仓库脚本一律纯 ASCII 或带 BOM，见 [powershell-编码与脚本经验.md](powershell-编码与脚本经验.md) |
 | 面板显示"连接失败" | ECHO 没起来 / 端口被占。看 `data\logs\echo-server.log.err`，或 `scripts\restart-echo.ps1` |

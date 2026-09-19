@@ -87,6 +87,45 @@ class CatalogAlignmentTests(unittest.TestCase):
         req = [i["id"] for i in components.load_manifests() if i.get("required")]
         self.assertEqual(req, ["runtime-core"])
 
+    def test_model_components_declare_model_id(self):
+        """模型类组件必须写明 `model_id`（2026-09-19 合并「模型/组件」页签时加的）。
+
+        有了它，面板才能在同一个页签里既显示"装没装"、又给出「下载」按钮
+        （`/api/models/download` 只认 modelinfo 的 id），不必维护第二份 id 映射。
+        """
+        bad = []
+        for cid, item in self.comp.items():
+            if item.get("kind") not in MODEL_KINDS:
+                continue
+            mid = item.get("model_id")
+            want = None
+            for m, c in [(m, component_id_for(m)) for m in self.mi]:
+                if c == cid:
+                    want = m
+            if mid != want:
+                bad.append("%s: model_id=%r 应为 %r" % (cid, mid, want))
+        self.assertEqual(bad, [], "模型类组件的 model_id 与 modelinfo 对不上：%s" % bad)
+
+    def test_model_readiness_has_a_single_source(self):
+        """就绪判定只能有一个来源：有 model_id 的组件必须与 `modelinfo.ready()` 一致。
+
+        否则两份判据会分叉（组件写死路径、modelinfo 各写一个 ready 函数），
+        用户会看到"组件说已装、模型说没装"这种自相矛盾。
+        """
+        from app import paths
+        cat = {i["id"]: i for i in components.catalog(include_blocked=True)["items"]}
+        checked = 0
+        for cid, item in self.comp.items():
+            mid = item.get("model_id")
+            if not mid:
+                continue
+            checked += 1
+            with self.subTest(component=cid):
+                self.assertEqual(cat[cid]["ready"], modelinfo.ready(mid),
+                                 "%s 的组件就绪判定与 %s 的模型就绪判定不一致" % (cid, mid))
+        self.assertGreater(checked, 0, "没有任何组件声明 model_id（映射丢了？）")
+        self.assertTrue(paths.models_root())
+
 
 if __name__ == "__main__":
     unittest.main()

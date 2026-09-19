@@ -275,15 +275,35 @@ def _measure_paths(entry):
     return [path] if path else []
 
 
+def _probe_for(entry):
+    """该模型条目的就绪探测函数（whisper 各档走同一个带参数的探测）。"""
+    probe = _PROBES.get(entry["id"])
+    if probe is not None:
+        return probe
+    name = entry["id"].split("-", 1)[1] if entry["id"].startswith("whisper-") else ""
+    return lambda: _ready_whisper(name)
+
+
+def ready(model_id):
+    """某个模型是否就绪：True/False/None（查不到这个 id 返回 None）。
+
+    给 `app/components.py` 这类外部清单用 —— **"装没装"只有一个判据**（2026-09-19
+    合并「模型/组件」两个页签时发现两套探测规则会分叉：组件说已装、模型说没装）。
+    """
+    for e in CATALOG:
+        if e["id"] == model_id:
+            try:
+                return bool(_probe_for(e)())
+            except Exception:
+                return False
+    return None
+
+
 def inventory():
     """返回清单 + 就绪状态 + 本地实际占用（MB）。任何异常都不抛，按未就绪处理。"""
     items = []
     for e in CATALOG:
-        probe = _PROBES.get(e["id"])
-        if probe is None:
-            name = e["id"].split("-", 1)[1] if e["id"].startswith("whisper-") else ""
-            def probe(n=name):
-                return _ready_whisper(n)
+        probe = _probe_for(e)
         try:
             ready = bool(probe())
         except Exception:

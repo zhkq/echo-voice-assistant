@@ -190,11 +190,23 @@ class GroupingTests(unittest.TestCase):
                                 "%s 会被智能体表格吞掉（该组只放 hidden 的智能体键）" % key)
 
     def test_model_tab_keys_share_the_model_group(self):
-        """「模型」页签承载的那 9 项要归在 model 组：页签挂了才能整块回退显示。"""
+        """「能力」页签承载的那些项要能被整块回退显示。
+
+        * 模型/引擎选择（sttModel 等 9 项）归 `model` 组 —— 页签挂了就在设置页整块出现；
+        * `ttsEngine` 是例外：它是"朗读"的行为开关，分组仍属「语音命令 → 朗读与反馈」
+          （回退时显示在原地、不搬家），只是编辑入口由能力页签接管。
+        """
+        cap_owned_elsewhere = {"ttsEngine"}
+        self.assertTrue(cap_owned_elsewhere <= self.model_keys,
+                        "ttsEngine 应由能力页签承载（加入 MODEL_KEYS）")
         for key in self.model_keys:
             self.assertIn(key, DEFAULTS, "%s 不在 DEFAULTS 里" % key)
+            if key in cap_owned_elsewhere:
+                self.assertEqual(DEFAULTS[key]["grp"], "voice",
+                                 "%s 回退时应出现在「语音命令 → 朗读与反馈」里" % key)
+                continue
             self.assertEqual(DEFAULTS[key]["grp"], "model",
-                             "%s 在「模型」页签上，grp 应是 model（回退显示用）" % key)
+                             "%s 在「能力」页签上，grp 应是 model（回退显示用）" % key)
 
     def test_order_field_is_total_and_unique(self):
         self.assertEqual(len(SETTING_ORDER), len(DEFAULTS))
@@ -449,12 +461,23 @@ class OptionAndPanelWiringTests(unittest.TestCase):
         self.assertIn("_panelRefreshSeconds", js)
         self.assertIn("if (!_panelRefreshDue()) return;", js)
 
-    def test_tts_provider_card_has_no_second_selector(self):
-        """TTS 不许在卡片上再放一个下拉（providerTts 已因此弃用）。"""
+    def test_tts_has_exactly_one_selector(self):
+        """TTS 只有一个开关：能力页签里那个 `ttsEngine` 下拉（providerTts 已弃用）。"""
         js = _read(os.path.join("web", "app.js"))
         self.assertIn("data-provider-kind", js)
-        self.assertIn('if (k.id === "tts")', js,
-                      "卡片里 TTS 那一格要单独处理（只显示状态，不放第二个下拉）")
+        self.assertIn("data-tts-engine", js, "TTS 的选择走 ttsEngine 这一个开关")
+        self.assertNotIn('data-provider-kind="tts"', js, "不许再给 TTS 放第二个 provider 下拉")
+        self.assertNotIn("providerTts", js, "弃用项不该被面板引用")
+
+    def test_capability_page_covers_every_capability_kind(self):
+        """能力页签要按"能力种类"渲染，并且每类都能看到实现与组件两件事。"""
+        js = _read(os.path.join("web", "app.js"))
+        for token in ("const CAP_KINDS", "capKindCard", "capProviderBlock", "capCompTable",
+                      "renderCapEnv", "function loadCapabilities"):
+            with self.subTest(token=token):
+                self.assertIn(token, js)
+        self.assertIn('CAP_KINDS = ["asr", "llm", "tts"]', js)
+        self.assertIn("capCompsOf", js, "组件按 kind 归到对应能力卡里")
 
     def test_agent_switch_also_enables_the_product(self):
         """智能体开关即单选：选中时要把该产品的启用开关一起打开，避免自相矛盾。"""

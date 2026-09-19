@@ -58,7 +58,7 @@
 | `ttsEngine` ↔ `providerTts` | 同一个"朗读用哪个"的两个入口；而且**互相打架**：配了 `providerTts` 时 `ttsEngine=off` 关不掉朗读 | 只留 `ttsEngine`（它带 `off`、`auto` 回退、分平台候选项）。`providerTts` 弃用，老值自动搬到 `ttsEngine`（`edge-tts` → `edge-tts`；`local-tts` → **本平台离线引擎**，不搬 `auto`：`auto` 会优先出网，等于把"我不想出网"反过来了）。卡片里那一格改为**只读状态**（当前实现 + 就绪 + 是否出网 + 指路） |
 | `worklogEnabled` ↔ `worklogMode=off` | 同一个"不归档"的两个开关 | 只留 `worklogEnabled`；`worklogMode` 弃用，老值 `off` 自动把总开关置关（行为不变） |
 | `agentCodebuddyEnabled` ↔ `agentBackend` | 面板是"互斥单选"，但产品自带的启用开关没人写 → 会出现"开关已选中、状态却是未启用" | 面板选中某产品时**一并**写它的 `configKey`（选中即启用），自相矛盾的状态消失 |
-| `sttModel` ↔ `meetingSttModel` | 同一族引擎、命名不齐（"命令转写引擎" vs "会议转写模型"） | 统一成「命令转写引擎」/「会议转写引擎」，都归 `model` 组（顶部「模型」页签承载） |
+| `sttModel` ↔ `meetingSttModel` | 同一族引擎、命名不齐（"命令转写引擎" vs "会议转写模型"） | 统一成「命令转写引擎」/「会议转写引擎」，都归 `model` 组（顶部「能力」页签承载，见 [能力页签重设计](能力页签重设计.md)） |
 | `meetingsDir` ↔ `meetingWorkspace` | 一个管**文件**放哪、一个管 **DSH 会话**登记到哪个工作区，标签相似极易混淆 | 改名为「会议文件目录」/「会议会话工作区」，并在描述里互相点名 |
 
 > 顺带修掉的"双刃"项：`apiAuthEnabled` 打开后**连本地面板也会 401**（面板不带令牌，
@@ -91,7 +91,7 @@
 | `panel` | 面板与服务 | 8 | DSH 地址、ECHO 端口、仪表盘热键/打开方式/自动显示/收起、自动刷新秒、API 鉴权 |
 | `paths` | 存储路径 | 2 | 会议文件目录、模型目录 |
 | `router` | 模型路由 | 7 | 自动注册、显示名、探测间隔、首字节/连接超时、熔断阈值/冷却 |
-| `model` | 模型与引擎 | 9 | 只在「模型」页签加载失败时出现（回退显示，见 §5.3） |
+| `model` | 模型与引擎 | 9 | 只在「能力」页签加载失败时出现（回退显示，见 §5.3） |
 
 ### 4.3 二级小节（`sub`）：包含关系，不是并列关系
 
@@ -139,7 +139,7 @@
 ```powershell
 # 0) 不开浏览器看菜单长什么样（同一份元数据 + 同一套排序/过滤规则）
 .\venv\Scripts\python.exe scripts\preview-settings-menu.py            # 正常
-.\venv\Scripts\python.exe scripts\preview-settings-menu.py --models-fail   # 模拟模型页签挂掉
+.\venv\Scripts\python.exe scripts\preview-settings-menu.py --models-fail   # 模拟能力页签挂掉（那 9 项回退到设置页）
 .\venv\Scripts\python.exe scripts\preview-settings-menu.py --out docs\settings-menu.txt
 
 # 1) 清点 + 门禁：任何"没人读 / 只写没人读 / 未确认"的项都会让这一步失败
@@ -153,7 +153,7 @@ powershell -ExecutionPolicy Bypass -File scripts\check-windows.ps1
 ```
 
 当前渲染结果的快照：[`docs/settings-menu.txt`](settings-menu.txt)（61 个可见项 + 智能体表格 +
-能力 provider 卡片；模型页签可用时那 9 项不在表单里）。
+能力页签；页签可用时那 9 项不在表单里）。
 
 `tests/test_settings_wiring.py` 覆盖的保证：
 
@@ -162,7 +162,8 @@ powershell -ExecutionPolicy Bypass -File scripts\check-windows.ps1
 2. **每项都能读回**：对全部 86 项（含隐藏项与密钥）走一遍 `PUT /api/settings` → 读回；
    密钥必须遮罩 + `hasValue`，空串不得清空，`__clear__` 才清空。
 3. **分组不出错**：可见项的 `grp` 必须在面板分组表里有标题与位置；可见项不许落在 `agent` 组；
-   「模型」页签的 9 项必须在 `model` 组（页签挂了才能整块回退）。
+   「能力」页签承载的 9 项必须在 `model` 组（页签挂了才能整块回退；`ttsEngine` 例外，
+   它仍属「语音命令 → 朗读与反馈」，只是编辑入口在能力页签）。
    二级小节另有一组检查：名字不许与任何一级分组同名（包含关系）、一个小节只能属于一个分组、
    声明了的小节必须有项用它、所有分组与小节标题必须含中文（"别用英文"）。
 4. **候选项不是幻觉**：`wakeEngine` 的每个选项都必须有实现（`wake.ENGINE_LABELS`），

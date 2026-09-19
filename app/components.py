@@ -46,6 +46,10 @@ def _builtin() -> List[dict]:
       min_os                各平台最低版本，如 {"macos": "14.0"}
       optional/required     required 的首装必装（D23）
       detect                就绪探测规则：{"path"|"any"|"python"|"exe"}
+                            有 ``model_id`` 时**不用它** —— 直接问 `modelinfo`（见 `_detect`）
+      model_id              对应的模型清单 id（`app/modelinfo.py`）：有它就能在面板里
+                            直接下载/复制命令（`/api/models/download` 认这个 id），
+                            也保证"装没装"只有一个判据（2026-09-19 合并「模型/组件」时加的）
       source/how            获取方式（在线优先、离线兜底，D2）
       deps                  依赖的组件 id
     """
@@ -68,54 +72,52 @@ def _builtin() -> List[dict]:
         dict(id="stt-sensevoice", kind="stt", name="SenseVoice 中文短命令", optional=True, required=False,
              purpose="语音命令与会议转写的默认引擎（自带标点）",
              size_mb=896, platforms=["win32", "macos", "linux"], min_os={},
-             detect={"path": "sensevoice"}, source="modelscope", ref="iic/SenseVoiceSmall",
+             model_id="sensevoice", source="modelscope", ref="iic/SenseVoiceSmall",
              how="面板下载或自行拷贝到 models/sensevoice；需 funasr + torch"),
         dict(id="stt-sherpa", kind="stt", name="sherpa-onnx 流式转写", optional=True, required=False,
              purpose="免 torch 的轻量流式转写（推荐组合之一，D1）",
              size_mb=189, platforms=["win32", "macos", "linux"], min_os={},
-             detect={"path": "sherpa-onnx-streaming"}, source="modelscope",
+             model_id="sherpa", source="modelscope",
              how="面板下载或自行拷贝到 models/sherpa-onnx-streaming"),
         dict(id="stt-whisper-tiny", kind="stt", name="Whisper tiny", optional=True, required=False,
              purpose="最小最快的档位（精度最低，适合纯英文短句）",
              size_mb=75, platforms=["win32", "macos", "linux"], min_os={},
-             detect={"any": ["faster-whisper/tiny/model.bin", "hub/models--Systran--faster-whisper-tiny"]},
+             model_id="whisper-tiny",
              source="hf-mirror", how="面板下载或从源机拷贝 models/faster-whisper/tiny"),
         dict(id="stt-whisper-base", kind="stt", name="Whisper base", optional=True, required=False,
              purpose="免 torch 的推荐组合之一（D1：sherpa-onnx + whisper-base）",
              size_mb=141, platforms=["win32", "macos", "linux"], min_os={},
-             detect={"any": ["faster-whisper/base/model.bin", "hub/models--Systran--faster-whisper-base"]},
+             model_id="whisper-base",
              source="hf-mirror", how="面板下载或从源机拷贝 models/faster-whisper/base"),
         dict(id="stt-whisper-small", kind="stt", name="Whisper small", optional=True, required=False,
              purpose="多语种转写（推荐组合之一，D1）",
              size_mb=464, platforms=["win32", "macos", "linux"], min_os={},
-             detect={"any": ["faster-whisper/small/model.bin", "hub/models--Systran--faster-whisper-small"]},
+             model_id="whisper-small",
              source="hf-mirror", how="面板下载或从源机拷贝 models/faster-whisper/small"),
         dict(id="stt-whisper-medium", kind="stt", name="Whisper medium", optional=True, required=False,
              purpose="介于 small 与 large-v3 之间的档位（内存换精度）",
              size_mb=1500, platforms=["win32", "macos", "linux"], min_os={},
-             detect={"any": ["faster-whisper/medium/model.bin", "hub/models--Systran--faster-whisper-medium"]},
+             model_id="whisper-medium",
              source="hf-mirror", how="面板下载或从源机拷贝 models/faster-whisper/medium"),
         dict(id="stt-whisper-large-v3", kind="stt", name="Whisper large-v3", optional=True, required=False,
              purpose="精度优先的转写档位（显存/内存占用大）",
              size_mb=2950, platforms=["win32", "macos", "linux"], min_os={},
-             detect={"any": ["faster-whisper/large-v3/model.bin",
-                             "hub/models--Systran--faster-whisper-large-v3"]},
+             model_id="whisper-large-v3",
              source="hf-mirror", how="面板下载（约 3 GB）；建议配合 accel-cuda"),
         dict(id="stt-qwen3asr", kind="stt", name="Qwen3-ASR 0.6B + 强制对齐", optional=True, required=False,
              purpose="方言/口音更强的转写，并给出逐句时间对齐",
              size_mb=3600, platforms=["win32", "macos", "linux"], min_os={},
-             detect={"python": "qwen_asr"}, source="modelscope", ref="Qwen/Qwen3-ASR-0.6B",
+             model_id="qwen3asr", source="modelscope", ref="Qwen/Qwen3-ASR-0.6B",
              how="scripts/install-qwen3asr.ps1（首次自动从 ModelScope 下载）"),
         dict(id="wake-kws", kind="wake", name="唤醒词 KWS", optional=True, required=False,
              purpose="离线关键词唤醒（默认不装：需常开麦克风，有隐私成本）",
              size_mb=40, platforms=["win32", "macos", "linux"], min_os={},
-             detect={"path": "wakeword/kws-zh-en-3m"}, source="modelscope",
+             model_id="kws", source="modelscope",
              how="自行获取 sherpa-onnx KWS 权重，按面板给的四个文件名放好"),
         dict(id="diarize-pyannote", kind="diarize", name="说话人分离（pyannote）", optional=True, required=False,
              purpose="会议里区分不同说话人（HF 上是 gated 模型）",
              size_mb=32, platforms=["win32", "macos", "linux"], min_os={},
-             detect={"any": ["pyannote/pyannote-segmentation-3.0-local",
-                             "pyannote/pyannote-wespeaker-local"]},
+             model_id="pyannote",
              source="hf-gated", never_ship=True,          # 许可证不允许再分发（D22 的例外）
              how="面板给授权链接与下载命令；同意条款后由用户自己拉取"),
     ]
@@ -161,9 +163,21 @@ def _ver_tuple_has(have, need) -> bool:
 # ---------------------------------------------------------------- 就绪探测
 
 def _detect(item: dict) -> Optional[bool]:
-    """按清单里的 ``detect`` 判断本机是否已具备。返回 True/False/None（无法判定）。"""
+    """按清单里的 ``detect`` 判断本机是否已具备。返回 True/False/None（无法判定）。
+
+    **有 ``model_id`` 的组件直接问 `modelinfo`**（2026-09-19 合并「模型/组件」两个页签时定的）：
+    同一份权重原来有两套判据（组件清单写死路径、modelinfo 各写一个 ready 函数），
+    两边一旦分叉就会出现"组件说已装、模型说没装"。现在模型类组件只有一个判据来源。
+    """
     from app import paths
 
+    mid = item.get("model_id")
+    if mid:
+        try:
+            from app import modelinfo
+            return modelinfo.ready(mid)
+        except Exception:
+            return None
     d = item.get("detect") or {}
     checks: List[bool] = []
     if d.get("path") or d.get("any"):

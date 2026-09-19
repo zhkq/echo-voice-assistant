@@ -624,11 +624,15 @@ class PresetTests(unittest.TestCase):
 
 
 class PanelWiringTests(unittest.TestCase):
-    """面板接线守卫（P5）。
+    """面板接线守卫（P5 + 2026-09-19 合并成一个「能力」页签）。
 
     面板 JS 在本仓库没有单测基础设施（只跑 `node --check`），所以用"源码断言"把
-    **接线必须存在**这件事钉住 —— 否则将来重构设置页很容易把这张卡片变成孤儿：
+    **接线必须存在**这件事钉住 —— 否则将来重构页签很容易把这块界面变成孤儿：
     端点还在、函数还在，但没人调用，用户看不到任何 provider 选择界面。
+
+    2026-09-19 变化：原「模型」页签 + 原「组件」页签 + 设置页的「能力 provider」卡片
+    三处都在回答"每个功能由什么实现、装好了没"，用户指出设计重叠 → 合并成一个
+    一级页签「能力」（`#view-capabilities`）。provider 的选择/在线服务编辑搬进该页签。
     """
 
     @classmethod
@@ -639,29 +643,42 @@ class PanelWiringTests(unittest.TestCase):
         with open(os.path.join(root, "web", "index.html"), encoding="utf-8") as fh:
             cls.html = fh.read()
 
-    def test_card_renderer_exists_and_uses_all_three_endpoints(self):
-        self.assertIn("function renderProvidersCard", self.js)
+    def test_capability_page_uses_all_three_endpoints(self):
+        self.assertIn("function loadCapabilities", self.js)
         self.assertIn("/api/providers?ready=true", self.js)
         self.assertIn("/api/providers/presets", self.js)
         self.assertIn("/api/providers/config", self.js)
+        self.assertIn("/api/components?includeBlocked=true", self.js)
 
-    def test_card_is_mounted_in_the_settings_view_and_loaded(self):
-        self.assertIn('id="providersHost"', self.html)
-        # 挂载点必须在设置页里（在 view-settings 之后）
-        self.assertLess(self.html.index('id="view-settings"'), self.html.index('id="providersHost"'),
-                        "provider 卡片应在设置页内")
-        self.assertIn("function loadProviders()", self.js)
-        self.assertIn('if (name === "settings") { loadSettings(); loadProviders(); }', self.js,
-                      "切到设置页时必须加载 provider 卡片（否则卡片永远空白）")
+    def test_capability_page_is_a_first_level_tab_and_loaded(self):
+        self.assertIn('data-view="capabilities"', self.html)
+        self.assertIn('id="view-capabilities"', self.html)
+        self.assertIn('if (name === "capabilities") loadCapabilities();', self.js,
+                      "切到能力页签时必须加载（否则页面永远空白）")
+        # 两个旧页签已合并进来，不该再有各自的挂载点/分发
+        for gone in ('data-view="models"', 'data-view="components"',
+                     'id="providersHost"', 'id="componentsHost"'):
+            self.assertNotIn(gone, self.html, "%s 应已被「能力」页签合并" % gone)
+        self.assertNotIn("loadProviders()", self.js)
+        self.assertNotIn("loadModels()", self.js.split("function downloadMissingModels")[0])
 
-    def test_card_owns_the_editing_ui(self):
-        """用户实测指出「同一个功能两套界面」→ 配置项 hidden、编辑搬进卡片。"""
-        self.assertIn("btnProviderSave", self.js, "卡片要有自己的保存按钮")
+    def test_capability_page_hosts_exist_in_the_html(self):
+        """JS 里挂载点/按钮的 id 必须真在 index.html 里 —— 否则渲染静默失败（用户看到空白页签）。"""
+        for host in ("capKindCards", "capFuncCards", "capEnvHost", "capOverview",
+                     "capOvSummary", "btnCapReload", "btnCapDownloadMissing"):
+            with self.subTest(id=host):
+                self.assertIn('id="%s"' % host, self.html, "index.html 缺少 #%s" % host)
+                self.assertIn('$("#%s")' % host, self.js, "app.js 没有用 #%s" % host)
+
+    def test_capability_page_owns_the_editing_ui(self):
+        """用户实测指出「同一个功能两套界面」→ 配置项 hidden、编辑搬进能力页签。"""
         self.assertIn("保存在线服务设置", self.js)
+        self.assertIn("data-cap-save", self.js, "页签要有自己的保存按钮")
         self.assertIn("data-provider-kind", self.js)
+        self.assertIn("data-tts-engine", self.js, "TTS 的选择就是 ttsEngine（唯一开关）")
 
     def test_provider_settings_are_hidden_from_the_generic_form(self):
-        """这九个键**不再**出现在通用设置表单里（否则又变成两套界面）。"""
+        """这八个键**不再**出现在通用设置表单里（否则又变成两套界面）。"""
         from app.config import DEFAULTS
         for key in ("providerAsr", "providerLlm",
                     "providerLlmBaseUrl", "providerLlmApiKey", "providerLlmModel",
@@ -670,10 +687,10 @@ class PanelWiringTests(unittest.TestCase):
                 meta = DEFAULTS.get(key)
                 self.assertIsNotNone(meta, "%s 必须存在" % key)
                 self.assertTrue(meta.get("hidden"),
-                                "%s 应由「能力 provider」卡片承载，不出现在通用表单" % key)
+                                "%s 应由「能力」页签承载，不出现在通用表单" % key)
                 self.assertEqual(meta["grp"], "provider")
                 self.assertTrue(meta["label"] and meta["description"])
-        # providerTts 更进一步：与 ttsEngine 重复 → 已弃用（既不出现在表单，也不出现在卡片）
+        # providerTts 更进一步：与 ttsEngine 重复 → 已弃用（既不出现在表单，也不出现在页签）
         self.assertTrue(DEFAULTS["providerTts"].get("deprecated"))
 
     def test_provider_config_endpoint_serves_them_masked(self):

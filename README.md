@@ -124,7 +124,10 @@ mac/start_mac.sh
 - **模型路由（ECHO AUTO）**：把多个上游（内网网关 / 公网 API / 任意 OpenAI 兼容端点）组成
   「模型组」，按通道号顺序派发并自动故障转移 + 熔断，DSH 里只需选一个 `ECHO AUTO`
   （见下文「模型路由」）。
-- **模型面板**：设置页列出每个功能需要的模型、体积、落地路径与就绪状态，能从 ModelScope / HF 镜像一键下载。
+- **能力页签**：把"每个功能用哪个实现"（本地引擎 / 在线服务 / 关闭）与"装没装、怎么装"放在一处 ——
+  转写 / 语言模型 / 朗读三类能力各一张卡，卡里能选实现、看就绪、下载缺失模型、填在线服务地址与密钥
+  （并标明哪些会出网）。2026-09-19 由原「模型」「组件」两个页签 + 设置页的 provider 卡片合并而来
+  （见 [docs/能力页签重设计.md](docs/能力页签重设计.md)）。
 - **可被其他应用调用**：本地 REST API（转写、TTS、会议、设置），面板与手机 App 共用同一入口。
 
 ## 技术栈
@@ -218,7 +221,7 @@ ECHO 自带一个**本机模型路由**（`dsh-failover/proxy.py`，只监听回
 |---|---|
 | 面板 → 设置 → 模型 → **下载** | SenseVoice、Whisper 各档、Qwen3-ASR、sherpa 流式（走 ModelScope / hf-mirror 镜像） |
 | 首次使用时自动下载 | SenseVoice 走 ModelScope 缓存；Whisper 走 HF 镜像缓存 |
-| 从别处拷贝 | 说话人分离（pyannote，HF 上是 gated 模型）与 KWS 唤醒词模型：按模型面板里给的**落地路径**放对目录即可 |
+| 从别处拷贝 | 说话人分离（pyannote，HF 上是 gated 模型）与 KWS 唤醒词模型：按「能力」页签里给的**落地路径**放对目录即可 |
 
 面板会显示每一项的体积、目标路径与当前是否就绪，落地路径是**代码约定**（改名会加载不到）。
 
@@ -228,7 +231,7 @@ ECHO 自带一个**本机模型路由**（`dsh-failover/proxy.py`，只监听回
 powershell -File scripts\install-qwen3asr.ps1   # 装依赖(qwen-asr) + 下载模型(~1.5GB)
 ```
 
-装好后在 顶部「模型」页签 → 会议转写引擎 选择 `qwen3asr`（命令转写引擎 `sttModel` 也可选）。
+装好后在 顶部「能力」页签 → 语音转写 → 会议转写引擎 选择 `qwen3asr`（命令转写引擎 `sttModel` 也可选）。
 模型经 modelscope 缓存加载（`~/.cache/modelscope`，无中文路径兼容问题）。
 
 ## DSH Desktop 宿主插件（echo-host）—— 已退役（2026-09-17）

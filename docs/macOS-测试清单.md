@@ -46,7 +46,7 @@ bash mac/start_mac.sh     # 启动 ECHO
 - `sw_vers` / `python -V` / `uname -m`
 - `bash mac/setup_mac.sh` 的**完整输出**
 - `data/logs/` 下的日志（尤其 `echo-server.log`）
-- 「环境体检」与「组件」页签的截图
+- 「环境体检」与「能力」页签的截图（能力页签 = 用哪个实现 + 装没装，2026-09-19 合并自原「模型」「组件」）
 - 失败项的现象（报错原文、截图）
 
 ## 5. 已知的、不是你问题的项（如实记录即可）

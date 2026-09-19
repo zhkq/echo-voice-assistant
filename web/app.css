@@ -368,6 +368,34 @@ main { max-width: 1200px; margin: 12px auto; padding: 0 14px; }
 .set-row .ctl { width: 280px; }
 .set-row input[type="checkbox"] { width: 18px; height: 18px; accent-color: var(--accent); }
 
+/* ---------- 能力页签（2026-09-19 合并 模型/组件/provider 三处） ---------- */
+/* 一张能力卡里：「用哪个实现」一行 + 出网标注 + 在线服务字段 + 组件表。 */
+.cap-prov { margin: 2px 0 8px; }
+.cap-prov-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.cap-prov-row .cap-label { font-size: 13px; color: var(--muted); flex-shrink: 0; }
+.cap-prov-row .ctl { width: 300px; }
+.cap-online { border-left: 3px solid var(--border); padding-left: 10px; margin: 6px 0 4px 6px; }
+.cap-sub {
+  margin: 10px 0 4px; font-size: 12px; color: var(--muted); font-weight: 600;
+  border-bottom: 1px dashed var(--border); padding-bottom: 3px;
+}
+.cap-engine-row { display: flex; gap: 18px; flex-wrap: wrap; }
+.cap-engine-row label { font-size: 13px; display: flex; align-items: center; gap: 8px; }
+.cap-engine-row .ctl { width: 220px; }
+.cap-prov-state {
+  display: flex; align-items: center; gap: 10px; padding: 4px 2px; font-size: 13px;
+  border-bottom: 1px dashed var(--border);
+}
+.cap-table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+.cap-table th {
+  text-align: left; font-weight: 600; color: var(--muted); font-size: 11.5px;
+  padding: 4px 6px; border-bottom: 1px solid var(--border);
+}
+.cap-table td { padding: 6px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+.cap-table tr:last-child td { border-bottom: none; }
+.cap-cur-row { background: rgba(120, 180, 255, .08); }
+.cap-cur-row td:first-child { box-shadow: inset 3px 0 0 var(--accent); }
+
 /* ---------- 设置 → 智能体：列表开关 + 选中项展开设置 ---------- */
 .agent-table-wrap { padding: 2px 0; }
 .agent-table { display: flex; flex-direction: column; gap: 6px; }

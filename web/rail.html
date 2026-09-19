@@ -144,7 +144,7 @@
 
   <button class="btn" id="btnSay" title="按压说话（快捷键同 Ctrl+Alt+C）">说话</button>
 
-  <button class="btn" id="btnModels" title="展开面板并打开「模型」页签">模型</button>
+  <button class="btn" id="btnModels" title="展开面板并打开「能力」页签（用哪个实现 + 装没装）">能力</button>
 
   <div class="bottom">
     <div class="sep"></div>
@@ -382,10 +382,10 @@
     toast("仅在折叠条中可展开");
   });
 
-  // 「模型」按钮：先让主面板展开后落在「模型」页签（同源 localStorage 传意图），再通知宿主展开。
+  // 「能力」按钮：先让主面板展开后落在「能力」页签（同源 localStorage 传意图），再通知宿主展开。
   const btnModels = document.getElementById("btnModels");
   btnModels.addEventListener("click", () => {
-    try { localStorage.setItem("echo.gotoView", "models"); } catch (e) { /* 忽略 */ }
+    try { localStorage.setItem("echo.gotoView", "capabilities"); } catch (e) { /* 忽略 */ }
     const wv = window.chrome && window.chrome.webview;
     if (wv && typeof wv.postMessage === "function") {
       wv.postMessage("rail-expand");

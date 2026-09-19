@@ -73,13 +73,12 @@ function switchView(name) {
   $(`#view-${name}`).classList.remove("hidden");
   $$(".tab").forEach((t) => t.classList.toggle("active", t.dataset.view === name));
   if (name === "dashboard") { refreshDashboard(); loadTargets(); }
-  if (name === "settings") { loadSettings(); loadProviders(); }
+  if (name === "settings") loadSettings();
   if (name === "history") loadHistory();
   if (name === "meetings") { loadMeetings(); refreshMeetingHeader(); }
   if (name === "boot") { loadBoot(); loadBootLogs(); }
   if (name === "failover") loadRouter();
-  if (name === "models") loadModels();
-  if (name === "components") loadComponents();
+  if (name === "capabilities") loadCapabilities();
 }
 $$(".tab").forEach((t) => t.addEventListener("click", () => switchView(t.dataset.view)));
 
@@ -884,10 +883,11 @@ const SET_SUB_ORDER = ["record", "command", "speech", "beep"];
 const SET_SUB_NAMES = { record: "录音与转写", command: "命令与会话",
   speech: "朗读与反馈", beep: "提示音与通知" };
 
-/* 模型相关配置项：从「设置」页移出，统一由「模型」页签承载（前端过滤，后端 grp 不动）。
-   见下方「模型」视图：按功能展示 选择 + 就绪 + 获取。 */
+/* "用哪个实现"相关的配置项：从「设置」页移出，统一由顶部「能力」页签承载
+   （前端过滤，后端 grp 不动）——它们都是"每个能力用哪个实现/装没装"这一类问题。
+   ttsEngine 也在其中：它是朗读的唯一开关（本地/在线/关闭），能力页签的"语音合成"卡承载它。 */
 const MODEL_KEYS = new Set([
-  "sttModel", "meetingSttModel", "device",
+  "sttModel", "meetingSttModel", "device", "ttsEngine",
   "wakeEngine", "meetingDiarize",
   "voiceprintEnabled", "voiceprintAutoEnroll", "voiceprintThreshold", "voiceprintMargin",
 ]);
@@ -1041,173 +1041,351 @@ $("#settingsForm").addEventListener("click", async (e) => {
   if (a) toast(a.available ? `${a.displayName} 可用` : `${a.displayName} 不可用：${a.reason || ""}`);
 });
 
-/* ---- 能力 provider（P5 / D25）：ASR / LLM / TTS 各选一个实现 ----
-   数据面：GET /api/providers（谁在生效、是否出网、就绪与否）+
-           GET /api/providers/presets（在线服务公开预设，一键填地址与模型名）。
-   与「组件」页签的分工：组件 = 装什么（模型/引擎/运行时），provider = 用哪个（含在线服务）。
-   自包含：整个渲染包在 try/catch 里，失败只影响本卡片（设置页照常可用）。 */
+/* ---- 能力页签（2026-09-19 合并：原「模型」页签 + 原「组件」页签 + 设置页的「能力 provider」卡片）----
 
-function loadProviders() {
-  const host = $("#providersHost");
-  if (host) renderProvidersCard(host);
+   为什么合并：三处都在回答同一件事 —— "这台机器上，每个功能**由什么实现、装好了没**"。
+     * 原「模型」页签：用哪个本地引擎 + 装没装 + 下载；
+     * 原「组件」页签：装没装 + 怎么装（纯表格，没有动作）；
+     * 设置页的 provider 卡片：用哪个（本地/在线/路由）+ 出网吗 + 在线服务地址密钥。
+   用户直接指出这是设计重叠 → 现在**每个能力只在这一处看全**：先"用哪个"，再"装没装/怎么装"。
+
+   页面结构：三个能力卡（语音转写 / 语言模型 / 语音合成）+ 其他功能卡（唤醒 / 说话人分离 /
+   声纹 / 计算设备，复用 renderModelCard）+ 运行环境（运行时 / 加速 / 智能体后端）。
+
+   数据面：
+     /api/components?includeBlocked=true   装什么（有 model_id 的就绪判定问 modelinfo，单一判据）
+     /api/models                           模型下载元数据与进度（按 model_id 关联）
+     /api/providers[?ready=true]           实现清单（本地 / 在线 / 路由 + 出网 + 就绪）
+     /api/providers/config|presets         在线服务的地址/模型/密钥（遮罩）与一键预设
+     /api/settings                         每个能力的"用哪个"（sttModel/ttsEngine/wakeEngine…）
+     /api/stt/status、/api/voiceprints     设备与声纹库（计算设备/声纹卡用）            */
+let _capCache = { comps: null, prov: null, cfg: null, presets: null };
+let _capPoll = null;
+
+const CAP_KINDS = ["asr", "llm", "tts"];
+const CAP_META = {
+  asr: { icon: "🎤", title: "语音转写", note: "命令口述与会议录音都走它；本地引擎与在线服务二选一" },
+  llm: { icon: "🧠", title: "语言模型", note: "生成纪要；配了它，不装智能体也能出纪要" },
+  tts: { icon: "🔊", title: "语音合成", note: "朗读复述确认、语音简报与提示语；off = 完全不朗读" },
+};
+const CAP_TTS_LABEL = {
+  auto: "自动（优先 edge-tts，失败回退离线）", "edge-tts": "edge-tts（微软在线 · 出网）",
+  off: "关闭朗读",
+};
+
+/** 某类能力的可装组件（本平台适用的）。 */
+function capCompsOf(kind) {
+  const items = ((_capCache.comps || {}).items) || [];
+  return items.filter((c) => c.kind === kind && c.applicable);
 }
 
-async function renderProvidersCard(host) {
-  host.innerHTML = `<div class="set-group"><div class="set-group-title">
-    <span class="set-arrow">▶</span><span>能力 provider</span></div>
-    <div class="set-group-body muted">读取中…</div></div>`;
-  let data = null, presets = { presets: [] }, cfg = { settings: [] };
-  try {
-    data = await api("/api/providers?ready=true");
-    try { presets = await api("/api/providers/presets"); } catch (e) { presets = { presets: [] }; }
-    // 地址/模型/密钥也由本卡片承载（这些键在通用设置表单里是 hidden 的：
-    // 同一个功能两套界面是用户实测指出的设计问题，2026-09-19）
-    cfg = await api("/api/providers/config");
-  } catch (e) {
-    host.innerHTML = `<div class="set-group"><div class="set-group-title">
-      <span class="set-arrow">▶</span><span>能力 provider</span></div>
-      <div class="set-group-body muted">读取失败：${esc(e.message)}</div></div>`;
-    return;
-  }
-  const all = data.providers || [];
-  const kinds = data.kinds || [];
-  const byKind = (k) => all.filter((p) => p.kind === k);
-  const cfgOf = (key) => (cfg.settings || []).find((s) => s.key === key) || null;
-  const readyBadge = (p) => {
-    if (p.ready === true) return `<span style="color:var(--ok,#3a3)">已就绪</span>`;
-    if (p.ready === false) return `<span class="muted">未就绪</span>`;
-    return `<span class="muted">未知</span>`;
-  };
-  // 只有在线 provider 才需要地址/模型/密钥；本地实现没有这些字段
-  const ONLINE_KINDS = { asr: { prefix: "providerAsr", on: "openai-asr" },
-                         llm: { prefix: "providerLlm", on: "openai-llm" } };
-  const field = (key, type) => {
-    const s = cfgOf(key);
-    if (!s) return "";
-    const id = "prov-" + key;
-    if (s.secret) {
-      return `<div class="set-row" style="margin:0">
-        <label for="${id}">${esc(s.label)}</label>
-        <div style="display:flex;gap:6px;align-items:center">
-          <input type="password" class="ctl" id="${id}" data-key="${key}" data-secret="1" style="flex:1"
-            value="" autocomplete="new-password"
-            placeholder="${s.hasValue ? "已配置（留空 = 不改）" : "未配置"}">
-          <button type="button" class="btn" data-clear-secret="${key}"
-            style="flex:0 0 auto;padding:2px 8px;font-size:12px" title="清空这个密钥">清除</button>
-        </div>
-      </div>`;
+/** TTS 的"当前实现"名字：由 ttsEngine 派生（它是朗读的唯一开关）。 */
+function capTtsCurrentName() {
+  const engine = String((settingByKey("ttsEngine") || {}).value || "auto");
+  if (engine === "off") return "已关闭朗读";
+  if (engine === "edge-tts") return "edge-tts（微软在线）";
+  if (engine === "auto") return "自动（优先 edge-tts）";
+  return "本机离线合成（" + engine + "）";
+}
+
+/** 组件状态徽标。 */
+function capCompBadge(c) {
+  const m = c.model_id ? modelById(c.model_id) : null;
+  const job = (m && _modelJobsCache[m.id]) || {};
+  if (job.status === "running") return modelBadge(`下载中 ${Math.round(job.percent || 0)}%`, "warn");
+  if (c.ready === true) return modelBadge("✅ 已就绪", "ok");
+  if (c.ready === false) return modelBadge(c.model_id ? "⬇ 未安装" : "未安装", "warn");
+  return modelBadge("未知", "idle");
+}
+
+/** 组件表的「获取」格：能下载就给下载按钮（走 /api/models/download），否则给复制说明。 */
+function capCompActions(c) {
+  const m = c.model_id ? modelById(c.model_id) : null;
+  if (m) {
+    const job = _modelJobsCache[m.id] || {};
+    if (job.status === "running") {
+      return `<span class="muted" style="font-size:12px">下载中 ${Math.round(job.percent || 0)}%</span>`;
     }
+    return modelActions(m);
+  }
+  const btns = [];
+  if (c.how) btns.push(`<button type="button" class="btn mini" data-mcopy="${esc(c.how)}">复制安装说明</button>`);
+  if (c.ref) btns.push(`<span class="muted" style="font-size:12px">${esc(c.ref)}</span>`);
+  return btns.join(" ");
+}
+
+/** 组件表：能力卡里的"装没装 / 怎么装"。`currentIds` 命中的行标「当前使用」。 */
+function capCompTable(comps, currentIds) {
+  if (!comps.length) return `<div class="muted" style="font-size:12px">本平台没有可装的组件。</div>`;
+  const cur = new Set((currentIds || []).filter(Boolean));
+  const rows = comps.map((c) => `<tr class="${cur.has(c.model_id) ? "cap-cur-row" : ""}">
+      <td>${cur.has(c.model_id) ? "<b>▶ 当前</b> " : ""}${esc(c.name || c.id)}</td>
+      <td>${capCompBadge(c)}</td>
+      <td class="muted">${c.size_mb ? c.size_mb + " MB" : "-"}</td>
+      <td class="muted" style="font-size:12px">${esc(c.purpose || "")}</td>
+      <td>${capCompActions(c)}</td>
+    </tr>`).join("");
+  return `<table class="cap-table"><thead><tr>
+      <th>组件</th><th>状态</th><th>体积</th><th>用途</th><th>获取</th>
+    </tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+/** 在线服务的一个字段（地址/模型名/密钥）。密钥沿用服务端遮罩：空 = 不改。 */
+function capCfgField(key) {
+  const s = ((_capCache.cfg || {}).settings || []).find((x) => x.key === key);
+  if (!s) return "";
+  const id = "cap-" + key;
+  if (s.secret) {
     return `<div class="set-row" style="margin:0">
       <label for="${id}">${esc(s.label)}</label>
-      <input class="ctl" id="${id}" data-key="${key}" type="${type || "text"}" value="${esc(s.value || "")}">
-      <div class="desc">${esc(s.description || "")}</div>
-    </div>`;
-  };
-  let html = `<div class="set-group-title" style="padding:0 0 6px 0">
-      <span>能力 provider</span>
-      <span class="spacer"></span>
-      <span class="muted" style="font-size:12px">选「用哪个」并填在线服务的地址与密钥；「装什么」见「组件」页签</span>
-    </div>`;
-  /* TTS 这一格**只显示状态、不放第二个下拉**：朗读"用哪个实现"就是设置里的
-     「语音合成引擎」（auto / edge-tts / 本平台离线引擎 / off）。卡片再给一个下拉
-     等于同一个功能两套界面，而且两个开关会互相打架（providerTts 已因此弃用，
-     2026-09-19）。这里按 ttsEngine + 就绪状态报出"当前实现"，并指路到设置里改。 */
-  const ttsStatusRow = (items, meta) => {
-    const engine = String((meta && meta.value) || "auto");
-    const edge = items.find((p) => p.id === "edge-tts") || null;
-    const offline = items.find((p) => p.id !== "edge-tts") || null;
-    let cur = null, note = "";
-    if (engine === "off") {
-      note = "已关闭朗读：复述确认、语音简报、提示语都不会出声";
-    } else if (engine === "edge-tts") {
-      cur = edge; note = "固定走微软在线合成（文本出网）";
-    } else if (engine === "auto") {
-      cur = (edge && edge.ready === true) ? edge : offline;
-      note = "自动：优先 edge-tts，不可用时回退本机离线合成";
-    } else {
-      cur = offline; note = `固定走本机离线合成（${engine}）`;
-    }
-    const name = cur ? cur.name : "已关闭";
-    const egress = (cur && cur.egress)
-      ? `<div class="desc" style="color:var(--warn,#c80)">⚠ 数据会出网：${esc(cur.egress_note || "")}</div>`
-      : `<div class="desc muted">数据不出本机</div>`;
-    return `<div class="set-row">
-      <label>${esc((meta && meta.label) || "语音合成引擎")}</label>
-      <div style="display:flex;align-items:center;gap:8px">
-        <b>${esc(name)}</b><span class="muted" style="font-size:12px">${cur ? readyBadge(cur) : ""}</span>
+      <div style="display:flex;gap:6px;align-items:center">
+        <input type="password" class="ctl" id="${id}" data-key="${key}" data-secret="1" style="flex:1"
+          value="" autocomplete="new-password"
+          placeholder="${s.hasValue ? "已配置（留空 = 不改）" : "未配置"}">
+        <button type="button" class="btn" data-clear-secret="${key}"
+          style="flex:0 0 auto;padding:2px 8px;font-size:12px" title="清空这个密钥">清除</button>
       </div>
-      <div class="desc">${esc(note)}</div>
-      ${egress}
-      <div class="desc">切换请到「设置 → 朗读与反馈 → 语音合成引擎」（同一个开关，这里不重复放）</div>
     </div>`;
-  };
-  for (const k of kinds) {
-    const items = byKind(k.id);
-    if (!items.length) continue;
-    if (k.id === "tts") { html += ttsStatusRow(items, cfgOf("ttsEngine")); continue; }
-    const opts = items.map((p) => {
-      const flags = [p.egress ? "出网" : "本地", p.ready === false ? "未就绪" : ""].filter(Boolean).join("·");
-      return `<option value="${esc(p.id)}" ${p.active ? "selected" : ""}>${esc(p.name)}（${esc(flags)}）</option>`;
-    }).join("");
-    const cur = items.find((p) => p.active) || items[0];
-    const egressLine = cur && cur.egress
+  }
+  return `<div class="set-row" style="margin:0">
+    <label for="${id}">${esc(s.label)}</label>
+    <input class="ctl" id="${id}" data-key="${key}" value="${esc(s.value || "")}">
+    <div class="desc">${esc(s.description || "")}</div>
+  </div>`;
+}
+
+/** 在线服务预设：一键把公开的地址与模型名填进字段（密钥仍要自己填）。 */
+function capPresets(kind) {
+  const all = (_capCache.presets || {}).presets || [];
+  const mine = all.filter((p) => (p.kind || "llm") === kind);
+  if (!mine.length) return "";
+  return `<div class="set-row" style="margin:0"><label>在线服务预设</label>
+      <div style="display:flex;flex-wrap:wrap;gap:6px">` +
+    mine.map((p) => {
+      const idx = all.indexOf(p);
+      return `<button type="button" class="btn" data-preset-index="${idx}"
+        style="padding:3px 10px;font-size:12px" title="${esc(p.note || "")}">${esc(p.name)}</button>`;
+    }).join("") +
+    `</div><div class="desc">点一下把<b>地址与模型名</b>填进上面的字段；密钥请手动填（接口永不回显）；` +
+    `内网网关的地址属单位内部信息，需自己填。</div></div>`;
+}
+
+/** 「用哪个实现」区块：下拉（选中即生效）+ 就绪 + 出网标注 + 在线服务的地址/模型/密钥。 */
+function capProviderBlock(kind) {
+  const provs = ((_capCache.prov || {}).providers || []).filter((p) => p.kind === kind);
+  if (!provs.length) return "";
+  const isTts = kind === "tts";
+  const cur = isTts ? null : (provs.find((p) => p.active) || provs[0]);
+  let select = "";
+  let currentLine = "";
+  if (isTts) {
+    // TTS 的"用哪个"就是 ttsEngine（含 off）：选项从设置元数据来，避免再造一个开关
+    const meta = settingByKey("ttsEngine");
+    const opts = (meta && meta.options) || [];
+    select = `<select class="ctl" data-tts-engine="1">` + opts.map((o) =>
+      `<option value="${esc(o)}" ${String(o) === String(meta && meta.value) ? "selected" : ""}>` +
+      `${esc(CAP_TTS_LABEL[o] || o)}</option>`).join("") + `</select>`;
+    currentLine = `<span class="muted" style="font-size:12px">当前 <b>${esc(capTtsCurrentName())}</b></span>`;
+  } else {
+    select = `<select class="ctl" data-provider-kind="${esc(kind)}">` + provs.map((p) =>
+      `<option value="${esc(p.id)}" ${p.active ? "selected" : ""}>${esc(p.name)}` +
+      `（${p.egress ? "出网" : "本地"}${p.ready === false ? " · 未就绪" : ""}）</option>`).join("") + `</select>`;
+    const rdy = cur.ready === true ? `<span style="color:var(--ok,#3a3)">已就绪</span>`
+      : cur.ready === false ? `<span class="muted">未就绪</span>` : `<span class="muted">未知</span>`;
+    currentLine = `<span class="muted" style="font-size:12px">当前 <b>${esc(cur.name)}</b> · ${rdy}</span>`;
+  }
+  let egress;
+  if (isTts) {
+    const engine = String((settingByKey("ttsEngine") || {}).value || "auto");
+    const edge = provs.find((p) => p.id === "edge-tts");
+    egress = (engine === "edge-tts" || (engine === "auto" && edge && edge.ready !== false))
+      ? `<div class="desc" style="color:var(--warn,#c80)">⚠ 数据会出网：${esc((edge && edge.egress_note) || "被朗读的文本会发送到微软合成语音")}</div>`
+      : `<div class="desc muted">数据不出本机</div>`;
+  } else {
+    egress = cur.egress
       ? `<div class="desc" style="color:var(--warn,#c80)">⚠ 数据会出网：${esc(cur.egress_note || "")}</div>`
       : `<div class="desc muted">数据不出本机</div>`;
-    html += `<div class="set-row">
-      <label for="prov-${esc(k.id)}">${esc(k.label)}</label>
-      <select class="ctl" id="prov-${esc(k.id)}" data-provider-kind="${esc(k.id)}">${opts}</select>
-      <div class="desc">当前：<b>${esc(cur ? cur.name : "-")}</b> · ${cur ? readyBadge(cur) : ""}（选中即生效）</div>
-      ${egressLine}
-    </div>`;
-    // 选中的是在线实现时，就地展开它需要的地址/模型/密钥
-    const online = ONLINE_KINDS[k.id];
-    if (online && cur && cur.id === online.on) {
-      html += `<div style="border-left:3px solid var(--line,#333);padding-left:10px;margin:2px 0 10px 6px">
-        ${field(online.prefix + "BaseUrl")}
-        ${field(online.prefix + "Model")}
-        ${field(online.prefix + "ApiKey")}
-      </div>`;
-    }
   }
-  // 在线服务预设：一键把公开的地址与模型名填进上面的字段（密钥仍要自己填）
-  const fills = (presets.presets || []);
-  if (fills.length) {
-    html += `<div class="set-row"><label>在线服务预设</label><div style="display:flex;flex-wrap:wrap;gap:6px">` +
-      fills.map((p, i) => `<button type="button" class="btn" data-preset-index="${i}"
-        style="padding:3px 10px;font-size:12px" title="${esc(p.note || "")}">${esc(p.name)}</button>`).join("") +
-      `</div><div class="desc">点一下把<b>地址与模型名</b>填进对应字段；密钥请手动填（接口永不回显）；` +
-      `内网网关的地址属单位内部信息，需自己填。</div></div>`;
-    host.dataset.presets = JSON.stringify(fills);
-  }
-  html += `<div style="display:flex;gap:8px;align-items:center;padding-top:4px">
-      <button type="button" class="btn" id="btnProviderSave">保存在线服务设置</button>
-      <span class="muted" style="font-size:12px">密钥留空 = 不改；下拉选择是选中即生效</span>
+  return `<div class="cap-prov">
+      <div class="cap-prov-row"><span class="cap-label">用哪个实现</span>${select}${currentLine}</div>
+      ${egress}${capOnlineBlock(kind, cur)}
     </div>`;
-  host.innerHTML = `<div class="set-group"><div class="set-group-body">${html}</div></div>`;
+}
 
-  const save = $("#btnProviderSave");
-  if (save) save.addEventListener("click", async () => {
-    const values = {};
-    $$("#providersHost [data-key]").forEach((el) => {
-      const key = el.dataset.key;
-      const meta = cfgOf(key);
-      if (!meta) return;
-      if (meta.secret) {                       // 密钥：只提交这轮真的输入了新值的
-        if (el.value && el.value.trim()) values[key] = el.value;
-        return;
+/** 选中在线实现时就地展开它需要的地址/模型/密钥（+ 预设 + 保存）。 */
+function capOnlineBlock(kind, cur) {
+  const ONLINE = { asr: { prefix: "providerAsr", on: "openai-asr" },
+                   llm: { prefix: "providerLlm", on: "openai-llm" } };
+  const o = ONLINE[kind];
+  if (!o || !cur || cur.id !== o.on) return "";
+  return `<div class="cap-online">
+      ${capCfgField(o.prefix + "BaseUrl")}${capCfgField(o.prefix + "Model")}${capCfgField(o.prefix + "ApiKey")}
+      ${capPresets(kind)}
+      <div style="display:flex;gap:8px;align-items:center;padding-top:4px">
+        <button type="button" class="btn" data-cap-save="1">保存在线服务设置</button>
+        <span class="muted" style="font-size:12px">密钥留空 = 不改；下拉选择是选中即生效</span>
+      </div>
+    </div>`;
+}
+
+/** 转写卡的本地面：两个引擎下拉（命令/会议）+ 可装的本地模型（当前用的标出来）。 */
+function capAsrLocal() {
+  const stt = settingByKey("sttModel");
+  const mstt = settingByKey("meetingSttModel");
+  const curIds = [engineModelId(stt && stt.value), engineModelId(mstt && mstt.value)];
+  return `<div class="cap-sub">本地引擎（选「本地转写引擎」时生效）</div>
+    <div class="cap-engine-row">
+      <label>命令转写${_selectHtml("sttModel", stt && stt.options, stt && stt.value)}</label>
+      <label>会议转写${_selectHtml("meetingSttModel", mstt && mstt.options, mstt && mstt.value)}</label>
+    </div>
+    <div class="cap-sub">可装的本地模型</div>
+    ${capCompTable(capCompsOf("stt"), curIds)}`;
+}
+
+/** 一张能力卡：标题 + 说明 + 「用哪个」+ 各自的补充内容。 */
+function capKindCard(kind) {
+  const meta = CAP_META[kind] || { icon: "•", title: kind, note: "" };
+  let body = capProviderBlock(kind);
+  if (kind === "asr") body += capAsrLocal();
+  if (kind === "llm") {
+    body += `<div class="muted" style="font-size:12px;margin-top:6px">
+      `+`ECHO AUTO（多上游派发）的成员与优先级在「模型路由」页签里配；
+      这里只选"用哪个实现"和在线服务的地址/模型/密钥。</div>
+      <div class="mcard-act"><button type="button" class="btn mini" data-goto="failover">去模型路由</button></div>`;
+  }
+  if (kind === "tts") {
+    body += `<div class="cap-sub">两种实现</div>` +
+      ((_capCache.prov || {}).providers || []).filter((p) => p.kind === "tts").map((p) =>
+        `<div class="cap-prov-state"><b>${esc(p.name)}</b>` +
+        `<span class="muted" style="font-size:12px">${p.egress ? "会出网" : "不出本机"} · ` +
+        `${p.ready === true ? "已就绪" : p.ready === false ? "未就绪" : "未知"}</span></div>`).join("");
+  }
+  return `<div class="mcard">
+    <div class="mcard-head"><div class="mcard-ic">${meta.icon}</div>
+      <div class="mcard-title">${esc(meta.title)}</div></div>
+    <div class="mcard-body">
+      <div class="muted" style="font-size:12px;margin-bottom:6px">${esc(meta.note)}</div>
+      ${body}
+    </div></div>`;
+}
+
+/** 顶部一览：三个能力当前用的是什么 + 组件就绪计数。 */
+function renderCapOverview() {
+  const host = $("#capOverview");
+  const items = ((_capCache.comps || {}).items) || [];
+  const usable = items.filter((c) => c.applicable);
+  const readyN = usable.filter((c) => c.ready === true).length;
+  const provs = ((_capCache.prov || {}).providers) || [];
+  const dotOf = (ok) => (ok === true ? "green" : ok === false ? "yellow" : "idle");
+  if (host) {
+    host.innerHTML = CAP_KINDS.map((k) => {
+      if (k === "tts") {
+        const engine = String((settingByKey("ttsEngine") || {}).value || "auto");
+        const edge = provs.find((p) => p.id === "edge-tts") || {};
+        const ok = engine === "off" ? false : (engine === "auto" ? edge.ready !== false : true);
+        return `<span class="ov-item"><span class="dot d-${dotOf(ok)}"></span>${esc(CAP_META[k].title)} ` +
+          `<b>${esc(capTtsCurrentName())}</b></span>`;
       }
-      values[key] = el.value;
-    });
-    if (!Object.keys(values).length) { toast("没有需要保存的改动"); return; }
+      const p = provs.find((x) => x.kind === k && x.active) || provs.find((x) => x.kind === k) || {};
+      return `<span class="ov-item"><span class="dot d-${dotOf(p.ready)}"></span>${esc(CAP_META[k].title)} ` +
+        `<b>${esc(p.name || "—")}</b></span>`;
+    }).join("");
+  }
+  const sum = $("#capOvSummary");
+  if (sum) sum.textContent = `组件就绪 ${readyN}/${usable.length}`;
+}
+
+/** 运行环境：装不了就得手装的 pypi 类组件（运行时 / 加速 / 智能体后端）。 */
+function renderCapEnv() {
+  const host = $("#capEnvHost");
+  if (!host) return;
+  const comps = capCompsOf("runtime").concat(capCompsOf("accel"), capCompsOf("agent"));
+  const blocked = (((_capCache.comps || {}).items) || []).filter((c) => !c.applicable);
+  const blockedHtml = blocked.length
+    ? `<div class="muted" style="margin-top:8px;font-size:12px">本平台不适用（显示但不可选）：
+         <ul style="margin:4px 0 0 18px">` +
+      blocked.map((c) => `<li>${esc(c.name || c.id)}：${esc(c.blockedReason || "不适用")}</li>`).join("") +
+      `</ul></div>`
+    : "";
+  const plat = ((_capCache.comps || {}).platform || "") +
+    (((_capCache.comps || {}).osVersion) ? " " + _capCache.comps.osVersion : "");
+  host.innerHTML = `<div class="card">
+    <div class="card-title">🧱 运行环境 <span class="muted">${esc(plat)}</span></div>
+    ${capCompTable(comps, [])}
+    <div class="muted" style="margin-top:6px;font-size:12px">
+      这些是 pip 装的运行时/加速库，面板不代下：点「复制安装说明」拿到命令后自己执行。
+    </div>
+    ${blockedHtml}
+  </div>`;
+}
+
+/** 能力页签的事件绑定（一个页面一次，重绘不用重绑）。 */
+function bindCapCards() {
+  const host = $("#view-capabilities");
+  if (!host || host.dataset.bound) return;
+  host.dataset.bound = "1";
+  host.addEventListener("change", async (e) => {
+    const el = e.target;
+    let key, val;
+    if (el.dataset.mset) { key = el.dataset.mset; val = el.value; }
+    else if (el.dataset.mbool) { key = el.dataset.mbool; val = el.checked; }
+    else if (el.dataset.mnum) { key = el.dataset.mnum; val = parseFloat(el.value) || 0; }
+    else if (el.dataset.ttsEngine) { key = "ttsEngine"; val = el.value; }
+    else return;
     try {
-      await api("/api/settings", { method: "PUT", body: JSON.stringify({ values }) });
-      toast("已保存 " + Object.keys(values).length + " 项");
-      loadProviders();
-    } catch (err) { toast("保存失败：" + err.message); }
+      await api("/api/settings", { method: "PUT", body: JSON.stringify({ values: { [key]: val } }) });
+      toast("已更新");
+      const r = await api("/api/settings");
+      _settingsCache = r.settings || _settingsCache;
+      loadCapabilities();
+    } catch (err) { toast("更新失败：" + err.message); }
+  });
+  host.addEventListener("click", async (e) => {
+    const save = e.target.closest("[data-cap-save]");
+    if (save) {
+      const values = {};
+      $$("#view-capabilities [data-key]").forEach((el) => {
+        const key = el.dataset.key;
+        const meta = (((_capCache.cfg || {}).settings) || []).find((x) => x.key === key);
+        if (!meta) return;
+        if (meta.secret) { if (el.value && el.value.trim()) values[key] = el.value; return; }
+        values[key] = el.value;
+      });
+      if (!Object.keys(values).length) { toast("没有需要保存的改动"); return; }
+      try {
+        await api("/api/settings", { method: "PUT", body: JSON.stringify({ values }) });
+        toast("已保存 " + Object.keys(values).length + " 项");
+        loadCapabilities();
+      } catch (err) { toast("保存失败：" + err.message); }
+      return;
+    }
+    const dl = e.target.closest("[data-msdl]");
+    if (dl) {
+      dl.disabled = true;
+      try {
+        const r = await post("/api/models/download", { id: dl.dataset.msdl, force: dl.dataset.force === "1" });
+        toast(r.message || "已开始下载");
+      } catch (err) { toast("下载失败：" + err.message); }
+      loadCapabilities();
+      return;
+    }
+    const cp = e.target.closest("[data-mcopy]");
+    if (cp) {
+      try { await navigator.clipboard.writeText(cp.dataset.mcopy); toast("已复制"); }
+      catch (err) { toast("复制失败，请手动选择"); }
+      return;
+    }
+    const go = e.target.closest("[data-goto]");
+    if (go) { switchView(go.dataset.goto); return; }
+    const rl = e.target.closest("[data-cap-reload]");
+    if (rl) { loadCapabilities(); return; }
+    const preset = e.target.closest("[data-preset-index]");
+    if (preset) { await capApplyPreset(preset.dataset.presetIndex); return; }
   });
 }
 
-/* 选 provider：立即写配置（与"命令目标"下拉同一种交互：选中即持久化） */
+/* 选 provider：立即写配置（与"命令目标"下拉同一种交互：选中即持久化）。
+   TTS 不走这里：它的开关是 ttsEngine（见 bindCapCards 的 data-tts-engine）。 */
 document.addEventListener("change", async (e) => {
   const kind = e.target && e.target.dataset ? e.target.dataset.providerKind : "";
   if (!kind) return;
@@ -1216,98 +1394,86 @@ document.addEventListener("change", async (e) => {
     await api("/api/settings", { method: "PUT", body: JSON.stringify({ values: { [key]: e.target.value } }) });
     toast("已切换到：" + e.target.value);
     await loadSettings();
-    loadProviders();
+    loadCapabilities();
   } catch (err) { toast("切换失败：" + err.message); }
 });
 
-/* 在线服务预设：把公开的地址/模型名**填进卡片里的字段**（不直接保存，让用户过一眼再点保存）；
-   若对应的在线 provider 还没被选中，先把下拉切过去（否则字段没渲染出来）。 */
-document.addEventListener("click", async (e) => {
-  const idx = e.target && e.target.dataset ? e.target.dataset.presetIndex : "";
-  if (idx === "" || idx == null) return;
-  const host = $("#providersHost");
-  let list = [];
-  try { list = JSON.parse(host.dataset.presets || "[]"); } catch (err) { list = []; }
-  const p = list[Number(idx)];
+/** 在线服务预设：填进字段（不直接保存，让用户过一眼再点保存）；未选中在线实现时先切过去。 */
+async function capApplyPreset(idx) {
+  const all = ((_capCache.presets || {}).presets) || [];
+  const p = all[Number(idx)];
   if (!p) return;
   const kind = p.kind === "asr" ? "asr" : "llm";
   const prefix = kind === "asr" ? "providerAsr" : "providerLlm";
   const onlineId = kind === "asr" ? "openai-asr" : "openai-llm";
-  const kindKey = kind === "asr" ? "providerAsr" : "providerLlm";
-  const fieldEl = (key) => $(`#providersHost [data-key="${key}"]`);
-  // 没有地址的预设（内网网关）只提示，不填
+  const fieldEl = (key) => $(`#view-capabilities [data-key="${key}"]`);
   if (!p.base_url && !p.model) { toast("这个预设需要你自己填地址（属单位内部信息）"); return; }
-  if (!fieldEl(prefix + "BaseUrl")) {          // 在线 provider 未选中 → 先切过去
+  if (!fieldEl(prefix + "BaseUrl")) {                 // 在线实现未选中 → 先切过去
     try {
-      await api("/api/settings", { method: "PUT", body: JSON.stringify({ values: { [kindKey]: onlineId } }) });
+      await api("/api/settings", { method: "PUT", body: JSON.stringify({ values: { [prefix]: onlineId } }) });
     } catch (err) { toast("切换 provider 失败：" + err.message); return; }
-    await renderProvidersCard(host);
+    await loadCapabilities();
   }
   if (p.base_url && fieldEl(prefix + "BaseUrl")) fieldEl(prefix + "BaseUrl").value = p.base_url;
   if (p.model && fieldEl(prefix + "Model")) fieldEl(prefix + "Model").value = p.model;
   toast("已填入地址与模型名，请补密钥后点「保存在线服务设置」");
-});
-
-/* 「组件」页签的入口（switchView 分发到这里）。渲染逻辑复用自包含的卡片渲染器，
-   所以页签与（曾经的）设置页卡片能共用一份实现。 */
-function loadComponents() {
-  const host = $("#componentsHost");
-  if (host) renderComponentsCard(host);
 }
 
-/* ---- 组件清单（2.0 / P2、D22、D23）----
-   数据来自 /api/components（组件内核），按 kind 分组展示：就绪状态、体积、获取方式；
-   不适用于本平台的组件（如 mac 上的 CUDA）**显示但标注原因**，不隐藏（D24）。 */
-async function renderComponentsCard(host) {
-  let data = null;
+/** 读取能力页签的全部数据并渲染。失败时把模型相关设置退回设置页（唯一入口不能断）。 */
+async function loadCapabilities() {
+  const host = $("#capKindCards");
+  if (!host) return;
+  const wasOk = _capTabOk;
   try {
-    data = await api("/api/components?includeBlocked=true");
+    const [setRes, modelsRes, compRes, provRes, cfgRes, presetRes, sttRes, vpRes] = await Promise.all([
+      api("/api/settings"),
+      api("/api/models"),
+      api("/api/components?includeBlocked=true"),
+      api("/api/providers?ready=true"),
+      api("/api/providers/config").catch(() => ({ settings: [] })),
+      api("/api/providers/presets").catch(() => ({ presets: [] })),
+      api("/api/stt/status").catch(() => null),
+      api("/api/voiceprints").catch(() => null),
+    ]);
+    _settingsCache = setRes.settings || _settingsCache;
+    _modelsCache = modelsRes.items || [];
+    _modelJobsCache = (modelsRes.jobs && modelsRes.jobs.items) || {};
+    _capCache = { comps: compRes, prov: provRes, cfg: cfgRes, presets: presetRes };
+    _sttCache = sttRes;
+    _vpCache = vpRes;
+    _capTabOk = true;
+    renderCapOverview();
+    host.innerHTML = CAP_KINDS.map(capKindCard).join("");
+    const funcs = $("#capFuncCards");
+    if (funcs) funcs.innerHTML = modelFunctions()
+      .filter((f) => ["wake", "diar", "vp", "dev"].indexOf(f.id) >= 0).map(renderModelCard).join("");
+    renderCapEnv();
+    bindCapCards();
+    const active = modelsRes.jobs && modelsRes.jobs.active;
+    if (active && !_capPoll) _capPoll = setInterval(loadCapabilities, 1500);
+    else if (!active && _capPoll) { clearInterval(_capPoll); _capPoll = null; }
+    if (!wasOk) loadSettings();        // 页签恢复：设置页里回退显示的那些项可以收起来了
   } catch (e) {
-    host.innerHTML = `<div class="set-group"><div class="set-group-title">
-      <span class="set-arrow">▶</span><span>组件</span></div>
-      <div class="set-group-body muted">读取失败：${esc(e.message)}</div></div>`;
-    return;
+    host.innerHTML = `<div class="mcard bad">
+      <div class="mcard-head"><div class="mcard-ic">⚠</div>
+        <div class="mcard-title">能力清单加载失败</div>${modelBadge("不可用", "miss")}</div>
+      <div class="mcard-body">
+        <div class="mcard-warn">${esc(e.message)}</div>
+        <div class="mcard-meta">模型/引擎相关设置已暂时回到「设置」页签，先在那儿改也可以；这里恢复后会自动收起。</div>
+        <div class="mcard-act"><button type="button" class="btn mini" data-cap-reload="1">重试</button></div>
+      </div></div>`;
+    bindCapCards();
+    _capTabOk = false;
+    if (wasOk) { try { loadSettings(); } catch (_) { /* 忽略 */ } }
   }
-  const KIND_NAMES = { runtime: "运行时", accel: "加速", stt: "转写引擎", diarize: "说话人分离",
-                       wake: "唤醒", tts: "语音合成", agent: "智能体" };
-  const items = data.items || [];
-  const usable = items.filter((i) => i.applicable);
-  const ready = usable.filter((i) => i.ready === true);
-  const totalMb = usable.reduce((n, i) => n + (i.size_mb || 0), 0);
-  const badge = (i) => {
-    if (!i.applicable) return `<span class="muted">不适用</span>`;
-    if (i.ready === true) return `<span style="color:var(--ok,#3a3)">已就绪</span>`;
-    if (i.ready === false) return `<span class="muted">未安装</span>`;
-    return `<span class="muted">未知</span>`;
-  };
-  const rows = usable.map((i) => `<tr>
-      <td>${esc(KIND_NAMES[i.kind] || i.kind)}</td>
-      <td>${esc(i.name || i.id)}${i.required ? "（必装）" : ""}</td>
-      <td>${badge(i)}</td>
-      <td>${i.size_mb == null ? "-" : i.size_mb + " MB"}</td>
-      <td class="muted" style="font-size:12px">${esc(i.how || i.source || "")}</td>
-    </tr>`).join("");
-  const blocked = items.filter((i) => !i.applicable)
-    .map((i) => `<li>${esc(i.name || i.id)}：${esc(i.blockedReason || "不适用")}</li>`).join("");
-  host.innerHTML = `<div class="set-group" data-grp="components">
-    <div class="set-group-title" role="button" tabindex="0" aria-expanded="true">
-      <span class="set-arrow">▶</span><span>组件</span>
-      <span class="set-count">${ready.length}/${usable.length}</span>
-    </div>
-    <div class="set-group-body">
-      <div class="muted" style="margin:0 0 8px;font-size:12px">
-        平台 ${esc(data.platform)}${data.osVersion ? " " + esc(data.osVersion) : ""} ·
-        全部装齐约 ${totalMb} MB · 已就绪 ${ready.length} 个，未装 ${usable.length - ready.length} 个。
-        主包只含核心代码，模型与引擎按需安装（向导会逐项问）。
-      </div>
-      <table class="muted" style="width:100%;font-size:12px">
-        <thead><tr><th>类别</th><th>组件</th><th>状态</th><th>体积</th><th>获取方式</th></tr></thead>
-        <tbody>${rows}</tbody></table>
-      ${blocked ? `<div class="muted" style="margin-top:8px;font-size:12px">
-        本平台不适用（显示但不可选）：<ul style="margin:4px 0 0 18px">${blocked}</ul></div>` : ""}
-    </div>
-  </div>`;
 }
+
+const _btnCapReload = $("#btnCapReload");
+if (_btnCapReload) _btnCapReload.addEventListener("click", () => loadCapabilities());
+const _btnCapDlMissing = $("#btnCapDownloadMissing");
+if (_btnCapDlMissing) _btnCapDlMissing.addEventListener("click", () => downloadMissingModels());
+
+
 
 /* ---- 环境体检 + 迁移已有会议（2.0 / P1、D20、D21） ----
    只读展示四类根（ECHO/DATA/MEETINGS/MODELS）的存在、可写性与磁盘余量，并提供
@@ -1386,11 +1552,11 @@ async function loadSettings() {
     _settingsCache = r.settings;
     _agentsCache = r.agents || [];
     const groups = {};
-    // 模型相关项正常由「模型」页签承载；该页签加载失败时（_modelsTabOk=false）回退显示，
-    // 免得唯一入口挂掉时连转写引擎都改不回来。
+    // 模型/引擎/朗读实现相关项正常由顶部「能力」页签承载；该页签加载失败时（_capTabOk=false）
+    // 回退显示，免得唯一入口挂掉时连转写引擎都改不回来。
     // 组内顺序用后端给的 `order`（= DEFAULTS 声明顺序）：/api/settings 是按 (grp, key)
     // 字母序来的，直接渲染会把"三个提示音开关"这类编排打散（见 config.SETTING_ORDER）。
-    const rows = r.settings.filter((s) => !(_modelsTabOk && MODEL_KEYS.has(s.key)));
+    const rows = r.settings.filter((s) => !(_capTabOk && MODEL_KEYS.has(s.key)));
     rows.sort((a, b) => ((a.order ?? 1e6) - (b.order ?? 1e6))
       || String(a.key).localeCompare(String(b.key)));
     rows.forEach((s) => { (groups[s.grp] = groups[s.grp] || []).push(s); });
@@ -1401,10 +1567,11 @@ async function loadSettings() {
     const extra = Object.keys(groups).filter((g) => !SET_GROUP_ORDER.includes(g));
     const collapsed = _collapsedGroups();
     const form = $("#settingsForm");
-    // 模型项被移走后设置页要给一句指路；页签挂掉时反过来提示它们仍在本页
-    const modelHintRow = _modelsTabOk
-      ? `<div class="muted" style="margin:0 0 10px">转写引擎 / 计算设备 / 唤醒 / 声纹 / 说话人分离已移到顶部「模型」页签（按功能选择，带就绪状态与获取入口）。</div>`
-      : `<div class="mcard-warn" style="margin:0 0 10px">「模型」页签加载失败，模型相关设置暂时保留在本页；页签恢复后会自动收起。</div>`;
+    // 模型/引擎项被移走后设置页要给一句指路；能力页签挂掉时反过来提示它们仍在本页
+    const modelHintRow = _capTabOk
+      ? `<div class="muted" style="margin:0 0 10px">转写引擎 / 朗读实现 / 计算设备 / 唤醒 / 声纹 / 说话人分离，
+          以及在线服务的地址与密钥，都已移到顶部「<b>能力</b>」页签（用哪个实现 + 装没装，一处看全）。</div>`
+      : `<div class="mcard-warn" style="margin:0 0 10px">「能力」页签加载失败，模型与在线服务相关设置暂时保留在本页；页签恢复后会自动收起。</div>`;
     form.innerHTML = modelHintRow + [...known, ...extra].map((g) => {
       const items = groups[g];
       const isCollapsed = collapsed.has(g);
@@ -1591,7 +1758,7 @@ function fmtMb(mb) {
   return mb >= 1024 ? (mb / 1024).toFixed(1) + " GB" : mb + " MB";
 }
 
-/* ================= 模型（按功能组织：选择 + 就绪 + 获取） =================
+/* ================= 模型功能卡（能力页签的「其他功能」区） =================
    配置来自 /api/settings（MODEL_KEYS 那批），就绪/获取来自 /api/models
    （app/modelinfo.py，含 ready/target/size/how/cmd），声纹来自 /api/voiceprints，
    已加载引擎来自 /api/stt/status。
@@ -1601,10 +1768,9 @@ let _modelsCache = [];        // /api/models items
 let _modelJobsCache = {};     // /api/models → jobs.items（下载进度/失败原因）
 let _vpCache = null;          // /api/voiceprints
 let _sttCache = null;         // /api/stt/status
-let _modelViewPoll = null;
-// 「模型」页签是否健康：ok 时设置页收起那 9 个模型项，加载失败时回退到设置页显示
-// （否则页签一出错，界面上就再没有入口改回转写引擎/设备了）
-let _modelsTabOk = true;
+// 「能力」页签是否健康：ok 时设置页收起那些"用哪个实现"的项，加载失败时回退到设置页显示
+// （否则页签一出错，界面上就再没有入口改回转写引擎/朗读实现/设备了）
+let _capTabOk = true;
 
 const _ENGINE_MODEL_ID = { sensevoice: "sensevoice", qwen3asr: "qwen3asr", sherpa: "sherpa" };
 
@@ -1693,19 +1859,6 @@ function _loadState(f) {
   return critical ? { kind: "miss", text: "未就绪" } : { kind: "warn", text: "未安装" };
 }
 
-function renderModelOverview(fns) {
-  const host = $("#modelOverview");
-  if (!host) return;
-  let ready = 0, total = 0;
-  host.innerHTML = fns.map((f) => {
-    const s = _loadState(f);
-    if (f.catalogId) { total++; if (s.kind === "ok") ready++; }
-    const dot = { ok: "green", miss: "red", warn: "yellow" }[s.kind] || "idle";
-    return `<span class="ov-item"><span class="dot d-${dot}"></span>${esc(f.name)} <b>${esc(s.text)}</b></span>`;
-  }).join("");
-  const sum = $("#modelOvSummary");
-  if (sum) sum.textContent = `模型就绪 ${ready}/${total}`;
-}
 
 /** 单张功能卡。 */
 function renderModelCard(f) {
@@ -1771,85 +1924,7 @@ function renderModelCard(f) {
   </div>`;
 }
 
-function bindModelCards() {
-  const host = $("#modelCards");
-  if (!host || host.dataset.bound) return;
-  host.dataset.bound = "1";
-  host.addEventListener("change", async (e) => {
-    const el = e.target;
-    let key, val;
-    if (el.dataset.mset) { key = el.dataset.mset; val = el.value; }
-    else if (el.dataset.mbool) { key = el.dataset.mbool; val = el.checked; }
-    else if (el.dataset.mnum) { key = el.dataset.mnum; val = parseFloat(el.value) || 0; }
-    else return;
-    try {
-      await api("/api/settings", { method: "PUT", body: JSON.stringify({ values: { [key]: val } }) });
-      toast("已更新");
-      const r = await api("/api/settings");
-      _settingsCache = r.settings || _settingsCache;
-      loadModels();
-    } catch (err) { toast("更新失败：" + err.message); }
-  });
-  host.addEventListener("click", async (e) => {
-    const rl = e.target.closest("[data-mreload]");
-    if (rl) { loadModels(); return; }
-    const dl = e.target.closest("[data-msdl]");
-    if (dl) {
-      dl.disabled = true;
-      try {
-        const r = await post("/api/models/download", { id: dl.dataset.msdl, force: dl.dataset.force === "1" });
-        toast(r.message || "已开始下载");
-      } catch (err) { toast("下载失败：" + err.message); }
-      loadModels();
-      return;
-    }
-    const cp = e.target.closest("[data-mcopy]");
-    if (cp) {
-      try { await navigator.clipboard.writeText(cp.dataset.mcopy); toast("已复制"); }
-      catch (err) { toast("复制失败，请手动选择"); }
-    }
-  });
-}
 
-async function loadModels() {
-  const host = $("#modelCards");
-  if (!host) return;
-  const wasOk = _modelsTabOk;
-  try {
-    const [setRes, modelsRes, sttRes, vpRes] = await Promise.all([
-      api("/api/settings"),
-      api("/api/models"),
-      api("/api/stt/status").catch(() => null),
-      api("/api/voiceprints").catch(() => null),
-    ]);
-    _settingsCache = setRes.settings || _settingsCache;
-    _modelsCache = modelsRes.items || [];
-    _modelJobsCache = (modelsRes.jobs && modelsRes.jobs.items) || {};
-    _sttCache = sttRes;
-    _vpCache = vpRes;
-    _modelsTabOk = true;
-    const fns = modelFunctions();
-    renderModelOverview(fns);
-    host.innerHTML = fns.map(renderModelCard).join("");
-    bindModelCards();
-    const active = modelsRes.jobs && modelsRes.jobs.active;
-    if (active && !_modelViewPoll) _modelViewPoll = setInterval(loadModels, 1500);
-    else if (!active && _modelViewPoll) { clearInterval(_modelViewPoll); _modelViewPoll = null; }
-    if (!wasOk) loadSettings();        // 页签恢复：设置页里回退显示的那些项可以收起来了
-  } catch (e) {
-    host.innerHTML = `<div class="mcard bad">
-      <div class="mcard-head"><div class="mcard-ic">⚠</div>
-        <div class="mcard-title">模型清单加载失败</div>${modelBadge("不可用", "miss")}</div>
-      <div class="mcard-body">
-        <div class="mcard-warn">${esc(e.message)}</div>
-        <div class="mcard-meta">模型相关设置已暂时回到「设置」页签，先在那儿改也可以；这里恢复后会自动收起。</div>
-        <div class="mcard-act"><button class="btn mini" data-mreload="1">重试</button></div>
-      </div></div>`;
-    bindModelCards();
-    _modelsTabOk = false;
-    if (wasOk) { try { loadSettings(); } catch (_) { /* 忽略 */ } }
-  }
-}
 
 /** 等某个模型下载任务结束（或超时），用于「一键下载缺失」串行排队。 */
 function _waitModelJob(id, timeoutMs) {
@@ -1871,17 +1946,15 @@ function _waitModelJob(id, timeoutMs) {
 async function downloadMissingModels() {
   const missing = _modelsCache.filter((m) => !m.ready && m.downloadable !== false && m.source !== "copy");
   if (!missing.length) { toast("没有需要下载的模型"); return; }
-  toast(`开始下载 ${missing.length} 个模型…`);
+  toast(`开始下载 ${missing.length} 个模型…（可在本页看进度）`);
   for (const m of missing) {
     try { await post("/api/models/download", { id: m.id, force: false }); } catch (e) { /* 继续下一个 */ }
     await _waitModelJob(m.id);
   }
   toast("缺失模型下载完成");
-  loadModels();
+  loadCapabilities();
 }
 
-const _btnDlMissing = $("#btnModelDownloadMissing");
-if (_btnDlMissing) _btnDlMissing.addEventListener("click", () => downloadMissingModels());
 
 function renderSettingRow(s) {
   const id = "set-" + s.key;
@@ -2298,7 +2371,7 @@ if ("serviceWorker" in navigator) {
 initRouterUI();
 /* 折叠条（rail.html）点「模型」时经同源 localStorage 传来的落地页签意图；
    主面板展开会重新加载本页，所以在这里消费一次即清掉。 */
-const _VIEWS = ["dashboard", "settings", "history", "meetings", "boot", "failover", "models", "components"];
+const _VIEWS = ["dashboard", "settings", "history", "meetings", "boot", "failover", "capabilities"];
 let _bootView = "dashboard";
 try {
   const q = new URLSearchParams(location.search).get("view");

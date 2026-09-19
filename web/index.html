@@ -22,8 +22,7 @@
     <button class="tab" data-view="meetings">会议</button>
     <button class="tab" data-view="boot">启动</button>
     <button class="tab" data-view="failover">模型路由</button>
-    <button class="tab" data-view="models">模型</button>
-    <button class="tab" data-view="components">组件</button>
+    <button class="tab" data-view="capabilities">能力</button>
   </nav>
 </header>
 
@@ -104,11 +103,6 @@
         </button>
       </div>
       <div id="settingsForm" class="settings-form"></div>
-    </div>
-    <!-- 能力 provider（P5）：ASR / LLM / TTS 各选一个实现，带出网标注与在线服务预设。
-         自包含卡片：读取失败只影响本卡片，不拖垮设置页。 -->
-    <div class="card">
-      <div id="providersHost"></div>
     </div>
     <!-- 服务运维：重启 ECHO 本身（独立进程执行，面板自动重连） -->
     <div class="card">
@@ -198,23 +192,30 @@
     </div>
   </section>
 
-  <!-- ============ 模型：按「功能」组织（选择 + 就绪 + 获取），与设置页解耦 ============ -->
-  <section id="view-components" class="view hidden">
-    <!-- 组件页（2.0 / P2）：内容由 app.js 的 renderComponentsCard() 渲染 -->
-    <div id="componentsHost"></div>
-  </section>
-  <section id="view-models" class="view hidden">
+  <!-- ============ 能力：合并原「模型」「组件」两个页签 + 设置页的「能力 provider」卡片 ============
+       每个能力只在这一处出现：先「用哪个实现」（本地引擎 / 在线服务 / 关闭），
+       再「装没装、怎么装」（组件就绪 + 下载/复制命令/官方链接 + 出网标注）。
+       2026-09-19 用户指出三处设计重叠（模型页签 / 组件页签 / 设置里的 provider 卡片）
+       都只在讲"这台机器上每个功能由什么实现、装好了没"，故合并成一个一级页签。 -->
+  <section id="view-capabilities" class="view hidden">
     <div class="card">
-      <div class="card-title"><span class="ic">🧠</span>模型
-        <span class="muted" id="modelOvSummary">—</span>
+      <div class="card-title"><span class="ic">🧩</span>能力
+        <span class="muted" id="capOvSummary">—</span>
         <span class="spacer"></span>
-        <button class="btn" id="btnModelDownloadMissing" title="下载所有缺失且可从上游获取的模型">一键下载缺失</button>
+        <button class="btn" id="btnCapDownloadMissing" title="下载所有缺失且可从上游获取的模型">一键下载缺失</button>
+        <button class="btn" id="btnCapReload" title="重新读取能力与组件状态">刷新</button>
       </div>
-      <div class="model-ov" id="modelOverview"></div>
+      <div class="model-ov" id="capOverview"></div>
+      <div class="muted" style="margin-top:6px;font-size:12px">
+        每个能力一处看全：<b>用哪个实现</b>（本地 / 在线 / 关闭）+ <b>装没装、怎么装</b>。
+        下拉与开关都是选中即生效；密钥只存本机、接口永不回显；标「出网」的会把数据发到外部服务。
+      </div>
     </div>
-    <div class="model-cards" id="modelCards"></div>
+    <div class="model-cards" id="capKindCards"></div>
+    <div class="model-cards" id="capFuncCards"></div>
+    <div id="capEnvHost"></div>
     <div class="muted model-foot">
-      路径是代码约定，改了加载器就找不到模型，所以原样展示。「已选但未就绪」会标红并给「去安装/去下载」。
+      路径是代码约定，改了加载器就找不到模型，所以原样展示。「已选但未就绪」会标红并给「去下载」。
     </div>
   </section>
 </main>

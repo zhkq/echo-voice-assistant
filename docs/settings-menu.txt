@@ -1,4 +1,4 @@
-语音命令（voice）  —— 27 项
+语音命令（voice）  —— 26 项
   ▸ 录音与转写（record）  —— 10 项
       转写语言                   sttLanguage                str    = zh
       媒体键触发                  triggerKeys                list   = vol_up
@@ -17,8 +17,7 @@
       命令目标会话（面板同步）           commandTargetSession       str    = 
       用户所在地                  userLocation               str    = 北京
       发送环境上下文                sendEnvContext             bool   = True
-  ▸ 朗读与反馈（speech）  —— 7 项
-      语音合成引擎                 ttsEngine                  str    = auto
+  ▸ 朗读与反馈（speech）  —— 6 项
       语音复述确认                 voiceConfirm               bool   = True
       语音简报                   voiceBrief                 bool   = True
       简报最大字数                 maxBriefChars              int    = 200
@@ -79,4 +78,4 @@
     熔断连续失败次数               routerBreakerThreshold     int    = 2
     熔断冷却秒                  routerBreakerCooldown      int    = 30
 
-可见项合计：61（含智能体表格 1 块 + 能力 provider 卡片 1 块）
+可见项合计：60（含智能体表格 1 块 + 能力 provider 卡片 1 块）
