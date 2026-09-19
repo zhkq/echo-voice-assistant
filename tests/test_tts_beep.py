@@ -82,6 +82,83 @@ class PlayBeepTests(unittest.TestCase):
         self.assertIn("echo_platform.play_wav_async", src, "提示音必须走接缝")
 
 
+class BeepSpeechSerializationTests(unittest.TestCase):
+    """提示音与朗读必须**串起来**（2026-09-19 用户提问："语音复述是不是和停录提示音有冲突"）。
+
+    机制：提示音是**异步**播的（winsound SND_ASYNC / afplay），朗读走另一套音频通路
+    （sounddevice / SAPI / say），两套互不知情 —— 转写只要几百毫秒（和 done 提示音
+    0.29 s 同量级），复述就可能在提示音还没播完时起播，听感是糊的；会议指令路径更直接
+    （`play_beep` 紧接着 `speak_async`，同一瞬间起播）。
+    现在 `play_beep` 记下"预计播完时刻"，`speak()` 起播前 `wait_beep_done()` 避让。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="echo-beepser-")
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.tmp, ignore_errors=True))
+        self._dir = patch.object(tts, "BEEPS_DIR", self.tmp)
+        self._dir.start()
+        self.addCleanup(self._dir.stop)
+        self._log = patch.object(db, "add_log", lambda *a, **k: None)
+        self._log.start()
+        self.addCleanup(self._log.stop)
+        self._reset = patch.object(tts, "_beep_until", 0.0)
+        self._reset.start()
+        self.addCleanup(self._reset.stop)
+        with open(os.path.join(self.tmp, "done.wav"), "wb") as fh:
+            fh.write(b"RIFF....WAVE")
+
+    def test_play_beep_records_when_it_will_finish(self):
+        with patch.object(tts.echo_platform, "play_wav_async", return_value=True), \
+                patch.object(tts, "_beep_seconds", lambda name, default=0.22: 0.29):
+            self.assertTrue(tts.play_beep("done"))
+        self.assertGreater(tts.beep_pending(), 0.0, "播完时刻应被记下")
+        self.assertLess(tts.beep_pending(), 0.30)
+
+    def test_failed_beep_records_nothing(self):
+        with patch.object(tts.echo_platform, "play_wav_async", return_value=False):
+            self.assertFalse(tts.play_beep("done"))
+        self.assertEqual(tts.beep_pending(), 0.0, "没播出去就不该让朗读白等")
+
+    def test_wait_sleeps_only_the_remaining_time(self):
+        slept = []
+        with patch.object(tts.echo_platform, "play_wav_async", return_value=True), \
+                patch.object(tts, "_beep_seconds", lambda name, default=0.22: 0.3):
+            tts.play_beep("done")
+            with patch.object(tts.time, "sleep", lambda s: slept.append(s)):
+                tts.wait_beep_done()
+        self.assertEqual(len(slept), 1)
+        self.assertGreater(slept[0], 0.0)
+        self.assertLess(slept[0], 0.31)
+
+    def test_wait_is_a_noop_without_a_pending_beep(self):
+        slept = []
+        with patch.object(tts.time, "sleep", lambda s: slept.append(s)):
+            tts.wait_beep_done()
+        self.assertEqual(slept, [], "没有提示音在播时必须零成本返回")
+
+    def test_wait_is_capped(self):
+        """时间戳坏掉（等过头）时不能拖住主流程：上限 1 秒。"""
+        slept = []
+        with patch.object(tts, "beep_pending", lambda: 30.0), \
+                patch.object(tts.time, "sleep", lambda s: slept.append(s)):
+            tts.wait_beep_done()
+        self.assertEqual(slept, [1.0])
+
+    def test_speak_waits_for_the_beep_first(self):
+        """朗读入口必须先避让提示音（这是用户问的那条冲突的正面修复）。"""
+        order = []
+        with patch.object(tts, "wait_beep_done", lambda *a, **k: order.append("wait")), \
+                patch.object(tts, "_speak_offline", lambda text: order.append("speak") or True):
+            self.assertTrue(tts.speak("你好", "sapi"))
+        self.assertEqual(order, ["wait", "speak"], "顺序必须是先避让、再出声")
+
+    def test_off_engine_still_does_not_speak(self):
+        with patch.object(tts, "wait_beep_done") as wait, \
+                patch.object(tts, "_speak_offline", lambda text: True):
+            self.assertFalse(tts.speak("你好", "off"))
+        wait.assert_not_called()
+
+
 class BeepFilesTests(unittest.TestCase):
     """五个提示音的物理属性（回归保护：别再把某个文件换成哑的/换掉格式）。"""
 

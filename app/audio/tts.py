@@ -33,6 +33,16 @@ _EDGE_VOICE = "zh-CN-XiaoxiaoNeural"
 _edge_broken = False
 _lock = threading.Lock()
 
+#: 最近一次提示音的**预计结束时刻**（monotonic）。
+#  为什么需要：提示音是**异步**播的（Windows=winsound SND_ASYNC / macOS=afplay），
+#  而朗读走的是另一套音频通路（sounddevice / SAPI / say）—— 两套通路互不知情，
+#  叠在一起就糊（2026-09-19 用户提问："语音复述是不是和停录提示音有冲突"：
+#  停录提示音还没播完，转写已经完成、复述就起播了；会议指令路径更明显 ——
+#  `play_beep` 紧接着 `speak_async`，同一瞬间起播）。
+#  这里记下结束时刻，朗读前统一等一等（见 `wait_beep_done`）。
+_beep_until = 0.0
+_beep_lock = threading.Lock()
+
 
 def play_beep(name):
     """播放 assets/beeps/<name>.wav（start/done/ok/err…）。返回是否**成功播出**。
@@ -56,7 +66,30 @@ def play_beep(name):
         return False
     if not ok:
         _log_beep(name, wav, "播放失败（接缝返回 False）")
+    else:
+        # 记下"这个音什么时候播完"：朗读前据此避让（见 wait_beep_done 的说明）
+        global _beep_until
+        with _beep_lock:
+            _beep_until = max(_beep_until, time.monotonic() + _beep_seconds(name))
     return ok
+
+
+def beep_pending():
+    """还没播完的提示音还剩几秒（没有就返回 0）。给测试与需要精确排队的调用方用。"""
+    with _beep_lock:
+        return max(0.0, _beep_until - time.monotonic())
+
+
+def wait_beep_done(max_wait=1.0):
+    """等异步提示音播完再返回（最长 ``max_wait`` 秒）。
+
+    朗读（`speak`）在合成之前会调它：**提示音与朗读不能同时出声**，否则听感是糊的
+    （两套音频通路在系统混音器里叠着响）。零成本：没有正在播的提示音时立刻返回。
+    上限 1 秒是防呆 —— 提示音最长 0.3 秒，真等过头说明时间戳坏了，不能拖住主流程。
+    """
+    left = min(beep_pending(), max(0.0, float(max_wait)))
+    if left > 0:
+        time.sleep(left)
 
 
 def _log_beep(name, path, why):
@@ -163,6 +196,8 @@ def speak(text, engine="auto", timeout=60):
         return False
     if engine == "off":
         return False
+    # 提示音与朗读串起来：停录提示音/发送提示音还没播完时，先等它（否则两个音叠着响）
+    wait_beep_done()
     offline = _offline_engine_ids()
     if engine in offline or (engine == "auto" and _edge_broken):
         return _speak_offline(text)
