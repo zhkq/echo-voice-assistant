@@ -38,7 +38,20 @@ from typing import Optional, Tuple
 # ------------------------------------------------------------------ 根目录
 
 def echo_root() -> str:
-    """代码所在目录（安装目录）。"""
+    """代码所在目录（安装目录）。
+
+    默认**由 ``__file__`` 推导**——"代码在哪，根就在哪"，这就是全系统内部一律
+    相对根书写的前提：整棵树挪到任何地方都自洽，没有任何一处写死安装路径。
+
+    环境变量 ``ECHO_ROOT`` 可覆盖，用于打包分发（程序目录只读、数据放别处）与
+    多实例/测试。**刻意只做成环境变量，不做面板配置项**：安装根配错的后果是全盘
+    静默跑偏（模型找不到、数据写错地方、门禁测的不是这棵树），
+    ``scripts/startup.ps1`` 里"某棵树悄悄用了另一棵树的 venv"就是这个事故类型。
+    用户该配的是**数据类**目录：``ECHO_DATA`` / ``meetingsDir`` / ``modelsDir``。
+    """
+    override = os.environ.get("ECHO_ROOT")
+    if override:
+        return os.path.abspath(os.path.expanduser(override))
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 

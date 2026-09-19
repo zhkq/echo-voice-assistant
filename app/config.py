@@ -17,14 +17,21 @@
 """
 import os
 
+from app import paths
 import app.db as db
 
 # ---- 路径占位符 -----------------------------------------------------------
 # 配置里存占位符而不是绝对路径，这样同一个默认值在任何机器/任何安装目录都能用，
 # 也不会把个人路径写进仓库。读取时（Settings._load）统一展开。
-#   {ECHO} = ECHO 根目录（仓库根）
-#   {DATA} = ECHO 的 data 目录
-ECHO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+#   {ECHO} = ECHO 根目录（安装根，可被 ECHO_ROOT 覆盖）
+#   {DATA} = ECHO 的数据根（**分平台**，可被 ECHO_DATA 覆盖）
+#
+# 两个占位符都必须**问路径层**，不许在这里各推一遍：
+#   * {ECHO} 自己推 → 设了 ECHO_ROOT 时，配置展开与路径层会指向不同的树（split-brain）；
+#   * {DATA} 写成 join(ECHO_ROOT, "data") → macOS 上会把数据根算进 .app 里，
+#     而 D18 要求 macOS 写 ~/Library/Application Support/ECHO。
+# ECHO_ROOT 这个模块属性保留给老调用方，取值与 paths.echo_root() 一致。
+ECHO_ROOT = paths.echo_root()
 
 
 def expand_path(value):
@@ -33,11 +40,14 @@ def expand_path(value):
     展开后统一走 os.path.normpath：占位符写的是正斜杠（`{ECHO}/data/meetings`），
     直接拼接会得到 `C:\\...\\ECHO-public/data/meetings` 这种混合分隔符——Windows
     能用，但日志里难看，且与用户手填的反斜杠路径比较时还需要额外容错。
+
+    取值是**调用时**问路径层（不是模块常量），所以 ECHO_ROOT / ECHO_DATA 这类
+    环境变量在进程内改了也立刻生效——测试和多实例隔离依赖这一点。
     """
     if not isinstance(value, str) or "{" not in value:
         return value
-    out = (value.replace("{ECHO}", ECHO_ROOT)
-                .replace("{DATA}", os.path.join(ECHO_ROOT, "data")))
+    out = (value.replace("{ECHO}", paths.echo_root())
+                .replace("{DATA}", paths.data_root()))
     return os.path.normpath(out)
 
 # ---- 极简回复要求文案（两个版本都保留：V1 是已落库的旧默认值，用于迁移比对）----
