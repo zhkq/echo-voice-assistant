@@ -154,22 +154,23 @@ DEFAULTS = {
                             description="DSH Desktop 2.x 的 Web 服务地址（GUI 与 API 同端口，默认 43120）", value_type="str"),
     "serverPort":      dict(value=8970, grp="panel", label="ECHO 面板端口",
                             description="控制面板与 API 的监听端口（8890 曾被系统保留段占用，改用 8970）", value_type="int"),
-    "commandWorkspace": dict(value="", grp="command", label="命令会话工作区",
+    # ---------- 语音命令 → 命令与会话（二级子分组，见 grp/sub 的说明）----------
+    "commandWorkspace": dict(value="", grp="voice", sub="command", label="命令会话工作区",
                              description="默认命令会话建在这个目录对应的 DSH 工作区里，"
                                          "从而归入侧栏对应分组（例如你自己的「日常交互」）。"
                                          "留空 = 建在 ECHO 根目录（侧栏显示为未分组）",
                              value_type="str"),
-    "commandIdleRotateHours": dict(value=4, grp="command", label="命令会话空闲轮换小时",
+    "commandIdleRotateHours": dict(value=4, grp="voice", sub="command", label="命令会话空闲轮换小时",
                                    description="默认命令会话空闲超过 N 小时且新指令未要求延续上一话题时，"
                                                "自动轮换新会话（0=关闭；会话不在默认工作区时会强制轮换一次）",
                                    value_type="float"),
-    "commandTargetWorkspace": dict(value="", grp="command", label="命令目标工作区（面板同步）",
+    "commandTargetWorkspace": dict(value="", grp="voice", sub="command", label="命令目标工作区（面板同步）",
                                    description="面板仪表盘「命令目标」下拉里选中的工作区。选中后，"
                                                "语音命令（媒体键/热键/唤醒/麦克风按钮）与打字命令都发到这里，"
                                                "不再使用上面那个会轮换的默认命令会话。"
                                                "由面板下拉自动写入，一般不用手改；留空 = 回到默认会话",
                                    value_type="str"),
-    "commandTargetSession": dict(value="", grp="command", label="命令目标会话（面板同步）",
+    "commandTargetSession": dict(value="", grp="voice", sub="command", label="命令目标会话（面板同步）",
                                  description="面板选中的具体对话：填了就直接发给它（不轮换、也不自动挑最近会话）。"
                                              "会话被归档/删除后自动回退到「该工作区自动」。"
                                              "由面板下拉自动写入，一般不用手改",
@@ -188,10 +189,10 @@ DEFAULTS = {
                                         "留空 = {ECHO}/models。支持 {ECHO}/{DATA} 占位符与 ~。"
                                         "改后需重新下载模型，或自行把原目录拷过去",
                             value_type="str"),
-    "userLocation":    dict(value="北京", grp="command", label="用户所在地",
+    "userLocation":    dict(value="北京", grp="voice", sub="command", label="用户所在地",
                             description="发给 DSH 命令时附带的地理位置（天气/时间等问答需要）",
                             value_type="str"),
-    "sendEnvContext":  dict(value=True, grp="command", label="发送环境上下文",
+    "sendEnvContext":  dict(value=True, grp="voice", sub="command", label="发送环境上下文",
                             description="命令前附加当前时间与所在地，让 DSH 对'今天/明天/本地'有概念",
                             value_type="bool"),
     # device / sttModel / wakeEngine / meetingSttModel / meetingDiarize / voiceprint*
@@ -204,17 +205,18 @@ DEFAULTS = {
                             description="sensevoice 最快（中文短命令），qwen3asr 更准（需下载模型），sherpa 流式，whisper 模型按名",
                             value_type="str",
                             options=["sensevoice", "qwen3asr", "sherpa", "tiny", "base", "small", "medium", "large"]),
-    "sttLanguage":     dict(value="zh", grp="voice", label="转写语言",
+    # ---------- 语音命令 → 录音与转写（二级子分组）----------
+    "sttLanguage":     dict(value="zh", grp="voice", sub="record", label="转写语言",
                             description="命令与会议共用的转写语言：zh/en/ja/ko/yue，或 auto 自动识别。"
                                         "填全名（如 Chinese）会自动纠正；非法值回退 zh（Whisper 只认 ISO 码，"
                                         "填错会让转写结果变空）",
                             value_type="str", options=["zh", "en", "ja", "ko", "yue", "auto"]),
-    "triggerKeys":     dict(value=["vol_up"], grp="voice", label="媒体键触发",
+    "triggerKeys":     dict(value=["vol_up"], grp="voice", sub="record", label="媒体键触发",
                             description="耳机/键盘媒体键作为说话快捷键（vol_up/play_pause/next/prev）",
                             value_type="list", options=["vol_up", "vol_down", "play_pause", "next", "prev"]),
-    "wakeHotkey":      dict(value="Ctrl+Alt+C", grp="voice", label="唤醒热键",
+    "wakeHotkey":      dict(value="Ctrl+Alt+C", grp="voice", sub="record", label="唤醒热键",
                             description="全局热键开始录音说话", value_type="str"),
-    "fallbackHotkey":  dict(value="Ctrl+Alt+V", grp="voice", label="回退热键",
+    "fallbackHotkey":  dict(value="Ctrl+Alt+V", grp="voice", sub="record", label="回退热键",
                             description="媒体键失效时使用的备用热键", value_type="str"),
     # 面板热键由 ECHO 服务自己 RegisterHotKey 注册（纯 ctypes），**不依赖 DSH 插件**：
     # 2026-09-12 实测 DSH Desktop 2.0.9 里插件（ESM 动态 import）取不到 electron 的
@@ -232,52 +234,53 @@ DEFAULTS = {
     "panelStartCollapsed": dict(value=True, grp="panel", label="自动显示时收起为折叠条",
                                 description="True=启动后显示 64px 折叠条（点箭头/热键展开）；False=直接展开面板",
                                 value_type="bool"),
-    "silenceThreshold": dict(value=0.012, grp="voice", label="静音阈值",
+    "silenceThreshold": dict(value=0.012, grp="voice", sub="record", label="静音阈值",
                              description="音量低于此值视为静音（0~1）", value_type="float"),
-    "silenceHangoverMs": dict(value=1100, grp="voice", label="静音收尾毫秒",
+    "silenceHangoverMs": dict(value=1100, grp="voice", sub="record", label="静音收尾毫秒",
                               description="静音持续多久自动停录", value_type="int"),
-    "noSpeechAbortMs": dict(value=4000, grp="voice", label="无语音放弃毫秒",
+    "noSpeechAbortMs": dict(value=4000, grp="voice", sub="record", label="无语音放弃毫秒",
                             description="开口后多长时间没声音就放弃", value_type="int"),
-    "maxRecordMs":     dict(value=30000, grp="voice", label="最长录音毫秒",
+    "maxRecordMs":     dict(value=30000, grp="voice", sub="record", label="最长录音毫秒",
                             description="单次命令录音上限", value_type="int"),
-    "inputDeviceId":   dict(value=-1, grp="voice", label="输入设备 ID",
+    "inputDeviceId":   dict(value=-1, grp="voice", sub="record", label="输入设备 ID",
                             description="-1=系统默认麦克风", value_type="int"),
-    "consumeMediaKey": dict(value=True, grp="voice", label="拦截媒体键",
+    "consumeMediaKey": dict(value=True, grp="voice", sub="record", label="拦截媒体键",
                             description="触发后不向系统透传媒体键", value_type="bool"),
-    "beepOnStart":     dict(value=True, grp="beep", label="开始提示音", description="开始录音时播放提示音",
+    # ---------- 语音命令 → 提示音与通知（二级子分组）----------
+    "beepOnStart":     dict(value=True, grp="voice", sub="beep", label="开始提示音", description="开始录音时播放提示音",
                             value_type="bool"),
-    "beepOnDone":      dict(value=True, grp="beep", label="停录提示音", description="停止录音时播放提示音",
+    "beepOnDone":      dict(value=True, grp="voice", sub="beep", label="停录提示音", description="停止录音时播放提示音",
                             value_type="bool"),
-    "beepOnSend":      dict(value=True, grp="beep", label="发送提示音", description="命令发送成功提示音",
+    "beepOnSend":      dict(value=True, grp="voice", sub="beep", label="发送提示音", description="命令发送成功提示音",
                             value_type="bool"),
-    "notifyOnSend":    dict(value=True, grp="beep", label="桌面通知",
+    "notifyOnSend":    dict(value=True, grp="voice", sub="beep", label="桌面通知",
                             description="发送成功后弹系统通知", value_type="bool"),
-    # ---------- 朗读与反馈（语音合成 + 播报哪些内容）----------
+    # ---------- 语音命令 → 朗读与反馈（语音合成 + 播报哪些内容）----------
     # ttsEngine 是朗读"用哪个实现"的**唯一**开关：auto / edge-tts（微软在线）/ 本平台离线引擎 / off。
     # 历史上有第二个开关 providerTts（能力 provider 卡片上的 TTS 下拉），两者重复且会互相打架
     # （配了 providerTts 时 ttsEngine=off 关不掉朗读）→ 2026-09-19 弃用 providerTts。
-    "ttsEngine":       dict(value="auto", grp="speech", label="语音合成引擎",
+    "ttsEngine":       dict(value="auto", grp="voice", sub="speech", label="语音合成引擎",
                             description="朗读与提示语用哪个实现，四选一："
                                         "auto=优先 edge-tts（★微软在线，文本会发往 speech.platform.bing.com），"
                                         "不可用时降级本机离线合成；edge-tts=只走在线；"
                                         "离线引擎（Windows SAPI / macOS say）=全离线、音色略差；off=关闭朗读",
                             value_type="str", options=["auto", "edge-tts", "sapi", "off"]),
-    "voiceConfirm":    dict(value=True, grp="speech", label="语音复述确认",
+    "voiceConfirm":    dict(value=True, grp="voice", sub="speech", label="语音复述确认",
                             description="发送前朗读一遍识别到的命令", value_type="bool"),
-    "voiceBrief":      dict(value=True, grp="speech", label="语音简报",
+    "voiceBrief":      dict(value=True, grp="voice", sub="speech", label="语音简报",
                             description="任务完成后朗读精简结果", value_type="bool"),
-    "maxBriefChars":   dict(value=200, grp="speech", label="简报最大字数",
+    "maxBriefChars":   dict(value=200, grp="voice", sub="speech", label="简报最大字数",
                             description="语音简报文本长度上限", value_type="int"),
     # ---------- 极简回复（2026-09-12 用户要求）----------
     # 命令末尾附一段"先给极简结论、再换行给详情"的要求：
     # 语音只朗读结论那一段（assistant.conclusion_only），详情留在回复/会话里给人看。
-    "minimalReply":    dict(value=True, grp="speech", label="要求极简回复",
+    "minimalReply":    dict(value=True, grp="voice", sub="speech", label="要求极简回复",
                             description="在命令末尾附一句要求：先给极简结论，再换行写详情（语音只读结论）",
                             value_type="bool"),
-    "minimalReplyChars": dict(value=60, grp="speech", label="极简回复字数上限",
+    "minimalReplyChars": dict(value=60, grp="voice", sub="speech", label="极简回复字数上限",
                               description="写进要求的长度约束（口语一句话约 30~60 字）", value_type="int"),
     "minimalReplyHint": dict(value=_MINIMAL_REPLY_HINT_V2,
-                             grp="speech", label="极简回复要求文案",
+                             grp="voice", sub="speech", label="极简回复要求文案",
                              description="拼在命令末尾；{chars} 会替换成上面的字数上限",
                              value_type="str"),
     # ---------- 唤醒词 ----------
@@ -491,6 +494,13 @@ DEFAULTS = {
 # 键隔开）。这里把声明顺序作为 `order` 字段随行发给面板，由面板排序 —— 库层保持简单。
 SETTING_ORDER = {key: index for index, key in enumerate(DEFAULTS)}
 
+#: 二级子分组（`sub`）：**只用于展示**，与 grp 是"包含"关系而不是并列关系。
+# 为什么需要：语音命令是个大功能，它的四件事（怎么录、发到哪、播报什么、提示音）
+# 各成一组才看得清；但它们不该和「语音命令」平级（2026-09-19 用户反馈："语音命令和
+# beep/command/speech 应该是包含不是并列"）。子分组名与顺序在面板侧
+# （web/app.js 的 SET_SUB_ORDER / SET_SUB_NAMES），这里只声明归属。
+SUBS = ("record", "command", "speech", "beep")
+
 # 默认值迁移：早期版本把某个默认值当作"用户已设置"写进了库（seed_defaults 不覆盖已有
 # value），此后改 DEFAULTS 就不生效了。这里登记"旧默认值 → 采用新默认值"：
 # 只有当前值仍等于旧默认值时才改写，用户手动改过的一律不动。
@@ -632,6 +642,8 @@ class Settings:
                 continue
             r = dict(r)
             r["order"] = SETTING_ORDER.get(r["key"], len(DEFAULTS))
+            # 二级子分组（可选）：同一个 grp 内的再分节，面板渲染成可折叠的小节
+            r["sub"] = meta.get("sub", "")
             if meta.get("secret"):
                 r["hasValue"] = bool(str(r.get("value") or "").strip())
                 r["value"] = ""

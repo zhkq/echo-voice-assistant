@@ -338,6 +338,29 @@ main { max-width: 1200px; margin: 12px auto; padding: 0 14px; }
 .set-group.collapsed .set-group-body { display: none; }
 .set-group:not(.collapsed) .set-group-body { animation: setFade .15s ease-out; }
 @keyframes setFade { from { opacity: .35; } to { opacity: 1; } }
+
+/* ---------- 设置表单：二级小节（包含在一级分组里，不是并列分组）---------- */
+/* 例：「语音命令」下的 录音与转写 / 命令与会话 / 朗读与反馈 / 提示音与通知。
+   视觉上比一级分组轻一档（弱色标题、左侧竖线缩进），一眼能看出从属关系。 */
+.set-subgroup { margin: 2px 0 6px; border-left: 2px solid var(--border); }
+.set-sub-title {
+  color: var(--muted); font-weight: 600; font-size: 13px;
+  padding: 6px 8px 6px 10px; cursor: pointer; user-select: none;
+  display: flex; align-items: center; gap: 8px;
+}
+.set-sub-title:hover { color: var(--fg); }
+.set-sub-title .set-arrow {
+  font-size: 9px; width: 10px; flex-shrink: 0;
+  transition: transform .15s; transform: rotate(90deg);
+}
+.set-subgroup.collapsed .set-sub-title .set-arrow { transform: rotate(0deg); }
+.set-sub-title .set-count {
+  margin-left: auto; font-size: 11px; font-weight: 400; color: var(--muted);
+  background: var(--card); border: 1px solid var(--border);
+  border-radius: 9px; padding: 1px 7px;
+}
+.set-sub-body { padding: 0 10px 4px; }
+.set-subgroup.collapsed .set-sub-body { display: none; }
 .set-row { display: flex; align-items: center; gap: 12px; padding: 8px 4px; }
 .set-row + .set-row { border-top: 1px dashed var(--border); }
 .set-row label { width: 180px; flex-shrink: 0; font-size: 13px; }

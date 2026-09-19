@@ -29,16 +29,20 @@ sys.path.insert(0, ROOT)
 
 
 def _panel_group_tables():
-    """从 web/app.js 抓面板的分组表与 MODEL_KEYS（正则抓取，不执行 JS）。"""
+    """从 web/app.js 抓面板的分组表 / 二级小节表 / MODEL_KEYS（正则抓取，不执行 JS）。"""
     with open(os.path.join(ROOT, "web", "app.js"), encoding="utf-8") as fh:
         js = fh.read()
     order = re.search(r"const SET_GROUP_ORDER = \[(.*?)\];", js, re.S)
     names = re.search(r"const SET_GROUP_NAMES = \{(.*?)\};", js, re.S)
+    sub_order = re.search(r"const SET_SUB_ORDER = \[(.*?)\];", js, re.S)
+    sub_names = re.search(r"const SET_SUB_NAMES = \{(.*?)\};", js, re.S)
     model_keys = re.search(r"const MODEL_KEYS = new Set\(\[(.*?)\]\);", js, re.S)
-    if not (order and names and model_keys):
+    if not (order and names and sub_order and sub_names and model_keys):
         raise SystemExit("web/app.js 里的分组表被改得认不出来了")
     return (re.findall(r'"([a-z]+)"', order.group(1)),
             dict(re.findall(r'([a-z]+):\s*"([^"]+)"', names.group(1))),
+            re.findall(r'"([a-z]+)"', sub_order.group(1)),
+            dict(re.findall(r'([a-z]+):\s*"([^"]+)"', sub_names.group(1))),
             set(re.findall(r'"(\w+)"', model_keys.group(1))))
 
 
@@ -62,21 +66,38 @@ def rows(models_tab_ok=True):
         db.DATA_DIR, db.DB_FILE = old
         shutil.rmtree(tmp, ignore_errors=True)
 
-    _order, _names, model_keys = _panel_group_tables()
+    *_tables, model_keys = _panel_group_tables()
     out = [s for s in data if not (models_tab_ok and s["key"] in model_keys)]
     # 与 web/app.js 的 loadSettings() 完全一致：先按 order，再按 key
     out.sort(key=lambda s: (s.get("order", 10 ** 6), s["key"]))
     return out
 
 
+def _item_line(s, indent="    "):
+    flags = []
+    if s.get("secret"):
+        flags.append("密钥")
+    if s.get("hasValue"):
+        flags.append("已配置")
+    vt = s.get("value_type", "?")
+    value = s.get("value")
+    if s.get("secret"):
+        value = "******" if s.get("hasValue") else "(空)"
+    elif isinstance(value, list):
+        value = ",".join(str(v) for v in value) or "(空)"
+    elif isinstance(value, str) and len(value) > 28:
+        value = value[:28] + "…"
+    return ("%s%-22s %-26s %-6s = %s%s"
+            % (indent, s.get("label", ""), s["key"], vt, value,
+               ("  [" + ",".join(flags) + "]") if flags else ""))
+
+
 def render(models_tab_ok=True):
-    order, names, _model_keys = _panel_group_tables()
+    order, names, sub_order, sub_names, _model_keys = _panel_group_tables()
     data = rows(models_tab_ok)
     groups = {}
     for s in data:
         groups.setdefault(s["grp"], []).append(s)
-    if models_tab_ok and "model" not in groups:
-        pass
     lines = []
     known = [g for g in order if g in groups]
     extra = [g for g in groups if g not in order]
@@ -85,25 +106,19 @@ def render(models_tab_ok=True):
         title = names.get(grp)
         head = "%s（%s）" % (title, grp) if title else "%s（未命名分组！）" % grp
         lines.append("%s  —— %d 项" % (head, len(items)))
-        for s in items:
-            flags = []
-            if s.get("secret"):
-                flags.append("密钥")
-            if s.get("hasValue"):
-                flags.append("已配置")
-            vt = s.get("value_type", "?")
-            value = s.get("value")
-            if s.get("secret"):
-                value = "******" if s.get("hasValue") else "(空)"
-            elif isinstance(value, list):
-                value = ",".join(str(v) for v in value) or "(空)"
-            elif isinstance(value, str) and len(value) > 28:
-                value = value[:28] + "…"
-            lines.append("    %-22s %-26s %-6s = %s%s"
-                         % (s.get("label", ""), s["key"], vt, value,
-                            ("  [" + ",".join(flags) + "]") if flags else ""))
+        # 二级小节：与 renderGroupBody() 同一套规则（有 sub 的按小节，其余平铺）
+        subbed = [s for s in items if s.get("sub")]
+        by_sub = {}
+        for s in subbed:
+            by_sub.setdefault(s["sub"], []).append(s)
+        for k in [k for k in sub_order if k in by_sub] + \
+                [k for k in by_sub if k not in sub_order]:
+            lines.append("  ▸ %s（%s）  —— %d 项"
+                         % (sub_names.get(k, "未命名小节！"), k, len(by_sub[k])))
+            lines += [_item_line(s, indent="      ") for s in by_sub[k]]
+        lines += [_item_line(s) for s in items if not s.get("sub")]
         lines.append("")
-    lines.append("可见项合计：%d（含智能体表格 1 块）" % len(data))
+    lines.append("可见项合计：%d（含智能体表格 1 块 + 能力 provider 卡片 1 块）" % len(data))
     return "\n".join(lines)
 
 

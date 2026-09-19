@@ -1,14 +1,35 @@
-语音命令（voice）  —— 10 项
-    转写语言                   sttLanguage                str    = zh
-    媒体键触发                  triggerKeys                list   = vol_up
-    唤醒热键                   wakeHotkey                 str    = Ctrl+Alt+C
-    回退热键                   fallbackHotkey             str    = Ctrl+Alt+V
-    静音阈值                   silenceThreshold           float  = 0.012
-    静音收尾毫秒                 silenceHangoverMs          int    = 1100
-    无语音放弃毫秒                noSpeechAbortMs            int    = 4000
-    最长录音毫秒                 maxRecordMs                int    = 30000
-    输入设备 ID                inputDeviceId              int    = -1
-    拦截媒体键                  consumeMediaKey            bool   = True
+语音命令（voice）  —— 27 项
+  ▸ 录音与转写（record）  —— 10 项
+      转写语言                   sttLanguage                str    = zh
+      媒体键触发                  triggerKeys                list   = vol_up
+      唤醒热键                   wakeHotkey                 str    = Ctrl+Alt+C
+      回退热键                   fallbackHotkey             str    = Ctrl+Alt+V
+      静音阈值                   silenceThreshold           float  = 0.012
+      静音收尾毫秒                 silenceHangoverMs          int    = 1100
+      无语音放弃毫秒                noSpeechAbortMs            int    = 4000
+      最长录音毫秒                 maxRecordMs                int    = 30000
+      输入设备 ID                inputDeviceId              int    = -1
+      拦截媒体键                  consumeMediaKey            bool   = True
+  ▸ 命令与会话（command）  —— 6 项
+      命令会话工作区                commandWorkspace           str    = 
+      命令会话空闲轮换小时             commandIdleRotateHours     float  = 4
+      命令目标工作区（面板同步）          commandTargetWorkspace     str    = 
+      命令目标会话（面板同步）           commandTargetSession       str    = 
+      用户所在地                  userLocation               str    = 北京
+      发送环境上下文                sendEnvContext             bool   = True
+  ▸ 朗读与反馈（speech）  —— 7 项
+      语音合成引擎                 ttsEngine                  str    = auto
+      语音复述确认                 voiceConfirm               bool   = True
+      语音简报                   voiceBrief                 bool   = True
+      简报最大字数                 maxBriefChars              int    = 200
+      要求极简回复                 minimalReply               bool   = True
+      极简回复字数上限               minimalReplyChars          int    = 60
+      极简回复要求文案               minimalReplyHint           str    = 【回复要求】最终回复先给我一个极简结论：{chars} …
+  ▸ 提示音与通知（beep）  —— 4 项
+      开始提示音                  beepOnStart                bool   = True
+      停录提示音                  beepOnDone                 bool   = True
+      发送提示音                  beepOnSend                 bool   = True
+      桌面通知                   notifyOnSend               bool   = True
 
 唤醒词（wake）  —— 9 项
     启用语音唤醒                 wakeEnabled                bool   = False
@@ -20,21 +41,6 @@
     确认帧数                   wakeConfirmX               int    = 2
     确认窗口                   wakeConfirmN               int    = 3
     静音门控                   wakeSilenceFloor           int    = 60
-
-提示音与通知（beep）  —— 4 项
-    开始提示音                  beepOnStart                bool   = True
-    停录提示音                  beepOnDone                 bool   = True
-    发送提示音                  beepOnSend                 bool   = True
-    桌面通知                   notifyOnSend               bool   = True
-
-朗读与反馈（speech）  —— 7 项
-    语音合成引擎                 ttsEngine                  str    = auto
-    语音复述确认                 voiceConfirm               bool   = True
-    语音简报                   voiceBrief                 bool   = True
-    简报最大字数                 maxBriefChars              int    = 200
-    要求极简回复                 minimalReply               bool   = True
-    极简回复字数上限               minimalReplyChars          int    = 60
-    极简回复要求文案               minimalReplyHint           str    = 【回复要求】最终回复先给我一个极简结论：{chars} …
 
 会议（meeting）  —— 4 项
     分段分钟                   meetingSegmentMinutes      int    = 10
@@ -49,14 +55,6 @@
     归档提示词模板                worklogPrompt              str    = 【纪要归档任务】
 笔记库根目录：{vault}
 会议标题…
-
-命令与会话（command）  —— 6 项
-    命令会话工作区                commandWorkspace           str    = 
-    命令会话空闲轮换小时             commandIdleRotateHours     float  = 4
-    命令目标工作区（面板同步）          commandTargetWorkspace     str    = 
-    命令目标会话（面板同步）           commandTargetSession       str    = 
-    用户所在地                  userLocation               str    = 北京
-    发送环境上下文                sendEnvContext             bool   = True
 
 面板与服务（panel）  —— 8 项
     DSH 服务地址               dshBaseUrl                 str    = http://127.0.0.1:43120
@@ -81,4 +79,4 @@
     熔断连续失败次数               routerBreakerThreshold     int    = 2
     熔断冷却秒                  routerBreakerCooldown      int    = 30
 
-可见项合计：61（含智能体表格 1 块）
+可见项合计：61（含智能体表格 1 块 + 能力 provider 卡片 1 块）

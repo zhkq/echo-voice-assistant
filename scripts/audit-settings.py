@@ -160,8 +160,11 @@ def _keys_from_config():
                         src, re.M | re.S)
         body = blk.group(1) if blk else ""
         grp = re.search(r'grp="([a-z]+)"', body)
+        sub = re.search(r'sub="([a-z]+)"', body)
         flags[key] = {
             "grp": grp.group(1) if grp else "?",
+            # 二级小节：包含在 grp 里的再分节（见 config.SUBS + web/app.js 的 SET_SUB_NAMES）
+            "sub": sub.group(1) if sub else "",
             "deprecated": "deprecated=True" in body,
             "hidden": "hidden=True" in body,
             "secret": "secret=True" in body,
@@ -278,16 +281,16 @@ def main(argv):
           "* `DEAD` = 谁都不碰；`DEPRECATED` = 已弃用（不再展示、写入被拒收）。", "",
           "`--check` 在出现 DEAD / PANEL-ONLY / **未确认**的间接读与面板消费时返回 1；",
           "`tests/test_settings_wiring.py` 会跑这个检查，并额外验「每项都能读回」。", "",
-          "| 键 | 分组 | 标记 | 判定 | 读它的地方（app/ 内） | 面板读 | 写它的地方 |",
-          "|---|---|---|---|---|---|---|"]
+          "| 键 | 分组 | 二级小节 | 标记 | 判定 | 读它的地方（app/ 内） | 面板读 | 写它的地方 |",
+          "|---|---|---|---|---|---|---|---|"]
     for key, f, h, v in rows:
         tag = ",".join([t for t, on in (("deprecated", f["deprecated"]), ("hidden", f["hidden"]),
                                         ("secret", f["secret"])) if on]) or "-"
         reads = "<br>".join(h["read"][:4]) or "-"
         panel_reads = "<br>".join(h.get("panel_read", [])[:3]) or "-"
         writes = "<br>".join(h["write"][:3]) or "-"
-        md.append("| `%s` | %s | %s | **%s** | %s | %s | %s |"
-                  % (key, f["grp"], tag, v, reads, panel_reads, writes))
+        md.append("| `%s` | %s | %s | %s | **%s** | %s | %s | %s |"
+                  % (key, f["grp"], f.get("sub") or "-", tag, v, reads, panel_reads, writes))
     out = os.path.join(ROOT, "docs", "settings-audit.md")
     with open(out, "w", encoding="utf-8") as fh:
         fh.write("\n".join(md) + "\n")

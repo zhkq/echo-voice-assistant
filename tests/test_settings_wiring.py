@@ -98,36 +98,94 @@ class SettingsAuditTests(unittest.TestCase):
 # ---------------------------------------------------------------- 2. 分组
 
 class GroupingTests(unittest.TestCase):
-    """分组合法性：面板按 grp 分组渲染，grp 写错 = 设置项从界面上消失。"""
+    """分组合法性：面板按 grp 分组渲染，grp 写错 = 设置项从界面上消失。
+
+    另有二级小节（`sub`）：它是**包含在**一级分组里的再分节，不是并列分组
+    （用户 2026-09-19：「语音命令和 beep/command/speech 应该是包含不是并列」）。
+    """
 
     @classmethod
     def setUpClass(cls):
         cls.js = _read(os.path.join("web", "app.js"))
         order = re.search(r"const SET_GROUP_ORDER = \[(.*?)\];", cls.js, re.S)
         names = re.search(r"const SET_GROUP_NAMES = \{(.*?)\};", cls.js, re.S)
-        assert order and names, "web/app.js 里的分组表被改得认不出来了"
+        sub_order = re.search(r"const SET_SUB_ORDER = \[(.*?)\];", cls.js, re.S)
+        sub_names = re.search(r"const SET_SUB_NAMES = \{(.*?)\};", cls.js, re.S)
+        assert order and names and sub_order and sub_names, \
+            "web/app.js 里的分组表被改得认不出来了"
         cls.order = re.findall(r'"([a-z]+)"', order.group(1))
         cls.names = dict(re.findall(r'([a-z]+):\s*"([^"]+)"', names.group(1)))
+        cls.sub_order = re.findall(r'"([a-z]+)"', sub_order.group(1))
+        cls.sub_names = dict(re.findall(r'([a-z]+):\s*"([^"]+)"', sub_names.group(1)))
         mk = re.search(r"const MODEL_KEYS = new Set\(\[(.*?)\]\);", cls.js, re.S)
         assert mk, "web/app.js 里的 MODEL_KEYS 被改得认不出来了"
         cls.model_keys = set(re.findall(r'"(\w+)"', mk.group(1)))
 
+    def _visible(self):
+        return {k: m for k, m in DEFAULTS.items()
+                if not m.get("deprecated") and not m.get("hidden")}
+
     def test_every_group_has_a_title_and_a_place_in_the_order(self):
         """可见项的 grp 必须在面板分组表里（hidden 项归卡片/智能体表格，不参与分组渲染）。"""
-        for key, meta in DEFAULTS.items():
-            if meta.get("deprecated") or meta.get("hidden"):
-                continue
+        for key, meta in self._visible().items():
             with self.subTest(key=key):
                 self.assertIn(meta["grp"], self.order,
                               "%s 的分组不在 SET_GROUP_ORDER 里" % key)
                 self.assertIn(meta["grp"], self.names,
                               "%s 的分组没有中文标题" % key)
 
+    def test_group_and_sub_titles_are_chinese(self):
+        """标题一律中文（用户要求「别用英文」）—— 界面上不该出现 grp/sub 的英文键名。"""
+        cjk = re.compile(r"[\u4e00-\u9fff]")
+        for key, title in self.names.items():
+            with self.subTest(kind="group", key=key):
+                self.assertTrue(cjk.search(title), "分组标题不是中文：%s=%r" % (key, title))
+        for key, title in self.sub_names.items():
+            with self.subTest(kind="sub", key=key):
+                self.assertTrue(cjk.search(title), "小节标题不是中文：%s=%r" % (key, title))
+
+    def test_sub_sections_are_contained_not_parallel(self):
+        """二级小节必须「包含在」某个分组里：不许有与分组同名的小节。"""
+        grps = {m["grp"] for m in self._visible().values()}
+        self.assertFalse(grps & set(self.sub_order),
+                         "小节名 %s 同时被当成了一级分组（用户要求包含关系，不是并列）"
+                         % sorted(grps & set(self.sub_order)))
+        owners = {}
+        for key, meta in self._visible().items():
+            sub = meta.get("sub")
+            if not sub:
+                continue
+            owners.setdefault(sub, set()).add(meta["grp"])
+        for sub, grp_set in owners.items():
+            with self.subTest(sub=sub):
+                self.assertEqual(len(grp_set), 1,
+                                 "小节 %s 出现在多个分组里：%s" % (sub, sorted(grp_set)))
+
+    def test_every_sub_section_is_declared_named_and_used(self):
+        declared = set(self.sub_order)
+        used = set()
+        for key, meta in self._visible().items():
+            sub = meta.get("sub")
+            if not sub:
+                continue
+            used.add(sub)
+            with self.subTest(key=key):
+                self.assertIn(sub, declared,
+                              "%s 的小节 %r 没在 SET_SUB_ORDER 里（面板会排到末尾）" % (key, sub))
+                self.assertIn(sub, self.sub_names, "%s 的小节没有中文标题" % key)
+        self.assertEqual(declared - used, set(),
+                         "声明了却没有任何设置项的小节（会留下空标题）：%s"
+                         % sorted(declared - used))
+
+    def test_api_rows_carry_the_sub_section(self):
+        """面板靠 `sub` 字段决定分节 —— 它必须随 /api/settings 下发（并由面板渲染）。"""
+        self.assertIn('s.sub', self.js, "面板要按 sub 分节")
+        self.assertIn("renderGroupBody", self.js)
+        self.assertIn("toggleSetSub", self.js, "二级小节要能各自折叠")
+
     def test_no_visible_setting_lands_in_the_agent_group(self):
         """「智能体」组的整块内容由智能体表格渲染 —— 普通项进去就再也看不见了。"""
-        for key, meta in DEFAULTS.items():
-            if meta.get("deprecated") or meta.get("hidden"):
-                continue
+        for key, meta in self._visible().items():
             self.assertNotEqual(meta["grp"], "agent",
                                 "%s 会被智能体表格吞掉（该组只放 hidden 的智能体键）" % key)
 

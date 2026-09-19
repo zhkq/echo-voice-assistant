@@ -866,16 +866,23 @@ $("#gotoMeetings").addEventListener("click", (e) => { e.preventDefault(); switch
 /* ================= 设置 ================= */
 let _settingsCache = [];
 
-/* 分组展示顺序 = 业务相关性（与后端 grp 取值解耦，后端不因展示顺序而改动）：
-   智能体(决定谁干活) → 语音命令(主用法) → 唤醒词 → 提示音与通知 → 朗读与反馈
-   → 会议 → 纪要归档 → 命令与会话(进阶) → 面板与服务 → 存储路径 → 模型路由。
+/* 一级分组（后端 grp）展示顺序 = 业务相关性：
+   智能体(决定谁干活) → 语音命令(主用法，内含 4 个二级小节) → 唤醒词 → 会议 → 纪要归档
+   → 面板与服务 → 存储路径 → 模型路由。
    `model` 只在「模型」页签加载失败时出现（那 9 项回退到设置页）。 */
-const SET_GROUP_ORDER = ["agent", "model", "voice", "wake", "beep", "speech", "meeting",
-  "worklog", "command", "panel", "paths", "router", "dsh"];
+const SET_GROUP_ORDER = ["agent", "model", "voice", "wake", "meeting",
+  "worklog", "panel", "paths", "router", "dsh"];
 const SET_GROUP_NAMES = { agent: "智能体", model: "模型与引擎", voice: "语音命令",
-  wake: "唤醒词", beep: "提示音与通知", speech: "朗读与反馈", meeting: "会议",
-  worklog: "纪要归档", command: "命令与会话", panel: "面板与服务", paths: "存储路径",
-  router: "模型路由", dsh: "DSH 服务" };
+  wake: "唤醒词", meeting: "会议", worklog: "纪要归档",
+  panel: "面板与服务", paths: "存储路径", router: "模型路由", dsh: "DSH 服务" };
+
+/* 二级小节（后端 sub）：**包含在**所属分组里，不是与它并列的分组。
+   用户 2026-09-19 反馈："语音命令和 beep / command / speech 应该是包含不是并列" ——
+   所以「语音命令」下按"怎么录 → 发到哪 → 播报什么 → 提示音"分四节，
+   小节名与顺序都在这里，后端只声明归属（config.py 的 sub）。 */
+const SET_SUB_ORDER = ["record", "command", "speech", "beep"];
+const SET_SUB_NAMES = { record: "录音与转写", command: "命令与会话",
+  speech: "朗读与反馈", beep: "提示音与通知" };
 
 /* 模型相关配置项：从「设置」页移出，统一由「模型」页签承载（前端过滤，后端 grp 不动）。
    见下方「模型」视图：按功能展示 选择 + 就绪 + 获取。 */
@@ -884,8 +891,10 @@ const MODEL_KEYS = new Set([
   "wakeEngine", "meetingDiarize",
   "voiceprintEnabled", "voiceprintAutoEnroll", "voiceprintThreshold", "voiceprintMargin",
 ]);
-/* 默认展开；用户折叠过的分组记在 localStorage，刷新/重开面板后保持 */
+/* 默认展开；用户折叠过的分组/小节记在 localStorage，刷新/重开面板后保持。
+   两级各一份状态：`echo.settings.collapsedGroups`（一级）、`...collapsedSubs`（二级）。 */
 const SET_COLLAPSE_KEY = "echo.settings.collapsedGroups";
+const SET_SUB_COLLAPSE_KEY = "echo.settings.collapsedSubs";
 
 function _collapsedGroups() {
   try { return new Set(JSON.parse(localStorage.getItem(SET_COLLAPSE_KEY) || "[]")); }
@@ -893,6 +902,14 @@ function _collapsedGroups() {
 }
 function _saveCollapsedGroups(set) {
   try { localStorage.setItem(SET_COLLAPSE_KEY, JSON.stringify([...set])); } catch (e) { /* 忽略 */ }
+}
+/* 二级小节的折叠状态按 "分组/小节" 记：同名小节将来若出现在别的分组也不会串。 */
+function _collapsedSubs() {
+  try { return new Set(JSON.parse(localStorage.getItem(SET_SUB_COLLAPSE_KEY) || "[]")); }
+  catch (e) { return new Set(); }
+}
+function _saveCollapsedSubs(set) {
+  try { localStorage.setItem(SET_SUB_COLLAPSE_KEY, JSON.stringify([...set])); } catch (e) { /* 忽略 */ }
 }
 
 /* 智能体元信息（来自 /api/agents）：
@@ -1394,7 +1411,7 @@ async function loadSettings() {
       const no = g === "agent" ? (_agentsCache.filter((a) => a.active).length || 0) : items.length;
       const body = g === "agent"
         ? `<div id="agentTable" class="agent-table-wrap"></div>`
-        : items.map((s) => renderSettingRow(s)).join("");
+        : renderGroupBody(g, items);
       return `<div class="set-group${isCollapsed ? " collapsed" : ""}" data-grp="${esc(g)}">
         <div class="set-group-title" role="button" tabindex="0" aria-expanded="${!isCollapsed}">
           <span class="set-arrow">▶</span>
@@ -1416,7 +1433,7 @@ async function loadSettings() {
   } catch (e) { toast("加载设置失败：" + e.message); }
 }
 
-/* 分组折叠/展开（事件委托，重绘后无需重新绑定） */
+/* 一级分组折叠/展开（事件委托，重绘后无需重新绑定） */
 function toggleSetGroup(titleEl) {
   const box = titleEl.closest(".set-group");
   if (!box) return;
@@ -1427,12 +1444,59 @@ function toggleSetGroup(titleEl) {
   if (nowCollapsed) collapsed.add(g); else collapsed.delete(g);
   _saveCollapsedGroups(collapsed);
 }
+
+/** 分组内容：有条目带 `sub` 时按二级小节渲染（可各自折叠），其余直接平铺。
+ *
+ *  为什么是"包含"而不是并列：语音命令这一个功能里有"怎么录 / 发到哪 / 播报什么 / 提示音"
+ *  四件事，各成一节才看得清，但它们都属于「语音命令」——用户 2026-09-19 明确要求
+ *  "语音命令和 beep / command / speech 应该是包含不是并列"。小节名与顺序见 SET_SUB_NAMES。
+ */
+function renderGroupBody(grp, items) {
+  const subbed = items.filter((s) => s.sub);
+  if (!subbed.length) return items.map((s) => renderSettingRow(s)).join("");
+  const bySub = {};
+  subbed.forEach((s) => { (bySub[s.sub] = bySub[s.sub] || []).push(s); });
+  const collapsedSubs = _collapsedSubs();
+  // 已知小节按声明的流程顺序；未知小节（后端口径变了）排到末尾，不隐藏任何设置项
+  const order = SET_SUB_ORDER.filter((k) => bySub[k]);
+  const extra = Object.keys(bySub).filter((k) => !SET_SUB_ORDER.includes(k));
+  const plain = items.filter((s) => !s.sub);          // 没归小节的老项：仍平铺在末尾
+  return [...order, ...extra].map((k) => {
+    const stateKey = grp + "/" + k;
+    const isCollapsed = collapsedSubs.has(stateKey);
+    return `<div class="set-subgroup${isCollapsed ? " collapsed" : ""}" data-sub="${esc(stateKey)}">
+      <div class="set-sub-title" role="button" tabindex="0" aria-expanded="${!isCollapsed}">
+        <span class="set-arrow">▶</span>
+        <span>${esc(SET_SUB_NAMES[k] || k)}</span>
+        <span class="set-count">${bySub[k].length}</span>
+      </div>
+      <div class="set-sub-body">${bySub[k].map((s) => renderSettingRow(s)).join("")}</div>
+    </div>`;
+  }).join("") + plain.map((s) => renderSettingRow(s)).join("");
+}
+
+/** 二级小节折叠/展开。 */
+function toggleSetSub(titleEl) {
+  const box = titleEl.closest(".set-subgroup");
+  if (!box) return;
+  const key = box.dataset.sub;
+  const nowCollapsed = box.classList.toggle("collapsed");
+  titleEl.setAttribute("aria-expanded", String(!nowCollapsed));
+  const collapsed = _collapsedSubs();
+  if (nowCollapsed) collapsed.add(key); else collapsed.delete(key);
+  _saveCollapsedSubs(collapsed);
+}
+
 $("#settingsForm").addEventListener("click", (e) => {
+  const sub = e.target.closest(".set-sub-title");
+  if (sub) { toggleSetSub(sub); return; }
   const title = e.target.closest(".set-group-title");
   if (title) toggleSetGroup(title);
 });
 $("#settingsForm").addEventListener("keydown", (e) => {
   if (e.key !== "Enter" && e.key !== " ") return;
+  const sub = e.target.closest(".set-sub-title");
+  if (sub) { e.preventDefault(); toggleSetSub(sub); return; }
   const title = e.target.closest(".set-group-title");
   if (title) { e.preventDefault(); toggleSetGroup(title); }
 });
@@ -1451,12 +1515,20 @@ $("#btnSettingsCollapseAll")?.addEventListener("click", () => {
   const boxes = $$("#settingsForm .set-group");
   const anyOpen = boxes.some((b) => !b.classList.contains("collapsed"));
   const collapsed = _collapsedGroups();
+  const subs = _collapsedSubs();
   boxes.forEach((b) => {
     b.classList.toggle("collapsed", anyOpen);
     b.querySelector(".set-group-title")?.setAttribute("aria-expanded", String(!anyOpen));
     if (anyOpen) collapsed.add(b.dataset.grp); else collapsed.delete(b.dataset.grp);
   });
+  // 二级小节跟着一起收/放：否则"全部折叠"后再点开某个分组，里面还是一片展开的项
+  $$("#settingsForm .set-subgroup").forEach((b) => {
+    b.classList.toggle("collapsed", anyOpen);
+    b.querySelector(".set-sub-title")?.setAttribute("aria-expanded", String(!anyOpen));
+    if (anyOpen) subs.add(b.dataset.sub); else subs.delete(b.dataset.sub);
+  });
   _saveCollapsedGroups(collapsed);
+  _saveCollapsedSubs(subs);
   _syncSettingsCollapseAll();
 });
 
