@@ -83,11 +83,15 @@ function switchView(name) {
 $$(".tab").forEach((t) => t.addEventListener("click", () => switchView(t.dataset.view)));
 
 /* ---------------- 可折叠卡片 ----------------
-   给 `.card` 加 class="collapsible" 与 data-collapse-id，标题点一下就能折叠/展开，
-   状态记在 localStorage（跨刷新/重开保持）。第一个用它是「模型路由 → 路由参数」
-   （2026-09-19 用户要求："路由参数增加折叠"——7 项静置在那里太长，但又不常改）。
+   给卡片加 class="collapsible" 与 data-collapse-id，点标题就能折叠/展开，状态记在
+   localStorage（跨刷新/重开保持）。支持两种卡片：
+     * `.card`  —— 标题 `.card-title`，内容 `.card-body`（静态卡片，如路由参数）；
+     * `.mcard` —— 标题 `.mcard-head`，内容 `.mcard-body`（能力页签里动态渲染的卡片）。
    与设置页的分组折叠是**两套存储**：一个记分组、一个记卡片，互不影响。 */
 const CARD_COLLAPSE_KEY = "echo.panel.collapsedCards";
+const COLLAPSE_TITLE_SEL = ".card.collapsible > .card-title, .mcard.collapsible > .mcard-head";
+const COLLAPSE_ANY_SEL = ".card.collapsible, .mcard.collapsible";
+const COLLAPSE_TITLE_CHILD = ":scope > .card-title, :scope > .mcard-head";
 
 function _collapsedCards() {
   try { return new Set(JSON.parse(localStorage.getItem(CARD_COLLAPSE_KEY) || "[]")); }
@@ -98,28 +102,27 @@ function _saveCollapsedCards(set) {
 }
 function _cardTitleOf(el) {
   // 只认"直接子标题"：卡片里嵌套的其它标题（如设置页分组）不该触发卡片折叠
-  const t = el.closest(".card.collapsible > .card-title");
-  return t || null;
+  return el.closest(COLLAPSE_TITLE_SEL) || null;
 }
 function toggleCollapsibleCard(card) {
   if (!card) return;
   const id = card.dataset.collapseId || card.id;
   if (!id) return;
   const nowCollapsed = card.classList.toggle("collapsed");
-  const title = card.querySelector(":scope > .card-title");
+  const title = card.querySelector(COLLAPSE_TITLE_CHILD);
   if (title) title.setAttribute("aria-expanded", String(!nowCollapsed));
   const collapsed = _collapsedCards();
   if (nowCollapsed) collapsed.add(id); else collapsed.delete(id);
   _saveCollapsedCards(collapsed);
 }
-/** 应用已保存的折叠状态（页面加载时调一次；DOM 是静态的，之后靠委托点击）。 */
-function applyCollapsedCards() {
+/** 应用已保存的折叠状态。**动态卡片每次重绘后都要调一次**（能力页签渲染完会调）。 */
+function applyCollapsedCards(root) {
   const collapsed = _collapsedCards();
-  $$(".card.collapsible").forEach((card) => {
+  $$(COLLAPSE_ANY_SEL, root).forEach((card) => {
     const id = card.dataset.collapseId || card.id;
     const isCollapsed = collapsed.has(id);
     card.classList.toggle("collapsed", isCollapsed);
-    const title = card.querySelector(":scope > .card-title");
+    const title = card.querySelector(COLLAPSE_TITLE_CHILD);
     if (title) {
       title.setAttribute("role", "button");
       title.setAttribute("tabindex", "0");
@@ -1454,7 +1457,11 @@ function capAsrLocal() {
     ${capCompTable(capCompsOf("stt"), curIds)}`;
 }
 
-/** 一张能力卡：标题 + 说明 + 「用哪个」+ 各自的补充内容。 */
+/** 一张能力卡：标题 + 说明 + 「用哪个」+ 各自的补充内容。可折叠（点标题）。
+ *
+ *  折叠是 2026-09-19 用户要求："能力下面的各卡片也增加折叠功能" ——
+ *  这张页签内容长（转写那张有 8 个模型行），折叠状态记在 localStorage，重绘后仍保持。
+ */
 function capKindCard(kind) {
   const meta = CAP_META[kind] || { icon: "•", title: kind, note: "" };
   let body = capProviderBlock(kind);
@@ -1465,8 +1472,8 @@ function capKindCard(kind) {
   }
   // TTS 不再单列「两种实现」：那两行的状态与下拉选项里的（出网/本地 · 就绪）是同一份信息，
   // 顶部概览条也已经各给了一个点 + 名字（2026-09-19 用户实测反馈：重复）。
-  return `<div class="mcard">
-    <div class="mcard-head"><div class="mcard-ic">${meta.icon}</div>
+  return `<div class="mcard collapsible" data-collapse-id="cap-${esc(kind)}">
+    <div class="mcard-head"><span class="set-arrow">▶</span><div class="mcard-ic">${meta.icon}</div>
       <div class="mcard-title">${esc(meta.title)}</div></div>
     <div class="mcard-body">
       <div class="muted" style="font-size:12px;margin-bottom:6px">${esc(meta.note)}</div>
@@ -1514,13 +1521,21 @@ function renderCapEnv() {
     : "";
   const plat = ((_capCache.comps || {}).platform || "") +
     (((_capCache.comps || {}).osVersion) ? " " + _capCache.comps.osVersion : "");
-  host.innerHTML = `<div class="card">
-    <div class="card-title">🧱 运行环境 <span class="muted">${esc(plat)}</span></div>
-    ${capCompTable(comps, [])}
-    <div class="muted" style="margin-top:6px;font-size:12px">
-      这些是 pip 装的运行时/加速库，面板不代下：点「复制安装说明」拿到命令后自己执行。
+  const readyN = (((_capCache.comps || {}).items) || [])
+    .filter((c) => c.applicable && c.ready === true).length;
+  const totalN = (((_capCache.comps || {}).items) || []).filter((c) => c.applicable).length;
+  host.innerHTML = `<div class="card collapsible" data-collapse-id="cap-env">
+    <div class="card-title"><span class="set-arrow">▶</span><span class="ic">🧱</span>运行环境
+      <span class="muted">${esc(plat)}</span>
+      <span class="muted" style="margin-left:auto">就绪 ${readyN}/${totalN}</span>
     </div>
-    ${blockedHtml}
+    <div class="card-body">
+      ${capCompTable(comps, [])}
+      <div class="muted" style="margin-top:6px;font-size:12px">
+        这些是 pip 装的运行时/加速库，面板不代下：点「复制说明」拿到命令后自己执行。
+      </div>
+      ${blockedHtml}
+    </div>
   </div>`;
 }
 
@@ -1717,6 +1732,7 @@ async function loadCapabilities() {
       .filter((f) => ["wake", "diar", "vp", "dev"].indexOf(f.id) >= 0).map(renderModelCard).join("");
     renderCapEnv();
     bindCapCards();
+    applyCollapsedCards($("#view-capabilities"));   // 应用上次的卡片折叠状态（动态卡片要重绘后应用）
     const active = modelsRes.jobs && modelsRes.jobs.active;
     if (active && !_capPoll) _capPoll = setInterval(loadCapabilities, 1500);
     else if (!active && _capPoll) { clearInterval(_capPoll); _capPoll = null; }
@@ -2207,8 +2223,9 @@ function renderModelCard(f) {
       `<div class="mcard-act">${modelActions(m)}</div>`;
   }
 
-  return `<div class="mcard${cls}">
-    <div class="mcard-head"><div class="mcard-ic">${f.icon}</div>
+  // 可折叠（点标题）：id 用功能 id（wake/diar/vp/dev），状态与其它卡片同一份存储
+  return `<div class="mcard${cls} collapsible" data-collapse-id="cap-func-${esc(f.id)}">
+    <div class="mcard-head"><span class="set-arrow">▶</span><div class="mcard-ic">${f.icon}</div>
       <div class="mcard-title">${esc(f.name)}</div>${badge}</div>
     <div class="mcard-body">${body}</div>
   </div>`;

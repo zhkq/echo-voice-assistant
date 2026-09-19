@@ -228,8 +228,11 @@
       <div class="card-title"><span class="ic">🧩</span>能力
         <span class="muted" id="capOvSummary">—</span>
         <span class="spacer"></span>
-        <button class="btn" id="btnCapDownloadMissing" title="下载所有缺失且可从上游获取的模型">一键下载缺失</button>
-        <button class="btn" id="btnCapReload" title="重新读取能力与组件状态">刷新</button>
+        <!-- 按钮短一点、用 mini：窄边条里原来「一键下载缺失 + 刷新」会折成两行
+             （用户 2026-09-19："第一排的一键下载缺失和刷新再缩一下，别换行"）。完整说明进 title。 -->
+        <button class="btn mini" id="btnCapDownloadMissing"
+                title="把所有缺失、且能从上游获取的模型排成队列依次下载">下载缺失</button>
+        <button class="btn mini" id="btnCapReload" title="重新读取能力与组件状态">刷新</button>
       </div>
       <div class="model-ov" id="capOverview"></div>
       <div class="muted" style="margin-top:6px;font-size:12px">
