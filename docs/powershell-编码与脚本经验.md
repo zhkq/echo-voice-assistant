@@ -82,6 +82,20 @@ $c = [System.IO.File]::ReadAllText($f, [Text.UTF8Encoding]::new($false))
 
 4. **git 提示 `LF will be replaced by CRLF`** 只是 autocrlf 归一化提示，不影响 PowerShell 解析。
 
+5. **管理员策略会拦"引号内含 `|`"的命令行**（2026-09-19 实测，`WinError 786`）
+   - 症状：`subprocess.run(["powershell", ..., "-Command", ps])` 在 `CreateProcess` 阶段
+     直接抛 `OSError: [WinError 786] Access to %1 has been restricted by your Administrator
+     by policy rule %2`（中文："管理员用策略规则限制了对 %1 的访问"）。
+   - 触发条件（`scripts/probe_powershell.py` 夹出来的）：命令里出现**引号内的 `|` 字面量**
+     （例如 `"$_.Name + ' | ' + $_.Culture"`）→ 被拦；同样带**真管道** `|`（在引号外）→ 通过。
+     疑似 EDR 按命令行文本做注入/管道启发式判定。
+   - 与"命令行多长"无关，与"哪个 venv 的 python"无关，与"用不用 Add-Type"无关。
+   - **规避**：不要在 PowerShell 命令的字符串里放 `|`。要输出多列就分语句输出
+     （`... { $_.A; $_.B }`）由调用方排版，或用 `-f` 格式化。
+   - ECHO 自己的两条命令（`app/platform/win32/sapi.py` 的常驻 SAPI、`win32/env.py` 的桌面
+     通知）都**不含**这种写法，实测通过 —— 所以**产品功能不受影响**，被拦的只是当时的探针。
+   - 判别手段：`scripts/probe_powershell.py`（直接 import 生产模块拿脚本正文来试）。
+
 ---
 
 ## 六、收尾/提交前检查清单
@@ -91,3 +105,4 @@ $c = [System.IO.File]::ReadAllText($f, [Text.UTF8Encoding]::new($false))
 - [ ] 中文日志按预期编码写入 `data\logs\`（无 GBK 乱码）
 - [ ] 后台服务用 `pythonw.exe` 启动，不依附任何控制台窗口
 - [ ] 有返回值的函数调用已用 `$null =` / `| Out-Null` 吸收，启动窗口不再打印杂项
+- [ ] `-Command` 的命令行里**没有**"引号内的 `|`"（会被管理员策略拦，WinError 786）
