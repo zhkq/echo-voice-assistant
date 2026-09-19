@@ -32,6 +32,7 @@ from app.config import DEFAULTS, settings                         # noqa: E402
 
 TOKEN = "probe-token-1234"
 COOKIE_NAME = "dsh-auth-TESTSERVER"
+COOKIE_NAME_PREFIX = "dsh-auth-"
 COOKIE_VALUE = "v1.test.cookie"
 
 
@@ -141,6 +142,50 @@ class HarnessAuthTests(_Base):
         self.assertIsInstance(res, dict)
         self.assertEqual(_HarnessStub.state["rpc"], ["session/list"])
 
+    def test_no_token_falls_back_to_the_home_secret(self):
+        """没有 token 也能连：用 harness **自己家目录**里的 browser-session 密钥铸 Cookie。
+
+        2026-09-19 实测发现独立 harness 的 `.credentials.yaml` 与桌面版同构，
+        于是"用户自己起的实例 / token 轮换"这些情况都不再需要用户去拿 token。
+        """
+        import base64
+        import tempfile
+
+        home = tempfile.mkdtemp(prefix="echo-hn-secret-")
+        self.addCleanup(shutil.rmtree, home, ignore_errors=True)
+        secret = base64.urlsafe_b64encode(b"\x02" * 32).rstrip(b"=").decode()
+        with open(os.path.join(home, ".credentials.yaml"), "w", encoding="utf-8") as fh:
+            fh.write("version: 1\nrecords:\n  client-connection/browser-session:\n"
+                     "    kind: secret\n    payload:\n      version: 1\n"
+                     "      secret: %s\n" % secret)
+        with patch.object(harness_proc, "home", lambda: home), \
+                patch.object(harness_proc, "token", lambda: ""):
+            a = self._agent()
+            cookie = a._cookie_header()
+        self.assertTrue(cookie.startswith(COOKIE_NAME_PREFIX), cookie)
+        self.assertIn("=v1.", cookie)
+
+    def test_no_token_and_no_file_says_how_to_set_it(self):
+        """两条路都没有时，错误信息要指到面板上那一栏（而不是含糊的 401）。"""
+        import tempfile
+        home = tempfile.mkdtemp(prefix="echo-hn-empty-")
+        self.addCleanup(shutil.rmtree, home, ignore_errors=True)
+        with patch.object(harness_proc, "home", lambda: home), \
+                patch.object(harness_proc, "token", lambda: ""):
+            with self.assertRaises(Exception) as cm:
+                self._agent()._cookie_header()
+        msg = str(cm.exception)
+        self.assertIn("harness 访问 token", msg)
+        self.assertIn("选中本智能体", msg)
+
+    def test_token_wins_over_the_home_secret(self):
+        """有 token 就走 token（ECHO 自己拉起的实例，token 才是最新鲜的）。"""
+        called = {"secret": 0}
+        a = self._agent()
+        with patch.object(type(a), "_secret_cookie", lambda self: called.__setitem__("secret", 1) or "x=1"):
+            a._cookie_header()
+        self.assertEqual(called["secret"], 0, "有 token 时不该走密钥退路")
+
     def test_401_triggers_relogin_and_retry(self):
         """cookie 过期不该让一次命令白跑：401 → 重登一次 → 成功。"""
         a = self._agent()
@@ -152,19 +197,29 @@ class HarnessAuthTests(_Base):
         self.assertEqual(_HarnessStub.state["rpc"], ["session/create"])
 
     def test_bad_token_gives_a_human_reason(self):
-        with patch.object(harness_proc, "token", lambda: "wrong-token"):
+        """token 错了、家目录里也没有可用密钥时 → 给出人话（而不是裸 403）。"""
+        import tempfile
+        home = tempfile.mkdtemp(prefix="echo-hn-bad-")
+        self.addCleanup(shutil.rmtree, home, ignore_errors=True)
+        with patch.object(harness_proc, "home", lambda: home), \
+                patch.object(harness_proc, "token", lambda: "wrong-token"):
             a = self._agent()
             with self.assertRaises(Exception) as cm:
                 a._cookie_header()
         self.assertIn("token", str(cm.exception))
 
     def test_missing_token_tells_you_what_to_do(self):
-        with patch.object(harness_proc, "token", lambda: ""):
+        import tempfile
+        home = tempfile.mkdtemp(prefix="echo-hn-none-")
+        self.addCleanup(shutil.rmtree, home, ignore_errors=True)
+        with patch.object(harness_proc, "home", lambda: home), \
+                patch.object(harness_proc, "token", lambda: ""):
             a = self._agent()
             with self.assertRaises(Exception) as cm:
                 a._cookie_header()
         msg = str(cm.exception)
         self.assertIn("选中", msg, "要告诉用户怎么让它有 token")
+        self.assertIn("harness 访问 token", msg, "并指出面板上那一栏")
 
     def test_available_reports_live_service(self):
         a = self._agent()

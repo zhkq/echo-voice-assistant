@@ -14,7 +14,7 @@
 | 启动 | 用户装并运行 Desktop | **ECHO 作为子进程拉起**：`npx -y @deepseek-ai/dsh web --port 43199 --no-open` |
 | 端口 | 43120 | 默认 **43199**（刻意避开，两者可并存） |
 | 家目录（DSH_HOME） | 桌面版自己的（`~/.dsh`） | **`{DATA}/harness`**（默认），与 Desktop 完全分开 |
-| 鉴权 | `/api` 校验**签名 Cookie**（密钥在凭据文件里，ECHO 自铸 HMAC） | 启动时打印 `…/?token=<token>`，用它访问一次换 `dsh-auth-…` Cookie |
+| 鉴权 | `/api` 校验**签名 Cookie**（密钥在凭据文件里，ECHO 自铸 HMAC） | 两条路都行：① 启动时打印的 token → Cookie；② **它自己家目录 `.credentials.yaml` 里的同名密钥** → 自铸 Cookie（与桌面版同构，实测通过） |
 | 接口面 | `session/*` `workspace/*` `settings/*` | **同上**（实测 `session/list`、`session/create`、`workspace/create` 全 200） |
 
 所以"用户只装 harness + ECHO"这条路是通的；ECHO 现在把它做成了**第三个智能体**，
@@ -50,6 +50,36 @@ POST /api/settings/describe                 → 端点存在（参数形状不�
 2. **杀进程要杀整棵树。** `npx` 会套 `cmd → node(npx-cli) → cmd → node(dsh)` 四层，
    只 `terminate()` 最外层 wrapper 等于没杀（实测：切回 DSH 后 43199 仍在监听）。
    现在用 `taskkill /PID <pid> /T /F`，并在端口仍被占用时按"监听该端口的 PID"补一刀。
+3. **token 每次启动都会换，而且不落盘**（实测三次启动三个不同 token；家目录里搜不到它）。
+   所以"从文件里读一个固定 token"这条路不存在 —— 这也是为什么后来加了第 3 条鉴权退路
+   （见下节）：直接用它家目录里的 browser-session 密钥铸 Cookie，就不必追着 token 跑。
+
+### 鉴权怎么选（2026-09-19 补充实测）
+
+独立 harness 的 `.credentials.yaml` 与桌面版**结构完全同构**：
+
+```yaml
+version: 1
+records:
+  client-connection/browser-session:
+    kind: secret
+    payload:
+      version: 1
+      secret: <base64url>        # 就是铸 dsh-auth-… Cookie 的 HMAC 密钥
+```
+
+所以 `HarnessAgent._login()` 现在是**两条路**：
+
+1. **有 token 就用 token**（ECHO 自己拉起时从 stdout 抓到的，最"新鲜"）：`GET /?token=…`
+   → 303 里拿 `Set-Cookie`；
+2. **没有 token 就用它家目录里的密钥自铸 Cookie**（与桌面版同一套算法，只是把密钥路径换成
+   `{harnessHome}/.credentials.yaml`）。实测：把 token 全部清掉，只靠这个文件也能连上并
+   列出会话 → 用户**不需要**去拿 token；
+3. 两条都不行才报错，并把"怎么填 token"说清楚（面板那一栏）。
+
+**结论**：面板上的「harness 访问 token」平时可以**一直留空**。只有一种情况需要它 ——
+harness 跑在**另一台机器/另一个家目录**（ECHO 读不到它的 `.credentials.yaml`）时，
+才把启动时打印的 token 粘进去。
 
 ## 3. ECHO 侧的实现
 

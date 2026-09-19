@@ -59,10 +59,15 @@ def _b64url_decode(text: str) -> bytes:
     return base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
 
 
-def _load_browser_secret() -> str:
-    """从 ~/.dsh/.credentials.yaml 提取 browser-session 签名密钥（base64url 文本）。"""
+def _load_browser_secret(path: str = "") -> str:
+    """从 `.credentials.yaml` 提取 browser-session 签名密钥（base64url 文本）。
+
+    `path` 缺省是 DSH Desktop 的家目录；独立 harness 传它自己的家目录 —— 两份文件
+    **结构完全同构**（都有 `records['client-connection/browser-session'].payload.secret`），
+    所以这个解析器能同时服务两个后端（2026-09-19 实测对比过）。
+    """
     try:
-        with open(CREDENTIALS_PATH, "r", encoding="utf-8") as f:
+        with open(path or CREDENTIALS_PATH, "r", encoding="utf-8") as f:
             lines = f.read().splitlines()
     except OSError:
         return ""
@@ -87,12 +92,17 @@ def _load_browser_secret() -> str:
     return ""
 
 
-def _make_cookie(base_url: str) -> str:
-    """按桌面版算法自铸签名 Cookie（payload v1 + HMAC-SHA256，authority=Host 头）。"""
-    secret_b64 = _load_browser_secret()
+def _make_cookie(base_url: str, secret_b64: str = "", credentials_path: str = "") -> str:
+    """按桌面版算法自铸签名 Cookie（payload v1 + HMAC-SHA256，authority=Host 头）。
+
+    `secret_b64` 显式给密钥（独立 harness 用它**自己家目录**里的那份）；
+    不给就从 `credentials_path`（缺省桌面版凭据文件）里读。
+    """
+    if not secret_b64:
+        secret_b64 = _load_browser_secret(credentials_path)
     if not secret_b64:
         raise DshError(
-            f"无法读取浏览器会话密钥（{CREDENTIALS_PATH} 中缺少 "
+            f"无法读取浏览器会话密钥（{credentials_path or CREDENTIALS_PATH} 中缺少 "
             f"records.{AUTH_RECORD_KEY}.payload.secret）")
     secret = _b64url_decode(secret_b64)
 
