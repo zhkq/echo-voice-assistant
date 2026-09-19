@@ -25,6 +25,34 @@ class PathSafetyTests(unittest.TestCase):
             os.mkdir(root)
             self.assertIsNone(safe_under(root, "..", "web-backup", "secret.txt"))
 
+    # 以下为 §13.8 安全网补充：这些边界是 P3 动路径层时最容易被"顺手改坏"的地方
+    def test_accepts_nested_parts(self):
+        with tempfile.TemporaryDirectory() as root:
+            os.makedirs(os.path.join(root, "sub"))
+            self.assertEqual(safe_under(root, "sub", "f.txt"),
+                             os.path.realpath(os.path.join(root, "sub", "f.txt")))
+
+    def test_absolute_path_inside_root_is_allowed(self):
+        """绝对路径只要落在根内就合法（os.path.join 会用后一个参数整段替换）。"""
+        with tempfile.TemporaryDirectory() as root:
+            inner = os.path.join(root, "sub")
+            os.makedirs(inner)
+            self.assertEqual(safe_under(root, inner), os.path.realpath(inner))
+
+    def test_base_itself_is_rejected_unless_allowed(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.assertIsNone(safe_under(root))
+            self.assertEqual(safe_under(root, allow_base=True), os.path.realpath(root))
+
+    def test_empty_part_resolves_to_base_and_is_rejected(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.assertIsNone(safe_under(root, ""))
+
+    @unittest.skipUnless(os.name == "nt", "跨盘符没有共同路径（ValueError）只在 Windows 上出现")
+    def test_different_drive_is_rejected(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.assertIsNone(safe_under(root, "D:\\echo-elsewhere\\x.txt"))
+
 
 class LoopbackGuardTests(unittest.TestCase):
     def test_accepts_loopback_hosts(self):

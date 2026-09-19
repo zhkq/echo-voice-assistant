@@ -1,0 +1,323 @@
+﻿# -*- coding: utf-8 -*-
+"""启动状态机的 characterization 测试（§13.8 安全网第 2 项，P3 前置）
+
+`app/boot.py` 是"面板先可用、其余组件后台分阶段拉起"的编排器，状态机是
+`pending → starting → online | failed | disabled | idle`。P3 要动的是被它拉起的
+那些组件（热键/TTS/边条/模型加载），一旦状态机语义被改动，面板上看到的
+"启动中/失败/已就绪"就会失真 —— 而面板是用户唯一的观察窗口。
+
+本文件钉住：注册与快照的结构、report() 的状态跃迁与上报映射、_run_start 的三条
+分支（无启动函数 / 正常 / 抛异常）、手动启停的拒绝条件、以及 setup() 登记的组件清单。
+
+不碰真实 data/（db 重定向到临时目录）。
+"""
+import os
+import shutil
+import sys
+import tempfile
+import threading
+import time
+import unittest
+from unittest.mock import MagicMock, patch
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import app.boot as boot                                      # noqa: E402
+import app.db as db                                          # noqa: E402
+from app.config import settings                              # noqa: E402
+
+
+class _BootStateTestCase(unittest.TestCase):
+    """每个用例一套干净的注册表（boot 的注册表是模块级全局）。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp(prefix="echo-boot-")
+        cls._old_db = (db.DATA_DIR, db.DB_FILE)
+        db.DATA_DIR = cls.tmp
+        db.DB_FILE = os.path.join(cls.tmp, "test.db")
+        db.init()
+        settings.seed_defaults()
+
+    @classmethod
+    def tearDownClass(cls):
+        db.DATA_DIR, db.DB_FILE = cls._old_db
+        settings._cache = None
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def setUp(self):
+        boot._COMPONENTS.clear()
+        del boot._ORDER[:]
+        boot.set_phase("init")
+        self._log = patch.object(boot, "_log")          # 不往库里写日志，只记录调用
+        self.log = self._log.start()
+        self.addCleanup(self._log.stop)
+
+    def _wait_status(self, cid, want, timeout=3.0):
+        end = time.time() + timeout
+        while time.time() < end:
+            if boot._COMPONENTS[cid]["status"] == want:
+                return True
+            time.sleep(0.01)
+        return False
+
+
+class RegistrationAndSnapshotTests(_BootStateTestCase):
+    def test_register_and_snapshot_structure(self):
+        boot.register("x", "某组件", "🎤", can_start=True, can_stop=True, kind="model")
+        snap = boot.snapshot()
+        self.assertEqual(snap["phase"], "init")
+        self.assertEqual(len(snap["components"]), 1)
+        comp = snap["components"][0]
+        self.assertEqual(comp["id"], "x")
+        self.assertEqual(comp["label"], "某组件")
+        self.assertEqual(comp["status"], "pending")
+        self.assertEqual(comp["kind"], "model")
+        # 内部函数不许外泄到 API 面
+        self.assertNotIn("_start_fn", comp)
+        self.assertNotIn("_stop_fn", comp)
+
+    def test_register_is_idempotent(self):
+        """重复注册同一个 id 不能把组件列两遍（summary.total 会被算翻倍）。"""
+        boot.register("x", "某组件", "🎤")
+        boot.register("x", "某组件（改）", "🎤")
+        snap = boot.snapshot()
+        self.assertEqual(len(snap["components"]), 1)
+        self.assertEqual(snap["summary"]["total"], 1)
+        self.assertEqual(snap["components"][0]["label"], "某组件（改）")
+
+    def test_summary_counts_each_state(self):
+        boot.register("a", "A", "", status="online")
+        boot.register("b", "B", "", status="idle")
+        boot.register("c", "C", "", status="disabled")
+        boot.register("d", "D", "", status="failed")
+        boot.register("e", "E", "", status="starting")
+        boot.register("f", "F", "", status="pending")
+        s = boot.snapshot()["summary"]
+        self.assertEqual(s, {"total": 6, "ready": 3, "failed": 1, "running": 1, "pending": 1})
+
+    def test_setup_registers_the_documented_components(self):
+        boot.setup()
+        snap = boot.snapshot()
+        self.assertEqual([c["id"] for c in snap["components"]],
+                         ["server", "dsh", "failover", "stt-cmd", "stt-meeting",
+                          "tts", "wake", "hotkey", "meeting", "diarize"])
+        by_id = {c["id"]: c for c in snap["components"]}
+        self.assertEqual(by_id["server"]["status"], "online", "面板服务阶段 0 就已就绪")
+        self.assertFalse(by_id["server"]["can_start"])
+        self.assertEqual(by_id["stt-meeting"]["status"], "idle", "会议引擎按需加载")
+        self.assertEqual(by_id["stt-meeting"]["kind"], "model")
+        for cid in ("hotkey", "wake", "stt-cmd", "stt-meeting"):
+            self.assertTrue(by_id[cid]["can_stop"], "%s 应可手动停止" % cid)
+
+    def test_setup_twice_does_not_duplicate(self):
+        boot.setup()
+        boot.setup()
+        self.assertEqual(boot.snapshot()["summary"]["total"], 10)
+
+
+class ReportTests(_BootStateTestCase):
+    def test_starting_records_start_time_once(self):
+        boot.register("x", "X", "")
+        boot.report("x", status="starting", detail="启动中…", progress=0.0)
+        started = boot._COMPONENTS["x"]["started_at"]
+        self.assertIsNotNone(started)
+        boot.report("x", status="starting", detail="还是启动中")
+        self.assertEqual(boot._COMPONENTS["x"]["started_at"], started)
+
+    def test_online_records_duration_and_detail(self):
+        boot.register("x", "X", "")
+        boot.report("x", status="starting")
+        time.sleep(0.02)
+        snap = boot.report("x", status="online", detail="已启动", progress=1.0)
+        self.assertEqual(snap["status"], "online")
+        self.assertEqual(snap["detail"], "已启动")
+        self.assertEqual(snap["progress"], 1.0)
+        self.assertGreaterEqual(snap["duration"], 0.0)
+
+    def test_empty_detail_keeps_previous_text(self):
+        boot.register("x", "X", "")
+        boot.report("x", status="starting", detail="加载模型…")
+        boot.report("x", status="online")
+        self.assertEqual(boot._COMPONENTS["x"]["detail"], "加载模型…")
+
+    def test_error_is_stored_and_logged(self):
+        boot.register("x", "X", "")
+        boot.report("x", status="failed", detail="炸了", error="详细错误")
+        self.assertEqual(boot._COMPONENTS["x"]["error"], "详细错误")
+        self.assertTrue(self.log.called)
+        levels = [c.args[1] for c in self.log.call_args_list]
+        self.assertIn("error", levels)
+
+    def test_online_is_logged_as_info(self):
+        boot.register("x", "标签", "")
+        boot.report("x", status="online", detail="就绪")
+        self.assertEqual(self.log.call_args_list[-1].args[0], "x")
+        self.assertEqual(self.log.call_args_list[-1].args[1], "info")
+
+    def test_unknown_component_returns_none(self):
+        self.assertIsNone(boot.report("nope", status="online"))
+
+    def test_report_maps_to_the_dashboard_service_registry(self):
+        """面板的组件状态来自 services；映射错了面板就永远显示 unknown。"""
+        boot.register("hotkey", "热键/媒体键", "")
+        fake = MagicMock()
+        with patch.dict(boot._SERVICE_REPORTERS, {"hotkey": fake}):
+            boot.report("hotkey", status="online", detail="组合键 + 媒体键")
+        fake.assert_called_once_with("online", "组合键 + 媒体键")
+
+    def test_failed_report_falls_back_to_the_error_text(self):
+        boot.register("hotkey", "热键", "")
+        fake = MagicMock()
+        with patch.dict(boot._SERVICE_REPORTERS, {"hotkey": fake}):
+            boot.report("hotkey", status="failed", detail="", error="钩子装不上")
+        fake.assert_called_once_with("failed", "钩子装不上")
+
+    def test_server_reporter_takes_no_arguments(self):
+        boot.register("server", "面板服务", "")
+        called = []
+        with patch.dict(boot._SERVICE_REPORTERS, {"server": lambda: called.append(True)}):
+            boot.report("server", status="online", detail="ECHO x.y.z")
+        self.assertEqual(called, [True])
+
+    def test_reporter_exception_does_not_break_reporting(self):
+        boot.register("hotkey", "热键", "")
+        with patch.dict(boot._SERVICE_REPORTERS,
+                        {"hotkey": MagicMock(side_effect=RuntimeError("db down"))}):
+            snap = boot.report("hotkey", status="online", detail="就绪")
+        self.assertEqual(snap["status"], "online")
+
+
+class RunStartTests(_BootStateTestCase):
+    def test_missing_start_fn_counts_as_builtin_online(self):
+        boot.register("x", "X", "", start_fn=None)
+        boot._run_start("x")
+        self.assertEqual(boot._COMPONENTS["x"]["status"], "online")
+        self.assertEqual(boot._COMPONENTS["x"]["detail"], "内置")
+
+    def test_exception_becomes_failed_with_error_text(self):
+        def boom(report):
+            raise RuntimeError("模型加载失败")
+        boot.register("x", "X", "", start_fn=boom)
+        boot._run_start("x")
+        comp = boot._COMPONENTS["x"]
+        self.assertEqual(comp["status"], "failed")
+        self.assertEqual(comp["error"], "模型加载失败")
+        self.assertEqual(comp["detail"], "模型加载失败")
+
+    def test_start_fn_reporting_its_own_status_wins(self):
+        def ok(report):
+            report(status="online", detail="已运行 · API 可访问", progress=1.0)
+        boot.register("x", "X", "", start_fn=ok)
+        boot._run_start("x")
+        self.assertEqual(boot._COMPONENTS["x"]["detail"], "已运行 · API 可访问")
+
+    def test_start_fn_marking_failed_is_not_overwritten(self):
+        def fail(report):
+            report(status="failed", detail="没装上", error="没装上")
+        boot.register("x", "X", "", start_fn=fail)
+        boot._run_start("x")
+        self.assertEqual(boot._COMPONENTS["x"]["status"], "failed")
+
+    def test_progress_callback_reaches_the_snapshot(self):
+        def staged(report):
+            report(detail="探测中…", progress=0.1)
+            report(detail="注册 ECHO AUTO…", progress=0.7)
+            report(status="online", detail="完成", progress=1.0)
+        boot.register("x", "X", "", start_fn=staged)
+        boot._run_start("x")
+        snap = boot.snapshot()["components"][0]
+        self.assertEqual(snap["progress"], 1.0)
+        self.assertEqual(snap["detail"], "完成")
+
+    def test_unknown_component_is_a_noop(self):
+        boot._run_start("nope")     # 不抛异常
+        self.assertEqual(boot.snapshot()["components"], [])
+
+
+class ManualStartStopTests(_BootStateTestCase):
+    def test_start_unknown_component(self):
+        self.assertEqual(boot.start_component("nope"), (False, "组件不存在"))
+
+    def test_start_rejected_when_not_startable(self):
+        boot.register("x", "X", "", can_start=False)
+        self.assertEqual(boot.start_component("x"), (False, "该组件不可手动启动"))
+
+    def test_start_rejected_while_starting(self):
+        boot.register("x", "X", "", status="starting")
+        self.assertEqual(boot.start_component("x"), (False, "正在启动中"))
+
+    def test_start_runs_the_start_fn_in_background(self):
+        done = threading.Event()
+
+        def fn(report):
+            done.set()
+            report(status="online", detail="好了")
+        boot.register("x", "X", "", start_fn=fn)
+        self.assertEqual(boot.start_component("x"), (True, "已开始启动"))
+        self.assertTrue(done.wait(3.0), "启动函数应在后台线程里跑")
+        self.assertTrue(self._wait_status("x", "online"))
+
+    def test_stop_unknown_component(self):
+        self.assertEqual(boot.stop_component("nope"), (False, "组件不存在"))
+
+    def test_stop_rejected_without_stop_fn(self):
+        boot.register("x", "X", "", start_fn=lambda report: None, stop_fn=None)
+        self.assertEqual(boot.stop_component("x"), (False, "该组件不可停止"))
+
+    def test_stop_sets_idle(self):
+        boot.register("x", "X", "", start_fn=lambda report: None,
+                      stop_fn=lambda: None, status="online")
+        self.assertEqual(boot.stop_component("x"), (True, "已停止"))
+        self.assertEqual(boot._COMPONENTS["x"]["status"], "idle")
+        self.assertEqual(boot._COMPONENTS["x"]["detail"], "已停止")
+
+    def test_stop_exception_is_returned_not_raised(self):
+        def bad_stop():
+            raise RuntimeError("卸载失败")
+        boot.register("x", "X", "", start_fn=lambda report: None,
+                      stop_fn=bad_stop, status="online")
+        self.assertEqual(boot.stop_component("x"), (False, "卸载失败"))
+        self.assertEqual(boot._COMPONENTS["x"]["status"], "online", "失败时别谎报已停")
+
+    def test_spawn_skips_settled_components(self):
+        started = []
+        for cid, status in (("a", "pending"), ("b", "online"),
+                            ("c", "starting"), ("d", "disabled")):
+            boot.register(cid, cid, "", status=status,
+                          start_fn=(lambda c: (lambda report: started.append(c)))(cid))
+        boot._spawn(["a", "b", "c", "d", "missing"])
+        end = time.time() + 3.0
+        while time.time() < end and not started:
+            time.sleep(0.01)
+        time.sleep(0.1)
+        self.assertEqual(started, ["a"], "只应拉起 pending 的那个")
+
+
+class BootOrchestrationTests(_BootStateTestCase):
+    def test_run_boot_settles_everything_and_marks_done(self):
+        """全量编排：所有登记的组件都拉起后 phase=done（用"内置"组件避免加载模型）。"""
+        for cid in ("failover", "dsh", "tts", "hotkey", "meeting", "diarize",
+                    "stt-cmd", "wake"):
+            boot.register(cid, cid, "", start_fn=None)
+        boot._run_boot()
+        self.assertEqual(boot._PHASE, "done")
+        snap = boot.snapshot()
+        self.assertEqual(snap["summary"]["running"], 0)
+        self.assertEqual(snap["summary"]["ready"], 8)
+
+    def test_start_all_async_returns_immediately(self):
+        for cid in ("failover", "dsh", "tts", "hotkey", "meeting", "diarize",
+                    "stt-cmd", "wake"):
+            boot.register(cid, cid, "", start_fn=None)
+        t0 = time.time()
+        boot.start_all_async()
+        self.assertLess(time.time() - t0, 1.0, "编排必须是后台线程，不能阻塞启动路径")
+        end = time.time() + 3.0
+        while time.time() < end and boot._PHASE != "done":
+            time.sleep(0.01)
+        self.assertEqual(boot._PHASE, "done")
+
+
+if __name__ == "__main__":
+    unittest.main()
