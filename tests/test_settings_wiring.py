@@ -576,15 +576,29 @@ class OptionAndPanelWiringTests(unittest.TestCase):
                       "按钮不许竖排（窄边条实测会被挤成一列字）")
 
     def test_model_action_labels_stay_short(self):
-        """按钮文字要短（完整含义进 title）——「重新下载/复制下载命令/复制目标路径」都太长。"""
+        """按钮/链接文字要短（完整含义进 title）——「复制下载命令/复制目标路径」都太长。"""
         js = _read(os.path.join("web", "app.js"))
         block = js.split("function modelActions")[1].split("\n}")[0]
-        for label in (">下载</button>", ">复制命令</button>", ">复制路径</button>", ">链接</a>"):
-            with self.subTest(label=label):
-                self.assertIn(label, block)
-        for gone in ("重新下载</button>", "复制目标路径</button>", "复制下载命令</button>"):
-            with self.subTest(label=gone):
-                self.assertNotIn(gone, block, "长按钮文字应改成短标签 + title")
+        for token in ('data-msdl=', "重新下载", '"下载"', "复制命令", "复制路径", ">链接</a>", "title="):
+            with self.subTest(token=token):
+                self.assertIn(token, block)
+        for gone in ("复制目标路径</button>", "复制下载命令</button>"):
+            with self.subTest(gone=gone):
+                self.assertNotIn(gone, block, "长按钮文字应改成短标签 + title（title 里保留原名）")
+
+    def test_ready_items_downgrade_their_actions(self):
+        """已就绪的项不再摆显眼的下载按钮（用户："已就绪的还用保留下载吗"）。
+
+        两档层级：未就绪 → 「下载」主按钮（`.btn.mini`）；已就绪 → 小文字链接
+        （`.act-link`：灰字、悬停才亮，但仍可点「重新下载」）。
+        """
+        js = _read(os.path.join("web", "app.js"))
+        css = _read(os.path.join("web", "app.css"))
+        block = js.split("function modelActions")[1].split("\n}")[0]
+        self.assertIn('ready ? "act-link" : "btn mini"', block, "按 ready 分两档类名")
+        self.assertIn('data-force="${ready ? "1" : "0"}"', block)
+        self.assertIn(".act-link {", css)
+        self.assertIn(".act-link:hover", css)
 
     def test_engine_labels_do_not_wrap_vertically(self):
         """「命令转写 / 会议转写」在窄边条里被压成竖排两行 → 加 nowrap + 窄屏各占一行。"""

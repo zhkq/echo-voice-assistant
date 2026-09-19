@@ -2073,30 +2073,35 @@ function friendlyOption(key, v) {
 
 function modelBadge(text, kind) { return `<span class="mcard-badge ${kind}">${esc(text)}</span>`; }
 
-/** 模型卡片的「获取」按钮组：下载 / 复制命令 / 复制路径 / 官方链接。
+/** 模型/组件的「获取」动作组：下载 / 复制命令 / 复制路径 / 官方链接。
  *
- *  按钮文字一律**短**（用户 2026-09-19 实测："按钮字太多"，窄边条里"重新下载"被挤成竖排）：
- *  完整含义进 title —— 「下载」（已装的写"重新下载（覆盖现有文件）"）、
- *  「复制命令」/「复制路径」（cmd_label 再长也压成这两个词）、链接保留厂商给的短标签。
+ *  **两档视觉层级**（2026-09-19 用户："已就绪的还用保留下载吗"）：
+ *    * 未就绪 → 「下载」是**主按钮**（.btn.mini，一眼看到要做什么）；
+ *    * 已就绪 → 不再摆一个显眼的下载按钮，全部降级成**小文字链接**
+ *      （`重新下载 · 复制命令`，`.act-link`，灰字、悬停才亮）——
+ *      已装好的行视觉上"安静"，但"重下"这条路还在（模型损坏/想刷新快照时用得上）。
+ *  文字一律**短**（用户："按钮字太多"，窄边条里会被挤成竖排），完整含义进 title。
  */
 function modelActions(m) {
   if (!m) return "";
+  const ready = !!m.ready;
+  const cls = ready ? "act-link" : "btn mini";          // 已就绪 → 文字链接；未就绪 → 按钮
   const btns = [];
   if (m.downloadable !== false && m.source !== "copy") {
-    btns.push(`<button class="btn mini" data-msdl="${esc(m.id)}" data-force="${m.ready ? "1" : "0"}"
-      title="${m.ready ? "重新下载（覆盖现有文件）" : "从上游下载到本机"}">下载</button>`);
+    btns.push(`<button class="${cls}" data-msdl="${esc(m.id)}" data-force="${ready ? "1" : "0"}"
+      title="${ready ? "重新下载（覆盖现有文件）" : "从上游下载到本机"}">${ready ? "重新下载" : "下载"}</button>`);
   }
   if (m.cmd) {
-    btns.push(`<button class="btn mini" data-mcopy="${esc(m.cmd)}"
+    btns.push(`<button class="${cls}" data-mcopy="${esc(m.cmd)}"
       title="${esc(m.cmd_label || "复制下载命令")}">复制命令</button>`);
   }
   if (m.source === "copy") {
-    btns.push(`<button class="btn mini" data-mcopy="${esc(m.target)}"
+    btns.push(`<button class="${cls}" data-mcopy="${esc(m.target)}"
       title="复制落地路径：${esc(m.target)}">复制路径</button>`);
   }
   for (const link of (m.links || [])) {
     if (String(link.url || "").startsWith("https://huggingface.co/"))
-      btns.push(`<a class="btn mini" href="${esc(link.url)}" target="_blank" rel="noopener noreferrer"
+      btns.push(`<a class="${cls}" href="${esc(link.url)}" target="_blank" rel="noopener noreferrer"
         title="${esc(link.label || "官方页面")}">链接</a>`);
   }
   return btns.join("");
