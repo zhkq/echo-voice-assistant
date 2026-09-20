@@ -29,6 +29,13 @@
 #     -SkipDesktopLnk     不装桌面快捷方式
 #     -SkipDshCheck       跳过 DSH Desktop 检测
 #     -SkipStart          结束后不询问是否立即启动 ECHO
+#     -PipIndex <url>     用国内 pip 镜像装基础依赖（可选，例如
+#                         https://pypi.tuna.tsinghua.edu.cn/simple）；不传就用官方 PyPI
+#
+# 在线创建 runtime-core 的三级降级（都不需要 GitHub）：
+#     uv venv --python 3.11 → py -3.11 -m venv → **python.org 嵌入包 + get-pip**
+#   ⚠ 前两级依赖 GitHub 资产（uv 自带的 CPython 从 objects.githubusercontent.com 拉），
+#     公司网常封它 —— 第三级只依赖 python.org 与 PyPI，是内网的正解（2026-09-21 实测）。
 #
 # 编码声明：本文件必须保持 UTF-8 带 BOM（WinPS 5.1 才能正确解析中文）。
 # =====================================================================
@@ -44,7 +51,8 @@ param(
     [switch]$SkipStartupLnk,
     [switch]$SkipDesktopLnk,
     [switch]$SkipDshCheck,
-    [switch]$SkipStart
+    [switch]$SkipStart,
+    [string]$PipIndex = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -423,6 +431,56 @@ function Get-RuntimeCorePython([string]$dir) {
     return ''
 }
 
+function Install-EmbeddedPython([string]$rcDir) {
+    # 从 python.org 的"嵌入包"造一个可重定位 CPython —— **不需要 uv、不需要 GitHub、不需要预装 Python**。
+    #
+    # 为什么必须有这么一级（2026-09-21 实测）：`uv` 以及它要用的 CPython 都从 GitHub 资产下载，
+    # 内网/被污染的网络上会直接失败（实测 objects.githubusercontent.com 不通），而
+    # **python.org 与 PyPI 是通的**。嵌入包只有 ~11 MB，自带 python.exe 与 pythonw.exe。
+    #
+    # 两个必须做的收尾：
+    #   1. `._pth` 里打开 `import site`，否则 pip 装的包 import 不到；
+    #   2. `._pth` 里加上安装根（`..`）—— 嵌入包是 **isolated 模式**：cwd 与 PYTHONPATH
+    #      都不算数，`import app` 只能靠这一行（2026-09-21 实测踩到）。
+    $url = 'https://www.python.org/ftp/python/3.11.9/python-3.11.9-embed-amd64.zip'
+    $zip = Join-Path $env:TEMP ('echo-py-embed-' + [guid]::NewGuid().ToString('N').Substring(0, 8) + '.zip')
+    Info ("下载 Python 3.11 嵌入包（约 11 MB）: {0}" -f $url)
+    try {
+        Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing -TimeoutSec 300
+    } catch {
+        Err ("下载嵌入包失败：{0}" -f $_.Exception.Message)
+        return $false
+    }
+    New-Item -ItemType Directory -Path $rcDir -Force | Out-Null
+    Invoke-Native 'tar' @('-xf', $zip, '-C', $rcDir) | Out-Null
+    Remove-Item $zip -Force -ErrorAction SilentlyContinue
+    $pth = Get-ChildItem (Join-Path $rcDir '*._pth') -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($pth) {
+        $keep = @(Get-Content $pth.FullName | Where-Object {
+            $_ -notmatch '^\s*#?\s*import site\s*$' -and $_.Trim() -ne '..' -and $_.Trim() -ne 'Lib\site-packages' })
+        Set-Content -Path $pth.FullName -Value ($keep + @('import site', 'Lib\site-packages', '..')) -Encoding ASCII
+    } else {
+        Warn '嵌入包里没有 ._pth —— ECHO 的 app 包可能 import 不到'
+    }
+    $gp = Join-Path $env:TEMP 'echo-get-pip.py'
+    Info '安装 pip（get-pip.py，来自 bootstrap.pypa.io）...'
+    try {
+        Invoke-WebRequest -Uri 'https://bootstrap.pypa.io/get-pip.py' -OutFile $gp -UseBasicParsing -TimeoutSec 180
+    } catch {
+        Err ("下载 get-pip.py 失败：{0}" -f $_.Exception.Message)
+        return $false
+    }
+    $py = Join-Path $rcDir 'python.exe'
+    $prevEA = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try { & $py $gp 2>&1 | ForEach-Object { Write-Host "      $_" -ForegroundColor Gray } }
+    finally { $ErrorActionPreference = $prevEA }
+    Remove-Item $gp -Force -ErrorAction SilentlyContinue
+    if (-not (Test-Path $py)) { Err '嵌入包解压后没有 python.exe'; return $false }
+    Ok '嵌入包运行时已就绪（python.exe / pythonw.exe）'
+    return $true
+}
+
 function Install-RuntimeCore {
     $rcDir = Join-Path $script:ExistingDir 'runtime-core'
     $rcPy = Get-RuntimeCorePython $rcDir
@@ -478,16 +536,25 @@ function Install-RuntimeCore {
         Err ("包里没有 python.exe: {0}" -f $cand)
         exit 1
     }
-    # ② 在线创建：uv 优先，其次 py 启动器
+    # ② 在线创建：uv → py 启动器 → **python.org 嵌入包**（依次降级，后者不依赖 GitHub）
+    $made = $false
     $uv = Get-Command uv -ErrorAction SilentlyContinue
     if ($uv) {
         Info '用 uv 创建 runtime-core（需要网络）...'
         & $uv.Source venv --python 3.11 $rcDir 2>&1 | ForEach-Object { Write-Host "      $_" -ForegroundColor Gray }
-    } elseif (Get-Command py -ErrorAction SilentlyContinue) {
+        $made = [bool](Get-RuntimeCorePython $rcDir)
+        if (-not $made) { Warn 'uv 这条路没成（公司网常封它依赖的 GitHub 资产）—— 改用 python.org 嵌入包' }
+    }
+    if (-not $made -and (Get-Command py -ErrorAction SilentlyContinue)) {
         Info '用 py -3.11 创建 runtime-core（需要网络）...'
         & py -3.11 -m venv $rcDir 2>&1 | ForEach-Object { Write-Host "      $_" -ForegroundColor Gray }
-    } else {
-        Err '没有 runtime-core，也没有 uv / py 可用 —— 主包自己跑不起来，必须先准备运行时。三选一：'
+        $made = [bool](Get-RuntimeCorePython $rcDir)
+    }
+    if (-not $made) {
+        $made = Install-EmbeddedPython $rcDir
+    }
+    if (-not $made) {
+        Err '没有 runtime-core，也没有 uv / py / python.org 可用 —— 主包自己跑不起来。三选一：'
         Err '  1) 把 runtime-core 离线组件包放到交付包同目录（或用 -ComponentDir 指定）'
         Err '  2) 装 uv（https://docs.astral.sh/uv/）后重跑本向导'
         Err '  3) 装 Python 3.11.x（python.org，勾选 Add to PATH）后重跑'
@@ -498,8 +565,11 @@ function Install-RuntimeCore {
     $req = Join-Path $script:ExistingDir 'requirements-core.txt'
     if (Test-Path $req) {
         Info '安装 runtime-core 基础依赖（requirements-core.txt，约 100 MB）...'
-        Invoke-Native $rcPy @('-m', 'pip', 'install', '--upgrade', 'pip') | Out-Null
-        $r = Invoke-Native $rcPy @('-m', 'pip', 'install', '-r', $req)
+        if ($PipIndex) { Info ("pip 源: {0}" -f $PipIndex) }
+        Invoke-Native $rcPy (@('-m', 'pip', 'install', '--upgrade', 'pip') +
+                             @(if ($PipIndex) { @('-i', $PipIndex) } else { @() })) | Out-Null
+        $r = Invoke-Native $rcPy (@('-m', 'pip', 'install', '-r', $req) +
+                                  @(if ($PipIndex) { @('-i', $PipIndex) } else { @() }))
         if ($r.code -ne 0) { Warn ("基础依赖安装返回非零（{0}）：{1}" -f $r.code, $r.out) }
     } else {
         Warn '包内没有 requirements-core.txt，跳过基础依赖安装'

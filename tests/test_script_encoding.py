@@ -12,7 +12,7 @@ Windows PowerShell 5.1 对**无 BOM** 的 .ps1 按系统 ANSI（本机 936/GBK�
 `docs/powershell-编码与脚本经验.md` 定的约定是「本仓库脚本一律纯 ASCII 或带 BOM」，
 但以前只是注释里的君子协定。本文件把它变成可执行断言：
 
-  1. `scripts/` 与 `dsh-failover/` 下的 .ps1 必须是合法 UTF-8；
+  1. `scripts/`、`dsh-failover/` 与 `.dsh/`（技能自带的脚本）下的 .ps1 必须是合法 UTF-8；
   2. 含非 ASCII 字节的，必须带 UTF-8 BOM；
   3. BOM 之后不得再有别的 BOM（避免双重 BOM）。
 
@@ -23,7 +23,9 @@ import os
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SCAN_DIRS = ("scripts", "dsh-failover")
+#: `.dsh/skills/**` 也扫：技能里带的脚本要在**别人的机器**上跑，正是这条守卫防的坑
+#: （2026-09-21：安装技能 `echo-install` 带了中文 .ps1）。
+SCAN_DIRS = ("scripts", "dsh-failover", ".dsh")
 UTF8_BOM = b"\xef\xbb\xbf"
 
 
