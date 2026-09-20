@@ -34,7 +34,24 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import app.db as db                                          # noqa: E402
 from app import platform as echo_platform                     # noqa: E402
 from app.config import DEFAULTS, Settings, settings           # noqa: E402
+from app.config import platform_default, platform_options     # noqa: E402
 from app.platform import darwin, linux, win32                 # noqa: E402
+
+
+def _expected_default(key):
+    """当前平台下 ``key`` 的有效默认值（= ``seed_defaults()`` 应当写进库的值）。
+
+    ``config.DEFAULTS`` 是 **Windows 基准值**，不是"当前平台的默认值"：mac/linux 的
+    ``PLATFORM_DEFAULTS`` 会覆盖其中几项（device=cpu、sttModel=base…）。所以断言必须
+    走平台接缝，写死基准值会让用例在 CI 的 mac/linux runner 上必红（2026-09-20 修）。
+    """
+    return platform_default(key, DEFAULTS[key]["value"])
+
+
+def _declared_default(mod, key):
+    """把 ``mod`` 的平台声明当作"当前平台"时，``key`` 的有效默认值。"""
+    declared = (mod.PLATFORM_DEFAULTS.get("settingDefaults") or {}).get(key)
+    return DEFAULTS[key]["value"] if declared is None else declared
 
 
 class PlatformDeclarations(unittest.TestCase):
@@ -123,13 +140,19 @@ class ConfigConsumesTheDeclarations(unittest.TestCase):
         return {r["key"]: r for r in db.all_settings()}[key]
 
     def test_current_platform_defaults_apply(self):
-        """本机（Windows）跑：写进去的就是基准值，行为零变化。"""
+        """本机平台跑：写进库的就是**本平台**的有效默认值。
+
+        Windows 上有效默认值 == ``DEFAULTS`` 基准值，所以这条在 Windows 依然等价于
+        "写进去的就是基准值，行为零变化"；但在 mac/linux 上基准值不对（device=cpu 等），
+        断言必须走平台接缝。
+        """
         settings.seed_defaults()
-        self.assertEqual(self._stored("device"), DEFAULTS["device"]["value"])
-        self.assertEqual(self._stored("sttModel"), DEFAULTS["sttModel"]["value"])
-        self.assertEqual(self._stored("ttsEngine"), DEFAULTS["ttsEngine"]["value"])
-        self.assertEqual(self._row("ttsEngine")["options"], DEFAULTS["ttsEngine"]["options"])
-        self.assertEqual(settings.get("device"), DEFAULTS["device"]["value"])
+        for key in ("device", "sttModel", "ttsEngine"):
+            self.assertEqual(self._stored(key), _expected_default(key),
+                             "%s 应写入本平台默认值" % key)
+        self.assertEqual(self._row("ttsEngine")["options"],
+                         platform_options("ttsEngine", DEFAULTS["ttsEngine"]["options"]))
+        self.assertEqual(settings.get("device"), _expected_default("device"))
 
     def test_macos_declarations_reach_the_database_and_the_panel(self):
         with self._as_platform(darwin):
@@ -146,13 +169,19 @@ class ConfigConsumesTheDeclarations(unittest.TestCase):
 
     def test_existing_database_gets_platform_options_on_reseed(self):
         """老库（键已存在）重新 seed 时，元数据（候选项）也要按平台刷新。"""
-        settings.seed_defaults()                       # 先按基准值建库
-        with self._as_platform(darwin):
-            settings.seed_defaults()                   # 再按 mac 声明 seed
+        settings.seed_defaults()                       # 先按本平台默认值建库
+        before = self._stored("device")                # 库里已有的值
+        # 挑一个 device 默认值与 before **不同**的声明来 patch："已有值不被平台默认值
+        # 顶掉"这条断言才在 win/mac/linux 三种 runner 上都有效力（若 patch 成与本平台
+        # 同值的声明，断言会退化成恒真）。
+        other = next(m for m in (win32, darwin, linux)
+                     if _declared_default(m, "device") != before)
+        with self._as_platform(other):
+            settings.seed_defaults()                   # 再按 other 平台的声明 seed
             self.assertEqual(self._row("ttsEngine")["options"],
-                             ["auto", "edge-tts", "say", "off"])
+                             list(other.PLATFORM_DEFAULTS["settingOptions"]["ttsEngine"]))
             # 但**已有值**不能被平台默认值改写（用户改过就得留着）
-            self.assertEqual(self._stored("device"), DEFAULTS["device"]["value"])
+            self.assertEqual(self._stored("device"), before)
 
     def test_user_value_beats_platform_default(self):
         with self._as_platform(darwin):

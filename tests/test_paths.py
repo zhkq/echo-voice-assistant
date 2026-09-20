@@ -295,9 +295,14 @@ class EchoRootOverrideTests(unittest.TestCase):
             # 相对路径补全以覆盖后的根为基准
             self.assertEqual(paths.resolve("models"),
                              os.path.normpath(os.path.join(tmp, "models")))
-            # 没单独指定 ECHO_DATA 时，数据根跟着安装根走（Windows 默认 {ECHO}/data）
-            self.assertEqual(os.path.normpath(paths.data_root()),
-                             os.path.normpath(os.path.join(tmp, "data")))
+            # 没单独指定 ECHO_DATA 时，数据根按**本平台**的 dataDir 声明推导：
+            # Windows 是 {ECHO}/data（跟着覆盖后的根走），mac 是
+            # ~/Library/Application Support/ECHO、linux 是 XDG（都不含 {ECHO}）。
+            # 写死 join(tmp, "data") 会让这条在 CI 的 mac/linux runner 上必红（2026-09-20 修）。
+            spec = paths._platform_defaults().get("dataDir") or "{ECHO}/data"
+            self.assertEqual(
+                os.path.normpath(paths.data_root()),
+                os.path.normpath(os.path.expanduser(spec).replace("{ECHO}", tmp)))
             # 显式 ECHO_DATA 依然优先
             other = tempfile.mkdtemp(prefix="echo-data-")
             os.environ["ECHO_DATA"] = other
