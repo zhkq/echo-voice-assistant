@@ -548,6 +548,42 @@ def _credential_rows(kind: str, provider_id: str, values: dict) -> list:
     return rows
 
 
+def _agent_backend_rows(choice: str) -> list:
+    """向导的智能体选择 → **面板那套**设置（键与值都必须与面板一致）。
+
+    面板切换智能体时写的是（`web/app.js` 的 `data-agent-toggle`）：
+    ``agentBackend = <智能体名>`` **加上**该产品自己的启用开关（`config_key`，如
+    ``agentHarnessEnabled``）——"选中即启用"，两个开关不留矛盾。
+
+    向导原来直接把**组件 id** 当智能体名写（`agent-harness`），而注册表里的名字是
+    `harness` / `dsh` / `codebuddy`：`agents.active_name()` 发现名字不认识就降级回 dsh，
+    于是用户在向导里选了「标准版」**静默不生效**；又漏了启用开关，`harness_proc.requested()`
+    恒为 False —— harness 永远不会被拉起。（2026-09-20 实测踩到，两处一起。）
+
+    认不出的名字**一个字都不写**：宁可不动，也不要往 `agentBackend` 里写一个无效值。
+    """
+    cid = str(choice or "").strip()
+    if not cid:
+        return []
+    want = cid[len("agent-"):] if cid.startswith("agent-") else cid
+    try:
+        from app import agents as agents_mod
+        known = list(agents_mod.names())
+        cfg_key = ""
+        for cls in agents_mod.specs():
+            if getattr(cls, "name", "") == want:
+                cfg_key = str(getattr(cls, "config_key", "") or "")
+                break
+    except Exception:
+        return []                       # 注册表拿不到就不猜
+    if want not in known:
+        return []
+    rows = [{"key": "agentBackend", "value": want}]
+    if cfg_key:
+        rows.append({"key": cfg_key, "value": True})
+    return rows
+
+
 def _setting_updates(choices: dict) -> list:
     """三处位置 + provider + 智能体 → 设置项。只写用户真的填了的（空值不覆盖已有配置）。"""
     locs = dict(choices.get("locations") or {})
@@ -562,7 +598,9 @@ def _setting_updates(choices: dict) -> list:
         rows.append({"key": "worklogEnabled", "value": True})
     agent = str(choices.get("agent", "") or "").strip()
     if agent:
-        rows.append({"key": "agentBackend", "value": agent})
+        # 智能体：写**面板那套**设置（名字要是注册表里的名字，而不是组件 id），
+        # 否则选择会静默失效、harness 也不会被拉起（详见 `_agent_backend_rows`）。
+        rows += _agent_backend_rows(agent)
     if choices.get("asrOnline"):
         rows.append({"key": "providerAsr", "value": "openai-asr"})
     llm_provider = llm_provider_id(choices)
@@ -729,6 +767,20 @@ def build_plan(choices: dict) -> dict:
     }
 
 
+def apply_settings_effects(updated, *, harness_timeout=None) -> list:
+    """写配置后的**联动**：唤醒起停 / 路由热重载 / 独立 harness 随选随起。
+
+    真身是 `app/settings_effects.py`（与 `PUT /api/settings` 共用同一份，不许各写一遍）。
+    这一层包一下是为了：① 可被测试整体替换（见 `tests/test_wizard.py` 的 `_PATCHED`）；
+    ② 给 harness 一个**短超时** —— 本函数跑在 `POST /api/wizard/execute` 的请求线程里，
+    不能让"开始准备"为了等它就绪卡满 `READY_TIMEOUT`（60s）。拉起照旧发生，只是不在这里等。
+    """
+    from app import settings_effects
+    if harness_timeout is None:
+        harness_timeout = settings_effects.WIZARD_HARNESS_TIMEOUT
+    return settings_effects.apply(updated, harness_timeout=harness_timeout)
+
+
 def execute_plan(plan: dict = None, *, choices: dict = None,
                  settings_update=None, start_download=None, ready=None,
                  plan_file: str = "") -> dict:
@@ -763,6 +815,23 @@ def execute_plan(plan: dict = None, *, choices: dict = None,
             result["ok"] = False
             result["failed"].append({"component": "(设置)", "error": "%s: %s"
                                      % (type(exc).__name__, exc)})
+        else:
+            # 写配置后的**联动**：唤醒起停 / 路由热重载 / 独立 harness 随选随起。
+            # 必须做 —— 否则"在向导里选了标准版"只会留下一行设置，harness 不会起来
+            # （2026-09-20 实测：`agentBackend` 写了但 `harness_proc.requested()` 恒假，
+            #  且这段联动原先只长在 `PUT /api/settings` 里）。与面板共用同一份逻辑。
+            try:
+                effects = apply_settings_effects(result["config"])
+            except Exception as exc:
+                effects = [{"scope": "(联动)", "ok": False,
+                            "detail": "%s: %s" % (type(exc).__name__, exc)}]
+            result["effects"] = effects
+            for eff in effects:
+                if not eff.get("ok"):
+                    # 只登记不中断：某个联动没成不该让整场安装停在第一步。
+                    result["ok"] = False
+                    result["failed"].append({"component": "(%s 联动)" % eff.get("scope"),
+                                             "error": str(eff.get("detail") or "")})
 
     # ② 依次触发下载
     for item in built.get("downloads") or []:

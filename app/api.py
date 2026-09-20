@@ -267,36 +267,18 @@ def get_settings(_auth=Depends(optional_auth)):
 @router.put("/settings")
 def put_settings(body: SettingsIn, _auth=Depends(optional_auth)):
     updated = settings.update(body.values)
-    # 配置变更后的联动
-    if any(k.startswith("wake") for k in updated):
-        runtime.stop_wake()
-        if settings.get("wakeEnabled", False):
-            runtime.start_wake()
-    if any(k.startswith("router") for k in updated):
-        # 路由相关项（探测间隔/组名/自动注册）落到 dsh-failover/config.json 并热重载
-        from app import router_admin
-        ok, detail = router_admin.apply_settings(updated)
-        if not ok:
-            raise HTTPException(status_code=400, detail=f"路由配置未能应用：{detail}")
-    # 智能体相关项：清实例缓存，让新选择/新路径立即生效
-    if any(k.startswith("agent") or k.startswith("harness") for k in updated):
-        try:
-            from app import agents
-            agents.reset()
-        except Exception:
-            pass
-        # 独立 harness 随选随起/随走随停（只停 ECHO 自己起的那个，用户手起的实例不动）
-        try:
-            from app import harness_proc
-            if harness_proc.requested():
-                ok, msg = harness_proc.ensure_running()
-                if not ok:
-                    # 不抛 400：选择已经生效，只是服务没起来 —— 面板的「检测」会显示原因
-                    print("[api] 拉起独立 harness 未成功: %s" % msg)
-            else:
-                harness_proc.stop()
-        except Exception as e:
-            print("[api] harness 联动失败: %s" % e)
+    # 配置变更后的联动：wake / router / 智能体-harness。
+    # **抽到 app/settings_effects.py**：这段原来只长在这里，于是不走这个 HTTP 接口的写入
+    # 都享受不到它 —— 向导执行相就是调 `settings.update()` 的，实测"在向导里选了标准版"
+    # 从来没把 harness 拉起来（2026-09-20）。
+    from app import settings_effects
+    for eff in settings_effects.apply(updated):
+        if eff["scope"] == "router" and not eff["ok"]:
+            # 路由配置没应用上要明确失败（原来就是 400）；其余联动只记日志，
+            # 选择已经生效，只是服务/进程没起来 —— 面板的「检测」会显示原因。
+            raise HTTPException(status_code=400, detail=f"路由配置未能应用：{eff['detail']}")
+        if not eff["ok"]:
+            print("[api] %s 联动未成功: %s" % (eff["scope"], eff["detail"]))
     return {"ok": True, "updated": updated}
 
 

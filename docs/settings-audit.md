@@ -37,7 +37,7 @@
 | `meetingKeepRawAudio` | meeting | - | - | **OK** | app/meeting.py:1925 | - | - |
 | `meetingSegmentMinutes` | meeting | - | - | **OK** | app/meeting.py:159<br>app/meeting.py:175<br>app/meeting.py:486 | - | - |
 | `meetingWorkspace` | meeting | - | - | **OK** | app/meeting.py:876 | - | - |
-| `device` | model | - | - | **OK** | app/api.py:158<br>app/api.py:610<br>app/assistant.py:305<br>app/boot.py:332 | web/app.js:2147<br>web/app.js:2199 | - |
+| `device` | model | - | - | **OK** | app/api.py:158<br>app/api.py:592<br>app/assistant.py:305<br>app/boot.py:332 | web/app.js:2147<br>web/app.js:2199 | - |
 | `meetingDiarize` | model | - | - | **OK** | app/meeting.py:161<br>app/meeting.py:490 | web/app.js:2200 | - |
 | `meetingSttModel` | model | - | - | **OK** | app/meeting.py:157<br>app/meeting.py:378<br>app/meeting.py:483<br>mac/run_mac.py:40 | web/app.js:1509<br>web/app.js:2143<br>web/app.js:2197 | - |
 | `sttModel` | model | - | - | **OK** | app/assistant.py:296<br>app/meeting.py:170<br>app/meeting.py:483<br>app/meeting.py:550 | web/app.js:1508<br>web/app.js:2143<br>web/app.js:2196 | - |
@@ -70,7 +70,7 @@
 | `commandTargetWorkspace` | voice | command | - | **OK** | app/assistant.py:399 | web/app.js:899 | - |
 | `commandWorkspace` | voice | command | - | **OK** | app/agents/dsh_agent.py:519<br>app/agents/dsh_agent.py:568 | - | - |
 | `consumeMediaKey` | voice | record | - | **OK** | app/platform/win32/hotkey.py:148 | - | - |
-| `inputDeviceId` | voice | record | - | **OK** | app/api.py:1242<br>app/assistant.py:327<br>app/assistant.py:336<br>app/meeting.py:176 | - | - |
+| `inputDeviceId` | voice | record | - | **OK** | app/api.py:1224<br>app/assistant.py:327<br>app/assistant.py:336<br>app/meeting.py:176 | - | - |
 | `maxBriefChars` | voice | speech | - | **OK** | app/assistant.py:512 | - | - |
 | `maxRecordMs` | voice | record | - | **OK** | app/assistant.py:323 | - | - |
 | `minimalReply` | voice | speech | - | **OK** | app/assistant.py:121 | - | - |
@@ -91,7 +91,7 @@
 | `wakeConfirmN` | wake | - | - | **OK** | app/audio/wake.py:289<br>app/audio/wake.py:301 | - | - |
 | `wakeConfirmX` | wake | - | - | **OK** | app/audio/wake.py:288<br>app/audio/wake.py:300 | - | - |
 | `wakeCooldownSec` | wake | - | - | **OK** | app/audio/wake.py:287 | - | - |
-| `wakeEnabled` | wake | - | - | **OK** | app/api.py:273<br>app/boot.py:397<br>app/runtime.py:270<br>mac/mac_runtime.py:243 | - | - |
+| `wakeEnabled` | wake | - | - | **OK** | app/boot.py:397<br>app/runtime.py:270<br>app/settings_effects.py:53<br>mac/mac_runtime.py:243 | - | - |
 | `wakeKeywords` | wake | - | - | **OK** | app/assistant.py:65<br>app/audio/wake.py:186<br>app/audio/wake.py:227 | - | - |
 | `wakePaused` | wake | - | - | **OK** | app/audio/wake.py:293<br>app/audio/wake.py:299<br>app/audio/wake.py:313 | - | - |
 | `wakeSilenceFloor` | wake | - | - | **OK** | app/audio/wake.py:290 | - | - |

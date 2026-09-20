@@ -22,7 +22,9 @@ from app import wizard
 
 #: 会被打桩的模块级函数（一个都不能漏还原：`wizard.plat` 就是共享的 `app.platform`，
 #: 不还原会污染其它测试，造成顺序相关的假红）
-_PATCHED = ("locations_report", "network_report", "audio_report", "node_report", "agent_report")
+_PATCHED = ("locations_report", "network_report", "audio_report", "node_report", "agent_report",
+            # 写配置后的联动：真跑会去起/停 harness 与唤醒监听，测试里必须哑掉（见 _PlanTestCase）
+            "apply_settings_effects")
 
 
 class _WizardTestCase(unittest.TestCase):
@@ -213,6 +215,9 @@ class _PlanTestCase(_WizardTestCase):
         self._orig_ready = modelinfo.ready
         components.load_manifests = lambda root=None: [dict(x) for x in _FIXTURE_COMPONENTS]
         modelinfo.ready = lambda mid: (mid == "sherpa")
+        # 写配置后的联动在测试里哑掉：真做会去起/停独立 harness（npx）与唤醒监听，
+        # 既慢又动本机进程。要验它的测试自己把它换成记录器（见 EffectsTests）。
+        wizard.apply_settings_effects = lambda updated, **kw: []
 
     def tearDown(self):
         components.load_manifests = self._orig_manifests
@@ -262,9 +267,26 @@ class BuildPlanTests(_PlanTestCase):
         self.assertTrue(plan["summary"]["egress"], "确认页要能直接拿到出网声明")
         self.assertIn("providerAsr", [c["key"] for c in plan["config"]])
 
-    def test_agent_choice_writes_backend(self):
-        plan = wizard.build_plan({"agent": "agent-harness"})
-        self.assertIn({"key": "agentBackend", "value": "agent-harness"}, plan["config"])
+    def test_agent_choice_writes_the_backend_name_not_the_component_id(self):
+        """选「标准版」要写**注册表里的名字** + 它自己的启用开关（与面板那套一致）。
+
+        2026-09-20 实测踩到两处：向导原来把**组件 id** 当名字写（`agent-harness`），
+        `agents.active_name()` 不认这个名字 → 静默降级回 dsh，用户的选择等于没生效；
+        而且漏了 `agentHarnessEnabled`，`harness_proc.requested()` 恒假 → harness 永不拉起。
+        """
+        cfg = {c["key"]: c["value"]
+               for c in wizard.build_plan({"agent": "agent-harness"})["config"]}
+        self.assertEqual(cfg["agentBackend"], "harness")
+        self.assertIs(cfg["agentHarnessEnabled"], True)
+        # 没有 config_key 的产品（dsh）不需要额外开关
+        cfg2 = {c["key"]: c["value"] for c in wizard.build_plan({"agent": "dsh"})["config"]}
+        self.assertEqual(cfg2["agentBackend"], "dsh")
+        self.assertNotIn("agentHarnessEnabled", cfg2)
+
+    def test_unknown_agent_name_writes_nothing(self):
+        """认不出的名字一个字都不写 —— 绝不往 `agentBackend` 里塞无效值。"""
+        keys = [c["key"] for c in wizard.build_plan({"agent": "no-such-agent"})["config"]]
+        self.assertNotIn("agentBackend", keys)
 
     def test_unknown_component_is_reported_not_installed(self):
         plan = wizard.build_plan({"engines": ["nope"]})
@@ -338,6 +360,39 @@ class ExecutePlanTests(_PlanTestCase):
         self.assertEqual(saved["state"], "running")
         self.assertIn("built", saved)
         self.assertIn("execution", saved)
+
+    def test_config_write_runs_the_shared_effects(self):
+        """写配置后必须跑**联动**（唤醒 / 路由 / 独立 harness）。
+
+        2026-09-20 实测踩到：这段联动原先只长在 `PUT /api/settings` 里，而向导执行相直接调
+        `settings.update()` —— 于是"在向导里选了标准版"只留下一行设置，harness 永远不起来。
+        """
+        calls = []
+
+        def fake_effects(updated, **kw):
+            calls.append(list(updated))
+            return [{"scope": "agent", "ok": False, "detail": "找不到 npx：需要本机有 Node.js"}]
+
+        wizard.apply_settings_effects = fake_effects
+        plan = wizard.build_plan({"agent": "agent-harness"})
+        result = wizard.execute_plan(plan, plan_file=self._plan_file(),
+                                     settings_update=lambda values: list(values),
+                                     start_download=lambda mid: (True, "ok"),
+                                     ready=lambda mid: True)
+        self.assertEqual(calls, [["agentBackend", "agentHarnessEnabled"]])
+        self.assertFalse(result["ok"], "联动失败要登记进结果（末页据此回答「还不能做什么」）")
+        self.assertTrue(any("agent" in str(f.get("component") or "") for f in result["failed"]))
+
+    def test_effects_success_leaves_the_run_ok(self):
+        wizard.apply_settings_effects = lambda updated, **kw: [
+            {"scope": "agent", "ok": True, "detail": "独立 harness 启动中"}]
+        plan = wizard.build_plan({"agent": "agent-harness"})
+        result = wizard.execute_plan(plan, plan_file=self._plan_file(),
+                                     settings_update=lambda values: list(values),
+                                     start_download=lambda mid: (True, "ok"),
+                                     ready=lambda mid: True)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["effects"][0]["scope"], "agent")
 
     def test_state_view_speaks_the_ui_language(self):
         target = self._plan_file()

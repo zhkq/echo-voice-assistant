@@ -280,14 +280,19 @@ def forget_token():
         pass
 
 
-def ensure_running():
+def ensure_running(timeout=None):
     """确保 harness 在跑。幂等。返回 ``(ok, detail)``。
+
+    ``timeout``：等它就绪的上限（秒），``None`` 用 ``READY_TIMEOUT``（60s，首次 npx 装插件
+    确实要那么久）。向导执行相传一个小值（见 `settings_effects.WIZARD_HARNESS_TIMEOUT`）——
+    它是在 HTTP 请求线程里跑的，不能让"开始准备"卡满一分钟；拉起本身照旧发生，只是不在这里等。
 
     并发安全：boot 的启动步骤与「切换智能体」的联动可能几乎同时调进来，
     所以"探活 → 决定是否 Popen"这段必须**串行**（否则会拉起两个实例 ——
     实测过：43199 与 43206 两个 node 同时在跑）。
     """
     global _proc, _proc_pid, _last_launch
+    wait_for = READY_TIMEOUT if timeout is None else max(0.0, float(timeout))
     conflict = port_conflict()
     if conflict:
         return False, conflict
@@ -337,7 +342,7 @@ def ensure_running():
         pass
     threading.Thread(target=_read_output, args=(proc,), daemon=True,
                      name="harness-log").start()
-    deadline = time.monotonic() + READY_TIMEOUT
+    deadline = time.monotonic() + wait_for
     while time.monotonic() < deadline:
         if proc.poll() is not None:
             return False, ("独立 harness 启动后立即退出（code=%s）——命令或环境有问题，"
