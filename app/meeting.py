@@ -75,7 +75,7 @@ _state = {
 }
 # 录音状态锁：start/stop 必须原子化 —— 否则并发 stop（如面板按钮双击/重复请求）
 # 会同时通过 active 检查，造成重复转写 + 重复纪要（日志里出现过两次“停止录音”同秒）。
-_state_lock = threading.Lock()
+_state_lock = threading.RLock()
 _retranscribing = {"set": set(), "lock": threading.Lock()}
 
 # 转写进度：meeting_id -> {phase, seg_index, seg_total, percent, detail, updated_at}
@@ -143,6 +143,9 @@ def start_meeting():
     with _state_lock:
         if _state["active"]:
             return False, "会议录音已在进行中"
+        old = _state["recorder"]
+        if old and old.thread and old.thread.is_alive():
+            return False, "上次录音尚未退出，请稍后重试；持续异常请重启 ECHO"
         cfg = settings
         now = datetime.datetime.now()
         folder = os.path.join(meetings_dir(), now.strftime("%Y-%m-%d_%H-%M-%S"))
@@ -179,17 +182,28 @@ def start_meeting():
         # 却一条音频都没录到（2026-09-16 空会议就是设备打不开后线程静默退出）。
         if not recorder.wait_started(timeout=6):
             err = recorder.error or "打开麦克风超时（设备被占用或权限不足）"
-            recorder.stop()
+            stopped = recorder.stop()
             db.update_meeting(meeting_id, status="error")
-            _state.update(active=False, folder=None, recorder=None, level=0.0, error=err)
+            _state.update(active=False, folder=None, recorder=None if stopped else recorder,
+                          started_at=None, level=0.0, error=err)
             db.add_log("error", "meeting", f"开始录音失败（{os.path.basename(folder)}）：{err}")
             return False, f"无法开始录音：{err}"
 
         _state.update(active=True, folder=folder, recorder=recorder,
                       started_at=meta["start"], error="")
+        threading.Thread(target=_watch_recorder, args=(recorder,), daemon=True).start()
         db.add_event("meeting_started", {"meeting": os.path.basename(folder), "id": meeting_id})
         db.add_log("info", "meeting", f"开始录音: {os.path.basename(folder)}")
         return True, os.path.basename(folder)
+
+
+def _watch_recorder(recorder):
+    """An unexpected device failure must not leave the UI claiming it is recording."""
+    recorder.thread.join()
+    with _state_lock:
+        if _state["recorder"] is recorder and _state["active"]:
+            recorder.error = recorder.error or "录音意外结束"
+            stop_meeting()
 
 
 def stop_meeting():
@@ -198,7 +212,10 @@ def stop_meeting():
             return False, "没有进行中的会议"
         recorder = _state["recorder"]
         folder = _state["folder"]
-        recorder.stop()
+        if not recorder.stop():
+            err = "麦克风尚未释放，录音正在停止；请勿重复开麦，持续异常请重启 ECHO"
+            _state.update(error=err, level=0.0)
+            return False, err
         _state.update(active=False, level=0.0, recorder=None)
 
         meta_path = os.path.join(folder, "meta.json")
@@ -212,6 +229,16 @@ def stop_meeting():
         _state["folder"] = None
 
         meeting = db.get_meeting_by_name(os.path.basename(folder))
+        if recorder.error and segs:
+            if meeting:
+                db.update_meeting(meeting["id"], ended_at=meta["end"],
+                                  duration_seconds=meta["durationSeconds"],
+                                  segments=len(segs), status="interrupted")
+            err = f"录音中断：{recorder.error}；已保留音频，可手动重新转写"
+            _state.update(error=err)
+            db.add_event("meeting_stopped", {"meeting": os.path.basename(folder), "error": err})
+            db.add_log("error", "meeting", err)
+            return False, err
         if not segs:
             # 没录到任何音频：直接标 error，不再假装"转写中"（否则永远卡住，
             # 因为转写拿到 0 分段会立刻返回）。见 2026-09-16 的设备打开失败。

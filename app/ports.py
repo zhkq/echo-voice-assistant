@@ -225,3 +225,31 @@ def resolve_port(preferred: int, *, host: str = "127.0.0.1", data_root: Optional
     if port and data_root:
         write_port_file(data_root, port)
     return port, note
+
+
+def active_port(default: int = 8970, data_root: Optional[str] = None) -> int:
+    """ECHO 当前**实际**监听端口：``echo-port.txt`` 优先，读不到才回退 ``default``。
+
+    为什么不能用 ``settings.serverPort``：那只是**首选**端口。被占用或落在
+    Windows 保留段时，``main.py`` 会让位并把实际端口写回 ``echo-port.txt``
+    （见 ``pick()`` / ``write_port_file()``）。面板/边条/浏览器若仍按配置打开，
+    就会连到没人监听的旧端口 —— 页面已渲染但所有请求失败，点按钮报
+    "Load failed"（2026-09-20 实际事故：ECHO 让位到 8971，边条还开在 8970）。
+
+    ``data_root`` 省略时用 ``paths.data_root()``（惰性导入，避免循环依赖）。
+    """
+    if data_root is None:
+        try:
+            from app import paths
+            data_root = paths.data_root()
+        except Exception:
+            data_root = ""
+    if data_root:
+        port = read_port_file(data_root, 0)
+        if 0 < port <= 65535:
+            return port
+    try:
+        default = int(default)
+    except (TypeError, ValueError):
+        return 0
+    return default if 0 < default <= 65535 else 0

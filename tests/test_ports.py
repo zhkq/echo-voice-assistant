@@ -194,6 +194,14 @@ class PortFileTests(unittest.TestCase):
         self.assertGreater(port, 0)
         self.assertEqual(ports.read_port_file(self.tmp), port)
 
+    def test_active_port_prefers_file_over_configured_default(self):
+        """ECHO 让位后实际端口在 echo-port.txt；active_port 必须优先它，而不是首选端口。"""
+        ports.write_port_file(self.tmp, 8971)
+        self.assertEqual(ports.active_port(default=8970, data_root=self.tmp), 8971)
+
+    def test_active_port_falls_back_when_no_file(self):
+        self.assertEqual(ports.active_port(default=18060, data_root=self.tmp), 18060)
+
 
 if __name__ == "__main__":
     unittest.main()

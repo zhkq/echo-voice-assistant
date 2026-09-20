@@ -3,8 +3,16 @@
 DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$DIR"
 
+if [ -z "${ECHO_DATA:-}" ] && [ -f "$DIR/data/echo.db" ]; then
+  export ECHO_DATA="$DIR/data"
+fi
+
 PID_FILE="data/echo-mac.pid"
-PORT="$(./venv/bin/python -c "from app.config import settings; print(int(settings.get('serverPort', 8970)))" 2>/dev/null || echo 8970)"
+# 端口优先取 echo-port.txt（ECHO 让位后的实际端口）；读不到才回退配置的首选端口。
+PORT="$(cat data/echo-port.txt 2>/dev/null || true)"
+if [ -z "$PORT" ]; then
+  PORT="$(./venv/bin/python -c "from app.config import settings; print(int(settings.get('serverPort', 8970)))" 2>/dev/null || echo 8970)"
+fi
 
 is_echo_pid() {
   case "${1:-}" in ''|*[!0-9]*) return 1 ;; esac

@@ -13,7 +13,7 @@ import app.assistant as assistant
 from app.audio.wake import WakeListener, engine_label as wake_engine_label
 from app.config import settings
 from app.hotkey import HotkeyListener
-from app import paths, services
+from app import paths, ports, services
 from app import platform as echo_platform
 
 _hotkey = None
@@ -62,7 +62,8 @@ def _spawn_sidebar(collapsed: bool = False):
     exe = sidebar_exe_path()
     if not exe:
         return False
-    port = int(settings.get("serverPort", 8970))
+    # 实际端口，不是首选端口：ECHO 让位后 echo-port.txt 才是权威（否则边条开在死端口）。
+    port = ports.active_port(int(settings.get("serverPort", 8970)))
     args = [exe, f"--url=http://127.0.0.1:{port}/", "--width=450"]
     if collapsed:
         args.append("--collapsed")
@@ -170,7 +171,7 @@ def open_panel_window():
         return False
     _panel_last_open = now
 
-    port = int(settings.get("serverPort", 8970))
+    port = ports.active_port(int(settings.get("serverPort", 8970)))
     url = f"http://127.0.0.1:{port}/"
     mode = str(settings.get("panelOpenMode", "app") or "app")
 
