@@ -991,6 +991,46 @@ def api_wizard_plan_put(body: WizardPlanIn, _auth=Depends(optional_auth)):
     return {"plan": wizard.save_plan(body.plan or {})}
 
 
+class WizardChoicesIn(BaseModel):
+    choices: dict = {}
+
+
+@router.post("/wizard/preview")
+def api_wizard_preview(body: WizardChoicesIn, _auth=Depends(optional_auth)):
+    """确认页的数据：把选择展开成"将下载什么、合计多大、将写哪些设置"。
+
+    **纯计算**（除了把状态记成 reviewing）：用户在这一页还能返回改，什么都还没落地。
+    """
+    from app import wizard
+    built = wizard.build_plan(body.choices or {})
+    plan = wizard.load_plan()
+    plan["state"] = "reviewing"
+    plan["choices"] = dict(body.choices or {})
+    plan["built"] = built
+    wizard.save_plan(plan)
+    return {"plan": built}
+
+
+@router.post("/wizard/execute")
+def api_wizard_execute(body: WizardChoicesIn, _auth=Depends(optional_auth)):
+    """执行相：**先写配置，再依次触发下载**；已就绪的跳过，单项失败不中断其余。
+
+    这里不再问任何问题（设计 §1）—— 请求本身就是"确认页点下开始"那一下。
+    """
+    from app import wizard
+    return {"result": wizard.execute_plan(choices=body.choices or {})}
+
+
+@router.get("/wizard/state")
+def api_wizard_state(_auth=Depends(optional_auth)):
+    """执行相的状态：每项 排队中 / 正在下载 / 好了 / 没成 / 已跳过 + 总进度。
+
+    复用 ``modelinfo.jobs()`` 的真实进度，所以关掉面板再打开也能接着看。
+    """
+    from app import wizard
+    return wizard.execution_state()
+
+
 # ---------------------------------------------------------------- 能力 provider（P5 / D25）
 # ASR / LLM / TTS 三类能力的统一清单：谁在生效、是不是要出网（egress）、就绪与否。
 # 与 /api/components 的分工：**components = 装什么**（模型/引擎/运行时的安装与就绪），

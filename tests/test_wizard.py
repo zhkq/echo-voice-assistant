@@ -14,6 +14,8 @@ import os
 import tempfile
 import unittest
 
+from app import components
+from app import modelinfo
 from app import paths
 from app import wizard
 
@@ -170,6 +172,174 @@ class PlanStoreTests(_WizardTestCase):
         target = self._plan_file()
         saved = wizard.save_plan({"choices": "nope"}, target)
         self.assertEqual(saved["choices"], {})
+
+
+#: 组件清单的替身：只保留测试要用的形状（真清单会随产品演进，测试不该跟着抖）
+_FIXTURE_COMPONENTS = [
+    {"id": "stt-sherpa", "name": "sherpa-onnx 流式转写", "model_id": "sherpa",
+     "size_mb": 189, "how": "面板下载"},
+    {"id": "stt-whisper-base", "name": "Whisper base", "model_id": "whisper-base",
+     "size_mb": 141, "how": "面板下载"},
+    {"id": "wake-kws", "name": "唤醒词 KWS", "model_id": "kws", "size_mb": 40, "how": ""},
+    {"id": "diarize-pyannote", "name": "说话人分离（pyannote）", "model_id": "pyannote",
+     "size_mb": 32, "never_ship": True, "how": "需要 HF 授权"},
+    {"id": "accel-cuda", "name": "CUDA 加速", "size_mb": 2500,
+     "command": "python -m pip install torch", "how": "按显卡驱动安装"},
+    {"id": "agent-harness", "name": "独立 DeepSeek Harness（本机服务）", "size_mb": 0,
+     "command": "npx -y @deepseek-ai/dsh web", "how": "随选随起"},
+]
+
+
+class _PlanTestCase(_WizardTestCase):
+    """把组件清单与就绪探测换成替身：测的是**计划的形状与顺序**，不是本机装了什么。
+
+    约定：只有 ``sherpa`` 是"已就绪"的 —— 用来钉"已就绪的不重复下载"。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self._orig_manifests = components.load_manifests
+        self._orig_ready = modelinfo.ready
+        components.load_manifests = lambda root=None: [dict(x) for x in _FIXTURE_COMPONENTS]
+        modelinfo.ready = lambda mid: (mid == "sherpa")
+
+    def tearDown(self):
+        components.load_manifests = self._orig_manifests
+        modelinfo.ready = self._orig_ready
+        super().tearDown()
+
+
+class BuildPlanTests(_PlanTestCase):
+
+    def test_only_missing_packages_are_scheduled(self):
+        plan = wizard.build_plan({"engines": ["stt-sherpa", "stt-whisper-base"]})
+        self.assertEqual([d["component"] for d in plan["downloads"]],
+                         ["stt-sherpa", "stt-whisper-base"])
+        self.assertEqual(plan["downloadCount"], 1, "sherpa 已就绪，不该再排一次")
+        self.assertEqual(plan["todoMb"], 141)
+        self.assertEqual(plan["readyMb"], 189)
+        self.assertIn("1 项已经装好", plan["summary"]["alreadyReady"])
+
+    def test_wake_and_diarize_join_the_plan(self):
+        plan = wizard.build_plan({"wake": True, "diarize": True})
+        self.assertEqual([d["component"] for d in plan["downloads"]], ["wake-kws"])
+        diarize = [m for m in plan["manual"] if m["component"] == "diarize-pyannote"][0]
+        self.assertIn("许可证", diarize["reason"],
+                      "gated 的能力包要说清「不能随包分发」，而不是假装能装")
+
+    def test_accel_is_manual_and_comes_last(self):
+        plan = wizard.build_plan({"engines": ["stt-whisper-base"], "accel": True})
+        self.assertEqual([d["phase"] for d in plan["downloads"]], ["engines"])
+        accel = [m for m in plan["manual"] if m["component"] == "accel-cuda"][0]
+        self.assertEqual(accel["phase"], "accel")
+        self.assertTrue(accel["command"], "面板不代装的项必须给出可粘贴的命令")
+
+    def test_three_locations_become_config_writes_and_notes_enables_worklog(self):
+        plan = wizard.build_plan({"locations": {"models": self.tmp, "notes": self.tmp}})
+        keys = [c["key"] for c in plan["config"]]
+        self.assertIn("modelsDir", keys)
+        self.assertIn("worklogVaultRoot", keys)
+        self.assertIn("worklogEnabled", keys, "指了笔记库就要把归档打开")
+        self.assertNotIn("meetingsDir", keys, "没填的位置不该被写进去（不覆盖已有配置）")
+
+    def test_online_asr_is_a_provider_choice_not_a_download(self):
+        plan = wizard.build_plan({"asrOnline": True})
+        self.assertEqual(plan["downloads"], [], "在线转写不占本机空间，不该产生下载项")
+        asr = [p for p in plan["providers"] if p["kind"] == "asr"]
+        self.assertTrue(asr, "在线转写应作为 provider 选择出现")
+        self.assertTrue(asr[0]["egress"], "在线转写必须标出网")
+        self.assertTrue(plan["summary"]["egress"], "确认页要能直接拿到出网声明")
+        self.assertIn("providerAsr", [c["key"] for c in plan["config"]])
+
+    def test_agent_choice_writes_backend(self):
+        plan = wizard.build_plan({"agent": "agent-harness"})
+        self.assertIn({"key": "agentBackend", "value": "agent-harness"}, plan["config"])
+
+    def test_unknown_component_is_reported_not_installed(self):
+        plan = wizard.build_plan({"engines": ["nope"]})
+        self.assertEqual(plan["downloads"], [])
+        self.assertEqual([u["component"] for u in plan["unavailable"]], ["nope"])
+        self.assertIn("清单里没有", plan["unavailable"][0]["reason"])
+
+
+class ExecutePlanTests(_PlanTestCase):
+
+    def _plan_file(self):
+        return os.path.join(self.tmp, "wizard-plan.json")
+
+    def test_config_is_written_before_any_download(self):
+        order = []
+        plan = wizard.build_plan({"locations": {"models": self.tmp},
+                                  "engines": ["stt-whisper-base"]})
+        result = wizard.execute_plan(
+            plan, plan_file=self._plan_file(),
+            settings_update=lambda values: (order.append("settings"), list(values))[1],
+            start_download=lambda mid: (order.append(mid), (True, "ok"))[1],
+            ready=lambda mid: False)
+        self.assertEqual(order[0], "settings", "配置必须先行：下载要知道往哪写")
+        self.assertIn("whisper-base", order)
+        self.assertEqual(result["config"], ["modelsDir"])
+        self.assertTrue(result["ok"])
+
+    def test_ready_items_are_skipped_and_not_downloaded(self):
+        calls = []
+        plan = wizard.build_plan({"engines": ["stt-sherpa"]})
+        result = wizard.execute_plan(
+            plan, plan_file=self._plan_file(),
+            settings_update=lambda values: list(values),
+            start_download=lambda mid: (calls.append(mid), (True, "ok"))[1],
+            ready=lambda mid: True)
+        self.assertEqual(calls, [], "已就绪的项不该再触发下载")
+        self.assertEqual([r["component"] for r in result["skipped"]], ["stt-sherpa"])
+
+    def test_one_failure_does_not_stop_the_others(self):
+        plan = wizard.build_plan({"engines": ["stt-whisper-base", "wake-kws"]})
+        result = wizard.execute_plan(
+            plan, plan_file=self._plan_file(),
+            settings_update=lambda values: list(values),
+            start_download=lambda mid: (False, "network down") if mid == "whisper-base"
+                                       else (True, "ok"),
+            ready=lambda mid: False)
+        self.assertFalse(result["ok"])
+        self.assertEqual([r["modelId"] for r in result["failed"]], ["whisper-base"])
+        self.assertEqual([r["modelId"] for r in result["downloads"]], ["kws"],
+                         "前一项失败不能挡住后面的项")
+
+    def test_a_raising_download_is_recorded_not_propagated(self):
+        def boom(mid):
+            raise RuntimeError("kaboom")
+
+        plan = wizard.build_plan({"engines": ["stt-whisper-base"]})
+        result = wizard.execute_plan(plan, plan_file=self._plan_file(),
+                                     settings_update=lambda values: list(values),
+                                     start_download=boom, ready=lambda mid: False)
+        self.assertFalse(result["ok"])
+        self.assertIn("kaboom", result["failed"][0]["error"])
+
+    def test_plan_file_remembers_state_built_and_execution(self):
+        target = self._plan_file()
+        plan = wizard.build_plan({"engines": ["stt-whisper-base"]})
+        wizard.execute_plan(plan, plan_file=target,
+                            settings_update=lambda values: list(values),
+                            start_download=lambda mid: (True, "ok"),
+                            ready=lambda mid: False)
+        saved = wizard.load_plan(target)
+        self.assertEqual(saved["state"], "running")
+        self.assertIn("built", saved)
+        self.assertIn("execution", saved)
+
+    def test_state_view_speaks_the_ui_language(self):
+        target = self._plan_file()
+        plan = wizard.build_plan({"engines": ["stt-sherpa", "stt-whisper-base"]})
+        wizard.execute_plan(plan, plan_file=target,
+                            settings_update=lambda values: list(values),
+                            start_download=lambda mid: (True, "ok"),
+                            ready=lambda mid: mid == "sherpa")   # 只有 sherpa 已就绪
+        state = wizard.execution_state(target)
+        rows = {r["component"]: r for r in state["items"]}
+        self.assertEqual(rows["stt-sherpa"]["text"], "已经装好，跳过")
+        self.assertIn(rows["stt-whisper-base"]["text"], ("排队中", "正在下载", "好了"))
+        self.assertTrue(state["summary"].endswith("项已就绪"))
 
 
 if __name__ == "__main__":

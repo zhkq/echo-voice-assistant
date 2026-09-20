@@ -288,6 +288,8 @@ DEFAULT_PLAN = {
     "state": "draft",
     "updatedAt": "",
     "choices": {},        # 位置 / 转写方式 / 唤醒 / 分离 / 加速 / AI 服务 / 智能体 / 兜底
+    "built": {},          # 由 build_plan() 展开出来的执行计划（确认页显示、执行相执行）
+    "execution": {},      # 执行相的执行记录（谁开始了、谁跳过、谁失败）
     "note": "",
 }
 
@@ -299,12 +301,20 @@ def plan_path() -> str:
 def _normalize(data) -> dict:
     plan = dict(DEFAULT_PLAN)
     plan["choices"] = {}
+    plan["built"] = {}
+    plan["execution"] = {}
     if isinstance(data, dict):
         for key in ("state", "updatedAt", "note"):
             if key in data:
                 plan[key] = data[key]
         if isinstance(data.get("choices"), dict):
             plan["choices"] = dict(data["choices"])
+        # built / execution 必须一起保留：否则"关掉面板再打开还能接着看进度"就不成立
+        # （2026-09-20 被 test_plan_file_remembers_state_built_and_execution 抓到）。
+        if isinstance(data.get("built"), dict):
+            plan["built"] = dict(data["built"])
+        if isinstance(data.get("execution"), dict):
+            plan["execution"] = dict(data["execution"])
     plan["schema"] = PLAN_SCHEMA
     if plan.get("state") not in PLAN_STATES:
         plan["state"] = "draft"
@@ -335,3 +345,307 @@ def save_plan(data, path: str = "") -> dict:
         json.dump(plan, fh, ensure_ascii=False, indent=2)
     os.replace(tmp, target)
     return plan
+
+
+# ---------------------------------------------------------------- 决策 → 执行计划
+#
+# 用户的选择（choices）要展开成两类动作：
+#   * **下载**：能力包 → `modelinfo.start_download(model_id)`（组件清单里的 model_id 是唯一映射）；
+#   * **写配置**：三处位置、provider 选择、智能体后端 —— 不占空间但要落进设置。
+# 还有一类**面板不代装**的（CUDA 的 pip 包、gated 的 pyannote、本机服务），单独列出来并
+# 写清原因与做法（设计 §0.6：不隐藏、不假装）。
+#
+# 顺序固定（设计 §4）：配置先行（下载才知道往哪写）→ 引擎 → 加速 → 兜底。
+# runtime-core 由安装器在打开面板之前就装好，所以这里只校验、不下载。
+
+PHASE_ORDER = ("config", "engines", "accel", "fallback")
+
+PLAN_BUILD_SCHEMA = "echo-wizard-build/1"
+
+
+def _setting_updates(choices: dict) -> list:
+    """三处位置 → 设置项。只写用户真的填了的（空值不覆盖已有配置）。"""
+    locs = dict(choices.get("locations") or {})
+    rows = []
+    for key, setting_key in (("models", "modelsDir"),
+                             ("meetings", "meetingsDir"),
+                             ("notes", "worklogVaultRoot")):
+        value = str(locs.get(key, "") or "").strip()
+        if value:
+            rows.append({"key": setting_key, "value": value})
+    if str(locs.get("notes", "") or "").strip():
+        rows.append({"key": "worklogEnabled", "value": True})
+    agent = str(choices.get("agent", "") or "").strip()
+    if agent:
+        rows.append({"key": "agentBackend", "value": agent})
+    if choices.get("asrOnline"):
+        rows.append({"key": "providerAsr", "value": "openai-asr"})
+    llm = choices.get("llm") or {}
+    if str(llm.get("provider", "") or "").strip():
+        rows.append({"key": "providerLlm", "value": str(llm["provider"]).strip()})
+    # 在线服务/转写的地址与密钥：键名由 providers 层定义，向导不猜 —— 由调用方原样传入
+    extra = choices.get("extraSettings") or {}
+    if isinstance(extra, dict):
+        for key, value in extra.items():
+            if isinstance(key, str) and key.strip() and isinstance(value, (str, int, float, bool)):
+                rows.append({"key": key.strip(), "value": value})
+    return rows
+
+
+def _component_action(cid: str, manifests: dict) -> dict:
+    """一个组件 id → 一条动作（下载 / 面板不代装 / 未知）。"""
+    item = manifests.get(cid)
+    if not item:
+        return {"kind": "unknown", "component": cid, "label": cid, "approxMb": 0,
+                "reason": "清单里没有这个能力包（看 app/components.py 或 components/*.json）"}
+    label = str(item.get("name") or cid)
+    size = int(item.get("size_mb") or 0)
+    model_id = str(item.get("model_id") or "")
+    base = {"component": cid, "label": label, "approxMb": size,
+            "how": str(item.get("how") or "")}
+    # **不能随包分发 / 不许再分发**要排在 model_id 之前：pyannote 这类既有 model_id
+    # 又是 gated（modelinfo 明确不支持从接口下载），先看 model_id 会把它排成"可下载"。
+    if item.get("never_ship"):
+        out = dict(base)
+        out.update({"kind": "manual",
+                    "reason": "这个能力包不能随包分发（许可证限制），要你自己获取"})
+        return out
+    if model_id:
+        ready = None
+        try:
+            from app import modelinfo
+            ready = modelinfo.ready(model_id)
+        except Exception:
+            ready = None
+        out = dict(base)
+        out.update({"kind": "download", "modelId": model_id, "ready": ready})
+        # 引擎依赖：装了 funasr 才有 sensevoice/qwen3asr；torch 是加速的依赖
+        dep = str(item.get("pkg") or "")
+        if dep:
+            out["needs"] = dep
+        return out
+    if item.get("command"):
+        out = dict(base)
+        out.update({"kind": "manual", "reason": "需要在本机跑一个服务，面板不代装",
+                    "command": str(item["command"])})
+        return out
+    out = dict(base)
+    out.update({"kind": "manual", "reason": "这个能力包要手工准备（见说明）"})
+    return out
+
+
+def _provider_spec(kind: str, provider_id: str) -> dict:
+    """取一个 provider 的元数据（含出网声明）。取不到就返回空 dict（不编造）。
+
+    注意 ``providers.catalog()`` 的清单键是 **``providers``**（不是 ``items``）——
+    2026-09-20 这里写错一次，后果是"用户选了在线转写却被静默丢掉"。
+    """
+    try:
+        from app import providers as providers_mod
+        rows = providers_mod.catalog(ready=False).get("providers") or []
+        for row in rows:
+            if row.get("kind") == kind and row.get("id") == provider_id:
+                return {"kind": kind, "id": provider_id, "name": row.get("name", ""),
+                        "source": row.get("source", ""), "egress": bool(row.get("egress")),
+                        "egressNote": row.get("egress_note", "")}
+    except Exception:
+        pass
+    return {}
+
+
+def build_plan(choices: dict) -> dict:
+    """把用户的选择展开成执行计划（确认页显示它，执行相执行它）。**纯计算，不落地**。"""
+    choices = dict(choices or {})
+    manifests = {}
+    try:
+        from app import components
+        manifests = {i["id"]: i for i in components.load_manifests()}
+    except Exception:
+        manifests = {}
+
+    wanted = [("engines", cid) for cid in (choices.get("engines") or [])]
+    if choices.get("wake"):
+        wanted.append(("engines", "wake-kws"))
+    if choices.get("diarize"):
+        wanted.append(("engines", "diarize-pyannote"))
+    if choices.get("accel"):
+        wanted.append(("accel", "accel-cuda"))
+    wanted += [("fallback", cid) for cid in (choices.get("fallback") or [])]
+
+    downloads, manual, unavailable = [], [], []
+    for phase, cid in wanted:
+        action = _component_action(str(cid), manifests)
+        action["phase"] = phase
+        if action["kind"] == "download":
+            downloads.append(action)
+        elif action["kind"] == "manual":
+            manual.append(action)
+        else:
+            unavailable.append(action)
+
+    providers = []
+    if choices.get("asrOnline"):
+        spec = _provider_spec("asr", "openai-asr")
+        if spec:
+            providers.append(spec)
+    llm = choices.get("llm") or {}
+    if str(llm.get("provider", "") or "").strip():
+        spec = _provider_spec("llm", str(llm["provider"]).strip())
+        if spec:
+            providers.append(spec)
+
+    todo = [d for d in downloads if d.get("ready") is not True]
+    total = sum(int(d.get("approxMb") or 0) for d in downloads)
+    todo_mb = sum(int(d.get("approxMb") or 0) for d in todo)
+    return {
+        "schema": PLAN_BUILD_SCHEMA,
+        "builtAt": _now(),
+        "phases": list(PHASE_ORDER),
+        "config": _setting_updates(choices),
+        "providers": providers,
+        "downloads": downloads,
+        "manual": manual,
+        "unavailable": unavailable,
+        "totalMb": total,
+        "todoMb": todo_mb,
+        "readyMb": total - todo_mb,
+        "downloadCount": len(todo),
+        #: 确认页/末页要用的人话汇总（"将下载 N 项、合计 X MB"）
+        "summary": {
+            "downloads": "将下载 %d 项，合计约 %d MB" % (len(todo), todo_mb),
+            "alreadyReady": "另有 %d 项已经装好，不重复下载" % (len(downloads) - len(todo)),
+            "config": "将写入 %d 项设置" % len(_setting_updates(choices)),
+            "manual": ("%d 项要你手工准备" % len(manual)) if manual else "",
+            "egress": [p["egressNote"] for p in providers if p.get("egress")],
+        },
+    }
+
+
+def execute_plan(plan: dict = None, *, choices: dict = None,
+                 settings_update=None, start_download=None, ready=None,
+                 plan_file: str = "") -> dict:
+    """执行相：**先把配置写下去，再依次触发下载**（设计 §4 的固定顺序）。
+
+    设计上的两条硬要求在这里落地：
+      * 已经就绪的**不重复下载**（`ready() is True` 就跳过，并记进 ``skipped``）；
+      * 任何一项失败都**只登记、不中断**其余项（用户可重试或跳过，设计 §4）。
+    三个外部动作都可注入，便于测试；默认走真实的 ``settings.update`` / ``modelinfo``。
+    """
+    built = plan or build_plan(choices or {})
+    if settings_update is None:
+        from app.config import settings as _settings
+        settings_update = _settings.update
+    if start_download is None or ready is None:
+        from app import modelinfo
+        start_download = start_download or modelinfo.start_download
+        ready = ready or modelinfo.ready
+
+    result = {"startedAt": _now(), "config": [], "downloads": [], "skipped": [],
+              "failed": [], "ok": True}
+
+    # ① 配置先行：下载才知道往哪写
+    values = {}
+    for row in built.get("config") or []:
+        values[row["key"]] = row["value"]
+    if values:
+        try:
+            updated = settings_update(values)
+            result["config"] = list(updated or values.keys())
+        except Exception as exc:
+            result["ok"] = False
+            result["failed"].append({"component": "(设置)", "error": "%s: %s"
+                                     % (type(exc).__name__, exc)})
+
+    # ② 依次触发下载
+    for item in built.get("downloads") or []:
+        mid = item.get("modelId") or ""
+        row = {"component": item.get("component"), "modelId": mid,
+               "label": item.get("label"), "approxMb": item.get("approxMb")}
+        if not mid:
+            row["status"] = "manual"
+            result["failed"].append(row)
+            continue
+        try:
+            if ready(mid) is True:
+                row["status"] = "ready"
+                result["skipped"].append(row)
+                continue
+        except Exception:
+            pass
+        try:
+            ok, msg = start_download(mid)
+            row["status"] = "running" if ok else "error"
+            row["message"] = str(msg)
+            (result["downloads"] if ok else result["failed"]).append(row)
+            if not ok:
+                result["ok"] = False
+        except Exception as exc:
+            row["status"] = "error"
+            row["error"] = "%s: %s" % (type(exc).__name__, exc)
+            result["failed"].append(row)
+            result["ok"] = False
+
+    # ③ 记进计划文件（面板重开后据此续显）
+    current = load_plan(plan_file)
+    current["state"] = "running"
+    current["built"] = built
+    current["execution"] = result
+    if choices:
+        current["choices"] = dict(choices)
+    save_plan(current, plan_file)
+    return result
+
+
+def execution_state(plan_file: str = "") -> dict:
+    """执行相的状态：把计划里的每项 + 真实下载进度（``modelinfo.jobs``）合成一份给人看的东西。
+
+    状态词是**界面用语**（设计 §4）：排队中 / 正在下载 / 好了 / 没成 / 已跳过。
+    """
+    plan = load_plan(plan_file)
+    built = plan.get("built") or {}
+    execution = plan.get("execution") or {}
+    jobs = {}
+    try:
+        from app import modelinfo
+        jobs = modelinfo.jobs() or {}
+    except Exception:
+        jobs = {}
+
+    def status_of(mid: str) -> dict:
+        job = jobs.get(mid) or {}
+        state = str(job.get("status") or "")
+        if state == "running":
+            return {"state": "downloading", "text": "正在下载",
+                    "percent": job.get("percent"), "downloadedMb": job.get("downloaded_mb")}
+        if state == "done":
+            return {"state": "done", "text": "好了", "percent": 100}
+        if state == "error":
+            return {"state": "error", "text": "没成", "message": str(job.get("error") or "")}
+        return {"state": "queued", "text": "排队中", "percent": 0}
+
+    skipped = {r.get("modelId") for r in (execution.get("skipped") or [])}
+    rows = []
+    for item in built.get("downloads") or []:
+        mid = item.get("modelId") or ""
+        row = {"component": item.get("component"), "modelId": mid,
+               "label": item.get("label"), "approxMb": item.get("approxMb"),
+               "phase": item.get("phase")}
+        if mid and mid in skipped:
+            row.update({"state": "skipped", "text": "已经装好，跳过"})
+        else:
+            row.update(status_of(mid) if mid else {"state": "manual", "text": "要手工准备"})
+        rows.append(row)
+
+    done = [r for r in rows if r["state"] in ("done", "skipped")]
+    return {
+        "planState": plan.get("state", "draft"),
+        "running": bool([r for r in rows if r["state"] == "downloading"]),
+        "total": len(rows),
+        "finished": len(done),
+        "items": rows,
+        "manual": built.get("manual") or [],
+        "unavailable": built.get("unavailable") or [],
+        "config": execution.get("config") or [],
+        "failed": execution.get("failed") or [],
+        "summary": ("%d/%d 项已就绪" % (len(done), len(rows))) if rows else "没有要下载的东西",
+    }
