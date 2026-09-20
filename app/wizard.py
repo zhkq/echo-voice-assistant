@@ -497,6 +497,19 @@ def build_plan(choices: dict) -> dict:
     todo = [d for d in downloads if d.get("ready") is not True]
     total = sum(int(d.get("approxMb") or 0) for d in downloads)
     todo_mb = sum(int(d.get("approxMb") or 0) for d in todo)
+    # "还不能做什么"：末页（S11）要能回答这个问题 —— 用"你会失去什么"的说法，不说技术原因
+    missing = []
+    if not choices.get("llmReady"):
+        missing.append({"feature": "自动写会议纪要",
+                        "reason": "还没配 AI 服务（你自己填一个地址就能用）",
+                        "fix": "面板 → 模型路由"})
+    if not str(choices.get("agent", "") or "").strip():
+        missing.append({"feature": "让 ECHO 帮你动手（整理笔记、操作文件）",
+                        "reason": "还没选智能体后端", "fix": "回到向导第 7 步"})
+    if choices.get("asrOnline"):
+        missing.append({"feature": "断网时也能转写",
+                        "reason": "你选了在线转写 —— 网断了就转不了",
+                        "fix": "向导第 8 步装一个小号兜底"})
     return {
         "schema": PLAN_BUILD_SCHEMA,
         "builtAt": _now(),
@@ -506,6 +519,7 @@ def build_plan(choices: dict) -> dict:
         "downloads": downloads,
         "manual": manual,
         "unavailable": unavailable,
+        "missing": missing,
         "totalMb": total,
         "todoMb": todo_mb,
         "readyMb": total - todo_mb,
@@ -516,6 +530,7 @@ def build_plan(choices: dict) -> dict:
             "alreadyReady": "另有 %d 项已经装好，不重复下载" % (len(downloads) - len(todo)),
             "config": "将写入 %d 项设置" % len(_setting_updates(choices)),
             "manual": ("%d 项要你手工准备" % len(manual)) if manual else "",
+            "missing": ("还有 %d 项功能要补" % len(missing)) if missing else "",
             "egress": [p["egressNote"] for p in providers if p.get("egress")],
         },
     }
@@ -645,6 +660,7 @@ def execution_state(plan_file: str = "") -> dict:
         "items": rows,
         "manual": built.get("manual") or [],
         "unavailable": built.get("unavailable") or [],
+        "missing": built.get("missing") or [],
         "config": execution.get("config") or [],
         "failed": execution.get("failed") or [],
         "summary": ("%d/%d 项已就绪" % (len(done), len(rows))) if rows else "没有要下载的东西",

@@ -23,6 +23,7 @@
     <button class="tab" data-view="boot">启动</button>
     <button class="tab" data-view="failover">模型路由</button>
     <button class="tab" data-view="capabilities">能力</button>
+    <button class="tab" data-view="wizard">向导</button>
   </nav>
 </header>
 
@@ -250,6 +251,13 @@
     <div class="muted model-foot">
       路径是代码约定，改了加载器就找不到模型，所以原样展示。「已选但未就绪」会标红并给「去下载」。
     </div>
+  </section>
+  <!-- ============ 首装向导（D23/D24；设计见 docs/向导-分步设计.md）============
+       读者假设是「没用过 ECHO、没有技术背景」的同事，所以文案一律说人话：
+       每步都是「这是干什么的 / 不装会怎样 / 你要决定什么」。
+       前 9 步只做选择（只读体检 + 写计划），点「开始准备」才真正下载。 -->
+  <section id="view-wizard" class="view hidden">
+    <div id="wizHost"></div>
   </section>
 </main>
 
