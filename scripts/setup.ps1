@@ -1,7 +1,10 @@
 ﻿# setup.ps1 — ECHO 一次性初始化（venv 校验 / 补装依赖 / 模型校验 / 建库）
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
-$py = Join-Path $root 'venv\Scripts\python.exe'
+# D22: main package has no bundled runtime; runtime-core component provides it.
+$py = Join-Path $root 'runtime-core\python.exe'
+if (-not (Test-Path $py)) { $py = Join-Path $root 'runtime-core\Scripts\python.exe' }
+if (-not (Test-Path $py)) { $py = Join-Path $root 'venv\Scripts\python.exe' }
 # 若存在 ASCII junction（解决 nagisa/dynet 无法读中文路径的问题），优先使用
 $pyAlt = $env:ECHO_PYTHON   # 可选：非 ASCII 路径下的解释器覆盖，见 docs/DEPLOY.md
 if ($pyAlt -and (Test-Path $pyAlt)) { $py = $pyAlt }
@@ -10,8 +13,8 @@ Write-Host '=== ECHO setup ===' -ForegroundColor Cyan
 
 # 1. venv
 if (-not (Test-Path $py)) {
-    Write-Host '[!] 未找到 venv。请按 docs/DEPLOY.md 创建：python -m venv venv 后装 requirements.txt' -ForegroundColor Yellow
-    Write-Host "    python -m venv venv"
+    Write-Host '[!] 未找到运行时（runtime-core\python.exe 或 venv\Scripts\python.exe）' -ForegroundColor Yellow
+    Write-Host '    主包：让 install.ps1 准备 runtime-core；整包/源码：按 docs/DEPLOY.md 建 venv' -ForegroundColor Yellow
     exit 1
 }
 Write-Host "[1/4] venv OK: $py"

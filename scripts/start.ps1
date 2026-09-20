@@ -22,7 +22,11 @@ $root = Split-Path $PSScriptRoot -Parent
 
 # (retired 2026-09-17) The DSH Desktop host plugin (echo-host) is gone - see plugin/README.md.
 
-$py = Join-Path $root 'venv\Scripts\python.exe'
+# D22: the main package ships no runtime - the runtime-core component supplies it.
+# Prefer runtime-core\python.exe, fall back to the legacy bundled venv.
+$py = Join-Path $root 'runtime-core\python.exe'
+if (-not (Test-Path $py)) { $py = Join-Path $root 'runtime-core\Scripts\python.exe' }
+if (-not (Test-Path $py)) { $py = Join-Path $root 'venv\Scripts\python.exe' }
 # ECHO_PYTHON exists for ONE reason: a tree whose own path is non-ASCII cannot let
 # funasr/nagisa read model files through it, so it points at an ASCII junction of
 # the venv. A tree whose path is ALREADY ASCII must not borrow it - otherwise a
@@ -30,7 +34,7 @@ $py = Join-Path $root 'venv\Scripts\python.exe'
 # and installing dependencies for 2.0 would contaminate the stable install.
 $pyAlt = $env:ECHO_PYTHON
 if ($pyAlt -and (Test-Path $pyAlt) -and ($root -match '[^\x20-\x7E]')) { $py = $pyAlt }
-if (-not (Test-Path $py)) { Write-Host 'venv missing - run scripts\setup.ps1 first' -ForegroundColor Red; exit 1 }
+if (-not (Test-Path $py)) { Write-Host 'runtime missing (runtime-core\ or venv\) - run install.ps1 / setup.ps1 first' -ForegroundColor Red; exit 1 }
 
 $logDir = Join-Path $root 'data\logs'
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null

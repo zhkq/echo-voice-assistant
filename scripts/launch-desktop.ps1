@@ -33,7 +33,10 @@ try {
 } catch { }
 
 $root = Split-Path $PSScriptRoot -Parent
-$py = Join-Path $root 'venv\Scripts\python.exe'
+# D22: main package has no bundled runtime; runtime-core component provides it.
+$py = Join-Path $root 'runtime-core\python.exe'
+if (-not (Test-Path $py)) { $py = Join-Path $root 'runtime-core\Scripts\python.exe' }
+if (-not (Test-Path $py)) { $py = Join-Path $root 'venv\Scripts\python.exe' }
 # Prefer the ASCII junction (works around tools that cannot read non-ASCII paths).
 $pyAlt = $env:ECHO_PYTHON   # 可选：非 ASCII 路径下的解释器覆盖，见 docs/DEPLOY.md
 if ($pyAlt -and (Test-Path $pyAlt)) { $py = $pyAlt }

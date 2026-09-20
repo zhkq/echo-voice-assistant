@@ -12,16 +12,21 @@
 #
 # USAGE
 #   powershell -File scripts\build-package.ps1                    # public, code only
-#   powershell -File scripts\build-package.ps1 -Profile internal   # + models + venv
+#   powershell -File scripts\build-package.ps1 -Profile main       # D22 main package
+#   powershell -File scripts\build-package.ps1 -Profile internal   # legacy monolith
 #   powershell -File scripts\build-package.ps1 -DryRun             # checks + inventory only
 #   powershell -File scripts\build-package.ps1 -OutDir D:\build
 #
 # PROFILES
-#   public    core code only (D22): app web mac scripts plugin docs assets
+#   public    core code only: app web mac scripts plugin docs assets
 #             dsh-failover (minus config.json) .dsh sidebar sources + root docs
-#   internal  public + models\ (minus pyannote: gated weights) + venv\
+#   main      the D22 delivery package: same content as public, PLUS components\*.json,
+#             wrapped in ECHO\, with manifest.json at its root. Carries NO runtime and NO
+#             model - the installer adds the required component (runtime-core, D23) and
+#             the panel wizard adds the optional ones (D24). Hard gate: unpacked <= 20 MB.
+#   internal  legacy monolith (pre-D22): public + models\ (minus pyannote) + venv\
 #
-# NEVER PACKED (both profiles)
+# NEVER PACKED (all profiles)
 #   dsh-failover\config.json   real intranet gateway + userId
 #   settings.yaml*             DSH home settings (and their .bak copies)
 #   *.credentials*  *.env      credentials
@@ -33,7 +38,7 @@
 # ASCII-ONLY on purpose (see echo-instance-lib.ps1).
 # =====================================================================
 param(
-    [ValidateSet('public', 'internal')][string]$Profile = 'public',
+    [ValidateSet('public', 'main', 'internal')][string]$Profile = 'public',
     [string]$OutDir = '',
     [string]$Version = '',
     [switch]$DryRun
@@ -69,11 +74,26 @@ if (Test-Path $pyproject) {
 }
 Say "version: $Version"
 
+# ---------------------------------------------------------------- platform
+# Delivery packages are per platform (D22): ECHO-<profile>-<platform>-<version>-<stamp>.
+$arch = if ([Environment]::Is64BitOperatingSystem) { 'x64' } else { 'x86' }
+$plat = "win-$arch"
+if ($PSVersionTable.PSVersion.Major -ge 6) {
+    if ($IsMacOS) { $plat = "macos-$arch" }
+    elseif ($IsLinux) { $plat = "linux-$arch" }
+}
+Say "platform: $plat"
+
 # ---------------------------------------------------------------- whitelist
 $dirs = @('app', 'web', 'mac', 'scripts', 'plugin', 'docs', 'assets', 'dsh-failover', '.dsh', 'sidebar')
+if ($Profile -eq 'main') {
+    # components\*.json = the offline component declarations the panel also reads.
+    if (Test-Path (Join-Path $root 'components')) { $dirs += @('components') }
+    else { Say 'components\ not present yet - manifest.json will declare none' }
+}
 if ($Profile -eq 'internal') { $dirs += @('models', 'venv') }
 $rootFiles = @('README.md', 'ARCHITECTURE.md', 'LICENSE', 'pyproject.toml',
-               'requirements.txt', '.gitignore', '.gitattributes')
+               'requirements.txt', 'requirements-core.txt', '.gitignore', '.gitattributes')
 
 # Paths never packed, matched against the tree-relative path (forward slashes).
 $forbiddenPath = @(
@@ -182,9 +202,24 @@ if ($bad.Count -gt 0) {
 }
 Ok 'no forbidden files or content'
 
+# ---------------------------------------------------------------- D22 size gate
+# The main package has exactly one job: be small enough to hand over by mail/IM and to
+# upgrade in seconds. If it grows past the budget, fail here instead of quietly shipping
+# a package that defeats the whole split (REFACTOR-PLAN D22: 10-20 MB, main = code only).
+if ($Profile -eq 'main') {
+    if ($totalBytes -gt 20MB) {
+        Say 'largest contributors:'
+        $files | Sort-Object Len -Descending | Select-Object -First 10 | ForEach-Object {
+            Say ("    {0,10} KB  {1}" -f [Math]::Round($_.Len / 1KB, 1), $_.Rel)
+        }
+        Die ("main package is {0} MB unpacked - over the 20 MB D22 budget" -f [Math]::Round($totalBytes / 1MB, 2))
+    }
+    Ok ("main package size gate: {0} MB <= 20 MB" -f [Math]::Round($totalBytes / 1MB, 2))
+}
+
 if ($DryRun) {
     Write-Host ''
-    Ok "dry run: nothing written. Would produce ECHO-$Profile-$Version-<stamp>.zip in $OutDir"
+    Ok "dry run: nothing written. Would produce ECHO-$Profile-$plat-$Version-<stamp>.zip in $OutDir"
     exit 0
 }
 
@@ -193,12 +228,12 @@ $stamp = Get-Date -Format 'yyyyMMdd-HHmm'
 $stage = Join-Path $env:TEMP ("echo-pack-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
 New-Item -ItemType Directory -Path $stage -Force | Out-Null
 Say "staging to $stage"
-# The internal profile wraps everything in ECHO\. Reason: scripts\install.ps1 (the
-# internal whole-package route) detects the archive's single top-level directory and
-# moves it into place. Built flat, this zip has ~20 top-level entries, so Step04 moved
-# just one of them and then deleted the rest of the extracted tree. The public profile
-# stays flat: docs\macOS-*.md tell the reader to unzip it directly.
-$wrap = if ($Profile -eq 'internal') { 'ECHO' } else { '' }
+# The main and internal profiles wrap everything in ECHO\. Reason: scripts\install.ps1
+# (the delivery route) detects the archive's single top-level directory and moves it into
+# place. Built flat, the zip has ~20 top-level entries, so Step04 used to move just one of
+# them and then delete the rest of the extracted tree. The public profile stays flat:
+# docs\macOS-*.md tell the reader to unzip it directly.
+$wrap = if ($Profile -eq 'public') { '' } else { 'ECHO' }
 if ($wrap) { Say "wrapping every file in $wrap/ (installer expects a single top-level dir)" }
 function Get-StagedRel([string]$rel) { if ($wrap) { return "$wrap/$rel" } return $rel }
 foreach ($f in $files) {
@@ -246,9 +281,55 @@ foreach ($f in ($files | Sort-Object Rel)) {
 }
 [System.IO.File]::WriteAllLines((Join-Path $stage 'SHA256SUMS.txt'), $sums, (New-Object System.Text.UTF8Encoding($false)))
 
+# ---------------------------------------------------------------- manifest.json
+# The installer and the panel wizard both need to know "what is this package, and what
+# does it still need". requiredComponents is PARSED from app\components.py REQUIRED_IDS
+# rather than duplicated here, so the manifest can never drift from the panel's view.
+$requiredIds = @()
+$compPy = Join-Path $root 'app\components.py'
+if (Test-Path $compPy) {
+    $mm = Select-String -LiteralPath $compPy -Pattern 'REQUIRED_IDS\s*=\s*\(([^)]*)\)' | Select-Object -First 1
+    if ($mm) {
+        $requiredIds = @([regex]::Matches($mm.Matches[0].Groups[1].Value, '"([^"]+)"') |
+                         ForEach-Object { $_.Groups[1].Value })
+    }
+}
+if ($requiredIds.Count -eq 0) {
+    Warn 'could not parse REQUIRED_IDS from app\components.py - assuming runtime-core'
+    $requiredIds = @('runtime-core')
+}
+$compDecl = @()
+$compDir = Join-Path $root 'components'
+if (Test-Path $compDir) {
+    $compDecl = @(Get-ChildItem $compDir -Filter '*.json' -File | Sort-Object Name |
+                  ForEach-Object { "components/$($_.Name)" })
+}
+$manifest = [ordered]@{
+    format             = 'echo-package/1'
+    kind               = $Profile
+    appVersion         = $Version
+    platform           = $plat
+    builtAt            = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss zzz')
+    git                = "$branch @ $head$dirty"
+    layout             = $layout
+    files              = $files.Count
+    unpackedBytes      = $totalBytes
+    checksums          = 'SHA256SUMS.txt'
+    runtimeBundled     = ($Profile -eq 'internal')
+    modelsBundled      = ($Profile -eq 'internal')
+    requiredComponents = $requiredIds
+    componentManifests = $compDecl
+    entrypoints        = @('install.bat', 'install.ps1', 'scripts/start.ps1')
+    note               = 'No runtime and no models are bundled (D22). The installer adds the required components; the panel wizard adds the optional ones.'
+}
+$manifestRel = if ($wrap) { "$wrap/manifest.json" } else { 'manifest.json' }
+[System.IO.File]::WriteAllText((Join-Path $stage $manifestRel.Replace('/', '\')),
+    (($manifest | ConvertTo-Json -Depth 6) + "`n"), (New-Object System.Text.UTF8Encoding($false)))
+Say ("manifest.json: kind=$Profile platform=$plat required=$($requiredIds -join ',') components=$($compDecl.Count)")
+
 # ---------------------------------------------------------------- zip
 if (-not (Test-Path $OutDir)) { New-Item -ItemType Directory -Path $OutDir -Force | Out-Null }
-$zipName = "ECHO-$Profile-$Version-$stamp.zip"
+$zipName = "ECHO-$Profile-$plat-$Version-$stamp.zip"
 $zipPath = Join-Path $OutDir $zipName
 Say "compressing to $zipPath"
 Add-Type -AssemblyName System.IO.Compression.FileSystem

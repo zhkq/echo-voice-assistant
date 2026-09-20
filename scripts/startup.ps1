@@ -74,7 +74,10 @@ SupLog "watchdog mutex acquired ($mtxName)"
 # this script (see the Startup shortcut -> scripts\echo-startup.vbs).
 
 # ---- 2/3. resolve pythonw and keep ECHO alive ----
-$py = Join-Path $root 'venv\Scripts\python.exe'
+# D22: main package has no bundled runtime; runtime-core component provides it.
+$py = Join-Path $root 'runtime-core\python.exe'
+if (-not (Test-Path $py)) { $py = Join-Path $root 'runtime-core\Scripts\python.exe' }
+if (-not (Test-Path $py)) { $py = Join-Path $root 'venv\Scripts\python.exe' }
 # ECHO_PYTHON exists for ONE reason: a tree whose own path is non-ASCII cannot let
 # funasr/nagisa read model files through it, so it points at an ASCII junction of
 # the venv. A tree whose path is ALREADY ASCII must not borrow it - otherwise a
@@ -82,7 +85,7 @@ $py = Join-Path $root 'venv\Scripts\python.exe'
 # and installing dependencies for 2.0 would contaminate the stable install.
 $pyAlt = $env:ECHO_PYTHON
 if ($pyAlt -and (Test-Path $pyAlt) -and ($root -match '[^\x20-\x7E]')) { $py = $pyAlt }
-if (-not (Test-Path $py)) { SupLog "venv missing - cannot start ECHO: $py"; exit 1 }
+if (-not (Test-Path $py)) { SupLog "runtime missing - cannot start ECHO (runtime-core\ or venv\): $py"; exit 1 }
 $pyw = $py -replace 'python\.exe$', 'pythonw.exe'
 if (-not (Test-Path $pyw)) { SupLog "pythonw missing: $pyw"; exit 1 }
 

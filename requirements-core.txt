@@ -1,0 +1,19 @@
+# runtime-core 组件的基础依赖（REFACTOR-PLAN D22/D23）
+#
+# 这份清单只解决一件事：**服务起得来、面板打得开**。
+# 转写 / 唤醒 / 说话人分离 / 加速的依赖**不在这里** —— 它们各自是可选组件，
+# 由面板「组件」页按机器与环境选装（清单见 app/components.py）。
+#
+# 谁在用它：主包（-Profile main）不含运行时，install.ps1 准备 runtime-core 时用这份清单；
+# 也可以手工装：<运行时>\python.exe -m pip install -r requirements-core.txt
+fastapi>=0.115
+uvicorn[standard]>=0.30
+pydantic>=2.7
+python-multipart>=0.0.9
+httpx>=0.27
+PyYAML>=6.0
+ruamel.yaml>=0.18
+numpy>=1.26
+sounddevice>=0.5
+soundfile>=0.12
+soxr>=0.3
