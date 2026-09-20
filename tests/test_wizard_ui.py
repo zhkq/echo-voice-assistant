@@ -57,20 +57,31 @@ class WizardUiWiringTests(unittest.TestCase):
         # 决策相只写计划（PUT /api/wizard/plan），不直接写设置、不直接触发下载
         self.assertIn('api("/api/wizard/plan", {', self.js)
 
-    def test_s6_collects_address_and_key_inline(self):
-        """S6 要能**就地**填地址与密钥。
+    def test_s6_leads_with_the_agent_and_hides_direct_llm_as_a_fallback(self):
+        """S6 的主线是**智能体**：纪要、归档、语音指令都靠它（用户 2026-09-20 定调），
+        直连大模型只做**折叠兜底**，而且必须**显式打开**才生效。
 
-        2026-09-20 之前这里只有一个「去模型路由」的按钮 —— 用户得自己换页去找，
-        本步等于没做完（这就是 roadmap 上的"下一刀"）。
+        为什么这条重要：`providerLlm` 一旦非空，`meeting.direct_llm_decision()` 会强制
+        纪要走直连、把智能体踢开 —— 所以"填了地址就自动启用"是不能接受的。
         """
         block = self.js[self.js.index("function wizRenderLlm"):]
         block = block[:block.index("\n}\n")]
+        # 主线：指向第 7 步准备智能体
+        self.assertIn('id="wizGoAgent"', block, "S6 要有「去第 7 步准备智能体」的入口")
+        self.assertIn('findIndex((s) => s.id === "agent")', block,
+                      "该入口要真的跳到智能体那一步")
+        # 兜底：显式开关 + 默认收起 + 写明不推荐
+        self.assertIn('data-wizdirect="1"', block, "直连要有一个显式开关")
+        self.assertIn("不推荐", block, "直连必须写明不推荐")
+        self.assertIn('id="wizDirectBox"', block)
+        self.assertIn('${direct ? "" : "hidden"}', block, "兜底区要默认收起")
+        self.assertIn("_wizChoices.llm.direct", block, "开关要落到 choices.llm.direct")
+        # 三个字段仍在（打开兜底后才填）
         for field in ("wizLlmBase", "wizLlmKey", "wizLlmModel"):
-            self.assertIn('id="%s"' % field, block, "S6 缺少 %s 输入框" % field)
+            self.assertIn('id="%s"' % field, block, "兜底区缺少 %s 输入框" % field)
         self.assertIn('type="password"', block, "密钥框必须是密码框")
-        self.assertIn("_wizChoices.llm", block, "填的东西要进 choices.llm，执行相才会写进设置")
-        self.assertIn("wizSaveChoices", block, "填完要存进计划文件（关掉面板不丢）")
-        self.assertNotIn("wizGoLlm", self.js, "不该再把「跳去模型路由」当唯一入口")
+        self.assertIn("wizSaveChoices", block, "改动要存进计划文件（关掉面板不丢）")
+        self.assertNotIn("wizGoLlm", self.js, "不该再有「跳去模型路由」当唯一入口")
 
     def test_first_install_enters_the_wizard_automatically(self):
         """首装（`installed-components.json` 缺失）要自动进向导，且不抢用户显式指定的页签。"""

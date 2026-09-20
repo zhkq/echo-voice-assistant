@@ -476,8 +476,9 @@ PLAN_BUILD_SCHEMA = "echo-wizard-build/1"
 #: 按**后缀**匹配而不是写死整串：前缀（providerLlm / providerAsr）属于 provider 的命名空间。
 _CRED_FIELDS = (("baseUrl", "BaseUrl"), ("apiKey", "ApiKey"), ("model", "Model"))
 
-#: S6 就地填了地址、却没显式选 provider 时落到这一个（单上游直连）。
-#: 多上游派发是「ECHO AUTO」那套的事，向导不替用户改（用户显式选了就以他为准）。
+#: S6 打开"直连兜底"（`llm.direct`）时落到这一个（单上游直连）。
+#: 多上游派发是「ECHO AUTO」那套的事，向导不替用户改（用户显式选了 provider 就以他为准）。
+#: 注意它**不会**因为"填了地址"就自动生效 —— 见 `llm_provider_id()` 的说明。
 DEFAULT_ONLINE_LLM = "openai-llm"
 
 
@@ -488,26 +489,42 @@ def llm_choice(choices: dict) -> dict:
 
 
 def llm_provider_id(choices: dict) -> str:
-    """S6 最终用哪个 provider：用户显式选的优先；只填了地址就用单上游直连。"""
+    """S6 的**直连兜底**用哪个 provider —— **只有用户显式打开才写**，不自动默认。
+
+    2026-09-20 用户定调：会议纪要、归档、语音指令**默认都走智能体**（只有它有 skill
+    机制做灵活扩展），直连大模型只是"不装智能体"时的兜底，**不推荐**。
+    而 `meeting.direct_llm_decision()` 的第 1 条判据是"`providerLlm` 非空就强制走直连、
+    哪怕 agent 也在" —— 所以向导**绝不能**因为"用户填了地址"就替他打开这个开关，
+    否则等于把用户从推荐的智能体路径上踢走。
+    """
     llm = llm_choice(choices)
     explicit = str(llm.get("provider", "") or "").strip()
     if explicit:
         return explicit
-    filled = any(str(llm.get(field, "") or "").strip() for field, _ in _CRED_FIELDS)
-    return DEFAULT_ONLINE_LLM if filled else ""
+    # 前端只表达"我要用直连兜底"（`llm.direct`）；provider id 留在后端，不进 JS。
+    return DEFAULT_ONLINE_LLM if llm.get("direct") else ""
 
 
 def llm_configured(choices: dict) -> bool:
-    """S6 是否已经"能写纪要"：勾了「我已经有」，**或**就地填全了地址与密钥。
+    """直连兜底是否**可用**：显式打开了它，且地址与密钥都填全。
 
-    两个判据都认，是因为前端会勾选、脚本/接口调用可能只填字段 —— 后端不该因为
-    少一个布尔就把它算成"没有 AI 服务"（那会让末页的"还不能做什么"说假话）。
+    只认"填全"：半填的配置一旦写进 `providerLlm`，会把纪要**强制**从智能体切到直连
+    却用不了 —— 比不配更糟。
     """
-    if (choices or {}).get("llmReady"):
-        return True
     llm = llm_choice(choices)
+    if not llm_provider_id(choices):
+        return False
     return bool(str(llm.get("baseUrl", "") or "").strip()
                 and str(llm.get("apiKey", "") or "").strip())
+
+
+def minutes_capable(choices: dict) -> bool:
+    """「能不能自动写纪要」：**有智能体**（默认路径）或直连兜底可用。
+
+    纪要不只看"有没有模型"：归档（写进笔记库）与语音指令都依赖智能体的 skill 机制，
+    所以默认路径是智能体；直连只是兜底。
+    """
+    return bool(str((choices or {}).get("agent", "") or "").strip()) or llm_configured(choices)
 
 
 def _credential_rows(kind: str, provider_id: str, values: dict) -> list:
@@ -671,10 +688,11 @@ def build_plan(choices: dict) -> dict:
     todo_mb = sum(int(d.get("approxMb") or 0) for d in todo)
     # "还不能做什么"：末页（S11）要能回答这个问题 —— 用"你会失去什么"的说法，不说技术原因
     missing = []
-    if not llm_configured(choices):
+    if not minutes_capable(choices):
         missing.append({"feature": "自动写会议纪要",
-                        "reason": "还没配 AI 服务（你自己填一个地址就能用）",
-                        "fix": "面板 → 模型路由"})
+                        "reason": "纪要由智能体负责（归档和语音指令也走它，靠技能扩展）；"
+                                  "直连一个 AI 服务是不推荐的兜底",
+                        "fix": "回到向导第 7 步准备智能体"})
     if not str(choices.get("agent", "") or "").strip():
         missing.append({"feature": "让 ECHO 帮你动手（整理笔记、操作文件）",
                         "reason": "还没选智能体后端", "fix": "回到向导第 7 步"})

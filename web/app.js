@@ -2758,9 +2758,9 @@ function wizBlankChoices() {
     locations: { models: "", meetings: "", notes: "" },
     engines: [], wake: false, diarize: false, accel: false,
     asrOnline: false, llmReady: false, agent: "", fallback: [],
-    /* S6：AI 服务（用户自备）。地址/密钥/模型**就地填**，执行相由后端落到
-       provider 自己声明的设置键上（app/wizard.py 的 _credential_rows）。 */
-    llm: { provider: "", baseUrl: "", apiKey: "", model: "" },
+    /* S6：纪要默认走**智能体**；`llm.direct` 才是"直连兜底"的显式开关（不推荐）。
+       填了地址**不等于**启用 —— 见 wizRenderLlm 的说明。 */
+    llm: { direct: false, baseUrl: "", apiKey: "", model: "" },
   };
 }
 
@@ -2829,8 +2829,8 @@ async function loadWizard() {
                                            saved.locations || {});
     if (!Array.isArray(_wizChoices.engines)) _wizChoices.engines = [];
     if (!Array.isArray(_wizChoices.fallback)) _wizChoices.fallback = [];
-    /* S6 的地址/密钥/模型：老计划文件里没有 llm 这一块，补成完整骨架再渲染 */
-    _wizChoices.llm = Object.assign({ provider: "", baseUrl: "", apiKey: "", model: "" },
+    /* S6 的直连兜底字段：老计划文件里没有 llm 这一块，补成完整骨架再渲染 */
+    _wizChoices.llm = Object.assign({ direct: false, baseUrl: "", apiKey: "", model: "" },
                                     saved.llm || {});
     if (plan.plan && plan.plan.state === "running") _wizStep = WIZ_STEPS.findIndex((s) => s.id === "run");
     wizRender();
@@ -3088,61 +3088,78 @@ function wizRenderAccel(host) {
   }));
 }
 
-/* ---------------- S6 AI 服务（用户自备，刻意没有默认） ----------------
-   2026-09-20：地址与密钥**就地填**（原先只有一个跳去「模型路由」的按钮，用户得换页
-   自己找）。填的东西进 `choices.llm`，执行相由后端落到该 provider **自己声明**的
-   设置键上（`app/providers/openai.py` 的 details.settings）—— 面板不写死键名。
-   留空即不改动已有配置（这是 `_setting_updates` 的一贯规矩）。 */
+/* ---------------- S6 让 ECHO 会写纪要（默认走智能体） ----------------
+   2026-09-20 用户定调：会议纪要、归档、语音指令**都走智能体**（只有它有 skill 机制做
+   灵活扩展），**不推荐**直连大模型。所以这一步的主线是"把智能体准备起来"，入口指向第 7 步；
+   直连 AI 服务收进折叠区当兜底。
+
+   为什么不能"填了地址就自动算启用"：`providerLlm` 一旦非空，`meeting.direct_llm_decision()`
+   的第 1 条判据会**强制**纪要走直连、把智能体踢开（见 app/wizard.py 的 `llm_provider_id`）。 */
 function wizRenderLlm(host) {
+  const agents = (_wizEnv && _wizEnv.agents) || {};
+  const harness = agents.harness || {}, desk = agents.dsh || {};
+  const ready = !!(harness.online || desk.online);
   const llm = _wizChoices.llm || {};
-  const filled = !!(llm.baseUrl || "").trim() && !!(llm.apiKey || "").trim();
+  const direct = !!llm.direct;
   host.innerHTML = wizCard("让 ECHO 会写纪要",
-    "把转写好的文字交给一个 AI 服务，让它整理成会议纪要。",
+    "开完会，ECHO 把转写稿整理成带结论和待办的会议纪要。",
     "不能自动生成会议纪要（转写、录音、会议列表都照常可用）。",
-    `<div class="wiz-lose">AI 服务要你自己准备：ECHO <b>不提供、也不代管</b> 它。
-       你手上有内网服务地址、或某个在线服务的密钥，就填在下面。</div>
-     <div class="wiz-fields">
-       <label class="wiz-field"><span>服务地址</span>
-         <input class="input" id="wizLlmBase" placeholder="http://内网地址/v1"
-                value="${esc(llm.baseUrl || "")}"></label>
-       <label class="wiz-field"><span>密钥</span>
-         <input class="input" id="wizLlmKey" type="password" placeholder="服务方给你的那一串"
-                value="${esc(llm.apiKey || "")}"></label>
-       <label class="wiz-field"><span>模型名（可留空）</span>
-         <input class="input" id="wizLlmModel" placeholder="例如 deepseek-chat"
-                value="${esc(llm.model || "")}"></label>
-     </div>
-     <div class="muted">填好这两项，点「开始准备」时会写进设置；以后想改、或想配多个上游
-       按顺序用，再到「模型路由」里改。</div>
-     <label class="wiz-opt ${_wizChoices.llmReady ? "on" : ""}">
-       <input type="checkbox" data-wizllm="1" ${_wizChoices.llmReady ? "checked" : ""}>
-       <span class="wiz-opt-body"><span class="wiz-opt-name">我已经有可用的 AI 服务</span>
-       <span class="muted">${filled ? "上面填的就是" : "在别处已经配好，这次不用再填"}</span></span>
-     </label>`);
+    `<div class="wiz-lose">这件事由<b>智能体</b>来做 —— 而且不只是写纪要：把纪要归档进你的
+       笔记库、按你的话去整理文件，也都走它。智能体用「技能」扩展，以后想加新玩法不用改 ECHO。</div>
+     <div class="wiz-env-row"><b>智能体</b><span>${ready
+        ? "已经就绪 ✓ 现在就写得了纪要"
+        : "还没准备 —— 准备好就能自动写纪要，也能归档、听指令"}</span></div>
+     <div><button class="btn" id="wizGoAgent">${ready ? "去第 7 步看看" : "去第 7 步准备智能体"}</button></div>
+     <label class="wiz-opt ${direct ? "on" : ""}">
+       <input type="checkbox" data-wizdirect="1" ${direct ? "checked" : ""}>
+       <span class="wiz-opt-body"><span class="wiz-opt-name">没有智能体？直连一个 AI 服务（不推荐）</span>
+       <span class="muted">这条路只能写纪要：<b>归档和语音指令仍然需要智能体</b>。打开后会强制纪要走直连。</span></span>
+     </label>
+     <div id="wizDirectBox" class="${direct ? "" : "hidden"}">
+       <div class="wiz-fields">
+         <label class="wiz-field"><span>服务地址</span>
+           <input class="input" id="wizLlmBase" placeholder="http://内网地址/v1"
+                  value="${esc(llm.baseUrl || "")}"></label>
+         <label class="wiz-field"><span>密钥</span>
+           <input class="input" id="wizLlmKey" type="password" placeholder="服务方给你的那一串"
+                  value="${esc(llm.apiKey || "")}"></label>
+         <label class="wiz-field"><span>模型名（可留空）</span>
+           <input class="input" id="wizLlmModel" placeholder="例如 deepseek-chat"
+                  value="${esc(llm.model || "")}"></label>
+       </div>
+       <div class="muted">以后想改、或想配多个上游按顺序用，到「模型路由」里改。</div>
+     </div>`);
   wizWhy(host);
-  /* 地址与密钥都填了就自动算"已经有"（免得用户还要再勾一次）；
-     用 change 而不是 input：逐键 PUT 计划文件没必要，失焦/下一步时存一次够了。 */
+  const go = $("#wizGoAgent", host);
+  if (go) go.addEventListener("click", () => {
+    const i = WIZ_STEPS.findIndex((s) => s.id === "agent");
+    if (i >= 0) { _wizStep = i; wizRender(); }
+  });
+  const directBox = $("[data-wizdirect='1']", host);
+  if (directBox) directBox.addEventListener("change", () => {
+    _wizChoices.llm = Object.assign({ direct: false, baseUrl: "", apiKey: "", model: "" },
+                                    _wizChoices.llm || {});
+    _wizChoices.llm.direct = directBox.checked;
+    const label = directBox.closest(".wiz-opt");
+    if (label) label.classList.toggle("on", directBox.checked);
+    const box = $("#wizDirectBox", host);
+    if (box) box.classList.toggle("hidden", !directBox.checked);
+    wizSaveChoices();
+  });
+  /* 三格用 change 而不是 input：逐键 PUT 计划文件没必要，失焦/下一步时存一次够了。 */
   const bind = (sel, field) => {
     const el = $(sel, host);
     if (!el) return;
     el.addEventListener("change", () => {
-      _wizChoices.llm = Object.assign({ provider: "", baseUrl: "", apiKey: "", model: "" },
+      _wizChoices.llm = Object.assign({ direct: false, baseUrl: "", apiKey: "", model: "" },
                                       _wizChoices.llm || {});
       _wizChoices.llm[field] = el.value;
-      const l = _wizChoices.llm;
-      if ((l.baseUrl || "").trim() && (l.apiKey || "").trim()) {
-        _wizChoices.llmReady = true;
-        const box = $("[data-wizllm='1']", host);
-        if (box) box.checked = true;
-      }
       wizSaveChoices();
     });
   };
   bind("#wizLlmBase", "baseUrl");
   bind("#wizLlmKey", "apiKey");
   bind("#wizLlmModel", "model");
-  const box = $("[data-wizllm='1']", host);
-  if (box) box.addEventListener("change", () => { _wizChoices.llmReady = box.checked; wizSaveChoices(); });
 }
 
 /* ---------------- S7 智能体后端（默认标准 DSH） ---------------- */

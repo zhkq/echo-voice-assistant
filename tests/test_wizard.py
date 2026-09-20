@@ -354,44 +354,63 @@ class ExecutePlanTests(_PlanTestCase):
 
 
 class LlmCredentialsTests(_PlanTestCase):
-    """S6「就地填地址与密钥」（2026-09-20）：键名取自 provider **自己声明**的清单，向导不猜。"""
+    """S6：纪要**默认走智能体**，直连大模型是**显式打开**的、不推荐的兜底。
+
+    2026-09-20 用户定调：纪要、归档、语音指令都靠智能体（只有它有 skill 机制做灵活扩展）。
+    这里最要紧的是那条**反面守卫** —— 光填地址/密钥**不许**替用户把纪要切到直连：
+    `providerLlm` 一旦非空，`meeting.direct_llm_decision()` 的第 1 条判据就会强制直连、
+    把智能体踢开。键名则取自 provider **自己声明**的清单，向导不猜。
+    """
 
     def _cfg(self, choices):
         return {r["key"]: r["value"] for r in wizard.build_plan(choices)["config"]}
 
-    def test_inline_credentials_land_on_the_declared_keys(self):
-        cfg = self._cfg({"llm": {"baseUrl": "http://10.1.2.3:8000/v1",
+    def test_filling_the_fields_alone_never_switches_to_direct_llm(self):
+        """**关键回归守卫**：填了地址与密钥、但没打开兜底开关 → 一个 providerLlm* 都不许写。"""
+        cfg = self._cfg({"llm": {"baseUrl": "http://10.1.2.3:8000/v1", "apiKey": "sk-abc"}})
+        for key in ("providerLlm", "providerLlmBaseUrl", "providerLlmApiKey", "providerLlmModel"):
+            self.assertNotIn(key, cfg,
+                             "填了字段就写 %s = 把用户从推荐的智能体路径上踢走" % key)
+
+    def test_explicit_direct_fallback_lands_on_the_declared_keys(self):
+        cfg = self._cfg({"llm": {"direct": True, "baseUrl": "http://10.1.2.3:8000/v1",
                                  "apiKey": "sk-abc", "model": "deepseek-chat"}})
-        self.assertEqual(cfg["providerLlm"], wizard.DEFAULT_ONLINE_LLM,
-                         "只填了地址、没显式选 provider → 落到单上游直连那一条")
+        self.assertEqual(cfg["providerLlm"], wizard.DEFAULT_ONLINE_LLM)
         self.assertEqual(cfg["providerLlmBaseUrl"], "http://10.1.2.3:8000/v1")
         self.assertEqual(cfg["providerLlmApiKey"], "sk-abc")
         self.assertEqual(cfg["providerLlmModel"], "deepseek-chat")
 
     def test_empty_fields_do_not_overwrite_existing_config(self):
-        cfg = self._cfg({"llm": {"baseUrl": "http://x/v1"}})
+        cfg = self._cfg({"llm": {"direct": True, "baseUrl": "http://x/v1"}})
         self.assertEqual(cfg["providerLlmBaseUrl"], "http://x/v1")
         self.assertNotIn("providerLlmApiKey", cfg, "没填密钥就不该写（不覆盖已有配置）")
         self.assertNotIn("providerLlmModel", cfg)
 
     def test_explicit_provider_wins_and_undeclared_keys_are_not_invented(self):
-        """显式选的 provider 不能被顶掉；没声明这些键的 provider 更不许瞎写。"""
+        """显式选了别的 provider 就以他为准；没声明这些键的 provider 更不许瞎写。"""
         cfg = self._cfg({"llm": {"provider": "echo-auto", "baseUrl": "http://x/v1"}})
         self.assertEqual(cfg["providerLlm"], "echo-auto")
         self.assertNotIn("providerLlmBaseUrl", cfg,
                          "echo-auto 没声明 providerLlm* 这些键 → 向导不该发明键名")
 
-    def test_inline_credentials_count_as_having_an_ai_service(self):
-        """只填字段、没勾选，也要算「能写纪要」—— 否则末页的「还不能做什么」会说假话。"""
-        missing = [m["feature"] for m in
-                   wizard.build_plan({"llm": {"baseUrl": "http://x/v1",
-                                              "apiKey": "k"}})["missing"]]
-        self.assertNotIn("自动写会议纪要", missing)
-        plain = [m["feature"] for m in wizard.build_plan({})["missing"]]
-        self.assertIn("自动写会议纪要", plain, "什么都没配时才该提示缺 AI 服务")
+    def test_minutes_need_the_agent_or_an_explicit_fallback(self):
+        """「能不能写纪要」= **有智能体**（默认路径）或打开并填全了直连兜底。"""
+        def missing(choices):
+            return [m["feature"] for m in wizard.build_plan(choices)["missing"]]
+
+        self.assertIn("自动写会议纪要", missing({}), "什么都没配就该提示缺")
+        self.assertNotIn("自动写会议纪要", missing({"agent": "agent-harness"}),
+                         "有智能体就算能写纪要 —— 这就是默认路径")
+        self.assertIn("自动写会议纪要",
+                      missing({"llm": {"baseUrl": "http://x/v1", "apiKey": "k"}}),
+                      "只填字段、没打开开关 ≠ 能写纪要")
+        self.assertNotIn("自动写会议纪要",
+                         missing({"llm": {"direct": True, "baseUrl": "http://x/v1",
+                                          "apiKey": "k"}}),
+                         "打开并填全兜底才算用得上")
 
     def test_egress_declaration_reaches_the_confirm_page(self):
-        plan = wizard.build_plan({"llm": {"baseUrl": "http://x/v1"}})
+        plan = wizard.build_plan({"llm": {"direct": True, "baseUrl": "http://x/v1"}})
         self.assertEqual([p["id"] for p in plan["providers"]], [wizard.DEFAULT_ONLINE_LLM])
         self.assertTrue(plan["summary"]["egress"], "在线服务必须在确认页声明出网")
 
@@ -413,7 +432,8 @@ class InstalledComponentsTests(_PlanTestCase):
         target = self._installed()
         plan_file = os.path.join(self.tmp, "wizard-plan.json")
         choices = {"engines": ["stt-sherpa", "stt-whisper-base"],
-                   "llm": {"baseUrl": "http://x/v1", "apiKey": "sk-SECRET"}}
+                   "llm": {"direct": True, "baseUrl": "http://x/v1",
+                           "apiKey": "sk-SECRET"}}
         built = wizard.build_plan(choices)
         wizard.save_plan({"state": "running", "choices": choices, "built": built}, plan_file)
 
