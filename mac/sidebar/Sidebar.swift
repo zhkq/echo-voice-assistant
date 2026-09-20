@@ -22,8 +22,9 @@ final class EdgeView: NSView {
 
 final class Sidebar: NSObject, NSApplicationDelegate, WKScriptMessageHandler,
                      WKNavigationDelegate, WKUIDelegate {
-    let port: Int
+    var port: Int
     let command: String
+    let dataDir: String?
     var baseURL: URL { URL(string: "http://127.0.0.1:\(port)")! }
     var commandFile: URL!
     var lastCommand = ""
@@ -42,7 +43,30 @@ final class Sidebar: NSObject, NSApplicationDelegate, WKScriptMessageHandler,
     var hoverArmed = true
     var failedViews = Set<ObjectIdentifier>()
 
-    init(port: Int, command: String) { self.port = port; self.command = command }
+    init(port: Int, command: String, data: String?) {
+        self.port = port; self.command = command; self.dataDir = data
+    }
+
+    // ECHO 的实际端口以 echo-port.txt 为权威来源。首选端口被占/落在保留段时 ECHO 会让位，
+    // 只按启动参数里的端口加载就会一直连不上（已渲染的页面点按钮报 "Load failed"）。
+    func resolvedPort() -> Int {
+        guard let dir = dataDir else { return port }
+        let file = URL(fileURLWithPath: dir).appendingPathComponent("echo-port.txt")
+        guard let text = try? String(contentsOf: file, encoding: .utf8),
+              let value = Int(text.trimmingCharacters(in: .whitespacesAndNewlines)),
+              (1...65535).contains(value) else { return port }
+        return value
+    }
+
+    // 重试前对齐端口；变了就整页重载 —— origin 都换了，只重连旧端口没用。
+    func refreshPort() {
+        let fresh = resolvedPort()
+        guard fresh != port else { return }
+        port = fresh
+        NSLog("ECHO sidebar: port -> %d", port)
+        rail?.load(URLRequest(url: baseURL.appendingPathComponent("/web/rail.html")))
+        dashboard?.load(URLRequest(url: baseURL))
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let dir = FileManager.default.homeDirectoryForCurrentUser
@@ -118,6 +142,7 @@ final class Sidebar: NSObject, NSApplicationDelegate, WKScriptMessageHandler,
         RunLoop.main.add(timer, forMode: .common)
         retryTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
             guard let self = self else { return }
+            self.refreshPort()
             for view in [self.rail, self.dashboard].compactMap({ $0 })
                 where !view.isLoading && (view.url == nil || self.failedViews.contains(ObjectIdentifier(view))) {
                 let path = view === self.rail ? "/web/rail.html" : "/"
@@ -312,7 +337,8 @@ guard let port = Int(value(after: "--port") ?? "8970"), (1...65535).contains(por
 }
 let command = value(after: "--command") ?? "toggle"
 guard ["toggle", "expand", "expanded", "collapsed", "quit"].contains(command) else { exit(2) }
-let delegate = Sidebar(port: port, command: command)
+let dataDir = value(after: "--data")
+let delegate = Sidebar(port: port, command: command, data: dataDir)
 let application = NSApplication.shared
 application.setActivationPolicy(.accessory)
 application.delegate = delegate

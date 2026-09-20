@@ -45,13 +45,30 @@ class MacSidebarTests(unittest.TestCase):
 
     def test_spawn_passes_configured_port_and_detaches(self):
         with patch.object(self.runtime, "sidebar_exe_path", return_value="/tmp/ECHO Sidebar"), \
+                patch.object(self.runtime, "_retire_stale_sidebars") as retire, \
                 patch.object(self.runtime.os, "makedirs"), \
                 patch("builtins.open", unittest.mock.mock_open()), \
                 patch.object(self.runtime.subprocess, "Popen") as popen:
             self.assertTrue(self.runtime._spawn_sidebar("toggle"))
             self.assertEqual(popen.call_args.args[0],
-                             ["/tmp/ECHO Sidebar", "--port", "9123", "--command", "toggle"])
+                             ["/tmp/ECHO Sidebar", "--port", "9123", "--command", "toggle",
+                              "--data", self.runtime.paths.data_root()])
             self.assertTrue(popen.call_args.kwargs["start_new_session"])
+            # 换端口后必须先清掉开在旧端口上的浮动框，否则屏幕上会有两个边条
+            retire.assert_called_once_with(9123)
+
+    def test_spawn_prefers_actual_port_from_port_file(self):
+        """首选端口被占、ECHO 让位后，浮动框必须按 echo-port.txt 的实际端口打开。"""
+        with patch.object(self.runtime, "sidebar_exe_path", return_value="/tmp/ECHO Sidebar"), \
+                patch.object(self.runtime, "_actual_port", return_value=8971), \
+                patch.object(self.runtime, "_retire_stale_sidebars") as retire, \
+                patch.object(self.runtime.os, "makedirs"), \
+                patch("builtins.open", unittest.mock.mock_open()), \
+                patch.object(self.runtime.subprocess, "Popen") as popen:
+            self.assertTrue(self.runtime._spawn_sidebar("collapsed"))
+            argv = popen.call_args.args[0]
+            self.assertEqual(argv[argv.index("--port") + 1], "8971")
+            retire.assert_called_once_with(8971)
 
 
 if __name__ == "__main__":

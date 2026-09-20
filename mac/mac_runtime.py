@@ -11,6 +11,8 @@ app.boot / app.api / app.main 无需任何改动。
   * 唤醒沿用跨平台的 app.audio.wake.WakeListener
 """
 import os
+import re
+import signal
 import subprocess
 import threading
 import time
@@ -19,7 +21,7 @@ import app.assistant as assistant
 from app.audio.wake import WakeListener
 from app.config import settings
 from app.hotkey import HotkeyListener
-from app import services
+from app import paths, ports, services
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -27,6 +29,52 @@ _hotkey = None
 _wake = None
 _lock = threading.Lock()
 _panel_last_open = 0.0
+
+
+def _actual_port() -> int:
+    """ECHO **实际**监听端口：echo-port.txt 优先，回退配置的首选端口。
+
+    不能用 settings.serverPort 直接开浮动框/浏览器：ECHO 让位后（端口被占或
+    落在保留段）实际端口写在 echo-port.txt，按配置开就会连到死端口。
+    """
+    return ports.active_port(int(settings.get("serverPort", 8970)))
+
+
+def _sidebar_processes():
+    """当前运行的 echo-sidebar 进程 → ``[(pid, port)]``（查不到返回空表）。"""
+    found = []
+    try:
+        res = subprocess.run(["pgrep", "-x", "echo-sidebar"],
+                             capture_output=True, text=True, timeout=2)
+    except Exception:
+        return found
+    for pid_text in res.stdout.split():
+        if not pid_text.isdigit():
+            continue
+        try:
+            cmd = subprocess.run(["ps", "-p", pid_text, "-o", "command="],
+                                 capture_output=True, text=True, timeout=2).stdout
+        except Exception:
+            continue
+        m = re.search(r"--port\s+(\d+)", cmd)
+        if m:
+            found.append((int(pid_text), int(m.group(1))))
+    return found
+
+
+def _retire_stale_sidebars(port: int) -> None:
+    """退出开在**别的**端口上的旧浮动框。
+
+    浮动框的单实例锁是按端口命名的（Sidebar.swift 的 sidebar-<port>.lock），
+    ECHO 换端口后旧实例不会被新实例接管，结果是屏幕上两个边条、其中一个永远连不上。
+    """
+    for pid, proc_port in _sidebar_processes():
+        if proc_port != port:
+            try:
+                os.kill(pid, signal.SIGTERM)
+                print(f"[mac] 退出旧浮动框 pid={pid}（端口 {proc_port} → {port}）")
+            except OSError:
+                pass
 
 
 def sidebar_exe_path():
@@ -39,13 +87,16 @@ def _spawn_sidebar(command):
     exe = sidebar_exe_path()
     if not exe:
         return False
+    port = _actual_port()
+    # 换端口后先清掉旧端口的浮动框，否则旧实例（锁按端口命名）会赖在屏幕上连不上。
+    _retire_stale_sidebars(port)
     log_dir = os.path.join(BASE_DIR, "data", "logs")
     os.makedirs(log_dir, exist_ok=True)
     try:
         with open(os.path.join(log_dir, "sidebar-mac.log"), "ab") as log:
             subprocess.Popen(
-                [exe, "--port", str(int(settings.get("serverPort", 8970))),
-                 "--command", command], cwd=BASE_DIR,
+                [exe, "--port", str(port), "--command", command,
+                 "--data", paths.data_root()], cwd=BASE_DIR,
                 stdin=subprocess.DEVNULL, stdout=log, stderr=log,
                 start_new_session=True,
             )
@@ -86,7 +137,7 @@ def _open_browser():
     if now - _panel_last_open < 1.5:
         return False
     _panel_last_open = now
-    port = int(settings.get("serverPort", 8970))
+    port = _actual_port()
     url = f"http://127.0.0.1:{port}/"
     try:
         subprocess.Popen(["open", url], close_fds=True)
