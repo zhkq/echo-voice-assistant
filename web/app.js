@@ -2784,7 +2784,7 @@ function wizMaskSetting(key, value) {
 
 /* 三处位置（设计 §2 的 S1）。文案里的"为什么"必须留着 —— 小白靠它理解自己在决定什么。 */
 const WIZ_LOCATIONS = [
-  { key: "models", label: "能力包",
+  { key: "models", label: "模型文件",
     hint: "转写方式、唤醒词这些要额外下载的东西放这里。它最占地方，建议放在空间多的盘。" },
   { key: "meetings", label: "会议文件",
     hint: "录音和文字稿。里面是原始录音，注意隐私；会随使用慢慢变大。" },
@@ -2853,7 +2853,7 @@ function wizTally() {
   if (c.asrOnline) mb = Math.max(0, mb);          // 在线转写不占本机
   const disk = (_wizEnv && _wizEnv.locations || []).find((l) => l.key === "models") || {};
   const free = disk.freeGB == null ? "—" : `${disk.freeGB} GB`;
-  const parts = [`已选 ${ids.length} 项`, `合计 ${wizSize(mb)}`, `能力包盘剩余 ${free}`];
+  const parts = [`已选 ${ids.length} 项`, `合计 ${wizSize(mb)}`, `模型文件盘剩余 ${free}`];
   if (disk.freeGB != null && mb / 1024 > disk.freeGB) parts.push("⚠ 空间可能不够");
   return parts.join(" · ");
 }
@@ -2998,9 +2998,9 @@ function wizRenderWhere(host) {
     </div>`;
   }).join("");
   host.innerHTML = wizCard("东西放在哪",
-    "ECHO 会产生三类文件：<b>能力包</b>（要下载的东西）、<b>会议文件</b>（录音和文字稿）、<b>笔记库</b>（纪要归档的地方）。" +
+    "ECHO 会产生三类文件：<b>模型文件</b>（要下载的东西）、<b>会议文件</b>（录音和文字稿）、<b>笔记库</b>（纪要归档的地方）。" +
     "它们可以放在不同的盘 —— 留空就用默认位置。",
-    "能力包盘空间不够会在下载到一半时失败；不指笔记库，纪要就只能留在 ECHO 里。",
+    "模型文件盘空间不够会在下载到一半时失败；不指笔记库，纪要就只能留在 ECHO 里。",
     rows + `<div class="muted">路径里的中文字符有时会让转写引擎出问题，建议用纯英文目录。</div>`);
   wizWhy(host);
   $$("[data-wizloc]", host).forEach((inp) => inp.addEventListener("change", () => {
@@ -3187,7 +3187,7 @@ function wizRenderOffline(host) {
     "断网时没有本地转写（如果你选了在线转写，这一条尤其值得装）。",
     (tiny ? wizOption("stt-whisper-tiny", (_wizChoices.fallback || []).includes("stt-whisper-tiny"),
         { label: tiny.name, multi: true, name: "wizfallback" })
-          : `<div class="muted">清单里没有这个能力包。</div>`));
+          : `<div class="muted">清单里没有这个模型文件。</div>`));
   wizWhy(host);
   wizBindPicks(host, (el) => {
     const set = new Set(_wizChoices.fallback || []);

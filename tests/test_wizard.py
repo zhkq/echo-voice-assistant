@@ -4,7 +4,7 @@
 重点不在"本机探得准不准"（那取决于机器），而在三条硬要求：
 
 1. 环境报告**永不抛异常** —— 环境坏掉的时候，体检页恰恰最需要能打开；
-2. **三处位置**（能力包 / 会议文件 / 笔记库）都在报告里，且**各自**报所在盘的剩余空间；
+2. **三处位置**（模型文件 / 会议文件 / 笔记库）都在报告里，且**各自**报所在盘的剩余空间；
 3. 计划文件能往返、能容错、且**只写它自己那一个文件**（不碰设置、不下载）。
 
 探测函数一律被打桩：测试不该依赖本机有没有显卡、能不能上网。
@@ -95,10 +95,10 @@ class EnvironmentReportTests(_WizardTestCase):
         self.assertTrue(notes["writable"])
 
     def test_unwritable_required_location_is_blocked(self):
-        """能力包/会议文件不可写 = 硬阻塞（向导据此拦住"开始准备"）。"""
+        """模型文件/会议文件不可写 = 硬阻塞（向导据此拦住"开始准备"）。"""
         self.stub_quiet()
         wizard.locations_report = lambda: [
-            {"key": "models", "label": "能力包", "settingKey": "modelsDir", "path": "",
+            {"key": "models", "label": "模型文件", "settingKey": "modelsDir", "path": "",
              "configured": False, "exists": False, "ascii": True, "writable": False,
              "freeGB": None, "note": "配置为空"},
             {"key": "notes", "label": "笔记库", "settingKey": "worklogVaultRoot", "path": "",
@@ -107,7 +107,18 @@ class EnvironmentReportTests(_WizardTestCase):
         ]
         report = wizard.environment_report()
         self.assertEqual([r["key"] for r in report["blocked"]], ["models"],
-                         "笔记库没设不算阻塞；能力包不可写才算")
+                         "笔记库没设不算阻塞；模型文件不可写才算")
+
+    def test_user_facing_term_is_model_files_not_capability_packages(self):
+        """界面用词是**模型文件**（2026-09-20 按用户要求由"能力包"改的）。
+
+        钉住后端给界面的标签：三处位置的第一处、以及网络体检的两条下载目标。
+        前端那半由 `tests/test_wizard_ui.py` 的术语守卫看着。
+        """
+        labels = {key: label for key, label, _setting, _required in wizard.LOCATIONS}
+        self.assertEqual(labels["models"], "模型文件")
+        for _tid, label, _url in wizard.NET_TARGETS[:2]:
+            self.assertIn("模型文件", label, "下载目标的说法要跟界面用词一致")
 
     def test_recommend_hides_accel_without_gpu(self):
         self.stub_quiet()
@@ -225,7 +236,7 @@ class BuildPlanTests(_PlanTestCase):
         self.assertEqual([d["component"] for d in plan["downloads"]], ["wake-kws"])
         diarize = [m for m in plan["manual"] if m["component"] == "diarize-pyannote"][0]
         self.assertIn("许可证", diarize["reason"],
-                      "gated 的能力包要说清「不能随包分发」，而不是假装能装")
+                      "gated 的模型文件要说清「不能随包分发」，而不是假装能装")
 
     def test_accel_is_manual_and_comes_last(self):
         plan = wizard.build_plan({"engines": ["stt-whisper-base"], "accel": True})
@@ -415,8 +426,8 @@ class InstalledComponentsTests(_PlanTestCase):
         self.assertNotIn("sk-SECRET", json.dumps(payload, ensure_ascii=False),
                          "返回值里也不该带密钥")
         self.assertFalse(wizard.first_run(target), "写完就不再是首装")
-        self.assertTrue(payload["modelsDir"], "要记下能力包放在哪")
-        # 能力包「已装」来自 ready() 这个真值，不是计划里的乐观期待
+        self.assertTrue(payload["modelsDir"], "要记下模型文件放在哪")
+        # 模型文件「已装」来自 ready() 这个真值，不是计划里的乐观期待
         components = {c["id"]: c for c in payload["components"]}
         self.assertTrue(components["stt-sherpa"]["ready"])
         self.assertFalse(components["stt-whisper-base"]["ready"])

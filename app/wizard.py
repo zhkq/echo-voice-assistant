@@ -4,7 +4,7 @@
 设计见 `docs/向导-分步设计.md`。这一层只做两件事，都是"只读检测"或"只写自己的小文件"：
 
   * ``environment_report()``：向导的"检查你的电脑"，以及每一步"推荐哪个 / 默认勾什么"的依据
-    —— 三处位置与空间（能力包 / 会议文件 / 笔记库）、显卡、网络、麦克风、Node、智能体。
+    —— 三处位置与空间（模型文件 / 会议文件 / 笔记库）、显卡、网络、麦克风、Node、智能体。
   * ``load_plan()`` / ``save_plan()``：**决策相**的用户选择（可续跑）。
 
 **这一层不做任何下载、不写任何设置**：把"选"与"装"分开是这套向导的核心（设计 §1）。
@@ -33,16 +33,18 @@ PLAN_SCHEMA = "echo-wizard/1"
 PLAN_STATES = ("draft", "reviewing", "running", "done")
 
 #: 三处位置（设计 §2 的 S1）：key → (界面上的名字, 配置键, 是否"必须可写")
+#: 界面用词是**模型文件**（2026-09-20 由"能力包"改的：用户说"能力包"看不出是什么，
+#: "模型文件"一眼就懂 —— 它就是这个目录里放的那些下载下来的文件）。
 LOCATIONS = (
-    ("models", "能力包", "modelsDir", True),
+    ("models", "模型文件", "modelsDir", True),
     ("meetings", "会议文件", "meetingsDir", True),
     ("notes", "笔记库", "worklogVaultRoot", False),
 )
 
 #: 网络体检目标（设计 §2 的 S0）。探这些是因为"能不能在线装"决定走在线还是离线组件包。
 NET_TARGETS = (
-    ("modelscope", "能力包下载（ModelScope）", "https://www.modelscope.cn"),
-    ("hf_mirror", "能力包下载（HF 镜像）", "https://hf-mirror.com"),
+    ("modelscope", "模型文件下载（ModelScope）", "https://www.modelscope.cn"),
+    ("hf_mirror", "模型文件下载（HF 镜像）", "https://hf-mirror.com"),
     ("pypi", "依赖下载（PyPI）", "https://pypi.org/simple/"),
 )
 
@@ -133,7 +135,7 @@ def locations_report() -> list:
     except Exception:
         pass
     return [
-        _location_entry("models", "能力包", "modelsDir", model_path, bool(models)),
+        _location_entry("models", "模型文件", "modelsDir", model_path, bool(models)),
         _location_entry("meetings", "会议文件", "meetingsDir", meeting_path, bool(meetings)),
         _location_entry("notes", "笔记库", "worklogVaultRoot", notes, bool(notes)),
     ]
@@ -368,7 +370,7 @@ def first_run(path: str = "") -> bool:
     """首装？（还没写过 `installed-components.json`）
 
     老用户升级时也没有这个文件 → 会当首装进一次向导。这是**刻意**的：他们要补
-    "能力包放哪 / 笔记库在哪 / AI 服务"，而决策相全程只读、也能一路跳过。
+    "模型文件放哪 / 笔记库在哪 / AI 服务"，而决策相全程只读、也能一路跳过。
     取不到时返回 False（宁可漏进一次向导，也不要因为探测失败把面板挡在门外）。
     ``path`` 只为测试注入；默认是数据根下的那个文件。
     """
@@ -379,7 +381,7 @@ def first_run(path: str = "") -> bool:
 
 
 def _model_ready(model_id: str):
-    """能力包是否就绪（真值来源：`modelinfo.ready`）。取不到返回 None —— 不假装"没装"。"""
+    """模型文件是否就绪（真值来源：`modelinfo.ready`）。取不到返回 None —— 不假装"没装"。"""
     try:
         from app import modelinfo
         return modelinfo.ready(model_id)
@@ -390,7 +392,7 @@ def _model_ready(model_id: str):
 def finalize(plan_file: str = "", *, path: str = "", ready=None, write=None) -> dict:
     """向导走到末页时写 `data/installed-components.json`（设计 §4/§5 的"执行后真值"）。
 
-    **绝不写设置的值**：里面可能有在线服务的密钥，而这个文件是明文。只记能力包的
+    **绝不写设置的值**：里面可能有在线服务的密钥，而这个文件是明文。只记模型文件的
     已装状态与本地位置，以及"向导写过哪些设置"的**键名**列表。
 
     `ready` / `write` 可注入，便于测试；默认走 `modelinfo.ready` 与真实写盘。
@@ -458,7 +460,7 @@ def _model_ready_call(ready, model_id: str):
 # ---------------------------------------------------------------- 决策 → 执行计划
 #
 # 用户的选择（choices）要展开成两类动作：
-#   * **下载**：能力包 → `modelinfo.start_download(model_id)`（组件清单里的 model_id 是唯一映射）；
+#   * **下载**：模型文件 → `modelinfo.start_download(model_id)`（组件清单里的 model_id 是唯一映射）；
 #   * **写配置**：三处位置、provider 选择、智能体后端 —— 不占空间但要落进设置。
 # 还有一类**面板不代装**的（CUDA 的 pip 包、gated 的 pyannote、本机服务），单独列出来并
 # 写清原因与做法（设计 §0.6：不隐藏、不假装）。
@@ -562,7 +564,7 @@ def _component_action(cid: str, manifests: dict) -> dict:
     item = manifests.get(cid)
     if not item:
         return {"kind": "unknown", "component": cid, "label": cid, "approxMb": 0,
-                "reason": "清单里没有这个能力包（看 app/components.py 或 components/*.json）"}
+                "reason": "清单里没有这个模型文件（看 app/components.py 或 components/*.json）"}
     label = str(item.get("name") or cid)
     size = int(item.get("size_mb") or 0)
     model_id = str(item.get("model_id") or "")
@@ -573,7 +575,7 @@ def _component_action(cid: str, manifests: dict) -> dict:
     if item.get("never_ship"):
         out = dict(base)
         out.update({"kind": "manual",
-                    "reason": "这个能力包不能随包分发（许可证限制），要你自己获取"})
+                    "reason": "这个模型文件不能随包分发（许可证限制），要你自己获取"})
         return out
     if model_id:
         ready = None
@@ -595,7 +597,7 @@ def _component_action(cid: str, manifests: dict) -> dict:
                     "command": str(item["command"])})
         return out
     out = dict(base)
-    out.update({"kind": "manual", "reason": "这个能力包要手工准备（见说明）"})
+    out.update({"kind": "manual", "reason": "这一项要手工准备（见说明）"})
     return out
 
 

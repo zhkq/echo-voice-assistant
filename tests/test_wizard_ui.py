@@ -108,6 +108,12 @@ class WizardUiWiringTests(unittest.TestCase):
             for text in texts:
                 self.assertNotIn(word, text,
                                  "文案里不该出现技术词「%s」：%s" % (word, text[:60]))
+        # 用词（2026-09-20 按用户要求）：说「模型文件」，不再说「能力包」——
+        # "能力包"是向导自己造的词，看不出里面是什么；"模型文件"一眼就懂。
+        for text in texts:
+            self.assertNotIn("能力包", text,
+                             "旧用词「能力包」不该再出现，改说「模型文件」：%s" % text[:60])
+        self.assertIn("模型文件", block, "三处位置的第一处要叫「模型文件」")
         # 人话标志：体积要带换算，而不是只给 MB 数字
         self.assertIn("首歌", block, "体积要给一个人话换算")
 
