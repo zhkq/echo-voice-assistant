@@ -829,8 +829,10 @@ def meeting_worklog(mid: int, body: WorklogIn, _auth=Depends(optional_auth)):
 def worklog_status(_auth=Depends(optional_auth)):
     """归档可用性（面板据此决定「写工作日志」是否可点）。"""
     ok, reason = worklog.ready()
+    # 注：`mode` 已随 worklogMode(=off 与 worklogEnabled 重复的开关) 于 2026-09-19 弃用，
+    # 这里不再暴露该字段，前端也不读它（修复 /worklog/status 500）。
     return {"ready": ok, "reason": reason,
-            "enabled": worklog.enabled(), "mode": worklog.mode(),
+            "enabled": worklog.enabled(),
             "vault": worklog.vault_root()}
 
 
