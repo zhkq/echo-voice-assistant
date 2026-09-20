@@ -372,7 +372,13 @@ function Step04-Extract {
 # edge_tts/modelscope 全部挡掉后，app.main/api/db 仍能导入 —— 引擎导入都是惰性的。）
 # D24 要求：安装器里**没有任何选择界面**，能自动决定的就自动决定。
 function Find-RuntimeCorePackage {
-    $names = @('ECHO-组件-runtime-core-*.zip', 'ECHO-component-runtime-core-*.zip')
+    # 三种来源，按"越专用越先"排列：单组件包 → 离线合集（D23 的兜底）→ 解开的目录。
+    $names = @(
+        'ECHO-组件-runtime-core-*.zip',
+        'ECHO-component-runtime-core-*.zip',
+        'ECHO-离线组件合集-*.zip',
+        'ECHO-offline-*.zip'
+    )
     $search = @()
     if ($ComponentDir) { $search += $ComponentDir }
     if ($script:ZipPath) { $search += (Split-Path $script:ZipPath -Parent) }
@@ -409,26 +415,50 @@ function Install-RuntimeCore {
         Info '(模拟) 装基础依赖 requirements-core.txt（约 100 MB）'
         return
     }
-    # ① 离线组件包优先：无网场景的唯一出路
+    # ① 离线包优先：无网场景的唯一出路
     $cand = Find-RuntimeCorePackage
     if ($cand) {
-        Info ("从离线组件包准备 runtime-core: {0}" -f $cand)
-        $tmp = ''
+        $isBundle = ((Split-Path $cand -Leaf) -match 'offline|离线')
+        if ($isBundle) { Info ("从离线合集准备 runtime-core: {0}" -f $cand) }
+        else { Info ("从离线组件包准备 runtime-core: {0}" -f $cand) }
         if ($cand -like '*.zip') {
+            # 包内是"安装根相对路径"（runtime-core\python.exe、models\...）：解到临时目录后
+            # **只取 runtime-core** —— 其余组件由面板向导决定装不装（D24，安装器不越权）。
             $tmp = Join-Path $script:ExistingDir ('.rc-tmp-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
             New-Item -ItemType Directory -Path $tmp -Force | Out-Null
             Invoke-Native 'tar' @('-xf', $cand, '-C', $tmp) | Out-Null
-            $inner = @(Get-ChildItem $tmp -Directory -Force)
-            $src = if ($inner.Count -eq 1) { $inner[0].FullName } else { $tmp }
+            $inner = Join-Path $tmp 'runtime-core'
+            if (-not (Test-Path $inner)) { $inner = Join-Path $tmp 'components\runtime-core' }
+            if (Test-Path $inner) {
+                if (Test-Path $rcDir) { Remove-Item $rcDir -Recurse -Force -ErrorAction SilentlyContinue }
+                Move-Item $inner $rcDir -Force
+            } elseif ((Get-RuntimeCorePython $tmp)) {
+                # 旧式载荷：zip 根就是运行时本体
+                New-Item -ItemType Directory -Path $rcDir -Force | Out-Null
+                Get-ChildItem $tmp -Force | Move-Item -Destination $rcDir -Force
+            } else {
+                Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
+                Err ("包里没有 runtime-core（离线合集应含 runtime-core\**）: {0}" -f $cand)
+                exit 1
+            }
+            Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
         } else {
-            $src = $cand
+            # 目录形态：要么本身就是运行时，要么里面套一层 runtime-core\
+            $src = if ((Get-RuntimeCorePython $cand)) { $cand } else { Join-Path $cand 'runtime-core' }
+            if (-not (Test-Path $src)) { Err ("目录里没有 runtime-core: {0}" -f $cand); exit 1 }
+            if (Test-Path $rcDir) { Remove-Item $rcDir -Recurse -Force -ErrorAction SilentlyContinue }
+            New-Item -ItemType Directory -Path $rcDir -Force | Out-Null
+            Get-ChildItem $src -Force | Move-Item -Destination $rcDir -Force
         }
-        New-Item -ItemType Directory -Path $rcDir -Force | Out-Null
-        Get-ChildItem $src -Force | Move-Item -Destination $rcDir -Force
-        if ($tmp) { Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue }
+        if ($isBundle) {
+            # 记下离线合集位置：其余组件由面板向导按需补装（D24），安装器只装必装的这一件
+            $rec = Join-Path $script:ExistingDir 'offline-components.txt'
+            Set-Content -Path $rec -Value $cand -Encoding UTF8
+            Info ("已记录离线合集路径（面板可按需补装其它组件）: {0}" -f $rec)
+        }
         $rcPy = Get-RuntimeCorePython $rcDir
-        if ($rcPy) { Ok ("runtime-core 已安装（离线包）: {0}" -f $rcPy); return }
-        Err ("离线组件包里没有 python.exe: {0}" -f $cand)
+        if ($rcPy) { Ok ("runtime-core 已安装: {0}" -f $rcPy); return }
+        Err ("包里没有 python.exe: {0}" -f $cand)
         exit 1
     }
     # ② 在线创建：uv 优先，其次 py 启动器
