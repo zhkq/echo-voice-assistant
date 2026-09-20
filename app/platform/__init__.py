@@ -288,3 +288,24 @@ def os_version(name: str = "") -> tuple:
     except Exception:
         pass
     return ()
+
+
+def gpu_info() -> dict:
+    """显卡信息（首装向导用：决定推荐哪档转写、要不要显示"用显卡加速"）。
+
+    返回 ``{"vendor","name","vramMb","driver","source"}``；**探测不到就返回空字段，不猜**
+    —— 向导据此说"没检测到独立显卡"，而不是编一个型号出来。任何异常都不抛。
+    """
+    blank = {"vendor": "", "name": "", "vramMb": 0, "driver": "", "source": ""}
+    fn = _platform_fn("gpu_info")
+    if not callable(fn):
+        return blank
+    try:
+        data = dict(fn() or {})
+    except Exception:
+        return blank
+    out = dict(blank)
+    for key in blank:
+        if key in data:
+            out[key] = data[key]
+    return out

@@ -953,6 +953,44 @@ def api_components(platform: str = "", includeBlocked: bool = False,
     return components.catalog(platform=platform or None, include_blocked=bool(includeBlocked))
 
 
+# ---------------------------------------------------------------- 首装向导（D23/D24）
+# "选"与"装"分开：这三个端点只做**只读体检**与**写用户自己的计划文件**，
+# 不下载、不写设置（设计 docs/向导-分步设计.md §1）。真正的下载/配置写入在执行相，
+# 复用现有的 /api/models/download 与 /api/settings。
+
+@router.get("/wizard/env")
+def api_wizard_env(_auth=Depends(optional_auth)):
+    """向导的"检查你的电脑"：三处位置与空间、显卡、网络、麦克风、Node、智能体状态。
+
+    **永不 500**：任何一项探测失败都登记进报告（``note`` 字段），因为环境坏掉的时候，
+    这个页面恰恰最需要能打开。
+    """
+    from app import wizard
+    return wizard.environment_report()
+
+
+class WizardPlanIn(BaseModel):
+    plan: dict = {}
+
+
+@router.get("/wizard/plan")
+def api_wizard_plan(_auth=Depends(optional_auth)):
+    """读向导计划（决策相的产物）。文件缺失/损坏都返回默认骨架。"""
+    from app import wizard
+    return {"plan": wizard.load_plan(), "states": list(wizard.PLAN_STATES)}
+
+
+@router.put("/wizard/plan")
+def api_wizard_plan_put(body: WizardPlanIn, _auth=Depends(optional_auth)):
+    """写向导计划（原子替换，只写 data/wizard-plan.json）。
+
+    只接受 ``state`` 与 ``choices`` 这类"用户的选择"；**设置与下载都不在这里发生**，
+    这样用户随时能改、随时能退，不会留下半装状态。
+    """
+    from app import wizard
+    return {"plan": wizard.save_plan(body.plan or {})}
+
+
 # ---------------------------------------------------------------- 能力 provider（P5 / D25）
 # ASR / LLM / TTS 三类能力的统一清单：谁在生效、是不是要出网（egress）、就绪与否。
 # 与 /api/components 的分工：**components = 装什么**（模型/引擎/运行时的安装与就绪），
