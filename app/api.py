@@ -316,6 +316,41 @@ def get_agents(probe: bool = False, _auth=Depends(optional_auth)):
     }
 
 
+@router.post("/harness/browser")
+def post_harness_browser(_auth=Depends(optional_auth)):
+    """在浏览器里打开独立 harness 的 Web 界面（仪表盘「超级助理」名字后那个小图标）。
+
+    为什么由**服务端**打开、而不是把 URL 交给页面：harness 的登录靠启动时那条带
+    `?token=…` 的 URL，token 是密钥 —— 经接口下发等于把它写进浏览器历史和前端内存。
+    这里服务端拼好 URL 直接调系统 shell，响应只回**不含 token** 的地址供提示。
+    """
+    from app import harness_proc
+    from app import platform as echo_platform
+    if not harness_proc.online():
+        if not harness_proc.requested():
+            return {"ok": False,
+                    "message": "独立 harness 没在运行：在 设置 → 智能体 里选中"
+                               "「独立 DeepSeek Harness」，ECHO 会自动拉起它"}
+        return {"ok": False, "message": "独立 harness 没在监听 %s（看 data/logs/harness.log）"
+                                        % harness_proc.base_url()}
+    tok = harness_proc.token()
+    note = ""
+    if not tok:
+        # 手里没有 token（例如实例是上一轮 ECHO 拉起的）→ 让它重启一次换一枚新的：
+        # 浏览器必须带 token 才能真正进界面（我们那枚密钥 Cookie 给不了浏览器）。
+        tok, note = harness_proc.ensure_token()
+    if not harness_proc.online():
+        return {"ok": False, "message": "独立 harness 没在监听 %s（%s）"
+                                        % (harness_proc.base_url(), note or "看 data/logs/harness.log")}
+    url = harness_proc.base_url() + ("/?token=%s" % tok if tok else "/")
+    if not echo_platform.shell_open(url):
+        return {"ok": False, "message": "打开浏览器失败（%s）" % harness_proc.base_url()}
+    msg = "已在浏览器打开 %s" % harness_proc.base_url()
+    if not tok:
+        msg += "（没拿到登录 token：%s）" % (note or "建议在设置里填一次")
+    return {"ok": True, "url": harness_proc.base_url(), "message": msg}
+
+
 @router.post("/settings/reset")
 def reset_settings(key: str = "", _auth=Depends(optional_auth)):
     settings.reset(key or None)
@@ -794,8 +829,10 @@ def meeting_worklog(mid: int, body: WorklogIn, _auth=Depends(optional_auth)):
 def worklog_status(_auth=Depends(optional_auth)):
     """归档可用性（面板据此决定「写工作日志」是否可点）。"""
     ok, reason = worklog.ready()
+    # 注：`mode` 已随 worklogMode(=off 与 worklogEnabled 重复的开关) 于 2026-09-19 弃用，
+    # 这里不再暴露该字段，前端也不读它（修复 /worklog/status 500）。
     return {"ready": ok, "reason": reason,
-            "enabled": worklog.enabled(), "mode": worklog.mode(),
+            "enabled": worklog.enabled(),
             "vault": worklog.vault_root()}
 
 
@@ -916,6 +953,84 @@ def api_components(platform: str = "", includeBlocked: bool = False,
     """
     from app import components
     return components.catalog(platform=platform or None, include_blocked=bool(includeBlocked))
+
+
+# ---------------------------------------------------------------- 首装向导（D23/D24）
+# "选"与"装"分开：这三个端点只做**只读体检**与**写用户自己的计划文件**，
+# 不下载、不写设置（设计 docs/向导-分步设计.md §1）。真正的下载/配置写入在执行相，
+# 复用现有的 /api/models/download 与 /api/settings。
+
+@router.get("/wizard/env")
+def api_wizard_env(_auth=Depends(optional_auth)):
+    """向导的"检查你的电脑"：三处位置与空间、显卡、网络、麦克风、Node、智能体状态。
+
+    **永不 500**：任何一项探测失败都登记进报告（``note`` 字段），因为环境坏掉的时候，
+    这个页面恰恰最需要能打开。
+    """
+    from app import wizard
+    return wizard.environment_report()
+
+
+class WizardPlanIn(BaseModel):
+    plan: dict = {}
+
+
+@router.get("/wizard/plan")
+def api_wizard_plan(_auth=Depends(optional_auth)):
+    """读向导计划（决策相的产物）。文件缺失/损坏都返回默认骨架。"""
+    from app import wizard
+    return {"plan": wizard.load_plan(), "states": list(wizard.PLAN_STATES)}
+
+
+@router.put("/wizard/plan")
+def api_wizard_plan_put(body: WizardPlanIn, _auth=Depends(optional_auth)):
+    """写向导计划（原子替换，只写 data/wizard-plan.json）。
+
+    只接受 ``state`` 与 ``choices`` 这类"用户的选择"；**设置与下载都不在这里发生**，
+    这样用户随时能改、随时能退，不会留下半装状态。
+    """
+    from app import wizard
+    return {"plan": wizard.save_plan(body.plan or {})}
+
+
+class WizardChoicesIn(BaseModel):
+    choices: dict = {}
+
+
+@router.post("/wizard/preview")
+def api_wizard_preview(body: WizardChoicesIn, _auth=Depends(optional_auth)):
+    """确认页的数据：把选择展开成"将下载什么、合计多大、将写哪些设置"。
+
+    **纯计算**（除了把状态记成 reviewing）：用户在这一页还能返回改，什么都还没落地。
+    """
+    from app import wizard
+    built = wizard.build_plan(body.choices or {})
+    plan = wizard.load_plan()
+    plan["state"] = "reviewing"
+    plan["choices"] = dict(body.choices or {})
+    plan["built"] = built
+    wizard.save_plan(plan)
+    return {"plan": built}
+
+
+@router.post("/wizard/execute")
+def api_wizard_execute(body: WizardChoicesIn, _auth=Depends(optional_auth)):
+    """执行相：**先写配置，再依次触发下载**；已就绪的跳过，单项失败不中断其余。
+
+    这里不再问任何问题（设计 §1）—— 请求本身就是"确认页点下开始"那一下。
+    """
+    from app import wizard
+    return {"result": wizard.execute_plan(choices=body.choices or {})}
+
+
+@router.get("/wizard/state")
+def api_wizard_state(_auth=Depends(optional_auth)):
+    """执行相的状态：每项 排队中 / 正在下载 / 好了 / 没成 / 已跳过 + 总进度。
+
+    复用 ``modelinfo.jobs()`` 的真实进度，所以关掉面板再打开也能接着看。
+    """
+    from app import wizard
+    return wizard.execution_state()
 
 
 # ---------------------------------------------------------------- 能力 provider（P5 / D25）

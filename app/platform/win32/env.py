@@ -342,3 +342,38 @@ def named_lock_held(lock_id, lock_path) -> bool:
 
 def release_named_lock(handle):
     _kernel32().CloseHandle(handle)
+
+
+def gpu_info():
+    """显卡信息（首装向导判断"要不要装显卡加速"用）。
+
+    只查 NVIDIA —— ECHO 目前只支持它的加速。优先问 ``nvidia-smi``（装了驱动就有），
+    **不走 wmic / PowerShell**：那两个是本仓库明令收进平台接缝的 Windows 专有命令，
+    而且新版 Windows 上 wmic 已被弃用。探测不到就返回空字段（不猜型号）。
+    """
+    import shutil
+    import subprocess
+
+    out = {"vendor": "", "name": "", "vramMb": 0, "driver": "", "source": ""}
+    exe = shutil.which("nvidia-smi")
+    if not exe:
+        return out
+    try:
+        raw = subprocess.run(
+            [exe, "--query-gpu=name,memory.total,driver_version",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=8)
+    except Exception:
+        return out
+    rows = [r for r in (raw.stdout or "").splitlines() if r.strip()]
+    if not rows:
+        return out
+    parts = [p.strip() for p in rows[0].split(",")]
+    if len(parts) >= 3:
+        try:
+            vram = int(float(parts[1] or 0))
+        except ValueError:
+            vram = 0
+        out.update({"vendor": "nvidia", "name": parts[0], "vramMb": vram,
+                    "driver": parts[2], "source": "nvidia-smi"})
+    return out

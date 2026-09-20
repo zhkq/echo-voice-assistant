@@ -47,6 +47,13 @@ class AgentSettingsOwnershipTests(unittest.TestCase):
         """`harnessToken` 这类密钥可以写在 settings_keys 里（适配器要用它连服务），
         但 `agent_settings()` 必须把它挡在接口之外 —— 面板永远看不到明文。"""
         from app import agents
+    def test_secret_keys_are_declared_and_only_report_whether_set(self):
+        """密钥（`harnessToken`）要能被面板编辑，但**值永不出接口**。
+
+        2026-09-19 用户实测问"我在哪里配置 key"：原来这类键被整条跳过，于是错误提示让人
+        "把 token 填到「harness 访问 token」里"，而面板上根本没有那一栏。
+        现在的契约：行照发（面板渲染成密码框），但只带 `secret=True` + `hasValue`，`value` 恒为空。
+        """
         secrets = [(k, o) for k, o in _owner_map().items() if DEFAULTS[k].get("secret")]
         self.assertTrue(secrets, "至少要有一个密钥项被这条用例覆盖到（harnessToken）")
         for key, owners in secrets:
@@ -54,9 +61,15 @@ class AgentSettingsOwnershipTests(unittest.TestCase):
                 self.assertTrue(any(key in (getattr(cls, "settings_keys", ()) or ())
                                     for cls in agents.specs()),
                                 "%s 应由某个适配器声明" % key)
-                for cls in agents.specs():
-                    keys = {s["key"] for s in agents.agent_settings(cls)}
-                    self.assertNotIn(key, keys, "%s 是密钥，不该经 /api/agents 下发" % key)
+                declared = [cls for cls in agents.specs()
+                            if key in (getattr(cls, "settings_keys", ()) or ())]
+                for cls in declared:
+                    rows = {s["key"]: s for s in agents.agent_settings(cls)}
+                    self.assertIn(key, rows, "%s 应作为密钥行下发（面板需要那一栏）" % key)
+                    row = rows[key]
+                    self.assertTrue(row.get("secret"))
+                    self.assertFalse(row.get("value"), "密钥的值不许出接口")
+                    self.assertIn("hasValue", row, "面板要靠它显示「已配置/未配置」")
 
     def test_no_key_is_claimed_by_two_agents(self):
         for key, owners in _owner_map().items():

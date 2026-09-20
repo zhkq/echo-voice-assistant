@@ -1,13 +1,15 @@
 ﻿# =====================================================================
 # install.ps1 — ECHO 一键安装向导（同事版）
 #
-# 适用路线：**内部「整包」**（需要 ECHO-*.zip，内含预置 venv 与已下载模型）。
-# 公开仓库**只提供从源码安装**（见 README）：整包不在仓库、也不进 Release ——
-# 它内含单位内网信息，以及需要单独授权的模型权重，不适合公开分发。
+# 适用路线（两种交付包）
+#   主包（D22，方向）：ECHO-main-<平台>-<版本>-<时间>.zip —— **仅代码 + 组件清单**，
+#     不带运行时、不带模型。本脚本解压后按 manifest.json 准备 **runtime-core** 组件
+#     （离线组件包优先，其次用 uv / py 在线创建），再拉起面板；其余组件由面板向导选装。
+#   整包（legacy，pre-D22）：ECHO-internal-*.zip —— 自带 venv 与模型，解压即可用。
+#     过渡期继续可用；两种包的取舍见 docs\REFACTOR-PLAN.md 的 D22/D23/D24。
 #
-# 场景 A（推荐，交付 zip）：把本脚本 + install.bat 与
-#   ECHO-交付包-YYYYMMDD.zip 放在同一文件夹，双击 install.bat 即可：
-#   自动发现 zip → 选择安装目录 → 解压 → venv 修复校验 → 建库 →
+# 场景 A（推荐，交付 zip）：把本脚本 + install.bat 与交付包放在同一文件夹，双击 install.bat：
+#   自动发现 zip → 选择安装目录 → 解压 → （主包：准备 runtime-core）→ 建库 →
 #   桌面快捷方式 → 开机自启（无窗口） → DSH 检测引导 → 完成。
 #
 # 场景 B（本机重装 / 目录已就位）：在 ECHO\scripts 里直接运行，检测到
@@ -18,9 +20,11 @@
 #   可选：
 #     -Zip <path>         指定交付包 zip（默认自动发现）
 #     -DestDir <dir>      安装目录（默认 D:\ECHO，D 盘不存在则 C:\ECHO）
+#     -ComponentDir <dir> 离线组件包所在目录（主包准备 runtime-core 时优先从这里找）
 #     -Silent             无人值守：全默认值，不询问
 #     -DryRun             只模拟：打印将执行的动作，不写任何系统位置
-#     -SkipSetup          跳过 venv 初始化（已初始化过的包）
+#     -SkipSetup          跳过初始化（整包：venv 修复建库；主包：等同 -SkipRuntime）
+#     -SkipRuntime        不准备 runtime-core（主包专用，留给测试/CI）
 #     -SkipStartupLnk     不装开机自启
 #     -SkipDesktopLnk     不装桌面快捷方式
 #     -SkipDshCheck       跳过 DSH Desktop 检测
@@ -32,9 +36,11 @@
 param(
     [string]$Zip = '',
     [string]$DestDir = '',
+    [string]$ComponentDir = '',
     [switch]$Silent,
     [switch]$DryRun,
     [switch]$SkipSetup,
+    [switch]$SkipRuntime,
     [switch]$SkipStartupLnk,
     [switch]$SkipDesktopLnk,
     [switch]$SkipDshCheck,
@@ -49,6 +55,7 @@ $script:ZipTop = 'ECHO'
 $script:TargetDir = ''
 $script:DestRoot = ''
 $script:ExistingDir = ''
+$script:IsMainPackage = $false
 $script:DryRun = [bool]$DryRun
 $script:Silent = [bool]$Silent
 
@@ -174,11 +181,17 @@ function Step01-Environment {
 function Step02-Source {
     Step 2 '确定 ECHO 来源'
     # 场景 B：脚本位于 ECHO\scripts\ 且已有 venv → 已存在目录
+    # 但**显式给了 -Zip 时以交付包为准**：否则"把 install.bat + zip 放进已有 ECHO
+    # 目录再双击"会被静默当成"重装已有目录"，你给的包根本没被解压（2026-09-20 实测）。
     $parentOfScripts = Split-Path $PSScriptRoot -Parent
-    if (Test-Path (Join-Path $parentOfScripts 'venv\Scripts\python.exe')) {
+    $hasVenv = Test-Path (Join-Path $parentOfScripts 'venv\Scripts\python.exe')
+    if ($hasVenv -and -not $Zip) {
         $script:ExistingDir = $parentOfScripts
         Ok ("检测到已有 ECHO 目录: {0}" -f $script:ExistingDir)
         return
+    }
+    if ($hasVenv) {
+        Info ("同目录已有 ECHO（{0}），但显式指定了 -Zip：按交付包安装" -f $parentOfScripts)
     }
     # 场景 A：定位交付 zip
     if ($Zip) {
@@ -197,14 +210,32 @@ function Step02-Source {
     }
     $sizeGb = [math]::Round((Get-Item $script:ZipPath).Length / 1GB, 2)
     Ok ("交付包: {0}  ({1} GB)" -f $script:ZipPath, $sizeGb)
-    # 探测 zip 顶层目录
-    $r = Invoke-Native 'tar' @('-tf', $script:ZipPath)
-    $firstLine = ($r.out -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -First 1)
-    if ($firstLine) {
-        $top = ($firstLine -split '[\\/]')[0]
-        if ($top) { $script:ZipTop = $top }
+    # 探测 zip 顶层目录。
+    # 不要用 `tar -tf` 的输出：Invoke-Native 会把多行压成一行（($keep -join ' ')），
+    # 于是"取第一行 → 取第一个路径段"必然拿到排序最靠前的那一项；本包内 `.dsh/...`
+    # 恰好排在最前，实测把默认安装目录算成了 D:\.dsh（2026-09-20）。
+    # 改成读 zip 中央目录：快，且不依赖外部命令。
+    $topDirs = @()
+    $z = $null
+    try {
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        $z = [System.IO.Compression.ZipFile]::OpenRead($script:ZipPath)
+        $topDirs = @($z.Entries |
+            ForEach-Object { ($_.FullName -replace '\\', '/').Split('/')[0] } |
+            Where-Object { $_ } |
+            Sort-Object -Unique)
+    } catch {
+        Warn ("读取交付包目录失败: {0}" -f $_.Exception.Message)
+    } finally { if ($z) { $z.Dispose() } }
+    if ($topDirs -contains 'ECHO') {
+        $script:ZipTop = 'ECHO'
+        Info ("zip 顶层目录: ECHO（与它同级的还有 {0} 项）" -f ($topDirs.Count - 1))
+    } elseif ($topDirs.Count -eq 1) {
+        $script:ZipTop = $topDirs[0]
+        Info ("zip 顶层目录: {0}" -f $script:ZipTop)
+    } else {
+        Info ("zip 顶层目录不唯一: {0}（按 ECHO 处理）" -f ($topDirs -join ', '))
     }
-    Info ("zip 顶层目录: {0}（期望 ECHO）" -f $script:ZipTop)
 }
 
 function Step03-Dest {
@@ -261,7 +292,7 @@ function Step04-Extract {
         New-Item -ItemType Directory -Path $script:TargetDir -Force | Out-Null
     }
     if ($script:DryRun) {
-        Info "(模拟) tar -xf {0} 到 {1}" -f $script:ZipPath, $script:TargetDir
+        Info ("(模拟) tar -xf {0} 到 {1}" -f $script:ZipPath, $script:TargetDir)
         $script:ExistingDir = $script:TargetDir
         return
     }
@@ -276,46 +307,211 @@ function Step04-Extract {
             Err ("解压失败: {0}" -f $r.out)
             exit 1
         }
-        $topDir = Get-ChildItem $tmp -Directory | Select-Object -First 1
-        if (-not $topDir) {
-            Err 'zip 内未发现顶层目录（交付包结构异常）。'
-            exit 1
-        }
-        # 顶层目录放入目标：
-        #   目标不存在 / 为空 → 整体改名移动（同盘 rename，瞬间完成）
-        #   目标非空（用户已确认）→ 顶层内容逐项移入
+        # 判断包结构：**唯一**顶层目录 = 包装型包（build-package 的 main / internal 档
+        # 会裹一层 ECHO\）；否则是平铺包（public 档是平铺的）。
+        # 注意 zip 根除了 ECHO\ 还有两个包元数据文件（BUILD-INFO.txt / SHA256SUMS.txt），
+        # 所以不能要求"根目录零文件"——上一版按 1 目录 + 0 文件判定，真包被判成平铺包，
+        # 结果整个树被装深一层（dest\ECHO\app\…，2026-09-20 真跑时发现）。
+        # 旧代码更早的版本则无条件只搬"第一个目录"，平铺包会只剩 1 个目录、其余被删。
+        $pkgMeta   = @('BUILD-INFO.txt', 'SHA256SUMS.txt')
+        $rootDirs  = @(Get-ChildItem $tmp -Directory -Force -ErrorAction SilentlyContinue)
+        $rootFiles = @(Get-ChildItem $tmp -File -Force -ErrorAction SilentlyContinue)
+        $extraFiles = @($rootFiles | Where-Object { $pkgMeta -notcontains $_.Name })
+        $wrapped = ($rootDirs.Count -eq 1 -and $extraFiles.Count -eq 0)
         $tItems = @(Get-ChildItem $script:TargetDir -Force -ErrorAction SilentlyContinue)
-        if ($tItems.Count -eq 0) {
-            Remove-Item $script:TargetDir -Force -ErrorAction SilentlyContinue
-            Move-Item $topDir.FullName $script:TargetDir -Force
+        if ($wrapped) {
+            # 顶层目录放入目标：
+            #   目标不存在 / 为空 → 整体改名移动（同盘 rename，瞬间完成）
+            #   目标非空（用户已确认）→ 顶层内容逐项移入
+            $topDir = $rootDirs[0]
+            if ($tItems.Count -eq 0) {
+                Remove-Item $script:TargetDir -Force -ErrorAction SilentlyContinue
+                Move-Item $topDir.FullName $script:TargetDir -Force
+            } else {
+                Get-ChildItem $topDir.FullName -Force | Move-Item -Destination $script:TargetDir -Force
+                Remove-Item $topDir.FullName -Force -Recurse -ErrorAction SilentlyContinue
+            }
+            # 包元数据跟着落到安装目录（留着对账用；它们描述的是这个包）
+            if (-not (Test-Path $script:TargetDir)) {
+                New-Item -ItemType Directory -Path $script:TargetDir -Force | Out-Null
+            }
+            foreach ($mf in $rootFiles) {
+                if ($pkgMeta -contains $mf.Name) {
+                    Move-Item $mf.FullName (Join-Path $script:TargetDir $mf.Name) -Force
+                }
+            }
         } else {
-            Get-ChildItem $topDir.FullName -Force | Move-Item -Destination $script:TargetDir -Force
-            Remove-Item $topDir.FullName -Force -Recurse -ErrorAction SilentlyContinue
+            Info ("平铺包：把 {0} 个顶层项逐一移入目标目录" -f ($rootDirs.Count + $rootFiles.Count))
+            if (-not (Test-Path $script:TargetDir)) {
+                New-Item -ItemType Directory -Path $script:TargetDir -Force | Out-Null
+            }
+            Get-ChildItem $tmp -Force | Move-Item -Destination $script:TargetDir -Force
         }
         Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
     } catch {
         Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
         throw
     }
-    if (-not (Test-Path (Join-Path $script:TargetDir 'venv\Scripts\python.exe'))) {
-        Err '解压完成但未找到 venv\Scripts\python.exe，包可能不完整。'
+    # 包的种类：整包自带 venv；主包只有代码 + manifest.json（D22），运行时随后由
+    # runtime-core 组件补上 —— 以前这里只认 venv，主包会被误判成"包不完整"。
+    if (Test-Path (Join-Path $script:TargetDir 'venv\Scripts\python.exe')) {
+        Ok ("解压完成: {0}（整包：自带 venv）" -f $script:TargetDir)
+    } elseif (Test-Path (Join-Path $script:TargetDir 'manifest.json')) {
+        $script:IsMainPackage = $true
+        Ok ("解压完成: {0}（主包：仅代码，运行时由 runtime-core 组件提供）" -f $script:TargetDir)
+    } else {
+        Err '解压完成但既没有 venv\Scripts\python.exe 也没有 manifest.json，包可能不完整。'
         exit 1
     }
-    Ok ("解压完成: {0}" -f $script:TargetDir)
     $script:ExistingDir = $script:TargetDir
 }
 
+# ------------------------------------------------------- runtime-core（D22/D23）
+# 主包不含运行时，安装器得负责把 **runtime-core** 装上 —— 它是唯一必装组件，没有它
+# 连面板都起不来。（已实测：把 torch/funasr/faster_whisper/sherpa_onnx/pyannote/
+# edge_tts/modelscope 全部挡掉后，app.main/api/db 仍能导入 —— 引擎导入都是惰性的。）
+# D24 要求：安装器里**没有任何选择界面**，能自动决定的就自动决定。
+function Find-RuntimeCorePackage {
+    # 三种来源，按"越专用越先"排列：单组件包 → 离线合集（D23 的兜底）→ 解开的目录。
+    $names = @(
+        'ECHO-组件-runtime-core-*.zip',
+        'ECHO-component-runtime-core-*.zip',
+        'ECHO-离线组件合集-*.zip',
+        'ECHO-offline-*.zip'
+    )
+    $search = @()
+    if ($ComponentDir) { $search += $ComponentDir }
+    if ($script:ZipPath) { $search += (Split-Path $script:ZipPath -Parent) }
+    $search += $PSScriptRoot
+    foreach ($d in $search) {
+        if (-not $d -or -not (Test-Path $d)) { continue }
+        foreach ($n in $names) {
+            $hit = Get-ChildItem $d -Filter $n -File -ErrorAction SilentlyContinue |
+                   Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            if ($hit) { return $hit.FullName }
+        }
+        $dirHit = Join-Path $d 'runtime-core'
+        if ((Get-RuntimeCorePython $dirHit)) { return $dirHit }
+    }
+    return ''
+}
+
+# runtime-core 有两种合法布局：可重定位 CPython（python.exe 在根）与 venv 式
+# （Scripts\python.exe）。两种都要认 —— 否则"安装器建的"与"启动器找的"会对不上。
+function Get-RuntimeCorePython([string]$dir) {
+    foreach ($rel in @('python.exe', 'Scripts\python.exe')) {
+        $p = Join-Path $dir $rel
+        if (Test-Path $p) { return $p }
+    }
+    return ''
+}
+
+function Install-RuntimeCore {
+    $rcDir = Join-Path $script:ExistingDir 'runtime-core'
+    $rcPy = Get-RuntimeCorePython $rcDir
+    if ($rcPy) { Ok ("runtime-core 已就绪: {0}" -f $rcPy); return }
+    if ($script:DryRun) {
+        Info ("(模拟) 准备 runtime-core → {0}（离线组件包优先，其次 uv / py 在线创建）" -f $rcDir)
+        Info '(模拟) 装基础依赖 requirements-core.txt（约 100 MB）'
+        return
+    }
+    # ① 离线包优先：无网场景的唯一出路
+    $cand = Find-RuntimeCorePackage
+    if ($cand) {
+        $isBundle = ((Split-Path $cand -Leaf) -match 'offline|离线')
+        if ($isBundle) { Info ("从离线合集准备 runtime-core: {0}" -f $cand) }
+        else { Info ("从离线组件包准备 runtime-core: {0}" -f $cand) }
+        if ($cand -like '*.zip') {
+            # 包内是"安装根相对路径"（runtime-core\python.exe、models\...）：解到临时目录后
+            # **只取 runtime-core** —— 其余组件由面板向导决定装不装（D24，安装器不越权）。
+            $tmp = Join-Path $script:ExistingDir ('.rc-tmp-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+            New-Item -ItemType Directory -Path $tmp -Force | Out-Null
+            Invoke-Native 'tar' @('-xf', $cand, '-C', $tmp) | Out-Null
+            $inner = Join-Path $tmp 'runtime-core'
+            if (-not (Test-Path $inner)) { $inner = Join-Path $tmp 'components\runtime-core' }
+            if (Test-Path $inner) {
+                if (Test-Path $rcDir) { Remove-Item $rcDir -Recurse -Force -ErrorAction SilentlyContinue }
+                Move-Item $inner $rcDir -Force
+            } elseif ((Get-RuntimeCorePython $tmp)) {
+                # 旧式载荷：zip 根就是运行时本体
+                New-Item -ItemType Directory -Path $rcDir -Force | Out-Null
+                Get-ChildItem $tmp -Force | Move-Item -Destination $rcDir -Force
+            } else {
+                Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
+                Err ("包里没有 runtime-core（离线合集应含 runtime-core\**）: {0}" -f $cand)
+                exit 1
+            }
+            Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
+        } else {
+            # 目录形态：要么本身就是运行时，要么里面套一层 runtime-core\
+            $src = if ((Get-RuntimeCorePython $cand)) { $cand } else { Join-Path $cand 'runtime-core' }
+            if (-not (Test-Path $src)) { Err ("目录里没有 runtime-core: {0}" -f $cand); exit 1 }
+            if (Test-Path $rcDir) { Remove-Item $rcDir -Recurse -Force -ErrorAction SilentlyContinue }
+            New-Item -ItemType Directory -Path $rcDir -Force | Out-Null
+            Get-ChildItem $src -Force | Move-Item -Destination $rcDir -Force
+        }
+        if ($isBundle) {
+            # 记下离线合集位置：其余组件由面板向导按需补装（D24），安装器只装必装的这一件
+            $rec = Join-Path $script:ExistingDir 'offline-components.txt'
+            Set-Content -Path $rec -Value $cand -Encoding UTF8
+            Info ("已记录离线合集路径（面板可按需补装其它组件）: {0}" -f $rec)
+        }
+        $rcPy = Get-RuntimeCorePython $rcDir
+        if ($rcPy) { Ok ("runtime-core 已安装: {0}" -f $rcPy); return }
+        Err ("包里没有 python.exe: {0}" -f $cand)
+        exit 1
+    }
+    # ② 在线创建：uv 优先，其次 py 启动器
+    $uv = Get-Command uv -ErrorAction SilentlyContinue
+    if ($uv) {
+        Info '用 uv 创建 runtime-core（需要网络）...'
+        & $uv.Source venv --python 3.11 $rcDir 2>&1 | ForEach-Object { Write-Host "      $_" -ForegroundColor Gray }
+    } elseif (Get-Command py -ErrorAction SilentlyContinue) {
+        Info '用 py -3.11 创建 runtime-core（需要网络）...'
+        & py -3.11 -m venv $rcDir 2>&1 | ForEach-Object { Write-Host "      $_" -ForegroundColor Gray }
+    } else {
+        Err '没有 runtime-core，也没有 uv / py 可用 —— 主包自己跑不起来，必须先准备运行时。三选一：'
+        Err '  1) 把 runtime-core 离线组件包放到交付包同目录（或用 -ComponentDir 指定）'
+        Err '  2) 装 uv（https://docs.astral.sh/uv/）后重跑本向导'
+        Err '  3) 装 Python 3.11.x（python.org，勾选 Add to PATH）后重跑'
+        exit 1
+    }
+    $rcPy = Get-RuntimeCorePython $rcDir
+    if (-not $rcPy) { Err ("创建 runtime-core 失败: {0}" -f $rcDir); exit 1 }
+    $req = Join-Path $script:ExistingDir 'requirements-core.txt'
+    if (Test-Path $req) {
+        Info '安装 runtime-core 基础依赖（requirements-core.txt，约 100 MB）...'
+        Invoke-Native $rcPy @('-m', 'pip', 'install', '--upgrade', 'pip') | Out-Null
+        $r = Invoke-Native $rcPy @('-m', 'pip', 'install', '-r', $req)
+        if ($r.code -ne 0) { Warn ("基础依赖安装返回非零（{0}）：{1}" -f $r.code, $r.out) }
+    } else {
+        Warn '包内没有 requirements-core.txt，跳过基础依赖安装'
+    }
+    Ok ("runtime-core 就绪: {0}" -f $rcPy)
+}
+
 function Step05-Init {
+    if ($script:IsMainPackage) {
+        Step 5 '运行时准备（runtime-core 组件，D23）'
+        if ($SkipSetup -or $SkipRuntime) {
+            Warn '已跳过 runtime-core 准备（-SkipSetup / -SkipRuntime）—— 此时面板起不来'
+            return
+        }
+        Install-RuntimeCore
+        return
+    }
     Step 5 'venv 初始化与建库（new-machine-setup.ps1）'
+    # 先看跳过标志，再查脚本：否则 -SkipSetup 遇到"包里没有 new-machine-setup.ps1"
+    # 仍然会 exit 1，与它声明的用途（已初始化过的包，跳过）自相矛盾（2026-09-20 实测）。
+    if ($SkipSetup) {
+        Warn '已跳过初始化（-SkipSetup）'
+        return
+    }
     $setup = Join-Path $script:ExistingDir 'scripts\new-machine-setup.ps1'
     if (-not (Test-Path $setup)) {
         Err ("未找到初始化脚本: {0}" -f $setup)
         if ($script:DryRun) { return }
         exit 1
-    }
-    if ($SkipSetup) {
-        Warn '已跳过初始化（-SkipSetup）'
-        return
     }
     if ($script:DryRun) {
         Info "(模拟) 运行 new-machine-setup.ps1（修 pyvenv.cfg → 校验 → 补依赖 → 建库）"
@@ -343,28 +539,56 @@ function Step05-Init {
 function Step06-SelfCheck {
     Step 6 '安装自检'
     $fail = 0
+    # 解释器可能来自 runtime-core 组件（主包，D22）或自带的 venv（整包）
+    $rcPy = Get-RuntimeCorePython (Join-Path $script:ExistingDir 'runtime-core')
     $venvPy = Join-Path $script:ExistingDir 'venv\Scripts\python.exe'
-    if (Test-Path $venvPy) { Ok 'venv\Scripts\python.exe 存在' } else { Err '缺 venv\Scripts\python.exe'; $fail++ }
-    $pyw = Join-Path $script:ExistingDir 'venv\Scripts\pythonw.exe'
-    if (Test-Path $pyw) { Ok 'venv\Scripts\pythonw.exe 存在' } else { Warn '缺 pythonw.exe（启动将失败，建议重跑初始化）' }
+    if ($rcPy) { Ok ("runtime-core 就绪（D22 组件）: {0}" -f (Split-Path $rcPy -Leaf)) }
+    elseif (Test-Path $venvPy) { Ok 'venv\Scripts\python.exe 存在（整包）' }
+    else { Err '缺运行时（runtime-core 或 venv）'; $fail++ }
+    $anyPy = if ($rcPy) { $rcPy } else { $venvPy }
+    $pyw = $anyPy -replace 'python\.exe$', 'pythonw.exe'
+    if (Test-Path $pyw) { Ok ("{0} 存在" -f (Split-Path $pyw -Leaf)) }
+    else { Warn ("缺 {0}（启动将失败，建议重跑初始化）" -f (Split-Path $pyw -Leaf)) }
+    if ($script:IsMainPackage) {
+        $mani = Join-Path $script:ExistingDir 'manifest.json'
+        if (Test-Path $mani) { Ok 'manifest.json 存在（主包）' } else { Warn '缺 manifest.json' }
+    }
     $start = Join-Path $script:ExistingDir 'scripts\start.ps1'
     if (Test-Path $start) { Ok 'scripts\start.ps1 存在' } else { Err '缺 scripts\start.ps1'; $fail++ }
     $web = Join-Path $script:ExistingDir 'web\index.html'
     if (Test-Path $web) { Ok 'web 面板存在' } else { Warn '缺 web\index.html' }
-    # 端口占用检查
+    # 端口占用检查：端口由 data\echo-port.txt 决定（默认 8970）。
+    # 写死 8970 时它既发现不了"真端口被占"，也认不出"已有实例在跑"（本机实际 18060）。
+    $port = 8970
+    $portFile = Join-Path $script:ExistingDir 'data\echo-port.txt'
+    if (Test-Path $portFile) {
+        $parsed = 0
+        $raw = (Get-Content $portFile -ErrorAction SilentlyContinue |
+                Where-Object { $_.Trim() } | Select-Object -First 1)
+        if ($raw -and [int]::TryParse($raw.Trim(), [ref]$parsed) -and $parsed -gt 0) {
+            $port = $parsed
+            Info ("端口取自 data\echo-port.txt: {0}" -f $port)
+        } else {
+            Warn ("data\echo-port.txt 内容无法解析（{0}），按默认 {1} 检查" -f $raw, $port)
+        }
+    }
     $c = New-Object System.Net.Sockets.TcpClient
     try {
-        $iar = $c.BeginConnect('127.0.0.1', 8970, $null, $null)
+        $iar = $c.BeginConnect('127.0.0.1', $port, $null, $null)
         if ($iar.AsyncWaitHandle.WaitOne(800)) {
             $c.EndConnect($iar)
-            Warn '端口 8970 已被占用（本机可能已有 ECHO 在运行，不影响安装）'
+            Warn ("端口 {0} 已被占用（本机已有 ECHO 在运行，不影响安装）" -f $port)
         } else {
-            Ok '端口 8970 空闲'
+            Ok ("端口 {0} 空闲" -f $port)
         }
     } catch { } finally { $c.Dispose() }
     if ($fail -gt 0) {
         Err ("自检失败项: {0} 项，安装可能不可用" -f $fail)
-        if (-not (Ask-YesNo '继续？')) { exit 1 }
+        if ($script:DryRun) {
+            Info '(模拟) 真实安装走到这里会中止（默认 N）——请先修好上面的失败项'
+            return
+        }
+        if (-not (Ask-YesNo '自检未通过，仍要继续？' $false)) { exit 1 }
     }
 }
 
@@ -380,7 +604,8 @@ function Step07-Shortcuts {
             if ($LASTEXITCODE -eq 0) { Ok '桌面快捷方式已创建' } else { Warn '桌面快捷方式创建未成功' }
         }
     } else {
-        Warn '跳过桌面快捷方式'
+        if ($SkipDesktopLnk) { Warn '跳过桌面快捷方式（-SkipDesktopLnk）' }
+        else { Warn ("未找到桌面快捷方式安装脚本，未创建: {0}" -f $lnkInstaller) }
     }
     # ---- 开机自启（vbs 隐藏方案：绕开组策略对 -WindowStyle Hidden 的拦截）----
     if ($SkipStartupLnk) {
@@ -430,7 +655,9 @@ function Step07-Shortcuts {
     $lnk.Arguments = "`"$vbsPath`""
     $lnk.WorkingDirectory = $root
     $lnk.Description = 'ECHO 开机自启（无窗口启动器）'
-    $icon = Join-Path $root 'venv\Scripts\python.exe'
+    $icon = Join-Path $root 'runtime-core\python.exe'
+    if (-not (Test-Path $icon)) { $icon = Join-Path $root 'runtime-core\Scripts\python.exe' }
+    if (-not (Test-Path $icon)) { $icon = Join-Path $root 'venv\Scripts\python.exe' }
     if (Test-Path $icon) { $lnk.IconLocation = "$icon,0" }
     else { $lnk.IconLocation = "$env:SystemRoot\System32\shell32.dll,220" }
     $lnk.Save()
@@ -478,6 +705,9 @@ function Step08-Finalize {
         Write-Host '      建议立即设置：'
         Write-Host '        面板 → 设置 → 通用 → 计算设备：无 NVIDIA 显卡选 cpu'
         Write-Host '        面板 → 设置 → 会议 → 会议纪要工作区：可留空（默认 ECHO 根目录）'
+        if ($script:IsMainPackage) {
+            Write-Host '      主包不含模型与引擎：面板 → 设置 →「组件」按这台机器的环境选装'
+        }
     }
     Write-Host '    ────────────────────────────────────────────────' -ForegroundColor DarkGray
     # ---- 询问是否启动 ----

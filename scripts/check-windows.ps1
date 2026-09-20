@@ -35,6 +35,8 @@ if (-not ($py -and (Test-Path $py))) {
     $junction = Join-Path $env:USERPROFILE '.echo-venv\Scripts\python.exe'
     if (Test-Path $junction) { $py = $junction }
 }
+if (-not ($py -and (Test-Path $py))) { $py = Join-Path $root 'runtime-core\python.exe' }
+if (-not ($py -and (Test-Path $py))) { $py = Join-Path $root 'runtime-core\Scripts\python.exe' }
 if (-not ($py -and (Test-Path $py))) { $py = Join-Path $root 'venv\Scripts\python.exe' }
 if (-not (Test-Path $py)) {
     Write-Host "[FAIL] no interpreter found (set ECHO_PYTHON or create venv\): $py" -ForegroundColor Red

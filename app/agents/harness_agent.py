@@ -13,6 +13,7 @@
 2026-09-19 隔离实测（独立 DSH_HOME + 端口 43199）：
 `session/list`、`session/create`、`workspace/create` 全部 200，请求体与 ECHO 现有实现一致。
 """
+import os
 import time
 import urllib.error
 import urllib.request
@@ -38,6 +39,7 @@ class HarnessAgent(DshAgent):
     #: 它自己的配置项（面板在展开区里编辑）；token 是 secret，不会经接口回显
     settings_keys = ("harnessCommand", "harnessHome", "harnessPort", "harnessToken")
     capabilities = ("workspace", "session", "cancel", "history")
+    web_ui = True          # 它有 Web 界面 → 仪表盘上给一个"用浏览器打开它"的小图标
 
     def __init__(self, base_url=None):
         super().__init__(base_url or harness_proc.base_url())
@@ -45,10 +47,29 @@ class HarnessAgent(DshAgent):
 
     # ------------------------------------------------------------- 鉴权
 
-    def _login(self):
-        """用 token 换 Cookie。
+    def _credentials_path(self):
+        """独立 harness 自己的凭据文件（与桌面版同构）。"""
+        return os.path.join(harness_proc.home(), ".credentials.yaml")
 
-        harness 的登录是**一个 303**：
+    def _secret_cookie(self):
+        """退路：用 harness **自己家目录**里的 browser-session 密钥直接铸 Cookie。
+
+        为什么要有这条路（2026-09-19 实测发现）：独立 harness 的 `.credentials.yaml` 与
+        桌面版**结构完全同构**，都存着 `records['client-connection/browser-session'].payload.secret`。
+        所以"用户自己起的实例 / ECHO 重启后 token 变了"这些情况下，根本不必去要 token ——
+        照桌面版同一套算法铸 Cookie 就行。token 只有在**读不到那个文件**时才是必需的。
+        """
+        from app.agents.dsh_agent import _load_browser_secret
+        secret = _load_browser_secret(self._credentials_path())
+        if not secret:
+            return ""
+        from app.agents.dsh_agent import _make_cookie
+        return _make_cookie(self.base_url, secret_b64=secret)
+
+    def _login(self):
+        """换 Cookie：**优先 token**（ECHO 自己拉起时抓到的），拿不到就用家目录里的密钥铸。
+
+        harness 的 token 登录是**一个 303**：
             GET /?token=<token>  →  303 See Other + Set-Cookie: dsh-auth-…  →  Location: /
         所以**绝不能跟着跳转**：urllib 默认会跟随，而它跟随时**不带**这一步拿到的
         Set-Cookie（除非用 cookiejar），跳到 `/` 就被围栏判 401 —— 表现为
@@ -57,10 +78,14 @@ class HarnessAgent(DshAgent):
         """
         tok = harness_proc.token()
         if not tok:
+            cookie = self._secret_cookie()
+            if cookie:
+                return cookie
             raise DshError(
-                "没有 harness 访问 token：ECHO 还没把它拉起来，且设置里也没填。"
-                "选中本智能体后 ECHO 会自动启动并获取；若你是自己起的 harness，"
-                "把启动时打印的 token 填到「harness 访问 token」里")
+                "没有 harness 访问 token，也读不到它的凭据文件（%s）：ECHO 还没把它拉起来，"
+                "设置里也没填 token。选中本智能体后 ECHO 会自动启动并获取；"
+                "若你是自己起的 harness，把启动时打印的 token 填到「harness 访问 token」里"
+                % self._credentials_path())
         req = urllib.request.Request(self.base_url + "/?token=" + tok)
         opener = urllib.request.build_opener(_NoRedirect)
         try:
@@ -72,6 +97,9 @@ class HarnessAgent(DshAgent):
                 headers = e.headers          # 303 就是**正常**的登录响应
             elif e.code in (401, 403):
                 harness_proc.forget_token()      # 这个 token 不能用了，别再反复试
+                cookie = self._secret_cookie()   # 退路：拿家目录里的密钥铸一枚
+                if cookie:
+                    return cookie
                 raise DshError("harness 拒绝了 token（HTTP %s）：token 可能已过期 —— "
                                "重新选中本智能体让 ECHO 重拉一次，或更新"
                                "「harness 访问 token」" % e.code) from e

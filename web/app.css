@@ -136,6 +136,18 @@ body { min-width: 0; }
 .card.collapsible.collapsed > .card-body,
 .mcard.collapsible.collapsed > .mcard-body { display: none; }
 .card.collapsible.collapsed { padding-bottom: 6px; }   /* 折叠后别留一大截空白 */
+/* 仪表盘「超级助理」名字后的小图标：当前智能体自带 Web 界面时才出现（独立 harness）。
+   点它由服务端打开浏览器（token 不下发到页面），所以这里只是个普通按钮。 */
+.agent-web-open {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 22px; height: 22px; padding: 0; margin-left: 2px; flex-shrink: 0;
+  background: var(--card2); color: var(--text);
+  border: 1px solid var(--border); border-radius: 6px;
+  cursor: pointer; font-size: 12px; line-height: 1;
+}
+.agent-web-open:hover { border-color: var(--accent); filter: brightness(1.15); }
+.agent-web-open:disabled { opacity: .5; cursor: default; }
+.agent-web-open span { pointer-events: none; }
 .collapsible.collapsed > .card-title,
 .collapsible.collapsed > .mcard-head { margin-bottom: 0; }
 .card-title .more {
@@ -999,3 +1011,44 @@ main { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
 .mcard-nums .ctl { width: 90px; }
 .mcard-act { display: flex; gap: 8px; flex-wrap: wrap; }
 .model-foot { margin-top: 12px; font-size: 12.5px; }
+
+/* ---------- 首装向导（设计见 docs/向导-分步设计.md）----------
+   规矩：文案说人话；体积带人话换算；不满足条件的项「显示但禁用 + 写清原因」，不隐藏。
+   主按钮靠右（按建议装上），计划条常驻底部 —— 用户随时看得见取舍的代价。 */
+.wiz-nav { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 12px; }
+.wiz-dot { display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px;
+  border-radius: 999px; border: 1px solid var(--border); background: transparent;
+  color: var(--muted); font-size: 12px; cursor: pointer; }
+.wiz-dot > span { display: inline-flex; width: 18px; height: 18px; border-radius: 50%;
+  align-items: center; justify-content: center; background: var(--border);
+  color: var(--text); font-size: 11px; }
+.wiz-dot.done { color: var(--text); border-color: var(--green); }
+.wiz-dot.cur { color: var(--text); border-color: var(--accent); font-weight: 600; }
+.wiz-dot.cur > span { background: var(--accent); color: #fff; }
+.wiz-what { margin: 2px 0 6px; line-height: 1.75; }
+.wiz-why-body { line-height: 1.75; }
+.wiz-lose { color: var(--red); margin: 6px 0; line-height: 1.65; }
+.wiz-opts { display: flex; flex-direction: column; gap: 8px; margin-top: 10px; }
+.wiz-opt { display: flex; gap: 10px; align-items: flex-start; padding: 10px 12px;
+  border: 1px solid var(--border); border-radius: var(--radius); cursor: pointer; }
+.wiz-opt.on { border-color: var(--accent); }
+.wiz-opt.blocked { opacity: .55; cursor: not-allowed; }
+.wiz-opt-body { display: flex; flex-direction: column; gap: 2px; }
+.wiz-opt-name { font-weight: 600; }
+.wiz-blocked { color: var(--red); font-size: 12px; }
+.wiz-plan { font-size: 12px; color: var(--muted); }
+.wiz-foot { display: flex; align-items: center; gap: 8px; margin-top: 12px; }
+.wiz-loc { display: flex; flex-direction: column; gap: 4px; padding: 10px 0;
+  border-bottom: 1px solid var(--border); }
+.wiz-loc-input { width: 100%; }
+.wiz-env { display: flex; flex-direction: column; gap: 4px; margin: 6px 0; }
+.wiz-env-row { display: flex; gap: 10px; line-height: 1.6; }
+.wiz-env-row > b { min-width: 64px; color: var(--muted); font-weight: 600; }
+.wiz-sum { display: flex; flex-direction: column; gap: 6px; line-height: 1.7; }
+.wiz-sum ul { margin: 2px 0 2px 18px; }
+.wiz-sum code { background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+  padding: 1px 5px; font-size: 12px; }
+.wiz-run-row { display: flex; justify-content: space-between; gap: 10px;
+  padding: 6px 0; border-bottom: 1px solid var(--border); }
+.wiz-done-ok { font-size: 15px; margin: 6px 0; }
+.wiz-next { margin: 10px 0; line-height: 1.75; }

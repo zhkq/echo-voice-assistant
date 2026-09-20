@@ -23,6 +23,7 @@
     <button class="tab" data-view="boot">启动</button>
     <button class="tab" data-view="failover">模型路由</button>
     <button class="tab" data-view="capabilities">能力</button>
+    <button class="tab" data-view="wizard">向导</button>
   </nav>
 </header>
 
@@ -33,6 +34,10 @@
       <!-- 命令模块：控制 + 目标选择 + 近期历史 -->
       <div class="card span-2" id="cmdCard">
         <div class="card-title"><span class="ic sbadge" title="超级助理"><b>S</b></span>超级助理
+          <!-- 智能体自带 Web 界面时（目前是独立 DeepSeek Harness）在名字后给一个小图标；
+               点了由**服务端**打开浏览器 —— token 不下发到页面（见 api.py /harness/browser）。 -->
+          <button type="button" class="agent-web-open hidden" id="agentWebOpen"
+                  title="在浏览器里打开它的 Web 界面"><span>🌐</span></button>
           <div class="mic-level hidden" id="cmdLevel" title="语音命令收音电平"><i></i><i></i><i></i><i></i><i></i></div>
           <a class="more" id="gotoHistory" href="#">全部 ›</a>
         </div>
@@ -246,6 +251,13 @@
     <div class="muted model-foot">
       路径是代码约定，改了加载器就找不到模型，所以原样展示。「已选但未就绪」会标红并给「去下载」。
     </div>
+  </section>
+  <!-- ============ 首装向导（D23/D24；设计见 docs/向导-分步设计.md）============
+       读者假设是「没用过 ECHO、没有技术背景」的同事，所以文案一律说人话：
+       每步都是「这是干什么的 / 不装会怎样 / 你要决定什么」。
+       前 9 步只做选择（只读体检 + 写计划），点「开始准备」才真正下载。 -->
+  <section id="view-wizard" class="view hidden">
+    <div id="wizHost"></div>
   </section>
 </main>
 

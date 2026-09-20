@@ -32,6 +32,7 @@ from app.config import DEFAULTS, settings                         # noqa: E402
 
 TOKEN = "probe-token-1234"
 COOKIE_NAME = "dsh-auth-TESTSERVER"
+COOKIE_NAME_PREFIX = "dsh-auth-"
 COOKIE_VALUE = "v1.test.cookie"
 
 
@@ -141,6 +142,50 @@ class HarnessAuthTests(_Base):
         self.assertIsInstance(res, dict)
         self.assertEqual(_HarnessStub.state["rpc"], ["session/list"])
 
+    def test_no_token_falls_back_to_the_home_secret(self):
+        """没有 token 也能连：用 harness **自己家目录**里的 browser-session 密钥铸 Cookie。
+
+        2026-09-19 实测发现独立 harness 的 `.credentials.yaml` 与桌面版同构，
+        于是"用户自己起的实例 / token 轮换"这些情况都不再需要用户去拿 token。
+        """
+        import base64
+        import tempfile
+
+        home = tempfile.mkdtemp(prefix="echo-hn-secret-")
+        self.addCleanup(shutil.rmtree, home, ignore_errors=True)
+        secret = base64.urlsafe_b64encode(b"\x02" * 32).rstrip(b"=").decode()
+        with open(os.path.join(home, ".credentials.yaml"), "w", encoding="utf-8") as fh:
+            fh.write("version: 1\nrecords:\n  client-connection/browser-session:\n"
+                     "    kind: secret\n    payload:\n      version: 1\n"
+                     "      secret: %s\n" % secret)
+        with patch.object(harness_proc, "home", lambda: home), \
+                patch.object(harness_proc, "token", lambda: ""):
+            a = self._agent()
+            cookie = a._cookie_header()
+        self.assertTrue(cookie.startswith(COOKIE_NAME_PREFIX), cookie)
+        self.assertIn("=v1.", cookie)
+
+    def test_no_token_and_no_file_says_how_to_set_it(self):
+        """两条路都没有时，错误信息要指到面板上那一栏（而不是含糊的 401）。"""
+        import tempfile
+        home = tempfile.mkdtemp(prefix="echo-hn-empty-")
+        self.addCleanup(shutil.rmtree, home, ignore_errors=True)
+        with patch.object(harness_proc, "home", lambda: home), \
+                patch.object(harness_proc, "token", lambda: ""):
+            with self.assertRaises(Exception) as cm:
+                self._agent()._cookie_header()
+        msg = str(cm.exception)
+        self.assertIn("harness 访问 token", msg)
+        self.assertIn("选中本智能体", msg)
+
+    def test_token_wins_over_the_home_secret(self):
+        """有 token 就走 token（ECHO 自己拉起的实例，token 才是最新鲜的）。"""
+        called = {"secret": 0}
+        a = self._agent()
+        with patch.object(type(a), "_secret_cookie", lambda self: called.__setitem__("secret", 1) or "x=1"):
+            a._cookie_header()
+        self.assertEqual(called["secret"], 0, "有 token 时不该走密钥退路")
+
     def test_401_triggers_relogin_and_retry(self):
         """cookie 过期不该让一次命令白跑：401 → 重登一次 → 成功。"""
         a = self._agent()
@@ -152,19 +197,29 @@ class HarnessAuthTests(_Base):
         self.assertEqual(_HarnessStub.state["rpc"], ["session/create"])
 
     def test_bad_token_gives_a_human_reason(self):
-        with patch.object(harness_proc, "token", lambda: "wrong-token"):
+        """token 错了、家目录里也没有可用密钥时 → 给出人话（而不是裸 403）。"""
+        import tempfile
+        home = tempfile.mkdtemp(prefix="echo-hn-bad-")
+        self.addCleanup(shutil.rmtree, home, ignore_errors=True)
+        with patch.object(harness_proc, "home", lambda: home), \
+                patch.object(harness_proc, "token", lambda: "wrong-token"):
             a = self._agent()
             with self.assertRaises(Exception) as cm:
                 a._cookie_header()
         self.assertIn("token", str(cm.exception))
 
     def test_missing_token_tells_you_what_to_do(self):
-        with patch.object(harness_proc, "token", lambda: ""):
+        import tempfile
+        home = tempfile.mkdtemp(prefix="echo-hn-none-")
+        self.addCleanup(shutil.rmtree, home, ignore_errors=True)
+        with patch.object(harness_proc, "home", lambda: home), \
+                patch.object(harness_proc, "token", lambda: ""):
             a = self._agent()
             with self.assertRaises(Exception) as cm:
                 a._cookie_header()
         msg = str(cm.exception)
         self.assertIn("选中", msg, "要告诉用户怎么让它有 token")
+        self.assertIn("harness 访问 token", msg, "并指出面板上那一栏")
 
     def test_available_reports_live_service(self):
         a = self._agent()
@@ -229,7 +284,12 @@ class HarnessAgentRegistryTests(unittest.TestCase):
         keys = {s["key"] for s in h["settings"]}
         self.assertIn("harnessCommand", keys)
         self.assertIn("harnessPort", keys)
-        self.assertNotIn("harnessToken", keys, "密钥不该经接口下发")
+        # 密钥行要下发（面板得有那一栏让用户填），但只报"配没配"，值永不出接口
+        token_row = [s for s in h["settings"] if s["key"] == "harnessToken"]
+        self.assertEqual(len(token_row), 1, "token 行应在，供面板渲染密码框")
+        self.assertTrue(token_row[0].get("secret"))
+        self.assertEqual(token_row[0].get("value"), "")
+        self.assertIn("hasValue", token_row[0])
 
     def test_config_keys_are_agent_group_and_hidden(self):
         for key in ("agentHarnessEnabled", "harnessHome", "harnessPort",
@@ -521,6 +581,108 @@ class ClientFollowsSelectionTests(unittest.TestCase):
         body = resp.json()
         self.assertEqual(body["workspaces"], [])
         self.assertIn("token", body["note"])
+
+
+class HarnessBrowserOpenTests(unittest.TestCase):
+    """仪表盘那个"用浏览器打开它的 Web 端"的小图标（2026-09-19 用户要求）。
+
+    要点：URL 里的 token 是密钥 → **服务端拼好直接调系统浏览器**，响应里只回不含 token 的地址。
+    """
+
+    def setUp(self):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        from app.api import router
+        app = FastAPI()
+        app.include_router(router)
+        self.client = TestClient(app)
+
+    def test_opens_the_browser_with_the_token_url(self):
+        opened = []
+        with patch.object(harness_proc, "online", lambda timeout=1.0: True), \
+                patch.object(harness_proc, "base_url", lambda: "http://127.0.0.1:43199"), \
+                patch.object(harness_proc, "token", lambda: "tok-abc"), \
+                patch("app.platform.shell_open",
+                      lambda url, params="": opened.append(url) or True):
+            body = self.client.post("/api/harness/browser").json()
+        self.assertTrue(body["ok"], body)
+        self.assertEqual(opened, ["http://127.0.0.1:43199/?token=tok-abc"],
+                         "要用带 token 的 URL 打开（浏览器才能直接进界面）")
+        self.assertNotIn("tok-abc", str(body), "响应里不许回 token")
+
+    def test_online_without_token_still_opens(self):
+        """能拿到家目录密钥铸 Cookie 的场景：没有 token 时打开裸地址也够用。"""
+        opened = []
+        with patch.object(harness_proc, "online", lambda timeout=1.0: True), \
+                patch.object(harness_proc, "base_url", lambda: "http://127.0.0.1:43199"), \
+                patch.object(harness_proc, "token", lambda: ""), \
+                patch("app.platform.shell_open",
+                      lambda url, params="": opened.append(url) or True):
+            body = self.client.post("/api/harness/browser").json()
+        self.assertTrue(body["ok"], body)
+        self.assertEqual(opened, ["http://127.0.0.1:43199/"])
+
+    def test_offline_tells_you_what_to_do_without_opening(self):
+        opened = []
+        with patch.object(harness_proc, "online", lambda timeout=1.0: False), \
+                patch.object(harness_proc, "requested", lambda: False), \
+                patch("app.platform.shell_open", lambda url, params="": opened.append(url)):
+            body = self.client.post("/api/harness/browser").json()
+        self.assertFalse(body["ok"])
+        self.assertEqual(opened, [], "没在跑就不该弹浏览器")
+        self.assertIn("设置 → 智能体", body["message"])
+
+    def test_shell_failure_is_reported(self):
+        with patch.object(harness_proc, "online", lambda timeout=1.0: True), \
+                patch.object(harness_proc, "base_url", lambda: "http://127.0.0.1:43199"), \
+                patch.object(harness_proc, "token", lambda: "t"), \
+                patch("app.platform.shell_open", lambda url, params="": False):
+            body = self.client.post("/api/harness/browser").json()
+        self.assertFalse(body["ok"])
+        self.assertIn("打开浏览器失败", body["message"])
+
+    def test_missing_token_triggers_a_restart_to_get_one(self):
+        """手里没有 token 时（实例是上一轮 ECHO 拉起的）→ 重启一次换一枚新的，
+        因为**浏览器**必须带 token 才能真正进界面。"""
+        opened = []
+        with patch.object(harness_proc, "online", lambda timeout=1.0: True), \
+                patch.object(harness_proc, "base_url", lambda: "http://127.0.0.1:43199"), \
+                patch.object(harness_proc, "ensure_token",
+                             lambda timeout=45.0: ("fresh-token-0123456789", "已重新拉起并拿到新 token")), \
+                patch.object(harness_proc, "token", lambda: ""), \
+                patch("app.platform.shell_open",
+                      lambda url, params="": opened.append(url) or True):
+            body = self.client.post("/api/harness/browser").json()
+        self.assertTrue(body["ok"], body)
+        self.assertIn("token=fresh-token-0123456789", opened[0])
+
+    def test_ensure_token_keeps_an_existing_one(self):
+        with patch.object(harness_proc, "token", lambda: "already-here-0123456"):
+            tok, note = harness_proc.ensure_token()
+        self.assertEqual(tok, "already-here-0123456")
+        self.assertIn("已有", note)
+
+    def test_ensure_token_does_not_touch_foreign_instances(self):
+        """不是 ECHO 起的（没有 pid 记录）→ 不能为了拿 token 去重启别人的实例。"""
+        with patch.object(harness_proc, "token", lambda: ""), \
+                patch.object(harness_proc, "_load_pid", lambda: 0), \
+                patch.object(harness_proc, "started_by_echo", lambda: False), \
+                patch.object(harness_proc, "stop") as stop_mock, \
+                patch.object(harness_proc, "ensure_running") as run_mock:
+            tok, note = harness_proc.ensure_token()
+        self.assertEqual(tok, "")
+        stop_mock.assert_not_called()
+        run_mock.assert_not_called()
+        self.assertIn("不是 ECHO 起的", note)
+
+    def test_short_junk_token_is_ignored(self):
+        """设置里可能留着垃圾值（实测撞到过 `"echo"`）→ 当没填，别拿去登录或拼 URL。"""
+        with patch.object(harness_proc, "_token", ""), \
+                patch.object(harness_proc, "load_saved_token", lambda: ""), \
+                patch("app.config.settings.get", lambda k, d=None: "echo" if k == "harnessToken" else d):
+            self.assertEqual(harness_proc.token(), "")
+        self.assertTrue(harness_proc._looks_like_token("x" * harness_proc.MIN_TOKEN_LEN))
+        self.assertFalse(harness_proc._looks_like_token("echo"))
 
 
 if __name__ == "__main__":

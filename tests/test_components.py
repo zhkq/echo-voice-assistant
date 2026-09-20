@@ -160,6 +160,71 @@ class InstallCommandTests(unittest.TestCase):
             srv.shutdown()
 
 
+class StandaloneHarnessComponentTests(unittest.TestCase):
+    """运行环境里要有「独立 DeepSeek Harness（本机服务）」（2026-09-19 用户要求：
+
+    "运行环境哪里要增加独立 DSH"）。它与 DSH Desktop 那条的区别：不装桌面客户端也能用，
+    而且 ECHO 能把它作为子进程随自己拉起 → 清单里给它一条可复制的启动命令。
+    """
+
+    def setUp(self):
+        items = {i["id"]: i for i in components.load_manifests()}
+        self.item = items.get("agent-harness")
+        self.assertIsNotNone(self.item, "清单里缺少独立 harness 那条")
+
+    def test_manifest_shape(self):
+        it = self.item
+        self.assertEqual(it["kind"], "agent")
+        self.assertIn("独立", it["name"])
+        self.assertEqual(it["detect"], {"setting": "harnessPort"},
+                         "就绪判据取配置里的端口（与 ECHO 实际连的地址一致）")
+        self.assertIn("npx", it["command"])
+        self.assertIn("--port", it["command"])
+        self.assertEqual(it["command_label"], "复制启动命令")
+        self.assertTrue(it.get("service"),
+                        "它是本机服务（面板因此显示「未运行」而不是「未安装」）")
+        self.assertNotIn("pkg", it, "它不是 pip 包")
+        self.assertNotIn("requirements", it)
+
+    def test_dsh_desktop_row_is_also_a_service(self):
+        items = {i["id"]: i for i in components.load_manifests()}
+        self.assertTrue(items["agent-dsh"].get("service"))
+
+    def test_command_survives_catalog(self):
+        """catalog() 会用 pip 命令覆盖 command —— 没有 pkg 的组件不能因此被清空。"""
+        cat = {i["id"]: i for i in components.catalog(include_blocked=True)["items"]}
+        self.assertIn("npx", cat["agent-harness"]["command"])
+        self.assertEqual(cat["agent-harness"]["command_label"], "复制启动命令")
+        self.assertEqual(cat["runtime-core"]["command_label"], "下载命令",
+                         "pip 类组件的标签保持「下载命令」")
+
+    def test_detect_accepts_a_bare_port(self):
+        import http.server
+        import threading
+        from unittest.mock import patch
+
+        class _H(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):                       # noqa: N802
+                self.send_response(401)             # 任何响应都算"服务在跑"
+                self.end_headers()
+
+            def log_message(self, *a):
+                pass
+
+        srv = http.server.HTTPServer(("127.0.0.1", 0), _H)
+        port = srv.server_address[1]
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            with patch("app.config.settings.get",
+                       lambda k, d=None: str(port) if k == "harnessPort" else d):
+                self.assertIs(components._detect({"detect": {"setting": "harnessPort"}}), True)
+            with patch("app.config.settings.get",
+                       lambda k, d=None: "1" if k == "harnessPort" else d):
+                self.assertIs(components._detect({"detect": {"setting": "harnessPort"}}), False)
+        finally:
+            srv.shutdown()
+
+
 class PlatformFilterTests(unittest.TestCase):
     def test_accel_cuda_does_not_appear_on_macos(self):
         data = components.catalog(platform="macos")

@@ -453,7 +453,9 @@ async function renderSummary() {
     try {
       if (window.mermaid && pv.querySelector("pre.mermaid")) {
         mermaid.initialize({ startOnLoad: false, theme: "dark", securityLevel: "strict" });
-        await mermaid.run({ nodes: pv.querySelectorAll("pre.mermaid") });
+        // suppressErrors：某张图语法有问题时，只把那一张标成错误，不让它带崩后面几张。
+        // 2026-09-20 实测：一张 flowchart 的标签里嵌了半角引号 → 后面的 timeline/时序图也没渲染出来。
+        await mermaid.run({ nodes: pv.querySelectorAll("pre.mermaid"), suppressErrors: true });
         bindMermaidZoom(pv);
       }
     } catch (e) { /* 图表渲染失败不影响纪要文本 */ }

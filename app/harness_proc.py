@@ -99,6 +99,16 @@ def requested():
         return False
 
 
+#: 真实 token 是 43 字符的 base64url（实测）；短于这个长度的值一律当成"没填"。
+#  为什么要有这道闸：设置里可能留着垃圾值（我这次就撞上过 —— 值竟是 `"echo"`），
+#  拿它登录必然 401，还会把**浏览器打开**那个功能带沟里（URL 里拼个假 token）。
+MIN_TOKEN_LEN = 16
+
+
+def _looks_like_token(value) -> bool:
+    return len(str(value or "").strip()) >= MIN_TOKEN_LEN
+
+
 def token():
     """当前 token：进程内捕获的 > 上次落盘的（服务重启、实例还活着的情形）> 用户手填的。"""
     if _token:
@@ -107,9 +117,10 @@ def token():
     if saved:
         return saved
     try:
-        return str(settings.get("harnessToken", "") or "").strip()
+        manual = str(settings.get("harnessToken", "") or "").strip()
     except Exception:
         return ""
+    return manual if _looks_like_token(manual) else ""
 
 
 def set_token(value):
@@ -403,6 +414,35 @@ def stop():
                          "停止失败：%s 仍在监听（可能需要手动结束该进程）" % base_url())
 
 
+def ensure_token(timeout=45.0):
+    """确保手里有一枚 **可用的** token；没有就把 ECHO 自己起的实例重启一次重新抓。
+
+    为什么需要它：token 只在"ECHO 亲自 Popen 并读 stdout"那一刻能拿到。ECHO 重启后接手
+    旧实例时手里没有 token（进程不是我们起的、stdout 也不在我们手里）—— 而**用浏览器打开
+    它的 Web 界面**必须带 token（浏览器没法用我们那枚密钥 Cookie）。
+    所以此时把实例重启一次（**只动 ECHO 自己起的**，pid 文件为凭），换一枚新 token。
+
+    返回 ``(token, detail)``；`token` 为空表示拿不到（用户手工起的实例，我们不碰）。
+    """
+    tok = token()
+    if tok:
+        return tok, "已有 token"
+    if not (started_by_echo() or _load_pid()):
+        return "", ("这个 harness 不是 ECHO 起的（没有 pid 记录），拿不到登录 token —— "
+                    "把它停掉让 ECHO 重新拉起，或把启动时打印的 token 填到设置里")
+    stop()
+    ok, msg = ensure_running()
+    if not ok:
+        return "", msg
+    deadline = time.monotonic() + max(5.0, float(timeout))
+    while time.monotonic() < deadline:
+        tok = token()
+        if tok:
+            return tok, "已重新拉起并拿到新 token"
+        time.sleep(0.5)
+    return "", "重启后仍没抓到 token：看 data/logs/harness.log"
+
+
 def status_detail():
     """给面板/日志用的一句话状态。"""
     if online():
@@ -411,3 +451,17 @@ def status_detail():
     if requested():
         return "idle", "已配置为随 ECHO 启动，但当前没在监听 %s" % base_url()
     return "disabled", "未启用（选中「独立 harness」时才会启动）"
+
+
+def sync_status():
+    """把当前状态写进组件状态表（启动页/仪表盘读它）。
+
+    为什么要显式同步：进程可能是**上一次 ECHO 拉起的**（这次只是接手），那条路径不会走
+    `_read_output`（只在真正 Popen 时启动），状态行就会一直停在"启动中"。
+    """
+    try:
+        status, detail = status_detail()
+        services.report_harness(status, detail)
+        return status, detail
+    except Exception:
+        return "unknown", ""

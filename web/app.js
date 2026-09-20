@@ -79,6 +79,7 @@ function switchView(name) {
   if (name === "boot") { loadBoot(); loadBootLogs(); }
   if (name === "failover") loadRouter();
   if (name === "capabilities") loadCapabilities();
+  if (name === "wizard") loadWizard();
 }
 $$(".tab").forEach((t) => t.addEventListener("click", () => switchView(t.dataset.view)));
 
@@ -662,6 +663,8 @@ $$("[data-goto-link='failover']").forEach((a) =>
 
 async function refreshDashboard() {
   refreshFailoverCard();            // 模型路由小卡片（独立容错，不阻塞主刷新）
+  // 智能体 Web 界面小图标（独立 harness）：跟着仪表盘刷新一起更新，失败不阻塞
+  refreshAgentsForDashboard().catch(() => {});
   try {
     const st = await api("/api/status");
     document.body.classList.remove("echo-offline");   // 顶栏去掉常驻状态后，靠这个红标表示"连不上"
@@ -1105,7 +1108,13 @@ function agentDetailHtml() {
     const id = "agent-set-" + s.key;
     const cur_val = _agentDirty[s.key] !== undefined ? _agentDirty[s.key] : s.value;
     let ctl;
-    if (s.value_type === "bool") {
+    if (s.secret) {
+      // 密钥：只显示"配没配"，值永不下发（后端也不回显）→ 密码框 + 留空 = 不改
+      // （2026-09-19 用户实测问"我在哪里配置 key"：这类键原来被整条跳过，面板上没处填）
+      ctl = `<input type="password" class="ctl" id="${id}" data-agent-field="${esc(s.key)}"
+               data-secret="1" value="" autocomplete="new-password"
+               placeholder="${s.hasValue ? "已配置（留空 = 不改）" : "未配置"}">`;
+    } else if (s.value_type === "bool") {
       ctl = `<input type="checkbox" class="ctl" id="${id}" data-agent-field="${esc(s.key)}"
                ${cur_val ? "checked" : ""}>`;
     } else if (s.options && s.options.length) {
@@ -1141,9 +1150,44 @@ async function loadAgents(probe = false) {
   try {
     const r = await api("/api/agents" + (probe ? "?probe=1" : ""));
     _agentsCache = r.agents || [];
+    refreshAgentWebIcon();
     return r;
   } catch (e) { return null; }
 }
+
+/** 仪表盘「超级助理」名字后的小图标：当前智能体自带 Web 界面时才出现。
+ *
+ *  2026-09-19 用户要求："我选了独立 dsh 之后，在仪表盘超级助理名称后面增加一个小图标，
+ *  让我点了之后能打开浏览器展示独立 dsh 的 web 端"。
+ *  点击**不**在前端拼 URL —— harness 的 URL 里带 token（密钥），拼在前端等于把它写进
+ *  浏览器历史；改成让服务端拼好并直接调系统浏览器（POST /api/harness/browser）。 */
+function refreshAgentWebIcon() {
+  const btn = $("#agentWebOpen");
+  if (!btn) return;
+  const cur = (_agentsCache || []).find((a) => a.active);
+  const show = !!(cur && cur.webUi);
+  btn.classList.toggle("hidden", !show);
+  if (show) {
+    btn.title = `在浏览器里打开「${cur.displayName}」的 Web 界面`;
+  }
+}
+
+async function refreshAgentsForDashboard() {
+  await loadAgents(false);
+}
+
+$("#agentWebOpen")?.addEventListener("click", async (e) => {
+  const btn = e.currentTarget;
+  btn.disabled = true;
+  try {
+    const r = await api("/api/harness/browser", { method: "POST" });
+    toast(r.message || (r.ok ? "已在浏览器打开" : "打开失败"));
+  } catch (err) {
+    toast("打开失败：" + err.message);
+  } finally {
+    btn.disabled = false;
+  }
+});
 
 /* ---------------- 设置 → 智能体：开关即单选，切换立即保存 ---------------- */
 $("#settingsForm").addEventListener("change", async (e) => {
@@ -1242,6 +1286,8 @@ function capCompBadge(c) {
   const job = (m && _modelJobsCache[m.id]) || {};
   if (job.status === "running") return modelBadge(`下载中 ${Math.round(job.percent || 0)}%`, "warn");
   if (c.ready === true) return modelBadge("✅ 已就绪", "ok");
+  // 「本机服务」（DSH Desktop / 独立 harness）不是"没装"，是"没在跑" —— 措辞要准
+  if (c.service) return modelBadge(c.ready === false ? "⏹ 未运行" : "未知", "warn");
   if (c.ready === false) return modelBadge(c.model_id ? "⬇ 未安装" : "未安装", "warn");
   return modelBadge("未知", "idle");
 }
@@ -1264,9 +1310,11 @@ function capCompActions(c) {
   }
   const btns = [];
   if (c.command) {
+    // 标签由清单给：pip 类 = 「下载命令」；独立 harness = 「复制启动命令」
+    const label = c.command_label || "下载命令";
     btns.push(`<button type="button" class="btn mini" data-mcopy="${esc(c.command)}"
       title="复制后粘进终端执行（cmd 与 PowerShell 都行，在哪个目录执行都行）：&#10;${esc(c.command)}"
-      >下载命令</button>`);
+      >${esc(label)}</button>`);
   }
   if (c.ref) btns.push(`<span class="muted" style="font-size:12px">${esc(c.ref)}</span>`);
   return btns.join(" ");
@@ -1545,7 +1593,8 @@ function renderCapEnv() {
       ${capCompTable(comps, [])}
       <div class="muted" style="margin-top:6px;font-size:12px">
         这些是本机依赖与服务：pip 类的点「下载命令」复制到剪贴板后自己执行（命令里带的是本机解释器，
-        在哪个目录、用 cmd 还是 PowerShell 都行）；服务类（如 DSH Desktop）装客户端并保持运行即可。
+        在哪个目录、用 cmd 还是 PowerShell 都行）；服务类（DSH Desktop）装客户端并保持运行即可，
+        独立 harness 则可以由 ECHO 随自己拉起（设置 → 智能体）。
       </div>
       ${blockedHtml}
     </div>
@@ -2691,7 +2740,521 @@ if ("serviceWorker" in navigator) {
 initRouterUI();
 /* 折叠条（rail.html）点「模型」时经同源 localStorage 传来的落地页签意图；
    主面板展开会重新加载本页，所以在这里消费一次即清掉。 */
-const _VIEWS = ["dashboard", "settings", "history", "meetings", "boot", "failover", "capabilities"];
+/* ================= 首装向导（D23/D24；设计见 docs/向导-分步设计.md）=================
+   两条规矩（改这段代码前请先读设计文档 §0/§1）：
+
+   1. **两相分离**：前 9 步只做「选」——只读体检 + 写自己的计划文件（/api/wizard/plan）。
+      点「开始准备」才进执行相（/api/wizard/execute），之后只有进度、重试、跳过。
+   2. **读者是没用过 ECHO、没有技术背景的人**：每步都说清「这是干什么的 / 不装会怎样 /
+      你要决定什么」，技术词首次出现就地用一句白话解释（术语对照表见设计文档 §0.3）。
+      体积一律带人话换算；按钮主位永远是「按建议装上」。
+   默认值尽量替用户选好（设计 §0.4）：转写方式默认本机最轻那档；AI 服务**刻意没有默认**
+   （那是用户自备的，ECHO 不提供也不代管）。 */
+let _wizEnv = null, _wizComps = [], _wizBuilt = null, _wizStep = 0, _wizTimer = null;
+let _wizChoices = wizBlankChoices();
+
+function wizBlankChoices() {
+  return {
+    locations: { models: "", meetings: "", notes: "" },
+    engines: [], wake: false, diarize: false, accel: false,
+    asrOnline: false, llmReady: false, agent: "", fallback: [],
+  };
+}
+
+/* 体积的人话换算（设计 §3：精确数字降为次行小字）。1 首歌 ≈ 1 MB，与设计文档口径一致。 */
+function wizSize(mb) {
+  const n = Number(mb) || 0;
+  if (!n) return "很小，不占地方";
+  if (n >= 2000) return `约 ${(n / 1024).toFixed(1)} GB`;
+  if (n >= 100) return `约 ${n} MB（差不多 ${Math.round(n)} 首歌）`;
+  return `约 ${n} MB`;
+}
+
+/* 三处位置（设计 §2 的 S1）。文案里的"为什么"必须留着 —— 小白靠它理解自己在决定什么。 */
+const WIZ_LOCATIONS = [
+  { key: "models", label: "能力包",
+    hint: "转写方式、唤醒词这些要额外下载的东西放这里。它最占地方，建议放在空间多的盘。" },
+  { key: "meetings", label: "会议文件",
+    hint: "录音和文字稿。里面是原始录音，注意隐私；会随使用慢慢变大。" },
+  { key: "notes", label: "笔记库",
+    hint: "纪要归档到哪里 —— 通常是你已经在用的笔记库。不填也能用，只是纪要留在 ECHO 里。" },
+];
+
+const WIZ_STEPS = [
+  { id: "env", name: "检查你的电脑", render: wizRenderEnv },
+  { id: "where", name: "东西放在哪", render: wizRenderWhere },
+  { id: "stt", name: "把录音变成文字", render: wizRenderStt },
+  { id: "wake", name: "喊一声就开始", render: wizRenderWake },
+  { id: "diarize", name: "分清谁在说话", render: wizRenderDiarize },
+  { id: "accel", name: "用显卡加速", render: wizRenderAccel },
+  { id: "llm", name: "让 ECHO 会写纪要", render: wizRenderLlm },
+  { id: "agent", name: "让 ECHO 能动手", render: wizRenderAgent },
+  { id: "offline", name: "断网也能用", render: wizRenderOffline },
+  { id: "confirm", name: "确认一下", render: wizRenderConfirm },
+  { id: "run", name: "正在准备", render: wizRenderRun },
+  { id: "done", name: "你的 ECHO 现在能做什么", render: wizRenderDone },
+];
+
+function wizComp(id) { return _wizComps.find((c) => c.id === id) || null; }
+function wizByKind(kind) { return _wizComps.filter((c) => c.kind === kind); }
+
+async function loadWizard() {
+  const host = $("#wizHost");
+  if (!host) return;
+  host.innerHTML = `<div class="empty">正在检查这台电脑…</div>`;
+  try {
+    const [env, comps, plan] = await Promise.all([
+      api("/api/wizard/env"),
+      api("/api/components?includeBlocked=true"),
+      api("/api/wizard/plan"),
+    ]);
+    _wizEnv = env;
+    _wizComps = comps.items || [];
+    _wizChoices = wizBlankChoices();
+    const saved = (plan.plan && plan.plan.choices) || {};
+    Object.assign(_wizChoices, saved);
+    _wizChoices.locations = Object.assign({ models: "", meetings: "", notes: "" },
+                                           saved.locations || {});
+    if (!Array.isArray(_wizChoices.engines)) _wizChoices.engines = [];
+    if (!Array.isArray(_wizChoices.fallback)) _wizChoices.fallback = [];
+    if (plan.plan && plan.plan.state === "running") _wizStep = WIZ_STEPS.findIndex((s) => s.id === "run");
+    wizRender();
+  } catch (e) {
+    host.innerHTML = `<div class="empty">检查失败：${esc(e.message)}</div>`;
+  }
+}
+
+/* 计划条：随时看得见取舍的代价（设计 §3）。这是"逐步确认"能成立的前提。 */
+function wizTally() {
+  const c = _wizChoices;
+  const ids = [];
+  (c.engines || []).forEach((id) => ids.push(id));
+  if (c.wake) ids.push("wake-kws");
+  if (c.diarize) ids.push("diarize-pyannote");
+  if (c.accel) ids.push("accel-cuda");
+  (c.fallback || []).forEach((id) => ids.push(id));
+  let mb = 0;
+  ids.forEach((id) => { const it = wizComp(id); if (it) mb += Number(it.size_mb || 0); });
+  if (c.asrOnline) mb = Math.max(0, mb);          // 在线转写不占本机
+  const disk = (_wizEnv && _wizEnv.locations || []).find((l) => l.key === "models") || {};
+  const free = disk.freeGB == null ? "—" : `${disk.freeGB} GB`;
+  const parts = [`已选 ${ids.length} 项`, `合计 ${wizSize(mb)}`, `能力包盘剩余 ${free}`];
+  if (disk.freeGB != null && mb / 1024 > disk.freeGB) parts.push("⚠ 空间可能不够");
+  return parts.join(" · ");
+}
+
+function wizStepNav() {
+  return `<div class="wiz-nav">${WIZ_STEPS.map((s, i) => {
+    const cls = i === _wizStep ? "cur" : (i < _wizStep ? "done" : "");
+    return `<button class="wiz-dot ${cls}" data-wizgoto="${i}"
+              title="${esc(s.name)}"><span>${i + 1}</span>${esc(s.name)}</button>`;
+  }).join("")}</div>`;
+}
+
+function wizRender() {
+  const host = $("#wizHost");
+  if (!host) return;
+  const step = WIZ_STEPS[_wizStep] || WIZ_STEPS[0];
+  host.innerHTML = wizStepNav() + `<div class="wiz-body" id="wizBody"></div>` +
+    `<div class="wiz-foot"><span class="wiz-plan">${esc(wizTally())}</span>
+       <span class="spacer"></span>
+       <button class="btn" id="wizBack" ${_wizStep === 0 ? "disabled" : ""}>上一步</button>
+       <button class="btn" id="wizNext">下一步</button></div>`;
+  step.render($("#wizBody"));
+  $$("[data-wizgoto]", host).forEach((b) => b.addEventListener("click", () => {
+    _wizStep = Number(b.dataset.wizgoto);
+    wizRender();
+  }));
+  const back = $("#wizBack");
+  if (back) back.addEventListener("click", () => { _wizStep = Math.max(0, _wizStep - 1); wizRender(); });
+  const next = $("#wizNext");
+  if (next) next.addEventListener("click", () => { _wizStep = Math.min(WIZ_STEPS.length - 1, _wizStep + 1); wizRender(); });
+}
+
+/* 每一步的骨架（设计 §3 的三段式）：这是干什么的 / 不装会怎样 / 你要决定什么。 */
+function wizCard(title, what, lose, body) {
+  return `<div class="card wiz-card">
+    <div class="card-title">${esc(title)}
+      <span class="spacer"></span>
+      <button class="link wiz-why" data-wizwhy="1">这是什么？</button>
+    </div>
+    <div class="card-body">
+      <div class="wiz-what">${what}</div>
+      ${lose ? `<div class="wiz-lose">不装会怎样：${lose}</div>` : ""}
+      <div class="wiz-why-body hidden">${what}<div class="muted">${
+        "这一步只决定「要不要装」。真正开始下载在最后一步 —— 你可以随时返回改动，什么都不会提前落地。"}</div></div>
+      <div class="wiz-opts">${body}</div>
+    </div>
+  </div>`;
+}
+
+/* 一个选项行：勾选 + 人话体积 + 要求 + 不满足的原因（禁用而非隐藏，D24）。 */
+function wizOption(id, checked, opts) {
+  const o = opts || {};
+  const item = wizComp(id) || {};
+  const blocked = !!item.blockedReason;
+  const size = o.sizeMb != null ? o.sizeMb : item.size_mb;
+  return `<label class="wiz-opt ${checked ? "on" : ""} ${blocked ? "blocked" : ""}">
+    <input type="${o.multi ? "checkbox" : "radio"}" name="${esc(o.name || "wizpick")}"
+           value="${esc(id)}" ${checked ? "checked" : ""} ${blocked ? "disabled" : ""}
+           data-wizpick="${esc(id)}">
+    <span class="wiz-opt-body">
+      <span class="wiz-opt-name">${esc(o.label || item.name || id)}${o.recommend ? ' <span class="badge done">建议</span>' : ""}</span>
+      <span class="muted">${esc(wizSize(size))}${o.note ? " · " + esc(o.note) : ""}</span>
+      ${blocked ? `<span class="wiz-blocked">用不了：${esc(item.blockedReason)}</span>` : ""}
+    </span>
+  </label>`;
+}
+
+function wizBindPicks(host, onChange) {
+  $$("[data-wizpick]", host).forEach((el) => el.addEventListener("change", () => {
+    onChange(el);
+    wizSaveChoices();
+    const bar = $(".wiz-plan");
+    if (bar) bar.textContent = wizTally();
+    $$(".wiz-opt", host).forEach((row) => {
+      const inp = row.querySelector("input");
+      row.classList.toggle("on", !!(inp && inp.checked));
+    });
+  }));
+}
+
+async function wizSaveChoices(state) {
+  try {
+    await api("/api/wizard/plan", {
+      method: "PUT",
+      body: JSON.stringify({ plan: { state: state || "draft", choices: _wizChoices } }),
+    });
+  } catch (e) { /* 存不上不打断用户，最后一步会再存一次 */ }
+}
+
+/* ---------------- S0 检查你的电脑 ---------------- */
+function wizRenderEnv(host) {
+  const env = _wizEnv || {};
+  const gpu = env.gpu || {};
+  const rows = [];
+  rows.push(`<div class="wiz-env-row"><b>系统</b><span>${esc(env.platformName || env.platform || "—")} ${esc(env.osVersion || "")}</span></div>`);
+  rows.push(`<div class="wiz-env-row"><b>显卡</b><span>${
+    gpu.vramMb ? esc(`${gpu.name}（显卡内存约 ${(gpu.vramMb / 1024).toFixed(1)} GB）→ 可以让转写更快`)
+               : "没检测到独立显卡 —— 不影响使用，只是转写慢一些"}</span></div>`);
+  const net = env.network || {};
+  rows.push(`<div class="wiz-env-row"><b>网络</b><span>${esc(net.verdict || "—")}</span></div>`);
+  const audio = env.audio || {};
+  rows.push(`<div class="wiz-env-row"><b>麦克风</b><span>${
+    audio.inputs ? `检测到 ${audio.inputs} 个输入设备 ✓` : "没检测到麦克风 —— 录音功能会受影响"}</span></div>`);
+  const blocked = env.blocked || [];
+  const blockedHtml = blocked.length
+    ? `<div class="wiz-lose">先要解决：${blocked.map((b) => esc(`${b.label}（${b.note || "不可写"}）`)).join("、")}</div>`
+    : "";
+  host.innerHTML = wizCard("检查你的电脑",
+    "先看清这台电脑有什么、缺什么，后面每一步的建议都按它来。这一步不会下载任何东西。",
+    "", blockedHtml + `<div class="wiz-env">${rows.join("")}</div>
+      <div class="muted">这些结论只用来给建议，不会替你决定。</div>`);
+  wizWhy(host);
+}
+
+function wizWhy(host) {
+  $$("[data-wizwhy]", host).forEach((b) => b.addEventListener("click", () => {
+    const card = b.closest(".wiz-card");
+    const body = card && card.querySelector(".wiz-why-body");
+    const main = card && card.querySelector(".wiz-what");
+    if (body) body.classList.toggle("hidden");
+    if (main) main.classList.toggle("hidden");
+    b.textContent = body && body.classList.contains("hidden") ? "这是什么？" : "收起说明";
+  }));
+}
+
+/* ---------------- S1 东西放在哪 ---------------- */
+function wizRenderWhere(host) {
+  const disks = {};
+  (_wizEnv && _wizEnv.locations || []).forEach((l) => { disks[l.key] = l; });
+  const rows = WIZ_LOCATIONS.map((loc) => {
+    const d = disks[loc.key] || {};
+    const val = _wizChoices.locations[loc.key] || "";
+    const state = !val ? "还没设置"
+      : (d.writable ? `✓ 可以写 · 这个盘还剩 ${d.freeGB == null ? "—" : d.freeGB + " GB"}`
+                    : `✗ ${d.note || "不可写"}`);
+    return `<div class="wiz-loc">
+      <div class="wiz-opt-name">${esc(loc.label)}</div>
+      <div class="muted">${esc(loc.hint)}</div>
+      <input class="input wiz-loc-input" data-wizloc="${esc(loc.key)}"
+             placeholder="${esc(d.path || "（用默认位置）")}" value="${esc(val)}">
+      <div class="muted">${esc(state)}</div>
+    </div>`;
+  }).join("");
+  host.innerHTML = wizCard("东西放在哪",
+    "ECHO 会产生三类文件：<b>能力包</b>（要下载的东西）、<b>会议文件</b>（录音和文字稿）、<b>笔记库</b>（纪要归档的地方）。" +
+    "它们可以放在不同的盘 —— 留空就用默认位置。",
+    "能力包盘空间不够会在下载到一半时失败；不指笔记库，纪要就只能留在 ECHO 里。",
+    rows + `<div class="muted">路径里的中文字符有时会让转写引擎出问题，建议用纯英文目录。</div>`);
+  wizWhy(host);
+  $$("[data-wizloc]", host).forEach((inp) => inp.addEventListener("change", () => {
+    _wizChoices.locations[inp.dataset.wizloc] = inp.value.trim();
+    wizSaveChoices();
+  }));
+}
+
+/* ---------------- S2 把录音变成文字 ---------------- */
+function wizRenderStt(host) {
+  const rec = (_wizEnv && _wizEnv.recommend) || {};
+  const engine = rec.engine || "stt-sherpa";
+  const list = wizByKind("stt");
+  const body = list.map((c) => wizOption(c.id, (_wizChoices.engines || []).includes(c.id),
+    { multi: true, name: "wizstt", recommend: c.id === "stt-sherpa" || c.id === engine })).join("")
+    + wizOption("__online__", _wizChoices.asrOnline,
+        { label: "把录音发给在线服务转成文字（不占本机空间）", sizeMb: 0, name: "wizonline",
+          note: "需要联网，录音内容会发给那家服务" });
+  host.innerHTML = wizCard("把录音变成文字",
+    "开完会、说完话，把录音交给 ECHO，它自动变成带标点的文字稿。ECHO 的「会议纪要」和「语音指令」都建立在它之上。",
+    "录音不会变成文字 —— 会议纪要和「发指令」都用不了（其它功能不受影响）。",
+    body + `<div class="muted">可以多选：日常口述用快的，正式会议用准的。不确定就按建议，只装第一个。</div>`);
+  wizWhy(host);
+  wizBindPicks(host, (el) => {
+    const id = el.dataset.wizpick;
+    if (id === "__online__") {
+      _wizChoices.asrOnline = el.checked;
+      if (el.checked) { _wizChoices.engines = []; wizRender(); }
+      return;
+    }
+    const set = new Set(_wizChoices.engines || []);
+    if (el.checked) set.add(id); else set.delete(id);
+    _wizChoices.engines = [...set];
+    if (el.checked) _wizChoices.asrOnline = false;
+  });
+}
+
+/* ---------------- S3 唤醒词 ---------------- */
+function wizRenderWake(host) {
+  const c = wizComp("wake-kws") || {};
+  host.innerHTML = wizCard("喊一声就开始",
+    "装了它，你可以直接喊一句话开始录音，不用先按快捷键。",
+    "只能用快捷键或面板按钮开始录音（对很多人来说这没什么不方便）。",
+    wizOption("wake-kws", !!_wizChoices.wake, { label: "喊一声就开始", label2: "" }) +
+    `<div class="wiz-lose">要留意：它需要一直听着麦克风，有隐私成本 —— 所以默认不装。</div>`);
+  wizWhy(host);
+  wizBindPicks(host, (el) => { _wizChoices.wake = true; });
+  $$("[data-wizpick='wake-kws']", host).forEach((el) => el.addEventListener("change", () => {
+    _wizChoices.wake = el.checked;
+  }));
+}
+
+/* ---------------- S4 说话人分离 ---------------- */
+function wizRenderDiarize(host) {
+  host.innerHTML = wizCard("分清谁在说话",
+    "开会时自动区分每个人 —— 文字稿里会写成「张三：…」「李四：…」。",
+    "会议记录里分不出谁在说，只有一整段文字。",
+    wizOption("diarize-pyannote", !!_wizChoices.diarize, { label: "自动区分谁在说话" }) +
+    `<div class="wiz-lose">它需要你先在一个外部站点同意使用条款并拿一份授权，所以 ECHO 不能替你下载。</div>`);
+  wizWhy(host);
+  $$("[data-wizpick='diarize-pyannote']", host).forEach((el) => el.addEventListener("change", () => {
+    _wizChoices.diarize = el.checked; wizSaveChoices();
+  }));
+}
+
+/* ---------------- S5 显卡加速（条件步） ---------------- */
+function wizRenderAccel(host) {
+  const rec = (_wizEnv && _wizEnv.recommend) || {};
+  if (_wizChoices.asrOnline || !rec.showAccel) {
+    host.innerHTML = wizCard("用显卡加速", "这一步用不上。", "",
+      `<div class="muted">${esc(rec.accelReason || (_wizChoices.asrOnline
+        ? "你选了在线转写 —— 转写不在本机跑，不需要显卡加速"
+        : "没检测到独立显卡"))}。</div>`);
+    wizWhy(host);
+    return;
+  }
+  host.innerHTML = wizCard("用显卡加速",
+    "如果这台电脑有独立显卡，可以让转写快好几倍。",
+    "能用，只是慢一些（大约 5–10 倍）。",
+    wizOption("accel-cuda", !!_wizChoices.accel, { label: "让转写跑在显卡上" }) +
+    `<div class="muted">${esc(rec.accelReason || "")}。它要额外下载几个 GB，而且必须按显卡驱动版本装 —— 面板不代装，会给一条可粘贴的命令。</div>`);
+  wizWhy(host);
+  $$("[data-wizpick='accel-cuda']", host).forEach((el) => el.addEventListener("change", () => {
+    _wizChoices.accel = el.checked; wizSaveChoices();
+  }));
+}
+
+/* ---------------- S6 AI 服务（用户自备，刻意没有默认） ---------------- */
+function wizRenderLlm(host) {
+  host.innerHTML = wizCard("让 ECHO 会写纪要",
+    "把转写好的文字交给一个 AI 服务，让它整理成会议纪要。",
+    "不能自动生成会议纪要（转写、录音、会议列表都照常可用）。",
+    `<div class="wiz-lose">AI 服务要你自己准备：ECHO <b>不提供、也不代管</b> 它。
+       你手上有内网服务地址、或某个在线服务的密钥，就可以直接用。</div>
+     <label class="wiz-opt ${_wizChoices.llmReady ? "on" : ""}">
+       <input type="checkbox" data-wizllm="1" ${_wizChoices.llmReady ? "checked" : ""}>
+       <span class="wiz-opt-body"><span class="wiz-opt-name">我已经有可用的 AI 服务</span>
+       <span class="muted">地址与密钥在「模型路由」里填 —— 那里也是「配哪些上游、按什么顺序用」的地方</span></span>
+     </label>
+     <div><button class="btn" id="wizGoLlm">去填地址与密钥</button></div>`);
+  wizWhy(host);
+  const box = $("[data-wizllm='1']", host);
+  if (box) box.addEventListener("change", () => { _wizChoices.llmReady = box.checked; wizSaveChoices(); });
+  const go = $("#wizGoLlm", host);
+  if (go) go.addEventListener("click", () => switchView("failover"));
+}
+
+/* ---------------- S7 智能体后端（默认标准 DSH） ---------------- */
+function wizRenderAgent(host) {
+  const agents = (_wizEnv && _wizEnv.agents) || {};
+  const node = (_wizEnv && _wizEnv.node) || {};
+  const std = agents.harness || {}, desk = agents.dsh || {};
+  host.innerHTML = wizCard("让 ECHO 能动手",
+    "上面几步让 ECHO 能「听懂」和「写字」，这一步让它能<b>动手</b>：把纪要存进你的笔记库、按你的话去整理文件。",
+    "不能帮你操作电脑、整理笔记 —— 转写和纪要不受影响。",
+    wizOption("__std__", _wizChoices.agent === "agent-harness",
+        { label: "DSH 标准版（推荐）", sizeMb: 0, name: "wizagent",
+          note: node.ok ? "点一下我来准备，需要联网，大约几分钟；以后归我管"
+                        : "需要先装 Node.js（我会给你入口）" })
+    + wizOption("dsh", _wizChoices.agent === "dsh",
+        { label: "我已经装了 DSH 桌面客户端", sizeMb: 0, name: "wizagent",
+          note: desk.online ? "检测到它正在运行 ✓" : "我会自动找到它并检查" })
+    + wizOption("__none__", !_wizChoices.agent,
+        { label: "先不用", sizeMb: 0, name: "wizagent", note: "以后想加：面板 → 能力 → 随时补" })
+    + (std.online ? `<div class="muted">标准版已经在运行 ✓</div>` : "")
+    + (desk.detail ? `<div class="muted">桌面客户端：${esc(desk.detail)}</div>` : "")
+    + `<div><button class="btn" id="wizProbeAgents">检测一下</button></div>`);
+  wizWhy(host);
+  wizBindPicks(host, (el) => {
+    const v = el.dataset.wizpick;
+    _wizChoices.agent = v === "__none__" ? "" : (v === "__std__" ? "agent-harness" : v);
+  });
+  const probe = $("#wizProbeAgents", host);
+  if (probe) probe.addEventListener("click", async () => {
+    probe.disabled = true;
+    try { await api("/api/agents?probe=1"); await loadWizard(); }
+    catch (e) { toast("检测失败：" + e.message); }
+    finally { probe.disabled = false; }
+  });
+}
+
+/* ---------------- S8 断网也能用 ---------------- */
+function wizRenderOffline(host) {
+  const tiny = wizComp("stt-whisper-tiny");
+  host.innerHTML = wizCard("断网也能用",
+    "放一个很小的转写包在本机：网断了、或者在线服务连不上时，它还能把录音变成文字。",
+    "断网时没有本地转写（如果你选了在线转写，这一条尤其值得装）。",
+    (tiny ? wizOption("stt-whisper-tiny", (_wizChoices.fallback || []).includes("stt-whisper-tiny"),
+        { label: tiny.name, multi: true, name: "wizfallback" })
+          : `<div class="muted">清单里没有这个能力包。</div>`));
+  wizWhy(host);
+  wizBindPicks(host, (el) => {
+    const set = new Set(_wizChoices.fallback || []);
+    if (el.checked) set.add(el.dataset.wizpick); else set.delete(el.dataset.wizpick);
+    _wizChoices.fallback = [...set];
+  });
+}
+
+/* ---------------- S9 确认一下（唯一闸门） ---------------- */
+async function wizRenderConfirm(host) {
+  host.innerHTML = `<div class="card"><div class="card-body">正在算一下要装什么…</div></div>`;
+  try {
+    const r = await api("/api/wizard/preview", {
+      method: "POST", body: JSON.stringify({ choices: _wizChoices }),
+    });
+    _wizBuilt = r.plan || {};
+  } catch (e) {
+    host.innerHTML = `<div class="card"><div class="card-body">算不出来：${esc(e.message)}</div></div>`;
+    return;
+  }
+  const b = _wizBuilt;
+  const dls = (b.downloads || []).map((d) => `<li>${esc(d.label || d.component)} —— ${esc(wizSize(d.approxMb))}${
+    d.ready === true ? "（已经装好，会跳过）" : ""}</li>`).join("");
+  const man = (b.manual || []).map((m) => `<li>${esc(m.label || m.component)} —— ${esc(m.reason || "")}</li>`).join("");
+  const cfg = (b.config || []).map((c) => `<li>${esc(c.key)} → ${esc(String(c.value))}</li>`).join("");
+  const eg = (b.providers || []).filter((p) => p.egress)
+    .map((p) => `<li>${esc(p.name)}：${esc(p.egressNote || "")}</li>`).join("");
+  host.innerHTML = wizCard("确认一下",
+    "下面是这次要准备的东西。<b>点「开始准备」之前，什么都不会下载</b>；想改就返回上一步。",
+    "",
+    `<div class="wiz-sum">
+       <div><b>${esc((b.summary || {}).downloads || "")}</b></div>
+       ${dls ? `<ul>${dls}</ul>` : `<div class="muted">没有要下载的东西</div>`}
+       ${man ? `<div class="wiz-lose">这几项要你自己准备（面板不代装）：</div><ul>${man}</ul>` : ""}
+       ${cfg ? `<div>将写入这些设置：</div><ul>${cfg}</ul>` : ""}
+       ${eg ? `<div class="wiz-lose">会把数据发到外部服务：</div><ul>${eg}</ul>` : ""}
+       <div class="muted">开始之后你可以关掉这个页面 —— 下载在 ECHO 里继续，回来还能看进度。</div>
+     </div>
+     <div><button class="btn" id="wizStart">开始准备</button></div>`);
+  wizWhy(host);
+  const start = $("#wizStart", host);
+  if (start) start.addEventListener("click", async () => {
+    start.disabled = true;
+    try {
+      await api("/api/wizard/execute", { method: "POST", body: JSON.stringify({ choices: _wizChoices }) });
+      _wizStep = WIZ_STEPS.findIndex((s) => s.id === "run");
+      wizRender();
+    } catch (e) { toast("没能开始：" + e.message); start.disabled = false; }
+  });
+}
+
+/* ---------------- S10 正在准备 ---------------- */
+async function wizRenderRun(host) {
+  const draw = (st) => {
+    const rows = (st.items || []).map((it) => `<div class="wiz-run-row">
+      <span>${esc(it.label || it.component)}</span>
+      <span class="muted">${esc(it.text || "")}${it.percent != null && it.state === "downloading"
+        ? ` ${it.percent}%` : ""}</span></div>`).join("");
+    const failed = (st.failed || []).map((f) => `<li>${esc(f.component || "")}：${esc(f.error || f.message || "")}</li>`).join("");
+    host.innerHTML = `<div class="card"><div class="card-title">正在准备
+        <span class="spacer"></span><span class="muted">${esc(st.summary || "")}</span></div>
+      <div class="card-body">
+        ${rows || `<div class="muted">没有要下载的东西</div>`}
+        ${failed ? `<div class="wiz-lose">这几项没成（可以重试，或先跳过）：</div><ul>${failed}</ul>` : ""}
+        <div class="muted">可以关掉这个页面：下载在 ECHO 里继续跑，回来还能看进度。</div>
+        <div><button class="btn" id="wizFinish">看看现在能做什么</button></div>
+      </div></div>`;
+    const fin = $("#wizFinish", host);
+    if (fin) fin.addEventListener("click", () => {
+      if (_wizTimer) { clearInterval(_wizTimer); _wizTimer = null; }
+      _wizStep = WIZ_STEPS.findIndex((s) => s.id === "done");
+      wizRender();
+    });
+  };
+  const tick = async () => {
+    try { draw(await api("/api/wizard/state")); }
+    catch (e) { host.innerHTML = `<div class="card"><div class="card-body">读进度失败：${esc(e.message)}</div></div>`; }
+  };
+  await tick();
+  if (_wizTimer) clearInterval(_wizTimer);
+  _wizTimer = setInterval(tick, 2000);
+}
+
+/* ---------------- S11 你的 ECHO 现在能做什么 ---------------- */
+async function wizRenderDone(host) {
+  let st = {};
+  try { st = await api("/api/wizard/state"); } catch (e) { /* 取不到就只列"怎么开始用" */ }
+  const ok = (st.items || []).filter((i) => i.state === "done" || i.state === "skipped");
+  const manual = st.manual || [];
+  const missing = st.missing || [];
+  const cant = (st.failed || []).length + manual.length;
+  host.innerHTML = `<div class="card"><div class="card-title">你的 ECHO 现在能做什么</div>
+    <div class="card-body">
+      <div class="wiz-done-ok">✓ 录音 → 自动变成文字（${ok.length ? "已就绪 " + ok.length + " 项" : "按你选的配置"}）</div>
+      ${missing.length ? `<div class="wiz-lose">还不能做什么（以后随时能补）：</div>
+        <ul>${missing.map((m) => `<li>${esc(m.feature)} —— ${esc(m.reason || "")}
+          ${m.fix ? `<span class="muted">（${esc(m.fix)}）</span>` : ""}</li>`).join("")}</ul>` : ""}
+      ${manual.length ? `<div class="wiz-lose">这些还要你自己准备一下：</div>
+        <ul>${manual.map((m) => `<li>${esc(m.label || m.component)} —— ${esc(m.reason || "")}
+          ${m.command ? `<code>${esc(m.command)}</code>` : ""}</li>`).join("")}</ul>` : ""}
+      ${cant ? "" : `<div class="muted">没有失败项。</div>`}
+      <div class="wiz-next">
+        <div><b>怎么开始用</b></div>
+        <div>1. 按 Ctrl + Shift + E 呼出面板</div>
+        <div>2. 对着麦克风说一句，或点面板上的录音按钮</div>
+        <div>3. 开完会在「会议」里看文字稿和纪要</div>
+      </div>
+      <div class="muted">以后想加能力：面板 → 能力 → 随时补（不用重装 ECHO）。</div>
+      <div><button class="btn" id="wizRestart">回到第一步重新看</button></div>
+    </div></div>`;
+  const again = $("#wizRestart", host);
+  if (again) again.addEventListener("click", () => { _wizStep = 0; wizRender(); });
+}
+
+
+/* 页签清单：新加页签要同时在 index.html 里加 <button class="tab" data-view="…">
+   和 <section id="view-…">，否则 switchView 会找不到容器。 */
+const _VIEWS = ["dashboard", "settings", "history", "meetings", "boot", "failover",
+                "capabilities", "wizard"];
 let _bootView = "dashboard";
 try {
   const q = new URLSearchParams(location.search).get("view");

@@ -604,8 +604,8 @@ class OptionAndPanelWiringTests(unittest.TestCase):
         """pip 类组件的动作叫「下载命令」，复制的是后端拼好的整条命令（用户 2026-09-19 指定）。"""
         js = _read(os.path.join("web", "app.js"))
         block = js.split("function capCompActions")[1].split("\n}")[0]
-        self.assertIn(">下载命令</button>", block)
-        self.assertNotIn(">复制说明</button>", block, "标签已改名为「下载命令」")
+        self.assertIn('c.command_label || "下载命令"', block, "标签默认就是「下载命令」")
+        self.assertNotIn(">复制说明</button>", block, "标签已改名")
         self.assertIn('data-mcopy="${esc(c.command)}"', block,
                       "复制的是后端给的 command（带解释器路径），不是 how 说明")
         self.assertIn("cmd 与 PowerShell 都行，在哪个目录执行都行", block,
@@ -619,6 +619,47 @@ class OptionAndPanelWiringTests(unittest.TestCase):
         m = re.search(r"\.cap-engine-row label\s*\{([^}]*)\}", css)
         self.assertIsNotNone(m)
         self.assertIn("white-space: nowrap", m.group(1))
+
+    def test_dashboard_agent_web_icon(self):
+        """仪表盘「超级助理」名字后的小图标：只在当前智能体自带 Web 界面时出现；
+
+        点击由**服务端**打开浏览器（token 不下发到页面）。
+        2026-09-19 用户要求："我选了独立 dsh 之后…增加一个小图标让我点了之后能打开浏览器"。
+        """
+        html = _read(os.path.join("web", "index.html"))
+        m = re.search(r'<button[^>]*id="agentWebOpen"[^>]*>', html, re.S)
+        self.assertIsNotNone(m, "仪表盘标题里要有这个按钮")
+        self.assertIn("hidden", m.group(0), "默认隐藏，靠 JS 按当前智能体显示")
+        self.assertLess(html.index('id="agentWebOpen"'), html.index('id="cmdLevel"'),
+                        "它要挨着「超级助理」标题，不是塞在别处")
+        js = _read(os.path.join("web", "app.js"))
+        self.assertIn("function refreshAgentWebIcon", js)
+        self.assertIn("cur.webUi", js, "按后端给的 webUi 标记显示")
+        self.assertIn('"/api/harness/browser", { method: "POST" }', js,
+                      "点击走服务端打开（前端不拼带 token 的 URL）")
+        self.assertNotIn("?token=", js, "前端不许出现带 token 的 URL 拼接")
+        css = _read(os.path.join("web", "app.css"))
+        self.assertIn(".agent-web-open", css)
+
+    def test_command_button_label_comes_from_the_manifest(self):
+        """「下载命令 / 复制启动命令」的标签由清单给（独立 harness 那条是"启动命令"）。"""
+        js = _read(os.path.join("web", "app.js"))
+        block = js.split("function capCompActions")[1].split("\n}")[0]
+        self.assertIn("c.command_label", block)
+        self.assertIn('c.command_label || "下载命令"', block, "缺省仍是「下载命令」")
+
+    def test_secret_agent_key_gets_a_password_field(self):
+        """智能体展开区里的密钥（harness 访问 token）要能填 —— 密码框 + 留空 = 不改。
+
+        2026-09-19 用户实测问"我在哪里配置 key"：提示语让人填 token，面板上却没那一栏。
+        """
+        js = _read(os.path.join("web", "app.js"))
+        block = js.split("function agentDetailHtml")[1].split("\nfunction ")[0]
+        self.assertIn("if (s.secret)", block, "密钥行要有单独分支")
+        self.assertIn('type="password"', block)
+        self.assertIn('data-secret="1"', block)
+        self.assertIn("已配置（留空 = 不改）", block, "占位符要说清留空不改")
+        self.assertIn("未配置", block)
 
     def test_agent_switch_also_enables_the_product(self):
         """智能体开关即单选：选中时要把该产品的启用开关一起打开，避免自相矛盾。"""

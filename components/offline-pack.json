@@ -1,0 +1,69 @@
+[
+  {
+    "id": "runtime-core",
+    "pack": {
+      "kind": "runtime",
+      "dest": "runtime-core",
+      "base": "uv-standalone-cpython-3.11",
+      "requirements": "requirements-core.txt",
+      "approx_mb": 155,
+      "how": "取 uv 管理的 standalone CPython（可重定位，不依赖目标机 Python），复制成 runtime-core，删掉 uv 的 Lib\\EXTERNALLY-MANAGED 标记，再按 requirements-core.txt 装基础依赖"
+    }
+  },
+  {
+    "id": "stt-sherpa",
+    "pack": {
+      "kind": "files",
+      "items": [{ "from": "models/sherpa-onnx-streaming", "to": "models/sherpa-onnx-streaming" }],
+      "approx_mb": 189
+    }
+  },
+  {
+    "id": "stt-whisper-base",
+    "pack": {
+      "kind": "files",
+      "items": [{ "from": "models/faster-whisper/base", "to": "models/faster-whisper/base" }],
+      "approx_mb": 141
+    }
+  },
+  {
+    "id": "stt-whisper-small",
+    "pack": {
+      "kind": "files",
+      "items": [{ "from": "models/faster-whisper/small", "to": "models/faster-whisper/small" }],
+      "approx_mb": 464
+    }
+  },
+  {
+    "id": "stt-whisper-medium",
+    "pack": {
+      "kind": "files",
+      "items": [{ "from": "models/faster-whisper/medium", "to": "models/faster-whisper/medium" }],
+      "approx_mb": 1460
+    }
+  },
+  {
+    "id": "stt-whisper-large-v3",
+    "pack": {
+      "kind": "files",
+      "items": [{ "from": "models/faster-whisper/large-v3", "to": "models/faster-whisper/large-v3" }],
+      "approx_mb": 2948
+    }
+  },
+  {
+    "id": "stt-sensevoice",
+    "pack": {
+      "kind": "files",
+      "items": [{ "from": "models/sensevoice", "to": "models/sensevoice" }],
+      "approx_mb": 896
+    }
+  },
+  {
+    "id": "wake-kws",
+    "pack": {
+      "kind": "files",
+      "items": [{ "from": "models/wakeword", "to": "models/wakeword" }],
+      "approx_mb": 40
+    }
+  }
+]
