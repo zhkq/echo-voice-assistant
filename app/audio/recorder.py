@@ -63,6 +63,10 @@ def _open_input(device_id=-1, blocksize=0):
     try:
         return _try_open(first)
     except Exception as exc:
+        # 首选（显式指定或系统默认）失败是最关键的一条诊断，必须记录：下面的兜底
+        # 遍历会因为 seen={first} 跳过它、不再为它写日志。
+        _log_record(first if first is not None else -1, 0, False,
+                    f"首选设备打开失败: {str(exc)[:60]}")
         if echo_platform.isolates_audio_capture():
             raise RuntimeError("无法打开所选麦克风，请在系统设置中检查输入设备和权限；"
                                "未自动尝试其他设备：" + str(exc)) from exc
@@ -276,8 +280,11 @@ class MeetingRecorder:
                         writer.setsampwidth(2)
                         writer.setframerate(SAMPLE_RATE)
                         samples = 0
-                    # Each block updates the WAV header, avoiding a whole segment
-                    # held only in memory. Finalize before closing the device.
+                    # 每个采样块都写盘并 flush：避免"整个分段只留在内存里"——设备断开时
+                    # 已写入的部分仍在磁盘上。注意 WAV 头里的长度字段由 wave 模块在
+                    # close() 时才回填，所以这里是"数据已落盘、头还没定稿"；正常路径由
+                    # finally 的 close_segment() 收尾（硬杀进程会留下占位长度的头，
+                    # 属已知限制，见 PR #5 的说明）。
                     writer.writeframes(np.ascontiguousarray(data).tobytes())
                     audio_file.flush()
                     if name not in self.segments:

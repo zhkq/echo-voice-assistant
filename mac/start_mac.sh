@@ -43,9 +43,16 @@ if ! kill -0 "$NEW_PID" 2>/dev/null; then
 fi
 # 实际端口以 echo-port.txt 为准（首选端口被占/落在保留段时 ECHO 会让位）。
 # 它由 run_mac.py 在 uvicorn 启动前写出，所以这里短暂轮询一下。
+# 关键：端口文件在**实际数据根**下，不一定是仓库的 data/ —— 全新安装（仓库里没有
+# data/echo.db、ECHO_DATA 未导出）时数据根是平台默认（mac 上
+# ~/Library/Application Support/ECHO），写死 data/echo-port.txt 会读到空文件、
+# 于是打印出首选端口而不是真实端口。这里问应用自己的路径层要数据根
+# （与 mac_runtime.py 传给浮动框的 --data 同源）。
+DATA_DIR="$(./venv/bin/python -c "from app import paths; print(paths.data_root())" 2>/dev/null || true)"
+[ -n "$DATA_DIR" ] || DATA_DIR="$DIR/data"
 PORT=""
 for _ in 1 2 3 4 5 6; do
-  if [ -s data/echo-port.txt ]; then PORT="$(cat data/echo-port.txt 2>/dev/null || true)"; break; fi
+  if [ -s "$DATA_DIR/echo-port.txt" ]; then PORT="$(cat "$DATA_DIR/echo-port.txt" 2>/dev/null || true)"; break; fi
   sleep 0.5
 done
 if [ -z "$PORT" ]; then

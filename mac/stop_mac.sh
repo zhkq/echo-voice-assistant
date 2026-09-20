@@ -9,7 +9,11 @@ fi
 
 PID_FILE="data/echo-mac.pid"
 # 端口优先取 echo-port.txt（ECHO 让位后的实际端口）；读不到才回退配置的首选端口。
-PORT="$(cat data/echo-port.txt 2>/dev/null || true)"
+# 数据根问应用的路径层要：全新安装时它是平台默认目录，不是仓库的 data/。
+# 否则兜底清理会去清一个没人监听的端口，真残留反而留在那里。
+DATA_DIR="$(./venv/bin/python -c "from app import paths; print(paths.data_root())" 2>/dev/null || true)"
+[ -n "$DATA_DIR" ] || DATA_DIR="$DIR/data"
+PORT="$(cat "$DATA_DIR/echo-port.txt" 2>/dev/null || true)"
 if [ -z "$PORT" ]; then
   PORT="$(./venv/bin/python -c "from app.config import settings; print(int(settings.get('serverPort', 8970)))" 2>/dev/null || echo 8970)"
 fi
