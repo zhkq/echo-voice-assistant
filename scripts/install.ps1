@@ -174,11 +174,17 @@ function Step01-Environment {
 function Step02-Source {
     Step 2 '确定 ECHO 来源'
     # 场景 B：脚本位于 ECHO\scripts\ 且已有 venv → 已存在目录
+    # 但**显式给了 -Zip 时以交付包为准**：否则"把 install.bat + zip 放进已有 ECHO
+    # 目录再双击"会被静默当成"重装已有目录"，你给的包根本没被解压（2026-09-20 实测）。
     $parentOfScripts = Split-Path $PSScriptRoot -Parent
-    if (Test-Path (Join-Path $parentOfScripts 'venv\Scripts\python.exe')) {
+    $hasVenv = Test-Path (Join-Path $parentOfScripts 'venv\Scripts\python.exe')
+    if ($hasVenv -and -not $Zip) {
         $script:ExistingDir = $parentOfScripts
         Ok ("检测到已有 ECHO 目录: {0}" -f $script:ExistingDir)
         return
+    }
+    if ($hasVenv) {
+        Info ("同目录已有 ECHO（{0}），但显式指定了 -Zip：按交付包安装" -f $parentOfScripts)
     }
     # 场景 A：定位交付 zip
     if ($Zip) {
@@ -197,14 +203,32 @@ function Step02-Source {
     }
     $sizeGb = [math]::Round((Get-Item $script:ZipPath).Length / 1GB, 2)
     Ok ("交付包: {0}  ({1} GB)" -f $script:ZipPath, $sizeGb)
-    # 探测 zip 顶层目录
-    $r = Invoke-Native 'tar' @('-tf', $script:ZipPath)
-    $firstLine = ($r.out -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -First 1)
-    if ($firstLine) {
-        $top = ($firstLine -split '[\\/]')[0]
-        if ($top) { $script:ZipTop = $top }
+    # 探测 zip 顶层目录。
+    # 不要用 `tar -tf` 的输出：Invoke-Native 会把多行压成一行（($keep -join ' ')），
+    # 于是"取第一行 → 取第一个路径段"必然拿到排序最靠前的那一项；本包内 `.dsh/...`
+    # 恰好排在最前，实测把默认安装目录算成了 D:\.dsh（2026-09-20）。
+    # 改成读 zip 中央目录：快，且不依赖外部命令。
+    $topDirs = @()
+    $z = $null
+    try {
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        $z = [System.IO.Compression.ZipFile]::OpenRead($script:ZipPath)
+        $topDirs = @($z.Entries |
+            ForEach-Object { ($_.FullName -replace '\\', '/').Split('/')[0] } |
+            Where-Object { $_ } |
+            Sort-Object -Unique)
+    } catch {
+        Warn ("读取交付包目录失败: {0}" -f $_.Exception.Message)
+    } finally { if ($z) { $z.Dispose() } }
+    if ($topDirs -contains 'ECHO') {
+        $script:ZipTop = 'ECHO'
+        Info ("zip 顶层目录: ECHO（与它同级的还有 {0} 项）" -f ($topDirs.Count - 1))
+    } elseif ($topDirs.Count -eq 1) {
+        $script:ZipTop = $topDirs[0]
+        Info ("zip 顶层目录: {0}" -f $script:ZipTop)
+    } else {
+        Info ("zip 顶层目录不唯一: {0}（按 ECHO 处理）" -f ($topDirs -join ', '))
     }
-    Info ("zip 顶层目录: {0}（期望 ECHO）" -f $script:ZipTop)
 }
 
 function Step03-Dest {
@@ -261,7 +285,7 @@ function Step04-Extract {
         New-Item -ItemType Directory -Path $script:TargetDir -Force | Out-Null
     }
     if ($script:DryRun) {
-        Info "(模拟) tar -xf {0} 到 {1}" -f $script:ZipPath, $script:TargetDir
+        Info ("(模拟) tar -xf {0} 到 {1}" -f $script:ZipPath, $script:TargetDir)
         $script:ExistingDir = $script:TargetDir
         return
     }
@@ -276,21 +300,32 @@ function Step04-Extract {
             Err ("解压失败: {0}" -f $r.out)
             exit 1
         }
-        $topDir = Get-ChildItem $tmp -Directory | Select-Object -First 1
-        if (-not $topDir) {
-            Err 'zip 内未发现顶层目录（交付包结构异常）。'
-            exit 1
-        }
-        # 顶层目录放入目标：
-        #   目标不存在 / 为空 → 整体改名移动（同盘 rename，瞬间完成）
-        #   目标非空（用户已确认）→ 顶层内容逐项移入
+        # 判断包结构：**唯一**顶层目录 = 包装型包（build-package -Profile internal
+        # 现在会裹一层 ECHO\）；否则是平铺包（public 档是平铺的）。
+        # 旧代码无条件只搬"第一个目录"：平铺包会因此只搬走 .dsh 或 app 一个目录，
+        # 剩下的被下面的 Remove-Item $tmp 直接删掉（2026-09-20 发现）。
+        $rootDirs  = @(Get-ChildItem $tmp -Directory -Force -ErrorAction SilentlyContinue)
+        $rootFiles = @(Get-ChildItem $tmp -File -Force -ErrorAction SilentlyContinue)
+        $wrapped = ($rootDirs.Count -eq 1 -and $rootFiles.Count -eq 0)
         $tItems = @(Get-ChildItem $script:TargetDir -Force -ErrorAction SilentlyContinue)
-        if ($tItems.Count -eq 0) {
-            Remove-Item $script:TargetDir -Force -ErrorAction SilentlyContinue
-            Move-Item $topDir.FullName $script:TargetDir -Force
+        if ($wrapped) {
+            # 顶层目录放入目标：
+            #   目标不存在 / 为空 → 整体改名移动（同盘 rename，瞬间完成）
+            #   目标非空（用户已确认）→ 顶层内容逐项移入
+            $topDir = $rootDirs[0]
+            if ($tItems.Count -eq 0) {
+                Remove-Item $script:TargetDir -Force -ErrorAction SilentlyContinue
+                Move-Item $topDir.FullName $script:TargetDir -Force
+            } else {
+                Get-ChildItem $topDir.FullName -Force | Move-Item -Destination $script:TargetDir -Force
+                Remove-Item $topDir.FullName -Force -Recurse -ErrorAction SilentlyContinue
+            }
         } else {
-            Get-ChildItem $topDir.FullName -Force | Move-Item -Destination $script:TargetDir -Force
-            Remove-Item $topDir.FullName -Force -Recurse -ErrorAction SilentlyContinue
+            Info ("平铺包：把 {0} 个顶层项逐一移入目标目录" -f ($rootDirs.Count + $rootFiles.Count))
+            if (-not (Test-Path $script:TargetDir)) {
+                New-Item -ItemType Directory -Path $script:TargetDir -Force | Out-Null
+            }
+            Get-ChildItem $tmp -Force | Move-Item -Destination $script:TargetDir -Force
         }
         Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
     } catch {
@@ -307,15 +342,17 @@ function Step04-Extract {
 
 function Step05-Init {
     Step 5 'venv 初始化与建库（new-machine-setup.ps1）'
+    # 先看跳过标志，再查脚本：否则 -SkipSetup 遇到"包里没有 new-machine-setup.ps1"
+    # 仍然会 exit 1，与它声明的用途（已初始化过的包，跳过）自相矛盾（2026-09-20 实测）。
+    if ($SkipSetup) {
+        Warn '已跳过初始化（-SkipSetup）'
+        return
+    }
     $setup = Join-Path $script:ExistingDir 'scripts\new-machine-setup.ps1'
     if (-not (Test-Path $setup)) {
         Err ("未找到初始化脚本: {0}" -f $setup)
         if ($script:DryRun) { return }
         exit 1
-    }
-    if ($SkipSetup) {
-        Warn '已跳过初始化（-SkipSetup）'
-        return
     }
     if ($script:DryRun) {
         Info "(模拟) 运行 new-machine-setup.ps1（修 pyvenv.cfg → 校验 → 补依赖 → 建库）"
@@ -351,20 +388,38 @@ function Step06-SelfCheck {
     if (Test-Path $start) { Ok 'scripts\start.ps1 存在' } else { Err '缺 scripts\start.ps1'; $fail++ }
     $web = Join-Path $script:ExistingDir 'web\index.html'
     if (Test-Path $web) { Ok 'web 面板存在' } else { Warn '缺 web\index.html' }
-    # 端口占用检查
+    # 端口占用检查：端口由 data\echo-port.txt 决定（默认 8970）。
+    # 写死 8970 时它既发现不了"真端口被占"，也认不出"已有实例在跑"（本机实际 18060）。
+    $port = 8970
+    $portFile = Join-Path $script:ExistingDir 'data\echo-port.txt'
+    if (Test-Path $portFile) {
+        $parsed = 0
+        $raw = (Get-Content $portFile -ErrorAction SilentlyContinue |
+                Where-Object { $_.Trim() } | Select-Object -First 1)
+        if ($raw -and [int]::TryParse($raw.Trim(), [ref]$parsed) -and $parsed -gt 0) {
+            $port = $parsed
+            Info ("端口取自 data\echo-port.txt: {0}" -f $port)
+        } else {
+            Warn ("data\echo-port.txt 内容无法解析（{0}），按默认 {1} 检查" -f $raw, $port)
+        }
+    }
     $c = New-Object System.Net.Sockets.TcpClient
     try {
-        $iar = $c.BeginConnect('127.0.0.1', 8970, $null, $null)
+        $iar = $c.BeginConnect('127.0.0.1', $port, $null, $null)
         if ($iar.AsyncWaitHandle.WaitOne(800)) {
             $c.EndConnect($iar)
-            Warn '端口 8970 已被占用（本机可能已有 ECHO 在运行，不影响安装）'
+            Warn ("端口 {0} 已被占用（本机已有 ECHO 在运行，不影响安装）" -f $port)
         } else {
-            Ok '端口 8970 空闲'
+            Ok ("端口 {0} 空闲" -f $port)
         }
     } catch { } finally { $c.Dispose() }
     if ($fail -gt 0) {
         Err ("自检失败项: {0} 项，安装可能不可用" -f $fail)
-        if (-not (Ask-YesNo '继续？')) { exit 1 }
+        if ($script:DryRun) {
+            Info '(模拟) 真实安装走到这里会中止（默认 N）——请先修好上面的失败项'
+            return
+        }
+        if (-not (Ask-YesNo '自检未通过，仍要继续？' $false)) { exit 1 }
     }
 }
 
@@ -380,7 +435,8 @@ function Step07-Shortcuts {
             if ($LASTEXITCODE -eq 0) { Ok '桌面快捷方式已创建' } else { Warn '桌面快捷方式创建未成功' }
         }
     } else {
-        Warn '跳过桌面快捷方式'
+        if ($SkipDesktopLnk) { Warn '跳过桌面快捷方式（-SkipDesktopLnk）' }
+        else { Warn ("未找到桌面快捷方式安装脚本，未创建: {0}" -f $lnkInstaller) }
     }
     # ---- 开机自启（vbs 隐藏方案：绕开组策略对 -WindowStyle Hidden 的拦截）----
     if ($SkipStartupLnk) {

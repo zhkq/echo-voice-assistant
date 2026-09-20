@@ -100,12 +100,24 @@ $forbiddenPath = @(
 # "settings.yaml.bak": that artifact is blocked by the PATH check above, and matching
 # the bare string only trips over prose (comments/docs explaining the 2026-09-14
 # incident), which is exactly the kind of false positive that gets a check disabled.
-$forbiddenContent = @(
-    ('aiopen\.' + 'bjunicom'),
-    ('zhou' + 'kq1'),
-    '(?i)sk-[A-Za-z0-9]{20,}',
-    'BEGIN [A-Z ]*PRIVATE KEY'
-)
+$rxIntranetHost = ('aiopen\.' + 'bjunicom')
+$rxUserId       = ('zhou' + 'kq1')
+$rxApiKey       = '(?i)sk-[A-Za-z0-9]{20,}'
+$rxPemHeader    = 'BEGIN [A-Z ]*PRIVATE KEY'
+$forbiddenContent = @($rxIntranetHost, $rxUserId, $rxApiKey, $rxPemHeader)
+
+# The PEM-header rule is skipped inside vendored third-party trees (venv\, models\).
+# Those trees legitimately carry PEM markers: pycryptodome ships real throwaway test
+# keys in Crypto/SelfTest/**, and cryptography/paramiko mention the header as a plain
+# literal. 2026-09-20: this made every -Profile internal build fail with 34 false
+# positives - i.e. the very package scripts\install.ps1 needs could not be built.
+# Every other content rule AND every path rule still applies to vendored files, so a
+# token pasted into venv\pip.conf is still caught.
+$vendoredPrefix = @('venv/', 'models/')
+function Test-Vendored([string]$rel) {
+    foreach ($p in $vendoredPrefix) { if ($rel.StartsWith($p)) { return $true } }
+    return $false
+}
 $textExt = @('.py', '.ps1', '.cmd', '.bat', '.js', '.css', '.html', '.json', '.md',
              '.txt', '.yaml', '.yml', '.toml', '.cs', '.csproj', '.sh', '.plist', '.vbs', '.svg')
 
@@ -149,10 +161,14 @@ foreach ($f in $files) {
     $ext = [System.IO.Path]::GetExtension($f.Rel).ToLower()
     if ($textExt -notcontains $ext) { continue }
     if ($f.Len -gt 4MB) { continue }              # minified vendor bundles: skip the scan
+    $rules = $forbiddenContent
+    if (Test-Vendored $f.Rel) {
+        $rules = @($forbiddenContent | Where-Object { $_ -ne $rxPemHeader })
+    }
     $i = 0
     foreach ($line in [System.IO.File]::ReadLines($f.Full)) {
         $i++
-        foreach ($rx in $forbiddenContent) {
+        foreach ($rx in $rules) {
             if ($line -match $rx) { $bad += "forbidden content: $($f.Rel):$i  (/$rx/)" }
         }
         if ($bad.Count -gt 40) { break }
@@ -177,8 +193,16 @@ $stamp = Get-Date -Format 'yyyyMMdd-HHmm'
 $stage = Join-Path $env:TEMP ("echo-pack-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
 New-Item -ItemType Directory -Path $stage -Force | Out-Null
 Say "staging to $stage"
+# The internal profile wraps everything in ECHO\. Reason: scripts\install.ps1 (the
+# internal whole-package route) detects the archive's single top-level directory and
+# moves it into place. Built flat, this zip has ~20 top-level entries, so Step04 moved
+# just one of them and then deleted the rest of the extracted tree. The public profile
+# stays flat: docs\macOS-*.md tell the reader to unzip it directly.
+$wrap = if ($Profile -eq 'internal') { 'ECHO' } else { '' }
+if ($wrap) { Say "wrapping every file in $wrap/ (installer expects a single top-level dir)" }
+function Get-StagedRel([string]$rel) { if ($wrap) { return "$wrap/$rel" } return $rel }
 foreach ($f in $files) {
-    $dst = Join-Path $stage $f.Rel.Replace('/', '\')
+    $dst = Join-Path $stage (Get-StagedRel $f.Rel).Replace('/', '\')
     $dstDir = Split-Path $dst -Parent
     if (-not (Test-Path $dstDir)) { New-Item -ItemType Directory -Path $dstDir -Force | Out-Null }
     Copy-Item -LiteralPath $f.Full -Destination $dst -Force
@@ -191,6 +215,9 @@ $branch = ''
 try { $branch = (git -C $root rev-parse --abbrev-ref HEAD 2>$null) } catch { }
 $dirty = ''
 try { if ((git -C $root status --porcelain 2>$null | Measure-Object).Count -gt 0) { $dirty = ' (working tree dirty)' } } catch { }
+$layout = if ($wrap) { "all files under $wrap/ ; BUILD-INFO.txt and SHA256SUMS.txt sit at the archive root" }
+          else { "flat, no wrapper directory" }
+$sumsBase = if ($wrap) { "relative to $wrap/ inside the archive" } else { "relative to the archive root" }
 $info = @(
     "ECHO delivery package",
     "profile      : $Profile",
@@ -200,6 +227,8 @@ $info = @(
     "git          : $branch @ $head$dirty",
     "files        : $($files.Count)",
     "unpacked     : $([Math]::Round($totalBytes / 1MB, 2)) MB",
+    "layout       : $layout",
+    "checksums    : SHA256SUMS.txt lists the paths $sumsBase",
     "",
     "This package was produced by scripts\build-package.ps1, which packs a whitelist and",
     "refuses to build when a forbidden file or content pattern is present. It never",
@@ -212,7 +241,7 @@ $info = @(
 
 $sums = New-Object System.Collections.Generic.List[string]
 foreach ($f in ($files | Sort-Object Rel)) {
-    $h = (Get-FileHash -LiteralPath (Join-Path $stage $f.Rel.Replace('/', '\')) -Algorithm SHA256).Hash.ToLower()
+    $h = (Get-FileHash -LiteralPath (Join-Path $stage (Get-StagedRel $f.Rel).Replace('/', '\')) -Algorithm SHA256).Hash.ToLower()
     $sums.Add("$h  $($f.Rel)")
 }
 [System.IO.File]::WriteAllLines((Join-Path $stage 'SHA256SUMS.txt'), $sums, (New-Object System.Text.UTF8Encoding($false)))
