@@ -1033,6 +1033,28 @@ def api_wizard_state(_auth=Depends(optional_auth)):
     return wizard.execution_state()
 
 
+@router.get("/wizard/first-run")
+def api_wizard_first_run(_auth=Depends(optional_auth)):
+    """是不是首装（还没写过 ``data/installed-components.json``）。
+
+    **刻意做成最轻的一个接口**：面板启动时就要问它，所以这里只做一次
+    ``os.path.isfile`` —— 不能顺手拉 ``/api/wizard/env``（那个要探网，1.5 s 起）。
+    面板据此自动进向导（设计 §0/§1：首装必须进向导，不得跳过）。
+    """
+    from app import wizard
+    return {"firstRun": wizard.first_run(), "installed": wizard.installed_path()}
+
+
+@router.post("/wizard/finalize")
+def api_wizard_finalize(_auth=Depends(optional_auth)):
+    """向导走到末页时调用：写 ``data/installed-components.json``（执行后的真值）。
+
+    写完 ``first_run()`` 就变 False，面板不再自动进向导 —— 这就是"向导走过一次"的凭据。
+    """
+    from app import wizard
+    return {"installed": wizard.finalize()}
+
+
 # ---------------------------------------------------------------- 能力 provider（P5 / D25）
 # ASR / LLM / TTS 三类能力的统一清单：谁在生效、是不是要出网（egress）、就绪与否。
 # 与 /api/components 的分工：**components = 装什么**（模型/引擎/运行时的安装与就绪），

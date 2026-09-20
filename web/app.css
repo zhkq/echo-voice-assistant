@@ -1041,6 +1041,11 @@ main { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
 .wiz-loc { display: flex; flex-direction: column; gap: 4px; padding: 10px 0;
   border-bottom: 1px solid var(--border); }
 .wiz-loc-input { width: 100%; }
+/* S6 就地填地址/密钥（2026-09-20）：一行一项，标签在左、输入框占满剩余宽度 */
+.wiz-fields { display: flex; flex-direction: column; gap: 8px; margin: 10px 0; }
+.wiz-field { display: flex; align-items: center; gap: 10px; }
+.wiz-field > span { min-width: 96px; color: var(--muted); font-size: 12px; }
+.wiz-field > input { flex: 1; min-width: 0; }
 .wiz-env { display: flex; flex-direction: column; gap: 4px; margin: 6px 0; }
 .wiz-env-row { display: flex; gap: 10px; line-height: 1.6; }
 .wiz-env-row > b { min-width: 64px; color: var(--muted); font-weight: 600; }

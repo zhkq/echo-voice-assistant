@@ -2758,6 +2758,9 @@ function wizBlankChoices() {
     locations: { models: "", meetings: "", notes: "" },
     engines: [], wake: false, diarize: false, accel: false,
     asrOnline: false, llmReady: false, agent: "", fallback: [],
+    /* S6：AI 服务（用户自备）。地址/密钥/模型**就地填**，执行相由后端落到
+       provider 自己声明的设置键上（app/wizard.py 的 _credential_rows）。 */
+    llm: { provider: "", baseUrl: "", apiKey: "", model: "" },
   };
 }
 
@@ -2768,6 +2771,15 @@ function wizSize(mb) {
   if (n >= 2000) return `约 ${(n / 1024).toFixed(1)} GB`;
   if (n >= 100) return `约 ${n} MB（差不多 ${Math.round(n)} 首歌）`;
   return `约 ${n} MB`;
+}
+
+/* 确认页要列出「将写入哪些设置」，但**密钥类不能明文显示**：面板可能开着共享屏幕，
+   截图/肩窥都算泄漏。判据看键名后缀 —— 与 provider 声明的键名（…ApiKey / …Token）一致。
+   2026-09-20：S6 支持就地填地址与密钥之后，密钥才第一次走到这个列表上。 */
+function wizMaskSetting(key, value) {
+  const text = String(value == null ? "" : value);
+  if (!text) return text;
+  return /(ApiKey|Token|Secret|Password)$/i.test(String(key || "")) ? "••••••（已隐藏）" : text;
 }
 
 /* 三处位置（设计 §2 的 S1）。文案里的"为什么"必须留着 —— 小白靠它理解自己在决定什么。 */
@@ -2817,6 +2829,9 @@ async function loadWizard() {
                                            saved.locations || {});
     if (!Array.isArray(_wizChoices.engines)) _wizChoices.engines = [];
     if (!Array.isArray(_wizChoices.fallback)) _wizChoices.fallback = [];
+    /* S6 的地址/密钥/模型：老计划文件里没有 llm 这一块，补成完整骨架再渲染 */
+    _wizChoices.llm = Object.assign({ provider: "", baseUrl: "", apiKey: "", model: "" },
+                                    saved.llm || {});
     if (plan.plan && plan.plan.state === "running") _wizStep = WIZ_STEPS.findIndex((s) => s.id === "run");
     wizRender();
   } catch (e) {
@@ -3073,24 +3088,61 @@ function wizRenderAccel(host) {
   }));
 }
 
-/* ---------------- S6 AI 服务（用户自备，刻意没有默认） ---------------- */
+/* ---------------- S6 AI 服务（用户自备，刻意没有默认） ----------------
+   2026-09-20：地址与密钥**就地填**（原先只有一个跳去「模型路由」的按钮，用户得换页
+   自己找）。填的东西进 `choices.llm`，执行相由后端落到该 provider **自己声明**的
+   设置键上（`app/providers/openai.py` 的 details.settings）—— 面板不写死键名。
+   留空即不改动已有配置（这是 `_setting_updates` 的一贯规矩）。 */
 function wizRenderLlm(host) {
+  const llm = _wizChoices.llm || {};
+  const filled = !!(llm.baseUrl || "").trim() && !!(llm.apiKey || "").trim();
   host.innerHTML = wizCard("让 ECHO 会写纪要",
     "把转写好的文字交给一个 AI 服务，让它整理成会议纪要。",
     "不能自动生成会议纪要（转写、录音、会议列表都照常可用）。",
     `<div class="wiz-lose">AI 服务要你自己准备：ECHO <b>不提供、也不代管</b> 它。
-       你手上有内网服务地址、或某个在线服务的密钥，就可以直接用。</div>
+       你手上有内网服务地址、或某个在线服务的密钥，就填在下面。</div>
+     <div class="wiz-fields">
+       <label class="wiz-field"><span>服务地址</span>
+         <input class="input" id="wizLlmBase" placeholder="http://内网地址/v1"
+                value="${esc(llm.baseUrl || "")}"></label>
+       <label class="wiz-field"><span>密钥</span>
+         <input class="input" id="wizLlmKey" type="password" placeholder="服务方给你的那一串"
+                value="${esc(llm.apiKey || "")}"></label>
+       <label class="wiz-field"><span>模型名（可留空）</span>
+         <input class="input" id="wizLlmModel" placeholder="例如 deepseek-chat"
+                value="${esc(llm.model || "")}"></label>
+     </div>
+     <div class="muted">填好这两项，点「开始准备」时会写进设置；以后想改、或想配多个上游
+       按顺序用，再到「模型路由」里改。</div>
      <label class="wiz-opt ${_wizChoices.llmReady ? "on" : ""}">
        <input type="checkbox" data-wizllm="1" ${_wizChoices.llmReady ? "checked" : ""}>
        <span class="wiz-opt-body"><span class="wiz-opt-name">我已经有可用的 AI 服务</span>
-       <span class="muted">地址与密钥在「模型路由」里填 —— 那里也是「配哪些上游、按什么顺序用」的地方</span></span>
-     </label>
-     <div><button class="btn" id="wizGoLlm">去填地址与密钥</button></div>`);
+       <span class="muted">${filled ? "上面填的就是" : "在别处已经配好，这次不用再填"}</span></span>
+     </label>`);
   wizWhy(host);
+  /* 地址与密钥都填了就自动算"已经有"（免得用户还要再勾一次）；
+     用 change 而不是 input：逐键 PUT 计划文件没必要，失焦/下一步时存一次够了。 */
+  const bind = (sel, field) => {
+    const el = $(sel, host);
+    if (!el) return;
+    el.addEventListener("change", () => {
+      _wizChoices.llm = Object.assign({ provider: "", baseUrl: "", apiKey: "", model: "" },
+                                      _wizChoices.llm || {});
+      _wizChoices.llm[field] = el.value;
+      const l = _wizChoices.llm;
+      if ((l.baseUrl || "").trim() && (l.apiKey || "").trim()) {
+        _wizChoices.llmReady = true;
+        const box = $("[data-wizllm='1']", host);
+        if (box) box.checked = true;
+      }
+      wizSaveChoices();
+    });
+  };
+  bind("#wizLlmBase", "baseUrl");
+  bind("#wizLlmKey", "apiKey");
+  bind("#wizLlmModel", "model");
   const box = $("[data-wizllm='1']", host);
   if (box) box.addEventListener("change", () => { _wizChoices.llmReady = box.checked; wizSaveChoices(); });
-  const go = $("#wizGoLlm", host);
-  if (go) go.addEventListener("click", () => switchView("failover"));
 }
 
 /* ---------------- S7 智能体后端（默认标准 DSH） ---------------- */
@@ -3160,7 +3212,7 @@ async function wizRenderConfirm(host) {
   const dls = (b.downloads || []).map((d) => `<li>${esc(d.label || d.component)} —— ${esc(wizSize(d.approxMb))}${
     d.ready === true ? "（已经装好，会跳过）" : ""}</li>`).join("");
   const man = (b.manual || []).map((m) => `<li>${esc(m.label || m.component)} —— ${esc(m.reason || "")}</li>`).join("");
-  const cfg = (b.config || []).map((c) => `<li>${esc(c.key)} → ${esc(String(c.value))}</li>`).join("");
+  const cfg = (b.config || []).map((c) => `<li>${esc(c.key)} → ${esc(wizMaskSetting(c.key, c.value))}</li>`).join("");
   const eg = (b.providers || []).filter((p) => p.egress)
     .map((p) => `<li>${esc(p.name)}：${esc(p.egressNote || "")}</li>`).join("");
   host.innerHTML = wizCard("确认一下",
@@ -3248,6 +3300,10 @@ async function wizRenderDone(host) {
     </div></div>`;
   const again = $("#wizRestart", host);
   if (again) again.addEventListener("click", () => { _wizStep = 0; wizRender(); });
+  /* 走到末页 = 向导走完了：写 data/installed-components.json（设计 §4/§5 的"执行后真值"）。
+     这是**首装判据**的凭据 —— 写完 `/api/wizard/first-run` 就变 false，面板以后不再自动进向导。
+     失败不影响用户看这一页（下次进末页还会再试一次）。 */
+  post("/api/wizard/finalize", {}).catch(() => {});
 }
 
 
@@ -3255,14 +3311,30 @@ async function wizRenderDone(host) {
    和 <section id="view-…">，否则 switchView 会找不到容器。 */
 const _VIEWS = ["dashboard", "settings", "history", "meetings", "boot", "failover",
                 "capabilities", "wizard"];
-let _bootView = "dashboard";
+let _bootView = "";
 try {
   const q = new URLSearchParams(location.search).get("view");
   const want = q || localStorage.getItem("echo.gotoView");
   if (localStorage.getItem("echo.gotoView")) localStorage.removeItem("echo.gotoView");
   if (want && _VIEWS.includes(want)) _bootView = want;
 } catch (e) { /* 忽略 */ }
-switchView(_bootView);
+
+/* 进哪个页签：显式指定（?view=… / echo.gotoView）最优先；否则**首装直接进向导**
+   （设计 §0/§1："首装只装 runtime-core，随后立刻进向导，向导不得跳过" —— 判据是
+   服务端 `data/installed-components.json` 在不在，由 /api/wizard/first-run 回答）。
+   为什么用"最多 800ms 的赛跑"而不是直接 await：面板要立刻可交互，探测失败/超时
+   就按老行为进仪表盘，绝不因为这一步白屏。
+   想直接看仪表盘：地址栏加 `?view=dashboard`；向导走过一次末页后也不再自动进。 */
+async function bootView() {
+  if (_bootView) { switchView(_bootView); return; }
+  const first = await Promise.race([
+    api("/api/wizard/first-run").then((r) => !!(r && r.firstRun)).catch(() => false),
+    new Promise((res) => setTimeout(() => res(false), 800)),
+  ]);
+  if (first) toast("第一次使用：先花两分钟过一遍向导（随时可以跳过）");
+  switchView(first ? "wizard" : "dashboard");
+}
+bootView();
 applyCollapsedCards();      // 应用上次的卡片折叠状态（「模型路由 → 路由参数」等）
 
 /* ---------------- 自动刷新：间隔取自设置 panelAutoRefresh ----------------

@@ -342,5 +342,93 @@ class ExecutePlanTests(_PlanTestCase):
         self.assertTrue(state["summary"].endswith("项已就绪"))
 
 
+class LlmCredentialsTests(_PlanTestCase):
+    """S6「就地填地址与密钥」（2026-09-20）：键名取自 provider **自己声明**的清单，向导不猜。"""
+
+    def _cfg(self, choices):
+        return {r["key"]: r["value"] for r in wizard.build_plan(choices)["config"]}
+
+    def test_inline_credentials_land_on_the_declared_keys(self):
+        cfg = self._cfg({"llm": {"baseUrl": "http://10.1.2.3:8000/v1",
+                                 "apiKey": "sk-abc", "model": "deepseek-chat"}})
+        self.assertEqual(cfg["providerLlm"], wizard.DEFAULT_ONLINE_LLM,
+                         "只填了地址、没显式选 provider → 落到单上游直连那一条")
+        self.assertEqual(cfg["providerLlmBaseUrl"], "http://10.1.2.3:8000/v1")
+        self.assertEqual(cfg["providerLlmApiKey"], "sk-abc")
+        self.assertEqual(cfg["providerLlmModel"], "deepseek-chat")
+
+    def test_empty_fields_do_not_overwrite_existing_config(self):
+        cfg = self._cfg({"llm": {"baseUrl": "http://x/v1"}})
+        self.assertEqual(cfg["providerLlmBaseUrl"], "http://x/v1")
+        self.assertNotIn("providerLlmApiKey", cfg, "没填密钥就不该写（不覆盖已有配置）")
+        self.assertNotIn("providerLlmModel", cfg)
+
+    def test_explicit_provider_wins_and_undeclared_keys_are_not_invented(self):
+        """显式选的 provider 不能被顶掉；没声明这些键的 provider 更不许瞎写。"""
+        cfg = self._cfg({"llm": {"provider": "echo-auto", "baseUrl": "http://x/v1"}})
+        self.assertEqual(cfg["providerLlm"], "echo-auto")
+        self.assertNotIn("providerLlmBaseUrl", cfg,
+                         "echo-auto 没声明 providerLlm* 这些键 → 向导不该发明键名")
+
+    def test_inline_credentials_count_as_having_an_ai_service(self):
+        """只填字段、没勾选，也要算「能写纪要」—— 否则末页的「还不能做什么」会说假话。"""
+        missing = [m["feature"] for m in
+                   wizard.build_plan({"llm": {"baseUrl": "http://x/v1",
+                                              "apiKey": "k"}})["missing"]]
+        self.assertNotIn("自动写会议纪要", missing)
+        plain = [m["feature"] for m in wizard.build_plan({})["missing"]]
+        self.assertIn("自动写会议纪要", plain, "什么都没配时才该提示缺 AI 服务")
+
+    def test_egress_declaration_reaches_the_confirm_page(self):
+        plan = wizard.build_plan({"llm": {"baseUrl": "http://x/v1"}})
+        self.assertEqual([p["id"] for p in plan["providers"]], [wizard.DEFAULT_ONLINE_LLM])
+        self.assertTrue(plan["summary"]["egress"], "在线服务必须在确认页声明出网")
+
+
+class InstalledComponentsTests(_PlanTestCase):
+    """首装判据 + 执行后真值（设计 §4/§5）。"""
+
+    def _installed(self):
+        return os.path.join(self.tmp, wizard.INSTALLED_FILE)
+
+    def test_first_run_follows_the_installed_file(self):
+        target = self._installed()
+        self.assertTrue(wizard.first_run(target), "这个文件不存在 = 首装")
+        with open(target, "w", encoding="utf-8") as fh:
+            fh.write("{}")
+        self.assertFalse(wizard.first_run(target), "写过了 = 面板不再自动进向导")
+
+    def test_finalize_records_truth_and_never_the_secret(self):
+        target = self._installed()
+        plan_file = os.path.join(self.tmp, "wizard-plan.json")
+        choices = {"engines": ["stt-sherpa", "stt-whisper-base"],
+                   "llm": {"baseUrl": "http://x/v1", "apiKey": "sk-SECRET"}}
+        built = wizard.build_plan(choices)
+        wizard.save_plan({"state": "running", "choices": choices, "built": built}, plan_file)
+
+        payload = wizard.finalize(plan_file, path=target, ready=lambda mid: mid == "sherpa")
+
+        with open(target, encoding="utf-8") as fh:
+            raw = fh.read()
+        self.assertNotIn("sk-SECRET", raw, "密钥**绝不能**落进这个明文文件")
+        self.assertIn("providerLlmApiKey", raw, "但要记下「写过哪些键」（只记键名）")
+        self.assertNotIn("sk-SECRET", json.dumps(payload, ensure_ascii=False),
+                         "返回值里也不该带密钥")
+        self.assertFalse(wizard.first_run(target), "写完就不再是首装")
+        self.assertTrue(payload["modelsDir"], "要记下能力包放在哪")
+        # 能力包「已装」来自 ready() 这个真值，不是计划里的乐观期待
+        components = {c["id"]: c for c in payload["components"]}
+        self.assertTrue(components["stt-sherpa"]["ready"])
+        self.assertFalse(components["stt-whisper-base"]["ready"])
+
+    def test_finalize_survives_a_broken_plan_file(self):
+        """计划文件坏掉也要能写出真值：这是向导末页的调用，不能被一个坏文件卡住。"""
+        target = self._installed()
+        payload = wizard.finalize(os.path.join(self.tmp, "nope.json"), path=target,
+                                  ready=lambda mid: None)
+        self.assertTrue(os.path.isfile(target))
+        self.assertEqual(payload["components"], [])
+
+
 if __name__ == "__main__":
     unittest.main()

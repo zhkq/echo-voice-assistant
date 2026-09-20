@@ -347,6 +347,114 @@ def save_plan(data, path: str = "") -> dict:
     return plan
 
 
+# ---------------------------------------------------------------- 首装判据 / 执行后真值
+#
+# 设计 §5：`data/installed-components.json` 是**执行后的真值**，由向导走到末页时写出；
+# 它**不存在 = 还没走过向导 = 首装**，面板据此自动进向导（设计 §0/§1："首装只装
+# runtime-core，随后立刻进向导，向导不得跳过"）。
+#
+# 判据是"这个文件在不在"，**不是扫目录猜** —— 扫目录会把"装了但没走过向导"和
+# "走过向导但选择跳过"混成同一种状态（设计 §5 明令不靠扫目录猜）。
+
+INSTALLED_FILE = "installed-components.json"
+INSTALLED_SCHEMA = "echo-installed-components/1"
+
+
+def installed_path() -> str:
+    return os.path.join(paths.data_root(), INSTALLED_FILE)
+
+
+def first_run(path: str = "") -> bool:
+    """首装？（还没写过 `installed-components.json`）
+
+    老用户升级时也没有这个文件 → 会当首装进一次向导。这是**刻意**的：他们要补
+    "能力包放哪 / 笔记库在哪 / AI 服务"，而决策相全程只读、也能一路跳过。
+    取不到时返回 False（宁可漏进一次向导，也不要因为探测失败把面板挡在门外）。
+    ``path`` 只为测试注入；默认是数据根下的那个文件。
+    """
+    try:
+        return not os.path.isfile(path or installed_path())
+    except Exception:
+        return False
+
+
+def _model_ready(model_id: str):
+    """能力包是否就绪（真值来源：`modelinfo.ready`）。取不到返回 None —— 不假装"没装"。"""
+    try:
+        from app import modelinfo
+        return modelinfo.ready(model_id)
+    except Exception:
+        return None
+
+
+def finalize(plan_file: str = "", *, path: str = "", ready=None, write=None) -> dict:
+    """向导走到末页时写 `data/installed-components.json`（设计 §4/§5 的"执行后真值"）。
+
+    **绝不写设置的值**：里面可能有在线服务的密钥，而这个文件是明文。只记能力包的
+    已装状态与本地位置，以及"向导写过哪些设置"的**键名**列表。
+
+    `ready` / `write` 可注入，便于测试；默认走 `modelinfo.ready` 与真实写盘。
+    """
+    plan = load_plan(plan_file)
+    built = plan.get("built") or {}
+    execution = plan.get("execution") or {}
+    ready = ready or _model_ready
+
+    components = []
+    seen = set()
+    for item in built.get("downloads") or []:
+        cid = str(item.get("component") or "")
+        mid = str(item.get("modelId") or "")
+        if cid:
+            if cid in seen:
+                continue
+            seen.add(cid)
+        state = _model_ready_call(ready, mid) if mid else None
+        components.append({"id": cid or mid, "modelId": mid,
+                           "label": item.get("label") or cid,
+                           "phase": item.get("phase") or "",
+                           "ready": state,
+                           "at": _now()})
+
+    payload = {
+        "schema": INSTALLED_SCHEMA,
+        "writtenAt": _now(),
+        "firstRunDone": True,
+        "dataRoot": paths.data_root(),
+        "modelsDir": paths.models_root(),
+        #: 只记**键名**（不记值）：密钥不能落明文。面板据此知道"向导写过哪些配置"。
+        "configKeys": [str(r.get("key")) for r in (built.get("config") or []) if r.get("key")],
+        "components": components,
+        "skipped": [r.get("component") for r in (execution.get("skipped") or [])],
+        "failed": [{"component": r.get("component"),
+                    "message": str(r.get("message") or r.get("error") or "")}
+                   for r in (execution.get("failed") or [])],
+    }
+
+    target = path or installed_path()
+    if write is not None:
+        write(target, payload)
+        return payload
+    folder = os.path.split(target)[0]
+    if folder and not os.path.isdir(folder):
+        os.makedirs(folder, exist_ok=True)
+    tmp = target + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, ensure_ascii=False, indent=2)
+    os.replace(tmp, target)
+    payload["path"] = target
+    return payload
+
+
+def _model_ready_call(ready, model_id: str):
+    """调一次就绪探测；任何异常都算 None（未知），不由它把 finalize 拖崩。"""
+    try:
+        state = ready(model_id)
+    except Exception:
+        return None
+    return None if state is None else bool(state)
+
+
 # ---------------------------------------------------------------- 决策 → 执行计划
 #
 # 用户的选择（choices）要展开成两类动作：
@@ -362,9 +470,64 @@ PHASE_ORDER = ("config", "engines", "accel", "fallback")
 
 PLAN_BUILD_SCHEMA = "echo-wizard-build/1"
 
+#: S6 就地填的三样 → provider 声明里的键名后缀（`providerLlmBaseUrl` / `…ApiKey` / `…Model`）。
+#: 按**后缀**匹配而不是写死整串：前缀（providerLlm / providerAsr）属于 provider 的命名空间。
+_CRED_FIELDS = (("baseUrl", "BaseUrl"), ("apiKey", "ApiKey"), ("model", "Model"))
+
+#: S6 就地填了地址、却没显式选 provider 时落到这一个（单上游直连）。
+#: 多上游派发是「ECHO AUTO」那套的事，向导不替用户改（用户显式选了就以他为准）。
+DEFAULT_ONLINE_LLM = "openai-llm"
+
+
+def llm_choice(choices: dict) -> dict:
+    """S6 的选择（provider + 地址/密钥/模型）。容错：不是 dict 就当没填。"""
+    llm = (choices or {}).get("llm") or {}
+    return llm if isinstance(llm, dict) else {}
+
+
+def llm_provider_id(choices: dict) -> str:
+    """S6 最终用哪个 provider：用户显式选的优先；只填了地址就用单上游直连。"""
+    llm = llm_choice(choices)
+    explicit = str(llm.get("provider", "") or "").strip()
+    if explicit:
+        return explicit
+    filled = any(str(llm.get(field, "") or "").strip() for field, _ in _CRED_FIELDS)
+    return DEFAULT_ONLINE_LLM if filled else ""
+
+
+def llm_configured(choices: dict) -> bool:
+    """S6 是否已经"能写纪要"：勾了「我已经有」，**或**就地填全了地址与密钥。
+
+    两个判据都认，是因为前端会勾选、脚本/接口调用可能只填字段 —— 后端不该因为
+    少一个布尔就把它算成"没有 AI 服务"（那会让末页的"还不能做什么"说假话）。
+    """
+    if (choices or {}).get("llmReady"):
+        return True
+    llm = llm_choice(choices)
+    return bool(str(llm.get("baseUrl", "") or "").strip()
+                and str(llm.get("apiKey", "") or "").strip())
+
+
+def _credential_rows(kind: str, provider_id: str, values: dict) -> list:
+    """把就地填的地址/密钥/模型落到**该 provider 自己声明**的设置键上（空值跳过）。
+
+    provider 声明了什么键就写什么键 —— 向导不发明键名（声明见
+    `app/providers/openai.py` 的 `details.settings`）。
+    """
+    keys = _provider_spec(kind, provider_id).get("settings") or []
+    rows = []
+    for field, suffix in _CRED_FIELDS:
+        value = str((values or {}).get(field, "") or "").strip()
+        if not value:
+            continue                       # 空值不覆盖已有配置（与下面位置项同一规矩）
+        key = next((k for k in keys if k.endswith(suffix)), "")
+        if key:
+            rows.append({"key": key, "value": value})
+    return rows
+
 
 def _setting_updates(choices: dict) -> list:
-    """三处位置 → 设置项。只写用户真的填了的（空值不覆盖已有配置）。"""
+    """三处位置 + provider + 智能体 → 设置项。只写用户真的填了的（空值不覆盖已有配置）。"""
     locs = dict(choices.get("locations") or {})
     rows = []
     for key, setting_key in (("models", "modelsDir"),
@@ -380,10 +543,12 @@ def _setting_updates(choices: dict) -> list:
         rows.append({"key": "agentBackend", "value": agent})
     if choices.get("asrOnline"):
         rows.append({"key": "providerAsr", "value": "openai-asr"})
-    llm = choices.get("llm") or {}
-    if str(llm.get("provider", "") or "").strip():
-        rows.append({"key": "providerLlm", "value": str(llm["provider"]).strip()})
-    # 在线服务/转写的地址与密钥：键名由 providers 层定义，向导不猜 —— 由调用方原样传入
+    llm_provider = llm_provider_id(choices)
+    if llm_provider:
+        rows.append({"key": "providerLlm", "value": llm_provider})
+        # S6 就地填的地址/密钥/模型（键名来自 provider 自己的声明，见 _credential_rows）
+        rows += _credential_rows("llm", llm_provider, llm_choice(choices))
+    # 其余任意设置：键名由调用方原样传入（向导不猜）
     extra = choices.get("extraSettings") or {}
     if isinstance(extra, dict):
         for key, value in extra.items():
@@ -445,9 +610,14 @@ def _provider_spec(kind: str, provider_id: str) -> dict:
         rows = providers_mod.catalog(ready=False).get("providers") or []
         for row in rows:
             if row.get("kind") == kind and row.get("id") == provider_id:
+                details = row.get("details") or {}
                 return {"kind": kind, "id": provider_id, "name": row.get("name", ""),
                         "source": row.get("source", ""), "egress": bool(row.get("egress")),
-                        "egressNote": row.get("egress_note", "")}
+                        "egressNote": row.get("egress_note", ""),
+                        # 该 provider **自己声明**的设置键（`app/providers/openai.py` 的
+                        # `details.settings`）。S6 就地填的地址/密钥就落到这些键上 ——
+                        # 向导**不猜键名**，provider 改了自己的键这里自动跟上。
+                        "settings": [str(k) for k in (details.get("settings") or [])]}
     except Exception:
         pass
     return {}
@@ -488,9 +658,9 @@ def build_plan(choices: dict) -> dict:
         spec = _provider_spec("asr", "openai-asr")
         if spec:
             providers.append(spec)
-    llm = choices.get("llm") or {}
-    if str(llm.get("provider", "") or "").strip():
-        spec = _provider_spec("llm", str(llm["provider"]).strip())
+    llm_provider = llm_provider_id(choices)
+    if llm_provider:
+        spec = _provider_spec("llm", llm_provider)
         if spec:
             providers.append(spec)
 
@@ -499,7 +669,7 @@ def build_plan(choices: dict) -> dict:
     todo_mb = sum(int(d.get("approxMb") or 0) for d in todo)
     # "还不能做什么"：末页（S11）要能回答这个问题 —— 用"你会失去什么"的说法，不说技术原因
     missing = []
-    if not choices.get("llmReady"):
+    if not llm_configured(choices):
         missing.append({"feature": "自动写会议纪要",
                         "reason": "还没配 AI 服务（你自己填一个地址就能用）",
                         "fix": "面板 → 模型路由"})

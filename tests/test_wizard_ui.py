@@ -51,10 +51,37 @@ class WizardUiWiringTests(unittest.TestCase):
 
     def test_wizard_calls_only_the_wizard_endpoints_and_saves_choices(self):
         for url in ("/api/wizard/env", "/api/wizard/plan", "/api/wizard/preview",
-                    "/api/wizard/execute", "/api/wizard/state"):
+                    "/api/wizard/execute", "/api/wizard/state",
+                    "/api/wizard/first-run", "/api/wizard/finalize"):
             self.assertIn(url, self.js, "向导要用 %s" % url)
         # 决策相只写计划（PUT /api/wizard/plan），不直接写设置、不直接触发下载
         self.assertIn('api("/api/wizard/plan", {', self.js)
+
+    def test_s6_collects_address_and_key_inline(self):
+        """S6 要能**就地**填地址与密钥。
+
+        2026-09-20 之前这里只有一个「去模型路由」的按钮 —— 用户得自己换页去找，
+        本步等于没做完（这就是 roadmap 上的"下一刀"）。
+        """
+        block = self.js[self.js.index("function wizRenderLlm"):]
+        block = block[:block.index("\n}\n")]
+        for field in ("wizLlmBase", "wizLlmKey", "wizLlmModel"):
+            self.assertIn('id="%s"' % field, block, "S6 缺少 %s 输入框" % field)
+        self.assertIn('type="password"', block, "密钥框必须是密码框")
+        self.assertIn("_wizChoices.llm", block, "填的东西要进 choices.llm，执行相才会写进设置")
+        self.assertIn("wizSaveChoices", block, "填完要存进计划文件（关掉面板不丢）")
+        self.assertNotIn("wizGoLlm", self.js, "不该再把「跳去模型路由」当唯一入口")
+
+    def test_first_install_enters_the_wizard_automatically(self):
+        """首装（`installed-components.json` 缺失）要自动进向导，且不抢用户显式指定的页签。"""
+        self.assertIn('api("/api/wizard/first-run")', self.js)
+        block = self.js[self.js.index("async function bootView()"):]
+        block = block[:block.index("applyCollapsedCards()")]
+        self.assertIn("if (_bootView) { switchView(_bootView); return; }", block,
+                      "显式指定页签（?view=… / echo.gotoView）时不许抢")
+        self.assertIn('switchView(first ? "wizard" : "dashboard")', block)
+        self.assertIn("post(\"/api/wizard/finalize\", {})", self.js,
+                      "走到末页要写 installed-components.json（首装判据的凭据）")
 
     def test_every_step_has_a_renderer(self):
         steps = re.findall(r'\{ id: "[a-z]+", name: "[^"]+", render: (\w+) \}', self.js)
@@ -83,6 +110,19 @@ class WizardUiWiringTests(unittest.TestCase):
                                  "文案里不该出现技术词「%s」：%s" % (word, text[:60]))
         # 人话标志：体积要带换算，而不是只给 MB 数字
         self.assertIn("首歌", block, "体积要给一个人话换算")
+
+    def test_confirm_page_masks_secret_settings(self):
+        """确认页会列出「将写入哪些设置」——密钥必须打码。
+
+        S6 支持就地填地址与密钥之后，密钥第一次走到这个列表上；明文列出来
+        （面板可能在共享屏幕/被截图）就是泄漏。
+        """
+        self.assertIn("function wizMaskSetting(", self.js, "缺打码函数")
+        block = self.js[self.js.index("async function wizRenderConfirm"):]
+        block = block[:block.index("\n}\n")]
+        self.assertIn("wizMaskSetting(c.key, c.value)", block,
+                      "确认页的设置列表要走打码，不能直接 esc(c.value)")
+        self.assertNotIn("String(c.value)", block, "不允许再明文渲染设置值")
 
     def test_three_locations_are_all_present(self):
         for key in ("models", "meetings", "notes"):
