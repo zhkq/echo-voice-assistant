@@ -491,11 +491,14 @@ def llm_choice(choices: dict) -> dict:
 def llm_provider_id(choices: dict) -> str:
     """S6 的**直连兜底**用哪个 provider —— **只有用户显式打开才写**，不自动默认。
 
-    2026-09-20 用户定调：会议纪要、归档、语音指令**默认都走智能体**（只有它有 skill
-    机制做灵活扩展），直连大模型只是"不装智能体"时的兜底，**不推荐**。
-    而 `meeting.direct_llm_decision()` 的第 1 条判据是"`providerLlm` 非空就强制走直连、
-    哪怕 agent 也在" —— 所以向导**绝不能**因为"用户填了地址"就替他打开这个开关，
-    否则等于把用户从推荐的智能体路径上踢走。
+    2026-09-20 用户定调：纪要、归档、语音指令**默认都走智能体**（只有它有 skill 机制做
+    灵活扩展），直连大模型只是"不装智能体"时的兜底，**不推荐**。
+
+    纪要在 `meeting.direct_llm_decision()` 里本来就是 **agent-first**（agent 可用就走 agent，
+    直连只在 agent 不可用时生效）—— 所以这里的关键不是"抢不抢 agent 的活"，而是
+    **别把一个用户没做过的选择写进设置**：他只是随手填了地址，向导就替他选定
+    "没有智能体时用哪个直连 provider"，还把它写进了 `providerLlm`（一个全局的、别的功能
+    也会读的开关）。所以必须由用户明确打开。
     """
     llm = llm_choice(choices)
     explicit = str(llm.get("provider", "") or "").strip()

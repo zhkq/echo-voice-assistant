@@ -1569,21 +1569,22 @@ def _llm_provider_for_summary():
 def direct_llm_decision():
     """纪要是否走**直连 LLM provider**？返回 ``(bool, 原因)``。
 
-    判据（顺序即优先级）：
-      1. 用户显式选了 `providerLlm`（非空）→ 就按他选的走（哪怕 agent 也在）；
-      2. 否则：**agent 用不了**（DSH 未就绪）而 LLM provider 就绪 → 走直连 —— 这正是
-         P5 的承诺："不装 agent 也能出纪要"；
-      3. 其它情况保持原样（agent 路径），老用户行为零变化。
+    判据（2026-09-20 按"会议纪要只用 agent"的定调重写）：
+      1. **agent（DSH）可用 → 一律走 agent**。纪要不是"孤立地调一次大模型"：同一场会议里
+         分段与归档走的是同一个会话（日志原话"纪要/分段/归档共用此会话"），而归档还依赖
+         agent 的 skill 机制 —— 只要 agent 在，就不该把它绕过去；
+      2. agent 不可用而 LLM provider 就绪 → 直连兜底（P5 的承诺："不装 agent 也能出纪要"）；
+      3. 其它 → 保持 agent 路径（由原路径报错，不静默走一条没配好的路）。
+
+    **为什么删掉了原来"用户显式选了 `providerLlm` 就优先直连"那条判据**：
+    `providerLlm` 的默认值是 `""`，而 `""` 与 `"echo-auto"` 的**生效 provider 完全一样**
+    （`providers.default_id("llm")` 就是 `echo-auto`）。原判据看的是"原始设置非空"，于是
+    "在面板里显式选了 ECHO AUTO"这个动作会**静默把纪要从 agent 切到直连** —— 实测踩到过
+    （2026-09-19_19-18-25 那场：19:19 走 agent，次日 02:04 变成直连）。同一个 provider
+    不该有两种路由，而且用户选路由时并没想到会顺手关掉纪要的 agent 路径。
 
     只读判断，不做任何副作用；探测失败一律按"不走直连"处理（宁可退回老路）。
     """
-    from app.config import settings
-    chosen = str(settings.get("providerLlm", "") or "").strip()
-    if chosen:
-        inst, pid = _llm_provider_for_summary()
-        if inst is None:
-            return False, "配置的 LLM provider 不可用（%s）" % pid
-        return True, "按设置使用 LLM provider %s" % chosen
     try:
         from app import manager
         agent_ok = bool(manager.dsh_ready())
@@ -1672,11 +1673,12 @@ def _spawn_provider_summary(meeting_id, folder, out_name="summary.md", extra="")
 def request_summary(meeting_id, folder=None, extra=""):
     """生成整场会议纪要（纯 markdown，可含 Mermaid 图表），后台线程写 summary.md。
 
-    两条路（P5 起）：
-      * **agent 路径**（默认）：把 transcript.md 的**路径**交给 DSH，由它用 read 工具读并撰写；
-      * **直连 LLM 路径**：没有可用 agent（或用户显式选了 `providerLlm`）时，把转写**内联**
-        喂给 LLM provider —— 这样"不装 agent 也能出纪要"（P5 的验收点）。
-    标题/简介/摘要/分段由第二次调用（request_topic_segments）以 JSON 提供。
+    两条路（P5 起，2026-09-20 起**以 agent 为准**）：
+      * **agent 路径**（默认，只要 DSH 就绪就走它）：把 transcript.md 的**路径**交给 DSH，
+        由它用 read 工具读并撰写；分段与归档共用这个会话；
+      * **直连 LLM 路径**（兜底）：**agent 用不了**（DSH 未就绪）而 LLM provider 就绪时，
+        把转写**内联**喂给 LLM provider —— 这样"不装 agent 也能出纪要"（P5 的验收点）。
+    标题/简介/摘要/分段由第二次调用（request_topic_segments）以 JSON 提供（那次**只走 agent**）。
 
     ``extra`` = 追加要求（面板「重新生成」里填的那种）。**两条路都必须带上它** ——
     2026-09-19 修：以前 `regenerate_summary` 把它记进 summary_runs 却没往下传，

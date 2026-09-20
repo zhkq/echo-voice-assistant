@@ -74,6 +74,10 @@ PANEL_READ_PATTERNS = (
 ACK_INDIRECT = {
     # 智能体注册表：类属性 config_key 决定启用开关，`is_enabled` 用变量读（不是字面量）
     "agentCodebuddyEnabled": "app/agents/__init__.py:111 is_enabled() 按类的 config_key 读",
+    # provider 选择：providers 层用 `"provider%s" % kind.capitalize()` 拼键名读
+    # （providerLlm / providerAsr 共用同一个循环名，所以扫描看不见字面量）。
+    # 2026-09-20 起纪要不再自己读 providerLlm（改 agent-first，见 meeting.direct_llm_decision）。
+    "providerLlm": "app/providers/__init__.py:181 active_id() 拼键名读（provider<Kind>）",
     # 路由进程参数：router_admin 把它们映射成 dsh-failover/config.json 的字段名
     "routerProbeInterval": "app/router_admin.py:435 参数映射（写进 dsh-failover/config.json）",
     "routerFirstByteTimeout": "app/router_admin.py:436 参数映射",

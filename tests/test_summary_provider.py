@@ -5,8 +5,11 @@
 配一个在线 LLM（或让 ECHO AUTO 路由可用）就能出纪要，**装不装 agent 都不影响**。
 
 本文件钉住五件事：
-1. **选择判据**：显式选了 `providerLlm` 就按用户选的走；否则 agent 不可用而 LLM provider
-   就绪时才切直连；agent 可用时保持原样（老用户零变化）；
+1. **选择判据**（2026-09-20 改成 agent-first）：**agent（DSH）可用就一律走 agent**（纪要/分段/
+   归档共用同一会话）；只有 agent 不可用而 LLM provider 就绪时才切直连。**显式设了
+   `providerLlm` 不再抢走 agent 的活** —— 因为 `providerLlm` 的 `""` 与 `"echo-auto"` 生效
+   provider 完全一样（`default_id("llm") == "echo-auto"`），按"原始设置非空"判会静默关掉
+   agent 路径；
 2. **材料内联**：直连路径必须把转写正文放进 prompt（LLM 没有 read 工具），且超长要**说明被截断**；
 3. **落盘纪律与 agent 路径一致**：过短/疑似占位话**不回写**，失败写 error 日志；
 4. **不串台**：走直连时**完全不动** DSH 客户端（用"一调用就炸"的假客户端证明）；
@@ -77,13 +80,21 @@ class DecisionTests(unittest.TestCase):
         return patch("app.config.settings.get",
                      lambda k, d=None: provider_llm if k == "providerLlm" else d)
 
-    def test_explicit_choice_wins(self):
+    def test_agent_available_always_wins_even_with_an_explicit_provider(self):
+        """**关键守卫**：agent 可用时，显式设了 `providerLlm` 也**不许**抢走纪要。
+
+        原判据是"`providerLlm` 非空就强制直连"，但 `""` 与 `"echo-auto"` 的生效 provider
+        完全一样（`default_id("llm") == "echo-auto"`）—— 于是"在面板里选了 ECHO AUTO"
+        会静默把纪要从 agent 切到直连（2026-09-20 实测踩到）。
+        """
         fake = _FakeLlm()
-        with self._settings("openai-llm"), \
-                patch.object(meeting, "_llm_provider_for_summary", lambda: (fake, "openai-llm")):
-            use, why = meeting.direct_llm_decision()
-        self.assertTrue(use)
-        self.assertIn("openai-llm", why)
+        for chosen in ("openai-llm", "echo-auto"):
+            with self._settings(chosen), \
+                    patch("app.manager.dsh_ready", lambda: True), \
+                    patch.object(meeting, "_llm_provider_for_summary", lambda: (fake, chosen)):
+                use, why = meeting.direct_llm_decision()
+            self.assertFalse(use, "providerLlm=%r 时也不该绕过 agent" % chosen)
+            self.assertIn("agent", why)
 
     def test_agent_available_keeps_the_old_path(self):
         with self._settings(""), \
@@ -111,12 +122,23 @@ class DecisionTests(unittest.TestCase):
         self.assertFalse(use, "两边都不可用时保持老路（错误由原路径报）")
         self.assertIn("没有可用", why)
 
-    def test_explicit_choice_that_is_broken_reports_reason(self):
+    def test_provider_choice_no_longer_participates_in_routing(self):
+        """`providerLlm` 已不再参与这条路的路由（老判据 "非空就强制直连" 已删）。
+
+        agent 可用时，无论这个设置是空、是坏的（ghost）、还是路由（echo-auto），结果都一样。
+        """
+        for chosen in ("", "ghost", "echo-auto", "openai-llm"):
+            with self._settings(chosen), \
+                    patch("app.manager.dsh_ready", lambda: True):
+                use, why = meeting.direct_llm_decision()
+            self.assertFalse(use, "providerLlm=%r 不该影响判定" % chosen)
+        # agent 不可用时仍然认 provider（P5 的兜底）
         with self._settings("ghost"), \
+                patch("app.manager.dsh_ready", lambda: False), \
                 patch.object(meeting, "_llm_provider_for_summary",
                              lambda: (None, "没有可用的 LLM provider")):
             use, why = meeting.direct_llm_decision()
-        self.assertFalse(use)
+        self.assertFalse(use, "兜底 provider 取不到时保持 agent 路（由原路径报错）")
         self.assertTrue(why)
 
 

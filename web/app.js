@@ -3093,8 +3093,10 @@ function wizRenderAccel(host) {
    灵活扩展），**不推荐**直连大模型。所以这一步的主线是"把智能体准备起来"，入口指向第 7 步；
    直连 AI 服务收进折叠区当兜底。
 
-   为什么不能"填了地址就自动算启用"：`providerLlm` 一旦非空，`meeting.direct_llm_decision()`
-   的第 1 条判据会**强制**纪要走直连、把智能体踢开（见 app/wizard.py 的 `llm_provider_id`）。 */
+   为什么不能"填了地址就自动算启用"：`providerLlm` 是个**全局**开关（别的功能也读它），
+   而且纪要在 `meeting.direct_llm_decision()` 里是 **agent-first** —— 有智能体就走智能体，
+   直连只在"没有智能体"时生效。向导不该因为用户随手填了地址，就替他选定"没有智能体时
+   用哪个直连 provider"。 */
 function wizRenderLlm(host) {
   const agents = (_wizEnv && _wizEnv.agents) || {};
   const harness = agents.harness || {}, desk = agents.dsh || {};
@@ -3113,7 +3115,7 @@ function wizRenderLlm(host) {
      <label class="wiz-opt ${direct ? "on" : ""}">
        <input type="checkbox" data-wizdirect="1" ${direct ? "checked" : ""}>
        <span class="wiz-opt-body"><span class="wiz-opt-name">没有智能体？直连一个 AI 服务（不推荐）</span>
-       <span class="muted">这条路只能写纪要：<b>归档和语音指令仍然需要智能体</b>。打开后会强制纪要走直连。</span></span>
+       <span class="muted">这条路只能写纪要：<b>归档和语音指令仍然需要智能体</b>。只在你没有智能体时生效。</span></span>
      </label>
      <div id="wizDirectBox" class="${direct ? "" : "hidden"}">
        <div class="wiz-fields">

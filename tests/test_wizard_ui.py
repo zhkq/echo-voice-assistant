@@ -61,8 +61,9 @@ class WizardUiWiringTests(unittest.TestCase):
         """S6 的主线是**智能体**：纪要、归档、语音指令都靠它（用户 2026-09-20 定调），
         直连大模型只做**折叠兜底**，而且必须**显式打开**才生效。
 
-        为什么这条重要：`providerLlm` 一旦非空，`meeting.direct_llm_decision()` 会强制
-        纪要走直连、把智能体踢开 —— 所以"填了地址就自动启用"是不能接受的。
+        为什么这条重要：`providerLlm` 是个**全局**开关（别的功能也读），纪要在
+        `meeting.direct_llm_decision()` 里又是 agent-first —— 向导不该因为用户随手填了
+        地址，就替他选定"没有智能体时用哪个直连 provider"。
         """
         block = self.js[self.js.index("function wizRenderLlm"):]
         block = block[:block.index("\n}\n")]
