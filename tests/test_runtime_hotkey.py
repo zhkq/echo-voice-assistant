@@ -71,6 +71,18 @@ def _patch_settings_get(mapping, default=None):
     return patch.object(settings, "get", side_effect=_get)
 
 
+def _patch_active_port(port):
+    """把「实际监听端口」钉死——**凡是用例要断言 URL 里的端口，就必须带上这个**。
+
+    `runtime` 开面板/边条取的是 `ports.active_port(settings.serverPort)`：**活动**端口，
+    不是配置端口（ECHO 让位后 `echo-port.txt` 才是权威，理由见 `app/ports.py::active_port`
+    里的 2026-09-20 事故）。只打 `settings.get` 会漏到跑测试这台机器的
+    `data/echo-port.txt`：开发机上写着 18060，于是断言 8970 的用例变红（2026-09-21 真实
+    拦到 3 个），而恰好断言 18060 的用例只是**碰巧**过 —— 那是环境泄漏，不是被测行为。
+    """
+    return patch.object(runtime.ports, "active_port", return_value=port)
+
+
 class FacadeTests(unittest.TestCase):
     """`app/hotkey.py` 是门面：必须转发到当前平台的实现（P3 契约）。"""
 
@@ -421,15 +433,17 @@ class SidebarLifecycleTests(unittest.TestCase):
     def test_spawn_arguments_and_flags_are_pinned(self):
         exe = self._make_exe("sidebar", "bin", "Release", "net7.0-windows", "win-x64",
                              "echo-sidebar.exe")
+        # 首选端口 8970、活动端口 8971：边条必须开在**活动**端口上（见 _patch_active_port）。
         with patch.object(runtime, "BASE_DIR", self.tmp), \
                 patch.object(runtime, "sidebar_exe_path", return_value=exe), \
                 patch.object(runtime.subprocess, "Popen") as popen, \
-                _patch_settings_get({"serverPort": 8970}):
+                _patch_settings_get({"serverPort": 8970}), \
+                _patch_active_port(8971):
             self.assertTrue(runtime._spawn_sidebar(collapsed=True))
         args, kwargs = popen.call_args
         argv = args[0]
         self.assertEqual(argv[0], exe)
-        self.assertIn("--url=http://127.0.0.1:8970/", argv)
+        self.assertIn("--url=http://127.0.0.1:8971/", argv)
         self.assertIn("--width=450", argv)
         self.assertIn("--collapsed", argv)
         self.assertEqual(kwargs["cwd"], os.path.dirname(exe))
@@ -484,7 +498,8 @@ class SidebarLifecycleTests(unittest.TestCase):
 
 
 class PanelWindowTests(unittest.TestCase):
-    """打开整窗：URL 用配置端口、1.5 秒去抖、优先 Chromium --app。"""
+    """打开整窗：URL 用**活动**端口（echo-port.txt 权威，不是配置里的首选端口）、1.5 秒去抖、
+    优先 Chromium --app。"""
 
     def setUp(self):
         runtime._panel_last_open = 0.0
@@ -497,21 +512,39 @@ class PanelWindowTests(unittest.TestCase):
         return types.SimpleNamespace(
             windll=types.SimpleNamespace(shell32=types.SimpleNamespace(ShellExecuteW=_exec)))
 
-    def test_uses_configured_port_and_default_browser(self):
+    def test_uses_active_port_and_default_browser(self):
         calls = []
         with patch.dict(sys.modules, {"ctypes": self._fake_ctypes(calls)}), \
                 patch.object(runtime.echo_platform, "chromium_candidates", return_value=[]), \
-                _patch_settings_get({"serverPort": 18060, "panelOpenMode": "app"}):
+                _patch_settings_get({"serverPort": 18060, "panelOpenMode": "app"}), \
+                _patch_active_port(18060):
             self.assertTrue(runtime.open_panel_window())
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0]["target"], "http://127.0.0.1:18060/")
         self.assertIsNone(calls[0]["params"])
 
+    def test_url_uses_the_active_port_not_the_configured_one(self):
+        """让位场景（2026-09-20 事故）：ECHO 从 8970 让位到 8971，面板若仍按配置的 8970
+        打开，页面会渲染出来但所有请求失败（点按钮报 "Load failed"）。"""
+        exe = os.path.join(tempfile.gettempdir(), "echo-fake-chrome-reloc.exe")
+        with open(exe, "wb") as fh:
+            fh.write(b"x")
+        self.addCleanup(os.remove, exe)
+        calls = []
+        with patch.dict(sys.modules, {"ctypes": self._fake_ctypes(calls)}), \
+                patch.object(runtime.echo_platform, "chromium_candidates", return_value=[exe]), \
+                _patch_settings_get({"serverPort": 8970, "panelOpenMode": "app"}), \
+                _patch_active_port(8971):
+            self.assertTrue(runtime.open_panel_window())
+        self.assertEqual(calls[0]["target"], exe)
+        self.assertEqual(calls[0]["params"], "--app=http://127.0.0.1:8971/")
+
     def test_second_call_within_debounce_is_ignored(self):
         calls = []
         with patch.dict(sys.modules, {"ctypes": self._fake_ctypes(calls)}), \
                 patch.object(runtime.echo_platform, "chromium_candidates", return_value=[]), \
-                _patch_settings_get({"serverPort": 18060, "panelOpenMode": "app"}):
+                _patch_settings_get({"serverPort": 18060, "panelOpenMode": "app"}), \
+                _patch_active_port(18060):
             self.assertTrue(runtime.open_panel_window())
             self.assertFalse(runtime.open_panel_window(), "1.5 秒内的重复触发要忽略")
         self.assertEqual(len(calls), 1)
@@ -526,7 +559,8 @@ class PanelWindowTests(unittest.TestCase):
             with patch.dict(sys.modules, {"ctypes": self._fake_ctypes(calls)}), \
                     patch.object(runtime.echo_platform, "chromium_candidates",
                                  return_value=[exe]), \
-                    _patch_settings_get({"serverPort": 8970, "panelOpenMode": "app"}):
+                    _patch_settings_get({"serverPort": 8970, "panelOpenMode": "app"}), \
+                    _patch_active_port(8970):
                 self.assertTrue(runtime.open_panel_window())
             self.assertEqual(calls[0]["target"], exe)
             self.assertEqual(calls[0]["params"], "--app=http://127.0.0.1:8970/")
@@ -538,7 +572,8 @@ class PanelWindowTests(unittest.TestCase):
         with patch.dict(sys.modules, {"ctypes": self._fake_ctypes(calls)}), \
                 patch.object(runtime.echo_platform, "chromium_candidates",
                              return_value=["X:\\chrome.exe"]), \
-                _patch_settings_get({"serverPort": 8970, "panelOpenMode": "browser"}):
+                _patch_settings_get({"serverPort": 8970, "panelOpenMode": "browser"}), \
+                _patch_active_port(8970):
             self.assertTrue(runtime.open_panel_window())
         self.assertEqual(calls[0]["target"], "http://127.0.0.1:8970/")
 
