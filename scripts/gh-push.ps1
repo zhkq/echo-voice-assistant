@@ -49,6 +49,10 @@ $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
 Set-Location $root
 
+# Set when the pre-push hook rejects the push (identity allowlist, see .githooks/pre-push).
+# That verdict is client-side and deterministic, so IP rotation and retries cannot change it.
+$script:HookBlocked = $false
+
 $repoUrl = 'https://github.com/zhkq/echo-voice-assistant.git'
 
 # GitHub front IPs (they rotate - always probe, never trust a remembered one).
@@ -109,6 +113,7 @@ function Invoke-Push([string]$resolve, [string]$branch) {
         $lines = & git @cfg push -u origin $branch --progress 2>&1
         $code = $LASTEXITCODE
         foreach ($line in $lines) { Write-Host $line }
+        if (("$lines") -match 'push blocked') { $script:HookBlocked = $true }
         return $code
     } finally {
         $ErrorActionPreference = $prev
@@ -173,6 +178,7 @@ function Invoke-PushViaProxy([int]$port, [string]$branch) {
         $lines = & git @cfg push -u origin $branch --progress 2>&1
         $code = $LASTEXITCODE
         foreach ($line in $lines) { Write-Host $line }
+        if (("$lines") -match 'push blocked') { $script:HookBlocked = $true }
         return $code
     } finally { $ErrorActionPreference = $prev }
 }
@@ -293,6 +299,14 @@ for ($attempt = 1; $attempt -le $Retries; $attempt++) {
         $secs = [int]((Get-Date) - $started).TotalSeconds
         Write-Host "push OK in ${secs}s" -ForegroundColor Green
         exit 0
+    }
+    if ($script:HookBlocked) {
+        # Nothing about the network is wrong - the repo itself refused the push, so stop
+        # instead of burning every remaining IP and attempt on the same deterministic verdict.
+        Write-Host ''
+        Write-Host 'the local git hook rejected this push (see its message above) - the network is fine,' -ForegroundColor Red
+        Write-Host 'so rotating IPs or retrying cannot help. Fix the commits, then re-run.' -ForegroundColor Red
+        exit 1
     }
     Write-Host "direct attempt $attempt failed (git exit $code); trying the local CONNECT proxy" -ForegroundColor Yellow
     $proxyTried = $false
