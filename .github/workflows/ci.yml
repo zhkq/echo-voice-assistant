@@ -112,6 +112,41 @@ jobs:
           tests.test_ports
           tests.test_mac_sidebar
 
+      # 安装脚本的语法只能在真 mac 上卡：开发机（Windows 上的 Git Bash）是 bash 5.x，
+      # 而**同事机器上的是系统自带的 3.2** —— 关联数组、${x,,}、mapfile 这些在 5.x 下
+      # 全绿、到 3.2 直接报错。所以这里用 /bin/bash（3.2）而不是 PATH 里的那个。
+      - name: Install shell scripts must parse under the system bash (3.2)
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "/bin/bash -> $(/bin/bash --version | head -1)"
+          # 显式用 /bin/bash：macOS 自带的就是 3.2，正是同事机器上的那个
+          for f in mac/*.sh .dsh/skills/echo-install/scripts/*.sh; do
+            echo "--- $f"
+            /bin/bash -n "$f"
+          done
+          # 装了 shellcheck 就顺手跑（runner 一般自带；没有就跳过，不假装检查过）
+          if command -v shellcheck >/dev/null 2>&1; then
+            shellcheck -S warning mac/*.sh .dsh/skills/echo-install/scripts/*.sh
+          else
+            echo "no shellcheck on this runner - skipped"
+          fi
+
+      - name: macOS install script self-test (no network, no Homebrew)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # 只跑「不碰网络、不碰 brew」的部分：参数校验、错误路径、引擎映射表。
+          # 目的是卡住"表漂了"和"错误路径没给指引"，真正的安装不在 CI 里跑。
+          f=.dsh/skills/echo-install/scripts/echo-install-components.sh
+          /bin/bash "$f" --help >/dev/null
+          if /bin/bash "$f" 2>/dev/null; then
+            echo "::error::缺 --dest 时应当失败"; exit 1
+          fi
+          if /bin/bash "$f" --dest /no/such/dir 2>/dev/null; then
+            echo "::error::目录不存在时应当失败"; exit 1
+          fi
+
   windows-smoke:
     name: windows smoke (full deps)
     if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'

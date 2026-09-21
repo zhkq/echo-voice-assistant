@@ -1,4 +1,4 @@
-# =====================================================================
+﻿# =====================================================================
 # build-package.ps1 - build an ECHO delivery package from this tree
 #
 # WHY THIS EXISTS
@@ -51,6 +51,11 @@ param(
     [string]$Version = '',
     [string]$Component = '',
     [string[]]$Components = @(),
+    # 目标平台的标签，用来命名包与写 manifest.json 的 platform（默认按**构建机**推断）。
+    # 为什么需要它：macOS 的交付包只能在 mac 上打（sidebar 是 Windows .NET 产物、打包脚本是
+    # PowerShell），而我们要在 Windows 上给同事准备 mac 资料夹 —— 没有这个参数，包名与清单
+    # 会永远写着 win-x64（2026-09-21 加）。取值形如 macos-arm64 / macos-universal。
+    [string]$Platform = '',
     [switch]$DryRun
 )
 
@@ -91,6 +96,14 @@ $plat = "win-$arch"
 if ($PSVersionTable.PSVersion.Major -ge 6) {
     if ($IsMacOS) { $plat = "macos-$arch" }
     elseif ($IsLinux) { $plat = "linux-$arch" }
+}
+# -Platform 显式覆盖：让 Windows 上也能产出"给 mac 用"的资料夹（包名与 manifest 的 platform
+# 都要标对，否则同事/agent 会以为拿到的是 Windows 包）。
+if ($Platform) {
+    if ($Platform -notmatch '^[a-z0-9]+-[a-z0-9]+$') {
+        Die ("-Platform 形如 macos-arm64 / macos-universal，收到: {0}" -f $Platform)
+    }
+    $plat = $Platform
 }
 Say "platform: $plat"
 
@@ -315,6 +328,13 @@ $forbiddenPath = @(
     '(^|/)logs?(/|$).*\.log$',
     '(^|/)dist(/|$)'
 )
+# mac 包不带 Windows 边条的 .NET 构建产物：sidebar/bin/ 里是 net7.0-windows/win-x64 的
+# 预编译 exe 与 WebView2 DLL（约 4 MB），对 mac 毫无用处（mac 的浮动框是 mac/sidebar 下的
+# Swift，用 Xcode 现编）。源码（.csproj/Program.cs）保留，将来在 Windows 上重建还要用。
+if ($plat -like 'macos*') {
+    $forbiddenPath += '(^|/)sidebar/bin/'
+    Say 'macos pack: excluding sidebar/bin (Windows .NET build output)'
+}
 # Content never packed: scan text files for these.
 # The literals are split on purpose so this script passes its own scan - it has to
 # live in the same tree it packs. Note there is deliberately NO rule for the string
