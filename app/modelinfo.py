@@ -196,10 +196,15 @@ CATALOG = [
          purpose="流式转写；唤醒词功能也用它", size="~189 MB",
          target="models/sherpa-onnx-streaming/（encoder*/decoder*/joiner*.onnx + bpe.model + tokens.txt）",
          source="auto", ref="csukuangfj/sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20",
+         # ModelScope 上同一个模型在作者本人的账号下（pkufool = csukuangfj 的 MS 账号）。
+         # 优先走它：公司网会用代理拦 hf-mirror 的证书，同事为此被迫设 HF_HUB_VERIFY=0
+         # 才能下这个模型（2026-09-21 实测）。探过：仓库存在且 5 个必需文件齐全。
+         ms_ref="pkufool/sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20",
          allow=["encoder-epoch-99-avg-1.int8.onnx", "decoder-epoch-99-avg-1.int8.onnx",
                 "joiner-epoch-99-avg-1.int8.onnx", "bpe.model", "tokens.txt"],
-         how="上游是 HF 上的 k2-fsa 模型（国内走 hf-mirror 镜像）。点下载只拉 int8 三件 + bpe.model + "
-             "+ tokens.txt（约 189MB）直接落到该目录；代码用前缀匹配认文件，文件名不用改。"),
+         how="优先从 ModelScope 拉（sherpa-onnx 官方也在那边镜像），失败才回落 hf-mirror。"
+             "只拉 int8 三件 + bpe.model + tokens.txt（约 189MB）直接落到该目录；"
+             "代码用前缀匹配认文件，文件名不用改。"),
 ]
 
 for _n in ("tiny", "base", "small", "medium", "large-v3"):
@@ -210,7 +215,10 @@ for _n in ("tiny", "base", "small", "medium", "large-v3"):
         size=WHISPER_SIZES[_n],
         target=f"models/faster-whisper/{_n}/（须含 model.bin）或 HF 缓存 models/hub/models--Systran--faster-whisper-{_n}/",
         source="auto", ref=f"Systran/faster-whisper-{_n}",
-        how="点下载会从 HF 镜像（hf-mirror.com）拉到 models/hub 缓存（stt 按名字加载时直接命中该缓存）；"
+        # Systran 官方在 ModelScope 也有同名仓库（实测 base 档 200，且 model.bin /
+        # config.json / tokenizer.json / vocabulary.txt 齐全）—— 同样优先走它，绕开证书问题。
+        ms_ref=f"Systran/faster-whisper-{_n}",
+        how="优先从 ModelScope 拉（Systran 官方镜像），失败才回落 HF 镜像（hf-mirror.com）；"
             "也可以从源机拷 models/faster-whisper/<档> 目录过来。",
         cmd=f'python -c "from faster_whisper import WhisperModel; WhisperModel(\'{_n}\')"'))
 
@@ -344,6 +352,32 @@ def _downloaded_mb(mid):
     return sum(_dir_mb(p) for p in _watch_paths(mid) if os.path.isdir(p))
 
 
+def _snapshot(ms_id: str = "", hf_id: str = "", local_dir=None, allow=None) -> str:
+    """按「先 ModelScope、失败再 HF」的顺序拉一个模型仓库，返回实际用的源。
+
+    为什么优先 ModelScope（2026-09-21 实测反馈）：公司网用代理拦 hf-mirror 的证书，
+    同事被逼到设 `HF_HUB_VERIFY=0` 才下得了 sherpa —— 那是**关掉 TLS 校验**，不该是交付路径。
+    而 sherpa 与 whisper 在 ModelScope 上都有官方镜像（`pkufool/…` / `Systran/…`，实测文件齐全），
+    走它根本不必碰证书。HF 仍然作为回落：万一 ModelScope 上没有或临时挂了。
+    """
+    errs = []
+    if ms_id:
+        try:
+            from modelscope import snapshot_download as ms_dl
+            ms_dl(ms_id, local_dir=local_dir, allow_patterns=allow)
+            return "modelscope"
+        except Exception as e:                       # noqa: BLE001 - 要把原因带上去
+            errs.append("ModelScope(%s): %s" % (ms_id, e))
+    if hf_id:
+        try:
+            from huggingface_hub import snapshot_download as hf_dl
+            hf_dl(hf_id, local_dir=local_dir, allow_patterns=allow)
+            return "huggingface"
+        except Exception as e:                       # noqa: BLE001
+            errs.append("HF(%s): %s" % (hf_id, e))
+    raise RuntimeError("；".join(errs) or "没有可用的下载源")
+
+
 def _download_worker(entry):
     mid = entry["id"]
     expected = _EXPECTED_MB.get(mid) or 0
@@ -373,31 +407,29 @@ def _download_worker(entry):
         pass
 
     try:
+        source_used = ""
         if mid == "sensevoice":
-            from modelscope import snapshot_download
-            snapshot_download("iic/SenseVoiceSmall")
+            source_used = _snapshot(ms_id="iic/SenseVoiceSmall")
             try:
-                snapshot_download("iic/speech_fsmn_vad_zh-cn-16k-common-pytorch")
+                _snapshot(ms_id="iic/speech_fsmn_vad_zh-cn-16k-common-pytorch")
             except Exception as e:
                 print(f"[modelinfo] VAD 模型下载失败（加载时会再试）: {e}")
         elif mid == "qwen3asr":
-            from modelscope import snapshot_download
-            snapshot_download("Qwen/Qwen3-ASR-0.6B")
-            snapshot_download("Qwen/Qwen3-ForcedAligner-0.6B")
+            source_used = _snapshot(ms_id="Qwen/Qwen3-ASR-0.6B")
+            _snapshot(ms_id="Qwen/Qwen3-ForcedAligner-0.6B")
         elif mid.startswith("whisper-"):
-            tier = mid.split("-", 1)[1]
-            from huggingface_hub import snapshot_download
-            snapshot_download(f"Systran/faster-whisper-{tier}")
+            source_used = _snapshot(ms_id=entry.get("ms_ref") or "", hf_id=entry["ref"])
         elif mid == "sherpa":
             # 只拉代码认的那几个文件名，直接落到目标目录（local_dir），省掉 400MB 的 fp32 与测试音频
-            from huggingface_hub import snapshot_download
-            snapshot_download(entry["ref"],
-                              local_dir=os.path.join(models_dir(), "sherpa-onnx-streaming"),
-                              allow_patterns=entry.get("allow") or None)
+            source_used = _snapshot(ms_id=entry.get("ms_ref") or "", hf_id=entry["ref"],
+                                    local_dir=os.path.join(models_dir(), "sherpa-onnx-streaming"),
+                                    allow=entry.get("allow") or None)
         _JOBS[mid].update(status="done", percent=100,
-                          message="下载完成", done_at=time.strftime("%H:%M:%S"),
+                          message=("下载完成（来自 %s）" % source_used) if source_used else "下载完成",
+                          source=source_used,
+                          done_at=time.strftime("%H:%M:%S"),
                           downloaded_mb=_downloaded_mb(mid))
-        print(f"[modelinfo] {mid} 下载完成，{_downloaded_mb(mid)} MB")
+        print(f"[modelinfo] {mid} 下载完成，{_downloaded_mb(mid)} MB（源：{source_used or '本地脚本'}）")
     except Exception as e:
         _JOBS[mid].update(status="failed", message=f"{type(e).__name__}: {e}",
                           done_at=time.strftime("%H:%M:%S"))
@@ -471,3 +503,29 @@ def jobs():
         j["active"] = (mid == active)
         out[mid] = j
     return {"active": active, "items": out}
+
+
+#: 下载任务的状态词（归一后）。生产端只写 running/done/failed，
+#: 但调用方历史上有人判断 "error" —— 见 job_state() 的说明。
+JOB_STATES = ("queued", "running", "done", "failed")
+
+
+def job_state(job) -> str:
+    """把一条下载任务归一成 ``queued | running | done | failed``。
+
+    为什么要有它（2026-09-21 同事实测）：``_download_worker`` 失败时写的是 **"failed"**，
+    而向导的 ``execution_state`` 判断的是 **"error"** —— 两边词表不一致，于是**下载失败
+    在面板上显示成"排队中"，永远不动**（用户看到 qwen3asr 卡在"正在准备中/排队中"）。
+    技能里的两份等待逻辑（.ps1 / .sh）也各自踩了同一个坑。
+
+    所以：**所有调用方都走这个函数**，别再自己比对字面量。
+    """
+    s = str((job or {}).get("status") or "").strip().lower()
+    if s in ("failed", "error", "fail"):
+        return "failed"
+    if s in ("running", "downloading"):
+        return "running"
+    if s in ("done", "ok", "ready"):
+        return "done"
+    return "queued"
+

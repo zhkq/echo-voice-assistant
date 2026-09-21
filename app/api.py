@@ -979,6 +979,16 @@ class WizardChoicesIn(BaseModel):
     choices: dict = {}
 
 
+class InstallReportIn(BaseModel):
+    """技能装完登记的内容（结构由技能决定，服务端只做**宽松**校验）。
+
+    典型字段：``engines``（列表）、``wake`` / ``diarize``（布尔）、``agent``（名字）、
+    ``models``（列表）、``dirs``（三处路径）、``versions``（python/echo 版本）、``notes``。
+    服务端不强制 schema：技能可能先于 ECHO 升级，多写字段不该被拒。
+    """
+    report: dict = {}
+
+
 @router.post("/wizard/preview")
 def api_wizard_preview(body: WizardChoicesIn, _auth=Depends(optional_auth)):
     """确认页的数据：把选择展开成"将下载什么、合计多大、将写哪些设置"。
@@ -1035,6 +1045,35 @@ def api_wizard_finalize(_auth=Depends(optional_auth)):
     """
     from app import wizard
     return {"installed": wizard.finalize()}
+
+
+# ---------------------------------------------------------------- 安装状态（技能优先，2026-09-21）
+# 安装现在由**技能**在用户自己的 agent 里完成（docs/安装-技能优先.md）。这两个接口是技能与
+# 面板的**共用真值**：技能装完登记（/report），面板读它决定"要不要提示还没装完"（/state）。
+# 刻意不叫 wizard/*：向导只是众多调用方之一，安装状态本身与向导无关。
+
+
+@router.get("/install/state")
+def api_install_state(_auth=Depends(optional_auth)):
+    """这台机器装成什么样了：登记过没有 / 选了什么 / 还缺什么。
+
+    面板启动时问它（比 ``/api/wizard/first-run`` 重，但**不再强制进向导**，所以不必卡在
+    800ms 的赛跑里）。技能也用它做最终自检 —— 一套判断两处复用。
+    """
+    from app import install_state
+    return install_state.state()
+
+
+@router.post("/install/report")
+def api_install_report(body: InstallReportIn, _auth=Depends(optional_auth)):
+    """技能装完登记："我装了哪些、什么版本、装在哪"。
+
+    **不写设置值**（报告是明文，可能被拷来拷去）：只记组件、模型、版本、目录与人话备注。
+    写完 ``install_state.declared()`` 就为真 —— 面板不再提示"还没装完"，也不再自动进向导。
+    """
+    from app import install_state
+    saved = install_state.save_report(body.report or {})
+    return {"ok": True, "saved": saved, "state": install_state.state()}
 
 
 # ---------------------------------------------------------------- 能力 provider（P5 / D25）

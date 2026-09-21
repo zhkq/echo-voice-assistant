@@ -254,22 +254,24 @@ function Step02-Source {
     $sizeGb = [math]::Round((Get-Item $script:ZipPath).Length / 1GB, 2)
     Ok ("交付包: {0}  ({1} GB)" -f $script:ZipPath, $sizeGb)
     # 探测 zip 顶层目录。
-    # 不要用 `tar -tf` 的输出：Invoke-Native 会把多行压成一行（($keep -join ' ')），
-    # 于是"取第一行 → 取第一个路径段"必然拿到排序最靠前的那一项；本包内 `.dsh/...`
-    # 恰好排在最前，实测把默认安装目录算成了 D:\.dsh（2026-09-20）。
-    # 改成读 zip 中央目录：快，且不依赖外部命令。
+    # **不用 Add-Type / System.IO.Compression**：受限语言模式（ConstrainedLanguage，或公司的
+    # WDAC/AppLocker 策略）会把 Add-Type 拦掉 —— 2026-09-21 同事就被拦在这里，手改脚本删掉
+    # 那一行才能继续装。改用系统自带的 tar（Win10 1803+，本脚本解压本来就用它）列目录。
+    # 输出要**重定向到文件再逐行读**：不要走 Invoke-Native（它把多行压成一行，2026-09-20 踩过，
+    # 结果把默认安装目录算成了 D:\.dsh）。下面也刻意不用 .NET 方法调用，全用 PowerShell 运算符。
     $topDirs = @()
-    $z = $null
+    $listFile = Join-Path $env:TEMP ("echo-ziplist-$PID-" + (Get-Random) + ".txt")
     try {
-        Add-Type -AssemblyName System.IO.Compression.FileSystem
-        $z = [System.IO.Compression.ZipFile]::OpenRead($script:ZipPath)
-        $topDirs = @($z.Entries |
-            ForEach-Object { ($_.FullName -replace '\\', '/').Split('/')[0] } |
-            Where-Object { $_ } |
-            Sort-Object -Unique)
+        & tar -tf $script:ZipPath > $listFile 2>$null
+        if (Test-Path $listFile) {
+            $topDirs = @(Get-Content $listFile -ErrorAction SilentlyContinue |
+                ForEach-Object { (($_ -replace '\\', '/') -split '/')[0] } |
+                Where-Object { $_ } |
+                Sort-Object -Unique)
+        }
     } catch {
         Warn ("读取交付包目录失败: {0}" -f $_.Exception.Message)
-    } finally { if ($z) { $z.Dispose() } }
+    } finally { Remove-Item $listFile -Force -ErrorAction SilentlyContinue }
     if ($topDirs -contains 'ECHO') {
         $script:ZipTop = 'ECHO'
         Info ("zip 顶层目录: ECHO（与它同级的还有 {0} 项）" -f ($topDirs.Count - 1))

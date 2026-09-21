@@ -873,6 +873,18 @@ def execute_plan(plan: dict = None, *, choices: dict = None,
     return result
 
 
+def _job_state(job) -> str:
+    """下载任务的归一状态。真身在 ``modelinfo.job_state()``（那里写了为什么必须有它：
+    生产端写 "failed" 而这里曾判断 "error"，导致失败被显示成"排队中"）。"""
+    try:
+        from app import modelinfo
+        return modelinfo.job_state(job)
+    except Exception:
+        s = str((job or {}).get("status") or "").strip().lower()
+        return {"failed": "failed", "error": "failed",
+                "running": "running", "done": "done"}.get(s, "queued")
+
+
 def execution_state(plan_file: str = "") -> dict:
     """执行相的状态：把计划里的每项 + 真实下载进度（``modelinfo.jobs``）合成一份给人看的东西。
 
@@ -884,20 +896,27 @@ def execution_state(plan_file: str = "") -> dict:
     jobs = {}
     try:
         from app import modelinfo
-        jobs = modelinfo.jobs() or {}
+        # ⚠ `modelinfo.jobs()` 返回的是**包装**结构 `{active, items:{id: job}}`，这里要的是
+        # 里面那张表。原先直接写 `jobs.get(mid)` —— 在包装字典上找 id 永远找不到，
+        # 于是**每一项都显示"排队中"**，与真实进度无关（2026-09-21 同事实测：qwen3asr
+        # 无论成功还是失败都卡在"正在准备中/排队中"，就是这个）。
+        jobs = (modelinfo.jobs() or {}).get("items") or {}
     except Exception:
         jobs = {}
 
     def status_of(mid: str) -> dict:
         job = jobs.get(mid) or {}
-        state = str(job.get("status") or "")
+        # **走归一化，别自己比对字面量**：worker 写的是 "failed"，这里原来判断 "error"，
+        # 于是下载失败被显示成"排队中"（2026-09-21 同事实测 qwen3asr 卡住不出来）。
+        state = _job_state(job)
         if state == "running":
             return {"state": "downloading", "text": "正在下载",
                     "percent": job.get("percent"), "downloadedMb": job.get("downloaded_mb")}
         if state == "done":
             return {"state": "done", "text": "好了", "percent": 100}
-        if state == "error":
-            return {"state": "error", "text": "没成", "message": str(job.get("error") or "")}
+        if state == "failed":
+            return {"state": "error", "text": "没成",
+                    "message": str(job.get("message") or job.get("error") or "下载失败")}
         return {"state": "queued", "text": "排队中", "percent": 0}
 
     skipped = {r.get("modelId") for r in (execution.get("skipped") or [])}

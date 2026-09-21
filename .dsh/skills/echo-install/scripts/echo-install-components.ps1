@@ -57,14 +57,14 @@ function Step([string]$m) { Write-Host ''; Write-Host "== $m" -ForegroundColor C
 # 依据：app/audio/stt.py 的 _parse_choice()（sttModel 取值 = sherpa|sensevoice|qwen3asr|whisper 档名）
 #       与 app/components.py 的清单（model_id / 体积 / 来源）。
 $ENGINE_MAP = @{
-    'sherpa'           = @{ pip = @('sherpa-onnx');                       model = 'sherpa';           stt = 'sherpa' }
-    'whisper-tiny'     = @{ pip = @('faster-whisper', 'huggingface-hub'); model = 'whisper-tiny';     stt = 'tiny' }
-    'whisper-base'     = @{ pip = @('faster-whisper', 'huggingface-hub'); model = 'whisper-base';     stt = 'base' }
-    'whisper-small'    = @{ pip = @('faster-whisper', 'huggingface-hub'); model = 'whisper-small';    stt = 'small' }
-    'whisper-medium'   = @{ pip = @('faster-whisper', 'huggingface-hub'); model = 'whisper-medium';   stt = 'medium' }
-    'whisper-large-v3' = @{ pip = @('faster-whisper', 'huggingface-hub'); model = 'whisper-large-v3'; stt = 'large-v3' }
-    'sensevoice'       = @{ pip = @('funasr', 'modelscope', 'torch');     model = 'sensevoice';       stt = 'sensevoice' }
-    'qwen3asr'         = @{ pip = @('transformers', 'modelscope', 'torch'); model = 'qwen3asr';       stt = 'qwen3asr' }
+    'sherpa'           = @{ pip = @('sherpa-onnx');                       model = 'sherpa';           stt = 'sherpa';   module = 'sherpa_onnx' }
+    'whisper-tiny'     = @{ pip = @('faster-whisper', 'huggingface-hub'); model = 'whisper-tiny';     stt = 'tiny';     module = 'faster_whisper' }
+    'whisper-base'     = @{ pip = @('faster-whisper', 'huggingface-hub'); model = 'whisper-base';     stt = 'base';     module = 'faster_whisper' }
+    'whisper-small'    = @{ pip = @('faster-whisper', 'huggingface-hub'); model = 'whisper-small';    stt = 'small';    module = 'faster_whisper' }
+    'whisper-medium'   = @{ pip = @('faster-whisper', 'huggingface-hub'); model = 'whisper-medium';   stt = 'medium';   module = 'faster_whisper' }
+    'whisper-large-v3' = @{ pip = @('faster-whisper', 'huggingface-hub'); model = 'whisper-large-v3'; stt = 'large-v3'; module = 'faster_whisper' }
+    'sensevoice'       = @{ pip = @('funasr', 'modelscope', 'torch');     model = 'sensevoice';       stt = 'sensevoice'; module = 'funasr' }
+    'qwen3asr'         = @{ pip = @('transformers', 'modelscope', 'torch'); model = 'qwen3asr';       stt = 'qwen3asr'; module = 'transformers' }
 }
 
 # ---------------------------------------------------------------- 运行时 / 端口 / API
@@ -148,6 +148,22 @@ function Get-ModelState([string]$Id) {
     return $null
 }
 
+function Get-JobState($job) {
+    # 归一化下载状态。**别自己比对字面量**：worker 失败时写的是 "failed"，而这里原来判断
+    # 的是 "error" —— 于是"下载失败"被显示成"排队中"、等待逻辑一直傻等到超时
+    # （2026-09-21 同事实测：qwen3asr 下载失败，面板一直显示"正在准备中/排队中"）。
+    $s = ""
+    if ($job) { $s = ("$($job.status)").Trim().ToLower() }
+    switch ($s) {
+        'done'    { return 'done' }
+        'failed'  { return 'failed' }
+        'error'   { return 'failed' }
+        'fail'    { return 'failed' }
+        'running' { return 'running' }
+        default   { return 'queued' }
+    }
+}
+
 function Wait-Model([string]$Id) {
     $deadline = (Get-Date).AddSeconds($WaitSeconds)
     while ((Get-Date) -lt $deadline) {
@@ -155,9 +171,12 @@ function Wait-Model([string]$Id) {
             $jobs = (Invoke-Api -Path '/api/models').jobs
             $job = $null
             if ($jobs -and $jobs.PSObject.Properties.Name -contains $Id) { $job = $jobs.$Id }
-            if ($job) {
-                if ($job.status -eq 'done') { return $true }
-                if ($job.status -eq 'error') { Warn ("{0} 下载失败：{1}" -f $Id, $job.error); return $false }
+            $state = Get-JobState $job
+            if ($state -eq 'done') { return $true }
+            if ($state -eq 'failed') {
+                $why = "$($job.message)"; if (-not $why) { $why = "$($job.error)" }
+                Warn ("{0} 下载失败：{1}" -f $Id, $why)
+                return $false
             }
         } catch { }
         Start-Sleep -Seconds 5
@@ -175,6 +194,68 @@ function Install-Model([string]$Id, [string]$Label) {
     if (-not $r.ok) { Warn ("接口说：{0}" -f $r.message); return $false }
     Say '下载中（走 ModelScope / hf-mirror 镜像）…'
     return (Wait-Model $Id)
+}
+
+function Test-EngineModule([string]$Name) {
+    # 依赖到底装没装：**以 import 为准**。"pip 返回 0"不算数 —— 2026-09-21 踩过：
+    # uv 建的 venv 没有 pip，依赖一个都没装，安装器却打印了"安装完成"。
+    if (-not $Name) { return $true }
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        & $rcPy -c "import $Name" 2>&1 | Out-Null
+        return ($LASTEXITCODE -eq 0)
+    } catch { return $false }
+    finally { $ErrorActionPreference = $prev }
+}
+
+# ---------------------------------------------------------------- 智能体（标准版 harness）
+
+function Prepare-Agent {
+    # 智能体以前**不是**安装里的一步：向导只写两个设置键，harness 由 ECHO 在后台静默拉起
+    # （`npx -y @deepseek-ai/dsh`，首次要下几十 MB）—— 用户选完"标准版"看不到任何动静，
+    # 以为没生效（2026-09-21 实测反馈："选了 dsh 标准版，没看到下载提示"）。
+    # 这里把它变成**显式的一步**：查 node → 预热 npm 包（有输出）→ 后面再等它就绪。
+    if ($Agent -ne 'harness') { return $true }
+    Step '准备智能体（标准版 harness）'
+    $npx = Get-Command npx -ErrorAction SilentlyContinue
+    if (-not $npx) {
+        Warn '没找到 npx —— harness 靠 npx 起，需要本机有 Node.js'
+        Say '  装了 Node 再重跑本脚本；装了但不在 PATH 里时，把面板 → 设置 → 智能体里的'
+        Say '  「harness 启动命令」改成 npx 的全路径。'
+        return $false
+    }
+    Ok ("npx: {0}" -f $npx.Source)
+    Say '预热 npm 包（首次要从 npm 拉，几十 MB —— 这是唯一一次慢）…'
+    $code = 0
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'          # 原生命令往 stderr 写时别炸（WinPS 5.1 老坑）
+    try {
+        & $npx.Source -y '@deepseek-ai/dsh' --version 2>&1 |
+            ForEach-Object { Write-Host "      $_" -ForegroundColor DarkGray }
+        $code = $LASTEXITCODE
+    } catch {
+        Warn ("预热失败：{0}" -f $_.Exception.Message)
+        $code = 1
+    } finally { $ErrorActionPreference = $prev }
+    if ($code -eq 0) { Ok 'harness 包已就绪（npx 缓存里）' }
+    else { Warn ("预热返回 {0} —— 首次启动时 ECHO 会再试一次，可能要等 1–2 分钟" -f $code) }
+    return ($code -eq 0)
+}
+
+function Wait-Harness([int]$Seconds = 150) {
+    if ($Agent -ne 'harness') { return $true }
+    Step '等智能体就绪（写完设置后 ECHO 会自动拉起 harness）'
+    $deadline = (Get-Date).AddSeconds($Seconds)
+    while ((Get-Date) -lt $deadline) {
+        try {
+            $st = Invoke-Api -Path '/api/status' -TimeoutSec 10
+            if ($st.dsh -and $st.dsh.online -eq $true) { Ok '智能体已就绪（harness online）'; return $true }
+        } catch { }
+        Start-Sleep -Seconds 5
+    }
+    Warn ("等 {0}s 仍未就绪 —— 看 data\logs\harness.log（首次从 npm 拉包慢是常见的）" -f $Seconds)
+    return $false
 }
 
 # ---------------------------------------------------------------- 主流程
@@ -207,11 +288,25 @@ if ($Diarize) {
 if ($AccelCuda) { $pips += 'torch'; Warn 'CUDA 版 torch 体积大（约 2.5 GB），且要求 N 卡与匹配的驱动' }
 
 Install-PipDeps $pips
-
+$null = Prepare-Agent          # 先把 npm 包预热好，免得写入设置后 ECHO 拉起时干等
 Ensure-Service
 
+# 依赖没装上的引擎**不要白下模型**：装了也跑不起来，还会在自检里变成一条含糊的失败
+$skipModel = @{}
+foreach ($pair in $models) {
+    if (-not $ENGINE_MAP.ContainsKey($pair[1])) { continue }
+    $mod = $ENGINE_MAP[$pair[1]].module
+    if ($mod -and -not (Test-EngineModule $mod)) {
+        Warn ("跳过 {0} 的模型下载：依赖 {1} 没装上（先解决依赖）" -f $pair[1], $mod)
+        $skipModel[$pair[0]] = $true
+    }
+}
+
 $modelOk = @{}
-foreach ($pair in $models) { $modelOk[$pair[0]] = Install-Model $pair[0] $pair[1] }
+foreach ($pair in $models) {
+    if ($skipModel.ContainsKey($pair[0])) { $modelOk[$pair[0]] = $false; continue }
+    $modelOk[$pair[0]] = Install-Model $pair[0] $pair[1]
+}
 
 # 2) 写设置（与面板同一套键）
 Step '写入设置'
@@ -238,20 +333,57 @@ if ($values.Count -gt 0) {
     catch { Err ("写设置失败：{0}" -f $_.Exception.Message) }
 } else { Say '没有要写的设置' }
 
-# 3) 自检 + 报告
+# 3) 自检：**以 import / ready / online 为准**，有任何一项没成就非 0 退出（别假装成功）
 Step '自检'
+$failed = @()
 try {
     $st = Invoke-Api -Path '/api/status' -TimeoutSec 20
     foreach ($c in $st.components) { Say ("{0,-9} {1}" -f $c.name, $c.status) }
 } catch { Warn ("取 /api/status 失败：{0}" -f $_.Exception.Message) }
+foreach ($e in $Engines) {
+    if (-not $ENGINE_MAP.ContainsKey($e)) { continue }
+    $mod = $ENGINE_MAP[$e].module
+    if (Test-EngineModule $mod) { Ok ("{0,-18} import {1} 通过" -f $e, $mod) }
+    else { Err ("{0,-18} 依赖缺失：import {1} 失败" -f $e, $mod); $failed += $e }
+}
 foreach ($pair in $models) {
     $st2 = Get-ModelState $pair[0]
-    $flag = if ($st2 -and $st2.ready -eq $true) { '✓ 就绪' } else { '✗ 还没好' }
-    Say ("{0,-22} {1}" -f $pair[1], $flag)
+    if ($st2 -and $st2.ready -eq $true) { Ok ("{0,-18} 模型就绪" -f $pair[1]) }
+    else { Err ("{0,-18} 模型还没好" -f $pair[1]); $failed += ("%s 模型" -f $pair[1]) }
 }
+$agentOk = Wait-Harness
+if (-not $agentOk) { $failed += '智能体（harness）' }
+
+# 4) 登记安装 —— 这是"装完了"的凭据：面板据此不再提示未安装、也不再自动进向导
+Step '登记安装'
+$report = @{
+    installer = 'echo-install skill'
+    platform  = 'win32'
+    destDir   = $script:Root
+    engines   = @($Engines)
+    wake      = [bool]$Wake
+    diarize   = [bool]$Diarize
+    accelCuda = [bool]$AccelCuda
+    agent     = $Agent
+    models    = @($models | ForEach-Object { $_[0] })
+    dirs      = @{ modelsDir = $ModelsDir; meetingsDir = $MeetingsDir; notesDir = $NotesDir }
+    pip       = ($pips -join ' ')
+}
+try {
+    $null = Invoke-Api -Path '/api/install/report' -Method Post -Body @{ report = $report } -TimeoutSec 30
+    Ok '已登记（面板不会再提示"还没装完"）'
+} catch { Warn ("登记失败（不影响使用）：{0}" -f $_.Exception.Message) }
+
+# 5) 结论
 Write-Host ''
-Write-Host '  完成。剩下的：' -ForegroundColor White
-Say '1) 面板：按 Ctrl+Shift+E（或浏览器打开 http://127.0.0.1:<端口>/）'
-Say '2) 会议纪要/归档/指令需要"智能体"：面板 → 设置 → 智能体（本脚本已按 -Agent 选好；'
-Say '   harness 需要本机有 Node.js，没有就装 Node 或改用已装的 DSH 桌面版）'
-Say '3) 说话人分离要 HF 授权；CUDA 加速要 N 卡 —— 都不影响转写与纪要'
+if ($failed.Count -eq 0) {
+    Write-Host '  全部就绪。怎么开始用：' -ForegroundColor White
+    Say '1) 双击桌面「ECHO 个人助理」，面板会自动打开（也可以按 Ctrl+Shift+E）'
+    Say '2) 对着麦克风说一句试试；开完会在「会议」里看到文字稿'
+    Say '3) 以后想加能力：面板 → 能力 → 随时补（不用重装）'
+    exit 0
+}
+Write-Host ("  装完了，但**有 {0} 项没就绪** —— 别当成装好了：" -f $failed.Count) -ForegroundColor Red
+foreach ($f in $failed) { Say ("  - {0}" -f $f) }
+Say '补救：照上面的提示装依赖 / 重跑本脚本（已装好的会跳过）；也可以到 面板 → 能力 里重试。'
+exit 1

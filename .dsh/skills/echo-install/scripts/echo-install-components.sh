@@ -278,11 +278,20 @@ if mode == "model_ready":
     print("0")
 elif mode == "job_status":
     print(((d.get("jobs") or {}).get(arg) or {}).get("status") or "")
+elif mode == "job_state":
+    # 归一化：worker 失败时写的是 "failed"，判断 "error" 会让失败显示成"排队中"
+    # （2026-09-21 同事实测：qwen3asr 下载失败，面板一直显示排队中）。
+    st = str(((d.get("jobs") or {}).get(arg) or {}).get("status") or "").strip().lower()
+    print({"failed": "failed", "error": "failed", "fail": "failed",
+           "running": "running", "done": "done"}.get(st, "queued"))
 elif mode == "job_error":
-    print(((d.get("jobs") or {}).get(arg) or {}).get("error") or "")
+    j = (d.get("jobs") or {}).get(arg) or {}
+    print(j.get("message") or j.get("error") or "")
 elif mode == "components":
     for c in (d.get("components") or []):
         print("  %-12s %s" % (c.get("name", ""), c.get("status", "")))
+elif mode == "dsh_online":
+    print("1" if (d.get("dsh") or {}).get("online") else "0")
 ' "$1" "${2:-}" 2>/dev/null || true
 }
 
@@ -359,9 +368,9 @@ wait_model() {
   local id="$1" waited=0
   while [ "$waited" -lt "$WAIT_SECONDS" ]; do
     local st
-    st="$(api GET /api/models "" 20 | json_query job_status "$id")"
+    st="$(api GET /api/models "" 20 | json_query job_state "$id")"
     if [ "$st" = "done" ]; then return 0; fi
-    if [ "$st" = "error" ]; then
+    if [ "$st" = "failed" ]; then
       warn "$id 下载失败：$(api GET /api/models "" 20 | json_query job_error "$id")"
       return 1
     fi
@@ -470,12 +479,69 @@ install_pip_deps "$PIPS"
 # shellcheck disable=SC2086
 ENGINE_LIST="${ENGINE_LIST# }"
 
+# 智能体（标准版 harness）以前**不是**安装里的一步：只写两个设置键，harness 由 ECHO 在后台
+# 静默拉起（`npx -y @deepseek-ai/dsh`，首次要下几十 MB）—— 用户选完看不到任何动静
+# （2026-09-21 实测："选了 dsh 标准版，没看到下载提示"）。这里变成显式的一步。
+prepare_agent() {
+  [ "$AGENT" = "harness" ] || return 0
+  step "准备智能体（标准版 harness）"
+  if ! command -v npx >/dev/null 2>&1; then
+    warn "没找到 npx —— harness 靠 npx 起，需要本机有 Node.js"
+    say "  装了 Node 再重跑本脚本；装了但不在 PATH 里时，把面板 → 设置 → 智能体里的"
+    say "  「harness 启动命令」改成 npx 的全路径。"
+    return 1
+  fi
+  ok "npx: $(command -v npx)"
+  say "预热 npm 包（首次要从 npm 拉，几十 MB —— 这是唯一一次慢）…"
+  if npx -y @deepseek-ai/dsh --version 2>&1 | sed 's/^/      /'; then
+    ok "harness 包已就绪（npx 缓存里）"
+    return 0
+  fi
+  warn "预热失败 —— 首次启动时 ECHO 会再试一次，可能要等 1–2 分钟"
+  return 1
+}
+
+wait_harness() {   # 写完设置后 ECHO 会自动拉起；这里等它 online
+  [ "$AGENT" = "harness" ] || return 0
+  step "等智能体就绪"
+  local waited=0
+  while [ "$waited" -lt 150 ]; do
+    if [ "$(api GET /api/status "" 10 | json_query dsh_online)" = "1" ]; then
+      ok "智能体已就绪（harness online）"
+      return 0
+    fi
+    sleep 5
+    waited=$((waited + 5))
+  done
+  warn "等 150s 仍未就绪 —— 看 logs 下的 harness 日志（首次从 npm 拉包慢是常见的）"
+  return 1
+}
+
 pip_ok=0
 verify_engines && pip_ok=1
+agent_ok=0
+prepare_agent && agent_ok=1
 
 ensure_service
 
+# 依赖没装上的引擎**不要白下模型**：装了也跑不起来，还会在自检里变成一条含糊的失败
+SKIP_IDS=""
 for id in $MODEL_IDS; do
+  one=""
+  for e in $ENGINE_LIST; do
+    if [ "$(engine_model "$e")" = "$id" ]; then one="$e"; break; fi
+  done
+  if [ -n "$one" ]; then
+    mod="$(engine_module "$one")"
+    if [ -n "$mod" ] && ! "$PY" -c "import $mod" >/dev/null 2>&1; then
+      warn "跳过 $id 的模型下载：依赖 $mod 没装上（先解决依赖）"
+      SKIP_IDS="$SKIP_IDS $id"
+    fi
+  fi
+done
+
+for id in $MODEL_IDS; do
+  case " $SKIP_IDS " in *" $id "*) continue ;; esac
   install_model "$id" || true
 done
 
@@ -501,23 +567,39 @@ write_settings $SETTINGS || true
 
 step "自检"
 api GET /api/status "" 20 | json_query components || warn "取 /api/status 失败"
+FAILED=""
+if [ "$pip_ok" -eq 0 ]; then FAILED="$FAILED 引擎依赖"; fi
 for id in $MODEL_IDS; do
-  if [ "$(model_ready "$id")" = "1" ]; then say "$(printf '%-14s' "$id") ✓ 就绪"
-  else say "$(printf '%-14s' "$id") ✗ 还没好"; fi
+  if [ "$(model_ready "$id")" = "1" ]; then ok "$(printf '%-14s' "$id") 模型就绪"
+  else err "$(printf '%-14s' "$id") 模型还没好"; FAILED="$FAILED $id"; fi
 done
+wait_harness || FAILED="$FAILED 智能体"
+
+# 登记安装 —— 这是"装完了"的凭据：面板据此不再提示未安装、也不再自动进向导
+step "登记安装"
+REPORT=$(cat <<JSON
+{"installer":"echo-install skill","platform":"macos","destDir":"$DEST",
+ "engines":"$ENGINE_LIST","wake":$([ "$WAKE" -eq 1 ] && echo true || echo false),
+ "diarize":$([ "$DIARIZE" -eq 1 ] && echo true || echo false),
+ "agent":"$AGENT","models":"$MODEL_IDS","notes":"pip: $PIPS"}
+JSON
+)
+r="$(api POST /api/install/report "{\"report\": $REPORT}" 30)"
+if printf '%s' "$r" | grep -q '"ok"[[:space:]]*:[[:space:]]*true'; then
+  ok "已登记（面板不会再提示「还没装完」）"
+else
+  warn "登记失败（不影响使用）：$r"
+fi
 
 echo ""
-if [ "$pip_ok" -eq 1 ]; then
-  echo "  完成。剩下的："
-else
-  echo "  装完了，但**有引擎不可用**（见上面的 [fail]）—— 别当成装好了。"
+if [ -z "$FAILED" ]; then
+  echo "  全部就绪。怎么开始用："
+  say "1) 浏览器打开 http://127.0.0.1:$(echo_port)/"
+  say "   mac 上热键要先在「系统设置 → 隐私与安全性 → 辅助功能 / 输入监控」里授权"
+  say "2) 首次运行会提示「来自身份不明的开发者」（还没签名公证）—— 右键打开或去隐私设置里允许"
+  say "3) 以后想加能力：面板 → 能力 → 随时补（不用重装）"
+  exit 0
 fi
-say "1) 面板：浏览器打开 http://127.0.0.1:$(echo_port)/"
-say "   mac 上热键要先在「系统设置 → 隐私与安全性 → 辅助功能 / 输入监控」里授权"
-say "2) 会议纪要 / 归档 / 语音指令需要「智能体」：面板 → 设置 → 智能体（本脚本已按 --agent 选好）"
-say "   harness 需要本机有 Node.js；没有就装 Node，或改用已装的 DSH 桌面版"
-say "3) 首次运行 macOS 会提示「来自身份不明的开发者」（还没签名公证）"
-say "   右键打开，或去「系统设置 → 隐私与安全性」里允许即可"
-
-if [ "$pip_ok" -eq 0 ]; then exit 1; fi
-exit 0
+echo "  装完了，但**这些没就绪** —— 别当成装好了：$FAILED"
+say "补救：按上面的提示装依赖 / 重跑本脚本（已装好的会跳过）；也可以到 面板 → 能力 里重试。"
+exit 1

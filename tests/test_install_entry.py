@@ -57,16 +57,17 @@ def _mac_shell_scripts():
 
 _PS1_MAP_LINE = re.compile(
     r"^\s*'([^']+)'\s*=\s*@\{\s*pip\s*=\s*@\(([^)]*)\)\s*;\s*"
-    r"model\s*=\s*'([^']+)'\s*;\s*stt\s*=\s*'([^']+)'\s*\}", re.M)
+    r"model\s*=\s*'([^']+)'\s*;\s*stt\s*=\s*'([^']+)'\s*"
+    r"(?:;\s*module\s*=\s*'([^']+)'\s*)?\}", re.M)
 
 
 def _parse_ps1_engine_map():
-    """把 Windows 组件安装器里的 $ENGINE_MAP 解析成 {引擎: {pip, model, stt}}。"""
+    """把 Windows 组件安装器里的 $ENGINE_MAP 解析成 {引擎: {pip, model, stt, module}}。"""
     text = _read(PS1_COMPONENTS)
     out = {}
-    for engine, pip_part, model, stt in _PS1_MAP_LINE.findall(text):
+    for engine, pip_part, model, stt, module in _PS1_MAP_LINE.findall(text):
         out[engine] = {"pip": re.findall(r"'([^']+)'", pip_part),
-                       "model": model, "stt": stt}
+                       "model": model, "stt": stt, "module": module or ""}
     if not out:
         raise AssertionError("$ENGINE_MAP 一条都没解析出来 —— 格式变了？")
     return out
@@ -212,6 +213,7 @@ class EngineTableAlignmentTests(unittest.TestCase):
         cls.sh_pip = _parse_bash_case_map(SH, "engine_pip")
         cls.sh_model = _parse_bash_case_map(SH, "engine_model")
         cls.sh_stt = _parse_bash_case_map(SH, "engine_stt")
+        cls.sh_module = _parse_bash_case_map(SH, "engine_module")
 
     def test_both_installers_cover_the_same_engines(self):
         self.assertEqual(sorted(self.ps1), sorted(self.sh_stt),
@@ -235,6 +237,25 @@ class EngineTableAlignmentTests(unittest.TestCase):
         for engine, info in self.ps1.items():
             self.assertEqual(info["stt"], _lookup_case_arm(self.sh_stt, engine),
                              f"{engine} 写进 sttModel 的值两边不一致")
+
+    def test_python_authority_table_agrees_with_both_installers(self):
+        """**权威表在 `app/install_state.py`**，两个安装器是它的镜像 —— 三者必须逐项一致。
+
+        为什么把权威放在 python 侧：安装状态/自检/面板横幅都由 ECHO 自己算（`install_state.py`），
+        技能脚本在"还没装好 ECHO"时就得知道引擎→依赖的映射，所以只能各留一份镜像。
+        镜像与权威漂了，症状是"技能装的东西 app 不认"，或者"面板说还缺、其实已经装了"。
+        """
+        sys.path.insert(0, ROOT)
+        from app import install_state
+        specs = install_state.ENGINE_SPECS
+        self.assertEqual(sorted(specs), sorted(self.ps1),
+                         "app/install_state.py 与安装器认识的引擎集合不一致")
+        for engine, spec in specs.items():
+            self.assertEqual(spec["model"], self.ps1[engine]["model"], f"{engine} 模型 id")
+            self.assertEqual(spec["stt"], self.ps1[engine]["stt"], f"{engine} sttModel 值")
+            self.assertEqual(spec["module"], self.ps1[engine]["module"], f"{engine} pip 模块名")
+            self.assertEqual(spec["module"], _lookup_case_arm(self.sh_module, engine),
+                             f"{engine} 的 bash 镜像与权威表不一致")
 
     def test_model_ids_exist_in_the_component_catalog(self):
         known = _component_model_ids()

@@ -177,9 +177,20 @@ bash "$kit/echo-install/scripts/echo-install-components.sh" \
 > / `--meetings-dir` / `--notes-dir` / `--pip-index`），只是写法从 `-PascalCase` 变成 `--kebab-case`。
 > 脚本自带 `--help`。
 
-两边这个脚本都做四件事：装所选引擎的 **pip 依赖** → 起服务 → **下载所选模型**（ModelScope / hf-mirror，
-带进度与超时）→ 写设置（`sttModel`/`meetingSttModel`/`wakeEnabled`/`agentBackend`+`agentHarnessEnabled`/三处目录）。
-**幂等**：已经装好的会跳过，重跑安全。**装完会逐个 `import` 复核引擎**（不是"pip 说成功"就算数）。
+两边这个脚本都做五件事：装所选引擎的 **pip 依赖** → **准备智能体**（查 npx、预热
+`npx -y @deepseek-ai/dsh` —— 首次那几十 MB 就是在这里下的）→ 起服务 → **下载所选模型**
+（ModelScope 优先，回落 hf-mirror，带进度与超时）→ 写设置 → **自检并登记**。
+**幂等**：已经装好的会跳过，重跑安全。
+
+三个要点（都是 2026-09-21 实测踩出来的）：
+
+- **装完会 `POST /api/install/report` 登记**。这是"装完了"的凭据：面板据此**不再提示"还没装完"、
+  也不再自动进向导**。没登记的话，用户打开面板会看到一条"这台机器还没登记安装完成"的横幅。
+- **自检以 `import` / 模型 ready / 智能体 online 为准**，任何一项没成就**非 0 退出**并列出是哪几项 ——
+  别把"pip 返回 0"当成"装好了"（uv 建的 venv 没 pip，依赖一个没装，安装器却打印了"安装完成"）。
+- **失败会显形**：模型下载失败会打印**服务给的原因**（例如 `ImportError: No module named
+  'modelscope'`），不会再出现"一直排队中"这种含糊状态（那是状态词表 + 取错结构两个 bug）。
+  依赖没装上的引擎会**跳过它的模型下载**（装了也跑不起来），直接告诉你缺哪个包。
 
 ## 4. 验收（必须做，并如实汇报）
 

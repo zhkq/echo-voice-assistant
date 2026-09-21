@@ -83,6 +83,53 @@ function switchView(name) {
 }
 $$(".tab").forEach((t) => t.addEventListener("click", () => switchView(t.dataset.view)));
 
+/* ---------------- 安装状态横幅（技能优先，2026-09-21） ----------------
+   安装现在多半是**助手按 echo-install 技能**在用户自己的 agent 里完成的
+   （docs/安装-技能优先.md）。面板因此不再用"首装"当"进向导"的理由 —— 那条判据原本
+   只有向导末页才写，于是技能装完打开面板还是进向导。改成：默认进仪表盘，顶部给一条
+   **不打断**的横幅说清"登记了没有 / 还缺什么 / 下一步干什么"，向导降级为手动入口。 */
+async function renderInstallNotice() {
+  let st = null;
+  try { st = await api("/api/install/state"); } catch (e) { return; }   // 取不到就不打扰
+  if (!st) return;
+  let box = $("#installNotice");
+  if (!box) {
+    box = document.createElement("div");
+    box.id = "installNotice";
+    const main = document.querySelector("main");
+    if (!main) return;
+    main.insertBefore(box, main.firstChild);
+  }
+  const miss = st.missing || [];
+  if (st.declared && !miss.length) {
+    // 装好了就别占地方；只在"能力"页给一句可查的结论（那里才是补能力的地方）
+    box.innerHTML = "";
+    box.dataset.state = "ok";
+    return;
+  }
+  const rep = st.report || {};
+  const items = miss.slice(0, 4).map((m) =>
+    `<li>${esc(m.feature || "")} —— ${esc(m.reason || "")}${m.fix ? `<span class="muted">（${esc(m.fix)}）</span>` : ""}</li>`).join("");
+  const head = st.declared
+    ? `安装已登记${rep.savedAt ? "（" + esc(rep.savedAt) + "）" : ""}，但还有 ${miss.length} 项没就绪`
+    : `这台机器还没登记安装完成`;
+  const how = st.declared
+    ? `可以现在补：面板 → 能力；或让助手再跑一次 echo-install 技能（已装好的会跳过）。`
+    : `推荐做法：把分享包里的 <code>echo-install</code> 文件夹交给你的 AI 助手，说「按 echo-install 这个技能给我装 ECHO」。<b>没有助手</b>也可以点下面的「手动向导」按界面走一遍。`;
+  box.dataset.state = "warn";
+  box.innerHTML = `<div class="install-notice">
+      <div><b>${head}</b></div>
+      <div class="muted">${how}</div>
+      ${items ? `<ul>${items}</ul>` : ""}
+      <div><button class="btn" id="installGoCap">看还缺什么</button>
+           <button class="btn ghost" id="installGoWizard">手动向导</button></div>
+    </div>`;
+  const cap = $("#installGoCap", box);
+  if (cap) cap.addEventListener("click", () => switchView("capabilities"));
+  const wiz = $("#installGoWizard", box);
+  if (wiz) wiz.addEventListener("click", () => switchView("wizard"));
+}
+
 /* ---------------- 可折叠卡片 ----------------
    给卡片加 class="collapsible" 与 data-collapse-id，点标题就能折叠/展开，状态记在
    localStorage（跨刷新/重开保持）。支持两种卡片：
@@ -3261,10 +3308,16 @@ async function wizRenderConfirm(host) {
 /* ---------------- S10 正在准备 ---------------- */
 async function wizRenderRun(host) {
   const draw = (st) => {
-    const rows = (st.items || []).map((it) => `<div class="wiz-run-row">
+    // 失败的项要把**原因**显示出来：以前只显示"没成"两个字，而"失败"还被状态词表 bug
+    // 显示成了"排队中"（见 app/modelinfo.py 的 job_state 说明）。
+    const rows = (st.items || []).map((it) => {
+      const detail = it.state === "error" && it.message
+        ? ` —— <span class="wiz-lose">${esc(it.message)}</span>` : "";
+      return `<div class="wiz-run-row">
       <span>${esc(it.label || it.component)}</span>
       <span class="muted">${esc(it.text || "")}${it.percent != null && it.state === "downloading"
-        ? ` ${it.percent}%` : ""}</span></div>`).join("");
+        ? ` ${it.percent}%` : ""}${detail}</span></div>`;
+    }).join("");
     const failed = (st.failed || []).map((f) => `<li>${esc(f.component || "")}：${esc(f.error || f.message || "")}</li>`).join("");
     host.innerHTML = `<div class="card"><div class="card-title">正在准备
         <span class="spacer"></span><span class="muted">${esc(st.summary || "")}</span></div>
@@ -3322,7 +3375,7 @@ async function wizRenderDone(host) {
   /* 走到末页 = 向导走完了：写 data/installed-components.json（设计 §4/§5 的"执行后真值"）。
      这是**首装判据**的凭据 —— 写完 `/api/wizard/first-run` 就变 false，面板以后不再自动进向导。
      失败不影响用户看这一页（下次进末页还会再试一次）。 */
-  post("/api/wizard/finalize", {}).catch(() => {});
+  post("/api/wizard/finalize", {}).then(() => renderInstallNotice()).catch(() => {});
 }
 
 
@@ -3338,20 +3391,15 @@ try {
   if (want && _VIEWS.includes(want)) _bootView = want;
 } catch (e) { /* 忽略 */ }
 
-/* 进哪个页签：显式指定（?view=… / echo.gotoView）最优先；否则**首装直接进向导**
-   （设计 §0/§1："首装只装 runtime-core，随后立刻进向导，向导不得跳过" —— 判据是
-   服务端 `data/installed-components.json` 在不在，由 /api/wizard/first-run 回答）。
-   为什么用"最多 800ms 的赛跑"而不是直接 await：面板要立刻可交互，探测失败/超时
-   就按老行为进仪表盘，绝不因为这一步白屏。
-   想直接看仪表盘：地址栏加 `?view=dashboard`；向导走过一次末页后也不再自动进。 */
+/* 进哪个页签：显式指定（?view=… / echo.gotoView）最优先；否则**进仪表盘**。
+   这里以前是"首装直接进向导"，判据是服务端 installed-components.json 在不在 —— 但那个文件
+   只有向导末页才写，而安装现在多半由**助手按 echo-install 技能**完成，于是"技能装完打开面板
+   还是进向导"（2026-09-21 实测反馈）。现在改成：**永不自动进向导**，没装完由顶部横幅说清下一步
+   （横幅可一键进向导或能力页）。想直接看向导：`?view=wizard`。 */
 async function bootView() {
-  if (_bootView) { switchView(_bootView); return; }
-  const first = await Promise.race([
-    api("/api/wizard/first-run").then((r) => !!(r && r.firstRun)).catch(() => false),
-    new Promise((res) => setTimeout(() => res(false), 800)),
-  ]);
-  if (first) toast("第一次使用：先花两分钟过一遍向导（随时可以跳过）");
-  switchView(first ? "wizard" : "dashboard");
+  if (_bootView) { switchView(_bootView); renderInstallNotice(); return; }
+  switchView("dashboard");
+  renderInstallNotice();
 }
 bootView();
 applyCollapsedCards();      // 应用上次的卡片折叠状态（「模型路由 → 路由参数」等）

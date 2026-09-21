@@ -1,0 +1,181 @@
+# -*- coding: utf-8 -*-
+"""安装状态（技能优先）与下载状态词的守卫。
+
+背景（2026-09-21 实测反馈）
+--------------------------
+同事在一台新机器上跑安装技能，反馈三件事，其中两件在这里钉住：
+
+1. **技能装完，进 ECHO 还是进向导页** —— 面板的首装判据只有 `installed-components.json`，
+   而那个文件只有向导末页才写。技能现在会 `POST /api/install/report`，`install_state.declared()`
+   也认它，面板就不再提示"没装完"、也不再自动进向导。
+2. **选 qwen3asr 一直显示"正在准备中 / 排队中"** —— 根因是状态词表不一致：
+   `modelinfo._download_worker` 失败写 `"failed"`，而 `wizard.execution_state` 判断 `"error"`，
+   于是**失败被当成"还没开始"**。这里用真实的 `jobs()` 形状把它钉死。
+"""
+import json
+import os
+import sys
+import tempfile
+import unittest
+from unittest.mock import patch
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from app import install_state, wizard                      # noqa: E402
+
+
+class DownloadStateVocabularyTests(unittest.TestCase):
+    """失败必须显示"没成 + 原因"，不能显示"排队中"。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="echo-installstate-")
+        self.addCleanup(__import__("shutil").rmtree, self.tmp, ignore_errors=True)
+        self.plan_file = os.path.join(self.tmp, "plan.json")
+        wizard.save_plan({
+            "state": "running",
+            "built": {"downloads": [
+                {"component": "stt-qwen3asr", "modelId": "qwen3asr", "label": "Qwen3-ASR", "approxMb": 3600},
+                {"component": "stt-sherpa", "modelId": "sherpa", "label": "sherpa", "approxMb": 189},
+            ]},
+            "execution": {"skipped": [], "failed": []},
+        }, self.plan_file)
+
+    def _state_with(self, jobs):
+        with patch("app.modelinfo.jobs", lambda: {"active": None, "items": jobs}):
+            return wizard.execution_state(self.plan_file)
+
+    def test_failed_job_is_reported_as_failed_with_reason(self):
+        """**这就是同事看到的那个 bug**：worker 写 "failed"，向导原来只认 "error"。"""
+        st = self._state_with({
+            "qwen3asr": {"status": "failed", "message": "ImportError: No module named 'modelscope'"},
+        })
+        row = [r for r in st["items"] if r["modelId"] == "qwen3asr"][0]
+        self.assertEqual("error", row["state"], "失败必须显示成失败")
+        self.assertEqual("没成", row["text"])
+        self.assertIn("modelscope", row["message"], "要把原因带出来，别只说'没成'")
+
+    def test_legacy_error_spelling_still_works(self):
+        st = self._state_with({"qwen3asr": {"status": "error", "error": "boom"}})
+        row = [r for r in st["items"] if r["modelId"] == "qwen3asr"][0]
+        self.assertEqual("error", row["state"])
+
+    def test_unknown_status_is_queued_and_done_is_done(self):
+        st = self._state_with({"sherpa": {"status": "done"}})
+        rows = {r["modelId"]: r for r in st["items"]}
+        self.assertEqual("done", rows["sherpa"]["state"])
+        self.assertEqual("queued", rows["qwen3asr"]["state"], "没见过的状态保守显示为排队中")
+        self.assertEqual(1, st["finished"])
+
+    def test_modelinfo_job_state_normalises(self):
+        from app import modelinfo
+        self.assertEqual("failed", modelinfo.job_state({"status": "failed"}))
+        self.assertEqual("failed", modelinfo.job_state({"status": "error"}))
+        self.assertEqual("running", modelinfo.job_state({"status": "running"}))
+        self.assertEqual("done", modelinfo.job_state({"status": "done"}))
+        self.assertEqual("queued", modelinfo.job_state({}))
+        self.assertEqual("queued", modelinfo.job_state(None))
+
+
+class InstallReportTests(unittest.TestCase):
+    """技能登记 → declared() 为真 → 面板不再当"没装完"。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="echo-installreport-")
+        self.addCleanup(__import__("shutil").rmtree, self.tmp, ignore_errors=True)
+        self.path = os.path.join(self.tmp, "install-report.json")
+
+    def test_no_report_no_wizard_file_means_not_declared(self):
+        with patch.object(wizard, "installed_path", lambda: os.path.join(self.tmp, "nope.json")):
+            self.assertFalse(install_state.declared(self.path))
+
+    def test_wizard_file_alone_counts_as_declared(self):
+        legacy = os.path.join(self.tmp, "installed-components.json")
+        with open(legacy, "w", encoding="utf-8") as fh:
+            fh.write("{}")
+        with patch.object(wizard, "installed_path", lambda: legacy):
+            self.assertTrue(install_state.declared(self.path),
+                            "老安装（向导装的）不能被当成首装")
+
+    def test_report_roundtrip_and_declared(self):
+        saved = install_state.save_report({"engines": ["sherpa"], "agent": "harness"}, self.path)
+        self.assertEqual(install_state.REPORT_SCHEMA, saved["schema"])
+        self.assertTrue(saved.get("savedAt"))
+        with patch.object(wizard, "installed_path", lambda: os.path.join(self.tmp, "nope.json")):
+            self.assertTrue(install_state.declared(self.path))
+            back = install_state.load_report(self.path)
+        self.assertEqual(["sherpa"], back["engines"])
+
+    def test_broken_report_file_does_not_raise(self):
+        with open(self.path, "w", encoding="utf-8") as fh:
+            fh.write("{ not json")
+        self.assertEqual({}, install_state.load_report(self.path))
+
+    def test_wanted_falls_back_to_settings_when_no_report(self):
+        """没有报告时（老安装）从设置推"用户想要什么"。"""
+        report = {}
+        self.assertEqual({}, report)
+        with patch("app.config.settings.get", side_effect=lambda k, d=None: {
+                "sttModel": "base", "meetingSttModel": "sherpa",
+                "wakeEnabled": True, "agentBackend": "harness"}.get(k, d)):
+            want = install_state.wanted(report)
+        self.assertIn("whisper-base", want["engines"])
+        self.assertIn("sherpa", want["engines"])
+        self.assertTrue(want["wake"])
+        self.assertEqual("harness", want["agent"])
+
+    def test_missing_calls_out_a_missing_module(self):
+        report = {"engines": ["qwen3asr"], "agent": "none"}
+        # 依赖探测注入成"没有"，模型探测注入成"就绪" → 必须报"缺依赖"
+        with patch.object(install_state, "_module_ok", lambda name: False), \
+                patch.object(install_state, "_model_ready", lambda mid: True):
+            miss = install_state.missing(report)
+        self.assertTrue(miss)
+        self.assertIn("transformers", miss[0]["reason"])
+
+    def test_missing_is_empty_when_everything_checks_out(self):
+        report = {"engines": ["sherpa"], "agent": "none"}
+        with patch.object(install_state, "_module_ok", lambda name: True), \
+                patch.object(install_state, "_model_ready", lambda mid: True):
+            self.assertEqual([], install_state.missing(report))
+
+    def test_state_exposes_engine_detail(self):
+        report = {"engines": ["sherpa"], "agent": "none"}
+        with patch.object(install_state, "load_report", lambda path="": report), \
+                patch.object(install_state, "declared", lambda path="": True), \
+                patch.object(install_state, "_module_ok", lambda name: True), \
+                patch.object(install_state, "_model_ready", lambda mid: mid == "sherpa"):
+            st = install_state.state()
+        self.assertTrue(st["declared"])
+        self.assertTrue(st["ready"])
+        self.assertEqual("sherpa", st["engines"][0]["id"])
+        self.assertTrue(st["engines"][0]["modelReady"])
+
+    def test_engine_specs_match_the_app_engine_choices(self):
+        """权威表里的 stt 值必须是 app 认得的（与安装器镜像由另一个测试盯）。"""
+        from app.audio import stt as stt_mod
+        for engine, spec in install_state.ENGINE_SPECS.items():
+            got_engine, _model = stt_mod.resolve_engine(spec["stt"])
+            if engine.startswith("whisper-"):
+                self.assertEqual("whisper", got_engine, engine)
+                self.assertIn(spec["stt"], stt_mod.WHISPER_MODELS, engine)
+            elif engine == "sherpa":
+                self.assertEqual("sherpa", got_engine)
+            elif engine == "sensevoice":
+                self.assertEqual("sensevoice", got_engine)
+            elif engine == "qwen3asr":
+                self.assertEqual("qwen3asr", got_engine)
+            else:
+                self.fail("测试没覆盖这个引擎：%s" % engine)
+
+    def test_report_never_stores_secret_values(self):
+        """报告是明文，可能被拷来拷去 —— 结构里不许出现"值"的设置键。"""
+        src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                "app", "install_state.py"), encoding="utf-8").read()
+        for risky in ("api_key", "apiKey", "token", "secret", "password"):
+            self.assertNotIn(risky, src.lower(), "安装状态里不该出现任何密钥字段")
+        # 报告里只记"装了什么"，不记设置值 —— 顺便确认 json 是唯一的持久化方式
+        self.assertIn("install-report.json", src)
+
+
+if __name__ == "__main__":
+    unittest.main()
