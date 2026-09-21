@@ -52,8 +52,12 @@ class WizardUiWiringTests(unittest.TestCase):
     def test_wizard_calls_only_the_wizard_endpoints_and_saves_choices(self):
         for url in ("/api/wizard/env", "/api/wizard/plan", "/api/wizard/preview",
                     "/api/wizard/execute", "/api/wizard/state",
-                    "/api/wizard/first-run", "/api/wizard/finalize"):
+                    "/api/wizard/finalize"):
             self.assertIn(url, self.js, "向导要用 %s" % url)
+        # `/api/wizard/first-run` **不在**这个清单里：2026-09-21 起面板不再用它决定页签
+        # （那正是"技能装完还被塞进向导"的原因），接口本身留着给别的调用方/老客户端。
+        self.assertNotIn("/api/wizard/first-run", self.js,
+                         "面板不该再用 first-run 决定进哪个页签")
         # 决策相只写计划（PUT /api/wizard/plan），不直接写设置、不直接触发下载
         self.assertIn('api("/api/wizard/plan", {', self.js)
 
@@ -84,16 +88,35 @@ class WizardUiWiringTests(unittest.TestCase):
         self.assertIn("wizSaveChoices", block, "改动要存进计划文件（关掉面板不丢）")
         self.assertNotIn("wizGoLlm", self.js, "不该再有「跳去模型路由」当唯一入口")
 
-    def test_first_install_enters_the_wizard_automatically(self):
-        """首装（`installed-components.json` 缺失）要自动进向导，且不抢用户显式指定的页签。"""
-        self.assertIn('api("/api/wizard/first-run")', self.js)
+    def test_boot_never_forces_the_wizard(self):
+        """**首装不再自动进向导**（2026-09-21 改，取代原来的
+        `test_first_install_enters_the_wizard_automatically`）。
+
+        为什么改：安装现在由助手按 `echo-install` 技能完成（见 `docs/安装-技能优先.md`），
+        而"首装"的判据 `installed-components.json` **只有向导末页才写** —— 于是技能装完，
+        用户打开面板还是被塞进向导页（2026-09-21 同事实测反馈）。
+        新的契约：默认进仪表盘；"登记了没有 / 还缺什么"由顶部横幅说清；
+        向导保留但降级为手动入口（`?view=wizard`），永不自动弹出。
+        """
+        block = self.js[self.js.index("async function bootView()"):]
+        block = block[:block.index("\n}")]
+        self.assertNotIn("wizard/first-run", block,
+                         "bootView 不该再拿 first-run 当进向导的理由")
+        self.assertIn('switchView("dashboard")', block, "默认进仪表盘")
+        self.assertIn("renderInstallNotice()", block, "要用安装状态横幅说清下一步")
+        self.assertIn("async function renderInstallNotice()", self.js)
+        self.assertIn('api("/api/install/state")', self.js, "横幅读的是安装状态接口")
+        # 横幅要给出两条明确去处，而不是只报个错
+        self.assertIn('switchView("wizard")', self.js, "手动向导仍要可达")
+        self.assertIn('switchView("capabilities")', self.js, "补能力要可达")
+        # 显式指定页签（?view=… / echo.gotoView）最优先，不许被默认逻辑抢走
         block = self.js[self.js.index("async function bootView()"):]
         block = block[:block.index("applyCollapsedCards()")]
-        self.assertIn("if (_bootView) { switchView(_bootView); return; }", block,
-                      "显式指定页签（?view=… / echo.gotoView）时不许抢")
-        self.assertIn('switchView(first ? "wizard" : "dashboard")', block)
-        self.assertIn("post(\"/api/wizard/finalize\", {})", self.js,
-                      "走到末页要写 installed-components.json（首装判据的凭据）")
+        self.assertIn("if (_bootView) { switchView(_bootView); renderInstallNotice(); return; }",
+                      block, "显式指定页签时不许抢")
+        # 走完向导末页仍要写 installed-components.json（老的首装判据，install_state 也认它）
+        self.assertIn('post("/api/wizard/finalize", {})', self.js,
+                      "走到末页要写 installed-components.json")
 
     def test_every_step_has_a_renderer(self):
         steps = re.findall(r'\{ id: "[a-z]+", name: "[^"]+", render: (\w+) \}', self.js)

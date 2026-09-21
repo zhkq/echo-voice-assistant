@@ -3373,7 +3373,7 @@ async function wizRenderDone(host) {
   const again = $("#wizRestart", host);
   if (again) again.addEventListener("click", () => { _wizStep = 0; wizRender(); });
   /* 走到末页 = 向导走完了：写 data/installed-components.json（设计 §4/§5 的"执行后真值"）。
-     这是**首装判据**的凭据 —— 写完 `/api/wizard/first-run` 就变 false，面板以后不再自动进向导。
+     这是**首个安装判据**的凭据（`install_state.declared()` 也认它）—— 写完面板就不再提示"还没装完"。
      失败不影响用户看这一页（下次进末页还会再试一次）。 */
   post("/api/wizard/finalize", {}).then(() => renderInstallNotice()).catch(() => {});
 }
