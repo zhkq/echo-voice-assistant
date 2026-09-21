@@ -175,7 +175,10 @@ class StandaloneHarnessComponentTests(unittest.TestCase):
     def test_manifest_shape(self):
         it = self.item
         self.assertEqual(it["kind"], "agent")
-        self.assertIn("独立", it["name"])
+        # 两个智能体要能一眼分清（同事 2026-09-21 反馈：状态里 `dsh` offline 被误读成"坏了"）：
+        # 这条 = 标准版 harness，另一条 = DSH Desktop 桌面版
+        self.assertIn("harness", it["name"])
+        self.assertIn("标准版", it["name"])
         self.assertEqual(it["detect"], {"setting": "harnessPort"},
                          "就绪判据取配置里的端口（与 ECHO 实际连的地址一致）")
         self.assertIn("npx", it["command"])
@@ -189,6 +192,35 @@ class StandaloneHarnessComponentTests(unittest.TestCase):
     def test_dsh_desktop_row_is_also_a_service(self):
         items = {i["id"]: i for i in components.load_manifests()}
         self.assertTrue(items["agent-dsh"].get("service"))
+
+    def test_two_agent_rows_are_told_apart(self):
+        """两个智能体二选一，名字必须能分清（同事 2026-09-21 反馈的误读点）。
+
+        面板据此把"没选中的那条"显示成「未使用」，而不是看着像坏了。
+        """
+        items = {i["id"]: i for i in components.load_manifests()}
+        dsh, hrn = items["agent-dsh"], items["agent-harness"]
+        self.assertNotEqual(dsh["name"], hrn["name"])
+        self.assertIn("DSH Desktop", dsh["name"])
+        self.assertIn("标准版", hrn["name"])
+        # 两条的 how 都要点出"二选一"这件事
+        self.assertIn("二选一", dsh["how"])
+
+    def test_agent_rows_carry_active_flag(self):
+        """catalog 的 agent 行带 active（当前选中哪个）—— 面板据此改文案。"""
+        from unittest.mock import patch
+
+        from app.config import settings as real_settings
+
+        def fake_get(key, default=None):
+            return "harness" if key == "agentBackend" else real_settings.get(key, default)
+
+        with patch.object(real_settings, "get", fake_get):
+            cat = {i["id"]: i for i in components.catalog(include_blocked=True)["items"]}
+        self.assertIs(cat["agent-harness"]["active"], True)
+        self.assertIs(cat["agent-dsh"]["active"], False)
+        self.assertNotIn("active", cat["runtime-core"],
+                         "只有 agent 类才有这个概念")
 
     def test_command_survives_catalog(self):
         """catalog() 会用 pip 命令覆盖 command —— 没有 pkg 的组件不能因此被清空。"""

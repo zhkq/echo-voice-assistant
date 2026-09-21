@@ -79,8 +79,53 @@ def home():
     return os.path.join(paths.data_root(), "harness")
 
 
+#: 本地永久安装的落点（安装技能把 `@deepseek-ai/dsh` 装到这里，见 `.dsh/skills/echo-install`）。
+LOCAL_ENTRY_REL = os.path.join("harness", "dsh", "node_modules",
+                               "@deepseek-ai", "dsh", "lib", "bin.js")
+
+
+def local_entry():
+    """本地永久安装的 `lib/bin.js` 全路径；没有（或空文件）返回空串。
+
+    为什么专门找它（同事 2026-09-22 实测 B5）：`npx -y @deepseek-ai/dsh web` 冷启动
+    **2 分 10 秒**（npx 每次重新解析安装），直连这个文件只要 **9 秒**。
+    """
+    p = os.path.join(paths.echo_root(), LOCAL_ENTRY_REL)
+    try:
+        if os.path.isfile(p) and os.path.getsize(p) > 0:
+            return p
+    except OSError:
+        pass
+    return ""
+
+
+def _node_exe():
+    """node 可执行文件全路径：先按平台接缝找（托管 / nvm / 官方安装），再退回 PATH。"""
+    d = find_node_dir()
+    if d:
+        for name in ("node.exe", "node"):
+            cand = os.path.join(d, name)
+            if os.path.isfile(cand):
+                return cand
+    return shutil.which("node") or ""
+
+
+def is_default_command(raw) -> bool:
+    """设置里还是出厂那条 npx 命令（= 用户没自己表过态）。"""
+    return str(raw or "").strip() in ("", DEFAULT_COMMAND, "npx -y @deepseek-ai/dsh web")
+
+
 def command():
-    return str(settings.get("harnessCommand", DEFAULT_COMMAND) or DEFAULT_COMMAND).strip()
+    raw = str(settings.get("harnessCommand", DEFAULT_COMMAND) or DEFAULT_COMMAND).strip()
+    # 装了本地件、但设置还停在出厂 npx 时自动改走本地入口（老设置/升级上来的机器都受益）。
+    # 只在"用户没改过"时生效 —— 用户自己写的命令一个字都不动。
+    if is_default_command(raw):
+        entry = local_entry()
+        if entry:
+            node = _node_exe()
+            if node:
+                return '"%s" "%s" web' % (node, entry)
+    return raw
 
 
 def requested():
@@ -214,6 +259,16 @@ def _read_output(proc):
         fh = open(log_path, "a", encoding="utf-8", errors="replace")
     except Exception:
         fh = None
+    if fh:
+        # 每次启动写一条分隔：日志是追加模式，没有分隔时堆在一起的 traceback 看着像"同一个进程
+        # 反复重启"（同事 2026-09-21 排障反馈），根本分不清哪段属于哪次。
+        try:
+            import time as _t
+            fh.write("\n===== harness 启动 %s pid=%s =====\n"
+                     % (_t.strftime("%Y-%m-%d %H:%M:%S"), getattr(proc, "pid", "?")))
+            fh.flush()
+        except Exception:
+            pass
     try:
         for raw in iter(proc.stdout.readline, b""):
             line = raw.decode("utf-8", "replace").rstrip()

@@ -31,7 +31,7 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 class HarnessAgent(DshAgent):
     name = "harness"
-    display_name = "独立 DeepSeek Harness"
+    # 面板/文档统一叫「标准版 harness」：与「DSH Desktop 桌面版」区分开（同事 2026-09-21 反馈）
     vendor = "DeepSeek（npm @deepseek-ai/dsh）"
     description = ("独立 harness 的 web 服务（随 ECHO 启动，默认 127.0.0.1:43199）——"
                    "不装 DSH Desktop 也能用；/api 接口与 Desktop 完全一致")
@@ -144,7 +144,7 @@ class HarnessAgent(DshAgent):
             if not harness_proc.online(timeout=1.0):
                 if not harness_proc.requested():
                     return False, ("独立 harness 没在运行：在面板把它选为当前智能体"
-                                   "（或打开「启用独立 DeepSeek Harness」），"
+                                   "（或打开「启用标准版 harness」），"
                                    "ECHO 会自动拉起（需要本机 Node / npx）")
                 return False, ("独立 harness 没在监听 %s：看 data/logs/harness.log —— "
                                "多数是 Node/npx 不在 PATH（把「harness 启动命令」改成 npx 全路径）"

@@ -238,7 +238,7 @@ def _start_harness(report):
                    detail="未选中，已收尾：%s" % msg if ok else msg)
             return
         harness_proc.sync_status()
-        report(status="disabled", detail="未选中（设置 → 智能体 → 独立 DeepSeek Harness）",
+        report(status="disabled", detail="未选中（设置 → 智能体 → 标准版 harness）",
                progress=0.0)
         return
     report(detail="拉起独立 harness…", progress=0.2)
@@ -465,7 +465,7 @@ def setup():
              can_stop=False)
     register("failover", "模型路由（ECHO AUTO）", "🛰️", start_fn=_start_failover,
              can_start=True, can_stop=False)
-    register("harness", "独立 DeepSeek Harness", "🧩", start_fn=_start_harness,
+    register("harness", "标准版 harness", "🧩", start_fn=_start_harness,
              stop_fn=_stop_harness, can_start=True, can_stop=True)
     register("stt-cmd", "命令转写引擎（常驻）", "🎤", start_fn=_start_stt_cmd,
              stop_fn=_stop_stt_cmd, can_start=True, can_stop=True)

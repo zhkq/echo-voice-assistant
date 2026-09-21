@@ -313,8 +313,8 @@ def post_harness_browser(_auth=Depends(optional_auth)):
     if not harness_proc.online():
         if not harness_proc.requested():
             return {"ok": False,
-                    "message": "独立 harness 没在运行：在 设置 → 智能体 里选中"
-                               "「独立 DeepSeek Harness」，ECHO 会自动拉起它"}
+                    "message": "标准版 harness 没在运行：在 设置 → 智能体 里选中"
+                               "「标准版 harness」，ECHO 会自动拉起它"}
         return {"ok": False, "message": "独立 harness 没在监听 %s（看 data/logs/harness.log）"
                                         % harness_proc.base_url()}
     tok = harness_proc.token()

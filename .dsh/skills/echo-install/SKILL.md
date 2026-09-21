@@ -188,6 +188,9 @@ bash "$kit/echo-install/scripts/echo-install-components.sh" \
 → 起服务 → **下载所选模型**（ModelScope 优先，回落 hf-mirror，带进度与超时）→ 写设置 →
 **自检并登记**。**幂等**：已经装好的会跳过，重跑安全。
 
+> 每一步的输出也会落到 **`<安装目录>/data/logs/install-<时间戳>.log`**（独立于终端）——
+> 终端被关掉、或被 agent 收走输出时，排障看这份日志就够（A6）。
+
 > **为什么改成永久安装（2026-09-22）**：同一台机器实测 `npx -y @deepseek-ai/dsh web` 冷启动
 > **2 分 10 秒**，直连本地 `lib/bin.js` 只要 **9 秒** —— npx 每次都要重新解析安装。脚本会把
 > `"<node 全路径>" "<安装目录>/harness/dsh/node_modules/@deepseek-ai/dsh/lib/bin.js" web`

@@ -69,16 +69,18 @@ def _builtin() -> List[dict]:
         # 而且 ECHO 2.0 **根本不用 SDK** —— `app/agents/dsh_agent.py` 用标准库 urllib 直连
         # DSH Desktop 的本机 HTTP JSON-RPC（`dshBaseUrl`，默认 127.0.0.1:43120）。
         # 于是这条改成"本机服务"：装桌面客户端并保持运行即可，就绪判据 = 那个地址通不通。
-        dict(id="agent-dsh", kind="agent", name="DSH Desktop（本机服务）", optional=True, required=False,
+        dict(id="agent-dsh", kind="agent", name="DSH Desktop 桌面版（本机服务）", optional=True, required=False,
              purpose="ECHO 通过本机 HTTP JSON-RPC 使用 DSH（会话 / 纪要 / 模型注册）；不需要 Python SDK",
              size_mb=0, platforms=["win32", "macos", "linux"], min_os={"macos": "14.0"},
              detect={"setting": "dshBaseUrl"}, service=True,
              source="manual",
-             how="装 DSH Desktop 客户端并让它保持运行即可；地址见 设置 → 智能体 → DSH 服务地址"),
+             how="装 DSH Desktop 客户端并让它保持运行即可；地址见 设置 → 智能体 → DSH 服务地址。"
+                 "它与下面那条「标准版 harness」**二选一**：没选中的那条显示「未运行 / 未使用」是正常的，"
+                 "不代表坏了"),
         # 2026-09-19 用户要求："运行环境哪里要增加独立 DSH" —— 上面那条是桌面客户端，
         # 这条是**独立发行版**（npm @deepseek-ai/dsh）：同样只需"服务在跑"，
         # 但多一条路 —— ECHO 能把它作为自己的子进程随自己拉起（选中该智能体即可）。
-        dict(id="agent-harness", kind="agent", name="独立 DeepSeek Harness（本机服务）",
+        dict(id="agent-harness", kind="agent", name="标准版 harness（DeepSeek Harness · 本机服务）",
              optional=True, required=False,
              purpose="npm 包 @deepseek-ai/dsh 的 web 服务；不装 DSH Desktop 也能用它干活",
              size_mb=0, platforms=["win32", "macos", "linux"], min_os={},
@@ -87,8 +89,9 @@ def _builtin() -> List[dict]:
              source="manual",
              command="npx -y @deepseek-ai/dsh web --port 43199 --no-open",
              command_label="复制启动命令",
-             how="在 设置 → 智能体 里选中「独立 DeepSeek Harness」，ECHO 会自动拉起它；"
-                 "也可以自己跑右边这条命令（需要本机 Node / npx）"),
+             how="在 设置 → 智能体 里选中它，ECHO 会自动拉起；安装技能会把它**永久装到 "
+                 "<安装目录>/harness/dsh**（冷启动约 10 秒），命令记在设置的 harnessCommand 里。"
+                 "右边这条是没装成时的兜底（走 npx，首次要多等 1-2 分钟）"),
         dict(id="accel-cuda", kind="accel", name="CUDA 加速", optional=True, required=False,
              purpose="让转写/说话人分离跑在 N 卡上（3 倍以上速度）",
              size_mb=2500, platforms=["win32", "linux"], min_os={},   # mac 上不出现
@@ -284,6 +287,23 @@ def load_manifests(root: Optional[str] = None) -> List[dict]:
     return [items[k] for k in sorted(items)]
 
 
+def _agent_active(component_id: str):
+    """这个"本机服务"式智能体是不是用户**当前选中**的那个；认不出返回 None（不猜）。
+
+    为什么要有这个字段（同事 2026-09-21 反馈）：两个智能体是**二选一**，选标准版时
+    DSH Desktop 那条自然是 offline —— 面板只写"未运行"，用户读成"坏了/没装好"。
+    有了 `active`，面板才能说清"这条不是坏了，是你没在用"。
+    """
+    want = {"agent-dsh": "dsh", "agent-harness": "harness"}.get(component_id)
+    if not want:
+        return None
+    try:
+        from app.config import settings
+        return str(settings.get("agentBackend", "") or "").strip() == want
+    except Exception:                                 # noqa: BLE001 —— 读不到就不表态
+        return None
+
+
 def _install_command(item: dict) -> str:
     """给需要 pip 的组件拼一条**可直接粘贴执行**的命令（用当前解释器）。
 
@@ -342,6 +362,8 @@ def catalog(*, platform: Optional[str] = None, os_version: Optional[Tuple[int, .
             row["ready"] = _detect(item)
         except Exception:
             row["ready"] = None
+        if item.get("kind") == "agent":
+            row["active"] = _agent_active(item["id"])
         out.append(row)
     return {"platform": p, "osVersion": ".".join(str(x) for x in ver), "items": out}
 

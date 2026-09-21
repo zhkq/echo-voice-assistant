@@ -1365,7 +1365,11 @@ function capCompBadge(c) {
   if (job.status === "running") return modelBadge(`下载中 ${Math.round(job.percent || 0)}%`, "warn");
   if (c.ready === true) return modelBadge("✅ 已就绪", "ok");
   // 「本机服务」（DSH Desktop / 独立 harness）不是"没装"，是"没在跑" —— 措辞要准
-  if (c.service) return modelBadge(c.ready === false ? "⏹ 未运行" : "未知", "warn");
+  // 两个智能体是**二选一**：没选中的那条要说"未使用"，否则用户读成"坏了"（同事 2026-09-21 反馈）
+  if (c.service) {
+    if (c.active === false) return modelBadge("⏹ 未使用（你选的是另一个）", "idle");
+    return modelBadge(c.ready === false ? "⏹ 未运行" : "未知", "warn");
+  }
   if (c.ready === false) return modelBadge(c.model_id ? "⬇ 未安装" : "未安装", "warn");
   return modelBadge("未知", "idle");
 }

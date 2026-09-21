@@ -413,7 +413,7 @@ DEFAULTS = {
     # 与 DSH Desktop 只差两点：**谁提供 web 服务**（npm 包 vs 桌面客户端）、**鉴权**
     # （启动时打印的 token → Cookie vs 逆向签名 Cookie）；/api 接口面完全相同（2026-09-19 实测）。
     # 详见 app/harness_proc.py 与 docs/独立harness接入.md。
-    "agentHarnessEnabled": dict(value=False, grp="agent", label="启用独立 DeepSeek Harness",
+    "agentHarnessEnabled": dict(value=False, grp="agent", label="启用标准版 harness（DeepSeek Harness）",
                                 description="本项与「执行智能体」都指向它时，ECHO 才把独立 harness "
                                             "作为子进程拉起（切走即停）；需要本机 Node / npx",
                                 value_type="bool", hidden=True),

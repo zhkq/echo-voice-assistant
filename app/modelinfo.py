@@ -382,6 +382,34 @@ def download_pyannote() -> str:
     return "modelscope"
 
 
+#: 失败原因的关键词 → 人话（A4：同事被公司代理拦证书，界面上只看到裸 SSLError，不知该干什么）
+_ERROR_HINTS = (
+    (("certificate verify failed", "certificate_verify_failed", "sslerror", "self signed",
+      "self-signed", "unable to get local issuer", "certverifyfailed"),
+     "证书校验失败（公司代理常见的中间人证书问题）—— 不要关校验，改用 ModelScope 源或换网络"),
+    (("proxy", "407", "tunnel connection failed", "connect tunnel"),
+     "被代理拦下（需要认证或代理不通）—— 检查系统代理设置，或把模型源地址加进白名单"),
+    (("403", "forbidden", "gated"),
+     "源站拒绝（403 / 需要同意条款）—— 到该模型页面同意条款，或改用 ModelScope 镜像"),
+    (("401", "unauthorized"),
+     "需要登录（401）—— 填 HF Token（设置 → 模型）或改用 ModelScope 源"),
+    (("getaddrinfo", "name or service not known", "nodename nor servname",
+      "temporary failure in name resolution", "max retries exceeded", "connection refused",
+      "connection reset", "timed out", "timeout"),
+     "网络不通或超时 —— 稍后重试；公司网里多半要走代理"),
+)
+
+
+def explain_download_error(raw):
+    """把底层下载异常翻成一句**能照着做**的人话；认不出返回空串（不硬编）。"""
+    low = str(raw or "").lower()
+    if not low:
+        return ""
+    for keys, tip in _ERROR_HINTS:
+        if any(k in low for k in keys):
+            return tip
+    return ""
+
 def _snapshot(ms_id: str = "", hf_id: str = "", local_dir=None, allow=None) -> str:
     """按「先 ModelScope、失败再 HF」的顺序拉一个模型仓库，返回实际用的源。
 
@@ -405,7 +433,10 @@ def _snapshot(ms_id: str = "", hf_id: str = "", local_dir=None, allow=None) -> s
             return "huggingface"
         except Exception as e:                       # noqa: BLE001
             errs.append("HF(%s): %s" % (hf_id, e))
-    raise RuntimeError("；".join(errs) or "没有可用的下载源")
+    detail = "；".join(errs) or "没有可用的下载源"
+    tip = explain_download_error(detail)
+    # 两个源都失败时附一句"该怎么办"（A4）—— 否则用户只看到两段英文异常
+    raise RuntimeError(("%s\n怎么办：%s" % (detail, tip)) if tip else detail)
 
 
 def _download_worker(entry):

@@ -48,11 +48,25 @@ $ErrorActionPreference = 'Stop'
 $script:Root = (Resolve-Path -LiteralPath $DestDir).Path
 $script:HarnessCommand = ''    # 本地永久安装成功时填（见 Prepare-Agent）
 
-function Say([string]$m)  { Write-Host "  $m" }
-function Ok([string]$m)   { Write-Host "  [ok]   $m" -ForegroundColor Green }
-function Warn([string]$m) { Write-Host "  [warn] $m" -ForegroundColor Yellow }
-function Err([string]$m)  { Write-Host "  [fail] $m" -ForegroundColor Red }
-function Step([string]$m) { Write-Host ''; Write-Host "== $m" -ForegroundColor Cyan }
+# A6：每一步同时留一份**独立于终端**的日志（终端关掉、输出被 agent 收走时还能回看）。
+# 落点 <安装目录>\data\logs\install-<时间戳>.log；写不进去（权限/只读）就静默放弃，绝不挡安装。
+$script:InstallLog = ''
+try {
+    $logDir = Join-Path $script:Root 'data\logs'
+    New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+    $script:InstallLog = Join-Path $logDir ("install-{0}.log" -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
+    Add-Content -LiteralPath $script:InstallLog -Encoding UTF8 -Value ("===== echo-install-components {0} 安装目录={1} =====" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $script:Root)
+} catch { $script:InstallLog = '' }
+
+function LogLine([string]$m) {
+    if (-not $script:InstallLog) { return }
+    try { Add-Content -LiteralPath $script:InstallLog -Encoding UTF8 -Value ("[{0}] {1}" -f (Get-Date -Format 'HH:mm:ss'), $m) } catch { }
+}
+function Say([string]$m)  { Write-Host "  $m"; LogLine "  $m" }
+function Ok([string]$m)   { Write-Host "  [ok]   $m" -ForegroundColor Green; LogLine "[ok]   $m" }
+function Warn([string]$m) { Write-Host "  [warn] $m" -ForegroundColor Yellow; LogLine "[warn] $m" }
+function Err([string]$m)  { Write-Host "  [fail] $m" -ForegroundColor Red; LogLine "[fail] $m" }
+function Step([string]$m) { Write-Host ''; Write-Host "== $m" -ForegroundColor Cyan; LogLine "== $m" }
 
 # 引擎 → (pip 依赖 / 要下的 model_id / 写进 sttModel 的值)
 # 依据：app/audio/stt.py 的 _parse_choice()（sttModel 取值 = sherpa|sensevoice|qwen3asr|whisper 档名）

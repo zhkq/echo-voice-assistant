@@ -60,11 +60,20 @@ if [ -t 1 ] && command -v tput >/dev/null 2>&1 && [ "$(tput colors 2>/dev/null |
 else
   C_OK=""; C_WARN=""; C_ERR=""; C_STEP=""; C_OFF=""
 fi
-say()  { echo "  $*"; }
-ok()   { echo "  ${C_OK}[ok]${C_OFF}   $*"; }
-warn() { echo "  ${C_WARN}[warn]${C_OFF} $*"; }
-err()  { echo "  ${C_ERR}[fail]${C_OFF} $*"; }
-step() { echo ""; echo "${C_STEP}== $*${C_OFF}"; }
+# A6：每一步同时留一份**独立于终端**的日志（终端关掉、输出被 agent 收走时还能回看）。
+# 落点 <安装目录>/data/logs/install-<时间戳>.log；写不进去（权限/只读）就静默放弃，绝不挡安装。
+INSTALL_LOG=""
+_tee() {
+  if [ -n "$INSTALL_LOG" ]; then
+    printf '[%s] %s\n' "$(date '+%H:%M:%S')" "$*" >> "$INSTALL_LOG" 2>/dev/null || true
+  fi
+  return 0
+}
+say()  { echo "  $*"; _tee "  $*"; }
+ok()   { echo "  ${C_OK}[ok]${C_OFF}   $*"; _tee "[ok]   $*"; }
+warn() { echo "  ${C_WARN}[warn]${C_OFF} $*"; _tee "[warn] $*"; }
+err()  { echo "  ${C_ERR}[fail]${C_OFF} $*"; _tee "[fail] $*"; }
+step() { echo ""; echo "${C_STEP}== $*${C_OFF}"; _tee "== $*"; }
 
 usage() {
   cat <<'USAGE'
@@ -135,6 +144,12 @@ case "$DEST" in
 esac
 if [ ! -d "$DEST" ]; then err "目录不存在：$DEST"; exit 2; fi
 DEST="$(cd "$DEST" && pwd)"
+LOG_DIR="$DEST/data/logs"
+if mkdir -p "$LOG_DIR" 2>/dev/null; then
+  INSTALL_LOG="$LOG_DIR/install-$(date '+%Y%m%d-%H%M%S').log"
+  printf '===== echo-install-components %s 安装目录=%s =====\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$DEST" \
+    >> "$INSTALL_LOG" 2>/dev/null || INSTALL_LOG=""
+fi
 
 case "$WAIT_SECONDS" in
   ''|*[!0-9]*) err "--wait-seconds 要是整数秒：$WAIT_SECONDS"; exit 2 ;;
@@ -500,7 +515,7 @@ prepare_agent() {
   fi
   ok "node: $node_bin"
 
-  local target="$ROOT/harness/dsh"
+  local target="$DEST/harness/dsh"
   local entry="$target/node_modules/@deepseek-ai/dsh/lib/bin.js"
   if [ ! -s "$entry" ]; then
     if ! command -v npm >/dev/null 2>&1; then
