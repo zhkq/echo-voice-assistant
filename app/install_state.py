@@ -181,10 +181,16 @@ def missing(report: dict = None) -> list:
     for engine in want["engines"]:
         spec = ENGINE_SPECS.get(engine) or {}
         if not _module_ok(spec.get("module", "")):
+            fix = "用 echo-install 技能重跑，或 pip install %s" % spec.get("module", "?")
+            if os.name == "nt":
+                # Windows 上"包在、导不进来"最常见的原因是缺 VC++ 运行库（原生扩展都要它）——
+                # 面板顺手把这句话给出来，用户不用去猜 "DLL load failed" 是什么意思。
+                fix += "；若报 DLL load failed，先装 Microsoft Visual C++ 2015-2022 运行库（x64）" \
+                       "：https://aka.ms/vs/17/release/vc_redist.x64.exe"
             out.append({
                 "feature": spec.get("label") or engine,
                 "reason": "缺 Python 依赖（%s）—— 转写时会直接报错" % spec.get("module", "?"),
-                "fix": "用 echo-install 技能重跑，或 pip install %s" % spec.get("module", "?"),
+                "fix": fix,
             })
             continue
         if _model_ready(spec.get("model", "")) is False:

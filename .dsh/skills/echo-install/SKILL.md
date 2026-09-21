@@ -68,6 +68,12 @@ foreach ($u in 'https://pypi.org/simple/','https://www.python.org/','https://www
 # 智能体要用 Node；边条要用 .NET 7 Desktop Runtime（没有也能用浏览器面板）
 foreach ($c in 'node','npx') { $p = Get-Command $c -ErrorAction SilentlyContinue; "$c -> $(if($p){$p.Source}else{'没有'})" }
 dotnet --list-runtimes 2>$null | Select-String 'WindowsDesktop.App 7\.'
+
+# VC++ 2015-2022 运行库：torch / ctranslate2 / sherpa-onnx / onnxruntime 这些**原生扩展**都要它。
+# 干净镜像上常常没有，而报错只说 "DLL load failed … 找不到指定的模块"（同事 2026-09-21 卡在这）。
+$vc = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64' -ErrorAction SilentlyContinue
+"VC++ 2015-2022 x64 -> " + $(if ($vc -and $vc.Installed -eq 1) { $vc.Version }
+  else { '没有（第 3 步会自动下载安装，会弹 UAC；装不了就手动装 https://aka.ms/vs/17/release/vc_redist.x64.exe）' })
 ```
 
 ### macOS
@@ -222,6 +228,7 @@ curl -s "http://127.0.0.1:$port/api/models" | ./venv/bin/python -m json.tool | h
 | 现象 | 怎么处理 |
 |---|---|
 | **Windows**：启动时弹 **「You must install or update .NET」** | 那是**右缘浮动条**要 .NET 7 Desktop **Runtime**（与 ECHO 本体无关）。要么装它，要么：浏览器打开 `http://127.0.0.1:<端口>/` → 设置 → 面板 → **仪表盘打开方式 = browser**，并把「启动时自动显示折叠条」关掉 |
+| **Windows**：`import torch` / `sherpa_onnx` / `ctranslate2` 报 **`DLL load failed … 找不到指定的模块`** | 缺 **Microsoft Visual C++ 2015-2022 运行库（x64）** —— 这些原生扩展都要它，干净镜像上常常没有（2026-09-21 同事实测）。技能的第 3 步会**自动下载安装**（弹 UAC 点「是」）；装不了就手动装 `https://aka.ms/vs/17/release/vc_redist.x64.exe` 后**重跑技能**（可能要重启一次） |
 | **Windows**：弹 **「WebView2 初始化失败」** | 缺 Edge WebView2 Runtime（Win10/11 一般自带）；同样可改用浏览器面板 |
 | **macOS**：提示「来自身份不明的开发者」/ 打不开 | **正常现象**：还没做签名与公证。右键 →「打开」，或去「系统设置 → 隐私与安全性」里允许一次 |
 | **macOS**：热键按了没反应 | 要在「系统设置 → 隐私与安全性 → **辅助功能 / 输入监控**」里给终端（或 ECHO）授权 —— **首次必须人工点**，脚本代替不了 |

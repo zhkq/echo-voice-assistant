@@ -209,6 +209,63 @@ function Test-EngineModule([string]$Name) {
     finally { $ErrorActionPreference = $prev }
 }
 
+# ---------------------------------------------------------------- VC++ 运行库（原生扩展的前置）
+
+function Test-VCRuntime {
+    # Windows 上 torch / ctranslate2（faster-whisper）/ sherpa-onnx / onnxruntime 这些**原生扩展**
+    # 都要 Microsoft Visual C++ 2015-2022 运行库（x64）。干净镜像上常常没有，而报错只说
+    # "DLL load failed while importing …: 找不到指定的模块" —— 2026-09-21 同事就卡在这一句上。
+    # 官方检测点：注册表 14.0\VC\Runtimes\x64 的 Installed=1（14.0 = 2015 起合并的那一版）。
+    foreach ($k in @('HKLM:\SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64',
+                     'HKLM:\SOFTWARE\WOW6432Node\Microsoft\VisualStudio\14.0\VC\Runtimes\x64')) {
+        try { if ((Get-ItemProperty -Path $k -ErrorAction Stop).Installed -eq 1) { return $true } } catch { }
+    }
+    # 注册表读不到时退一步看 System32 的关键 DLL（三件齐了才认）
+    foreach ($d in @('vcruntime140.dll', 'vcruntime140_1.dll', 'msvcp140.dll')) {
+        if (-not (Test-Path (Join-Path $env:SystemRoot "System32\$d"))) { return $false }
+    }
+    return $true
+}
+
+function Install-VCRuntime {
+    # 下载官方安装器并静默安装。**需要管理员** —— 会弹 UAC，请用户点「是」；
+    # 装不了（无管理员/被策略拦）就返回 $false，由调用方给人工指引。
+    $url = 'https://aka.ms/vs/17/release/vc_redist.x64.exe'
+    $exe = Join-Path $env:TEMP 'vcredist_x64.exe'
+    Say ("下载 VC++ 运行库：{0}" -f $url)
+    try { Invoke-WebRequest -Uri $url -OutFile $exe -UseBasicParsing -TimeoutSec 300 }
+    catch { Warn ("下载失败：{0}" -f $_.Exception.Message); return $false }
+    Say '开始安装（会弹 UAC 授权框，请点「是」）…'
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $p = Start-Process -FilePath $exe -ArgumentList @('/install', '/quiet', '/norestart') -Wait -PassThru
+        # 0 = 成功；3010 = 成功但需要重启 —— 都算装上了
+        if ($p.ExitCode -eq 0 -or $p.ExitCode -eq 3010) { return $true }
+        Warn ("VC++ 安装程序返回 {0}（没有管理员权限时常见）" -f $p.ExitCode)
+        return $false
+    } catch { Warn ("VC++ 安装失败：{0}" -f $_.Exception.Message); return $false }
+    finally { $ErrorActionPreference = $prev }
+}
+
+function Get-ImportFailure([string]$Name) {
+    # 真 import 一次并把错误文本带回来 —— 用来区分"包没装"和"缺 DLL（要装 VC++）"。
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $out = (& $rcPy -c "import $Name" 2>&1 | Out-String)
+        return @{ ok = ($LASTEXITCODE -eq 0); text = ($out).Trim() }
+    } catch { return @{ ok = $false; text = "$($_.Exception.Message)" } }
+    finally { $ErrorActionPreference = $prev }
+}
+
+function Test-DllLoadFailure([string]$Text) {
+    if (-not $Text) { return $false }
+    return ($Text -match 'DLL load failed' -or $Text -match 'WinError 126' -or
+            $Text -match '找不到指定的模块' -or
+            $Text -match 'The specified module could not be found')
+}
+
 # ---------------------------------------------------------------- 智能体（标准版 harness）
 
 function Prepare-Agent {
@@ -288,6 +345,22 @@ if ($Diarize) {
 }
 if ($AccelCuda) { $pips += 'torch'; Warn 'CUDA 版 torch 体积大（约 2.5 GB），且要求 N 卡与匹配的驱动' }
 
+# VC++ 运行库先解决：torch / ctranslate2 / sherpa-onnx / onnxruntime 都依赖它，
+# 缺了会在**装完引擎之后**才以 "DLL load failed" 的形式炸（2026-09-21 同事卡在这）。
+Step '检查 VC++ 运行库（原生扩展的前置）'
+if (Test-VCRuntime) {
+    Ok 'VC++ 2015-2022 运行库已就绪'
+} else {
+    Warn '缺 Microsoft Visual C++ 2015-2022 运行库（x64）—— 转写引擎的原生扩展都要它'
+    if (Install-VCRuntime) {
+        Ok 'VC++ 运行库已安装'
+    } else {
+        Say '  没装成。请手动装（或让管理员装）后重跑本脚本：'
+        Say '    https://aka.ms/vs/17/release/vc_redist.x64.exe'
+        Say '  装的时候会弹 UAC，点「是」；装完可能需要重启一次。'
+    }
+}
+
 Install-PipDeps $pips
 $null = Prepare-Agent          # 先把 npm 包预热好，免得写入设置后 ECHO 拉起时干等
 Ensure-Service
@@ -344,8 +417,20 @@ try {
 foreach ($e in $Engines) {
     if (-not $ENGINE_MAP.ContainsKey($e)) { continue }
     $mod = $ENGINE_MAP[$e].module
-    if (Test-EngineModule $mod) { Ok ("{0,-18} import {1} 通过" -f $e, $mod) }
-    else { Err ("{0,-18} 依赖缺失：import {1} 失败" -f $e, $mod); $failed += $e }
+    $imp = Get-ImportFailure $mod
+    if ($imp.ok) {
+        Ok ("{0,-18} import {1} 通过" -f $e, $mod)
+    } elseif (Test-DllLoadFailure $imp.text) {
+        # 包在、但原生 DLL 加载不了 —— 几乎都是缺 VC++ 运行库。给可操作的一句话，别丢原始堆栈。
+        Err ("{0,-18} 缺系统 DLL（多半是 VC++ 运行库）：import {1} 失败" -f $e, $mod)
+        Say '      装这个后重跑本脚本： https://aka.ms/vs/17/release/vc_redist.x64.exe'
+        $failed += $e
+    } else {
+        Err ("{0,-18} 依赖缺失：import {1} 失败" -f $e, $mod)
+        $firstLine = ($imp.text -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -Last 1)
+        if ($firstLine) { Say ("      {0}" -f $firstLine.Trim()) }
+        $failed += $e
+    }
 }
 foreach ($pair in $models) {
     $st2 = Get-ModelState $pair[0]

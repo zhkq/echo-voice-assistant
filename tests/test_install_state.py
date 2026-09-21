@@ -231,5 +231,36 @@ class PyannoteSourceTests(unittest.TestCase):
         self.assertIn("pyannote", sh, "mac 技能同理")
 
 
+class VCRuntimeGuidanceTests(unittest.TestCase):
+    """Windows 上"包在、导不进来"要指向 VC++ 运行库（2026-09-21 同事实测卡在这）。"""
+
+    def test_skill_preflights_and_installs_vc_runtime(self):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        ps1 = open(os.path.join(root, ".dsh", "skills", "echo-install", "scripts",
+                                "echo-install-components.ps1"), encoding="utf-8").read()
+        # 官方检测点（注册表 14.0\VC\Runtimes\x64 的 Installed=1）
+        self.assertIn("VC\\Runtimes\\x64", ps1, "要用官方注册表检测点判断装没装")
+        self.assertIn("aka.ms/vs/17/release/vc_redist.x64.exe", ps1, "要给官方下载地址")
+        self.assertIn("function Install-VCRuntime", ps1, "要能自己把它装上")
+        # 失败要区分"缺包"和"缺 DLL"
+        self.assertIn("DLL load failed", ps1)
+        self.assertIn("function Test-DllLoadFailure", ps1)
+
+    def test_skill_docs_mention_vc_runtime(self):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        md = open(os.path.join(root, ".dsh", "skills", "echo-install", "SKILL.md"),
+                  encoding="utf-8").read()
+        self.assertIn("vc_redist.x64.exe", md, "技能文档的失败表要写这一条")
+        self.assertIn("DLL load failed", md)
+
+    def test_missing_hint_mentions_vc_runtime_on_windows(self):
+        report = {"engines": ["sherpa"], "agent": "none"}
+        with patch.object(install_state, "_module_ok", lambda name: False), \
+                patch.object(install_state, "_model_ready", lambda mid: True), \
+                patch.object(install_state.os, "name", "nt"):
+            miss = install_state.missing(report)
+        self.assertIn("Visual C++", miss[0]["fix"], "Windows 上要顺手提示 VC++ 运行库")
+
+
 if __name__ == "__main__":
     unittest.main()
