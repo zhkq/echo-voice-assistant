@@ -163,6 +163,8 @@ def api_status(_auth=Depends(optional_auth)):
         "meeting": st,
         "busy": assistant.is_busy(),
         "busyOwner": assistant._busy_owner["name"],
+        # 启动期自愈留痕（如清理被强杀留下的 WAL）：面板只提示一次，见 web/app.js
+        "startupNotes": db.startup_notes(),
         # 命令流当前阶段（listening/transcribing/running）：面板据此给"说话"按钮做动效
         "busyPhase": assistant._busy_owner.get("phase"),
         "uptime": services.uptime(),

@@ -193,7 +193,23 @@ def main():
     except Exception:
         pass
 
+    # A3（同事 2026-09-21 反馈）：上次被强杀（关机 / 任务管理器 / 掉电）留下的
+    # echo.db-wal / -shm 会让下一次启动卡在 `Waiting for application startup`。
+    # 走到这里已经**持有单实例锁**，处理这两个文件是安全的；自愈失败也绝不挡启动。
+    try:
+        _wal_note = db.heal_stale_wal()
+        if _wal_note:
+            print(_wal_note, flush=True)
+    except Exception as e:                            # noqa: BLE001 —— 自愈不能挡启动
+        _wal_note = ""
+        print(f"清理残留数据库日志失败（不影响启动）：{e}", flush=True)
+
     db.init()
+    if _wal_note:
+        try:
+            db.add_log("warn", "system", _wal_note)   # 留一条给排障用
+        except Exception:
+            pass
     preferred = int(settings.get("serverPort", 8970))
     # 防重复实例（第 2 道、兜底）：端口上已经有东西在监听。锁只能挡住"也用这把锁的实例"，
     # 挡不住老版本进程或别的程序占着端口，所以这一层保留 —— 但它是兜底，不是权威。

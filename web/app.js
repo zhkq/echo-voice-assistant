@@ -130,6 +130,36 @@ async function renderInstallNotice() {
   if (wiz) wiz.addEventListener("click", () => switchView("wizard"));
 }
 
+/* ---------------- 启动自愈提示（A3，2026-09-22） ----------------
+   后端启动时若发现上次被强杀留下的数据库日志（echo.db-wal / -shm）并做了归位，
+   会把一句人话放进 /api/status 的 startupNotes。这里**只提示一次**（刷新后又出现会烦人），
+   点「知道了」即收 —— 不打断、不阻断。 */
+let _startupNotesSeen = false;
+function renderStartupNotes(st) {
+  if (_startupNotesSeen) return;
+  const notes = (st && st.startupNotes) || [];
+  if (!notes.length) return;
+  _startupNotesSeen = true;
+  let box = $("#startupNotes");
+  if (!box) {
+    box = document.createElement("div");
+    box.id = "startupNotes";
+    const main = document.querySelector("main");
+    if (!main) return;
+    main.insertBefore(box, main.firstChild);
+  }
+  box.dataset.state = "warn";
+  box.innerHTML = `<div class="install-notice">
+      <div><b>启动时自动处理了一处异常</b></div>
+      <ul>${notes.map((n) => `<li>${esc(n)}</li>`).join("")}</ul>
+      <div class="muted">常见原因是上次 ECHO 不是正常退出的（关机 / 任务管理器结束进程 / 掉电）。
+        已经处理好了，正常用即可。</div>
+      <div><button class="btn ghost" id="startupNotesOk">知道了</button></div>
+    </div>`;
+  const ok = $("#startupNotesOk", box);
+  if (ok) ok.addEventListener("click", () => box.remove());
+}
+
 /* ---------------- 可折叠卡片 ----------------
    给卡片加 class="collapsible" 与 data-collapse-id，点标题就能折叠/展开，状态记在
    localStorage（跨刷新/重开保持）。支持两种卡片：
@@ -716,6 +746,7 @@ async function refreshDashboard() {
     const st = await api("/api/status");
     document.body.classList.remove("echo-offline");   // 顶栏去掉常驻状态后，靠这个红标表示"连不上"
     renderLiveStatus(st);                             // 启动页"启动日志"标题右侧的在线时长 + 状态
+    renderStartupNotes(st);                           // 启动期自愈留痕（只提示一次）
     // 会议控制
     const mb = $("#meetingBadge");
     mb.textContent = st.meeting.active ? "录音中" : "空闲";

@@ -32,6 +32,7 @@ import json
 import os
 import sqlite3
 import threading
+import time
 
 from app import paths as _paths
 
@@ -337,6 +338,89 @@ def _query_one(sql, params=()):
         return dict(row) if row else None
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------- 启动自愈（A3）
+
+#: 启动期"人话提示"（面板顶栏只提示一次）：目前只有 WAL 自愈会往里写。
+_STARTUP_NOTES = []
+
+
+def add_startup_note(text):
+    """记一条启动提示（幂等：同一句不重复记）。"""
+    if text and text not in _STARTUP_NOTES:
+        _STARTUP_NOTES.append(text)
+
+
+def startup_notes():
+    """启动提示快照（面板 / API 用）。"""
+    return list(_STARTUP_NOTES)
+
+
+def heal_stale_wal(timeout=2.0):
+    """收拾上次**被强杀**留下的 `echo.db-wal` / `-shm`；返回人话提示（没事返回空串）。
+
+    背景（同事 2026-09-21 反馈 A3）：关机 / 任务管理器结束进程 / 掉电之后重开 ECHO，
+    会卡在 `Waiting for application startup`。正常的 WAL 由 SQLite 自己恢复，真会被卡住的
+    是**锁文件 + 半截 WAL**：那份残留会一直让新进程拿不到写锁。
+
+    调用时机很关键：**必须在持有单实例锁之后、`db.init()` 之前**
+    （见 `app/main.py:main()`）—— 否则可能动到另一个正在跑的实例的库。
+
+    做法按风险从低到高：
+      1. 先正常打开库并 `wal_checkpoint(TRUNCATE)`：绝大多数残留到这一步就归位了
+         （checkpoint 成功后 SQLite 会自己把 WAL 清掉，数据不丢）；
+      2. 打不开（`database is locked` / 损坏 / 数据库文件都不在）就把这两个文件
+         **改名留证**（`*.stale-<时间戳>`），让 SQLite 按"无 WAL"重建。
+         这一步可能丢掉最后一次没落盘的写入 —— 所以只在第 1 步失败时做，且改名不删除。
+
+    全程不抛异常（调用方还会再兜一层）：自愈失败绝不能反过来挡住启动。
+    """
+    wal = DB_FILE + "-wal"
+    shm = DB_FILE + "-shm"
+    leftovers = [p for p in (wal, shm) if os.path.exists(p)]
+    if not leftovers:
+        return ""
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    reason = ""
+    if os.path.exists(DB_FILE):
+        try:
+            conn = sqlite3.connect(DB_FILE, timeout=timeout)
+            try:
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            finally:
+                conn.close()
+        except Exception as e:                        # noqa: BLE001 —— 自愈要吞掉一切
+            reason = f"{type(e).__name__}: {e}"
+        else:
+            # 归位成功：checkpoint 后残留要么已消失、要么是 0 字节的空壳，都不用管
+            return ""
+    else:
+        reason = "只剩 WAL/SHM、数据库文件不在（多半是上次装到一半被结束）"
+
+    moved, failed = [], []
+    for p in (wal, shm):
+        if not os.path.exists(p):
+            continue
+        dst = f"{p}.stale-{stamp}"
+        try:
+            os.replace(p, dst)
+            moved.append(os.path.basename(dst))
+        except OSError as e:
+            failed.append(f"{os.path.basename(p)}（{e}）")
+
+    note = ""
+    if moved:
+        note = (f"发现上次异常退出留下的数据库日志（{reason}），已移开备份："
+                f"{'、'.join(moved)}；ECHO 已照常启动，数据一般不受影响")
+    if failed:
+        tail = ("；另有 " + "、".join(failed) + " 移不动，若启动卡住请手动删除")
+        note = (note + tail) if note else (
+            "发现残留的数据库日志但移不动：" + "、".join(failed) + "；若启动卡住请手动删除")
+    if note:
+        add_startup_note(note)
+    return note
 
 
 # ---------------------------------------------------------------- 初始化/迁移
