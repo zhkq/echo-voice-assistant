@@ -70,3 +70,8 @@ assets/echo.ico
 # 独立 harness 的临时家目录（探测/试跑时会在 cwd 下生成，含 node_modules）
 __probe__/
 
+# WorkBuddy（同事机器上的 agent 宿主）把自己的 memory 目录落在 cwd：2026-09-22 在仓库根
+# 生成过 .workbuddy/memory/*.md，白占 git status 一行，还差点被打包/提交进去。
+# 它不是 ECHO 的东西（ECHO 只用 **用户家目录** 下的 ~/.workbuddy 找 node），忽略掉即可。
+.workbuddy/
+
