@@ -257,9 +257,16 @@ class VCRuntimeGuidanceTests(unittest.TestCase):
         report = {"engines": ["sherpa"], "agent": "none"}
         with patch.object(install_state, "_module_ok", lambda name: False), \
                 patch.object(install_state, "_model_ready", lambda mid: True), \
-                patch.object(install_state.os, "name", "nt"):
+                patch.object(install_state, "_is_windows", lambda: True):
             miss = install_state.missing(report)
         self.assertIn("Visual C++", miss[0]["fix"], "Windows 上要顺手提示 VC++ 运行库")
+
+    def test_windows_detection_goes_through_the_platform_seam(self):
+        """app/ 里不许直接写 os.name 分支（audit-paths 会拦，2026-09-21 实测）。"""
+        src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                "app", "install_state.py"), encoding="utf-8").read()
+        self.assertNotIn('os.name == "nt"', src, "要走 platform.current()，别自己判 os.name")
+        self.assertIn("platform as echo_platform", src)
 
 
 if __name__ == "__main__":

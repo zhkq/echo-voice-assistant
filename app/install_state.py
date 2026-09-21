@@ -169,6 +169,16 @@ def wanted(report: dict = None) -> dict:
     return _wanted_from_settings()
 
 
+def _is_windows() -> bool:
+    """当前是不是 Windows —— **走平台接缝**，不在 app/ 里直接写 os.name 分支
+    （audit-paths 会拦：平台差异只能住在 app/platform/ 下，2026-09-21 实测踩到）。"""
+    try:
+        from app import platform as echo_platform
+        return echo_platform.current() == "win32"
+    except Exception:
+        return False
+
+
 def missing(report: dict = None) -> list:
     """**还缺什么** —— 逐项从真值推，返回给人看的三元组列表。
 
@@ -182,7 +192,7 @@ def missing(report: dict = None) -> list:
         spec = ENGINE_SPECS.get(engine) or {}
         if not _module_ok(spec.get("module", "")):
             fix = "用 echo-install 技能重跑，或 pip install %s" % spec.get("module", "?")
-            if os.name == "nt":
+            if _is_windows():
                 # Windows 上"包在、导不进来"最常见的原因是缺 VC++ 运行库（原生扩展都要它）——
                 # 面板顺手把这句话给出来，用户不用去猜 "DLL load failed" 是什么意思。
                 fix += "；若报 DLL load failed，先装 Microsoft Visual C++ 2015-2022 运行库（x64）" \
