@@ -46,6 +46,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $script:Root = (Resolve-Path -LiteralPath $DestDir).Path
+$script:HarnessCommand = ''    # 本地永久安装成功时填（见 Prepare-Agent）
 
 function Say([string]$m)  { Write-Host "  $m" }
 function Ok([string]$m)   { Write-Host "  [ok]   $m" -ForegroundColor Green }
@@ -268,36 +269,110 @@ function Test-DllLoadFailure([string]$Text) {
 
 # ---------------------------------------------------------------- 智能体（标准版 harness）
 
+function Resolve-NodeDir {
+    # npx 可能在"托管式" node 里（同事机器上只有 WorkBuddy 的 node，且不在系统 PATH 里）。
+    # 候选顺序与 ECHO 运行时的探测保持一致（见 app/platform/win32/env.py 的 node_dirs()）。
+    $cands = @()
+    $wb = Join-Path $env:USERPROFILE '.workbuddy\binaries\node\versions'
+    if (Test-Path $wb) {
+        $cands += (Get-ChildItem $wb -Directory -ErrorAction SilentlyContinue |
+                   Sort-Object Name -Descending | ForEach-Object { $_.FullName })
+    }
+    if ($env:APPDATA) { $cands += (Join-Path $env:APPDATA 'nvm\current') }
+    foreach ($p in @("$env:ProgramFiles\nodejs", "${env:ProgramFiles(x86)}\nodejs",
+                     "$env:LOCALAPPDATA\Programs\nodejs")) {
+        if ($p -and $p -notlike '\nodejs') { $cands += $p }
+    }
+    foreach ($d in $cands) {
+        foreach ($n in @('npx.cmd', 'npx.exe', 'npx')) {
+            if (Test-Path (Join-Path $d $n)) { return $d }
+        }
+    }
+    return ''
+}
+
 function Prepare-Agent {
-    # 智能体以前**不是**安装里的一步：向导只写两个设置键，harness 由 ECHO 在后台静默拉起
-    # （`npx -y @deepseek-ai/dsh`，首次要下几十 MB）—— 用户选完"标准版"看不到任何动静，
-    # 以为没生效（2026-09-21 实测反馈："选了 dsh 标准版，没看到下载提示"）。
-    # 这里把它变成**显式的一步**：查 node → 预热 npm 包（有输出）→ 后面再等它就绪。
+    # 标准版 harness **本地永久安装 + 绝对路径直连**（2026-09-22 同事实测后改）：
+    #   同一台机器同一个 dsh：
+    #     npx -y @deepseek-ai/dsh web   →  就绪 **2 分 10 秒**（1403 行 npm warn cleanup）
+    #     node <本地 bin.js> web        →  就绪 **9 秒**
+    #   慢的锅不在 dsh 也不在用户机器，就在 npx 这一层（每次冷启动都要重新解析安装 + 回滚清理）。
+    #   绝对路径还顺带绕开两个坑：① 进程 PATH 里没有 node（桌面快捷方式启动时）；
+    #   ② 宿主（WorkBuddy 等）的安全删除 shim 拦 npm 批量删除。
+    # 失败时**回退**到 npx（ECHO 的默认命令），不让安装流程卡死。
     if ($Agent -ne 'harness') { return $true }
-    Step '准备智能体（标准版 harness）'
-    $npx = Get-Command npx -ErrorAction SilentlyContinue
-    if (-not $npx) {
-        Warn '没找到 npx —— harness 靠 npx 起，需要本机有 Node.js'
-        Say '  装了 Node 再重跑本脚本；装了但不在 PATH 里时，把面板 → 设置 → 智能体里的'
-        Say '  「harness 启动命令」改成 npx 的全路径。'
+    Step '准备智能体（标准版 harness：本地永久安装）'
+    $nodeDir = Resolve-NodeDir
+    if (-not $nodeDir) {
+        Warn '没找到 node/npx —— 标准版 harness 需要本机有 Node.js'
+        Say '  装了 Node 再重跑本脚本；装了但不在 PATH 里时，下面会把全路径自动写进设置。'
         return $false
     }
-    Ok ("npx: {0}" -f $npx.Source)
-    Say '预热 npm 包（首次要从 npm 拉，几十 MB —— 这是唯一一次慢）…'
-    $code = 0
-    $prev = $ErrorActionPreference
-    $ErrorActionPreference = 'Continue'          # 原生命令往 stderr 写时别炸（WinPS 5.1 老坑）
-    try {
-        & $npx.Source -y '@deepseek-ai/dsh' --version 2>&1 |
-            ForEach-Object { Write-Host "      $_" -ForegroundColor DarkGray }
-        $code = $LASTEXITCODE
-    } catch {
-        Warn ("预热失败：{0}" -f $_.Exception.Message)
-        $code = 1
-    } finally { $ErrorActionPreference = $prev }
-    if ($code -eq 0) { Ok 'harness 包已就绪（npx 缓存里）' }
-    else { Warn ("预热返回 {0} —— 首次启动时 ECHO 会再试一次，可能要等 1–2 分钟" -f $code) }
-    return ($code -eq 0)
+    $node = Join-Path $nodeDir 'node.exe'
+    if (-not (Test-Path $node)) { $node = Join-Path $nodeDir 'node' }
+    $npm = Join-Path $nodeDir 'npm.cmd'
+    if (-not (Test-Path $npm)) { $npm = Join-Path $nodeDir 'npm' }
+    Ok ("node: {0}" -f $node)
+
+    $target = Join-Path $script:Root 'harness\dsh'
+    $entry = Join-Path $target 'node_modules\@deepseek-ai\dsh\lib\bin.js'
+    if (Test-Path $entry) {
+        Ok '标准版已在本机（跳过下载）'
+    } else {
+        if (-not (Test-Path $npm)) {
+            Warn ("没找到 npm：{0} —— 装了 Node 但缺 npm？回退到 npx 方式" -f $npm)
+            return $false
+        }
+        New-Item -ItemType Directory -Force -Path $target | Out-Null
+        if (-not (Test-Path (Join-Path $target 'package.json'))) {
+            '{ "name": "echo-harness", "private": true }' |
+                Set-Content -Path (Join-Path $target 'package.json') -Encoding UTF8
+        }
+        Say '下载并安装标准版（一次性，几十 MB，可能要几分钟；请勿中断）...'
+        $prev = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        # 宿主的安全删除 shim 会把 npm reify 的批量删除拦下来（SAFE_DELETE_BULK_CONFIRM_REQUIRED），
+        # 装出来是"目录在、文件被截断"的半残包 —— 装的时候把它关掉。
+        $oldShim = $env:CODEBUDDY_SAFE_DELETE_ENABLED
+        $env:CODEBUDDY_SAFE_DELETE_ENABLED = '0'
+        Push-Location $target
+        try {
+            & $npm install '@deepseek-ai/dsh@0.1.5-rc.2' --no-audit --no-fund 2>&1 |
+                ForEach-Object { Write-Host "      $_" -ForegroundColor DarkGray }
+            $code = $LASTEXITCODE
+        } catch {
+            Warn ("安装失败：{0}" -f $_.Exception.Message)
+            $code = 1
+        } finally {
+            Pop-Location
+            $ErrorActionPreference = $prev
+            if ($null -eq $oldShim) { Remove-Item Env:\CODEBUDDY_SAFE_DELETE_ENABLED -ErrorAction SilentlyContinue }
+            else { $env:CODEBUDDY_SAFE_DELETE_ENABLED = $oldShim }
+        }
+        if ($code -ne 0 -or -not (Test-Path $entry)) {
+            Warn ("标准版没装成（退出码 {0}）—— 回退到 npx，首次启动要多等 1-2 分钟" -f $code)
+            return $false
+        }
+    }
+
+    # 完整性自检：同事踩的就是"目录在、文件被截断"（node-pty 缺 index.js，dsh 直接加载失败）
+    $broken = @()
+    if (-not (Test-Path $entry)) { $broken += 'lib\bin.js' }
+    foreach ($pty in (Get-ChildItem $target -Recurse -Directory -Filter 'node-pty' -ErrorAction SilentlyContinue)) {
+        foreach ($f in @('package.json', 'lib\index.js')) {
+            if (-not (Test-Path (Join-Path $pty.FullName $f))) { $broken += ("node-pty\" + $f) }
+        }
+    }
+    if ($broken.Count -gt 0) {
+        Warn ("安装不完整：{0}" -f ($broken -join ', '))
+        Say ("  修法：删掉 {0} 后重跑本脚本" -f $target)
+        return $false
+    }
+
+    $script:HarnessCommand = '"{0}" "{1}" web' -f $node, $entry
+    Ok '标准版已就绪（本地永久安装，冷启动约 10 秒）'
+    Say ("  启动命令：{0}" -f $script:HarnessCommand)
+    return $true
 }
 
 function Wait-Harness([int]$Seconds = 150) {
@@ -401,6 +476,9 @@ switch ($Agent) {
     'dsh'     { $values['agentBackend'] = 'dsh' }
     default   { }
 }
+# 本地永久安装成功 → 把绝对路径写进设置：ECHO 直连它，冷启动约 10 秒（见 Prepare-Agent）。
+# 没装成就不写，ECHO 用默认的 npx 命令兜底（首次会慢 1-2 分钟，但能用）。
+if ($script:HarnessCommand) { $values['harnessCommand'] = $script:HarnessCommand }
 if ($values.Count -gt 0) {
     foreach ($k in $values.Keys) { Say ("{0} = {1}" -f $k, $values[$k]) }
     try { $null = Invoke-Api -Path '/api/settings' -Method Put -Body @{ values = $values } -TimeoutSec 60; Ok '设置已写入' }

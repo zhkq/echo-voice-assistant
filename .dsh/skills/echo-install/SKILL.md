@@ -183,10 +183,18 @@ bash "$kit/echo-install/scripts/echo-install-components.sh" \
 > / `--meetings-dir` / `--notes-dir` / `--pip-index`），只是写法从 `-PascalCase` 变成 `--kebab-case`。
 > 脚本自带 `--help`。
 
-两边这个脚本都做五件事：装所选引擎的 **pip 依赖** → **准备智能体**（查 npx、预热
-`npx -y @deepseek-ai/dsh` —— 首次那几十 MB 就是在这里下的）→ 起服务 → **下载所选模型**
-（ModelScope 优先，回落 hf-mirror，带进度与超时）→ 写设置 → **自检并登记**。
-**幂等**：已经装好的会跳过，重跑安全。
+两边这个脚本都做五件事：装所选引擎的 **pip 依赖** → **准备智能体**（把标准版 harness
+**永久装到 `<安装目录>/harness/dsh`**，冷启动约 10 秒；装不上才回退 `npx -y @deepseek-ai/dsh`）
+→ 起服务 → **下载所选模型**（ModelScope 优先，回落 hf-mirror，带进度与超时）→ 写设置 →
+**自检并登记**。**幂等**：已经装好的会跳过，重跑安全。
+
+> **为什么改成永久安装（2026-09-22）**：同一台机器实测 `npx -y @deepseek-ai/dsh web` 冷启动
+> **2 分 10 秒**，直连本地 `lib/bin.js` 只要 **9 秒** —— npx 每次都要重新解析安装。脚本会把
+> `"<node 全路径>" "<安装目录>/harness/dsh/node_modules/@deepseek-ai/dsh/lib/bin.js" web`
+> 写进设置的 **`harnessCommand`**（这是唯一会带空格的设置项，所以两边都按"一项一参数"传给
+> `/api/settings`，Windows 侧走 `$values['harnessCommand']`、macOS 侧走数组 `"${SETTINGS[@]}"`）。
+> 装完还会做一次**完整性自检**：`lib/bin.js` 存在且非空、任何 `node-pty` 都带 `package.json`
+> 与 `lib/index.js` —— 同事踩过"目录在、文件被截断"导致 dsh 直接加载失败。
 
 三个要点（都是 2026-09-21 实测踩出来的）：
 
@@ -236,7 +244,7 @@ curl -s "http://127.0.0.1:$port/api/models" | ./venv/bin/python -m json.tool | h
 | **macOS**：浮动条没出现 | 需要 Apple Command Line Tools（`xcode-select --install`）后跑 `bash mac/build_sidebar.sh`；**没有也能用**：浏览器打开面板即可 |
 | **macOS**：`brew` 找不到 | 先装 Homebrew（https://brew.sh），再重跑 `mac/setup_mac.sh` |
 | **macOS**：装 `funasr`/`torch` 很慢 | Apple 芯片装的是普通版 torch（走 MPS，**不要**装 CUDA 版）；嫌大就先只装 `sherpa` |
-| 智能体没起来（纪要/归档/指令不能用） | 需要 **Node.js**：装 Node 后重跑第 3 步的组件脚本（`-Agent harness` / `--agent harness`）—— ECHO 会自动拉起标准版；或改用已装的 DSH 桌面版。**注意**：node 装在托管目录（如 WorkBuddy）里、不在系统 PATH 时，ECHO 自己会探测（2026-09-22 起），但仍建议把 npx 全路径写进「启动命令」 |
+| 智能体没起来（纪要/归档/指令不能用） | 需要 **Node.js**：装 Node 后重跑第 3 步的组件脚本（`-Agent harness` / `--agent harness`）—— 脚本会把标准版**永久装到 `<安装目录>/harness/dsh`** 并写好 `harnessCommand`，ECHO 直接拉起（冷启动约 10 秒）；或改用已装的 DSH 桌面版。**注意**：node 装在托管目录（如 WorkBuddy）里、不在系统 PATH 时，ECHO 自己会探测（2026-09-22 起）；若 `harnessCommand` 里是 `npx …`（回退路径），第一次启动仍要等 1-2 分钟 |
 | npm 报 `SAFE_DELETE_BULK_CONFIRM_REQUIRED` | 宿主（WorkBuddy 等）的安全删除 shim 拦了批量删除。装 dsh 时带 `CODEBUDDY_SAFE_DELETE_ENABLED=0`；**别中途 kill npx/npm**，否则包会装残（`node-pty` 缺 `index.js`） |
 | 改设置报 `422 … ["body","values"] Field required` | `PUT /api/settings` 的 body 必须包一层：`{"values": {"harnessCommand": "…"}}`；`agentBackend` 写 `harness`（不是组件名 `agent-harness`）并同时开 `agentHarnessEnabled` |
 | `pip` 慢 / 超时 | Windows 加 `-PipIndex https://pypi.tuna.tsinghua.edu.cn/simple`；mac 加 `--pip-index https://pypi.tuna.tsinghua.edu.cn/simple`，重跑（已装好的会跳过） |

@@ -324,8 +324,7 @@ install_pip_deps() {
   local pip_args=""
   if [ -n "$PIP_INDEX" ]; then pip_args="-i $PIP_INDEX"; say "pip 源：$PIP_INDEX"; fi
   # 这里就是要按空格拆成多个包名 / 参数，所以不加引号
-  # shellcheck disable=SC2086
-  if "$PY" -m pip install --no-warn-script-location $pip_args $pkgs; then
+    if "$PY" -m pip install --no-warn-script-location $pip_args $pkgs; then
     ok "pip 返回成功：$pkgs"
   else
     warn "pip 返回非零 —— 下面会用 import 逐个复核，装不上的会明确列出来"
@@ -475,35 +474,63 @@ if [ "$ACCEL_CUDA" -eq 1 ]; then
   warn "mac 上没有 CUDA —— 忽略 --accel-cuda（Apple 芯片走 MPS，装普通版 torch 即可）"
 fi
 
-# shellcheck disable=SC2086
 PIPS="${PIPS# }"
-# shellcheck disable=SC2086
 MODEL_IDS="${MODEL_IDS# }"
-# shellcheck disable=SC2086
 install_pip_deps "$PIPS"
-# shellcheck disable=SC2086
 ENGINE_LIST="${ENGINE_LIST# }"
 
-# 智能体（标准版 harness）以前**不是**安装里的一步：只写两个设置键，harness 由 ECHO 在后台
-# 静默拉起（`npx -y @deepseek-ai/dsh`，首次要下几十 MB）—— 用户选完看不到任何动静
-# （2026-09-21 实测："选了 dsh 标准版，没看到下载提示"）。这里变成显式的一步。
+# 智能体（标准版 harness）：**本地永久安装 + 绝对路径直连**（2026-09-22 改）。
+# 为什么不用 npx：同一台机器实测 `npx -y @deepseek-ai/dsh web` 冷启动要 **2 分 10 秒**，
+# 而直连本地 bin.js 只要 **9 秒** —— 慢在 npx 每次重新解析安装 + 回滚清理。
+# 绝对路径还顺带绕开"进程 PATH 里没有 node"与宿主的安全删除 shim。失败则回退 npx。
+HARNESS_COMMAND=""
 prepare_agent() {
   [ "$AGENT" = "harness" ] || return 0
-  step "准备智能体（标准版 harness）"
-  if ! command -v npx >/dev/null 2>&1; then
-    warn "没找到 npx —— harness 靠 npx 起，需要本机有 Node.js"
-    say "  装了 Node 再重跑本脚本；装了但不在 PATH 里时，把面板 → 设置 → 智能体里的"
-    say "  「harness 启动命令」改成 npx 的全路径。"
+  step "准备智能体（标准版 harness：本地永久安装）"
+  local node_bin="" d=""
+  if command -v node >/dev/null 2>&1; then node_bin="$(command -v node)"; fi
+  if [ -z "$node_bin" ]; then
+    for d in /opt/homebrew/bin /usr/local/bin "$HOME/.volta/bin"; do
+      if [ -x "$d/node" ]; then node_bin="$d/node"; break; fi
+    done
+  fi
+  if [ -z "$node_bin" ]; then
+    warn "没找到 node —— 标准版 harness 需要 Node.js（brew install node）"
     return 1
   fi
-  ok "npx: $(command -v npx)"
-  say "预热 npm 包（首次要从 npm 拉，几十 MB —— 这是唯一一次慢）…"
-  if npx -y @deepseek-ai/dsh --version 2>&1 | sed 's/^/      /'; then
-    ok "harness 包已就绪（npx 缓存里）"
-    return 0
+  ok "node: $node_bin"
+
+  local target="$ROOT/harness/dsh"
+  local entry="$target/node_modules/@deepseek-ai/dsh/lib/bin.js"
+  if [ ! -s "$entry" ]; then
+    if ! command -v npm >/dev/null 2>&1; then
+      warn "没找到 npm —— 回退到 npx，首次启动要多等 1-2 分钟"
+      return 1
+    fi
+    mkdir -p "$target"
+    if [ ! -f "$target/package.json" ]; then
+      printf '{"name":"echo-harness","private":true}\n' > "$target/package.json"
+    fi
+    say "下载并安装标准版（一次性，几十 MB，可能要几分钟；请勿中断）..."
+    ( cd "$target" && npm install '@deepseek-ai/dsh@0.1.5-rc.2' --no-audit --no-fund 2>&1 | sed 's/^/      /' )
+    if [ ! -s "$entry" ]; then
+      warn "标准版没装成 —— 回退到 npx，首次启动要多等 1-2 分钟"
+      return 1
+    fi
   fi
-  warn "预热失败 —— 首次启动时 ECHO 会再试一次，可能要等 1–2 分钟"
-  return 1
+  # 完整性自检：同事踩过"目录在、文件被截断"（node-pty 缺 index.js，dsh 直接加载失败）
+  local pty=""
+  for pty in $(find "$target" -type d -name node-pty 2>/dev/null); do
+    if [ ! -f "$pty/package.json" ] || [ ! -f "$pty/lib/index.js" ]; then
+      warn "安装不完整：$pty 缺 package.json / lib/index.js"
+      say "  修法：删掉 $target 后重跑本脚本"
+      return 1
+    fi
+  done
+  HARNESS_COMMAND="\"$node_bin\" \"$entry\" web"
+  ok "标准版已就绪（本地永久安装，冷启动约 10 秒）"
+  say "  启动命令：$HARNESS_COMMAND"
+  return 0
 }
 
 wait_harness() {   # 写完设置后 ECHO 会自动拉起；这里等它 online
@@ -518,7 +545,11 @@ wait_harness() {   # 写完设置后 ECHO 会自动拉起；这里等它 online
     sleep 5
     waited=$((waited + 5))
   done
-  warn "等 150s 仍未就绪 —— 看 logs 下的 harness 日志（首次从 npm 拉包慢是常见的）"
+  if [ -n "$HARNESS_COMMAND" ]; then
+    warn "等 150s 仍未就绪 —— 看 logs 下的 harness 日志；本地件已装好，先查 node 能否直接跑"
+  else
+    warn "等 150s 仍未就绪 —— 看 logs 下的 harness 日志（回退到 npx，首次拉包慢是常见的）"
+  fi
   return 1
 }
 
@@ -550,25 +581,28 @@ for id in $MODEL_IDS; do
   install_model "$id" || true
 done
 
-SETTINGS=""
+SETTINGS=()
 if [ -n "$FIRST_STT" ]; then
-  SETTINGS="sttModel=$FIRST_STT"
+  SETTINGS+=("sttModel=$FIRST_STT")
   # 会议通常要更准：选里有 whisper 档就用它
-  if [ -n "$WHISPER_STT" ]; then SETTINGS="$SETTINGS meetingSttModel=$WHISPER_STT"
-  else SETTINGS="$SETTINGS meetingSttModel=$FIRST_STT"; fi
+  if [ -n "$WHISPER_STT" ]; then SETTINGS+=("meetingSttModel=$WHISPER_STT")
+  else SETTINGS+=("meetingSttModel=$FIRST_STT"); fi
 fi
-if [ "$WAKE" -eq 1 ]; then SETTINGS="$SETTINGS wakeEnabled=true"; fi
-if [ -n "$MODELS_DIR" ]; then SETTINGS="$SETTINGS modelsDir=$MODELS_DIR"; fi
-if [ -n "$MEETINGS_DIR" ]; then SETTINGS="$SETTINGS meetingsDir=$MEETINGS_DIR"; fi
-if [ -n "$NOTES_DIR" ]; then SETTINGS="$SETTINGS worklogVaultRoot=$NOTES_DIR worklogEnabled=true"; fi
+if [ "$WAKE" -eq 1 ]; then SETTINGS+=("wakeEnabled=true"); fi
+if [ -n "$MODELS_DIR" ]; then SETTINGS+=("modelsDir=$MODELS_DIR"); fi
+if [ -n "$MEETINGS_DIR" ]; then SETTINGS+=("meetingsDir=$MEETINGS_DIR"); fi
+if [ -n "$NOTES_DIR" ]; then SETTINGS+=("worklogVaultRoot=$NOTES_DIR" "worklogEnabled=true"); fi
 case "$AGENT" in
-  harness) SETTINGS="$SETTINGS agentBackend=harness agentHarnessEnabled=true" ;;
-  dsh)     SETTINGS="$SETTINGS agentBackend=dsh" ;;
+  harness)
+    SETTINGS+=("agentBackend=harness" "agentHarnessEnabled=true")
+    # 本地永久安装时写绝对路径：冷启动 ~10s；没装成就不写，交给 npx 默认值
+    if [ -n "$HARNESS_COMMAND" ]; then SETTINGS+=("harnessCommand=$HARNESS_COMMAND"); fi
+    ;;
+  dsh)     SETTINGS+=("agentBackend=dsh") ;;
   none)    ;;
   *)       warn "不认识的 --agent：$AGENT（按 none 处理）" ;;
 esac
-# shellcheck disable=SC2086
-write_settings $SETTINGS || true
+if [ "${#SETTINGS[@]}" -gt 0 ]; then write_settings "${SETTINGS[@]}" || true; else say "没有要写的设置"; fi
 
 step "自检"
 api GET /api/status "" 20 | json_query components || warn "取 /api/status 失败"
