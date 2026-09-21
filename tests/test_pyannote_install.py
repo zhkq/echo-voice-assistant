@@ -68,17 +68,43 @@ class PyannoteInstallTests(unittest.TestCase):
 
     def test_hf_fallback_uses_the_official_endpoint(self):
         """ModelScope 失败才回落 HF，且必须打官方 endpoint（镜像另说）。"""
-        with patch("modelscope.snapshot_download", side_effect=RuntimeError("ms down")), \
-                patch("huggingface_hub.get_token", return_value="test-token"), \
-                patch("huggingface_hub.hf_hub_download") as download, \
-                patch.object(installer, "complete", return_value=True):
-            installer.download()
-        self.assertEqual(download.call_count, 4)
-        for call, (repo, folder, filename) in zip(download.call_args_list, installer.ASSETS):
-            self.assertEqual(call.kwargs["endpoint"], "https://huggingface.co")
-            self.assertEqual(call.kwargs["repo_id"], repo)
-            self.assertEqual(call.kwargs["filename"], filename)
-            self.assertEqual(call.kwargs["local_dir"], str(installer.MODEL_ROOT / folder))
+        with tempfile.TemporaryDirectory() as folder:
+            with patch("modelscope.snapshot_download", side_effect=RuntimeError("ms down")), \
+                    patch("huggingface_hub.get_token", return_value="test-token"), \
+                    patch("huggingface_hub.hf_hub_download") as download, \
+                    patch.object(installer, "model_root", lambda: Path(folder)), \
+                    patch.object(installer, "complete", return_value=True):
+                installer.download()
+            self.assertEqual(download.call_count, 4)
+            for call, (repo, folder_name, filename) in zip(download.call_args_list, installer.ASSETS):
+                self.assertEqual(call.kwargs["endpoint"], "https://huggingface.co")
+                self.assertEqual(call.kwargs["repo_id"], repo)
+                self.assertEqual(call.kwargs["filename"], filename)
+                self.assertEqual(call.kwargs["local_dir"], str(Path(folder) / folder_name))
+
+    def test_model_root_follows_the_configured_models_dir(self):
+        """落点必须跟着**可配置的** modelsDir 走 —— 否则"下到 A 地、查 B 地"。
+
+        2026-09-22 同事实测：装着装着改了模型目录，pyannote 就永远显示未就绪。
+        """
+        with tempfile.TemporaryDirectory() as folder:
+            with patch("app.paths.models_root", lambda: folder):
+                self.assertEqual(installer.model_root(), Path(folder) / "pyannote")
+        # 拿不到 app.paths 时才退回安装根下的兜底路径
+        with patch.dict("sys.modules", {"app": None, "app.paths": None}):
+            self.assertEqual(installer.model_root(), installer.MODEL_ROOT)
+
+    def test_complete_checks_the_same_place_it_downloads_to(self):
+        """写与查同源：下载用哪个根，complete() 默认就查哪个根。"""
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder) / "pyannote"
+            with patch.object(installer, "model_root", lambda: root):
+                self.assertFalse(installer.complete(), "空目录不该算完整")
+                for _, directory, filename in installer.ASSETS:
+                    path = root / directory / filename
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_bytes(b"test model")
+                self.assertTrue(installer.complete())
 
 
 if __name__ == "__main__":

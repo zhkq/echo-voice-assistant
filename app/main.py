@@ -12,6 +12,13 @@ import time
 from contextlib import asynccontextmanager
 
 from app import paths
+from app import netlocal
+
+# 本机回环调用不经过系统代理。企业机器上常设 http_proxy，而 ECHO 与自己的本地服务
+# （面板 API / 模型路由 / 独立 harness / DSH Desktop）全靠 127.0.0.1 —— 被代理劫走就是
+# "服务明明在跑、ECHO 却认为它挂了"（2026-09-22 同事反馈 B2）。进程一启动就装上，
+# 越早越好：之后所有 urllib 调用都受益，也不必逐个调用点去改。
+netlocal.install_loopback_bypass()
 
 # 输出被 -RedirectStandardOutput 重定向到文件后默认是块缓冲，
 # 导致 print 日志迟迟不落盘。改成行缓冲，日志即时可见。

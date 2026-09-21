@@ -181,3 +181,16 @@ def gpu_info():
         out.update({"vendor": "nvidia", "name": parts[0], "vramMb": vram,
                     "driver": parts[2], "source": "nvidia-smi"})
     return out
+
+
+def node_dirs():
+    """可能装着 node/npx 的目录（按可信度排序）。见 win32 同名的说明。"""
+    home = os.path.expanduser("~")
+    out = ["/usr/local/bin", "/usr/bin", "/bin"]
+    nvm = os.path.join(home, ".nvm", "versions", "node")
+    try:
+        out += [os.path.join(nvm, v, "bin") for v in sorted(os.listdir(nvm), reverse=True)]
+    except OSError:
+        pass
+    out.append(os.path.join(home, ".volta", "bin"))
+    return [d for d in out if d and os.path.isdir(d)]

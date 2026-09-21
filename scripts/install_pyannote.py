@@ -6,6 +6,7 @@ import subprocess
 import sys
 
 ROOT = Path(__file__).resolve().parents[1]
+#: 兜底落点。**真正该用的是 model_root()** —— 这个常量只在"拿不到 app.paths"时才用。
 MODEL_ROOT = ROOT / "models" / "pyannote"
 ASSETS = (
     ("pyannote/segmentation-3.0", "pyannote-segmentation-3.0-local", "pytorch_model.bin"),
@@ -13,6 +14,26 @@ ASSETS = (
     ("pyannote/speaker-diarization-community-1", "pyannote-plda-local", "plda/plda.npz"),
     ("pyannote/speaker-diarization-community-1", "pyannote-plda-local", "plda/xvec_transform.npz"),
 )
+
+
+def model_root():
+    """pyannote 的落点：**必须与就绪判据同一个来源**（``app.paths.models_root()``）。
+
+    2026-09-22 修：原先 ``download()`` 与 ``complete()`` 都写死 ``MODEL_ROOT``
+    （= ``<安装根>/models/pyannote``），而 ``modelinfo.ready_pyannote()`` 查的是**可配置的**
+    ``modelsDir``。同事在安装时填了「模型放哪」，就出现"下到 A 地、查 B 地" —— 装完永远
+    显示未就绪。默认值相同时才看不出来，所以这个坑只在"用户改过模型目录"时暴露。
+
+    ``scripts/`` 下的脚本直接运行时 sys.path[0] 是 ``scripts/``，所以要自己把 ECHO 根塞进去，
+    否则 ``import app`` 会失败、悄悄退回兜底路径（那就等于没修）。
+    """
+    try:
+        if str(ROOT) not in sys.path:
+            sys.path.insert(0, str(ROOT))
+        from app import paths
+        return Path(paths.models_root()) / "pyannote"
+    except Exception:
+        return MODEL_ROOT
 ACCESS_HELP = (
     "请先在 Hugging Face 官方页面同意模型使用条件：\n"
     "https://huggingface.co/pyannote/segmentation-3.0\n"
@@ -21,7 +42,8 @@ ACCESS_HELP = (
 )
 
 
-def complete(root=MODEL_ROOT):
+def complete(root=None):
+    root = Path(root) if root else model_root()
     return all((root / folder / filename).is_file()
                and (root / folder / filename).stat().st_size > 0
                for _, folder, filename in ASSETS)
@@ -30,15 +52,17 @@ def complete(root=MODEL_ROOT):
 def download():
     # This script runs in a separate process: do not change the server's offline mode.
     os.environ["HF_HUB_OFFLINE"] = "0"
+    root = model_root()                     # ← 与就绪判据同源（别再写 MODEL_ROOT）
+    print(f"落点：{root}", flush=True)
     # ① ModelScope 优先：三个仓库在那边**同名且匿名可下**（2026-09-21 实测），
     #    既不用 HF Token，也不碰公司代理对 hf 证书的拦截。
     try:
         from modelscope import snapshot_download
         for repo, folder, filename in ASSETS:
             print(f"下载 {repo} / {filename}（ModelScope）", flush=True)
-            snapshot_download(repo, local_dir=str(MODEL_ROOT / folder),
+            snapshot_download(repo, local_dir=str(root / folder),
                               allow_patterns=[filename])
-        if complete():
+        if complete(root):
             print("模型文件下载完成（来自 ModelScope）。")
             return
         print("ModelScope 下来的文件不完整，改用 Hugging Face。", flush=True)
@@ -58,8 +82,8 @@ def download():
     for repo, folder, filename in ASSETS:
         print(f"下载 {repo} / {filename}", flush=True)
         hf_hub_download(repo_id=repo, filename=filename, token=token,
-                        endpoint="https://huggingface.co", local_dir=str(MODEL_ROOT / folder))
-    if not complete():
+                        endpoint="https://huggingface.co", local_dir=str(root / folder))
+    if not complete(root):
         raise RuntimeError("模型文件不完整，请重试下载。")
 
 

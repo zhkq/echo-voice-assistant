@@ -26,7 +26,7 @@ whenToUse: 新机器首装 ECHO（Windows 或 macOS）；或把 ECHO 交给同�
 | **装到哪个目录** | Windows `D:\ECHO`（没 D 盘就用空间最大的盘）；macOS `~/ECHO` | ⚠ **必须纯英文路径**，别放桌面/中文/OneDrive/iCloud —— 转写引擎读中文路径会出问题 |
 | **转写方式**（可多选，见下表） | **`sherpa`**（边听边出字，189 MB，**不需要独显**） | 这是唯一"装完立刻能用又不吃显卡"的一档 |
 | **要不要唤醒词**（喊一声就开始） | 不要 | 要常开麦克风，有隐私成本；模型 40 MB |
-| **要不要说话人分离**（会议里区分谁在说） | 不要 | 需 HF 授权（gated），ECHO 不能替你下 |
+| **要不要说话人分离**（会议里区分谁在说） | 不要（除非会议真的要区分谁在说） | 现在可一键装（ModelScope 匿名可下）；**使用条款请用户自行确认** |
 | **要不要显卡加速 / 方言口音** | 不要 | Windows 要 N 卡（mac 没有 CUDA，见下）；方言档 3.6 GB，还得先有 torch |
 | **模型 / 会议文件 / 笔记库放哪** | 留空=默认（都在安装目录下） | 填了「笔记库」就会把纪要归档到那儿（通常是你已有的 Obsidian 库） |
 
@@ -236,10 +236,12 @@ curl -s "http://127.0.0.1:$port/api/models" | ./venv/bin/python -m json.tool | h
 | **macOS**：浮动条没出现 | 需要 Apple Command Line Tools（`xcode-select --install`）后跑 `bash mac/build_sidebar.sh`；**没有也能用**：浏览器打开面板即可 |
 | **macOS**：`brew` 找不到 | 先装 Homebrew（https://brew.sh），再重跑 `mac/setup_mac.sh` |
 | **macOS**：装 `funasr`/`torch` 很慢 | Apple 芯片装的是普通版 torch（走 MPS，**不要**装 CUDA 版）；嫌大就先只装 `sherpa` |
-| 智能体没起来（纪要/归档/指令不能用） | 需要 **Node.js**：装 Node 后重跑第 3 步的组件脚本（`-Agent harness` / `--agent harness`）—— ECHO 会自动拉起标准版；或改用已装的 DSH 桌面版 |
+| 智能体没起来（纪要/归档/指令不能用） | 需要 **Node.js**：装 Node 后重跑第 3 步的组件脚本（`-Agent harness` / `--agent harness`）—— ECHO 会自动拉起标准版；或改用已装的 DSH 桌面版。**注意**：node 装在托管目录（如 WorkBuddy）里、不在系统 PATH 时，ECHO 自己会探测（2026-09-22 起），但仍建议把 npx 全路径写进「启动命令」 |
+| npm 报 `SAFE_DELETE_BULK_CONFIRM_REQUIRED` | 宿主（WorkBuddy 等）的安全删除 shim 拦了批量删除。装 dsh 时带 `CODEBUDDY_SAFE_DELETE_ENABLED=0`；**别中途 kill npx/npm**，否则包会装残（`node-pty` 缺 `index.js`） |
+| 改设置报 `422 … ["body","values"] Field required` | `PUT /api/settings` 的 body 必须包一层：`{"values": {"harnessCommand": "…"}}`；`agentBackend` 写 `harness`（不是组件名 `agent-harness`）并同时开 `agentHarnessEnabled` |
 | `pip` 慢 / 超时 | Windows 加 `-PipIndex https://pypi.tuna.tsinghua.edu.cn/simple`；mac 加 `--pip-index https://pypi.tuna.tsinghua.edu.cn/simple`，重跑（已装好的会跳过） |
 | 模型下载慢或卡住 | 挑更小的档位（如 `whisper-tiny`）；下载在 ECHO 服务里继续跑，可不盯；进度看面板 → 能力 |
-| **说话人分离**装不上 | pyannote 是 HF gated 模型：让用户自己去 HF **同意条款**再拉，ECHO 不代下（许可证不允许再分发） |
+| **说话人分离**装不上 | 2026-09-21 起三件套从 **ModelScope 匿名可下**（`scripts/install_pyannote.py`，ModelScope 优先、HF 兜底）。先查两件事：① 是不是改过「模型放哪」——落点跟随 `modelsDir`；② 使用条款是否已由用户确认 |
 | 老机器磁盘不够 | 只装 `sherpa`（189 MB）+ 不装唤醒词，安装目录约 0.4 GB |
 | **macOS**：脚本报 `$'\r': command not found` | 说明 `.sh` 被传成了 CRLF（Windows 上解压/复制过的痕迹）。用 `bash` 跑之前先 `perl -pi -e 's/\r$//' 文件` 或重新从 zip 解一次 |
 

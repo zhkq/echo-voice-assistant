@@ -164,6 +164,43 @@ def _argv():
     return [exe] + parts[1:]
 
 
+#: npx 的可执行名（Windows 上是 npx.cmd —— isfile 判断不认 PATHEXT）
+_NPX_NAMES = ("npx.cmd", "npx.exe", "npx")
+
+
+def find_node_dir():
+    """本机 node/npx 所在目录；找不到返回空串。平台差异一律走 ``app.platform`` 接缝。"""
+    from app import platform as echo_platform
+    try:
+        dirs = echo_platform.node_dirs()
+    except Exception:
+        dirs = []
+    for d in dirs:
+        for name in _NPX_NAMES:
+            if os.path.isfile(os.path.join(d, name)):
+                return d
+    return ""
+
+
+def ensure_node_on_path():
+    """把 node 目录补进**本进程**的 PATH（幂等），返回补进去的目录（没找到则空串）。
+
+    为什么必须改本进程（2026-09-22 同事反馈 B1）：``shutil.which("npx")`` 读的是**本进程**的
+    ``os.environ``，早于给子进程准备的那份 env —— 所以"只在 Popen 前构造 env"完全没用，
+    ``_argv()`` 里那句 which 依旧返回 None，harness 就被静默放弃了。
+
+    顺带的好处：在 ``env = dict(os.environ)`` **之前**调用，子进程也会自动继承这条 PATH。
+    """
+    d = find_node_dir()
+    if not d:
+        return ""
+    cur = os.environ.get("PATH", "")
+    have = [p.lower() for p in cur.split(os.pathsep) if p]
+    if d.lower() not in have:
+        os.environ["PATH"] = d + os.pathsep + cur
+    return d
+
+
 def _read_output(proc):
     """后台读子进程输出：写日志 + 抓 token。"""
     global _token
@@ -292,6 +329,9 @@ def ensure_running(timeout=None):
     实测过：43199 与 43206 两个 node 同时在跑）。
     """
     global _proc, _proc_pid, _last_launch
+    # 先把 node 目录补进**本进程** PATH —— `shutil.which` 读的是它，而不是下面给子进程的 env。
+    # 桌面快捷方式启动时 PATH 里常常没有托管式 node（2026-09-22 同事反馈 B1）。
+    ensure_node_on_path()
     wait_for = READY_TIMEOUT if timeout is None else max(0.0, float(timeout))
     conflict = port_conflict()
     if conflict:

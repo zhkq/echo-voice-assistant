@@ -377,3 +377,33 @@ def gpu_info():
         out.update({"vendor": "nvidia", "name": parts[0], "vramMb": vram,
                     "driver": parts[2], "source": "nvidia-smi"})
     return out
+
+
+def node_dirs():
+    """可能装着 node/npx 的目录（按可信度排序）。
+
+    为什么需要（2026-09-22 同事反馈 B1）：ECHO 由**桌面快捷方式**启动时，进程 PATH 里可能
+    没有 node —— 机器上只有 WorkBuddy / nvm 这类"托管"node，它们不写系统 PATH。而独立
+    harness 靠 npx 起，于是静默失败（只在 /api/boot/status 里看到 failed）。
+    托管式 node 放最前：那种机器上它通常才是唯一可用的。
+    """
+    home = os.path.expanduser("~")
+    out = []
+    # ① 托管式 node（WorkBuddy 装在自家 binaries 下；版本目录名倒序 = 新版本在前）
+    base = os.path.join(home, ".workbuddy", "binaries", "node", "versions")
+    try:
+        out += [os.path.join(base, v) for v in sorted(os.listdir(base), reverse=True)]
+    except OSError:
+        pass
+    # ② nvm-windows 的 current 软链
+    appdata = os.environ.get("APPDATA", "")
+    if appdata:
+        out.append(os.path.join(appdata, "nvm", "current"))
+    # ③ 官方安装包（环境变量为空时跳过，免得拼出相对路径）
+    for env_name, tail in (("ProgramFiles", "nodejs"),
+                           ("ProgramFiles(x86)", "nodejs"),
+                           ("LOCALAPPDATA", os.path.join("Programs", "nodejs"))):
+        root = os.environ.get(env_name, "")
+        if root:
+            out.append(os.path.join(root, tail))
+    return [d for d in out if d and os.path.isdir(d)]

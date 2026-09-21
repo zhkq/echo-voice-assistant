@@ -170,3 +170,16 @@ def gpu_info():
     所以这里如实返回"未知"，不编造型号 —— 向导据此不显示"用显卡加速"那一步。
     """
     return {"vendor": "", "name": "", "vramMb": 0, "driver": "", "source": ""}
+
+
+def node_dirs():
+    """可能装着 node/npx 的目录（按可信度排序）。见 win32 同名的说明。"""
+    home = os.path.expanduser("~")
+    out = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"]
+    nvm = os.path.join(home, ".nvm", "versions", "node")
+    try:
+        out += [os.path.join(nvm, v, "bin") for v in sorted(os.listdir(nvm), reverse=True)]
+    except OSError:
+        pass
+    out.append(os.path.join(home, ".volta", "bin"))
+    return [d for d in out if d and os.path.isdir(d)]

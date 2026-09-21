@@ -320,3 +320,18 @@ def gpu_info() -> dict:
         if key in data:
             out[key] = data[key]
     return out
+
+
+def node_dirs() -> list:
+    """本机**可能**装着 node/npx 的目录（按可信度排序）。没有实现或都没有时返回空列表。
+
+    用途：ECHO 由桌面快捷方式启动时，进程 PATH 里未必有 node（托管式 node 故意不写系统
+    PATH），而独立 harness 靠 npx 起 —— 找不到就静默失败（2026-09-22 同事反馈 B1）。
+    """
+    fn = _platform_fn("node_dirs")
+    if not callable(fn):
+        return []
+    try:
+        return [str(d) for d in (fn() or []) if d]
+    except Exception:
+        return []
