@@ -155,6 +155,11 @@ function Find-DeliveryZip {
     # models/ 半解到安装目录里。2026-09-20 实测踩到：install.bat 原来那个 for 循环按字母序
     # 正好选中 ECHO-offline-*。所以先排除组件类（中英两种命名都认），再按时间取最新；
     # 实在只剩组件包时（有人只拷了一个包过来）才退而用它，让用户看到真实报错。
+    #
+    # 2026-09-21 增补：还要排除**外层工具包**（ECHO-kit-*.zip）。发给同事的就是它 ——
+    # 里面装着主包 + 安装技能，名字同样匹配 ECHO-*.zip，而且往往**比主包更新**
+    # （先打主包、后压工具包）。只按时间取最新就会选中它，解出来根本没有 manifest.json。
+    # 同事反馈"资料目录里找不到 install.ps1"就是这一串问题的入口。
     $dirs = @($PSScriptRoot)
     $dl = Join-Path $env:USERPROFILE 'Downloads'
     if (Test-Path $dl) { $dirs += $dl }
@@ -166,7 +171,7 @@ function Find-DeliveryZip {
         foreach ($f in @(Get-ChildItem $d -Filter 'ECHO-*.zip' -File -ErrorAction SilentlyContinue)) {
             $all += $f
             $isPack = $false
-            foreach ($p in @('*-offline-*', '*-component-*', '*组件*')) {
+            foreach ($p in @('*-offline-*', '*-component-*', '*组件*', '*-kit-*', '*工具包*')) {
                 if ($f.Name -like $p) { $isPack = $true; break }
             }
             if (-not $isPack) { $preferred += $f }

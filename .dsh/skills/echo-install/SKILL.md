@@ -66,13 +66,25 @@ dotnet --list-runtimes 2>$null | Select-String 'WindowsDesktop.App 7\.'
 
 ### ① 解开主包 + 准备运行时
 
+> ⚠️ **`install.ps1` 在 `ECHO-main-*.zip` 里面**（路径是 `ECHO\scripts\install.ps1`）。
+> 资料目录里**没有**散着的 `install.ps1` —— 别在那儿找它（2026-09-21 同事就卡在这里）。
+> 也不能只把 `install.ps1` 单独拷出来跑：它要跟同一个包里的 `manifest.json`、其它脚本待在一起。
+
 ```powershell
-$pkg = '<资料目录>'                     # 主包 zip 所在目录（或直接给 zip 全路径）
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\install.ps1 `
-    -Zip "$pkg\ECHO-main-win-x64-*.zip" `
-    -DestDir 'D:\ECHO' -Silent
+$pkg  = 'C:\资料目录'          # 放着 ECHO-main-win-x64-*.zip 的那个目录
+$zip  = (Get-ChildItem "$pkg\ECHO-main-win-x64-*.zip" -File |
+         Sort-Object LastWriteTime -Descending | Select-Object -First 1).FullName
+$stage = Join-Path $env:TEMP 'echo-pack'
+Expand-Archive -Path $zip -DestinationPath $stage -Force      # 先解出来
+
+powershell -NoProfile -ExecutionPolicy Bypass -File "$stage\ECHO\scripts\install.ps1" `
+    -Zip $zip -DestDir 'D:\ECHO' -Silent
+#                                  ↑ 显式传 -Zip：不传的话脚本要在自己的目录/上级/~/Downloads 里
+#                                    猜哪个 ECHO-*.zip 是交付包，资料目录里往往不止一个 zip
 # 加 -PipIndex https://pypi.tuna.tsinghua.edu.cn/simple  可换国内 pip 镜像（慢就用它）
 ```
+
+`$stage` 只是个中转站，装完可以删（`Remove-Item $stage -Recurse -Force`）—— 安装目录里已经有它要的东西了。
 
 主包**不含运行时**。`install.ps1` 会按三级降级找 CPython：
 `uv venv --python 3.11` → `py -3.11 -m venv` → **python.org 嵌入包 + get-pip**（约 11 MB，只依赖 python.org）。
@@ -81,14 +93,17 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\install.ps1 `
 ### ② 按确认结果装组件
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File `
-    "$PSScriptRoot\scripts\echo-install-components.ps1" `
+$skill = 'C:\资料目录\echo-install'      # 你手上的技能目录（里面是 scripts\）
+powershell -NoProfile -ExecutionPolicy Bypass -File "$skill\scripts\echo-install-components.ps1" `
     -DestDir 'D:\ECHO' `
     -Engines sherpa,whisper-base `      # ← 换成第 1 步确认的
     -Wake `                             # ← 用户要唤醒词才加
     -Agent harness `                    # 默认标准版
     -NotesDir 'D:\我的笔记库'            # ← 用户给了笔记库才加
 ```
+
+> 用**显式路径**（如上），别用 `$PSScriptRoot`：那条命令是在**你自己的终端**里执行的，
+> 内联运行时 `$PSScriptRoot` 是空的，会拼出 `\scripts\...` 这种不存在的路径。
 
 它做四件事：装所选引擎的 **pip 依赖** → 起服务 → **下载所选模型**（ModelScope / hf-mirror，带进度与超时）
 → 写设置（`sttModel`/`meetingSttModel`/`wakeEnabled`/`agentBackend`+`agentHarnessEnabled`/三处目录）。

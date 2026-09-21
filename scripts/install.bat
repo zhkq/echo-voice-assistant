@@ -23,7 +23,7 @@ echo.
 REM 自动发现同目录下的交付包 zip（若有，传给 install.ps1）
 set "ZIP="
 for %%f in ("%~dp0ECHO-*.zip") do (
-    echo %%~nxf | findstr /I /C:"-offline-" /C:"-component-" >nul || set "ZIP=%%f"
+    echo %%~nxf | findstr /I /C:"-offline-" /C:"-component-" /C:"-kit-" >nul || set "ZIP=%%f"
 )
 if defined ZIP (
     echo  发现交付包: %ZIP%
