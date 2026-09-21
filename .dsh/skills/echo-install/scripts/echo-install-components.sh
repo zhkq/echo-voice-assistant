@@ -468,12 +468,17 @@ if [ "$WAKE" -eq 1 ]; then
 fi
 if [ "$DIARIZE" -eq 1 ]; then
   PIPS="$PIPS pyannote.audio torch"
-  warn "说话人分离（pyannote）是 HF 上的 gated 模型：ECHO 不能替你下载，要在 HF 同意条款后自己拉（面板 → 组件）"
+  MODEL_IDS="$MODEL_IDS pyannote"
+  warn "说话人分离的权重走 ModelScope 同名镜像（官方在 HF 上要求先同意条款）—— 请自行确认合规"
 fi
 if [ "$ACCEL_CUDA" -eq 1 ]; then
   warn "mac 上没有 CUDA —— 忽略 --accel-cuda（Apple 芯片走 MPS，装普通版 torch 即可）"
 fi
 
+# shellcheck disable=SC2086
+PIPS="${PIPS# }"
+# shellcheck disable=SC2086
+MODEL_IDS="${MODEL_IDS# }"
 # shellcheck disable=SC2086
 install_pip_deps "$PIPS"
 # shellcheck disable=SC2086

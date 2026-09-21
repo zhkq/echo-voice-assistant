@@ -177,5 +177,59 @@ class InstallReportTests(unittest.TestCase):
         self.assertIn("install-report.json", src)
 
 
+class PyannoteSourceTests(unittest.TestCase):
+    """说话人分离的权重：**改成从 ModelScope 自动装**（2026-09-21）。
+
+    背景：HF 上 pyannote 三个仓库是 gated（要同意条款 + Token），以前只能让用户自己去
+    HF 同意再拉 —— 同事选了"说话人分离"就卡在这一步。实测 ModelScope 上**同名仓库匿名可下**
+    （segmentation-3.0 / wespeaker-voxceleb-resnet34-LM / speaker-diarization-community-1，
+    含 plda/plda.npz 与 plda/xvec_transform.npz），于是能和别的引擎一样一键下载。
+
+    这里钉三件事：① 下载闸门不再拒绝；② 落盘目录与 `app/audio/diarize.py` 期望的一致；
+    ③ 权重**仍然不随交付包分发**（never_ship 不动）—— 那是"再分发"与"用户机器上下载"的分界。
+    """
+
+    def setUp(self):
+        from app import modelinfo
+        self.modelinfo = modelinfo
+
+    def test_download_gate_no_longer_refuses_pyannote(self):
+        entry = self.modelinfo._by_id("pyannote")
+        self.assertIsNotNone(entry, "目录里得有 pyannote")
+        self.assertIsNot(entry.get("downloadable"), False,
+                         "downloadable=False 会让面板和技能都下不了它")
+
+    def test_assets_land_where_diarize_looks(self):
+        import re
+        src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                "app", "audio", "diarize.py"), encoding="utf-8").read()
+        folders = {folder for _repo, folder, _files in self.modelinfo.PYANNOTE_ASSETS}
+        for folder in folders:
+            self.assertIn('"%s"' % folder, src,
+                          f"diarize.py 里找不到 {folder} —— 下载下来也用不上")
+        # plda 要落在 <folder>/plda/ 下（diarize 的 plda_dir 多拼了一层）
+        plda_files = [f for _r, folder, files in self.modelinfo.PYANNOTE_ASSETS
+                      if folder == "pyannote-plda-local" for f in files]
+        self.assertTrue(any(f.startswith("plda/") for f in plda_files),
+                        "plda 的两个文件必须在 plda/ 子目录里")
+
+    def test_weights_are_still_never_shipped(self):
+        from app import components
+        entry = [i for i in components.load_manifests() if i["id"] == "diarize-pyannote"][0]
+        self.assertTrue(entry.get("never_ship"),
+                        "权重仍不许随交付包分发 —— 只是允许在用户机器上下载")
+        self.assertEqual("modelscope", entry.get("source"))
+
+    def test_skill_installers_wire_diarize_to_the_download(self):
+        """技能里 --diarize 必须真的**触发下载**，不能只打一句提示。"""
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        ps1 = open(os.path.join(root, ".dsh", "skills", "echo-install", "scripts",
+                                "echo-install-components.ps1"), encoding="utf-8").read()
+        sh = open(os.path.join(root, ".dsh", "skills", "echo-install", "scripts",
+                               "echo-install-components.sh"), encoding="utf-8").read()
+        self.assertIn("@('pyannote',", ps1, "Windows 技能要把 pyannote 加进待下载清单")
+        self.assertIn("pyannote", sh, "mac 技能同理")
+
+
 if __name__ == "__main__":
     unittest.main()

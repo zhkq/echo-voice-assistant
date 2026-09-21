@@ -30,6 +30,21 @@ def complete(root=MODEL_ROOT):
 def download():
     # This script runs in a separate process: do not change the server's offline mode.
     os.environ["HF_HUB_OFFLINE"] = "0"
+    # ① ModelScope 优先：三个仓库在那边**同名且匿名可下**（2026-09-21 实测），
+    #    既不用 HF Token，也不碰公司代理对 hf 证书的拦截。
+    try:
+        from modelscope import snapshot_download
+        for repo, folder, filename in ASSETS:
+            print(f"下载 {repo} / {filename}（ModelScope）", flush=True)
+            snapshot_download(repo, local_dir=str(MODEL_ROOT / folder),
+                              allow_patterns=[filename])
+        if complete():
+            print("模型文件下载完成（来自 ModelScope）。")
+            return
+        print("ModelScope 下来的文件不完整，改用 Hugging Face。", flush=True)
+    except Exception as exc:
+        print(f"ModelScope 这条路没成（{type(exc).__name__}），改用 Hugging Face。", flush=True)
+    # ② 回落 HF（gated：需要同意条款 + Token）
     os.environ["HF_ENDPOINT"] = "https://huggingface.co"
     from huggingface_hub import get_token, hf_hub_download
 

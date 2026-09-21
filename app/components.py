@@ -140,11 +140,12 @@ def _builtin() -> List[dict]:
              model_id="kws", source="modelscope",
              how="自行获取 sherpa-onnx KWS 权重，按面板给的四个文件名放好"),
         dict(id="diarize-pyannote", kind="diarize", name="说话人分离（pyannote）", optional=True, required=False,
-             purpose="会议里区分不同说话人（HF 上是 gated 模型）",
+             purpose="会议里区分不同说话人（三件套；HF 上是 gated，ModelScope 上有同名开放镜像）",
              size_mb=32, platforms=["win32", "macos", "linux"], min_os={},
              model_id="pyannote",
-             source="hf-gated", never_ship=True,          # 许可证不允许再分发（D22 的例外）
-             how="面板给授权链接与下载命令；同意条款后由用户自己拉取"),
+             source="modelscope", never_ship=True,        # 权重仍不随包分发（只在你机器上下载）
+             how="点下载即可（ModelScope 同名仓库，匿名可下）。请自行确认 pyannote 的使用条款 ——"
+                 "官方在 HF 上要求先同意条件，走镜像等于跳过那一步。"),
     ]
 
 

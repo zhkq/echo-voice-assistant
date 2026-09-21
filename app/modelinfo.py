@@ -226,13 +226,18 @@ CATALOG += [
     dict(id="pyannote", group="可选功能", name="说话人分离（pyannote 三件套）",
          purpose="会议纪要区分说话人（设置里默认关闭）", size="模型与 PyTorch 等依赖需额外磁盘空间",
          target="models/pyannote/{pyannote-segmentation-3.0-local, pyannote-wespeaker-local, pyannote-plda-local}",
-         source="script", ref="pyannote/segmentation-3.0 + wespeaker-voxceleb-resnet34-LM",
-         cmd=_pyannote_command(), cmd_label="复制下载命令", downloadable=False,
-         links=[{"label": "分段模型授权", "url": "https://huggingface.co/pyannote/segmentation-3.0"},
-                {"label": "PLDA 模型授权", "url": "https://huggingface.co/pyannote/speaker-diarization-community-1"}],
-         how="首次需在官方页面同意使用条件，并通过 hf auth login 登录（只读 Token）。"
-             "复制下方命令到终端自行执行，即可将所需文件下载到对应目录。"
-             "命令仅下载模型；使用说话人分离还需安装 pyannote.audio 4.x 与 speechbrain 依赖。"),
+         # 2026-09-21：这三个仓库在 HF 上是 gated（要同意条款 + Token），但 ModelScope 上**同名
+         # 且匿名可下**，所以改成和别的引擎一样一键下载。之前只能让用户自己去 HF 同意条款再拉，
+         # 同事选了"说话人分离"就卡在这一步。
+         source="modelscope", ref="pyannote/segmentation-3.0 + wespeaker-voxceleb-resnet34-LM",
+         cmd=_pyannote_command(), cmd_label="复制下载命令",
+         links=[{"label": "分段模型（HF 条款页）", "url": "https://huggingface.co/pyannote/segmentation-3.0"},
+                {"label": "PLDA 模型（HF 条款页）", "url": "https://huggingface.co/pyannote/speaker-diarization-community-1"}],
+         how="点下载即可（走 ModelScope，与前面几个引擎一样）。"
+             "**请自行确认 pyannote 的使用条款**：官方在 HF 上要求先同意条件，"
+             "ModelScope 的同名仓库是公开镜像，走它等于跳过那一步 —— 这是使用者的合规判断。"
+             "权重不随 ECHO 交付包分发（只在你自己的机器上下载）。"
+             "另外还需安装 pyannote.audio 4.x 与 speechbrain 依赖（复制下方命令可装）。"),
 
     dict(id="kws", group="可选功能", name="唤醒词 KWS（kws-zh-en-3m）",
          purpose="语音唤醒（设置里默认关闭）", size="~39 MB",
@@ -352,6 +357,31 @@ def _downloaded_mb(mid):
     return sum(_dir_mb(p) for p in _watch_paths(mid) if os.path.isdir(p))
 
 
+#: pyannote 三件套：HF 上**同名仓库是 gated 的**（要同意条款 + Token），而 ModelScope 上
+#: 同名仓库**匿名可下**（2026-09-21 实测：三个 repo 都 200，且 plda/plda.npz、
+#: plda/xvec_transform.npz、两个 pytorch_model.bin 都在）。只取 ECHO 真正加载的那几个文件，
+#: 放进 `app/audio/diarize.py` 期望的目录结构。
+#: ⚠ 权重**仍然不随包分发**（components.py 的 never_ship=True 不动）—— 这是"在用户机器上下载"。
+PYANNOTE_ASSETS = (
+    ("pyannote/segmentation-3.0", "pyannote-segmentation-3.0-local", ["pytorch_model.bin"]),
+    ("pyannote/wespeaker-voxceleb-resnet34-LM", "pyannote-wespeaker-local", ["pytorch_model.bin"]),
+    ("pyannote/speaker-diarization-community-1", "pyannote-plda-local",
+     ["plda/plda.npz", "plda/xvec_transform.npz"]),
+)
+
+
+def download_pyannote() -> str:
+    """拉 pyannote 三件套（走 ModelScope）。返回实际用的源名。
+
+    历史上这一步只能由用户自己去 HF 同意条款、`hf auth login` 再下（gated），
+    而 ModelScope 上有同名仓库且匿名可下 —— 于是它和别的引擎一样能自动装了。
+    """
+    root = os.path.join(models_dir(), "pyannote")
+    for repo, folder, files in PYANNOTE_ASSETS:
+        _snapshot(ms_id=repo, local_dir=os.path.join(root, folder), allow=files)
+    return "modelscope"
+
+
 def _snapshot(ms_id: str = "", hf_id: str = "", local_dir=None, allow=None) -> str:
     """按「先 ModelScope、失败再 HF」的顺序拉一个模型仓库，返回实际用的源。
 
@@ -424,6 +454,8 @@ def _download_worker(entry):
             source_used = _snapshot(ms_id=entry.get("ms_ref") or "", hf_id=entry["ref"],
                                     local_dir=os.path.join(models_dir(), "sherpa-onnx-streaming"),
                                     allow=entry.get("allow") or None)
+        elif mid == "pyannote":
+            source_used = download_pyannote()
         _JOBS[mid].update(status="done", percent=100,
                           message=("下载完成（来自 %s）" % source_used) if source_used else "下载完成",
                           source=source_used,

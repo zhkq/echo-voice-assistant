@@ -283,7 +283,8 @@ foreach ($e in $Engines) {
 if ($Wake) { $pips += 'sherpa-onnx'; $models += , @('kws', '唤醒词 KWS') }
 if ($Diarize) {
     $pips += @('pyannote.audio', 'torch')
-    Warn '说话人分离（pyannote）是 HF 上的 gated 模型：ECHO 不能替你下载，要在 HF 同意条款后自己拉（见面板 → 组件）'
+    $models += , @('pyannote', '说话人分离（pyannote 三件套）')
+    Warn '说话人分离的权重走 ModelScope 同名镜像（官方在 HF 上要求先同意条款）—— 请自行确认合规'
 }
 if ($AccelCuda) { $pips += 'torch'; Warn 'CUDA 版 torch 体积大（约 2.5 GB），且要求 N 卡与匹配的驱动' }
 

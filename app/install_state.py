@@ -203,8 +203,8 @@ def missing(report: dict = None) -> list:
             from app import modelinfo
             if modelinfo.ready_pyannote() is False:
                 out.append({"feature": "说话人分离（会议里区分谁在说）",
-                            "reason": "pyannote 是 HuggingFace 上的 gated 模型，ECHO 不能替你下载",
-                            "fix": "去 HF 同意条款后，在面板 → 能力 里触发下载"})
+                            "reason": "三件套模型还没下载（官方在 HF 上 gated，ModelScope 有同名镜像）",
+                            "fix": "面板 → 组件 → 直接点下载（走 ModelScope）；或让助手跑 echo-install 技能"})
         except Exception:
             pass
 
