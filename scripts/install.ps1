@@ -60,6 +60,7 @@ $script:StepCount = 8
 $script:LogPath = Join-Path $env:TEMP 'ECHO-install.log'
 $script:ZipPath = ''
 $script:ZipTop = 'ECHO'
+$script:TreeSource = ''      # 场景 C：来源是已解开的包目录（不再有 zip）
 $script:TargetDir = ''
 $script:DestRoot = ''
 $script:ExistingDir = ''
@@ -223,6 +224,18 @@ function Step02-Source {
     if ($hasVenv) {
         Info ("同目录已有 ECHO（{0}），但显式指定了 -Zip：按交付包安装" -f $parentOfScripts)
     }
+    # 场景 C（2026-09-21）：脚本就位于一个**已解开的**包根下（同级有 manifest.json），且没给 -Zip。
+    #   直接拿这个目录当来源 —— 不再要求 zip，也不解压，只把内容复制到安装目录。
+    #
+    #   为什么加这条：发给同事的资料夹里，主包是**解开**放的（外层只压一次），
+    #   而 install.ps1 本身就在主包里（ECHO\scripts\install.ps1）—— 旧版本没有这条路径，
+    #   于是"资料目录里没有 install.ps1"成了同事装不下去的第一道坎（2026-09-21 实测反馈）。
+    #   同时它也绕开了 Find-DeliveryZip 在多 zip 目录里猜错包的风险。
+    if (-not $Zip -and (Test-Path (Join-Path $parentOfScripts 'manifest.json'))) {
+        $script:TreeSource = $parentOfScripts
+        Ok ("未给 -Zip，但同级有 manifest.json：按【已解开的包目录】安装 —— {0}" -f $script:TreeSource)
+        return
+    }
     # 场景 A：定位交付 zip
     if ($Zip) {
         if (-not (Test-Path $Zip)) { Err "指定的 zip 不存在: {0}" -f $Zip; exit 1 }
@@ -305,9 +318,61 @@ function Step03-Dest {
     Info ("安装目录: {0}" -f $script:TargetDir)
 }
 
+function Set-PackageKind {
+    # 包的种类：整包自带 venv；主包只有代码 + manifest.json（D22），运行时随后由
+    # runtime-core 组件补上 —— 以前这里只认 venv，主包会被误判成"包不完整"。
+    param([string]$Dir, [string]$Verb = '解压完成')
+    if (Test-Path (Join-Path $Dir 'venv\Scripts\python.exe')) {
+        Ok ("{0}: {1}（整包：自带 venv）" -f $Verb, $Dir)
+    } elseif (Test-Path (Join-Path $Dir 'manifest.json')) {
+        $script:IsMainPackage = $true
+        Ok ("{0}: {1}（主包：仅代码，运行时由 runtime-core 组件提供）" -f $Verb, $Dir)
+    } else {
+        Err ("{0}但既没有 venv\Scripts\python.exe 也没有 manifest.json，包可能不完整。" -f $Verb)
+        exit 1
+    }
+    $script:ExistingDir = $Dir
+}
+
+function Copy-ExtractedTree {
+    # 场景 C：来源是**已解开的**包目录 → 复制，不解压。
+    $src = (Resolve-Path $script:TreeSource).Path
+    $dst = $script:TargetDir
+    $dstFull = if (Test-Path $dst) { (Resolve-Path $dst).Path } else { '' }
+    if ($dstFull -and ($dstFull -eq $src)) {
+        # 就地把包解在了目标目录（比如把资料夹解压到 D:\ 得到 D:\ECHO）—— 什么都不用做
+        Ok '来源就是安装目录，无需复制'
+        Set-PackageKind -Dir $dst -Verb '已解开的包'
+        return
+    }
+    if ($script:DryRun) {
+        Info ("(模拟) 不解压：把 {0} 的内容复制到 {1}" -f $src, $dst)
+        # 目标目录还没建，但后续步骤认的是"安装目录"，所以要按 $dst 记账 ——
+        # 早先这里对来源目录调了 Set-PackageKind，于是第 5 步把**来源**当成了安装目录。
+        if (Test-Path (Join-Path $src 'manifest.json')) { $script:IsMainPackage = $true }
+        Ok ("(模拟) 目标将成为主包目录: {0}" -f $dst)
+        $script:ExistingDir = $dst
+        return
+    }
+    if (Test-Path $dst) {
+        $items = @(Get-ChildItem $dst -Force -ErrorAction SilentlyContinue)
+        if ($items.Count -gt 0) {
+            if (-not (Ask-YesNo ("目标目录非空（{0} 项），继续复制？" -f $items.Count))) { exit 1 }
+        }
+    } else {
+        New-Item -ItemType Directory -Path $dst -Force | Out-Null
+    }
+    Info ("不解压，直接复制已解开的包到 {0}（约 10 MB，比解压快得多）" -f $dst)
+    foreach ($item in @(Get-ChildItem $src -Force)) {
+        Copy-Item -LiteralPath $item.FullName -Destination $dst -Recurse -Force
+    }
+    Set-PackageKind -Dir $dst -Verb '复制完成'
+}
+
 function Step04-Extract {
-    Step 4 '解压交付包'
+    Step 4 '取交付包内容'
     if ($script:ExistingDir) { Ok '已有目录模式，跳过解压'; return }
+    if ($script:TreeSource) { Copy-ExtractedTree; return }
     if (Test-Path (Join-Path $script:TargetDir 'venv\Scripts\python.exe')) {
         Warn '目标目录已含 venv，视为已解压的 ECHO，跳过解压。'
         $script:ExistingDir = $script:TargetDir
@@ -382,18 +447,7 @@ function Step04-Extract {
         Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
         throw
     }
-    # 包的种类：整包自带 venv；主包只有代码 + manifest.json（D22），运行时随后由
-    # runtime-core 组件补上 —— 以前这里只认 venv，主包会被误判成"包不完整"。
-    if (Test-Path (Join-Path $script:TargetDir 'venv\Scripts\python.exe')) {
-        Ok ("解压完成: {0}（整包：自带 venv）" -f $script:TargetDir)
-    } elseif (Test-Path (Join-Path $script:TargetDir 'manifest.json')) {
-        $script:IsMainPackage = $true
-        Ok ("解压完成: {0}（主包：仅代码，运行时由 runtime-core 组件提供）" -f $script:TargetDir)
-    } else {
-        Err '解压完成但既没有 venv\Scripts\python.exe 也没有 manifest.json，包可能不完整。'
-        exit 1
-    }
-    $script:ExistingDir = $script:TargetDir
+    Set-PackageKind -Dir $script:TargetDir
 }
 
 # ------------------------------------------------------- runtime-core（D22/D23）
@@ -486,6 +540,25 @@ function Install-EmbeddedPython([string]$rcDir) {
     return $true
 }
 
+function Assert-Pip([string]$Py) {
+    # 返回 $true 表示这个解释器能用 pip。
+    # 为什么必须有它：`uv venv` 默认**不装 pip**（没有 --seed 时），于是后面
+    # `python -m pip install -r requirements-core.txt` 直接以 "No module named pip" 失败，
+    # 而旧代码只 Warn 一句就继续、最后还打印"安装完成" —— 同事拿到的是一个没有依赖、
+    # 根本起不来的 ECHO（2026-09-21 实测：uv 路径下必然复现，先前被 uv 的 FATAL 挡在后面没暴露）。
+    # 这里**故意**不用 `uv venv --seed`：老版本 uv 不认这个参数，会把整条 uv 路废掉。
+    # 用 ensurepip 兜底既兼容又能修好任何"没有 pip"的解释器。
+    $r = Invoke-Native $Py @('-m', 'pip', '--version')
+    if ($r.code -eq 0) { return $true }
+    Info '这个运行时没有 pip（uv 建的 venv 默认不带）—— 用 ensurepip 补上...'
+    $e = Invoke-Native $Py @('-m', 'ensurepip', '--upgrade', '--default-pip')
+    if ($e.code -ne 0) { Warn ("ensurepip 失败: {0}" -f $e.out) }
+    $r2 = Invoke-Native $Py @('-m', 'pip', '--version')
+    if ($r2.code -eq 0) { Ok 'pip 已补上'; return $true }
+    Err ("这个运行时没有可用的 pip，装不了基础依赖: {0}" -f $Py)
+    return $false
+}
+
 function Install-RuntimeCore {
     $rcDir = Join-Path $script:ExistingDir 'runtime-core'
     $rcPy = Get-RuntimeCorePython $rcDir
@@ -546,13 +619,21 @@ function Install-RuntimeCore {
     $uv = Get-Command uv -ErrorAction SilentlyContinue
     if ($uv) {
         Info '用 uv 创建 runtime-core（需要网络）...'
-        & $uv.Source venv --python 3.11 $rcDir 2>&1 | ForEach-Object { Write-Host "      $_" -ForegroundColor Gray }
+        # 必须走 Invoke-Native：uv 把进度写到 **stderr**，而本脚本顶部是
+        # $ErrorActionPreference='Stop' —— 直接 `& uv ... 2>&1` 会把那条 stderr 变成
+        # **终止性错误**，安装当场中断，"降级到 python.org 嵌入包"那条路根本没机会跑。
+        # 2026-09-21 实测踩到：本机装了 uv，公司网封掉它依赖的 GitHub 资产（CPython 从
+        # objects.githubusercontent.com 拉），于是第 5 步直接 FATAL。同事的机器同样会中。
+        $r = Invoke-Native $uv.Source @('venv', '--python', '3.11', $rcDir)
+        if ($r.out) { Write-Host ("      " + $r.out) -ForegroundColor Gray }
         $made = [bool](Get-RuntimeCorePython $rcDir)
-        if (-not $made) { Warn 'uv 这条路没成（公司网常封它依赖的 GitHub 资产）—— 改用 python.org 嵌入包' }
+        if (-not $made) { Warn ("uv 这条路没成（公司网常封它依赖的 GitHub 资产）: {0} —— 改用下一级" -f $r.out) }
     }
     if (-not $made -and (Get-Command py -ErrorAction SilentlyContinue)) {
         Info '用 py -3.11 创建 runtime-core（需要网络）...'
-        & py -3.11 -m venv $rcDir 2>&1 | ForEach-Object { Write-Host "      $_" -ForegroundColor Gray }
+        # 同理走 Invoke-Native：`py` 失败时也会往 stderr 写。
+        $r = Invoke-Native 'py' @('-3.11', '-m', 'venv', $rcDir)
+        if ($r.out) { Write-Host ("      " + $r.out) -ForegroundColor Gray }
         $made = [bool](Get-RuntimeCorePython $rcDir)
     }
     if (-not $made) {
@@ -569,13 +650,26 @@ function Install-RuntimeCore {
     if (-not $rcPy) { Err ("创建 runtime-core 失败: {0}" -f $rcDir); exit 1 }
     $req = Join-Path $script:ExistingDir 'requirements-core.txt'
     if (Test-Path $req) {
+        # 没有 pip 就没法装依赖 —— 先补，补不上就**如实失败**，别走到最后打印"安装完成"
+        if (-not (Assert-Pip $rcPy)) {
+            Err '基础依赖装不上，这次安装不完整（ECHO 起不来）。可重跑本向导，或放一个离线 runtime-core 组件包再试。'
+            exit 1
+        }
         Info '安装 runtime-core 基础依赖（requirements-core.txt，约 100 MB）...'
         if ($PipIndex) { Info ("pip 源: {0}" -f $PipIndex) }
-        Invoke-Native $rcPy (@('-m', 'pip', 'install', '--upgrade', 'pip') +
-                             @(if ($PipIndex) { @('-i', $PipIndex) } else { @() })) | Out-Null
-        $r = Invoke-Native $rcPy (@('-m', 'pip', 'install', '-r', $req) +
-                                  @(if ($PipIndex) { @('-i', $PipIndex) } else { @() }))
-        if ($r.code -ne 0) { Warn ("基础依赖安装返回非零（{0}）：{1}" -f $r.code, $r.out) }
+        $pipArgs = @(if ($PipIndex) { @('-i', $PipIndex) } else { @() })
+        Invoke-Native $rcPy (@('-m', 'pip', 'install', '--upgrade', 'pip') + $pipArgs) | Out-Null
+        $r = Invoke-Native $rcPy (@('-m', 'pip', 'install', '-r', $req) + $pipArgs)
+        if ($r.code -ne 0) {
+            if ($r.out) { Write-Host ("      " + $r.out) -ForegroundColor Gray }
+            Err ("基础依赖安装失败（返回 {0}）。" -f $r.code)
+            Err '这次安装**不完整**，别当成装好了 —— ECHO 起不来。建议：'
+            Err '  1) 重跑本向导（装好的部分会跳过）'
+            Err '  2) 加 -PipIndex https://pypi.tuna.tsinghua.edu.cn/simple 换国内源'
+            Err '  3) 或改用离线 runtime-core 组件包（-ComponentDir 指定所在目录）'
+            exit 1
+        }
+        Ok '基础依赖安装完成'
     } else {
         Warn '包内没有 requirements-core.txt，跳过基础依赖安装'
     }
@@ -641,6 +735,19 @@ function Step06-SelfCheck {
     $pyw = $anyPy -replace 'python\.exe$', 'pythonw.exe'
     if (Test-Path $pyw) { Ok ("{0} 存在" -f (Split-Path $pyw -Leaf)) }
     else { Warn ("缺 {0}（启动将失败，建议重跑初始化）" -f (Split-Path $pyw -Leaf)) }
+    # **有 python.exe 不等于能用**：还得能 import 核心依赖。
+    # 2026-09-21 的坑：uv 建的 venv 没有 pip，基础依赖一个都没装上，而安装器照样打印
+    # "安装完成！"—— 同事拿到的是一个起不来的 ECHO。装了没装，以 import 为准。
+    if ($anyPy -and (Test-Path $anyPy)) {
+        $im = Invoke-Native $anyPy @('-c', 'import fastapi, uvicorn')
+        if ($im.code -eq 0) {
+            Ok '基础依赖可导入（fastapi / uvicorn）'
+        } else {
+            Err ("基础依赖导入失败: {0}" -f $im.out)
+            Err '这次安装**不完整**（ECHO 起不来）。重跑本向导，或加 -PipIndex 换国内源。'
+            $fail++
+        }
+    }
     if ($script:IsMainPackage) {
         $mani = Join-Path $script:ExistingDir 'manifest.json'
         if (Test-Path $mani) { Ok 'manifest.json 存在（主包）' } else { Warn '缺 manifest.json' }

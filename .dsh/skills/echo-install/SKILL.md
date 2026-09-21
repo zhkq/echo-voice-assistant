@@ -10,11 +10,12 @@ whenToUse: 新机器首装 ECHO；或把 ECHO 交给同事时，让**他那边�
 
 ## 0. 这个技能怎么用（也是给同事看的三句话）
 
-1. 把这个技能文件夹连同 **`ECHO-main-<平台>-<版本>-<时间>.zip`**（必备，约 3 MB）放在一起。
+1. 资料夹里是**一个技能 + 一份已经解开的主程序**：`echo-install\`（本技能）与 `ECHO\`（主程序，
+   不用再解压）。把整个资料夹给你的 agent。
 2. 对你的 agent 说：**「按 echo-install 这个技能给我装 ECHO」**。
 3. agent 会问你几个问题（装到哪、要哪些能力），然后自己下载安装。
 
-**它不需要 git、不需要 GitHub**：代码来自那个 zip；运行时来自 **python.org**；依赖来自 **PyPI**；
+**它不需要 git、不需要 GitHub**：代码来自资料夹里那个 `ECHO\`；运行时来自 **python.org**；依赖来自 **PyPI**；
 模型来自 **ModelScope / hf-mirror**（ECHO 内置 `HF_ENDPOINT=https://hf-mirror.com`）。
 
 ## 1. 先跟用户确认（必须问，不要替他决定）
@@ -64,31 +65,35 @@ dotnet --list-runtimes 2>$null | Select-String 'WindowsDesktop.App 7\.'
 
 ## 3. 装（两步，都可重跑）
 
-### ① 解开主包 + 准备运行时
+### ① 装主程序 + 准备运行时
 
-> ⚠️ **`install.ps1` 在 `ECHO-main-*.zip` 里面**（路径是 `ECHO\scripts\install.ps1`）。
-> 资料目录里**没有**散着的 `install.ps1` —— 别在那儿找它（2026-09-21 同事就卡在这里）。
-> 也不能只把 `install.ps1` 单独拷出来跑：它要跟同一个包里的 `manifest.json`、其它脚本待在一起。
+> **`install.ps1` 就在 `ECHO\scripts\` 里**（资料夹解开后它就在那儿），不是散在资料夹根上。
+> 资料夹里 `ECHO\` 是**已经解开的主程序** —— 所以这一步**不会再解压**，只是把它复制到安装目录。
 
 ```powershell
-$pkg  = 'C:\资料目录'          # 放着 ECHO-main-win-x64-*.zip 的那个目录
-$zip  = (Get-ChildItem "$pkg\ECHO-main-win-x64-*.zip" -File |
-         Sort-Object LastWriteTime -Descending | Select-Object -First 1).FullName
-$stage = Join-Path $env:TEMP 'echo-pack'
-Expand-Archive -Path $zip -DestinationPath $stage -Force      # 先解出来
-
-powershell -NoProfile -ExecutionPolicy Bypass -File "$stage\ECHO\scripts\install.ps1" `
-    -Zip $zip -DestDir 'D:\ECHO' -Silent
-#                                  ↑ 显式传 -Zip：不传的话脚本要在自己的目录/上级/~/Downloads 里
-#                                    猜哪个 ECHO-*.zip 是交付包，资料目录里往往不止一个 zip
+$kit = 'C:\资料目录'          # 解开资料夹后的目录（里面有 ECHO\ 和 echo-install\）
+powershell -NoProfile -ExecutionPolicy Bypass -File "$kit\ECHO\scripts\install.ps1" `
+    -DestDir 'D:\ECHO' -Silent
 # 加 -PipIndex https://pypi.tuna.tsinghua.edu.cn/simple  可换国内 pip 镜像（慢就用它）
 ```
 
-`$stage` 只是个中转站，装完可以删（`Remove-Item $stage -Recurse -Force`）—— 安装目录里已经有它要的东西了。
+脚本看到 `ECHO\` 同级有 `manifest.json`，就知道这是"已解开的包"，直接复制（约 10 MB，秒级）。
+若 `ECHO\` **已经在**你要装的位置（例如把资料夹直接解压到了 `D:\`、得到 `D:\ECHO`），
+把 `-DestDir` 指成它自己即可，脚本会跳过多余的复制。
+
+**退化路径**：如果手上只有 `ECHO-main-*.zip`（没解开），先解一层再跑同样的命令：
+
+```powershell
+Expand-Archive -Path "$kit\ECHO-main-win-x64-*.zip" -DestinationPath $kit -Force
+# 之后同上：-File "$kit\ECHO\scripts\install.ps1" ...
+```
 
 主包**不含运行时**。`install.ps1` 会按三级降级找 CPython：
 `uv venv --python 3.11` → `py -3.11 -m venv` → **python.org 嵌入包 + get-pip**（约 11 MB，只依赖 python.org）。
-最后一级是内网的正解 —— **全程不需要 GitHub**。基础依赖约 100 MB，几分钟。
+前两级都要从 GitHub 资产拉 CPython（`objects.githubusercontent.com`）—— **公司网必失败**，
+所以第三级才是内网的正解：**全程不需要 GitHub**。基础依赖约 100 MB，几分钟。
+（2026-09-21 修：uv 失败时脚本原本会**直接中断**、不走第三级，因为 uv 的进度输出走 stderr 而脚本
+把 stderr 当成了终止性错误。现在三级都会依次试。）
 
 ### ② 按确认结果装组件
 
