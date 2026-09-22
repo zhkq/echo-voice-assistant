@@ -146,6 +146,35 @@ def active_name():
     return enabled[0] if enabled else DEFAULT_AGENT
 
 
+def selected_name():
+    """用户**选中**的智能体名（读原始设置，**不做**可用性降级）。
+
+    与 :func:`active_name` 的区别：那个会为了降级去探测可用性、返回"实际会用哪个"；
+    这个只回答"用户选的是哪个"。面板/折叠条要据此说"你选的那个在不在" ——
+    而不是拿**另一个**适配器的状态去报失败（2026-09-22 同事实测：选了标准版 harness，
+    右缘折叠条却按 DSH Desktop 的探活结果显示红灯 `DSH×`；安装脚本也拿顶层 dsh 判
+    harness，把成功安装报成失败。同一类病，已在多处出现）。
+    """
+    try:
+        want = str(settings.get("agentBackend", DEFAULT_AGENT) or DEFAULT_AGENT).strip()
+    except Exception:
+        want = DEFAULT_AGENT
+    return want or DEFAULT_AGENT
+
+
+def meta(name):
+    """某个适配器的展示元信息（认不出就如实回退，**不抛** —— 它只用于显示）。"""
+    for cls in specs():
+        if cls.name == name:
+            return {
+                "name": cls.name,
+                "displayName": cls.display_name or cls.name,
+                "shortName": cls.short_name or cls.display_name or cls.name,
+                "vendor": cls.vendor or "",
+            }
+    return {"name": name or "", "displayName": name or "", "shortName": name or "", "vendor": ""}
+
+
 def _log_fallback(want, got):
     if want == got:
         return

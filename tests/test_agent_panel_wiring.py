@@ -69,5 +69,65 @@ class PanelWordingTests(unittest.TestCase):
         self.assertIn("_installNoticeSig", self.js)     # 只在状态变化时重拉，不做成轮询
 
 
+class ShortNameTests(unittest.TestCase):
+    """折叠条只有 48 逻辑宽 —— 每个适配器都要有一个塞得下的短名。"""
+
+    def test_every_adapter_declares_a_short_name(self):
+        from app import agents
+        agents.list_agents()
+        for cls in agents.specs():
+            self.assertTrue(cls.short_name, "%s 没写 short_name" % cls.name)
+            # 要求是"比全称短"（折叠条靠省略号收尾，按字符数卡死没意义）：
+            # 全称是给人读的，"标准版 harness（DeepSeek Harness）"塞进 48 宽会被切得认不出是谁。
+            self.assertLess(len(cls.short_name), len(cls.display_name),
+                            "%s 的 short_name 没比 display_name 短：%r vs %r"
+                            % (cls.name, cls.short_name, cls.display_name))
+
+    def test_meta_falls_back_instead_of_raising(self):
+        """认不出的名字也要能显示（它只用于界面，不该把接口带崩）。"""
+        from app import agents
+        got = agents.meta("no-such-agent")
+        self.assertEqual(got["name"], "no-such-agent")
+        self.assertIn("shortName", got)
+
+    def test_selected_name_is_the_raw_setting_not_the_fallback(self):
+        """`selected_name()` 回答"用户选的是哪个"，不做可用性降级探测。
+
+        这正是折叠条与安装脚本需要的口径 —— 拿**另一个**适配器的状态去报失败，
+        就是 2026-09-22 那两次"红灯/假失败"的根。
+        """
+        from unittest.mock import patch
+        from app import agents
+        from app.config import settings
+        with patch.object(settings, "get", lambda k, d=None: "harness" if k == "agentBackend" else d):
+            self.assertEqual(agents.selected_name(), "harness")
+
+
+class CurrentAgentIsWhatTheRailShows(unittest.TestCase):
+    """折叠条那行必须显示**当前选中的**智能体（2026-09-22 同事截图报的红灯）。
+
+    从前它读顶层 `st.dsh` —— 那是 DSH **桌面版**适配器。用户选了标准版 harness 时
+    `dsh.online` 恒为 false，于是折叠条常年红灯「DSH×」，而 harness 其实好着。
+    与"安装脚本拿顶层 dsh 判 harness，把成功安装报成失败"是同一个病。
+    """
+
+    def test_rail_uses_the_agent_field(self):
+        rail = _read("web", "rail.html")
+        self.assertIn("st.agent", rail, "折叠条没读 st.agent")
+        self.assertNotIn("st.dsh && st.dsh.online", rail,
+                         "折叠条又在直接看顶层 dsh 了 —— 选标准版时会恒红")
+
+    def test_status_exposes_the_selected_agent(self):
+        api = _read("app", "api.py")
+        self.assertIn('"agent": agent_info', api, "/api/status 没有透出当前智能体")
+        self.assertIn('"skipped": bool(selected and selected != "dsh")', api,
+                      "顶层 dsh 没有区分「没选它」与「它坏了」")
+
+    def test_status_does_not_clobber_skipped_with_offline(self):
+        """`/api/status` 曾被后来的探活覆写回 offline，两个接口口径打架（同事反馈 3.4）。"""
+        api = _read("app", "api.py")
+        self.assertIn('services.report_dsh("skipped"', api)
+
+
 if __name__ == "__main__":
     unittest.main()

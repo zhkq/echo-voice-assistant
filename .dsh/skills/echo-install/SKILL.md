@@ -109,6 +109,12 @@ done
 ### Windows ① 装主程序 + 准备运行时
 
 > **`install.ps1` 就在 `ECHO\scripts\` 里**（资料夹解开后它就在那儿），不是散在资料夹根上。
+>
+> **务必用下面这种 `powershell -File …` 的形式**（`-ExecutionPolicy Bypass` 是关键）。
+> 有同事在**已经打开的 PowerShell 会话里**直接 `& '…\install.ps1'`，而那台机器默认
+> `ExecutionPolicy = Restricted` —— 脚本**一行都不执行**，退出码还是 **0**、日志文件也不生成，
+> 表现得像"跑了 5 秒，什么都没发生"，很难查（2026-09-22 同事实测 2.1）。
+> 非要在当前会话里跑，就先 `Set-ExecutionPolicy -Scope Process Bypass -Force`。
 
 ```powershell
 $kit = 'C:\资料目录'          # 解开资料夹后的目录（里面有 ECHO\ 和 echo-install\）

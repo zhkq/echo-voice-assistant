@@ -529,5 +529,35 @@ class LauncherFailureIsNotInstallFailure(unittest.TestCase):
                       "Ask-YesNo 在 Silent 下取默认值 —— 所以 -Silent 也会真去拉起")
 
 
+class HarnessTreeSmokeTest(unittest.TestCase):
+    """「装好了」的判据不能只看 bin.js 在不在（2026-09-22 同事反馈 3.2）。
+
+    实测：`zod@4.6.5` 装着、`package.json` 也在，但整个 `v4/` 子目录缺失 ——
+    `node bin.js web` 报 `ERR_MODULE_NOT_FOUND: …zod/v4/classic/external.js`。
+    而旧自检只验「bin.js 存在且非空」+「node-pty 带 package.json/lib/index.js」，
+    两条**全过**，于是"已装好"快路径把坏树当好的用，之后每次启动都失败；npm 又只按
+    版本号认为它已装，后续修复轮也不会碰它（重跑只会说 changed N packages）。
+    """
+
+    def test_both_helpers_run_a_smoke_test(self):
+        for path, tag in ((HarnessLocalInstallTests.PS1_HELPER, "ps1"),
+                          (HarnessLocalInstallTests.SH_HELPER, "sh")):
+            self.assertIn("--version", _read(path), "%s 助手没有冒烟测试" % tag)
+
+    def test_fast_path_requires_the_smoke_test(self):
+        """bin.js 在、但跑不起来时，**不许**走「已装好、跳过下载」那条路。"""
+        ps1 = _read(HarnessLocalInstallTests.PS1_HELPER)
+        self.assertIn("Test-HarnessTree $target).Count -eq 0", ps1,
+                      "Windows 侧的快路径又只看 bin.js 了")
+        sh = _strip_bash_comments(_read(HarnessLocalInstallTests.SH_HELPER))
+        self.assertIn('tree_broken "$TARGET"', sh, "mac 侧的快路径又只看 bin.js 了")
+
+    def test_a_broken_tree_is_reinstalled_not_reused(self):
+        """判定残树后要**整树删掉重装** —— npm 不会去修缺失的子目录。"""
+        for path, tag in ((HarnessLocalInstallTests.PS1_HELPER, "ps1"),
+                          (HarnessLocalInstallTests.SH_HELPER, "sh")):
+            self.assertIn("装残", _read(path), "%s 助手没说清残树要重装" % tag)
+
+
 if __name__ == "__main__":
     unittest.main()

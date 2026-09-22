@@ -53,9 +53,11 @@ _OLD_PID_PATH = harness_proc._pid_path
 _OLD_TOKEN_PATH = harness_proc._token_path
 _OLD_LEGACY_TOKEN_PATH = harness_proc._legacy_token_path
 _OLD_DB = (db.DATA_DIR, db.DB_FILE)
+_OLD_ROUTER_RECHECK = None
 
 
 def setUpModule():
+    global _OLD_ROUTER_RECHECK
     harness_proc._pid_path = lambda: os.path.join(_TMP_DIR, "harness.pid")
     harness_proc._token_path = lambda: os.path.join(_TMP_DIR, "harness-token.txt")
     harness_proc._legacy_token_path = lambda: os.path.join(
@@ -66,6 +68,11 @@ def setUpModule():
     db.DATA_DIR = _TMP_DIR
     db.DB_FILE = os.path.join(_TMP_DIR, "echo-test.db")
     db.init()
+    # 别让"智能体就绪后延迟复核 ECHO AUTO 注册"的后台线程跑起来：它会调**真实**的
+    # `llm_router.sync()` 写 DSH 配置文件（AGENTS.md 明令测试不许碰），而且会活到测试结束之后。
+    from app import boot as _boot
+    _OLD_ROUTER_RECHECK = _boot._ROUTER_RECHECK_ENABLED
+    _boot._ROUTER_RECHECK_ENABLED = False
 
 
 def tearDownModule():
@@ -73,6 +80,9 @@ def tearDownModule():
     harness_proc._token_path = _OLD_TOKEN_PATH
     harness_proc._legacy_token_path = _OLD_LEGACY_TOKEN_PATH
     db.DATA_DIR, db.DB_FILE = _OLD_DB
+    if _OLD_ROUTER_RECHECK is not None:
+        from app import boot as _boot
+        _boot._ROUTER_RECHECK_ENABLED = _OLD_ROUTER_RECHECK
     try:
         settings._cache = None
     except Exception:
@@ -591,6 +601,48 @@ class HarnessProcTests(unittest.TestCase):
         for path in (harness_proc._token_path(), harness_proc._legacy_token_path()):
             self.assertFalse(os.path.isfile(path), "还有残留：%s" % path)
 
+    def test_new_instance_token_overwrites_the_stale_one(self):
+        """重启后必须认**新实例**的 token（2026-09-22 同事实测 P0）。
+
+        时序：ECHO 重启 → `token()` 先把**上一枚**旧 token 从文件读进模块级 `_token`
+        → 发现 harness 已死、Popen 一个新实例 → 新实例打印全新 token。
+        修之前那段写的是 `if m and not _token`，于是真 token 被旧值挡掉、既不记内存也不落盘
+        → 文件里一直是旧的 → 登录 401 → ECHO AUTO 注册不上（面板显示"未注册"）。
+
+        触发条件很常见：**token 文件在、harness 没在跑**（机器重启后首次启动就是这种情形），
+        所以"首次安装"反而测不出来 —— 这条路径容易一直漏着。
+        """
+        stale, fresh = "s" * 32, "f" * 32
+        with open(harness_proc._token_path(), "w", encoding="utf-8") as fh:
+            fh.write(stale)
+        harness_proc.set_token("")
+        # 关键前提：load_saved_token() 会把旧值灌进模块级 _token（root cause 就在这）
+        self.assertEqual(harness_proc.load_saved_token(), stale)
+
+        class _Stdout:
+            def __init__(self, lines):
+                self._lines = iter([ln.encode("utf-8") + b"\n" for ln in lines] + [b""])
+
+            def readline(self):
+                return next(self._lines, b"")
+
+        class _Proc:
+            pid = 4242
+
+            def __init__(self, lines):
+                self.stdout = _Stdout(lines)
+
+        with patch.object(harness_proc.paths, "data_root", lambda: _TMP_DIR):
+            harness_proc._read_output(_Proc(
+                ["dsh web: http://127.0.0.1:43199/?token=%s" % fresh]))
+        try:
+            self.assertEqual(harness_proc._token, fresh,
+                             "新实例打印的 token 被上一枚旧值挡住了")
+            with open(harness_proc._token_path(), encoding="utf-8-sig") as fh:
+                self.assertEqual(fh.read().strip(), fresh, "新 token 没落盘")
+        finally:
+            harness_proc.forget_token()
+
     def test_reserved_ports_are_refused(self):
         """不许占 Desktop 的 43120 / ECHO 自己的 18060 —— 占了就是互相打架。"""
         for p in (43120, 18060):
@@ -653,7 +705,10 @@ class HarnessBootTests(unittest.TestCase):
         from app import boot
         seen = {}
         with patch.object(harness_proc, "requested", lambda: True), \
-                patch.object(harness_proc, "ensure_running", lambda: (True, "已启动(测试)")):
+                patch.object(harness_proc, "ensure_running", lambda: (True, "已启动(测试)")), \
+                patch.object(boot, "_register_router_after_agent_start"):
+            # 那条"注册 ECHO AUTO"的路会真的写 DSH 配置文件，这里换成替身 ——
+            # 本用例只关心 `_start_harness` 报了什么状态。
             boot._start_harness(lambda **kw: seen.update(kw))
         self.assertEqual(seen.get("status"), "online")
         self.assertIn("测试", seen.get("detail", ""))

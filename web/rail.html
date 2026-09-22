@@ -152,8 +152,8 @@
          四行同一套「圆点 + 短文字」，圆点对齐成一列；时长行左缘与圆点同列。
          第一颗灯以外的三行都不是"服务名"，所以灯文字直接用状态词（空闲/处理中/录音中/离线）。 -->
     <div class="status" id="svcStatus">
-      <div class="s-row" id="rowDsh" title="DSH Desktop 服务状态">
-        <i class="s-dot"></i><span class="s-txt">DSH</span>
+      <div class="s-row" id="rowDsh" title="当前智能体的状态（DSH Desktop / 标准版 harness / CodeBuddy 三选一）">
+        <i class="s-dot"></i><span class="s-txt">智能体</span>
       </div>
       <div class="s-row" id="rowNet" title="模型路由（ECHO AUTO）：按通道号顺序派发，通道不通自动换下一个">
         <i class="s-dot"></i><span class="s-txt">路由</span>
@@ -287,9 +287,21 @@
                    : ["on", "空闲", "没有正在执行的任务"]);
       setSvc(rowEcho, lv[0], lv[1],
         `ECHO 服务在线 · 已连续在线 ${fmtUptimeLong(st.uptime)} · 当前${lv[1]} · ${lv[2]}`);
-      const dshOn = !!(st.dsh && st.dsh.online);
-      setSvc(rowDsh, dshOn ? "on" : "off", dshOn ? "DSH" : "DSH×",
-             dshOn ? "DSH Desktop 在线" : "DSH Desktop 离线（命令/会议纪要会受影响）");
+      // 当前智能体（DSH Desktop / 标准版 harness / CodeBuddy 是**单选**）。
+      // 从前这里读顶层 `st.dsh` —— 那是**桌面版**适配器，选了标准版 harness 时它恒为 false，
+      // 于是折叠条常年红灯「DSH×」（2026-09-22 同事实测：同事选了标准版，条上却红着 dsh）。
+      // 与"安装脚本拿顶层 dsh 判 harness，把成功安装报成失败"是同一个病。
+      const ag = st.agent || {};
+      const agName = ag.shortName || ag.displayName || "智能体";
+      const agFull = ag.displayName || agName;
+      if (ag.online) {
+        setSvc(rowDsh, "on", agName, `${agFull} 在线${ag.detail ? "：" + ag.detail : ""}`);
+      } else if (ag.status && ag.status !== "unknown" && ag.status !== "skipped") {
+        setSvc(rowDsh, "off", agName + "×",
+               `${agFull} 未就绪${ag.detail ? "：" + ag.detail : ""}（命令/会议纪要靠它）`);
+      } else {
+        setSvc(rowDsh, "", agName, `读不到 ${agFull} 的状态`);
+      }
       if (!levelTimer) {
         // 只有录音/采集期间才有电平，平时不轮询，省开销
         levelTimer = setInterval(async () => {
@@ -305,7 +317,7 @@
       liveUp.textContent = "—";
       liveBox.title = "ECHO 服务不可达，读不到在线时长";
       setSvc(rowEcho, "off", "离线", "ECHO 服务不可达（时长与状态都读不到）");
-      setSvc(rowDsh, "", "DSH", "未知（需 ECHO 服务才能读取 DSH 状态）");
+      setSvc(rowDsh, "", "智能体", "未知（需 ECHO 服务才能读取智能体状态）");
       setSvc(rowNet, "", "路由", "未知（需 ECHO 服务才能读取路由状态）");
     }
     renderButtons();

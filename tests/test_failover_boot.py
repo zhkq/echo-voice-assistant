@@ -65,6 +65,35 @@ class AgentGateTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("检测 agent-dsh 失败", why)
 
+    def test_the_reason_quoted_is_the_selected_agents(self):
+        """失败原因要以**你选中的那个**为主（2026-09-22 同事反馈 3.5）。
+
+        从前按固定顺序 ("dsh","harness") 收集原因再用「；」拼起来，于是选了标准版 harness
+        的人会读到**桌面版**的原因「未找到 DSH 凭据文件 …（DSH Desktop 是否已登录过？）」——
+        等于又把他往没选的那个上引（同一类误导本轮已出现三次：安装脚本判据、启动页、折叠条）。
+        """
+
+        class _Dead:
+            def available(self, probe=False):
+                return False, "未找到 DSH 凭据文件 C:\\Users\\x\\.dsh\\.credentials.yaml" \
+                              "（DSH Desktop 是否已登录过？）"
+
+        class _AlsoDead:
+            def available(self, probe=False):
+                return False, "标准版 harness 没在监听 http://127.0.0.1:43199"
+
+        def _agent(name=None):
+            return _AlsoDead() if name == "harness" else _Dead()
+
+        with patch("app.agents.names", lambda: ["dsh", "harness"]), \
+                patch.object(boot, "selected_agent", lambda: "harness"), \
+                patch("app.agents.get_agent", _agent):
+            ok, why = boot._agent_dsh_available()
+        self.assertFalse(ok)
+        self.assertIn("标准版 harness 没在监听", why, "没先说用户选中的那个")
+        self.assertNotIn("DSH Desktop 是否已登录过", why,
+                         "又拿没选的那个（桌面版）的原因去解释了")
+
 
 class StartFailoverTests(unittest.TestCase):
     """`_start_failover` 的四种分支：路由失败 / 设置关掉 / 没装 agent / 装了 agent。"""

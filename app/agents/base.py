@@ -22,6 +22,10 @@ class AgentAdapter:
     # ---- 元信息（面板展示用）------------------------------------------------
     name = ""              # 内部标识（配置值），如 "dsh" / "codebuddy"
     display_name = ""      # 面板显示名，如 "DSH Desktop"
+    #: 极窄处（右缘折叠条只有 48 逻辑宽）用的短名；空则退回 display_name。
+    #  为什么要单开一个：display_name 是给人读全称的（"标准版 harness（DeepSeek Harness）"），
+    #  塞进折叠条会被省略号切得认不出是谁。
+    short_name = ""
     vendor = ""            # 厂商/来源，简短
     description = ""       # 一句话说明
     config_key = ""        # 对应的"启用开关"配置键；空串表示无开关（恒启用）

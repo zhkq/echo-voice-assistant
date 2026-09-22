@@ -95,7 +95,7 @@ resolve_node() {
 
 # 返回"不完整"的条目（每行一条）；空 = 完好
 tree_broken() {
-  local target="$1" pty=""
+  local target="$1" pty="" out="" code=""
   if [ ! -s "$target/node_modules/@deepseek-ai/dsh/lib/bin.js" ]; then
     echo "lib/bin.js（缺或为空）"
   fi
@@ -104,6 +104,18 @@ tree_broken() {
       echo "node-pty 不完整：$pty"
     fi
   done
+  # **冒烟测试**：真把模块图加载一遍（`node bin.js --version`，跑完即退、不起服务）。
+  # 为什么非要有它（2026-09-22 同事反馈 3.2，Windows 侧同步）：上面几条只验"文件在不在"，
+  # 而 npm 安装被中途打断会留下**目录在、子目录整片没有**的残树 —— 实测 zod@4.6.5 装着、
+  # package.json 也在，但整个 v4/ 缺失，报 `ERR_MODULE_NOT_FOUND: …zod/v4/classic/external.js`；
+  # 上面几条**全过**，于是"已装好"快路径把坏树当好的用，之后每次启动都失败。
+  if [ -s "$target/node_modules/@deepseek-ai/dsh/lib/bin.js" ]; then
+    out="$("$NODE" "$target/node_modules/@deepseek-ai/dsh/lib/bin.js" --version 2>&1)"
+    code=$?
+    if [ "$code" -ne 0 ]; then
+      echo "跑不起来（node bin.js --version 退出码 $code）：$(printf '%s' "$out" | tail -3 | tr '\n' ' ')"
+    fi
+  fi
 }
 
 # 在 npx 缓存里找装好的 dsh 树：输出 "版本<TAB>node_modules 路径"，按 mtime 新到旧
@@ -159,10 +171,18 @@ ok "node: $NODE"
 TARGET="$DEST/harness/dsh"
 ENTRY="$TARGET/node_modules/@deepseek-ai/dsh/lib/bin.js"
 
-if [ -s "$ENTRY" ]; then
-  ok "标准版已经在本机（跳过下载）"
+if [ -s "$ENTRY" ] && [ -z "$(tree_broken "$TARGET")" ]; then
+  # "装好了"不能只看 bin.js 在不在 —— 必须过完整性自检 + 冒烟测试（见 tree_broken 的注释）
+  ok "标准版已经在本机（跳过下载；完整性自检 + 冒烟测试都过）"
 else
   mkdir -p "$TARGET"
+  if [ -s "$ENTRY" ]; then
+    # bin.js 在却没过自检 = 上次装残了 → **整树删掉重装**：npm 只按版本号判断"这个包已装"，
+    # 不会去修缺失的子目录（重跑 install 只会说 changed N packages）；package-lock 也可能
+    # 被写残，残留会让下次 install 直接报 Invalid/Missing，一起删掉才干净。
+    warn "检测到上次装残了（bin.js 在但跑不起来）—— 删掉整树重装"
+    rm -rf "$TARGET/node_modules" "$TARGET/package-lock.json" 2>/dev/null || true
+  fi
   if [ ! -f "$TARGET/package.json" ]; then
     printf '{"name":"echo-harness","private":true}\n' > "$TARGET/package.json"
   fi

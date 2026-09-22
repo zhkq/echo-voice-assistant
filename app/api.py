@@ -147,9 +147,27 @@ class KeyCreateIn(BaseModel):
 # ---------------------------------------------------------------- 状态与配置
 @router.get("/status")
 def api_status(_auth=Depends(optional_auth)):
+    from app import agents
+    selected = agents.selected_name()
     dsh_ok = manager.dsh_ready()
-    services.report_dsh("online" if dsh_ok else "offline",
-                        "API 可访问" if dsh_ok else "未运行")
+    if selected and selected != "dsh":
+        # 用户选的是**别的**智能体：不要拿桌面版的探活结果去覆盖组件状态。
+        # 那会把 boot 写好的「未使用」又改回 offline，于是 /api/status 与 /api/boot/status
+        # 对同一件事两种说法（2026-09-22 同事反馈 3.4）；折叠条也从这里取状态。
+        services.report_dsh("skipped",
+                            "未使用（你选的是 %s）" % agents.meta(selected)["displayName"])
+    else:
+        services.report_dsh("online" if dsh_ok else "offline",
+                            "API 可访问" if dsh_ok else "未运行")
+    components = services.snapshot()
+    # 当前选中的智能体：折叠条/面板据此显示"我用的那个"，而不是永远盯着 DSH Desktop。
+    # 状态取自组件表（boot 与各适配器往里写）；**不在这里探活** —— 这个接口被高频轮询，
+    # 而 codebuddy 那种"每次调用起一个进程"的适配器探一次就是要起进程。
+    agent_info = dict(agents.meta(selected))
+    mine = next((c for c in components if c.get("name") == selected), None)
+    agent_info["status"] = (mine or {}).get("status") or "unknown"
+    agent_info["detail"] = (mine or {}).get("detail") or ""
+    agent_info["online"] = agent_info["status"] == "online"
     st = meeting.meeting_status()
     # 转写引擎加载状态（detail 展示）
     stt_st = stt_mod.engine_status()
@@ -157,8 +175,11 @@ def api_status(_auth=Depends(optional_auth)):
     services.report_stt("online" if stt_st["loaded"] else "ready",
                         f"{loaded_desc} · {stt_st['device']}")
     return {
-        "components": services.snapshot(),
-        "dsh": {"online": dsh_ok},
+        "components": components,
+        # 顶层 dsh = DSH **桌面版**适配器。skipped 表示"用户选了别的智能体、这个没在用"，
+        # 让消费者能区分"它没选"与"它坏了"（折叠条曾把前者显示成红灯 DSH×）。
+        "dsh": {"online": dsh_ok, "skipped": bool(selected and selected != "dsh")},
+        "agent": agent_info,
         "stt": stt_st,
         "meeting": st,
         "busy": assistant.is_busy(),

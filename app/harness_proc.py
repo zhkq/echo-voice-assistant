@@ -281,10 +281,19 @@ def _read_output(proc):
                 except Exception:
                     pass
             m = TOKEN_RE.search(line)
-            if m and not _token:
-                _token = m.group(1)
-                _persist_token(_token)
-                services.report_harness("online", "独立 harness（%s）" % base_url())
+            if m:
+                found = m.group(1)
+                if found != _token:
+                    # 这个进程是**我们刚 Popen 的**（见 ensure_running），它打印的 token 就是
+                    # **当前实例**的权威值 —— 必须覆盖，不能用 `if not _token` 挡。
+                    # 2026-09-22 同事实测 P0：ECHO 重启后 load_saved_token() 会先把**上一枚**
+                    # 旧 token 灌进模块级 _token，新实例的真 token 就被挡掉、既不记内存也不落盘
+                    # → 文件里一直是旧的 → 登录 401 → ECHO AUTO 注册不上。
+                    # 触发条件很常见：token 文件已存在而 harness 没在跑（**机器重启后首启**即是），
+                    # 所以首次安装反而测不出来。
+                    _token = found
+                    _persist_token(_token)
+                    services.report_harness("online", "独立 harness（%s）" % base_url())
     except Exception:
         pass
     finally:
@@ -457,6 +466,11 @@ def ensure_running(timeout=None):
         except Exception:
             flags = {}
         _last_launch = now
+        # 我们要拉一个**新实例**，它待会儿会打印一枚**新** token。先把上一枚忘掉：
+        # 否则从这一刻到新 token 被抓到之间，token() 会返回**旧**值并被拿去登录（401）；
+        # 而且 load_saved_token() 早已把旧值灌进模块级 _token（2026-09-22 同事实测 P0：
+        # 机器重启后首启必现，文件里一直留着上个实例的 token）。
+        forget_token()
         try:
             proc = subprocess.Popen(
                 full, cwd=dsh_home, env=env,

@@ -126,6 +126,7 @@ def _make_cookie(base_url: str, secret_b64: str = "", credentials_path: str = ""
 class DshAgent(AgentAdapter):
     name = "dsh"
     display_name = "DSH Desktop"
+    short_name = "DSH"
     vendor = "DeepSeek Harness"
     description = "DSH Desktop 2.x 本机 JSON-RPC（GUI 与 API 同端口，默认 43120）"
     config_key = ""                       # DSH 是默认后端，不设启用开关

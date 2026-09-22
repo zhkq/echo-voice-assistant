@@ -438,6 +438,31 @@ class FailoverDetailRefreshTests(_BootStateTestCase):
         boot._refresh_failover_detail(note="测试")
         self.assertEqual(boot._COMPONENTS["failover"]["detail"], "探测路由端口…")
 
+    def test_return_value_tells_the_caller_whether_to_retry(self):
+        """返回值就是"要不要稍后再试"的信号（同事反馈 3.3 的重试靠它）。
+
+        为什么需要重试：标准版的家目录（含 settings.yaml）是 **harness 自己启动后**才写出来的，
+        而 `ensure_running()` 返回时只保证端口在听 —— 第一次复核经常撞上"家目录还没初始化"，
+        之后又没人再试，文案就永久停在失败态（实测 40 秒后再看一个字没变）。
+        """
+        with patch.object(boot, "_agent_dsh_available",
+                          return_value=(False, "没找到 DSH 家目录")):
+            self.assertFalse(boot._refresh_failover_detail(note="测试"),
+                             "没注册上就应该告诉调用方「还可以再试」")
+        with patch.object(boot, "_agent_dsh_available", return_value=(True, "")), \
+             patch("app.llm_router.sync", return_value=(True, "已写入 2 个家目录")):
+            self.assertTrue(boot._refresh_failover_detail(note="测试"),
+                            "注册成功了就不该再排重试")
+
+    def test_recheck_loop_stops_immediately_when_disabled(self):
+        """测试环境必须能一键关掉那个后台线程（它会写真实 DSH 配置）。"""
+        old = boot._ROUTER_RECHECK_ENABLED
+        boot._ROUTER_RECHECK_ENABLED = False
+        try:
+            boot._router_recheck_loop()      # 立刻返回，不睡也不调 sync
+        finally:
+            boot._ROUTER_RECHECK_ENABLED = old
+
 
 class PanelRendersSkippedTests(unittest.TestCase):
     """前端契约：skipped 要有文案、要渲染成 idle 而不是错误 —— 否则后端改对了面板还是红的。"""

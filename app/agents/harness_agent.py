@@ -35,6 +35,7 @@ class HarnessAgent(DshAgent):
     # **这一行不能删**：本类继承 DshAgent，删掉就会继承父类的 "DSH Desktop"，
     # 面板上标准版与桌面版两行长得一模一样（2026-09-22 真踩过，见 tests/test_harness_agent.py）。
     display_name = "标准版 harness（DeepSeek Harness）"
+    short_name = "标准版"        # 折叠条只有 48 逻辑宽，全称会被省略号切掉
     vendor = "DeepSeek（npm @deepseek-ai/dsh）"
     description = ("独立 harness 的 web 服务（随 ECHO 启动，默认 127.0.0.1:43199）——"
                    "不装 DSH Desktop 也能用；/api 接口与 Desktop 完全一致")

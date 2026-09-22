@@ -184,6 +184,7 @@ def _parse_output(stdout):
 class CodeBuddyAgent(AgentAdapter):
     name = "codebuddy"
     display_name = "CodeBuddy Code（WorkBuddy 引擎）"
+    short_name = "CodeBuddy"
     vendor = "腾讯 CodeBuddy"
     description = ("CodeBuddy Code CLI 无头模式（-p）。WorkBuddy 桌面端内置同一引擎；"
                    "每次调用一个独立进程，直接拿到最终回复")

@@ -90,6 +90,30 @@ function Test-HarnessTree([string]$Target) {
             }
         }
     }
+    # **冒烟测试**：真把模块图加载一遍（`node bin.js --version`，跑完即退、不起服务）。
+    # 为什么非要有它（2026-09-22 同事反馈 3.2）：上面那几条只验"文件在不在"，而 npm 安装
+    # 被中途打断（沙箱回收 / 手动 Ctrl-C）会留下**目录在、子目录整片没有**的残树 ——
+    # 实测 zod@4.6.5 装着、package.json 也在，但整个 v4/ 目录缺失，报的是
+    # `ERR_MODULE_NOT_FOUND: …zod/v4/classic/external.js`；上面几条**全过**，于是
+    # "已装好"快路径把坏树当好的用，之后每次启动都失败。只有真加载一遍才抓得到这种残。
+    if ($broken.Count -eq 0 -and (Test-Path -LiteralPath $entry)) {
+        $nodeExe = $NodeExe
+        if (-not $nodeExe) { $nodeExe = Resolve-Node }
+        if ($nodeExe) {
+            $prevEap = $ErrorActionPreference
+            $ErrorActionPreference = 'Continue'
+            try {
+                $out = & $nodeExe $entry --version 2>&1
+                $code = $LASTEXITCODE
+            } catch {
+                $out = @($_.Exception.Message); $code = -1
+            } finally { $ErrorActionPreference = $prevEap }
+            if ($code -ne 0) {
+                $tail = (($out | Select-Object -Last 3) -join ' ').Trim()
+                $broken += ("跑不起来（node bin.js --version 退出码 {0}）：{1}" -f $code, $tail)
+            }
+        }
+    }
     return , $broken
 }
 
@@ -239,13 +263,32 @@ if (-not $node) {
 Ok ("node: {0}" -f $node)
 
 function Test-Entry {
-    return ((Test-Path -LiteralPath $entry) -and ((Get-Item -LiteralPath $entry).Length -gt 0))
+    # "装好了"的判据**不能只看 bin.js 在不在** —— 必须过完整性自检 + 冒烟测试。
+    # 否则被中途打断留下的残树会被当成好的（同事 2026-09-22 实测：zod/v4 整片缺失，
+    # bin.js 却在，于是每次都走"跳过下载"、每次启动都失败，而且 npm 按版本号认为
+    # 它已装好、后续修复轮也不会碰它）。
+    return ((Test-Path -LiteralPath $entry) -and
+            ((Get-Item -LiteralPath $entry).Length -gt 0) -and
+            ((Test-HarnessTree $target).Count -eq 0))
 }
 
 if (Test-Entry) {
-    Ok '标准版已经在本机（跳过下载）'
+    Ok '标准版已经在本机（跳过下载；完整性自检 + 冒烟测试都过）'
 } else {
     try { New-Item -ItemType Directory -Force -Path $target | Out-Null } catch { }
+    if (Test-Path -LiteralPath $entry) {
+        # bin.js 在却没过自检 = 上一次装残了。**先整树删掉再装** ——
+        # npm 只按版本号判断"这个包已装"，不会去修缺失的子目录，直接重跑 install
+        # 只会说 "changed N packages"（同事实测）。package-lock 同样可能被写残，
+        # 一起删掉才干净（残留的 lock 会让下次 install 直接报 Invalid/Missing）。
+        Warn '检测到上次装残了（bin.js 在但跑不起来）—— 删掉整树重装'
+        $nm = Join-Path $target 'node_modules'
+        if (-not (Remove-Tree $nm)) {
+            Err ("清不掉半残的 {0}（可能被占用）—— 手动删掉后重跑" -f $nm)
+            exit 1
+        }
+        Remove-Item -LiteralPath (Join-Path $target 'package-lock.json') -Force -ErrorAction SilentlyContinue
+    }
     $pkgJson = Join-Path $target 'package.json'
     if (-not (Test-Path -LiteralPath $pkgJson)) {
         '{ "name": "echo-harness", "private": true }' | Set-Content -LiteralPath $pkgJson -Encoding UTF8
