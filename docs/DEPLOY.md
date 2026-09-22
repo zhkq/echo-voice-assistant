@@ -1,7 +1,46 @@
 # 部署指南（Windows）
 
 从零把 ECHO 跑起来。全程只需要 Windows 10/11 + Python；**执行指令 / 生成纪要**这一步需要另外装
-**DSH Desktop**（可选，不装也能用转写、会议、面板）。
+一个智能体（可选，不装也能用转写、会议、面板）。
+
+---
+
+## 两条路，先选一条
+
+| 你想要的 | 走哪条 | 从哪开始 |
+|---|---|---|
+| **装上就能用**（不碰命令行、不建 venv） | **安装包**：下载 → 交给 AI 助手一句话装好 | 下面「路线 A」 |
+| 自己掌控环境 / 改代码 / 无外网 | **源码 + 手工 venv** | 下面「路线 B」→ 从 §0 开始 |
+
+### 路线 A（推荐）：用安装包 + 安装技能
+
+1. 从 [Releases](https://github.com/zhkq/echo-voice-assistant/releases) 下载 `ECHO-kit-<stamp>.zip`；
+2. **解压**，把得到的整个文件夹交给你的 AI 助手（Claude Code / Cursor / DSH……都可以）；
+3. 跟它说：**「按 echo-install 这个技能给我装 ECHO」**。
+
+助手会问你装到哪、要哪种转写、要不要唤醒词，然后自己把**运行时（CPython）、依赖、模型、
+系统前置（缺 VC++ 运行库时）**都处理好——运行时来自 python.org、依赖来自 PyPI、
+模型来自 ModelScope / hf-mirror 镜像，**不需要 git，也不需要 GitHub**。
+
+想手工装也行（不进 AI 助手）：
+
+```powershell
+# ① 主程序 + 运行时
+powershell -NoProfile -ExecutionPolicy Bypass -File "<资料夹>\ECHO\scripts\install.ps1" `
+    -DestDir 'D:\ECHO' -Silent
+# ② 引擎 / 模型 / 设置（按你的选择）
+powershell -NoProfile -ExecutionPolicy Bypass -File "<资料夹>\echo-install\scripts\echo-install-components.ps1" `
+    -DestDir 'D:\ECHO' -Engines sensevoice -Agent harness
+```
+
+包里的 `先读我.md` 是给用户看的三句话说明；`echo-install/SKILL.md` 是给助手看的完整步骤。
+
+> **这条路的两个前提**：① 装的位置**路径尽量纯英文**（个别原生依赖读不了非 ASCII 路径）；
+> ② 首次要联网（拉依赖与模型，约 7 GB；Windows + NVIDIA 显卡更多）。
+
+### 路线 B：从源码（本节以下内容）
+
+适合无外网、要改代码、或想完全自己掌控环境的场景 —— 从下面 §0 开始。
 
 ---
 
@@ -82,14 +121,27 @@ powershell -File scripts\start.ps1 -Background   # 后台启动（无窗口）
 内网环境连不上外网时：把另一台机器上已经就绪的 `models/` 目录（或 ModelScope 缓存
 `~/.cache/modelscope/models`）按同样的相对路径拷过来即可。
 
-## 4. 接上 DSH Desktop（可选，用来"执行指令/写纪要"）
+## 4. 接上一个智能体（可选，用来"执行指令/写纪要"）
 
-1. 安装并启动 DSH Desktop，在其设置里**放开本机访问**（ECHO 默认连 `http://127.0.0.1:43120`）。
-2. 面板 → 启动 → `DSH 执行引擎` 应为在线；不在线可点「启动」/「重试」。
-3. ~~想让 DSH 启动时顺便守护 ECHO（并在 DSH 升级后自动重装插件）~~ —— **该插件已于 2026-09-17 退役**
-   （原因与清理范围见 `plugin/README.md`）。ECHO 的启动/守护改由自己负责：登录自启走
-   `scripts\echo-startup.vbs` → `scripts\startup.ps1`，手动启动走 `scripts\start.ps1`，
-   桌面快捷方式走 `scripts\launch-desktop.ps1`；面板端口一律读 `data\echo-port.txt`。
+不接也能用：转写、会议、说话人分离、面板都照常。接了才有"语音指挥它干活 / 自动写纪要"。
+
+**二选一**（面板 → 设置 → 智能体）：
+
+| 选它 | 前提 | 说明 |
+|---|---|---|
+| **标准版 harness**（推荐，2.0 新增） | 本机有 **Node.js** | ECHO 随自己启动它，**不用装 DSH Desktop**。首次会把它**永久装到 `<安装目录>\harness\dsh`**（本地直连，冷启动约 10 秒；对照 `npx` 的 2 分 10 秒） |
+| **DSH Desktop** | 已装并登录 DSH Desktop 2.x | 与 1.x 一样：装好后在它的设置里**放开本机访问**（ECHO 默认连 `http://127.0.0.1:43120`） |
+
+选完看 **面板 → 启动**：对应的那条应为**在线**（另一条会显示「未使用（你选的是 …）」——那不是故障）。
+不在线可点「启动」/「重试」。
+
+> 两个智能体都用的话也没问题：ECHO 按 `agentBackend` 只用一个，另一个标"未使用"。
+> 标准版的家目录是**独立的**（`<安装目录>\data\harness`），不会碰 DSH Desktop 的配置。
+
+> ~~想让 DSH 启动时顺便守护 ECHO（并在 DSH 升级后自动重装插件）~~ —— **该插件已于 2026-09-17 退役**
+> （原因与清理范围见 `plugin/README.md`）。ECHO 的启动/守护改由自己负责：登录自启走
+> `scripts\echo-startup.vbs` → `scripts\startup.ps1`，手动启动走 `scripts\start.ps1`，
+> 桌面快捷方式走 `scripts\launch-desktop.ps1`；面板端口一律读 `data\echo-port.txt`。
 
 ## 5. 右缘边条（可选）
 

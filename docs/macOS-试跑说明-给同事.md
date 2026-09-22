@@ -32,13 +32,19 @@ ECHO 是一个**本地运行的语音助理**（Windows 上已经用了一年多
 | 磁盘 ≥ 6 GB 空闲 | `df -h ~` |
 | 能上网 | 首次要装依赖 |
 
-解压（同目录里有个 `.sha256` 校验文件，建议先校验）：
+从 [Releases](https://github.com/zhkq/echo-voice-assistant/releases) 下载
+**`ECHO-kit-macos-<stamp>.zip`**（约 2 MB），解压：
 
 ```bash
-shasum -a 256 -c ECHO-public-1.0.0-*.zip.sha256     # 应输出 OK
-unzip ECHO-public-1.0.0-*.zip -d echo-mac
-cd echo-mac
+unzip ECHO-kit-macos-*.zip                 # 解出来是 ECHO-kit-macos-<stamp>/ 文件夹
+cd ECHO-kit-macos-*/ECHO                   # ECHO/ 就是主程序（mac/setup_mac.sh 在里面）
 ```
+
+> 包里那个 `先读我.md` 是给同事看的**三句话说明**；走 AI 助手的话把**整个文件夹**交给它、
+> 说「按 `echo-install` 这个技能给我装 ECHO」即可，它会连环境、依赖、模型一起装好
+> （见旁边的 `echo-install/SKILL.md`）。**下面第 2 节起是手工那条路**。
+>
+> （旧文档里提到的 `ECHO-public-1.0.0-*.zip` 已随 2.0 的分层交付退役，不要再发那个。）
 
 ---
 

@@ -15,8 +15,15 @@
 
 ## 1. 拿到代码
 
-解压 `ECHO-public-1.0.0-*.zip`（约 2.6 MB，**只有代码**：app/ web/ mac/ scripts/ …；
-模型与依赖按需装，不带 venv、不带模型权重）。
+从 [Releases](https://github.com/zhkq/echo-voice-assistant/releases) 下载
+**`ECHO-kit-macos-<stamp>.zip`**（约 2 MB）。解压后里面的 `ECHO/` 就是主程序 ——
+**只有代码**（`app/ web/ mac/ scripts/ …`），模型与依赖按需装，不带 venv、不带模型权重。
+
+> **更省事的走法**：把解压出来的**整个文件夹**交给 AI 助手，说
+> 「按 `echo-install` 这个技能给我装 ECHO」——它会装环境、依赖、模型并写好设置
+> （步骤见 `echo-install/SKILL.md`）。**本文余下部分是手工那条路**，用于我们自己复现问题。
+>
+> （`ECHO-public-1.0.0-*.zip` 那套扁平包已随 2.0 的分层交付退役，不要再发那个。）
 
 ## 2. 装依赖并启动
 
