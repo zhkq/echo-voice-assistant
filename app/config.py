@@ -428,7 +428,8 @@ DEFAULTS = {
                         value_type="int", hidden=True),
     "harnessCommand": dict(value="npx -y @deepseek-ai/dsh web", grp="agent", label="harness 启动命令",
                            description="拉起独立 harness 的命令（--port / --no-open 由 ECHO 追加）。"
-                                       "Node/npx 不在 PATH 里时，这里填 npx 全路径",
+                                       "安装技能会填成 <安装目录>/harness/dsh 里的本地入口（冷启动约 10 秒）；"
+                                       "装不起来就把这里改回 npx -y @deepseek-ai/dsh web 兜底",
                            value_type="str", hidden=True),
     "harnessToken": dict(value="", grp="agent", label="harness 访问 token",
                          description="只有当你自己启动了 harness（终端里跑 npx @deepseek-ai/dsh web）"

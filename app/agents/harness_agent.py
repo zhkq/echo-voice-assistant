@@ -31,7 +31,10 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 class HarnessAgent(DshAgent):
     name = "harness"
-    # 面板/文档统一叫「标准版 harness」：与「DSH Desktop 桌面版」区分开（同事 2026-09-21 反馈）
+    # 面板/文档统一叫「标准版 harness」：与「DSH Desktop 桌面版」区分开（同事 2026-09-21 反馈）。
+    # **这一行不能删**：本类继承 DshAgent，删掉就会继承父类的 "DSH Desktop"，
+    # 面板上标准版与桌面版两行长得一模一样（2026-09-22 真踩过，见 tests/test_harness_agent.py）。
+    display_name = "标准版 harness（DeepSeek Harness）"
     vendor = "DeepSeek（npm @deepseek-ai/dsh）"
     description = ("独立 harness 的 web 服务（随 ECHO 启动，默认 127.0.0.1:43199）——"
                    "不装 DSH Desktop 也能用；/api 接口与 Desktop 完全一致")
@@ -143,12 +146,12 @@ class HarnessAgent(DshAgent):
         except DshError as e:
             if not harness_proc.online(timeout=1.0):
                 if not harness_proc.requested():
-                    return False, ("独立 harness 没在运行：在面板把它选为当前智能体"
-                                   "（或打开「启用标准版 harness」），"
-                                   "ECHO 会自动拉起（需要本机 Node / npx）")
-                return False, ("独立 harness 没在监听 %s：看 data/logs/harness.log —— "
-                               "多数是 Node/npx 不在 PATH（把「harness 启动命令」改成 npx 全路径）"
-                               % self.base_url)
+                    return False, ("标准版 harness 没在运行：在面板把它选为当前智能体"
+                                   "（或打开「启用标准版 harness」），ECHO 会自动拉起"
+                                   "（需要本机 Node；安装技能会把它永久装到 <安装目录>/harness/dsh）")
+                return False, ("标准版 harness 没在监听 %s：看 data/logs/harness.log —— "
+                               "本地件装好后仍起不来，多半是 node 不在 PATH 或上次装残了"
+                               "（重跑 echo-install 技能会补齐）" % self.base_url)
             return False, "连不上独立 harness：%s" % e
 
 

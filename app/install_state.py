@@ -228,11 +228,11 @@ def missing(report: dict = None) -> list:
         if not _node_ok():
             out.append({"feature": "智能体（会议纪要 / 归档 / 语音指令）",
                         "reason": "没找到 Node.js（harness 靠 npx 起）",
-                        "fix": "装 Node.js 后重跑 echo-install 技能，或把「harness 启动命令」改成 npx 全路径"})
+                        "fix": "装 Node.js 后重跑 echo-install 技能（它会把标准版永久装到 <安装目录>/harness/dsh 并写好启动命令）"})
         elif not _harness_online():
             out.append({"feature": "智能体（会议纪要 / 归档 / 语音指令）",
                         "reason": "harness 没在运行（已选但没起来）",
-                        "fix": "面板 → 服务 → 启动 harness；首次会从 npm 拉包，慢是正常的"})
+                        "fix": "面板 → 服务 → 启动 harness；安装技能会把它永久装到 <安装目录>/harness/dsh（冷启动约 10 秒），起不来就看 data/logs/harness.log"})
     return out
 
 

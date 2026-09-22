@@ -88,6 +88,20 @@ $$(".tab").forEach((t) => t.addEventListener("click", () => switchView(t.dataset
    （docs/安装-技能优先.md）。面板因此不再用"首装"当"进向导"的理由 —— 那条判据原本
    只有向导末页才写，于是技能装完打开面板还是进向导。改成：默认进仪表盘，顶部给一条
    **不打断**的横幅说清"登记了没有 / 还缺什么 / 下一步干什么"，向导降级为手动入口。 */
+/* 横幅原来只在页面启动时拉一次 —— harness 后来起来了，它还写着"还有 1 项没就绪"，
+   与智能体表格里的"可用"看着互相打脸（2026-09-22 用户实测反馈）。
+   改成：组件状态一变就立刻重拉，否则最多每 60 秒重拉一次（别把它变成轮询负担）。 */
+let _installNoticeAt = 0;
+let _installNoticeSig = "";
+function maybeRefreshInstallNotice(st) {
+  const sig = JSON.stringify((st && st.components) || []);
+  const now = Date.now();
+  if (sig === _installNoticeSig && now - _installNoticeAt < 60000) return;
+  _installNoticeSig = sig;
+  _installNoticeAt = now;
+  renderInstallNotice().catch(() => {});
+}
+
 async function renderInstallNotice() {
   let st = null;
   try { st = await api("/api/install/state"); } catch (e) { return; }   // 取不到就不打扰
@@ -747,6 +761,7 @@ async function refreshDashboard() {
     document.body.classList.remove("echo-offline");   // 顶栏去掉常驻状态后，靠这个红标表示"连不上"
     renderLiveStatus(st);                             // 启动页"启动日志"标题右侧的在线时长 + 状态
     renderStartupNotes(st);                           // 启动期自愈留痕（只提示一次）
+    maybeRefreshInstallNotice(st);                     // "还缺什么"横幅别停在旧结论上
     // 会议控制
     const mb = $("#meetingBadge");
     mb.textContent = st.meeting.active ? "录音中" : "空闲";
@@ -1137,13 +1152,23 @@ function _saveCollapsedSubs(set) {
 let _agentsCache = [];
 const _agentDirty = {};        // 展开区里改过、但还没点保存的值
 
-/** 智能体状态徽标（探测结论）。 */
+/** 智能体状态徽标：三个信号要分开说（2026-09-22 实测反馈）。
+ *
+ *  原来只写"可用"：三行都是"可用"，用户读成"都在用/都正常"，而顶部横幅又在说
+ *  "harness 没在运行" —— 看着自相矛盾。其实三个词是三件事：
+ *    * available = 探测结论（这个产品在本机能不能用）；
+ *    * active    = 当前 ECHO 用的是不是它（单选，看右边的开关）；
+ *    * enabled   = 产品自己的启用开关。
+ *  所以文案要同时说清"能不能用"与"在不在用"。
+ */
 function agentStatusChip(a) {
   if (!a) return "";
   let cls = "off", text = "未启用";
-  if (a.enabled && a.available) { cls = "on"; text = "可用"; }
-  else if (a.enabled && !a.available) { cls = "bad"; text = "不可用"; }
-  return `<span class="agent-chip ${cls}">${esc(text)}</span>`;
+  if (a.active && a.available) { cls = "on"; text = "使用中"; }
+  else if (a.active) { cls = "bad"; text = "已选但不可用"; }
+  else if (a.enabled && a.available) { cls = "idle"; text = "可用（未使用）"; }
+  else if (a.enabled) { cls = "bad"; text = "不可用"; }
+  return `<span class="agent-chip ${cls}" title="${esc(a.reason || "")}">${esc(text)}</span>`;
 }
 
 /** 智能体表格：每行一个开关（互斥单选），选中的那行下方展开它的设置内容。 */

@@ -280,6 +280,16 @@ class HarnessAgentRegistryTests(unittest.TestCase):
         got = {a["name"]: a for a in agents.list_agents()}
         h = got["harness"]
         self.assertTrue(h["displayName"])
+        # **展示名必须与桌面版不同**：本适配器继承 DshAgent，漏写 display_name 就会继承父类的
+        # "DSH Desktop"，面板上两行一模一样（2026-09-22 用户看着截图报的就是这个）。
+        self.assertNotEqual(h["displayName"], got["dsh"]["displayName"],
+                            "标准版 harness 不能与 DSH Desktop 同名（漏写就继承父类）")
+        self.assertIn("标准版", h["displayName"])
+        from app.agents.dsh_agent import DshAgent
+        from app.agents.harness_agent import HarnessAgent
+        self.assertEqual(HarnessAgent.display_name, h["displayName"])
+        self.assertNotEqual(HarnessAgent.display_name, DshAgent.display_name,
+                            "必须在子类里显式覆盖 display_name")
         self.assertFalse(h["enabled"], "默认不启用（选了才随 ECHO 启动）")
         keys = {s["key"] for s in h["settings"]}
         self.assertIn("harnessCommand", keys)
