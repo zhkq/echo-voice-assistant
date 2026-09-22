@@ -1,8 +1,8 @@
 # ECHO — Windows 语音助手 + 会议纪要
 
-> **当前稳定版本：v1.0.0**（tag [`v1.0.0`](../../releases/tag/v1.0.0)）
+> **当前稳定版本：v2.0.0**（tag [`v2.0.0`](../../releases/tag/v2.0.0)）
 > · `main` 分支始终是稳定线，可放心 clone
-> · 下一代（核心+组件分层交付、双平台一等公民）正在 `2.0-dev` 分支开发，**请勿从该分支安装**
+> · 安装不再需要 clone：从 [Releases](../../releases) 下载对应平台的安装包（见下）
 > · 版本规划见 [docs/REFACTOR-PLAN.md](docs/REFACTOR-PLAN.md)
 
 Windows 上的一体化个人语音助手：**全局热键/唤醒词 → 本地转写 → 交给大模型执行 → 语音播报结论**，
@@ -25,15 +25,16 @@ ECHO 自己**不做推理**，只负责录音、转写、编排、面板与播�
 
 | 你是 | 走哪条路 | 入口 |
 |---|---|---|
+| **想直接装上用（推荐）** | 从 Releases 下载对应平台的**安装包**，把文件夹交给 AI 助手说一句「按 echo-install 技能给我装 ECHO」 | [Releases](../../releases) |
 | **想自己跑起来 / 看代码 / 提 PR** | `git clone`，默认分支 `main` 就是稳定版 | [→ 从源码运行](#从源码运行) |
 | **只要某一版的源码** | Release 里的源码归档，可精确定版 | [Releases](../../releases) |
 
-> **本仓库只提供从源码安装。** 仓库不含模型权重（`models/` 已 gitignore），
-> 首次安装需拉约 7 GB 依赖（Windows + NVIDIA 显卡时更多）；模型在装好后从
-> 面板 → **设置 → 模型** 下载（走 ModelScope / hf-mirror 镜像）。
+> **安装包是纯代码**（约 3 MB：主程序 + 安装技能 + 说明）。它由 `scripts/build-package.ps1`
+> 按白名单打出，构建期硬校验——**不含**内网地址、凭据、模型权重、预置 venv。运行时与模型
+> 在安装时按你的选择从 python.org / PyPI / ModelScope 拉，**不预置**，所以包才这么小。
 >
-> **面向内部同事的"整包"交付流程不在本仓库。** 整包内含预置 venv 与已下载的模型权重，
-> 其中部分模型有单独的授权条款、不适合公开分发；同事请向维护者索取内部说明。
+> 仓库本身也不含模型权重（`models/` 已 gitignore）；首次安装需拉约 7 GB 依赖
+> （Windows + NVIDIA 显卡时更多），模型走 ModelScope / hf-mirror 国内镜像。
 
 
 ## 从源码运行
@@ -41,7 +42,7 @@ ECHO 自己**不做推理**，只负责录音、转写、编排、面板与播�
 ```powershell
 git clone https://github.com/zhkq/echo-voice-assistant.git
 cd echo-voice-assistant
-git checkout v1.0.0          # 可选：锁定到某个稳定版（不切 = main，同样是稳定线）
+git checkout v2.0.0          # 可选：锁定到某个稳定版（不切 = main，同样是稳定线）
 
 python -m venv venv
 .\venv\Scripts\python.exe -m pip install -r requirements.txt
@@ -83,7 +84,7 @@ mac/start_mac.sh
 旧用户在设置里将 `panelOpenMode` 改为 `sidebar` 后，重启 ECHO 即可随服务启动。
 限制和权限设置见 **[mac/README.md](mac/README.md)**。
 
-> **注意**：`main` 是稳定线；`2.0-dev` 是下一代开发分支，**不要从它安装**。
+> **注意**：`main` 是稳定线（v2.0.0 起，双平台与分层交付都已并进来）。
 > 版本号唯一权威来源是 `app/__init__.py:__version__`（`tests/test_version.py` 兜住一致性），
 > 发版流程见 [docs/REFACTOR-PLAN.md §13](docs/REFACTOR-PLAN.md)。
 

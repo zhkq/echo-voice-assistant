@@ -5,5 +5,5 @@
 `pyproject.toml`）都必须与它一致，由 `tests/test_version.py` 兜住。
 发布流程见 docs/REFACTOR-PLAN.md §13。
 """
-__version__ = "1.0.0"
+__version__ = "2.0.0"
 
