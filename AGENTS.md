@@ -13,3 +13,20 @@
   - `curl -s -X POST http://127.0.0.1:8970/api/control/mic/test`（无响应=卡死）
   - `sample <pid> 3 -file /tmp/sample.txt` 后搜 `HALB_Mutex` / `CreateIOProcID`
 - **铁律**：任何地方都**不要**用 `sd.default.device[下标]` 硬取输入设备；需要默认输入就传 `device=None`。
+
+### 跑单测会把开发机上正在跑的「标准版 harness」杀掉（2026-09-22 事故）
+
+- **症状**：面板上 `harness`（标准版）显示 `offline / 已停止`，会议纪要生成报
+  `harness 登录失败：<urlopen error [WinError 10061] 目标计算机积极拒绝>`（43199 没在监听）。
+- **根因**：`tests/test_harness_agent.py::HarnessBrowserOpenTests::test_online_without_token_still_opens`
+  调的是**真实**的 `harness_proc.ensure_token()`。而 `harness_proc._pid_path()` 走
+  `paths.data_root()`，**不受**测试里 patch 的 `db.DATA_DIR` 约束 —— 于是它读到真实的
+  `data/logs/harness.pid`，认定"这是 ECHO 起的"，`stop()` 就把正在跑的那个**杀掉**；
+  紧接着的 `ensure_running()` 又因为测试把 `online`/`token` 换成了替身而永远起不来。
+  表现就是"服务自己停了"，而当时四个停止出口都只写一句"已停止"，查不出是谁。
+- **修复**：`tests/test_harness_agent.py` 在 `setUpModule()` 里把 `_pid_path` 指到临时目录
+  （顺带把 `db.DATA_DIR/DB_FILE` 也隔离，免得把"已停止"写进真实库），并加了护栏用例
+  `test_harness_pid_file_is_isolated_from_the_real_one`；`harness_proc.stop(reason=…)` 现在把
+  **谁/为什么**写进组件状态与日志（`已停止标准版 harness（原因）pid=…`），下次一眼可查。
+- **铁律**：测试**不许**直接碰真实 harness 的 pid 文件/端口状态；凡是会走到
+  `harness_proc.stop()` / `ensure_running()` 的测试，要么打桩，要么先做上面那种隔离。

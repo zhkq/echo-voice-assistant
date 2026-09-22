@@ -18,6 +18,7 @@ import json
 import os
 import shutil
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -34,6 +35,37 @@ TOKEN = "probe-token-1234"
 COOKIE_NAME = "dsh-auth-TESTSERVER"
 COOKIE_NAME_PREFIX = "dsh-auth-"
 COOKIE_VALUE = "v1.test.cookie"
+
+#: 把 harness 的 pid 文件隔离到临时目录（2026-09-22 事故的根因就在这）。
+#:
+#: `harness_proc._pid_path()` 走的是 `paths.data_root()`，**不受**测试里 patch 的
+#: `db.DATA_DIR` 约束。于是 `test_online_without_token_still_opens` 调到真实的
+#: `ensure_token()` 时：读到了**真实**的 `harness.pid` → 认定"这是 ECHO 起的" →
+#: `stop()` 把开发者/同事正在跑的标准版**杀掉**，而它后面又因为 `online`/`token` 被替身
+#: 固定住，永远起不回来 —— 表现就是"标准版服务自己停了"，且四个停止出口都只写一句"已停止"。
+_TMP_DIR = tempfile.mkdtemp(prefix="echo-harness-test-")
+_OLD_PID_PATH = harness_proc._pid_path
+_OLD_DB = (db.DATA_DIR, db.DB_FILE)
+
+
+def setUpModule():
+    harness_proc._pid_path = lambda: os.path.join(_TMP_DIR, "harness.pid")
+    # 数据库也要隔离：本模块有些用例会走 `services.report_harness()` / `sync_status()`，
+    # 不隔离就会把"已停止"写进**真实**的 data/echo.db，面板上看着像服务真的停了
+    # （同一类事故的另一半，2026-09-22 一并堵上）。
+    db.DATA_DIR = _TMP_DIR
+    db.DB_FILE = os.path.join(_TMP_DIR, "echo-test.db")
+    db.init()
+
+
+def tearDownModule():
+    harness_proc._pid_path = _OLD_PID_PATH
+    db.DATA_DIR, db.DB_FILE = _OLD_DB
+    try:
+        settings._cache = None
+    except Exception:
+        pass
+    shutil.rmtree(_TMP_DIR, ignore_errors=True)
 
 
 class _HarnessStub(BaseHTTPRequestHandler):
@@ -405,16 +437,22 @@ class HarnessProcTests(unittest.TestCase):
         with patch.object(harness_proc, "_load_pid", lambda: 4242), \
                 patch.object(harness_proc, "online",
                              lambda timeout=1.0: not state["killed"]), \
-                patch.object(harness_proc, "_kill_tree", lambda pid: state["killed"].append(pid)), \
+                patch.object(harness_proc, "_kill_tree",
+                             lambda pid: state["killed"].append(pid)), \
                 patch.object(harness_proc, "_listener_pid", lambda p: 4242), \
-                patch.object(harness_proc, "_clear_pid", lambda: None):
+                patch.object(harness_proc, "_clear_pid", lambda: None), \
+                patch.object(harness_proc.services, "report_harness") as reported, \
+                patch("app.db.add_log") as logged:
             ok, _msg = harness_proc.stop(reason="测试用原因")
         self.assertTrue(ok)
-        rows = db._query("SELECT level, source, message FROM logs WHERE source = 'harness' "
-                         "ORDER BY id DESC LIMIT 5")
-        self.assertTrue(rows, "停掉 harness 必须留一条日志")
-        self.assertIn("测试用原因", rows[0]["message"])
-        self.assertIn("4242", rows[0]["message"], "日志里要有 pid，便于和进程对账")
+        # 组件状态里带原因（面板状态行看得到）
+        detail = reported.call_args[0][1]
+        self.assertIn("测试用原因", detail)
+        # 日志里带原因 + pid（和进程对账用）
+        msgs = [c[0][2] for c in logged.call_args_list if len(c[0]) >= 3]
+        self.assertTrue(msgs, "停掉 harness 必须留一条日志")
+        self.assertIn("测试用原因", msgs[-1])
+        self.assertIn("4242", msgs[-1])
 
     def test_every_stop_call_site_gives_a_reason(self):
         """四处停止点都要带原因 —— 漏一处，下次还是查不出来。"""
@@ -428,6 +466,16 @@ class HarnessProcTests(unittest.TestCase):
         self.assertIn("stop(reason=", boot_src, "启动自愈的停止没写原因")
         token_src = inspect.getsource(harness_proc.ensure_token)
         self.assertIn("stop(reason=", token_src, "换 token 的重启没写原因")
+
+    def test_harness_pid_file_is_isolated_from_the_real_one(self):
+        """护栏：本模块必须把 pid 文件指向临时目录。
+
+        否则 `stop()`/`ensure_token()` 会读真实的 `data/logs/harness.pid`，
+        把正在跑的标准版杀掉（2026-09-22 就是这么把开发机上的服务弄停的）。
+        """
+        p = harness_proc._pid_path()
+        self.assertTrue(p.startswith(_TMP_DIR),
+                        "pid 文件没隔离：实际是 %s —— 测试会杀掉真实 harness" % p)
 
     def test_reserved_ports_are_refused(self):
         """不许占 Desktop 的 43120 / ECHO 自己的 18060 —— 占了就是互相打架。"""
