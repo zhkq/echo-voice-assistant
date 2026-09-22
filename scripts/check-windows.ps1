@@ -47,12 +47,28 @@ $results = New-Object System.Collections.Generic.List[string]
 
 function Invoke-Step([string]$name, [string]$exe, [string[]]$argv) {
     if (-not $Quiet) { Write-Host ("--- " + $name) -ForegroundColor Cyan }
-    $out = & $exe @argv 2>&1
-    $code = $LASTEXITCODE
-    if (-not $Quiet) { $out | Select-Object -Last 12 | ForEach-Object { Write-Host ("    " + $_) } }
-    if ($code -eq 0) { $results.Add("PASS  $name"); return }
-    if ($Quiet) { $out | Select-Object -Last 25 | ForEach-Object { Write-Host ("    " + $_) -ForegroundColor Red } }
-    $results.Add("FAIL  $name (exit=$code)")
+    $t0 = Get-Date
+    # STREAM while capturing. The old `$out = & $exe @argv 2>&1` captured EVERYTHING, so the
+    # 927-test step (~9 min) produced zero output until it finished: no progress, and no way to
+    # tell "slow" from "hung" when reading this as a background job log (user report 2026-09-23).
+    $lines = New-Object System.Collections.Generic.List[string]
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        & $exe @argv 2>&1 | ForEach-Object {
+            $lines.Add([string]$_)
+            if (-not $Quiet) { Write-Host ("    " + $_) }
+        }
+        $code = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $prevEap
+    }
+    $secs = [int]((Get-Date) - $t0).TotalSeconds
+    if (-not $Quiet) { Write-Host ("    [{0}s]" -f $secs) -ForegroundColor DarkGray }
+    if ($code -eq 0) { $results.Add("PASS  $name (${secs}s)"); return }
+    # Already streamed above unless -Quiet; only then re-print the tail for the failure.
+    if ($Quiet) { $lines | Select-Object -Last 25 | ForEach-Object { Write-Host ("    " + $_) -ForegroundColor Red } }
+    $results.Add("FAIL  $name (exit=$code, ${secs}s)")
 }
 
 Write-Host "ECHO Windows gate - interpreter: $py" -ForegroundColor Green
