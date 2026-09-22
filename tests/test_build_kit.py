@@ -208,6 +208,29 @@ class PushFlowChecksPackages(unittest.TestCase):
         src = (SCRIPTS / "build_kit.py").read_text(encoding="utf-8")
         self.assertIn("--check", src)
 
+    def test_quick_gate_really_forwards_quick(self):
+        """`-QuickGate` 必须真的把 `-Quick` 传给 gate —— 否则"快档"只是个名字。
+
+        为什么要这个开关：gate 的第 4 步是 927 个用例（约 9 分钟），而只改文档/注释时
+        那 9 分钟什么也买不到。`check-windows.ps1` 早就支持 `-Quick`，缺的只是 gh-push
+        没有透传的口子。
+        """
+        src = (SCRIPTS / "gh-push.ps1").read_text(encoding="utf-8")
+        self.assertIn("[switch]$QuickGate", src)
+        self.assertIn("$gateArgs += '-Quick'", src)
+        self.assertIn("& powershell.exe @gateArgs", src)
+
+    def test_the_full_gate_is_still_the_default(self):
+        """默认档位不许被悄悄降级 —— 全量测试是推送前唯一的闸。
+
+        `-QuickGate` 抓不到行为回归（那正是那 927 个用例的活），所以它只能是**显式开关**。
+        """
+        src = (SCRIPTS / "gh-push.ps1").read_text(encoding="utf-8")
+        self.assertIn("if ($QuickGate) {", src,
+                      "只在显式传了 -QuickGate 时才允许加 -Quick")
+        self.assertIn("Write-Host '=== Windows gate: scripts\\check-windows.ps1 ==='",
+                      src, "默认那条分支不见了（默认必须跑全量）")
+
 
 class KitZipCarriesATopLevelPrefix(unittest.TestCase):
     """zip 条目必须带 `<kit>/` 前缀，否则解包出来是一堆散文件（2026-09-22 踩过）。"""

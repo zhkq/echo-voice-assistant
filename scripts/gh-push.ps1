@@ -36,11 +36,18 @@
 #   powershell -File scripts\gh-push.ps1                       # push what is already committed
 #   powershell -File scripts\gh-push.ps1 -Message "feat: xxx"   # git add -A, commit, push
 #   powershell -File scripts\gh-push.ps1 -Verify                # probe + ls-remote only
+#   powershell -File scripts\gh-push.ps1 -QuickGate             # gate minus the full test suite
 #   powershell -File scripts\gh-push.ps1 -Retries 5 -TopN 4     # more attempts / more IPs
 param(
     [string]$Message = '',
     [switch]$Verify,
     [switch]$SkipCheck,
+    # Quick gate: forward -Quick to check-windows.ps1, i.e. compile + import smoke + platform
+    # contract + ruff, but SKIP the 927-case suite (~9 min -> ~3 s).
+    # WHEN: docs/comment-only commits, or when you ALREADY ran the full suite yourself.
+    # WHY NOT DEFAULT: it cannot catch behaviour regressions - that is what the suite is for.
+    # Prefer this over -SkipCheck: same time saved, still gets syntax/import/lint coverage.
+    [switch]$QuickGate,
     [int]$Retries = 3,
     [int]$TopN = 3,
     [int]$LowSpeedSeconds = 90
@@ -241,11 +248,18 @@ if ($Message) {
 # ---- Windows smoke gate ----
 # Same checks CI runs, but on this machine, right before anything leaves it. Skipped for
 # -Verify (probe only) and for -SkipCheck (escape hatch: broken venv / offline work).
+# -QuickGate forwards -Quick to the gate: everything except the 927-case suite (~9 min -> ~3 s).
 if (-not $SkipCheck -and -not $Verify) {
     $gate = Join-Path $PSScriptRoot 'check-windows.ps1'
     if (Test-Path $gate) {
-        Write-Host '=== Windows gate: scripts\check-windows.ps1 ===' -ForegroundColor Cyan
-        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $gate
+        $gateArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $gate)
+        if ($QuickGate) {
+            Write-Host '=== Windows gate: QUICK (full test suite skipped) ===' -ForegroundColor Cyan
+            $gateArgs += '-Quick'
+        } else {
+            Write-Host '=== Windows gate: scripts\check-windows.ps1 ===' -ForegroundColor Cyan
+        }
+        & powershell.exe @gateArgs
         if ($LASTEXITCODE -ne 0) {
             Write-Host ''
             Write-Host 'gate FAILED - nothing was pushed. Fix it, or re-run with -SkipCheck to override.' -ForegroundColor Red
