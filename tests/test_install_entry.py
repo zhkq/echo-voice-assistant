@@ -493,5 +493,41 @@ class AgentResumeNoteIsDocumented(unittest.TestCase):
         self.assertIn("重跑", text)
 
 
+class LauncherFailureIsNotInstallFailure(unittest.TestCase):
+    """「有没有把 ECHO 拉起来」不能决定安装成败（2026-09-22 同事实测）。
+
+    症状：在**没有控制台的沙箱**里（agent 自动装 ECHO 的环境）跑
+    `install.ps1 -DestDir C:\\ECHO -Silent`，收尾那步拉起 console 程序失败，报
+    `ERROR_NO_DATA (0x800700E8)`「管道正被关闭」；而脚本顶部是
+    `$ErrorActionPreference = 'Stop'` → 它变成**终止性异常** → 被入口 catch 抓住 →
+    一次**完全成功**的安装打印「安装中断」并 `exit 1`。
+    这正是同事已经报过一次的「装好了却报失败」，换个地方又出现。
+
+    而且 `-Silent` 下 `Ask-YesNo` 取默认值 `$true`，所以**技能那条命令必然走到这里**。
+    """
+
+    def test_no_bare_start_process_can_abort_the_install(self):
+        code = "\n".join(ln for ln in _read(INSTALL_PS1).splitlines()
+                        if not ln.lstrip().startswith("#"))
+        self.assertEqual(code.count("Start-Process"), 1,
+                         "拉起 ECHO 的进程创建只应留一处（包在 Start-EchoDetached 里）；"
+                         "裸调用会以终止性异常把成功的安装判成失败")
+        self.assertIn("function Start-EchoDetached", code)
+        self.assertIn("-ErrorAction Stop", code, "要显式接住，不能指望外层 catch 兜")
+
+    def test_failure_says_the_install_itself_is_fine(self):
+        code = _read(INSTALL_PS1)
+        self.assertIn("安装本身是好的", code,
+                      "拉起失败时必须明确告诉用户：安装没问题，双击快捷方式即可")
+
+    def test_silent_still_asks_to_launch(self):
+        """记录这个前提 —— 它正是"沙箱里必然踩到"的原因。"""
+        text = _read(INSTALL_PS1)
+        self.assertIn("Ask-YesNo '现在启动 ECHO 并打开控制面板？' $true", text,
+                      "启动那步的默认答案变了的话，这条前提要一起复核")
+        self.assertIn("if ($script:Silent -or $script:DryRun) {", text,
+                      "Ask-YesNo 在 Silent 下取默认值 —— 所以 -Silent 也会真去拉起")
+
+
 if __name__ == "__main__":
     unittest.main()

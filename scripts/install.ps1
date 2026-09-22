@@ -865,6 +865,28 @@ function Step07-Shortcuts {
     Ok ("已创建开机自启: {0}" -f $lnkPath)
 }
 
+function Start-EchoDetached {
+    <#
+      可选收尾步骤：把 ECHO 拉起来。**失败绝不能算安装失败**（2026-09-22 同事实测）。
+
+      为什么单独包一层：在没有控制台的沙箱里（agent 自动装 ECHO 的环境）拉起一个 console
+      程序会失败，报 `ERROR_NO_DATA (0x800700E8)`「管道正被关闭」。而本脚本顶部是
+      `$ErrorActionPreference = 'Stop'` —— 这个失败会变成**终止性异常**，被入口的 catch 抓住，
+      于是一次**完全成功**的安装最后打印「安装中断」并 exit 1。那正是同事已经报过一次的
+      「装好了却报失败」，换个地方又出现。启动只是锦上添花，不该对安装结果有否决权。
+
+      另外：`-Silent` 下 Ask-YesNo 取默认值 $true，所以**技能那条命令必然走到这里**。
+    #>
+    param([string[]]$ArgList)
+    try {
+        Start-Process powershell -ArgumentList $ArgList -WindowStyle Normal -ErrorAction Stop
+        return $true
+    } catch {
+        Warn ("自动启动没成功：{0}" -f $_.Exception.Message)
+        return $false
+    }
+}
+
 function Step08-Finalize {
     Step 8 'DSH 检测与收尾'
     # ---- DSH Desktop 检测 ----
@@ -918,10 +940,16 @@ function Step08-Finalize {
             $launcher = Join-Path $script:ExistingDir 'scripts\launch-desktop.ps1'
             if (Test-Path $launcher) {
                 Info '正在启动（launch-desktop.ps1：后台启动 ECHO + 打开面板）...'
-                Start-Process powershell -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$launcher`"") -WindowStyle Normal
+                $ok = Start-EchoDetached @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$launcher`"")
+                if (-not $ok) {
+                    Write-Host '      安装本身是好的 —— 双击桌面「ECHO 个人助理」即可启动（或跑 scripts\launch-desktop.ps1）。' -ForegroundColor Yellow
+                }
             } elseif (Test-Path $startScript) {
                 Info '正在后台启动 ECHO...'
-                Start-Process powershell -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$startScript`"", '-Background') -WindowStyle Normal
+                $ok = Start-EchoDetached @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$startScript`"", '-Background')
+                if (-not $ok) {
+                    Write-Host '      安装本身是好的 —— 双击桌面「ECHO 个人助理」即可启动（或跑 scripts\start.ps1）。' -ForegroundColor Yellow
+                }
             }
         }
     }
