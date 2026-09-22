@@ -89,3 +89,28 @@
   `llm_router.dsh_homes()`（app/ 里还有"写死 .dsh 的文件白名单 + 总数上限"的测试
   `tests/test_dsh_home_coupling.py` 盯着，加一处就红）。替没装的 DSH 造目录同样是错的
   （D25）：家目录不存在就跳过，并如实回报"没找到 DSH 家目录"。
+
+### 交付包（dist/）只能由 `scripts/build_kit.py` 出，不要手工组 kit（2026-09-22）
+
+- **事故**：同事要测安装，`dist/` 里的 kit 比源码旧了整整 9 小时 —— 当天 13:30–15:00 的修复
+  （含「标准版本地永久安装」）**一个都没进包**，拿旧包测等于测不到新东西。根因是组 kit 一直是
+  **手工活**：`scripts/` 里没有对应脚本，靠人记步骤，还要从 `dist/` 里翻上一代 kit 去捡
+  `先读我.md`（而 `dist/` 不进 git，随时会被清空）。手工活必然漂移。
+- **现在的正解**：`python scripts/build_kit.py` 一条命令出全部 —— 两个平台的主包 + 两个 kit + 自检。
+  `--check` 只报告 `dist/` 与当前源码是否一致（退出码 2=过期 / 3=还没出过包）；`--kits-only` 复用
+  已有主包只重组 kit。`先读我.md` 模板**在 git 里**（`delivery/`，刻意不在打包白名单内，
+  所以不会被塞进主包）。
+- **推送前的闸**：`scripts/gh-push.ps1` 在 Windows gate 之后跑一次 `--check`，过期就**黄字警告**。
+  刻意**不拦推送** —— `dist/` 不在 git 里，不该让一个本地产物挡住代码。
+- **两个平台必须同一个 profile**：都用 `-Profile main`。mac 曾经用 `public`：包里**没有**
+  `components/`，而 `manifest.json` 照样声明了 `components/offline-pack.json` —— 交付清单里的
+  假话，而 manifest 正是安装流程用来判断「这是已解开的包」的那个文件。`build-package.ps1` 现在
+  只声明**真的进了包**的那些，`build_kit.py` 也把它列成自检项。
+- **踩坑一：`edit` 工具会抹掉 UTF-8 BOM。** `scripts/build-package.ps1` 含中文注释，靠 BOM 让
+  PowerShell 5.1 正确按 UTF-8 读；一次 `edit` 之后 BOM 没了 → 5.1 按 GBK 解析 → 直接**解析失败**
+  （报 `表达式或语句中包含意外的标记"}"`）。改过含中文的 `.ps1` 之后务必确认 BOM 还在；
+  `tests/test_script_encoding.py` 会挡住，别绕过它。
+- **踩坑二：kit 的 zip 条目必须带 `<kit 名>/` 顶层前缀。** 少了它，解包出来是一堆散文件而不是
+  「一个文件夹」，而 `先读我.md` 恰恰让同事「把这个文件夹整个交给助手」。**这个坑不报错**。
+- **铁律**：要出包就走 `scripts/build_kit.py`；**不要把手工步骤写回文档当正解**。
+  契约由 `tests/test_build_kit.py` 钉住（模板在 git、两边都走 main、kit 前缀、推送挂检查）。

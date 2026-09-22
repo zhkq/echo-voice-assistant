@@ -523,8 +523,14 @@ if ($requiredIds.Count -eq 0) {
 $compDecl = @()
 $compDir = Join-Path $root 'components'
 if (Test-Path $compDir) {
+    # 只声明**真的进了包**的那些：components/ 目前只随 main 档打包，public 档不打。
+    # 不筛的话 public 的 manifest 会声明一个包里根本没有的文件 —— 交付清单里的假话，
+    # 而 manifest.json 正是安装流程用来判断"这是已解开的包"的那个文件（2026-09-22 发现：
+    # mac 走 public 时它声明了 components/offline-pack.json，包里却没有）。
+    $packedRels = @($files | ForEach-Object { $_.Rel })
     $compDecl = @(Get-ChildItem $compDir -Filter '*.json' -File | Sort-Object Name |
-                  ForEach-Object { "components/$($_.Name)" })
+                  ForEach-Object { "components/$($_.Name)" } |
+                  Where-Object { $packedRels -contains $_ })
 }
 $manifest = [ordered]@{
     format             = 'echo-package/1'

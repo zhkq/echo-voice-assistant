@@ -1,0 +1,232 @@
+# -*- coding: utf-8 -*-
+"""交付包脚本的契约：模板在仓库里、两边都走 main、推送时会检查是否过期。
+
+背景（2026-09-22）
+------------------
+同事要测安装，dist/ 里的包比源码旧了 9 小时，13:30-15:00 的修复（含「标准版本地
+永久安装」）根本没进包。根因是**组 kit 一直是手工活**：没有脚本、靠人记步骤，还要
+从 dist 里翻上一代 kit 捡 `先读我.md`。这次把它固化成 `scripts/build_kit.py`，并让
+`gh-push.ps1` 推送前跑 `--check`。
+
+本文件钉住的是"固化"本身，防止将来又被改回手工/漂移：
+  1. `先读我.md` 模板必须**在 git 里**（不是从 dist 捡 —— dist 不进 git，随时会被清空）；
+  2. 两个平台都必须走 `-Profile main`（mac 曾经用 public：包里没有 components/，
+     而 manifest.json 声明了它 —— 交付清单里的假话）；
+  3. `--check` 的判据（哈希比对、kit 前缀区分、skill 一致性）真的有效；
+  4. 推送流程里必须挂着这道检查。
+"""
+import importlib.util
+import os
+import shutil
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+ROOT = Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+SCRIPTS = ROOT / "scripts"
+DELIVERY = ROOT / "delivery"
+SKILL = ROOT / ".dsh" / "skills" / "echo-install"
+
+
+def _load_build_kit():
+    """把 scripts/build_kit.py 当模块加载（它不在包路径里）。"""
+    path = SCRIPTS / "build_kit.py"
+    spec = importlib.util.spec_from_file_location("build_kit_under_test", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+build_kit = _load_build_kit()
+
+
+class DeliveryTemplatesLiveInGit(unittest.TestCase):
+    """`先读我.md` 模板必须在仓库里，不能靠从 dist 里捡。"""
+
+    def test_templates_exist_and_are_not_empty(self):
+        for name in ("kit-readme-win.md", "kit-readme-mac.md"):
+            path = DELIVERY / name
+            self.assertTrue(path.is_file(), f"缺少 {name} —— kit 组不出来")
+            self.assertGreater(path.stat().st_size, 500, f"{name} 太小，像是空了")
+
+    def test_templates_are_utf8_and_introduce_the_skill_flow(self):
+        for name in ("kit-readme-win.md", "kit-readme-mac.md"):
+            text = (DELIVERY / name).read_text(encoding="utf-8")
+            self.assertIn("echo-install", text,
+                          f"{name} 没提 echo-install —— 那不是给同事的那份说明")
+            self.assertIn("交给你的 AI 助手", text,
+                          f"{name} 少了「把文件夹交给助手」这条交互（两平台已统一）")
+
+    def test_templates_are_not_inside_the_packed_tree(self):
+        """delivery/ 不该被打进 ECHO/：它只是组装 kit 的输入。"""
+        packed_dirs = {"app", "web", "mac", "scripts", "plugin", "docs",
+                       "assets", "dsh-failover", ".dsh", "sidebar", "components"}
+        self.assertNotIn(DELIVERY.name, packed_dirs,
+                         "delivery/ 若进了打包白名单，模板会被塞进主包")
+
+
+class BothPlatformsUseMainProfile(unittest.TestCase):
+    """mac 曾经走 public：包里没有 components/，而 manifest 声明了它。"""
+
+    def test_every_platform_is_built_with_profile_main(self):
+        src = (SCRIPTS / "build_kit.py").read_text(encoding="utf-8")
+        self.assertIn('"-Profile", "main"', src,
+                      "build_kit.py 不再固定用 -Profile main —— mac 会退回 public")
+        self.assertNotIn('"public"', src,
+                         "build_kit.py 里不该再出现 public profile")
+
+    def test_platform_matrix_is_win_plus_macos(self):
+        keys = [p["key"] for p in build_kit.PLATFORMS]
+        self.assertEqual(keys, ["win", "macos"])
+        for plat in build_kit.PLATFORMS:
+            self.assertTrue((DELIVERY / plat["readme"]).is_file(),
+                            f"{plat['key']} 的说明模板不存在: {plat['readme']}")
+
+    def test_macos_passes_the_platform_flag_and_win_does_not(self):
+        by_key = {p["key"]: p for p in build_kit.PLATFORMS}
+        self.assertIsNone(by_key["win"]["package_platform"],
+                          "win 不该传 -Platform（应由构建机推断）")
+        self.assertEqual(by_key["macos"]["package_platform"], "macos-universal")
+
+
+class KitDiscovery(unittest.TestCase):
+    """`ECHO-kit` 是 `ECHO-kit-macos` 的前缀，选择器必须分得开。"""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="echokit-"))
+        for name in ("ECHO-kit-20260922-2051", "ECHO-kit-macos-20260922-2051",
+                     "ECHO-kit-20260922-2046", "not-a-kit", "ECHO-kit-bogus"):
+            (self.tmp / name).mkdir()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_win_selector_ignores_the_macos_kit(self):
+        found = [p.name for p in build_kit.find_kits(self.tmp, "ECHO-kit")]
+        self.assertEqual(found, ["ECHO-kit-20260922-2046", "ECHO-kit-20260922-2051"])
+
+    def test_macos_selector_only_matches_its_own(self):
+        found = [p.name for p in build_kit.find_kits(self.tmp, "ECHO-kit-macos")]
+        self.assertEqual(found, ["ECHO-kit-macos-20260922-2051"])
+
+    def test_newest_kit_is_the_last_by_name(self):
+        plat = {"kit_prefix": "ECHO-kit"}
+        self.assertEqual(build_kit.newest_kit(self.tmp, plat).name,
+                         "ECHO-kit-20260922-2051")
+
+
+class StalenessJudgement(unittest.TestCase):
+    """`--check` 的判据：包里记的哈希 vs 仓库现在的内容。"""
+
+    def test_read_sums_parses_the_build_package_format(self):
+        with tempfile.TemporaryDirectory(prefix="echosums-") as tmp:
+            kit = Path(tmp)
+            (kit / "SHA256SUMS.txt").write_text(
+                "abc123  app/api.py\n"
+                "def456  web/app.js\n"
+                "\n",
+                encoding="utf-8")
+            sums = build_kit.read_sums(kit)
+            self.assertEqual(sums, {"app/api.py": "abc123", "web/app.js": "def456"})
+
+    def test_read_sums_survives_a_missing_file(self):
+        with tempfile.TemporaryDirectory(prefix="echosums-") as tmp:
+            self.assertEqual(build_kit.read_sums(Path(tmp)), {})
+
+    def test_compare_skill_passes_for_a_faithful_copy(self):
+        with tempfile.TemporaryDirectory(prefix="echoskill-") as tmp:
+            kit = Path(tmp)
+            shutil.copytree(SKILL, kit / "echo-install")
+            self.assertEqual(build_kit.compare_skill(kit), [])
+
+    def test_compare_skill_catches_a_drifted_file(self):
+        """包里的技能比仓库旧 —— 正是同事会照着一份过时说明安装的那种事故。"""
+        with tempfile.TemporaryDirectory(prefix="echoskill-") as tmp:
+            kit = Path(tmp)
+            shutil.copytree(SKILL, kit / "echo-install")
+            target = kit / "echo-install" / "SKILL.md"
+            target.write_text(target.read_text(encoding="utf-8") + "\nstale\n",
+                              encoding="utf-8")
+            problems = build_kit.compare_skill(kit)
+            self.assertTrue(any("不一致" in p for p in problems), problems)
+
+    def test_compare_skill_catches_a_missing_file(self):
+        with tempfile.TemporaryDirectory(prefix="echoskill-") as tmp:
+            kit = Path(tmp)
+            shutil.copytree(SKILL, kit / "echo-install")
+            (kit / "echo-install" / "scripts" / "harness-install-local.ps1").unlink()
+            problems = build_kit.compare_skill(kit)
+            self.assertTrue(any("缺文件" in p for p in problems), problems)
+
+    def test_compare_manifest_catches_a_declared_but_absent_component(self):
+        """public 档曾经的假话：manifest 声明了包里没有的 components/*.json。"""
+        with tempfile.TemporaryDirectory(prefix="echomf-") as tmp:
+            kit = Path(tmp)
+            (kit / "ECHO").mkdir()
+            (kit / "ECHO" / "manifest.json").write_text(
+                '{"componentManifests": ["components/offline-pack.json"]}',
+                encoding="utf-8")
+            problems = build_kit.compare_manifest(kit)
+            self.assertTrue(any("components" in p for p in problems), problems)
+
+    def test_compare_manifest_passes_when_the_declared_file_is_there(self):
+        with tempfile.TemporaryDirectory(prefix="echomf-") as tmp:
+            kit = Path(tmp)
+            (kit / "ECHO" / "components").mkdir(parents=True)
+            (kit / "ECHO" / "components" / "offline-pack.json").write_text("[]",
+                                                                           encoding="utf-8")
+            (kit / "ECHO" / "manifest.json").write_text(
+                '{"componentManifests": ["components/offline-pack.json"]}',
+                encoding="utf-8")
+            self.assertEqual(build_kit.compare_manifest(kit), [])
+
+
+class BuildPackageDeclaresOnlyPackedComponents(unittest.TestCase):
+    """`build-package.ps1` 写 manifest 时要筛掉没进包的那些。"""
+
+    def test_component_manifests_are_filtered_by_packed_files(self):
+        src = (SCRIPTS / "build-package.ps1").read_text(encoding="utf-8")
+        self.assertIn("$packedRels", src,
+                      "manifest 的 componentManifests 没按实际打包内容过滤 —— "
+                      "public 档会再次声明一个包里没有的文件")
+
+
+class PushFlowChecksPackages(unittest.TestCase):
+    """推送时必须查一眼 dist/ 是否过期（这正是 2026-09-22 漏掉的那一步）。"""
+
+    def test_gh_push_runs_the_check(self):
+        src = (SCRIPTS / "gh-push.ps1").read_text(encoding="utf-8")
+        self.assertIn("build_kit.py", src)
+        self.assertIn("--check", src)
+        self.assertIn("kitScript", src)
+
+    def test_check_mode_exists_and_has_its_own_exit_code(self):
+        self.assertEqual(build_kit.EXIT_STALE, 2)
+        self.assertEqual(build_kit.EXIT_ABSENT, 3)
+        src = (SCRIPTS / "build_kit.py").read_text(encoding="utf-8")
+        self.assertIn("--check", src)
+
+
+class KitZipCarriesATopLevelPrefix(unittest.TestCase):
+    """zip 条目必须带 `<kit>/` 前缀，否则解包出来是一堆散文件（2026-09-22 踩过）。"""
+
+    def test_make_zip_prefixes_every_entry(self):
+        import zipfile
+        with tempfile.TemporaryDirectory(prefix="echozip-") as tmp:
+            src = Path(tmp) / "ECHO-kit-20260922-2100"
+            (src / "ECHO").mkdir(parents=True)
+            (src / "ECHO" / "hello.txt").write_text("hi", encoding="utf-8")
+            (src / "先读我.md").write_text("read me", encoding="utf-8")
+            out = Path(tmp) / "kit.zip"
+            build_kit.make_zip(src, out, src.name)
+            with zipfile.ZipFile(out) as zf:
+                names = zf.namelist()
+            self.assertTrue(all(n.startswith(src.name + "/") for n in names), names)
+            self.assertIn(f"{src.name}/ECHO/hello.txt", names)
+            self.assertIn(f"{src.name}/先读我.md", names)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -256,6 +256,30 @@ if (-not $SkipCheck -and -not $Verify) {
     }
 }
 
+# ---- delivery packages: is dist/ still current? ----
+# WHY (2026-09-22): the kits in dist/ sat 9 hours behind the source, so a colleague was
+# handed a package that predated the fixes (the local-harness-install helper was missing
+# entirely). dist/ is gitignored, so a stale kit must NEVER block a code push - this only
+# makes it impossible to miss. Rebuild with: python scripts\build_kit.py
+if (-not $SkipCheck -and -not $Verify) {
+    $kitScript = Join-Path $PSScriptRoot 'build_kit.py'
+    $kitPy = Get-PyExe
+    if ((Test-Path $kitScript) -and $kitPy) {
+        Write-Host '=== delivery packages: dist\ vs current source ===' -ForegroundColor Cyan
+        & $kitPy $kitScript --check
+        if ($LASTEXITCODE -eq 2) {
+            Write-Host ''
+            Write-Host 'WARNING: a kit in dist\ is older than the source it was built from.' -ForegroundColor Yellow
+            Write-Host '         Rebuild before handing anything out: python scripts\build_kit.py' -ForegroundColor Yellow
+            Write-Host '         (not blocking this push - dist\ is not tracked by git)' -ForegroundColor DarkGray
+        }
+    } else {
+        Write-Host 'scripts\build_kit.py or a python interpreter not found - package check skipped.' -ForegroundColor DarkGray
+    }
+}
+
+
+
 $branch = git symbolic-ref --short HEAD
 $started = Get-Date
 
