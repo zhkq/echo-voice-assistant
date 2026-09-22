@@ -96,7 +96,7 @@ def _agent(harness_timeout=None) -> dict:
             notes.append(str(msg))
             ok = ok and bool(hok)
         else:
-            harness_proc.stop()
+            harness_proc.stop(reason="设置里切走了智能体（agentBackend 不再是 harness）")
             notes.append("未选中独立 harness，已停掉 ECHO 自己拉起的那个")
     except Exception as exc:
         ok = False

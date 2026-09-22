@@ -468,7 +468,7 @@ def _listener_pid(want_port):
         return 0
 
 
-def stop():
+def stop(reason=""):
     """停止 **ECHO 自己起的** harness（用户手工起的实例不动）。返回 ``(ok, detail)``。
 
     归属判据（两道，任一成立即认为是我们起的）：
@@ -477,10 +477,15 @@ def stop():
         "切走了但端口还挂着"，实测踩过。
     收尾动作：先杀整棵树（npx 会套 cmd→node→cmd→node，只 terminate 最外层等于没杀），
     再用"谁在监听本端口"兜底补一刀 —— 但**只在端口确实归我们管**时才动它。
+
+    `reason`（2026-09-22 加）：**谁、为什么**把它停掉的，写进日志与组件状态。
+    起因：有同事发现"标准版服务自己停了"，而当时只有一句"已停止"，光看状态分辨不出是
+    "设置里切走了智能体"、"面板点了停止"、还是"换 token 重启没起来"—— 全是 stop() 一个出口。
     """
     global _proc, _proc_pid
     proc, pid = _proc, _proc_pid
-    recorded = bool(pid) or bool(_load_pid())
+    recorded_pid = pid or _load_pid() or 0     # 提前取：下面 _clear_pid() 之后就查不到了
+    recorded = bool(recorded_pid)
     if not recorded:
         _proc, _proc_pid = None, 0
         return True, "独立 harness 不是本进程起的，未做处理"
@@ -505,11 +510,21 @@ def stop():
     _clear_pid()
     forget_token()
     still = online(timeout=0.6)
+    who = ("（%s）" % reason) if reason else ""
     try:
         services.report_harness("offline" if not still else "online",
-                                "已停止" if not still else "停止失败：端口仍在监听")
+                                ("已停止%s" % who) if not still
+                                else "停止失败：端口仍在监听")
     except Exception:
         pass
+    if not still:
+        try:
+            # 留一条可追溯的日志：下次"它怎么自己停了"就有据可查（面板日志页可见）
+            from app import db
+            db.add_log("info", "harness",
+                       "已停止标准版 harness%s pid=%s" % (who, recorded_pid or "?"))
+        except Exception:
+            pass
     return (not still), ("已停止独立 harness" if not still else
                          "停止失败：%s 仍在监听（可能需要手动结束该进程）" % base_url())
 
@@ -530,7 +545,7 @@ def ensure_token(timeout=45.0):
     if not (started_by_echo() or _load_pid()):
         return "", ("这个 harness 不是 ECHO 起的（没有 pid 记录），拿不到登录 token —— "
                     "把它停掉让 ECHO 重新拉起，或把启动时打印的 token 填到设置里")
-    stop()
+    stop(reason="为了拿登录 token 重启一次（ECHO 接手旧实例时手里没有 token）")
     ok, msg = ensure_running()
     if not ok:
         return "", msg

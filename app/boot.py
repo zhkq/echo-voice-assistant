@@ -233,7 +233,7 @@ def _start_harness(report):
     if not harness_proc.requested():
         # 自愈：上次是我们起的、这次没被选中 → 顺手收掉（否则切回 DSH 后 node 一直挂着）
         if harness_proc._load_pid() or harness_proc.started_by_echo():
-            ok, msg = harness_proc.stop()
+            ok, msg = harness_proc.stop(reason="启动自愈：当前没选中它，收掉上次 ECHO 起的实例")
             report(status="disabled" if ok else "failed",
                    detail="未选中，已收尾：%s" % msg if ok else msg)
             return
@@ -253,7 +253,7 @@ def _start_harness(report):
 
 def _stop_harness():
     from app import harness_proc
-    harness_proc.stop()
+    harness_proc.stop(reason="面板/接口手动停止")
 
 
 def _agent_dsh_available():

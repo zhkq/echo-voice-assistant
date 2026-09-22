@@ -395,6 +395,40 @@ class HarnessProcTests(unittest.TestCase):
         self.assertIn(4242, state["killed"], "要按 pid 文件杀掉那个实例")
         self.assertIn("已停止", msg)
 
+    def test_stop_records_who_stopped_it(self):
+        """**谁**把它停掉的必须留痕（2026-09-22 用户问"标准版怎么自己停了"）。
+
+        当时只有一句"已停止"：设置里切走、面板点停止、换 token 重启没起来 —— 全是同一个出口，
+        光看状态分辨不出来。现在 stop(reason=…) 要同时写进日志与组件状态。
+        """
+        state = {"killed": []}
+        with patch.object(harness_proc, "_load_pid", lambda: 4242), \
+                patch.object(harness_proc, "online",
+                             lambda timeout=1.0: not state["killed"]), \
+                patch.object(harness_proc, "_kill_tree", lambda pid: state["killed"].append(pid)), \
+                patch.object(harness_proc, "_listener_pid", lambda p: 4242), \
+                patch.object(harness_proc, "_clear_pid", lambda: None):
+            ok, _msg = harness_proc.stop(reason="测试用原因")
+        self.assertTrue(ok)
+        rows = db._query("SELECT level, source, message FROM logs WHERE source = 'harness' "
+                         "ORDER BY id DESC LIMIT 5")
+        self.assertTrue(rows, "停掉 harness 必须留一条日志")
+        self.assertIn("测试用原因", rows[0]["message"])
+        self.assertIn("4242", rows[0]["message"], "日志里要有 pid，便于和进程对账")
+
+    def test_every_stop_call_site_gives_a_reason(self):
+        """四处停止点都要带原因 —— 漏一处，下次还是查不出来。"""
+        import inspect
+
+        from app import boot, settings_effects
+        for mod, fname in ((boot, "_stop_harness"), (settings_effects, "_agent")):
+            src = inspect.getsource(getattr(mod, fname))
+            self.assertIn("stop(reason=", src, "%s.%s 里的停止没写原因" % (mod.__name__, fname))
+        boot_src = inspect.getsource(boot._start_harness)
+        self.assertIn("stop(reason=", boot_src, "启动自愈的停止没写原因")
+        token_src = inspect.getsource(harness_proc.ensure_token)
+        self.assertIn("stop(reason=", token_src, "换 token 的重启没写原因")
+
     def test_reserved_ports_are_refused(self):
         """不许占 Desktop 的 43120 / ECHO 自己的 18060 —— 占了就是互相打架。"""
         for p in (43120, 18060):
@@ -446,7 +480,7 @@ class HarnessBootTests(unittest.TestCase):
         seen = {}
         with patch.object(harness_proc, "requested", lambda: False), \
                 patch.object(harness_proc, "_load_pid", lambda: 4242), \
-                patch.object(harness_proc, "stop", lambda: (True, "已停止独立 harness")):
+                patch.object(harness_proc, "stop", lambda **kw: (True, "已停止独立 harness")):
             boot._start_harness(lambda **kw: seen.update(kw))
         self.assertEqual(seen.get("status"), "disabled")
         self.assertIn("收尾", seen.get("detail", ""))
