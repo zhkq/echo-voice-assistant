@@ -312,10 +312,23 @@ elif mode == "job_error":
     j = (d.get("jobs") or {}).get(arg) or {}
     print(j.get("message") or j.get("error") or "")
 elif mode == "components":
+    # 未选中的那个智能体印成 offline 会被读成"坏了"——把选中的 agent 名当参数传进来，
+    # 未选中的那条标 skipped 并写清"你选的是另一个"（2026-09-22 同事被这条误导过两次）。
     for c in (d.get("components") or []):
-        print("  %-12s %s" % (c.get("name", ""), c.get("status", "")))
-elif mode == "dsh_online":
-    print("1" if (d.get("dsh") or {}).get("online") else "0")
+        name = c.get("name", "")
+        if name in ("dsh", "harness") and arg and name != arg:
+            print("  %-12s %s  （未使用：你选的是 %s）" % (name, "skipped", arg))
+        else:
+            print("  %-12s %s" % (name, c.get("status", "")))
+elif mode == "harness_state":
+    # 标准版 harness 的状态在 **components** 里（name='harness'）。
+    # 顶层 `dsh` 是 DSH **桌面版**那条适配器，选 harness 时它本来就该是 offline ——
+    # 拿它判 harness 会**恒为假**：白等 150 秒、报"还差 1 项"（2026-09-22 同事实测）。
+    for c in (d.get("components") or []):
+        if c.get("name") == "harness":
+            print(c.get("status") or "")
+            sys.exit(0)
+    print("")
 ' "$1" "${2:-}" 2>/dev/null || true
 }
 
@@ -526,9 +539,10 @@ prepare_agent() {
   ok "node: $node_bin"
 
   # 装/修本地永久入口交给专门的脚本：它按"① 已装好 ② npm install ③ 从 npx 缓存复制"
-  # 三条路依次试。**为什么必须有第 ③ 条**（2026-09-22 实测）：@deepseek-ai/dsh@0.1.5-rc.2
-  # 的依赖图在公共 registry 上是坏的（子包依赖 ^0.1.5-rc.3，而那个 rc.3 从没发布过），
-  # npm 必然 ETARGET —— 老逻辑这时只会回退 npx，于是用户那边每次冷启动都要 2 分钟。
+  # 三条路依次试。**为什么要留着第 ③ 条**：@deepseek-ai/dsh@0.1.5-rc.2 的依赖图出过
+  # registry 事故（子包依赖 ^0.1.5-rc.3，而那个 rc.3 当时没发布），npm 会 ETARGET ——
+  # 老逻辑这时只会回退 npx，用户那边每次冷启动都要 2 分钟。该事故 2026-09-22 晚复测已恢复
+  # （rc.3 发布了、npm 584 包装成），但这类事故会复发，而 npx 慢是必然的，故三条路都保留。
   local helper="" cmd_file=""
   helper="$(dirname "$0")/harness-install-local.sh"
   if [ ! -f "$helper" ]; then
@@ -558,20 +572,32 @@ prepare_agent() {
 
 wait_harness() {   # 写完设置后 ECHO 会自动拉起；这里等它 online
   [ "$AGENT" = "harness" ] || return 0
-  step "等智能体就绪"
-  local waited=0
-  while [ "$waited" -lt 150 ]; do
-    if [ "$(api GET /api/status "" 10 | json_query dsh_online)" = "1" ]; then
+  # 等待时长分档：本地永久安装（绝对路径直连）实测 ~11 秒就起；走 npx 才要一两分钟。
+  # 从前一律 150 秒，那是照 npx 时代定的 —— 失败时白等两分半。
+  local limit=45 how="本地永久安装，通常 10 秒内"
+  if [ -z "$HARNESS_COMMAND" ]; then limit=150; how="npx 路径，首次要 1-2 分钟"; fi
+  step "等智能体就绪（$how）"
+  local waited=0 st="" last=""
+  while [ "$waited" -lt "$limit" ]; do
+    st="$(api GET /api/status "" 10 | json_query harness_state)"
+    if [ "$st" = "online" ]; then
       ok "智能体已就绪（harness online）"
       return 0
     fi
-    sleep 5
-    waited=$((waited + 5))
+    if [ "$st" = "failed" ]; then
+      # 它已经明确失败了就别等满 —— 直接把原因指向日志（多半是 node 不在 PATH / 上次装残）
+      err "智能体启动失败 —— 看 logs 下的 harness 日志（node 不在 PATH、或上次装残了）"
+      return 1
+    fi
+    [ -n "$st" ] && last="$st"
+    sleep 3
+    waited=$((waited + 3))
   done
+  warn "等 ${limit}s harness 仍未 online（最后状态：${last:-取不到}）—— 看 logs 下的 harness 日志"
   if [ -n "$HARNESS_COMMAND" ]; then
-    warn "等 150s 仍未就绪 —— 看 logs 下的 harness 日志；本地件已装好，先查 node 能否直接跑"
+    warn "本地件已装好，先查 node 能否直接跑那条 harnessCommand"
   else
-    warn "等 150s 仍未就绪 —— 看 logs 下的 harness 日志（回退到 npx，首次拉包慢是常见的）"
+    warn "回退到了 npx，首次拉包慢是常见的"
   fi
   return 1
 }
@@ -635,7 +661,7 @@ esac
 if [ "${#SETTINGS[@]}" -gt 0 ]; then write_settings "${SETTINGS[@]}" || true; else say "没有要写的设置"; fi
 
 step "自检"
-api GET /api/status "" 20 | json_query components || warn "取 /api/status 失败"
+api GET /api/status "" 20 | json_query components "$AGENT" || warn "取 /api/status 失败"
 FAILED=""
 if [ "$pip_ok" -eq 0 ]; then FAILED="$FAILED 引擎依赖"; fi
 for id in $MODEL_IDS; do

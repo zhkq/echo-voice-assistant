@@ -882,7 +882,9 @@ const STATUS_TEXT = { online: "在线", offline: "离线", active: "工作中", 
   error: "错误", disabled: "未启用", paused: "暂停", unknown: "未知",
   transcribing: "转写中", sent: "已发送", running: "执行中", done: "完成", failed: "失败",
   pending: "排队中", recording: "录音中", transcribed: "已完成", interrupted: "已中断",
-  starting: "启动中" };
+  starting: "启动中",
+  // 「你选了另一个智能体」——不是故障，所以既不算失败也不能渲染成错误徽章
+  skipped: "未使用" };
 
 /* 历史回复先给这么多字的预览，超出可展开全文（issue #2：以前硬截 300 字、后面看不到） */
 const REPLY_PREVIEW = 300;
@@ -2757,6 +2759,8 @@ function bootBadgeCls(status) {
   if (status === "failed") return "error";
   if (status === "starting" || status === "running") return "running";
   if (status === "disabled") return "disabled";
+  // 「未使用（你选了另一个智能体）」用 idle 徽章：这不是故障，别染成红的
+  if (status === "skipped") return "idle";
   if (status === "idle") return "idle";
   return "idle";
 }

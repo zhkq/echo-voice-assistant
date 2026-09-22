@@ -190,6 +190,13 @@ bash "$kit/echo-install/scripts/echo-install-components.sh" \
 
 > 每一步的输出也会落到 **`<安装目录>/data/logs/install-<时间戳>.log`**（独立于终端）——
 > 终端被关掉、或被 agent 收走输出时，排障看这份日志就够（A6）。
+>
+> **给 agent：如果你的执行环境会中途回收后台进程** —— 有同事的沙箱约 2 分钟杀一次，
+> 而且**连脚本派生出来的 ECHO 服务也一起带走**，组件脚本因此断过两次（断在 pip 中途、
+> 断在模型下载刚发起时）。**断在中途就直接重跑同一条组件命令**，脚本是幂等的：
+> 已装好的会跳过（依赖秒过、标准版走"已装好"快路径、模型跳过），重跑即续上。
+> 断点看 **`<安装目录>/data/logs/install-<最新时间戳>.log`** 的最后几行。
+> 真人双击安装不受影响（不会有人两分钟杀一次进程）。
 
 > **为什么改成永久安装（2026-09-22）**：同一台机器实测 `npx -y @deepseek-ai/dsh web` 冷启动
 > **2 分 10 秒**，直连本地 `lib/bin.js` 只要 **9 秒** —— npx 每次都要重新解析安装。
@@ -204,14 +211,16 @@ bash "$kit/echo-install/scripts/echo-install-components.sh" \
 > 一眼看到实际命令）：加 `-PinHarnessCommand` / `--pin-harness-command`。
 > 手动改它注意：`PUT /api/settings` 的 body 要包一层 `{"values": {"harnessCommand": "…"}}`。
 
-> **装本地入口的三条路（2026-09-22 晚补，脚本 `harness-install-local.ps1` / `.sh`）**：
+> **装本地入口的三条路（脚本 `harness-install-local.ps1` / `.sh`）**：
 > ① 已经装好 → 直接用；② `npm install @deepseek-ai/dsh@<版本>`；③ **从 npx 缓存复制**同版本那份整树。
-> 为什么必须有 ③：`0.1.5-rc.2` 的依赖图在公共 registry 上是**坏的** —— 有子包被写成
-> `^0.1.5-rc.3`，而那个子包的 rc.3 从没发布过，`npm` 必然报
+> ③ 存在的原因：`0.1.5-rc.2` 的依赖图**出过** registry 事故 —— 有子包被写成
+> `^0.1.5-rc.3`，而那个子包的 rc.3 当时还没发布，`npm` 报
 > `ETARGET No matching version found for …documentpreview@^0.1.5-rc.3`。
-> 老逻辑这时只会回退 npx（用户那边每次冷启动都慢两分钟）。现在会自动去 `npm config get cache`
-> 的 `_npx` 目录里找**同版本**（找不到就用最新的那份并**明确告警版本不同**）复制过来，
-> 再跑同一套完整性自检。想指定别的版本：`-DshVersion <版本>` / `--dsh-version <版本>`。
+> **2026-09-22 晚同事复测：rc.3 已发布，npm 这条路现在是通的**（584 包，约 2 分钟）。
+> 但这类事故会复发，而 npx 慢是必然的，所以 ③ 保留。
+> 缓存里没有时脚本会**先让 npx 把缓存填上再复制**（全新机器的 `_npx` 缓存是空的 ——
+> 同事这次就是这种情况）；填不上才回退 npx。版本不一致会**明确告警**（仍可用）。
+> 想指定别的版本：`-DshVersion <版本>` / `--dsh-version <版本>`。
 > 单独修装坏的标准版：直接跑 `harness-install-local.ps1 -DestDir <安装目录>`（Windows）或
 > `bash harness-install-local.sh --dest <安装目录>`（macOS），加 `-FromCache` / `--from-cache`
 > 可跳过 npm 走缓存复制（离线也能装）。
@@ -266,7 +275,7 @@ curl -s "http://127.0.0.1:$port/api/models" | ./venv/bin/python -m json.tool | h
 | **macOS**：装 `funasr`/`torch` 很慢 | Apple 芯片装的是普通版 torch（走 MPS，**不要**装 CUDA 版）；嫌大就先只装 `sherpa` |
 | 智能体没起来（纪要/归档/指令不能用） | 需要 **Node.js**：装 Node 后重跑第 3 步的组件脚本（`-Agent harness` / `--agent harness`）—— 脚本会把标准版**永久装到 `<安装目录>/harness/dsh`** 并写好 `harnessCommand`，ECHO 直接拉起（冷启动约 10 秒）；或改用已装的 DSH 桌面版。**注意**：node 装在托管目录（如 WorkBuddy）里、不在系统 PATH 时，ECHO 自己会探测（2026-09-22 起）；若 `harnessCommand` 里是 `npx …`（回退路径），第一次启动仍要等 1-2 分钟 |
 | npm 报 `SAFE_DELETE_BULK_CONFIRM_REQUIRED` | 宿主（WorkBuddy 等）的安全删除 shim 拦了批量删除。装 dsh 时带 `CODEBUDDY_SAFE_DELETE_ENABLED=0`；**别中途 kill npx/npm**，否则包会装残（`node-pty` 缺 `index.js`） |
-| npm 装 dsh 报 `ETARGET / No matching version found for …documentpreview@^0.1.5-rc.3` | **公共 registry 上这个版本的依赖图是坏的**（不是你的机器问题）。2026-09-22 起脚本会自动改走 **npx 缓存复制**：先用 `npx -y @deepseek-ai/dsh web` 跑一次把缓存填上（或本来就在用 npx），再重跑组件脚本即可；也可直接 `harness-install-local.ps1 -DestDir <安装目录> -FromCache`（macOS：`bash harness-install-local.sh --dest <安装目录> --from-cache`）。日志里会写明用了哪份缓存树、版本是否一致 |
+| npm 装 dsh 报 `ETARGET / No matching version found for …documentpreview@^0.1.5-rc.3` | 这是 **registry 侧的依赖图事故**（不是你的机器问题）：`0.1.5-rc.2` 有个子包依赖 `^0.1.5-rc.3`，而那个 rc.3 当时没发布。**2026-09-22 晚复测已恢复**（rc.3 已发布），先直接重跑一次多半就好了。仍不行时脚本会自动改走 **npx 缓存复制**（缓存空会先让 npx 填上，再复制）；也可直接 `harness-install-local.ps1 -DestDir <安装目录> -FromCache`（macOS：`bash harness-install-local.sh --dest <安装目录> --from-cache`）。日志里会写明用了哪份缓存树、版本是否一致 |
 | 改设置报 `422 … ["body","values"] Field required` | `PUT /api/settings` 的 body 必须包一层：`{"values": {"harnessCommand": "…"}}`；`agentBackend` 写 `harness`（不是组件名 `agent-harness`）并同时开 `agentHarnessEnabled` |
 | `pip` 慢 / 超时 | Windows 加 `-PipIndex https://pypi.tuna.tsinghua.edu.cn/simple`；mac 加 `--pip-index https://pypi.tuna.tsinghua.edu.cn/simple`，重跑（已装好的会跳过） |
 | 模型下载慢或卡住 | 挑更小的档位（如 `whisper-tiny`）；下载在 ECHO 服务里继续跑，可不盯；进度看面板 → 能力 |

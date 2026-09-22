@@ -382,5 +382,116 @@ class HarnessLocalInstallTests(unittest.TestCase):
         self.assertIn("harness-install-local", text, "技能没告诉排障的人可以单独跑助手")
 
 
+class InstallReportsTheRightHarnessState(unittest.TestCase):
+    """安装器判「智能体就绪」必须看 **components 里的 harness**（2026-09-22 同事反馈的 P0）。
+
+    症状：`-Agent harness` 装完，脚本白等 150 秒 → 结论里报「还差 1 项 智能体（harness）」
+    → `EXITCODE=1`，而那一刻 `/api/status` 里 harness 明明是 online。
+    根因：判据用的是**顶层 `dsh`** —— 那是 DSH **桌面版**适配器，选 harness 时它本来就该是
+    offline，于是这个判断**恒为假**。两个平台的组件脚本犯了同一个错。
+    """
+
+    def test_ps1_judges_the_harness_component(self):
+        code = "\n".join(ln for ln in _read(PS1_COMPONENTS).splitlines()
+                         if not ln.lstrip().startswith("#"))
+        self.assertNotIn("$st.dsh.online", code,
+                         "又拿顶层 dsh 判 harness 了 —— 选标准版时恒为假，会把成功报成失败")
+        self.assertIn("components", code, "要从 components 里取 harness 的状态")
+
+    def test_sh_judges_the_harness_component(self):
+        code = _strip_bash_comments(_read(SH))
+        self.assertNotIn("dsh_online", code,
+                         "mac 侧还留着读顶层 dsh 的判据 —— 与 Windows 是同一个 bug")
+        self.assertIn("harness_state", code, "mac 侧没有取 harness 组件状态的判据")
+
+    def test_wait_is_tiered_by_install_kind(self):
+        """本地永久安装实测约 11 秒就起；150 秒是照 npx 时代定的，失败时白等两分半。"""
+        ps1 = _read(PS1_COMPONENTS)
+        self.assertIn("$local = [bool]$script:HarnessCommand", ps1, "Windows 侧没有按安装方式分档")
+        self.assertIn("$Seconds = 45", ps1)
+        sh = _read(SH)
+        self.assertIn("limit=45", sh, "mac 侧没有按安装方式分档")
+        self.assertIn("limit=150", sh)
+
+    def test_selfcheck_marks_the_unselected_agent_as_skipped(self):
+        """自检输出里 `dsh offline` 与 `harness online` 并排打印，人/agent 都容易读成「坏了」。"""
+        self.assertIn("skipped", _read(PS1_COMPONENTS), "Windows 自检没标出未选中的智能体")
+        self.assertIn("skipped", _read(SH), "mac 自检没标出未选中的智能体")
+
+
+class NativeCommandStderrIsNotAnError(unittest.TestCase):
+    """`$ErrorActionPreference='Stop'` + `2>&1 |` 会把 native 的**警告**升格成终止性错误。
+
+    2026-09-22 同事实测：npm 明明装成功了（190 包、bin.js 就位），却因为一句
+    `npm warn deprecated …` 跳进 catch、打印「npm 执行异常」。更糟的是警告若出现在
+    **安装中途**，管道提前中断会留下半个 node_modules —— 正是「装残」那类事故的隐患。
+    """
+
+    HELPER = os.path.join(ROOT, ".dsh", "skills", "echo-install", "scripts",
+                          "harness-install-local.ps1")
+
+    def test_native_calls_downgrade_error_action_preference(self):
+        text = _read(self.HELPER)
+        self.assertIn("$ErrorActionPreference = 'Continue'", text,
+                      "native 调用前没有临时降级 —— npm 的警告会被当成异常")
+        self.assertIn("$LASTEXITCODE", text, "降级之后必须改看退出码判成败")
+
+    def test_robocopy_is_guarded_too(self):
+        """同一个坑在 robocopy 上也会咬人：异常会**绕过**「0-7 都算成功」那句判断。"""
+        text = _read(self.HELPER)
+        self.assertIn("$rcExit", text, "robocopy 没按退出码判成败")
+
+    def test_npm_noise_is_suppressed(self):
+        self.assertIn("--loglevel=error", _read(self.HELPER), "没压 npm 的 deprecated 噪音")
+
+    def test_bash_side_needs_no_such_guard(self):
+        """mac 只有 `set -u`（没有 `set -e`），stderr 不会升级成致命错误。
+
+        记录这个差异，免得有人「为了对齐」给 bash 也加一层莫名其妙的包装。
+        """
+        self.assertNotIn("set -e", _read(HarnessLocalInstallTests.SH_HELPER))
+
+
+class NpxCacheCanBeFilled(unittest.TestCase):
+    """全新机器上 `_npx` 缓存是空的 —— 第 ③ 条兜底必须能自己把缓存填上。
+
+    2026-09-22 同事就是这种情况：装之前刚清过缓存，于是「从 npx 缓存复制」无物可复制。
+    """
+
+    def test_both_helpers_can_fill_the_cache(self):
+        ps1 = _read(HarnessLocalInstallTests.PS1_HELPER)
+        sh = _read(HarnessLocalInstallTests.SH_HELPER)
+        self.assertIn("Fill-NpxCache", ps1, "Windows 侧没有「先填缓存」这条路")
+        self.assertIn("fill_cache", sh, "mac 侧没有「先填缓存」这条路")
+        # 填缓存不能去占 43199（那是 ECHO 自己 harness 的端口）—— 只看代码，注释里提到无妨
+        ps1_code = "\n".join(ln for ln in ps1.splitlines() if not ln.lstrip().startswith("#"))
+        self.assertNotIn("43199", ps1_code)
+        self.assertNotIn("43199", _strip_bash_comments(sh))
+
+    def test_fill_uses_a_command_that_exits_immediately(self):
+        """用 `--package=<包> -- node --version` 把包装进缓存，而不是「起一次 web 再杀」：
+        后者要挑空闲端口、要管进程回收，而这里跑完即退。"""
+        for path in (HarnessLocalInstallTests.PS1_HELPER, HarnessLocalInstallTests.SH_HELPER):
+            text = _read(path)
+            self.assertIn("--package=@deepseek-ai/dsh@", text, f"{path} 的填缓存手法不对")
+
+    def test_registry_claim_is_downgraded(self):
+        """registry 那次事故已恢复（2026-09-22 晚复测 npm 584 包装成）——
+        注释里再写「必然 ETARGET」会把以后排障的人带偏。"""
+        for path in (HarnessLocalInstallTests.PS1_HELPER, HarnessLocalInstallTests.SH_HELPER,
+                     PS1_COMPONENTS, SH, SKILL_MD):
+            self.assertNotIn("必然 ETARGET", _read(path), f"{path} 还留着旧结论")
+
+
+class AgentResumeNoteIsDocumented(unittest.TestCase):
+    """给 agent 的一句话：执行环境中途回收进程时，直接重跑同一条命令（脚本幂等）。"""
+
+    def test_skill_tells_agents_to_just_rerun(self):
+        text = _read(SKILL_MD)
+        self.assertIn("install-", text, "技能没提断点日志的位置")
+        self.assertIn("幂等", text)
+        self.assertIn("重跑", text)
+
+
 if __name__ == "__main__":
     unittest.main()

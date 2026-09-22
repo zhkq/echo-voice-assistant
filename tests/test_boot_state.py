@@ -320,5 +320,138 @@ class BootOrchestrationTests(_BootStateTestCase):
         self.assertEqual(boot._PHASE, "done")
 
 
+class SkippedAgentTests(_BootStateTestCase):
+    """「你选了另一个智能体」不该被报成失败（2026-09-22 同事反馈）。
+
+    症状：装了标准版 harness，启动页却写「就绪 10/11 · 失败 1」，把「DSH 执行引擎」
+    渲染成红色，还教用户去启动一个**他没选**的组件（"请启动 DSH Desktop…"）。
+    根因：`_start_dsh` 不看 `agentBackend`，无条件去起桌面版，起不来就报 failed ——
+    而两个智能体是**二选一**，没选它的机器上它本来就该是"未使用"。
+
+    这是同一类误导的第二次出现（上一轮是"dsh offline 是不是坏了"，换了个页面又来）。
+    """
+
+    def _register_agents(self):
+        """两个智能体都要登记 —— detail 里的名字取自组件显示名，只登记一个会回退成内部 id。"""
+        boot.register("dsh", "DSH 执行引擎", "⚙️", start_fn=boot._start_dsh)
+        boot.register("harness", "标准版 harness", "🧩", start_fn=boot._start_harness)
+
+    def test_unselected_desktop_is_skipped_not_failed(self):
+        self._register_agents()
+        with patch.object(boot, "selected_agent", return_value="harness"):
+            boot._run_start("dsh")
+        comp = boot._COMPONENTS["dsh"]
+        self.assertEqual(comp["status"], "skipped", "没选它就不该去启动、更不该报失败")
+        self.assertEqual(comp["error"], "", "skipped 不是错误")
+        self.assertIn("标准版", comp["detail"], "要说清你选的是哪一个，别让人去猜")
+
+    def test_selected_desktop_still_starts(self):
+        """选中桌面版时行为一个字都不变 —— 别把正常启动路径也 skip 掉。"""
+        self._register_agents()
+        with patch.object(boot, "selected_agent", return_value="dsh"), \
+             patch("app.manager.dsh_ready", return_value=True):
+            boot._run_start("dsh")
+        self.assertEqual(boot._COMPONENTS["dsh"]["status"], "online")
+
+    def test_unselected_harness_is_skipped(self):
+        self._register_agents()
+        with patch.object(boot, "selected_agent", return_value="dsh"), \
+             patch("app.harness_proc.requested", return_value=False), \
+             patch("app.harness_proc._load_pid", return_value=None), \
+             patch("app.harness_proc.started_by_echo", return_value=False), \
+             patch("app.harness_proc.sync_status"):
+            boot._run_start("harness")
+        comp = boot._COMPONENTS["harness"]
+        self.assertEqual(comp["status"], "skipped")
+        self.assertIn("DSH", comp["detail"])
+
+    def test_skipped_counts_as_ready_and_never_as_failed(self):
+        """统计口径：skipped 是"不用它"，不是"它坏了" —— 否则选标准版的机器永远显示失败 1。"""
+        boot.register("a", "A", "", status="online")
+        boot.register("dsh", "DSH 执行引擎", "", status="skipped")
+        s = boot.snapshot()["summary"]
+        self.assertEqual(s["failed"], 0)
+        self.assertEqual(s["ready"], 2)
+        self.assertEqual(s["pending"], 0)
+
+    def test_only_the_two_agents_are_ever_skipped(self):
+        """skipped 只用于"二选一的智能体"，别扩散成"所有没启用的组件"。
+
+        `diarize` 的 disabled 有别的含义（模型缺失、可补救），两者不能混。
+        """
+        boot.setup()
+        with patch.object(boot, "selected_agent", return_value="harness"), \
+             patch("app.manager.dsh_ready", return_value=False), \
+             patch("app.manager.dsh_start", return_value=(False, "没开")), \
+             patch("app.harness_proc.requested", return_value=False), \
+             patch("app.harness_proc._load_pid", return_value=None), \
+             patch("app.harness_proc.started_by_echo", return_value=False), \
+             patch("app.harness_proc.sync_status"):
+            boot._run_start("dsh")
+            boot._run_start("harness")
+        by_id = {c["id"]: c["status"] for c in boot.snapshot()["components"]}
+        self.assertEqual(by_id["dsh"], "skipped")
+        self.assertEqual(by_id["harness"], "skipped")
+        self.assertNotEqual(by_id["diarize"], "skipped", "diarize 的 disabled 含义不同")
+
+
+class FailoverDetailRefreshTests(_BootStateTestCase):
+    """failover 的文案不能是启动那一瞬间的陈旧结论（2026-09-22 同事反馈）。
+
+    注册 ECHO AUTO 那步跑在**阶段 1**，可能早于 harness 起来 —— 当时探测到的
+    "标准版 harness 没在监听 43199" 被烤进 detail，等 harness 真起来了面板还在念，
+    排障时被这句自相矛盾的话带偏（尤其"node 不在 PATH"那句，指向的正是已修好的那条）。
+    """
+
+    def setUp(self):
+        super().setUp()
+        boot.register("failover", "模型路由（ECHO AUTO）", "🛰️", status="online")
+        self._old_router_detail = boot._ROUTER_DETAIL
+        boot._ROUTER_DETAIL = "运行中 · http://127.0.0.1:18060"
+        self.addCleanup(setattr, boot, "_ROUTER_DETAIL", self._old_router_detail)
+
+    def test_detail_is_recomputed_when_the_agent_comes_up(self):
+        with patch.object(boot, "_agent_dsh_available",
+                          return_value=(False, "标准版 harness 没在监听 http://127.0.0.1:43199")):
+            boot._refresh_failover_detail(note="启动时")
+        self.assertIn("没在监听", boot._COMPONENTS["failover"]["detail"])
+
+        # 智能体就绪后再算一次：必须按**现在**的状态重写
+        with patch.object(boot, "_agent_dsh_available", return_value=(True, "")), \
+             patch("app.llm_router.sync", return_value=(True, "已写入 2 个家目录")):
+            boot._refresh_failover_detail(note="智能体就绪后复核")
+        detail = boot._COMPONENTS["failover"]["detail"]
+        self.assertNotIn("没在监听", detail, "旧的探测结论必须被重写掉")
+        self.assertIn("已写入 2 个家目录", detail)
+
+    def test_router_base_detail_is_preserved(self):
+        """重算的只是"注册进 DSH 的情况"，路由本身那句话不能丢。"""
+        with patch.object(boot, "_agent_dsh_available", return_value=(True, "")), \
+             patch("app.llm_router.sync", return_value=(True, "ok")):
+            boot._refresh_failover_detail(note="测试")
+        self.assertIn("http://127.0.0.1:18060", boot._COMPONENTS["failover"]["detail"])
+
+    def test_noop_before_the_router_is_up(self):
+        """路由还没起来时（_ROUTER_DETAIL 为空）不该瞎写一句。"""
+        boot._ROUTER_DETAIL = ""
+        boot.report("failover", status="starting", detail="探测路由端口…")
+        boot._refresh_failover_detail(note="测试")
+        self.assertEqual(boot._COMPONENTS["failover"]["detail"], "探测路由端口…")
+
+
+class PanelRendersSkippedTests(unittest.TestCase):
+    """前端契约：skipped 要有文案、要渲染成 idle 而不是错误 —— 否则后端改对了面板还是红的。"""
+
+    def test_status_text_and_badge_cover_skipped(self):
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            "web", "app.js")
+        with open(path, encoding="utf-8") as fh:
+            js = fh.read()
+        self.assertIn("skipped:", js, "STATUS_TEXT 里没有 skipped —— 徽章会显示原始英文")
+        self.assertIn('status === "skipped"', js, "bootBadgeCls 不认识 skipped")
+        # 「未使用」不能被染成错误色：bootBadgeCls 里 skipped 必须排在 failed 之后返回 idle
+        self.assertIn('if (status === "skipped") return "idle"', js)
+
+
 if __name__ == "__main__":
     unittest.main()

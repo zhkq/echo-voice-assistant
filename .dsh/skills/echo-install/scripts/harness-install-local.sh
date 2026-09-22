@@ -7,15 +7,18 @@
 #
 # 为什么需要它（2026-09-22 实测，见 AGENTS.md）：
 #   * `npx -y @deepseek-ai/dsh web` 冷启动 **2 分 10 秒**，直连本地 bin.js 只要 **9 秒**；
-#   * 而 `npm install @deepseek-ai/dsh@0.1.5-rc.2` 在公共 registry 上**装不下来**：
-#     它的依赖图里有个子包被写成 ^0.1.5-rc.3，而那个子包的 rc.3 从没发布过 ->
+#   * 而 `npm install @deepseek-ai/dsh@0.1.5-rc.2` **曾经**在公共 registry 上装不下来：
+#     它的依赖图里有个子包被写成 ^0.1.5-rc.3，而那个子包的 rc.3 当时从没发布过 ->
 #     `ETARGET No matching version found for ...documentpreview@^0.1.5-rc.3`。
-#     老脚本遇到这个只会回退 npx，于是用户那边每次冷启动都慢两分钟。
+#     **2026-09-22 晚同事复测：rc.3 系列已发布，npm 这条路现在是通的** —— 所以第 ③ 条
+#     目前用不上，但保留：registry 上这种依赖图事故会复发，而 npx 慢是必然的。
+#     老脚本当初遇到装不上只会回退 npx，于是用户那边每次冷启动都慢两分钟。
 #
 # 三条路依次试：
 #   1) 已经装好（bin.js 非空）-> 直接用；
 #   2) npm install @deepseek-ai/dsh@<版本>（--from-cache 时跳过）；
-#   3) **从 npx 缓存复制**同版本那份整树（版本不一致会明确告警，仍可用）。
+#   3) **从 npx 缓存复制**同版本那份整树 —— 缓存里没有时先用 npx 把缓存填上再复制
+#      （全新机器的 _npx 缓存是空的）；版本不一致会明确告警，仍可用。
 #
 # 成功：最后一行 stdout 打印 `HARNESS_COMMAND=<node 全路径> <bin.js 全路径> web`；
 #       传了 --command-file 就同时写进那个文件。
@@ -127,6 +130,22 @@ cache_trees() {
   done | sort -rn | cut -f2-
 }
 
+# 全新机器上 _npx 缓存是**空的**（2026-09-22 同事实测：装之前刚清过缓存）→ 第 ③ 条无物可复制。
+# 这里主动把缓存填一次：`npx --yes --package=<包> -- node --version` —— `--package` 会**先把包
+# 装进 npx 自己的缓存**，然后跑一条必然立刻退出的命令。比"起一次 web 再杀掉"干净得多：
+# 不用挑空闲端口（更不能占 43199），不用管进程回收。
+#
+# 能救 / 不能救：npm install **到目标目录**失败、但 npx 自建缓存能成（本地原因）时能救；
+# registry 真坏的时候 npx 背后还是 npm，一样装不上 —— 那是"没有可用的下载源"，只能回退 npx 慢跑。
+fill_cache() {
+  local npx=""
+  npx="$(command -v npx 2>/dev/null || true)"
+  [ -n "$npx" ] || return 1
+  say "  缓存是空的 —— 让 npx 先把这份装进它自己的缓存（要 1-2 分钟）..."
+  "$npx" --yes "--package=@deepseek-ai/dsh@$VERSION" -- node --version 2>&1 | sed 's/^/      /' || true
+  [ -n "$(cache_trees)" ]
+}
+
 say "安装目录：$DEST"
 say "标准版版本：$VERSION"
 
@@ -169,6 +188,18 @@ else
     done <<EOF
 $(cache_trees)
 EOF
+    if [ -z "$PICK" ]; then
+      # 全新机器上缓存往往是空的（同事实测）→ 先自己填一次再找
+      if fill_cache; then
+        while IFS="$(printf '\t')" read -r v p; do
+          [ -n "$p" ] || continue
+          if [ -z "$PICK" ]; then PICK="$p"; VER="$v"; fi
+          if [ "$v" = "$VERSION" ]; then PICK="$p"; VER="$v"; break; fi
+        done <<EOF
+$(cache_trees)
+EOF
+      fi
+    fi
     if [ -z "$PICK" ]; then
       err "npx 缓存里也没有可用的标准版 —— 回退 npx：首次启动要多等 1-2 分钟"
       say "  想装本地入口：先跑一次 npx -y @deepseek-ai/dsh web（把缓存填上）再重跑本脚本"

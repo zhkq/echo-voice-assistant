@@ -333,9 +333,10 @@ function Prepare-Agent {
     Ok ("node: {0}" -f $node)
 
     # 装/修本地永久入口交给专门的脚本：它按"① 已装好 ② npm install ③ 从 npx 缓存复制"
-    # 三条路依次试。**为什么必须有第 ③ 条**（2026-09-22 实测）：`@deepseek-ai/dsh@0.1.5-rc.2`
-    # 的依赖图在公共 registry 上是坏的（子包依赖 ^0.1.5-rc.3，而那个 rc.3 从没发布过），
-    # npm 必然 ETARGET —— 老逻辑这时只会回退 npx，于是用户那边每次冷启动都要 2 分钟。
+    # 三条路依次试。**为什么要留着第 ③ 条**：`@deepseek-ai/dsh@0.1.5-rc.2` 的依赖图出过
+    # registry 事故（子包依赖 ^0.1.5-rc.3，而那个 rc.3 当时没发布），npm 会 ETARGET ——
+    # 老逻辑这时只会回退 npx，用户那边每次冷启动都要 2 分钟。该事故 2026-09-22 晚复测已恢复
+    # （rc.3 发布了、npm 584 包装成），但这类事故会复发，而 npx 慢是必然的，故三条路都保留。
     # $PSScriptRoot 在 -File 执行时一定有；内联/点源时可能为空，退一步用 $PSCommandPath
     $here = $PSScriptRoot
     if (-not $here) { try { $here = Split-Path -Parent $PSCommandPath } catch { $here = '' } }
@@ -369,18 +370,48 @@ function Prepare-Agent {
     return $true
 }
 
-function Wait-Harness([int]$Seconds = 150) {
+function Get-HarnessState {
+    # 标准版 harness 的状态在 /api/status 的 **components** 里（name = 'harness'）。
+    # 顶层 `dsh` 是 DSH **桌面版**那条适配器（app/api.py → manager.dsh_ready()），
+    # `-Agent harness` 时它本来就该是 offline —— 拿它判 harness 会**恒为假**。
+    # 2026-09-22 同事实测：装完白等 150 秒、报"还差 1 项"并 EXITCODE=1，
+    # 而那一刻 /api/status 里 harness 明明是 online。
+    param($Status)
+    $h = @($Status.components | Where-Object { $_.name -eq 'harness' })
+    if ($h.Count -eq 0) { return $null }
+    return $h[0]
+}
+
+function Wait-Harness {
     if ($Agent -ne 'harness') { return $true }
-    Step '等智能体就绪（写完设置后 ECHO 会自动拉起 harness）'
+    # 等待时长分档：本地永久安装（绝对路径直连）实测 ~11 秒就起；走 npx 才要一两分钟。
+    # 从前一律 150 秒 —— 那是照 npx 时代定的，失败时白等两分半，还把提示指向"从 npm 拉包慢"。
+    $local = [bool]$script:HarnessCommand
+    $Seconds = 45
+    $how = '本地永久安装，通常 10 秒内'
+    if (-not $local) { $Seconds = 150; $how = 'npx 路径，首次要 1-2 分钟' }
+    Step ("等智能体就绪（{0}）" -f $how)
     $deadline = (Get-Date).AddSeconds($Seconds)
+    $last = ''
     while ((Get-Date) -lt $deadline) {
         try {
             $st = Invoke-Api -Path '/api/status' -TimeoutSec 10
-            if ($st.dsh -and $st.dsh.online -eq $true) { Ok '智能体已就绪（harness online）'; return $true }
+            $h = Get-HarnessState $st
+            if ($h -and $h.status -eq 'online') {
+                Ok ("智能体已就绪（harness online：{0}）" -f $h.detail)
+                return $true
+            }
+            if ($h -and $h.status -eq 'failed') {
+                # 它已经明确失败了就不要再等满 —— 把 detail 原样说出来（多半是 node 不在 PATH / 装残）
+                Warn ("智能体启动失败：{0}" -f $h.detail)
+                return $false
+            }
+            if ($h) { $last = [string]$h.status }
         } catch { }
-        Start-Sleep -Seconds 5
+        Start-Sleep -Seconds 3
     }
-    Warn ("等 {0}s 仍未就绪 —— 看 data\logs\harness.log（首次从 npm 拉包慢是常见的）" -f $Seconds)
+    if (-not $last) { $last = '取不到状态' }
+    Warn ("等 {0}s harness 仍未 online（最后状态：{1}）—— 看 data\logs\harness.log" -f $Seconds, $last)
     return $false
 }
 
@@ -488,7 +519,17 @@ Step '自检'
 $failed = @()
 try {
     $st = Invoke-Api -Path '/api/status' -TimeoutSec 20
-    foreach ($c in $st.components) { Say ("{0,-9} {1}" -f $c.name, $c.status) }
+    foreach ($c in $st.components) {
+        # 未选中的那个智能体印成 offline 会被读成"坏了"——同事已被这条误导过两次
+        # （上一轮"dsh offline 是不是坏了"，这一轮又是启动页）。直接标 skipped 并写清你没选它。
+        if ($c.name -eq 'dsh' -and $Agent -eq 'harness') {
+            Say ("{0,-9} {1}  （未使用：你选的是标准版 harness）" -f $c.name, 'skipped'); continue
+        }
+        if ($c.name -eq 'harness' -and $Agent -ne 'harness') {
+            Say ("{0,-9} {1}  （未使用：你选的是 {2}）" -f $c.name, 'skipped', $Agent); continue
+        }
+        Say ("{0,-9} {1}" -f $c.name, $c.status)
+    }
 } catch { Warn ("取 /api/status 失败：{0}" -f $_.Exception.Message) }
 foreach ($e in $Engines) {
     if (-not $ENGINE_MAP.ContainsKey($e)) { continue }

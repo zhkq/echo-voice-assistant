@@ -5,15 +5,18 @@
 #
 # 为什么需要它（2026-09-22 实测，见 AGENTS.md）：
 #   * `npx -y @deepseek-ai/dsh web` 冷启动 **2 分 10 秒**，直连本地 bin.js 只要 **9 秒**；
-#   * 而 `npm install @deepseek-ai/dsh@0.1.5-rc.2` 在公共 registry 上**装不下来**：
-#     它的依赖图里有个子包被写成 ^0.1.5-rc.3，而那个子包的 rc.3 从没发布过 ->
+#   * 而 `npm install @deepseek-ai/dsh@0.1.5-rc.2` **曾经**在公共 registry 上装不下来：
+#     它的依赖图里有个子包被写成 ^0.1.5-rc.3，而那个子包的 rc.3 当时从没发布过 ->
 #     `ETARGET No matching version found for ...documentpreview@^0.1.5-rc.3`。
-#     老脚本遇到这个只会回退 npx，于是用户那边每次冷启动都慢两分钟。
+#     **2026-09-22 晚同事复测：rc.3 系列已经发布，npm 这条路现在是通的**（584 包，2 分钟）
+#     —— 所以第 ③ 条目前用不上，但保留：registry 上这种依赖图事故会复发，而 npx 慢是必然的。
+#     老脚本当初遇到装不上只会回退 npx，于是用户那边每次冷启动都慢两分钟。
 #
 # 所以这里按三条路依次试：
 #   1) 已经装好（bin.js 非空）-> 直接用；
 #   2) npm install @deepseek-ai/dsh@<Version>（-FromCache 时跳过）；
-#   3) **从 npx 缓存复制**同版本那份整树 —— npm 的 _npx 缓存里通常已经有一份能跑的。
+#   3) **从 npx 缓存复制**同版本那份整树 —— 缓存里没有时会先用 npx 把缓存填上再复制
+#      （全新机器的 _npx 缓存是空的，2026-09-22 同事就是这种情况）。
 #      版本不一致会明确告警（仍可用），完全不掩盖。
 #
 # 成功时：
@@ -149,8 +152,15 @@ function Copy-Tree([string]$From, [string]$To) {
     try { New-Item -ItemType Directory -Force -Path $To | Out-Null } catch { return $false }
     $rc = Get-Command robocopy -ErrorAction SilentlyContinue
     if ($rc) {
-        & $rc.Source $From $To /E /NFL /NDL /NJH /NJS /NP /R:1 /W:1 | Out-Null
-        return ($LASTEXITCODE -lt 8)          # robocopy：0-7 都是成功
+        # 与 npm 那处同一个坑：robocopy 的提示可能走 stderr，`Stop` 会把它升格成异常，
+        # 从而**绕过**下面"按退出码判成败"那句（robocopy 0-7 都算成功，异常却直接抛走）。
+        $prevEap = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            & $rc.Source $From $To /E /NFL /NDL /NJH /NJS /NP /R:1 /W:1 | Out-Null
+            $rcExit = $LASTEXITCODE
+        } finally { $ErrorActionPreference = $prevEap }
+        return ($rcExit -lt 8)                # robocopy：0-7 都是成功
     }
     try {
         Copy-Item -Path (Join-Path $From '*') -Destination $To -Recurse -Force -ErrorAction Stop
@@ -166,6 +176,59 @@ $target = Join-Path $root 'harness\dsh'
 $entry = Join-Path $target 'node_modules\@deepseek-ai\dsh\lib\bin.js'
 
 Say ("安装目录：{0}" -f $root)
+function Fill-NpxCache([string]$Version) {
+    # 全新机器上 npm 的 _npx 缓存是**空的**（2026-09-22 同事实测：装之前刚清过缓存），
+    # 于是第 ③ 条兜底"从缓存复制"无物可复制。这里主动把缓存填上一次。
+    #
+    # 手法：`npx --yes --package=<包> -- node --version`。--package 会**先把包装进 npx 自己的
+    # 缓存**，然后跑一条必然立刻退出的命令。比"起一次 web 再杀掉"干净得多：不用挑空闲端口
+    # （更不能占 43199），不用管进程回收，也不会留下半个服务在跑。
+    #
+    # 能救 / 不能救，说清楚（别让人误以为它万能）：
+    #   * 能救：npm install **到目标目录**失败，但 npx 自建缓存能成 —— 宿主的安全删除 shim、
+    #     目标路径怪异（中文/超长/网络盘）这类**本地**原因；
+    #   * 不能救：registry 真坏的时候，npx 背后还是 npm，一样装不上。那种情况就是没有可用的
+    #     下载源，只能回退 npx 慢慢跑（本函数失败即返回 $false，不改变原有行为）。
+    $npx = ''
+    $node = Resolve-Node
+    $nodeDir = ''
+    if ($node) { $nodeDir = Split-Path -Parent $node }
+    foreach ($d in @($nodeDir, "$env:ProgramFiles\nodejs", "$env:LOCALAPPDATA\Programs\nodejs")) {
+        if (-not $d) { continue }
+        foreach ($n in @('npx.cmd', 'npx.exe', 'npx')) {
+            $c = Join-Path $d $n
+            if (Test-Path -LiteralPath $c) { $npx = $c; break }
+        }
+        if ($npx) { break }
+    }
+    if (-not $npx) {
+        $c = Get-Command npx -ErrorAction SilentlyContinue
+        if ($c) { $npx = $c.Source }
+    }
+    if (-not $npx) { return $false }
+
+    Say '  缓存是空的 —— 让 npx 先把这份装进它自己的缓存（要 1-2 分钟）...'
+    $oldPath = $env:PATH
+    if ($nodeDir) { $env:PATH = $nodeDir + ';' + $env:PATH }   # 别让子进程找不到 node
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        & $npx --yes ("--package=@deepseek-ai/dsh@{0}" -f $Version) -- node --version 2>&1 |
+            ForEach-Object { LogLine ("      " + $_) }
+    } catch {
+        Warn ("填缓存时出错：{0}" -f $_.Exception.Message)
+    } finally {
+        $ErrorActionPreference = $prevEap
+        $env:PATH = $oldPath
+    }
+    if ((@(Get-NpxCacheTrees -Root $CacheDir).Count) -gt 0) {
+        Ok '缓存已填上'
+        return $true
+    }
+    Warn '没能把缓存填上（npx 本身也装不下来 —— 那说明这次没有可用的下载源）'
+    return $false
+}
+
 Say ("标准版版本：{0}" -f $Version)
 
 $node = Resolve-Node
@@ -198,8 +261,25 @@ if (Test-Entry) {
             $env:CODEBUDDY_SAFE_DELETE_ENABLED = '0'
             Push-Location $target
             try {
-                & $npm install ("@deepseek-ai/dsh@{0}" -f $Version) --no-audit --no-fund 2>&1 |
-                    ForEach-Object { Write-Host ("      " + $_) -ForegroundColor DarkGray; LogLine ("      " + $_) }
+                # native 命令把进度/警告写在 **stderr**；而 `$ErrorActionPreference = 'Stop'` 下
+                # `2>&1 |` 会把 stderr 升格成 terminating error —— 一句 `npm warn deprecated …`
+                # 就会跳进 catch，看起来像 npm 坏了。2026-09-22 同事实测：明明装成功了却报
+                # "npm 执行异常"；更糟的是若警告出现在**安装中途**，管道会提前中断、留下半个
+                # node_modules（正是 B4 那类"装残"）。所以这里临时降级，成败只看 **退出码**。
+                # --loglevel=error 顺带把 deprecated 这类噪音压掉。
+                $prevEap = $ErrorActionPreference
+                $ErrorActionPreference = 'Continue'
+                try {
+                    & $npm install ("@deepseek-ai/dsh@{0}" -f $Version) `
+                        --no-audit --no-fund --loglevel=error 2>&1 |
+                        ForEach-Object { Write-Host ("      " + $_) -ForegroundColor DarkGray; LogLine ("      " + $_) }
+                    $npmExit = $LASTEXITCODE
+                } finally {
+                    $ErrorActionPreference = $prevEap
+                }
+                if ($npmExit -ne 0) {
+                    Warn ("npm 退出码 {0} —— 这条路没成，继续试下一条" -f $npmExit)
+                }
             } catch {
                 Warn ("npm 执行异常：{0}" -f $_.Exception.Message)
             } finally {
@@ -213,7 +293,7 @@ if (Test-Entry) {
     }
 
     if (-not (Test-Entry)) {
-        Warn 'npm 这条路没装上（公共 registry 上这个版本的依赖图可能是坏的，见 AGENTS.md）'
+        Warn 'npm 这条路没装上（这个版本的依赖图曾出过 registry 事故，见 AGENTS.md）'
         Say '  改用 npx 缓存里那份已经能跑的树 ...'
         $trees = Get-NpxCacheTrees -Root $CacheDir
         $pick = $null
@@ -223,6 +303,19 @@ if (Test-Entry) {
         } elseif ($trees.Count -gt 0) {
             $pick = $trees | Sort-Object Time -Descending | Select-Object -First 1
             Warn ("缓存里没有 {0}，退而用 {1}（版本不同，但比 npx 快得多）" -f $Version, $pick.Version)
+        }
+        if (-not $pick) {
+            # 全新机器上缓存往往是空的（同事实测）→ 先自己填一次再找
+            if (Fill-NpxCache -Version $Version) {
+                $trees = Get-NpxCacheTrees -Root $CacheDir
+                $exact = @($trees | Where-Object { $_.Version -eq $Version })
+                if ($exact.Count -gt 0) {
+                    $pick = $exact | Sort-Object Time -Descending | Select-Object -First 1
+                } elseif ($trees.Count -gt 0) {
+                    $pick = $trees | Sort-Object Time -Descending | Select-Object -First 1
+                    Warn ("缓存里没有 {0}，退而用 {1}（版本不同，但比 npx 快得多）" -f $Version, $pick.Version)
+                }
+            }
         }
         if (-not $pick) {
             Err 'npx 缓存里也没有可用的标准版 —— 回退 npx：首次启动要多等 1-2 分钟'

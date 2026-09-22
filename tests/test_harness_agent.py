@@ -634,7 +634,9 @@ class HarnessBootTests(unittest.TestCase):
                 patch.object(harness_proc, "_load_pid", lambda: 0), \
                 patch.object(harness_proc, "started_by_echo", lambda: False):
             boot._start_harness(lambda **kw: seen.update(kw))
-        self.assertEqual(seen.get("status"), "disabled")
+        # skipped 而不是 disabled：两个智能体是二选一，没选它算"未使用"，
+        # 不该计入启动页的"失败"（2026-09-22 同事反馈：选了标准版却报 DSH 执行引擎失败）
+        self.assertEqual(seen.get("status"), "skipped")
 
     def test_start_step_cleans_up_a_leftover_when_not_requested(self):
         """没选中但上次是我们起的 → 启动时收尾（自愈，免得 node 一直挂着）。"""
@@ -644,7 +646,7 @@ class HarnessBootTests(unittest.TestCase):
                 patch.object(harness_proc, "_load_pid", lambda: 4242), \
                 patch.object(harness_proc, "stop", lambda **kw: (True, "已停止独立 harness")):
             boot._start_harness(lambda **kw: seen.update(kw))
-        self.assertEqual(seen.get("status"), "disabled")
+        self.assertEqual(seen.get("status"), "skipped")
         self.assertIn("收尾", seen.get("detail", ""))
 
     def test_start_step_launches_when_requested(self):

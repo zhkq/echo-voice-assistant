@@ -4,8 +4,12 @@
 阶段 0：面板 HTTP 立即可用（main.py 同步完成，server 直接 online）。
 阶段 1+：后台线程按依赖分阶段拉起各组件，各自独立状态/进度，可重试/启停。
 
-状态机：pending → starting → online | failed | disabled | idle
+状态机：pending → starting → online | failed | disabled | skipped | idle
   idle 用于"按需"组件（会议转写引擎），表示已就绪但未加载模型。
+  skipped 用于"你选了别的那个"的组件（两个智能体是二选一）：它**不是**故障 ——
+  启动页不该把它算进"失败"，更不该教用户去启动一个他没选的组件
+  （2026-09-22 同事反馈：选了标准版 harness，启动页却报「DSH 执行引擎 失败」并让他去开
+  DSH Desktop；上一条同类误导是"dsh offline 是不是坏了"，换个页面又出现）。
 """
 import threading
 import time
@@ -36,6 +40,25 @@ def _log(cid, level, msg):
         db.add_log(level, "boot", f"[{cid}] {msg}")
     except Exception:
         pass
+
+
+def selected_agent():
+    """用户**当前选中**的智能体名（原始设置，不走 `agents.active_name()` 的降级探测）。
+
+    为什么不用 active_name()：那个会为了降级去**探测可用性**，而这里要回答的是
+    "用户选的是哪个" —— 未选中的组件该标 skipped，而不是去猜它能不能用。
+    """
+    try:
+        from app.config import settings as _s
+        return str(_s.get("agentBackend", "") or "").strip()
+    except Exception:
+        return ""
+
+
+def _agent_choice_detail(want):
+    """「未使用（你选的是 X）」——X 用组件的显示名，别让用户去猜内部 id。"""
+    label = (_COMPONENTS.get(want) or {}).get("label") or want or "别的智能体"
+    return "未使用（你选的是 %s）" % label
 
 
 def register(cid, label, icon, start_fn=None, stop_fn=None, can_start=True,
@@ -196,7 +219,9 @@ def snapshot():
         c.pop("_start_fn", None)
         c.pop("_stop_fn", None)
     total = len(comps)
-    ready = sum(1 for c in comps if c["status"] in ("online", "idle", "disabled"))
+    # skipped 计入就绪：它表示"你选了另一个智能体"，不是待办事项 ——
+    # 否则选了标准版 harness 的机器会永远显示「就绪 10/11 · 失败 1」。
+    ready = sum(1 for c in comps if c["status"] in ("online", "idle", "disabled", "skipped"))
     failed = sum(1 for c in comps if c["status"] == "failed")
     running = sum(1 for c in comps if c["status"] == "starting")
     return {
@@ -211,6 +236,11 @@ def snapshot():
 
 def _start_dsh(report):
     from app import manager
+    # 两个智能体是**二选一**：没选桌面版就别去启动它，更别把"没启动"记成失败。
+    want = selected_agent()
+    if want and want != "dsh":
+        report(status="skipped", detail=_agent_choice_detail(want), progress=0.0)
+        return
     report(detail="探测中…", progress=0.1)
     if manager.dsh_ready():
         report(status="online", detail="已运行 · API 可访问", progress=1.0)
@@ -234,11 +264,12 @@ def _start_harness(report):
         # 自愈：上次是我们起的、这次没被选中 → 顺手收掉（否则切回 DSH 后 node 一直挂着）
         if harness_proc._load_pid() or harness_proc.started_by_echo():
             ok, msg = harness_proc.stop(reason="启动自愈：当前没选中它，收掉上次 ECHO 起的实例")
-            report(status="disabled" if ok else "failed",
-                   detail="未选中，已收尾：%s" % msg if ok else msg)
+            report(status="skipped" if ok else "failed",
+                   detail="未使用，已收尾：%s" % msg if ok else msg)
             return
         harness_proc.sync_status()
-        report(status="disabled", detail="未选中（设置 → 智能体 → 标准版 harness）",
+        # skipped（不是 disabled）：这不是"坏了也没启用"，而是"你选了另一个"，不该计入失败
+        report(status="skipped", detail=_agent_choice_detail(selected_agent()),
                progress=0.0)
         return
     report(detail="拉起独立 harness…", progress=0.2)
@@ -256,14 +287,15 @@ def _start_harness(report):
 
 
 def _register_router_after_agent_start():
-    """智能体起来后补一次 ECHO AUTO 注册（幂等；失败只记日志，不影响组件状态）。"""
+    """智能体起来后补一次 ECHO AUTO 注册（幂等），并**重算 failover 的文案**。
+
+    前半句是原有行为：标准版的家目录是**它启动时**才建出来的，而注册那步跑在阶段 1、
+    可能早于这里，所以智能体就绪后要补一次。
+    后半句是 2026-09-22 同事反馈的修复：阶段 1 探测出的"标准版 harness 没在监听 43199"
+    会一直挂在面板 detail 上，harness 真起来了也不刷新 —— 现在在这里按当前状态重写。
+    """
     try:
-        from app.config import settings as _s
-        if not _s.get("routerAutoRegister", True):
-            return
-        from app import llm_router
-        ok, detail = llm_router.sync()
-        db.add_log("info", "boot", "ECHO AUTO 注册（智能体就绪后复核）：%s" % detail)
+        _refresh_failover_detail(note="智能体就绪后复核")
     except Exception as exc:
         db.add_log("warn", "boot", "智能体就绪后复核 ECHO AUTO 注册失败：%s" % exc)
 
@@ -307,39 +339,66 @@ def _agent_dsh_available():
     return False, "；".join(reasons) or "没有可用的 DSH 智能体"
 
 
+# 模型路由自身的基础描述（"运行中 · http://…"）。failover 组件的 detail = 它 + 「注册进 DSH 的情况」。
+# 为什么拆成两半：注册那步跑在**阶段 1**，可能早于 harness 起来 —— 当时探测到的
+# "标准版 harness 没在监听 43199" 会被**烤进** detail 字符串，等 harness 真起来之后面板还在念
+# （2026-09-22 同事反馈：排障时被这句自相矛盾的文案带偏，尤其"node 不在 PATH"那句指向的正是
+# 已经修好的那条）。拆开后，harness 就绪时重算后半句即可。
+_ROUTER_DETAIL = ""
+
+
+def _refresh_failover_detail(note="启动时", emit=None):
+    """按**当前**状态重写 failover 组件的 detail（幂等，可反复调用）。
+
+    `emit`：组件上报函数。默认走模块级 `report("failover", …)`；
+    `_start_failover` 把它**注入的那个** report 传进来 —— 别在这里改成全局调用，
+    那会把可测试的接缝拆掉（`tests/test_failover_boot.py` 正是靠注入点断言的）。
+    """
+    if not _ROUTER_DETAIL:
+        return
+    if emit is None:
+        emit = lambda **kw: report("failover", **kw)      # noqa: E731
+    base = _ROUTER_DETAIL
+    try:
+        from app.config import settings as _s
+        if not _s.get("routerAutoRegister", True):
+            emit(status="online", detail=f"{base} · 已按设置跳过 ECHO AUTO 注册", progress=1.0)
+            return
+        agent_ok, agent_why = _agent_dsh_available()
+        if not agent_ok:
+            # D25：没装 agent 就不动 DSH 的配置文件；路由照常可用
+            emit(status="online",
+                 detail=f"{base} · 未注册进 DSH（{agent_why}）· 路由本身可用", progress=1.0)
+            db.add_log("info", "boot", f"[{note}] 跳过 ECHO AUTO 注册：{agent_why}")
+            return
+        from app import llm_router
+        rok, rdetail = llm_router.sync()
+        if rok:
+            emit(status="online", detail=f"{base} · {rdetail}", progress=1.0)
+            db.add_log("info", "boot", f"[{note}] ECHO AUTO 注册：{rdetail}")
+        else:
+            emit(status="online", detail=f"{base} · ECHO AUTO 未注册（{rdetail}）", progress=1.0)
+            print(f"[boot] ECHO AUTO 注册失败: {rdetail}")
+    except Exception as exc:
+        emit(status="online",
+             detail=f"{base} · ECHO AUTO 注册异常（{type(exc).__name__}: {exc}）", progress=1.0)
+        print(f"[boot] ECHO AUTO 注册异常: {exc}")
+
+
 def _start_failover(report):
     """确保模型路由在运行并起守护线程；**装了 agent-dsh 时**才顺带注册进 DSH（D25）。"""
+    global _ROUTER_DETAIL
     from app import failover_proxy
     report(detail="探测路由端口…", progress=0.2)
     ok, detail = failover_proxy.start_guard()
     if not ok:
         report(status="failed", detail=detail, error=detail)
         return
+    _ROUTER_DETAIL = detail
+    report(detail="注册 ECHO AUTO…", progress=0.7)
     # 顺带把 ECHO 的模型组（config.json 的 groups）注册成 DSH 的本地模型；
     # 注册失败不影响路由本身，只是 DSH 里选不到 ECHO AUTO。
-    from app.config import settings as _s
-    if not _s.get("routerAutoRegister", True):
-        report(status="online", detail=f"{detail} · 已按设置跳过 ECHO AUTO 注册", progress=1.0)
-        return
-    agent_ok, agent_why = _agent_dsh_available()
-    if not agent_ok:
-        # D25：没装 agent 就不动 DSH 的配置文件；路由照常可用
-        report(status="online",
-               detail=f"{detail} · 未注册进 DSH（{agent_why}）· 路由本身可用",
-               progress=1.0)
-        db.add_log("info", "boot", f"跳过 ECHO AUTO 注册：{agent_why}")
-        return
-    try:
-        from app import llm_router
-        report(detail="注册 ECHO AUTO…", progress=0.7)
-        rok, rdetail = llm_router.sync()
-        detail = f"{detail} · {rdetail}" if rok else f"{detail} · ECHO AUTO 未注册（{rdetail}）"
-        if not rok:
-            print(f"[boot] ECHO AUTO 注册失败: {rdetail}")
-    except Exception as exc:
-        detail = f"{detail} · ECHO AUTO 注册异常（{type(exc).__name__}: {exc}）"
-        print(f"[boot] ECHO AUTO 注册异常: {exc}")
-    report(status="online", detail=detail, progress=1.0)
+    _refresh_failover_detail(note="启动时", emit=report)
 
 
 def _stt_engine_and_model(setting_key):
