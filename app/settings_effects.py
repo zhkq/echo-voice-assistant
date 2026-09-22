@@ -101,4 +101,15 @@ def _agent(harness_timeout=None) -> dict:
     except Exception as exc:
         ok = False
         notes.append("harness 联动失败：%s" % exc)
+    # 智能体动了就复核一次 ECHO AUTO 注册：标准版的家目录是"选中它"之后才存在的，
+    # 不补这一次，只装标准版的机器要等到下次重启才在 DSH 里选得到 ECHO AUTO。
+    # 注册失败只写进 detail（不把设置保存判成失败）：路由本身与智能体都不受影响。
+    try:
+        from app.config import settings as _s
+        if _s.get("routerAutoRegister", True):
+            from app import llm_router
+            sok, sdetail = llm_router.sync()
+            notes.append(str(sdetail) if sok else "注册 ECHO AUTO 失败：%s" % sdetail)
+    except Exception as exc:
+        notes.append("注册 ECHO AUTO 异常：%s" % exc)
     return {"scope": "agent", "ok": ok, "detail": "；".join(n for n in notes if n)}

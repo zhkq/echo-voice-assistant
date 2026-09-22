@@ -248,7 +248,24 @@ def _start_harness(report):
     if not ok:
         report(status="failed", detail=msg, error=msg)
         return
+    # 标准版的家目录是**它启动时**才建出来的，而"注册 ECHO AUTO"那一步（_start_failover）
+    # 跑在阶段 1、可能早于这里 —— 所以智能体就绪后补一次注册（幂等），
+    # 否则只装标准版的机器第一次启动时 DSH 里选不到 ECHO AUTO。
+    _register_router_after_agent_start()
     report(status="online", detail=msg, progress=1.0)
+
+
+def _register_router_after_agent_start():
+    """智能体起来后补一次 ECHO AUTO 注册（幂等；失败只记日志，不影响组件状态）。"""
+    try:
+        from app.config import settings as _s
+        if not _s.get("routerAutoRegister", True):
+            return
+        from app import llm_router
+        ok, detail = llm_router.sync()
+        db.add_log("info", "boot", "ECHO AUTO 注册（智能体就绪后复核）：%s" % detail)
+    except Exception as exc:
+        db.add_log("warn", "boot", "智能体就绪后复核 ECHO AUTO 注册失败：%s" % exc)
 
 
 def _stop_harness():
@@ -257,21 +274,37 @@ def _stop_harness():
 
 
 def _agent_dsh_available():
-    """装了 `agent-dsh` 才算"有 DSH 可注册"（D25）。返回 ``(ok, reason)``。
+    """有没有**可注册的** DSH（桌面版或标准版任一在跑）。返回 ``(ok, reason)``。
 
-    为什么要这道闸（D25）：把模型组写进 `~/.dsh/settings.yaml` + `.credentials.yaml`
+    为什么要这道闸（D25）：把模型组写进 DSH 家目录的 settings.yaml + .credentials.yaml
     是**给 agent 用的**——没装 agent 时写了没人读，还会平白在用户家里建/改配置文件。
     而**路由本身照常运行**：它是 ECHO 的 LLM provider（`echo-auto`），不是 agent 的附属
     （纪要/命令可以直接经它直连上游，这条已在 P5 打通）。
     手动"注册到 DSH"的按钮不受此限制 —— D25 说的是自动那一半。
+
+    2026-09-22 更正判据：原来只看桌面版适配器，于是"只装标准版"（向导的默认选择）
+    永远注册不上 —— 同事不一定两个都装。现在两个适配器问一遍，任一可用即放行；
+    具体写到哪个家目录由 `llm_router.dsh_homes()` 按**实际存在**的家目录决定。
     """
     try:
         from app import agents
-        if "dsh" not in agents.names():
-            return False, "未安装 agent-dsh（内置适配器未注册）"
-        return agents.get_agent("dsh").available()
+        names = agents.names()
     except Exception as e:
         return False, "检测 agent-dsh 失败：%s" % e
+    if "dsh" not in names and "harness" not in names:
+        return False, "未安装 agent-dsh（内置适配器未注册）"
+    reasons = []
+    for name in ("dsh", "harness"):
+        if name not in names:
+            continue
+        try:
+            ok, why = agents.get_agent(name).available()
+        except Exception as e:
+            ok, why = False, "%s 探测失败：%s: %s" % (name, type(e).__name__, e)
+        if ok:
+            return True, why
+        reasons.append(why)
+    return False, "；".join(reasons) or "没有可用的 DSH 智能体"
 
 
 def _start_failover(report):

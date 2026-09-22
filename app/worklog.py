@@ -123,6 +123,27 @@ def ensure_dsh_default_access():
     return True, f"已校正：{cur} → {DSH_FULL_ACCESS}"
 
 
+def _session_store_paths() -> list:
+    """会话存档（projection cache）可能在的目录：**每个存在的 DSH 家目录**各一份。
+
+    为什么要多份（2026-09-22）：标准版 harness 的家目录是独立的（`harnessHome`，
+    缺省 {DATA}/harness），只认桌面版那份的话，只装标准版的机器上这里恒为 "unknown"
+    —— 少了"首次归档可能要等几分钟"的提前提示（见 `session_access` 的调用点）。
+    末尾始终附上老位置兜底：家目录都还没初始化时行为与以前一致。
+    """
+    dirs = []
+    try:
+        from app import llm_router
+        for home in llm_router.dsh_homes():
+            dirs.append(os.path.join(str(home["home"]), "storages",
+                                     "session_projcache", "sessions"))
+    except Exception:
+        pass
+    if _SESSION_STORE not in dirs:
+        dirs.append(_SESSION_STORE)
+    return dirs
+
+
 def session_access(session_id):
     """本场会话的权限档位：`full` / `restricted` / `unknown`（只读，尽力而为）。
 
@@ -133,15 +154,17 @@ def session_access(session_id):
     """
     if not session_id:
         return "unknown"
-    try:
-        with open(os.path.join(_SESSION_STORE, session_id + ".json"), encoding="utf-8") as f:
-            rows = (json.load(f).get("record") or {}).get("rows") or {}
-        val = (rows.get("permissions") or {}).get("val") or {}
+    for store in _session_store_paths():
+        try:
+            with open(os.path.join(store, session_id + ".json"), encoding="utf-8") as f:
+                rows = (json.load(f).get("record") or {}).get("rows") or {}
+            val = (rows.get("permissions") or {}).get("val") or {}
+        except Exception:
+            continue
         if not isinstance(val, dict) or not val:
-            return "unknown"
+            continue
         return "full" if val.get("sandbox") == DSH_FULL_ACCESS else "restricted"
-    except Exception:
-        return "unknown"
+    return "unknown"
 
 
 # ---------------------------------------------------------------- 材料准备

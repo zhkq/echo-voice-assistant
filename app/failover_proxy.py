@@ -101,11 +101,25 @@ def ensure_running():
     out = os.path.join(LOG_DIR, "proxy-echo.log")
     err = os.path.join(LOG_DIR, "proxy-echo.err.log")
     _last_launch = now          # 先记时刻：即使 Popen 抛异常也要进冷却，避免风暴
+    env = dict(os.environ)
+    # 告诉路由进程"去哪儿找凭据"：DSH 可能只有一个家目录（桌面版或标准版），也可能两个
+    # 都有，甚至一个都没有 —— 只认桌面版时，只装标准版的机器上组成员密钥会解析成空
+    # （见 app/llm_router.py 的 dsh_homes 与 dsh-failover/proxy.py 的 _cred_paths）。
+    # 这里只传**位置**、不传密钥；家目录后来才出现时由 homes.json 热更新兜住。
+    try:
+        from app import llm_router
+        homes = [str(h["home"]) for h in llm_router.dsh_homes()]
+        if homes:
+            env["ECHO_DSH_HOMES"] = os.pathsep.join(homes)
+        env["ECHO_DSH_HOMES_FILE"] = str(llm_router.HOMES_FILE)
+    except Exception:
+        pass
     try:
         with open(out, "a", encoding="utf-8") as fo, open(err, "a", encoding="utf-8") as fe:
             subprocess.Popen(
                 [pyw, script],
                 cwd=os.path.dirname(script),
+                env=env,
                 stdout=fo,
                 stderr=fe,
                 creationflags=echo_platform.no_window_creationflags(),

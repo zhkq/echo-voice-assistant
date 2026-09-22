@@ -105,7 +105,10 @@ harness 跑在**另一台机器/另一个家目录**（ECHO 读不到它的 `.cr
      「harness 启动命令」改成 npx 的全路径。
    * **端口**：默认 43199；不要填 43120（桌面版）或 18060（ECHO 自己），`port_conflict()` 会拒绝。
    * **你自己起的实例**：ECHO 不碰它；要用它就把启动时打印的 token 填进「harness 访问 token」。
-   * **日志**：`data/logs/harness.log`（子进程全部输出）、`data/logs/harness-token.txt`、`data/logs/harness.pid`。
+   * **日志**：`data/logs/harness.log`（子进程全部输出）、`data/logs/harness.pid`；
+     token 落在 **`data/harness-token.txt`**（2026-09-22 从 `data/logs/` 挪出来：那里是
+     "日志"语义，会被日志清理与"测试不许碰真实状态"的约定误伤，token 一丢就得把 harness
+     重启一遍换一枚）。老位置仍会被读一次并自动迁移。
 
 ## 5. 还没验 / 待办
 

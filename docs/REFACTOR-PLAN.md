@@ -774,6 +774,13 @@ Windows 与 macOS 结构一致，仅 `dsh` 可执行文件来自各自的平台 
 
 注意 (c) 在重构后其实**变好了**：今天是"用带签名 Cookie 的 RPC 把会话内容读出来自己渲染"（因为 DSH 的 web UI 不支持按会话直达的 URL）；换成 SDK 后 `RunResult.events` / `notifications` 直接给事件，不再需要逆向。
 
+> **复核结论（2026-09-22，标准版 harness）**：装到标准版后重新验证过"能不能拼 URL 跳到具体会话"
+> ——**不能**。桌面版与标准版共用同一套 Web 前端（`@deepseek-ai/dsh-web-frontend` 0.1.5-rc.2），
+> app 与 vendor bundle 里都没有 `location.search` / `location.hash` / `URLSearchParams` /
+> `sessionStorage` / `location.pathname`，前端不解析任何 query/hash 参数来定位会话。这是硬限制，
+> 不是 ECHO 的疏漏，所以面板内渲染（(c)，以及 (a) 自建 web 实例）仍是唯一可行的"看会话"路径，
+> 别再尝试"跳到 DSH 网页的具体会话"。
+
 **(a) 与 (c) 不冲突**，可以都做：面板内嵌会话视图（默认路径）+ 需要时打开完整 web 界面（进阶路径）。
 
 **已定（D26）：(a) + (c) 并存。**

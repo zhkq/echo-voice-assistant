@@ -12,8 +12,9 @@ D25 的原话：**多上游派发路由属于主包**（`dsh-failover/` 是 ECHO
 
 凭据处理（写死一条纪律）
 ----------------------
-路由令牌从 `app.llm_router.router_token()` 取（它管着 `~/.dsh/.credentials.yaml` 里的
-`ECHO_ROUTER_TOKEN`）。**令牌永远不进清单**（`ProviderSpec.details` 里只有端口与模型名），
+路由令牌从 `app.llm_router.router_token()` 取（它按"实际存在的 DSH 家目录"逐份找
+ECHO_ROUTER_TOKEN —— 桌面版或标准版，只装其中一个也行；两个都没装时路由对本机
+不校验令牌）。**令牌永远不进清单**（`ProviderSpec.details` 里只有端口与模型名），
 也不写进任何日志。
 """
 from __future__ import annotations

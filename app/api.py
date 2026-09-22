@@ -444,9 +444,13 @@ def del_commands(_auth=Depends(optional_auth)):
 def get_command_session(cmd_id: int, limit: int = 12, _auth=Depends(optional_auth)):
     """某条命令落在了哪个 DSH 会话，以及该会话最近几轮对话（面板「历史 → 看会话」）。
 
-    为什么由 ECHO 读：DSH 的 Web UI 没有"按会话直达"的 URL（实测前端 bundle 不解析
-    任何 URL 查询/哈希参数，也没有自定义协议），跳不过去；而 ECHO 有签名 Cookie 的
+    为什么由 ECHO 读：DSH 的 Web UI 没有"按会话直达"的 URL，跳不过去；而 ECHO 有签名 Cookie 的
     RPC 通道，能直接把会话内容取回来渲染。
+
+    这是**硬限制**，已对标准版 harness 源码层面复核（dsh-web-frontend 0.1.5-rc.2，桌面版与
+    标准版共用同一套前端 bundle）：app 与 vendor bundle 都不含 location.search / location.hash /
+    URLSearchParams / sessionStorage / location.pathname，即前端不解析任何 query/hash 参数来定位
+    会话。别再去试"拼一个会话 URL 跳过去"——这条路不存在，面板内渲染是唯一可行的查看方式。
     """
     row = db.get_command(cmd_id)
     if not row:

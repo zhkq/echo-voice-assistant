@@ -30,6 +30,11 @@ logs/
 dsh-failover/config.json
 dsh-failover/logs/
 dsh-failover/__pycache__/
+# ECHO 写给路由进程的"去哪儿找凭据"清单：含本机绝对路径，不入库（注册时自动生成）
+dsh-failover/homes.json
+
+# ---- 标准版 harness 的本地永久安装（安装技能写进来，约 223 MB，严禁入库）----
+harness/
 
 # ---- 本地设置/凭据（严禁入库）----
 secrets/

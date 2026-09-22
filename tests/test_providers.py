@@ -438,7 +438,11 @@ class SecretHandlingTests(unittest.TestCase):
         payload = {r["key"]: r["value"] for r in client.get("/api/settings").json()["settings"]}
         payload["providerLlmApiKey"] = ""                 # 遮罩后的空串（最危险的那个）
         payload["userLocation"] = "北京"
-        r = client.put("/api/settings", json={"values": payload})
+        # 整批保存若真的改了智能体/路由/唤醒那几个键，联动会去碰真实的 harness 进程、
+        # dsh-failover/config.json 与 DSH 家目录（app/settings_effects.py）——
+        # 本用例只关心"密钥没被清掉"，把整段联动哑掉。
+        with patch("app.settings_effects.apply", lambda updated: []):
+            r = client.put("/api/settings", json={"values": payload})
         self.assertEqual(r.status_code, 200, r.text)
         self.assertEqual(settings.get("providerLlmApiKey"), self.SECRET,
                          "整批保存后密钥被清掉了 —— 这正是要防的事故")

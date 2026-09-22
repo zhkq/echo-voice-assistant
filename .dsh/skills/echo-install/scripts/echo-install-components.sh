@@ -45,6 +45,8 @@ WAKE=0
 DIARIZE=0
 ACCEL_CUDA=0
 AGENT="harness"
+DSH_VERSION="0.1.5-rc.2"
+PIN_HARNESS_COMMAND=0
 MODELS_DIR=""
 MEETINGS_DIR=""
 NOTES_DIR=""
@@ -93,6 +95,10 @@ usage() {
     --diarize            装说话人分离（pyannote，需 HF 授权）
     --accel-cuda         mac 上无意义，会忽略并提示
     --agent <名>         harness（默认，标准版）/ dsh / none
+    --dsh-version <版本> 标准版本地安装的版本（默认 0.1.5-rc.2）。npm 装不下来时会
+                         从 npx 缓存里找**同版本**那份复制
+    --pin-harness-command 把本地入口的绝对路径写进设置 harnessCommand（默认**不写**：
+                         ECHO 自己会优先本地入口，node 换版本不用改配置）
     --models-dir <目录>  模型放哪（默认安装目录下）
     --meetings-dir <目录> 会议录音放哪（默认安装目录下）
     --notes-dir <目录>   笔记库（填了会打开纪要归档）
@@ -116,6 +122,9 @@ while [ $# -gt 0 ]; do
     --accel-cuda)     ACCEL_CUDA=1; shift ;;
     --agent)          AGENT="${2:-}"; shift 2 ;;
     --agent=*)        AGENT="${1#*=}"; shift ;;
+    --dsh-version)    DSH_VERSION="${2:-}"; shift 2 ;;
+    --dsh-version=*)  DSH_VERSION="${1#*=}"; shift ;;
+    --pin-harness-command) PIN_HARNESS_COMMAND=1; shift ;;
     --models-dir)     MODELS_DIR="${2:-}"; shift 2 ;;
     --models-dir=*)   MODELS_DIR="${1#*=}"; shift ;;
     --meetings-dir)   MEETINGS_DIR="${2:-}"; shift 2 ;;
@@ -497,7 +506,8 @@ ENGINE_LIST="${ENGINE_LIST# }"
 # 智能体（标准版 harness）：**本地永久安装 + 绝对路径直连**（2026-09-22 改）。
 # 为什么不用 npx：同一台机器实测 `npx -y @deepseek-ai/dsh web` 冷启动要 **2 分 10 秒**，
 # 而直连本地 bin.js 只要 **9 秒** —— 慢在 npx 每次重新解析安装 + 回滚清理。
-# 绝对路径还顺带绕开"进程 PATH 里没有 node"与宿主的安全删除 shim。失败则回退 npx。
+# 绝对路径还顺带绕开"进程 PATH 里没有 node"与宿主的安全删除 shim。
+# 装法见 harness-install-local.sh（npm 装不下来时从 npx 缓存复制同版本树；再失败才回退 npx）。
 HARNESS_COMMAND=""
 prepare_agent() {
   [ "$AGENT" = "harness" ] || return 0
@@ -515,34 +525,32 @@ prepare_agent() {
   fi
   ok "node: $node_bin"
 
-  local target="$DEST/harness/dsh"
-  local entry="$target/node_modules/@deepseek-ai/dsh/lib/bin.js"
-  if [ ! -s "$entry" ]; then
-    if ! command -v npm >/dev/null 2>&1; then
-      warn "没找到 npm —— 回退到 npx，首次启动要多等 1-2 分钟"
-      return 1
-    fi
-    mkdir -p "$target"
-    if [ ! -f "$target/package.json" ]; then
-      printf '{"name":"echo-harness","private":true}\n' > "$target/package.json"
-    fi
-    say "下载并安装标准版（一次性，几十 MB，可能要几分钟；请勿中断）..."
-    ( cd "$target" && npm install '@deepseek-ai/dsh@0.1.5-rc.2' --no-audit --no-fund 2>&1 | sed 's/^/      /' )
-    if [ ! -s "$entry" ]; then
-      warn "标准版没装成 —— 回退到 npx，首次启动要多等 1-2 分钟"
-      return 1
-    fi
+  # 装/修本地永久入口交给专门的脚本：它按"① 已装好 ② npm install ③ 从 npx 缓存复制"
+  # 三条路依次试。**为什么必须有第 ③ 条**（2026-09-22 实测）：@deepseek-ai/dsh@0.1.5-rc.2
+  # 的依赖图在公共 registry 上是坏的（子包依赖 ^0.1.5-rc.3，而那个 rc.3 从没发布过），
+  # npm 必然 ETARGET —— 老逻辑这时只会回退 npx，于是用户那边每次冷启动都要 2 分钟。
+  local helper="" cmd_file=""
+  helper="$(dirname "$0")/harness-install-local.sh"
+  if [ ! -f "$helper" ]; then
+    warn "缺 $helper —— 回退到 npx（首次启动要多等 1-2 分钟）"
+    return 1
   fi
-  # 完整性自检：同事踩过"目录在、文件被截断"（node-pty 缺 index.js，dsh 直接加载失败）
-  local pty=""
-  for pty in $(find "$target" -type d -name node-pty 2>/dev/null); do
-    if [ ! -f "$pty/package.json" ] || [ ! -f "$pty/lib/index.js" ]; then
-      warn "安装不完整：$pty 缺 package.json / lib/index.js"
-      say "  修法：删掉 $target 后重跑本脚本"
-      return 1
-    fi
-  done
-  HARNESS_COMMAND="\"$node_bin\" \"$entry\" web"
+  cmd_file="${TMPDIR:-/tmp}/echo-harness-command-$$.txt"
+  rm -f "$cmd_file" 2>/dev/null || true
+  if ! bash "$helper" --dest "$DEST" --version "$DSH_VERSION" --node "$node_bin" \
+        --command-file "$cmd_file" --log-file "$INSTALL_LOG"; then
+    warn "标准版本地永久安装没成 —— 回退到 npx，首次启动要多等 1-2 分钟（日志里有原因）"
+    rm -f "$cmd_file" 2>/dev/null || true
+    return 1
+  fi
+  if [ -s "$cmd_file" ]; then
+    HARNESS_COMMAND="$(cat "$cmd_file")"
+  fi
+  rm -f "$cmd_file" 2>/dev/null || true
+  if [ -z "$HARNESS_COMMAND" ]; then
+    warn "安装脚本没回传启动命令 —— 回退 npx"
+    return 1
+  fi
   ok "标准版已就绪（本地永久安装，冷启动约 10 秒）"
   say "  启动命令：$HARNESS_COMMAND"
   return 0
@@ -610,8 +618,15 @@ if [ -n "$NOTES_DIR" ]; then SETTINGS+=("worklogVaultRoot=$NOTES_DIR" "worklogEn
 case "$AGENT" in
   harness)
     SETTINGS+=("agentBackend=harness" "agentHarnessEnabled=true")
-    # 本地永久安装时写绝对路径：冷启动 ~10s；没装成就不写，交给 npx 默认值
-    if [ -n "$HARNESS_COMMAND" ]; then SETTINGS+=("harnessCommand=$HARNESS_COMMAND"); fi
+    # **默认不写 harnessCommand**（2026-09-22 晚改）：设置停在出厂值时，ECHO 自己会
+    # 优先用本地入口（`harness_proc.command()`：出厂值 + 本地入口存在 → 直连），
+    # node 也由它探测（与上面 Resolve-NodeDir/ECHO 的 node_dirs 同一批目录）。
+    # 好处：node 换版本（WorkBuddy / brew 升级）不用改配置 —— 写死绝对路径时，
+    # 那条路径一失效 harness 就起不来，而这个设置是隐藏项，用户很难自己找到。
+    # 想钉死：加 --pin-harness-command。
+    if [ -n "$HARNESS_COMMAND" ] && [ "$PIN_HARNESS_COMMAND" -eq 1 ]; then
+      SETTINGS+=("harnessCommand=$HARNESS_COMMAND")
+    fi
     ;;
   dsh)     SETTINGS+=("agentBackend=dsh") ;;
   none)    ;;

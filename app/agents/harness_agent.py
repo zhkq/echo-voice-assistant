@@ -54,6 +54,17 @@ class HarnessAgent(DshAgent):
         """独立 harness 自己的凭据文件（与桌面版同构）。"""
         return os.path.join(harness_proc.home(), ".credentials.yaml")
 
+    def _workspace_registry_path(self):
+        """独立 harness **自己家目录**里的工作区注册表。
+
+        父类（DshAgent）缺省读 `~/.dsh/storages/workspace.json` —— 那是 DSH Desktop 的家，
+        跟独立 harness 的 DSH_HOME（`harness_proc.home()`）是**两套**。读错注册表会把
+        Desktop 的旧 workspaceId 当成 harness 的，`create_session(workspace_id=…)` 就报
+        `workspace/not-found`，导致回退 cwd 方式建会话 → 侧栏全部落到「未分组」
+        （2026-09-22 实测：指令会话 + 会议会话全未分组，根因就是这里）。
+        """
+        return os.path.join(harness_proc.home(), "storages", "workspace.json")
+
     def _secret_cookie(self):
         """退路：用 harness **自己家目录**里的 browser-session 密钥直接铸 Cookie。
 

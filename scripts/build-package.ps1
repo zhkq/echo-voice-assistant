@@ -324,6 +324,7 @@ $forbiddenPath = @(
     '\.db(-wal|-shm)?$',
     '\.pid$',
     '(^|/)dsh-failover/config\.json$',
+    '(^|/)dsh-failover/homes\.json$',
     '(^|/)models/pyannote(/|$)',
     '(^|/)logs?(/|$).*\.log$',
     '(^|/)dist(/|$)'

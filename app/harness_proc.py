@@ -17,7 +17,9 @@
 本模块负责把 harness 当作 **ECHO 的子进程** 拉起/探活/停止，并把 token 交给适配器：
   * 幂等：先探活，已在跑（用户自己起的、或上次留下的）就不重复起；
   * 冷却：避免每个复查周期都 Popen 一次（与 failover_proxy 同一套教训）；
-  * token：从子进程 stdout 解析出来，存进程内 + 落一份到 ``data/logs/harness-token.txt``
+  * token：从子进程 stdout 解析出来，存进程内 + 落一份到
+    ``{DATA}/harness-token.txt``（2026-09-22 从 ``logs/`` 挪出来：那里会被当日志清理，
+    还会被"测试不许碰真实状态"的约定误伤，token 一丢就得重启 harness 换一枚）
     （下次 ECHO 重启时若发现同一实例还在跑，可以复用它，免得再起一个）；
   * 只停 ECHO 自己起的那个（记住 pid），不动用户手工启动的实例；
   * 默认**不随 ECHO 启动**：只有把 `agentBackend` 选成 harness（或 `agentHarnessEnabled`
@@ -293,12 +295,34 @@ def _read_output(proc):
                 pass
 
 
+def _token_path():
+    """token 落盘位置：``{DATA}/harness-token.txt``。
+
+    2026-09-22 从 ``{DATA}/logs/harness-token.txt`` 挪出来，两个理由：
+      * ``logs/`` 是"日志"语义 —— 日志轮转/清理、以及"测试不许碰真实状态"这类约定都按
+        日志对待它，token 跟着消失就变成"ECHO 重启后手里没有 token"，只好把 harness
+        重启一遍换一枚（这台机器冷启动两分钟，还会打断正在跑的会话）；
+      * 挪到数据根，与 ``echo.pid`` / ``echo-port.txt`` 同级 —— 它们同样是"进程状态"，
+        没有人会去清理。
+    老位置仍会被读（见 :func:`load_saved_token`），读到就顺手迁到新位置。
+    """
+    return os.path.join(paths.data_root(), "harness-token.txt")
+
+
+def _legacy_token_path():
+    """老位置（只读兼容 + 迁移用；写盘一律写 :func:`_token_path`）。"""
+    return os.path.join(paths.data_root(), "logs", "harness-token.txt")
+
+
 def _persist_token(value):
-    """token 落一份到 data/logs（服务重启后若实例还在跑，可复用，不必再起一个）。"""
+    """token 落一份（ECHO 重启后若实例还在跑，可复用，不必再起一个）。"""
     try:
-        p = os.path.join(paths.data_root(), "logs", "harness-token.txt")
-        with open(p, "w", encoding="utf-8") as fh:
+        with open(_token_path(), "w", encoding="utf-8") as fh:
             fh.write(value)
+    except Exception:
+        pass
+    try:
+        os.remove(_legacy_token_path())        # 迁移：别留两份
     except Exception:
         pass
 
@@ -349,16 +373,28 @@ def port_conflict():
 
 
 def load_saved_token():
-    """读回上次落盘的 token（进程内为空时用）。"""
+    """读回上次落盘的 token（进程内为空时用）；老位置也认，读到就迁到新位置。
+
+    用 ``utf-8-sig`` 读：PowerShell 5.1 的 ``Set-Content -Encoding UTF8`` 会**带 BOM**，
+    手工修过这个文件的话，BOM 会被当成 token 的一部分拼进登录 URL —— 实测报的是一句
+    莫名其妙的 ``'ascii' codec can't encode character '\\ufeff'``（2026-09-22 踩过）。
+    """
     global _token
     if _token:
         return _token
     try:
-        p = os.path.join(paths.data_root(), "logs", "harness-token.txt")
-        with open(p, "r", encoding="utf-8") as fh:
+        with open(_token_path(), "r", encoding="utf-8-sig") as fh:
             _token = fh.read().strip()
     except Exception:
         _token = ""
+    if not _token:                             # 升级路径：老位置（data/logs/）里还有
+        try:
+            with open(_legacy_token_path(), "r", encoding="utf-8-sig") as fh:
+                _token = fh.read().strip()
+            if _token:
+                _persist_token(_token)
+        except Exception:
+            _token = ""
     return _token
 
 
@@ -366,10 +402,11 @@ def forget_token():
     """丢掉一个用不了的 token（文件里的 + 进程内的），下次重拉时会重新捕获。"""
     global _token
     _token = ""
-    try:
-        os.remove(os.path.join(paths.data_root(), "logs", "harness-token.txt"))
-    except Exception:
-        pass
+    for path in (_token_path(), _legacy_token_path()):
+        try:
+            os.remove(path)
+        except Exception:
+            pass
 
 
 def ensure_running(timeout=None):

@@ -323,5 +323,64 @@ class MacScriptPortabilityTests(unittest.TestCase):
                       "端口/数据根必须问应用自己的路径层，不能写死 <安装目录>/data")
 
 
+class HarnessLocalInstallTests(unittest.TestCase):
+    """标准版本地永久安装的"三条路"契约（2026-09-22 晚补）。
+
+    为什么值得钉：这条路径坏掉时**表面看不出来** —— 只是"冷启动慢两分钟"，
+    而慢的原因在日志里只表现为 npm 的一串 ETARGET。要保证的最低限度：
+    两个平台的安装器都走**同一个**助手脚本、助手真的实现了"从 npx 缓存复制"那条路、
+    失败时给的是**可执行的**下一步，且技能文档写清了这条坑。
+    """
+
+    PS1_HELPER = os.path.join(ROOT, ".dsh", "skills", "echo-install", "scripts",
+                              "harness-install-local.ps1")
+    SH_HELPER = os.path.join(ROOT, ".dsh", "skills", "echo-install", "scripts",
+                             "harness-install-local.sh")
+
+    def test_both_platforms_delegate_to_the_helper(self):
+        self.assertIn("harness-install-local.ps1", _read(PS1_COMPONENTS),
+                      "Windows 组件安装器没走本地安装助手（又各自实现一遍了？）")
+        self.assertIn("harness-install-local.sh", _read(SH),
+                      "mac 组件安装器没走本地安装助手")
+
+    def test_helpers_are_twins(self):
+        """两个助手必须都在，且都实现同样的三件事：缓存路径、完整性自检、可覆盖版本。"""
+        for path, tag in ((self.PS1_HELPER, "ps1"), (self.SH_HELPER, "sh")):
+            self.assertTrue(os.path.isfile(path), f"{tag} 助手脚本不在：{path}")
+            text = _read(path)
+            self.assertIn("_npx", text, f"{tag} 助手没有「从 npx 缓存复制」那条路")
+            self.assertIn("node-pty", text, f"{tag} 助手缺完整性自检（半残包要拦下）")
+            self.assertIn("0.1.5-rc.2", text, f"{tag} 助手的默认版本漂了")
+
+    def test_version_and_cache_only_are_overridable(self):
+        """registry 哪天又坏在别的版本上时，要能一行参数换版本 / 离线只走缓存。"""
+        self.assertIn("DshVersion", _read(PS1_COMPONENTS), "Windows 侧缺 -DshVersion")
+        self.assertIn("--dsh-version", _read(SH), "mac 侧缺 --dsh-version")
+        self.assertIn("FromCache", _read(self.PS1_HELPER))
+        self.assertIn("--from-cache", _read(self.SH_HELPER))
+
+    def test_pinning_the_absolute_path_is_opt_in(self):
+        """默认**不写** harnessCommand（交给 ECHO 自动解析），要钉死得显式加开关。
+
+        为什么默认不写（2026-09-22 晚定）：写死 node 绝对路径后，node 一升级
+        （WorkBuddy / nvm 换版本目录）那条路径就失效、harness 起不来，而
+        `harnessCommand` 是隐藏设置，用户很难自己找到并改回来。
+        ECHO 的 `command()` 本来就会在"出厂值 + 本地入口存在"时直连本地入口，
+        node 也由 `node_dirs()` 探测（与技能里的 Resolve-NodeDir 同一批目录）。
+        """
+        ps1 = _read(PS1_COMPONENTS)
+        sh = _read(SH)
+        self.assertIn("[switch]$PinHarnessCommand", ps1, "Windows 侧没有钉死开关")
+        self.assertIn("and $PinHarnessCommand", ps1, "Windows 侧默认没走'不写'那条（开关没参与判断）")
+        self.assertIn("--pin-harness-command", sh, "mac 侧没有钉死开关")
+        self.assertIn('[ "$PIN_HARNESS_COMMAND" -eq 1 ]', sh, "mac 侧默认没走'不写'那条")
+        self.assertIn("--pin-harness-command", _read(SKILL_MD), "技能没写清默认不写 / 怎么钉死")
+
+    def test_skill_documents_the_registry_trap(self):
+        text = _read(SKILL_MD)
+        self.assertIn("ETARGET", text, "技能没写清 npm 装不下来这条及其绕法")
+        self.assertIn("harness-install-local", text, "技能没告诉排障的人可以单独跑助手")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -3,9 +3,11 @@
 
 职责三件事：
 
-  1. **候选发现**：读 DSH 的 `~/.dsh/settings.yaml`，把 DSH 里已有的模型供应商/模型
+  1. **候选发现**：读 DSH 的 settings.yaml，把 DSH 里已有的模型供应商/模型
      摊平成"可勾选的候选成员"（内置 deepseek 官方路由 + 用户自己配的每一条 pi-ai 路由）。
      这样用户在 ECHO 里勾几个模型就能组成模型组，不用手抄 URL 和模型 id。
+     **两个家目录都读**（桌面版 + 标准版 harness，见 `llm_router.dsh_homes()`）：
+     同事不一定两个都装，只装标准版时配置在它的家目录里。
   2. **组成员增删改**：写回 `dsh-failover/config.json` 的 `groups.<echo-auto>`，
      并让路由进程热重载（`POST /admin/reload`），最后同步注册进 DSH。
   3. **健康聚合**：把路由的 `/health`、DSH 注册态、config.json 里的组定义合成一份
@@ -79,22 +81,63 @@ def group_config() -> dict:
 
 
 # ---------------------------------------------------------------- DSH 侧：候选模型
+def _merge_settings(into: dict, part: dict) -> dict:
+    """把一份 settings.yaml 并进已有结果：**先到的优先**（桌面版在前，标准版补缺）。"""
+    for key, val in part.items():
+        if key == "llm-pi-ai" and isinstance(val, dict):
+            cur = into.get("llm-pi-ai")
+            if not isinstance(cur, dict):
+                into[key] = dict(val)
+                continue
+            merged = dict(cur)
+            for k2, v2 in val.items():
+                if k2 == "providers" and isinstance(v2, dict):
+                    provs = dict(merged.get("providers") or {})
+                    for pid, prov in v2.items():
+                        provs.setdefault(pid, prov)
+                    merged["providers"] = provs
+                else:
+                    merged.setdefault(k2, v2)
+            into[key] = merged
+        else:
+            into.setdefault(key, val)
+    return into
+
+
 def _dsh_settings() -> dict:
-    try:
-        import yaml as pyyaml
-        return pyyaml.safe_load(llm_router.SETTINGS.read_text(encoding="utf-8")) or {}
-    except Exception:
-        return {}
+    """DSH 的 settings.yaml —— **合并所有存在的家目录**（桌面版优先，标准版补缺）。
+
+    只装标准版时它在 {DATA}/harness 下：只看桌面版的话，面板「添加成员」里
+    一个候选都列不出来（同事不一定两个都装，2026-09-22）。
+    """
+    homes = llm_router.dsh_homes()
+    if not homes:                      # 家目录都还没初始化：退回 DSH_HOME 指的那份（老行为）
+        homes = [{"settings": llm_router.SETTINGS}]
+    doc: dict = {}
+    for h in homes:
+        try:
+            import yaml as pyyaml
+            part = pyyaml.safe_load(Path(h["settings"]).read_text(encoding="utf-8")) or {}
+        except Exception:
+            continue
+        if isinstance(part, dict):
+            _merge_settings(doc, part)
+    return doc
 
 
 def _cred_refs() -> set:
-    """凭据库里已登记的 ref 名（只判有无，不读值）。"""
-    try:
-        import yaml as pyyaml
-        doc = pyyaml.safe_load(llm_router.CREDENTIALS.read_text(encoding="utf-8")) or {}
-        return set((doc.get("refs") or {}).keys())
-    except Exception:
-        return set()
+    """**所有存在的家目录**里已登记的 ref 名（只判有无，不读值）。"""
+    homes = llm_router.dsh_homes()
+    paths = [Path(h["credentials"]) for h in homes] or [llm_router.CREDENTIALS]
+    refs: set = set()
+    for path in paths:
+        try:
+            import yaml as pyyaml
+            doc = pyyaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
+            refs |= set((doc.get("refs") or {}).keys())
+        except Exception:
+            continue
+    return refs
 
 
 def _has_key(cred: str, refs: set) -> bool:
@@ -396,6 +439,7 @@ def save_group_meta(display_name: str = None, context_window=None, max_tokens=No
 
 # ---------------------------------------------------------------- DSH 注册态
 def registration() -> dict:
+    """注册态：**每个存在的 DSH 家目录各一行**（`registered` 仍表示"任一处注册了"）。"""
     st = llm_router.status()
     route = st.get("route") or {}
     return {
@@ -404,6 +448,12 @@ def registration() -> dict:
         "base_url": (route.get("baseURL") if isinstance(route, dict) else "") or "",
         "models": len((route.get("models") if isinstance(route, dict) else []) or []),
         "settings": st.get("settings", ""),
+        "homes": [{
+            "kind": h.get("kind", ""),
+            "label": h.get("label", ""),
+            "registered": bool(h.get("registered")),
+            "settings": h.get("settings", ""),
+        } for h in (st.get("homes") or [])],
     }
 
 

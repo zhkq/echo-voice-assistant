@@ -423,6 +423,27 @@ function renderRouterCandidates() {
   sel.innerHTML = opts.join("");
 }
 
+/** 注册态文案：DSH 可能有两个家目录（桌面版 / 标准版 harness），**分别**说清谁注册了。
+ *  同事不一定两个都装（2026-09-22）：只装一个时也要说得明白，别只报一句"已注册"。 */
+function routerRegText(reg) {
+  const homes = reg.homes || [];
+  const label = (h) => esc(h.label || h.kind || "DSH");
+  const on = homes.filter((h) => h.registered);
+  const off = homes.filter((h) => !h.registered);
+  if (!homes.length) {
+    return reg.registered
+      ? "<b>已注册</b>"
+      : `<b style="color:var(--yellow)">未注册</b>`;
+  }
+  if (!on.length) {
+    return `<b style="color:var(--yellow)">未注册</b>（${homes.map(label).join(" / ")}）`;
+  }
+  return `<b>已注册</b>（${on.map(label).join(" / ")}）` +
+    (off.length
+      ? ` · <span style="color:var(--yellow)">${off.map(label).join(" / ")} 未注册</span>`
+      : "");
+}
+
 function renderRouterHead() {
   const v = _rtView || {};
   const reg = v.registration || {};
@@ -451,7 +472,7 @@ function renderRouterHead() {
     `（显示名 ${esc(g.display_name || "ECHO AUTO")}）· ` +
     `${enabled}/${_rtMembers.length} 启用 · ` +
     `${Math.round((g.context_window || 0) / 1000)}K 上下文 / ${Math.round((g.max_tokens || 0) / 1000)}K 输出 · ` +
-    (reg.registered ? `<b>已注册</b>` : `<b style="color:var(--yellow)">未注册</b>`) +
+    routerRegText(reg) +
     (r.online ? "" : ` · <span style="color:var(--red)">路由进程未运行：${esc(r.error || "")}</span>`);
   const rb = $("#rtRegister");
   rb.textContent = reg.registered ? "重新注册到 DSH" : "注册到 DSH";
@@ -2521,9 +2542,12 @@ $("#btnSettingsSave").addEventListener("click", async () => {
 
 /* ================= 历史 ================= */
 
-/* 命令 → DSH 会话：DSH 的 Web UI 没有"按会话直达"的 URL（实测前端不解析任何 URL 参数，
-   也没有自定义协议），所以跳不过去；改成在 ECHO 里就地看——标题来自 /api/dsh/targets，
-   内容按需读 /api/commands/{id}/session（后端用签名 Cookie 走 session/page）。 */
+/* 命令 → DSH 会话：DSH 的 Web UI 没有"按会话直达"的 URL，跳不过去；改成在 ECHO 里就地看——
+   标题来自 /api/dsh/targets，内容按需读 /api/commands/{id}/session（后端用签名 Cookie 走
+   session/page）。
+   注：这是硬限制，非 ECHO 疏漏——已对标准版 harness（0.1.5-rc.2，与桌面版共用同一套前端）
+   源码复核，bundle 不解析任何 query/hash 参数（无 location.search/hash/URLSearchParams/
+   sessionStorage/pathname），别再去试会话直达 URL。 */
 let _sessionInfo = {};
 
 async function loadSessionInfo() {

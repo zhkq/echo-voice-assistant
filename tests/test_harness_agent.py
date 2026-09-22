@@ -36,20 +36,30 @@ COOKIE_NAME = "dsh-auth-TESTSERVER"
 COOKIE_NAME_PREFIX = "dsh-auth-"
 COOKIE_VALUE = "v1.test.cookie"
 
-#: 把 harness 的 pid 文件隔离到临时目录（2026-09-22 事故的根因就在这）。
+#: 把 harness 的 pid 文件与 token 文件都隔离到临时目录（2026-09-22 事故的根因就在这）。
 #:
-#: `harness_proc._pid_path()` 走的是 `paths.data_root()`，**不受**测试里 patch 的
-#: `db.DATA_DIR` 约束。于是 `test_online_without_token_still_opens` 调到真实的
+#: `harness_proc._pid_path()` / `_token_path()` 走的是 `paths.data_root()`，**不受**测试里
+#: patch 的 `db.DATA_DIR` 约束。于是 `test_online_without_token_still_opens` 调到真实的
 #: `ensure_token()` 时：读到了**真实**的 `harness.pid` → 认定"这是 ECHO 起的" →
 #: `stop()` 把开发者/同事正在跑的标准版**杀掉**，而它后面又因为 `online`/`token` 被替身
 #: 固定住，永远起不回来 —— 表现就是"标准版服务自己停了"，且四个停止出口都只写一句"已停止"。
+#:
+#: token 文件是同一类漏网（2026-09-22 晚复查发现）：`HarnessProcTests` 里两个 stop() 用例
+#: 只把 `_clear_pid` 打了桩，`stop()` 末尾的 `forget_token()` 照样删**真实** token 文件 ——
+#: 后果是"ECHO 重启后手里没有 token"，面板显示"token 未获取"，点「用浏览器打开」还会为了
+#: 换 token 把 harness 重启一遍（冷启动两分钟）。这里一并隔离。
 _TMP_DIR = tempfile.mkdtemp(prefix="echo-harness-test-")
 _OLD_PID_PATH = harness_proc._pid_path
+_OLD_TOKEN_PATH = harness_proc._token_path
+_OLD_LEGACY_TOKEN_PATH = harness_proc._legacy_token_path
 _OLD_DB = (db.DATA_DIR, db.DB_FILE)
 
 
 def setUpModule():
     harness_proc._pid_path = lambda: os.path.join(_TMP_DIR, "harness.pid")
+    harness_proc._token_path = lambda: os.path.join(_TMP_DIR, "harness-token.txt")
+    harness_proc._legacy_token_path = lambda: os.path.join(
+        _TMP_DIR, "logs", "harness-token.txt")
     # 数据库也要隔离：本模块有些用例会走 `services.report_harness()` / `sync_status()`，
     # 不隔离就会把"已停止"写进**真实**的 data/echo.db，面板上看着像服务真的停了
     # （同一类事故的另一半，2026-09-22 一并堵上）。
@@ -60,6 +70,8 @@ def setUpModule():
 
 def tearDownModule():
     harness_proc._pid_path = _OLD_PID_PATH
+    harness_proc._token_path = _OLD_TOKEN_PATH
+    harness_proc._legacy_token_path = _OLD_LEGACY_TOKEN_PATH
     db.DATA_DIR, db.DB_FILE = _OLD_DB
     try:
         settings._cache = None
@@ -343,6 +355,55 @@ class HarnessAgentRegistryTests(unittest.TestCase):
         self.assertTrue(DEFAULTS["harnessToken"].get("secret"))
         self.assertIn("harness", DEFAULTS["agentBackend"]["options"])
 
+    def test_find_workspace_reads_its_own_home_registry(self):
+        """harness 的 `find_workspace` 必须读**自己家目录**的 workspace.json。
+
+        （2026-09-22 实测：独立 harness 全走了 `~/.dsh/storages/workspace.json` —— 那是
+        DSH Desktop 的家目录注册表。于是 `ensure_workspace` 拿回 Desktop 的旧 workspaceId，
+        `create_session(workspace_id=…)` 报 `workspace/not-found` → 回退 cwd 建会话 →
+        指令会话与会议会话全部落到 DSH 侧栏的「未分组」。）
+        """
+        from app.agents.harness_agent import HarnessAgent
+        home = tempfile.mkdtemp(prefix="echo-hn-reg-")
+        self.addCleanup(shutil.rmtree, home, ignore_errors=True)
+        osp = os.path.join
+        storages = osp(home, "storages")
+        os.makedirs(storages)
+        path_meet = osp(home, "data", "meetings")
+        os.makedirs(osp(home, "data"))
+        reg = {
+            "unit": {"name": "workspace", "version": 2},
+            "global": {"initialized": True, "workspaceIds": ["uniq-meet-ws"]},
+            "tables": {"workspaces": {"uniq-meet-ws": {
+                "path": path_meet, "title": "会议专区", "sessionIds": []}}},
+        }
+        with open(osp(storages, "workspace.json"), "w", encoding="utf-8") as fh:
+            json.dump(reg, fh)
+
+        a = HarnessAgent()
+        # ① 不联网：把 session/list 这条路径清空，只看注册表②（fixture 里也没有带 ws 的会话）
+        # ② 家目录指到 tmp，避免碰真实 harness 的 DSH_HOME
+        with patch.object(HarnessAgent, "list_sessions", lambda self: []), \
+                patch.object(harness_proc, "home", lambda: home):
+            self.assertEqual(a._workspace_registry_path(), osp(storages, "workspace.json"),
+                             "注册表路径必须落在 harness 自己的家目录，不许是 ~/.dsh")
+            self.assertEqual(a.find_workspace(path_meet), "uniq-meet-ws")
+            # 会话列表为空时不会从乱塞的 workspaceId 里捡到一个不存在的后端 ID
+            self.assertEqual(a.find_workspace(osp(home, "does-not-exist")), "")
+
+    def test_find_workspace_registry_path_is_not_desktop_home(self):
+        """父类默认读 `~/.dsh`；harness 子类必须覆盖指向 `harness_proc.home()`。"""
+        from app.agents.harness_agent import HarnessAgent
+        a = HarnessAgent()
+        with patch.object(harness_proc, "home", lambda: "/tmp/fake-harness-home"):
+            p = a._workspace_registry_path()
+        self.assertNotIn(".dsh", p.split("/")[-3:] + p.split("\\")[-3:],
+                         "harness 的注册表路径不该落在桌面版家目录 ~/.dsh")
+        self.assertTrue(p.endswith((
+            "fake-harness-home" + os.sep + "storages" + os.sep + "workspace.json")),
+            "harness 的注册表应位于它自己的 DSH_HOME 下，实际 %r" % p)
+
+
 
 class HarnessProcTests(unittest.TestCase):
     """进程管理：随 ECHO 启动的判据、幂等、token 解析、只停自己起的。"""
@@ -476,6 +537,59 @@ class HarnessProcTests(unittest.TestCase):
         p = harness_proc._pid_path()
         self.assertTrue(p.startswith(_TMP_DIR),
                         "pid 文件没隔离：实际是 %s —— 测试会杀掉真实 harness" % p)
+
+    def test_harness_token_file_is_isolated_from_the_real_one(self):
+        """护栏：token 文件同样必须指向临时目录。
+
+        `stop()` 末尾会 `forget_token()`；只把 `_clear_pid` 打桩是拦不住的 ——
+        2026-09-22 实测：跑完 `HarnessProcTests` 真实的 token 文件就没了，
+        后果是"ECHO 重启后手里没 token"，面板显示"token 未获取"，
+        点「用浏览器打开」还要为换 token 把 harness 重启一遍（冷启动两分钟）。
+        """
+        for path in (harness_proc._token_path(), harness_proc._legacy_token_path()):
+            self.assertTrue(path.startswith(_TMP_DIR),
+                            "token 文件没隔离：实际是 %s —— 测试会删掉真实 token" % path)
+
+    def test_token_is_migrated_from_the_old_logs_location(self):
+        """升级路径：老位置（data/logs 下）还有 token 时要读得到，并搬到新位置。"""
+        harness_proc.set_token("")
+        legacy = harness_proc._legacy_token_path()
+        os.makedirs(os.path.dirname(legacy), exist_ok=True)
+        with open(legacy, "w", encoding="utf-8") as fh:
+            fh.write("legacy-" + "t" * 30)
+        try:
+            self.assertEqual(harness_proc.load_saved_token(), "legacy-" + "t" * 30)
+            self.assertTrue(os.path.isfile(harness_proc._token_path()), "没搬到新位置")
+            self.assertFalse(os.path.isfile(legacy), "搬家后不该留旧文件")
+        finally:
+            harness_proc.forget_token()
+
+    def test_token_file_with_a_bom_is_still_read_clean(self):
+        """带 BOM 的 token 文件也要读干净。
+
+        PowerShell 5.1 的 `Set-Content -Encoding UTF8` 会写 BOM（手工修这个文件就会踩到），
+        而 BOM 一旦被当成 token 的一部分拼进登录 URL，报的是一句莫名其妙的
+        `'ascii' codec can't encode character '\\ufeff'`。
+        """
+        harness_proc.set_token("")
+        with open(harness_proc._token_path(), "wb") as fh:
+            fh.write(b"\xef\xbb\xbf" + (b"t" * 40))
+        try:
+            self.assertEqual(harness_proc.load_saved_token(), "t" * 40,
+                             "BOM 被当成 token 的一部分了")
+        finally:
+            harness_proc.forget_token()
+
+    def test_forget_token_clears_both_locations(self):
+        harness_proc.set_token("")
+        for path in (harness_proc._token_path(), harness_proc._legacy_token_path()):
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("t" * 40)
+        harness_proc.forget_token()
+        self.assertEqual(harness_proc.token(), "")
+        for path in (harness_proc._token_path(), harness_proc._legacy_token_path()):
+            self.assertFalse(os.path.isfile(path), "还有残留：%s" % path)
 
     def test_reserved_ports_are_refused(self):
         """不许占 Desktop 的 43120 / ECHO 自己的 18060 —— 占了就是互相打架。"""

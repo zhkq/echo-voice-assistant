@@ -27,7 +27,10 @@ DSH 侧把 provider 的 baseURL 指向本服务（默认 http://127.0.0.1:8899�
 密钥来源（优先级从高到低）
   - 组成员配置里的 "token"
   - 环境变量 FAILOVER_<CREDENTIAL>
-  - ~/.dsh/.credentials.yaml 的 refs（DSH 的凭据库，如 INTERNAL_LLM_TOKEN、DEEPSEEK_API_KEY）
+  - **每个存在的 DSH 家目录**里的 .credentials.yaml refs（如 INTERNAL_LLM_TOKEN、
+    DEEPSEEK_API_KEY）。DSH 可能只有一个家目录 —— 桌面版（用户家目录下的 .dsh）或
+    标准版 harness（ECHO 的 data 目录下 harness/），也可能两个都有、一个都没有，
+    所以按列表逐份找，别只认桌面版那一份。
   - 路由自身令牌 ECHO_ROUTER_TOKEN（同库 refs，用于校验 DSH 发来的 Bearer）
 
 用法
@@ -75,6 +78,13 @@ DEFAULT_BREAKER_COOLDOWN = 30.0
 CRED_YAML = Path.home() / ".dsh" / ".credentials.yaml"
 TOKEN_REF = "ECHO_ROUTER_TOKEN"
 
+#: "去哪儿找凭据"的清单：ECHO 每次注册模型组时写（app/llm_router.py 的 _write_homes_file），
+#: 或者启动时用 ECHO_DSH_HOMES 环境变量告知。**热更新**：家目录可能在 ECHO/路由起来之后
+#: 才出现（用户在面板里选中标准版，harness 家目录才被建出来），所以按 mtime 缓存并重读。
+HOMES_FILE = Path(os.environ.get("ECHO_DSH_HOMES_FILE")
+                  or (Path(__file__).resolve().parent / "homes.json"))
+_HOMES_CACHE: dict = {"mtime": "init", "paths": None}
+
 # 命中这些状态码时换下一个成员；其余 4xx 原样透传给 DSH
 FAILOVER_STATUS = {401, 402, 403, 404, 429}
 
@@ -90,20 +100,54 @@ PUBLIC_SAFE_FIELDS = {
 # ---------------------------------------------------------------------------
 # 凭据
 # ---------------------------------------------------------------------------
-def _cred_refs() -> dict:
-    """从 ~/.dsh/.credentials.yaml 读 refs（正则足够，不引入 YAML 依赖）。"""
-    out: dict[str, str] = {}
+def cred_paths() -> list:
+    """要搜索的凭据库路径（按顺序、前面的优先）。
+
+    顺序：① homes.json（ECHO 写的，热更新）；② ECHO_DSH_HOMES 环境变量（启动时告知）；
+    ③ 桌面版那一份（老行为，一个家目录都没被告知时的兜底）。文件不存在就跳过 ——
+    凭据库是 DSH 自己建的，这里绝不代建。
+    """
     try:
-        text = CRED_YAML.read_text(encoding="utf-8")
+        mtime = HOMES_FILE.stat().st_mtime
     except Exception:
-        return out
-    for m in re.finditer(r"^\s{2}([A-Za-z0-9_\-]+)\s*:\s*(\S+)\s*$", text, re.M):
-        out[m.group(1)] = m.group(2).strip().strip("\"'")
+        mtime = None
+    if _HOMES_CACHE["mtime"] == mtime and _HOMES_CACHE["paths"] is not None:
+        return _HOMES_CACHE["paths"]
+    paths: list[Path] = []
+    if mtime is not None:
+        try:
+            doc = json.loads(HOMES_FILE.read_text(encoding="utf-8"))
+            for item in doc.get("credentials") or []:
+                if isinstance(item, str) and item.strip():
+                    paths.append(Path(item))
+        except Exception:
+            paths = []
+    if not paths:
+        for chunk in (os.environ.get("ECHO_DSH_HOMES") or "").split(os.pathsep):
+            chunk = chunk.strip()
+            if chunk:
+                paths.append(Path(chunk) / ".credentials.yaml")
+    if not paths:
+        paths = [CRED_YAML]
+    _HOMES_CACHE["mtime"], _HOMES_CACHE["paths"] = mtime, paths
+    return paths
+
+
+def _cred_refs() -> dict:
+    """所有存在的 DSH 凭据库里的 refs（前一份优先，后面的补缺；不引入 YAML 依赖）。"""
+    out: dict[str, str] = {}
+    for path in cred_paths():
+        try:
+            text = Path(path).read_text(encoding="utf-8")
+        except Exception:
+            continue
+        for m in re.finditer(r"^\s{2}([A-Za-z0-9_\-]+)\s*:\s*(\S+)\s*$", text, re.M):
+            out.setdefault(m.group(1), m.group(2).strip().strip("\"'"))
     return out
 
 
 def resolve_credential(ref: str) -> str:
-    """ref 名 → 真实密钥：环境变量优先，其次 DSH 凭据库。"""
+    """ref 名 → 真实密钥：环境变量优先，其次各 DSH 凭据库。"""
     if not ref:
         return ""
     env = os.environ.get("FAILOVER_" + ref) or os.environ.get(ref)

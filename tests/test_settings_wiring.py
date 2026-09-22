@@ -234,9 +234,18 @@ def _probe_value(meta, current):
 @contextmanager
 def _quiet_side_effects():
     """PUT /api/settings 的联动在测试里哑掉：重启唤醒监听、热重载路由进程、写
-    dsh-failover/config.json 都与「设置能不能读回来」无关，真做会污染仓库与进程。"""
+    dsh-failover/config.json 都与「设置能不能读回来」无关，真做会污染仓库与进程。
+
+    **`_agent` 也必须哑掉**（2026-09-22 补）：这条路上的智能体联动会走到真实的
+    `harness_proc.stop()` / `ensure_running()`（本轮转测试会把 `agentBackend` 探成别的值），
+    而 pid 文件走 `paths.data_root()`、**不受测试里替换的 `db.DATA_DIR` 约束** ——
+    也就是会把开发机上正在跑的标准版 harness 杀掉（AGENTS.md 记过同类事故）。
+    改成整体替身：这条用例只关心"设置读得回来"。
+    """
     with patch("app.runtime.stop_wake"), patch("app.runtime.start_wake"), \
-            patch("app.router_admin.apply_settings", lambda updated: (True, "")):
+            patch("app.router_admin.apply_settings", lambda updated: (True, "")), \
+            patch("app.settings_effects._agent",
+                  lambda *a, **kw: {"scope": "agent", "ok": True, "detail": ""}):
         yield
 
 

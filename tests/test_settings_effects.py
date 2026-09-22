@@ -72,6 +72,7 @@ class AgentTests(unittest.TestCase):
         """向导传的短超时必须原样传下去（它跑在 HTTP 请求线程里，不能卡 60s）。"""
         with patch("app.agents.reset"), \
                 patch("app.harness_proc.requested", lambda: True), \
+                patch("app.llm_router.sync", lambda: (True, "已注册到 标准版 harness")), \
                 patch("app.harness_proc.ensure_running") as run:
             run.return_value = (True, "独立 harness 启动中")
             out = settings_effects.apply(["agentBackend"], harness_timeout=4.0)
@@ -82,6 +83,7 @@ class AgentTests(unittest.TestCase):
     def test_stops_harness_when_not_requested(self):
         with patch("app.agents.reset"), \
                 patch("app.harness_proc.requested", lambda: False), \
+                patch("app.llm_router.sync", lambda: (True, "已注册到 DSH 桌面版")), \
                 patch("app.harness_proc.stop") as stop:
             settings_effects.apply(["agentBackend"])
         stop.assert_called_once()
@@ -89,11 +91,38 @@ class AgentTests(unittest.TestCase):
     def test_launch_failure_is_reported(self):
         with patch("app.agents.reset"), \
                 patch("app.harness_proc.requested", lambda: True), \
+                patch("app.llm_router.sync", lambda: (True, "已注册到 标准版 harness")), \
                 patch("app.harness_proc.ensure_running",
                       lambda **kw: (False, "找不到 npx：需要本机有 Node.js")):
             out = settings_effects.apply(["agentBackend"])
         self.assertFalse(out[0]["ok"])
         self.assertIn("npx", out[0]["detail"])
+
+    def test_registers_echo_auto_after_the_agent_moves(self):
+        """动完智能体要补一次 ECHO AUTO 注册（标准版的家目录是选中它之后才存在的）。
+
+        不补这一次，只装标准版的机器要等到下次重启才能在 DSH 里选到 ECHO AUTO
+        —— 同事不一定两个都装（2026-09-22）。
+        """
+        with patch("app.agents.reset"), \
+                patch("app.harness_proc.requested", lambda: True), \
+                patch("app.harness_proc.ensure_running", lambda **kw: (True, "已在运行")), \
+                patch("app.llm_router.sync") as sync:
+            sync.return_value = (True, "已注册到 标准版 harness")
+            out = settings_effects.apply(["agentBackend"])
+        sync.assert_called_once()
+        self.assertIn("已注册到", out[0]["detail"])
+
+    def test_registration_follows_the_auto_register_switch(self):
+        """关掉「启动时注册到 DSH」就别写 —— 与 boot 那道闸用同一个开关。"""
+        with patch("app.agents.reset"), \
+                patch("app.harness_proc.requested", lambda: False), \
+                patch("app.harness_proc.stop"), \
+                patch("app.config.settings.get",
+                      lambda k, d=None: False if k == "routerAutoRegister" else d), \
+                patch("app.llm_router.sync") as sync:
+            settings_effects.apply(["agentBackend"])
+        sync.assert_not_called()
 
 
 if __name__ == "__main__":

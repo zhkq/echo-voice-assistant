@@ -225,12 +225,22 @@ class DshAgent(AgentAdapter):
     def has_workspaces(self):
         return True
 
+    def _workspace_registry_path(self):
+        """本后端自己的 DSH 工作区注册表 `workspace.json` 的路径（只读）。
+
+        DSH Desktop 的注册表在桌面版家目录 `~/.dsh`；独立 harness 有**自己**的家目录
+        （`harness_proc.home()`），子类覆盖这里即可指向它，**不许**沿用 `~/.dsh`
+        （AGENTS.md 铁律：不许把 DSH 家目录写死成 `~/.dsh`）。
+        读错注册表 = 拿到别的后端的旧 workspaceId，建会话时报 not-found → 回退 cwd → 未分组。
+        """
+        return os.path.join(os.path.expanduser("~"), ".dsh", "storages", "workspace.json")
+
     def find_workspace(self, path):
         """按目录路径找工作区 id（大小写与结尾斜杠容错）。找不到返回 ""。"""
         if not path:
             return ""
         want = os.path.normcase(os.path.normpath(path))
-        # ① 会话列表里带 workspaceId 的会话（最可靠：直接反映 DSH 当前认知）
+        # ① 会话列表里带 workspaceId 的会话（最直接：反映 DSH 当前认知）
         try:
             for it in self.list_sessions():
                 if it.get("workspaceId") and \
@@ -238,10 +248,10 @@ class DshAgent(AgentAdapter):
                     return it["workspaceId"]
         except Exception:
             pass
-        # ② 兜底：直接读 DSH 的工作区注册表（只读，不改写）
+        # ② 兜底：直接读 **本后端自己** 的工作区注册表（只读，不改写）
         try:
             import json as _json
-            reg = os.path.join(os.path.expanduser("~"), ".dsh", "storages", "workspace.json")
+            reg = self._workspace_registry_path()
             if os.path.isfile(reg):
                 with open(reg, "r", encoding="utf-8") as f:
                     doc = _json.load(f)
@@ -377,8 +387,11 @@ class DshAgent(AgentAdapter):
     def recent_messages(self, session_id, limit=12, anchor_text=None, max_events=600):
         """取会话里的 user/assistant 文本消息（工具调用/步骤事件忽略）。
 
-        用途：面板「命令历史 → 看会话」——DSH 的 Web UI 没有按会话直达的 URL
-        （前端 bundle 不解析任何 URL 参数），只能由 ECHO 用带签名 Cookie 的 RPC 读出来渲染。
+        用途：面板「命令历史 → 看会话」——DSH（桌面版与标准版 harness 共用同一套 Web 前端）
+        没有按会话直达的 URL。这是源码层面验过的硬限制（dsh-web-frontend 0.1.5-rc.2 的 app 与
+        vendor bundle 里都没有 location.search / location.hash / URLSearchParams /
+        sessionStorage / location.pathname，前端不解析任何 query/hash 参数），不是 ECHO 的疏漏，
+        所以只能由 ECHO 用带签名 Cookie 的 RPC 读出来渲染在面板里。
 
         anchor_text：传命令原文时，定位到该指令那一轮（user 消息里含这段文本），
         从那里往后取 limit 条——同一会话里多条指令各有各的上下文，而不是都看会话尾部。

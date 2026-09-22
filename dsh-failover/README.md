@@ -57,31 +57,65 @@ dsh-failover/proxy.py（本机 8899，ECHO 启动时由 boot 组件守护）
 
 ## 注册进 DSH（ECHO AUTO）
 
-DSH 的 `dsh-llm-pi-ai` 适配器**按请求**读取 `~/.dsh/settings.yaml`，provider 路由集合
+DSH 的 `dsh-llm-pi-ai` 适配器**按请求**读取家目录里的 `settings.yaml`，provider 路由集合
 变化会原子重新注册——所以不需要写 DSH 插件、也不需要重启 DSH。ECHO 启动时由
 `app/llm_router.py` 自动完成（设置里可关）：
 
 1. 读 `dsh-failover/config.json` 的 `groups`：每个组 = DSH 里一个可选模型；
-2. 在 `~/.dsh/settings.yaml` 的 `llm-pi-ai.providers.echo-auto` 下 upsert 路由
-   （`baseURL: http://127.0.0.1:8899`，`apiKeyEnv: ECHO_ROUTER_TOKEN`）——用
-   ruamel.yaml 往返写入，保留用户注释，写前备份 `settings.yaml.bak-echo-auto-*`；
-3. 在 `~/.dsh/.credentials.yaml` 的 `refs` 下确保存在 `ECHO_ROUTER_TOKEN`
-   （路由自己的令牌；组内成员的真实密钥只由 ECHO 持有）。
+2. 在**每个实际存在的 DSH 家目录**的 `settings.yaml` 里 upsert
+   `llm-pi-ai.providers.echo-auto`（`baseURL: http://127.0.0.1:8899`，
+   `apiKeyEnv: ECHO_ROUTER_TOKEN`）——用 ruamel.yaml 往返写入，保留用户注释，
+   写前备份 `settings.yaml.bak-echo-auto-*`；
+3. 在同一个家目录的 `.credentials.yaml` 的 `refs` 下确保存在 `ECHO_ROUTER_TOKEN`，
+   而且**每个家目录里是同一个值**（路由只认 config.json 里那一个令牌，两份不一致
+   必然有一边 401）。
 
-手动执行 / 查看：
+### 用户不一定两个都装（2026-09-22 同事反馈）
+
+同一台机器上可能只有桌面版、只有标准版，也可能两个都没有 —— 四种情况都要自洽：
+
+| 这台机器有 | 写到哪 | 说明 |
+|---|---|---|
+| 只有桌面版 | 桌面版家目录（`DSH_HOME`，缺省用户家目录下的 .dsh） | 老行为 |
+| 只有标准版 | 标准版家目录（`harnessHome`，缺省 `{DATA}/harness`） | 向导默认就是标准版，**这条以前是坏的**：注册不到、令牌读成空串 |
+| 两个都有 | 两处都写 | 令牌统一，两个 DSH 里都选得到 ECHO AUTO |
+| 两个都没有 | 哪都不写 | 回报"没找到 DSH 家目录"，路由本身照常可用（纪要可直连上游） |
+
+判据是**家目录里已经有 `settings.yaml`**（DSH 首次运行会自己写下它）：只有目录名、
+没有这个文件 = 那台 DSH 还没初始化过，**不替它造配置**（D25 的纪律）。
+
+boot 的闸（`boot._agent_dsh_available()`）同步放宽：桌面版或标准版**任一**可用就注册；
+标准版的家目录是"选中它"之后才存在的，所以 `boot._start_harness()` 就绪后、
+以及面板里改智能体设置后的联动（`settings_effects._agent()`）都会再复核一次注册。
+
+### 路由进程去哪儿找密钥
+
+`app/llm_router.py` 每次注册都会把"存在的家目录"写进 **`dsh-failover/homes.json`**
+（只有路径，不含密钥）；路由进程（`proxy.py` 的 `cred_paths()`）按 mtime **热读**它，
+逐份找 `refs`。于是成员密钥（内网网关令牌这类）写在哪个家目录里都找得到，
+家目录**后来才出现**（用户在面板里选中标准版）也不用手动重启路由进程。
+没有 `homes.json` 时退回启动时的 `ECHO_DSH_HOMES` 环境变量，再退回桌面版那一份（老行为）；
+`FAILOVER_<REF>` / `<REF>` 环境变量始终最优先。
+
+手动执行 / 查看（**用 `-m` 跑**：脚本要能 `import app`，直接 `python app\llm_router.py`
+会以 `ModuleNotFoundError: No module named 'app'` 收场 —— 2026-09-22 实测）：
 
 ```powershell
-# 立即注册（幂等）
-& $HOME\.echo-venv\Scripts\python.exe app\llm_router.py
-# 看当前注册态（不写任何文件）
-& $HOME\.echo-venv\Scripts\python.exe app\llm_router.py --check
+cd <安装目录>          # 例如 C:\echo-dev
+# 立即注册（幂等；写到每个存在的家目录）
+& .\venv\Scripts\python.exe -m app.llm_router
+# 看当前注册态（不写任何文件；homes 里逐家目录列出注册没注册）
+& .\venv\Scripts\python.exe -m app.llm_router --check
 ```
 
-DSH 侧的默认模型（`agent-default-model`）由你自己决定（本机当前已设为 `echo-auto/echo-auto`）。
+DSH 侧的默认模型（`agent-default-model`）由你自己决定（桌面版本机当前是
+`deepseek-official/deepseek-flash`，标准版是内网 `bjunicom-deepseek-v4-flash`）。
 ECHO AUTO 是「可选模型」，ECHO 没运行时选它会明确失败（路由不在），不会静默走别的上游。
 
-内网那两条 provider（`intranet-deepseek-v4-flash`、`…-ep`）保持**直连内网**，不经过本路由；
-要内网优先、内网不通自动换官方，就在面板里把它们加成 ECHO AUTO 的通道（本机就是这么配的）。
+内网那条 provider（`bjunicom-deepseek-v4-flash`）保持**直连内网**，不经过本路由；
+要内网优先、内网不通自动换官方，就在面板里把它加成 ECHO AUTO 的通道（本机就是这么配的）。
+**两个 DSH 各有一份 settings.yaml**，直连 provider 与 `agent-default-model` 要各配一次
+（ECHO 只管 `echo-auto` 这一条）。
 
 ## 文件结构
 

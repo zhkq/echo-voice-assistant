@@ -21,6 +21,10 @@
 #   -Diarize               装说话人分离（pyannote，需 HF 授权，重依赖）
 #   -AccelCuda             装 CUDA 版 torch（需 N 卡）
 #   -Agent <名>            智能体后端：harness(默认,= DSH 标准版) / dsh / none
+#   -DshVersion <版本>     标准版本地安装的版本（默认 0.1.5-rc.2）。npm 装不下来时
+#                          会从 npx 缓存里找**同版本**那份复制（见 harness-install-local.ps1）
+#   -PinHarnessCommand     把本地入口的绝对路径写进设置 harnessCommand（默认**不写**：
+#                          ECHO 自己会优先本地入口，node 换版本不用改配置）
 #   -ModelsDir / -MeetingsDir / -NotesDir   三处位置（留空=默认；-NotesDir 填了会开归档）
 #   -PipIndex <url>        国内 pip 镜像，例如 https://pypi.tuna.tsinghua.edu.cn/simple
 #   -SkipPip               只下模型、不装 pip 依赖
@@ -36,6 +40,8 @@ param(
     [switch]$Diarize,
     [switch]$AccelCuda,
     [string]$Agent = 'harness',
+    [string]$DshVersion = '0.1.5-rc.2',
+    [switch]$PinHarnessCommand,
     [string]$ModelsDir = '',
     [string]$MeetingsDir = '',
     [string]$NotesDir = '',
@@ -324,66 +330,40 @@ function Prepare-Agent {
     }
     $node = Join-Path $nodeDir 'node.exe'
     if (-not (Test-Path $node)) { $node = Join-Path $nodeDir 'node' }
-    $npm = Join-Path $nodeDir 'npm.cmd'
-    if (-not (Test-Path $npm)) { $npm = Join-Path $nodeDir 'npm' }
     Ok ("node: {0}" -f $node)
 
-    $target = Join-Path $script:Root 'harness\dsh'
-    $entry = Join-Path $target 'node_modules\@deepseek-ai\dsh\lib\bin.js'
-    if (Test-Path $entry) {
-        Ok '标准版已在本机（跳过下载）'
-    } else {
-        if (-not (Test-Path $npm)) {
-            Warn ("没找到 npm：{0} —— 装了 Node 但缺 npm？回退到 npx 方式" -f $npm)
-            return $false
-        }
-        New-Item -ItemType Directory -Force -Path $target | Out-Null
-        if (-not (Test-Path (Join-Path $target 'package.json'))) {
-            '{ "name": "echo-harness", "private": true }' |
-                Set-Content -Path (Join-Path $target 'package.json') -Encoding UTF8
-        }
-        Say '下载并安装标准版（一次性，几十 MB，可能要几分钟；请勿中断）...'
-        $prev = $ErrorActionPreference
-        $ErrorActionPreference = 'Continue'
-        # 宿主的安全删除 shim 会把 npm reify 的批量删除拦下来（SAFE_DELETE_BULK_CONFIRM_REQUIRED），
-        # 装出来是"目录在、文件被截断"的半残包 —— 装的时候把它关掉。
-        $oldShim = $env:CODEBUDDY_SAFE_DELETE_ENABLED
-        $env:CODEBUDDY_SAFE_DELETE_ENABLED = '0'
-        Push-Location $target
-        try {
-            & $npm install '@deepseek-ai/dsh@0.1.5-rc.2' --no-audit --no-fund 2>&1 |
-                ForEach-Object { Write-Host "      $_" -ForegroundColor DarkGray }
-            $code = $LASTEXITCODE
-        } catch {
-            Warn ("安装失败：{0}" -f $_.Exception.Message)
-            $code = 1
-        } finally {
-            Pop-Location
-            $ErrorActionPreference = $prev
-            if ($null -eq $oldShim) { Remove-Item Env:\CODEBUDDY_SAFE_DELETE_ENABLED -ErrorAction SilentlyContinue }
-            else { $env:CODEBUDDY_SAFE_DELETE_ENABLED = $oldShim }
-        }
-        if ($code -ne 0 -or -not (Test-Path $entry)) {
-            Warn ("标准版没装成（退出码 {0}）—— 回退到 npx，首次启动要多等 1-2 分钟" -f $code)
-            return $false
-        }
-    }
-
-    # 完整性自检：同事踩的就是"目录在、文件被截断"（node-pty 缺 index.js，dsh 直接加载失败）
-    $broken = @()
-    if (-not (Test-Path $entry)) { $broken += 'lib\bin.js' }
-    foreach ($pty in (Get-ChildItem $target -Recurse -Directory -Filter 'node-pty' -ErrorAction SilentlyContinue)) {
-        foreach ($f in @('package.json', 'lib\index.js')) {
-            if (-not (Test-Path (Join-Path $pty.FullName $f))) { $broken += ("node-pty\" + $f) }
-        }
-    }
-    if ($broken.Count -gt 0) {
-        Warn ("安装不完整：{0}" -f ($broken -join ', '))
-        Say ("  修法：删掉 {0} 后重跑本脚本" -f $target)
+    # 装/修本地永久入口交给专门的脚本：它按"① 已装好 ② npm install ③ 从 npx 缓存复制"
+    # 三条路依次试。**为什么必须有第 ③ 条**（2026-09-22 实测）：`@deepseek-ai/dsh@0.1.5-rc.2`
+    # 的依赖图在公共 registry 上是坏的（子包依赖 ^0.1.5-rc.3，而那个 rc.3 从没发布过），
+    # npm 必然 ETARGET —— 老逻辑这时只会回退 npx，于是用户那边每次冷启动都要 2 分钟。
+    # $PSScriptRoot 在 -File 执行时一定有；内联/点源时可能为空，退一步用 $PSCommandPath
+    $here = $PSScriptRoot
+    if (-not $here) { try { $here = Split-Path -Parent $PSCommandPath } catch { $here = '' } }
+    $helper = ''
+    if ($here) { $helper = Join-Path $here 'harness-install-local.ps1' }
+    if (-not $helper -or -not (Test-Path -LiteralPath $helper)) {
+        Warn ("缺 harness-install-local.ps1（脚本目录 {0}）—— 回退到 npx（首次启动要多等 1-2 分钟）" -f $here)
         return $false
     }
-
-    $script:HarnessCommand = '"{0}" "{1}" web' -f $node, $entry
+    $cmdFile = Join-Path $env:TEMP ("echo-harness-command-{0}.txt" -f $PID)
+    $out = @()
+    try {
+        $out = & $helper -DestDir $script:Root -Version $script:DshVersion `
+                         -NodeExe $node -CommandFile $cmdFile -LogFile $script:InstallLog
+    } catch {
+        Warn ("装本地标准版时出错：{0}" -f $_.Exception.Message)
+    }
+    $cmdLine = @($out | Where-Object { $_ -like 'HARNESS_COMMAND=*' })
+    if (Test-Path -LiteralPath $cmdFile) {
+        $script:HarnessCommand = (Get-Content -LiteralPath $cmdFile -Raw).Trim()
+        Remove-Item -LiteralPath $cmdFile -Force -ErrorAction SilentlyContinue
+    } elseif ($cmdLine.Count -gt 0) {
+        $script:HarnessCommand = ([string]$cmdLine[-1]).Substring('HARNESS_COMMAND='.Length)
+    }
+    if (-not $script:HarnessCommand) {
+        Warn '标准版本地永久安装没成 —— 回退到 npx，首次启动要多等 1-2 分钟（日志里有原因）'
+        return $false
+    }
     Ok '标准版已就绪（本地永久安装，冷启动约 10 秒）'
     Say ("  启动命令：{0}" -f $script:HarnessCommand)
     return $true
@@ -490,9 +470,13 @@ switch ($Agent) {
     'dsh'     { $values['agentBackend'] = 'dsh' }
     default   { }
 }
-# 本地永久安装成功 → 把绝对路径写进设置：ECHO 直连它，冷启动约 10 秒（见 Prepare-Agent）。
-# 没装成就不写，ECHO 用默认的 npx 命令兜底（首次会慢 1-2 分钟，但能用）。
-if ($script:HarnessCommand) { $values['harnessCommand'] = $script:HarnessCommand }
+# **默认不写 harnessCommand**（2026-09-22 晚改）：设置停在出厂值时，ECHO 自己会优先用本地
+# 入口（`harness_proc.command()`：出厂值 + 本地入口存在 -> 直连，冷启动约 10 秒），node 也由
+# 它探测（`node_dirs()` 与上面 Resolve-NodeDir 是同一批目录）。好处：node 换版本
+# （WorkBuddy / nvm 升级）不用改配置 —— 写死绝对路径时那条路径一失效 harness 就起不来，
+# 而这个设置是隐藏项，用户很难自己找到。想钉死：加 -PinHarnessCommand。
+# 没装成本地入口时也不用写：ECHO 用默认 npx 命令兜底（首次慢 1-2 分钟，但能用）。
+if ($script:HarnessCommand -and $PinHarnessCommand) { $values['harnessCommand'] = $script:HarnessCommand }
 if ($values.Count -gt 0) {
     foreach ($k in $values.Keys) { Say ("{0} = {1}" -f $k, $values[$k]) }
     try { $null = Invoke-Api -Path '/api/settings' -Method Put -Body @{ values = $values } -TimeoutSec 60; Ok '设置已写入' }
