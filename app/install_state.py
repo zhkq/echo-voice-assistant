@@ -139,6 +139,15 @@ def _harness_online() -> bool:
         return False
 
 
+def _dsh_online() -> bool:
+    """选中的是 DSH Desktop 时，问**它自己**在不在（默认 43120）。"""
+    try:
+        from app import manager
+        return bool(manager.dsh_ready())
+    except Exception:
+        return False
+
+
 def _wanted_from_settings() -> dict:
     """没有报告时，从**设置**推"用户想要什么"（老安装/向导安装走这条路）。"""
     out = {"engines": [], "wake": False, "diarize": False, "agent": ""}
@@ -225,7 +234,19 @@ def missing(report: dict = None) -> list:
             pass
 
     if want["agent"] in ("harness", "dsh"):
-        if not _node_ok():
+        # **按选中的那个适配器**判断在不在线。
+        # 原来对 harness 与 dsh 都去问标准版 harness —— 而 `_harness_online()` 在
+        # `harness_proc.requested()` 为假（= agentBackend 不是 harness）时**必然返回 False**，
+        # 于是选了 DSH Desktop 的机器永远被告知"harness 没在运行、还没装完"
+        # （2026-09-23 迁移实测撞到：Desktop 正在跑、面板仍列这一条）。
+        # 与同事报过的「拿另一个适配器的状态判断」是同一个病。
+        if want["agent"] == "dsh":
+            if not _dsh_online():
+                out.append({"feature": "智能体（会议纪要 / 归档 / 语音指令）",
+                            "reason": "DSH Desktop 没在运行（你选的是桌面版）",
+                            "fix": "启动 DSH Desktop（它是宿主应用，ECHO 只连不拉）；"
+                                   "或在 设置 → 智能体 里改用「标准版 harness」（只要本机有 Node.js）"})
+        elif not _node_ok():
             out.append({"feature": "智能体（会议纪要 / 归档 / 语音指令）",
                         "reason": "没找到 Node.js（harness 靠 npx 起）",
                         "fix": "装 Node.js 后重跑 echo-install 技能（它会把标准版永久装到 <安装目录>/harness/dsh 并写好启动命令）"})

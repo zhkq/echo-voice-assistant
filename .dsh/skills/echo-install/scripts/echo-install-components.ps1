@@ -485,11 +485,21 @@ foreach ($pair in $models) {
 # 2) 写设置（与面板同一套键）
 Step '写入设置'
 $values = @{}
-if ($Engines.Count -gt 0) {
-    $first = $ENGINE_MAP[$Engines[0]]
+# 只认**查得到**的引擎名，认不出就一个都不写。
+# 为什么必须筛（2026-09-23 实测踩到）：`powershell -File 脚本.ps1 -Engines a,b` 会把
+# `a,b` 当成**一个字符串**（-File 不做数组解析）→ `$ENGINE_MAP['a,b']` 是 $null →
+# `$first.stt` 也是 $null → **把用户原有的 sttModel / meetingSttModel 覆盖成 null**，
+# 而且引擎依赖（funasr/transformers）也被静默跳过。宁可不动设置，也不能写空值。
+$knownEngines = @($Engines | Where-Object { $ENGINE_MAP.ContainsKey($_) })
+if ($Engines.Count -gt 0 -and $knownEngines.Count -eq 0) {
+    Warn ("没有可识别的引擎（{0}）—— 跳过 sttModel / meetingSttModel，现有设置保持不动。" -f ($Engines -join ', '))
+    Warn "  提示：用 -File 调用时不要用逗号分隔多个引擎（会被当成一个名字），改用 & 脚本.ps1 -Engines a,b"
+}
+if ($knownEngines.Count -gt 0) {
+    $first = $ENGINE_MAP[$knownEngines[0]]
     $values['sttModel'] = $first.stt
     # 会议通常要更准：选里有 whisper 档就用它
-    $whisper = $Engines | Where-Object { $_ -like 'whisper-*' } | Select-Object -First 1
+    $whisper = $knownEngines | Where-Object { $_ -like 'whisper-*' } | Select-Object -First 1
     $values['meetingSttModel'] = if ($whisper) { $ENGINE_MAP[$whisper].stt } else { $first.stt }
 }
 if ($Wake) { $values['wakeEnabled'] = $true }

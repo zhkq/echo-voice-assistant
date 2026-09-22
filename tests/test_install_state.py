@@ -138,6 +138,35 @@ class InstallReportTests(unittest.TestCase):
                 patch.object(install_state, "_model_ready", lambda mid: True):
             self.assertEqual([], install_state.missing(report))
 
+    def test_desktop_choice_is_judged_by_the_desktop_not_the_harness(self):
+        """选了 DSH Desktop 时，在线与否要看**桌面版**（2026-09-23 迁移实测撞到）。
+
+        `_harness_online()` 在 `harness_proc.requested()` 为假（= agentBackend 不是 harness）
+        时**必然返回 False**，而原来 dsh 分支也去问它 —— 于是选了 Desktop 的机器永远被告知
+        "harness 没在运行、还没装完"。与同事报过的「拿另一个适配器的状态判断」是同一个病。
+        """
+        report = {"engines": [], "agent": "dsh"}
+        # Desktop 在线 + harness 必然"不在线"：不该报任何缺失
+        with patch.object(install_state, "_dsh_online", lambda: True), \
+                patch.object(install_state, "_harness_online", lambda: False), \
+                patch.object(install_state, "_node_ok", lambda: False):
+            self.assertEqual([], install_state.missing(report),
+                             "选了 Desktop 却拿 harness 的状态报缺失")
+        # Desktop 不在线：要把原因说成桌面版，别再提 harness
+        with patch.object(install_state, "_dsh_online", lambda: False):
+            miss = install_state.missing(report)
+        self.assertTrue(miss)
+        self.assertIn("DSH Desktop 没在运行", miss[0]["reason"])
+        self.assertNotIn("harness 没在运行", miss[0]["reason"])
+
+    def test_harness_choice_still_checks_node_and_harness(self):
+        report = {"engines": [], "agent": "harness"}
+        with patch.object(install_state, "_dsh_online", lambda: True), \
+                patch.object(install_state, "_node_ok", lambda: False):
+            miss = install_state.missing(report)
+        self.assertTrue(miss)
+        self.assertIn("Node.js", miss[0]["reason"])
+
     def test_state_exposes_engine_detail(self):
         report = {"engines": ["sherpa"], "agent": "none"}
         with patch.object(install_state, "load_report", lambda path="": report), \
