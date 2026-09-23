@@ -23,6 +23,27 @@
 - **铁律**：`scripts/start.ps1` / `startup.ps1` / `launch-desktop.ps1` **一律用 `Start-EchoProcess` 起 ECHO**，不要再写 `Start-Process -FilePath $pyw`。
 - **顺带一个编码坑**：这三个脚本是 **ASCII-only（无 BOM）**，改它们时注释也只能用 ASCII；`launch-desktop.ps1` 是例外（**带 BOM**、里面有中文）。**任何用 Python/编辑器整体改写这些文件的操作都必须保住 BOM** —— 本次就踩了：抹掉 `launch-desktop.ps1` 的 BOM 之后，PowerShell 5.1 按 ANSI 读中文注释，直接**解析失败**（用 5.1 的 `Parser.ParseFile` 复核能同样报出来）。
 
+### 发 Release 绕 GitHub DNS 污染：uploads 的 IP 只能靠"带 token 的探针"选（2026-09-23）
+
+- 这台网络把 `*.github.com` 全解析成 `127.0.0.1`。`gh-push.ps1` 管的是 **git push**；
+  **`gh`（建 Release、传附件）要自己起代理**：`scripts/gh-proxy.py <port> host=ip ...`，
+  再让 `gh` 走它（`$env:HTTPS_PROXY='http://127.0.0.1:<port>'`）。
+- **api 与 uploads 不是同一台前置**，所以必须按 host 分别钉 IP（这正是 `gh-proxy.py` 支持
+  `host=ip` 写法的原因）。`gh release upload` 报 `HTTP 400 / 404 Bad request` 基本都是
+  **uploads 指错了 IP**，不是权限或 release id 的问题。
+- **别用"未授权探针"挑 IP —— 会把你骗反**（这次连骗两轮）：
+  - 不带 token 去 POST 上传端点时，**正确的主机**可能回 `400`（请求体不合规），
+    而**错误的主机**反而回 `403`。看着"403 更像个真端点"，结论正好是反的。
+  - 可靠判据：**带 token 逐个 IP 真上传一次**，谁回 **201** 谁对（探针资产随后删掉）。
+    2026-09-23 实测：uploads 只有 `20.205.243.161` 给 201，`.165` 给 403、`140.82.112.6` 给 404。
+  - api 用 `GET /rate_limit` 判：`200`/`401` = 对；`301` = 那台不是 api 主机（`/` 的状态码没这分辨力）。
+- **IP 会漂，别记死**：同一天里 api 的 DoH 结果 `20.205.243.168` 先能用、一小时后连不上，
+  换 `140.82.112.6` 才通。**发版前现探现用**。
+- **`gh-proxy.py` 开了 `SO_REUSEADDR`**：旧代理没杀干净也能再 bind 同一端口，于是"两个代理
+  抢端口"很难察觉（表现是同一个 host 一会儿通一会儿不通）。换 IP 前先按命令行把
+  `gh-proxy.py` 进程**全部**杀干净。
+- 中文标题/正文仍然走 `gh api --input <utf8-json>`（PowerShell 直接传参会乱码）。
+
 ### 跑单测会把开发机上正在跑的「标准版 harness」杀掉（2026-09-22 事故）
 
 - **症状**：面板上 `harness`（标准版）显示 `offline / 已停止`，会议纪要生成报
