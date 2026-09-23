@@ -33,6 +33,10 @@ try {
 } catch { }
 
 $root = Split-Path $PSScriptRoot -Parent
+
+# Start the service without ever creating a console window: the venv pythonw would
+# otherwise leak a console that Windows Terminal shows as an empty tab.
+. (Join-Path $PSScriptRoot 'echo-launch-lib.ps1')
 # D22: main package has no bundled runtime; runtime-core component provides it.
 $py = Join-Path $root 'runtime-core\python.exe'
 if (-not (Test-Path $py)) { $py = Join-Path $root 'runtime-core\Scripts\python.exe' }
@@ -117,9 +121,12 @@ if (-not $alive) {
         Show-Error "pythonw missing - run scripts\setup.ps1 first`n$pyw"
         exit 1
     }
-    $p = Start-Process -FilePath $pyw -ArgumentList @('-m', 'app.main') -WorkingDirectory $root `
-        -RedirectStandardOutput $out -RedirectStandardError $err -PassThru
-    Log "ECHO started in background PID=$($p.Id); waiting for the port (pythonw has no window)"
+    # Must go through Start-EchoProcess: Start-Process has no CreateNoWindow switch and
+    # the venv pythonw leaks a console that Windows Terminal shows as an empty tab
+    # (see the header of echo-launch-lib.ps1).
+    $p = Start-EchoProcess -Pythonw $pyw -WorkDir $root -Arguments '-m app.main' `
+        -OutLog $out -ErrLog $err
+    Log "ECHO started in background PID=$($p.Id); waiting for the port (no console window)"
     for ($i = 0; $i -lt 75; $i++) {
         Start-Sleep -Seconds 1
         if (Test-TcpPort $echoPort) { $alive = $true; break }

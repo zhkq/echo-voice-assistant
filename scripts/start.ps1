@@ -20,6 +20,10 @@ param(
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
 
+# Start the service without ever creating a console window: the venv pythonw would
+# otherwise leak a console that Windows Terminal shows as an empty tab.
+. (Join-Path $PSScriptRoot 'echo-launch-lib.ps1')
+
 # (retired 2026-09-17) The DSH Desktop host plugin (echo-host) is gone - see plugin/README.md.
 
 # D22: the main package ships no runtime - the runtime-core component supplies it.
@@ -82,9 +86,11 @@ function Test-EchoPort([int]$port = 8970) {
 }
 
 function Start-EchoOnce([switch]$Quiet) {
-    $p = Start-Process -FilePath $pyw -ArgumentList @('-m', 'app.main') `
-        -WorkingDirectory $root -RedirectStandardOutput $outLog `
-        -RedirectStandardError $errLog -PassThru
+    # Must go through Start-EchoProcess: Start-Process has no CreateNoWindow switch and
+    # the venv pythonw leaks a console that Windows Terminal shows as an empty tab
+    # (see the header of echo-launch-lib.ps1).
+    $p = Start-EchoProcess -Pythonw $pyw -WorkDir $root -Arguments '-m app.main' `
+        -OutLog $outLog -ErrLog $errLog
     if (-not $Quiet) { Write-Host "ECHO started in background (PID $($p.Id))  panel port: see data\echo-port.txt" }
     return $p
 }

@@ -23,6 +23,10 @@ param(
 
 $ErrorActionPreference = 'Continue'
 $root = Split-Path $PSScriptRoot -Parent
+
+# Start the service without ever creating a console window: the venv pythonw would
+# otherwise leak a console that Windows Terminal shows as an empty tab.
+. (Join-Path $PSScriptRoot 'echo-launch-lib.ps1')
 $logDir = Join-Path $root 'data\logs'
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
 $supLog = Join-Path $logDir 'echo-supervisor.log'
@@ -143,9 +147,11 @@ function Test-EchoAlive {
 # ECHO has its own single-instance lock (see app\single_instance.py) plus a port
 # check, so this probe-then-start dance can no longer race with a live instance.
 function Start-EchoOnce {
-    $p = Start-Process -FilePath $pyw -ArgumentList @('-m', 'app.main') `
-        -WorkingDirectory $root -RedirectStandardOutput $outLog `
-        -RedirectStandardError $errLog -PassThru
+    # Must go through Start-EchoProcess: Start-Process has no CreateNoWindow switch and
+    # the venv pythonw leaks a console that Windows Terminal shows as an empty tab
+    # (see the header of echo-launch-lib.ps1).
+    $p = Start-EchoProcess -Pythonw $pyw -WorkDir $root -Arguments '-m app.main' `
+        -OutLog $outLog -ErrLog $errLog
     return $p
 }
 
