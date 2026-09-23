@@ -304,6 +304,28 @@ def _assign_speakers(seg_rows, turns):
     return out
 
 
+def _ensure_speaker_column(rows):
+    """把转写行统一成 5 元组 ``(seg, start, end, speaker, text)``。
+
+    文本优先引擎（SenseVoice / Qwen3-ASR）与 whisper/provider 路径产出的都是 **4 元组**，
+    说话人那一列由 `_assign_speakers` 补。这里保证"补过了"这件事**一定发生**：
+
+    原来只有 `if diarize: ... else: ...` 的 else 分支（= 关闭分离）会补空说话人，
+    分离**抛异常**时什么都不做，4 元组就一路进到 `db.add_lines`，报
+    ``ValueError: not enough values to unpack (expected 5, got 4)`` ——
+    前面几十分钟的转写成果全丢（2026-09-23 实测：运行时缺 speechbrain）。
+    形状是 db 层的契约，不能靠"分离恰好成功"来维持。
+    """
+    out = []
+    for row in rows:
+        if len(row) == 5:
+            out.append(tuple(row))
+        else:
+            seg, s, e, txt = row
+            out.append((seg, s, e, "", txt))
+    return out
+
+
 def _align_sentences(sv_text, wsegs):
     """SenseVoice 整段文本（带标点）对齐 whisper 碎句时间轴，按标点切句。"""
     import difflib
@@ -567,6 +589,7 @@ def _transcribe_impl(folder):
         wmodel = stt_mod._get_whisper(cfg.get("sttModel", "small"),
                                       cfg.get("sttDevice", "auto"))
 
+    diarize_fail = ""      # 分离失败只记一次：8 段会议连说 8 遍会淹没日志
     for i, seg in enumerate(segs, start=1):
         seg_idx = int(seg.split(".")[0])
         seg_path = os.path.join(folder, seg)
@@ -602,11 +625,20 @@ def _transcribe_impl(folder):
                     seg_rows = _fallback_sv_rows(sv, wmodel, seg_path, seg_idx, seg_min, cfg)
             else:
                 seg_rows = _fallback_sv_rows(sv, wmodel, seg_path, seg_idx, seg_min, cfg)
+            if not seg_rows:
+                # **静默零行是这套流程最贵的失败**：引擎抛异常只 print 到 stderr，
+                # 库里一行不留，事后完全查不出"这场为什么是空的"
+                # （2026-09-21 71 分钟那场就是这样）。
+                db.add_log("warn", "meeting",
+                           f"{meeting_name} 第{i}段没有转出任何文字"
+                           f"（引擎 {sv_kind}；引擎异常详情见 data/logs/echo-server.log.err）")
         else:
             try:
                 out, _info = stt_mod.transcribe_whisper(wmodel, seg_path, cfg.get("sttLanguage", "zh"))
                 seg_rows = [(seg_idx, s.start, s.end, s.text.strip()) for s in out]
             except Exception as e:
+                db.add_log("error", "meeting",
+                           f"{meeting_name} 第{i}段 whisper 转写失败：{type(e).__name__}: {e}")
                 print("转写失败:", e, file=sys.stderr)
 
         if diarize:
@@ -657,10 +689,17 @@ def _transcribe_impl(folder):
                     except Exception as e:
                         db.add_log("warn", "voiceprint", f"声纹识别失败（跳过本段）：{e}")
             except Exception as e:
+                # 分离不可用不能连累整场转写：形状归一在下面统一做。失败原因也落库
+                # （原来只 print 到 stderr，日志里查不到"为什么这场没有说话人"）。
+                if not diarize_fail:
+                    diarize_fail = f"{type(e).__name__}: {e}"
+                    db.add_log("warn", "meeting",
+                               f"{meeting_name} 说话人分离不可用，本场不标说话人：{diarize_fail}")
                 print("说话人分离失败:", e, file=sys.stderr)
-        else:
-            seg_rows = [(seg, s, e, "", txt) for seg, s, e, txt in seg_rows]
 
+        # 形状归一必须在 extend 之前：分离成功给 5 元组，关闭/失败时这里是 4 元组，
+        # 而 db.add_lines 只认 5 元组（见 _ensure_speaker_column 的说明）。
+        seg_rows = _ensure_speaker_column(seg_rows)
         db_rows.extend(seg_rows)
         meta.setdefault("transcribed", []).append(seg)
         with open(os.path.join(folder, "meta.json"), "w", encoding="utf-8") as f:
@@ -710,9 +749,27 @@ def _transcribe_impl(folder):
         db.replace_speakers(meeting_id, speaker_names)
     db.add_lines(meeting_id, db_rows)
     db.cleanup_empty_speakers(meeting_id)
-    db.update_meeting(meeting_id, status="transcribed",
-                      duration_seconds=meta.get("durationSeconds", 0),
-                      segments=len(segs))
+    if db_rows:
+        db.update_meeting(meeting_id, status="transcribed",
+                          duration_seconds=meta.get("durationSeconds", 0),
+                          segments=len(segs))
+    else:
+        # 「一行都没有也叫 transcribed」是假话：面板显示成功、纪要写着"没内容"，
+        # 真正原因（引擎异常/依赖缺失）只在 stderr 里 —— 用户看到的是"成功了但空的"。
+        # 2026-09-21 那场 71 分钟的会就是这么过去的（2026-09-23 复查发现）。
+        reason = "没有转出任何文字（转写引擎失败，或这段录音确实没人说话）"
+        db.update_meeting(meeting_id, status="error",
+                          duration_seconds=meta.get("durationSeconds", 0),
+                          segments=len(segs))
+        db.add_log("error", "meeting", f"{meeting_name} 转写结束但一行文字都没有：{reason}")
+        try:
+            _cur = db.get_meeting(meeting_id)
+            _old = ((_cur["notes"] if _cur is not None else "") or "")
+        except Exception:
+            _old = ""
+        # notes 是用户的地盘：只在它空着的时候写，绝不覆盖用户写的东西
+        if not _old.strip():
+            db.update_meeting(meeting_id, notes=reason)
     export_transcript(meeting_id, folder)
 
     if cfg.get("autoSummarize", True) and db_rows:

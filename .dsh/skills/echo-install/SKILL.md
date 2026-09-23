@@ -38,7 +38,16 @@ whenToUse: 新机器首装 ECHO（Windows 或 macOS）；或把 ECHO 交给同�
 | `whisper-base` | 141 MB | `faster-whisper` | 更准的档位（D1 推荐组合：sherpa + base） |
 | `whisper-tiny` / `small` / `medium` / `large-v3` | 75 / 464 / 1500 / 2950 MB | 同上 | 档位越高越准也越慢 |
 | `sensevoice` | 896 MB | `funasr` + `torch`（**+约 2 GB**） | 中文短句标点最准，但拖 torch |
-| `qwen3asr` | 3.6 GB | `transformers` + `torch` | 方言/口音更强；Windows 需要 N 卡，mac 上很慢 |
+| `qwen3asr` | 3.6 GB | `qwen-asr` + `transformers==4.57.6` + `torch` | 方言/口音更强；Windows 需要 N 卡，mac 上很慢 |
+
+**会议转写还额外要一把"时间戳骨架"**（`whisper-small` + `faster-whisper`，约 464 MB）：
+`sensevoice` 自己不出时间戳，非得靠它对齐；`qwen3asr` 有 ForcedAligner，只在回退时才用。
+**这套依赖漏了不会报错**，只会把一整场会转成"（未检测到有效语音）"的空文件 ——
+所以选 `sensevoice` 时安装器会自动把 `whisper-small` 一起装上，别手工砍掉（2026-09-23 实测）。
+
+**CUDA 版 torch 必须从 PyTorch 官方索引装**（`-AccelCuda` / `--accel-cuda`）：
+PyPI 上的 Windows torch 是 **CPU 版**，装完 `torch.cuda.is_available()` 是 False，
+表面"装上了"其实一直在跑 CPU。Windows 侧安装器现在会自动换索引（默认 cu128）。
 
 **智能体（会议纪要 / 归档 / 语音指令靠它）**：**默认就用标准版**（`agentBackend=harness`），
 **不用问用户**；只要本机有 Node.js，ECHO 会自己把它拉起来。没有 Node 就照第 5 节处理。
@@ -292,6 +301,9 @@ curl -s "http://127.0.0.1:$port/api/models" | ./venv/bin/python -m json.tool | h
 | `pip` 慢 / 超时 | Windows 加 `-PipIndex https://pypi.tuna.tsinghua.edu.cn/simple`；mac 加 `--pip-index https://pypi.tuna.tsinghua.edu.cn/simple`，重跑（已装好的会跳过） |
 | 模型下载慢或卡住 | 挑更小的档位（如 `whisper-tiny`）；下载在 ECHO 服务里继续跑，可不盯；进度看面板 → 能力 |
 | **说话人分离**装不上 | 2026-09-21 起三件套从 **ModelScope 匿名可下**（`scripts/install_pyannote.py`，ModelScope 优先、HF 兜底）。先查两件事：① 是不是改过「模型放哪」——落点跟随 `modelsDir`；② 使用条款是否已由用户确认 |
+| 会议转出来是空的（`（未检测到有效语音）`）或整场没有说话人 | 两把常见的刀：① **时间戳骨架缺依赖** —— `sensevoice` 少了 `whisper-small`/`faster-whisper` 会安静地转出空文件（见第 1 节表下的说明）；② **说话人分离失败**（缺 `speechbrain`、或用条款/模型没下）。2026-09-23 起分离失败**不再连累**整场转写（会补空说话人列照常落库），失败原因写进 `logs` 表与 `data\logs\echo-server.log.err`，先看这两处 |
+| whisper 报 `Library cublas64_12.dll is not found or cannot be loaded` | torch 被换成了 CUDA 13 的构建（cu130），而 faster-whisper 的 ctranslate2 只认 CUDA 12 的 cublas。装回 cu128：`pip install --force-reinstall torch torchaudio --index-url https://download.pytorch.org/whl/cu128` |
+| 选 `qwen3asr` 却报 `qwen-asr package is required for Qwen3-ASR` | 只装了 `transformers` 没装 `qwen-asr`（这正是 2.0.0 的漏洞，已修）。跑 `scripts\install-qwen3asr.ps1`（它会装 `qwen-asr==0.0.6` + `transformers==4.57.6`）。**别只升 transformers**：5.x 上 qwen-asr 0.0.6 直接 import 不了 |
 | 老机器磁盘不够 | 只装 `sherpa`（189 MB）+ 不装唤醒词，安装目录约 0.4 GB |
 | **macOS**：脚本报 `$'\r': command not found` | 说明 `.sh` 被传成了 CRLF（Windows 上解压/复制过的痕迹）。用 `bash` 跑之前先 `perl -pi -e 's/\r$//' 文件` 或重新从 zip 解一次 |
 

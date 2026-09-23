@@ -130,7 +130,10 @@ class InstallReportTests(unittest.TestCase):
                 patch.object(install_state, "_model_ready", lambda mid: True):
             miss = install_state.missing(report)
         self.assertTrue(miss)
-        self.assertIn("transformers", miss[0]["reason"])
+        # 报的必须是**真正的引擎包** qwen_asr：写 transformers 时，装了 transformers 5.x
+        # 而没装 qwen-asr 也会判"就绪"，用户拿到的是一句莫名其妙的运行时错
+        # （2026-09-23 实测：RuntimeError: qwen-asr package is required for Qwen3-ASR）。
+        self.assertIn("qwen_asr", miss[0]["reason"])
 
     def test_missing_is_empty_when_everything_checks_out(self):
         report = {"engines": ["sherpa"], "agent": "none"}

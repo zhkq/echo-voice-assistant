@@ -27,6 +27,7 @@
 #                          ECHO 自己会优先本地入口，node 换版本不用改配置）
 #   -ModelsDir / -MeetingsDir / -NotesDir   三处位置（留空=默认；-NotesDir 填了会开归档）
 #   -PipIndex <url>        国内 pip 镜像，例如 https://pypi.tuna.tsinghua.edu.cn/simple
+#   -TorchIndex <url>      -AccelCuda 时 torch 走哪个索引（默认官方 cu128；PyPI 上的是 CPU 版）
 #   -SkipPip               只下模型、不装 pip 依赖
 #   -WaitSeconds <秒>      等模型下载的上限（默认 1800）
 #
@@ -46,6 +47,7 @@ param(
     [string]$MeetingsDir = '',
     [string]$NotesDir = '',
     [string]$PipIndex = '',
+    [string]$TorchIndex = '',
     [switch]$SkipPip,
     [int]$WaitSeconds = 1800
 )
@@ -84,8 +86,17 @@ $ENGINE_MAP = @{
     'whisper-small'    = @{ pip = @('faster-whisper', 'huggingface-hub'); model = 'whisper-small';    stt = 'small';    module = 'faster_whisper' }
     'whisper-medium'   = @{ pip = @('faster-whisper', 'huggingface-hub'); model = 'whisper-medium';   stt = 'medium';   module = 'faster_whisper' }
     'whisper-large-v3' = @{ pip = @('faster-whisper', 'huggingface-hub'); model = 'whisper-large-v3'; stt = 'large-v3'; module = 'faster_whisper' }
-    'sensevoice'       = @{ pip = @('funasr', 'modelscope', 'torch');     model = 'sensevoice';       stt = 'sensevoice'; module = 'funasr' }
-    'qwen3asr'         = @{ pip = @('transformers', 'modelscope', 'torch'); model = 'qwen3asr';       stt = 'qwen3asr'; module = 'transformers' }
+    # 会议转写（app/meeting.py）对文本优先引擎要先拿 whisper-small 当时间戳骨架：
+    #   * sensevoice 自己**没有时间戳** -> 骨架是必需的（skeleton = $true）
+    #   * qwen3asr 有 ForcedAligner 原生时间戳，whisper 只是回退 -> 不硬性要求
+    'sensevoice'       = @{ pip = @('funasr', 'modelscope', 'torch');     model = 'sensevoice';       stt = 'sensevoice'; module = 'funasr';    skeleton = $true }
+    # qwen3asr 的正解是 scripts/install-qwen3asr.ps1（qwen-asr==0.0.6 + transformers==4.57.6
+    # + accelerate==1.12.0，见 app/audio/stt.py 的 _get_qwen3asr 文档）。
+    # **transformers 必须钉在 4.57.6**：装成 5.x 时 qwen-asr 0.0.6 直接 import 不了；
+    # module 也必须是 qwen_asr —— 原来写 'transformers' 会让自检在引擎根本跑不起来时
+    # 照样判"已就绪"（2026-09-23 实测：新装的 2.0 会议转写报
+    # `RuntimeError: qwen-asr package is required for Qwen3-ASR`，而组件自检全绿）。
+    'qwen3asr'         = @{ pip = @('qwen-asr==0.0.6', 'transformers==4.57.6', 'accelerate==1.12.0', 'modelscope', 'torch'); model = 'qwen3asr'; stt = 'qwen3asr'; module = 'qwen_asr' }
 }
 
 # ---------------------------------------------------------------- 运行时 / 端口 / API
@@ -431,19 +442,32 @@ Ok ("运行时：{0}" -f $rcPy)
 # 1) 依赖 + 模型
 $pips = @()
 $models = @()
+$needSkeleton = $false
 foreach ($e in $Engines) {
     if (-not $ENGINE_MAP.ContainsKey($e)) { Warn ("不认识这个引擎，跳过：{0}" -f $e); continue }
     $m = $ENGINE_MAP[$e]
     $pips += $m.pip
     $models += , @($m.model, $e)
+    if ($m.skeleton) { $needSkeleton = $true }
+}
+# 会议时间戳骨架：缺了**不会报错**，只会安静地出一场空纪要（2026-09-23 实测）。
+if ($needSkeleton) {
+    $pips += 'faster-whisper'
+    if (-not ($models | Where-Object { $_[0] -eq 'whisper-small' })) {
+        $models += , @('whisper-small', '会议时间戳骨架 whisper-small')
+    }
 }
 if ($Wake) { $pips += 'sherpa-onnx'; $models += , @('kws', '唤醒词 KWS') }
 if ($Diarize) {
-    $pips += @('pyannote.audio', 'torch')
+    # 与 scripts/install_pyannote.py 的装法**逐字对齐**（那里是唯一的正解来源）。
+    # 关键：pyannote 4.x 的说话人嵌入走 speechbrain，只装 pyannote.audio 时分离要到
+    # **运行时**才报 "No module named 'speechbrain'"，而分离失败又会连累整场转写
+    # （见 app/meeting.py 的 _ensure_speaker_column；2026-09-23 实测）。
+    $pips += @('pyannote.audio>=4.0,<5', 'speechbrain>=1.0,<2', 'huggingface-hub>=0.34,<2', 'torch')
     $models += , @('pyannote', '说话人分离（pyannote 三件套）')
     Warn '说话人分离的权重走 ModelScope 同名镜像（官方在 HF 上要求先同意条款）—— 请自行确认合规'
 }
-if ($AccelCuda) { $pips += 'torch'; Warn 'CUDA 版 torch 体积大（约 2.5 GB），且要求 N 卡与匹配的驱动' }
+if ($AccelCuda) { Warn 'CUDA 版 torch 体积大（约 2.5 GB），且要求 N 卡与匹配的驱动' }
 
 # VC++ 运行库先解决：torch / ctranslate2 / sherpa-onnx / onnxruntime 都依赖它，
 # 缺了会在**装完引擎之后**才以 "DLL load failed" 的形式炸（2026-09-21 同事卡在这）。
@@ -462,6 +486,19 @@ if (Test-VCRuntime) {
 }
 
 Install-PipDeps $pips
+
+# CUDA 版 torch 必须从 PyTorch 官方索引装：**PyPI 上的 Windows torch 是 CPU 版**。
+# 2026-09-23 实测：pip 从 PyPI 拿到 torch-2.14.0（wheel 仅 124 MB），
+# torch.cuda.is_available()=False —— 用户以为装了 GPU，其实一直在跑 CPU，
+# 而 -AccelCuda 原来只是往列表里加了个 'torch'，等于什么都没做。
+# 选 cu128：它是覆盖 50 系（sm_120）的第一个稳定档，且 torch\lib 自带 CUDA 12 的
+# cublas64_12.dll —— faster-whisper 的 ctranslate2 正需要它（换成 cu130 后只剩 _13，
+# whisper 时间戳骨架会以 "Library cublas64_12.dll is not found" 失败）。
+if ($AccelCuda) {
+    $torchIndex = if ($TorchIndex) { $TorchIndex } else { 'https://download.pytorch.org/whl/cu128' }
+    Warn ("CUDA 版 torch：从官方索引重装（{0}）" -f $torchIndex)
+    Install-PipDeps @('torch', 'torchaudio') -PipIndex $torchIndex
+}
 $null = Prepare-Agent          # 先把 npm 包预热好，免得写入设置后 ECHO 拉起时干等
 Ensure-Service
 
@@ -559,10 +596,46 @@ foreach ($e in $Engines) {
         $failed += $e
     }
 }
+# 会议骨架也要查：sensevoice 没有时间戳，faster-whisper 装不上时会议不会报错，
+# 只会写一场"（未检测到有效语音）"的空纪要 —— 必须在自检里挑明。
+if ($needSkeleton) {
+    $impSk = Get-ImportFailure 'faster_whisper'
+    if ($impSk.ok) {
+        Ok ("{0,-18} import {1} 通过" -f '会议骨架', 'faster_whisper')
+    } elseif (Test-DllLoadFailure $impSk.text) {
+        Err ("{0,-18} 缺系统 DLL（多半是 VC++ 运行库）：import {1} 失败" -f '会议骨架', 'faster_whisper')
+        Say '      装这个后重跑本脚本： https://aka.ms/vs/17/release/vc_redist.x64.exe'
+        $failed += '会议时间戳骨架（faster-whisper）'
+    } else {
+        Err ("{0,-18} 依赖缺失：import {1} 失败（会议会出一场空纪要）" -f '会议骨架', 'faster_whisper')
+        $firstLine = ($impSk.text -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -Last 1)
+        if ($firstLine) { Say ("      {0}" -f $firstLine.Trim()) }
+        $failed += '会议时间戳骨架（faster-whisper）'
+    }
+}
 foreach ($pair in $models) {
     $st2 = Get-ModelState $pair[0]
     if ($st2 -and $st2.ready -eq $true) { Ok ("{0,-18} 模型就绪" -f $pair[1]) }
     else { Err ("{0,-18} 模型还没好" -f $pair[1]); $failed += ("%s 模型" -f $pair[1]) }
+}
+# -AccelCuda 的成色要**实测**：装完看 cuda.is_available()，别信"pip 返回 0"。
+# 这是"以为有 GPU 其实在跑 CPU"的唯一可靠判据（2026-09-23 实测踩到）。
+if ($AccelCuda) {
+    $cudaState = ''
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $cudaState = (& $rcPy -c "import torch;print('GPU' if torch.cuda.is_available() else 'CPU')" 2>&1 | Out-String)
+    } catch { $cudaState = "$($_.Exception.Message)" }
+    finally { $ErrorActionPreference = $prev }
+    if ($cudaState -match 'GPU') {
+        Ok 'torch 已启用 GPU（cuda.is_available() = True）'
+    } else {
+        Err 'torch 装了但 cuda.is_available() = False —— 仍在跑 CPU'
+        Say '      多半是装到了 PyPI 的 CPU 版；用官方索引重装：'
+        Say ('      "{0}" -m pip install --force-reinstall torch torchaudio --index-url https://download.pytorch.org/whl/cu128' -f $rcPy)
+        $failed += 'CUDA（torch 未启用 GPU）'
+    }
 }
 $agentOk = Wait-Harness
 if (-not $agentOk) { $failed += '智能体（harness）' }

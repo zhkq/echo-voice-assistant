@@ -37,7 +37,10 @@ ENGINE_SPECS = {
     "whisper-medium":   {"module": "faster_whisper",  "model": "whisper-medium",   "stt": "medium",   "label": "Whisper medium"},
     "whisper-large-v3": {"module": "faster_whisper",  "model": "whisper-large-v3", "stt": "large-v3", "label": "Whisper large-v3"},
     "sensevoice":       {"module": "funasr",          "model": "sensevoice",       "stt": "sensevoice", "label": "SenseVoice 中文短句"},
-    "qwen3asr":         {"module": "transformers",    "model": "qwen3asr",         "stt": "qwen3asr", "label": "Qwen3-ASR 方言/口音"},
+    # module 必须是 qwen_asr（真正的引擎包），不能写 transformers：装了 transformers 5.x
+    # 而没装 qwen-asr 时，写 transformers 会让这里判"已就绪"，而会议转写会报
+    # "qwen-asr package is required for Qwen3-ASR"（2026-09-23 实测，发布版 2.0.0 就有）。
+    "qwen3asr":         {"module": "qwen_asr",        "model": "qwen3asr",         "stt": "qwen3asr", "label": "Qwen3-ASR 方言/口音"},
 }
 
 #: sttModel 的值 → 引擎名（把"用户选的设置"翻回"要装什么"）

@@ -58,7 +58,10 @@ def _mac_shell_scripts():
 _PS1_MAP_LINE = re.compile(
     r"^\s*'([^']+)'\s*=\s*@\{\s*pip\s*=\s*@\(([^)]*)\)\s*;\s*"
     r"model\s*=\s*'([^']+)'\s*;\s*stt\s*=\s*'([^']+)'\s*"
-    r"(?:;\s*module\s*=\s*'([^']+)'\s*)?\}", re.M)
+    r"(?:;\s*module\s*=\s*'([^']+)')?"
+    # module 之后允许零或多个附加键（如 sensevoice 的 `; skeleton = $true`）：
+    # 表是会长字段的，解析器不该因为多了个字段就静默漏掉整条引擎。
+    r"(?:;\s*[A-Za-z_]\w*\s*=\s*[^;}]+)*\s*\}", re.M)
 
 
 def _parse_ps1_engine_map():

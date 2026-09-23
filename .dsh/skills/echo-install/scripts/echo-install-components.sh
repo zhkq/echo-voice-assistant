@@ -183,7 +183,9 @@ engine_pip() {
     whisper-tiny|whisper-base|whisper-small|whisper-medium|whisper-large-v3)
               echo "faster-whisper huggingface-hub" ;;
     sensevoice) echo "funasr modelscope torch" ;;
-    qwen3asr)   echo "transformers modelscope torch" ;;
+    # 与 scripts/install-qwen3asr.ps1 的依赖**逐字一致**：qwen-asr 0.0.6 只兼容
+    # transformers 4.57.6，装成 5.x 会 import 不了（2026-09-23 实测）。
+    qwen3asr)   echo "qwen-asr==0.0.6 transformers==4.57.6 accelerate==1.12.0 modelscope torch" ;;
     *) echo "" ;;
   esac
 }
@@ -219,7 +221,7 @@ engine_module() {
     sherpa)     echo "sherpa_onnx" ;;
     whisper-*)  echo "faster_whisper" ;;
     sensevoice) echo "funasr" ;;
-    qwen3asr)   echo "transformers" ;;
+    qwen3asr)   echo "qwen_asr" ;;
     *) echo "" ;;
   esac
 }
@@ -503,7 +505,10 @@ if [ "$WAKE" -eq 1 ]; then
   MODEL_IDS="$MODEL_IDS kws"
 fi
 if [ "$DIARIZE" -eq 1 ]; then
-  PIPS="$PIPS pyannote.audio torch"
+  # 与 scripts/install_pyannote.py 的装法**逐字对齐**：pyannote 4.x 的说话人嵌入走
+  # speechbrain，漏装它分离要到运行时才报 "No module named 'speechbrain'"
+  # （2026-09-23 实测，Windows 侧同样问题）。
+  PIPS="$PIPS pyannote.audio>=4.0,<5 speechbrain>=1.0,<2 huggingface-hub>=0.34,<2 torch"
   MODEL_IDS="$MODEL_IDS pyannote"
   warn "说话人分离的权重走 ModelScope 同名镜像（官方在 HF 上要求先同意条款）—— 请自行确认合规"
 fi

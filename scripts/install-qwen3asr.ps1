@@ -3,12 +3,18 @@
 # 模型：Qwen/Qwen3-ASR-0.6B（~4GB 显存，modelscope 缓存，无中文路径问题）
 $ErrorActionPreference = 'Continue'
 $root = Split-Path $PSScriptRoot -Parent
-$py = Join-Path $root 'venv\Scripts\python.exe'
-# 若存在 ASCII junction（解决 nagisa/dynet 无法读中文路径的问题），优先使用
+# 解释器解析顺序与 scripts\start.ps1 / startup.ps1 / check-windows.ps1 **保持一致**：
+# 2.0 的运行时目录叫 runtime-core（uv 建的），只有老树才叫 venv。
+# 这里原来只认 venv\Scripts\python.exe，于是 runtime-core 安装上点面板的
+# 「下载 Qwen3-ASR」必然报 "缺少 venv"（2026-09-23 实测）。
+$py = Join-Path $root 'runtime-core\python.exe'
+if (-not (Test-Path $py)) { $py = Join-Path $root 'runtime-core\Scripts\python.exe' }
+if (-not (Test-Path $py)) { $py = Join-Path $root 'venv\Scripts\python.exe' }
+# 只有"自己路径含非 ASCII"的树才借 ECHO_PYTHON（指向 venv 的 ASCII 目录联接）：
+# 路径本来就是 ASCII 的树若借了，会把依赖装进**别人的**运行时里（与 start.ps1 同一条规则）。
 $pyAlt = $env:ECHO_PYTHON
-    # 可选：非 ASCII 路径下的解释器覆盖，见 docs/DEPLOY.md
-if ($pyAlt -and (Test-Path $pyAlt)) { $py = $pyAlt }
-if (-not (Test-Path $py)) { Write-Host '缺少 venv' -ForegroundColor Red; exit 1 }
+if ($pyAlt -and (Test-Path $pyAlt) -and ($root -match '[^\x20-\x7E]')) { $py = $pyAlt }
+if (-not (Test-Path $py)) { Write-Host "runtime missing (runtime-core\ or venv\): $py" -ForegroundColor Red; exit 1 }
 
 Write-Host '[1/2] 安装 qwen-asr 依赖（清华镜像）...' -ForegroundColor Cyan
 & $py -m pip install --disable-pip-version-check -i https://pypi.tuna.tsinghua.edu.cn/simple `
