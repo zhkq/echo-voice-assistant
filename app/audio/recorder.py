@@ -105,9 +105,31 @@ def _open_input(device_id=-1, blocksize=0):
 
 
 def list_input_devices():
+    """输入设备清单。
+
+    **同一个硬件会按 host API 各出现一次**（MME / DirectSound / WASAPI / WDM-KS），
+    蓝牙耳机还会多一条 Hands-Free（HFP，通常 8 kHz）—— 所以这里带上 `hostapi` 与
+    `samplerate`，面板的下拉才能让人选得明白（2026-09-23 用户实测："同一个设备出现在
+    不同的位置我应该怎么选"）。`virtual=True` 表示映射/回环/汇总这类**不该选**的端点。
+    """
     import sounddevice as sd
-    return [{"index": d["index"], "name": d["name"], "channels": d["max_input_channels"]}
-            for d in sd.query_devices() if d["max_input_channels"] > 0]
+    try:
+        apis = {i: a["name"] for i, a in enumerate(sd.query_hostapis())}
+    except Exception:
+        apis = {}
+    out = []
+    for d in sd.query_devices():
+        if d["max_input_channels"] <= 0:
+            continue
+        out.append({
+            "index": d["index"],
+            "name": d["name"],
+            "channels": d["max_input_channels"],
+            "hostapi": apis.get(d["hostapi"], ""),
+            "samplerate": int(d["default_samplerate"] or 0),
+            "virtual": bool(_is_virtual_device(d.get("name"))),
+        })
+    return out
 
 
 def default_input_device():

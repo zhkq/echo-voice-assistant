@@ -123,8 +123,21 @@ def _audio_input_options(max_age=30.0):
     try:
         from app.audio import recorder
         for d in recorder.list_input_devices():
-            items.append({"value": int(d["index"]),
-                          "label": "%s · %s" % (d["index"], d["name"])})
+            # 标签里带上 host API 与原生采样率：同一个硬件会按 API 各出现一次，
+            # 不写出来用户根本没法选（"同一个设备出现在不同的位置我应该怎么选"）。
+            # ECHO 打开麦克风时**固定要 16 kHz**（recorder._open_input），所以
+            # 原生 16 kHz 的那条最省事；映射/虚拟端点直接标出来"别选"。
+            api = str(d.get("hostapi") or "").replace("Windows ", "")
+            sr = d.get("samplerate") or 0
+            tag = " · ".join(x for x in (api, ("%g kHz" % (sr / 1000.0)) if sr else "") if x)
+            label = "%s · %s" % (d["index"], d["name"])
+            if tag:
+                label += "  [%s]" % tag
+            if d.get("virtual"):
+                label += "  ← 映射/虚拟设备，别选"
+            elif sr == 16000:
+                label += "  ← 原生 16 kHz，推荐"
+            items.append({"value": int(d["index"]), "label": label})
     except Exception as e:
         # 取不到就只留"系统默认"，并把原因写进 label —— 别让下拉空着，也别假装有设备
         return [{"value": -1, "label": "系统默认（设备列表取不到：%s）" % e}]

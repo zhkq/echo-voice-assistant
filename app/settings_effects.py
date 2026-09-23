@@ -23,6 +23,19 @@ from __future__ import annotations
 WIZARD_HARNESS_TIMEOUT = 4.0
 
 
+def _wake_device_keys() -> set:
+    """改了这些键会改变**唤醒用的麦**，所以要重开唤醒监听。
+
+    事实源是录音层那张表（`recorder.INPUT_DEVICE_KEYS`）：唤醒跟指令共用"指令"那一侧的
+    设备，通用 `inputDeviceId` 是兜底。写死在这里会漂，所以现取；取不到就退回字面量。
+    """
+    try:
+        from app.audio.recorder import INPUT_DEVICE_KEYS
+        return {"inputDeviceId", INPUT_DEVICE_KEYS["command"]}
+    except Exception:
+        return {"inputDeviceId", "commandInputDeviceId"}
+
+
 def apply(updated, *, harness_timeout=None) -> list:
     """按"哪些键变了"做联动。
 
@@ -32,7 +45,10 @@ def apply(updated, *, harness_timeout=None) -> list:
     keys = [str(k) for k in (updated or [])]
     out = []
 
-    if any(k.startswith("wake") for k in keys):
+    # 唤醒监听：改 wake* 要跟着起停；改**唤醒用的那个麦**也要重开 —— 唤醒是在启动时
+    # 读一次设备的（app/audio/wake.py 的 _run_impl），不重启就还是老麦，
+    # 表现成"设置改了没用"。（_wake() 自己判断 wakeEnabled，没开就不动。）
+    if any(k.startswith("wake") for k in keys) or any(k in _wake_device_keys() for k in keys):
         out.append(_wake())
 
     if any(k.startswith("router") for k in keys):

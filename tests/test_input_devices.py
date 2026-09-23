@@ -63,9 +63,28 @@ class DeviceOptionsTests(unittest.TestCase):
         self.assertIn("MAXHUB 全向麦", opts[2]["label"])
         self.assertIn("3", opts[2]["label"])
 
+    def test_label_shows_host_api_and_rate_so_users_can_choose(self):
+        """同一个硬件按 host API 各出现一次 —— 标签里必须能看出该选哪条。"""
+        fake = [
+            {"index": 14, "name": "耳机 (MAXHUB BM12)", "channels": 1,
+             "hostapi": "Windows WASAPI", "samplerate": 16000, "virtual": False},
+            {"index": 2, "name": "耳机 (MAXHUB BM12)", "channels": 1,
+             "hostapi": "MME", "samplerate": 44100, "virtual": False},
+            {"index": 0, "name": "Microsoft 声音映射器 - Input", "channels": 2,
+             "hostapi": "MME", "samplerate": 44100, "virtual": True},
+        ]
+        with patch.object(recorder, "list_input_devices", lambda: fake):
+            opts = config._audio_input_options()
+        self.assertIn("WASAPI", opts[1]["label"])
+        self.assertIn("16 kHz", opts[1]["label"])
+        self.assertIn("推荐", opts[1]["label"])
+        self.assertNotIn("推荐", opts[2]["label"], "44.1 kHz 不是原生 16 kHz")
+        self.assertIn("别选", opts[3]["label"], "映射/虚拟端点要明确劝退")
+
     def test_device_query_failure_still_offers_the_default(self):
         def boom():
             raise RuntimeError("PortAudio 没起来")
+
         with patch.object(recorder, "list_input_devices", boom):
             opts = config._audio_input_options()
         self.assertEqual(1, len(opts))
