@@ -127,12 +127,11 @@ def capabilities(request: Request):
     st = _st(request)
     cfg = st.cfg
     models = st.pool.status()
-    # 槽 → 模型 id，客户端据此路由（一个模型可能满足多个槽）
-    slots: dict = {}
-    for m in models:
-        for s in [m["slot"]] + list(m.get("supports") or []):
-            if s:
-                slots.setdefault(s, []).append(m["id"])
+    # 槽 → 模型 id。**从池里取，不在这里重新汇总** —— 池的 `_by_slot` 同时是
+    # `pick_for_slot` 用的那一份，所以"宣告的"与"路由得到的"在构造上就是同一个东西。
+    # （曾经这里按 `[slot] + supports` 自己算，而池只按 `slot` 建索引，
+    #   结果宣告了 asr.timestamps 却路由不过去。顺序也由池定：第一个就是会选中的那个。）
+    slots = st.pool.slots()
     return {
         "protocol": 1,
         "server": {"id": cfg.get("server.id", ""), "version": __version__},
@@ -219,7 +218,11 @@ async def asr(request: Request, variant: str = "long", timestamps: int = 0,
     cid = client_of(request)
     want_ts = bool(int(timestamps or 0))
 
-    slot = "asr.short" if str(variant).lower() in ("short", "fast") else "asr.long"
+    # `variant` → 槽。**注意短档的槽叫 `asr.text` 而不是 `asr.short`** ——
+    # 曾经这里写成 `asr.short`，而那是个**没有任何模型提供的槽**：
+    # `variant=short` 一律 404，而默认的 `variant=long` 把测试全带过去了。
+    # 现在由 `test_every_advertised_slot_is_routable` 盯着这类幽灵槽。
+    slot = "asr.text" if str(variant).lower() in ("short", "fast") else "asr.long"
     model_id = st.pool.pick_for_slot(slot, model)
     spec = st.pool.spec(model_id)
 

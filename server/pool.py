@@ -115,7 +115,16 @@ class EnginePool:
                 # 常驻的启动即预热：让第一个客户端别等加载
                 e.state = "absent"
             self._entries[s.id] = e
-            self._by_slot.setdefault(s.slot, []).append(s.id)
+            # **`slot` 与 `supports` 都要建索引。**
+            #
+            # 起因是一个真实的漏洞：`/v1/capabilities` 说"我能满足 asr.timestamps"
+            # （它按 `[slot] + supports` 汇总），而这里只认 `slot` ——
+            # 于是服务端**宣告了一个自己路由不过去的槽**：客户端照着 capabilities
+            # 把请求发过来，收到 404 model_not_found。同一份事实在两个地方各算一遍，
+            # 必然会漂。现在两边都从这一个索引出。
+            for slot_name in (s.slot, *(s.supports or ())):
+                if slot_name:
+                    self._by_slot.setdefault(slot_name, []).append(s.id)
         self.loaders = dict(loaders)
         self.vram_budget_mb = int(vram_budget_mb or 0)
         self.load_timeout_s = float(load_timeout_s)
@@ -131,6 +140,17 @@ class EnginePool:
 
     def models_for_slot(self, slot: str) -> List[str]:
         return list(self._by_slot.get(slot, []))
+
+    def slots(self) -> Dict[str, List[str]]:
+        """槽 → 模型 id 的**唯一一份**事实。
+
+        `capabilities` 必须用它，不许自己再按 `status()` 汇总一遍 ——
+        那个"同一份事实算两遍"正是 `asr.timestamps` 曾经"宣告得出去、路由不回来"
+        的成因（见 `__init__` 里的说明）。这里把顺序也定下来：
+        **按 spec 声明顺序**，`pick_for_slot` 取的就是每张列表的第一个，
+        所以客户端看到的第一个＝它真会得到的那个。
+        """
+        return {slot: list(ids) for slot, ids in self._by_slot.items()}
 
     def pick_for_slot(self, slot: str, want: str = "") -> str:
         """按槽选模型；`want` 是指名道姓的覆盖。槽上没有可用模型时报 404。"""

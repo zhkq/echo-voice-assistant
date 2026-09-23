@@ -247,6 +247,27 @@ class EndpointTests(_AppCase):
                              headers={"Content-Type": "audio/wav"})
         self.assertEqual(r.json()["timestamps"], "exact")
 
+    def test_short_variant_reaches_the_short_model(self):
+        """`variant=short` 必须真的走通 —— 默认是 `long`，所以这条路径
+        不写用例就永远没人走（曾经它 404，而全部用例都是绿的）。"""
+        r = self.client.post("/v1/asr?variant=short", content=_wav_bytes(),
+                             headers={"Content-Type": "audio/wav"})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["modelId"], "asr-short")
+        self.assertEqual(r.json()["modelVersion"], "fake-v1")
+
+    def test_long_variant_reaches_the_long_model(self):
+        r = self.client.post("/v1/asr?variant=long", content=_wav_bytes(),
+                             headers={"Content-Type": "audio/wav"})
+        self.assertEqual(r.json()["modelId"], "asr-long")
+
+    def test_unknown_slot_named_by_model_is_a_clean_404(self):
+        """点名一个不存在的模型 → 干净的 `model_not_found`，不是 500。"""
+        r = self.client.post("/v1/asr?model=nope", content=_wav_bytes(),
+                             headers={"Content-Type": "audio/wav"})
+        self.assertEqual(r.status_code, 404, r.text)
+        self.assertEqual(r.json()["code"], "model_not_found")
+
     def test_diarize_returns_local_labels_and_space(self):
         r = self.client.post("/v1/diarize", content=_wav_bytes(),
                              headers={"Content-Type": "audio/wav"})
@@ -463,6 +484,78 @@ class TempWorkspaceTests(unittest.TestCase):
 
 # ---------------------------------------------------------------- 模型池
 
+class SlotRoutingTests(unittest.TestCase):
+    """**"宣告了"必须等于"路由得过去"。**
+
+    这是一条把两个方向都钉住的等价关系，起因是两个真实的、互不相干的漏洞：
+
+      1. `/v1/capabilities` 按 `[slot] + supports` 汇总能提供的槽，
+         而 `EnginePool._by_slot` 只按 `slot` 建索引 —— 于是服务端**宣告了
+         `asr.timestamps`，却路由不过去**（客户端照 capabilities 发请求收到 404）。
+         同一份事实在两处各算一遍，必然漂。
+      2. `POST /v1/asr?variant=short` 去要 `asr.short` 这个槽 ——
+         而**没有任何模型提供它**，于是短档一律 404。默认的 `variant=long`
+         把测试全带绿了，所以一直没露。
+
+    两个漏洞的症状是同一个：**客户端按服务端自己说的话办事，却被打回来。**
+    所以用例也写成一句话：`capabilities` 里列出的每个槽，`pick_for_slot` 都能解析。
+    """
+
+    def _pool(self):
+        return EnginePool([ModelSpec.from_dict(d) for d in FAKE_SPECS], {"fake": _fake_loader})
+
+    def test_supports_are_routable_not_just_advertised(self):
+        pool = self._pool()
+        self.assertEqual(pool.models_for_slot("asr.timestamps"), ["asr-long"],
+                         "长音频那个模型声明了 supports=[asr.timestamps]，就该能按它路由")
+        self.assertEqual(pool.models_for_slot("asr.text"), ["asr-short"])
+
+    def test_every_advertised_slot_is_routable(self):
+        """`capabilities` 说什么能提供，`pick_for_slot` 就得能选出模型来。"""
+        pool = self._pool()
+        advertised = pool.slots()
+        self.assertTrue(advertised)
+        for slot in sorted(advertised):
+            with self.subTest(slot=slot):
+                self.assertNotEqual(pool.pick_for_slot(slot), "",
+                                    "宣告了 %s 却路由不过去" % slot)
+
+    def test_capabilities_slots_come_from_the_pool_itself(self):
+        """**构造上的保证，不只是用例上的。**
+
+        `capabilities` 曾经自己按 `[slot] + supports` 汇总一遍，而池只按 `slot`
+        建索引 —— 同一份事实算两遍，于是漂了。现在它必须**取池里那一份**。
+        这条钉的是"取"这个动作：把池的那份改掉，`capabilities` 必须跟着变。
+        """
+        pool = self._pool()
+        pool._by_slot["asr.text"] = ["asr-long", "asr-short"]      # 人为改顺序
+        self.assertEqual(pool.slots()["asr.text"], ["asr-long", "asr-short"])
+        # 而且顺序是有意义的：pick_for_slot 取第一个
+        self.assertEqual(pool.pick_for_slot("asr.text"), "asr-long")
+
+    def test_slots_order_matches_what_pick_for_slot_returns(self):
+        """客户端看到的**第一个**模型＝它真会得到的那个（否则"预览"是假话）。"""
+        pool = self._pool()
+        for slot, ids in pool.slots().items():
+            with self.subTest(slot=slot):
+                self.assertEqual(ids[0], pool.pick_for_slot(slot))
+
+    def test_short_variant_is_not_a_phantom_slot(self):
+        """`variant=short` 要落到一个**真的有人提供**的槽上。
+
+        这条单独钉，是因为默认 `variant=long` 会让"短档 404"这条路径
+        在端点用例里**永远不会被走到**（见类注释）。
+        """
+        loaders = engines.build_loaders(device="cuda")
+        specs = engines.default_specs()
+        pool = EnginePool(specs, loaders)
+        for variant, want_slot in (("short", "asr.text"), ("long", "asr.long")):
+            with self.subTest(variant=variant):
+                self.assertIn(want_slot, [s.slot for s in specs],
+                              "variant=%s 想要的槽 %s 没有模型提供" % (variant, want_slot))
+                self.assertTrue(pool.pick_for_slot(want_slot))
+
+
 class EnginePoolTests(unittest.TestCase):
     def _pool(self, specs=None, **kw):
         return EnginePool(specs or [ModelSpec.from_dict(d) for d in FAKE_SPECS],
@@ -550,6 +643,87 @@ class EnginePoolTests(unittest.TestCase):
         self.assertEqual(st["asr-short"]["state"], "ready")
         self.assertEqual(st["asr-short"]["supports"], [])
         self.assertEqual(st["asr-long"]["supports"], ["asr.timestamps"])
+
+
+class DeviceAssertionTests(unittest.TestCase):
+    """服务端**不回退 CPU** —— 而且判据要按 impl 分开问。
+
+    这里钉的是一个真实存在过的漏洞：原来只问一句 `cuda_available()`
+    （ctranslate2 **或** torch 任一有 CUDA 就算有）。于是当这台机器
+    ctranslate2 有 CUDA、torch 没有（或反过来）时，`_assert_device` 放行，
+    紧接着**客户端引擎层自己的 `except -> CPU`** 把它悄悄降级成 CPU ——
+    正是这条铁律要拦的事，却从判据的缝里漏过去了。
+
+    现在按 impl 问它真正依赖的运行时，本类把这个判据钉住。
+    """
+
+    def test_sensevoice_is_judged_by_torch_not_ctranslate2(self):
+        """funasr 的 SenseVoice 按 `torch.cuda.is_available()` 决定设备。
+
+        ctranslate2 说有 CUDA **不算数** —— 那只证明 whisper 那边能用。
+        """
+        with patch.object(engines, "_runtime_has_cuda",
+                          side_effect=lambda rt: rt == "ctranslate2"):
+            with self.assertRaises(RuntimeError) as ctx:
+                engines._assert_device("sensevoice", "cuda")
+        self.assertIn("torch", str(ctx.exception))
+
+    def test_whisper_is_judged_by_ctranslate2(self):
+        """faster-whisper 走 ctranslate2，所以 torch 缺席不该拦它。"""
+        with patch.object(engines, "_runtime_has_cuda",
+                          side_effect=lambda rt: rt == "ctranslate2"):
+            engines._assert_device("whisper", "cuda")      # 不该抛
+
+    def test_cpu_specs_are_never_blocked(self):
+        """显式写 `device: cpu` 就是**接受** CPU，不该被拦（拦住反而是 bug）。"""
+        with patch.object(engines, "_runtime_has_cuda", return_value=False):
+            engines._assert_device("sensevoice", "cpu")
+            engines._assert_device("whisper", "cpu")
+
+    def test_sherpa_is_cpu_by_nature(self):
+        """sherpa-onnx 本来就是 CPU 引擎 —— 对它不存在"回退"这回事。"""
+        with patch.object(engines, "_runtime_has_cuda",
+                          side_effect=lambda rt: False):
+            engines._assert_device("sherpa", "cuda")
+
+    def test_no_cuda_at_all_refuses_every_gpu_impl(self):
+        with patch.object(engines, "_runtime_has_cuda", return_value=False):
+            for impl in ("sensevoice", "qwen3asr", "whisper"):
+                with self.assertRaises(RuntimeError, msg=impl):
+                    engines._assert_device(impl, "cuda")
+
+    def test_every_built_impl_has_a_declared_runtime(self):
+        """新加 impl 时必须**显式**说明它跑在哪个运行时上。
+
+        漏了会**默认按 torch 判**（`_IMPL_RUNTIME.get(impl, "torch")`）——
+        对 torch 系是对的，对别的就是碰运气。所以宁可这里红。
+        """
+        loaders = engines.build_loaders(device="cuda")
+        self.assertEqual(sorted(loaders), sorted(engines._IMPL_RUNTIME),
+                         "build_loaders 与 _IMPL_RUNTIME 的 impl 集合不一致")
+
+    def test_vector_loaders_actually_assert_the_device(self):
+        """**这条钉的是一个真出现过的漏洞。**
+
+        `diarize._load_pipeline` 内部是 `torch.device("cuda") if
+        torch.cuda.is_available() else torch.device("cpu")` —— 一句实打实的静默
+        CPU 回退。而 `_diarize_loader` / `_embed_loader` 起初**没有**查设备，
+        于是那句回退在服务端是可达的：模型"加载成功"了，只是慢十倍，
+        指标上还看不出原因。
+
+        所以直接拿真加载器试：没有 CUDA 时它**必须在建引擎之前**就抛，
+        而不是"建完再说"。`_load_pipeline` 被替换掉 —— 一旦设备检查漏了，
+        这个替身会被调用，用例就会以"不该被调用"的方式红，指得比以前清楚。
+        """
+        called = []
+        with patch("app.audio.diarize._load_pipeline",
+                   side_effect=lambda *a, **k: called.append(1)):
+            with patch.object(engines, "_runtime_has_cuda", return_value=False):
+                for impl in ("pyannote", "pyannote-embed"):
+                    loader = engines.build_loaders(device="cuda")[impl]
+                    with self.assertRaises(RuntimeError, msg=impl):
+                        loader(None)
+        self.assertEqual(called, [], "设备检查漏了：引擎在拒绝之前就被建起来了")
 
 
 class VectorSpaceFrozenTests(unittest.TestCase):

@@ -18,6 +18,13 @@ Python 无害，但 `server/` 是**只跑在 Linux 容器里**的那一半：Doc
 
 注：只查"声明在不在"与"当前字节干不干净"，**不**去查 git index 里的 blob
 （那需要跑 git，单测不该依赖 git 可执行文件在场）。
+
+这条守卫**当场抓过一次真事故**（2026-09-24）：一次临时的变异脚本用
+`pathlib.Path.read_text()` + `write_text()` 改 `server/routes.py`，
+在 Windows 上把整份文件悄悄转成了 CRLF —— `read_text` 按 universal newlines
+把 `\r\n` 归一成 `\n`，`write_text` 又按 `os.linesep` 把它们写回 `\r\n`。
+`edit` 工具不会这样，但**任何"读出来再写回去"的脚本都会**。
+所以改过 `server/` 下的文件之后，跑这个用例，别靠眼睛看。
 """
 import os
 import unittest

@@ -85,6 +85,14 @@ def create_app(cfg=None) -> FastAPI:
         log.info("echo-backend %s 起来了：listen=%s models=%d 并发上限=%d",
                  __version__, cfg.get("server.listen", ""), len(pool.status()),
                  cfg.max_concurrent)
+        # GPU 可见性单独吼一声。这台机器上 `models.device: cuda` 而看不到 CUDA 时，
+        # **每个**模型都会在加载时被拒（见 engines._assert_device）—— 那是刻意的，
+        # 但日志里得能一眼看出根因，而不是只看到一堆 model_failed。
+        _device = str(cfg.get("models.device", "cuda") or "cuda")
+        if _device == "cuda" and not engines.cuda_available():
+            log.warning("models.device=cuda，但本机看不到可用的 CUDA —— 所有模型都会"
+                        "在加载时被拒（服务端刻意不回退 CPU）。请检查显卡驱动 / "
+                        "容器 --gpus all / nvidia-container-toolkit。")
         try:
             yield
         finally:

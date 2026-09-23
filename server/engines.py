@@ -39,18 +39,71 @@ def cuda_available() -> bool:
         return False
 
 
-def _assert_device(device: str) -> None:
+#: impl → 它真正跑在哪个运行时上。**判据必须按 impl 分开**（原因见 `_assert_device`）。
+#: `sensevoice` / `qwen3asr` / `pyannote*` 都是 torch 系：`_get_sensevoice` 看的是
+#: `torch.cuda.is_available()`，`diarize._load_pipeline` 看的是 `torch.device("cuda")`
+#: 还是 `"cpu"`。`load_engine` 里那句"先 import ctranslate2"只是**导入顺序**的
+#: 规避（WinError 127），不是设备决定的依据 —— 别把它当成 ctranslate2 系。
+_IMPL_RUNTIME = {
+    "sensevoice": "torch",         # funasr AutoModel
+    "qwen3asr": "torch",           # funasr AutoModel + ForcedAligner
+    "whisper": "ctranslate2",      # faster-whisper
+    "sherpa": "cpu-ok",            # onnxruntime：本来就是 CPU 引擎，没有"回退"这回事
+    "pyannote": "torch",           # pyannote 分离管线
+    "pyannote-embed": "torch",     # 同一套管线的嵌入出口
+}
+
+
+def _runtime_has_cuda(runtime: str) -> bool:
+    """**只问真正会决定去留的那个运行时。**
+
+    为什么不能笼统地问 "本机有没有 CUDA"：客户端那两个 `_get_*` 各自按**自己**的
+    运行时决定设备 —— `_get_sensevoice` 看 `torch.cuda.is_available()`，
+    `_get_whisper` 看 ctranslate2 能不能建出模型。如果这台机器 ctranslate2 有 CUDA
+    而 torch 没有（或反过来），一句笼统的 "cuda_available()" 会放行，
+    然后**客户端那层自己的 `except -> CPU` 就把我们悄悄降级了** ——
+    正是这个函数要拦住的事。按 impl 问，才拦得住。
+    """
+    if runtime == "cpu-ok":
+        return True
+    if runtime == "torch":
+        try:
+            import torch
+            return bool(torch.cuda.is_available())
+        except Exception:
+            return False
+    try:
+        import ctranslate2
+        return ctranslate2.get_cuda_device_count() > 0
+    except Exception:
+        return False
+
+
+def _assert_device(impl: str, device: str) -> None:
     """服务端**不许静默回退 CPU**（设计 §3.4，与客户端刻意相反）。
 
     客户端单用户，偷偷回退 CPU 是对的（宁可慢也要出结果）；服务端一旦回退，
     会拖慢**所有**客户端，而且从指标上看不出原因。所以这里**在加载前**就失败，
     让客户端的那个引擎层根本没机会走它的 `except -> cpu` 分支。
+
+    **判据按 impl 分开问**（见 `_runtime_has_cuda`）—— 笼统地问"CUDA 可用吗"
+    会在两个运行时不一致的机器上放行，然后被客户端那层悄悄降级。
+
+    残留缺口（诚实记着）：`_get_whisper` / `_get_sensevoice` **内部**那个
+    `except -> CPU` 还包着"运行时说能用、但建模型时炸了"（cuDNN 版本不匹配之类）。
+    那种情况这里拦不住，因为失败发生在加载过程里。真正的堵法是给客户端引擎层加一个
+    `allow_cpu_fallback=False`，属于客户端侧改动，还没做。
     """
-    if device == "cuda" and not cuda_available():
+    if device != "cuda":
+        return
+    runtime = _IMPL_RUNTIME.get(impl, "torch")
+    if runtime == "cpu-ok":
+        return
+    if not _runtime_has_cuda(runtime):
         raise RuntimeError(
-            "这个模型要求 GPU，但本机没有可用的 CUDA —— 服务端不回退 CPU"
-            "（会把所有客户端一起拖慢）。请检查显卡驱动/容器 --gpus，"
-            "或把这个 spec 的 device 改成 cpu 并接受它的性能。")
+            "模型 %s 要求 GPU，但它依赖的运行时（%s）看不到可用的 CUDA —— "
+            "服务端不回退 CPU（会把所有客户端一起拖慢）。请检查显卡驱动/容器 --gpus，"
+            "或把这个 spec 的 device 改成 cpu 并接受它的性能。" % (impl, runtime))
 
 
 # ---------------------------------------------------------------- 语音转文本
@@ -111,7 +164,7 @@ class _SttEngine:
 
 def _stt_loader(engine_name: str, model: str, device: str):
     def load(spec: ModelSpec):
-        _assert_device(device)
+        _assert_device(engine_name, device)
         from app.audio import stt
         mdl = model
         if not mdl and engine_name == "qwen3asr":
@@ -126,7 +179,13 @@ def _stt_loader(engine_name: str, model: str, device: str):
 # ---------------------------------------------------------------- 说话人向量
 
 class _DiarizeEngine:
-    """说话人分离：出时间轴 + 每个说话人的嵌入。"""
+    """说话人分离：出时间轴 + 每个说话人的嵌入。
+
+    **必须过 `_assert_device`**（由加载器做）：`diarize._load_pipeline` 内部是
+    `torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")` ——
+    一句实打实的**静默 CPU 回退**。客户端单用户时它是对的（宁可慢也要出结果），
+    服务端上它就是"把所有人都拖慢且指标上看不出来"。所以这一层要在加载前拦住。
+    """
 
     def __init__(self):
         from app.audio import diarize
@@ -168,12 +227,25 @@ class _EmbedEngine:
             pass
 
 
-def _diarize_loader(_spec: ModelSpec):
-    return _DiarizeEngine()
+def _torch_loader(impl: str, device: str, factory):
+    """产出一个"先查设备、再建引擎"的加载器。
+
+    `_diarize_loader` / `_embed_loader` 原来**没有**查设备，于是 pyannote 那句
+    静默 CPU 回退在服务端是可达的 —— 这是一处真实的漏洞，不是风格问题。
+    收在这一个工厂里，将来再加 torch 系 impl 也不会漏。
+    """
+    def load(_spec: ModelSpec):
+        _assert_device(impl, device)
+        return factory()
+    return load
 
 
-def _embed_loader(_spec: ModelSpec):
-    return _EmbedEngine()
+def _diarize_loader(device: str):
+    return _torch_loader("pyannote", device, _DiarizeEngine)
+
+
+def _embed_loader(device: str):
+    return _torch_loader("pyannote-embed", device, _EmbedEngine)
 
 
 # ---------------------------------------------------------------- 注册表
@@ -185,8 +257,8 @@ def build_loaders(device: str = "cuda") -> Dict[str, object]:
         "qwen3asr": _stt_loader("qwen3asr", "", device),
         "whisper": _stt_loader("whisper", "", device),
         "sherpa": _stt_loader("sherpa", "", device),
-        "pyannote": _diarize_loader,
-        "pyannote-embed": _embed_loader,
+        "pyannote": _diarize_loader(device),
+        "pyannote-embed": _embed_loader(device),
     }
 
 

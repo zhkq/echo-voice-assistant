@@ -1481,6 +1481,10 @@ tmp:
 | 超过 `max_bytes` 时按最旧优先删，**不写爆盘** | ✅ | `TempWorkspaceTests.test_sweep_by_size_removes_oldest_first` |
 | 显存不足 → 拒绝（`gpu_oom`），**不是** OOM、**不是**悄悄用 CPU | ✅ | `EnginePoolTests.test_vram_budget_refuses_instead_of_oom` |
 | 加载失败如实报 `model_failed`，不静默回退 CPU | ✅ | `EnginePoolTests.test_load_failure_does_not_fall_back_to_cpu` |
+| 设备判据**按 impl 分开问**：sensevoice/qwen3asr/pyannote 看 torch，whisper 看 ctranslate2 | ✅ | `DeviceAssertionTests` |
+| 向量类加载器**也**查设备（pyannote 内部那句静默 CPU 回退必须够不到） | ✅ | `DeviceAssertionTests.test_vector_loaders_actually_assert_the_device` |
+| 新加 impl 必须显式声明运行时，不许靠默认值蒙 | ✅ | `DeviceAssertionTests.test_every_built_impl_has_a_declared_runtime` |
+| 显式 `device: cpu` 是**接受** CPU，不该被拦 | ✅ | `DeviceAssertionTests.test_cpu_specs_are_never_blocked` |
 | 并发要同一个模型 → loader 只被调用一次（单飞） | ✅ | `EnginePoolTests.test_single_flight` |
 | 推理中引用计数 > 0 的模型不被卸载 | ✅ | `EnginePoolTests.test_refcount_blocks_unload` |
 | LRU 驱逐最久未用的，**常驻的永不驱逐** | ✅ | `EnginePoolTests.test_lru_evicts_idle_but_never_resident` |
@@ -1497,6 +1501,7 @@ tmp:
 | 客户端中途断开后临时目录为空 | ⏳ | 需要真 ASGI 断连才能测 |
 | 预置残留文件 → 启动时清空（sweep on startup） | ⏳ | `Sweeper` 已实现，用例待补 |
 | 只读 rootfs + tmpfs 下跑通全部端点（容器冒烟） | ⏳ | v3，且只能在 Linux 上跑 |
+| 客户端引擎层内部那句 `except -> CPU` 也要能被关掉（`allow_cpu_fallback=False`） | ⏳ | 客户端侧改动：现在只拦得住"运行时说没 CUDA"，拦不住"运行时说能用、建模型时炸了" |
 
 > **为什么 §12 值得这么细。** 前面每一节的设计都有"如果没人看着就会退化"的地方：
 > 服务端会慢慢认识业务、临时文件会慢慢漏、GPU 会慢慢被 OOM 掉。
@@ -1524,5 +1529,29 @@ tmp:
    `vectorSpaceId`**，另一套只在客户端本地。多一套的收益远小于"两个向量空间"带来的复杂度。
 2. **`asr.short`（指令增强）要不要开？** 它会给服务端引入高频小请求。开了就要独立队列 +
    独立配额（前置文档已设计），不开则路由表里少一行。**建议 v1 不开**，先只服务会议链路。
+
+   > **v1 现状 ≠ 这条建议（2026-09-24，需要拍板）。** v1 骨架里**没有配额机制**
+   > （配额随 v2 的 JWT/scopes 一起做），所以"默认配额为 0"这句话今天是**没有执行者**的：
+   > `variant=short` 现在**是通的**，由常驻的 `asr-short`（SenseVoice）服务。
+   >
+   > 而且 `asr-short` 的 `resident: true` 在当前实现里是**纯开销** —— 文档给的理由是
+   > "会议档也用 SenseVoice"，但本实现的 `asr-long` 走的是 qwen3asr，没有任何内部调用方。
+   > 于是现在这一档"又占着显存、又对外开着"，与建议正好相反。
+   >
+   > 三条路，选一条（**建议第 3 条**，它最小且不会说谎）：
+   > 1. 真的实现配额（`specs[].quota` + 准入时校验）→ 最贴原设计，但属于 v2 工作量；
+   > 2. 给 spec 加 `served: false`（模型留着但不对外路由）→ 语义清楚，但是**新机制**，
+   >    不是文档里写的那个；
+   > 3. **v1 就把 `asr-short` 从出厂清单里去掉**，`variant=short` 让 `asr-long` 通过
+   >    `supports: [asr.text, ...]` 兜住（短请求只是"用大模型跑几秒音频"，慢一点但正确）。
+   >    等真要做指令增强时再把小模型加回来 —— 那时配额机制也一起有了。
 3. **TLS 用什么形态？** mTLS（内网证书，需 PKI）还是自签 + `client_id:secret`→JWT
    （自包含，无外部依赖）。**建议 v1 用后者**，把 mTLS 留给单位 PKI 就绪之后。
+4. **两级闸门在收完音频之后才判"忙"，是不是太晚？**（2026-09-24 实现时发现）
+   现在的顺序是 `收音频 → 转 wav → 抢闸门 → 推理`：忙的判定发生在**上传完成之后**。
+   好处是"慢上传不占着 GPU 通道"（通道是给推理的，不是给网络的）；
+   坏处是一个客户端可以同时开很多条上传，**每条都把最多 64 MB 落盘**，
+   然后才被 `409 client_busy` 顶回来 —— `tmp` 的容量上限会兜住盘，但那是一次真实的写放大。
+   **建议：在收音频之前先做一次"便宜的预检"**（这个 client 或全局是否已经满了 → 立刻拒，
+   不读 body），真正的槽位仍然只在推理前后持有。这样"满了立刻说系统忙"（用户的原始要求）
+   才在**字节层面**也成立，同时不改变"通道只归推理"的语义。
