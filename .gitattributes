@@ -4,6 +4,13 @@
 .githooks/** -text
 *.sh          -text
 
+# ---- 服务端（server/）只跑在 Linux 容器里，必须保持 LF ----
+# 仓库开着 core.autocrlf=true：Dockerfile 一旦在 checkout 时变成 CRLF，容器里的
+# /bin/sh 会把 \r 当成参数的一部分（`pip install -r requirements.txt\r`），
+# 构建报 "not found" 之类的怪错 —— 与 .sh 是同一类坑，只是它坏在镜像里而不是本机。
+# 契约由 tests/test_line_endings.py 钉住。
+server/** -text
+
 # ---- 模型文件一律按二进制处理（不做任何行尾转换）----
 # 仓库开着 core.autocrlf=true：若不声明，tokens.txt / en.phone / config.yaml 这类文本文件
 # 在 checkout 时会被转成 CRLF，而 tokens.txt 每行就是一个 token，末尾多出 \r 会改变 token 内容

@@ -1,0 +1,55 @@
+# ECHO 能力后端 —— 参考部署（Linux + Docker）。
+#
+#   docker compose -f server/compose.yaml up -d --build
+#
+# 三个刻意的选择：
+#   * `read_only: true` —— 根文件系统只读。**这是"服务端不存储业务数据"最有力的一层**：
+#     程序想往磁盘写东西会直接报错，而不是静默发生；审计范围因此缩小到下面那一个卷。
+#   * `queue_max=0` 写死在环境里 —— 通道满了直接拒，重试由客户端负责（设计 §3.6）。
+#   * `ECHO_MAX_CONCURRENT=2` —— 2026-09-23 定；上线后用真机压测校准
+#     （看"同时 2 路时单段耗时相对 1 路涨了多少"：涨得少说明还有余量）。
+services:
+  backend:
+    build:
+      context: ..
+      dockerfile: server/Dockerfile
+      args:
+        ECHO_EXTRA: "0"          # 改成 "1" 装上 torch 那组（SenseVoice / Qwen3-ASR / 说话人分离）
+    image: echo-backend:0.1.0
+    container_name: echo-backend
+    restart: unless-stopped
+    ports:
+      - "8900:8900"
+    environment:
+      ECHO_SERVER_ID: gpu-01
+      ECHO_LISTEN: "0.0.0.0:8900"
+      ECHO_MODELS_ROOT: /opt/echo/models
+      ECHO_TMP_ROOT: /var/echo/tmp
+      ECHO_MAX_CONCURRENT: "2"
+    volumes:
+      # 模型只读挂进来（几 GB，不该跟着镜像走）
+      - /srv/echo/models:/opt/echo/models:ro
+      # 临时文件：**唯一的可写处**。想更快就换成 tmpfs（见 Dockerfile 注释）
+      - /srv/echo/tmp:/var/echo/tmp
+    read_only: true
+    tmpfs:
+      - /tmp:size=512m,mode=1777
+    # GPU 直通：宿主装好 NVIDIA 驱动 + nvidia-container-toolkit 后即可用（设计 §9.2）
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8900/v1/health', timeout=4).status == 200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 60s
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"

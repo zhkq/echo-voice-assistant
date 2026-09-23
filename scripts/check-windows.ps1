@@ -74,7 +74,7 @@ function Invoke-Step([string]$name, [string]$exe, [string[]]$argv) {
 Write-Host "ECHO Windows gate - interpreter: $py" -ForegroundColor Green
 if (-not $Quiet) { Write-Host "repo: $root" }
 
-Invoke-Step 'compileall app mac scripts' $py @('-m', 'compileall', '-q', 'app', 'mac', 'scripts')
+Invoke-Step 'compileall app server mac scripts' $py @('-m', 'compileall', '-q', 'app', 'server', 'mac', 'scripts')
 Invoke-Step 'import smoke (entry modules)' $py @('-c', "import app.main, app.api, app.db, app.pathutil, app.modelinfo, app.llm_router, app.audio.tts, app.audio.wake, app.netguard; print('import smoke OK')")
 Invoke-Step 'platform contract tests' $py @('-m', 'unittest', '-q', 'tests.test_platform_contract')
 if (-not $Quick) {
@@ -100,7 +100,7 @@ if ($ruff) {
     $ruffExe = $ruff[0]
     $ruffArgs = @()
     if ($ruff.Count -gt 1) { $ruffArgs = $ruff[1..($ruff.Count - 1)] }
-    Invoke-Step 'ruff (undefined names F821 / syntax E9)' $ruffExe ($ruffArgs + @('check', '--select', 'F821,E9', 'app', 'mac', 'scripts'))
+    Invoke-Step 'ruff (undefined names F821 / syntax E9)' $ruffExe ($ruffArgs + @('check', '--select', 'F821,E9', 'app', 'server', 'mac', 'scripts'))
 } else {
     $results.Add('SKIP  ruff (install with: pip install -e .[dev]  or  uv tool install ruff)')
 }

@@ -1,0 +1,81 @@
+# ECHO 能力后端 —— 参考配置。
+#
+# 不给 `--config` 就用内置默认值 + 环境变量；这份文件是把默认值摊开写一遍，
+# 方便改。每一项的来历见 `docs/ECHO能力后端-服务端设计.md` §10。
+server:
+  id: gpu-01
+  listen: "0.0.0.0:8900"
+  instance_id: gpu01-a          # 临时目录的命名空间（多实例互不清扫对方）
+  vram_budget_mb: 20000         # 0 = 不限制；超预算**拒绝**而不是 OOM，也不回退 CPU
+
+limits:
+  # 2026-09-23 定：总通道 2、每客户端 1。
+  # **不排队** —— 满了直接拒（503 server_busy），重试由客户端负责。
+  max_concurrent: 2
+  per_client_concurrent: 1
+  queue_max: 0
+  busy_retry_after_s: 5
+  max_audio_seconds: 1800
+  max_upload_bytes: 67108864
+  load_timeout_s: 300
+  inference_timeout_s: 900
+
+tmp:
+  root: /var/echo/tmp           # 容器里挂的那一个可写卷；想更快就挂 tmpfs
+  ttl_hours: 4                  # 定时清理：删超过这么久的（**请求结束本来就会删**）
+  sweep_interval_s: 3600
+  max_bytes: 4294967296         # 超了先删最老的，而不是拒绝新请求
+
+models:
+  root: /opt/echo/models
+  device: cuda                  # cuda | cpu。**要 cuda 而没有 CUDA 时直接失败**，不回退
+  # 不写 specs 就用代码里的出厂清单（server/engines.py:default_specs）。
+  # 写出来是为了能改；`est_vram_mb` 与 `max_concurrency` 都是**占位值**，上线前要压测校准。
+  specs:
+    - id: asr-short             # 短音频（语音指令增强）：常驻，冷启动付一次
+      slot: asr.text
+      impl: sensevoice
+      resident: true
+      max_concurrency: 2
+      est_vram_mb: 1800
+      modelVersion: sensevoice-small
+    - id: asr-long              # 长音频（会议分段）：按需 + LRU；同时给时间戳
+      slot: asr.long
+      impl: qwen3asr
+      resident: false
+      max_concurrency: 1
+      est_vram_mb: 3900
+      modelVersion: qwen3-asr-0.6b
+      supports: [asr.text, asr.timestamps]
+    - id: diarize               # 说话人分离：**不是线程安全的**，并发只能 1
+      slot: diarize.turns
+      impl: pyannote
+      resident: false
+      max_concurrency: 1
+      est_vram_mb: 2600
+      modelVersion: pyannote-3.1-wespeaker-v1
+      vectorSpaceId: ws-resnet34-v1
+      dim: 256
+      supports: [diarize.embeddings]
+    - id: speaker-embed         # 说话人嵌入：与上面**同一个 vectorSpaceId**（要能互相比对）
+      slot: speaker.embed
+      impl: pyannote-embed
+      resident: false
+      max_concurrency: 1
+      est_vram_mb: 0
+      modelVersion: wespeaker-voxceleb-resnet34-LM-v1
+      vectorSpaceId: ws-resnet34-v1
+      dim: 256
+
+auth:
+  # **默认关**（本机起步）。监听地址不是回环时启动会大声告警 ——
+  # 不配鉴权就等于"谁连上谁能用你的 GPU"。
+  # 配对码 → client_id + secret → 短期 JWT 见设计 §7.4/§7.5（下一步）。
+  enabled: false
+  mode: token
+  tokens: []
+  # 打开后大概长这样：
+  #   enabled: true
+  #   tokens:
+  #     - { client_id: cli-07a3f2, token: "<32 字节随机>" }
+  #     - { client_id: cli-11b9c4, token: "<...>" }

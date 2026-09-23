@@ -1,0 +1,23 @@
+# ECHO 能力后端（服务端）自己的依赖 —— **与客户端那份刻意分开**。
+#
+# 客户端要"轻"（办公本、无 torch、约 350 MB）；服务端要"准"，重依赖放这边才对。
+fastapi>=0.115
+uvicorn[standard]>=0.30
+pydantic>=2.7
+PyYAML>=6.0
+numpy>=1.26
+soundfile>=0.12
+soxr>=0.3
+# 短音频转写（语音指令增强）。torch-free、单 wheel、CPU 也能跑。
+sherpa-onnx>=1.10
+
+# ---------------------------------------------------------------- 可选的重家伙
+#
+# 下面这组才是"为什么需要服务端"的原因，但它们体积大、要 GPU，所以**单独一层**：
+#
+#   funasr + torch                      → SenseVoice（短音频档，常驻）
+#   qwen-asr + transformers             → Qwen3-ASR（长音频档，带强制对齐）
+#   pyannote.audio + speechbrain        → 说话人分离 / 说话人嵌入
+#
+# 装法见 server/Dockerfile 的 ECHO_EXTRA 开关；不装也能起，只是
+# `/v1/capabilities` 里那些模型会如实报 `failed`（**不会假装就绪**）。
