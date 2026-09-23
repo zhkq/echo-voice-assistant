@@ -92,6 +92,10 @@ ACK_INDIRECT = {
     # （`_setting(spec["title_key"])`），所以扫描看不见字面量。消费方见那一行。
     "meetingWorkspaceTitle": "app/workspaces.py:36 _setting(title_key)：DSH「会议空间」分组名",
     "commandWorkspaceTitle": "app/workspaces.py:36 _setting(title_key)：DSH「指令空间」分组名",
+    # 按用途分的输入设备：app/audio/recorder.py 的 resolve_input_device() 查
+    # INPUT_DEVICE_KEYS 表读（键名来自表里的值，调用点上不是字面量）
+    "commandInputDeviceId": "app/audio/recorder.py:resolve_input_device() 查表读（指令/唤醒用哪个麦）",
+    "meetingInputDeviceId": "app/audio/recorder.py:resolve_input_device() 查表读（会议录音用哪个麦）",
 }
 
 #: 唯一消费方是面板 UI 的项（面板读它来改变自己的行为，app/ 不需要读）。

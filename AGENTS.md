@@ -2,6 +2,20 @@
 
 ## 必读：已知坑（务必牢记）
 
+### 重启/杀掉 ECHO 之前必须先看有没有正在录音的会议（2026-09-23 事故）
+
+- **事故**：为了改代码重启 ECHO，把用户**正在录的会议**打断了。ECHO 自己处理得很诚实 ——
+  起来时记 `[meeting] 检测到中断的会议（正在录音但进程已退出）：已标为 interrupted: <名字>`，
+  音频文件留在 `data/meetings/<名字>/` 里（可以重新转写），但这场录音**当场就断了**，
+  用户白录了一段。
+- **铁律**：任何会停/重启 ECHO 的操作（`stop.ps1`、杀 `app.main`、换包、换实例）之前，
+  先看 `GET /api/status` 的 `meeting.active`（或 `data/echo.pid` + 会议目录里正在增长的 `*.wav`）。
+  **`meeting.active == true` 就不要动** —— 先问用户，或等他录完。
+  顺带：刷新前端、改设置、跑单测都不需要重启；`PUT /api/settings` 是热生效的。
+- 附带结论：会议录音用的是**前台**麦克风租约（`recorder.py` 里 `input_stream(device_id)`
+  没有 `background=True`），所以**录音期间下语音指令会被拒**（"麦克风正在录音或测试"）。
+  想让"会议用全向麦 + 指令用耳机"真正并行，得让不同设备各自持有流，这是待办。
+
 ### 麦克风打不开 / 会议无法录音 / 进程 CPU 飙高 —— sd.default.device 下标取反 + CoreAudio HAL 死锁
 
 - **症状**：面板显示 `无法开始录音：打开麦克风超时（设备被占用或权限不足）`；`POST /api/control/mic/test` 挂住无响应；运行中的 `python mac/run_mac.py` 进程 CPU 长时间 >400%（线程空转）。

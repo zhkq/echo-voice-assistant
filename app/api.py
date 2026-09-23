@@ -1298,17 +1298,24 @@ def control_tts_test(_auth=Depends(optional_auth)):
 
 
 @router.post("/control/mic/test")
-def control_mic_test(_auth=Depends(optional_auth)):
-    """麦克风测试：统一占用保护；macOS 音频操作在可超时回收的子进程内。"""
+def control_mic_test(device: int = -1, purpose: str = "command",
+                     _auth=Depends(optional_auth)):
+    """麦克风测试：统一占用保护；macOS 音频操作在可超时回收的子进程内。
+
+    `device` 不给（-1）就按 `purpose` 解析：默认测**指令**那个麦
+    （`command` / `meeting`），这样"指令麦"和"会议麦"能分别试。
+    """
     import numpy as np
+    want = int(device) if int(device) >= 0 else recorder.resolve_input_device(purpose)
     try:
-        with recorder.input_stream(int(settings.get("inputDeviceId", -1))) as stream:
+        with recorder.input_stream(want) as stream:
             data, _ = stream.read(int(16000 * 1.0))
             rms = float(np.sqrt(np.mean((data.astype(np.float32) / 32768.0) ** 2)))
-            return {"ok": True, "device": stream.device, "rms": round(rms, 4)}
+            return {"ok": True, "device": stream.device, "rms": round(rms, 4),
+                    "purpose": purpose, "requested": want}
     except Exception as e:
         db.add_log("error", "api", f"mic test 失败: {e}")
-        return {"ok": False, "error": str(e)}
+        return {"ok": False, "error": str(e), "purpose": purpose, "requested": want}
 
 
 # ---------------------------------------------------------------- 启动编排

@@ -278,8 +278,9 @@ class WakeListener(threading.Thread):
 
         detector = self._make_detector()
 
-        device = int(self.settings_get("inputDeviceId", -1))
-        device = device if device >= 0 else None
+        from app.audio.recorder import resolve_input_device
+        _dev = resolve_input_device("command")   # 唤醒属于"指令"侧，与指令同一个麦
+        device = _dev if _dev >= 0 else None
         # device=None → sounddevice 自动使用系统默认输入设备（实测正确落到可用麦克风）。
         # 切勿用 sd.default.device[1] 硬取索引：本机该索引可能指向扬声器/失效设备导致打开失败。
         print(f"[wake] 输入设备: {device if device is not None else '系统默认'}", flush=True)

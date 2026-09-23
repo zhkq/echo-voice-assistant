@@ -118,6 +118,42 @@ def default_input_device():
         return None
 
 
+#: 用途 → 它自己的输入设备设置键。**通用项 `inputDeviceId` 始终是兜底**，
+#: 这样老配置一个键就把两个用途都定了，行为不变（不需要数据迁移）。
+INPUT_DEVICE_KEYS = {
+    "command": "commandInputDeviceId",   # 指令 / 唤醒 / 麦克风按钮
+    "meeting": "meetingInputDeviceId",   # 会议录音
+}
+
+
+def resolve_input_device(purpose="command"):
+    """按用途解析要用的输入设备 id（-1 = 交给 PortAudio 选系统默认）。
+
+    2026-09-23 用户需求："指令用耳机收音、会议用全向麦（MAXHUB）" —— 之前只有一个
+    `inputDeviceId`，会议与指令只能共用同一个麦。优先级：
+
+        该用途自己的设置（>=0 才算） → 通用 `inputDeviceId` → -1
+
+    取不到设置时返回 -1（= 系统默认），绝不抛异常：录音路径不该因为读配置失败就打不开麦。
+    """
+    key = INPUT_DEVICE_KEYS.get(purpose, "")
+    try:
+        from app.config import settings
+        if key:
+            try:
+                own = int(settings.get(key, -1))
+            except (TypeError, ValueError):
+                own = -1
+            if own >= 0:
+                return own
+        try:
+            return int(settings.get("inputDeviceId", -1))
+        except (TypeError, ValueError):
+            return -1
+    except Exception:
+        return -1
+
+
 def _write_wav(path, frames, sr=SAMPLE_RATE):
     data = np.concatenate(frames) if isinstance(frames, list) else frames
     with wave.open(path, "wb") as w:

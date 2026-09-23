@@ -102,6 +102,36 @@ def _effective_options(key, meta):
     """某个配置项在当前平台上的实际候选项。"""
     return platform_options(key, meta.get("options", []))
 
+
+#: 输入设备下拉项的 TTL 缓存（30 秒）。
+#: 设备会插拔，所以选项必须**运行时**取；但也不该每刷一次面板就查一次 PortAudio
+#: （mac 上的音频查询还可能把 CoreAudio HAL 卡住，见 AGENTS.md 的头号坑）。
+_INPUT_OPTIONS = {"at": 0.0, "items": []}
+
+
+def _audio_input_options(max_age=30.0):
+    """面板下拉用的输入设备项：``[{value, label}]``（value = 设备索引，-1 = 系统默认）。
+
+    `value` 与 `label` 分开，是因为面板的 `<select>` 要"值给程序、名字给人看"：
+    `3 · 耳机 (Realtek)` 这种字符串没法当 int 存回设置里。
+    """
+    import time as _time
+    now = _time.time()
+    if _INPUT_OPTIONS["items"] and (now - _INPUT_OPTIONS["at"]) < max_age:
+        return _INPUT_OPTIONS["items"]
+    items = [{"value": -1, "label": "系统默认（-1）"}]
+    try:
+        from app.audio import recorder
+        for d in recorder.list_input_devices():
+            items.append({"value": int(d["index"]),
+                          "label": "%s · %s" % (d["index"], d["name"])})
+    except Exception as e:
+        # 取不到就只留"系统默认"，并把原因写进 label —— 别让下拉空着，也别假装有设备
+        return [{"value": -1, "label": "系统默认（设备列表取不到：%s）" % e}]
+    _INPUT_OPTIONS["at"] = now
+    _INPUT_OPTIONS["items"] = items
+    return items
+
 # ---- 极简回复要求文案（两个版本都保留：V1 是已落库的旧默认值，用于迁移比对）----
 # V1：只回极简结论、详情留在会话里。
 _MINIMAL_REPLY_HINT_V1 = (
@@ -252,8 +282,25 @@ DEFAULTS = {
                             description="开口后多长时间没声音就放弃", value_type="int"),
     "maxRecordMs":     dict(value=30000, grp="voice", sub="record", label="最长录音毫秒",
                             description="单次命令录音上限", value_type="int"),
-    "inputDeviceId":   dict(value=-1, grp="voice", sub="record", label="输入设备 ID",
-                            description="-1=系统默认麦克风", value_type="int"),
+    "inputDeviceId":   dict(value=-1, grp="voice", sub="record", label="默认输入设备",
+                            description="指令、唤醒、会议都用它；下面两项可以各自覆盖。"
+                                        "-1 = 跟随系统默认麦克风",
+                            value_type="int", options_from="audio_inputs"),
+    # 2026-09-23 用户需求："指令用耳机收音、会议用全向麦（MAXHUB）" —— 之前只有一个
+    # inputDeviceId，会议与指令只能共用一个麦。**通用项仍是兜底**（-1 = 跟随它），
+    # 所以老配置不需要任何数据迁移，行为一个字都不变。
+    "commandInputDeviceId": dict(value=-1, grp="voice", sub="record",
+                                 label="指令/唤醒输入设备",
+                                 description="语音指令（媒体键/热键/唤醒/麦克风按钮）从哪个设备收音。"
+                                             "想让耳机上的媒体键触发、并用耳机麦说话，就在这里选耳机。"
+                                             "-1 = 跟随上面的默认输入设备",
+                                 value_type="int", options_from="audio_inputs"),
+    "meetingInputDeviceId": dict(value=-1, grp="voice", sub="record",
+                                 label="会议录音输入设备",
+                                 description="会议从哪个设备录音。会议室里选全向麦（如 MAXHUB）"
+                                             "比笔记本内置麦好得多。"
+                                             "-1 = 跟随上面的默认输入设备",
+                                 value_type="int", options_from="audio_inputs"),
     "consumeMediaKey": dict(value=True, grp="voice", sub="record", label="拦截媒体键",
                             description="触发后不向系统透传媒体键", value_type="bool"),
     # ---------- 语音命令 → 提示音与通知（二级子分组）----------
@@ -696,6 +743,9 @@ class Settings:
             r["order"] = SETTING_ORDER.get(r["key"], len(DEFAULTS))
             # 二级子分组（可选）：同一个 grp 内的再分节，面板渲染成可折叠的小节
             r["sub"] = meta.get("sub", "")
+            if meta.get("options_from") == "audio_inputs":
+                # 输入设备的下拉项在**运行时**注入：设备会插拔，静态写进库会过期。
+                r["options"] = _audio_input_options()
             if meta.get("secret"):
                 r["hasValue"] = bool(str(r.get("value") or "").strip())
                 r["value"] = ""

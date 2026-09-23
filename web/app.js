@@ -6,6 +6,13 @@ const $$ = (sel, root = document) => [...(root || document).querySelectorAll(sel
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g,
   (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
+/** 候选项统一成 `{value,label}` 两种形态都吃：
+ *  字符串（枚举，值即名字）与 `{value,label}`（值给程序、名字给人看 —— 例如输入设备的
+ *  「3 · 耳机 (Realtek)」，那个字符串没法当 int 存回设置里）。 */
+const optionPairs = (options) => (options || []).map((o) => (o && typeof o === "object")
+  ? { value: o.value, label: o.label != null ? o.label : o.value }
+  : { value: o, label: o });
+
 async function api(path, opts = {}) {
   const res = await fetch(path, {
     headers: { "Content-Type": "application/json" },
@@ -1245,8 +1252,8 @@ function agentDetailHtml() {
                ${cur_val ? "checked" : ""}>`;
     } else if (s.options && s.options.length) {
       ctl = `<select class="ctl" id="${id}" data-agent-field="${esc(s.key)}">` +
-        s.options.map((o) => `<option value="${esc(o)}" ${String(o) === String(cur_val) ? "selected" : ""}>` +
-          `${esc(o)}</option>`).join("") + `</select>`;
+        optionPairs(s.options).map((o) => `<option value="${esc(o.value)}" ${String(o.value) === String(cur_val) ? "selected" : ""}>` +
+          `${esc(o.label)}</option>`).join("") + `</select>`;
     } else {
       ctl = `<input class="ctl" id="${id}" data-agent-field="${esc(s.key)}" value="${esc(cur_val || "")}">`;
     }
@@ -2475,8 +2482,10 @@ function renderSettingRow(s) {
   } else if (s.value_type === "bool") {
     ctl = `<input type="checkbox" class="ctl" id="${id}" data-key="${s.key}" ${s.value ? "checked" : ""}>`;
   } else if (s.options && s.options.length) {
+    // 候选项两种形态：字符串（枚举）与 {value,label}（值给程序、名字给人看 ——
+    // 例如输入设备：value 是设备索引，label 是「3 · 耳机 (Realtek)」）。
     ctl = `<select class="ctl" id="${id}" data-key="${s.key}">` +
-      s.options.map((o) => `<option value="${esc(o)}" ${String(o) === String(s.value) ? "selected" : ""}>${esc(o)}</option>`).join("") +
+      optionPairs(s.options).map((o) => `<option value="${esc(o.value)}" ${String(o.value) === String(s.value) ? "selected" : ""}>${esc(o.label)}</option>`).join("") +
       `</select>`;
   } else if (s.value_type === "int" || s.value_type === "float") {
     ctl = `<input type="number" step="${s.value_type === "float" ? "any" : "1"}" class="ctl" id="${id}" data-key="${s.key}" value="${esc(s.value)}">`;

@@ -23,6 +23,7 @@ from app.config import settings
 from app.dsh import get_client, DshError
 from app.audio import stt as stt_mod
 from app.audio import tts as tts_mod
+from app.audio import recorder
 from app.audio.recorder import record_command
 
 BASE_DIR = paths.echo_root()
@@ -324,7 +325,7 @@ def _capture_worker(source):
             silence_threshold=float(cfg.get("silenceThreshold", 0.012)),
             hangover_ms=int(cfg.get("silenceHangoverMs", 1100)),
             no_speech_abort_ms=int(cfg.get("noSpeechAbortMs", 4000)),
-            device_id=int(cfg.get("inputDeviceId", -1)),
+            device_id=recorder.resolve_input_device("command"),
             # 复用录音器已有的电平回调（不开额外采样流，避免历史上 PortAudio 崩溃问题）
             level_cb=lambda v: _capture_level.__setitem__("value", float(v)),
         )
@@ -333,7 +334,7 @@ def _capture_worker(source):
             tts_mod.play_beep("done")
         if not ok:
             db.add_log("warn", "assistant",
-                       f"未检测到有效语音（设备={cfg.get('inputDeviceId', -1)}，"
+                       f"未检测到有效语音（设备={recorder.resolve_input_device('command')}，"
                        f"阈值={cfg.get('silenceThreshold', 0.012)}）")
             tts_mod.play_beep("err")
             if cfg.get("notifyOnSend", True):

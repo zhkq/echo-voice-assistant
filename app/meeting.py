@@ -22,7 +22,7 @@ import app.db as db
 from app.config import settings
 from app.dsh import get_client
 from app import paths, worklog
-from app.audio.recorder import MeetingRecorder
+from app.audio.recorder import MeetingRecorder, resolve_input_device
 from app.audio import stt as stt_mod
 from app.audio import tts as tts_mod
 from app import services
@@ -173,7 +173,7 @@ def start_meeting():
         recorder = MeetingRecorder(
             folder,
             segment_minutes=int(cfg.get("meetingSegmentMinutes", 10)),
-            device_id=int(cfg.get("inputDeviceId", -1)),
+            device_id=resolve_input_device("meeting"),
             level_cb=lambda lv: _state.update(level=lv),
         )
         recorder.start()
