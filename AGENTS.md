@@ -2,6 +2,32 @@
 
 ## 必读：已知坑（务必牢记）
 
+### 开发/稳定版怎么走：dev 里开发 → 稳定后推 git → **按用户指令**才同步稳定版（2026-09-23 用户定的规矩）
+
+- **两棵树是各自独立的代码副本**：`C:\echo-dev`（dev 环境 / 仓库）与 `D:\ECHO`（稳定版安装）。
+  稳定版跑它自己的 `app/`、读自己的 `data/`；**改仓库不会自动影响稳定版**。
+- 用户的规矩（原话："以后开发在 dev 环境，稳定后再推送 git，同时根据我的指令同步推稳定版"）：
+  1. 开发只在 `C:\echo-dev` 里做；
+  2. **稳定了才 `git push`**（不要为了"先存一下"就推半成品）；
+  3. 同步到稳定版**只在用户明确说"同步 / 部署到稳定版"时**做 —— 不许当成"顺手修一下"的副作用。
+- **同步稳定版只有一个入口**：`scripts/deploy-stable.ps1`。它会：
+  ① 发现有会议正在录就**拒绝**（exit 2）；② 工作树脏就拒绝；③ 用 `build_kit.py` 出包
+  （与用户拿到的是**同一个产物**）；④ 把 `<kit>\ECHO\*` 覆盖到 `D:\ECHO`
+  （`data\` `models\` `runtime-core\` 不在包里，原样保留）＋ 把安装技能覆盖到
+  `<DestDir>\.dsh\skills\echo-install\`；⑤ 覆盖后 `compileall` + import 冒烟；
+  ⑥ **只有加 `-Restart` 才重启 ECHO**。`-DryRun` 只报计划。
+  **流程：先 `-DryRun` 看计划 → 报给用户 → 用户点头 → 再真跑。**
+- **第一次事故（2026-09-23）**：为了让修复"立刻生效"，我手工把 19 个文件拷进 `D:\ECHO`
+  并重启，结果把用户**正在录的会议**打断了（ECHO 把它记成 `interrupted`，音频留着但录音断了）。
+  两条铁律由此而来：
+  * **不许手工往 `D:\ECHO` 拷文件** —— 要同步就走 `deploy-stable.ps1`；
+  * **任何停/重启 ECHO 的动作之前，先看 `GET /api/status` 的 `meeting.active`**。
+- **切换器不再住在仓库里**：`scripts/install-switcher.ps1` 把 `echo-supervisor.ps1` +
+  `echo-instance-lib.ps1` + 启动 vbs 装到 `%USERPROFILE%\.echo-switch\`，并把开机自启动指过去。
+  这样删掉/搬走 dev 树，稳定版照样开机自启。**别再用 `switch-instance.ps1 -InstallAutostart`**
+  —— 它会把自启动指回仓库（这正是被替换掉的那个耦合）。
+- 现状以 `scripts\switch-instance.ps1 -Status` 与 `GET /api/status` 为准，不要凭记忆。
+
 ### 重启/杀掉 ECHO 之前必须先看有没有正在录音的会议（2026-09-23 事故）
 
 - **事故**：为了改代码重启 ECHO，把用户**正在录的会议**打断了。ECHO 自己处理得很诚实 ——
