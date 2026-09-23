@@ -19,6 +19,7 @@ gh api repos/zhkq/echo-voice-assistant/releases/tags/v2.0.0 --jq .body > docs/re
 |---|---|---|---|
 | v2.0.0 | 2026-09-23 | [v2.0.0.md](v2.0.0.md) | [链接](https://github.com/zhkq/echo-voice-assistant/releases/tag/v2.0.0) |
 | v2.0.1 | 2026-09-23 | [v2.0.1.md](v2.0.1.md) | [链接](https://github.com/zhkq/echo-voice-assistant/releases/tag/v2.0.1) |
+| v2.0.2 | 2026-09-23 | [v2.0.2.md](v2.0.2.md) | [链接](https://github.com/zhkq/echo-voice-assistant/releases/tag/v2.0.2) |
 | v1.0.0 | 2026-09-18 | （未存档 —— 该惯例从 v2.0.0 起） | [链接](https://github.com/zhkq/echo-voice-assistant/releases/tag/v1.0.0) |
 
 发版流程见 [REFACTOR-PLAN §13](../REFACTOR-PLAN.md)；出包见仓库根的
