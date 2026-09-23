@@ -38,6 +38,53 @@ _busy_owner = {"name": None, "phase": None}
 # 收音阶段的实时电平（0~1），由 record_command 的 level_cb 更新，面板据此画波形
 _capture_level = {"value": 0.0}
 
+# ---------------------------------------------------------------- 让出麦克风（D1 单向抢占）
+#
+# 2026-09-23：会议开始录音时，如果语音指令正占着**会议要用的那个设备**，要让出。
+#
+# **为什么只允许这一个方向**（见 docs/统一路由-模型能力与设备.md §3.6.1）：
+#   会议 → 指令：被中断的是一句 ≤30 秒的语音指令，代价是"重说一遍" → 可以；
+#   指令 → 会议：被中断的可能是两小时的录音，代价是"白录一场" → 绝对不行。
+# 判据是"被中断的代价"，不是"谁优先级高"。
+#
+# 麦克风只在 record_command 期间被持有（转写、发 DSH 都不占麦），
+# 所以"指令正占着麦"的窗口就是**录那几秒** —— 先等它自然收尾，超时才中止。
+_capture_stop = threading.Event()     # 置位 = 请当前采集立刻停止（record_command 会在帧边界返回）
+_capture_active = threading.Event()   # 置位 = 此刻**正持有麦克风**（只覆盖 record_command）
+
+
+def cancel_capture(reason="开始会议录音"):
+    """请求中止当前语音指令的采集（目前只有"会议要开麦"这一条路会调）。
+
+    返回 True 表示真的发出了中止请求（当时确实在采集）。
+    """
+    if not _capture_active.is_set():
+        return False
+    _capture_stop.set()
+    try:
+        db.add_log("info", "assistant", f"语音指令已取消：{reason}（让出麦克风）")
+    except Exception:
+        pass
+    return True
+
+
+def yield_capture_for_meeting(timeout=3.0):
+    """会议要开麦了：先等指令**自然收尾**，超时才中止它。
+
+    等一等是划算的：多数情况用户已经说完、采集就在收尾（几秒），
+    这样**用户无感、那句指令也不丢**；只有真说了很长的话才动中止。
+
+    返回 True 表示"等不及、中止了"（调用方可以据此提示）。
+    """
+    if not _capture_active.is_set():
+        return False
+    deadline = time.time() + max(0.0, float(timeout))
+    while _capture_active.is_set() and time.time() < deadline:
+        time.sleep(0.05)
+    if not _capture_active.is_set():
+        return False                      # 自己收尾了，指令没丢
+    return cancel_capture("开始会议录音")
+
 # 等 DSH 回复的上限（秒）。2026-09-17 之前是 90 秒：语音问"查一下/解释一下"这类
 # 需要读代码的问题时，DSH 还在作答就被判超时，回复被丢掉（命令状态仍是 done，
 # 但 reply/brief 为空、也没有语音简报）。放宽到 300 秒。
@@ -356,20 +403,32 @@ def _capture_worker(source):
 
         wav = os.path.join(CAPTURES_DIR, f"voice-{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}.wav")
         set_phase("listening")
-        ok = record_command(
-            wav,
-            max_ms=int(cfg.get("maxRecordMs", 30000)),
-            silence_threshold=float(cfg.get("silenceThreshold", 0.012)),
-            hangover_ms=int(cfg.get("silenceHangoverMs", 1100)),
-            no_speech_abort_ms=int(cfg.get("noSpeechAbortMs", 4000)),
-            device_id=recorder.resolve_input_device("command"),
-            # 复用录音器已有的电平回调（不开额外采样流，避免历史上 PortAudio 崩溃问题）
-            level_cb=lambda v: _capture_level.__setitem__("value", float(v)),
-        )
+        _capture_stop.clear()
+        _capture_active.set()      # 从这里到 finally：正持有麦克风（会议侧据此决定等还是中止）
+        try:
+            ok = record_command(
+                wav,
+                max_ms=int(cfg.get("maxRecordMs", 30000)),
+                silence_threshold=float(cfg.get("silenceThreshold", 0.012)),
+                hangover_ms=int(cfg.get("silenceHangoverMs", 1100)),
+                no_speech_abort_ms=int(cfg.get("noSpeechAbortMs", 4000)),
+                device_id=recorder.resolve_input_device("command"),
+                # 复用录音器已有的电平回调（不开额外采样流，避免历史上 PortAudio 崩溃问题）
+                level_cb=lambda v: _capture_level.__setitem__("value", float(v)),
+                # D1：会议要开麦时置位它，采集会在下一帧返回（不再等静音收尾）
+                stop_event=_capture_stop,
+            )
+        finally:
+            _capture_active.clear()
         set_phase("transcribing")
         if cfg.get("beepOnDone", True):
             tts_mod.play_beep("done")
         if not ok:
+            if _capture_stop.is_set():
+                # 被"会议要开麦"中止的：这句指令本来就不该继续，**不要说"没听清"**
+                # （那句话会误导用户以为是识别问题，他会再说一遍，然后又撞上会议）
+                db.add_log("info", "assistant", "语音指令已取消（让出麦克风给会议录音）")
+                return
             db.add_log("warn", "assistant",
                        f"未检测到有效语音（设备={recorder.resolve_input_device('command')}，"
                        f"阈值={cfg.get('silenceThreshold', 0.012)}）")

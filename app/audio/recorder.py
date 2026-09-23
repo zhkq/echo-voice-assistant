@@ -20,10 +20,15 @@ from app.audio.mic import input_stream
 
 SAMPLE_RATE = 16000
 
-# 名字里带这些词的，基本都是"虚拟 / 映射 / 回环 / 汇总"设备：**兜底遍历**时不主动去开它们。
-# 为什么：macOS 上打开这类设备可能把 CoreAudio HAL 卡死（issue #15：麦克风永久超时 + CPU 400%），
+# 名字里带这些词的，基本都是"虚拟 / 映射 / 回环 / 汇总"设备：不主动去开它们。
+# 为什么：macOS 上打开这类设备可能把 CoreAudio HAL 卡死（issue #15：麦克风永久超时 + CPU 400%）——
+# AGENTS.md 里那次事故之后**任何**麦克风操作都会永久超时，只能重启 ECHO；
 # Windows 上则常见"录到静音或系统声音"（本机 idx0 就是「Microsoft 声音映射器」）。
-# 注意：只过滤兜底遍历；用户显式指定的设备、以及系统默认输入都不受此限制。
+#
+# 2026-09-23（D2）起，挡的范围从"兜底遍历"扩到**用户显式指定**：
+# 那次事故走的正是"用户手动选了 Oray / iPhone 麦克风"这条路，兜底过滤拦不住。
+# 被拦时日志会说清怎么放行（隐藏设置 `allowVirtualInputDevice`）。
+# **只有系统默认输入不受限制** —— 那是用户在操作系统层面选的，拦了就等于没有麦可用。
 _VIRTUAL_HINTS = ("声音映射器", "sound mapper", "映射器", "立体声混音", "stereo mix",
                   "virtual", "虚拟", "voicemeeter", "vb-audio", "cable", "loopback",
                   "blackhole", "soundflower", "aggregate", "汇总", "oray",
@@ -241,6 +246,13 @@ def resolve_input_device(purpose="command"):
             continue
         idx = find_input_device(raw)
         if idx is not None and idx >= 0:
+            # 2026-09-23 D2：**显式指定也要过黑名单**。
+            # 老配置里可能存的是**索引**（会漂），所以按 idx 反查当前名字，
+            # 查不到就退回配置值本身 —— 宁可少拦一次，也不要因为查不到名字就放行。
+            name = _device_name_by_index(idx) or raw
+            if _is_virtual_device(name) and not allow_virtual_input():
+                _warn_virtual_device(key, name, label)
+                return -1              # 回退系统默认（与"设备不在位"同一策略）
             return idx
         if idx is not None and idx < 0:
             return -1
@@ -248,6 +260,46 @@ def resolve_input_device(purpose="command"):
         _warn_missing_device(key, raw, label)
         return -1                      # 回退系统默认（用户定的策略）
     return -1
+
+
+def allow_virtual_input():
+    """是否允许使用虚拟/接力类输入设备（隐藏设置，默认否）。
+
+    读不到配置时返回 False —— 安全侧默认：宁可拦住，也不要冒"麦克风永久失效"的风险。
+    """
+    try:
+        from app.config import settings
+        return bool(settings.get("allowVirtualInputDevice", False))
+    except Exception:
+        return False
+
+
+def _device_name_by_index(index):
+    """按当前设备清单把索引反查成名字；查不到返回空串。
+
+    为什么要反查：老配置里的设备值可能是**索引**，而索引会随在位设备增减整体平移
+    （`find_input_device` 的注释里记着这个坑），所以黑名单必须按"当前这个名字"判。
+    """
+    try:
+        for d in list_input_devices_cached():
+            if int(d.get("index", -1)) == int(index):
+                return str(d.get("name") or "")
+    except Exception:
+        pass
+    return ""
+
+
+def _warn_virtual_device(key, name, label):
+    """选中的是虚拟/接力设备 → 拒绝并**说清怎么放行**（绝不静默换麦）。"""
+    try:
+        from app import db
+        db.add_log("warn", "audio",
+                   f"配置的{label}输入设备「{name}」是虚拟/接力类设备（{key}），已拒绝使用、"
+                   f"本次回退系统默认麦克风。这类设备不是真麦克风，打开它们可能把系统音频服务"
+                   f"卡死（macOS 上实测过：之后任何麦克风操作都失效，只能重启 ECHO）。"
+                   f"确实需要就在设置里打开「允许使用虚拟/接力输入设备」。")
+    except Exception:
+        pass
 
 
 def _warn_missing_device(key, wanted, label):

@@ -82,10 +82,31 @@ class CatalogAlignmentTests(unittest.TestCase):
                 bad.append("%s: modelinfo=%s组件=%s" % (mid, mi_mb, comp_mb))
         self.assertEqual(bad, [], "同一组件的体积在两份清单里差太多：%s" % bad)
 
-    def test_required_component_is_runtime_only(self):
-        """必装项只应是运行时核心：模型都该由向导按环境逐项问（D23），不该默认必装。"""
+    def test_required_components_are_runtime_and_the_command_engine(self):
+        """必装项 = 运行时核心 + **语音指令的转写引擎**。
+
+        D23 的原意是"模型都该由向导按环境逐项问，不该默认必装" —— 这条**仍然成立**，
+        所以**会议转写模型（sensevoice / whisper / qwen3asr）依旧全部可选**。
+
+        2026-09-23 对 `stt-sherpa` 开了一个**有意的例外**，理由两条：
+
+          1. 指令转写是 ECHO 的核心交互链路，**不允许依赖服务端可用性**
+             （3.0 设计里的铁律 L3）；
+          2. 那天的实测事故证明"靠向导逐项问"在这件事上**问不住** ——
+             稳定版 `models/sherpa-onnx-streaming` 齐全、面板报「已就绪」，
+             而 runtime-core 里没装 `sherpa_onnx`：每次语音指令都在转写处抛
+             ModuleNotFoundError，面板一声不响、DSH 什么都没收到。
+             用户根本不知道该去装什么。
+
+        例外**只开给这一个**（它同时是 pip 引擎与模型，且是指令链路必需品）；
+        下面第二条断言就是这条例外的边界。
+        """
         req = [i["id"] for i in components.load_manifests() if i.get("required")]
-        self.assertEqual(req, ["runtime-core"])
+        self.assertEqual(req, ["runtime-core", "stt-sherpa"])
+        models_required = [i["id"] for i in components.load_manifests()
+                           if i.get("required") and i.get("kind") in MODEL_KINDS]
+        self.assertEqual(models_required, ["stt-sherpa"],
+                         "除语音指令引擎外，不许再有模型类组件变成必装（D23 仍然有效）")
 
     def test_model_components_declare_model_id(self):
         """模型类组件必须写明 `model_id`（2026-09-19 合并「模型/组件」页签时加的）。

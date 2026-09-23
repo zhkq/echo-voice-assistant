@@ -170,6 +170,22 @@ def start_meeting():
             stt_model=meta["config"]["sttModel"], stt_device=meta["config"]["sttDevice"],
             diarize=1 if meta["config"]["diarize"] else 0)
 
+        # 2026-09-23（D1 单向抢占）：会议要开麦了，先请**正在收音**的语音指令让出。
+        #
+        # 为什么只允许这个方向：被中断的是一句 ≤30 秒的指令（重说一遍就行），
+        # 而会议可能两小时 —— 反过来让指令打断会议就是白录一场
+        # （AGENTS.md 里那次事故正是这类伤害）。见 docs/统一路由-模型能力与设备.md §3.6.1。
+        #
+        # 先等它自然收尾（多数情况用户已说完、几秒内就结束 → 用户无感、指令也不丢），
+        # 超时才中止。麦克风只在收音期间被持有，转写/等 DSH 都不占麦。
+        try:
+            from app import assistant as _assistant
+            if _assistant.yield_capture_for_meeting(timeout=3.0):
+                db.add_log("info", "meeting",
+                           "开始录音：上一条语音指令因让出麦克风被取消（等了 3 秒仍未收尾）")
+        except Exception as e:                      # 抢占失败不该挡住会议
+            db.add_log("warn", "meeting", f"让出麦克风的处理失败（不影响录音）：{e}")
+
         recorder = MeetingRecorder(
             folder,
             segment_minutes=int(cfg.get("meetingSegmentMinutes", 10)),

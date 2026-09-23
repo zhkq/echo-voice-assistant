@@ -30,8 +30,16 @@ from typing import Dict, List, Optional, Tuple
 #: 组件类别
 KINDS = ("runtime", "accel", "stt", "diarize", "wake", "tts", "agent")
 
-#: 必装组件（首装只装它，其余由向导逐项问，见 D23）
-REQUIRED_IDS = ("runtime-core",)
+#: 必装组件（首装就装这些；其余由向导逐项问，见 D23）
+#:
+#: 2026-09-23：`stt-sherpa` 从"可选"提升为**必装** —— 这是对 D23 的一处**有意反转**。
+#: 理由：指令转写是 ECHO 的核心交互链路，**不允许依赖服务端可用性**（3.0 铁律 L3）；
+#: 而 2026-09-23 的事故证明"靠向导逐项问"是问不住的 ——
+#: 稳定版模型文件齐全、面板报"已就绪"，可 runtime-core 里没装 sherpa_onnx，
+#: 于是每次语音指令都静默转写出空串（用户根本不知道该去装什么）。
+#: **注意范围**：这里提升的是**流式引擎 + 指令用模型**（约 216 MB）；
+#: 会议转写模型（sensevoice / whisper / qwen3asr）**仍然全部可选**。
+REQUIRED_IDS = ("runtime-core", "stt-sherpa")
 
 
 # ---------------------------------------------------------------- 内置清单
@@ -58,9 +66,12 @@ def _builtin() -> List[dict]:
     """
     return [
         dict(id="runtime-core", kind="runtime", name="运行时核心", required=True, optional=False,
-             purpose="Python 运行时依赖（faster-whisper / funasr / sherpa-onnx / numpy…）",
-             size_mb=100, platforms=["win32", "macos", "linux"], min_os={},
-             detect={"python": "faster_whisper", "any": ["funasr", "sherpa_onnx"]},
+             purpose="Python 运行时依赖（服务 + 面板 + **语音指令转写引擎 sherpa-onnx**）",
+             size_mb=130, platforms=["win32", "macos", "linux"], min_os={},
+             # 就绪判据必须与 requirements-core.txt **一致**。
+             # 2026-09-23 之前这里查的是 faster_whisper / funasr / sherpa_onnx，
+             # 而那份清单一个都没有 —— 于是这条判定一直在问它不装的包。
+             detect={"python": "sherpa_onnx"},
              source="pypi", requirements=True,
              how="装 ECHO 的依赖清单（命令已带上本机解释器路径，粘到终端即可）"),
         # 2026-09-19 更正：这条原来写的是「pip install deepseek-harness-sdk（265 MB）」，源自
@@ -102,13 +113,15 @@ def _builtin() -> List[dict]:
              size_mb=896, platforms=["win32", "macos", "linux"], min_os={},
              model_id="sensevoice", pkg="funasr", source="modelscope", ref="iic/SenseVoiceSmall",
              how="面板下载或自行拷贝到 models/sensevoice；需 funasr + torch"),
-        dict(id="stt-sherpa", kind="stt", name="sherpa-onnx 流式转写", optional=True, required=False,
-             purpose="免 torch 的轻量流式转写（推荐组合之一，D1）",
+        dict(id="stt-sherpa", kind="stt", name="sherpa-onnx 流式转写", optional=False, required=True,
+             purpose="**语音指令的转写引擎（必装）**：免 torch 的轻量流式转写。"
+                     "指令转写不允许依赖服务端可用性，所以它不能是可选件",
              size_mb=189, platforms=["win32", "macos", "linux"], min_os={},
              model_id="sherpa", pkg="sherpa-onnx", source="modelscope",
              how="面板下载或自行拷贝到 models/sherpa-onnx-streaming；"
                  "**还要装 pip 包 sherpa-onnx**（模型和引擎是两件事，"
-                 "2026-09-23 实测：只下模型时语音指令会静默转写出空串）"),
+                 "2026-09-23 实测：只下模型时语音指令会静默转写出空串）。"
+                 "运行时（runtime-core）已含这个 pip 包，正常装完即有"),
         dict(id="stt-whisper-tiny", kind="stt", name="Whisper tiny", optional=True, required=False,
              purpose="最小最快的档位（精度最低，适合纯英文短句）",
              size_mb=75, platforms=["win32", "macos", "linux"], min_os={},

@@ -337,6 +337,22 @@ DEFAULTS = {
                                              "比笔记本内置麦好得多。"
                                              "空 = 跟随上面的默认输入设备",
                                  value_type="str", options_from="audio_inputs"),
+    # 2026-09-23 D2：虚拟/接力设备黑名单的**逃生口**。
+    # 黑名单（见 recorder._VIRTUAL_HINTS）原来只挡"兜底遍历"，用户显式选的照开；
+    # 但 AGENTS.md 里那次事故（macOS 打开 Oray/iPhone 麦克风把 CoreAudio HAL 锁死，
+    # 之后**任何**麦克风操作永久超时、只能重启 ECHO）走的正是"显式指定"这条路。
+    # 现在显式指定也拦，被拦时日志会说清怎么放行 —— 就是下面这一项。
+    # 做成隐藏项：它是个"我确认要冒这个险"的开关，不该摆在常规设置里让人随手打开。
+    "allowVirtualInputDevice": dict(value=False, grp="voice", sub="record",
+                                    label="允许使用虚拟/接力输入设备",
+                                    description="虚拟、映射、回环、汇总、接力类设备"
+                                                "（Oray、iPhone 麦克风、立体声混音、BlackHole…）"
+                                                "不是真麦克风。打开它们可能把系统音频服务卡死"
+                                                "（macOS 上实测过一次，之后任何麦克风操作都失效、"
+                                                "只能重启 ECHO），所以默认拒绝——"
+                                                "包括你手动在上面两项里选中它们时。"
+                                                "确实需要（如回环测试）才打开这一项",
+                                    value_type="bool", hidden=True),
     "consumeMediaKey": dict(value=True, grp="voice", sub="record", label="拦截媒体键",
                             description="触发后不向系统透传媒体键", value_type="bool"),
     # ---------- 语音命令 → 提示音与通知（二级子分组）----------

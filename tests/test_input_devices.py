@@ -119,10 +119,65 @@ class ResolveInputDeviceTests(unittest.TestCase):
 
     def test_legacy_index_still_works(self):
         self.assertEqual(3, self._res({"meetingInputDeviceId": "3"}, "meeting"))
-        self.assertEqual(0, self._res({"meetingInputDeviceId": "0"}, "meeting"))
+        # index 0 在 FAKE_DEVICES 里是「Microsoft 声音映射器」= 虚拟设备，
+        # 2026-09-23（D2）起显式指定也过黑名单 → 被拒。见下面的虚拟设备用例。
+        self.assertEqual(-1, self._res({"meetingInputDeviceId": "0"}, "meeting"))
 
     def test_zero_is_a_real_device_not_a_fallback(self):
-        self.assertEqual(0, self._res({"meetingInputDeviceId": "0", "inputDeviceId": "9"}, "meeting"))
+        """索引 0 是**真实设备**，不能被当成"未设置"的哨兵值（`if idx:` 这类写法会犯的错）。
+
+        FAKE_DEVICES 里 index 0 恰好是虚拟设备，所以这里的结果是 -1 ——
+        但**理由必须是"虚拟设备被拒"，而不是"回退到了 inputDeviceId 那台"**：
+        下面两条断言就是在钉这件事（拿不到"回退"的证据）。
+        """
+        logs = []
+        got = self._res({"meetingInputDeviceId": "0", "inputDeviceId": "9"}, "meeting", logs)
+        self.assertEqual(-1, got)
+        self.assertEqual(1, len(logs))
+        self.assertIn("虚拟", logs[0][2], "应当是黑名单拒的")
+        self.assertNotIn("回退到系统默认麦克风", logs[0][2])  # 用的是黑名单那条文案
+
+    # ---------------------------------------------------------------- D2：设备黑名单
+    #
+    # 2026-09-23（D2）：挡的范围从"兜底遍历"扩到**用户显式指定**。
+    # 为什么值得单独几组用例：`_VIRTUAL_HINTS` 原来只管兜底遍历，而 AGENTS.md 记着的
+    # 那次事故（macOS 打开 Oray / iPhone 麦克风把 CoreAudio HAL 锁死，之后**任何**
+    # 麦克风操作永久超时、只能重启 ECHO）走的正是"用户手动选了它"这条路。
+
+    def test_explicit_virtual_by_name_is_refused(self):
+        logs = []
+        got = self._res({"meetingInputDeviceId": "Microsoft 声音映射器 - Input"}, "meeting", logs)
+        self.assertEqual(-1, got, "虚拟设备不该被打开")
+        self.assertEqual(1, len(logs))
+        self.assertEqual("warn", logs[0][0])
+        self.assertIn("虚拟", logs[0][2])
+        # 日志里给的是**设置页上那个标签**（不是设置键）—— 那才是用户找得到的东西。
+        # 顺手把"标签"这层耦合钉住：谁改了 config 里的 label，这里就红，
+        # 免得日志指着一个设置页上已经不存在的东西。
+        label = config.DEFAULTS["allowVirtualInputDevice"]["label"]
+        self.assertIn(label, logs[0][2], "被拦时必须说清怎么放行，否则用户无路可走")
+
+    def test_legacy_index_is_judged_by_the_resolved_name(self):
+        """老配置存的是**索引**：黑名单要按反查出来的**当前名字**判，不能拿索引字符串去比。"""
+        self.assertEqual(-1, self._res({"meetingInputDeviceId": "0"}, "meeting"))
+
+    def test_override_setting_lets_it_through(self):
+        """逃生口：确实要回环测试的人可以打开它 —— 放行，不是永久封死。"""
+        got = self._res({"meetingInputDeviceId": "0", "allowVirtualInputDevice": True}, "meeting")
+        self.assertEqual(0, got, "打开逃生口后应当放行（它确实是个设备，只是危险）")
+
+    def test_real_devices_are_unaffected(self):
+        self.assertEqual(14, self._res({"meetingInputDeviceId": "耳机 (MAXHUB BM12)"}, "meeting"))
+        self.assertEqual(29, self._res({"commandInputDeviceId":
+                                        "耳机 (Hands-Free OpenRun Pro by Shokz)"}, "command"))
+
+    def test_missing_device_still_reports_missing_not_virtual(self):
+        """不存在的设备要报"不在位" —— 理由不能被黑名单抢走（否则排障会走错方向）。"""
+        logs = []
+        got = self._res({"meetingInputDeviceId": "已经拔掉的麦克风"}, "meeting", logs)
+        self.assertEqual(-1, got)
+        self.assertIn("不可用", logs[0][2])
+        self.assertNotIn("虚拟", logs[0][2])
 
     def test_settings_failure_is_not_fatal(self):
         with patch.object(config.settings, "get", side_effect=RuntimeError("db 挂了")):
