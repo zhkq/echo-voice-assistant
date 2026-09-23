@@ -116,6 +116,104 @@ class KitDiscovery(unittest.TestCase):
         self.assertEqual(build_kit.newest_kit(self.tmp, plat).name,
                          "ECHO-kit-20260922-2051")
 
+    def test_kit_zip_for_picks_this_platform_only(self):
+        """`deploy-stable.ps1` 靠它拿"要部署哪个包"。
+
+        2026-09-23 实测事故：部署脚本原来自己在 PowerShell 里按「dist 里最新那个
+        ECHO-kit-*.zip」挑，而 do_build() 先 win 后 macos —— macOS 的 kit 永远最新，
+        于是往 Windows 安装覆盖的是 **mac 包**：`D:\ECHO\manifest.json` 变成
+        `platform: macos-universal`（两个 kit 之间只有它内容不同）。
+        """
+        for name in ("ECHO-kit-20260922-2051", "ECHO-kit-macos-20260922-2051"):
+            shutil.copyfile(__file__, self.tmp / (name + ".zip"))
+        win = build_kit.kit_zip_for(self.tmp, build_kit.PLATFORMS[0])
+        mac = build_kit.kit_zip_for(self.tmp, build_kit.PLATFORMS[1])
+        self.assertEqual(win.name, "ECHO-kit-20260922-2051.zip")
+        self.assertEqual(mac.name, "ECHO-kit-macos-20260922-2051.zip")
+
+    def test_kit_zip_for_returns_none_when_the_zip_is_missing(self):
+        """有目录没 zip（kit 只组了目录 / zip 被清掉）时要说"没有"，不能瞎猜。"""
+        self.assertIsNone(build_kit.kit_zip_for(self.tmp, build_kit.PLATFORMS[0]))
+
+
+class DeployKitCli(unittest.TestCase):
+    """`--deploy-kit <platform>`：stdout 只给路径，给部署脚本当唯一事实源。"""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="echodeploykit-"))
+        for name in ("ECHO-kit-20260922-2051", "ECHO-kit-macos-20260922-2051"):
+            (self.tmp / name).mkdir()
+            shutil.copyfile(__file__, self.tmp / (name + ".zip"))
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _run(self, *argv):
+        import io
+        from contextlib import redirect_stdout, redirect_stderr
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = build_kit.main(["--deploy-kit", argv[0], "--dist", str(self.tmp)])
+        return code, out.getvalue().strip(), err.getvalue().strip()
+
+    def test_win_prints_the_win_zip_only(self):
+        code, out, _err = self._run("win")
+        self.assertEqual(code, build_kit.EXIT_OK)
+        self.assertEqual(Path(out).name, "ECHO-kit-20260922-2051.zip",
+                         "输出必须是**一个路径**（调用方直接拿它当文件路径）")
+
+    def test_macos_prints_the_macos_zip_only(self):
+        code, out, _err = self._run("macos")
+        self.assertEqual(code, build_kit.EXIT_OK)
+        self.assertEqual(Path(out).name, "ECHO-kit-macos-20260922-2051.zip")
+
+    def test_unknown_platform_fails_without_touching_stdout(self):
+        code, out, err = self._run("solaris")
+        self.assertEqual(code, build_kit.EXIT_ERROR)
+        self.assertEqual(out, "", "失败信息不许混进 stdout（会被当成 kit 路径）")
+        self.assertIn("solaris", err)
+
+    def test_missing_kit_reports_absent(self):
+        code, out, _err = self._run("win")
+        self.assertEqual(code, build_kit.EXIT_OK)
+        (self.tmp / "ECHO-kit-20260922-2051.zip").unlink()
+        code, out, err = self._run("win")
+        self.assertEqual(code, build_kit.EXIT_ABSENT)
+        self.assertEqual(out, "")
+        self.assertIn("kit", err)
+
+
+class DeployStableUsesTheKitSelector(unittest.TestCase):
+    """部署脚本不许再自己挑包 —— 这是 2026-09-23 那次错覆盖的根因。
+
+    `docs/tests` 里对 .ps1 的这类"契约"一向用文本断言（如 `test_gh_push_runs_the_check`）：
+    脚本是 ASCII-only 的 PowerShell，没法 import，但把规则写在注释与代码里能被钉住。
+    """
+
+    def setUp(self):
+        self.text = (SCRIPTS / "deploy-stable.ps1").read_text(encoding="utf-8")
+
+    def test_asks_build_kit_for_the_kit(self):
+        self.assertIn("--deploy-kit", self.text)
+        self.assertIn("build_kit.py", self.text)
+
+    def test_does_not_pick_by_newest_zip_any_more(self):
+        self.assertNotIn("Sort-Object LastWriteTime | Select-Object -Last 1", self.text,
+                         "按最新 zip 挑 = 永远挑到 macOS 的包")
+
+    def test_verifies_the_kit_platform_before_overlaying(self):
+        self.assertIn("Get-KitPlatform", self.text)
+        self.assertIn("manifest.json", self.text)
+
+    def test_is_still_ascii_only(self):
+        """Windows PowerShell 5.1 把无 BOM 的 .ps1 当 ANSI 读：非 ASCII 会让它解析失败。"""
+        raw = (SCRIPTS / "deploy-stable.ps1").read_bytes()
+        self.assertFalse(raw.startswith(b"\xef\xbb\xbf"), "这个脚本约定不带 BOM")
+        try:
+            raw.decode("ascii")
+        except UnicodeDecodeError as exc:
+            self.fail("deploy-stable.ps1 必须是纯 ASCII：%s" % exc)
+
 
 class StalenessJudgement(unittest.TestCase):
     """`--check` 的判据：包里记的哈希 vs 仓库现在的内容。"""

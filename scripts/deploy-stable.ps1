@@ -17,6 +17,9 @@
 #   1. refuses while a meeting is recording   (GET <dest>/api/status -> meeting.active)
 #   2. refuses on a dirty working tree        (unless -AllowDirty)
 #   3. builds the kit                         (scripts\build_kit.py - the same artifact users get)
+#   3b. picks the kit for THIS machine's platform via
+#       `build_kit.py --deploy-kit win|macos` and refuses a kit whose own
+#       manifest.json says another platform  (see the 2026-09-23 note below)
 #   4. overlays <kit>\ECHO\*        onto <DestDir>            (data\ models\ runtime-core\ untouched)
 #      copies  <kit>\echo-install\* onto <DestDir>\.dsh\skills\echo-install\
 #   5. verifies the target                    (compileall app + import smoke)
@@ -26,7 +29,8 @@
 #   powershell -File scripts\deploy-stable.ps1 -DryRun     # plan + step-by-step diff, write nothing
 #   powershell -File scripts\deploy-stable.ps1             # deploy, do NOT touch the running ECHO
 #   powershell -File scripts\deploy-stable.ps1 -Restart    # deploy + restart ECHO
-#   powershell -File scripts\deploy-stable.ps1 -NoBuild    # reuse the newest dist\ECHO-kit-*.zip
+#   powershell -File scripts\deploy-stable.ps1 -NoBuild    # reuse the newest kit from dist\
+#   powershell -File scripts\deploy-stable.ps1 -Kit X.zip  # pin one archive (name in dist\ or a path)
 #
 # ASCII-ONLY on purpose: Windows PowerShell 5.1 parses a BOM-less .ps1 as ANSI,
 # so a non-ASCII literal can silently break the script (tests/test_script_encoding.py).
@@ -37,6 +41,7 @@ param(
     [switch]$Restart,
     [switch]$NoBuild,
     [switch]$AllowDirty,
+    [string]$Kit = '',
     [int]$WaitSeconds = 120
 )
 
@@ -47,6 +52,41 @@ function Say([string]$m)  { Write-Host "  $m" }
 function Ok([string]$m)   { Write-Host "  [ok]   $m" -ForegroundColor Green }
 function Warn2([string]$m) { Write-Host "  [warn] $m" -ForegroundColor Yellow }
 function Fail([string]$m) { Write-Host "  [fail] $m" -ForegroundColor Red }
+
+# ------------------------------------------------------------------ platform
+# 2026-09-23 BUG (fixed here): the kit was picked as "the newest ECHO-kit-*.zip in
+# dist", but do_build() assembles win FIRST and macos SECOND, so the macOS kit is
+# always the newest. A Windows deploy therefore overlaid the macOS kit - and the two
+# kits differ in exactly one file's CONTENT: manifest.json. D:\ECHO\manifest.json
+# ended up saying platform=macos-universal, and manifest.json is what install/update
+# flows read to decide which platform this unpacked tree is.
+# Now the selector lives in ONE place: scripts\build_kit.py --deploy-kit <key>
+# (build_kit.find_kits / newest_kit, pinned by tests\test_build_kit.py::KitDiscovery).
+function Get-HostPlatformKey {
+    # This script deploys onto the machine it runs on; the kits are win-x64 and
+    # macos-universal (see build_kit.PLATFORMS).
+    if ($env:OS -eq 'Windows_NT') { return 'win' }
+    return 'macos'
+}
+
+function Get-KitPlatform([string]$ZipPath) {
+    # Read ECHO/manifest.json out of the zip WITHOUT expanding it.
+    try {
+        Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
+        $z = [System.IO.Compression.ZipFile]::OpenRead($ZipPath)
+        try {
+            $e = $z.Entries | Where-Object { $_.FullName -match '(^|/)ECHO/manifest\.json$' } |
+                 Select-Object -First 1
+            if (-not $e) { return '' }
+            $sr = New-Object System.IO.StreamReader($e.Open())
+            $txt = $sr.ReadToEnd()
+            $sr.Close()
+            $m = [regex]::Match($txt, '"platform"\s*:\s*"([^"]+)"')
+            if ($m.Success) { return $m.Groups[1].Value }
+        } finally { $z.Dispose() }
+    } catch { return '' }
+    return ''
+}
 
 Write-Host ''
 Write-Host '  === deploy to the STABLE install ==='
@@ -116,10 +156,46 @@ if ($NoBuild) {
         if ($LASTEXITCODE -ne 0) { Fail "build_kit.py failed ($LASTEXITCODE)"; exit 1 }
     }
 }
-$zip = Get-ChildItem -Path (Join-Path $repoRoot 'dist') -Filter 'ECHO-kit-*.zip' -ErrorAction SilentlyContinue |
-       Sort-Object LastWriteTime | Select-Object -Last 1
-if (-not $zip) { Fail 'no dist\ECHO-kit-*.zip found - run scripts\build_kit.py first'; exit 1 }
-Say "kit  : $($zip.Name)"
+$zip = $null
+if ($Kit) {
+    # Explicit override: a name inside dist\, or a full path anywhere.
+    $cand = $Kit
+    if (-not (Test-Path -LiteralPath $cand)) {
+        $cand = Join-Path (Join-Path $repoRoot 'dist') $Kit
+    }
+    if (-not (Test-Path -LiteralPath $cand)) { Fail "kit not found: $Kit"; exit 1 }
+    $zip = Get-Item -LiteralPath $cand
+    Say "kit  : $($zip.Name)  (pinned with -Kit)"
+} else {
+    $platKey = Get-HostPlatformKey
+    $kitLine = @(& $py (Join-Path $repoRoot 'scripts\build_kit.py') --deploy-kit $platKey 2>&1 |
+                ForEach-Object { "$_" }) | Where-Object { $_ -and $_.Trim() } | Select-Object -Last 1
+    if ($LASTEXITCODE -ne 0 -or -not $kitLine) {
+        Fail "could not resolve the $platKey kit (scripts\build_kit.py --deploy-kit $platKey): $kitLine"
+        exit 1
+    }
+    $zip = Get-Item -LiteralPath $kitLine.Trim() -ErrorAction SilentlyContinue
+    if (-not $zip) { Fail "kit path from build_kit.py does not exist: $kitLine"; exit 1 }
+    Say "kit  : $($zip.Name)  (platform=$platKey)"
+    # The guard that would have caught the 2026-09-23 mix-up: refuse a kit whose own
+    # manifest says another platform.
+    $kitPlat = Get-KitPlatform $zip.FullName
+    if ($kitPlat) {
+        $matchesPlat = $false
+        if ($platKey -eq 'win') {
+            if ($kitPlat -like 'win*') { $matchesPlat = $true }
+        } else {
+            if ($kitPlat -like 'macos*') { $matchesPlat = $true }
+        }
+        if (-not $matchesPlat) {
+            Fail "this kit is for '$kitPlat' but this machine is '$platKey' - refusing to overlay it."
+            Say  '       (use -Kit to pin a different archive on purpose)'
+            exit 1
+        }
+    } else {
+        Warn2 'could not read ECHO/manifest.json from the kit - platform not verified'
+    }
+}
 
 # ---- 4) overlay ------------------------------------------------------------
 $tmp = Join-Path $env:TEMP ("echo-deploy-" + (Get-Date -Format 'yyyyMMdd-HHmmss'))

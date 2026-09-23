@@ -169,6 +169,26 @@ def newest_kit(dist: Path, plat: dict) -> Path | None:
     return kits[-1] if kits else None
 
 
+def kit_zip_for(dist: Path, plat: dict) -> Path | None:
+    """该平台「最新那个 kit」的 zip 路径（没有返回 None）。
+
+    `assemble_kit()` 的命名规则是 `<kit_prefix>-<stamp>`：先出同名目录，再打成同名 .zip。
+    这个函数专门给 `scripts/deploy-stable.ps1` 用 —— 它以前自己在 PowerShell 里按
+    「dist 里最新的 ECHO-kit-*.zip」挑包，而 `do_build()` 是**先 win 后 macos**，
+    于是 macOS 的 kit 永远是最新的：往 Windows 安装部署时覆盖的是 mac 包。
+
+    2026-09-23 实测后果：`D:\ECHO\manifest.json` 被写成 `platform: macos-universal`
+    （两个 kit 之间**只有 manifest.json 内容不同** —— 逐条比对过全部同名条目的哈希），
+    而 manifest 正是安装/更新流程用来判断"这是哪个平台的已解开包"的那个文件。
+    选择器只留一份（`find_kits`，`tests/test_build_kit.py::KitDiscovery` 钉着）。
+    """
+    kit = newest_kit(dist, plat)
+    if kit is None:
+        return None
+    zip_path = dist / (kit.name + ".zip")
+    return zip_path if zip_path.is_file() else None
+
+
 def newest_main_package(dist: Path, plat: dict) -> Path | None:
     pat = re.compile(r"^ECHO-main-" + re.escape(plat["label"]) + r"-\d.*\.zip$")
     found = [p for p in dist.glob("*.zip") if pat.match(p.name)]
@@ -541,9 +561,27 @@ def main(argv: list[str] | None = None) -> int:
                     help="覆盖时间戳（默认 now，形如 20260922-2100）")
     ap.add_argument("--no-verify", action="store_true", help="跳过出包后的自检")
     ap.add_argument("--dist", default="", help="输出目录（默认 <repo>/dist）")
+    ap.add_argument("--deploy-kit", default="", metavar="PLATFORM",
+                    help="只打印该平台最新 kit 的 zip 路径（不写盘；deploy-stable.ps1 用）")
     args = ap.parse_args(argv)
 
     dist = Path(args.dist).resolve() if args.dist else DIST
+    if args.deploy_kit:
+        # 只走选择器、不写任何东西：stdout **只**给路径（调用方直接拿去当文件路径），
+        # 失败信息一律走 stderr + 退出码，免得被当成路径拼进去。
+        want = args.deploy_kit.strip()
+        plat = next((p for p in PLATFORMS if p["key"] == want), None)
+        if plat is None:
+            print("[fail] 不认识的平台：%s（可选：%s）"
+                  % (want, ", ".join(p["key"] for p in PLATFORMS)), file=sys.stderr)
+            return EXIT_ERROR
+        zip_path = kit_zip_for(dist, plat)
+        if zip_path is None:
+            print("[fail] dist 里没有 %s 的 kit（目录或 %s.zip 缺失）：%s"
+                  % (plat["key"], plat["kit_prefix"], dist), file=sys.stderr)
+            return EXIT_ABSENT
+        print(str(zip_path))
+        return EXIT_OK
     try:
         plats = parse_platforms(args.platforms)
     except BuildError as exc:
