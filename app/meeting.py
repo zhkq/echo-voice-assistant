@@ -951,7 +951,9 @@ def _summary_session(client, meeting_id):
     sid, workspace_id, how = "", "", ""
     try:
         if getattr(client, "has_workspaces", lambda: False)():
-            wid, created = client.ensure_workspace(ws, title=os.path.basename(ws.rstrip("\\/")))
+            from app import workspaces as spaces_mod
+            wid, created = client.ensure_workspace(
+                ws, title=spaces_mod.title_for_path(ws))
             if wid:
                 sid = client.create_session(workspace_id=wid)
                 workspace_id = wid

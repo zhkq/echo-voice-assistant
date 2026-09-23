@@ -236,6 +236,29 @@ class DshAgent(AgentAdapter):
         """
         return os.path.join(os.path.expanduser("~"), ".dsh", "storages", "workspace.json")
 
+    def _registry_workspaces(self):
+        """本后端自己注册表里的 `{workspaceId: {path,title,...}}`；读不到返回 {}。
+
+        只读，绝不改写 DSH 的文件：ECHO 不是这份数据的主人（DSH 才是），
+        我们只借它做"这个目录有没有工作区 / 分组叫什么"的判断。
+        """
+        try:
+            import json as _json
+            reg = self._workspace_registry_path()
+            if not os.path.isfile(reg):
+                return {}
+            with open(reg, "r", encoding="utf-8") as f:
+                doc = _json.load(f)
+            return dict(((doc.get("tables") or {}).get("workspaces") or {}))
+        except Exception:
+            return {}
+
+    def workspace_title(self, workspace_id):
+        """某个工作区当前的分组名；读不到返回 ""。"""
+        if not workspace_id:
+            return ""
+        return str((self._registry_workspaces().get(workspace_id) or {}).get("title") or "")
+
     def find_workspace(self, path):
         """按目录路径找工作区 id（大小写与结尾斜杠容错）。找不到返回 ""。"""
         if not path:
@@ -250,17 +273,9 @@ class DshAgent(AgentAdapter):
         except Exception:
             pass
         # ② 兜底：直接读 **本后端自己** 的工作区注册表（只读，不改写）
-        try:
-            import json as _json
-            reg = self._workspace_registry_path()
-            if os.path.isfile(reg):
-                with open(reg, "r", encoding="utf-8") as f:
-                    doc = _json.load(f)
-                for wid, w in ((doc.get("tables") or {}).get("workspaces") or {}).items():
-                    if os.path.normcase(os.path.normpath(w.get("path") or "")) == want:
-                        return wid
-        except Exception:
-            pass
+        for wid, w in self._registry_workspaces().items():
+            if os.path.normcase(os.path.normpath(w.get("path") or "")) == want:
+                return wid
         return ""
 
     def ensure_workspace(self, path, title=""):
@@ -268,21 +283,54 @@ class DshAgent(AgentAdapter):
 
         建会话时传 workspaceId，DSH 会把它登记进该工作区——这是让会议会话
         出现在「会议工作区」分组里的关键，不需要我们再手工登记会话 id。
+
+        `title` 是**想要的分组名**。DSH 的 `workspace/create` 只收目录、名字由目录名
+        派生，所以中文名只能建好之后再 `workspace/rename`（见 `_apply_title`）。
         """
         path = (path or "").strip()
         if not path:
             return "", False
         wid = self.find_workspace(path)
         if wid:
-            return wid, False
+            created = False
+        else:
+            try:
+                res = self.rpc("workspace/create", {"request": {"path": path}}, timeout=20)
+            except DshError as e:
+                raise DshError(f"创建 DSH 工作区失败（{path}）：{e}") from e
+            val = res.get("value") or {}
+            ws = val.get("workspace") or {}
+            wid = ws.get("workspaceId") or ""
+            created = bool(val.get("created"))
+        if wid and title:
+            self._apply_title(wid, path, title, just_created=created)
+        return wid, created
+
+    def _apply_title(self, workspace_id, path, title, just_created=False):
+        """把分组名改成 `title` —— **只在用户没自己改过**时改。
+
+        判据：新建工作区的名字必然是目录名（basename），所以
+        "当前名 == basename" 就等于"没人动过"；用户起过名字的一律不碰。
+        返回动作字符串（renamed / unchanged / user-named / rename-failed），
+        供调用方决定要不要告警 —— 改名失败是静默的，必须能说出来。
+        """
+        title = (title or "").strip()
+        if not workspace_id or not title:
+            return "skipped"
+        base = os.path.basename((path or "").rstrip("\\/"))
+        cur = self.workspace_title(workspace_id)
+        if cur == title:
+            return "unchanged"
+        if not just_created and cur and cur != base:
+            return "user-named"
         try:
-            res = self.rpc("workspace/create", {"request": {"path": path}}, timeout=20)
-        except DshError as e:
-            raise DshError(f"创建 DSH 工作区失败（{path}）：{e}") from e
-        val = res.get("value") or {}
-        ws = val.get("workspace") or {}
-        wid = ws.get("workspaceId") or ""
-        return wid, bool(val.get("created"))
+            self.rpc("workspace/rename",
+                     {"request": {"workspaceId": workspace_id, "title": title}}, timeout=15)
+            return "renamed"
+        except Exception as e:
+            db.add_log("warn", "dsh",
+                       f"分组改名失败（{cur or base} → {title}）：{type(e).__name__}: {e}")
+            return "rename-failed"
 
     def archive_session(self, session_id, workspace_id=None):
         """归档会话：从侧栏隐藏，且不再计入「未分组」。会议删除时调用。"""
@@ -503,8 +551,11 @@ class DshAgent(AgentAdapter):
         """
         if workspace:
             try:
+                # 分组名走 app/workspaces.py 这一份事实源（默认「指令空间」；
+                # 用户自己配的工作区则仍用目录名，行为不变）。
+                from app import workspaces as spaces_mod
                 wid, created = self.ensure_workspace(
-                    workspace, title=os.path.basename(workspace.rstrip("\\/")))
+                    workspace, title=spaces_mod.title_for_path(workspace))
                 if wid:
                     sid = self.create_session(workspace_id=wid)
                     if sid:

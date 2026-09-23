@@ -640,6 +640,25 @@ if ($AccelCuda) {
 $agentOk = Wait-Harness
 if (-not $agentOk) { $failed += '智能体（harness）' }
 
+# 两个默认分组（「会议空间」/「指令空间」）：装好就该在 DSH 侧栏看到，而不是等开完
+# 第一场会、说第一句指令才冒出来。走 ECHO 自己的接口，幂等；用户改过名的工作区不动
+# （见 app/workspaces.py）。放在 Wait-Harness 之后：workspace/create 要 DSH 正在监听。
+Step '建立 DSH 分组（会议空间 / 指令空间）'
+try {
+    $sp = Invoke-Api -Path '/api/dsh/workspaces/ensure' -Method Post -Body @{} -TimeoutSec 90
+    foreach ($it in $sp.spaces) {
+        switch ("$($it.action)") {
+            'failed'    { Err ("{0,-10} 建立失败：{1}" -f $it.label, $it.detail); $failed += ("分组「{0}」" -f $it.label) }
+            'no-agent'  { Warn ("{0,-10} 智能体没就绪，稍后 ECHO 会自动补：{1}" -f $it.label, $it.detail) }
+            'skipped'   { Warn ("{0,-10} 没配目录，跳过（这个空间的会话会落在「未分组」）" -f $it.label) }
+            default     { Ok ("{0,-10} 「{1}」→ {2}" -f $it.label, $it.title, $it.path) }
+        }
+    }
+} catch {
+    # 不是硬失败：ECHO 建会话时还会再建一次（那时智能体必然已就绪）
+    Warn ("调 /api/dsh/workspaces/ensure 失败（不影响使用，ECHO 建会话时会自动补）：{0}" -f $_.Exception.Message)
+}
+
 # 4) 登记安装 —— 这是"装完了"的凭据：面板据此不再提示未安装、也不再自动进向导
 Step '登记安装'
 $report = @{

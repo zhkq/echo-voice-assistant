@@ -675,6 +675,35 @@ for id in $MODEL_IDS; do
 done
 wait_harness || FAILED="$FAILED 智能体"
 
+# 两个默认分组（「会议空间」/「指令空间」）：装好就该在 DSH 侧栏看到，而不是等开完
+# 第一场会、说第一句指令才冒出来。走 ECHO 自己的接口，幂等；用户改过名的工作区不动
+# （见 app/workspaces.py）。放在 wait_harness 之后：workspace/create 要 DSH 正在监听。
+step "建立 DSH 分组（会议空间 / 指令空间）"
+SP="$(api POST /api/dsh/workspaces/ensure '{}' 90)"
+if [ -z "$SP" ]; then
+  warn "调 /api/dsh/workspaces/ensure 失败（不影响使用，ECHO 建会话时会自动补）"
+else
+  # 每项一行：label / action / title / path，用 python 拆（mac 上不一定有 jq）
+  printf '%s' "$SP" | "$PY" -c '
+import json, sys
+try:
+    spaces = json.load(sys.stdin).get("spaces") or []
+except Exception as e:
+    print("  [warn] 解析分组结果失败：%s" % e); raise SystemExit(0)
+for it in spaces:
+    a = it.get("action")
+    if a == "failed":
+        print("  [fail] %-10s 建立失败：%s" % (it.get("label"), it.get("detail")))
+    elif a == "no-agent":
+        print("  [warn] %-10s 智能体没就绪，稍后 ECHO 会自动补：%s" % (it.get("label"), it.get("detail")))
+    elif a == "skipped":
+        print("  [warn] %-10s 没配目录，跳过（会话会落在「未分组」）" % it.get("label"))
+    else:
+        print("  [ok]   %-10s 「%s」→ %s" % (it.get("label"), it.get("title"), it.get("path")))
+'
+  case "$SP" in *'"action": "failed"'*|*'"action":"failed"'*) FAILED="$FAILED 分组" ;; esac
+fi
+
 # 登记安装 —— 这是"装完了"的凭据：面板据此不再提示未安装、也不再自动进向导
 step "登记安装"
 REPORT=$(cat <<JSON

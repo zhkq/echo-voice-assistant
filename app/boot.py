@@ -314,10 +314,33 @@ def _register_router_after_agent_start():
     except Exception as exc:
         db.add_log("warn", "boot", "智能体就绪后复核 ECHO AUTO 注册失败：%s" % exc)
         return
+    if _ROUTER_RECHECK_ENABLED:
+        # 与上面同一个安全开关：关掉它的时候（测试、或用户不要注册）也不许去碰真实 DSH。
+        _ensure_default_spaces()
     if done or not _ROUTER_RECHECK_ENABLED:
         return
     threading.Thread(target=_router_recheck_loop, daemon=True,
                      name="router-recheck").start()
+
+
+def _ensure_default_spaces():
+    """把两个默认分组（「会议空间」/「指令空间」）建好（幂等）。
+
+    安装技能装完会调一次 `/api/dsh/workspaces/ensure`；这里是**兜底** —— 没走技能、
+    直接装源码的机器，第一次启动后也该有这两个分组，而不是等开完第一场会才冒出来。
+    `workspace/create` 要 DSH 正在监听，所以只能放在"智能体就绪"之后。
+    失败只记日志：真正的建立时机还在建会话那一步（那时必然已经就绪）。
+    """
+    try:
+        from app import workspaces as spaces_mod
+        report = spaces_mod.ensure_spaces()
+    except Exception as exc:
+        db.add_log("warn", "boot", "建立默认 DSH 分组失败：%s" % exc)
+        return
+    made = [it for it in report if it["action"] == "created"]
+    if made:
+        db.add_log("info", "boot", "已建立默认 DSH 分组：" +
+                   "，".join("%s（%s）" % (it["label"], it["path"]) for it in made))
 
 
 def _router_recheck_loop():

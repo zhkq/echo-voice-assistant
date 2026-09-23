@@ -157,11 +157,19 @@ DEFAULTS = {
     "serverPort":      dict(value=8970, grp="panel", label="ECHO 面板端口",
                             description="控制面板与 API 的监听端口（8890 曾被系统保留段占用，改用 8970）", value_type="int"),
     # ---------- 语音命令 → 命令与会话（二级子分组，见 grp/sub 的说明）----------
-    "commandWorkspace": dict(value="", grp="voice", sub="command", label="命令会话工作区",
+    "commandWorkspace": dict(value="{ECHO}/data/command", grp="voice", sub="command",
+                             label="命令会话工作区",
                              description="默认命令会话建在这个目录对应的 DSH 工作区里，"
-                                         "从而归入侧栏对应分组（例如你自己的「日常交互」）。"
+                                         "从而归入侧栏的「指令空间」分组。"
+                                         "想并到自己的工作区（例如「日常交互」）就改成那个目录。"
                                          "留空 = 建在 ECHO 根目录（侧栏显示为未分组）",
                              value_type="str"),
+    "commandWorkspaceTitle": dict(value="指令空间", grp="voice", sub="command",
+                                  label="指令分组名",
+                                  description="上面那个工作区在 DSH 侧栏里显示的分组名。"
+                                              "只对 ECHO 自己创建的工作区生效，"
+                                              "你手动改过名字的一律以你的为准",
+                                  value_type="str"),
     "commandIdleRotateHours": dict(value=4, grp="voice", sub="command", label="命令会话空闲轮换小时",
                                    description="默认命令会话空闲超过 N 小时且新指令未要求延续上一话题时，"
                                                "自动轮换新会话（0=关闭；会话不在默认工作区时会强制轮换一次）",
@@ -351,6 +359,12 @@ DEFAULTS = {
                                          "**文件**放哪，这一项是 DSH **会话**登记到哪个工作区。"
                                          "{ECHO} = ECHO 根目录；留空 = 用固定的纪要会话（不分组）",
                              value_type="str"),
+    "meetingWorkspaceTitle": dict(value="会议空间", grp="meeting",
+                                  label="会议分组名",
+                                  description="上面那个工作区在 DSH 侧栏里显示的分组名。"
+                                              "只对 ECHO 自己创建的工作区生效，"
+                                              "你手动改过名字的一律以你的为准",
+                                  value_type="str"),
     # ---------- 纪要归档（工作日志 / 笔记库）----------
     # 设计：ECHO 只负责"把材料备齐 + 定位笔记库"，至于写到哪个目录、日志长什么样、
     # 有哪些专项与例会，全部由用户自己的归档技能（skill）决定。因此这里只有 4 项，
@@ -548,6 +562,10 @@ DEFAULT_MIGRATIONS = {
     # data/meetings 目录——因为 DSH 侧栏分组是显式登记制，只有指定了工作区目录
     # 才能把每场会议的会话登记进「会议工作区」。仅当用户从没改过（仍为空）才改写。
     "meetingWorkspace": ("", "{ECHO}/data/meetings"),
+    # 2026-09-23：命令工作区旧默认是「空（建在 ECHO 根目录、侧栏未分组）」→ 新默认
+    # `{ECHO}/data/command`。新机器装好就该在 DSH 侧栏看到「指令空间」分组，而不是
+    # 攒一堆未分组的会话。仅当用户从没改过（仍为空）才改写；配过自己目录的一律不动。
+    "commandWorkspace": ("", "{ECHO}/data/command"),
 }
 
 # 弃用项的值迁移：某个配置键被**弃用**（重复/失效）时，把"它当初表达的用户意图"

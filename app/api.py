@@ -395,6 +395,21 @@ def get_dsh_targets(_auth=Depends(optional_auth)):
     return {"workspaces": workspaces, "sessions": sessions, "agent": agent}
 
 
+@router.post("/dsh/workspaces/ensure")
+def post_dsh_workspaces_ensure(_auth=Depends(optional_auth)):
+    """建立/补齐两个默认分组：「会议空间」与「指令空间」。
+
+    安装技能在装完、智能体起来之后调一次 —— 这样用户第一次打开 DSH 侧栏就看到
+    两个分组，而不是等开完第一场会 / 说第一句指令才冒出来。幂等：已存在的原样返回，
+    用户自己改过名的工作区一律不动（见 app/workspaces.py）。
+    """
+    from app import workspaces as spaces_mod
+    report = spaces_mod.ensure_spaces()
+    bad = [it for it in report if it["action"] in ("failed", "no-agent")]
+    return {"ok": not bad, "spaces": report,
+            "note": "" if not bad else "；".join("%s：%s" % (b["label"], b["detail"]) for b in bad)}
+
+
 @router.post("/assistant/capture")
 def post_capture(body: CaptureIn, _auth=Depends(optional_auth)):
     ok = assistant.capture(body.source)

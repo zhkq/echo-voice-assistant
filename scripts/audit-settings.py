@@ -88,6 +88,10 @@ ACK_INDIRECT = {
     "wakeHotkey": "app/platform/win32/hotkey.py:148 热键注册表（键名来自元组）",
     "fallbackHotkey": "app/platform/win32/hotkey.py:148 同上（媒体键失效时的备用键）",
     "panelHotkey": "app/runtime.py:206 热键注册表（键名来自元组）",
+    # 分组名：app/workspaces.py 的 DEFAULT_SPACES 里用 title_key 当**循环变量**读
+    # （`_setting(spec["title_key"])`），所以扫描看不见字面量。消费方见那一行。
+    "meetingWorkspaceTitle": "app/workspaces.py:36 _setting(title_key)：DSH「会议空间」分组名",
+    "commandWorkspaceTitle": "app/workspaces.py:36 _setting(title_key)：DSH「指令空间」分组名",
 }
 
 #: 唯一消费方是面板 UI 的项（面板读它来改变自己的行为，app/ 不需要读）。

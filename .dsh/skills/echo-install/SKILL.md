@@ -49,6 +49,19 @@ whenToUse: 新机器首装 ECHO（Windows 或 macOS）；或把 ECHO 交给同�
 PyPI 上的 Windows torch 是 **CPU 版**，装完 `torch.cuda.is_available()` 是 False，
 表面"装上了"其实一直在跑 CPU。Windows 侧安装器现在会自动换索引（默认 cu128）。
 
+**装完还会建两个 DSH 分组**（这一步不用你操心，脚本自己调
+`POST /api/dsh/workspaces/ensure`）：
+
+| 分组 | 目录 | 说明 |
+|---|---|---|
+| 「会议空间」 | `{ECHO}/data/meetings`（设置 `meetingWorkspace`） | 每场会议一个会话 |
+| 「指令空间」 | `{ECHO}/data/command`（设置 `commandWorkspace`） | 默认命令 / 语音指令会话 |
+
+DSH 的 `workspace/create` **只收目录**、分组名由目录名派生，所以中文名是建好之后再
+`workspace/rename` 的；**用户自己改过名字的工作区一律不动**。名可在设置里改
+（`meetingWorkspaceTitle` / `commandWorkspaceTitle`）。不建也不影响功能 ——
+ECHO 建会话时还会再建一次，只是那时才出现在侧栏。
+
 **智能体（会议纪要 / 归档 / 语音指令靠它）**：**默认就用标准版**（`agentBackend=harness`），
 **不用问用户**；只要本机有 Node.js，ECHO 会自己把它拉起来。没有 Node 就照第 5 节处理。
 
