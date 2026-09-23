@@ -96,6 +96,8 @@ ACK_INDIRECT = {
     # INPUT_DEVICE_KEYS 表读（键名来自表里的值，调用点上不是字面量）
     "commandInputDeviceId": "app/audio/recorder.py:resolve_input_device() 查表读（指令/唤醒用哪个麦）",
     "meetingInputDeviceId": "app/audio/recorder.py:resolve_input_device() 查表读（会议录音用哪个麦）",
+    # 通用兜底那一项也是循环读（与用途键一起遍历），不再是 settings.get("inputDeviceId")
+    "inputDeviceId": "app/audio/recorder.py:resolve_input_device() 循环读（两个用途的通用兜底）",
 }
 
 #: 唯一消费方是面板 UI 的项（面板读它来改变自己的行为，app/ 不需要读）。

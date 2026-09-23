@@ -9,6 +9,7 @@
 命令录音失败返回 False；会议录音失败保存已收到的音频并记录 error。
 """
 import os
+import re
 import threading
 import time
 import wave
@@ -147,33 +148,117 @@ INPUT_DEVICE_KEYS = {
     "meeting": "meetingInputDeviceId",   # 会议录音
 }
 
+#: 设备清单缓存（给"按名字找设备"用；打开录音的路径上不该每次都查一遍 PortAudio）
+_DEVICE_CACHE = {"at": 0.0, "items": []}
+
+
+def list_input_devices_cached(max_age=30.0):
+    import time as _time
+    now = _time.time()
+    if _DEVICE_CACHE["items"] and (now - _DEVICE_CACHE["at"]) < max_age:
+        return _DEVICE_CACHE["items"]
+    items = list_input_devices()
+    _DEVICE_CACHE["at"] = now
+    _DEVICE_CACHE["items"] = items
+    return items
+
+
+def rank_hostapi(hostapi):
+    """同一个名字出现在多套 API 里时，谁更该用（小的优先）。
+
+    WASAPI 最现代（延迟低、共享模式能重采样），MME/DirectSound 是旧路，WDM-KS 不做
+    重采样（8 kHz 的蓝牙免提端点放在它下面经常直接打不开）。
+    """
+    low = str(hostapi or "").lower()
+    if "wasapi" in low:
+        return 0
+    if "directsound" in low:
+        return 1
+    if "mme" in low:
+        return 2
+    if "wdm" in low or "ks" in low:
+        return 3
+    return 4
+
+
+def find_input_device(value):
+    """把一个设置值解析成当前的 PortAudio 设备索引；找不到返回 None。
+
+    值的两种形态：
+      * 纯数字（含 -1）—— 老配置里的索引，原样返回（负数 = 系统默认）；
+      * 设备名 —— **稳定键**：名字对同一台物理设备是稳的，而 PortAudio 的索引会随
+        在位设备的增减整体平移（"同一个设备出现在不同的位置"就是这么来的）。
+        同名出现在多套 API 时按 `rank_hostapi()` 挑（WASAPI 优先）。
+    """
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if re.fullmatch(r"-?\d+", text):
+        return int(text)
+    best = None
+    try:
+        for d in list_input_devices_cached():
+            if str(d.get("name") or "") != text:
+                continue
+            rank = rank_hostapi(d.get("hostapi"))
+            if best is None or rank < best[0]:
+                best = (rank, int(d["index"]))
+    except Exception:
+        return None
+    return best[1] if best else None
+
 
 def resolve_input_device(purpose="command"):
-    """按用途解析要用的输入设备 id（-1 = 交给 PortAudio 选系统默认）。
+    """按用途解析要用的输入设备索引（-1 = 交给 PortAudio 选系统默认）。
 
     2026-09-23 用户需求："指令用耳机收音、会议用全向麦（MAXHUB）" —— 之前只有一个
     `inputDeviceId`，会议与指令只能共用同一个麦。优先级：
 
-        该用途自己的设置（>=0 才算） → 通用 `inputDeviceId` → -1
+        该用途自己的设置 → 通用 `inputDeviceId` → -1（系统默认）
 
-    取不到设置时返回 -1（= 系统默认），绝不抛异常：录音路径不该因为读配置失败就打不开麦。
+    设置值可以是**设备名（稳定键）**或老配置里的**索引**。**配置的设备不在位时回退到
+    默认设备，并写一条 warn 日志**（用户 2026-09-23 定的策略：宁可回退也不要打不开；
+    但绝不静默 —— 日志里说清"你要的那个没找到，这次用了默认"）。
+    任何异常都退回 -1：录音路径不该因为读配置失败就打不开麦。
     """
-    key = INPUT_DEVICE_KEYS.get(purpose, "")
     try:
         from app.config import settings
-        if key:
-            try:
-                own = int(settings.get(key, -1))
-            except (TypeError, ValueError):
-                own = -1
-            if own >= 0:
-                return own
-        try:
-            return int(settings.get("inputDeviceId", -1))
-        except (TypeError, ValueError):
-            return -1
     except Exception:
         return -1
+
+    def _read(key):
+        try:
+            return str(settings.get(key, "") or "").strip()
+        except Exception:
+            return ""
+
+    for key, label in ((INPUT_DEVICE_KEYS.get(purpose, ""), "该用途"),
+                       ("inputDeviceId", "默认")):
+        if not key:
+            continue
+        raw = _read(key)
+        if not raw or raw == "-1":
+            continue
+        idx = find_input_device(raw)
+        if idx is not None and idx >= 0:
+            return idx
+        if idx is not None and idx < 0:
+            return -1
+        # 名字没匹配上 = 设备不在位（拔了 / 没连上 / 改名了）
+        _warn_missing_device(key, raw, label)
+        return -1                      # 回退系统默认（用户定的策略）
+    return -1
+
+
+def _warn_missing_device(key, wanted, label):
+    """配置的设备找不到时的留痕（一次一条，绝不静默换麦）。"""
+    try:
+        from app import db
+        db.add_log("warn", "audio",
+                   f"配置的{label}输入设备「{wanted}」当前不可用（{key}），"
+                   f"本次回退到系统默认麦克风。插上设备后在 设置 → 语音命令 → 录音与转写 重选一次。")
+    except Exception:
+        pass
 
 
 def _write_wav(path, frames, sr=SAMPLE_RATE):
