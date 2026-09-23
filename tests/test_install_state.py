@@ -301,5 +301,50 @@ class VCRuntimeGuidanceTests(unittest.TestCase):
         self.assertIn("platform as echo_platform", src)
 
 
+class EngineProblemTests(unittest.TestCase):
+    """`engine_problem()` —— "这个 sttModel 取值现在能不能真用"（2026-09-23 事故）。
+
+    事故：用户在面板上把命令转写引擎改成 sherpa，而稳定版 runtime-core 里没有
+    `sherpa_onnx`。安装报告里登记的是另一个引擎，所以 `missing()` 一句话都不说；
+    设置热生效也绕过了校验 —— 直到说第一句命令才静默转写出空串。
+    """
+
+    def test_missing_module_is_reported(self):
+        with patch("app.install_state._module_ok", lambda name: name != "sherpa_onnx"), \
+                patch("app.install_state._model_ready", lambda mid: True):
+            problem = install_state.engine_problem("sherpa")
+        self.assertIn("sherpa_onnx", problem, "要说清缺哪个模块")
+        self.assertIn("能力", problem, "还要告诉用户去哪儿装")
+
+    def test_missing_model_is_reported(self):
+        with patch("app.install_state._module_ok", lambda name: True), \
+                patch("app.install_state._model_ready", lambda mid: False):
+            problem = install_state.engine_problem("sherpa")
+        self.assertIn("模型", problem)
+
+    def test_ready_engine_has_no_problem(self):
+        with patch("app.install_state._module_ok", lambda name: True), \
+                patch("app.install_state._model_ready", lambda mid: True):
+            self.assertEqual(install_state.engine_problem("sherpa"), "")
+            self.assertEqual(install_state.engine_problem("sensevoice"), "")
+
+    def test_unknown_choice_is_not_judged(self):
+        """认不出的值交给 stt.resolve_engine 的既有回退（它自己有告警），这里不表态。"""
+        self.assertEqual(install_state.engine_problem("不存在的引擎"), "")
+        self.assertEqual(install_state.engine_problem(""), "")
+
+    def test_engine_spec_maps_model_id_back_to_the_engine(self):
+        self.assertEqual(install_state.engine_spec("sherpa")["module"], "sherpa_onnx")
+        self.assertEqual(install_state.engine_spec("whisper-base")["stt"], "base")
+        self.assertEqual(install_state.engine_spec("kws"), {}, "KWS 不是转写引擎")
+
+    def test_problem_never_raises_on_a_broken_probe(self):
+        with patch("app.install_state._module_ok", side_effect=RuntimeError("boom")):
+            try:
+                install_state.engine_problem("sherpa")
+            except Exception as exc:                       # pragma: no cover - 失败即测试失败
+                self.fail("校验不能把调用方（保存设置）带崩：%s" % exc)
+
+
 if __name__ == "__main__":
     unittest.main()

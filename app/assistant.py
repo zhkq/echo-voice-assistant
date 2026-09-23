@@ -273,14 +273,23 @@ def capture(source="hotkey"):
     return True
 
 
+#: `_transcribe_command()` 的第三个返回值 —— 决定调用方怎么跟人说话
+ASR_OK = "ok"          # 拿到文本
+ASR_EMPTY = "empty"    # 引擎正常，但这段没听到内容（该提示"再说一次"）
+ASR_ERROR = "error"    # 引擎/依赖/模型出问题（该提示"引擎没装/报错"，**不能**说"没听清"）
+
+
 def _transcribe_command(wav, cfg):
     """命令转写：显式配了 `providerAsr` 就走 provider（P5），否则走本地引擎。
 
-    返回 ``(text, note)``：`note` 说明"走了谁 / 为什么没有文本"，供调用方写日志
-    （§19 发现③：空结果不许与"引擎挂了"混成一个空串）。
+    返回 ``(text, note, status)``：`note` 说明"走了谁 / 为什么没有文本"，供日志；
+    `status` ∈ ``ok/empty/error``。
 
-    为什么抽成函数：命令口述与会议转写必须用**同一条判据**
-    （`providers.asr_if_configured()`，只写一份），而且抽出来才能不开麦克风就测它。
+    为什么要分 status（2026-09-23 事故）：稳定版 runtime-core 里没装 `sherpa_onnx`，
+    命令转写每次都抛 ModuleNotFoundError 返回空串，而写进日志的只有一句
+    「转写为空（engine=sherpa）」—— 读起来像"没听清"，面板不报、用户以为录音坏了，
+    真正的根因（缺 pip 包）一个字都没露。判据与会议转写**共用** `transcribe_ex()`
+    （它就是为了把"这段没人说话"和"引擎挂了"分开才加的，见 §19 发现③）。
     """
     from app import providers as providers_mod
     provider, why = providers_mod.asr_if_configured()
@@ -291,9 +300,9 @@ def _transcribe_command(wav, cfg):
             note = "provider=%s" % why
             if out.get("reason"):
                 note += " reason=%s" % out["reason"]
-            return text, note
+            return text, note, ASR_OK if text else ASR_EMPTY
         except Exception as e:
-            return "", "provider=%s 失败：%s" % (why, e)
+            return "", "provider=%s 失败：%s" % (why, e), ASR_ERROR
     engine = cfg.get("sttModel", "sensevoice")
     stt_engine, stt_model = "whisper", engine
     if engine == "sensevoice":
@@ -301,12 +310,40 @@ def _transcribe_command(wav, cfg):
     elif engine == "sherpa":
         stt_engine = "sherpa"
     try:
-        text = stt_mod.transcribe(wav, engine=stt_engine, model=stt_model,
-                                  lang=cfg.get("sttLanguage", "zh"),
-                                  device=cfg.get("device", "auto"))
-    except Exception as e:
-        return "", "engine=%s 失败：%s" % (stt_engine, e)
-    return " ".join((text or "").split()), "engine=%s" % stt_engine
+        res = stt_mod.transcribe_ex(wav, engine=stt_engine, model=stt_model,
+                                    lang=cfg.get("sttLanguage", "zh"),
+                                    device=cfg.get("device", "auto"))
+    except Exception as e:                     # transcribe_ex() 自己不抛，这里只是护栏
+        return "", "engine=%s 失败：%s" % (stt_engine, e), ASR_ERROR
+    text = " ".join((res.get("text") or "").split())
+    note = "engine=%s status=%s" % (stt_engine, res.get("status"))
+    if res.get("detail"):
+        note += " detail=%s" % res["detail"]
+    if res.get("status") != stt_mod.TRANSCRIBE_OK or not text:
+        return text, note, ASR_ERROR if res.get("status") == stt_mod.TRANSCRIBE_ERROR else ASR_EMPTY
+    return text, note, ASR_OK
+
+
+#: 引擎的 pip 模块名 → 包名（`pip install` 用包名，报错里出现的是模块名）
+_ASR_MODULE_PKGS = (("sherpa_onnx", "sherpa-onnx"), ("faster_whisper", "faster-whisper"),
+                    ("funasr", "funasr"), ("qwen_asr", "qwen-asr"), ("ctranslate2", "ctranslate2"))
+
+
+def asr_failure_hint(note):
+    """把转写失败的原因翻成**一句用户能照着做的话**（桌面通知里用）。
+
+    `note` 是给日志的原始串（可能含 `ModuleNotFoundError: No module named 'sherpa_onnx'`）；
+    对用户直接抛这句等于没说 —— 要告诉他缺什么、去哪儿装。
+    """
+    low = str(note or "").lower()
+    for mod, pkg in _ASR_MODULE_PKGS:
+        if mod in low:
+            return "转写引擎没装（缺 %s）：面板「能力」页那行有可复制的安装命令" % pkg
+    if "文件不存在" in low or "no such file" in low:
+        return "录音文件没生成，请再说一次"
+    if "out of memory" in low or "显存" in low:
+        return "转写引擎显存不足：可换成 CPU 或更小的模型（设置 → 模型）"
+    return "转写引擎报错，命令没发出去：%s" % str(note or "")[:120]
 
 
 def _capture_worker(source):
@@ -342,10 +379,19 @@ def _capture_worker(source):
             return
         db.add_log("info", "assistant", f"录音完成: {os.path.basename(wav)}")
 
-        text, note = _transcribe_command(wav, cfg)
+        text, note, status = _transcribe_command(wav, cfg)
         if not text:
-            db.add_log("warn", "assistant", f"转写为空（{note}）")
             tts_mod.play_beep("err")
+            if status == ASR_ERROR:
+                # 引擎/依赖/模型的问题：**必须说出原因**。说成"没听清"会把用户
+                # 引到麦克风上去查，而真凶是没装的 pip 包（2026-09-23 事故）。
+                db.add_log("error", "assistant", f"命令转写失败（{note}）")
+                if cfg.get("notifyOnSend", True):
+                    notify("ECHO", asr_failure_hint(note))
+            else:
+                db.add_log("warn", "assistant", f"转写为空（{note}）")
+                if cfg.get("notifyOnSend", True):
+                    notify("ECHO", "没听清，请再说一次")
             return
         db.add_log("info", "assistant", f"识别: {text[:60]}（{note}）")
         print(f"[assistant] 识别: {text}")

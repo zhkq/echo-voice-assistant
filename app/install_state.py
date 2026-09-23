@@ -124,6 +124,49 @@ def _model_ready(model_id: str):
         return None
 
 
+def engine_spec(model_id: str) -> dict:
+    """按**模型 id** 反查引擎规格（返回副本，取不到给空 dict）。
+
+    为什么需要它：`app/components.py` 的 stt 组件只写 `model_id`（判"装没装"问
+    `modelinfo`），可"模型下好了"**不等于能用** —— 引擎的 pip 包是另一件事。
+    两张表要能对起来（`ENGINE_SPECS` 就是那张权威表），所以从这里反查，不在
+    components 里再抄一份。
+    """
+    mid = str(model_id or "")
+    for spec in ENGINE_SPECS.values():
+        if spec.get("model") == mid:
+            return dict(spec)
+    return {}
+
+
+def engine_problem(choice: str) -> str:
+    """这个 ``sttModel`` / ``meetingSttModel`` 取值**现在能不能真用**。
+
+    返回 ``""`` = 可用；否则一句给人看的原因（缺 pip 包 / 缺模型）。
+
+    为什么要有它（2026-09-23 实测事故）：`missing()` 只按**安装报告里登记过的引擎**
+    说话，而用户在面板上把 `sttModel` 改成没装过的引擎时那份报告不会变 —— 于是
+    "选了 sherpa、但稳定版 runtime-core 里没有 sherpa_onnx"一路无人提醒，
+    直到说第一句命令时才静默转写出空串（面板不报、DSH 也看不到请求）。
+    """
+    spec = ENGINE_SPECS.get(STT_TO_ENGINE.get(str(choice or "").strip(), "")) or {}
+    if not spec:
+        # 认不出的取值交给 stt.resolve_engine 的既有回退（它有告警），这里不表态
+        return ""
+    mod = str(spec.get("module") or "")
+    model = str(spec.get("model") or "")
+    try:
+        if mod and not _module_ok(mod):
+            return ("缺 Python 依赖 %s —— 转写时会直接报错；"
+                    "面板「能力」页对应组件那一行的「下载命令」可复制安装" % mod)
+        if model and _model_ready(model) is False:
+            return "模型文件还没就位（%s）—— 面板「能力」页那一行可直接下载" % model
+    except Exception as exc:
+        # 诊断函数不许把调用方（保存设置）带崩：说不清就说说不清
+        return "无法判断这个引擎能不能用（%s: %s）" % (type(exc).__name__, exc)
+    return ""
+
+
 def _node_ok() -> bool:
     try:
         import shutil

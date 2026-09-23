@@ -100,43 +100,45 @@ def _builtin() -> List[dict]:
         dict(id="stt-sensevoice", kind="stt", name="SenseVoice 中文短命令", optional=True, required=False,
              purpose="语音命令与会议转写的默认引擎（自带标点）",
              size_mb=896, platforms=["win32", "macos", "linux"], min_os={},
-             model_id="sensevoice", source="modelscope", ref="iic/SenseVoiceSmall",
+             model_id="sensevoice", pkg="funasr", source="modelscope", ref="iic/SenseVoiceSmall",
              how="面板下载或自行拷贝到 models/sensevoice；需 funasr + torch"),
         dict(id="stt-sherpa", kind="stt", name="sherpa-onnx 流式转写", optional=True, required=False,
              purpose="免 torch 的轻量流式转写（推荐组合之一，D1）",
              size_mb=189, platforms=["win32", "macos", "linux"], min_os={},
-             model_id="sherpa", source="modelscope",
-             how="面板下载或自行拷贝到 models/sherpa-onnx-streaming"),
+             model_id="sherpa", pkg="sherpa-onnx", source="modelscope",
+             how="面板下载或自行拷贝到 models/sherpa-onnx-streaming；"
+                 "**还要装 pip 包 sherpa-onnx**（模型和引擎是两件事，"
+                 "2026-09-23 实测：只下模型时语音指令会静默转写出空串）"),
         dict(id="stt-whisper-tiny", kind="stt", name="Whisper tiny", optional=True, required=False,
              purpose="最小最快的档位（精度最低，适合纯英文短句）",
              size_mb=75, platforms=["win32", "macos", "linux"], min_os={},
-             model_id="whisper-tiny",
+             model_id="whisper-tiny", pkg="faster-whisper",
              source="hf-mirror", how="面板下载或从源机拷贝 models/faster-whisper/tiny"),
         dict(id="stt-whisper-base", kind="stt", name="Whisper base", optional=True, required=False,
              purpose="免 torch 的推荐组合之一（D1：sherpa-onnx + whisper-base）",
              size_mb=141, platforms=["win32", "macos", "linux"], min_os={},
-             model_id="whisper-base",
+             model_id="whisper-base", pkg="faster-whisper",
              source="hf-mirror", how="面板下载或从源机拷贝 models/faster-whisper/base"),
         dict(id="stt-whisper-small", kind="stt", name="Whisper small", optional=True, required=False,
              purpose="多语种转写（推荐组合之一，D1）",
              size_mb=464, platforms=["win32", "macos", "linux"], min_os={},
-             model_id="whisper-small",
+             model_id="whisper-small", pkg="faster-whisper",
              source="hf-mirror", how="面板下载或从源机拷贝 models/faster-whisper/small"),
         dict(id="stt-whisper-medium", kind="stt", name="Whisper medium", optional=True, required=False,
              purpose="介于 small 与 large-v3 之间的档位（内存换精度）",
              size_mb=1500, platforms=["win32", "macos", "linux"], min_os={},
-             model_id="whisper-medium",
+             model_id="whisper-medium", pkg="faster-whisper",
              source="hf-mirror", how="面板下载或从源机拷贝 models/faster-whisper/medium"),
         dict(id="stt-whisper-large-v3", kind="stt", name="Whisper large-v3", optional=True, required=False,
              purpose="精度优先的转写档位（显存/内存占用大）",
              size_mb=2950, platforms=["win32", "macos", "linux"], min_os={},
-             model_id="whisper-large-v3",
+             model_id="whisper-large-v3", pkg="faster-whisper",
              source="hf-mirror", how="面板下载（约 3 GB）；建议配合 accel-cuda"),
         dict(id="stt-qwen3asr", kind="stt", name="Qwen3-ASR 0.6B + 强制对齐", optional=True, required=False,
              purpose="方言/口音更强的转写，并给出逐句时间对齐",
              size_mb=3600, platforms=["win32", "macos", "linux"], min_os={},
-             model_id="qwen3asr", source="modelscope", ref="Qwen/Qwen3-ASR-0.6B",
-             how="scripts/install-qwen3asr.ps1（首次自动从 ModelScope 下载）"),
+             model_id="qwen3asr", pkg="qwen-asr", source="modelscope", ref="Qwen/Qwen3-ASR-0.6B",
+             how="scripts/install-qwen3asr.ps1（首次自动从 ModelScope 下载）；需 qwen-asr + transformers"),
         dict(id="wake-kws", kind="wake", name="唤醒词 KWS", optional=True, required=False,
              purpose="离线关键词唤醒（默认不装：需常开麦克风，有隐私成本）",
              size_mb=40, platforms=["win32", "macos", "linux"], min_os={},
@@ -204,12 +206,36 @@ def _probe_url(url: str, timeout: float = 0.8) -> bool:
         return False
 
 
+def _module_ok(name: str) -> bool:
+    """pip 依赖在不在 —— **以 import 为准**（与 `install_state._module_ok()` 同一判据）。"""
+    if not name:
+        return True
+    try:
+        return importlib.util.find_spec(name) is not None
+    except Exception:
+        return False
+
+
+def _engine_spec(model_id: str) -> dict:
+    """模型 id → 引擎规格（stt 组件的 pip 依赖从这里取，不在本文件里再抄一份）。"""
+    try:
+        from app import install_state
+        return install_state.engine_spec(model_id)
+    except Exception:
+        return {}
+
+
 def _detect(item: dict) -> Optional[bool]:
     """按清单里的 ``detect`` 判断本机是否已具备。返回 True/False/None（无法判定）。
 
     **有 ``model_id`` 的组件直接问 `modelinfo`**（2026-09-19 合并「模型/组件」两个页签时定的）：
     同一份权重原来有两套判据（组件清单写死路径、modelinfo 各写一个 ready 函数），
     两边一旦分叉就会出现"组件说已装、模型说没装"。现在模型类组件只有一个判据来源。
+
+    **但"模型在"不等于"能用"**：stt 引擎还要 pip 包（sherpa-onnx / funasr /
+    faster-whisper…）。2026-09-23 实测事故：稳定版 `models/sherpa-onnx-streaming` 齐全、
+    面板显示「已就绪」，而 runtime-core 里没有 `sherpa_onnx` —— 每次语音指令都在
+    转写处抛 ModuleNotFoundError，面板一声不响。所以模型类组件**两个条件都要过**。
 
     **``{"setting": key}``** 用于"本机服务"类组件（DSH Desktop / 独立 harness）：把配置里的值
     当服务地址探一下 —— 这样它就绪判据跟 ECHO 实际连的地址一致，配置改了判据跟着变。
@@ -221,9 +247,13 @@ def _detect(item: dict) -> Optional[bool]:
     if mid:
         try:
             from app import modelinfo
-            return modelinfo.ready(mid)
+            ready = modelinfo.ready(mid)
         except Exception:
             return None
+        spec = _engine_spec(mid)
+        if ready and not _module_ok(str(spec.get("module") or "")):
+            return False
+        return ready
     d = item.get("detect") or {}
     if d.get("setting"):
         try:
@@ -249,16 +279,35 @@ def _detect(item: dict) -> Optional[bool]:
             p = os.path.join(models, rel.replace("/", os.sep))
             checks.append(os.path.isfile(p) or os.path.isdir(p))
     if d.get("python"):
-        try:
-            checks.append(importlib.util.find_spec(d["python"]) is not None)
-        except Exception:
-            checks.append(False)
+        checks.append(_module_ok(str(d["python"])))
     if d.get("exe"):
         checks.append(os.path.isfile(d["exe"]))
     if not checks:
         return None
     # any 语义：模型类组件常有多条落地路径，命中一条即算就绪；python 类同理
     return any(checks)
+
+
+def not_ready_reason(item: dict) -> Tuple[str, str]:
+    """「没装」的那一行**到底缺什么**：返回 ``(kind, 给人看的一句话)``。
+
+    kind ∈ ``""``（说不出）/ ``"python"``（缺 pip 包）/ ``"model"``（缺模型文件）——
+    面板据此把徽标从「⬇ 未安装」换成准确的「⚠ 缺依赖」（模型其实已经下好了）。
+    """
+    mid = item.get("model_id")
+    if not mid:
+        return "", ""
+    spec = _engine_spec(mid)
+    mod = str(spec.get("module") or "")
+    if not _module_ok(mod):
+        return "python", "缺 Python 依赖 %s —— 模型下好了也转写不了" % mod
+    try:
+        from app import modelinfo
+        if modelinfo.ready(mid) is False:
+            return "model", "模型文件还没下载"
+    except Exception:
+        pass
+    return "", ""
 
 
 # ---------------------------------------------------------------- 清单装载
@@ -362,6 +411,15 @@ def catalog(*, platform: Optional[str] = None, os_version: Optional[Tuple[int, .
             row["ready"] = _detect(item)
         except Exception:
             row["ready"] = None
+        # 「没就绪」要能说出缺什么：只说"未安装"会把用户引到下载模型上，
+        # 而真正缺的可能是 pip 包（2026-09-23 事故）。面板据 readyKind 换徽标措辞。
+        row["readyKind"] = ""
+        row["readyReason"] = ""
+        if row["ready"] is False:
+            try:
+                row["readyKind"], row["readyReason"] = not_ready_reason(item)
+            except Exception:
+                row["readyKind"], row["readyReason"] = "", ""
         if item.get("kind") == "agent":
             row["active"] = _agent_active(item["id"])
         out.append(row)

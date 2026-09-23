@@ -31,6 +31,21 @@ function toast(msg, ms = 2600) {
   t._timer = setTimeout(() => t.classList.add("hidden"), ms);
 }
 
+/** 保存设置后的提示：**联动没成功的要当场说出来**。
+ *
+ *  后端 `PUT /api/settings` 会把联动结果放在 `effects` 里。像「命令转写引擎改成了
+ *  sherpa，但这台机器没装 sherpa_onnx」这种事，若只提示"已保存"，用户要等到说第一句
+ *  命令时才发现——那时表现为"录音正常但没反应"，极难自己查到（2026-09-23 事故）。
+ */
+function toastSaved(r, fallback = "已保存") {
+  const bad = (((r || {}).effects) || []).filter((e) => e && e.ok === false);
+  if (bad.length) {
+    toast("已保存，但有联动没成功：" + bad.map((e) => e.detail).join("；"), 8000);
+    return;
+  }
+  toast(fallback);
+}
+
 /**
  * 自绘确认弹窗（替代浏览器原生 confirm）。
  *
@@ -1425,6 +1440,9 @@ function capCompBadge(c) {
     if (c.active === false) return modelBadge("⏹ 未使用（你选的是另一个）", "idle");
     return modelBadge(c.ready === false ? "⏹ 未运行" : "未知", "warn");
   }
+  // 「缺 pip 依赖」与「模型没下」是**两件事**：前者说"未安装"会把用户引去下载模型
+  // （模型其实已经在了）—— 2026-09-23 实测事故就是这么被误导的。
+  if (c.ready === false && c.readyKind === "python") return modelBadge("⚠ 缺依赖", "warn");
   if (c.ready === false) return modelBadge(c.model_id ? "⬇ 未安装" : "未安装", "warn");
   return modelBadge("未知", "idle");
 }
@@ -1443,7 +1461,15 @@ function capCompActions(c) {
     if (job.status === "running") {
       return `<span class="muted" style="font-size:12px">下载中 ${Math.round(job.percent || 0)}%</span>`;
     }
-    return modelActions(m);
+    // 模型类组件也可能缺 **pip 依赖**（如 sherpa：模型下好了、sherpa_onnx 没装）。
+    // 这时光给「下载模型」是错的 —— 把后端拼好的安装命令一并摆出来。
+    const needPip = c.readyKind === "python" && c.command;
+    const pipBtn = needPip
+      ? `<button type="button" class="btn mini" data-mcopy="${esc(c.command)}"
+          title="先装引擎依赖（复制后粘进终端执行）：&#10;${esc(c.command)}"
+          >复制安装命令</button>`
+      : "";
+    return modelActions(m) + pipBtn;
   }
   const btns = [];
   if (c.command) {
@@ -1483,6 +1509,7 @@ function capCompTable(comps, currentIds) {
         <span class="cap-comp-badge">${capCompBadge(c)}</span>
       </div>
       <div class="cap-comp-meta">${esc(meta)}</div>
+      ${c.readyReason ? `<div class="cap-comp-meta" style="color:var(--red)">${esc(c.readyReason)}</div>` : ""}
       ${how}
       <div class="cap-comp-acts">${capCompActions(c)}</div>
     </div>`;
@@ -1752,10 +1779,10 @@ function bindCapCards() {
     else if (el.dataset.ttsEngine) { key = "ttsEngine"; val = el.value; }
     else return;
     try {
-      await api("/api/settings", { method: "PUT", body: JSON.stringify({ values: { [key]: val } }) });
-      toast("已更新");
-      const r = await api("/api/settings");
-      _settingsCache = r.settings || _settingsCache;
+      const r = await api("/api/settings", { method: "PUT", body: JSON.stringify({ values: { [key]: val } }) });
+      toastSaved(r, "已更新");
+      const r2 = await api("/api/settings");
+      _settingsCache = r2.settings || _settingsCache;
       loadCapabilities();
     } catch (err) { toast("更新失败：" + err.message); }
   });
@@ -1772,8 +1799,8 @@ function bindCapCards() {
       });
       if (!Object.keys(values).length) { toast("没有需要保存的改动"); return; }
       try {
-        await api("/api/settings", { method: "PUT", body: JSON.stringify({ values }) });
-        toast("已保存 " + Object.keys(values).length + " 项");
+        const r = await api("/api/settings", { method: "PUT", body: JSON.stringify({ values }) });
+        toastSaved(r, "已保存 " + Object.keys(values).length + " 项");
         loadCapabilities();
       } catch (err) { toast("保存失败：" + err.message); }
       return;
@@ -1849,8 +1876,8 @@ function bindRouterLlm(host) {
     });
     if (!Object.keys(values).length) { toast("没有需要保存的改动"); return; }
     try {
-      await api("/api/settings", { method: "PUT", body: JSON.stringify({ values }) });
-      toast("已保存 " + Object.keys(values).length + " 项");
+      const r = await api("/api/settings", { method: "PUT", body: JSON.stringify({ values }) });
+      toastSaved(r, "已保存 " + Object.keys(values).length + " 项");
       loadRouterLlm();
     } catch (err) { toast("保存失败：" + err.message); }
   });
@@ -1872,10 +1899,10 @@ document.addEventListener("change", async (e) => {
   if (!kind) return;
   const key = "provider" + kind.charAt(0).toUpperCase() + kind.slice(1);
   try {
-    await api("/api/settings", { method: "PUT", body: JSON.stringify({ values: { [key]: e.target.value } }) });
-    toast("已切换到：" + e.target.value);
-    const r = await api("/api/settings");
-    _settingsCache = r.settings || _settingsCache;
+    const r = await api("/api/settings", { method: "PUT", body: JSON.stringify({ values: { [key]: e.target.value } }) });
+    toastSaved(r, "已切换到：" + e.target.value);
+    const r2 = await api("/api/settings");
+    _settingsCache = r2.settings || _settingsCache;
     refreshAfterProviderChange();
   } catch (err) { toast("切换失败：" + err.message); }
 });
@@ -2544,7 +2571,7 @@ $("#btnSettingsSave").addEventListener("click", async () => {
   Object.keys(_agentDirty).forEach((k) => { values[k] = _agentDirty[k]; });
   try {
     const r = await api("/api/settings", { method: "PUT", body: JSON.stringify({ values }) });
-    toast("已保存 " + Object.keys(r.updated).length + " 项");
+    toastSaved(r, "已保存 " + Object.keys(r.updated).length + " 项");
     Object.keys(_agentDirty).forEach((k) => delete _agentDirty[k]);
     await loadAgents(false);
     renderAgentTable();
@@ -2839,8 +2866,8 @@ function renderBoot(bs) {
   $$("#bootComponents .boot-model").forEach((sel) => sel.addEventListener("change", async (e) => {
     const key = e.currentTarget.dataset.model === "stt-cmd" ? "sttModel" : "meetingSttModel";
     try {
-      await api("/api/settings", { method: "PUT", body: JSON.stringify({ values: { [key]: e.currentTarget.value } }) });
-      toast("已切换模型，重新加载中…");
+      const r = await api("/api/settings", { method: "PUT", body: JSON.stringify({ values: { [key]: e.currentTarget.value } }) });
+      toastSaved(r, "已切换模型，重新加载中…");
       await post(`/api/boot/component/${e.currentTarget.dataset.model}/start`, {});
       loadBoot();
     } catch (err) { toast("切换失败：" + err.message); }

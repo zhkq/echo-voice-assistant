@@ -241,11 +241,17 @@ def _quiet_side_effects():
     而 pid 文件走 `paths.data_root()`、**不受测试里替换的 `db.DATA_DIR` 约束** ——
     也就是会把开发机上正在跑的标准版 harness 杀掉（AGENTS.md 记过同类事故）。
     改成整体替身：这条用例只关心"设置读得回来"。
+
+    **`_stt` 同理**（2026-09-23 补）：这轮 PUT 里有 `sttModel`/`meetingSttModel`，
+    联动会去 `boot.start_component("stt-cmd")` —— 那是**真加载模型**（funasr/whisper，
+    几 GB、几十秒），测试会被拖死甚至把显存占满。设置能不能读回来与它无关。
     """
     with patch("app.runtime.stop_wake"), patch("app.runtime.start_wake"), \
             patch("app.router_admin.apply_settings", lambda updated: (True, "")), \
             patch("app.settings_effects._agent",
-                  lambda *a, **kw: {"scope": "agent", "ok": True, "detail": ""}):
+                  lambda *a, **kw: {"scope": "agent", "ok": True, "detail": ""}), \
+            patch("app.settings_effects._stt",
+                  lambda *a, **kw: {"scope": "stt", "ok": True, "detail": ""}):
         yield
 
 

@@ -295,14 +295,17 @@ def put_settings(body: SettingsIn, _auth=Depends(optional_auth)):
     # 都享受不到它 —— 向导执行相就是调 `settings.update()` 的，实测"在向导里选了标准版"
     # 从来没把 harness 拉起来（2026-09-20）。
     from app import settings_effects
-    for eff in settings_effects.apply(updated):
+    effects = settings_effects.apply(updated)
+    for eff in effects:
         if eff["scope"] == "router" and not eff["ok"]:
             # 路由配置没应用上要明确失败（原来就是 400）；其余联动只记日志，
             # 选择已经生效，只是服务/进程没起来 —— 面板的「检测」会显示原因。
             raise HTTPException(status_code=400, detail=f"路由配置未能应用：{eff['detail']}")
         if not eff["ok"]:
             print("[api] %s 联动未成功: %s" % (eff["scope"], eff["detail"]))
-    return {"ok": True, "updated": updated}
+    # effects 一起回给面板：像「选的转写引擎没装」这种，用户必须**当场**知道，
+    # 不然要等说第一句命令才遇到静默失败（2026-09-23 事故）。
+    return {"ok": True, "updated": updated, "effects": effects}
 
 
 @router.get("/agents")

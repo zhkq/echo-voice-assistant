@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""settings_effects.py — 设置变更后的**联动**（wake / router / 智能体-harness）
+"""settings_effects.py — 设置变更后的**联动**（wake / router / 智能体-harness / 转写引擎）
 
 为什么单独一层
 --------------
@@ -21,6 +21,12 @@ from __future__ import annotations
 #: 向导执行相用它：只给"启动后立即失败"留一点探测时间，避免把 `POST /api/wizard/execute`
 #: 卡满 harness 的 READY_TIMEOUT（60s —— 首次 npx 装插件确实要那么久，但那是后台的事）。
 WIZARD_HARNESS_TIMEOUT = 4.0
+
+#: 转写引擎设置 → （boot 组件 id，要不要让组件按新引擎重载）
+#: `stt-cmd` 是**常驻**（启动时就预热模型），换引擎必须重载，否则"常驻"的还是旧模型；
+#: `stt-meeting` 是**按需**（开会才加载），只校验不预热 —— 不能为改一个设置就把
+#: 会议模型塞进显存。
+_STT_KEYS = {"sttModel": ("stt-cmd", True), "meetingSttModel": ("stt-meeting", False)}
 
 
 def _wake_device_keys() -> set:
@@ -56,6 +62,11 @@ def apply(updated, *, harness_timeout=None) -> list:
 
     if any(k.startswith("agent") or k.startswith("harness") for k in keys):
         out.append(_agent(harness_timeout))
+
+    # 转写引擎：改了就**当场校验**并让常驻组件重载（否则设置热生效会绕过
+    # "这个引擎到底能不能用"，见 _stt 的注释）。
+    if any(k in _STT_KEYS for k in keys):
+        out.append(_stt(updated))
 
     return out
 
@@ -129,3 +140,40 @@ def _agent(harness_timeout=None) -> dict:
     except Exception as exc:
         notes.append("注册 ECHO AUTO 异常：%s" % exc)
     return {"scope": "agent", "ok": ok, "detail": "；".join(n for n in notes if n)}
+
+
+def _stt(updated) -> dict:
+    """换了转写引擎：**当场校验它能不能用**，并让常驻组件按新引擎重载。
+
+    2026-09-23 实测：面板把「命令转写引擎」改成 sherpa（而这台稳定版 `runtime-core`
+    里没有 `sherpa_onnx`）之后，`stt-cmd` 组件仍显示「sensevoice · 就绪」——
+    直到说第一句命令才静默失败（转写出空串、DSH 什么都没收到）。
+    设置热生效不该绕过"这个引擎到底能不能用"，校验结果随 `PUT /api/settings` 一起
+    回给面板，用户当场就能看到原因。
+    """
+    from app.config import settings as _settings
+    notes, ok = [], True
+    for key, (cid, warm) in _STT_KEYS.items():
+        if key not in updated:
+            continue
+        choice = str(_settings.get(key, "") or "")
+        try:
+            from app import install_state
+            problem = install_state.engine_problem(choice)
+        except Exception as exc:                   # 校验自己不能把设置保存搞崩
+            problem = "校验失败：%s" % exc
+        if problem:
+            ok = False
+            notes.append("「%s」现在用不了：%s" % (choice or "(空)", problem))
+        else:
+            notes.append("「%s」可用" % (choice or "(空)"))
+        if not warm:
+            # 会议引擎是按需的：只校验，不为了改一个设置就把会议模型加载进显存
+            continue
+        try:
+            from app import boot
+            started, msg = boot.start_component(cid)
+            notes.append("已让「%s」按新引擎重载" % cid if started else "「%s」未重载（%s）" % (cid, msg))
+        except Exception as exc:
+            notes.append("重载 %s 失败：%s" % (cid, exc))
+    return {"scope": "stt", "ok": ok, "detail": "；".join(n for n in notes if n)}

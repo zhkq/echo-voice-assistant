@@ -214,7 +214,13 @@ class TranscribeImplWiringTests(unittest.TestCase):
 
 
 class CommandTranscribeTests(unittest.TestCase):
-    """命令口述转写也走 provider（P5）：判据与会议转写**同一份**（providers.asr_if_configured）。"""
+    """命令口述转写也走 provider（P5）：判据与会议转写**同一份**（providers.asr_if_configured）。
+
+    2026-09-23 事故后这里多钉一件事：`_transcribe_command()` 的第三个返回值
+    （ok/empty/error）必须把"引擎挂了"与"这段没人说话"分开 —— 稳定版没装 sherpa_onnx 时
+    命令转写每次都抛 ModuleNotFoundError，可日志里只有一句「转写为空（engine=sherpa）」，
+    于是被读成"没听清"，真正的根因一个字都没露。
+    """
 
     def setUp(self):
         self.logs = []
@@ -228,25 +234,28 @@ class CommandTranscribeTests(unittest.TestCase):
     def test_uses_provider_when_configured(self):
         fake = _FakeAsr(text="打开浏览器")
         with patch("app.providers.asr_if_configured", lambda: (fake, "openai-asr")), \
-                patch.object(self.assistant.stt_mod, "transcribe",
+                patch.object(self.assistant.stt_mod, "transcribe_ex",
                              side_effect=AssertionError("配了 provider 就不该调本地引擎")):
-            text, note = self.assistant._transcribe_command("a.wav", {"sttLanguage": "zh"})
+            text, note, status = self.assistant._transcribe_command("a.wav", {"sttLanguage": "zh"})
         self.assertEqual(text, "打开浏览器")
+        self.assertEqual(status, self.assistant.ASR_OK)
         self.assertIn("provider=openai-asr", note)
         self.assertEqual(fake.calls[0][1], "zh")
 
     def test_provider_error_returns_note_not_exception(self):
         fake = _FakeAsr(error=RuntimeError("openai-asr: HTTP 401 密钥无效"))
         with patch("app.providers.asr_if_configured", lambda: (fake, "openai-asr")):
-            text, note = self.assistant._transcribe_command("a.wav", {})
+            text, note, status = self.assistant._transcribe_command("a.wav", {})
         self.assertEqual(text, "")
+        self.assertEqual(status, self.assistant.ASR_ERROR)
         self.assertIn("401", note, "失败原因要能带到日志里")
 
     def test_provider_empty_result_keeps_the_reason(self):
         fake = _FakeAsr(text="", reason="empty-or-unknown")
         with patch("app.providers.asr_if_configured", lambda: (fake, "openai-asr")):
-            text, note = self.assistant._transcribe_command("a.wav", {})
+            text, note, status = self.assistant._transcribe_command("a.wav", {})
         self.assertEqual(text, "")
+        self.assertEqual(status, self.assistant.ASR_EMPTY, "provider 没报错就是 empty，不能算 error")
         self.assertIn("reason=empty-or-unknown", note)
 
     def test_local_path_used_when_not_configured(self):
@@ -254,24 +263,55 @@ class CommandTranscribeTests(unittest.TestCase):
 
         def fake_transcribe(wav, engine, model, lang, device):
             seen.update(engine=engine, model=model, lang=lang, device=device)
-            return "  你好   世界 "
+            return {"text": "  你好   世界 ", "status": stt.TRANSCRIBE_OK, "detail": ""}
 
         with patch("app.providers.asr_if_configured", lambda: (None, "未配置 providerAsr（用本地引擎）")), \
-                patch.object(self.assistant.stt_mod, "transcribe", fake_transcribe):
-            text, note = self.assistant._transcribe_command(
+                patch.object(self.assistant.stt_mod, "transcribe_ex", fake_transcribe):
+            text, note, status = self.assistant._transcribe_command(
                 "a.wav", {"sttModel": "sensevoice", "device": "cuda", "sttLanguage": "zh"})
         self.assertEqual(text, "你好 世界", "空白要归一化（老行为）")
+        self.assertEqual(status, self.assistant.ASR_OK)
         self.assertEqual(seen["engine"], "sensevoice")
         self.assertEqual(seen["device"], "cuda")
         self.assertIn("engine=sensevoice", note)
 
     def test_local_engine_failure_is_also_reported(self):
+        """本地引擎抛异常 → error（且原因进 note）—— 不许再被当成"没人说话"。"""
         with patch("app.providers.asr_if_configured", lambda: (None, "未配置")), \
-                patch.object(self.assistant.stt_mod, "transcribe",
+                patch.object(self.assistant.stt_mod, "transcribe_ex",
                              side_effect=RuntimeError("CUDA out of memory")):
-            text, note = self.assistant._transcribe_command("a.wav", {"sttModel": "whisper"})
+            text, note, status = self.assistant._transcribe_command("a.wav", {"sttModel": "whisper"})
         self.assertEqual(text, "")
+        self.assertEqual(status, self.assistant.ASR_ERROR)
         self.assertIn("CUDA out of memory", note)
+
+    def test_missing_dependency_is_error_not_empty(self):
+        """复现 2026-09-23 事故：引擎报"没有这个模块"必须是 error，并把原因带出来。"""
+        def boom(wav, engine, model, lang, device):
+            return {"text": "", "status": stt.TRANSCRIBE_ERROR,
+                    "detail": "sherpa: No module named 'sherpa_onnx'"}
+
+        with patch("app.providers.asr_if_configured", lambda: (None, "未配置")), \
+                patch.object(self.assistant.stt_mod, "transcribe_ex", boom):
+            text, note, status = self.assistant._transcribe_command("a.wav", {"sttModel": "sherpa"})
+        self.assertEqual(text, "")
+        self.assertEqual(status, self.assistant.ASR_ERROR)
+        self.assertIn("status=error", note)
+        self.assertIn("sherpa_onnx", note)
+        hint = self.assistant.asr_failure_hint(note)
+        self.assertIn("sherpa-onnx", hint, "给用户的话要说出缺哪个包（模块名对用户没用）")
+        self.assertIn("能力", hint, "还要告诉他在面板哪儿装")
+
+    def test_silence_is_empty_not_error(self):
+        """引擎正常但没内容 → empty：这时才该说"没听清"。"""
+        with patch("app.providers.asr_if_configured", lambda: (None, "未配置")), \
+                patch.object(self.assistant.stt_mod, "transcribe_ex",
+                             lambda *a, **kw: {"text": "", "status": stt.TRANSCRIBE_EMPTY,
+                                               "detail": "whisper 返回空结果"}):
+            text, note, status = self.assistant._transcribe_command("a.wav", {"sttModel": "whisper"})
+        self.assertEqual(text, "")
+        self.assertEqual(status, self.assistant.ASR_EMPTY)
+        self.assertIn("status=empty", note)
 
 
 if __name__ == "__main__":

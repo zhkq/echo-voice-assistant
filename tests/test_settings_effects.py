@@ -18,10 +18,12 @@ class DispatchTests(unittest.TestCase):
     def test_only_touched_scopes_run(self):
         with patch.object(settings_effects, "_wake") as w, \
                 patch.object(settings_effects, "_router") as r, \
-                patch.object(settings_effects, "_agent") as a:
+                patch.object(settings_effects, "_agent") as a, \
+                patch.object(settings_effects, "_stt") as s:
             w.return_value = {"scope": "wake", "ok": True, "detail": ""}
             r.return_value = {"scope": "router", "ok": True, "detail": ""}
             a.return_value = {"scope": "agent", "ok": True, "detail": ""}
+            s.return_value = {"scope": "stt", "ok": True, "detail": ""}
             self.assertEqual([e["scope"] for e in settings_effects.apply(["panelHotkey"])], [])
             self.assertEqual([e["scope"] for e in settings_effects.apply(["wakeEnabled"])], ["wake"])
             self.assertEqual([e["scope"] for e in settings_effects.apply(["wakeKeywords"])], ["wake"])
@@ -29,6 +31,10 @@ class DispatchTests(unittest.TestCase):
                              ["router"])
             self.assertEqual([e["scope"] for e in settings_effects.apply(["agentBackend"])], ["agent"])
             self.assertEqual([e["scope"] for e in settings_effects.apply(["harnessPort"])], ["agent"])
+            self.assertEqual([e["scope"] for e in settings_effects.apply(["sttModel"])], ["stt"])
+            self.assertEqual([e["scope"] for e in settings_effects.apply(["meetingSttModel"])], ["stt"])
+            self.assertEqual([e["scope"] for e in settings_effects.apply(["sttLanguage"])], [],
+                             "只改语言不用换引擎")
             self.assertEqual([e["scope"] for e in settings_effects.apply([])], [])
 
     def test_router_failure_is_reported_not_raised(self):
@@ -123,6 +129,75 @@ class AgentTests(unittest.TestCase):
                 patch("app.llm_router.sync") as sync:
             settings_effects.apply(["agentBackend"])
         sync.assert_not_called()
+
+
+class SttEngineEffectTests(unittest.TestCase):
+    """换转写引擎：**当场校验**它能不能用，并让常驻组件按新引擎重载。
+
+    2026-09-23 实测事故：面板把「命令转写引擎」改成 sherpa（而这台稳定版的
+    `runtime-core` 里没有 `sherpa_onnx`）后，`stt-cmd` 组件仍显示「sensevoice · 就绪」，
+    直到说第一句命令才静默转写出空串（面板不报、DSH 什么都没收到）。
+    设置热生效不该绕过"这个引擎到底能不能用"。
+    """
+
+    def _settings_get(self, values):
+        return lambda k, d=None: values.get(k, d)
+
+    def test_unusable_engine_is_reported_as_not_ok(self):
+        with patch("app.config.settings.get", self._settings_get({"sttModel": "sherpa"})), \
+                patch("app.install_state.engine_problem",
+                      lambda c: "缺 Python 依赖 sherpa_onnx"), \
+                patch("app.boot.start_component", lambda cid: (True, "已开始启动")):
+            out = settings_effects.apply(["sttModel"])
+        self.assertEqual([e["scope"] for e in out], ["stt"])
+        self.assertFalse(out[0]["ok"], "用不了的引擎要如实回 ok=False（API 只对 router 抛 400）")
+        self.assertIn("sherpa_onnx", out[0]["detail"])
+
+    def test_command_engine_reloads_the_resident_component(self):
+        """"常驻"的必须换掉，否则面板写着新引擎、实际还是旧模型在预热。"""
+        calls = []
+
+        def fake_start(cid):
+            calls.append(cid)
+            return True, "已开始启动"
+
+        with patch("app.config.settings.get", self._settings_get({"sttModel": "sensevoice"})), \
+                patch("app.install_state.engine_problem", lambda c: ""), \
+                patch("app.boot.start_component", fake_start):
+            out = settings_effects.apply(["sttModel"])
+        self.assertEqual(calls, ["stt-cmd"])
+        self.assertTrue(out[0]["ok"])
+        self.assertIn("重载", out[0]["detail"])
+
+    def test_meeting_engine_is_validated_but_not_preloaded(self):
+        """会议引擎是**按需**的：不能为了改一个设置就把会议模型塞进显存。"""
+        with patch("app.config.settings.get",
+                   self._settings_get({"meetingSttModel": "sensevoice"})), \
+                patch("app.install_state.engine_problem", lambda c: ""), \
+                patch("app.boot.start_component",
+                      side_effect=AssertionError("会议引擎不该被预热")):
+            out = settings_effects.apply(["meetingSttModel"])
+        self.assertTrue(out[0]["ok"])
+        self.assertIn("可用", out[0]["detail"])
+
+    def test_reload_refusal_is_reported_not_raised(self):
+        with patch("app.config.settings.get", self._settings_get({"sttModel": "sensevoice"})), \
+                patch("app.install_state.engine_problem", lambda c: ""), \
+                patch("app.boot.start_component", lambda cid: (False, "正在启动中")):
+            out = settings_effects.apply(["sttModel"])
+        self.assertIn("正在启动中", out[0]["detail"])
+
+    def test_validation_failure_never_raises(self):
+        """校验自己炸了也不能让「保存设置」失败（设置该存下来，原因写进 detail）。"""
+        def boom(_choice):
+            raise RuntimeError("install_state 炸了")
+
+        with patch("app.config.settings.get", self._settings_get({"sttModel": "sherpa"})), \
+                patch("app.install_state.engine_problem", boom), \
+                patch("app.boot.start_component", lambda cid: (True, "已开始启动")):
+            out = settings_effects.apply(["sttModel"])
+        self.assertFalse(out[0]["ok"])
+        self.assertIn("install_state 炸了", out[0]["detail"])
 
 
 if __name__ == "__main__":
