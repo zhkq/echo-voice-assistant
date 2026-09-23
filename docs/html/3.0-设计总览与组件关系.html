@@ -89,7 +89,7 @@ background:#2a2318;border:1px solid var(--yellow);color:var(--yellow);font-size:
 </style>
 </head><body>
 <div class="layout">
-<nav><div class="brand">ECHO 3.0 设计<small>架构设计文档</small></div><div class="docs"><a href="3.0-设计总览与组件关系.html" class="on">3.0 总览</a><a href="统一路由-模型能力与设备.html">统一路由</a><a href="能力路由-三后端与轻客户端.html">能力路由</a><a href="ECHO能力后端-服务端设计.html">能力后端</a><a href="前后分离-能力服务化设计.html">前后分离</a></div><div class="toc"><a class="l2" href="#h1">0. 一页速览</a><a class="l3" href="#h2">3.0 是什么</a><a class="l3" href="#h3">2.0 → 3.0 的变化</a><a class="l3" href="#h4">六条铁律（贯穿全部分册）</a><a class="l2" href="#h5">1. 组件关系总图</a><a class="l2" href="#h6">2. 数据与状态归属</a><a class="l3" href="#h7">2.1 目录与升级边界（&quot;删掉 ECHO 重装，用户不该丢任何东西&quot;）</a><a class="l3" href="#h13">2.2 安装根目录：{ECHO_BASE} 与它的兄弟目录</a><a class="l2" href="#h21">3. 一次会议转写的完整链路</a><a class="l2" href="#h22">4. 四个路由域的对齐</a><a class="l2" href="#h23">5. 能力槽 × 后端矩阵</a><a class="l3" href="#h24">5.1 声纹：它不跟着&quot;会议不兜底&quot;一起砍掉</a><a class="l2" href="#h29">6. 部署形态</a><a class="l3" href="#h30">6.1 客户端组件清单（必选 / 后装 / 可选）</a><a class="l3" href="#h31">6.2 智能体后端收敛到 DSH 标准版（唯一）</a><a class="l3" href="#h36">6.3 客户端最小安装范围（含要改的具体文件）</a><a class="l3" href="#h42">6.4 已经装过 DSH 的用户怎么办</a><a class="l2" href="#h48">7. 设备路由：两条泳道</a><a class="l2" href="#h49">8. 一致性对齐：修正了五处</a><a class="l3" href="#h50">还有两处需要收口（本次一并定）</a><a class="l2" href="#h51">9. 落地顺序（合并四份文档的排期）</a><a class="l2" href="#h52">10. 与现有代码的映射（落地挂点）</a><a class="l2" href="#h53">11. 未决问题汇总</a><a class="l2" href="#h54">12. 「会议不兜底」消掉了原来排的实测</a><a class="l3" href="#h55">但必须补上一件新的：离线队列</a></div></nav>
+<nav><div class="brand">ECHO 3.0 设计<small>架构设计文档</small></div><div class="docs"><a href="3.0-设计总览与组件关系.html" class="on">3.0 总览</a><a href="统一路由-模型能力与设备.html">统一路由</a><a href="能力路由-三后端与轻客户端.html">能力路由</a><a href="ECHO能力后端-服务端设计.html">能力后端</a><a href="前后分离-能力服务化设计.html">前后分离</a></div><div class="toc"><a class="l2" href="#h1">0. 一页速览</a><a class="l3" href="#h2">3.0 是什么</a><a class="l3" href="#h3">2.0 → 3.0 的变化</a><a class="l3" href="#h4">六条铁律（贯穿全部分册）</a><a class="l2" href="#h5">1. 组件关系总图</a><a class="l2" href="#h6">2. 数据与状态归属</a><a class="l3" href="#h7">2.1 目录与升级边界（&quot;删掉 ECHO 重装，用户不该丢任何东西&quot;）</a><a class="l3" href="#h13">2.2 安装根目录：{ECHO_BASE} 与它的兄弟目录</a><a class="l2" href="#h21">3. 一次会议转写的完整链路</a><a class="l2" href="#h22">4. 四个路由域的对齐</a><a class="l2" href="#h23">5. 能力槽 × 后端矩阵</a><a class="l3" href="#h24">5.1 声纹：它不跟着&quot;会议不兜底&quot;一起砍掉</a><a class="l2" href="#h29">6. 部署形态</a><a class="l3" href="#h30">6.1 客户端组件清单（必选 / 后装 / 可选）</a><a class="l3" href="#h31">6.2 智能体后端收敛到 DSH 标准版（唯一）</a><a class="l3" href="#h36">6.3 客户端最小安装范围（含要改的具体文件）</a><a class="l3" href="#h42">6.4 已经装过 DSH 的用户怎么办</a><a class="l3" href="#h48">6.5 标配化：会议转写 / 说话人分离 / 声纹比对</a><a class="l2" href="#h58">7. 设备路由：两条泳道</a><a class="l2" href="#h59">8. 一致性对齐：修正了五处</a><a class="l3" href="#h60">还有两处需要收口（本次一并定）</a><a class="l2" href="#h61">9. 落地顺序（合并四份文档的排期）</a><a class="l2" href="#h62">10. 与现有代码的映射（落地挂点）</a><a class="l2" href="#h63">11. 未决问题汇总</a><a class="l2" href="#h64">12. 「会议不兜底」消掉了原来排的实测</a><a class="l3" href="#h65">但必须补上一件新的：离线队列</a></div></nav>
 <main>
 <div class="banner"></div>
 <header class="doc"><h1>ECHO 3.0 设计总览与组件关系</h1>
@@ -486,9 +486,21 @@ env[&quot;DSH_HOME&quot;] = dsh_home          # 注释原文：&quot;独立家�
    · 沿用 → 只写 harnessHome
    · 导入 / 分开试用 → 建 {echoBase}/dsh/home，再跑 harness-install-local 装本体</code></pre>
 <p><strong>为什么"什么都没找到"也要问一句</strong>：<code>dsh_homes()</code> 的判据是 <code>settings.yaml</code>， 而<strong>装过但从未运行过的 DSH 没有这个文件</strong> —— 检测必然漏。问一句是最便宜的兜底， 也正是"不静默"原则的落点。</p>
-<p><strong>"导入"与"分开试用"的语义边界</strong></p>
-<div class="tw"><table><thead><tr><th></th><th>导入</th><th>分开试用</th></tr></thead><tbody><tr><td>技能</td><td><strong>复制</strong>到标准版家目录</td><td>不复制，留在桌面版</td></tr><tr><td>桌面版本体与家目录</td><td>原样不动</td><td>原样不动</td></tr><tr><td>会话 / 记忆</td><td><strong>不导</strong>（见下）</td><td>不导</td></tr><tr><td>面板上</td><td>标准版里立刻能看到那些技能</td><td>技能列表是空的，<strong>并明说为什么</strong></td></tr></tbody></table></div>
-<p><strong>只导 skills，不导会话/记忆。</strong> 会话存储是 DSH 的内部格式，跨版本导入风险高， 而且导坏了用户无从判断。v1 的边界是：<strong>技能是"能力"，可以搬；会话是"历史"， 留在原地（他打开桌面版就能看）</strong>。面板必须把这句话说出来，否则用户会以为都搬过来了。</p>
+<p><strong>"导入"与"分开试用"的语义边界</strong>（2026-09-23 定：<strong>只搬技能 + 大模型配置</strong>）</p>
+<div class="tw"><table><thead><tr><th></th><th>导入</th><th>分开试用</th></tr></thead><tbody><tr><td><strong>技能</strong></td><td><strong>复制</strong>到标准版家目录</td><td>不复制，留在桌面版</td></tr><tr><td><strong>大模型配置</strong></td><td><strong>合并</strong>（见下）</td><td>不合并</td></tr><tr><td>凭据（API key）</td><td><strong>单独问一句</strong>（见下）</td><td>不搬</td></tr><tr><td>桌面版本体与家目录</td><td>原样不动</td><td>原样不动</td></tr><tr><td><strong>会话 / 记忆</strong></td><td><strong>不搬</strong>（你不搬也对：跨版本格式风险高，坏了用户无从判断）</td><td>不搬</td></tr><tr><td>面板上</td><td>标准版里立刻能看到那些技能与模型</td><td>都是空的，<strong>并明说为什么</strong></td></tr></tbody></table></div>
+<p><strong>三件要分开处理，不能当成"复制一个目录"</strong></p>
+<p><strong>① 技能</strong> —— 直接复制 + 冲突处理（接上 <code>skills/</code> 的所有权机制，见下）。</p>
+<p><strong>② 大模型配置</strong> —— <strong>必须"合并"，不能"覆盖"。</strong> 两个原因：</p>
+<ul><li><code>settings.yaml</code> 是<strong>整个文件</strong>，里面不止模型配置（还有 UI、工作区等桌面版特有的东西）； 整文件复制会把不相干的设置也带过去</li><li><strong>ECHO 自己也会写这个文件</strong> —— <code>llm_router</code> 会把 <code>echo-auto</code> provider 注册进去。 直接覆盖会把 ECHO 刚写的冲掉</li></ul>
+<p>所以正确做法是：<strong>读桌面版 <code>settings.yaml</code> → 只提取 provider / model 相关段 → 合并进标准版的</strong> （标准版已有的键保留，尤其 <code>echo-auto</code>）。</p>
+<p><strong>③ 凭据（<code>.credentials.yaml</code>）—— 单独问一句</strong> ✅ <strong>已定（2026-09-23）</strong></p>
+<p>这是个容易漏的点：<strong>模型配置搬过去而密钥没搬，模型就是不可用的</strong>（provider 列出来了但没 key）。</p>
+<div class="tw"><table><thead><tr><th>选项</th><th>后果</th></tr></thead><tbody><tr><td>一起搬</td><td>立即可用；但同一份密钥在<strong>两个家目录各存一份</strong></td></tr><tr><td>不搬</td><td>更干净；但用户要<strong>重新填一次 key</strong></td></tr></tbody></table></div>
+<p><strong>决定</strong>：单独问一句 *"桌面版里配置的 API 密钥要一起复制过来吗？"* —— <strong>密钥的敏感性和技能不一样</strong>，不该被"导入技能"这个动作顺带决定。</p>
+<p><strong>提问时要做到的四点</strong>（否则这一问会变成走过场）：</p>
+<ol><li><strong>默认「不搬」</strong> —— 敏感东西的默认应当是保守的</li><li><strong>先列出来再问</strong>，不要只问"要不要"：*"发现 2 条密钥（内网网关 / DeepSeek 官方）"* —— 用户得知道自己在决定什么</li><li><strong>允许逐条勾选</strong> —— <code>.credentials.yaml</code> 里可能不止一条，用户未必都想搬 （实际通常只有 1–2 条，不会变成负担）</li><li><strong>说清搬完是"两份"</strong> —— 不替用户删桌面版那份（他可能还在用桌面版）， 但要讲明"以后换 key 得改两处"，否则将来一定困惑</li></ol>
+<p><strong>复制时保住权限</strong>：<code>.credentials.yaml</code> 通常要求 <code>0600</code>，复制后要<strong>显式设权限</strong>， 不能靠默认 umask 落地成可读。</p>
+<p><strong>为什么"会话 / 记忆"不搬（2026-09-23 定）</strong>：它是 DSH 的内部格式，跨版本导入风险高， 而且<strong>导坏了用户无从判断</strong>。边界是：<strong>技能与模型是"能力"，可以搬； 会话是"历史"，留在原地（他打开桌面版就能看）</strong>。 面板必须把这句话说出来，否则用户会以为都搬过来了。</p>
 <p><strong>"分开试用"必须可逆</strong> —— 它不该是一次性决定。面板要长期保留一个 <strong>「从桌面版导入技能」</strong>的入口：用户选"分开试用"往往是想先看看新版本， 试完再决定；把入口留着，"试用"才真的是试用。</p>
 <p><strong>技能冲突要接上 <code>skills/</code> 的所有权机制</strong>（§2.1）：</p>
 <ul><li>ECHO 自己装的（靠 <code>skills/.echo-managed</code> 清单识别）→ <strong>以包里的版本为准</strong></li><li>用户自己装的同名技能 → <strong>默认不覆盖</strong>，列出来让用户选</li><li>两侧同名 → 提示"桌面版有一份同名的，保留哪一份？"</li></ul>
@@ -503,8 +515,60 @@ env[&quot;DSH_HOME&quot;] = dsh_home          # 注释原文：&quot;独立家�
 <p>3.0 退役桌面版<strong>适配器</strong>（ECHO 不再通过它下命令），但：</p>
 <ul><li>桌面版<strong>本体不动</strong>，他可以在 ECHO 之外继续单独用</li><li>提供<strong>导入技能</strong>的显式操作：把桌面版家目录下的 <code>skills/</code> 复制进标准版家目录</li><li>面板明说一句：*"ECHO 3.0 起只用标准版；你原来的桌面版可以继续单独使用， 但它里面的技能和会话 ECHO 看不到了 —— 需要的话可以导入。"*</li></ul>
 <p>这样"退役"就不会被读成"数据丢了"。</p>
+<h3 id="h48">6.5 标配化：会议转写 / 说话人分离 / 声纹比对</h3>
+<p><strong>决定（2026-09-23）</strong>：把<strong>会议转写 / 说话人分离 / 声纹比对</strong>做成标配 —— <strong>删掉"是否开启"的开关，但不删掉这些配置本身</strong>（它们仍是设置 → 会议 下的重要内容）。 目的是减少配置复杂性：<strong>用户嫌的不是"配置多"，而是"要做没有信息量的决定"。</strong></p>
+<p><strong>"声纹入库"保持可选</strong> —— 这一条把误认风险一并解决了，见下。</p>
+<h4 id="h49">设置项怎么处理</h4>
+<div class="tw"><table><thead><tr><th>设置项</th><th>现值</th><th>处理</th><th>理由</th></tr></thead><tbody><tr><td><code>meetingDiarize</code></td><td><strong>False</strong></td><td><strong>删除</strong>，固定为开</td><td>3.0 里 diarize 在服务端，客户端零代价 —— 标配才因此可行</td></tr><tr><td><code>voiceprintEnabled</code></td><td><strong>False</strong></td><td><strong>删除</strong>，固定为开</td><td>比对总是尝试；库空时<strong>静默无结果</strong>，无副作用</td></tr><tr><td><code>voiceprintAutoEnroll</code></td><td>False</td><td><strong>保留为可选</strong>（默认<strong>关</strong>）</td><td>见下"为什么它不跟着标配"</td></tr><tr><td><code>voiceprintThreshold</code></td><td>0.65</td><td><strong>留在面板</strong>（会议 → 说话人 → 高级折叠）</td><td>认错人时它是<strong>唯一</strong>能调的东西；但默认收起，不占主视野</td></tr><tr><td><code>voiceprintMargin</code></td><td>0.05</td><td>同上</td><td></td></tr><tr><td><code>meetingSttModel</code></td><td><code>sensevoice</code></td><td><strong>删除</strong></td><td>3.0 里由<strong>能力路由</strong>按槽决定，不该是用户设置</td></tr><tr><td><code>providerAsr</code></td><td>—</td><td><strong>删除</strong>（同上）</td><td></td></tr><tr><td><code>meetingSegmentMinutes</code></td><td>10</td><td><strong>保留</strong></td><td>影响分段大小与离线队列粒度，是真需求</td></tr><tr><td><code>meetingAutoSummarize</code></td><td>True</td><td><strong>保留</strong></td><td>它控制的是 <strong>LLM 成本</strong>，不是质量；删了会让不想花钱的用户没法关</td></tr></tbody></table></div>
+<blockquote><p>判据一句话：<strong>"这是选择，还是状态 / 参数 / 成本？"</strong> —— 无信息量的二选一删掉；状态、参数、成本留下。</p></blockquote>
+<h4 id="h50">会议分组下的「说话人」子区（删掉开关，<strong>不是</strong>删掉配置区）</h4>
+<p><strong>要删的只是"是否开启说话人分离"这个二选一</strong>，不是整个配置区。 说话人分离与声纹<strong>仍然是设置 → 会议 下的重要内容</strong>，只是形态从"开关" 变成"<strong>状态 + 参数 + 入口</strong>"：</p>
+<pre class="code"><code>设置 → 会议
+├── 转写
+│   ├── 分段分钟          [10]                      ← 保留
+│   └── 自动生成纪要      [✓]                       ← 保留（控 LLM 成本）
+└── 说话人                                            ← 这一区保留，且是重点
+    ├── 分离与识别        ● 已启用（能力后端提供）    ← 只读状态，不再是开关
+    │                       pyannote-3.1 · ws-resnet34-v1
+    ├── 期望说话人数      [   ]  空 = 自动判断        ← ★新增，真有用的参数
+    ├── 声纹库            12 位联系人 · 38 条样本  [管理…]
+    ├── 记住联系人的声音  [ ]                         ← 原 autoEnroll，可选
+    └── 高级 ▾
+        ├── 匹配阈值      [0.65]
+        └── 歧义间隔      [0.05]</code></pre>
+<p><strong>为什么这些留着</strong>：</p>
+<div class="tw"><table><thead><tr><th>项</th><th>为什么留</th></tr></thead><tbody><tr><td><strong>只读状态行</strong></td><td>开关"开/关"其实承载了"到底生效了吗"这个问题；换成<strong>显示真实状态</strong>（启用 + 哪个模型 + 哪个 <code>vectorSpaceId</code>）信息量更大，而且不会出现"开了但后端没有引擎"的空转</td></tr><tr><td><strong>期望说话人数</strong>（新）</td><td>会议室里几个人用户是知道的。填了比让模型猜<strong>准得多</strong> —— <code>maxSpeakers</code> 已经能透传到 <code>/v1/diarize</code>（服务端 §6.5 已定义该参数）</td></tr><tr><td><strong>声纹库入口</strong></td><td>比对标配之后，用户需要知道"库里有什么、要不要清"</td></tr><tr><td><strong>记住联系人的声音</strong></td><td>上一条定的：可选（默认关）</td></tr><tr><td><strong>高级里的阈值 / 间隔</strong></td><td><strong>认错人时唯一的补救手段</strong>。默认收起、不占视野，但<strong>不能完全藏起来</strong> —— 藏起来等于出问题时没路可走</td></tr></tbody></table></div>
+<blockquote><p><strong>判据</strong>：<strong>删掉"要不要用"（无信息量的二选一），保留"用得怎么样"（状态、参数、补救）。</strong> 用户嫌的不是"配置多"，而是"要做没有信息量的决定"。</p></blockquote>
+<h4 id="h51">为什么 <code>voiceprintAutoEnroll</code> 不跟着标配 —— 它顺手把风险问题解决了</h4>
+<p><strong>关键推论：声纹比对的产出（自动命名）只在库非空时才会发生。</strong></p>
+<p>所以只要<strong>入库是用户主动的</strong>，风险就自然留在用户手里：</p>
+<div class="tw"><table><thead><tr><th></th><th>声纹库</th><th>比对行为</th><th>误认风险</th></tr></thead><tbody><tr><td>用户不开入库（<strong>默认</strong>）</td><td><strong>空</strong></td><td>静默无结果（<code>load_matcher()</code> 返回 <code>None</code>，直接返回"声纹库为空"）</td><td><strong>无</strong></td></tr><tr><td>用户开了入库</td><td>渐满</td><td>自动认人</td><td><strong>有，但那是他主动开的</strong></td></tr></tbody></table></div>
+<p>这也意味着<strong>我上一版提的 <code>name_source</code> 从"必须"降级为"可选改进"</strong>：</p>
+<ul><li>它原本是为了解决"默认承担风险、用户却看不见"</li><li>而<strong>现在默认根本不承担</strong> —— 库是空的，一个名字都不会被自动改</li><li>对<strong>主动开了入库</strong>的用户它仍有价值（一眼看出哪些名字是自动认的）</li><li>所以<strong>建议保留，但不阻塞其它工作</strong>（<code>ALTER TABLE speakers ADD COLUMN name_source TEXT DEFAULT &#x27;default&#x27;</code>）</li></ul>
+<h4 id="h52">入库的两条路（都要给，互不冲突）</h4>
+<div class="tw"><table><thead><tr><th>路径</th><th>适合谁</th><th>现在有没有</th></tr></thead><tbody><tr><td>全局开关 <code>voiceprintAutoEnroll</code>（默认<strong>关</strong>）：改名即入库</td><td>嫌麻烦的人，开一次就够</td><td>✅ 已有</td></tr><tr><td>显式「声纹入库」按钮：逐个说话人存</td><td>谨慎的人，只存确定的那几个</td><td>✅ 已有（<code>enroll_from_meeting</code>，面板入口 2026-09-21 就在）</td></tr></tbody></table></div>
+<p><strong>给"不喜欢声纹识别"的人一条干净的退出路径：什么都不做。</strong> 库永远是空的，比对静默无结果 —— 他连开关都不用去找。</p>
+<h4 id="h53">但有个体验缺口要补：用户怎么知道"声纹"这件事存在？</h4>
+<p>库空 = 完全无感，<strong>新用户永远发现不了这个功能</strong>。所以要给<strong>顺手且合语境的引导</strong>： 在会议说话人改名的地方放一句"<strong>记住这个人的声音？</strong>"（勾了才存）， 而不是只把一个全局开关藏在设置页里。</p>
+<p>这正是把"全局配置"变成"<strong>当下语境里的选择</strong>" —— 既减少了全局设置项，也更容易被发现。</p>
+<h4 id="h54">开了入库之后有个次要风险：会攒出"非联系人"</h4>
+<p><code>voiceprintAutoEnroll</code> 打开后，<strong>只要把说话人改个名就入库</strong>， 而 <code>is_default_name()</code> 只排除"说话人N" —— 所以"主持人""甲方"这类也会进声纹库。</p>
+<p><strong>不打算改逻辑</strong>（改名是用户的明确动作），但要保证： <strong>声纹库面板能一眼看出每个联系人有几条样本、并能逐条删</strong> —— 这个能力已经有了 （<code>delete_sample</code> / <code>delete_contact</code>），只要面板把它露出来。</p>
+<blockquote><p>注意这是<strong>可选路径上的问题</strong>，不再是"标配带来的副作用" —— 默认关的时候根本不会发生。</p></blockquote>
+<h4 id="h55">服务端侧：<code>diarize</code> 从"可选能力"升级为<strong>必备</strong></h4>
+<p>既然说话人分离是标配：</p>
+<ul><li><strong>服务端必须有可用的 <code>diarize</code></strong> —— <code>capabilities</code> 里缺它 = <strong>功能不完整</strong></li><li><strong>启动自检要报警</strong>：配了 diarize 模型但加载失败 → 管理面<strong>报红</strong> （以前默认关，失败无所谓；现在失败是功能缺失）</li><li><strong><code>/v1/ready</code> 的判据要包含 <code>diarize</code></strong>：只有 ASR 就绪<strong>不算</strong>就绪</li></ul>
+<h4 id="h56">一个要知道的连带代价：每段两次推理，而并发是 1</h4>
+<p>会议一段的链路是：</p>
+<pre class="code"><code>POST /v1/asr      （asr.text，可能还有 asr.timestamps）
+POST /v1/diarize  （diarize.turns + 嵌入）</code></pre>
+<p>而<strong>每客户端并发硬性 1</strong>（§服务端 §3.6）→ 同一段的这两三个请求是<strong>串行</strong>的。</p>
+<p>按现有实测估一下（10 分钟段）：ASR ≈ 8 s + diarize ≈ 14 s ≈ <strong>22 s/段</strong>； 一小时会议 6 段 ≈ <strong>2.2 分钟</strong>。<strong>这个量级可以接受，所以不改设计。</strong> 但两点要记住：</p>
+<ol><li><strong>顺序有讲究：先 <code>asr</code> 后 <code>diarize</code></strong> —— 文字先出来，用户更早看到内容； 而且 diarize 失败<strong>不该影响</strong>已经拿到的文字</li><li><strong>不要为了快把 asr 与 diarize 合成一个端点</strong> —— 那会破坏"服务端只认识槽"这个核心原则： 内部分别占两个模型的信号量、对外却只占一个客户端通道，<strong>总并发的算法会立刻变复杂</strong></li></ol>
+<h4 id="h57">迁移</h4>
+<ul><li>老用户库里那两个被删的键（<code>meetingDiarize</code> / <code>voiceprintEnabled</code>）<strong>留着没人读</strong>（无害）； 从 <code>DEFAULTS</code> 移除即可，面板不再显示</li><li><strong><code>voiceprintAutoEnroll</code> 不进弃用列表</strong> —— 它保留且<strong>仍是可选</strong>，老用户的值继续生效</li><li><strong>升级说明要写一句</strong>：*"3.0 起说话人分离与声纹比对默认启用，不再需要手动打开； 声纹库仍只存在你本机，可随时清空。"*</li><li>阈值 / 间隔门从面板移进隐藏设置，<strong>默认值不变</strong>（老用户调过的值仍然生效）</li></ul>
 <hr>
-<h2 id="h48">7. 设备路由：两条泳道</h2>
+<h2 id="h58">7. 设备路由：两条泳道</h2>
 <div class="diagram"><pre class="mermaid">flowchart LR
     subgraph LANES[&quot;两条平级泳道（无优先级）&quot;]
         direction TB
@@ -525,13 +589,13 @@ env[&quot;DSH_HOME&quot;] = dsh_home          # 注释原文：&quot;独立家�
     M --&gt;|&quot;同一设备&quot;| NO[&quot;后到者拒绝&lt;br/&gt;消息说清因果&quot;]</pre></div>
 <p><strong>唤醒不在图里</strong> —— 按约定本次排除。但要记住它是<strong>能力槽 <code>wake</code> 的本机实现</strong>， 只是<strong>不构成设备泳道</strong>（它沿用自己的设备设置，不进候选链）。</p>
 <hr>
-<h2 id="h49">8. 一致性对齐：修正了五处</h2>
+<h2 id="h59">8. 一致性对齐：修正了五处</h2>
 <p>分开写四份文档攒下的不一致，逐条裁定：</p>
 <div class="tw"><table><thead><tr><th>#</th><th>不一致</th><th>裁定</th></tr></thead><tbody><tr><td><strong>1</strong></td><td>前后分离 §9 说"给 <code>providers/</code> 加 <code>diarize</code> / <code>speaker-embed</code> 两个 kind"；能力路由 §9.1 说"新增 <code>app/capabilities/</code>，不要把槽塞进 providers"</td><td><strong>以能力路由为准。</strong> <code>providers/</code>（从 N 选 1）与能力槽（从 N 选 M 并<strong>拼装</strong>）是两个不同的问题；把后者塞进前者会把那个抽象撑坏。<code>providers/</code> 只保留 llm / tts / 整段 asr。</td></tr><tr><td><strong>2</strong></td><td>前后分离 §4.4 要求嵌入带 <code>modelVersion</code>；能力路由/服务端文档用 <code>vectorSpaceId</code></td><td><strong><code>vectorSpaceId</code> 为权威</strong>，<code>modelVersion</code> 只作展示。落库三列：<code>vector_space_id</code> / <code>backend_id</code> / <code>model_version</code>。判据只有一个。</td></tr><tr><td><strong>3</strong></td><td>前后分离 §3 设计了服务端指令增强（执行原子点 + grace 窗口）；服务端文档 §14 一度建议 v1 不开</td><td><strong>设计保留、默认关闭。</strong> 服务端 <code>models.specs</code> 里 <code>asr-short</code>（SenseVoice）本来就常驻（会议档也用），所以能力在；但 <code>/v1/asr?variant=short</code> 的<strong>默认配额为 0</strong> = 不对外。开启只需改配额。</td></tr><tr><td><strong>4</strong></td><td>前后分离 §2 说"办公本装不上 pyannote → <code>diarize</code>/<code>speaker.embed</code> 必须走服务端"；能力路由 §0.1 实测 sherpa-onnx 本机能做</td><td><strong>以能力路由为准。</strong> 这是<strong>质量权衡</strong>，不是可行性问题。§5 矩阵里本机那两格写"⚠️ 可选"而不是"❌"。</td></tr><tr><td><strong>5</strong></td><td><code>wake</code> 在能力路由 §4.2 是能力槽；在统一路由 §3.8 被排除</td><td><strong>两个层次，不冲突</strong>：<code>wake</code> 是<strong>能力槽</strong>（本机唯一实现），但<strong>不是设备泳道</strong>。已在本节与 §7 写明。</td></tr></tbody></table></div>
-<h3 id="h50">还有两处需要收口（本次一并定）</h3>
+<h3 id="h60">还有两处需要收口（本次一并定）</h3>
 <div class="tw"><table><thead><tr><th>项</th><th>收口</th></tr></thead><tbody><tr><td><strong>服务端端点清单</strong></td><td>以前后分离 §2.4（6 个）与 <code>ECHO能力后端-服务端设计.md</code> §6.1（7 个，多了 <code>/v1/ready</code>）为准 → <strong>以服务端文档为准</strong>，<code>/v1/ready</code> 与 <code>/v1/health</code> 必须分开（模型加载中不该被编排系统反复重启）。</td></tr><tr><td><strong>降级原因词汇表</strong></td><td>四域必须用同一套。权威清单在 <code>统一路由</code> §2（<code>absent</code> / <code>blocked</code> / <code>busy</code> / <code>offline</code> / <code>circuit-open</code> / <code>quota</code> / <code>unsupported</code> / <code>vector-mismatch</code> / <code>open-failed</code> / <code>error</code>），服务端错误码表要与它一一映射。</td></tr></tbody></table></div>
 <hr>
-<h2 id="h51">9. 落地顺序（合并四份文档的排期）</h2>
+<h2 id="h61">9. 落地顺序（合并四份文档的排期）</h2>
 <p>分成<strong>两组</strong>：左边不依赖前后分离，可以先做；右边是 3.0 主线。</p>
 <div class="diagram"><pre class="mermaid">flowchart LR
     subgraph NOW[&quot;可先做 —— 不依赖前后分离，纯收益&quot;]
@@ -555,20 +619,24 @@ env[&quot;DSH_HOME&quot;] = dsh_home          # 注释原文：&quot;独立家�
 <div class="tw"><table><thead><tr><th>阶段</th><th>内容</th><th>关键验收</th></tr></thead><tbody><tr><td><strong>阶段 -1</strong></td><td>交付包拆「默认档 / 离线增强档」</td><td>办公本按默认档装完 ≈ 0.6 GB、&lt; 3 分钟、<code>import torch</code> 失败、命令链路可用</td></tr><tr><td><strong>D1</strong></td><td>两级互斥（泳道级 + 设备级）</td><td>会议用全向麦 + 指令用耳机<strong>真并行</strong>（清掉 <code>AGENTS.md</code> 待办）</td></tr><tr><td><strong>D2</strong></td><td>设备黑名单机制</td><td>虚拟设备在<strong>枚举阶段</strong>被挡，不是试了才发现</td></tr><tr><td><strong>阶段 0</strong></td><td>定协议 + 抽 <code>CapabilityClient</code></td><td>客户端能在"本机 / 远端"间切换且<strong>行为等价</strong></td></tr><tr><td><strong>阶段 1</strong></td><td>建 ECHO 能力后端</td><td>服务端护栏测试全绿（无 DB、无业务词、临时文件清理）</td></tr><tr><td><strong>阶段 2</strong></td><td>内网适配器（复用 <code>OpenAICompatAsrProvider</code>）+ 探测 + 熔断</td><td>能识别"只给文本"；降级原因分类正确</td></tr><tr><td><strong>阶段 3</strong></td><td>能力路由表 + 面板 + 执行计划落 <code>meta.json</code></td><td>面板能回答"这次为什么走了本机"</td></tr><tr><td><strong>阶段 4</strong></td><td><code>vector_space_id</code> 迁移 + 会议级锁定 + 校准按钮</td><td>同会议不混向量空间</td></tr><tr><td><strong>D3</strong></td><td>两条泳道 + 候选链 + 懒选</td><td>错误消息列出<strong>每个候选的 skipped 原因</strong></td></tr><tr><td><strong>D4</strong></td><td>播放设备 + 优先级队列</td><td>高优先级可打断长朗读</td></tr><tr><td><strong>D5</strong></td><td><code>pick()</code> 内核收拢 + 统一路由面板</td><td>四域同一套状态词汇</td></tr></tbody></table></div>
 <p><strong>先做左边那组</strong>：它们不依赖任何新架构，做完立刻可验证、可回退。</p>
 <hr>
-<h2 id="h52">10. 与现有代码的映射（落地挂点）</h2>
+<h2 id="h62">10. 与现有代码的映射（落地挂点）</h2>
 <div class="tw"><table><thead><tr><th>3.0 组件</th><th>现有代码</th><th>动作</th></tr></thead><tbody><tr><td><code>api</code> 路由层</td><td><code>app/api.py</code></td><td>保留；新增面板「路由」页签接口</td></tr><tr><td>业务层</td><td><code>app/meeting.py</code> / <code>assistant.py</code> / <code>worklog.py</code></td><td>保留；把引擎调用改为经能力路由</td></tr><tr><td>状态</td><td><code>app/db.py</code>（schema + MIGRATIONS）</td><td>加迁移：<code>vector_space_id</code> / <code>backend_id</code>；新增设备候选链设置项</td></tr><tr><td>路径</td><td><code>app/paths.py</code></td><td>保留；<code>_settings_get()</code> 是<strong>现成接缝</strong>，服务端替换取值源即可</td></tr><tr><td>客户端引擎层</td><td><code>app/audio/stt.py</code> / <code>diarize.py</code></td><td><strong>是干净的引擎层</strong>，客户端与服务端共用；全局单例 + 全局锁要抽成 <code>EnginePool</code>（客户端=容量 1）</td></tr><tr><td>能力路由（新）</td><td>—</td><td><code>app/capabilities/</code>（槽 → 后端链 → 执行计划 → 拼装）</td></tr><tr><td>模型路由</td><td><code>app/llm_router.py</code> + <code>router_admin.py</code> + <code>dsh-failover/proxy.py</code></td><td>保留；<strong>熔断心智被 <code>pick()</code> 复用</strong>（v1 不强求改造）</td></tr><tr><td>设备路由</td><td><code>recorder.resolve_input_device()</code> + <code>mic.py</code></td><td>单值 → 候选链；全局锁 → 两级互斥；加黑名单</td></tr><tr><td>播放队列（新）</td><td><code>app/audio/tts.py</code></td><td><code>sd.play()</code> → 设备候选链；一把锁 → 优先级队列（<strong>吸收现有 beep 状态机</strong>）</td></tr><tr><td>引擎池</td><td><code>app/boot.py</code> 组件状态机 + <code>services.py</code></td><td>客户端保留；服务端复用同一套状态机与 <code>/api/boot/component/*</code> 形态</td></tr><tr><td>服务端（新）</td><td>—</td><td><code>server/</code> <strong>不放进 <code>app/</code></strong>（物理隔离比纪律可靠）</td></tr></tbody></table></div>
 <hr>
-<h2 id="h53">11. 未决问题汇总</h2>
-<div class="tw"><table><thead><tr><th>#</th><th>问题</th><th>我的倾向</th></tr></thead><tbody><tr><td>1</td><td>~~离线会议转写用哪个 sherpa 模型~~</td><td>✅ <strong>已定：不做本机兜底</strong>（2026-09-23）</td></tr><tr><td>2</td><td>~~默认档要不要内置 whisper-base~~</td><td>✅ <strong>已定：不内置</strong>（不做兜底，这个问题消失）</td></tr><tr><td>3</td><td>700 MB 离线包门禁是否保留原值</td><td>保留；<strong>DSH 不进包</strong>（走面板按需安装）正好腾出 223 MB</td></tr><tr><td>4</td><td>~~服务端跑不跑 GPU 版 pyannote 4.x~~</td><td>✅ <strong>已定：跑</strong>。客户端不产生向量 → <strong>全系统只有一个 <code>vectorSpaceId</code></strong>，§6.3 的会议级锁定从"硬约束"变成"天然成立"</td></tr><tr><td>5</td><td><code>asr.short</code>（指令增强）默认开不开</td><td><strong>默认关</strong>（配额 0），设计保留</td></tr><tr><td>6</td><td>服务端 TLS 形态</td><td>mTLS 还是 <code>client_id:secret</code> → JWT；<strong>v1 用后者</strong>，mTLS 等 PKI</td></tr><tr><td>7</td><td>候选链设置项：新增列表 vs 改现有单值</td><td><strong>新增列表 + 保留单值作链尾</strong>（零迁移）</td></tr><tr><td>8</td><td>会议中途设备消失怎么办</td><td>告警不静默换；是否允许<strong>分段边界换设备</strong>待定</td></tr><tr><td>9</td><td>黑名单激进程度</td><td>保守清单 + 命中提示，观察后再收紧</td></tr><tr><td>10</td><td>播放被抢占的任务丢弃还是重播</td><td><strong>丢弃</strong>（被抢的朗读重播很烦），或按用途细分</td></tr><tr><td>11</td><td><strong>离线队列怎么落</strong>（见 §12）</td><td>会议不做兜底后，<strong>它是唯一的降级路径</strong>，必须做：分段级状态 + 面板可见 + 手动重试</td></tr><tr><td>12</td><td><strong>桌面版资产只导 skills、不导会话/记忆</strong>（§6.4）</td><td>我的判断：会话是 DSH 内部格式，跨版本导入风险高且坏了用户无从判断。<strong>若你希望连会话一起搬，这条要改</strong></td></tr></tbody></table></div>
+<h2 id="h63">11. 未决问题汇总</h2>
+<div class="tw"><table><thead><tr><th>#</th><th>问题</th><th>我的倾向</th></tr></thead><tbody><tr><td>1</td><td>~~离线会议转写用哪个 sherpa 模型~~</td><td>✅ <strong>已定：不做本机兜底</strong>（2026-09-23）</td></tr><tr><td>2</td><td>~~默认档要不要内置 whisper-base~~</td><td>✅ <strong>已定：不内置</strong>（不做兜底，这个问题消失）</td></tr><tr><td>3</td><td>700 MB 离线包门禁是否保留原值</td><td>保留；<strong>DSH 不进包</strong>（走面板按需安装）正好腾出 223 MB</td></tr><tr><td>4</td><td>~~服务端跑不跑 GPU 版 pyannote 4.x~~</td><td>✅ <strong>已定：跑</strong>。客户端不产生向量 → <strong>全系统只有一个 <code>vectorSpaceId</code></strong>，§6.3 的会议级锁定从"硬约束"变成"天然成立"</td></tr><tr><td>5</td><td><code>asr.short</code>（指令增强）默认开不开</td><td><strong>默认关</strong>（配额 0），设计保留</td></tr><tr><td>6</td><td>服务端 TLS 形态</td><td>mTLS 还是 <code>client_id:secret</code> → JWT；<strong>v1 用后者</strong>，mTLS 等 PKI</td></tr><tr><td>7</td><td>候选链设置项：新增列表 vs 改现有单值</td><td><strong>新增列表 + 保留单值作链尾</strong>（零迁移）</td></tr><tr><td>8</td><td>会议中途设备消失怎么办</td><td>告警不静默换；是否允许<strong>分段边界换设备</strong>待定</td></tr><tr><td>9</td><td>黑名单激进程度</td><td>保守清单 + 命中提示，观察后再收紧</td></tr><tr><td>10</td><td>播放被抢占的任务丢弃还是重播</td><td><strong>丢弃</strong>（被抢的朗读重播很烦），或按用途细分</td></tr><tr><td>11</td><td><strong>离线队列怎么落</strong>（见 §12）</td><td>会议不做兜底后，<strong>它是唯一的降级路径</strong>，必须做：分段级状态 + 面板可见 + 手动重试</td></tr><tr><td>12</td><td>~~桌面版资产只导 skills、不导会话/记忆~~</td><td>✅ <strong>已定（2026-09-23）：只搬「技能 + 大模型配置」，会话/记忆不搬。</strong> 大模型配置要<strong>合并</strong>不能覆盖，凭据（API key）<strong>单独问一句</strong>（见 §6.4）</td></tr><tr><td>13</td><td><strong><code>speakers.name_source</code> 加不加</strong>（§6.5）</td><td><strong>建议加</strong>：给主动开了"记住联系人声音"的用户一个「哪些名字是自动认的」的标记。但它已不是安全网（默认库空、不会自动改名），<strong>不阻塞其它工作</strong></td></tr></tbody></table></div>
 <hr>
-<h2 id="h54">12. 「会议不兜底」消掉了原来排的实测</h2>
+<h2 id="h64">12. 「会议不兜底」消掉了原来排的实测</h2>
 <p>这条决定把施工面缩小了一圈 —— 三件原计划的实测里，两件直接取消、一件降级：</p>
 <div class="tw"><table><thead><tr><th>原计划的实测</th><th>现在</th><th>为什么</th></tr></thead><tbody><tr><td>① 四实现对比（funasr SenseVoice ↔ sherpa <code>from_sense_voice</code>；qwen-asr ↔ sherpa <code>from_qwen3_asr</code>）</td><td>❌ <strong>取消</strong></td><td>那是为了回答"办公本兜底能不能接近主力质量"。<strong>不做兜底就没有这个问题</strong>；服务端继续用已验证效果的 SenseVoice + Qwen3-ASR</td></tr><tr><td>② sherpa 声纹 / 分离模型的体积与中文效果</td><td>❌ <strong>取消</strong></td><td>客户端不再产生向量（<code>diarize.*</code> / <code>speaker.embed</code> 都只走后端），没有本机实现要评估</td></tr><tr><td>③ <code>ctranslate2</code> 剥掉两个 cuBLAS DLL 后能否 CPU 推理</td><td>⚠️ <strong>降级为可选</strong></td><td>它原本是为"客户端装 whisper 兜底"省 795 MB。不做兜底就没这个需求，只剩服务端磁盘占用这一个次要收益</td></tr></tbody></table></div>
 <p><strong>剩下还值得做的两件</strong>：</p>
 <ol><li><strong>办公本上 sherpa 流式模型的 RTF</strong> —— 决定指令链路的实际延迟。 它已经在用、效果已知，属于"有空再量"。</li><li><strong>声纹"同权重跨运行时可比性"</strong>（见 §5.1）—— 验证 funasr/pyannote 产出的嵌入与 sherpa-onnx ONNX 版是否<strong>在同一向量空间内可比</strong>。若成立，本机注册就能白拿 （几十 MB 模型 + <strong>声纹音频完全不出机</strong>）。<strong>投入很小、收益明确，建议保留。</strong></li></ol>
-<h3 id="h55">但必须补上一件新的：离线队列</h3>
+<h3 id="h65">但必须补上一件新的：离线队列</h3>
 <p>"会议不兜底"把<strong>离线队列从"可选优化"变成了"唯一降级路径"</strong>：</p>
 <ul><li>服务端不可达时，会议<strong>录音照常</strong>（录音是本机的），但<strong>转写只能排队</strong></li><li>所以队列必须：<strong>持久化</strong>（分段级状态 <code>pending/uploading/done/failed</code>）、<strong>面板可见</strong>、 <strong>可手动重试/取消</strong>、<strong>后端恢复后自动补传</strong></li><li>而且不能让用户误以为"录完就会自动出纪要" —— 面板要明确显示"<strong>等待能力后端</strong>"， 而不是"转写失败"</li></ul>
+<p><strong>并发与重试契约</strong>（2026-09-23 定，服务端侧见 <code>ECHO能力后端-服务端设计.md</code> §3.6）：</p>
+<div class="tw"><table><thead><tr><th>项</th><th>约定</th></tr></thead><tbody><tr><td>客户端并发</td><td><strong>固定 1</strong> —— 服务端强制每客户端 1 路，客户端<strong>不做并发旋钮</strong></td></tr><tr><td>服务端排队</td><td><strong>不排队</strong>；通道满（暂定总 2 路）直接拒</td></tr><tr><td>退避</td><td>优先听 <code>Retry-After</code>；没有则指数退避 + 抖动（1s→2s→4s…上限 60s）</td></tr><tr><td><strong>退避的作用域</strong></td><td><strong>整个队列</strong>，不是单个请求 —— 服务端忙是后端整体忙，不能让 6 个分段各自撞一次墙</td></tr></tbody></table></div>
+<p><strong>三种拒绝要分开处理</strong>（这是"明确拒绝类型"的落点）：</p>
+<div class="tw"><table><thead><tr><th><code>code</code></th><th>客户端动作</th></tr></thead><tbody><tr><td><code>409 client_busy</code></td><td><strong>不重试</strong> —— 自己上一个还没完，属客户端 bug，记日志</td></tr><tr><td><code>503 server_busy</code></td><td><strong>系统忙，稍后再试</strong> —— 暂停整个队列，退避后继续</td></tr><tr><td><code>429 quota_exceeded</code></td><td><strong>今天别再试</strong> —— 面板提示"当日额度已用完"</td></tr></tbody></table></div>
 <blockquote><p>这正好接上前面定过的幂等契约：<strong>服务端无状态，所以去重与重试的责任在客户端</strong> （分段请求带 <code>sha256</code>，服务端不缓存、重传即重算）。</p></blockquote>
 </main>
 </div>
