@@ -50,6 +50,9 @@ settings.yaml
 plugin/echo-host/echo-root.txt
 # 开机自启 vbs：由 install.ps1 生成，内容含本机绝对路径，不入库
 scripts/echo-startup.vbs
+# 实例切换 supervisor 的 vbs：由 switch-instance.ps1 -InstallAutostart 生成
+# （它是自定位的、不含绝对路径，但同样是"跑一次就有了"的产物，随 echo-startup.vbs 一起不入库）
+scripts/echo-switch-startup.vbs
 
 # ---- 编辑器 / 系统 ----
 .DS_Store
