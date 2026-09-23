@@ -19,11 +19,20 @@ WHY THIS EXISTS
   of ECHO (the skill's managed node path has already rotated once).
 
 USAGE (gh-push.ps1 starts it for you)
-  python scripts/gh-proxy.py <bind_port> <target_ip> [host]
+  python scripts/gh-proxy.py <bind_port> <target_ip> [host[,host...]]
+  python scripts/gh-proxy.py <bind_port> host=ip [host=ip ...]
   git -c http.proxy=http://127.0.0.1:<bind_port> push origin main
+  HTTPS_PROXY=http://127.0.0.1:<bind_port> gh release create ...   # see below
 
-  Only `host` (default github.com) is redirected to <target_ip>; every other CONNECT
-  target is connected normally, so this cannot silently reroute unrelated traffic.
+  Only the listed hosts are redirected; every other CONNECT target is connected normally,
+  so this cannot silently reroute unrelated traffic.
+
+  Two forms because one IP is not always enough. `<ip> [hosts]` serves a list of hosts from
+  ONE front IP. `host=ip` gives each host its own. The second form is what `gh` needs: its
+  REST calls go to api.github.com and its release-asset uploads go to uploads.github.com,
+  and those are DIFFERENT front IPs (2026-09-23 measured via DoH: api=20.205.243.168,
+  uploads=20.205.243.161 -> CNAME alambic-origin.githubusercontent.com). Pointing uploads
+  at the api IP gets a GitHub HTML "Bad request" page, not an upload.
 
 ASCII-only, same rule as this repo's .ps1 files: no encoding games, safe to print anywhere.
 """
@@ -54,7 +63,7 @@ def _pipe(src, dst):
                 pass
 
 
-def handle(client, target_ip, proxy_host):
+def handle(client, routes):
     upstream = None
     established = False
     try:
@@ -77,9 +86,10 @@ def handle(client, target_ip, proxy_host):
         host, _sep, port_text = parts[1].partition(":")
         port = int(port_text) if port_text else 443
 
-        if host.lower() == proxy_host:
-            upstream = socket.create_connection((target_ip, port), timeout=15)
-            route = target_ip
+        target = routes.get(host.lower())
+        if target:
+            upstream = socket.create_connection((target, port), timeout=15)
+            route = target
         else:
             upstream = socket.create_connection((host, port), timeout=15)
             route = host
@@ -112,25 +122,50 @@ def handle(client, target_ip, proxy_host):
                     pass
 
 
+def _parse_routes(argv):
+    """argv[2:] -> {host: ip}. Two accepted forms:
+        <ip> [host[,host...]]     one IP serves every listed host (what gh-push.ps1 uses)
+        host=ip [host=ip ...]     each host gets its own IP (what `gh release` needs)
+    """
+    if not argv:
+        raise ValueError("missing target ip or host=ip mapping")
+    routes = {}
+    if "=" not in argv[0]:
+        ip = argv[0]
+        raw = argv[1] if len(argv) > 1 else "github.com"
+        for h in raw.split(","):
+            h = h.strip().lower()
+            if h:
+                routes[h] = ip
+        return routes
+    for item in argv:
+        host, _sep, ip = item.partition("=")
+        host, ip = host.strip().lower(), ip.strip()
+        if host and ip:
+            routes[host] = ip
+    if not routes:
+        raise ValueError("no usable host=ip mapping in %r" % (argv,))
+    return routes
+
+
 def main():
     if len(sys.argv) < 3:
-        print("usage: gh-proxy.py <bind_port> <target_ip> [host]", file=sys.stderr)
+        print("usage: gh-proxy.py <bind_port> <target_ip> [host[,host...]]", file=sys.stderr)
+        print("       gh-proxy.py <bind_port> host=ip [host=ip ...]", file=sys.stderr)
         return 2
     port = int(sys.argv[1])
-    target_ip = sys.argv[2]
-    proxy_host = (sys.argv[3] if len(sys.argv) > 3 else "github.com").lower()
+    routes = _parse_routes(sys.argv[2:])
 
     srv = socket.socket()
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind(("127.0.0.1", port))
     srv.listen(16)
-    print("[gh-proxy] listening 127.0.0.1:%d  %s -> %s" % (port, proxy_host, target_ip),
-          flush=True)
+    print("[gh-proxy] listening 127.0.0.1:%d  %s" % (
+        port, "  ".join("%s -> %s" % (h, ip) for h, ip in sorted(routes.items()))), flush=True)
 
     while True:
         client, _addr = srv.accept()
-        threading.Thread(target=handle, args=(client, target_ip, proxy_host),
-                         daemon=True).start()
+        threading.Thread(target=handle, args=(client, routes), daemon=True).start()
 
 
 if __name__ == "__main__":
