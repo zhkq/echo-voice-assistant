@@ -220,7 +220,13 @@ def stop_meeting():
 
         meta_path = os.path.join(folder, "meta.json")
         meta = _load_json(meta_path, {})
-        segs = sorted(recorder.segments)
+        # 段列表 = 本次录出来的 **∪ 目录里已有的 *.wav**。
+        # 为什么把目录里那些也算上（2026-09-23）：把**另一段录音**（比如上一场被中断的）
+        # 拷进本场目录当 `00.wav`，就应当本次一并转写 —— 用户在电话里就是这么预期的
+        # （"拷进去是不是结束后就自动转了"）。只认录音器自己的内存清单时，拷进去的
+        # 那段会被**静默忽略**（`_transcribe_impl` 优先用 meta["segments"]，非空就不看目录）。
+        extra = [f for f in os.listdir(folder) if re.match(r"^\d+\.wav$", f)]
+        segs = sorted(set(recorder.segments) | set(extra))
         meta["end"] = datetime.datetime.now().isoformat(timespec="seconds")
         meta["segments"] = segs
         meta["durationSeconds"] = sum(_wav_seconds(os.path.join(folder, s)) for s in segs)
