@@ -359,7 +359,7 @@ class EnginePool:
 | 面板 | 含义 | 服务端对应 |
 |---|---|---|
 | 🔨 **命令转写引擎（常驻）** · `sensevoice` · `cuda:0` · `在线` · `15.2s` | 常驻引擎 + 设备 + 状态机 + 加载耗时 | `specs[asr-short]`：`resident: true` |
-| 📄 **会议转写引擎（按需）** · `qwen3asr` · `空闲` | 按需引擎，可卸载 | `specs[asr-meeting]`：`resident: false` |
+| 📄 **会议转写引擎（按需）** · `qwen3asr` · `空闲` | 按需引擎，可卸载 | `specs[asr-long]`：`resident: false` |
 | 引擎下拉 + 启动/停止 按钮 | 选实现 + 显式生命周期控制 | `specs[].impl` + `pool.acquire/unload` |
 
 **这张卡片上的每一个元素都是 `EnginePool` 需要的**：常驻/按需、状态（在线/空闲/模型加载）、
@@ -486,7 +486,7 @@ class TempWorkspace:
 | GET | `/v1/capabilities` | 能力 + 模型 + `modelVersion` + `vectorSpaceId` + 限制 + 当前实际可用性 |
 | GET | `/v1/health` | 存活（永远 200）+ 队列深度 + 显存 + 临时目录统计 |
 | GET | `/v1/ready` | 就绪（模型池可服务则 200，否则 503） |
-| POST | `/v1/asr` | 音频 → 文本（`?variant=short\|meeting`、`?timestamps=1`） |
+| POST | `/v1/asr` | 音频 → 文本（`?variant=short\|long`、`?timestamps=1`） |
 | POST | `/v1/diarize` | 音频 → turns + 嵌入（`?mode=segment\|turns`） |
 | POST | `/v1/speaker/embed` | 音频 → 嵌入 |
 | POST | `/v1/tts` | 文本 → 音频（可选能力） |
@@ -600,20 +600,34 @@ class TempWorkspace:
 
 | 参数 | 取值 | 默认 | 说明 |
 |---|---|---|---|
-| `variant` | `short` / `meeting` | `meeting` | **语义档位**，映射到不同模型（见下） |
+| `variant` | `short` / `long` | `long` | **语义档位**，映射到不同模型（见下） |
 | `timestamps` | `0` / `1` | `0` | 是否要句子级时间轴 |
 | `lang` | `zh` / `en` / `auto` … | `auto` | 语言提示 |
 | `model` | 模型 id | — | **高级覆盖**：绕过 variant 直接点名 |
 
 **两个 variant 的区别**（这是功能层面的关键）
 
-| | `short` | `meeting` |
+| | `short` | `long` |
 |---|---|---|
 | 用途 | 指令增强（几秒音频） | 会议分段（10 分钟） |
 | 模型 | 小模型（SenseVoice） | 大模型（Qwen3-ASR） |
 | 常驻 | **是**（冷启动付一次） | 否（按需 + LRU） |
 | 时间戳 | 通常无 | 有（可选 ForcedAligner） |
 | 延迟目标 | < 300 ms | 秒级到几十秒 |
+
+> **为什么第二个值叫 `long` 而不是 `meeting`**（2026-09-24 定）
+>
+> 这两个值是**服务端源码里的字面量**。而我们对 `server/` 有一条硬护栏：
+> **源码里不出现业务词**（`meeting` / `command` / `summary` / `voiceprint`），
+> 由 `tests/test_server_contract.py` 机械检查 —— 它是"服务端不认识业务"这条原则
+> 唯一不靠人自觉的保证。
+>
+> 若把值写成 `meeting`，护栏只有两个出路：给这个文件开白名单，或者把它弱化。
+> 前者等于在护栏上开第一个洞，后者等于拆掉护栏。都不如**换个中立的名字**。
+> `short` / `long` 描述的是**音频长度档位**，本来就更贴近服务端看到的东西：
+> 它只知道"这段音频要按短档还是长档处理"，不知道那是不是一场会议。
+>
+> 文档里说"会议转写引擎"是**给面板和人的话**（客户端自己的措辞）；协议里不出现。
 
 **响应**
 
@@ -637,7 +651,8 @@ class TempWorkspace:
    "按字数均摊"是**客户端**拿不到时间戳时做的兜底（现有 `_split_provider_text`），
    而且必须把 `estimated` 标进数据里 —— 那个标记属于客户端，
    服务端不该假装自己有精确时间戳。
-2. **服务端不认识"会议"。** `variant=meeting` 只是"用哪个模型"的提示，不带业务含义（§1.2）。
+2. **服务端不认识"会议"。** `variant=long` 只是"用哪个模型"的提示，不带业务含义（§1.2）。
+   名字取 `long` 而非 `meeting`，正是为了让这条原则**在源码里也成立** —— 见上面的说明。
 3. **不分段、不切句**（除模型自身能力）。一段进、一段文本 + 可选句子出；**切分是客户端的事**。
 
 ---
@@ -1387,8 +1402,9 @@ models:
       resident: true                   # 常驻：实测加载 ~15 s，冷启动付一次
       max_concurrency: 2
       device: cuda:0
-    - id: asr-meeting                  # 面板：会议转写引擎（按需）
-      slot: asr.timestamps
+    - id: asr-long                     # 面板：会议转写引擎（按需）
+      slot: asr.long
+      supports: [asr.text, asr.timestamps]   # 一个模型同时给文本与句级时间戳
       impl: qwen3asr                   # Qwen3-ASR-0.6B (+ ForcedAligner)
       resident: false                  # 按需 + LRU：显存约 4 GB
       max_concurrency: 1
@@ -1444,26 +1460,48 @@ tmp:
 
 ## 12. 护栏测试清单
 
-| 测试 | 断言 |
-|---|---|
-| `test_server_no_db.py` | `server/` 不 import `app.db`；跑完请求无 `.db` 文件生成 |
-| `test_server_no_business_words.py` | `server/` 源码不出现 `meeting`/`command`/`summary`/`voiceprint` |
-| `test_server_no_write_endpoints.py` | 路由表里没有写端点（白名单外） |
-| `test_server_logs_no_content.py` | 跑一次请求后日志 grep 不到输入文本/嵌入 |
-| `test_tmp_cleaned_on_success.py` | 请求成功后临时目录为空 |
-| `test_tmp_cleaned_on_exception.py` | 推理抛异常后临时目录为空 |
-| `test_tmp_cleaned_on_client_disconnect.py` | 客户端中途断开后临时目录为空 |
-| `test_tmp_swept_on_startup.py` | 预置残留文件 → 启动后清空 |
-| `test_tmp_ttl_sweeper.py` | 超龄文件被删除并写日志 |
-| `test_tmp_capacity_refuses.py` | 超过 `max_bytes` 时返回 429/507，**不写爆盘** |
-| `test_no_silent_cpu_fallback.py` | 模拟显存不足 → 返回 `503 gpu_oom`，**不是**悄悄用 CPU |
-| `test_pool_single_flight.py` | 10 个并发请求同一模型 → loader 只被调用 1 次 |
-| `test_pool_no_evict_while_in_use.py` | 推理中引用计数 > 0 的模型不被卸载 |
-| `test_pool_vram_budget.py` | 超预算时先卸载 LRU；仍不够则拒绝而非 OOM |
-| `test_vector_space_frozen.py` | 进程生命周期内 `vectorSpaceId` 不变；改配置需重启 |
-| `test_error_codes_client_mappable.py` | 每个错误码都能映射到前置文档的 9 类降级原因（契约对齐） |
-| `test_capabilities_reflects_state.py` | 模型 loading 时 `capabilities` 标 `loading`，不是撒谎说 ready |
-| `test_readonly_rootfs_smoke.py` | 只读 rootfs + tmpfs 下跑通全部端点（容器冒烟） |
+**表里写的是"断言"，不是"文件名"。** 这些断言全部落在 `tests/test_server_contract.py`
+一个文件里（按断言意图分组成若干 `TestCase`）—— 拆成 22 个文件只会让人不去跑它们。
+「状态」列的 ✅ 表示 v1 骨架已实现，⏳ 表示等对应功能落地时补（见 §13 阶段）。
+
+| 断言 | 状态 | 落在哪 |
+|---|---|---|
+| `server/` 不 import `app.db` 等客户端业务层 | ✅ | `NoBusinessCouplingTests.test_no_business_imports` |
+| `server/` 源码不出现 `meeting`/`command`/`summary`/`voiceprint` | ✅ | `NoBusinessCouplingTests.test_no_business_words_in_source` |
+| 路由表里没有写端点（白名单外） | ✅ | `NoBusinessCouplingTests.test_only_the_documented_routes_exist` |
+| 每个错误码都带 `code` + 能不能重试（契约对齐） | ✅ | `ErrorContractTests` |
+| `409 client_busy` 与 `503 server_busy` 是两回事，不混用 | ✅ | `ErrorContractTests.test_client_busy_and_server_busy_are_different` |
+| 两级闸门：每客户端 1 → `409`；全局 2 满 → `503` + `Retry-After` | ✅ | `AdmissionTests` + `AdmissionWiringTests` |
+| `queue_max=0`：满了**立即拒绝**，不留堆积请求 | ✅ | `AdmissionTests` |
+| 异常路径也要**还回槽位**（一次失败不许把服务端锁死） | ✅ | `AdmissionTests.test_slots_are_released_on_exception` |
+| 鉴权关 = 所有人 `anonymous`（谁都能用 GPU，所以启动要吼一声） | ✅ | `AdmissionWiringTests.test_auth_off_means_everyone_is_anonymous` |
+| 一次 `load()` 不许污染全局默认配置 | ✅ | `test_config_is_not_shared_between_loads` |
+| 请求成功与失败，两种路径都清干净临时目录 | ✅ | `TempWorkspaceTests.test_success_and_failure_both_clean_up` |
+| 超龄文件被清扫删掉，新鲜的留着 | ✅ | `TempWorkspaceTests.test_sweep_removes_old_and_keeps_fresh` |
+| 超过 `max_bytes` 时按最旧优先删，**不写爆盘** | ✅ | `TempWorkspaceTests.test_sweep_by_size_removes_oldest_first` |
+| 显存不足 → 拒绝（`gpu_oom`），**不是** OOM、**不是**悄悄用 CPU | ✅ | `EnginePoolTests.test_vram_budget_refuses_instead_of_oom` |
+| 加载失败如实报 `model_failed`，不静默回退 CPU | ✅ | `EnginePoolTests.test_load_failure_does_not_fall_back_to_cpu` |
+| 并发要同一个模型 → loader 只被调用一次（单飞） | ✅ | `EnginePoolTests.test_single_flight` |
+| 推理中引用计数 > 0 的模型不被卸载 | ✅ | `EnginePoolTests.test_refcount_blocks_unload` |
+| LRU 驱逐最久未用的，**常驻的永不驱逐** | ✅ | `EnginePoolTests.test_lru_evicts_idle_but_never_resident` |
+| 模型状态如实上报（`absent`/`ready`/`failed`），不撒谎 | ✅ | `EnginePoolTests.test_status_reflects_real_state` |
+| 铁律 L5：所有产出向量的模型共用**同一个** `vectorSpaceId` | ✅ | `VectorSpaceFrozenTests` |
+| 版本/向量空间在进程内**冻结**（`ModelSpec` 不可变） | ✅ | `VectorSpaceFrozenTests.test_model_spec_is_immutable` |
+| 客户端拿得到 `vectorSpaceId`（否则它没法判断"能不能比"） | ✅ | `EndpointTests.test_capabilities_reports_slots_and_vector_space` |
+| 不要时间戳时**不许**编一个 `estimated` 出来 | ✅ | `EndpointTests.test_asr_returns_text_and_no_fake_timestamps` |
+| 没实现的能力**如实拒绝**，不假装（`mode=turns`） | ✅ | `EndpointTests.test_diarize_turns_mode_is_refused_not_faked` |
+| 超长音频在读之前就被拒（不是读完再拒） | ✅ | `EndpointTests.test_declared_oversize_is_refused_before_reading` |
+| 跑完请求无 `.db` 文件生成 | ⏳ | 等鉴权/审计落库时一起查（v1 没有任何落库路径） |
+| 跑一次请求后日志 grep 不到输入文本/嵌入 | ⏳ | v2 上 metrics/日志时补 |
+| `loading` 期间 `capabilities` 标 `loading`，不是撒谎说 ready | ⏳ | 需要能卡住 loader 的假引擎 |
+| 客户端中途断开后临时目录为空 | ⏳ | 需要真 ASGI 断连才能测 |
+| 预置残留文件 → 启动时清空（sweep on startup） | ⏳ | `Sweeper` 已实现，用例待补 |
+| 只读 rootfs + tmpfs 下跑通全部端点（容器冒烟） | ⏳ | v3，且只能在 Linux 上跑 |
+
+> **为什么 §12 值得这么细。** 前面每一节的设计都有"如果没人看着就会退化"的地方：
+> 服务端会慢慢认识业务、临时文件会慢慢漏、GPU 会慢慢被 OOM 掉。
+> 这份清单是把那些"慢慢"变成"立刻红"。
+
 
 ---
 

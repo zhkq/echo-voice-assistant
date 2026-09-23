@@ -552,5 +552,34 @@ class EnginePoolTests(unittest.TestCase):
         self.assertEqual(st["asr-long"]["supports"], ["asr.timestamps"])
 
 
+class VectorSpaceFrozenTests(unittest.TestCase):
+    """铁律 L5：**同一场会议不得混用不同 `vectorSpaceId`**。
+
+    这条铁律在服务端只有两个可执行的落点，本类把它们各钉一条：
+
+    1. 出厂配置里**所有**声明了 `vectorSpaceId` 的模型必须共用同一个值。
+       一旦有人给"现场注册"配了另一个嵌入模型（很自然的优化冲动：
+       注册想快一点、用个小模型），比对就会在**跨向量空间**上做余弦相似度 ——
+       数字照样在 0~1 之间，**不报错，只是认错人**。所以必须机械拦住。
+    2. `ModelSpec` 不可变。版本/向量空间在**进程生命周期内冻结**：
+       配置改了要重启，不能让一个跑着的服务中途换向量空间，
+       那会让"同一场会议"里前后两段落在不同的空间里。
+    """
+
+    def test_every_vector_producing_spec_shares_one_space(self):
+        spaces = {}
+        for spec in engines.default_specs():
+            if spec.vector_space_id:
+                spaces.setdefault(spec.vector_space_id, []).append(spec.id)
+        self.assertTrue(spaces, "没有任何模型声明 vectorSpaceId？那 capabilities 就没法告诉客户端能不能比对")
+        self.assertEqual(len(spaces), 1,
+                         "出厂配置里有多个向量空间，客户端会把不可比的向量当成可比的：%s" % spaces)
+
+    def test_model_spec_is_immutable(self):
+        spec = engines.default_specs()[0]
+        with self.assertRaises(AttributeError):
+            spec.vector_space_id = "ws-somebody-changed-it-at-runtime"  # type: ignore[misc]
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -309,7 +309,7 @@ background:#2a2318;border:1px solid var(--yellow);color:var(--yellow);font-size:
         C-&gt;&gt;CA: 需求 = {asr.text, asr.timestamps, diarize.*}
         CA-&gt;&gt;I: POST /v1/asr
         I--&gt;&gt;CA: 文本（无时间戳 → 标注 estimated）
-        CA-&gt;&gt;S: POST /v1/asr?variant=meeting&amp;timestamps=1
+        CA-&gt;&gt;S: POST /v1/asr?variant=long&amp;timestamps=1
         S--&gt;&gt;CA: 时间戳骨架 + modelVersion
         CA-&gt;&gt;S: POST /v1/diarize
         S--&gt;&gt;CA: turns + speaker_embeddings + vectorSpaceId
