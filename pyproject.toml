@@ -2,7 +2,7 @@
 name = "echo"
 # 版本号唯一权威来源是 app/__init__.py:__version__，这里必须与它一致
 # （由 tests/test_version.py 断言，发版脚本也会同步）。见 docs/REFACTOR-PLAN.md §13.3
-version = "2.0.0"
+version = "2.0.1"
 description = "ECHO — 个人语音助理（本地转写 + DSH 执行 + 会议纪要 + 控制面板）"
 readme = "README.md"
 requires-python = ">=3.11"

@@ -580,7 +580,7 @@ async def _probe_loop(cfg: Config, client: httpx.AsyncClient):
 # FastAPI 应用
 # ---------------------------------------------------------------------------
 def create_app(cfg: Config):
-    app = FastAPI(title="echo-llm-router", version="2.0.0")
+    app = FastAPI(title="echo-llm-router", version="2.0.1")
     # 同源守卫：本服务是 OpenAI 兼容端点、且自动带上你真实的 key，
     # 若允许任意网页调用，等于给外部页面一个"免费用你额度"的入口。
     try:
@@ -627,7 +627,7 @@ def create_app(cfg: Config):
                         content=json.dumps({
                             "status": "ok",
                             "service": "echo-llm-router",
-                            "version": "2.0.0",
+                            "version": "2.0.1",
                             "groups": groups,
                             "routes": dict(_route_stats),
                             "history": list(_route_history),
