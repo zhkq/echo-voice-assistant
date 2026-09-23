@@ -1,6 +1,6 @@
 # ECHO — Windows 语音助手 + 会议纪要
 
-> **当前稳定版本：v2.0.1**（tag [`v2.0.1`](../../releases/tag/v2.0.1)）
+> **当前稳定版本：v2.0.2**（tag [`v2.0.2`](../../releases/tag/v2.0.2)）
 > · `main` 分支始终是稳定线，可放心 clone
 > · 安装不再需要 clone：从 [Releases](../../releases) 下载对应平台的安装包（见下）
 > · 版本规划见 [docs/REFACTOR-PLAN.md](docs/REFACTOR-PLAN.md)
@@ -42,7 +42,7 @@ ECHO 自己**不做推理**，只负责录音、转写、编排、面板与播�
 ```powershell
 git clone https://github.com/zhkq/echo-voice-assistant.git
 cd echo-voice-assistant
-git checkout v2.0.1          # 可选：锁定到某个稳定版（不切 = main，同样是稳定线）
+git checkout v2.0.2          # 可选：锁定到某个稳定版（不切 = main，同样是稳定线）
 
 python -m venv venv
 .\venv\Scripts\python.exe -m pip install -r requirements.txt
