@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ECHO 3.0 设计文档</title><style>
+:root{--bg:#0f1117;--card:#171a23;--card2:#1d2230;--border:#2a2f3e;--text:#e6e9f0;
+--muted:#8b93a7;--accent:#4f8cff;--green:#3ecf8e;--yellow:#e6b84c;--red:#ef5b5b;
+--purple:#a78bfa;--radius:10px}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{margin:0;background:var(--bg);color:var(--text);
+font:15px/1.75 -apple-system,"Segoe UI","Microsoft YaHei",system-ui,sans-serif}
+a{color:var(--accent);text-decoration:none}
+a:hover{text-decoration:underline}
+code{background:var(--card2);border:1px solid var(--border);border-radius:4px;
+padding:.08em .38em;font-family:"Cascadia Mono",Consolas,monospace;font-size:.88em}
+pre.code{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);
+padding:14px 16px;overflow:auto}
+pre.code code{background:none;border:0;padding:0;font-size:.86em;line-height:1.6}
+.layout{display:flex;align-items:flex-start;max-width:1720px;margin:0 auto}
+nav{position:sticky;top:0;width:232px;flex:0 0 232px;height:100vh;overflow:auto;
+padding:22px 12px 40px;border-right:1px solid var(--border)}
+nav .brand{font-weight:700;font-size:15px;margin:0 8px 4px}
+nav .brand small{display:block;font-weight:400;color:var(--muted);font-size:12px;margin-top:2px}
+nav .docs{margin:14px 0 18px;padding:0 0 14px;border-bottom:1px solid var(--border)}
+nav .docs a{display:block;padding:6px 8px;border-radius:6px;color:var(--muted);font-size:13px}
+nav .docs a:hover{background:var(--card);color:var(--text);text-decoration:none}
+nav .docs a.on{background:var(--card2);color:var(--text);font-weight:600}
+nav .toc a{display:block;padding:3px 8px;color:var(--muted);font-size:12.5px;
+border-left:2px solid transparent}
+nav .toc a:hover{color:var(--text);text-decoration:none;border-left-color:var(--border)}
+nav .toc a.l3{padding-left:20px;font-size:12px}
+main{flex:1 1 auto;min-width:0;padding:30px 40px 120px}
+header.doc{border-bottom:1px solid var(--border);padding-bottom:16px;margin-bottom:26px}
+header.doc h1{margin:0 0 6px;font-size:27px;line-height:1.3}
+header.doc .src{color:var(--muted);font-size:12.5px}
+h1,h2,h3,h4{line-height:1.35;scroll-margin-top:18px}
+h2{font-size:21px;margin:40px 0 14px;padding-top:14px;border-top:1px solid var(--border)}
+h2:first-of-type{border-top:0;padding-top:0}
+h3{font-size:17px;margin:26px 0 10px;color:#cfd6e6}
+h4{font-size:15px;margin:20px 0 8px;color:var(--muted)}
+p{margin:10px 0}
+ul,ol{margin:10px 0;padding-left:24px}
+li{margin:5px 0}
+li>ul,li>ol{margin:5px 0}
+blockquote{margin:14px 0;padding:10px 16px;background:var(--card);
+border-left:3px solid var(--accent);border-radius:0 var(--radius) var(--radius) 0;color:#c8cfdd}
+blockquote>p:first-child{margin-top:0}
+blockquote>p:last-child{margin-bottom:0}
+hr{border:0;border-top:1px solid var(--border);margin:34px 0}
+.tw{overflow-x:auto;margin:16px 0;border:1px solid var(--border);border-radius:var(--radius)}
+table{border-collapse:collapse;width:100%;font-size:13.5px}
+th,td{padding:8px 12px;text-align:left;vertical-align:top;border-bottom:1px solid var(--border)}
+th{background:var(--card2);font-weight:600;white-space:nowrap}
+tr:last-child td{border-bottom:0}
+tbody tr:hover{background:#1a1e29}
+strong{color:#fff;font-weight:600}
+.diagram{margin:20px 0;padding:14px;background:var(--card);border:1px solid var(--border);
+border-radius:var(--radius);overflow-x:auto}
+/* mermaid 渲染时会把 SVG **塞进** pre.mermaid 里（替换其内容），
+   所以这里只负责"还没渲染 / 渲染失败"时的源码外观。 */
+.diagram pre.mermaid{margin:0;background:none;color:var(--muted);font-size:12px;
+font-family:"Cascadia Mono",Consolas,monospace;white-space:pre-wrap}
+/* 一旦里面有 svg（JS 加 .rendered），就把字体与颜色交还给 mermaid。
+   —— 早先这里写成 .diagram.done pre.mermaid{display:none}，等于把渲染好的图自己藏了。 */
+.diagram.rendered pre.mermaid{white-space:normal;font-size:inherit;color:inherit}
+/* mermaid 给 SVG 打 width="100%"，宽图会被整体缩到容器宽 —— 实测一张自然宽 3170px 的图
+   被压到 1348px，14px 的字变成约 6px，等于看不清。
+   注意：**光靠 CSS 的 width:auto 没用**（SVG 的 auto 仍会解析成 100%），
+   所以由 JS 按 viewBox 把自然尺寸写成确定的 width/height 属性（见 markRendered）。
+   这里只声明"缩小"这一档：加了 .fit 才按容器宽缩放。 */
+.diagram.fit pre.mermaid svg{width:100% !important;max-width:100% !important;height:auto !important}
+.fitbtn{display:none;margin:0 0 10px;padding:3px 10px;font-size:12px;font-family:inherit;
+background:var(--card2);color:var(--muted);border:1px solid var(--border);
+border-radius:6px;cursor:pointer}
+.diagram.overflow .fitbtn{display:inline-block}
+.fitbtn:hover{color:var(--text);border-color:var(--accent)}
+.banner{display:none;margin:0 0 18px;padding:10px 14px;border-radius:var(--radius);
+background:#2a2318;border:1px solid var(--yellow);color:var(--yellow);font-size:13px}
+.no-mermaid .banner{display:block}
+@media print{
+  nav{display:none}main{padding:0}.layout{max-width:none}
+  body{background:#fff;color:#111}.diagram{border-color:#ccc}
+}
+@media (max-width:900px){
+  nav{display:none}.layout{display:block}main{padding:20px 16px 80px}
+}
+
+.idx{max-width:820px;margin:0 auto;padding:60px 24px}
+.idx h1{font-size:30px;margin:0 0 8px}
+.idx .sub{color:var(--muted);margin-bottom:34px}
+a.item{display:block;background:var(--card);border:1px solid var(--border);
+border-radius:var(--radius);padding:18px 20px;margin:12px 0;color:var(--text)}
+a.item:hover{border-color:var(--accent);text-decoration:none}
+a.item h3{margin:0 0 6px;font-size:17px;color:var(--accent)}
+a.item p{margin:0 0 8px;color:var(--muted);font-size:13.5px}
+</style></head><body><div class="idx">
+<h1>ECHO 3.0 设计文档</h1>
+<div class="sub">五份设计 + 组件关系图 · 离线可看 · 由 <code>scripts/build-design-page.py</code> 生成</div>
+<a class="item" href="3.0-设计总览与组件关系.html"><h3>3.0 总览</h3><p>组件关系图 · 一致性对齐 · 排期</p><code>docs/3.0-设计总览与组件关系.md</code></a><a class="item" href="统一路由-模型能力与设备.html"><h3>统一路由</h3><p>四域共享的选则内核 + 采集/播放设备</p><code>docs/统一路由-模型能力与设备.md</code></a><a class="item" href="能力路由-三后端与轻客户端.html"><h3>能力路由</h3><p>本机 / ECHO 后端 / 内网公共 + 安装预算</p><code>docs/能力路由-三后端与轻客户端.md</code></a><a class="item" href="ECHO能力后端-服务端设计.html"><h3>能力后端</h3><p>EnginePool · 临时文件 · 错误码契约</p><code>docs/ECHO能力后端-服务端设计.md</code></a><a class="item" href="前后分离-能力服务化设计.html"><h3>前后分离</h3><p>切面原则：业务数据留客户端</p><code>docs/前后分离-能力服务化设计.md</code></a>
+</div></body></html>

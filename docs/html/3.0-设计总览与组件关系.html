@@ -1,0 +1,678 @@
+<!DOCTYPE html>
+<html lang="zh-CN"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ECHO 3.0 设计总览与组件关系 · ECHO 3.0 设计</title>
+<style>
+:root{--bg:#0f1117;--card:#171a23;--card2:#1d2230;--border:#2a2f3e;--text:#e6e9f0;
+--muted:#8b93a7;--accent:#4f8cff;--green:#3ecf8e;--yellow:#e6b84c;--red:#ef5b5b;
+--purple:#a78bfa;--radius:10px}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{margin:0;background:var(--bg);color:var(--text);
+font:15px/1.75 -apple-system,"Segoe UI","Microsoft YaHei",system-ui,sans-serif}
+a{color:var(--accent);text-decoration:none}
+a:hover{text-decoration:underline}
+code{background:var(--card2);border:1px solid var(--border);border-radius:4px;
+padding:.08em .38em;font-family:"Cascadia Mono",Consolas,monospace;font-size:.88em}
+pre.code{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);
+padding:14px 16px;overflow:auto}
+pre.code code{background:none;border:0;padding:0;font-size:.86em;line-height:1.6}
+.layout{display:flex;align-items:flex-start;max-width:1720px;margin:0 auto}
+nav{position:sticky;top:0;width:232px;flex:0 0 232px;height:100vh;overflow:auto;
+padding:22px 12px 40px;border-right:1px solid var(--border)}
+nav .brand{font-weight:700;font-size:15px;margin:0 8px 4px}
+nav .brand small{display:block;font-weight:400;color:var(--muted);font-size:12px;margin-top:2px}
+nav .docs{margin:14px 0 18px;padding:0 0 14px;border-bottom:1px solid var(--border)}
+nav .docs a{display:block;padding:6px 8px;border-radius:6px;color:var(--muted);font-size:13px}
+nav .docs a:hover{background:var(--card);color:var(--text);text-decoration:none}
+nav .docs a.on{background:var(--card2);color:var(--text);font-weight:600}
+nav .toc a{display:block;padding:3px 8px;color:var(--muted);font-size:12.5px;
+border-left:2px solid transparent}
+nav .toc a:hover{color:var(--text);text-decoration:none;border-left-color:var(--border)}
+nav .toc a.l3{padding-left:20px;font-size:12px}
+main{flex:1 1 auto;min-width:0;padding:30px 40px 120px}
+header.doc{border-bottom:1px solid var(--border);padding-bottom:16px;margin-bottom:26px}
+header.doc h1{margin:0 0 6px;font-size:27px;line-height:1.3}
+header.doc .src{color:var(--muted);font-size:12.5px}
+h1,h2,h3,h4{line-height:1.35;scroll-margin-top:18px}
+h2{font-size:21px;margin:40px 0 14px;padding-top:14px;border-top:1px solid var(--border)}
+h2:first-of-type{border-top:0;padding-top:0}
+h3{font-size:17px;margin:26px 0 10px;color:#cfd6e6}
+h4{font-size:15px;margin:20px 0 8px;color:var(--muted)}
+p{margin:10px 0}
+ul,ol{margin:10px 0;padding-left:24px}
+li{margin:5px 0}
+li>ul,li>ol{margin:5px 0}
+blockquote{margin:14px 0;padding:10px 16px;background:var(--card);
+border-left:3px solid var(--accent);border-radius:0 var(--radius) var(--radius) 0;color:#c8cfdd}
+blockquote>p:first-child{margin-top:0}
+blockquote>p:last-child{margin-bottom:0}
+hr{border:0;border-top:1px solid var(--border);margin:34px 0}
+.tw{overflow-x:auto;margin:16px 0;border:1px solid var(--border);border-radius:var(--radius)}
+table{border-collapse:collapse;width:100%;font-size:13.5px}
+th,td{padding:8px 12px;text-align:left;vertical-align:top;border-bottom:1px solid var(--border)}
+th{background:var(--card2);font-weight:600;white-space:nowrap}
+tr:last-child td{border-bottom:0}
+tbody tr:hover{background:#1a1e29}
+strong{color:#fff;font-weight:600}
+.diagram{margin:20px 0;padding:14px;background:var(--card);border:1px solid var(--border);
+border-radius:var(--radius);overflow-x:auto}
+/* mermaid 渲染时会把 SVG **塞进** pre.mermaid 里（替换其内容），
+   所以这里只负责"还没渲染 / 渲染失败"时的源码外观。 */
+.diagram pre.mermaid{margin:0;background:none;color:var(--muted);font-size:12px;
+font-family:"Cascadia Mono",Consolas,monospace;white-space:pre-wrap}
+/* 一旦里面有 svg（JS 加 .rendered），就把字体与颜色交还给 mermaid。
+   —— 早先这里写成 .diagram.done pre.mermaid{display:none}，等于把渲染好的图自己藏了。 */
+.diagram.rendered pre.mermaid{white-space:normal;font-size:inherit;color:inherit}
+/* mermaid 给 SVG 打 width="100%"，宽图会被整体缩到容器宽 —— 实测一张自然宽 3170px 的图
+   被压到 1348px，14px 的字变成约 6px，等于看不清。
+   注意：**光靠 CSS 的 width:auto 没用**（SVG 的 auto 仍会解析成 100%），
+   所以由 JS 按 viewBox 把自然尺寸写成确定的 width/height 属性（见 markRendered）。
+   这里只声明"缩小"这一档：加了 .fit 才按容器宽缩放。 */
+.diagram.fit pre.mermaid svg{width:100% !important;max-width:100% !important;height:auto !important}
+.fitbtn{display:none;margin:0 0 10px;padding:3px 10px;font-size:12px;font-family:inherit;
+background:var(--card2);color:var(--muted);border:1px solid var(--border);
+border-radius:6px;cursor:pointer}
+.diagram.overflow .fitbtn{display:inline-block}
+.fitbtn:hover{color:var(--text);border-color:var(--accent)}
+.banner{display:none;margin:0 0 18px;padding:10px 14px;border-radius:var(--radius);
+background:#2a2318;border:1px solid var(--yellow);color:var(--yellow);font-size:13px}
+.no-mermaid .banner{display:block}
+@media print{
+  nav{display:none}main{padding:0}.layout{max-width:none}
+  body{background:#fff;color:#111}.diagram{border-color:#ccc}
+}
+@media (max-width:900px){
+  nav{display:none}.layout{display:block}main{padding:20px 16px 80px}
+}
+</style>
+</head><body>
+<div class="layout">
+<nav><div class="brand">ECHO 3.0 设计<small>架构设计文档</small></div><div class="docs"><a href="3.0-设计总览与组件关系.html" class="on">3.0 总览</a><a href="统一路由-模型能力与设备.html">统一路由</a><a href="能力路由-三后端与轻客户端.html">能力路由</a><a href="ECHO能力后端-服务端设计.html">能力后端</a><a href="前后分离-能力服务化设计.html">前后分离</a></div><div class="toc"><a class="l2" href="#h1">0. 一页速览</a><a class="l3" href="#h2">3.0 是什么</a><a class="l3" href="#h3">2.0 → 3.0 的变化</a><a class="l3" href="#h4">六条铁律（贯穿全部分册）</a><a class="l2" href="#h5">1. 组件关系总图</a><a class="l2" href="#h6">2. 数据与状态归属</a><a class="l3" href="#h7">2.1 目录与升级边界（&quot;删掉 ECHO 重装，用户不该丢任何东西&quot;）</a><a class="l3" href="#h13">2.2 安装根目录：{ECHO_BASE} 与它的兄弟目录</a><a class="l2" href="#h21">3. 一次会议转写的完整链路</a><a class="l2" href="#h22">4. 四个路由域的对齐</a><a class="l2" href="#h23">5. 能力槽 × 后端矩阵</a><a class="l3" href="#h24">5.1 声纹：它不跟着&quot;会议不兜底&quot;一起砍掉</a><a class="l2" href="#h29">6. 部署形态</a><a class="l3" href="#h30">6.1 客户端组件清单（必选 / 后装 / 可选）</a><a class="l3" href="#h31">6.2 智能体后端收敛到 DSH 标准版（唯一）</a><a class="l3" href="#h36">6.3 客户端最小安装范围（含要改的具体文件）</a><a class="l3" href="#h42">6.4 已经装过 DSH 的用户怎么办</a><a class="l2" href="#h48">7. 设备路由：两条泳道</a><a class="l2" href="#h49">8. 一致性对齐：修正了五处</a><a class="l3" href="#h50">还有两处需要收口（本次一并定）</a><a class="l2" href="#h51">9. 落地顺序（合并四份文档的排期）</a><a class="l2" href="#h52">10. 与现有代码的映射（落地挂点）</a><a class="l2" href="#h53">11. 未决问题汇总</a><a class="l2" href="#h54">12. 「会议不兜底」消掉了原来排的实测</a><a class="l3" href="#h55">但必须补上一件新的：离线队列</a></div></nav>
+<main>
+<div class="banner"></div>
+<header class="doc"><h1>ECHO 3.0 设计总览与组件关系</h1>
+<div class="src">源文件 <code>docs/3.0-设计总览与组件关系.md</code> · 由 <code>scripts/build-design-page.py</code> 生成，勿手改</div>
+</header>
+<blockquote><p>本文是四份设计文档的<strong>收口</strong>：一份总览、一组组件关系图、一次一致性对齐。</p>
+<div class="tw"><table><thead><tr><th>分册</th><th>回答</th></tr></thead><tbody><tr><td><code>docs/前后分离-能力服务化设计.md</code></td><td>切面原则：业务数据留客户端，服务端无状态</td></tr><tr><td><code>docs/能力路由-三后端与轻客户端.md</code></td><td>本机 / ECHO 后端 / 内网公共 三后端 + 办公本安装预算</td></tr><tr><td><code>docs/ECHO能力后端-服务端设计.md</code></td><td>服务端怎么建（EnginePool / 临时文件 / 错误码契约）</td></tr><tr><td><code>docs/统一路由-模型能力与设备.md</code></td><td>四域共享的选择内核 + 采集/播放设备</td></tr></tbody></table></div>
+<p><strong>本文不重复细节，只做三件事</strong>：总览、画图、对齐。</p></blockquote>
+<hr>
+<h2 id="h1">0. 一页速览</h2>
+<h3 id="h2">3.0 是什么</h3>
+<p><strong>一次架构分工的调整</strong>：客户端持有业务数据与状态、保留轻量保底能力； 服务端只做无状态算力；两者之间用一套"按优先级选资源"的路由统一起来。</p>
+<p>一句话：<strong>算力外置，状态留内，能力可降级。</strong></p>
+<h3 id="h3">2.0 → 3.0 的变化</h3>
+<div class="tw"><table><thead><tr><th></th><th>2.0（现状）</th><th>3.0</th></tr></thead><tbody><tr><td>进程形态</td><td>单进程单机</td><td>客户端 + 可选能力后端</td></tr><tr><td>重模型位置</td><td>全在本机（torch/pyannote/funasr）</td><td>全部在能力后端；客户端只留 <strong>torch-free 的指令链路</strong>（会议不兜底）</td></tr><tr><td>客户端安装</td><td>全量 &gt; 8 GB</td><td><strong>默认档 ≈ 0.6 GB</strong>（详见 §6）</td></tr><tr><td>多机支持</td><td>无（API 预留）</td><td>一服务端支撑多客户端 + 鉴权 + 配额</td></tr><tr><td>模型选择</td><td>全局单值设置</td><td><strong>能力槽 → 后端链</strong>，按槽分别选</td></tr><tr><td>设备选择</td><td>每泳道一个设备值 + 全局一把锁</td><td><strong>两条泳道 + 有序候选链 + 设备级互斥</strong></td></tr><tr><td>播放</td><td><code>sd.play()</code> 用默认输出 + 一把锁</td><td><strong>设备候选链 + 优先级队列 + 可抢占</strong></td></tr><tr><td>数据存储</td><td>单机 SQLite</td><td><strong>不变</strong> —— 仍然只有客户端有业务数据</td></tr></tbody></table></div>
+<p><strong>3.0 不改的东西</strong>：<code>echo.db</code> 仍是唯一事实来源；面板 / DSH / 技能 / 命令行仍走同一套 REST； "触点统一"这个 2.0 的核心决策一个字都没动。</p>
+<h3 id="h4">六条铁律（贯穿全部分册）</h3>
+<div class="tw"><table><thead><tr><th>#</th><th>铁律</th><th>出处</th></tr></thead><tbody><tr><td><strong>L1</strong></td><td>默认客户端 profile 不含 torch（也不含 CUDA、不含编译步骤）</td><td>能力路由 §1</td></tr><tr><td><strong>L2</strong></td><td>产生向量的能力，只允许跑在能声明 <code>vectorSpaceId</code> 的后端上</td><td>能力路由 §3</td></tr><tr><td><strong>L3</strong></td><td>唤醒与指令转写必须有本机后端，不得依赖服务端可用性</td><td>前后分离 §3</td></tr><tr><td><strong>L4</strong></td><td>服务端不存储业务数据；临时文件允许，但必须<strong>自有 + 可证明清理 + 有兜底</strong></td><td>服务端 §1/§5</td></tr><tr><td><strong>L5</strong></td><td>同一场会议不得混用不同 <code>vectorSpaceId</code> 的说话人向量</td><td>前后分离 §6.3</td></tr><tr><td><strong>L6</strong></td><td><strong>ECHO 安装目录里只允许放"可被整体覆盖"的东西</strong>；数据、第三方组件状态、用户资产一律在外面</td><td>本文 §2.1</td></tr></tbody></table></div>
+<hr>
+<h2 id="h5">1. 组件关系总图</h2>
+<div class="diagram"><pre class="mermaid">flowchart TB
+    subgraph TOUCH[&quot;触点层 —— 都走本机 REST :8970&quot;]
+        direction LR
+        T1[&quot;Web 面板&quot;]
+        T2[&quot;热键 / 媒体键&quot;]
+        T3[&quot;唤醒 KWS&quot;]
+        T4[&quot;DSH 技能 / CLI&quot;]
+        T5[&quot;手机 App（未来）&quot;]
+    end
+
+    subgraph CLIENT[&quot;客户端 ECHO —— 业务数据与状态的家&quot;]
+        direction TB
+        API[&quot;api 路由层&lt;br/&gt;REST · 鉴权&quot;]
+        BIZ[&quot;业务层&lt;br/&gt;会议 · 命令 · 纪要 · 工作日志&quot;]
+
+        subgraph STATE[&quot;状态与数据（只在这里）&quot;]
+            direction LR
+            DB[(&quot;echo.db&lt;br/&gt;唯一事实来源&quot;)]
+            MF[&quot;会议文件&lt;br/&gt;录音 / 转写 / 纪要&quot;]
+        end
+
+        subgraph ROUTE[&quot;统一路由层 —— 3.0 新增&quot;]
+            direction LR
+            CAPR[&quot;能力路由&lt;br/&gt;槽 → 后端链&quot;]
+            LLMR[&quot;模型路由&lt;br/&gt;LLM 提供商&quot;]
+            DEVR[&quot;设备路由&lt;br/&gt;两条泳道&quot;]
+            PLAYQ[&quot;播放队列&lt;br/&gt;优先级 + 抢占&quot;]
+        end
+
+        subgraph CENG[&quot;客户端引擎层 —— 只剩指令链路（无 torch）&quot;]
+            direction LR
+            E1[&quot;sherpa 流式&lt;br/&gt;指令转写（必选）&quot;]
+            E2[&quot;sherpa KWS&lt;br/&gt;唤醒（可选）&quot;]
+            E3[&quot;系统 TTS&lt;br/&gt;SAPI / say&quot;]
+        end
+
+        DSHE[&quot;DSH 引擎&lt;br/&gt;会话 · 技能 · 执行&quot;]
+        MIC[&quot;麦克风&lt;br/&gt;独占租约 · 设备级互斥&quot;]
+        SPK[&quot;扬声器&lt;br/&gt;队列串行&quot;]
+    end
+
+    subgraph SERVER[&quot;ECHO 能力后端 —— 无状态 · 无 DB · 不认识业务&quot;]
+        direction TB
+        CAPS[&quot;/v1/capabilities · /v1/health · /v1/ready&quot;]
+        POOL[&quot;EnginePool&lt;br/&gt;常驻 + 按需 + LRU + 显存预算&quot;]
+        SM1[&quot;SenseVoice（常驻）&quot;]
+        SM2[&quot;Qwen3-ASR（按需）&quot;]
+        SM3[&quot;pyannote（按需）&quot;]
+        SM4[&quot;声纹嵌入（常驻）&quot;]
+    end
+
+    subgraph EXT[&quot;外部服务&quot;]
+        direction TB
+        X1[&quot;内网公共 ASR&lt;br/&gt;只提供 asr.text&quot;]
+        X2[&quot;内网 LLM 网关&quot;]
+    end
+
+    T1 --&gt; API
+    T2 --&gt; API
+    T3 --&gt; API
+    T4 --&gt; API
+    T5 --&gt; API
+    API --&gt; BIZ
+    BIZ --&gt; DB
+    BIZ --&gt; MF
+    BIZ --&gt; ROUTE
+    BIZ --&gt; DSHE
+    DSHE --&gt; LLMR
+    LLMR --&gt; X2
+    CAPR --&gt; CENG
+    CAPR --&gt; CAPS
+    CAPR --&gt; X1
+    DEVR --&gt; MIC
+    PLAYQ --&gt; SPK
+    CAPS --&gt; POOL
+    POOL --&gt; SM1
+    POOL --&gt; SM2
+    POOL --&gt; SM3
+    POOL --&gt; SM4
+
+    classDef client fill:#e8f4ff,stroke:#2b6cb0
+    classDef server fill:#fff4e6,stroke:#c05621
+    classDef ext fill:#f0f0f0,stroke:#888
+    class API,BIZ,DSHE,MIC,SPK client
+    class CAPS,POOL,SM1,SM2,SM3,SM4 server
+    class X1,X2 ext</pre></div>
+<p><strong>看图要点</strong></p>
+<ol><li><strong><code>ROUTE</code> 是 3.0 唯一新增的一整层。</strong> 其余组件基本都在，只是职责被重新划线。</li><li><strong>业务数据只在 <code>CLIENT</code> 子图里</strong>（<code>DB</code> + <code>MF</code>）。服务端子图里没有任何存储节点 —— 这是结构上保证的。</li><li><strong><code>CAPR</code> 有三个出边</strong>（本机引擎 / ECHO 后端 / 内网公共），这正是"三后端"的图形化。 注意三个出边<strong>指向不同能力</strong>：本机<strong>只服务指令链路</strong>（会议不兜底）、ECHO 后端是全集、内网公共只有 <code>asr.text</code>。</li><li><strong><code>DEVR</code> 与 <code>PLAYQ</code> 只在客户端内部</strong> —— 设备是本机资源，永远不会成为一个能力槽。</li><li><strong><code>LLMR</code> 在 <code>DSHE</code> 之下</strong>，不在 <code>CAPR</code> 之下 —— 模型路由服务 DSH，能力路由服务识别链路，两者是并列的域（见 §4）。</li></ol>
+<hr>
+<h2 id="h6">2. 数据与状态归属</h2>
+<div class="diagram"><pre class="mermaid">flowchart LR
+    subgraph W[&quot;可写 · 长期保存（客户端独有）&quot;]
+        direction TB
+        W1[&quot;echo.db&lt;br/&gt;settings / commands / meetings&lt;br/&gt;speakers / lines / summary_runs&lt;br/&gt;voiceprints / speaker_embeddings&quot;]
+        W2[&quot;会议文件&lt;br/&gt;*.wav · meta.json · transcript.md · summary.md&quot;]
+    end
+
+    subgraph R[&quot;只读 · 可重建（客户端）&quot;]
+        direction TB
+        R1[&quot;模型权重&lt;br/&gt;models/ 目录&quot;]
+        R2[&quot;服务端能力快照&lt;br/&gt;capabilities 缓存（可随时丢弃）&quot;]
+    end
+
+    subgraph E[&quot;仅内存 / 有 TTL（服务端）&quot;]
+        direction TB
+        E1[&quot;请求级临时文件&lt;br/&gt;自有 · finally 必删 · 启动清扫&quot;]
+        E2[&quot;EnginePool 模型实例&lt;br/&gt;可随时卸载重建&quot;]
+        E3[&quot;限流计数 · 队列&lt;br/&gt;进程重启即消失&quot;]
+    end
+
+    subgraph F[&quot;永不出现（服务端）&quot;]
+        direction TB
+        F1[&quot;会议 / 转写文本 / 纪要&quot;]
+        F2[&quot;声纹库 / 说话人名&quot;]
+        F3[&quot;命令历史 / 设置&quot;]
+    end
+
+    W -.-&gt;|&quot;跨网络的只有：音频（为了算）&quot;| E
+    E -.-&gt;|&quot;回传的只有：文本 / 时间轴 / 嵌入&quot;| W
+    F ~~~ E</pre></div>
+<p><strong>这张图是 L4 的图形化。</strong> 判定标准不是"这个数据重不重要"，而是<strong>"它有没有跨请求累积"</strong>： 有累积（会议、库、设置）→ 客户端；无累积且只为算（音频缓冲、模型实例）→ 可以过服务端。</p>
+<p><strong>注意 <code>voiceprints</code> / <code>speaker_embeddings</code> 在 <code>W</code> 里，永远不在 <code>E</code> 或 <code>F</code> 的边界之外。</strong> 声纹是敏感个人信息，它的处理只发生在客户端（匹配）+ 服务端（一次性提嵌入，算完即弃）。</p>
+<h3 id="h7">2.1 目录与升级边界（"删掉 ECHO 重装，用户不该丢任何东西"）</h3>
+<h4 id="h8">现状是坏的，而且根因只有一处</h4>
+<p>Windows 上 <code>app/platform/win32/env.py:16</code> 是 <code>&quot;dataDir&quot;: &quot;{ECHO}/data&quot;</code> —— 于是<strong>四样会累积的东西全在 ECHO 安装目录里</strong>（macOS / Linux 反而是独立的，只有 Windows 不是）：</p>
+<div class="tw"><table><thead><tr><th>东西</th><th>现状落点（Windows）</th><th>谁拥有</th></tr></thead><tbody><tr><td>ECHO 自己的状态（<code>echo.db</code> / logs / pid / token）</td><td><code>&lt;ECHO&gt;\data\</code></td><td>ECHO</td></tr><tr><td>会议录音 / 转写 / 纪要</td><td><code>&lt;ECHO&gt;\data\meetings\</code></td><td><strong>用户</strong></td></tr><tr><td>模型权重</td><td><code>&lt;ECHO&gt;\models\</code>（<code>paths.models_root()</code> 缺省值）</td><td>用户</td></tr><tr><td><strong>DSH 标准版本体</strong>（约 223 MB）</td><td><code>&lt;ECHO&gt;\harness\dsh\</code></td><td><strong>DSH</strong></td></tr><tr><td><strong>DSH 家目录</strong>（skills / 会话 / 记忆 / <code>settings.yaml</code> / 凭据）</td><td><code>&lt;ECHO&gt;\data\harness\</code>（<code>harnessHome</code> 留空 → <code>{DATA}/harness</code>）</td><td><strong>用户 + DSH</strong></td></tr><tr><td>ECHO 自带的安装技能源</td><td><code>&lt;ECHO&gt;\.dsh\skills\echo-install\</code></td><td>ECHO</td></tr></tbody></table></div>
+<p><code>config.py:528</code> 把这件事写在了明面上： *"安装技能会填成 <code>&lt;安装目录&gt;/harness/dsh</code> 里的本地入口"*。</p>
+<p><strong>危害</strong>：用户"删掉 ECHO 重装"或升级包覆盖时，会连带毁掉 模型（几 GB，重下代价大）、会议数据、以及<strong>他在 DSH 里积累的 skills 与会话</strong>。</p>
+<h4 id="h9">修正后的根划分</h4>
+<p>原则一句话：<strong>ECHO 安装目录里只允许放"能被整体覆盖"的东西。</strong></p>
+<div class="tw"><table><thead><tr><th>根</th><th>放什么</th><th>谁拥有</th><th>升级时</th><th>默认值（Win）</th></tr></thead><tbody><tr><td><code>{ECHO}</code></td><td>代码 + 面板静态资源 + 随包脚本</td><td>ECHO</td><td><strong>覆盖</strong></td><td>安装目录</td></tr><tr><td><code>{RUNTIME}</code></td><td>Python 运行时</td><td>ECHO</td><td>覆盖但保留</td><td>独立</td></tr><tr><td><code>{DATA}</code></td><td>ECHO 自己的状态</td><td>ECHO</td><td><strong>保留</strong></td><td><strong><code>%LOCALAPPDATA%\ECHO</code></strong> ← 改这里</td></tr><tr><td><code>{MEETINGS}</code></td><td>会议录音 / 转写 / 纪要</td><td>用户</td><td><strong>保留</strong></td><td><code>{DATA}\meetings</code>（自动跟着独立）</td></tr><tr><td><code>{MODELS}</code></td><td>模型权重</td><td>用户</td><td><strong>保留</strong></td><td><code>{DATA}\models</code> ← 也要挪出 <code>{ECHO}</code></td></tr><tr><td><strong><code>{DSH_INSTALL}</code></strong></td><td>DSH 标准版本体</td><td><strong>DSH</strong></td><td><strong>保留</strong></td><td><code>%LOCALAPPDATA%\DeepSeekHarness\app</code></td></tr><tr><td><strong><code>{DSH_HOME}</code></strong></td><td>skills / 会话 / 记忆 / 设置 / 凭据</td><td><strong>用户 + DSH</strong></td><td><strong>绝对保留</strong></td><td><code>%LOCALAPPDATA%\DeepSeekHarness\home</code></td></tr></tbody></table></div>
+<p><strong>关键推论：改 <code>dataDir</code> 一处，<code>{DATA}</code> / <code>{MEETINGS}</code> 两样自动就独立了</strong> —— 因为后者的缺省值本来就挂在 <code>{DATA}</code> 下（<code>paths.meetings_root()</code>）。 剩下只需单独挪 <code>{MODELS}</code> 和两个 DSH 根。</p>
+<h4 id="h10">为什么 DSH 的两个根要<strong>用 DSH 的名字</strong>，而不是 ECHO 的名字</h4>
+<p><code>%LOCALAPPDATA%\DeepSeekHarness\</code> 而不是 <code>%LOCALAPPDATA%\ECHO\dsh\</code> —— 这不是洁癖：</p>
+<ol><li><strong>DSH 是独立产品。</strong> 用户会直接用它的 Web 界面（面板上就有「用浏览器打开标准版」）。 他的 skills / 会话 / 记忆是<strong>在 DSH 里积累的资产</strong>，不是 ECHO 的子数据。</li><li><strong>双向写入。</strong> 用户自己往 DSH 装 skill，ECHO 也装 skill（<code>echo-install</code>）。 两个来源共用一个 home，不能有谁"拥有"它。</li><li><strong>目录名就是所有权声明。</strong> 放在 ECHO 名下，下一次"清理 ECHO 目录"就会误删。</li></ol>
+<blockquote><p><strong>待确认</strong>：DSH 标准版<strong>自己</strong>的默认家目录是什么？如果它有既定约定， 应当<strong>优先跟随它</strong>，ECHO 只在用户显式配置时覆盖。这一条我不能凭猜——需要实测或问 DSH 侧。</p></blockquote>
+<h4 id="h11">迁移策略（老装机上 <code>{ECHO}\data</code> 已有数据）</h4>
+<ul><li><strong>新装</strong> → 直接用新位置</li><li><strong>老装</strong> → 检测到 <code>{ECHO}/data</code> 存在 → 面板提示 + <strong>一键迁移</strong>，<strong>不自动搬</strong> （几 GB 的会议录音与模型，移动有失败风险；<code>/api/paths/migrate-meetings</code> 已有现成先例）</li><li><strong>迁移期间</strong> → 新位置优先，老位置<strong>只读兼容</strong></li><li>迁移完不删老目录，让用户自己确认后再删</li></ul>
+<h4 id="h12">建议的两条铁律 + 护栏测试</h4>
+<blockquote><p><strong>L6：ECHO 安装目录里只允许出现"可被整体覆盖"的东西。</strong> 判据（也是最直白的验收）：<strong>"删掉整个 ECHO 目录重装，用户会丢什么？"</strong> 答案必须是"<strong>什么都没丢</strong>"。</p></blockquote>
+<div class="tw"><table><thead><tr><th>测试</th><th>断言</th></tr></thead><tbody><tr><td><code>test_echo_root_holds_only_code.py</code></td><td><code>{ECHO}</code> 下的顶层条目全在白名单内（<code>app/ web/ scripts/ plugin/ docs/ assets/</code> + 少数随包脚本）</td></tr><tr><td><code>test_roots_are_outside_echo.py</code></td><td><code>data_root()</code> / <code>meetings_root()</code> / <code>models_root()</code> / DSH 两个根的<strong>默认值都不在 <code>echo_root()</code> 之下</strong></td></tr><tr><td><code>test_dsh_home_never_under_echo.py</code></td><td><code>harness_home()</code> 解析结果不得落在 <code>{ECHO}</code> 内（显式配置成 ECHO 下时<strong>拒绝并报错</strong>，不是静默接受）</td></tr><tr><td><code>test_skills_ownership.py</code></td><td>ECHO 只更新自己装的 skill（靠 <code>skills/.echo-managed</code> 清单），<strong>不删用户自己装的</strong></td></tr></tbody></table></div>
+<p>最后一条是针对一个真实的坑：<code>skills/</code> 是 ECHO 与用户<strong>共享</strong>的目录。 没有所有权标记的话，升级时的"清理旧版本 skill"会误删用户自己的。</p>
+<h3 id="h13">2.2 安装根目录：<code>{ECHO_BASE}</code> 与它的兄弟目录</h3>
+<p><strong>提案</strong>（2026-09-23）：安装时问用户一个根目录，下面分几个兄弟目录：</p>
+<pre class="code"><code>{ECHO_BASE}/                  ← 安装时设定
+├── echo-core/    ECHO 代码 + 面板 + 随包脚本       → 升级**整体覆盖**
+├── data/         echo.db / logs / pid / token     → 必须保留   ★补
+├── models/       模型权重（几 GB）                 → 必须保留   ★补
+├── dsh/          DSH 标准版本体（+ DSH 家目录？）   → 必须保留
+├── meeting/      会议数据 **并**作「会议空间」工作区 → 必须保留
+└── aide/         指令数据（+ skills？）**并**作「指令空间」工作区 → 必须保留</code></pre>
+<h4 id="h14">为什么要补 <code>data/</code> 与 <code>models/</code></h4>
+<p>提案里只列了四个。缺的两项不是可选的：</p>
+<ul><li><strong><code>data/</code>（ECHO 自己的状态）不能塞进 <code>echo-core/</code></strong> —— 那是"可被整体覆盖"的目录， <code>echo.db</code> 会被升级冲掉（直接违反 L6）。它也不属于 meeting / aide / dsh 任何一类。</li><li><strong><code>models/</code>（几 GB）同样不属于那四类</strong>，而且用户很可能想把它放到<strong>另一个盘</strong> （大盘/慢盘放大模型，小 SSD 放程序）。所以缺省挂在根下，但<strong>必须允许单独覆盖</strong>。</li></ul>
+<h4 id="h15">这一步顺带修掉一个真实 bug</h4>
+<p>现状 <code>config.py</code> 里是<strong>两条独立设置</strong>，而且 <code>config.py:441-443</code> 的说明明确强调它们"不是一个东西"：</p>
+<div class="tw"><table><thead><tr><th>设置</th><th>现值</th><th>含义</th></tr></thead><tbody><tr><td><code>meetingsDir</code></td><td><code>&quot;&quot;</code> → <code>{DATA}/meetings</code></td><td>录音/纪要<strong>文件</strong>放哪</td></tr><tr><td><code>meetingWorkspace</code></td><td><code>{ECHO}/data/meetings</code></td><td>DSH <strong>会话</strong>登记到哪个工作区</td></tr></tbody></table></div>
+<p><strong>它们今天恰好指向同一个目录</strong>（Windows 上 <code>{DATA}</code> = <code>{ECHO}/data</code>）—— 但那是巧合，不是约束。用户一旦按说明去改 <code>meetingsDir</code>（搬家会议数据是常见诉求）， DSH 工作区仍停在老路径 → <strong>DSH 就看不到会议文件了，而且没有任何地方会报错。</strong></p>
+<p>提案把它定成一条规则：<strong><code>meeting/</code> 同时是数据目录与工作区</strong>。 所以 3.0 应当<strong>合并这两项</strong>（或强制联动），让"两条路到达同一目录"<strong>从巧合变成不变量</strong>。</p>
+<h4 id="h16">设置项收敛</h4>
+<div class="tw"><table><thead><tr><th>设置</th><th>作用</th><th>缺省</th></tr></thead><tbody><tr><td><strong><code>echoBase</code></strong>（新）</td><td>安装根。<strong>只在安装时写</strong>；运行时改它 = 触发迁移</td><td>安装时问用户</td></tr><tr><td><code>{ECHO}</code></td><td>代码根</td><td><code>{echoBase}/echo-core</code></td></tr><tr><td><code>{DATA}</code></td><td>ECHO 状态</td><td><code>{echoBase}/data</code></td></tr><tr><td><code>{MODELS}</code></td><td>模型权重</td><td><code>{echoBase}/models</code></td></tr><tr><td><code>dshInstall</code>（新）</td><td>DSH 本体</td><td><code>{echoBase}/dsh/app</code></td></tr><tr><td><code>meetingWorkspace</code> <strong>≡</strong> <code>meetingsDir</code></td><td>会议空间（<strong>并成一项</strong>）</td><td><code>{echoBase}/meeting</code></td></tr><tr><td><code>commandWorkspace</code></td><td>指令空间</td><td><code>{echoBase}/aide</code></td></tr></tbody></table></div>
+<p><strong>根只是缺省，每一项仍允许独立覆盖</strong> —— 模型与录音的体积特性不同，分盘是合理需求。</p>
+<h4 id="h17">已经落地的一半：<code>app/workspaces.py</code></h4>
+<p>这个模块已经存在，而且做的正是"目录 → DSH 工作区"这件事（<code>ensure_spaces()</code>）： 建目录 → <code>workspace/create</code> 拿 id → <code>workspace/rename</code> 改成中文名。 <code>meetingWorkspace</code> / <code>commandWorkspace</code> + 两个 <code>Title</code> 设置、<code>/api/dsh/workspaces/ensure</code>、 <code>boot.py</code> 的兜底重试都已就位。<strong>所以这个提案不需要新建机制，只需把根引进去、并调缺省值。</strong></p>
+<p>它同时提示了一条 DSH 的硬约束（做设计时别忘）： <strong>侧栏分组是"显式登记制"，只有用 <code>workspaceId</code> 建会话才会归组</strong>（传 <code>cwd</code> 只建目录不登记， 会话落到「未分组」）。而且 <code>workspace/create</code> 只收目录、分组名由目录名派生 —— 所以"建成「会议空间」"必须是<strong>三步</strong>，缺一步用户看到的就是"没分组"或"分组名是 meeting"。</p>
+<h4 id="h18">一个要拍板的点：<code>DSH_HOME</code> 放哪</h4>
+<p>"aide 装 skill"这句需要澄清一个事实：<strong>skills 在 DSH 家目录的 <code>skills/</code> 下，不在工作区里。</strong> 而 DSH 家目录同时装着 <code>storages/</code>（含 <code>workspace.json</code>）、会话、<code>settings.yaml</code>、<code>.credentials.yaml</code>。</p>
+<div class="tw"><table><thead><tr><th>方案</th><th><code>DSH_HOME</code></th><th>好处</th><th>代价</th></tr></thead><tbody><tr><td><strong>A</strong></td><td><code>{echoBase}/dsh/home</code></td><td>DSH 自己的存储与工作区<strong>不混</strong></td><td><code>aide/</code> 里看不到 skills，与"aide 装 skill"的说法不符</td></tr><tr><td><strong>B</strong></td><td><code>{echoBase}/aide</code></td><td>与提案说法一致：<code>aide/skills/</code> 与工作区文件同在一处</td><td><strong>DSH 会把自己的会话存储当成工作区内容</strong> —— <code>aide/storages/</code> 是 agent 自己的存档，工作区里的 agent 能读到它，可能被索引成噪音</td></tr></tbody></table></div>
+<p><strong>倾向 A</strong>：B 有一个真实的自引用问题。 若确实要 B，建议把 DSH 的状态放进隐藏子目录并在面板标注"别手删"。</p>
+<h4 id="h19">迁移（老装机）</h4>
+<div class="tw"><table><thead><tr><th>老位置</th><th>新位置</th></tr></thead><tbody><tr><td><code>D:\ECHO\{app,web,scripts,plugin,docs,assets}</code></td><td><code>{base}\echo-core\</code></td></tr><tr><td><code>D:\ECHO\data\</code></td><td><code>{base}\data\</code></td></tr><tr><td><code>D:\ECHO\data\meetings\</code></td><td><code>{base}\meeting\</code></td></tr><tr><td><code>D:\ECHO\data\command\</code></td><td><code>{base}\aide\</code></td></tr><tr><td><code>D:\ECHO\models\</code></td><td><code>{base}\models\</code></td></tr><tr><td><code>D:\ECHO\harness\dsh\</code></td><td><code>{base}\dsh\app\</code></td></tr><tr><td><code>D:\ECHO\data\harness\</code></td><td><code>{base}\dsh\home\</code>（或 <code>aide\</code>，待定）</td></tr></tbody></table></div>
+<p>策略与 §2.1 一致：<strong>不自动搬</strong>（几 GB）、面板提示 + 一键迁移、老位置只读兼容一个版本。</p>
+<h4 id="h20">安装向导要加的一步</h4>
+<ul><li>问根目录；建议 <code>D:\ECHO</code>（沿用现状习惯）或 <code>%LOCALAPPDATA%\ECHO</code></li><li>校验<strong>直接复用 <code>paths.validate_dir()</code></strong> —— 它已经具备：绝对路径、拒绝磁盘根 / 系统目录、 可写探针（"建了就删"），不用新写</li><li>再加一条<strong>空间检查</strong>：模型 + 会议录音可能几十 GB，装之前就要提示可用空间</li></ul>
+<hr>
+<h2 id="h21">3. 一次会议转写的完整链路</h2>
+<div class="diagram"><pre class="mermaid">sequenceDiagram
+    autonumber
+    participant U as 用户
+    participant C as 客户端 ECHO
+    participant DR as 设备路由
+    participant CA as 能力路由
+    participant S as ECHO 能力后端
+    participant I as 内网公共 ASR
+    participant DB as echo.db
+
+    U-&gt;&gt;C: 点「开始录音」
+    C-&gt;&gt;DR: 选设备（会议泳道）
+    DR-&gt;&gt;DR: 黑名单 → 在位 → 是否被指令泳道持有 → 实开探测
+    DR--&gt;&gt;C: MAXHUB 全向麦（取租约）
+    loop 每 meetingSegmentMinutes
+        C-&gt;&gt;C: 写分段 NN.wav 到会议目录
+    end
+    U-&gt;&gt;C: 点「结束录音」
+    C-&gt;&gt;DB: meetings.status = transcribing
+    loop 每个分段
+        C-&gt;&gt;CA: 需求 = {asr.text, asr.timestamps, diarize.*}
+        CA-&gt;&gt;I: POST /v1/asr
+        I--&gt;&gt;CA: 文本（无时间戳 → 标注 estimated）
+        CA-&gt;&gt;S: POST /v1/asr?variant=meeting&amp;timestamps=1
+        S--&gt;&gt;CA: 时间戳骨架 + modelVersion
+        CA-&gt;&gt;S: POST /v1/diarize
+        S--&gt;&gt;CA: turns + speaker_embeddings + vectorSpaceId
+        CA--&gt;&gt;C: 执行计划 + skipped 原因（每个槽走了谁）
+        C-&gt;&gt;C: 跨段同一性（本机聚类）+ 声纹匹配（本机库）
+        C-&gt;&gt;DB: lines / speakers / speaker_embeddings
+    end
+    C-&gt;&gt;C: 纪要生成（DSH 会话）
+    C--&gt;&gt;U: 完成提示音</pre></div>
+<p><strong>三个要点</strong></p>
+<ol><li><strong><code>asr.text</code> 走了内网公共、<code>asr.timestamps</code> 与 <code>diarize</code> 走了 ECHO 后端</strong> —— 这是"槽级拼装"的实例，也是 <code>_fallback_sv_rows()</code> 一般化后的样子。</li><li><strong><code>diarize</code> 之后客户端还要做一次本机计算</strong>（跨段同一性 + 声纹匹配）—— 这是整个设计里最容易被忽略的一步：服务端只出"段内结果 + 嵌入"，跨段身份是客户端的事。</li><li><strong><code>vectorSpaceId</code> 随每次 diarize 响应回来</strong>，客户端据此做会议级锁定（L5）。</li></ol>
+<hr>
+<h2 id="h22">4. 四个路由域的对齐</h2>
+<div class="diagram"><pre class="mermaid">flowchart TB
+    CORE[&quot;pick() 共享内核&lt;br/&gt;有序候选 · 排除判据 · 健康与冷却 · skipped 原因&quot;]
+
+    subgraph D1[&quot;模型路由（LLM 提供商）&quot;]
+        M1[&quot;echo-auto 通道链&quot;] --&gt; P1[&quot;无租约 · 熔断跳过&quot;]
+    end
+    subgraph D2[&quot;能力路由（识别链路）&quot;]
+        M2[&quot;槽 → 后端链&quot;] --&gt; P2[&quot;无租约 · 服务端有界队列&quot;]
+    end
+    subgraph D3[&quot;设备路由（采集）&quot;]
+        M3[&quot;泳道 → 设备候选链&quot;] --&gt; P3[&quot;独占租约 · 两级互斥 · 不排队&quot;]
+    end
+    subgraph D4[&quot;播放路由&quot;]
+        M4[&quot;泳道 → 设备候选链&quot;] --&gt; P4[&quot;独占租约 · 优先级队列 · 可抢占&quot;]
+    end
+
+    CORE --- D1
+    CORE --- D2
+    CORE --- D3
+    CORE --- D4</pre></div>
+<div class="tw"><table><thead><tr><th></th><th>模型路由</th><th>能力路由</th><th>采集设备</th><th>播放设备</th></tr></thead><tbody><tr><td><strong>候选</strong></td><td>通道</td><td>后端（本机/ECHO/内网）</td><td>设备链（2 泳道）</td><td>设备链</td></tr><tr><td><strong>租约</strong></td><td>无</td><td>无</td><td><strong>独占（跨泳道设备级互斥）</strong></td><td>独占</td></tr><tr><td><strong>排队</strong></td><td>否</td><td>服务端有界队列</td><td><strong>否 —— 快速失败</strong></td><td><strong>是 —— 优先级 + 可抢占</strong></td></tr><tr><td><strong>状态</strong></td><td>内网网关已就绪</td><td>新增</td><td>新增</td><td>新增</td></tr><tr><td><strong>实现</strong></td><td><code>dsh-failover/proxy.py</code>（独立进程）</td><td><code>app/capabilities/</code></td><td><code>mic.py</code> 改造</td><td><code>app/audio/playback.py</code></td></tr></tbody></table></div>
+<p><strong>共用的只有 <code>pick()</code> 内核</strong>，租约与队列各自实现。 强行合并（例如把设备塞进 <code>EnginePool</code>）会把两个本质不同的东西套进一个抽象： 池管的是"可共享的模型实例"，设备是"独占句柄"。</p>
+<hr>
+<h2 id="h23">5. 能力槽 × 后端矩阵</h2>
+<p>权威清单以 <code>docs/能力路由-三后端与轻客户端.md</code> §4.2 为准。</p>
+<div class="diagram"><pre class="mermaid">flowchart LR
+    subgraph SLOTS[&quot;能力槽&quot;]
+        direction TB
+        S1[&quot;asr.text&quot;]
+        S2[&quot;asr.timestamps&quot;]
+        S3[&quot;asr.streaming&quot;]
+        S4[&quot;diarize.turns / .embeddings&quot;]
+        S5[&quot;speaker.embed&quot;]
+        S6[&quot;tts&quot;]
+        S7[&quot;wake&quot;]
+    end
+    subgraph BE[&quot;后端&quot;]
+        direction TB
+        B1[&quot;本机（sherpa-onnx）&quot;]
+        B2[&quot;ECHO 能力后端&quot;]
+        B3[&quot;内网公共 ASR&quot;]
+    end
+    S1 --- B1
+    S1 --- B2
+    S1 --- B3
+    S2 --- B1
+    S2 --- B2
+    S3 --- B1
+    S4 --- B1
+    S4 --- B2
+    S5 --- B1
+    S5 --- B2
+    S6 --- B1
+    S7 --- B1</pre></div>
+<div class="tw"><table><thead><tr><th>槽</th><th>本机</th><th>ECHO 后端</th><th>内网公共</th><th>说明</th></tr></thead><tbody><tr><td><code>asr.text</code>（指令）</td><td>✅ <strong>锁定</strong></td><td>⚠️ 仅增强（默认关）</td><td>❌</td><td>L3：可用性归本机</td></tr><tr><td><code>asr.text</code>（会议）</td><td>❌ <strong>不兜底</strong></td><td>✅</td><td>✅ 优先（质量）</td><td>会议链路 100% 依赖后端</td></tr><tr><td><code>asr.timestamps</code></td><td>❌ <strong>不兜底</strong></td><td>✅</td><td>❌ 通常无</td><td>无时间戳时退回按字数均摊并标 <code>estimated</code></td></tr><tr><td><code>asr.streaming</code></td><td>✅</td><td>❌</td><td>❌</td><td>流式必须本机（指令专用）</td></tr><tr><td><code>diarize.*</code></td><td>❌ <strong>不兜底</strong></td><td>✅ 唯一</td><td>❌ <strong>永久排除</strong>（L2）</td><td></td></tr><tr><td><code>speaker.embed</code></td><td>❌ <strong>不兜底</strong></td><td>✅ 唯一</td><td>❌ <strong>永久排除</strong>（L2）</td><td>嵌入由后端提取；<strong>库仍在客户端</strong>，详见 §5.1</td></tr><tr><td><code>tts</code></td><td>✅ 系统自带</td><td>⚠️ 可选</td><td>❌</td><td></td></tr><tr><td><code>wake</code></td><td>✅ 唯一</td><td>❌</td><td>❌</td><td>是能力槽，但<strong>不是设备泳道</strong>（见 §7）</td></tr></tbody></table></div>
+<h3 id="h24">5.1 声纹：它不跟着"会议不兜底"一起砍掉</h3>
+<p>用户 2026-09-23 特别点名：*"不要默认会议本地转写，<strong>但是还要考虑声纹功能</strong>"*。 这两件事看着都在会议链路上，但<strong>约束条件完全不同</strong>，不能一刀切：</p>
+<div class="tw"><table><thead><tr><th></th><th>会议转写</th><th>声纹</th></tr></thead><tbody><tr><td>数据量</td><td>几十分钟音频（几十 MB / 场）</td><td><strong>秒级音频</strong>（现场注册）；会议侧复用已有嵌入</td></tr><tr><td>对延迟</td><td>可延迟（排队可接受）</td><td>注册要即时反馈</td></tr><tr><td>隐私等级</td><td>会议内容</td><td><strong>敏感个人信息</strong>（生物特征）</td></tr><tr><td>库在哪</td><td>—</td><td><strong>必须留在客户端</strong>（不变）</td></tr></tbody></table></div>
+<h4 id="h25">一个反直觉的结论：声纹"出机"在 3.0 下<strong>不新增任何暴露面</strong></h4>
+<p>早前的原则写过"生物特征不出内网"。但要注意：</p>
+<blockquote><p><strong>会议音频本来就要上行做转写。</strong> 从同一份音频里提声纹嵌入， 并不比"把这段音频送去转写"多泄露一个字节。</p></blockquote>
+<p>所以"为了声纹隐私而保留客户端本地 embedding"这个理由，<strong>在会议链路里站不住</strong>。 唯一真正新增的暴露面是<strong>现场注册</strong>（对着麦克风说一句话）—— 那段音频原本不必出机。</p>
+<h4 id="h26">因此声纹的形态：功能全保留，实现跟着链路走</h4>
+<div class="tw"><table><thead><tr><th>环节</th><th>放哪</th><th>变化</th></tr></thead><tbody><tr><td>提嵌入（会议说话人）</td><td><strong>服务端</strong>（<code>/v1/diarize</code> 已返回 <code>speaker_embeddings</code>）</td><td>无额外成本 —— 复用 diarize 的产物</td></tr><tr><td>提嵌入（现场注册）</td><td><strong>服务端</strong> <code>/v1/speaker/embed</code>（新增端点）</td><td>几秒音频上行；可选"仅本地"降级</td></tr><tr><td>余弦匹配 + 阈值 + 间隔门</td><td><strong>客户端</strong>（<code>VoiceMatcher</code>）</td><td>不变</td></tr><tr><td>声纹库 / 入库 / 改名 / 删除 / 合并</td><td><strong>客户端</strong>（<code>voiceprints</code> 表）</td><td>不变</td></tr><tr><td>「识别本场」</td><td><strong>客户端</strong>（用已落库的嵌入）</td><td>不变</td></tr></tbody></table></div>
+<p><strong>所以 <code>vectorSpaceId</code> 仍然只有一个来源</strong> —— §5.1.1 的简化（客户端不产生向量）<strong>成立</strong>。</p>
+<h4 id="h27">三件必须补上的事（现在是缺的）</h4>
+<ol><li><strong><code>vector_space_id</code> 落库。</strong> <code>speaker_embeddings</code> 与 <code>voiceprints</code> 现在只有 <code>embedding</code> + <code>dim</code> （<code>voiceprint.pack()</code> 返回 <code>(blob, dim)</code>）。换服务端 embedding 模型后，旧样本与新嵌入的余弦 <strong>会静默变成噪声</strong> —— 不报错，只是开始认错人。这是这套设计里唯一会<strong>不报错地出错</strong>的地方。</li><li><strong>现场注册功能目前不存在。</strong> <code>voiceprint.py</code> 只有 <code>enroll_from_meeting()</code> —— 入库的唯一路径是"在会议里把说话人改名为联系人"。有了 <code>/v1/speaker/embed</code> 才能做"念一段话就注册"，门槛会低很多，也才配得上"声纹库"这个名字。</li><li><strong>"换模型 = 全库失效"的迁移流程。</strong> 服务端换 embedding 模型时要有： 面板提示 + 「用新模型重新入库」+ 旧样本<strong>保留不删</strong>（只标为旧空间、不参与匹配）。</li></ol>
+<h4 id="h28">一个必须守住的不变量</h4>
+<p><strong>注册与识别必须同一向量空间。</strong></p>
+<p>如果将来允许"本机注册"（<code>sherpa-onnx</code> 的 <code>SpeakerEmbeddingExtractor</code>，模型只几十 MB）， 就必须让<strong>服务端也用同一个模型</strong> —— 否则本机注册的样本与会议里认出的嵌入<strong>不可比</strong>。</p>
+<p>这正是 <code>docs/能力路由-三后端与轻客户端.md</code> §0.1 里"同权重不同运行时"那个假设要回答的问题。 <strong>在那条被实测验证之前，"注册与识别都走服务端"是唯一不会错的选择。</strong></p>
+<blockquote><p>反过来说：如果实测证明"同权重、两边向量可比"，那么本机注册就能白拿 （几十 MB 模型 + 声纹音频完全不出机）。<strong>这是一条投入很小、收益明确的实测</strong>， 建议保留在待办里（与 §12 里被取消的那几件区分开）。</p></blockquote>
+<hr>
+<h2 id="h29">6. 部署形态</h2>
+<div class="diagram"><pre class="mermaid">flowchart TB
+    subgraph F1[&quot;形态 1 · 单机双进程 —— 第一步验证&quot;]
+        direction LR
+        A1[&quot;客户端&quot;] --&gt;|&quot;127.0.0.1&quot;| B1[&quot;ECHO 能力后端&quot;]
+    end
+    subgraph F2[&quot;形态 2 · 部门 GPU + N 客户端 —— 目标&quot;]
+        direction LR
+        A2a[&quot;办公本客户端&quot;] --&gt; B2[&quot;ECHO 能力后端&lt;br/&gt;GPU&quot;]
+        A2b[&quot;办公本客户端&quot;] --&gt; B2
+        A2c[&quot;会议室客户端&quot;] --&gt; B2
+    end
+    subgraph F3[&quot;形态 3 · 纯本机 —— 只够指令链路&quot;]
+        direction LR
+        A3[&quot;客户端&lt;br/&gt;指令链路完整&lt;br/&gt;会议转写排队等后端&quot;]
+    end</pre></div>
+<p><strong>形态 1 / 2 必须都支持</strong>；形态 3 的意义是"服务端没建好时，<strong>指令链路仍然完整可用</strong>"， <strong>不是</strong>"会议也能凑合转写"（见下）。</p>
+<div class="tw"><table><thead><tr><th>形态</th><th>客户端重量</th><th>会议转写</th><th>说话人/声纹</th></tr></thead><tbody><tr><td>1</td><td>轻（无 torch）</td><td>服务端</td><td>服务端</td></tr><tr><td>2</td><td>轻（无 torch）</td><td>服务端</td><td>服务端</td></tr><tr><td>3</td><td>轻（无 torch）</td><td><strong>排队等后端</strong>（无本机兜底）</td><td>不可用（不兜底）</td></tr></tbody></table></div>
+<p><strong>默认档客户端体积预算</strong>（详见能力路由 §1）：</p>
+<pre class="code"><code>必选：  运行时核心 155  +  本机流式 ASR 模型 189  +  ECHO 代码 3   ≈ 350 MB
+可选：  KWS 唤醒模型 40
+后装：  DSH 标准版 ~223 MB（装完在面板点一下装）
+不装：  会议转写 / 说话人分离 / 声纹的任何模型（会议明确不做本机兜底）</code></pre>
+<h3 id="h30">6.1 客户端组件清单（必选 / 后装 / 可选）</h3>
+<p>"必选"要分两个维度看，混在一起最容易漏东西：</p>
+<ul><li><strong>功能必选</strong> —— 没有它，ECHO 的核心链路断了</li><li><strong>包内必含</strong> —— 安装时就必须在包里（其余可以装完再从面板补）</li></ul>
+<div class="tw"><table><thead><tr><th>组件</th><th>功能必选</th><th>包内必含</th><th>说明</th></tr></thead><tbody><tr><td><code>runtime-core</code>（Python 运行时 + 基础依赖）</td><td>✅</td><td>✅</td><td>现在 <code>components.REQUIRED_IDS</code> 里<strong>唯一</strong>的一项</td></tr><tr><td><strong>本机流式 ASR 引擎 + 模型</strong>（sherpa-onnx + zipformer）</td><td>✅</td><td>✅</td><td><strong>铁律 L3</strong>：指令转写不得依赖服务端可用性。漏了它，症状就是"服务端一挂、按热键没反应"</td></tr><tr><td>ECHO 代码 + 面板静态文件</td><td>✅</td><td>✅</td><td>含仪表盘 / 会议 / 指令历史 / 设置 / 路由 / 组件页</td></tr><tr><td><strong>业务数据存储</strong>（<code>echo.db</code> + 会议文件目录）</td><td>✅</td><td>—</td><td>不是"组件"，是运行时产物；但它是"业务数据留客户端"的落点</td></tr><tr><td><strong>采集与播报</strong>（麦克风租约 + 播放队列 + 热键/媒体键）</td><td>✅</td><td>✅</td><td>客户端独有，服务端没有</td></tr><tr><td><strong>智能体后端 = DSH 标准版（唯一）</strong></td><td>✅</td><td>⚠️ <strong>后装</strong></td><td><code>assistant._dispatch()</code> 里 <code>client.ping()</code> 失败就直接 <code>DSH 未运行，命令未发送</code>。3.0 起退役桌面版与 CodeBuddy（见 §6.2）</td></tr><tr><td>DSH 技能目录（<code>.dsh/skills/</code>，含 <code>echo-install</code>）</td><td>⚠️</td><td>✅</td><td>装 / 修 DSH 靠它；没有它就只能手工装</td></tr><tr><td>TTS 离线音色（SAPI / <code>say</code> / espeak）</td><td>✅</td><td>—</td><td>系统自带，零依赖</td></tr><tr><td>唤醒 KWS（模型 40 MB）</td><td>❌</td><td>❌</td><td>设置里默认关闭，属"可选功能"</td></tr><tr><td>离线会议转写模型（sherpa 离线 / SenseVoice / whisper / Qwen3-ASR）</td><td>❌</td><td>❌</td><td><strong>明确不做本机兜底</strong>（2026-09-23 决定）：会议链路 100% 依赖能力后端</td></tr><tr><td>说话人分离 / 声纹模型</td><td>❌</td><td>❌</td><td>嵌入由后端提取（<code>/v1/diarize</code>、<code>/v1/speaker/embed</code>）；<strong>声纹库仍在客户端</strong>（见 §5.1）</td></tr><tr><td>CUDA 加速（<code>accel-cuda</code>）</td><td>❌</td><td>❌</td><td>客户端<strong>刻意不装</strong>（L1：默认档不含 torch / CUDA）</td></tr><tr><td>在线 TTS（edge-tts）</td><td>❌</td><td>—</td><td>纯 Python，无模型；离线用系统自带音色</td></tr></tbody></table></div>
+<p><strong>三条容易搞错的</strong>：</p>
+<ol><li><strong>智能体后端是功能必选，但不该进包。</strong> 它要联网（npm 584 包 / 约 2 分钟）、会失败； 把它的失败面关在主安装流程里，是"3 分钟装完"的前提 → 装完在面板点一下装（见 §9）。</li><li><strong>服务端不是"必装件"，但是会议链路的硬依赖。</strong> 客户端能独立启动（形态 3）， 指令链路完全不受影响；但<strong>会议转写没有本机兜底，后端不可达就只能排队</strong>。 安装引导里必须说清"会议转写需要能力服务端"，否则用户会以为"录完就自动出纪要"。</li><li><strong>本机 ASR 引擎最容易被漏掉</strong>，因为它不像模型那样显眼（它是一个 pip 依赖 + 一个模型目录）。 漏掉它的后果，正是 L3 要防的那件事 —— <strong>注意它是给指令链路兜底的，与会议无关</strong>。</li></ol>
+<h3 id="h31">6.2 智能体后端收敛到 DSH 标准版（唯一）</h3>
+<p><strong>决策</strong>：3.0 起客户端只保留 <strong>DSH 标准版 harness</strong>，退役 <strong>DSH 桌面版</strong>与 <strong>CodeBuddy</strong>。</p>
+<h4 id="h32">消掉的复杂度（按代码实测清点）</h4>
+<div class="tw"><table><thead><tr><th>位置</th><th>现状</th><th>收敛后</th></tr></thead><tbody><tr><td><code>app/agents/dsh_agent.py</code>（34 KB）</td><td>DSH Desktop 适配器（HTTP JSON-RPC <code>:43120</code>）</td><td>退役</td></tr><tr><td><code>app/agents/codebuddy.py</code>（13 KB）</td><td>CodeBuddy CLI 适配器</td><td>退役</td></tr><tr><td><code>app/config.py:498</code> <code>agentBackend</code></td><td>三选一（<code>dsh</code>/<code>codebuddy</code>/<code>harness</code>）</td><td>常量化 / 退役</td></tr><tr><td><code>app/config.py:502</code> <code>agentCodebuddyEnabled</code></td><td>—</td><td>退役</td></tr><tr><td><code>app/components.py:72</code> <code>agent-dsh</code></td><td>面板上的一张卡</td><td>退役</td></tr><tr><td><code>platform/{win32,darwin,linux}/env.py</code> <code>codebuddy_cli_candidates()</code></td><td>三个平台各一份</td><td>退役</td></tr><tr><td><code>agents/__init__.py::_log_fallback()</code></td><td>智能体之间自动降级</td><td>没有降级对象了</td></tr><tr><td><code>llm_router.dsh_homes()</code> + <code>router_admin</code> + <code>worklog.py</code></td><td>遍历<strong>多个</strong>家目录</td><td>收敛为单一家目录</td></tr><tr><td><code>harness_proc.requested()</code>（<code>:142</code>）</td><td><code>agentBackend==&quot;harness&quot;</code> <strong>且</strong> <code>agentHarnessEnabled</code></td><td>只剩启用开关</td></tr><tr><td><code>app/api.py:165</code> 智能体探测特例</td><td>"codebuddy 那种每次起进程的适配器"</td><td>探测变轻</td></tr></tbody></table></div>
+<p>最后一行顺手消掉了 <code>AGENTS.md</code> 里记的一个<strong>真实 bug</strong>： "切走智能体时只改 <code>agentBackend</code>，于是 node 进程一直挂着（<code>43199</code> 仍在监听）" —— 没有"切走"这回事了。</p>
+<h4 id="h33">面板要补的（因为变成了单点）</h4>
+<p>现在智能体区是<strong>两张卡、二选一</strong>；收敛后只剩一条，但它是<strong>唯一</strong>路径，所以必须更完整：</p>
+<ul><li>安装 / <strong>修复</strong> / 升级 —— <code>harness-install-local.{ps1,sh}</code> 已支持"修装坏的标准版"</li><li>查看日志（<code>data/logs/harness.log</code>）</li><li>重启 / 停止 —— <code>harness_proc.stop(reason=…)</code> 已会留痕</li><li>token 状态 + 「用浏览器打开」</li></ul>
+<h4 id="h34">必须写清的降级边界（单点风险）</h4>
+<div class="tw"><table><thead><tr><th>链路</th><th>DSH 标准版挂了会怎样</th></tr></thead><tbody><tr><td><strong>语音指令执行</strong></td><td><strong>断</strong> —— <code>assistant._dispatch()</code> 直接失败（"DSH 未运行，命令未发送"）</td></tr><tr><td><strong>会议纪要</strong></td><td><strong>不断</strong> —— 有<strong>直连 LLM 兜底</strong>：<code>meeting.direct_llm_decision()</code> 在"agent 不可用但 LLM provider 就绪"时走直连（P5 的承诺："不装 agent 也能出纪要"）</td></tr><tr><td>会议转写 / 说话人 / 声纹</td><td>不受影响（走能力路由，与智能体无关）</td></tr><tr><td>仪表盘 / 设置 / 历史 / 路由</td><td>不受影响</td></tr></tbody></table></div>
+<p><strong>所以"收敛"不等于"裸奔"</strong>：纪要仍有第二条路，但<strong>指令执行没有</strong> —— 这句要出现在面板的提示语里。</p>
+<h4 id="h35">两个执行建议</h4>
+<ol><li><strong><code>dsh_homes()</code> 先别删</strong>，把语义收窄为「标准版家目录 + 已存在的历史家目录（只读）」。 理由：已装机上可能还留着桌面版家目录；而 <code>test_dsh_home_coupling.py</code> 那条 "不许把家目录写死成 <code>~/.dsh</code>"的铁律依然正确。<strong>等一个版本之后再删。</strong></li><li><strong><code>test_dsh_multi_home.py</code>（22 KB）要重写</strong>：它钉的是"四种装法" （只有桌面版 / 只有标准版 / 都有 / 都没有），收敛后其中三种失去意义， 改成"只有标准版 / 家目录不存在"两态即可。<code>test_dsh_home_coupling.py</code> 保留不动。</li></ol>
+<h3 id="h36">6.3 客户端最小安装范围（含要改的具体文件）</h3>
+<p><strong>一句话</strong>：最小档 = <strong>Python 运行时（含 sherpa-onnx）+ sherpa 流式模型 + ECHO 代码 ≈ 374 MB</strong>， <strong>零联网下载</strong>；DSH 标准版 223 MB <strong>后装</strong>。</p>
+<h4 id="h37">清单</h4>
+<div class="tw"><table><thead><tr><th>项</th><th>实测 / 声明</th><th>进包</th><th>说明</th></tr></thead><tbody><tr><td><code>runtime-core</code>（uv CPython 3.11 + 基础依赖 + <strong>sherpa-onnx</strong>）</td><td>155 + 27.4 ≈ <strong>182 MB</strong></td><td>✅</td><td>见下"必须先修的缺口"</td></tr><tr><td><code>stt-sherpa</code>（流式 zipformer 模型）</td><td><strong>189.3 MB</strong></td><td>✅</td><td><strong>L3 的落点</strong>，必须从"可选"升为"必装"</td></tr><tr><td>ECHO 代码 + 面板静态资源</td><td><strong>~3 MB</strong></td><td>✅</td><td><code>app/ web/ scripts/ plugin/ docs/ assets/</code></td></tr><tr><td>系统 TTS</td><td><strong>0</strong></td><td>—</td><td>SAPI / <code>say</code> / espeak，系统自带</td></tr><tr><td><strong>小计（装完即可开面板 + 指令链路可用）</strong></td><td><strong>≈ 374 MB</strong></td><td></td><td></td></tr><tr><td>DSH 标准版（唯一智能体后端）</td><td>~223 MB</td><td>❌ <strong>后装</strong></td><td>面板点一下装；装完指令可执行、纪要可生成</td></tr><tr><td><code>wake-kws</code>（唤醒模型）</td><td>39.7 MB</td><td>❌ 可选</td><td>设置里默认关</td></tr></tbody></table></div>
+<h4 id="h38">⚠️ 必须先修的缺口：按现在的清单，最小档<strong>跑不起来指令转写</strong></h4>
+<p>四处对不上（这是 L3 落地时最容易漏的地方）：</p>
+<div class="tw"><table><thead><tr><th>位置</th><th>现状</th><th>问题</th></tr></thead><tbody><tr><td><code>requirements-core.txt</code></td><td>11 个基础包，<strong>没有 <code>sherpa-onnx</code></strong></td><td>装了模型也没有引擎</td></tr><tr><td><code>components.py:105</code> <code>stt-sherpa</code></td><td><code>optional=True, required=False</code></td><td>最小档<strong>不会</strong>装它</td></tr><tr><td><code>components.py:34</code> <code>REQUIRED_IDS</code></td><td>只有 <code>(&quot;runtime-core&quot;,)</code></td><td>同上</td></tr><tr><td><code>components.py:61-64</code> <code>runtime-core</code></td><td><code>purpose</code> 写"faster-whisper / funasr / sherpa-onnx"、<code>detect</code> 查这三个</td><td>而它实际装的 <code>requirements-core.txt</code> <strong>一个都没有</strong> → 这条的就绪判定一直在问它不装的包</td></tr></tbody></table></div>
+<p><strong>要改的三处（都很小）</strong>：</p>
+<ol><li><code>requirements-core.txt</code> += <code>sherpa-onnx&gt;=1.10</code></li><li><code>components.py</code>：<code>stt-sherpa</code> 由 <code>optional=True</code> 改为必装</li><li><code>components.py</code>：<code>REQUIRED_IDS</code> → <code>(&quot;runtime-core&quot;, &quot;stt-sherpa&quot;)</code>， 并把 <code>runtime-core</code> 的 <code>purpose</code> / <code>detect</code> 改成与 <code>requirements-core.txt</code> <strong>一致</strong></li></ol>
+<h4 id="h39">明确<strong>不进</strong>客户端的</h4>
+<div class="tw"><table><thead><tr><th>不装</th><th>省下</th></tr></thead><tbody><tr><td>torch + nvidia（CUDA 运行时）</td><td>4.3 GB + 914 MB</td></tr><tr><td>ctranslate2（捆 cuBLAS）</td><td>795 MB</td></tr><tr><td>SenseVoice 模型</td><td>896.5 MB</td></tr><tr><td>Qwen3-ASR + ForcedAligner</td><td>~3.6 GB</td></tr><tr><td>faster-whisper 各档</td><td>141 / 464 / 1460 / 2948 MB</td></tr><tr><td>pyannote 三件套</td><td>31.4 MB（但依赖 torch，所以一起省掉）</td></tr></tbody></table></div>
+<p><strong>对照本次实测的现状</strong>：<code>models/</code> <strong>8187.6 MB</strong> + torch/nvidia <strong>约 5.2 GB</strong> ≈ <strong>13.1 GB</strong>。 最小核心 <strong>374 MB</strong> —— 约 <strong>1/35</strong>。</p>
+<h4 id="h40">最小档装完能做什么</h4>
+<div class="tw"><table><thead><tr><th>能力</th><th>最小档</th><th>备注</th></tr></thead><tbody><tr><td>面板 / 设置 / 历史 / 路由 / 组件管理</td><td>✅</td><td></td></tr><tr><td>语音指令：<strong>转写</strong></td><td>✅</td><td>本机 sherpa，L3</td></tr><tr><td>语音指令：<strong>执行</strong></td><td>⚠️ <strong>需要 DSH</strong></td><td>后装；没有它 <code>_dispatch()</code> 直接失败</td></tr><tr><td>会议<strong>录音</strong></td><td>✅</td><td>本机，不依赖后端</td></tr><tr><td>会议<strong>转写</strong></td><td>❌ <strong>需要能力后端</strong></td><td>无后端时<strong>排队</strong>（§12）</td></tr><tr><td>说话人分离 / 声纹嵌入提取</td><td>❌ <strong>需要能力后端</strong></td><td></td></tr><tr><td>声纹<strong>匹配 / 库管理</strong></td><td>✅</td><td>匹配在客户端；但要有嵌入才用得上</td></tr><tr><td>纪要生成</td><td>⚠️ 需要 DSH <strong>且</strong>已转写</td><td></td></tr><tr><td>唤醒</td><td>⚠️ 需装 KWS</td><td>默认关</td></tr></tbody></table></div>
+<h4 id="h41">安装步骤（四步，第 2 步零联网）</h4>
+<ol><li>选安装根 <code>{echoBase}</code>（§2.2）</li><li>解包 → <strong>面板可用、指令转写可用</strong>（不联网、不下模型）</li><li>面板点一下装 <strong>DSH 标准版</strong>（联网，约 2 分钟）→ 指令可执行、纪要可生成</li><li>（组织级）配<strong>能力后端地址</strong> → 会议转写 / 说话人 / 声纹嵌入可用</li></ol>
+<h3 id="h42">6.4 已经装过 DSH 的用户怎么办</h3>
+<p><strong>核心政策：先发现，再沿用。不重装、不覆盖、不删除。</strong></p>
+<h4 id="h43">五种情形，逐条给政策</h4>
+<div class="tw"><table><thead><tr><th>情形</th><th>怎么检测（现成手段）</th><th>政策</th></tr></thead><tbody><tr><td><strong>A. 已在 ECHO 目录下装过标准版</strong>（<code>{ECHO}\harness\dsh</code>）</td><td><code>harness_proc.local_entry()</code> 已经在查 <code>LOCAL_ENTRY_REL</code></td><td><strong>移动</strong>到 <code>{echoBase}/dsh/app</code>，<strong>不重新下载</strong>（223 MB → 同盘移动是秒级）</td></tr><tr><td><strong>B. 自己装了标准版，并配了 <code>harnessCommand</code></strong></td><td><code>harnessCommand</code> ≠ 出厂值</td><td><strong>一个字都不动</strong>。现有政策已如此，3.0 必须保留</td></tr><tr><td><strong>C. 已有 DSH 家目录</strong>（skills / 会话 / 记忆 / 凭据）</td><td><code>llm_router.dsh_homes()</code> —— 判据是目录里有 <code>settings.yaml</code>，<strong>已经现成</strong></td><td><strong>列出让用户选</strong>；<strong>什么都没找到时也要问一句</strong>；<strong>确认没有才新建</strong>（完整流程见下）</td></tr><tr><td><strong>D. 已装 DSH 桌面版</strong></td><td><code>dsh_homes()</code> 里的 <code>HOME_DESKTOP</code>（<code>$DSH_HOME</code> 或 <code>~/.dsh</code>）</td><td><strong>本体不碰</strong>；只问一件事：<strong>技能导过来，还是分开试用</strong>（两个选项都可逆）</td></tr><tr><td><strong>E. 版本与 ECHO 期望的不一致</strong></td><td><code>harness-install-local.{ps1,sh}</code> 已会比较并<strong>明确告警</strong>（"仍可用，不完全掩盖"）</td><td>保留告警；<strong>发现已装版本比期望的新时，不要降级它</strong> —— 告警"ECHO 可能与它不兼容"更诚实</td></tr></tbody></table></div>
+<h4 id="h44">最关键的一条：别让用户看到<strong>空的技能列表</strong></h4>
+<p>现状会这样发生 —— <code>harness_proc.home()</code> <strong>永远返回一个值</strong>，<code>ensure_running()</code> 里强塞环境变量：</p>
+<pre class="code"><code>dsh_home = home()                   # harnessHome 或 {DATA}/harness，永不为空
+env[&quot;DSH_HOME&quot;] = dsh_home          # 注释原文：&quot;独立家目录：不碰 Desktop 的家&quot;</code></pre>
+<p>所以如果用户的技能/会话在 <code>~/.dsh</code>（桌面版惯例），ECHO 拉起的标准版会用 <code>{DATA}/harness</code> → <strong>他在 ECHO 面板里看到的技能列表是空的</strong>，而他的那份资产在别处， 两边互不知情。这就是"用户已经装了 DSH"最糟的体验。</p>
+<p><strong>3.0 改成"先检测 → 列出 / 追问 → 确认 → 才装"</strong>。放在<strong>面板点「安装标准版」这个动作里</strong> （不是 ECHO 主安装包 —— 那时 DSH 还没装，问了也没用）：</p>
+<pre class="code"><code>① 检测（不改任何东西）
+   llm_router.dsh_homes()        → 家目录（判据：有 settings.yaml）
+   harness_proc.local_entry()    → 本体（判据：bin.js 非空）
+   另外看一眼&quot;目录存在但没有 settings.yaml&quot;（装过但没运行过）
+
+② 分支
+   ┌ 找到 N 个 → 列出全部：路径 / 类型(桌面版|标准版) / 技能数 / 会话数 / 最后使用
+   │            让用户选一个作为 ECHO 用的，或选「新建」
+   └ 什么都没找到 → **仍然问一句**：&quot;你之前装过 DSH 吗？装在哪？&quot;
+                   给一个路径输入框（检测覆盖不全时让他指路）
+                     ├ 用户指了路径 → 回到 ② 按&quot;找到&quot;处理
+                     └ 用户确认「没有」 → 才走新建
+③ 按选中的类型决定后续问题
+   · 选中「标准版」家目录 → 直接沿用（写 harnessHome），**不再多问**
+   · 选中「桌面版」家目录 → **再问一句**：
+       「要把桌面版的技能导入新的标准版，还是分开试用？」
+         ├ 导入     → 新建标准版家目录 + 复制 skills/
+         └ 分开试用 → 新建标准版家目录（空的），**桌面版原样不动**
+④ 确认之后才做实际动作
+   · 沿用 → 只写 harnessHome
+   · 导入 / 分开试用 → 建 {echoBase}/dsh/home，再跑 harness-install-local 装本体</code></pre>
+<p><strong>为什么"什么都没找到"也要问一句</strong>：<code>dsh_homes()</code> 的判据是 <code>settings.yaml</code>， 而<strong>装过但从未运行过的 DSH 没有这个文件</strong> —— 检测必然漏。问一句是最便宜的兜底， 也正是"不静默"原则的落点。</p>
+<p><strong>"导入"与"分开试用"的语义边界</strong></p>
+<div class="tw"><table><thead><tr><th></th><th>导入</th><th>分开试用</th></tr></thead><tbody><tr><td>技能</td><td><strong>复制</strong>到标准版家目录</td><td>不复制，留在桌面版</td></tr><tr><td>桌面版本体与家目录</td><td>原样不动</td><td>原样不动</td></tr><tr><td>会话 / 记忆</td><td><strong>不导</strong>（见下）</td><td>不导</td></tr><tr><td>面板上</td><td>标准版里立刻能看到那些技能</td><td>技能列表是空的，<strong>并明说为什么</strong></td></tr></tbody></table></div>
+<p><strong>只导 skills，不导会话/记忆。</strong> 会话存储是 DSH 的内部格式，跨版本导入风险高， 而且导坏了用户无从判断。v1 的边界是：<strong>技能是"能力"，可以搬；会话是"历史"， 留在原地（他打开桌面版就能看）</strong>。面板必须把这句话说出来，否则用户会以为都搬过来了。</p>
+<p><strong>"分开试用"必须可逆</strong> —— 它不该是一次性决定。面板要长期保留一个 <strong>「从桌面版导入技能」</strong>的入口：用户选"分开试用"往往是想先看看新版本， 试完再决定；把入口留着，"试用"才真的是试用。</p>
+<p><strong>技能冲突要接上 <code>skills/</code> 的所有权机制</strong>（§2.1）：</p>
+<ul><li>ECHO 自己装的（靠 <code>skills/.echo-managed</code> 清单识别）→ <strong>以包里的版本为准</strong></li><li>用户自己装的同名技能 → <strong>默认不覆盖</strong>，列出来让用户选</li><li>两侧同名 → 提示"桌面版有一份同名的，保留哪一份？"</li></ul>
+<p>与 §2.1 的 <code>test_skills_ownership.py</code> 是同一个机制：<strong>别让任何一次自动动作删掉用户自己装的东西。</strong></p>
+<h4 id="h45">迁移的三个安全要求</h4>
+<ol><li><strong>先停</strong> —— 迁移前确认 <code>harness_proc.online()</code> 为假；不假就 <code>stop(reason=&quot;迁移 DSH 家目录&quot;)</code>（已会留痕）</li><li><strong>移动优先，复制兜底</strong> —— 同盘 <code>move</code> 是秒级；跨盘才复制（校验后删源）</li><li><strong>失败可回滚</strong> —— <strong>老位置保留到用户确认</strong>；迁移写一条 <code>db.add_log</code> （沿用"任何停/重启都要能查是谁、为什么"的既有纪律）</li></ol>
+<h4 id="h46">一条必须原样保留的现有政策</h4>
+<p><code>harness_proc.command()</code> 的注释：</p>
+<blockquote><p>*"只在'用户没改过'时生效 —— <strong>用户自己写的命令一个字都不动</strong>。"*</p></blockquote>
+<p><strong>这正是"用户已经装了 DSH"的正确答案。</strong> 把 <code>local_entry()</code> 的落点从 <code>{ECHO}/harness/dsh</code> 换成 <code>{echoBase}/dsh/app</code> 时，<strong>仍然只在出厂命令下自动切换</strong>； 用户改过的一律不碰。</p>
+<h4 id="h47">桌面版用户不会"被抛弃"</h4>
+<p>3.0 退役桌面版<strong>适配器</strong>（ECHO 不再通过它下命令），但：</p>
+<ul><li>桌面版<strong>本体不动</strong>，他可以在 ECHO 之外继续单独用</li><li>提供<strong>导入技能</strong>的显式操作：把桌面版家目录下的 <code>skills/</code> 复制进标准版家目录</li><li>面板明说一句：*"ECHO 3.0 起只用标准版；你原来的桌面版可以继续单独使用， 但它里面的技能和会话 ECHO 看不到了 —— 需要的话可以导入。"*</li></ul>
+<p>这样"退役"就不会被读成"数据丢了"。</p>
+<hr>
+<h2 id="h48">7. 设备路由：两条泳道</h2>
+<div class="diagram"><pre class="mermaid">flowchart LR
+    subgraph LANES[&quot;两条平级泳道（无优先级）&quot;]
+        direction TB
+        L1[&quot;指令泳道&lt;br/&gt;capture() 触发 · 秒级&quot;]
+        L2[&quot;会议泳道&lt;br/&gt;start_meeting() · 分钟到小时&quot;]
+    end
+    L1 --&gt; C1[&quot;候选链&lt;br/&gt;Jabra 耳机 → 内置麦 → 系统默认&quot;]
+    L2 --&gt; C2[&quot;候选链&lt;br/&gt;MAXHUB 全向麦 → 内置麦 → 系统默认&quot;]
+    C1 --&gt; SEL{&quot;逐个判定&lt;br/&gt;懒选 · 需要时才选&quot;}
+    C2 --&gt; SEL
+    SEL --&gt;|&quot;黑名单命中&quot;| X1[&quot;skipped: blocked&quot;]
+    SEL --&gt;|&quot;不在位&quot;| X2[&quot;skipped: absent&quot;]
+    SEL --&gt;|&quot;本轮已失败&quot;| X3[&quot;skipped: open-failed&quot;]
+    SEL --&gt;|&quot;被另一泳道持有&quot;| X4[&quot;skipped: busy&quot;]
+    SEL --&gt;|&quot;实开成功&quot;| G[&quot;取租约&quot;]
+    G --&gt; M[&quot;麦克风&lt;br/&gt;泳道级 + 设备级 两级互斥&quot;]
+    M --&gt;|&quot;不同设备&quot;| OK[&quot;两泳道并行 ✅&quot;]
+    M --&gt;|&quot;同一设备&quot;| NO[&quot;后到者拒绝&lt;br/&gt;消息说清因果&quot;]</pre></div>
+<p><strong>唤醒不在图里</strong> —— 按约定本次排除。但要记住它是<strong>能力槽 <code>wake</code> 的本机实现</strong>， 只是<strong>不构成设备泳道</strong>（它沿用自己的设备设置，不进候选链）。</p>
+<hr>
+<h2 id="h49">8. 一致性对齐：修正了五处</h2>
+<p>分开写四份文档攒下的不一致，逐条裁定：</p>
+<div class="tw"><table><thead><tr><th>#</th><th>不一致</th><th>裁定</th></tr></thead><tbody><tr><td><strong>1</strong></td><td>前后分离 §9 说"给 <code>providers/</code> 加 <code>diarize</code> / <code>speaker-embed</code> 两个 kind"；能力路由 §9.1 说"新增 <code>app/capabilities/</code>，不要把槽塞进 providers"</td><td><strong>以能力路由为准。</strong> <code>providers/</code>（从 N 选 1）与能力槽（从 N 选 M 并<strong>拼装</strong>）是两个不同的问题；把后者塞进前者会把那个抽象撑坏。<code>providers/</code> 只保留 llm / tts / 整段 asr。</td></tr><tr><td><strong>2</strong></td><td>前后分离 §4.4 要求嵌入带 <code>modelVersion</code>；能力路由/服务端文档用 <code>vectorSpaceId</code></td><td><strong><code>vectorSpaceId</code> 为权威</strong>，<code>modelVersion</code> 只作展示。落库三列：<code>vector_space_id</code> / <code>backend_id</code> / <code>model_version</code>。判据只有一个。</td></tr><tr><td><strong>3</strong></td><td>前后分离 §3 设计了服务端指令增强（执行原子点 + grace 窗口）；服务端文档 §14 一度建议 v1 不开</td><td><strong>设计保留、默认关闭。</strong> 服务端 <code>models.specs</code> 里 <code>asr-short</code>（SenseVoice）本来就常驻（会议档也用），所以能力在；但 <code>/v1/asr?variant=short</code> 的<strong>默认配额为 0</strong> = 不对外。开启只需改配额。</td></tr><tr><td><strong>4</strong></td><td>前后分离 §2 说"办公本装不上 pyannote → <code>diarize</code>/<code>speaker.embed</code> 必须走服务端"；能力路由 §0.1 实测 sherpa-onnx 本机能做</td><td><strong>以能力路由为准。</strong> 这是<strong>质量权衡</strong>，不是可行性问题。§5 矩阵里本机那两格写"⚠️ 可选"而不是"❌"。</td></tr><tr><td><strong>5</strong></td><td><code>wake</code> 在能力路由 §4.2 是能力槽；在统一路由 §3.8 被排除</td><td><strong>两个层次，不冲突</strong>：<code>wake</code> 是<strong>能力槽</strong>（本机唯一实现），但<strong>不是设备泳道</strong>。已在本节与 §7 写明。</td></tr></tbody></table></div>
+<h3 id="h50">还有两处需要收口（本次一并定）</h3>
+<div class="tw"><table><thead><tr><th>项</th><th>收口</th></tr></thead><tbody><tr><td><strong>服务端端点清单</strong></td><td>以前后分离 §2.4（6 个）与 <code>ECHO能力后端-服务端设计.md</code> §6.1（7 个，多了 <code>/v1/ready</code>）为准 → <strong>以服务端文档为准</strong>，<code>/v1/ready</code> 与 <code>/v1/health</code> 必须分开（模型加载中不该被编排系统反复重启）。</td></tr><tr><td><strong>降级原因词汇表</strong></td><td>四域必须用同一套。权威清单在 <code>统一路由</code> §2（<code>absent</code> / <code>blocked</code> / <code>busy</code> / <code>offline</code> / <code>circuit-open</code> / <code>quota</code> / <code>unsupported</code> / <code>vector-mismatch</code> / <code>open-failed</code> / <code>error</code>），服务端错误码表要与它一一映射。</td></tr></tbody></table></div>
+<hr>
+<h2 id="h51">9. 落地顺序（合并四份文档的排期）</h2>
+<p>分成<strong>两组</strong>：左边不依赖前后分离，可以先做；右边是 3.0 主线。</p>
+<div class="diagram"><pre class="mermaid">flowchart LR
+    subgraph NOW[&quot;可先做 —— 不依赖前后分离，纯收益&quot;]
+        direction TB
+        D1[&quot;D1 两级互斥&lt;br/&gt;泳道级 + 设备级&quot;]
+        D2[&quot;D2 设备黑名单&quot;]
+        MIN[&quot;阶段 -1&lt;br/&gt;交付包拆默认档 / 增强档&quot;]
+    end
+    subgraph MAIN[&quot;3.0 主线&quot;]
+        direction TB
+        P0[&quot;阶段 0&lt;br/&gt;定协议 + CapabilityClient&lt;br/&gt;本地实现原样保留&quot;]
+        P1[&quot;阶段 1&lt;br/&gt;建 ECHO 能力后端&quot;]
+        P2[&quot;阶段 2&lt;br/&gt;内网公共适配器 + 熔断&quot;]
+        P3[&quot;阶段 3&lt;br/&gt;能力路由表 + 面板&quot;]
+        P4[&quot;阶段 4&lt;br/&gt;向量空间字段 + 会议级锁定&quot;]
+        D3[&quot;D3 两条泳道 + 候选链 + 懒选&quot;]
+    end
+    NOW --&gt; MAIN
+    P0 --&gt; P1 --&gt; P2 --&gt; P3 --&gt; P4
+    D1 --&gt; D3</pre></div>
+<div class="tw"><table><thead><tr><th>阶段</th><th>内容</th><th>关键验收</th></tr></thead><tbody><tr><td><strong>阶段 -1</strong></td><td>交付包拆「默认档 / 离线增强档」</td><td>办公本按默认档装完 ≈ 0.6 GB、&lt; 3 分钟、<code>import torch</code> 失败、命令链路可用</td></tr><tr><td><strong>D1</strong></td><td>两级互斥（泳道级 + 设备级）</td><td>会议用全向麦 + 指令用耳机<strong>真并行</strong>（清掉 <code>AGENTS.md</code> 待办）</td></tr><tr><td><strong>D2</strong></td><td>设备黑名单机制</td><td>虚拟设备在<strong>枚举阶段</strong>被挡，不是试了才发现</td></tr><tr><td><strong>阶段 0</strong></td><td>定协议 + 抽 <code>CapabilityClient</code></td><td>客户端能在"本机 / 远端"间切换且<strong>行为等价</strong></td></tr><tr><td><strong>阶段 1</strong></td><td>建 ECHO 能力后端</td><td>服务端护栏测试全绿（无 DB、无业务词、临时文件清理）</td></tr><tr><td><strong>阶段 2</strong></td><td>内网适配器（复用 <code>OpenAICompatAsrProvider</code>）+ 探测 + 熔断</td><td>能识别"只给文本"；降级原因分类正确</td></tr><tr><td><strong>阶段 3</strong></td><td>能力路由表 + 面板 + 执行计划落 <code>meta.json</code></td><td>面板能回答"这次为什么走了本机"</td></tr><tr><td><strong>阶段 4</strong></td><td><code>vector_space_id</code> 迁移 + 会议级锁定 + 校准按钮</td><td>同会议不混向量空间</td></tr><tr><td><strong>D3</strong></td><td>两条泳道 + 候选链 + 懒选</td><td>错误消息列出<strong>每个候选的 skipped 原因</strong></td></tr><tr><td><strong>D4</strong></td><td>播放设备 + 优先级队列</td><td>高优先级可打断长朗读</td></tr><tr><td><strong>D5</strong></td><td><code>pick()</code> 内核收拢 + 统一路由面板</td><td>四域同一套状态词汇</td></tr></tbody></table></div>
+<p><strong>先做左边那组</strong>：它们不依赖任何新架构，做完立刻可验证、可回退。</p>
+<hr>
+<h2 id="h52">10. 与现有代码的映射（落地挂点）</h2>
+<div class="tw"><table><thead><tr><th>3.0 组件</th><th>现有代码</th><th>动作</th></tr></thead><tbody><tr><td><code>api</code> 路由层</td><td><code>app/api.py</code></td><td>保留；新增面板「路由」页签接口</td></tr><tr><td>业务层</td><td><code>app/meeting.py</code> / <code>assistant.py</code> / <code>worklog.py</code></td><td>保留；把引擎调用改为经能力路由</td></tr><tr><td>状态</td><td><code>app/db.py</code>（schema + MIGRATIONS）</td><td>加迁移：<code>vector_space_id</code> / <code>backend_id</code>；新增设备候选链设置项</td></tr><tr><td>路径</td><td><code>app/paths.py</code></td><td>保留；<code>_settings_get()</code> 是<strong>现成接缝</strong>，服务端替换取值源即可</td></tr><tr><td>客户端引擎层</td><td><code>app/audio/stt.py</code> / <code>diarize.py</code></td><td><strong>是干净的引擎层</strong>，客户端与服务端共用；全局单例 + 全局锁要抽成 <code>EnginePool</code>（客户端=容量 1）</td></tr><tr><td>能力路由（新）</td><td>—</td><td><code>app/capabilities/</code>（槽 → 后端链 → 执行计划 → 拼装）</td></tr><tr><td>模型路由</td><td><code>app/llm_router.py</code> + <code>router_admin.py</code> + <code>dsh-failover/proxy.py</code></td><td>保留；<strong>熔断心智被 <code>pick()</code> 复用</strong>（v1 不强求改造）</td></tr><tr><td>设备路由</td><td><code>recorder.resolve_input_device()</code> + <code>mic.py</code></td><td>单值 → 候选链；全局锁 → 两级互斥；加黑名单</td></tr><tr><td>播放队列（新）</td><td><code>app/audio/tts.py</code></td><td><code>sd.play()</code> → 设备候选链；一把锁 → 优先级队列（<strong>吸收现有 beep 状态机</strong>）</td></tr><tr><td>引擎池</td><td><code>app/boot.py</code> 组件状态机 + <code>services.py</code></td><td>客户端保留；服务端复用同一套状态机与 <code>/api/boot/component/*</code> 形态</td></tr><tr><td>服务端（新）</td><td>—</td><td><code>server/</code> <strong>不放进 <code>app/</code></strong>（物理隔离比纪律可靠）</td></tr></tbody></table></div>
+<hr>
+<h2 id="h53">11. 未决问题汇总</h2>
+<div class="tw"><table><thead><tr><th>#</th><th>问题</th><th>我的倾向</th></tr></thead><tbody><tr><td>1</td><td>~~离线会议转写用哪个 sherpa 模型~~</td><td>✅ <strong>已定：不做本机兜底</strong>（2026-09-23）</td></tr><tr><td>2</td><td>~~默认档要不要内置 whisper-base~~</td><td>✅ <strong>已定：不内置</strong>（不做兜底，这个问题消失）</td></tr><tr><td>3</td><td>700 MB 离线包门禁是否保留原值</td><td>保留；<strong>DSH 不进包</strong>（走面板按需安装）正好腾出 223 MB</td></tr><tr><td>4</td><td>~~服务端跑不跑 GPU 版 pyannote 4.x~~</td><td>✅ <strong>已定：跑</strong>。客户端不产生向量 → <strong>全系统只有一个 <code>vectorSpaceId</code></strong>，§6.3 的会议级锁定从"硬约束"变成"天然成立"</td></tr><tr><td>5</td><td><code>asr.short</code>（指令增强）默认开不开</td><td><strong>默认关</strong>（配额 0），设计保留</td></tr><tr><td>6</td><td>服务端 TLS 形态</td><td>mTLS 还是 <code>client_id:secret</code> → JWT；<strong>v1 用后者</strong>，mTLS 等 PKI</td></tr><tr><td>7</td><td>候选链设置项：新增列表 vs 改现有单值</td><td><strong>新增列表 + 保留单值作链尾</strong>（零迁移）</td></tr><tr><td>8</td><td>会议中途设备消失怎么办</td><td>告警不静默换；是否允许<strong>分段边界换设备</strong>待定</td></tr><tr><td>9</td><td>黑名单激进程度</td><td>保守清单 + 命中提示，观察后再收紧</td></tr><tr><td>10</td><td>播放被抢占的任务丢弃还是重播</td><td><strong>丢弃</strong>（被抢的朗读重播很烦），或按用途细分</td></tr><tr><td>11</td><td><strong>离线队列怎么落</strong>（见 §12）</td><td>会议不做兜底后，<strong>它是唯一的降级路径</strong>，必须做：分段级状态 + 面板可见 + 手动重试</td></tr><tr><td>12</td><td><strong>桌面版资产只导 skills、不导会话/记忆</strong>（§6.4）</td><td>我的判断：会话是 DSH 内部格式，跨版本导入风险高且坏了用户无从判断。<strong>若你希望连会话一起搬，这条要改</strong></td></tr></tbody></table></div>
+<hr>
+<h2 id="h54">12. 「会议不兜底」消掉了原来排的实测</h2>
+<p>这条决定把施工面缩小了一圈 —— 三件原计划的实测里，两件直接取消、一件降级：</p>
+<div class="tw"><table><thead><tr><th>原计划的实测</th><th>现在</th><th>为什么</th></tr></thead><tbody><tr><td>① 四实现对比（funasr SenseVoice ↔ sherpa <code>from_sense_voice</code>；qwen-asr ↔ sherpa <code>from_qwen3_asr</code>）</td><td>❌ <strong>取消</strong></td><td>那是为了回答"办公本兜底能不能接近主力质量"。<strong>不做兜底就没有这个问题</strong>；服务端继续用已验证效果的 SenseVoice + Qwen3-ASR</td></tr><tr><td>② sherpa 声纹 / 分离模型的体积与中文效果</td><td>❌ <strong>取消</strong></td><td>客户端不再产生向量（<code>diarize.*</code> / <code>speaker.embed</code> 都只走后端），没有本机实现要评估</td></tr><tr><td>③ <code>ctranslate2</code> 剥掉两个 cuBLAS DLL 后能否 CPU 推理</td><td>⚠️ <strong>降级为可选</strong></td><td>它原本是为"客户端装 whisper 兜底"省 795 MB。不做兜底就没这个需求，只剩服务端磁盘占用这一个次要收益</td></tr></tbody></table></div>
+<p><strong>剩下还值得做的两件</strong>：</p>
+<ol><li><strong>办公本上 sherpa 流式模型的 RTF</strong> —— 决定指令链路的实际延迟。 它已经在用、效果已知，属于"有空再量"。</li><li><strong>声纹"同权重跨运行时可比性"</strong>（见 §5.1）—— 验证 funasr/pyannote 产出的嵌入与 sherpa-onnx ONNX 版是否<strong>在同一向量空间内可比</strong>。若成立，本机注册就能白拿 （几十 MB 模型 + <strong>声纹音频完全不出机</strong>）。<strong>投入很小、收益明确，建议保留。</strong></li></ol>
+<h3 id="h55">但必须补上一件新的：离线队列</h3>
+<p>"会议不兜底"把<strong>离线队列从"可选优化"变成了"唯一降级路径"</strong>：</p>
+<ul><li>服务端不可达时，会议<strong>录音照常</strong>（录音是本机的），但<strong>转写只能排队</strong></li><li>所以队列必须：<strong>持久化</strong>（分段级状态 <code>pending/uploading/done/failed</code>）、<strong>面板可见</strong>、 <strong>可手动重试/取消</strong>、<strong>后端恢复后自动补传</strong></li><li>而且不能让用户误以为"录完就会自动出纪要" —— 面板要明确显示"<strong>等待能力后端</strong>"， 而不是"转写失败"</li></ul>
+<blockquote><p>这正好接上前面定过的幂等契约：<strong>服务端无状态，所以去重与重试的责任在客户端</strong> （分段请求带 <code>sha256</code>，服务端不缓存、重传即重算）。</p></blockquote>
+</main>
+</div>
+<script src="../../web/vendor/mermaid.min.js"></script>
+<script>
+(function () {
+  var banner = document.querySelector('.banner');
+  if (!window.mermaid) {
+    document.documentElement.classList.add('no-mermaid');
+    if (banner) banner.textContent = '⚠️ 没能加载 ' + "../../web/vendor/mermaid.min.js" +
+      '（需要保持仓库目录结构）。下面是 mermaid 源码，可直接粘到支持 mermaid 的编辑器里看。';
+    return;
+  }
+  // startOnLoad:false —— 自己驱动 run()，这样能拿到 promise 做错误呈现，
+  // 也避免 bundle 自己的 load 钩子再跑一遍。
+  mermaid.initialize({
+    startOnLoad: false, theme: 'dark', securityLevel: 'loose',
+    themeVariables: {
+      fontFamily: 'inherit', fontSize: '14px',
+      primaryColor: '#1d2230', primaryTextColor: '#e6e9f0', primaryBorderColor: '#3a4256',
+      lineColor: '#8b93a7', secondaryColor: '#171a23', tertiaryColor: '#0f1117',
+      background: '#171a23', mainBkg: '#1d2230', nodeBorder: '#3a4256',
+      clusterBkg: '#141822', clusterBorder: '#2a2f3e', titleColor: '#e6e9f0'
+    }
+  });
+  function markRendered() {
+    // pre.mermaid 里出现 svg = 这个图渲染成功了 → 交出源码外观
+    document.querySelectorAll('.diagram').forEach(function (d) {
+      var svg = d.querySelector('svg');
+      if (!svg) return;
+      // 按 viewBox 把自然尺寸钉成确定的 width/height 属性。
+      // 为什么必须在 JS 里做：mermaid 让 svg width="100%"，
+      // 而 CSS 的 `width:auto` 对 SVG 仍会解析成 100%，缩不掉也放不大。
+      var vb = (svg.getAttribute('viewBox') || '').trim().split(/[\s,]+/);
+      if (vb.length === 4) {
+        var nw = parseFloat(vb[2]), nh = parseFloat(vb[3]);
+        if (nw > 0 && nh > 0) {
+          svg.setAttribute('width', nw);
+          svg.setAttribute('height', nh);
+        }
+      }
+      svg.style.maxWidth = 'none';   // 清掉 mermaid 打的 inline max-width
+      d.classList.add('rendered');
+      // 自然宽超出容器 → 给一个「适应宽度」开关（此时还没加 .fit，量到的是自然宽）
+      var natural = svg.getBoundingClientRect().width;
+      var avail = d.clientWidth - 28;          // 减去 .diagram 的左右 padding
+      if (natural > avail + 4) {
+        d.classList.add('overflow');
+        var b = document.createElement('button');
+        b.type = 'button';
+        b.className = 'fitbtn';
+        b.textContent = '适应宽度';
+        b.addEventListener('click', function () {
+          var fit = d.classList.toggle('fit');
+          b.textContent = fit ? '原始大小' : '适应宽度';
+          d.scrollLeft = 0;
+        });
+        d.insertBefore(b, d.firstChild);
+      }
+    });
+    // 页级开关：图多的时候逐张点太烦。只在真的有超宽图时才出现。
+    var wrapped = document.querySelectorAll('.diagram.overflow').length;
+    if (wrapped && !document.getElementById('fitall')) {
+      var host = document.querySelector('header.doc');
+      if (host) {
+        var all = document.createElement('button');
+        all.id = 'fitall';
+        all.type = 'button';
+        all.className = 'fitbtn';
+        all.style.display = 'inline-block';
+        all.style.margin = '10px 0 0';
+        all.textContent = '全部适应宽度（' + wrapped + ' 张超宽）';
+        all.addEventListener('click', function () {
+          var diags = document.querySelectorAll('.diagram.overflow');
+          var toFit = !document.querySelector('.diagram.overflow.fit');
+          diags.forEach(function (d) {
+            d.classList.toggle('fit', toFit);
+            d.scrollLeft = 0;
+            var b = d.querySelector('.fitbtn');
+            if (b) b.textContent = toFit ? '原始大小' : '适应宽度';
+          });
+          all.textContent = toFit
+            ? '全部原始大小（' + diags.length + ' 张）'
+            : '全部适应宽度（' + diags.length + ' 张超宽）';
+        });
+        host.appendChild(all);
+      }
+    }
+  }
+  function start() {
+    var p;
+    try { p = mermaid.run({ querySelector: '.mermaid' }); } catch (e) { p = Promise.reject(e); }
+    Promise.resolve(p).catch(function (e) {
+      // 渲染失败时**说出来**，而不是安静地只留一段源码
+      if (banner) {
+        banner.style.display = 'block';
+        banner.textContent = '⚠️ 有图渲染失败：' + (e && e.message ? e.message : e) +
+          '（源码已原样保留在各图框里）';
+      }
+      if (window.console) console.error(e);
+    }).then(markRendered);
+  }
+  if (document.readyState === 'complete') { start(); }
+  else { window.addEventListener('load', start); }
+})();
+</script>
+</body></html>
