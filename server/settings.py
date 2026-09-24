@@ -27,6 +27,13 @@ DEFAULTS: Dict[str, Any] = {
         # 而鉴权库存着客户端凭据 —— 放一起意味着"照文档把 tmp 换成 tmpfs
         # 就会把配过的所有客户端清空"。两种相反的保留策略不能共用一个目录。
         "state_root": "",               # 空 = {ECHO}/data/server-state
+        # TLS（设计 §7.5 ① 的传输层）。**两个都填才启用 https**；
+        # 只填一个是配置错误 —— `main` 会**启动就报错**，不静默降级成 http
+        # （那是最糟的结果：部署的人以为连的是 https）。见 `main._tls_kwargs`。
+        "tls": {
+            "certfile": "",
+            "keyfile": "",
+        },
     },
     "limits": {
         "max_concurrent": 2,            # 服务端总通道

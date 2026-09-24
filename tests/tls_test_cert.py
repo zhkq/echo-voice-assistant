@@ -1,0 +1,95 @@
+# -*- coding: utf-8 -*-
+"""TLS 用例用的**测试专用**自签证书（内嵌 PEM，不依赖 openssl / cryptography）。
+
+为什么内嵌而不是现场生成：门禁不该为了一个 TLS 用例多一个依赖，也不该要求机器上有
+openssl（Windows 上不一定有）。代价是这张证书与私钥是公开的 —— **它们只在测试里用**：
+CN = `echo-tls-test`、只签 `localhost` / `127.0.0.1`，不在任何生产配置里，拿到也没有价值。
+
+生成方式（2026-09-24，一次性）::
+
+    openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 36500 \
+        -nodes -subj "/CN=echo-tls-test" -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
+
+有效期 100 年是有意的：它会随代码一起被提交，过期那天不该变成"用例莫名其妙红了"。
+"""
+
+CERT_PEM = """\
+-----BEGIN CERTIFICATE-----
+MIIDLzCCAhegAwIBAgIUa8ePgdZjnxB6vxlwEMUWHvIAHAUwDQYJKoZIhvcNAQEL
+BQAwGDEWMBQGA1UEAwwNZWNoby10bHMtdGVzdDAgFw0yNjA5MjQxMjI5MjJaGA8y
+MTI2MDgzMTEyMjkyMlowGDEWMBQGA1UEAwwNZWNoby10bHMtdGVzdDCCASIwDQYJ
+KoZIhvcNAQEBBQADggEPADCCAQoCggEBAKXB5m3Dnc8DHEdiChC/CVqTXnn2hp2m
+o2/bjZwB3T06kIDgfSrTHBNeoU0zC8lcwLu8DPCSbU8cETD+i5WWjj5Bvu2RGxmR
+9p3FQbpYvggMP41SUiN4I1cO5u02KNuM1ItpJUGfgYY7b2IERppgzAAzcyR0RE+P
+ObsdFWYfSu6OKS2bdutA6i56LLdh6MkktBuk0SvdHCxF+SWqAX5y8weoRgbUGXpR
+3oUyfh9Ho+uhsgeWQJ5jcdtVS6HWly7gtH3LAZc9S3UJiuO9WIOL3PFWbQqowtan
+ZRQi300czwEsktbMX6Yu0Xozp3rDM5UW+iROno2GhQWhbrCmrX3hdvsCAwEAAaNv
+MG0wHQYDVR0OBBYEFPoj5ydAgSW0zeEJPN32Qlj9SZw0MB8GA1UdIwQYMBaAFPoj
+5ydAgSW0zeEJPN32Qlj9SZw0MA8GA1UdEwEB/wQFMAMBAf8wGgYDVR0RBBMwEYIJ
+bG9jYWxob3N0hwR/AAABMA0GCSqGSIb3DQEBCwUAA4IBAQBFSNscntCeIH+gevwU
+bhp6ZEcosW5sG+6UP96fCJ/91oGNLc3JZ3tbl+btkdWO3DvCqvBKZEvwta/2UZId
+UzhuPF7qmBo3wdIOhAZ13gxKf9osR7K7MpS/8wJ6bnl/cA1h+XesP98QugShs3XM
+CMyCU3gZKrXYYvU3OGjK/N1QLUAIuBf+rBssGvAi3ehWvjodCfEQEcdNW+PbltLL
+5CMhbNhGcVLRN3s7FCKunwkZ4dw07xeJubnYuydESM4pe1uyGePO2R/aKQvAt7Sm
+CpWcVP59VrBrX1hVfDxuQpSKRHQS8yd8VhF+G74817EjpFqSlknidJrJiN9/n4s4
+O7oB
+-----END CERTIFICATE-----
+"""
+
+KEY_PEM = """\
+-----BEGIN PRIVATE KEY-----
+MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQClweZtw53PAxxH
+YgoQvwlak1559oadpqNv242cAd09OpCA4H0q0xwTXqFNMwvJXMC7vAzwkm1PHBEw
+/ouVlo4+Qb7tkRsZkfadxUG6WL4IDD+NUlIjeCNXDubtNijbjNSLaSVBn4GGO29i
+BEaaYMwAM3MkdERPjzm7HRVmH0rujiktm3brQOoueiy3YejJJLQbpNEr3RwsRfkl
+qgF+cvMHqEYG1Bl6Ud6FMn4fR6ProbIHlkCeY3HbVUuh1pcu4LR9ywGXPUt1CYrj
+vViDi9zxVm0KqMLWp2UUIt9NHM8BLJLWzF+mLtF6M6d6wzOVFvokTp6NhoUFoW6w
+pq194Xb7AgMBAAECggEAQjW7l2il5oS1jQXqQ1oroFRxToJcryha7FlkrUZJWyXD
+htck6DA/bLVF9RJIyPwVuGebO5UhuJHbhBiJJQ1ocBHO9BIcIxCc09RxNsAv2AMc
+d5TEXoqkgyfesi4KD/inBbDQQvA1yqp/CUXv9cZodkQW4B7ZEnaBdu5dF9e0FKlq
+7XgmdOuq9ZLhIf/KnlNYGiSJxCyMvXA+q0PF1NT0KlflG5TuZj/zwbHIbkbC97hP
+bWq6V2/WLRKUgccgOoUltVXx7nnd7UPYAzNNH6H0UDh+xZ6xw3BehuldFYdep/af
+21aRXd5puGmrHkSX+rFcPI4Pd/t4PEpM3oz3rfyscQKBgQDktiKExYOv5mBx7BvP
+GgGTFglfEF118Ts2mwrvhJb/0x6PMKdU19jsq4VjffLa9sCspDMXc5nIaGY0oun7
+t4Gl9lRjmNKGRc4wyOKDPTJ+C+Liy8oX/zEJlZywepJXQfWeqUXSWCT1N0jDyKha
+lEudHLEp7RqDvLXcFjMmdsLzHwKBgQC5iN5vaJat4RaD4o8RE8j/6h8TH/RxdlBe
+BB0nDdcW/AN4fVIV8mx8Z8/HpK7+6droWL79adKfmikkruUTxgWTJmX66WTNDjMv
+Aeyvz7J/tq3kgaq+7UTG9IVmjh8DFmm/rvV/+zX397OuPkNjy+o3rIxXe/SyVHRV
+UYoEclC8pQKBgQCPcCMp/e3fDa8DA79VHcxLARETi+HxrD8kugwbt540B6Ysy6jG
+LzEfDVt00HLVHNgt7jUUyi1yYPdon5v7gFVRTrISXK/8Ah+UvQhCosjeAHplHsY6
+UpPgnPJORDEvhHCU9ziQ+TMEj42VLG1ZkZPyjyIVV1y/rkSoKUwfHXCapQKBgHWW
+iWOSpe0N+3ca4BGyuHF5sLguSH6gvc7YTKGz495tWsXCp4PBYYB3Svj9JuvoyxT3
+KhTyPMtqqSjWr9kYZ/AbJgcgZQKRPV9NmPTUbg0DerKYe98GAdEWqHWXHZCXY+5Y
+tL+oN0wxcW+9hnh5hLhEY64OocdkP1bTluW6jfEBAoGAOqBcSFMP5IlnUljfJMag
+VXiwYUYgRmYlL6dce1MXnu346s3csCI1S/ofsMc006GhDW1S1+tkAlAl7wgjQWlN
+L9ZLUv95sUCnSBijMiAnf/Y5+MGcPz6new2+Q8xtbg7gPonx5Ns2IA3+ECGgfR7V
+tuFVg9plvDbJ3QxvGyfdnJM=
+-----END PRIVATE KEY-----
+"""
+
+
+#: **另一张**自签证书（只有证书、没有私钥）。
+#: 用途只有一个：证明"固定了 A 的客户端连不上只持 B 的服务端" —— 也就是**固定是真的
+#: 在生效**，而不是"反正都能连上"。客户端只需要知道"它不是这张"，所以不需要 B 的私钥。
+OTHER_CERT_PEM = """\
+-----BEGIN CERTIFICATE-----
+MIIDMTCCAhmgAwIBAgIUJ2PX3jNIJjCkuStGYGbta03OJAwwDQYJKoZIhvcNAQEL
+BQAwGTEXMBUGA1UEAwwOZWNoby10bHMtb3RoZXIwIBcNMjYwOTI0MTIzMzAxWhgP
+MjEyNjA4MzExMjMzMDFaMBkxFzAVBgNVBAMMDmVjaG8tdGxzLW90aGVyMIIBIjAN
+BgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAoZZlseYBKRH7hZVLeJSpqLN7dM3q
+yN/11UyxuWTKk266G5zzr+Zqp8h1IbAhep93DlTnkF2mOnrH8xlXRgxAa5SOd0Iq
+us3YymTEW5XlHyTXhgxKxCQIgEpu3TIpqyjOl7JyZZwQdEwQtmcjmOOsHagnKHGj
+6eankFhinhihjRoJm7NPYC6eV2KUz4lvuc+Fneqzn4gmGOgEXlAZxUS5bLgIJsGs
+Syk31Txxd3poH9vSspazeA2vN7+sQSSj/HNpfVMpWSG9QXfoRLjEEpGp9TTUEaWc
+9KzMDZ6pKGERlQnUQcU4MSnp86VYa9jzXZoQ7HJDJK9fgPuTrPc2wwtbIQIDAQAB
+o28wbTAdBgNVHQ4EFgQUT50+XyX5q5axlrayppt7twPlkYswHwYDVR0jBBgwFoAU
+T50+XyX5q5axlrayppt7twPlkYswDwYDVR0TAQH/BAUwAwEB/zAaBgNVHREEEzAR
+gglsb2NhbGhvc3SHBH8AAAEwDQYJKoZIhvcNAQELBQADggEBADDZqpbfOR4YhAUu
+emjWBYU8Tehuf5VL1VjASrnoXanHhgue+kGobmyI8hMlHHHcUJp13f8rcF8FWdnk
+vsn8OdV2OtSfJpP81x39LOs1hhuni6ZLbU0feX3Jz+HA2qiT33zMdPg5nsFgkPSU
+SJwvV5hnh8XcbfBhPSZuHsH9E5FM0NpOsnoSotEPn8GfbC+0/ztbanrHoZBPA0Ts
+WHKlDkJ4VixNKZmkvRAQ+wkrxCInqaMn6FqwsiQdRAmoNMqySCRTQMUv1AxR38hk
+iyziVrQARuzZ1iKBmYh/85QMOd0uamZzxXCuo/qczzrCpM5Iv0AQhF+9nW80Tn2Y
+3HbMB+M=
+-----END CERTIFICATE-----
+"""

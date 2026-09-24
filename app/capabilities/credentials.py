@@ -108,6 +108,10 @@ class BackendCredentials:
     server_name: str = ""
     #: 配对时记下的服务端证书指纹（设计 §7.5 ①：配对顺带交换信任，防中间人）
     cert_fingerprint: str = ""
+    #: 配对时取回的服务端证书（PEM）。https 时**必须**有它 ——
+    #: 连接时只认这一张（`pairing.pinned_context`），于是用户不必装自签根。
+    #: 它**不是秘密**（证书本来就是公开的），所以和凭据一起落盘没问题。
+    cert_pem: str = ""
     paired_at: float = field(default_factory=time.time)
     #: 最近一次换到的短期令牌（**不落盘**：它是短命的，重启后重新换即可）
     access_token: str = ""
@@ -172,6 +176,7 @@ def load() -> Optional[BackendCredentials]:
         secret=secret,
         server_name=str(data.get("server_name") or ""),
         cert_fingerprint=str(data.get("cert_fingerprint") or ""),
+        cert_pem=str(data.get("cert_pem") or ""),
         paired_at=float(data.get("paired_at") or 0.0),
     )
 

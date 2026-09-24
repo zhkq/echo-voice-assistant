@@ -198,6 +198,26 @@ def _db_log(level: str, source: str, message: str) -> None:
         "[%s] %s", source, message)
 
 
+def _tls_kwargs(cfg) -> dict:
+    """配置 → uvicorn 的 TLS 参数。没配就返回空字典（走 http）。
+
+    **只配了其中一个就报错退出**，绝不静默降级成 http —— 那是这类配置里最糟的结果：
+    部署的人以为自己是 https，客户端却在明文上传音频。宁可起不来。
+    """
+    cert = str(cfg.get("server.tls.certfile", "") or "").strip()
+    key = str(cfg.get("server.tls.keyfile", "") or "").strip()
+    if not cert and not key:
+        return {}
+    if not cert or not key:
+        raise SystemExit("server.tls 只配了一半（certfile=%r keyfile=%r）："
+                         "两个都要填才启用 https。**不会静默按 http 起** —— "
+                         "那会让你以为连的是 https。" % (cert, key))
+    for path in (cert, key):
+        if not os.path.isfile(path):
+            raise SystemExit("server.tls 指向的文件不存在：%s" % path)
+    return {"ssl_certfile": cert, "ssl_keyfile": key}
+
+
 def _normalize_scopes(raw: str) -> str:
     """把 `"asr,diarize"` / `"asr diarize"` / `"asr  diarize"` 统一成空格分隔。
 
@@ -480,7 +500,11 @@ def main(argv=None) -> int:
         return _admin_cli(cfg, args)
 
     import uvicorn
-    uvicorn.run(create_app(cfg), host=cfg.host, port=cfg.port, log_level=str(args.log_level))
+    tls = _tls_kwargs(cfg)
+    if tls:
+        log.info("以 https 启动（证书 %s）", tls["ssl_certfile"])
+    uvicorn.run(create_app(cfg), host=cfg.host, port=cfg.port,
+                log_level=str(args.log_level), **tls)
     return 0
 
 

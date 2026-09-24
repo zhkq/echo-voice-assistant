@@ -12,6 +12,13 @@ server:
   # 而鉴权库存着客户端凭据 —— 两者放一起意味着"照文档把 tmp 换成内存盘
   # 就会把配过的所有客户端清空"。容器里就是那两个保留策略相反的卷。
   state_root: /var/echo/state
+  # TLS（设计 §7.5 ①）。**两个都填才启用 https**；只填一个是配置错误，直接起不来
+  # （不静默降级成 http —— 那会让你以为连的是 https）。
+  # 客户端靠"配对时固定服务端证书"来验，不需要给每台机器装自签根。
+  # 容器里要把证书挂进来，例如 -v /etc/echo/tls:/etc/echo/tls:ro
+  tls:
+    certfile: ""          # 例如 /etc/echo/tls/server.crt
+    keyfile: ""           # 例如 /etc/echo/tls/server.key
 
 limits:
   # 2026-09-23 定：总通道 2、每客户端 1。

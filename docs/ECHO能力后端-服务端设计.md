@@ -1108,6 +1108,23 @@ secret 会留在聊天记录里，而且管理员得一台台填。
 正好用来交换信任：客户端记下指纹，之后连这个后端就校验它（防中间人）——
 **用户不需要去装自签证书的根**。这也是"配对"这件事除了发凭据之外的第二个价值。
 
+> **实现现状（2026-09-24 落地 TLS）**：服务端 `server.tls.certfile` / `keyfile`
+> 两个都填才起 https（只填一个**启动就报错**，绝不静默降级成 http —— 那会让部署的人
+> 以为连的是 https）；客户端在配对时**取回证书并固定**，之后每次调用都只认那一张。
+>
+> 三条必须说清楚的边界：
+> 1. **不给 `fp=` 时是 TOFU**（首次连接即信任）。第一次连接本身就是信任建立的那一刻，
+>    所以那时的中间人拦不住 —— 要真防住，配对串里**带指纹**（`echo://pair?...&fp=sha256:…`），
+>    给了就一定要对上，对不上直接拒（`test_a_mismatched_expected_fingerprint_stops_the_pairing`）。
+> 2. **https 而没有固定证书 → 拒绝连接**，不静默跳过校验。静默跳过的坏处不是"不安全"
+>    而是**从现象上看不出来**（照样能用），所以它是一条会红的用例，不是一段注释。
+> 3. `check_hostname=False`：内网后端常按 IP/短名访问，证书上不会签它。我们靠
+>    "证书必须就是配对时那一张"来认证 —— 比校名更强，而且不必给每台机器装根。
+>
+> 用例见 `tests/test_backend_tls.py`（13 条，含真 https 握手）与
+> `TlsConfigTests`（5 条）。证书是内嵌的测试专用自签证书
+> （`tests/tls_test_cert.py`），所以**门禁不需要 openssl、也不需要 cryptography**。
+
 #### ② 换令牌
 
 ```
@@ -1692,6 +1709,7 @@ client_body_temp_path /var/echo/tmp/nginx;
 | `server.instance_id` | `default` | 临时目录的命名空间，多实例互不清扫对方的残留 |
 | `server.state_root` | `{ECHO}/data/server-state` | ★ **耐久**状态（鉴权库）。**必须与 `tmp.root` 分开**，理由见 §9.3 |
 | `server.vram_budget_mb` | `0`（不限） | 超预算**拒绝**而不是 OOM，也绝不回退 CPU（§3.4） |
+| `server.tls.certfile` / `keyfile` | 空（http） | **两个都填**才起 https；只填一个**启动就报错**（不静默降级） |
 | `limits.max_concurrent` | **2** | 2026-09-23 定；上线后压测校准 |
 | `limits.per_client_concurrent` | **1** | 公平性：一个客户端不许占满 |
 | `limits.queue_max` | **0** | **不排队**，满了立刻拒（§3.6） |
@@ -1861,6 +1879,14 @@ client_body_temp_path /var/echo/tmp/nginx;
 | 宽限期**真的会到期**（不是永久后门） | ✅ | `SecretRotationGraceTests.test_the_grace_window_actually_expires` |
 | 之后再默认轮换一次，会把之前开的宽限门一并关上 | ✅ | `SecretRotationGraceTests.test_a_later_plain_rotation_closes_the_grace_window_too` |
 | 命令行把"宽限期不能用于泄漏"印出来，并给一张新配对码 | ✅ | `SecretRotationGraceTests.test_the_cli_default_says_it_leaves_no_grace` |
+| TLS：只配了 cert/key 之一 → **启动就报错**（不静默按 http 起） | ✅ | `TlsConfigTests.test_half_a_config_is_a_hard_error` |
+| TLS：配置真的被送到 uvicorn（不是配置文件里的一行字） | ✅ | `TlsConfigTests.test_the_server_actually_passes_them_to_uvicorn` |
+| 客户端配对时**取回并固定**服务端证书，落盘 | ✅ | `PinningEndToEndTests.test_pairing_over_https_pins_the_certificate` |
+| 配对串里的 `fp=` 对不上 → **拒绝配对**（防中间人） | ✅ | `PinningEndToEndTests.test_a_mismatched_expected_fingerprint_stops_the_pairing` |
+| 固定了 A 的客户端**连不上**只持 B 的服务端（固定真的在生效） | ✅ | `PinningEndToEndTests.test_a_client_pinned_to_another_certificate_cannot_connect` |
+| https 而没有固定证书 → **拒绝连接**，不静默跳过校验 | ✅ | `PinIsMandatoryTests` |
+| 换令牌那条路也用固定的证书（漏了就只能明文或跳过校验） | ✅ | `PinningEndToEndTests.test_a_capability_call_succeeds_with_the_pinned_certificate` |
+| http 的老路不因为 TLS 改动而坏掉 | ✅ | `PinningEndToEndTests.test_pairing_over_plain_http_still_works` |
 | 已存在的旧库会自动补 `name`/`scopes`（配对码）与 `daily_audio_minutes`（客户端），且**数据不丢** | ✅ | `AuthSchemaMigrationTests` |
 | **公开端点表之外的端点，匿名请求一律 401/403**（遍历 OpenAPI，不靠人记） | ✅ | `PublicSurfaceTests.test_every_other_endpoint_rejects_an_anonymous_request` |
 | 公开表里写了的那三个**真能匿名用**（不然探针会因鉴权失败而"显示不健康"） | ✅ | `PublicSurfaceTests.test_the_documented_public_endpoints_are_actually_reachable` |

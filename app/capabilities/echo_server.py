@@ -275,6 +275,21 @@ class EchoServerClient(CapabilityClient):
             raise error_from_server(body, status, self.backend_id, slot)
         return body
 
+    def _ssl_context(self, *, slot: str = ""):
+        """https 时的固定证书上下文；http 时返回 `None`。
+
+        **https 而没有固定证书 → 直接抛**（`blocked`），绝不静默跳过校验：
+        那等于把中间人放进来，而且从现象上完全看不出来（"能用"）。
+        """
+        if not pairing.is_https(self.base_url):
+            return None
+        try:
+            return pairing.pinned_context(getattr(self._creds, "cert_pem", "") or "",
+                                          what="ECHO 后端")
+        except pairing.PairingError as e:
+            raise CapabilityError("blocked", str(e), code="blocked",
+                                  backend_id=self.backend_id, slot=slot) from None
+
     def _request(self, method: str, path: str, *, data: Optional[bytes] = None,
                  content_type: str = "", timeout: float = 30.0,
                  slot: str = "", retry_auth: bool = True) -> tuple:
@@ -291,8 +306,9 @@ class EchoServerClient(CapabilityClient):
             req.add_header("Authorization", auth)
         # 让服务端日志与客户端日志能用同一个 id 对上（服务端 §7.3）
         req.add_header("X-Request-Id", _new_request_id())
+        context = self._ssl_context(slot=slot)
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
+            with urllib.request.urlopen(req, timeout=timeout, context=context) as resp:
                 raw = resp.read()
                 return resp.status, _maybe_json(raw)
         except urllib.error.HTTPError as e:

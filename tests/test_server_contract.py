@@ -2804,5 +2804,66 @@ class SecretRotationGraceTests(unittest.TestCase):
         self.assertIn("echo://pair?", out2, "没给新配对码，运维只能干等宽限期结束")
 
 
+class TlsConfigTests(unittest.TestCase):
+    """服务端 TLS 配置（设计 §13 的 TLS，2026-09-24 落地）。
+
+    最要紧的一条：**只配了 cert 或只配了 key 时不许静默按 http 起** ——
+    那会让部署的人以为连的是 https，而客户端在明文上传音频。
+    """
+
+    def _cfg(self, cert="", key=""):
+        cfg = settings_mod.load()
+        cfg.raw["server"]["tls"] = {"certfile": cert, "keyfile": key}
+        return cfg
+
+    def test_no_config_means_plain_http(self):
+        self.assertEqual(server_main._tls_kwargs(self._cfg()), {})
+
+    def test_half_a_config_is_a_hard_error(self):
+        with self.assertRaises(SystemExit) as ctx:
+            server_main._tls_kwargs(self._cfg(cert="C:/x.pem"))
+        self.assertIn("只配了一半", str(ctx.exception))
+        with self.assertRaises(SystemExit):
+            server_main._tls_kwargs(self._cfg(key="C:/y.pem"))
+
+    def test_a_missing_file_is_reported_not_ignored(self):
+        with self.assertRaises(SystemExit) as ctx:
+            server_main._tls_kwargs(self._cfg(cert="C:/nope.pem", key="C:/nope.key"))
+        self.assertIn("不存在", str(ctx.exception))
+
+    def test_both_files_present_gives_uvicorn_kwargs(self):
+        tmp = tempfile.mkdtemp(prefix="echo-tls-cfg-")
+        cert = os.path.join(tmp, "server.crt")
+        key = os.path.join(tmp, "server.key")
+        for p in (cert, key):
+            with open(p, "w", encoding="utf-8") as fh:
+                fh.write("x")
+        got = server_main._tls_kwargs(self._cfg(cert=cert, key=key))
+        self.assertEqual(got, {"ssl_certfile": cert, "ssl_keyfile": key})
+
+    def test_the_server_actually_passes_them_to_uvicorn(self):
+        """配置要真的被送到 uvicorn —— 否则"配了 https"只是配置文件里的一行字。"""
+        tmp = tempfile.mkdtemp(prefix="echo-tls-run-")
+        cert = os.path.join(tmp, "server.crt")
+        key = os.path.join(tmp, "server.key")
+        for p in (cert, key):
+            with open(p, "w", encoding="utf-8") as fh:
+                fh.write("x")
+        cfg_path = os.path.join(tmp, "server.yaml")
+        with open(cfg_path, "w", encoding="utf-8") as fh:
+            fh.write("server:\n  listen: '127.0.0.1:8999'\n"
+                     "  tls:\n    certfile: '%s'\n    keyfile: '%s'\n"
+                     % (cert.replace("\\", "/"), key.replace("\\", "/")))
+        import uvicorn
+        seen = {}
+        with patch.object(uvicorn, "run", lambda app, **kw: seen.update(kw)):
+            rc = server_main.main(["--config", cfg_path])
+        self.assertEqual(rc, 0)
+        # 比的是**同一个文件**，不是同一个字符串：YAML 里写的是正斜杠，配置读回来
+        # 原样就是正斜杠，而 `cert` 是本地拼的反斜杠路径。`os.path.samefile` 只认"同一份"。
+        self.assertTrue(os.path.samefile(seen.get("ssl_certfile", ""), cert))
+        self.assertTrue(os.path.samefile(seen.get("ssl_keyfile", ""), key))
+
+
 if __name__ == "__main__":
     unittest.main()
