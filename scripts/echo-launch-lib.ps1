@@ -28,6 +28,26 @@
 # "ASCII or BOM" for this directory.
 # =====================================================================
 
+function Get-EchoRoots {
+    # Resolve the two roots a tree can have (3.0 install-base layout, see app\paths.py:echo_base).
+    #
+    #   new layout : <base>\echo-core\   <- code (wholly replaced on upgrade)
+    #                <base>\{data,models,dsh\{app,home},meeting,aide}
+    #                <base>\{venv,runtime-core}   <- runtime, NEXT TO echo-core on purpose:
+    #                                                replacing echo-core must not reinstall deps
+    #   legacy     : code == base (a flat tree such as D:\ECHO\app, or a dev checkout)
+    #
+    # Self-describing on purpose - the SAME rule as app\paths.py:echo_base(): the folder name
+    # "echo-core" IS the marker. No config file is read here (install.ps1 must work before any
+    # settings database exists), and a tree that is not named echo-core keeps the old behaviour
+    # byte for byte.
+    param([Parameter(Mandatory = $true)][string]$Start)
+    $code = $Start
+    $base = $Start
+    if ((Split-Path $Start -Leaf) -ieq 'echo-core') { $base = Split-Path $Start -Parent }
+    return @{ Code = $code; Base = $base; IsNewLayout = ($base -ne $code) }
+}
+
 function Start-EchoProcess {
     # Runs <Pythonw> <Arguments> in $WorkDir with stdout/stderr redirected to the log
     # files, without ever creating a console window. Returns the cmd.exe wrapper Process.

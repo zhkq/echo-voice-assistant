@@ -27,7 +27,10 @@ $root = Split-Path $PSScriptRoot -Parent
 # Start the service without ever creating a console window: the venv pythonw would
 # otherwise leak a console that Windows Terminal shows as an empty tab.
 . (Join-Path $PSScriptRoot 'echo-launch-lib.ps1')
-$logDir = Join-Path $root 'data\logs'
+# 3.0 install-base layout: with the code in <base>\echo-core, data + runtime live in <base>.
+# On a flat tree base == root, so nothing changes (see app\paths.py:echo_base).
+$base = (Get-EchoRoots -Start $root).Base
+$logDir = Join-Path $base 'data\logs'
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
 $supLog = Join-Path $logDir 'echo-supervisor.log'
 
@@ -79,7 +82,12 @@ SupLog "watchdog mutex acquired ($mtxName)"
 
 # ---- 2/3. resolve pythonw and keep ECHO alive ----
 # D22: main package has no bundled runtime; runtime-core component provides it.
-$py = Join-Path $root 'runtime-core\python.exe'
+# New layout: look NEXT TO echo-core first (runtime survives a code-only upgrade), then
+# the legacy in-tree spots. On a flat tree both groups are the same paths.
+$py = Join-Path $base 'runtime-core\python.exe'
+if (-not (Test-Path $py)) { $py = Join-Path $base 'runtime-core\Scripts\python.exe' }
+if (-not (Test-Path $py)) { $py = Join-Path $base 'venv\Scripts\python.exe' }
+if (-not (Test-Path $py)) { $py = Join-Path $root 'runtime-core\python.exe' }
 if (-not (Test-Path $py)) { $py = Join-Path $root 'runtime-core\Scripts\python.exe' }
 if (-not (Test-Path $py)) { $py = Join-Path $root 'venv\Scripts\python.exe' }
 # ECHO_PYTHON exists for ONE reason: a tree whose own path is non-ASCII cannot let

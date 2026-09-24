@@ -22,6 +22,12 @@ param(
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
 
+# 3.0 install-base layout (see app\paths.py:echo_base): with the code in <base>\echo-core,
+# the pid/port files live in <base>\data. $root stays the CODE root - it is what the
+# "is this pid ours" match below needs (the command line carries the code path).
+. (Join-Path $PSScriptRoot 'echo-launch-lib.ps1')
+$base = (Get-EchoRoots -Start $root).Base
+
 function Write-Step([string]$message) {
     if (-not $Quiet) { Write-Host $message }
 }
@@ -52,7 +58,7 @@ function Test-EchoPid([int]$ProcessId) {
 $stopped = @()
 
 # ---- 1) pid file ----
-$pidFile = Join-Path $root 'data\echo.pid'
+$pidFile = Join-Path $base 'data\echo.pid'
 if (Test-Path $pidFile) {
     $echoPid = (Get-Content $pidFile -Raw).Trim()
     if ($echoPid -match '^\d+$') {

@@ -24,11 +24,22 @@ $root = Split-Path $PSScriptRoot -Parent
 # otherwise leak a console that Windows Terminal shows as an empty tab.
 . (Join-Path $PSScriptRoot 'echo-launch-lib.ps1')
 
+# 3.0 install-base layout: when this tree's code folder is named echo-core, the data root
+# and the runtime live in the PARENT folder (siblings of echo-core). Everything below that
+# used to be "just $root" is now "$base" - but $root stays the code root, because that is
+# what -WorkDir and `-m app.main` need. On a legacy flat tree base == root, so nothing changes.
+$roots = Get-EchoRoots -Start $root
+$base = $roots.Base
+
 # (retired 2026-09-17) The DSH Desktop host plugin (echo-host) is gone - see plugin/README.md.
 
 # D22: the main package ships no runtime - the runtime-core component supplies it.
-# Prefer runtime-core\python.exe, fall back to the legacy bundled venv.
-$py = Join-Path $root 'runtime-core\python.exe'
+# New layout looks NEXT TO echo-core first (runtime survives a code-only upgrade), then
+# the legacy in-tree locations. Prefer runtime-core\python.exe, fall back to the bundled venv.
+$py = Join-Path $base 'runtime-core\python.exe'
+if (-not (Test-Path $py)) { $py = Join-Path $base 'runtime-core\Scripts\python.exe' }
+if (-not (Test-Path $py)) { $py = Join-Path $base 'venv\Scripts\python.exe' }
+if (-not (Test-Path $py)) { $py = Join-Path $root 'runtime-core\python.exe' }
 if (-not (Test-Path $py)) { $py = Join-Path $root 'runtime-core\Scripts\python.exe' }
 if (-not (Test-Path $py)) { $py = Join-Path $root 'venv\Scripts\python.exe' }
 # ECHO_PYTHON exists for ONE reason: a tree whose own path is non-ASCII cannot let
@@ -40,7 +51,7 @@ $pyAlt = $env:ECHO_PYTHON
 if ($pyAlt -and (Test-Path $pyAlt) -and ($root -match '[^\x20-\x7E]')) { $py = $pyAlt }
 if (-not (Test-Path $py)) { Write-Host 'runtime missing (runtime-core\ or venv\) - run install.ps1 / setup.ps1 first' -ForegroundColor Red; exit 1 }
 
-$logDir = Join-Path $root 'data\logs'
+$logDir = Join-Path $base 'data\logs'
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
 $outLog = Join-Path $logDir 'echo-server.log'
 $errLog = "$outLog.err"
@@ -102,7 +113,7 @@ if ($Background -and -not $Supervise) {
 
 if ($Supervise) {
     SupLog "===== supervisor start (restartDelay=${RestartDelaySeconds}s) ====="
-    $echoPort = Resolve-EchoPort $root
+    $echoPort = Resolve-EchoPort $base
     SupLog "resolved ECHO port=$echoPort"
     while ($true) {
         if (Test-EchoPort $echoPort) { Start-Sleep -Seconds 15; continue }
