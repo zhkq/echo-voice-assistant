@@ -2091,20 +2091,47 @@ async function saveCapabilityRouting() {
   }
 }
 
+/** 解析配对串 `echo://pair?host=…&code=…&fp=sha256:…`（设计 §7.5 ①）。
+ *
+ * 管理员那边给的就是**这一整串**（服务端 `--new-pairing-code` 打的），用户粘一次就够。
+ * `fp=` 是防中间人的那一步：没有它，第一次连接只能 TOFU（第一次见谁信谁）。
+ * 认不出的键忽略、也不猜 —— 配对是安全动作，宁可少填让人补，不可猜错。
+ * 返回 null 表示"这压根不是配对串"（那就是普通地址，走老路）。 */
+function parsePairString(text) {
+  const m = /^echo:\/\/pair\b[^?]*\?(.*)$/i.exec(String(text || "").trim());
+  if (!m) return null;
+  const out = { url: "", code: "", fp: "" };
+  m[1].split("&").forEach((kv) => {
+    const i = kv.indexOf("=");
+    if (i < 0) return;
+    const k = decodeURIComponent(kv.slice(0, i)).trim().toLowerCase();
+    const v = decodeURIComponent(kv.slice(i + 1).replace(/\+/g, " ")).trim();
+    if (k === "host" || k === "url") out.url = v;
+    else if (k === "code") out.code = v;
+    else if (k === "fp" || k === "fingerprint") out.fp = v;
+  });
+  return out;
+}
+
 async function doCapabilityPair() {
-  const url = ($("#capPairUrl") || {}).value || "";
-  const code = ($("#capPairCode") || {}).value || "";
+  const raw = (($("#capPairUrl") || {}).value || "").trim();
+  const boxCode = (($("#capPairCode") || {}).value || "").trim();
+  const parsed = parsePairString(raw);
+  const url = parsed ? parsed.url : raw;
+  const code = (parsed && parsed.code) ? parsed.code : boxCode;
+  const fp = parsed ? parsed.fp : "";
   const state = $("#capPairState");
-  if (!url.trim()) { toast("先填后端地址"); return; }
-  if (!code.trim()) { toast("先填配对码"); return; }
-  if (state) state.textContent = "正在配对…";
+  if (!url) { toast(parsed ? "配对串里没有 host —— 让管理员重发一张" : "先填后端地址"); return; }
+  if (!code) { toast("先填配对码"); return; }
+  if (state) state.textContent = fp ? "正在配对…（会按串里的指纹校验证书）" : "正在配对…";
   try {
     const r = await api("/api/capability/pair", {
       method: "POST",
-      body: JSON.stringify({ base_url: url, code: code }),
+      body: JSON.stringify({ base_url: url, code: code, fingerprint: fp }),
     });
     toast(r.message || "配对成功");
     const c = $("#capPairCode"); if (c) c.value = "";
+    if (parsed) { const u = $("#capPairUrl"); if (u) u.value = url; }
     await loadCapabilityRouting(true);
   } catch (e) {
     // 400 的 body 是 {"detail": "一句人话"}（后端就是这么回的）。原样显示那条，

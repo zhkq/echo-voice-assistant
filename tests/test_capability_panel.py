@@ -96,8 +96,31 @@ class CapabilityCardWiringTests(unittest.TestCase):
         model = set(PairBackendIn.model_fields.keys())
         self.assertEqual(sorted(sent - model), [],
                          "面板送了模型没有的字段（拼错了？）：%s" % sorted(sent - model))
-        for must in ("base_url", "code"):
+        for must in ("base_url", "code", "fingerprint"):
             self.assertIn(must, sent, "配对必须送 %s" % must)
+
+    def test_the_pairing_string_is_parsed_on_the_panel_side(self):
+        """管理员的**一整串** `echo://pair?host=…&code=…&fp=…` 要能直接粘进来。
+
+        服务端 `--new-pairing-code` 打的就是这一串（含证书指纹，设计 §7.5 ①）。
+        如果面板不认它，用户就得手工把 host/code/fp 三段拆开抄 —— 那正是
+        `fp=` 会被抄错、抄漏的地方，而它恰好是防中间人的那一步。
+        """
+        self.assertIn("function parsePairString(", self.js, "没有配对串解析器")
+        body = self.js[self.js.index("function parsePairString("):]
+        body = body[:body.index("\n}\n") + 3]
+        # 正则里的 `echo://pair` 是转义写法（`/^echo:\/\/pair\b/`），所以按源码里的样子找
+        for token in ("echo:\\/\\/pair", "host", "code", "fp"):
+            self.assertIn(token, body, "解析器不认 %s" % token)
+        # 配对那条路要真的用它（写了不用等于没写）
+        pair = self.js[self.js.index("async function doCapabilityPair()"):]
+        pair = pair[:pair.index("\n}\n") + 3]
+        self.assertIn("parsePairString(", pair)
+
+    def test_the_pair_box_tells_people_they_can_paste_the_whole_string(self):
+        """界面文案要说到"粘整串" —— 否则用户只会去抄那串里的数字。"""
+        self.assertIn("echo://pair", self.html)
+        self.assertIn("配对串", self.html)
 
     def test_pairing_failures_show_the_servers_own_sentence(self):
         """400 的 body 是 `{"detail": "配对码无效"}` —— 面板要显示那句话，而不是 `HTTP 400: {...}`。

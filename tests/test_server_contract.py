@@ -2359,7 +2359,7 @@ class QuotaAdminTests(unittest.TestCase):
             code = server_main.main(["--config", self.cfg_path] + list(argv))
         return code, buf.getvalue()
 
-    def test_it_stores_the_limit_and_makes_it_effective_on_the_next_request(self):
+    def test_it_stores_the_limit_the_quota_ledger_reads(self):
         code, out = self._run("--set-quota", "cli-x", "--daily-audio-minutes", "120")
         self.assertEqual(code, 0, out)
         store = store_mod.Store(self.db_path)
@@ -2375,6 +2375,19 @@ class QuotaAdminTests(unittest.TestCase):
                 self.assertEqual(st._quota_limit_for("cli-x"), 120.0)
                 self.assertEqual(st.quota.limit_minutes("cli-x"), 120.0)
                 self.assertEqual(c.get("/v1/health").status_code, 200)
+
+    def test_the_message_does_not_promise_instant_effect(self):
+        """`--set-quota` 的提示**不许**说"下一个请求就生效" —— 实测不是这样。
+
+        2026-09-24 真机：改完立刻打后端仍然 200，要等**鉴权缓存**（默认 60 s）过期才是
+        429 `quota_exceeded`（`Retry-After` 指到本地 0 点，实测 4648 秒）。一句好意但错的
+        提示会让人以为"限流没生效"，然后跑去改别的配置。
+        """
+        code, out = self._run("--set-quota", "cli-x", "--daily-audio-minutes", "120")
+        self.assertEqual(code, 0, out)
+        self.assertIn("才生效", out)
+        self.assertNotIn("下一个请求就生效", out)
+        self.assertIn("不清零", out)
 
     def test_zero_means_use_the_global_default(self):
         self._run("--set-quota", "cli-x", "--daily-audio-minutes", "0")
@@ -2803,6 +2816,89 @@ class SecretRotationGraceTests(unittest.TestCase):
         self.assertIn("旧 secret 仍然能换令牌", out2)
         self.assertIn("不能用于", out2, "没说清宽限期不能用于泄漏 —— 那是最容易用错的地方")
         self.assertIn("echo://pair?", out2, "没给新配对码，运维只能干等宽限期结束")
+
+
+class PairingStringTests(unittest.TestCase):
+    """`--new-pairing-code` 打出来的那**一整串**（设计 §7.5 ①：`echo://pair?...&fp=`）。
+
+    这里是那条注释的兑现："证书指纹等 TLS 落地时再加 —— 现在写上去是假的"。
+    TLS 已经落地（见 `TlsConfigTests`），所以指纹要真的是那张证书的、没配 TLS 时**不许编**。
+
+    为什么值得三条用例：
+      * 指纹写错 = 客户端**配不上对**（现象是"配对码明明是对的却拒了"），或者更糟；
+      * 没配 TLS 却写了个假指纹 = 客户端拿它去校验 http，等于把"防中间人"变成一句空话；
+      * 服务端这份实现与客户端 `pairing.fingerprint_of` **有意各写一份**（`server/` 要能单独
+        部署），那就必须有东西盯着它们不许漂移 —— 下面第三条就是干这个的。
+    """
+
+    def _cfg(self, cert=""):
+        cfg = settings_mod.load()
+        cfg.raw["server"]["listen"] = "127.0.0.1:8900"
+        cfg.raw["server"]["tls"] = {"certfile": cert, "keyfile": cert}
+        return cfg
+
+    def _cert_file(self):
+        from tests.tls_test_cert import CERT_PEM
+        tmp = tempfile.mkdtemp(prefix="echo-pairstr-")
+        path = os.path.join(tmp, "server.crt")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(CERT_PEM)
+        return path
+
+    def test_the_fingerprint_matches_the_client_side_implementation(self):
+        from tests.tls_test_cert import CERT_PEM
+        # 两条实现分别在 server/ 与 app/ 里（服务端要能单独部署），这条用例是它们之间的桥。
+        from app.capabilities import pairing as app_pairing
+        self.assertEqual(server_main.cert_fingerprint(self._cert_file()),
+                         app_pairing.fingerprint_of(CERT_PEM))
+
+    def test_a_missing_or_broken_certificate_gives_an_empty_string(self):
+        """读不到就返回空串 —— 调用方把它当"没有指纹可给"，**不编一个假的**。"""
+        for path in ("", "C:/nope/none.pem", tempfile.mkdtemp(prefix="echo-pairstr-x-")):
+            with self.subTest(path=path):
+                self.assertEqual(server_main.cert_fingerprint(path), "")
+
+    def test_the_pairing_string_carries_host_code_and_fingerprint(self):
+        cfg = self._cfg(cert=self._cert_file())
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            server_main._print_pairing("7K2M9QX4", cfg)
+        out = buf.getvalue()
+        # 配了 TLS 就必须写 https:// —— 不带 scheme 的地址客户端按 http 处理，
+        # 在 https 服务端上只会得到一句"连不上"。
+        self.assertIn("echo://pair?host=https://127.0.0.1:8900&code=7K2M9QX4&fp=sha256:", out)
+        self.assertIn(server_main.cert_fingerprint(self._cert_file()), out)
+
+    def test_without_tls_it_does_not_invent_a_fingerprint(self):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            server_main._print_pairing("7K2M9QX4", self._cfg())
+        out = buf.getvalue()
+        # 只看配对串那一行 —— 说明文字里当然会提到 "fp="（那正是要解释的事）。
+        line = [ln for ln in out.splitlines() if "echo://pair" in ln]
+        self.assertEqual(len(line), 1, "配对串应当只有一行")
+        self.assertIn("host=http://127.0.0.1:8900&code=7K2M9QX4", line[0])
+        self.assertNotIn("fp=", line[0], "没配 TLS 就不能写 fp= —— 客户端会拿它去校验 http")
+        self.assertIn("TOFU", out, "没指纹时要说清楚这次只能 TOFU")
+
+    def test_a_wildcard_listen_is_never_handed_to_the_client(self):
+        """出厂默认监听 `0.0.0.0` —— 抄进配对串就是"同事那边连不上"，而且看不出原因。"""
+        cfg = self._cfg()
+        cfg.raw["server"]["listen"] = "0.0.0.0:8900"
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            server_main._print_pairing("7K2M9QX4", cfg)
+        out = buf.getvalue()
+        line = [ln for ln in out.splitlines() if "echo://pair" in ln][0]
+        self.assertNotIn("0.0.0.0", line, "通配地址不是客户端能用的地址")
+        self.assertIn("host=", line)
+        self.assertIn("通配地址", out, "换掉了地址就要说清楚为什么，以及怎么改")
+
+    def test_a_normal_listen_is_used_as_is_without_extra_noise(self):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            server_main._print_pairing("7K2M9QX4", self._cfg())
+        self.assertNotIn("通配地址", buf.getvalue(), "地址本来就对，不该多一段解释")
 
 
 class TlsConfigTests(unittest.TestCase):

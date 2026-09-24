@@ -1033,7 +1033,8 @@ secret 会留在聊天记录里，而且管理员得一台台填。
 ① 生成配对码（8 位、有效期 15 分钟、只存哈希），明文只出现这一次
      —— 管理面还没做，所以现在唯一的入口是命令行：
         python -m server.main --new-client "张三的办公本" --scopes "asr diarize"
-        →  echo://pair?host=gpu-01:8900&code=7K2M9QX4
+        →  echo://pair?host=http://gpu-01:8900&code=7K2M9QX4
+           （配了 TLS 时：echo://pair?host=https://gpu-01:8900&code=7K2M9QX4&fp=sha256:1f3a…）
      **名字与 scope 跟着码走**：兑换出来的客户端就用它们。
      所以"给这台机器只开 asr 权限"是能表达的，不是一句好听话。
      不填名字（`--new-pairing-code`）时才回退到对端自报与全局默认 scope。
@@ -1052,6 +1053,20 @@ secret 会留在聊天记录里，而且管理员得一台台填。
 ③ 客户端把 client_id + secret 落到**本机**（`{echoBase}/data/`，权限收紧）
    之后用它们换短期 JWT（§7.1），不再拿 secret 直接调能力
 ```
+
+> **2026-09-24 真机联调给配对串补的三处**（原稿只写 `host=gpu-01:8900&code=…`）：
+>
+> 1. **scheme 必须写**：客户端对不带 scheme 的地址默认按 http 处理
+>    （`pairing.normalize_base_url`），在 https 后端上就是一句"连不上"。配了 TLS 就写 `https://`。
+> 2. **`fp=` 真的打出来了**（原来那句注释是"等 TLS 落地再加，现在写上去是假的"）：指纹取自
+>    `server.tls.certfile`；**没配 TLS 时不写** —— 写一个假指纹比不写更坏（客户端会拿它去校验 http）。
+> 3. **通配监听地址不抄给客户端**：出厂默认 `0.0.0.0:8900` 对客户端没有意义，抄过去
+>    同事那边只会看到"连不上"。改成探测到的本机地址，并附一句"连不上就换成同事能访问到的
+>    主机名/IP"；探不到就留占位符让人自己填（**不猜**）。
+>
+> 三条都有用例（`tests/test_server_contract.PairingStringTests`），
+> 其中"服务端算的指纹 == 客户端 `fingerprint_of` 算的指纹"是一条**跨层**用例 ——
+> 两处实现是**有意分开**的（`server/` 要能单独部署），所以必须有东西盯着它们不许漂移。
 
 **为什么比"复制 secret"好**
 
@@ -1905,6 +1920,13 @@ client_body_temp_path /var/echo/tmp/nginx;
 | https 而没有固定证书 → **拒绝连接**，不静默跳过校验 | ✅ | `PinIsMandatoryTests` |
 | 换令牌那条路也用固定的证书（漏了就只能明文或跳过校验） | ✅ | `PinningEndToEndTests.test_a_capability_call_succeeds_with_the_pinned_certificate` |
 | http 的老路不因为 TLS 改动而坏掉 | ✅ | `PinningEndToEndTests.test_pairing_over_plain_http_still_works` |
+| `--new-client` 打出的配对串**带 scheme 与 `fp=`**（https 后端上抄过去就能用） | ✅ | `PairingStringTests.test_the_pairing_string_carries_host_code_and_fingerprint` |
+| 没配 TLS **不编** `fp=`（编了客户端会拿它去校验 http） | ✅ | `PairingStringTests.test_without_tls_it_does_not_invent_a_fingerprint` |
+| 通配监听（`0.0.0.0`）**不抄给客户端**，并说明怎么改 | ✅ | `PairingStringTests.test_a_wildcard_listen_is_never_handed_to_the_client` |
+| 服务端算的指纹 == 客户端 `pairing.fingerprint_of`（两处实现不许漂移） | ✅ | `PairingStringTests.test_the_fingerprint_matches_the_client_side_implementation` |
+| 证书读不到时返回空串，**不编一个假指纹** | ✅ | `PairingStringTests.test_a_missing_or_broken_certificate_gives_an_empty_string` |
+| 面板发的配对载荷字段与 `PairBackendIn` 完全一致（含 `fingerprint`） | ✅ | `test_capability_panel.CapabilityCardWiringTests.test_the_pair_payload_matches_the_api_model` |
+| 接口这条路**真的能把 `fp=` 送进配对**（字段存在 ≠ 打通） | ✅ | `test_capability_admin.PairingFingerprintTests` |
 | 已存在的旧库会自动补 `name`/`scopes`（配对码）与 `daily_audio_minutes`（客户端），且**数据不丢** | ✅ | `AuthSchemaMigrationTests` |
 | **公开端点表之外的端点，匿名请求一律 401/403**（遍历 OpenAPI，不靠人记） | ✅ | `PublicSurfaceTests.test_every_other_endpoint_rejects_an_anonymous_request` |
 | 公开表里写了的那三个**真能匿名用**（不然探针会因鉴权失败而"显示不健康"） | ✅ | `PublicSurfaceTests.test_the_documented_public_endpoints_are_actually_reachable` |

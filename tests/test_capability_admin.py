@@ -31,7 +31,8 @@ import app.db as db                                         # noqa: E402
 from app import capability_admin                            # noqa: E402
 from app.api import router as api_router                     # noqa: E402
 from app.capabilities import credentials as cred             # noqa: E402
-from app.capabilities import echo_server, router as cap_router  # noqa: E402
+from app.capabilities import echo_server, pairing            # noqa: E402
+from app.capabilities import router as cap_router            # noqa: E402
 from app.config import DEFAULTS, settings                    # noqa: E402
 
 # 桩服务器与那段"配对成功"的应答都在配对那批用例里。**故意复用而不是再写一份**：
@@ -253,6 +254,53 @@ class EndpointTests(_Isolated):
         r = self.client.post("/api/capability/pair", json={"base_url": s.url, "code": "ABC"})
         self.assertNotIn(_PAIR_OK["secret"], r.text)
         self.assertNotIn(_PAIR_OK["secret"], self.client.get("/api/capability").text)
+
+
+class PairingFingerprintTests(_Isolated):
+    """配对串里的 `fp=` 要真的通到接口上（设计 §7.5 ①）。
+
+    `pairing.pair(..., cert_fingerprint=)` 的能力由 `test_backend_tls` 钉着；
+    这里钉的是**它有没有被打通到 HTTP 接口** —— 加这个字段之前，`PairBackendIn`
+    根本没有它，于是界面上的"配对串带指纹"无处可填，那一层防中间人等于没接上
+    （`pairing.py` 里那 25 条用例照样全绿，因为没人从这条路走）。
+    """
+
+    def _tls(self):
+        from tests.test_backend_tls import _HttpsServer
+        srv = _HttpsServer()
+        self.addCleanup(srv.stop)
+        return srv
+
+    def test_a_matching_fingerprint_pairs_and_pins(self):
+        from tests.tls_test_cert import CERT_PEM
+        srv = self._tls()
+        r = self.client.post("/api/capability/pair",
+                             json={"base_url": srv.url, "code": "abc",
+                                   "fingerprint": pairing.fingerprint_of(CERT_PEM)})
+        self.assertEqual(r.status_code, 200, r.text)
+        stored = cred.load()
+        self.assertIsNotNone(stored)
+        self.assertEqual(stored.cert_fingerprint, pairing.fingerprint_of(CERT_PEM))
+
+    def test_a_mismatched_fingerprint_is_refused_with_one_line(self):
+        from tests.tls_test_cert import OTHER_CERT_PEM
+        srv = self._tls()
+        r = self.client.post("/api/capability/pair",
+                             json={"base_url": srv.url, "code": "abc",
+                                   "fingerprint": pairing.fingerprint_of(OTHER_CERT_PEM)})
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("中间人", r.json()["detail"])
+        self.assertIsNone(cred.load(), "指纹对不上却把凭据写下去了")
+
+    def test_without_a_fingerprint_it_is_still_tofu(self):
+        """老路不许坏：不填 `fp=` = 第一次见谁信谁（证书照样固定下来给下次用）。"""
+        from tests.tls_test_cert import CERT_PEM
+        srv = self._tls()
+        r = self.client.post("/api/capability/pair",
+                             json={"base_url": srv.url, "code": "abc"})
+        self.assertEqual(r.status_code, 200, r.text)
+        stored = cred.load()
+        self.assertEqual(stored.cert_fingerprint, pairing.fingerprint_of(CERT_PEM))
 
 
 class MeetingDetailWiringTests(_Isolated):

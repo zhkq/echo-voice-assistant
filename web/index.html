@@ -253,17 +253,19 @@
                 title="不等 30 秒缓存，马上把所有后端重问一遍">刷新</button>
       </div>
       <div class="card-body">
-        <!-- 配对：地址 + 配对码。**刻意不藏**（配好之后也留着）——"换一台后端"与
-             "第一次配对"是同一件事，藏起来只会让人找不到入口。 -->
+        <!-- 配对：**粘一整串**（`echo://pair?host=…&code=…&fp=…`）或分开填地址+码。
+             **刻意不藏**（配好之后也留着）——"换一台后端"与"第一次配对"是同一件事，
+             藏起来只会让人找不到入口。 -->
         <div id="capPairBox" class="cap-pair">
           <div class="muted" style="font-size:12px">
             这台机器可以把 GPU 重活（会议转写 / 说话人分离 / 声纹）交给一台带显卡的
             ECHO 后端做。<b>音频会离开这台机器</b>，所以要不要用由你决定（见下面的「允许音频去哪」）。
-            管理员给你一张<b>配对码</b>，粘在这里就能用；除配对码外不用填别的东西。
+            管理员给你一张<b>配对码或配对串</b>（<code>echo://pair?host=…&amp;code=…&amp;fp=…</code>），
+            整串粘在下面第一个框里即可；串里带指纹时会 <b>校验证书</b>，那是防中间人的一步。
           </div>
           <div class="cap-pair-row">
             <input id="capPairUrl" class="ctl grow" type="text" spellcheck="false"
-                   placeholder="后端地址，例如 10.100.0.24:8900">
+                   placeholder="配对串（echo://pair?host=…）或后端地址，例如 10.100.0.24:8900">
             <input id="capPairCode" class="ctl" type="text" spellcheck="false"
                    placeholder="配对码" style="max-width:140px">
             <button class="btn" id="btnCapPair">配对</button>

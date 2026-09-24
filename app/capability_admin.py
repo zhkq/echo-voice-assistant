@@ -245,7 +245,8 @@ def view(force: bool = False) -> Dict[str, Any]:
 
 # ---------------------------------------------------------------- 动作
 
-def pair(base_url: str, code: str, client_name: str = "") -> tuple:
+def pair(base_url: str, code: str, client_name: str = "",
+         cert_fingerprint: str = "") -> tuple:
     """配对并落盘。返回 `(ok, 一句话)` —— 与 `router_admin` 那批同样的形状。
 
     **失败不抛给调用方**：配对失败是用户的日常（码抄错、机器没开、码用过了），
@@ -253,6 +254,10 @@ def pair(base_url: str, code: str, client_name: str = "") -> tuple:
 
     没给名字时用**这台机器的计算机名**：管理员那边 `--list-clients` 看到的清单才有意义
     （服务端只在配对码上没写名字时才用它，所以这不会盖掉管理员填的资产名）。
+
+    `cert_fingerprint` 来自配对串里的 `fp=`（设计 §7.5 ①）：给了就**必须对上**，
+    对不上就拒绝 —— 那才是"防中间人"的那一步。留空 = TOFU（第一次见谁信谁），
+    与以前的行为一致。
     """
     from app.capabilities import pairing
     if not str(client_name or "").strip():
@@ -262,7 +267,8 @@ def pair(base_url: str, code: str, client_name: str = "") -> tuple:
         except Exception:                                   # pragma: no cover
             client_name = ""
     try:
-        creds = pairing.pair(base_url, code, client_name=client_name)
+        creds = pairing.pair(base_url, code, client_name=client_name,
+                             cert_fingerprint=cert_fingerprint)
     except pairing.PairingError as e:
         return False, str(e)
     except Exception as e:                                  # pragma: no cover - 兜底

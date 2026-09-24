@@ -447,13 +447,41 @@ class EchoServerContractTests(_Contract, unittest.TestCase):
         self.assertIn(ctx.exception.reason, ("offline", "absent"))
 
     def test_not_configured_is_absent_and_says_so(self):
+        # `creds=False` = **就当本机没配对**（地址也不许从凭据里来）。
+        # 这一句不能省：没有它，"配没配"就取决于**跑测试的那台机器**配过对没有 ——
+        # 2026-09-24 真机上配对一次之后这条用例当场变红（`refresh()` 返回 True）。
         from app.capabilities.echo_server import EchoServerClient
-        c = EchoServerClient(base_url="")
+        c = EchoServerClient(base_url="", creds=False)
         self.assertFalse(c.refresh(force=True))
         self.assertFalse(c.ready())
         with self.assertRaises(CapabilityError) as ctx:
             c.transcribe(self.wav())
         self.assertEqual(ctx.exception.reason, "absent")
+
+    def test_the_non_paired_switch_really_ignores_credentials(self):
+        """`creds=False` 的**地址**也不许来自凭据 —— 注释与行为必须一致。
+
+        背景：这个开关原来只挡住 `self._creds`，而 `base_url` 照旧从凭据文件里取。
+        于是"没配对"这件事**取决于跑测试的机器**：一台真配过对的开发机上，
+        `test_not_configured_is_absent_and_says_so` 会红，而报错信息
+        （`refresh()` 返回 True）完全指不到原因。
+        """
+        import types
+        from unittest.mock import patch
+
+        from app.capabilities import credentials as cred_mod
+        from app.capabilities import echo_server as es
+        fake = types.SimpleNamespace(base_url="http://127.0.0.1:9", client_id="cli-x",
+                                     secret="s", cert_pem="", cert_fingerprint="")
+        with patch.object(cred_mod, "load", lambda: fake), \
+                patch.object(es, "_setting", lambda key, default=None: ""):
+            # 反面：默认（creds=None）时"只配对、什么都没配"是**能用状态**（§2.7 的取舍）
+            self.assertEqual(es.EchoServerClient().base_url, "http://127.0.0.1:9")
+            # 正面：说了"就当没配对"，地址也必须是空的
+            self.assertEqual(es.EchoServerClient(base_url="", creds=False).base_url, "")
+            # 显式传地址永远赢
+            self.assertEqual(es.EchoServerClient(base_url="http://x:1", creds=False).base_url,
+                             "http://x:1")
 
 
 # ================================================================ 铁律

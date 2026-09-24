@@ -11,8 +11,10 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import logging
 import os
+import ssl
 import time
 from contextlib import asynccontextmanager
 
@@ -244,13 +246,70 @@ def _fmt_time(ts) -> str:
     return "-" if ts <= 0 else time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
 
 
+def cert_fingerprint(certfile: str) -> str:
+    """证书指纹 `sha256:<hex>`（与客户端 `pairing.fingerprint_of` 同一算法）。
+
+    为什么服务端自己写一遍、不 import 客户端的：`server/` 是**可以单独部署**的那一半
+    （设计 §1），能少依赖一层就少一层。代价是"两处算同一个东西"可能漂移 ——
+    所以有一条跨层用例拿同一张证书比两边的输出（`test_server_contract.CertFingerprintTests`）。
+
+    读不到 / 解不开一律返回空串：调用方把空串当作"没有指纹可给"，**不编一个假的**。
+    """
+    try:
+        with open(certfile, "rb") as fh:
+            pem = fh.read().decode("utf-8", "replace")
+        der = ssl.PEM_cert_to_DER_cert(pem)
+    except Exception:
+        return ""
+    if not der:
+        return ""
+    return "sha256:" + hashlib.sha256(der).hexdigest()
+
+
+def advertised_host(listen: str, tls: bool) -> tuple:
+    """把 `server.listen` 变成**客户端能用**的 `scheme://host:port`。返回 `(地址, 备注)`。
+
+    两处不能照抄 `listen`：
+
+    * **通配地址对客户端没有意义**。出厂默认就是 `0.0.0.0:8900`；把这个抄进配对串，
+      同事粘出来的结果是一句"连不上"，而且完全看不出是地址的错。所以这里探测本机地址，
+      探不到就留一个**占位符**让人自己填 —— 宁可让人补一次，也不猜一个错的。
+    * **配了 TLS 就必须写 `https://`**。客户端对不带 scheme 的地址默认按 http 处理
+      （`pairing.normalize_base_url`），在 https 服务端上同样是"连不上"。
+    """
+    raw = str(listen or "")
+    host, _, port = raw.rpartition(":")
+    if not port:
+        host, port = raw, ""
+    host = host.strip()
+    note = ""
+    if host in ("", "0.0.0.0", "::", "[::]", "*"):
+        guess = ""
+        try:
+            import socket
+            guess = socket.gethostbyname(socket.gethostname())
+        except Exception:                                    # pragma: no cover - 兜底
+            guess = ""
+        host = guess or "<这台后端的主机名或IP>"
+        note = ("服务端监听的是通配地址 %s —— 上面这个地址是**本机探测到**的；"
+                "同事连不上就换成他们能访问到的那台机器的主机名或 IP。" % (raw or "(空)"))
+    return "%s://%s:%s" % ("https" if tls else "http", host, port), note
+
+
 def _print_pairing(code: str, cfg, name: str = "", scopes: str = "") -> None:
-    host = str(cfg.get("server.listen", ""))
     ttl_min = int(float(cfg.get("auth.pairing_ttl_s", 900)) / 60)
+    # 配对串里带上服务端标识与**证书指纹**（设计 §7.5 ①）：客户端粘一次就够了，
+    # 而 `fp=` 让这次带外传递把中间人也一并挡住 —— 没有它，第一次连接只能 TOFU。
+    # 没配 TLS 时**不写** `fp=`：写一个假指纹比不写更坏（客户端会拿它去校验 http）。
+    fp = cert_fingerprint(str(cfg.get("server.tls.certfile", "") or ""))
+    addr, note = advertised_host(str(cfg.get("server.listen", "")), bool(fp))
+    suffix = ("&fp=" + fp) if fp else ""
     print("配对码（%d 分钟内有效，只能用一次）：" % ttl_min)
-    # 配对串里带上服务端标识，客户端粘一次就够了（§7.5 ①）。
-    # **证书指纹**（§7.5 的 `fp=`）等 TLS 落地时再加 —— 现在写上去是假的。
-    print("     echo://pair?host=%s&code=%s" % (host, code))
+    print("     echo://pair?host=%s&code=%s%s" % (addr, code, suffix))
+    if note:
+        print("     （%s）" % note)
+    if not fp:
+        print("     （没配 TLS，所以串里没有 fp= —— 客户端这次只能 TOFU，即第一次见谁信谁）")
     if name or scopes:
         print("这台客户端将建为：名字=%s  scopes=%s"
               % (name or "(对端自报)", scopes or "(不限)"))
@@ -412,7 +471,9 @@ def _admin_cli(cfg, args) -> int:
                       % (args.set_quota, cfg.get("limits.daily_audio_minutes", 0)))
             # 两件必须说清楚的事，否则会被理解成"改了立刻全网生效、并且已用量归零"：
             print("注意：① **今天的已用量不清零**（额度是按自然日算的），只有上限变了；"
-                  "上限的下一个请求就生效（鉴权缓存到期最迟 %s 秒）。"
+                  "② 上限**最多 %s 秒**后才生效 —— 鉴权把客户端那一行缓存了那么久"
+                  "（2026-09-24 实测：改完立刻打还是 200，等缓存过期才是 429）。"
+                  "要它马上生效就重启服务端。"
                   % cfg.get("auth.client_cache_ttl_s", 60))
             print("      ② 用量计数在**进程内**，所以多实例部署时各实例各算一份"
                   "（设计 §7.2 写明的取舍）。")

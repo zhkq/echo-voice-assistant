@@ -153,6 +153,9 @@ class PairBackendIn(BaseModel):
     base_url: str = ""
     code: str = ""
     client_name: str = ""
+    # 配对串里的 `fp=sha256:…`（设计 §7.5 ①）。给了就必须对上 —— 对不上直接拒绝配对，
+    # 那才是"防中间人"的那一步；留空 = TOFU。
+    fingerprint: str = ""
 
 
 # ---------------------------------------------------------------- 能力路由（3.0）
@@ -191,7 +194,8 @@ def api_capability_pair(body: PairBackendIn, _auth=Depends(optional_auth)):
     """
     from app import capability_admin
     ok, message = capability_admin.pair(body.base_url, body.code,
-                                        client_name=body.client_name)
+                                        client_name=body.client_name,
+                                        cert_fingerprint=body.fingerprint)
     if not ok:
         raise HTTPException(status_code=400, detail=message)
     return {"ok": True, "message": message, "pair": capability_admin.pair_view()}

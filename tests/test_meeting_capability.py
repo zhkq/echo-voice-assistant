@@ -261,6 +261,89 @@ class SessionDecisionTests(unittest.TestCase):
         self.assertTrue(any("原因" in m for _lv, _s, m in logged),
                         "日志里要写出 skip 的原因（连不上 / privacy 不允许 …）")
 
+    def test_a_paired_only_machine_also_falls_back_LOUDLY(self):
+        """**只配对、设置里没填地址**的机器，后端不可用时同样要留一句话。
+
+        这条是 2026-09-24 真机联调后读代码发现的：那句告警原来只在
+        `capabilityEchoServerUrl` 非空时打，而"只配对、什么都没配"从 §2.7 起
+        就是一种**能用状态** —— 于是那台机器掉了后端会**一声不响**地退回本机引擎，
+        正是这条告警要防的那件事（现象只是"转写很慢"，本机那条路的日志一切正常）。
+        """
+        import app.meeting as meeting
+        from app.capabilities import echo_server
+        from app.capabilities.credentials import BackendCredentials
+        from app.config import settings
+        logged = []
+        real_get = settings.get
+        # 用**真的**凭据类型，不用 SimpleNamespace：能力层会问它 `token_fresh()`，
+        # 假对象少一个属性就变成另一条错误路径（第一版就踩了，日志是
+        # "能力路由不可用…has no attribute 'token_fresh'"，断言看着像没打日志）。
+        dead = BackendCredentials(base_url="http://127.0.0.1:1", client_id="cli-x", secret="s")
+
+        def fake_get(key, default=None):
+            if key == "capabilityEchoServerUrl":
+                return ""                      # 设置里**没填**
+            return real_get(key, default)
+
+        with patch.object(settings, "get", fake_get), \
+             patch.object(echo_server, "_creds", lambda: dead), \
+             patch.multiple("app.meeting.db",
+                            add_log=lambda level, src, msg: logged.append((level, src, msg))):
+            self.assertIsNone(meeting._capability_asr_session(CFG))
+        self.assertTrue([m for lv, src, m in logged
+                         if lv == "warn" and "仍走本机引擎" in m],
+                        "只配对没填地址的机器静默退化了：%s" % logged)
+
+    def test_configured_counts_pairing_too(self):
+        """`echo_server.configured()`：**设置或配对，任一个都算**。"""
+        from app.capabilities import echo_server
+        from app.capabilities.credentials import BackendCredentials
+        with patch.object(echo_server, "_setting", lambda k, d=None: ""), \
+             patch.object(echo_server, "_creds", lambda: None):
+            self.assertFalse(echo_server.configured())
+        with patch.object(echo_server, "_setting", lambda k, d=None: "http://x:1"), \
+             patch.object(echo_server, "_creds", lambda: None):
+            self.assertTrue(echo_server.configured())
+        with patch.object(echo_server, "_setting", lambda k, d=None: ""), \
+             patch.object(echo_server, "_creds",
+                          lambda: BackendCredentials(base_url="http://y:2", client_id="c",
+                                                     secret="s")):
+            self.assertTrue(echo_server.configured(), "只配对也算配了")
+
+
+class StalePlanMustNotSurviveTests(unittest.TestCase):
+    """重转一场会时，**上一场的路由结论不许留下来**（2026-09-24 真机现场抓到）。
+
+    现场：先把 privacy 改成 `none`（于是计划阶段就用不上后端）再重转同会议 ——
+    `meta.json` 里的 `capability` 还是上一次那份，详情页写着"转写文本 → ECHO 后端"，
+    而这一场其实是**本机**转的。页面说的与实际用的不一致，比不显示更糟。
+    """
+
+    def test_a_capability_run_writes_the_plan(self):
+        from app.meeting import _apply_capability_meta
+        plan = {"picks": {"asr.text": {"backendId": "echo-server"}}}
+        meta = _apply_capability_meta({}, plan, {"estimated": 2})
+        self.assertEqual(meta["capability"], plan)
+        self.assertEqual(meta["timestampsKinds"], {"estimated": 2})
+
+    def test_a_local_run_drops_the_previous_plan(self):
+        from app.meeting import _apply_capability_meta
+        meta = {"capability": {"picks": {"asr.text": {"backendId": "echo-server"}}},
+                "timestampsKinds": {"estimated": 2}, "config": {"sttModel": "sensevoice"}}
+        _apply_capability_meta(meta, None, {})
+        self.assertNotIn("capability", meta, "上一场的执行计划留下来了 —— 页面会说谎")
+        self.assertNotIn("timestampsKinds", meta)
+        self.assertEqual(meta["config"], {"sttModel": "sensevoice"}, "别的键不能被误删")
+
+    def test_a_plan_without_timestamp_kinds_is_still_recorded(self):
+        """有计划、但这一段没拿到时间轴档位（空文本段）→ 只删时间轴那一项。"""
+        from app.meeting import _apply_capability_meta
+        plan = {"picks": {}}
+        meta = {"timestampsKinds": {"estimated": 2}}
+        _apply_capability_meta(meta, plan, {})
+        self.assertEqual(meta["capability"], plan)
+        self.assertNotIn("timestampsKinds", meta)
+
 
 class MeetingMetaTests(unittest.TestCase):
     """`meeting.meeting_meta()`：会议详情要读的那份"录音当时"的快照。

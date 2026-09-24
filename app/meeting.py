@@ -405,6 +405,30 @@ def _transcribe_meeting(folder):
         print(msg, file=sys.stderr)
 
 
+def _apply_capability_meta(meta: dict, cap_plan, cap_kinds) -> dict:
+    """把这一场的路由结论写进 `meta`；**没走能力层时要把上一场的结论删掉**。
+
+    为什么"删"这一步是必须的（2026-09-24 真机联调现场抓到）：`meta.json` 是**同一场会
+    反复重转时被覆盖写的**，而这两行只在走能力层时才写。于是"上一次走了 ECHO 后端、
+    这一次退回本机老路"（privacy 改成 none、或后端在计划阶段就用不上）之后，
+    详情页上那行仍然是上一次的 `转写文本 → ECHO 后端` —— 而这一场其实是本机转的。
+    `web/meeting.html` 里那句注释说得对：**"页签说会走 GPU、实际走了本机"这种对不上，
+    比不显示更糟。**
+
+    没走能力层时**不写一个"本机"占位**：面板那块在"没有数据"时是隐藏的，
+    而这台机器为什么退回本机，日志里有那句"配了能力后端，但本场仍走本机引擎 —— 原因：…"。
+    """
+    if cap_plan is not None:
+        meta["capability"] = cap_plan
+    else:
+        meta.pop("capability", None)
+    if cap_kinds:
+        meta["timestampsKinds"] = dict(cap_kinds)
+    else:
+        meta.pop("timestampsKinds", None)
+    return meta
+
+
 def _capability_asr_session(cfg):
     """本场是否走**能力后端**。返回 `(router, need)` 或 `None`。
 
@@ -430,7 +454,12 @@ def _capability_asr_session(cfg):
             # 实际在啃本机 CPU，而现象只是"转写很慢"（本机那条路的日志一切正常）。
             # 最常见的两种：后端地址配了但连不上（capabilities 拉不回来 → 不支持任何槽）、
             # 或者 privacy 设成了 none。
-            if str(settings.get("capabilityEchoServerUrl", "") or "").strip():
+            #
+            # 判据是 `echo_server.configured()`（设置里填了地址**或配对过**），不是只看设置：
+            # "只配对、什么都没配"从 §2.7 起就是能用状态，只看设置的话那台机器掉了后端
+            # 会一声不响地退回本机 —— 而"不声不响"恰恰是这条告警要防的那件事。
+            from app.capabilities import echo_server as _echo_backend
+            if _echo_backend.configured():
                 why = "；".join("%s(%s)" % (s.backend_id or "-", s.reason)
                                for s in plan.skipped if s.slot == "asr.text") or "没配可用后端"
                 db.add_log("warn", "capability",
@@ -789,10 +818,7 @@ def _transcribe_impl(folder):
         # 3.0：把这次"用了谁/跳过了谁/为什么"与时间轴档位落盘。
         # 为什么每次都写：转写可能中途崩/被重启，**已完成的段也要留下当时的路由结论**，
         # 否则事后只能看到"转了一半"，而不知道为什么后半段没走。
-        if cap_plan is not None:
-            meta["capability"] = cap_plan
-        if cap_kinds:
-            meta["timestampsKinds"] = dict(cap_kinds)
+        _apply_capability_meta(meta, cap_plan, cap_kinds)
         with open(os.path.join(folder, "meta.json"), "w", encoding="utf-8") as f:
             json.dump(meta, f, ensure_ascii=False, indent=2)
 

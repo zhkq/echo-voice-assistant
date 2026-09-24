@@ -6,11 +6,16 @@
 这类故障**没有报错**，只有"服务看起来没起来"，所以必须有测试钉住。
 """
 import os
+import ssl
 import unittest
+import urllib.error
 import urllib.request
 from unittest.mock import patch
 
 from app import netlocal
+from app.capabilities import pairing
+from tests.test_backend_tls import _HttpsServer
+from tests.tls_test_cert import CERT_PEM, OTHER_CERT_PEM
 
 
 class IsLoopbackTests(unittest.TestCase):
@@ -130,6 +135,85 @@ class InstallBypassTests(unittest.TestCase):
         with patch.object(netlocal._DIRECT_OPENER, "open", return_value="DIRECT") as direct:
             self.assertEqual(urllib.request.urlopen(req), "DIRECT")
             direct.assert_called_once()
+
+
+class TlsKwargsThroughBypassTests(unittest.TestCase):
+    """**回环 + 证书固定必须能一起用**（2026-09-24 真机踩坑，专门钉住）。
+
+    真机现象：配了 `echo-server` 后端之后，能力层报
+    ``OpenerDirector.open() got an unexpected keyword argument 'context'`` ——
+    后端在本机（`127.0.0.1:8900`）走的是回环分支，而回环分支把 `context=` 原样透传给了
+    `_DIRECT_OPENER.open()`。`context` 是 **`urlopen()` 的形参**（它内部拿去建 `HTTPSHandler`），
+    `open()` 根本不认；于是**每一个**请求都发不出去。
+
+    为什么单测没拦住：全局转发只在 `app/main.py` 里装，而这一层用例（`InstallBypassTests`）
+    只测了"回环走无代理 opener"，**没有一条带着 `context` 走**。所以这里补的就是那个组合，
+    而且是**真握手**（真 https 服务端 + 真固定证书），不是打桩。
+    """
+
+    def setUp(self):
+        self._saved = {k: os.environ.get(k) for k in ("NO_PROXY", "no_proxy")}
+        netlocal.uninstall_loopback_bypass()
+        self.addCleanup(netlocal.uninstall_loopback_bypass)
+        self.addCleanup(self._restore_env)
+
+    def _restore_env(self):
+        for k, v in self._saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def test_a_bare_context_kwarg_is_not_forwarded_to_open(self):
+        """最小复现：`context=None`（http 调用每次都带）不许进 `open()`。"""
+        netlocal.install_loopback_bypass()
+        with patch.object(netlocal._DIRECT_OPENER, "open", return_value="DIRECT") as direct:
+            got = urllib.request.urlopen("http://127.0.0.1:1/x", timeout=1, context=None)
+            self.assertEqual(got, "DIRECT")
+            direct.assert_called_once()
+            self.assertNotIn("context", direct.call_args.kwargs, "context 又被塞进 open() 了")
+
+    def test_the_pinned_https_call_really_completes(self):
+        """正向：装转发 + 固定证书 + 回环 https → 真拿到响应。"""
+        srv = _HttpsServer()
+        self.addCleanup(srv.stop)
+        netlocal.install_loopback_bypass()
+        req = urllib.request.Request(srv.url + "/v1/pair", data=b"{}", method="POST")
+        ctx = pairing.pinned_context(CERT_PEM)
+        with urllib.request.urlopen(req, timeout=5, context=ctx) as resp:
+            self.assertEqual(resp.status, 200)
+            self.assertIn(b"cli-tls", resp.read())
+
+    def test_the_module_level_helper_takes_a_context_too(self):
+        """`netlocal.urlopen()` 与标准库同形，`context` 也得认（两条路不许漂移）。"""
+        srv = _HttpsServer()
+        self.addCleanup(srv.stop)
+        req = urllib.request.Request(srv.url + "/v1/pair", data=b"{}", method="POST")
+        with netlocal.urlopen(req, timeout=5, context=pairing.pinned_context(CERT_PEM)) as resp:
+            self.assertEqual(resp.status, 200)
+
+    def test_a_wrong_pin_is_still_rejected_through_the_bypass(self):
+        """**固定还在生效**：拿别人的证书当固定证书，必须连不上。
+
+        没有这条，一个"把 context 直接丢掉"的修法也能让上面两条绿 —— 那等于关掉校验。
+        """
+        srv = _HttpsServer()
+        self.addCleanup(srv.stop)
+        netlocal.install_loopback_bypass()
+        req = urllib.request.Request(srv.url + "/v1/pair", data=b"{}", method="POST")
+        ctx = pairing.pinned_context(OTHER_CERT_PEM)
+        with self.assertRaises((urllib.error.URLError, ssl.SSLError)):
+            urllib.request.urlopen(req, timeout=5, context=ctx)
+
+    def test_external_calls_get_the_context_back(self):
+        """外部地址那条分支：摘下来的 TLS 形参要**还回**标准库，不能吞掉。"""
+        netlocal.install_loopback_bypass()
+        sentinel = object()
+        with patch.object(netlocal, "_ORIGINAL_URLOPEN", return_value="NORMAL") as normal:
+            self.assertEqual(
+                urllib.request.urlopen("https://pypi.org/simple/", timeout=2, context=sentinel),
+                "NORMAL")
+        self.assertIs(normal.call_args.kwargs.get("context"), sentinel)
 
 
 if __name__ == "__main__":

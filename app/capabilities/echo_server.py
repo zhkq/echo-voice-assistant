@@ -70,15 +70,20 @@ def _creds():
         return None
 
 
-def _base_url_from_settings() -> str:
+def _base_url_from_settings(*, use_credentials: bool = True) -> str:
     """后端地址：**设置里填的优先**，没填就用配对时记下的那个。
 
     顺序这么定是因为两种来源的语义不同：设置里的是"运营让我连这台"，
     凭据里的是"我配对时连的是这台"。前者是显式配置，该赢。
+
+    `use_credentials=False`（= 构造时传了 `creds=False`）连凭据都不看 —— 那是
+    "就当本机没配对"这条断言的唯一正确读法（见 `__init__` 的注释）。
     """
     url = str(_setting("capabilityEchoServerUrl", "") or "").strip().rstrip("/")
     if url:
         return url
+    if not use_credentials:
+        return ""
     c = _creds()
     return str(getattr(c, "base_url", "") or "").strip().rstrip("/")
 
@@ -114,10 +119,15 @@ class EchoServerClient(CapabilityClient):
     def __init__(self, base_url: str = "", token: str = "", *,
                  backend_id: str = "", timeout_infer: float = INFER_TIMEOUT_S,
                  creds: Optional[Any] = None):
-        self.base_url = (base_url or _base_url_from_settings()).rstrip("/")
-        self._token = token or _token_from_settings()
         # `creds=None` 表示"自己去读一次"；显式传 `False` 表示"就当本机没配对"
-        # （测试要能明确地说"这次不要碰凭据文件"）
+        # —— 连**地址**都不许从凭据里来。原来只挡住了 `self._creds`，地址照旧从凭据文件
+        # 读出来，于是这句开关名不副实：`EchoServerClient(base_url="")` 到底算不算"配了"，
+        # 取决于**跑它的那台机器有没有配过对**（2026-09-24 在这台机器上真配了一次之后，
+        # `test_not_configured_is_absent_and_says_so` 当场变红，根因就是这里）。
+        use_creds = creds is not False
+        self.base_url = (base_url or _base_url_from_settings(
+            use_credentials=use_creds)).rstrip("/")
+        self._token = token or _token_from_settings()
         self._creds = _creds() if creds is None else (creds or None)
         if backend_id:
             self.backend_id = backend_id
@@ -405,6 +415,17 @@ def _new_request_id() -> str:
 
 # `urllib.parse.quote` 要用到，但只在这一个地方 —— 放模块底下省一次 import 开销
 import urllib.parse  # noqa: E402
+
+
+def configured() -> bool:
+    """本机**配没配**这个后端：设置里填了地址，**或者配对过**。
+
+    与"连得上吗"无关 —— 它回答的是"这台机器到底认不认一个能力后端"。
+    为什么要一个公开入口：`app/meeting.py` 要判断"该不该为'退回了本机'留一句话"。
+    以前那里只看 `capabilityEchoServerUrl` 非不非空，而"只配对、什么都没配"
+    从 §2.7 起就是一种**能用状态** —— 于是那种机器掉了后端会一声不响地退回本机。
+    """
+    return bool(_base_url_from_settings())
 
 
 def client_from_settings() -> Optional[EchoServerClient]:
