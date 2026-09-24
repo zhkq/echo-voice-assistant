@@ -400,12 +400,20 @@ def _sources_for_privacy(privacy: str) -> set:
 
 
 def _setting_key_for(slot: str) -> str:
-    """槽 → "用哪个后端"那个设置键。"""
+    """槽 → "用哪个后端"那个设置键。
+
+    `diarize.turn_embeddings` 与 `diarize.turns` / `diarize.embeddings` **归同一个设置**：
+    说话人这一族必须同源（`SAME_SOURCE_SLOTS`），给它们各自一个设置项只会让人配出
+    "时间轴走 ECHO、嵌入走本机"这种**标签对不上**的组合。
+    （这一条是被 `test_both_directions_agree` 抓出来的：面板那边列了它，这里漏了，
+    表现会是"设置里明明选了 ECHO，某个槽还是按自动挑"。）
+    """
     return {
         "asr.text": "capabilityMeetingAsrBackend",
         "asr.timestamps": "capabilityMeetingAsrBackend",
         "diarize.turns": "capabilityDiarizeBackend",
         "diarize.embeddings": "capabilityDiarizeBackend",
+        "diarize.turn_embeddings": "capabilityDiarizeBackend",
         "speaker.embed": "capabilityEmbedBackend",
     }.get(slot, "")
 
@@ -427,18 +435,20 @@ def _default_log(level, source, message):
 
 
 def build_default_router(settings_get=None, log=None) -> CapabilityRouter:
-    """按设置造一个路由器：本机 + （配了地址才有的）ECHO 后端。
+    """按设置造一个路由器：本机 + （配了地址**或配过对**才有的）ECHO 后端。
 
     内网公共服务（`intranet`）**还没做**（那是施工顺序的 step 2），
     所以这里不造它 —— 造一个空壳只会让"配了却永远失败"变成一个谜。
     """
     from app.capabilities.local import LocalCapabilityClient
+    from app.capabilities.echo_server import client_from_settings
 
     clients: List[CapabilityClient] = [LocalCapabilityClient()]
-    get = settings_get or _default_setting
-    if str(get("capabilityEchoServerUrl", "") or "").strip():
-        from app.capabilities.echo_server import EchoServerClient
-        c = EchoServerClient()
+    # 地址有两个来源（设置里填的、配对时记下的），`client_from_settings()` 已经定好顺序；
+    # 这里**只问它**，不再自己判断 `capabilityEchoServerUrl` —— 曾经就是这样，
+    # 于是"只配对、什么都没配"的那台机器根本不会把后端交给路由。
+    c = client_from_settings()
+    if c is not None:
         c.refresh()                     # 拉一次 capabilities（失败不抛，只是不支持任何槽）
         clients.append(c)
     return CapabilityRouter(clients, settings_get=settings_get, log=log)

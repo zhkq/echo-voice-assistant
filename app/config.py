@@ -902,7 +902,7 @@ class Settings:
             return DEFAULTS[key]["value"]
         return default
 
-    def all(self):
+    def all(self, include_hidden: bool = False):
         """合并 DB 元数据与当前值，返回面板可直接渲染的列表。
 
         被剔除的项（面板与 /api/settings 都看不到，但值仍留在库里、get() 依然可读）：
@@ -912,6 +912,12 @@ class Settings:
 
         每行带 `order`（= DEFAULTS 里的声明顺序）：库层返回的是 (grp, key) 字母序，
         光靠它无法表达"三个提示音开关要挨在一起"这类编排，面板据此字段排序。
+
+        `include_hidden=True` 给**那些自定义 UI 自己**用（2026-09-24，「能力路由」那一批：
+        它们全是 hidden，由那个页签承载）。**用同一个函数出同一形状的行**，
+        而不是让每个自定义页签各自拼一个 —— 那正是"同一份事实算两遍"，
+        迟早出现"设置页能改、页签里的下拉缺一项"这种对不上的现象。
+        默认 False，所以 `/api/settings` 的行为一个字都没变。
 
         **密钥（``secret=True``）在这里被遮掉**（P5 凭据管理）：这一层是所有出口的必经之路
         （`/api/settings`、面板、将来的手机端），所以在源头遮一次，而不是指望每个消费方
@@ -923,7 +929,9 @@ class Settings:
         out = []
         for r in rows:
             meta = DEFAULTS.get(r["key"], {})
-            if meta.get("deprecated") or meta.get("hidden"):
+            if meta.get("deprecated"):
+                continue
+            if meta.get("hidden") and not include_hidden:
                 continue
             r = dict(r)
             r["order"] = SETTING_ORDER.get(r["key"], len(DEFAULTS))

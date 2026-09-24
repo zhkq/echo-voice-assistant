@@ -1958,6 +1958,9 @@ async function loadCapabilities() {
       .filter((f) => ["wake", "diar", "vp", "dev"].indexOf(f.id) >= 0).map(renderModelCard).join("");
     renderCapEnv();
     bindCapCards();
+    // GPU 后端卡（能力路由）。**排在主清单之后**：它是一次轻量请求，
+    // 主清单失败也要能看到后端状态（反过来也一样，两边各自兜自己的错）。
+    await loadCapabilityRouting();
     applyCollapsedCards($("#view-capabilities"));   // 应用上次的卡片折叠状态（动态卡片要重绘后应用）
     const active = modelsRes.jobs && modelsRes.jobs.active;
     if (active && !_capPoll) _capPoll = setInterval(loadCapabilities, 1500);
@@ -1982,6 +1985,156 @@ const _btnCapReload = $("#btnCapReload");
 if (_btnCapReload) _btnCapReload.addEventListener("click", () => loadCapabilities());
 const _btnCapDlMissing = $("#btnCapDownloadMissing");
 if (_btnCapDlMissing) _btnCapDlMissing.addEventListener("click", () => downloadMissingModels());
+
+
+/* ================= GPU 后端（能力路由，3.0）=================
+
+   为什么长在「能力」页签里、而不是单开一个页签：用户 2026-09-19 明确要求
+   "每个能力只在这一处出现"（当时模型页签 / 组件页签 / 设置里的 provider 卡片三处
+   都在讲同一件事，被合并成这一个页签）。"这个能力用哪个实现"与"用本机还是用那台
+   GPU"是同一个问题的两半，再开一页就是走回那次合并之前。
+
+   三条设计：
+   1. **这里不算"会选中谁"** —— 那是 `router.plan` 的唯一职责（会议主链路用的就是它）。
+      页签只显示事实：每个后端自己声明了什么、健不健康、配置选的是哪个。
+      这里再算一遍，迟早出现"页签说会走 GPU、实际走了本机"。
+   2. 设置行**由后端出**（`/api/capability` 的 `settings`，形状与设置页相同），
+      用同一个 `renderSettingRow` 渲染 —— 那几项是 hidden，不出现在设置页。
+   3. 配对失败**显示成一句人话**（后端也是这么回的），不是一串 HTTP 报错。 */
+let _capRouteCache = null;
+
+function capBackendBadge(b) {
+  if (b.ready === true) return `<span class="badge online">可用</span>`;
+  if (b.ready === false) return `<span class="badge offline">不可用</span>`;
+  return `<span class="badge idle">未知</span>`;
+}
+
+function renderCapBackends(rows) {
+  const host = $("#capBackendList");
+  if (!host) return;
+  if (!rows.length) { host.innerHTML = ""; return; }
+  const src = { local: "这台机器", lan: "内网", wan: "公网" };
+  host.innerHTML = rows.map((b) => {
+    const slots = (b.slotsLabeled || []).map((s) => s.label).join("、") || "（什么都没声明）";
+    const extra = b.capsError
+      ? `<div class="cap-be-slots">读不到能力清单：${esc(b.capsError)}</div>` : "";
+    return `<div class="cap-be-row">
+      <span class="cap-be-name">${esc(b.label || b.backendId)}</span>
+      ${capBackendBadge(b)}
+      <span class="muted" style="font-size:12px">${esc(src[b.source] || b.source || "")}${b.serverName ? " · " + esc(b.serverName) : ""}</span>
+      <div class="cap-be-slots">能做：${esc(slots)}</div>
+      ${extra}
+    </div>`;
+  }).join("");
+}
+
+function renderCapPairState(pair) {
+  const state = $("#capPairState");
+  if (!state) return;
+  if (!pair || !pair.paired) {
+    state.textContent = "还没配对 —— 这台机器只用本机引擎。";
+    return;
+  }
+  const token = pair.tokenFresh ? "令牌有效" : "下次调用时自动换令牌";
+  state.textContent = `已配对：${pair.serverName || pair.baseUrl}（${pair.clientId}）· ${token}`;
+}
+
+async function loadCapabilityRouting(force) {
+  const host = $("#capRouteSettings");
+  if (!host) return;
+  const badge = $("#capRouteBadge");
+  try {
+    const r = force
+      ? await api("/api/capability/probe", { method: "POST" })
+      : await api("/api/capability");
+    _capRouteCache = r;
+    renderCapPairState(r.pair);
+    renderCapBackends(r.backends || []);
+    // 配对输入框**不隐藏**：换一台后端（先解除配对、再配一次）与"第一次配对"
+    // 是同一件事，藏起来只会让人找不到入口。
+    const unpair = $("#btnCapUnpair");
+    if (unpair) unpair.classList.toggle("hidden", !(r.pair && r.pair.paired));
+    host.innerHTML = (r.settings || []).map(renderSettingRow).join("")
+      || `<div class="muted" style="font-size:12px">没有可显示的路由项。</div>`;
+    const n = (r.backends || []).filter((b) => b.backendId !== "local").length;
+    if (badge) {
+      badge.textContent = n ? `${n} 个后端` : "只用本机";
+      badge.className = "badge " + (n ? "online" : "idle");
+    }
+  } catch (e) {
+    host.innerHTML = `<div class="muted" style="font-size:12px">读取失败：${esc(e.message)}</div>`;
+    if (badge) { badge.textContent = "读取失败"; badge.className = "badge offline"; }
+  }
+}
+
+async function saveCapabilityRouting() {
+  const host = $("#capRouteSettings");
+  const state = $("#capRouteSaveState");
+  if (!host || !_capRouteCache) return;
+  const values = {};
+  $$("#capRouteSettings [data-key]").forEach((el) => {
+    const meta = (_capRouteCache.settings || []).find((s) => s.key === el.dataset.key);
+    if (!meta) return;
+    if (meta.value_type === "bool") values[meta.key] = el.checked;
+    else if (meta.value_type === "int") values[meta.key] = parseInt(el.value, 10) || 0;
+    else values[meta.key] = el.value;
+  });
+  if (!Object.keys(values).length) { toast("没有需要保存的项"); return; }
+  try {
+    await api("/api/settings", { method: "PUT", body: JSON.stringify({ values }) });
+    toast("已保存 " + Object.keys(values).length + " 项能力路由设置");
+    if (state) state.textContent = "已保存";
+    await loadCapabilityRouting();
+  } catch (e) {
+    toast("保存失败：" + e.message);
+    if (state) state.textContent = "保存失败";
+  }
+}
+
+async function doCapabilityPair() {
+  const url = ($("#capPairUrl") || {}).value || "";
+  const code = ($("#capPairCode") || {}).value || "";
+  const state = $("#capPairState");
+  if (!url.trim()) { toast("先填后端地址"); return; }
+  if (!code.trim()) { toast("先填配对码"); return; }
+  if (state) state.textContent = "正在配对…";
+  try {
+    const r = await api("/api/capability/pair", {
+      method: "POST",
+      body: JSON.stringify({ base_url: url, code: code }),
+    });
+    toast(r.message || "配对成功");
+    const c = $("#capPairCode"); if (c) c.value = "";
+    await loadCapabilityRouting(true);
+  } catch (e) {
+    // 400 的 body 是 {"detail": "一句人话"}（后端就是这么回的）。原样显示那条，
+    // 而不是把 `HTTP 400: {...}` 糊到人脸上。
+    let msg = e.message;
+    const m = /^\s*HTTP \d+:\s*(\{.*\})$/s.exec(msg);
+    if (m) { try { msg = JSON.parse(m[1]).detail || msg; } catch (_) { /* 原样 */ } }
+    if (state) state.textContent = msg;
+    toast(msg, 6000);
+  }
+}
+
+async function doCapabilityUnpair() {
+  if (!window.confirm("解除配对？\n\n这只是让这台机器忘掉后端凭据；"
+    + "服务端那本客户端清单归管理员。再要用得让管理员重新发一张配对码。")) return;
+  try {
+    const r = await api("/api/capability/unpair", { method: "POST" });
+    toast(r.message || "已解除配对");
+    await loadCapabilityRouting(true);
+  } catch (e) { toast("解除配对失败：" + e.message); }
+}
+
+const _btnCapPair = $("#btnCapPair");
+if (_btnCapPair) _btnCapPair.addEventListener("click", doCapabilityPair);
+const _btnCapUnpair = $("#btnCapUnpair");
+if (_btnCapUnpair) _btnCapUnpair.addEventListener("click", doCapabilityUnpair);
+const _btnCapRouteSave = $("#btnCapRouteSave");
+if (_btnCapRouteSave) _btnCapRouteSave.addEventListener("click", saveCapabilityRouting);
+const _btnCapRouteProbe = $("#btnCapRouteProbe");
+if (_btnCapRouteProbe) _btnCapRouteProbe.addEventListener("click", () => loadCapabilityRouting(true));
 
 
 

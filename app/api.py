@@ -144,6 +144,69 @@ class KeyCreateIn(BaseModel):
     name: str = "mobile"
 
 
+class PairBackendIn(BaseModel):
+    """配对一台 ECHO 能力后端。
+
+    `client_name` 是**对端自报的名字**，服务端只在配对码上没写名字时才用它
+    （管理员在码上填的名字是资产清点，不能被自报的盖掉，见服务端 §7.4）。
+    """
+    base_url: str = ""
+    code: str = ""
+    client_name: str = ""
+
+
+# ---------------------------------------------------------------- 能力路由（3.0）
+#
+# 这几个端点背后的活都在 `app/capability_admin.py`。刻意**不在 api.py 里算**：
+# 页面要的是一份"后端们现在是什么样"的快照，而这份快照的每一格都来自后端自己的
+# `describe()` —— 在路由层再算一遍就会出现两种说法（见那个模块开头的说明）。
+
+@router.get("/capability")
+def api_capability(_auth=Depends(optional_auth)):
+    """「能力路由」页签的全部数据：配对状态 + 每个后端 + 每个用途选的哪个后端。"""
+    from app import capability_admin
+    return capability_admin.view()
+
+
+@router.post("/capability/probe")
+def api_capability_probe(_auth=Depends(optional_auth)):
+    """立即重问一遍所有后端（面板上的「刷新」）。
+
+    与 `GET /capability` 的区别只有一个：**这次真的去问**（不吃 30 秒的缓存）。
+    失败**不报错** —— 后端连不上正是这个按钮要告诉人的事，它会体现在 `describe()` 里。
+    """
+    from app import capability_admin
+    ok, payload = capability_admin.probe()
+    if not ok:
+        raise HTTPException(status_code=503, detail=payload.get("error") or "刷新失败")
+    return payload
+
+
+@router.post("/capability/pair")
+def api_capability_pair(body: PairBackendIn, _auth=Depends(optional_auth)):
+    """用配对码换凭据并落盘（`{DATA}/backend.json`，Windows 走 DPAPI）。
+
+    **失败回 400 + 一句人话**，不是 500：配对码抄错、机器没开、码用过了，
+    这些都是日常，界面要能直接显示出来。
+    """
+    from app import capability_admin
+    ok, message = capability_admin.pair(body.base_url, body.code,
+                                        client_name=body.client_name)
+    if not ok:
+        raise HTTPException(status_code=400, detail=message)
+    return {"ok": True, "message": message, "pair": capability_admin.pair_view()}
+
+
+@router.post("/capability/unpair")
+def api_capability_unpair(_auth=Depends(optional_auth)):
+    """解除配对（只忘掉本机凭据）。"""
+    from app import capability_admin
+    ok, message = capability_admin.unpair()
+    if not ok:
+        raise HTTPException(status_code=400, detail=message)
+    return {"ok": True, "message": message, "pair": capability_admin.pair_view()}
+
+
 # ---------------------------------------------------------------- 状态与配置
 @router.get("/status")
 def api_status(_auth=Depends(optional_auth)):

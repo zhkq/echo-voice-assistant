@@ -245,6 +245,44 @@
         下拉与开关都是选中即生效；密钥只存本机、接口永不回显；标「出网」的会把数据发到外部服务。
       </div>
     </div>
+    <div class="card" id="capRouteCard">
+      <div class="card-title"><span class="ic">🖥️</span>GPU 后端（ECHO 能力后端）
+        <span class="badge idle" id="capRouteBadge">读取中…</span>
+        <span class="spacer"></span>
+        <button class="btn mini" id="btnCapRouteProbe"
+                title="不等 30 秒缓存，马上把所有后端重问一遍">刷新</button>
+      </div>
+      <div class="card-body">
+        <!-- 配对：地址 + 配对码。**刻意不藏**（配好之后也留着）——"换一台后端"与
+             "第一次配对"是同一件事，藏起来只会让人找不到入口。 -->
+        <div id="capPairBox" class="cap-pair">
+          <div class="muted" style="font-size:12px">
+            这台机器可以把 GPU 重活（会议转写 / 说话人分离 / 声纹）交给一台带显卡的
+            ECHO 后端做。<b>音频会离开这台机器</b>，所以要不要用由你决定（见下面的「允许音频去哪」）。
+            管理员给你一张<b>配对码</b>，粘在这里就能用；除配对码外不用填别的东西。
+          </div>
+          <div class="cap-pair-row">
+            <input id="capPairUrl" class="ctl grow" type="text" spellcheck="false"
+                   placeholder="后端地址，例如 10.100.0.24:8900">
+            <input id="capPairCode" class="ctl" type="text" spellcheck="false"
+                   placeholder="配对码" style="max-width:140px">
+            <button class="btn" id="btnCapPair">配对</button>
+            <button class="btn hidden" id="btnCapUnpair"
+                    title="让这台机器忘掉后端凭据（服务端那本清单归管理员）">解除配对</button>
+          </div>
+          <div class="muted" id="capPairState" style="font-size:12px"></div>
+        </div>
+        <div id="capBackendList" class="cap-prov"></div>
+        <!-- 「开会转写 / 说话人分离 / 声纹」分别用哪个后端（+ 允许音频去哪）。
+             这几行由 renderSettingRow 渲染（与设置页同一套标签/下拉/说明），
+             数据来自 /api/capability 的 settings —— 它们本身是 hidden，不出现在设置页。 -->
+        <div id="capRouteSettings" class="settings-form"></div>
+        <div class="cap-pair-row" style="padding-top:8px">
+          <button class="btn" id="btnCapRouteSave">保存</button>
+          <span class="muted" id="capRouteSaveState" style="font-size:12px"></span>
+        </div>
+      </div>
+    </div>
     <div class="model-cards" id="capKindCards"></div>
     <div class="model-cards" id="capFuncCards"></div>
     <div id="capEnvHost"></div>

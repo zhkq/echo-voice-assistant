@@ -1057,3 +1057,13 @@ main { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
   padding: 6px 0; border-bottom: 1px solid var(--border); }
 .wiz-done-ok { font-size: 15px; margin: 6px 0; }
 .wiz-next { margin: 10px 0; line-height: 1.75; }
+
+/* ============ GPU 后端（能力路由，3.0）============
+   配对那一行 + 每个后端一行。窄边条里同样要能收缩（见 docs/面板布局-窄边条.md：
+   默认 min-width:auto 会被内容顶住不让收缩）。 */
+.cap-pair-row { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; min-width: 0; padding: 6px 0; }
+.cap-pair-row > .ctl { min-width: 0; max-width: 100%; }
+.cap-be-row { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; min-width: 0;
+  padding: 6px 0; border-top: 1px solid var(--border); }
+.cap-be-row > .cap-be-name { font-weight: 600; min-width: 0; }
+.cap-be-slots { font-size: 12px; color: var(--muted); min-width: 0; }

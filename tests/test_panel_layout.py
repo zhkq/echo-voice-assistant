@@ -70,6 +70,15 @@ class PanelLayoutContractTests(unittest.TestCase):
         self._assert_has(".cap-pick", "min-width: 0")
         self._assert_has(".cap-prov", "min-width: 0")
 
+    def test_gpu_backend_rows_can_shrink(self):
+        """「GPU 后端」卡（能力路由）的两行同理：地址输入框 + 后端名 + 徽章是一排 flex 兄弟。
+
+        这几个选择器是 2026-09-24 加的；**加新行就顺手加上这一条** —— 那次整页出血
+        就是从"看起来多余的 `min-width: 0`"被删掉开始的。
+        """
+        self._assert_has(".cap-pair-row", "display: flex", "flex-wrap: wrap", "min-width: 0")
+        self._assert_has(".cap-be-row", "display: flex", "flex-wrap: wrap", "min-width: 0")
+
     def test_collapsible_cards_have_styles(self):
         """可折叠卡片：折叠时藏 body、箭头转向 —— `.card` 与能力页签的 `.mcard` 都支持。"""
         self.assertIn(".card.collapsible.collapsed > .card-body", self.css)

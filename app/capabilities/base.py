@@ -384,6 +384,18 @@ class CapabilityClient(abc.ABC):
         """True / False / None（判不了）。**不抛异常。**"""
         return True
 
+    def refresh(self, force: bool = False) -> bool:
+        """重新问一遍"你能干什么"，写回 `provides` / `vector_space_id`。
+
+        本机后端**不需要**它（能力是常量，看装没装就知道），远程后端需要（要联网问）。
+        放进基类而不是留给远程后端自己长，是因为**面板要能对着一排后端说同一句话**：
+        "都再问一遍"。没有它就只能在调用处 `getattr(c, "refresh", None)` 试探，
+        那样"本机后端到底需不需要刷新"这件事就没人回答了。
+
+        返回"拿到了吗"，**不抛异常**（跟 `ready()` 同一个道理：探测失败是常态）。
+        """
+        return True
+
     def describe(self) -> Dict[str, Any]:
         """给面板看的：它是谁、在哪、能干什么、健不健康。"""
         return {"backendId": self.backend_id, "source": self.source,
