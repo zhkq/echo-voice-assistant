@@ -102,6 +102,14 @@ def _cfg(tmp_root, max_concurrent=2, per_client=1, specs=None):
     cfg.raw["limits"]["max_concurrent"] = max_concurrent
     cfg.raw["limits"]["per_client_concurrent"] = per_client
     cfg.raw["models"]["specs"] = FAKE_SPECS if specs is None else specs
+    # **鉴权库必须落在这个临时目录里。** 不写这一行的话，`open_store(cfg)` 会去开
+    # `{ECHO}/data/server-state/echo-server-auth.db` —— 也就是**开发机上真实的那一个**：
+    # 每个 `_AppCase` 子类的 lifespan 都会创建/写入它。
+    # 2026-09-24 加 `calls` 表时才显形（调用记录开始一条条落进真实库，跨用例累积，
+    # 于是"只查自己那条"的断言全红）。之前没显形只是因为那些用例只读不写。
+    # 这与 AGENTS.md 里那几条"测试去动真实状态"的事故是同一个形状，所以在**唯一的
+    # 配置入口**上修，而不是让每个用例自己记得。
+    cfg.raw["auth"]["db"] = os.path.join(tmp_root, "auth.db")
     return cfg
 
 
@@ -1311,7 +1319,10 @@ class AuthSchemaTests(unittest.TestCase):
 
     def test_the_whitelist_here_matches_the_one_in_the_code(self):
         """代码里的白名单与设计 §8.5 必须一致（这里只钉前后两端不漂）。"""
-        self.assertEqual(tuple(store_mod.TABLE_WHITELIST), ("clients", "pairing_codes"))
+        # `calls` 是 2026-09-24 按设计加进来的（审计**元数据**，设计 §7.3 逐字给了那十列）。
+        # 加表要走评审 —— 这条断言就是那道门：白名单变了，这里必须跟着改一次。
+        self.assertEqual(tuple(store_mod.TABLE_WHITELIST),
+                         ("clients", "pairing_codes", "calls"))
 
 
 class AuthPairingTests(unittest.TestCase):
@@ -2375,6 +2386,299 @@ class QuotaAdminTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("没有这个客户端", out)
         self.assertNotIn("Traceback", out)
+
+
+class CallsTableTests(unittest.TestCase):
+    """`calls` 表：**只有元数据，没有内容**（设计 §7.3）。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="echo-calls-")
+        self.store = store_mod.Store(os.path.join(self.tmp, "auth.db"))
+        self.addCleanup(self.store.close)
+
+    def test_the_columns_are_exactly_the_documented_ten(self):
+        """列**一个不多**。这条是"表里不许出现内容"的机械版：加一列就得先改设计。"""
+        from server import calls as calls_mod
+        self.assertEqual(tuple(self.store.columns()["calls"]), calls_mod.CALL_FIELDS)
+
+    def test_no_column_is_named_like_content(self):
+        from server.calls import CALL_FIELDS
+        blacklist = ("text", "transcript", "content", "body", "audio", "wav",
+                     "embedding", "vector", "speaker_name", "meeting", "command",
+                     "summary", "voiceprint", "prompt", "reply")
+        self.assertEqual([c for c in CALL_FIELDS if c in blacklist], [])
+
+    def test_summary_counts_calls_errors_and_audio(self):
+        self.store.insert_calls([
+            {"ts": 100.0, "client_id": "c1", "endpoint": "/v1/asr", "model_id": "m",
+             "audio_seconds": 60.0, "duration_ms": 1000, "status": 200},
+            {"ts": 101.0, "client_id": "c1", "endpoint": "/v1/asr", "model_id": "m",
+             "audio_seconds": 30.0, "duration_ms": 500, "status": 429,
+             "error_code": "quota_exceeded"},
+            {"ts": 102.0, "client_id": "c2", "endpoint": "/v1/diarize", "model_id": "d",
+             "audio_seconds": 10.0, "duration_ms": 200, "status": 200},
+        ])
+        s = self.store.calls_summary(0)
+        self.assertEqual((s["total"], s["errors"], s["audioSeconds"]), (3, 1, 100.0))
+        by = {(g["client_id"], g["endpoint"]): g for g in s["groups"]}
+        self.assertEqual(by[("c1", "/v1/asr")]["calls"], 2)
+        self.assertEqual(by[("c1", "/v1/asr")]["errors"], 1)
+        self.assertEqual(by[("c2", "/v1/diarize")]["calls"], 1)
+        self.assertEqual(self.store.calls_summary(101.5)["total"], 1, "since 没生效")
+
+    def test_prune_removes_only_the_old_ones(self):
+        self.store.insert_calls([{"ts": 1.0, "client_id": "old"}, {"ts": 9e9, "client_id": "new"}])
+        self.assertEqual(self.store.prune_calls(100.0), 1)
+        left = self.store.recent_calls()
+        self.assertEqual([r["client_id"] for r in left], ["new"])
+
+    def test_insert_reports_failure_instead_of_raising(self):
+        """写审计失败了**不能抛** —— 调用方是后台线程，而那条路径不该把一次成功的转写搞挂。"""
+        self.store.close()
+        self.assertEqual(self.store.insert_calls([{"ts": 1.0, "client_id": "x"}]), 0)
+
+
+class CallLogTests(unittest.TestCase):
+    """异步写入：请求路径上不阻塞、队列满了丢并计数。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="echo-calllog-")
+        self.store = store_mod.Store(os.path.join(self.tmp, "auth.db"))
+        self.addCleanup(self.store.close)
+
+    def _log(self, **kw):
+        from server.calls import CallLog
+        kw.setdefault("flush_interval_s", 0.05)
+        return CallLog(self.store, **kw)
+
+    def test_it_writes_what_was_recorded(self):
+        log = self._log()
+        log.record(ts=1.0, client_id="c1", endpoint="/v1/asr", model_id="m",
+                   audio_seconds=12.5, duration_ms=800, status=200, request_id="r1",
+                   # 多传的键必须被忽略：**不许变成表里没有的列**
+                   nonsense="不该出现")
+        log.flush()
+        rows = self.store.recent_calls()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["client_id"], "c1")
+        self.assertEqual(rows[0]["audio_seconds"], 12.5)
+        self.assertNotIn("nonsense", rows[0])
+
+    def test_the_background_thread_writes_by_itself(self):
+        log = self._log()
+        log.start()
+        self.addCleanup(log.stop)
+        log.record(ts=2.0, client_id="bg", endpoint="/v1/asr", status=200)
+        for _ in range(50):
+            if self.store.recent_calls():
+                break
+            time.sleep(0.05)
+        self.assertEqual([r["client_id"] for r in self.store.recent_calls()], ["bg"])
+
+    def test_a_full_queue_drops_and_counts_instead_of_blocking(self):
+        """**队列满了要丢，不能阻塞**：审计排队不该把请求拖住。
+
+        丢了多少必须在 `stats()` 里看得见 —— 丢了却没人知道才是真问题。
+        """
+        log = self._log(max_queue=2, flush_interval_s=3600)   # 后台线程基本不动手
+        for i in range(10):
+            log.record(ts=float(i), client_id="c", endpoint="/v1/asr", status=200)
+        st = log.stats()
+        self.assertGreater(st["dropped"], 0, "队列满了却没丢 —— 那它是阻塞的？")
+        self.assertLessEqual(st["queued"], 2)
+        log.flush()
+        self.assertEqual(len(self.store.recent_calls()), 2)
+
+    def test_stop_flushes_what_is_left(self):
+        """退出前把剩下的写完 —— 不然最后一批调用记录会静默消失。"""
+        log = self._log(flush_interval_s=3600)
+        log.start()
+        log.record(ts=3.0, client_id="last", endpoint="/v1/asr", status=200)
+        log.stop()
+        self.assertEqual(len(self.store.recent_calls()), 1)
+
+    def test_prune_now_honours_retention_days(self):
+        log = self._log(retention_days=1)
+        self.store.insert_calls([{"ts": time.time() - 3 * 86400, "client_id": "old"},
+                                 {"ts": time.time(), "client_id": "new"}])
+        self.assertEqual(log.prune_now(), 1)
+        self.assertEqual([r["client_id"] for r in self.store.recent_calls()], ["new"])
+
+    def test_retention_zero_means_never_prune(self):
+        log = self._log(retention_days=0)
+        self.store.insert_calls([{"ts": 1.0, "client_id": "ancient"}])
+        self.assertEqual(log.prune_now(), 0)
+        self.assertEqual(len(self.store.recent_calls()), 1)
+
+
+class MetricsTests(unittest.TestCase):
+    def test_it_counts_calls_errors_and_audio_per_endpoint(self):
+        from server.calls import Metrics
+        m = Metrics()
+        m.observe("/v1/asr", 200, 1000, audio_seconds=60.0)
+        m.observe("/v1/asr", 429, 5, error_code="quota_exceeded")
+        m.observe("/v1/diarize", 200, 500, audio_seconds=30.0)
+        snap = m.snapshot()
+        self.assertEqual(snap["totalCalls"], 3)
+        self.assertEqual(snap["totalErrors"], 1)
+        self.assertEqual(snap["endpoints"]["/v1/asr"]["calls"], 2)
+        self.assertEqual(snap["endpoints"]["/v1/asr"]["audioSeconds"], 60.0)
+        self.assertEqual(snap["endpoints"]["/v1/asr"]["maxMs"], 1000)
+        self.assertEqual(snap["errorCodes"], {"quota_exceeded": 1})
+
+    def test_an_http_error_without_a_code_is_still_counted(self):
+        from server.calls import Metrics
+        m = Metrics()
+        m.observe("/v1/asr", 413, 1)
+        self.assertEqual(m.snapshot()["errorCodes"], {"http_413": 1})
+
+
+class CallRecordingWiringTests(_AppCase):
+    """记账真的接在请求上，而且**只记元数据**。"""
+
+    def _rows(self):
+        st = self.app.state.echo
+        st.call_log.flush()
+        return st.call_log.store.recent_calls(limit=50)
+
+    def test_a_successful_call_is_recorded_with_its_facts(self):
+        r = self.client.post("/v1/asr", content=_wav_bytes(seconds=1.0),
+                             headers={"Content-Type": "audio/wav",
+                                      "X-Request-Id": "req-abc"})
+        self.assertEqual(r.status_code, 200, r.text)
+        rows = self._rows()
+        self.assertEqual(len(rows), 1, rows)
+        row = rows[0]
+        self.assertEqual(row["endpoint"], "/v1/asr")
+        self.assertEqual(row["client_id"], "anonymous")     # 鉴权关着时的身份
+        self.assertEqual(row["status"], 200)
+        self.assertTrue(row["model_id"], "没记下用了哪个模型")
+        self.assertAlmostEqual(row["audio_seconds"], 1.0, places=1)
+        self.assertEqual(row["request_id"], "req-abc", "没把客户端的 X-Request-Id 带上")
+        self.assertGreater(row["duration_ms"], 0)
+
+    def test_a_refused_call_is_recorded_with_the_error_code(self):
+        """**错误码要留下** —— 那是排障唯一能回答"为什么"的东西。
+
+        做法：把配额用光，再发一次请求 → 429，且 `error_code` 是 `quota_exceeded`。
+        （错误码不是从状态码推的：`/v1/health` 的中间件读不到异常，
+        所以异常处理器要把它写进 `request.state` —— 这条用例顺带钉住那处接线。）
+        """
+        st = self.app.state.echo
+        st.quota.default_minutes = 1
+        st.quota.add("anonymous", 600)
+        r = self.client.post("/v1/asr", content=_wav_bytes(), headers={"Content-Type": "audio/wav"})
+        self.assertEqual(r.status_code, 429, r.text)
+        rows = self._rows()
+        self.assertEqual(len(rows), 1, rows)
+        self.assertEqual(rows[0]["status"], 429)
+        self.assertEqual(rows[0]["error_code"], "quota_exceeded")
+        self.assertEqual(rows[0]["audio_seconds"], 0.0, "被拒的请求不该有音频秒数")
+
+    def test_an_unauthenticated_request_is_not_recorded(self):
+        """401 是扫描器的噪音，不是"谁在用 GPU"。表里不该被它塞满。"""
+        cfg = _cfg(tempfile.mkdtemp(prefix="echo-calls-auth-"))
+        cfg.raw["auth"]["enabled"] = True
+        cfg.raw["auth"]["mode"] = "jwt"
+        cfg.raw["auth"]["jwt_secret"] = "0123456789abcdef0123456789abcdef"
+        with patch.object(engines, "build_loaders",
+                          lambda device="cuda": {"fake": _fake_loader}):
+            app = server_main.create_app(cfg)
+            with TestClient(app) as c:
+                r = c.post("/v1/asr", content=_wav_bytes(), headers={"Content-Type": "audio/wav"})
+                self.assertEqual(r.status_code, 401, r.text)
+                st = app.state.echo
+                st.call_log.flush()
+                self.assertEqual(st.call_log.store.recent_calls(), [])
+
+    def test_probe_endpoints_are_not_recorded(self):
+        """客户端每 30 秒拉一次 `/v1/capabilities` —— 记下来只会把表塞满噪音。"""
+        self.client.get("/v1/capabilities")
+        self.client.get("/v1/health")
+        self.client.get("/v1/ready")
+        self.assertEqual(self._rows(), [])
+
+    def test_health_carries_the_in_process_metrics(self):
+        self.client.post("/v1/asr", content=_wav_bytes(seconds=1.0),
+                         headers={"Content-Type": "audio/wav"})
+        body = self.client.get("/v1/health").json()
+        m = body["metrics"]
+        self.assertEqual(m["totalCalls"], 1)
+        self.assertIn("/v1/asr", m["endpoints"])
+        self.assertEqual(m["calls"]["dropped"], 0)
+        self.assertIn("retentionDays", m["calls"])
+
+    def test_the_recorded_row_has_no_content_columns(self):
+        """**机械地**再钉一次"表里没有内容"：整行的键就是设计那十个。"""
+        self.client.post("/v1/asr", content=_wav_bytes(seconds=1.0),
+                         headers={"Content-Type": "audio/wav"})
+        from server.calls import CALL_FIELDS
+        self.assertEqual(set(self._rows()[0].keys()), set(CALL_FIELDS))
+
+
+class CallsAdminTests(unittest.TestCase):
+    """`--stats` / `--list-calls`：管理面（v3）要用的同一份查询，先在命令行落地。"""
+
+    def setUp(self):
+        import json as _json
+        self.tmp = tempfile.mkdtemp(prefix="echo-calls-cli-")
+        self.db_path = os.path.join(self.tmp, "auth.db")
+        self.cfg_path = os.path.join(self.tmp, "server.yaml")
+        with open(self.cfg_path, "w", encoding="utf-8") as fh:
+            fh.write("server: {id: calls-cli}\n"
+                     "auth:\n  enabled: true\n  mode: jwt\n"
+                     "  jwt_secret: '0123456789abcdef0123456789abcdef'\n"
+                     "  db: '%s'\n"
+                     "tmp: {root: '%s'}\n"
+                     "models: {specs: %s}\n" % (self.db_path.replace("\\", "/"),
+                                               self.tmp.replace("\\", "/"),
+                                               _json.dumps(FAKE_SPECS)))
+
+    def _run(self, *argv):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = server_main.main(["--config", self.cfg_path] + list(argv))
+        return code, buf.getvalue()
+
+    def test_stats_on_an_empty_db_says_so(self):
+        code, out = self._run("--stats")
+        self.assertEqual(code, 0, out)
+        self.assertIn("共 0 次", out)
+        self.assertIn("没有任何调用记录", out)
+
+    def test_stats_prints_per_client_and_endpoint_numbers(self):
+        store = store_mod.Store(self.db_path)
+        store.insert_calls([
+            {"ts": time.time(), "client_id": "cli-x", "endpoint": "/v1/asr",
+             "model_id": "asr-long", "audio_seconds": 120.0, "duration_ms": 1500,
+             "status": 200},
+            {"ts": time.time(), "client_id": "cli-x", "endpoint": "/v1/asr",
+             "model_id": "asr-long", "audio_seconds": 0.0, "duration_ms": 10,
+             "status": 429, "error_code": "quota_exceeded"},
+        ])
+        store.close()
+        code, out = self._run("--stats", "--since-hours", "24")
+        self.assertEqual(code, 0, out)
+        self.assertIn("cli-x", out)
+        self.assertIn("/v1/asr", out)
+        self.assertIn("失败 1", out)
+        self.assertIn("2.00 分钟", out)
+
+    def test_list_calls_shows_metadata_and_says_it_has_no_content(self):
+        store = store_mod.Store(self.db_path)
+        store.insert_calls([{"ts": time.time(), "client_id": "cli-x",
+                             "endpoint": "/v1/diarize", "model_id": "diarize",
+                             "audio_seconds": 30.0, "duration_ms": 900, "status": 200}])
+        store.close()
+        code, out = self._run("--list-calls", "5")
+        self.assertEqual(code, 0, out)
+        self.assertIn("/v1/diarize", out)
+        self.assertIn("只有元数据", out)
+
+    def test_stats_can_look_at_everything(self):
+        code, out = self._run("--stats", "--since-hours", "0")
+        self.assertEqual(code, 0, out)
+        self.assertIn("全部", out)
 
 
 if __name__ == "__main__":

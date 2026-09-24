@@ -43,6 +43,17 @@ DEFAULTS: Dict[str, Any] = {
         # 否则就是设计 §7.2 里那句"没有执行者的话"。
         "daily_audio_minutes": 0,
     },
+    "calls": {
+        # 调用元数据（设计 §7.3）的异步写入参数。
+        # `flush_interval_s` 是"最多憋多久"：请求路径上只做 put_nowait，后台线程攒批写。
+        "flush_interval_s": 1.0,
+        # 队列上限。满了**丢并计数**（`/v1/health` 的 `metrics.calls.dropped` 看得见）——
+        # 审计不该把一次已经成功的转写拖慢或搞失败。
+        "max_queue": 1000,
+        # 保留天数。**这是"两个写卷保留策略相反"的那一半**（§9.3）：凭据长期留着，
+        # 调用记录可以老死（留着的价值随时间迅速下降，而它每天都在长）。0 = 不自动清。
+        "retention_days": 30,
+    },
     "tmp": {
         "root": "",                     # 空 = 系统临时目录下的 echo-server
         "ttl_hours": 4,                 # 定时清理：删超过这么久的

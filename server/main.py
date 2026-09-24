@@ -21,6 +21,7 @@ from fastapi.responses import JSONResponse
 
 from server import __version__, engines
 from server import auth as auth_mod
+from server import calls as calls_mod
 from server import errors as E
 from server import routes as routes_mod
 from server import settings as settings_mod
@@ -79,7 +80,18 @@ def create_app(cfg=None) -> FastAPI:
         # 跨进程撤销的发现机制（设计 §7.5 ④）。**命令行 `--revoke` 是另一个进程**，
         # 没有它的话，跑着的服务会继续接受已撤销的 JWT 直到缓存自己过期。
         auth_obj.watcher.start()
-        app.state.echo = routes_mod.State(cfg, pool, sweeper, auth=auth_obj)
+        # 调用元数据的异步写入（设计 §7.3）：请求路径上只做一次 put_nowait，
+        # 后台线程攒批写库。队列满了就丢并计数（审计不该拖慢或搞失败一次已经成功的转写）。
+        call_log = calls_mod.CallLog(
+            store,
+            flush_interval_s=float(cfg.get("calls.flush_interval_s", 1.0)),
+            max_queue=int(cfg.get("calls.max_queue", 1000)),
+            retention_days=float(cfg.get("calls.retention_days", 30)),
+            log=_db_log,
+        )
+        call_log.start()
+        app.state.echo = routes_mod.State(cfg, pool, sweeper, auth=auth_obj,
+                                         call_log=call_log)
 
         if not bool(cfg.get("auth.enabled", False)) and not _is_loopback(cfg.get("server.listen", "")):
             log.warning("鉴权是关的，而监听地址不是回环 —— 任何能连到这个端口的人都能用你的 GPU。"
@@ -107,6 +119,8 @@ def create_app(cfg=None) -> FastAPI:
         finally:
             sweeper.stop()
             auth_obj.watcher.stop()
+            # 先停记录线程（它退出前会把剩下的写完），再关库 —— 反了就会丢最后一批
+            call_log.stop()
             pool.shutdown()
             try:
                 store.close()
@@ -115,15 +129,73 @@ def create_app(cfg=None) -> FastAPI:
 
     app = FastAPI(title="ECHO capability backend", version=__version__, lifespan=lifespan)
 
+    @app.middleware("http")
+    async def _record_call(request: Request, call_next):
+        """把一次调用的元数据记进 `calls`（设计 §7.3）。**只有元数据，没有内容。**
+
+        为什么放在中间件里而不是三个端点各自写一遍：这是**一处**而不是三处容易漂的地方，
+        而且它能拿到端点拿不到的东西（最终状态码、真实总耗时、`request_id`）。
+        端点只负责往 `request.state.call_info` 里补它知道的事实（谁调的、哪个模型、
+        几秒音频、排队等了多久）。
+
+        **只记已鉴权的调用**（`clientId` 有值才记）：
+          * 未鉴权的 401 是扫描器的噪音，不是"谁在用 GPU"；
+          * 探针端点（`/health`、`/ready`、`/capabilities`）压根不进这张表 ——
+            客户端每 30 秒拉一次 capabilities，记下来只会把库塞满噪音。
+        判据直接用「有 scope 的端点」那张表（`routes.ENDPOINT_SCOPES`）—— 它就是
+        "哪些端点是能力调用"的权威定义，别在这里再列一遍。
+        """
+        st = getattr(request.app.state, "echo", None)
+        request.state.call_info = {}
+        t0 = time.time()
+        response = await call_next(request)
+        try:
+            if st is not None and request.url.path in routes_mod.ENDPOINT_SCOPES:
+                info = dict(getattr(request.state, "call_info", {}) or {})
+                if info.get("clientId"):
+                    duration_ms = int((time.time() - t0) * 1000)
+                    st.metrics.observe(request.url.path, response.status_code, duration_ms,
+                                       float(info.get("audioSeconds") or 0.0),
+                                       str(info.get("errorCode") or ""))
+                    st.call_log.record(
+                        ts=t0, client_id=str(info.get("clientId") or ""),
+                        endpoint=request.url.path,
+                        model_id=str(info.get("modelId") or ""),
+                        audio_seconds=float(info.get("audioSeconds") or 0.0),
+                        queue_wait_ms=int(info.get("queueWaitMs") or 0),
+                        duration_ms=duration_ms, status=int(response.status_code),
+                        error_code=str(info.get("errorCode") or ""),
+                        request_id=str(request.headers.get("x-request-id") or ""))
+        except Exception:                     # 记账失败**绝不**影响这次响应
+            log.debug("记录调用元数据时出错", exc_info=True)
+        return response
+
     @app.exception_handler(E.EchoError)
     async def _echo_error(_request: Request, exc: E.EchoError):
         headers = {}
         if exc.retry_after is not None:
             headers["Retry-After"] = str(int(exc.retry_after))
+        # 把错误码留给上面那个中间件 —— **异常处理器在中间件内侧**，
+        # 中间件只看得到响应、看不到异常；不在这里留一句，`calls` 里就只有状态码、
+        # 没有"为什么"（而 §6.3 那套错误码的全部意义就是回答"为什么"）。
+        info = getattr(_request.state, "call_info", None)
+        if isinstance(info, dict):
+            info["errorCode"] = exc.code
         return JSONResponse(status_code=exc.status, content=exc.body(), headers=headers)
 
     app.include_router(routes_mod.router)
     return app
+
+
+def _db_log(level: str, source: str, message: str) -> None:
+    """给后台线程用的一句日志（`CallLog` 写库失败时报一声）。
+
+    **不落客户端那个 `db` 表** —— 服务端只有一个审计库（`clients` / `pairing_codes` /
+    `calls`），往里塞一行"日志"就得再加一张表，而设计 §8.5 说加表要走评审。
+    写进进程日志就够了：那条路径的失败是运维信号，不是业务数据。
+    """
+    getattr(log, level if level in ("debug", "info", "warning", "error") else "info")(
+        "[%s] %s", source, message)
 
 
 def _normalize_scopes(raw: str) -> str:
@@ -242,6 +314,40 @@ def _admin_cli(cfg, args) -> int:
         if args.show_client:
             return _show_client(store, args.show_client)
 
+        # ---- 统计（只读）----
+        # 这两个动作是管理面（v3）要用的同一份查询，先在命令行落地：运维现在就能回答
+        # "谁在吃 GPU / 谁在被打回 / 今天多少分钟音频"，不必等网页。
+        if args.stats:
+            hours = float(args.since_hours or 0)
+            since = 0.0 if hours <= 0 else time.time() - hours * 3600.0
+            s_ = store.calls_summary(since)
+            span = "全部" if since <= 0 else "最近 %.1f 小时" % hours
+            print("调用汇总（%s）：共 %d 次，其中失败 %d 次，音频 %.1f 分钟"
+                  % (span, s_["total"], s_["errors"], s_["audioSeconds"] / 60.0))
+            if not s_["groups"]:
+                print("  （这段时间没有任何调用记录）")
+            for g in s_["groups"]:
+                print("  %-14s %-18s %6d 次  失败 %-4d 音频 %7.2f 分钟  "
+                      "平均 %6d ms  p95 %6d ms  最慢 %6d ms"
+                      % (g["client_id"] or "(无)", g["endpoint"], g["calls"], g["errors"],
+                         float(g["audio_seconds"] or 0) / 60.0, int(g["avg_ms"] or 0),
+                         int(g["p95_ms"] or 0), int(g["max_ms"] or 0)))
+            print("注：p95 是「这一组里第 95 百分位那条的耗时」"
+                  "（SQLite 没有百分位函数；数据量小、够看）—— 别当成严格分位数。")
+            return 0
+        if args.list_calls:
+            rows = store.recent_calls(limit=int(args.list_calls))
+            if not rows:
+                print("（还没有调用记录）")
+            for r in rows:
+                print("  %s  %-14s %-18s %-10s %6.1fs  %5d ms  %s%s"
+                      % (_fmt_time(r["ts"]), r["client_id"] or "(无)", r["endpoint"],
+                         r["model_id"] or "-", float(r["audio_seconds"] or 0),
+                         int(r["duration_ms"] or 0), r["status"],
+                         ("  " + r["error_code"]) if r["error_code"] else ""))
+            print("注：这张表里**只有元数据**（设计 §7.3）—— 没有音频、文本、嵌入、说话人数。")
+            return 0
+
         # ---- 改 ----
         if args.revoke:
             ver = a.cache.revoke(args.revoke)
@@ -326,6 +432,12 @@ def main(argv=None) -> int:
                     help="改这个客户端的每日音频分钟数上限（配合 --daily-audio-minutes）")
     ap.add_argument("--daily-audio-minutes", default="0", metavar="N",
                     help="每日音频分钟数；0 = 用全局默认（limits.daily_audio_minutes）")
+    ap.add_argument("--stats", action="store_true",
+                    help="看一段时间内的调用汇总（谁在用、错了多少、多少分钟音频）")
+    ap.add_argument("--since-hours", default="24", metavar="H",
+                    help="配合 --stats：看最近多少小时（默认 24；0 = 全部）")
+    ap.add_argument("--list-calls", type=int, default=0, metavar="N",
+                    help="看最近 N 条调用元数据（**只有元数据，没有内容**）")
     args = ap.parse_args(argv)
 
     logging.basicConfig(level=getattr(logging, str(args.log_level).upper(), logging.INFO),
@@ -336,7 +448,8 @@ def main(argv=None) -> int:
 
     admin_actions = (args.new_client, args.new_pairing_code, args.list_clients,
                      args.list_codes, args.show_client, args.revoke, args.disable,
-                     args.enable, args.set_scopes, args.rotate_secret, args.set_quota)
+                     args.enable, args.set_scopes, args.rotate_secret, args.set_quota,
+                     args.stats, args.list_calls)
     if any(admin_actions):
         return _admin_cli(cfg, args)
 

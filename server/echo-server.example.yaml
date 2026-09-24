@@ -30,6 +30,14 @@ limits:
   # 注意：用量计数在**进程内**，所以多实例部署时各算一份（设计 §7.2 写明的取舍）。
   daily_audio_minutes: 0
 
+calls:
+  # 调用元数据（设计 §7.3：只有 ts/client_id/endpoint/model_id/audio_seconds/
+  # queue_wait_ms/duration_ms/status/error_code/request_id —— **没有内容**）。
+  # 请求路径上只做一次 put_nowait，后台线程攒批写库（不把尾延迟绑在 fsync 上）。
+  flush_interval_s: 1.0
+  max_queue: 1000         # 满了丢并计数（/v1/health 的 metrics.calls.dropped 看得见）
+  retention_days: 30      # 调用记录可以老死；0 = 不自动清
+
 tmp:
   root: /var/echo/tmp           # 容器里挂的那一个可写卷；想更快就挂 tmpfs
   ttl_hours: 4                  # 定时清理：删超过这么久的（**请求结束本来就会删**）

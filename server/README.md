@@ -119,6 +119,9 @@ python scripts/smoke-echo-backend.py --pair-code 7K2M9QX4
 | `--disable ID` / `--enable ID` | 禁用（回 **403**）/ 启用（原令牌直接能用） |
 | `--set-scopes ID --scopes "asr"` | 改权限，**下一个请求就生效** |
 | `--rotate-secret ID` | 换 secret（新的只出现这一次）；**旧令牌与旧 secret 立刻全失效** |
+| `--set-quota ID --daily-audio-minutes 120` | 每日音频分钟数上限（0 = 用全局默认；**不清零已用量**） |
+| `--stats [--since-hours 24]` | 调用汇总：谁在用、失败多少、多少分钟音频、p95 耗时（`0` = 全部） |
+| `--list-calls N` | 最近 N 条调用**元数据**（这张表里没有音频/文本/嵌入/说话人数） |
 
 几条需要知道的语义：
 
@@ -127,6 +130,10 @@ python scripts/smoke-echo-backend.py --pair-code 7K2M9QX4
 - `--rotate-secret` **同时把 `token_version` +1**：v1 没有宽限期，新 secret 只能由管理员
   带外交给用户，客户端本来就要重新配对，所以不给"旧 JWT 还能再用一小时"的窗口。
 - `--enable` 之后**不需要重新换令牌**（`disabled` 与 `token_version` 是两回事）。
+- `--set-quota` **不清零今天的已用量**（额度按自然日算，改上限不该变成"送你一次重置"），
+  而且用量计数在**进程内** —— 多实例各算一份（设计 §7.2）。
+- `--stats` 的 **p95 是「这一组里第 95 百分位那条的耗时」**（SQLite 没有百分位函数；
+  数据量小、够看），别当成严格分位数。
 - `--revoke` 是**另一个进程**改库：服务端最迟 `auth.revoke_poll_s`（默认 5 秒）后生效 ——
   这是有意的取舍（用 5 秒换掉"每请求查库"），文档里没把它写成"立即"。
 - 这些动作**不打 HTTP，直接开库**。⚠️ 所以**它的安全边界就是"能读到鉴权库文件"**

@@ -1411,16 +1411,34 @@ Windows 上至少要走 DPAPI（`CryptProtectData`）；这与"业务数据留�
 | `admin_users` | 管理员账号 | `username` / `password_hash` / `disabled` / `last_login` | ⏳ |
 | `clients` | 客户端注册与凭据 | `client_id` / `name` / `secret_hash` / `scopes` / `token_version` / `last_seen` / `version` / `disabled` | ✅ |
 | `pairing_codes` | 待用的配对码 | `code_hash` / `expires_at` / `created_by`（**用掉即删**） | ✅ |
-| `calls` | 调用元数据 | `ts` / `client_id` / `endpoint` / `model_id` / `audio_seconds` / `queue_wait_ms` / `duration_ms` / `status` / `error_code` / `request_id` | ⏳ |
+| `calls` | 调用元数据 | `ts` / `client_id` / `endpoint` / `model_id` / `audio_seconds` / `queue_wait_ms` / `duration_ms` / `status` / `error_code` / `request_id` | ✅ **2026-09-24 已落地** |
 | `calls_rollup` | 小时/天聚合 | `bucket` / `client_id` / `endpoint` / `count` / `errors` / `p50` / `p95` / `audio_seconds` | ⏳ |
 | `model_events` | 模型生命周期 | `ts` / `model_id` / `event`(load/evict/fail) / `duration_ms` / `vram_mb` | ⏳ |
 | `admin_audit` | 管理动作 | `ts` / `admin` / `action` / `target` | ⏳ |
 
-> **`clients` 的实现与这张表有两处小出入，已按实现校正：**
-> v1 只落了 `created_at` / `updated_at` / `last_seen`，**没有** `quota` 列
-> （配额是 §7.2，还没做）、也没有 `version` 列（客户端版本只是配对时的入参，
-> 没有查询需求）。`updated_at` 是后加的、且是必需的 ——
+> **`clients` 的实现与这张表有两处小出入，已按实现校正（2026-09-24 再校正一次）：**
+> 落了 `created_at` / `updated_at` / `last_seen`，**没有** `version` 列
+> （客户端版本只是配对时的入参，没有查询需求）。`updated_at` 是后加的、且是必需的 ——
 > 跨进程撤销靠 `MAX(updated_at)` 发现变更（§7.5 ④）。
+> **配额列已经有了**：`daily_audio_minutes`（§7.2 落地时加的，0 = 用全局默认）。
+> 这条注原来写着"没有 quota 列、配额还没做"，配额做完了就得改 —— 文档里的
+> "还没做"必须跟着实现一起消失，否则下一个人会照着它再实现一遍。
+>
+> **`calls` 的实现（2026-09-24）**：列与这张表**逐字一致，一个不多** ——
+> 唯一性由 `CallLogTests`/`CallsTableTests` 钉着（`columns() == CALL_FIELDS`），
+> 因为"表里没有内容"这件事靠人记是记不住的。
+> 三条实现时才定的语义：
+> 1. **异步写**（`server/calls.py`）：请求路径上只做一次 `put_nowait`，
+>    后台线程攒批 `executemany`。同步写会把那次请求的尾延迟绑在 fsync 上，
+>    还会在库锁上制造热点（那把锁同时保护鉴权要读的行）。
+>    **队列满了丢并计数**（`/v1/health` 的 `metrics.calls.dropped` 看得见）。
+> 2. **只记已鉴权的调用**：401 是扫描器的噪音，不是"谁在用 GPU"；
+>    探针端点（`/health`、`/ready`、`/capabilities`）**压根不进这张表** ——
+>    客户端每 30 秒拉一次 capabilities，记下来只会把库塞满噪音。
+> 3. **保留期默认 30 天**（`calls.retention_days`，0 = 不自动清）。
+>    **`calls_rollup` 还没做**：它现在的位置是"让 `calls` 可以更早被清掉而长期统计仍在"。
+>    在管理面需要跨月视图之前，`calls_summary()` 直接在这一张表上聚合就够
+>    （一天几千条，SQLite 毫秒级），**不为一个还没出现的需求先养一张表**。
 
 > **`pairing_codes` 比这张表多了三列**（`client_id` / `name` / `scopes`，2026-09-24）：
 > 设计 §7.4 的"管理员新建客户端：填名字、scope、配额"那一步产出的**就是一张配对码**，
@@ -1667,6 +1685,9 @@ client_body_temp_path /var/echo/tmp/nginx;
 | `limits.load_timeout_s` | `300` | 等模型加载完的上限 |
 | `limits.inference_timeout_s` | `900` | 超了 `504` |
 | `limits.daily_audio_minutes` | **0（不限）** | 每个客户端每日音频分钟数上限（§7.2）。单客户端覆盖走 `--set-quota` |
+| `calls.flush_interval_s` | `1.0` | 调用元数据最多憋多久写一次（请求路径上只做一次 `put_nowait`） |
+| `calls.max_queue` | `1000` | 队列上限；**满了丢并计数**（`/v1/health` 的 `metrics.calls.dropped`） |
+| `calls.retention_days` | `30` | 调用记录保留天数（`0` = 不自动清）。凭据长期留、调用记录可以老死（§9.3） |
 | `tmp.root` | 系统临时目录下的 `echo-server` | 容器的临时卷。**可以换 tmpfs** |
 | `tmp.ttl_hours` | `4` | 定时清理删超过这么久的（请求结束本来就会删） |
 | `tmp.sweep_interval_s` | `3600` | 每小时扫一次 |
@@ -1832,8 +1853,18 @@ client_body_temp_path /var/echo/tmp/nginx;
 | 负/NaN/垃圾时长一律当 0（**不能把额度算成负的**） | ✅ | `QuotaLedgerTests.test_garbage_durations_are_ignored` |
 | 免凭据的 `/v1/capabilities` **只给全局上限，不给任何人的用量** | ✅ | `QuotaWiringTests.test_capabilities_exposes_the_global_limit_but_never_per_client_usage` |
 | `--set-quota` 真的落库并生效；不存在的客户端给一句人话 | ✅ | `QuotaAdminTests` |
-| metrics / SSE / `calls` 审计表（§7.3、§8.4） | ⏳ | 还没做；配额已经落地（见上） |
-| 管理面 / 审计表 / "存了什么"自证页（§8.4、§8.5） | ⏳ | 还没做；配对的入口暂时是命令行 |
+| `calls` 表：**列就是设计那十个，一个不多**（"表里没有内容"的机械版） | ✅ | `CallsTableTests.test_the_columns_are_exactly_the_documented_ten` |
+| 成功的调用被记下：端点/客户端/模型/音频秒数/状态/`X-Request-Id` | ✅ | `CallRecordingWiringTests.test_a_successful_call_is_recorded_with_its_facts` |
+| 被拒的调用也记，而且**错误码要留下**（不是从状态码猜） | ✅ | `CallRecordingWiringTests.test_a_refused_call_is_recorded_with_the_error_code` |
+| 401（未鉴权）**不进表** —— 那是扫描器噪音 | ✅ | `CallRecordingWiringTests.test_an_unauthenticated_request_is_not_recorded` |
+| 探针端点（`/health`、`/ready`、`/capabilities`）不进表 | ✅ | `CallRecordingWiringTests.test_probe_endpoints_are_not_recorded` |
+| `/v1/health` 的 metrics **不查库**（探针每几秒被敲一次） | ✅ | `CallRecordingWiringTests.test_health_carries_the_in_process_metrics` |
+| 队列满了**丢并计数**，绝不阻塞请求 | ✅ | `CallLogTests.test_a_full_queue_drops_and_counts_instead_of_blocking` |
+| 退出前把剩下的写完（不丢最后一批） | ✅ | `CallLogTests.test_stop_flushes_what_is_left` |
+| 保留期到了才清；`0` = 不自动清 | ✅ | `CallLogTests.test_prune_now_honours_retention_days` / `test_retention_zero_means_never_prune` |
+| 写审计**失败不抛**（后台线程，不该拖垮请求） | ✅ | `CallsTableTests.test_insert_reports_failure_instead_of_raising` |
+| `--stats` / `--list-calls` 能回答"谁在用、错了多少、多少分钟" | ✅ | `CallsAdminTests` |
+| 管理面 / 审计表 / "存了什么"自证页（§8.4、§8.5） | ◐ `calls` 审计表**已落地**；管理面网页与 `calls_rollup` 还没做 |
 
 > **为什么 §12 值得这么细。** 前面每一节的设计都有"如果没人看着就会退化"的地方：
 > 服务端会慢慢认识业务、临时文件会慢慢漏、GPU 会慢慢被 OOM 掉。
@@ -1848,7 +1879,7 @@ client_body_temp_path /var/echo/tmp/nginx;
 |---|---|---|---|
 | **v1** | 单进程 / 单机；`EnginePool`（单飞 + 引用计数 + LRU + 显存预算）；`TempWorkspace`；三个能力端点；`/health` `/ready` `/capabilities`；**两级闸门 + 廉价预检** | §12 全部护栏测试绿；两个客户端并发不互相阻塞 | **✅ 已落地** |
 | **v1.5**（原 v2 的鉴权部分） | **配对码 → `client_id` + `secret` → 短期 JWT**；scopes；`token_version` 撤销（同进程立即、跨进程 ≤5 秒轮询）← **实际做在了这里，不是 v2** | §12.1 全绿；命令行能发码、撤销能生效 | **✅ 已落地** |
-| **v2** | 配额（日额度 / 音频分钟数，§7.2）✅ **已落地 2026-09-24** + metrics + SSE 进度 + `calls` 审计表 | 与客户端路由层的降级原因**逐条对齐**；断网/降级演练 | ◐ 配额已落地；metrics / SSE / 审计表还没做 |
+| **v2** | 配额（日额度 / 音频分钟数，§7.2）✅ + **`calls` 审计表 + metrics ✅** + SSE 进度 + `calls_rollup` | 与客户端路由层的降级原因**逐条对齐**；断网/降级演练 | ◐ 配额与审计已落地（2026-09-24）；SSE / rollup 还没做 |
 | **v3** | 管理面（§8.4）+ 只读 rootfs 容器 + tmpfs + 反代配置 + 按模型分进程（按需）+ 多实例按能力拆分 | 容器冒烟；`/v1/health` 的临时目录统计长期归零 | ⏳ |
 
 > **为什么鉴权提前到了 v1.5，而不是留在 v2：** 原计划把它和**配额**绑在一趟做。

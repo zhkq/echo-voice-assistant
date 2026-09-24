@@ -25,7 +25,7 @@ from fastapi import APIRouter, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 
-from server import __version__, audio as audio_mod, errors, quota, tmp
+from server import __version__, audio as audio_mod, calls as calls_mod, errors, quota, tmp
 from server.pool import EnginePool
 
 router = APIRouter(prefix="/v1")
@@ -106,13 +106,18 @@ class State:
     """进程内共享状态。由 `main.create_app` 在 lifespan 里装好。"""
 
     def __init__(self, cfg, pool: EnginePool, sweeper: Optional[tmp.Sweeper] = None,
-                 auth=None):
+                 auth=None, call_log=None):
         self.cfg = cfg
         self.pool = pool
         self.sweeper = sweeper
         self.started = time.time()
         # 鉴权对象由 main 装（它要拿 store/config）。None → `client_of` 按"没鉴权"放行。
         self.auth = auth
+        # 调用元数据的异步记录 + 进程内 metrics（设计 §7.3 / §8.4）。
+        # 由 main 装（它才拿得到 store）。None 时下面的 `note_call` 是空操作 ——
+        # 这样单测里只想要一个 State 时不必造一个库。
+        self.call_log = call_log
+        self.metrics = calls_mod.Metrics()
         self.admission = Admission(
             max_concurrent=cfg.max_concurrent,
             per_client=cfg.per_client_concurrent,
@@ -150,6 +155,42 @@ class State:
         with self.admission.hold(client_id):
             self.quota.add(client_id, seconds)
             yield
+
+    # ---------------------------------------------------------------- 调用记账
+
+    @contextmanager
+    def timed_billing(self, client_id: str, seconds: float, request=None):
+        """`billing` + 顺手量出**排队等了多久**（设计 §7.3 的 `queue_wait_ms`）。
+
+        为什么量这个：客户端看到的"很慢"有两种完全不同的成因 —— 排队等通道，
+        还是模型真的慢。没有这两个数就只能猜，而它们的解法相反
+        （前者要加通道/错峰，后者要换模型）。
+        """
+        t_wait = time.time()
+        with self.billing(client_id, seconds):
+            waited = int((time.time() - t_wait) * 1000)
+            if request is not None:
+                note_call(request, queueWaitMs=waited)
+            yield
+
+
+def note_call(request, **fields) -> None:
+    """往 `request.state.call_info` 里补一条事实（谁调的、哪个模型、几秒音频、等了多久）。
+
+    真正落库在 `main.create_app` 的中间件里 —— 一处而不是三个端点各写一遍。
+    `request` 为 None（或不是 FastAPI 的 Request）时**静默忽略**：
+    这个函数会在每个请求路径上被调，它自己不该成为新的失败点。
+    """
+    if request is None:
+        return
+    try:
+        info = getattr(request.state, "call_info", None)
+        if not isinstance(info, dict):
+            info = {}
+            request.state.call_info = info
+        info.update(fields)
+    except Exception:                                          # pragma: no cover - 兜底
+        pass
 
 
 def _st(request: Request) -> State:
@@ -294,6 +335,10 @@ def health(request: Request):
         "models": {m["id"]: m["state"] for m in st.pool.status()},
         # 今天各客户端用了多少分钟（**只有数字，没有内容**）。运维要看"谁在吃 GPU"。
         "quota": st.quota.snapshot(),
+        # 此刻的仪表（进程内计数，**不查库** —— 探针每几秒被敲一次）。
+        # 跨时间/跨客户端的查询在管理面与 `--stats` 里走 `calls` 表。
+        "metrics": dict(st.metrics.snapshot(),
+                        calls=(st.call_log.stats() if st.call_log is not None else {})),
     }
 
 
@@ -386,9 +431,11 @@ async def asr(request: Request, variant: str = "long", timestamps: int = 0,
     # 否则客户端拿到的是"空 body 的错误"，它的降级逻辑就瞎了。
     try:
         cid = client_id_of(request, need_scope="asr")
+        note_call(request, clientId=cid)
         st.quota.check(cid)                    # 今天的额度用完了？**也在读 body 之前**
         model_id = st.pool.pick_for_slot(slot, model)
         spec = st.pool.spec(model_id)
+        note_call(request, modelId=model_id)
         # **先判忙，再读 body**（同样是"先挑模型、再动字节"的顺序）：
         # 忙的时候一个字节都不收，见 `Admission.precheck`。
         st.admission.precheck(cid)
@@ -405,7 +452,8 @@ async def asr(request: Request, variant: str = "long", timestamps: int = 0,
 
         def _infer():
             t0 = time.time()
-            with st.billing(cid, seconds):
+            note_call(request, audioSeconds=seconds)
+            with st.timed_billing(cid, seconds, request):
                 with st.pool.acquire(model_id) as engine:
                     return _finish_asr(engine, wav, lang, want_ts, model_id, spec,
                                        seconds, t0)
@@ -434,11 +482,13 @@ async def diarize(request: Request, mode: str = "segment", maxSpeakers: int = 0,
     cfg = st.cfg
     try:
         cid = client_id_of(request, need_scope="diarize")
+        note_call(request, clientId=cid)
         if str(mode) != "segment":
             raise errors.bad_request("mode=%r 尚未实现（v1 只支持 segment）" % mode)
         st.quota.check(cid)
         model_id = st.pool.pick_for_slot("diarize.turns", model)
         spec = st.pool.spec(model_id)
+        note_call(request, modelId=model_id)
         st.admission.precheck(cid)             # 先判忙，再读 body
         audio_mod.check_declared_size(request, cfg)
     except errors.EchoError as e:
@@ -452,7 +502,8 @@ async def diarize(request: Request, mode: str = "segment", maxSpeakers: int = 0,
 
         def _infer():
             t0 = time.time()
-            with st.billing(cid, seconds):
+            note_call(request, audioSeconds=seconds)
+            with st.timed_billing(cid, seconds, request):
                 with st.pool.acquire(model_id) as engine:
                     return engine.analyze(wav, max_speakers=int(maxSpeakers) or None), t0
 
@@ -490,9 +541,11 @@ async def speaker_embed(request: Request, count: int = 1, model: str = ""):
     cfg = st.cfg
     try:
         cid = client_id_of(request, need_scope="embed")
+        note_call(request, clientId=cid)
         st.quota.check(cid)
         model_id = st.pool.pick_for_slot("speaker.embed", model)
         spec = st.pool.spec(model_id)
+        note_call(request, modelId=model_id)
         st.admission.precheck(cid)             # 先判忙，再读 body
         audio_mod.check_declared_size(request, cfg)
     except errors.EchoError as e:
@@ -506,7 +559,8 @@ async def speaker_embed(request: Request, count: int = 1, model: str = ""):
 
         def _infer():
             t0 = time.time()
-            with st.billing(cid, seconds):
+            note_call(request, audioSeconds=seconds)
+            with st.timed_billing(cid, seconds, request):
                 with st.pool.acquire(model_id) as engine:
                     return engine.embed(wav), t0
 

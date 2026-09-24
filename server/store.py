@@ -42,7 +42,8 @@ import time
 from typing import Any, Dict, List, Optional
 
 #: 设计 §8.5 的表白名单（**唯一**一份）。`CREATE TABLE` 只允许出现在这里。
-TABLE_WHITELIST = ("clients", "pairing_codes")
+#: `calls` 是 2026-09-24 按设计加进来的（审计元数据，设计 §7.3 逐字定义了那十列）。
+TABLE_WHITELIST = ("clients", "pairing_codes", "calls")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS clients (
@@ -73,6 +74,23 @@ CREATE TABLE IF NOT EXISTS pairing_codes (
     scopes     TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_pairing_expires ON pairing_codes(expires_at);
+-- 调用元数据（设计 §7.3）。**只有元数据，没有内容**：没有音频、文本、嵌入、说话人数。
+-- 列就是设计 §8.5 表里那十个，一个不多 —— 加列要走那条"多一张表都要评审"的同一道门。
+CREATE TABLE IF NOT EXISTS calls (
+    ts            REAL NOT NULL,
+    client_id     TEXT NOT NULL DEFAULT '',
+    endpoint      TEXT NOT NULL DEFAULT '',
+    model_id      TEXT NOT NULL DEFAULT '',
+    audio_seconds REAL NOT NULL DEFAULT 0,
+    queue_wait_ms INTEGER NOT NULL DEFAULT 0,
+    duration_ms   INTEGER NOT NULL DEFAULT 0,
+    status        INTEGER NOT NULL DEFAULT 0,
+    error_code    TEXT NOT NULL DEFAULT '',
+    request_id    TEXT NOT NULL DEFAULT ''
+);
+-- 两个索引对应两种真实查询：按时间倒着看最近（面板），按客户端+时间做汇总（统计）。
+CREATE INDEX IF NOT EXISTS idx_calls_ts ON calls(ts);
+CREATE INDEX IF NOT EXISTS idx_calls_client_ts ON calls(client_id, ts);
 """
 
 #: `CREATE TABLE IF NOT EXISTS` 对**已经存在**的表不会补列 ——
@@ -251,6 +269,97 @@ class Store:
                 (max(0.0, float(daily_audio_minutes or 0.0)), client_id))
             self._db.commit()
             return bool(cur.rowcount)
+
+    # ---------------------------------------------------------------- 调用元数据（§7.3）
+
+    def insert_calls(self, rows: List[Dict[str, Any]]) -> int:
+        """批量写调用记录。返回写了几条。
+
+        **批量**是有意的：`calls` 是异步写（`server/calls.py` 的后台线程），
+        一条一条 commit 会让每条都付一次 fsync；攒一小批一次写完更省，
+        而且**不阻塞请求**本来就是这条设计的目的（§7.3）。
+        写失败不抛给调用方 —— 审计写不进去不该让一次已经成功的转写变成失败。
+        """
+        if not rows:
+            return 0
+        cols = ("ts", "client_id", "endpoint", "model_id", "audio_seconds",
+                "queue_wait_ms", "duration_ms", "status", "error_code", "request_id")
+        #: 缺字段时按列类型给默认值。**不能给 `None`**：这几列都是 `NOT NULL DEFAULT ''`，
+        #: 显式写 `None` 会撞约束 → `IntegrityError` → 整批记录被丢掉（而调用方是后台线程，
+        #: 只会在日志里留一句"写库失败"）。第一版就是这么写的，被
+        #: `CallsTableTests.test_prune_removes_only_the_old_ones`（只传了两个字段）抓出来。
+        blanks = {"ts": 0.0, "client_id": "", "endpoint": "", "model_id": "",
+                  "audio_seconds": 0.0, "queue_wait_ms": 0, "duration_ms": 0,
+                  "status": 0, "error_code": "", "request_id": ""}
+        values = [tuple(r.get(c) if r.get(c) is not None else blanks[c] for c in cols)
+                  for r in rows]
+        with self._lock:
+            try:
+                self._db.executemany(
+                    "INSERT INTO calls (%s) VALUES (%s)" % (", ".join(cols),
+                                                            ", ".join("?" * len(cols))),
+                    values)
+                self._db.commit()
+                return len(values)
+            except Exception:
+                return 0
+
+    def recent_calls(self, limit: int = 50, client_id: str = "") -> List[Dict[str, Any]]:
+        """最近若干条（新的在前）。面板/排障用。"""
+        limit = max(1, min(1000, int(limit or 50)))
+        with self._lock:
+            if client_id:
+                cur = self._db.execute(
+                    "SELECT * FROM calls WHERE client_id=? ORDER BY ts DESC LIMIT ?",
+                    (client_id, limit))
+            else:
+                cur = self._db.execute("SELECT * FROM calls ORDER BY ts DESC LIMIT ?",
+                                       (limit,))
+            return [dict(r) for r in cur.fetchall()]
+
+    def calls_summary(self, since_ts: float) -> Dict[str, Any]:
+        """按 `client_id × endpoint` 汇总一段时间内的调用（面板的"谁在用/出错多少"）。
+
+        **p95 用 SQL 算不出来**（SQLite 没有百分位函数），所以这里取"这一组里第 95 百分位
+        的那条的耗时"—— 数据量小（一天几千条）、而且是给人看的，不值得为它引入一个
+        统计库。**如实说明它是这么算的**，别当成严格分位数。
+        """
+        with self._lock:
+            rows = [dict(r) for r in self._db.execute(
+                "SELECT client_id, endpoint, COUNT(*) AS calls,"
+                " SUM(CASE WHEN status >= 400 OR error_code <> '' THEN 1 ELSE 0 END) AS errors,"
+                " SUM(audio_seconds) AS audio_seconds,"
+                " AVG(duration_ms) AS avg_ms,"
+                " MAX(duration_ms) AS max_ms"
+                " FROM calls WHERE ts >= ?"
+                " GROUP BY client_id, endpoint ORDER BY calls DESC", (float(since_ts),)
+            ).fetchall()]
+            for r in rows:
+                cur = self._db.execute(
+                    "SELECT duration_ms FROM calls WHERE ts >= ? AND client_id=? AND endpoint=?"
+                    " ORDER BY duration_ms LIMIT 1 OFFSET ?",
+                    (float(since_ts), r["client_id"], r["endpoint"],
+                     max(0, int((r["calls"] or 0) * 0.95) - 1)))
+                one = cur.fetchone()
+                r["p95_ms"] = int(one["duration_ms"]) if one else int(r["avg_ms"] or 0)
+        return {
+            "since": float(since_ts),
+            "total": sum(int(r["calls"] or 0) for r in rows),
+            "errors": sum(int(r["errors"] or 0) for r in rows),
+            "audioSeconds": round(sum(float(r["audio_seconds"] or 0) for r in rows), 2),
+            "groups": rows,
+        }
+
+    def prune_calls(self, before_ts: float) -> int:
+        """删掉 `before_ts` 之前的记录。返回删了几条。
+
+        **这是"两个写卷保留策略相反"的那一半**（§9.3）：`clients` 那些凭据要长期留着，
+        而调用记录是**可以老死**的 —— 留着的价值随时间迅速下降，而它每天都在长。
+        """
+        with self._lock:
+            cur = self._db.execute("DELETE FROM calls WHERE ts < ?", (float(before_ts),))
+            self._db.commit()
+            return int(cur.rowcount or 0)
 
     def rotate_secret(self, client_id: str, secret_hash: str) -> Optional[Dict[str, Any]]:
         """轮换 secret（设计 §7.5 ⑤）。返回更新后的行；客户端不存在返回 None。
