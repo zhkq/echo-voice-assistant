@@ -37,6 +37,20 @@ header .btns { margin-left:auto; display:flex; gap:8px; flex-wrap:wrap; }
 .col-head { display:flex; align-items:center; gap:10px; padding:8px 16px; color:var(--muted);
   font-size:13px; border-bottom:1px solid var(--border); flex-shrink:0; flex-wrap:wrap; }
 .col-head strong { color:var(--text); }
+/* ---------- 「这场会用了哪个后端」（能力路由，3.0） ----------
+   窄边条里同样要能收缩：整块与里面每一行都给了 min-width:0
+   （默认 min-width:auto 会被长文本顶住不让收缩，见 docs/面板布局-窄边条.md）。 */
+.cap-box { padding:6px 16px; border-bottom:1px solid var(--border); flex-shrink:0;
+  font-size:12px; color:var(--muted); min-width:0; }
+.cap-box .cap-line { min-width:0; overflow-wrap:anywhere; }
+.cap-box .cap-line b { color:var(--text); }
+.cap-box .cap-more { margin-top:4px; min-width:0; }
+.cap-box .cap-more > summary { cursor:pointer; min-width:0; }
+.cap-box .cap-t { margin-top:6px; color:var(--text); opacity:.8; }
+.cap-box .cap-r { display:flex; gap:8px; flex-wrap:wrap; min-width:0; padding:2px 0; }
+.cap-box .cap-slot, .cap-box .cap-be { flex:0 1 auto; min-width:0; }
+.cap-box .cap-be { color:var(--text); }
+.cap-box .cap-why, .cap-box .cap-d { min-width:0; overflow-wrap:anywhere; opacity:.85; }
 /* ---------- 纪要编辑 ---------- */
 #summaryBox .sm-bar { display:flex; align-items:center; gap:8px; margin:0 0 10px; padding-bottom:8px;
   border-bottom:1px solid var(--border); }
@@ -207,6 +221,11 @@ input[type=range].seek::-webkit-slider-thumb { -webkit-appearance:none; width:15
       <button class="tab-sm" data-tab="summary">纪要</button>
     </div>
     <div class="col-head" id="colHead"></div>
+    <!-- 这场会实际用了哪个后端、跳过了谁、为什么（3.0）。默认折起来一行 ——
+         绝大多数时候人只想知道"用了谁"；排障时才展开看降级原因。
+         内容由 renderCapability() 填，数据来自详情接口的 capability 字段
+         （那里的中文翻译是服务端给的，前端不自己维护词汇表）。 -->
+    <div id="capBox" class="hidden"></div>
     <div class="col-scroll" id="transcriptBox"><div class="empty">加载中…</div></div>
     <div class="col-scroll hidden" id="summaryBox"></div>
   </div>
@@ -351,6 +370,7 @@ async function load() {
     : (M.segments || 0);
   $("#meta").textContent = `开始 ${M.started_at || ""} · ${fmtHM(M.duration_seconds)} 分钟 · ${segCount} 段 · ${st[M.status]||M.status}`;
   syncTitleEditBtn();
+  renderCapability();
   buildTimeline();
   $("#pDur").textContent = fmtTimeH(_totalDur);
   $("#pSeek").max = Math.floor(_totalDur || 0);
@@ -359,6 +379,50 @@ async function load() {
   renderColHead();
 }
 window.addEventListener("DOMContentLoaded", () => { bindSummaryEdit(); load(); });
+
+/* ---------- 「这场会用了哪个后端」（3.0 能力路由） ----------
+
+   数据是录音当时写进 meta.json 的快照（服务端 plan_summary 翻好中文再下发）。
+   **前端不重算、也不自己维护原因词汇表** —— 那样迟早和服务端说的不一样，
+   而"页签说会走 GPU、实际走了本机"这种对不上，比不显示更糟。
+
+   默认只显示一行"用了谁"；降级原因折在 <details> 里，排障时才展开。 */
+function renderCapability() {
+  const box = $("#capBox");
+  if (!box) return;
+  const cap = M && M.capability;
+  if (!cap || (!cap.picks.length && !cap.skipped.length && !cap.timestampsLabel)) {
+    box.className = "hidden";
+    box.innerHTML = "";
+    return;
+  }
+  const used = cap.picks.length
+    ? cap.picks.map((p) => `${esc(p.slotLabel)} → <b>${esc(p.backendLabel)}</b>`).join("，")
+    : "（没记到实际用了谁）";
+  const ts = cap.timestampsLabel ? ` · 时间轴：${esc(cap.timestampsLabel)}` : "";
+  const nSkip = cap.skipped.length;
+  // 一行摘要 + 可展开的细节。没有跳过项时不显示那个"为什么"的入口（免得点开是空的）。
+  const detail = [];
+  if (nSkip) {
+    detail.push(`<div class="cap-t">为什么没用别的（${nSkip} 条）</div>`);
+    detail.push(cap.skipped.map((s) => `<div class="cap-r">
+      <span class="cap-slot">${esc(s.slotLabel)}</span>
+      <span class="cap-be">${esc(s.backendLabel)}</span>
+      <span class="cap-why">${esc(s.reasonLabel)}</span>
+      ${s.detail ? `<span class="cap-d">${esc(s.detail)}</span>` : ""}
+    </div>`).join(""));
+  }
+  if (cap.vectorSpaceId) {
+    detail.push(`<div class="cap-t">向量空间：<code>${esc(cap.vectorSpaceId)}</code></div>`);
+  }
+  if (cap.notes && cap.notes.length) {
+    detail.push(`<div class="cap-t">备注</div>` + cap.notes.map((n) => `<div class="cap-d">${esc(n)}</div>`).join(""));
+  }
+  const body = detail.length
+    ? `<details class="cap-more"><summary>细节</summary>${detail.join("")}</details>` : "";
+  box.className = "cap-box";
+  box.innerHTML = `<div class="cap-line">🖥 ${used}${ts}</div>${body}`;
+}
 
 /* ---------- 纪要页签 ---------- */
 let _summaryLoaded = false;

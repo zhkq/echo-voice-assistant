@@ -22,7 +22,6 @@ def _read(name):
     with open(os.path.join(_ROOT, "web", name), encoding="utf-8") as fh:
         return fh.read()
 
-
 #: 这张卡里**要被人点的**元素（必须真接上事件，否则点了没反应）。
 _WIRED_IDS = ("btnCapPair", "btnCapUnpair", "btnCapRouteSave", "btnCapRouteProbe",
               "capPairUrl", "capPairCode", "capPairState", "capBackendList",
@@ -113,6 +112,63 @@ class CapabilityCardWiringTests(unittest.TestCase):
     def test_the_unpair_button_is_hidden_until_there_is_something_to_unpair(self):
         """没配对时不该有一个"解除配对"按钮杵在那儿。"""
         self.assertIn('class="btn hidden" id="btnCapUnpair"', self.html)
+
+
+class MeetingDetailShowsThePlanTests(unittest.TestCase):
+    """会议详情页那块"这场会用了哪个后端"（3.0）。
+
+    数据链路：`meta.json` → `meeting.meeting_meta()` → `api.get_meeting` 的 `capability`
+    字段（服务端用 `capability_admin.plan_summary` 翻好中文）→ 面板渲染。
+    最容易断在两头：接口忘了带、面板忘了渲染 —— 两者在界面上都表现为"什么都没有"，
+    而人看不出是断了还是"这场会本来就没记"。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.html = _read("meeting.html")
+
+    def _fn(self, name):
+        body = self.html[self.html.index("function %s(" % name):]
+        return body[:body.index("\n}\n") + 3]
+
+    def test_the_block_exists_and_is_hidden_by_default(self):
+        self.assertIn('id="capBox"', self.html)
+        self.assertIn('id="capBox" class="hidden"', self.html)
+
+    def test_load_actually_renders_it(self):
+        body = self.html[self.html.index("async function load()"):]
+        body = body[:body.index("\n}\n") + 3]
+        self.assertIn("renderCapability()", body,
+                      "详情加载完了却没渲染那块 —— 界面永远是空的")
+
+    def test_it_reads_the_servers_translation_instead_of_its_own(self):
+        """**前端不许自己维护降级原因词汇表。**
+
+        原因的中文在 `capability_admin.REASON_LABELS`（Python 侧，与权威词汇同源）。
+        在 JS 里再写一份，迟早出现"后端说 vector-mismatch、面板显示成别的意思"。
+        所以钉住：渲染只用服务端给的 `*Label`，不自己映射。
+        """
+        body = self._fn("renderCapability")
+        for field in ("reasonLabel", "slotLabel", "backendLabel"):
+            self.assertIn(field, body, "没用到服务端给的中文：%s" % field)
+        self.assertNotIn("REASON_LABELS", self.html)
+
+    def test_it_does_not_recompute_the_plan(self):
+        """只用 `M.capability`（录音时的快照），不在前端重算"会选谁"。"""
+        body = self._fn("renderCapability")
+        self.assertIn("M.capability", body)
+        self.assertNotIn("/api/capability", body)
+
+    def test_the_rows_can_shrink(self):
+        """窄边条里这块也要能收缩（长文案不许把布局顶宽，见 docs/面板布局-窄边条.md）。"""
+        flat = self.html.replace(" ", "")            # CSS 里的空格不影响判定
+        for sel in (".cap-box", ".cap-box.cap-line", ".cap-box.cap-more",
+                    ".cap-box.cap-r"):
+            with self.subTest(sel=sel):
+                self.assertIn(sel + "{", flat, "CSS 里没有 %s 的规则" % sel)
+                i = flat.index(sel + "{")
+                self.assertIn("min-width:0", flat[i:i + 400],
+                              "%s 缺 min-width:0（窄边条里会顶宽）" % sel)
 
 
 if __name__ == "__main__":

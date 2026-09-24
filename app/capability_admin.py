@@ -64,6 +64,120 @@ CHOICE_LABELS: Dict[str, str] = {
     "off": "关掉（不做这件事）",
 }
 
+#: 降级原因（**权威十词**，`docs/统一路由` §2）→ 一句人话。
+#:
+#: 为什么这张表在 Python 侧、不在面板里：面板（`web/meeting.html` 与 `app.js`）
+#: 只是把这段文字渲染出来，而**权威词汇在 Python 侧**（`base.SKIP_REASONS`）。
+#: 在 JS 里再抄一份，迟早出现"后端说 vector-mismatch、面板显示成别的意思"这种对不上的现象。
+REASON_LABELS: Dict[str, str] = {
+    "absent": "不在位（没配这台后端 / 本机没装这个能力）",
+    "blocked": "被策略挡住（「允许音频去哪」不允许给它）",
+    "busy": "正忙（上一次还没结束）",
+    "offline": "连不上",
+    "circuit-open": "连续失败，暂时跳过",
+    "quota": "额度用尽",
+    "unsupported": "不支持这件事",
+    "vector-mismatch": "向量空间对不上（混用会认错人）",
+    "open-failed": "打不开",
+    "error": "出错了",
+}
+
+#: 时间轴精度档位 → 一句人话（就是 `base` 里那四个）。
+TIMESTAMPS_LABELS: Dict[str, str] = {
+    "exact": "精确（模型自己给的）",
+    "aligned": "对齐（按骨架把文本对上去）",
+    "estimated": "估算（按字数均摊）",
+    "none": "没有时间轴",
+}
+
+
+def _slot_label(slot: str) -> str:
+    return SLOT_LABELS.get(slot, slot)
+
+
+def _backend_label(backend_id: str) -> str:
+    return BACKEND_LABELS.get(backend_id, backend_id or "（未知）")
+
+
+def _as_dict(value: Any) -> Dict[str, Any]:
+    """当字典用；不是字典就当成空。
+
+    **为什么值得一个小函数**：这些值来自盘上的 `meta.json` —— 可能是老版本写的，
+    也可能被人手工编辑过。一个 `"picks": "oops"` 就让 `plan_summary` 抛异常，
+    而它的调用方是"打开会议详情"：**一场会的详情页不该因为元数据里一个字段坏了就打不开**。
+    （这条是被 `test_it_never_raises_on_a_hand_edited_file` 抓出来的 —— 第一版我直接
+    `.items()`，一改坏就 500。）
+    """
+    return value if isinstance(value, dict) else {}
+
+
+def _as_list(value: Any) -> list:
+    """当列表用；不是列表就当成空（字符串也算"不是列表" —— 它会被逐字符拆开）。"""
+    return list(value) if isinstance(value, (list, tuple)) else []
+
+
+def plan_summary(plan: Any, timestamps_kinds: Any = None) -> Optional[Dict[str, Any]]:
+    """把会议里记下的执行计划（`Plan.as_dict()` 那份）翻成面板能直接渲染的形状。
+
+    **这是"这场会实际用了谁"的唯一来源。** 读的是录音时写进 `meta.json` 的快照，
+    **不重新算一遍计划**：重算得到的是"现在会选谁"，与"当时选了谁"可能不同
+    （配置改了、后端掉了），而人问的恰恰是后者。
+
+    认不出来的槽 / 后端 / 原因**一律退回原始标识符**，不猜也不丢：宁可让人看到
+    `asr.streaming` 这种内部词，也不要显示一个错误的翻译。
+
+    整个函数**不抛异常**（输入来自盘上可能被手改坏的 `meta.json`）。
+    """
+    if not isinstance(plan, dict):
+        return None
+    picks = []
+    for slot, pick in sorted(_as_dict(plan.get("picks")).items()):
+        if not isinstance(pick, dict):
+            continue
+        picks.append({
+            "slot": slot, "slotLabel": _slot_label(slot),
+            "backendId": pick.get("backendId", ""),
+            "backendLabel": _backend_label(pick.get("backendId", "")),
+            "vectorSpaceId": pick.get("vectorSpaceId", ""),
+        })
+    skipped = []
+    for item in _as_list(plan.get("skipped")):
+        if not isinstance(item, dict):
+            continue
+        reason = str(item.get("reason") or "")
+        skipped.append({
+            "slot": item.get("slot", ""), "slotLabel": _slot_label(item.get("slot", "")),
+            "backendId": item.get("backendId", ""),
+            "backendLabel": _backend_label(item.get("backendId", "")),
+            "reason": reason,
+            "reasonLabel": REASON_LABELS.get(reason, reason or "（没给原因）"),
+            "detail": str(item.get("detail") or ""),
+        })
+    kinds: Dict[str, int] = {}
+    for key, value in _as_dict(timestamps_kinds).items():
+        try:
+            n = int(value)
+        except (TypeError, ValueError):
+            continue                    # 数不出来就当没记过 —— 别让详情页打不开
+        if n:
+            kinds[str(key)] = n
+    if not (picks or skipped or kinds):
+        # 什么都没记（老会议 / 走的是本机回退路径）→ 返回 None 当"没有这段信息"，
+        # 而不是给面板一个空壳（空壳会渲染成"用了谁：无"，看着像出了问题）。
+        return None
+    return {
+        "picks": picks,
+        "skipped": skipped,
+        # `candidates` / `notes` 原样带上：排障细节，面板自己决定折起来还是展开，
+        # 服务端不预先删减（删了就得在别处再判一次"哪些值得留"）。
+        "candidates": dict(_as_dict(plan.get("candidates"))),
+        "notes": [str(n) for n in _as_list(plan.get("notes"))],
+        "vectorSpaceId": plan.get("vectorSpaceId", ""),
+        "timestampsKinds": kinds,
+        "timestampsLabel": "；".join(
+            "%s × %d" % (TIMESTAMPS_LABELS.get(k, k), v) for k, v in sorted(kinds.items())),
+    }
+
 
 def _setting(key, default=None):
     try:

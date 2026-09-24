@@ -2064,6 +2064,29 @@ def get_meeting_detail(meeting_id):
     }
 
 
+def meeting_meta(meeting_name: str) -> dict:
+    """读一场会的 `meta.json`（读不到/坏了都返回 `{}`）。
+
+    为什么要一个公开入口：**录音当时的那份快照只有这个文件里才有** ——
+    3.0 把"每个槽用了谁、跳过了谁、为什么"（`Plan.as_dict()`）和"时间轴精度档位"
+    都写在这儿（见 `_transcribe_impl`）。会议详情要显示它，而 `_load_json`
+    是模块私有、路径拼接也不该让调用方自己拼。
+
+    **不重新算一遍计划**：配置改了、后端掉了之后重算得到的是"现在会选谁"，
+    与人问的"当时用了谁"是两件事。
+    """
+    if not meeting_name:
+        return {}
+    # 目录名只取最后一段：库里的 name 正常不会带分隔符，但这条路径是**读文件**，
+    # 值得花一行把 `..` / 分隔符挡在门外（api.py 的 `_meeting_dirname` 同理）。
+    safe = os.path.basename(str(meeting_name).replace("\\", "/").rstrip("/"))
+    if not safe:
+        return {}
+    path = os.path.join(meetings_dir(), safe, "meta.json")
+    data = _load_json(path, {})
+    return data if isinstance(data, dict) else {}
+
+
 def delete_meeting(meeting_id):
     """删除会议：DB 记录 + （可选）音频文件。"""
     meeting = db.get_meeting(meeting_id)

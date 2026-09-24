@@ -255,5 +255,136 @@ class EndpointTests(_Isolated):
         self.assertNotIn(_PAIR_OK["secret"], self.client.get("/api/capability").text)
 
 
+class MeetingDetailWiringTests(_Isolated):
+    """会议详情接口要把**录音时那份执行计划**带出来（3.0 的最后一环）。
+
+    这里只钉"接口带没带、翻没翻"：`meeting.get_meeting_detail()` 与 `meeting_meta()`
+    各自的行为由 `tests/test_meeting_capability.py` 钉着，两处不重复测同一件事。
+    """
+
+    def _detail(self, meta):
+        from app import meeting
+        row = {"id": 1, "name": "2026-09-24_15-03-13", "segments": 2,
+               "status": "transcribed", "duration_seconds": 600}
+        with mock.patch.object(meeting, "get_meeting_detail", lambda mid: dict(row)), \
+             mock.patch.object(meeting, "build_segments", lambda mid: []), \
+             mock.patch.object(meeting, "meeting_meta", lambda name: meta):
+            return self.client.get("/api/meetings/1")
+
+    def test_it_carries_the_recorded_plan_with_labels(self):
+        from app.capabilities.router import Pick, Plan, Skipped
+        plan = Plan(picks={"asr.text": Pick("asr.text", "echo-server", "")},
+                    skipped=[Skipped("asr.text", "local", "absent", "没装")]).as_dict()
+        r = self._detail({"capability": plan, "timestampsKinds": {"exact": 2}})
+        self.assertEqual(r.status_code, 200, r.text)
+        cap = r.json()["capability"]
+        self.assertEqual(cap["picks"][0]["backendLabel"], "ECHO 后端")
+        self.assertEqual(cap["picks"][0]["slotLabel"], "转写文本")
+        self.assertIn("不在位", cap["skipped"][0]["reasonLabel"])
+        self.assertEqual(cap["timestampsKinds"], {"exact": 2})
+
+    def test_a_meeting_without_a_recorded_plan_says_none(self):
+        """老会议、或者走本机回退那条路：没有这段信息就是 `None`（不是空壳）。"""
+        r = self._detail({})
+        self.assertEqual(r.status_code, 200)
+        self.assertIsNone(r.json()["capability"])
+
+    def test_a_corrupt_meta_json_does_not_break_the_detail_page(self):
+        """`meta.json` 被手改坏 → 详情页照样打得开（只是没有那段信息）。"""
+        r = self._detail({"capability": "这不是字典", "timestampsKinds": "也不是"})
+        self.assertEqual(r.status_code, 200)
+        self.assertIsNone(r.json()["capability"])
+
+
+class PlanSummaryTests(unittest.TestCase):
+    """`plan_summary()`：把会议里记下的执行计划翻成人话。
+
+    输入是**录音当时的快照**（`meta.json` 里的 `Plan.as_dict()`），所以用例直接用
+    那个函数生成输入，而不是手写一个"我以为的形状" —— 手写的迟早与真形状漂开，
+    然后翻译静默出错（面板照常渲染，只是显示的东西不对）。
+    """
+
+    def _plan(self):
+        from app.capabilities.router import Pick, Plan, Skipped
+        return Plan(picks={"asr.text": Pick("asr.text", "echo-server", "优先"),
+                           "diarize.turns": Pick("diarize.turns", "local", "")},
+                    skipped=[Skipped("asr.text", "local", "absent", "没装 whisper"),
+                             Skipped("diarize.turns", "echo-server", "blocked", "privacy=lan")],
+                    candidates={"asr.text": ["echo-server"]},
+                    vector_space_id="ws-x", notes=["第一次尝试失败，换了后端"]).as_dict()
+
+    def test_it_labels_slots_backends_and_reasons(self):
+        out = capability_admin.plan_summary(self._plan(), {"exact": 3, "estimated": 1})
+        self.assertIsNotNone(out)
+        picked = {p["slot"]: p for p in out["picks"]}
+        self.assertEqual(picked["asr.text"]["backendLabel"], "ECHO 后端")
+        self.assertEqual(picked["diarize.turns"]["backendLabel"], "本机")
+        self.assertNotEqual(picked["asr.text"]["slotLabel"], "asr.text", "槽没翻成中文")
+        reasons = {s["backendId"]: s for s in out["skipped"]}
+        self.assertIn("不在位", reasons["local"]["reasonLabel"])
+        self.assertIn("策略", reasons["echo-server"]["reasonLabel"])
+        self.assertEqual(out["timestampsKinds"], {"exact": 3, "estimated": 1})
+        self.assertIn("精确", out["timestampsLabel"])
+        self.assertIn("估算", out["timestampsLabel"])
+
+    def test_it_keeps_the_details_the_panel_may_need(self):
+        """`candidates` / `notes` / `vectorSpaceId` 原样带上（服务端不预判哪些值得留）。"""
+        out = capability_admin.plan_summary(self._plan(), None)
+        self.assertEqual(out["candidates"], {"asr.text": ["echo-server"]})
+        self.assertEqual(out["notes"], ["第一次尝试失败，换了后端"])
+        self.assertEqual(out["vectorSpaceId"], "ws-x")
+
+    def test_unknown_reason_falls_back_to_the_raw_token(self):
+        """**不许猜翻译**：认不出的原因原样显示，让人能拿去搜。"""
+        plan = {"picks": {}, "skipped": [{"slot": "asr.text", "backendId": "local",
+                                          "reason": "weird-new-reason", "detail": ""}]}
+        out = capability_admin.plan_summary(plan, None)
+        self.assertEqual(out["skipped"][0]["reasonLabel"], "weird-new-reason")
+
+    def test_unknown_slot_and_backend_fall_back_too(self):
+        """认不出的槽/后端原样显示 —— 但**别拿真存在的槽当"不认识的"**：
+        `asr.streaming` 在 `SLOT_LABELS` 里是有中文的（"流式转写"），
+        第一版用例拿它当未知槽，断言直接被打回来。"""
+        plan = {"picks": {"asr.weird-thing": {"backendId": "brand-new-backend"}},
+                "skipped": []}
+        out = capability_admin.plan_summary(plan, None)
+        self.assertEqual(out["picks"][0]["slotLabel"], "asr.weird-thing")
+        self.assertEqual(out["picks"][0]["backendLabel"], "brand-new-backend")
+
+    def test_every_authoritative_reason_has_a_sentence(self):
+        """权威十词**每一个**都要有中文 —— 少一个，界面上就会出现英文 token。
+
+        防的是"加了新错误码/新原因，却忘了配文案"：词汇表在 `base.SKIP_REASONS`，
+        翻译在这里，两处必须一起长。
+        """
+        from app.capabilities.base import SKIP_REASONS
+        missing = sorted(set(SKIP_REASONS) - set(capability_admin.REASON_LABELS))
+        self.assertEqual(missing, [], "这些降级原因没有中文文案：%s" % missing)
+
+    def test_every_timestamps_kind_has_a_sentence(self):
+        from app.capabilities import assemble
+        kinds = (assemble.TIMESTAMPS_EXACT, assemble.TIMESTAMPS_ALIGNED,
+                 assemble.TIMESTAMPS_ESTIMATED, assemble.TIMESTAMPS_NONE)
+        missing = [k for k in kinds if k not in capability_admin.TIMESTAMPS_LABELS]
+        self.assertEqual(missing, [], "这些档位没有中文文案：%s" % missing)
+
+    def test_nothing_recorded_is_none_not_an_empty_shell(self):
+        """老会议 / 走本机回退那条路没有这段信息 → `None`，不是空壳。
+
+        空壳会让面板渲染出"用了谁：无"，看着像出了问题。
+        """
+        self.assertIsNone(capability_admin.plan_summary(None, None))
+        self.assertIsNone(capability_admin.plan_summary({}, {}))
+        self.assertIsNone(capability_admin.plan_summary({"picks": {}, "skipped": []}, None))
+
+    def test_it_never_raises_on_a_hand_edited_file(self):
+        """`meta.json` 是盘上的文件，可能被人手改坏 —— 翻译**不许炸**（炸了就是详情页打不开）。"""
+        for junk in ({"picks": "not-a-dict"}, {"skipped": [None, 1, "x"]},
+                     {"picks": {"asr.text": "b"}}, {"skipped": "nope"},
+                     {"picks": {"asr.text": {"backendId": None}}}):
+            with self.subTest(junk=junk):
+                capability_admin.plan_summary(junk, {"exact": "not-a-number"})
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -813,6 +813,13 @@ def get_meeting(mid: int, _auth=Depends(optional_auth)):
     detail["segments"] = meeting.build_segments(mid)
     folder = os.path.join(meeting.meetings_dir(), detail["name"])
     detail["hasSegments"] = os.path.isfile(os.path.join(folder, "topics.md"))
+    # 3.0：这场会**实际**用了哪个后端、跳过了谁、为什么（录音时写进 meta.json 的快照）。
+    # 翻译成面板能直接渲染的形状放在 capability_admin —— 槽/后端/原因的中文名那里
+    # 已经有一份，别在面板的 JS 里再抄一份词汇表。没有这段信息时是 None（老会议）。
+    from app import capability_admin
+    meta = meeting.meeting_meta(detail["name"])
+    detail["capability"] = capability_admin.plan_summary(
+        meta.get("capability"), meta.get("timestampsKinds"))
     return detail
 
 

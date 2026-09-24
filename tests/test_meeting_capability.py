@@ -197,13 +197,21 @@ class SessionDecisionTests(unittest.TestCase):
     """**什么情况下才走能力后端** —— 这条决定了"没配后端时行为不变"。"""
 
     def test_no_backend_configured_means_no_session(self):
-        """没配地址 → 返回 None → `_transcribe_impl` 走原来那段本地代码。"""
+        """没配地址**也没配对** → 返回 None → `_transcribe_impl` 走原来那段本地代码。
+
+        **两处都要打桩**：地址有两个来源，配对凭据那条路现在也会让后端"存在"
+        （`client_from_settings()`）。只堵设置那一条的话，这台机器哪天真配了对，
+        这条用例就会红 —— 而它报的是"没配后端却开了 session"，指不到真正的原因。
+        """
         import app.meeting as meeting
+        from app.capabilities import credentials, echo_server
         from app.config import settings
         with patch.object(settings, "get",
                           lambda k, d=None: "" if k == "capabilityEchoServerUrl" else d), \
+             patch.object(echo_server, "_creds", lambda: None), \
              patch.multiple("app.meeting.db", add_log=lambda *a, **k: None):
             self.assertIsNone(meeting._capability_asr_session(CFG))
+        self.assertTrue(callable(credentials.load))     # 别把整个模块的入口打没了
 
     def test_configured_and_reachable_backend_produces_a_session(self):
         """配了**且真的可用**的后端 → 给出 session（不是 None）。
@@ -252,6 +260,53 @@ class SessionDecisionTests(unittest.TestCase):
                         "静默退化了，没留下原因：%s" % logged)
         self.assertTrue(any("原因" in m for _lv, _s, m in logged),
                         "日志里要写出 skip 的原因（连不上 / privacy 不允许 …）")
+
+
+class MeetingMetaTests(unittest.TestCase):
+    """`meeting.meeting_meta()`：会议详情要读的那份"录音当时"的快照。
+
+    这场会实际用了哪个后端**只在这里**（`meta.json` 的 `capability`），
+    所以详情页能不能回答那个问题，全看这个函数读得对不对。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="echo-meeting-meta-")
+        p = patch("app.meeting.meetings_dir", lambda: self.tmp)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _write(self, name, payload):
+        d = os.path.join(self.tmp, name)
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "meta.json"), "w", encoding="utf-8") as fh:
+            fh.write(payload if isinstance(payload, str) else json.dumps(payload))
+        return name
+
+    def test_it_reads_back_what_the_recorder_wrote(self):
+        import app.meeting as meeting
+        name = self._write("2026-09-24_15-03-13", {"capability": {"picks": {}},
+                                                  "timestampsKinds": {"exact": 2}})
+        got = meeting.meeting_meta(name)
+        self.assertEqual(got["timestampsKinds"], {"exact": 2})
+
+    def test_missing_or_broken_file_is_an_empty_dict_not_an_exception(self):
+        """读不到 / 内容坏了都返回 `{}`：**一场会的详情页不该因为元数据坏了就打不开**。"""
+        import app.meeting as meeting
+        self.assertEqual(meeting.meeting_meta("没有这场会"), {})
+        self.assertEqual(meeting.meeting_meta(""), {})
+        self.assertEqual(meeting.meeting_meta(None), {})
+        broken = self._write("坏文件", "{这不是 JSON")
+        self.assertEqual(meeting.meeting_meta(broken), {})
+        notdict = self._write("不是对象", "[1, 2, 3]")
+        self.assertEqual(meeting.meeting_meta(notdict), {})
+
+    def test_a_name_with_separators_cannot_escape_the_meetings_root(self):
+        """库里的 name 正常不会带路径分隔符，但这条路径是**读文件** —— 花一行挡住它。"""
+        import app.meeting as meeting
+        outside = os.path.join(self.tmp, "..", "secret")
+        os.makedirs(os.path.dirname(outside), exist_ok=True)
+        self.assertEqual(meeting.meeting_meta("../../secret"), {})
+        self.assertEqual(meeting.meeting_meta("..\\..\\secret"), {})
 
 
 if __name__ == "__main__":
