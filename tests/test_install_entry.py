@@ -336,6 +336,48 @@ class DownloadClientTests(unittest.TestCase):
                         % names)
 
 
+class MacInstallBaseLayoutTests(unittest.TestCase):
+    """mac 侧的脚本也要认安装根布局（同一条判据，三处一起守）。
+
+    为什么值得单独钉：**"只在 Windows 上想到"这类漏改已经出现两次** ——
+    `launch-desktop.ps1` 漏了（同事实测报 `venv missing`）、`startup.ps1`/`restart-echo.ps1`
+    漏了两处（端口文件永远读不到）。mac 这边同样的三件东西（venv / data / 启动脚本）
+    一旦落进 `echo-core`，后果是"升级整体覆盖代码"时把运行时和数据一起删掉（L6）。
+    """
+
+    def _text(self, name):
+        with open(os.path.join(ROOT, "mac", name), encoding="utf-8") as fh:
+            return fh.read()
+
+    def test_each_runtime_script_computes_both_roots(self):
+        for name in ("setup_mac.sh", "start_mac.sh", "stop_mac.sh"):
+            text = self._text(name)
+            with self.subTest(script=name):
+                self.assertIn('basename "$CODE"', text,
+                              "%s 没有'代码目录叫 echo-core 就上提一层'的判据" % name)
+                self.assertIn('BASE="$CODE"', text, "%s 没有 BASE（安装根）" % name)
+
+    def test_the_venv_is_created_in_the_install_base(self):
+        self.assertIn('venv "$BASE/venv"', self._text("setup_mac.sh"),
+                      "venv 建在 echo-core 里 → 升级覆盖代码会把运行时一起删掉")
+
+    def test_the_running_scripts_use_the_base_venv_and_data(self):
+        start = self._text("start_mac.sh")
+        self.assertIn('"$BASE/venv/bin/python"', start)
+        self.assertIn('"$BASE/data/logs"', start)
+        self.assertNotIn("./venv/bin/python", start, "还在用代码目录里的 venv")
+        stop = self._text("stop_mac.sh")
+        self.assertIn('PID_FILE="$BASE/data/echo-mac.pid"', stop,
+                      "pid 文件按代码目录找 → 停不掉真进程（或误判没在跑）")
+
+    def test_the_installer_runs_the_path_probe_in_the_code_dir(self):
+        """`from app import paths` 必须在**代码目录**里跑：安装根里没有 app 包。"""
+        with open(SH, encoding="utf-8") as fh:
+            text = fh.read()
+        self.assertIn('cd "$CODE" && "$PY" -c \'from app import paths', text,
+                      "数据根探测跑在安装根里 → ImportError → 回落成错的目录")
+
+
 class MacScriptPortabilityTests(unittest.TestCase):
     """mac 脚本必须能在**系统自带的 bash 3.2** 上跑（开发机是 5.x，测不出来）。"""
 

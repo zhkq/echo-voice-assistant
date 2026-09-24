@@ -53,7 +53,7 @@ fi
 # ~/Library/Application Support/ECHO），写死 data/echo-port.txt 会读到空文件、
 # 于是打印出首选端口而不是真实端口。这里问应用自己的路径层要数据根
 # （与 mac_runtime.py 传给浮动框的 --data 同源）。
-DATA_DIR="$(./venv/bin/python -c "from app import paths; print(paths.data_root())" 2>/dev/null || true)"
+DATA_DIR="$("$BASE/venv/bin/python" -c "from app import paths; print(paths.data_root())" 2>/dev/null || true)"
 [ -n "$DATA_DIR" ] || DATA_DIR="$DIR/data"
 PORT=""
 for _ in 1 2 3 4 5 6; do
@@ -61,7 +61,7 @@ for _ in 1 2 3 4 5 6; do
   sleep 0.5
 done
 if [ -z "$PORT" ]; then
-  PORT="$(./venv/bin/python -c "from app.config import settings; print(int(settings.get('serverPort', 8970)))" 2>/dev/null || echo 8970)"
+  PORT="$("$BASE/venv/bin/python" -c "from app.config import settings; print(int(settings.get('serverPort', 8970)))" 2>/dev/null || echo 8970)"
 fi
 echo "ECHO 已启动（pid $NEW_PID）"
 echo "面板： http://127.0.0.1:$PORT"

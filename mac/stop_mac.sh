@@ -1,21 +1,24 @@
 #!/usr/bin/env bash
 # stop_mac.sh — 停止 ECHO（macOS）
-DIR="$(cd "$(dirname "$0")/.." && pwd)"
-cd "$DIR"
+# 3.0 安装根布局：代码目录名叫 echo-core 时安装根是它的父目录（venv/ 与 data/ 在那边）。
+CODE="$(cd "$(dirname "$0")/.." && pwd)"
+BASE="$CODE"
+if [ "$(basename "$CODE")" = "echo-core" ]; then BASE="$(cd "$CODE/.." && pwd)"; fi
+cd "$CODE"
 
-if [ -z "${ECHO_DATA:-}" ] && [ -f "$DIR/data/echo.db" ]; then
-  export ECHO_DATA="$DIR/data"
+if [ -z "${ECHO_DATA:-}" ] && [ -f "$BASE/data/echo.db" ]; then
+  export ECHO_DATA="$BASE/data"
 fi
 
-PID_FILE="data/echo-mac.pid"
+PID_FILE="$BASE/data/echo-mac.pid"
 # 端口优先取 echo-port.txt（ECHO 让位后的实际端口）；读不到才回退配置的首选端口。
 # 数据根问应用的路径层要：全新安装时它是平台默认目录，不是仓库的 data/。
 # 否则兜底清理会去清一个没人监听的端口，真残留反而留在那里。
-DATA_DIR="$(./venv/bin/python -c "from app import paths; print(paths.data_root())" 2>/dev/null || true)"
-[ -n "$DATA_DIR" ] || DATA_DIR="$DIR/data"
+DATA_DIR="$("$BASE/venv/bin/python" -c "from app import paths; print(paths.data_root())" 2>/dev/null || true)"
+[ -n "$DATA_DIR" ] || DATA_DIR="$BASE/data"
 PORT="$(cat "$DATA_DIR/echo-port.txt" 2>/dev/null || true)"
 if [ -z "$PORT" ]; then
-  PORT="$(./venv/bin/python -c "from app.config import settings; print(int(settings.get('serverPort', 8970)))" 2>/dev/null || echo 8970)"
+  PORT="$("$BASE/venv/bin/python" -c "from app.config import settings; print(int(settings.get('serverPort', 8970)))" 2>/dev/null || echo 8970)"
 fi
 
 is_echo_pid() {
