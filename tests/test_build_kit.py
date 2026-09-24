@@ -214,6 +214,26 @@ class DeployStableUsesTheKitSelector(unittest.TestCase):
         except UnicodeDecodeError as exc:
             self.fail("deploy-stable.ps1 必须是纯 ASCII：%s" % exc)
 
+    def test_overlays_into_the_code_dir_of_the_target(self):
+        """3.0 新布局的目标机把代码放在 `<DestDir>\\echo-core`。
+
+        原来这里无条件 `Copy-Item <kit>\\ECHO\\* -> DestDir` —— 往新布局的机器上部署会**拷错一层**
+        （代码散在安装根上，`app` 包进不了 `sys.path`）。脚本按"目标里有没有
+        `echo-core\\app\\main.py`"判布局（与 `app/paths.py:echo_base()` 同一条），
+        覆盖目标与第 5 步验证的 `Push-Location` 都跟着走。
+        """
+        self.assertIn("$destCode", self.text, "没有按布局算出的覆盖目标")
+        self.assertIn("echo-core\\app\\main.py", self.text, "判据不见了")
+        self.assertIn("Copy-Tree $srcEcho $destCode", self.text,
+                      "覆盖代码时必须落到代码目录，而不是无条件落到 DestDir")
+        self.assertIn("Push-Location $destCode", self.text,
+                      "验证那步也要在代码目录里跑（compileall app / import app）")
+
+    def test_the_skill_lands_beside_the_code(self):
+        """安装技能跟着代码走：新布局进 `<DestDir>\\echo-core\\.dsh\\skills\\echo-install`。"""
+        self.assertIn("$destSkill", self.text)
+        self.assertIn("Copy-Tree $srcSkill $destSkill", self.text)
+
 
 class StalenessJudgement(unittest.TestCase):
     """`--check` 的判据：包里记的哈希 vs 仓库现在的内容。"""
