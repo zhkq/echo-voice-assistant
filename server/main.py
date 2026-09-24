@@ -197,7 +197,7 @@ def _admin_cli(cfg, args) -> int:
         # 而且**说的事一样**（没有这个客户端）。`--revoke` 更糟：它会打印
         # "已撤销 xxx（token_version → 0）"，看着像成功了。
         target = (args.show_client or args.revoke or args.disable or args.enable
-                  or args.set_scopes or args.rotate_secret)
+                  or args.set_scopes or args.rotate_secret or args.set_quota)
         if target:
             row = store.client(target)
             if row is None:
@@ -266,6 +266,21 @@ def _admin_cli(cfg, args) -> int:
             print("已把 %s 的 scopes 改成：%s" % (args.set_scopes, scopes or "(不限)"))
             print("**下一个请求就生效** —— 鉴权读的是库里的行，不是 JWT 里的声明。")
             return 0
+        if args.set_quota:
+            minutes = float(args.daily_audio_minutes or 0)
+            a.set_quota(args.set_quota, minutes)
+            if minutes > 0:
+                print("已把 %s 的每日音频上限设成 %.1f 分钟。" % (args.set_quota, minutes))
+            else:
+                print("已把 %s 的每日音频上限设成 0（= 用全局默认，也就是 %s 分钟；0 表示不限）。"
+                      % (args.set_quota, cfg.get("limits.daily_audio_minutes", 0)))
+            # 两件必须说清楚的事，否则会被理解成"改了立刻全网生效、并且已用量归零"：
+            print("注意：① **今天的已用量不清零**（额度是按自然日算的），只有上限变了；"
+                  "上限的下一个请求就生效（鉴权缓存到期最迟 %s 秒）。"
+                  % cfg.get("auth.client_cache_ttl_s", 60))
+            print("      ② 用量计数在**进程内**，所以多实例部署时各实例各算一份"
+                  "（设计 §7.2 写明的取舍）。")
+            return 0
         if args.rotate_secret:
             secret = a.rotate_secret(args.rotate_secret)
             print("已轮换 %s 的 secret。**新的明文只出现这一次**：" % args.rotate_secret)
@@ -307,6 +322,10 @@ def main(argv=None) -> int:
                     help="改 scopes，配合 --scopes（下一个请求就生效）")
     ap.add_argument("--rotate-secret", default="", metavar="CLIENT_ID",
                     help="换 secret 并打印新的（只出现这一次）；旧令牌立即失效")
+    ap.add_argument("--set-quota", default="", metavar="CLIENT_ID",
+                    help="改这个客户端的每日音频分钟数上限（配合 --daily-audio-minutes）")
+    ap.add_argument("--daily-audio-minutes", default="0", metavar="N",
+                    help="每日音频分钟数；0 = 用全局默认（limits.daily_audio_minutes）")
     args = ap.parse_args(argv)
 
     logging.basicConfig(level=getattr(logging, str(args.log_level).upper(), logging.INFO),
@@ -317,7 +336,7 @@ def main(argv=None) -> int:
 
     admin_actions = (args.new_client, args.new_pairing_code, args.list_clients,
                      args.list_codes, args.show_client, args.revoke, args.disable,
-                     args.enable, args.set_scopes, args.rotate_secret)
+                     args.enable, args.set_scopes, args.rotate_secret, args.set_quota)
     if any(admin_actions):
         return _admin_cli(cfg, args)
 

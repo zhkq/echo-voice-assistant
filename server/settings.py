@@ -37,6 +37,11 @@ DEFAULTS: Dict[str, Any] = {
         "max_upload_bytes": 64 * 1024 * 1024,
         "inference_timeout_s": 900,
         "load_timeout_s": 300,          # 等模型加载完的上限
+        # 每客户端每日音频分钟数上限；**0 = 不限**（出厂值）。
+        # 出厂给 0 的理由：v1 先在单机/小范围用，"一上来就限死"会让人以为服务端坏了。
+        # 但它必须**可配、而且有执行者**（`server/quota.py` 与 `--set-quota`），
+        # 否则就是设计 §7.2 里那句"没有执行者的话"。
+        "daily_audio_minutes": 0,
     },
     "tmp": {
         "root": "",                     # 空 = 系统临时目录下的 echo-server

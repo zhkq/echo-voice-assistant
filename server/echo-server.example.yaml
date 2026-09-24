@@ -24,6 +24,11 @@ limits:
   max_upload_bytes: 67108864
   load_timeout_s: 300
   inference_timeout_s: 900
+  # 每客户端每日音频分钟数上限；0 = 不限（出厂值）。
+  # 给某个客户端单独设上限走命令行：
+  #   python -m server.main --set-quota <client_id> --daily-audio-minutes 120
+  # 注意：用量计数在**进程内**，所以多实例部署时各算一份（设计 §7.2 写明的取舍）。
+  daily_audio_minutes: 0
 
 tmp:
   root: /var/echo/tmp           # 容器里挂的那一个可写卷；想更快就挂 tmpfs

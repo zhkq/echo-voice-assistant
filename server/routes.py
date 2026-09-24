@@ -25,7 +25,7 @@ from fastapi import APIRouter, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 
-from server import __version__, audio as audio_mod, errors, tmp
+from server import __version__, audio as audio_mod, errors, quota, tmp
 from server.pool import EnginePool
 
 router = APIRouter(prefix="/v1")
@@ -118,6 +118,38 @@ class State:
             per_client=cfg.per_client_concurrent,
             retry_after=int(cfg.get("limits.busy_retry_after_s", 5)),
         )
+        # 每日音频分钟数（设计 §7.2）。**进程内计数**：每请求查库会把库变成瓶颈，
+        # 而配额判断正好在每个请求的最前面。代价（多实例各算一份）写在 quota.py 开头。
+        self.quota = quota.open_ledger(cfg, limit_for=self._quota_limit_for)
+
+    def _quota_limit_for(self, client_id: str) -> float:
+        """这个客户端的专属上限（分钟）；0/取不到 = 用全局默认。
+
+        走鉴权缓存（不查库）：`Auth.authenticate` 刚刚才读过同一行，缓存里就是它。
+        """
+        auth = self.auth
+        if auth is None:
+            return 0.0
+        try:
+            row = auth.cache.get(client_id) or {}
+        except Exception:
+            return 0.0
+        try:
+            return float(row.get("daily_audio_minutes") or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    @contextmanager
+    def billing(self, client_id: str, seconds: float):
+        """占通道 + 记这一笔配额。**顺序是有意的：先占通道，再记账。**
+
+        被 `409 client_busy` / `503 server_busy` 顶回去的请求**不计费** ——
+        我们没为它烧 GPU。反过来，通道拿到了、模型要开跑了，即使推理随后失败也计费：
+        那段 GPU 时间是真的花了。
+        """
+        with self.admission.hold(client_id):
+            self.quota.add(client_id, seconds)
+            yield
 
 
 def _st(request: Request) -> State:
@@ -230,6 +262,10 @@ def capabilities(request: Request):
             "maxConcurrent": cfg.max_concurrent,
             "perClientConcurrent": cfg.per_client_concurrent,
             "queueMax": int(cfg.get("limits.queue_max", 0)),
+            # 全局的每日音频分钟数（0 = 不限）。**只给全局值**：这个端点免凭据，
+            # 拿不到客户端身份，也就不能说"你个人还剩多少" —— 那会泄露别人的用量。
+            # 每个客户端自己的剩余量在推理响应的 `quotaRemainingMinutes` 里。
+            "dailyAudioMinutes": st.quota.default_minutes,
         },
         "busy": st.admission.snapshot(),
         "slots": slots,
@@ -256,6 +292,8 @@ def health(request: Request):
         "tmpSweep": (st.sweeper.last.as_dict()
                      if getattr(st.sweeper, "last", None) is not None else None),
         "models": {m["id"]: m["state"] for m in st.pool.status()},
+        # 今天各客户端用了多少分钟（**只有数字，没有内容**）。运维要看"谁在吃 GPU"。
+        "quota": st.quota.snapshot(),
     }
 
 
@@ -348,6 +386,7 @@ async def asr(request: Request, variant: str = "long", timestamps: int = 0,
     # 否则客户端拿到的是"空 body 的错误"，它的降级逻辑就瞎了。
     try:
         cid = client_id_of(request, need_scope="asr")
+        st.quota.check(cid)                    # 今天的额度用完了？**也在读 body 之前**
         model_id = st.pool.pick_for_slot(slot, model)
         spec = st.pool.spec(model_id)
         # **先判忙，再读 body**（同样是"先挑模型、再动字节"的顺序）：
@@ -366,12 +405,18 @@ async def asr(request: Request, variant: str = "long", timestamps: int = 0,
 
         def _infer():
             t0 = time.time()
-            with st.admission.hold(cid):
+            with st.billing(cid, seconds):
                 with st.pool.acquire(model_id) as engine:
                     return _finish_asr(engine, wav, lang, want_ts, model_id, spec,
                                        seconds, t0)
 
-        return await run_in_threadpool(_infer)
+        out = await run_in_threadpool(_infer)
+    remaining = st.quota.remaining_minutes(cid)
+    if remaining is not None:
+        # 让客户端能提前提示"今天快用完了" —— 它自己算不出来（额度在服务端那本账上）。
+        # **不限时不给这个字段**：给 -1 或一个大数，界面都会当成"有额度"去显示。
+        out["quotaRemainingMinutes"] = round(remaining, 1)
+    return out
 
 
 @router.post("/diarize")
@@ -391,6 +436,7 @@ async def diarize(request: Request, mode: str = "segment", maxSpeakers: int = 0,
         cid = client_id_of(request, need_scope="diarize")
         if str(mode) != "segment":
             raise errors.bad_request("mode=%r 尚未实现（v1 只支持 segment）" % mode)
+        st.quota.check(cid)
         model_id = st.pool.pick_for_slot("diarize.turns", model)
         spec = st.pool.spec(model_id)
         st.admission.precheck(cid)             # 先判忙，再读 body
@@ -406,7 +452,7 @@ async def diarize(request: Request, mode: str = "segment", maxSpeakers: int = 0,
 
         def _infer():
             t0 = time.time()
-            with st.admission.hold(cid):
+            with st.billing(cid, seconds):
                 with st.pool.acquire(model_id) as engine:
                     return engine.analyze(wav, max_speakers=int(maxSpeakers) or None), t0
 
@@ -415,7 +461,7 @@ async def diarize(request: Request, mode: str = "segment", maxSpeakers: int = 0,
     for i, lab in enumerate(labels or []):
         if i < len(embs):
             speakers[str(lab)] = [round(float(x), 6) for x in embs[i]]
-    return {
+    out = {
         "modelId": model_id,
         "modelVersion": spec.model_version,
         # 客户端比较两批嵌入的**唯一**依据（不是模型名）
@@ -427,6 +473,10 @@ async def diarize(request: Request, mode: str = "segment", maxSpeakers: int = 0,
         "audioSeconds": round(seconds, 2),
         "durationMs": int((time.time() - t0) * 1000),
     }
+    remaining = st.quota.remaining_minutes(cid)
+    if remaining is not None:
+        out["quotaRemainingMinutes"] = round(remaining, 1)
+    return out
 
 
 @router.post("/speaker/embed")
@@ -440,6 +490,7 @@ async def speaker_embed(request: Request, count: int = 1, model: str = ""):
     cfg = st.cfg
     try:
         cid = client_id_of(request, need_scope="embed")
+        st.quota.check(cid)
         model_id = st.pool.pick_for_slot("speaker.embed", model)
         spec = st.pool.spec(model_id)
         st.admission.precheck(cid)             # 先判忙，再读 body
@@ -455,13 +506,13 @@ async def speaker_embed(request: Request, count: int = 1, model: str = ""):
 
         def _infer():
             t0 = time.time()
-            with st.admission.hold(cid):
+            with st.billing(cid, seconds):
                 with st.pool.acquire(model_id) as engine:
                     return engine.embed(wav), t0
 
         (vecs, _labels), t0 = await run_in_threadpool(_infer)
     want = max(1, int(count or 1))
-    return {
+    out = {
         "embeddings": [[round(float(x), 6) for x in v] for v in (vecs or [])[:want]],
         "dim": int(spec.dim or 0),
         "vectorSpaceId": spec.vector_space_id,
@@ -469,3 +520,7 @@ async def speaker_embed(request: Request, count: int = 1, model: str = ""):
         "audioSeconds": round(seconds, 2),
         "durationMs": int((time.time() - t0) * 1000),
     }
+    remaining = st.quota.remaining_minutes(cid)
+    if remaining is not None:
+        out["quotaRemainingMinutes"] = round(remaining, 1)
+    return out

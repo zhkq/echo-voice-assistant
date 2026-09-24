@@ -17,7 +17,7 @@
 """
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 #: 面板上的中文名。**放这一层而不是契约层**：`base.SLOTS` 是给路由用的词汇表，
 #: 往里面塞展示文案会让"契约"变成"界面"。

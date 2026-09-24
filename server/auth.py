@@ -470,6 +470,18 @@ class Auth:
         self.store.set_scopes(client_id, scopes)
         self.cache.forget(client_id)          # 下一请求重新读库，立即生效
 
+    def set_quota(self, client_id: str, daily_audio_minutes: float) -> None:
+        """改每日音频分钟数上限（0 = 用全局默认）。
+
+        与 `set_scopes` 一样走 `cache.forget()` → **下一个请求就按新上限判**。
+        但**不清零已用量**：额度按自然日算（`quota.py`），改上限不该变成"送你一次重置"。
+        """
+        if self.store.client(client_id) is None:
+            raise errors.EchoError(404, "client_not_found",
+                                   "没有这个客户端", detail=client_id)
+        self.store.set_quota(client_id, daily_audio_minutes)
+        self.cache.forget(client_id)
+
     def set_disabled(self, client_id: str, disabled: bool) -> None:
         if self.store.client(client_id) is None:
             raise errors.EchoError(404, "client_not_found",

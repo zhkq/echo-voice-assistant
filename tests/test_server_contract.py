@@ -2123,6 +2123,10 @@ class AuthSchemaMigrationTests(unittest.TestCase):
         self.addCleanup(store.close)
         self.assertIn("name", store.columns()["pairing_codes"])
         self.assertIn("scopes", store.columns()["pairing_codes"])
+        # 2026-09-24 补的配额列：老库也要拿到，否则 `--set-quota` 会报 no such column
+        self.assertIn("daily_audio_minutes", store.columns()["clients"])
+        self.assertEqual(store.client("cli-old")["daily_audio_minutes"], 0,
+                         "老客户端该拿到 0（= 用全局默认），不是 None")
         self.assertEqual(store.client("cli-old")["name"], "老客户端", "迁移把数据弄丢了")
 
     def test_new_columns_are_usable_right_away(self):
@@ -2132,6 +2136,245 @@ class AuthSchemaMigrationTests(unittest.TestCase):
         store.put_pairing_code("h", 60, created_by="x", name="带名字的", scopes="asr")
         row = store.pairing_codes()[0]
         self.assertEqual((row["name"], row["scopes"]), ("带名字的", "asr"))
+
+
+class QuotaLedgerTests(unittest.TestCase):
+    """每日音频分钟数（设计 §7.2）。**账本本身**的行为，不碰 HTTP。"""
+
+    def _ledger(self, minutes=0.0, limit_for=None, clock=None):
+        from server import quota as quota_mod
+        return quota_mod.QuotaLedger(default_minutes=minutes, limit_for=limit_for,
+                                     clock=clock)
+
+    def test_zero_means_unlimited_and_says_so(self):
+        """`0 = 不限`。**剩余量返回 `None`**，不是 -1 也不是一个大数 ——
+        后两种客户端都会当成"有额度"去显示，而"不限"该显示成"不限"。"""
+        led = self._ledger(0)
+        led.add("c1", 99999)
+        led.check("c1")                       # 不抛
+        self.assertIsNone(led.remaining_minutes("c1"))
+
+    def test_it_refuses_once_the_quota_is_used_up(self):
+        led = self._ledger(1)                 # 1 分钟
+        led.check("c1")                       # 还没用，放行
+        led.add("c1", 60)
+        with self.assertRaises(Exception) as ctx:
+            led.check("c1")
+        self.assertEqual(ctx.exception.code, "quota_exceeded")
+        self.assertEqual(ctx.exception.status, 429)
+
+    def test_retry_after_points_at_local_midnight(self):
+        """`Retry-After` 要指到**明天 0 点**（额度按本地自然日算），不是固定 5 秒。"""
+        import datetime
+        clock = lambda: datetime.datetime(2026, 9, 24, 23, 30, 0)   # noqa: E731
+        led = self._ledger(1, clock=clock)
+        led.add("c1", 60)
+        with self.assertRaises(Exception) as ctx:
+            led.check("c1")
+        self.assertEqual(ctx.exception.retry_after, 30 * 60)
+
+    def test_the_counter_resets_on_a_new_day(self):
+        import datetime
+        day = {"now": datetime.datetime(2026, 9, 24, 23, 59, 0)}
+        led = self._ledger(1, clock=lambda: day["now"])
+        led.add("c1", 60)
+        with self.assertRaises(Exception):
+            led.check("c1")
+        day["now"] = datetime.datetime(2026, 9, 25, 0, 1, 0)        # 跨天
+        led.check("c1")                       # 新的一天，重新放行
+        self.assertEqual(led.used_minutes("c1"), 0.0)
+
+    def test_a_per_client_limit_overrides_the_global_one(self):
+        led = self._ledger(10, limit_for=lambda cid: 1 if cid == "small" else 0)
+        led.add("small", 60)
+        led.add("big", 60)
+        with self.assertRaises(Exception):
+            led.check("small")                # 它的专属上限是 1 分钟
+        led.check("big")                      # 它用全局的 10 分钟
+        self.assertEqual(led.limit_minutes("big"), 10)
+
+    def test_a_broken_limit_lookup_falls_back_to_the_global_default(self):
+        """`limit_for` 抛异常时**不能把请求放行成"不限"以外的别的东西** ——
+        回退到全局默认，而不是崩掉整条请求路径。"""
+        def boom(_cid):
+            raise RuntimeError("库挂了")
+        led = self._ledger(1, limit_for=boom)
+        led.add("c1", 60)
+        with self.assertRaises(Exception):
+            led.check("c1")
+
+    def test_garbage_durations_are_ignored(self):
+        """负数 / NaN / 字符串一律当 0：**宁可少算，也不能把额度算成负的**。"""
+        led = self._ledger(1)
+        for bad in (-5, float("nan"), "x", None, {}):
+            led.add("c1", bad)
+        self.assertEqual(led.used_minutes("c1"), 0.0)
+
+    def test_the_snapshot_is_numbers_only(self):
+        """账本快照会进 `/v1/health`，所以里面**只有数字，没有内容**。"""
+        led = self._ledger(3)
+        led.add("cli-1", 90)
+        snap = led.snapshot()
+        self.assertEqual(snap["defaultMinutes"], 3)
+        self.assertEqual(snap["clients"], {"cli-1": 1.5})
+        self.assertTrue(snap["day"])
+
+    def test_it_does_not_pre_emptively_refuse_a_request_that_would_exceed(self):
+        """**只看"已经用完"，不预测"这一条会不会超"。**
+
+        预测量要等解码出音频秒数，而那时 body 已经收完了 —— 那正是设计要避免的
+        "先落盘再说不行"。所以边界上允许最后一次略微超额，超出部分记进今天。
+        这条用例把那个取舍钉住：用掉 59 秒（上限 1 分钟）时**仍然放行**。
+        """
+        led = self._ledger(1)
+        led.add("c1", 59)
+        led.check("c1")                       # 还剩 1 秒，放行
+        led.add("c1", 600)                    # 这一条严重超额
+        with self.assertRaises(Exception):
+            led.check("c1")                   # 下一条才拒
+
+
+class QuotaWiringTests(_AppCase):
+    """配额真的接在路由上。"""
+
+    def test_an_exhausted_client_is_refused_before_a_single_byte_is_read(self):
+        """**判定在读 body 之前**（与 `Admission.precheck` 同一个道理）。
+
+        证据同 `test_precheck_refuses_before_a_single_byte_is_read`：把 `Content-Length`
+        声报成超过上限 —— 先查大小会得到 413，先查配额会得到 429。拿到 429 = 顺序正确。
+        """
+        st = self.app.state.echo
+        st.quota.default_minutes = 1          # 这个实例的上限改成 1 分钟
+        st.quota.add("anonymous", 600)        # 已经用满
+        limit = int(st.cfg.get("limits.max_upload_bytes", 64 * 1024 * 1024))
+        r = self.client.post("/v1/asr", content=b"x" * 1024,
+                            headers={"Content-Type": "audio/wav",
+                                     "Content-Length": str(limit + 1)})
+        self.assertEqual(r.status_code, 429, r.text)
+        self.assertEqual(r.json()["code"], "quota_exceeded")
+        self.assertIn("Retry-After", r.headers)
+
+    def test_a_busy_request_is_not_billed(self):
+        """**先占通道，再记账**：被 `server_busy` 顶回去的请求不该扣额度 ——
+        我们没为它烧 GPU。这条用 `State.billing` 直接钉（不靠两个请求赛跑）。
+        """
+        cfg = _cfg(tempfile.mkdtemp(prefix="echo-srv-quota-"), max_concurrent=1, per_client=1)
+        with patch.object(engines, "build_loaders",
+                          lambda device="cuda": {"fake": _fake_loader}):
+            app = server_main.create_app(cfg)
+            with TestClient(app) as c:
+                st = app.state.echo
+                with st.admission.hold("someone-else"):     # 唯一的通道被占
+                    with self.assertRaises(Exception) as ctx:
+                        with st.billing("anonymous", 60.0):
+                            pass
+                    self.assertEqual(ctx.exception.code, "server_busy")
+                self.assertEqual(st.quota.used_minutes("anonymous"), 0.0,
+                                 "被顶回去的请求扣了额度")
+
+    def test_a_successful_request_is_billed_the_real_audio_seconds(self):
+        r = self.client.post("/v1/asr", content=_wav_bytes(seconds=1.0),
+                             headers={"Content-Type": "audio/wav"})
+        self.assertEqual(r.status_code, 200, r.text)
+        used = self.app.state.echo.quota.used_minutes("anonymous")
+        self.assertAlmostEqual(used, 1.0 / 60.0, places=2,
+                               msg="记的不是真实音频秒数：%s 分钟" % used)
+
+    def test_the_response_says_what_is_left_only_when_there_is_a_limit(self):
+        """有额度时才回 `quotaRemainingMinutes`；**不限时不给这个字段**
+        （给 -1 或一个大数，界面都会当成"有额度"去显示）。"""
+        st = self.app.state.echo
+        r = self.client.post("/v1/asr", content=_wav_bytes(seconds=1.0),
+                             headers={"Content-Type": "audio/wav"})
+        self.assertNotIn("quotaRemainingMinutes", r.json())
+        st.quota.default_minutes = 10
+        r2 = self.client.post("/v1/asr", content=_wav_bytes(seconds=1.0),
+                              headers={"Content-Type": "audio/wav"})
+        self.assertIn("quotaRemainingMinutes", r2.json())
+        left = r2.json()["quotaRemainingMinutes"]
+        # 只用了 1 秒，所以剩下的四舍五入后仍可能等于 10.0 —— 断言范围而不是严格小于
+        self.assertGreater(left, 9.0)
+        self.assertLessEqual(left, 10.0)
+
+    def test_capabilities_exposes_the_global_limit_but_never_per_client_usage(self):
+        """`/v1/capabilities` **免凭据** —— 所以它只能说全局上限，
+        绝不能说"某个客户端今天用了多少"（那是别人的用量）。"""
+        st = self.app.state.echo
+        st.quota.default_minutes = 7
+        st.quota.add("cli-somebody", 600)
+        body = self.client.get("/v1/capabilities").json()
+        self.assertEqual(body["limits"]["dailyAudioMinutes"], 7)
+        self.assertNotIn("cli-somebody", json.dumps(body, ensure_ascii=False))
+
+    def test_health_shows_todays_usage(self):
+        self.app.state.echo.quota.add("anonymous", 90)
+        body = self.client.get("/v1/health").json()
+        self.assertEqual(body["quota"]["clients"].get("anonymous"), 1.5)
+
+
+class QuotaAdminTests(unittest.TestCase):
+    """`--set-quota`：给单个客户端设上限。
+
+    **必须给一个临时 `--config`**：命令行入口会自己开库（`open_store`），
+    不给配置就落到**真实的 state 目录**上 —— 第一版就是这么写的，跑起来报
+    "没有这个客户端"，因为它在看另一个库。这类"测试去动真实状态"的错
+    这个仓库已经踩过好几次（见 AGENTS.md），所以这里照 `AdminCliTests` 的做法
+    写一份临时配置。测试用的库是 `test_quota_cli_*`，**不是** `auth.db`。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="echo-quota-cli-")
+        self.db_path = os.path.join(self.tmp, "auth.db")
+        self.cfg_path = os.path.join(self.tmp, "server.yaml")
+        with open(self.cfg_path, "w", encoding="utf-8") as fh:
+            fh.write("server: {id: quota-cli, listen: '127.0.0.1:8902'}\n"
+                     "auth:\n  enabled: true\n  mode: jwt\n"
+                     "  jwt_secret: '0123456789abcdef0123456789abcdef'\n"
+                     "  db: '%s'\n"
+                     "tmp: {root: '%s'}\n"
+                     "models: {specs: %s}\n" % (self.db_path.replace("\\", "/"),
+                                               self.tmp.replace("\\", "/"),
+                                               json.dumps(FAKE_SPECS)))
+        # 预置一个客户端（等于"装好了的机器"）
+        seed = store_mod.Store(self.db_path)
+        seed.upsert_client("cli-x", "测试机", auth_mod.hash_secret("s", "cli-x"),
+                           scopes="asr")
+        seed.close()
+
+    def _run(self, *argv):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = server_main.main(["--config", self.cfg_path] + list(argv))
+        return code, buf.getvalue()
+
+    def test_it_stores_the_limit_and_makes_it_effective_on_the_next_request(self):
+        code, out = self._run("--set-quota", "cli-x", "--daily-audio-minutes", "120")
+        self.assertEqual(code, 0, out)
+        store = store_mod.Store(self.db_path)
+        self.addCleanup(store.close)
+        self.assertEqual(store.client("cli-x")["daily_audio_minutes"], 120.0)
+        # 生效路径：鉴权缓存里那一行，就是配额账本读的那一行（`State._quota_limit_for`）
+        cfg = settings_mod.load(self.cfg_path)
+        with patch.object(engines, "build_loaders",
+                          lambda device="cuda": {"fake": _fake_loader}):
+            app = server_main.create_app(cfg)
+            with TestClient(app) as c:
+                st = app.state.echo
+                self.assertEqual(st._quota_limit_for("cli-x"), 120.0)
+                self.assertEqual(st.quota.limit_minutes("cli-x"), 120.0)
+                self.assertEqual(c.get("/v1/health").status_code, 200)
+
+    def test_zero_means_use_the_global_default(self):
+        self._run("--set-quota", "cli-x", "--daily-audio-minutes", "0")
+        store = store_mod.Store(self.db_path)
+        self.addCleanup(store.close)
+        self.assertEqual(store.client("cli-x")["daily_audio_minutes"], 0.0)
+
+    def test_an_unknown_client_is_reported_cleanly(self):
+        code, out = self._run("--set-quota", "没有这个", "--daily-audio-minutes", "5")
+        self.assertEqual(code, 1)
+        self.assertIn("没有这个客户端", out)
+        self.assertNotIn("Traceback", out)
 
 
 if __name__ == "__main__":

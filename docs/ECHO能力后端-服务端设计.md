@@ -846,10 +846,26 @@ class TempWorkspace:
 
 #### D. `POST /v1/tts` —— 文本 → 音频（可选，低优先）
 
-**v1 可以是空实现**，`capabilities` 里完全可以不声明它。
+**v1 是空实现**，`capabilities` 里不声明它。
 
 理由：客户端已有系统自带 TTS（SAPI / `say` / espeak，**零依赖**）与 edge-tts（纯 Python）。
 服务端 TTS 只在"想统一音色"或"客户端没有可用音色"时才有价值。
+
+> **2026-09-24 复核：仍然不做，而且理由比原来更硬。** 那轮要把"所有剩余功能"做完时
+> 逐条查了消费方，结论是这个端点在当前架构里**没有位置**：
+>
+> 1. **客户端侧已经拍过板**：`app/capabilities/router.py` 的 `DEFAULT_ORDER` 里写的是
+>    `"tts": ()`，注释是"**不走能力层**（客户端自己的 `providers` 管）"。
+>    要做服务端 TTS，就得先推翻那条决定。
+> 2. **它是廉价本地活**：合成一句话在客户端是毫秒级、不出网；走服务端 = 上行文本 +
+>    下行音频 + 一次排队等待。为了"统一音色"把一次本地操作变成一次网络往返，
+>    与铁律 L1（客户端要轻）和"能本地做就别推给服务端"都相反。
+> 3. **要真做就得选一套权重**（Piper / VITS），而那台 GPU 机器上没有任何 TTS 权重，
+>    也没有测试环境能验证音质与延迟 —— 那等于交付一个装不上、也验不了的功能。
+>
+> 所以 `tts` 这个槽**留在词汇表里**（将来接内网 TTS 服务或第三方 TTS 后端时它就位），
+> 但 v1/v2 都不实现服务端端点。要改这个决定，先答一个问题：
+> **"哪台客户端没有可用音色？"** —— 答不上来就不做。
 
 ---
 
@@ -950,7 +966,24 @@ scopes:  asr | diarize | embed | tts
 
 **v1.5 只落了 scopes 的一半**：`asr` / `diarize` / `embed` 已经在
 `routes.ENDPOINT_SCOPES` 里逐端点声明并强制（`tts` 等有端点时再加）。
-**配额还没做** —— 现在只有 §3.6 的并发闸门，"每日音频分钟数"这类要等 v2。
+
+**每日音频分钟数配额（2026-09-24 已落地，`server/quota.py`）**：全局默认
+`limits.daily_audio_minutes`（出厂 `0` = 不限），单客户端覆盖
+`clients.daily_audio_minutes`（`--set-quota <id> --daily-audio-minutes N`）。
+用完回 **429 `quota_exceeded` + `Retry-After`**（指到**本地明天 0 点**）。
+
+五条**实现时才定下来**的语义，写在这里免得以后被读错：
+
+| 问题 | 定的做法 | 为什么 |
+|---|---|---|
+| 什么时候记账？ | **拿到推理通道之后**（`State.billing`：先 `hold`、再 `add`） | 被 `409/503` 顶回去的请求没烧 GPU，不该扣额度；通道拿到、模型要开跑了，即使推理随后失败也扣（那段 GPU 时间真花了） |
+| 超一点点怎么办？ | **允许最后一次略微超额**（只看"已经用完"，不预测"这一条会不会超"） | 预测量要等解码出音频秒数，而那时 body 已经收完 —— 那正是要避免的"先落盘再说不行"。拿字节数猜时长误差极大，更糟 |
+| "不限"怎么表达？ | 上限 `0`；剩余量**不给字段** | 回 -1 或一个大数，客户端都会当成"有额度"去显示，而"不限"该显示成"不限" |
+| 客户端怎么知道快用完了？ | 推理成功的响应带 `quotaRemainingMinutes`（不限时不带） | 它自己算不出来（额度在服务端那本账上）。`/v1/capabilities` 是**免凭据**端点，只能给全局值 —— 给个人用量等于泄露别人的 |
+| 改了上限，已用量清零吗？ | **不清零**，只有上限变（下一请求生效，缓存到期最迟 60 秒） | 额度按自然日算；改上限不该变成"送你一次重置" |
+
+**没做的**：队列优先级（本来就不排队）、以及把计数搬成多实例共享 ——
+那要外部计数器或按 `client_id` 粘实例（§9.4）。v1 不做，但**不许把日额度说成"精确的"**。
 
 **scopes 的一条约定（容易被写反）**：**空 scopes = 不额外限制**，不是"什么都不许"。
 把空解释成全禁，会让"我明明配了客户端却全 403"变成一个谜；
@@ -966,11 +999,12 @@ scopes:  asr | diarize | embed | tts
 
 | 数据 | 在哪 | 为什么 |
 |---|---|---|
-| 剩余分钟数 / 并发数 | **进程内计数**（滑动窗口） | 每请求查库会让库变成瓶颈 |
+| 今天已用的分钟数 | **进程内**（`server/quota.py` 的 `QuotaLedger`） | 每请求查库会让库变成瓶颈，而配额判断在每个请求的最前面 |
+| 并发数 | **进程内**（`Admission`） | 同上 |
 | 长期统计 | 定期由 `calls_rollup` 承接 | 给运营看，不给鉴权看 |
-| 配额**上限** | 库（`clients` 表） | 改动少，可缓存 |
+| 配额**上限** | 库（`clients.daily_audio_minutes`）+ 配置默认值 | 改动少，可缓存（鉴权缓存里那一行就是它） |
 
-代价：多实例时计数不共享 → **同客户的并发配额按实例各算一份**。
+代价：多实例时计数不共享 → **同一个客户端的日额度与并发配额按实例各算一份**。
 如果这个不可接受，就按 §9.4 把该客户粘到固定实例（按 client_id 哈希一路上游）。
 **这是"能力面不查库"换来的必然取舍，要写在明处。**
 
@@ -1632,6 +1666,7 @@ client_body_temp_path /var/echo/tmp/nginx;
 | `limits.max_upload_bytes` | `64 MiB` | 声明值在读 body 前就检查（§6.5 公共约定） |
 | `limits.load_timeout_s` | `300` | 等模型加载完的上限 |
 | `limits.inference_timeout_s` | `900` | 超了 `504` |
+| `limits.daily_audio_minutes` | **0（不限）** | 每个客户端每日音频分钟数上限（§7.2）。单客户端覆盖走 `--set-quota` |
 | `tmp.root` | 系统临时目录下的 `echo-server` | 容器的临时卷。**可以换 tmpfs** |
 | `tmp.ttl_hours` | `4` | 定时清理删超过这么久的（请求结束本来就会删） |
 | `tmp.sweep_interval_s` | `3600` | 每小时扫一次 |
@@ -1784,10 +1819,20 @@ client_body_temp_path /var/echo/tmp/nginx;
 | `--rotate-secret`：旧 secret 与旧令牌**都立刻失效**，新的能用 | ✅ | `AdminCliTests.test_rotate_secret_kills_both_...` |
 | 不存在的 client_id：一句人话 + 退出码 1，不是 traceback | ✅ | `AdminCliTests.test_unknown_client_ids_are_reported_cleanly` |
 | 版本号只增不减（否则旧令牌会"复活"） | ✅ | `AdminCliTests.test_version_only_ever_goes_up` |
-| 已存在的旧库会自动补 `name`/`scopes` 列，且**数据不丢** | ✅ | `AuthSchemaMigrationTests` |
+| 已存在的旧库会自动补 `name`/`scopes`（配对码）与 `daily_audio_minutes`（客户端），且**数据不丢** | ✅ | `AuthSchemaMigrationTests` |
 | **公开端点表之外的端点，匿名请求一律 401/403**（遍历 OpenAPI，不靠人记） | ✅ | `PublicSurfaceTests.test_every_other_endpoint_rejects_an_anonymous_request` |
 | 公开表里写了的那三个**真能匿名用**（不然探针会因鉴权失败而"显示不健康"） | ✅ | `PublicSurfaceTests.test_the_documented_public_endpoints_are_actually_reachable` |
-| 配额（日额度 / 音频分钟数，§7.2） | ⏳ | 还没做；现在只有并发闸门 |
+| 配额用完 → **429 `quota_exceeded`**，`Retry-After` 指到本地明天 0 点 | ✅ | `QuotaLedgerTests.test_it_refuses_once_the_quota_is_used_up` / `test_retry_after_points_at_local_midnight` |
+| **判定在读 body 之前**（声报超大长度时拿到 429 而不是 413 = 顺序正确） | ✅ | `QuotaWiringTests.test_an_exhausted_client_is_refused_before_a_single_byte_is_read` |
+| **被 409/503 顶回去的请求不扣额度**（先占通道、再记账） | ✅ | `QuotaWiringTests.test_a_busy_request_is_not_billed` |
+| 记的是**真实音频秒数**，不是请求数 | ✅ | `QuotaWiringTests.test_a_successful_request_is_billed_the_real_audio_seconds` |
+| `0 = 不限`，且剩余量**不给字段**（不是 -1 / 大数） | ✅ | `QuotaLedgerTests.test_zero_means_unlimited_and_says_so` / `test_the_response_says_what_is_left_only_when_there_is_a_limit` |
+| 额度按**本地自然日**重置 | ✅ | `QuotaLedgerTests.test_the_counter_resets_on_a_new_day` |
+| 单客户端上限覆盖全局；取不到时回退全局而不是崩 | ✅ | `QuotaLedgerTests.test_a_per_client_limit_overrides_the_global_one` / `test_a_broken_limit_lookup_falls_back_to_the_global_default` |
+| 负/NaN/垃圾时长一律当 0（**不能把额度算成负的**） | ✅ | `QuotaLedgerTests.test_garbage_durations_are_ignored` |
+| 免凭据的 `/v1/capabilities` **只给全局上限，不给任何人的用量** | ✅ | `QuotaWiringTests.test_capabilities_exposes_the_global_limit_but_never_per_client_usage` |
+| `--set-quota` 真的落库并生效；不存在的客户端给一句人话 | ✅ | `QuotaAdminTests` |
+| metrics / SSE / `calls` 审计表（§7.3、§8.4） | ⏳ | 还没做；配额已经落地（见上） |
 | 管理面 / 审计表 / "存了什么"自证页（§8.4、§8.5） | ⏳ | 还没做；配对的入口暂时是命令行 |
 
 > **为什么 §12 值得这么细。** 前面每一节的设计都有"如果没人看着就会退化"的地方：
@@ -1803,7 +1848,7 @@ client_body_temp_path /var/echo/tmp/nginx;
 |---|---|---|---|
 | **v1** | 单进程 / 单机；`EnginePool`（单飞 + 引用计数 + LRU + 显存预算）；`TempWorkspace`；三个能力端点；`/health` `/ready` `/capabilities`；**两级闸门 + 廉价预检** | §12 全部护栏测试绿；两个客户端并发不互相阻塞 | **✅ 已落地** |
 | **v1.5**（原 v2 的鉴权部分） | **配对码 → `client_id` + `secret` → 短期 JWT**；scopes；`token_version` 撤销（同进程立即、跨进程 ≤5 秒轮询）← **实际做在了这里，不是 v2** | §12.1 全绿；命令行能发码、撤销能生效 | **✅ 已落地** |
-| **v2** | 配额（日额度 / 音频分钟数，§7.2）+ metrics + SSE 进度 + `calls` 审计表 | 与客户端路由层的降级原因**逐条对齐**；断网/降级演练 | ⏳ |
+| **v2** | 配额（日额度 / 音频分钟数，§7.2）✅ **已落地 2026-09-24** + metrics + SSE 进度 + `calls` 审计表 | 与客户端路由层的降级原因**逐条对齐**；断网/降级演练 | ◐ 配额已落地；metrics / SSE / 审计表还没做 |
 | **v3** | 管理面（§8.4）+ 只读 rootfs 容器 + tmpfs + 反代配置 + 按模型分进程（按需）+ 多实例按能力拆分 | 容器冒烟；`/v1/health` 的临时目录统计长期归零 | ⏳ |
 
 > **为什么鉴权提前到了 v1.5，而不是留在 v2：** 原计划把它和**配额**绑在一趟做。
@@ -1864,3 +1909,20 @@ client_body_temp_path /var/echo/tmp/nginx;
    契约由 `AdmissionWiringTests` 三条钉住。其中"预检真的在读 body 之前"用的证据是**顺序**：
    把 `Content-Length` 声报成超过上限的值 —— 先查大小会得到 `413 payload_too_large`，
    先判忙会得到 `409 client_busy`。顺序即证据，不靠读代码确认。
+
+5. **服务端做不做 TTS（`/v1/tts`）、做不做 `mode=turns`？`diarize.turn_embeddings` 谁用？**
+
+   **已拍板（2026-09-24）：两个都不做，理由是"没有消费方"，写在这里免得下一个人重做一遍。**
+
+   | 项 | 现状 | 为什么不做 |
+   |---|---|---|
+   | `POST /v1/tts` | 白名单里挂着 ⏳，`capabilities` 不声明 | 客户端侧**已经拍过板**：`router.DEFAULT_ORDER` 里 `"tts": ()`，注释"不走能力层（客户端自己的 providers 管）"。做它等于推翻那条决定；而且合成一句话在客户端是毫秒级本地活，走服务端变成一次往返（详见 §6.6 D） |
+   | `mode=turns`（逐 turn 嵌入） | 服务端**如实拒绝**（400 + "v1 只支持 segment"），不是假成功 | `diarize.turn_embeddings` 这个槽在客户端**一个消费方都没有** —— 全仓只有词汇表、路由表和面板标签提到它。搜索证据：`grep turn_embeddings app/` 只命中 `base.py`（槽清单）、`router.py`（默认顺序 + 设置映射）、`capability_admin.py`（中文标签） |
+   | `variant=short` | 已由 `asr-long` 的 `supports` 兜住（见第 2 条） | — |
+
+   **判据不是"难不难做"，是"做完谁用"。** 一个没有消费方的端点是纯负债：
+   它要跟着协议、鉴权、配额、文档、测试一起演进，却没有任何东西会因为它的存在而变好。
+   真正的"什么时候做"的信号也很具体：
+   * TTS —— 出现**一台没有任何可用音色的客户端**（答不上来就不做）；
+   * `turns` —— 客户端需要一个"逐句的说话人向量"（例如按句归属联系人），
+     而现在的段内聚类 + 客户端自己维护的说话人合并已经够用。

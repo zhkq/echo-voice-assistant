@@ -52,6 +52,9 @@ CREATE TABLE IF NOT EXISTS clients (
     scopes        TEXT NOT NULL DEFAULT '',
     token_version INTEGER NOT NULL DEFAULT 1,
     disabled      INTEGER NOT NULL DEFAULT 0,
+    -- 每客户端专属的每日音频分钟数配额；0 = 用全局默认（limits.daily_audio_minutes）。
+    -- **是上限不是内容**，所以不撞 §8.5 的"内容/业务概念"列名黑名单。
+    daily_audio_minutes REAL NOT NULL DEFAULT 0,
     created_at    REAL NOT NULL,
     updated_at    REAL NOT NULL,
     last_seen     REAL NOT NULL DEFAULT 0
@@ -78,6 +81,10 @@ CREATE INDEX IF NOT EXISTS idx_pairing_expires ON pairing_codes(expires_at);
 #: 不删列、不搬数据。再多就需要真正的迁移工具了（版本表 + 顺序执行）——
 #: 那时把这段换掉，别在上面长出第二套逻辑。
 _ADDED_COLUMNS = {
+    "clients": (
+        # 每客户端专属的每日音频分钟数配额（0 = 用全局默认，见 server/quota.py）。
+        ("daily_audio_minutes", "REAL NOT NULL DEFAULT 0"),
+    ),
     "pairing_codes": (
         ("name", "TEXT NOT NULL DEFAULT ''"),
         ("scopes", "TEXT NOT NULL DEFAULT ''"),
@@ -226,6 +233,22 @@ class Store:
             cur = self._db.execute(
                 "UPDATE clients SET scopes=?, updated_at=? WHERE client_id=?",
                 (str(scopes or ""), time.time(), client_id))
+            self._db.commit()
+            return bool(cur.rowcount)
+
+    def set_quota(self, client_id: str, daily_audio_minutes: float) -> bool:
+        """改一个客户端的**每日音频分钟数**上限（0 = 用全局默认）。返回改到了吗。
+
+        **不推 `updated_at`**：它只影响这个客户端能被用多久，不影响"它是谁、能不能进"，
+        所以不需要惊动 `RevocationWatcher`（那位的职责是让"撤销/禁用/换 secret"在别的
+        进程里 ≤5 秒被发现）。改了配额还要所有进程立刻知道，得等有真正的需求再说。
+        多实例下更要注意：**计数本来就不共享**（见 `quota.py` 开头），
+        配额改了之后各实例各按自己的计数判。
+        """
+        with self._lock:
+            cur = self._db.execute(
+                "UPDATE clients SET daily_audio_minutes=? WHERE client_id=?",
+                (max(0.0, float(daily_audio_minutes or 0.0)), client_id))
             self._db.commit()
             return bool(cur.rowcount)
 
