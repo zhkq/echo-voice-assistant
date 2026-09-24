@@ -196,7 +196,14 @@ function Copy-Tree([string]$From, [string]$To) {
 
 # ---------------------------------------------------------------- 主流程
 $root = (Resolve-Path -LiteralPath $DestDir).Path
-$target = Join-Path $root 'harness\dsh'
+# -DestDir 是**安装根**。3.0 布局里 DSH 本体放 <根>\dsh\app（与它并排的是 dsh\home），
+# 老式扁平安装仍在 <根>\harness\dsh —— 判据与 app\paths.py:echo_base() 同一条：
+# 代码在 <根>\echo-core 下就是新布局。这不是"猜"：install.ps1 已经按这条把代码放好了。
+if (Test-Path (Join-Path $root 'echo-core\app\main.py')) {
+    $target = Join-Path $root 'dsh\app'
+} else {
+    $target = Join-Path $root 'harness\dsh'
+}
 $entry = Join-Path $target 'node_modules\@deepseek-ai\dsh\lib\bin.js'
 
 Say ("安装目录：{0}" -f $root)

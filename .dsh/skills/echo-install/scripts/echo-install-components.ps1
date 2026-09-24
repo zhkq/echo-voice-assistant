@@ -53,11 +53,23 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+# -DestDir 是**安装根**。3.0 布局里代码在 <根>\echo-core，数据/模型/DSH/会议/指令都是
+# 它的兄弟目录；老式扁平安装里代码就在根下（判据与 app\paths.py:echo_base() 同一条）。
+#   $script:Root = 安装根（数据、日志、运行时、DSH 落点都按它算）
+#   $script:Code = 代码目录（scripts\ 在这儿）
 $script:Root = (Resolve-Path -LiteralPath $DestDir).Path
+$script:Code = $script:Root
+if ((Split-Path $script:Root -Leaf) -ieq 'echo-core') {
+    # 调用方把代码目录当成了安装根（例如从 <根>\echo-core 里重跑）→ 上提一层
+    $script:Root = Split-Path $script:Root -Parent
+} elseif (-not (Test-Path (Join-Path $script:Root 'app\main.py'))) {
+    # 全新安装：代码还没到位，但 3.0 布局已经定了 —— 代码将落在 <根>\echo-core
+    $script:Code = Join-Path $script:Root 'echo-core'
+}
 $script:HarnessCommand = ''    # 本地永久安装成功时填（见 Prepare-Agent）
 
 # A6：每一步同时留一份**独立于终端**的日志（终端关掉、输出被 agent 收走时还能回看）。
-# 落点 <安装目录>\data\logs\install-<时间戳>.log；写不进去（权限/只读）就静默放弃，绝不挡安装。
+# 落点 <安装根>\data\logs\install-<时间戳>.log；写不进去（权限/只读）就静默放弃，绝不挡安装。
 $script:InstallLog = ''
 try {
     $logDir = Join-Path $script:Root 'data\logs'
@@ -134,7 +146,7 @@ function Ensure-Service {
     Step '启动 ECHO 服务'
     try { $null = Invoke-Api -Path '/api/status' -TimeoutSec 5; Ok '服务已在运行'; return }
     catch { }
-    $start = Join-Path $script:Root 'scripts\start.ps1'
+    $start = Join-Path $script:Code 'scripts\start.ps1'
     if (-not (Test-Path $start)) { Err "找不到启动脚本：$start"; exit 1 }
     Say '服务没在跑，后台启动一次…'
     Start-Process powershell -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass',
@@ -430,9 +442,9 @@ function Wait-Harness {
 
 Write-Host ''
 Write-Host '  === ECHO 组件安装（按需下载）===' -ForegroundColor White
-Write-Host ("  安装目录：{0}" -f $script:Root)
-if (-not (Test-Path (Join-Path $script:Root 'app'))) {
-    Err '这个目录里没有 app\ —— 看起来不是 ECHO 安装目录（先跑 install.ps1）'
+Write-Host ("  安装根：{0}（代码在 {1}）" -f $script:Root, $script:Code)
+if (-not (Test-Path (Join-Path $script:Code 'app'))) {
+    Err ("这个目录里没有 app\ —— 看起来不是 ECHO 安装目录：{0}（先跑 install.ps1）" -f $script:Code)
     exit 1
 }
 $rcPy = Get-RuntimePython
