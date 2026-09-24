@@ -255,14 +255,30 @@ def load(path: Optional[str] = None) -> Config:
     return Config(raw=raw)
 
 
-def install_paths_seam(cfg: Config) -> None:
-    """把 `app.paths` 的取值源换成服务端配置。
+def install_paths_seam(cfg: Config):
+    """把 `app.paths` 的取值源换成服务端配置。**返回一个「还原」函数。**
 
     `app/paths.py` 的 `_settings_get()` 注释里写着"测试可替换本函数" —— 就是这里用。
     这样 `paths.models_root()` 会返回服务端的模型目录，而**不用改 paths.py 一行**，
     也不用把客户端的 `settings` 表拖进服务端。
+
+    ## ⚠️ 这是**进程内全局** Monkey-patch
+
+    它改的是 `app.paths` 模块上的一个函数，**一旦装上，整个进程的 `paths.*` 都跟着变**
+    （那些按客户端设置解析的目录会一并不认账，比如会议目录会返回空、掉回默认目录）。
+
+    这件事在测试里真出过事故（2026-09-24）：一个新测试文件（`test_capabilities_contract`）
+    起了真 app 来验客户端适配器，跑完没还原 —— 于是**排在它后面的** `test_config_compat`
+    里，"路径跟随用户设置"那条突然红了，报的却是 `paths` 的默认值，
+    看现象完全联想不到是**另一个测试文件**留下的全局状态。
+
+    所以这里把"怎么撤销"明确交出去：调用方拿返回值去还原。
+    起真 app 的测试**必须**还原（`create_app` 内部会调它，所以测试要自己快照
+    `app.paths._settings_get` 再在 tearDown 里放回去）。
     """
     from app import paths
+
+    original = getattr(paths, "_settings_get", None)
 
     def _get(name: str) -> str:
         if name == "modelsDir":
@@ -270,3 +286,14 @@ def install_paths_seam(cfg: Config) -> None:
         return ""
 
     paths._settings_get = _get
+
+    def restore() -> None:
+        if original is None:
+            try:
+                delattr(paths, "_settings_get")
+            except AttributeError:
+                pass
+        else:
+            paths._settings_get = original
+
+    return restore

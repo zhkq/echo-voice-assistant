@@ -98,6 +98,15 @@ ACK_INDIRECT = {
     "meetingInputDeviceId": "app/audio/recorder.py:resolve_input_device() 查表读（会议录音用哪个麦）",
     # 通用兜底那一项也是循环读（与用途键一起遍历），不再是 settings.get("inputDeviceId")
     "inputDeviceId": "app/audio/recorder.py:resolve_input_device() 循环读（两个用途的通用兜底）",
+    # 能力路由（3.0）：槽 → 设置键的映射在 router._setting_key_for() 里，
+    # 调用点拿到的是映射出来的**键名变量**（`self._get(_setting_key_for(slot))`），
+    # 所以扫描看不见字面量。映射本身在 router.py 的 _setting_key_for()。
+    "capabilityMeetingAsrBackend": "app/capabilities/router.py:_setting_key_for() 映射读（asr.text/timestamps 用哪个后端）",
+    "capabilityDiarizeBackend": "app/capabilities/router.py:_setting_key_for() 映射读（说话人分离用哪个后端）",
+    "capabilityEmbedBackend": "app/capabilities/router.py:_setting_key_for() 映射读（声纹提取用哪个后端）",
+    # privacy 约束在 plan() 里按点分路径读（`self._get("capabilityPrivacy", "lan")`），
+    # 但那一行同时含别的字面量，被判成间接；消费方就是 plan() 的 allowed_sources。
+    "capabilityPrivacy": "app/capabilities/router.py:plan() 读它算 allowed_sources（哪些后端根本不被考虑）",
 }
 
 #: 唯一消费方是面板 UI 的项（面板读它来改变自己的行为，app/ 不需要读）。

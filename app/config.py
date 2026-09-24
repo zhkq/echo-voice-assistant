@@ -594,6 +594,52 @@ DEFAULTS = {
     "providerAsrModel": dict(value="", grp="provider", label="在线转写模型名", hidden=True,
                              description="留空 = whisper-1（OpenAI 兼容服务的默认转写模型）",
                              value_type="str"),
+    # ---------- 能力路由（3.0）：每个槽用哪个后端 ----------
+    # **全部 hidden**：这一批由将来的「能力路由」页签承载（与 provider 那批同一个做法）。
+    # hidden 的好处是**不需要动 `web/app.js` 的分组表**，也不会在设置页里冒出半成品；
+    # 值照样能读能写（`Settings.update` 只拒 deprecated，不拒 hidden）。
+    "capabilityEchoServerUrl": dict(
+        value="", grp="capability", label="ECHO 能力后端地址", hidden=True,
+        description="ECHO 能力后端（无状态服务端）的根地址，例如 http://gpu-01:8900。"
+                    "留空 = 不用这个后端。它只做 GPU 重活（会议转写/说话人分离/声纹），"
+                    "**不存任何业务数据**",
+        value_type="str"),
+    "capabilityEchoServerToken": dict(
+        value="", grp="capability", label="ECHO 能力后端令牌（配对获得）", hidden=True,
+        description="配对换来的短期 JWT。过期后需要重新配对/换令牌 —— "
+                    "本版**不做自动续期**，过期会如实报「凭据不被接受」而不是静默失败",
+        value_type="str", secret=True),
+    "capabilityEchoServerStaticToken": dict(
+        value="", grp="capability", label="ECHO 能力后端静态令牌", hidden=True,
+        description="服务端 `auth.mode=token` 时用的那把静态令牌（单人/本机场景）。"
+                    "配了配对令牌就以那个为准",
+        value_type="str", secret=True),
+    "capabilityPrivacy": dict(
+        value="lan", grp="capability", label="允许音频去哪", hidden=True,
+        options=["none", "lan", "wan"],
+        description="none = 不出机（只用本机引擎）；lan = 允许发到单位内网的 ECHO 后端；"
+                    "wan = 还允许更远的公共服务。这是**约束**，不是优先级 —— "
+                    "它决定哪些后端根本不被考虑，见能力路由的 privacy 判据",
+        value_type="str"),
+    "capabilityMeetingAsrBackend": dict(
+        value="auto", grp="capability", label="会议转写用哪个后端", hidden=True,
+        options=["auto", "echo-server", "local", "intranet"],
+        description="会议链路的 asr.text。auto = 按「内网公共 → ECHO 后端 → 本机(装了才用)」"
+                    "的顺序挑第一个可用的",
+        value_type="str"),
+    "capabilityDiarizeBackend": dict(
+        value="auto", grp="capability", label="说话人分离用哪个后端", hidden=True,
+        options=["auto", "echo-server", "local", "off"],
+        description="说话人时间轴与逐说话人嵌入。off = 不要说话人（会议照常出无说话人的转写）。"
+                    "**产出向量的能力只能落在能声明向量空间的后端上**（本机在内网公共服务上不行）",
+        value_type="str"),
+    "capabilityEmbedBackend": dict(
+        value="auto", grp="capability", label="声纹提取用哪个后端", hidden=True,
+        options=["auto", "echo-server", "local", "off"],
+        description="现场注册联系人时的单条嵌入。**必须与会议里认出的说话人同源**"
+                    "（同一个向量空间），否则余弦相似度没有意义 —— 而比错的表现是"
+                    "**认错人且不报错**，所以这条由路由强制，不靠自觉",
+        value_type="str"),
     # ---------- 面板 / 服务 ----------
     "panelAutoRefresh": dict(value=3, grp="panel", label="面板自动刷新秒",
                              description="仪表盘 / 启动页 / 模型路由页的自动刷新间隔（秒）；"

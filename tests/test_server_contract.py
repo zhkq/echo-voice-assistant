@@ -1077,6 +1077,13 @@ class ErrorCodeSurvivesLargeBodyTests(unittest.TestCase):
 
         import uvicorn
 
+        from app import paths
+
+        # 快照 `app.paths` 的取值源：`create_app()` 里的 `install_paths_seam`
+        # 是**进程内全局** Monkey-patch，不还原会连累别的测试文件（2026-09-24 踩过，
+        # 见 `test_capabilities_contract.py` 同名说明）。
+        cls._paths_seam = getattr(paths, "_settings_get", None)
+
         cls._tmp = tempfile.mkdtemp(prefix="echo-rst-")
         cfg = _cfg(cls._tmp)
         with patch.object(engines, "build_loaders",
@@ -1106,6 +1113,14 @@ class ErrorCodeSurvivesLargeBodyTests(unittest.TestCase):
             cls._thread.join(timeout=5)
         except Exception:
             pass
+        from app import paths
+        if cls._paths_seam is None:
+            try:
+                delattr(paths, "_settings_get")
+            except AttributeError:
+                pass
+        else:
+            paths._settings_get = cls._paths_seam
 
     def _post(self, path, body, ctype="audio/wav", timeout=30):
         import urllib.error
@@ -1153,6 +1168,67 @@ class ErrorCodeSurvivesLargeBodyTests(unittest.TestCase):
         """小 body 一直是好的 —— 用它做对照，说明上面几条失败不是别的原因。"""
         self._assert_code("/v1/asr?model=nope", b"x" * 1024, 404, "model_not_found",
                           times=1)
+
+
+class PathsSeamTests(unittest.TestCase):
+    """`install_paths_seam` 是**进程内全局** Monkey-patch，必须能被撤销。
+
+    它改的是 `app.paths` 模块上的一个函数：装上之后整个进程的 `paths.*` 都改读服务端
+    配置（`meetings_root()` 于是返回空、掉回默认目录）。
+
+    这件事真出过事故（2026-09-24）：一个新测试文件起了真 app 验客户端适配器、
+    跑完没还原 —— 于是**排在它后面的** `test_config_compat` 里，"路径跟随用户设置"
+    那条突然红了，报的是 paths 的默认值，看现象完全联想不到是**另一个测试文件**
+    留下的全局状态。
+
+    所以这里钉两件事：**能撤销**，以及**起真 app 的测试都记得撤销**。
+    """
+
+    def test_returns_a_restore_that_actually_restores(self):
+        from app import paths
+        before = getattr(paths, "_settings_get", None)
+        cfg = settings_mod.load()
+        restore = settings_mod.install_paths_seam(cfg)
+        self.assertNotEqual(getattr(paths, "_settings_get", None), before,
+                            "装上之后取值源应该变了")
+        restore()
+        self.assertIs(getattr(paths, "_settings_get", None), before,
+                      "撤销之后必须回到原样")
+
+    def test_restore_is_safe_when_there_was_nothing_to_restore(self):
+        from app import paths
+        had = hasattr(paths, "_settings_get")
+        saved = getattr(paths, "_settings_get", None)
+        try:
+            if had:
+                delattr(paths, "_settings_get")
+            settings_mod.install_paths_seam(settings_mod.load())()
+            self.assertFalse(hasattr(paths, "_settings_get"),
+                             "原本没有这个属性，撤销后也不该留下一个")
+        finally:
+            if had:
+                paths._settings_get = saved
+
+    def test_every_test_that_starts_a_real_app_restores_the_seam(self):
+        """**凡是调 `create_app()` 的测试文件，都得处理这个 seam。**
+
+        这条是防复发的：上面的注释解释了污染怎么发生、为什么难查。
+        靠人记住不如靠这一条 —— 漏了就直接列出来。
+        """
+        tests_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)))
+        offenders = []
+        for fn in sorted(os.listdir(tests_dir)):
+            if not fn.endswith(".py"):
+                continue
+            with open(os.path.join(tests_dir, fn), encoding="utf-8") as fh:
+                src = fh.read()
+            if "create_app(" not in src:
+                continue
+            if "_settings_get" not in src:
+                offenders.append(fn)
+        self.assertEqual(offenders, [],
+                         "这些测试起了真 app 但没还原 app.paths 的取值源（会连累别的测试文件）：%s"
+                         % offenders)
 
 
 class VectorSpaceFrozenTests(unittest.TestCase):
