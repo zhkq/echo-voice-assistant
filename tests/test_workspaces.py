@@ -53,34 +53,47 @@ def _specs(tmp, meeting_title="会议空间", command_title="指令空间"):
 
 
 class SpaceSpecTests(unittest.TestCase):
-    def test_settings_drive_paths_and_titles(self):
-        table = {"meetingWorkspace": "{ECHO}/data/meetings",
-                 "meetingWorkspaceTitle": "会议空间",
-                 "commandWorkspace": "{ECHO}/data/command",
-                 "commandWorkspaceTitle": "指令空间"}
-        with patch.object(workspaces, "_setting", lambda k, d="": table.get(k, d)):
+    def test_paths_come_from_the_paths_layer_not_from_raw_settings(self):
+        """**目录只有 `app/paths.py` 一个来源**（3.0 起）。
+
+        原来 `space_specs()` 直接读 `meetingWorkspace` / `commandWorkspace` 两个设置，
+        于是"会议文件目录"（`meetingsDir`）与"会议会话工作区"（`meetingWorkspace`）是两条
+        独立的路 —— 用户改了前者、后者不动，**DSH 就看不到会议文件，而且没有任何地方报错**。
+        现在两条路都收敛到 `paths`：`meeting_space_root()` ≡ `meetings_root()`。
+        """
+        from app import paths
+        table = {"meetingWorkspaceTitle": "会议空间", "commandWorkspaceTitle": "指令空间"}
+        with patch.object(paths, "meeting_space_root", lambda: r"D:\base\meeting"), \
+                patch.object(paths, "command_root", lambda: r"D:\base\aide"), \
+                patch.object(workspaces, "_setting", lambda k, d="": table.get(k, d)):
             specs = workspaces.space_specs()
         self.assertEqual(["会议空间", "指令空间"], [s["label"] for s in specs])
         self.assertEqual(["会议空间", "指令空间"], [s["title"] for s in specs])
-        self.assertEqual("{ECHO}/data/meetings", specs[0]["path"])
-        self.assertEqual("{ECHO}/data/command", specs[1]["path"])
+        self.assertEqual(r"D:\base\meeting", specs[0]["path"])
+        self.assertEqual(r"D:\base\aide", specs[1]["path"])
 
     def test_title_for_path_uses_configured_title_for_default_spaces(self):
-        table = {"meetingWorkspace": r"D:\ECHO\data\meetings",
-                 "meetingWorkspaceTitle": "会议空间"}
-        with patch.object(workspaces, "_setting", lambda k, d="": table.get(k, d)):
+        from app import paths
+        table = {"meetingWorkspaceTitle": "会议空间"}
+        with patch.object(paths, "meeting_space_root", lambda: r"D:\ECHO\data\meetings"), \
+                patch.object(workspaces, "_setting", lambda k, d="": table.get(k, d)):
             self.assertEqual("会议空间", workspaces.title_for_path(r"D:\ECHO\data\meetings"))
             # 大小写/结尾斜杠容错
             self.assertEqual("会议空间", workspaces.title_for_path("d:\\echo\\data\\meetings\\"))
 
     def test_title_for_path_keeps_basename_for_other_dirs(self):
-        with patch.object(workspaces, "_setting", lambda k, d="": ""):
+        from app import paths
+        with patch.object(paths, "meeting_space_root", lambda: r"D:\base\meeting"), \
+                patch.object(paths, "command_root", lambda: r"D:\base\aide"), \
+                patch.object(workspaces, "_setting", lambda k, d="": ""):
             self.assertEqual("日常交互", workspaces.title_for_path(r"D:\work\日常交互"))
             self.assertEqual("", workspaces.title_for_path(""))
 
     def test_title_falls_back_to_factory_name_when_setting_blank(self):
-        table = {"meetingWorkspace": r"D:\ECHO\data\meetings", "meetingWorkspaceTitle": ""}
-        with patch.object(workspaces, "_setting", lambda k, d="": table.get(k, d)):
+        from app import paths
+        table = {"meetingWorkspaceTitle": ""}
+        with patch.object(paths, "meeting_space_root", lambda: r"D:\ECHO\data\meetings"), \
+                patch.object(workspaces, "_setting", lambda k, d="": table.get(k, d)):
             self.assertEqual("会议空间", workspaces.title_for_path(r"D:\ECHO\data\meetings"))
 
 

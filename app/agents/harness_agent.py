@@ -160,7 +160,8 @@ class HarnessAgent(DshAgent):
                 if not harness_proc.requested():
                     return False, ("标准版 harness 没在运行：在面板把它选为当前智能体"
                                    "（或打开「启用标准版 harness」），ECHO 会自动拉起"
-                                   "（需要本机 Node；安装技能会把它永久装到 <安装目录>/harness/dsh）")
+                                   "（需要本机 Node；安装技能会把它永久装到 "
+                                   "`{echoBase}/dsh/app`，老装机在 `<安装目录>/harness/dsh`）")
                 return False, ("标准版 harness 没在监听 %s：看 data/logs/harness.log —— "
                                "本地件装好后仍起不来，多半是 node 不在 PATH 或上次装残了"
                                "（重跑 echo-install 技能会补齐）" % self.base_url)

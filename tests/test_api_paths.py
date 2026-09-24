@@ -41,11 +41,13 @@ class PathsApiTests(unittest.TestCase):
     def tearDownClass(cls):
         shutil.rmtree(cls.tmp, ignore_errors=True)
 
-    def test_env_endpoint_reports_four_roots(self):
+    def test_env_endpoint_reports_every_root(self):
         r = self.client.get("/api/paths/env")
         self.assertEqual(r.status_code, 200, r.text)
         data = r.json()
-        self.assertEqual([x["name"] for x in data["roots"]], ["ECHO", "DATA", "MEETINGS", "MODELS"])
+        self.assertEqual([x["name"] for x in data["roots"]],
+                         ["ECHO_BASE", "ECHO", "DATA", "MEETINGS", "MODELS",
+                          "AIDE", "DSH", "DSH_HOME"])
         self.assertIn("configured", data)
         self.assertIn("port", data)
         self.assertIsInstance(data["meetingDirs"], int)

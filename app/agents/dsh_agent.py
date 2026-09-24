@@ -581,7 +581,11 @@ class DshAgent(AgentAdapter):
         # session_id 去发命令 —— 那正是"配置了独立 dsh 但命令还是发到 desktop"的原因。
         row = db.get_session("command", agent=self.name)
         sid = (row or {}).get("session_id") or ""
-        want_ws = (settings.get("commandWorkspace", "") or "").strip()
+        # 工作区路径**问路径层**（3.0：`{echoBase}/aide`；老装机仍是 `{ECHO}/data/command`）。
+        # 原来直接读设置字符串，于是布局一变、或用户改了「会议/指令目录」，
+        # 会话就静默落到老目录（看着像"侧栏里多了个未分组"）。
+        from app import paths as _paths
+        want_ws = _paths.command_root()
         idle_h = None
         if row and sid:
             used = (row.get("last_used_at") or "").strip()
@@ -630,7 +634,8 @@ class DshAgent(AgentAdapter):
         row = db.get_session(kind, agent=self.name)
         if row and row.get("session_id"):
             return row["session_id"]
-        ws = (settings.get("commandWorkspace", "") or "").strip() if kind == "command" else ""
+        from app import paths as _paths
+        ws = _paths.command_root() if kind == "command" else ""
         sid = self._new_default_session(ws)
         if sid:
             db.upsert_session(kind, sid, name or kind, agent=self.name)

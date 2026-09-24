@@ -101,7 +101,8 @@ def _builtin() -> List[dict]:
              command="npx -y @deepseek-ai/dsh web --port 43199 --no-open",
              command_label="复制启动命令",
              how="在 设置 → 智能体 里选中它，ECHO 会自动拉起；安装技能会把它**永久装到 "
-                 "<安装目录>/harness/dsh**（冷启动约 10 秒），命令记在设置的 harnessCommand 里。"
+                 "`{echoBase}/dsh/app`**（新布局；老装机仍在 `<安装目录>/harness/dsh`，"
+                 "冷启动约 10 秒），命令记在设置的 harnessCommand 里。"
                  "右边这条是没装成时的兜底（走 npx，首次要多等 1-2 分钟）"),
         dict(id="accel-cuda", kind="accel", name="CUDA 加速", optional=True, required=False,
              purpose="让转写/说话人分离跑在 N 卡上（3 倍以上速度）",

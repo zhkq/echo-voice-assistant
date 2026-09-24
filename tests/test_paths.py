@@ -67,8 +67,15 @@ class RootTests(unittest.TestCase):
         self.assertEqual(paths.data_root(), os.path.abspath(tmp))
 
     def test_windows_default_is_under_echo_root(self):
+        """**老布局（没有安装根）**下 Windows 的默认数据根是 `{ECHO}/data`。
+
+        3.0 加了安装根布局：有 `{echoBase}` 时数据根是 `{echoBase}/data`。
+        两个分支各有归属 —— 新布局那一支在 `tests/test_install_base_layout.py`，
+        这里只钉"没有安装根时的老行为一个字节都没变"。
+        """
         if os.name != "nt":
             self.skipTest("Windows 专属默认值")
+        self.assertEqual(paths.echo_base(), "", "这个用例测的是老布局；安装根不该在这出现")
         self.assertEqual(paths.data_root(), os.path.join(paths.echo_root(), "data"))
 
     def test_macos_default_is_application_support(self):
@@ -107,6 +114,13 @@ class RootTests(unittest.TestCase):
             paths._platform_defaults = saved
 
     def test_meetings_and_models_defaults(self):
+        """**老布局**的两个可配置根：`{DATA}/meetings` 与 `{ECHO}/models`。
+
+        （新布局是 `{echoBase}/meeting` 与 `{echoBase}/models`，见
+        `tests/test_install_base_layout.py`。这里同样先断言"当前没有安装根"，
+        否则这条用例会因为跑在哪儿而红/绿不一。）
+        """
+        self.assertEqual(paths.echo_base(), "")
         self.assertEqual(paths.meetings_root(), os.path.join(paths.data_root(), "meetings"))
         self.assertEqual(paths.models_root(), os.path.join(paths.echo_root(), "models"))
 
@@ -178,10 +192,16 @@ class ValidateTests(unittest.TestCase):
 
 
 class PreflightTests(unittest.TestCase):
-    def test_preflight_never_raises_and_lists_four_roots(self):
+    def test_preflight_never_raises_and_lists_every_root(self):
+        """体检页要列**全部**的根（3.0 起多了安装根、指令空间、DSH 那两个）。
+
+        顺序固定：一眼能从"代码在哪"看到"数据/模型/会议/指令/DSH 分别在哪" ——
+        布局变复杂之后，这一页就是"我的东西到底放哪了"的唯一出口。
+        """
         out = paths.preflight()
         names = [r["name"] for r in out["roots"]]
-        self.assertEqual(names, ["ECHO", "DATA", "MEETINGS", "MODELS"])
+        self.assertEqual(names, ["ECHO_BASE", "ECHO", "DATA", "MEETINGS", "MODELS",
+                                 "AIDE", "DSH", "DSH_HOME"])
         for item in out["roots"]:
             self.assertIn("writable", item)
             self.assertIn("freeGB", item)
@@ -195,7 +215,7 @@ class PreflightTests(unittest.TestCase):
         paths._settings_get = boom
         try:
             out = paths.preflight()
-            self.assertEqual(len(out["roots"]), 4)
+            self.assertEqual(len(out["roots"]), 8)
         finally:
             paths._settings_get = saved
 

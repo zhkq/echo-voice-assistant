@@ -28,12 +28,16 @@ BASE_DIR = paths.echo_root()
 
 # 和 stt.py 用同一套缓存约定：HF 落 models/hub（走国内镜像），ModelScope 落 ~/.cache/modelscope
 #
-# 下面这行是**早期兜底值**（默认安装下 = {ECHO}/models，与 paths.models_root() 相同）。
-# 权威值由启动阶段按 D30 设定：app/main.py 的 lifespan 在 seed_defaults() 之后、
-# boot.setup() 之前，用户**显式配置了 modelsDir** 时用 paths.hf_home() 覆盖它。
-# 保留 setdefault 的原因：huggingface_hub 在自己被 import 时就算死缓存路径，而这个模块
-# 可能早于 lifespan 被 import；兜底保证“没走到 lifespan 也不至于没有 HF_HOME”。
-os.environ.setdefault("HF_HOME", os.path.join(BASE_DIR, "models"))
+# 下面这行的兜底值**必须等于权威值** `paths.models_root()`：
+#   * 老布局 → `{ECHO}/models`
+#   * 新布局（3.0 安装根） → `{echoBase}/models`
+# 2026-09-24 改布局时差点留下一个大坑：原来这里写死 `BASE_DIR/models`，
+# 而新布局下 `BASE_DIR`（代码根）= `{echoBase}/echo-core` —— 于是**权重下到
+# `echo-core/models`、而 `models_root()` 去 `{echoBase}/models` 找**，两边不一致，
+# huggingface 会静默重下几 GB，而且模型落进了"可被整体覆盖"的代码目录（违反 L6）。
+# 权威值仍由启动阶段（app/main.py 的 lifespan，seed_defaults() 之后）再定一次：
+# 配置库要等 seed 完才准，而这个模块可能更早被 import。
+os.environ.setdefault("HF_HOME", paths.models_root())
 os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 os.environ.setdefault("MODELSCOPE_DISABLE_PROGRESS_BAR", "1")
 

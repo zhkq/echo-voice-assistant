@@ -26,11 +26,15 @@ DSH 侧栏的分组是**显式登记制**：一个会话只有登记进 `workspa
 import os
 
 #: 两个默认分组。key = 目录设置；title_key = 分组名设置（用户可改）；default_title = 出厂名。
+#: `resolver` 给出"目录到底在哪" —— 会议那一项走 `paths.meeting_space_root()`
+#: （3.0：**会议目录 ≡ 会议工作区**，见 `paths` 里那段说明），指令那一项走 `paths.command_root()`。
 DEFAULT_SPACES = (
     dict(key="meetingWorkspace", title_key="meetingWorkspaceTitle",
-         default_title="会议空间", what="每场会议的纪要/议题/归档会话"),
+         default_title="会议空间", what="每场会议的纪要/议题/归档会话",
+         resolver="meeting_space_root"),
     dict(key="commandWorkspace", title_key="commandWorkspaceTitle",
-         default_title="指令空间", what="默认命令与语音指令会话"),
+         default_title="指令空间", what="默认命令与语音指令会话",
+         resolver="command_root"),
 )
 
 
@@ -43,6 +47,18 @@ def _setting(key, default=""):
         return default
 
 
+def space_path(spec):
+    """这个空间的目录。**不再直接读设置**：两条路到达同一目录必须是不变量。"""
+    try:
+        from app import paths
+        fn = getattr(paths, spec.get("resolver") or "", None)
+        if fn is not None:
+            return str(fn() or "")
+    except Exception:
+        pass
+    return _setting(spec["key"])          # 兜底：paths 不可用（例如极度受限的测试替身）
+
+
 def title_for_path(path):
     """这个目录该叫什么分组名。
 
@@ -53,7 +69,7 @@ def title_for_path(path):
         return ""
     want = os.path.normcase(os.path.normpath(path))
     for spec in DEFAULT_SPACES:
-        space = _setting(spec["key"])
+        space = space_path(spec)
         if space and os.path.normcase(os.path.normpath(space)) == want:
             return _setting(spec["title_key"]) or spec["default_title"]
     return os.path.basename(path.rstrip("\\/"))
@@ -69,7 +85,7 @@ def space_specs():
     for spec in DEFAULT_SPACES:
         title = _setting(spec["title_key"]) or spec["default_title"]
         out.append(dict(key=spec["key"], label=spec["default_title"],
-                        path=_setting(spec["key"]), title=title, what=spec["what"]))
+                        path=space_path(spec), title=title, what=spec["what"]))
     return out
 
 

@@ -283,12 +283,13 @@ DEFAULTS = {
     "serverPort":      dict(value=8970, grp="panel", label="ECHO 面板端口",
                             description="控制面板与 API 的监听端口（8890 曾被系统保留段占用，改用 8970）", value_type="int"),
     # ---------- 语音命令 → 命令与会话（二级子分组，见 grp/sub 的说明）----------
-    "commandWorkspace": dict(value="{ECHO}/data/command", grp="voice", sub="command",
+    "commandWorkspace": dict(value="{ECHO_BASE}/aide", grp="voice", sub="command",
                              label="命令会话工作区",
                              description="默认命令会话建在这个目录对应的 DSH 工作区里，"
                                          "从而归入侧栏的「指令空间」分组。"
-                                         "想并到自己的工作区（例如「日常交互」）就改成那个目录。"
-                                         "留空 = 建在 ECHO 根目录（侧栏显示为未分组）",
+                                         "3.0 的安装根布局里它就在 `{echoBase}/aide`；"
+                                         "老装机仍在 `{ECHO}/data/command`（**不搬家**）。"
+                                         "想并到自己的工作区（例如「日常交互」）就改成那个目录。",
                              value_type="str"),
     "commandWorkspaceTitle": dict(value="指令空间", grp="voice", sub="command",
                                   label="指令分组名",
@@ -315,14 +316,17 @@ DEFAULTS = {
     # 留空 = 用默认值；默认值由 app/paths.py 解析（分平台，见 app/platform/<os>/env.py）。
     # 这里存的是"用户指定值"而不是解析后的绝对路径——占位符让同一份配置在任何机器都能用。
     "meetingsDir":     dict(value="", grp="paths", label="会议文件目录",
-                            description="会议录音与纪要**文件**的存放目录。留空 = {DATA}/meetings。"
-                                        "支持 {ECHO}/{DATA} 占位符与 ~。"
-                                        "改后旧会议仍留在原目录，需要用面板里的「迁移已有会议」搬过来。"
-                                        "（与「会议 → 会议会话工作区」不同：那一个是 DSH 会话登记到哪个工作区）",
+                            description="会议录音与纪要**文件**的存放目录。"
+                                        "留空 = 新布局 `{echoBase}/meeting`／老装机 `{DATA}/meetings`。"
+                                        "支持 {ECHO}/{ECHO_BASE}/{DATA} 占位符与 ~。"
+                                        "**它同时就是「会议空间」DSH 工作区**（3.0 起两项合并成一项）——"
+                                        "所以改这里不会出现「文件搬了、DSH 还在看老目录」那种事。"
+                                        "改后旧会议仍留在原目录，需要用面板里的「迁移已有会议」搬过来。",
                             value_type="str"),
     "modelsDir":       dict(value="", grp="paths", label="模型目录",
                             description="模型权重（whisper / SenseVoice / 唤醒词 / pyannote…）的存放目录。"
-                                        "留空 = {ECHO}/models。支持 {ECHO}/{DATA} 占位符与 ~。"
+                                        "留空 = 新布局 `{echoBase}/models`／老装机 `{ECHO}/models`。"
+                                        "支持 {ECHO}/{ECHO_BASE}/{DATA} 占位符与 ~。"
                                         "改后需重新下载模型，或自行把原目录拷过去",
                             value_type="str"),
     "userLocation":    dict(value="北京", grp="voice", sub="command", label="用户所在地",
@@ -535,14 +539,15 @@ DEFAULTS = {
     "voiceprintMargin": dict(value=0.05, grp="model", label="声纹歧义间隔",
                              description="候选联系人与次优的最小差距：差距过小视为认不准，不自动命名",
                              value_type="float"),
-    "meetingWorkspace": dict(value="{ECHO}/data/meetings", grp="meeting",
+    "meetingWorkspace": dict(value="{ECHO_BASE}/meeting", grp="meeting",
                              label="会议会话工作区",
                              description="一场会议一个 DSH 会话（纪要/分段/归档共用），下一场新建；"
                                          "这些会话都会登记进这个目录对应的 DSH 工作区，"
                                          "从而归入侧栏的「会议工作区」分组。"
-                                         "注意与「存储路径 → 会议目录」的区别：那一个是录音/纪要"
-                                         "**文件**放哪，这一项是 DSH **会话**登记到哪个工作区。"
-                                         "{ECHO} = ECHO 根目录；留空 = 用固定的纪要会话（不分组）",
+                                         "**3.0 起它与「存储路径 → 会议目录」是同一件事**"
+                                         "（会议数据目录 ≡ 会议工作区）：这一项只在老装机上"
+                                         "还记得用户当年的自定义值，新装机请改「会议文件目录」那一项。"
+                                         "{ECHO}/{ECHO_BASE} 都可用",
                              value_type="str"),
     "meetingWorkspaceTitle": dict(value="会议空间", grp="meeting",
                                   label="会议分组名",
@@ -617,7 +622,8 @@ DEFAULTS = {
                                             "作为子进程拉起（切走即停）；需要本机 Node / npx",
                                 value_type="bool", hidden=True),
     "harnessHome": dict(value="", grp="agent", label="harness 数据目录（DSH_HOME）",
-                        description="独立 harness 的家目录；留空 = {DATA}/harness。"
+                        description="独立 harness 的家目录；"
+                                    "留空 = 新布局 `{echoBase}/dsh/home`／老装机 `{DATA}/harness`。"
                                     "刻意与 Desktop 的家目录分开（各用各的），"
                                     "两边的会话与设置互不干扰",
                         value_type="str", hidden=True),
@@ -627,7 +633,8 @@ DEFAULTS = {
                         value_type="int", hidden=True),
     "harnessCommand": dict(value="npx -y @deepseek-ai/dsh web", grp="agent", label="harness 启动命令",
                            description="拉起独立 harness 的命令（--port / --no-open 由 ECHO 追加）。"
-                                       "安装技能会填成 <安装目录>/harness/dsh 里的本地入口（冷启动约 10 秒）；"
+                                       "安装技能会把它指向本地入口（新布局 `{echoBase}/dsh/app`、"
+                                       "老装机 `<安装目录>/harness/dsh`；冷启动约 10 秒）；"
                                        "装不起来就把这里改回 npx -y @deepseek-ai/dsh web 兜底",
                            value_type="str", hidden=True),
     "harnessToken": dict(value="", grp="agent", label="harness 访问 token",

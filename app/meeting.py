@@ -1047,7 +1047,12 @@ def _summary_session(client, meeting_id):
       未配置 meetingWorkspace 时退回固定的「纪要会话」（旧行为）。
     """
     meeting_id = _session_key(meeting_id)
-    ws = (settings.get("meetingWorkspace", "") or "").strip()
+    # **3.0：会议数据目录 ≡ 会议工作区**（`paths.meeting_space_root()`）。原来这里直接读
+    # `meetingWorkspace` 字符串，于是"用户改了「会议文件目录」"之后，DSH 会话还登记在
+    # 老目录 —— 文件在 A、工作区在 B，DSH 看不到会议文件，而且没有任何地方会报错。
+    # 老装机上"改过 meetingWorkspace、没改 meetingsDir"的值仍被尊重（见 paths 那个函数）。
+    from app import paths as _paths
+    ws = _paths.meeting_space_root()
     if not ws:
         return client.ensure_session("summary", name="纪要会话")
 

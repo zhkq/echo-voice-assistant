@@ -108,8 +108,15 @@ class MigrateMeetingsTests(unittest.TestCase):
 
 class EnvReportTests(unittest.TestCase):
     def test_report_is_panel_ready(self):
+        """面板要能直接渲染：每个根都有 name/path/exists/ascii/writable/freeGB/note。
+
+        3.0 起根变多了（安装根 + 指令空间 + DSH 本体与家目录）—— 这一页现在是
+        "我的东西到底放哪了"的唯一出口，少一个根就等于有一类东西看不见。
+        """
         r = pathadmin.env_report()
-        self.assertEqual([x["name"] for x in r["roots"]], ["ECHO", "DATA", "MEETINGS", "MODELS"])
+        self.assertEqual([x["name"] for x in r["roots"]],
+                         ["ECHO_BASE", "ECHO", "DATA", "MEETINGS", "MODELS",
+                          "AIDE", "DSH", "DSH_HOME"])
         self.assertIn("configured", r)
         self.assertIn("port", r)
         self.assertIsInstance(r["meetingDirs"], int)
@@ -124,7 +131,7 @@ class EnvReportTests(unittest.TestCase):
         paths._settings_get = boom
         try:
             r = pathadmin.env_report()
-            self.assertEqual(len(r["roots"]), 4)
+            self.assertEqual(len(r["roots"]), 8)
         finally:
             paths._settings_get = saved
 

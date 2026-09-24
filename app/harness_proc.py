@@ -72,18 +72,34 @@ def home():
     """harness 自己的 DSH_HOME（独立于 Desktop 那边，避免两边抢同一份会话/设置）。
 
     注意：这里刻意**不**去读 Desktop 的家目录常量 —— 本模块只认 `harnessHome` 配置
-    （留空 = `{DATA}/harness`）。上面那句"独立"就是这个意思：谁也别改谁。
+    （留空 = `paths.dsh_home_root()`：新布局 `{echoBase}/dsh/home`，老布局 `{DATA}/harness`）。
+    上面那句"独立"就是这个意思：谁也别改谁。
     """
     raw = str(settings.get("harnessHome", "") or "").strip()
     from app.config import expand_path
     if raw:
         return expand_path(raw)
-    return os.path.join(paths.data_root(), "harness")
+    return paths.dsh_home_root()
 
 
 #: 本地永久安装的落点（安装技能把 `@deepseek-ai/dsh` 装到这里，见 `.dsh/skills/echo-install`）。
+#: 两个都是**相对尾巴**：老布局相对 `{ECHO}`、新布局相对 `{echoBase}`
+#: （安装脚本与用例按它们拼路径，所以名字与含义要稳定）。
 LOCAL_ENTRY_REL = os.path.join("harness", "dsh", "node_modules",
                                "@deepseek-ai", "dsh", "lib", "bin.js")
+LOCAL_ENTRY_REL_BASE = os.path.join("dsh", "app", "node_modules",
+                                    "@deepseek-ai", "dsh", "lib", "bin.js")
+
+
+def local_entry_paths():
+    """本地入口**可能**在哪（按可能性排序：新布局 → 老布局）。安装与排障用它。"""
+    first = os.path.join(paths.dsh_root(), "node_modules", "@deepseek-ai", "dsh",
+                         "lib", "bin.js")
+    legacy = os.path.join(paths.echo_root(), LOCAL_ENTRY_REL)
+    out = [first]
+    if os.path.normcase(legacy) != os.path.normcase(first):
+        out.append(legacy)
+    return out
 
 
 def local_entry():
@@ -91,13 +107,18 @@ def local_entry():
 
     为什么专门找它（同事 2026-09-22 实测 B5）：`npx -y @deepseek-ai/dsh web` 冷启动
     **2 分 10 秒**（npx 每次重新解析安装），直连这个文件只要 **9 秒**。
+
+    落点由 `paths.dsh_root()` 决定：新布局 `{echoBase}/dsh/app`，老布局
+    `{ECHO}/harness/dsh`（**老装机不搬** —— 搬了等于让人重下一遍 223 MB）。
+    两个都找：有些机器是"新布局的代码 + 2.0 时代装的 harness"（升级上来、还没重装 DSH），
+    老入口照样能用，找一下比让人重下 223 MB 划算。
     """
-    p = os.path.join(paths.echo_root(), LOCAL_ENTRY_REL)
-    try:
-        if os.path.isfile(p) and os.path.getsize(p) > 0:
-            return p
-    except OSError:
-        pass
+    for p in local_entry_paths():
+        try:
+            if os.path.isfile(p) and os.path.getsize(p) > 0:
+                return p
+        except OSError:
+            continue
     return ""
 
 
