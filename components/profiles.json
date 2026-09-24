@@ -1,0 +1,45 @@
+{
+  "schema": 1,
+  "note": "交付档位（能力路由 §1.1/§11 step -1）。**这里是一份事实的唯一来源**：两个档各装什么、多大、不许出现什么。默认档的判据是铁律 L1（不含 torch / CUDA / 编译步骤），验收数字是 §1.2 那张表。校验它的用例是 tests/test_default_profile.py —— 改了这里、没改依赖清单，用例会红。",
+  "profiles": [
+    {
+      "id": "default",
+      "label": "默认档（办公本）",
+      "summary": "服务起得来、面板打得开、语音指令能转写；会议转写交给 GPU 后端（本机不做兜底）",
+      "requirements": "requirements-core.txt",
+      "components": ["runtime-core", "stt-sherpa", "wake-kws"],
+      "extraMb": 222,
+      "extraLabel": "DSH（标准版 harness 本地入口，实测 223 MB / 55 秒）",
+      "require": ["fastapi", "uvicorn", "numpy", "sounddevice", "sherpa-onnx"],
+      "forbid": ["torch", "torchaudio", "torchvision", "funasr", "pyannote.audio",
+                 "speechbrain", "transformers", "faster-whisper", "ctranslate2",
+                 "onnxruntime-gpu"],
+      "forbidComponents": ["stt-sensevoice", "stt-whisper-small", "stt-whisper-medium",
+                           "stt-whisper-large-v3"],
+      "forbidComponentsWhy": "只查依赖清单是不够的：**torch 还能从组件那条路溜回来** —— 把 stt-sensevoice（funasr+torch，896 MB）挪进默认档，依赖清单一个字都不用改。whisper small 以上也不是因为带 torch，而是体积（464 MB 起）不该进办公本的默认档；办公本要本机转写就加 stt-whisper-base（141 MB，torch-free）。",
+      "accept": [
+        "装完 `import torch` 失败（这是这一档的定义，不是副作用）",
+        "冷启动到能听命令 < 10 秒（不加载 torch/funasr）",
+        "默认常驻内存 < 500 MB",
+        "语音指令链路可用：唤醒 + 命令转写都在本机（铁律 L3）"
+      ]
+    },
+    {
+      "id": "offline",
+      "label": "离线增强档",
+      "summary": "本机也能转写 / 说话人分离 / 声纹：模型 + torch 系依赖，**按需选装**（不是一档全装）",
+      "requirements": "requirements.txt",
+      "components": ["stt-whisper-base", "stt-whisper-small", "stt-whisper-medium",
+                     "stt-whisper-large-v3", "stt-sensevoice"],
+      "extraMb": 0,
+      "extraLabel": "",
+      "require": [],
+      "forbid": [],
+      "forbidComponents": [],
+      "accept": [
+        "办公本建议只加 stt-whisper-base（141 MB，torch-free）",
+        "torch 系（SenseVoice / pyannote / Qwen3-ASR）装之前先看 §1.3 那五类故障"
+      ]
+    }
+  ]
+}

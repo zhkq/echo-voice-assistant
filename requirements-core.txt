@@ -1,9 +1,15 @@
 # runtime-core 组件的基础依赖（REFACTOR-PLAN D22/D23）
 #
-# 这份清单解决两件事：**服务起得来、面板打得开**，以及
+# 这份清单就是「**默认档**」的依赖（权威档位表：components/profiles.json）。
+# 它解决三件事：**服务起得来、面板打得开**，以及
 # **语音指令能转写**（见文件末尾 sherpa-onnx 的说明）。
-# 会议转写 / 唤醒 / 说话人分离 / 加速的依赖**不在这里** —— 它们各自是可选组件，
-# 由面板「组件」页按机器与环境选装（清单见 app/components.py）。
+# 会议转写 / 说话人分离 / 加速的依赖**不在这里** —— 它们属于「离线增强档」，
+# 各自是可选组件，由面板「组件」页按机器与环境选装（清单见 app/components.py）。
+#
+# **默认档不含 torch**（铁律 L1）：本文档 §1.3 列的"装不上 / 启动分钟级 /
+# WinError 127 / 诡异崩溃"五类问题全部来自 torch 系。这条由
+# tests/test_default_profile.py 守着 —— 往这份清单里加 torch 系、或把带 torch 的
+# 组件挪进默认档，用例都会红。
 #
 # 谁在用它：主包（-Profile main）不含运行时，install.ps1 准备 runtime-core 时用这份清单；
 # 也可以手工装：<运行时>\python.exe -m pip install -r requirements-core.txt
