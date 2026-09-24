@@ -124,77 +124,149 @@ class LocalCapabilityClient(CapabilityClient):
     # ---------------------------------------------------------------- ASR
 
     def transcribe(self, wav, *, lang="auto", want_timestamps=False,
-                   variant="long", **kw) -> AsrResult:
+                   variant="long", engine_hint="", **kw) -> AsrResult:
         """走 `stt.transcribe_ex()`（那条**已经区分了 ok/empty/error/missing** 的入口）。
 
         为什么不用老的 `transcribe()`：它把"这段没人说话"和"引擎挂了"都变成一个空串，
         调用方只能猜。`transcribe_ex` 就是为了修这个才存在的
         （见 `app/audio/stt.py` 里那段注释，PROGRESS §19 发现③）。
+
+        `want_timestamps=True` 时会尽量给出**句级时间轴**，并按 `assemble` 的档位如实标注
+        （`exact` / `aligned` / `estimated`）—— 这是会议链路一直在做的事，
+        本函数把它和拼装层对齐，让"本机"成为一个**行为等价**的后端而不是另一套逻辑。
         """
         if not os.path.isfile(wav):
             raise CapabilityError("open-failed", "文件不存在: %s" % wav,
                                   backend_id=self.backend_id, slot="asr.text")
         from app.audio import stt
 
-        engine, model = self._pick_engine(want_timestamps)
+        engine, model = self._pick_engine(engine_hint)
+        if want_timestamps:
+            got, text = self._with_timestamps(wav, engine, model, lang)
+            return AsrResult(
+                text=text, sentences=tuple(got.sentences), timestamps=got.timestamps,
+                provenance=Provenance(self.backend_id, self._model_version(engine, model)),
+                audio_seconds=_wav_seconds(wav))
+
         try:
             out = stt.transcribe_ex(wav, engine=engine, model=model, lang=lang,
                                     device=_device())
         except Exception as e:                       # 引擎抛异常：如实翻，不吞
             raise CapabilityError("open-failed", "%s: %s" % (engine, e),
                                   backend_id=self.backend_id, slot="asr.text") from None
-
         status = str(out.get("status") or "")
         reason = _STT_STATUS_TO_REASON.get(status, "error")
         if reason:
             raise CapabilityError(reason, str(out.get("detail") or status),
                                   code=status, backend_id=self.backend_id, slot="asr.text")
-
-        text = str(out.get("text") or "")
-        sentences = ()
-        timestamps = "none"
-        if want_timestamps:
-            sentences = self._sentences(wav, engine, model, lang)
-            timestamps = "exact" if sentences else "none"
         return AsrResult(
-            text=text, sentences=sentences, timestamps=timestamps,
+            text=str(out.get("text") or ""), timestamps="none",
             provenance=Provenance(self.backend_id, self._model_version(engine, model)),
             audio_seconds=_wav_seconds(wav))
 
-    def _pick_engine(self, want_timestamps: bool):
-        """挑本机引擎。`meetingSttModel` / `sttModel` 是既有的两个设置，沿用它。
+    def _pick_engine(self, engine_hint=""):
+        """挑本机引擎。返回 `(engine, model)`。
 
-        要时间戳时优先**能出句级时间戳**的引擎（whisper / qwen3asr）——
-        否则"我要时间戳"会静默降级成没有，而调用方无法区分
-        "模型给不出"和"我们没挑对引擎"。
+        **必须用 `stt.resolve_engine()` 解析**，因为那个设置值是**混的**：
+        `sensevoice` / `qwen3asr` / `sherpa` 是**引擎名**，而 `small` / `medium` / `large`
+        是 **whisper 的模型名**。第一版我在这里按"engine=设置值、model=另一个设置值"接，
+        于是用户把会议引擎设成 `small` 时，会拿另一个值当模型名 → 引擎加载失败，
+        而错误信息看着像"模型不存在"，很难联想到是这里接错了。
+
+        `engine_hint` 让调用方（会议链路）把它自己的设置传进来；
+        不传就用客户端的"会议转写引擎"。命令链路传的是 `sttModel`。
         """
-        if want_timestamps:
-            preferred = "whisper" if importlib_find("faster_whisper") else ""
-            if preferred:
-                return preferred, str(_setting("sttModel", "small") or "small")
-        model = str(_setting("meetingSttModel", "sensevoice") or "sensevoice")
-        return model, str(_setting("sttModel", "small") or "small")
+        from app.audio import stt
+        choice = str(engine_hint or _setting("meetingSttModel", "sensevoice") or "sensevoice")
+        return stt.resolve_engine(choice)
 
-    def _sentences(self, wav, engine, model, lang):
-        """句级时间戳。只有 whisper 那条路是现成可用的。
+    def _with_timestamps(self, wav, engine, model, lang):
+        """要句级时间轴时走这里。返回 `(Assembled, 文本)`。
 
-        qwen3asr 的 `_qwen3asr_sentences` 需要拿**已加载的实例**，而本机这条路径
-        不持有实例（`transcribe_ex` 内部自己管缓存）。所以这里**刻意只做 whisper**，
-        其余一律返回空 = 没有时间戳 —— 宁可如实说"没有"，也不去猜一个时间轴出来。
+        三条路，优先级与会议链路一致：
+          1. whisper —— 它自己就出 segments（一句一次前向，**不重复跑**）
+          2. qwen3asr —— 原生 `_qwen3asr_sentences`（带 ForcedAligner 时是精确句子）
+          3. 其余（SenseVoice 等）—— 文本来自它，时间骨架借 whisper，`assemble` 对齐
+
+        第 3 条就是原来 `meeting.py` 的 `_fallback_sv_rows`。**现在两边都走 `assemble`**，
+        所以不会出现"同一场会议 A 段一个精度、B 段另一个精度"。
         """
-        if engine != "whisper":
-            return ()
+        from app.audio import stt
+        from app.capabilities import assemble
+
+        if engine == "whisper":
+            try:
+                with stt._ENGINE_LOCK:                          # noqa: SLF001
+                    inst = stt._ENGINES.get(stt.engine_key("whisper", model))  # noqa: SLF001
+                if inst is None:
+                    inst = stt._get_whisper(model, _device())
+                segs, _info = stt.transcribe_whisper(inst, wav, lang)
+                native = [(float(s.start), float(s.end), str(s.text).strip())
+                          for s in segs if str(getattr(s, "text", "")).strip()]
+                if native:
+                    text = " ".join(t for _a, _b, t in native)
+                    return assemble.assemble(sentences=native), text
+            except Exception:
+                pass                       # 落到下面的"文本 + 骨架"路
+            got = assemble.assemble(text=self._text_only(wav, engine, model, lang))
+            return got, " ".join(t for _a, _b, t in got.sentences)
+
+        text = self._text_only(wav, engine, model, lang)
+
+        # qwen3asr：原生句子（有 ForcedAligner 时精确）
+        if engine == "qwen3asr":
+            native = self._qwen_sentences(wav, model, lang)
+            if native:
+                return assemble.assemble(sentences=native), text
+
+        # 其余（SenseVoice 等）：文本 + whisper 时间骨架 → 按字对齐
+        skeleton = self._whisper_skeleton(wav, lang)
+        return assemble.assemble(text=text, skeleton=skeleton), text
+
+    def _text_only(self, wav, engine, model, lang) -> str:
+        """只取文本（失败/空都返回空串 —— 由调用方按档位如实处理，不在这里抛）。"""
+        from app.audio import stt
         try:
-            from app.audio import stt
-            with stt._ENGINE_LOCK:                      # noqa: SLF001 —— 与 stt 内部同款
-                inst = stt._ENGINES.get("whisper:%s" % model)   # noqa: SLF001
-            if inst is None:
-                return ()
-            segs, _info = stt.transcribe_whisper(inst, wav, lang)
-            return tuple((float(s.start), float(s.end), str(s.text).strip())
-                         for s in segs if str(getattr(s, "text", "")).strip())
+            out = stt.transcribe_ex(wav, engine=engine, model=model, lang=lang,
+                                   device=_device())
         except Exception:
-            return ()
+            return ""
+        status = str(out.get("status") or "")
+        if _STT_STATUS_TO_REASON.get(status, "error"):
+            return ""
+        return str(out.get("text") or "")
+
+    def _qwen_sentences(self, wav, model, lang):
+        """qwen3asr 的原生句级时间轴。**取不到实例就返回空**（不抛、不假装）。"""
+        from app.audio import stt
+        for key in (f"qwen3asr:{model}:",
+                    f"qwen3asr:{model}:Qwen/Qwen3-ForcedAligner-0.6B"):
+            with stt._ENGINE_LOCK:                                  # noqa: SLF001
+                inst = stt._ENGINES.get(key)                        # noqa: SLF001
+            if inst is None:
+                continue
+            try:
+                _text, sents = stt._qwen3asr_sentences(        # noqa: SLF001
+                    inst, wav, stt._LANG_MAP.get(str(lang).lower()))   # noqa: SLF001
+                return [(float(a), float(b), t) for a, b, t in sents]
+            except Exception:
+                return []
+        return []
+
+    def _whisper_skeleton(self, wav, lang):
+        """借 whisper 的逐句时间轴当骨架。
+
+        固定用 `small`（与会议链路原来的选择一致）—— 骨架只需要**时间**，
+        不需要最准的识别；用 large 会白等好几倍时间。
+        """
+        from app.audio import stt
+        try:
+            inst = stt._get_whisper("small", _device())             # noqa: SLF001
+            segs, _info = stt.transcribe_whisper(inst, wav, lang)
+            return [(float(s.start), float(s.end), str(s.text).strip())
+                    for s in segs if str(getattr(s, "text", "")).strip()]
+        except Exception:
+            return []
 
     @staticmethod
     def _model_version(engine: str, model: str) -> str:

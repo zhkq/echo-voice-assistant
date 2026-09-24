@@ -25,6 +25,10 @@ from app import paths, worklog
 from app.audio.recorder import MeetingRecorder, resolve_input_device
 from app.audio import stt as stt_mod
 from app.audio import tts as tts_mod
+# 拼装层（设计 §4.4）：把各后端给回的东西统一成"逐句 + 时间"，并且**只在这一处**实现。
+# 模块级 import 是刻意的：它只依赖标准库 + dataclasses，没有重依赖，
+# 而且漏了它会在**第一次转写时**才炸（NameError），不如导入时就炸。
+from app.capabilities import assemble
 from app import services
 
 # 安装根由路径层给（含 ECHO_ROOT 覆盖）；会议目录一律走 meetings_dir()（D20/D21）。
@@ -401,6 +405,91 @@ def _transcribe_meeting(folder):
         print(msg, file=sys.stderr)
 
 
+def _capability_asr_session(cfg):
+    """本场是否走**能力后端**。返回 `(router, need)` 或 `None`。
+
+    ## 判据：计划里 `asr.text` 落到**本机以外**的后端
+
+    这样"没配后端"的机器走的是**原来那段本地代码**（行为一模一样），
+    而配了 ECHO 后端/内网服务的机器就真的把音频发出去 —— 这是接线风险最小的形态：
+    新路径只在真的要用它的时候才生效。
+
+    为什么不是"永远走路由器"：那会要求本机后端与原来那段代码**逐字节等价**，
+    而那段代码包含 SenseVoice 文本 + whisper 骨架的对齐、qwen3asr 的原生句子、
+    whisper 的 segments、以及各自的空结果留痕 —— 一次性替换它风险太高，
+    收益也只是"代码好看一点"。**先把远端这条路打通**，本地那条等它被证明可靠再收。
+    """
+    try:
+        from app.capabilities import Need, build_default_router
+        router = build_default_router()
+        need = Need(slots=("asr.text", "asr.timestamps"), purpose="meeting")
+        plan = router.plan(need)
+        picked = plan.backend_for("asr.text")
+        if not picked or picked == "local":
+            # 配了后端但这一轮用不上 —— **要说清楚为什么**，否则用户以为它在用后端，
+            # 实际在啃本机 CPU，而现象只是"转写很慢"（本机那条路的日志一切正常）。
+            # 最常见的两种：后端地址配了但连不上（capabilities 拉不回来 → 不支持任何槽）、
+            # 或者 privacy 设成了 none。
+            if str(settings.get("capabilityEchoServerUrl", "") or "").strip():
+                why = "；".join("%s(%s)" % (s.backend_id or "-", s.reason)
+                               for s in plan.skipped if s.slot == "asr.text") or "没配可用后端"
+                db.add_log("warn", "capability",
+                           "配了能力后端，但本场仍走本机引擎 —— 原因：%s" % why)
+            return None
+        db.add_log("info", "capability",
+                   "本场转写走能力后端：%s（%s）"
+                   % (picked, plan.picks["asr.text"].reason))
+        return router, need
+    except Exception as e:
+        db.add_log("warn", "capability", f"能力路由不可用，本场回落本地引擎：{e}")
+        return None
+
+
+def _capability_skeleton(router, need, seg_path, cfg):
+    """从 `asr.timestamps` 槽要一份时间骨架。**要不到就当没有**（不抛、不假装）。
+
+    为什么值得单独要一次：`asr.text` 与 `asr.timestamps` **可以是两个不同的后端**
+    （设计 §4.2 的槽清单本来就这么分）。比如文本走内网公共服务（它只给文本），
+    而骨架走 ECHO 后端。要到了就 `assemble` 对齐（`aligned`），要不到就按字数均摊
+    （`estimated`）—— 两种都在数据里标明。
+
+    ⚠️ 这段会**把同一段音频再传一次**。所以只在 `asr.text` 没给句子时才走：
+    像 ECHO 后端那种"一个模型同时给文本与时间戳"的情况，第一次调用就已经带回来了
+    （`transcribe(want_timestamps=True)` 会传 `timestamps=1`），不该白跑一趟。
+    """
+    try:
+        res, _plan = router.call("asr.timestamps", need, wav=seg_path,
+                                lang=cfg.get("sttLanguage", "zh"), want_timestamps=True)
+        return res.sentences
+    except Exception as e:
+        db.add_log("debug", "capability", f"没拿到时间骨架，按字数均摊：{e}")
+        return ()
+
+
+def _capability_segment_rows(router, need, seg_path, cfg, seg_idx, seg_min, cap_kinds):
+    """一段音频走能力后端 → `(seg_rows, plan_dict)`。
+
+    **刻意抽出来**，不塞在 `_transcribe_impl` 的大循环里：验收这段逻辑需要构造
+    "一场会议 + meta.json + 一个库 + 一个 wav"，而它自己只依赖
+    `(router, need, wav 路径, 几个设置值)`。混在那个 350 行的函数里测，
+    夹具就得把 `db`、`meta`、导出、后台线程全桩掉 —— 实测那样会**污染后面的测试文件**
+    （Windows 上删不掉临时库、`database is locked`），而且报错出现在别人那里。
+
+    `cap_kinds` 是就地累加的档位计数（`{exact: 3, estimated: 1}`），最终写进 `meta.json`。
+    """
+    lang = cfg.get("sttLanguage", "zh")
+    seg_sec = _wav_seconds(seg_path) or seg_min * 60.0
+    res, plan = router.call("asr.text", need, wav=seg_path, lang=lang,
+                            want_timestamps=True)
+    # 后端自己给了句级时间轴就直接用；没给就去 `asr.timestamps` 槽要骨架
+    # （**可能与文本是不同的后端** —— 那正是槽清单分开的意义）。
+    skeleton = () if res.sentences else _capability_skeleton(router, need, seg_path, cfg)
+    got = assemble.assemble(text=res.text, sentences=res.sentences,
+                            skeleton=skeleton, seg_seconds=seg_sec)
+    cap_kinds[got.timestamps] = cap_kinds.get(got.timestamps, 0) + 1
+    return [(seg_idx, st, en, txt) for st, en, txt in got.sentences], plan.as_dict(), got
+
+
 def _fallback_sv_rows(sv, wmodel, seg_path, seg_idx, seg_min, cfg):
     """回退路径：whisper 时间戳骨架 + SenseVoice 文本字符级对齐切句（保留句级时间戳）。
 
@@ -536,10 +625,19 @@ def _transcribe_impl(folder):
     wmodel = None
     sv = None
     asr_provider = _active_asr_provider()          # P5：显式配了 providerAsr 才走在线/外部转写
+    # 3.0 能力后端：**只有计划把 asr.text 派到本机以外**时才不是 None。
+    # 与 providerAsr 的分工：providerAsr 是"用户显式配了一个在线转写服务"（P5，既有）；
+    # 能力路由是"按槽选后端"（3.0，可能选到 ECHO 后端/内网公共服务）。
+    # **providerAsr 优先** —— 那是用户已经配好、且在跑的路径，不能被悄悄换掉。
+    cap_session = None if asr_provider is not None else _capability_asr_session(cfg)
     if asr_provider is not None:
         # 走 provider 时**不加载本地引擎**（省显存/省时间；也正是"没有 GPU 也能转写"的意义）
         db.add_log("info", "meeting", "本场转写走 provider（不加载本地模型）：%s"
                    % _asr_provider_id())
+    elif cap_session is not None:
+        # 走远端能力后端时**同样不加载本地引擎** —— 这正是"办公本没有 GPU 也能转写"的意义。
+        # 引擎留给"远端失败时回落本地"那条路按需加载（见循环里的兜底）。
+        db.add_log("info", "meeting", "本场转写走能力后端（不加载本地模型）")
     elif use_sv:
         wmodel = stt_mod._get_whisper("small", cfg.get("sttDevice", "auto"))
         if sv_kind == "qwen3asr":
@@ -552,6 +650,11 @@ def _transcribe_impl(folder):
                                       cfg.get("sttDevice", "auto"))
 
     diarize_fail = ""      # 分离失败只记一次：8 段会议连说 8 遍会淹没日志
+    #: 3.0：把"这次每个槽用了谁、跳过了谁、为什么"与时间轴档位**写进 meta.json**。
+    #: 设计 §4.4 要求执行计划按会议生成一次并落盘 —— 否则"这次为什么走了本机"
+    #: 事后完全查不出来（面板与导出都只能看到一个转写结果）。
+    cap_plan = None
+    cap_kinds = {}
     for i, seg in enumerate(segs, start=1):
         seg_idx = int(seg.split(".")[0])
         seg_path = os.path.join(folder, seg)
@@ -576,6 +679,25 @@ def _transcribe_impl(folder):
             except Exception as e:
                 db.add_log("error", "meeting",
                            f"{meeting_name} 第{i}段转写失败（provider）：{e}")
+        elif cap_session is not None:
+            # 3.0：文本走能力后端，时间轴由**拼装层**统一决定（设计 §4.4）。
+            router, need = cap_session
+            try:
+                seg_rows, plan_dict, got = _capability_segment_rows(
+                    router, need, seg_path, cfg, seg_idx, seg_min, cap_kinds)
+                cap_plan = cap_plan or plan_dict
+                if not seg_rows:
+                    # 空结果**显式留痕**（与本地那条路同一个纪律）：
+                    # 区分"这段没人说话"与"后端出了问题"
+                    db.add_log("warn", "meeting",
+                               f"{meeting_name} 第{i}段没有内容"
+                               f"（档位 {got.timestamps}）——本段不写行")
+            except Exception as e:
+                db.add_log("error", "meeting",
+                           f"{meeting_name} 第{i}段能力后端转写失败：{type(e).__name__}: {e}")
+                # **不在段内回落到本地引擎**：一场会议里"前几段走服务端、后几段走本机"
+                # 会让时间轴精度与文本风格前后不一致，而用户看不出来。
+                # 失败就留痕、本段不写行；整场是否重跑由人决定（见 retranscribe_meeting）。
         elif use_sv:
             # Qwen3-ASR：优先用 ForcedAligner 原生时间戳（自然句子），失败回退 whisper 骨架对齐
             if sv_kind == "qwen3asr":
@@ -664,6 +786,13 @@ def _transcribe_impl(folder):
         seg_rows = _ensure_speaker_column(seg_rows)
         db_rows.extend(seg_rows)
         meta.setdefault("transcribed", []).append(seg)
+        # 3.0：把这次"用了谁/跳过了谁/为什么"与时间轴档位落盘。
+        # 为什么每次都写：转写可能中途崩/被重启，**已完成的段也要留下当时的路由结论**，
+        # 否则事后只能看到"转了一半"，而不知道为什么后半段没走。
+        if cap_plan is not None:
+            meta["capability"] = cap_plan
+        if cap_kinds:
+            meta["timestampsKinds"] = dict(cap_kinds)
         with open(os.path.join(folder, "meta.json"), "w", encoding="utf-8") as f:
             json.dump(meta, f, ensure_ascii=False, indent=2)
 

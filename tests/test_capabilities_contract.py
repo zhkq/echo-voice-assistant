@@ -52,6 +52,11 @@ from app.capabilities import (                                     # noqa: E402
     error_from_server,
 )
 from app.capabilities.router import _sources_for_privacy                 # noqa: E402
+from app.capabilities.assemble import (                                  # noqa: E402
+    TIMESTAMPS_EXACT,
+    TIMESTAMPS_KINDS,
+    TIMESTAMPS_NONE,
+)
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -155,11 +160,19 @@ class _Contract:
         self.assertTrue(r.provenance.backend_id, "结果必须带出处")
         self.assertTrue(r.provenance.model_version, "结果必须带模型版本")
 
-    def test_timestamps_are_only_exact_or_none_never_invented(self):
-        """服务端与**本机**都不许编 `estimated` —— 那是拼装层的兜底（设计 §4.4）。
+    def test_timestamps_label_always_matches_the_data(self):
+        """**标签必须与数据一致** —— 这是"两个后端行为等价"最值钱的一条。
 
-        这条是"同一份契约跑两边"最值钱的一条：它把"谁能编时间戳"这件事钉成了一句
-        两边都必须满足的话，而不是各写各的。
+        原本这条写的是"只能是 `exact` / `none`"，那是**引入拼装层之前**的写法。
+        现在客户端后端可以自己装配，于是多了 `aligned`（有精确骨架、文本按字对齐）
+        与 `estimated`（按字数均摊）。所以真正要钉的不再是"哪两个值"，
+        而是**标签不许与数据打架**：
+
+          * 说 `none` ⟺ 不给句子轴（不能说了没有又给一份）
+          * 说 `exact`/`aligned`/`estimated` ⟹ **必须有**句子轴（不能空口说精确）
+
+        为什么这条比"限定取值"更值钱：取值集合以后还会变（服务端将来可能给
+        `estimated` 之外的档），但"说到做不到"永远是错的。
         """
         c = self.make_client()
         if not c.supports("asr.text"):
@@ -167,12 +180,27 @@ class _Contract:
         for want in (False, True):
             with self.subTest(want_timestamps=want):
                 r = c.transcribe(self.wav(), lang="zh", want_timestamps=want)
-                self.assertIn(r.timestamps, ("exact", "none"))
-                if r.timestamps == "none":
-                    self.assertEqual(r.sentences, (),
-                                     "说了没有时间戳，就不该再给句子轴")
+                self.assertIn(r.timestamps, TIMESTAMPS_KINDS)
+                if r.timestamps == TIMESTAMPS_NONE:
+                    self.assertEqual(r.sentences, (), "说了没有时间戳，就不该再给句子轴")
                 else:
-                    self.assertTrue(r.sentences, "说了 exact，就得真有句子轴")
+                    self.assertTrue(r.sentences, "说了 %s，就得真有句子轴" % r.timestamps)
+                    for a, b, t in r.sentences:
+                        self.assertLessEqual(a, b, "句子轴的起点不该晚于终点")
+
+    def test_a_remote_backend_never_invents_estimated(self):
+        """**服务端不装配**，所以它只会说 `exact` / `none`。
+
+        拼装是**客户端**的事（设计 §4.4），服务端只回答"我这句时间轴是真给了还是没给"。
+        这条钉住 `from_server` 的规整：服务端说了别的值也不认，一律当 `none`
+        —— 免得下游把服务端随口一个词当成"精确时间戳"。
+        """
+        r = AsrResult.from_server({"text": "x", "timestamps": "estimated"}, "srv")
+        self.assertEqual(r.timestamps, TIMESTAMPS_NONE)
+        r2 = AsrResult.from_server({"text": "x", "timestamps": "exact",
+                                    "sentences": [{"start": 0, "end": 1, "text": "x"}]}, "srv")
+        self.assertEqual(r2.timestamps, TIMESTAMPS_EXACT)
+        self.assertTrue(r2.sentences)
 
     # ---- 说话人 ------------------------------------------------------------
 
