@@ -388,11 +388,34 @@ def _admin_cli(cfg, args) -> int:
                   "（设计 §7.2 写明的取舍）。")
             return 0
         if args.rotate_secret:
-            secret = a.rotate_secret(args.rotate_secret)
-            print("已轮换 %s 的 secret。**新的明文只出现这一次**：" % args.rotate_secret)
+            grace = float(args.grace_hours or 0)
+            cid = args.rotate_secret
+            secret = a.rotate_secret(cid, grace_hours=grace)
+            print("已轮换 %s 的 secret。**新的明文只出现这一次**：" % cid)
             print("     %s" % secret)
-            print("同时 token_version +1：**它原来的令牌立刻全失效**，必须重新配对"
-                  "（v1 不留宽限期，见设计 §7.5 ⑤）。")
+            print("同时 token_version +1：**它原来那些令牌立刻全失效**"
+                  "（泄漏时最想立刻断掉的就是它们）。")
+            if grace > 0:
+                # 宽限期里旧 secret 还能换令牌 —— 所以这时候客户端**不需要**立刻做什么。
+                # 但服务端只存哈希、发不出新 secret（设计原话"secret 只出现这一次"），
+                # 所以"自动换新"做不到；能做的是**同时给一张新配对码**，让运维在宽限期内
+                # 把新凭据交出去。
+                row = store.client(cid) or {}
+                name = str(row.get("name") or "")
+                scopes_of = str(row.get("scopes") or "")
+                print("宽限期 %.1f 小时内，**旧 secret 仍然能换令牌**：客户端不会断。"
+                      % grace)
+                print("⚠️ 但这把旧 secret 也照样进得来 —— **所以宽限期不能用于"
+                      "「secret 泄漏」**，只用于例行轮换不打断客户端。泄漏请用默认"
+                      "（不带 --grace-hours），那样旧的立刻失效。")
+                print("再给你一张配对码，趁宽限期内把新凭据交给那台机器：")
+                code = a.create_pairing_code(created_by="cli:rotate",
+                                             name=name or cid, scopes=scopes_of)
+                _print_pairing(code, cfg, name=name or cid, scopes=scopes_of)
+            else:
+                print("**不留宽限期**：旧 secret 立刻失效，它必须重新配对。"
+                      "想让旧 secret 多活一阵（例行轮换、不打断客户端），加 "
+                      "--grace-hours 24。")
             return 0
 
         return 2
@@ -428,6 +451,9 @@ def main(argv=None) -> int:
                     help="改 scopes，配合 --scopes（下一个请求就生效）")
     ap.add_argument("--rotate-secret", default="", metavar="CLIENT_ID",
                     help="换 secret 并打印新的（只出现这一次）；旧令牌立即失效")
+    ap.add_argument("--grace-hours", default="0", metavar="H",
+                    help="配合 --rotate-secret：宽限期内**旧 secret 仍可换令牌**"
+                         "（0 = 旧的立刻失效）。⚠️ 宽限期不能用于 secret 泄漏")
     ap.add_argument("--set-quota", default="", metavar="CLIENT_ID",
                     help="改这个客户端的每日音频分钟数上限（配合 --daily-audio-minutes）")
     ap.add_argument("--daily-audio-minutes", default="0", metavar="N",

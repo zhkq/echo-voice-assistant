@@ -1182,13 +1182,29 @@ clients 表：secret_hash / secret_rotated_at
      → 客户端自动落盘新 secret、平滑切换，用户无感
 ```
 
-> **v1 现状：只做了"换掉即失效"，上面那套宽限期还没做（2026-09-24）。**
-> 宽限期要在 `clients` 上加 `prev_secret_hash` / `prev_secret_expires_at` 两列，
-> 而"宽限期内谁还能进"这件事一旦摊开就要想清楚（两把 secret 同时有效，
-> 撤销时怎么保证两把都失效？）。v1 先做最简单的那条：
-> `Store.rotate_secret` 换掉哈希，旧的**立刻**失效 ——
-> 代价是用户要重新配对一次，而配对成本很低（管理面再报一个码）。
-> **别把这张表读成"已经能平滑轮换"。**
+> **实现现状（2026-09-24 落地宽限期，并更正了这段设计里的一句话）**
+>
+> 已按 `clients` 加 `secret_rotated_at` / `prev_secret_hash` / `prev_secret_expires_at`
+> 三列实现。但原文那句"**服务端回 `X-Echo-Secret-Rotated: 1` + 新 secret，
+> 客户端自动落盘新 secret**"**照字面实现不了**，原因很硬：
+> **服务端只存 `secret_hash`，它手上没有新 secret 的明文**（这正是"secret 只出现这一次"
+> 的代价）。所以"自动换新"这条做不到，能做的是三件事：
+>
+> | 做什么 | 怎么做 |
+> |---|---|
+> | 客户端**不断** | 宽限期内旧 secret 仍可换令牌（`prev_secret_hash` + 未过期） |
+> | 客户端**知道该换了** | `/v1/token` 回 `X-Echo-Secret-Rotated: 1` + `X-Echo-Secret-Expires`；客户端写一条 warn 日志 |
+> | 运维**手上有东西可交** | `--rotate-secret ID --grace-hours 24` 顺带再发一张配对码 |
+>
+> **另一条必须写明白的边界：宽限期不能用于 secret 泄漏。**
+> 宽限期内持有旧 secret 的人照样进得来，所以它换不掉一个已经泄出去的秘密 ——
+> 它只解决"例行轮换不想打断客户端"。泄漏就用**默认轮换**（不带 `--grace-hours`）：
+> 旧 secret 立刻失效、`prev_*` 一并清空。命令行的输出把这两句都印出来。
+>
+> **`token_version` 在两种模式下都 +1**：宽限期给的是**旧 secret** 一条活路，
+> 不是给旧**令牌** —— 泄漏时最先想断掉的就是那些已经发出去的 JWT。
+> 契约由 `SecretRotationGraceTests`（8 条）钉住，其中三条专门钉"它不是什么"：
+> 旧令牌照样立刻死、宽限期真的会到期、之后再默认轮换一次会把之前开的门一起关上。
 
 #### ⑥ 客户端本地存什么（**这是客户端侧的安全边界**）
 
@@ -1840,6 +1856,11 @@ client_body_temp_path /var/echo/tmp/nginx;
 | `--rotate-secret`：旧 secret 与旧令牌**都立刻失效**，新的能用 | ✅ | `AdminCliTests.test_rotate_secret_kills_both_...` |
 | 不存在的 client_id：一句人话 + 退出码 1，不是 traceback | ✅ | `AdminCliTests.test_unknown_client_ids_are_reported_cleanly` |
 | 版本号只增不减（否则旧令牌会"复活"） | ✅ | `AdminCliTests.test_version_only_ever_goes_up` |
+| `--rotate-secret` 同时 bump `token_version` | ✅ | `AdminCliTests` / `SecretRotationGraceTests.test_old_tokens_die_immediately_even_with_grace` |
+| 宽限期：旧 **secret** 还能换令牌，并在响应头里告诉客户端 | ✅ | `SecretRotationGraceTests.test_grace_keeps_the_old_secret_usable_for_token_exchange` / `test_the_route_reports_rotation_in_headers` |
+| 宽限期**真的会到期**（不是永久后门） | ✅ | `SecretRotationGraceTests.test_the_grace_window_actually_expires` |
+| 之后再默认轮换一次，会把之前开的宽限门一并关上 | ✅ | `SecretRotationGraceTests.test_a_later_plain_rotation_closes_the_grace_window_too` |
+| 命令行把"宽限期不能用于泄漏"印出来，并给一张新配对码 | ✅ | `SecretRotationGraceTests.test_the_cli_default_says_it_leaves_no_grace` |
 | 已存在的旧库会自动补 `name`/`scopes`（配对码）与 `daily_audio_minutes`（客户端），且**数据不丢** | ✅ | `AuthSchemaMigrationTests` |
 | **公开端点表之外的端点，匿名请求一律 401/403**（遍历 OpenAPI，不靠人记） | ✅ | `PublicSurfaceTests.test_every_other_endpoint_rejects_an_anonymous_request` |
 | 公开表里写了的那三个**真能匿名用**（不然探针会因鉴权失败而"显示不健康"） | ✅ | `PublicSurfaceTests.test_the_documented_public_endpoints_are_actually_reachable` |

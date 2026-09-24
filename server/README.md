@@ -119,6 +119,7 @@ python scripts/smoke-echo-backend.py --pair-code 7K2M9QX4
 | `--disable ID` / `--enable ID` | 禁用（回 **403**）/ 启用（原令牌直接能用） |
 | `--set-scopes ID --scopes "asr"` | 改权限，**下一个请求就生效** |
 | `--rotate-secret ID` | 换 secret（新的只出现这一次）；**旧令牌与旧 secret 立刻全失效** |
+| `--rotate-secret ID --grace-hours 24` | 例行轮换不打断客户端：宽限期内**旧 secret 仍可换令牌**，并顺带再发一张配对码。⚠️ **不能用于 secret 泄漏**（旧 secret 照样进得来） |
 | `--set-quota ID --daily-audio-minutes 120` | 每日音频分钟数上限（0 = 用全局默认；**不清零已用量**） |
 | `--stats [--since-hours 24]` | 调用汇总：谁在用、失败多少、多少分钟音频、p95 耗时（`0` = 全部） |
 | `--list-calls N` | 最近 N 条调用**元数据**（这张表里没有音频/文本/嵌入/说话人数） |

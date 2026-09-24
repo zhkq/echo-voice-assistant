@@ -488,24 +488,36 @@ class Auth:
                                    "没有这个客户端", detail=client_id)
         self.cache.set_disabled(client_id, disabled)
 
-    def rotate_secret(self, client_id: str) -> str:
+    def rotate_secret(self, client_id: str, grace_hours: float = 0.0) -> str:
         """换 secret，返回**新的明文 secret**（只在这一刻出现）。
 
-        同时 `token_version` +1（见 `Store.rotate_secret` 的说明）——
-        也就是说**轮换之后这个客户端必须重新配对/重新拿 secret**，
-        不存在"旧令牌还能再用一小时"的窗口。
+        **总是**把 `token_version` +1：任何已发出的 JWT 立刻失效。
+        宽限期是"给旧 **secret** 一条活路"，不是"给旧令牌"—— 泄漏之后最想立刻断掉的
+        就是那些已经发出去的令牌。
+
+        `grace_hours > 0` 时旧 secret 仍可换令牌直到过期。**它不是为泄漏准备的**
+        （详见 `docs/ECHO能力后端-服务端设计.md` §7.5 ⑤：宽限期里持有旧 secret 的人
+        仍然进得来，所以它换不掉一个已经泄出去的秘密），只用于**例行轮换不打断客户端**。
         """
         if self.store.client(client_id) is None:
             raise errors.EchoError(404, "client_not_found",
                                    "没有这个客户端", detail=client_id)
         secret = new_secret()
-        self.store.rotate_secret(client_id, hash_secret(secret, client_id))
+        self.store.rotate_secret(client_id, hash_secret(secret, client_id),
+                                 grace_hours=grace_hours)
         self.cache.forget(client_id)
         return secret
 
     # ---- 换令牌（§7.5 ②）---------------------------------------------------
 
     def token_for(self, authorization: str) -> Dict[str, Any]:
+        """`Basic client_id:secret` → 短期 JWT。
+
+        宽限期内**旧 secret 也认**（`prev_secret_hash` + 未过期），并在响应里带
+        `secretRotated` —— 让客户端至少知道"该重新配对了"，而不是等宽限期一过
+        突然全部 401。**服务端发不出新 secret**：它只存哈希（设计原话"secret 只出现
+        这一次"），所以这里给的是**通知**，不是"自动换新"。
+        """
         cid, secret = parse_basic(authorization)
         row = self.cache.get(cid)
         if row is None:
@@ -513,14 +525,24 @@ class Auth:
             raise errors.unauthorized("客户端不认识")
         if int(row.get("disabled") or 0):
             raise errors.forbidden("这个客户端已被禁用")
-        if not hmac.compare_digest(str(row.get("secret_hash") or ""),
-                                   hash_secret(secret, cid)):
-            raise errors.unauthorized("secret 不对")
+        given = hash_secret(secret, cid)
+        rotated = False
+        if not hmac.compare_digest(str(row.get("secret_hash") or ""), given):
+            expiry = float(row.get("prev_secret_expires_at") or 0)
+            prev = str(row.get("prev_secret_hash") or "")
+            if prev and expiry > time.time() and hmac.compare_digest(prev, given):
+                rotated = True            # 宽限期内用旧 secret —— 放行，但告诉他
+            else:
+                raise errors.unauthorized("secret 不对")
         ttl = int(self.cfg.get("auth.token_ttl_s", 3600))
         token, expires_in = issue_token(row, self.key, ttl)
-        return {"accessToken": token, "expiresIn": expires_in,
-                "scopes": str(row.get("scopes") or "").split(),
-                "clientId": cid}
+        out = {"accessToken": token, "expiresIn": expires_in,
+               "scopes": str(row.get("scopes") or "").split(),
+               "clientId": cid}
+        if rotated:
+            out["secretRotated"] = True
+            out["secretExpiresAt"] = float(row.get("prev_secret_expires_at") or 0)
+        return out
 
 
 def open_store(cfg) -> Store:

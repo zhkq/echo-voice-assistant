@@ -263,9 +263,20 @@ def token(request: Request):
     """用 `client_id:secret` 换短期 JWT（设计 §7.5 ②）。
 
     **不做 refresh token**：secret 本来就在客户端本地，多一层只是把同一个东西存两份。
+
+    宽限期内用**旧 secret** 也能换到令牌，这时响应带上
+    `X-Echo-Secret-Rotated: 1` 与 `X-Echo-Secret-Expires`（epoch 秒）——
+    让客户端知道"你手上那把该换了"，而不是等宽限期一过突然全部 401。
+    **服务端发不出新 secret**（只存哈希），所以这是**通知**、不是自动换新：
+    客户端要做的就是提醒人重新配对一次。理由写在设计 §7.5 ⑤。
     """
     st = _st(request)
-    return st.auth.token_for(request.headers.get("authorization") or "")
+    out = st.auth.token_for(request.headers.get("authorization") or "")
+    headers = {}
+    if out.get("secretRotated"):
+        headers["X-Echo-Secret-Rotated"] = "1"
+        headers["X-Echo-Secret-Expires"] = str(int(float(out.get("secretExpiresAt") or 0)))
+    return JSONResponse(content=out, headers=headers)
 
 
 def _source_of(request: Request) -> str:

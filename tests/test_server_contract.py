@@ -2681,5 +2681,128 @@ class CallsAdminTests(unittest.TestCase):
         self.assertIn("全部", out)
 
 
+class SecretRotationGraceTests(unittest.TestCase):
+    """轮换宽限期（设计 §7.5 ⑤）。
+
+    **它不等于"secret 泄漏也能平滑轮换"** —— 宽限期里持有旧 secret 的人照样进得来，
+    所以它换不掉一个已经泄出去的秘密。这一组用例把"它到底是什么"钉住：
+    旧的 secret **能换令牌**、旧的**令牌**照样立刻死、宽限期一过旧 secret 立刻不认。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="echo-rotate-")
+        self.store = store_mod.Store(os.path.join(self.tmp, "auth.db"))
+        self.addCleanup(self.store.close)
+        self.cfg = settings_mod.load()
+        self.cfg.raw["auth"]["enabled"] = True
+        self.cfg.raw["auth"]["mode"] = "jwt"
+        self.cfg.raw["auth"]["jwt_secret"] = "0123456789abcdef0123456789abcdef"
+        self.cfg.raw["auth"]["db"] = os.path.join(self.tmp, "auth.db")
+        self.auth = auth_mod.Auth(self.cfg, self.store)
+        self.store.upsert_client("cli-1", "测试机", auth_mod.hash_secret("old-secret", "cli-1"),
+                                 scopes="asr")
+        self.auth.cache.forget("cli-1")
+
+    def _basic(self, secret):
+        raw = base64.b64encode(("cli-1:%s" % secret).encode()).decode()
+        return "Basic " + raw
+
+    def test_default_rotation_kills_the_old_secret_immediately(self):
+        self.auth.rotate_secret("cli-1")
+        with self.assertRaises(Exception) as ctx:
+            self.auth.token_for(self._basic("old-secret"))
+        self.assertEqual(ctx.exception.code, "unauthorized")
+
+    def test_grace_keeps_the_old_secret_usable_for_token_exchange(self):
+        self.auth.rotate_secret("cli-1", grace_hours=24)
+        out = self.auth.token_for(self._basic("old-secret"))
+        self.assertTrue(out.get("secretRotated"), "没告诉客户端它的 secret 已经轮换")
+        self.assertTrue(out.get("accessToken"))
+        self.assertGreater(out["secretExpiresAt"], time.time())
+
+    def test_the_new_secret_also_works_right_away(self):
+        new = self.auth.rotate_secret("cli-1", grace_hours=24)
+        out = self.auth.token_for(self._basic(new))
+        self.assertTrue(out.get("accessToken"))
+        self.assertFalse(out.get("secretRotated"), "新 secret 不该被当成轮换中的旧的")
+
+    def test_old_tokens_die_immediately_even_with_grace(self):
+        """宽限期给的是**旧 secret** 一条活路，不是旧令牌 —— 泄漏时最想断掉的就是令牌。"""
+        row = self.store.client("cli-1")
+        token, _ttl = auth_mod.issue_token(row, self.auth.key, 3600)
+        self.auth.rotate_secret("cli-1", grace_hours=24)
+        with self.assertRaises(Exception) as ctx:
+            self.auth.authenticate("Bearer " + token)
+        self.assertEqual(ctx.exception.code, "unauthorized")
+
+    def test_the_grace_window_actually_expires(self):
+        """宽限期过了，旧 secret 就不认了 —— 否则它就不是"期限"，是永久后门。"""
+        self.auth.rotate_secret("cli-1", grace_hours=0.0003)      # ~1 秒
+        time.sleep(1.2)
+        self.auth.cache.forget("cli-1")          # 让缓存重读那一行
+        with self.assertRaises(Exception) as ctx:
+            self.auth.token_for(self._basic("old-secret"))
+        self.assertEqual(ctx.exception.code, "unauthorized")
+
+    def test_a_later_plain_rotation_closes_the_grace_window_too(self):
+        """先开宽限、之后再默认轮换一次 → 上一把也立刻失效。
+
+        （泄漏之后的补刀就该是"默认轮换"，它必须把那扇开着的门一起关上。）
+        """
+        self.auth.rotate_secret("cli-1", grace_hours=24)
+        self.auth.rotate_secret("cli-1")
+        self.auth.cache.forget("cli-1")
+        with self.assertRaises(Exception):
+            self.auth.token_for(self._basic("old-secret"))
+
+    def test_the_route_reports_rotation_in_headers(self):
+        """`/v1/token` 要把它变成头，客户端才看得见（`X-Echo-Secret-Rotated`）。"""
+        new_secret = self.auth.rotate_secret("cli-1", grace_hours=24)
+        cfg = _cfg(tempfile.mkdtemp(prefix="echo-rotate-srv-"))
+        cfg.raw["auth"]["db"] = os.path.join(self.tmp, "auth.db")
+        cfg.raw["auth"]["enabled"] = True
+        cfg.raw["auth"]["mode"] = "jwt"
+        cfg.raw["auth"]["jwt_secret"] = "0123456789abcdef0123456789abcdef"
+        with patch.object(engines, "build_loaders",
+                          lambda device="cuda": {"fake": _fake_loader}):
+            app = server_main.create_app(cfg)
+            with TestClient(app) as c:
+                r = c.post("/v1/token", headers={"Authorization": self._basic("old-secret")})
+                self.assertEqual(r.status_code, 200, r.text)
+                self.assertEqual(r.headers.get("X-Echo-Secret-Rotated"), "1")
+                self.assertTrue(int(r.headers.get("X-Echo-Secret-Expires") or 0) > time.time())
+                # 新 secret 走的是正常那条路：能用，但**不带那个头**
+                r2 = c.post("/v1/token", headers={"Authorization": self._basic(new_secret)})
+                self.assertEqual(r2.status_code, 200, r2.text)
+                self.assertIsNone(r2.headers.get("X-Echo-Secret-Rotated"))
+
+    def test_the_cli_default_says_it_leaves_no_grace(self):
+        cfg_path = os.path.join(self.tmp, "server.yaml")
+        with open(cfg_path, "w", encoding="utf-8") as fh:
+            fh.write("server: {id: rot}\n"
+                     "auth:\n  enabled: true\n  mode: jwt\n"
+                     "  jwt_secret: '0123456789abcdef0123456789abcdef'\n"
+                     "  db: '%s'\n"
+                     "models: {specs: %s}\n" % (os.path.join(self.tmp, "auth2.db")
+                                               .replace("\\", "/"), json.dumps(FAKE_SPECS)))
+        seed = store_mod.Store(os.path.join(self.tmp, "auth2.db"))
+        seed.upsert_client("cli-1", "测试机", auth_mod.hash_secret("s", "cli-1"), scopes="asr")
+        seed.close()
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = server_main.main(["--config", cfg_path, "--rotate-secret", "cli-1"])
+        self.assertEqual(rc, 0)
+        self.assertIn("不留宽限期", buf.getvalue())
+        buf2 = io.StringIO()
+        with contextlib.redirect_stdout(buf2):
+            rc2 = server_main.main(["--config", cfg_path, "--rotate-secret", "cli-1",
+                                    "--grace-hours", "24"])
+        out2 = buf2.getvalue()
+        self.assertEqual(rc2, 0)
+        self.assertIn("旧 secret 仍然能换令牌", out2)
+        self.assertIn("不能用于", out2, "没说清宽限期不能用于泄漏 —— 那是最容易用错的地方")
+        self.assertIn("echo://pair?", out2, "没给新配对码，运维只能干等宽限期结束")
+
+
 if __name__ == "__main__":
     unittest.main()

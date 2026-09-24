@@ -244,6 +244,17 @@ def fetch_token(creds: BackendCredentials, *, timeout: float = PAIR_TIMEOUT_S
         expires_in = int(body.get("expiresIn") or 0)
     except (TypeError, ValueError):
         expires_in = 0
+    if body.get("secretRotated"):
+        # 服务端在宽限期内认了我们手上这把旧 secret，并顺带告诉我们"该换了"。
+        # **它发不出新 secret**（只存哈希，设计 §7.5 ⑤），所以这里能做的只有"说出来" ——
+        # 让人重新配对一次。不说的话，宽限期一过就是一片 401，而那时已经没人知道原因。
+        try:
+            from app import db
+            db.add_log("warn", "capability",
+                       "后端凭据已被管理员轮换：请在宽限期结束前重新配对"
+                       "（服务端只存哈希，没法把新 secret 发给我们）")
+        except Exception:
+            pass
     return token, expires_in
 
 

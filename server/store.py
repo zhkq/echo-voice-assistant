@@ -56,6 +56,12 @@ CREATE TABLE IF NOT EXISTS clients (
     -- 每客户端专属的每日音频分钟数配额；0 = 用全局默认（limits.daily_audio_minutes）。
     -- **是上限不是内容**，所以不撞 §8.5 的"内容/业务概念"列名黑名单。
     daily_audio_minutes REAL NOT NULL DEFAULT 0,
+    -- 轮换宽限期（设计 §7.5 ⑤，2026-09-24）：轮换后**旧 secret 还能用一阵**，
+    -- 让客户端在下一次换令牌时平滑过渡、不必当场重新配对。
+    -- `prev_*` 只在宽限期内非空；`secret_rotated_at` 是给人看的时间戳。
+    secret_rotated_at      REAL NOT NULL DEFAULT 0,
+    prev_secret_hash       TEXT NOT NULL DEFAULT '',
+    prev_secret_expires_at REAL NOT NULL DEFAULT 0,
     created_at    REAL NOT NULL,
     updated_at    REAL NOT NULL,
     last_seen     REAL NOT NULL DEFAULT 0
@@ -102,6 +108,10 @@ _ADDED_COLUMNS = {
     "clients": (
         # 每客户端专属的每日音频分钟数配额（0 = 用全局默认，见 server/quota.py）。
         ("daily_audio_minutes", "REAL NOT NULL DEFAULT 0"),
+        # 轮换宽限期（设计 §7.5 ⑤）：旧 secret 还能用一阵。
+        ("secret_rotated_at", "REAL NOT NULL DEFAULT 0"),
+        ("prev_secret_hash", "TEXT NOT NULL DEFAULT ''"),
+        ("prev_secret_expires_at", "REAL NOT NULL DEFAULT 0"),
     ),
     "pairing_codes": (
         ("name", "TEXT NOT NULL DEFAULT ''"),
@@ -361,23 +371,38 @@ class Store:
             self._db.commit()
             return int(cur.rowcount or 0)
 
-    def rotate_secret(self, client_id: str, secret_hash: str) -> Optional[Dict[str, Any]]:
+    def rotate_secret(self, client_id: str, secret_hash: str,
+                      grace_hours: float = 0.0) -> Optional[Dict[str, Any]]:
         """轮换 secret（设计 §7.5 ⑤）。返回更新后的行；客户端不存在返回 None。
 
-        v1 **不带宽限期**：旧 secret 立刻失效。而且**同时把 `token_version` +1** ——
-        理由：v1 里轮换之后客户端本来就必须重新配对（新 secret 只能由管理员带外交给用户），
-        既然它已经必须重新配对，就没必要再留一个"旧 JWT 还能用最多 1 小时"的窗口。
-        留着那个窗口反而更容易让人误以为"轮换失败了"。
-        宽限期（`prev_secret_hash` + 24h 双 secret）是 v2 的事。
+        **总是**把 `token_version` +1：任何已发出的 JWT 立刻失效。
+        理由见 `Auth.rotate_secret` —— 宽限期是"给旧 secret 一条活路"，不是"给旧令牌"。
+
+        `grace_hours > 0` 时**旧 secret 还能用来换令牌**直到过期（`prev_*` 两列）；
+        `0`（默认）时旧的**立刻**失效，并且**把可能存在的宽限期一并清掉** ——
+        泄漏之后补一次默认轮换，就该把之前开的那扇门也关上。
         """
+        now = time.time()
         with self._lock:
-            cur = self._db.execute(
-                "UPDATE clients SET secret_hash=?, token_version=token_version+1, "
-                "updated_at=? WHERE client_id=?",
-                (secret_hash, time.time(), client_id))
-            self._db.commit()
-            if not cur.rowcount:
+            cur = self._db.execute("SELECT secret_hash FROM clients WHERE client_id=?",
+                                   (client_id,)).fetchone()
+            if cur is None:
                 return None
+            old_hash = str(cur["secret_hash"] or "")
+            if grace_hours and grace_hours > 0:
+                self._db.execute(
+                    "UPDATE clients SET secret_hash=?, token_version=token_version+1,"
+                    " secret_rotated_at=?, prev_secret_hash=?, prev_secret_expires_at=?,"
+                    " updated_at=? WHERE client_id=?",
+                    (secret_hash, now, old_hash, now + float(grace_hours) * 3600.0,
+                     now, client_id))
+            else:
+                self._db.execute(
+                    "UPDATE clients SET secret_hash=?, token_version=token_version+1,"
+                    " secret_rotated_at=?, prev_secret_hash='', prev_secret_expires_at=0,"
+                    " updated_at=? WHERE client_id=?",
+                    (secret_hash, now, now, client_id))
+            self._db.commit()
             row = self._db.execute("SELECT * FROM clients WHERE client_id=?",
                                    (client_id,)).fetchone()
         return dict(row) if row else None
