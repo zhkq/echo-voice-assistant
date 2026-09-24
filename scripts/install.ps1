@@ -546,8 +546,12 @@ function Install-EmbeddedPython([string]$rcDir) {
     #
     # 两个必须做的收尾：
     #   1. `._pth` 里打开 `import site`，否则 pip 装的包 import 不到；
-    #   2. `._pth` 里加上安装根（`..`）—— 嵌入包是 **isolated 模式**：cwd 与 PYTHONPATH
+    #   2. `._pth` 里加上**代码目录** —— 嵌入包是 **isolated 模式**：cwd 与 PYTHONPATH
     #      都不算数，`import app` 只能靠这一行（2026-09-21 实测踩到）。
+    #      ⚠️ 2026-09-25 同事实测（测试报告 §4.1 A）：这里原来**写死 `..`**，那是扁平布局的
+    #      相对项；3.0 代码在 `<base>\echo-core` 下，`..` 只到 `<base>` → `sys.path` 里
+    #      没有代码目录 → 服务起来就 `No module named 'app'`，而 PYTHONPATH 在 isolated
+    #      模式下**被完全忽略**，没有任何兜底。所以相对项必须按 Resolve-CoreDir 的结果算。
     $url = 'https://www.python.org/ftp/python/3.11.9/python-3.11.9-embed-amd64.zip'
     $zip = Join-Path $env:TEMP ('echo-py-embed-' + [guid]::NewGuid().ToString('N').Substring(0, 8) + '.zip')
     Info ("下载 Python 3.11 嵌入包（约 11 MB）: {0}" -f $url)
@@ -562,9 +566,20 @@ function Install-EmbeddedPython([string]$rcDir) {
     Remove-Item $zip -Force -ErrorAction SilentlyContinue
     $pth = Get-ChildItem (Join-Path $rcDir '*._pth') -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($pth) {
+        # 代码目录相对 runtime-core 的写法：新布局 `..\echo-core`、扁平布局 `..`。
+        # 不从 $rcDir 反推（带盘符/大小写差异容易算错），直接由"安装根 + 代码目录名"推：
+        # CoreDir 一定是 TargetDir 下的相对子路径（见 Resolve-CoreDir）。
+        $coreRel = ''
+        if ($script:CoreDir -and $script:TargetDir -and
+            $script:CoreDir.StartsWith($script:TargetDir, [StringComparison]::OrdinalIgnoreCase)) {
+            $coreRel = $script:CoreDir.Substring($script:TargetDir.Length).TrimStart('\', '/')
+        }
+        $codeEntry = if ($coreRel) { '..\' + $coreRel } else { '..' }
         $keep = @(Get-Content $pth.FullName | Where-Object {
-            $_ -notmatch '^\s*#?\s*import site\s*$' -and $_.Trim() -ne '..' -and $_.Trim() -ne 'Lib\site-packages' })
-        Set-Content -Path $pth.FullName -Value ($keep + @('import site', 'Lib\site-packages', '..')) -Encoding ASCII
+            $_ -notmatch '^\s*#?\s*import site\s*$' -and $_.Trim() -ne '..' -and
+            $_.Trim() -ne 'Lib\site-packages' -and $_.Trim() -ne $codeEntry })
+        Set-Content -Path $pth.FullName -Value ($keep + @('import site', 'Lib\site-packages', $codeEntry)) -Encoding ASCII
+        Ok ("嵌入包 sys.path 已写入代码目录（{0}）" -f $codeEntry)
     } else {
         Warn '嵌入包里没有 ._pth —— ECHO 的 app 包可能 import 不到'
     }

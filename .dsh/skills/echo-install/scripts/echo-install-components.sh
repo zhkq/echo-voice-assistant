@@ -179,7 +179,12 @@ engine_known() {
 
 engine_pip() {
   case "$1" in
-    sherpa)   echo "sherpa-onnx" ;;
+    # 每个 STT 档都必须带**模型下载客户端**（modelscope 或 huggingface-hub 之一）：
+    # app/modelinfo._snapshot() 是"先 ModelScope、失败再 HF"，一个都没有就必然下不到模型。
+    # sherpa 原来只装 sherpa-onnx，而默认档恰是第一个"只有 sherpa"的档位
+    # （whisper-* 顺带带 hf-hub、sensevoice/qwen3asr 顺带带 modelscope）。
+    # 与 Windows 侧逐字对应，由 tests/test_install_entry.py 的 DownloadClientTests 守着。
+    sherpa)   echo "sherpa-onnx modelscope" ;;
     whisper-tiny|whisper-base|whisper-small|whisper-medium|whisper-large-v3)
               echo "faster-whisper huggingface-hub" ;;
     sensevoice) echo "funasr modelscope torch" ;;

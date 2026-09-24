@@ -92,7 +92,13 @@ function Step([string]$m) { Write-Host ''; Write-Host "== $m" -ForegroundColor C
 # 依据：app/audio/stt.py 的 _parse_choice()（sttModel 取值 = sherpa|sensevoice|qwen3asr|whisper 档名）
 #       与 app/components.py 的清单（model_id / 体积 / 来源）。
 $ENGINE_MAP = @{
-    'sherpa'           = @{ pip = @('sherpa-onnx');                       model = 'sherpa';           stt = 'sherpa';   module = 'sherpa_onnx' }
+    # ⚠️ 每个 STT 档都必须带**模型下载客户端**（modelscope 或 huggingface-hub 之一）：
+    # `app/modelinfo._snapshot()` 是"先 ModelScope、失败再 HF"，一个都没有就必然下不到模型。
+    # sherpa 档原来只装 sherpa-onnx —— 而默认档恰好是第一个"只有 sherpa"的档位
+    # （whisper-* 顺带带 hf-hub、sensevoice/qwen3asr 顺带带 modelscope），于是全新机器
+    # 默认档必然卡在"模型下不下来"（同事 2026-09-25 实测报告 §4.1 B）。
+    # 这条由 tests/test_install_entry.py 的 DownloadClientTests 守着，别再漏。
+    'sherpa'           = @{ pip = @('sherpa-onnx', 'modelscope');         model = 'sherpa';           stt = 'sherpa';   module = 'sherpa_onnx' }
     'whisper-tiny'     = @{ pip = @('faster-whisper', 'huggingface-hub'); model = 'whisper-tiny';     stt = 'tiny';     module = 'faster_whisper' }
     'whisper-base'     = @{ pip = @('faster-whisper', 'huggingface-hub'); model = 'whisper-base';     stt = 'base';     module = 'faster_whisper' }
     'whisper-small'    = @{ pip = @('faster-whisper', 'huggingface-hub'); model = 'whisper-small';    stt = 'small';    module = 'faster_whisper' }
@@ -133,13 +139,23 @@ function Get-EchoPort {
 
 function Invoke-Api {
     param([string]$Path, [string]$Method = 'GET', $Body = $null, [int]$TimeoutSec = 30)
-    $port = Get-EchoPort
-    $args = @{ Uri = "http://127.0.0.1:$port$Path"; Method = $Method; TimeoutSec = $TimeoutSec }
+    # 走 Invoke-WebRequest 再**自己按 UTF-8 解字节**，而不是 Invoke-RestMethod 直接吃 JSON：
+    # Windows PowerShell 5.1 在响应头没写 charset 时按 **ISO-8859-1** 解 JSON —— FastAPI 回的
+    # `application/json` 正好不带 charset，于是所有中文 detail 变成 `ç¬ç«` 这种乱码
+    # （同事实测报告 §4.4 G：`{DATA}\logs\install-*.log` 里满是乱码，排障时误导人）。
+    # 5.1 没有能救它的 -Encoding 开关，只能拿原始字节自己解。
+    $req = @{ Uri = "http://127.0.0.1:$(Get-EchoPort)$Path"; Method = $Method
+              TimeoutSec = $TimeoutSec; UseBasicParsing = $true }
     if ($null -ne $Body) {
-        $args.ContentType = 'application/json'
-        $args.Body = ($Body | ConvertTo-Json -Depth 6 -Compress)
+        $req.ContentType = 'application/json; charset=utf-8'
+        $req.Body = [System.Text.Encoding]::UTF8.GetBytes(($Body | ConvertTo-Json -Depth 6 -Compress))
     }
-    return Invoke-RestMethod @args
+    $resp = Invoke-WebRequest @req
+    $bytes = if ($resp.RawContentStream) { $resp.RawContentStream.ToArray() } else { @() }
+    if (-not $bytes -or $bytes.Length -eq 0) { return $null }
+    $text = [System.Text.Encoding]::UTF8.GetString($bytes)
+    if (-not $text.Trim()) { return $null }
+    return ($text | ConvertFrom-Json)
 }
 
 function Ensure-Service {
@@ -212,7 +228,11 @@ function Wait-Model([string]$Id) {
     $deadline = (Get-Date).AddSeconds($WaitSeconds)
     while ((Get-Date) -lt $deadline) {
         try {
-            $jobs = (Invoke-Api -Path '/api/models').jobs
+            # `/api/models` 的形状是 `{active: [...], items: {<id>: {...}}}` —— **任务在 items 里**。
+            # 同事实测报告 §4.2 C：这里原来读 `$jobs.$Id`（少一层 items），于是 `$job` 恒为 null
+            # → 状态归一成 `queued` → 一直空等到 `-WaitSeconds`（默认 1800 秒）超时；
+            # 症状是"脚本卡住了"，其实是白等半小时。`Get-ModelState` 读的就是 items，两边一致。
+            $jobs = (Invoke-Api -Path '/api/models').items
             $job = $null
             if ($jobs -and $jobs.PSObject.Properties.Name -contains $Id) { $job = $jobs.$Id }
             $state = Get-JobState $job

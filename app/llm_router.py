@@ -150,11 +150,17 @@ def _home_entry(kind: str, label: str, home) -> dict:
 def dsh_homes() -> list:
     """**实际存在**的 DSH 家目录（桌面版在前、标准版在后；同一路径只算一处）。
 
-    「存在」的判据是里面已经有 `settings.yaml`：DSH 首次运行时会自己写下它，
-    只有目录名对得上而没有这个文件，说明那台 DSH 还没初始化过 —— 这时**不替它造**
-    配置（D25 的老纪律：没装 agent 就不动别人家的配置文件）。
+    「存在」的判据是里面已经有 `settings.yaml` **或** `.credentials.yaml`：
 
-    这样四种装法都自洽：只有桌面版 / 只有标准版 / 两个都有 / 两个都没有（返回空列表）。
+    * `settings.yaml` —— 桌面版首次运行就会写下它；
+    * `.credentials.yaml` —— **标准版 harness 只写这个、从不写 settings.yaml**。
+      2026-09-25 同事实测报告 §4.3 F：判据原来只认 `settings.yaml`，于是"只装标准版"
+      的机器 `dsh_homes()` 返回 `[]`，`sync()` 报"没找到 DSH 家目录"，**ECHO AUTO 100%
+      注册不上**（`/api/failover/health` → `groups: []`），而 `boot.py` 的 15s×8 次重试
+      救不了 —— 判据本身不可能满足。症状是"智能体链路静默失效"，只有装过桌面版的机器不受影响。
+
+    两个都不在时仍然**不替它造**配置（D25：没装 agent 就不动别人家的配置文件），
+    所以四种装法照旧自洽：只有桌面版 / 只有标准版 / 两个都有 / 两个都没有（返回空列表）。
     """
     out, seen = [], set()
     candidates = [(HOME_DESKTOP, "DSH 桌面版", DSH_HOME)]
@@ -170,7 +176,7 @@ def dsh_homes() -> list:
             continue
         seen.add(key)
         entry = _home_entry(kind, label, home)
-        if entry["settings"].is_file():
+        if entry["settings"].is_file() or entry["credentials"].is_file():
             out.append(entry)
     return out
 

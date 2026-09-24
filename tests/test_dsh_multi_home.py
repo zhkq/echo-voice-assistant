@@ -121,6 +121,27 @@ class HomeDiscoveryTests(_Isolated):
         self.assertFalse((empty / "settings.yaml").exists(),
                          "不许替没初始化完的 DSH 造配置")
 
+    def test_a_home_with_only_credentials_is_a_home_too(self):
+        """**标准版 harness 的家目录只有 `.credentials.yaml`，从不写 `settings.yaml`。**
+
+        2026-09-25 同事实测报告 §4.3 F：判据原来只认 `settings.yaml`，于是"只装标准版"
+        的机器 `dsh_homes()` 返回 `[]` → `sync()` 报"没找到 DSH 家目录" → **ECHO AUTO
+        100% 注册不上**（`/api/failover/health` 的 `groups: []`），而 `boot.py` 的
+        15s×8 次重试救不了 —— 判据本身不可能满足。症状是"智能体链路静默失效"，
+        且**只有装过桌面版的机器不受影响**（桌面版会写 settings.yaml）。
+
+        这条钉住"有凭据也算初始化过"；同时 `test_a_directory_without_settings_is_not_a_home`
+        继续钉住"两样都没有 = 还没初始化，别碰它"（D25）。
+        """
+        h = self.tmp / "harness-creds-only"
+        h.mkdir()
+        (h / ".credentials.yaml").write_text("dsh: {token: T-only-creds}\n", encoding="utf-8")
+        self.use_homes(desktop=None, harness=h)
+        self.assertEqual([x["kind"] for x in llm_router.dsh_homes()], ["harness"],
+                         "只有 .credentials.yaml 的家目录必须算数（标准版就是这样）")
+        self.assertFalse((h / "settings.yaml").exists(),
+                         "这条用例不该顺手造 settings.yaml —— 那是 sync() 的事")
+
     def test_nothing_is_created_when_no_dsh_is_installed(self):
         self.use_homes(desktop=None, harness=None)
         ok, detail = llm_router.sync()

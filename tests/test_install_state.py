@@ -209,6 +209,55 @@ class InstallReportTests(unittest.TestCase):
         self.assertIn("install-report.json", src)
 
 
+class ComponentsScriptReadsTheApiRightTests(unittest.TestCase):
+    """组件安装脚本读 ECHO 接口的两处细节 —— 都是同事 2026-09-25 实测报告里的坑。
+
+    * **C**：`Wait-Model` 原来读 `/api/models` 的 `jobs.<id>`，而真实形状是
+      `jobs.items.<id>`（`modelinfo.jobs()` 返回 `{active, items}`）→ `$job` 恒 null →
+      状态归一成 `queued` → **空等到 1800 秒超时**。症状是"脚本卡住了"，没人会想到是读错了路径。
+    * **G**：`Invoke-Api` 原来用 `Invoke-RestMethod` 直接吃 JSON，而 Windows PowerShell 5.1
+      在响应头没有 charset 时按 ISO-8859-1 解 —— FastAPI 回的 `application/json` 正好不带
+      charset，于是 `install-*.log` 里的中文全成了 `ç¬ç«` 这种乱码，排障时误导人。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        cls.path = os.path.join(root, ".dsh", "skills", "echo-install", "scripts",
+                                "echo-install-components.ps1")
+        with open(cls.path, encoding="utf-8-sig") as fh:
+            cls.text = fh.read()
+
+    def _fn(self, name):
+        body = self.text[self.text.index("function %s" % name):]
+        return body[:body.index("\n}") + 2]
+
+    def test_wait_model_reads_jobs_items(self):
+        body = self._fn("Wait-Model")
+        self.assertIn("/api/models", body, "这段该是查下载任务的")
+        self.assertIn(").items", body,
+                      "必须读 jobs.items.<id> —— 读 jobs.<id> 会永远拿到 $null（报告 §4.2 C）")
+
+    def test_invoke_api_decodes_utf8_itself(self):
+        body = self._fn("Invoke-Api")
+        self.assertIn("UTF8.GetString", body,
+                      "PS 5.1 会把不带 charset 的 JSON 按 Latin-1 解 → 中文乱码（报告 §4.4 G）")
+        # 只断言"没有**调用**它"：函数里那句解释性注释本来就会提到这个名字
+        # （第一版用 assertNotIn("Invoke-RestMethod") 被自己的注释抓了 —— 与 `fp=` 那次同类）。
+        self.assertNotIn("Invoke-RestMethod @", body,
+                         "别再用 Invoke-RestMethod —— 它没有能救编码的开关")
+
+    def test_it_matches_the_real_api_shape(self):
+        """顺带钉住"真实形状"这一侧：`modelinfo.jobs()` 必须仍然是 `{active, items}`。
+
+        两边各改一半（脚本改成 items、接口又改回别的形状）时，这条会红。
+        """
+        from app import modelinfo
+        shape = modelinfo.jobs()
+        self.assertIn("items", shape)
+        self.assertIn("active", shape)
+
+
 class PyannoteSourceTests(unittest.TestCase):
     """说话人分离的权重：**改成从 ModelScope 自动装**（2026-09-21）。
 

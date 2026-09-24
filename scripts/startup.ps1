@@ -139,7 +139,12 @@ function Test-EchoPort([int]$port = 8970) {
 # 2026-09-18: the live host had exactly two such leftovers (one serving, one
 # alive-but-not-listening and still loading SenseVoice in the background).
 function Test-EchoAlive {
-    $pidFile = Join-Path $root 'data\echo.pid'
+    # echo.pid lives in the INSTALL BASE, not in the code dir: with the 3.0 layout the code
+    # sits in <base>\echo-core and the data root is <base>. Using $root here made this probe
+    # return false forever - "alive but still starting" was read as "not running", which is
+    # exactly the shape of the 2026-09-15 duplicate-instance incident.
+    # (colleague's test report 2026-09-25 section 4.2 E)
+    $pidFile = Join-Path $base 'data\echo.pid'
     if (-not (Test-Path $pidFile)) { return $false }
     $p = Get-Content $pidFile -Raw -ErrorAction SilentlyContinue
     if ($null -eq $p) { return $false }
@@ -163,7 +168,7 @@ function Start-EchoOnce {
     return $p
 }
 
-$echoPort = Resolve-EchoPort $root
+$echoPort = Resolve-EchoPort $base
 SupLog "resolved ECHO port=$echoPort"
 
 if (Test-EchoPort $echoPort) { SupLog "ECHO already listening on $echoPort" }

@@ -285,6 +285,57 @@ class EngineTableAlignmentTests(unittest.TestCase):
                 self.fail(f"测试没覆盖这个引擎的分类：{engine}")
 
 
+class DownloadClientTests(unittest.TestCase):
+    """每个 STT 引擎档都必须带**模型下载客户端**（同事实测报告 §4.1 B，2026-09-25）。
+
+    为什么值得单独钉一条：`app/modelinfo._snapshot()` 的下载路径是
+    「**先 ModelScope、失败再 HF**」—— 两条路各需要一个客户端模块，**一个都没有就必然
+    下不到模型**。而这个洞一直是被盖住的：whisper-* 档顺带装了 `huggingface-hub`、
+    sensevoice/qwen3asr 顺带装了 `modelscope`，于是 3.0 的**默认档（只有 sherpa）**
+    一装就卡在"模型下不下来"，安装脚本空等到 1800 秒超时，报的是两句 ImportError。
+
+    钉两层：
+      * 引擎表（两个平台都要）—— 安装器装依赖时就该把客户端带上；
+      * 默认档的依赖清单 —— 模型以后还能从面板补下，运行期也得有客户端。
+    """
+
+    CLIENTS = ("modelscope", "huggingface-hub")
+
+    def _has_client(self, pips):
+        return [c for c in self.CLIENTS
+                if any(p.split("==")[0].split(">")[0].strip() == c for p in pips)]
+
+    def test_windows_engine_map_carries_a_download_client(self):
+        for engine, row in _parse_ps1_engine_map().items():
+            with self.subTest(engine=engine):
+                self.assertTrue(self._has_client(row["pip"]),
+                                "%s 档没带下载客户端（modelscope / huggingface-hub）：%s"
+                                % (engine, row["pip"]))
+
+    def test_macos_engine_map_carries_a_download_client(self):
+        for engine, value in _parse_bash_case_map(SH, "engine_pip").items():
+            with self.subTest(engine=engine):
+                self.assertTrue(self._has_client(value.split()),
+                                "%s 档没带下载客户端（mac 侧）：%s" % (engine, value))
+
+    def test_the_two_platforms_pick_the_same_client_for_sherpa(self):
+        """**两个平台不许各挑一个**：挑不同的客户端会让"Windows 能用、mac 下不动"这种事
+        只在一边复现，而两边的日志长得一样。"""
+        ps1 = _parse_ps1_engine_map()["sherpa"]["pip"]
+        sh = _parse_bash_case_map(SH, "engine_pip")["sherpa"].split()
+        self.assertEqual(self._has_client(ps1), self._has_client(sh),
+                         "sherpa 档在两平台上带的客户端不一致：win=%s mac=%s" % (ps1, sh))
+
+    def test_the_default_profile_requirements_carry_one_too(self):
+        """默认档的依赖清单里也要有 —— 它是**运行时**依赖，不只是安装期依赖。"""
+        with open(os.path.join(ROOT, "requirements-core.txt"), encoding="utf-8") as fh:
+            names = [ln.split(">")[0].split("=")[0].strip().lower()
+                     for ln in fh if ln.strip() and not ln.strip().startswith("#")]
+        self.assertTrue([c for c in self.CLIENTS if c in names],
+                        "requirements-core.txt 里没有下载客户端（modelscope / huggingface-hub）：%s"
+                        % names)
+
+
 class MacScriptPortabilityTests(unittest.TestCase):
     """mac 脚本必须能在**系统自带的 bash 3.2** 上跑（开发机是 5.x，测不出来）。"""
 

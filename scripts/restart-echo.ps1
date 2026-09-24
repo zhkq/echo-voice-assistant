@@ -27,7 +27,13 @@ param(
 $ErrorActionPreference = 'Stop'
 $scripts = $PSScriptRoot
 $root = Split-Path $scripts -Parent
-$logDir = Join-Path $root 'data\logs'
+# 3.0 安装根布局：代码在 <base>\echo-core 时，data（restart.log / echo-port.txt）在 <base> 下。
+# 这个脚本不 source echo-launch-lib.ps1（它要在"运行时可能已经坏了"的时候也能跑），
+# 所以按同一条规则内联算一次 —— 判据与 app\paths.py:echo_base() 一致。
+# 同事实测报告 §4.2 E：漏改这里会让 restart.log 落进 echo-core\data\、端口文件读不到。
+$installBase = $root
+if ((Split-Path $root -Leaf) -ieq 'echo-core') { $installBase = Split-Path $root -Parent }
+$logDir = Join-Path $installBase 'data\logs'
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
 $log = Join-Path $logDir 'restart.log'
 
@@ -65,7 +71,7 @@ function Test-EchoPort([int]$port = 8970) {
 Write-Log "===== restart requested (wait ${WaitMs}ms) ====="
 Start-Sleep -Milliseconds $WaitMs
 
-$port = Resolve-EchoPort $root
+$port = Resolve-EchoPort $installBase
 Write-Log "resolved ECHO port=$port"
 
 $stop = Join-Path $scripts 'stop.ps1'

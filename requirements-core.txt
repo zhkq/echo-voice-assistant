@@ -34,3 +34,16 @@ soxr>=0.3
 # 那次只修了"不再静默失败"（会告诉你缺哪个包），**根因在这里**：
 # 准备运行时的时候就应该把它装上。torch-free、约 27 MB、全平台有 wheel。
 sherpa-onnx>=1.10
+# 2026-09-25：**模型下载客户端也是必装**（同事实测报告 §4.1 B）。
+#
+# 为什么：`app/modelinfo._snapshot()` 的下载路径是"**先 ModelScope、失败再 HF**"，
+# 两条路各自需要 `modelscope` / `huggingface_hub` 之一 —— **一个都没有就必然下不到模型**，
+# 而默认档（sherpa）恰好是**第一个"只有 sherpa"** 的档位：whisper-* 档顺带带了
+# `huggingface-hub`、sensevoice/qwen3asr 顺带带了 `modelscope`，所以这个洞一直被盖着。
+# 实测现象（同事 2026-09-25，全新机器、默认档）：
+#     RuntimeError: ModelScope(...): No module named 'modelscope'；
+#                   HF(...):        No module named 'huggingface_hub'
+# 选 ModelScope 而不是 huggingface-hub：同事那台机器实测走 ModelScope **189 MB / 15 秒**
+# 下完（内网走它最稳），而且它有国内源；两者都不拖 torch（L1 安全，Requires-Dist 逐条核过）。
+# 这条同时由 tests/test_install_entry.py 的"每个 STT 引擎必须带下载客户端"守着。
+modelscope>=1.9
