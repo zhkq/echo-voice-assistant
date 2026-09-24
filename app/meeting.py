@@ -348,62 +348,9 @@ def _ensure_speaker_column(rows):
     return out
 
 
-def _align_sentences(sv_text, wsegs):
-    """SenseVoice 整段文本（带标点）对齐 whisper 碎句时间轴，按标点切句。"""
-    import difflib
-    if not wsegs or not sv_text:
-        return []
-    w_chars, w_times = [], []
-    for st, en, txt in wsegs:
-        t = (txt or "").strip()
-        if not t:
-            continue
-        n = len(t)
-        for i, ch in enumerate(t):
-            w_chars.append(ch)
-            w_times.append(st + (en - st) * (i + 0.5) / n)
-    if not w_chars:
-        return []
-    sv = list(sv_text)
-    sm = difflib.SequenceMatcher(None, sv, w_chars, autojunk=False)
-    tmap = {}
-    for op, i1, i2, j1, j2 in sm.get_opcodes():
-        if op == "equal":
-            for k in range(i2 - i1):
-                tmap[i1 + k] = w_times[j1 + k]
-    sv_times = []
-    last_i, last_t = -1, 0.0
-    for i in range(len(sv)):
-        if i in tmap:
-            last_i, last_t = i, tmap[i]
-            sv_times.append(tmap[i])
-        else:
-            nxt = None
-            for j in range(i + 1, len(sv)):
-                if j in tmap:
-                    nxt = (j, tmap[j])
-                    break
-            if nxt and last_i >= 0 and nxt[0] != last_i:
-                sv_times.append(last_t + (nxt[1] - last_t) * (i - last_i) / (nxt[0] - last_i))
-            else:
-                sv_times.append(last_t)
-    sentences = []
-    buf = []
-    seg_start = 0.0
-    for i, ch in enumerate(sv):
-        if not buf:
-            seg_start = sv_times[i]
-        buf.append(ch)
-        if ch in "。！？…":
-            txt = "".join(buf).strip()
-            if txt:
-                sentences.append((seg_start, sv_times[i], txt))
-            buf = []
-    if buf:
-        txt = "".join(buf).strip()
-        if txt:
-            sentences.append((seg_start, sv_times[-1], txt))
-    return sentences
+# `_align_sentences`（SenseVoice 文本对齐 whisper 骨架）已搬到
+# `app/capabilities/assemble.align_sentences` —— 设计 §4.4：拼装规则只写一份。
+# 那边是**原样搬过去**的（这段逻辑在实机上跑过不少会议，重写只会引入难查的时间轴退化）。
 
 
 def _boot_meeting_stt(status, detail=""):
@@ -455,7 +402,13 @@ def _transcribe_meeting(folder):
 
 
 def _fallback_sv_rows(sv, wmodel, seg_path, seg_idx, seg_min, cfg):
-    """回退路径：whisper 时间戳骨架 + SenseVoice 文本字符级对齐切句（保留句级时间戳）。"""
+    """回退路径：whisper 时间戳骨架 + SenseVoice 文本字符级对齐切句（保留句级时间戳）。
+
+    对齐那一步的实现已搬到 `app.capabilities.assemble`（设计 §4.4：拼装规则只写一份）。
+    这里保留原有的"三段兜底"顺序 —— 骨架 + 文本 → 骨架 → 整段一行 ——
+    但**交给拼装层统一判**，并把精度档位带出来（见 `_transcribe_impl` 里写进 meta 的那处）。
+    """
+    from app.capabilities import assemble
     wsegs = []
     try:
         out, _info = stt_mod.transcribe_whisper(wmodel, seg_path, cfg.get("sttLanguage", "zh"))
@@ -469,12 +422,8 @@ def _fallback_sv_rows(sv, wmodel, seg_path, seg_idx, seg_min, cfg):
             sv_text = re.sub(r"<\|[^|]*\|>", "", res[0].get("text", "") or "").strip()
     except Exception as e:
         print("SenseVoice 转写失败:", e, file=sys.stderr)
-    sentences = _align_sentences(sv_text, wsegs) if (sv_text and wsegs) else []
-    if not sentences and wsegs:
-        sentences = [(st, en, txt) for st, en, txt in wsegs if txt]
-    if not sentences and sv_text:
-        sentences = [(0.0, seg_min * 60.0, sv_text)]
-    return [(seg_idx, st, en, txt) for st, en, txt in sentences]
+    got = assemble.assemble(text=sv_text, skeleton=wsegs, seg_seconds=seg_min * 60.0)
+    return [(seg_idx, st, en, txt) for st, en, txt in got.sentences]
 
 
 def _active_asr_provider():
@@ -498,25 +447,16 @@ def _asr_provider_id():
 def _split_provider_text(text, seg_dur):
     """把外部转写返回的整段文本按句切分，并按字数在段时长内均摊时间。
 
-    外部/在线 ASR 只给整段文本（没有词级时间戳）。整段一行会让面板的"逐句跳转"失去意义，
-    所以按中文句末标点切句、按字数比例分配起止时间 —— 时间不精确，但**顺序与位置对**，
-    且明写在注释里（不假装它是精确时间戳）。
+    **实现已搬到 `app.capabilities.assemble.estimate_sentences`**（设计 §4.4：
+    拼装规则只写一份）。这里留成薄壳，因为它是被用例钉住的既有接口
+    （`tests/test_asr_provider.py` 四条）—— 换实现不改契约。
+
+    为什么要搬：同一个"整段文本怎么变成逐句时间"的问题，本地引擎那条路
+    （`_fallback_sv_rows`）也有一份自己的做法。两份各自演化就会出现
+    "同一场会议里，A 段时间轴一个精度、B 段另一个精度，而面板上看不出区别"。
     """
-    import re as _re
-    text = (text or "").strip()
-    if not text:
-        return []
-    parts = [p for p in _re.split(r"(?<=[。！？!?；;])", text) if p and p.strip()]
-    if not parts:
-        parts = [text]
-    total_chars = sum(len(p) for p in parts) or 1
-    out = []
-    t = 0.0
-    for p in parts:
-        dur = max(float(seg_dur) * len(p) / total_chars, 0.05)
-        out.append((round(t, 2), round(t + dur, 2), p.strip()))
-        t += dur
-    return out
+    from app.capabilities import assemble
+    return assemble.estimate_sentences(text, seg_dur)
 
 
 def _transcribe_impl(folder):
