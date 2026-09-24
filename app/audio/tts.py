@@ -49,6 +49,16 @@ def play_beep(name):
 
     播放实现是平台差异（Windows=winsound 异步、macOS=afplay），收在接缝里。
 
+    ## 提示音**不参与扬声器设备池**（2026-09-24 拍板，是有意的）
+
+    两个平台的接缝（`winsound` / `afplay`）**都没有设备参数**，只能走系统默认输出。
+    想让提示音也走到配置的那台扬声器上，只能改用 `sounddevice` 播 ——
+    但那样要自己管异步性、重采样与失败回退，为一个 0.3 秒的"咚"不值当。
+    用户 2026-09-24 的话："提示音不行就不行吧，tts 走就行"。
+
+    所以：**语音播报（`_play_wav_data`）走设备池，提示音跟随系统默认。**
+    要改这条，就得先换掉播放实现（`app/audio/output.py` 里已有解析逻辑，可用）。
+
     ⚠️ 2026-09-19 起不再静默：原实现"文件不存在直接 return、异常 pass"，
     表现和"设备没声音"完全一样，导致"提示音到底响没响"查了两天。现在：
       * 文件不存在 / 播放失败（接缝返回 False）都写一条 ``debug`` 日志（source=tts）；
@@ -101,10 +111,21 @@ def _log_beep(name, path, why):
         pass
 
 
-def _play_wav_data(data, sr):
+def _play_wav_data(data, sr, purpose="command"):
+    """播一段内存里的音频。**这里是唯一走 sounddevice 的播放出口**，所以也在这里选扬声器。
+
+    为什么要带 `purpose`：设备池是按用途解析的（指令的确认想只让自己听见、
+    会议的播报想让全场听见）。默认 `command` —— 播报绝大多数发生在指令链路。
+
+    **"系统默认"是不传 `device`，而不是传 `sd.default.device[1]`**：
+    那个下标的含义是"(输入, 输出)"里的输出，且会随在位设备增减平移，
+    硬取等于把"哪台扬声器"交给运气（AGENTS.md 记过一次同类事故）。
+    `output.play_device_kwargs()` 就是替这件事负责的。
+    """
     try:
         import sounddevice as sd
-        sd.play(data, sr)
+        from app.audio import output as out_mod
+        sd.play(data, sr, **out_mod.play_device_kwargs(purpose))
         sd.wait()
     except Exception:
         pass

@@ -107,6 +107,11 @@ ACK_INDIRECT = {
     # privacy 约束在 plan() 里按点分路径读（`self._get("capabilityPrivacy", "lan")`），
     # 但那一行同时含别的字面量，被判成间接；消费方就是 plan() 的 allowed_sources。
     "capabilityPrivacy": "app/capabilities/router.py:plan() 读它算 allowed_sources（哪些后端根本不被考虑）",
+    # 播放设备（扬声器）与采集侧同形：用途键在 OUTPUT_DEVICE_KEYS 表里，
+    # 调用点拿到的是**映射出来的键名变量**（`_read_setting(key)`），所以扫描看不见字面量。
+    # （同一份名单里 commandInputDeviceId / meetingInputDeviceId 就是同一个理由。）
+    "commandOutputDeviceId": "app/audio/output.py:resolve_output_device() 查 OUTPUT_DEVICE_KEYS 读（指令播报用哪台扬声器）",
+    "meetingOutputDeviceId": "app/audio/output.py:resolve_output_device() 查 OUTPUT_DEVICE_KEYS 读（会议播报用哪台扬声器）",
 }
 
 #: 唯一消费方是面板 UI 的项（面板读它来改变自己的行为，app/ 不需要读）。

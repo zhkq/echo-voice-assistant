@@ -89,7 +89,7 @@ background:#2a2318;border:1px solid var(--yellow);color:var(--yellow);font-size:
 </style>
 </head><body>
 <div class="layout">
-<nav><div class="brand">ECHO 3.0 设计<small>架构设计文档</small></div><div class="docs"><a href="3.0-设计总览与组件关系.html">3.0 总览</a><a href="统一路由-模型能力与设备.html" class="on">统一路由</a><a href="能力路由-三后端与轻客户端.html">能力路由</a><a href="ECHO能力后端-服务端设计.html">能力后端</a><a href="前后分离-能力服务化设计.html">前后分离</a></div><div class="toc"><a class="l2" href="#h1">0. 结论速览</a><a class="l2" href="#h2">1. 四类候选资源：共享什么，不共享什么</a><a class="l2" href="#h3">2. 选择内核</a><a class="l2" href="#h4">3. 采集设备路由</a><a class="l3" href="#h5">3.1 现状盘点：已经有的比想象多</a><a class="l3" href="#h6">3.2 缺口</a><a class="l3" href="#h7">3.3 设计：两条平级泳道，各一条有序候选链</a><a class="l3" href="#h8">3.4 选中时机：在&quot;明确需要&quot;的那一刻懒选</a><a class="l3" href="#h9">3.5 黑名单：把 AGENTS.md 的铁律变成机制</a><a class="l3" href="#h10">3.6 两级互斥：泳道级 + 设备级（修掉那个待办）</a><a class="l3" href="#h14">3.7 设备标识的稳定性</a><a class="l3" href="#h15">3.8 唤醒的处置：它在指令泳道里，不是被排除</a><a class="l2" href="#h16">4. 播放设备路由与队列</a><a class="l3" href="#h17">4.1 现状：完全空白</a><a class="l3" href="#h18">4.2 设计：优先级队列 + 可抢占</a><a class="l3" href="#h19">4.3 与已有提示音机制的关系</a><a class="l2" href="#h20">5. 统一面板</a><a class="l2" href="#h21">6. 边界：什么该合，什么不该合</a><a class="l2" href="#h22">7. 落地顺序（按&quot;独立性&quot;排，不按&quot;重要性&quot;排）</a><a class="l2" href="#h23">8. 待拍板</a></div></nav>
+<nav><div class="brand">ECHO 3.0 设计<small>架构设计文档</small></div><div class="docs"><a href="3.0-设计总览与组件关系.html">3.0 总览</a><a href="统一路由-模型能力与设备.html" class="on">统一路由</a><a href="能力路由-三后端与轻客户端.html">能力路由</a><a href="ECHO能力后端-服务端设计.html">能力后端</a><a href="前后分离-能力服务化设计.html">前后分离</a></div><div class="toc"><a class="l2" href="#h1">0. 结论速览</a><a class="l2" href="#h2">1. 四类候选资源：共享什么，不共享什么</a><a class="l2" href="#h3">2. 选择内核</a><a class="l2" href="#h4">3. 采集设备路由</a><a class="l3" href="#h5">3.1 现状盘点：已经有的比想象多</a><a class="l3" href="#h7">3.2 缺口</a><a class="l3" href="#h8">3.3 设计：两条平级泳道，各一条有序候选链</a><a class="l3" href="#h9">3.4 选中时机：在&quot;明确需要&quot;的那一刻懒选</a><a class="l3" href="#h10">3.5 黑名单：把 AGENTS.md 的铁律变成机制</a><a class="l3" href="#h11">3.6 两级互斥：泳道级 + 设备级（修掉那个待办）</a><a class="l3" href="#h15">3.7 设备标识的稳定性</a><a class="l3" href="#h16">3.8 唤醒的处置：它在指令泳道里，不是被排除</a><a class="l2" href="#h17">4. 播放设备路由与队列</a><a class="l3" href="#h18">4.1 现状：完全空白</a><a class="l3" href="#h19">4.2 设计：优先级队列 + 可抢占</a><a class="l3" href="#h20">4.3 与已有提示音机制的关系</a><a class="l2" href="#h21">5. 统一面板</a><a class="l2" href="#h22">6. 边界：什么该合，什么不该合</a><a class="l2" href="#h23">7. 落地顺序（按&quot;独立性&quot;排，不按&quot;重要性&quot;排）</a><a class="l2" href="#h24">8. 待拍板</a></div></nav>
 <main>
 <div class="banner"></div>
 <header class="doc"><h1>统一路由：模型 · 能力 · 采集设备 · 播放设备</h1>
@@ -146,10 +146,18 @@ error           其它失败（带 detail）</code></pre>
 <h2 id="h4">3. 采集设备路由</h2>
 <h3 id="h5">3.1 现状盘点：已经有的比想象多</h3>
 <div class="tw"><table><thead><tr><th>已有</th><th>位置</th><th>说明</th></tr></thead><tbody><tr><td><strong>用途分级</strong></td><td><code>recorder.INPUT_DEVICE_KEYS</code> = <code>{command, meeting}</code></td><td>指令与会议各有设备设置</td></tr><tr><td><strong>三级优先解析</strong></td><td><code>recorder.resolve_input_device(purpose)</code></td><td>该用途设置 → 通用 <code>inputDeviceId</code> → <code>-1</code>（系统默认）</td></tr><tr><td><strong>设备名 = 稳定键</strong></td><td><code>recorder.find_input_device()</code></td><td>注释明确写了"PortAudio 索引会随在位设备增减整体平移"——<strong>这个坑已经踩过并修好了</strong></td></tr><tr><td><strong>多 API 去重</strong></td><td><code>recorder.rank_hostapi()</code></td><td>同名出现在 WASAPI/MME/DS 时，WASAPI 优先（WDM-KS 不做重采样，蓝牙免提端点常打不开）</td></tr><tr><td><strong>设备清单缓存</strong></td><td><code>recorder.list_input_devices_cached(30s)</code></td><td>录音路径不每次查 PortAudio</td></tr><tr><td><strong>独占租约 + 抢占</strong></td><td><code>mic.py</code>：<code>_foreground</code> / <code>_yield_requested</code> / <code>background=</code></td><td>前台采集抢占唤醒监听</td></tr><tr><td><strong>崩溃隔离</strong></td><td><code>mic.py</code>：<code>_quarantined</code> + <code>_IsolatedStream</code> 子进程</td><td>macOS 上设备操作在<strong>可抛之子进程</strong>里跑，HAL 死锁时杀子进程而不杀 ECHO</td></tr><tr><td><strong>缺设备回退策略</strong></td><td><code>resolve_input_device()</code> 末尾</td><td>回退系统默认 + <strong>写 warn 日志</strong>（"宁可回退也不要打不开，但绝不静默"）</td></tr></tbody></table></div>
+<h4 id="h6">3.1.1 播放设备（扬声器）也进同一个池（2026-09-24 落地）</h4>
+<p>采集这一侧早就按用途挑设备了（指令用耳机、会议用全向麦），而<strong>播放一直是"系统默认发声"</strong> —— 于是同一台机器上会出现：</p>
+<p>麦选了耳机（不想把全场录进来），播报却从会议室音箱出去（把"已发送"念给全场听）</p>
+<p>两个方向的需求本来就是对称的，所以扬声器照同一套形状管（<code>app/audio/output.py</code>）：</p>
+<div class="tw"><table><thead><tr><th>形状</th><th>采集</th><th>播放</th></tr></thead><tbody><tr><td>用途键</td><td><code>INPUT_DEVICE_KEYS</code></td><td><code>OUTPUT_DEVICE_KEYS</code>（<code>command</code> / <code>meeting</code>）</td></tr><tr><td>名字当稳定键</td><td><code>find_input_device</code></td><td><code>find_output_device</code></td></tr><tr><td>同一设备的多套 API</td><td><code>rank_hostapi</code></td><td><strong>复用同一个</strong>（"哪套 API 更好"是同一个答案）</td></tr><tr><td>不在位</td><td>warn + 回退默认</td><td>warn + 回退默认</td></tr></tbody></table></div>
+<p><strong>唯一的实质差别是"池"</strong>：采集那边每个用途只有一个值（历史包袱）， 播放这边直接做成<strong>有序候选</strong> <code>outputDeviceIds</code> —— 取<strong>第一个在位的</strong>。 这就是"用优先级最高的在线设备"在播放侧的落点：顺序由用户排， 拔了一台自动落到下一台，全都不在位才回退系统默认并写日志。</p>
+<p>三条实现纪律：</p>
+<ol><li><strong>"系统默认"= 不传 <code>device</code> 参数</strong>，不是 <code>sd.default.device[1]</code>。 那个下标会随在位设备增减平移；AGENTS.md 记过一次同类事故 （把 <code>(输入, 输出)</code> 的下标取错，在 macOS 上把 CoreAudio HAL 锁死）。</li><li><strong>配了设备的那些项走 "audio_outputs" 动态选项</strong>：设备会插拔，静态写进库会过期； 当前值（哪怕是旧索引或已拔掉的名字）也要列进去，否则面板显示成"系统默认"、 一保存就把真值覆盖掉。</li><li><strong>提示音有意不跟设备池</strong>：两个平台的接缝（<code>winsound</code> / <code>afplay</code>）都没有设备参数， 要让提示音也走到指定扬声器只能改用 <code>sounddevice</code>，代价是自行管异步与回退 —— 为一个 0.3 秒的"咚"不值当（用户 2026-09-24 的原话："提示音不行就不行吧， tts 走就行"）。<strong>这是取舍，不是漏了</strong>，用例把这句话钉着。</li></ol>
 <p><strong>结论：底子很好，缺的正好是用户要的那三样。</strong></p>
-<h3 id="h6">3.2 缺口</h3>
+<h3 id="h7">3.2 缺口</h3>
 <div class="tw"><table><thead><tr><th>缺口</th><th>现状</th><th>用户要的</th></tr></thead><tbody><tr><td><strong>① 有序候选链</strong></td><td>每个用途<strong>一个</strong>设备值</td><td>"按优先顺序连接" —— 需要<strong>列表</strong></td></tr><tr><td><strong>② 「在线」判定</strong></td><td>解析到索引就<strong>直接尝试打开</strong>，失败才发现</td><td>"优先级最高的<strong>在线</strong>设备" —— 需要<strong>先判定再选</strong></td></tr><tr><td><strong>③ 设备黑名单</strong></td><td>只有 <code>AGENTS.md</code> 里一条<strong>人读的铁律</strong>（"不要用 <code>sd.default.device[下标]</code>"）</td><td>需要<strong>机制的</strong> deny-list（见 §3.5）</td></tr><tr><td><strong>④ 互斥粒度</strong></td><td><strong>全局一把锁</strong>（<code>mic.py:_lock</code> / <code>_foreground</code>）</td><td>两条泳道用<strong>不同设备时要能并行</strong>（见 §3.6）</td></tr></tbody></table></div>
-<h3 id="h7">3.3 设计：两条平级泳道，各一条有序候选链</h3>
+<h3 id="h8">3.3 设计：两条平级泳道，各一条有序候选链</h3>
 <p><strong>只有两条泳道：指令（含唤醒）与 会议。</strong></p>
 <p><strong>唤醒不是第三条泳道</strong> —— 它和指令<strong>共用同一个设备设置</strong>，这是<strong>现状且是对的</strong>：</p>
 <pre class="code"><code># app/audio/wake.py:282
@@ -168,7 +176,7 @@ _dev = resolve_input_device(&quot;command&quot;)   # 唤醒属于&quot;指令&qu
   → -1（系统默认，永远可用，是兜底底线）</code></pre>
 <p><strong>两条泳道之间没有优先级</strong> —— 它们平级。谁在用什么设备由 §3.6 的两级互斥决定， 不由优先级数字决定。这样"抢占"这个概念就不需要存在了。</p>
 <blockquote><p><strong>链尾重叠要留意</strong>：两条链的最后一档常常都是"内置麦"。若会议因为全向麦不在位 而落到了内置麦，此时下指令也会落到内置麦 → 被拒。<strong>这是正确行为</strong>， 但错误消息必须说清因果（"会议正在使用内置麦克风"），见 §3.6。</p></blockquote>
-<h3 id="h8">3.4 选中时机：在"明确需要"的那一刻懒选</h3>
+<h3 id="h9">3.4 选中时机：在"明确需要"的那一刻懒选</h3>
 <div class="tw"><table><thead><tr><th>泳道</th><th>触发点</th><th>持有期</th></tr></thead><tbody><tr><td>指令</td><td><code>assistant.capture()</code> 被热键 / 媒体键 / 面板按钮触发时</td><td>秒级（<code>maxRecordMs</code> 默认 30 s）</td></tr><tr><td>会议</td><td><code>meeting.start_meeting()</code> 被点「开始录音」时</td><td>分钟到小时</td></tr></tbody></table></div>
 <p>三条推论：</p>
 <ol><li><strong>不后台监听设备插拔，不维护"当前在线设备"缓存。</strong> 每次开麦现解析， 拿到的就是此刻真实的在位情况 —— <strong>没有状态可以漂</strong>。</li><li><strong>不做预测性选择</strong>（不提前占住最好的设备）：占住本身就是代价。</li><li><code>known_bad_this_run</code> 只是"本轮别再撞同一个坏设备"的记忆，不是状态机。</li></ol>
@@ -183,7 +191,7 @@ for d in candidates:
     else: mark_bad(d);        skip  &quot;open-failed&quot;
 → 全部失败：抛错，消息里列出每个候选的原因（不是一句&quot;打不开麦克风&quot;）</code></pre>
 <p>最后那句很重要：<strong>错误消息必须列出全部候选的去向</strong>。 现在的报错是 <code>无法开始录音：打开麦克风超时（设备被占用或权限不足）</code> —— 用户无从知道"我配的全向麦到底是不在位、被占用、还是被黑名单挡了"。</p>
-<h3 id="h9">3.5 黑名单：把 <code>AGENTS.md</code> 的铁律变成机制</h3>
+<h3 id="h10">3.5 黑名单：把 <code>AGENTS.md</code> 的铁律变成机制</h3>
 <p><code>AGENTS.md</code> 记着一个<strong>不可自愈</strong>的事故：</p>
 <blockquote><p>macOS 上打开 <code>OrayVirtualAudioDevice</code> / <code>&quot;iPhone&quot;的麦克风</code> 这类虚拟/接力设备， 可能把 CoreAudio HAL 锁死（<code>HALB_Mutex::Lock()</code> 卡在 <code>HAL_CreateIOProcID</code>）， <strong>此时任何进程内麦克风操作都会永久超时，只能重启 ECHO</strong>。</p></blockquote>
 <p>现在的防线只有"默认输入用 <code>device=None</code> 交给 PortAudio 选"—— 这只挡住了<strong>默认路径</strong>， 用户手动指定一个虚拟设备时<strong>没有任何机制拦</strong>。</p>
@@ -192,7 +200,7 @@ for d in candidates:
 <p>四条规则：</p>
 <ol><li><strong>在枚举阶段过滤</strong>，不是"试失败后再记住" —— 因为<strong>试一次的代价是 HAL 死锁</strong>。</li><li>被 deny 的候选出现在面板上，标灰 + 说明原因 + 提供<strong>强制覆盖</strong>开关 （有人确实需要虚拟设备，比如要做录音回环测试）。</li><li>覆盖后如果 <code>_quarantined</code> 被置位 → 明确提示"请重启 ECHO"，并<strong>停止一切麦克风操作</strong> （已有机制，<code>mic.py:98</code>）。</li><li>deny 模式是<strong>客户端本地配置</strong>，可增删。</li></ol>
 <blockquote><p>顺带把默认设备的取法也钉住：<code>sd.default.device</code> 是 <code>(输入, 输出)</code> 二元组， <strong><code>[0]</code> 才是输入</strong>。任何地方都不许用 <code>sd.default.device[下标]</code> 硬取输入设备 —— 需要默认输入就传 <code>device=None</code>（<code>wake.py:232</code> 已是这个结论）。</p></blockquote>
-<h3 id="h10">3.6 两级互斥：泳道级 + 设备级（修掉那个待办）</h3>
+<h3 id="h11">3.6 两级互斥：泳道级 + 设备级（修掉那个待办）</h3>
 <p><strong>现状</strong>：<code>mic.py</code> 的 <code>_lock</code> 与 <code>_foreground</code> 都是<strong>模块级全局一把</strong>。 所以即使把会议配到全向麦、指令配到耳机，第二个泳道照样被拒：</p>
 <pre class="code"><code>MicrophoneBusy: 麦克风正在录音或测试，请先结束当前操作</code></pre>
 <p><code>AGENTS.md</code> 把这条记为待办："想让'会议用全向麦 + 指令用耳机'真正并行， 得让不同设备各自持有流"。</p>
@@ -216,7 +224,7 @@ def claim(lane, device_key, who):
 <p>注意区分：<strong>"结束录音"不是抢占，是协作式结束</strong>（它本来就要求会议停）。 那条语义可以结束会议，前提是指令麦克风可用 —— 见 §3.6.2。</p>
 <p>另外<strong>唤醒监听</strong>作为后台持有者会主动让出（<code>_yield_requested</code>，已有机制）。</p></blockquote>
 <p>配套：<code>_quarantined</code> 语义不变（子进程杀不掉 → 全局停用麦克风，要求重启）。</p>
-<h4 id="h11">三个常被问到的边界（2026-09-23 澄清）</h4>
+<h4 id="h12">三个常被问到的边界（2026-09-23 澄清）</h4>
 <p><strong>① "配了两个 mic 就能并行" —— 要补一个条件：两个都</strong>能成功打开****</p>
 <p>"在位"不等于"能开"（可能被别的程序占用、权限不够、驱动问题）。 所以准确说法是：<strong>两个不同的、且都实开成功的 mic 才能并行。</strong></p>
 <p>如果候选链往前落的过程里撞车了，就会冲突：</p>
@@ -231,7 +239,7 @@ def claim(lane, device_key, who):
 <p>三条出路，只有第三条能做：</p>
 <div class="tw"><table><thead><tr><th>做法</th><th>结论</th></tr></thead><tbody><tr><td>让指令<strong>抢</strong>会议</td><td>❌ 会直接断掉录音（<code>AGENTS.md</code> 里那次打断会议的事故就是这类）</td></tr><tr><td>会议中排队等麦</td><td>❌ 会议可能开两小时，排队没意义</td></tr><tr><td><strong>配第二个麦</strong>（耳机/USB 麦）</td><td>✅ <strong>这就是 D1 的解法</strong></td></tr></tbody></table></div>
 <p>→ 所以面板在"会议录音输入设备"那一项旁边，可以顺手给一句引导： *"再配一个麦克风给语音指令，会议中也能下指令。"*</p>
-<h4 id="h12">3.6.1 单向抢占：<strong>会议可以中止指令</strong>（反过来不行）</h4>
+<h4 id="h13">3.6.1 单向抢占：<strong>会议可以中止指令</strong>（反过来不行）</h4>
 <p>2026-09-23 问："开始录音时如果指令占着会议的 mic，可以停掉指令让会议录音吗？"</p>
 <p><strong>可以。而且机制已经预留好了。</strong></p>
 <p><strong>为什么这个方向可以、反方向不行 —— 代价不对称：</strong></p>
@@ -247,7 +255,7 @@ def claim(lane, device_key, who):
 <p>麦克风只在 <code>record_command()</code> 期间被持有 —— <strong>转写、发 DSH 都不占麦</strong>。 所以"指令正占着麦"的窗口就是<strong>录那几秒</strong>（上限 <code>maxRecordMs</code> = 30 s）。</p>
 <div class="tw"><table><thead><tr><th>策略</th><th>结果</th></tr></thead><tbody><tr><td>立刻中止</td><td>最简单；但用户刚说完、正在收尾时也会被砍掉</td></tr><tr><td><strong>短等待（3 s）→ 超时中止</strong></td><td>⭐ <strong>建议</strong>：多数情况指令自然收尾（用户无感、指令也没丢）；极端情况也不会卡住会议</td></tr><tr><td>一直等</td><td>❌ 用户说了接近 30 s 的话，会议就得干等 30 s</td></tr></tbody></table></div>
 <p><strong>中止之后必须给反馈</strong>（否则用户等不到回应会困惑）： 面板与日志记一条 <strong>"上一条语音指令因开始会议而取消"</strong>，并播一个提示音。 <strong>不要复用现在的"没听清，请再说一次"</strong> —— 那句话在"因开会而取消"的场景下是误导。</p>
-<h4 id="h13">3.6.2 会议录音期间：谁能进来、什么能结束它</h4>
+<h4 id="h14">3.6.2 会议录音期间：谁能进来、什么能结束它</h4>
 <p><strong>规则（2026-09-23）</strong>：会议<strong>只被"结束录音"这一个语义中断</strong>； 其余指令照常执行，<strong>不影响会议</strong>（见上面的行为矩阵）。</p>
 <p><strong>三个结束入口，以及它们是否依赖麦克风：</strong></p>
 <div class="tw"><table><thead><tr><th>入口</th><th>占麦克风吗</th><th>单麦机器可用？</th></tr></thead><tbody><tr><td>面板<strong>按钮</strong>「结束录音」</td><td>否</td><td>✅ <strong>永远可用</strong></td></tr><tr><td><strong>技能</strong>（<code>.dsh/skills/meeting-record</code> 的 stop）</td><td>否</td><td>✅ <strong>永远可用</strong></td></tr><tr><td><strong>语音</strong>（说"结束录音 / 停止录音 / 停录…"）</td><td><strong>是</strong>（走指令泳道）</td><td>❌ <strong>单麦不可用</strong></td></tr></tbody></table></div>
@@ -261,19 +269,19 @@ def claim(lane, device_key, who):
 <blockquote><p>在<strong>会议自己的音频流</strong>上跑关键词检测（KWS / 低配流式 ASR）来识别"结束录音" —— 技术上可行且<strong>不占额外设备</strong>，但：</p>
 <ul><li>会议里有人正常讨论到"结束录音"这几个字就会<strong>误停会议</strong>（除非强制唤醒词）</li><li>要在会议录音线程里再挂一套识别，<strong>复杂度与收益不成比例</strong></li><li>而按钮与技能<strong>已经覆盖了单麦场景</strong></li></ul>
 <p>→ <strong>不做。</strong> 与 2026-09-23 的口径一致：<strong>前提就是指令 mic 可用。</strong></p></blockquote>
-<h3 id="h14">3.7 设备标识的稳定性</h3>
+<h3 id="h15">3.7 设备标识的稳定性</h3>
 <p>候选链存<strong>设备名</strong>（稳定键）—— 这一点现有设计已经做对了，照用。补两条：</p>
 <ul><li>同名设备出现在多套 hostapi 时，按 <code>rank_hostapi()</code> 选（已有）。</li><li>候选链里<strong>允许写索引</strong>以兼容老配置，但面板上一律显示解析后的<strong>名字</strong>， 并在名字解析失败时提示"这个序号现在指向别的设备了，请重选"（索引会漂，名字不会）。</li></ul>
-<h3 id="h15">3.8 唤醒的处置：它在<strong>指令泳道里</strong>，不是被排除</h3>
+<h3 id="h16">3.8 唤醒的处置：它在<strong>指令泳道里</strong>，不是被排除</h3>
 <blockquote><p><strong>2026-09-23 修订</strong>：原稿写"唤醒不进候选链、不构成第三条泳道" —— 前半句对， 但措辞容易读成"唤醒跟这套设计无关"。澄清后发现：<strong>唤醒和指令共用同一个设备设置</strong> （<code>wake.py:282</code> 的注释与 <code>config.py:329</code> 的 label 都写明了）， 所以它是<strong>指令泳道上的后台持有者</strong>，本来就<strong>不是</strong>第三条泳道。</p></blockquote>
 <div class="tw"><table><thead><tr><th>项</th><th>处置</th></tr></thead><tbody><tr><td>设备来源</td><td><strong>与指令同一个设置</strong>（<code>commandInputDeviceId</code>）—— 现状已如此，不改</td></tr><tr><td>持有方式</td><td>后台持有 + <strong>可被前台采集让出</strong>（<code>_yield_requested</code>，已有机制）</td></tr><tr><td>会议要用同一设备时</td><td>走 §3.6.1 的<strong>单向抢占</strong>：会议优先，唤醒会让出；会议期间它拿不到设备（设备级互斥自然挡住），继续等待即可</td></tr><tr><td>面板</td><td>不占"设备路由表"的独立一行；可在<strong>指令泳道</strong>下显示它的当前状态</td></tr></tbody></table></div>
 <p><strong>不用为唤醒单独做候选链</strong> —— 它跟随指令的设备走。 <code>settings_effects.py</code> 里已有的联动（改 <code>commandInputDeviceId</code> 时重开唤醒监听）就是这件事的证明。</p>
 <p><strong>将来若要给唤醒独立设备</strong>，接口是留着的（<code>lane</code> 加一个 <code>wake</code>）；但要先想清楚 它 <strong>24 小时持有</strong>一个设备值不值 —— 代价与另外两条泳道不是一个量级。</p>
 <hr>
-<h2 id="h16">4. 播放设备路由与队列</h2>
-<h3 id="h17">4.1 现状：完全空白</h3>
+<h2 id="h17">4. 播放设备路由与队列</h2>
+<h3 id="h18">4.1 现状：完全空白</h3>
 <div class="tw"><table><thead><tr><th>项</th><th>现状</th></tr></thead><tbody><tr><td>设备选择</td><td><strong>无</strong> —— <code>tts._play_wav_data()</code> 直接 <code>sd.play(data, sr)</code>，用系统默认输出</td></tr><tr><td>串行</td><td>靠 <code>tts.py:34</code> 的一把 <code>_lock</code></td></tr><tr><td>优先级 / 抢占</td><td>无 —— 一条长朗读播报时，错误提示音只能干等</td></tr></tbody></table></div>
-<h3 id="h18">4.2 设计：优先级队列 + 可抢占</h3>
+<h3 id="h19">4.2 设计：优先级队列 + 可抢占</h3>
 <p><strong>这是四个域里唯一需要真队列的地方。</strong></p>
 <pre class="code"><code># app/audio/playback.py（新增）
 优先级（数字越小越先播）：
@@ -287,11 +295,11 @@ def claim(lane, device_key, who):
 <p>设备侧与采集对称：</p>
 <pre class="code"><code>&quot;outputDevices&quot;: [&quot;会议室音箱&quot;, &quot;笔记本扬声器&quot;]     // 有序候选链</code></pre>
 <p>同样三级回退：候选链 → 默认输出 → 系统默认。播放探测比采集<strong>安全得多</strong> （打开输出设备不会锁死 HAL），所以"在线"判定可以直接尝试。</p>
-<h3 id="h19">4.3 与已有提示音机制的关系</h3>
+<h3 id="h20">4.3 与已有提示音机制的关系</h3>
 <p><code>tts.py</code> 已有 <code>_beep_until</code> / <code>beep_pending()</code> / <code>wait_beep_done()</code> 处理"提示音是异步播的、<code>speak_async</code> 紧随其后会打架"这个真实问题。</p>
 <p><strong>新队列要吸收这些语义，不要另起一套</strong>： <code>play_beep</code> 入队（优先级 40/95）、<code>beep_pending()</code> 变成"队列里还有提示音"、 <code>wait_beep_done()</code> 变成"等队列排空到该优先级以下"。否则会出现两套并行的播放状态。</p>
 <hr>
-<h2 id="h20">5. 统一面板</h2>
+<h2 id="h21">5. 统一面板</h2>
 <p>一张「路由」页，<strong>四张表，同一套视觉</strong>：</p>
 <pre class="code"><code>┌─ 大模型提供商（已有） ──────────────────────────────┐
 │ 通道1  内网网关      ● 在线    优先级 1   [置顶][禁用] │
@@ -313,14 +321,14 @@ def claim(lane, device_key, who):
 <p><strong>必备的一个能力：显示"上一次为什么没走你期望的那个"</strong> —— 这是用户排障的唯一入口。 实现上就是把 <code>Pick.skipped</code> 持久化到最近 N 条（<code>events</code> 表已有结构）。</p>
 <p><strong>采集设备那块要额外显示已解析到的真实设备名</strong>（因为设置值可能是会漂的索引）， 以及<strong>黑名单命中提示</strong>（含"覆盖"开关）。</p>
 <hr>
-<h2 id="h21">6. 边界：什么该合，什么不该合</h2>
+<h2 id="h22">6. 边界：什么该合，什么不该合</h2>
 <div class="tw"><table><thead><tr><th>问题</th><th>结论</th></tr></thead><tbody><tr><td>设备路由放进 <code>EnginePool</code>？</td><td><strong>不</strong>。池管的是"可共享的模型实例"，设备是"独占句柄"。套一起会让两者都变形。</td></tr><tr><td>设备路由放进 <code>/v1/capabilities</code>？</td><td><strong>不</strong>。设备是本机资源，服务端没有麦克风。</td></tr><tr><td>四处共用一套代码？</td><td><strong>只共用 <code>pick()</code> 内核</strong>（§2）。租约、队列、抢占各自实现。</td></tr><tr><td>LLM 路由要不要改成用 <code>pick()</code>？</td><td><strong>建议改</strong>。<code>dsh-failover/proxy.py</code> 的健康/熔断逻辑与 <code>pick()</code> 同构，收拢后只有一处需要维护；但它是<strong>独立进程</strong>，要么提取成共享模块，要么用它现成的实现作为参考实现，<strong>v1 不强求</strong>。</td></tr><tr><td>设备优先级存哪？</td><td><strong>客户端 DB（settings 表）</strong>。这是业务配置，不出本机。</td></tr></tbody></table></div>
 <hr>
-<h2 id="h22">7. 落地顺序（按"独立性"排，不按"重要性"排）</h2>
+<h2 id="h23">7. 落地顺序（按"独立性"排，不按"重要性"排）</h2>
 <div class="tw"><table><thead><tr><th>阶段</th><th>内容</th><th>为什么这个顺序</th></tr></thead><tbody><tr><td><strong>D1</strong></td><td><strong>两级互斥：泳道级 + 设备级</strong>（§3.6）</td><td>独立、无新概念、直接修掉 <code>AGENTS.md</code> 里的待办。做完立刻能"会议用全向麦 + 指令用耳机并行"</td></tr><tr><td><strong>D2</strong></td><td><strong>黑名单机制</strong>（§3.5）</td><td>独立、纯防御、把一条人读的铁律变成机制。防的是不可自愈的 HAL 死锁</td></tr><tr><td><strong>D3</strong></td><td><strong>两条泳道 + 有序候选链 + 懒选 + <code>skipped</code> 原因</strong>（§3.3/3.4）</td><td>本次要的核心能力；依赖 D1 的设备级互斥表</td></tr><tr><td><strong>D4</strong></td><td><strong>播放设备 + 优先级队列</strong>（§4）</td><td>相对独立，但要先吸收 <code>tts.py</code> 已有的 beep 状态机</td></tr><tr><td><strong>D5</strong></td><td><strong><code>pick()</code> 内核收拢 + 统一面板</strong></td><td>等前三处都跑过一遍，才看得清哪部分真能共享</td></tr></tbody></table></div>
 <p><strong>D1 和 D2 可以先做</strong>，它们不依赖能力路由，也不依赖前后分离 —— 纯收益，风险低。</p>
 <hr>
-<h2 id="h23">8. 待拍板</h2>
+<h2 id="h24">8. 待拍板</h2>
 <ol><li><strong>候选链的设置项怎么放？</strong> 新增 <code>commandInputDevices</code> / <code>meetingInputDevices</code>（列表）， 还是把现有单值直接改成列表？<strong>建议新增列表 + 保留单值作链尾</strong>，零数据迁移， 老配置行为一个字不变（沿用 <code>inputDeviceId</code> 那条"通用项兜底"的既有设计哲学）。</li><li><strong>会议中途设备消失怎么办？</strong>（2 小时持有期内全向麦被拔 / 蓝牙断）这是"懒选"留下的 唯一长窗口。我倾向<strong>明确告警 + 不静默换设备</strong>（半场换设备会导致音质突变、时间轴要重新校准）； 但 ECHO 本来就按 <code>meetingSegmentMinutes</code> 分段，<strong>在分段边界换设备</strong>技术上是可行的。 要不要允许？还是就老实报"录音已中断"？</li><li><strong>黑名单默认包含哪些？</strong> 我列的 8 个模式来自 <code>AGENTS.md</code> 的实际事故 （<code>Oray*</code> / <code>*Virtual*</code> / <code>iPhone*</code> 等）。要不要更激进（默认 deny 一切非物理设备）？ <strong>建议先用保守清单 + 命中时提示</strong>，观察一段时间再收紧 —— 误杀一个真需要的设备比漏放更烦人。</li><li><strong>播放高优先级抢占时，被抢的任务丢弃还是重播？</strong> 我倾向<strong>丢弃</strong>（被打断的朗读重播很烦）， 但"转写完成提示音"这种可能希望补播。要不要按用途细分？</li></ol>
 </main>
 </div>

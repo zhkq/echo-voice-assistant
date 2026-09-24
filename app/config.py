@@ -107,6 +107,8 @@ def _effective_options(key, meta):
 #: 设备会插拔，所以选项必须**运行时**取；但也不该每刷一次面板就查一次 PortAudio
 #: （mac 上的音频查询还可能把 CoreAudio HAL 卡住，见 AGENTS.md 的头号坑）。
 _INPUT_OPTIONS = {"at": 0.0, "items": []}
+#: 扬声器候选项的缓存（与输入侧各一份：设备增减会同时影响两者，但查询是分开的）
+_OUTPUT_OPTIONS = {"at": 0.0, "items": []}
 
 #: "系统默认"这一项的值。空串 = 不指定（跟随系统）；老配置里的 -1 也当同一意思。
 SYSTEM_DEFAULT_DEVICE = ""
@@ -126,24 +128,8 @@ def _audio_device_options(max_age=30.0):
         return _INPUT_OPTIONS["items"]
     try:
         from app.audio import recorder
-        best = {}
-        for d in recorder.list_input_devices():
-            name = str(d.get("name") or "").strip()
-            if not name:
-                continue
-            rank = recorder.rank_hostapi(d.get("hostapi"))
-            if name in best and best[name][0] <= rank:
-                continue
-            api = str(d.get("hostapi") or "").replace("Windows ", "")
-            sr = d.get("samplerate") or 0
-            tag = " · ".join(x for x in (api, ("%g kHz" % (sr / 1000.0)) if sr else "") if x)
-            label = name + (("  [%s]" % tag) if tag else "")
-            if d.get("virtual"):
-                label += "  ← 映射/虚拟设备，别选"
-            elif sr == 16000:
-                label += "  ← 原生 16 kHz，推荐"
-            best[name] = (rank, {"value": name, "label": label})
-        items = [v[1] for _name, v in sorted(best.items(), key=lambda kv: (kv[1][0], kv[0]))]
+        items = _dedupe_devices(recorder.list_input_devices(),
+                                _input_extra_label, recorder.rank_hostapi)
     except Exception:
         return []
     _INPUT_OPTIONS["at"] = now
@@ -158,13 +144,89 @@ def _audio_input_options(current=None):
     这两种都不在候选项里。**必须把它显式列出来**：否则面板会把它显示成"系统默认"，
     而用户一保存就把真值覆盖成空（静默丢配置）。
     """
-    items = [{"value": SYSTEM_DEFAULT_DEVICE, "label": "系统默认（跟随系统）"}]
-    items += list(_audio_device_options())
+    return _with_current(_audio_device_options(), current)
+
+
+def _audio_output_options(current=None):
+    """扬声器下拉：形状与输入侧完全一致（面板可以复用同一套渲染）。
+
+    **`outputDeviceIds`（优先级池）不走这里** —— 它是个多值列表，
+    面板该渲染成"可排序的多选"，不是下拉。
+    """
+    return _with_current(_audio_output_device_options(), current)
+
+
+def _with_current(items, current):
+    out = [{"value": SYSTEM_DEFAULT_DEVICE, "label": "系统默认（跟随系统）"}]
+    out += list(items)
     cur = str(current if current is not None else "").strip()
-    if cur and cur != "-1" and not any(str(o["value"]) == cur for o in items):
-        items.insert(1, {"value": cur,
-                         "label": "%s  ← 当前值（设备不在位，或是旧的索引号，建议重选）" % cur})
+    if cur and cur != "-1" and not any(str(o["value"]) == cur for o in out):
+        out.insert(1, {"value": cur,
+                       "label": "%s  ← 当前值（设备不在位，或是旧的索引号，建议重选）" % cur})
+    return out
+
+
+def _dedupe_devices(devices, extra_label, rank_of):
+    """设备清单 → 下拉项：**同名去重**（按 host API 排名）并生成人看的标签。
+
+    输入与输出**共用这一段**：去重规则、标签格式、"同一设备在多套 API 里出现"的处理
+    完全一样，只有"推荐什么"不同（输入推荐原生 16 kHz；输出没有这条）——
+    那部分由 `extra_label` 回调给。
+    """
+    best = {}
+    for d in devices:
+        name = str(d.get("name") or "").strip()
+        if not name:
+            continue
+        rank = rank_of(d.get("hostapi"))
+        if name in best and best[name][0] <= rank:
+            continue
+        api = str(d.get("hostapi") or "").replace("Windows ", "")
+        sr = d.get("samplerate") or 0
+        tag = " · ".join(x for x in (api, ("%g kHz" % (sr / 1000.0)) if sr else "") if x)
+        label = name + (("  [%s]" % tag) if tag else "")
+        suffix = extra_label(d)
+        if suffix:
+            label += "  " + suffix
+        best[name] = (rank, {"value": name, "label": label})
+    return [v[1] for _n, v in sorted(best.items(), key=lambda kv: (kv[1][0], kv[0]))]
+
+
+def _input_extra_label(d):
+    if d.get("virtual"):
+        return "← 映射/虚拟设备，别选"
+    if (d.get("samplerate") or 0) == 16000:
+        return "← 原生 16 kHz，推荐"
+    return ""
+
+
+def _output_extra_label(d):
+    # 输出侧**没有**"原生 16 kHz 推荐"这一条：播报走 44.1/48 kHz 才是正常的，
+    # 拿输入的推荐语去标扬声器会把用户指错方向。
+    if d.get("virtual"):
+        return "← 映射/虚拟设备，别选"
+    return ""
+
+
+def _audio_output_device_options(max_age=30.0):
+    """扬声器候选项（不含"系统默认"）：`[{value: 设备名, label: 人看的}]`。
+
+    value 同样用**设备名**当稳定键（索引会随在位设备增减平移）。
+    """
+    import time as _time
+    now = _time.time()
+    if _OUTPUT_OPTIONS["items"] and (now - _OUTPUT_OPTIONS["at"]) < max_age:
+        return _OUTPUT_OPTIONS["items"]
+    try:
+        from app.audio import output, recorder
+        items = _dedupe_devices(output.list_output_devices(),
+                                _output_extra_label, recorder.rank_hostapi)
+    except Exception:
+        return []
+    _OUTPUT_OPTIONS["at"] = now
+    _OUTPUT_OPTIONS["items"] = items
     return items
+
 
 # ---- 极简回复要求文案（两个版本都保留：V1 是已落库的旧默认值，用于迁移比对）----
 # V1：只回极简结论、详情留在会话里。
@@ -337,6 +399,30 @@ DEFAULTS = {
                                              "比笔记本内置麦好得多。"
                                              "空 = 跟随上面的默认输入设备",
                                  value_type="str", options_from="audio_inputs"),
+    # ---------- 播放设备（扬声器）也进设备池 ----------
+    # 采集那侧早就有"按用途挑设备"，播放一直是"系统默认发声"，于是会出现
+    # "麦选了耳机（不想把全场录进来），播报却从会议室音箱出去（把'已发送'念给全场听）"。
+    # 两个方向的需求本来就是对称的，所以扬声器也照同一套形状管：
+    # **有序候选（优先级池）+ 在位判定 + 回退不静默**。
+    # 实现与理由见 `app/audio/output.py`。
+    "outputDeviceIds": dict(value=[], grp="voice", sub="speech", label="扬声器优先级",
+                            description="按**优先级**排列的播放设备，逗号分隔；"
+                                        "每次播报取**第一个在位的**（拔了/没连上会自动跳过）。"
+                                        "空 = 用系统默认扬声器。"
+                                        "例：`Bose Speaker, 扬声器 (Realtek)`",
+                            value_type="list", options_from="audio_outputs"),
+    "commandOutputDeviceId": dict(value="", grp="voice", sub="speech",
+                                  label="指令播报扬声器",
+                                  description="语音复述确认、提示音从哪个设备出声。"
+                                              "想只让自己听见（不打扰别人）就在这儿选耳机。"
+                                              "空 = 按上面的优先级池挑",
+                                  value_type="str", options_from="audio_outputs"),
+    "meetingOutputDeviceId": dict(value="", grp="voice", sub="speech",
+                                  label="会议播报扬声器",
+                                  description="会议相关播报从哪个设备出声。"
+                                              "想全场都听见就选会议室音箱（如 MAXHUB）。"
+                                              "空 = 按上面的优先级池挑",
+                                  value_type="str", options_from="audio_outputs"),
     # 2026-09-23 D2：虚拟/接力设备黑名单的**逃生口**。
     # 黑名单（见 recorder._VIRTUAL_HINTS）原来只挡"兜底遍历"，用户显式选的照开；
     # 但 AGENTS.md 里那次事故（macOS 打开 Oray/iPhone 麦克风把 CoreAudio HAL 锁死，
@@ -846,6 +932,8 @@ class Settings:
                 # 把当前值一起传进去 —— 旧索引/已拔掉的设备名也要在列表里出现，
                 # 否则面板会显示成"系统默认"，一保存就把真值覆盖掉。
                 r["options"] = _audio_input_options(r.get("value"))
+            elif meta.get("options_from") == "audio_outputs":
+                r["options"] = _audio_output_options(r.get("value"))
             if meta.get("secret"):
                 r["hasValue"] = bool(str(r.get("value") or "").strip())
                 r["value"] = ""
