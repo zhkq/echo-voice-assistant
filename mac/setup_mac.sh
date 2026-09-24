@@ -2,8 +2,13 @@
 # setup_mac.sh — ECHO macOS 环境安装（初始化一次即可）
 set -e
 
-DIR="$(cd "$(dirname "$0")/.." && pwd)"
-cd "$DIR"
+# 3.0 安装根布局：代码目录名叫 echo-core 时，安装根是它的父目录 ——
+# venv/ 与 data/ 都放安装根（否则"升级整体覆盖 echo-core"会把运行时和数据一起删掉）。
+# 判据与 app/paths.py:echo_base() 一致；扁平安装里 CODE == BASE，行为不变。
+CODE="$(cd "$(dirname "$0")/.." && pwd)"
+BASE="$CODE"
+if [ "$(basename "$CODE")" = "echo-core" ]; then BASE="$(cd "$CODE/.." && pwd)"; fi
+cd "$CODE"
 
 echo "==> 检查 Homebrew"
 if ! command -v brew >/dev/null 2>&1; then
@@ -22,13 +27,13 @@ if [ ! -x "$PY" ]; then
 fi
 
 echo "==> 创建虚拟环境 venv/"
-"$PY" -m venv venv
-./venv/bin/python -m pip install --upgrade pip
+"$PY" -m venv "$BASE/venv"
+"$BASE/venv/bin/python" -m pip install --upgrade pip
 
 echo "==> 安装依赖（首次较慢，请耐心等待）"
-./venv/bin/python -m pip install -r mac/requirements-mac.txt
+"$BASE/venv/bin/python" -m pip install -r mac/requirements-mac.txt
 
-mkdir -p data/logs
+mkdir -p "$BASE/data/logs"
 
 if xcrun --find swiftc >/dev/null 2>&1; then
   bash mac/build_sidebar.sh || echo "浮动框构建失败，可继续使用浏览器面板。"

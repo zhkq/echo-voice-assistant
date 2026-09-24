@@ -153,7 +153,14 @@ case "$DEST" in
 esac
 if [ ! -d "$DEST" ]; then err "目录不存在：$DEST"; exit 2; fi
 DEST="$(cd "$DEST" && pwd)"
-LOG_DIR="$DEST/data/logs"
+# --dest 是**安装根**。3.0 布局里代码在 <根>/echo-core，数据/模型/DSH/会议/指令是它的兄弟目录；
+# 老式扁平安装里代码就在根下（判据与 app/paths.py:echo_base() 一致：代码目录名叫 echo-core）。
+#   BASE  数据/日志/运行时都按它算（新老布局都是 --dest 本身）
+#   CODE  代码目录（`from app import paths` 与启动脚本要在这里跑）
+BASE="$DEST"
+CODE="$DEST"
+if [ -f "$DEST/echo-core/app/main.py" ]; then CODE="$DEST/echo-core"; fi
+LOG_DIR="$BASE/data/logs"
 if mkdir -p "$LOG_DIR" 2>/dev/null; then
   INSTALL_LOG="$LOG_DIR/install-$(date '+%Y%m%d-%H%M%S').log"
   printf '===== echo-install-components %s 安装目录=%s =====\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$DEST" \
@@ -249,9 +256,9 @@ find_python() {
 
 PY="$(find_python || true)"
 if [ -z "$PY" ]; then
-  err "找不到运行时：$DEST/venv/bin/python"
+  err "找不到运行时：$BASE/venv/bin/python（或 $BASE/runtime-core）"
   say "先跑环境安装（它会用 Homebrew 装 python@3.11 与 portaudio，再建 venv、装依赖）："
-  say "    bash $DEST/mac/setup_mac.sh"
+  say "    bash $CODE/mac/setup_mac.sh"
   exit 1
 fi
 
@@ -260,8 +267,11 @@ fi
 # （与 mac/start_mac.sh 同一套做法）。
 data_root() {
   local d
-  d="$(cd "$DEST" && "$PY" -c 'from app import paths; print(paths.data_root())' 2>/dev/null || true)"
-  [ -n "$d" ] || d="$DEST/data"
+  # 必须在**代码目录**里跑（`from app import paths`）：新布局下 app 在 <根>/echo-core，
+  # 在安装根里跑只会 ImportError → 回落成 $BASE/data，而 mac 的数据根其实在
+  # ~/Library/Application Support/ECHO（老布局）或 <根>/data（新布局）。
+  d="$(cd "$CODE" && "$PY" -c 'from app import paths; print(paths.data_root())' 2>/dev/null || true)"
+  [ -n "$d" ] || d="$BASE/data"
   echo "$d"
 }
 DATA_DIR="$(data_root)"
@@ -344,10 +354,10 @@ api_up() { api GET /api/status "" 5 | grep -q '"components"'; }
 ensure_service() {
   step "启动 ECHO 服务"
   if api_up; then ok "服务已在运行（端口 $(echo_port)）"; return 0; fi
-  local starter="$DEST/mac/start_mac.sh"
+  local starter="$CODE/mac/start_mac.sh"
   if [ ! -f "$starter" ]; then err "找不到启动脚本：$starter"; exit 1; fi
   say "服务没在跑，后台启动一次…"
-  ( cd "$DEST" && nohup bash "$starter" >/dev/null 2>&1 & ) || true
+  ( cd "$CODE" && nohup bash "$starter" >/dev/null 2>&1 & ) || true
   local i=0
   while [ "$i" -lt 60 ]; do
     sleep 2
@@ -474,7 +484,7 @@ print(json.dumps({"values": vals}))
 echo ""
 echo "  === ECHO 组件安装（macOS，按需下载）==="
 say "安装目录：$DEST"
-[ -d "$DEST/app" ] || { err "这个目录里没有 app/ —— 看起来不是 ECHO 安装目录"; exit 1; }
+[ -d "$CODE/app" ] || { err "这个目录里没有 app/ —— 看起来不是 ECHO 安装目录：$CODE"; exit 1; }
 ok "运行时：$PY"
 say "数据根：$DATA_DIR"
 

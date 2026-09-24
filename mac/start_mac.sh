@@ -2,21 +2,26 @@
 # start_mac.sh — 后台启动 ECHO（macOS）
 set -e
 
-DIR="$(cd "$(dirname "$0")/.." && pwd)"
-cd "$DIR"
+# 3.0 安装根布局：代码目录名叫 echo-core 时，安装根是它的父目录 ——
+# venv/ 与 data/ 都放安装根（否则"升级整体覆盖 echo-core"会把运行时和数据一起删掉）。
+# 判据与 app/paths.py:echo_base() 一致；扁平安装里 CODE == BASE，行为不变。
+CODE="$(cd "$(dirname "$0")/.." && pwd)"
+BASE="$CODE"
+if [ "$(basename "$CODE")" = "echo-core" ]; then BASE="$(cd "$CODE/.." && pwd)"; fi
+cd "$CODE"
 
-if [ -z "${ECHO_DATA:-}" ] && [ -f "$DIR/data/echo.db" ]; then
-  export ECHO_DATA="$DIR/data"
+if [ -z "${ECHO_DATA:-}" ] && [ -f "$BASE/data/echo.db" ]; then
+  export ECHO_DATA="$BASE/data"
 fi
 
-if [ ! -x ./venv/bin/python ]; then
+if [ ! -x "$BASE/venv/bin/python" ]; then
   echo "尚未初始化环境，请先运行： mac/setup_mac.sh"
   exit 1
 fi
 
-mkdir -p data/logs
+mkdir -p "$BASE/data/logs"
 
-PID_FILE="data/echo-mac.pid"
+PID_FILE="$BASE/data/echo-mac.pid"
 is_echo_pid() {
   case "${1:-}" in ''|*[!0-9]*) return 1 ;; esac
   CMD="$(ps -p "$1" -o command= 2>/dev/null || true)"
@@ -32,7 +37,7 @@ if [ -f "$PID_FILE" ]; then
   rm -f "$PID_FILE"
 fi
 
-nohup ./venv/bin/python mac/run_mac.py >> data/logs/echo-mac.out 2>&1 &
+nohup "$BASE/venv/bin/python" mac/run_mac.py >> "$BASE/data/logs/echo-mac.out" 2>&1 &
 NEW_PID=$!
 echo "$NEW_PID" > "$PID_FILE"
 sleep 0.5
