@@ -210,6 +210,17 @@ $srcEcho = if ($kitDir) { Join-Path $kitDir.FullName 'ECHO' } else { $null }
 $srcSkill = if ($kitDir) { Join-Path $kitDir.FullName 'echo-install' } else { $null }
 
 $added = 0; $updated = 0; $same = 0
+# 3.0 install-base layout: the target may keep its code in <DestDir>\echo-core (a fresh install)
+# or directly in <DestDir> (a flat legacy install). The overlay must land in the CODE dir, while
+# data\ / models\ / runtime-core\ live in the install base - they are not in the kit at all, so
+# they are unaffected either way. Same rule as app\paths.py:echo_base(): code under echo-core
+# means the new layout.
+$destCode = $DestDir
+if (Test-Path -LiteralPath (Join-Path $DestDir 'echo-core\app\main.py')) {
+    $destCode = Join-Path $DestDir 'echo-core'
+}
+$destSkill = if ($destCode -ne $DestDir) { Join-Path $destCode '.dsh\skills\echo-install' }
+             else { Join-Path $DestDir '.dsh\skills\echo-install' }
 function Copy-Tree([string]$From, [string]$To, [string]$Label) {
     if ($DryRun) { Say "  [dry] would overlay $Label : $From -> $To"; return }
     if (-not (Test-Path -LiteralPath $From)) { Warn2 "missing in kit: $From"; return }
@@ -233,10 +244,10 @@ function Copy-Tree([string]$From, [string]$To, [string]$Label) {
 }
 
 if ($DryRun) {
-    Say "  [dry] would overlay the kit's ECHO\ over $DestDir (data\ models\ runtime-core\ are not in the kit, so they stay)"
+    Say "  [dry] would overlay the kit's ECHO\ over $destCode (data\ models\ runtime-core\ are not in the kit, so they stay)"
 } else {
-    Copy-Tree $srcEcho $DestDir 'ECHO\'
-    Copy-Tree $srcSkill (Join-Path $DestDir '.dsh\skills\echo-install') 'echo-install\'
+    Copy-Tree $srcEcho $destCode 'ECHO\'
+    Copy-Tree $srcSkill $destSkill 'echo-install\'
     Ok "overlay done: $added added, $updated updated, $same unchanged"
     Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
 }
@@ -248,7 +259,7 @@ if (Test-Path -LiteralPath $destPy) {
     if ($DryRun) {
         Say '  [dry] would verify: compileall app + import smoke'
     } else {
-        Push-Location $DestDir
+        Push-Location $destCode
         try {
             & $destPy -m compileall -q app | Out-Null
             if ($LASTEXITCODE -ne 0) { Fail 'compileall failed on the target'; exit 1 }
