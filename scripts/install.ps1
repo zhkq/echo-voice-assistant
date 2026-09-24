@@ -62,6 +62,10 @@ $script:ZipPath = ''
 $script:ZipTop = 'ECHO'
 $script:TreeSource = ''      # 场景 C：来源是已解开的包目录（不再有 zip）
 $script:TargetDir = ''
+# 3.0 安装根布局：TargetDir 是**安装根**（数据/模型/DSH/会议/指令与运行时都在它下面），
+# CoreDir 是**代码目录**。全新安装时 CoreDir = <root>\echo-core（整体可覆盖）；
+# 老式扁平安装里两者相同（代码就在安装根下）—— 解析见 Resolve-CoreDir。
+$script:CoreDir = ''
 $script:DestRoot = ''
 $script:ExistingDir = ''
 $script:IsMainPackage = $false
@@ -320,6 +324,42 @@ function Step03-Dest {
     Info ("安装目录: {0}" -f $script:TargetDir)
 }
 
+function Resolve-CoreDir {
+    # 代码放哪（3.0 安装根布局，判据与 app\paths.py:echo_base() 同一条）。
+    #
+    #   全新安装  -> <安装根>\echo-core     代码单独一个"整体可覆盖"的目录，
+    #                                       数据/模型/DSH/会议/指令是它的兄弟目录
+    #   已有扁平安装 -> 安装根本身           **绝不移动老装机的代码**（搬了等于重装一遍：
+    #                                       venv/模型/DPAPI 凭据全在旧相对位置上）
+    #
+    # "已有扁平安装"的判据是"安装根下已经有代码"（app\main.py）—— 只看目录非空会把
+    # "用户把一个空 U 盘目录当安装目标"误判成老装机。
+    if ($script:CoreDir) { return }
+    if ((Split-Path $script:TargetDir -Leaf) -ieq 'echo-core') {
+        # 安装"根"被传成了代码目录（最常见的来源：从 <base>\echo-core\scripts\install.ps1
+        # 里重跑一次）。认出来：根上提一层，代码就是它 —— 否则数据会被写进可覆盖的代码目录。
+        $script:CoreDir = $script:TargetDir
+        $script:TargetDir = Split-Path $script:TargetDir -Parent
+        Info ("目标传的是代码目录，安装根上提为 {0}" -f $script:TargetDir)
+        return
+    }
+    if (Test-Path (Join-Path $script:TargetDir 'app\main.py')) {
+        $script:CoreDir = $script:TargetDir
+        Info '检测到代码在安装根下（老式扁平安装）：原地升级，不移动代码'
+        return
+    }
+    $script:CoreDir = Join-Path $script:TargetDir 'echo-core'
+    Info ("3.0 安装根布局：代码放 {0}" -f $script:CoreDir)
+    if ($script:DryRun) { return }
+    # 六个兄弟目录先建出来：让"我的东西放哪了"一眼可见，也免得后面某一步漏建。
+    # 都不是"必须存在"（首次录音/首次下模型时才真正用到），建空的没有副作用。
+    foreach ($d in @('data', 'models', 'meeting', 'aide',
+                     'dsh\app', 'dsh\home')) {
+        New-Item -ItemType Directory -Force -Path (Join-Path $script:TargetDir $d) | Out-Null
+    }
+    Ok '已建兄弟目录：data / models / meeting / aide / dsh\app / dsh\home'
+}
+
 function Set-PackageKind {
     # 包的种类：整包自带 venv；主包只有代码 + manifest.json（D22），运行时随后由
     # runtime-core 组件补上 —— 以前这里只认 venv，主包会被误判成"包不完整"。
@@ -339,7 +379,8 @@ function Set-PackageKind {
 function Copy-ExtractedTree {
     # 场景 C：来源是**已解开的**包目录 → 复制，不解压。
     $src = (Resolve-Path $script:TreeSource).Path
-    $dst = $script:TargetDir
+    Resolve-CoreDir
+    $dst = $script:CoreDir
     $dstFull = if (Test-Path $dst) { (Resolve-Path $dst).Path } else { '' }
     if ($dstFull -and ($dstFull -eq $src)) {
         # 就地把包解在了目标目录（比如把资料夹解压到 D:\ 得到 D:\ECHO）—— 什么都不用做
@@ -373,11 +414,15 @@ function Copy-ExtractedTree {
 
 function Step04-Extract {
     Step 4 '取交付包内容'
+    Resolve-CoreDir
     if ($script:ExistingDir) { Ok '已有目录模式，跳过解压'; return }
     if ($script:TreeSource) { Copy-ExtractedTree; return }
-    if (Test-Path (Join-Path $script:TargetDir 'venv\Scripts\python.exe')) {
-        Warn '目标目录已含 venv，视为已解压的 ECHO，跳过解压。'
-        $script:ExistingDir = $script:TargetDir
+    # "已经解压过了吗"要看**代码**在不在，不能看 venv：3.0 布局里 venv 在安装根下、
+    # 代码在 <root>\echo-core，而扁平安装里两者同一个目录 —— 只认 venv 会把
+    # "新布局的机器 + 又给了一个 zip" 判成"已解压"，于是代码根本不更新。
+    if (Test-Path (Join-Path $script:CoreDir 'app\main.py')) {
+        Warn '目标里已经有 ECHO 代码，视为已解压的 ECHO，跳过解压。'
+        $script:ExistingDir = $script:CoreDir
         return
     }
     if (Test-Path $script:TargetDir) {
@@ -415,34 +460,34 @@ function Step04-Extract {
         $rootFiles = @(Get-ChildItem $tmp -File -Force -ErrorAction SilentlyContinue)
         $extraFiles = @($rootFiles | Where-Object { $pkgMeta -notcontains $_.Name })
         $wrapped = ($rootDirs.Count -eq 1 -and $extraFiles.Count -eq 0)
-        $tItems = @(Get-ChildItem $script:TargetDir -Force -ErrorAction SilentlyContinue)
+        $tItems = @(Get-ChildItem $script:CoreDir -Force -ErrorAction SilentlyContinue)
         if ($wrapped) {
-            # 顶层目录放入目标：
+            # 顶层目录放入**代码目录**（CoreDir；老式扁平安装下它就等于安装根）：
             #   目标不存在 / 为空 → 整体改名移动（同盘 rename，瞬间完成）
             #   目标非空（用户已确认）→ 顶层内容逐项移入
             $topDir = $rootDirs[0]
+            if (-not (Test-Path $script:CoreDir)) {
+                New-Item -ItemType Directory -Path $script:CoreDir -Force | Out-Null
+            }
             if ($tItems.Count -eq 0) {
-                Remove-Item $script:TargetDir -Force -ErrorAction SilentlyContinue
-                Move-Item $topDir.FullName $script:TargetDir -Force
+                Remove-Item $script:CoreDir -Force -ErrorAction SilentlyContinue
+                Move-Item $topDir.FullName $script:CoreDir -Force
             } else {
-                Get-ChildItem $topDir.FullName -Force | Move-Item -Destination $script:TargetDir -Force
+                Get-ChildItem $topDir.FullName -Force | Move-Item -Destination $script:CoreDir -Force
                 Remove-Item $topDir.FullName -Force -Recurse -ErrorAction SilentlyContinue
             }
-            # 包元数据跟着落到安装目录（留着对账用；它们描述的是这个包）
-            if (-not (Test-Path $script:TargetDir)) {
-                New-Item -ItemType Directory -Path $script:TargetDir -Force | Out-Null
-            }
+            # 包元数据跟着落到**安装根**（留着对账用；它们描述的是这个包，不属于代码）
             foreach ($mf in $rootFiles) {
                 if ($pkgMeta -contains $mf.Name) {
                     Move-Item $mf.FullName (Join-Path $script:TargetDir $mf.Name) -Force
                 }
             }
         } else {
-            Info ("平铺包：把 {0} 个顶层项逐一移入目标目录" -f ($rootDirs.Count + $rootFiles.Count))
-            if (-not (Test-Path $script:TargetDir)) {
-                New-Item -ItemType Directory -Path $script:TargetDir -Force | Out-Null
+            Info ("平铺包：把 {0} 个顶层项逐一移入代码目录" -f ($rootDirs.Count + $rootFiles.Count))
+            if (-not (Test-Path $script:CoreDir)) {
+                New-Item -ItemType Directory -Path $script:CoreDir -Force | Out-Null
             }
-            Get-ChildItem $tmp -Force | Move-Item -Destination $script:TargetDir -Force
+            Get-ChildItem $tmp -Force | Move-Item -Destination $script:CoreDir -Force
         }
         Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
     } catch {
@@ -562,7 +607,7 @@ function Assert-Pip([string]$Py) {
 }
 
 function Install-RuntimeCore {
-    $rcDir = Join-Path $script:ExistingDir 'runtime-core'
+    $rcDir = Join-Path $script:TargetDir 'runtime-core'
     $rcPy = Get-RuntimeCorePython $rcDir
     if ($rcPy) { Ok ("runtime-core 已就绪: {0}" -f $rcPy); return }
     if ($script:DryRun) {
@@ -714,8 +759,8 @@ function Step05-Init {
             & powershell -NoProfile -ExecutionPolicy Bypass -File $setup
         } finally { Pop-Location }
         # new-machine-setup 内部错误时并非总是非零退出，用产物判断
-        $dbOk = Test-Path (Join-Path $script:ExistingDir 'data\echo.db')
-        $pyOk = Test-Path (Join-Path $script:ExistingDir 'venv\Scripts\python.exe')
+        $dbOk = Test-Path (Join-Path $script:TargetDir 'data\echo.db')
+        $pyOk = Test-Path (Join-Path $script:TargetDir 'venv\Scripts\python.exe')
         if ($dbOk -and $pyOk) { Ok '初始化完成（venv / 数据库就绪）' }
         else {
             Warn '初始化未完全成功（缺 data\echo.db 或 venv）'
@@ -728,8 +773,8 @@ function Step06-SelfCheck {
     Step 6 '安装自检'
     $fail = 0
     # 解释器可能来自 runtime-core 组件（主包，D22）或自带的 venv（整包）
-    $rcPy = Get-RuntimeCorePython (Join-Path $script:ExistingDir 'runtime-core')
-    $venvPy = Join-Path $script:ExistingDir 'venv\Scripts\python.exe'
+    $rcPy = Get-RuntimeCorePython (Join-Path $script:TargetDir 'runtime-core')
+    $venvPy = Join-Path $script:TargetDir 'venv\Scripts\python.exe'
     if ($rcPy) { Ok ("runtime-core 就绪（D22 组件）: {0}" -f (Split-Path $rcPy -Leaf)) }
     elseif (Test-Path $venvPy) { Ok 'venv\Scripts\python.exe 存在（整包）' }
     else { Err '缺运行时（runtime-core 或 venv）'; $fail++ }
@@ -761,7 +806,7 @@ function Step06-SelfCheck {
     # 端口占用检查：端口由 data\echo-port.txt 决定（默认 8970）。
     # 写死 8970 时它既发现不了"真端口被占"，也认不出"已有实例在跑"（本机实际 18060）。
     $port = 8970
-    $portFile = Join-Path $script:ExistingDir 'data\echo-port.txt'
+    $portFile = Join-Path $script:TargetDir 'data\echo-port.txt'
     if (Test-Path $portFile) {
         $parsed = 0
         $raw = (Get-Content $portFile -ErrorAction SilentlyContinue |
@@ -856,8 +901,8 @@ function Step07-Shortcuts {
     $lnk.Arguments = "`"$vbsPath`""
     $lnk.WorkingDirectory = $root
     $lnk.Description = 'ECHO 开机自启（无窗口启动器）'
-    $icon = Join-Path $root 'runtime-core\python.exe'
-    if (-not (Test-Path $icon)) { $icon = Join-Path $root 'runtime-core\Scripts\python.exe' }
+    $icon = Join-Path $script:TargetDir 'runtime-core\python.exe'
+    if (-not (Test-Path $icon)) { $icon = Join-Path $script:TargetDir 'runtime-core\Scripts\python.exe' }
     if (-not (Test-Path $icon)) { $icon = Join-Path $root 'venv\Scripts\python.exe' }
     if (Test-Path $icon) { $lnk.IconLocation = "$icon,0" }
     else { $lnk.IconLocation = "$env:SystemRoot\System32\shell32.dll,220" }
