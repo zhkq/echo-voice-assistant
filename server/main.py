@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import time
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
@@ -125,43 +126,154 @@ def create_app(cfg=None) -> FastAPI:
     return app
 
 
+def _normalize_scopes(raw: str) -> str:
+    """把 `"asr,diarize"` / `"asr diarize"` / `"asr  diarize"` 统一成空格分隔。
+
+    存的格式就是 `_check_scope` 里 `.split()` 认的那种；不统一的话，
+    `--set-scopes cli-x asr,diarize` 会存成一个**永远匹配不上任何槽**的字符串 ——
+    表现是"我明明给了权限却全 403"，很难查。
+    """
+    parts = [p for p in str(raw or "").replace(",", " ").split() if p]
+    return " ".join(parts)
+
+
+def _fmt_time(ts) -> str:
+    ts = float(ts or 0)
+    return "-" if ts <= 0 else time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
+
+
+def _print_pairing(code: str, cfg, name: str = "", scopes: str = "") -> None:
+    host = str(cfg.get("server.listen", ""))
+    ttl_min = int(float(cfg.get("auth.pairing_ttl_s", 900)) / 60)
+    print("配对码（%d 分钟内有效，只能用一次）：" % ttl_min)
+    # 配对串里带上服务端标识，客户端粘一次就够了（§7.5 ①）。
+    # **证书指纹**（§7.5 的 `fp=`）等 TLS 落地时再加 —— 现在写上去是假的。
+    print("     echo://pair?host=%s&code=%s" % (host, code))
+    if name or scopes:
+        print("这台客户端将建为：名字=%s  scopes=%s"
+              % (name or "(对端自报)", scopes or "(不限)"))
+    print("把它给同事，在客户端面板里粘贴一次即可。")
+
+
+def _show_client(store, client_id: str) -> int:
+    r = store.client(client_id)
+    if r is None:
+        print("没有这个客户端：%s" % client_id)
+        return 1
+    print("client_id     %s" % r["client_id"])
+    print("名字          %s" % (r["name"] or "(未命名)"))
+    print("scopes        %s" % (r["scopes"] or "(不限)"))
+    print("状态          %s" % ("已禁用" if r["disabled"] else "正常"))
+    print("token_version %s   （撤销/轮换一次 +1；JWT 里带着它）" % r["token_version"])
+    print("创建          %s" % _fmt_time(r["created_at"]))
+    print("最后改动      %s" % _fmt_time(r["updated_at"]))
+    print("最后活跃      %s" % _fmt_time(r["last_seen"]))
+    return 0
+
+
 def _admin_cli(cfg, args) -> int:
     """管理动作的命令行入口。
 
-    **为什么要有它**：`/v1/pair` 需要一次性配对码，而配对码只能由"服务端这边"生成。
-    管理面（设计 §8.4）还没做，所以在那之前必须有一条命令行的路 ——
-    否则这套鉴权装上了却发不出第一份凭据，等于没装。
+    **为什么是命令行而不是网页**：管理面（设计 §8.4）还没做，而
+    `/v1/pair` 需要一次性配对码、只能由服务端这边生成 ——
+    没有这条路，鉴权装上了也发不出第一份凭据，等于没装。
+    网页版要独立端口 + 管理员密码哈希 + 会话 + CSRF（§8.4 的"管理面自己的安全"），
+    那是另一块工作；**运维真正需要的那几个动作先把这里补齐**。
 
-    这些动作**不打 HTTP**：它们直接开库。理由很实在 ——
+    这些动作**不打 HTTP**：直接开库。理由很实在 ——
     给管理动作开一条免鉴权的内部端点，正是最容易变成漏洞的做法。
+
+    ⚠️ **这条命令的安全边界就是"能读到鉴权库文件"**（也就是 shell 权限）。
+    所以它不需要再问一遍密码；但也意味着**别把库文件放到别人读得到的地方**。
     """
     store = auth_mod.open_store(cfg)
     try:
         a = auth_mod.Auth(cfg, store)
-        if args.new_pairing_code:
-            code = a.create_pairing_code(created_by=args.created_by or "cli")
-            host = str(cfg.get("server.listen", ""))
-            # 配对串里带上服务端标识，客户端粘一次就够了（§7.5 ①）。
-            # **证书指纹**（§7.5 的 `fp=`）等 TLS 落地时再加 —— 现在写上去是假的。
-            print("配对码（15 分钟内有效，只能用一次）：")
-            print("     echo://pair?host=%s&code=%s" % (host, code))
-            print("把它给同事，在客户端面板里粘贴一次即可。")
+        scopes = _normalize_scopes(args.scopes)
+
+        # ---- 先统一处理"要指定一个客户端"的动作 ----
+        # 不做这一步的话，不存在的 id 会一路走到 `Auth.set_disabled` 里抛
+        # `EchoError`，然后以一段 traceback 收场 —— 对运维来说那是噪音，
+        # 而且**说的事一样**（没有这个客户端）。`--revoke` 更糟：它会打印
+        # "已撤销 xxx（token_version → 0）"，看着像成功了。
+        target = (args.show_client or args.revoke or args.disable or args.enable
+                  or args.set_scopes or args.rotate_secret)
+        if target:
+            row = store.client(target)
+            if row is None:
+                print("没有这个客户端：%s" % target)
+                ids = [r["client_id"] for r in store.clients()]
+                print("现有的：%s" % (", ".join(ids) if ids else "（还没有任何客户端）"))
+                return 1
+
+        # ---- 新建客户端 / 发配对码 ----
+        if args.new_client or args.new_pairing_code:
+            name = str(args.new_client or "")
+            code = a.create_pairing_code(created_by=args.created_by or "cli",
+                                         name=name, scopes=scopes)
+            _print_pairing(code, cfg, name=name, scopes=scopes)
             return 0
+
+        # ---- 查看 ----
         if args.list_clients:
             rows = store.clients()
             if not rows:
                 print("（还没有任何客户端）")
             for r in rows:
-                print("%-12s ver=%-3s disabled=%-5s scopes=%-20s name=%s" % (
-                    r["client_id"], r["token_version"], bool(r["disabled"]),
-                    r["scopes"] or "(不限)", r["name"]))
+                print("%-12s %-9s ver=%-3s scopes=%-18s 最后活跃=%-16s %s" % (
+                    r["client_id"],
+                    "已禁用" if r["disabled"] else "正常",
+                    r["token_version"], r["scopes"] or "(不限)",
+                    _fmt_time(r["last_seen"]), r["name"]))
             return 0
+        if args.list_codes:
+            rows = store.pairing_codes()
+            now = time.time()
+            if not rows:
+                print("（没有待用的配对码）")
+            for r in rows:
+                left = float(r["expires_at"]) - now
+                print("%-10s 剩余 %5.1f 分钟  名字=%-16s scopes=%-16s 由 %s 发" % (
+                    "(哈希)", max(0.0, left / 60), r.get("name") or "(对端自报)",
+                    r.get("scopes") or "(不限)", r.get("created_by") or "-"))
+            if rows:
+                print("注：配对码**只存哈希**，所以这里看不到明文 —— 明文只在生成时出现过一次。")
+            return 0
+        if args.show_client:
+            return _show_client(store, args.show_client)
+
+        # ---- 改 ----
         if args.revoke:
             ver = a.cache.revoke(args.revoke)
             print("已撤销 %s（token_version → %s）。"
                   "服务端最迟 %s 秒后发现（跨进程靠轮询，见设计 §7.5 ④）。"
                   % (args.revoke, ver, cfg.get("auth.revoke_poll_s", 5)))
             return 0
+        if args.disable or args.enable:
+            cid = args.disable or args.enable
+            a.set_disabled(cid, bool(args.disable))
+            if args.disable:
+                print("已禁用 %s。它现在会收到 403（不是 401 —— 是「认识你但不许用」）。"
+                      % cid)
+            else:
+                # 注意：`disabled` 与 `token_version` 是两回事 ——
+                # 启用只是把那一位置回 0，**它手上那个令牌仍然是有效的**
+                # （版本号没变、scopes 没变），不需要重新换。别写成"要重新换令牌"。
+                print("已启用 %s。它手上的凭据仍然有效，可以直接继续用。" % cid)
+            return 0
+        if args.set_scopes:
+            a.set_scopes(args.set_scopes, scopes)
+            print("已把 %s 的 scopes 改成：%s" % (args.set_scopes, scopes or "(不限)"))
+            print("**下一个请求就生效** —— 鉴权读的是库里的行，不是 JWT 里的声明。")
+            return 0
+        if args.rotate_secret:
+            secret = a.rotate_secret(args.rotate_secret)
+            print("已轮换 %s 的 secret。**新的明文只出现这一次**：" % args.rotate_secret)
+            print("     %s" % secret)
+            print("同时 token_version +1：**它原来的令牌立刻全失效**，必须重新配对"
+                  "（v1 不留宽限期，见设计 §7.5 ⑤）。")
+            return 0
+
         return 2
     finally:
         store.close()
@@ -174,12 +286,27 @@ def main(argv=None) -> int:
     ap.add_argument("--listen", default="", help="覆盖监听地址，如 0.0.0.0:8900")
     ap.add_argument("--log-level", default="info")
     # ---- 管理动作（做完就退出，不起服务）----
+    # 「新建客户端」这个动作就是**发一张带着名字与 scope 的配对码** ——
+    # 与 `--new-pairing-code` 是同一件事，区别只在于填不填名字/scope。
+    ap.add_argument("--new-client", default="", metavar="NAME",
+                    help="新建客户端：生成一张带着这个名字与 --scopes 的配对码")
     ap.add_argument("--new-pairing-code", action="store_true",
-                    help="生成一个一次性配对码并打印配对串（管理面做好之前的入口）")
+                    help="只发配对码，不预先指定名字与 scope（对端自报）")
+    ap.add_argument("--scopes", default="", metavar="LIST",
+                    help='权限列表，如 "asr diarize embed"（逗号或空格分隔；空 = 不限）')
     ap.add_argument("--created-by", default="", help="配对码的备注（谁发的）")
     ap.add_argument("--list-clients", action="store_true", help="列出已配对的客户端")
+    ap.add_argument("--list-codes", action="store_true", help="列出待用的配对码与剩余时间")
+    ap.add_argument("--show-client", default="", metavar="CLIENT_ID", help="看一个客户端的详情")
     ap.add_argument("--revoke", default="", metavar="CLIENT_ID",
                     help="撤销一个客户端（token_version +1，立即生效）")
+    ap.add_argument("--disable", default="", metavar="CLIENT_ID",
+                    help="禁用一个客户端（它收到 403，凭据仍然有效）")
+    ap.add_argument("--enable", default="", metavar="CLIENT_ID", help="重新启用")
+    ap.add_argument("--set-scopes", default="", metavar="CLIENT_ID",
+                    help="改 scopes，配合 --scopes（下一个请求就生效）")
+    ap.add_argument("--rotate-secret", default="", metavar="CLIENT_ID",
+                    help="换 secret 并打印新的（只出现这一次）；旧令牌立即失效")
     args = ap.parse_args(argv)
 
     logging.basicConfig(level=getattr(logging, str(args.log_level).upper(), logging.INFO),
@@ -188,7 +315,10 @@ def main(argv=None) -> int:
     if args.listen:
         cfg.raw.setdefault("server", {})["listen"] = args.listen
 
-    if args.new_pairing_code or args.list_clients or args.revoke:
+    admin_actions = (args.new_client, args.new_pairing_code, args.list_clients,
+                     args.list_codes, args.show_client, args.revoke, args.disable,
+                     args.enable, args.set_scopes, args.rotate_secret)
+    if any(admin_actions):
         return _admin_cli(cfg, args)
 
     import uvicorn

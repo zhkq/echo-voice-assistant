@@ -7,6 +7,11 @@ server:
   listen: "0.0.0.0:8900"
   instance_id: gpu01-a          # 临时目录的命名空间（多实例互不清扫对方）
   vram_budget_mb: 20000         # 0 = 不限制；超预算**拒绝**而不是 OOM，也不回退 CPU
+  # **耐久**状态（鉴权库）放哪。空 = {ECHO}/data/server-state。
+  # **故意与 `tmp.root` 分开**：tmp 是"随便删、可以挂 tmpfs"的，
+  # 而鉴权库存着客户端凭据 —— 两者放一起意味着"照文档把 tmp 换成内存盘
+  # 就会把配过的所有客户端清空"。容器里就是那两个保留策略相反的卷。
+  state_root: /var/echo/state
 
 limits:
   # 2026-09-23 定：总通道 2、每客户端 1。
@@ -28,7 +33,9 @@ tmp:
 
 models:
   root: /opt/echo/models
-  device: cuda                  # cuda | cpu。**要 cuda 而没有 CUDA 时直接失败**，不回退
+  # cuda | cpu。**要 cuda 而没有 CUDA 时直接失败**，不回退 CPU（设计 §3.4）——
+  # 服务端一旦回退，会把所有客户端一起拖慢，而且从指标上看不出原因。
+  device: cuda
   # 不写 specs 就用代码里的出厂清单（server/engines.py:default_specs）。
   # 写出来是为了能改；`est_vram_mb` 与 `max_concurrency` 都是**占位值**，上线前要压测校准。
   specs:
@@ -84,14 +91,27 @@ auth:
   pair_window_s: 300             # 失败退避窗口
   pair_max_failures: 5           # 窗口内失败几次开始 429
   cache_ttl_s: 60                # client 行缓存多久（撤销走主动失效，不靠它）
-  default_scopes: ""             # 空 = 配对出来的客户端没有额外限制
-  db: ""                         # 空 = {tmp.root}/echo-server-auth.db
+  revoke_poll_s: 5               # 跨进程撤销的发现间隔（命令行 --revoke 靠它生效）
+  default_scopes: ""             # 空 = 配对出来且码上没写 scope 的客户端没有额外限制
+  # 空 = {server.state_root}/echo-server-auth.db。
+  # **刻意不回退到 tmp.root**：那是"随便删、可以挂 tmpfs"的地方，
+  # 而这里存的是客户端凭据 —— 放那儿就等于"照文档把 tmp 换成内存盘，所有客户端一起消失"。
+  db: ""
   # 静态令牌模式大概长这样（每把令牌可以带自己的 scopes）：
   #   enabled: true
   #   tokens:
   #     - { client_id: cli-07a3f2, token: "<32 字节随机>", scopes: "asr diarize embed" }
   #     - { client_id: cli-11b9c4, token: "<...>", scopes: "asr" }
   #
-  # jwt 模式：配好 jwt_secret 之后，用命令行发配对码（管理面还没做）：
-  #   python -m server.main --new-pairing-code --created-by 管理员
-  # 把输出的配对串给同事，他在客户端面板里粘一次即可。
+  # jwt 模式：配好 jwt_secret 之后，用命令行管客户端（管理面网页还没做）。
+  # **名字与 scope 跟着码走**，所以"给这台机器只开 asr"是能表达的：
+  #   python -m server.main --new-client "张三的办公本" --scopes "asr diarize"
+  #   python -m server.main --list-clients      # 看已配对的
+  #   python -m server.main --list-codes        # 看待用的码与剩余时间（只有哈希）
+  #   python -m server.main --show-client cli-07a3f2
+  #   python -m server.main --revoke cli-07a3f2         # 撤销（版本号 +1，立即失效）
+  #   python -m server.main --disable cli-07a3f2        # 禁用（回 403）/ --enable
+  #   python -m server.main --set-scopes cli-07a3f2 --scopes "asr"
+  #   python -m server.main --rotate-secret cli-07a3f2  # 换 secret，旧的立刻全失效
+  # 把配对串给同事，他在客户端面板里粘一次即可。
+  # 这些命令**直接开库、不打 HTTP** —— 安全边界就是"能读到这个库文件"。

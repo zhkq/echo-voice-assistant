@@ -981,11 +981,16 @@ secret 会留在聊天记录里，而且管理员得一台台填。
 ```
 ① 生成配对码（8 位、有效期 15 分钟、只存哈希），明文只出现这一次
      —— 管理面还没做，所以现在唯一的入口是命令行：
-        python -m server.main --new-pairing-code --created-by 管理员
+        python -m server.main --new-client "张三的办公本" --scopes "asr diarize"
         →  echo://pair?host=gpu-01:8900&code=7K2M9QX4
-     （**刻意不给管理动作开免鉴权的内部端点** —— 那正是最容易变成漏洞的做法；
-       这条命令直接开库，不打 HTTP。）
-     `--list-clients` 看已配对的，`--revoke <client_id>` 撤销。
+     **名字与 scope 跟着码走**：兑换出来的客户端就用它们。
+     所以"给这台机器只开 asr 权限"是能表达的，不是一句好听话。
+     不填名字（`--new-pairing-code`）时才回退到对端自报与全局默认 scope。
+     优先级：**码上的名字 > 对端自报的名字** —— 自报的能改名，那份清单就不算清点了。
+     （`--list-clients` / `--list-codes` / `--show-client` / `--revoke` / `--disable` /
+       `--enable` / `--set-scopes` / `--rotate-secret` 见 `server/README.md`。
+       **刻意不给管理动作开免鉴权的内部端点** —— 那正是最容易变成漏洞的做法；
+       这些命令直接开库，安全边界就是"能读到鉴权库文件"。）
 
 ② 用户在客户端面板粘贴配对码（或由安装脚本带参传入）
    POST /v1/pair  {code, clientName, clientVersion}
@@ -1200,6 +1205,22 @@ Windows 上至少要走 DPAPI（`CryptProtectData`）；这与"业务数据留�
 
 ### 8.4 管理面（Admin Console）
 
+> **实现状态（2026-09-24）：管理面网页还没做 —— `/admin/*` 一个路由都没有。**
+> 但**运维真正需要的动作已经齐了，在命令行里**：
+> `--new-client`（发一张带名字与 scope 的码）/ `--list-clients` / `--list-codes` /
+> `--show-client` / `--revoke` / `--disable` / `--enable` / `--set-scopes` /
+> `--rotate-secret`，见 `server/README.md`。
+>
+> **为什么先做命令行**：网页版要独立端口 + 管理员密码哈希（argon2id）+ 会话 +
+> 登录限速 + CSRF（见本章末尾"管理面自己的安全"），那是另一块工作；
+> 而那五个页签里**有三个依赖 `calls` / `calls_rollup`**（§8.5，属于 v2）——
+> 表还没建，页面就是空的。所以顺序是：**命令行先让运维能干活 → v2 建审计表与指标
+> → 再做网页**。把网页提前做，只会得到一个"模型状态查看器"。
+>
+> 命令行那条路**刻意不打 HTTP**（直接开库）：给管理动作开一条免鉴权的内部端点，
+> 正是最容易变成漏洞的做法。代价要写在明处 ——
+> **它的安全边界就是"能读到鉴权库文件"**，也就是 shell 权限。
+
 **一句话**：服务端自带一个管理网页，给运维看**模型跑得怎么样、客户端有谁在连、谁调了什么**。
 它读的是 §8.2 的指标与 §7.3 的审计数据，**不读任何内容**。
 
@@ -1331,6 +1352,18 @@ Windows 上至少要走 DPAPI（`CryptProtectData`）；这与"业务数据留�
 > （配额是 §7.2，还没做）、也没有 `version` 列（客户端版本只是配对时的入参，
 > 没有查询需求）。`updated_at` 是后加的、且是必需的 ——
 > 跨进程撤销靠 `MAX(updated_at)` 发现变更（§7.5 ④）。
+
+> **`pairing_codes` 比这张表多了三列**（`client_id` / `name` / `scopes`，2026-09-24）：
+> 设计 §7.4 的"管理员新建客户端：填名字、scope、配额"那一步产出的**就是一张配对码**，
+> 所以名字与 scope 必须**跟着码走**（不加这两列，"给这台机器只开 asr"就没法表达，
+> 兑出来的客户端只能拿到全局默认）。`client_id` 是预留的绑定列，v1 还没用。
+>
+> 这三列是**后加的**，而 `CREATE TABLE IF NOT EXISTS` **不会给已存在的表补列** ——
+> 已经跑过的服务端（开发机的库、容器里那个 state 卷）不会自动多出来。
+> 所以 `store.py` 里有一段**最小的补列迁移**（`_ADDED_COLUMNS`：只加列，
+> 不改类型、不删列、不搬数据）。**再多就需要真正的迁移工具了**
+> （版本表 + 顺序执行），别在那段上面长出第二套逻辑。
+> 契约由 `AuthSchemaMigrationTests` 钉住。
 
 #### 列黑名单（任何表都不许有）
 
@@ -1709,6 +1742,14 @@ client_body_temp_path /var/echo/tmp/nginx;
 | 每个能力端点都声明了 scope，而且**真的传下去了** | ✅ | `AuthScopeTests.test_endpoints_actually_pass_their_scope` |
 | 命令行发的码，服务端进程真能兑换（端到端） | ✅ | `AdminCliTests.test_the_printed_code_actually_works` |
 | `--list-clients` / `--revoke` 真的动库 | ✅ | `AdminCliTests` |
+| **名字与 scope 跟着码走**；码上带的盖过对端自报的 | ✅ | `AdminCliTests.test_new_client_carries_name_and_scopes_on_the_code` |
+| `--list-codes` 能看剩余时间，但**看不到明文**（只存哈希） | ✅ | `AdminCliTests.test_list_codes_shows_pending_codes_without_the_plaintext` |
+| `--set-scopes` **下一个请求**就生效（不该要求重新换令牌） | ✅ | `AdminCliTests.test_set_scopes_takes_effect_on_the_next_request` |
+| `--disable` 是 403；`--enable` 之后**原令牌直接能用** | ✅ | `AdminCliTests.test_disable_is_403_and_enable_restores_the_same_token` |
+| `--rotate-secret`：旧 secret 与旧令牌**都立刻失效**，新的能用 | ✅ | `AdminCliTests.test_rotate_secret_kills_both_...` |
+| 不存在的 client_id：一句人话 + 退出码 1，不是 traceback | ✅ | `AdminCliTests.test_unknown_client_ids_are_reported_cleanly` |
+| 版本号只增不减（否则旧令牌会"复活"） | ✅ | `AdminCliTests.test_version_only_ever_goes_up` |
+| 已存在的旧库会自动补 `name`/`scopes` 列，且**数据不丢** | ✅ | `AuthSchemaMigrationTests` |
 | 配额（日额度 / 音频分钟数，§7.2） | ⏳ | 还没做；现在只有并发闸门 |
 | 管理面 / 审计表 / "存了什么"自证页（§8.4、§8.5） | ⏳ | 还没做；配对的入口暂时是命令行 |
 

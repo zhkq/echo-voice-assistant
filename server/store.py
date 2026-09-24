@@ -61,10 +61,28 @@ CREATE TABLE IF NOT EXISTS pairing_codes (
     created_at REAL NOT NULL,
     expires_at REAL NOT NULL,
     created_by TEXT NOT NULL DEFAULT '',
-    client_id  TEXT NOT NULL DEFAULT ''
+    client_id  TEXT NOT NULL DEFAULT '',
+    -- 这对列是 2026-09-24 补的：设计 §7.4 说"管理员新建客户端时填名字与 scope"，
+    -- 而"新建"这一步产出的是一张**配对码** —— 名字与 scope 必须**跟着码走**，
+    -- 否则兑换出来的客户端只能拿到 `auth.default_scopes`，
+    -- "给这台机器只开 asr 权限"就无从表达。
+    name       TEXT NOT NULL DEFAULT '',
+    scopes     TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_pairing_expires ON pairing_codes(expires_at);
 """
+
+#: `CREATE TABLE IF NOT EXISTS` 对**已经存在**的表不会补列 ——
+#: 已经跑过的服务端（开发机上的 `data/backend-dev/auth.db`、容器里那个 state 卷）
+#: 不会因为改了 SCHEMA 就多出列来。所以这里做一次**最小的**补列迁移：只加列，不改类型、
+#: 不删列、不搬数据。再多就需要真正的迁移工具了（版本表 + 顺序执行）——
+#: 那时把这段换掉，别在上面长出第二套逻辑。
+_ADDED_COLUMNS = {
+    "pairing_codes": (
+        ("name", "TEXT NOT NULL DEFAULT ''"),
+        ("scopes", "TEXT NOT NULL DEFAULT ''"),
+    ),
+}
 
 
 class Store:
@@ -86,7 +104,18 @@ class Store:
         self._db.row_factory = sqlite3.Row
         with self._lock:
             self._db.executescript(SCHEMA)
+            self._migrate_locked()
             self._db.commit()
+
+    def _migrate_locked(self) -> None:
+        """补上 `_ADDED_COLUMNS` 里那些列。必须在持 `_lock` 时调用。"""
+        for table, cols in _ADDED_COLUMNS.items():
+            have = {r["name"] for r in
+                    self._db.execute('PRAGMA table_info("%s")' % table).fetchall()}
+            for name, decl in cols:
+                if name not in have:
+                    self._db.execute('ALTER TABLE "%s" ADD COLUMN %s %s'
+                                     % (table, name, decl))
 
     # ---------------------------------------------------------------- 自检
 
@@ -186,27 +215,60 @@ class Store:
                              (1 if disabled else 0, time.time(), client_id))
             self._db.commit()
 
-    def rotate_secret(self, client_id: str, secret_hash: str) -> None:
-        """轮换 secret（设计 §7.5 ⑤）。v1 不留宽限期，旧的立刻失效。
+    def set_scopes(self, client_id: str, scopes: str) -> bool:
+        """改一个客户端的 scopes。返回"确实改到了某个客户端吗"。
 
-        宽限期（`prev_secret_hash` + 24h）是 v2 的事：它需要在 `clients` 上加两列，
-        而那两列一旦加上就要想清楚"宽限期内谁还能进"。v1 先做"换掉即失效"，
-        因为配对成本很低（管理面再报一个码）。
+        **改完立即生效**（下一个请求就按新 scopes 判）：鉴权读的是**缓存里的行**，
+        不是 JWT 里那个 `scopes` 声明 —— 后者只是签发给客户端看的。
+        所以这里把 `updated_at` 也推一下，跨进程的轮询能发现（§7.5 ④）。
         """
         with self._lock:
-            self._db.execute(
-                "UPDATE clients SET secret_hash=?, updated_at=? WHERE client_id=?",
+            cur = self._db.execute(
+                "UPDATE clients SET scopes=?, updated_at=? WHERE client_id=?",
+                (str(scopes or ""), time.time(), client_id))
+            self._db.commit()
+            return bool(cur.rowcount)
+
+    def rotate_secret(self, client_id: str, secret_hash: str) -> Optional[Dict[str, Any]]:
+        """轮换 secret（设计 §7.5 ⑤）。返回更新后的行；客户端不存在返回 None。
+
+        v1 **不带宽限期**：旧 secret 立刻失效。而且**同时把 `token_version` +1** ——
+        理由：v1 里轮换之后客户端本来就必须重新配对（新 secret 只能由管理员带外交给用户），
+        既然它已经必须重新配对，就没必要再留一个"旧 JWT 还能用最多 1 小时"的窗口。
+        留着那个窗口反而更容易让人误以为"轮换失败了"。
+        宽限期（`prev_secret_hash` + 24h 双 secret）是 v2 的事。
+        """
+        with self._lock:
+            cur = self._db.execute(
+                "UPDATE clients SET secret_hash=?, token_version=token_version+1, "
+                "updated_at=? WHERE client_id=?",
                 (secret_hash, time.time(), client_id))
             self._db.commit()
+            if not cur.rowcount:
+                return None
+            row = self._db.execute("SELECT * FROM clients WHERE client_id=?",
+                                   (client_id,)).fetchone()
+        return dict(row) if row else None
 
     # ---------------------------------------------------------------- 配对码
 
-    def put_pairing_code(self, code_hash: str, ttl_s: float, created_by: str = "") -> None:
+    def put_pairing_code(self, code_hash: str, ttl_s: float, created_by: str = "",
+                         name: str = "", scopes: str = "") -> None:
+        """存一张待用的配对码。
+
+        `name` / `scopes` 是**这张码将要创建的那个客户端**的身份 ——
+        设计 §7.4 的"管理员新建客户端时填名字与 scope"就落在这里。
+        不带着走的话，兑换出来的客户端只能拿到全局默认 scopes，
+        "给这台机器只开 asr"就没法表达。
+        """
         now = time.time()
         with self._lock:
             self._db.execute(
-                "INSERT INTO pairing_codes (code_hash, created_at, expires_at, created_by) "
-                "VALUES (?,?,?,?)", (code_hash, now, now + float(ttl_s), created_by))
+                "INSERT INTO pairing_codes "
+                "(code_hash, created_at, expires_at, created_by, name, scopes) "
+                "VALUES (?,?,?,?,?,?)",
+                (code_hash, now, now + float(ttl_s), created_by, str(name or ""),
+                 str(scopes or "")))
             self._db.commit()
 
     def take_pairing_code(self, code_hash: str) -> Optional[Dict[str, Any]]:

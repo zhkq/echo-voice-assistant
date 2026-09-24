@@ -46,6 +46,10 @@ DEFAULTS: Dict[str, Any] = {
     },
     "models": {
         "root": "",                     # 空 = {ECHO}/models（跟客户端同一个模型库）
+        # cuda | cpu。**要 cuda 而没有 CUDA 时直接失败**，不回退 CPU（设计 §3.4）。
+        # 写进默认值是为了让它出现在配置清单里 ——
+        # 它是"服务端绝不静默降级"这条铁律的开关，不该只藏在 `get(..., "cuda")` 里。
+        "device": "cuda",
         "specs": [],                    # 见下方 yaml 示例；空 = 用代码里的默认清单
     },
     "auth": {

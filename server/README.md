@@ -97,20 +97,42 @@ powershell -File scripts/check-windows.ps1             # 全量门禁
 # 1) 配置文件里把 auth 打开并配好密钥
 #    auth: {enabled: true, mode: jwt, jwt_secret: "<openssl rand -hex 32>"}
 
-# 2) 发一个一次性配对码（管理面还没做，所以走命令行）
-python -m server.main --config data/backend-dev/server.yaml --new-pairing-code
+# 2) 新建客户端 = 发一张带着名字与 scope 的配对码
+python -m server.main --config <cfg> --new-client "张三的办公本" --scopes "asr diarize"
 #    → echo://pair?host=127.0.0.1:8900&code=7K2M9QX4
 
 # 3) 用码换凭据 → 换令牌 → 带令牌调用
 python scripts/smoke-echo-backend.py --pair-code 7K2M9QX4
-
-# 其它管理动作
-python -m server.main --config <cfg> --list-clients
-python -m server.main --config <cfg> --revoke cli-07a3f2
 ```
 
-`--revoke` 是**另一个进程**：服务端最迟 `auth.revoke_poll_s`（默认 5 秒）后生效 ——
-这是有意的取舍（用 5 秒换掉"每请求查库"），文档里没有把它写成"立即"。
+### 管理动作（命令行）
+
+管理面网页（设计 §8.4）**还没做**。运维真正需要的那几个动作在命令行里齐了：
+
+| 命令 | 干什么 |
+|---|---|
+| `--new-client NAME [--scopes "asr diarize"]` | 新建客户端（发一张带名字与 scope 的配对码） |
+| `--new-pairing-code` | 只发码，不预先指定名字与 scope（对端自报） |
+| `--list-clients` / `--list-codes` | 看已配对的 / 待用的码（含剩余时间；**码只看得到哈希**） |
+| `--show-client ID` | 一个客户端的详情（名字 / scopes / 状态 / 版本号 / 时间） |
+| `--revoke ID` | 撤销（`token_version` +1，**立即**失效） |
+| `--disable ID` / `--enable ID` | 禁用（回 **403**）/ 启用（原令牌直接能用） |
+| `--set-scopes ID --scopes "asr"` | 改权限，**下一个请求就生效** |
+| `--rotate-secret ID` | 换 secret（新的只出现这一次）；**旧令牌与旧 secret 立刻全失效** |
+
+几条需要知道的语义：
+
+- **名字 / scope 跟着码走**：`--new-client` 填的名字与 scope 存在配对码上，兑换时直接用。
+  **码上带的盖过对端自报的** —— 自报的能改名，那份清单就不算清点了。
+- `--rotate-secret` **同时把 `token_version` +1**：v1 没有宽限期，新 secret 只能由管理员
+  带外交给用户，客户端本来就要重新配对，所以不给"旧 JWT 还能再用一小时"的窗口。
+- `--enable` 之后**不需要重新换令牌**（`disabled` 与 `token_version` 是两回事）。
+- `--revoke` 是**另一个进程**改库：服务端最迟 `auth.revoke_poll_s`（默认 5 秒）后生效 ——
+  这是有意的取舍（用 5 秒换掉"每请求查库"），文档里没把它写成"立即"。
+- 这些动作**不打 HTTP，直接开库**。⚠️ 所以**它的安全边界就是"能读到鉴权库文件"**
+  （也就是 shell 权限）。别把库文件放到别人读得到的地方。
+- 给 `pairing_codes` 加列时做了**最小的补列迁移**（已存在的库自动补 `name`/`scopes`）。
+  再多就得换真正的迁移工具，别在那段上面长出第二套逻辑。
 
 ## 六、容器里跑（Linux + Docker）
 

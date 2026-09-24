@@ -415,12 +415,19 @@ class Auth:
 
     # ---- 配对（§7.4）-------------------------------------------------------
 
-    def create_pairing_code(self, created_by: str = "") -> str:
-        """管理面调用：生成一次性配对码，**明文只在这里返回这一次**。"""
+    def create_pairing_code(self, created_by: str = "", name: str = "",
+                            scopes: str = "") -> str:
+        """生成一次性配对码，**明文只在这里返回这一次**。
+
+        `name` / `scopes` 是**这张码将要创建的那个客户端**的身份（设计 §7.4 的
+        "管理员新建客户端：填名字、scope、配额"）。它们跟着码走，
+        兑换时直接用 —— 不这么做的话，`--new-client "张三的办公本" --scopes asr`
+        就只是一句好听话：兑出来的客户端还是全局默认 scopes。
+        """
         code = new_pairing_code()
         self.store.put_pairing_code(hash_pairing_code(code),
                                     float(self.cfg.get("auth.pairing_ttl_s", 900)),
-                                    created_by=created_by)
+                                    created_by=created_by, name=name, scopes=scopes)
         return code
 
     def redeem(self, code: str, client_name: str = "") -> Dict[str, Any]:
@@ -437,15 +444,52 @@ class Auth:
             raise errors.unauthorized("配对码已过期")
         cid = new_client_id()
         secret = new_secret()
-        self.store.upsert_client(cid, client_name or "未命名客户端",
-                                 hash_secret(secret, cid),
-                                 scopes=str(self.cfg.get("auth.default_scopes", "") or ""))
+        # **码上带的名字优先于对端自报的。**
+        # 理由：设计 §7.4 说"配对绑机器、不绑人"，名字是**管理侧的资产名**
+        # （"张三的办公本"），对端自报的 `clientName` 是它自己说的 ——
+        # 让自报的覆盖掉管理员填的，等于"谁都能给自己改个名"，
+        # 那份清单就不再是清点了。管理员没填（`--new-pairing-code`）时才用自报的。
+        name = str(row.get("name") or "") or client_name or "未命名客户端"
+        scopes = str(row.get("scopes") or "") or str(self.cfg.get("auth.default_scopes", "") or "")
+        self.store.upsert_client(cid, name, hash_secret(secret, cid), scopes=scopes)
         fetched = self.store.client(cid)
         if fetched:
             self.cache.put(fetched)
-        return {"clientId": cid, "secret": secret,
+        return {"clientId": cid, "secret": secret, "name": name,
+                "scopes": scopes.split(),
                 "serverName": str(self.cfg.get("server.id", "")),
                 "protocol": 1}
+
+    # ---- 管理动作（命令行 / 将来的管理面都走这几个）--------------------------
+
+    def set_scopes(self, client_id: str, scopes: str) -> None:
+        """改 scopes。**立即生效** —— 鉴权读的是缓存里的行，不是 JWT 里的声明。"""
+        if self.store.client(client_id) is None:
+            raise errors.EchoError(404, "client_not_found",
+                                   "没有这个客户端", detail=client_id)
+        self.store.set_scopes(client_id, scopes)
+        self.cache.forget(client_id)          # 下一请求重新读库，立即生效
+
+    def set_disabled(self, client_id: str, disabled: bool) -> None:
+        if self.store.client(client_id) is None:
+            raise errors.EchoError(404, "client_not_found",
+                                   "没有这个客户端", detail=client_id)
+        self.cache.set_disabled(client_id, disabled)
+
+    def rotate_secret(self, client_id: str) -> str:
+        """换 secret，返回**新的明文 secret**（只在这一刻出现）。
+
+        同时 `token_version` +1（见 `Store.rotate_secret` 的说明）——
+        也就是说**轮换之后这个客户端必须重新配对/重新拿 secret**，
+        不存在"旧令牌还能再用一小时"的窗口。
+        """
+        if self.store.client(client_id) is None:
+            raise errors.EchoError(404, "client_not_found",
+                                   "没有这个客户端", detail=client_id)
+        secret = new_secret()
+        self.store.rotate_secret(client_id, hash_secret(secret, client_id))
+        self.cache.forget(client_id)
+        return secret
 
     # ---- 换令牌（§7.5 ②）---------------------------------------------------
 

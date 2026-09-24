@@ -17,6 +17,7 @@ import io
 import json
 import os
 import re
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -627,6 +628,37 @@ class ExampleConfigTests(unittest.TestCase):
         cfg = self._example()
         self.assertIsNone(cfg.get("models.resident"),
                           "示例配置里出现了顶层 models.resident —— 代码不读它")
+
+    def test_example_covers_every_default_key(self):
+        """**出厂默认值里的每一个键，示例配置都要写出来。**
+
+        这条是被两次真事故逼出来的：示例配置里少了 `server.state_root` 与
+        `models.device`，而后者是"服务端绝不静态降级"那条铁律的开关 ——
+        用户拿到一份看起来完整的配置，**不知道有这些开关，也就不会去调**。
+        而 `models.device` 不写就默认 cuda，在只有 CPU 的机器上会变成
+        "所有模型都加载失败"，原因藏在代码里。
+
+        漏掉的键在这里会直接列出来，别靠人眼比对 YAML。
+        """
+        import yaml
+
+        def flatten(d, prefix=""):
+            out = set()
+            for k, v in (d or {}).items():
+                path = "%s.%s" % (prefix, k) if prefix else str(k)
+                if isinstance(v, dict):
+                    out |= flatten(v, path)
+                else:
+                    out.add(path)
+            return out
+
+        defaults = flatten(settings_mod.DEFAULTS)
+        with open(os.path.join(SERVER_DIR, "echo-server.example.yaml"), encoding="utf-8") as fh:
+            example = flatten(yaml.safe_load(fh))
+        missing = sorted(defaults - example)
+        self.assertEqual(missing, [],
+                         "这些出厂配置键没有出现在示例配置里（用户不会知道它们存在）：%s"
+                         % missing)
 
 
 class SlotRoutingTests(unittest.TestCase):
@@ -1826,6 +1858,204 @@ class AdminCliTests(unittest.TestCase):
         store = auth_mod.open_store(cfg)
         self.assertEqual(store.client(out["clientId"])["token_version"], 2)
         store.close()
+
+    # ---- 2026-09-24 补齐的管理动作 ----------------------------------------
+
+    def _client(self, name="张三的办公本", scopes="asr diarize"):
+        """新建一个客户端并返回它的配对结果。走**真实的命令行路径**。"""
+        _, out = self._run("--new-client", name, "--scopes", scopes, "--created-by", "t")
+        code = re.search(r"code=([A-Z0-9]+)", out).group(1)
+        cfg = settings_mod.load(self.cfg_path)
+        store = auth_mod.open_store(cfg)
+        try:
+            return auth_mod.Auth(cfg, store).redeem(code, "对端自报的名字")
+        finally:
+            store.close()
+
+    def test_new_client_carries_name_and_scopes_on_the_code(self):
+        """**`--new-client 名字 --scopes X` 不能只是一句好听话。**
+
+        设计 §7.4 说"管理员新建客户端：填名字、scope、配额"。而那一步产出的是一张
+        **配对码** —— 名字与 scope 必须跟着码走，否则兑出来的客户端只能拿到全局默认，
+        "给这台机器只开 asr"就无从表达。这里同时钉住名字的**优先级**：
+        **码上带的盖过对端自报的**（自报的能改名，那份清单就不算清点了）。
+        """
+        paired = self._client("张三的办公本", "asr,diarize")   # 逗号也要认
+        self.assertEqual(paired["scopes"], ["asr", "diarize"], "码上的 scope 没跟着走")
+        cfg = settings_mod.load(self.cfg_path)
+        store = auth_mod.open_store(cfg)
+        self.addCleanup(store.close)
+        row = store.client(paired["clientId"])
+        self.assertEqual(row["name"], "张三的办公本", "对端自报的名字把管理员填的盖掉了")
+        self.assertEqual(row["scopes"], "asr diarize")
+
+    def test_list_codes_shows_pending_codes_without_the_plaintext(self):
+        self._run("--new-client", "还没配对的机器", "--scopes", "asr")
+        rc, out = self._run("--list-codes")
+        self.assertEqual(rc, 0)
+        self.assertIn("还没配对的机器", out)
+        self.assertIn("剩余", out)
+        self.assertIn("只存哈希", out)
+
+    def test_show_client_prints_the_essentials(self):
+        paired = self._client()
+        rc, out = self._run("--show-client", paired["clientId"])
+        self.assertEqual(rc, 0)
+        for token in (paired["clientId"], "张三的办公本", "asr diarize", "token_version"):
+            self.assertIn(token, out)
+
+    def test_set_scopes_takes_effect_on_the_next_request(self):
+        """改 scopes **下一个请求就生效** —— 鉴权读的是库里的行，不是 JWT 里的声明。
+
+        所以既不需要"重新换令牌"，也不需要 bump `token_version`。
+        """
+        paired = self._client("改权限的", "asr diarize")
+        cfg = settings_mod.load(self.cfg_path)
+        store = auth_mod.open_store(cfg)
+        a = auth_mod.Auth(cfg, store)
+        basic = base64.b64encode(
+            ("%s:%s" % (paired["clientId"], paired["secret"])).encode()).decode()
+        tok = a.token_for("Basic " + basic)["accessToken"]
+        a.authenticate("Bearer " + tok, need_scope="diarize")        # 现在可以
+        store.close()
+
+        self.assertEqual(self._run("--set-scopes", paired["clientId"],
+                                   "--scopes", "asr")[0], 0)
+        # 新开一个 Auth（= 另一个进程/另一份缓存），复现真实时序
+        store2 = auth_mod.open_store(cfg)
+        self.addCleanup(store2.close)
+        a2 = auth_mod.Auth(cfg, store2)
+        a2.authenticate("Bearer " + tok, need_scope="asr")
+        with self.assertRaises(errors.EchoError) as ctx:
+            a2.authenticate("Bearer " + tok, need_scope="diarize")
+        self.assertEqual(ctx.exception.status, 403)
+
+    def test_disable_is_403_and_enable_restores_the_same_token(self):
+        """禁用是 403（认识你但不许用）；**启用之后原令牌直接能用**。
+
+        别把"启用"写成"要重新换令牌"：`disabled` 与 `token_version` 是两回事 ——
+        启用只把那一位置回 0，版本号没变、scopes 没变，手上那个 JWT 仍然有效。
+        """
+        paired = self._client("要禁用的", "asr")
+        cfg = settings_mod.load(self.cfg_path)
+        store = auth_mod.open_store(cfg)
+        a = auth_mod.Auth(cfg, store)
+        basic = base64.b64encode(
+            ("%s:%s" % (paired["clientId"], paired["secret"])).encode()).decode()
+        tok = a.token_for("Basic " + basic)["accessToken"]
+        store.close()
+
+        self.assertEqual(self._run("--disable", paired["clientId"])[0], 0)
+        store = auth_mod.open_store(cfg)
+        a = auth_mod.Auth(cfg, store)
+        with self.assertRaises(errors.EchoError) as ctx:
+            a.authenticate("Bearer " + tok, need_scope="asr")
+        self.assertEqual(ctx.exception.status, 403, "禁用该是 403，不是 401")
+        store.close()
+
+        self.assertEqual(self._run("--enable", paired["clientId"])[0], 0)
+        store = auth_mod.open_store(cfg)
+        a = auth_mod.Auth(cfg, store)
+        a.authenticate("Bearer " + tok, need_scope="asr")     # **同一个令牌**
+        store.close()
+
+    def test_rotate_secret_kills_both_the_old_secret_and_the_old_token(self):
+        """轮换：新 secret 能用，**旧令牌与旧 secret 都立刻失效**。
+
+        轮换同时把 `token_version` +1。理由：v1 没有宽限期，新 secret 只能由管理员
+        带外交给用户 —— 客户端本来就必须重新配对，那就没必要再留一个
+        "旧 JWT 还能用最多 1 小时"的窗口（留着反而容易让人以为轮换没生效）。
+        """
+        paired = self._client("要轮换的", "asr")
+        cfg = settings_mod.load(self.cfg_path)
+        store = auth_mod.open_store(cfg)
+        a = auth_mod.Auth(cfg, store)
+        old_basic = base64.b64encode(
+            ("%s:%s" % (paired["clientId"], paired["secret"])).encode()).decode()
+        old_tok = a.token_for("Basic " + old_basic)["accessToken"]
+        store.close()
+
+        rc, out = self._run("--rotate-secret", paired["clientId"])
+        self.assertEqual(rc, 0)
+        # 新 secret 是那行"只有它自己、没有空格"的输出
+        cands = [ln.strip() for ln in out.splitlines()
+                 if ln.strip() and " " not in ln.strip() and len(ln.strip()) > 20]
+        self.assertTrue(cands, "没打印出新 secret：%s" % out)
+        new_secret = cands[0]
+
+        store = auth_mod.open_store(cfg)
+        a = auth_mod.Auth(cfg, store)
+        with self.assertRaises(errors.EchoError):
+            a.authenticate("Bearer " + old_tok, need_scope="asr")
+        with self.assertRaises(errors.EchoError):
+            a.token_for("Basic " + old_basic)
+        new_basic = base64.b64encode(
+            ("%s:%s" % (paired["clientId"], new_secret)).encode()).decode()
+        self.assertTrue(a.token_for("Basic " + new_basic)["accessToken"])
+        store.close()
+
+    def test_unknown_client_ids_are_reported_cleanly(self):
+        """不存在的 id：**一句人话 + 退出码 1**，不是 traceback。
+
+        之前 `--revoke` 更糟：`store.revoke` 对不存在的行返回 0，
+        于是打印"已撤销 xxx（token_version → 0）"—— 看着像成功了。
+        """
+        for flag in ("--show-client", "--revoke", "--disable", "--enable",
+                     "--set-scopes", "--rotate-secret"):
+            with self.subTest(flag=flag):
+                rc, out = self._run(flag, "cli-does-not-exist")
+                self.assertEqual(rc, 1, out)
+                self.assertIn("没有这个客户端", out)
+
+    def test_version_only_ever_goes_up(self):
+        """轮换 +1、撤销再 +1 —— 版本号只增不减，否则旧令牌会"复活"。"""
+        paired = self._client("连着改的", "asr")
+        self._run("--rotate-secret", paired["clientId"])
+        self._run("--revoke", paired["clientId"])
+        cfg = settings_mod.load(self.cfg_path)
+        store = auth_mod.open_store(cfg)
+        self.addCleanup(store.close)
+        self.assertEqual(store.client(paired["clientId"])["token_version"], 3)
+
+
+class AuthSchemaMigrationTests(unittest.TestCase):
+    """`CREATE TABLE IF NOT EXISTS` **不会**给已存在的表补列。
+
+    所以给 `pairing_codes` 加 `name` / `scopes` 时，已经跑过的服务端
+    （开发机的 `data/backend-dev/auth.db`、容器里那个 state 卷）不会自动多出列来 ——
+    不补的话，`--new-client` 会在 INSERT 时报"no such column"，
+    而现象是"换了一台机器就好了"，很难查。
+    """
+
+    def test_old_schema_gets_the_new_columns_and_keeps_data(self):
+        path = os.path.join(tempfile.mkdtemp(prefix="echo-migrate-"), "auth.db")
+        # 造一个"旧版"库：只有当初那几列
+        db = sqlite3.connect(path)
+        db.executescript(
+            "CREATE TABLE clients (client_id TEXT PRIMARY KEY, name TEXT NOT NULL DEFAULT '',"
+            " secret_hash TEXT NOT NULL, scopes TEXT NOT NULL DEFAULT '',"
+            " token_version INTEGER NOT NULL DEFAULT 1, disabled INTEGER NOT NULL DEFAULT 0,"
+            " created_at REAL NOT NULL, updated_at REAL NOT NULL, last_seen REAL NOT NULL DEFAULT 0);"
+            "CREATE TABLE pairing_codes (code_hash TEXT PRIMARY KEY, created_at REAL NOT NULL,"
+            " expires_at REAL NOT NULL, created_by TEXT NOT NULL DEFAULT '',"
+            " client_id TEXT NOT NULL DEFAULT '');")
+        db.execute("INSERT INTO clients VALUES ('cli-old','老客户端','h','asr',1,0,1,1,0)")
+        db.commit()
+        db.close()
+
+        store = store_mod.Store(path)         # 打开 = 触发迁移
+        self.addCleanup(store.close)
+        self.assertIn("name", store.columns()["pairing_codes"])
+        self.assertIn("scopes", store.columns()["pairing_codes"])
+        self.assertEqual(store.client("cli-old")["name"], "老客户端", "迁移把数据弄丢了")
+
+    def test_new_columns_are_usable_right_away(self):
+        path = os.path.join(tempfile.mkdtemp(prefix="echo-migrate2-"), "auth.db")
+        store = store_mod.Store(path)
+        self.addCleanup(store.close)
+        store.put_pairing_code("h", 60, created_by="x", name="带名字的", scopes="asr")
+        row = store.pairing_codes()[0]
+        self.assertEqual((row["name"], row["scopes"]), ("带名字的", "asr"))
 
 
 if __name__ == "__main__":
