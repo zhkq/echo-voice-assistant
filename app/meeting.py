@@ -429,27 +429,188 @@ def _apply_capability_meta(meta: dict, cap_plan, cap_kinds) -> dict:
     return meta
 
 
-def _capability_asr_session(cfg):
-    """本场是否走**能力后端**。返回 `(router, need)` 或 `None`。
+def _session_slots(cfg, need_speaker=False):
+    """本场要向能力层要哪些槽。**顺序有讲究：说话人那一族按 `diarize.turns` → `speaker.embed`**。
 
-    ## 判据：计划里 `asr.text` 落到**本机以外**的后端
+    为什么要先 `diarize.turns`：`router.plan()` 的向量空间锁（L5）是**沿着槽的顺序**
+    推进的 —— 第一个同源槽定下本场的 `vectorSpaceId`，后面的候选都按它重判。
+    把 `speaker.embed` 排在前面，锁就由它定（同一个后端时结果一样，但语义上不对：
+    这场会先有分离，才谈得上"认出的这个人是谁"）。
 
-    这样"没配后端"的机器走的是**原来那段本地代码**（行为一模一样），
-    而配了 ECHO 后端/内网服务的机器就真的把音频发出去 —— 这是接线风险最小的形态：
-    新路径只在真的要用它的时候才生效。
+    `speaker.embed` 只在**声纹识别真的会用**时才要（`need_speaker`）：
+    `_capability_diarize_segment` 用的是 `diarize.turns` 那条缝，本环节不消费
+    `speaker.embed` —— 把它列进来只会在面板上多出一行"跳过了谁"，而那不是这场会的真相。
+    """
+    slots = ["asr.text", "asr.timestamps"]
+    if bool(cfg.get("diarize")):
+        slots.append("diarize.turns")
+        if need_speaker:
+            slots.append("speaker.embed")
+    return tuple(slots)
+
+
+def _skips_brief(plan, slot):
+    """把某一槽的 `skipped` 压成一句人话：`echo-server(absent);local(unsupported)`。
+
+    日志里要能一眼看出"为什么没用那个后端"，而 `Skipped.detail` 里那些长句子
+    （"它只提供 asr.text"…）留在 `meta.json` 里给面板展开看，不进日志行。
+    """
+    return ";".join("%s(%s)" % (s.backend_id or "-", s.reason)
+                    for s in plan.skipped if s.slot == slot) or "没配可用后端"
+
+
+def _first_reason(plan, slot):
+    """某一槽该报的降级原因（**权威十词之一**）。
+
+    用 `router.most_informative()` 挑：计划里会同时留下好几条 `skipped`，
+    其中 `absent`（"没配这个后端"）几乎必然出现，而真实原因可能是
+    `unsupported` / `blocked` —— 报 `absent` 会把用户往错的方向指
+    （他会去配一个**配了也没用**的后端）。挑不到就按 `absent`。
+    """
+    from app.capabilities.router import most_informative
+    best = most_informative([s for s in plan.skipped if s.slot == slot])
+    return best.reason if best else "absent"
+
+
+class _CapabilitySession(object):
+    """本场会议的能力路由会话：**一个 router + 一份槽清单 + 锁定的向量空间**。
+
+    为什么要一个对象而不是原来那个 `(router, need)` 二元组：
+    铁律 L5 要求"**同一场会议**不许混向量空间"，而 `router.call()` 是**每次调用各自
+    规划一次**的 —— 不把上一次锁到的空间带过来，第二次调用就可能规划到另一个后端
+    （`Need` 是 frozen 的，改不了，只能每次重建）。所以锁必须由调用方持有并传回去。
+
+    它同时钉住"会议这边**不自己 new 客户端**"：所有调用都经由 `router`，
+    `SAME_SOURCE_SLOTS` 的强制才不会被我绕过（任务里点名的那条）。
+
+    `__iter__` 是为了兼容既有用法（`router, need = session`）—— 它曾经就是个二元组。
+    """
+
+    __slots__ = ("router", "cfg", "slots", "vector_space_id")
+
+    def __init__(self, router, cfg, slots, vector_space_id=""):
+        self.router = router
+        self.cfg = cfg
+        self.slots = tuple(slots)
+        self.vector_space_id = str(vector_space_id or "")
+
+    def need(self):
+        """这一次调用要用的 `Need`（带上当前锁定的向量空间）。"""
+        from app.capabilities import Need
+        return Need(slots=self.slots, purpose="meeting",
+                    privacy="", vector_space_id=self.vector_space_id)
+
+    def plan(self):
+        """先规划一遍（**不联网、不调用**）：用来判"这场要不要走能力层"。"""
+        return self.router.plan(self.need())
+
+    def local_slots(self):
+        """每个槽的落点：`{槽: "local" | "empty"}` —— 只有**不归能力层**的槽在里面。
+
+        为什么需要这个：会话是**按整场**建的（"有没有槽落在本机以外"），
+        而"这段代码走哪条路"是**按槽**定的。只点名了分离的机器上，
+        会话存在、但 `asr.text` 归本机 —— 那时转写必须走原来那段本地代码，
+        而不是把 `asr.text` 交给能力层再失败一次（`router.call` 在没有本机客户端时
+        只会抛 `absent`，整个转写就没了）。
+
+        两种情形，**不要混为一谈**（`docs/能力路由` §5.1 专门把这两种分开）：
+
+          * `"local"` —— 计划**明确**落在本机（用户点名 local；或本机客户端在那儿、
+            默认链转到了它）。这是"他选的主选"，不是降级，日志按 info 记。
+          * `"empty"` —— 计划里这一槽**谁都干不了**（没有注册的后端能提供它）。
+            会议这边仍然回落到本机那段代码（总比整场空着强），但**必须留一条 warn
+            带权威 `reason`** —— 用户会问"我配了后端，这场为什么没有说话人"，
+            而答案是 `unsupported` / `blocked`（privacy 挡住）之类的具体原因。
+
+        判据是"计划的候选池里有没有这个槽"，不是"有没有注册本机客户端"：
+        本机没装引擎时它也注册着（`provides` 为空），拿它当"归本机"会掩盖真正的失败。
+        """
+        plan = self.plan()
+        out = {}
+        for slot in self.slots:
+            backend = plan.backend_for(slot)
+            if backend == "local":
+                out[slot] = "local"
+            elif plan.candidates.get(slot):
+                continue                    # 有能干的 → 归能力层
+            elif any(s.backend_id == "local" for s in plan.skipped if s.slot == slot):
+                out[slot] = "local"         # 本机候选被跳过（例如它没装这个能力）
+            else:
+                out[slot] = "empty"
+        return out
+
+    def note_local_and_empty(self):
+        """把"哪些槽不归能力层、为什么"写进日志。返回 `local_slots()` 的结果。
+
+        放在这里而不是散在调用处：这句话**一场只该说一次**（8 段会议连说 8 遍
+        会把日志淹掉），而空槽的原因正是排障要的第一手信息。
+        """
+        out = self.local_slots()
+        for slot, kind in sorted(out.items()):
+            if kind == "local":
+                continue
+            plan = self.plan()
+            db.add_log("warn", "capability",
+                       "本场 %s 走不了能力后端（reason=%s）：%s —— 这一槽回落本机"
+                       % (slot, _first_reason(plan, slot), _skips_brief(plan, slot)))
+        return out
+
+    def call(self, slot, **kw):
+        """按槽调用；成功后把锁推进到这次实际生效的向量空间。
+
+        `plan.vector_space_id` 只在"这次真的选出了同源后端"时才有值
+        （`router.plan` 里锁是**第一次拿到向量时**写进计划的），所以这里刻意
+        不把空值写回来 —— 那会把已经锁好的空间抹掉，等于给跨空间回退开门。
+        """
+        result, plan = self.router.call(slot, self.need(), **kw)
+        locked = str(getattr(plan, "vector_space_id", "") or "")
+        if locked:
+            self.vector_space_id = locked
+        return result, plan
+
+    def with_speaker_slot(self, slots):
+        """换一份槽清单（判"要不要走能力层"时先不算声纹槽，判完再补上）。"""
+        self.slots = tuple(slots)
+        return self
+
+    def __iter__(self):
+        # 兼容 `router, need = session` 这种老写法（`need` 是**当场算出来的快照**，
+        # 与 `call()` 里那份等价 —— 只要中间没有别的调用推进锁）。
+        return iter((self.router, self.need()))
+
+
+def _capability_asr_session(cfg, need_speaker=False):
+    """本场是否走**能力后端**。返回 `_CapabilitySession` 或 `None`。
+
+    ## 判据：计划里**任何一个会议槽**落到本机以外的后端
+
+    早先这条只问 `asr.text`（step 3 只接了转写）。step 4 把分离也接上之后，
+    "只问 asr.text"会漏掉一种真实配置：转写点名用本机、分离点名用 ECHO 后端
+    （台式机有 GPU 转写、但没装 pyannote）。那种机器上，走哪一段代码**按槽分开**：
+    `asr.text` 落本机 → 文本走原来那段本地代码；`diarize.turns` 落后端 → 分离走能力层。
 
     为什么不是"永远走路由器"：那会要求本机后端与原来那段代码**逐字节等价**，
     而那段代码包含 SenseVoice 文本 + whisper 骨架的对齐、qwen3asr 的原生句子、
     whisper 的 segments、以及各自的空结果留痕 —— 一次性替换它风险太高，
     收益也只是"代码好看一点"。**先把远端这条路打通**，本地那条等它被证明可靠再收。
+
+    **没配后端（也没配对）时行为逐字不变**：所有槽都落到本机 → 返回 None →
+    `_transcribe_impl` 走原来那段本地代码（含原来的 `diarize_wav_full`）。
     """
     try:
-        from app.capabilities import Need, build_default_router
+        from app.capabilities import build_default_router
         router = build_default_router()
-        need = Need(slots=("asr.text", "asr.timestamps"), purpose="meeting")
-        plan = router.plan(need)
-        picked = plan.backend_for("asr.text")
-        if not picked or picked == "local":
+        base_slots = _session_slots(cfg, need_speaker=False)
+        session = _CapabilitySession(router, cfg, base_slots)
+        plan = session.plan()
+        # 带上声纹槽再规划一次（`need_speaker`）—— 判据只看"有没有落在本机之外"，
+        # 多一个槽只会让计划更完整，不会把本机结果变成远端结果。
+        if need_speaker and "diarize.turns" in base_slots:
+            session.with_speaker_slot(_session_slots(cfg, need_speaker=True))
+            plan = session.plan()
+
+        live = [(s, plan.backend_for(s)) for s in session.slots]
+        if not any(bid and bid != "local" for _s, bid in live):
             # 配了后端但这一轮用不上 —— **要说清楚为什么**，否则用户以为它在用后端，
             # 实际在啃本机 CPU，而现象只是"转写很慢"（本机那条路的日志一切正常）。
             # 最常见的两种：后端地址配了但连不上（capabilities 拉不回来 → 不支持任何槽）、
@@ -460,21 +621,30 @@ def _capability_asr_session(cfg):
             # 会一声不响地退回本机 —— 而"不声不响"恰恰是这条告警要防的那件事。
             from app.capabilities import echo_server as _echo_backend
             if _echo_backend.configured():
-                why = "；".join("%s(%s)" % (s.backend_id or "-", s.reason)
-                               for s in plan.skipped if s.slot == "asr.text") or "没配可用后端"
+                why = "；".join("%s=%s[%s]" % (s, b or "-", _skips_brief(plan, s))
+                                for s, b in live)
                 db.add_log("warn", "capability",
                            "配了能力后端，但本场仍走本机引擎 —— 原因：%s" % why)
+                # 分离这一条单独吼一声：`asr.text` 有本机兜底（走原来那段代码），
+                # 而 `diarize.turns` **没有**（§5.1）—— 用户以为配了就会有说话人，
+                # 实际这一场一个说话人标签都不会有，而表现只是"分离没生效"。
+                if "diarize.turns" in session.slots:
+                    db.add_log("warn", "capability",
+                               "本场不会标说话人：说话人分离没有本机兜底（设计 §5.1），"
+                               "而 %s" % _skips_brief(plan, "diarize.turns"))
             return None
+        who = "，".join("%s→%s" % (s, b) for s, b in live if b) or "（没有槽被选中）"
         db.add_log("info", "capability",
-                   "本场转写走能力后端：%s（%s）"
-                   % (picked, plan.picks["asr.text"].reason))
-        return router, need
+                   "本场会议走能力后端：%s%s" % (
+                       who, "（向量空间 %s）" % plan.vector_space_id
+                       if plan.vector_space_id else ""))
+        return session
     except Exception as e:
         db.add_log("warn", "capability", f"能力路由不可用，本场回落本地引擎：{e}")
         return None
 
 
-def _capability_skeleton(router, need, seg_path, cfg):
+def _capability_skeleton(cap, seg_path, cfg):
     """从 `asr.timestamps` 槽要一份时间骨架。**要不到就当没有**（不抛、不假装）。
 
     为什么值得单独要一次：`asr.text` 与 `asr.timestamps` **可以是两个不同的后端**
@@ -487,36 +657,158 @@ def _capability_skeleton(router, need, seg_path, cfg):
     （`transcribe(want_timestamps=True)` 会传 `timestamps=1`），不该白跑一趟。
     """
     try:
-        res, _plan = router.call("asr.timestamps", need, wav=seg_path,
-                                lang=cfg.get("sttLanguage", "zh"), want_timestamps=True)
+        res, _plan = cap.call("asr.timestamps", wav=seg_path,
+                              lang=cfg.get("sttLanguage", "zh"), want_timestamps=True)
         return res.sentences
     except Exception as e:
         db.add_log("debug", "capability", f"没拿到时间骨架，按字数均摊：{e}")
         return ()
 
 
-def _capability_segment_rows(router, need, seg_path, cfg, seg_idx, seg_min, cap_kinds):
-    """一段音频走能力后端 → `(seg_rows, plan_dict)`。
+def _capability_segment_rows(cap, seg_path, cfg, seg_idx, seg_min, cap_kinds):
+    """一段音频走能力后端 → `(seg_rows, plan_dict, got)`。
 
     **刻意抽出来**，不塞在 `_transcribe_impl` 的大循环里：验收这段逻辑需要构造
     "一场会议 + meta.json + 一个库 + 一个 wav"，而它自己只依赖
-    `(router, need, wav 路径, 几个设置值)`。混在那个 350 行的函数里测，
+    `(会话, wav 路径, 几个设置值)`。混在那个 350 行的函数里测，
     夹具就得把 `db`、`meta`、导出、后台线程全桩掉 —— 实测那样会**污染后面的测试文件**
     （Windows 上删不掉临时库、`database is locked`），而且报错出现在别人那里。
+
+    `cap` 是 `_CapabilitySession`（原来是 `(router, need)` 二元组；改成对象是为了让
+    `asr.text` 与 `diarize.turns` **共用同一个向量空间锁**，见 `_CapabilitySession`）。
 
     `cap_kinds` 是就地累加的档位计数（`{exact: 3, estimated: 1}`），最终写进 `meta.json`。
     """
     lang = cfg.get("sttLanguage", "zh")
     seg_sec = _wav_seconds(seg_path) or seg_min * 60.0
-    res, plan = router.call("asr.text", need, wav=seg_path, lang=lang,
-                            want_timestamps=True)
+    res, plan = cap.call("asr.text", wav=seg_path, lang=lang, want_timestamps=True)
     # 后端自己给了句级时间轴就直接用；没给就去 `asr.timestamps` 槽要骨架
     # （**可能与文本是不同的后端** —— 那正是槽清单分开的意义）。
-    skeleton = () if res.sentences else _capability_skeleton(router, need, seg_path, cfg)
+    skeleton = () if res.sentences else _capability_skeleton(cap, seg_path, cfg)
     got = assemble.assemble(text=res.text, sentences=res.sentences,
                             skeleton=skeleton, seg_seconds=seg_sec)
     cap_kinds[got.timestamps] = cap_kinds.get(got.timestamps, 0) + 1
     return [(seg_idx, st, en, txt) for st, en, txt in got.sentences], plan.as_dict(), got
+
+
+def _normalize_diarize(result):
+    """把能力层的 `DiarizeResult` 归一成 `diarize_wav_full()` 的形状。
+
+    返回 `(turns, embs, labels)`：
+      * `turns`  —— `[(start, end, 局部标签), …]`（与 pyannote 同形）
+      * `embs`   —— `(n, dim)` float32，**numpy 数组**（`SpeakerRegistry` 与
+                    `voiceprint.identify` 直接对它做 `np.stack` / 索引）
+      * `labels` —— `list[str]`，且**每个标签都能在 embs 里找到下标**
+                    （`registry.map(embs, labels)` 会按 `labels[i]` 取名字）
+
+    两处坑，都在这里挡住：
+
+    ① **局部标签不一定是 `SPEAKER_xx`。** 契约只保证"这个字符串在本次响应内标识一个
+       说话人"（`base.DiarizeResult` 的注释就是这么写的）。所以这里不解析、不改写标签，
+       原样交给 `SpeakerRegistry` —— 它只把标签当字典的键，显示名（`说话人N`）由它自己出。
+
+    ② **嵌入可能是稀疏的。** `speakers` 与 `labels` 是两条信息，只有"对得上"时
+       第 i 个嵌入才属于第 i 个标签。这里**按标签取嵌入**（`speakers[k]`），
+       缺谁就不给谁 —— 宁可少一个人，也不要给错人的向量（比错的后果是认错人且不报错）。
+    """
+    import numpy as np
+
+    turns = [(float(a), float(b), str(s)) for a, b, s in (result.turns or ())]
+    speakers = {str(k): v for k, v in (result.speakers or {}).items()}
+    labels = [str(k) for k in speakers]
+    dim = int(result.dim or 0)
+    if not dim and labels:
+        dim = len(speakers[labels[0]] or ())
+    if not labels or dim <= 0:
+        # 没有嵌入：给一个**形状合法**的空数组（0 行、dim 列），
+        # 让 `registry.map(embs, labels)` 走它自己的 n == 0 分支而不是崩在 `axis=1` 上。
+        return turns, np.zeros((0, max(dim, 1)), dtype=np.float32), []
+    embs = np.asarray([speakers[k] for k in labels], dtype=np.float32).reshape(
+        len(labels), dim)
+    return turns, embs, labels
+
+
+def _capability_diarize_segment(cap, seg_path):
+    """一段音频走能力层的 `diarize.turns` → `(turns, embs, labels, plan_dict)`。
+
+    形状与 `diarize_wav_full()` **逐字对齐**（见 `_normalize_diarize`）—— 会议那边
+    落库/合并/声纹识别那几段代码**一行都不用改**，这正是 step 4 敢接的前提。
+
+    四种返回要分清（前三种调用方走原来那段本地代码）：
+
+      * 本场压根不做分离（槽不在会话里）→ 全 `None`；
+      * 计划把 `diarize.turns` 派给本机（**用户显式选的本机**，不是兜底）→ 全 `None`；
+      * 能力层这一槽失败 → 全 `None`（+ 一条带 `reason` 的 warn），**不冒充**成功；
+      * 拿到结果 → `(turns, embs, labels, plan.as_dict())`。
+
+    为什么失败之后**还允许**调用方落回本机那段代码：`_capability_asr_session` 的判据
+    已经把"没配后端"的机器挡在外面了（那些机器根本进不到这里）；能进到这里而这一槽
+    失败的情形只有"配了后端但这一槽用不了"（后端没这个模型 / privacy 挡住 / 熔断）。
+    那时**回落到用户自己装了的本机引擎**是 §5.1 允许的"他选的主选"，不是被取消的那种
+    "自动兜底"；而且失败原因已经写进日志，不会变成"静默降级"。
+    """
+    if "diarize.turns" not in cap.slots:
+        return None, None, None, None
+    if "diarize.turns" in cap.local_slots():
+        # 这一槽的活不归能力层（用户点名了本机，或这一槽谁都干不了）。
+        # **这里刻意不写 warn**：那句话说一次就够（`note_local_and_empty()` 在开会话时
+        # 已经说过了，带权威 reason），8 段会议连说 8 遍只会把日志淹掉。
+        # 调用方据此走原来那段 `diarize_wav_full` 代码 —— 与今天逐字一致。
+        return None, None, None, None
+    try:
+        res, plan = cap.call("diarize.turns", wav=seg_path)
+    except Exception as e:
+        reason = getattr(e, "reason", "") or "error"
+        db.add_log("warn", "capability",
+                   "说话人分离这一槽走不了能力后端（reason=%s）：%s" % (reason, e))
+        return None, None, None, None
+    turns, embs, labels = _normalize_diarize(res)
+    db.add_log("debug", "capability",
+               "本段说话人分离来自 %s（向量空间 %s，%d 个说话人）"
+               % (res.provenance.backend_id or "?", res.vector_space_id or "?", len(labels)))
+    return turns, embs, labels, plan.as_dict()
+
+
+def _merge_capability_plans(*plans):
+    """把几份执行计划合成一份写进 `meta.json`（后给的槽覆盖先给的）。
+
+    为什么要合：`asr.text` 与 `diarize.turns` 是**两次独立的 `router.call()`**，
+    各自返回的计划里只有"这次实际用了谁"。只写其中一份，面板上就会缺一个槽 ——
+    而"这场会到底用了谁"正是这个字段存在的唯一理由。
+
+    只做浅合并，**不做业务判断**：`picks` 按槽覆盖，`skipped` 去重后保留全部
+    （排障时"谁被跳过、为什么"越多越好），`vectorSpaceId` 取最后一份非空的。
+
+    传进来的可能是 `as_dict()` 出来的字典（也可能有 `None`），一律容错 ——
+    它是往盘上写的路径，坏一个字段不该让整场转写挂掉。
+    """
+    out = {"picks": {}, "skipped": [], "notes": []}
+    seen_skips = set()
+    for plan in plans:
+        if not isinstance(plan, dict):
+            continue
+        picks = plan.get("picks")
+        if isinstance(picks, dict):
+            out["picks"].update(picks)
+        for item in (plan.get("skipped") or []):
+            if not isinstance(item, dict):
+                continue
+            key = (item.get("slot"), item.get("backendId"), item.get("reason"))
+            if key in seen_skips:
+                continue
+            seen_skips.add(key)
+            out["skipped"].append(item)
+        if plan.get("vectorSpaceId"):
+            out["vectorSpaceId"] = plan["vectorSpaceId"]
+        notes = plan.get("notes")
+        if isinstance(notes, list):
+            out["notes"].extend(str(n) for n in notes)
+        cands = plan.get("candidates")
+        if isinstance(cands, dict):
+            out.setdefault("candidates", {}).update(cands)
+    if not out["notes"]:
+        out.pop("notes")
+    return out
 
 
 def _fallback_sv_rows(sv, wmodel, seg_path, seg_idx, seg_min, cfg):
@@ -620,7 +912,10 @@ def _transcribe_impl(folder):
     registry = None
     if diarize:
         try:
-            from app.audio.diarize import diarize_wav_full, SpeakerRegistry
+            # 这里仍然要 import，因为**本机分离那条路**（第一步没配后端）继续用它：
+            # 能力层只是"有后端时"的另一条缝，不是替换（见 `_capability_diarize_segment`）。
+            # `diarize_wav_full` 本身在下面按需导入（step 4 起它不再无条件执行）。
+            from app.audio.diarize import SpeakerRegistry
             registry = SpeakerRegistry()
         except Exception as e:
             print("说话人分离模块不可用，跳过:", e, file=sys.stderr)
@@ -654,20 +949,43 @@ def _transcribe_impl(folder):
     wmodel = None
     sv = None
     asr_provider = _active_asr_provider()          # P5：显式配了 providerAsr 才走在线/外部转写
-    # 3.0 能力后端：**只有计划把 asr.text 派到本机以外**时才不是 None。
-    # 与 providerAsr 的分工：providerAsr 是"用户显式配了一个在线转写服务"（P5，既有）；
-    # 能力路由是"按槽选后端"（3.0，可能选到 ECHO 后端/内网公共服务）。
+    # 3.0 能力后端：**只有计划里至少一个会议槽落在本机以外**时才不是 None（见
+    # `_capability_asr_session` 的判据）。与 providerAsr 的分工：providerAsr 是
+    # "用户显式配了一个在线转写服务"（P5，既有）；能力路由是"按槽选后端"（3.0）。
     # **providerAsr 优先** —— 那是用户已经配好、且在跑的路径，不能被悄悄换掉。
-    cap_session = None if asr_provider is not None else _capability_asr_session(cfg)
+    #
+    # `need_speaker`：这一场**会不会真的用声纹板**（v2 的"识别说话人是谁"）。
+    # 声纹开着但没有联系人样本时 `load_matcher()` 返回 None —— 那种情况下
+    # 不该把 `speaker.embed` 列进计划（面板上会多一行"跳过了谁"，而那不是这场会的真相）。
+    need_speaker = False
+    if diarize and vp_matcher is not None:
+        need_speaker = True
+    cap_session = (None if asr_provider is not None
+                   else _capability_asr_session(cfg, need_speaker=need_speaker))
+    # 会话是**按整场**建的（"有没有槽落在本机以外"），而"这段代码走哪条路"要**按槽**定：
+    #   * `asr.text` 归本机（用户点名 local，或这一槽没有可用后端）→ 文本走原来那段本地代码；
+    #     **`diarize.turns` 仍可能走后端** —— 正是"台式机自己转写、分离发给 GPU"那种配置。
+    #   * 反过来，转写走后端而分离归本机也一样。
+    # 不这么分的话，只配了分离的机器上会拿 `asr.text` 去问一个没有本机客户端的路由，
+    # 结果是一条 `absent` 错误、**整场转写一行都没有**。
+    #
+    # `note_local_and_empty()` 就在这个岔口上说一句话：哪些槽不归能力层、为什么
+    # （空槽带权威 reason）。整场只在这里说一次。
+    cap_local = (cap_session.note_local_and_empty() if cap_session is not None
+                 else {})
+    asr_is_local = cap_session is None or "asr.text" in cap_local
     if asr_provider is not None:
         # 走 provider 时**不加载本地引擎**（省显存/省时间；也正是"没有 GPU 也能转写"的意义）
         db.add_log("info", "meeting", "本场转写走 provider（不加载本地模型）：%s"
                    % _asr_provider_id())
-    elif cap_session is not None:
+    elif not asr_is_local:
         # 走远端能力后端时**同样不加载本地引擎** —— 这正是"办公本没有 GPU 也能转写"的意义。
         # 引擎留给"远端失败时回落本地"那条路按需加载（见循环里的兜底）。
         db.add_log("info", "meeting", "本场转写走能力后端（不加载本地模型）")
     elif use_sv:
+        if cap_session is not None:
+            db.add_log("info", "meeting",
+                       "本场转写按计划走本机（分离那一槽才走后端）")
         wmodel = stt_mod._get_whisper("small", cfg.get("sttDevice", "auto"))
         if sv_kind == "qwen3asr":
             sv = stt_mod._get_qwen3asr(cfg.get("sttDevice", "auto"),
@@ -683,6 +1001,7 @@ def _transcribe_impl(folder):
     #: 设计 §4.4 要求执行计划按会议生成一次并落盘 —— 否则"这次为什么走了本机"
     #: 事后完全查不出来（面板与导出都只能看到一个转写结果）。
     cap_plan = None
+    asr_plan = None        # asr.text 那次调用留下的计划（`diarize.*` 没跑时用它）
     cap_kinds = {}
     for i, seg in enumerate(segs, start=1):
         seg_idx = int(seg.split(".")[0])
@@ -708,13 +1027,12 @@ def _transcribe_impl(folder):
             except Exception as e:
                 db.add_log("error", "meeting",
                            f"{meeting_name} 第{i}段转写失败（provider）：{e}")
-        elif cap_session is not None:
+        elif not asr_is_local:
             # 3.0：文本走能力后端，时间轴由**拼装层**统一决定（设计 §4.4）。
-            router, need = cap_session
             try:
                 seg_rows, plan_dict, got = _capability_segment_rows(
-                    router, need, seg_path, cfg, seg_idx, seg_min, cap_kinds)
-                cap_plan = cap_plan or plan_dict
+                    cap_session, seg_path, cfg, seg_idx, seg_min, cap_kinds)
+                asr_plan = plan_dict          # 最近一次调用的计划（跳过的项也在这里）
                 if not seg_rows:
                     # 空结果**显式留痕**（与本地那条路同一个纪律）：
                     # 区分"这段没人说话"与"后端出了问题"
@@ -758,8 +1076,21 @@ def _transcribe_impl(folder):
             _set_progress(meeting_id, phase="说话人分离", seg_index=i, seg_total=seg_total,
                           percent=percent, detail=f"第 {i}/{seg_total} 段 · 分离说话人")
             try:
-                from app.audio.diarize import diarize_wav_full
-                turns_raw, embs, labels = diarize_wav_full(seg_path)
+                # 3.0（step 4）：分离先问能力路由的 `diarize.turns` 槽。
+                # 返回 None 的几种情况都退回**原来那段本机代码**（形状已经归一，见
+                # `_normalize_diarize`）：本场没有这个槽 / 这一槽按计划归本机 /
+                # 这一槽失败 / 本场压根没开会话（`cap_session is None` = 没配后端）。
+                # 失败时那条 warn 已经在 `_capability_diarize_segment` 里写过了 ——
+                # 所以这里**不再重复**报错，只是走本机（最坏情况与今天逐字一致）。
+                turns_raw = embs = labels = None
+                if cap_session is not None:
+                    turns_raw, embs, labels, dia_plan = _capability_diarize_segment(
+                        cap_session, seg_path)
+                    if dia_plan:
+                        cap_plan = dia_plan
+                if turns_raw is None:
+                    from app.audio.diarize import diarize_wav_full
+                    turns_raw, embs, labels = diarize_wav_full(seg_path)
                 label_map = registry.map(embs, labels)
                 key_map = {}
                 for plabel, disp in label_map.items():
@@ -770,6 +1101,8 @@ def _transcribe_impl(folder):
                 turns = [(s, e, key_map[spk]) for s, e, spk in turns_raw]
                 seg_rows = _assign_speakers(seg_rows, turns)
                 # 声纹识别：本段每个说话人找常用联系人，整场累计（取相似度最高的一次）
+                # 注意这里不需要"注册"：`diarize.turns` 那一次调用**同时带回了每个说话人
+                # 的嵌入**（`DiarizeResult.speakers`）—— 声纹用的就是它，与分离同源。
                 if vp_matcher is not None:
                     try:
                         from app import voiceprint
@@ -818,7 +1151,14 @@ def _transcribe_impl(folder):
         # 3.0：把这次"用了谁/跳过了谁/为什么"与时间轴档位落盘。
         # 为什么每次都写：转写可能中途崩/被重启，**已完成的段也要留下当时的路由结论**，
         # 否则事后只能看到"转了一半"，而不知道为什么后半段没走。
-        _apply_capability_meta(meta, cap_plan, cap_kinds)
+        # 两份计划要合起来看：`asr_plan` 有转写那一槽、`cap_plan`（分离那次调用）
+        # 多了 `diarize.turns` —— 只写其中一份，面板上就会缺一个槽，
+        # 而"这场会每个槽各用了谁"正是这个字段存在的唯一理由。
+        if cap_plan and asr_plan:
+            seg_plan = _merge_capability_plans(asr_plan, cap_plan)
+        else:
+            seg_plan = cap_plan or asr_plan
+        _apply_capability_meta(meta, seg_plan, cap_kinds)
         with open(os.path.join(folder, "meta.json"), "w", encoding="utf-8") as f:
             json.dump(meta, f, ensure_ascii=False, indent=2)
 
