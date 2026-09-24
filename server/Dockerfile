@@ -11,25 +11,33 @@
 # 带上高精度转写与说话人分离（体积大、要 GPU）：
 #     docker build -f server/Dockerfile --build-arg ECHO_EXTRA=1 -t echo-backend:0.1.0-full .
 #
-# 跑（只读根 + 唯一可写处是临时卷；GPU 直通见 §9.2）：
+# 跑（只读根 + 两个可写挂载：临时卷 + 状态卷；GPU 直通见 §9.2）：
 #     docker run -d --name echo-backend --gpus all \
 #       --read-only \
 #       -v /srv/echo/tmp:/var/echo/tmp \
+#       -v /srv/echo/state:/var/echo/state \
 #       -v /srv/echo/models:/opt/echo/models:ro \
 #       -p 8900:8900 \
 #       -e ECHO_MODELS_ROOT=/opt/echo/models \
 #       -e ECHO_TMP_ROOT=/var/echo/tmp \
+#       -e ECHO_STATE_ROOT=/var/echo/state \
 #       echo-backend:0.1.0
 #
-# 临时文件是**落盘**的（按日期分目录 + 定时清理，见 server/tmp.py）。
-# 想白拿内存盘就把挂载点换成 tmpfs：
-#     --tmpfs /var/echo/tmp:size=4g
+# **两个卷的保留策略是相反的，别合并、别搞错：**
+#
+#   /var/echo/tmp    临时文件（按日期分目录 + 定时清理，见 server/tmp.py）。
+#                    丢了没关系，甚至可以换成内存盘白拿性能：
+#                        --tmpfs /var/echo/tmp:size=4g
+#   /var/echo/state  **耐久**状态：鉴权库（clients / pairing_codes）。
+#                    **绝对不要挂 tmpfs、也不要和 tmp 共用一个卷** ——
+#                    丢了就要把所有客户端重新配对一遍。
 # =====================================================================
 FROM python:3.11-slim
 
 ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
-    ECHO_TMP_ROOT=/var/echo/tmp
+    ECHO_TMP_ROOT=/var/echo/tmp \
+    ECHO_STATE_ROOT=/var/echo/state
 
 WORKDIR /opt/echo
 
@@ -54,7 +62,8 @@ RUN if [ "$ECHO_EXTRA" = "1" ]; then \
 COPY server/ /opt/echo/server/
 COPY app/ /opt/echo/app/
 
-VOLUME ["/var/echo/tmp"]
+# 两个可写挂载点（见文件头的说明：保留策略相反，别合并）
+VOLUME ["/var/echo/tmp", "/var/echo/state"]
 EXPOSE 8900
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \

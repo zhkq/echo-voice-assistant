@@ -22,6 +22,11 @@ DEFAULTS: Dict[str, Any] = {
         "listen": "0.0.0.0:8900",
         "instance_id": "default",       # 临时目录的命名空间（多实例互不清扫）
         "vram_budget_mb": 0,            # 0 = 不限制（CPU-only 或显存充足）
+        # **耐久**状态（鉴权库）放哪。**故意与 `tmp.root` 分开**：
+        # tmp 是"随便删"的（还会被清理器扫、可以挂 tmpfs 换性能），
+        # 而鉴权库存着客户端凭据 —— 放一起意味着"照文档把 tmp 换成 tmpfs
+        # 就会把配过的所有客户端清空"。两种相反的保留策略不能共用一个目录。
+        "state_root": "",               # 空 = {ECHO}/data/server-state
     },
     "limits": {
         "max_concurrent": 2,            # 服务端总通道
@@ -47,10 +52,26 @@ DEFAULTS: Dict[str, Any] = {
         # **默认关**：本机起步（127.0.0.1）不该先跟凭据较劲。
         # 但监听地址不是回环时启动会**大声告警**（见 main.lifespan）——
         # 不配鉴权就等于"谁连上谁能用你的 GPU"，生产必须打开。
-        # 配对码 → client_id + secret → 短期 JWT 见设计 §7.4/§7.5（下一步）。
         "enabled": False,
-        "mode": "token",                # token（v1）| mtls（预留）
-        "tokens": [],                   # [{"client_id": "...", "token": "..."}]；v1 够用
+        # token = 静态令牌（**v1 起步用**，手工发凭据）
+        # jwt   = 配对码 + secret + 短期 JWT（设计 §7.4/§7.5，多人时用这个）
+        "mode": "token",
+        "tokens": [],                   # [{"client_id": "...", "token": "...", "scopes": "asr"}]]
+        # ---- mode=jwt 时才有意义 ----
+        # **必须自己配**。刻意不"没配就随机生成一个"：那会让进程一重启
+        # 所有客户端全部 401，而现象很难联想到"密钥每次都是新的"。
+        # 生成：openssl rand -hex 32
+        "jwt_secret": "",
+        "token_ttl_s": 3600,            # 短期令牌 1 小时（不做 refresh token）
+        "clock_skew_s": 60,             # 内网机器时钟未必准
+        "pairing_enabled": True,        # 关掉之后新机器进不来（老的照用）
+        "pairing_ttl_s": 900,           # 配对码 15 分钟
+        "pair_window_s": 300,           # 失败退避窗口
+        "pair_max_failures": 5,         # 窗口内失败几次开始退避
+        "cache_ttl_s": 60,              # client 行缓存多久（撤销走主动失效，不靠它）
+        "revoke_poll_s": 5,             # 跨进程撤销的发现间隔（设计 §7.5 ④：≤5 秒）
+        "default_scopes": "",           # 空 = 新配对客户端没有额外限制
+        "db": "",                       # 空 = {tmp.root}/echo-server-auth.db
     },
 }
 
@@ -74,11 +95,33 @@ def _deep_merge(base: dict, over: dict) -> dict:
     return out
 
 
+_TRUTHY = ("1", "true", "yes", "on", "y", "t")
+_FALSY = ("0", "false", "no", "off", "n", "f")
+
+
+def _env_bool(name: str) -> Optional[bool]:
+    """环境变量里的布尔。**认不出来就返回 None**（当作没设），不猜。
+
+    容器编排工具里 `"false"` 是个字符串，而 Python 里非空字符串都是真 ——
+    直接 `bool(os.environ[...])` 会让 `ECHO_AUTH_ENABLED=false` 变成**打开鉴权**。
+    这类静默反向是配置层最贵的错。
+    """
+    raw = str(os.environ.get(name, "") or "").strip().lower()
+    if raw in _TRUTHY:
+        return True
+    if raw in _FALSY:
+        return False
+    return None
+
+
 def _env_overrides() -> dict:
     """环境变量覆盖（容器里最方便的一层）。
 
-    只认少数几个真正需要按环境变的：
-        ECHO_SERVER_ID / ECHO_LISTEN / ECHO_TMP_ROOT / ECHO_MODELS_ROOT / ECHO_MAX_CONCURRENT
+    只认少数几个真正需要按环境变的。契约（哪些变量真的被读）由
+    `tests/test_server_contract.py::EnvOverrideTests` 盯着：它会**扫
+    `server/compose.yaml` 与 `server/echo-server.example.yaml` 里出现的每一个
+    `ECHO_*` 名字**，逐个确认这里真的处理了 —— 写进部署文件的变量名不被读，
+    是最容易发生、又最难发现的一种谎（服务照着文档配，行为却完全没变）。
     """
     out: Dict[str, Any] = {}
     if os.environ.get("ECHO_SERVER_ID"):
@@ -87,6 +130,8 @@ def _env_overrides() -> dict:
         out.setdefault("server", {})["listen"] = os.environ["ECHO_LISTEN"]
     if os.environ.get("ECHO_TMP_ROOT"):
         out.setdefault("tmp", {})["root"] = os.environ["ECHO_TMP_ROOT"]
+    if os.environ.get("ECHO_STATE_ROOT"):
+        out.setdefault("server", {})["state_root"] = os.environ["ECHO_STATE_ROOT"]
     if os.environ.get("ECHO_MODELS_ROOT"):
         out.setdefault("models", {})["root"] = os.environ["ECHO_MODELS_ROOT"]
     if os.environ.get("ECHO_MAX_CONCURRENT"):
@@ -94,6 +139,25 @@ def _env_overrides() -> dict:
             out.setdefault("limits", {})["max_concurrent"] = int(os.environ["ECHO_MAX_CONCURRENT"])
         except ValueError:
             pass
+    if os.environ.get("ECHO_PER_CLIENT_CONCURRENT"):
+        try:
+            out.setdefault("limits", {})["per_client_concurrent"] = \
+                int(os.environ["ECHO_PER_CLIENT_CONCURRENT"])
+        except ValueError:
+            pass
+    if os.environ.get("ECHO_DEVICE"):
+        out.setdefault("models", {})["device"] = os.environ["ECHO_DEVICE"]
+
+    enabled = _env_bool("ECHO_AUTH_ENABLED")
+    if enabled is not None:
+        out.setdefault("auth", {})["enabled"] = enabled
+    if os.environ.get("ECHO_AUTH_MODE"):
+        out.setdefault("auth", {})["mode"] = os.environ["ECHO_AUTH_MODE"]
+    if os.environ.get("ECHO_JWT_SECRET"):
+        out.setdefault("auth", {})["jwt_secret"] = os.environ["ECHO_JWT_SECRET"]
+    pairing = _env_bool("ECHO_PAIRING_ENABLED")
+    if pairing is not None:
+        out.setdefault("auth", {})["pairing_enabled"] = pairing
     return out
 
 
@@ -149,6 +213,19 @@ class Config:
             return root
         import tempfile
         return os.path.join(tempfile.gettempdir(), "echo-server")
+
+    @property
+    def state_root(self) -> str:
+        """**耐久**状态的根目录（目前只有鉴权库）。
+
+        与 `tmp_root` 刻意分开，理由见 `DEFAULTS` 里那段注释：
+        tmp 会被清理、可以挂 tmpfs，而这里的东西丢了就要重新配对一遍所有客户端。
+        """
+        root = str(self.get("server.state_root", "") or "").strip()
+        if root:
+            return root
+        return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            "data", "server-state")
 
     @property
     def models_root(self) -> str:

@@ -4,10 +4,14 @@
 #
 # 三个刻意的选择：
 #   * `read_only: true` —— 根文件系统只读。**这是"服务端不存储业务数据"最有力的一层**：
-#     程序想往磁盘写东西会直接报错，而不是静默发生；审计范围因此缩小到下面那一个卷。
+#     程序想往磁盘写东西会直接报错，而不是静默发生；审计范围因此缩小到下面那两个卷。
 #   * `queue_max=0` 写死在环境里 —— 通道满了直接拒，重试由客户端负责（设计 §3.6）。
 #   * `ECHO_MAX_CONCURRENT=2` —— 2026-09-23 定；上线后用真机压测校准
 #     （看"同时 2 路时单段耗时相对 1 路涨了多少"：涨得少说明还有余量）。
+#
+# **两个卷的保留策略是相反的，别合并：**
+#   tmp    临时文件，丢了没关系，可以换 tmpfs 换性能
+#   state  **耐久**状态（鉴权库）—— 换 tmpfs 就等于把所有客户端清空、要重新配对
 services:
   backend:
     build:
@@ -25,12 +29,20 @@ services:
       ECHO_LISTEN: "0.0.0.0:8900"
       ECHO_MODELS_ROOT: /opt/echo/models
       ECHO_TMP_ROOT: /var/echo/tmp
+      ECHO_STATE_ROOT: /var/echo/state
       ECHO_MAX_CONCURRENT: "2"
+      # 鉴权：**一上网就必须打开**（不打开 = 谁连上谁能用你的 GPU）。
+      # 打开前先配好 ECHO_JWT_SECRET，否则服务端起不来（见 settings.py 的说明）：
+      #   ECHO_AUTH_ENABLED: "true"
+      #   ECHO_AUTH_MODE: jwt
+      #   ECHO_JWT_SECRET: "<openssl rand -hex 32>"
     volumes:
       # 模型只读挂进来（几 GB，不该跟着镜像走）
       - /srv/echo/models:/opt/echo/models:ro
-      # 临时文件：**唯一的可写处**。想更快就换成 tmpfs（见 Dockerfile 注释）
+      # 临时文件：丢了没事。想更快就换成 tmpfs（见 Dockerfile 注释）
       - /srv/echo/tmp:/var/echo/tmp
+      # **耐久**状态：鉴权库。别换 tmpfs、别和上面合并
+      - /srv/echo/state:/var/echo/state
     read_only: true
     tmpfs:
       - /tmp:size=512m,mode=1777

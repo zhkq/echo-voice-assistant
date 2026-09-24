@@ -8,6 +8,12 @@ PyYAML>=6.0
 numpy>=1.26
 soundfile>=0.12
 soxr>=0.3
+# 鉴权：配对码 → client_id + secret → 短期 JWT（设计 §7.1/§7.4/§7.5）。
+# 纯 Python、无编译步骤。**只有服务端需要它** —— 客户端只把 accessToken
+# 当成不透明字符串转发，所以它不进 requirements-core.txt。
+# 刻意不手搓 JWT：`alg: none` 与算法混淆这两个坑都源于"自己解析头部"，
+# 让一个被反复审计过的库来做，我们只在它外面加一层"头部必须恰好是我们签的那种"。
+PyJWT>=2.8
 # 短音频转写（语音指令增强）。torch-free、单 wheel、CPU 也能跑。
 sherpa-onnx>=1.10
 

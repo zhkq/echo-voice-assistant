@@ -96,28 +96,34 @@ def _settings_get(name: str) -> str:
 
 ### 2.3 目录结构
 
+**下面是 v1 实际落地的样子**（原稿把 `routes/` 拆成了 6 个文件、还有一个 `audit.py`；
+实测下来路由总量不到 400 行，拆开只会让人在 6 个文件之间跳 —— 合成一个 `routes.py`，
+等它真的长到看不完再拆。**目录结构要跟着代码长，不是先画好格子往里填。**）
+
 ```
 server/
-  __init__.py
-  main.py          # FastAPI app 工厂 + 生命周期（启动预热 / 退出清理）
+  __init__.py      # 版本号
+  main.py          # FastAPI app 工厂 + 生命周期 + 命令行管理入口（发码/列客户端/撤销）
   settings.py      # 服务端配置：YAML + 环境变量（独立于客户端 config）
   errors.py        # 机器可读错误码（§6.3）
-  auth.py          # mTLS / JWT / scopes / 配额
-  audit.py         # 只记元数据
+  auth.py          # ★ 配对 / JWT / scopes / 撤销（+ 跨进程撤销轮询）
+  store.py         # ★ 唯一落库处：clients + pairing_codes（§8.5）
+  engines.py       # 引擎加载器：把 app/audio/* 包成 EnginePool 能持有的东西
   pool.py          # ★ EnginePool（§4）
   tmp.py           # ★ TempWorkspace（§5.3）
   audio.py         # 上传校验 + 解码 + 重采样
-  routes/
-    capabilities.py
-    asr.py
-    diarize.py
-    embed.py
-    tts.py
-    health.py
-  tests/           # 服务端自己的护栏测试（§12）
+  routes.py        # /v1/*（含 §3.6 两级闸门；能力端点 + 配对/令牌）
+  requirements.txt / Dockerfile / compose.yaml / echo-server.example.yaml
 ```
 
+`audit.py` 与 `routes/` 的拆分**还没做** —— 审计表（`calls`）属于 v2，
+路由拆分等它真的需要。
+
 **服务端不放进 `app/`** —— 放进去就会忍不住 import 业务模块。物理隔离比纪律可靠。
+`tests/test_server_contract.py::NoBusinessCouplingTests` 把这条钉成可执行的断言：
+`server/` 不许 import `app.db` / `app.config` / `app.meeting` / `app.assistant` /
+`app.worklog` / `app.voiceprint` / `app.api`。
+（`app.audio.*` 是**能力**层，借用它是刻意的 —— 见 `server/engines.py` 的说明。）
 
 ---
 
@@ -486,17 +492,24 @@ class TempWorkspace:
 
 ### 6.1 端点白名单（全部无状态）
 
-| 方法 | 路径 | 语义 |
-|---|---|---|
-| GET | `/v1/capabilities` | 能力 + 模型 + `modelVersion` + `vectorSpaceId` + 限制 + 当前实际可用性 |
-| GET | `/v1/health` | 存活（永远 200）+ 队列深度 + 显存 + 临时目录统计 |
-| GET | `/v1/ready` | 就绪（模型池可服务则 200，否则 503） |
-| POST | `/v1/asr` | 音频 → 文本（`?variant=short\|long`、`?timestamps=1`） |
-| POST | `/v1/diarize` | 音频 → turns + 嵌入（`?mode=segment\|turns`） |
-| POST | `/v1/speaker/embed` | 音频 → 嵌入 |
-| POST | `/v1/tts` | 文本 → 音频（可选能力） |
+| 方法 | 路径 | 语义 | v1 |
+|---|---|---|---|
+| GET | `/v1/capabilities` | 能力 + 模型 + `modelVersion` + `vectorSpaceId` + 限制 + 当前实际可用性 | ✅ |
+| GET | `/v1/health` | 存活（永远 200）+ 队列深度 + 显存 + 临时目录统计 | ✅ |
+| GET | `/v1/ready` | 就绪（模型池可服务则 200，否则 503） | ✅ |
+| POST | `/v1/pair` | **配对**：一次性码 → `client_id` + `secret`（§7.4，唯一免凭据的端点） | ✅ |
+| POST | `/v1/token` | **换令牌**：`Basic client_id:secret` → 短期 JWT（§7.5 ②） | ✅ |
+| POST | `/v1/asr` | 音频 → 文本（`?variant=short\|long`、`?timestamps=1`） | ✅ |
+| POST | `/v1/diarize` | 音频 → turns + 嵌入（`?mode=segment\|turns`，v1 只做 `segment`） | ✅ |
+| POST | `/v1/speaker/embed` | 音频 → 嵌入 | ✅ |
+| POST | `/v1/tts` | 文本 → 音频（可选能力） | ⏳ |
 
-**没有任何写端点。** `POST /v1/voiceprints` 这类一旦出现，护栏测试就该红。
+**除了换凭据那两条，没有任何写端点。** `/v1/pair` 与 `/v1/token` 写的是 §8.5 白名单里的
+`clients` / `pairing_codes` 两张**管理**表，一个字节的内容都不碰 —— 它们在护栏测试的
+白名单里被**显式列出**，而不是靠"凡是 auth 开头就放行"那种模糊规则（后者会让下一个
+"看起来像鉴权"的业务端点溜进来）。
+
+`POST /v1/voiceprints` 这类一旦出现，护栏测试就该红。
 
 ### 6.2 `capabilities` 必须反映**真实**可用性
 
@@ -547,15 +560,24 @@ class TempWorkspace:
 |---|---|---|
 | 400 | `bad_request` | 不重试（客户端 bug） |
 | 401 | `unauthorized` | 刷新凭据；失败则标记后端不可用 |
-| 403 | `forbidden` | 该 scope 未授权 → 跳过此后端 |
+| 403 | `forbidden` | 该 scope 未授权（或客户端被禁用）→ 跳过此后端 |
 | **409** | **`client_busy`** | **不重试** —— 自己上一个请求还没完（并发应配 1，属客户端 bug，记日志） |
 | 413 | `audio_too_long` / `payload_too_large` | 改分段重试；否则跳过 |
 | 415 | `unsupported_media` | 换编码；否则跳过 |
 | 429 | `quota_exceeded` | **今天别再试**（`Retry-After` = 到次日重置的秒数） |
+| 429 | `rate_limited` | **配对专用**：试错太多次 → 等 `Retry-After` 秒再来（§7.4） |
 | 429 | `queue_full` | 退避重试（**当前 `queue_max=0`，用不到**，占位见 §3.6） |
 | **503** | **`server_busy`** | **系统忙，稍后再试** —— 退避重试，尊重 `Retry-After` |
 | 503 | `model_loading` / `gpu_oom` / `model_failed` | **降级到链上下一个后端** |
+| 503 | `auth_misconfigured` | **服务端自己没配好**（例如 `mode=jwt` 却没配密钥）→ 别翻自己的配置，报给运营 |
 | 504 | `inference_timeout` | 降级；并回报"此后端对这么长的音频不可用" |
+
+**`429` 上的三个码也必须分开**：`quota_exceeded`（今天别再试）、`rate_limited`
+（等几秒再来）、`queue_full`（退避重试）是三件不同的事，合成一个就只能盲目退避。
+
+**`503` 上的 `auth_misconfigured` 与 `401` 也必须分开**：401 是"你的凭据不对"，
+客户端会去翻自己的配置；503 是"我这边没配好"，客户端翻自己的配置是白费力气。
+把这两种失败混起来是最贵的一种省事。
 
 **`409 client_busy` 与 `503 server_busy` 必须分开**（§3.6）：
 前者的重试**永远不会成功**，后者重试才是对的。合并成一个码，客户端就只能盲目重试。
@@ -810,6 +832,12 @@ class TempWorkspace:
 
 ## 7. 鉴权、配额与多租户
 
+> **实现状态（2026-09-24）**：§7.1 / §7.4 / §7.5 的核心**已经落地** ——
+> 配对码、secret 哈希、短期 JWT、`token_version` 撤销、scopes、跨进程撤销轮询。
+> **还没做的**是 §7.2 的**配额**（并发之外的日额度/音频分钟数）与 §8.4 的管理面，
+> 所以现在配对的入口是命令行（`python -m server.main --new-pairing-code`）。
+> 每条断言落在哪个用例上见 §12。**没实现的那些不许在文档里读起来像已经做了。**
+
 ### 7.1 身份模型：**传输层与应用层分开**
 
 先把一个容易混的概念拆开 —— **"链路可信"和"这是谁"是两件事**：
@@ -847,8 +875,19 @@ scopes:  asr | diarize | embed | tts
 配额维度：并发数 / 单请求最大音频秒数 / 每日音频分钟数 / 队列优先级
 ```
 
+**v1.5 只落了 scopes 的一半**：`asr` / `diarize` / `embed` 已经在
+`routes.ENDPOINT_SCOPES` 里逐端点声明并强制（`tts` 等有端点时再加）。
+**配额还没做** —— 现在只有 §3.6 的并发闸门，"每日音频分钟数"这类要等 v2。
+
+**scopes 的一条约定（容易被写反）**：**空 scopes = 不额外限制**，不是"什么都不许"。
+把空解释成全禁，会让"我明明配了客户端却全 403"变成一个谜；
+真正的"什么都不许"应该由 `disabled` 表达（那是 403，语义是"认识你但不许用"）。
+契约由 `AuthScopeTests.test_empty_scopes_mean_no_extra_restriction` 钉住。
+
 **按槽分别限额与排队**（前置文档已定）：
 `asr.short`（高频小请求）与 `diarize`（吃 GPU）分开队列，**避免高频小请求饿死长任务**。
+（v1 出厂清单里没有 `asr.short` 这个模型，但**槽还在**、由长档那个模型的
+`supports` 兜住 —— 所以将来分队列时按槽分，不用等小模型回来。）
 
 **配额计数放内存，不每请求查库**（§8.5 的硬约束）：
 
@@ -881,18 +920,22 @@ scopes:  asr | diarize | embed | tts
 **问题**：客户端要拿到 `client_id` + `secret`。手工复制粘贴有两个毛病 ——
 secret 会留在聊天记录里，而且管理员得一台台填。
 
-**做法：一次性配对码**（管理面「新建客户端」时生成）
+**做法：一次性配对码**（管理面「新建客户端」时生成；管理面做好之前走命令行）
 
 ```
-① 管理员在管理面新建客户端：填名字（"张三的办公本"）、scope、配额
-   → 服务端生成一次性配对码（8 位、有效期 15 分钟、只存哈希）
-   → 界面上只显示这一次（之后再也读不到）
+① 生成配对码（8 位、有效期 15 分钟、只存哈希），明文只出现这一次
+     —— 管理面还没做，所以现在唯一的入口是命令行：
+        python -m server.main --new-pairing-code --created-by 管理员
+        →  echo://pair?host=gpu-01:8900&code=7K2M9QX4
+     （**刻意不给管理动作开免鉴权的内部端点** —— 那正是最容易变成漏洞的做法；
+       这条命令直接开库，不打 HTTP。）
+     `--list-clients` 看已配对的，`--revoke <client_id>` 撤销。
 
-② 用户在客户端面板输入配对码（或由安装脚本带参传入）
+② 用户在客户端面板粘贴配对码（或由安装脚本带参传入）
    POST /v1/pair  {code, clientName, clientVersion}
    → 校验：未过期 / 未用过 / 未撤销
    → 服务端生成 client_id + secret（**secret 只在这一个响应里出现**）
-   → 配对码标记已用、绑定到该 client_id
+   → 配对码**用掉即删**（不是"标记已用"—— 见 §8.5）
 
 ③ 客户端把 client_id + secret 落到**本机**（`{echoBase}/data/`，权限收紧）
    之后用它们换短期 JWT（§7.1），不再拿 secret 直接调能力
@@ -988,18 +1031,32 @@ POST /v1/token
 #### ④ 撤销：能到什么程度
 
 ```
-撤销 → clients.token_version += 1
-     → （多实例）各实例靠轻量轮询发现：SELECT MAX(updated_at) FROM clients
+撤销 → clients.token_version += 1（**同时动 updated_at**）
+     → 同一进程：直接失效那份缓存 → **立即**
+     → 别的进程/实例：靠轻量轮询发现 SELECT MAX(updated_at) FROM clients
      → 下一个请求 ver 不匹配 → 401
 ```
 
-| 部署 | 撤销延迟 |
-|---|---|
-| 单实例 | **立即**（直接改内存缓存） |
-| 多实例 | **≤ 5 秒**（轻量轮询） |
+| 路径 | 撤销延迟 | 实现 |
+|---|---|---|
+| **同一进程内**（管理面 / 管理 API） | **立即** | `ClientCache.revoke` 改库 + 立刻失效缓存 |
+| **另一个进程**（命令行 `--revoke`、多实例） | **≤ 轮询间隔**（默认 5 秒） | `RevocationWatcher` |
 
 **多实例不做实例间广播** —— 那要引入消息通道，而 5 秒撤销延迟对办公场景够用。
 **但这个延迟要如实写进文档，不能说成"立即"。**
+
+> **这一格是被一次真事故补上的。** 原来只有"同一进程立即"那一半，
+> `RevocationWatcher` 根本没实现 —— 于是**唯一的运维入口**（命令行 `--revoke`）
+> 撤销之后，跑着的服务会**继续接受那个 JWT** 直到缓存自己过期（默认 60 秒）。
+> "撤销立即生效"这句在真实使用路径上是假话。端到端冒烟时才暴露出来：
+> 命令行撤销 → 带旧 JWT 请求 → 依然放行。契约由
+> `AuthTokenTests.test_revoke_from_another_process_is_eventually_noticed` 钉住。
+>
+> 探针刻意用 **`MAX(updated_at)` 而不是 `MAX(token_version)`**：撤销改 `token_version`、
+> 禁用改 `disabled`、轮换改 `secret_hash`，**三者都要能被发现**，
+> 而它们改的列不一样。`updated_at` 是它们的共同痕迹。
+> 代价是"改了却没动 `updated_at`"的写入发现不了 —— 所以 `store.py` 里
+> **每一处改 `clients` 的地方都显式写了 `updated_at`**。
 
 #### ⑤ 轮换，而不是重新配对
 
@@ -1012,6 +1069,14 @@ clients 表：secret_hash / secret_rotated_at
      客户端下次换令牌时服务端回 X-Echo-Secret-Rotated: 1 + 新 secret
      → 客户端自动落盘新 secret、平滑切换，用户无感
 ```
+
+> **v1 现状：只做了"换掉即失效"，上面那套宽限期还没做（2026-09-24）。**
+> 宽限期要在 `clients` 上加 `prev_secret_hash` / `prev_secret_expires_at` 两列，
+> 而"宽限期内谁还能进"这件事一旦摊开就要想清楚（两把 secret 同时有效，
+> 撤销时怎么保证两把都失效？）。v1 先做最简单的那条：
+> `Store.rotate_secret` 换掉哈希，旧的**立刻**失效 ——
+> 代价是用户要重新配对一次，而配对成本很低（管理面再报一个码）。
+> **别把这张表读成"已经能平滑轮换"。**
 
 #### ⑥ 客户端本地存什么（**这是客户端侧的安全边界**）
 
@@ -1192,15 +1257,24 @@ Windows 上至少要走 DPAPI（`CryptProtectData`）；这与"业务数据留�
 
 #### 表白名单（唯一白名单，多一张都要走评审）
 
-| 表 | 存什么 | 关键列 |
-|---|---|---|
-| `admin_users` | 管理员账号 | `username` / `password_hash` / `disabled` / `last_login` |
-| `clients` | 客户端注册与凭据 | `client_id` / `name` / `secret_hash` / `scopes` / `quota` / `token_version` / `last_seen` / `version` / `disabled` |
-| `pairing_codes` | 待用的配对码 | `code_hash` / `expires_at` / `created_by`（**用掉即删**） |
-| `calls` | 调用元数据 | `ts` / `client_id` / `endpoint` / `model_id` / `audio_seconds` / `queue_wait_ms` / `duration_ms` / `status` / `error_code` / `request_id` |
-| `calls_rollup` | 小时/天聚合 | `bucket` / `client_id` / `endpoint` / `count` / `errors` / `p50` / `p95` / `audio_seconds` |
-| `model_events` | 模型生命周期 | `ts` / `model_id` / `event`(load/evict/fail) / `duration_ms` / `vram_mb` |
-| `admin_audit` | 管理动作 | `ts` / `admin` / `action` / `target` |
+**v1 只有前两张**（鉴权落地时建的，`server/store.py`）；后面几张要等管理面与统计。
+表集合**只是白名单的子集**，所以护栏测试钉的是"⊆ 白名单"，不是"== 白名单"。
+
+| 表 | 存什么 | 关键列 | v1 |
+|---|---|---|---|
+| `admin_users` | 管理员账号 | `username` / `password_hash` / `disabled` / `last_login` | ⏳ |
+| `clients` | 客户端注册与凭据 | `client_id` / `name` / `secret_hash` / `scopes` / `token_version` / `last_seen` / `version` / `disabled` | ✅ |
+| `pairing_codes` | 待用的配对码 | `code_hash` / `expires_at` / `created_by`（**用掉即删**） | ✅ |
+| `calls` | 调用元数据 | `ts` / `client_id` / `endpoint` / `model_id` / `audio_seconds` / `queue_wait_ms` / `duration_ms` / `status` / `error_code` / `request_id` | ⏳ |
+| `calls_rollup` | 小时/天聚合 | `bucket` / `client_id` / `endpoint` / `count` / `errors` / `p50` / `p95` / `audio_seconds` | ⏳ |
+| `model_events` | 模型生命周期 | `ts` / `model_id` / `event`(load/evict/fail) / `duration_ms` / `vram_mb` | ⏳ |
+| `admin_audit` | 管理动作 | `ts` / `admin` / `action` / `target` | ⏳ |
+
+> **`clients` 的实现与这张表有两处小出入，已按实现校正：**
+> v1 只落了 `created_at` / `updated_at` / `last_seen`，**没有** `quota` 列
+> （配额是 §7.2，还没做）、也没有 `version` 列（客户端版本只是配对时的入参，
+> 没有查询需求）。`updated_at` 是后加的、且是必需的 ——
+> 跨进程撤销靠 `MAX(updated_at)` 发现变更（§7.5 ④）。
 
 #### 列黑名单（任何表都不许有）
 
@@ -1276,25 +1350,40 @@ docker run --gpus all ...
 
 **所以 GPU 直通本身不难**，难的是"Windows + Docker"这一层 —— 这也是推荐 A 的原因。
 
-### 9.3 容器怎么配：只读根 + 一个可写临时卷
+### 9.3 容器怎么配：只读根 + **两个**可写卷（保留策略相反）
 
 ```bash
 docker run -d --name echo-backend \
   --gpus all \
   --read-only \                                # 根文件系统只读
-  -v /srv/echo/tmp:/var/echo/tmp \             # ★ 唯一可写的地方
+  -v /srv/echo/tmp:/var/echo/tmp \             # 临时文件：丢了没关系
+  -v /srv/echo/state:/var/echo/state \         # ★ 耐久状态：鉴权库，**别丢**
   -v /srv/echo/models:/opt/echo/models:ro \    # 模型只读
-  -v /srv/echo/db:/var/echo/db \               # 管理面的库（很小）
-  -p 8900:8900 -p 8901:8901 \
+  -p 8900:8900 \
   -e ECHO_TMP_ROOT=/var/echo/tmp \
-  echo-backend:1.0.0
+  -e ECHO_STATE_ROOT=/var/echo/state \
+  echo-backend:0.1.0
 ```
 
 **`--read-only` 仍是这里最有价值的一条**：它让"不小心把音频写到某个目录"**直接报错**，
-而不是静默发生。临时目录成了**唯一**可写的地方 —— **审计范围因此缩小到一个目录**。
+而不是静默发生。可写的地方只剩这两个卷 —— **审计范围因此缩小到两个目录**。
+
+> **修订（2026-09-24）：从"一个可写卷"改成"两个"。**
+> 原稿只有一个 `/var/echo/tmp`，还建议"想更快就换 tmpfs"。鉴权落地后这条变成了**陷阱**：
+> 客户端凭据（`clients` 表）当时按缺省落在 `{tmp.root}` 下，
+> **运维照着文档把 tmp 换成内存盘，所有配过的客户端就一起没了** —— 而且现场现象是
+> "所有人都得重新配对"，很难联想到内存盘。
+>
+> 根因不是"放错了目录"，而是**把两种相反的保留策略塞进了同一个目录**：
+> tmp 是"随便删、可丢弃"，凭据是"丢了要重来一遍"。
+> 所以拆成 `tmp.root` 与 `server.state_root` 两个配置项、两个卷，
+> 并且 `open_store()` **刻意不回退到 `tmp.root`**。
+> 契约由 `EnvOverrideTests.test_state_root_is_not_tmp_root` 与
+> `test_open_store_never_lands_in_tmp` 钉住。
 
 > 修订（2026-09-23）：原稿写的是 `--tmpfs /tmp`（全内存）。按"临时文件落盘 + 定时清理"
 > 的决定改成**可写卷** —— 更简单，而且**对性能几乎没有影响**（见 9.4）。
+> （注意这条只适用于 `tmp` 卷；`state` 卷**永远不许**换成 tmpfs。）
 
 ### 9.4 临时文件：按日期落盘 + 定时清理
 
@@ -1365,7 +1454,9 @@ client_body_temp_path /var/echo/tmp/nginx;
 
 ### 9.7 启动与退出
 
-- **启动**：先起 HTTP（`/v1/health` 立刻 200），再**后台预热常驻模型**（复用 `boot.py` 的分阶段编排）
+- **启动**：先起 HTTP（`/v1/health` 立刻 200），再**后台预热常驻模型**（复用 `boot.py` 的分阶段编排）。
+  另外起两样东西：**临时目录定时清理**（§5）与**撤销轮询**（§7.5 ④，默认 5 秒一次）。
+  v1 出厂清单里没有常驻模型，所以"预热"这一步实际上是空转 —— 这是对的，不是 bug（§14-2）
 - **退出**：`pool.shutdown()` 释放显存 + 等在飞请求结束（有超时）。
   **临时文件不在这里清** —— 交给定时清理，免得退出被慢盘拖住
 - **崩溃**：定时清理兜底
@@ -1393,56 +1484,65 @@ client_body_temp_path /var/echo/tmp/nginx;
 
 独立 YAML + 环境变量覆盖。**不读客户端的 settings 表**。
 
-```yaml
-server:
-  id: gpu-01
-  listen: 0.0.0.0:8900
-  tls: {cert: /etc/echo/server.crt, key: /etc/echo/server.key}
-  instance_id: gpu01-a            # 临时目录命名空间
+> **完整可用的参考文件是 `server/echo-server.example.yaml`，本章不抄第二份。**
+> 抄一份 = 两份事实，必然漂 —— 而且漂的时候**不报错**，只是文档在说谎：
+> 照文档配出来的服务端，与代码默认的服务端不是同一个东西。
+> 那份文件的内容由 `ExampleConfigTests` 盯着（逐项比对 `default_specs()`、
+> 2026-09-23 定的并发数、以及"没有顶层 `resident` 键"）。
+> 这一章只讲**每一项为什么是这个值**。
 
-models:
-  root: /opt/echo/models
-  vram_budget_mb: 20000
-  # 注意：**没有 `resident:` 这个顶层键** —— 常驻与否是**每个 spec 自己的**
-  # `resident: true/false`（代码只读那一处；写了顶层键也不会有人理它）。
-  # 2026-09-24 拍板：出厂清单一个都不常驻（§14-2），所以下面全是 false。
-  specs:
-    # ── 与现网一致：沿用已在实机验证效果的两个引擎，服务端不要换 ──
-    - id: asr-long                     # 长音频（会议分段）：按需 + LRU
-      slot: asr.long
-      supports: [asr.text, asr.timestamps]   # 一个模型同时给文本与句级时间戳
-      impl: qwen3asr                   # Qwen3-ASR-0.6B (+ ForcedAligner)
-      resident: false                  # 按需 + LRU：显存约 4 GB
-      max_concurrency: 1
-      # v1 **不放** asr-short（SenseVoice 常驻小模型）：短请求由上面那个
-      # `supports: [asr.text]` 兜住 —— 慢一点但结果正确。见 §14-2。
-    - id: pyannote-3.1
-      slot: diarize.turns
-      max_concurrency: 1            # 非线程安全
-      vectorSpaceId: ws-resnet34-v1 # 换模型 = 换这个 id = 重启
-    - id: speaker-embed
-      slot: speaker.embed
-      modelVersion: sherpa-campplus-zh-v1
-      vectorSpaceId: ws-campplus-zh-v1
+#### 配置项与来历
 
-limits:
-  max_audio_seconds: 1800
-  max_upload_bytes: 67108864
-  # 并发：服务端总通道 2（暂定，实验后定）；每客户端硬性 1（§3.6）
-  max_concurrent: 2
-  per_client_concurrent: 1
-  # 不排队：通道满了立刻拒（503 server_busy + Retry-After），重试由客户端负责
-  queue_max: 0
-  busy_retry_after_s: 5
-  # 仅当上面 queue_max > 0 时才生效（v1 不启用）
-  queue_wait_timeout_s: 120
-  inference_timeout_s: 900
+| 键 | 默认 | 为什么 |
+|---|---|---|
+| `server.id` | `echo-backend-1` | 出现在 `capabilities` 里，客户端用它区分后端 |
+| `server.listen` | `0.0.0.0:8900` | 不是回环 + 没开鉴权时，启动会**大声告警** |
+| `server.instance_id` | `default` | 临时目录的命名空间，多实例互不清扫对方的残留 |
+| `server.state_root` | `{ECHO}/data/server-state` | ★ **耐久**状态（鉴权库）。**必须与 `tmp.root` 分开**，理由见 §9.3 |
+| `server.vram_budget_mb` | `0`（不限） | 超预算**拒绝**而不是 OOM，也绝不回退 CPU（§3.4） |
+| `limits.max_concurrent` | **2** | 2026-09-23 定；上线后压测校准 |
+| `limits.per_client_concurrent` | **1** | 公平性：一个客户端不许占满 |
+| `limits.queue_max` | **0** | **不排队**，满了立刻拒（§3.6） |
+| `limits.busy_retry_after_s` | `5` | `server_busy` 时给客户端的建议等待 |
+| `limits.max_audio_seconds` | `1800` | 半小时；超了 `413 audio_too_long` |
+| `limits.max_upload_bytes` | `64 MiB` | 声明值在读 body 前就检查（§6.5 公共约定） |
+| `limits.load_timeout_s` | `300` | 等模型加载完的上限 |
+| `limits.inference_timeout_s` | `900` | 超了 `504` |
+| `tmp.root` | 系统临时目录下的 `echo-server` | 容器的临时卷。**可以换 tmpfs** |
+| `tmp.ttl_hours` | `4` | 定时清理删超过这么久的（请求结束本来就会删） |
+| `tmp.sweep_interval_s` | `3600` | 每小时扫一次 |
+| `tmp.max_bytes` | `4 GiB` | 超了**先删最老的**，而不是拒绝新请求 |
+| `models.root` | `{ECHO}/models` | 跟客户端同一个模型库 |
+| `models.device` | `cuda`（示例里写死） | 要 cuda 而没有 CUDA 时**直接失败**，不回退（§3.4） |
+| `models.specs` | 空 = 用 `engines.default_specs()` | 空是**有意的**：出厂清单只有代码里一份 |
+| `auth.enabled` | `false` | 本机起步不该先跟凭据较劲；上网必须打开 |
+| `auth.mode` | `token` | `token`（静态，单人）｜`jwt`（配对，多人） |
+| `auth.jwt_secret` | 空 | `mode=jwt` 时**必须**配；没配则拒绝启动而**不是**随机生成（§7.5） |
+| `auth.token_ttl_s` | `3600` | 短期令牌；不做 refresh token |
+| `auth.clock_skew_s` | `60` | 内网机器时钟未必准 |
+| `auth.pairing_enabled` | `true` | 关掉后新机器进不来（老客户端照用） |
+| `auth.pairing_ttl_s` | `900` | 配对码 15 分钟 |
+| `auth.pair_window_s` / `pair_max_failures` | `300` / `5` | 免凭据端点的失败退避（§7.4 约定 1） |
+| `auth.cache_ttl_s` | `60` | client 行缓存多久（撤销走主动失效，**不靠它**） |
+| `auth.revoke_poll_s` | `5` | 跨进程撤销的发现间隔（§7.5 ④） |
+| `auth.default_scopes` | 空 | 空 = 配对出来的客户端**没有额外限制**（§7.2） |
+| `auth.db` | 空 = `{state_root}/echo-server-auth.db` | **刻意不回退到 `tmp.root`** |
 
-tmp:
-  root: /dev/shm/echo
-  max_bytes: 4294967296
-  ttl_s: 600
-```
+#### 环境变量
+
+只认少数几个（容器里最方便的那一层）：`ECHO_SERVER_ID` / `ECHO_LISTEN` /
+`ECHO_TMP_ROOT` / `ECHO_STATE_ROOT` / `ECHO_MODELS_ROOT` / `ECHO_DEVICE` /
+`ECHO_MAX_CONCURRENT` / `ECHO_PER_CLIENT_CONCURRENT` / `ECHO_AUTH_ENABLED` /
+`ECHO_AUTH_MODE` / `ECHO_JWT_SECRET` / `ECHO_PAIRING_ENABLED`。
+
+**布尔要认得出 `"false"`**：容器编排里它是字符串，而 Python 里非空字符串都是真 ——
+直接 `bool(os.environ[...])` 会让 `ECHO_AUTH_ENABLED=false` **打开**鉴权。
+认不出来的值一律当作"没设"，**绝不猜**。
+
+**"部署文件里写的变量必须真的被读"由机器保证**：`EnvOverrideTests` 扫
+`compose.yaml` 与示例配置里出现的每一个 `ECHO_*` 名字，逐个确认代码处理了。
+（写这个测试时它当场抓到一个 `ECHO_STATE_ROOT` 只写在注释里、代码没读 ——
+那正是最容易发生、又最难发现的一种谎：服务照着文档配，行为却完全没变。）
 
 ---
 
@@ -1458,6 +1558,10 @@ tmp:
 | 显存不足 | 卸载 LRU → 仍不够 → `503 gpu_oom` | **绝不回退 CPU**；降级 |
 | （`queue_max>0` 时才会有）队列满 | `429 queue_full` + `Retry-After` | 退避重试 —— **v1 用不到** |
 | 配额用尽 | `429 quota_exceeded` | 提示用户 / 按日重置（**今天别再试**） |
+| 配对试错过多 | `429 rate_limited` + `Retry-After`（§7.4） | 等 `Retry-After` 秒再试一次 |
+| 凭据不对 / 已撤销 | `401 unauthorized` | 用 secret 换新令牌；仍失败则标记后端不可用 |
+| 客户端被禁用 / scope 不足 | `403 forbidden` | **跳过此后端**（换凭据也没用） |
+| 服务端鉴权没配好 | `503 auth_misconfigured` | **别翻自己的配置** —— 报给运营 |
 | 音频过长 | `413 audio_too_long` | 客户端重新分段 |
 | 推理超时 | `504 inference_timeout` | 降级（并记住"此后端不适合这么长的音频"） |
 | 客户端断开 | 中止推理 + 清临时文件 | 整段重试（幂等在客户端） |
@@ -1517,6 +1621,38 @@ tmp:
 | 只读 rootfs + tmpfs 下跑通全部端点（容器冒烟） | ⏳ | v3，且只能在 Linux 上跑 |
 | 客户端引擎层内部那句 `except -> CPU` 也要能被关掉（`allow_cpu_fallback=False`） | ⏳ | 客户端侧改动：现在只拦得住"运行时说没 CUDA"，拦不住"运行时说能用、建模型时炸了" |
 
+### 12.1 鉴权的断言（设计 §7，2026-09-24 落地）
+
+| 断言 | 状态 | 落在哪 |
+|---|---|---|
+| 库里的表集合 ⊆ §8.5 白名单 | ✅ | `AuthSchemaTests.test_tables_are_a_subset_of_the_documented_whitelist` |
+| 任何列名都不命中"内容/业务概念"黑名单 | ✅ | `AuthSchemaTests.test_no_column_is_named_like_content` |
+| 配对码**只能用一次** | ✅ | `AuthPairingTests.test_code_is_single_use` |
+| 码要归一化（抄错大小写/带空格不该让人白试） | ✅ | `AuthPairingTests.test_code_is_normalized_so_case_and_spaces_do_not_matter` |
+| 过期的码被拒 | ✅ | `AuthPairingTests.test_expired_code_is_refused` |
+| **secret 与配对码都不落明文**（直接翻库文件字节） | ✅ | `AuthPairingTests.test_secret_is_never_stored_in_plaintext` |
+| 码**用掉即删**（不是"标记已用"） | ✅ | `AuthPairingTests.test_used_code_is_deleted_not_kept` |
+| 免凭据端点限速防爆破（429 + `Retry-After`） | ✅ | `AuthPairingTests.test_throttle_stops_brute_force` |
+| 配对成功要把失败计数清零（否则整个出口 IP 被连坐） | ✅ | `AuthPairingTests.test_successful_pairing_clears_the_failure_counter` |
+| 可以整个关掉配对（新机器进不来） | ✅ | `AuthPairingTests.test_pairing_can_be_switched_off` |
+| `alg: none` 被拒 | ✅ | `AuthTokenTests.test_alg_none_is_refused` |
+| **算法判断是我们自己的，不依赖库的默认行为** | ✅ | `AuthTokenTests.test_alg_check_is_ours_not_the_librarys` |
+| 用别的密钥签的令牌被拒 | ✅ | `AuthTokenTests.test_token_signed_with_another_key_is_refused` |
+| 改过载荷（例如把 `ver` 改大）签名就对不上 | ✅ | `AuthTokenTests.test_tampered_payload_is_refused` |
+| 过期令牌被拒；60 秒时钟偏差被容忍 | ✅ | `AuthTokenTests.test_expired_token_is_refused` / `test_clock_skew_is_tolerated` |
+| **撤销在下一个请求就生效**（同进程） | ✅ | `AuthTokenTests.test_revoke_takes_effect_on_the_very_next_request` |
+| **另一个进程的撤销 ≤ 轮询间隔被发现** | ✅ | `AuthTokenTests.test_revoke_from_another_process_is_eventually_noticed` |
+| 轮询探针能发现**禁用**（不只是撤销） | ✅ | `AuthTokenTests.test_watcher_notices_disable_too_not_just_revoke` |
+| 没变化就不刷缓存（幂等） | ✅ | `AuthTokenTests.test_watcher_only_refreshes_when_something_actually_changed` |
+| 禁用是 **403** 不是 401（"认识你但不许用"） | ✅ | `AuthTokenTests.test_disabled_client_gets_403_not_401` |
+| 没配 `jwt_secret` 是 **503 auth_misconfigured**，不是 401 | ✅ | `AuthTokenTests.test_missing_jwt_secret_is_a_server_side_error_not_401` |
+| scope 不足 → 403；**空 scopes = 不额外限制** | ✅ | `AuthScopeTests` |
+| 每个能力端点都声明了 scope，而且**真的传下去了** | ✅ | `AuthScopeTests.test_endpoints_actually_pass_their_scope` |
+| 命令行发的码，服务端进程真能兑换（端到端） | ✅ | `AdminCliTests.test_the_printed_code_actually_works` |
+| `--list-clients` / `--revoke` 真的动库 | ✅ | `AdminCliTests` |
+| 配额（日额度 / 音频分钟数，§7.2） | ⏳ | 还没做；现在只有并发闸门 |
+| 管理面 / 审计表 / "存了什么"自证页（§8.4、§8.5） | ⏳ | 还没做；配对的入口暂时是命令行 |
+
 > **为什么 §12 值得这么细。** 前面每一节的设计都有"如果没人看着就会退化"的地方：
 > 服务端会慢慢认识业务、临时文件会慢慢漏、GPU 会慢慢被 OOM 掉。
 > 这份清单是把那些"慢慢"变成"立刻红"。
@@ -1526,11 +1662,22 @@ tmp:
 
 ## 13. 实施阶段
 
-| 阶段 | 内容 | 验收 |
-|---|---|---|
-| **v1** | 单进程 / 单机 / 静态 token；`EnginePool`（常驻 + 按需 + 单飞 + LRU）；`TempWorkspace`；4 个能力端点；`/health` `/ready` `/capabilities` | §12 全部护栏测试绿；两个客户端并发不互相阻塞 |
-| **v2** | JWT + scopes + 配额 + 机器可读错误码契约 + metrics + SSE 进度 | 与客户端路由层的降级原因**逐条对齐**；断网/降级演练 |
-| **v3** | 只读 rootfs 容器 + tmpfs + 反代配置 + 按模型分进程（按需）+ 多实例按能力拆分 | 容器冒烟；`/v1/health` 的临时目录统计长期归零 |
+| 阶段 | 内容 | 验收 | 状态 |
+|---|---|---|---|
+| **v1** | 单进程 / 单机；`EnginePool`（单飞 + 引用计数 + LRU + 显存预算）；`TempWorkspace`；三个能力端点；`/health` `/ready` `/capabilities`；**两级闸门 + 廉价预检** | §12 全部护栏测试绿；两个客户端并发不互相阻塞 | **✅ 已落地** |
+| **v1.5**（原 v2 的鉴权部分） | **配对码 → `client_id` + `secret` → 短期 JWT**；scopes；`token_version` 撤销（同进程立即、跨进程 ≤5 秒轮询）← **实际做在了这里，不是 v2** | §12.1 全绿；命令行能发码、撤销能生效 | **✅ 已落地** |
+| **v2** | 配额（日额度 / 音频分钟数，§7.2）+ metrics + SSE 进度 + `calls` 审计表 | 与客户端路由层的降级原因**逐条对齐**；断网/降级演练 | ⏳ |
+| **v3** | 管理面（§8.4）+ 只读 rootfs 容器 + tmpfs + 反代配置 + 按模型分进程（按需）+ 多实例按能力拆分 | 容器冒烟；`/v1/health` 的临时目录统计长期归零 | ⏳ |
+
+> **为什么鉴权提前到了 v1.5，而不是留在 v2：** 原计划把它和**配额**绑在一趟做。
+> 实际开工后发现两件事可以拆：JWT/scopes/撤销是**安全边界**（没有它，服务端一上网
+> 就等于"谁连上谁能用你的 GPU"），而配额是**公平性**（没有它只是有人多占一点）。
+> 安全边界不该等公平性一起做。所以鉴权先落地，配额留在 v2。
+>
+> 代价是**配对的入口暂时是命令行**（管理面在 v3）——
+> 这条路已经通了：`python -m server.main --new-pairing-code`。
+> 一个功能"装上了却发不出第一份凭据"等于没装，所以命令行入口是这一阶段的**必需品**，
+> 不是临时脚手架。
 
 **v1 就能满足"办公本可用"的全部需求** —— 办公本的会议转写、说话人分离、声纹都只需要 v1 的能力。
 

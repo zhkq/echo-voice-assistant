@@ -69,12 +69,29 @@ models:
 auth:
   # **默认关**（本机起步）。监听地址不是回环时启动会大声告警 ——
   # 不配鉴权就等于"谁连上谁能用你的 GPU"。
-  # 配对码 → client_id + secret → 短期 JWT 见设计 §7.4/§7.5（下一步）。
   enabled: false
+  # token = 静态令牌（v1 起步、单人）。jwt = 配对码 + secret + 短期 JWT（多人）。
+  # 用 jwt 时**必须**配 jwt_secret，否则服务端起不来（刻意不随机生成：
+  # 那会让进程一重启所有客户端全部 401，而现象很难联想到"密钥每次都是新的"）。
+  #   openssl rand -hex 32
   mode: token
   tokens: []
-  # 打开后大概长这样：
+  jwt_secret: ""
+  token_ttl_s: 3600              # 短期令牌 1 小时（不做 refresh token）
+  clock_skew_s: 60               # 内网机器时钟未必准，容忍 60 秒偏差
+  pairing_enabled: true          # 关掉之后新机器进不来（老客户端照用）
+  pairing_ttl_s: 900             # 配对码 15 分钟
+  pair_window_s: 300             # 失败退避窗口
+  pair_max_failures: 5           # 窗口内失败几次开始 429
+  cache_ttl_s: 60                # client 行缓存多久（撤销走主动失效，不靠它）
+  default_scopes: ""             # 空 = 配对出来的客户端没有额外限制
+  db: ""                         # 空 = {tmp.root}/echo-server-auth.db
+  # 静态令牌模式大概长这样（每把令牌可以带自己的 scopes）：
   #   enabled: true
   #   tokens:
-  #     - { client_id: cli-07a3f2, token: "<32 字节随机>" }
-  #     - { client_id: cli-11b9c4, token: "<...>" }
+  #     - { client_id: cli-07a3f2, token: "<32 字节随机>", scopes: "asr diarize embed" }
+  #     - { client_id: cli-11b9c4, token: "<...>", scopes: "asr" }
+  #
+  # jwt 模式：配好 jwt_secret 之后，用命令行发配对码（管理面还没做）：
+  #   python -m server.main --new-pairing-code --created-by 管理员
+  # 把输出的配对串给同事，他在客户端面板里粘一次即可。

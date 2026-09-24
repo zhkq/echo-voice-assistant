@@ -104,11 +104,14 @@ class Admission:
 class State:
     """进程内共享状态。由 `main.create_app` 在 lifespan 里装好。"""
 
-    def __init__(self, cfg, pool: EnginePool, sweeper: Optional[tmp.Sweeper] = None):
+    def __init__(self, cfg, pool: EnginePool, sweeper: Optional[tmp.Sweeper] = None,
+                 auth=None):
         self.cfg = cfg
         self.pool = pool
         self.sweeper = sweeper
         self.started = time.time()
+        # 鉴权对象由 main 装（它要拿 store/config）。None → `client_of` 按"没鉴权"放行。
+        self.auth = auth
         self.admission = Admission(
             max_concurrent=cfg.max_concurrent,
             per_client=cfg.per_client_concurrent,
@@ -122,25 +125,82 @@ def _st(request: Request) -> State:
 
 # ---------------------------------------------------------------- 鉴权
 
-def client_of(request: Request) -> str:
-    """返回 client_id。**v1 骨架**：配置里配了几把 token 就认几把。
+#: 端点 → 它需要的 scope（设计 §7.2：`asr | diarize | embed | tts`）。
+#: 放在路由这一层，而不是让每个端点在函数体里各写一遍 ——
+#: "哪些端点属于哪个权限"是**一张表**，不是散落在各处的字符串。
+ENDPOINT_SCOPES = {
+    "/v1/asr": "asr",
+    "/v1/diarize": "diarize",
+    "/v1/speaker/embed": "embed",
+}
 
-    配对码 → `client_id` + secret → 短期 JWT 是下一步（设计 §7.4/§7.5）；
-    现在这一层已经把"每个请求是谁"这件事定下来，配额与审计都能挂上去。
-    鉴权关闭时（默认，便于本机起步）返回 `"anonymous"`。
+
+def client_of(request: Request, need_scope: str = "") -> dict:
+    """这个请求是谁（+ 有没有这项权限）。返回客户端行，失败抛 401/403。
+
+    真正的判断都在 `server/auth.py`（内存缓存 + `token_version` 比对，不每请求查库）；
+    这里只负责把它接到 FastAPI 的 `Request` 上。
+
+    鉴权关着时（默认，便于本机起步）所有请求都算 `anonymous` ——
+    此时"每客户端 1 条通道"就退化成"全局 1 条"，这正是本机单用户时的正确语义。
     """
     st = _st(request)
-    cfg = st.cfg
-    if not bool(cfg.get("auth.enabled", False)):
-        return "anonymous"
-    raw = str(request.headers.get("authorization") or "")
-    token = raw[7:].strip() if raw.startswith("Bearer ") else ""
-    if not token:
-        raise errors.unauthorized("缺少 Bearer 令牌")
-    for row in (cfg.get("auth.tokens") or []):
-        if str(row.get("token") or "") == token:
-            return str(row.get("client_id") or "unknown")
-    raise errors.unauthorized("令牌无效")
+    auth = getattr(st, "auth", None)
+    if auth is None:
+        # 理论上不会发生（main 里一定装）。留一条**诚实**的退路：
+        # 宁可按"没鉴权"放行并让它显形，也不要在这里凭空造一个 401 出来 ——
+        # 那会让"服务端起不来"表现成"所有凭据都不对"。
+        return {"client_id": "anonymous", "scopes": "", "token_version": 1, "disabled": 0}
+    return auth.authenticate(request.headers.get("authorization") or "", need_scope=need_scope)
+
+
+def client_id_of(request: Request, need_scope: str = "") -> str:
+    return str(client_of(request, need_scope=need_scope).get("client_id") or "anonymous")
+
+
+# ---------------------------------------------------------------- 配对与令牌
+
+@router.post("/pair")
+def pair(request: Request, payload: Optional[dict] = None):
+    """用一次性配对码换 `client_id` + `secret`（设计 §7.4）。**唯一的免凭据端点。**
+
+    免凭据 == 必须**额外防猜**：失败计数 + 退避（`PairThrottle`），
+    而且管理员可以整个关掉（`auth.pairing_enabled: false`，关掉后新机器进不来）。
+    """
+    st = _st(request)
+    auth = st.auth
+    if not bool(st.cfg.get("auth.pairing_enabled", True)):
+        raise errors.forbidden("服务端已关闭配对")
+    source = _source_of(request)
+    auth.throttle.check(source)
+    body = payload or {}
+    try:
+        out = auth.redeem(str(body.get("code") or ""),
+                          client_name=str(body.get("clientName") or ""))
+    except errors.EchoError:
+        auth.throttle.failed(source)
+        raise
+    auth.throttle.succeeded(source)
+    return out
+
+
+@router.post("/token")
+def token(request: Request):
+    """用 `client_id:secret` 换短期 JWT（设计 §7.5 ②）。
+
+    **不做 refresh token**：secret 本来就在客户端本地，多一层只是把同一个东西存两份。
+    """
+    st = _st(request)
+    return st.auth.token_for(request.headers.get("authorization") or "")
+
+
+def _source_of(request: Request) -> str:
+    """限速的"来源"。优先 `X-Forwarded-For` 的第一段（反代后面真正的那台）。"""
+    fwd = str(request.headers.get("x-forwarded-for") or "").split(",")[0].strip()
+    if fwd:
+        return fwd
+    client = getattr(request, "client", None)
+    return str(getattr(client, "host", "") or "unknown")
 
 
 # ---------------------------------------------------------------- 查询端点
@@ -245,7 +305,7 @@ async def asr(request: Request, variant: str = "long", timestamps: int = 0,
     """
     st = _st(request)
     cfg = st.cfg
-    cid = client_of(request)
+    cid = client_id_of(request, need_scope="asr")
     want_ts = bool(int(timestamps or 0))
 
     # `variant` → 槽。**注意短档的槽叫 `asr.text` 而不是 `asr.short`** ——
@@ -283,7 +343,7 @@ async def diarize(request: Request, mode: str = "segment", maxSpeakers: int = 0,
     """
     st = _st(request)
     cfg = st.cfg
-    cid = client_of(request)
+    cid = client_id_of(request, need_scope="diarize")
     if str(mode) != "segment":
         raise errors.bad_request("mode=%r 尚未实现（v1 只支持 segment）" % mode)
 
@@ -327,7 +387,7 @@ async def speaker_embed(request: Request, count: int = 1, model: str = ""):
     """
     st = _st(request)
     cfg = st.cfg
-    cid = client_of(request)
+    cid = client_id_of(request, need_scope="embed")
     model_id = st.pool.pick_for_slot("speaker.embed", model)
     spec = st.pool.spec(model_id)
     st.admission.precheck(cid)                 # 先判忙，再读 body

@@ -11,6 +11,10 @@
 
 不碰真实麦克风、不加载真实模型：引擎层用假加载器（`_FakeEngine`）。
 """
+import base64
+import contextlib
+import io
+import json
 import os
 import re
 import sys
@@ -22,11 +26,14 @@ from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import jwt                                                     # noqa: E402
 from fastapi.testclient import TestClient                        # noqa: E402
 
+from server import auth as auth_mod                              # noqa: E402
 from server import engines, errors, main as server_main, tmp     # noqa: E402
 from server import routes as routes_mod                          # noqa: E402
 from server import settings as settings_mod                      # noqa: E402
+from server import store as store_mod                            # noqa: E402
 from server.pool import EnginePool, ModelSpec                    # noqa: E402
 
 SERVER_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "server")
@@ -172,13 +179,23 @@ class NoBusinessCouplingTests(unittest.TestCase):
         self.assertEqual(bad, [], "服务端 import 了客户端的业务层：%s" % bad)
 
     def test_only_the_documented_routes_exist(self):
-        """`/v1/*` 只有设计里那几条；**没有任何写端点**。
+        """`/v1/*` 只有设计里那几条；**没有任何写业务数据的端点**。
 
         这条是"服务端不存储业务数据"的结构性保证之一 ——
         一旦有人加了 `/v1/x`，它会红，而不是悄悄多一个能存东西的口子。
+
+        `/v1/pair` 与 `/v1/token` 是**例外，但不是漏洞**：它们是**鉴权**端点
+        （设计 §7.4/§7.5），写的是设计 §8.5 白名单里的 `clients` / `pairing_codes`
+        两张**管理**表，一个字节的内容都不碰。它们在这里被显式列出来，
+        而不是靠"凡是 auth 开头就放行"那种模糊规则 —— 后者会让下一个
+        "看起来像鉴权"的业务端点溜进来。
         """
         allowed = {
+            # 查询
             ("GET", "/v1/capabilities"), ("GET", "/v1/health"), ("GET", "/v1/ready"),
+            # 鉴权（唯一免凭据的是 pair）
+            ("POST", "/v1/pair"), ("POST", "/v1/token"),
+            # 能力（**都不是**写端点：收音频、出结果、不留存）
             ("POST", "/v1/asr"), ("POST", "/v1/diarize"), ("POST", "/v1/speaker/embed"),
         }
         got = set()
@@ -886,6 +903,682 @@ class VectorSpaceFrozenTests(unittest.TestCase):
         spec = engines.default_specs()[0]
         with self.assertRaises(AttributeError):
             spec.vector_space_id = "ws-somebody-changed-it-at-runtime"  # type: ignore[misc]
+
+
+# ================================================================ 鉴权
+#
+# 设计 §7。这一组用例的写法有一条贯穿的原则：**只钉"能观察到的行为"**，
+# 不去断言内部实现（比如"缓存里有没有那一行"）—— 后者会让重构变成改测试。
+
+def _auth_cfg(tmp_root, **over):
+    cfg = settings_mod.load()
+    cfg.raw["tmp"]["root"] = tmp_root
+    cfg.raw["auth"]["db"] = os.path.join(tmp_root, "auth.db")
+    for k, v in over.items():
+        cfg.raw["auth"][k] = v
+    return cfg
+
+
+class AuthSchemaTests(unittest.TestCase):
+    """设计 §8.5 的存储边界 —— **这是"服务端到底存了什么"唯一能被机器检查的地方**。
+
+    判据一句话：存**关于请求的元数据**与**关于客户端的管理数据**；
+    不存**请求的内容**，也不存任何业务概念。
+
+    两条断言把这句话变成可执行的：表集合 ⊆ 白名单，列名不得命中列黑名单。
+    加表加列都要先面对这两条。
+    """
+
+    #: 设计 §8.5 的列黑名单。**刻意放在测试里而不是 `server/store.py`** ——
+    #: 它是审计规则不是运行时数据，而且它本身就是由那些"不许出现在服务端源码里的词"
+    #: 拼成的：放进 server/ 会跟"源码不含业务词"的护栏打架，而护栏不该为自己让路。
+    COLUMN_BLACKLIST = ("text", "transcript", "content", "body", "audio", "wav",
+                        "embedding", "vector", "speaker_name", "meeting", "command",
+                        "summary", "voiceprint", "prompt", "reply")
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="echo-auth-schema-")
+        self.store = store_mod.Store(os.path.join(self.tmp, "auth.db"))
+        self.addCleanup(self.store.close)
+
+    def test_tables_are_a_subset_of_the_documented_whitelist(self):
+        self.assertTrue(set(self.store.tables()) <= set(store_mod.TABLE_WHITELIST),
+                        "出现了白名单外的表：%s" % (set(self.store.tables()) - set(store_mod.TABLE_WHITELIST)))
+        self.assertTrue(self.store.tables(), "一张表都没有？那鉴权没地方放")
+
+    def test_no_column_is_named_like_content(self):
+        bad = []
+        for table, cols in self.store.columns().items():
+            for c in cols:
+                if c.lower() in self.COLUMN_BLACKLIST:
+                    bad.append("%s.%s" % (table, c))
+        self.assertEqual(bad, [], "库里出现了'内容/业务概念'的列名：%s" % bad)
+
+    def test_the_whitelist_here_matches_the_one_in_the_code(self):
+        """代码里的白名单与设计 §8.5 必须一致（这里只钉前后两端不漂）。"""
+        self.assertEqual(tuple(store_mod.TABLE_WHITELIST), ("clients", "pairing_codes"))
+
+
+class AuthPairingTests(unittest.TestCase):
+    """配对：一次性码 → `client_id` + `secret`（设计 §7.4）。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="echo-auth-pair-")
+        self.cfg = _auth_cfg(self.tmp, enabled=True, mode="jwt",
+                             jwt_secret="unit-test-secret-0123456789abcdef")
+        self.store = auth_mod.open_store(self.cfg)
+        self.auth = auth_mod.Auth(self.cfg, self.store)
+        self.addCleanup(self.store.close)
+
+    def test_code_is_single_use(self):
+        code = self.auth.create_pairing_code("admin")
+        first = self.auth.redeem(code, "张三的办公本")
+        self.assertTrue(first["clientId"].startswith("cli-"))
+        self.assertTrue(first["secret"])
+        with self.assertRaises(errors.EchoError) as ctx:
+            self.auth.redeem(code, "别人")
+        self.assertEqual(ctx.exception.status, 401)
+
+    def test_code_is_normalized_so_case_and_spaces_do_not_matter(self):
+        """人工抄码必然带上空格、大小写也会随手改 —— 归一化，别让人白试。"""
+        code = self.auth.create_pairing_code()
+        out = self.auth.redeem("  " + code.lower() + " ", "抄错大小写的同事")
+        self.assertTrue(out["clientId"])
+
+    def test_unknown_code_is_refused(self):
+        with self.assertRaises(errors.EchoError) as ctx:
+            self.auth.redeem("ZZZZZZZZ")
+        self.assertEqual(ctx.exception.status, 401)
+
+    def test_expired_code_is_refused(self):
+        self.cfg.raw["auth"]["pairing_ttl_s"] = -1        # 生成即过期
+        code = self.auth.create_pairing_code()
+        with self.assertRaises(errors.EchoError) as ctx:
+            self.auth.redeem(code)
+        self.assertEqual(ctx.exception.status, 401)
+
+    def test_secret_is_never_stored_in_plaintext(self):
+        """**只存哈希**（§7.4 约定 2）—— 直接翻库文件字节，不信任代码注释。"""
+        code = self.auth.create_pairing_code()
+        out = self.auth.redeem(code, "谁的机器")
+        blob = open(os.path.join(self.tmp, "auth.db"), "rb").read()
+        self.assertNotIn(out["secret"].encode(), blob, "secret 明文落库了")
+        self.assertNotIn(code.encode(), blob, "配对码明文落库了")
+        row = self.store.client(out["clientId"])
+        self.assertTrue(row["secret_hash"])
+        self.assertNotEqual(row["secret_hash"], out["secret"])
+
+    def test_used_code_is_deleted_not_kept(self):
+        """§8.5："用掉即删" —— 留着会让"待用配对码 0 行"那张自证页说谎。"""
+        code = self.auth.create_pairing_code()
+        self.assertEqual(len(self.store.pairing_codes()), 1)
+        self.auth.redeem(code)
+        self.assertEqual(self.store.pairing_codes(), [])
+
+    def test_throttle_stops_brute_force(self):
+        """免凭据的端点必须防猜（§7.4 约定 1）。
+
+        31 个字符、8 位的码空间不小，但**不限速就等于把爆破变成一件耐心的事**。
+
+        **故意走 HTTP 而不是直接调 `redeem()`**：限速的"来源"是 HTTP 层的东西
+        （`X-Forwarded-For` / 对端地址），计数挂在端点上。这一点是本用例第一次
+        写错时暴露出来的 —— 当时直接调 `redeem()`，401 一个接一个地来，
+        因为**端点上的计数压根没被碰到**。"类里有个限速器"不等于"端点防住了"。
+        """
+        cfg = _auth_cfg(tempfile.mkdtemp(prefix="echo-auth-throttle-"),
+                        enabled=True, mode="jwt",
+                        jwt_secret="unit-test-secret-0123456789abcdef",
+                        pair_max_failures=3)
+        with patch.object(engines, "build_loaders",
+                          lambda device="cuda": {"fake": _fake_loader}):
+            app = server_main.create_app(cfg)
+            with TestClient(app) as c:
+                for i in range(3):
+                    r = c.post("/v1/pair", json={"code": "AAAAAAAA"})
+                    self.assertEqual(r.status_code, 401, "第 %d 次应当是码不对" % (i + 1))
+                r = c.post("/v1/pair", json={"code": "AAAAAAAA"})
+        self.assertEqual(r.status_code, 429, r.text)
+        self.assertEqual(r.json()["code"], "rate_limited")
+        self.assertIn("Retry-After", r.headers)
+
+    def test_successful_pairing_clears_the_failure_counter(self):
+        """配对成功要把计数清零 —— 否则一个用户手滑几次，
+        整个办公室（同一个出口 IP）后面都进不来。"""
+        cfg = _auth_cfg(tempfile.mkdtemp(prefix="echo-auth-throttle2-"),
+                        enabled=True, mode="jwt",
+                        jwt_secret="unit-test-secret-0123456789abcdef",
+                        pair_max_failures=3)
+        with patch.object(engines, "build_loaders",
+                          lambda device="cuda": {"fake": _fake_loader}):
+            app = server_main.create_app(cfg)
+            with TestClient(app) as c:
+                for _ in range(2):
+                    c.post("/v1/pair", json={"code": "AAAAAAAA"})
+                code = c.app.state.echo.auth.create_pairing_code("admin")
+                ok = c.post("/v1/pair", json={"code": code, "clientName": "手滑的那位"})
+                self.assertEqual(ok.status_code, 200, ok.text)
+                # 计数被清掉，所以后面还能再失败两次而不被限速
+                for _ in range(2):
+                    r = c.post("/v1/pair", json={"code": "AAAAAAAA"})
+                    self.assertEqual(r.status_code, 401)
+
+    def test_pairing_can_be_switched_off(self):
+        """关掉之后**新机器进不来**（老客户端照用）—— §7.4 约定 1 的"可选择关闭"。"""
+        cfg = _auth_cfg(tempfile.mkdtemp(prefix="echo-auth-pairoff-"),
+                        enabled=True, mode="jwt",
+                        jwt_secret="unit-test-secret-0123456789abcdef",
+                        pairing_enabled=False)
+        with patch.object(engines, "build_loaders",
+                          lambda device="cuda": {"fake": _fake_loader}):
+            app = server_main.create_app(cfg)
+            with TestClient(app) as c:
+                code = c.app.state.echo.auth.create_pairing_code("admin")
+                r = c.post("/v1/pair", json={"code": code})
+        self.assertEqual(r.status_code, 403, r.text)
+
+
+class AuthTokenTests(unittest.TestCase):
+    """令牌：换、验、以及**撤销立即生效**（设计 §7.5）。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="echo-auth-token-")
+        self.cfg = _auth_cfg(self.tmp, enabled=True, mode="jwt",
+                             jwt_secret="unit-test-secret-0123456789abcdef")
+        self.store = auth_mod.open_store(self.cfg)
+        self.auth = auth_mod.Auth(self.cfg, self.store)
+        self.addCleanup(self.store.close)
+        code = self.auth.create_pairing_code()
+        paired = self.auth.redeem(code, "测试客户端")
+        self.client_id = paired["clientId"]
+        self.secret = paired["secret"]
+        self.basic = "Basic " + base64.b64encode(
+            ("%s:%s" % (self.client_id, self.secret)).encode()).decode()
+
+    def _bearer(self):
+        return "Bearer " + self.auth.token_for(self.basic)["accessToken"]
+
+    def test_token_round_trip(self):
+        out = self.auth.token_for(self.basic)
+        self.assertEqual(out["clientId"], self.client_id)
+        self.assertEqual(out["expiresIn"], 3600)
+        claims = auth_mod.decode_token(out["accessToken"], self.cfg.get("auth.jwt_secret"))
+        self.assertEqual(claims["sub"], self.client_id)
+        self.assertEqual(claims["ver"], 1)
+        self.assertIn("jti", claims)
+
+    def test_wrong_secret_is_refused(self):
+        other = "Basic " + base64.b64encode(
+            ("%s:%s" % (self.client_id, "not-the-secret")).encode()).decode()
+        with self.assertRaises(errors.EchoError) as ctx:
+            self.auth.token_for(other)
+        self.assertEqual(ctx.exception.status, 401)
+
+    def test_missing_jwt_secret_is_a_server_side_error_not_401(self):
+        """没配密钥是**服务端自己的问题**，不能报成"你的凭据不对"。
+
+        客户端看到 401 会去翻自己的配置；运营看到 503 auth_misconfigured
+        才会来看服务端。**把这两种失败混起来是最贵的一种省事。**
+        """
+        cfg = _auth_cfg(tempfile.mkdtemp(prefix="echo-auth-nokey-"), enabled=True, mode="jwt")
+        cfg.raw["auth"]["jwt_secret"] = ""
+        store = auth_mod.open_store(cfg)
+        self.addCleanup(store.close)
+        a = auth_mod.Auth(cfg, store)
+        with self.assertRaises(errors.EchoError) as ctx:
+            a.key
+        self.assertEqual(ctx.exception.status, 503)
+        self.assertEqual(ctx.exception.code, "auth_misconfigured")
+
+    # ---- JWT 校验的四个经典攻击面 -------------------------------------------
+
+    def test_alg_none_is_refused(self):
+        """`alg: none` —— 最经典的 JWT 漏洞。
+
+        如果实现信任 token 自称的算法，攻击者把签名段留空就能伪造任意身份。
+        """
+        forged = jwt.encode({"sub": self.client_id, "ver": 1,
+                             "exp": int(time.time()) + 600},
+                            key="", algorithm="none")
+        with self.assertRaises(errors.EchoError) as ctx:
+            auth_mod.decode_token(forged, self.cfg.get("auth.jwt_secret"))
+        self.assertEqual(ctx.exception.status, 401)
+
+    def test_alg_check_is_ours_not_the_librarys(self):
+        """**这一层是我们自己的判断，不许依赖库的默认行为。**
+
+        PyJWT 传 `algorithms=["HS256"]` 时自己也会拒 `alg=none`
+        （实测抛 `InvalidAlgorithmError`）。所以上面那条用例**两条防线任一条在都能过**，
+        它并没有钉住我们的那一层。
+
+        这里把库换成"什么都放行"，验证我们自己的 header 检查仍然拦得住 ——
+        因为"库会替我们挡住"这件事**不是我们的契约**：库可以换、可以升级、
+        可以作为别的用途被包装。撤销一个身份靠的是我们自己的判断。
+        """
+        forged = jwt.encode({"sub": self.client_id, "ver": 1,
+                             "exp": int(time.time()) + 600},
+                            key="", algorithm="none")
+        with patch.object(auth_mod.jwt, "decode",
+                          return_value={"sub": self.client_id, "ver": 1}):
+            with self.assertRaises(errors.EchoError) as ctx:
+                auth_mod.decode_token(forged, self.cfg.get("auth.jwt_secret"))
+        self.assertEqual(ctx.exception.status, 401)
+        self.assertIn("算法", str(ctx.exception.detail))
+
+    def test_header_must_be_exactly_what_we_issue(self):
+        """`typ` 也必须是我们认的那两种之一（缺省或 `JWT`）。
+
+        这条同样是**我们自己的**约定：私有协议里收紧头部，比"以后再说"便宜。
+        """
+        weird = jwt.encode({"sub": self.client_id, "ver": 1,
+                            "exp": int(time.time()) + 600, "typ": "something-else"},
+                           self.cfg.get("auth.jwt_secret"), algorithm="HS256",
+                           headers={"typ": "not-a-jwt"})
+        with self.assertRaises(errors.EchoError):
+            auth_mod.decode_token(weird, self.cfg.get("auth.jwt_secret"))
+
+    def test_token_signed_with_another_key_is_refused(self):
+        forged = jwt.encode({"sub": self.client_id, "ver": 1,
+                             "exp": int(time.time()) + 600},
+                            "attacker-key", algorithm="HS256")
+        with self.assertRaises(errors.EchoError):
+            auth_mod.decode_token(forged, self.cfg.get("auth.jwt_secret"))
+
+    def test_tampered_payload_is_refused(self):
+        """改载荷（比如把 ver 改大以"撤销后继续用"）必须让签名对不上。"""
+        good = self.auth.token_for(self.basic)["accessToken"]
+        head, payload, sig = good.split(".")
+        padded = payload + "=" * (-len(payload) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(padded))
+        claims["ver"] = 999
+        forged_payload = base64.urlsafe_b64encode(
+            json.dumps(claims).encode()).decode().rstrip("=")
+        with self.assertRaises(errors.EchoError):
+            auth_mod.decode_token("%s.%s.%s" % (head, forged_payload, sig),
+                                  self.cfg.get("auth.jwt_secret"))
+
+    def test_expired_token_is_refused(self):
+        expired = jwt.encode({"sub": self.client_id, "ver": 1,
+                              "exp": int(time.time()) - 7200},
+                             self.cfg.get("auth.jwt_secret"), algorithm="HS256")
+        with self.assertRaises(errors.EchoError):
+            auth_mod.decode_token(expired, self.cfg.get("auth.jwt_secret"))
+
+    def test_clock_skew_is_tolerated(self):
+        """内网机器时钟未必准 —— 60 秒内的偏差要放行（§7.5 ③）。"""
+        slightly_expired = jwt.encode({"sub": self.client_id, "ver": 1,
+                                       "exp": int(time.time()) - 10},
+                                      self.cfg.get("auth.jwt_secret"), algorithm="HS256")
+        claims = auth_mod.decode_token(slightly_expired, self.cfg.get("auth.jwt_secret"))
+        self.assertEqual(claims["sub"], self.client_id)
+
+    # ---- 撤销 ---------------------------------------------------------------
+
+    def test_revoke_takes_effect_on_the_very_next_request(self):
+        """**撤销必须立即生效**，不许等那 1 小时的 exp 走完（§7.4 约定 4）。
+
+        这是"短期 JWT 也能安全撤销"的全部依据：JWT 里带 `ver`，
+        与缓存里的 `token_version` 比对。撤销 = 版本 +1 → 下一个请求就 401。
+        """
+        bearer = self._bearer()
+        self.auth.authenticate(bearer)                       # 现在能用
+        self.auth.cache.revoke(self.client_id)               # 撤销
+        with self.assertRaises(errors.EchoError) as ctx:
+            self.auth.authenticate(bearer)                   # 同一个 token
+        self.assertEqual(ctx.exception.status, 401)
+        self.assertIn("撤销", str(ctx.exception.detail) or str(ctx.exception))
+
+    def test_token_signed_before_revoke_is_still_refused_after_reissue(self):
+        """撤销后再换的新令牌版本号已经变了，旧令牌**永远**回不来。"""
+        old = self._bearer()
+        self.auth.cache.revoke(self.client_id)
+        fresh = self._bearer()
+        self.assertNotEqual(old, fresh)
+        self.auth.authenticate(fresh)
+        with self.assertRaises(errors.EchoError):
+            self.auth.authenticate(old)
+
+    def test_disabled_client_gets_403_not_401(self):
+        """禁用是"我认识你，但不许用" —— 403。与 401（不知道你是谁）语义不同。"""
+        bearer = self._bearer()
+        self.auth.cache.set_disabled(self.client_id, True)
+        with self.assertRaises(errors.EchoError) as ctx:
+            self.auth.authenticate(bearer)
+        self.assertEqual(ctx.exception.status, 403)
+
+    def test_unknown_client_is_401(self):
+        forged = jwt.encode({"sub": "cli-does-not-exist", "ver": 1,
+                             "exp": int(time.time()) + 600},
+                            self.cfg.get("auth.jwt_secret"), algorithm="HS256")
+        with self.assertRaises(errors.EchoError) as ctx:
+            self.auth.authenticate("Bearer " + forged)
+        self.assertEqual(ctx.exception.status, 401)
+
+    # ---- 跨进程撤销（这一条是补上一个真实漏洞时写的）------------------------
+
+    def test_revoke_from_another_process_is_eventually_noticed(self):
+        """**命令行 `--revoke` 是另一个进程。** 它改的是库，跑着的服务不会自己知道。
+
+        实测过：命令行撤销之后，服务端**继续接受**那个 JWT，直到缓存自己过期
+        （默认 60 秒）。设计里其实早写了"多实例 ≤5 秒靠轻量轮询发现"，
+        但代码里没实现 —— 于是"撤销立即生效"这句在**唯一的运维入口**上是假话。
+
+        这条用例模拟"另一个进程"：**绕开 `Auth` 对象，直接改库**，
+        然后只调 `poll_once()`（不 sleep，确定性强），再看那个老 JWT 是否已经不认。
+        """
+        bearer = self._bearer()
+        self.auth.authenticate(bearer)                       # 现在能用
+
+        # 另开一个"进程"：新 Store + 新 Auth，改库（等同于命令行 --revoke）
+        other = auth_mod.open_store(self.cfg)
+        self.addCleanup(other.close)
+        auth_mod.Auth(self.cfg, other).cache.revoke(self.client_id)
+
+        # 本进程此刻**还不知道**（缓存里还是旧版本号）—— 这正是漏洞的样子
+        self.auth.authenticate(bearer)
+        # 轮询一次 → 发现 updated_at 变了 → 整体刷缓存
+        self.assertTrue(self.auth.watcher.poll_once(), "轮询没发现库变过")
+        with self.assertRaises(errors.EchoError) as ctx:
+            self.auth.authenticate(bearer)
+        self.assertEqual(ctx.exception.status, 401)
+
+    def test_watcher_only_refreshes_when_something_actually_changed(self):
+        """没变化就不刷 —— 否则每 5 秒把所有客户端行重读一遍，白烧。
+
+        注意第一次轮询**会**返回 True：`setUp` 是先建 watcher、再配对，
+        所以"多了一个客户端"对它是货真价实的变化。把它吸收掉之后，
+        后面几次必须都是空转。这条钉的是**幂等**，不是"第一次必须为假"。
+        """
+        self.assertTrue(self.auth.watcher.poll_once(), "配对是变化，第一次该发现")
+        settled = self.auth.watcher.refreshes
+        for _ in range(3):
+            self.assertFalse(self.auth.watcher.poll_once())
+        self.assertEqual(self.auth.watcher.refreshes, settled, "没变化却又刷了缓存")
+
+    def test_watcher_notices_disable_too_not_just_revoke(self):
+        """探针是 `MAX(updated_at)` 而不是 `MAX(token_version)` ——**因为它要能发现禁用**。
+
+        这是我刻意的选择：撤销改 `token_version`，禁用改 `disabled`，
+        如果只看 token_version，禁用就永远同步不到别的进程。
+        """
+        other = auth_mod.open_store(self.cfg)
+        self.addCleanup(other.close)
+        other.set_disabled(self.client_id, True)             # 另一个进程禁用它
+        self.assertTrue(self.auth.watcher.poll_once())
+        with self.assertRaises(errors.EchoError) as ctx:
+            self.auth.authenticate(self._bearer())
+        self.assertEqual(ctx.exception.status, 403)
+
+
+class AuthScopeTests(unittest.TestCase):
+    """scopes：`asr | diarize | embed | tts`（设计 §7.2）。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="echo-auth-scope-")
+        self.cfg = _auth_cfg(self.tmp, enabled=True, mode="jwt",
+                             jwt_secret="unit-test-secret-0123456789abcdef")
+        self.store = auth_mod.open_store(self.cfg)
+        self.auth = auth_mod.Auth(self.cfg, self.store)
+        self.addCleanup(self.store.close)
+
+    def _client(self, scopes):
+        cid = auth_mod.new_client_id()
+        self.store.upsert_client(cid, "n", auth_mod.hash_secret("s", cid), scopes)
+        row = self.store.client(cid)
+        token, _ = auth_mod.issue_token(row, self.cfg.get("auth.jwt_secret"), 600)
+        return "Bearer " + token
+
+    def test_scope_is_enforced(self):
+        bearer = self._client("asr")
+        self.auth.authenticate(bearer, need_scope="asr")           # 放行
+        with self.assertRaises(errors.EchoError) as ctx:
+            self.auth.authenticate(bearer, need_scope="diarize")
+        self.assertEqual(ctx.exception.status, 403)
+
+    def test_empty_scopes_mean_no_extra_restriction(self):
+        """**空 scopes = 不额外限制**，不是"什么都不许"。
+
+        把空解释成"全禁"会让"我明明配了客户端却全 403"变成一个谜；
+        真正的"什么都不许"应该由 `disabled` 表达。
+        """
+        bearer = self._client("")
+        for scope in ("asr", "diarize", "embed"):
+            self.auth.authenticate(bearer, need_scope=scope)
+
+    def test_every_capability_endpoint_declares_a_scope(self):
+        """端点到 scope 是一张**表**，不是散落各处的字符串 —— 表要覆盖所有能力端点。"""
+        capability_posts = {p for (m, p) in
+                            [("POST", "/v1/asr"), ("POST", "/v1/diarize"),
+                             ("POST", "/v1/speaker/embed")]}
+        self.assertEqual(set(routes_mod.ENDPOINT_SCOPES), capability_posts)
+        self.assertEqual(routes_mod.ENDPOINT_SCOPES["/v1/diarize"], "diarize")
+
+    def test_endpoints_actually_pass_their_scope(self):
+        """接了表还不够 —— 端点得**真的把 scope 传下去**（否则表是摆设）。"""
+        src = open(os.path.join(SERVER_DIR, "routes.py"), encoding="utf-8").read()
+        for path, scope in routes_mod.ENDPOINT_SCOPES.items():
+            with self.subTest(path=path):
+                self.assertIn('need_scope="%s"' % scope, src,
+                              "%s 没有把 need_scope=%s 传下去" % (path, scope))
+
+
+class EnvOverrideTests(unittest.TestCase):
+    """部署文件里写的 `ECHO_*` 变量，代码必须**真的读**。
+
+    这是本仓库吃过的一类亏的通用形态：**手册上写了、代码里没做**。
+    这里用机器把它变成可执行的 —— 扫 `compose.yaml` 与 `echo-server.example.yaml`
+    里出现的每一个 `ECHO_*` 名字，逐个确认 `_env_overrides()` 处理了。
+
+    为什么值得单独一条：写进部署文件的变量名不被读，是**最容易发生、又最难发现**
+    的一种谎 —— 服务照着文档配，行为却完全没变，而现场看起来"配置是对的"。
+    """
+
+    #: 这些是**故意**只出现在注释里当示例值的（比如让人自己填的密钥格式）。
+    #: 白名单要短，而且每一条都要能说出为什么 —— 它就是这个测试的漏洞面。
+    ALLOWED_UNIMPLEMENTED = set()
+
+    def _declared(self):
+        names = set()
+        # compose：**运行时环境变量**才在 `environment:` 里；`build.args` 是构建期的。
+        # 结构上摘掉 `build`，比写一份"允许名单"可靠 —— 名单是会过期的，
+        # 而"这一段不是运行时配置"是文件的固有结构。
+        import yaml
+        compose = yaml.safe_load(
+            open(os.path.join(SERVER_DIR, "compose.yaml"), encoding="utf-8").read()) or {}
+        for svc in (compose.get("services") or {}).values():
+            if isinstance(svc, dict):
+                names |= set(re.findall(r"\bECHO_[A-Z0-9_]+\b",
+                                        json.dumps(svc.get("environment") or {})))
+        # 示例配置里的 `ECHO_*` 全是运行时变量
+        names |= set(re.findall(r"\bECHO_[A-Z0-9_]+\b",
+                                open(os.path.join(SERVER_DIR, "echo-server.example.yaml"),
+                                     encoding="utf-8").read()))
+        # Dockerfile：只有 `ENV` 声明的是**运行时**配置。
+        # `ARG` / `--build-arg` / `RUN if [ "$X" = ... ]` 都是构建期的。
+        # （前两版这里都写松了：先扫整个文件、再按"含 ARG 的行"过滤，
+        #   而 `RUN if [ "$ECHO_EXTRA" = "1" ]` 两样都不含 —— 是**测试自己**
+        #   把 build arg 误报成运行时变量。所以改成只认 ENV 块。）
+        env_lines, collecting = [], False
+        with open(os.path.join(SERVER_DIR, "Dockerfile"), encoding="utf-8") as fh:
+            docker_lines = fh.read().splitlines()
+        for ln in docker_lines:
+            if ln.startswith("ENV "):
+                collecting = True
+            elif collecting and not ln.endswith("\\") and not ln.startswith(" "):
+                collecting = False
+            if collecting:
+                env_lines.append(ln)
+        names |= set(re.findall(r"\bECHO_[A-Z0-9_]+\b", "\n".join(env_lines)))
+        return names
+
+    def test_every_declared_env_var_is_actually_read(self):
+        src = open(os.path.join(SERVER_DIR, "settings.py"), encoding="utf-8").read()
+        missing = sorted(n for n in self._declared()
+                         if n not in src and n not in self.ALLOWED_UNIMPLEMENTED)
+        self.assertEqual(missing, [],
+                         "这些变量写进了部署文件，但 settings._env_overrides 没读它们：%s"
+                         % missing)
+
+    def test_we_declare_a_reasonable_number_of_vars(self):
+        """防止上一条因为正则没匹配上而空转。"""
+        self.assertGreaterEqual(len(self._declared()), 5)
+
+    def test_false_is_not_truthy(self):
+        """`ECHO_AUTH_ENABLED=false` **不能**把鉴权打开。
+
+        容器编排里 `"false"` 是字符串，而 Python 里非空字符串都是真 ——
+        直接 `bool(os.environ[...])` 会让"我明明关了"变成"它开着"。
+        """
+        for value, expect in (("false", False), ("0", False), ("no", False),
+                              ("true", True), ("1", True), ("yes", True)):
+            with self.subTest(value=value):
+                with patch.dict(os.environ, {"ECHO_AUTH_ENABLED": value}, clear=False):
+                    over = settings_mod._env_overrides()
+                self.assertEqual(over.get("auth", {}).get("enabled"), expect)
+
+    def test_unparsable_bool_is_treated_as_unset(self):
+        """认不出来就当没设 —— **绝不猜**（猜错的代价是静默反向）。"""
+        with patch.dict(os.environ, {"ECHO_AUTH_ENABLED": "maybe"}, clear=False):
+            over = settings_mod._env_overrides()
+        self.assertNotIn("enabled", over.get("auth", {}))
+
+    def test_documented_auth_env_vars_work(self):
+        """`compose.yaml` 里以注释形式给的那三个鉴权变量，**取消注释就得能用**。
+
+        它们没进上面那条"声明 ⇒ 被读"的扫描（因为在 compose 里是注释，
+        yaml 看不见）。但注释也是文档 —— 用户照着取消注释，行为必须跟着变。
+        所以单独钉一条。
+        """
+        env = {"ECHO_AUTH_ENABLED": "true", "ECHO_AUTH_MODE": "jwt",
+               "ECHO_JWT_SECRET": "x" * 32, "ECHO_PAIRING_ENABLED": "false"}
+        with patch.dict(os.environ, env, clear=False):
+            over = settings_mod._env_overrides()
+        self.assertEqual(over["auth"]["enabled"], True)
+        self.assertEqual(over["auth"]["mode"], "jwt")
+        self.assertEqual(over["auth"]["jwt_secret"], "x" * 32)
+        self.assertEqual(over["auth"]["pairing_enabled"], False)
+
+    def test_state_root_is_not_tmp_root(self):
+        """**耐久状态不许落在临时目录里**（这一条是被一个真实的数据丢失隐患逼出来的）。
+
+        `tmp.root` 是"随便删、会被清理器扫、可以挂 tmpfs 换性能"的地方；
+        鉴权库存着所有客户端凭据。两者放一起意味着：运维照文档把 tmp 换成内存盘，
+        **所有配过的客户端一起消失**。
+        """
+        cfg = settings_mod.load()
+        self.assertNotEqual(os.path.abspath(cfg.state_root),
+                            os.path.abspath(cfg.tmp_root),
+                            "state_root 与 tmp_root 不能是同一个目录")
+        with patch.dict(os.environ, {"ECHO_TMP_ROOT": "/dev/shm/echo"}, clear=False):
+            cfg2 = settings_mod.load()
+        self.assertNotIn("/dev/shm", cfg2.state_root,
+                         "把 tmp 指到内存盘之后，state_root 跟着搬过去了 —— 那会丢客户端")
+
+    def test_open_store_never_lands_in_tmp(self):
+        """配置里不写 `auth.db` 时，库文件也不许落在 tmp_root 下。"""
+        cfg = settings_mod.load()
+        cfg.raw["tmp"]["root"] = tempfile.mkdtemp(prefix="echo-env-tmp-")
+        cfg.raw["server"]["state_root"] = tempfile.mkdtemp(prefix="echo-env-state-")
+        cfg.raw["auth"]["db"] = ""
+        store = auth_mod.open_store(cfg)
+        self.addCleanup(store.close)
+        self.assertTrue(store.path.startswith(cfg.raw["server"]["state_root"]),
+                        "鉴权库落到了 %s" % store.path)
+        self.assertNotIn(cfg.raw["tmp"]["root"], store.path)
+
+
+class AdminCliTests(unittest.TestCase):
+    """命令行管理入口（管理面做好之前的唯一入口）。
+
+    为什么它必须被测试：`/v1/pair` 要一次性配对码，而配对码只能从服务端这边发。
+    管理面（设计 §8.4）还没做，所以**这条命令不通 = 这套鉴权装上了也用不起来**。
+    它是"整套鉴权能不能真的落地"的最后一步，比任何单个函数都值得钉。
+
+    这些动作**不打 HTTP**：直接开库。给管理动作开一条免鉴权的内部端点，
+    正是最容易变成漏洞的做法。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="echo-auth-cli-")
+        self.cfg_path = os.path.join(self.tmp, "server.yaml")
+        with open(self.cfg_path, "w", encoding="utf-8") as fh:
+            # specs 用假模型（YAML 是 JSON 的超集，直接塞进去）——
+            # 这组用例验的是**鉴权链路**，不该顺手把 qwen3asr 真加载一遍。
+            fh.write(
+                "server: {id: cli-test, listen: '127.0.0.1:8901'}\n"
+                "auth:\n"
+                "  enabled: true\n"
+                "  mode: jwt\n"
+                "  jwt_secret: '0123456789abcdef0123456789abcdef'\n"
+                "  db: '%s'\n"
+                "tmp: {root: '%s'}\n"
+                "models: {specs: %s}\n" % (
+                    os.path.join(self.tmp, "auth.db").replace("\\", "/"),
+                    self.tmp.replace("\\", "/"),
+                    json.dumps(FAKE_SPECS)))
+
+    def _run(self, *argv):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = server_main.main(["--config", self.cfg_path] + list(argv))
+        return rc, buf.getvalue()
+
+    def test_new_pairing_code_prints_a_pasteable_string(self):
+        rc, out = self._run("--new-pairing-code", "--created-by", "管理员")
+        self.assertEqual(rc, 0)
+        self.assertIn("echo://pair?", out)
+        self.assertIn("code=", out)
+
+    def test_the_printed_code_actually_works(self):
+        """**端到端的那一步**：命令行生成的码，服务端进程真的能兑换。
+
+        这条把两件事接起来 —— 命令行写的库，就是服务端读的那个库。
+        分开测两边都对、合起来不通，是这类工具最常见的坏法。
+        """
+        _, out = self._run("--new-pairing-code")
+        url = [ln.strip() for ln in out.splitlines() if "echo://pair" in ln][0]
+        code = url.split("code=")[1].split("&")[0]
+
+        cfg = settings_mod.load(self.cfg_path)
+        with patch.object(engines, "build_loaders",
+                          lambda device="cuda": {"fake": _fake_loader}):
+            app = server_main.create_app(cfg)
+            with TestClient(app) as c:
+                r = c.post("/v1/pair", json={"code": code, "clientName": "CLI 的机器"})
+                self.assertEqual(r.status_code, 200, r.text)
+                cid = r.json()["clientId"]
+                # 换令牌 + 带上它调能力端点（应当越过鉴权，落到音频解码那一层）
+                basic = base64.b64encode(
+                    ("%s:%s" % (cid, r.json()["secret"])).encode()).decode()
+                tok = c.post("/v1/token",
+                             headers={"Authorization": "Basic " + basic}).json()["accessToken"]
+                r = c.post("/v1/asr", content=_wav_bytes(),
+                           headers={"Content-Type": "audio/wav",
+                                    "Authorization": "Bearer " + tok})
+                self.assertEqual(r.status_code, 200, r.text)
+
+    def test_list_clients_shows_a_paired_one(self):
+        self._run("--new-pairing-code")
+        cfg = settings_mod.load(self.cfg_path)
+        store = auth_mod.open_store(cfg)
+        code = auth_mod.Auth(cfg, store).create_pairing_code()
+        auth_mod.Auth(cfg, store).redeem(code, "列出来的那台")
+        store.close()
+        rc, out = self._run("--list-clients")
+        self.assertEqual(rc, 0)
+        self.assertIn("列出来的那台", out)
+
+    def test_revoke_bumps_the_version(self):
+        cfg = settings_mod.load(self.cfg_path)
+        store = auth_mod.open_store(cfg)
+        a = auth_mod.Auth(cfg, store)
+        out = a.redeem(a.create_pairing_code(), "要被撤的")
+        store.close()
+        rc, text = self._run("--revoke", out["clientId"])
+        self.assertEqual(rc, 0)
+        self.assertIn("撤销", text)
+        store = auth_mod.open_store(cfg)
+        self.assertEqual(store.client(out["clientId"])["token_version"], 2)
+        store.close()
 
 
 if __name__ == "__main__":

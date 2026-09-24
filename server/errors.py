@@ -78,6 +78,26 @@ def quota_exceeded(retry_after: int) -> EchoError:
     return EchoError(429, "quota_exceeded", "当日额度已用完", retry_after=retry_after)
 
 
+def rate_limited(retry_after: int, detail: str = "") -> EchoError:
+    """被限速（目前只用于 `/v1/pair` 的失败退避）。
+
+    **与 `quota_exceeded` 分开**：那个是"额度用完了"，这个是"你刚试错太多次"。
+    客户端对前者的正确反应是"今天别再试"，对后者是"等几秒再试一次" ——
+    合成一个 code 就只能盲目退避。
+    """
+    return EchoError(429, "rate_limited", "尝试过于频繁，请稍后再试",
+                     retry_after=retry_after, detail=detail)
+
+
+def auth_misconfigured(detail: str = "") -> EchoError:
+    """服务端自己的鉴权配置不对（例如 `mode=jwt` 却没配密钥）。
+
+    **不是 401**：401 是"你的凭据不对"，这个是"我这边没配好"——
+    客户端不该去翻自己的配置，运营该来看服务端日志。
+    """
+    return EchoError(503, "auth_misconfigured", "服务端鉴权未正确配置", detail=detail)
+
+
 def server_busy(retry_after: int) -> EchoError:
     """服务端通道满。**系统忙，稍后再试** —— 这条才该退避重试。"""
     return EchoError(503, "server_busy", "系统忙，请稍后再试", retry_after=retry_after)
