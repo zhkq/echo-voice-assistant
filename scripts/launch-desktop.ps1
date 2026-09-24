@@ -37,8 +37,15 @@ $root = Split-Path $PSScriptRoot -Parent
 # Start the service without ever creating a console window: the venv pythonw would
 # otherwise leak a console that Windows Terminal shows as an empty tab.
 . (Join-Path $PSScriptRoot 'echo-launch-lib.ps1')
+# 3.0 安装根布局（判据同 app\paths.py:echo_base）：代码在 <base>\echo-core 时，
+# 运行时（runtime-core / venv）、数据（data\echo-port.txt、data\logs）都在 <base> 下；
+# 老式扁平安装里 base == root，行为一字不变。$root 仍是**代码根**（-WorkDir 要它）。
+$installBase = (Get-EchoRoots -Start $root).Base
 # D22: main package has no bundled runtime; runtime-core component provides it.
-$py = Join-Path $root 'runtime-core\python.exe'
+$py = Join-Path $installBase 'runtime-core\python.exe'
+if (-not (Test-Path $py)) { $py = Join-Path $installBase 'runtime-core\Scripts\python.exe' }
+if (-not (Test-Path $py)) { $py = Join-Path $installBase 'venv\Scripts\python.exe' }
+if (-not (Test-Path $py)) { $py = Join-Path $root 'runtime-core\python.exe' }
 if (-not (Test-Path $py)) { $py = Join-Path $root 'runtime-core\Scripts\python.exe' }
 if (-not (Test-Path $py)) { $py = Join-Path $root 'venv\Scripts\python.exe' }
 # Prefer the ASCII junction (works around tools that cannot read non-ASCII paths).
@@ -61,10 +68,10 @@ function Resolve-EchoPort([string]$root) {
     }
     return 8970
 }
-$echoPort = Resolve-EchoPort $root
+$echoPort = Resolve-EchoPort $installBase
 $base = "http://127.0.0.1:$echoPort"
 $dshPort = 43120          # DSH Desktop 2.x: GUI + API on one port
-$logDir = Join-Path $root 'data\logs'
+$logDir = Join-Path $installBase 'data\logs'
 $logFile = Join-Path $logDir 'launch.log'
 $out = Join-Path $logDir 'echo-server.log'
 $err = Join-Path $logDir 'echo-server.log.err'
