@@ -518,22 +518,39 @@ class TempWorkspace:
 
 ### 6.1 端点白名单（全部无状态）
 
-| 方法 | 路径 | 语义 | v1 |
-|---|---|---|---|
-| GET | `/v1/capabilities` | 能力 + 模型 + `modelVersion` + `vectorSpaceId` + 限制 + 当前实际可用性 | ✅ |
-| GET | `/v1/health` | 存活（永远 200）+ 队列深度 + 显存 + 临时目录统计 | ✅ |
-| GET | `/v1/ready` | 就绪（模型池可服务则 200，否则 503） | ✅ |
-| POST | `/v1/pair` | **配对**：一次性码 → `client_id` + `secret`（§7.4，唯一免凭据的端点） | ✅ |
-| POST | `/v1/token` | **换令牌**：`Basic client_id:secret` → 短期 JWT（§7.5 ②） | ✅ |
-| POST | `/v1/asr` | 音频 → 文本（`?variant=short\|long`、`?timestamps=1`） | ✅ |
-| POST | `/v1/diarize` | 音频 → turns + 嵌入（`?mode=segment\|turns`，v1 只做 `segment`） | ✅ |
-| POST | `/v1/speaker/embed` | 音频 → 嵌入 | ✅ |
-| POST | `/v1/tts` | 文本 → 音频（可选能力） | ⏳ |
+| 方法 | 路径 | 语义 | v1 | 要凭据吗 |
+|---|---|---|---|---|
+| GET | `/v1/capabilities` | 能力 + 模型 + `modelVersion` + `vectorSpaceId` + 限制 + 当前实际可用性 | ✅ | **不**（见下） |
+| GET | `/v1/health` | 存活（永远 200）+ 队列深度 + 显存 + 临时目录统计 | ✅ | **不** |
+| GET | `/v1/ready` | 就绪（模型池可服务则 200，否则 503） | ✅ | **不** |
+| POST | `/v1/pair` | **配对**：一次性码 → `client_id` + `secret`（§7.4） | ✅ | **不**（但要配对码 + 限速） |
+| POST | `/v1/token` | **换令牌**：`Basic client_id:secret` → 短期 JWT（§7.5 ②） | ✅ | Basic |
+| POST | `/v1/asr` | 音频 → 文本（`?variant=short\|long`、`?timestamps=1`） | ✅ | Bearer + `asr` |
+| POST | `/v1/diarize` | 音频 → turns + 嵌入（`?mode=segment\|turns`，v1 只做 `segment`） | ✅ | Bearer + `diarize` |
+| POST | `/v1/speaker/embed` | 音频 → 嵌入 | ✅ | Bearer + `embed` |
+| POST | `/v1/tts` | 文本 → 音频（可选能力） | ⏳ | Bearer + `tts` |
 
 **除了换凭据那两条，没有任何写端点。** `/v1/pair` 与 `/v1/token` 写的是 §8.5 白名单里的
 `clients` / `pairing_codes` 两张**管理**表，一个字节的内容都不碰 —— 它们在护栏测试的
 白名单里被**显式列出**，而不是靠"凡是 auth 开头就放行"那种模糊规则（后者会让下一个
 "看起来像鉴权"的业务端点溜进来）。
+
+#### 哪几个端点不需要凭据（2026-09-24 起写准）
+
+这一栏以前写的是"`/v1/pair` 是唯一免凭据的端点" —— **那句话是错的**，而且是跑真服务端时
+才发现的：`/v1/health`、`/v1/ready`、`/v1/capabilities` 三个 GET 也是敞开的（状态码 200），
+因为它们的处理函数压根没调 `client_of`。查下来**敞开是对的，是文档写窄了**：
+
+| 敞开的原因 | 说明 |
+|---|---|
+| `health` / `ready` 是**探针** | Docker healthcheck 与监控**拿不到凭据**。要它们带令牌，等于让探针也配一套凭据；而探针配错的表现是"服务端显示不健康"，比 401 更难查 |
+| `capabilities` 要在**配对之前**就能看 | 面板得先告诉人"这台能干什么"（有没有 diarize、几个并发），人才决定要不要配对。它返回的只有模型名、限制、忙闲 —— **没有业务数据**，也不含任何客户端的身份 |
+| `pair` 是**唯一免凭据的写端点** | 所以它单独防猜：一次性码 + 失败退避（`PairThrottle`）+ 可整个关掉（`auth.pairing_enabled: false`） |
+
+真正要守住的是"**GPU 活必须带凭据**"，也就是 `asr` / `diarize` / `speaker/embed`
+（加上将来的 `tts`）四条。这条不再靠"我记得给新端点接上鉴权"来保证：
+`PublicSurfaceTests` 会**遍历 OpenAPI 里的端点**，凡不在这张公开表里的匿名请求一律要是
+401/403 —— 新端点忘了接鉴权，用例就红。
 
 `POST /v1/voiceprints` 这类一旦出现，护栏测试就该红。
 
@@ -1154,6 +1171,24 @@ clients 表：secret_hash / secret_rotated_at
 **明文 secret 放普通文件是不够的** —— 这台机器上任何用户态程序都能读。
 Windows 上至少要走 DPAPI（`CryptProtectData`）；这与"业务数据留客户端"是同一类纪律。
 
+> **实现现状（2026-09-24）**，落在 `app/capabilities/credentials.py` + `pairing.py`：
+>
+> | 项 | 做法 | 为什么 |
+> |---|---|---|
+> | Windows | DPAPI（`CryptProtectData`，**用户作用域**，`CRYPTPROTECT_UI_FORBIDDEN`） | 绑用户账户：文件拷走也解不开。`ctypes` 直调系统 API，**不引新依赖**（客户端装机要短，见铁律 L1） |
+> | Linux/macOS | `0600` | POSIX 上没有等价的"绑用户"服务，权限就是那道墙。**这是一处明确的取舍**，用例专门把它钉住（`test_posix_plain_envelope_is_the_documented_tradeoff`），别读成"已经够安全" |
+> | `accessToken` / `expiresAt` | **完全不落盘** | 它短命（1 小时），重启后重新换一次就行；落在盘上只是多一个泄漏面。本文原本写的是"可只放内存，或与上同权限落盘" —— 选了前者 |
+> | 读坏了 | `load()` 返回 `None`（= 没配对），**永不抛** | 一个坏文件不该让面板起不来；让上层走"重新配对" |
+> | `certFingerprint` | 存下来了，**但客户端现在不校验** | TLS 属于 v2（§13）。写在这里是为了不让调用方以为"填了就等于锁住了" |
+>
+> **401 之后换一次再试一次**（`EchoServerClient._request`）：手上那个令牌还没到我们以为的
+> 过期时间、服务端那边已经不认了 —— 成因是管理员 `--rotate-secret`（`token_version` +1）
+> 或内网两台机器时钟差几分钟。这两种都是"再换一个就好"，不该让用户看到一次失败。
+> **只试一次**：真是 secret 失效的话再换也换不来，无限重试只会把一次失败变成一个转不出来的循环。
+>
+> 手填的令牌（`capabilityEchoServerToken` / `…StaticToken`）**不参与自动续期** ——
+> 它不是我们换来的，也就不知道期限，静默拿凭据去换一个反而会把人的调试意图搅乱。
+
 #### ⑦ 与"内网公共 ASR"的凭据**不要混为一谈**
 
 | | ECHO 能力后端 | 内网公共 ASR |
@@ -1750,6 +1785,8 @@ client_body_temp_path /var/echo/tmp/nginx;
 | 不存在的 client_id：一句人话 + 退出码 1，不是 traceback | ✅ | `AdminCliTests.test_unknown_client_ids_are_reported_cleanly` |
 | 版本号只增不减（否则旧令牌会"复活"） | ✅ | `AdminCliTests.test_version_only_ever_goes_up` |
 | 已存在的旧库会自动补 `name`/`scopes` 列，且**数据不丢** | ✅ | `AuthSchemaMigrationTests` |
+| **公开端点表之外的端点，匿名请求一律 401/403**（遍历 OpenAPI，不靠人记） | ✅ | `PublicSurfaceTests.test_every_other_endpoint_rejects_an_anonymous_request` |
+| 公开表里写了的那三个**真能匿名用**（不然探针会因鉴权失败而"显示不健康"） | ✅ | `PublicSurfaceTests.test_the_documented_public_endpoints_are_actually_reachable` |
 | 配额（日额度 / 音频分钟数，§7.2） | ⏳ | 还没做；现在只有并发闸门 |
 | 管理面 / 审计表 / "存了什么"自证页（§8.4、§8.5） | ⏳ | 还没做；配对的入口暂时是命令行 |
 

@@ -691,14 +691,16 @@ DEFAULTS = {
                     "**不存任何业务数据**",
         value_type="str"),
     "capabilityEchoServerToken": dict(
-        value="", grp="capability", label="ECHO 能力后端令牌（配对获得）", hidden=True,
-        description="配对换来的短期 JWT。过期后需要重新配对/换令牌 —— "
-                    "本版**不做自动续期**，过期会如实报「凭据不被接受」而不是静默失败",
+        value="", grp="capability", label="ECHO 能力后端令牌（手工填）", hidden=True,
+        description="手工贴进来的 Bearer 令牌，用来排障或临时绕开配对。"
+                    "**配对换来的令牌不在这里** —— 它在 data/backend.json 里，"
+                    "过期自动续期。填了这个就以它为准，且**不会自动续期**",
         value_type="str", secret=True),
     "capabilityEchoServerStaticToken": dict(
         value="", grp="capability", label="ECHO 能力后端静态令牌", hidden=True,
         description="服务端 `auth.mode=token` 时用的那把静态令牌（单人/本机场景）。"
-                    "配了配对令牌就以那个为准",
+                    "与上面的手工令牌同级：**填了任一个就以手工令牌为准**，"
+                    "配对凭据会被绕过（所以配对之后别再留着它）",
         value_type="str", secret=True),
     "capabilityPrivacy": dict(
         value="lan", grp="capability", label="允许音频去哪", hidden=True,
