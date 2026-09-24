@@ -89,7 +89,7 @@ background:#2a2318;border:1px solid var(--yellow);color:var(--yellow);font-size:
 </style>
 </head><body>
 <div class="layout">
-<nav><div class="brand">ECHO 3.0 设计<small>架构设计文档</small></div><div class="docs"><a href="3.0-设计总览与组件关系.html">3.0 总览</a><a href="统一路由-模型能力与设备.html">统一路由</a><a href="能力路由-三后端与轻客户端.html">能力路由</a><a href="ECHO能力后端-服务端设计.html" class="on">能力后端</a><a href="前后分离-能力服务化设计.html">前后分离</a></div><div class="toc"><a class="l2" href="#h1">0. 结论速览</a><a class="l2" href="#h2">1. 职责边界（钉死，并用测试保证）</a><a class="l3" href="#h3">1.1 做什么</a><a class="l3" href="#h4">1.2 不做什么</a><a class="l3" href="#h5">1.3 禁令 → 护栏测试</a><a class="l2" href="#h6">2. 目录结构，以及怎么复用客户端引擎层</a><a class="l3" href="#h7">2.1 好消息：引擎层本来就是干净的</a><a class="l3" href="#h8">2.2 一个现成的接缝</a><a class="l3" href="#h9">2.3 目录结构</a><a class="l2" href="#h10">3. 并发与进程模型（最难的部分）</a><a class="l3" href="#h11">3.1 现有引擎层为什么不能直接用</a><a class="l3" href="#h12">3.2 并发度的决定因素</a><a class="l3" href="#h13">3.3 v1：单进程 + EnginePool + 两级并发闸门（不排队）</a><a class="l3" href="#h14">3.4 服务端不许静默回退 CPU</a><a class="l3" href="#h15">3.4 服务端不许静默回退 CPU</a><a class="l3" href="#h16">3.5 v2：按模型分进程（需要时再做）</a><a class="l3" href="#h17">3.6 并发准入与拒绝类型（2026-09-23 定）</a><a class="l2" href="#h24">4. EnginePool：核心组件</a><a class="l3" href="#h25">4.1 职责</a><a class="l3" href="#h26">4.2 接口草案</a><a class="l3" href="#h27">4.3 常驻 vs 按需（沿用客户端 boot.py 的心智）</a><a class="l3" href="#h28">4.4 版本冻结（关键）</a><a class="l3" href="#h29">4.5 面板上那两张卡，已经是 EnginePool 的 UI 原型</a><a class="l3" href="#h30">4.6 澄清：torch 禁令只针对客户端</a><a class="l2" href="#h31">5. 临时文件与音频管线</a><a class="l3" href="#h32">5.1 政策：允许，但必须&quot;有主&quot;</a><a class="l3" href="#h33">5.2 为什么不能把清理交给框架（实测证据）</a><a class="l3" href="#h34">5.3 TempWorkspace：唯一的临时文件入口</a><a class="l3" href="#h35">5.4 协议上仍然建议用 raw body</a><a class="l3" href="#h36">5.5 请求生命周期</a><a class="l2" href="#h37">6. HTTP 契约</a><a class="l3" href="#h38">6.1 端点白名单（全部无状态）</a><a class="l3" href="#h39">6.2 capabilities 必须反映真实可用性</a><a class="l3" href="#h40">6.3 错误模型：机器可读</a><a class="l3" href="#h41">6.4 长请求与进度</a><a class="l3" href="#h42">6.5 逐端点功能规格</a><a class="l2" href="#h50">7. 鉴权、配额与多租户</a><a class="l3" href="#h51">7.1 身份模型：传输层与应用层分开</a><a class="l3" href="#h52">7.2 scopes 与配额</a><a class="l3" href="#h53">7.3 审计日志：只有元数据</a><a class="l3" href="#h54">7.4 客户端配对（pairing）：凭据怎么发出去</a><a class="l3" href="#h55">7.5 令牌、撤销与本地存储（完整生命周期）</a><a class="l2" href="#h64">8. 可观测性</a><a class="l3" href="#h65">8.1 两个探针要分开</a><a class="l3" href="#h66">8.2 指标清单</a><a class="l3" href="#h67">8.3 日志规范</a><a class="l3" href="#h68">8.4 管理面（Admin Console）</a><a class="l3" href="#h73">8.5 服务端到底存什么（边界，替代原来的&quot;没有 DB&quot;）</a><a class="l2" href="#h78">9. 部署与运维</a><a class="l3" href="#h79">9.1 宿主系统：要用 Docker 的话，&quot;容器里就是 Linux&quot;</a><a class="l3" href="#h80">9.2 GPU 直通：不是难点，但要配对</a><a class="l3" href="#h81">9.3 容器怎么配：只读根 + 两个可写卷（保留策略相反）</a><a class="l3" href="#h82">9.4 临时文件：按日期落盘 + 定时清理</a><a class="l3" href="#h83">9.5 反向代理（最容易破的一环）</a><a class="l3" href="#h84">9.6 单实例 vs 多实例（真实取舍）</a><a class="l3" href="#h85">9.7 启动与退出</a><a class="l3" href="#h86">9.8 换模型的纪律：把&quot;尽量统一&quot;变成机制</a><a class="l2" href="#h87">10. 服务端配置</a><a class="l2" href="#h90">11. 失败模式总表</a><a class="l2" href="#h91">12. 护栏测试清单</a><a class="l3" href="#h92">12.1 鉴权的断言（设计 §7，2026-09-24 落地）</a><a class="l2" href="#h93">13. 实施阶段</a><a class="l2" href="#h94">14. 已拍板 / 待拍板</a></div></nav>
+<nav><div class="brand">ECHO 3.0 设计<small>架构设计文档</small></div><div class="docs"><a href="3.0-设计总览与组件关系.html">3.0 总览</a><a href="统一路由-模型能力与设备.html">统一路由</a><a href="能力路由-三后端与轻客户端.html">能力路由</a><a href="ECHO能力后端-服务端设计.html" class="on">能力后端</a><a href="前后分离-能力服务化设计.html">前后分离</a></div><div class="toc"><a class="l2" href="#h1">0. 结论速览</a><a class="l2" href="#h2">1. 职责边界（钉死，并用测试保证）</a><a class="l3" href="#h3">1.1 做什么</a><a class="l3" href="#h4">1.2 不做什么</a><a class="l3" href="#h5">1.3 禁令 → 护栏测试</a><a class="l2" href="#h6">2. 目录结构，以及怎么复用客户端引擎层</a><a class="l3" href="#h7">2.1 好消息：引擎层本来就是干净的</a><a class="l3" href="#h8">2.2 一个现成的接缝</a><a class="l3" href="#h9">2.3 目录结构</a><a class="l2" href="#h10">3. 并发与进程模型（最难的部分）</a><a class="l3" href="#h11">3.1 现有引擎层为什么不能直接用</a><a class="l3" href="#h12">3.2 并发度的决定因素</a><a class="l3" href="#h13">3.3 v1：单进程 + EnginePool + 两级并发闸门（不排队）</a><a class="l3" href="#h14">3.4 服务端不许静默回退 CPU</a><a class="l3" href="#h15">3.4 服务端不许静默回退 CPU</a><a class="l3" href="#h16">3.5 v2：按模型分进程（需要时再做）</a><a class="l3" href="#h17">3.6 并发准入与拒绝类型（2026-09-23 定）</a><a class="l2" href="#h25">4. EnginePool：核心组件</a><a class="l3" href="#h26">4.1 职责</a><a class="l3" href="#h27">4.2 接口草案</a><a class="l3" href="#h28">4.3 常驻 vs 按需（沿用客户端 boot.py 的心智）</a><a class="l3" href="#h29">4.4 版本冻结（关键）</a><a class="l3" href="#h30">4.5 面板上那两张卡，已经是 EnginePool 的 UI 原型</a><a class="l3" href="#h31">4.6 澄清：torch 禁令只针对客户端</a><a class="l2" href="#h32">5. 临时文件与音频管线</a><a class="l3" href="#h33">5.1 政策：允许，但必须&quot;有主&quot;</a><a class="l3" href="#h34">5.2 为什么不能把清理交给框架（实测证据）</a><a class="l3" href="#h35">5.3 TempWorkspace：唯一的临时文件入口</a><a class="l3" href="#h36">5.4 协议上仍然建议用 raw body</a><a class="l3" href="#h37">5.5 请求生命周期</a><a class="l2" href="#h38">6. HTTP 契约</a><a class="l3" href="#h39">6.1 端点白名单（全部无状态）</a><a class="l3" href="#h40">6.2 capabilities 必须反映真实可用性</a><a class="l3" href="#h41">6.3 错误模型：机器可读</a><a class="l3" href="#h42">6.4 长请求与进度</a><a class="l3" href="#h43">6.5 逐端点功能规格</a><a class="l2" href="#h52">7. 鉴权、配额与多租户</a><a class="l3" href="#h53">7.1 身份模型：传输层与应用层分开</a><a class="l3" href="#h54">7.2 scopes 与配额</a><a class="l3" href="#h55">7.3 审计日志：只有元数据</a><a class="l3" href="#h56">7.4 客户端配对（pairing）：凭据怎么发出去</a><a class="l3" href="#h57">7.5 令牌、撤销与本地存储（完整生命周期）</a><a class="l2" href="#h66">8. 可观测性</a><a class="l3" href="#h67">8.1 两个探针要分开</a><a class="l3" href="#h68">8.2 指标清单</a><a class="l3" href="#h69">8.3 日志规范</a><a class="l3" href="#h70">8.4 管理面（Admin Console）</a><a class="l3" href="#h75">8.5 服务端到底存什么（边界，替代原来的&quot;没有 DB&quot;）</a><a class="l2" href="#h80">9. 部署与运维</a><a class="l3" href="#h81">9.1 宿主系统：要用 Docker 的话，&quot;容器里就是 Linux&quot;</a><a class="l3" href="#h82">9.2 GPU 直通：不是难点，但要配对</a><a class="l3" href="#h83">9.3 容器怎么配：只读根 + 两个可写卷（保留策略相反）</a><a class="l3" href="#h84">9.4 临时文件：按日期落盘 + 定时清理</a><a class="l3" href="#h85">9.5 反向代理（最容易破的一环）</a><a class="l3" href="#h86">9.6 单实例 vs 多实例（真实取舍）</a><a class="l3" href="#h87">9.7 启动与退出</a><a class="l3" href="#h88">9.8 换模型的纪律：把&quot;尽量统一&quot;变成机制</a><a class="l2" href="#h89">10. 服务端配置</a><a class="l2" href="#h92">11. 失败模式总表</a><a class="l2" href="#h93">12. 护栏测试清单</a><a class="l3" href="#h94">12.1 鉴权的断言（设计 §7，2026-09-24 落地）</a><a class="l2" href="#h95">13. 实施阶段</a><a class="l2" href="#h96">14. 已拍板 / 待拍板</a></div></nav>
 <main>
 <div class="banner"></div>
 <header class="doc"><h1>ECHO 能力后端 · 服务端设计</h1>
@@ -188,7 +188,15 @@ server/ 不 import：app.db、app.config.settings、app.meeting、app.assistant
 <pre class="code"><code>占通道：从「准入通过」到「推理结束 + 临时文件清理完」
 不占通道：TLS 握手、鉴权、上传接收、解码、重采样、响应序列化</code></pre>
 <p>审批与接收<strong>不占</strong>通道，否则一个 20 MB 的上传会把坑占几十秒； 但推理阶段<strong>确实占</strong>，因为 GPU 才是那个真正的稀缺资源。 代价是"可能传完了才发现被拒" → 用下面的乐观预检缓解。</p>
-<h4 id="h19">拒绝响应（三种，客户端行为完全不同）</h4>
+<h4 id="h19">这条闸门只有在"请求真能并行"时才有意义（2026-09-24 实测补上）</h4>
+<p><strong>实测过一个会让上面整张表变成空话的问题</strong>：三个能力端点是 <code>async def</code> （因为要 <code>await request.stream()</code> 收 body），而 FastAPI 把 <code>async def</code> 处理函数 <strong>跑在事件循环上</strong>。里面那些阻塞调用（<code>soundfile</code> 解码、<code>soxr</code> 重采样、 <code>funasr</code>/<code>pyannote</code> 推理）于是把整个事件循环按住 → <strong>所有请求被一条一条串行处理</strong>：</p>
+<pre class="code"><code>两个&quot;并发&quot;请求：各花 t / 2t，墙钟 ≈ 2t      ← 完全串行
+busy.active 全程 = 0                        ← 闸门根本没记录到活跃请求</code></pre>
+<p>也就是说 <code>max_concurrent: 2</code> 是假的，两级闸门也永远不会看到两个请求同时在跑 —— 而<strong>当时所有用例都是绿的</strong>，因为 <code>TestClient</code> 本来就把请求串起来发，它测不出这件事。</p>
+<p><strong>规矩：端点里任何阻塞调用都必须下线程池</strong>（<code>run_in_threadpool</code>）， 包括解码与重采样，不只是推理。修完之后的对照实测：</p>
+<pre class="code"><code>两个并发请求：一路 200，另一路 **0.03s 就回 409 client_busy**，busy.active 峰值 = 1</code></pre>
+<p>契约由 <code>EventLoopNotBlockedTests</code> 钉住 —— 它<strong>必须</strong>用 <code>httpx.ASGITransport</code> + <code>asyncio.gather</code>（真的同时进同一个事件循环）， 判据是<strong>墙钟</strong>：并行时 ≈ <code>d</code>，串行时 ≈ <code>2d</code>。</p>
+<h4 id="h20">拒绝响应（三种，客户端行为完全不同）</h4>
 <div class="tw"><table><thead><tr><th>场景</th><th>HTTP</th><th><code>code</code></th><th><code>Retry-After</code></th><th>客户端应当</th></tr></thead><tbody><tr><td>该客户端自己已有请求在跑</td><td><strong>409</strong></td><td><code>client_busy</code></td><td>不给</td><td><strong>不要重试</strong> —— 是它自己上一个还没完（并发应配 1，属客户端 bug）</td></tr><tr><td><strong>服务端通道满</strong></td><td><strong>503</strong></td><td><code>server_busy</code></td><td><strong>给</strong>（建议 5 s）</td><td><strong>系统忙，稍后再试</strong>（退避，见下）</td></tr><tr><td>该客户端当日配额用完</td><td><strong>429</strong></td><td><code>quota_exceeded</code></td><td>到次日重置的秒数</td><td><strong>今天别再试</strong></td></tr></tbody></table></div>
 <p><strong>为什么必须分成三个 code</strong>：统一回一个 <code>429</code>/<code>503</code> 的话，客户端只能盲目重试 —— 而 <code>client_busy</code> 重试<strong>永远不会成功</strong>，<code>quota_exceeded</code> 重试只是白烧额度。 <strong>"明确拒绝的类型"就是这个意思。</strong></p>
 <p>响应体（<code>message</code> 给人看、<code>code</code> 给程序看）：</p>
@@ -200,24 +208,24 @@ Retry-After: 5
   &quot;message&quot;: &quot;系统忙，请稍后再试&quot;,
   &quot;retryAfter&quot;: 5
 }</code></pre>
-<h4 id="h20">乐观预检（省掉"传完才被拒"）</h4>
+<h4 id="h21">乐观预检（省掉"传完才被拒"）</h4>
 <p>客户端上传前可先读 <code>GET /v1/capabilities</code> 的 <code>activeRequests</code> / <code>maxConcurrent</code> / <code>perClientActive</code> —— 已满就<strong>先不发</strong>。 但要注意：</p>
 <ul><li>预检是<strong>乐观</strong>的（你看到空闲、发过去时别人先占了）→ <strong>真正的准入仍然在服务端</strong></li><li>它只是<strong>减少无谓的上传</strong>，<strong>不是保证</strong></li></ul>
-<h4 id="h21">重试归客户端（服务端只给两样东西）</h4>
+<h4 id="h22">重试归客户端（服务端只给两样东西）</h4>
 <p>服务端<strong>不排队、不重试、不占着连接等</strong>。它只负责给：</p>
 <ol><li><strong>明确的 <code>code</code></strong> —— 让客户端知道"该不该重试"</li><li><strong><code>Retry-After</code></strong> —— 让客户端知道"多久之后再来"（<strong>服务端比客户端更清楚自己有多忙</strong>）</li></ol>
 <p><strong>客户端侧</strong>（契约要求；落地细节见 3.0 总览 §12 的离线队列）：</p>
 <ul><li>优先听 <code>Retry-After</code>；没有则<strong>指数退避 + 抖动</strong>（1s → 2s → 4s → … 上限 60s）</li><li><strong>退避作用于整个队列，不是单个请求</strong> —— 服务端忙是后端整体忙， 不能让 6 个分段各自去撞一次墙</li><li>一直重试到成功或用户取消；连续失败 N 次后面板提示"服务端持续繁忙"（<strong>但不是"失败"</strong>）</li><li><strong><code>client_busy</code> 视为客户端 bug</strong>（并发必须配成 1）：记日志，<strong>不重试</strong></li></ul>
-<h4 id="h22">并发闸门 ≠ 配额（两道都要，别合并）</h4>
+<h4 id="h23">并发闸门 ≠ 配额（两道都要，别合并）</h4>
 <div class="tw"><table><thead><tr><th></th><th>并发闸门</th><th>配额</th></tr></thead><tbody><tr><td>时间尺度</td><td><strong>此刻</strong></td><td>当日累计</td></tr><tr><td>拒了之后</td><td>稍后就好了</td><td><strong>今天都不会好</strong></td></tr><tr><td>返</td><td><code>503 server_busy</code> / <code>409 client_busy</code></td><td><code>429 quota_exceeded</code></td></tr></tbody></table></div>
-<h4 id="h23"><code>queue_max</code> 保留但默认 0</h4>
+<h4 id="h24"><code>queue_max</code> 保留但默认 0</h4>
 <p>配置项留着（<code>queue_max</code> / <code>queue_wait_timeout_s</code>），<strong>默认 0 = 不排队</strong>。 将来若实验发现尖峰丢请求太多，可以开一个小队列 —— 那时 <code>429 queue_full</code> 才会出现。<strong>现在这个 code 用不到，但先在错误码表里占位</strong>， 免得以后新增时老客户端不认识。</p>
 <hr>
-<h2 id="h24">4. <code>EnginePool</code>：核心组件</h2>
+<h2 id="h25">4. <code>EnginePool</code>：核心组件</h2>
 <blockquote><p>客户端与服务端<strong>共用</strong>这个抽象；客户端只是"池容量 1、无 LRU 卸载"的特例。</p></blockquote>
-<h3 id="h25">4.1 职责</h3>
+<h3 id="h26">4.1 职责</h3>
 <div class="tw"><table><thead><tr><th>职责</th><th>说明</th></tr></thead><tbody><tr><td><strong>单飞加载</strong></td><td>并发 N 个请求要同一个模型，只加载一次，其余等待同一个 Future</td></tr><tr><td><strong>引用计数</strong></td><td>推理中不许卸载</td></tr><tr><td><strong>LRU 卸载</strong></td><td>显存压力下按"最久未使用且引用计数为 0"卸载</td></tr><tr><td><strong>显存预算</strong></td><td>加载前预估，超预算先卸载，仍不够则拒绝（<strong>不 OOM、不回退 CPU</strong>）</td></tr><tr><td><strong>状态上报</strong></td><td>每个模型 <code>absent / loading / ready / failed / evicting</code>，供 <code>/v1/capabilities</code> 与 <code>/v1/health</code></td></tr><tr><td><strong>版本冻结</strong></td><td><code>modelVersion</code> / <code>vectorSpaceId</code> 在<strong>进程生命周期内不变</strong></td></tr><tr><td><strong>加载可等待不可取消</strong></td><td>加载是长操作，请求<strong>排队等待</strong>（有超时），不能取消半途的加载</td></tr></tbody></table></div>
-<h3 id="h26">4.2 接口草案</h3>
+<h3 id="h27">4.2 接口草案</h3>
 <pre class="code"><code>class ModelSpec(NamedTuple):
     id: str                # &quot;pyannote-3.1&quot;
     slot: str              # &quot;diarize.turns&quot;
@@ -236,34 +244,34 @@ class EnginePool:
     def status(self) -&gt; dict: ...       # 给 /v1/capabilities
     def unload(self, model_id: str) -&gt; bool: ...
     def shutdown(self) -&gt; None: ...     # 退出时释放显存</code></pre>
-<h3 id="h27">4.3 常驻 vs 按需（沿用客户端 <code>boot.py</code> 的心智）</h3>
+<h3 id="h28">4.3 常驻 vs 按需（沿用客户端 <code>boot.py</code> 的心智）</h3>
 <div class="tw"><table><thead><tr><th>模型</th><th>策略</th><th>理由</th></tr></thead><tbody><tr><td>speaker embedding</td><td><strong>常驻</strong></td><td>小、高频、加载快 → 冷启动就预热</td></tr><tr><td>sherpa / 短音频 ASR</td><td><strong>常驻</strong></td><td>命令路径要低延迟</td></tr><tr><td>会议 ASR（中型）</td><td>按需 + LRU</td><td>用量中等</td></tr><tr><td>大模型（Qwen3-ASR / whisper-large）</td><td>按需 + LRU</td><td>吃显存</td></tr><tr><td>pyannote 三件套</td><td>按需 + LRU</td><td>加载慢、显存大</td></tr></tbody></table></div>
 <p>这与客户端 <code>boot.py</code> 的「<code>stt-cmd</code> 常驻 / <code>stt-meeting</code> 按需并可卸载」是<strong>同一个模型</strong> —— 可以直接复用那套组件状态机的心智（<code>pending→starting→online/failed/disabled/idle</code>）。</p>
-<h3 id="h28">4.4 版本冻结（关键）</h3>
+<h3 id="h29">4.4 版本冻结（关键）</h3>
 <p><code>modelVersion</code> 与 <code>vectorSpaceId</code> <strong>在进程生命周期内不得变化</strong>。理由： 客户端按 <code>vectorSpaceId</code> 分组比较嵌入，并做<strong>会议级锁定</strong>。 如果服务端在同一个 <code>vectorSpaceId</code> 下悄悄换了模型（比如运维换了个权重文件）， 客户端的跨段质心与声纹匹配会<strong>静默失效</strong> —— 余弦相似度不会崩，只会开始认错人。</p>
 <p>所以：换模型 = <strong>换 <code>vectorSpaceId</code> = 重启服务</strong>。配置里写死，运行时不可热改。</p>
-<h3 id="h29">4.5 面板上那两张卡，已经是 <code>EnginePool</code> 的 UI 原型</h3>
+<h3 id="h30">4.5 面板上那两张卡，已经是 <code>EnginePool</code> 的 UI 原型</h3>
 <p>现网面板「启动」页签里已经有这两张卡：</p>
 <div class="tw"><table><thead><tr><th>面板</th><th>含义</th><th>服务端对应</th></tr></thead><tbody><tr><td>🔨 <strong>命令转写引擎（常驻）</strong> · <code>sensevoice</code> · <code>cuda:0</code> · <code>在线</code> · <code>15.2s</code></td><td>常驻引擎 + 设备 + 状态机 + 加载耗时</td><td><strong>服务端 v1 没有这张卡</strong> —— 出厂清单不放常驻模型（§14-2），短请求由长档那个模型兜住</td></tr><tr><td>📄 <strong>会议转写引擎（按需）</strong> · <code>qwen3asr</code> · <code>空闲</code></td><td>按需引擎，可卸载</td><td><code>specs[asr-long]</code>：<code>resident: false</code></td></tr><tr><td>引擎下拉 + 启动/停止 按钮</td><td>选实现 + 显式生命周期控制</td><td><code>specs[].impl</code> + <code>pool.acquire/unload</code></td></tr></tbody></table></div>
 <blockquote><p><strong>"常驻卡"这一格 v1 是空的，这是刻意的。</strong> 客户端面板上那两张卡是<strong>客户端自己的</strong>引擎 （本机跑 sherpa / qwen3asr）。服务端不需要照抄这个形状：它的出厂清单三个模型<strong>全是按需</strong> ——第一次请求各付一次加载，之后不重复付。等真做指令增强时，<code>asr-short</code> 会带着配额机制 一起回到服务端，那时这张卡才有对应的格子。别为了"对齐表格"把常驻模型加回来。</p></blockquote>
 <p><strong>这张卡片上的每一个元素都是 <code>EnginePool</code> 需要的</strong>：常驻/按需、状态（在线/空闲/模型加载）、 加载耗时、当前实现、显式启停。所以：</p>
 <ol><li><strong>服务端直接复用 <code>app/boot.py</code> 的组件状态机</strong>（<code>pending→starting→online/failed/disabled/idle</code>） 与 <code>app/services.py</code> 的状态上报，不要另造一套。</li><li><strong>服务端的 <code>/v1/capabilities</code> 就是这两张卡的数据源</strong> —— 它必须能渲染出同样的东西。</li><li><strong>客户端组件页应该分成两块：「本机组件」+「服务端引擎」。</strong> 后者是服务端 <code>/v1/capabilities</code> 的渲染。理由：用户要知道"我现在能不能走服务端、它在不在加载中"， 否则"会议转写卡住"时无从判断是本机问题还是服务端问题。</li></ol>
-<h3 id="h30">4.6 澄清：torch 禁令只针对客户端</h3>
+<h3 id="h31">4.6 澄清：torch 禁令只针对客户端</h3>
 <p>前置文档说的"默认档不含 torch"是<strong>客户端</strong>的约束（办公本装不下、启动慢）。 <strong>服务端可以也应该装 torch</strong> —— SenseVoice（funasr）与 Qwen3-ASR（qwen-asr + transformers） 都是 torch 系，而它们的中文效果已在实机验证，是服务端的<strong>主力</strong>而非可选项。</p>
 <p>服务端的对应约束不是"别装 torch"，而是：</p>
 <ul><li>显存预算有界（§4.1），加载前预估、超预算拒绝</li><li><strong>不许静默回退 CPU</strong>（§3.4）</li><li>模型加载是启动成本，不是请求成本（常驻预热）</li></ul>
 <hr>
-<h2 id="h31">5. 临时文件与音频管线</h2>
+<h2 id="h32">5. 临时文件与音频管线</h2>
 <blockquote><p><strong>📌 2026-09-23 简化说明</strong>：本章的落盘策略已按"<strong>按日期落盘 + 定时清理</strong>"放宽 ——<strong>不再用内存盘、不做容量硬门禁、不做出入口封装</strong>。 <strong>权威口径在 §9.4</strong>，本章其余部分（为什么不能交给框架管、raw body、请求生命周期） 仍然有效，但凡是与 §9.4 冲突的，<strong>以 §9.4 为准</strong>。</p></blockquote>
-<h3 id="h32">5.1 政策：允许，但必须"有主"</h3>
+<h3 id="h33">5.1 政策：允许，但必须"有主"</h3>
 <p><strong>临时文件是允许的</strong> —— 引擎确实需要文件（<code>funasr</code> 要路径、<code>diarize._read_wav()</code> 读文件、 调试要留样）。约束不是"禁止落盘"，而是：</p>
 <div class="tw"><table><thead><tr><th>要求</th><th>含义</th></tr></thead><tbody><tr><td><strong>自有</strong></td><td>由我们的代码创建和删除，<strong>不交给框架管</strong></td></tr><tr><td><strong>可证明清理</strong></td><td>请求结束（含异常、含客户端断开）后必然删除，有测试断言</td></tr><tr><td><strong>有兜底</strong></td><td>崩溃/断电残留 → 启动时清扫；删除失败 → 登记并重试</td></tr><tr><td><strong>有上限</strong></td><td>临时目录容量有界（tmpfs <code>size=</code> 或磁盘配额），满了拒绝而不是写爆盘</td></tr><tr><td><strong>有命名空间</strong></td><td>按实例隔离，多实例/多进程互不清扫对方的文件</td></tr></tbody></table></div>
-<h3 id="h33">5.2 为什么不能把清理交给框架（实测证据）</h3>
+<h3 id="h34">5.2 为什么不能把清理交给框架（实测证据）</h3>
 <p>Starlette 1.6.0 的 multipart 解析器：</p>
 <pre class="code"><code>spool_max_size = 1024 * 1024   # 1 MB —— 类属性，实测</code></pre>
 <p><strong>任何超过 1 MB 的文件字段都会 spool 到磁盘临时文件。</strong> 一个 10 分钟的会议分段是 19 MB， 所以走 <code>UploadFile</code> / <code>File(...)</code> 的路径<strong>必然落盘</strong> —— 而且那个文件由框架创建、 由框架决定何时关闭，<strong>我们的 <code>finally</code> 看不到它</strong>。</p>
 <p><code>app/api.py:582/623/650</code> 的 <code>_save_upload_wav</code> / <code>stt_transcribe</code> / <code>stt_sentences</code> 就是这个形态。它们今天是环回接口，无所谓；<strong>但绝不能照搬进服务端</strong>。</p>
-<h3 id="h34">5.3 <code>TempWorkspace</code>：唯一的临时文件入口</h3>
+<h3 id="h35">5.3 <code>TempWorkspace</code>：唯一的临时文件入口</h3>
 <pre class="code"><code># server/tmp.py
 class TempWorkspace:
     &quot;&quot;&quot;一次请求的临时文件工作区。所有落盘必须经由它。
@@ -278,11 +286,11 @@ class TempWorkspace:
     def write_stream(self, chunks) -&gt; str: ...   # 流式落盘 + 边写边限长</code></pre>
 <p>配套三个兜底：</p>
 <ol><li><strong>启动清扫</strong>：进程启动时删除 <code>&lt;tmp_root&gt;/&lt;instance_id&gt;/</code> 下所有残留（上次崩溃留下的）。</li><li><strong>TTL 兜底</strong>：后台定时器扫超过 N 分钟未修改的文件并删除，写日志。</li><li><strong>自检端点</strong>：<code>GET /v1/health</code> 返回 <code>tmp: {root, files, bytes, oldest}</code>。 <strong>数字不归零就是 bug 的信号</strong> —— 运维一眼能看出泄漏。</li></ol>
-<h3 id="h35">5.4 协议上仍然建议用 raw body</h3>
+<h3 id="h36">5.4 协议上仍然建议用 raw body</h3>
 <p>即使临时文件合法，<strong>仍建议音频用 <code>application/octet-stream</code> 原始 body</strong>，不用 multipart：</p>
 <div class="tw"><table><thead><tr><th>理由</th><th>说明</th></tr></thead><tbody><tr><td>所有权清晰</td><td>我们自己 <code>async for chunk in request.stream()</code> 写进 <code>TempWorkspace</code>，框架不碰</td></tr><tr><td>提前拒绝</td><td>先看 <code>Content-Length</code>，超限直接 <code>413</code>，<strong>不读一个字节</strong></td></tr><tr><td>边写边限长</td><td>没有 <code>Content-Length</code>（chunked）时，写超限即中止</td></tr><tr><td>客户端更简单</td><td>不用拼 multipart —— 现有 <code>providers/openai.py:134-149</code> 那 18 行手工 multipart 可以不要</td></tr><tr><td>少一个解析器 = 少一个攻击面</td><td>不解析边界，不担心 parser 的 spool 行为变化</td></tr></tbody></table></div>
 <p>参数（语言、模型、是否要时间戳）走 query string / header。</p>
-<h3 id="h36">5.5 请求生命周期</h3>
+<h3 id="h37">5.5 请求生命周期</h3>
 <pre class="code"><code>1. 鉴权 + 配额检查（不读 body）
 2. Content-Length / Content-Type 校验 → 不合格立刻 413/415
 3. with TempWorkspace() as ws:
@@ -294,12 +302,12 @@ class TempWorkspace:
 9. 记审计日志（client_id / request_id / 端点 / 音频秒数 / 耗时 / 状态码）</code></pre>
 <p><strong>关键：响应里绝不返回文件路径</strong> —— 那会把临时文件的生命周期泄漏给客户端。</p>
 <hr>
-<h2 id="h37">6. HTTP 契约</h2>
-<h3 id="h38">6.1 端点白名单（全部无状态）</h3>
+<h2 id="h38">6. HTTP 契约</h2>
+<h3 id="h39">6.1 端点白名单（全部无状态）</h3>
 <div class="tw"><table><thead><tr><th>方法</th><th>路径</th><th>语义</th><th>v1</th></tr></thead><tbody><tr><td>GET</td><td><code>/v1/capabilities</code></td><td>能力 + 模型 + <code>modelVersion</code> + <code>vectorSpaceId</code> + 限制 + 当前实际可用性</td><td>✅</td></tr><tr><td>GET</td><td><code>/v1/health</code></td><td>存活（永远 200）+ 队列深度 + 显存 + 临时目录统计</td><td>✅</td></tr><tr><td>GET</td><td><code>/v1/ready</code></td><td>就绪（模型池可服务则 200，否则 503）</td><td>✅</td></tr><tr><td>POST</td><td><code>/v1/pair</code></td><td><strong>配对</strong>：一次性码 → <code>client_id</code> + <code>secret</code>（§7.4，唯一免凭据的端点）</td><td>✅</td></tr><tr><td>POST</td><td><code>/v1/token</code></td><td><strong>换令牌</strong>：<code>Basic client_id:secret</code> → 短期 JWT（§7.5 ②）</td><td>✅</td></tr><tr><td>POST</td><td><code>/v1/asr</code></td><td>音频 → 文本（<code>?variant=short|long</code>、<code>?timestamps=1</code>）</td><td>✅</td></tr><tr><td>POST</td><td><code>/v1/diarize</code></td><td>音频 → turns + 嵌入（<code>?mode=segment|turns</code>，v1 只做 <code>segment</code>）</td><td>✅</td></tr><tr><td>POST</td><td><code>/v1/speaker/embed</code></td><td>音频 → 嵌入</td><td>✅</td></tr><tr><td>POST</td><td><code>/v1/tts</code></td><td>文本 → 音频（可选能力）</td><td>⏳</td></tr></tbody></table></div>
 <p><strong>除了换凭据那两条，没有任何写端点。</strong> <code>/v1/pair</code> 与 <code>/v1/token</code> 写的是 §8.5 白名单里的 <code>clients</code> / <code>pairing_codes</code> 两张<strong>管理</strong>表，一个字节的内容都不碰 —— 它们在护栏测试的 白名单里被<strong>显式列出</strong>，而不是靠"凡是 auth 开头就放行"那种模糊规则（后者会让下一个 "看起来像鉴权"的业务端点溜进来）。</p>
 <p><code>POST /v1/voiceprints</code> 这类一旦出现，护栏测试就该红。</p>
-<h3 id="h39">6.2 <code>capabilities</code> 必须反映<strong>真实</strong>可用性</h3>
+<h3 id="h40">6.2 <code>capabilities</code> 必须反映<strong>真实</strong>可用性</h3>
 <p>不能只声明"我支持 diarize"，还要声明此刻能不能用：</p>
 <pre class="code"><code>{
   &quot;protocol&quot;: 1,
@@ -330,7 +338,7 @@ class TempWorkspace:
   }
 }</code></pre>
 <p>客户端据此决定：<code>state != ready</code> 且 <code>estWait</code> 太长 → 直接走别的后端，不必白等。</p>
-<h3 id="h40">6.3 错误模型：<strong>机器可读</strong></h3>
+<h3 id="h41">6.3 错误模型：<strong>机器可读</strong></h3>
 <p>客户端路由层要按<strong>原因</strong>决定降级。所以错误体必须带稳定 code：</p>
 <pre class="code"><code>{&quot;code&quot;: &quot;model_loading&quot;, &quot;message&quot;: &quot;diarize model is loading&quot;, &quot;retryAfter&quot;: 30}</code></pre>
 <div class="tw"><table><thead><tr><th>HTTP</th><th>code</th><th>客户端应做的事</th></tr></thead><tbody><tr><td>400</td><td><code>bad_request</code></td><td>不重试（客户端 bug）</td></tr><tr><td>401</td><td><code>unauthorized</code></td><td>刷新凭据；失败则标记后端不可用</td></tr><tr><td>403</td><td><code>forbidden</code></td><td>该 scope 未授权（或客户端被禁用）→ 跳过此后端</td></tr><tr><td><strong>409</strong></td><td><strong><code>client_busy</code></strong></td><td><strong>不重试</strong> —— 自己上一个请求还没完（并发应配 1，属客户端 bug，记日志）</td></tr><tr><td>413</td><td><code>audio_too_long</code> / <code>payload_too_large</code></td><td>改分段重试；否则跳过</td></tr><tr><td>415</td><td><code>unsupported_media</code></td><td>换编码；否则跳过</td></tr><tr><td>429</td><td><code>quota_exceeded</code></td><td><strong>今天别再试</strong>（<code>Retry-After</code> = 到次日重置的秒数）</td></tr><tr><td>429</td><td><code>rate_limited</code></td><td><strong>配对专用</strong>：试错太多次 → 等 <code>Retry-After</code> 秒再来（§7.4）</td></tr><tr><td>429</td><td><code>queue_full</code></td><td>退避重试（<strong>当前 <code>queue_max=0</code>，用不到</strong>，占位见 §3.6）</td></tr><tr><td><strong>503</strong></td><td><strong><code>server_busy</code></strong></td><td><strong>系统忙，稍后再试</strong> —— 退避重试，尊重 <code>Retry-After</code></td></tr><tr><td>503</td><td><code>model_loading</code> / <code>gpu_oom</code> / <code>model_failed</code></td><td><strong>降级到链上下一个后端</strong></td></tr><tr><td>503</td><td><code>auth_misconfigured</code></td><td><strong>服务端自己没配好</strong>（例如 <code>mode=jwt</code> 却没配密钥）→ 别翻自己的配置，报给运营</td></tr><tr><td>504</td><td><code>inference_timeout</code></td><td>降级；并回报"此后端对这么长的音频不可用"</td></tr></tbody></table></div>
@@ -338,15 +346,25 @@ class TempWorkspace:
 <p><strong><code>503</code> 上的 <code>auth_misconfigured</code> 与 <code>401</code> 也必须分开</strong>：401 是"你的凭据不对"， 客户端会去翻自己的配置；503 是"我这边没配好"，客户端翻自己的配置是白费力气。 把这两种失败混起来是最贵的一种省事。</p>
 <p><strong><code>409 client_busy</code> 与 <code>503 server_busy</code> 必须分开</strong>（§3.6）： 前者的重试<strong>永远不会成功</strong>，后者重试才是对的。合并成一个码，客户端就只能盲目重试。</p>
 <p>这张表要与前置文档 §5.2 的 9 类降级原因<strong>一一对齐</strong>（<code>unavailable</code> / <code>timeout</code> / <code>quota</code> / <code>auth</code> / <code>privacy-denied</code> / <code>unsupported</code> / <code>vector-mismatch</code> / <code>quality-rejected</code>）。 契约不对齐，路由层就只能靠猜 —— 那等于没有降级逻辑。</p>
-<h3 id="h41">6.4 长请求与进度</h3>
+<h3 id="h42">6.4 长请求与进度</h3>
 <ul><li><code>Accept: text/event-stream</code> → 推 <code>{&quot;stage&quot;: &quot;decode|infer|done&quot;, &quot;progress&quot;: 0.4}</code></li><li><strong>连接状态只在内存</strong>；客户端断开 → 中止推理（<code>Lease.__exit__</code> 释放）+ 清理临时文件</li><li>断了客户端整段重试，服务端不补偿 —— 这就是"无状态"的代价，已在幂等契约里说明</li><li><strong>但 v1 其实不需要 SSE</strong>，理由见 §6.5 的"进度"一段</li></ul>
-<h3 id="h42">6.5 逐端点功能规格</h3>
-<h4 id="h43">公共约定（所有端点）</h4>
+<h3 id="h43">6.5 逐端点功能规格</h3>
+<h4 id="h44">公共约定（所有端点）</h4>
 <div class="tw"><table><thead><tr><th>项</th><th>约定</th></tr></thead><tbody><tr><td>方法</td><td>只有 <code>GET</code> 与 <code>POST</code>（无写端点，§6.1）</td></tr><tr><td>音频</td><td><code>application/octet-stream</code>，<strong>raw body</strong>（理由见 §5.4）</td></tr><tr><td>其它参数</td><td><strong>query string</strong> —— body 被音频占了，参数没地方放</td></tr><tr><td>认证</td><td><code>Authorization: Bearer &lt;token&gt;</code>，或 mTLS 证书（§7.1）</td></tr><tr><td>协议版本</td><td><code>X-Echo-Protocol: 1</code></td></tr><tr><td>对账</td><td><code>X-Request-Id</code>（客户端给，服务端回显；没给就生成）——两边日志靠它对齐（§7.3）</td></tr><tr><td>段落标识</td><td><code>X-Segment-Id</code>（如 <code>&lt;会议名&gt;#03</code>；服务端<strong>只回显与记日志</strong>，不解析）</td></tr></tbody></table></div>
 <p><strong>音频规格</strong></p>
 <div class="tw"><table><thead><tr><th>项</th><th>约定</th></tr></thead><tbody><tr><td>采样率</td><td>任意（服务端重采样到模型需要的），<strong>推荐 16 kHz</strong></td></tr><tr><td>声道</td><td>1 或 N；<strong>N&gt;1 时服务端下混为单声道</strong>（会议录音可能多声道）</td></tr><tr><td>位深</td><td><code>pcm_s16le</code> 为基准；也接受 <code>wav</code>、<code>opus</code></td></tr><tr><td>编码声明</td><td><code>Content-Type: audio/wav</code> / <code>audio/opus</code>；不声明按 PCM 处理</td></tr><tr><td>上限</td><td><code>limits.maxAudioSeconds</code> 与 <code>maxUploadBytes</code>，超了 <code>413</code></td></tr></tbody></table></div>
+<h4 id="h45">公共约定补充：<strong>回错误之前必须把请求体抽干</strong>（2026-09-24 实测补上）</h4>
+<p>服务端在<strong>读 body 之前</strong>就拒掉请求时（鉴权失败、模型不存在、自己忙、参数不合法……）， 必须在回响应<strong>之前</strong>把还没读的请求体读掉。否则：</p>
+<pre class="code"><code>服务端没读完 body 就回响应并关连接
+  → socket 里剩下的未读数据让对端收到 RST
+  → RST **丢掉对端接收缓冲里已经到达的响应体**
+  → 客户端只拿到状态码，body 是空的 —— 而 code 就在 body 里</code></pre>
+<p>实测（<code>POST /v1/asr?model=nope</code>）：body 2 KB 时正常；<strong>0.9 MB 时 body 为空</strong>。 而且是<strong>竞态</strong> —— 同一次跑里一个端点丢了、另一个没丢，所以偶尔能过、极易漏掉。 大音频恰恰是最需要错误码的场合（<code>audio_too_long</code> / <code>payload_too_large</code> / <code>client_busy</code> / <code>model_not_found</code>），<strong>丢了 code，客户端只能盲目重试</strong> —— 那正是 §6.3 整套错误模型存在的意义。</p>
+<p>两条实现规矩：</p>
+<ol><li><strong>顺序是"先抽干、再抛"</strong>，不能"先回响应再抽" —— 那时连接已经要关了，RST 照样发生。</li><li><strong>声报超大的请求（<code>payload_too_large</code>）故意不抽干</strong>：那可能真是 999 MB。 "413 = 太大了"光看状态码就够，不需要 code 去区分；真正必须保住 code 的， 是那些<strong>体量正常但被业务拒掉</strong>的请求。</li></ol>
+<p>实现见 <code>server/audio.drain</code> 与 <code>server/routes._reject</code>； 契约由 <code>ErrorCodeSurvivesLargeBodyTests</code> 钉住 —— 它<strong>必须走真 socket</strong> （<code>uvicorn</code> 起在临时端口上），因为 RST 是 TCP 层的事， <code>TestClient</code> / <code>httpx.ASGITransport</code> 都是进程内直调 ASGI，<strong>根本复现不了</strong>。</p>
 <hr>
-<h4 id="h44">A. <code>POST /v1/asr</code> —— 音频 → 文本</h4>
+<h4 id="h46">A. <code>POST /v1/asr</code> —— 音频 → 文本</h4>
 <p><strong>做什么</strong>：一段音频转成文本，可选带句子级时间戳。</p>
 <p><strong>参数</strong></p>
 <div class="tw"><table><thead><tr><th>参数</th><th>取值</th><th>默认</th><th>说明</th></tr></thead><tbody><tr><td><code>variant</code></td><td><code>short</code> / <code>long</code></td><td><code>long</code></td><td><strong>语义档位</strong>，映射到不同模型（见下）</td></tr><tr><td><code>timestamps</code></td><td><code>0</code> / <code>1</code></td><td><code>0</code></td><td>是否要句子级时间轴</td></tr><tr><td><code>lang</code></td><td><code>zh</code> / <code>en</code> / <code>auto</code> …</td><td><code>auto</code></td><td>语言提示</td></tr><tr><td><code>model</code></td><td>模型 id</td><td>—</td><td><strong>高级覆盖</strong>：绕过 variant 直接点名</td></tr></tbody></table></div>
@@ -372,7 +390,7 @@ class TempWorkspace:
 <p><strong>三条语义约定</strong></p>
 <ol><li><strong><code>timestamps</code> 只有 <code>exact</code> 与 <code>none</code>，服务端不编 <code>estimated</code>。</strong> "按字数均摊"是<strong>客户端</strong>拿不到时间戳时做的兜底（现有 <code>_split_provider_text</code>）， 而且必须把 <code>estimated</code> 标进数据里 —— 那个标记属于客户端， 服务端不该假装自己有精确时间戳。</li><li><strong>服务端不认识"会议"。</strong> <code>variant=long</code> 只是"用哪个模型"的提示，不带业务含义（§1.2）。 名字取 <code>long</code> 而非 <code>meeting</code>，正是为了让这条原则<strong>在源码里也成立</strong> —— 见上面的说明。</li><li><strong>不分段、不切句</strong>（除模型自身能力）。一段进、一段文本 + 可选句子出；<strong>切分是客户端的事</strong>。</li></ol>
 <hr>
-<h4 id="h45">B. <code>POST /v1/diarize</code> —— 音频 → 说话人时间轴 + 嵌入</h4>
+<h4 id="h47">B. <code>POST /v1/diarize</code> —— 音频 → 说话人时间轴 + 嵌入</h4>
 <p><strong>做什么</strong>：分段 + 嵌入 + 聚类。<strong>这是全系统唯一产生说话人向量的地方。</strong></p>
 <p><strong>参数</strong></p>
 <div class="tw"><table><thead><tr><th>参数</th><th>取值</th><th>默认</th><th>说明</th></tr></thead><tbody><tr><td><code>mode</code></td><td><code>segment</code> / <code>turns</code></td><td><code>segment</code></td><td>档 1 / 档 2（见下）</td></tr><tr><td><code>maxSpeakers</code></td><td>整数</td><td>—</td><td>已知人数时的提示（<strong>能显著提升准确率</strong>）</td></tr><tr><td><code>model</code></td><td>模型 id</td><td>—</td><td>高级覆盖</td></tr></tbody></table></div>
@@ -397,7 +415,7 @@ class TempWorkspace:
 <p><strong>两条必须写进契约的话</strong></p>
 <ol><li><strong><code>speaker</code> 是 local label，只在本次响应内有意义。</strong> 这一段里的 <code>S0</code> 与下一个分段里的 <code>S0</code> <strong>没有任何关系</strong> —— 跨段同一性是<strong>客户端</strong>做的（现有 <code>SpeakerRegistry</code>）。</li><li><strong>客户端绝不能把两个不同 <code>vectorSpaceId</code> 的结果混进同一场会议。</strong> 这是 L5，不是建议。 服务端的责任是<strong>如实声明</strong> <code>vectorSpaceId</code>；<strong>拒绝混用</strong>是客户端的责任。</li></ol>
 <hr>
-<h4 id="h46">C. <code>POST /v1/speaker/embed</code> —— 音频 → 嵌入</h4>
+<h4 id="h48">C. <code>POST /v1/speaker/embed</code> —— 音频 → 嵌入</h4>
 <p><strong>做什么</strong>：把一段音频变成说话人嵌入。<strong>主要用途是"现场注册联系人"</strong> —— 现在 <code>voiceprint.py</code> 只有 <code>enroll_from_meeting()</code>，入库的唯一路径是"在会议里改名为联系人"， 门槛太高。</p>
 <p><strong>参数</strong></p>
 <div class="tw"><table><thead><tr><th>参数</th><th>取值</th><th>说明</th></tr></thead><tbody><tr><td><code>count</code></td><td><code>1</code> / <code>N</code></td><td>音频里预期几个说话人；<code>N&gt;1</code> 时返回 N 个嵌入（服务端自己聚）</td></tr><tr><td><code>model</code></td><td>模型 id</td><td>高级覆盖</td></tr></tbody></table></div>
@@ -412,11 +430,11 @@ class TempWorkspace:
 <p><strong>一条边界</strong>：<strong>服务端只提嵌入，不做任何"这是谁"的判断。</strong> 匹配、阈值、间隔门、库管理全在客户端（<code>VoiceMatcher</code>）—— 库是敏感个人信息，而且阈值是每个客户私有的调参（前置文档 §5）。</p>
 <p><strong>与 <code>diarize</code> 的关系</strong>：<code>vectorSpaceId</code> <strong>必须一致</strong>，否则"现场注册的人"在会议里认不出来。 两者由<strong>同一个模型</strong>提供，服务端要保证这一点<strong>并声明出来</strong>。</p>
 <hr>
-<h4 id="h47">D. <code>POST /v1/tts</code> —— 文本 → 音频（可选，低优先）</h4>
+<h4 id="h49">D. <code>POST /v1/tts</code> —— 文本 → 音频（可选，低优先）</h4>
 <p><strong>v1 可以是空实现</strong>，<code>capabilities</code> 里完全可以不声明它。</p>
 <p>理由：客户端已有系统自带 TTS（SAPI / <code>say</code> / espeak，<strong>零依赖</strong>）与 edge-tts（纯 Python）。 服务端 TTS 只在"想统一音色"或"客户端没有可用音色"时才有价值。</p>
 <hr>
-<h4 id="h48">横切功能</h4>
+<h4 id="h50">横切功能</h4>
 <p><strong>批量：不做批量端点，靠客户端并发</strong></p>
 <p>会议有几十个分段，逐个 POST 会嫌啰嗦。但：</p>
 <ul><li><strong>不做 multipart 批量</strong> —— §5.2 的实测：框架会把大文件 spool 到磁盘</li><li><strong>不做 <code>/v1/batch</code></strong> —— 请求体要装多段音频，等于自己发明一个容器格式</li></ul>
@@ -429,12 +447,12 @@ class TempWorkspace:
 <div class="tw"><table><thead><tr><th>谁</th><th>配置</th><th>行为</th></tr></thead><tbody><tr><td>服务端通道满</td><td>— （<strong>不排队，立刻拒</strong>）</td><td><code>503 server_busy</code> + <code>Retry-After</code>，客户端退避重试</td></tr><tr><td>（留空给未来的 <code>queue_max&gt;0</code>）</td><td><code>queue_wait_timeout_s</code></td><td>默认不启用</td></tr><tr><td>服务端推理</td><td><code>inference_timeout_s</code>（默认 900）</td><td>中止 + <code>504 inference_timeout</code></td></tr><tr><td>客户端 HTTP</td><td>客户端定（要比服务端长）</td><td>断开 → 服务端检测到并<strong>中止推理 + 清临时文件</strong></td></tr></tbody></table></div>
 <p><strong>最后一行是必须的</strong> —— 否则用户取消了，GPU 还在为一个没人要的结果烧着。</p>
 <hr>
-<h4 id="h49">服务端功能边界（一眼表）</h4>
+<h4 id="h51">服务端功能边界（一眼表）</h4>
 <div class="tw"><table><thead><tr><th>做</th><th>不做</th></tr></thead><tbody><tr><td>音频 → 文本（+ 可选时间轴）</td><td>不认识"会议 / 命令 / 纪要"</td></tr><tr><td>音频 → 说话人时间轴 + 嵌入</td><td><strong>不做跨段同一性</strong>（客户端的）</td></tr><tr><td>音频 → 说话人嵌入</td><td><strong>不做身份判断/匹配</strong>（客户端的）</td></tr><tr><td>文本 → 音频（可选）</td><td>不存任何东西（临时文件除外，§5）</td></tr><tr><td>声明能力、版本、真实可用性</td><td>不做 job 队列 / 批量容器格式 / 分段</td></tr></tbody></table></div>
 <hr>
-<h2 id="h50">7. 鉴权、配额与多租户</h2>
+<h2 id="h52">7. 鉴权、配额与多租户</h2>
 <blockquote><p><strong>实现状态（2026-09-24）</strong>：§7.1 / §7.4 / §7.5 的核心<strong>已经落地</strong> —— 配对码、secret 哈希、短期 JWT、<code>token_version</code> 撤销、scopes、跨进程撤销轮询。 <strong>还没做的</strong>是 §7.2 的<strong>配额</strong>（并发之外的日额度/音频分钟数）与 §8.4 的管理面， 所以现在配对的入口是命令行（<code>python -m server.main --new-pairing-code</code>）。 每条断言落在哪个用例上见 §12。<strong>没实现的那些不许在文档里读起来像已经做了。</strong></p></blockquote>
-<h3 id="h51">7.1 身份模型：<strong>传输层与应用层分开</strong></h3>
+<h3 id="h53">7.1 身份模型：<strong>传输层与应用层分开</strong></h3>
 <p>先把一个容易混的概念拆开 —— <strong>"链路可信"和"这是谁"是两件事</strong>：</p>
 <div class="tw"><table><thead><tr><th>层</th><th>解决什么</th><th>用什么</th><th>可替换？</th></tr></thead><tbody><tr><td><strong>传输层</strong></td><td>链路加密、防窃听</td><td><strong>TLS（强制，即使内网）</strong></td><td>自签 / 内网 CA / mTLS</td></tr><tr><td><strong>应用层</strong></td><td><strong>这是哪个客户端</strong>、能做什么、用了多少配额</td><td><strong><code>client_id</code> + 短期 JWT</strong></td><td><strong>不可替换</strong></td></tr></tbody></table></div>
 <p><strong>为什么应用层身份永远是 <code>client_id</code>，而不是"证书即身份"</strong></p>
@@ -443,7 +461,7 @@ class TempWorkspace:
 <p>所以 3.0 的选型是：</p>
 <ul><li><strong>v1 = 配对码 → <code>client_id</code> + <code>secret</code> → 短期 JWT</strong>（自包含，不依赖 PKI）</li><li><strong>mTLS 是可选加固</strong>，<strong>不替代</strong> <code>client_id</code>：它只多一道"网络层准入"， 身份、配额、撤销仍然走应用层（否则撤销就退化成 CRL 问题）</li></ul>
 <p><strong>兜底的"每请求 HMAC 签名"也去掉</strong> —— 它只在完全无法上 TLS 时才有意义， 而"无法上 TLS"的内网场景不该被支持（上行的是音频与声纹衍生数据）。</p>
-<h3 id="h52">7.2 scopes 与配额</h3>
+<h3 id="h54">7.2 scopes 与配额</h3>
 <pre class="code"><code>scopes:  asr | diarize | embed | tts
 配额维度：并发数 / 单请求最大音频秒数 / 每日音频分钟数 / 队列优先级</code></pre>
 <p><strong>v1.5 只落了 scopes 的一半</strong>：<code>asr</code> / <code>diarize</code> / <code>embed</code> 已经在 <code>routes.ENDPOINT_SCOPES</code> 里逐端点声明并强制（<code>tts</code> 等有端点时再加）。 <strong>配额还没做</strong> —— 现在只有 §3.6 的并发闸门，"每日音频分钟数"这类要等 v2。</p>
@@ -452,13 +470,13 @@ class TempWorkspace:
 <p><strong>配额计数放内存，不每请求查库</strong>（§8.5 的硬约束）：</p>
 <div class="tw"><table><thead><tr><th>数据</th><th>在哪</th><th>为什么</th></tr></thead><tbody><tr><td>剩余分钟数 / 并发数</td><td><strong>进程内计数</strong>（滑动窗口）</td><td>每请求查库会让库变成瓶颈</td></tr><tr><td>长期统计</td><td>定期由 <code>calls_rollup</code> 承接</td><td>给运营看，不给鉴权看</td></tr><tr><td>配额<strong>上限</strong></td><td>库（<code>clients</code> 表）</td><td>改动少，可缓存</td></tr></tbody></table></div>
 <p>代价：多实例时计数不共享 → <strong>同客户的并发配额按实例各算一份</strong>。 如果这个不可接受，就按 §9.4 把该客户粘到固定实例（按 client_id 哈希一路上游）。 <strong>这是"能力面不查库"换来的必然取舍，要写在明处。</strong></p>
-<h3 id="h53">7.3 审计日志：只有元数据</h3>
+<h3 id="h55">7.3 审计日志：只有元数据</h3>
 <pre class="code"><code>{&quot;ts&quot;:&quot;...&quot;,&quot;request_id&quot;:&quot;...&quot;,&quot;client_id&quot;:&quot;cli-07&quot;,&quot;endpoint&quot;:&quot;/v1/diarize&quot;,
  &quot;audio_seconds&quot;:601.4,&quot;bytes&quot;:19200000,&quot;backend&quot;:&quot;pyannote-3.1&quot;,
  &quot;duration_ms&quot;:8421,&quot;status&quot;:200,&quot;queue_wait_ms&quot;:120}</code></pre>
 <p><strong>没有</strong>音频、文本、嵌入、说话人数。两边用 <code>request_id</code> 对齐 —— 排障能对上，服务端侧无内容。这是"不存储"与"可排障"的平衡点。</p>
 <p><code>request_id</code> 优先取客户端传入的 <code>X-Request-Id</code>（没有则服务端生成并回传）， 这样客户端能把它写进自己的业务日志（<code>db.add_log(source=&quot;capability&quot;, ...)</code>）。</p>
-<h3 id="h54">7.4 客户端配对（pairing）：凭据怎么发出去</h3>
+<h3 id="h56">7.4 客户端配对（pairing）：凭据怎么发出去</h3>
 <p><strong>问题</strong>：客户端要拿到 <code>client_id</code> + <code>secret</code>。手工复制粘贴有两个毛病 —— secret 会留在聊天记录里，而且管理员得一台台填。</p>
 <p><strong>做法：一次性配对码</strong>（管理面「新建客户端」时生成；管理面做好之前走命令行）</p>
 <pre class="code"><code>① 生成配对码（8 位、有效期 15 分钟、只存哈希），明文只出现这一次
@@ -481,8 +499,8 @@ class TempWorkspace:
 <div class="tw"><table><thead><tr><th></th><th>复制 secret</th><th>配对码</th></tr></thead><tbody><tr><td>泄漏面</td><td>secret 进了聊天记录 / 截图</td><td>只能用一次、15 分钟过期、用掉即废</td></tr><tr><td>绑定</td><td>无（谁拿到谁能用）</td><td>绑到具体客户端名与版本</td></tr><tr><td>撤销</td><td>只能撤 secret</td><td>既能撤客户端，也能作废未用的码</td></tr><tr><td>管理员负担</td><td>手工发</td><td>报一个码</td></tr></tbody></table></div>
 <p><strong>四条安全约定</strong></p>
 <ol><li><strong><code>/v1/pair</code> 是唯一不需要既有凭据的能力端点</strong>（它本来就是换凭据的）。 所以要额外防滥用：<strong>限速 + 失败计数 + 可选择"关闭配对"</strong>（关掉后新机器进不来）。</li><li><strong>配对码与 secret 都只存哈希</strong>；明文只在生成/下发那一次出现。</li><li><strong>配对绑机器，不绑人。</strong> 一个客户端一份凭据 —— 撤销时"这台机器失去权限" 比"这个人失去权限"更好操作，而且配额本来就按机器算。</li><li><strong>撤销必须立即生效。</strong> 短期 JWT（1 h）意味着撤销最多滞后 1 小时，不可接受。 所以 JWT 里带 <code>tokenVersion</code>、<code>clients</code> 表里也有一个：<strong>撤销 = 版本 +1</strong>； 服务端校验时比对<strong>进程内缓存</strong>（不每请求查库，见 §8.5 最后一段）。</li></ol>
-<h3 id="h55">7.5 令牌、撤销与本地存储（完整生命周期）</h3>
-<h4 id="h56">全部状态转换一张图</h4>
+<h3 id="h57">7.5 令牌、撤销与本地存储（完整生命周期）</h3>
+<h4 id="h58">全部状态转换一张图</h4>
 <pre class="code"><code>[未配对] ──配对码──▶ [已配对·持 secret]
                           │  每小时用 secret 换 JWT
                           ▼
@@ -491,7 +509,7 @@ class TempWorkspace:
    撤销 / 禁用 ───────────┴──▶ 下一个请求 401（ver 不匹配）
    secret 泄漏 ──管理员轮换──▶ 旧 secret 宽限 24h，客户端自动切新</code></pre>
 <p><strong>为什么不设 refresh token</strong>：secret 本来就在客户端本地。 多一层 refresh token 只是把同一个东西存两份，复杂度换不到安全性。</p>
-<h4 id="h57">① 配对（一次，带外）</h4>
+<h4 id="h59">① 配对（一次，带外）</h4>
 <pre class="code"><code>【管理面】管理员新建客户端：填 名称 / scopes / 配额
   → 服务端生成配对码，只存哈希，15 分钟过期
   → 界面给出**一个可直接粘贴的配对串**：
@@ -502,14 +520,14 @@ class TempWorkspace:
   POST https://gpu-01:8900/v1/pair   { code, clientName, clientVersion }
   ← 200 { clientId: &quot;cli-07a3f2&quot;, secret: &quot;…&quot;, serverName, protocol: 1 }</code></pre>
 <p><strong>配对串里带证书指纹，是一石二鸟。</strong> 配对本来就是<strong>带外</strong>的（人工传递）， 正好用来交换信任：客户端记下指纹，之后连这个后端就校验它（防中间人）—— <strong>用户不需要去装自签证书的根</strong>。这也是"配对"这件事除了发凭据之外的第二个价值。</p>
-<h4 id="h58">② 换令牌</h4>
+<h4 id="h60">② 换令牌</h4>
 <pre class="code"><code>POST /v1/token
   Authorization: Basic base64(clientId:secret)
 ← 200 { accessToken, expiresIn: 3600, scopes, quota }</code></pre>
 <p><strong>JWT 里放什么（关键）</strong></p>
 <div class="tw"><table><thead><tr><th>声明</th><th>内容</th><th>为什么</th></tr></thead><tbody><tr><td><code>sub</code></td><td><code>client_id</code></td><td>一切配额/日志的挂载点</td></tr><tr><td><code>scopes</code></td><td>允许的槽</td><td>免得每请求查 scope</td></tr><tr><td><code>ver</code></td><td>签发时的 <code>token_version</code></td><td><strong>撤销靠它</strong></td></tr><tr><td><code>exp</code></td><td>1 小时</td><td></td></tr><tr><td><code>iat</code> / <code>jti</code></td><td>签发时间 / 令牌 id</td><td>排障</td></tr></tbody></table></div>
 <p><strong>不放</strong>：任何业务信息、配额余额 —— 余额必须实时读内存，签死在 token 里必然不准。</p>
-<h4 id="h59">③ 调能力时的校验（<strong>全部在内存，不查库</strong>）</h4>
+<h4 id="h61">③ 调能力时的校验（<strong>全部在内存，不查库</strong>）</h4>
 <pre class="code"><code>① 验签名 + exp（允许 60 s 时钟偏差 —— 内网机器时钟未必准）
 ② client_id 在缓存里？不在 → 查库一次并缓存；查不到 → 401
 ③ 缓存里的 ver == token.ver ？不等 = 已撤销 → 401
@@ -517,7 +535,7 @@ class TempWorkspace:
 ⑤ scopes 含所需槽？→ 403
 ⑥ 并发 / 队列 / 日配额没超？→ 429
 ⑦ 放行 → `calls` 记录**异步写库**，不阻塞请求</code></pre>
-<h4 id="h60">④ 撤销：能到什么程度</h4>
+<h4 id="h62">④ 撤销：能到什么程度</h4>
 <pre class="code"><code>撤销 → clients.token_version += 1（**同时动 updated_at**）
      → 同一进程：直接失效那份缓存 → **立即**
      → 别的进程/实例：靠轻量轮询发现 SELECT MAX(updated_at) FROM clients
@@ -526,7 +544,7 @@ class TempWorkspace:
 <p><strong>多实例不做实例间广播</strong> —— 那要引入消息通道，而 5 秒撤销延迟对办公场景够用。 <strong>但这个延迟要如实写进文档，不能说成"立即"。</strong></p>
 <blockquote><p><strong>这一格是被一次真事故补上的。</strong> 原来只有"同一进程立即"那一半， <code>RevocationWatcher</code> 根本没实现 —— 于是<strong>唯一的运维入口</strong>（命令行 <code>--revoke</code>） 撤销之后，跑着的服务会<strong>继续接受那个 JWT</strong> 直到缓存自己过期（默认 60 秒）。 "撤销立即生效"这句在真实使用路径上是假话。端到端冒烟时才暴露出来： 命令行撤销 → 带旧 JWT 请求 → 依然放行。契约由 <code>AuthTokenTests.test_revoke_from_another_process_is_eventually_noticed</code> 钉住。</p>
 <p>探针刻意用 <strong><code>MAX(updated_at)</code> 而不是 <code>MAX(token_version)</code></strong>：撤销改 <code>token_version</code>、 禁用改 <code>disabled</code>、轮换改 <code>secret_hash</code>，<strong>三者都要能被发现</strong>， 而它们改的列不一样。<code>updated_at</code> 是它们的共同痕迹。 代价是"改了却没动 <code>updated_at</code>"的写入发现不了 —— 所以 <code>store.py</code> 里 <strong>每一处改 <code>clients</code> 的地方都显式写了 <code>updated_at</code></strong>。</p></blockquote>
-<h4 id="h61">⑤ 轮换，而不是重新配对</h4>
+<h4 id="h63">⑤ 轮换，而不是重新配对</h4>
 <p>secret 泄漏或例行轮换时，<strong>不要让用户再跑一趟输配对码</strong>：</p>
 <pre class="code"><code>clients 表：secret_hash / secret_rotated_at
             prev_secret_hash / prev_secret_expires_at    ← 宽限期
@@ -534,34 +552,34 @@ class TempWorkspace:
      客户端下次换令牌时服务端回 X-Echo-Secret-Rotated: 1 + 新 secret
      → 客户端自动落盘新 secret、平滑切换，用户无感</code></pre>
 <blockquote><p><strong>v1 现状：只做了"换掉即失效"，上面那套宽限期还没做（2026-09-24）。</strong> 宽限期要在 <code>clients</code> 上加 <code>prev_secret_hash</code> / <code>prev_secret_expires_at</code> 两列， 而"宽限期内谁还能进"这件事一旦摊开就要想清楚（两把 secret 同时有效， 撤销时怎么保证两把都失效？）。v1 先做最简单的那条： <code>Store.rotate_secret</code> 换掉哈希，旧的<strong>立刻</strong>失效 —— 代价是用户要重新配对一次，而配对成本很低（管理面再报一个码）。 <strong>别把这张表读成"已经能平滑轮换"。</strong></p></blockquote>
-<h4 id="h62">⑥ 客户端本地存什么（<strong>这是客户端侧的安全边界</strong>）</h4>
+<h4 id="h64">⑥ 客户端本地存什么（<strong>这是客户端侧的安全边界</strong>）</h4>
 <p><code>{echoBase}/data/backend.json</code>：</p>
 <div class="tw"><table><thead><tr><th>字段</th><th>说明</th></tr></thead><tbody><tr><td><code>baseUrl</code></td><td>后端地址</td></tr><tr><td><code>clientId</code></td><td></td></tr><tr><td><code>secret</code></td><td><strong>必须保护</strong>：Linux/macOS <code>0600</code>；Windows 走 <strong>DPAPI</strong>（绑用户账户）</td></tr><tr><td><code>certFingerprint</code></td><td>配对时记下，之后校验（防中间人）</td></tr><tr><td><code>accessToken</code> / <code>expiresAt</code></td><td>可只放内存，或与上同权限落盘</td></tr></tbody></table></div>
 <p><strong>明文 secret 放普通文件是不够的</strong> —— 这台机器上任何用户态程序都能读。 Windows 上至少要走 DPAPI（<code>CryptProtectData</code>）；这与"业务数据留客户端"是同一类纪律。</p>
-<h4 id="h63">⑦ 与"内网公共 ASR"的凭据<strong>不要混为一谈</strong></h4>
+<h4 id="h65">⑦ 与"内网公共 ASR"的凭据<strong>不要混为一谈</strong></h4>
 <div class="tw"><table><thead><tr><th></th><th>ECHO 能力后端</th><th>内网公共 ASR</th></tr></thead><tbody><tr><td>身份</td><td>我们签发的 <code>client_id</code> + JWT</td><td><strong>别人家的凭据</strong>（常见就是一把 API key）</td></tr><tr><td>配对</td><td>我们的配对流程</td><td>没有，管理员手工填</td></tr><tr><td>审计</td><td>我们的 <code>calls</code> 表</td><td><strong>无</strong>（只有对方能看）</td></tr><tr><td>撤销</td><td>我们的管理面</td><td>找对方管理员</td></tr></tbody></table></div>
 <p>所以别把它俩抽象成一套凭据模型 —— 在客户端里它们是<strong>两份独立配置</strong>： <code>{echoBase}/data/backend.json</code>（我们的）与设置里的 <code>providerAsrBaseUrl/ApiKey</code>（别人的）。</p>
 <hr>
-<h2 id="h64">8. 可观测性</h2>
-<h3 id="h65">8.1 两个探针要分开</h3>
+<h2 id="h66">8. 可观测性</h2>
+<h3 id="h67">8.1 两个探针要分开</h3>
 <div class="tw"><table><thead><tr><th>端点</th><th>语义</th><th>何时非 200</th></tr></thead><tbody><tr><td><code>/v1/health</code></td><td><strong>存活</strong>（liveness）</td><td>几乎不失败；挂了才失败</td></tr><tr><td><code>/v1/ready</code></td><td><strong>就绪</strong>（readiness）</td><td>模型池全 failed / 显存耗尽 → 503</td></tr></tbody></table></div>
 <p>混在一起会导致：模型加载中 → 被编排系统反复重启 → 永远起不来。</p>
-<h3 id="h66">8.2 指标清单</h3>
+<h3 id="h68">8.2 指标清单</h3>
 <pre class="code"><code>每端点：QPS / p50 / p95 / 错误码分布
 队列：深度 / 等待时长分布
 模型：state / 加载次数 / 加载耗时 / 显存占用 / 命中率（复用 vs 新加载）
 降级：各错误码计数（客户端侧也统计，两边对账）
 临时文件：文件数 / 字节数 / 最老文件年龄</code></pre>
 <p><strong>最后一项是"不存储"的运行期体检指标。</strong> 它不归零就说明有泄漏。</p>
-<h3 id="h67">8.3 日志规范</h3>
+<h3 id="h69">8.3 日志规范</h3>
 <div class="tw"><table><thead><tr><th>应该记</th><th>不该记</th></tr></thead><tbody><tr><td><code>request_id / client_id / endpoint / 音频秒数 / 耗时 / 状态码 / 队列等待</code></td><td>音频、转写文本、嵌入、请求体</td></tr><tr><td><code>model_id / 加载耗时 / 显存</code></td><td>说话人名、会议名</td></tr><tr><td><code>evict / oom / timeout / 降级原因</code></td><td>任何用户内容</td></tr></tbody></table></div>
 <blockquote><p>反例警示：客户端 <code>app/assistant.py:349</code> 写着 <code>db.add_log(&quot;info&quot;, &quot;assistant&quot;, f&quot;识别: {text[:60]}（{note}）&quot;)</code>。 这在客户端是合理的（本机日志），<strong>照搬到服务端就是泄漏</strong>。</p></blockquote>
-<h3 id="h68">8.4 管理面（Admin Console）</h3>
+<h3 id="h70">8.4 管理面（Admin Console）</h3>
 <p><strong>一句话</strong>：服务端自带一个管理网页，给运维看<strong>模型跑得怎么样、客户端有谁在连、谁调了什么</strong>。 它读的是 §8.2 的指标与 §7.3 的审计数据，<strong>不读任何内容</strong>。</p>
-<h4 id="h69">与能力面严格隔离</h4>
+<h4 id="h71">与能力面严格隔离</h4>
 <div class="tw"><table><thead><tr><th></th><th>能力面</th><th>管理面</th></tr></thead><tbody><tr><td>路径</td><td><code>/v1/*</code></td><td><code>/admin/*</code>（页面）+ <code>/admin/api/*</code></td></tr><tr><td>鉴权</td><td>客户端凭据（mTLS / <code>client_id:secret</code>→JWT）</td><td><strong>管理员用户名 + 密码</strong> → 会话</td></tr><tr><td>端口</td><td>对客户端网段开放</td><td><strong>建议独立端口</strong>，只对运维网段开放</td></tr><tr><td>状态</td><td><strong>仍然无状态</strong>（可水平扩）</td><td>有状态（会话 + 读写库）</td></tr><tr><td>内容</td><td>只过音频与结果</td><td><strong>只有元数据，永不显示内容</strong></td></tr></tbody></table></div>
 <p><strong>建议独立端口的理由</strong>：防火墙规则一条就够 （<code>客户端网段 → :8900</code>、<code>运维网段 → :8901</code>），比在同一个端口上做路径级 ACL 可靠。 也让"管理面能不能水平扩"这个问题变得无关紧要。</p>
-<h4 id="h70">五个页签</h4>
+<h4 id="h72">五个页签</h4>
 <p><strong>① 概览</strong></p>
 <pre class="code"><code>能力后端 gpu-01 · v1.0.0 · 运行 3d 12h
 当前并发 3 / 4     队列 2     今日音频 412 分钟
@@ -582,7 +600,7 @@ class TempWorkspace:
 <blockquote><p>这正是 §7.3"两边用 <code>request_id</code> 对齐"的兑现处： 服务端这行说"12:04:11 那一段耗时 8.4 秒、成功"； 客户端那边用同一个 <code>request_id</code> 说"那是《周三例会》第 3 段"。 <strong>合起来能排障，分开都不越界。</strong></p></blockquote>
 <p><strong>⑤ 统计</strong> —— 运营对账用</p>
 <ul><li>按客户端：调用数 / 音频分钟 / 错误率 / 平均延迟</li><li>按端点：QPS / p50 / p95 / 错误码分布</li><li>按模型：加载次数 / 平均推理耗时 / 显存峰值</li><li>时间序列：小时 / 天</li></ul>
-<h4 id="h71">一个必须做的页面：「存了什么」自证页</h4>
+<h4 id="h73">一个必须做的页面：「存了什么」自证页</h4>
 <p>管理面里放一页，把 §8.5 的白名单<strong>渲染成实际状态</strong>：</p>
 <pre class="code"><code>服务端数据库：echo-server.db（12.4 MB）
 ✅ admin_users      3 行   管理员账号（密码哈希）
@@ -593,33 +611,33 @@ class TempWorkspace:
 ❌ 不存在任何承载内容的表
 最后自检：2026-09-23 12:04  通过</code></pre>
 <p><strong>价值</strong>：客户/合规问"你们服务端到底存了什么"时不用解释，指给他看。 这一页自己也要有护栏测试（§12）—— <strong>页面行数与实际库不一致就是 bug</strong>。</p>
-<h4 id="h72">管理面自己的安全</h4>
+<h4 id="h74">管理面自己的安全</h4>
 <div class="tw"><table><thead><tr><th>项</th><th>要求</th></tr></thead><tbody><tr><td>密码存储</td><td><strong>argon2id</strong>（或 bcrypt），绝不明文/可逆</td></tr><tr><td>会话</td><td>短期 cookie（HttpOnly + Secure + SameSite=Strict），<strong>不用 localStorage</strong></td></tr><tr><td>登录限速</td><td>失败计数 + 指数退避 + 锁定</td></tr><tr><td>CSRF</td><td>管理面<strong>只做同源</strong>，改动用 POST + CSRF token</td></tr><tr><td>审计</td><td><strong>管理动作也要记</strong>（谁在什么时候撤销了哪个客户端）</td></tr><tr><td>初始账号</td><td>首次启动生成随机密码并<strong>打到 stdout 一次</strong>，强制首次登录改密；<strong>不设默认密码</strong></td></tr></tbody></table></div>
 <hr>
-<h3 id="h73">8.5 服务端到底存什么（边界，替代原来的"没有 DB"）</h3>
+<h3 id="h75">8.5 服务端到底存什么（边界，替代原来的"没有 DB"）</h3>
 <p><strong>判据一句话</strong>：存<strong>关于请求的元数据</strong>和<strong>关于客户端的管理数据</strong>； 不存<strong>请求的内容</strong>，也不存任何业务概念。</p>
-<h4 id="h74">表白名单（唯一白名单，多一张都要走评审）</h4>
+<h4 id="h76">表白名单（唯一白名单，多一张都要走评审）</h4>
 <p><strong>v1 只有前两张</strong>（鉴权落地时建的，<code>server/store.py</code>）；后面几张要等管理面与统计。 表集合<strong>只是白名单的子集</strong>，所以护栏测试钉的是"⊆ 白名单"，不是"== 白名单"。</p>
 <div class="tw"><table><thead><tr><th>表</th><th>存什么</th><th>关键列</th><th>v1</th></tr></thead><tbody><tr><td><code>admin_users</code></td><td>管理员账号</td><td><code>username</code> / <code>password_hash</code> / <code>disabled</code> / <code>last_login</code></td><td>⏳</td></tr><tr><td><code>clients</code></td><td>客户端注册与凭据</td><td><code>client_id</code> / <code>name</code> / <code>secret_hash</code> / <code>scopes</code> / <code>token_version</code> / <code>last_seen</code> / <code>version</code> / <code>disabled</code></td><td>✅</td></tr><tr><td><code>pairing_codes</code></td><td>待用的配对码</td><td><code>code_hash</code> / <code>expires_at</code> / <code>created_by</code>（<strong>用掉即删</strong>）</td><td>✅</td></tr><tr><td><code>calls</code></td><td>调用元数据</td><td><code>ts</code> / <code>client_id</code> / <code>endpoint</code> / <code>model_id</code> / <code>audio_seconds</code> / <code>queue_wait_ms</code> / <code>duration_ms</code> / <code>status</code> / <code>error_code</code> / <code>request_id</code></td><td>⏳</td></tr><tr><td><code>calls_rollup</code></td><td>小时/天聚合</td><td><code>bucket</code> / <code>client_id</code> / <code>endpoint</code> / <code>count</code> / <code>errors</code> / <code>p50</code> / <code>p95</code> / <code>audio_seconds</code></td><td>⏳</td></tr><tr><td><code>model_events</code></td><td>模型生命周期</td><td><code>ts</code> / <code>model_id</code> / <code>event</code>(load/evict/fail) / <code>duration_ms</code> / <code>vram_mb</code></td><td>⏳</td></tr><tr><td><code>admin_audit</code></td><td>管理动作</td><td><code>ts</code> / <code>admin</code> / <code>action</code> / <code>target</code></td><td>⏳</td></tr></tbody></table></div>
 <blockquote><p><strong><code>clients</code> 的实现与这张表有两处小出入，已按实现校正：</strong> v1 只落了 <code>created_at</code> / <code>updated_at</code> / <code>last_seen</code>，<strong>没有</strong> <code>quota</code> 列 （配额是 §7.2，还没做）、也没有 <code>version</code> 列（客户端版本只是配对时的入参， 没有查询需求）。<code>updated_at</code> 是后加的、且是必需的 —— 跨进程撤销靠 <code>MAX(updated_at)</code> 发现变更（§7.5 ④）。</p></blockquote>
-<h4 id="h75">列黑名单（任何表都不许有）</h4>
+<h4 id="h77">列黑名单（任何表都不许有）</h4>
 <pre class="code"><code>text  transcript  content  body  audio  wav  embedding  vector
 speaker_name  meeting  command  summary  voiceprint  prompt  reply</code></pre>
 <p>护栏测试直接扫 <code>PRAGMA table_info</code> 的列名，<strong>命中就红</strong>。</p>
-<h4 id="h76">三件与"不存储"有关的具体约束</h4>
+<h4 id="h78">三件与"不存储"有关的具体约束</h4>
 <ol><li><strong><code>calls</code> 会涨，必须有保留策略</strong>：默认 90 天，再由 <code>calls_rollup</code> 承接长期统计。 rollup 表是纯计数与分位，<strong>不含单条记录</strong>。</li><li><strong><code>request_id</code> 是关联键，不是内容</strong> —— 它本身不泄漏任何东西， 但它是服务端与客户端对账的<strong>唯一</strong>手段，<strong>不能去掉</strong>。</li><li><strong><code>last_seen</code> / <code>version</code> 属于运营数据</strong>，可以存； 但<strong>不许存客户端的业务状态</strong>（比如"这台机器正在录哪场会议"）。</li></ol>
-<h4 id="h77">与多实例的关系（这次修订带来的新取舍）</h4>
+<h4 id="h79">与多实例的关系（这次修订带来的新取舍）</h4>
 <p>有了库之后，<strong>"服务端无状态"要拆成两句</strong>：</p>
 <div class="tw"><table><thead><tr><th></th><th>能力面</th><th>管理面 + 库</th></tr></thead><tbody><tr><td>状态</td><td><strong>仍然无状态</strong>（请求自带上下文）</td><td>有状态（会话 + 读写库）</td></tr><tr><td>水平扩</td><td>随便加实例、不需要共享存储</td><td><strong>需要共享库</strong>，或只在一个实例上开管理面</td></tr><tr><td>对能力面的影响</td><td>—</td><td><strong>能力面绝不每请求查库</strong></td></tr></tbody></table></div>
 <p><strong>关键约束：能力路径上不能每请求查一次库</strong>，否则库就成了能力面的单点与瓶颈。 凭据校验与配额计数走<strong>进程内缓存 + 事件驱动刷新</strong>（撤销靠 <code>token_version</code> 推送）。 这是这次修订<strong>唯一</strong>真正削弱了原设计的地方，必须记在明处。</p>
 <hr>
-<h2 id="h78">9. 部署与运维</h2>
-<h3 id="h79">9.1 宿主系统：要用 Docker 的话，"容器里就是 Linux"</h3>
+<h2 id="h80">9. 部署与运维</h2>
+<h3 id="h81">9.1 宿主系统：要用 Docker 的话，"容器里就是 Linux"</h3>
 <p><strong>关键推论</strong>：Docker 在 Windows 上跑的<strong>也是 Linux 容器</strong>（WSL2 后端）。 所以在"要用 Docker"这个前提下，Windows / Linux 的选择<strong>只影响宿主，不影响我们的代码</strong>。</p>
 <p><strong>结论：代码只需支持 Linux 容器一套。</strong> 不为 Windows 原生写第二套 —— 这是这次决定省下的最大一块工作量。</p>
 <div class="tw"><table><thead><tr><th>方案</th><th>宿主</th><th>容器</th><th>GPU 直通</th><th>评价</th></tr></thead><tbody><tr><td><strong>A. Linux + Docker</strong></td><td>Linux</td><td>Linux</td><td><code>--gpus all</code> + nvidia-container-toolkit，<strong>成熟</strong></td><td>⭐ <strong>推荐</strong></td></tr><tr><td><strong>B. Windows + Docker Desktop</strong></td><td>Windows</td><td>Linux（WSL2）</td><td>驱动装在 Windows、WSL2 透传；<code>--gpus all</code> 同样可用，但多一层、性能略损</td><td>可行</td></tr><tr><td>C. Windows 原生</td><td>Windows</td><td>无</td><td>无直通问题，性能最好</td><td><strong>不推荐</strong>：丢掉只读 rootfs 这层保护，还要为 Windows 单独适配（信号、coredump、路径…）</td></tr></tbody></table></div>
 <p><strong>如果单位只能给 Windows 机器</strong> → 选 B。代价是 GPU 性能通常比裸 Linux 低 <strong>5–15%</strong>（WSL2 的 CUDA 层）， 外加一层排障面。</p>
-<h3 id="h80">9.2 GPU 直通：不是难点，但要配对</h3>
+<h3 id="h82">9.2 GPU 直通：不是难点，但要配对</h3>
 <p><strong>Linux（三件事）</strong>：</p>
 <pre class="code"><code># ① 宿主装 NVIDIA 驱动
 # ② 装 nvidia-container-toolkit
@@ -629,7 +647,7 @@ docker run --gpus all ...</code></pre>
 <p><strong>Windows + Docker Desktop（两个坑）</strong>：</p>
 <ul><li>NVIDIA 驱动装<strong>在 Windows 上</strong>，<strong>不要</strong>装进 WSL 里</li><li>Docker Desktop 必须用 <strong>WSL2 后端</strong>（不是 Hyper-V）</li><li><code>--gpus all</code> 同样可用；<code>nvidia-smi</code> 在容器里可能显示不全（<strong>不影响推理</strong>）</li></ul>
 <p><strong>所以 GPU 直通本身不难</strong>，难的是"Windows + Docker"这一层 —— 这也是推荐 A 的原因。</p>
-<h3 id="h81">9.3 容器怎么配：只读根 + <strong>两个</strong>可写卷（保留策略相反）</h3>
+<h3 id="h83">9.3 容器怎么配：只读根 + <strong>两个</strong>可写卷（保留策略相反）</h3>
 <pre class="code"><code>docker run -d --name echo-backend \
   --gpus all \
   --read-only \                                # 根文件系统只读
@@ -644,7 +662,7 @@ docker run --gpus all ...</code></pre>
 <blockquote><p><strong>修订（2026-09-24）：从"一个可写卷"改成"两个"。</strong> 原稿只有一个 <code>/var/echo/tmp</code>，还建议"想更快就换 tmpfs"。鉴权落地后这条变成了<strong>陷阱</strong>： 客户端凭据（<code>clients</code> 表）当时按缺省落在 <code>{tmp.root}</code> 下， <strong>运维照着文档把 tmp 换成内存盘，所有配过的客户端就一起没了</strong> —— 而且现场现象是 "所有人都得重新配对"，很难联想到内存盘。</p>
 <p>根因不是"放错了目录"，而是<strong>把两种相反的保留策略塞进了同一个目录</strong>： tmp 是"随便删、可丢弃"，凭据是"丢了要重来一遍"。 所以拆成 <code>tmp.root</code> 与 <code>server.state_root</code> 两个配置项、两个卷， 并且 <code>open_store()</code> <strong>刻意不回退到 <code>tmp.root</code></strong>。 契约由 <code>EnvOverrideTests.test_state_root_is_not_tmp_root</code> 与 <code>test_open_store_never_lands_in_tmp</code> 钉住。</p></blockquote>
 <blockquote><p>修订（2026-09-23）：原稿写的是 <code>--tmpfs /tmp</code>（全内存）。按"临时文件落盘 + 定时清理" 的决定改成<strong>可写卷</strong> —— 更简单，而且<strong>对性能几乎没有影响</strong>（见 9.4）。 （注意这条只适用于 <code>tmp</code> 卷；<code>state</code> 卷<strong>永远不许</strong>换成 tmpfs。）</p></blockquote>
-<h3 id="h82">9.4 临时文件：按日期落盘 + 定时清理</h3>
+<h3 id="h84">9.4 临时文件：按日期落盘 + 定时清理</h3>
 <p><strong>决定（2026-09-23）</strong>：不搞内存盘、不搞容量硬门禁 —— <strong>按日期落盘，定时清理</strong>。</p>
 <pre class="code"><code>{tmp_root}/
 ├── 2026-09-23/
@@ -658,7 +676,7 @@ docker run --gpus all ...</code></pre>
 <p><strong>为什么落盘不牺牲性能</strong>：一段 10 分钟音频是 19 MB，写一次、读一次。 相对于转写本身的几秒到几十秒，<strong>磁盘 IO 是噪声级</strong>。真正影响性能的是 GPU，不是这块盘。</p>
 <p><strong>一个免费的 Linux 优化（零代码改动）</strong>：把 <code>tmp_root</code> 指到 <code>/dev/shm</code> 即可白拿内存盘。 <strong>默认不这么做</strong>（保持"落盘 + 定时清理"的简单默认），但如果实测发现 IO 是瓶颈，改一个配置项就行。</p>
 <p><strong>建议</strong>：临时目录放 <strong>SSD</strong>，别放网络盘 / 机械盘。</p>
-<h3 id="h83">9.5 反向代理（最容易破的一环）</h3>
+<h3 id="h85">9.5 反向代理（最容易破的一环）</h3>
 <pre class="code"><code>proxy_request_buffering off;        # 别把大 body 缓到磁盘
 proxy_max_temp_file_size 0;         # 禁止代理临时文件
 client_max_body_size 64m;           # 与 maxUploadBytes 对齐
@@ -668,47 +686,47 @@ proxy_buffering off;                # 流式响应必须
 client_body_temp_path /var/echo/tmp/nginx;
 # access_log 不含 $request_body</code></pre>
 <p><strong>漏了这段，应用层再干净也没用</strong> —— 音频会被 nginx 缓存到磁盘，而应用层完全看不见。</p>
-<h3 id="h84">9.6 单实例 vs 多实例（真实取舍）</h3>
+<h3 id="h86">9.6 单实例 vs 多实例（真实取舍）</h3>
 <p>无状态 → 多实例可以直接轮询扩。<strong>但模型权重不共享</strong>：</p>
 <ul><li>每个实例各自加载模型 → <strong>显存 × 实例数</strong></li><li>所以单卡上"多实例"通常是<strong>负优化</strong></li></ul>
 <div class="tw"><table><thead><tr><th>场景</th><th>方案</th></tr></thead><tbody><tr><td>单卡、显存够</td><td><strong>单实例</strong>，靠 EnginePool 内部并发（v1）</td></tr><tr><td>单机多卡</td><td>每卡一个实例，端口不同，前置负载均衡<strong>按模型亲和</strong></td></tr><tr><td>多机</td><td>按<strong>能力</strong>分实例：一台专做 <code>asr</code>，一台专做 <code>diarize</code>/<code>embed</code>；客户端按槽分别配置地址</td></tr></tbody></table></div>
 <p>最后一行很重要：<strong>因为路由是"按槽选后端"，客户端天然支持"asr 在这台、diarize 在那台"</strong> —— 不需要服务端做集群。这是把复杂度留在客户端编排的又一个好处。</p>
-<h3 id="h85">9.7 启动与退出</h3>
+<h3 id="h87">9.7 启动与退出</h3>
 <ul><li><strong>启动</strong>：先起 HTTP（<code>/v1/health</code> 立刻 200），再<strong>后台预热常驻模型</strong>（复用 <code>boot.py</code> 的分阶段编排）。 另外起两样东西：<strong>临时目录定时清理</strong>（§5）与<strong>撤销轮询</strong>（§7.5 ④，默认 5 秒一次）。 v1 出厂清单里没有常驻模型，所以"预热"这一步实际上是空转 —— 这是对的，不是 bug（§14-2）</li><li><strong>退出</strong>：<code>pool.shutdown()</code> 释放显存 + 等在飞请求结束（有超时）。 <strong>临时文件不在这里清</strong> —— 交给定时清理，免得退出被慢盘拖住</li><li><strong>崩溃</strong>：定时清理兜底</li></ul>
-<h3 id="h86">9.8 换模型的纪律：把"尽量统一"变成机制</h3>
+<h3 id="h88">9.8 换模型的纪律：把"尽量统一"变成机制</h3>
 <p><strong>决定（2026-09-23）</strong>：服务端<strong>不轻易换模型</strong>，效果稳定后尽量统一。</p>
 <p>这是<strong>好消息</strong>：<code>vectorSpaceId</code> 稳定 ⟹ 客户端声纹库不会莫名失效， 会议级向量空间锁定（L5）<strong>实际不会被触发</strong>。</p>
 <p>但"人不换"不等于"机制不让换"，所以要三道闸（成本都很低）：</p>
 <div class="tw"><table><thead><tr><th>闸</th><th>做什么</th></tr></thead><tbody><tr><td><strong>① 声明</strong></td><td><code>capabilities</code> 里如实报 <code>vectorSpaceId</code> 与 <code>modelVersion</code>（<strong>已有</strong>）→ 客户端能<strong>发现</strong>变化</td></tr><tr><td><strong>② 显式操作</strong></td><td>改模型<strong>不是改一行配置就生效</strong> —— 必须在管理面确认，且<strong>重启才生效</strong></td></tr><tr><td><strong>③ 提示后果</strong></td><td>确认时明说：<strong>"这会改变向量空间，已有声纹库需要重新入库（旧样本保留、但不参与匹配）"</strong></td></tr></tbody></table></div>
 <p>这样"尽量统一"就有<strong>机制保障</strong>，而不是靠记性。</p>
 <hr>
-<h2 id="h87">10. 服务端配置</h2>
+<h2 id="h89">10. 服务端配置</h2>
 <p>独立 YAML + 环境变量覆盖。<strong>不读客户端的 settings 表</strong>。</p>
 <blockquote><p><strong>完整可用的参考文件是 <code>server/echo-server.example.yaml</code>，本章不抄第二份。</strong> 抄一份 = 两份事实，必然漂 —— 而且漂的时候<strong>不报错</strong>，只是文档在说谎： 照文档配出来的服务端，与代码默认的服务端不是同一个东西。 那份文件的内容由 <code>ExampleConfigTests</code> 盯着（逐项比对 <code>default_specs()</code>、 2026-09-23 定的并发数、以及"没有顶层 <code>resident</code> 键"）。 这一章只讲<strong>每一项为什么是这个值</strong>。</p></blockquote>
-<h4 id="h88">配置项与来历</h4>
+<h4 id="h90">配置项与来历</h4>
 <div class="tw"><table><thead><tr><th>键</th><th>默认</th><th>为什么</th></tr></thead><tbody><tr><td><code>server.id</code></td><td><code>echo-backend-1</code></td><td>出现在 <code>capabilities</code> 里，客户端用它区分后端</td></tr><tr><td><code>server.listen</code></td><td><code>0.0.0.0:8900</code></td><td>不是回环 + 没开鉴权时，启动会<strong>大声告警</strong></td></tr><tr><td><code>server.instance_id</code></td><td><code>default</code></td><td>临时目录的命名空间，多实例互不清扫对方的残留</td></tr><tr><td><code>server.state_root</code></td><td><code>{ECHO}/data/server-state</code></td><td>★ <strong>耐久</strong>状态（鉴权库）。<strong>必须与 <code>tmp.root</code> 分开</strong>，理由见 §9.3</td></tr><tr><td><code>server.vram_budget_mb</code></td><td><code>0</code>（不限）</td><td>超预算<strong>拒绝</strong>而不是 OOM，也绝不回退 CPU（§3.4）</td></tr><tr><td><code>limits.max_concurrent</code></td><td><strong>2</strong></td><td>2026-09-23 定；上线后压测校准</td></tr><tr><td><code>limits.per_client_concurrent</code></td><td><strong>1</strong></td><td>公平性：一个客户端不许占满</td></tr><tr><td><code>limits.queue_max</code></td><td><strong>0</strong></td><td><strong>不排队</strong>，满了立刻拒（§3.6）</td></tr><tr><td><code>limits.busy_retry_after_s</code></td><td><code>5</code></td><td><code>server_busy</code> 时给客户端的建议等待</td></tr><tr><td><code>limits.max_audio_seconds</code></td><td><code>1800</code></td><td>半小时；超了 <code>413 audio_too_long</code></td></tr><tr><td><code>limits.max_upload_bytes</code></td><td><code>64 MiB</code></td><td>声明值在读 body 前就检查（§6.5 公共约定）</td></tr><tr><td><code>limits.load_timeout_s</code></td><td><code>300</code></td><td>等模型加载完的上限</td></tr><tr><td><code>limits.inference_timeout_s</code></td><td><code>900</code></td><td>超了 <code>504</code></td></tr><tr><td><code>tmp.root</code></td><td>系统临时目录下的 <code>echo-server</code></td><td>容器的临时卷。<strong>可以换 tmpfs</strong></td></tr><tr><td><code>tmp.ttl_hours</code></td><td><code>4</code></td><td>定时清理删超过这么久的（请求结束本来就会删）</td></tr><tr><td><code>tmp.sweep_interval_s</code></td><td><code>3600</code></td><td>每小时扫一次</td></tr><tr><td><code>tmp.max_bytes</code></td><td><code>4 GiB</code></td><td>超了<strong>先删最老的</strong>，而不是拒绝新请求</td></tr><tr><td><code>models.root</code></td><td><code>{ECHO}/models</code></td><td>跟客户端同一个模型库</td></tr><tr><td><code>models.device</code></td><td><code>cuda</code>（示例里写死）</td><td>要 cuda 而没有 CUDA 时<strong>直接失败</strong>，不回退（§3.4）</td></tr><tr><td><code>models.specs</code></td><td>空 = 用 <code>engines.default_specs()</code></td><td>空是<strong>有意的</strong>：出厂清单只有代码里一份</td></tr><tr><td><code>auth.enabled</code></td><td><code>false</code></td><td>本机起步不该先跟凭据较劲；上网必须打开</td></tr><tr><td><code>auth.mode</code></td><td><code>token</code></td><td><code>token</code>（静态，单人）｜<code>jwt</code>（配对，多人）</td></tr><tr><td><code>auth.jwt_secret</code></td><td>空</td><td><code>mode=jwt</code> 时<strong>必须</strong>配；没配则拒绝启动而<strong>不是</strong>随机生成（§7.5）</td></tr><tr><td><code>auth.token_ttl_s</code></td><td><code>3600</code></td><td>短期令牌；不做 refresh token</td></tr><tr><td><code>auth.clock_skew_s</code></td><td><code>60</code></td><td>内网机器时钟未必准</td></tr><tr><td><code>auth.pairing_enabled</code></td><td><code>true</code></td><td>关掉后新机器进不来（老客户端照用）</td></tr><tr><td><code>auth.pairing_ttl_s</code></td><td><code>900</code></td><td>配对码 15 分钟</td></tr><tr><td><code>auth.pair_window_s</code> / <code>pair_max_failures</code></td><td><code>300</code> / <code>5</code></td><td>免凭据端点的失败退避（§7.4 约定 1）</td></tr><tr><td><code>auth.cache_ttl_s</code></td><td><code>60</code></td><td>client 行缓存多久（撤销走主动失效，<strong>不靠它</strong>）</td></tr><tr><td><code>auth.revoke_poll_s</code></td><td><code>5</code></td><td>跨进程撤销的发现间隔（§7.5 ④）</td></tr><tr><td><code>auth.default_scopes</code></td><td>空</td><td>空 = 配对出来的客户端<strong>没有额外限制</strong>（§7.2）</td></tr><tr><td><code>auth.db</code></td><td>空 = <code>{state_root}/echo-server-auth.db</code></td><td><strong>刻意不回退到 <code>tmp.root</code></strong></td></tr></tbody></table></div>
-<h4 id="h89">环境变量</h4>
+<h4 id="h91">环境变量</h4>
 <p>只认少数几个（容器里最方便的那一层）：<code>ECHO_SERVER_ID</code> / <code>ECHO_LISTEN</code> / <code>ECHO_TMP_ROOT</code> / <code>ECHO_STATE_ROOT</code> / <code>ECHO_MODELS_ROOT</code> / <code>ECHO_DEVICE</code> / <code>ECHO_MAX_CONCURRENT</code> / <code>ECHO_PER_CLIENT_CONCURRENT</code> / <code>ECHO_AUTH_ENABLED</code> / <code>ECHO_AUTH_MODE</code> / <code>ECHO_JWT_SECRET</code> / <code>ECHO_PAIRING_ENABLED</code>。</p>
 <p><strong>布尔要认得出 <code>&quot;false&quot;</code></strong>：容器编排里它是字符串，而 Python 里非空字符串都是真 —— 直接 <code>bool(os.environ[...])</code> 会让 <code>ECHO_AUTH_ENABLED=false</code> <strong>打开</strong>鉴权。 认不出来的值一律当作"没设"，<strong>绝不猜</strong>。</p>
 <p><strong>"部署文件里写的变量必须真的被读"由机器保证</strong>：<code>EnvOverrideTests</code> 扫 <code>compose.yaml</code> 与示例配置里出现的每一个 <code>ECHO_*</code> 名字，逐个确认代码处理了。 （写这个测试时它当场抓到一个 <code>ECHO_STATE_ROOT</code> 只写在注释里、代码没读 —— 那正是最容易发生、又最难发现的一种谎：服务照着文档配，行为却完全没变。）</p>
 <hr>
-<h2 id="h90">11. 失败模式总表</h2>
+<h2 id="h92">11. 失败模式总表</h2>
 <div class="tw"><table><thead><tr><th>失败</th><th>服务端行为</th><th>客户端应对</th></tr></thead><tbody><tr><td>服务端不可达</td><td>—</td><td>降级链下一个后端</td></tr><tr><td><strong>该客户端自己已有请求在跑</strong></td><td><strong><code>409 client_busy</code></strong>（不排队）</td><td><strong>不重试</strong> —— 并发应配 1，属客户端 bug，记日志</td></tr><tr><td><strong>服务端通道满</strong>（总 2 路）</td><td><strong><code>503 server_busy</code> + <code>Retry-After: 5</code></strong>（<strong>不排队</strong>）</td><td><strong>系统忙，稍后再试</strong>：退避重试（退避作用于<strong>整个队列</strong>）</td></tr><tr><td>模型加载中</td><td><code>503 model_loading</code> + <code>Retry-After</code></td><td>等或降级（看 <code>estWait</code>）</td></tr><tr><td>加载失败</td><td><code>503 model_failed</code>；<code>/v1/capabilities</code> 标 <code>failed</code></td><td>跳过此后端，直到 capabilities 变化</td></tr><tr><td>显存不足</td><td>卸载 LRU → 仍不够 → <code>503 gpu_oom</code></td><td><strong>绝不回退 CPU</strong>；降级</td></tr><tr><td>（<code>queue_max&gt;0</code> 时才会有）队列满</td><td><code>429 queue_full</code> + <code>Retry-After</code></td><td>退避重试 —— <strong>v1 用不到</strong></td></tr><tr><td>配额用尽</td><td><code>429 quota_exceeded</code></td><td>提示用户 / 按日重置（<strong>今天别再试</strong>）</td></tr><tr><td>配对试错过多</td><td><code>429 rate_limited</code> + <code>Retry-After</code>（§7.4）</td><td>等 <code>Retry-After</code> 秒再试一次</td></tr><tr><td>凭据不对 / 已撤销</td><td><code>401 unauthorized</code></td><td>用 secret 换新令牌；仍失败则标记后端不可用</td></tr><tr><td>客户端被禁用 / scope 不足</td><td><code>403 forbidden</code></td><td><strong>跳过此后端</strong>（换凭据也没用）</td></tr><tr><td>服务端鉴权没配好</td><td><code>503 auth_misconfigured</code></td><td><strong>别翻自己的配置</strong> —— 报给运营</td></tr><tr><td>音频过长</td><td><code>413 audio_too_long</code></td><td>客户端重新分段</td></tr><tr><td>推理超时</td><td><code>504 inference_timeout</code></td><td>降级（并记住"此后端不适合这么长的音频"）</td></tr><tr><td>客户端断开</td><td>中止推理 + 清临时文件</td><td>整段重试（幂等在客户端）</td></tr><tr><td>服务端崩溃</td><td>启动时清扫残留临时文件</td><td>重试；<code>request_id</code> 用于对账</td></tr><tr><td>删除临时文件失败</td><td>登记 + 重试 + <code>warn</code> 日志；<code>/v1/health</code> 可见</td><td>—</td></tr></tbody></table></div>
 <hr>
-<h2 id="h91">12. 护栏测试清单</h2>
+<h2 id="h93">12. 护栏测试清单</h2>
 <p><strong>表里写的是"断言"，不是"文件名"。</strong> 这些断言全部落在 <code>tests/test_server_contract.py</code> 一个文件里（按断言意图分组成若干 <code>TestCase</code>）—— 拆成 22 个文件只会让人不去跑它们。 「状态」列的 ✅ 表示 v1 骨架已实现，⏳ 表示等对应功能落地时补（见 §13 阶段）。</p>
-<div class="tw"><table><thead><tr><th>断言</th><th>状态</th><th>落在哪</th></tr></thead><tbody><tr><td><code>server/</code> 不 import <code>app.db</code> 等客户端业务层</td><td>✅</td><td><code>NoBusinessCouplingTests.test_no_business_imports</code></td></tr><tr><td><code>server/</code> 源码不出现 <code>meeting</code>/<code>command</code>/<code>summary</code>/<code>voiceprint</code></td><td>✅</td><td><code>NoBusinessCouplingTests.test_no_business_words_in_source</code></td></tr><tr><td>路由表里没有写端点（白名单外）</td><td>✅</td><td><code>NoBusinessCouplingTests.test_only_the_documented_routes_exist</code></td></tr><tr><td>每个错误码都带 <code>code</code> + 能不能重试（契约对齐）</td><td>✅</td><td><code>ErrorContractTests</code></td></tr><tr><td><code>409 client_busy</code> 与 <code>503 server_busy</code> 是两回事，不混用</td><td>✅</td><td><code>ErrorContractTests.test_client_busy_and_server_busy_are_different</code></td></tr><tr><td>两级闸门：每客户端 1 → <code>409</code>；全局 2 满 → <code>503</code> + <code>Retry-After</code></td><td>✅</td><td><code>AdmissionTests</code> + <code>AdmissionWiringTests</code></td></tr><tr><td><code>queue_max=0</code>：满了<strong>立即拒绝</strong>，不留堆积请求</td><td>✅</td><td><code>AdmissionTests</code></td></tr><tr><td><strong>预检在读 body 之前跑</strong>：忙的时候一个字节都不收（证据是顺序：声报超限的 <code>Content-Length</code> 得到 <code>409</code> 而非 <code>413</code>）</td><td>✅</td><td><code>AdmissionWiringTests.test_precheck_refuses_before_a_single_byte_is_read</code></td></tr><tr><td>预检<strong>只判不占</strong>，不许变成第二个真相来源（权威判定始终是 <code>hold</code>）</td><td>✅</td><td><code>AdmissionWiringTests.test_precheck_is_advisory_so_hold_is_still_authoritative</code></td></tr><tr><td>被预检挡回来的请求不留临时文件</td><td>✅</td><td><code>AdmissionWiringTests.test_precheck_does_not_write_any_temp_file</code></td></tr><tr><td>出厂清单里<strong>没有常驻的 ASR 模型</strong>（v1 无配额，常驻＝白占显存且对外开着，§14-2）</td><td>✅</td><td><code>DefaultSpecsTests.test_no_resident_asr_model</code></td></tr><tr><td>去掉 asr-short <strong>不等于</strong>关掉短档：<code>asr.text</code> 仍有人接</td><td>✅</td><td><code>DefaultSpecsTests.test_the_short_slot_is_still_served</code></td></tr><tr><td>出厂清单里只有一个 ASR 模型，它同时给文本与时间戳</td><td>✅</td><td><code>DefaultSpecsTests.test_one_model_serves_both_text_and_timestamps</code></td></tr><tr><td>异常路径也要<strong>还回槽位</strong>（一次失败不许把服务端锁死）</td><td>✅</td><td><code>AdmissionTests.test_slots_are_released_on_exception</code></td></tr><tr><td>鉴权关 = 所有人 <code>anonymous</code>（谁都能用 GPU，所以启动要吼一声）</td><td>✅</td><td><code>AdmissionWiringTests.test_auth_off_means_everyone_is_anonymous</code></td></tr><tr><td>一次 <code>load()</code> 不许污染全局默认配置</td><td>✅</td><td><code>test_config_is_not_shared_between_loads</code></td></tr><tr><td>请求成功与失败，两种路径都清干净临时目录</td><td>✅</td><td><code>TempWorkspaceTests.test_success_and_failure_both_clean_up</code></td></tr><tr><td>超龄文件被清扫删掉，新鲜的留着</td><td>✅</td><td><code>TempWorkspaceTests.test_sweep_removes_old_and_keeps_fresh</code></td></tr><tr><td>超过 <code>max_bytes</code> 时按最旧优先删，<strong>不写爆盘</strong></td><td>✅</td><td><code>TempWorkspaceTests.test_sweep_by_size_removes_oldest_first</code></td></tr><tr><td>显存不足 → 拒绝（<code>gpu_oom</code>），<strong>不是</strong> OOM、<strong>不是</strong>悄悄用 CPU</td><td>✅</td><td><code>EnginePoolTests.test_vram_budget_refuses_instead_of_oom</code></td></tr><tr><td>加载失败如实报 <code>model_failed</code>，不静默回退 CPU</td><td>✅</td><td><code>EnginePoolTests.test_load_failure_does_not_fall_back_to_cpu</code></td></tr><tr><td>设备判据<strong>按 impl 分开问</strong>：sensevoice/qwen3asr/pyannote 看 torch，whisper 看 ctranslate2</td><td>✅</td><td><code>DeviceAssertionTests</code></td></tr><tr><td>向量类加载器<strong>也</strong>查设备（pyannote 内部那句静默 CPU 回退必须够不到）</td><td>✅</td><td><code>DeviceAssertionTests.test_vector_loaders_actually_assert_the_device</code></td></tr><tr><td>新加 impl 必须显式声明运行时，不许靠默认值蒙</td><td>✅</td><td><code>DeviceAssertionTests.test_every_built_impl_has_a_declared_runtime</code></td></tr><tr><td>显式 <code>device: cpu</code> 是<strong>接受</strong> CPU，不该被拦</td><td>✅</td><td><code>DeviceAssertionTests.test_cpu_specs_are_never_blocked</code></td></tr><tr><td>并发要同一个模型 → loader 只被调用一次（单飞）</td><td>✅</td><td><code>EnginePoolTests.test_single_flight</code></td></tr><tr><td>推理中引用计数 &gt; 0 的模型不被卸载</td><td>✅</td><td><code>EnginePoolTests.test_refcount_blocks_unload</code></td></tr><tr><td>LRU 驱逐最久未用的，<strong>常驻的永不驱逐</strong></td><td>✅</td><td><code>EnginePoolTests.test_lru_evicts_idle_but_never_resident</code></td></tr><tr><td>模型状态如实上报（<code>absent</code>/<code>ready</code>/<code>failed</code>），不撒谎</td><td>✅</td><td><code>EnginePoolTests.test_status_reflects_real_state</code></td></tr><tr><td>铁律 L5：所有产出向量的模型共用<strong>同一个</strong> <code>vectorSpaceId</code></td><td>✅</td><td><code>VectorSpaceFrozenTests</code></td></tr><tr><td>版本/向量空间在进程内<strong>冻结</strong>（<code>ModelSpec</code> 不可变）</td><td>✅</td><td><code>VectorSpaceFrozenTests.test_model_spec_is_immutable</code></td></tr><tr><td>客户端拿得到 <code>vectorSpaceId</code>（否则它没法判断"能不能比"）</td><td>✅</td><td><code>EndpointTests.test_capabilities_reports_slots_and_vector_space</code></td></tr><tr><td>不要时间戳时<strong>不许</strong>编一个 <code>estimated</code> 出来</td><td>✅</td><td><code>EndpointTests.test_asr_returns_text_and_no_fake_timestamps</code></td></tr><tr><td>没实现的能力<strong>如实拒绝</strong>，不假装（<code>mode=turns</code>）</td><td>✅</td><td><code>EndpointTests.test_diarize_turns_mode_is_refused_not_faked</code></td></tr><tr><td>超长音频在读之前就被拒（不是读完再拒）</td><td>✅</td><td><code>EndpointTests.test_declared_oversize_is_refused_before_reading</code></td></tr><tr><td>跑完请求无 <code>.db</code> 文件生成</td><td>⏳</td><td>等鉴权/审计落库时一起查（v1 没有任何落库路径）</td></tr><tr><td>跑一次请求后日志 grep 不到输入文本/嵌入</td><td>⏳</td><td>v2 上 metrics/日志时补</td></tr><tr><td><code>loading</code> 期间 <code>capabilities</code> 标 <code>loading</code>，不是撒谎说 ready</td><td>⏳</td><td>需要能卡住 loader 的假引擎</td></tr><tr><td>客户端中途断开后临时目录为空</td><td>⏳</td><td>需要真 ASGI 断连才能测</td></tr><tr><td>预置残留文件 → 启动时清空（sweep on startup）</td><td>⏳</td><td><code>Sweeper</code> 已实现，用例待补</td></tr><tr><td>只读 rootfs + tmpfs 下跑通全部端点（容器冒烟）</td><td>⏳</td><td>v3，且只能在 Linux 上跑</td></tr><tr><td>客户端引擎层内部那句 <code>except -&gt; CPU</code> 也要能被关掉（<code>allow_cpu_fallback=False</code>）</td><td>⏳</td><td>客户端侧改动：现在只拦得住"运行时说没 CUDA"，拦不住"运行时说能用、建模型时炸了"</td></tr></tbody></table></div>
-<h3 id="h92">12.1 鉴权的断言（设计 §7，2026-09-24 落地）</h3>
+<div class="tw"><table><thead><tr><th>断言</th><th>状态</th><th>落在哪</th></tr></thead><tbody><tr><td><code>server/</code> 不 import <code>app.db</code> 等客户端业务层</td><td>✅</td><td><code>NoBusinessCouplingTests.test_no_business_imports</code></td></tr><tr><td><code>server/</code> 源码不出现 <code>meeting</code>/<code>command</code>/<code>summary</code>/<code>voiceprint</code></td><td>✅</td><td><code>NoBusinessCouplingTests.test_no_business_words_in_source</code></td></tr><tr><td>路由表里没有写端点（白名单外）</td><td>✅</td><td><code>NoBusinessCouplingTests.test_only_the_documented_routes_exist</code></td></tr><tr><td>每个错误码都带 <code>code</code> + 能不能重试（契约对齐）</td><td>✅</td><td><code>ErrorContractTests</code></td></tr><tr><td><code>409 client_busy</code> 与 <code>503 server_busy</code> 是两回事，不混用</td><td>✅</td><td><code>ErrorContractTests.test_client_busy_and_server_busy_are_different</code></td></tr><tr><td>两级闸门：每客户端 1 → <code>409</code>；全局 2 满 → <code>503</code> + <code>Retry-After</code></td><td>✅</td><td><code>AdmissionTests</code> + <code>AdmissionWiringTests</code></td></tr><tr><td><code>queue_max=0</code>：满了<strong>立即拒绝</strong>，不留堆积请求</td><td>✅</td><td><code>AdmissionTests</code></td></tr><tr><td><strong>预检在读 body 之前跑</strong>：忙的时候一个字节都不收（证据是顺序：声报超限的 <code>Content-Length</code> 得到 <code>409</code> 而非 <code>413</code>）</td><td>✅</td><td><code>AdmissionWiringTests.test_precheck_refuses_before_a_single_byte_is_read</code></td></tr><tr><td>预检<strong>只判不占</strong>，不许变成第二个真相来源（权威判定始终是 <code>hold</code>）</td><td>✅</td><td><code>AdmissionWiringTests.test_precheck_is_advisory_so_hold_is_still_authoritative</code></td></tr><tr><td>被预检挡回来的请求不留临时文件</td><td>✅</td><td><code>AdmissionWiringTests.test_precheck_does_not_write_any_temp_file</code></td></tr><tr><td>出厂清单里<strong>没有常驻的 ASR 模型</strong>（v1 无配额，常驻＝白占显存且对外开着，§14-2）</td><td>✅</td><td><code>DefaultSpecsTests.test_no_resident_asr_model</code></td></tr><tr><td>去掉 asr-short <strong>不等于</strong>关掉短档：<code>asr.text</code> 仍有人接</td><td>✅</td><td><code>DefaultSpecsTests.test_the_short_slot_is_still_served</code></td></tr><tr><td>出厂清单里只有一个 ASR 模型，它同时给文本与时间戳</td><td>✅</td><td><code>DefaultSpecsTests.test_one_model_serves_both_text_and_timestamps</code></td></tr><tr><td>异常路径也要<strong>还回槽位</strong>（一次失败不许把服务端锁死）</td><td>✅</td><td><code>AdmissionTests.test_slots_are_released_on_exception</code></td></tr><tr><td>鉴权关 = 所有人 <code>anonymous</code>（谁都能用 GPU，所以启动要吼一声）</td><td>✅</td><td><code>AdmissionWiringTests.test_auth_off_means_everyone_is_anonymous</code></td></tr><tr><td>一次 <code>load()</code> 不许污染全局默认配置</td><td>✅</td><td><code>test_config_is_not_shared_between_loads</code></td></tr><tr><td>请求成功与失败，两种路径都清干净临时目录</td><td>✅</td><td><code>TempWorkspaceTests.test_success_and_failure_both_clean_up</code></td></tr><tr><td>超龄文件被清扫删掉，新鲜的留着</td><td>✅</td><td><code>TempWorkspaceTests.test_sweep_removes_old_and_keeps_fresh</code></td></tr><tr><td>超过 <code>max_bytes</code> 时按最旧优先删，<strong>不写爆盘</strong></td><td>✅</td><td><code>TempWorkspaceTests.test_sweep_by_size_removes_oldest_first</code></td></tr><tr><td>显存不足 → 拒绝（<code>gpu_oom</code>），<strong>不是</strong> OOM、<strong>不是</strong>悄悄用 CPU</td><td>✅</td><td><code>EnginePoolTests.test_vram_budget_refuses_instead_of_oom</code></td></tr><tr><td>加载失败如实报 <code>model_failed</code>，不静默回退 CPU</td><td>✅</td><td><code>EnginePoolTests.test_load_failure_does_not_fall_back_to_cpu</code></td></tr><tr><td>设备判据<strong>按 impl 分开问</strong>：sensevoice/qwen3asr/pyannote 看 torch，whisper 看 ctranslate2</td><td>✅</td><td><code>DeviceAssertionTests</code></td></tr><tr><td>向量类加载器<strong>也</strong>查设备（pyannote 内部那句静默 CPU 回退必须够不到）</td><td>✅</td><td><code>DeviceAssertionTests.test_vector_loaders_actually_assert_the_device</code></td></tr><tr><td>新加 impl 必须显式声明运行时，不许靠默认值蒙</td><td>✅</td><td><code>DeviceAssertionTests.test_every_built_impl_has_a_declared_runtime</code></td></tr><tr><td>显式 <code>device: cpu</code> 是<strong>接受</strong> CPU，不该被拦</td><td>✅</td><td><code>DeviceAssertionTests.test_cpu_specs_are_never_blocked</code></td></tr><tr><td>并发要同一个模型 → loader 只被调用一次（单飞）</td><td>✅</td><td><code>EnginePoolTests.test_single_flight</code></td></tr><tr><td>推理中引用计数 &gt; 0 的模型不被卸载</td><td>✅</td><td><code>EnginePoolTests.test_refcount_blocks_unload</code></td></tr><tr><td>LRU 驱逐最久未用的，<strong>常驻的永不驱逐</strong></td><td>✅</td><td><code>EnginePoolTests.test_lru_evicts_idle_but_never_resident</code></td></tr><tr><td>模型状态如实上报（<code>absent</code>/<code>ready</code>/<code>failed</code>），不撒谎</td><td>✅</td><td><code>EnginePoolTests.test_status_reflects_real_state</code></td></tr><tr><td>铁律 L5：所有产出向量的模型共用<strong>同一个</strong> <code>vectorSpaceId</code></td><td>✅</td><td><code>VectorSpaceFrozenTests</code></td></tr><tr><td>版本/向量空间在进程内<strong>冻结</strong>（<code>ModelSpec</code> 不可变）</td><td>✅</td><td><code>VectorSpaceFrozenTests.test_model_spec_is_immutable</code></td></tr><tr><td>客户端拿得到 <code>vectorSpaceId</code>（否则它没法判断"能不能比"）</td><td>✅</td><td><code>EndpointTests.test_capabilities_reports_slots_and_vector_space</code></td></tr><tr><td>不要时间戳时<strong>不许</strong>编一个 <code>estimated</code> 出来</td><td>✅</td><td><code>EndpointTests.test_asr_returns_text_and_no_fake_timestamps</code></td></tr><tr><td>没实现的能力<strong>如实拒绝</strong>，不假装（<code>mode=turns</code>）</td><td>✅</td><td><code>EndpointTests.test_diarize_turns_mode_is_refused_not_faked</code></td></tr><tr><td>超长音频在读之前就被拒（不是读完再拒）</td><td>✅</td><td><code>EndpointTests.test_declared_oversize_is_refused_before_reading</code></td></tr><tr><td>跑完请求无 <code>.db</code> 文件生成</td><td>⏳</td><td>等鉴权/审计落库时一起查（v1 没有任何落库路径）</td></tr><tr><td>跑一次请求后日志 grep 不到输入文本/嵌入</td><td>⏳</td><td>v2 上 metrics/日志时补</td></tr><tr><td><code>loading</code> 期间 <code>capabilities</code> 标 <code>loading</code>，不是撒谎说 ready</td><td>⏳</td><td>需要能卡住 loader 的假引擎</td></tr><tr><td>客户端中途断开后临时目录为空</td><td>⏳</td><td>需要真 ASGI 断连才能测</td></tr><tr><td>预置残留文件 → 启动时清空（sweep on startup）</td><td>⏳</td><td><code>Sweeper</code> 已实现，用例待补</td></tr><tr><td>只读 rootfs + tmpfs 下跑通全部端点（容器冒烟）</td><td>⏳</td><td>v3，且只能在 Linux 上跑</td></tr><tr><td>客户端引擎层内部那句 <code>except -&gt; CPU</code> 也要能被关掉（<code>allow_cpu_fallback=False</code>）</td><td>⏳</td><td>客户端侧改动：现在只拦得住"运行时说没 CUDA"，拦不住"运行时说能用、建模型时炸了"</td></tr><tr><td><strong>两个并发请求真的能并行</strong>（墙钟 ≈ 单次，不是两次之和）</td><td>✅</td><td><code>EventLoopNotBlockedTests.test_two_concurrent_*_requests_actually_overlap</code></td></tr><tr><td>并发时闸门真的记录到"有请求在跑"（<code>busy.active</code> ≥ 1）</td><td>✅</td><td><code>EventLoopNotBlockedTests.test_global_channels_are_actually_usable</code></td></tr><tr><td><strong>大 body 下错误码也必须送到</strong>（真 socket，RST 复现不了走进程内）</td><td>✅</td><td><code>ErrorCodeSurvivesLargeBodyTests</code></td></tr></tbody></table></div>
+<h3 id="h94">12.1 鉴权的断言（设计 §7，2026-09-24 落地）</h3>
 <div class="tw"><table><thead><tr><th>断言</th><th>状态</th><th>落在哪</th></tr></thead><tbody><tr><td>库里的表集合 ⊆ §8.5 白名单</td><td>✅</td><td><code>AuthSchemaTests.test_tables_are_a_subset_of_the_documented_whitelist</code></td></tr><tr><td>任何列名都不命中"内容/业务概念"黑名单</td><td>✅</td><td><code>AuthSchemaTests.test_no_column_is_named_like_content</code></td></tr><tr><td>配对码<strong>只能用一次</strong></td><td>✅</td><td><code>AuthPairingTests.test_code_is_single_use</code></td></tr><tr><td>码要归一化（抄错大小写/带空格不该让人白试）</td><td>✅</td><td><code>AuthPairingTests.test_code_is_normalized_so_case_and_spaces_do_not_matter</code></td></tr><tr><td>过期的码被拒</td><td>✅</td><td><code>AuthPairingTests.test_expired_code_is_refused</code></td></tr><tr><td><strong>secret 与配对码都不落明文</strong>（直接翻库文件字节）</td><td>✅</td><td><code>AuthPairingTests.test_secret_is_never_stored_in_plaintext</code></td></tr><tr><td>码<strong>用掉即删</strong>（不是"标记已用"）</td><td>✅</td><td><code>AuthPairingTests.test_used_code_is_deleted_not_kept</code></td></tr><tr><td>免凭据端点限速防爆破（429 + <code>Retry-After</code>）</td><td>✅</td><td><code>AuthPairingTests.test_throttle_stops_brute_force</code></td></tr><tr><td>配对成功要把失败计数清零（否则整个出口 IP 被连坐）</td><td>✅</td><td><code>AuthPairingTests.test_successful_pairing_clears_the_failure_counter</code></td></tr><tr><td>可以整个关掉配对（新机器进不来）</td><td>✅</td><td><code>AuthPairingTests.test_pairing_can_be_switched_off</code></td></tr><tr><td><code>alg: none</code> 被拒</td><td>✅</td><td><code>AuthTokenTests.test_alg_none_is_refused</code></td></tr><tr><td><strong>算法判断是我们自己的，不依赖库的默认行为</strong></td><td>✅</td><td><code>AuthTokenTests.test_alg_check_is_ours_not_the_librarys</code></td></tr><tr><td>用别的密钥签的令牌被拒</td><td>✅</td><td><code>AuthTokenTests.test_token_signed_with_another_key_is_refused</code></td></tr><tr><td>改过载荷（例如把 <code>ver</code> 改大）签名就对不上</td><td>✅</td><td><code>AuthTokenTests.test_tampered_payload_is_refused</code></td></tr><tr><td>过期令牌被拒；60 秒时钟偏差被容忍</td><td>✅</td><td><code>AuthTokenTests.test_expired_token_is_refused</code> / <code>test_clock_skew_is_tolerated</code></td></tr><tr><td><strong>撤销在下一个请求就生效</strong>（同进程）</td><td>✅</td><td><code>AuthTokenTests.test_revoke_takes_effect_on_the_very_next_request</code></td></tr><tr><td><strong>另一个进程的撤销 ≤ 轮询间隔被发现</strong></td><td>✅</td><td><code>AuthTokenTests.test_revoke_from_another_process_is_eventually_noticed</code></td></tr><tr><td>轮询探针能发现<strong>禁用</strong>（不只是撤销）</td><td>✅</td><td><code>AuthTokenTests.test_watcher_notices_disable_too_not_just_revoke</code></td></tr><tr><td>没变化就不刷缓存（幂等）</td><td>✅</td><td><code>AuthTokenTests.test_watcher_only_refreshes_when_something_actually_changed</code></td></tr><tr><td>禁用是 <strong>403</strong> 不是 401（"认识你但不许用"）</td><td>✅</td><td><code>AuthTokenTests.test_disabled_client_gets_403_not_401</code></td></tr><tr><td>没配 <code>jwt_secret</code> 是 <strong>503 auth_misconfigured</strong>，不是 401</td><td>✅</td><td><code>AuthTokenTests.test_missing_jwt_secret_is_a_server_side_error_not_401</code></td></tr><tr><td>scope 不足 → 403；<strong>空 scopes = 不额外限制</strong></td><td>✅</td><td><code>AuthScopeTests</code></td></tr><tr><td>每个能力端点都声明了 scope，而且<strong>真的传下去了</strong></td><td>✅</td><td><code>AuthScopeTests.test_endpoints_actually_pass_their_scope</code></td></tr><tr><td>命令行发的码，服务端进程真能兑换（端到端）</td><td>✅</td><td><code>AdminCliTests.test_the_printed_code_actually_works</code></td></tr><tr><td><code>--list-clients</code> / <code>--revoke</code> 真的动库</td><td>✅</td><td><code>AdminCliTests</code></td></tr><tr><td>配额（日额度 / 音频分钟数，§7.2）</td><td>⏳</td><td>还没做；现在只有并发闸门</td></tr><tr><td>管理面 / 审计表 / "存了什么"自证页（§8.4、§8.5）</td><td>⏳</td><td>还没做；配对的入口暂时是命令行</td></tr></tbody></table></div>
 <blockquote><p><strong>为什么 §12 值得这么细。</strong> 前面每一节的设计都有"如果没人看着就会退化"的地方： 服务端会慢慢认识业务、临时文件会慢慢漏、GPU 会慢慢被 OOM 掉。 这份清单是把那些"慢慢"变成"立刻红"。</p></blockquote>
 <hr>
-<h2 id="h93">13. 实施阶段</h2>
+<h2 id="h95">13. 实施阶段</h2>
 <div class="tw"><table><thead><tr><th>阶段</th><th>内容</th><th>验收</th><th>状态</th></tr></thead><tbody><tr><td><strong>v1</strong></td><td>单进程 / 单机；<code>EnginePool</code>（单飞 + 引用计数 + LRU + 显存预算）；<code>TempWorkspace</code>；三个能力端点；<code>/health</code> <code>/ready</code> <code>/capabilities</code>；<strong>两级闸门 + 廉价预检</strong></td><td>§12 全部护栏测试绿；两个客户端并发不互相阻塞</td><td><strong>✅ 已落地</strong></td></tr><tr><td><strong>v1.5</strong>（原 v2 的鉴权部分）</td><td><strong>配对码 → <code>client_id</code> + <code>secret</code> → 短期 JWT</strong>；scopes；<code>token_version</code> 撤销（同进程立即、跨进程 ≤5 秒轮询）← <strong>实际做在了这里，不是 v2</strong></td><td>§12.1 全绿；命令行能发码、撤销能生效</td><td><strong>✅ 已落地</strong></td></tr><tr><td><strong>v2</strong></td><td>配额（日额度 / 音频分钟数，§7.2）+ metrics + SSE 进度 + <code>calls</code> 审计表</td><td>与客户端路由层的降级原因<strong>逐条对齐</strong>；断网/降级演练</td><td>⏳</td></tr><tr><td><strong>v3</strong></td><td>管理面（§8.4）+ 只读 rootfs 容器 + tmpfs + 反代配置 + 按模型分进程（按需）+ 多实例按能力拆分</td><td>容器冒烟；<code>/v1/health</code> 的临时目录统计长期归零</td><td>⏳</td></tr></tbody></table></div>
 <blockquote><p><strong>为什么鉴权提前到了 v1.5，而不是留在 v2：</strong> 原计划把它和<strong>配额</strong>绑在一趟做。 实际开工后发现两件事可以拆：JWT/scopes/撤销是<strong>安全边界</strong>（没有它，服务端一上网 就等于"谁连上谁能用你的 GPU"），而配额是<strong>公平性</strong>（没有它只是有人多占一点）。 安全边界不该等公平性一起做。所以鉴权先落地，配额留在 v2。</p>
 <p>代价是<strong>配对的入口暂时是命令行</strong>（管理面在 v3）—— 这条路已经通了：<code>python -m server.main --new-pairing-code</code>。 一个功能"装上了却发不出第一份凭据"等于没装，所以命令行入口是这一阶段的<strong>必需品</strong>， 不是临时脚手架。</p></blockquote>
 <p><strong>v1 就能满足"办公本可用"的全部需求</strong> —— 办公本的会议转写、说话人分离、声纹都只需要 v1 的能力。</p>
 <hr>
-<h2 id="h94">14. 已拍板 / 待拍板</h2>
+<h2 id="h96">14. 已拍板 / 待拍板</h2>
 <ol><li><strong>服务端跑不跑 GPU 的 pyannote 4.x？</strong> 若跑，服务端就有两套分离实现（pyannote 与 sherpa-onnx ONNX），<code>vectorSpaceId</code> 会有两个。<strong>建议：服务端只提供一套并明确声明它的 <code>vectorSpaceId</code></strong>，另一套只在客户端本地。多一套的收益远小于"两个向量空间"带来的复杂度。</li><li><strong><code>asr.short</code>（指令增强）要不要开？</strong> 它会给服务端引入高频小请求。开了就要独立队列 + 独立配额（前置文档已设计），不开则路由表里少一行。<strong>建议 v1 不开</strong>，先只服务会议链路。</li></ol>
 <blockquote><p><strong>已拍板（2026-09-24）：v1 就从出厂清单去掉 <code>asr-short</code>。</strong> 起因是核验时发现"建议 v1 不开"这句话<strong>没有执行者</strong>：v1 没有配额机制（配额随 v2 的 JWT/scopes 一起做），所以"默认配额为 0"落不了地；而 <code>asr-short</code> 的 <code>resident: true</code> 在本实现里是<strong>纯开销</strong> —— 文档给的理由是"会议档也用 SenseVoice"，但 <code>asr-long</code> 走的是 qwen3asr，<strong>没有任何内部调用方</strong>。于是它"又占着显存、又对外开着"，与建议正好相反。</p>
 <p><code>engines.default_specs()</code> 现在只有三个模型：<code>asr-long</code> （<code>supports: [asr.text, asr.timestamps]</code>）、<code>diarize</code>、<code>speaker-embed</code>。于是：</p>

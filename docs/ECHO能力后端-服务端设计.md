@@ -231,6 +231,32 @@ server/
 但推理阶段**确实占**，因为 GPU 才是那个真正的稀缺资源。
 代价是"可能传完了才发现被拒" → 用下面的乐观预检缓解。
 
+#### 这条闸门只有在"请求真能并行"时才有意义（2026-09-24 实测补上）
+
+**实测过一个会让上面整张表变成空话的问题**：三个能力端点是 `async def`
+（因为要 `await request.stream()` 收 body），而 FastAPI 把 `async def` 处理函数
+**跑在事件循环上**。里面那些阻塞调用（`soundfile` 解码、`soxr` 重采样、
+`funasr`/`pyannote` 推理）于是把整个事件循环按住 → **所有请求被一条一条串行处理**：
+
+```
+两个"并发"请求：各花 t / 2t，墙钟 ≈ 2t      ← 完全串行
+busy.active 全程 = 0                        ← 闸门根本没记录到活跃请求
+```
+
+也就是说 `max_concurrent: 2` 是假的，两级闸门也永远不会看到两个请求同时在跑 ——
+而**当时所有用例都是绿的**，因为 `TestClient` 本来就把请求串起来发，它测不出这件事。
+
+**规矩：端点里任何阻塞调用都必须下线程池**（`run_in_threadpool`），
+包括解码与重采样，不只是推理。修完之后的对照实测：
+
+```
+两个并发请求：一路 200，另一路 **0.03s 就回 409 client_busy**，busy.active 峰值 = 1
+```
+
+契约由 `EventLoopNotBlockedTests` 钉住 —— 它**必须**用
+`httpx.ASGITransport` + `asyncio.gather`（真的同时进同一个事件循环），
+判据是**墙钟**：并行时 ≈ `d`，串行时 ≈ `2d`。
+
 #### 拒绝响应（三种，客户端行为完全不同）
 
 | 场景 | HTTP | `code` | `Retry-After` | 客户端应当 |
@@ -616,6 +642,36 @@ class TempWorkspace:
 | 位深 | `pcm_s16le` 为基准；也接受 `wav`、`opus` |
 | 编码声明 | `Content-Type: audio/wav` / `audio/opus`；不声明按 PCM 处理 |
 | 上限 | `limits.maxAudioSeconds` 与 `maxUploadBytes`，超了 `413` |
+
+#### 公共约定补充：**回错误之前必须把请求体抽干**（2026-09-24 实测补上）
+
+服务端在**读 body 之前**就拒掉请求时（鉴权失败、模型不存在、自己忙、参数不合法……），
+必须在回响应**之前**把还没读的请求体读掉。否则：
+
+```
+服务端没读完 body 就回响应并关连接
+  → socket 里剩下的未读数据让对端收到 RST
+  → RST **丢掉对端接收缓冲里已经到达的响应体**
+  → 客户端只拿到状态码，body 是空的 —— 而 code 就在 body 里
+```
+
+实测（`POST /v1/asr?model=nope`）：body 2 KB 时正常；**0.9 MB 时 body 为空**。
+而且是**竞态** —— 同一次跑里一个端点丢了、另一个没丢，所以偶尔能过、极易漏掉。
+大音频恰恰是最需要错误码的场合（`audio_too_long` / `payload_too_large` /
+`client_busy` / `model_not_found`），**丢了 code，客户端只能盲目重试** ——
+那正是 §6.3 整套错误模型存在的意义。
+
+两条实现规矩：
+
+1. **顺序是"先抽干、再抛"**，不能"先回响应再抽" —— 那时连接已经要关了，RST 照样发生。
+2. **声报超大的请求（`payload_too_large`）故意不抽干**：那可能真是 999 MB。
+   "413 = 太大了"光看状态码就够，不需要 code 去区分；真正必须保住 code 的，
+   是那些**体量正常但被业务拒掉**的请求。
+
+实现见 `server/audio.drain` 与 `server/routes._reject`；
+契约由 `ErrorCodeSurvivesLargeBodyTests` 钉住 —— 它**必须走真 socket**
+（`uvicorn` 起在临时端口上），因为 RST 是 TCP 层的事，
+`TestClient` / `httpx.ASGITransport` 都是进程内直调 ASGI，**根本复现不了**。
 
 ---
 
@@ -1620,6 +1676,9 @@ client_body_temp_path /var/echo/tmp/nginx;
 | 预置残留文件 → 启动时清空（sweep on startup） | ⏳ | `Sweeper` 已实现，用例待补 |
 | 只读 rootfs + tmpfs 下跑通全部端点（容器冒烟） | ⏳ | v3，且只能在 Linux 上跑 |
 | 客户端引擎层内部那句 `except -> CPU` 也要能被关掉（`allow_cpu_fallback=False`） | ⏳ | 客户端侧改动：现在只拦得住"运行时说没 CUDA"，拦不住"运行时说能用、建模型时炸了" |
+| **两个并发请求真的能并行**（墙钟 ≈ 单次，不是两次之和） | ✅ | `EventLoopNotBlockedTests.test_two_concurrent_*_requests_actually_overlap` |
+| 并发时闸门真的记录到"有请求在跑"（`busy.active` ≥ 1） | ✅ | `EventLoopNotBlockedTests.test_global_channels_are_actually_usable` |
+| **大 body 下错误码也必须送到**（真 socket，RST 复现不了走进程内） | ✅ | `ErrorCodeSurvivesLargeBodyTests` |
 
 ### 12.1 鉴权的断言（设计 §7，2026-09-24 落地）
 

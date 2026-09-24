@@ -22,6 +22,7 @@ from contextlib import contextmanager
 from typing import Optional
 
 from fastapi import APIRouter, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 
 from server import __version__, audio as audio_mod, errors, tmp
@@ -276,6 +277,36 @@ def ready(request: Request):
 
 # ---------------------------------------------------------------- 能力端点
 
+#: **为什么解码与推理必须下线程池（`run_in_threadpool`），而不是直接在这儿调。**
+#
+# 这三个端点是 `async def`（因为要 `await request.stream()` 收 body），
+# 而 FastAPI 把 `async def` 处理函数**跑在事件循环上**。于是里面任何一段阻塞调用
+# （`soundfile` 解码、`soxr` 重采样、`funasr`/`pyannote` 推理）都会**把整个事件循环按住**，
+# 结果是：**所有请求被一条一条地串行处理**，`limits.max_concurrent: 2` 变成一句空话，
+# 两级闸门也永远不会看到"两个请求同时在跑"。
+#
+# 这不是理论风险，是实测出来的（2026-09-24）：两个"并发"请求各花 `t` 与 `2t`，
+# 墙钟 ≈ `2t` —— 完全串行。而当时的用例全是绿的，因为 `TestClient` 本来就把
+# 同一客户端的请求串起来发，**它根本测不出这件事**（同一个盲点之前已经让
+# "并发闸门测试空转"过一次）。现在由 `EventLoopNotBlockedTests` 用
+# `httpx.ASGITransport` + `asyncio.gather` 钉住：两个请求的墙钟必须**明显小于**两条之和。
+#
+# 顺带一个后果：串行时 `/v1/health` 还能答（它是同步端点，走线程池），
+# 所以"服务看着是活的"，但能力端点其实在排队 —— 这类问题靠看日志很难发现。
+
+
+async def _reject(request: Request, exc) -> None:
+    """**先把请求体抽干，再抛。**
+
+    不这么做的话，错误码会凭空消失：服务端没读完 body 就回响应并关连接，
+    未读数据让对端收到 RST，而 RST 会丢掉对端接收缓冲里的响应体。
+    实测 0.9 MB 的 body + `?model=nope` → 404 但 body 为空（2 KB 时正常）——
+    而且是竞态，偶尔才复现。完整说明见 `audio.drain`。
+    """
+    await audio_mod.drain(request)
+    raise exc
+
+
 def _finish_asr(engine, wav: str, lang: str, timestamps: bool, model_id: str,
                 spec, seconds: float, t0: float) -> dict:
     out = engine.transcribe(wav, lang=lang, timestamps=timestamps)
@@ -305,7 +336,6 @@ async def asr(request: Request, variant: str = "long", timestamps: int = 0,
     """
     st = _st(request)
     cfg = st.cfg
-    cid = client_id_of(request, need_scope="asr")
     want_ts = bool(int(timestamps or 0))
 
     # `variant` → 槽。**注意短档的槽叫 `asr.text` 而不是 `asr.short`** ——
@@ -313,21 +343,35 @@ async def asr(request: Request, variant: str = "long", timestamps: int = 0,
     # `variant=short` 一律 404，而默认的 `variant=long` 把测试全带过去了。
     # 现在由 `test_every_advertised_slot_is_routable` 盯着这类幽灵槽。
     slot = "asr.text" if str(variant).lower() in ("short", "fast") else "asr.long"
-    model_id = st.pool.pick_for_slot(slot, model)
-    spec = st.pool.spec(model_id)
-
-    # **先判忙，再读 body**（同样是"先挑模型、再动字节"的顺序）：
-    # 忙的时候一个字节都不收，见 `Admission.precheck`。
-    st.admission.precheck(cid)
-    audio_mod.check_declared_size(request, cfg)
+    # 这一整段都在**读 body 之前**（鉴权 / 挑模型 / 判忙 / 查大小）。
+    # 任何一条拒了都必须**先把 body 抽干再抛**（见 `_reject`），
+    # 否则客户端拿到的是"空 body 的错误"，它的降级逻辑就瞎了。
+    try:
+        cid = client_id_of(request, need_scope="asr")
+        model_id = st.pool.pick_for_slot(slot, model)
+        spec = st.pool.spec(model_id)
+        # **先判忙，再读 body**（同样是"先挑模型、再动字节"的顺序）：
+        # 忙的时候一个字节都不收，见 `Admission.precheck`。
+        st.admission.precheck(cid)
+        audio_mod.check_declared_size(request, cfg)
+    except errors.EchoError as e:
+        if e.code == "payload_too_large":
+            raise            # 声报超大：**故意不抽干**（可能真是 999 MB），只回 413
+        await _reject(request, e)
     with tmp.TempWorkspace(cfg.tmp_root) as ws:
         src, ctype = await audio_mod.receive(request, ws, cfg)
         wav = ws.path("seg.wav")
-        seconds = audio_mod.to_wav16k(src, wav, ctype, cfg)
-        t0 = time.time()
-        with st.admission.hold(cid):
-            with st.pool.acquire(model_id) as engine:
-                return _finish_asr(engine, wav, lang, want_ts, model_id, spec, seconds, t0)
+        # 解码 / 重采样也是 CPU 活：同样要下线程池（见 `_infer` 上方的说明）
+        seconds = await run_in_threadpool(audio_mod.to_wav16k, src, wav, ctype, cfg)
+
+        def _infer():
+            t0 = time.time()
+            with st.admission.hold(cid):
+                with st.pool.acquire(model_id) as engine:
+                    return _finish_asr(engine, wav, lang, want_ts, model_id, spec,
+                                       seconds, t0)
+
+        return await run_in_threadpool(_infer)
 
 
 @router.post("/diarize")
@@ -343,23 +387,30 @@ async def diarize(request: Request, mode: str = "segment", maxSpeakers: int = 0,
     """
     st = _st(request)
     cfg = st.cfg
-    cid = client_id_of(request, need_scope="diarize")
-    if str(mode) != "segment":
-        raise errors.bad_request("mode=%r 尚未实现（v1 只支持 segment）" % mode)
-
-    model_id = st.pool.pick_for_slot("diarize.turns", model)
-    spec = st.pool.spec(model_id)
-    st.admission.precheck(cid)                 # 先判忙，再读 body
-    audio_mod.check_declared_size(request, cfg)
+    try:
+        cid = client_id_of(request, need_scope="diarize")
+        if str(mode) != "segment":
+            raise errors.bad_request("mode=%r 尚未实现（v1 只支持 segment）" % mode)
+        model_id = st.pool.pick_for_slot("diarize.turns", model)
+        spec = st.pool.spec(model_id)
+        st.admission.precheck(cid)             # 先判忙，再读 body
+        audio_mod.check_declared_size(request, cfg)
+    except errors.EchoError as e:
+        if e.code == "payload_too_large":
+            raise
+        await _reject(request, e)
     with tmp.TempWorkspace(cfg.tmp_root) as ws:
         src, ctype = await audio_mod.receive(request, ws, cfg)
         wav = ws.path("seg.wav")
-        seconds = audio_mod.to_wav16k(src, wav, ctype, cfg)
-        t0 = time.time()
-        with st.admission.hold(cid):
-            with st.pool.acquire(model_id) as engine:
-                turns, embs, labels = engine.analyze(
-                    wav, max_speakers=int(maxSpeakers) or None)
+        seconds = await run_in_threadpool(audio_mod.to_wav16k, src, wav, ctype, cfg)
+
+        def _infer():
+            t0 = time.time()
+            with st.admission.hold(cid):
+                with st.pool.acquire(model_id) as engine:
+                    return engine.analyze(wav, max_speakers=int(maxSpeakers) or None), t0
+
+        (turns, embs, labels), t0 = await run_in_threadpool(_infer)
     speakers = {}
     for i, lab in enumerate(labels or []):
         if i < len(embs):
@@ -387,19 +438,28 @@ async def speaker_embed(request: Request, count: int = 1, model: str = ""):
     """
     st = _st(request)
     cfg = st.cfg
-    cid = client_id_of(request, need_scope="embed")
-    model_id = st.pool.pick_for_slot("speaker.embed", model)
-    spec = st.pool.spec(model_id)
-    st.admission.precheck(cid)                 # 先判忙，再读 body
-    audio_mod.check_declared_size(request, cfg)
+    try:
+        cid = client_id_of(request, need_scope="embed")
+        model_id = st.pool.pick_for_slot("speaker.embed", model)
+        spec = st.pool.spec(model_id)
+        st.admission.precheck(cid)             # 先判忙，再读 body
+        audio_mod.check_declared_size(request, cfg)
+    except errors.EchoError as e:
+        if e.code == "payload_too_large":
+            raise
+        await _reject(request, e)
     with tmp.TempWorkspace(cfg.tmp_root) as ws:
         src, ctype = await audio_mod.receive(request, ws, cfg)
         wav = ws.path("seg.wav")
-        seconds = audio_mod.to_wav16k(src, wav, ctype, cfg)
-        t0 = time.time()
-        with st.admission.hold(cid):
-            with st.pool.acquire(model_id) as engine:
-                vecs, _labels = engine.embed(wav)
+        seconds = await run_in_threadpool(audio_mod.to_wav16k, src, wav, ctype, cfg)
+
+        def _infer():
+            t0 = time.time()
+            with st.admission.hold(cid):
+                with st.pool.acquire(model_id) as engine:
+                    return engine.embed(wav), t0
+
+        (vecs, _labels), t0 = await run_in_threadpool(_infer)
     want = max(1, int(count or 1))
     return {
         "embeddings": [[round(float(x), 6) for x in v] for v in (vecs or [])[:want]],

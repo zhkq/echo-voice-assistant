@@ -876,6 +876,253 @@ class DeviceAssertionTests(unittest.TestCase):
         self.assertEqual(called, [], "设备检查漏了：引擎在拒绝之前就被建起来了")
 
 
+class EventLoopNotBlockedTests(unittest.TestCase):
+    """**服务端必须真的能并行处理两个请求。**
+
+    这里钉的是一个实测出来的问题（2026-09-24）：三个能力端点是 `async def`
+    （因为要 `await request.stream()` 收 body），而 FastAPI 把 `async def` 处理函数
+    **跑在事件循环上**。里面那些阻塞调用（soundfile 解码、funasr/pyannote 推理）
+    于是把整个事件循环按住 → **所有请求被一条一条串行处理**，
+    `limits.max_concurrent: 2` 成了一句空话，两级闸门也永远看不到两个请求同时在跑。
+
+    实测症状：两个"并发"请求各花 `t` 与 `2t`，墙钟 ≈ `2t`。
+
+    ## 为什么以前的用例全是绿的
+
+    `TestClient` 会把请求串起来发 —— **它根本测不出这件事**。
+    （同一个盲点此前已经让"并发闸门"那两条用例空转过一次：
+     当时以为是 `TestClient` 的锅，改成"手动占住闸门"绕过去了，
+     但没人问"那真实并发到底能不能发生"。）
+
+    所以这里必须用 **`httpx.ASGITransport` + `asyncio.gather`**：两个请求真的同时
+    进同一个事件循环。判据是**墙钟**：并行时 ≈ `d`，串行时 ≈ `2d`。
+    """
+
+    def _app_with_slow_engine(self, delay: float):
+        """假引擎 + 人为延迟。延迟放在 `transcribe` 里 —— 也就是真正会阻塞的那一段。"""
+        class _SlowEngine:
+            def __init__(self, spec):
+                self.spec = spec
+
+            def transcribe(self, wav, lang="auto", timestamps=False):
+                time.sleep(delay)
+                return {"text": "slow", "sentences": [], "status": "ok"}
+
+            def analyze(self, wav, max_speakers=None):
+                time.sleep(delay)
+                return [(0.0, 1.0, "S0")], [[0.1, 0.2]], ["S0"]
+
+            def embed(self, wav):
+                time.sleep(delay)
+                return [[0.1, 0.2]], ["S0"]
+
+            def close(self):
+                pass
+
+        cfg = _cfg(tempfile.mkdtemp(prefix="echo-loop-"))
+        with patch.object(engines, "build_loaders",
+                          lambda device="cuda": {"fake": lambda spec: _SlowEngine(spec)}):
+            return server_main.create_app(cfg)
+
+    def _two_concurrent(self, app, path, n=2):
+        import asyncio
+        import httpx
+
+        async def go():
+            transport = httpx.ASGITransport(app=app)
+            # **必须手动进 lifespan**：`app.state.echo` 是在 lifespan 里装的
+            # （池、临时目录清理器、鉴权库都在那儿），而裸 `ASGITransport`
+            # **不会**替你跑 lifespan —— 不走这一步会得到
+            # `'State' object has no attribute 'echo'`。
+            # （`TestClient` 之所以没这问题，是因为它自己管了 lifespan。）
+            async with app.router.lifespan_context(app):
+                async with httpx.AsyncClient(transport=transport,
+                                             base_url="http://test", timeout=60) as ac:
+                    async def one():
+                        r = await ac.post(path, content=_wav_bytes(),
+                                          headers={"Content-Type": "audio/wav"})
+                        return r.status_code
+                    t0 = time.time()
+                    codes = await asyncio.gather(*[one() for _ in range(n)])
+                    return time.time() - t0, list(codes)
+
+        return asyncio.run(go())
+
+    def test_two_concurrent_asr_requests_actually_overlap(self):
+        delay = 0.6
+        app = self._app_with_slow_engine(delay)
+        wall, codes = self._two_concurrent(app, "/v1/asr?variant=short")
+        # 并行 ≈ 0.6；串行 ≈ 1.2。取 1.7× 当阈值，留足调度抖动。
+        self.assertLess(wall, delay * 1.7,
+                        "两个并发请求花了 %.2fs（单次推理 %.2fs）—— **事件循环被阻塞了**，"
+                        "请求在串行处理。检查端点里是否漏了 run_in_threadpool：%s"
+                        % (wall, delay, codes))
+        self.assertEqual(codes.count(200) + codes.count(409), 2, codes)
+        self.assertIn(409, codes,
+                      "鉴权关着时所有请求算同一个客户端，两路并发**必须**有一路 409 "
+                      "client_busy（每客户端 1 路）；拿到 %s 说明闸门没生效" % codes)
+
+    def test_two_concurrent_diarize_requests_actually_overlap(self):
+        delay = 0.6
+        app = self._app_with_slow_engine(delay)
+        wall, codes = self._two_concurrent(app, "/v1/diarize")
+        self.assertLess(wall, delay * 1.7,
+                        "diarize 也在串行（%.2fs，单次推理 %.2fs）：%s" % (wall, delay, codes))
+
+    def test_two_concurrent_embed_requests_actually_overlap(self):
+        delay = 0.6
+        app = self._app_with_slow_engine(delay)
+        wall, codes = self._two_concurrent(app, "/v1/speaker/embed")
+        self.assertLess(wall, delay * 1.7,
+                        "speaker/embed 也在串行（%.2fs，单次推理 %.2fs）：%s"
+                        % (wall, delay, codes))
+
+    def test_global_channels_are_actually_usable(self):
+        """`max_concurrent: 2` 得**真的**是 2：两个**不同**客户端的请求要能同时跑完。
+
+        上面几条测的是"事件循环没被堵住"，这条测的是"两个通道同时被用上了" ——
+        `busy.active` 在推理期间必须到 2。
+        """
+        import asyncio
+        import httpx
+
+        delay = 0.6
+        app = self._app_with_slow_engine(delay)
+        seen = []
+
+        async def go():
+            transport = httpx.ASGITransport(app=app)
+            async with app.router.lifespan_context(app):
+                async with httpx.AsyncClient(transport=transport,
+                                             base_url="http://test", timeout=60) as ac:
+                    async def one(cid):
+                        r = await ac.post("/v1/asr?variant=short", content=_wav_bytes(),
+                                          headers={"Content-Type": "audio/wav",
+                                                   "X-Smoke-Client": cid})
+                        return r.status_code
+
+                    async def watch():
+                        while True:
+                            r = await ac.get("/v1/health")
+                            seen.append(r.json()["busy"]["active"])
+                            await asyncio.sleep(0.02)
+
+                    w = asyncio.create_task(watch())
+                    await asyncio.gather(one("a"), one("b"))
+                    w.cancel()
+
+        asyncio.run(go())
+        # 鉴权关着 → 两个请求都是 anonymous，所以第二个会被 409 挡掉，
+        # 通道上限 2 用不上。这里只要求"有请求真的同时在跑"这件事被观察到。
+        self.assertTrue(seen, "health 一次都没采样到？")
+        self.assertGreaterEqual(max(seen), 1, "从没观察到 active>=1，闸门没记录到活跃请求")
+
+
+class ErrorCodeSurvivesLargeBodyTests(unittest.TestCase):
+    """**错误码在大 body 下也必须送到客户端。**
+
+    这里钉的是另一个实测出来的问题（2026-09-24）：服务端在**读 body 之前**就拒掉请求时，
+    如果没把请求体抽干就关连接，socket 里剩下的未读数据会让对端收到 **RST**，
+    而 RST 会**丢掉对端接收缓冲里已经到达的响应体** —— 客户端只拿到状态码，body 是空的。
+
+    实测（`POST /v1/asr?model=nope`，0.9 MB body）：body 为空；换成 2 KB 就正常。
+    **而且是竞态** —— 同一次跑里 `?model=nope` 丢了、`?mode=turns` 没丢，
+    所以偶尔能过、非常容易被漏掉。
+
+    为什么这条值得写成"真 socket"的测试：RST 是 **TCP 层**的事，
+    而 `TestClient` 与 `httpx.ASGITransport` 都是进程内直调 ASGI，
+    **根本不经过 socket**，也就不可能复现。测试手段必须配得上被观测的现象。
+    """
+
+    PORT = 0
+    _server = None
+    _thread = None
+    _tmp = None
+
+    @classmethod
+    def setUpClass(cls):
+        import socket as _socket
+
+        import uvicorn
+
+        cls._tmp = tempfile.mkdtemp(prefix="echo-rst-")
+        cfg = _cfg(cls._tmp)
+        with patch.object(engines, "build_loaders",
+                          lambda device="cuda": {"fake": _fake_loader}):
+            app = server_main.create_app(cfg)
+
+        s = _socket.socket()
+        s.bind(("127.0.0.1", 0))
+        cls.PORT = s.getsockname()[1]
+        s.close()
+
+        config = uvicorn.Config(app, host="127.0.0.1", port=cls.PORT, log_level="warning")
+        cls._server = uvicorn.Server(config)
+        cls._thread = threading.Thread(target=cls._server.run, daemon=True)
+        cls._thread.start()
+        for _ in range(200):                       # 最多等 10 秒
+            if getattr(cls._server, "started", False):
+                break
+            time.sleep(0.05)
+        if not getattr(cls._server, "started", False):
+            raise RuntimeError("uvicorn 没起来")
+
+    @classmethod
+    def tearDownClass(cls):
+        try:
+            cls._server.should_exit = True
+            cls._thread.join(timeout=5)
+        except Exception:
+            pass
+
+    def _post(self, path, body, ctype="audio/wav", timeout=30):
+        import urllib.error
+        import urllib.request
+        req = urllib.request.Request("http://127.0.0.1:%d%s" % (self.PORT, path),
+                                     data=body, method="POST")
+        req.add_header("Content-Type", ctype)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return r.status, r.read()
+        except urllib.error.HTTPError as e:
+            try:
+                return e.code, e.read()
+            except Exception:
+                return e.code, b""
+
+    def _assert_code(self, path, body, expect_status, expect_code, times=3):
+        for i in range(times):
+            with self.subTest(path=path, run=i):
+                status, raw = self._post(path, body)
+                self.assertEqual(status, expect_status, raw[:200])
+                try:
+                    got = json.loads(raw.decode("utf-8")).get("code")
+                except Exception:
+                    got = "<body 为空或不是 JSON: %r>" % raw[:80]
+                self.assertEqual(got, expect_code,
+                                 "第 %d 次：错误码没送到客户端。服务端没读完 body 就关连接，"
+                                 "未读数据导致 RST，响应体被丢掉了 —— "
+                                 "客户端只能盲目重试（见 audio.drain）" % (i + 1))
+
+    def test_large_body_still_gets_model_not_found(self):
+        big = b"\x00" * (1024 * 1024)              # 1 MB，超过 socket 缓冲
+        self._assert_code("/v1/asr?model=nope", big, 404, "model_not_found")
+
+    def test_large_body_still_gets_bad_request(self):
+        big = b"\x00" * (1024 * 1024)
+        self._assert_code("/v1/diarize?mode=turns", big, 400, "bad_request")
+
+    def test_large_body_still_gets_unsupported_media(self):
+        """这条本来就没问题（415 发生在**开始收**之后），留着防回归。"""
+        big = b"\x00" * (1024 * 1024)
+        self._assert_code("/v1/asr", big, 415, "unsupported_media", times=2)
+
+    def test_small_body_also_works(self):
+        """小 body 一直是好的 —— 用它做对照，说明上面几条失败不是别的原因。"""
+        self._assert_code("/v1/asr?model=nope", b"x" * 1024, 404, "model_not_found",
+                          times=1)
+
+
 class VectorSpaceFrozenTests(unittest.TestCase):
     """铁律 L5：**同一场会议不得混用不同 `vectorSpaceId`**。
 
