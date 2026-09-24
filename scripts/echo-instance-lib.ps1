@@ -64,8 +64,17 @@ function Get-EchoInstanceRoot($cfg, [string]$name) {
 }
 
 # --------------------------------------------------------------- probes
+# 3.0 install-base layout: an instance 'root' is the CODE dir (the command line carries
+# -File <root>\scripts\startup.ps1, which is what we match on), while data\echo.pid and
+# data\echo-port.txt live in the INSTALL BASE - the parent folder when the code dir is
+# named echo-core. Same rule as app\paths.py:echo_base(); on a flat tree both are equal.
+function Get-EchoDataRoot([string]$root) {
+    if ((Split-Path $root -Leaf) -ieq 'echo-core') { return (Split-Path $root -Parent) }
+    return $root
+}
+
 function Get-EchoPidFileValue([string]$root) {
-    $f = Join-Path $root 'data\echo.pid'
+    $f = Join-Path (Get-EchoDataRoot $root) 'data\echo.pid'
     if (-not (Test-Path $f)) { return 0 }
     $v = Get-Content $f -Raw -ErrorAction SilentlyContinue
     if ($null -eq $v) { return 0 }
@@ -75,7 +84,7 @@ function Get-EchoPidFileValue([string]$root) {
 }
 
 function Get-EchoPortFromFile([string]$root) {
-    $f = Join-Path $root 'data\echo-port.txt'
+    $f = Join-Path (Get-EchoDataRoot $root) 'data\echo-port.txt'
     if (-not (Test-Path $f)) { return 0 }
     $v = Get-Content $f -Raw -ErrorAction SilentlyContinue
     if ($null -eq $v) { return 0 }
