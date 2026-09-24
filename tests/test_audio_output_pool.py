@@ -178,11 +178,18 @@ class BeepsFollowSystemDefaultTests(_PoolCase):
     """提示音**有意不参与**扬声器设备池（2026-09-24 拍板）。
 
     Windows 的接缝是 `winsound`、macOS 是 `afplay`，**都没有设备参数** ——
-    想让提示音走到指定扬声器，只能改用 `sounddevice`，代价是得自己管异步性、
-    重采样与失败回退。用户的原话："提示音不行就不行吧，tts 走就行"。
+    所以"配了扬声器池"对提示音不生效。这是取舍，不是漏了。
 
-    这条用例存在的意义是**把这个取舍钉住**：它不是漏了，是有意的。
-    哪天有人"顺手把提示音也接上"，希望他先看到这段话、再决定值不值当。
+    ## 为什么不能"顺手"改成 `sd.play`（这条用例真正在钉的东西）
+
+    `sounddevice.play()` 的文档：*"It **cannot be used for multiple overlapping
+    playbacks**. … Call `stop()` to terminate any currently running invocation"*。
+    而**播报也走 `sd.play`**（`_play_wav_data`）。所以提示音一改用它，就变成
+    "播报正在念 → 提示音响 → 播报**被当场切断**"，且只在与播报重叠时发生 ——
+    最难查的那类时序问题。
+
+    所以这里**行为性地**钉住：一次提示音**绝不许碰 sounddevice 的全局播放态**。
+    只写注释拦不住下一个人；钉住"没调用 sd.play"才拦得住。
     """
 
     def test_beep_uses_the_platform_seam_and_ignores_the_pool(self):
@@ -196,13 +203,43 @@ class BeepsFollowSystemDefaultTests(_PoolCase):
         self.assertTrue(seam.called,
                         "提示音应当走平台接缝（跟随系统默认），这是有意的取舍")
 
-    def test_module_names_the_tradeoff_so_nobody_thinks_it_is_a_bug(self):
-        """源码里要写明"为什么提示音不跟设备池" —— 否则下一个人会当 bug 修。"""
+    def test_beep_never_touches_sounddevices_global_playback(self):
+        """**核心那条**：提示音不许调 `sd.play`，否则会和播报抢全局播放态。
+
+        真跑去调了会怎样：`sd.play` 内部先 `sd.stop()`，把正在念的播报切断。
+        这里只要它**被调用**就红 —— 不等到真出 bug 才发现。
+        """
+        from app.audio import tts
+        import sounddevice as sd
+        with patch("app.config.settings.get",
+                   _settings({"outputDeviceIds": ["Bose Speaker"]})), \
+             patch.object(sd, "play") as sd_play, \
+             patch.object(tts.echo_platform, "play_wav_async") as seam:
+            seam.return_value = True
+            tts.play_beep("ok")
+        self.assertFalse(sd_play.called,
+                         "提示音调了 sounddevice 的 sd.play —— 它会 stop() 掉正在播的语音播报。"
+                         "真要给提示音选设备，得单独开一条 sd.OutputStream（见 play_beep 的说明）")
+
+    def test_module_records_the_REAL_reason_not_the_wrong_ones(self):
+        """源码里写的理由必须是**真的那条**。
+
+        第一版注释写的是"得自己管异步性、重采样与失败回退" —— 前两条**是错的**：
+        `sd.play` 本来就非阻塞（不 wait 即异步），而提示音是 44.1 kHz 的常规率。
+        照着错的理由做决定，会把人带到"那就顺手实现一下吧"—— 恰好踩进真正的坑。
+        """
         import inspect
         from app.audio import tts
         doc = inspect.getdoc(tts.play_beep) or ""
         self.assertIn("不参与扬声器设备池", doc)
         self.assertIn("都没有设备参数", doc)
+        # 真正的隐患：全局播放态 + stop()
+        self.assertIn("cannot be used", doc)
+        self.assertIn("OutputStream", doc, "要给出正解的方向，别只说'不行'")
+        # 反面证据也要留着，否则会被当成"纯没收益"
+        self.assertIn("winsound 老 waveOut", doc)
+        # 那两条错的理由不许再出现
+        self.assertNotIn("拍板，是有意的", doc)
 
 
 class TtsUsesThePoolTests(_PoolCase):

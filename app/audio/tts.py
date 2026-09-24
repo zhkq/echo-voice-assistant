@@ -49,15 +49,39 @@ def play_beep(name):
 
     播放实现是平台差异（Windows=winsound 异步、macOS=afplay），收在接缝里。
 
-    ## 提示音**不参与扬声器设备池**（2026-09-24 拍板，是有意的）
+    ## 提示音**不参与扬声器设备池**（2026-09-24 拍板）
 
     两个平台的接缝（`winsound` / `afplay`）**都没有设备参数**，只能走系统默认输出。
-    想让提示音也走到配置的那台扬声器上，只能改用 `sounddevice` 播 ——
-    但那样要自己管异步性、重采样与失败回退，为一个 0.3 秒的"咚"不值当。
-    用户 2026-09-24 的话："提示音不行就不行吧，tts 走就行"。
+    所以"配了扬声器池"这件事对提示音不生效 —— 这是**有意的取舍，不是漏了**。
 
-    所以：**语音播报（`_play_wav_data`）走设备池，提示音跟随系统默认。**
-    要改这条，就得先换掉播放实现（`app/audio/output.py` 里已有解析逻辑，可用）。
+    ### 真正的理由：会和播报抢 sounddevice 的**全局播放态**
+
+    看起来"改成 `sd.play(data, sr, device=…)` 就行了"（15 行），但那会引入一个
+    **间歇性**的坏问题。`sounddevice.play()` 自己的文档写着：
+
+        This is a convenience function for interactive use... It **cannot be used
+        for multiple overlapping playbacks**. ... Call `stop()` to terminate any
+        currently running invocation of `play()` ...
+
+    而**语音播报也走 `sd.play`**（见 `_play_wav_data`）。所以提示音一改成它，
+    就变成"播报正在念 → 提示音响起 → 播报**被当场切断**"，且只在与播报重叠时发生
+    —— 正是最难查的那类时序问题。今天不会发生，因为提示音走的是**另一条通路**
+    （winsound → waveOut，由系统混音），两条路互不干扰。
+
+    ### 要做得对的代价（供将来真要动它时参考）
+
+    库自己指了路：*"If you need more control (e.g. … multiple overlapping
+    playbacks) … you should explicitly create an `OutputStream`."* —— 也就是给提示音
+    **单独一条长驻 `sd.OutputStream`**（回调驱动、按设备缓存），并重做
+    `_beep_until` 那笔账（现在是按文件时长记的）。那是 60~100 行 + 用例，**且必须真机验**。
+
+    ### 一条反面证据（别把这条当成"纯没收益"）
+
+    `app/platform/win32/env.py` 里留着一句实测：*"sounddevice 播是能听到的 ——
+    怀疑就是这条 winsound 老 waveOut 通路"*。也就是说**某些机器上接缝确实播不出声，
+    而 sounddevice 能**。所以：提示音现在响 → 别动它；提示音在某台机器上是哑的 →
+    该修，但**正解是专用流，不是 `sd.play`**（别拿"播报被切断"去换"提示音能响"，
+    那是拿一个更难查的问题换一个更好查的问题）。
 
     ⚠️ 2026-09-19 起不再静默：原实现"文件不存在直接 return、异常 pass"，
     表现和"设备没声音"完全一样，导致"提示音到底响没响"查了两天。现在：
