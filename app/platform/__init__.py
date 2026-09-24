@@ -243,6 +243,43 @@ def hf_executable(install_root: str) -> str:
     return os.path.join(install_root, "venv", "bin", "hf")
 
 
+# ---------------------------------------------------------------- 秘密保护（凭据落盘）
+#
+# 客户端凭据（`{DATA}/backend.json` 里的 `client_id` + `secret`）在不同平台上
+# **靠不同的东西**保护：Windows 上 DPAPI 把密文绑到当前用户账户，POSIX 上只能靠
+# 文件权限 0600。这属于平台差异，所以按 D12 收在这里，业务代码（credentials.py）
+# 只调用这几个名字，不写 `sys.platform` / `os.name` 分支。
+#
+# 三个平台**接口一致**：POSIX 的 `restrict_file` 真的 chmod，Windows 的是空实现
+# （它的墙是 DPAPI）。由 tests/test_path_seam.py 的原语清单钉住。
+
+def protect_secret_kind() -> str:
+    """这个平台用哪种保护（`dpapi` / `plain`）—— 写进信封，读的时候据此选解密路径。"""
+    fn = _platform_fn("protect_secret_kind")
+    return str(fn()) if callable(fn) else "plain"
+
+
+def protect_secret(data: bytes) -> bytes:
+    """把一段秘密包成"只有本机这个用户能解开"的形式。"""
+    fn = _platform_fn("protect_secret")
+    return bytes(fn(bytes(data))) if callable(fn) else bytes(data)
+
+
+def unprotect_secret(blob: bytes) -> bytes:
+    """解开。**解不开就抛** —— 调用方兜住并当成"没配对"，绝不退回明文路径去猜。"""
+    fn = _platform_fn("unprotect_secret")
+    if not callable(fn):
+        raise RuntimeError("这个平台没有实现 unprotect_secret")
+    return bytes(fn(bytes(blob)))
+
+
+def restrict_file(path: str) -> None:
+    """把这个文件收紧到"只有本用户能读"（平台各自的最强手段）。"""
+    fn = _platform_fn("restrict_file")
+    if callable(fn):
+        fn(path)
+
+
 def shell_script(hf: str, jobs) -> str:
     """把若干条 argv 渲染成该平台的 shell 下载脚本。"""
     fn = _platform_fn("shell_script")

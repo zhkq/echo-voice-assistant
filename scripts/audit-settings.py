@@ -104,9 +104,9 @@ ACK_INDIRECT = {
     "capabilityMeetingAsrBackend": "app/capabilities/router.py:_setting_key_for() 映射读（asr.text/timestamps 用哪个后端）",
     "capabilityDiarizeBackend": "app/capabilities/router.py:_setting_key_for() 映射读（说话人分离用哪个后端）",
     "capabilityEmbedBackend": "app/capabilities/router.py:_setting_key_for() 映射读（声纹提取用哪个后端）",
-    # privacy 约束在 plan() 里按点分路径读（`self._get("capabilityPrivacy", "lan")`），
-    # 但那一行同时含别的字面量，被判成间接；消费方就是 plan() 的 allowed_sources。
-    "capabilityPrivacy": "app/capabilities/router.py:plan() 读它算 allowed_sources（哪些后端根本不被考虑）",
+    # capabilityPrivacy **已经不在这里**（2026-09-24）：闸报"已不再是间接读，请从名单里删掉"。
+    # 原因是它现在有一处**直接字面量**读法（app/capability_admin.py 的 `_setting("capabilityPrivacy")`），
+    # 扫描看得见了。这正是这份名单的防腐机制在起作用 —— 名单里多留一项 = 掩护一处真的漏读。
     # 播放设备（扬声器）与采集侧同形：用途键在 OUTPUT_DEVICE_KEYS 表里，
     # 调用点拿到的是**映射出来的键名变量**（`_read_setting(key)`），所以扫描看不见字面量。
     # （同一份名单里 commandInputDeviceId / meetingInputDeviceId 就是同一个理由。）

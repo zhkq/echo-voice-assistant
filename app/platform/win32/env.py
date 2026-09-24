@@ -7,6 +7,7 @@ Windows 是 ECHO 的主平台，因此这些值与 1.x 的行为**逐字保持**
 本文件里的每个原语都由 ``app/platform/__init__.py`` 转发给业务代码；业务代码
 （``app/`` 的其它模块）不得再自己写 ``os.name`` / ``LOCALAPPDATA`` / ``platform.system()`` 分支。
 """
+import ctypes
 import os
 
 NAME = "win32"
@@ -407,3 +408,83 @@ def node_dirs():
         if root:
             out.append(os.path.join(root, tail))
     return [d for d in out if d and os.path.isdir(d)]
+
+
+# ---------------------------------------------------------------- 秘密保护（凭据落盘）
+#
+# 这里放的是**客户端凭据**（配对换来的 `client_id` + `secret`）的落盘保护。
+# 为什么是 DPAPI 而不是"跟 provider 密钥一样存 SQLite"：provider 密钥泄露 = 花你的额度；
+# 后端凭据泄露 = **用你的显卡 + 以你的身份出现在服务端审计里**。值钱程度不同，
+# 所以它单独走一条更硬的路（`app/capabilities/credentials.py` 里有完整说明）。
+#
+# 用**用户作用域**（不传 `CRYPTPROTECT_LOCAL_MACHINE`）：密文绑到当前用户账户，
+# 文件被拷到别的机器/别的账户都解不开 —— 这正是我们要的那条性质。
+
+class _Blob(ctypes.Structure):
+    _fields_ = [("cbData", ctypes.c_ulong), ("pbData", ctypes.POINTER(ctypes.c_char))]
+
+
+def protect_secret_kind() -> str:
+    """保护方式的标记，写进信封（`dpapi` / `plain`），读的时候据此选解密路径。"""
+    return "dpapi"
+
+
+def _dpapi(protect: bool, data: bytes) -> bytes:
+    """`CryptProtectData` / `CryptUnprotectData`（用户作用域，不弹 UI）。
+
+    `CRYPTPROTECT_UI_FORBIDDEN` 是必须的：ECHO 是后台进程，少了它某些情况下会弹一个
+    **没人能点**的系统对话框，把调用挂死。
+
+    `argtypes` 全部显式声明：x64 下不声明的话结构体指针会被按 32 位截断，
+    表现为"偶尔解密失败"这种极难查的错。
+    """
+    from ctypes import wintypes
+    crypt32 = ctypes.WinDLL("crypt32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    crypt32.CryptProtectData.argtypes = [
+        ctypes.POINTER(_Blob), wintypes.LPCWSTR, ctypes.POINTER(_Blob),
+        ctypes.c_void_p, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(_Blob)]
+    crypt32.CryptProtectData.restype = wintypes.BOOL
+    crypt32.CryptUnprotectData.argtypes = [
+        ctypes.POINTER(_Blob), ctypes.POINTER(wintypes.LPWSTR), ctypes.POINTER(_Blob),
+        ctypes.c_void_p, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(_Blob)]
+    crypt32.CryptUnprotectData.restype = wintypes.BOOL
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+
+    buf = ctypes.create_string_buffer(bytes(data), len(data))
+    blob_in = _Blob(len(data), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char)))
+    blob_out = _Blob()
+    ui_forbidden = 0x1
+    if protect:
+        ok = crypt32.CryptProtectData(ctypes.byref(blob_in), "ECHO backend credential",
+                                      None, None, None, ui_forbidden,
+                                      ctypes.byref(blob_out))
+    else:
+        descr = ctypes.c_wchar_p()
+        ok = crypt32.CryptUnprotectData(ctypes.byref(blob_in), ctypes.byref(descr),
+                                        None, None, None, ui_forbidden,
+                                        ctypes.byref(blob_out))
+    if not ok:
+        raise OSError(ctypes.get_last_error(), "DPAPI 调用失败")
+    try:
+        return ctypes.string_at(blob_out.pbData, blob_out.cbData)
+    finally:
+        kernel32.LocalFree(blob_out.pbData)
+
+
+def protect_secret(data: bytes) -> bytes:
+    return _dpapi(True, bytes(data))
+
+
+def unprotect_secret(blob: bytes) -> bytes:
+    """解不开就抛（调用方兜住并当成"没配对"）—— **不退回明文去猜**。"""
+    return _dpapi(False, bytes(blob))
+
+
+def restrict_file(path: str) -> None:
+    """Windows 上那道墙是 DPAPI（绑用户账户），文件权限不必再管。
+
+    留这个空实现是为了让三个平台的 env 模块**接口一致**（`test_path_seam.py` 钉着）：
+    业务代码只写一句 `platform.restrict_file(path)`，不必知道哪几个平台需要它。
+    """
+    return None

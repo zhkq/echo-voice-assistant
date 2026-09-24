@@ -130,7 +130,11 @@ class EveryPlatformImplementsThePrimitives(unittest.TestCase):
                   "detach_gui_kwargs", "detach_console_kwargs", "console_shell_argv",
                   "process_running", "shell_open", "play_wav_async",
                   "offline_tts_speak", "offline_tts_label", "offline_tts_display",
-                  "notify", "sidebar_candidates")
+                  "notify", "sidebar_candidates",
+                  # 秘密保护（客户端凭据落盘）：Windows 用 DPAPI，POSIX 用 0600。
+                  # 三平台必须同名同义 —— 否则"在 Windows 上写好的调用"到 mac 上就崩。
+                  "protect_secret_kind", "protect_secret", "unprotect_secret",
+                  "restrict_file")
 
     def test_all_platform_env_modules_expose_every_primitive(self):
         import importlib
@@ -219,6 +223,16 @@ class ScannerSelfTest(unittest.TestCase):
 
     def test_ignores_url_scheme_as_a_drive_literal(self):
         self.assertNotIn("DRIVE_LITERAL", self._rules('X = "http://127.0.0.1:1/"\n'))
+
+    def test_ignores_a_format_placeholder_before_a_scheme(self):
+        """`"%s://%s"` 不是盘符路径。
+
+        2026-09-24：`app/capabilities/pairing.py` 拼后端地址就是这样写的，被误报。
+        `http://` 当初能躲过是因为候选字母 `p` 前面还有 `t`；而 `%s://` 里 `s` 前面是 `%`，
+        旧的正则只看"前一个字符是不是字母数字下划线"，于是把它当成了 `s:` 盘符。
+        """
+        self.assertNotIn("DRIVE_LITERAL", self._rules('X = "%s://%s" % (a, b)\n'))
+        self.assertNotIn("DRIVE_LITERAL", self._rules('X = f"{scheme}://{host}"\n'))
 
     def test_flags_a_real_drive_literal(self):
         self.assertIn("DRIVE_LITERAL", self._rules('X = r"C:\\Windows"\n'))

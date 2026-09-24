@@ -194,3 +194,22 @@ def node_dirs():
         pass
     out.append(os.path.join(home, ".volta", "bin"))
     return [d for d in out if d and os.path.isdir(d)]
+
+
+# ---------------------------------------------------------------- 秘密保护（凭据落盘）
+# POSIX 共享实现：落盘靠文件权限（见 _posix.py 里那段取舍说明）。
+
+def protect_secret_kind() -> str:
+    return _posix.protect_secret_kind()
+
+
+def protect_secret(data: bytes) -> bytes:
+    return _posix.protect_secret(data)
+
+
+def unprotect_secret(blob: bytes) -> bytes:
+    return _posix.unprotect_secret(blob)
+
+
+def restrict_file(path: str) -> None:
+    return _posix.restrict_file(path)

@@ -52,8 +52,13 @@ ALLOWED = [
     ("app/paths.py", "PATH_DERIVATION"),
 ]
 
-#: 真正的盘符绝对路径；负向后顾排除 http:// / https:// 这类 scheme（"p:/" 会误中）。
-DRIVE_RE = re.compile(r"(?<![A-Za-z0-9_])[A-Za-z]:[\\/]")
+#: 真正的盘符绝对路径。负向后顾排除两类**看着像盘符其实不是**的东西：
+#:   * `http://` / `https://` —— 盘符候选是 `p`，但它前面还有 `t`（字母），已被排除；
+#:   * `"%s://%s"` 这种**格式化模板** —— 盘符候选是 `s`，前面是 `%`。
+#:     2026-09-24 实测：`app/capabilities/pairing.py` 拼 URL 就是这么写的，
+#:     被误报成盘符路径。所以把 `%` 与 `}`（f-string 的收尾）也加进排除集。
+#:     反过来不会漏报：真的盘符路径前面不会是 `%` / `}`。
+DRIVE_RE = re.compile(r"(?<![A-Za-z0-9_%}])[A-Za-z]:[\\/]")
 #: tokens that mean "this module is branching on the platform"
 #: 注意 win32 / macos / linux 是**清单中立标记**（见 app/platform/__init__.py
 #: 「清单用的平台标记」），清单里写它们不算平台分支，所以不在此列。

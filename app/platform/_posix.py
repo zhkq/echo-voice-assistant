@@ -179,3 +179,33 @@ def offline_tts_speak(text: str, timeout: int = 60,
         except Exception:
             continue
     return False
+
+
+# ------------------------------------------------------------------ 秘密保护（凭据落盘）
+#
+# 与 Windows 那侧（DPAPI，绑用户账户）对称：POSIX 上**没有等价的"绑用户"系统服务**，
+# 所以这里的墙是文件权限 `0600`。这是一处**明确的取舍**，不是"忘了加密" ——
+# 谁想给 Linux 也加一层，得先在这里实现，再动那侧的说明。
+# 取舍由 tests/test_backend_credentials.py 的一条用例写在明处（它叫
+# `test_posix_plain_envelope_is_the_documented_tradeoff`）。
+
+def protect_secret_kind() -> str:
+    """保护方式的标记，写进信封（`dpapi` / `plain`）。"""
+    return "plain"
+
+
+def protect_secret(data: bytes) -> bytes:
+    """原样返回 —— 真保护靠 `restrict_file()` 的 0600。"""
+    return bytes(data)
+
+
+def unprotect_secret(blob: bytes) -> bytes:
+    return bytes(blob)
+
+
+def restrict_file(path: str) -> None:
+    """收紧到 0600。失败不抛：有些文件系统不支持改权限，调用方另有兜底。"""
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass

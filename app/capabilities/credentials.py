@@ -8,11 +8,15 @@
 
 | 平台 | 手段 | 为什么 |
 |---|---|---|
-| Windows | **DPAPI**（`CryptProtectData`，用户作用域） | 绑到**用户账户**：换个账户/把文件拷走都解不开。用 `ctypes` 调系统 API —— 不引新依赖 |
+| Windows | **DPAPI**（`CryptProtectData`，用户作用域） | 绑到**用户账户**：换个账户/把文件拷走都解不开 |
 | Linux / macOS | 文件权限 `0600` | POSIX 上没有等价的"绑用户"系统服务，权限就是那道墙 |
 
-Windows 上**同时也**把权限收紧（`icacls` 太吵，这里只依赖 DPAPI）——
-但文件仍落在用户目录下，且不写进 `settings` 表：
+**实现在 `app/platform/` 里（D12）**：这两条都是平台差异，业务代码不许自己写
+`sys.platform` / `os.name` 分支。所以本文件从不 import `ctypes`，只调
+`platform.protect_secret()` / `unprotect_secret()` / `restrict_file()` 这三个原语。
+
+> 一开始 DPAPI 是直接写在这个文件里的 —— 闸**立刻红了**（`test_path_seam.py` 的 D12
+> 那条线，它存在就是为了拦这个）。搬进接缝之后，三个平台接口一致，本文件也就没了平台分支。
 
 > **为什么不跟 provider 密钥一样存 SQLite？** 那条路今天能用，但它是**明文**的
 > （只在接口层遮罩）。后端密钥比 provider 密钥更值钱：provider 泄露=花你的额度，
@@ -29,10 +33,8 @@ Windows 上**同时也**把权限收紧（`icacls` 太吵，这里只依赖 DPAP
 from __future__ import annotations
 
 import base64
-import ctypes
 import json
 import os
-import sys
 import time
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, Optional
@@ -55,69 +57,24 @@ def credentials_path() -> str:
     return os.path.join(root, FILENAME)
 
 
-# ---------------------------------------------------------------- DPAPI
-
-class _Blob(ctypes.Structure):
-    _fields_ = [("cbData", ctypes.c_ulong), ("pbData", ctypes.POINTER(ctypes.c_char))]
-
-
-def _dpapi_available() -> bool:
-    return sys.platform == "win32"
-
-
-def _dpapi(protect: bool, data: bytes) -> bytes:
-    """`CryptProtectData` / `CryptUnprotectData`（**用户作用域**，不弹 UI）。
-
-    `CRYPTPROTECT_UI_FORBIDDEN` 是必须的：ECHO 是后台进程，
-    少了它某些情况下会弹一个**没人能点**的系统对话框把调用挂住。
-
-    `argtypes` 全部显式声明：x64 下不声明的话，结构体指针会被按 32 位截断，
-    表现为"偶尔解密失败"这种极难查的错。
-    """
-    from ctypes import wintypes
-    crypt32 = ctypes.WinDLL("crypt32", use_last_error=True)
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    crypt32.CryptProtectData.argtypes = [
-        ctypes.POINTER(_Blob), wintypes.LPCWSTR, ctypes.POINTER(_Blob),
-        ctypes.c_void_p, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(_Blob)]
-    crypt32.CryptProtectData.restype = wintypes.BOOL
-    crypt32.CryptUnprotectData.argtypes = [
-        ctypes.POINTER(_Blob), ctypes.POINTER(wintypes.LPWSTR), ctypes.POINTER(_Blob),
-        ctypes.c_void_p, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(_Blob)]
-    crypt32.CryptUnprotectData.restype = wintypes.BOOL
-    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
-
-    buf = ctypes.create_string_buffer(bytes(data), len(data))
-    blob_in = _Blob(len(data), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char)))
-    blob_out = _Blob()
-    UI_FORBIDDEN = 0x1
-    if protect:
-        ok = crypt32.CryptProtectData(ctypes.byref(blob_in), "ECHO backend credential",
-                                      None, None, None, UI_FORBIDDEN,
-                                      ctypes.byref(blob_out))
-    else:
-        descr = ctypes.c_wchar_p()
-        ok = crypt32.CryptUnprotectData(ctypes.byref(blob_in), ctypes.byref(descr),
-                                        None, None, None, UI_FORBIDDEN,
-                                        ctypes.byref(blob_out))
-    if not ok:
-        raise OSError(ctypes.get_last_error(), "DPAPI 调用失败")
-    try:
-        return ctypes.string_at(blob_out.pbData, blob_out.cbData)
-    finally:
-        kernel32.LocalFree(blob_out.pbData)
-
+# ---------------------------------------------------------------- 加密信封
 
 def _seal(plaintext: str) -> Dict[str, str]:
-    """secret → 落盘用的信封。Windows 上是 DPAPI 密文，别处是明文 + 0600。"""
+    """secret → 落盘用的信封。平台决定是 DPAPI 密文还是明文 + 0600。"""
+    from app import platform
     raw = plaintext.encode("utf-8")
-    if _dpapi_available():
-        return {"enc": _ENC_DPAPI,
-                "value": base64.b64encode(_dpapi(True, raw)).decode("ascii")}
-    return {"enc": _ENC_PLAIN, "value": base64.b64encode(raw).decode("ascii")}
+    blob = platform.protect_secret(raw)
+    kind = platform.protect_secret_kind()
+    # 平台声称"保护了"、字节却一模一样 → 那它其实没保护。**如实降级成 plain**：
+    # 信封上写着 dpapi 而盘上是明文，比不写更糟（读的人会以为它是安全的）。
+    if kind != _ENC_PLAIN and blob == raw:
+        kind = _ENC_PLAIN
+    return {"enc": kind, "value": base64.b64encode(blob).decode("ascii")}
 
 
 def _open(envelope: Any) -> str:
+    """解信封。**认不出/解不开都返回空串**，由 `load()` 统一当"没配对"。"""
+    from app import platform
     if not isinstance(envelope, dict):
         return ""
     enc = str(envelope.get("enc") or "")
@@ -126,13 +83,11 @@ def _open(envelope: Any) -> str:
     except Exception:
         return ""
     if enc == _ENC_DPAPI:
-        if not _dpapi_available():
-            # 把 Windows 上配的文件拷到了 Linux：**解不开就说解不开**，
-            # 不要退回明文路径去猜
-            return ""
         try:
-            return _dpapi(False, blob).decode("utf-8")
+            return platform.unprotect_secret(blob).decode("utf-8")
         except Exception:
+            # 把 Windows 上配的文件拷到 Linux（或反过来）：**解不开就说解不开**，
+            # 绝不退回明文路径去猜 —— 猜错的表现是"用着别人的身份"。
             return ""
     if enc == _ENC_PLAIN:
         try:
@@ -191,13 +146,9 @@ def save(creds: BackendCredentials) -> str:
 
 
 def _restrict(path: str) -> None:
-    """POSIX 上收紧到 0600。Windows 上靠 DPAPI（文件本身在用户目录内）。"""
-    if os.name == "nt":
-        return
-    try:
-        os.chmod(path, 0o600)
-    except Exception:
-        pass
+    """把权限收到"只有本用户能读"（平台各自的最强手段，见 `app/platform/`）。"""
+    from app import platform
+    platform.restrict_file(path)
 
 
 def load() -> Optional[BackendCredentials]:
