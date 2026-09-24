@@ -20,6 +20,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from server import __version__, engines
+from server import admin as admin_mod
 from server import auth as auth_mod
 from server import calls as calls_mod
 from server import errors as E
@@ -92,6 +93,13 @@ def create_app(cfg=None) -> FastAPI:
         call_log.start()
         app.state.echo = routes_mod.State(cfg, pool, sweeper, auth=auth_obj,
                                          call_log=call_log)
+        # 管理面（设计 §8.4）：**独立端口上的只读控制台**。等 state 造好再起 ——
+        # 它读的就是那份状态（池 / 配额账本 / metrics / 调用记录），两个 app 共用一份。
+        admin_server = None
+        try:
+            admin_server = admin_mod.start_admin_server(cfg, app.state.echo, log=log)
+        except Exception as e:
+            log.warning("管理面没起来（不影响能力面）：%s", e)
 
         if not bool(cfg.get("auth.enabled", False)) and not _is_loopback(cfg.get("server.listen", "")):
             log.warning("鉴权是关的，而监听地址不是回环 —— 任何能连到这个端口的人都能用你的 GPU。"
@@ -121,6 +129,8 @@ def create_app(cfg=None) -> FastAPI:
             auth_obj.watcher.stop()
             # 先停记录线程（它退出前会把剩下的写完），再关库 —— 反了就会丢最后一批
             call_log.stop()
+            if admin_server is not None:
+                admin_server.should_exit = True
             pool.shutdown()
             try:
                 store.close()
@@ -407,6 +417,44 @@ def _admin_cli(cfg, args) -> int:
             print("      ② 用量计数在**进程内**，所以多实例部署时各实例各算一份"
                   "（设计 §7.2 写明的取舍）。")
             return 0
+
+        # ---- 管理面账号（设计 §8.4）----
+        # 管理面**故意只读**，所以建账号 / 禁用 / 删除只在这里 —— 与别的写动作同一条出口。
+        if args.new_admin:
+            pwd = admin_mod.new_password()
+            store.upsert_admin(args.new_admin, admin_mod.hash_password(pwd))
+            store.audit("cli", "new-admin", args.new_admin)
+            print("已建（或重置）管理员 %s。**口令只出现这一次**：" % args.new_admin)
+            print("     %s" % pwd)
+            print("管理面板：http://%s/admin/ （要先在配置里设 server.admin_listen）"
+                  % (cfg.get("server.admin_listen", "") or "127.0.0.1:8901"))
+            return 0
+        if args.list_admins:
+            rows = store.admins()
+            if not rows:
+                print("（还没有管理员账号 —— 管理面登录会一直失败，用 --new-admin 建一个）")
+            for r in rows:
+                print("%-16s %-8s 建号 %-16s 最后登录 %s"
+                      % (r["username"], "已禁用" if r["disabled"] else "正常",
+                         _fmt_time(r["created_at"]), _fmt_time(r["last_login"])))
+            return 0
+        if args.disable_admin or args.enable_admin:
+            name = args.disable_admin or args.enable_admin
+            if store.admin(name) is None:
+                print("没有这个管理员：%s" % name)
+                return 1
+            store.set_admin_disabled(name, bool(args.disable_admin))
+            store.audit("cli", "disable-admin" if args.disable_admin else "enable-admin", name)
+            print("已%s管理员 %s。" % ("禁用" if args.disable_admin else "启用", name))
+            print("（禁用之后他手上的会话**下一个请求就失效** —— 管理面每请求都重读账号行。）")
+            return 0
+        if args.delete_admin:
+            if not store.delete_admin(args.delete_admin):
+                print("没有这个管理员：%s" % args.delete_admin)
+                return 1
+            store.audit("cli", "delete-admin", args.delete_admin)
+            print("已删除管理员 %s。" % args.delete_admin)
+            return 0
         if args.rotate_secret:
             grace = float(args.grace_hours or 0)
             cid = args.rotate_secret
@@ -484,6 +532,14 @@ def main(argv=None) -> int:
                     help="配合 --stats：看最近多少小时（默认 24；0 = 全部）")
     ap.add_argument("--list-calls", type=int, default=0, metavar="N",
                     help="看最近 N 条调用元数据（**只有元数据，没有内容**）")
+    # ---- 管理面（设计 §8.4）的账号：管理面自己**只读**，所以账号只能从这里建 ----
+    ap.add_argument("--new-admin", default="", metavar="NAME",
+                    help="建管理员账号（或重置其口令）；**口令只打印这一次**")
+    ap.add_argument("--list-admins", action="store_true", help="看有哪些管理员账号")
+    ap.add_argument("--disable-admin", default="", metavar="NAME",
+                    help="禁用一个管理员（他手上的会话下一个请求就失效）")
+    ap.add_argument("--enable-admin", default="", metavar="NAME", help="重新启用")
+    ap.add_argument("--delete-admin", default="", metavar="NAME", help="删掉一个管理员")
     args = ap.parse_args(argv)
 
     logging.basicConfig(level=getattr(logging, str(args.log_level).upper(), logging.INFO),
@@ -495,7 +551,8 @@ def main(argv=None) -> int:
     admin_actions = (args.new_client, args.new_pairing_code, args.list_clients,
                      args.list_codes, args.show_client, args.revoke, args.disable,
                      args.enable, args.set_scopes, args.rotate_secret, args.set_quota,
-                     args.stats, args.list_calls)
+                     args.stats, args.list_calls, args.new_admin, args.list_admins,
+                     args.disable_admin, args.enable_admin, args.delete_admin)
     if any(admin_actions):
         return _admin_cli(cfg, args)
 

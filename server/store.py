@@ -43,7 +43,9 @@ from typing import Any, Dict, List, Optional
 
 #: 设计 §8.5 的表白名单（**唯一**一份）。`CREATE TABLE` 只允许出现在这里。
 #: `calls` 是 2026-09-24 按设计加进来的（审计元数据，设计 §7.3 逐字定义了那十列）。
-TABLE_WHITELIST = ("clients", "pairing_codes", "calls")
+#: `admin_users` / `admin_audit` 是同一天做管理面时加的（设计 §8.4 那五个页签要一个
+#: 管理员账号体系；审计动作表本来就在白名单里）。
+TABLE_WHITELIST = ("clients", "pairing_codes", "calls", "admin_users", "admin_audit")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS clients (
@@ -97,6 +99,23 @@ CREATE TABLE IF NOT EXISTS calls (
 -- 两个索引对应两种真实查询：按时间倒着看最近（面板），按客户端+时间做汇总（统计）。
 CREATE INDEX IF NOT EXISTS idx_calls_ts ON calls(ts);
 CREATE INDEX IF NOT EXISTS idx_calls_client_ts ON calls(client_id, ts);
+-- 管理面的账号（设计 §8.4）。**只有哈希**，明文只出现一次（建账号时打印出来）。
+-- 它与管理动作的审计是两张表：一张是"谁能进来"，一张是"他做了什么"。
+CREATE TABLE IF NOT EXISTS admin_users (
+    username      TEXT PRIMARY KEY,
+    password_hash TEXT NOT NULL,
+    disabled      INTEGER NOT NULL DEFAULT 0,
+    created_at    REAL NOT NULL,
+    last_login    REAL NOT NULL DEFAULT 0
+);
+-- 管理动作的审计。**动作都是写动作**（只读的看不算动作），所以这张表很小。
+CREATE TABLE IF NOT EXISTS admin_audit (
+    ts     REAL NOT NULL,
+    admin  TEXT NOT NULL DEFAULT '',
+    action TEXT NOT NULL DEFAULT '',
+    target TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_admin_audit_ts ON admin_audit(ts);
 """
 
 #: `CREATE TABLE IF NOT EXISTS` 对**已经存在**的表不会补列 ——
@@ -406,6 +425,70 @@ class Store:
             row = self._db.execute("SELECT * FROM clients WHERE client_id=?",
                                    (client_id,)).fetchone()
         return dict(row) if row else None
+
+    # ---------------------------------------------------------------- 配对码
+
+    # ---------------------------------------------------------------- 管理面账号（§8.4）
+
+    def upsert_admin(self, username: str, password_hash: str) -> None:
+        """建账号 / 重置密码。**只存哈希**（明文只在生成时打印一次）。"""
+        now = time.time()
+        with self._lock:
+            self._db.execute(
+                "INSERT INTO admin_users (username, password_hash, disabled, created_at,"
+                " last_login) VALUES (?,?,0,?,0)"
+                " ON CONFLICT(username) DO UPDATE SET password_hash=excluded.password_hash",
+                (str(username or ""), str(password_hash or ""), now))
+            self._db.commit()
+
+    def admin(self, username: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self._db.execute("SELECT * FROM admin_users WHERE username=?",
+                                   (str(username or ""),)).fetchone()
+        return dict(row) if row else None
+
+    def admins(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT username, disabled, created_at, last_login FROM admin_users"
+                " ORDER BY username").fetchall()
+        return [dict(r) for r in rows]
+
+    def set_admin_disabled(self, username: str, disabled: bool) -> bool:
+        with self._lock:
+            cur = self._db.execute("UPDATE admin_users SET disabled=? WHERE username=?",
+                                   (1 if disabled else 0, str(username or "")))
+            self._db.commit()
+            return bool(cur.rowcount)
+
+    def delete_admin(self, username: str) -> bool:
+        with self._lock:
+            cur = self._db.execute("DELETE FROM admin_users WHERE username=?",
+                                   (str(username or ""),))
+            self._db.commit()
+            return bool(cur.rowcount)
+
+    def touch_admin_login(self, username: str) -> None:
+        with self._lock:
+            self._db.execute("UPDATE admin_users SET last_login=? WHERE username=?",
+                             (time.time(), str(username or "")))
+            self._db.commit()
+
+    def audit(self, admin: str, action: str, target: str = "") -> None:
+        """记一条管理动作。**只有元数据**：谁、做了什么、对谁 —— 没有内容。"""
+        with self._lock:
+            self._db.execute("INSERT INTO admin_audit (ts, admin, action, target)"
+                             " VALUES (?,?,?,?)",
+                             (time.time(), str(admin or ""), str(action or ""),
+                              str(target or "")))
+            self._db.commit()
+
+    def recent_audit(self, limit: int = 50) -> List[Dict[str, Any]]:
+        limit = max(1, min(500, int(limit or 50)))
+        with self._lock:
+            rows = self._db.execute("SELECT * FROM admin_audit ORDER BY ts DESC LIMIT ?",
+                                    (limit,)).fetchall()
+        return [dict(r) for r in rows]
 
     # ---------------------------------------------------------------- 配对码
 

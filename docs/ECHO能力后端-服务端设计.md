@@ -1307,17 +1307,34 @@ Windows 上至少要走 DPAPI（`CryptProtectData`）；这与"业务数据留�
 
 ### 8.4 管理面（Admin Console）
 
-> **实现状态（2026-09-24）：管理面网页还没做 —— `/admin/*` 一个路由都没有。**
-> 但**运维真正需要的动作已经齐了，在命令行里**：
-> `--new-client`（发一张带名字与 scope 的码）/ `--list-clients` / `--list-codes` /
-> `--show-client` / `--revoke` / `--disable` / `--enable` / `--set-scopes` /
-> `--rotate-secret`，见 `server/README.md`。
+> **实现状态（2026-09-24）：管理面已经落地，但刻意是「只读」的。**
+> `server.admin_listen` 一配就起（独立端口），五个页签都在；账号只能从命令行建：
+> `--new-admin`（口令只打印一次）/ `--list-admins` / `--disable-admin` /
+> `--enable-admin` / `--delete-admin`。
 >
-> **为什么先做命令行**：网页版要独立端口 + 管理员密码哈希（argon2id）+ 会话 +
-> 登录限速 + CSRF（见本章末尾"管理面自己的安全"），那是另一块工作；
-> 而那五个页签里**有三个依赖 `calls` / `calls_rollup`**（§8.5，属于 v2）——
-> 表还没建，页面就是空的。所以顺序是：**命令行先让运维能干活 → v2 建审计表与指标
-> → 再做网页**。把网页提前做，只会得到一个"模型状态查看器"。
+> **为什么刻意不做写动作**：那五个页签要回答的是"模型跑得怎么样、客户端有谁在连、
+> 谁调了什么" —— 全是**看**。而写动作（发码 / 撤销 / 禁用 / 改 scope / 换 secret / 配配额）
+> 命令行已经齐了，而且那条路**刻意不打 HTTP、直接开库**。要加写端点，先回答一个问题：
+> **它比"运维在那台机器上敲一条命令"多解决了什么？** 答不上来就别加 ——
+> 这正是"给管理动作开一条免鉴权的内部端点"最危险的开始。
+> 契约由 `IsolationTests.test_the_admin_api_has_no_write_endpoints` 钉着：
+> 真加了写端点，那条会红，加的人必须在提交里说明理由。
+>
+> | 项 | 做法 | 为什么 |
+> |---|---|---|
+> | 口令哈希 | **`hashlib.scrypt`**（stdlib） | 设计写的是 argon2id —— 那是更好的选择，但它要引 `argon2-cffi`，而**服务端镜像的依赖面**不值得为它长一条。这是**写明了的偏离**；要换的时候两个函数各改一行，旧哈希靠 `scrypt$` 前缀区分，可平滑迁移 |
+> | 会话 | **进程内**（`SessionStore`，8 小时） | 管理面本来就不该水平扩；"把会话写进库"要再加一张表（白名单要走评审），不值。代价：重启即全部登出 |
+> | CSRF | 双提交令牌，写请求必须带 `X-CSRF-Token` | 现在唯一的 POST 是登录（天然免 CSRF），但机制先立着 —— 加写动作时不会忘 |
+> | 登录防爆破 | 5 次失败 / 5 分钟退避 | 免凭据端点都要防爆破，与 `/v1/pair` 同一个理由 |
+> | 账号枚举 | **不区分**"没有这个用户"与"口令不对"：两种失败的响应体**逐字相同** | 分开说等于送一个枚举账号的接口。用例比的是**两个响应体相等**，不是"含某个词" |
+> | 禁用生效 | 每个请求重读账号行；被禁用/删掉的账号**手上会话立刻作废** | 不然"禁用"要等 8 小时会话到期才生效 |
+>
+> 「存了什么」页读的是**活着的库**（表名与列名当场从数据库读出来），
+> 所以"服务端不存内容"能当场核对。**"哪些列名算内容"这个判断留在测试里**
+> （`AuthSchemaTests.test_no_column_is_named_like_content`）——
+> 第一版我把它写进了服务端，立刻被 `test_no_business_words_in_source` 抓住：
+> 那个黑名单必然要**逐字列出那几个业务概念**，而**服务端源码里不许出现它们**。
+> 更细的一个坑：那条护栏**连注释一起扫** —— 我第二版在注释里写出那个词，照样红。
 >
 > 命令行那条路**刻意不打 HTTP**（直接开库）：给管理动作开一条免鉴权的内部端点，
 > 正是最容易变成漏洞的做法。代价要写在明处 ——
@@ -1706,6 +1723,7 @@ client_body_temp_path /var/echo/tmp/nginx;
 |---|---|---|
 | `server.id` | `echo-backend-1` | 出现在 `capabilities` 里，客户端用它区分后端 |
 | `server.listen` | `0.0.0.0:8900` | 不是回环 + 没开鉴权时，启动会**大声告警** |
+| `server.admin_listen` | 空（**管理面关着**） | 管理面的**独立**端口（§8.4）。空 = 不起；非回环时启动会告警 |
 | `server.instance_id` | `default` | 临时目录的命名空间，多实例互不清扫对方的残留 |
 | `server.state_root` | `{ECHO}/data/server-state` | ★ **耐久**状态（鉴权库）。**必须与 `tmp.root` 分开**，理由见 §9.3 |
 | `server.vram_budget_mb` | `0`（不限） | 超预算**拒绝**而不是 OOM，也绝不回退 CPU（§3.4） |
@@ -1911,7 +1929,16 @@ client_body_temp_path /var/echo/tmp/nginx;
 | 保留期到了才清；`0` = 不自动清 | ✅ | `CallLogTests.test_prune_now_honours_retention_days` / `test_retention_zero_means_never_prune` |
 | 写审计**失败不抛**（后台线程，不该拖垮请求） | ✅ | `CallsTableTests.test_insert_reports_failure_instead_of_raising` |
 | `--stats` / `--list-calls` 能回答"谁在用、错了多少、多少分钟" | ✅ | `CallsAdminTests` |
-| 管理面 / 审计表 / "存了什么"自证页（§8.4、§8.5） | ◐ `calls` 审计表**已落地**；管理面网页与 `calls_rollup` 还没做 |
+| 管理面：**每个数据端点都要登录**（没登录一律 401） | ✅ | `LoginTests.test_every_data_endpoint_requires_a_login` |
+| 管理面：**不区分**"没有这个用户"与"口令不对"（响应体逐字相同） | ✅ | `LoginTests.test_a_wrong_password_is_refused_without_saying_which_part_was_wrong` |
+| 管理面：登录防爆破（429） | ✅ | `LoginTests.test_brute_force_is_throttled` |
+| 管理面：禁用/删掉的账号**手上会话立刻作废** | ✅ | `SessionStoreTests.test_disabling_a_user_kills_his_sessions` |
+| 管理面：**没有写端点**（写动作走命令行） | ✅ | `IsolationTests.test_the_admin_api_has_no_write_endpoints` |
+| **两个 app 的路径不许交叉**（管理面无 `/v1`、能力面无 `/admin`） | ✅ | `IsolationTests` 两条 |
+| 能力面的客户端 JWT 在管理面上**认不到**（两套身份） | ✅ | `IsolationTests.test_a_capability_jwt_is_useless_on_the_admin_console` |
+| 「存了什么」页读的是**活着的库**（表/列当场读出来） | ✅ | `DataTests.test_inventory_lists_the_live_schema` |
+| 口令只存哈希，且**建号时打印的那个口令验证得过** | ✅ | `PasswordTests` / `AdminCliTests.test_new_admin_prints_the_password_once...` |
+| 管理面 / 审计表 / "存了什么"自证页（§8.4、§8.5） | ✅ **已落地**（只读；`calls_rollup` 仍未做） | — |
 
 > **为什么 §12 值得这么细。** 前面每一节的设计都有"如果没人看着就会退化"的地方：
 > 服务端会慢慢认识业务、临时文件会慢慢漏、GPU 会慢慢被 OOM 掉。
@@ -1927,7 +1954,7 @@ client_body_temp_path /var/echo/tmp/nginx;
 | **v1** | 单进程 / 单机；`EnginePool`（单飞 + 引用计数 + LRU + 显存预算）；`TempWorkspace`；三个能力端点；`/health` `/ready` `/capabilities`；**两级闸门 + 廉价预检** | §12 全部护栏测试绿；两个客户端并发不互相阻塞 | **✅ 已落地** |
 | **v1.5**（原 v2 的鉴权部分） | **配对码 → `client_id` + `secret` → 短期 JWT**；scopes；`token_version` 撤销（同进程立即、跨进程 ≤5 秒轮询）← **实际做在了这里，不是 v2** | §12.1 全绿；命令行能发码、撤销能生效 | **✅ 已落地** |
 | **v2** | 配额（日额度 / 音频分钟数，§7.2）✅ + **`calls` 审计表 + metrics ✅** + SSE 进度 + `calls_rollup` | 与客户端路由层的降级原因**逐条对齐**；断网/降级演练 | ◐ 配额与审计已落地（2026-09-24）；SSE / rollup 还没做 |
-| **v3** | 管理面（§8.4）+ 只读 rootfs 容器 + tmpfs + 反代配置 + 按模型分进程（按需）+ 多实例按能力拆分 | 容器冒烟；`/v1/health` 的临时目录统计长期归零 | ⏳ |
+| **v3** | 管理面（§8.4）✅ **只读版已落地 2026-09-24** + 只读 rootfs 容器 + tmpfs + 反代配置 + 按模型分进程（按需）+ 多实例按能力拆分 | 容器冒烟；`/v1/health` 的临时目录统计长期归零 | ◐ 只读管理面已落地；写动作**刻意**仍在命令行；容器加固还没做 |
 
 > **为什么鉴权提前到了 v1.5，而不是留在 v2：** 原计划把它和**配额**绑在一趟做。
 > 实际开工后发现两件事可以拆：JWT/scopes/撤销是**安全边界**（没有它，服务端一上网

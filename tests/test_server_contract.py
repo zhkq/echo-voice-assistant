@@ -1320,9 +1320,10 @@ class AuthSchemaTests(unittest.TestCase):
     def test_the_whitelist_here_matches_the_one_in_the_code(self):
         """代码里的白名单与设计 §8.5 必须一致（这里只钉前后两端不漂）。"""
         # `calls` 是 2026-09-24 按设计加进来的（审计**元数据**，设计 §7.3 逐字给了那十列）。
+        # `admin_users` / `admin_audit` 是同一天做管理面时加的（§8.4 要一套管理员账号体系）。
         # 加表要走评审 —— 这条断言就是那道门：白名单变了，这里必须跟着改一次。
         self.assertEqual(tuple(store_mod.TABLE_WHITELIST),
-                         ("clients", "pairing_codes", "calls"))
+                         ("clients", "pairing_codes", "calls", "admin_users", "admin_audit"))
 
 
 class AuthPairingTests(unittest.TestCase):

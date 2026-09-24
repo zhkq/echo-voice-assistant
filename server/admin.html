@@ -1,0 +1,277 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ECHO 能力后端 · 管理面</title>
+<style>
+  :root { --bg:#0f1115; --card:#171a21; --card2:#1e222b; --text:#e6e8ec;
+          --muted:#9aa3b2; --border:#2a2f3a; --green:#3fb950; --red:#f85149;
+          --yellow:#d29922; --accent:#388bfd; }
+  * { box-sizing:border-box; min-width:0; }
+  body { margin:0; background:var(--bg); color:var(--text);
+         font:14px/1.6 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif; }
+  header { display:flex; align-items:center; gap:12px; flex-wrap:wrap;
+           padding:10px 16px; border-bottom:1px solid var(--border); }
+  header .t { font-weight:600; }
+  header .sub { color:var(--muted); font-size:12px; }
+  header .spacer { flex:1; }
+  button { background:var(--card2); color:var(--text); border:1px solid var(--border);
+           border-radius:6px; padding:6px 12px; cursor:pointer; font-size:13px; }
+  button:hover { border-color:var(--accent); }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  main { padding:12px 16px 40px; max-width:1200px; margin:0 auto; }
+  .tabs { display:flex; gap:6px; flex-wrap:wrap; margin-bottom:12px; }
+  .tabs button.active { background:var(--accent); border-color:var(--accent); color:#fff; }
+  .card { background:var(--card); border:1px solid var(--border); border-radius:10px;
+          padding:12px 14px; margin-bottom:12px; min-width:0; }
+  .card h2 { margin:0 0 8px; font-size:14px; font-weight:600; }
+  .kv { display:flex; gap:18px; flex-wrap:wrap; }
+  .kv div { min-width:0; }
+  .kv b { display:block; font-size:18px; }
+  .kv span { color:var(--muted); font-size:12px; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th,td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--border); }
+  th { color:var(--muted); font-weight:500; }
+  code { background:var(--bg); border:1px solid var(--border); border-radius:4px;
+         padding:1px 5px; font-size:12px; }
+  .muted { color:var(--muted); }
+  .badge { padding:1px 8px; border-radius:10px; font-size:12px;
+           border:1px solid var(--border); }
+  .on { color:var(--green); border-color:var(--green); }
+  .off { color:var(--red); border-color:var(--red); }
+  .idle { color:var(--yellow); border-color:var(--yellow); }
+  #login { max-width:340px; margin:12vh auto; }
+  #login input { width:100%; margin:6px 0; padding:8px 10px; border-radius:6px;
+                 border:1px solid var(--border); background:var(--card2); color:var(--text); }
+  #err { color:var(--red); font-size:13px; min-height:20px; }
+  .hidden { display:none !important; }
+</style>
+</head>
+<body>
+<div id="login">
+  <div class="card">
+    <h2>ECHO 能力后端 · 管理面</h2>
+    <div class="muted" style="font-size:12px">
+      只读控制台：模型、客户端、调用与「存了什么」。<b>写动作走命令行</b>（见 server/README.md）。
+    </div>
+    <input id="u" placeholder="管理员用户名" autocomplete="username">
+    <input id="p" type="password" placeholder="口令" autocomplete="current-password">
+    <div style="display:flex;gap:8px;align-items:center">
+      <button class="primary" id="btnLogin">登录</button>
+      <span id="err"></span>
+    </div>
+  </div>
+</div>
+
+<div id="app" class="hidden">
+  <header>
+    <span class="t">ECHO 能力后端</span>
+    <span class="sub" id="hdr"></span>
+    <span class="spacer"></span>
+    <span class="sub" id="who"></span>
+    <button id="btnReload">刷新</button>
+    <button id="btnLogout">登出</button>
+  </header>
+  <main>
+    <div class="tabs">
+      <button data-tab="overview" class="active">概览</button>
+      <button data-tab="models">模型</button>
+      <button data-tab="clients">客户端</button>
+      <button data-tab="calls">调用</button>
+      <button data-tab="inventory">存了什么</button>
+    </div>
+    <div id="view"></div>
+  </main>
+</div>
+
+<script>
+const $ = (s) => document.querySelector(s);
+let CSRF = "";
+
+async function api(path, opts = {}) {
+  const res = await fetch(path, { credentials: "same-origin", ...opts });
+  if (res.status === 401) { showLogin(); throw new Error("需要登录"); }
+  if (!res.ok) throw new Error(`HTTP ${res.status}: ${await res.text()}`);
+  return res.json();
+}
+
+function esc(s) {
+  return String(s == null ? "" : s).replace(/[&<>"']/g,
+    (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+const hm = (sec) => {
+  sec = Number(sec || 0);
+  const d = Math.floor(sec / 86400), h = Math.floor((sec % 86400) / 3600),
+        m = Math.floor((sec % 3600) / 60);
+  return (d ? d + "d " : "") + h + "h " + m + "m";
+};
+const ago = (ts) => {
+  ts = Number(ts || 0);
+  if (!ts) return "—";
+  const s = Math.max(0, Math.floor(Date.now() / 1000 - ts));
+  return s < 60 ? s + " 秒前" : (s < 3600 ? Math.floor(s / 60) + " 分钟前" : hm(s) + " 前");
+};
+const mb = (n) => (Number(n || 0) / 1024).toFixed(1) + " GB";
+
+function showLogin() {
+  $("#login").classList.remove("hidden");
+  $("#app").classList.add("hidden");
+}
+function showApp() {
+  $("#login").classList.add("hidden");
+  $("#app").classList.remove("hidden");
+}
+
+$("#btnLogin").onclick = async () => {
+  $("#err").textContent = "";
+  try {
+    const r = await api("/admin/api/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username: $("#u").value, password: $("#p").value }),
+    });
+    CSRF = r.csrf || "";
+    showApp();
+    await boot();
+  } catch (e) { $("#err").textContent = e.message; }
+};
+$("#p").addEventListener("keydown", (e) => { if (e.key === "Enter") $("#btnLogin").click(); });
+
+$("#btnLogout").onclick = async () => {
+  try {
+    await api("/admin/api/logout", { method: "POST", headers: { "X-CSRF-Token": CSRF } });
+  } catch (e) { /* 会话可能已经过期，照样回登录页 */ }
+  CSRF = "";
+  showLogin();
+};
+$("#btnReload").onclick = () => render();
+
+document.querySelectorAll(".tabs button").forEach((b) => {
+  b.onclick = () => {
+    document.querySelectorAll(".tabs button").forEach((x) => x.classList.remove("active"));
+    b.classList.add("active");
+    render();
+  };
+});
+
+async function boot() {
+  try {
+    const me = await api("/admin/api/me");
+    CSRF = me.csrf || CSRF;
+    $("#who").textContent = "管理员：" + me.username + " · 会话 " + me.sessions + " 个";
+    showApp();
+    await render();
+  } catch (e) { showLogin(); }
+}
+
+async function render() {
+  const tab = (document.querySelector(".tabs button.active") || {}).dataset?.tab || "overview";
+  const v = $("#view");
+  try {
+    if (tab === "overview") v.innerHTML = await viewOverview();
+    else if (tab === "models") v.innerHTML = await viewModels();
+    else if (tab === "clients") v.innerHTML = await viewClients();
+    else if (tab === "calls") v.innerHTML = await viewCalls();
+    else v.innerHTML = await viewInventory();
+  } catch (e) {
+    v.innerHTML = `<div class="card"><h2>读不到</h2><div class="muted">${esc(e.message)}</div></div>`;
+  }
+}
+
+async function viewOverview() {
+  const d = await api("/admin/api/overview");
+  $("#hdr").textContent = `${d.server.id} · v${d.server.version} · 运行 ${hm(d.server.uptimeSeconds)}`
+    + (d.server.tls ? " · https" : " · http");
+  const m = d.metrics, q = d.quota;
+  const used = Object.values(q.clients || {}).reduce((a, b) => a + Number(b || 0), 0);
+  const okRate = m.totalCalls ? (100 * (m.totalCalls - m.totalErrors) / m.totalCalls).toFixed(1) : "—";
+  const errs = Object.entries(m.errorCodes || {}).map(([k, n]) => `${k}×${n}`).join("、") || "无";
+  return `<div class="card"><h2>概览</h2>
+    <div class="kv">
+      <div><b>${d.busy.active} / ${d.busy.maxConcurrent}</b><span>当前并发（每客户端上限 ${d.busy.perClientConcurrent}）</span></div>
+      <div><b>${m.totalCalls}</b><span>累计调用（本次进程）</span></div>
+      <div><b>${okRate}%</b><span>成功率</span></div>
+      <div><b>${used.toFixed(1)} 分钟</b><span>今日音频（各客户端合计）</span></div>
+      <div><b>${d.sessions}</b><span>管理面在线会话</span></div>
+      <div><b>${Object.keys(q.clients || {}).length}</b><span>今日用过的客户端</span></div>
+    </div>
+    <div style="margin-top:8px" class="muted">错误码：${esc(errs)}</div>
+    <div class="muted">显存：${esc(JSON.stringify(d.vram))} · 调用记录队列：排队 ${d.calls.queued ?? 0}
+      · 丢弃 ${d.calls.dropped ?? 0}（丢弃是"审计写不进去"，不是请求失败）</div>
+  </div>
+  <div class="card"><h2>各端点</h2>${table(
+    ["端点", "调用", "失败", "音频分钟", "最近耗时", "最慢"],
+    Object.entries(m.endpoints || {}).map(([k, r]) => [k, r.calls, r.errors,
+      (Number(r.audioSeconds || 0) / 60).toFixed(2), r.lastMs + " ms", r.maxMs + " ms"]))}</div>`;
+}
+
+async function viewModels() {
+  const d = await api("/admin/api/models");
+  return `<div class="card"><h2>模型</h2>${table(
+    ["模型", "槽", "状态", "常驻", "估显存", "并发", "向量空间"],
+    d.models.map((x) => [x.id, x.slot || "—", x.state, x.resident ? "是" : "否",
+      mb(x.estVramMb), x.maxConcurrency, x.vectorSpaceId || "—"]))}
+    <div class="muted" style="margin-top:8px">显存：${esc(JSON.stringify(d.vram))}。
+      加载/卸载是能力面自己的状态机（按需 + LRU），管理面只读。</div></div>`;
+}
+
+async function viewClients() {
+  const d = await api("/admin/api/clients");
+  return `<div class="card"><h2>客户端（最近 24 小时：${d.totals.calls} 次调用，失败 ${d.totals.errors}）</h2>
+  ${table(["客户端", "名字", "状态", "scopes", "最后活跃", "今日调用", "失败", "今日音频", "日配额"],
+    d.clients.map((c) => [c.clientId, c.name || "—",
+      c.disabled ? '<span class="badge off">已禁用</span>' : '<span class="badge on">正常</span>',
+      c.scopes || "(不限)", ago(c.lastSeen), c.calls, c.errors,
+      c.audioMinutes + " min", c.dailyAudioMinutes ? c.dailyAudioMinutes + " min/天" : "全局默认"]))}
+  <div class="muted" style="margin-top:8px">写动作（撤销 / 禁用 / 改 scope / 换 secret / 改配额）
+    <b>故意不在这里</b>：它们在命令行里，而且那条路直接开库、不多开一条 HTTP 入口。</div></div>`;
+}
+
+async function viewCalls() {
+  const d = await api("/admin/api/calls");
+  const groups = (d.aggregate && d.aggregate.groups) || [];
+  return `<div class="card"><h2>按客户端 × 端点（最近 24 小时）</h2>${table(
+    ["客户端", "端点", "调用", "失败", "音频分钟", "平均", "p95", "最慢"],
+    groups.map((g) => [g.client_id || "(无)", g.endpoint, g.calls, g.errors,
+      (Number(g.audio_seconds || 0) / 60).toFixed(2), Math.round(g.avg_ms || 0) + " ms",
+      (g.p95_ms || 0) + " ms", (g.max_ms || 0) + " ms"]))}</div>
+  <div class="card"><h2>最近 ${d.recent.length} 条</h2>${table(
+    ["时间", "客户端", "端点", "模型", "音频", "耗时", "状态", "错误码"],
+    d.recent.map((r) => [new Date(Number(r.ts) * 1000).toLocaleString(), r.client_id,
+      r.endpoint, r.model_id || "—", Number(r.audio_seconds || 0).toFixed(1) + "s",
+      r.duration_ms + " ms", r.status, r.error_code || "—"]))}
+  <div class="muted" style="margin-top:8px">这张表里**只有元数据** —— 没有音频、文本、嵌入、说话人数。</div></div>`;
+}
+
+async function viewInventory() {
+  const d = await api("/admin/api/inventory");
+  const rows = Object.entries(d.tables).map(([t, cols]) =>
+    [t, cols.length, cols.join(", "), d.whitelist.includes(t) ? "在白名单" : "**不在白名单**"]);
+  return `<div class="card"><h2>存了什么</h2>
+    <div>${esc(d.statement)}</div>
+    <div class="muted" style="margin-top:6px">下面这张表读的是<b>活着的库</b>，不是文档：
+      表名与列名都是当场从数据库读出来的。命中"内容黑名单"的列：<b>${d.contentColumns.length ? esc(d.contentColumns.join("、")) : "0 个"}</b>。</div>
+  </div>
+  <div class="card"><h2>表与列（实际状态）</h2>${table(["表", "列数", "列", "白名单"], rows)}
+    <div class="muted" style="margin-top:8px">两个目录：临时 <code>${esc(d.tmpRoot || "(默认)")}</code>
+      （可以被清理器删、可以挂 tmpfs）；耐久 <code>${esc(d.stateRoot || "(默认)")}</code>。
+      <b>两种相反的保留策略，故意分开</b>。</div></div>
+  <div class="card"><h2>最近的管理动作</h2>${table(
+    ["时间", "管理员", "动作", "对象"],
+    d.recentAudit.map((a) => [new Date(Number(a.ts) * 1000).toLocaleString(), a.admin,
+      a.action, a.target || "—"]))}</div>`;
+}
+
+function table(head, rows) {
+  if (!rows.length) return `<div class="muted">（没有数据）</div>`;
+  return `<table><thead><tr>${head.map((h) => `<th>${esc(h)}</th>`).join("")}</tr></thead>
+    <tbody>${rows.map((r) => `<tr>${r.map((c) =>
+      `<td>${typeof c === "string" && c.startsWith("<span") ? c : esc(c)}</td>`).join("")}</tr>`).join("")}
+    </tbody></table>`;
+}
+
+boot();
+</script>
+</body>
+</html>
