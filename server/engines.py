@@ -270,16 +270,23 @@ def default_specs() -> List[ModelSpec]:
     "服务端总通道 2" 这个数压不压得住。
 
     `vectorSpaceId` 只有产出向量的两个模型有，而且**必须相同**（见 `_EmbedEngine`）。
+
+    **没有"短档小模型"**（2026-09-24 定，见设计 §14-2）。原方案里
+    `asr-short`（SenseVoice）常驻给语音指令增强用，但：
+    ① v1 没有配额机制，所以"默认不对外"这句话没有执行者；
+    ② 本实现的长档走 qwen3asr，**没有任何内部调用方**用它 ——
+       于是它"又占着显存、又对外开着"，与"v1 先不开"的建议正好相反。
+    所以 v1 干脆不放它：短请求（几秒音频）由 `asr-long` 的
+    `supports: [asr.text]` 兜住 —— 慢一点但结果正确。
+    真要做指令增强时，把 asr-short 连同**配额机制**一起加回来。
     """
     return [
-        # 短音频（语音指令增强）：常驻，冷启动付一次，之后每次 < 300 ms
-        ModelSpec(id="asr-short", slot="asr.text", impl="sensevoice", resident=True,
-                  max_concurrency=2, est_vram_mb=1800,
-                  model_version="sensevoice-small"),
-        # 长音频（会议分段）：按需 + LRU；它**同时**给文本与句级时间戳
+        # 长音频：按需 + LRU；它**同时**给文本与句级时间戳，
+        # 所以 `variant=short`（几秒音频）也落在它身上，只是慢一点。
         ModelSpec(id="asr-long", slot="asr.long", impl="qwen3asr", resident=False,
                   max_concurrency=1, est_vram_mb=3900,
-                  model_version="qwen3-asr-0.6b", supports=("asr.text", "asr.timestamps")),
+                  model_version="qwen3-asr-0.6b",
+                  supports=("asr.text", "asr.timestamps")),
         # 说话人分离：**不是线程安全的**，所以并发只能 1
         ModelSpec(id="diarize", slot="diarize.turns", impl="pyannote", resident=False,
                   max_concurrency=1, est_vram_mb=2600,

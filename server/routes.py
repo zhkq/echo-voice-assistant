@@ -47,9 +47,7 @@ class Admission:
     @contextmanager
     def hold(self, client_id: str):
         with self._lock:
-            if self._per.get(client_id, 0) >= self.per_client:
-                # 先查客户端自己：这条**重试没用**，所以给 409 而不是 503
-                raise errors.client_busy()
+            self._check_locked(client_id)
             self._per[client_id] = self._per.get(client_id, 0) + 1
         if not self._sem.acquire(blocking=False):
             with self._lock:
@@ -64,6 +62,36 @@ class Admission:
                 self._active = max(0, self._active - 1)
                 self._per[client_id] = max(0, self._per.get(client_id, 1) - 1)
             self._sem.release()
+
+    def _check_locked(self, client_id: str) -> None:
+        """**只判、不占**。必须在持 `_lock` 时调用。
+
+        用自己维护的 `_active` 而不是去读 `BoundedSemaphore._value` ——
+        后者是 CPython 的私有实现细节，不该被我们依赖。
+        `_active` 在拿到信号量之后、释放信号量之前于锁内加减，
+        所以在任何一个静止点上它就是"此刻占着几个通道"。
+        """
+        if self._per.get(client_id, 0) >= self.per_client:
+            # 先查客户端自己：这条**重试没用**，所以给 409 而不是 503
+            raise errors.client_busy()
+        if self._active >= self.max_concurrent:
+            raise errors.server_busy(self.retry_after)
+
+    def precheck(self, client_id: str) -> None:
+        """收音频**之前**的便宜预检：满了就立刻拒，一个字节都不读。
+
+        为什么要有它：真正的槽位（`hold`）只该在**推理**前后持有 —— 通道是给 GPU 的，
+        不是给网络的，让一个慢上传占着通道是错的。但这样一来，"忙"的判定就发生在
+        **上传完成之后**，于是一个客户端能同时开很多条上传、**每条最多 64 MB 先落盘**，
+        然后才被 `409` 顶回来：`tmp` 的容量上限能兜住盘，但那是一次真实的写放大，
+        而且与"满了立刻告诉客户端系统忙、重试由客户端负责"的原意不符。
+
+        所以这里做一次**无副作用的预检**：提前把"系统忙"说出去。
+        它是**尽力而为**的 —— 预检通过之后 `hold` 仍可能失败（别人刚抢了通道），
+        那条路径照旧按 `client_busy` / `server_busy` 拒。**权威判定始终在 `hold`。**
+        """
+        with self._lock:
+            self._check_locked(client_id)
 
     def snapshot(self) -> dict:
         with self._lock:
@@ -210,8 +238,10 @@ async def asr(request: Request, variant: str = "long", timestamps: int = 0,
               lang: str = "auto", model: str = ""):
     """音频 → 文本（可选句级时间轴）。
 
-    `variant`：`short`（快、常驻）/ `long`（准、按需）。两个都是**质量与延迟**的说法，
-    不含任何业务含义 —— 服务端不认识"会议""指令"这些概念。
+    `variant`：`short`（几秒音频，快）/ `long`（长音频，准）。两个都是**质量与延迟**的
+    说法，不含任何业务含义 —— 服务端不认识"会议""指令"这些概念。
+    v1 里两者常常落到**同一个**模型上（长档那个声明了 `supports: [asr.text]`），
+    因为出厂清单不再放常驻的小模型（见 `engines.default_specs` 的说明）。
     """
     st = _st(request)
     cfg = st.cfg
@@ -226,6 +256,9 @@ async def asr(request: Request, variant: str = "long", timestamps: int = 0,
     model_id = st.pool.pick_for_slot(slot, model)
     spec = st.pool.spec(model_id)
 
+    # **先判忙，再读 body**（同样是"先挑模型、再动字节"的顺序）：
+    # 忙的时候一个字节都不收，见 `Admission.precheck`。
+    st.admission.precheck(cid)
     audio_mod.check_declared_size(request, cfg)
     with tmp.TempWorkspace(cfg.tmp_root) as ws:
         src, ctype = await audio_mod.receive(request, ws, cfg)
@@ -256,6 +289,7 @@ async def diarize(request: Request, mode: str = "segment", maxSpeakers: int = 0,
 
     model_id = st.pool.pick_for_slot("diarize.turns", model)
     spec = st.pool.spec(model_id)
+    st.admission.precheck(cid)                 # 先判忙，再读 body
     audio_mod.check_declared_size(request, cfg)
     with tmp.TempWorkspace(cfg.tmp_root) as ws:
         src, ctype = await audio_mod.receive(request, ws, cfg)
@@ -296,6 +330,7 @@ async def speaker_embed(request: Request, count: int = 1, model: str = ""):
     cid = client_of(request)
     model_id = st.pool.pick_for_slot("speaker.embed", model)
     spec = st.pool.spec(model_id)
+    st.admission.precheck(cid)                 # 先判忙，再读 body
     audio_mod.check_declared_size(request, cfg)
     with tmp.TempWorkspace(cfg.tmp_root) as ws:
         src, ctype = await audio_mod.receive(request, ws, cfg)

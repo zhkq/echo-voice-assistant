@@ -358,9 +358,14 @@ class EnginePool:
 
 | 面板 | 含义 | 服务端对应 |
 |---|---|---|
-| 🔨 **命令转写引擎（常驻）** · `sensevoice` · `cuda:0` · `在线` · `15.2s` | 常驻引擎 + 设备 + 状态机 + 加载耗时 | `specs[asr-short]`：`resident: true` |
+| 🔨 **命令转写引擎（常驻）** · `sensevoice` · `cuda:0` · `在线` · `15.2s` | 常驻引擎 + 设备 + 状态机 + 加载耗时 | **服务端 v1 没有这张卡** —— 出厂清单不放常驻模型（§14-2），短请求由长档那个模型兜住 |
 | 📄 **会议转写引擎（按需）** · `qwen3asr` · `空闲` | 按需引擎，可卸载 | `specs[asr-long]`：`resident: false` |
 | 引擎下拉 + 启动/停止 按钮 | 选实现 + 显式生命周期控制 | `specs[].impl` + `pool.acquire/unload` |
+
+> **"常驻卡"这一格 v1 是空的，这是刻意的。** 客户端面板上那两张卡是**客户端自己的**引擎
+> （本机跑 sherpa / qwen3asr）。服务端不需要照抄这个形状：它的出厂清单三个模型**全是按需**
+> ——第一次请求各付一次加载，之后不重复付。等真做指令增强时，`asr-short` 会带着配额机制
+> 一起回到服务端，那时这张卡才有对应的格子。别为了"对齐表格"把常驻模型加回来。
 
 **这张卡片上的每一个元素都是 `EnginePool` 需要的**：常驻/按需、状态（在线/空闲/模型加载）、
 加载耗时、当前实现、显式启停。所以：
@@ -610,10 +615,16 @@ class TempWorkspace:
 | | `short` | `long` |
 |---|---|---|
 | 用途 | 指令增强（几秒音频） | 会议分段（10 分钟） |
-| 模型 | 小模型（SenseVoice） | 大模型（Qwen3-ASR） |
-| 常驻 | **是**（冷启动付一次） | 否（按需 + LRU） |
+| 目标模型 | 小模型（SenseVoice） | 大模型（Qwen3-ASR） |
+| 常驻 | 原设计是；**v1 没有**（§14-2） | 否（按需 + LRU） |
 | 时间戳 | 通常无 | 有（可选 ForcedAligner） |
 | 延迟目标 | < 300 ms | 秒级到几十秒 |
+
+> **v1 的实现现状（2026-09-24 拍板，§14-2）：两个 variant 目前落到同一个模型上。**
+> 出厂清单里只有 `asr-long`（`supports: [asr.text, asr.timestamps]`），
+> 所以 `variant=short` 是**用大模型跑几秒音频** —— 比小模型慢，但结果正确，
+> 客户端不需要为此写分支。`variant` 这个参数仍然保留：它是**质量与延迟的档位**，
+> 换实现（比如以后加回小模型、或换成别的后端）时协议不用改。
 
 > **为什么第二个值叫 `long` 而不是 `meeting`**（2026-09-24 定）
 >
@@ -1392,22 +1403,19 @@ server:
 models:
   root: /opt/echo/models
   vram_budget_mb: 20000
-  resident: [speaker-embed, asr-short]
+  # 注意：**没有 `resident:` 这个顶层键** —— 常驻与否是**每个 spec 自己的**
+  # `resident: true/false`（代码只读那一处；写了顶层键也不会有人理它）。
+  # 2026-09-24 拍板：出厂清单一个都不常驻（§14-2），所以下面全是 false。
   specs:
     # ── 与现网一致：沿用已在实机验证效果的两个引擎，服务端不要换 ──
-    # 对应面板「命令转写引擎（常驻）」与「会议转写引擎（按需）」两张卡。
-    - id: asr-short                    # 面板：命令转写引擎（常驻）
-      slot: asr.text
-      impl: sensevoice                 # funasr SenseVoiceSmall
-      resident: true                   # 常驻：实测加载 ~15 s，冷启动付一次
-      max_concurrency: 2
-      device: cuda:0
-    - id: asr-long                     # 面板：会议转写引擎（按需）
+    - id: asr-long                     # 长音频（会议分段）：按需 + LRU
       slot: asr.long
       supports: [asr.text, asr.timestamps]   # 一个模型同时给文本与句级时间戳
       impl: qwen3asr                   # Qwen3-ASR-0.6B (+ ForcedAligner)
       resident: false                  # 按需 + LRU：显存约 4 GB
       max_concurrency: 1
+      # v1 **不放** asr-short（SenseVoice 常驻小模型）：短请求由上面那个
+      # `supports: [asr.text]` 兜住 —— 慢一点但结果正确。见 §14-2。
     - id: pyannote-3.1
       slot: diarize.turns
       max_concurrency: 1            # 非线程安全
@@ -1473,6 +1481,12 @@ tmp:
 | `409 client_busy` 与 `503 server_busy` 是两回事，不混用 | ✅ | `ErrorContractTests.test_client_busy_and_server_busy_are_different` |
 | 两级闸门：每客户端 1 → `409`；全局 2 满 → `503` + `Retry-After` | ✅ | `AdmissionTests` + `AdmissionWiringTests` |
 | `queue_max=0`：满了**立即拒绝**，不留堆积请求 | ✅ | `AdmissionTests` |
+| **预检在读 body 之前跑**：忙的时候一个字节都不收（证据是顺序：声报超限的 `Content-Length` 得到 `409` 而非 `413`） | ✅ | `AdmissionWiringTests.test_precheck_refuses_before_a_single_byte_is_read` |
+| 预检**只判不占**，不许变成第二个真相来源（权威判定始终是 `hold`） | ✅ | `AdmissionWiringTests.test_precheck_is_advisory_so_hold_is_still_authoritative` |
+| 被预检挡回来的请求不留临时文件 | ✅ | `AdmissionWiringTests.test_precheck_does_not_write_any_temp_file` |
+| 出厂清单里**没有常驻的 ASR 模型**（v1 无配额，常驻＝白占显存且对外开着，§14-2） | ✅ | `DefaultSpecsTests.test_no_resident_asr_model` |
+| 去掉 asr-short **不等于**关掉短档：`asr.text` 仍有人接 | ✅ | `DefaultSpecsTests.test_the_short_slot_is_still_served` |
+| 出厂清单里只有一个 ASR 模型，它同时给文本与时间戳 | ✅ | `DefaultSpecsTests.test_one_model_serves_both_text_and_timestamps` |
 | 异常路径也要**还回槽位**（一次失败不许把服务端锁死） | ✅ | `AdmissionTests.test_slots_are_released_on_exception` |
 | 鉴权关 = 所有人 `anonymous`（谁都能用 GPU，所以启动要吼一声） | ✅ | `AdmissionWiringTests.test_auth_off_means_everyone_is_anonymous` |
 | 一次 `load()` 不许污染全局默认配置 | ✅ | `test_config_is_not_shared_between_loads` |
@@ -1522,7 +1536,7 @@ tmp:
 
 ---
 
-## 14. 待拍板
+## 14. 已拍板 / 待拍板
 
 1. **服务端跑不跑 GPU 的 pyannote 4.x？** 若跑，服务端就有两套分离实现（pyannote 与
    sherpa-onnx ONNX），`vectorSpaceId` 会有两个。**建议：服务端只提供一套并明确声明它的
@@ -1530,28 +1544,39 @@ tmp:
 2. **`asr.short`（指令增强）要不要开？** 它会给服务端引入高频小请求。开了就要独立队列 +
    独立配额（前置文档已设计），不开则路由表里少一行。**建议 v1 不开**，先只服务会议链路。
 
-   > **v1 现状 ≠ 这条建议（2026-09-24，需要拍板）。** v1 骨架里**没有配额机制**
-   > （配额随 v2 的 JWT/scopes 一起做），所以"默认配额为 0"这句话今天是**没有执行者**的：
-   > `variant=short` 现在**是通的**，由常驻的 `asr-short`（SenseVoice）服务。
+   > **已拍板（2026-09-24）：v1 就从出厂清单去掉 `asr-short`。**
+   > 起因是核验时发现"建议 v1 不开"这句话**没有执行者**：v1 没有配额机制（配额随 v2 的
+   > JWT/scopes 一起做），所以"默认配额为 0"落不了地；而 `asr-short` 的 `resident: true`
+   > 在本实现里是**纯开销** —— 文档给的理由是"会议档也用 SenseVoice"，但 `asr-long` 走的是
+   > qwen3asr，**没有任何内部调用方**。于是它"又占着显存、又对外开着"，与建议正好相反。
    >
-   > 而且 `asr-short` 的 `resident: true` 在当前实现里是**纯开销** —— 文档给的理由是
-   > "会议档也用 SenseVoice"，但本实现的 `asr-long` 走的是 qwen3asr，没有任何内部调用方。
-   > 于是现在这一档"又占着显存、又对外开着"，与建议正好相反。
-   >
-   > 三条路，选一条（**建议第 3 条**，它最小且不会说谎）：
-   > 1. 真的实现配额（`specs[].quota` + 准入时校验）→ 最贴原设计，但属于 v2 工作量；
-   > 2. 给 spec 加 `served: false`（模型留着但不对外路由）→ 语义清楚，但是**新机制**，
-   >    不是文档里写的那个；
-   > 3. **v1 就把 `asr-short` 从出厂清单里去掉**，`variant=short` 让 `asr-long` 通过
-   >    `supports: [asr.text, ...]` 兜住（短请求只是"用大模型跑几秒音频"，慢一点但正确）。
-   >    等真要做指令增强时再把小模型加回来 —— 那时配额机制也一起有了。
+   > `engines.default_specs()` 现在只有三个模型：`asr-long`
+   > （`supports: [asr.text, asr.timestamps]`）、`diarize`、`speaker-embed`。于是：
+   > - `variant=short`（几秒音频）**照样能用**，落在 `asr-long` 上 —— 慢一点，但
+   >   "拿到文本"这件事没有变，客户端不需要为此写分支；
+   > - 出厂清单里**没有常驻模型**了（三个都是按需 + LRU）。第一次请求各自付一次加载，
+   >   之后不重复付（显存预算 20 GB 装得下 3900 + 2600 MB，不会被 LRU 挤掉）；
+   > - 想做指令增强时，把 `asr-short` 连同**配额机制**一起加回来 ——
+   >   那时"默认不对外"才真正有执行者。契约由
+   >   `SlotRoutingTests.test_short_variant_is_not_a_phantom_slot` 与
+   >   `DefaultSpecsTests` 钉住（后者断言出厂清单里没有常驻的 ASR 模型）。
 3. **TLS 用什么形态？** mTLS（内网证书，需 PKI）还是自签 + `client_id:secret`→JWT
    （自包含，无外部依赖）。**建议 v1 用后者**，把 mTLS 留给单位 PKI 就绪之后。
-4. **两级闸门在收完音频之后才判"忙"，是不是太晚？**（2026-09-24 实现时发现）
-   现在的顺序是 `收音频 → 转 wav → 抢闸门 → 推理`：忙的判定发生在**上传完成之后**。
-   好处是"慢上传不占着 GPU 通道"（通道是给推理的，不是给网络的）；
-   坏处是一个客户端可以同时开很多条上传，**每条都把最多 64 MB 落盘**，
-   然后才被 `409 client_busy` 顶回来 —— `tmp` 的容量上限会兜住盘，但那是一次真实的写放大。
-   **建议：在收音频之前先做一次"便宜的预检"**（这个 client 或全局是否已经满了 → 立刻拒，
-   不读 body），真正的槽位仍然只在推理前后持有。这样"满了立刻说系统忙"（用户的原始要求）
-   才在**字节层面**也成立，同时不改变"通道只归推理"的语义。
+4. ~~**两级闸门在收完音频之后才判"忙"，是不是太晚？**~~ **已拍板并实现（2026-09-24）：
+   加一次便宜的预检。**
+
+   现在三个能力端点（`/v1/asr`、`/v1/diarize`、`/v1/speaker/embed`）的顺序是
+   `认客户端 → 挑模型 → 预检忙 → 查声明大小 → 收音频 → 转 wav → 抢闸门 → 推理`。
+   `Admission.precheck(cid)` 在读 body **之前**跑：满了就立刻拒，**一个字节都不收**。
+   真正的槽位仍然只在推理前后持有 —— 通道是给 GPU 的，不是给网络的。
+
+   `precheck` **只判不占**，所以它不会变成第二个真相来源：**权威判定始终是 `hold`**。
+   预检通过之后 `hold` 仍可能失败（通道刚被别人抢走），那条路径照旧 409/503。
+
+   为什么值得单独做：不做的话，一个客户端能同时开很多条上传、**每条最多 64 MB 先落盘**，
+   然后才被 `409` 顶回来。`tmp` 的容量上限能兜住盘，但那是一次真实的写放大，
+   而且与"满了立刻告诉客户端系统忙、重试由客户端负责"的原意不符。
+
+   契约由 `AdmissionWiringTests` 三条钉住。其中"预检真的在读 body 之前"用的证据是**顺序**：
+   把 `Content-Length` 声报成超过上限的值 —— 先查大小会得到 `413 payload_too_large`，
+   先判忙会得到 `409 client_busy`。顺序即证据，不靠读代码确认。

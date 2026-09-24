@@ -32,14 +32,13 @@ models:
   # 不写 specs 就用代码里的出厂清单（server/engines.py:default_specs）。
   # 写出来是为了能改；`est_vram_mb` 与 `max_concurrency` 都是**占位值**，上线前要压测校准。
   specs:
-    - id: asr-short             # 短音频（语音指令增强）：常驻，冷启动付一次
-      slot: asr.text
-      impl: sensevoice
-      resident: true
-      max_concurrency: 2
-      est_vram_mb: 1800
-      modelVersion: sensevoice-small
-    - id: asr-long              # 长音频（会议分段）：按需 + LRU；同时给时间戳
+    # 2026-09-24 定：**v1 不做独立的短档小模型**。
+    # 理由：SenseVoice 常驻要一直占着显存，而 v1 里没有任何内部调用方用它
+    # （长档走 qwen3asr），等于"又占显存、又和长档抢同一个槽"。
+    # 短请求（几秒音频）交给 `asr-long` 的 `supports: [asr.text]` 兜住 ——
+    # 慢一点但结果正确。等真要做指令增强时，把 asr-short 连同**配额机制**一起加回来。
+    # 见 docs/ECHO能力后端-服务端设计.md §14-2。
+    - id: asr-long              # 长音频（会议分段）：按需 + LRU；同时给文本与时间戳
       slot: asr.long
       impl: qwen3asr
       resident: false

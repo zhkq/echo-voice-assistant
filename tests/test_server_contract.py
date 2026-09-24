@@ -394,6 +394,54 @@ class AdmissionWiringTests(_AppCase):
                 self.assertEqual(r.json()["message"], "系统忙，请稍后再试")
                 self.assertIn("Retry-After", r.headers)
 
+    def test_precheck_refuses_before_a_single_byte_is_read(self):
+        """**预检必须在读 body 之前**，否则"忙"这个答复是在 64 MB 落盘之后才说的。
+
+        怎么判定"一个字节都没读"：把 `Content-Length` 声报成**超过上限**的值。
+        如果实现先去查大小，会得到 `413 payload_too_large`；
+        如果先去判忙，会得到 `409 client_busy`。
+        拿到 409 = 预检真的跑在收音频之前。顺序即证据。
+        """
+        st = self.app.state.echo
+        limit = int(st.cfg.get("limits.max_upload_bytes", 64 * 1024 * 1024))
+        with st.admission.hold("anonymous"):
+            r = self.client.post("/v1/asr", content=b"x" * 1024,
+                                 headers={"Content-Type": "audio/wav",
+                                          "Content-Length": str(limit + 1)})
+        self.assertEqual(r.status_code, 409, r.text)
+        self.assertEqual(r.json()["code"], "client_busy",
+                         "先判大小去了：说明「忙」是在收完之后才判的")
+
+    def test_precheck_does_not_write_any_temp_file(self):
+        """被预检挡回来的请求，临时目录里不该留下任何东西。"""
+        st = self.app.state.echo
+        with st.admission.hold("anonymous"):
+            self.client.post("/v1/asr", content=b"x" * 4096,
+                             headers={"Content-Type": "audio/wav"})
+        left = [p for p in os.listdir(st.cfg.tmp_root)
+                if p not in ("", ".") and not p.startswith(".")]
+        # 日期目录是空的（sweep 会把它清掉），关键是里面没有 request 目录
+        for d in left:
+            sub = os.path.join(st.cfg.tmp_root, d)
+            if os.path.isdir(sub):
+                self.assertEqual(os.listdir(sub), [], "预检挡回来的请求留下了临时文件")
+
+    def test_precheck_is_advisory_so_hold_is_still_authoritative(self):
+        """预检只是"提前说一声" —— 它**不占槽**，所以权威判定仍然在 `hold`。
+
+        这条钉住"预检不能变成第二个真相来源"：把闸门占满之后，
+        `precheck` 确实拒绝；而它**没有**偷偷把计数改掉。
+        """
+        adm = routes_mod.Admission(2, 1)
+        adm.precheck("c1")                       # 空的时候不该拒
+        self.assertEqual(adm.snapshot()["active"], 0, "precheck 不许占槽")
+        with adm.hold("c1"):
+            with self.assertRaises(errors.EchoError) as ctx:
+                adm.precheck("c1")
+            self.assertEqual(ctx.exception.code, "client_busy")
+            self.assertEqual(adm.snapshot()["active"], 1, "precheck 不许改计数")
+        adm.precheck("c1")                       # 放掉之后又能过
+
     def test_auth_off_means_everyone_is_anonymous(self):
         """鉴权关着时所有请求算同一个客户端 —— 于是"每客户端 1"就成了全局 1。
 
@@ -484,6 +532,86 @@ class TempWorkspaceTests(unittest.TestCase):
 
 # ---------------------------------------------------------------- 模型池
 
+class DefaultSpecsTests(unittest.TestCase):
+    """出厂清单的形状（2026-09-24 拍板的结果，见设计 §14-2）。
+
+    决定是：**v1 不放常驻的小模型**（`asr-short`）。短请求由长档那个
+    `supports: [asr.text]` 兜住。这里把决定的后果钉住，免得以后有人
+    "顺手加回一个常驻小模型"—— 那会把显存一直占着，而 v1 没有配额机制
+    能让它"只对内不对外"。
+    """
+
+    def test_no_resident_asr_model(self):
+        resident = [s.id for s in engines.default_specs()
+                    if s.resident and (s.slot.startswith("asr") or "asr.text" in (s.supports or ()))]
+        self.assertEqual(resident, [],
+                         "出厂清单里出现了常驻的 ASR 模型：%s。v1 没有配额机制，"
+                         "它会一直占着显存且对外开着（见设计 §14-2）" % resident)
+
+    def test_the_short_slot_is_still_served(self):
+        """去掉 asr-short **不等于**关掉短档 —— `variant=short` 必须仍有人接。"""
+        pool = EnginePool(engines.default_specs(), engines.build_loaders(device="cuda"))
+        self.assertIn("asr.text", pool.slots(), "去掉 asr-short 之后短档没人接了")
+        self.assertTrue(pool.pick_for_slot("asr.text"))
+
+    def test_one_model_serves_both_text_and_timestamps(self):
+        """长档那个模型一人多角（文本 + 时间戳），这正是它没被拆成两个 spec 的原因。"""
+        specs = engines.default_specs()
+        long_spec = [s for s in specs if s.id == "asr-long"][0]
+        self.assertIn("asr.text", long_spec.supports)
+        self.assertIn("asr.timestamps", long_spec.supports)
+        self.assertEqual(len([s for s in specs if "asr" in s.slot or "asr.text" in (s.supports or ())]), 1,
+                         "出厂清单里应当只有一个 ASR 模型")
+
+
+class ExampleConfigTests(unittest.TestCase):
+    """`server/echo-server.example.yaml` 必须与代码里的出厂清单**说同一件事**。
+
+    起因：这份示例配置是把默认值摊开写一遍给人改的，于是它天然会漂 ——
+    本仓库已经吃过一次这个亏（`dist/` 里手工组出来的 kit 比源码旧了 9 小时，
+    当天的修复一个都没进包；见 AGENTS.md）。**手工活必然漂移**，所以要机器看着。
+
+    这类漂移不报错、也不影响运行（`build_pool` 优先读 yaml），只是**文档在说谎**：
+    人照着示例改出来的服务端，与代码默认的服务端不是同一个东西。
+    """
+
+    def _example(self):
+        path = os.path.join(SERVER_DIR, "echo-server.example.yaml")
+        self.assertTrue(os.path.isfile(path), "示例配置不见了")
+        return settings_mod.load(path)
+
+    def test_loads_without_error(self):
+        cfg = self._example()
+        self.assertTrue(cfg.specs, "示例配置里没有 specs —— 照它跑会得到空清单")
+        self.assertEqual(cfg.port, 8900, "示例里的监听端口应当与文档写的一致")
+
+    def test_specs_match_the_code_defaults(self):
+        """逐项比对：示例里写的 = `default_specs()` 产出的。"""
+        cfg = self._example()
+        from_yaml = [ModelSpec.from_dict(d) for d in cfg.specs]
+        from_code = engines.default_specs()
+        key = lambda s: (s.id, s.slot, s.impl, s.resident, tuple(sorted(s.supports)),  # noqa: E731
+                         s.vector_space_id)
+        self.assertEqual([key(s) for s in from_yaml], [key(s) for s in from_code],
+                         "示例配置与出厂清单不一致 —— 改了一边就要改另一边")
+
+    def test_example_limits_match_the_decided_values(self):
+        """2026-09-23 定的数：总通道 2、每客户端 1、**不排队**。"""
+        cfg = self._example()
+        self.assertEqual(cfg.max_concurrent, 2)
+        self.assertEqual(cfg.per_client_concurrent, 1)
+        self.assertEqual(int(cfg.get("limits.queue_max", -1)), 0)
+
+    def test_example_does_not_use_a_top_level_resident_key(self):
+        """`models.resident` 是个**不存在的开关** —— 代码只读每个 spec 的 `resident`。
+
+        文档里曾经写着它，照抄的人会以为"我配了常驻"，然后发现谁也没理它。
+        """
+        cfg = self._example()
+        self.assertIsNone(cfg.get("models.resident"),
+                          "示例配置里出现了顶层 models.resident —— 代码不读它")
+
+
 class SlotRoutingTests(unittest.TestCase):
     """**"宣告了"必须等于"路由得过去"。**
 
@@ -543,16 +671,21 @@ class SlotRoutingTests(unittest.TestCase):
     def test_short_variant_is_not_a_phantom_slot(self):
         """`variant=short` 要落到一个**真的有人提供**的槽上。
 
-        这条单独钉，是因为默认 `variant=long` 会让"短档 404"这条路径
-        在端点用例里**永远不会被走到**（见类注释）。
+        注意"有人提供"＝ `slot` **或** `supports` 里出现 —— 这正是本文件开头
+        那两个漏洞的教训（`_by_slot` 曾经只认 `slot`）。所以这里断言的是
+        `pool.slots()`（两者都算），不是 `[s.slot for s in specs]`。
+        一开始这条写的就是后者，于是去掉 asr-short 之后它红了 ——
+        **是断言的标准错了，不是代码错了**。
+
+        另外这条要单独钉，因为默认 `variant=long` 会让"短档"这条路径
+        在端点用例里不容易被走到（见类注释）。
         """
-        loaders = engines.build_loaders(device="cuda")
-        specs = engines.default_specs()
-        pool = EnginePool(specs, loaders)
+        pool = EnginePool(engines.default_specs(), engines.build_loaders(device="cuda"))
+        provided = pool.slots()
         for variant, want_slot in (("short", "asr.text"), ("long", "asr.long")):
             with self.subTest(variant=variant):
-                self.assertIn(want_slot, [s.slot for s in specs],
-                              "variant=%s 想要的槽 %s 没有模型提供" % (variant, want_slot))
+                self.assertIn(want_slot, provided,
+                              "variant=%s 想要的槽 %s 没有任何模型提供" % (variant, want_slot))
                 self.assertTrue(pool.pick_for_slot(want_slot))
 
 
