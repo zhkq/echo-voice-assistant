@@ -94,6 +94,20 @@ class NewLayoutRootsTests(_BaseCase):
         self.assertEqual(paths.command_root(), os.path.join(base, "aide"))
         self.assertEqual(paths.base_dir("core"), os.path.join(base, "echo-core"))
 
+    def test_the_agent_fallback_cwd_is_the_command_space(self):
+        """agent 的兜底 cwd 必须是**指令空间**，不许落在可整体覆盖的 `echo-core` 里。
+
+        2026-09-25 定：`agents/base` 原来把兜底 cwd 写成 `paths.echo_root()` —— 新布局下
+        那就是 `echo-core`（升级即覆盖的代码目录）：agent 能直接改删代码，DSH 还会把代码
+        当工作区内容索引。现在是 `paths.command_root()`（新布局 `{echoBase}/aide`、
+        老装机 `{ECHO}/data/command`），与建命令会话用的工作区是同一个位置。
+        """
+        from app.agents.base import echo_workspace
+        self.assertEqual(echo_workspace(), os.path.join(self.tmp, "aide"))
+        code = os.path.normcase(os.path.join(self.tmp, "echo-core"))
+        self.assertFalse(os.path.normcase(echo_workspace()).startswith(code + os.sep),
+                         "兜底 cwd 又跑回 echo-core 里了")
+
     def test_every_root_is_under_the_base(self):
         for fn in (paths.data_root, paths.models_root, paths.meetings_root,
                    paths.dsh_root, paths.dsh_home_root, paths.command_root):

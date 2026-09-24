@@ -20,7 +20,7 @@ ECHO 可对接的"智能体产品"在此登记。每个适配器模块暴露：
 import threading
 
 from app.config import settings
-from app.agents.base import AgentAdapter, AgentError, ECHO_WORKSPACE  # noqa: F401（对外导出）
+from app.agents.base import AgentAdapter, AgentError, echo_workspace  # noqa: F401（对外导出）
 
 _PENDING = []        # [(cls, factory)]
 _INSTANCES = {}      # name -> adapter 实例

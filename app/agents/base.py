@@ -105,4 +105,16 @@ class AgentAdapter:
 
 
 # ECHO 工作区（工作区会话在此目录下创建，GUI 会话列表中归属清晰）
-ECHO_WORKSPACE = paths.echo_root()
+#
+# 2026-09-25：从 `paths.echo_root()`（代码根）改成**指令空间**。新布局下代码根是
+# `<base>\echo-core` —— 那是「升级时整体覆盖」的目录：会话落在里面，agent 能直接改删代码，
+# DSH 还会把代码当工作区内容索引。`paths.command_root()` 给的就是设计里那个位置
+# （新布局 `{echoBase}/aide`、老装机 `{ECHO}/data/command`），与 dsh_agent 建命令会话时
+# 用的工作区一致 —— 两条路到达同一目录，从巧合变成不变量。
+def echo_workspace() -> str:
+    """没有指定工作区时的**兜底 cwd**（指令空间）。"""
+    try:
+        from app import paths as _paths
+        return _paths.command_root() or _paths.echo_root()
+    except Exception:                                        # pragma: no cover - 兜底
+        return paths.echo_root()

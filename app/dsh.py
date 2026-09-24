@@ -5,7 +5,7 @@
 DSH 的实现被迁到 `app/agents/dsh_agent.py` 并实现 `AgentAdapter` 接口；
 本模块保留原有导出名，避免既有调用点失效：
 
-    DshClient / DshError / get_client() / ECHO_WORKSPACE
+    DshClient / DshError / get_client() / echo_workspace
 
 **get_client() 的语义（2026-09-19 修正）**：返回**当前选中的**智能体适配器
 （`agentBackend` → dsh / harness / codebuddy，含不可用时的降级）。
@@ -15,7 +15,7 @@ desktop"）。凡是"让某个智能体干活"的调用点都该用当前选中�
 **只有"管 DSH Desktop 这个进程本身"的场景**（启动/探测桌面版）才用
 `app.agents.get_agent("dsh")` 指名道姓。
 """
-from app.agents.base import ECHO_WORKSPACE                     # noqa: F401
+from app.agents.base import echo_workspace                     # noqa: F401
 from app.agents.dsh_agent import (                              # noqa: F401
     DshAgent,
     DshError,

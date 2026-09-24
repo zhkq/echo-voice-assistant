@@ -37,7 +37,7 @@ import urllib.request
 
 import app.db as db
 from app.config import settings
-from app.agents.base import AgentAdapter, AgentError, ECHO_WORKSPACE
+from app.agents.base import AgentAdapter, AgentError, echo_workspace
 
 DEFAULT_BASE_URL = "http://127.0.0.1:43120"
 
@@ -566,7 +566,7 @@ class DshAgent(AgentAdapter):
             except Exception as e:
                 db.add_log("warn", "assistant",
                            f"按工作区新建默认会话失败，回退 cwd 方式：{e}")
-        return self.create_session(cwd=ECHO_WORKSPACE)
+        return self.create_session(cwd=echo_workspace())
 
     def ensure_command_session(self, text=""):
         """取默认（command）命令会话。

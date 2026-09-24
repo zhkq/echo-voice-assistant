@@ -26,7 +26,7 @@ import threading
 import time
 
 from app.config import settings
-from app.agents.base import AgentAdapter, AgentError, ECHO_WORKSPACE
+from app.agents.base import AgentAdapter, AgentError, echo_workspace
 from app import platform as echo_platform
 
 # 认证失效的识别串（实测原文）
@@ -116,7 +116,7 @@ def _run_headless(cli, node, prompt, timeout, cwd=None, resume_sid=""):
 
     t0 = time.time()
     try:
-        p = subprocess.run(cmd, cwd=cwd or ECHO_WORKSPACE, env=env,
+        p = subprocess.run(cmd, cwd=cwd or echo_workspace(), env=env,
                            capture_output=True, timeout=timeout,
                            creationflags=echo_platform.no_window_creationflags())
     except subprocess.TimeoutExpired:
@@ -284,7 +284,7 @@ class CodeBuddyAgent(AgentAdapter):
         with _MAP_LOCK:
             real_sid = _SESSION_MAP.get(session_id, "")
         rc, out, err, dt = _run_headless(cli, node, text, timeout,
-                                         cwd=cwd or ECHO_WORKSPACE,
+                                         cwd=cwd or echo_workspace(),
                                          resume_sid=real_sid)
         if AUTH_HINT.lower() in (err or "").lower() or AUTH_HINT.lower() in (out or "").lower():
             raise AgentError(f"{AUTH_REASON}（原始报错：{err.strip()[:160]}）")
