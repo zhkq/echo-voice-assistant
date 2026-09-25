@@ -1322,27 +1322,54 @@ Windows 上至少要走 DPAPI（`CryptProtectData`）；这与"业务数据留�
 
 ### 8.4 管理面（Admin Console）
 
-> **实现状态（2026-09-24）：管理面已经落地，但刻意是「只读」的。**
-> `server.admin_listen` 一配就起（独立端口），五个页签都在；账号只能从命令行建：
-> `--new-admin`（口令只打印一次）/ `--list-admins` / `--disable-admin` /
-> `--enable-admin` / `--delete-admin`。
+> **实现状态（2026-09-25）：管理面落地，并且**带写端点**了。**
+> `server.admin_listen` 一配就起（独立端口），五个页签都在；
+> 写动作（**发授权 / 禁用·启用 / 撤销 / 改 scopes / 改配额 / 轮换 secret / 作废配对码**）
+> 在面板上就能做，而**判断与落库仍然只有一份实现**（`server/ops.py`，
+> 与命令行的 `--new-client` / `--revoke` / `--rotate-secret` 共用）。
 >
-> **为什么刻意不做写动作**：那五个页签要回答的是"模型跑得怎么样、客户端有谁在连、
-> 谁调了什么" —— 全是**看**。而写动作（发码 / 撤销 / 禁用 / 改 scope / 换 secret / 配配额）
-> 命令行已经齐了，而且那条路**刻意不打 HTTP、直接开库**。要加写端点，先回答一个问题：
-> **它比"运维在那台机器上敲一条命令"多解决了什么？** 答不上来就别加 ——
-> 这正是"给管理动作开一条免鉴权的内部端点"最危险的开始。
-> 契约由 `IsolationTests.test_the_admin_api_has_no_write_endpoints` 钉着：
-> 真加了写端点，那条会红，加的人必须在提交里说明理由。
+> **这推翻的是"只读"这个结论，不是它的判据。** 只读那一版（2026-09-24）的判据是
+> "要加写动作，先回答：它比运维在那台机器上敲一条命令多解决了什么？"——
+> 今天这个问题的答案是**用户明确要的"发授权"**：运维常常不在那台机器上，
+> "去敲一条命令"实际是"先 SSH 进去"，那一步经常比动作本身还贵。
+> **答不上来还是别加**；而一旦要加，就按下面的七道闸加。
+>
+> | 闸 | 做法 | 为什么 |
+> |---|---|---|
+> | ① 监听面 | 仍只监听 `server.admin_listen`（本机 `127.0.0.1:8901`） | 能力面 `0.0.0.0:8900` 与客户端那侧一个字节都没动；管理面靠**防火墙一条规则**隔离 |
+> | ② 会话 | 所有写端点必须管理员会话，没会话 **401** | **绝不降级成"只读放行"** —— 写面一旦有"没登录也能过"的口子，它就等于公开的提权入口 |
+> | ③ CSRF / DNS-rebinding | 写请求要同站 `Origin`（或 `Referer`）+ 非简单请求标志头 `X-ECHO-Admin` + `X-CSRF-Token`，任一不满足 **403** | cookie 是 `SameSite=Strict`，但 **rebinding 不受它保护**（浏览器认为那是同站请求，cookie 照发）；挡它的是 `Origin` —— 那种请求的 `Origin` 是攻击者的域名。自定义头则让浏览器**必须先发预检**，跨站表单发不出它 |
+> | ④ 审计 | 每个写动作**含失败**一条 `admin_audit`，操作者是**登录的管理员名** | 审计的全部价值是回答"是**谁**动的"；失败也要留痕（`action` 后缀 `.failed`，原因进 `target` —— 表只有四列，加列要走 §8.5 评审） |
+> | ⑤ 二次确认 | 撤销 / 轮换 secret / 作废码：前端弹确认 + 后端要求 body 带 `confirm`（目标 id 或 `true`），缺/错 **400** | 前端挡"手滑"，后端那个字段挡"直接构造请求"，并逼请求**指名**它要动谁 |
+> | ⑥ 秘密只回显一次 | 轮换出的 secret、刚发的配对串只在**那一次响应**里出现；库里只有哈希 | 与管理面"每一条响应都进浏览器"这件事对齐：截图、控制台、报错都可能带走秘密 |
+> | ⑦ 一份实现 | `server/ops.py` | 命令行与管理面各写一遍必然漂移（改了统一化/审计/宽限期，另一边不会跟着改） |
+>
+> **一处写明了的偏离**：会话 cookie 是 `HttpOnly + SameSite=Strict`，**没有 `Secure`**
+> —— 管理面是明文 http（回环端口、不走 TLS），给 http 页面设 `Secure` 浏览器根本不会存，
+> 表现是"登录成功了，下一个请求又 401"。将来管理面走 https 时再补上。
+>
+> **刻意不做的**：管理面**不改管理员账号**（增删改口令仍只在命令行
+> `--new-admin` / `--disable-admin` / `--delete-admin`，面板最多只读展示清单）。
+> 理由：改账号等于"改谁能进这扇门"，而面板本身就在这扇门里 ——
+> 一次会话劫持就能顺手把攻击者自己加成管理员。
+> 同样**不暴露 `auth.jwt_secret`**：任何接口都不返回它。
+>
+> 护栏：`tests/test_admin_console.py` 的 `WriteGuardTests`（**从 `openapi()` 现读**每个写端点，
+> 逐个验未登录 401 / 跨站 Origin 403 / 缺自定义头 403 / 缺 CSRF 403，并断言未登录时
+> **库里一个字节都不动**）、`ConfirmTests`、`PairingCodeWriteTests`、`ClientWriteTests`、
+> `AuditTests`、`SharedImplementationTests`，以及
+> `IsolationTests.test_every_write_endpoint_is_registered`（写端点必须逐个登记）。
+> 原来那条"管理面不许有写端点"的用例已按这次需求改写 —— 加端点是允许的，
+> 但"忘了加防护"必须红。
 >
 > | 项 | 做法 | 为什么 |
 > |---|---|---|
 > | 口令哈希 | **`hashlib.scrypt`**（stdlib） | 设计写的是 argon2id —— 那是更好的选择，但它要引 `argon2-cffi`，而**服务端镜像的依赖面**不值得为它长一条。这是**写明了的偏离**；要换的时候两个函数各改一行，旧哈希靠 `scrypt$` 前缀区分，可平滑迁移 |
 > | 会话 | **进程内**（`SessionStore`，8 小时） | 管理面本来就不该水平扩；"把会话写进库"要再加一张表（白名单要走评审），不值。代价：重启即全部登出 |
-> | CSRF | 双提交令牌，写请求必须带 `X-CSRF-Token` | 现在唯一的 POST 是登录（天然免 CSRF），但机制先立着 —— 加写动作时不会忘 |
 > | 登录防爆破 | 5 次失败 / 5 分钟退避 | 免凭据端点都要防爆破，与 `/v1/pair` 同一个理由 |
 > | 账号枚举 | **不区分**"没有这个用户"与"口令不对"：两种失败的响应体**逐字相同** | 分开说等于送一个枚举账号的接口。用例比的是**两个响应体相等**，不是"含某个词" |
 > | 禁用生效 | 每个请求重读账号行；被禁用/删掉的账号**手上会话立刻作废** | 不然"禁用"要等 8 小时会话到期才生效 |
+> | 写动作的生效延迟 | 管理面与能力面**同进程、共用同一个 `Auth` 缓存** → 撤销/禁用/改 scopes **当场**生效；命令行是另一个进程，靠 `RevocationWatcher` 在 ≤ `auth.revoke_poll_s`（默认 5 秒）内发现 | 两条路的延迟不一样，就**不要**把它写成同一个词（§7.5 ④ 那张表） |
 >
 > 「存了什么」页读的是**活着的库**（表名与列名当场从数据库读出来），
 > 所以"服务端不存内容"能当场核对。**"哪些列名算内容"这个判断留在测试里**
@@ -1351,9 +1378,8 @@ Windows 上至少要走 DPAPI（`CryptProtectData`）；这与"业务数据留�
 > 那个黑名单必然要**逐字列出那几个业务概念**，而**服务端源码里不许出现它们**。
 > 更细的一个坑：那条护栏**连注释一起扫** —— 我第二版在注释里写出那个词，照样红。
 >
-> 命令行那条路**刻意不打 HTTP**（直接开库）：给管理动作开一条免鉴权的内部端点，
-> 正是最容易变成漏洞的做法。代价要写在明处 ——
-> **它的安全边界就是"能读到鉴权库文件"**，也就是 shell 权限。
+> 命令行那条路仍然**不打 HTTP**（直接开库），它的安全边界依然是
+> **"能读到鉴权库文件"**（也就是 shell 权限）—— 这一点没有因为管理面可写而改变。
 
 **一句话**：服务端自带一个管理网页，给运维看**模型跑得怎么样、客户端有谁在连、谁调了什么**。
 它读的是 §8.2 的指标与 §7.3 的审计数据，**不读任何内容**。
@@ -1450,14 +1476,17 @@ Windows 上至少要走 DPAPI（`CryptProtectData`）；这与"业务数据留�
 
 #### 管理面自己的安全
 
-| 项 | 要求 |
-|---|---|
-| 密码存储 | **argon2id**（或 bcrypt），绝不明文/可逆 |
-| 会话 | 短期 cookie（HttpOnly + Secure + SameSite=Strict），**不用 localStorage** |
-| 登录限速 | 失败计数 + 指数退避 + 锁定 |
-| CSRF | 管理面**只做同源**，改动用 POST + CSRF token |
-| 审计 | **管理动作也要记**（谁在什么时候撤销了哪个客户端） |
-| 初始账号 | 首次启动生成随机密码并**打到 stdout 一次**，强制首次登录改密；**不设默认密码** |
+**要求 → 实现（2026-09-25 校正过一次，两处偏离写明）**：
+
+| 项 | 要求 | 实现 |
+|---|---|---|
+| 密码存储 | **argon2id**（或 bcrypt），绝不明文/可逆 | **`hashlib.scrypt`**（stdlib）。这是**写明了的偏离**：argon2id 更好，但要引 `argon2-cffi`，为它给服务端镜像长一条依赖不值；换的时候两个函数各改一行，旧哈希靠 `scrypt$` 前缀区分 |
+| 会话 | 短期 cookie（HttpOnly + Secure + SameSite=Strict），**不用 localStorage** | `HttpOnly + SameSite=Strict`，**没有 `Secure`**（管理面是明文 http 回环端口，设了 `Secure` 浏览器不存 cookie → "登录成功但下一请求 401"）。Tokenizer 在响应体里回一次、前端只放内存，**不用 localStorage** |
+| 登录限速 | 失败计数 + 指数退避 + 锁定 | 5 次 / 5 分钟退避（与 `/v1/pair` 同一形状）。**没有**"永久锁定"：锁死一个账号在单人运维的场景里就是把自己关在门外 |
+| CSRF | 管理面**只做同源**，改动用 POST + CSRF token | 同站 `Origin`/`Referer` + `X-ECHO-Admin` 非简单请求标志头 + 双提交 `X-CSRF-Token`；**默认拒绝**（中间件拦所有 `/admin/api` 的非 GET，`login` 豁免） |
+| 审计 | **管理动作也要记**（谁在什么时候撤销了哪个客户端） | `admin_audit`，**含失败**；操作者是登录的管理员名（见 §8.5 那条注） |
+| 初始账号 | 首次启动生成随机密码并**打到 stdout 一次**，强制首次登录改密；**不设默认密码** | `--new-admin` 生成随机口令并**只打印一次**（不落明文）。**没有**"强制首次改密"：管理面不改账号（改账号仍只在命令行），所以那句话落在"口令只出现一次 + 随时 `--new-admin` 重置"上 —— 这是第二处偏离，理由见 §8.4 |
+
 
 ---
 
@@ -1473,13 +1502,21 @@ Windows 上至少要走 DPAPI（`CryptProtectData`）；这与"业务数据留�
 
 | 表 | 存什么 | 关键列 | v1 |
 |---|---|---|---|
-| `admin_users` | 管理员账号 | `username` / `password_hash` / `disabled` / `last_login` | ⏳ |
+| `admin_users` | 管理员账号 | `username` / `password_hash` / `disabled` / `last_login` | ✅ **2026-09-24 已落地** |
 | `clients` | 客户端注册与凭据 | `client_id` / `name` / `secret_hash` / `scopes` / `token_version` / `last_seen` / `version` / `disabled` | ✅ |
 | `pairing_codes` | 待用的配对码 | `code_hash` / `expires_at` / `created_by`（**用掉即删**） | ✅ |
 | `calls` | 调用元数据 | `ts` / `client_id` / `endpoint` / `model_id` / `audio_seconds` / `queue_wait_ms` / `duration_ms` / `status` / `error_code` / `request_id` | ✅ **2026-09-24 已落地** |
 | `calls_rollup` | 小时/天聚合 | `bucket` / `client_id` / `endpoint` / `count` / `errors` / `p50` / `p95` / `audio_seconds` | ⏳ |
 | `model_events` | 模型生命周期 | `ts` / `model_id` / `event`(load/evict/fail) / `duration_ms` / `vram_mb` | ⏳ |
-| `admin_audit` | 管理动作 | `ts` / `admin` / `action` / `target` | ⏳ |
+| `admin_audit` | 管理动作 | `ts` / `admin` / `action` / `target` | ✅ **2026-09-24 已落地** |
+
+> **`admin_audit` 只有这四列，2026-09-25 管理面开写时也没加列。**
+> "这次动作成没成、为什么没成"编码在 `action`（成功 `revoke`、失败 `revoke.failed`）
+> 与 `target`（`cli-1 | forbidden 没登录或会话已过期`）里 —— **不加 `result`/`reason` 列**：
+> 加列要走这张白名单的同一道评审门，而这里的信息量四列装得下。
+> 操作者是**登录的管理员名**（命令行那条路记 `cli`：它没有"谁"这个概念，
+> 安全边界是 shell 权限）。只读的**看**不算动作 —— 否则刷新页面的手速就能把表刷满。
+
 
 > **`clients` 的实现与这张表有两处小出入，已按实现校正（2026-09-24 再校正一次）：**
 > 落了 `created_at` / `updated_at` / `last_seen`，**没有** `version` 列
@@ -1955,12 +1992,21 @@ client_body_temp_path /var/echo/tmp/nginx;
 | 管理面：**不区分**"没有这个用户"与"口令不对"（响应体逐字相同） | ✅ | `LoginTests.test_a_wrong_password_is_refused_without_saying_which_part_was_wrong` |
 | 管理面：登录防爆破（429） | ✅ | `LoginTests.test_brute_force_is_throttled` |
 | 管理面：禁用/删掉的账号**手上会话立刻作废** | ✅ | `SessionStoreTests.test_disabling_a_user_kills_his_sessions` |
-| 管理面：**没有写端点**（写动作走命令行） | ✅ | `IsolationTests.test_the_admin_api_has_no_write_endpoints` |
+| 管理面**写端点逐个登记**（2026-09-25 起可写，取代原来的"一个都不许有"） | ✅ | `IsolationTests.test_every_write_endpoint_is_registered` |
+| **每个写端点**：未登录 401 / 跨站 Origin 403 / 缺 `X-ECHO-Admin` 403 / 缺 CSRF 403 | ✅ | `WriteGuardTests`（**从 openapi 现读**端点） |
+| 未登录时写请求**库里一个字节都不动**、也不写审计 | ✅ | `WriteGuardTests.test_no_side_effect_when_not_logged_in` |
+| 危险动作缺 `confirm` → 400 且无副作用 | ✅ | `ConfirmTests` |
+| 发授权：明文只出现一次、库里只有哈希、**用掉一次即失效** | ✅ | `PairingCodeWriteTests` |
+| 撤销后旧令牌**下一个请求**就 401（管理面同进程立刻生效） | ✅ | `ClientWriteTests.test_revoke_kills_the_token_on_the_very_next_request` |
+| 轮换 secret：新的只回显一次、旧 secret/旧令牌立刻失效、详情与列表不含哈希 | ✅ | `ClientWriteTests.test_rotate_secret_*` |
+| 每个写动作（**含失败**）一条审计，操作者是登录的管理员名 | ✅ | `AuditTests` |
+| 命令行与管理面**共用同一份实现**（同一串配对串、同一批 store 方法） | ✅ | `SharedImplementationTests` |
+| 只读端点只要登录，**不要求**写请求那几个头 | ✅ | `ReadOnlyNotLockedTests` |
 | **两个 app 的路径不许交叉**（管理面无 `/v1`、能力面无 `/admin`） | ✅ | `IsolationTests` 两条 |
 | 能力面的客户端 JWT 在管理面上**认不到**（两套身份） | ✅ | `IsolationTests.test_a_capability_jwt_is_useless_on_the_admin_console` |
 | 「存了什么」页读的是**活着的库**（表/列当场读出来） | ✅ | `DataTests.test_inventory_lists_the_live_schema` |
 | 口令只存哈希，且**建号时打印的那个口令验证得过** | ✅ | `PasswordTests` / `AdminCliTests.test_new_admin_prints_the_password_once...` |
-| 管理面 / 审计表 / "存了什么"自证页（§8.4、§8.5） | ✅ **已落地**（只读；`calls_rollup` 仍未做） | — |
+| 管理面 / 审计表 / "存了什么"自证页（§8.4、§8.5） | ✅ **已落地**（可写，带七道闸；`calls_rollup` 仍未做） | — |
 
 > **为什么 §12 值得这么细。** 前面每一节的设计都有"如果没人看着就会退化"的地方：
 > 服务端会慢慢认识业务、临时文件会慢慢漏、GPU 会慢慢被 OOM 掉。
@@ -1976,7 +2022,7 @@ client_body_temp_path /var/echo/tmp/nginx;
 | **v1** | 单进程 / 单机；`EnginePool`（单飞 + 引用计数 + LRU + 显存预算）；`TempWorkspace`；三个能力端点；`/health` `/ready` `/capabilities`；**两级闸门 + 廉价预检** | §12 全部护栏测试绿；两个客户端并发不互相阻塞 | **✅ 已落地** |
 | **v1.5**（原 v2 的鉴权部分） | **配对码 → `client_id` + `secret` → 短期 JWT**；scopes；`token_version` 撤销（同进程立即、跨进程 ≤5 秒轮询）← **实际做在了这里，不是 v2** | §12.1 全绿；命令行能发码、撤销能生效 | **✅ 已落地** |
 | **v2** | 配额（日额度 / 音频分钟数，§7.2）✅ + **`calls` 审计表 + metrics ✅** + SSE 进度 + `calls_rollup` | 与客户端路由层的降级原因**逐条对齐**；断网/降级演练 | ◐ 配额与审计已落地（2026-09-24）；SSE / rollup 还没做 |
-| **v3** | 管理面（§8.4）✅ **只读版已落地 2026-09-24** + 只读 rootfs 容器 + tmpfs + 反代配置 + 按模型分进程（按需）+ 多实例按能力拆分 | 容器冒烟；`/v1/health` 的临时目录统计长期归零 | ◐ 只读管理面已落地；写动作**刻意**仍在命令行；容器加固还没做 |
+| **v3** | 管理面（§8.4）✅ **只读版 2026-09-24 → 写端点（发授权/禁用/撤销/改权限配额/轮换 secret）2026-09-25** + 只读 rootfs 容器 + tmpfs + 反代配置 + 按模型分进程（按需）+ 多实例按能力拆分 | 容器冒烟；`/v1/health` 的临时目录统计长期归零 | ◐ 管理面已可写（七道闸：会话/同站 Origin/非简单请求头/CSRF/审计/二次确认/秘密只回显一次），容器加固还没做 |
 
 > **为什么鉴权提前到了 v1.5，而不是留在 v2：** 原计划把它和**配额**绑在一趟做。
 > 实际开工后发现两件事可以拆：JWT/scopes/撤销是**安全边界**（没有它，服务端一上网

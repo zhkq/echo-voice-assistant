@@ -11,10 +11,8 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import logging
 import os
-import ssl
 import time
 from contextlib import asynccontextmanager
 
@@ -26,12 +24,20 @@ from server import admin as admin_mod
 from server import auth as auth_mod
 from server import calls as calls_mod
 from server import errors as E
+from server import ops as ops_mod
 from server import routes as routes_mod
 from server import settings as settings_mod
 from server import tmp
 from server.pool import EnginePool, ModelSpec
 
 log = logging.getLogger("echo.server")
+
+#: 这两个小工具的实现 2026-09-25 搬去了 `server/ops.py` —— 管理面「发授权」也要拼
+#: **一模一样**的配对串（含证书指纹），两处各写一遍必然漂移。
+#: 这里保留旧名字：跨层用例（`test_server_contract.CertFingerprintTests`）在用它，
+#: 改名只会把"两处实现"换成"两处名字"。
+cert_fingerprint = ops_mod.cert_fingerprint
+advertised_host = ops_mod.advertised_host
 
 
 def _is_loopback(listen: str) -> bool:
@@ -95,8 +101,10 @@ def create_app(cfg=None) -> FastAPI:
         call_log.start()
         app.state.echo = routes_mod.State(cfg, pool, sweeper, auth=auth_obj,
                                          call_log=call_log)
-        # 管理面（设计 §8.4）：**独立端口上的只读控制台**。等 state 造好再起 ——
-        # 它读的就是那份状态（池 / 配额账本 / metrics / 调用记录），两个 app 共用一份。
+        # 管理面（设计 §8.4）：**独立端口上的控制台**（2026-09-25 起带写端点，
+        # 全部要求管理员会话 + 同站 Origin + 非简单请求标志头，见 `server/admin.py`）。
+        # 等 state 造好再起 —— 它读的就是那份状态（池 / 配额账本 / metrics / 调用记录），
+        # 而且"撤销 / 禁用 / 改 scopes"能当场让能力面那份鉴权缓存失效（同一个进程）。
         admin_server = None
         try:
             admin_server = admin_mod.start_admin_server(cfg, app.state.echo, log=log)
@@ -231,14 +239,12 @@ def _tls_kwargs(cfg) -> dict:
 
 
 def _normalize_scopes(raw: str) -> str:
-    """把 `"asr,diarize"` / `"asr diarize"` / `"asr  diarize"` 统一成空格分隔。
+    """`"asr,diarize"` / `"asr diarize"` / `"asr  diarize"` 统一成空格分隔。
 
-    存的格式就是 `_check_scope` 里 `.split()` 认的那种；不统一的话，
-    `--set-scopes cli-x asr,diarize` 会存成一个**永远匹配不上任何槽**的字符串 ——
-    表现是"我明明给了权限却全 403"，很难查。
+    实现在 `server/ops.py`（管理面的表单同样要认逗号 —— 同一件事只留一份）。
+    这里留个薄别名，免得老调用方/脚本找不到它。
     """
-    parts = [p for p in str(raw or "").replace(",", " ").split() if p]
-    return " ".join(parts)
+    return ops_mod.normalize_scopes(raw)
 
 
 def _fmt_time(ts) -> str:
@@ -246,74 +252,40 @@ def _fmt_time(ts) -> str:
     return "-" if ts <= 0 else time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
 
 
-def cert_fingerprint(certfile: str) -> str:
-    """证书指纹 `sha256:<hex>`（与客户端 `pairing.fingerprint_of` 同一算法）。
+def _print_pairing(code, cfg, name: str = "", scopes: str = "") -> None:
+    """打印配对码与那一整串 `echo://pair?…`。
 
-    为什么服务端自己写一遍、不 import 客户端的：`server/` 是**可以单独部署**的那一半
-    （设计 §1），能少依赖一层就少一层。代价是"两处算同一个东西"可能漂移 ——
-    所以有一条跨层用例拿同一张证书比两边的输出（`test_server_contract.CertFingerprintTests`）。
-
-    读不到 / 解不开一律返回空串：调用方把空串当作"没有指纹可给"，**不编一个假的**。
+    `code` 可以是 `ops.issue_pairing_code()` 的**结果**（推荐：那时 URL 已按这次真正的
+    有效期拼好），也可以是一个裸的码。两种都从 `ops` 那一处取同一串 ——
+    命令行与管理面看到的配对串必须逐字相同（`fp=` / scheme 少一个，客户端就连不上，
+    而且看不出原因）。
     """
-    try:
-        with open(certfile, "rb") as fh:
-            pem = fh.read().decode("utf-8", "replace")
-        der = ssl.PEM_cert_to_DER_cert(pem)
-    except Exception:
-        return ""
-    if not der:
-        return ""
-    return "sha256:" + hashlib.sha256(der).hexdigest()
-
-
-def advertised_host(listen: str, tls: bool) -> tuple:
-    """把 `server.listen` 变成**客户端能用**的 `scheme://host:port`。返回 `(地址, 备注)`。
-
-    两处不能照抄 `listen`：
-
-    * **通配地址对客户端没有意义**。出厂默认就是 `0.0.0.0:8900`；把这个抄进配对串，
-      同事粘出来的结果是一句"连不上"，而且完全看不出是地址的错。所以这里探测本机地址，
-      探不到就留一个**占位符**让人自己填 —— 宁可让人补一次，也不猜一个错的。
-    * **配了 TLS 就必须写 `https://`**。客户端对不带 scheme 的地址默认按 http 处理
-      （`pairing.normalize_base_url`），在 https 服务端上同样是"连不上"。
-    """
-    raw = str(listen or "")
-    host, _, port = raw.rpartition(":")
-    if not port:
-        host, port = raw, ""
-    host = host.strip()
-    note = ""
-    if host in ("", "0.0.0.0", "::", "[::]", "*"):
-        guess = ""
-        try:
-            import socket
-            guess = socket.gethostbyname(socket.gethostname())
-        except Exception:                                    # pragma: no cover - 兜底
-            guess = ""
-        host = guess or "<这台后端的主机名或IP>"
-        note = ("服务端监听的是通配地址 %s —— 上面这个地址是**本机探测到**的；"
-                "同事连不上就换成他们能访问到的那台机器的主机名或 IP。" % (raw or "(空)"))
-    return "%s://%s:%s" % ("https" if tls else "http", host, port), note
-
-
-def _print_pairing(code: str, cfg, name: str = "", scopes: str = "") -> None:
-    ttl_min = int(float(cfg.get("auth.pairing_ttl_s", 900)) / 60)
-    # 配对串里带上服务端标识与**证书指纹**（设计 §7.5 ①）：客户端粘一次就够了，
-    # 而 `fp=` 让这次带外传递把中间人也一并挡住 —— 没有它，第一次连接只能 TOFU。
-    # 没配 TLS 时**不写** `fp=`：写一个假指纹比不写更坏（客户端会拿它去校验 http）。
-    fp = cert_fingerprint(str(cfg.get("server.tls.certfile", "") or ""))
-    addr, note = advertised_host(str(cfg.get("server.listen", "")), bool(fp))
-    suffix = ("&fp=" + fp) if fp else ""
+    issued = code if isinstance(code, dict) else ops_mod.pairing_string(cfg, str(code))
+    ttl_min = int(float(issued.get("ttlSeconds") or 0) / 60)
     print("配对码（%d 分钟内有效，只能用一次）：" % ttl_min)
-    print("     echo://pair?host=%s&code=%s%s" % (addr, code, suffix))
-    if note:
-        print("     （%s）" % note)
-    if not fp:
+    print("     %s" % issued["url"])
+    if issued.get("note"):
+        print("     （%s）" % issued["note"])
+    if not issued.get("fingerprint"):
         print("     （没配 TLS，所以串里没有 fp= —— 客户端这次只能 TOFU，即第一次见谁信谁）")
     if name or scopes:
         print("这台客户端将建为：名字=%s  scopes=%s"
               % (name or "(对端自报)", scopes or "(不限)"))
     print("把它给同事，在客户端面板里粘贴一次即可。")
+
+
+def cert_fingerprint(certfile: str) -> str:
+    """证书指纹 `sha256:<hex>`。**实现在 `server/ops.py`**（管理面同一条路要用）。
+
+    这里保留这个名字只是为了不打断老调用方与跨层用例
+    （`test_server_contract.CertFingerprintTests.test_the_fingerprint_matches_the_client_side_implementation`）。
+    """
+    return ops_mod.cert_fingerprint(certfile)
+
+
+def advertised_host(listen: str, tls: bool) -> tuple:
+    """`server.listen` → 客户端能用的 `scheme://host:port`。**实现在 `server/ops.py`**。"""
+    return ops_mod.advertised_host(listen, tls)
 
 
 def _show_client(store, client_id: str) -> int:
@@ -370,9 +342,9 @@ def _admin_cli(cfg, args) -> int:
         # ---- 新建客户端 / 发配对码 ----
         if args.new_client or args.new_pairing_code:
             name = str(args.new_client or "")
-            code = a.create_pairing_code(created_by=args.created_by or "cli",
-                                         name=name, scopes=scopes)
-            _print_pairing(code, cfg, name=name, scopes=scopes)
+            issued = ops_mod.issue_pairing_code(cfg, a, created_by=args.created_by or "cli",
+                                               name=name, scopes=scopes)
+            _print_pairing(issued, cfg, name=name, scopes=scopes)
             return 0
 
         # ---- 查看 ----
@@ -388,15 +360,15 @@ def _admin_cli(cfg, args) -> int:
                     _fmt_time(r["last_seen"]), r["name"]))
             return 0
         if args.list_codes:
-            rows = store.pairing_codes()
-            now = time.time()
+            # 与管理面「待用码」那一页共用同一个整理函数（`ops.pending_pairing_codes`）——
+            # 否则两边对"剩余多久 / 谁发的"会有两套算法。
+            rows = ops_mod.pending_pairing_codes(store)
             if not rows:
                 print("（没有待用的配对码）")
             for r in rows:
-                left = float(r["expires_at"]) - now
                 print("%-10s 剩余 %5.1f 分钟  名字=%-16s scopes=%-16s 由 %s 发" % (
-                    "(哈希)", max(0.0, left / 60), r.get("name") or "(对端自报)",
-                    r.get("scopes") or "(不限)", r.get("created_by") or "-"))
+                    "(哈希)", r["remainingSeconds"] / 60.0, r["name"] or "(对端自报)",
+                    r["scopes"] or "(不限)", r["createdBy"] or "-"))
             if rows:
                 print("注：配对码**只存哈希**，所以这里看不到明文 —— 明文只在生成时出现过一次。")
             return 0
@@ -438,15 +410,18 @@ def _admin_cli(cfg, args) -> int:
             return 0
 
         # ---- 改 ----
+        # 从这里往下的**每一个**动作都走 `server/ops.py` —— 管理面的写端点调的是
+        # 同一批函数（`ops.revoke_client` / `ops.set_client_disabled` / …）。
+        # 两个出口共用一份判断与落库，漂移就无从发生。
         if args.revoke:
-            ver = a.cache.revoke(args.revoke)
+            out = ops_mod.revoke_client(cfg, a, args.revoke)
             print("已撤销 %s（token_version → %s）。"
                   "服务端最迟 %s 秒后发现（跨进程靠轮询，见设计 §7.5 ④）。"
-                  % (args.revoke, ver, cfg.get("auth.revoke_poll_s", 5)))
+                  % (args.revoke, out["tokenVersion"], out["revokePollSeconds"]))
             return 0
         if args.disable or args.enable:
             cid = args.disable or args.enable
-            a.set_disabled(cid, bool(args.disable))
+            ops_mod.set_client_disabled(cfg, a, cid, bool(args.disable))
             if args.disable:
                 print("已禁用 %s。它现在会收到 403（不是 401 —— 是「认识你但不许用」）。"
                       % cid)
@@ -457,13 +432,13 @@ def _admin_cli(cfg, args) -> int:
                 print("已启用 %s。它手上的凭据仍然有效，可以直接继续用。" % cid)
             return 0
         if args.set_scopes:
-            a.set_scopes(args.set_scopes, scopes)
-            print("已把 %s 的 scopes 改成：%s" % (args.set_scopes, scopes or "(不限)"))
+            out = ops_mod.set_client_scopes(cfg, a, args.set_scopes, scopes)
+            print("已把 %s 的 scopes 改成：%s" % (args.set_scopes, out["scopes"] or "(不限)"))
             print("**下一个请求就生效** —— 鉴权读的是库里的行，不是 JWT 里的声明。")
             return 0
         if args.set_quota:
             minutes = float(args.daily_audio_minutes or 0)
-            a.set_quota(args.set_quota, minutes)
+            ops_mod.set_client_quota(cfg, a, args.set_quota, minutes)
             if minutes > 0:
                 print("已把 %s 的每日音频上限设成 %.1f 分钟。" % (args.set_quota, minutes))
             else:
@@ -480,7 +455,9 @@ def _admin_cli(cfg, args) -> int:
             return 0
 
         # ---- 管理面账号（设计 §8.4）----
-        # 管理面**故意只读**，所以建账号 / 禁用 / 删除只在这里 —— 与别的写动作同一条出口。
+        # 管理面**刻意不改账号**（面板上只有一份只读清单）：改账号等于"改谁能进这扇门"，
+        # 而面板本身就在这扇门里 —— 让面板改账号，就是给一次会话劫持配一个提权出口。
+        # 所以建账号 / 禁用 / 删除只在这里，与其他写动作同一条出口（能开库 = shell 权限）。
         if args.new_admin:
             pwd = admin_mod.new_password()
             store.upsert_admin(args.new_admin, admin_mod.hash_password(pwd))
@@ -519,9 +496,9 @@ def _admin_cli(cfg, args) -> int:
         if args.rotate_secret:
             grace = float(args.grace_hours or 0)
             cid = args.rotate_secret
-            secret = a.rotate_secret(cid, grace_hours=grace)
+            out = ops_mod.rotate_client_secret(cfg, a, cid, grace_hours=grace)
             print("已轮换 %s 的 secret。**新的明文只出现这一次**：" % cid)
-            print("     %s" % secret)
+            print("     %s" % out["secret"])
             print("同时 token_version +1：**它原来那些令牌立刻全失效**"
                   "（泄漏时最想立刻断掉的就是它们）。")
             if grace > 0:
@@ -529,18 +506,17 @@ def _admin_cli(cfg, args) -> int:
                 # 但服务端只存哈希、发不出新 secret（设计原话"secret 只出现这一次"），
                 # 所以"自动换新"做不到；能做的是**同时给一张新配对码**，让运维在宽限期内
                 # 把新凭据交出去。
-                row = store.client(cid) or {}
-                name = str(row.get("name") or "")
-                scopes_of = str(row.get("scopes") or "")
+                name = str(out.get("name") or "")
+                scopes_of = str(out.get("scopes") or "")
                 print("宽限期 %.1f 小时内，**旧 secret 仍然能换令牌**：客户端不会断。"
                       % grace)
                 print("⚠️ 但这把旧 secret 也照样进得来 —— **所以宽限期不能用于"
                       "「secret 泄漏」**，只用于例行轮换不打断客户端。泄漏请用默认"
                       "（不带 --grace-hours），那样旧的立刻失效。")
                 print("再给你一张配对码，趁宽限期内把新凭据交给那台机器：")
-                code = a.create_pairing_code(created_by="cli:rotate",
-                                             name=name or cid, scopes=scopes_of)
-                _print_pairing(code, cfg, name=name or cid, scopes=scopes_of)
+                issued = ops_mod.issue_pairing_code(cfg, a, name=name or cid,
+                                                   scopes=scopes_of, created_by="cli:rotate")
+                _print_pairing(issued, cfg, name=name or cid, scopes=scopes_of)
             else:
                 print("**不留宽限期**：旧 secret 立刻失效，它必须重新配对。"
                       "想让旧 secret 多活一阵（例行轮换、不打断客户端），加 "
@@ -593,7 +569,7 @@ def main(argv=None) -> int:
                     help="配合 --stats：看最近多少小时（默认 24；0 = 全部）")
     ap.add_argument("--list-calls", type=int, default=0, metavar="N",
                     help="看最近 N 条调用元数据（**只有元数据，没有内容**）")
-    # ---- 管理面（设计 §8.4）的账号：管理面自己**只读**，所以账号只能从这里建 ----
+    # ---- 管理面（设计 §8.4）的账号：管理面**只读展示**清单，所以账号只能从这里建 ----
     ap.add_argument("--new-admin", default="", metavar="NAME",
                     help="建管理员账号（或重置其口令）；**口令只打印这一次**")
     ap.add_argument("--list-admins", action="store_true", help="看有哪些管理员账号")

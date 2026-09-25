@@ -74,6 +74,7 @@ curl -s -X POST "$B/v1/diarize" -H 'Content-Type: audio/wav' \
 ## 四、单测与门禁
 
 ```bash
+python -m unittest tests.test_admin_console           # 管理面：登录 / 隔离 / 写面的七道闸
 python -m unittest tests.test_server_contract          # 服务端契约与护栏
 python -m unittest tests.test_line_endings             # server/ 必须保持 LF
 powershell -File scripts/check-windows.ps1             # 全量门禁
@@ -90,6 +91,18 @@ powershell -File scripts/check-windows.ps1             # 全量门禁
 | `EnginePoolTests` | 单飞 / 引用计数 / LRU / 显存预算 / **不回退 CPU** |
 | `Auth*Tests` | 配对码一次性、只存哈希、`alg:none` 被拒、撤销下一个请求就生效 |
 | `AuthSchemaTests` | 库里只有白名单内的表、列名不命中"内容"黑名单 |
+
+`tests/test_admin_console.py` 里与写面有关的那几组：
+
+| 组 | 在钉什么 |
+|---|---|
+| `WriteGuardTests` | 每个写端点（**从 openapi 现读**）：未登录 401、跨站 `Origin` 403、缺 `X-ECHO-Admin` 403、缺 CSRF 403；未登录时**库里一个字节都不动** |
+| `ConfirmTests` | 撤销 / 轮换 secret / 作废码缺 `confirm` → 400 且无副作用 |
+| `PairingCodeWriteTests` | 明文配对串只出现一次、库里只有哈希、**用掉一次就失效**、作废后兑不了 |
+| `ClientWriteTests` | 禁用/启用、撤销后旧令牌**下一个请求就 401**、改 scopes/配额、轮换后新 secret 能用而旧 secret/旧令牌立刻死 |
+| `AuditTests` | 每个写动作（**含失败**）一条审计，操作者是**登录的管理员名** |
+| `SharedImplementationTests` | 命令行与管理面**同一串配对串、同一套 store 方法**（`server/ops.py`） |
+| `ReadOnlyNotLockedTests` | 只读端点只要登录，**不要求**写请求那几个头 |
 
 ## 五、试鉴权（配对 → 令牌）
 
@@ -126,18 +139,81 @@ python scripts/smoke-echo-backend.py --pair-code 7K2M9QX4
 | `--new-admin NAME` | 建管理员账号（或重置其口令）；**口令只打印这一次** |
 | `--list-admins` / `--disable-admin NAME` / `--enable-admin NAME` / `--delete-admin NAME` | 管理面账号的增删改（禁用后他手上的会话**下一个请求就失效**） |
 
-### 管理面（只读控制台）
+### 管理面（控制台 + 写端点）
 
 在配置里设 `server.admin_listen`（例如 `127.0.0.1:8901`）就会起一个**独立端口**上的
 管理页面：`http://<host>:<port>/admin/`。
 
-- **它是只读的**：模型 / 客户端 / 调用 / 「存了什么」四个页签外加概览，全是**看**。
-  写动作（发码、撤销、禁用、改 scope、换 secret、改配额）**故意留在命令行** ——
-  那条路直接开库，不多开一条 HTTP 入口。
-- **账号只能从命令行建**（`--new-admin`），因为管理面自己没有写端点。
-- 一个管理员都没有时，登录**永远失败** —— 启动日志里会大声说这一句。
-- 独立端口的意义是**防火墙一条规则就够**（`客户端网段 → 8900`、`运维网段 → 8901`），
-  比在同一端口上做路径级 ACL 可靠。
+**2026-09-25 起它可写了**（用户要"发授权"这类动作能在面板上完成）。读的部分还是那五个页签
+（概览 / 模型 / 客户端 / 调用 / 存了什么）；写的部分见下表。
+
+| 方法 + 路径 | 干什么 | 要 `confirm` |
+|---|---|---|
+| `POST /admin/api/pairing-codes` | **发授权**：发一张配对码；body `{name, scopes, ttlSeconds, createdBy}`；响应里的 `pairingCode.url` 是**一次性明文** | 否 |
+| `DELETE /admin/api/pairing-codes/{id}` | 作废一张**未使用**的码（`{id}` = 码的哈希，清单里给的就是它） | **是** |
+| `POST /admin/api/clients/{id}/disable` / `enable` | 禁用（403）/ 启用（原令牌直接能用） | 否 |
+| `POST /admin/api/clients/{id}/revoke` | 撤销：`token_version + 1`，**立刻**失效 | **是** |
+| `POST /admin/api/clients/{id}/scopes` | 改权限，body `{scopes}`（空串 = 不限） | 否 |
+| `POST /admin/api/clients/{id}/quota` | 改每日音频分钟数，body `{dailyAudioMinutes}`（0 = 全局默认） | 否 |
+| `POST /admin/api/clients/{id}/rotate-secret` | 换 secret，**新明文只回显一次**；可带 `{graceHours}`（默认 0 = 旧的立刻失效） | **是** |
+
+只读补充：`GET /admin/api/pairing-codes`（待用码 + 剩余时间）、
+`GET /admin/api/clients/{id}`（详情，**没有哈希**）、`GET /admin/api/admins`
+（管理员账号清单，**只读** —— 改账号仍然只在命令行）。
+
+#### 写面的七道闸（缺一条都算没做完）
+
+1. **仍只监听 `server.admin_listen`**（本机 `127.0.0.1:8901`）。能力面 `0.0.0.0:8900` 没动。
+2. **必须管理员会话**：没有有效会话一律 **401**，不会降级成"只读放行"。
+3. **CSRF / DNS-rebinding**：写请求必须 (a) `Origin`（或 `Referer`）**是本站**
+   （`http://127.0.0.1:8901` / `http://localhost:8901` …），(b) 带 `X-ECHO-Admin` 头，
+   (c) 带会话里的 `X-CSRF-Token`。任一条不满足 → **403**，并落一条审计。
+   cookie 是 `HttpOnly + SameSite=Strict`（**没有 `Secure`**：管理面是明文 http，
+   设了 `Secure` 浏览器根本不会存 —— 那是"登录成功但下一请求 401"的经典坑）。
+4. **审计**：每个写动作（**含失败**）一条 `admin_audit`，操作者是**登录的管理员名**；
+   失败把原因写进 `target`（表只有四列，加列要走 §8.5 评审）。
+5. **危险动作二次确认**：撤销 / 轮换 secret / 作废码 —— 面板先弹确认框，
+   后端还要求 body 里带 `confirm`（值 = 目标 id 或 `true`），缺了或不对就是 **400**。
+6. **秘密只回显一次**：轮换出的 secret、刚发的配对串只在**那一次响应**里出现；
+   之后任何接口都不返回明文（配对码库里本来就只有哈希）。面板把它放在一个
+   "只显示这一次"的框里，**刷新即消失**。
+7. **复用命令行那条路的实现**（`server/ops.py`）：`main._admin_cli` 与管理面写端点调的是
+   同一个 `issue_pairing_code` / `revoke_client` / `rotate_client_secret` / …，
+   不在管理面里另写一套。
+
+> **用 `curl` 手测写端点**：必须自己带上那三个头（浏览器会自己带 `Origin`），否则 403：
+>
+> ```bash
+> C=http://127.0.0.1:8901
+> # ① 登录：把 cookie 存进 jar.txt，把响应体存进 login.json（里面有 csrf）
+> curl -s -c jar.txt -o login.json -X POST $C/admin/api/login \
+>      -H 'Content-Type: application/json' \
+>      -d '{"username":"ops","password":"<口令>"}'
+> CSRF=$(python -c "import json;print(json.load(open('login.json'))['csrf'])")
+> # ② 发一张配对码：三个头一个都不能少
+> curl -s -b jar.txt -X POST $C/admin/api/pairing-codes \
+>      -H 'Content-Type: application/json' -H 'X-ECHO-Admin: 1' \
+>      -H "X-CSRF-Token: $CSRF" -H "Origin: $C" \
+>      -d '{"name":"张三的办公本","scopes":"asr diarize","ttlSeconds":3600}'
+> # ③ 撤销（危险动作，要带 confirm）
+> curl -s -b jar.txt -X POST $C/admin/api/clients/cli-1/revoke \
+>      -H 'Content-Type: application/json' -H 'X-ECHO-Admin: 1' \
+>      -H "X-CSRF-Token: $CSRF" -H "Origin: $C" -d '{"confirm":"cli-1"}'
+> ```
+>
+> **只读端点不需要这几个头**（`GET /admin/api/clients` 之类带上 cookie 就够）——
+> 别把只读也一起锁死。
+
+**面板上有什么**（与上表一一对应）：
+
+- 「客户端 / 发授权」页签：**发授权表单**（名字 / scopes / 有效期 / 备注）→ 生成后
+  一个黄色框里显示**一次**明文配对串，带「复制」按钮与"只显示这一次"的提示；
+- 同一个页签下方是**待用码列表**（剩余时间 / 到期时间 / 作废按钮）；
+- 客户端表格每行有 **禁用·启用 / 撤销 / 改 scopes / 改配额 / 轮换 secret**；
+  撤销与轮换先弹确认框（后端还要 `confirm`，见第 5 条闸）；
+- 轮换出来的新 secret 同样在那个"只显示这一次"的框里 —— **刷新页面它就不见了**
+  （后端也不会再给）；
+- 「存了什么」页签底部多了**管理员账号清单（只读）**与**最近的管理动作**（含失败）。
 
 几条需要知道的语义：
 

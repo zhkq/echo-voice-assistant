@@ -538,6 +538,21 @@ class Store:
                 "SELECT * FROM pairing_codes ORDER BY created_at").fetchall()
         return [dict(r) for r in rows]
 
+    def delete_pairing_code(self, code_hash: str) -> bool:
+        """作废一张**未使用**的配对码。返回"确实删掉了一张吗"。
+
+        **表里活着的都是未使用的**：`take_pairing_code` 在兑换时就把行删掉了
+        （设计 §8.5"用掉即删"），所以"作废"与"删掉"是同一件事 ——
+        不需要额外的状态列（加列要走 §8.5 那道评审门）。
+        返回 `False`（= 没有这张码）时**不是**错误状态的伪装：调用方要回 404，
+        否则"我用了一个错误的 id"看起来像成功了。
+        """
+        with self._lock:
+            cur = self._db.execute("DELETE FROM pairing_codes WHERE code_hash=?",
+                                   (str(code_hash or ""),))
+            self._db.commit()
+            return bool(cur.rowcount)
+
     def sweep_pairing_codes(self, now: Optional[float] = None) -> int:
         """删掉过期的码。返回删了几条。
 

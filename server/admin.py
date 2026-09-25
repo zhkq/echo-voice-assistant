@@ -1,15 +1,35 @@
 # -*- coding: utf-8 -*-
-"""管理面（设计 §8.4）：**独立端口上的只读控制台**。
+"""管理面（设计 §8.4）：**独立端口上的控制台**（2026-09-25 起带写端点）。
 
-## 为什么是只读的
+## 为什么从只读变成可写，以及这一版的边界
 
-设计那五个页签要回答的是"**模型跑得怎么样、客户端有谁在连、谁调了什么**" ——
-全是**看**。写动作（发码 / 撤销 / 禁用 / 改 scope / 换 secret / 配配额）**命令行已经齐了**
-（`server/README.md` 那张表），而且那条路**刻意不打 HTTP、直接开库**：
-给管理动作开一条免鉴权的内部端点，正是最容易变成漏洞的做法。
+只读那一版（2026-09-24）的判据是：五个页签要回答"模型跑得怎么样、客户端有谁在连、
+谁调了什么" —— 全是**看**，而写动作命令行已经齐了。那条判据今天依然成立，
+**变的是需求**：用户要"发授权"这类动作能在面板上完成（人在 GPU 那台机器之外时，
+"去敲一条命令"往往是"先 SSH 进去"，那一步经常比动作本身还贵）。
 
-所以这一版刻意**不提供写端点**。要加写动作，先回答一个问题：
-**它比"运维在那台机器上敲一条命令"多解决了什么？** 答不上来就别加。
+所以写端点开了，但**每一条都带防护**（下面"写面的七道闸"），
+而且**判断与落库一行都不在这里新写** —— 全部走 `server/ops.py`，
+与命令行共用同一份实现（两道出口漂移过一次就够贵了）。
+
+## 写面的七道闸（缺一条都算没做完）
+
+1. **仍只监听 `server.admin_listen`**（出厂/本机是 `127.0.0.1:8901`）。
+   能力面 `0.0.0.0:8900` 一个字节都没动。
+2. **必须管理员会话**：没有有效会话一律 401，**绝不降级成"只读放行"**。
+3. **CSRF / DNS-rebinding**：写请求要 (a) `Origin`（或 `Referer`）是本站、
+   (b) 带一个非简单请求标志头 `X-ECHO-Admin`、(c) 带会话里的 `X-CSRF-Token`。
+   为什么三样都要：cookie 是 `SameSite=Strict`，但 **DNS-rebinding 不受它保护**
+   —— 攻击者把域名解析到 `127.0.0.1` 时，浏览器认为这是**同站**请求，
+   cookie 照发。挡住它的是(a)：那种请求的 `Origin` 是攻击者的域名，对不上。
+   (b) 的另一个作用见下面 `WRITE_HEADER` 的注释。
+4. **审计**：每个写动作（**含失败**）落一条 `admin_audit`，操作者是**登录的管理员名**
+   （不是字符串 `cli`）。失败把原因写进 `target`（表只有四列，加列要走 §8.5 评审）。
+5. **危险动作二次确认**：撤销 / 轮换 secret / 作废配对码 —— 前端弹确认框，
+   后端还要求请求体里带 `confirm`（值 = 目标 id 或 `true`），缺了或不对就是 400。
+6. **秘密只回显一次**：轮换出的 secret、刚发的配对串只在**这一次响应**里出现，
+   之后任何接口都不再返回明文（配对码库里本来就是哈希）。
+7. **复用命令行那条路的实现**（`server/ops.py`），不在管理面里另写一套。
 
 ## 与能力面严格隔离（设计 §8.4）
 
@@ -32,8 +52,14 @@
    两个函数各换一行，旧哈希靠前缀（`scrypt$…`）区分，可平滑迁移。
 2. **会话在进程内**（`SessionStore`）：重启即全部登出。管理面本来就不该水平扩，
    而"把会话写进库"要再加一张表（白名单要走评审）—— 不值。
-3. **写请求要带 CSRF 令牌**（双提交）。现在唯一的 POST 是登录（它天然免 CSRF），
-   但机制先立起来：将来加写动作时不会忘。
+3. **写请求要带 CSRF 令牌**（双提交）**+ 非简单请求标志头 + 同站 Origin**，
+   三样都由一道中间件统一把关（见 `_write_guard`）—— 默认拒绝，
+   以后新加的写端点自动受保护，不会因为"忘了调某个 helper"而漏。
+4. **会话 cookie 没有 `Secure`**：设计 §8.4 那张表写的是 `HttpOnly + Secure +
+   SameSite=Strict`，而管理面**是明文 http**（回环端口，`start_admin_server` 不过 TLS）。
+   给一个 http 页面设 `Secure` cookie，浏览器**根本不会存** —— 表现是"登录成功了，
+   下一个请求又是 401"。所以这里刻意只设 `HttpOnly + SameSite=Strict`（照实际实现来），
+   并在设计文档里把这处偏离写明；将来管理面走 https 时再补上 `Secure`。
 """
 from __future__ import annotations
 
@@ -42,6 +68,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 import time
 from typing import Any, Dict, Optional
@@ -50,6 +77,28 @@ from fastapi import APIRouter, FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from server import __version__, errors
+from server import ops as ops_mod
+
+#: 写请求必须带的**非简单请求标志头**（值随便，非空即可）。
+#:
+#: 它的作用不是"再验一次身份"，而是让浏览器**必须先发 CORS 预检**：
+#: 跨站页面能发 `<form method=post>`（简单请求，不带自定义头），也能发
+#: `<img>`/`<script>` 这类拿不到响应的请求 —— 但它们**都发不出自定义头**。
+#: 所以"必须有这个头"这一条，直接把"只靠受害者浏览器里的 cookie 就能提权"
+#: 那条路堵死，而且它不依赖任何浏览器的默认行为。
+WRITE_HEADER = "X-ECHO-Admin"
+
+#: 审计里给"被闸门挡回来的写请求"用的动作名（真实动作名由端点自己记）。
+GUARD_ACTION = "write-guard"
+
+#: 「发授权」表单能填的有效期边界（秒）。**有上下界**是有意的：
+#: 太短（<60 秒）等于发出去就是废码，太长（>7 天）等于把一张长期通行证留在库里。
+MIN_PAIRING_TTL_S = 60
+MAX_PAIRING_TTL_S = 7 * 24 * 3600
+
+#: 只认这几个名字是"本站"。`parse_listen` 出的 `0.0.0.0`/`::`/`*` 是通配地址，
+#: 它们不是浏览器地址栏里能出现的东西，所以换成这三个回环名。
+_LOOPBACK_NAMES = ("127.0.0.1", "localhost", "[::1]")
 
 #: 口令哈希的参数（scrypt）。**这些都是"让人算不快"的参数**：
 #: n=2^14 时一次验证约几十毫秒，暴力破解的代价因此抬高。
@@ -167,12 +216,16 @@ def create_admin_app(cfg, state) -> FastAPI:
 
     # ---- 鉴权 ----
 
+    def store_of() -> Optional[Any]:
+        """能力面那个鉴权库（管理面读写的都是它）。没有 → None。"""
+        return state.auth.store if state.auth is not None else None
+
     def current_admin(request: Request) -> Dict[str, Any]:
         token = request.cookies.get(COOKIE_NAME) or ""
         row = sessions.get(token)
         if row is None:
             raise errors.unauthorized("没登录或会话已过期")
-        store = state.auth.store if state.auth is not None else None
+        store = store_of()
         if store is not None:
             who = store.admin(row["username"])
             if who is None or int(who.get("disabled") or 0):
@@ -182,10 +235,87 @@ def create_admin_app(cfg, state) -> FastAPI:
         return {"username": row["username"], "csrf": row["csrf"]}
 
     def require_csrf(request: Request, who: Dict[str, Any]) -> None:
-        """双提交校验。现在只有登录是 POST（免 CSRF），机制先立着，加写动作时不会忘。"""
+        """双提交校验。写请求那道中间件已经查过一遍（默认拒绝），
+        这里再查一次是**纵深防御**：某天中间件被改动/被挪走，登录态本身也还在。"""
         sent = request.headers.get("x-csrf-token") or ""
         if not sent or not hmac.compare_digest(sent, str(who.get("csrf") or "")):
             raise errors.forbidden("CSRF 令牌不对（刷新页面重试）")
+
+    async def body_of(request: Request) -> Dict[str, Any]:
+        """请求体（字典）。缺 body / 不是 JSON / 是别的类型 → 空字典。
+
+        **不在这里报错**：具体哪个字段缺了由那个动作自己说（那样报错里能带上字段名），
+        而且"缺 confirm"这类判断要在审计区间**之内**做（见 `as_write`）。
+        """
+        try:
+            payload = await request.json()
+        except Exception:
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    def check_confirm(payload: Dict[str, Any], target: str) -> None:
+        """危险动作的二次确认。值 = 目标 id 或 `true`（也收字符串 `"true"`）。
+
+        **后端也要查，不能只靠前端弹窗**：前端确认框挡的是"手滑"，
+        挡不住"直接构造一个请求"—— 而这个字段的意义正是让"撤销/换 secret/作废码"
+        这类动作必须**明确指名**它要动谁（写错 id 与写对 id 的请求长得不一样）。
+        """
+        got = (payload or {}).get("confirm")
+        if got is True:
+            return
+        text = str(got if got is not None else "").strip()
+        if text and text.lower() == "true":
+            return
+        if text and text == str(target):
+            return
+        raise errors.bad_request("危险操作要带 confirm（值 = 目标 id 或 true）")
+
+    def as_write(request: Request, action: str, target: str, fn, *, confirm=None):
+        """跑一个写动作：**会话 → 二次确认 → 执行 → 审计（成功与失败都留痕）**。
+
+        操作者用**登录的管理员名**（`who["username"]`），不是字符串 `cli` ——
+        审计的全部价值就在于回答"是**谁**动的"。命令行那条路记的是 `cli`
+        （它没有"谁"这个概念，安全边界是 shell 权限）。
+
+        顺序：闸门/确认失败也要留痕，所以确认检查放在 try 里面。
+        """
+        who = current_admin(request)
+        store = store_of()
+        try:
+            if confirm is not None:
+                check_confirm(confirm, target)
+            out = fn(who)
+        except errors.EchoError as exc:
+            audit_write(store, who["username"], action + ".failed", target, exc)
+            raise
+        except Exception as exc:                               # pragma: no cover - 兜底
+            audit_write(store, who["username"], action + ".failed", target, exc)
+            raise
+        audit_write(store, who["username"], action, target)
+        return out
+
+    # ---- 写请求的统一闸门（**默认拒绝**）----
+    #
+    # 为什么是中间件而不是"每个端点开头调一个 helper"：写端点是**会长的**
+    # （这一批加了七个），而"新加一个端点时别忘了调某某"是靠人记住的事。
+    # 中间件在这里，新的写端点**自动**受保护；漏掉的反而是"忘了给只读端点开口子"
+    # —— 那种错一测就出来，而且不会静默提权。
+
+    @app.middleware("http")
+    async def _write_guard(request: Request, call_next):
+        path = request.url.path
+        is_write = (request.method not in ("GET", "HEAD", "OPTIONS")
+                    and path.startswith("/admin/api"))
+        if is_write and path != "/admin/api/login":
+            denied = check_write_request(request, cfg, sessions)
+            if denied is not None:
+                # 失败也留痕（但**不知道是谁**的请求不留 —— 那会是扫描器刷表）。
+                row = sessions.get(request.cookies.get(COOKIE_NAME) or "")
+                if row is not None:
+                    audit_write(store_of(), row.get("username") or "",
+                                GUARD_ACTION, "%s %s" % (request.method, path), denied)
+                return JSONResponse(status_code=denied.status, content=denied.body())
+        return await call_next(request)
 
     # ---- 登录 / 登出 ----
 
@@ -285,15 +415,15 @@ def create_admin_app(cfg, state) -> FastAPI:
         for r in rows:
             cid = r["client_id"]
             stat = per_client.get(cid, {})
-            out.append({
-                "clientId": cid, "name": r.get("name", ""), "scopes": r.get("scopes", ""),
-                "disabled": bool(r.get("disabled")),
-                "lastSeen": r.get("last_seen", 0),
-                "dailyAudioMinutes": r.get("daily_audio_minutes", 0),
+            # 用同一个 `client_view`（**白名单式**）—— 列表与详情两处各挑一遍字段，
+            # 迟早会有一处把 `secret_hash` 带出去。
+            row = client_view(r)
+            row.update({
                 "usedMinutesToday": used.get(cid, 0),
                 "calls": stat.get("calls", 0), "errors": stat.get("errors", 0),
                 "audioMinutes": round(float(stat.get("audioSeconds", 0)) / 60.0, 2),
             })
+            out.append(row)
         return {"since": since, "clients": out,
                 "totals": {"calls": agg.get("total", 0), "errors": agg.get("errors", 0)}}
 
@@ -346,6 +476,176 @@ def create_admin_app(cfg, state) -> FastAPI:
         return {"username": who["username"], "csrf": who["csrf"],
                 "sessions": sessions.count()}
 
+    @api.get("/admins")
+    def admins(request: Request):
+        """管理员账号清单（**只读**）。
+
+        管理面**不改账号**（增删改口令仍然只在命令行）：改账号是"改谁能进这扇门"，
+        而面板本身就在这扇门里 —— 让面板改账号，等于给一次会话劫持配一个提权出口。
+        所以这里只把清单摊开给人看（谁、禁用没有、上次登录）。
+        """
+        current_admin(request)
+        store = store_of()
+        rows = store.admins() if store is not None else []
+        return {"admins": [
+            {"username": r.get("username", ""), "disabled": bool(r.get("disabled")),
+             "createdAt": float(r.get("created_at") or 0),
+             "lastLogin": float(r.get("last_login") or 0)} for r in rows],
+            "note": "账号的增删改只在命令行（--new-admin / --disable-admin / --delete-admin）"}
+
+    @api.get("/clients/{client_id}")
+    def client_detail(request: Request, client_id: str):
+        """一个客户端的详情。**没有 `secret_hash`**（见 `client_view`）。"""
+        current_admin(request)
+        store = store_of()
+        row = store.client(client_id) if store is not None else None
+        if row is None:
+            raise errors.EchoError(404, "client_not_found", "没有这个客户端", detail=client_id)
+        used = state.quota.snapshot().get("clients", {})
+        view = client_view(row)
+        view["usedMinutesToday"] = used.get(client_id, 0)
+        # **名字说清楚它是什么**：这不是"今日调用数"（那个在列表里，按小时窗口算），
+        # 而是最近 200 条里属于它的那几条 —— 面板按需展开时看的就是这个。
+        view["recentCalls"] = len(store.recent_calls(limit=200, client_id=client_id))
+        return view
+
+    # ---- 发授权：配对码（写）----
+
+    @api.get("/pairing-codes")
+    def pairing_codes(request: Request):
+        """待用的配对码。**明文永远不在这里** —— 库里只有哈希（设计 §7.4 约定 2）。"""
+        current_admin(request)
+        return {"codes": ops_mod.pending_pairing_codes(store_of()),
+                "defaultTtlSeconds": int(cfg.get("auth.pairing_ttl_s", 900)),
+                "minTtlSeconds": MIN_PAIRING_TTL_S, "maxTtlSeconds": MAX_PAIRING_TTL_S,
+                "note": "配对码只存哈希：明文只在发出去的那一刻出现过一次，这里看不到。"}
+
+    @api.post("/pairing-codes")
+    async def issue_pairing_code(request: Request):
+        """**发授权**：生成一张带名字 / scopes / 有效期的配对码。
+
+        响应里那个 `pairingCode.url` 是**一次性**明文（含证书指纹的整串）：
+        只出现这一次，之后任何接口都不会再给（库里存的是哈希）。
+        `confirm` 不是必需的 —— 发码是"多了一张待用的码"，不是破坏性动作，
+        而且撤销它只需要再点一次「作废」。
+        """
+        payload = await body_of(request)
+        name = str(payload.get("name") or "")
+        scopes = str(payload.get("scopes") or "")
+        note = str(payload.get("createdBy") or payload.get("note") or "")
+
+        def fn(who):
+            return {"ok": True, "pairingCode": ops_mod.issue_pairing_code(
+                cfg, state.auth, name=name, scopes=scopes,
+                ttl_s=parse_ttl(payload.get("ttlSeconds"),
+                                float(cfg.get("auth.pairing_ttl_s", 900))),
+                created_by=note or ("admin:" + str(who["username"])))}
+
+        return as_write(request, "issue-pairing-code", name or "(未命名客户端)", fn)
+
+    @api.delete("/pairing-codes/{code_id}")
+    async def revoke_pairing_code(request: Request, code_id: str):
+        """作废一张**未使用**的配对码（**危险动作**：要带 `confirm`）。"""
+        payload = await body_of(request)
+        return as_write(request, "delete-pairing-code", code_id,
+                        lambda who: ops_mod.revoke_pairing_code(store_of(), code_id),
+                        confirm=payload)
+
+    # ---- 客户端管理（写）----
+
+    @api.post("/clients/{client_id}/disable")
+    async def disable_client(request: Request, client_id: str):
+        """禁用：它会收到 403「认识你但不许用」，凭据本身**没有失效**。"""
+        return as_write(request, "disable", client_id,
+                        lambda who: ops_mod.set_client_disabled(cfg, state.auth,
+                                                                client_id, True))
+
+    @api.post("/clients/{client_id}/enable")
+    async def enable_client(request: Request, client_id: str):
+        """启用：**它手上那个令牌直接就能用**（版本号没动，见 `ops.set_client_disabled`）。"""
+        return as_write(request, "enable", client_id,
+                        lambda who: ops_mod.set_client_disabled(cfg, state.auth,
+                                                                client_id, False))
+
+    @api.post("/clients/{client_id}/revoke")
+    async def revoke_client(request: Request, client_id: str):
+        """撤销（**危险动作**：要带 `confirm`）：`token_version + 1`，令牌立刻失效。
+
+        管理面与能力面在**同一个进程**、共用同一个 `Auth` 缓存，
+        所以这里改完**当场**生效（不是"最多 5 秒"，那是命令行/多实例那条路）。
+        """
+        payload = await body_of(request)
+        return as_write(request, "revoke", client_id,
+                        lambda who: ops_mod.revoke_client(cfg, state.auth, client_id),
+                        confirm=payload)
+
+    @api.post("/clients/{client_id}/scopes")
+    async def set_client_scopes(request: Request, client_id: str):
+        """改权限（`scopes` 必须给，空串 = 不限）。**下一个请求就生效**。"""
+        payload = await body_of(request)
+
+        def fn(who):
+            if "scopes" not in payload:
+                raise errors.bad_request("要带 scopes 字段（空串 = 不限）")
+            return ops_mod.set_client_scopes(cfg, state.auth, client_id,
+                                             str(payload.get("scopes") or ""))
+
+        return as_write(request, "set-scopes", client_id, fn)
+
+    @api.post("/clients/{client_id}/quota")
+    async def set_client_quota(request: Request, client_id: str):
+        """改每日音频分钟数（`dailyAudioMinutes`，0 = 用全局默认）。
+
+        **不清零今天的已用量** —— 额度按自然日算，改上限不该变成"送你一次重置"。
+        """
+        payload = await body_of(request)
+
+        def fn(who):
+            if "dailyAudioMinutes" not in payload:
+                raise errors.bad_request("要带 dailyAudioMinutes 字段（0 = 用全局默认）")
+            try:
+                minutes = float(payload.get("dailyAudioMinutes"))
+            except (TypeError, ValueError):
+                raise errors.bad_request("dailyAudioMinutes 要是分钟数")
+            if minutes < 0:
+                raise errors.bad_request("dailyAudioMinutes 不能是负数")
+            return ops_mod.set_client_quota(cfg, state.auth, client_id, minutes)
+
+        return as_write(request, "set-quota", client_id, fn)
+
+    @api.post("/clients/{client_id}/rotate-secret")
+    async def rotate_client_secret(request: Request, client_id: str):
+        """轮换 secret（**危险动作**：要带 `confirm`）。
+
+        响应里的新 secret **只出现这一次**：库里存的是哈希，之后任何接口都不会再给。
+        同时 `token_version + 1` —— 它原来那些令牌立刻全失效（泄漏时最想断的就是它们）。
+
+        `graceHours > 0` 时旧 secret 在宽限期内仍能换令牌（例行轮换不打断客户端），
+        并**顺带再发一张配对码**把那台机器接回来 —— 与命令行的 `--grace-hours`
+        走的是同一条路。⚠️ 宽限期**不能用于 secret 泄漏**（旧 secret 照样进得来）。
+        """
+        payload = await body_of(request)
+
+        def fn(who):
+            raw = payload.get("graceHours")
+            grace = 0.0
+            if raw not in (None, ""):
+                try:
+                    grace = float(raw)
+                except (TypeError, ValueError):
+                    raise errors.bad_request("graceHours 要是小时数")
+                if grace < 0 or grace > 24 * 30:
+                    raise errors.bad_request("graceHours 要在 0 ~ 720 之间")
+            out = ops_mod.rotate_client_secret(cfg, state.auth, client_id, grace_hours=grace)
+            if grace > 0:
+                out["pairingCode"] = ops_mod.issue_pairing_code(
+                    cfg, state.auth, name=out.get("name") or client_id,
+                    scopes=out.get("scopes") or "",
+                    created_by="rotate:" + str(who["username"]))
+            return out
+
+        return as_write(request, "rotate-secret", client_id, fn, confirm=payload)
+
     app.include_router(api)
     app.add_exception_handler(errors.EchoError, _error_handler)
 
@@ -384,6 +684,142 @@ def parse_listen(text: str) -> tuple:
         return ("", 0)
 
 
+# ---------------------------------------------------------------- 写请求的三道闸
+
+def allowed_origins(cfg, request: Optional[Request] = None) -> set:
+    """本站的 origin 白名单（`scheme://host:port`，小写）。
+
+    端口来自 `server.admin_listen`（管理面的真实监听地址）。
+    **没有配置端口时**（只有单测会直接 `create_admin_app` 而不配监听）才退一步
+    读请求自己的 `Host` —— 而且**只认回环名**：`Host: evil.example:8901` 这种
+    一个字都不采纳。这条兜底是有意的窄：DNS-rebinding 的攻击者控制不了受害者的
+    `Host` 是 `127.0.0.1` 还是自己的域名，所以"只信回环名"不会给它任何东西。
+    """
+    host, port = parse_listen(cfg.get("server.admin_listen", ""))
+    if not port:
+        if request is None:
+            return set()
+        h, p = parse_listen(request.headers.get("host") or "")
+        if h not in ("127.0.0.1", "localhost", "::1", "[::1]") or not p:
+            return set()
+        host, port = h, p
+    names = list(_LOOPBACK_NAMES)
+    if host and host not in ("0.0.0.0", "::", "*", ""):
+        names.append(host)
+    # 两种 scheme 都收：管理面自己是明文 http，但放在反代后面时浏览器看到的是 https。
+    # 认的是**同站**这件事，scheme 不改变它是不是本站。
+    return {"%s://%s:%d" % (scheme, name, port)
+            for name in set(names) for scheme in ("http", "https")}
+
+
+def origin_of(request: Request) -> str:
+    """这次请求的"来源站"：`Origin` 优先，没有就用 `Referer` 的 scheme+host+port。
+
+    `Referer` 要**只取到 host 为止**（它带完整路径），而且取不出来就返回空串 ——
+    空串在调用方那里一律是拒绝，不会因为"解析失败"变成放行。
+    """
+    raw = str(request.headers.get("origin") or "").strip()
+    if raw:
+        return raw.lower().rstrip("/")
+    ref = str(request.headers.get("referer") or "").strip()
+    if not ref:
+        return ""
+    m = re.match(r"^([a-zA-Z][a-zA-Z0-9+.\-]*://[^/?#]+)", ref)
+    return m.group(1).lower() if m else ""
+
+
+def check_write_request(request: Request, cfg, sessions, *, cookie_name: str = COOKIE_NAME):
+    """写请求的闸门。返回 `None` = 放行，否则返回一个 `EchoError`（401/403）。
+
+    **顺序是有意的**：先认身份（401），再判"这次请求像不像浏览器从本站发出的"（403）。
+    反过来的话，一个没登录的跨站请求会得到 403，而 403 已经泄漏了
+    "这个端点存在且需要凭据"这件小事 —— 401 更诚实也更有用。
+    """
+    token = request.cookies.get(cookie_name) or ""
+    row = sessions.get(token)
+    if row is None:
+        return errors.unauthorized("没登录或会话已过期")
+    sent = str(request.headers.get("x-csrf-token") or "")
+    if not sent or not hmac.compare_digest(sent, str(row.get("csrf") or "")):
+        return errors.forbidden("CSRF 令牌不对（刷新页面重试）")
+    if not str(request.headers.get(WRITE_HEADER) or "").strip():
+        # 见 `WRITE_HEADER` 的注释：这一条不是身份校验，是"非简单请求"的标志。
+        return errors.forbidden("写请求必须带 %s 头（防跨站表单的那道闸）" % WRITE_HEADER)
+    origin = origin_of(request)
+    if not origin or origin not in allowed_origins(cfg, request):
+        return errors.forbidden("写请求的 Origin/Referer 不是本站（%s）"
+                                % (origin or "缺失"))
+    return None
+
+
+def audit_write(store, admin: str, action: str, target: str = "", exc=None) -> None:
+    """记一条写动作（成功或失败）。
+
+    **失败也要留痕**：`admin_audit` 只有四列（`ts/admin/action/target`，设计 §8.5），
+    所以"结果与原因"编码进 `action`（成功 `revoke`、失败 `revoke.failed`）与
+    `target`（`cli-x | forbidden 没登录或会话已过期`）—— **不加列**：
+    加列要走 §8.5 那道评审门，而这里的信息量四列装得下。
+
+    写不进去**不覆盖原来的错误**：审计失败不该把"一次已经成功的动作"变成 500
+    （客户端会重试，于是动作做两遍），也不该把原始异常吃掉。
+    """
+    if store is None:
+        return
+    text = str(target or "")
+    if exc is not None:
+        why = "%s %s" % (getattr(exc, "code", "error"),
+                         getattr(exc, "detail", "") or getattr(exc, "message", ""))
+        text = (text + " | " + why) if text else why.strip()
+    try:
+        store.audit(str(admin or ""), str(action or ""), text)
+    except Exception:                                          # pragma: no cover - 兜底
+        pass
+
+
+def client_view(row: Dict[str, Any]) -> Dict[str, Any]:
+    """一个客户端行 → **可以出网**的那份视图。
+
+    **白名单式**：只挑这几个字段。绝不 `dict(row)` —— 那一行里有 `secret_hash`
+    与 `prev_secret_hash`，而管理面的每一条响应都会进浏览器（截图、控制台、
+    发给人的报错）。"秘密只回显一次"这条闸门就靠这个函数守住。
+    """
+    prev_exp = float(row.get("prev_secret_expires_at") or 0)
+    return {
+        "clientId": str(row.get("client_id") or ""),
+        "name": str(row.get("name") or ""),
+        "scopes": str(row.get("scopes") or ""),
+        "scopesList": str(row.get("scopes") or "").split(),
+        "disabled": bool(row.get("disabled")),
+        "tokenVersion": int(row.get("token_version") or 0),
+        "dailyAudioMinutes": float(row.get("daily_audio_minutes") or 0.0),
+        "createdAt": float(row.get("created_at") or 0),
+        "updatedAt": float(row.get("updated_at") or 0),
+        "lastSeen": float(row.get("last_seen") or 0),
+        "secretRotatedAt": float(row.get("secret_rotated_at") or 0),
+        # 宽限期里旧 secret 还能换令牌 —— 这件事必须显形，否则"轮换过了"是个错觉
+        "oldSecretUsableUntil": prev_exp if prev_exp > time.time() else 0.0,
+    }
+
+
+def parse_ttl(seconds, default: float) -> float:
+    """配对码有效期（秒）。空 → 用配置默认；坏值/越界 → 400。
+
+    **越界就是 400，不静默夹紧**：夹紧会让"我明明填了 30 天"变成"其实只发了 7 天"，
+    而发码的人以为同事有 30 天。
+    """
+    if seconds in (None, "", 0):
+        return float(default)
+    try:
+        ttl = float(seconds)
+    except (TypeError, ValueError):
+        raise errors.bad_request("ttlSeconds 要是秒数")
+    if ttl < MIN_PAIRING_TTL_S or ttl > MAX_PAIRING_TTL_S:
+        raise errors.bad_request("ttlSeconds 要在 %d ~ %d 秒之间（%.1f 分钟 ~ %.0f 天）"
+                                 % (MIN_PAIRING_TTL_S, MAX_PAIRING_TTL_S,
+                                    MIN_PAIRING_TTL_S / 60.0, MAX_PAIRING_TTL_S / 86400.0))
+    return ttl
+
+
 def start_admin_server(cfg, state, *, log=None):
     """在**另一个端口**上把管理面跑起来（同一个进程、后台线程）。
 
@@ -413,7 +849,9 @@ def start_admin_server(cfg, state, *, log=None):
             log.warning("管理面监听在 %s:%d（不是回环）—— 那个网段里谁能连上谁就能看到"
                         "模型/客户端/调用元数据。请用防火墙只放运维网段（设计 §8.4）。",
                         host, port)
-        log.info("管理面在 http://%s:%d/admin/ （**只读**；写动作走命令行）", host, port)
+        log.info("管理面在 http://%s:%d/admin/ （**可写**：发授权 / 禁用 / 撤销 / 改 scopes / "
+                 "改配额 / 轮换 secret；全部要求管理员会话 + 同站 Origin + %s 头）",
+                 host, port, WRITE_HEADER)
     server = uvicorn.Server(uvicorn.Config(app, host=host, port=port, log_level="warning"))
     thread = threading.Thread(target=server.run, name="echo-admin", daemon=True)
     thread.start()
@@ -450,7 +888,10 @@ class _Throttle:
 def _page() -> str:
     """管理页面。**一个文件、无构建步骤**（服务端不进前端工具链）。
 
-    它只做一件事：把 `/admin/api/*` 的结果画成五个页签。**没有任何写动作**。
+    它只做两件事：把 `/admin/api/*` 的结果画成页签，以及把写动作发给那几个写端点
+    （写请求都带 `X-ECHO-Admin` 与 `X-CSRF-Token`，危险动作先弹二次确认）。
+    页面里**没有任何秘密** —— 新 secret / 新配对串只存在这一次响应的内存里，
+    刷新之后不再出现（后端也不会再给）。
     """
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "admin.html")
     try:

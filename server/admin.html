@@ -20,12 +20,15 @@
            border-radius:6px; padding:6px 12px; cursor:pointer; font-size:13px; }
   button:hover { border-color:var(--accent); }
   button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  button.danger { color:var(--red); border-color:#5a2a2a; }
+  button.danger:hover { border-color:var(--red); }
   main { padding:12px 16px 40px; max-width:1200px; margin:0 auto; }
   .tabs { display:flex; gap:6px; flex-wrap:wrap; margin-bottom:12px; }
   .tabs button.active { background:var(--accent); border-color:var(--accent); color:#fff; }
   .card { background:var(--card); border:1px solid var(--border); border-radius:10px;
           padding:12px 14px; margin-bottom:12px; min-width:0; }
   .card h2 { margin:0 0 8px; font-size:14px; font-weight:600; }
+  .card.once { border-color:var(--yellow); }
   .kv { display:flex; gap:18px; flex-wrap:wrap; }
   .kv div { min-width:0; }
   .kv b { display:block; font-size:18px; }
@@ -46,6 +49,17 @@
                  border:1px solid var(--border); background:var(--card2); color:var(--text); }
   #err { color:var(--red); font-size:13px; min-height:20px; }
   .hidden { display:none !important; }
+  .form { display:flex; gap:10px; flex-wrap:wrap; align-items:flex-end; margin-top:8px; }
+  .form label { display:flex; flex-direction:column; gap:4px; font-size:12px; color:var(--muted); }
+  .form input, .form select { padding:6px 8px; border-radius:6px; min-width:170px;
+                              border:1px solid var(--border); background:var(--card2);
+                              color:var(--text); font-size:13px; }
+  .acts { display:flex; gap:6px; flex-wrap:wrap; }
+  .acts button { padding:3px 8px; font-size:12px; }
+  .secret { font-family:ui-monospace,Consolas,monospace; font-size:13px; word-break:break-all;
+            background:var(--bg); border:1px solid var(--yellow); border-radius:6px;
+            padding:8px 10px; margin-top:8px; user-select:all; }
+  .errtxt { color:var(--red); font-size:12px; min-height:16px; margin-top:6px; }
 </style>
 </head>
 <body>
@@ -53,7 +67,8 @@
   <div class="card">
     <h2>ECHO 能力后端 · 管理面</h2>
     <div class="muted" style="font-size:12px">
-      只读控制台：模型、客户端、调用与「存了什么」。<b>写动作走命令行</b>（见 server/README.md）。
+      模型、客户端、调用与「存了什么」，以及<b>发授权 / 禁用 / 撤销 / 改权限与配额 / 轮换 secret</b>。
+      写动作要登录，且只在<b>本站页面</b>里能发（跨站请求一律 403）。
     </div>
     <input id="u" placeholder="管理员用户名" autocomplete="username">
     <input id="p" type="password" placeholder="口令" autocomplete="current-password">
@@ -77,7 +92,7 @@
     <div class="tabs">
       <button data-tab="overview" class="active">概览</button>
       <button data-tab="models">模型</button>
-      <button data-tab="clients">客户端</button>
+      <button data-tab="clients">客户端 / 发授权</button>
       <button data-tab="calls">调用</button>
       <button data-tab="inventory">存了什么</button>
     </div>
@@ -88,18 +103,40 @@
 <script>
 const $ = (s) => document.querySelector(s);
 let CSRF = "";
+/* 「只显示这一次」的东西（新 secret / 新配对串）只活在这个变量里：
+   刷新页面 = 变量没了 = 不再回显。后端也不会再给（库里只有哈希）。 */
+let ONCE = null;
 
 async function api(path, opts = {}) {
   const res = await fetch(path, { credentials: "same-origin", ...opts });
-  if (res.status === 401) { showLogin(); throw new Error("需要登录"); }
-  if (!res.ok) throw new Error(`HTTP ${res.status}: ${await res.text()}`);
-  return res.json();
+  if (res.ok) return res.json();
+  let body = null;
+  try { body = await res.json(); } catch (e) { body = null; }
+  const msg = body
+    ? ((body.message || ("HTTP " + res.status)) + (body.detail ? "：" + body.detail : ""))
+    : ("HTTP " + res.status);
+  if (res.status === 401 && !$("#app").classList.contains("hidden")) showLogin();
+  throw new Error(msg);
+}
+
+/* 写请求：必须带**非简单请求标志头**与 CSRF 令牌（Origin 由浏览器自己带）。
+   这两个头不是"再多验一次身份"，而是让浏览器必须先发预检 —— 跨站表单发不出自定义头。 */
+function whdrs() {
+  return { "Content-Type": "application/json", "X-ECHO-Admin": "1", "X-CSRF-Token": CSRF };
+}
+async function wpost(path, body) {
+  return api(path, { method: "POST", headers: whdrs(), body: JSON.stringify(body || {}) });
+}
+async function wdelete(path, body) {
+  return api(path, { method: "DELETE", headers: whdrs(), body: JSON.stringify(body || {}) });
 }
 
 function esc(s) {
   return String(s == null ? "" : s).replace(/[&<>"']/g,
     (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
+/* 表格里要放按钮时用它包一下（**调用方负责转义里面的值**）。 */
+const raw = (html) => ({ __raw: html });
 const hm = (sec) => {
   sec = Number(sec || 0);
   const d = Math.floor(sec / 86400), h = Math.floor((sec % 86400) / 3600),
@@ -111,6 +148,13 @@ const ago = (ts) => {
   if (!ts) return "—";
   const s = Math.max(0, Math.floor(Date.now() / 1000 - ts));
   return s < 60 ? s + " 秒前" : (s < 3600 ? Math.floor(s / 60) + " 分钟前" : hm(s) + " 前");
+};
+const ts = (v) => (Number(v || 0) ? new Date(Number(v) * 1000).toLocaleString() : "—");
+const left = (sec) => {
+  sec = Number(sec || 0);
+  if (sec <= 0) return '<span class="badge off">已过期</span>';
+  return sec < 3600 ? Math.ceil(sec / 60) + " 分钟"
+                    : (sec < 86400 ? (sec / 3600).toFixed(1) + " 小时" : (sec / 86400).toFixed(1) + " 天");
 };
 const mb = (n) => (Number(n || 0) / 1024).toFixed(1) + " GB";
 
@@ -140,9 +184,10 @@ $("#p").addEventListener("keydown", (e) => { if (e.key === "Enter") $("#btnLogin
 
 $("#btnLogout").onclick = async () => {
   try {
-    await api("/admin/api/logout", { method: "POST", headers: { "X-CSRF-Token": CSRF } });
+    await wpost("/admin/api/logout");
   } catch (e) { /* 会话可能已经过期，照样回登录页 */ }
   CSRF = "";
+  ONCE = null;
   showLogin();
 };
 $("#btnReload").onclick = () => render();
@@ -171,9 +216,9 @@ async function render() {
   try {
     if (tab === "overview") v.innerHTML = await viewOverview();
     else if (tab === "models") v.innerHTML = await viewModels();
-    else if (tab === "clients") v.innerHTML = await viewClients();
+    else if (tab === "clients") { v.innerHTML = await viewClients(); bindClients(); }
     else if (tab === "calls") v.innerHTML = await viewCalls();
-    else v.innerHTML = await viewInventory();
+    else { v.innerHTML = await viewInventory(); }
   } catch (e) {
     v.innerHTML = `<div class="card"><h2>读不到</h2><div class="muted">${esc(e.message)}</div></div>`;
   }
@@ -216,16 +261,177 @@ async function viewModels() {
       加载/卸载是能力面自己的状态机（按需 + LRU），管理面只读。</div></div>`;
 }
 
+/* ---------------------------------------------------------------- 客户端 / 发授权 */
+
+function onceCard() {
+  if (!ONCE) return "";
+  return `<div class="card once">
+    <h2>${esc(ONCE.title)}</h2>
+    <div class="muted">⚠️ <b>只显示这一次</b>：刷新页面后不再出现，后端也不会再给
+      （库里只有哈希）。现在复制走。</div>
+    <div class="secret" id="onceVal">${esc(ONCE.value)}</div>
+    <div style="display:flex;gap:8px;margin-top:8px">
+      <button class="primary" id="btnCopy">复制</button>
+      <button id="btnOnceClose">我已复制，关掉</button>
+    </div>
+    ${ONCE.extra ? `<div class="muted" style="margin-top:6px">${esc(ONCE.extra)}</div>` : ""}
+  </div>`;
+}
+
+function bindOnce() {
+  const copy = $("#btnCopy");
+  if (!copy) return;
+  copy.onclick = async () => {
+    const text = ONCE ? ONCE.value : "";
+    try {
+      await navigator.clipboard.writeText(text);
+      copy.textContent = "已复制 ✓";
+    } catch (e) {
+      // 回退：把文本选中，让人自己 Ctrl+C（老浏览器 / 非安全上下文里 clipboard 可能不可用）
+      const el = $("#onceVal");
+      const r = document.createRange();
+      r.selectNodeContents(el);
+      const sel = window.getSelection();
+      sel.removeAllRanges();
+      sel.addRange(r);
+      copy.textContent = "已选中，请按 Ctrl+C";
+    }
+  };
+  const close = $("#btnOnceClose");
+  if (close) close.onclick = () => { ONCE = null; render(); };
+}
+
+function issueForm() {
+  const ttls = [["900", "15 分钟"], ["3600", "1 小时"], ["86400", "1 天"], ["604800", "7 天"]];
+  return `<div class="card"><h2>发授权（给新客户端一张配对码）</h2>
+    <div class="muted">生成一串 <code>echo://pair?host=…&amp;code=…</code>，粘给同事在客户端面板里
+      <b>用一次</b>。名字与 scopes <b>跟着码走</b>（对端自报的盖不过它）。</div>
+    <div class="form">
+      <label>客户端名字<input id="pcName" placeholder="张三的办公本"></label>
+      <label>scopes<input id="pcScopes" placeholder="asr diarize（逗号或空格；空 = 不限）"></label>
+      <label>有效期<select id="pcTtl">${ttls.map(([v, t]) =>
+        `<option value="${v}">${t}</option>`).join("")}</select></label>
+      <label>备注（谁发的）<input id="pcNote" placeholder="ops"></label>
+      <button class="primary" id="btnIssue">生成配对码</button>
+    </div>
+    <div class="errtxt" id="issueErr"></div></div>`;
+}
+
+function pendingCodes(d) {
+  const rows = (d.codes || []).map((c) => [
+    c.name || "(未命名)", c.scopes || "(不限)", c.createdBy || "—",
+    c.expired ? '<span class="badge off">已过期</span>' : left(c.remainingSeconds),
+    ts(c.expiresAt),
+    raw(`<button class="danger" data-code="${esc(c.id)}">作废</button>`),
+  ]);
+  return `<div class="card"><h2>待用的配对码（${(d.codes || []).length}）</h2>
+    ${table(["名字", "scopes", "谁发的", "剩余", "到期时间", "操作"], rows)}
+    <div class="muted" style="margin-top:6px">${esc(d.note)}</div></div>`;
+}
+
+function clientActions(c) {
+  const id = esc(c.clientId);
+  return `<div class="acts">
+    <button data-act="${c.disabled ? "enable" : "disable"}" data-id="${id}">${c.disabled ? "启用" : "禁用"}</button>
+    <button class="danger" data-act="revoke" data-id="${id}">撤销</button>
+    <button data-act="scopes" data-id="${id}" data-scopes="${esc(c.scopes)}">改 scopes</button>
+    <button data-act="quota" data-id="${id}" data-quota="${Number(c.dailyAudioMinutes || 0)}">改配额</button>
+    <button class="danger" data-act="rotate" data-id="${id}">轮换 secret</button>
+  </div>`;
+}
+
 async function viewClients() {
   const d = await api("/admin/api/clients");
-  return `<div class="card"><h2>客户端（最近 24 小时：${d.totals.calls} 次调用，失败 ${d.totals.errors}）</h2>
-  ${table(["客户端", "名字", "状态", "scopes", "最后活跃", "今日调用", "失败", "今日音频", "日配额"],
-    d.clients.map((c) => [c.clientId, c.name || "—",
-      c.disabled ? '<span class="badge off">已禁用</span>' : '<span class="badge on">正常</span>',
-      c.scopes || "(不限)", ago(c.lastSeen), c.calls, c.errors,
-      c.audioMinutes + " min", c.dailyAudioMinutes ? c.dailyAudioMinutes + " min/天" : "全局默认"]))}
-  <div class="muted" style="margin-top:8px">写动作（撤销 / 禁用 / 改 scope / 换 secret / 改配额）
-    <b>故意不在这里</b>：它们在命令行里，而且那条路直接开库、不多开一条 HTTP 入口。</div></div>`;
+  const codes = await api("/admin/api/pairing-codes");
+  const rows = d.clients.map((c) => [
+    c.clientId, c.name || "—",
+    c.disabled ? '<span class="badge off">已禁用</span>' : '<span class="badge on">正常</span>',
+    c.scopes || "(不限)", "v" + c.tokenVersion, ago(c.lastSeen), c.calls, c.errors,
+    c.audioMinutes + " min",
+    c.dailyAudioMinutes ? c.dailyAudioMinutes + " min/天" : "全局默认",
+    raw(clientActions(c)),
+  ]);
+  return onceCard() + issueForm() + pendingCodes(codes)
+    + `<div class="card"><h2>客户端（最近 24 小时：${d.totals.calls} 次调用，失败 ${d.totals.errors}）</h2>
+    ${table(["客户端", "名字", "状态", "scopes", "版本", "最后活跃", "今日调用", "失败",
+             "今日音频", "日配额", "操作"], rows)}
+    <div class="muted" style="margin-top:8px">
+      危险动作（<b>撤销 / 轮换 secret / 作废配对码</b>）会先弹确认，请求里还带
+      <code>confirm</code> —— 前端弹窗挡手滑，后端那个字段挡"直接构造一个请求"。<br>
+      <b>撤销</b>是 <code>token_version + 1</code>，<b>立刻</b>生效（管理面与能力面同进程、
+      共用同一个鉴权缓存）；<b>禁用</b>只是 403，凭据没失效，随时能再启用。</div></div>`;
+}
+
+function bindClients() {
+  bindOnce();
+  const issue = $("#btnIssue");
+  if (issue) {
+    issue.onclick = async () => {
+      $("#issueErr").textContent = "";
+      try {
+        const r = await wpost("/admin/api/pairing-codes", {
+          name: $("#pcName").value, scopes: $("#pcScopes").value,
+          ttlSeconds: Number($("#pcTtl").value), note: $("#pcNote").value,
+        });
+        const pc = r.pairingCode;
+        ONCE = {
+          title: "新的配对串（" + (pc.name || "未命名客户端") + "）",
+          value: pc.url,
+          extra: "有效 " + Math.round(pc.ttlSeconds / 60) + " 分钟；scopes=" + (pc.scopes || "不限")
+                 + "；由 " + (pc.createdBy || "—") + " 发",
+        };
+        await render();
+      } catch (e) { $("#issueErr").textContent = e.message; }
+    };
+  }
+  document.querySelectorAll("[data-act]").forEach((b) => { b.onclick = () => clientAction(b); });
+  document.querySelectorAll("[data-code]").forEach((b) => { b.onclick = () => dropCode(b); });
+}
+
+async function clientAction(btn) {
+  const id = btn.dataset.id, act = btn.dataset.act;
+  try {
+    if (act === "disable" || act === "enable") {
+      const q = act === "disable"
+        ? "禁用 " + id + "？\n\n它会收到 403（认识它但不许用）；凭据没有失效，随时能重新启用。"
+        : "启用 " + id + "？\n\n它手上那个令牌直接就能用，不需要重新配对。";
+      if (!confirm(q)) return;
+      await wpost(`/admin/api/clients/${id}/${act}`);
+    } else if (act === "revoke") {
+      if (!confirm("撤销 " + id + "？\n\n它手上的令牌**立刻全部失效**，那台机器必须重新配对"
+                   + "（重新发一张配对码）。")) return;
+      await wpost(`/admin/api/clients/${id}/revoke`, { confirm: id });
+    } else if (act === "scopes") {
+      const v = prompt("新的 scopes（逗号或空格分隔；留空 = 不限）：", btn.dataset.scopes || "");
+      if (v === null) return;
+      await wpost(`/admin/api/clients/${id}/scopes`, { scopes: v });
+    } else if (act === "quota") {
+      const v = prompt("每日音频分钟数上限（0 = 用全局默认；**不清零今天的已用量**）：",
+                       btn.dataset.quota || "0");
+      if (v === null) return;
+      await wpost(`/admin/api/clients/${id}/quota`, { dailyAudioMinutes: Number(v) });
+    } else if (act === "rotate") {
+      if (!confirm("轮换 " + id + " 的 secret？\n\n"
+                   + "① 新的明文**只显示这一次**（关掉就再也看不到）；\n"
+                   + "② 它原来那些令牌立刻全失效。")) return;
+      const r = await wpost(`/admin/api/clients/${id}/rotate-secret`, { confirm: id });
+      ONCE = {
+        title: "新的 secret（" + id + "）",
+        value: r.secret,
+        extra: "带外交给那台机器：旧 secret 与旧令牌已经立刻失效。",
+      };
+    }
+    await render();
+  } catch (e) { alert("失败：" + e.message); }
+}
+
+async function dropCode(btn) {
+  const id = btn.dataset.code;
+  if (!confirm("作废这张配对码？\n\n它还没被用过；作废之后那个码就兑不了了。")) return;
+  try {
+    await wdelete("/admin/api/pairing-codes/" + encodeURIComponent(id), { confirm: id });
+    await render();
+  } catch (e) { alert("失败：" + e.message); }
 }
 
 async function viewCalls() {
@@ -246,28 +452,39 @@ async function viewCalls() {
 
 async function viewInventory() {
   const d = await api("/admin/api/inventory");
+  const acc = await api("/admin/api/admins");
   const rows = Object.entries(d.tables).map(([t, cols]) =>
     [t, cols.length, cols.join(", "), d.whitelist.includes(t) ? "在白名单" : "**不在白名单**"]);
   return `<div class="card"><h2>存了什么</h2>
     <div>${esc(d.statement)}</div>
     <div class="muted" style="margin-top:6px">下面这张表读的是<b>活着的库</b>，不是文档：
-      表名与列名都是当场从数据库读出来的。命中"内容黑名单"的列：<b>${d.contentColumns.length ? esc(d.contentColumns.join("、")) : "0 个"}</b>。</div>
+      表名与列名都是当场从数据库读出来的。${esc(d.contentCheck)}</div>
   </div>
   <div class="card"><h2>表与列（实际状态）</h2>${table(["表", "列数", "列", "白名单"], rows)}
     <div class="muted" style="margin-top:8px">两个目录：临时 <code>${esc(d.tmpRoot || "(默认)")}</code>
       （可以被清理器删、可以挂 tmpfs）；耐久 <code>${esc(d.stateRoot || "(默认)")}</code>。
       <b>两种相反的保留策略，故意分开</b>。</div></div>
+  <div class="card"><h2>管理员账号（本面板只读）</h2>${table(
+    ["账号", "状态", "建号", "最后登录"],
+    acc.admins.map((a) => [a.username,
+      a.disabled ? '<span class="badge off">已禁用</span>' : '<span class="badge on">正常</span>',
+      ts(a.createdAt), ts(a.lastLogin)]))}
+    <div class="muted" style="margin-top:6px">${esc(acc.note)} —— 面板刻意不改账号：
+      改账号等于"改谁能进这扇门"，而面板本身就在这扇门里（一次会话劫持就能顺手把自己加成管理员）。</div></div>
   <div class="card"><h2>最近的管理动作</h2>${table(
     ["时间", "管理员", "动作", "对象"],
     d.recentAudit.map((a) => [new Date(Number(a.ts) * 1000).toLocaleString(), a.admin,
-      a.action, a.target || "—"]))}</div>`;
+      a.action, a.target || "—"]))}
+    <div class="muted" style="margin-top:6px">写动作**含失败**都在这里（失败的动作名带
+      <code>.failed</code>，"被闸门挡回来"的记成 <code>write-guard</code>）。</div></div>`;
 }
 
 function table(head, rows) {
   if (!rows.length) return `<div class="muted">（没有数据）</div>`;
   return `<table><thead><tr>${head.map((h) => `<th>${esc(h)}</th>`).join("")}</tr></thead>
     <tbody>${rows.map((r) => `<tr>${r.map((c) =>
-      `<td>${typeof c === "string" && c.startsWith("<span") ? c : esc(c)}</td>`).join("")}</tr>`).join("")}
+      `<td>${(c && typeof c === "object" && c.__raw) ? c.__raw
+             : (typeof c === "string" && c.startsWith("<span") ? c : esc(c))}</td>`).join("")}</tr>`).join("")}
     </tbody></table>`;
 }
 

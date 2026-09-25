@@ -416,17 +416,21 @@ class Auth:
     # ---- 配对（§7.4）-------------------------------------------------------
 
     def create_pairing_code(self, created_by: str = "", name: str = "",
-                            scopes: str = "") -> str:
+                            scopes: str = "", ttl_s: Optional[float] = None) -> str:
         """生成一次性配对码，**明文只在这里返回这一次**。
 
         `name` / `scopes` 是**这张码将要创建的那个客户端**的身份（设计 §7.4 的
         "管理员新建客户端：填名字、scope、配额"）。它们跟着码走，
         兑换时直接用 —— 不这么做的话，`--new-client "张三的办公本" --scopes asr`
         就只是一句好听话：兑出来的客户端还是全局默认 scopes。
+
+        `ttl_s` 不给就用 `auth.pairing_ttl_s`（出厂 15 分钟）。管理面的「发授权」
+        表单要能选更长的有效期（例如给外地同事发一天的码），那只是**同一个入口
+        的一个入参**，所以参数加在这里，而不是让管理面自己写一遍落库。
         """
         code = new_pairing_code()
-        self.store.put_pairing_code(hash_pairing_code(code),
-                                    float(self.cfg.get("auth.pairing_ttl_s", 900)),
+        ttl = float(self.cfg.get("auth.pairing_ttl_s", 900)) if ttl_s is None else float(ttl_s)
+        self.store.put_pairing_code(hash_pairing_code(code), ttl,
                                     created_by=created_by, name=name, scopes=scopes)
         return code
 
