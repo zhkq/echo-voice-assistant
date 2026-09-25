@@ -506,9 +506,12 @@ DEFAULTS = {
                              description="低于此音量不送入唤醒模型（省电防误触发）", value_type="int"),
     # ---------- 会议 ----------
     "meetingSttModel":  dict(value="sensevoice", grp="model", label="会议转写引擎",
-                             description="sensevoice 最快（中文会议推荐）；small/medium/large 是 whisper；qwen3asr 最准但慢约 20 倍（GPU rtf≈0.45）",
+                             description="sensevoice 最快（中文会议推荐）；small/medium/large 是 whisper；"
+                                         "qwen3asr 最准但慢约 20 倍（GPU rtf≈0.45）；"
+                                         "sherpa 是流式引擎（只装它也能用，但它不给句级时间戳 → "
+                                         "时间轴按字数估算，详情页会标「估算」）",
                              value_type="str",
-                             options=["sensevoice", "qwen3asr", "small", "medium", "large"]),
+                             options=["sensevoice", "qwen3asr", "sherpa", "small", "medium", "large"]),
     "meetingSegmentMinutes": dict(value=10, grp="meeting", label="分段分钟",
                                   description="录音每 N 分钟存一个文件", value_type="int"),
     "meetingAutoSummarize": dict(value=True, grp="meeting", label="自动生成纪要",

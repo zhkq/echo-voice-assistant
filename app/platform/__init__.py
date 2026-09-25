@@ -286,6 +286,19 @@ def shell_script(hf: str, jobs) -> str:
     return str(fn(hf, jobs)) if callable(fn) else ""
 
 
+def console_command(argv) -> str:
+    """把 argv 渲染成**能直接粘进本机控制台**的一行命令（Windows=PowerShell，POSIX=sh）。
+
+    为什么要走接缝（2026-09-25）：同一份"复制命令"在 PowerShell 里必须以 `& "…"` 调用
+    （路径带空格时尤其如此），而在 sh 里 `&` 是**后台运行** —— 拼错了用户只会看到一条
+    静默挂起的命令。业务代码只给 argv，不关心用户用的是哪套 shell。
+    """
+    fn = _platform_fn("console_command")
+    if callable(fn):
+        return str(fn([str(a) for a in argv]))
+    return " ".join(str(a) for a in argv)
+
+
 def acquire_named_lock(lock_id: str, lock_path: str):
     """获取内核级单实例锁。返回 (handle, detail)。**失败必须显式上报，不能吞。**"""
     return module().acquire_named_lock(lock_id, lock_path)

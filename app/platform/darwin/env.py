@@ -149,6 +149,17 @@ def shell_script(hf: str, jobs) -> str:
     return " &&\n".join(lines)
 
 
+def console_command(argv) -> str:
+    """把一条 argv 渲染成能直接粘进 POSIX sh 的一行命令。
+
+    POSIX 上没有 Windows 那个调用运算符：直接写（必要时加引号）就能跑，而 `&` 在 sh 里
+    是"后台运行"——写成 Windows 那种 `& "…"` 会让用户看到一条**静默挂在后台**的命令。
+    """
+    import shlex
+    parts = [str(a) for a in argv]
+    return shlex.join(parts) if parts else ""
+
+
 # ------------------------------------------------------------------ 单实例锁（flock）
 
 def acquire_named_lock(lock_id, lock_path):

@@ -203,7 +203,10 @@ def start_meeting():
         if not recorder.wait_started(timeout=6):
             err = recorder.error or "打开麦克风超时（设备被占用或权限不足）"
             stopped = recorder.stop()
-            db.update_meeting(meeting_id, status="error")
+            # 原因必须落库（`meetings.error`，面板直接显示它）：只写 status=error 时，
+            # 面板只能自己编一句"麦克风没打开"，与真实原因（这里是具体的打开失败）
+            # 对不上也没人知道。见 db.py 迁移 6。
+            _mark_meeting_error(meeting_id, f"开始录音失败：{err}")
             _state.update(active=False, folder=None, recorder=None if stopped else recorder,
                           started_at=None, level=0.0, error=err)
             db.add_log("error", "meeting", f"开始录音失败（{os.path.basename(folder)}）：{err}")
@@ -259,7 +262,8 @@ def stop_meeting():
             if meeting:
                 db.update_meeting(meeting["id"], ended_at=meta["end"],
                                   duration_seconds=meta["durationSeconds"],
-                                  segments=len(segs), status="interrupted")
+                                  segments=len(segs), status="interrupted",
+                                  error=f"录音中断：{recorder.error}")
             err = f"录音中断：{recorder.error}；已保留音频，可手动重新转写"
             _state.update(error=err)
             db.add_event("meeting_stopped", {"meeting": os.path.basename(folder), "error": err})
@@ -271,7 +275,8 @@ def stop_meeting():
             err = (recorder.error if recorder else "") or "录音过程没有产生任何音频分段"
             if meeting:
                 db.update_meeting(meeting["id"], ended_at=meta["end"],
-                                  duration_seconds=0, segments=0, status="error")
+                                  duration_seconds=0, segments=0, status="error",
+                                  error=f"没有录到音频：{err}")
             _state.update(error=err)
             db.add_event("meeting_stopped", {"meeting": os.path.basename(folder), "error": err})
             db.add_log("error", "meeting",
@@ -279,9 +284,11 @@ def stop_meeting():
             return False, f"没有录到音频：{err}"
 
         if meeting:
+            # `error=""`：这一场开始（重新）转写了，上一次失败的原因不能再留在字段里
+            # 冒充"本次的失败原因"（重新转写成功之后面板仍显示旧原因，是最难查的那种假象）。
             db.update_meeting(meeting["id"], ended_at=meta["end"],
                               duration_seconds=meta["durationSeconds"],
-                              segments=len(segs), status="transcribing")
+                              segments=len(segs), status="transcribing", error="")
 
         # 后台转写（不阻塞）
         threading.Thread(target=_transcribe_meeting, args=(folder,), daemon=True).start()
@@ -376,6 +383,100 @@ def _boot_note_meeting_key():
         pass
 
 
+# ---------------------------------------------------------------- 引擎分派
+
+#: 会议链路**整场文件转写**能直接驱动的本机引擎（= `meetingSttModel` 的合法引擎取值）。
+#:
+#: 判据只有一条：`_transcribe_impl` 里真的有一段代码把整个 wav 转成文字、再按
+#: `app.capabilities.assemble` 拼成逐句时间。名字列在这里、而不是散在 if/elif 里，
+#: 是为了让"驱动不了"那句报错能**自己说出支持哪些** —— 报错文案与分派逻辑必须是
+#: 同一份事实，否则改了分派忘了改文案，用户又被指到错方向（2026-09-25）。
+MEETING_LOCAL_ENGINES = ("whisper", "sensevoice", "qwen3asr", "sherpa")
+
+#: 报错文案里逐条列出"支持哪些"时用的说法（给人看，不是给代码看）。
+MEETING_ENGINE_LABELS = {
+    "whisper": "whisper 的模型名（small / medium / large / large-v3 …）",
+    "sensevoice": "sensevoice",
+    "qwen3asr": "qwen3asr",
+    "sherpa": "sherpa",
+}
+
+
+def unsupported_engine_reason(choice):
+    """会议链路驱动不了的引擎 → 一句**要素齐全**的人话（哪个引擎 / 支持哪些 / 下一步）。
+
+    三要素缺一不可，这是 2026-09-25 那次故障的教训：只报"转写失败"，用户不知道换什么；
+    只说"不支持"，用户不知道支持什么；不给下一步，用户只能重复试同一件事。
+
+    两条可执行的路都写在这里（`capabilityMeetingAsrBackend` **已经没有 auto**，
+    所以措辞是"指定"，不是"等它自动挑"）：
+      ① 把 `meetingSttModel` 改成下面列出的任一个；
+      ② 到「能力」页签把「会议转写用哪个后端」指定为「ECHO 后端」，整场交给配对的机器。
+
+    同时明说"这一场没有开始转写" —— 否则用户会以为是转了一半失败，去翻音频找问题。
+    """
+    who = str(choice or "").strip() or "（空）"
+    supported = "、".join(MEETING_ENGINE_LABELS[e] for e in MEETING_LOCAL_ENGINES)
+    return (
+        "会议转写引擎「%s」不能用于整场会议的文件转写：这条链路只支持 %s。"
+        "可执行的下一步二选一：① 到 设置 → 会议 把「会议转写引擎」改成上面任一个；"
+        "② 到 设置 → 能力 把「会议转写用哪个后端」**指定**为「ECHO 后端」"
+        "（capabilityMeetingAsrBackend=echo-server；这一项没有 auto，不会自动兜底），"
+        "让整场转写交给配对的机器。这一场**没有开始转写**，原样重试也不会成功。"
+        % (who, supported))
+
+
+def resolve_meeting_engine(choice):
+    """`meetingSttModel` → `(engine, model, problem)`。
+
+    `problem` 非空 = **这条链路驱动不了这个取值**，调用方必须当场失败并把它原样报出去。
+
+    为什么需要它（2026-09-25 用户报的真实故障，面板显示 0 行 + "麦克风没打开"）：
+    原来这里是 ``use_sv = cfg.get("sttModel") in ("sensevoice", "qwen3asr")`` … ``else:
+    _get_whisper(cfg.get("sttModel"))`` —— 于是安装器给"只装 sherpa"的默认档写的
+    ``meetingSttModel=sherpa`` 会**拿引擎名当 whisper 模型名去加载**：`WHISPER_MODELS`
+    里没有 sherpa，每段静默出 0 行，最后只落一个 ``status=error``、原因一个字都没有。
+    现在这条路径不存在了。
+
+    解析归 `stt.resolve_engine()`（与 boot、能力层本机后端 `capabilities/local.py`
+    **同一份**规则，不再各写一份"哪些值是引擎名"）；whisper 的模型名再按
+    `WHISPER_MODELS` 校验一次 —— `resolve_engine` 对认不出的值**一律回退成 whisper**，
+    不校验就等于没判（"paraformer" 会变成"加载 whisper 模型 paraformer"）。
+    """
+    from app.audio import stt
+    eng, model = stt.resolve_engine(choice)
+    if eng not in MEETING_LOCAL_ENGINES:
+        # 目前不可能（resolve_engine 只会出这四个），留个闸：真出了就响亮拒绝，
+        # 绝不落到 `else` 里"拿未知名字当 whisper 模型"。
+        return "", "", unsupported_engine_reason(choice)
+    if eng == "whisper" and model not in stt.WHISPER_MODELS:
+        return "", "", unsupported_engine_reason(choice)
+    return eng, model, ""
+
+
+def _mark_meeting_error(meeting_id, reason, **extra):
+    """把一场会标成 `error` **并留下具体原因**（落 `meetings.error`，v6 加的那一列）。
+
+    `reason` 是给人看的一句话，不是"失败"两个字：面板就显示它，接口契约见
+    `app/api.py` 的 `GET /api/meetings`（列表）与 `GET /api/meetings/{mid}`（详情）。
+    """
+    if not meeting_id:
+        return
+    fields = {"status": "error", "error": str(reason or "")[:2000]}
+    fields.update(extra)
+    db.update_meeting(meeting_id, **fields)
+
+
+class MeetingEngineRefused(Exception):
+    """会议链路**驱动不了配置的引擎** —— 原因已经在库里/日志里/组件状态里说清楚了。
+
+    为什么用异常、而不是让 `_transcribe_impl` 静悄悄 `return`：`_transcribe_meeting`
+    把"正常返回"当成**转写完成**（报 `idle`、加载完成提示音"叮叮"）。守卫要表达的是
+    "这一场**没有开始转写**"，如果只是 return，上层会紧接着喊一声"转写完成"、
+    还响一个成功音 —— 与刚落库的失败原因、与刚才响过的错误音**自相矛盾**。
+    """
+
+
 def _transcribe_meeting(folder):
     """后台转写主入口；任何异常写入日志，不静默丢失。"""
     name = os.path.basename(folder)
@@ -390,13 +491,23 @@ def _transcribe_meeting(folder):
         _boot_note_meeting_key()
         _boot_meeting_stt("online", "转写完成 · 引擎已加载")
         tts_mod.beep_ok()          # 转写完成提示音（叮叮）
+    except MeetingEngineRefused:
+        # 引擎驱动不了：原因、日志、组件状态、错误提示音都已经在 `_transcribe_impl`
+        # 的守卫里做完了。这里唯一要做的是**别把"转写完成"接上去** ——
+        # 否则用户同时看到"转写完成 · 引擎已加载"和一条失败原因，还听见两声提示音。
+        if mid:
+            _clear_progress(mid)
     except Exception as e:
         import traceback
         msg = f"[{datetime.datetime.now().isoformat(timespec='seconds')}] " \
               f"转写异常: {e!r}\n{traceback.format_exc()}"
         db.add_log("error", "meeting", msg[:1500])
+        # 落库的是**具体原因**（类型 + 消息），不是"转写失败"四个字：面板要显示它，
+        # 而 `_transcribe_meeting` 是最后一道网 —— 走到这里说明上面哪一步炸了，
+        # 原因只在这条异常里（`msg` 带时间戳与 traceback，太长，不适合当面板文案）。
         if meeting:
-            db.update_meeting(meeting["id"], status="error")
+            _mark_meeting_error(meeting["id"],
+                                f"转写异常：{type(e).__name__}: {e}")
         if mid:
             _clear_progress(mid)
         services.report_meeting("error", f"转写失败 {name}")
@@ -836,6 +947,34 @@ def _fallback_sv_rows(sv, wmodel, seg_path, seg_idx, seg_min, cfg):
     return [(seg_idx, st, en, txt) for st, en, txt in got.sentences]
 
 
+def _sherpa_rows(seg_path, seg_idx, seg_min, cfg, cap_kinds):
+    """sherpa 整段转写 → 逐句行；返回 `(rows, why)`（`why` 非空 = 这段没转出东西的原因）。
+
+    为什么这么短：sherpa 的整文件转写路径**本来就有**（`stt.transcribe_ex(engine="sherpa")`，
+    它区分 ok/empty/error/missing），会议这边缺的只是"调它 + 把整段文本拼成逐句时间"。
+
+    为什么**不去借 whisper 时间骨架**（SenseVoice 那条路借了）：骨架要 `_get_whisper("small")`，
+    而 sherpa 恰恰是"这台机器上没装 whisper/funasr"时的引擎（安装器给只装 sherpa 的默认档
+    写的就是它）—— 在那台机器上骨架必然拿不到。借了的话，同一份设置在不同机器上会给出
+    不同的时间轴档位（`aligned` vs `estimated`），而档位是要如实进 `meta.json`、上详情的。
+    所以这里固定走"按字数均摊"，档位 `estimated` —— 与 provider 转写、以及 SenseVoice
+    拿不到骨架时**同一个机制**（`assemble.assemble`），不另写一套。
+
+    `cap_kinds` 是就地累加的档位计数（`{exact: 3, estimated: 1}`），最终写进 `meta.json`。
+    """
+    from app.capabilities import assemble
+    out = stt_mod.transcribe_ex(seg_path, engine="sherpa",
+                               lang=cfg.get("sttLanguage", "zh"))
+    text = str(out.get("text") or "").strip()
+    if not text:
+        # `detail` 是引擎自己说的话（缺依赖 / 模型没就位…），优先用它 —— 只写"空结果"
+        # 会把"这段没人说话"和"sherpa 根本没装上"又混成一样，那正是要修掉的病。
+        return [], str(out.get("detail") or out.get("status") or "sherpa 返回空结果")
+    got = assemble.assemble(text=text, seg_seconds=_wav_seconds(seg_path) or seg_min * 60.0)
+    cap_kinds[got.timestamps] = cap_kinds.get(got.timestamps, 0) + 1
+    return [(seg_idx, st, en, txt) for st, en, txt in got.sentences], ""
+
+
 def _active_asr_provider():
     """会议转写是否走 provider（P5）。**只有用户显式配了 `providerAsr` 才返回实例**。
 
@@ -890,14 +1029,15 @@ def _transcribe_impl(folder):
     if not segs:
         # 兜底：没有音频无法转写，状态不能停在 transcribing（会永远卡住）
         if meeting:
-            db.update_meeting(meeting["id"], status="error")
-            db.add_log("error", "meeting", f"没有音频分段，无法转写：{meeting_name}")
+            reason = "这场会没有音频分段，无法转写（录音目录里没有 0*.wav）"
+            _mark_meeting_error(meeting["id"], reason)
+            db.add_log("error", "meeting", f"{reason}：{meeting_name}")
         return
     if not meeting:
         return
     meeting_id = meeting["id"]
     db.clear_meeting_lines(meeting_id)
-    db.update_meeting(meeting_id, status="transcribing")
+    db.update_meeting(meeting_id, status="transcribing", error="")
 
     # 进度初始化（面板据此显示第 N/M 段 + 阶段）
     seg_total = len(segs)
@@ -942,10 +1082,13 @@ def _transcribe_impl(folder):
         except Exception as e:
             db.add_log("warn", "voiceprint", f"声纹库不可用，跳过自动识别：{e}")
 
-    # 文本优先引擎（SenseVoice / Qwen3-ASR）：Qwen3-ASR 用 ForcedAligner 原生句子+时间戳；
-    # SenseVoice 用 whisper 时间戳骨架 + 字符级对齐切句（保留句级时间戳）
-    use_sv = cfg.get("sttModel") in ("sensevoice", "qwen3asr")
-    sv_kind = cfg.get("sttModel")
+    # 本机引擎分派。**先解析、先判能不能驱动，再加载模型** —— 顺序本身就是这条修复的
+    # 一半：驱动不了的引擎必须在任何模型被加载之前就响亮失败（见 resolve_meeting_engine）。
+    #   文本优先引擎（SenseVoice / Qwen3-ASR）：Qwen3-ASR 用 ForcedAligner 原生句子+时间戳；
+    #   SenseVoice 用 whisper 时间戳骨架 + 字符级对齐切句（保留句级时间戳）；
+    #   sherpa 只给整段文本（无句级时间戳）→ 按字数均摊，档位 `estimated`。
+    eng = ""               # 本场真正驱动的本机引擎（provider / 能力后端那条路用不到）
+    eng_model = ""
     wmodel = None
     sv = None
     asr_provider = _active_asr_provider()          # P5：显式配了 providerAsr 才走在线/外部转写
@@ -982,19 +1125,43 @@ def _transcribe_impl(folder):
         # 走远端能力后端时**同样不加载本地引擎** —— 这正是"办公本没有 GPU 也能转写"的意义。
         # 引擎留给"远端失败时回落本地"那条路按需加载（见循环里的兜底）。
         db.add_log("info", "meeting", "本场转写走能力后端（不加载本地模型）")
-    elif use_sv:
+    else:
+        eng, eng_model, eng_problem = resolve_meeting_engine(cfg.get("sttModel"))
+        if eng_problem:
+            # ① 驱动不了的引擎当场说清楚，绝不静默 ——
+            # **此刻一个模型都还没加载**，库里留的是原因，不是"转写失败"四个字。
+            db.add_log("error", "meeting",
+                       f"{meeting_name} 无法开始转写：{eng_problem}")
+            _mark_meeting_error(meeting_id, eng_problem,
+                                duration_seconds=meta.get("durationSeconds", 0),
+                                segments=len(segs))
+            _clear_progress(meeting_id)
+            _boot_meeting_stt("failed", eng_problem[:200])
+            services.report_meeting("error", f"转写失败 {meeting_name}")
+            tts_mod.play_beep("err")
+            # 抛出去，别让上层以为"跑完了"（否则紧跟一句"转写完成" + 成功提示音）。
+            raise MeetingEngineRefused(eng_problem)
         if cap_session is not None:
             db.add_log("info", "meeting",
                        "本场转写按计划走本机（分离那一槽才走后端）")
-        wmodel = stt_mod._get_whisper("small", cfg.get("sttDevice", "auto"))
-        if sv_kind == "qwen3asr":
-            sv = stt_mod._get_qwen3asr(cfg.get("sttDevice", "auto"),
-                                       forced_aligner="Qwen/Qwen3-ForcedAligner-0.6B")
-        else:
+        if eng == "sensevoice":
+            # 与改动前逐字一致：文本用 SenseVoice，时间骨架借 whisper small
+            wmodel = stt_mod._get_whisper("small", cfg.get("sttDevice", "auto"))
             sv = stt_mod._get_sensevoice(cfg.get("sttDevice", "auto"))
-    else:
-        wmodel = stt_mod._get_whisper(cfg.get("sttModel", "small"),
-                                      cfg.get("sttDevice", "auto"))
+        elif eng == "qwen3asr":
+            wmodel = stt_mod._get_whisper("small", cfg.get("sttDevice", "auto"))
+            sv = stt_mod._get_qwen3asr(cfg.get("sttDevice", "auto"), eng_model,
+                                       forced_aligner="Qwen/Qwen3-ForcedAligner-0.6B")
+        elif eng == "sherpa":
+            # 先加载（加载失败就在**写任何东西之前**当场报错，与另外三条路同一个纪律）。
+            # 识别器本身不用往下传：`stt.transcribe_ex()` 取的是 `_get_sherpa()` 的
+            # 进程内单例，这里拿到的是同一个对象，传下去只是多一个参数。
+            # sherpa **没有句级时间戳**，也因此**不去借 whisper 骨架**：借了的话
+            # "时间轴精度"就取决于这台机器上恰好装没装 whisper，而档位必须如实
+            # （见 `_sherpa_rows` 的注释）。
+            stt_mod._get_sherpa()
+        else:
+            wmodel = stt_mod._get_whisper(eng_model, cfg.get("sttDevice", "auto"))
 
     diarize_fail = ""      # 分离失败只记一次：8 段会议连说 8 遍会淹没日志
     #: 3.0：把"这次每个槽用了谁、跳过了谁、为什么"与时间轴档位**写进 meta.json**。
@@ -1045,9 +1212,9 @@ def _transcribe_impl(folder):
                 # **不在段内回落到本地引擎**：一场会议里"前几段走服务端、后几段走本机"
                 # 会让时间轴精度与文本风格前后不一致，而用户看不出来。
                 # 失败就留痕、本段不写行；整场是否重跑由人决定（见 retranscribe_meeting）。
-        elif use_sv:
+        elif eng == "sensevoice" or eng == "qwen3asr":
             # Qwen3-ASR：优先用 ForcedAligner 原生时间戳（自然句子），失败回退 whisper 骨架对齐
-            if sv_kind == "qwen3asr":
+            if eng == "qwen3asr":
                 lang_hint = stt_mod._LANG_MAP.get(str(cfg.get("sttLanguage", "zh")).lower(), None)
                 _full_text, sentences = stt_mod._qwen3asr_sentences(sv, seg_path, lang_hint)
                 if sentences:
@@ -1062,8 +1229,16 @@ def _transcribe_impl(folder):
                 # （2026-09-21 71 分钟那场就是这样）。
                 db.add_log("warn", "meeting",
                            f"{meeting_name} 第{i}段没有转出任何文字"
-                           f"（引擎 {sv_kind}；引擎异常详情见 data/logs/echo-server.log.err）")
-        else:
+                           f"（引擎 {eng}；引擎异常详情见 data/logs/echo-server.log.err）")
+        elif eng == "sherpa":
+            seg_rows, sherpa_why = _sherpa_rows(seg_path, seg_idx, seg_min, cfg, cap_kinds)
+            if not seg_rows:
+                # 与上面两条本地路同一个纪律：空结果要留痕，并且把**引擎自己说的原因**
+                # （依赖缺失/模型没就位/接口变了）带出来 —— sherpa 是这个仓库里最容易
+                # "没装好却看起来在跑"的引擎（2026-09-23 实测过一次）。
+                db.add_log("warn", "meeting",
+                           f"{meeting_name} 第{i}段没有转出任何文字（引擎 sherpa）：{sherpa_why}")
+        elif eng == "whisper":
             try:
                 out, _info = stt_mod.transcribe_whisper(wmodel, seg_path, cfg.get("sttLanguage", "zh"))
                 seg_rows = [(seg_idx, s.start, s.end, s.text.strip()) for s in out]
@@ -1207,9 +1382,11 @@ def _transcribe_impl(folder):
     db.add_lines(meeting_id, db_rows)
     db.cleanup_empty_speakers(meeting_id)
     if db_rows:
+        # `error=""`：转写成功了，上一次失败的原因必须清掉（否则面板会拿旧原因
+        # 解释这一场的结果 —— 而那是最像"代码坏了"的一种假象）。
         db.update_meeting(meeting_id, status="transcribed",
                           duration_seconds=meta.get("durationSeconds", 0),
-                          segments=len(segs))
+                          segments=len(segs), error="")
     else:
         # 「一行都没有也叫 transcribed」是假话：面板显示成功、纪要写着"没内容"，
         # 真正原因（引擎异常/依赖缺失）只在 stderr 里 —— 用户看到的是"成功了但空的"。
@@ -1217,7 +1394,7 @@ def _transcribe_impl(folder):
         reason = "没有转出任何文字（转写引擎失败，或这段录音确实没人说话）"
         db.update_meeting(meeting_id, status="error",
                           duration_seconds=meta.get("durationSeconds", 0),
-                          segments=len(segs))
+                          segments=len(segs), error=reason)
         db.add_log("error", "meeting", f"{meeting_name} 转写结束但一行文字都没有：{reason}")
         try:
             _cur = db.get_meeting(meeting_id)

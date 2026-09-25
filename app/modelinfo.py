@@ -17,9 +17,11 @@ ModelScope 缓存固定在 ~/.cache/modelscope/models（funasr 不认识中文�
 """
 import importlib.util
 import os
+import re
 import threading
 import time
 
+from app import interpreter
 from app import paths
 from app import platform as echo_platform
 
@@ -172,6 +174,20 @@ def _ready_qwen(model_id):
     return os.path.isdir(_ms_dir(model_id))
 
 
+def _cmd_chain(*parts):
+    """把几条可粘贴命令用 `&&` 串起来（取不到的那些丢掉，免得留下光秃秃的 `&&`）。"""
+    return " && ".join(p for p in parts if p)
+
+
+#: SenseVoice 的手动下载命令。**载荷里只用单引号**：PowerShell 5.1 把带内嵌双引号的参数
+#: 传给原生 exe 时会把引号吞掉（`-c "print(\"a b\")"` 到 python 手里成了 `print(a b)`）,
+#: 而这条命令就是要给人粘进 PowerShell 的。护栏见 tests/test_install_state.py。
+_SENSEVOICE_PY = ("from modelscope import snapshot_download; "
+                  "print(snapshot_download('iic/SenseVoiceSmall'))")
+_QWEN3ASR_PY = ("from modelscope import snapshot_download; "
+                "snapshot_download('Qwen/Qwen3-ASR-0.6B')")
+
+
 # ---------------------------------------------------------------- 清单
 # source: auto = 首次使用会自动联网下载；script = 跑安装脚本；copy = 只能从源机拷贝
 CATALOG = [
@@ -182,7 +198,7 @@ CATALOG = [
          how="还需 funasr + torch 运行时（Windows 随 requirements.txt 装好；macOS 运行 "
              "`venv/bin/pip install funasr modelscope torch`）。选中即用：首次加载会自动从 "
              "ModelScope 下载模型（含 VAD）。也可先手动拉：",
-         cmd='python -c "from modelscope import snapshot_download; print(snapshot_download(\'iic/SenseVoiceSmall\'))"'),
+         cmd=interpreter.python_command("-c", _SENSEVOICE_PY)),
 
     dict(id="qwen3asr", group="转写引擎", name="Qwen3-ASR 0.6B + 强制对齐",
          purpose="更准的中文转写（会议纪要推荐，显存约 4GB）", size="~3.6 GB（两个模型）",
@@ -190,11 +206,12 @@ CATALOG = [
          source="script", ref="Qwen/Qwen3-ASR-0.6B",
          how="跑安装脚本（会先装 qwen-asr/transformers 依赖，再从 ModelScope 下模型）：",
          # 一键安装命令是平台专有的（Windows 是 .ps1，macOS 没有对应脚本 → 回落成 pip 说明），
-         # 由接缝给（D12：业务代码不写平台命令）。
+         # 由接缝给（D12：业务代码不写平台命令）。回落那条也要**带解释器全路径** —— 它同样
+         # 会被「复制命令」原样贴进终端（2026-09-25：裸 `python` 在一台嵌入包里直接跑不了）。
          cmd=echo_platform.model_install_command(
              "qwen3asr",
-             "pip install qwen-asr transformers && python -c 'from modelscope import "
-             "snapshot_download; snapshot_download(\"Qwen/Qwen3-ASR-0.6B\")'")),
+             _cmd_chain(interpreter.pip_install_command("qwen-asr", "transformers"),
+                        interpreter.python_command("-c", _QWEN3ASR_PY)))),
 
     dict(id="sherpa", group="转写引擎", name="sherpa-onnx 流式 zipformer（中英）",
          purpose="流式转写；唤醒词功能也用它", size="~189 MB",
@@ -224,7 +241,8 @@ for _n in ("tiny", "base", "small", "medium", "large-v3"):
         ms_ref=f"Systran/faster-whisper-{_n}",
         how="优先从 ModelScope 拉（Systran 官方镜像），失败才回落 HF 镜像（hf-mirror.com）；"
             "也可以从源机拷 models/faster-whisper/<档> 目录过来。",
-        cmd=f'python -c "from faster_whisper import WhisperModel; WhisperModel(\'{_n}\')"'))
+        cmd=interpreter.python_command(
+            "-c", "from faster_whisper import WhisperModel; WhisperModel('%s')" % _n)))
 
 CATALOG += [
     dict(id="pyannote", group="可选功能", name="说话人分离（pyannote 三件套）",
@@ -316,8 +334,107 @@ def ready(model_id):
     return None
 
 
+# ---------------------------------------------------------------- 「缺依赖」怎么修
+#: 引擎的 pip 包没装时，文案里要出现"再点一次下载"这类**下一步**指引 —— 同事 2026-09-25
+#: 的实测顺序是：点下载 → 一闪而过报缺依赖 → 复制安装命令装依赖 → 面板如实变成
+#: 「模型文件还没下载」→ 用户以为卡死了（其实只差"再点一次下载"，界面一个字都没说）。
+_NEXT_STEP_DOWNLOAD = "再回来点下载 → 依赖装好后，回到「设置 → 模型」再点一次「下载」。"
+
+
+def dependency_problem(model_id) -> dict:
+    """这个模型的**引擎 pip 依赖**在本机缺不缺；缺了就一次说清"怎么修"（否则空 dict）。
+
+    返回 ``{"reason", "module", "installCommand", "nextStep", "message"}``：
+
+      * ``reason``         —— 缺什么（给人看的一句话）；
+      * ``installCommand`` —— 那条 pip 安装命令（带本机解释器全路径，可直接粘贴）；
+      * ``nextStep``       —— 装完之后该点什么（面板可直接渲染）；
+      * ``message``        —— 上面三块拼好的整段（`/api/models/download` 的 detail 用它）。
+
+    判据与别处**同一份**：引擎模块名来自 `install_state.ENGINE_SPECS`（权威表），
+    命令来自 `components.install_command_for_model()`（组件清单的 pkg 是唯一出处）。
+    """
+    mid = str(model_id or "").strip()
+    if not mid:
+        return {}
+    try:
+        from app import install_state
+        spec = install_state.engine_spec(mid)
+    except Exception:
+        spec = {}
+    mod = str((spec or {}).get("module") or "")
+    if not mod:
+        return {}                       # 不是转写引擎（KWS / pyannote…）：这里不表态
+    try:
+        if _pkg_available(mod):
+            return {}
+    except Exception:
+        return {}
+    try:
+        from app import components
+        cmd = components.install_command_for_model(mid)
+    except Exception:
+        cmd = ""
+    if not cmd:
+        cmd = interpreter.pip_install_command(mod)
+    label = str((spec or {}).get("label") or mid)
+    reason = "缺 Python 依赖 %s（%s 的引擎包还没装）" % (mod, label)
+    step1 = "第一步 · 先装依赖：把这条命令复制到终端执行 —— %s" % (cmd or ("pip install %s" % mod))
+    return {"reason": reason, "module": mod, "installCommand": cmd,
+            "nextStep": _NEXT_STEP_DOWNLOAD,
+            "message": "%s\n%s\n%s" % (reason, step1, "第二步 · " + _NEXT_STEP_DOWNLOAD)}
+
+
+#: 底层异常里的 "No module named 'x'" —— 下载客户端（modelscope / huggingface_hub）没装时
+#: 报的就是它。用户看到的是**下载失败**，其实要装的是 pip 包。
+_NO_MODULE_RE = re.compile(r"No module named '([\w.]+)'")
+
+
+def _failure_hint(mid: str, raw) -> str:
+    """下载失败时补一句"该怎么办"（认不出返回空串，不硬编）。"""
+    prob = dependency_problem(mid)
+    if prob:
+        return prob["message"]
+    hit = _NO_MODULE_RE.search(str(raw or ""))
+    if not hit:
+        return ""
+    mod = hit.group(1).split(".")[0]
+    try:
+        from app import components
+        cmd = components.install_command_for_model(mid)
+    except Exception:
+        cmd = ""
+    if not cmd:
+        cmd = interpreter.pip_install_command(mod)
+    return ("缺 Python 依赖 %s（下载客户端没装，模型下不下来）\n"
+            "第一步 · 先装依赖：把这条命令复制到终端执行 —— %s\n"
+            "第二步 · %s" % (mod, cmd or ("pip install %s" % mod), _NEXT_STEP_DOWNLOAD))
+
+
+def _next_step_fields(entry) -> dict:
+    """未就绪时给面板的**「下一步点什么」**（③：见 `dependency_problem` 那段说明）。
+
+    依赖缺 → 先装依赖（附那条命令）；依赖齐 → 就是"再点一次下载"。
+    不提供自动下载的条目（source=copy / downloadable=False）不给下载建议。
+    """
+    prob = dependency_problem(entry["id"])
+    if prob:
+        return {"dependencyReady": False, "installCommand": prob["installCommand"],
+                "nextStep": prob["nextStep"], "notReadyReason": prob["reason"]}
+    downloadable = not (entry.get("downloadable") is False or entry.get("source") == "copy")
+    return {"dependencyReady": True, "installCommand": "",
+            "nextStep": ("再点一次「下载」，把模型文件拉下来（依赖已就绪）" if downloadable
+                         else ""),
+            "notReadyReason": "模型文件还没就位" if downloadable else ""}
+
+
 def inventory():
-    """返回清单 + 就绪状态 + 本地实际占用（MB）。任何异常都不抛，按未就绪处理。"""
+    """返回清单 + 就绪状态 + 本地实际占用（MB）。任何异常都不抛，按未就绪处理。
+
+    未就绪的条目额外带 ``dependencyReady`` / ``installCommand`` / ``nextStep`` /
+    ``notReadyReason``：面板要能直接说出"下一步点什么"，而不是只显示一个红徽标
+    （同事 2026-09-25：装完依赖后界面停在"模型文件还没下载"，看着像卡死）。
+    """
     items = []
     for e in CATALOG:
         probe = _probe_for(e)
@@ -326,7 +443,13 @@ def inventory():
         except Exception:
             ready = False
         local = sum(_dir_mb(p) for p in _measure_paths(e) if os.path.isdir(p))
-        items.append(dict(e, ready=ready, local_mb=local))
+        row = dict(e, ready=ready, local_mb=local)
+        if not ready:
+            try:
+                row.update(_next_step_fields(e))
+            except Exception:
+                pass
+        items.append(row)
     return items
 
 
@@ -498,9 +621,15 @@ def _download_worker(entry):
                           downloaded_mb=_downloaded_mb(mid))
         print(f"[modelinfo] {mid} 下载完成，{_downloaded_mb(mid)} MB（源：{source_used or '本地脚本'}）")
     except Exception as e:
-        _JOBS[mid].update(status="failed", message=f"{type(e).__name__}: {e}",
+        msg = f"{type(e).__name__}: {e}"
+        hint = _failure_hint(mid, msg)
+        if hint:
+            # 只报两句英文异常，用户不知道下一步干什么（A4）—— 缺依赖时把"装什么 + 装完
+            # 再点一次下载"直接附在后面（同事 2026-09-25 实测那条路）。
+            msg = "%s\n怎么办：%s" % (msg, hint)
+        _JOBS[mid].update(status="failed", message=msg,
                           done_at=time.strftime("%H:%M:%S"))
-        print(f"[modelinfo] {mid} 下载失败: {e}")
+        print(f"[modelinfo] {mid} 下载失败: {msg}")
     finally:
         stop.set()
         _ACTIVE["id"] = None
@@ -530,6 +659,11 @@ def start_download(mid, force=False):
     """开始下载（后台线程）。返回 (ok, message)。同一时刻只允许一个下载任务。
 
     force=False 时，已就绪的模型会拒绝——避免手滑重下 190MB / 3GB（界面上"重新下载"才带 force）。
+
+    **缺依赖时先在入口拦下**（同事 2026-09-25 实测）：不拦的话后台线程会一闪而过地失败
+    （`No module named 'modelscope'`），用户只看到"缺依赖"三个字，既不知道该装什么，
+    也不知道装完要**回来再点一次下载**。拦下时返回的那句话里三件都有（原因 + 安装命令 +
+    下一步），面板的 `/api/models/download` 还会把它们拆成字段（见 `app/api.py`）。
     """
     entry = _by_id(mid)
     if not entry:
@@ -538,6 +672,12 @@ def start_download(mid, force=False):
         return False, "请复制下载命令，在终端自行执行。"
     if entry.get("source") == "copy":
         return False, "该模型没有稳定的公开下载源，请从源机拷贝（见说明）"
+    try:
+        prob = dependency_problem(mid)
+    except Exception:
+        prob = {}
+    if prob:
+        return False, prob["message"]
     if not force:
         try:
             if _is_ready(entry):

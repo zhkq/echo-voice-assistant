@@ -234,11 +234,29 @@ def _is_windows() -> bool:
         return False
 
 
+def _install_command_for(spec: dict) -> str:
+    """引擎的 pip 安装命令（走组件清单，不在这里再抄一份"包名 → 命令"）。
+
+    2026-09-25 的 bug 就是"抄了两份"：面板「复制安装命令」用了 `sys.executable`，
+    而「复制命令」还是裸 `python` —— 干净装机上后者直接跑不了。凡是**要贴给用户跑**的
+    命令，都从 `app/interpreter.py` 那条路算。
+    """
+    try:
+        from app import components
+        return components.install_command_for_model(str(spec.get("model") or ""))
+    except Exception:
+        return ""
+
+
 def missing(report: dict = None) -> list:
     """**还缺什么** —— 逐项从真值推，返回给人看的三元组列表。
 
     每一项：``{"feature", "reason", "fix"}``（与向导 `build_plan()` 的 missing 同形，
     面板/技能可以直接复用同一套渲染）。
+
+    缺依赖那一项额外带 **安装命令**（`fix` 里已经写着），模型未下那一项带
+    ``nextStep`` / ``action``：面板要能直接说出"下一步点哪个按钮"，而不是让用户对着
+    "模型文件还没下载"猜（同事 2026-09-25：他以为卡死了，其实只差再点一次下载）。
     """
     want = wanted(report)
     out = []
@@ -246,7 +264,10 @@ def missing(report: dict = None) -> list:
     for engine in want["engines"]:
         spec = ENGINE_SPECS.get(engine) or {}
         if not _module_ok(spec.get("module", "")):
-            fix = "用 echo-install 技能重跑，或 pip install %s" % spec.get("module", "?")
+            cmd = _install_command_for(spec)
+            fix = "第一步 · 先装依赖：把这条命令复制到终端执行 —— %s" % (
+                cmd or ("pip install %s" % spec.get("module", "?")))
+            fix += "；第二步 · 再回来点下载：依赖装好后，回到「设置 → 模型」再点一次「下载」"
             if _is_windows():
                 # Windows 上"包在、导不进来"最常见的原因是缺 VC++ 运行库（原生扩展都要它）——
                 # 面板顺手把这句话给出来，用户不用去猜 "DLL load failed" 是什么意思。
@@ -256,13 +277,20 @@ def missing(report: dict = None) -> list:
                 "feature": spec.get("label") or engine,
                 "reason": "缺 Python 依赖（%s）—— 转写时会直接报错" % spec.get("module", "?"),
                 "fix": fix,
+                "nextStep": "先装依赖，再回来点一次「下载」",
+                "action": "install",
+                "installCommand": cmd,
             })
             continue
         if _model_ready(spec.get("model", "")) is False:
             out.append({
                 "feature": spec.get("label") or engine,
                 "reason": "模型文件还没下载（依赖已就绪）",
-                "fix": "面板 → 能力 → 下载 %s；或让助手跑 echo-install 技能" % (spec.get("model") or engine),
+                "fix": "依赖已经装好了 —— 回到「设置 → 模型」，**再点一次「下载」**把模型文件拉下来"
+                       "（或让助手跑 echo-install 技能）",
+                "nextStep": "再点一次「下载」",
+                "action": "download",
+                "modelId": spec.get("model") or engine,
             })
 
     if want["wake"] and _model_ready("kws") is False:

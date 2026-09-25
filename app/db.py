@@ -270,6 +270,19 @@ MIGRATIONS = [
     ALTER TABLE dsh_sessions ADD COLUMN agent TEXT DEFAULT '';
     ALTER TABLE meeting_sessions ADD COLUMN agent TEXT DEFAULT '';
     """),
+    # 6: `meetings.error` —— 这一场**为什么失败**（人话，直接给面板看）。
+    #    为什么非加一列不可（2026-09-25 用户报的真实故障）：多处只写 `status="error"`、
+    #    一个字的原因都不落库，于是面板只能自己编一句"麦克风没打开（被占用/权限）或全程
+    #    无声"—— 而那一场其实是**会议链路驱动不了配置的转写引擎**（sherpa 被当成 whisper
+    #    模型名加载），跟麦克风毫无关系，用户被指到完全错误的方向。
+    #    为什么不用 notes：`notes` 是**用户的地盘**（他自己的备注/标签，默认 '{}'），
+    #    拿它装系统报错会把用户写的东西挤掉（`_transcribe_impl` 里"只在空着时写"那条
+    #    就是为这个加的，代价是默认值 '{}' 让它几乎永远不生效）。
+    #    读取面：`/api/meetings`（列表）与 `/api/meetings/<id>`（详情）都是 `SELECT *`
+    #    原样返回，不需要额外改动 —— 契约由 tests/test_api_contract.py 钉住。
+    (6, """
+    ALTER TABLE meetings ADD COLUMN error TEXT DEFAULT '';
+    """),
 ]
 
 def _migrate_session_owner(conn):
@@ -659,7 +672,8 @@ def create_meeting(name, started_at="", stt_model="small", stt_device="auto", di
 
 def update_meeting(meeting_id, **fields):
     allowed = {"title", "ended_at", "duration_seconds", "status",
-               "stt_model", "stt_device", "diarize", "segments", "audio_bytes", "notes"}
+               "stt_model", "stt_device", "diarize", "segments", "audio_bytes",
+               "notes", "error"}
     sets, params = [], []
     for k, v in fields.items():
         if k in allowed:

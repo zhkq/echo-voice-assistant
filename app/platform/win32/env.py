@@ -300,6 +300,43 @@ def shell_script(hf: str, jobs) -> str:
     return "\n".join(lines)
 
 
+# ------------------------------------------------------------------ 可粘贴的一行命令
+
+#: 在 PowerShell 里**必须加引号**的字符：空格/制表（会被拆成两个参数）、引号、反引号、
+#: `$`（变量展开）、`& | ; < > ( )` 这些语句分隔/重定向/分组符、以及 `,`（参数位置的数组
+#: 构造符）`%` —— 裸写会让 PowerShell 把它当语法而不是参数（`-c print(1)` 直接报解析错误）。
+_PS_NEEDS_QUOTE = " \t\"'`$&|;<>(),%"
+
+
+def console_command(argv) -> str:
+    """把一条 argv 渲染成**能直接粘进 PowerShell 就跑**的一行命令。
+
+    为什么需要它（2026-09-25 同事实测）：面板上「复制命令」给的是 `python -c "…"`，
+    而同事那台干净装机是 python.org 嵌入包 —— `python` 不在 PATH 上，粘进 PowerShell
+    直接"不是内部或外部命令"，他自己补了绝对路径才跑起来。命令得由**运行时**算出来，
+    而"算哪套 shell 的写法"是平台差异，所以收在接缝里（业务代码只给 argv）。
+
+    形态：``& "C:\\…\\python.exe" -c "…"``。第一个参数（可执行文件）**总是**加引号 ——
+    路径里有空格时不加引号 PowerShell 会把它当一个字符串表达式；`&` 是它的调用运算符
+    （实测 ``& "C:\\Program Files\\…\\python.exe" -c "print('a b')"`` 能跑）。
+
+    ⚠ **参数里不要带内嵌双引号**：PowerShell 5.1 把带内嵌双引号的参数传给原生 exe 时
+    会把引号**吞掉**（实测 ``-c "print(\\"a b\\")"`` 到 python 手里成了 ``print(a b)``，
+    直接 SyntaxError）。所以 python 载荷里的字符串一律写**单引号**；这里只把 `` ` `` 与
+    `$` 转义掉（PowerShell 双引号串里的转义符是反引号，不是反斜杠）。
+    """
+    parts = [str(a) for a in argv]
+    if not parts:
+        return ""
+    out = ['"%s"' % parts[0].replace("`", "``").replace("$", "`$")]
+    for p in parts[1:]:
+        if any(ch in p for ch in _PS_NEEDS_QUOTE):
+            out.append('"%s"' % p.replace("`", "``").replace("$", "`$"))
+        else:
+            out.append(p)
+    return "& " + " ".join(out)
+
+
 # ------------------------------------------------------------------ 单实例锁（命名互斥量）
 
 ERROR_ALREADY_EXISTS = 183

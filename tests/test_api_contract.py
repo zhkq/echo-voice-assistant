@@ -152,6 +152,55 @@ class MeetingEndpointContractTests(_IsolatedDb, unittest.TestCase):
         self.assertEqual(self.client.get("/api/meeting/status").status_code, 200)
 
 
+class MeetingErrorFieldContractTests(_IsolatedDb, unittest.TestCase):
+    """会议**失败原因**的接口契约：`meetings.error` 必须原样送到面板。
+
+    为什么这条是契约（2026-09-25 用户报的真实故障）：库里原来只有 `status=error`、
+    一个字的原因都没有，面板只好自己编一句"麦克风没打开（被占用/权限）或全程无声" ——
+    而那一场其实是**会议链路驱动不了配置的转写引擎**。后端现在把原因落在
+    `meetings.error` 上，面板要读它，所以这个字段出现在哪些接口、叫什么名字，
+    必须有用例钉住：改了列名/忘了带出去，面板就会**又退回**去编假原因。
+
+    面板卡片（`web/app.js` 的会议列表）用的是 **列表接口**，详情页用详情接口 ——
+    两个都要有这一个键，所以两个都测。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        app = FastAPI()
+        app.include_router(router)
+        cls.client = TestClient(app)
+
+    def setUp(self):
+        self.mid = db.create_meeting("2026-09-25_10-00-00", started_at="2026-09-25T10:00:00")
+        self.reason = ("会议转写引擎「sherpa」不能用于整场会议的文件转写："
+                       "这条链路只支持 whisper、sensevoice、qwen3asr、sherpa。")
+        db.update_meeting(self.mid, status="error", error=self.reason)
+
+    def tearDown(self):
+        db.delete_meeting(self.mid)
+
+    def test_the_detail_endpoint_returns_the_reason(self):
+        detail = self.client.get("/api/meetings/%d" % self.mid).json()
+        self.assertEqual(detail.get("error"), self.reason,
+                         "详情接口必须把 meetings.error 原样带出来：%s" % sorted(detail))
+
+    def test_the_list_endpoint_returns_the_reason_too(self):
+        """面板的会议卡片渲染的是**列表**接口的条目（`m.status === "error"` 那一支）。"""
+        items = self.client.get("/api/meetings").json()["items"]
+        row = [it for it in items if it["id"] == self.mid]
+        self.assertEqual(len(row), 1)
+        self.assertEqual(row[0].get("error"), self.reason,
+                         "列表接口必须带 error，否则面板卡片读不到原因：%s" % sorted(row[0]))
+
+    def test_a_successful_meeting_says_nothing_in_that_field(self):
+        """能用的路径行为不变：没失败时这个字段是空串（面板据此决定显不显示原因）。"""
+        db.update_meeting(self.mid, status="transcribed", error="")
+        detail = self.client.get("/api/meetings/%d" % self.mid).json()
+        self.assertEqual((detail.get("error") or ""), "")
+
+
 class PortFileContractTests(unittest.TestCase):
     """`data\\echo-port.txt`：名字、位置、读写语义（脚本与技能据此找服务）。"""
 

@@ -1510,6 +1510,7 @@ function capCompTable(comps, currentIds) {
       </div>
       <div class="cap-comp-meta">${esc(meta)}</div>
       ${c.readyReason ? `<div class="cap-comp-meta" style="color:var(--red)">${esc(c.readyReason)}</div>` : ""}
+      ${c.readyNextStep ? `<div class="cap-comp-meta" style="color:var(--red)">下一步：${esc(c.readyNextStep)}</div>` : ""}
       ${how}
       <div class="cap-comp-acts">${capCompActions(c)}</div>
     </div>`;
@@ -1810,7 +1811,18 @@ function bindCapCards() {
       dl.disabled = true;
       try {
         const r = await post("/api/models/download", { id: dl.dataset.msdl, force: dl.dataset.force === "1" });
-        toast(r.message || "已开始下载");
+        // 被"缺依赖"拒掉时：后端给的是**整段可展示的说明**（原因 + 安装命令 + 下一步），
+        // 只弹一句"缺依赖"用户不知道该装什么、也不知道装完要回来再点一次下载
+        // （2026-09-25 同事实测）。所以把详情落进该模型的任务状态 —— 卡片会据此渲染
+        // 「复制安装命令」按钮（data-mcopy，处理器在下面同一处）。
+        if (r && r.ok === false && r.detail) {
+          _modelJobsCache[dl.dataset.msdl] = { status: "failed", message: r.detail,
+                                               installCommand: r.installCommand || "",
+                                               local: true };
+          toast(r.reason || r.message || "下载没有开始");
+        } else {
+          toast(r.message || "已开始下载");
+        }
       } catch (err) { toast("下载失败：" + err.message); }
       loadCapabilities();
       return;
@@ -1947,7 +1959,20 @@ async function loadCapabilities() {
     _capCache.comps = compRes;
     _settingsCache = setRes.settings || _settingsCache;
     _modelsCache = modelsRes.items || [];
-    _modelJobsCache = (modelsRes.jobs && modelsRes.jobs.items) || {};
+    // 任务缓存：**服务端的为准**，但要保住「本地记下的下载被拒」（见 data-msdl 处理器：
+    // 缺依赖时下载根本没开始，服务端不会有这个 id 的任务，整体覆盖会把那段说明和
+    // 「复制安装命令」按钮一起冲掉）。规则：
+    //   * 服务端报了这个 id（重试后 running/done/failed）→ 服务端覆盖本地记录；
+    //   * 模型已经就绪 → 丢掉本地那条失败（别让"✅ 已就绪"旁边挂着旧失败）。
+    const srvJobs = (modelsRes.jobs && modelsRes.jobs.items) || {};
+    const localJobs = {};
+    for (const [id, job] of Object.entries(_modelJobsCache || {})) {
+      if (!job || !job.local) continue;
+      const mm = _modelsCache.find((x) => x.id === id);
+      if (mm && mm.ready) continue;
+      localJobs[id] = job;
+    }
+    _modelJobsCache = Object.assign(localJobs, srvJobs);
     _sttCache = sttRes;
     _vpCache = vpRes;
     _capTabOk = true;
@@ -2613,10 +2638,21 @@ function renderModelCard(f) {
     if (f.toggleKey) {
       control += `<label class="mcard-sw"><input type="checkbox" data-mbool="${esc(f.toggleKey)}" ${f.value ? "checked" : ""}><span>启用（录音时区分说话人）</span></label>`;
     }
+    // 未就绪：不能只说"会失败"，要接上后端给的**下一步**（"再点一次下载"）与安装命令 ——
+    // 用户上次就卡在这一屏，以为坏了。installCommand 走 esc()，并复用已有的 data-mcopy。
     const warn = (st.kind === "miss")
-      ? `<div class="mcard-warn">⚠ 所选模型未就绪，现在用它转写会失败</div>` : "";
+      ? `<div class="mcard-warn">⚠ 所选模型未就绪，现在用它转写会失败`
+        + (m && m.nextStep ? ` —— ${esc(m.nextStep)}` : "")
+        + (m && m.installCommand
+            ? `<div style="margin-top:6px"><button class="btn" data-mcopy="${esc(m.installCommand)}">复制安装命令</button></div>`
+            : "")
+        + `</div>` : "";
+    // 后端的失败说明是多行的（原因 + 命令 + 下一步），必须 pre-wrap 才读得出来
     const failMsg = failed
-      ? `<div class="mcard-warn">下载失败：${esc(job.message || "未知原因")}</div>` : "";
+      ? `<div class="mcard-warn" style="white-space:pre-wrap">下载失败：${esc(job.message || "未知原因")}`
+        + (job.installCommand ? `<div style="margin-top:6px"><button class="btn" data-mcopy="${esc(job.installCommand)}">复制安装命令</button></div>` : "")
+        + `</div>`
+      : "";
     // 本地占用 + 落地路径（路径是代码约定，原样展示不翻译）
     const meta = m ? `<div class="mcard-meta">${esc(m.size)}` +
       `${m.local_mb ? `（本地 ${fmtMb(m.local_mb)}）` : ""} · 落地 <code>${esc(m.target)}</code></div>` : "";
@@ -2872,9 +2908,16 @@ function renderMeetingItems(el, items) {
     // 显示出来反而重复——开始时间已经在下面的 m-meta 里了（2026-09-12 起）。
     const nameHtml = `<div class="m-name">${esc(shortTitle || m.name)}</div>`;
     const hasSummary = m.has_summary ? `<span class="m-summary-tag" title="已生成会议纪要">📄</span>` : "";
-    // 录音失败（PR #11 起会明确标 error）：给一句能行动的说明，而不是只有「错误」两个字
+    // 录音/转写失败（PR #11 起会明确标 error）：显示**后端记下的真实原因**。
+    //
+    // 2026-09-25 改：原来这里是一句**硬编码**的"没录到音频：麦克风没打开（被占用/权限）
+    // 或全程无声…"。真机上因此踩过一次：录到了 1 段音频、0 行文字（真因是会议链路的
+    // 本机引擎驱动不了 sherpa），界面却把排查方向指向麦克风，白折腾半天。
+    // 现在原因由后端落库（`meetings.error`，`GET /api/meetings` 与详情都带），面板只负责显示；
+    // 后端没记下原因时也要说人话，**不许再默认成"麦克风没打开"**。
+    const errText = String((m && m.error) || "").trim();
     const errHint = m.status === "error"
-      ? `<div class="m-meta" style="color:var(--red)">没录到音频：麦克风没打开（被占用/权限）或全程无声；换设备后重试，详见 启动 → 日志</div>`
+      ? `<div class="m-meta" style="color:var(--red)">${esc(errText || "这场会议失败了，但原因没有记下来 —— 详见 启动 → 日志")}</div>`
       : "";
     return `<div class="meeting-item" data-id="${m.id}">
       <span class="badge ${meetingBadgeCls(m.status)}">${MEETING_STATUS_TEXT[m.status] || STATUS_TEXT[m.status] || m.status}</span>

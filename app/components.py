@@ -303,10 +303,14 @@ def _detect(item: dict) -> Optional[bool]:
 
 
 def not_ready_reason(item: dict) -> Tuple[str, str]:
-    """「没装」的那一行**到底缺什么**：返回 ``(kind, 给人看的一句话)``。
+    """「没装」的那一行**到底缺什么、下一步干什么**：返回 ``(kind, 给人看的一句话)``。
 
     kind ∈ ``""``（说不出）/ ``"python"``（缺 pip 包）/ ``"model"``（缺模型文件）——
     面板据此把徽标从「⬇ 未安装」换成准确的「⚠ 缺依赖」（模型其实已经下好了）。
+
+    文案要**能照着做**（同事 2026-09-25 实测）：那一刻用户看到的是"缺依赖"三个字，
+    不知道该装什么、更不知道装完还要**回来再点一次下载**。所以原因后面直接跟
+    **安装命令**与一句下一步；面板要单独一个"下一步"字段时用 :func:`not_ready_next_step`。
     """
     mid = item.get("model_id")
     if not mid:
@@ -314,14 +318,32 @@ def not_ready_reason(item: dict) -> Tuple[str, str]:
     spec = _engine_spec(mid)
     mod = str(spec.get("module") or "")
     if not _module_ok(mod):
-        return "python", "缺 Python 依赖 %s —— 模型下好了也转写不了" % mod
+        cmd = _install_command(item)
+        reason = "缺 Python 依赖 %s —— 模型下好了也转写不了；第一步先装依赖：%s" % (mod, cmd or ("pip install %s" % mod))
+        reason += "；第二步回到这里再点一次「下载」"
+        return "python", reason
     try:
         from app import modelinfo
         if modelinfo.ready(mid) is False:
-            return "model", "模型文件还没下载"
+            return "model", "模型文件还没下载（依赖已就绪）—— 再点一次「下载」把模型文件拉下来"
     except Exception:
         pass
     return "", ""
+
+
+def not_ready_next_step(item: dict, kind: str = "") -> str:
+    """面板要的**「下一步点什么」**（一句话；说不出返回空串）。
+
+    与 :func:`not_ready_reason` 分开：原因会拼进一段红字里，而这一条是**动作**，
+    面板可以拿它渲染按钮/提示（同事 2026-09-25：装完依赖后面板停在"模型文件还没下载"，
+    没有任何指引，用户以为卡死了）。
+    """
+    kind = kind or not_ready_reason(item)[0]
+    if kind == "python":
+        return "先复制执行安装命令把依赖装上，再回来点一次「下载」"
+    if kind == "model":
+        return "再点一次「下载」，把模型文件拉下来"
+    return ""
 
 
 # ---------------------------------------------------------------- 清单装载
@@ -367,6 +389,24 @@ def _agent_active(component_id: str):
         return None
 
 
+def install_command_for_model(model_id: str) -> str:
+    """按**模型 id** 找到对应组件那条 pip 安装命令；找不到返回空串。
+
+    为什么要有它（同事 2026-09-25 实测）：点「下载」被"缺依赖"挡住时，用户需要的是
+    **那条能装的命令**，而不是一句"缺 funasr"。命令只能由组件清单的 `pkg` 拼出来
+    （`:func:`_install_command`` 是唯一出处），所以 modelinfo / install_state 都从这里取，
+    不许再各抄一份"包名 → 命令"的映射 —— 那个 bug 就是抄出来的（一份用了 `sys.executable`、
+    另一份还是裸 `python`）。
+    """
+    mid = str(model_id or "").strip()
+    if not mid:
+        return ""
+    for item in load_manifests():
+        if item.get("model_id") == mid:
+            return _install_command(item)
+    return ""
+
+
 def _install_command(item: dict) -> str:
     """给需要 pip 的组件拼一条**可直接粘贴执行**的命令（用当前解释器）。
 
@@ -374,32 +414,19 @@ def _install_command(item: dict) -> str:
     pip 不关心当前目录（在哪儿跑都一样），真正会出错的是**用哪个解释器**：
     裸 `pip install x` 会装到 PATH 上第一个 Python 里，ECHO 自己的 venv 根本看不到，
     于是面板永远显示"未安装"。所以命令一律写成 `<本机解释器> -m pip install …`。
-    路径含空格时加引号（此时 PowerShell 还需要在前面加 `&`，写在 how 里提醒）。
+
+    "本机解释器怎么算"（`pythonw.exe` → `python.exe`、含空格时怎么加引号、PowerShell 里
+    要不要 `&`）收在 `app/interpreter.py`，本文件只负责"装哪个包"。
     """
     if not (item.get("pkg") or item.get("requirements")):
         return ""
-    from app import paths
-    py = ""
-    try:
-        import sys
-        py = sys.executable or ""
-    except Exception:
-        py = ""
-    if not py:
-        return ""
-    # ECHO 服务自己是 pythonw.exe（无控制台）——拿它跑 pip 会看不到任何输出、像是卡住。
-    # 同一目录下的 python.exe 才是该用的那个（实测：面板会把 sys.executable 原样吐出来）。
-    if os.path.basename(py).lower() == "pythonw.exe":
-        cand = os.path.join(os.path.dirname(py), "python.exe")
-        if os.path.isfile(cand):
-            py = cand
-    py_arg = '"%s"' % py if " " in py else py
+    from app import interpreter
     if item.get("pkg"):
-        tail = str(item["pkg"])
+        targets = [str(item["pkg"])]
     else:
-        req = os.path.join(paths.echo_root(), "requirements.txt")
-        tail = '-r "%s"' % req
-    return "%s -m pip install %s" % (py_arg, tail)
+        from app import paths
+        targets = ["-r", os.path.join(paths.echo_root(), "requirements.txt")]
+    return interpreter.pip_install_command(*targets)
 
 
 def catalog(*, platform: Optional[str] = None, os_version: Optional[Tuple[int, ...]] = None,
@@ -429,11 +456,13 @@ def catalog(*, platform: Optional[str] = None, os_version: Optional[Tuple[int, .
         # 而真正缺的可能是 pip 包（2026-09-23 事故）。面板据 readyKind 换徽标措辞。
         row["readyKind"] = ""
         row["readyReason"] = ""
+        row["readyNextStep"] = ""
         if row["ready"] is False:
             try:
                 row["readyKind"], row["readyReason"] = not_ready_reason(item)
+                row["readyNextStep"] = not_ready_next_step(item, row["readyKind"])
             except Exception:
-                row["readyKind"], row["readyReason"] = "", ""
+                row["readyKind"], row["readyReason"], row["readyNextStep"] = "", "", ""
         if item.get("kind") == "agent":
             row["active"] = _agent_active(item["id"])
         out.append(row)

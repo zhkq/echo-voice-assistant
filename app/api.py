@@ -508,10 +508,30 @@ def post_model_download(body: ModelDownloadIn, _auth=Depends(optional_auth)):
 
     pyannote 只提供复制命令，不支持从此接口触发下载。
     source=copy 的模型仍返回拷贝说明。
+
+    **被"缺依赖"拒掉时，把"怎么修"一起返回**（同事 2026-09-25 实测）：只有一句
+    "缺依赖"时用户不知道该装什么、也不知道装完要回来再点一次下载。所以这里多给三个
+    字段（老调用方只看 ``ok`` / ``message``，不受影响）：
+
+      * ``detail``         —— 整段话（原因 + 安装命令 + 下一步），可直接展示；
+      * ``reason``         —— 原因一句话；
+      * ``installCommand`` —— 那条可粘贴的 pip 安装命令；
+      * ``nextStep``       —— 下一步点什么。
     """
     from app import modelinfo
-    ok, msg = modelinfo.start_download(body.id.strip(), force=bool(body.force))
-    return {"ok": ok, "message": msg}
+    mid = body.id.strip()
+    ok, msg = modelinfo.start_download(mid, force=bool(body.force))
+    out = {"ok": ok, "message": msg}
+    if not ok:
+        try:
+            prob = modelinfo.dependency_problem(mid)
+        except Exception:
+            prob = {}
+        if prob:
+            out.update(detail=prob["message"], reason=prob["reason"],
+                       installCommand=prob["installCommand"], nextStep=prob["nextStep"],
+                       nextAction="install")
+    return out
 
 
 @router.post("/system/restart")

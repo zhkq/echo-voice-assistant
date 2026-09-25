@@ -53,9 +53,13 @@ CURRENT_SCHEMA_VERSION = max(v for v, _ in db.MIGRATIONS)
 #:   * dsh_sessions.agent / meeting_sessions.agent（v5，2026-09-19）：会话归属哪个智能体后端，
 #:     换后端（DSH Desktop ↔ 独立 harness ↔ CodeBuddy）后旧会话必须失效 —— 详见 app/db.py
 #:     的 _migrate_session_owner 与 PROGRESS §47。
+#:   * meetings.error（v6，2026-09-25）：这一场**为什么失败**的人话（面板直接显示）。
+#:     在此之前多处只写 status=error、原因一个字都不落库，面板只能自己编
+#:     "麦克风没打开" —— 而真实原因是转写引擎驱动不了。用 notes 装不行（那是用户的地盘）。
 POST_1X_COLUMNS = {
     ("dsh_sessions", "agent"),
     ("meeting_sessions", "agent"),
+    ("meetings", "error"),
 }
 
 

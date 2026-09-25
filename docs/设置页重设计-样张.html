@@ -1,0 +1,544 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>ECHO 设置页重设计 · 样张</title>
+<style>
+  :root{
+    --bg:#0e131c; --bg2:#131a26; --card:#161d2b; --card2:#1b2333;
+    --line:#25314a; --line2:#2f3d5a; --txt:#e6edf5; --mut:#8fa3b8; --dim:#6b7f96;
+    --acc:#4aa3ff; --acc2:#2f6fd0; --ok:#4ec9a0; --warn:#e5b567; --err:#ff6b6b;
+    --r:10px;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--txt);
+       font:14px/1.55 "Microsoft YaHei","PingFang SC",system-ui,-apple-system,"Segoe UI",sans-serif}
+  .wrap{max-width:1020px;margin:0 auto;padding:22px 20px 60px}
+
+  /* ---------- 样张横幅 ---------- */
+  .banner{display:flex;align-items:center;gap:14px;flex-wrap:wrap;
+    background:linear-gradient(90deg,#152036,#132033);border:1px solid var(--line2);
+    border-radius:var(--r);padding:10px 14px;margin-bottom:18px}
+  .banner b{font-size:13px;letter-spacing:.4px}
+  .banner .tag{font-size:11px;color:var(--mut);border:1px solid var(--line2);
+    border-radius:99px;padding:2px 9px}
+  .banner .sp{flex:1}
+  .seg{display:inline-flex;border:1px solid var(--line2);border-radius:8px;overflow:hidden}
+  .seg button{background:transparent;border:0;color:var(--mut);padding:5px 11px;font-size:12px;cursor:pointer}
+  .seg button.on{background:var(--acc2);color:#fff}
+
+  h1{font-size:19px;margin:0 0 4px}
+  .sub{color:var(--dim);font-size:12px;margin-bottom:18px}
+
+  /* ---------- 页签 ---------- */
+  .tabs{display:flex;gap:6px;border-bottom:1px solid var(--line);margin-bottom:18px}
+  .tabs button{background:transparent;border:0;border-bottom:2px solid transparent;
+    color:var(--mut);font-size:14px;padding:9px 14px;cursor:pointer}
+  .tabs button:hover{color:var(--txt)}
+  .tabs button.on{color:var(--acc);border-bottom-color:var(--acc)}
+  .tabs .who{margin-left:auto;font-size:11px;color:var(--dim);align-self:center}
+
+  section[data-tab]{display:none}
+  section[data-tab].on{display:block}
+
+  .card{background:var(--card);border:1px solid var(--line);border-radius:var(--r);
+    padding:14px 16px;margin-bottom:14px}
+  .card > h2{font-size:13px;margin:0 0 4px;color:var(--txt);letter-spacing:.3px}
+  .card > .hint{font-size:11.5px;color:var(--dim);margin-bottom:10px}
+
+  /* ---------- 一行设置 ---------- */
+  .row{display:flex;align-items:center;gap:12px;padding:8px 0;border-top:1px solid #1e2839}
+  .row:first-of-type{border-top:0}
+  .row .lbl{flex:0 0 168px;color:var(--txt);font-size:13px;display:flex;align-items:center;gap:6px}
+  .row .ctl{flex:1;min-width:0;display:flex;align-items:center;gap:8px}
+  .row .tail{flex:0 0 auto;display:flex;align-items:center;gap:6px}
+  select,input[type=text],input[type=number]{background:var(--card2);color:var(--txt);
+    border:1px solid var(--line2);border-radius:7px;padding:6px 8px;font-size:13px;min-width:0;max-width:100%}
+  select:focus,input:focus{outline:1px solid var(--acc);border-color:var(--acc)}
+  .num{width:88px}
+  .ellip{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .btn{background:var(--card2);color:var(--txt);border:1px solid var(--line2);
+    border-radius:7px;padding:5px 10px;font-size:12px;cursor:pointer}
+  .btn:hover{border-color:var(--acc);color:var(--acc)}
+  .btn.primary{background:var(--acc2);border-color:var(--acc2);color:#fff}
+  .btn.primary:hover{background:#3a7fe0;color:#fff}
+  .btn.ghost{background:transparent}
+
+  /* 平铺说明（只在"平铺"模式显示；且只有危险项永远平铺） */
+  .desc{display:none;font-size:11.5px;color:var(--mut);margin:2px 0 6px 180px}
+  body.flat .desc{display:block}
+  .desc.always{display:block;color:var(--warn)}
+
+  /* ---------- 浮窗说明 ---------- */
+  .q{width:15px;height:15px;flex:0 0 15px;border-radius:50%;border:1px solid var(--line2);
+    color:var(--dim);font-size:10.5px;line-height:13px;text-align:center;cursor:help;position:relative}
+  .q:hover{border-color:var(--acc);color:var(--acc)}
+  .q .pop{position:absolute;left:20px;top:-6px;z-index:9;width:330px;display:none;
+    background:#101827;border:1px solid var(--line2);border-radius:8px;padding:9px 11px;
+    color:var(--mut);font-size:11.5px;line-height:1.6;box-shadow:0 8px 26px #0008;text-align:left;font-weight:400}
+  .q .pop b{color:var(--txt);font-weight:600}
+  .q:hover .pop,.q.open .pop{display:block}
+
+  /* ---------- 分组小标题 ---------- */
+  .grp{font-size:11px;color:var(--dim);letter-spacing:.6px;margin:12px 0 2px;text-transform:uppercase}
+  .grp:first-child{margin-top:0}
+
+  /* ---------- 单选组（会议能力跑在哪） ---------- */
+  .radios{display:flex;flex-direction:column;gap:6px}
+  .radios label{display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer}
+  .radios label .why{color:var(--dim);font-size:11.5px}
+  .subrow{margin-left:26px;padding-left:10px;border-left:2px solid #22314a}
+  .check{display:flex;align-items:center;gap:7px;font-size:13px;cursor:pointer}
+
+  /* ---------- 徽标 / 提示条 ---------- */
+  .badge{font-size:11px;border-radius:99px;padding:1.5px 8px;border:1px solid;white-space:nowrap}
+  .badge.ok{color:var(--ok);border-color:#2c5f4d;background:#12241e}
+  .badge.warn{color:var(--warn);border-color:#5d4a24;background:#241f12}
+  .badge.err{color:var(--err);border-color:#6b2f2f;background:#241417}
+  .badge.idle{color:var(--dim);border-color:var(--line2)}
+  .note{display:flex;gap:9px;align-items:flex-start;border-radius:8px;padding:9px 11px;
+    font-size:12px;margin:8px 0 0;border:1px solid}
+  .note.info{background:#12203a;border-color:#2a4a78;color:#cfe2ff}
+  .note.warn{background:#241f12;border-color:#5d4a24;color:#f0dcae}
+  .note .n-act{margin-left:auto;display:flex;gap:6px;flex:0 0 auto}
+  .note code{background:#0d1626;border:1px solid var(--line);border-radius:5px;
+    padding:1px 5px;font-size:11px;color:#bcd6ff}
+
+  /* ---------- 设备紧凑行 ---------- */
+  .devpair{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  .devbox{background:var(--card2);border:1px solid var(--line);border-radius:8px;padding:9px 11px}
+  .devbox .t{font-size:11.5px;color:var(--dim);margin-bottom:6px;display:flex;align-items:center;gap:5px}
+  .devbox .c{display:flex;gap:7px;align-items:center}
+
+  /* ---------- 后端清单表 ---------- */
+  table{width:100%;border-collapse:collapse;font-size:12.5px}
+  th{color:var(--dim);font-weight:400;text-align:left;padding:6px 8px;border-bottom:1px solid var(--line)}
+  td{padding:7px 8px;border-bottom:1px solid #1e2839;color:var(--txt)}
+  tr:last-child td{border-bottom:0}
+  .dot{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:6px}
+  .dot.on{background:var(--ok)}.dot.off{background:#4a5a70}.dot.warn{background:var(--warn)}
+  .mono{font-family:ui-monospace,Consolas,monospace;font-size:11.5px;color:var(--mut)}
+
+  .foot{color:var(--dim);font-size:11.5px;margin-top:20px;border-top:1px solid var(--line);padding-top:12px}
+  .foot b{color:var(--mut)}
+</style>
+</head>
+<body class="flat">
+<div class="wrap">
+
+  <div class="banner">
+    <b>ECHO · 设置页重设计样张</b>
+    <span class="tag">静态预览，不连后端</span>
+    <span class="sp"></span>
+    <span class="tag">说明文字</span>
+    <span class="seg">
+      <button id="mFlat" class="on" onclick="setMode('flat')">平铺（现状）</button>
+      <button id="mPop" onclick="setMode('pop')">浮窗（新）</button>
+    </span>
+  </div>
+
+  <h1>设置</h1>
+  <div class="sub">四个页签各管一件事：<b>常规</b>=这台机器怎么表现 · <b>语音与设备</b>=声音从哪进从哪出 · <b>智能体</b>=选哪个智能体与它的模型 · <b>能力后端</b>=算力放哪</div>
+
+  <div class="tabs" id="tabs">
+    <button class="on" onclick="tab(0)">常规</button>
+    <button onclick="tab(1)">语音与设备</button>
+    <button onclick="tab(2)">智能体</button>
+    <button onclick="tab(3)">能力后端</button>
+    <span class="who" id="who">这一页只管：界面 · 自启 · 端口 · 日志</span>
+  </div>
+
+  <!-- ================= 常规 ================= -->
+  <section data-tab="0" class="on">
+    <div class="card">
+      <h2>界面与偏好</h2>
+      <div class="row">
+        <div class="lbl">界面语言 <span class="q">?<span class="pop">面板与提示语言。改完立即生效，不影响会议里已经转写好的文本。</span></span></div>
+        <div class="ctl"><select><option>简体中文</option><option>English</option></select></div>
+      </div>
+      <div class="row">
+        <div class="lbl">极简回复 <span class="q">?<span class="pop">让智能体先给结论、再把细节放在后面。适合手机上看，长报告会显得"短"。</span></span></div>
+        <div class="ctl"><label class="check"><input type="checkbox" checked> 只回结论 + 换行细节</label></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>服务与运维</h2>
+      <div class="row">
+        <div class="lbl">开机自启 <span class="q">?<span class="pop">登录 Windows 后自动把 ECHO 服务拉起来（后台，没有窗口）。</span></span></div>
+        <div class="ctl"><label class="check"><input type="checkbox" checked> 已开启</label></div>
+        <div class="tail"><button class="btn ghost">查看启动项</button></div>
+      </div>
+      <div class="row">
+        <div class="lbl">面板端口</div>
+        <div class="ctl"><input class="num" type="number" value="8970"></div>
+        <div class="tail"><span class="badge ok">正在监听</span></div>
+      </div>
+      <div class="row">
+        <div class="lbl">服务状态</div>
+        <div class="ctl"><span class="mono">pid 23180 · 已运行 3 小时 12 分 · 常驻 468 MB</span></div>
+        <div class="tail">
+          <button class="btn">重启 ECHO</button>
+          <button class="btn ghost">打开日志目录</button>
+        </div>
+      </div>
+      <div class="note warn">
+        <span>⚠</span>
+        <span>会议正在录音时<b>不要重启</b> —— 会打断这一场。当前没有在录，可以安全重启。</span>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= 语音与设备 ================= -->
+  <section data-tab="1">
+    <div class="card">
+      <h2>命令采集</h2>
+      <div class="hint">"说一句话给 ECHO"这条链：唤醒 → 收音 → 转成文字。会议那一套在下面单独一组。</div>
+      <div class="row">
+        <div class="lbl">唤醒词 <span class="q">?<span class="pop">说这个词开始收音。改完需要重启一次生效。</span></span></div>
+        <div class="ctl"><input type="text" value="小助手" style="width:120px"></div>
+      </div>
+      <div class="row">
+        <div class="lbl">收音设备
+          <span class="q">?<span class="pop">语音指令、唤醒词都从这里进。可以和会议用不同的麦（例如指令用耳机、会议用全向麦）。</span></span>
+        </div>
+        <div class="ctl">
+          <select style="flex:1"><option>系统默认麦克风</option><option>耳机麦克风 (Realtek)</option><option>麦克风阵列 (USB Audio)</option></select>
+          <button class="btn">试一下</button>
+        </div>
+      </div>
+      <div class="row">
+        <div class="lbl">转写引擎
+          <span class="q">?<span class="pop"><b>本机引擎</b>：sherpa（流式、最快）、SenseVoice（中文准）、whisper（最准最慢）。<br><b>在线服务</b>：OpenAI 兼容的外部转写，<b>音频会出网</b>；会议那边也会用同一个服务。</span></span>
+        </div>
+        <div class="ctl"><select style="flex:1">
+          <option>sherpa-onnx 流式（推荐）</option>
+          <option>SenseVoice 中文</option>
+          <option>whisper small</option>
+          <option>在线服务（OpenAI 兼容）…</option>
+        </select></div>
+        <div class="tail"><span class="badge ok">就绪</span></div>
+      </div>
+      <div class="row">
+        <div class="lbl">中文短命令引擎</div>
+        <div class="ctl"><span class="mono ellip">SenseVoiceSmall</span></div>
+        <div class="tail">
+          <span class="badge warn">缺依赖</span>
+          <button class="btn">下载</button>
+          <button class="btn ghost">复制命令</button>
+          <button class="btn ghost">复制安装命令</button>
+        </div>
+      </div>
+      <div class="note info">
+        <span>ⓘ</span>
+        <span>还差 <b>Python 依赖</b>（<code>funasr</code>），模型下好了也转写不了。<br>
+              <b>两步走</b>：① 点右边「复制安装命令」粘到 PowerShell 跑完 → ② 回来点一次「下载」。</span>
+        <span class="n-act"><button class="btn primary">复制安装命令</button></span>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>会议录音</h2>
+      <div class="hint">录一整场会：音频写在哪、多长一段、录的时候要不要安静。</div>
+      <div class="row">
+        <div class="lbl">会议麦克风
+          <span class="q">?<span class="pop">会议通常用全向麦（离人远、拾音范围大），和上面的指令麦分开设。录制期间麦克风只被会议持有，语音指令会被拒。</span></span>
+        </div>
+        <div class="ctl">
+          <select style="flex:1"><option>系统默认麦克风</option><option>麦克风阵列 (USB Audio)</option><option>耳机麦克风 (Realtek)</option></select>
+          <button class="btn">试一下</button>
+        </div>
+      </div>
+      <div class="row">
+        <div class="lbl">分段时长 <span class="q">?<span class="pop">音频切成多长一段写盘。<b>小一点</b>更抗中途断电，<b>大一点</b>文件更整（默认 10 分钟）。</span></span></div>
+        <div class="ctl"><input class="num" type="number" value="10"> <span style="color:var(--dim);font-size:12px">分钟</span></div>
+      </div>
+      <div class="row">
+        <div class="lbl">音频存放</div>
+        <div class="ctl"><span class="mono ellip">C:\ECHO\meeting</span></div>
+        <div class="tail"><button class="btn ghost">打开</button></div>
+      </div>
+      <div class="row">
+        <div class="lbl">录音期间静音提示音</div>
+        <div class="ctl"><label class="check"><input type="checkbox" checked> 不要提示音进录音</label></div>
+      </div>
+      <div class="row">
+        <div class="lbl">结束后自动转写</div>
+        <div class="ctl"><label class="check"><input type="checkbox" checked> 停止录音后立刻转写</label></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>任务反馈</h2>
+      <div class="hint">ECHO 怎么"回话"给你：响一声、还是读出来。</div>
+      <div class="row">
+        <div class="lbl">播放设备
+          <span class="q">?<span class="pop">提示音与朗读都从这里出。会议录音期间会自动静音（见上一组）。</span></span>
+        </div>
+        <div class="ctl">
+          <select style="flex:1"><option>系统默认扬声器</option><option>耳机 (Realtek)</option></select>
+          <button class="btn">试听</button>
+        </div>
+      </div>
+      <div class="row">
+        <div class="lbl">提示音</div>
+        <div class="ctl"><label class="check"><input type="checkbox"> 开始/结束收音时响一声</label></div>
+      </div>
+      <div class="row">
+        <div class="lbl">朗读引擎（TTS） <span class="q">?<span class="pop"><b>本机离线</b>=不出网；<b>在线</b>=音质更好，但朗读的文本会发给服务商；<b>关闭</b>=不朗读，只显示文字。</span></span></div>
+        <div class="ctl"><select><option>本机离线朗读</option><option>在线（Edge TTS）</option><option>关闭</option></select></div>
+      </div>
+      <div class="row">
+        <div class="lbl">任务完成提示</div>
+        <div class="ctl"><label class="check"><input type="checkbox" checked> 长任务（转写 / 纪要）完成后响一声</label></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= 智能体与模型 ================= -->
+  <section data-tab="2">
+    <div class="card">
+      <h2>智能体</h2>
+      <div class="row">
+        <div class="lbl">后端</div>
+        <div class="ctl"><select><option>标准版 harness</option><option>DSH 桌面版</option></select></div>
+        <div class="tail"><span class="badge ok">在线</span><button class="btn">用浏览器打开</button></div>
+      </div>
+      <div class="row">
+        <div class="lbl">家目录</div>
+        <div class="ctl"><span class="mono ellip">C:\ECHO\dsh\home</span></div>
+        <div class="tail"><button class="btn ghost">打开</button></div>
+      </div>
+      <div class="row">
+        <div class="lbl">指令空间 <span class="q">?<span class="pop">语音指令建出来的会话都登记在这个目录下，DSH 侧栏里会聚成一个分组。</span></span></div>
+        <div class="ctl"><span class="mono ellip">C:\ECHO\aide</span></div>
+      </div>
+      <div class="row">
+        <div class="lbl">会议工作区 <span class="q">?<span class="pop">每场会议生成的纪要会话登记在这里。会议音频与文本存在 <code>C:\ECHO\meeting</code>。</span></span></div>
+        <div class="ctl"><span class="mono ellip">C:\ECHO\meeting</span></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2 style="display:flex;align-items:center;gap:8px;margin-bottom:8px">通道设置
+        <span class="badge ok">通道 2 · 外4.1F</span>
+        <a href="#" style="margin-left:auto;font-size:12px;color:var(--acc);text-decoration:none">仪表盘 ↗</a>
+      </h2>
+      <div class="hint" style="margin-bottom:10px">DSH 模型 <b>echo-auto</b>（显示名 ECHO AUTO）· 2/2 启用 · 131K 上下文 / 33K 输出 ·
+        已注册（标准版 harness）· <span style="color:var(--warn)">DSH 桌面版 未注册</span>
+        <span class="q">?<span class="pop">ECHO 会把自己注册进<b>所有装好的</b>智能体家目录（桌面版 + 标准版），令牌保持一致；只装一个就只注册一个。没注册的那一侧，智能体里选不到 ECHO AUTO。</span></span>
+      </div>
+      <div style="display:flex;align-items:center;gap:10px;padding:7px 0;border-top:1px solid #1e2839">
+        <span class="ord" style="flex:0 0 22px;height:22px;line-height:22px;text-align:center;border-radius:6px;background:#243049;color:#a9c4e6;font-size:12px">1</span>
+        <span style="flex:1">内Flash</span>
+        <span class="dot off"></span>
+        <button class="btn ghost" style="padding:2px 7px">↑</button>
+        <button class="btn ghost" style="padding:2px 7px">↓</button>
+        <label class="sw" style="display:inline-flex"><input type="checkbox" checked></label>
+      </div>
+      <div style="display:flex;align-items:center;gap:10px;padding:7px 0;border-top:1px solid #1e2839">
+        <span style="flex:0 0 22px;height:22px;line-height:22px;text-align:center;border-radius:6px;background:#243049;color:#a9c4e6;font-size:12px">2</span>
+        <span style="flex:1">外4.1F</span>
+        <span class="dot on"></span>
+        <button class="btn ghost" style="padding:2px 7px">↑</button>
+        <button class="btn ghost" style="padding:2px 7px">↓</button>
+        <label style="display:inline-flex"><input type="checkbox" checked></label>
+      </div>
+      <div style="display:flex;align-items:center;gap:8px;margin:12px 0 2px;padding-top:10px;border-top:1px solid #26324a">
+        <span style="font-size:11px;color:var(--dim);letter-spacing:.5px">未加入路由组（不参与排序）</span>
+        <span class="q">?<span class="pop"><b>勾选 = 加入路由组</b>，列表顺序 = 取用优先级。<br>
+          · 勾上后它<b>自动排到已勾选的那几个后面</b>，你可以继续用 ↑ ↓ 调整；<br>
+          · 取消勾选，它就沉到这个区域，<b>不再参与排序</b>；<br>
+          · 「立即探测」发现的新模型只出现在这里，<b>不会自动勾选</b> —— 要不要用由你定。</span></span>
+        <span style="margin-left:auto;font-size:11px;color:var(--dim)">3 个候选</span>
+      </div>
+      <div style="display:flex;align-items:center;gap:10px;padding:7px 0">
+        <span style="flex:0 0 22px"></span>
+        <span style="flex:1;color:var(--mut)">DeepSeek 官方</span>
+        <span class="badge warn">缺密钥</span>
+        <span class="dot warn"></span>
+        <label style="display:inline-flex"><input type="checkbox"></label>
+      </div>
+      <div style="display:flex;align-items:center;gap:10px;padding:7px 0;border-top:1px solid #1e2839">
+        <span style="flex:0 0 22px"></span>
+        <span style="flex:1;color:var(--mut)">本机 Ollama</span>
+        <span class="badge idle">未启动</span>
+        <span class="dot off"></span>
+        <label style="display:inline-flex"><input type="checkbox"></label>
+      </div>
+      <div style="display:flex;align-items:center;gap:10px;padding:7px 0;border-top:1px solid #1e2839">
+        <span style="flex:0 0 22px"></span>
+        <span style="flex:1;color:var(--mut)">Qwen3-32B</span>
+        <span class="badge ok">新发现</span>
+        <span class="dot on"></span>
+        <label style="display:inline-flex"><input type="checkbox"></label>
+      </div>
+      <div style="display:flex;gap:10px;margin-top:10px">
+        <button class="btn" style="flex:1">保存</button>
+      </div>
+      <div style="display:flex;gap:14px;margin-top:10px;font-size:12px;color:var(--acc)">
+        <a href="#" style="color:var(--acc);text-decoration:none">立即探测</a>
+        <a href="#" style="color:var(--acc);text-decoration:none">重载配置</a>
+        <a href="#" style="color:var(--acc);text-decoration:none">重新注册到 DSH</a>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= 能力后端 ================= -->
+  <section data-tab="3">
+    <div class="card">
+      <h2>会议转写服务</h2>
+      <div class="hint">转写、说话人分离、声纹提取<b>一起</b>跟着这个选择走，不必各选各的。</div>
+      <div class="radios">
+        <label><input type="radio" name="mc" value="echo-server" checked onchange="svc('echo-server')"> ECHO 后端 <span class="why">配对的那台 GPU 机器（推荐）</span></label>
+        <label><input type="radio" name="mc" value="local" onchange="svc('local')"> 本机 <span class="why">这台机器上的引擎；默认档没有 GPU 引擎，会慢</span></label>
+        <label><input type="radio" name="mc" value="asr-provider" onchange="svc('asr-provider')"> 网络服务商 <span class="why">外部/内网服务 · 入口先留着，适配器未实现</span></label>
+      </div>
+      <div class="row" style="margin-top:12px;border-top:1px solid #1e2839">
+        <div class="lbl">会议产出
+          <span class="q">?<span class="pop">默认<b>全开</b>：文字 + 说话人 + 声纹。<br>
+            · <b>转写 + 说话人</b>：不做声纹识别（不比对联系人，也不消耗那份算力）<br>
+            · <b>只要文字</b>：不产出任何说话人信息，后端算力最省</span></span>
+        </div>
+        <div class="ctl"><select>
+          <option>转写 + 说话人 + 声纹（默认）</option>
+          <option>转写 + 说话人</option>
+          <option>只要文字</option>
+        </select></div>
+      </div>
+      <div class="note info">
+        <span>ⓘ</span>
+        <span>这一项<b>没有"自动"</b>：选中的那个用不了时会明确报错（说清是哪个后端、为什么），不会悄悄换别的兜底。</span>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2 id="svcTitle">ECHO 后端</h2>
+      <div class="hint" id="svcHint">配对那台 GPU 机器；下面的清单是它的实况。</div>
+
+      <div data-svc="echo-server">
+        <div class="row">
+          <div class="lbl">配对</div>
+          <div class="ctl"><input type="text" placeholder="粘贴配对串，例如 echo://pair?host=https://…" style="flex:1"></div>
+          <div class="tail"><button class="btn primary">配对</button></div>
+        </div>
+        <div class="row">
+          <div class="lbl">后端清单</div>
+          <div class="ctl"><span class="mono">2 台 · 1 台可用</span></div>
+          <div class="tail"><button class="btn">重新探测</button></div>
+        </div>
+        <table style="margin-top:6px">
+          <tr><th>地址</th><th>能力</th><th>向量空间</th><th>状态</th></tr>
+          <tr>
+            <td class="mono">https://192.168.1.170:8900</td>
+            <td>转写 · 说话人 · 声纹</td>
+            <td class="mono">echo-dev / 1</td>
+            <td><span class="dot on"></span>在线 42ms</td>
+          </tr>
+          <tr>
+            <td class="mono">http://10.0.0.9:8900</td>
+            <td>转写</td>
+            <td class="mono">—</td>
+            <td><span class="dot off"></span>连不上</td>
+          </tr>
+        </table>
+      </div>
+
+      <div data-svc="local" style="display:none">
+        <div class="row">
+          <div class="lbl">会议转写引擎
+            <span class="q">?<span class="pop">本机跑会议只能用这几个。<b>sherpa</b>=流式、最快、没有句级时间戳（按字数均摊）；<b>SenseVoice</b>=中文准，但缺时间戳时要借 whisper 骨架；<b>whisper</b>=时间戳最准、最慢。</span></span>
+          </div>
+          <div class="ctl"><select>
+            <option>sherpa-onnx 流式（推荐）</option>
+            <option>SenseVoice 中文</option>
+            <option>whisper small</option>
+          </select></div>
+          <div class="tail"><span class="badge ok">就绪</span></div>
+        </div>
+        <div class="row">
+          <div class="lbl">本机算力</div>
+          <div class="ctl"><span class="mono">CPU · 无 GPU 加速</span></div>
+          <div class="tail"><span class="badge idle">长会议会慢</span></div>
+        </div>
+        <div class="note warn">
+          <span>⚠</span>
+          <span>本机跑会议时，<b>说话人分离与声纹</b>会另起一套向量空间（与后端产出的不是同一个）—— 所以「会议产出」里选「只要文字」通常更合适。</span>
+        </div>
+      </div>
+
+      <div data-svc="asr-provider" style="display:none">
+        <div class="note info">
+          <span>ⓘ</span>
+          <span>这个入口<b>先留着</b>：适配器还没实现（等接口规范）。选了它，会议会<b>如实报"不在位"</b>，不会偷偷换别的后端。</span>
+        </div>
+        <div class="row">
+          <div class="lbl">服务地址</div>
+          <div class="ctl"><input type="text" placeholder="（待接口规范）" disabled style="flex:1"></div>
+        </div>
+        <div class="row">
+          <div class="lbl">密钥</div>
+          <div class="ctl"><input type="text" placeholder="（待接口规范）" disabled style="flex:1"></div>
+        </div>
+      </div>
+
+      <div class="row" style="margin-top:10px;border-top:1px solid #1e2839">
+        <div class="lbl">出网许可 <span class="q">?<span class="pop">约束哪些后端可以用：<b>不出机</b>=只用本机；<b>内网</b>=允许 ECHO 后端；<b>允许出网</b>=还允许网络服务商。</span></span></div>
+        <div class="ctl"><select><option>允许内网（推荐）</option><option>不出机</option><option>允许出网</option></select></div>
+        <div class="tail"><span class="badge ok">与当前选择一致</span></div>
+      </div>
+    </div>
+  </section>
+
+  <div class="foot">
+    <b>怎么读这张样张</b>：右上角可在「平铺（现状）」与「浮窗（新）」之间切换 —— 新形态下每行只剩短标签 + 控件，
+    长说明收到行尾的 <span class="q" style="display:inline-flex">?</span> 里；只有<b>不可逆</b>或<b>会出网</b>的项（例如上面的服务重启、
+    出网许可、在线转写）才把话留在明面上。<br>
+    页签分工一句话记忆：<b>常规</b>=表现 · <b>语音与设备</b>=进出 · <b>智能体</b>=文本与路由 · <b>能力后端</b>=算力。
+  </div>
+</div>
+
+<script>
+  const WHO = [
+    "这一页只管：界面 · 自启 · 端口 · 日志",
+    "这一页只管：录音/播放设备 · 引擎 · 唤醒 · 提示音",
+    "这一页只管：智能体选择 · 它的模型与密钥 · ECHO AUTO",
+    "这一页只管：配对 · 后端清单 · 会议转写服务"
+  ];
+  function tab(i){
+    document.querySelectorAll('#tabs button').forEach((b,k)=>{
+      if(k<4) b.classList.toggle('on', k===i);
+    });
+    document.querySelectorAll('section[data-tab]').forEach(s=>{
+      s.classList.toggle('on', s.dataset.tab === String(i));
+    });
+    document.getElementById('who').textContent = WHO[i];
+  }
+  function setMode(m){
+    document.body.classList.toggle('flat', m==='flat');
+    document.getElementById('mFlat').classList.toggle('on', m==='flat');
+    document.getElementById('mPop').classList.toggle('on', m==='pop');
+  }
+  // 会议转写服务：选哪个就只展示哪个的设置（"选什么看什么"）
+  const SVC = {
+    'echo-server': ['ECHO 后端', '配对那台 GPU 机器；下面的清单是它的实况。'],
+    'local':       ['本机', '会议在这台机器上跑；引擎与就绪状态如下。'],
+    'asr-provider':['网络服务商', '外部/内网服务；适配器等接口规范，入口先留着。']
+  };
+  function svc(which){
+    document.querySelectorAll('[data-svc]').forEach(el=>{
+      el.style.display = (el.dataset.svc === which) ? '' : 'none';
+    });
+    const meta = SVC[which] || ['', ''];
+    document.getElementById('svcTitle').textContent = meta[0];
+    document.getElementById('svcHint').textContent = meta[1];
+  }
+  // 点击 ? 也能开浮窗（触屏/不习惯悬停的人）
+  document.addEventListener('click', e=>{
+    const q = e.target.closest('.q');
+    document.querySelectorAll('.q.open').forEach(x=>{ if(x!==q) x.classList.remove('open'); });
+    if(q) q.classList.toggle('open');
+  });
+</script>
+</body>
+</html>

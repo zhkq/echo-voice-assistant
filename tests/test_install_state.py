@@ -14,6 +14,8 @@
 """
 import json
 import os
+import re
+import shutil
 import sys
 import tempfile
 import unittest
@@ -393,6 +395,318 @@ class EngineProblemTests(unittest.TestCase):
                 install_state.engine_problem("sherpa")
             except Exception as exc:                       # pragma: no cover - 失败即测试失败
                 self.fail("校验不能把调用方（保存设置）带崩：%s" % exc)
+
+
+class InterpreterHelperTests(unittest.TestCase):
+    """解释器助手（`app/interpreter.py`）—— 「复制命令」开箱即用的那一层。
+
+    同事 2026-09-25 在一台干净装机上实测：面板「设置 → 模型」的「复制命令」给的是
+    **裸 `python`**，而那台机器是 python.org 的嵌入包（`python` 不在 PATH 上）—— 粘进
+    PowerShell 直接"不是内部或外部命令"，他自己补了绝对路径才跑起来。同一个面板上的
+    「复制安装命令」早就用了 `sys.executable`：根因是"算解释器"被抄了两份、只改了一份。
+    """
+
+    def test_pythonw_is_swapped_for_python(self):
+        """ECHO 服务跑在 `pythonw.exe` 下（无控制台）：拿它跑 `-c` / pip 会"什么都不显示"。"""
+        from app import interpreter
+
+        tmp = tempfile.mkdtemp(prefix="echo-interp-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        open(os.path.join(tmp, "python.exe"), "wb").close()
+        with patch.object(sys, "executable", os.path.join(tmp, "pythonw.exe")):
+            self.assertEqual(os.path.join(tmp, "python.exe"), interpreter.python_executable())
+        # 同目录没有 python.exe 时保持原样（不假装换过）
+        empty = tempfile.mkdtemp(prefix="echo-interp-")
+        self.addCleanup(shutil.rmtree, empty, ignore_errors=True)
+        with patch.object(sys, "executable", os.path.join(empty, "pythonw.exe")):
+            self.assertEqual(os.path.join(empty, "pythonw.exe"), interpreter.python_executable())
+
+    def test_path_with_spaces_is_quoted(self):
+        """路径含空格也要能跑：解释器路径必须加引号，且 PowerShell 里要 `&` 调用。"""
+        from app import interpreter
+
+        spaced = os.path.join(tempfile.gettempdir(), "echo space", "python.exe")
+        with patch.object(sys, "executable", spaced):
+            self.assertEqual(spaced, interpreter.python_executable())
+            cmd = interpreter.python_command("-c", "print('hi')")
+            pip_cmd = interpreter.pip_install_command("funasr")
+        self.assertIn('"%s"' % spaced, cmd, "含空格的解释器路径必须加引号：%s" % cmd)
+        self.assertIn("-c", cmd)
+        self.assertIn('"%s"' % spaced, pip_cmd)
+        self.assertIn("-m pip install funasr", pip_cmd)
+        if os.name == "nt":
+            # PowerShell：`&` 是调用运算符（路径带引号时必须用它，否则只是一个字符串表达式）
+            self.assertTrue(cmd.startswith('& "'), cmd)
+            self.assertIn('"print(\'hi\')"', cmd, "参数含括号/空格时也要加引号：%s" % cmd)
+        else:
+            import shlex
+            self.assertEqual([spaced, "-c", "print('hi')"], shlex.split(cmd),
+                             "POSIX 上必须仍是**能跑的一行命令**（不能带 PowerShell 的 &）：%s" % cmd)
+
+    def test_no_interpreter_means_no_command(self):
+        """算不出解释器时返回空串 —— 不许硬编一个 `python` 糊弄过去（那正是这个 bug）。"""
+        from app import interpreter
+
+        with patch.object(sys, "executable", ""):
+            self.assertEqual("", interpreter.python_command("-c", "print(1)"))
+            self.assertEqual("", interpreter.pip_install_command("funasr"))
+
+
+#: 「裸解释器」：不是路径、前面也没有 `-m ` 的 python / pip 调用。
+#: 负向后顾 `(?<![\w./\\:-])` 用来放过 `C:\…\python.exe` 这种**绝对路径**。
+_BARE_INTERPRETER_RE = re.compile(r"(?<![\w./\\:-])(?<!-m )(python[0-9.]*|pip[0-9.]*)(?=\s|$)")
+
+
+class CatalogCommandsArePasteAndRunTests(unittest.TestCase):
+    """**catalog 全量扫描**：每条 `cmd` 都得是"粘进终端就能跑"的。
+
+    为什么扫全量而不是挑一条测（同事踩的就是漏改）：`iic/SenseVoiceSmall` 与
+    `faster_whisper` 那两条写的是裸 `python`，别的条目（qwen3asr 的平台脚本、pyannote 的
+    hf 脚本）本来就是好的 —— 只测一条会漏掉下一次"新加的档位又写回裸 python"。
+    """
+
+    def _entries_with_cmd(self):
+        from app import modelinfo
+        return [(e["id"], str(e.get("cmd") or "")) for e in modelinfo.CATALOG if e.get("cmd")]
+
+    def test_every_cmd_has_a_label_when_it_has_one_at_all(self):
+        """`cmd_label` 只允许"有命令且有标签"或"两者都没有"，不许出现空标签。"""
+        from app import modelinfo
+        bad = []
+        for e in modelinfo.CATALOG:
+            label = e.get("cmd_label")
+            if label is None:
+                continue
+            if not str(label).strip():
+                bad.append(e["id"])
+            if not e.get("cmd"):
+                bad.append("%s: 有标签没命令" % e["id"])
+        self.assertEqual(bad, [], "cmd_label 与 cmd 对不上：%s" % bad)
+
+    def test_no_entry_calls_a_bare_interpreter(self):
+        bad = []
+        for mid, cmd in self._entries_with_cmd():
+            if re.match(r"\s*(python|pip)", cmd, re.I):
+                bad.append("%s: 裸解释器开头 -> %s" % (mid, cmd[:60]))
+                continue
+            for hit in _BARE_INTERPRETER_RE.finditer(cmd):
+                bad.append("%s: 命令里出现裸 %r" % (mid, hit.group(0)))
+        self.assertEqual(bad, [], "这些命令在一台干净装机上跑不了：%s" % bad)
+
+    def test_every_cmd_is_either_absolute_or_a_platform_script(self):
+        """每条命令都得有一个"为什么它开箱即用"的理由（否则就是漏改）。"""
+        from app import interpreter, modelinfo, paths
+        from app import platform as echo_platform
+
+        py = interpreter.python_executable()
+        hf = echo_platform.hf_executable(paths.echo_root())
+        self.assertTrue(py and os.path.isabs(py), "算不出本机解释器的绝对路径")
+        bad, checked = [], 0
+        for mid, cmd in self._entries_with_cmd():
+            checked += 1
+            ok = (py in cmd                                        # ① 本机解释器全路径
+                  or cmd == echo_platform.model_install_command(mid)   # ② 平台一键安装脚本
+                  or (hf and hf in cmd))                           # ③ venv 里的 hf 下载脚本
+            if not ok:
+                bad.append("%s -> %s" % (mid, cmd[:80]))
+        self.assertGreaterEqual(checked, 8, "catalog 里带 cmd 的条目变少了？扫到的：%s" % checked)
+        self.assertEqual(bad, [], "这些命令既没带本机解释器、也不是平台脚本：%s" % bad)
+
+    def test_python_commands_appear_in_the_scan_and_carry_the_interpreter(self):
+        """正向断言：真的是 python 命令的那些条目，必须带**本机**解释器（含 basename）。"""
+        from app import interpreter
+
+        py = interpreter.python_executable()
+        checked = []
+        for mid, cmd in self._entries_with_cmd():
+            if "-c " not in cmd and "-m pip" not in cmd:
+                continue                       # 平台脚本 / hf 脚本：不该硬塞解释器
+            checked.append(mid)
+            with self.subTest(entry=mid):
+                self.assertIn(py, cmd)
+                self.assertIn(os.path.basename(py), cmd)
+        self.assertIn("sensevoice", checked, "扫到的是空的 —— 扫描规则失效了？")
+        self.assertTrue(any(m.startswith("whisper-") for m in checked), checked)
+
+
+class MissingDependencyGuidanceTests(unittest.TestCase):
+    """「下载」因缺依赖被拒时，要把**怎么修**直接摆出来（同事 2026-09-25 实测）。
+
+    当时面板只报一句"缺依赖"：用户不知道该装什么，更不知道装完还要**回来再点一次下载**。
+    所以响应里三件都要有 —— 原因 / 那条安装命令 / 下一步。
+    """
+
+    def setUp(self):
+        from app import paths
+        self._get = paths._settings_get
+        self.tmp = tempfile.mkdtemp(prefix="echo-depguide-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        paths._settings_get = lambda name: self.tmp if name == "modelsDir" else ""
+        self.addCleanup(setattr, paths, "_settings_get", self._get)
+
+    def test_download_refusal_carries_reason_command_and_next_step(self):
+        from app import interpreter, modelinfo
+        with patch.object(modelinfo, "_pkg_available", lambda name: False):
+            ok, msg = modelinfo.start_download("sensevoice")
+        self.assertFalse(ok)
+        self.assertIn("funasr", msg, "要说清缺哪个包")
+        self.assertIn("-m pip install funasr", msg, "要给出那条安装命令")
+        self.assertIn(interpreter.python_executable(), msg, "命令要带本机解释器全路径")
+        self.assertIn("再点一次", msg, "要讲清第二步：装完再回来点一次下载")
+
+    def test_refusal_is_a_refusal_not_a_started_job(self):
+        """拒绝必须是**拒**：不能一边报缺依赖、一边把后台任务挂上（用户会以为在下）。"""
+        from app import modelinfo
+        with patch.object(modelinfo, "_pkg_available", lambda name: False):
+            modelinfo.start_download("sensevoice")
+        self.assertIsNone(modelinfo.jobs()["active"])
+
+    def test_dependency_problem_shape(self):
+        from app import modelinfo
+        with patch.object(modelinfo, "_pkg_available", lambda name: False):
+            prob = modelinfo.dependency_problem("sensevoice")
+        self.assertEqual("funasr", prob["module"])
+        self.assertIn("funasr", prob["reason"])
+        self.assertIn("-m pip install funasr", prob["installCommand"])
+        self.assertIn("再点一次", prob["nextStep"])
+        self.assertIn(prob["reason"], prob["message"])
+        # 不是转写引擎的条目（KWS / pyannote）不该被当成"缺依赖"
+        with patch.object(modelinfo, "_pkg_available", lambda name: False):
+            self.assertEqual({}, modelinfo.dependency_problem("kws"))
+            self.assertEqual({}, modelinfo.dependency_problem("pyannote"))
+
+    def test_api_returns_the_structured_fields(self):
+        """面板要能**直接拿字段**，不用去正则解析那句话。"""
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+
+        from app import modelinfo
+        from app.api import router
+
+        app = FastAPI()
+        app.include_router(router)
+        client = TestClient(app)
+        with patch.object(modelinfo, "_pkg_available", lambda name: False):
+            r = client.post("/api/models/download", json={"id": "sensevoice"})
+        self.assertEqual(200, r.status_code, r.text)
+        data = r.json()
+        self.assertFalse(data["ok"])
+        self.assertIn("funasr", data["reason"])
+        self.assertIn("-m pip install funasr", data["installCommand"])
+        self.assertIn("再点一次", data["nextStep"])
+        self.assertIn("再点一次", data["detail"], "detail 是给面板直接显示的那整段")
+        self.assertEqual("install", data["nextAction"])
+
+    def test_download_failure_message_also_says_what_to_do(self):
+        """后台线程真失败了也要带"怎么办"（缺 modelscope 这类下载客户端时）。"""
+        from app import modelinfo
+        with patch.object(modelinfo, "_pkg_available", lambda name: True):
+            hint = modelinfo._failure_hint(
+                "sensevoice", "RuntimeError: No module named 'modelscope'")
+        self.assertIn("modelscope", hint)
+        self.assertIn("-m pip install funasr", hint)
+        self.assertIn("再点一次", hint)
+        # 认不出的失败不加戏
+        with patch.object(modelinfo, "_pkg_available", lambda name: True):
+            self.assertEqual("", modelinfo._failure_hint("sensevoice", "HTTP 500"))
+
+
+class ModelNotDownloadedNextStepTests(unittest.TestCase):
+    """依赖就绪、只差模型文件时，要明说"再点一次下载"（同事 2026-09-25 实测）。
+
+    他的实际顺序：点下载 → 报缺依赖 → 复制安装命令装依赖 → 面板如实变成"模型文件还没
+    下载" → **他以为卡死了**（其实只差再点一次「下载」，界面一个字都没说）。
+    """
+
+    def setUp(self):
+        from app import paths
+        self._get = paths._settings_get
+        self.tmp = tempfile.mkdtemp(prefix="echo-nextstep-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        paths._settings_get = lambda name: self.tmp if name == "modelsDir" else ""
+        self.addCleanup(setattr, paths, "_settings_get", self._get)
+
+    def test_install_state_says_deps_are_ready_and_what_to_click(self):
+        report = {"engines": ["sensevoice"], "agent": "none"}
+        with patch.object(install_state, "_module_ok", lambda name: True), \
+                patch.object(install_state, "_model_ready", lambda mid: False):
+            miss = install_state.missing(report)
+        self.assertTrue(miss)
+        self.assertIn("依赖已就绪", miss[0]["reason"], "这一档必须是「依赖已就绪」那类")
+        self.assertNotIn("缺 Python 依赖", miss[0]["reason"])
+        self.assertEqual("download", miss[0]["action"])
+        self.assertEqual("sensevoice", miss[0]["modelId"])
+        self.assertIn("再点一次", miss[0]["nextStep"])
+        self.assertIn("下载", miss[0]["fix"])
+
+    def test_install_state_missing_dep_points_at_the_install_command(self):
+        report = {"engines": ["sensevoice"], "agent": "none"}
+        with patch.object(install_state, "_module_ok", lambda name: False), \
+                patch.object(install_state, "_model_ready", lambda mid: True):
+            miss = install_state.missing(report)
+        self.assertIn("funasr", miss[0]["reason"])
+        self.assertIn("-m pip install funasr", miss[0]["fix"], "缺依赖要直接给出安装命令")
+        self.assertIn("再点一次", miss[0]["fix"], "还要讲清第二步")
+        self.assertEqual("install", miss[0]["action"])
+        self.assertIn("-m pip install funasr", miss[0]["installCommand"])
+
+    def test_components_reason_and_next_step_for_both_kinds(self):
+        from app import components
+        item = {"id": "stt-sensevoice", "model_id": "sensevoice", "pkg": "funasr"}
+        # ① 缺依赖
+        with patch("app.components._module_ok", lambda name: False):
+            kind, reason = components.not_ready_reason(item)
+            nxt = components.not_ready_next_step(item, kind)
+        self.assertEqual("python", kind)
+        self.assertIn("funasr", reason)
+        self.assertIn("-m pip install funasr", reason)
+        self.assertIn("下载", nxt)
+        # ② 依赖齐、只差模型
+        with patch("app.components._module_ok", lambda name: True), \
+                patch("app.modelinfo.ready", lambda mid: False):
+            kind, reason = components.not_ready_reason(item)
+            nxt = components.not_ready_next_step(item, kind)
+        self.assertEqual("model", kind)
+        self.assertIn("依赖已就绪", reason)
+        self.assertNotIn("缺 Python 依赖", reason)
+        self.assertIn("再点一次", nxt)
+
+    def test_catalog_row_exposes_the_next_step(self):
+        """「能力」页签那一行也要带下一步（面板不必自己去拼文案）。"""
+        from app import components
+        with patch("app.modelinfo.ready", lambda mid: False), \
+                patch("app.components._module_ok", lambda name: True):
+            row = {i["id"]: i for i in components.catalog(include_blocked=True)["items"]}["stt-sensevoice"]
+        self.assertIs(row["ready"], False)
+        self.assertEqual("model", row["readyKind"])
+        self.assertIn("再点一次", row["readyNextStep"])
+
+    def test_inventory_tells_the_panel_the_next_step(self):
+        """`/api/models` 的条目要带「下一步点什么」；缺依赖时还要带那条命令。"""
+        from app import modelinfo
+
+        with patch.object(modelinfo, "_ready_whisper", lambda name: False), \
+                patch.object(modelinfo, "_pkg_available", lambda name: True):
+            row = {i["id"]: i for i in modelinfo.inventory()}["whisper-small"]
+        self.assertIs(row["ready"], False)
+        self.assertIs(row["dependencyReady"], True)
+        self.assertIn("再点一次", row["nextStep"])
+
+        with patch.object(modelinfo, "_ready_whisper", lambda name: False), \
+                patch.object(modelinfo, "_pkg_available", lambda name: False):
+            row = {i["id"]: i for i in modelinfo.inventory()}["whisper-small"]
+        self.assertIs(row["dependencyReady"], False)
+        self.assertIn("-m pip install faster-whisper", row["installCommand"])
+        self.assertIn("再点一次", row["nextStep"])
+
+    def test_ready_rows_are_left_alone(self):
+        """老装机（依赖齐、模型已下）**行为不许变**：不加任何"下一步"字段。"""
+        from app import modelinfo
+        with patch.object(modelinfo, "_ready_whisper", lambda name: True):
+            row = {i["id"]: i for i in modelinfo.inventory()}["whisper-small"]
+        self.assertIs(row["ready"], True)
+        self.assertNotIn("nextStep", row)
+        self.assertNotIn("installCommand", row)
 
 
 if __name__ == "__main__":
