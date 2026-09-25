@@ -26,9 +26,22 @@ class WizardUiWiringTests(unittest.TestCase):
         self.js = _read(APP_JS)
         self.html = _read(INDEX)
 
-    def test_tab_and_view_container_exist(self):
-        self.assertIn('data-view="wizard"', self.html, "页签按钮必须存在，否则进不去向导")
-        self.assertIn('id="view-wizard"', self.html, "视图容器必须存在，否则 switchView 会取到 null")
+    def test_wizard_card_lives_in_the_general_tab(self):
+        """向导 2026-09-25 从**顶层页签**搬进「常规」页最后一张卡（默认收起）。
+
+        这条改过断言（旧结构）：原来钉 `data-view="wizard"` + `id="view-wizard"`；
+        现在钉"那张卡在常规页里、带折叠标记、且默认收起"以及"宿主还在"——
+        意图不变：**向导必须有真实的落点，点得进去、渲染得出**。
+        """
+        self.assertNotIn('data-view="wizard"', self.html, "向导不再是顶层页签")
+        self.assertNotIn('id="view-wizard"', self.html, "独立的向导视图已删")
+        self.assertIn('id="wizCard"', self.html, "向导卡必须存在")
+        self.assertIn('data-collapse-id="wizard"', self.html, "向导卡要能折叠（状态记 localStorage）")
+        self.assertIn('data-collapse-default="closed"', self.html, "向导卡默认收起（11 步摊开太长）")
+        self.assertLess(self.html.index('id="view-general"'), self.html.index('id="wizCard"'),
+                        "向导卡要在「常规」页里")
+        self.assertLess(self.html.index('id="bootLogCard"'), self.html.index('id="wizCard"'),
+                        "向导卡要在常规页**最后一张**（启动日志之后）")
         self.assertIn('id="wizHost"', self.html, "向导的渲染宿主必须存在")
 
     def test_declared_views_all_have_a_container(self):
@@ -36,23 +49,26 @@ class WizardUiWiringTests(unittest.TestCase):
 
         这条同时钉住两件事：① 新页签不能只加一半；② ``_VIEWS`` 那一行本身还在
         （2026-09-20：它被整行替换掉过，页签点进去什么都不发生）。
+        2026-09-25：向导并进常规后不再登记在 ``_VIEWS`` 里（它是一张卡，不是页签）。
         """
         m = re.search(r"const _VIEWS = \[(.*?)\]", self.js, re.S)
         self.assertIsNotNone(m, "找不到 _VIEWS 声明 —— 它必须存在且只有一处")
         views = re.findall(r'"([a-z]+)"', m.group(1))
-        self.assertIn("wizard", views, "_VIEWS 里要登记 wizard")
+        self.assertNotIn("wizard", views, "向导已并进「常规」，不该再是顶层页签")
+        self.assertEqual(len(views), 7, "整合后顶层是 7 个页签：%s" % views)
         for name in views:
             self.assertIn('id="view-%s"' % name, self.html,
                           "页签 %s 没有对应的 #view-%s 容器" % (name, name))
 
     def test_switch_view_dispatches_to_the_wizard_loader(self):
-        """切到向导页签必须真的加载向导。
+        """切到「常规」要顺带把向导卡的数据拉起来（否则展开那张卡是空白）。
 
-        2026-09-25：`switchView()` 里那句从 `if (name === …)` 改成了
-        `if (view === …)`（先把老页签名折算成新 id，见 VIEW_ALIASES）——
-        断言的意图不变，只跟着变量名走。
+        2026-09-25：`switchView()` 里那句从 `if (name === …)` 改成 `if (view === …)`；
+        同日向导并进常规，分派从 `if (view === "wizard") loadWizard();`
+        变成 `if (view === "general") { …; loadWizard(); }` —— 意图不变：
+        **切到承载向导的那一页时要真的加载向导**。
         """
-        self.assertRegex(self.js, r'if \(view === "wizard"\) loadWizard\(\);')
+        self.assertRegex(self.js, r'if \(view === "general"\) \{[^}]*loadWizard\(\);')
         self.assertIn("async function loadWizard()", self.js)
 
     def test_wizard_calls_only_the_wizard_endpoints_and_saves_choices(self):
@@ -103,6 +119,10 @@ class WizardUiWiringTests(unittest.TestCase):
         用户打开面板还是被塞进向导页（2026-09-21 同事实测反馈）。
         新的契约：默认进仪表盘；"登记了没有 / 还缺什么"由顶部横幅说清；
         向导保留但降级为手动入口（`?view=wizard`），永不自动弹出。
+
+        2026-09-25：向导并进「常规」最后一张卡后，手动入口从 `switchView("wizard")`
+        改成 `gotoWizard()`（切常规 + 展开那张卡 + 滚过去），`?view=wizard` 也走同一条路
+        （`_bootWantWizard`）。意图不变：**手动可达、且不自动弹出**。
         """
         block = self.js[self.js.index("async function bootView()"):]
         block = block[:block.index("\n}")]
@@ -113,14 +133,19 @@ class WizardUiWiringTests(unittest.TestCase):
         self.assertIn("async function renderInstallNotice()", self.js)
         self.assertIn('api("/api/install/state")', self.js, "横幅读的是安装状态接口")
         # 横幅要给出两条明确去处，而不是只报个错
-        self.assertIn('switchView("wizard")', self.js, "手动向导仍要可达")
+        self.assertIn("gotoWizard()", self.js, "手动向导仍要可达（横幅那个按钮）")
+        self.assertIn('wiz.addEventListener("click", () => gotoWizard())', self.js,
+                      "横幅的「手动向导」要真的接到 gotoWizard")
+        self.assertIn('_bootWantWizard', self.js, "?view=wizard 老深链要落到常规并展开向导卡")
+        self.assertIn("if (_bootWantWizard) gotoWizard();", block,
+                      "老深链下手要真的展开向导卡")
         # 2026-09-25 页签整合：「能力」页签改名「能力后端」（id capability），出口跟着改
         self.assertIn('switchView("capability")', self.js, "补能力要可达")
         # 显式指定页签（?view=… / echo.gotoView）最优先，不许被默认逻辑抢走
         block = self.js[self.js.index("async function bootView()"):]
         block = block[:block.index("applyCollapsedCards()")]
-        self.assertIn("if (_bootView) { switchView(_bootView); renderInstallNotice(); return; }",
-                      block, "显式指定页签时不许抢")
+        self.assertIn("if (_bootView) {", block, "显式指定页签时不许抢")
+        self.assertIn("switchView(_bootView)", block)
         # 走完向导末页仍要写 installed-components.json（老的首装判据，install_state 也认它）
         self.assertIn('post("/api/wizard/finalize", {})', self.js,
                       "走到末页要写 installed-components.json")

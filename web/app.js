@@ -91,19 +91,23 @@ function confirmDialog(message, { okText = "确定", cancelText = "取消", dang
 
 /* ================= 视图切换 ================= */
 /* 页签清单（2026-09-25 整合后）：新加页签要同时在 index.html 里加
-   <button class="tab" data-view="…"> 和 <section id="view-…">，否则 switchView 找不到容器。 */
+   <button class="tab" data-view="…"> 和 <section id="view-…">，否则 switchView 找不到容器。
+   同日「向导」也并进「常规」最后一张卡（默认收起），所以顶层只剩 7 个。 */
 const _VIEWS = ["dashboard", "general", "voice", "agent", "capability",
-                "history", "meetings", "wizard"];
+                "history", "meetings"];
 
 /* 旧入口 → 新页签（深链/书签/别处硬编码的兼容层）：
    原来是 8 个页签，其中「设置 / 启动 / 模型路由 / 能力」四个合并成了
-   「常规 / 语音与设备 / 智能体 / 能力后端」四个**顶层**页签 —— 见 docs/设置项归属表.md。
+   「常规 / 语音与设备 / 智能体 / 能力后端」四个**顶层**页签 —— 见 docs/设置项归属表.md；
+   「向导」同日并进「常规」的最后一张卡（默认收起，落到常规后会自动展开并滚过去）。
      settings    → general      （原设置页 → 常规）
      boot        → general      （原启动页 → 常规；启动状态与日志就在那一页）
      failover    → agent         （原模型路由页 → 智能体；成员、优先级、路由参数都在那一页）
-     capabilities→ capability    （原能力页 → 能力后端） */
+     capabilities→ capability    （原能力页 → 能力后端）
+     wizard      → general      （原向导页 → 常规最后一张「安装向导」卡；见 gotoWizard） */
 const VIEW_ALIASES = {
   settings: "general", boot: "general", failover: "agent", capabilities: "capability",
+  wizard: "general",
 };
 function normView(name) {
   const n = String(name || "");
@@ -117,16 +121,33 @@ function switchView(name) {
   if (host) host.classList.remove("hidden");
   $$(".tab").forEach((t) => t.classList.toggle("active", t.dataset.view === view));
   if (view === "dashboard") { refreshDashboard(); loadTargets(); }
-  // 四个设置页签共用一份设置数据：loadSettings() 一次把四页的卡片都画出来（切页不重拉）
-  if (view === "general") { loadSettings(); loadBoot(); loadBootLogs(); }
+  // 四个设置页签共用一份设置数据：loadSettings() 一次把四页的卡片都画出来（切页不重拉）。
+  // 「常规」里还挂着启动状态与**安装向导**卡，所以那一页要多拉两样。
+  if (view === "general") { loadSettings(); loadBoot(); loadBootLogs(); loadWizard(); }
   if (view === "voice") loadSettings();
   if (view === "agent") { loadSettings(); loadRouter(); }
   if (view === "capability") { loadSettings(); loadCapabilities(); }
   if (view === "history") loadHistory();
   if (view === "meetings") { loadMeetings(); refreshMeetingHeader(); }
-  if (view === "wizard") loadWizard();
 }
 $$(".tab").forEach((t) => t.addEventListener("click", () => switchView(t.dataset.view)));
+
+/** 打开「常规」页最后那张「安装向导」卡（原 `switchView("wizard")` 的去处）。
+ *  三件事一起做，缺一样用户体验就是"点了没反应"：切到常规 → **展开**那张卡（并把它从
+ *  localStorage 的折叠集合里去掉，否则下次重绘又被收起来）→ 拉一次向导数据 → 滚到它。 */
+async function gotoWizard() {
+  switchView("general");
+  const card = $("#wizCard");
+  if (card) {
+    card.classList.remove("collapsed");
+    card.querySelector(":scope > .card-title")?.setAttribute("aria-expanded", "true");
+    const collapsed = _collapsedCards();
+    if (collapsed.delete("wizard")) _saveCollapsedCards(collapsed);
+  }
+  try { await loadWizard(); } catch (e) { /* 拉不到就只展开；卡片自己会显示失败原因 */ }
+  const after = $("#wizCard");
+  if (after) after.scrollIntoView({ behavior: "smooth", block: "start" });
+}
 
 /* ---------------- 安装状态横幅（技能优先，2026-09-21） ----------------
    安装现在多半是**助手按 echo-install 技能**在用户自己的 agent 里完成的
@@ -186,7 +207,8 @@ async function renderInstallNotice() {
   const cap = $("#installGoCap", box);
   if (cap) cap.addEventListener("click", () => switchView("capability"));
   const wiz = $("#installGoWizard", box);
-  if (wiz) wiz.addEventListener("click", () => switchView("wizard"));
+  // 「向导」不再是页签：切到常规 + 展开那张卡 + 滚过去（见 gotoWizard）
+  if (wiz) wiz.addEventListener("click", () => gotoWizard());
 }
 
 /* ---------------- 启动自愈提示（A3，2026-09-22） ----------------
@@ -237,6 +259,25 @@ function _collapsedCards() {
 function _saveCollapsedCards(set) {
   try { localStorage.setItem(CARD_COLLAPSE_KEY, JSON.stringify([...set])); } catch (e) { /* 忽略 */ }
 }
+/* 「默认收起」的卡片种子（2026-09-25，为「常规 → 安装向导」那张卡加的）：
+   折叠状态是"在集合里 = 收起"，而"用户从没表态过"和"用户手动展开过"在集合里长得一样
+   （都不在集合里）。所以用**一个一次性标记**记住"这些卡已经按默认值种子过了"：
+   只在第一次见到 `data-collapse-default="closed"` 的卡时把它的 id 塞进折叠集合，
+   之后完全由用户自己的点击决定（展开就是展开，下次打开还是展开）。 */
+const COLLAPSE_SEEDED_KEY = "echo.panel.collapseDefaultsSeeded";
+function _seedCollapseDefaults() {
+  let seeded = null;
+  try { seeded = new Set(JSON.parse(localStorage.getItem(COLLAPSE_SEEDED_KEY) || "[]")); }
+  catch (e) { seeded = new Set(); }
+  const want = $$('[data-collapse-default="closed"]')
+    .map((card) => card.dataset.collapseId || card.id)
+    .filter((id) => id && !seeded.has(id));
+  if (!want.length) return;
+  const collapsed = _collapsedCards();
+  want.forEach((id) => { collapsed.add(id); seeded.add(id); });
+  _saveCollapsedCards(collapsed);
+  try { localStorage.setItem(COLLAPSE_SEEDED_KEY, JSON.stringify([...seeded])); } catch (e) { /* 忽略 */ }
+}
 function _cardTitleOf(el) {
   // 只认"直接子标题"：卡片里嵌套的其它标题（如设置页分组）不该触发卡片折叠
   return el.closest(COLLAPSE_TITLE_SEL) || null;
@@ -254,6 +295,7 @@ function toggleCollapsibleCard(card) {
 }
 /** 应用已保存的折叠状态。**动态卡片每次重绘后都要调一次**（能力页签渲染完会调）。 */
 function applyCollapsedCards(root) {
+  _seedCollapseDefaults();                 // 「默认收起」的卡（安装向导）第一次先落进折叠集合
   const collapsed = _collapsedCards();
   $$(COLLAPSE_ANY_SEL, root).forEach((card) => {
     const id = card.dataset.collapseId || card.id;
@@ -621,12 +663,50 @@ async function ensureSettings(force) {
   return _settingsCache;
 }
 
-/* 2026-09-25：原来「模型路由 → 路由参数」那张指路卡连同 `loadRouterSettings()` /
-   `saveRouterSettings()` 一起删掉了 —— 现在 7 项路由参数就长在**同一个页签**（智能体）的
-   「通道设置」卡「高级」里（见 SET_CARDS.agent），再留一张指路卡就是自说自话。
-   `#rtSetHost` / `#rtSetGo` / `#rtSetSave` 三个 id 一并消失（tests 里对应的旧布局断言已更新）。 */
+/* 2026-09-25（第二版）：7 项路由参数回到**这张卡自己的「保存」**名下 —— 用户要求把
+   「语言模型 / 通道成员 / 派发情况 / 通道设置」合成一张卡，卡内一处改就该一处存。
+   所以 `#rtSetHost` 那 7 行由 renderSettingsPanes() 填，落库交给卡内的 `#rtSave`
+   （见下面的 saveRouter），页签顶部的「保存」只管 pane 里那些设置卡片 —— 不会出现
+   两个按钮都管同一件事。 */
 
+/** 收集某个根节点下 `[data-key]` 的表单值（bool / list / int / float / 密钥的分支与既有实现一致）。
+ *  页签顶部的「保存」与「模型路由」卡内的「保存」共用它，免得两处各写一份、哪天漂移。 */
+function collectSettingValues(rootSel) {
+  const values = {};
+  $$(`${rootSel} [data-key]`).forEach((el) => {
+    const key = el.dataset.key;
+    const meta = _settingsCache.find((s) => s.key === key);
+    if (!meta) return;
+    if (meta.secret) {
+      // 密钥：**只在这轮真的输入了新值时才提交**（空 = 不改）。服务端另有同样的闸。
+      if (el.value && el.value.trim()) values[key] = el.value;
+      return;
+    }
+    if (meta.value_type === "bool") values[key] = el.checked;
+    else if (meta.value_type === "list") {
+      values[key] = el.value.split(/[,，]/).map((s) => s.trim()).filter(Boolean);
+    } else if (meta.value_type === "int") values[key] = parseInt(el.value, 10) || 0;
+    else if (meta.value_type === "float") values[key] = parseFloat(el.value) || 0;
+    else values[key] = el.value;
+  });
+  return values;
+}
+
+/** 「模型路由」卡内的「保存」：**这张卡里的改动一起落库**
+ *  ① 成员 / 优先级 / 昵称 → `PUT /api/router/members`（热重载 + 同步注册到 DSH）；
+ *  ② 「高级 → 路由参数」那 7 项 → `PUT /api/settings`（后端会写 `dsh-failover/config.json` 并热重载）。
+ *  页签顶部那个「保存」只收 `[data-settab-pane]` 里的设置行（`#rtSetHost` 不在其中），
+ *  所以同一件事不会被两个按钮管。 */
 async function saveRouter() {
+  // ① 先存 7 项参数（有改动才发请求；没动就不打扰后端）
+  const params = collectSettingValues("#rtSetHost");
+  if (Object.keys(params).length) {
+    try {
+      const rs = await api("/api/settings", { method: "PUT", body: JSON.stringify({ values: params }) });
+      toastSaved(rs, `已保存 ${Object.keys(params).length} 项路由参数`);
+    } catch (e) { toast("路由参数保存失败：" + e.message, 5000); return; }
+  }
+  // ② 再存成员与优先级
   const payload = _rtMembers.map((m, i) => ({
     priority: i + 1,
     name: (m.name || "").trim() || `通道${i + 1}`,
@@ -647,6 +727,7 @@ async function saveRouter() {
     const sb = $("#rtSave");
     if (sb) { sb.classList.remove("primary"); sb.textContent = "保存"; }
     await loadRouter();
+    await loadSettings();          // 参数改完让卡片里的取值跟着刷新
   } catch (e) { toast("保存失败：" + e.message, 5000); }
 }
 
@@ -874,7 +955,8 @@ function renderLiveStatus(st) {
     return;
   }
   const up = fmtUptime(st.uptime);
-  el.innerHTML = `<span>已在线 <b>${up}</b></span><span class="badge ${v.cls}">${v.text}</span>`;
+  // 只放"当前状态"：运行时长在「服务」卡里已经有了，同一页不重复第二遍（2026-09-25 整合）
+  el.innerHTML = `<span class="badge ${v.cls}">${v.text}</span>`;
   el.title = `ECHO 服务连续在线 ${up}，当前${v.text} · ${v.tip}`;
 }
 
@@ -1130,6 +1212,7 @@ $("#gotoMeetings").addEventListener("click", (e) => { e.preventDefault(); switch
    `SET_GROUP_ORDER` / `SET_GROUP_NAMES` / `SET_SUB_NAMES` 保留下来给兜底用（grp 词汇表）。 */
 let _settingsCache = [];        // 设置元数据全集（可见行 + provider/能力/智能体的 hidden 行）
 let _capView = null;            // GET /api/capability 的最近一次返回（含 hidden 的能力键与后端清单）
+let _compsCache = null;         // GET /api/components（常规页那条"组件就绪 N/M"的摘要用）
 let _routerView = null;         // GET /api/router/status（通道设置的状态行）
 let _statusCache = null;        // GET /api/status（服务卡的运行信息）
 
@@ -1264,13 +1347,10 @@ const SET_CARDS = {
           + "所以「指令空间」和「会议工作区」会各聚成一个分组。目录不存在时会自动建；"
           + "换成自己的目录后，旧会话仍留在原处。",
       common: ["commandWorkspace", "meetingWorkspace", "modelsDir"] },
-    { id: "chan", title: "通道设置",
-      help: "ECHO AUTO 注册进**所有装好的**智能体家目录；没注册的那一侧选不到它。",
-      common: () => renderChanStatus(),
-      advOrder: ["路由参数"],
-      adv: ["routerAutoRegister", "routerDisplayName", "routerProbeInterval",
-            "routerFirstByteTimeout", "routerConnectTimeout",
-            "routerBreakerThreshold", "routerBreakerCooldown"] },
+    // 「模型路由」那张卡**不在这里**：它是 index.html 里的静态卡（语言模型 / 通道成员 /
+    // 派发情况 三个 host 要被 loadRouter 系列反复渲染，重绘会和并发请求互相覆盖）。
+    // 卡里那 7 项路由参数由 renderSettingsPanes() 填进 `#rtSetHost`，落点记在
+    // SET_PLACED_ELSEWHERE 里；卡内的「保存」= saveRouter()（成员 + 参数）。
   ],
   capability: [
     { id: "capsvc", title: "会议转写服务",
@@ -1295,9 +1375,16 @@ const SET_CARDS = {
    `meetingSttModel`（会议转写引擎）就是这一条：归属表把它放在「能力后端 / 本机」，
    而它由「能力后端」页签里原「能力」页签那块渲染（`capAsrLocal()` 的「会议转写」下拉，见
    `#capKindCards`）—— 所以本文件不再重复画一遍，也不该落进「未归类」兜底卡。
+   `router*` 那 7 项同理：它们是「智能体」页那张**静态**「模型路由」卡「高级」里的行，
+   由 renderSettingsPanes() 填进 `#rtSetHost`（`SET_CARDS` 里没有这张卡，见那边的注释）。
    注：其余 model/provider 键（sttModel / ttsEngine / wakeEngine / device / voiceprint*）在
    语音与设备页签的卡片里也有控件，那一处重叠是"四个非设置视图重做"要收口的遗留，见交接报告。 */
-const SET_PLACED_ELSEWHERE = new Set(["meetingSttModel"]);
+const SET_PLACED_ELSEWHERE = new Set([
+  "meetingSttModel",
+  "routerAutoRegister", "routerDisplayName", "routerProbeInterval",
+  "routerFirstByteTimeout", "routerConnectTimeout",
+  "routerBreakerThreshold", "routerBreakerCooldown",
+]);
 
 /* 说明留在明面上的项（用户规则：只有"不可逆 / 会出网 / 生物特征"这类不平铺进 `?`）。
    其余项的 `description` 一律收进行尾的 `?` 浮窗。
@@ -1895,8 +1982,8 @@ function capKindCard(kind) {
 function renderCapOverview() {
   const host = $("#capOverview");
   const items = ((_capCache.comps || {}).items) || [];
-  const usable = items.filter((c) => c.applicable);
-  const readyN = usable.filter((c) => c.ready === true).length;
+  // 就绪判据与「常规 → 启动状态」那条摘要共用 compsTally()：两处数字不会打架
+  const tally = compsTally(items);
   const provs = ((_capCache.prov || {}).providers) || [];
   const dotOf = (ok) => (ok === true ? "green" : ok === false ? "yellow" : "idle");
   if (host) {
@@ -1914,7 +2001,7 @@ function renderCapOverview() {
     }).join("");
   }
   const sum = $("#capOvSummary");
-  if (sum) sum.textContent = `组件就绪 ${readyN}/${usable.length}`;
+  if (sum) sum.textContent = `组件就绪 ${tally.ready}/${tally.total}`;
 }
 
 /** 运行环境：装不了就得手装的 pypi 类组件（运行时 / 加速 / 智能体后端）。 */
@@ -1931,13 +2018,11 @@ function renderCapEnv() {
     : "";
   const plat = ((_capCache.comps || {}).platform || "") +
     (((_capCache.comps || {}).osVersion) ? " " + _capCache.comps.osVersion : "");
-  const readyN = (((_capCache.comps || {}).items) || [])
-    .filter((c) => c.applicable && c.ready === true).length;
-  const totalN = (((_capCache.comps || {}).items) || []).filter((c) => c.applicable).length;
+  const envTally = compsTally(((_capCache.comps || {}).items) || []);
   host.innerHTML = `<div class="card collapsible" data-collapse-id="cap-env">
     <div class="card-title"><span class="set-arrow">▶</span><span class="ic">🧱</span>运行环境
       <span class="muted">${esc(plat)}</span>
-      <span class="muted" style="margin-left:auto">就绪 ${readyN}/${totalN}</span>
+      <span class="muted" style="margin-left:auto">就绪 ${envTally.ready}/${envTally.total}</span>
     </div>
     <div class="card-body">
       ${capCompTable(comps, [])}
@@ -2549,22 +2634,11 @@ async function saveMeetingBackends(sel, kind) {
 }
 
 /* ---- 状态显示：**一律用后端给的字段**，面板不写死原因 ----
-   * 后端可用性：/api/capability 的 backends[].ready / capsError / paired / auth；
-   * 组件就绪：/api/components 的 ready / readyReason / readyNextStep / blockedReason / installCommand；
-   * 模型（引擎）就绪：/api/models 的 ready / notReadyReason / nextStep / installCommand，
-     下载被拒时后端还会给 detail/reason/nextStep（见 POST /api/models/download）。 */
-function firstReason() {
-  for (let i = 0; i < arguments.length; i++) {
-    const v = arguments[i];
-    if (v !== undefined && v !== null && String(v).trim()) return String(v);
-  }
-  return "";
-}
-function sWhyHtml(label, text) {
-  if (!text) return "";
-  return `<div class="snote ${label === "错误" ? "err" : "info"}"><span>ⓘ</span><span>`
-       + (label ? `<b>${esc(label)}</b>：` : "") + richText(text) + `</span></div>`;
-}
+   2026-09-25 整合后，这一批渲染器只剩「会议转写服务」卡在用：
+     * 后端可用性：/api/capability 的 backends[].ready / capsError / paired / auth；
+     * 组件/模型的"装没装、缺什么、怎么装"由「能力后端」页原「能力」那套渲染
+       （capCompTable / renderModelCard 直接用 readyReason / readyNextStep /
+       installCommand / notReadyReason / nextStep —— 那是**唯一**一处）。 */
 function backendRow(backendId) {
   return ((_capView || {}).backends || []).find((b) => b.backendId === backendId) || null;
 }
@@ -2616,47 +2690,31 @@ function renderServiceCard() {
     </div>`;
 }
 
-/* ---- 语音与设备 → 命令采集：选中引擎的就绪状态 + 真原因 ---- */
-function engineStateHtml(engineKey) {
+/* ---- 语音与设备里的"引擎还没就绪"提示：**指路，不是第二份就绪清单** ----
+   2026-09-25 用户要求把重复的就绪信息整合到一处（常规的启动状态 ↔ 能力后端的可装模型）。
+   所以这里不再渲染就绪徽标/模型体积/缺失原因/下载/复制命令（那些只在「能力后端」页出现一次），
+   只在**当前选中的引擎还没就绪**时冒一行警告 + 一个跳转 —— 目的是别让"选了没装的引擎"
+   变成静默失败（2026-09-23 那次事故），而不是把清单抄一遍。 */
+function enginePointerHtml(engineKey) {
   const engine = String(settingValue(engineKey));
-  const mid = engineModelId(engine);
-  const m = modelById(mid);
-  if (!m) {
-    return `<div class="srow"><div class="lbl"></div><div class="sctl">
-      <span class="smono">${esc(engine || "—")}</span>
-      <span class="sbadge">模型清单里没有对应条目</span></div></div>`;
-  }
-  const job = _modelJobsCache[m.id] || {};
-  const acts = [];
-  if (m.ready) {
-    return `<div class="srow"><div class="lbl"></div><div class="sctl">
-      <span class="smono">${esc(m.name || m.id)}</span><span class="sbadge ok">就绪</span>
-      <span class="sbadge">${esc(m.size || "")}</span></div></div>`;
-  }
-  const why = firstReason(job.message, m.detail, m.notReadyReason, m.reason);
-  const next = firstReason(m.nextStep, job.nextStep);
-  const cmd = firstReason(m.installCommand, job.installCommand, m.cmd);
-  if (cmd) acts.push(`<button class="btn" data-mcopy="${esc(cmd)}"
-      title="复制到终端执行（命令里带的是本机解释器，在哪个目录、用哪个终端都行）">复制命令</button>`);
-  if (m.downloadable !== false && m.source !== "copy") {
-    acts.push(`<button class="btn primary" data-msdl="${esc(m.id)}" data-force="0">下载</button>`);
-  }
-  return `<div class="srow"><div class="lbl"></div><div class="sctl">
-      <span class="smono">${esc(m.name || m.id)}</span><span class="sbadge err">未就绪</span>
-      <span class="sacts">${acts.join("")}</span></div></div>
-    ${sWhyHtml("原因", why)}${sWhyHtml("下一步", next)}`;
+  const m = modelById(engineModelId(engine));
+  const ready = m ? m.ready === true : false;
+  if (ready) return "";
+  const what = m ? (m.name || m.id) : (engine || "（未选）");
+  return `<div class="snote warn"><span>⚠</span><span>选中的「${esc(what)}」还没就绪 ——
+      缺失原因、下一步与安装方式都在「能力后端」页。</span>
+      <span class="sacts"><button class="btn" data-goto="capability">去能力后端 →</button></span></div>`;
 }
-const renderCmdEngineStatus = () => engineStateHtml("sttModel");
-/** 朗读的状态取 `/api/status` 里那条组件（`在线 · edge-tts` 这种就是后端自己写的 detail）——
- *  TTS 不是模型清单里的条目，走引擎那条会得到"清单里没有对应条目"，那是误导。 */
+const renderCmdEngineStatus = () => enginePointerHtml("sttModel");
+/** 朗读同理：TTS 不是模型清单里的条目，看 `/api/status` 里那条组件在不在线。
+ *  自己关掉（ttsEngine=off）不算"没就绪"，不打扰。 */
 function renderTtsStatus() {
+  if (String(settingValue("ttsEngine")) === "off") return "";
   const c = ((_statusCache || {}).components || []).find((x) => x.name === "tts");
-  if (!c) return "";
-  const cls = c.status === "online" ? "ok" : (c.status === "disabled" ? "" : "warn");
-  const text = c.status === "online" ? "在线" : (c.status === "disabled" ? "未启用" : (c.status || ""));
-  return `<div class="srow"><div class="lbl"></div><div class="sctl">
-    <span class="smono">${esc(c.detail || "")}</span>
-    <span class="sbadge ${cls}">${esc(text)}</span></div></div>`;
+  if (!c || c.status === "online") return "";
+  return `<div class="snote warn"><span>⚠</span><span>朗读组件现在不是在线状态
+      （${esc(c.detail || c.status || "")}）—— 实现与就绪情况在「能力后端」页的「语音合成」卡。</span>
+      <span class="sacts"><button class="btn" data-goto="capability">去能力后端 →</button></span></div>`;
 }
 
 /* ---- 智能体卡（常用）：选中哪个 + 状态 + 家目录 ---- */
@@ -2722,23 +2780,10 @@ function renderAgentCardAdv() {
   return out.join("");
 }
 
-/* ---- 智能体 → 通道设置（状态来自 /api/router/status） ---- */
-function renderChanStatus() {
-  const v = _routerView || {};
-  const members = (v.members || []).filter((m) => m.enabled !== false);
-  const g = v.group || {};
-  const names = members.map((m, i) => `通道${m.priority || i + 1} ${m.name || "(未命名)"}`).join(" · ");
-  // 这一行只看状态：注册到哪些 DSH 家目录由下面那张「通道成员」卡的 `#rtReg` 说，
-  // 成员与优先级的编辑也在那张卡里（页签整合后就在同一页，所以是页内跳转而不是切页签）。
-  return `<div class="srow"><div class="lbl"><span class="lt">通道成员</span>
-      ${sHelp("ECHO 注册进**所有装好的**智能体家目录；没注册的那一侧选不到 "
-            + (g.display_name || "ECHO AUTO") + "。成员与优先级在下面那张卡里改。")}</div>
-      <div class="sctl"><span class="smono">${esc(g.display_name || "ECHO AUTO")} · `
-    + `${members.length} 个启用${names ? " · " + esc(names) : ""}</span>
-        <span class="sbadge ${members.length ? "ok" : "warn"}">${members.length ? "有成员" : "没有启用的成员"}</span>
-        <button class="btn" data-scroll="#rtMembers" title="滚到下面的「通道成员」卡">成员与优先级 ↓</button>
-      </div></div>`;
-}
+/* 2026-09-25：原来那张「通道设置」卡（注册情况 + 通道状态 + 7 项参数）连同
+   `renderChanStatus()` 一起并进了「智能体」页那张**静态**的「模型路由」卡：
+   注册情况由 `#rtReg`（renderRouterHead）说，成员状态由 `#rtMembers` 说，
+   7 项参数在它的「高级」里 —— 一页一张路由卡，不再各说一段。 */
 
 /* ---- 能力后端 → 会议转写服务（1 个单选 + 1 个下拉，写回 3 个键） ---- */
 function renderMeetingServiceCard() {
@@ -2887,16 +2932,18 @@ function renderSettingsPanes() {
     const host = $(hosts[id]);
     if (host) host.innerHTML = (html[id] || []).join("");
   });
-  // 环境体检（四类根 + 一键迁移）：不是设置项，但和「工作区」同处一页。**每次重绘都刷一遍数据**，
-  // 但容器只建一次（否则重绘会一层层套娃）
+  // 「模型路由」卡（index.html 里**静态**的）里的 7 项路由参数：卡本身不能由 JS 生成
+  // （它的 host 会被 loadRouter()/loadRouterLlm() 渲染，重绘会和并发请求互相覆盖），
+  // 所以这里只把「高级」里那 7 行填进它的 `#rtSetHost`；展开状态与动态卡共用 `_sadvOpen`。
+  const rp = $("#rtSetHost");
+  if (rp) rp.innerHTML = renderSettingRows(settingRows([...ROUTER_KEYS]));
+  const radv = $("#rtMergeCard .sadv");
+  if (radv) radv.classList.toggle("open", _sadvOpen.has("router"));
+
+  // 环境体检（四类根 + 一键迁移）：不是设置项，静态 host 就在「智能体」页**最后一张**，
+  // 每次重绘刷一遍数据（容器不重建）
   try {
-    const pane = $('[data-settab-pane="agent"]');
-    let host = $("#envCheckHost");
-    if (pane && !host) {
-      host = document.createElement("div");
-      host.id = "envCheckHost";
-      pane.appendChild(host);
-    }
+    const host = $("#envCheckHost");
     if (host) renderEnvCheck(host);
   } catch (e) { /* 体检卡片失败不能拖垮设置页 */ }
   ["#view-general", "#view-voice", "#view-agent", "#view-capability"]
@@ -2907,10 +2954,12 @@ function renderSettingsPanes() {
 async function loadSettings() {
   const grab = (p) => p.catch(() => null);
   try {
-    const [setRes, cfgRes, capRes, modelsRes, rtRes, stRes] = await Promise.all([
+    const [setRes, cfgRes, capRes, compsRes, modelsRes, rtRes, stRes] = await Promise.all([
       api("/api/settings"),
       grab(api("/api/providers/config")),
       grab(api("/api/capability")),
+      // 常规页那条"组件与模型就绪 N/M"的摘要要用它（就绪清单本身只在能力后端页渲染）
+      grab(api("/api/components?includeBlocked=true")),
       grab(api("/api/models")),
       grab(api("/api/router/status")),
       grab(api("/api/status")),
@@ -2923,11 +2972,13 @@ async function loadSettings() {
     mergeSettingsRows((capRes && capRes.settings) || []);
     (_agentsCache || []).forEach((a) => mergeSettingsRows(a.settings || []));
     _capView = capRes;
+    _compsCache = compsRes;
     _modelsCache = (modelsRes && modelsRes.items) || [];
     _modelJobsCache = (modelsRes && modelsRes.jobs && modelsRes.jobs.items) || {};
     _routerView = rtRes;
     _statusCache = stRes;
     renderSettingsPanes();
+    renderBootReadyNote();            // 摘要行用的就是 _compsCache，重绘后要跟着更新
   } catch (e) { toast("加载设置失败：" + e.message); }
 }
 
@@ -3478,26 +3529,12 @@ document.addEventListener("click", async (e) => {
 
 /* 保存（四个设置页签各有一条工具条，按钮是 `[data-set-save]`）。
    收集范围是**四个 pane 里的全部 data-key** —— 一次 loadSettings() 会把四页都渲染出来，
-   所以从哪一页点保存，落库的都是同一份完整表单（与整合前"设置页一个保存按钮"行为一致）。 */
+   所以从哪一页点保存，落库的都是同一份完整表单（与整合前"设置页一个保存按钮"行为一致）。
+   **不含**「智能体 → 模型路由」那张静态卡（它有自己的「保存」，管成员 + 7 项路由参数，
+   见 saveRouter）—— 一件事只有一个按钮。 */
 document.addEventListener("click", async (e) => {
   if (!e.target.closest("[data-set-save]")) return;
-  const values = {};
-  $$("[data-settab-pane] [data-key]").forEach((el) => {
-    const key = el.dataset.key;
-    const meta = _settingsCache.find((s) => s.key === key);
-    if (!meta) return;
-    if (meta.secret) {
-      // 密钥：**只在这轮真的输入了新值时才提交**（空 = 不改）。
-      // 服务端另有同样的闸（空串不改、清除走 __clear__），这里是第一道。
-      if (el.value && el.value.trim()) values[key] = el.value;
-      return;
-    }
-    if (meta.value_type === "bool") values[key] = el.checked;
-    else if (meta.value_type === "list") values[key] = el.value.split(/[,，]/).map(s => s.trim()).filter(Boolean);
-    else if (meta.value_type === "int") values[key] = parseInt(el.value, 10) || 0;
-    else if (meta.value_type === "float") values[key] = parseFloat(el.value) || 0;
-    else values[key] = el.value;
-  });
+  const values = collectSettingValues("[data-settab-pane]");
   // apiAuthEnabled 是"双刃"开关：打开后**所有**接口（含本地面板）都要 Bearer 令牌，
   // 而面板不带令牌 → 一开就连不上、也没法再关回来。所以强制二次确认（2026-09-19 设置审计）。
   const authRow = _settingsCache.find((s) => s.key === "apiAuthEnabled");
@@ -3735,8 +3772,19 @@ $("#btnCleanShort").addEventListener("click", async (e) => {
   } catch (e2) { toast("清理失败：" + e2.message); }
 });
 
-/* ================= 启动 ================= */
-let _bootSettings = [];
+/* ================= 启动状态（常规页；只讲"这台机器自己的运行态"）=================
+   2026-09-25 整合（用户："常规里面的启动状态，语音转写里面的可装模型那个区域内容比较重叠，
+   整合到一起"）：**组件/模型"装没装 / 缺什么 / 怎么装"只在「能力后端」页渲染一处**，
+   这一块从此不再展开那份就绪清单（就绪徽标 / 缺失原因 / 下载 / 复制安装命令都搬走），
+   只留：
+     * 一句启动摘要（`#bootSummary`，/api/boot/status 的 summary）+ 一行"组件就绪 N/M"的
+       **指路**（按钮切到「能力后端」页）；
+     * 只有这里有、且是运维信息的两样东西：**启动失败的真原因**（`error`/`detail`）与
+       **组件进程的启停**（`can_start`/`can_stop` → /api/boot/component/{id}/{start|stop}）；
+     * （下文同页）启动日志 `#bootLogs`。
+   顺带删掉的是这一块里**重复的设置编辑入口**：`sttModel` / `meetingSttModel` 两个下拉与
+   `ttsEngine` 的在线开关 —— 它们各自的家在「语音与设备」（命令采集 / 任务反馈）与
+   「能力后端」（语音转写 / 语音合成卡）。 */
 
 function bootBadgeCls(status) {
   if (status === "online" || status === "active") return "online";
@@ -3749,85 +3797,101 @@ function bootBadgeCls(status) {
   return "idle";
 }
 
-function _settingMeta(key) {
-  return _bootSettings.find((s) => s.key === key) || {};
-}
-
-function _settingValue(key) {
-  return _settingMeta(key).value;
-}
-
 async function loadBoot() {
   try {
-    const [bs, sr, st] = await Promise.all([
-      api("/api/boot/status"), api("/api/settings"), api("/api/status")]);
-    _bootSettings = sr.settings;
+    const [bs, st] = await Promise.all([api("/api/boot/status"), api("/api/status")]);
     renderBoot(bs);
-    renderLiveStatus(st);            // 在线时长 + 状态（启动日志标题右侧）
+    renderLiveStatus(st);            // 当前状态（启动日志标题右侧）
   } catch (e) {
-    $("#bootSummary").textContent = "加载失败：" + e.message;
+    const sum = $("#bootSummary");
+    if (sum) sum.textContent = "加载失败：" + e.message;
     renderLiveStatus(null);
   }
 }
 
-function renderBoot(bs) {
-  const s = bs.summary;
-  $("#bootSummary").textContent =
-    `就绪 ${s.ready}/${s.total} · 失败 ${s.failed} · 进行中 ${s.running}`;
-  const sttOpts = _settingMeta("sttModel").options || [];
-  const meetOpts = _settingMeta("meetingSttModel").options || [];
-  const ttsEngine = _settingValue("ttsEngine");
-  $("#bootComponents").innerHTML = bs.components.map((c) => {
-    const cls = bootBadgeCls(c.status);
-    const bar = c.status === "starting"
-      ? `<div class="boot-bar"><i style="width:${Math.max(4, Math.round(c.progress * 100))}%"></i></div>` : "";
-    let ctl = "";
-    if (c.id === "stt-cmd" || c.id === "stt-meeting") {
-      const opts = c.id === "stt-cmd" ? sttOpts : meetOpts;
-      const cur = c.id === "stt-cmd" ? _settingValue("sttModel") : _settingValue("meetingSttModel");
-      ctl = `<select class="ctl boot-model" data-model="${c.id}">` +
-        opts.map((o) => `<option value="${esc(o)}" ${String(o) === String(cur) ? "selected" : ""}>${esc(o)}</option>`).join("") + `</select>`;
-    } else if (c.id === "tts") {
-      const online = ttsEngine !== "sapi";
-      ctl = `<label class="boot-switch"><input type="checkbox" data-ttsonline ${online ? "checked" : ""}>
-        <span>${online ? "在线" : "离线"}</span></label>`;
+/** 组件/模型的"就绪 + 装没装"汇总：**与「能力后端」页顶部那条概览用同一个判据**
+ *  （`applicable` 且 `ready === true`），免得两处报出不一样的数字。 */
+function compsTally(items) {
+  const usable = (items || []).filter((c) => c.applicable);
+  return { ready: usable.filter((c) => c.ready === true).length, total: usable.length };
+}
+
+/** 「常规 → 启动状态」里那一行摘要 + 跳转（**不展开清单**：清单只在「能力后端」页）。
+ *  数据来自 `/api/components`（`_compsCache`，loadSettings 取的），与能力页同一份判据。 */
+function renderBootReadyNote() {
+  const note = $("#bootReadyNote");
+  if (!note) return;
+  const t = _compsCache ? compsTally(_compsCache.items) : null;
+  let line = "读取中…";
+  if (t) {
+    if (!t.total) {
+      line = `后端没给出可判定的组件`;
+    } else if (t.ready >= t.total) {
+      line = `组件与模型<span class="sbadge ok">全部就绪 ${t.ready}/${t.total}</span>`;
+    } else {
+      line = `组件与模型<span class="sbadge warn">还有 ${t.total - t.ready} 项没就绪</span>`
+           + `<span class="muted">（共 ${t.total} 项）</span>`;
     }
+  }
+  note.innerHTML = `<div class="srow"><div class="lbl"><span class="lt">组件与模型</span>
+      ${sHelp("装没装 / 缺什么 / 怎么装（下载、复制安装命令）都在「能力后端」页一处看全 —— "
+            + "这一页只报个数，不重复展开那份清单。")}</div>
+    <div class="sctl"><span class="smono">${line}</span>
+      <span class="sacts"><button class="btn" data-goto="capability"
+        title="缺失原因、下一步与下载/复制安装命令都在那一页">去能力后端 →</button></span>
+    </div></div>
+    <div class="snote info"><span>ⓘ</span><span>这一页只管<b>这台机器自己的运行态</b>：
+      启动摘要、组件进程启停、启动日志。组件与模型的就绪清单在「能力后端」页。</span></div>`;
+}
+
+/** 组件进程那几行的**短名**（标签列只有 84px，后端给的 `label` 动辄 8~12 个字会被省略号切：
+ *  「命令转写引擎（常驻）」「模型路由（ECHO AUTO）」「标准版 harness」…）。
+ *  完整名字仍在 `title` 里 —— 只改显示，不改任何值。 */
+const BOOT_SHORT_LABELS = {
+  server: "面板服务", dsh: "DSH 引擎", failover: "模型路由", harness: "harness",
+  "stt-cmd": "命令转写", "stt-meeting": "会议转写", tts: "语音合成",
+  wake: "语音唤醒", hotkey: "热键", meeting: "会议录音", diarize: "说话人分离",
+};
+
+function renderBoot(bs) {
+  const s = bs.summary || {};
+  const sum = $("#bootSummary");
+  // 「启动 N/M」是**启动阶段**的服务计数（与下面"组件与模型"那个安装口径不是一回事，
+  // 所以标题这句写清是"启动"，免得两个数字看着打架）
+  if (sum) sum.textContent = `启动 ${s.ready}/${s.total} · 失败 ${s.failed} · 进行中 ${s.running}`;
+
+  // ① 一行摘要 + 跳转：就绪清单在「能力后端」页，这里只报个数并指路
+  renderBootReadyNote();
+
+  // ② 只有这里有：启动失败的真原因（后端给的 error/detail）+ 组件进程的启停
+  const ops = $("#bootOps");
+  if (!ops) return;
+  const rows = [];
+  const list = (bs.components || []).filter((c) => c.can_start || c.can_stop || c.status === "failed");
+  if (!list.length) {
+    ops.innerHTML = `<div class="sset-hint">没有可启停的组件（后端没给 can_start/can_stop）。</div>`;
+    return;
+  }
+  ops.innerHTML = `<div class="ssec">组件进程（启停）</div>` + list.map((c) => {
+    const cls = bootBadgeCls(c.status);
     const btns = [];
-    if (c.can_start) btns.push(`<button class="btn mini" data-boot="${c.id}:start">${c.status === "failed" ? "重试" : "启动"}</button>`);
-    if (c.can_stop) btns.push(`<button class="btn mini danger" data-boot="${c.id}:stop">停止</button>`);
-    const sub = c.substep ? ` · <span class="boot-sub">${esc(c.substep)}</span>` : "";
-    const dur = c.duration ? `<span class="boot-dur">${c.duration}s</span>` : "";
-    // 没有控件就不渲染 boot-ctl：模板里那个空 span 在窄边条的网格布局下会多占一行（含行间距）
-    const ctlHtml = (ctl || btns.length)
-      ? `<span class="boot-ctl">${ctl} ${btns.join("")}</span>` : "";
-    return `<div class="boot-row" data-cid="${c.id}">
-      <span class="boot-ic">${c.icon}</span>
-      <span class="boot-name">${esc(c.label)}</span>
-      <span class="badge ${cls}">${STATUS_TEXT[c.status] || c.status}</span>
-      <span class="boot-detail">${esc(c.detail)}${sub}</span>
-      ${dur}
-      ${bar}
-      ${ctlHtml}
-    </div>`;
+    if (c.can_start) {
+      btns.push(`<button class="btn" data-boot="${esc(c.id)}:start">`
+        + `${c.status === "failed" ? "重试" : "启动"}</button>`);
+    }
+    if (c.can_stop) btns.push(`<button class="btn danger" data-boot="${esc(c.id)}:stop">停止</button>`);
+    // 失败才把原因摊开（这是"启动失败原因"，只有这一页有）；跑得正常的那些把 detail 收到
+    // title 里 —— 既不在页面上重复一遍状态文案，信息也没丢
+    const why = c.status === "failed"
+      ? `<div class="snote err"><span>⚠</span><span>${richText(c.error || c.detail || "")}</span></div>`
+      : "";
+    const short = BOOT_SHORT_LABELS[c.id] || c.label || c.id;
+    return `<div class="srow" title="${esc(c.detail || "")}">
+      <div class="lbl"><span class="lt" title="${esc(c.label || c.id)}">${c.icon || ""} ${esc(short)}</span></div>
+      <div class="sctl"><span class="badge ${cls}">${STATUS_TEXT[c.status] || c.status || ""}</span>
+        <span class="sacts">${btns.join("")}</span></div></div>${why}`;
   }).join("");
-  // 事件
-  $$("#bootComponents .boot-model").forEach((sel) => sel.addEventListener("change", async (e) => {
-    const key = e.currentTarget.dataset.model === "stt-cmd" ? "sttModel" : "meetingSttModel";
-    try {
-      const r = await api("/api/settings", { method: "PUT", body: JSON.stringify({ values: { [key]: e.currentTarget.value } }) });
-      toastSaved(r, "已切换模型，重新加载中…");
-      await post(`/api/boot/component/${e.currentTarget.dataset.model}/start`, {});
-      loadBoot();
-    } catch (err) { toast("切换失败：" + err.message); }
-  }));
-  $$("#bootComponents [data-ttsonline]").forEach((chk) => chk.addEventListener("change", async (e) => {
-    try {
-      await api("/api/settings", { method: "PUT", body: JSON.stringify({ values: { ttsEngine: e.currentTarget.checked ? "edge-tts" : "sapi" } }) });
-      toast("已切换 TTS 模式");
-      loadBoot();
-    } catch (err) { toast("切换失败：" + err.message); }
-  }));
-  $$("#bootComponents [data-boot]").forEach((btn) => btn.addEventListener("click", async (e) => {
+  $$("#bootOps [data-boot]").forEach((btn) => btn.addEventListener("click", async (e) => {
     const [cid, act] = e.currentTarget.dataset.boot.split(":");
     try {
       const r = await post(`/api/boot/component/${cid}/${act}`, {});
@@ -4452,21 +4516,30 @@ async function wizRenderDone(host) {
 
 
 /* 进哪个页签：显式指定（`?view=…` / `echo.gotoView`）最优先；否则**进仪表盘**。
-   深链先过 `normView()`（老值 settings/boot/failover/capabilities 折算到新页签）。
+   深链先过 `normView()`（老值 settings/boot/failover/capabilities 折算到新页签，wizard → general）。
    这里以前是"首装直接进向导"，判据是服务端 installed-components.json 在不在 —— 但那个文件
    只有向导末页才写，而安装现在多半由**助手按 echo-install 技能**完成，于是"技能装完打开面板
    还是进向导"（2026-09-21 实测反馈）。现在改成：**永不自动进向导**，没装完由顶部横幅说清下一步
-   （横幅可一键进向导或能力后端页）。想直接看向导：`?view=wizard`。 */
+   （横幅可一键进向导或能力后端页）。想直接看向导：`?view=wizard` —— 落到「常规」后
+   会**自动展开向导卡并滚过去**（不能只是"到了常规但看不到向导"）。 */
 let _bootView = "";
+let _bootWantWizard = false;      // 老深链/老 gotoView 明确要向导：落到常规后要展开那张卡
 try {
   const q = new URLSearchParams(location.search).get("view");
-  const want = normView(q || localStorage.getItem("echo.gotoView") || "");
+  const raw = q || localStorage.getItem("echo.gotoView") || "";
+  const want = normView(raw);
+  _bootWantWizard = String(raw).trim().toLowerCase() === "wizard";
   if (localStorage.getItem("echo.gotoView")) localStorage.removeItem("echo.gotoView");
   if (want && _VIEWS.includes(want)) _bootView = want;
 } catch (e) { /* 忽略 */ }
 
 async function bootView() {
-  if (_bootView) { switchView(_bootView); renderInstallNotice(); return; }
+  if (_bootView) {
+    switchView(_bootView);
+    renderInstallNotice();
+    if (_bootWantWizard) gotoWizard();     // 老书签：展开向导卡 + 滚到它
+    return;
+  }
   switchView("dashboard");
   renderInstallNotice();
 }

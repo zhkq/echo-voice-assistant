@@ -16,9 +16,10 @@
 <header class="topbar">
   <div class="brand">ECHO<span class="sub">个人助理</span></div>
   <!-- 顶层页签（2026-09-25 整合）：原来的「设置 / 启动 / 模型路由 / 能力」四个入口合并成
-       常规（原设置+启动）· 语音与设备 · 智能体（原模型路由）· 能力后端（原能力），
-       **只有这一层**，不再有子页签。旧深链 `?view=settings|boot|failover|capabilities`
-       由 app.js 的 VIEW_ALIASES 折算到新 id。 -->
+       常规（原设置+启动）· 语音与设备 · 智能体（原模型路由）· 能力后端（原能力）；
+       同日「向导」也并进「常规」页最后一张卡（默认收起），所以顶层只剩 7 个。
+       **只有这一层**，不再有子页签。旧深链 `?view=settings|boot|failover|capabilities|wizard`
+       由 app.js 的 VIEW_ALIASES 折算到新 id（wizard 还会自动展开那张卡并滚过去）。 -->
   <nav class="tabs">
     <button class="tab active" data-view="dashboard">仪表盘</button>
     <button class="tab" data-view="general">常规</button>
@@ -27,7 +28,6 @@
     <button class="tab" data-view="capability">能力后端</button>
     <button class="tab" data-view="history">历史</button>
     <button class="tab" data-view="meetings">会议</button>
-    <button class="tab" data-view="wizard">向导</button>
   </nav>
 </header>
 
@@ -121,13 +121,19 @@
          `test_capability_panel` 那条"卡片在哪个视图里"的断言靠"取到视图自己的 </section>"来切） -->
     <div class="ssetpane" data-settab-pane="general"><div id="setPaneGeneral"></div></div>
 
-    <!-- 原「启动」页签：组件启动状态 + 启动日志 -->
+    <!-- 原「启动」页签，2026-09-25 整合后只留"这台机器自己的运行态"：
+         启动摘要 + 「组件就绪 N/M → 去能力后端」指路 + 组件进程启停 + 启动日志。
+         组件/模型"装没装、缺什么、怎么装"的就绪清单**只在「能力后端」页渲染一处**
+         （原来那份 `#bootComponents` 明细已删，理由见 app.js 的 renderBoot 注释）。 -->
     <div class="card">
       <div class="card-title">启动状态
         <span class="spacer"></span>
         <span class="muted" id="bootSummary">—</span>
       </div>
-      <div id="bootComponents" class="boot-list"></div>
+      <div class="card-body">
+        <div id="bootReadyNote"></div>
+        <div id="bootOps"></div>
+      </div>
     </div>
     <!-- 可折叠卡片（静态示例：class="collapsible" + data-collapse-id，点标题折叠/展开，
          状态记在 localStorage，见 app.js 的 toggleCollapsibleCard）。 -->
@@ -135,11 +141,25 @@
       <div class="card-title"><span class="set-arrow">▶</span>启动日志
         <span class="muted" style="font-size:12px">(自动刷新)</span>
         <span class="spacer"></span>
-        <!-- 在线时长 + 当前状态（用户 2026-09-12：原顶栏右上角那组信息挪到这里） -->
+        <!-- 当前状态（进程在不在 / 忙不忙）；运行时长在「服务」卡里，不在这里重复一遍 -->
         <span class="boot-live" id="bootLive">—</span>
       </div>
       <div class="card-body">
         <div id="bootLogs" class="boot-log"></div>
+      </div>
+    </div>
+
+    <!-- 安装向导（2026-09-25 从顶层页签并进「常规」**最后一张卡**，11 步流程原样搬进来）：
+         默认**收起** —— 11 步摊开会把这一页拉得很长。折叠状态与别的卡片同一套
+         （`data-collapse-id` + localStorage）；`data-collapse-default="closed"` 表示
+         "用户还没表态过时按收起算"，见 app.js 的 _seedCollapseDefaults()。 -->
+    <div class="card collapsible" id="wizCard" data-collapse-id="wizard" data-collapse-default="closed">
+      <div class="card-title"><span class="set-arrow">▶</span><span class="ic">🧭</span>安装向导
+        <span class="spacer"></span>
+        <span class="muted" style="font-size:12px">第一次装、或以后想补能力时走一遍；不装也能用，缺什么顶部横幅会说</span>
+      </div>
+      <div class="card-body">
+        <div id="wizHost"></div>
       </div>
     </div>
   </section>
@@ -181,31 +201,40 @@
     </div>
     <div class="ssetpane" data-settab-pane="agent"><div id="setPaneAgent"></div></div>
 
-    <!-- 原「模型路由」页签：语言模型（用哪个实现）+ 通道成员 + 派发情况 -->
-    <div class="card">
-      <div class="card-title"><span class="ic">🧠</span>语言模型（用哪个实现）
-        <span class="spacer"></span>
-        <span class="muted" id="rtLlmHint">生成纪要靠它；不装智能体也能出纪要</span>
-      </div>
-      <div class="card-body">
-        <div id="rtLlmHost" class="cap-prov"></div>
-      </div>
-    </div>
-    <div class="card">
-      <div class="card-title"><span class="ic">🛰️</span>通道成员
+    <!-- ====== 模型路由：语言模型 + 通道成员 + 派发情况 **合成一张卡**（2026-09-25 用户要求）======
+         卡内分层用设置卡片同一套小节样式（`.ssec`）；7 项路由参数在「高级」里。
+         这些 host 是**静态**的：`loadRouter()` / `loadRouterLlm()` / `renderRouter*()` 都按 id 渲染 ——
+         静态放着就不会被 `loadSettings()` 的重绘冲掉（两边的请求是并发的，动态渲染会互相覆盖）。
+         只有「高级」里的那 7 行参数由 renderSettingsPanes() 填进 `#rtSetHost`。
+         卡内的「保存」= 这张卡里的全部改动（成员/优先级 + 7 项参数），页签顶部的「保存」只管
+         上面那些设置卡片（见 app.js 的 saveRouter 注释）。 -->
+    <div class="card collapsible" id="rtMergeCard" data-collapse-id="set-router">
+      <div class="card-title"><span class="set-arrow">▶</span><span class="ic">🛰️</span>模型路由
         <span class="badge idle" id="rtBadge">检查中…</span>
+        <span class="sq" role="button" tabindex="0" aria-label="说明">?<span class="spop">这一张卡管四件事：<b>语言模型</b>（用哪个实现 + 在线服务）、<b>通道成员</b>（顺序 = 优先级）、<b>派发情况</b>（命中与成功率），以及「高级」里的 <b>7 项路由参数</b>。成员与参数的改动都由卡内的「保存」落库。</span></span>
         <span class="spacer"></span>
         <a class="rt-link" id="rtDashLink" href="#" target="_blank" rel="noopener"
            title="打开路由自带页面：命中统计与切换历史">仪表盘 ↗</a>
       </div>
       <div class="card-body">
+        <!-- 概要行：DSH 模型是哪个 / 几路启用 / 上下文 / 注册到了哪些家目录 -->
         <div class="rt-reg muted" id="rtReg">加载中…</div>
+
+        <div class="ssec">语言模型</div>
+        <div class="sset-hint">生成纪要靠它；不装智能体也能出纪要。选中即生效；密钥只存本机、接口永不回显。</div>
+        <div id="rtLlmHost" class="cap-prov"></div>
+
+        <div class="ssec">通道成员（顺序 = 优先级）</div>
         <div class="rt-list" id="rtMembers"></div>
         <div class="rt-add">
           <select id="rtCandSelect" class="ctl grow" title="候选来自 DSH 里已配置的模型供应商"></select>
-          <button class="btn" id="rtAdd" title="加入模型组">＋ 加入</button>
-          <button class="btn" id="rtSave" title="保存并让路由热重载 + 同步注册到 DSH">保存</button>
+          <button class="btn" id="rtAdd" title="加入模型组（加完记得点「保存」）">＋ 加入</button>
+          <button class="btn" id="rtSave"
+                  title="保存这张卡里的改动：成员与优先级写回路由并热重载；「高级」里的 7 项路由参数写回设置">保存</button>
         </div>
+
+        <div class="ssec">派发情况</div>
+        <div class="rt-stats" id="rtStats"></div>
         <div class="rt-foot">
           <button class="link" id="rtProbe" title="不等后台周期，马上把所有成员探一遍">立即探测</button>
           <span class="rt-sep">·</span>
@@ -213,14 +242,20 @@
           <span class="rt-sep">·</span>
           <button class="link" id="rtRegister" title="把当前模型组写成 DSH 的本地模型">注册到 DSH</button>
         </div>
+
+        <div class="sadv">
+          <button type="button" class="sadvbtn" aria-expanded="false"><span class="set-arrow">▶</span>高级</button>
+          <div class="sadvbody">
+            <div class="ssec">路由参数</div>
+            <div id="rtSetHost"></div>
+          </div>
+        </div>
       </div>
     </div>
-    <div class="card">
-      <div class="card-title"><span class="ic">📊</span>派发情况</div>
-      <div class="card-body">
-        <div class="rt-stats" id="rtStats"></div>
-      </div>
-    </div>
+
+    <!-- 环境体检：2026-09-25 用户要求放到「智能体」页**最后一张**（内容不动；卡片由
+         renderEnvCheck() 渲染进这个静态 host，所以它始终在这一页末尾）。 -->
+    <div id="envCheckHost"></div>
   </section>
 
   <!-- ============ 能力后端（原「设置 → 能力后端」+ 原「能力」）============
@@ -329,15 +364,10 @@
     </div>
   </section>
 
-  
-  
-    <!-- ============ 首装向导（D23/D24；设计见 docs/向导-分步设计.md）============
-       读者假设是「没用过 ECHO、没有技术背景」的同事，所以文案一律说人话：
-       每步都是「这是干什么的 / 不装会怎样 / 你要决定什么」。
+  <!-- 首装向导的文档说明：内容已搬进「常规」页最后一张「安装向导」卡
+       （设计见 docs/向导-分步设计.md）。读者假设是「没用过 ECHO、没有技术背景」的同事，
+       所以文案一律说人话：每步都是「这是干什么的 / 不装会怎样 / 你要决定什么」。
        前 9 步只做选择（只读体检 + 写计划），点「开始准备」才真正下载。 -->
-  <section id="view-wizard" class="view hidden">
-    <div id="wizHost"></div>
-  </section>
 </main>
 
 <div id="toast" class="toast hidden"></div>
