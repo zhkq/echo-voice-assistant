@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 # ECHO 直接依赖（重建 venv 用；torch/CUDA 等重依赖与安装顺序见 docs/DEPLOY.md）
 # 安装方式见 scripts/setup.ps1
 fastapi>=0.115

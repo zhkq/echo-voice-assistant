@@ -8,6 +8,22 @@
 3. 剩下的它自己下载安装：运行时来自 **python.org**、依赖来自 **PyPI**、模型来自
    **ModelScope / hf-mirror** 镜像 —— **不需要 git，也不需要 GitHub**。
 
+## 想更快？有一条不绕助手的「快路」（一条命令）
+
+助手那条路每一步都要联网 + 每步都要确认，慢就慢在这儿。资料夹里已经把那些步骤固化成了
+一个脚本（`ECHO\scripts\install-all.ps1`，**装的东西与助手那条路完全一样**）：
+
+```powershell
+# 在这个文件夹里打开 PowerShell，跑这一条（-Yes = 不提问，全默认）
+powershell -NoProfile -ExecutionPolicy Bypass -File ".\ECHO\scripts\install-all.ps1" -Yes
+```
+
+它会**一次走完**：解包就位 → 建运行时 → 装核心依赖 → 装组件（sherpa 模型/设置/自检）→
+**打印面板地址**。加 `-Profile main -Wake` 会多装唤醒词；`-Agent harness` 仍会配智能体。
+
+> 如果你拿到的是 **`ECHO-kit-min-*.zip`（离线最小包）**，那就更省事：**双击 `装我.cmd`**，
+> 全程不联网（依赖与模型都在包里）。**离线包不需要联网、也不需要助手。**
+
 ## 包里有什么
 
 | 文件 | 说明 |

@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 # runtime-core 组件的基础依赖（REFACTOR-PLAN D22/D23）
 #
 # 这份清单就是「**默认档**」的依赖（权威档位表：components/profiles.json）。

@@ -19,6 +19,35 @@ whenToUse: 新机器首装 ECHO（Windows 或 macOS）；或把 ECHO 交给同�
 模型来自 **ModelScope / hf-mirror**（ECHO 内置 `HF_ENDPOINT=https://hf-mirror.com`）。
 运行时按平台不同：**Windows** 从 python.org 取（嵌入包兜底），**macOS** 用 Homebrew 的 `python@3.11`。
 
+### 0.1 快路：一条命令（固化脚本，不绕 agent）
+
+上面那条"交给 agent 逐步做"的路**继续有效**；但如果只求**装得快**（同事抱怨的就是这个：
+每步联网 + 每步确认），资料夹里有把第 1–4 节固化下来的入口：
+
+```powershell
+# ① 离线最小包（ECHO-kit-min-*.zip）：**双击 装我.cmd 就行**；等价的命令行是
+powershell -NoProfile -ExecutionPolicy Bypass -File "<kit>\install-offline.ps1" -Root D:\ECHO
+# ② 在线工具包（ECHO-kit-*.zip）：入口在主程序里（同一个脚本），加 -Offline 就是离线那条路
+powershell -NoProfile -ExecutionPolicy Bypass -File "<kit>\ECHO\scripts\install-all.ps1" -Yes
+```
+
+它一次走完：**就位主程序 → 建运行时 → 装核心依赖 → 装组件 → 打印面板地址**。
+其中"装组件"这一步**仍然调本技能里的
+`echo-install-components.ps1`**（引擎/模型/设置/自检只有这一份实现，两边共用）。
+参数：`-Profile minimal|main`、`-Root <安装根>`、`-Agent none|harness|dsh`、`-Yes`、`-Offline`。
+
+* **离线包不需要联网、也不需要 agent**：依赖来自包里的 `bundle\wheels`（pip 带
+  `--no-index --find-links`），流式模型来自 `bundle\models`，运行时兜底是
+  `bundle\runtime\python-3.11.9-embed-amd64.zip`（目标机没有 Python / uv 时用它）。
+* 离线包里 **`-Agent` 默认 `none`** —— 包**不含 DSH/harness**（`@deepseek-ai/dsh` 是私有
+  npm 包，许可上不能随包分发）。要会议纪要 / 归档 / 语音指令的智能体时，仍走第 5 节那条
+  （联网 + npm / npx 缓存）的路，装组件时用 `-Agent harness`。
+* 想加唤醒词 / whisper 档 / SenseVoice / 说话人分离：那些**模型不随包**，装完在面板 →
+  「能力」里按需下载即可（联网）。
+
+> 两条路装出来的**东西是一样的**（同一个组件脚本、同一套设置键、同一份自检）。
+> 快路只是把"读 SKILL.md → 逐步确认 → 逐步联网"换成"一条命令跑到底"。
+
 ## 1. 先跟用户确认（必须问，不要替他决定）
 
 | 要问什么 | 推荐 | 为什么问 |
