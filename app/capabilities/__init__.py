@@ -20,7 +20,7 @@
 """
 from app.capabilities.base import (          # noqa: F401
     BACKEND_ECHO_SERVER,
-    BACKEND_INTRANET,
+    BACKEND_ASR_PROVIDER,
     BACKEND_LOCAL,
     LOCAL_ONLY_SLOTS,
     PRIVACY_ORDER,
@@ -52,7 +52,7 @@ from app.capabilities.router import (        # noqa: F401
 )
 
 __all__ = [
-    "BACKEND_ECHO_SERVER", "BACKEND_INTRANET", "BACKEND_LOCAL",
+    "BACKEND_ECHO_SERVER", "BACKEND_ASR_PROVIDER", "BACKEND_LOCAL",
     "LOCAL_ONLY_SLOTS", "PRIVACY_ORDER", "SKIP_REASONS", "SLOTS",
     "SOURCE_LAN", "SOURCE_LOCAL", "SOURCE_WAN", "VECTOR_SLOTS",
     "SERVER_CODE_RETRY", "SERVER_CODE_TO_REASON",

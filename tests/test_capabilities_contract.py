@@ -32,7 +32,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.capabilities import (                                     # noqa: E402
     BACKEND_ECHO_SERVER,
-    BACKEND_INTRANET,
+    BACKEND_ASR_PROVIDER,
     BACKEND_LOCAL,
     SERVER_CODE_RETRY,
     SERVER_CODE_TO_REASON,
@@ -539,7 +539,7 @@ class IronLawTests(unittest.TestCase):
     def test_L2_vector_slots_require_a_declared_vector_space(self):
         """**产出向量的能力，不许落在不能声明向量空间的后端上。**
 
-        反例就是"内网公共 ASR"那类服务：它能转写，但你不知道它的嵌入属于哪个空间。
+        反例就是"网络服务商"那类服务：它能转写，但你不知道它的嵌入属于哪个空间。
         拿它去比余弦相似度**不报错**，只是认错人。
         """
         blind = _StubClient("blind", {"diarize.turns"}, source=SOURCE_WAN, vspace="")

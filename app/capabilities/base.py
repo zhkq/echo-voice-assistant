@@ -81,11 +81,13 @@ LOCAL_ONLY_SLOTS: Tuple[str, ...] = ("wake",)
 #: 三类来源。`source` 决定"能不能出机"，是 privacy 约束的判据。
 SOURCE_LOCAL = "local"
 SOURCE_LAN = "lan"          # ECHO 能力后端（单位内网）
-SOURCE_WAN = "wan"          # 内网公共 ASR（其实是"别人的服务"，可能进一步出网）
+SOURCE_WAN = "wan"          # 网络服务商（可能是公网、也可能是企业内网 —— 先按最保守的算）
 
 BACKEND_LOCAL = "local"
 BACKEND_ECHO_SERVER = "echo-server"
-BACKEND_INTRANET = "intranet"
+#: 网络服务商（`providerAsr` 那一路的服务化形态）。**入口空置**：链上有它、设置里能选，
+#: 但适配器还没写 —— 选中会如实报 `absent`，不假装能用（接口规范到位后再实现）。
+BACKEND_ASR_PROVIDER = "asr-provider"
 
 #: privacy 约束的宽严（`需求.constraints.privacy`）：
 #:   none = 不出机（只许本地）｜lan = 允许内网 ｜wan = 允许更远
@@ -102,7 +104,7 @@ SKIP_REASONS: Tuple[str, ...] = (
     "offline",          # 探测不通
     "circuit-open",     # 熔断冷却中
     "quota",            # 额度用尽 / 被限流
-    "unsupported",      # 不支持该需求（内网公共服务被问 diarize）
+    "unsupported",      # 不支持该需求（只会转写的网络服务商被问 diarize）
     "vector-mismatch",  # vectorSpaceId 与本次会议锁定的不一致
     "open-failed",      # 实开失败
     "error",            # 其它失败（带 detail）

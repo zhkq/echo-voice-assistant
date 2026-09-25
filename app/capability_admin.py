@@ -36,7 +36,7 @@ SLOT_LABELS: Dict[str, str] = {
 BACKEND_LABELS: Dict[str, str] = {
     "local": "本机",
     "echo-server": "ECHO 后端",
-    "intranet": "内网公共 ASR",
+    "asr-provider": "网络服务商",
 }
 
 #: 哪个设置键管哪些槽 —— **面板要按人来分组**（"开会转写用哪个后端"而不是
@@ -60,7 +60,7 @@ CHOICE_LABELS: Dict[str, str] = {
     "auto": "自动（按优先级挑第一个可用的）",
     "echo-server": "只用 ECHO 后端",
     "local": "只用本机",
-    "intranet": "只用内网公共 ASR",
+    "asr-provider": "只用网络服务商",
     "off": "关掉（不做这件事）",
 }
 

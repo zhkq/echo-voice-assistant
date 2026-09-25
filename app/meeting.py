@@ -648,7 +648,7 @@ def _capability_skeleton(cap, seg_path, cfg):
     """从 `asr.timestamps` 槽要一份时间骨架。**要不到就当没有**（不抛、不假装）。
 
     为什么值得单独要一次：`asr.text` 与 `asr.timestamps` **可以是两个不同的后端**
-    （设计 §4.2 的槽清单本来就这么分）。比如文本走内网公共服务（它只给文本），
+    （设计 §4.2 的槽清单本来就这么分）。比如文本走网络服务商（它只给文本），
     而骨架走 ECHO 后端。要到了就 `assemble` 对齐（`aligned`），要不到就按字数均摊
     （`estimated`）—— 两种都在数据里标明。
 

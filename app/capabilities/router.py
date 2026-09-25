@@ -5,7 +5,7 @@
 
 | 做什么 | 不这么做会怎样 |
 |---|---|
-| 按槽把活派给"声明自己能干"的后端 | 把 `diarize` 派给只会转写的内网公共服务 → 每次失败 |
+| 按槽把活派给"声明自己能干"的后端 | 把 `diarize` 派给只会转写的网络服务商 → 每次失败 |
 | 失败**换下一个**，而不是整条链路失败 | 一个后端挂了 = 一场会议没有转写 |
 | **铁律 L2/L5**：说话人这一家子只落在能声明 `vectorSpaceId` 的后端、且全场同源 | 跨向量空间比余弦相似度 → **认错人且不报错** |
 | **铁律 L3**：指令链路的主选必须是本机 | 服务端一挂，"说句话"这件事就不可用了 |
@@ -32,7 +32,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from app.capabilities.base import (
     BACKEND_ECHO_SERVER,
-    BACKEND_INTRANET,
+    BACKEND_ASR_PROVIDER,
     BACKEND_LOCAL,
     LOCAL_ONLY_SLOTS,
     PRIVACY_ORDER,
@@ -74,7 +74,7 @@ REASON_PRIORITY: Tuple[str, ...] = (
 )
 
 #: 默认优先级（`auto` 时用）。顺序 = 质量与可控性的折中：
-#:   ECHO 后端（可控、有向量空间） → 本机（不出机但弱） → 内网公共（不可控）
+#:   ECHO 后端（可控、有向量空间） → 本机（不出机但弱） → 网络服务商（不可控）
 #: 注意 `wake` 与**指令**链路不走这张表（L3 把它钉在本机）。
 #:
 #: ⚠️ **会议链路的槽里没有本机**（`docs/能力路由-三后端与轻客户端.md` §5.1，
@@ -87,7 +87,7 @@ REASON_PRIORITY: Tuple[str, ...] = (
 #: **"不默认本机" ≠ "禁止本机"**：用户显式把该槽设成 `local` 时照用
 #: （`_order_for` 里 `explicit != "auto"` 那条，走的是"他选的主选"而不是"兜底"）。
 DEFAULT_ORDER: Dict[str, Tuple[str, ...]] = {
-    "asr.text": (BACKEND_ECHO_SERVER, BACKEND_LOCAL, BACKEND_INTRANET),
+    "asr.text": (BACKEND_ECHO_SERVER, BACKEND_LOCAL, BACKEND_ASR_PROVIDER),
     "asr.timestamps": (BACKEND_ECHO_SERVER,),
     "asr.streaming": (BACKEND_LOCAL,),          # 流式是"边说边出"，只有本机做得到
     "wake": (BACKEND_LOCAL,),                   # 铁律 L3
@@ -160,7 +160,7 @@ class Plan:
     #: 每个槽**按优先级排好的、确实可用的**后端 id。
     #:
     #: 为什么单独存一份：`call()` 要"失败换下一个"，而"下一个"必须是**筛过的**候选。
-    #: 早先它是拿 `_order_for()` 重新算的 —— 那张表里有 echo-server / intranet
+    #: 早先它是拿 `_order_for()` 重新算的 —— 那张表里有 echo-server / asr-provider
     #: 这些**压根没注册**的名字，于是"尝试预算"被它们占掉，真正能用的备选反而被
     #: MAX_ATTEMPTS 截掉了（表现是"明明有备选却说都不行"）。
     candidates: Dict[str, List[str]] = field(default_factory=dict)
@@ -449,7 +449,7 @@ def _default_log(level, source, message):
 def build_default_router(settings_get=None, log=None) -> CapabilityRouter:
     """按设置造一个路由器：本机 + （配了地址**或配过对**才有的）ECHO 后端。
 
-    内网公共服务（`intranet`）**还没做**（那是施工顺序的 step 2），
+    网络服务商（`asr-provider`）**入口空置**（适配器等接口规范），
     所以这里不造它 —— 造一个空壳只会让"配了却永远失败"变成一个谜。
     """
     from app.capabilities.local import LocalCapabilityClient

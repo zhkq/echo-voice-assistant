@@ -9,7 +9,7 @@
 拼/解，而不是复用被测代码 —— 复用就变成了"自己跟自己一致"，测不出协议错。
 
 内网那台真服务的协议（帧格式 / 是否先发 JSON 配置 / 采样率）**还没确认**
-（设计 §8.2.2），所以这里只验**传输层**；消息语义留给 `intranet` 适配器。
+（设计 §8.2.2），所以这里只验**传输层**；消息语义留给「网络服务商」适配器。
 """
 import base64
 import hashlib
@@ -393,7 +393,7 @@ class WssTests(unittest.TestCase):
 class NothingImportsItYetTests(unittest.TestCase):
     """**这个模块现在是独立的**（设计 §8.2.2：真协议还没确认）。
 
-    这条用例不是"防别人用"，而是把那句状态**写成可执行的**：等 `intranet` 适配器
+    这条用例不是"防别人用"，而是把那句状态**写成可执行的**：等「网络服务商」适配器
     接上它时，这条会红 —— 那时顺手把它删掉，并在适配器的提交里说明协议已确认。
     没有它的话，"还没接"这件事只存在于文档里，而文档会漂。
     """
@@ -416,7 +416,7 @@ class NothingImportsItYetTests(unittest.TestCase):
                     if "wsclient" in src:
                         hits.append(os.path.relpath(path, root))
         self.assertEqual(hits, [],
-                         "有人 import 了 wsclient —— 说明 intranet 适配器接上了？"
+                         "有人 import 了 wsclient —— 说明网络服务商适配器接上了？"
                          "那请把这条用例删掉，并在提交里写明真协议已确认（设计 §8.2.2）")
 
 

@@ -718,8 +718,8 @@ DEFAULTS = {
         value_type="str"),
     "capabilityMeetingAsrBackend": dict(
         value="auto", grp="capability", label="会议转写用哪个后端", hidden=True,
-        options=["auto", "echo-server", "local", "intranet"],
-        description="会议链路的 asr.text。auto = 按「ECHO 后端 → 本机 → 内网公共」"
+        options=["auto", "echo-server", "local", "asr-provider"],
+        description="会议链路的 asr.text。auto = 按「ECHO 后端 → 本机 → 网络服务商」"
                     "的顺序挑第一个可用的",
         value_type="str"),
     "capabilityDiarizeBackend": dict(
@@ -729,7 +729,7 @@ DEFAULTS = {
                     "**会议链路的默认链上没有本机**（不做兜底）：ECHO 后端不可用时这场会议就是"
                     "没有说话人，而不是**自动**降级到本机 —— 本机与后端是两个向量空间，"
                     "混用会认错人。想全本地跑，把这里**显式**选成「只用本机」。"
-                    "**产出向量的能力只能落在能声明向量空间的后端上**（内网公共服务不行）",
+                    "**产出向量的能力只能落在能声明向量空间的后端上**（网络服务商不行）",
         value_type="str"),
     "capabilityEmbedBackend": dict(
         value="auto", grp="capability", label="声纹提取用哪个后端", hidden=True,
