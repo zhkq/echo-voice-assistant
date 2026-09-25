@@ -6,6 +6,7 @@
 """
 import os
 import tempfile
+from typing import List
 
 from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, UploadFile
 from pydantic import BaseModel
@@ -814,6 +815,142 @@ def transcribe_status(_auth=Depends(optional_auth)):
     return meeting.transcribe_progress()
 
 
+@router.post("/meetings/import")
+async def meetings_import(
+        files: List[UploadFile] = File(...),
+        title: str = Form(""),
+        start: str = Form(""),
+        notes: str = Form(""),
+        block_frames: int = Form(0),
+        _auth=Depends(optional_auth)):
+    """导入 1..N 个音频文件为**一场会议**（顺序即分段顺序），导入成功后自动开始转写。
+
+    为什么是 multipart 而不是 JSON+本地路径：录音在**用户的机器/手机**上，面板是浏览器，
+    能给出的只有文件本身。路径式接口还会让"导入"变成"任意文件读取"。
+
+    字段：
+      files        1..N 个音频文件（**表单里出现的顺序 = 分段顺序**，前端按用户选的顺序 append）
+      title        可选标题（写 `meetings.title`）
+      start        可选会议时间（`YYYY-MM-DD HH:MM[:SS]` / ISO；空=现在）
+      notes        可选备注（写 `meetings.notes`）
+      block_frames 可选：转码分块大小（0 = 用 `importer.DEFAULT_BLOCK_FRAMES`）。
+                   **留这个口子是为了可验**：用例传一个小值就能断言"分块解码"真的发生了
+                   （见 `tests/test_meeting_import.py` 的大文件用例），而不是靠读代码相信。
+
+    支持的格式：**wav / flac / mp3 / ogg**（本机 soundfile + libsndfile 实测可读）。
+    `m4a`/`aac` **明确拒绝**（HTTP 400 + 一句"需要 ffmpeg、请先转成 wav/mp3"的原因）——
+    不许假装支持，也不许静默失败。详见 `app/audio/importer.py`。
+
+    ## 为什么是"同步转码 + 后台转写"，而不是整条异步
+
+    异步（立刻返回、后台转码）有两个问题：
+      * 用户看不到"上传/转换"的真实进度，而 50 MB 的录音转换要几十秒；
+      * 转码失败时那条会议记录/目录**已经建出来了** —— 而"导入失败不许留下垃圾目录"
+        是这次需求里的硬要求。所以：**先把每个文件转码成 16k 单声道 wav 落进会议目录，
+        全部成功之后才 `db.create_meeting()`**；这期间请求保持打开（前端有上传进度条），
+        转换本身也不占事件循环（`run_in_threadpool`）。
+
+    返回: {"ok", "name", "id", "files", "seconds", "message"}；`id` 供前端接着轮询
+    既有的 `GET /api/transcribe/status`（**不新造一套进度 UI**）。
+    """
+    from starlette.concurrency import run_in_threadpool
+    from app.audio import importer as imp
+
+    picked = [f for f in (files or []) if f is not None]
+    if not picked:
+        raise HTTPException(status_code=400, detail="没有收到任何音频文件")
+
+    tmps = []
+    try:
+        for f in picked:
+            name = _upload_name(f.filename)
+            # 扩展名一眼读不了的（m4a/aac/…）**在读字节之前**就拒绝：省掉一次白传
+            # 几百兆，而且用户拿到的是"这个格式要 ffmpeg"，不是 libsndfile 那句
+            # 认不出格式的 `Format not recognised.`（见 importer.unusable_extension_reason）。
+            if os.path.splitext(name)[1].lower() in imp.UNUSABLE_EXTS:
+                raise HTTPException(status_code=400,
+                                    detail=imp.unusable_extension_reason(name))
+            # **分块落临时文件**：`UploadFile.read(1MB)` 一块一块写，50 MB+ 的录音
+            # 不会有任何一刻整段在内存里（`MAX_UPLOAD_BYTES` 是明面上的上限，
+            # 超了当场 413，不让它写满用户的临时盘）。
+            tmp = _new_upload_tmp(name)
+            tmps.append(tmp)
+            total = 0
+            with open(tmp, "wb") as out:
+                while True:
+                    chunk = await f.read(UPLOAD_CHUNK_BYTES)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > MAX_UPLOAD_BYTES:
+                        raise HTTPException(
+                            status_code=413,
+                            detail="「%s」超过 %d MB，不能导入（请先切成几段再导入）"
+                                   % (name, MAX_UPLOAD_BYTES // (1024 * 1024)))
+                    out.write(chunk)
+            if total == 0:
+                raise HTTPException(status_code=400,
+                                    detail="「%s」是空文件（0 字节），没有音频可导入。" % name)
+            db.add_log("debug", "api",
+                       "meetings.import 收到 %s（%d 字节）" % (name, total))
+        # 转码 + 建库 + 起转写线程都在这里；失败会带上**真原因**回来。
+        pairs = list(zip(tmps, [ _upload_name(f.filename) for f in picked]))
+        kw = {}
+        if int(block_frames or 0) > 0:
+            kw["block_frames"] = int(block_frames)
+        res = await run_in_threadpool(_import_uploads, pairs, title, start, notes, kw)
+    finally:
+        for tmp in tmps:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+    ok, payload = res
+    if not ok:
+        # 业务性失败**带原因**（面板只显示后端给的真原因，不许自己编）。
+        # 走 400 而不是 200+ok=false：这是"你给的文件不行"，与 `/api/models/download`
+        # 那种"排队/开关"型失败不同，前端据此区分"要重新选文件"与"稍后重试"。
+        raise HTTPException(status_code=400, detail=payload)
+    # 把这一场的**真实**数字（时长/段数/重采样路径）一并回给前端：提示条上要能说
+    # "已导入 2 段、共 3.1 分钟"，而不用再拉一次列表。
+    name = payload
+    row = db.get_meeting_by_name(name) or {}
+    return {"ok": True, "name": name, "id": row.get("id"),
+            "files": int(row.get("segments") or 0),
+            "seconds": float(row.get("duration_seconds") or 0.0),
+            "message": "已导入 %d 段音频（%.1f 分钟），正在转写"
+                       % (int(row.get("segments") or 0),
+                          float(row.get("duration_seconds") or 0.0) / 60.0)}
+
+
+def _upload_name(raw):
+    """上传文件名 → 只取最后一段（报错文案与 meta.json 都显示它，不显示临时名）。"""
+    return os.path.basename(str(raw or "").replace("\\", "/")) or "（未命名）"
+
+
+def _new_upload_tmp(name):
+    """给一个上传文件开一个临时落点（**同一目录一条路**，便于 50 MB 分块写）。"""
+    import uuid
+    suffix = os.path.splitext(name)[1] or ".bin"
+    fn = "echo-imp%d-%s%s" % (os.getpid(), uuid.uuid4().hex[:10], suffix)
+    return os.path.join(tempfile.gettempdir(), fn)
+
+
+def _import_uploads(pairs, title, start, notes, kw):
+    """（线程池里跑）`[(临时路径, 原始名)]` → `meeting.import_meeting()`。
+
+    为什么要把"临时路径 / 原始名"拆成两份：转码读的是临时文件，而**报错文案与
+    `meta.json` 的 `importedFrom` 必须是用户认识的那个名字**（`echo-imp1234-ab12.m4a`
+    这种临时名对用户毫无意义，也会把"哪个文件失败了"这件事变得没法查）。
+    所以路径走 `files`、显示名走 `display_names`，一一对应。
+    """
+    names = [n for _p, n in pairs]
+    paths = [p for p, _n in pairs]
+    return meeting.import_meeting(paths, title=title, start=start, notes=notes,
+                                  display_names=names, **kw)
+
+
 @router.get("/meetings")
 def get_meetings(limit: int = 100, offset: int = 0, _auth=Depends(optional_auth)):
     items = db.list_meetings(limit=min(limit, 500), offset=max(offset, 0))
@@ -821,7 +958,47 @@ def get_meetings(limit: int = 100, offset: int = 0, _auth=Depends(optional_auth)
     for it in items:
         folder = os.path.join(meeting.meetings_dir(), it["name"])
         it["has_summary"] = os.path.isfile(os.path.join(folder, "summary.md"))
+        # 「已压缩」标记（2026-09-26）：列表卡片要显示
+        # "原 149.0 MB → 现 76.0 MB（省 49%）"。**只读 meta.json**，不重算、不估算
+        # （估算值只在压缩前的预览里出现，两个数绝不能混）。
+        # 失败时留 `None`：老会议根本没有这个块，面板据此不显示任何标记。
+        try:
+            it["compression"] = meeting.compression_info(it["name"])
+        except Exception:
+            it["compression"] = None
     return {"items": items}
+
+
+# ---- 历史音频无损压缩（FLAC）：**必须声明在 `/meetings/{mid}` 之前** ----
+# FastAPI 按声明顺序匹配：`/meetings/compress/preview` 先撞上的会是 `{mid}: int`，
+# 于是 `"compress"` 过不了 int 校验 → **422**，而静态路由永远到不了。
+# 这不是风格问题，是"接口 422 却查不出为什么"的那类坑，所以三条一起放在这里。
+
+@router.get("/meetings/compress/preview")
+def meetings_compress_preview(limit: int = 500, _auth=Depends(optional_auth)):
+    """「先算给你看」：可压缩 N 场 / 能省 X（**只读，一个字节都不写**）。
+
+    字段见 `meeting.compression_preview()`。刻意与"开始压缩"分成两个端点：
+    用户点开入口时**必须先看到数字**再决定要不要动手（这也是需求里点名的那一步）。
+    """
+    return meeting.compression_preview(limit=limit)
+
+
+@router.post("/meetings/compress")
+def meetings_compress(limit: int = 500, _auth=Depends(optional_auth)):
+    """用户确认之后**真的动手**（后台线程；进度见 `/meetings/compress/status`）。
+
+    返回 `{ok, message}`：正在跑时 `ok=false` 且 `message` 说清"已有任务在跑"，
+    与 `/api/meeting/start|stop` 同一套"业务性失败也是 200"的既有约定。
+    """
+    ok, msg = meeting.compress_meetings(limit=limit)
+    return {"ok": ok, "message": msg}
+
+
+@router.get("/meetings/compress/status")
+def meetings_compress_status(_auth=Depends(optional_auth)):
+    """压缩进度 + 最近一次的结果汇总（与转写进度**分开**，互不顶掉对方的进度条）。"""
+    return meeting.compress_progress()
 
 
 @router.get("/meetings/{mid}")
@@ -849,18 +1026,41 @@ def get_meeting(mid: int, _auth=Depends(optional_auth)):
 
 @router.get("/meetings/{mid}/audio")
 def meeting_audio(mid: int, seg: int = 1, _auth=Depends(optional_auth)):
-    """返回某段录音 wav（支持 Range，供前端同步播放）。
+    """返回某段录音（支持 Range，供前端同步播放）。
 
-    `seg` 是 int、`{seg:02d}` 不会带分隔符；会议目录名仍走 _safe_under 兜底
+    2026-09-26：历史音频可能已经被**无损压成 FLAC**（`01.flac`，原件已删）。
+    面板那边不许知道这件事 —— 这条接口一律回 **WAV**：
+
+      * 是 `.wav` → 直接 `FileResponse`（与改动前逐字一致，不复制、不占额外磁盘）；
+      * 是 `.flac` → **用时解码**成临时 WAV 再回（浏览器对 `audio/flac` 的支持
+        并不一致，而我们已经有一条可靠的解码路，没必要把它交给浏览器赌）。
+
+    临时文件不在这里删：它是**正在被 HTTP 流式读**的文件，删了会让播放中途断掉。
+    它落在 `audiofile.TEMP_DECODE_DIR`，由 `audiofile.gc_temp()`（下次解码时顺手扫）
+    与退出时的清理兜底 —— 这一点在代码注释里写明，免得日后有人以为它是泄漏。
+
+    `seg` 是 int、`{seg:02d}` 不会带分隔符；会议目录名仍走 `_safe_under` 兜底
     （万一库里的 name 被写进奇怪值，也不至于跑到会议目录之外）。
     """
     m = db.get_meeting(mid)
     if not m:
         raise HTTPException(status_code=404, detail="会议不存在")
-    path = _safe_under(meeting.meetings_dir(), _meeting_dirname(m["name"]), f"{seg:02d}.wav")
-    if not path or not os.path.isfile(path):
+    folder = _safe_under(meeting.meetings_dir(), _meeting_dirname(m["name"]),
+                         allow_base=True)
+    if not folder:
+        raise HTTPException(status_code=404, detail="音频段不存在")
+    from app.audio import audiofile
+    path = audiofile.resolve_segment(folder, seg)
+    if not path:
         raise HTTPException(status_code=404, detail="音频段不存在")
     from fastapi.responses import FileResponse
+    if audiofile.is_flac(path):
+        try:
+            path = audiofile.decode_to_wav(path)
+        except audiofile.CompressionError as e:
+            raise HTTPException(status_code=500,
+                                detail="这段音频（%s）解不开，无法播放：%s"
+                                       % (os.path.basename(path), e))
     return FileResponse(path, media_type="audio/wav", filename=f"seg{seg:02d}.wav")
 
 

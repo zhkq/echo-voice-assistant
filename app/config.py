@@ -517,7 +517,14 @@ DEFAULTS = {
     "meetingAutoSummarize": dict(value=True, grp="meeting", label="自动生成纪要",
                                  description="转写完成后自动请 DSH 生成纪要（★转写全文会发给 DSH 配置的模型服务：内网网关即贵单位内网，公网 API 即模型厂商）", value_type="bool"),
     "meetingKeepRawAudio": dict(value=True, grp="meeting", label="保留原始音频",
-                                description="删除会议时是否同时删除音频", value_type="bool"),
+                                description="删除会议时是否同时删除音频。"
+                                            "**也管无损压缩**：勾着时压缩只写 FLAC、"
+                                            "不删原始 WAV（更保险，但不腾空间）；"
+                                            "取消勾选才会在校验通过后删原件", value_type="bool"),
+    "meetingAutoCompressAudio": dict(value=False, grp="meeting", label="转写完成后自动压缩",
+                                     description="默认关闭。开启后每场会议**转写完成**时自动把音频段"
+                                                 "无损压成 FLAC（省约一半磁盘、转写文本逐字不变）。"
+                                                 "手动入口在「会议」页", value_type="bool"),
     "meetingDiarize":   dict(value=False, grp="model", label="区分说话人",
                              description="本地 pyannote 分离（CPU 下较慢）", value_type="bool"),
     # ---------- 常用联系人声纹（issue #6）：改名入库 → 新会议自动认人 ----------

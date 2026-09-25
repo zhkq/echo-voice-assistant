@@ -258,7 +258,7 @@ async function viewModels() {
     d.models.map((x) => [x.id, x.slot || "—", x.state, x.resident ? "是" : "否",
       mb(x.estVramMb), x.maxConcurrency, x.vectorSpaceId || "—"]))}
     <div class="muted" style="margin-top:8px">显存：${esc(JSON.stringify(d.vram))}。
-      加载/卸载是能力面自己的状态机（按需 + LRU），管理面只读。</div></div>`;
+      加载/卸载是能力面自己的状态机（按需 + LRU），模型加载/卸载不在这里（那是能力面自己的状态机）；发授权与客户端管理在「客户端」页签。</div></div>`;
 }
 
 /* ---------------------------------------------------------------- 客户端 / 发授权 */

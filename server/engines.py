@@ -162,14 +162,24 @@ class _SttEngine:
             pass
 
 
-def _stt_loader(engine_name: str, model: str, device: str):
+def _stt_loader(engine_name: str, model: str, device: str, forced_aligner: str = ""):
     def load(spec: ModelSpec):
         _assert_device(engine_name, device)
         from app.audio import stt
         mdl = model
         if not mdl and engine_name == "qwen3asr":
             mdl = "Qwen/Qwen3-ASR-0.6B"
-        key = stt.load_engine(engine_name, mdl, device)
+        extra = {}
+        if engine_name == "qwen3asr":
+            # **接线缺口修在这里**（2026-09-26 实测）：qwen3asr 的句级时间戳只有带上
+            # 强制对齐器才有 —— 不带的话 `return_time_stamps=True` 只换回一句
+            # "return_time_stamps requires forced_aligner. Skipping timestamps."，
+            # 而 `default_specs()` 给这个 spec 宣告的偏偏是
+            # `supports: [asr.text, asr.timestamps]` —— 名不副实。
+            # 对齐器与 ASR 是**同一个进程内的两份权重**，所以它必须在**加载时**一起进来；
+            # 值取自客户端引擎层那一个常量（服务端不另抄一份，免得两处漂移）。
+            extra["forced_aligner"] = forced_aligner or stt.QWEN3_FORCED_ALIGNER
+        key = stt.load_engine(engine_name, mdl, device, **extra)
         if not stt.key_loaded(key):
             raise RuntimeError("引擎 %s 没有加载起来（key=%s）" % (engine_name, key))
         return _SttEngine(engine_name, mdl, device, key)
@@ -254,6 +264,8 @@ def build_loaders(device: str = "cuda") -> Dict[str, object]:
     """impl 名 → 加载器。**只在这里认识"客户端有哪些引擎"**，池本身不认识。"""
     return {
         "sensevoice": _stt_loader("sensevoice", "", device),
+        # qwen3asr 这条**必须**带强制对齐器（`_stt_loader` 里补的默认值，
+        # 见那里的注释）：`default_specs()` 给它的 `supports` 里有 `asr.timestamps`。
         "qwen3asr": _stt_loader("qwen3asr", "", device),
         "whisper": _stt_loader("whisper", "", device),
         "sherpa": _stt_loader("sherpa", "", device),

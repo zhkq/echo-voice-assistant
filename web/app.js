@@ -3644,9 +3644,16 @@ function meetingBadgeCls(status) {
   return "idle";
 }
 
-/* 会议状态文案：error 在会议语境里是「录音失败（没录到音频）」，比通用的「错误」更能说明问题 */
+/* 会议状态文案：error 在会议语境里是「录音失败（没录到音频）」，比通用的「错误」更能说明问题。
+   `imported`（2026-09-25 新增）= 「待转写」：**音频已经在库里、还没有文字**。
+   为什么单独加这一档而不是复用别的：
+     * `transcribed` 会谎称已完成（库里一行都没有）；
+     * `interrupted` 的意思是"录音中断"（进程崩了/设备掉了），用它表达"导进来还没转"
+       会让两种完全不同的状况在列表里长得一模一样（同事的夹具脚本当初只能这么办，
+       并在交付文档里写明了那是妥协）；
+     * `error` 会被读成"录音失败"，而导入的音频明明在。 */
 const MEETING_STATUS_TEXT = { recording: "录音中", transcribing: "转写中", transcribed: "已转写",
-  error: "录音失败", interrupted: "已中断" };
+  imported: "待转写", error: "录音失败", interrupted: "已中断" };
 
 function renderMeetingItems(el, items) {
   if (!items.length) {
@@ -3681,11 +3688,21 @@ function renderMeetingItems(el, items) {
     const errHint = m.status === "error"
       ? `<div class="m-meta" style="color:var(--red)">${esc(errText || "这场会议失败了，但原因没有记下来 —— 详见 启动 → 日志")}</div>`
       : "";
+    // 「已压缩」标记（2026-09-26，历史音频无损压成 FLAC）。
+    // 数字**全部来自后端**（`meta.json` 里的真实前后字节），面板一个数都不自己算：
+    // 估算值只在压缩前的预览里出现，两个数混在一起用户就分不清"预览"与"实况"了。
+    const cp = m.compression;
+    const compTag = (cp && cp.beforeBytes)
+      ? `<span class="m-compress" title="音频已无损压缩为 FLAC${cp.deletedRaw ? "（原始 WAV 已删除）" : "（按「保留原始音频」设置未删原件）"}">已压缩：原 ${esc(cp.beforeText)} → 现 ${esc(cp.afterText)}（省 ${cp.savedPercent}%）</span>`
+      : "";
+    // `已压缩` 也进 m-meta 那一行（列表窄的时候不至于撑宽卡片）
+    const compMeta = compTag ? `<div class="m-meta">${compTag}</div>` : "";
     return `<div class="meeting-item" data-id="${m.id}">
       <span class="badge ${meetingBadgeCls(m.status)}">${MEETING_STATUS_TEXT[m.status] || STATUS_TEXT[m.status] || m.status}</span>
       <div class="grow">
         ${nameHtml}
         <div class="m-meta">${esc(started)} · ${fmtHM(dur)} · ${m.segments || 0} 段 ${hasSummary}</div>
+        ${compMeta}
         ${txHtml}
         ${errHint}
       </div>
@@ -3771,6 +3788,374 @@ $("#btnCleanShort").addEventListener("click", async (e) => {
     loadMeetings();
   } catch (e2) { toast("清理失败：" + e2.message); }
 });
+
+/* ================= 历史音频无损压缩（FLAC）=================
+   需求（2026-09-26）：历史会议的音频段无损压成 FLAC（省约一半磁盘、转写文本逐字不变）。
+   面板这一块只做三件事，**一个数字都不自己算**：
+
+     ① 点「压缩音频」→ 先算给你看（`GET /api/meetings/compress/preview`，只读）；
+     ② 用户确认 → `POST /api/meetings/compress`（后台跑）；
+     ③ 压缩中显示进度（复用 `.tx-bar`，与上传/导入同一套视觉）→ 完成后刷新列表，
+        卡片上出现「已压缩：原 X → 现 Y（省 Z%）」（数字来自后端 `meta.json`）。
+
+   为什么预览与执行是两个端点：**先算给你看**是需求里点名的一步，
+   合并成一个的话用户点下去就已经在压了，没有"看清数字再决定"的机会。 */
+let _compressBusy = false;
+let _compressPoll = null;
+let _compressPreview = null;
+
+function fmtSavedBytes(n) { return fmtSize(Math.max(0, Number(n) || 0)); }
+
+function renderCompressPreview(p) {
+  _compressPreview = p;
+  const host = $("#compressPreview");
+  const note = $("#compressNote");
+  const picked = $("#compressPicked");
+  if (host) {
+    if (!p || !p.count) {
+      host.textContent = p && p.alreadyMeetings
+        ? `没有可压缩的会议（已有 ${p.alreadyMeetings} 场压缩过）`
+        : "没有可压缩的会议";
+    } else {
+      const keep = p.keepRawAudio
+        ? `能少占 ${p.estimateText}（保留原件，实际腾出 0）`
+        : `预计省 ${p.reclaimText}`;
+      host.textContent = `可压缩 ${p.count} 场 · 原 ${p.beforeText} → 约 ${p.estimateText}`;
+      host.textContent += ` · ${keep}`;
+    }
+  }
+  if (note) note.textContent = (p && p.note) || "";
+  if (picked) {
+    const rows = ((p && p.meetings) || []).filter((m) => m.compressible || m.compressed);
+    picked.innerHTML = rows.slice(0, 30).map((m) => {
+      if (m.compressed && m.compressedBytes) {
+        return `<div class="ip-item">
+          <span class="ip-name" title="${esc(m.title || m.name)}">${esc(m.title || m.name)}</span>
+          <span class="ip-size">已压缩：原 ${esc(m.compressedBytes.beforeText || fmtSize(m.compressedBytes.before))} → 现 ${esc(m.compressedBytes.afterText || fmtSize(m.compressedBytes.after))}（省 ${m.compressedBytes.percent}%）</span>
+        </div>`;
+      }
+      return `<div class="ip-item">
+        <span class="ip-name" title="${esc(m.title || m.name)}">${esc(m.title || m.name)}</span>
+        <span class="ip-size">${m.compressible} 段 · ${fmtSize(m.beforeBytes)} → 约 ${fmtSize(m.estimateBytes)}</span>
+      </div>`;
+    }).join("");
+    if (rows.length > 30) {
+      picked.innerHTML += `<div class="ip-item"><span class="ip-size">…另有 ${rows.length - 30} 场</span></div>`;
+    }
+  }
+  const btn = $("#btnCompressStart");
+  if (btn) btn.disabled = _compressBusy || !(p && p.count);
+}
+
+async function loadCompressPreview() {
+  try {
+    renderCompressPreview(await api("/api/meetings/compress/preview"));
+  } catch (e) {
+    const host = $("#compressPreview");
+    if (host) host.textContent = "算不出来：" + e.message;
+  }
+}
+
+/** 压缩进度条（复用 `.tx-bar`）+ 完成后的一次性收尾。 */
+function setCompressBar(percent, text) {
+  const bar = $("#compressBar");
+  const state = $("#compressState");
+  if (bar) {
+    bar.classList.remove("hidden");
+    bar.querySelector("i").style.width = Math.max(0, Math.min(100, percent || 0)) + "%";
+  }
+  if (state) state.textContent = text || "";
+}
+
+function hideCompressBar() {
+  const bar = $("#compressBar");
+  if (bar) { bar.classList.add("hidden"); bar.querySelector("i").style.width = "0%"; }
+}
+
+function stopCompressPoll() {
+  if (_compressPoll) { clearInterval(_compressPoll); _compressPoll = null; }
+}
+
+/** 轮询压缩进度；跑完自动收尾（刷新预览 + 会议列表，让「已压缩」标记出现）。 */
+function startCompressPoll() {
+  stopCompressPoll();
+  const tick = async () => {
+    let st = null;
+    try { st = await api("/api/meetings/compress/status"); } catch (e) { return; }
+    const p = (st && st.progress) || {};
+    if (st && st.running) {
+      setCompressBar(p.percent || 0, p.detail || p.phase || "压缩中…");
+      return;
+    }
+    // 跑完：显示汇总，刷列表（「已压缩」标记就来自列表接口）
+    stopCompressPoll();
+    _compressBusy = false;
+    const last = (st && st.last) || null;
+    setCompressBar(100, (last && last.message) || "压缩完成");
+    const btn = $("#btnCompressStart");
+    if (btn) btn.disabled = false;
+    toast((last && last.message) || "压缩完成", 6000);
+    await loadMeetings();
+    await loadCompressPreview();
+    setTimeout(hideCompressBar, 4000);
+  };
+  _compressPoll = setInterval(tick, 1500);
+  tick();
+}
+
+async function runCompress() {
+  if (_compressBusy) return;
+  const p = _compressPreview;
+  const keep = p && p.keepRawAudio;
+  const lines = p && p.count
+    ? [`可压缩 ${p.count} 场；原 ${p.beforeText} → 约 ${p.estimateText}。`,
+       keep ? "当前设置「保留原始音频」为开：**只压缩、不删原件**（不会真正腾出空间）。"
+            : "压缩后会删除原始 WAV（读回校验通过才删）。",
+       "压缩过程中请勿关闭 ECHO。"]
+    : ["没有可压缩的会议。"];
+  if (!p || !p.count) { toast("没有可压缩的会议"); return; }
+  if (!(await confirmDialog(lines.join("\n"), { okText: "开始压缩" }))) return;
+  _compressBusy = true;
+  const btn = $("#btnCompressStart");
+  if (btn) btn.disabled = true;
+  try {
+    const r = await post("/api/meetings/compress", {});
+    toast(r.message);
+    if (!r.ok) { _compressBusy = false; if (btn) btn.disabled = false; return; }
+    setCompressBar(0, "已开始…");
+    startCompressPoll();
+  } catch (e) {
+    _compressBusy = false;
+    if (btn) btn.disabled = false;
+    toast("压缩失败：" + e.message);
+  }
+}
+
+if ($("#btnCompressToggle")) {
+  /** 展开/收起压缩面板；展开时**总是重算一遍**（数字必须是最新的）。
+   *
+   * `urlFlag` 为真时允许 `?compress=1` 直接展开 —— 与 `?view=` 同一套写法，
+   * 用来做无头截图与"把入口链接发给别人"。 */
+  async function openCompressBox() {
+    const box = $("#compressBox");
+    if (!box) return;
+    box.classList.remove("hidden");
+    const host = $("#compressPreview");
+    if (host) host.textContent = "正在计算…";
+    await loadCompressPreview();
+  }
+  $("#btnCompressToggle").addEventListener("click", async (e) => {
+    e.currentTarget.blur();
+    const box = $("#compressBox");
+    if (!box) return;
+    box.classList.toggle("hidden");
+    if (box.classList.contains("hidden")) { stopCompressPoll(); return; }
+    await openCompressBox();
+  });
+  $("#btnCompressStart").addEventListener("click", (e) => { e.currentTarget.blur(); runCompress(); });
+  $("#btnCompressCancel").addEventListener("click", (e) => {
+    e.currentTarget.blur();
+    if (_compressBusy) { toast("正在压缩，请等它结束（压缩是后台任务，随时可以看进度）"); return; }
+    hideCompressBar();
+    $("#compressBox").classList.add("hidden");
+  });
+  // 两件**打开就要接上**的事（刷新页面 / 从别处跳过来）：
+  //   ① 已经有一个压缩任务在跑 → 进度条自己接上；
+  //   ② URL 带 `?compress=1` → 直接展开（无头截图与分享链接都用它）。
+  const _autoOpen = /(?:^|[?&])compress=1(?:&|$)/.test(location.search);
+  api("/api/meetings/compress/status").then((st) => {
+    const running = !!(st && st.running);
+    if (running) _compressBusy = true;
+    if (running || _autoOpen) {
+      $("#compressBox").classList.remove("hidden");
+      if (running) startCompressPoll();
+      else loadCompressPreview();
+    }
+  }).catch(() => {
+    if (_autoOpen) openCompressBox();
+  });
+}
+
+/* ================= 导入录音（成为一场会议）=================
+   后端：`POST /api/meetings/import`（multipart，字段 files[] / title / start / notes）。
+   这一块只做三件事：
+     ① 选文件 —— **可多选，列表里显示顺序**（顺序就是分段顺序，所以顺序要能改）；
+     ② 上传 —— 用 XHR，因为只有 XHR 才有上传进度（fetch 没有 upload 进度事件）；
+     ③ 导入成功后**什么都不用新造** —— 会议列表的 `pollTranscribe` 会自己把这个 id
+        的转写进度画出来（后端导入时就把状态切成 `transcribing` 了）。 */
+let _importPicked = [];        // 已选文件（**顺序即分段顺序**）
+let _importBusy = false;
+
+function fmtSize(n) {
+  const b = Number(n) || 0;
+  if (b >= 1024 * 1024) return (b / 1024 / 1024).toFixed(1) + " MB";
+  if (b >= 1024) return Math.round(b / 1024) + " KB";
+  return b + " B";
+}
+
+function renderImportPicked() {
+  const host = $("#importPicked");
+  if (!host) return;
+  host.innerHTML = _importPicked.map((f, i) => `
+    <div class="ip-item" data-i="${i}">
+      <span class="ip-idx">${i + 1}.</span>
+      <span class="ip-name" title="${esc(f.name)}">${esc(f.name)}</span>
+      <span class="ip-size">${fmtSize(f.size)}</span>
+      <button class="btn" data-act="up" title="上移一段"${i === 0 ? " disabled" : ""}>↑</button>
+      <button class="btn" data-act="down" title="下移一段"${i === _importPicked.length - 1 ? " disabled" : ""}>↓</button>
+      <button class="btn danger" data-act="del" title="从列表里去掉">移除</button>
+    </div>`).join("");
+  $$("#importPicked .ip-item").forEach((row) => {
+    row.addEventListener("click", (e) => {
+      const btn = e.target.closest("button");
+      if (!btn || btn.disabled) return;
+      const i = parseInt(row.dataset.i, 10);
+      const act = btn.dataset.act;
+      if (act === "del") _importPicked.splice(i, 1);
+      if (act === "up" && i > 0) {
+        [_importPicked[i - 1], _importPicked[i]] = [_importPicked[i], _importPicked[i - 1]];
+      }
+      if (act === "down" && i < _importPicked.length - 1) {
+        [_importPicked[i + 1], _importPicked[i]] = [_importPicked[i], _importPicked[i + 1]];
+      }
+      renderImportPicked();
+    });
+  });
+  const start = $("#btnImportStart");
+  if (start) start.disabled = _importBusy || !_importPicked.length;
+  const state = $("#importState");
+  if (state && !_importBusy) {
+    state.textContent = _importPicked.length
+      ? `已选 ${_importPicked.length} 个文件，将按上面的顺序变成第 1..${_importPicked.length} 段`
+      : "";
+  }
+}
+
+/** 上传进度条：复用会议卡片那条 `.tx-bar`（不新造进度 UI）。 */
+function setImportBar(percent, text) {
+  const bar = $("#importBar");
+  const state = $("#importState");
+  if (bar) {
+    bar.classList.remove("hidden");
+    bar.querySelector("i").style.width = Math.max(0, Math.min(100, percent)) + "%";
+  }
+  if (state) state.textContent = text || "";
+}
+
+function hideImportBar() {
+  const bar = $("#importBar");
+  if (bar) { bar.classList.add("hidden"); bar.querySelector("i").style.width = "0%"; }
+}
+
+/** 把失败原因**原样**显示出来：后端给的是给人看的一句话（接口 400 的 `detail`）。 */
+function importErrorText(xhr) {
+  let detail = "";
+  try { detail = (JSON.parse(xhr.responseText) || {}).detail || ""; } catch (e) { detail = ""; }
+  if (!detail) detail = (xhr.responseText || "").trim().slice(0, 300);
+  if (!detail) detail = `HTTP ${xhr.status}`;
+  return detail;
+}
+
+function runImport() {
+  if (_importBusy) return Promise.resolve();
+  if (!_importPicked.length) { toast("请先选择录音文件"); return Promise.resolve(); }
+  _importBusy = true;
+  const start = $("#btnImportStart");
+  if (start) start.disabled = true;
+  setImportBar(0, "准备上传…");
+
+  const fd = new FormData();
+  // **顺序就是分段顺序**：FormData 的 append 顺序 = 后端收到的顺序
+  _importPicked.forEach((f) => fd.append("files", f, f.name));
+  const title = ($("#importTitle") || {}).value || "";
+  const startAt = ($("#importStart") || {}).value || "";
+  const notes = ($("#importNotes") || {}).value || "";
+  if (title.trim()) fd.append("title", title.trim());
+  if (startAt.trim()) fd.append("start", startAt.trim());
+  if (notes.trim()) fd.append("notes", notes.trim());
+
+  return new Promise((resolve) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", "/api/meetings/import");
+    xhr.upload.onprogress = (ev) => {
+      if (!ev.lengthComputable) { setImportBar(5, "正在上传…"); return; }
+      const pct = Math.round(ev.loaded / ev.total * 100);
+      setImportBar(pct, `正在上传 ${pct}%（${fmtSize(ev.loaded)} / ${fmtSize(ev.total)}）`);
+    };
+    xhr.upload.onload = () => setImportBar(100, "上传完成，正在解码/转成 16 kHz 单声道…");
+    xhr.onerror = () => {
+      _importBusy = false;
+      hideImportBar();
+      if (start) start.disabled = false;
+      toast("导入失败：网络中断（ECHO 可能正在重启）", 6000);
+      resolve();
+    };
+    xhr.onload = () => {
+      _importBusy = false;
+      if (start) start.disabled = false;
+      let body = {};
+      try { body = JSON.parse(xhr.responseText) || {}; } catch (e) { body = {}; }
+      if (xhr.status !== 200 || body.ok === false) {
+        // **显示后端给的真原因**（本项目硬规矩：界面不许自己编原因）
+        const why = importErrorText(xhr);
+        setImportBar(0, "导入失败：" + why);
+        toast("导入失败：" + why, 9000);
+        resolve();
+        return;
+      }
+      hideImportBar();
+      _importPicked = [];
+      const files = $("#importFiles");
+      if (files) files.value = "";
+      renderImportPicked();
+      const st = $("#importState");
+      if (st) st.textContent = body.message || "已导入，正在转写";
+      toast(body.message || "已导入，正在转写", 5000);
+      // 导入后**自动进入既有转写进度显示**：`pollTranscribe` 每 2 秒拉一次
+      // `/api/transcribe/status` + `/api/meetings`，这一场已经是 `transcribing`，
+      // 进度条会自己出现（不新造一套进度 UI）。
+      loadMeetings();
+      resolve();
+    };
+    xhr.send(fd);
+  });
+}
+
+if ($("#btnImportToggle")) {
+  $("#btnImportToggle").addEventListener("click", (e) => {
+    e.currentTarget.blur();
+    const box = $("#importBox");
+    if (!box) return;
+    box.classList.toggle("hidden");
+    if (!box.classList.contains("hidden")) {
+      const hint = $("#importHint");
+      if (hint) hint.textContent = "可多选，顺序即分段顺序";
+      renderImportPicked();
+    }
+  });
+  $("#importFiles").addEventListener("change", (e) => {
+    // 追加而不是替换：用户可能分几次选（第一次挑手机录的、第二次挑会议室的）
+    const add = [...(e.target.files || [])];
+    const seen = new Set(_importPicked.map((f) => f.name + ":" + f.size + ":" + f.lastModified));
+    add.forEach((f) => {
+      const key = f.name + ":" + f.size + ":" + f.lastModified;
+      if (!seen.has(key)) { _importPicked.push(f); seen.add(key); }
+    });
+    e.target.value = "";       // 清掉 input 的值：再选同一批文件也要能触发 change
+    renderImportPicked();
+  });
+  $("#btnImportStart").addEventListener("click", (e) => { e.currentTarget.blur(); runImport(); });
+  $("#btnImportCancel").addEventListener("click", (e) => {
+    e.currentTarget.blur();
+    if (_importBusy) { toast("正在导入，请等它结束（上传中取消会留下半场会）"); return; }
+    _importPicked = [];
+    const files = $("#importFiles");
+    if (files) files.value = "";
+    renderImportPicked();
+    hideImportBar();
+    $("#importBox").classList.add("hidden");
+  });
+}
 
 /* ================= 启动状态（常规页；只讲"这台机器自己的运行态"）=================
    2026-09-25 整合（用户："常规里面的启动状态，语音转写里面的可装模型那个区域内容比较重叠，

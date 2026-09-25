@@ -357,8 +357,69 @@
     <div class="card">
       <div class="card-title">会议列表
         <span class="spacer"></span>
+        <button class="btn" id="btnCompressToggle"
+                title="把历史会议的音频无损压成 FLAC：省约一半磁盘，转写文本逐字不变">压缩音频</button>
+        <button class="btn" id="btnImportToggle" title="把已有的录音（wav/flac/mp3/ogg）导入成一场会议">导入录音</button>
         <button class="btn" id="btnMeetingFromList">开始录音</button>
         <button class="btn danger" id="btnCleanShort" title="删除 2 分钟以内的会议录音（含音频）">清理短录音</button>
+      </div>
+      <!-- 历史音频无损压缩（FLAC）：入口在标题栏，展开后**先算给你看**
+           （可压缩 N 场 / 能省 X）→ 用户确认 → 才动手；进度复用上面的 tx-bar。 -->
+      <div id="compressBox" class="import-box hidden">
+        <div class="compress-row">
+          <span class="cr-label">能省多少</span>
+          <span id="compressPreview">正在计算…</span>
+        </div>
+        <div class="compress-note" id="compressNote"></div>
+        <div id="compressPicked" class="import-picked"></div>
+        <div class="import-actions">
+          <button class="btn primary" id="btnCompressStart" disabled>开始压缩</button>
+          <button class="btn" id="btnCompressCancel">取消</button>
+          <span class="muted" id="compressState"></span>
+        </div>
+        <div id="compressBar" class="tx-bar hidden"><i style="width:0%"></i></div>
+        <div class="muted" style="font-size:12px;margin-top:6px">
+          无损压缩（FLAC）：转写文本逐字不变，音频一个样本都不丢。
+          压缩后会读回比对（时长 + 逐样本），任何一项不过就保留原件并报错。
+          正在录音 / 正在转写的会议一律跳过；已经是 FLAC 的不会重复压。
+        </div>
+      </div>
+      <!-- 导入录音：文件（可多选，顺序即分段顺序）+ 可选标题，点「开始导入」上传。
+           上传进度与导入后的转写进度都走上面那条 tx-bar（与会议卡片同一套视觉，
+           不新造控件）。格式范围按**本机实测**写：见 app/audio/importer.py。 -->
+      <div id="importBox" class="import-box hidden">
+        <div class="set-row">
+          <label for="importFiles">录音文件</label>
+          <input class="ctl" type="file" id="importFiles" multiple
+                 accept=".wav,.flac,.mp3,.ogg,audio/wav,audio/flac,audio/mpeg,audio/ogg">
+          <div class="desc" id="importHint">可多选，顺序即分段顺序</div>
+        </div>
+        <div class="set-row">
+          <label for="importTitle">标题</label>
+          <input class="ctl" type="text" id="importTitle" placeholder="可留空，默认用时间" maxlength="200">
+          <div class="desc">留空则显示导入时间</div>
+        </div>
+        <div class="set-row">
+          <label for="importStart">会议时间</label>
+          <input class="ctl" type="text" id="importStart" placeholder="如 2026-09-20 10:48（可留空）">
+          <div class="desc">只影响会议名与显示的时间</div>
+        </div>
+        <div class="set-row">
+          <label for="importNotes">备注</label>
+          <input class="ctl" type="text" id="importNotes" placeholder="可留空" maxlength="2000">
+          <div class="desc">写进这场会议的备注</div>
+        </div>
+        <div id="importPicked" class="import-picked"></div>
+        <div class="import-actions">
+          <button class="btn primary" id="btnImportStart" disabled>开始导入</button>
+          <button class="btn" id="btnImportCancel">取消</button>
+          <span class="muted" id="importState"></span>
+        </div>
+        <div id="importBar" class="tx-bar hidden"><i style="width:0%"></i></div>
+        <div class="muted" style="font-size:12px;margin-top:6px">
+          可导入 wav / flac / mp3 / ogg（本机直接读）。m4a、aac 需要先用 ffmpeg 转成 wav 或 mp3，
+          导入时会把这一步告诉你。
+        </div>
       </div>
       <div id="meetingList" class="meeting-list"></div>
     </div>

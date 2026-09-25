@@ -23,6 +23,11 @@ from app.config import settings
 from app.dsh import get_client
 from app import paths, worklog
 from app.audio.recorder import MeetingRecorder, resolve_input_device
+# 音频段的**归档格式与用时解码**（2026-09-26：历史音频无损压成 FLAC）。
+# 为什么单独一个模块：sherpa 只认 RIFF/WAV，所以"读到 flac 就先解成临时 wav
+# 再交给既有代码"这件事必须**引擎无关**地只写一份（不要指望各引擎自己认 FLAC）。
+# 也刻意不去动 `app/audio/stt.py`（另一个任务在改它）。
+from app.audio import audiofile
 from app.audio import stt as stt_mod
 from app.audio import tts as tts_mod
 # 拼装层（设计 §4.4）：把各后端给回的东西统一成"逐句 + 时间"，并且**只在这一处**实现。
@@ -81,6 +86,415 @@ _state = {
 # 会同时通过 active 检查，造成重复转写 + 重复纪要（日志里出现过两次“停止录音”同秒）。
 _state_lock = threading.RLock()
 _retranscribing = {"set": set(), "lock": threading.Lock()}
+
+# ---------------------------------------------------------------- 音频压缩
+# 历史会议的音频段（`01.wav`…）**无损**压成 FLAC（`01.flac`，省约一半磁盘）。
+# 详见 `app/audio/audiofile.py` 的模块注释，以及本文件 `compress_meetings()`。
+#
+# 进度单独一份（**不塞进 `_transcribe_progress`**）：用户在看"转写中"的进度条时
+# 压缩不该把它顶掉，反过来也一样。面板用 `GET /api/meetings/compress/status` 取它。
+_compress = {
+    "active": False,
+    "lock": threading.Lock(),
+    "progress": {"running": False, "phase": "", "done": 0, "total": 0, "percent": 0,
+                 "current": "", "updated_at": 0.0},
+    "last": None,        # 最近一次的结果汇总（面板压缩完要显示它）
+}
+
+
+def _set_compress_progress(**kw):
+    with _compress["lock"]:
+        _compress["progress"].update(kw)
+        _compress["progress"]["updated_at"] = time.time()
+
+
+def compress_progress():
+    """压缩进度（面板轮询）。`last` = 最近一次完成的汇总（可能为空）。"""
+    with _compress["lock"]:
+        out = dict(_compress["progress"])
+        out["last"] = dict(_compress["last"]) if _compress["last"] else None
+        return out
+
+
+def compression_state(meeting_name):
+    """一场会议在"要不要压/能不能压"上的状态（`(kind, why)`，kind 空 = 可以压）。
+
+    三条硬约束各自对应一支，判据只写这一份（预览与执行共用，所以"看到的能压"
+    与"真的去压"不可能对不上）：
+
+      * `"recording"` —— 正在录音的那一场**一律跳过**（不许动正在写的文件）；
+      * `"transcribing"` —— 转写中的那一场也跳过（引擎正在读这些文件）；
+      * `"retranscribing"` —— 面板刚点过「重新转写」，同一条纪律（进程内标记）。
+
+    注意这里**不判** `meetingKeepRawAudio`：那个设置管的是"删不删原件"，
+    不管"压不压"（压缩本身在任何情况下都是无损的，见 `compress_meetings`）。
+    """
+    name = str(meeting_name or "")
+    if not name:
+        return "missing", "没有会议名"
+    with _state_lock:
+        if _state["active"] and os.path.basename(_state["folder"] or "") == name:
+            return "recording", "正在录音"
+    with _retranscribing["lock"]:
+        if name in _retranscribing["set"]:
+            return "retranscribing", "正在重新转写"
+    try:
+        m = db.get_meeting_by_name(name)
+    except Exception:
+        m = None
+    if m and (m.get("status") or "") in ("transcribing",):
+        return "transcribing", "正在转写"
+    return "", ""
+
+
+def _compression_summary(meta):
+    """从 `meta.json` 里取这场会的压缩记录（没有 = None）。"""
+    comp = meta.get("compression") if isinstance(meta, dict) else None
+    return comp if isinstance(comp, dict) else None
+
+
+def compression_info(meeting_name):
+    """给面板/接口用的"这一场压过了吗"（没有记录返回 None）。
+
+    形状（列表与详情共用同一份，面板只读它）：
+        {beforeBytes, afterBytes, savedPercent, deletedRaw, at, segments, keptRaw}
+    """
+    meta = meeting_meta(meeting_name)
+    comp = _compression_summary(meta)
+    if not comp:
+        return None
+    try:
+        before = int(comp.get("beforeBytes") or 0)
+        after = int(comp.get("afterBytes") or 0)
+    except (TypeError, ValueError):
+        return None
+    if not before and not after:
+        return None
+    return {
+        "beforeBytes": before,
+        "afterBytes": after,
+        "savedPercent": int(comp.get("savedPercent")
+                            if comp.get("savedPercent") is not None
+                            else audiofile.saving_percent(before, after)),
+        "deletedRaw": bool(comp.get("deletedRaw")),
+        "keptRaw": bool(comp.get("keptRaw")),
+        "at": comp.get("at") or "",
+        "segments": int(comp.get("segments") or 0),
+        "beforeText": audiofile.human_size(before),
+        "afterText": audiofile.human_size(after),
+        "savedText": audiofile.human_size(max(before - after, 0)),
+    }
+
+
+def compression_preview(limit=500, items=None):
+    """「先算给你看」：可压缩 N 场 / 能省 X（**纯读，不写一个字节**）。
+
+    返回的字段就是面板要显示的那几个，另外带上逐场的 `meetings`（详情可展开）。
+    `deletedRaw`/`keptRaw` 由 `meetingKeepRawAudio` 决定 —— 用户勾了"保留原始音频"
+    时我们**只压不删**，所以"省下多少"是 0，但"能少占多少"仍然报出来
+    （面板上必须分得清这两件事，否则用户会以为压缩骗了他）。
+
+    `items` 可显式传 `[(name, folder, skipKind, skipWhy, title), …]`（用例用；
+    也方便日后接"只算选中的那几场"）。默认取库里的会议。
+    """
+    keep_raw = bool(settings.get("meetingKeepRawAudio", True))
+    if items is None:
+        items = []
+        for m in db.list_meetings(limit=max(1, min(int(limit or 500), 2000))):
+            name = m["name"]
+            kind, why = compression_state(name)
+            items.append((name, os.path.join(meetings_dir(), name), kind, why,
+                          m.get("title") or name))
+    scan = audiofile.scan_meetings([(n, f) for n, f, _k, _w, _t in items],
+                                   keep_raw=keep_raw)
+    by_name = {e["name"]: e for e in scan["meetings"]}
+    out_items = []
+    for name, folder, kind, why, title in items:
+        entry = by_name.get(name) or {"name": name}
+        entry["title"] = title
+        entry["skippedReason"] = why
+        entry["skipKind"] = kind
+        if kind and entry.get("compressible"):
+            # 正在用的那一场不参与统计（否则"可压缩 N 场"会把一场点了没反应的算进去）
+            scan["count"] -= 1
+            scan["beforeBytes"] -= entry.get("beforeBytes") or 0
+            scan["estimateBytes"] -= entry.get("estimateBytes") or 0
+            entry["compressible"] = 0
+            entry["beforeBytes"] = 0
+            entry["estimateBytes"] = 0
+        out_items.append(entry)
+    out = {
+        "meetings": out_items,
+        "count": max(scan["count"], 0),
+        "beforeBytes": max(scan["beforeBytes"], 0),
+        "estimateBytes": max(scan["estimateBytes"], 0),
+        "alreadyMeetings": scan["alreadyMeetings"],
+        "alreadyBytes": scan["alreadyBytes"],
+        "keepRawAudio": keep_raw,
+        # 勾了"保留原始音频" = **永不自动删原件** → 省下的字节就是 0（压了也不省）
+        "reclaimBytes": 0 if keep_raw else max(scan["beforeBytes"] - scan["estimateBytes"], 0),
+        "busy": bool(_compress["active"]),
+        "note": ("已开启「保留原始音频」：本次只压缩、不删原件 —— 音频确实变小了，"
+                 "但不会真正腾出空间（腾空间请先到 设置 → 会议 取消勾选）"
+                 if keep_raw else "压缩后会删除原始 WAV（读回校验通过才删）"),
+    }
+    out["beforeText"] = audiofile.human_size(out["beforeBytes"])
+    out["estimateText"] = audiofile.human_size(out["estimateBytes"])
+    out["reclaimText"] = audiofile.human_size(out["reclaimBytes"])
+    out["alreadyText"] = audiofile.human_size(out["alreadyBytes"])
+    return out
+
+
+def compress_meetings(limit=500):
+    """用户确认之后**真的动手**：后台线程逐场压缩（面板轮询进度）。
+
+    返回 `(ok, message)`；已有任务在跑时不重复起第二个。
+
+    ## 这一场到底压不压（`meetingKeepRawAudio` 的语义）
+
+    用户那句设置的原文是「保留原始音频 —— 删除会议时是否同时删除音频」，即
+    **"不自动删原件"**。所以：
+
+      * 勾着（默认 True）→ **照压**（压缩是无损的，压了不吃亏），但**不删原件**，
+        日志与 `meta.json` 里如实写 `keptRaw: true`，面板显示"已压缩（保留原件）"；
+      * 没勾 → 压完**校验通过才删原件**，真正腾出空间。
+
+    为什么不是"勾着就整场跳过"：那样默认设置下这个功能对所有人都不生效，
+    用户问的是"能不能省空间"，而被"保留原始音频"这四个字拦在门外 —— 那不是它的意思。
+    """
+    keep_raw = bool(settings.get("meetingKeepRawAudio", True))
+    with _compress["lock"]:
+        if _compress["active"]:
+            return False, "压缩任务已在进行中"
+        _compress["active"] = True
+    _set_compress_progress(running=True, phase="准备", done=0, total=0, percent=0,
+                           current="")
+    threading.Thread(target=_compress_worker, args=(int(limit or 500), keep_raw),
+                     daemon=True).start()
+    return True, ("已开始压缩（%s）" % ("保留原件，只压缩" if keep_raw else "校验通过后删除原件"))
+
+
+def _compress_worker(limit, keep_raw):
+    """后台压缩：逐场、逐段压缩；每场一个汇总写回 `meta.json` 与日志。"""
+    started = time.time()
+    summary = {"ok": True, "keepRaw": keep_raw, "meetings": [], "compressed": 0,
+               "skipped": 0, "failed": 0, "beforeBytes": 0, "afterBytes": 0,
+               "savedBytes": 0, "deletedSegments": 0, "message": ""}
+    try:
+        items = []
+        for m in db.list_meetings(limit=max(1, min(int(limit or 500), 2000))):
+            name = m["name"]
+            kind, why = compression_state(name)
+            items.append((name, os.path.join(meetings_dir(), name), kind, why))
+        todo = [it for it in items if not it[2]]
+        summary["skipped"] = len(items) - len(todo)
+        _set_compress_progress(phase="压缩音频", total=len(todo), done=0, percent=0)
+        for pos, (name, folder, _kind, _why) in enumerate(todo, start=1):
+            _set_compress_progress(current=name, done=pos - 1,
+                                   percent=round((pos - 1) / max(len(todo), 1) * 100),
+                                   detail="第 %d/%d 场 · %s" % (pos, len(todo), name))
+            try:
+                res = _compress_one_meeting(name, folder, keep_raw)
+            except Exception as e:                       # 单场炸了不该毁掉整批
+                res = {"name": name, "ok": False, "reason": "%s: %s" % (type(e).__name__, e)}
+                db.add_log("error", "meeting", "压缩 %s 失败：%s" % (name, res["reason"]))
+            summary["meetings"].append(res)
+            # 计数按**段**而不是按场：部分失败时"压好了几段"是真事实，
+            # 不能因为另一段坏了就把它从汇总里抹掉（面板与日志都要看得见）。
+            if res.get("ok"):
+                summary["compressed"] += 1
+            if res.get("segments") or res.get("deletedSegments"):
+                summary["beforeBytes"] += res.get("beforeBytes") or 0
+                summary["afterBytes"] += res.get("afterBytes") or 0
+                summary["savedBytes"] += res.get("savedBytes") or 0
+                summary["deletedSegments"] += res.get("deletedSegments") or 0
+            if not res.get("ok"):
+                summary["failed"] += 1
+            _set_compress_progress(done=pos, percent=round(pos / max(len(todo), 1) * 100))
+        summary["seconds"] = round(time.time() - started, 1)
+        summary["beforeText"] = audiofile.human_size(summary["beforeBytes"])
+        summary["afterText"] = audiofile.human_size(summary["afterBytes"])
+        summary["savedText"] = audiofile.human_size(summary["savedBytes"])
+        summary["message"] = _compress_summary_text(summary)
+        db.add_log("info", "meeting", "音频压缩完成：" + summary["message"])
+    except Exception as e:
+        import traceback
+        summary["ok"] = False
+        summary["message"] = "压缩任务异常：%s: %s" % (type(e).__name__, e)
+        db.add_log("error", "meeting",
+                   summary["message"] + "\n" + traceback.format_exc()[:1200])
+    finally:
+        with _compress["lock"]:
+            _compress["active"] = False
+            _compress["last"] = summary
+        _set_compress_progress(running=False, phase="完成", percent=100, current="")
+
+
+def _compress_summary_text(summary):
+    """整批的一句话汇总（面板 toast 与日志共用同一句，不许两处各编一套）。"""
+    parts = []
+    if summary.get("compressed"):
+        parts.append("已压缩 %d 场：%s → %s（省 %s）"
+                     % (summary["compressed"], summary.get("beforeText") or "0 B",
+                        summary.get("afterText") or "0 B",
+                        summary.get("savedText") or "0 B"))
+    if summary.get("deletedSegments"):
+        parts.append("删除原件 %d 段" % summary["deletedSegments"])
+    elif summary.get("compressed") and summary.get("keepRaw"):
+        parts.append("按「保留原始音频」设置未删原件")
+    if summary.get("failed"):
+        parts.append("失败 %d 场（原件已保留，详见日志）" % summary["failed"])
+    if summary.get("skipped"):
+        parts.append("跳过 %d 场（录音中/转写中）" % summary["skipped"])
+    return "；".join(parts) or "没有需要压缩的会议"
+
+
+def _compress_one_meeting(name, folder, keep_raw):
+    """压一场会。**任何失败都保留原件**，并把具体原因返回给调用方。
+
+    返回字段：`name/ok/beforeBytes/afterBytes/savedBytes/deletedSegments/segments/
+    failures/reason/keptRaw/seconds`。
+
+    写回 `meta.json` 的 `compression` 块是**面板"已压缩：原 149 MB → 现 76 MB（省 49%）"
+    的唯一数据来源** —— 不重新估算，只报真实字节。
+    """
+    t0 = time.time()
+    out = {"name": name, "ok": False, "beforeBytes": 0, "afterBytes": 0,
+           "savedBytes": 0, "deletedSegments": 0, "segments": [], "failures": [],
+           "keptRaw": bool(keep_raw), "reason": "", "seconds": 0.0}
+    if not os.path.isdir(folder):
+        out["reason"] = "会议目录不存在"
+        return out
+    # **正在用的那一场一律跳过**（录音中 / 转写中 / 刚点过重新转写）。
+    # 判据在这里**再判一次**，不只依赖 `_compress_worker` 的过滤：这个函数是
+    # "动文件"的最后一道闸，任何调用方（含日后新加的入口、或用例直接调它）
+    # 都不该能绕过去动一个正在写的文件。
+    kind, why = compression_state(name)
+    if kind:
+        out["ok"] = True
+        out["reason"] = "跳过：%s（%s）" % (why, kind)
+        return out
+    plan = audiofile.plan_for_meeting(folder)
+    if plan["error"]:
+        out["reason"] = plan["error"]
+        return out
+    if not plan["compressible"]:
+        # 没有任何**可压**的段：可能是"已经压过了"（幂等：不重复压、不报错），
+        # 也可能是"全坏了"。两者必须分开报 —— 把"全坏了"也说成"没问题"，
+        # 用户永远不会知道盘上有段音频是截断的。
+        out["ok"] = not plan["broken"]
+        if plan["broken"]:
+            out["reason"] = "；".join("%s %s" % (f, r) for f, r in plan["broken"][:3])
+        else:
+            out["reason"] = "已经是压缩状态，无需处理"
+        info = compression_info(name)
+        if info:
+            out["beforeBytes"] = info["beforeBytes"]
+            out["afterBytes"] = info["afterBytes"]
+        return out
+
+    for path in plan["compressible"]:
+        res = audiofile.compress_segment(path, keep_raw=keep_raw)
+        seg_name = os.path.basename(path)
+        if not res["ok"]:
+            # **任何一步不过 → 保留原件 + 明确报错**（`compress_segment` 已经保证
+            # 原件还在：它只在写出 flac 且逐样本校验通过之后才删 wav）。
+            out["failures"].append({"file": seg_name, "reason": res["reason"]})
+            db.add_log("error", "meeting",
+                       "%s %s 压缩失败，**原件已保留**：%s" % (name, seg_name, res["reason"]))
+            continue
+        out["beforeBytes"] += res["before"] or 0
+        out["afterBytes"] += res["after"] or 0
+        if res["deleted"]:
+            out["deletedSegments"] += 1
+        if res.get("verified") == "existing":
+            continue
+        out["segments"].append({
+            "file": seg_name,
+            "flac": os.path.basename(res["flac"]),
+            "before": res["before"], "after": res["after"],
+            "percent": audiofile.saving_percent(res["before"], res["after"]),
+            "verified": res.get("verified") or "",
+            "deleted": bool(res["deleted"]),
+        })
+        # 逐段留痕：压了什么、省了多少、验证结果、有没有删原件 —— 四件事缺一不可。
+        db.add_log("info", "meeting",
+                   "音频压缩 %s/%s → %s：%s → %s（省 %d%%，校验=%s，原件%s）"
+                   % (name, seg_name, out["segments"][-1]["flac"],
+                      audiofile.human_size(res["before"]),
+                      audiofile.human_size(res["after"]),
+                      out["segments"][-1]["percent"],
+                      "逐样本一致" if res.get("verified") == "lossless" else (res.get("verified") or "未校验"),
+                      "已删除" if res["deleted"] else "已保留"))
+
+    out["savedBytes"] = max(out["beforeBytes"] - out["afterBytes"], 0)
+    out["seconds"] = round(time.time() - t0, 1)
+    # 有硬伤、压根没进"可压"清单的段也要算进失败（否则"压了好的 3 段、
+    # 第 4 段是截断的"会报成完全成功）。
+    for fname, reason in plan["broken"]:
+        out["failures"].append({"file": fname, "reason": reason})
+    # `ok` 的语义：**这一场要求的活是不是全都干成了**。
+    # 部分失败（一段坏了、另一段压好）必须是 False —— 面板据此把失败原因显示出来；
+    # 若报 True，用户只会看到"已压缩"，而有一段其实没压（甚至被截断），
+    # 那种"看起来成功了"最难查。
+    out["ok"] = not out["failures"]
+    if out["failures"]:
+        total = len(plan["compressible"]) + len(plan["broken"])
+        head = "%d/%d 段压缩失败（**原件已保留**）" % (len(out["failures"]), total)
+        out["reason"] = "%s：%s" % (
+            head, "；".join("%s %s" % (f["file"], f["reason"]) for f in out["failures"][:3]))
+
+    # 落盘：把真实的压缩前后字节写进 meta.json（**只在真的压了东西时写**，
+    # 否则会把"上一场的记录"改写成空壳）。
+    if out["segments"]:
+        try:
+            meta = _load_json(os.path.join(folder, "meta.json"), {})
+            if not isinstance(meta, dict):
+                meta = {}
+            prev = _compression_summary(meta) or {}
+            before = int(prev.get("beforeBytes") or 0) + out["beforeBytes"]
+            after = int(prev.get("afterBytes") or 0) + out["afterBytes"]
+            # 段列表同步成"盘上真实的段"（wav 已删、flac 已落地）—— `_transcribe_impl`
+            # 优先读 `meta["segments"]`，不改它的话重转会去找那个已经被删掉的 wav。
+            meta["segments"] = ["%02d%s" % (i, audiofile.FLAC_EXT)
+                                if not os.path.isfile(os.path.join(folder, "%02d%s" % (i, audiofile.WAV_EXT)))
+                                else "%02d%s" % (i, audiofile.WAV_EXT)
+                                for i in audiofile.list_segments(folder)]
+            meta["compression"] = {
+                "at": datetime.datetime.now().isoformat(timespec="seconds"),
+                "beforeBytes": before,
+                "afterBytes": after,
+                "savedPercent": audiofile.saving_percent(before, after),
+                "deletedRaw": bool(prev.get("deletedRaw")) or out["deletedSegments"] > 0,
+                "keptRaw": bool(keep_raw),
+                "segments": len(audiofile.list_segments(folder)),
+                "lastRun": {
+                    "at": datetime.datetime.now().isoformat(timespec="seconds"),
+                    "beforeBytes": out["beforeBytes"],
+                    "afterBytes": out["afterBytes"],
+                    "deletedSegments": out["deletedSegments"],
+                    "failures": out["failures"],
+                    "seconds": out["seconds"],
+                },
+            }
+            audiofile.write_meta(folder, meta)
+            info = compression_info(name) or {}
+            out["beforeBytes"] = info.get("beforeBytes", out["beforeBytes"])
+            out["afterBytes"] = info.get("afterBytes", out["afterBytes"])
+            out["totalSaved"] = max(out["beforeBytes"] - out["afterBytes"], 0)
+            db.add_log("info", "meeting",
+                       "%s 音频压缩汇总：原 %s → 现 %s（省 %d%%，删原件 %d 段，%s）"
+                       % (name, info.get("beforeText") or "?",
+                          info.get("afterText") or "?",
+                          info.get("savedPercent") or 0,
+                          out["deletedSegments"],
+                          "保留原件" if keep_raw else "已删原件"))
+        except Exception as e:
+            # 记录写不进去不影响"音频已经压好"这个事实，但必须吼一声（否则面板
+            # 永远显示不出"已压缩"，而用户以为没压成功）。
+            db.add_log("warn", "meeting", "%s 压缩记录写入 meta.json 失败：%s" % (name, e))
+    return out
+
 
 # 转写进度：meeting_id -> {phase, seg_index, seg_total, percent, detail, updated_at}
 _transcribe_progress = {}
@@ -248,11 +662,16 @@ def stop_meeting():
         # 拷进本场目录当 `00.wav`，就应当本次一并转写 —— 用户在电话里就是这么预期的
         # （"拷进去是不是结束后就自动转了"）。只认录音器自己的内存清单时，拷进去的
         # 那段会被**静默忽略**（`_transcribe_impl` 优先用 meta["segments"]，非空就不看目录）。
-        extra = [f for f in os.listdir(folder) if re.match(r"^\d+\.wav$", f)]
-        segs = sorted(set(recorder.segments) | set(extra))
+        extra = [f for f in audiofile.segment_files(folder)
+                 if f.lower().endswith(audiofile.WAV_EXT)]
+        segs = sorted(set(recorder.segments) | set(extra),
+                      key=lambda n: int(str(n).split(".")[0]))
         meta["end"] = datetime.datetime.now().isoformat(timespec="seconds")
         meta["segments"] = segs
-        meta["durationSeconds"] = sum(_wav_seconds(os.path.join(folder, s)) for s in segs)
+        meta["durationSeconds"] = sum(
+            audiofile.audio_seconds(_resolve_seg_paths(folder, [s]).get(s) or
+                                    os.path.join(folder, s))
+            for s in segs)
         with open(meta_path, "w", encoding="utf-8") as f:
             json.dump(meta, f, ensure_ascii=False, indent=2)
         _state["folder"] = None
@@ -299,6 +718,26 @@ def stop_meeting():
 
 # ---------------------------------------------------------------- 转写
 
+def _resolve_seg_paths(folder, segs):
+    """`[段文件名, …]` → `{段文件名: 盘上实际存在的路径}`（找不到的**不放进去**）。
+
+    判据只有一条、而且只写一份：`audiofile.resolve_segment()`（优先 `.wav`、其次 `.flac`）。
+    为什么优先 wav：压缩是"先写 flac → 校验通过 → 删 wav"，两个都在意味着**收尾没完成**，
+    这时以原件为准。播放那一路（`api.meeting_audio`）用的是同一个函数，
+    "转写读的段"与"播放放的段"因此**不可能**不一致。
+    """
+    out = {}
+    for seg in segs:
+        try:
+            idx = int(str(seg).split(".")[0])
+        except (TypeError, ValueError):
+            continue
+        path = audiofile.resolve_segment(folder, idx)
+        if path:
+            out[seg] = path
+    return out
+
+
 def _load_json(path, default):
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -308,12 +747,14 @@ def _load_json(path, default):
 
 
 def _wav_seconds(path):
-    try:
-        import wave
-        with wave.open(path, "rb") as w:
-            return w.getnframes() / float(w.getframerate())
-    except Exception:
-        return 0
+    """任意会议音频段的时长（秒）；读不了返回 0。
+
+    2026-09-26 起不改名、不改契约，但实现换成 `audiofile.audio_seconds()`：
+    段可能是 `.flac`（历史音频无损压缩的产物），而标准库 `wave` **读不了 FLAC** ——
+    继续用 `wave` 会让压缩过的会议在时间轴上退化成"每段 0 秒"（`_seg_duration_map`
+    与导出、`build_segments` 全用它）。名字留着是为了不动那十几处调用点。
+    """
+    return audiofile.audio_seconds(path)
 
 
 def _assign_speakers(seg_rows, turns):
@@ -477,6 +918,43 @@ class MeetingEngineRefused(Exception):
     """
 
 
+def _maybe_auto_compress(folder):
+    """「转写完成后自动压缩」开关（`meetingAutoCompressAudio`，**默认关**）。
+
+    刻意做成**单场、前台**（不借 `compress_meetings()` 的整批后台任务）：
+    这里刚转写完一场，用户要的是"这一场的空间收回来"，而不是顺手把几百场历史
+    会议全压一遍（那会突然吃满 CPU/磁盘，而他没点过任何按钮）。
+    整批那条路留给面板上的显式入口。
+
+    `meetingKeepRawAudio` 在这里同样生效（勾着 = 只压不删）—— 语义只写一份，
+    与 `compress_meetings()` 共用 `_compress_one_meeting()`。
+    """
+    try:
+        if not bool(settings.get("meetingAutoCompressAudio", False)):
+            return
+        name = os.path.basename(folder)
+        kind, why = compression_state(name)
+        if kind:
+            # 转写刚结束、状态还是 transcribing 时也会落到这里 —— 那种情况**不能压**
+            # （`_transcribe_impl` 的 finally 才刚把文件句柄放开），如实说一句就好。
+            db.add_log("debug", "meeting", "自动压缩跳过 %s：%s" % (name, why))
+            return
+        keep_raw = bool(settings.get("meetingKeepRawAudio", True))
+        res = _compress_one_meeting(name, folder, keep_raw)
+        if res.get("ok"):
+            db.add_log("info", "meeting",
+                       "自动压缩 %s：原 %s → 现 %s（%s，耗时 %.1fs）"
+                       % (name, audiofile.human_size(res.get("beforeBytes") or 0),
+                          audiofile.human_size(res.get("afterBytes") or 0),
+                          "保留原件" if keep_raw else "已删原件", res.get("seconds") or 0.0))
+        else:
+            db.add_log("warn", "meeting",
+                       "自动压缩 %s 未完成（原件已保留）：%s" % (name, res.get("reason")))
+    except Exception as e:
+        db.add_log("warn", "meeting", "自动压缩失败（不影响转写结果）：%s: %s"
+                   % (type(e).__name__, e))
+
+
 def _transcribe_meeting(folder):
     """后台转写主入口；任何异常写入日志，不静默丢失。"""
     name = os.path.basename(folder)
@@ -491,6 +969,10 @@ def _transcribe_meeting(folder):
         _boot_note_meeting_key()
         _boot_meeting_stt("online", "转写完成 · 引擎已加载")
         tts_mod.beep_ok()          # 转写完成提示音（叮叮）
+        # 可选：转写完成后自动做无损压缩（设置 `meetingAutoCompressAudio`，**默认关**）。
+        # 放在提示音**之后**、且自己吞掉所有异常：压缩失败绝不能影响"这一场转写完成了"
+        # 这件事，更不能把上一行的状态改回去（用户听到的是"叮叮"，界面必须是成功）。
+        _maybe_auto_compress(folder)
     except MeetingEngineRefused:
         # 引擎驱动不了：原因、日志、组件状态、错误提示音都已经在 `_transcribe_impl`
         # 的守卫里做完了。这里唯一要做的是**别把"转写完成"接上去** ——
@@ -1022,14 +1504,17 @@ def _transcribe_impl(folder):
                                            mcfg.get("autoSummarize", True))),
         "diarize": bool(settings.get("meetingDiarize", mcfg.get("diarize", False))),
     }
-    segs = sorted(meta.get("segments", []) or
-                  [f for f in os.listdir(folder) if re.match(r"^\d+\.wav$", f)])
+    # 段发现：`meta["segments"]` 优先（录音当时的快照，含主人手工拷进来的段），
+    # 兜底走 `audiofile.segment_files()` —— 它**同时认 `.wav` 与 `.flac`**，
+    # 否则"全压成 flac 之后 meta 丢了"的会议会被当成"这场没有音频"（转写直接不开始）。
+    segs = sorted(meta.get("segments", []) or audiofile.segment_files(folder),
+                  key=lambda n: int(str(n).split(".")[0]))
     meeting_name = os.path.basename(folder)
     meeting = db.get_meeting_by_name(meeting_name)
     if not segs:
         # 兜底：没有音频无法转写，状态不能停在 transcribing（会永远卡住）
         if meeting:
-            reason = "这场会没有音频分段，无法转写（录音目录里没有 0*.wav）"
+            reason = "这场会没有音频分段，无法转写（录音目录里没有 0*.wav / 0*.flac）"
             _mark_meeting_error(meeting["id"], reason)
             db.add_log("error", "meeting", f"{reason}：{meeting_name}")
         return
@@ -1043,6 +1528,15 @@ def _transcribe_impl(folder):
     seg_total = len(segs)
     _set_progress(meeting_id, phase="准备模型", seg_index=0, seg_total=seg_total,
                   percent=0, detail=f"共 {seg_total} 段")
+
+    # 段号 → 盘上**实际存在**的音频文件：历史音频压成 FLAC 之后这里给的是 `.flac`。
+    # 为什么一次算好、后面各处都用它：
+    #   * 播放那一路（`api.meeting_audio`）按同一个规则找文件（`audiofile.resolve_segment`）；
+    #   * 分离（`diarize_wav_full`）、能力后端（`wav=seg_path`）拿到的必须**能读**；
+    #   * 时间轴的 `audio_seconds()` 也要认 flac（`_wav_seconds` 已经是它了）。
+    seg_paths = _resolve_seg_paths(folder, segs)
+    segs = sorted(seg_paths, key=lambda n: int(str(n).split(".")[0]))
+    seg_total = len(segs)
 
     db_rows = []
     speaker_names = {}
@@ -1170,172 +1664,182 @@ def _transcribe_impl(folder):
     cap_plan = None
     asr_plan = None        # asr.text 那次调用留下的计划（`diarize.*` 没跑时用它）
     cap_kinds = {}
-    for i, seg in enumerate(segs, start=1):
-        seg_idx = int(seg.split(".")[0])
-        seg_path = os.path.join(folder, seg)
-        percent = round(i / seg_total * 100) if seg_total else 0
-        _set_progress(meeting_id, phase="转写中", seg_index=i, seg_total=seg_total,
-                      percent=percent, detail=f"第 {i}/{seg_total} 段 · {cfg.get('sttModel', '')}")
-        seg_rows = []
-        if asr_provider is not None:
-            # P5：外部/在线转写。没有词级时间戳，所以服务端返回的文本在本段时长内
-            # 按句切分、按字数均摊时间（比"整段一行"更接近本地引擎的输出形状）。
-            try:
-                out = asr_provider.transcribe(seg_path, lang=cfg.get("sttLanguage", "zh"))
-                text = (out.get("text") or "").strip()
-                if text:
-                    seg_rows = [(seg_idx, st, en, txt) for st, en, txt in
-                                _split_provider_text(text, _wav_seconds(seg_path) or seg_min * 60.0)]
-                else:
-                    # 空结果**显式留痕**：区分"这段没人说话"与"provider 出错"（§19 发现③）
-                    why = out.get("reason") or "empty"
-                    db.add_log("warn", "meeting",
-                               f"{meeting_name} 第{i}段转写为空（{why}）——本段不写行")
-            except Exception as e:
-                db.add_log("error", "meeting",
-                           f"{meeting_name} 第{i}段转写失败（provider）：{e}")
-        elif not asr_is_local:
-            # 3.0：文本走能力后端，时间轴由**拼装层**统一决定（设计 §4.4）。
-            try:
-                seg_rows, plan_dict, got = _capability_segment_rows(
-                    cap_session, seg_path, cfg, seg_idx, seg_min, cap_kinds)
-                asr_plan = plan_dict          # 最近一次调用的计划（跳过的项也在这里）
-                if not seg_rows:
-                    # 空结果**显式留痕**（与本地那条路同一个纪律）：
-                    # 区分"这段没人说话"与"后端出了问题"
-                    db.add_log("warn", "meeting",
-                               f"{meeting_name} 第{i}段没有内容"
-                               f"（档位 {got.timestamps}）——本段不写行")
-            except Exception as e:
-                db.add_log("error", "meeting",
-                           f"{meeting_name} 第{i}段能力后端转写失败：{type(e).__name__}: {e}")
-                # **不在段内回落到本地引擎**：一场会议里"前几段走服务端、后几段走本机"
-                # 会让时间轴精度与文本风格前后不一致，而用户看不出来。
-                # 失败就留痕、本段不写行；整场是否重跑由人决定（见 retranscribe_meeting）。
-        elif eng == "sensevoice" or eng == "qwen3asr":
-            # Qwen3-ASR：优先用 ForcedAligner 原生时间戳（自然句子），失败回退 whisper 骨架对齐
-            if eng == "qwen3asr":
-                lang_hint = stt_mod._LANG_MAP.get(str(cfg.get("sttLanguage", "zh")).lower(), None)
-                _full_text, sentences = stt_mod._qwen3asr_sentences(sv, seg_path, lang_hint)
-                if sentences:
-                    seg_rows = [(seg_idx, st, en, txt) for st, en, txt in sentences]
+    # **用时解码（本次功能的关键一步）**：段可能是 `.flac`，而引擎（尤其 sherpa）
+    # 只认 RIFF/WAV —— 这里把整场的 flac 一次解成临时 WAV，交给下面**所有**既有代码
+    # （本机引擎 / provider / 能力后端 / 说话人分离都拿同一个 `seg_path`）；
+    # `with` 退出时临时文件即刻删除（见 `audiofile.decoded_segments`）。
+    # 放在循环外面而不是每段各来一次：`decoded_segments` 只扫一次临时目录、只收集一次
+    # 删除清单；逐段解码会在 N 段上扫 N 次（几十分钟的会议犯不着）。
+    with audiofile.decoded_segments(
+            [(int(str(s).split(".")[0]), seg_paths[s]) for s in segs]) as decoded_items:
+        seg_map = {idx: path for idx, path in decoded_items}
+        for i, seg in enumerate(segs, start=1):
+            seg_idx = int(seg.split(".")[0])
+            # 解出来的临时 WAV（是 wav 的段就是原路径，不复制）
+            seg_path = seg_map.get(seg_idx) or seg_paths[seg]
+            percent = round(i / seg_total * 100) if seg_total else 0
+            _set_progress(meeting_id, phase="转写中", seg_index=i, seg_total=seg_total,
+                          percent=percent, detail=f"第 {i}/{seg_total} 段 · {cfg.get('sttModel', '')}")
+            seg_rows = []
+            if asr_provider is not None:
+                # P5：外部/在线转写。没有词级时间戳，所以服务端返回的文本在本段时长内
+                # 按句切分、按字数均摊时间（比"整段一行"更接近本地引擎的输出形状）。
+                try:
+                    out = asr_provider.transcribe(seg_path, lang=cfg.get("sttLanguage", "zh"))
+                    text = (out.get("text") or "").strip()
+                    if text:
+                        seg_rows = [(seg_idx, st, en, txt) for st, en, txt in
+                                    _split_provider_text(text, _wav_seconds(seg_path) or seg_min * 60.0)]
+                    else:
+                        # 空结果**显式留痕**：区分"这段没人说话"与"provider 出错"（§19 发现③）
+                        why = out.get("reason") or "empty"
+                        db.add_log("warn", "meeting",
+                                   f"{meeting_name} 第{i}段转写为空（{why}）——本段不写行")
+                except Exception as e:
+                    db.add_log("error", "meeting",
+                               f"{meeting_name} 第{i}段转写失败（provider）：{e}")
+            elif not asr_is_local:
+                # 3.0：文本走能力后端，时间轴由**拼装层**统一决定（设计 §4.4）。
+                try:
+                    seg_rows, plan_dict, got = _capability_segment_rows(
+                        cap_session, seg_path, cfg, seg_idx, seg_min, cap_kinds)
+                    asr_plan = plan_dict          # 最近一次调用的计划（跳过的项也在这里）
+                    if not seg_rows:
+                        # 空结果**显式留痕**（与本地那条路同一个纪律）：
+                        # 区分"这段没人说话"与"后端出了问题"
+                        db.add_log("warn", "meeting",
+                                   f"{meeting_name} 第{i}段没有内容"
+                                   f"（档位 {got.timestamps}）——本段不写行")
+                except Exception as e:
+                    db.add_log("error", "meeting",
+                               f"{meeting_name} 第{i}段能力后端转写失败：{type(e).__name__}: {e}")
+                    # **不在段内回落到本地引擎**：一场会议里"前几段走服务端、后几段走本机"
+                    # 会让时间轴精度与文本风格前后不一致，而用户看不出来。
+                    # 失败就留痕、本段不写行；整场是否重跑由人决定（见 retranscribe_meeting）。
+            elif eng == "sensevoice" or eng == "qwen3asr":
+                # Qwen3-ASR：优先用 ForcedAligner 原生时间戳（自然句子），失败回退 whisper 骨架对齐
+                if eng == "qwen3asr":
+                    lang_hint = stt_mod._LANG_MAP.get(str(cfg.get("sttLanguage", "zh")).lower(), None)
+                    _full_text, sentences = stt_mod._qwen3asr_sentences(sv, seg_path, lang_hint)
+                    if sentences:
+                        seg_rows = [(seg_idx, st, en, txt) for st, en, txt in sentences]
+                    else:
+                        seg_rows = _fallback_sv_rows(sv, wmodel, seg_path, seg_idx, seg_min, cfg)
                 else:
                     seg_rows = _fallback_sv_rows(sv, wmodel, seg_path, seg_idx, seg_min, cfg)
-            else:
-                seg_rows = _fallback_sv_rows(sv, wmodel, seg_path, seg_idx, seg_min, cfg)
-            if not seg_rows:
-                # **静默零行是这套流程最贵的失败**：引擎抛异常只 print 到 stderr，
-                # 库里一行不留，事后完全查不出"这场为什么是空的"
-                # （2026-09-21 71 分钟那场就是这样）。
-                db.add_log("warn", "meeting",
-                           f"{meeting_name} 第{i}段没有转出任何文字"
-                           f"（引擎 {eng}；引擎异常详情见 data/logs/echo-server.log.err）")
-        elif eng == "sherpa":
-            seg_rows, sherpa_why = _sherpa_rows(seg_path, seg_idx, seg_min, cfg, cap_kinds)
-            if not seg_rows:
-                # 与上面两条本地路同一个纪律：空结果要留痕，并且把**引擎自己说的原因**
-                # （依赖缺失/模型没就位/接口变了）带出来 —— sherpa 是这个仓库里最容易
-                # "没装好却看起来在跑"的引擎（2026-09-23 实测过一次）。
-                db.add_log("warn", "meeting",
-                           f"{meeting_name} 第{i}段没有转出任何文字（引擎 sherpa）：{sherpa_why}")
-        elif eng == "whisper":
-            try:
-                out, _info = stt_mod.transcribe_whisper(wmodel, seg_path, cfg.get("sttLanguage", "zh"))
-                seg_rows = [(seg_idx, s.start, s.end, s.text.strip()) for s in out]
-            except Exception as e:
-                db.add_log("error", "meeting",
-                           f"{meeting_name} 第{i}段 whisper 转写失败：{type(e).__name__}: {e}")
-                print("转写失败:", e, file=sys.stderr)
-
-        if diarize:
-            _set_progress(meeting_id, phase="说话人分离", seg_index=i, seg_total=seg_total,
-                          percent=percent, detail=f"第 {i}/{seg_total} 段 · 分离说话人")
-            try:
-                # 3.0（step 4）：分离先问能力路由的 `diarize.turns` 槽。
-                # 返回 None 的几种情况都退回**原来那段本机代码**（形状已经归一，见
-                # `_normalize_diarize`）：本场没有这个槽 / 这一槽按计划归本机 /
-                # 这一槽失败 / 本场压根没开会话（`cap_session is None` = 没配后端）。
-                # 失败时那条 warn 已经在 `_capability_diarize_segment` 里写过了 ——
-                # 所以这里**不再重复**报错，只是走本机（最坏情况与今天逐字一致）。
-                turns_raw = embs = labels = None
-                if cap_session is not None:
-                    turns_raw, embs, labels, dia_plan = _capability_diarize_segment(
-                        cap_session, seg_path)
-                    if dia_plan:
-                        cap_plan = dia_plan
-                if turns_raw is None:
-                    from app.audio.diarize import diarize_wav_full
-                    turns_raw, embs, labels = diarize_wav_full(seg_path)
-                label_map = registry.map(embs, labels)
-                key_map = {}
-                for plabel, disp in label_map.items():
-                    num = re.sub(r"\D", "", disp)
-                    key = "S" + num
-                    key_map[plabel] = key
-                    speaker_names[key] = disp
-                turns = [(s, e, key_map[spk]) for s, e, spk in turns_raw]
-                seg_rows = _assign_speakers(seg_rows, turns)
-                # 声纹识别：本段每个说话人找常用联系人，整场累计（取相似度最高的一次）
-                # 注意这里不需要"注册"：`diarize.turns` 那一次调用**同时带回了每个说话人
-                # 的嵌入**（`DiarizeResult.speakers`）—— 声纹用的就是它，与分离同源。
-                if vp_matcher is not None:
-                    try:
-                        from app import voiceprint
-                        for disp, m in voiceprint.identify(embs, labels, label_map,
-                                                           vp_matcher).items():
-                            vp_stats["tried"] += 1
-                            if float(m["sim"]) > vp_stats["best"]:
-                                vp_stats["best"] = float(m["sim"])
-                                vp_stats["best_name"] = m.get("name") or ""
-                            if not m["ok"]:
-                                r = m.get("reason") or "?"
-                                vp_stats["miss"][r] = vp_stats["miss"].get(r, 0) + 1
-                                continue
-                            vp_stats["hit"] += 1
-                            old = vp_names.get(disp)
-                            if old is None:
-                                db.add_log("info", "voiceprint",
-                                           f"{meeting_name} 第{i}段：{disp} → {m['name']}"
-                                           f"（相似度 {m['sim']:.2f}，次优 {m['runner']:.2f}）")
-                            if old is None or m["sim"] > old[1]:
-                                vp_names[disp] = (m["name"], m["sim"])
-                        if vp_names:
-                            # 同人合并 + 把联系人名写进本场显示名（用户手改过的名字
-                            # 由 replace_speakers 的「已有名优先」逻辑保留，不会被顶掉）
-                            vp_merges = voiceprint.duplicate_merges(
-                                {d: v[0] for d, v in vp_names.items()})
-                            for disp, (nm, _sim) in vp_names.items():
-                                tgt = vp_merges.get(disp, disp)
-                                speaker_names["S" + re.sub(r"\D", "", tgt)] = nm
-                    except Exception as e:
-                        db.add_log("warn", "voiceprint", f"声纹识别失败（跳过本段）：{e}")
-            except Exception as e:
-                # 分离不可用不能连累整场转写：形状归一在下面统一做。失败原因也落库
-                # （原来只 print 到 stderr，日志里查不到"为什么这场没有说话人"）。
-                if not diarize_fail:
-                    diarize_fail = f"{type(e).__name__}: {e}"
+                if not seg_rows:
+                    # **静默零行是这套流程最贵的失败**：引擎抛异常只 print 到 stderr，
+                    # 库里一行不留，事后完全查不出"这场为什么是空的"
+                    # （2026-09-21 71 分钟那场就是这样）。
                     db.add_log("warn", "meeting",
-                               f"{meeting_name} 说话人分离不可用，本场不标说话人：{diarize_fail}")
-                print("说话人分离失败:", e, file=sys.stderr)
+                               f"{meeting_name} 第{i}段没有转出任何文字"
+                               f"（引擎 {eng}；引擎异常详情见 data/logs/echo-server.log.err）")
+            elif eng == "sherpa":
+                seg_rows, sherpa_why = _sherpa_rows(seg_path, seg_idx, seg_min, cfg, cap_kinds)
+                if not seg_rows:
+                    # 与上面两条本地路同一个纪律：空结果要留痕，并且把**引擎自己说的原因**
+                    # （依赖缺失/模型没就位/接口变了）带出来 —— sherpa 是这个仓库里最容易
+                    # "没装好却看起来在跑"的引擎（2026-09-23 实测过一次）。
+                    db.add_log("warn", "meeting",
+                               f"{meeting_name} 第{i}段没有转出任何文字（引擎 sherpa）：{sherpa_why}")
+            elif eng == "whisper":
+                try:
+                    out, _info = stt_mod.transcribe_whisper(wmodel, seg_path, cfg.get("sttLanguage", "zh"))
+                    seg_rows = [(seg_idx, s.start, s.end, s.text.strip()) for s in out]
+                except Exception as e:
+                    db.add_log("error", "meeting",
+                               f"{meeting_name} 第{i}段 whisper 转写失败：{type(e).__name__}: {e}")
+                    print("转写失败:", e, file=sys.stderr)
 
-        # 形状归一必须在 extend 之前：分离成功给 5 元组，关闭/失败时这里是 4 元组，
-        # 而 db.add_lines 只认 5 元组（见 _ensure_speaker_column 的说明）。
-        seg_rows = _ensure_speaker_column(seg_rows)
-        db_rows.extend(seg_rows)
-        meta.setdefault("transcribed", []).append(seg)
-        # 3.0：把这次"用了谁/跳过了谁/为什么"与时间轴档位落盘。
-        # 为什么每次都写：转写可能中途崩/被重启，**已完成的段也要留下当时的路由结论**，
-        # 否则事后只能看到"转了一半"，而不知道为什么后半段没走。
-        # 两份计划要合起来看：`asr_plan` 有转写那一槽、`cap_plan`（分离那次调用）
-        # 多了 `diarize.turns` —— 只写其中一份，面板上就会缺一个槽，
-        # 而"这场会每个槽各用了谁"正是这个字段存在的唯一理由。
-        if cap_plan and asr_plan:
-            seg_plan = _merge_capability_plans(asr_plan, cap_plan)
-        else:
-            seg_plan = cap_plan or asr_plan
-        _apply_capability_meta(meta, seg_plan, cap_kinds)
-        with open(os.path.join(folder, "meta.json"), "w", encoding="utf-8") as f:
-            json.dump(meta, f, ensure_ascii=False, indent=2)
+            if diarize:
+                _set_progress(meeting_id, phase="说话人分离", seg_index=i, seg_total=seg_total,
+                              percent=percent, detail=f"第 {i}/{seg_total} 段 · 分离说话人")
+                try:
+                    # 3.0（step 4）：分离先问能力路由的 `diarize.turns` 槽。
+                    # 返回 None 的几种情况都退回**原来那段本机代码**（形状已经归一，见
+                    # `_normalize_diarize`）：本场没有这个槽 / 这一槽按计划归本机 /
+                    # 这一槽失败 / 本场压根没开会话（`cap_session is None` = 没配后端）。
+                    # 失败时那条 warn 已经在 `_capability_diarize_segment` 里写过了 ——
+                    # 所以这里**不再重复**报错，只是走本机（最坏情况与今天逐字一致）。
+                    turns_raw = embs = labels = None
+                    if cap_session is not None:
+                        turns_raw, embs, labels, dia_plan = _capability_diarize_segment(
+                            cap_session, seg_path)
+                        if dia_plan:
+                            cap_plan = dia_plan
+                    if turns_raw is None:
+                        from app.audio.diarize import diarize_wav_full
+                        turns_raw, embs, labels = diarize_wav_full(seg_path)
+                    label_map = registry.map(embs, labels)
+                    key_map = {}
+                    for plabel, disp in label_map.items():
+                        num = re.sub(r"\D", "", disp)
+                        key = "S" + num
+                        key_map[plabel] = key
+                        speaker_names[key] = disp
+                    turns = [(s, e, key_map[spk]) for s, e, spk in turns_raw]
+                    seg_rows = _assign_speakers(seg_rows, turns)
+                    # 声纹识别：本段每个说话人找常用联系人，整场累计（取相似度最高的一次）
+                    # 注意这里不需要"注册"：`diarize.turns` 那一次调用**同时带回了每个说话人
+                    # 的嵌入**（`DiarizeResult.speakers`）—— 声纹用的就是它，与分离同源。
+                    if vp_matcher is not None:
+                        try:
+                            from app import voiceprint
+                            for disp, m in voiceprint.identify(embs, labels, label_map,
+                                                               vp_matcher).items():
+                                vp_stats["tried"] += 1
+                                if float(m["sim"]) > vp_stats["best"]:
+                                    vp_stats["best"] = float(m["sim"])
+                                    vp_stats["best_name"] = m.get("name") or ""
+                                if not m["ok"]:
+                                    r = m.get("reason") or "?"
+                                    vp_stats["miss"][r] = vp_stats["miss"].get(r, 0) + 1
+                                    continue
+                                vp_stats["hit"] += 1
+                                old = vp_names.get(disp)
+                                if old is None:
+                                    db.add_log("info", "voiceprint",
+                                               f"{meeting_name} 第{i}段：{disp} → {m['name']}"
+                                               f"（相似度 {m['sim']:.2f}，次优 {m['runner']:.2f}）")
+                                if old is None or m["sim"] > old[1]:
+                                    vp_names[disp] = (m["name"], m["sim"])
+                            if vp_names:
+                                # 同人合并 + 把联系人名写进本场显示名（用户手改过的名字
+                                # 由 replace_speakers 的「已有名优先」逻辑保留，不会被顶掉）
+                                vp_merges = voiceprint.duplicate_merges(
+                                    {d: v[0] for d, v in vp_names.items()})
+                                for disp, (nm, _sim) in vp_names.items():
+                                    tgt = vp_merges.get(disp, disp)
+                                    speaker_names["S" + re.sub(r"\D", "", tgt)] = nm
+                        except Exception as e:
+                            db.add_log("warn", "voiceprint", f"声纹识别失败（跳过本段）：{e}")
+                except Exception as e:
+                    # 分离不可用不能连累整场转写：形状归一在下面统一做。失败原因也落库
+                    # （原来只 print 到 stderr，日志里查不到"为什么这场没有说话人"）。
+                    if not diarize_fail:
+                        diarize_fail = f"{type(e).__name__}: {e}"
+                        db.add_log("warn", "meeting",
+                                   f"{meeting_name} 说话人分离不可用，本场不标说话人：{diarize_fail}")
+                    print("说话人分离失败:", e, file=sys.stderr)
+
+            # 形状归一必须在 extend 之前：分离成功给 5 元组，关闭/失败时这里是 4 元组，
+            # 而 db.add_lines 只认 5 元组（见 _ensure_speaker_column 的说明）。
+            seg_rows = _ensure_speaker_column(seg_rows)
+            db_rows.extend(seg_rows)
+            meta.setdefault("transcribed", []).append(seg)
+            # 3.0：把这次"用了谁/跳过了谁/为什么"与时间轴档位落盘。
+            # 为什么每次都写：转写可能中途崩/被重启，**已完成的段也要留下当时的路由结论**，
+            # 否则事后只能看到"转了一半"，而不知道为什么后半段没走。
+            # 两份计划要合起来看：`asr_plan` 有转写那一槽、`cap_plan`（分离那次调用）
+            # 多了 `diarize.turns` —— 只写其中一份，面板上就会缺一个槽，
+            # 而"这场会每个槽各用了谁"正是这个字段存在的唯一理由。
+            if cap_plan and asr_plan:
+                seg_plan = _merge_capability_plans(asr_plan, cap_plan)
+            else:
+                seg_plan = cap_plan or asr_plan
+            _apply_capability_meta(meta, seg_plan, cap_kinds)
+            with open(os.path.join(folder, "meta.json"), "w", encoding="utf-8") as f:
+                json.dump(meta, f, ensure_ascii=False, indent=2)
 
     # 声纹识别产物：① 同人说话人键合并（行改标到保留键）；② 留存各说话人平均声纹
     remap = ({"S" + re.sub(r"\D", "", d): "S" + re.sub(r"\D", "", t)
@@ -1463,14 +1967,19 @@ def _fmt_ts_full(sec):
 
 
 def _seg_duration_map(folder):
-    """段号 -> 该段音频总时长（秒）。"""
+    """段号 -> 该段音频总时长（秒）。
+
+    2026-09-26 起按 `audiofile.resolve_segment()` 找文件：段可能是 `.flac`
+    （历史音频无损压缩的产物），而 `.wav` 那时已经删了 —— 只认 wav 会让
+    压缩过的会议在详情页/导出里**每段都显示 0 秒**（时间轴整体塌掉）。
+    """
     out = {}
     if not os.path.isdir(folder):
         return out
-    for f in os.listdir(folder):
-        m = re.match(r"^(\d+)\.wav$", f)
-        if m:
-            out[int(m.group(1))] = _wav_seconds(os.path.join(folder, f))
+    for idx in audiofile.list_segments(folder):
+        path = audiofile.resolve_segment(folder, idx)
+        if path:
+            out[idx] = audiofile.audio_seconds(path)
     return out
 
 
@@ -2573,7 +3082,9 @@ def retranscribe_meeting(meeting_id):
         return False, "会议不存在"
     name = meeting["name"]
     folder = os.path.join(meetings_dir(), name)
-    segs = [f for f in os.listdir(folder) if re.match(r"^\d+\.wav$", f)] if os.path.isdir(folder) else []
+    # 段发现同时认 flac（历史音频压缩后 wav 已删）—— 只认 wav 会让压缩过的会议
+    # 报"该会议没有音频片段，无法转写"，而那正是用户最想重新转一场的时候。
+    segs = audiofile.segment_files(folder) if os.path.isdir(folder) else []
     if not segs:
         return False, "该会议没有音频片段，无法转写"
     with _retranscribing["lock"]:
@@ -2592,6 +3103,292 @@ def retranscribe_meeting(meeting_id):
 
     threading.Thread(target=_run, daemon=True).start()
     return True, f"已开始重新转写（{name}）"
+
+
+# ---------------------------------------------------------------- 导入录音（成为一场会议）
+
+#: 与"正在重转"共用同一把纪律：**同一时刻只允许一场导入**。
+#: 为什么必须互斥：导入会往会议目录里写 `01.wav/02.wav…`，两场导入并发就会抢同一批段号，
+#: 而"谁的 01.wav 是谁的"事后完全查不出来（表现是转写内容串了，最难查的那种）。
+_importing = {"lock": threading.Lock(), "busy": False}
+
+
+class _ImportFailed(Exception):
+    """内部：某个音频文件转换失败 —— 原因已经是给人看的一句话（原样返回给调用方）。"""
+
+
+def _unique_meeting_folder(root, stamp):
+    """给这场导入挑一个还没被占用的会议目录名，并**直接建出来**。
+
+    命名沿用会议链路的既有形状 `2026-08-21_10-00-00`（`_meeting_hour()` /
+    `_meeting_date()` 都按这个形状解析，换了形状面板就认不出时间）。
+    同一秒重复导入（脚本连打两次）时加 `_2`、`_3` 后缀 —— **绝不覆盖**既有会议：
+    覆盖会把别人的录音整段冲掉，而那是最不可逆的一种错。
+    """
+    base = stamp or datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    for i in range(1, 100):
+        name = base if i == 1 else "%s_%d" % (base, i)
+        folder = os.path.join(root, name)
+        try:
+            os.makedirs(folder)          # exist_ok=False：谁先建谁得到它
+        except FileExistsError:
+            continue
+        except OSError as e:
+            return "", "", "无法创建会议目录（%s）：%s" % (folder, e)
+        return name, folder, ""
+    return "", "", "同一时间点的会议目录已经存在 100 个（%s）——请稍后再导入" % base
+
+
+def _import_cfg():
+    """导入时写进 `meta.json` 的配置快照（与 `start_meeting()` 同一组键）。
+
+    为什么照抄录音那份：`_transcribe_impl` 把 `meta["config"]` 当**兜底**读
+    （设置改了之后重转用新值，但快照能说明"导入当时这台机器是怎么配的"）。
+    """
+    cfg = settings
+    return {
+        "sttModel": cfg.get("meetingSttModel", "small"),
+        "sttDevice": cfg.get("device", "auto"),
+        "sttLanguage": cfg.get("sttLanguage", "zh"),
+        "segmentMinutes": cfg.get("meetingSegmentMinutes", 10),
+        "autoSummarize": cfg.get("meetingAutoSummarize", True),
+        "diarize": cfg.get("meetingDiarize", False),
+    }
+
+
+def import_meeting(files, *, title="", start="", notes="", started_at="", block_frames=None,
+                   display_names=None):
+    """把 1..N 个音频文件导入成**一场会议**（顺序即分段顺序），成功后自动开始转写。
+
+    参数：
+      files        音频文件路径的**有序**列表（顺序 = 段号顺序）
+      title        可选标题（写 `meetings.title`）
+      start        可选的会议时间（`YYYY-MM-DD HH:MM[:SS]` / ISO；空 = 现在）
+      notes        可选备注（写 `meetings.notes`）
+      started_at   可选的 ISO 起始时间（给了就用它，不再从 `start` 推；测试用来固定目录名）
+      block_frames 可选：转码分块大小（用例据此断言"没整段进内存"）
+      display_names 可选：与 `files` 一一对应的**显示名**。HTTP 那条路传的是上传临时文件，
+                   而报错文案与 `meta.json` 里的 `importedFrom` 必须是用户认识的原文件名
+                   （`echo-imp123-ab12.m4a` 这种临时名会让"哪个文件失败了"没法查）。
+                   不给就按 `files[i]` 的文件名显示。
+
+    返回 `(ok, name_or_reason)`；`ok=True` 时第二项是会议目录名。
+
+    ## 状态落点：`imported`（「待转写」），不是 `transcribed` 也不是 `interrupted`
+
+    同事的夹具脚本当初只能用 `interrupted`，因为**当时没有"待转写"这一档**；
+    他自己在文档里写明了那是个妥协（"面板没有'待转写'这个状态；`transcribed` 会谎称
+    已完成、`error` 又会被读成录音失败"）。既然这次是新功能，就把这一档**真的加上**：
+
+      * `transcribed` 是假话 —— 库里一行转写都没有，面板却显示"已转写"；
+      * `error` 更糟 —— 面板把它读成"录音失败（没录到音频）"，而音频明明好端端躺在磁盘上；
+      * `interrupted` 的意思已经被"录音中断"占住了（进程崩了/设备掉了），
+        用它表达"导进来还没转"会让这两种完全不同的状况在日志与列表里长得一模一样；
+      * `imported` 只多一个词，却把语义说准了：**音频在、还没有文字**。
+        它同时也是转写**失败**之后的落点之一吗？不是 —— 转写失败仍走 `error`
+        （带真原因），`imported` 只表示"排着队等转写"。
+
+    面板侧同步加了这一档的文案（`web/app.js` / `web/meeting.html`：
+    「待转写」，徽章用 `idle` 色，不是红的）。**"已导入但转写没起来"仍然要看 `error`** ——
+    那一档才有原因，`imported` 只是排队。
+
+    ## 顺序：先全部转码成功，再建库记录 / 写 meta
+
+    "不许留下垃圾目录"这条要求决定了顺序：**任何一个文件失败 = 整场不落地**
+    （目录删掉、库里没有记录、返回真原因）。所以先把每个文件转成
+    `01.wav/02.wav…`，全部成功之后才 `db.create_meeting()`。
+    """
+    paths = [str(p) for p in (files or []) if str(p or "").strip()]
+    if not paths:
+        return False, "没有选择任何音频文件"
+    # 正在录音时**不许**导入：两个动作都要抢麦克风前后的那台机器（导入完会立刻起转写，
+    # 而转写会吃满 CPU/GPU —— 那正好会拖垮正在进行的录音）。这不是技术上的互斥，
+    # 是"别在用户录音时干重活"的礼貌，所以给一句能照做的话，而不是含糊地失败。
+    if _state["active"]:
+        return False, "正在录音中，不能同时导入录音；请先停止录音，再导入"
+    # 同一时刻只允许一场导入（见 `_importing`）
+    with _importing["lock"]:
+        if _importing["busy"]:
+            return False, "已有一次录音导入正在进行，请等它结束"
+        _importing["busy"] = True
+    try:
+        return _import_meeting_locked(paths, title=title, start=start, notes=notes,
+                                      started_at=started_at, block_frames=block_frames,
+                                      display_names=display_names)
+    finally:
+        with _importing["lock"]:
+            _importing["busy"] = False
+
+
+def _import_meeting_locked(paths, *, title, start, notes, started_at, block_frames,
+                           display_names=None):
+    from app.audio import importer as imp
+
+    root = ensure_meetings_dir()
+    stamp = _parse_start_stamp(start) or datetime.datetime.now().strftime(
+        "%Y-%m-%d_%H-%M-%S")
+    if not started_at:
+        try:
+            started_at = datetime.datetime.strptime(stamp, "%Y-%m-%d_%H-%M-%S").isoformat(
+                timespec="seconds")
+        except ValueError:
+            started_at = datetime.datetime.now().isoformat(timespec="seconds")
+
+    # **先定好名字、再真正落盘**：目录一旦建出来就属于"垃圾目录"要清理的那一类。
+    name, folder, why = _unique_meeting_folder(root, stamp)
+    if not name:
+        return False, why
+
+    logger = lambda level, msg: db.add_log(level, "meeting", msg)   # noqa: E731
+    # 显示名：HTTP 那条路传的是上传临时文件，用户认识的是原文件名（见 `display_names`）。
+    shown = list(display_names or [])
+    results = []
+    try:
+        total = len(paths)
+        for i, src in enumerate(paths, start=1):
+            seg = "%02d.wav" % i
+            dst = os.path.join(folder, seg)
+            label = imp.display_name(shown[i - 1] if i - 1 < len(shown) else src)
+            _set_progress(name, phase="导入中", seg_index=i, seg_total=total,
+                          percent=round((i - 1) / float(total) * 100),
+                          detail="正在转换第 %d/%d 个文件（%s）" % (i, total, label))
+            kw = {"filename": label, "logger": logger}
+            if block_frames:
+                kw["block_frames"] = int(block_frames)
+            try:
+                res = imp.convert_to_16k_mono(src, dst, **kw)
+            except imp.ImportAudioError as e:
+                raise _ImportFailed(str(e))
+            except Exception as e:                      # 磁盘满 / 权限 / 引擎级意外
+                raise _ImportFailed("%s：%s" % (type(e).__name__, e))
+            results.append(res)
+            db.add_log("info", "meeting",
+                       "导入 %s：%s → %s（%.1f 秒，源 %.0f Hz/%d 声道）"
+                       % (name, label, seg, res.seconds, res.src_rate, res.src_channels))
+    except _ImportFailed as e:
+        _clear_progress(name)
+        _cleanup_import(folder)
+        db.add_log("error", "meeting", "导入录音失败（%s）：%s" % (name, e))
+        return False, str(e)
+    except Exception as e:
+        _clear_progress(name)
+        _cleanup_import(folder)
+        db.add_log("error", "meeting", "导入录音失败（%s）：%r" % (name, e))
+        return False, "导入失败：%s: %s" % (type(e).__name__, e)
+
+    duration = round(sum(r.seconds for r in results), 3)
+    audio_bytes = sum(int(r.dst_bytes or 0) for r in results)
+    # 用户认识的那个文件名的清单（`r.src` 在 HTTP 那条路是临时文件，见 `display_names`）
+    shown_names = [r.filename for r in results]
+    meta = {
+        "start": started_at,
+        "source": "import",
+        "importedFrom": list(shown_names),
+        "importedAt": datetime.datetime.now().isoformat(timespec="seconds"),
+        "durationSeconds": duration,
+        "sampleRate": imp.TARGET_RATE,
+        "channels": imp.TARGET_CHANNELS,
+        "sampleFormat": "16-bit PCM",
+        # 重采样走的哪条路**逐文件落盘**：用户问"这段转得准不准"、或排障时
+        # "这台机器上到底用了 soxr 还是兜底插值"，答案在这里（日志里也有同样一行）。
+        "resampled": [{"file": r.filename, "how": r.resampled,
+                       "srcRate": r.src_rate, "srcChannels": r.src_channels,
+                       "srcFormat": r.src_format} for r in results],
+        "config": _import_cfg(),
+    }
+    if (title or "").strip():
+        meta["title"] = str(title).strip()[:200]
+    if (notes or "").strip():
+        meta["notes"] = str(notes).strip()[:2000]
+
+    # 库记录在**音频全部就位之后**才建：失败路径上就不会留下"有记录、没音频"的空会议。
+    try:
+        meeting_id = db.create_meeting(
+            name, started_at=started_at, stt_model=meta["config"]["sttModel"],
+            stt_device=meta["config"]["sttDevice"],
+            diarize=1 if meta["config"]["diarize"] else 0)
+    except Exception as e:
+        _cleanup_import(folder)
+        db.add_log("error", "meeting", "导入录音建记录失败（%s）：%s" % (name, e))
+        return False, "导入失败（写会议记录）：%s" % e
+
+    if str(title or "").strip():
+        db.update_meeting(meeting_id, title=str(title).strip()[:200])
+    if str(notes or "").strip():
+        db.update_meeting(meeting_id, notes=str(notes).strip()[:2000])
+    # 段数/时长/体积先写全（**转写之前**面板就能显示"29:37 · 3 段"），
+    # 状态留给下一步：`imported` = 「待转写」。见函数头的状态说明。
+    db.update_meeting(meeting_id, ended_at=started_at, duration_seconds=duration,
+                      segments=len(results), audio_bytes=audio_bytes,
+                      status="imported", error="")
+
+    meta["segments"] = ["%02d.wav" % i for i in range(1, len(results) + 1)]
+    try:
+        with open(os.path.join(folder, "meta.json"), "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
+    except OSError as e:
+        # meta.json 写不进去 = 这一场之后没法重转（`_transcribe_impl` 要读它）。
+        # 宁可现在整套撤掉，也不要留一场"看着在、其实坏了"的会议。
+        _cleanup_import(folder)
+        try:
+            db.delete_meeting(meeting_id)
+        except Exception:
+            pass
+        db.add_log("error", "meeting", "导入录音写 meta.json 失败（%s）：%s" % (name, e))
+        return False, "导入失败（写 meta.json，可能是磁盘满）：%s" % e
+
+    db.add_event("meeting_imported", {"meeting": name, "id": meeting_id,
+                                      "files": len(results), "seconds": duration})
+    db.add_log("info", "meeting",
+               "已导入 %d 个音频文件为一场会议：%s（%.1f 分钟，%d 段）——开始转写"
+               % (len(results), name, duration / 60.0, len(results)))
+
+    # 转写：先切到 `transcribing`（面板的进度条据此显示），再起后台线程。
+    # 导入阶段的进度**在这里停掉**：它是按会议名登记的（那时还没有 id），
+    # 不清的话 `/api/transcribe/status` 会永远挂着一条"导入中 50%"的死记录，
+    # 而那是排障时最容易把人带偏的那种残留（"它是不是卡在导入了？"）。
+    _clear_progress(name)
+    db.update_meeting(meeting_id, status="transcribing", error="")
+    threading.Thread(target=_transcribe_meeting, args=(folder,), daemon=True).start()
+    return True, name
+
+
+class _ImportFailed(Exception):
+    """内部：某个音频文件转换失败 —— 原因已经是给人看的一句话（原样返回给调用方）。"""
+
+
+def _cleanup_import(folder):
+    """导入失败 → 把这场会议的目录整个删掉（**不许留下垃圾目录**）。
+
+    为什么要删干净而不是"留着半成品让用户自己看"：会议列表是按目录名找音频的，
+    留一个只有 01.wav 的目录，用户会以为"导进去了一半"，而它的 `meta.json`
+    根本不存在（`_transcribe_impl` 读不到段清单，重新转写也救不回来）。
+    """
+    import shutil
+    try:
+        shutil.rmtree(folder, ignore_errors=True)
+    except Exception:
+        pass
+
+
+def _parse_start_stamp(value):
+    """用户给的会议时间 → 会议目录名形状 `%Y-%m-%d_%H-%M-%S`（认不出就返回空串）。
+
+    认得出的是用户在界面/接口上真会写的形状：`2026-09-20` / `2026-09-20 10:48` /
+    ISO（`2026-09-20T10:48:26`）/ 已经就是这个目录名。**认不出不报错** ——
+    时间只是个默认名，落到"现在"比拒绝一次导入合理。
+    """
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    text = text.replace("T", " ")
+    for fmt in ("%Y-%m-%d_%H-%M-%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M",
+                "%Y-%m-%d_%H-%M", "%Y-%m-%d"):
+        try:
+            return datetime.datetime.strptime(text, fmt).strftime("%Y-%m-%d_%H-%M-%S")
+        except ValueError:
+            continue
+    return ""
 
 
 # ---------------------------------------------------------------- 查询

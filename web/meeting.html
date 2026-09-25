@@ -362,7 +362,7 @@ async function load() {
   if (!MID) { $("#transcriptBox").innerHTML = '<div class="empty">缺少会议 id（?id=xxx）</div>'; return; }
   M = await api("/api/meetings/" + MID);
   $("#title").textContent = M.title || M.name;
-  const st = { recording:"录音中", transcribing:"转写中", transcribed:"已转写", error:"录音失败", interrupted:"已中断" };
+  const st = { recording:"录音中", transcribing:"转写中", transcribed:"已转写", imported:"待转写", error:"录音失败", interrupted:"已中断" };
   // 详情接口的 segments 是分段数组（app/api.py 用 build_segments 覆盖），不是数字，取长度才是段数；
   // 数组为空（历史会议转写行已不在库、仅剩 transcript.md 文件）时回落数据库里的段数。
   const segCount = Array.isArray(M.segments)
@@ -962,7 +962,7 @@ async function downloadOfflineHtml() {
           t.lines.map((l) => '<span class="tseg">' + esc(l.text) + '</span>').join(" ") + '</div></div>').join("") +
         '</div>';
     }).join("");
-    const stText = { recording:"录音中", transcribing:"转写中", transcribed:"已转写", error:"录音失败", interrupted:"已中断" }[M.status] || M.status;
+    const stText = { recording:"录音中", transcribing:"转写中", transcribed:"已转写", imported:"待转写", error:"录音失败", interrupted:"已中断" }[M.status] || M.status;
     const data = JSON.stringify({
       name: M.title || M.name, meta: (M.started_at || "") + " · " + fmtHM(M.duration_seconds) + " · " + stText,
       summary: sum.content || "", topics: topicsMd || "", transcript: tr.content || "",

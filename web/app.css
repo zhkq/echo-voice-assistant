@@ -550,6 +550,52 @@ select.ctl { text-overflow: ellipsis; }
 .tx-bar { height: 5px; border-radius: 3px; background: var(--card); margin-top: 7px; overflow: hidden; border: 1px solid var(--border); }
 .tx-bar i { display: block; height: 100%; background: linear-gradient(90deg, var(--accent), #7aa7ff); border-radius: 3px; transition: width .8s; }
 .tx-info { color: var(--muted); font-size: 11.5px; margin-top: 4px; }
+/* 「已压缩」标记（2026-09-26，历史音频无损压成 FLAC）。
+   为什么另起一个类而不是复用它旁边的 `.m-meta`：它需要**能换行、能收缩**，
+   否则窄边条里"原 149.0 MB → 现 76.0 MB（省 49%）"这一串会把卡片顶宽
+   （docs/面板布局-窄边条.md 记的就是这类出血）。 */
+.meeting-item .m-compress {
+  color: var(--accent); font-size: 11.5px; overflow-wrap: anywhere; min-width: 0;
+}
+/* ---------- 无损压缩面板（会议页签，2026-09-26） ----------
+   与导入那一块共用 `.import-box` / `.tx-bar` / `.import-picked`，
+   只多"能省多少"这一行。**不做成 `.set-row`**（那会让预览文字与说明挤成两条窄列，
+   窄边条下尤其难读）：标签 + 数字一行、说明另起一行，都能换行收缩。 */
+.compress-row {
+  display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap;
+  padding: 6px 0; min-width: 0; font-size: 13px;
+}
+.compress-row .cr-label { color: var(--muted); flex-shrink: 0; }
+.compress-row #compressPreview { min-width: 0; overflow-wrap: anywhere; }
+.compress-note {
+  color: var(--muted); font-size: 12px; line-height: 1.6;
+  overflow-wrap: anywhere; min-width: 0;
+}
+
+/* ---------- 导入录音（会议页签，2026-09-25） ----------
+   沿用既有控件：行是 `.set-row`（标签与控件同行、间距紧），进度条是上面的 `.tx-bar`
+   （**不新造一套进度 UI**）。只加"已选文件列表"与动作行两块新样式。 */
+.import-box {
+  border: 1px solid var(--border); border-radius: 8px; background: var(--card2);
+  padding: 6px 10px 10px; margin-bottom: 10px; min-width: 0;
+}
+.import-box .set-row { padding: 6px 0; }
+.import-box .set-row + .set-row { border-top: 1px dashed var(--border); }
+.import-picked { display: flex; flex-direction: column; gap: 4px; margin: 6px 0 2px; min-width: 0; }
+.import-picked:empty { display: none; }
+.import-picked .ip-item {
+  display: flex; align-items: center; gap: 8px; min-width: 0;
+  font-size: 12.5px; background: var(--card); border: 1px solid var(--border);
+  border-radius: 6px; padding: 4px 8px;
+}
+.import-picked .ip-item .ip-idx { color: var(--muted); flex-shrink: 0; font-variant-numeric: tabular-nums; }
+.import-picked .ip-item .ip-name {
+  flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.import-picked .ip-item .ip-size { color: var(--muted); flex-shrink: 0; font-size: 11.5px; }
+.import-picked .ip-item .btn { padding: 2px 8px; font-size: 12px; }
+.import-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 8px; min-width: 0; }
+.import-actions #importState { overflow-wrap: anywhere; }
 
 /* ---------- 弹层 ---------- */
 .modal {
