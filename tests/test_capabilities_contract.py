@@ -752,3 +752,42 @@ class VocabularyTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class MeetingAsrBackendIsExplicitTests(unittest.TestCase):
+    """会议转写后端**不给 auto**（用户 2026-09-25 定）。
+
+    三条要守的：
+      * 选项里不许再有 `auto`；
+      * **默认值必须落在选项里** —— 不落就会出现"下拉选不到当前值、保存写回空串"的静默失效；
+      * 老库里存的 `auto` 必须被迁移走（否则新代码面对一个不存在的选项）。
+
+    背景（真机上真出现过）：auto 的链末尾是本机，默认档的本机是 sherpa，而会议链路驱动不了它
+    → 录到音频却 0 行文字，面板还把原因显示成"麦克风没打开"。显式选择之后，"用不了"就变成
+    一件说得出名字的事。
+    """
+
+    def test_there_is_no_auto_option(self):
+        from app.config import DEFAULTS
+        meta = DEFAULTS["capabilityMeetingAsrBackend"]
+        self.assertNotIn("auto", meta["options"],
+                         "会议转写后端不许再给 auto：用不了时要能说清是哪一个后端")
+        self.assertIn(meta["value"], meta["options"], "默认值不在选项里 → 面板选不到当前值")
+
+    def test_the_default_is_a_real_backend(self):
+        from app.config import DEFAULTS
+        self.assertEqual(DEFAULTS["capabilityMeetingAsrBackend"]["value"], "echo-server",
+                         "默认给「ECHO 后端」：默认档的设计就是会议交给 GPU 那台")
+
+    def test_an_old_auto_value_is_migrated(self):
+        from app.config import DEFAULT_MIGRATIONS
+        self.assertEqual(DEFAULT_MIGRATIONS.get("capabilityMeetingAsrBackend"),
+                         ("auto", "echo-server"),
+                         "老库里的 auto 必须迁走 —— 迁移表里少了这一条")
+
+    def test_every_option_is_a_known_backend(self):
+        from app.capabilities import base
+        from app.config import DEFAULTS
+        known = {base.BACKEND_ECHO_SERVER, base.BACKEND_LOCAL, base.BACKEND_ASR_PROVIDER}
+        opts = set(DEFAULTS["capabilityMeetingAsrBackend"]["options"])
+        self.assertEqual(opts - known, set(),
+                         "选项里出现了路由不认识的后端 id：%s" % (opts - known))

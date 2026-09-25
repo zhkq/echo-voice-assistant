@@ -717,10 +717,13 @@ DEFAULTS = {
                     "它决定哪些后端根本不被考虑，见能力路由的 privacy 判据",
         value_type="str"),
     "capabilityMeetingAsrBackend": dict(
-        value="auto", grp="capability", label="会议转写用哪个后端", hidden=True,
-        options=["auto", "echo-server", "local", "asr-provider"],
-        description="会议链路的 asr.text。auto = 按「ECHO 后端 → 本机 → 网络服务商」"
-                    "的顺序挑第一个可用的",
+        value="echo-server", grp="capability", label="会议转写用哪个后端", hidden=True,
+        # 2026-09-25（用户）：**不给 auto** —— auto 的链末尾是本机，而默认档的本机是 sherpa，
+        # 会议链路驱动不了它（拿 "sherpa" 当 whisper 模型名加载）→ 录到音频、0 行文字，
+        # 面板还把原因显示成"麦克风没打开"。直接选一个，用不了时说得出名字。
+        options=["echo-server", "local", "asr-provider"],
+        description="会议链路的 asr.text。**没有 auto**：直接选一个；选中的那个用不了时会"
+                    "如实报错（说清是哪个后端、为什么），不会悄悄换别的兜底。「ECHO 后端」= 配对好的 GPU 机器；「本机」= 这台机器的转写引擎；「网络服务商」= 外部/内网服务（适配器未实现）",
         value_type="str"),
     "capabilityDiarizeBackend": dict(
         value="auto", grp="capability", label="说话人分离用哪个后端", hidden=True,
@@ -809,6 +812,9 @@ DEFAULT_MIGRATIONS = {
     # `{ECHO}/data/command`。新机器装好就该在 DSH 侧栏看到「指令空间」分组，而不是
     # 攒一堆未分组的会话。仅当用户从没改过（仍为空）才改写；配过自己目录的一律不动。
     "commandWorkspace": ("", "{ECHO}/data/command"),
+    # 2026-09-25：会议转写后端**取消 auto**（用户定）→ 老库里还是 auto 的迁成 echo-server。
+    # 只搬"仍是旧默认值"的那种；用户手动设过别的值一律不动（这套机制的规矩）。
+    "capabilityMeetingAsrBackend": ("auto", "echo-server"),
 }
 
 # 弃用项的值迁移：某个配置键被**弃用**（重复/失效）时，把"它当初表达的用户意图"
