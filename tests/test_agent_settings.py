@@ -145,8 +145,17 @@ class AgentPanelWiringTests(unittest.TestCase):
             cls.js = fh.read()
 
     def test_detail_renders_fields_from_the_agents_payload(self):
-        self.assertIn("(cur.settings || []).map", self.js,
+        """**意图**：展开区必须按后端给的 `settings` 逐项渲染（否则 DSH 地址 / CLI 路径没入口）。
+
+        2026-09-25：设置区改版后这一行变成 `(cur.settings || []).filter(...).map(...)`
+        （要跳过 harnessHome —— 它已经在上面单独成行），**行为没变**，变的是字面表达式。
+        所以这里断言"确实拿 `cur.settings` 去遍历"，中间允许夹一层 filter；
+        只钉死字面串会让每次无害重构都误报（这次就是）。
+        """
+        self.assertIn("(cur.settings || [])", self.js,
                       "展开区要按后端给的 settings 渲染（否则 DSH 地址/CLI 路径没入口）")
+        self.assertRegex(self.js, r"\(cur\.settings \|\| \[\]\)[\s\S]{0,120}?\.map\(",
+                         "必须真的遍历它逐项渲染（允许中间夹 filter 之类的筛选）")
         self.assertIn('data-agent-field="${esc(s.key)}"', self.js)
 
     def test_hidden_key_lookup_is_gone(self):

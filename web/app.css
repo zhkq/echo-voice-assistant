@@ -1067,3 +1067,127 @@ main { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
   padding: 6px 0; border-top: 1px solid var(--border); }
 .cap-be-row > .cap-be-name { font-weight: 600; min-width: 0; }
 .cap-be-slots { font-size: 12px; color: var(--muted); min-width: 0; }
+
+/* ============ 设置区 v3（2026-09-25 重设计 · 边条优先）============
+   规格：`docs/设置项归属表.md`（106 项逐条落点）+ `docs/设置页重设计-样张.html`（视觉）。
+   三条硬要求都落在下面这几条样式里：
+     ① 边条优先：标签与控件**同一行**（标签固定 84px、超长省略号），卡片标题独占一行；
+     ② 同卡内 ≥2 个纯复选项 → 一行两个（`.schk2` 两列 grid）；
+     ③ 间距要紧：行距/内边距直接抄样张（gap 6 / padding 4px 0 / 字号 12·11·10.5）。
+   颜色仍用面板自己的变量（--bg/--card/--border…），样张那套十六进制只当参考 —— 面板各页
+   共用一套配色，设置区不该是唯一一个色偏的地方。
+   注意：`test_panel_layout.py` 的窄边条守卫要求**新加的行也能收缩**（见文件末尾那段说明），
+   所以下面所有新容器都带 min-width: 0，且下拉一律 `class="ctl"` 复用 select.ctl 的可收缩规则。 */
+
+.sset-tabs {
+  display: flex; gap: 2px; border-bottom: 1px solid var(--border);
+  margin: 2px 0 0; flex-wrap: wrap; min-width: 0;
+}
+.sset-tabs button {
+  background: transparent; border: 0; border-bottom: 2px solid transparent;
+  color: var(--muted); font-size: 12.5px; padding: 6px 7px; cursor: pointer; white-space: nowrap;
+}
+.sset-tabs button:hover { color: var(--text); }
+.sset-tabs button.on { color: var(--accent); border-bottom-color: var(--accent); font-weight: 600; }
+.sset-who { font-size: 10.5px; color: var(--muted); margin: 6px 0 0; }
+.ssetpane { min-width: 0; display: flex; flex-direction: column; }
+
+/* 卡片：标题独占一行、整卡可折叠（折叠机制复用 .card.collapsible + applyCollapsedCards） */
+.settings-form .card { padding: 8px 9px; margin-bottom: 8px; }
+.settings-form .card > .card-title { font-size: 12.5px; font-weight: 600; margin-bottom: 6px; gap: 6px; }
+.settings-form .card.closed > .card-body,
+.settings-form .card.collapsible.collapsed > .card-body { display: none; }
+.settings-form .card.collapsible.collapsed { padding-bottom: 8px; }
+.sset-hint { font-size: 10.5px; color: var(--muted); margin: 0 0 4px; line-height: 1.5; }
+
+/* 行：标签与控件同一行（边条 84px，宽面板 150px） */
+.srow { display: flex; align-items: center; gap: 6px; padding: 4px 0;
+  border-top: 1px solid var(--border); min-width: 0; }
+.srow:first-child { border-top: 0; }
+.srow > .lbl { flex: 0 0 84px; min-width: 0; display: flex; align-items: center; gap: 4px;
+  font-size: 12px; white-space: nowrap; }
+.srow > .lbl > .lt { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.srow > .sctl { flex: 1 1 auto; min-width: 0; display: flex; align-items: center; gap: 5px; }
+.srow > .sctl > select.ctl { flex: 1 1 auto; }
+.srow > .sctl > input.ctl[type="text"], .srow > .sctl > input.ctl[type="password"] { flex: 1 1 auto; }
+.srow input.ctl, .srow select.ctl { padding: 3px 6px; font-size: 12px; border-radius: 6px; }
+.srow input.num { flex: 0 0 62px; width: 62px; text-align: right; }
+.sunit { color: var(--muted); font-size: 11px; flex: 0 0 auto; }
+.sdesc { font-size: 10.5px; color: var(--muted); line-height: 1.5; margin: 2px 0 4px;
+  min-width: 0; overflow-wrap: anywhere; }
+.sdesc.warn { color: #f0dcae; }
+.srow-wrap { padding: 4px 0; border-top: 1px solid var(--border); min-width: 0; }
+.srow-wrap:first-child { border-top: 0; }
+.srow-wrap > .srow { border-top: 0; padding-top: 0; }
+.smono { font-family: ui-monospace, Consolas, monospace; font-size: 11px; color: var(--muted);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; flex: 1 1 auto; }
+
+/* 纯复选项：一行两个（≥2 个就进这个 grid） */
+.schk { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; cursor: pointer; min-width: 0; }
+.schk input { margin: 0; width: 14px; height: 14px; accent-color: var(--accent); flex: 0 0 auto; }
+.schk > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.schk2 { display: grid; grid-template-columns: 1fr 1fr; gap: 3px 8px; padding: 4px 0;
+  border-top: 1px solid var(--border); min-width: 0; }
+.sras { display: flex; flex-direction: column; align-items: flex-start; gap: 3px; padding: 4px 0; min-width: 0; }
+
+/* 「? 」浮窗：长说明不再平铺（不可逆/出网/生物特征那几项仍留在明面上，见 app.js SET_LOUD_DESC） */
+.sq { width: 13px; height: 13px; flex: 0 0 13px; border-radius: 50%; border: 1px solid var(--border);
+  color: var(--muted); font-size: 9.5px; line-height: 11px; text-align: center; cursor: help;
+  position: relative; display: inline-block; }
+.sq:hover { border-color: var(--accent); color: var(--accent); }
+.sq .spop { position: absolute; left: 16px; top: -4px; z-index: 30; width: 250px; max-width: 74vw;
+  display: none; background: #101827; border: 1px solid var(--border); border-radius: 7px;
+  padding: 7px 9px; color: var(--muted); font-size: 11px; line-height: 1.5; text-align: left;
+  font-weight: 400; white-space: normal; box-shadow: 0 8px 24px rgba(0,0,0,.55); }
+.sq .spop b { color: var(--text); }
+.sq:hover .spop, .sq.open .spop { display: block; }
+
+/* 高级设置区：默认收起，点「▶ 高级」向下展开 */
+.sadv { margin-top: 5px; border-top: 1px dashed var(--border); padding-top: 4px; min-width: 0; }
+.sadvbtn { background: transparent; border: 0; color: var(--muted); font-size: 11px;
+  cursor: pointer; padding: 1px 0; }
+.sadvbtn:hover { color: var(--accent); }
+.sadvbtn .set-arrow { display: inline-block; font-size: 8px; width: 10px; margin-right: 3px;
+  transform: rotate(0deg); transition: transform .12s; }
+.sadv.open .sadvbtn .set-arrow { transform: rotate(90deg); }
+.sadvbody { display: none; margin-top: 3px; min-width: 0; }
+.sadv.open .sadvbody { display: block; }
+.ssec { font-size: 10px; color: var(--muted); letter-spacing: .4px; margin: 8px 0 2px; padding-top: 7px;
+  border-top: 1px solid var(--border); display: flex; align-items: center; gap: 4px; }
+.ssec:first-child { border-top: 0; padding-top: 2px; margin-top: 2px; }
+
+/* 状态/提示 */
+.sbadge { font-size: 10px; border-radius: 99px; padding: 1px 6px; white-space: nowrap; flex: 0 0 auto;
+  border: 1px solid var(--border); color: var(--muted); }
+.sbadge.ok { color: var(--green); border-color: #2c5f4d; background: rgba(62,207,142,.08); }
+.sbadge.warn { color: var(--yellow); border-color: #5d4a24; background: rgba(230,184,76,.08); }
+.sbadge.err { color: var(--red); border-color: #5a2f34; background: rgba(239,91,91,.08); }
+.sdot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; flex: 0 0 6px; background: #4a5a70; }
+.sdot.on { background: var(--green); }
+.sdot.warn { background: var(--yellow); }
+.sdot.off { background: #4a5a70; }
+.snote { display: flex; gap: 6px; border-radius: 6px; padding: 6px 7px; font-size: 11px;
+  margin-top: 6px; border: 1px solid var(--border); color: var(--muted); line-height: 1.55;
+  min-width: 0; overflow-wrap: anywhere; }
+.snote.info { background: rgba(79,140,255,.08); border-color: #2a4a78; color: #cfe2ff; }
+.snote.warn { background: rgba(230,184,76,.08); border-color: #5d4a24; color: #f0dcae; }
+.snote.err { background: rgba(239,91,91,.08); border-color: #5a2f34; color: #f0a0a0; }
+.snote code { background: var(--bg); border: 1px solid var(--border); border-radius: 4px;
+  padding: 0 3px; font-size: 10.5px; color: #bcd6ff; overflow-wrap: anywhere; }
+.sacts { display: flex; align-items: center; gap: 5px; flex-wrap: wrap; min-width: 0; padding: 3px 0; }
+.sacts .btn { padding: 2px 7px; font-size: 11px; }
+.sbe { display: flex; align-items: baseline; gap: 6px; flex-wrap: wrap; padding: 5px 0;
+  border-top: 1px solid var(--border); min-width: 0; }
+.sbe:first-child { border-top: 0; }
+.sbe > .nm { font-weight: 600; font-size: 12px; min-width: 0; }
+.sbe > .why { color: var(--muted); font-size: 11px; min-width: 0; flex: 1 1 100%; line-height: 1.5;
+  overflow-wrap: anywhere; }
+
+/* 宽面板（>860px）才把标签放宽 —— 面板主要形态是 ~360px 的边条 */
+@media (min-width: 861px) {
+  .srow { gap: 9px; padding: 5px 0; }
+  .srow > .lbl { flex: 0 0 150px; }
+}
+/* 新加的行同样必须能收缩（见 docs/面板布局-窄边条.md §2 与 test_panel_layout.py） */
+.sset-tabs, .ssetpane, .srow, .srow-wrap, .srow > .sctl, .schk2, .sadv, .sadvbody,
+  .sacts, .sbe, .snote, .sset-tabs button { min-width: 0; }

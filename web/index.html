@@ -91,7 +91,12 @@
     </div>
   </section>
 
-  <!-- ============ 设置 ============ -->
+  <!-- ============ 设置 ============
+       2026-09-25 重设计（规格：docs/设置项归属表.md · 视觉：docs/设置页重设计-样张.html）：
+       一个设置区、四个子页签（常规 / 语音与设备 / 智能体 / 能力后端），
+       每张卡都是「可折叠卡片 + 常用参数 + 默认收起的高级设置区」。
+       卡片与行**全部由 app.js 的 loadSettings() 渲染**（值来自 /api/settings 等接口），
+       这里只留四个空面板与顶部那条子页签栏 —— 静态写死值会和后端漂移。 -->
   <section id="view-settings" class="view hidden">
     <div class="card">
       <div class="card-title">设置 <span class="muted">(保存到本地数据库)</span>
@@ -99,7 +104,7 @@
         <button class="btn" id="btnSettingsSave">保存</button>
         <!-- 双箭头（2026-09-13 用户要求把文字按钮换成双箭头交互，并放到最右侧）：
              朝上=点了折叠全部，全折叠后翻 180° 朝下 -->
-        <button class="btn icon" id="btnSettingsCollapseAll" title="折叠全部分组" aria-label="折叠全部分组">
+        <button class="btn icon" id="btnSettingsCollapseAll" title="折叠全部卡片" aria-label="折叠全部卡片">
           <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.4"
                stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
             <path d="M6 11.5 12 7l6 4.5" />
@@ -107,17 +112,14 @@
           </svg>
         </button>
       </div>
-      <div id="settingsForm" class="settings-form"></div>
+      <div class="sset-tabs" id="settingsTabs"></div>
+      <div class="sset-who" id="settingsWho"></div>
     </div>
-    <!-- 服务运维：重启 ECHO 本身（独立进程执行，面板自动重连） -->
-    <div class="card">
-      <div class="card-title">🔧 服务
-        <span class="muted" id="svcHint">重启会中断正在进行的录音/命令</span>
-      </div>
-      <div class="card-body row">
-        <button class="btn danger" id="btnRestartEcho" title="停止并重新启动 ECHO 服务进程">重启 ECHO 服务</button>
-        <span class="muted" id="restartState"></span>
-      </div>
+    <div id="settingsForm" class="settings-form">
+      <section class="ssetpane" data-settab-pane="general"><div id="setPaneGeneral"></div></section>
+      <section class="ssetpane hidden" data-settab-pane="voice"><div id="setPaneVoice"></div></section>
+      <section class="ssetpane hidden" data-settab-pane="agent"><div id="setPaneAgent"></div></section>
+      <section class="ssetpane hidden" data-settab-pane="capability"><div id="setPaneCapability"></div></section>
     </div>
   </section>
 
@@ -199,17 +201,21 @@
       </div>
     </div>
     <!-- 可折叠卡片：class="collapsible" + data-collapse-id，点标题折叠/展开，
-         状态记在 localStorage（见 app.js 的 toggleCollapsibleCard）。 -->
+         状态记在 localStorage（见 app.js 的 toggleCollapsibleCard）。
+         2026-09-25：7 项路由参数**搬进「设置 → 智能体 → 通道设置」**（docs/设置项归属表.md
+         逐条给的归属：grp=router → 智能体/通道设置）。这里只留一张指路卡 ——
+         同一个设置项两处能改，就是 2026-09-19 那次"三处都在讲同一件事"的老问题。 -->
     <div class="card collapsible" id="rtSetCard" data-collapse-id="router-params">
       <div class="card-title"><span class="set-arrow">▶</span><span class="ic">⚙️</span>路由参数
         <span class="spacer"></span>
-        <span class="muted" style="font-size:12px">改完点「保存」；标注需重启的项要重启路由进程</span>
+        <span class="muted" style="font-size:12px">已移到「设置 → 智能体 → 通道设置」</span>
       </div>
       <div class="card-body">
-        <div id="rtSetHost" class="settings-form"></div>
+        <div class="muted" id="rtSetHost" style="font-size:12px">注册到 DSH / 模型组显示名 / 健康探测间隔 /
+          成员首字节与连接超时 / 熔断阈值与冷却，共 7 项 —— 现在与通道成员、优先级放在同一张卡里。</div>
         <div style="display:flex;gap:8px;align-items:center;padding-top:8px">
-          <button class="btn" id="rtSetSave">保存</button>
-          <span class="muted" style="font-size:12px" id="rtSetState"></span>
+          <button class="btn" id="rtSetGo">去设置里改</button>
+          <span class="muted" style="font-size:12px" id="rtSetState">改完点设置页的「保存」</span>
         </div>
       </div>
     </div>
