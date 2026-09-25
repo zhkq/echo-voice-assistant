@@ -46,7 +46,13 @@ class WizardUiWiringTests(unittest.TestCase):
                           "页签 %s 没有对应的 #view-%s 容器" % (name, name))
 
     def test_switch_view_dispatches_to_the_wizard_loader(self):
-        self.assertRegex(self.js, r'if \(name === "wizard"\) loadWizard\(\);')
+        """切到向导页签必须真的加载向导。
+
+        2026-09-25：`switchView()` 里那句从 `if (name === …)` 改成了
+        `if (view === …)`（先把老页签名折算成新 id，见 VIEW_ALIASES）——
+        断言的意图不变，只跟着变量名走。
+        """
+        self.assertRegex(self.js, r'if \(view === "wizard"\) loadWizard\(\);')
         self.assertIn("async function loadWizard()", self.js)
 
     def test_wizard_calls_only_the_wizard_endpoints_and_saves_choices(self):
@@ -108,7 +114,8 @@ class WizardUiWiringTests(unittest.TestCase):
         self.assertIn('api("/api/install/state")', self.js, "横幅读的是安装状态接口")
         # 横幅要给出两条明确去处，而不是只报个错
         self.assertIn('switchView("wizard")', self.js, "手动向导仍要可达")
-        self.assertIn('switchView("capabilities")', self.js, "补能力要可达")
+        # 2026-09-25 页签整合：「能力」页签改名「能力后端」（id capability），出口跟着改
+        self.assertIn('switchView("capability")', self.js, "补能力要可达")
         # 显式指定页签（?view=… / echo.gotoView）最优先，不许被默认逻辑抢走
         block = self.js[self.js.index("async function bootView()"):]
         block = block[:block.index("applyCollapsedCards()")]
@@ -132,7 +139,9 @@ class WizardUiWiringTests(unittest.TestCase):
         ``providers``）不是文案，不该被这条拦住；注释同理。
         """
         start = self.js.index("首装向导")
-        block = self.js[start:self.js.index("const _VIEWS")]
+        # 切片终点必须是**向导代码之后**的锚点：`_VIEWS` 2026-09-25 挪到了文件开头
+        # （页签整合时和 switchView 放在一起），所以这里改用底部那段的起点。
+        block = self.js[start:self.js.index("async function bootView()")]
         han = "[\u4e00-\u9fff]"
         # 只看**单行双引号字符串**：向导里所有"说给用户听"的话都是这种（what / lose / label /
         # note）。模板串基本是 markup + ${} 代码，扫它容易把 JSON.stringify 这类代码误判成文案。

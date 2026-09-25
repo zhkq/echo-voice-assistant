@@ -178,10 +178,18 @@ class GroupingTests(unittest.TestCase):
                          % sorted(declared - used))
 
     def test_api_rows_carry_the_sub_section(self):
-        """面板靠 `sub` 字段决定分节 —— 它必须随 /api/settings 下发（并由面板渲染）。"""
+        """面板靠 `sub` 字段决定**高级设置区里的小节名** —— 它必须随 /api/settings 下发并被渲染。
+
+        2026-09-25：原来这条盯的是"二级小节（可折叠）"；页签整合后设置卡片只有
+        「常用 + 高级」两段，`sub` 改作高级区里的小节标题（没有 sub 的键用 SET_ADV_SEC，
+        见 `sAdvSection()`）。函数 `toggleSetSub` 也改名成了 `toggleSetAdv`
+        （它是**高级区**的展开开关，不是子页签切换）—— 断言的意图没变：API 给的分组信息
+        必须真的被面板用上，而不是躺在字段里没人读。
+        """
         self.assertIn('s.sub', self.js, "面板要按 sub 分节")
         self.assertIn("renderGroupBody", self.js)
-        self.assertIn("toggleSetSub", self.js, "二级小节要能各自折叠")
+        self.assertIn("function toggleSetAdv", self.js, "高级设置区要能各自折叠")
+        self.assertIn("SET_ADV_SEC", self.js, "没有 sub 的键要有一份显式小节名")
 
     def test_no_visible_setting_lands_in_the_agent_group(self):
         """「智能体」组的整块内容由智能体表格渲染 —— 普通项进去就再也看不见了。"""
@@ -495,19 +503,21 @@ class OptionAndPanelWiringTests(unittest.TestCase):
                       "能力页签只放转写与朗读；语言模型在「模型路由」页签里")
         self.assertIn("capCompsOf", js, "组件按 kind 归到对应能力卡里")
 
-    def test_language_model_block_lives_in_the_model_router_tab(self):
-        """语言模型（用哪个实现 + 在线服务）整合到「模型路由」页签（2026-09-19 用户要求）。
+    def test_language_model_block_lives_in_the_agent_tab(self):
+        """语言模型（用哪个实现 + 在线服务）与路由的成员/优先级在同一页（2026-09-19 用户要求）。
 
         理由：LLM 的"用哪个实现"和路由的上游配置是同一件事 —— ECHO AUTO 的成员本来就在
-        那个页签里配，分两处只会互相找不着。
+        这一页配，分两处只会互相找不着。
+        2026-09-25：那一页原来叫「模型路由」，页签整合后叫「智能体」（id `view-agent`）——
+        断言的意图不变，只换了 id。
         """
         js = _read(os.path.join("web", "app.js"))
         html = _read(os.path.join("web", "index.html"))
         self.assertIn('id="rtLlmHost"', html)
-        self.assertLess(html.index('id="view-failover"'), html.index('id="rtLlmHost"'),
-                        "语言模型块要在「模型路由」页签里")
+        self.assertLess(html.index('id="view-agent"'), html.index('id="rtLlmHost"'),
+                        "语言模型块要在「智能体」页签里")
         self.assertLess(html.index('id="rtLlmHost"'), html.index('id="rtBadge"'),
-                        "它排在通道设置之前（先选用哪个，再配通道）")
+                        "它排在通道成员之前（先选用哪个，再配通道）")
         self.assertIn("function loadRouterLlm", js)
         self.assertIn('capProviderBlock("llm")', js, "复用同一套渲染（状态/出网图标/在线服务字段）")
         self.assertIn("loadRouterLlm();", js.split("async function loadRouter()")[1][:1200],
@@ -546,7 +556,7 @@ class OptionAndPanelWiringTests(unittest.TestCase):
         self.assertNotIn("数据不出本机", js)
 
     def test_router_settings_keys_match_the_router_group(self):
-        """`ROUTER_KEYS`（被「模型路由」页签接管的键）必须与 `grp="router"` 一一对应。"""
+        """`ROUTER_KEYS`（路由参数那 7 项）必须与 `grp="router"` 一一对应。"""
         js = _read(os.path.join("web", "app.js"))
         m = re.search(r"const ROUTER_KEYS = new Set\(\[(.*?)\]\);", js, re.S)
         self.assertIsNotNone(m, "app.js 里应有 ROUTER_KEYS")
@@ -555,35 +565,38 @@ class OptionAndPanelWiringTests(unittest.TestCase):
                 if meta.get("grp") == "router" and not meta.get("deprecated")}
         self.assertEqual(declared, want, "路由参数集合与 config 的 router 组漂移了")
 
-    def test_router_settings_live_in_the_settings_agent_tab(self):
-        """路由参数（grp=router 的 7 项）住在「设置 → 智能体 → 通道设置」（2026-09-25 重设计）。
+    def test_router_settings_live_in_the_agent_tab(self):
+        """路由参数（grp=router 的 7 项）住在**顶层「智能体」页签**的「通道设置」卡高级区里。
 
-        这一条**改过断言**：2026-09-19 那一版把它们放在顶部「模型路由」页签，而
-        `docs/设置项归属表.md`（由 config.DEFAULTS 机械导出）逐条给的归属是
-        「智能体 / 通道设置」。两处都能改就是"同一个设置项两套界面"，所以
-        「模型路由」页签只留一张指路卡（`#rtSetHost` + 「去设置里改」），
-        真正的编辑行在设置页的落点表（`SET_CARDS`）里。
+        这一条**改过两次断言**，两次都是"旧布局"：
+          * 2026-09-19 版：它们在「设置」页里；
+          * 2026-09-25 版（本文件上一稿）：它们搬到顶部「模型路由」页签，那一页留一张指路卡
+            （`#rtSetHost` + 「去设置里改」）；
+          * 2026-09-25 整合后：四个设置视图**就是顶层页签**，模型路由的内容并进「智能体」，
+            那张指路卡也就没有存在意义了 —— 连同 `#rtSetHost` / `#rtSetGo` / `#rtSetSave`
+            和 `loadRouterSettings()` 一起删掉。**同一个设置项只能有一处能改**，
+            落点写在 `SET_CARDS` 的落点表里。
+        断言守的仍是同一件事：这 7 项有且仅有一个落点，且确实是"通道设置"那张卡。
         """
         js = _read(os.path.join("web", "app.js"))
         html = _read(os.path.join("web", "index.html"))
-        for token in ('id="rtSetHost"', 'id="rtSetGo"'):
-            self.assertIn(token, html, "index.html 缺少 %s" % token)
-        self.assertLess(html.index('id="view-failover"'), html.index('id="rtSetHost"'),
-                        "指路卡要在「模型路由」页签里")
-        self.assertIn("function loadRouterSettings", js)
-        self.assertIn("loadRouterSettings();", js.split("async function loadRouter()")[1][:900],
-                      "切到模型路由页签时要渲染指路卡")
-        self.assertNotIn('id="rtSetSave"', html,
-                         "路由参数不该再有第二个保存按钮（同一项只有一处能改）")
+        for gone in ('id="rtSetHost"', 'id="rtSetGo"', 'id="rtSetSave"'):
+            self.assertNotIn(gone, html, "%s 应已删除（路由参数只剩一处落点）" % gone)
+        self.assertNotIn("function loadRouterSettings", js, "指路卡那套函数应已删除，别留死代码")
         m = re.search(r"const SET_CARDS = \{(.*?)\n\};", js, re.S)
         self.assertIsNotNone(m, "app.js 里应有 SET_CARDS（设置页的落点表）")
         block = m.group(1)
+        chan = block[block.index('id: "chan"'):] if 'id: "chan"' in block else ""
+        self.assertTrue(chan, "落点表里应有「通道设置」卡")
         for key in ("routerAutoRegister", "routerDisplayName", "routerProbeInterval",
                     "routerFirstByteTimeout", "routerConnectTimeout",
                     "routerBreakerThreshold", "routerBreakerCooldown"):
             with self.subTest(key=key):
-                self.assertIn('"%s"' % key, block, "%s 不在设置页的落点表里" % key)
-        self.assertIn("renderSettingRow", js, "复用设置页的行渲染（样式一致）")
+                self.assertIn('"%s"' % key, chan, "%s 不在「通道设置」卡的落点里" % key)
+        self.assertIn('id="rtMembers"', html, "成员与优先级那张卡仍在「智能体」页签里")
+        self.assertLess(html.index('id="view-agent"'), html.index('id="rtMembers"'),
+                        "通道成员卡要在「智能体」页签里")
+        self.assertIn("renderSettingRow", js, "复用同一套行渲染（样式一致）")
         self.assertIn("async function ensureSettings", js, "多个页签共用一份设置数据")
 
     def test_component_list_is_rows_not_a_cramped_table(self):

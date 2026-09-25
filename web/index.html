@@ -15,14 +15,18 @@
 <body>
 <header class="topbar">
   <div class="brand">ECHO<span class="sub">个人助理</span></div>
+  <!-- 顶层页签（2026-09-25 整合）：原来的「设置 / 启动 / 模型路由 / 能力」四个入口合并成
+       常规（原设置+启动）· 语音与设备 · 智能体（原模型路由）· 能力后端（原能力），
+       **只有这一层**，不再有子页签。旧深链 `?view=settings|boot|failover|capabilities`
+       由 app.js 的 VIEW_ALIASES 折算到新 id。 -->
   <nav class="tabs">
     <button class="tab active" data-view="dashboard">仪表盘</button>
-    <button class="tab" data-view="settings">设置</button>
+    <button class="tab" data-view="general">常规</button>
+    <button class="tab" data-view="voice">语音与设备</button>
+    <button class="tab" data-view="agent">智能体</button>
+    <button class="tab" data-view="capability">能力后端</button>
     <button class="tab" data-view="history">历史</button>
     <button class="tab" data-view="meetings">会议</button>
-    <button class="tab" data-view="boot">启动</button>
-    <button class="tab" data-view="failover">模型路由</button>
-    <button class="tab" data-view="capabilities">能力</button>
     <button class="tab" data-view="wizard">向导</button>
   </nav>
 </header>
@@ -74,7 +78,7 @@
         <div class="card failover-card" id="failoverCard" title="点击查看完整路由历史与状态">
           <div class="card-title"><span class="ic">🛰️</span>模型路由
             <span class="badge idle" id="foStateText">检查中…</span>
-            <a class="more" data-goto-link="failover" href="#">详情 ›</a>
+            <a class="more" data-goto-link="agent" href="#">详情 ›</a>
           </div>
           <div class="card-body failover-row">
             <div class="fo-right" id="foCounts"></div>
@@ -91,20 +95,18 @@
     </div>
   </section>
 
-  <!-- ============ 设置 ============
-       2026-09-25 重设计（规格：docs/设置项归属表.md · 视觉：docs/设置页重设计-样张.html）：
-       一个设置区、四个子页签（常规 / 语音与设备 / 智能体 / 能力后端），
-       每张卡都是「可折叠卡片 + 常用参数 + 默认收起的高级设置区」。
-       卡片与行**全部由 app.js 的 loadSettings() 渲染**（值来自 /api/settings 等接口），
-       这里只留四个空面板与顶部那条子页签栏 —— 静态写死值会和后端漂移。 -->
-  <section id="view-settings" class="view hidden">
+  <!-- ============ 常规（原「设置」+ 原「启动」）============
+       2026-09-25：四个设置视图现在是**顶层页签**，每页顶部一条工具条（保存 + 折叠全部卡片），
+       下面的卡片与行全部由 app.js 的 loadSettings() 渲染（值来自 /api/settings 等接口）——
+       静态写死值会和后端漂移，这里只留空面板。 -->
+  <section id="view-general" class="view hidden">
     <div class="card">
-      <div class="card-title">设置 <span class="muted">(保存到本地数据库)</span>
+      <div class="card-title">常规 <span class="muted">(保存到本地数据库)</span>
         <span class="spacer"></span>
-        <button class="btn" id="btnSettingsSave">保存</button>
+        <button class="btn" data-set-save="1">保存</button>
         <!-- 双箭头（2026-09-13 用户要求把文字按钮换成双箭头交互，并放到最右侧）：
              朝上=点了折叠全部，全折叠后翻 180° 朝下 -->
-        <button class="btn icon" id="btnSettingsCollapseAll" title="折叠全部卡片" aria-label="折叠全部卡片">
+        <button class="btn icon" data-set-collapse="1" title="折叠全部卡片" aria-label="折叠全部卡片">
           <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.4"
                stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
             <path d="M6 11.5 12 7l6 4.5" />
@@ -112,14 +114,195 @@
           </svg>
         </button>
       </div>
-      <div class="sset-tabs" id="settingsTabs"></div>
-      <div class="sset-who" id="settingsWho"></div>
+      <!-- 这一页管什么：文案由 app.js 的 SET_TABS[].who 填（单一出处，别在两处写标题） -->
+      <div class="sset-who"></div>
     </div>
-    <div id="settingsForm" class="settings-form">
-      <section class="ssetpane" data-settab-pane="general"><div id="setPaneGeneral"></div></section>
-      <section class="ssetpane hidden" data-settab-pane="voice"><div id="setPaneVoice"></div></section>
-      <section class="ssetpane hidden" data-settab-pane="agent"><div id="setPaneAgent"></div></section>
-      <section class="ssetpane hidden" data-settab-pane="capability"><div id="setPaneCapability"></div></section>
+    <!-- 设置卡片由 app.js 渲染进这个 pane（用 div 不用 section：视图内不再嵌 section，
+         `test_capability_panel` 那条"卡片在哪个视图里"的断言靠"取到视图自己的 </section>"来切） -->
+    <div class="ssetpane" data-settab-pane="general"><div id="setPaneGeneral"></div></div>
+
+    <!-- 原「启动」页签：组件启动状态 + 启动日志 -->
+    <div class="card">
+      <div class="card-title">启动状态
+        <span class="spacer"></span>
+        <span class="muted" id="bootSummary">—</span>
+      </div>
+      <div id="bootComponents" class="boot-list"></div>
+    </div>
+    <!-- 可折叠卡片（静态示例：class="collapsible" + data-collapse-id，点标题折叠/展开，
+         状态记在 localStorage，见 app.js 的 toggleCollapsibleCard）。 -->
+    <div class="card collapsible" id="bootLogCard" data-collapse-id="boot-logs">
+      <div class="card-title"><span class="set-arrow">▶</span>启动日志
+        <span class="muted" style="font-size:12px">(自动刷新)</span>
+        <span class="spacer"></span>
+        <!-- 在线时长 + 当前状态（用户 2026-09-12：原顶栏右上角那组信息挪到这里） -->
+        <span class="boot-live" id="bootLive">—</span>
+      </div>
+      <div class="card-body">
+        <div id="bootLogs" class="boot-log"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 语音与设备 ============ -->
+  <section id="view-voice" class="view hidden">
+    <div class="card">
+      <div class="card-title">语音与设备 <span class="muted">(保存到本地数据库)</span>
+        <span class="spacer"></span>
+        <button class="btn" data-set-save="1">保存</button>
+        <button class="btn icon" data-set-collapse="1" title="折叠全部卡片" aria-label="折叠全部卡片">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.4"
+               stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M6 11.5 12 7l6 4.5" />
+            <path d="M6 18.5 12 14l6 4.5" />
+          </svg>
+        </button>
+      </div>
+      <div class="sset-who"></div>
+    </div>
+    <div class="ssetpane" data-settab-pane="voice"><div id="setPaneVoice"></div></div>
+  </section>
+
+  <!-- ============ 智能体（原「设置 → 智能体」+ 原「模型路由」）============ -->
+  <section id="view-agent" class="view hidden">
+    <div class="card">
+      <div class="card-title">智能体 <span class="muted">(保存到本地数据库)</span>
+        <span class="spacer"></span>
+        <button class="btn" data-set-save="1">保存</button>
+        <button class="btn icon" data-set-collapse="1" title="折叠全部卡片" aria-label="折叠全部卡片">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.4"
+               stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M6 11.5 12 7l6 4.5" />
+            <path d="M6 18.5 12 14l6 4.5" />
+          </svg>
+        </button>
+      </div>
+      <div class="sset-who"></div>
+    </div>
+    <div class="ssetpane" data-settab-pane="agent"><div id="setPaneAgent"></div></div>
+
+    <!-- 原「模型路由」页签：语言模型（用哪个实现）+ 通道成员 + 派发情况 -->
+    <div class="card">
+      <div class="card-title"><span class="ic">🧠</span>语言模型（用哪个实现）
+        <span class="spacer"></span>
+        <span class="muted" id="rtLlmHint">生成纪要靠它；不装智能体也能出纪要</span>
+      </div>
+      <div class="card-body">
+        <div id="rtLlmHost" class="cap-prov"></div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-title"><span class="ic">🛰️</span>通道成员
+        <span class="badge idle" id="rtBadge">检查中…</span>
+        <span class="spacer"></span>
+        <a class="rt-link" id="rtDashLink" href="#" target="_blank" rel="noopener"
+           title="打开路由自带页面：命中统计与切换历史">仪表盘 ↗</a>
+      </div>
+      <div class="card-body">
+        <div class="rt-reg muted" id="rtReg">加载中…</div>
+        <div class="rt-list" id="rtMembers"></div>
+        <div class="rt-add">
+          <select id="rtCandSelect" class="ctl grow" title="候选来自 DSH 里已配置的模型供应商"></select>
+          <button class="btn" id="rtAdd" title="加入模型组">＋ 加入</button>
+          <button class="btn" id="rtSave" title="保存并让路由热重载 + 同步注册到 DSH">保存</button>
+        </div>
+        <div class="rt-foot">
+          <button class="link" id="rtProbe" title="不等后台周期，马上把所有成员探一遍">立即探测</button>
+          <span class="rt-sep">·</span>
+          <button class="link" id="rtReload" title="让路由进程重读 config.json">重载配置</button>
+          <span class="rt-sep">·</span>
+          <button class="link" id="rtRegister" title="把当前模型组写成 DSH 的本地模型">注册到 DSH</button>
+        </div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-title"><span class="ic">📊</span>派发情况</div>
+      <div class="card-body">
+        <div class="rt-stats" id="rtStats"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 能力后端（原「设置 → 能力后端」+ 原「能力」）============
+       每个能力只在这一处出现：先「用哪个实现」（本地引擎 / 在线服务 / 关闭），
+       再「装没装、怎么装」（组件就绪 + 下载/复制命令/官方链接）。
+       2026-09-19 用户指出三处设计重叠（模型页签 / 组件页签 / 设置里的 provider 卡片）
+       都只在讲"这台机器上每个功能由什么实现、装好了没"，故合并到这一个页签。 -->
+  <section id="view-capability" class="view hidden">
+    <div class="card">
+      <div class="card-title">能力后端 <span class="muted">(保存到本地数据库)</span>
+        <span class="spacer"></span>
+        <button class="btn" data-set-save="1">保存</button>
+        <button class="btn icon" data-set-collapse="1" title="折叠全部卡片" aria-label="折叠全部卡片">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.4"
+               stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M6 11.5 12 7l6 4.5" />
+            <path d="M6 18.5 12 14l6 4.5" />
+          </svg>
+        </button>
+      </div>
+      <div class="sset-who"></div>
+    </div>
+    <div class="ssetpane" data-settab-pane="capability"><div id="setPaneCapability"></div></div>
+
+    <!-- 原「能力」页签的内容 -->
+    <div class="card">
+      <div class="card-title"><span class="ic">🧩</span>能力
+        <span class="muted" id="capOvSummary">—</span>
+        <span class="spacer"></span>
+        <!-- 按钮短一点、用 mini：窄边条里原来「一键下载缺失 + 刷新」会折成两行
+             （用户 2026-09-19："第一排的一键下载缺失和刷新再缩一下，别换行"）。完整说明进 title。 -->
+        <button class="btn mini" id="btnCapDownloadMissing"
+                title="把所有缺失、且能从上游获取的模型排成队列依次下载">下载缺失</button>
+        <button class="btn mini" id="btnCapReload" title="重新读取能力与组件状态">刷新</button>
+      </div>
+      <div class="model-ov" id="capOverview"></div>
+      <div class="muted" style="margin-top:6px;font-size:12px">
+        每个能力一处看全：<b>用哪个实现</b>（本地 / 在线 / 关闭）+ <b>装没装、怎么装</b>。
+        下拉与开关都是选中即生效；密钥只存本机、接口永不回显；标「出网」的会把数据发到外部服务。
+      </div>
+    </div>
+    <div class="card" id="capRouteCard">
+      <div class="card-title"><span class="ic">🖥️</span>后端面板（GPU 机器 / 配对）
+        <span class="badge idle" id="capRouteBadge">读取中…</span>
+        <span class="spacer"></span>
+        <button class="btn mini" id="btnCapRouteProbe"
+                title="不等 30 秒缓存，马上把所有后端重问一遍">刷新</button>
+      </div>
+      <div class="card-body">
+        <!-- 配对：**粘一整串**（`echo://pair?host=…&code=…&fp=…`）或分开填地址+码。
+             **刻意不藏**（配好之后也留着）——"换一台后端"与"第一次配对"是同一件事，
+             藏起来只会让人找不到入口。 -->
+        <div id="capPairBox" class="cap-pair">
+          <div class="muted" style="font-size:12px">
+            这台机器可以把 GPU 重活（会议转写 / 说话人分离 / 声纹）交给一台带显卡的
+            ECHO 后端做。<b>音频会离开这台机器</b>，所以要不要用由你决定（见上面的「会议转写服务」卡）。
+            管理员给你一张<b>配对码或配对串</b>（<code>echo://pair?host=…&amp;code=…&amp;fp=…</code>），
+            整串粘在下面第一个框里即可；串里带指纹时会 <b>校验证书</b>，那是防中间人的一步。
+          </div>
+          <div class="cap-pair-row">
+            <input id="capPairUrl" class="ctl grow" type="text" spellcheck="false"
+                   placeholder="配对串（echo://pair?host=…）或后端地址，例如 10.100.0.24:8900">
+            <input id="capPairCode" class="ctl" type="text" spellcheck="false"
+                   placeholder="配对码" style="max-width:140px">
+            <button class="btn" id="btnCapPair">配对</button>
+            <button class="btn hidden" id="btnCapUnpair"
+                    title="让这台机器忘掉后端凭据（服务端那本清单归管理员）">解除配对</button>
+          </div>
+          <div class="muted" id="capPairState" style="font-size:12px"></div>
+        </div>
+        <div id="capBackendList" class="cap-prov"></div>
+        <!-- 这一格只放一句指路：转写/分离/声纹的选择已经收进上面的「会议转写服务」卡
+             （一个单选 + 一个「会议产出」下拉 = 原来那三个键），所以这里不再放第二套下拉。
+             2026-09-25：同一个设置项两处能改，就是 2026-09-19 那次"三处都在讲同一件事"的老问题。 -->
+        <div id="capRouteSettings" class="settings-form"></div>
+      </div>
+    </div>
+    <div class="model-cards" id="capKindCards"></div>
+    <div class="model-cards" id="capFuncCards"></div>
+    <div id="capEnvHost"></div>
+    <div class="muted model-foot">
+      路径是代码约定，改了加载器就找不到模型，所以原样展示。「已选但未就绪」会标红并给「去下载」。
     </div>
   </section>
 
@@ -146,159 +329,9 @@
     </div>
   </section>
 
-  <!-- ============ 启动 ============ -->
-  <section id="view-boot" class="view hidden">
-    <div class="card">
-      <div class="card-title">启动状态
-        <span class="spacer"></span>
-        <span class="muted" id="bootSummary">—</span>
-      </div>
-      <div id="bootComponents" class="boot-list"></div>
-    </div>
-    <div class="card">
-      <div class="card-title">启动日志 <span class="muted" style="font-size:12px">(自动刷新)</span>
-        <span class="spacer"></span>
-        <!-- 在线时长 + 当前状态（用户 2026-09-12：原顶栏右上角那组信息挪到这里） -->
-        <span class="boot-live" id="bootLive">—</span>
-      </div>
-      <div id="bootLogs" class="boot-log"></div>
-    </div>
-  </section>
-
-  <!-- ============ 模型路由：通道设置 + 派发情况（两张独立卡片，2026-09-13 拆分） ============ -->
-  <section id="view-failover" class="view hidden">
-    <div class="card">
-      <div class="card-title"><span class="ic">🧠</span>语言模型（用哪个实现）
-        <span class="spacer"></span>
-        <span class="muted" id="rtLlmHint">生成纪要靠它；不装智能体也能出纪要</span>
-      </div>
-      <div class="card-body">
-        <div id="rtLlmHost" class="cap-prov"></div>
-      </div>
-    </div>
-    <div class="card">
-      <div class="card-title"><span class="ic">🛰️</span>通道设置
-        <span class="badge idle" id="rtBadge">检查中…</span>
-        <span class="spacer"></span>
-        <a class="rt-link" id="rtDashLink" href="#" target="_blank" rel="noopener"
-           title="打开路由自带页面：命中统计与切换历史">仪表盘 ↗</a>
-      </div>
-      <div class="card-body">
-        <div class="rt-reg muted" id="rtReg">加载中…</div>
-        <div class="rt-list" id="rtMembers"></div>
-        <div class="rt-add">
-          <select id="rtCandSelect" class="ctl grow" title="候选来自 DSH 里已配置的模型供应商"></select>
-          <button class="btn" id="rtAdd" title="加入模型组">＋ 加入</button>
-          <button class="btn" id="rtSave" title="保存并让路由热重载 + 同步注册到 DSH">保存</button>
-        </div>
-        <div class="rt-foot">
-          <button class="link" id="rtProbe" title="不等后台周期，马上把所有成员探一遍">立即探测</button>
-          <span class="rt-sep">·</span>
-          <button class="link" id="rtReload" title="让路由进程重读 config.json">重载配置</button>
-          <span class="rt-sep">·</span>
-          <button class="link" id="rtRegister" title="把当前模型组写成 DSH 的本地模型">注册到 DSH</button>
-        </div>
-      </div>
-    </div>
-    <!-- 可折叠卡片：class="collapsible" + data-collapse-id，点标题折叠/展开，
-         状态记在 localStorage（见 app.js 的 toggleCollapsibleCard）。
-         2026-09-25：7 项路由参数**搬进「设置 → 智能体 → 通道设置」**（docs/设置项归属表.md
-         逐条给的归属：grp=router → 智能体/通道设置）。这里只留一张指路卡 ——
-         同一个设置项两处能改，就是 2026-09-19 那次"三处都在讲同一件事"的老问题。 -->
-    <div class="card collapsible" id="rtSetCard" data-collapse-id="router-params">
-      <div class="card-title"><span class="set-arrow">▶</span><span class="ic">⚙️</span>路由参数
-        <span class="spacer"></span>
-        <span class="muted" style="font-size:12px">已移到「设置 → 智能体 → 通道设置」</span>
-      </div>
-      <div class="card-body">
-        <div class="muted" id="rtSetHost" style="font-size:12px">注册到 DSH / 模型组显示名 / 健康探测间隔 /
-          成员首字节与连接超时 / 熔断阈值与冷却，共 7 项 —— 现在与通道成员、优先级放在同一张卡里。</div>
-        <div style="display:flex;gap:8px;align-items:center;padding-top:8px">
-          <button class="btn" id="rtSetGo">去设置里改</button>
-          <span class="muted" style="font-size:12px" id="rtSetState">改完点设置页的「保存」</span>
-        </div>
-      </div>
-    </div>
-    <div class="card">
-      <div class="card-title"><span class="ic">📊</span>派发情况</div>
-      <div class="card-body">
-        <div class="rt-stats" id="rtStats"></div>
-      </div>
-    </div>
-  </section>
-
-  <!-- ============ 能力：原「模型」「组件」两个页签 + 设置页的「能力 provider」卡片合并而来 ============
-       每个能力只在这一处出现：先「用哪个实现」（本地引擎 / 在线服务 / 关闭），
-       再「装没装、怎么装」（组件就绪 + 下载/复制命令/官方链接）。
-       2026-09-19 用户指出三处设计重叠（模型页签 / 组件页签 / 设置里的 provider 卡片）
-       都只在讲"这台机器上每个功能由什么实现、装好了没"，故合并成一个一级页签。
-       语言模型（LLM）不在这里：它的"用哪个实现"与路由的上游配置是同一件事
-       （ECHO AUTO 的成员就在「模型路由」里配），2026-09-19 用户要求整合过去。 -->
-  <section id="view-capabilities" class="view hidden">
-    <div class="card">
-      <div class="card-title"><span class="ic">🧩</span>能力
-        <span class="muted" id="capOvSummary">—</span>
-        <span class="spacer"></span>
-        <!-- 按钮短一点、用 mini：窄边条里原来「一键下载缺失 + 刷新」会折成两行
-             （用户 2026-09-19："第一排的一键下载缺失和刷新再缩一下，别换行"）。完整说明进 title。 -->
-        <button class="btn mini" id="btnCapDownloadMissing"
-                title="把所有缺失、且能从上游获取的模型排成队列依次下载">下载缺失</button>
-        <button class="btn mini" id="btnCapReload" title="重新读取能力与组件状态">刷新</button>
-      </div>
-      <div class="model-ov" id="capOverview"></div>
-      <div class="muted" style="margin-top:6px;font-size:12px">
-        每个能力一处看全：<b>用哪个实现</b>（本地 / 在线 / 关闭）+ <b>装没装、怎么装</b>。
-        下拉与开关都是选中即生效；密钥只存本机、接口永不回显；标「出网」的会把数据发到外部服务。
-      </div>
-    </div>
-    <div class="card" id="capRouteCard">
-      <div class="card-title"><span class="ic">🖥️</span>GPU 后端（ECHO 能力后端）
-        <span class="badge idle" id="capRouteBadge">读取中…</span>
-        <span class="spacer"></span>
-        <button class="btn mini" id="btnCapRouteProbe"
-                title="不等 30 秒缓存，马上把所有后端重问一遍">刷新</button>
-      </div>
-      <div class="card-body">
-        <!-- 配对：**粘一整串**（`echo://pair?host=…&code=…&fp=…`）或分开填地址+码。
-             **刻意不藏**（配好之后也留着）——"换一台后端"与"第一次配对"是同一件事，
-             藏起来只会让人找不到入口。 -->
-        <div id="capPairBox" class="cap-pair">
-          <div class="muted" style="font-size:12px">
-            这台机器可以把 GPU 重活（会议转写 / 说话人分离 / 声纹）交给一台带显卡的
-            ECHO 后端做。<b>音频会离开这台机器</b>，所以要不要用由你决定（见下面的「允许音频去哪」）。
-            管理员给你一张<b>配对码或配对串</b>（<code>echo://pair?host=…&amp;code=…&amp;fp=…</code>），
-            整串粘在下面第一个框里即可；串里带指纹时会 <b>校验证书</b>，那是防中间人的一步。
-          </div>
-          <div class="cap-pair-row">
-            <input id="capPairUrl" class="ctl grow" type="text" spellcheck="false"
-                   placeholder="配对串（echo://pair?host=…）或后端地址，例如 10.100.0.24:8900">
-            <input id="capPairCode" class="ctl" type="text" spellcheck="false"
-                   placeholder="配对码" style="max-width:140px">
-            <button class="btn" id="btnCapPair">配对</button>
-            <button class="btn hidden" id="btnCapUnpair"
-                    title="让这台机器忘掉后端凭据（服务端那本清单归管理员）">解除配对</button>
-          </div>
-          <div class="muted" id="capPairState" style="font-size:12px"></div>
-        </div>
-        <div id="capBackendList" class="cap-prov"></div>
-        <!-- 「开会转写 / 说话人分离 / 声纹」分别用哪个后端（+ 允许音频去哪）。
-             这几行由 renderSettingRow 渲染（与设置页同一套标签/下拉/说明），
-             数据来自 /api/capability 的 settings —— 它们本身是 hidden，不出现在设置页。 -->
-        <div id="capRouteSettings" class="settings-form"></div>
-        <div class="cap-pair-row" style="padding-top:8px">
-          <button class="btn" id="btnCapRouteSave">保存</button>
-          <span class="muted" id="capRouteSaveState" style="font-size:12px"></span>
-        </div>
-      </div>
-    </div>
-    <div class="model-cards" id="capKindCards"></div>
-    <div class="model-cards" id="capFuncCards"></div>
-    <div id="capEnvHost"></div>
-    <div class="muted model-foot">
-      路径是代码约定，改了加载器就找不到模型，所以原样展示。「已选但未就绪」会标红并给「去下载」。
-    </div>
-  </section>
-  <!-- ============ 首装向导（D23/D24；设计见 docs/向导-分步设计.md）============
+  
+  
+    <!-- ============ 首装向导（D23/D24；设计见 docs/向导-分步设计.md）============
        读者假设是「没用过 ECHO、没有技术背景」的同事，所以文案一律说人话：
        每步都是「这是干什么的 / 不装会怎样 / 你要决定什么」。
        前 9 步只做选择（只读体检 + 写计划），点「开始准备」才真正下载。 -->

@@ -637,6 +637,11 @@ class PanelWiringTests(unittest.TestCase):
     2026-09-19 变化：原「模型」页签 + 原「组件」页签 + 设置页的「能力 provider」卡片
     三处都在回答"每个功能由什么实现、装好了没"，用户指出设计重叠 → 合并成一个
     一级页签「能力」（`#view-capabilities`）。provider 的选择/在线服务编辑搬进该页签。
+
+    2026-09-25 变化（**改的是布局断言，不是意图**）：顶层页签整合后那个页签叫「能力后端」，
+    id 改成 `#view-capability`，分发也从 `switchView()` 里的 if 链变成了
+    `if (view === "capability") { loadSettings(); loadCapabilities(); }`。
+    这条守的仍是同一件事：**那个页签存在、切过去真的会加载**。
     """
 
     @classmethod
@@ -655,14 +660,14 @@ class PanelWiringTests(unittest.TestCase):
         self.assertIn("/api/components?includeBlocked=true", self.js)
 
     def test_capability_page_is_a_first_level_tab_and_loaded(self):
-        self.assertIn('data-view="capabilities"', self.html)
-        self.assertIn('id="view-capabilities"', self.html)
-        self.assertIn('if (name === "capabilities") loadCapabilities();', self.js,
-                      "切到能力页签时必须加载（否则页面永远空白）")
+        self.assertIn('data-view="capability"', self.html)
+        self.assertIn('id="view-capability"', self.html)
+        self.assertIn('if (view === "capability") { loadSettings(); loadCapabilities(); }', self.js,
+                      "切到能力后端页签时必须加载（否则页面永远空白）")
         # 两个旧页签已合并进来，不该再有各自的挂载点/分发
         for gone in ('data-view="models"', 'data-view="components"',
                      'id="providersHost"', 'id="componentsHost"'):
-            self.assertNotIn(gone, self.html, "%s 应已被「能力」页签合并" % gone)
+            self.assertNotIn(gone, self.html, "%s 应已被「能力后端」页签合并" % gone)
         self.assertNotIn("loadProviders()", self.js)
         self.assertNotIn("loadModels()", self.js.split("function downloadMissingModels")[0])
 

@@ -23,7 +23,11 @@ def _read(name):
         return fh.read()
 
 #: 这张卡里**要被人点的**元素（必须真接上事件，否则点了没反应）。
-_WIRED_IDS = ("btnCapPair", "btnCapUnpair", "btnCapRouteSave", "btnCapRouteProbe",
+#: 2026-09-25 移除了 `btnCapRouteSave`：转写/分离/声纹三项（+ 出网许可、后端地址）已经收进
+#: 本页顶部的「会议转写服务」卡（一个单选 + 一个「会议产出」下拉 = 原来那三个键），
+#: 那张卡的行随页签顶部的「保存」落库，所以这个"第二套下拉的保存按钮"被删掉了
+#: （删的是**元素本身**，不是放宽这条断言的意图：要点的东西仍然必须接线）。
+_WIRED_IDS = ("btnCapPair", "btnCapUnpair", "btnCapRouteProbe",
               "capPairUrl", "capPairCode", "capPairState", "capBackendList",
               "capRouteSettings", "capRouteBadge")
 
@@ -60,13 +64,13 @@ class CapabilityCardWiringTests(unittest.TestCase):
                 self.assertIn(el, self.js_ids, "HTML 里有，但 JS 从来没引用它（点了没反应）")
 
     def test_the_card_lives_inside_the_capabilities_tab(self):
-        """**不新开页签**，长在「能力」页签里。
+        """**不新开页签**，长在「能力后端」页签里（2026-09-25 整合后就是顶层页签之一）。
 
         用户 2026-09-19 定的规矩："每个能力只在这一处出现" —— 当时的模型页签 / 组件页签 /
-        设置里的 provider 卡片三处都在讲同一件事，因此被合并。再开一个「能力路由」页签
-        就是走回合并之前。
+        设置里的 provider 卡片三处都在讲同一件事，因此被合并。这条断言守的是同一个意图，
+        只是页签 id 从 `view-capabilities` 改名成了 `view-capability`。
         """
-        start = self.html.index('id="view-capabilities"')
+        start = self.html.index('id="view-capability"')
         end = self.html.index("</section>", start)
         self.assertIn('id="capRouteCard"', self.html[start:end],
                       "GPU 后端卡跑到「能力」页签外面去了")

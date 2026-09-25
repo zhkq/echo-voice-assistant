@@ -88,7 +88,14 @@ class PanelLayoutContractTests(unittest.TestCase):
 
 
 class CollapsibleCardWiringTests(unittest.TestCase):
-    """可折叠卡片的接线（2026-09-19：先"路由参数增加折叠"，再"能力下面的各卡片也增加折叠"）。"""
+    """可折叠卡片的接线（2026-09-19：先"路由参数增加折叠"，再"能力下面的各卡片也增加折叠"）。
+
+    2026-09-25（页签整合）：原来拿「模型路由 → 路由参数」卡当**静态样板** —— 那张卡已经删了
+    （7 项路由参数搬进「智能体」页签的「通道设置」卡，由 JS 渲染），静态样板换成「常规」页签里
+    的**启动日志卡**（`data-collapse-id="boot-logs"`，真的静态、真的可折）。
+    这条断言的意图没变：index.html 里必须有一个货真价实的 `class="card collapsible"` 样板，
+    标题里带箭头、后面跟 `card-body`。
+    """
 
     @classmethod
     def setUpClass(cls):
@@ -97,13 +104,13 @@ class CollapsibleCardWiringTests(unittest.TestCase):
         with open(os.path.join(_ROOT, "web", "app.js"), encoding="utf-8") as fh:
             cls.js = fh.read()
 
-    def test_router_params_card_is_collapsible(self):
+    def test_static_collapsible_card_is_wired(self):
         self.assertIn('class="card collapsible"', self.html)
-        self.assertIn('data-collapse-id="router-params"', self.html)
-        m = re.search(r'<div class="card collapsible"[^>]*data-collapse-id="router-params">(.*?)<div class="card-body">',
+        self.assertIn('data-collapse-id="boot-logs"', self.html)
+        m = re.search(r'<div class="card collapsible"[^>]*data-collapse-id="boot-logs">(.*?)<div class="card-body">',
                       self.html, re.S)
-        self.assertIsNotNone(m, "找不到路由参数卡的标题块")
-        self.assertIn('class="set-arrow"', m.group(1), "标题里要有折叠箭头（与设置页分组同一套视觉）")
+        self.assertIsNotNone(m, "找不到启动日志卡的标题块")
+        self.assertIn('class="set-arrow"', m.group(1), "标题里要有折叠箭头（与设置页卡片同一套视觉）")
 
     def test_toggle_is_wired_with_persistence(self):
         for token in ("function toggleCollapsibleCard", "function applyCollapsedCards",
@@ -124,8 +131,10 @@ class CollapsibleCardWiringTests(unittest.TestCase):
                       'class="mcard${cls} collapsible"'):
             with self.subTest(token=token):
                 self.assertIn(token, self.js)
-        self.assertIn('applyCollapsedCards($("#view-capabilities"))', self.js,
-                      "动态卡片每次重绘后都要重新应用折叠状态")
+        # 动态卡片每次重绘后都要重新应用折叠状态（id 从 view-capabilities 改名为 view-capability）
+        self.assertIn('applyCollapsedCards($("#view-capability"))', self.js)
+        self.assertIn('["#view-general", "#view-voice", "#view-agent", "#view-capability"]', self.js,
+                      "四个设置页签的卡片都要重新应用折叠状态")
 
     def test_capability_top_buttons_are_compact(self):
         """顶部「下载缺失 / 刷新」要短、用 mini、同行不换行（用户实测反馈）。"""
