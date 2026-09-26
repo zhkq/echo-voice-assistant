@@ -90,6 +90,40 @@ TIMESTAMPS_LABELS: Dict[str, str] = {
     "none": "没有时间轴",
 }
 
+#: 同一档位的**短说法**（会议历史列表一行里塞不下上面那句解释）。
+#: 只在这里定义一次：列表用短说法、详情用长说法，两处都从这一份表里取词。
+TIMESTAMPS_SHORT: Dict[str, str] = {
+    "exact": "精确",
+    "aligned": "对齐",
+    "estimated": "估算",
+    "none": "无时间轴",
+}
+
+
+def timestamps_summary(timestamps_kinds: Any) -> Optional[Dict[str, Any]]:
+    """`meta.json` 的 `timestampsKinds` → 会议历史列表卡片要的那一格（没记过返回 None）。
+
+    形状：`{kinds: {档位: 段数}, label: "估算（按字数均摊） × 1", short: "估算 × 1"}`。
+    数字与档位**全部来自录音当时写下的快照**，这里只做翻译，**不重算** ——
+    与 `plan_summary` 里那段是同一份判据（抽出来共用，免得两个接口各说一套）。
+    """
+    kinds: Dict[str, int] = {}
+    for key, value in _as_dict(timestamps_kinds).items():
+        try:
+            n = int(value)
+        except (TypeError, ValueError):
+            continue                        # 数不出来就当没记过 —— 别让列表打不开
+        if n:
+            kinds[str(key)] = n
+    if not kinds:
+        return None
+    pairs = sorted(kinds.items())
+    return {
+        "kinds": kinds,
+        "label": "；".join("%s × %d" % (TIMESTAMPS_LABELS.get(k, k), v) for k, v in pairs),
+        "short": "；".join("%s × %d" % (TIMESTAMPS_SHORT.get(k, k), v) for k, v in pairs),
+    }
+
 
 def _slot_label(slot: str) -> str:
     return SLOT_LABELS.get(slot, slot)
@@ -136,9 +170,12 @@ def plan_summary(plan: Any, timestamps_kinds: Any = None,
     dia = diarize_summary(diarize_state)
     if not isinstance(plan, dict):
         # 没有执行计划也不算"什么都没有"：分离没做成这一条照样要说（老会议没有 plan，
-        # 但新写的 `diarize` 快照是有的）。
+        # 但新写的 `diarize` 快照是有的）。时间轴档位与 plan 是**两件独立的记录**
+        # （老会议就是"有档位、没有 plan"），所以这里同样要带上它。
+        ts0 = timestamps_summary(timestamps_kinds) or {}
         return {"picks": [], "skipped": [], "candidates": {}, "notes": [],
-                "vectorSpaceId": "", "timestampsKinds": {}, "timestampsLabel": "",
+                "vectorSpaceId": "", "timestampsKinds": ts0.get("kinds") or {},
+                "timestampsLabel": ts0.get("label") or "",
                 "diarize": dia} if dia else None
     picks = []
     for slot, pick in sorted(_as_dict(plan.get("picks")).items()):
@@ -163,14 +200,10 @@ def plan_summary(plan: Any, timestamps_kinds: Any = None,
             "reasonLabel": REASON_LABELS.get(reason, reason or "（没给原因）"),
             "detail": str(item.get("detail") or ""),
         })
-    kinds: Dict[str, int] = {}
-    for key, value in _as_dict(timestamps_kinds).items():
-        try:
-            n = int(value)
-        except (TypeError, ValueError):
-            continue                    # 数不出来就当没记过 —— 别让详情页打不开
-        if n:
-            kinds[str(key)] = n
+    # 时间轴档位与详情**共用同一份翻译**（`timestamps_summary`）：会议历史列表与
+    # 会议详情是同一件事的两处展示，各算一遍迟早对不上。
+    ts = timestamps_summary(timestamps_kinds) or {}
+    kinds = ts.get("kinds") or {}
     if not (picks or skipped or kinds or dia):
         # 什么都没记（老会议 / 走的是本机回退路径）→ 返回 None 当"没有这段信息"，
         # 而不是给面板一个空壳（空壳会渲染成"用了谁：无"，看着像出了问题）。
@@ -184,8 +217,7 @@ def plan_summary(plan: Any, timestamps_kinds: Any = None,
         "notes": [str(n) for n in _as_list(plan.get("notes"))],
         "vectorSpaceId": plan.get("vectorSpaceId", ""),
         "timestampsKinds": kinds,
-        "timestampsLabel": "；".join(
-            "%s × %d" % (TIMESTAMPS_LABELS.get(k, k), v) for k, v in sorted(kinds.items())),
+        "timestampsLabel": ts.get("label") or "",
         # 分离这一场的结论（成没成 / 不成是为什么）。**面板不许自己编这句话**。
         "diarize": dia,
     }

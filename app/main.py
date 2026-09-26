@@ -114,6 +114,16 @@ async def lifespan(app: FastAPI):
     db.add_log("info", "server", "ECHO 面板已启动（后台组件拉起中）")
     yield
     # ---- 关闭 ----
+    # 临时解码 WAV 的**第二道闸**（第一道是 `api._drop_temp_decode`：响应发完即删）。
+    # `audiofile.cleanup_registered()` 此前只被定义、没有任何调用方，而
+    # `api.meeting_audio` 的注释里写着"退出时的清理兜底"——那句当时是假的
+    # （2026-09-26 复查发现）。放在 `runtime.stop_all()` **之前**：万一停止组件
+    # 卡住（历史上真卡过），临时文件也已经清干净了。
+    try:
+        from app.audio import audiofile as _audiofile
+        _audiofile.cleanup_registered()
+    except Exception as _e:
+        print(f"[meeting] 临时解码文件收尾失败（不影响退出）: {_e}")
     runtime.stop_all()
     db.add_log("info", "server", "ECHO 服务已停止")
 

@@ -79,6 +79,18 @@ class PanelLayoutContractTests(unittest.TestCase):
         self._assert_has(".cap-pair-row", "display: flex", "flex-wrap: wrap", "min-width: 0")
         self._assert_has(".cap-be-row", "display: flex", "flex-wrap: wrap", "min-width: 0")
 
+    def test_history_rows_can_shrink(self):
+        """历史页（2026-09-26 第二轮）新加的两处也要能收缩 / 能换行。
+
+        会议条目上的「说话人 / 转写档位 / 看转写」与指令条目上的「耗时 · 后端 · 来源」
+        都是**长短不定**的一串字（说话人可能是几个中文姓名、档位可能是"估算（按字数均摊） × 3"）。
+        不给 `min-width: 0` + 允许断行，窄边条里就会把这行顶宽（正是这份文件开头那次出血）。
+        """
+        self._assert_has(".meeting-item .m-spk, .meeting-item .m-ts",
+                         "min-width: 0", "overflow-wrap: anywhere")
+        self._assert_has(".meeting-item .m-acts", "min-width: 0")
+        self._assert_has(".cmd-item .cmd-detail", "min-width: 0", "overflow-wrap: anywhere")
+
     def test_collapsible_cards_have_styles(self):
         """可折叠卡片：折叠时藏 body、箭头转向 —— `.card` 与能力页签的 `.mcard` 都支持。"""
         self.assertIn(".card.collapsible.collapsed > .card-body", self.css)

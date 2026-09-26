@@ -4,12 +4,14 @@
 鉴权：settings.apiAuthEnabled=false（默认）时全开放（仅本机）；
 开启后除 /api/status 外均要求 `Authorization: Bearer <token>`（api_keys 表）。
 """
+import json
 import os
 import tempfile
 from typing import List
 
 from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, UploadFile
 from pydantic import BaseModel
+from starlette.background import BackgroundTask
 
 import app.db as db
 from app import __version__ as _ECHO_VERSION
@@ -598,10 +600,40 @@ def post_restart(_auth=Depends(optional_auth)):
     return {"ok": ok, "message": msg}
 
 
+# ---- 「历史 → 指令历史」的读面 ----------------------------------------------
+# 列表条目里 `meta` 是**字符串**（库里的 JSON）。面板要的是"发送当时走的是哪个智能体"，
+# 让它去 JSON.parse 一个字符串字段是没必要的耦合，所以在这里摊平成一个字段。
+# 老记录没有它 → 空串，面板据此**一个字都不显示**（不编"应该走的是 X"）。
+
+def _command_row(row):
+    """`commands` 的一行 → 面板条目（把 `meta` 里的展示字段摊平）。"""
+    out = dict(row)
+    meta = {}
+    try:
+        parsed = json.loads(out.get("meta") or "{}")
+        if isinstance(parsed, dict):
+            meta = parsed
+    except Exception:
+        meta = {}
+    out["backend"] = str(meta.get("backend") or "")
+    out["intent"] = str(meta.get("intent") or "")
+    # `meta` 原文仍原样带着（别处可能要看；删字段是另一种"改契约"）
+    return out
+
+
 @router.get("/commands")
-def get_commands(limit: int = 100, offset: int = 0, _auth=Depends(optional_auth)):
-    return {"total": db.count_commands(),
-            "items": db.list_commands(limit=min(limit, 500), offset=max(offset, 0))}
+def get_commands(limit: int = 100, offset: int = 0, q: str = "", since: str = "",
+                 _auth=Depends(optional_auth)):
+    """命令历史（面板「历史 → 指令历史」）。
+
+    `limit`/`offset` 是**分页**（「加载更多」按 offset 追加，不是把几千条一次画出来）；
+    `q` 是按关键词过滤，`since`（`YYYY-MM-DD HH:MM:SS`，本地时间）是按时间过滤。
+    过滤在 **SQL 里**做，`total` 因此是"过滤后一共几条" —— 面板据此决定还要不要给
+    「加载更多」，不用自己数。
+    """
+    items = [_command_row(r) for r in
+             db.list_commands(limit=min(limit, 500), offset=max(offset, 0), q=q, since=since)]
+    return {"total": db.count_commands(q=q, since=since), "items": items}
 
 
 @router.delete("/commands")
@@ -997,6 +1029,14 @@ def _import_uploads(pairs, title, start, notes, kw):
 @router.get("/meetings")
 def get_meetings(limit: int = 100, offset: int = 0, _auth=Depends(optional_auth)):
     items = db.list_meetings(limit=min(limit, 500), offset=max(offset, 0))
+    # 说话人**一次查询**喂整页（不是每场一条 SQL）。列表卡片显示"👥 3 人"。
+    # 字段名叫 `speakerNames` 而**不叫** `speakers`：详情接口的 `speakers` 是
+    # `db.get_speakers()` 的原始行（[{label, name, …}]），两个接口同名不同形，
+    # 迟早有人拿 `m.speakers[0].name` 去读列表那份、静默拿到 undefined。
+    speaker_names = db.speaker_names_by_meeting()
+    # 时间轴档位的中文翻译**只有 capability_admin 一份**（面板不抄词汇表），
+    # 循环外取一次就够 —— 别在循环里重复 import。
+    from app import capability_admin
     # 补充 has_summary 等轻量展示字段（列表信息展示优化，2026-09-10）
     for it in items:
         folder = os.path.join(meeting.meetings_dir(), it["name"])
@@ -1009,6 +1049,15 @@ def get_meetings(limit: int = 100, offset: int = 0, _auth=Depends(optional_auth)
             it["compression"] = meeting.compression_info(it["name"])
         except Exception:
             it["compression"] = None
+        it["speakerNames"] = speaker_names.get(it["id"], [])
+        # 「转写档位」（2026-09-26，历史 → 会议历史列表）：exact / aligned / estimated。
+        # 与详情页的 `capability.timestampsLabel` **同一份翻译、同一份快照**
+        # （`capability_admin.timestamps_summary`），没记过的老会议是 None → 不显示。
+        try:
+            it["timestamps"] = capability_admin.timestamps_summary(
+                meeting.meeting_meta(it["name"]).get("timestampsKinds"))
+        except Exception:
+            it["timestamps"] = None
     return {"items": items}
 
 
@@ -1078,9 +1127,11 @@ def meeting_audio(mid: int, seg: int = 1, _auth=Depends(optional_auth)):
       * 是 `.flac` → **用时解码**成临时 WAV 再回（浏览器对 `audio/flac` 的支持
         并不一致，而我们已经有一条可靠的解码路，没必要把它交给浏览器赌）。
 
-    临时文件不在这里删：它是**正在被 HTTP 流式读**的文件，删了会让播放中途断掉。
-    它落在 `audiofile.TEMP_DECODE_DIR`，由 `audiofile.gc_temp()`（下次解码时顺手扫）
-    与退出时的清理兜底 —— 这一点在代码注释里写明，免得日后有人以为它是泄漏。
+    临时文件在这里**不立刻删**（它正被 HTTP 流式读，删了播放会中途断），但也不
+    等一小时：删的动作挂成响应的 `BackgroundTask`，**响应发完就跑**（见下面的
+    `_drop_temp_decode`）。此前只有 `audiofile.gc_temp()`（下次解码时顺手扫，TTL
+    1 小时）与"进程退出"两道闸，而后者当时**并不存在**（`cleanup_registered()`
+    没有任何调用方，2026-09-26 复查发现并接上）—— 长跑的 ECHO 会把 `%TEMP%` 攒住。
 
     `seg` 是 int、`{seg:02d}` 不会带分隔符；会议目录名仍走 `_safe_under` 兜底
     （万一库里的 name 被写进奇怪值，也不至于跑到会议目录之外）。
@@ -1097,14 +1148,45 @@ def meeting_audio(mid: int, seg: int = 1, _auth=Depends(optional_auth)):
     if not path:
         raise HTTPException(status_code=404, detail="音频段不存在")
     from fastapi.responses import FileResponse
-    if audiofile.is_flac(path):
+    if not audiofile.is_flac(path):
+        return FileResponse(path, media_type="audio/wav", filename=f"seg{seg:02d}.wav")
+    src_name = os.path.basename(path)
+    try:
+        temp_wav = audiofile.decode_to_wav(path)
+    except audiofile.CompressionError as e:
+        raise HTTPException(status_code=500,
+                            detail="这段音频（%s）解不开，无法播放：%s" % (src_name, e))
+    # **日志留痕**（需求原话："临时文件用完即删并在日志说明"）：解了哪一段、多大、
+    # 什么时候删。没有这一行，日后翻日志只看得到"播放了"，看不出 %TEMP% 里为什么要
+    # 多一个 19 MB 的文件。
+    db.add_log("info", "meeting",
+               "面板播放第 %d 段：%s 是 FLAC 归档，用时解码成临时 WAV（%.1f MB）"
+               "交给浏览器（它只认 RIFF/WAV）——响应发完即删"
+               % (seg, src_name, audiofile.stat_bytes(temp_wav) / 1048576.0))
+    return FileResponse(temp_wav, media_type="audio/wav", filename=f"seg{seg:02d}.wav",
+                        background=BackgroundTask(_drop_temp_decode, temp_wav))
+
+
+def _drop_temp_decode(path):
+    """`FileResponse` 发完之后的收尾：删掉临时解码 WAV（`audiofile` 那边的登记一起撤）。
+
+    为什么不直接在 `meeting_audio` 里 `os.remove`：`FileResponse` 是**流式**的，
+    return 那一刻字节还没发完。Starlette 在响应全部发完之后才跑 background task，
+    这才是"用完即删"的正确落点。
+
+    删不掉**绝不影响**用户：这次播放已经成功，只留一条 warn（`drop_temp` 自己不抛）。
+    """
+    try:
+        from app.audio import audiofile
+        if not audiofile.drop_temp(path):
+            db.add_log("warn", "meeting",
+                       "临时解码文件没删掉（%s）——下次解码时 gc_temp() 会兜底"
+                       % os.path.basename(path))
+    except Exception as e:
         try:
-            path = audiofile.decode_to_wav(path)
-        except audiofile.CompressionError as e:
-            raise HTTPException(status_code=500,
-                                detail="这段音频（%s）解不开，无法播放：%s"
-                                       % (os.path.basename(path), e))
-    return FileResponse(path, media_type="audio/wav", filename=f"seg{seg:02d}.wav")
+            db.add_log("warn", "meeting", "临时解码文件收尾异常：%s" % e)
+        except Exception:
+            pass
 
 
 @router.delete("/meetings/{mid}")

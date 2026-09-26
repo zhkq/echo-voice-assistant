@@ -21,9 +21,13 @@
        3. 能力与智能体   智能体选择 · 模型路由（合并卡）· 设备选择
                          ├ 已配对后端连接情况   ├ 本地能力部署运行情况（默认只展开"配置为要用的"）
                          └ 清理（先预览、后确认）
-       4. 历史           指令历史 · 会议历史（**这一轮只预留位置/空态**）
+       4. 历史           指令历史 · 会议历史（两个子页签，见 #view-history）
        原来的「常规 / 语音与设备 / 智能体 / 能力后端」四个设置页签就是被这三类替掉的
        （内容一项没少，只是重新分组 + 默认折叠，见 docs/设置项归属表.md）。
+       2026-09-26（第二轮）：原来的第五个页签「会议记录」**整体并入「历史 → 会议历史」**
+       —— 同一个实体只留一处渲染（`renderMeetingItems`）、一处状态（`MEETINGS`），
+       顶层因此从 6 个页签变成 5 个；旧深链 `?view=meetings` 由 VIEW_ALIASES 折算到历史页，
+       并自动落到「会议历史」子页签。
        旧深链 `?view=settings|boot|voice|agent|failover|capabilities|wizard` 由 app.js 的
        VIEW_ALIASES 折算到新 id（wizard 还会自动展开那张卡并滚过去）。 -->
   <nav class="tabs">
@@ -32,7 +36,6 @@
     <button class="tab" data-view="business">业务配置</button>
     <button class="tab" data-view="capability">能力与智能体</button>
     <button class="tab" data-view="history">历史</button>
-    <button class="tab" data-view="meetings">会议记录</button>
   </nav>
 </header>
 
@@ -361,111 +364,138 @@
     </div>
   </section>
 
-  <!-- ============ 历史（**这一轮只预留位置/空态**）============
-       用户："后面再续上指令和会议历史"。所以这里**只做占位与指路**，
-       不新写任何历史功能：指令历史用现成的那一份（一直就有），
-       会议历史这一轮只留一句说明 + 去「会议记录」页的入口。 -->
+  <!-- ============ 历史：**两个子页签** —— 指令历史 · 会议历史 ============
+       2026-09-26（第二轮）：这一页从占位变成真的两页，并且把原来的顶层「会议记录」页
+       **整体并进「会议历史」**（顶层页签随之 6 → 5）。
+
+       为什么并进而不是并存：那两处是**同一个实体**（同一批 `meetings` 行、同一个目录）。
+       并存就必然出现"同一场会议在两页各有一份状态"，而用户反复强调的就是
+       「一个实体只有一处状态」。所以会议列表**只有一个** `#meetingList`、
+       只有一个渲染函数（app.js 的 `renderMeetingItems`），两页共用。
+
+       子页签复用会议详情页那套 `.tabs-sm` / `.tab-sm`（**不新造控件**）；
+       切换由 app.js 的 `switchHistoryTab()` 负责，深链 `?view=meetings` 也落到第二个子页签。 -->
   <section id="view-history" class="view hidden">
     <div class="card">
       <div class="card-title">历史
         <span class="spacer"></span>
-        <span class="muted" style="font-size:12px">指令历史 · 会议历史（会议历史这一轮只预留位置）</span>
+        <span class="muted" style="font-size:12px">说过的指令 · 开过的会</span>
       </div>
-      <div class="sset-who">两个历史页签的落点：<b>指令历史</b>（下面这张卡，现成功能）与
-        <b>会议历史</b>（后续版本并入这里；现在看会议记录请去「会议记录」页）。</div>
-    </div>
-    <div class="card collapsible" data-collapse-id="hist-meetings" data-collapse-default="closed">
-      <div class="card-title"><span class="set-arrow">▶</span><span class="ic">🎙️</span>会议历史
-        <span class="sbadge">后续版本</span></div>
-      <div class="card-body">
-        <div class="muted" style="font-size:12px;line-height:1.6">
-          这一轮<b>只预留位置</b>：会议历史会把"每一场会议 + 它的转写与纪要"按时间排在这里。
-          现在请用「会议记录」页看全部录音与转写（同一批数据，只是还没并到这一页）。
-        </div>
-        <div class="sacts" style="padding-top:6px">
-          <button class="btn mini" data-goto="meetings">去「会议记录」›</button>
-        </div>
+      <div class="tabs-sm">
+        <button class="tab-sm active" data-htab="commands">指令历史</button>
+        <button class="tab-sm" data-htab="meetings">会议历史</button>
       </div>
     </div>
-    <div class="card">
-      <div class="card-title">指令历史
-        <span class="spacer"></span>
-        <button class="btn danger" id="btnClearCmds">清空</button>
-      </div>
-      <div id="historyList" class="cmd-list"></div>
-    </div>
-  </section>
 
-  <!-- ============ 会议记录（原「会议」页）============ -->
-  <section id="view-meetings" class="view hidden">
-    <div class="card">
-      <div class="card-title">会议记录
-        <span class="spacer"></span>
-        <button class="btn" id="btnCompressToggle"
-                title="把历史会议的音频无损压成 FLAC：省约一半磁盘，转写文本逐字不变">压缩音频</button>
-        <button class="btn" id="btnImportToggle" title="把已有的录音（wav/flac/mp3/ogg）导入成一场会议">导入录音</button>
-        <button class="btn" id="btnMeetingFromList">开始录音</button>
-        <button class="btn danger" id="btnCleanShort" title="删除 2 分钟以内的会议录音（含音频）">清理短录音</button>
-      </div>
-      <!-- 历史音频无损压缩（FLAC）：入口在标题栏，展开后**先算给你看**
-           （可压缩 N 场 / 能省 X）→ 用户确认 → 才动手；进度复用上面的 tx-bar。 -->
-      <div id="compressBox" class="import-box hidden">
-        <div class="compress-row">
-          <span class="cr-label">能省多少</span>
-          <span id="compressPreview">正在计算…</span>
+    <!-- ---------- ① 指令历史 ---------- -->
+    <div id="htab-commands" class="htab">
+      <div class="card">
+        <div class="card-title">指令历史
+          <span class="muted" style="font-size:12px" id="cmdHistCount">—</span>
+          <span class="spacer"></span>
+          <button class="btn danger" id="btnClearCmds">清空</button>
         </div>
-        <div class="compress-note" id="compressNote"></div>
-        <div id="compressPicked" class="import-picked"></div>
-        <div class="import-actions">
-          <button class="btn primary" id="btnCompressStart" disabled>开始压缩</button>
-          <button class="btn" id="btnCompressCancel">取消</button>
-          <span class="muted" id="compressState"></span>
-        </div>
-        <div id="compressBar" class="tx-bar hidden"><i style="width:0%"></i></div>
-        <div class="muted" style="font-size:12px;margin-top:6px">
-          无损压缩（FLAC）：转写文本逐字不变，音频一个样本都不丢。
-          压缩后会读回比对（时长 + 逐样本），任何一项不过就保留原件并报错。
-          正在录音 / 正在转写的会议一律跳过；已经是 FLAC 的不会重复压。
-        </div>
-      </div>
-      <!-- 导入录音：文件（可多选，顺序即分段顺序）+ 可选标题，点「开始导入」上传。
-           上传进度与导入后的转写进度都走上面那条 tx-bar（与会议卡片同一套视觉，
-           不新造控件）。格式范围按**本机实测**写：见 app/audio/importer.py。 -->
-      <div id="importBox" class="import-box hidden">
-        <div class="set-row">
-          <label for="importFiles">录音文件</label>
-          <input class="ctl" type="file" id="importFiles" multiple
-                 accept=".wav,.flac,.mp3,.ogg,audio/wav,audio/flac,audio/mpeg,audio/ogg">
-          <div class="desc" id="importHint">可多选，顺序即分段顺序</div>
-        </div>
-        <div class="set-row">
-          <label for="importTitle">标题</label>
-          <input class="ctl" type="text" id="importTitle" placeholder="可留空，默认用时间" maxlength="200">
-          <div class="desc">留空则显示导入时间</div>
-        </div>
-        <div class="set-row">
-          <label for="importStart">会议时间</label>
-          <input class="ctl" type="text" id="importStart" placeholder="如 2026-09-20 10:48（可留空）">
-          <div class="desc">只影响会议名与显示的时间</div>
-        </div>
-        <div class="set-row">
-          <label for="importNotes">备注</label>
-          <input class="ctl" type="text" id="importNotes" placeholder="可留空" maxlength="2000">
-          <div class="desc">写进这场会议的备注</div>
-        </div>
-        <div id="importPicked" class="import-picked"></div>
-        <div class="import-actions">
-          <button class="btn primary" id="btnImportStart" disabled>开始导入</button>
-          <button class="btn" id="btnImportCancel">取消</button>
-          <span class="muted" id="importState"></span>
-        </div>
-        <div id="importBar" class="tx-bar hidden"><i style="width:0%"></i></div>
-        <div class="muted" style="font-size:12px;margin-top:6px">
-          可导入 wav / flac / mp3 / ogg（本机直接读）。m4a、aac 需要先用 ffmpeg 转成 wav 或 mp3，
-          导入时会把这一步告诉你。
+        <div class="card-body">
+          <!-- 过滤：关键词 + 时间范围。**在服务端过滤**（`GET /api/commands?q=&since=`）——
+               历史会有几千条，在"已加载的这一页"上过滤会让"加载更多"的语义错位。
+               行沿用设置卡那套 `.srow`（标签与控件同行、边条 84px，能收缩）。 -->
+          <div class="srow">
+            <div class="lbl"><span class="lt">筛选</span></div>
+            <div class="sctl">
+              <input class="ctl" type="text" id="cmdFilter" placeholder="关键词（指令或回复里）">
+              <select class="ctl" id="cmdRange" title="只看这段时间里的指令">
+                <option value="">全部时间</option>
+                <option value="1">今天</option>
+                <option value="7">近 7 天</option>
+                <option value="30">近 30 天</option>
+              </select>
+              <button class="btn mini" id="btnCmdFilter">查询</button>
+            </div>
+          </div>
+          <div id="historyList" class="cmd-list"></div>
+          <!-- 分页：一次 50 条，这里按 offset 追加。条数由服务端给的 total 决定，
+               面板不自己数（`hidden` 表示"已经到底了"）。 -->
+          <div class="sacts" style="padding-top:6px">
+            <button class="btn mini hidden" id="btnCmdMore">加载更多</button>
+          </div>
         </div>
       </div>
-      <div id="meetingList" class="meeting-list"></div>
+    </div>
+
+    <!-- ---------- ② 会议历史（原顶层「会议记录」页整页并入；操作入口一个都没少） ---------- -->
+    <div id="htab-meetings" class="htab hidden">
+      <div class="card">
+        <div class="card-title">会议历史
+          <span class="spacer"></span>
+          <button class="btn" id="btnCompressToggle"
+                  title="把历史会议的音频无损压成 FLAC：省约一半磁盘，转写文本逐字不变">压缩音频</button>
+          <button class="btn" id="btnImportToggle" title="把已有的录音（wav/flac/mp3/ogg）导入成一场会议">导入录音</button>
+          <button class="btn" id="btnMeetingFromList">开始录音</button>
+          <button class="btn danger" id="btnCleanShort" title="删除 2 分钟以内的会议录音（含音频）">清理短录音</button>
+        </div>
+        <!-- 历史音频无损压缩（FLAC）：入口在标题栏，展开后**先算给你看**
+             （可压缩 N 场 / 能省 X）→ 用户确认 → 才动手；进度复用上面的 tx-bar。 -->
+        <div id="compressBox" class="import-box hidden">
+          <div class="compress-row">
+            <span class="cr-label">能省多少</span>
+            <span id="compressPreview">正在计算…</span>
+          </div>
+          <div class="compress-note" id="compressNote"></div>
+          <div id="compressPicked" class="import-picked"></div>
+          <div class="import-actions">
+            <button class="btn primary" id="btnCompressStart" disabled>开始压缩</button>
+            <button class="btn" id="btnCompressCancel">取消</button>
+            <span class="muted" id="compressState"></span>
+          </div>
+          <div id="compressBar" class="tx-bar hidden"><i style="width:0%"></i></div>
+          <div class="muted" style="font-size:12px;margin-top:6px">
+            无损压缩（FLAC）：转写文本逐字不变，音频一个样本都不丢。
+            压缩后会读回比对（时长 + 逐样本），任何一项不过就保留原件并报错。
+            正在录音 / 正在转写的会议一律跳过；已经是 FLAC 的不会重复压。
+          </div>
+        </div>
+        <!-- 导入录音：文件（可多选，顺序即分段顺序）+ 可选标题，点「开始导入」上传。
+             上传进度与导入后的转写进度都走上面那条 tx-bar（与会议卡片同一套视觉，
+             不新造控件）。格式范围按**本机实测**写：见 app/audio/importer.py。 -->
+        <div id="importBox" class="import-box hidden">
+          <div class="set-row">
+            <label for="importFiles">录音文件</label>
+            <input class="ctl" type="file" id="importFiles" multiple
+                   accept=".wav,.flac,.mp3,.ogg,audio/wav,audio/flac,audio/mpeg,audio/ogg">
+            <div class="desc" id="importHint">可多选，顺序即分段顺序</div>
+          </div>
+          <div class="set-row">
+            <label for="importTitle">标题</label>
+            <input class="ctl" type="text" id="importTitle" placeholder="可留空，默认用时间" maxlength="200">
+            <div class="desc">留空则显示导入时间</div>
+          </div>
+          <div class="set-row">
+            <label for="importStart">会议时间</label>
+            <input class="ctl" type="text" id="importStart" placeholder="如 2026-09-20 10:48（可留空）">
+            <div class="desc">只影响会议名与显示的时间</div>
+          </div>
+          <div class="set-row">
+            <label for="importNotes">备注</label>
+            <input class="ctl" type="text" id="importNotes" placeholder="可留空" maxlength="2000">
+            <div class="desc">写进这场会议的备注</div>
+          </div>
+          <div id="importPicked" class="import-picked"></div>
+          <div class="import-actions">
+            <button class="btn primary" id="btnImportStart" disabled>开始导入</button>
+            <button class="btn" id="btnImportCancel">取消</button>
+            <span class="muted" id="importState"></span>
+          </div>
+          <div id="importBar" class="tx-bar hidden"><i style="width:0%"></i></div>
+          <div class="muted" style="font-size:12px;margin-top:6px">
+            可导入 wav / flac / mp3 / ogg（本机直接读）。m4a、aac 需要先用 ffmpeg 转成 wav 或 mp3，
+            导入时会把这一步告诉你。
+          </div>
+        </div>
+        <div class="muted" style="font-size:12px;margin-bottom:8px">
+          点一场看<b>转写</b>、纪要与导出（详情页右上角的「⬇ 离线HTML」）。
+        </div>
+        <div id="meetingList" class="meeting-list"></div>
+      </div>
     </div>
   </section>
 

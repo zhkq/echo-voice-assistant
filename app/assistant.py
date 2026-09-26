@@ -545,6 +545,20 @@ def strip_injections(text):
     return "\n".join(lines).strip()
 
 
+def _agent_snapshot():
+    """**发送当时**用的是哪个智能体（显示名）。取不到就空串 —— 不猜。
+
+    为什么要落进 `commands.meta`：面板「历史 → 指令历史」要显示"这条走的是哪个后端"。
+    这是个**快照**，与会议 `meta.json` 里那份能力快照同一条纪律 —— 用户以后换了智能体，
+    历史记录仍该说"当时走的是谁"，而不是拿现在的配置去解释过去。
+    """
+    try:
+        from app import agents
+        return str(agents.meta(agents.active_name()).get("displayName") or "")
+    except Exception:
+        return ""
+
+
 def _dispatch(text, source, workspace=None, session_id=None):
     """发送到 DSH + 等回复 + 简报 + 历史。"""
     cfg = settings
@@ -553,8 +567,11 @@ def _dispatch(text, source, workspace=None, session_id=None):
     # 语音路径（媒体键/唤醒/麦克风按钮）不带目标 → 沿用面板「命令目标」下拉保存的选择
     if not workspace and not session_id:
         workspace, session_id = _configured_command_target(client)
-    cmd_id = db.add_command(text, source=source, status="pending",
-                            meta={"workspace": workspace, "session_id": session_id} if (workspace or session_id) else None)
+    meta = {"workspace": workspace, "session_id": session_id}
+    backend = _agent_snapshot()
+    if backend:
+        meta["backend"] = backend
+    cmd_id = db.add_command(text, source=source, status="pending", meta=meta)
     db.add_event("command_received", {"id": cmd_id, "text": text, "source": source})
     db.add_log("info", "assistant", f"命令[{source}]: {text}"
                + (f" → 工作区={workspace}" if workspace else "")

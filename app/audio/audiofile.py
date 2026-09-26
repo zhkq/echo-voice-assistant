@@ -429,10 +429,31 @@ def _unregister_temp(path):
 
 
 def cleanup_registered():
-    """删掉本进程登记过的临时解码文件（测试与 shutdown 用）。"""
+    """删掉本进程登记过的临时解码文件（测试与 shutdown 用）。
+
+    ⚠️ 谁在调它：`app/main.py` 的 lifespan 关闭段。此前它**只被定义、没有任何调用方**
+    （2026-09-26 复查发现）—— 而 `api.meeting_audio` 的注释里写着"退出时的清理兜底"，
+    那句当时是假的。播放那一路现在改成**响应发完立刻删**（`drop_temp()` +
+    `BackgroundTask`），这个函数退化成"进程被杀/异常退出时的第二道闸"。
+    """
     for path in list(_TEMP_REGISTRY):
         _unlink(path)
         _unregister_temp(path)
+
+
+def drop_temp(path):
+    """删掉一个临时解码文件**并撤掉登记**；删干净返回 True。
+
+    给"流式回完之后才敢删"那一类调用方用（`api.meeting_audio` 的 `FileResponse`
+    background task）：`decoded()` 是 `with` 退出即删，但 HTTP 那条路不能——文件
+    正在被流式读，return 之前删掉会让播放中途断掉。
+
+    与 `decoded()` 的 finally 同一条纪律：**只删调用方自己的那个路径**，
+    删不掉也**不抛**（播放已经成功了，删不掉只该留一条日志）。
+    """
+    _unlink(path)
+    _unregister_temp(path)
+    return not os.path.exists(path)
 
 
 def _unlink(path):

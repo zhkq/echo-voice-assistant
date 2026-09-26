@@ -263,6 +263,25 @@ def _quiet_side_effects():
         yield
 
 
+def _drop_settings_cache():
+    """丢掉**进程级**配置缓存（`app.config.settings._cache`）。
+
+    为什么非清不可（2026-09-26 实测的跨模块泄漏）：`settings` 是 `app/config.py` 里的
+    `Settings()` **单例**，值缓存在**实例**的 `self._cache` 上；而各用例类只把
+    `db.DATA_DIR/DB_FILE` 指到临时库 —— 那个补丁**管不到这个内存缓存**。
+    于是"写进临时库 → `settings.get()` 读回并缓存"留下的值会活到下一个测试模块：
+    本模块的「全部设置往返」把 86 项都写成探测值（int = 当前值 + 7），
+    于是 `tests.test_model_cleanup` 读到 `modelCleanupDays=97` 而不是 90。
+
+    ⚠️ 别写成 `from app import config as settings` 再 `settings._cache = None` ——
+    那样绑到的是**模块** `app.config`，设的是模块属性，单例上的缓存一个字节都没动
+    （第一版修复就是这么写错的：实测跑完 `app.config.__dict__['_cache'] is None`
+    但 `app.config.settings._cache['modelCleanupDays'] == 97`）。
+    这里用文件顶部导入的 `settings`：它就是那个单例。
+    """
+    settings._cache = None
+
+
 class RoundTripTests(unittest.TestCase):
     """每一项都要能写进去、读回来（面板与 API 用的就是这条路径）。"""
 
@@ -285,6 +304,11 @@ class RoundTripTests(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         db.DATA_DIR, db.DB_FILE = cls._old
+        # **源头复原**：本轮把所有项都写成了探测值（int = 当前值 + 7 → modelCleanupDays=97），
+        # 这些值现在就在进程级 `settings._cache` 里。不清的话，下一个测试模块一读配置
+        # 就拿到它们（实测 `tests.test_model_cleanup` 读到 97）。清在恢复 db **之后**，
+        # 下一次 `get()` 才会从正确的库重新加载。
+        _drop_settings_cache()
         shutil.rmtree(cls.tmp, ignore_errors=True)
 
     def _served_now(self):
@@ -386,6 +410,9 @@ class DeprecationTests(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         db.DATA_DIR, db.DB_FILE = cls._old
+        # 同一类风险：这几个迁移用例也会把值读进进程级缓存（worklogEnabled / ttsEngine），
+        # 恢复 db 之后必须一并丢掉，别留给后面的模块。
+        _drop_settings_cache()
         shutil.rmtree(cls.tmp, ignore_errors=True)
 
     def test_deprecated_keys_are_invisible_and_read_only(self):
@@ -739,6 +766,23 @@ class OptionAndPanelWiringTests(unittest.TestCase):
         """智能体开关即单选：选中时要把该产品的启用开关一起打开，避免自相矛盾。"""
         js = _read(os.path.join("web", "app.js"))
         self.assertIn("target.configKey", js)
+
+
+def tearDownModule():
+    """本模块跑完**不许**把进程级 `settings._cache` 留给后面的模块（兜底的那一道）。
+
+    两道防线各有分工：`RoundTripTests.tearDownClass` / `DeprecationTests.tearDownClass`
+    负责"谁写脏谁复原"（精确、及时）；这里是模块级兜底 —— 将来新增的用例类要是忘了复原，
+    模块退出的这一下还能挡住（实测过：只靠"清缓存"这一句写错形式，97 就照旧漏出去）。
+
+    顺带清掉第一版修复误设的**模块属性** `app.config.__dict__["_cache"]`（见
+    `_drop_settings_cache()` 的说明）—— 它是 `from app import config as settings` 那句
+    留下的，没有任何代码读它，留着只会误导下一个来看的人。
+    """
+    _drop_settings_cache()
+    _cfg_module = sys.modules.get("app.config")
+    if _cfg_module is not None:
+        _cfg_module.__dict__.pop("_cache", None)
 
 
 if __name__ == "__main__":

@@ -568,6 +568,20 @@ select.ctl { text-overflow: ellipsis; }
 .meeting-item .m-compress {
   color: var(--accent); font-size: 11.5px; overflow-wrap: anywhere; min-width: 0;
 }
+/* 「历史 → 会议历史」多出来的两格：说话人 / 转写档位（2026-09-26 第二轮）。
+   与 .m-compress 同一条纪律：能换行、能收缩，不许把卡片顶宽。 */
+.meeting-item .m-spk, .meeting-item .m-ts {
+  font-size: 11.5px; overflow-wrap: anywhere; min-width: 0; margin-left: 6px;
+}
+.meeting-item .m-ts { color: var(--muted); }
+/* 「看转写 ›」：条目内的一个小入口（转写文本查看）。
+   整条卡片本来就可点（进详情），这个链接只是**直达转写页签**，所以点击要 stopPropagation。 */
+.meeting-item .m-acts { margin-top: 5px; min-width: 0; }
+.meeting-item .m-open { color: var(--accent); font-size: 12px; cursor: pointer; white-space: nowrap; }
+.meeting-item .m-open:hover { text-decoration: underline; }
+/* 指令历史多出来的那一行：耗时 / 后端 / 来源（2026-09-26 第二轮） */
+.cmd-item .cmd-detail { color: var(--muted); font-size: 11.5px; margin: 2px 0 4px;
+  overflow-wrap: anywhere; min-width: 0; }
 /* ---------- 无损压缩面板（会议页签，2026-09-26） ----------
    与导入那一块共用 `.import-box` / `.tx-bar` / `.import-picked`，
    只多"能省多少"这一行。**不做成 `.set-row`**（那会让预览文字与说明挤成两条窄列，
@@ -718,17 +732,34 @@ input[type="range"].seek::-moz-range-thumb { width: 13px; height: 13px; border-r
   box-shadow: 0 4px 20px rgba(0,0,0,.4);
 }
 
-/* ---------- 历史 / 会议整页：占满视口高度 ----------
+/* ---------- 历史整页：占满视口高度 ----------
    原来写死 height: calc(100vh - 180px)：这个 180px 是拍脑袋的，窄窗口/顶栏换行时对不上，
    结果卡片底边之下留一条空白（用户 2026-09-17：指令历史和会议下方都有一个空行、高度不合适）。
-   改成 flex 高度链，列表正好填满"顶栏以下、卡片以内"的剩余空间，不再依赖任何魔法数。 */
+   改成 flex 高度链，列表正好填满"顶栏以下、卡片以内"的剩余空间，不再依赖任何魔法数。
+
+   2026-09-26（第二轮）：「会议记录」并进这一页之后，这一页变成**两层** ——
+   页头（标题 + 指令历史/会议历史两个子页签）+ 子页签内容。所以 flex 高度链要
+   **穿过子页签那一层**（`.htab`），页头固定、内容卡占满剩下的高度、列表自己滚：
+   不然整页会滚起来，「加载更多」被推到看不见的地方（而它正是这次要有的东西）。 */
 body { display: flex; flex-direction: column; min-height: 100vh; }
 main { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
-#view-history:not(.hidden), #view-meetings:not(.hidden) {
+/* **整页不滚、列表自己滚**：`min-height: 100vh` 给的是下界不是上界 —— 链条上每一环
+   都是 auto 高度时，列表会把整页撑长（实测 126 条 = 6000px 的页面，「加载更多」被推到
+   最底下，等于没有分页）。所以"历史页可见"时把视口高度钉死。
+   为什么用 body 上的一个类而不是 `:has()`：面板也要在 WebView2 / 老一点的 Safari 里跑，
+   `:has()` 的版本门槛不值得为这一条去赌；`body.echo-offline` 已经是同一套做法。 */
+body.on-history { height: 100vh; overflow-y: hidden; }
+#view-history:not(.hidden) {
   display: flex; flex-direction: column; flex: 1 1 auto; min-height: 0;
 }
-#view-history .card, #view-meetings .card {
+#view-history > .card { flex: 0 0 auto; }              /* 页头：只占自己那么高 */
+#view-history .htab { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
+#view-history .htab > .card {
   flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; margin-bottom: 0;
+}
+/* 指令历史那张卡多一层 `.card-body`（过滤行 + 列表 + 「加载更多」都在里面） */
+#view-history .htab > .card > .card-body {
+  flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column;
 }
 #historyList, #meetingList {
   flex: 1 1 auto; min-height: 0; height: auto; max-height: none; overflow-y: auto;

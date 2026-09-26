@@ -28,6 +28,7 @@ from fastapi import FastAPI                                 # noqa: E402
 from fastapi.testclient import TestClient                   # noqa: E402
 
 import app.db as db                                         # noqa: E402
+from app import meeting as meeting_mod                      # noqa: E402
 from app import paths                                       # noqa: E402
 from app import ports                                       # noqa: E402
 from app.api import router                                  # noqa: E402
@@ -199,6 +200,147 @@ class MeetingErrorFieldContractTests(_IsolatedDb, unittest.TestCase):
         db.update_meeting(self.mid, status="transcribed", error="")
         detail = self.client.get("/api/meetings/%d" % self.mid).json()
         self.assertEqual((detail.get("error") or ""), "")
+
+
+class HistoryEndpointsContractTests(_IsolatedDb, unittest.TestCase):
+    """「历史」两个页的数据面（2026-09-26 第二轮）：
+
+      * `GET /api/commands` 的 **分页 + 关键词 + 时间** 过滤（历史会有几千条，
+        一次画完是不可能的，所以过滤必须在 SQL 里、`total` 必须是过滤后的条数）；
+      * `GET /api/meetings` 每条要带 **转写档位**（exact/estimated）与 **说话人**，
+        以及既有的 **compression**（「已压缩」标记）。
+
+    为什么这些是契约：面板不自己算这些数 —— 它只渲染接口给的东西。
+    接口把字段改名/漏带，用户看到的就是"这一格永远是空的"，而且不会报错。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        # **会议目录也必须隔离**：不隔离的话 `meeting.meetings_dir()` 会指到这台机器的
+        # 真实 `data/meetings`（用户有 9 场真会议）—— 本用例要往会议目录里写 meta.json，
+        # 那是绝对不许发生的事（docs/AGENTS.md：真实会议数据只读）。
+        cls.meetings_root = os.path.join(cls.tmp, "meetings")
+        os.makedirs(cls.meetings_root, exist_ok=True)
+        p = patch.object(meeting_mod, "meetings_dir", lambda: cls.meetings_root)
+        p.start()
+        cls.addClassCleanup(p.stop)
+        app = FastAPI()
+        app.include_router(router)
+        cls.client = TestClient(app)
+
+    def setUp(self):
+        self.ids = [
+            db.add_command("帮我把今天的待办整理成列表", source="web", status="done"),
+            db.add_command("明天天气怎么样", source="wake", status="done"),
+            db.add_command("这段没听清", source="hotkey", status="failed"),
+        ]
+        db.update_command(self.ids[0], reply="整理好了：3 条待办", duration_ms=12438)
+        db.update_command(self.ids[2], error="DSH 未运行")
+        # 时间过滤的判据：把中间那条推到很久以前（`ts` 是与接口同一个定宽文本格式，
+        # `update_command` 刻意不允许改 ts —— 它不该被业务代码改；这里只能直改一下）
+        db._exec("UPDATE commands SET ts=? WHERE id=?", ("2020-01-01 08:00:00", self.ids[1]))
+
+    def tearDown(self):
+        for cid in self.ids:
+            db._exec("DELETE FROM commands WHERE id=?", (cid,))
+
+    def test_paging_returns_total_and_a_slice(self):
+        r = self.client.get("/api/commands?limit=2&offset=0").json()
+        self.assertEqual(r["total"], 3)
+        self.assertEqual(len(r["items"]), 2)
+        r2 = self.client.get("/api/commands?limit=2&offset=2").json()
+        self.assertEqual(len(r2["items"]), 1)
+        # 倒序：最新的那条在第一个
+        self.assertEqual(r["items"][0]["id"], self.ids[2])
+
+    def test_keyword_filters_and_total_follows_the_filter(self):
+        r = self.client.get("/api/commands?q=天气").json()
+        self.assertEqual(r["total"], 1, "关键词过滤要发生在 SQL 里，total 也得跟着变")
+        self.assertEqual([it["id"] for it in r["items"]], [self.ids[1]])
+        # 回复正文也在搜索范围内（用户记得住助手回了什么，记不住原话时用得上）
+        self.assertEqual(self.client.get("/api/commands?q=整理好了").json()["total"], 1)
+        # 失败原因同理
+        self.assertEqual(self.client.get("/api/commands?q=DSH").json()["total"], 1)
+        # 过滤后没有：total=0 且 items 空（面板据此显示"没有符合条件的指令"）
+        empty = self.client.get("/api/commands?q=不存在的词").json()
+        self.assertEqual((empty["total"], empty["items"]), (0, []))
+
+    def test_like_wildcards_are_not_special(self):
+        """用户搜 `%` 不该变成"匹配一切"（LIKE 的通配符要转义）。"""
+        self.assertEqual(self.client.get("/api/commands?q=%25").json()["total"], 0)
+
+    def test_since_filters_by_time(self):
+        r = self.client.get("/api/commands?since=2024-01-01 00:00:00").json()
+        self.assertEqual(r["total"], 2, "since 之后只剩两条（那条 2020 年的被排掉）")
+        old = self.client.get("/api/commands?since=2019-01-01 00:00:00").json()
+        self.assertEqual(old["total"], 3)
+
+    def test_command_rows_carry_the_backend_snapshot(self):
+        """`meta.backend`（发送当时的智能体）要摊平成 `backend` 字段；老记录是空串。
+
+        面板据此显示"走哪个后端"，**没有就一个字都不显示** —— 所以"没有"必须是空串，
+        不能是 `None`（那会渲染成 `后端 null`）。
+        """
+        cid = db.add_command("走哪条路", source="web",
+                             meta={"backend": "独立 harness", "workspace": "C:/x"})
+        try:
+            row = [it for it in self.client.get("/api/commands").json()["items"]
+                   if it["id"] == cid][0]
+            self.assertEqual(row["backend"], "独立 harness")
+            old = [it for it in self.client.get("/api/commands").json()["items"]
+                   if it["id"] == self.ids[0]][0]
+            self.assertEqual(old["backend"], "", "老记录没有这个字段 → 空串，不是 None")
+        finally:
+            db._exec("DELETE FROM commands WHERE id=?", (cid,))
+
+    def test_meeting_list_carries_timestamps_and_speakers(self):
+        """会议历史那一行要的三格：转写档位 / 说话人 / 已压缩。"""
+        name = "2026-09-26_10-00-00"
+        mid = db.create_meeting(name, started_at="2026-09-26T10:00:00")
+        db.update_meeting(mid, status="transcribed", segments=1, duration_seconds=60)
+        db.replace_speakers(mid, {"S1": "张三", "S2": "说话人2"})
+        # `timestampsKinds` 是录音当时写进 meta.json 的快照（这里造一份等价的）
+        folder = os.path.join(self.meetings_root, name)
+        os.makedirs(folder, exist_ok=True)
+        with open(os.path.join(folder, "meta.json"), "w", encoding="utf-8") as fh:
+            fh.write('{"timestampsKinds": {"estimated": 3}}')
+        try:
+            row = [it for it in self.client.get("/api/meetings").json()["items"]
+                   if it["id"] == mid][0]
+            self.assertEqual(row["speakerNames"], ["张三", "说话人2"])
+            self.assertNotIn("speakers", row,
+                             "列表用 speakerNames（字符串数组）；`speakers` 是详情接口那份原始行")
+            self.assertEqual(row["timestamps"]["kinds"], {"estimated": 3})
+            # 中文由服务端翻好（面板不抄词汇表）；档位原文仍在 kinds 里，可核对
+            self.assertIn("估算", row["timestamps"]["label"])
+            self.assertIn("compression", row, "「已压缩」那格还在（没被这次改动挤掉）")
+            self.assertIsNone(row["compression"], "没压过就是 None")
+        finally:
+            db.delete_meeting(mid)
+            shutil.rmtree(folder, ignore_errors=True)
+
+    def test_meeting_without_a_meta_file_says_nothing(self):
+        """老会议没有 `meta.json` → `timestamps` 是 `None`，面板据此**不显示这一格**。
+
+        （不许退化成空壳 `{}`：那会渲染成"时间轴 "半句话，看着像坏了。）
+        """
+        name = "2026-09-26_11-00-00"
+        mid = db.create_meeting(name, started_at="2026-09-26T11:00:00")
+        db.update_meeting(mid, status="transcribed", segments=1)
+        try:
+            row = [it for it in self.client.get("/api/meetings").json()["items"]
+                   if it["id"] == mid][0]
+            self.assertIsNone(row["timestamps"])
+            self.assertEqual(row["speakerNames"], [])
+        finally:
+            db.delete_meeting(mid)
+
+    def test_delete_meeting_route_still_exists(self):
+        """删除会议本来就没有面板入口，但接口必须在（历史页并入不许把它碰掉）。"""
+        routes = {(r.path, m) for r in router.routes for m in getattr(r, "methods", set())}
+        self.assertIn(("/api/meetings/{mid}", "DELETE"), routes)
+        self.assertIn(("/api/meetings/{mid}/retranscribe", "POST"), routes)
 
 
 class PortFileContractTests(unittest.TestCase):

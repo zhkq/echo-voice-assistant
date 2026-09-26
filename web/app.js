@@ -90,11 +90,18 @@ function confirmDialog(message, { okText = "确定", cancelText = "取消", dang
 }
 
 /* ================= 视图切换 ================= */
-/* 页签清单（2026-09-25 整合后）：新加页签要同时在 index.html 里加
+/* 页签清单：新加页签要同时在 index.html 里加
    <button class="tab" data-view="…"> 和 <section id="view-…">，否则 switchView 找不到容器。
-   同日「向导」也并进「常规」最后一张卡（默认收起），所以顶层只剩 7 个。 */
-const _VIEWS = ["dashboard", "general", "business", "capability",
-                "history", "meetings"];
+   2026-09-25：「向导」并进「常规」最后一张卡（默认收起），顶层剩 7 个。
+   2026-09-26（第一轮）：设置页分成三类 + 一个历史位，顶层 7 → 6。
+   2026-09-26（第二轮）：**「会议记录」整体并入「历史 → 会议历史」** —— 顶层 6 → 5。
+   为什么并：那是同一个实体（同一批 meetings 行、同一个目录）。两个页签并存就等于
+   同一场会议有两处状态，而用户的规矩是「一个实体只有一处状态」。 */
+const _VIEWS = ["dashboard", "general", "business", "capability", "history"];
+
+/* 历史页内部的两个子页签（**不是顶层页签**，所以不进 `_VIEWS`）：
+   `commands` = 指令历史，`meetings` = 会议历史。用 `.tab-sm` 那套控件。 */
+let _histTab = "commands";
 
 /* 旧入口 → 新页签（深链/书签/别处硬编码的兼容层）：
    2026-09-26 用户定的设置信息架构（IA）= **三类 + 一个历史位**：
@@ -105,7 +112,7 @@ const _VIEWS = ["dashboard", "general", "business", "capability",
                           ├ 已配对后端连接情况
                           ├ 本地能力部署运行情况（默认只展开"配置为要用的"）
                           └ 清理（先预览、后确认）
-     4. 历史           —— 指令历史 · 会议历史（**这一轮只预留位置/空态**）
+     4. 历史           —— 指令历史 · 会议历史（两个子页签）
 
    原来的「常规 / 语音与设备 / 智能体 / 能力后端」四个设置页签就是被这三类**替掉**的
    （内容一项没少，只是重新分组 + 默认折叠，见 docs/设置项归属表.md）。
@@ -115,26 +122,49 @@ const VIEW_ALIASES = {
   voice: "business", "语音与设备": "business", meetingsettings: "business",
   failover: "capability", model: "capability", models: "capability",
   capabilities: "capability", agent: "capability",
+  // 「会议记录」不再是顶层页签（2026-09-26 第二轮）：老书签/老链接一律落到
+  // 「历史」，再由 switchView 打开"会议历史"子页签（见那里的 `rawName`）。
+  meetings: "history", "会议记录": "history",
 };
 function normView(name) {
   const n = String(name || "");
   return VIEW_ALIASES[n] || n;
 }
 
+/** 历史页两个子页签的切换（**同一实体只有一处渲染**：
+ *  指令列表只有 `#historyList`、会议列表只有 `#meetingList`，切页签只是显示/隐藏）。 */
+function switchHistoryTab(name) {
+  _histTab = (name === "meetings") ? "meetings" : "commands";
+  $$("[data-htab]").forEach((b) => b.classList.toggle("active", b.dataset.htab === _histTab));
+  const cmd = $("#htab-commands"), mtg = $("#htab-meetings");
+  if (cmd) cmd.classList.toggle("hidden", _histTab !== "commands");
+  if (mtg) mtg.classList.toggle("hidden", _histTab !== "meetings");
+  if (_histTab === "meetings") { loadMeetings(); refreshMeetingHeader(); }
+  else loadHistory();
+}
+$$("[data-htab]").forEach((b) =>
+  b.addEventListener("click", () => switchHistoryTab(b.dataset.htab)));
+
 function switchView(name) {
-  const view = _VIEWS.includes(normView(name)) ? normView(name) : "dashboard";
+  const rawName = String(name || "");
+  const view = _VIEWS.includes(normView(rawName)) ? normView(rawName) : "dashboard";
   $$(".view").forEach((v) => v.classList.add("hidden"));
   const host = $(`#view-${view}`);
   if (host) host.classList.remove("hidden");
   $$(".tab").forEach((t) => t.classList.toggle("active", t.dataset.view === view));
+  // 历史页是"整页一个列表"：整页不滚、列表自己滚（CSS 的 `body.on-history`）。
+  // 不给它一个确定高度的话，列表会把整页撑长、「加载更多」被推到最下面（实测 126 条
+  // = 6000px 的页面）。其它页签照旧整页滚动，行为一字不变。
+  document.body.classList.toggle("on-history", view === "history");
   if (view === "dashboard") { refreshDashboard(); loadTargets(); }
   // 三个设置页签共用一份设置数据：loadSettings() 一次把三页的卡片都画出来（切页不重拉）。
   // 「ECHO 通用」里还挂着启动状态与**安装向导**卡，所以那一页要多拉两样。
   if (view === "general") { loadSettings(); loadBoot(); loadBootLogs(); loadWizard(); }
   if (view === "business") { loadSettings(); loadQueueCard(); }
   if (view === "capability") { loadSettings(); loadCapabilities(); loadRouter(); }
-  if (view === "history") loadHistory();
-  if (view === "meetings") { loadMeetings(); refreshMeetingHeader(); }
+  // 历史页：`?view=meetings` / `data-goto="meetings"` 这类老入口要落进"会议历史"子页签，
+  // 其余情况沿用用户上次看的那一个（默认指令历史）。
+  if (view === "history") switchHistoryTab(rawName === "meetings" ? "meetings" : _histTab);
 }
 $$(".tab").forEach((t) => t.addEventListener("click", () => switchView(t.dataset.view)));
 
@@ -1002,6 +1032,31 @@ const STATUS_TEXT = { online: "在线", offline: "离线", active: "工作中", 
 /* 历史回复先给这么多字的预览，超出可展开全文（issue #2：以前硬截 300 字、后面看不到） */
 const REPLY_PREVIEW = 300;
 
+/* 指令来源（`commands.source`）→ 面板上的人话。与 `STATUS_TEXT` 同一套做法：
+   数据库枚举值的翻译只写这一份，认不出的值原样显示（`|| c.source`）。
+   为什么要翻：历史页是给用户看的，"web / hotkey / wake" 这些是内部词。 */
+const CMD_SOURCE_TEXT = { web: "面板", hotkey: "热键", wake: "唤醒词", skill: "技能",
+  api: "接口", mobile: "手机", test: "测试" };
+
+/* 一条指令的"补充信息"那一行（历史页）
+   —— 用户想知道的是：什么时候说的 / 说了什么 / 走哪条引擎或后端 / 耗时 / 成没成 / 系统回了什么。
+   前两条在 head 与 text 里，成没成在徽章与 error 里，回了什么在 reply 里，
+   「哪条链路进来的」在 head 的来源那一格；这里只补**耗时 + 引擎/后端**。
+   数据没有的格子**不出现**（不编）。 */
+function cmdDetailLine(c) {
+  const bits = [];
+  const ms = Number(c.duration_ms || 0);
+  if (ms > 0) bits.push(`耗时 ${esc(fmtUptime(ms / 1000))}`);
+  // 「引擎或后端」：**发送当时**记下的智能体名（`commands.meta.backend`）。
+  // 语音指令那条链路本来就是本机引擎（sherpa/SenseVoice），老记录大多没有这个字段 ——
+  // 没有就一个字都不写，绝不拿"现在配的是谁"去解释过去。
+  const backend = String(c.backend || "").trim();
+  if (backend) bits.push(`后端 ${esc(backend)}`);
+  return bits.length ? `<div class="cmd-detail">${bits.join(" · ")}</div>` : "";
+}
+
+/* 指令列表（仪表盘"近期指令"、业务配置→队列、历史页**共用这一个函数**）。
+   `opts.detail` = 历史页要的完整形态（补上 耗时/后端/来源 那一行）。 */
 function renderCmdList(el, items, withReply, opts = {}) {
   if (!items.length) {
     el.innerHTML = `<div class="empty">暂无命令</div>`;
@@ -1016,9 +1071,10 @@ function renderCmdList(el, items, withReply, opts = {}) {
     return `<div class="cmd-item${jump ? " clickable" : ""}" data-id="${c.id}"${
       jump ? ` title="点击查看这条指令的完整历史"` : ""}>
       <div class="head"><span class="badge ${stCls}">${STATUS_TEXT[c.status] || c.status}</span>
-        <span class="muted" style="font-size:12px">${esc(c.source)}</span>
+        <span class="muted" style="font-size:12px">${esc(CMD_SOURCE_TEXT[c.source] || c.source)}</span>
         <span class="time">${esc(c.ts || "")}</span></div>
       <div class="text">${esc(c.text)}</div>
+      ${opts.detail ? cmdDetailLine(c) : ""}
       ${reply ? `<div class="reply">↳ <span class="reply-short">${esc(reply.slice(0, REPLY_PREVIEW))}</span>${
         long ? `<span class="reply-full hidden">${esc(reply)}</span>` : ""}</div>` : ""}
       ${long ? `<a class="reply-toggle" data-expand data-len="${reply.length}">展开全文（${reply.length} 字）</a>` : ""}
@@ -1081,6 +1137,7 @@ let _focusCmdId = null;   // 跨页签传参：loadHistory() 渲染完成后据�
 
 function openCmdInHistory(id) {
   _focusCmdId = String(id);
+  _histTab = "commands";          // 历史页有两个子页签：从仪表盘过来的一律进指令历史
   switchView("history");          // 内部会调用 loadHistory()
 }
 
@@ -1290,6 +1347,10 @@ const SET_ADV_SEC = {
   providerLlmModel: "在线服务", providerLlmApiKey: "在线服务",
   // 业务配置 → 会议（保存策略）
   meetingAutoSummarize: "录音与产出", meetingKeepRawAudio: "录音与产出",
+  // 压缩那条也归这里：不写它就会掉进 `sAdvSection()` 的 `"其他"` 兜底小节
+  // （`SET_CARDS.business` 的 `会议` 卡 `advOrder` 只有「录音与产出 / 出网许可」）
+  // —— 表现是开关**在**、但挂在一个叫「其他」的小节下，与它的两个同类分了家。
+  meetingAutoCompressAudio: "录音与产出",
   meetingWorkspaceTitle: "录音与产出", capabilityPrivacy: "出网许可",
   // 业务配置 → 工作区与归档
   worklogEnabled: "纪要归档", worklogEnsureSessionAccess: "纪要归档",
@@ -2312,7 +2373,7 @@ function queueBodyHtml() {
     <div class="cmd-list">${rows}</div>
     <div class="sacts" style="padding-top:6px">
       <button class="btn mini" data-goto="history">全部历史 ›</button>
-      <button class="btn mini" data-goto="meetings">会议记录 ›</button>
+      <button class="btn mini" data-goto="meetings">会议历史 ›</button>
     </div>`;
 }
 
@@ -3977,15 +4038,105 @@ function renderSessionMessages(r) {
   return head + items + `<div class="muted sess-foot">只显示最近的文本消息（工具调用/步骤已省略）</div>`;
 }
 
+/* ---------- 指令历史：筛选 + 分页（「加载更多」）----------
+   为什么过滤/翻页都由**服务端**做（`GET /api/commands?q=&since=&limit=&offset=`）：
+   历史会有几千条，"一次拉 200 条再在本地过滤"会让 `total` 与翻页语义都对不上
+   （第二页可能是过滤后的第 0 条），而"一次拉几千条"正是这次要避免的事。
+   面板只保存"这一屏的查询条件 + 已经渲染到第几条"，其余以服务端为准。 */
+const CMD_PAGE = 50;              // 一次 50 条（够看一屏，又不至于一次画几百个 DOM）
+let _cmdQ = "";                   // 关键词（服务端 LIKE）
+let _cmdSince = "";               // 时间下界（`YYYY-MM-DD HH:MM:SS` 本地时间，空=不限）
+let _cmdRows = [];                // 已加载的条目（累积）
+let _cmdTotal = 0;                // 服务端给的"当前筛选条件下共几条"
+
+/** 「近 N 天」→ 服务端要的 `since`（本地时间、与库里 `ts` 同格式，可直接字符串比较）。 */
+function cmdSinceFromDays(days) {
+  const d = Number(days || 0);
+  if (!(d > 0)) return "";
+  const t = new Date(Date.now() - d * 86400000);
+  const p = (n) => String(n).padStart(2, "0");
+  return `${t.getFullYear()}-${p(t.getMonth() + 1)}-${p(t.getDate())} `
+    + `${p(t.getHours())}:${p(t.getMinutes())}:${p(t.getSeconds())}`;
+}
+
+function cmdQueryUrl(offset) {
+  const parts = [`limit=${CMD_PAGE}`, `offset=${offset}`];
+  if (_cmdQ) parts.push("q=" + encodeURIComponent(_cmdQ));
+  if (_cmdSince) parts.push("since=" + encodeURIComponent(_cmdSince));
+  return "/api/commands?" + parts.join("&");
+}
+
+function renderCmdHistCount() {
+  const el = $("#cmdHistCount");
+  if (!el) return;
+  if (!_cmdTotal) { el.textContent = ""; return; }
+  const filtered = (_cmdQ || _cmdSince) ? "（已筛选）" : "";
+  el.textContent = `已显示 ${_cmdRows.length} / ${_cmdTotal} 条${filtered}`;
+}
+
+/** 「加载更多」按钮：只有还有没加载的才亮出来。 */
+function renderCmdMore() {
+  const btn = $("#btnCmdMore");
+  if (!btn) return;
+  btn.classList.toggle("hidden", _cmdRows.length >= _cmdTotal);
+}
+
+/** 重新查第一页（换筛选条件 / 清空后 / 进页面时都走它）。 */
 async function loadHistory() {
+  _cmdRows = [];
   try {
-    const [r] = await Promise.all([api("/api/commands?limit=200"), loadSessionInfo()]);
-    renderCmdList($("#historyList"), r.items, true, { sessions: true });
+    const [r] = await Promise.all([api(cmdQueryUrl(0)), loadSessionInfo()]);
+    _cmdTotal = Number(r.total || 0);
+    _cmdRows = r.items || [];
+    // 空态分两种：**从来没说过** 与 **筛掉之后没了** —— 说的话不一样，
+    // 后一种要提醒用户"是筛选条件把结果滤没了"（否则他会以为历史被清空了）。
+    const host = $("#historyList");
+    if (!_cmdRows.length) {
+      host.innerHTML = (_cmdQ || _cmdSince)
+        ? `<div class="empty">没有符合条件的指令。<br>换个关键词或时间范围再试。</div>`
+        : `<div class="empty">还没有指令记录。<br>在<b>仪表盘</b>输入一句话，
+           或按住说话键（唤醒词 / 热键）下达第一条指令。</div>`;
+    } else {
+      renderCmdList(host, _cmdRows, true, { sessions: true, detail: true });
+    }
+    renderCmdHistCount();
+    renderCmdMore();
     const id = _focusCmdId;     // 从仪表盘点过来的那条：等渲染完再定位+展开
     _focusCmdId = null;
     if (id) focusCmd(id);
   } catch (e) { toast("加载历史失败：" + e.message); }
 }
+
+/** 「加载更多」：按 offset 取下一页并**追加**（不重画已看过的那些，滚动位置不跳）。 */
+async function loadMoreHistory() {
+  const btn = $("#btnCmdMore");
+  if (!btn || btn.disabled) return;
+  btn.disabled = true;
+  try {
+    const r = await api(cmdQueryUrl(_cmdRows.length));
+    _cmdTotal = Number(r.total || _cmdTotal || 0);
+    const add = r.items || [];
+    _cmdRows = _cmdRows.concat(add);
+    if (add.length) renderCmdList($("#historyList"), _cmdRows, true, { sessions: true, detail: true });
+    renderCmdHistCount();
+    renderCmdMore();
+  } catch (e) { toast("加载更多失败：" + e.message); }
+  finally { btn.disabled = false; }
+}
+
+$("#btnCmdFilter").addEventListener("click", () => {
+  _cmdQ = ($("#cmdFilter").value || "").trim();
+  _cmdSince = cmdSinceFromDays($("#cmdRange") ? $("#cmdRange").value : "");
+  loadHistory();
+});
+// 回车即查询（与仪表盘输入框同一套习惯），下拉一改就重查
+$("#cmdFilter").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") $("#btnCmdFilter").click();
+});
+if ($("#cmdRange")) {
+  $("#cmdRange").addEventListener("change", () => $("#btnCmdFilter").click());
+}
+$("#btnCmdMore").addEventListener("click", loadMoreHistory);
 $("#btnClearCmds").addEventListener("click", async () => {
   if (!(await confirmDialog("确认清空全部命令历史？", { okText: "清空", danger: true }))) return;
   try { await api("/api/commands", { method: "DELETE" }); loadHistory(); }
@@ -4014,9 +4165,18 @@ function meetingBadgeCls(status) {
 const MEETING_STATUS_TEXT = { recording: "录音中", transcribing: "转写中", transcribed: "已转写",
   imported: "待转写", error: "录音失败", interrupted: "已中断" };
 
-function renderMeetingItems(el, items) {
+/* 会议列表条目（**全站唯一一处渲染**：仪表盘"最近几场"与「历史 → 会议历史」共用）。
+   `opts.full=true` 是历史页要的完整条目 —— 多几格：转写档位 / 说话人 / 「看转写」入口。
+   仪表盘只要最近几场，保持精简（用户反复强调"默认只露在用的"，别把整页塞满）。 */
+function renderMeetingItems(el, items, opts = {}) {
+  const full = !!opts.full;
   if (!items.length) {
-    el.innerHTML = `<div class="empty">暂无会议记录</div>`;
+    // 空态（用户点名要求会议历史有）：一场都没有时说清"怎么开始第一场"，
+    // 而不是丢一句"暂无"。仪表盘那张小卡保持原来那句短的（它周围已经有按钮了）。
+    el.innerHTML = full
+      ? `<div class="empty">还没有会议记录。<br>点上面的<b>「开始录音」</b>录一场，
+         或用<b>「导入录音」</b>把已有的录音变成一场会议。</div>`
+      : `<div class="empty">暂无会议记录</div>`;
     return;
   }
   el.innerHTML = items.map((m) => {
@@ -4036,6 +4196,20 @@ function renderMeetingItems(el, items) {
     // 显示出来反而重复——开始时间已经在下面的 m-meta 里了（2026-09-12 起）。
     const nameHtml = `<div class="m-name">${esc(shortTitle || m.name)}</div>`;
     const hasSummary = m.has_summary ? `<span class="m-summary-tag" title="已生成会议纪要">📄</span>` : "";
+    // 说话人（历史页才显示；名字来自数据库 speakers 表，改过名就是联系人姓名）。
+    // 一场都没标出来时**什么都不显示** —— 不写"未分离"（那是另一件事，得看 diarize 快照）。
+    // 字段是 `speakerNames`（字符串数组），不是详情接口那份 `speakers`（原始行对象）。
+    const spk = full ? (m.speakerNames || []).filter(Boolean) : [];
+    const spkTag = spk.length
+      ? `<span class="m-spk" title="这场会标出来的说话人：${esc(spk.join("、"))}">👥 ${spk.length} 人</span>`
+      : "";
+    // 转写档位（exact / aligned / estimated）：**服务端翻好中文再下发**
+    // （`capability_admin.timestamps_summary`，与详情页同一份翻译、同一份快照）。
+    // 老会议没记过 → `null` → 这一格不出现（不编"估算"）。
+    const ts = full ? m.timestamps : null;
+    const tsTag = (ts && (ts.short || ts.label))
+      ? `<span class="m-ts" title="句级时间轴：${esc(ts.label || "")}">时间轴 ${esc(ts.short || ts.label)}</span>`
+      : "";
     // 录音/转写失败（PR #11 起会明确标 error）：显示**后端记下的真实原因**。
     //
     // 2026-09-25 改：原来这里是一句**硬编码**的"没录到音频：麦克风没打开（被占用/权限）
@@ -4056,19 +4230,33 @@ function renderMeetingItems(el, items) {
       : "";
     // `已压缩` 也进 m-meta 那一行（列表窄的时候不至于撑宽卡片）
     const compMeta = compTag ? `<div class="m-meta">${compTag}</div>` : "";
+    // 「看转写 ›」：直接落到详情页的**转写**页签（转写文本查看的入口）。
+    // 导出（离线 HTML）沿用详情页右上角那颗按钮，**不在这里再造一个导出**。
+    const acts = full
+      ? `<div class="m-acts"><a class="m-open" data-open="${m.id}" data-tab="transcript">看转写 ›</a></div>`
+      : "";
     return `<div class="meeting-item" data-id="${m.id}">
       <span class="badge ${meetingBadgeCls(m.status)}">${MEETING_STATUS_TEXT[m.status] || STATUS_TEXT[m.status] || m.status}</span>
       <div class="grow">
         ${nameHtml}
-        <div class="m-meta">${esc(started)} · ${fmtHM(dur)} · ${m.segments || 0} 段 ${hasSummary}</div>
+        <div class="m-meta">${esc(started)} · ${fmtHM(dur)} · ${m.segments || 0} 段 ${hasSummary}${spkTag}</div>
+        ${tsTag ? `<div class="m-meta">${tsTag}</div>` : ""}
         ${compMeta}
         ${txHtml}
         ${errHint}
+        ${acts}
       </div>
     </div>`;
   }).join("");
   $$(".meeting-item", el).forEach((it) =>
     it.addEventListener("click", () => openMeetingDetail(parseInt(it.dataset.id, 10))));
+  // 「看转写 ›」：别让点击冒泡到整条（那会开成默认页签）—— 与指令卡片里
+  // `[data-expand]` 同一套 stopPropagation 纪律。
+  $$("[data-open]", el).forEach((a) => a.addEventListener("click", (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    openMeetingDetail(parseInt(a.dataset.open, 10), a.dataset.tab || "");
+  }));
 }
 
 async function pollTranscribe() {
@@ -4077,9 +4265,12 @@ async function pollTranscribe() {
   } catch (e) { return; }
   const v = $(".tab.active");
   if (!v) return;
-  if (v.dataset.view === "meetings") {
+  // 「会议记录」并进历史页之后，会议列表的宿主在**历史页的会议历史子页签**里 ——
+  // 判据因此是"顶层在历史页 **且** 子页签在会议历史"（否则会在你看指令历史时
+  // 偷偷重画一份看不见的列表）。
+  if (v.dataset.view === "history" && _histTab === "meetings") {
     const r = await api("/api/meetings?limit=100");
-    renderMeetingItems($("#meetingList"), r.items);
+    renderMeetingItems($("#meetingList"), r.items, { full: true });
     refreshMeetingHeader();          // 停留在会议列表页时按钮也要跟着录音状态变
   } else if (v.dataset.view === "dashboard") {
     const r = await api("/api/meetings?limit=5");
@@ -4091,13 +4282,16 @@ async function loadMeetings() {
   try {
     const r = await api("/api/meetings?limit=100");
     _meetings = r.items;
-    renderMeetingItems($("#meetingList"), r.items);
+    renderMeetingItems($("#meetingList"), r.items, { full: true });
   } catch (e) { toast("加载会议失败：" + e.message); }
 }
 
-/* ================= 会议详情（独立窗口） ================= */
-function openMeetingDetail(id) {
-  window.open(`/web/meeting.html?id=${id}`, "_blank");
+/* ================= 会议详情（独立窗口） =================
+   `tab` 可选：`transcript` 时直接落到详情页的转写页签（会议历史里的「看转写 ›」用它）。
+   不传就与以前逐字一样（详情页默认转写页签）。 */
+function openMeetingDetail(id, tab) {
+  const q = tab ? `&tab=${encodeURIComponent(tab)}` : "";
+  window.open(`/web/meeting.html?id=${id}${q}`, "_blank");
 }
 
 /* 会议列表页的录音按钮：必须跟随录音状态（用户 2026-09-12 反馈——开始录音后点"全部 ›"
@@ -5268,17 +5462,29 @@ async function wizRenderDone(host) {
    会**自动展开向导卡并滚过去**（不能只是"到了常规但看不到向导"）。 */
 let _bootView = "";
 let _bootWantWizard = false;      // 老深链/老 gotoView 明确要向导：落到常规后要展开那张卡
+let _bootWantHist = "";           // 老深链 `?view=meetings`：落到历史页后要打开"会议历史"子页签
 try {
   const q = new URLSearchParams(location.search).get("view");
   const raw = q || localStorage.getItem("echo.gotoView") || "";
-  const want = normView(raw);
-  _bootWantWizard = String(raw).trim().toLowerCase() === "wizard";
+  const rawKey = String(raw).trim();
+  const want = normView(rawKey);
+  _bootWantWizard = rawKey.toLowerCase() === "wizard";
+  // 「会议记录」已并入历史：`?view=meetings` 折算成 history 之后，子页签信息就丢了，
+  // 所以这里单独记一笔，bootView 里落到历史页时按它打开"会议历史"。
+  _bootWantHist = (rawKey === "meetings") ? "meetings" : "";
   if (localStorage.getItem("echo.gotoView")) localStorage.removeItem("echo.gotoView");
   if (want && _VIEWS.includes(want)) _bootView = want;
+  // `?compress=1`（分享链接 / 无头截图）同样要落到「会议历史」那一页 —— 否则被展开的
+  // 压缩面板藏在隐藏的子页签里，看着像"点了没反应"。
+  if (/(?:^|[?&])compress=1(?:&|$)/.test(location.search)) {
+    _bootWantHist = "meetings";
+    if (!_bootView) _bootView = "history";
+  }
 } catch (e) { /* 忽略 */ }
 
 async function bootView() {
   if (_bootView) {
+    if (_bootWantHist) _histTab = _bootWantHist;
     switchView(_bootView);
     renderInstallNotice();
     if (_bootWantWizard) gotoWizard();     // 老书签：展开向导卡 + 滚到它

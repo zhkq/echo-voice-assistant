@@ -64,6 +64,11 @@ class ApiVoiceprintTest(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         db.DATA_DIR, db.DB_FILE, paths_mod.meetings_root = cls._old
+        # 本类在 setUpClass 里把 `voiceprintEnabled` / `voiceprintAutoEnroll` 打开
+        # （入库到**临时库**），而进程级 `settings._cache` 不受 db 补丁约束 ——
+        # 不清的话，这两个 True 会留给后面的测试模块（详见
+        # tests/test_settings_wiring.py 的 `_drop_settings_cache()`）。
+        settings._cache = None
         shutil.rmtree(cls._tmp, ignore_errors=True)
 
     def setUp(self):

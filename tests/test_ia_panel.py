@@ -30,6 +30,12 @@ def _read(*parts):
         return fh.read()
 
 
+def _view_body(html, view):
+    """`#view-…` 那一段（到它自己的 `</section>` 为止）—— 视图内不再嵌 section。"""
+    start = html.index('id="view-%s"' % view)
+    return html[start:html.index("</section>", start)]
+
+
 class IATabsTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -60,17 +66,157 @@ class IATabsTests(unittest.TestCase):
                 self.assertRegex(aliases, r"%s:\s*\"%s\"" % (old, new),
                                  "%s 没有折算到 %s" % (old, new))
 
-    def test_history_tab_is_a_placeholder_only(self):
-        """第四位（历史）**这一轮只预留位置/空态**：不新写历史功能。"""
-        start = self.html.index('id="view-history"')
-        end = self.html.index("</section>", start)
-        body = self.html[start:end]
-        self.assertIn("会议历史", body, "历史页要有会议历史的占位")
-        self.assertIn("后续版本", body, "占位要说明它还没做")
-        self.assertIn('data-goto="meetings"', body, "占位要能指到现成的「会议记录」")
-        # 指令历史是**现成的**那份（不新增实现）：清空按钮与列表宿主都还在
-        self.assertIn('id="btnClearCmds"', body)
-        self.assertIn('id="historyList"', body)
+    def test_history_is_two_real_pages_not_a_placeholder(self):
+        """第四位（历史）**不再是占位** —— 指令历史 + 会议历史，两个子页签都真有内容。
+
+        2026-09-26（第二轮）：这一页原来是"后续版本"说明 + 一个去「会议记录」的入口。
+        现在子页签、两个列表宿主、清空按钮、筛选与「加载更多」都在这一页里。
+        """
+        body = _view_body(self.html, "history")
+        for want in ('data-htab="commands"', 'data-htab="meetings"',
+                     'id="htab-commands"', 'id="htab-meetings"'):
+            self.assertIn(want, body, "历史页缺少 %s" % want)
+        for gone in ("后续版本", "只预留位置", 'data-goto="meetings"'):
+            self.assertNotIn(gone, body, "历史页不该再是占位（%s）" % gone)
+        # 两个子页签各自的列表宿主、清空按钮都在这一页里（ID 不许搬家到别处）
+        for want in ('id="historyList"', 'id="btnClearCmds"', 'id="meetingList"'):
+            self.assertIn(want, body, "历史页缺少 %s" % want)
+        # 子页签复用会议详情页那套控件（**不新造控件**）
+        self.assertIn('class="tabs-sm"', body)
+        self.assertIn('class="tab-sm active" data-htab="commands"', body)
+        self.assertIn("function switchHistoryTab(", self.js)
+        self.assertIn('$$("[data-htab]")', self.js)
+
+
+class MeetingRecordsMergedIntoHistoryTests(unittest.TestCase):
+    """「会议记录」整体并入「历史 → 会议历史」（顶层页签 6 → 5，2026-09-26 第二轮）。
+
+    为什么并：那是**同一个实体**（同一批 `meetings` 行、同一个目录）。两个页签并存
+    必然出现"同一场会议两处状态"，而用户的规矩是「一个实体只有一处状态」。
+    所以这里钉的不是"某个函数还在"，而是**没有第二份**：
+    一个列表宿主、一个渲染函数、一处状态字段。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.js = _read("web", "app.js")
+        cls.html = _read("web", "index.html")
+
+    def test_top_level_tabs_are_five_and_meetings_is_gone(self):
+        views = re.findall(r'"([a-z]+)"',
+                           re.search(r"const _VIEWS = \[(.*?)\]", self.js, re.S).group(1))
+        self.assertEqual(views, ["dashboard", "general", "business", "capability", "history"],
+                         "并进历史后顶层应当是 5 个页签：%s" % views)
+        self.assertNotIn('data-view="meetings"', self.html, "「会议记录」不再是顶层页签")
+        self.assertNotIn('id="view-meetings"', self.html,
+                         "独立的会议视图已删（内容整页并入历史页，不是复制一份）")
+        for gone in ('id="setPaneMeetings"', 'data-view="会议记录"'):
+            self.assertNotIn(gone, self.html)
+
+    def test_old_deep_link_folds_to_the_meeting_history_sub_tab(self):
+        """老书签 `?view=meetings` 不许失效：落到历史页**并自动打开「会议历史」**。"""
+        aliases = re.search(r"const VIEW_ALIASES = \{(.*?)\};", self.js, re.S).group(1)
+        self.assertRegex(aliases, r'meetings:\s*"history"', "meetings 没有折算到 history")
+        self.assertIn("_bootWantHist", self.js, "深链要记住「落到会议历史子页签」")
+        self.assertIn('switchHistoryTab(rawName === "meetings" ? "meetings" : _histTab)', self.js,
+                      "switchView 要把老入口落到第二个子页签")
+
+    def test_one_entity_one_place(self):
+        """**同一实体只有一处渲染**：会议条目的 DOM 与渲染函数各只有一份。"""
+        self.assertEqual(self.html.count('id="meetingList"'), 1,
+                         "会议列表宿主只许有一个（并入时最容易出的错就是复制一份）")
+        self.assertEqual(self.html.count('id="historyList"'), 1)
+        self.assertEqual(self.html.count('id="compressBox"'), 1)
+        self.assertEqual(self.html.count('id="importBox"'), 1)
+        self.assertEqual(self.js.count("function renderMeetingItems("), 1,
+                         "会议条目只许有一个渲染函数（仪表盘「最近几场」与历史页共用它）")
+        self.assertEqual(self.js.count("function renderCmdList("), 1)
+        # 「会议条目」的 HTML 模板只有 renderMeetingItems 里那一处
+        self.assertEqual(self.js.count('class="meeting-item"'), 1,
+                         "会议条目模板被复制了第二份")
+        # 会议列表宿主只有两处被画：进入历史页加载时 + 转写进度轮询时。
+        # （仪表盘那张小卡画的是 `#recentMeetings`，不是同一个宿主。）
+        self.assertEqual(self.js.count('$("#meetingList")'), 2,
+                         "#meetingList 的渲染点应当恰好两处：%d"
+                         % self.js.count('$("#meetingList")'))
+
+    def test_command_history_filters_and_load_more(self):
+        """指令历史：按关键词/时间过滤 + 分页（「加载更多」）。
+
+        过滤与翻页**都在服务端**（`q` / `since` / `limit` / `offset`）——
+        拿"已加载的这一页"在本地过滤会让翻页语义错位（第 2 页可能是过滤后的第 0 条），
+        而一次拉几千条正是这次要避免的事。所以这里连"参数名"一起钉住。
+        """
+        body = _view_body(self.html, "history")
+        for want in ('id="cmdFilter"', 'id="cmdRange"', 'id="btnCmdFilter"', 'id="btnCmdMore"'):
+            self.assertIn(want, body, "指令历史缺少 %s" % want)
+        self.assertIn("function cmdQueryUrl(", self.js)
+        q = self.js[self.js.index("function cmdQueryUrl("):]
+        q = q[:q.index("\n}\n")]
+        for token in ("limit=", "offset=", "q=", "since="):
+            self.assertIn(token, q, "服务端过滤/分页的参数 %s 不见了" % token)
+        self.assertIn("const CMD_PAGE", self.js, "一次拉多少条要是一个明面上的常量")
+        more = self.js[self.js.index("async function loadMoreHistory()"):]
+        more = more[:more.index("\n}\n")]
+        self.assertIn("cmdQueryUrl(_cmdRows.length)", more, "「加载更多」要按已加载条数当 offset")
+        self.assertIn("_cmdRows = _cmdRows.concat(", more, "要**追加**，不是重画一遍")
+
+    def test_empty_states_are_written_out(self):
+        """空态：两个历史页都要说人话（用户点名要求会议历史有空态）。"""
+        # 指令历史：**从来没说过** 与 **被筛掉** 是两件事，话也不一样
+        self.assertIn("还没有指令记录", self.js)
+        self.assertIn("没有符合条件的指令", self.js)
+        # 会议历史：一场都没有时说清"怎么开始第一场"，不是丢一句"暂无"
+        self.assertIn("还没有会议记录", self.js)
+        self.assertIn("「开始录音」", self.js)
+        self.assertIn("「导入录音」", self.js)
+
+    def test_meeting_operations_are_all_still_reachable(self):
+        """**操作入口一个都不能丢**（并入历史时最容易丢的就是它们）。
+
+        逐项核对：开始/停止录音、导入录音、重新转写、压缩、清空指令历史。
+        删除会议本来就没有面板入口（只有 `DELETE /api/meetings/{id}`），
+        这一条不假装它存在 —— 见 test_api_contract 的路由断言。
+        """
+        body = _view_body(self.html, "history")
+        for bid in ("btnMeetingFromList",      # 开始/停止录音
+                    "btnImportToggle", "btnImportStart",      # 导入录音
+                    "btnCompressToggle", "btnCompressStart",  # 压缩
+                    "btnCleanShort"):                         # 清理短录音
+            with self.subTest(id=bid):
+                self.assertIn('id="%s"' % bid, body, "并入历史后 %s 不见了" % bid)
+        for bid in ("btnMeetingFromList", "btnImportToggle", "btnCompressToggle",
+                    "btnCleanShort", "btnClearCmds", "btnCmdMore", "btnCmdFilter"):
+            with self.subTest(id=bid):
+                self.assertIn('$("#%s")' % bid, self.js, "app.js 没有接线 %s" % bid)
+        # 重新转写 / 导出 / 纪要 都在会议详情页（历史条目点进去就是它）
+        detail = _read("web", "meeting.html")
+        for bid in ("btnRetranscribe", "btnExport", "btnRegenSummary", "btnWorklog"):
+            with self.subTest(id=bid):
+                self.assertIn('id="%s"' % bid, detail, "详情页少了 %s" % bid)
+        # 条目上有「看转写」入口，直达详情页的转写页签（转写文本查看）
+        self.assertIn('data-open="${m.id}"', self.js)
+        self.assertIn('data-tab="transcript"', self.js)
+        self.assertIn("function openMeetingDetail(id, tab)", self.js)
+        # 详情页要真的认 `?tab=`（否则那个入口只是"打开详情页"，落不到转写）
+        self.assertIn("function applyWantedTab()", detail)
+        self.assertIn("switchDocTab(want)", detail)
+
+    def test_meeting_history_shows_the_required_fields(self):
+        """会议历史的列表字段：时间/时长/段数/状态/转写档位/说话人/是否已压缩。"""
+        fn = self.js[self.js.index("function renderMeetingItems("):]
+        fn = fn[:fn.index("\n  }).join(\"\");")]
+        for token in ("m.started_at", "m.duration_seconds", "m.segments",
+                      "MEETING_STATUS_TEXT[m.status]", "m.timestamps", "m.speakerNames",
+                      "m.compression"):
+            with self.subTest(token=token):
+                self.assertIn(token, fn, "会议历史条目少了 %s" % token)
+        # 「已压缩」文案与详情页**同一份字段**（数字全部来自后端，面板不自己算）
+        for token in ("beforeText", "afterText", "savedPercent"):
+            self.assertIn(token, fn)
+        # 转写档位的中文由服务端给（面板不抄词汇表）
+        self.assertIn("capability_admin.timestamps_summary", _read("app", "api.py"))
+        self.assertIn("TIMESTAMPS_LABELS", _read("app", "capability_admin.py"))
 
 
 class FoldingTests(unittest.TestCase):

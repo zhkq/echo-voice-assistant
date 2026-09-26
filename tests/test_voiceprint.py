@@ -299,6 +299,12 @@ class LibraryTest(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         db.DATA_DIR, db.DB_FILE = cls._old_data, cls._old_db
+        # 进程级 `settings._cache` 挂在**单例**上，不受上面的 db 补丁约束：本类跑过的路径
+        # 会把临时库里的设置读进那个缓存（`RecognizeTest` 还会写 `voiceprintAutoEnroll`），
+        # 恢复库之后一并丢掉，免得留给后面的测试模块
+        # （详见 tests/test_settings_wiring.py 的 `_drop_settings_cache()`）。
+        from app.config import settings
+        settings._cache = None
         shutil.rmtree(cls._tmp, ignore_errors=True)
 
     def setUp(self):
@@ -385,6 +391,12 @@ class RecognizeTest(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         db.DATA_DIR, db.DB_FILE = cls._old_data, cls._old_db
+        # 进程级 `settings._cache` 挂在**单例**上，不受上面的 db 补丁约束：本类跑过的路径
+        # 会把临时库里的设置读进那个缓存（`RecognizeTest` 还会写 `voiceprintAutoEnroll`），
+        # 恢复库之后一并丢掉，免得留给后面的测试模块
+        # （详见 tests/test_settings_wiring.py 的 `_drop_settings_cache()`）。
+        from app.config import settings
+        settings._cache = None
         shutil.rmtree(cls._tmp, ignore_errors=True)
 
     def setUp(self):

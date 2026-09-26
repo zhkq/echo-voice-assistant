@@ -43,6 +43,10 @@ class SettingsMetaTests(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         db.DATA_DIR, db.DB_FILE = cls._old
+        # 进程级配置缓存（`settings` 是单例，`_cache` 挂在实例上）**不受** db 补丁约束：
+        # 本类从临时库读出去的设置会留在缓存里给后面的模块。恢复库之后一并丢掉
+        # （详见 tests/test_settings_wiring.py 的 `_drop_settings_cache()`）。
+        settings._cache = None
         shutil.rmtree(cls.tmp, ignore_errors=True)
 
     def _by_key(self):

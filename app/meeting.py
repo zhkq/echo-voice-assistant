@@ -1793,6 +1793,15 @@ def _transcribe_impl(folder):
     # `with` 退出时临时文件即刻删除（见 `audiofile.decoded_segments`）。
     # 放在循环外面而不是每段各来一次：`decoded_segments` 只扫一次临时目录、只收集一次
     # 删除清单；逐段解码会在 N 段上扫 N 次（几十分钟的会议犯不着）。
+    #
+    # **日志留痕**（需求原话："临时文件用完即删并在日志说明"）：整场解了几段、为什么、
+    # 什么时候删。这一行只在**真的有 FLAC 段**时写（没压缩过的会议日志一个字不多）。
+    n_flac = sum(1 for s in segs if audiofile.is_flac(seg_paths.get(s, "")))
+    if n_flac:
+        db.add_log("info", "meeting",
+                   "%s：%d/%d 段是 FLAC 归档，用时解码成临时 WAV 交给引擎"
+                   "（转写结束即删；sherpa 等只认 RIFF/WAV）"
+                   % (meeting_name, n_flac, len(segs)))
     with audiofile.decoded_segments(
             [(int(str(s).split(".")[0]), seg_paths[s]) for s in segs]) as decoded_items:
         seg_map = {idx: path for idx, path in decoded_items}
@@ -3584,6 +3593,14 @@ def get_meeting_detail(meeting_id):
         "summaries": db.get_summary_runs(meeting_id),
         "hasTranscript": os.path.isfile(os.path.join(folder, "transcript.md")),
         "hasSummary": os.path.isfile(os.path.join(folder, "summary.md")),
+        # 「已压缩：原 X → 现 Y（省 Z%）」——**详情页要用它**（2026-09-26 补齐）。
+        # 列表卡片走的是 `api.list_meetings` 里那句 `compression_info()`，而详情这条
+        # 接口原来**没有**这个字段：`openMeetingDetail()` 打开的是独立页
+        # `web/meeting.html`，它读的就是这份 detail —— 于是"列表上看得见、点进去就没了"。
+        # 形状与列表那份**逐字一致**（都是 `compression_info()` 的产物），
+        # 所以两个页面不需要各写一套渲染逻辑，也不需要各自算一遍数字。
+        # 没压过时是 None（面板据此不显示标记，与列表卡片同一判据）。
+        "compression": compression_info(meeting["name"]),
     }
 
 

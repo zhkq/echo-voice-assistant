@@ -23,6 +23,7 @@ from unittest.mock import patch
 
 import app.db as db
 from app import model_cleanup, model_usage, modelinfo
+from app.config import settings
 
 
 def _write(path, size):
@@ -52,6 +53,16 @@ class _CleanupTestCase(unittest.TestCase):
             p.start()
             self.addCleanup(p.stop)
         db.init()
+        # **读方自保**（2026-09-26 跨模块泄漏）：`settings` 是 `app/config.py` 里的单例，
+        # 值缓存在**实例**的 `settings._cache` 上；上面那些补丁只换了库（`db.DATA_DIR/DB_FILE`），
+        # **管不到这个内存缓存** —— 上一个测试模块留下的值会被这里原样读到。
+        # 实测：`tests.test_settings_wiring` 的「全部设置往返」把每一项都写成探测值
+        # （int = 当前值 + 7 → `modelCleanupDays=97`），于是
+        # `test_threshold_setting_is_honoured` 读到 97 而不是 90。
+        # 源头已在那边的 tearDownClass/tearDownModule 复原；这里再清一次，保证**无论前面
+        # 跑过什么模块**，本模块读到的都是自己的临时库。
+        settings._cache = None
+        self.addCleanup(setattr, settings, "_cache", None)
 
     # ---- 造现场的小工具（形状与真实落点一致）----
     def _ms(self, repo, size=1000):
@@ -67,6 +78,24 @@ class _CleanupTestCase(unittest.TestCase):
 
 
 class PreviewTests(_CleanupTestCase):
+    def test_process_wide_settings_cache_is_isolated(self):
+        """护栏（2026-09-26 跨模块泄漏）：`settings` 是**进程级单例**，`_cache` 挂在实例上，
+        上面的 `db.DATA_DIR/DB_FILE` 补丁**管不到它** —— 前一个测试模块留下的脏缓存会被这里读到。
+
+        真实症状（本模块单跑绿、与 `tests.test_settings_wiring` 同进程跑就红）：
+        `AssertionError: 97 != 90`。97 是那边「全部设置往返」写的探测值
+        （int = 当前值 90 + 7），它活在 `app.config.settings._cache` 这个 dict 里，
+        **不在库里**（承载它的那条临时库早被删了，本用例的临时库里根本没有这一行）。
+
+        所以这条钉住 `setUp` 的隔离动作：每个用例开始时缓存必须是空的，
+        下一次 `get()` 才会从本模块自己的临时库重新加载。
+        """
+        self.assertIsNone(settings._cache,
+                          "setUp 没清 app.config.settings._cache：跨模块的脏设置会漏进来"
+                          "（曾把 modelCleanupDays 读成 97）")
+        self.assertEqual(model_cleanup.preview()["days"], model_cleanup.DEFAULT_DAYS,
+                         "缓存清掉后，阈值必须来自本临时库/出厂默认值（90）")
+
     def test_preview_does_not_touch_disk(self):
         """预览**只读**：跑完之后每个目录、每个文件都还在，一个字节都没变。"""
         self._ms("Systran/faster-whisper-tiny", 2048)

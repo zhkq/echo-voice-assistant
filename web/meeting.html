@@ -208,6 +208,10 @@ input[type=range].seek::-webkit-slider-thumb { -webkit-appearance:none; width:15
   <span class="t" id="title">会议详情</span>
   <button class="t-edit" id="btnTitleEdit" title="改会议名称（同步列表与归档）" hidden>✏️</button>
   <span class="sub" id="meta"></span>
+  <!-- 「已压缩：原 149 MB → 现 76 MB（省 49%）」。与会议列表卡片**同一份文案、
+       同一个字段**（详情接口的 `compression`，服务端 `compression_info()` 给的
+       真实前后字节）—— 2026-09-26 之前只有列表卡片有它，点进详情就看不见了。 -->
+  <span class="sub" id="compressMark" hidden></span>
   <div class="btns">
     <input id="summaryExtra" class="input" style="width:220px" placeholder="重新生成纪要的追加要求（可选）">
     <button class="btn" id="btnRetranscribe">重新转写</button>
@@ -376,6 +380,7 @@ async function load() {
     ? (M.segments.length || M.segment_count || 0)
     : (M.segments || 0);
   $("#meta").textContent = `开始 ${M.started_at || ""} · ${fmtHM(M.duration_seconds)} 分钟 · ${segCount} 段 · ${st[M.status]||M.status}`;
+  renderCompressionMark();
   syncTitleEditBtn();
   renderCapability();
   buildTimeline();
@@ -385,7 +390,36 @@ async function load() {
   renderTopics();
   renderColHead();
 }
-window.addEventListener("DOMContentLoaded", () => { bindSummaryEdit(); load(); });
+/** `?tab=transcript|summary`：从「历史 → 会议历史」的「看转写 ›」或分享链接直达某个页签。
+ *  必须**等 `load()` 拿到会议详情之后**再切 —— `renderSummary()` 用的是 `M.id`，
+ *  在 M 还是 null 的时候切过去只会看到一句"加载纪要失败"，而且不会自己恢复。 */
+function applyWantedTab() {
+  const want = qs.get("tab");
+  if (want === "summary" || want === "transcript") switchDocTab(want);
+}
+window.addEventListener("DOMContentLoaded", () => {
+  bindSummaryEdit();
+  load().then(applyWantedTab).catch(applyWantedTab);
+});
+
+/* ---------- 「已压缩：原 X → 现 Y（省 Z%）」（历史音频无损压成 FLAC） ----------
+
+   与会议列表卡片**同一份判据、同一份文案**：数字全部来自详情接口的 `compression`
+   （服务端 `meeting.compression_info()`，读的是 `meta.json` 里**真实的**前后字节）。
+   前端一个数都不自己算 —— 估算值只在压缩前的预览里出现，两个数混在一起用户就
+   分不清"预览"与"实况"了（这条纪律与列表卡片逐字相同）。
+
+   没压过时 `compression` 是 `null` → 标记保持隐藏（连空行都不留）。 */
+function renderCompressionMark() {
+  const el = $("#compressMark");
+  if (!el) return;
+  const cp = M && M.compression;
+  if (!cp || !cp.beforeBytes) { el.hidden = true; el.textContent = ""; return; }
+  const why = cp.deletedRaw ? "原始 WAV 已删除" : "按「保留原始音频」设置未删原件";
+  el.hidden = false;
+  el.title = `音频已无损压缩为 FLAC（${why}）`;
+  el.textContent = `已压缩：原 ${cp.beforeText} → 现 ${cp.afterText}（省 ${cp.savedPercent}%）`;
+}
 
 /* ---------- 「这场会用了哪个后端」（3.0 能力路由） ----------
 

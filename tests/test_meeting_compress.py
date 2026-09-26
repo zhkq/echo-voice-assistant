@@ -31,6 +31,7 @@
 """
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -622,6 +623,48 @@ class PanelTextAndPreviewTests(_CompressCase):
         self.assertTrue(DEFAULTS["meetingKeepRawAudio"]["value"],
                         "「保留原始音频」的既有默认值不许被这次改动翻转")
 
+    def test_auto_compress_toggle_sits_beside_its_siblings(self):
+        """「转写完成后自动压缩」必须挂在「录音与产出」小节里，**不许掉进「其他」**。
+
+        `sAdvSection()` 的判据链是：`SET_ADV_SEC[键]` → 后端 `sub` → 卡的 `advDefault`
+        → `"其他"`。`meetingAutoCompressAudio` 既没有后端 `sub`（`config.py` 里只写了
+        `grp="meeting"`），会议卡也没写 `advDefault` —— 所以**不显式登记就一定会被
+        追加成一个小节名叫「其他」的组**，与它的两个同类（自动生成纪要 / 保留原始音频）
+        在界面上分家。功能上它还在（`renderAdvSections` 会把没排进 `advOrder` 的小节
+        追加在后面），所以这是个**不会报错、只会显得莫名其妙**的坑 —— 正是需要用例
+        盯住的那一类。2026-09-26 修的就是它。
+        """
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, "web", "app.js"), encoding="utf-8") as fh:
+            js = fh.read()
+        block = re.search(r"const SET_ADV_SEC = \{(.*?)\n\};", js, re.S)
+        self.assertIsNotNone(block, "找不到 SET_ADV_SEC —— 落点表的形状变了，用例要跟着改")
+        hit = re.search(r"meetingAutoCompressAudio:\s*\"([^\"]+)\"", block.group(1))
+        self.assertIsNotNone(
+            hit, "meetingAutoCompressAudio 没有显式小节名 —— 它会被画到「其他」小节里")
+        self.assertEqual(hit.group(1), "录音与产出",
+                         "它应当与「自动生成纪要 / 保留原始音频」同一个小节")
+
+    def test_detail_page_renders_the_compression_marker(self):
+        """会议**详情页**（`web/meeting.html`）必须真的把 `compression` 画出来。
+
+        接口给了字段、页面不画 = 用户还是看不见（这正是 2026-09-26 复查时的状态：
+        列表卡片有标记、详情页一个字都没有）。这条用例盯的是页面那一段 ——
+        落点在、渲染函数在、且它读的是与列表卡片**同一组字段名**
+        （`beforeText` / `afterText` / `savedPercent`），不允许自己重算一遍。
+        """
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, "web", "meeting.html"), encoding="utf-8") as fh:
+            html = fh.read()
+        self.assertIn('id="compressMark"', html, "详情页没有「已压缩」标记的落点")
+        self.assertIn("renderCompressionMark()", html, "落点在，但没有渲染它的调用")
+        body = re.search(r"function renderCompressionMark\(\)\s*\{(.*?)\n\}",
+                         html, re.S)
+        self.assertIsNotNone(body, "找不到 renderCompressionMark 的实现")
+        for token in ("M.compression", "beforeText", "afterText", "savedPercent"):
+            self.assertIn(token, body.group(1),
+                          "详情页的标记少了 %s —— 数字必须来自后端那一份" % token)
+
 
 class AutoCompressAfterTranscribeTests(_CompressCase):
     """可选项：`meetingAutoCompressAudio`（默认关）—— 开了才压，且只压这一场。"""
@@ -745,13 +788,39 @@ class ApiEndpointTests(_CompressCase):
         self.assertIn("MB", cp["beforeText"] + cp["afterText"])
 
     def test_detail_endpoint_carries_the_compression_marker(self):
+        """详情接口必须**真的带** `compression` —— 会议详情页读的就是它。
+
+        2026-09-26 复查发现的一个真缺口：这个字段原来只有**列表**接口有
+        （`api.list_meetings` 里那句 `compression_info()`），详情接口没有 ——
+        而 `openMeetingDetail()` 打开的是独立页 `web/meeting.html`，它读的是这份
+        detail。于是表现是"列表卡片上看得见、点进详情就没了"。
+
+        上一版这条用例断的是 `meeting.compression_info(detail["name"])` ——
+        那只证明**那个函数能跑**，接口漏了字段它照样绿。现在断的是**接口字段本身**。
+        """
         self.make_meeting(segments=1, seconds=1.0)
         mid = db.create_meeting(self.name, started_at="2026-09-20T10:00:00")
         self.addCleanup(db.delete_meeting, mid)
+
+        d0 = self.client.get("/api/meetings/%d" % mid).json()
+        self.assertIn("compression", d0, "详情接口少了 compression 字段")
+        self.assertIsNone(d0["compression"], "没压过时必须是 None（详情页据此不显示标记）")
+
         self.fail(self.name)
         detail = self.client.get("/api/meetings/%d" % mid).json()
-        # 详情里 `segments` 被 build_segments 覆盖成分段数组，压缩记录走 meta
-        self.assertIsNotNone(meeting.compression_info(detail["name"]))
+        cp = detail["compression"]
+        self.assertIsNotNone(cp, "压过之后详情接口必须带 compression")
+        for key in ("beforeBytes", "afterBytes", "beforeText", "afterText",
+                    "savedPercent", "deletedRaw", "keptRaw", "at", "segments"):
+            self.assertIn(key, cp, "详情页要用的字段少了 %s" % key)
+        self.assertGreater(cp["beforeBytes"], cp["afterBytes"])
+        self.assertGreater(cp["afterBytes"], 0)
+        # 与列表卡片**同源**：两处必须是同一份数字（否则同一个会议两个说法）
+        row = [it for it in self.client.get("/api/meetings").json()["items"]
+               if it["id"] == mid][0]
+        self.assertEqual(row["compression"]["beforeBytes"], cp["beforeBytes"])
+        self.assertEqual(row["compression"]["afterText"], cp["afterText"])
+        self.assertEqual(row["compression"]["savedPercent"], cp["savedPercent"])
 
     def test_audio_endpoint_serves_a_playable_wav_after_compression(self):
         """**面板播放**那一路：`01.wav` 已被压成 `01.flac` 也必须能播，且回的是 WAV。"""
@@ -819,6 +888,149 @@ class TempDecodeHygieneTests(_CompressCase):
         self.fail(self.name)
         self.assertTrue(os.path.isfile(other_wav), "别的会议的音频不许被动")
         self.assertTrue(os.path.isfile(stray), "会议目录里别的东西不许被删")
+
+
+class DiarizeOnFlacSegmentTests(_CompressCase):
+    """② 的**第三条**调用点：说话人分离那一路也必须拿到解出来的 WAV。
+
+    为什么单独立一条（2026-09-26 复查补的）：转写那条路（`_sherpa_rows` 收到的是不是
+    RIFF）与播放那条路（接口回的是不是 WAV）本来就有用例，**唯独分离没有** ——
+    而分离恰恰是三条里最容易漏的一条：它在 `_transcribe_impl` 的循环里拿的是同一个
+    `seg_path`，看着"顺手就对了"；可一旦有人把 `seg_path` 换回原路径，它未必报错
+    （pyannote 那条路对容器的宽容度与 sherpa 不同），表现会是"转写正常、分离悄悄
+    与转写分家"。所以这里断言的**不是"分离成功了"**，而是"喂给分离的就是那条解出来
+    的临时 WAV，而且用完就没了"。
+    """
+
+    def setUp(self):
+        super().setUp()
+        # ASR 打桩：本用例只关心分离拿到什么，不加载真模型。
+        p = patch.object(meeting, "_sherpa_rows",
+                         lambda path, idx, m, cfg, kinds: ([(idx, 0.0, 1.0, "一句话")], ""))
+        p.start()
+        self.addCleanup(p.stop)
+        p = patch.object(meeting.stt_mod, "_get_sherpa", lambda *a, **k: object())
+        p.start()
+        self.addCleanup(p.stop)
+        settings.update({"meetingSttModel": "sherpa"})
+
+    def test_diarize_receives_the_decoded_riff_wav_not_the_flac(self):
+        self.make_meeting(segments=2, seconds=1.0)
+        mid = db.create_meeting(self.name, started_at="2026-09-20T10:00:00")
+        self.addCleanup(db.delete_meeting, mid)
+        self.fail(self.name)                       # 先压成 flac（原件删掉）
+        self.assertFalse(os.path.exists(self.seg_path(1)), "前置：wav 应已被压掉")
+
+        seen = []
+
+        def spy(path, max_speakers=None):
+            # 在**分离那一刻**读头：临时文件还在；出了 `decoded_segments` 就没了。
+            with open(path, "rb") as fh:
+                seen.append((path, fh.read(4)))
+            return [(0.0, 1.0, "SPEAKER_00")], [[0.1] * 256], ["SPEAKER_00"]
+
+        p = patch("app.audio.diarize.diarize_wav_full", spy)
+        p.start()
+        self.addCleanup(p.stop)
+
+        meeting._transcribe_impl(self.folder)
+
+        self.assertEqual(len(seen), 2, "两段都该被送进分离")
+        for path, head in seen:
+            self.assertEqual(head, b"RIFF", "分离拿到的必须是 RIFF/WAV，不是 flac：%s" % path)
+            self.assertTrue(path.lower().endswith(".wav"), path)
+            self.assertFalse(os.path.exists(path), "分离用完，临时 WAV 必须已经删掉")
+
+
+class PlaybackDecodeHygieneTests(_CompressCase):
+    """播放那一路的"用完即删"：临时 WAV 在**响应发完之后**立刻删，不留到下一小时。
+
+    修的是什么（2026-09-26 复查发现的两处"看着有其实没有"）：
+      * 此前 `meeting_audio` 把 `decode_to_wav()` 的产物**登记了却从不删**，
+        只靠 `gc_temp()`（TTL 1 小时）兜底；
+      * 而注释里写的"退出时的清理兜底"当时**并不存在** ——
+        `audiofile.cleanup_registered()` 只被定义、全仓没有一个调用方。
+    现在：响应挂 `BackgroundTask` 发完即删（`api._drop_temp_decode`），
+    `app/main.py` 的 lifespan 关闭段补上 `cleanup_registered()` 当第二道闸。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        from app.api import router
+        app = FastAPI()
+        app.include_router(router)
+        cls.client = TestClient(app)
+
+    def _temp_leftovers(self):
+        try:
+            return sorted(n for n in os.listdir(self.decode_dir)
+                          if n.startswith(af.TEMP_PREFIX))
+        except OSError:
+            return []
+
+    def test_response_is_wav_and_the_temp_decode_is_deleted(self):
+        self.make_meeting(segments=1, seconds=1.0)
+        mid = db.create_meeting(self.name, started_at="2026-09-20T10:00:00")
+        self.addCleanup(db.delete_meeting, mid)
+        self.fail(self.name)
+
+        r = self.client.get("/api/meetings/%d/audio?seg=1" % mid)
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.content[:4], b"RIFF")
+        self.assertEqual(self._temp_leftovers(), [],
+                         "播放完临时解码文件必须已经删掉（不许留到 gc_temp）")
+        self.assertTrue(os.path.isfile(self.seg_path(1, ".flac")), "归档文件不许被动")
+
+    def test_the_same_segment_plays_twice_without_accumulating(self):
+        """连播两次：每次都回得出内容，且**每次都不留临时文件**（防"删早了"回归）。"""
+        self.make_meeting(segments=1, seconds=1.0)
+        mid = db.create_meeting(self.name, started_at="2026-09-20T10:00:00")
+        self.addCleanup(db.delete_meeting, mid)
+        self.fail(self.name)
+        for _ in range(2):
+            r = self.client.get("/api/meetings/%d/audio?seg=1" % mid)
+            self.assertEqual(r.status_code, 200)
+            self.assertEqual(r.content[:4], b"RIFF")
+            self.assertEqual(self._temp_leftovers(), [])
+
+    def test_the_decode_is_logged(self):
+        """日志留痕：翻日志要能看出"这一段为什么在 %TEMP% 里落了文件"。"""
+        self.make_meeting(segments=1, seconds=1.0)
+        mid = db.create_meeting(self.name, started_at="2026-09-20T10:00:00")
+        self.addCleanup(db.delete_meeting, mid)
+        self.fail(self.name)
+        self.client.get("/api/meetings/%d/audio?seg=1" % mid)
+        texts = [m for _lv, _src, m in self.logs]
+        hit = [t for t in texts if "FLAC" in t and "用时解码" in t and "删" in t]
+        self.assertTrue(hit, "应当有一条说明「解了哪段 / 多大 / 用完即删」的日志：%s" % texts)
+
+
+class TempRegistryTests(_CompressCase):
+    """`drop_temp()` / `cleanup_registered()` 本身：删得掉、登记也撤得干净。"""
+
+    def test_drop_temp_removes_the_file_and_unregisters_it(self):
+        # 直接走真解码造一个登记过的临时文件（`decode_to_wav(cleanup=True)` 会登记它）
+        src = self.make_meeting(segments=1, seconds=0.2)[0]
+        path = af.decode_to_wav(os.path.join(self.folder, src))
+        self.assertTrue(os.path.isfile(path))
+        self.assertIn(path, af._TEMP_REGISTRY)
+        self.assertTrue(af.drop_temp(path))
+        self.assertFalse(os.path.exists(path), "drop_temp 必须真的删掉文件")
+        self.assertNotIn(path, af._TEMP_REGISTRY, "登记也必须撤掉（否则 cleanup_registered 白跑）")
+        # 再删一次不抛（幂等）
+        self.assertTrue(af.drop_temp(path))
+
+    def test_cleanup_registered_removes_everything_it_registered(self):
+        src = self.make_meeting(segments=1, seconds=0.2)[0]
+        paths = [af.decode_to_wav(os.path.join(self.folder, src)) for _ in range(2)]
+        self.assertTrue(all(os.path.isfile(p) for p in paths))
+        af.cleanup_registered()
+        self.assertTrue(all(not os.path.exists(p) for p in paths),
+                        "进程退出兜底必须删掉登记过的临时文件")
+        self.assertEqual(af._TEMP_REGISTRY, set())
 
 
 if __name__ == "__main__":

@@ -593,17 +593,46 @@ def update_command(cmd_id, **fields):
     _exec(f"UPDATE commands SET {', '.join(sets)} WHERE id=?", params)
 
 
-def list_commands(limit=100, offset=0):
+def _command_where(q="", since=""):
+    """`commands` 的筛选条件（列表与计数**共用这一份**）。
+
+    「历史」页要能按关键词/时间过滤，而历史会很长（几千条）—— 过滤必须发生在
+    **SQL 里**，不能在面板上对"已加载的这一页"过滤：那样"加载更多"的翻页语义就错了
+    （第 2 页可能是过滤后的第 0 条），用户看到的条数也永远对不上 `total`。
+
+    `since` 是 `YYYY-MM-DD HH:MM:SS` 文本：`ts` 存的就是这个定宽格式
+    （`datetime('now','localtime')`），所以字符串比较等价于时间比较。
+    """
+    where, params = [], []
+    token = str(q or "").strip()
+    if token:
+        # `%`/`_` 是 LIKE 的通配符：用户搜 "50%" 时不该变成"匹配一切"。
+        esc = token.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        like = "%" + esc + "%"
+        where.append("(text LIKE ? ESCAPE '\\' OR reply LIKE ? ESCAPE '\\' "
+                     "OR brief LIKE ? ESCAPE '\\' OR error LIKE ? ESCAPE '\\')")
+        params += [like, like, like, like]
+    since = str(since or "").strip()
+    if since:
+        where.append("ts >= ?")
+        params.append(since)
+    return (" WHERE " + " AND ".join(where) if where else ""), params
+
+
+def list_commands(limit=100, offset=0, q="", since=""):
+    where, params = _command_where(q, since)
     return _query(
-        "SELECT * FROM commands ORDER BY id DESC LIMIT ? OFFSET ?", (limit, offset))
+        "SELECT * FROM commands" + where + " ORDER BY id DESC LIMIT ? OFFSET ?",
+        params + [limit, offset])
 
 
 def get_command(cmd_id):
     return _query_one("SELECT * FROM commands WHERE id=?", (cmd_id,))
 
 
-def count_commands():
-    return _query_one("SELECT COUNT(*) AS n FROM commands")["n"]
+def count_commands(q="", since=""):
+    where, params = _command_where(q, since)
+    return _query_one("SELECT COUNT(*) AS n FROM commands" + where, params)["n"]
 
 
 def clear_commands():
@@ -770,6 +799,22 @@ def replace_speakers(meeting_id, speaker_map):
 
 def get_speakers(meeting_id):
     return _query("SELECT * FROM speakers WHERE meeting_id=? ORDER BY id", (meeting_id,))
+
+
+def speaker_names_by_meeting():
+    """`{meeting_id: [显示名, …]}` —— **一次查询**喂整个会议列表。
+
+    为什么不是"每场调一次 `get_speakers`"：历史页一次要画 100 场，那就成了 100 条 SQL。
+    返回的是显示名（改过名就是联系人姓名，没改过是「说话人1」），面板只显示、不解释。
+    """
+    out = {}
+    for row in _query("SELECT meeting_id, label, name FROM speakers ORDER BY meeting_id, id"):
+        try:
+            mid = int(row["meeting_id"])
+        except (TypeError, ValueError):
+            continue
+        out.setdefault(mid, []).append(row["name"] or row["label"] or "")
+    return out
 
 
 def rename_speaker(meeting_id, label, new_name):
