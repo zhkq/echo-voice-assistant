@@ -127,7 +127,16 @@ class _MeetingCase(unittest.TestCase):
             p.start()
             self.addCleanup(p.stop)
 
-        settings.update({"meetingAutoSummarize": False, "meetingDiarize": False})
+        settings.update({"meetingAutoSummarize": False})
+        # 2026-09-26：说话人分离是会议的**必备环节**（不再是开关）——不打桩的话每个
+        # 转写用例都会去加载本机 pyannote（开发机上装着 → 白等几十秒 + 占显存），
+        # 而这一组用例要验的是**引擎分派**，不是分离本身（分离的护栏在
+        # tests/test_meeting_speakers_standard.py）。
+        p = patch("app.audio.diarize.diarize_wav_full",
+                  lambda path, max_speakers=None: ([(0.0, 1.0, "SPEAKER_00")],
+                                                   [[0.1] * 256], ["SPEAKER_00"]))
+        p.start()
+        self.addCleanup(p.stop)
         self.name = "%s__%s" % (_NAME, self._testMethodName)
         self.folder = self._make_meeting(self.name)
 
@@ -412,15 +421,51 @@ class SherpaMeetingTests(_MeetingCase):
 # ---------------------------------------------------------------- ④ 支持的引擎不受影响
 
 class SupportedEnginesUnchangedTests(_MeetingCase):
-    """whisper / sensevoice / qwen3asr：**谁去加载、用什么参数**逐字不变。
+    """sherpa / sensevoice / qwen3asr：**谁去加载、用什么参数**逐字不变。
 
-    这三个引擎今天能跑，这次修 bug 不许碰它们的行为（硬约束："老装机逐字不变"）。
+    这个三引擎今天能跑，不许因为别处的改动坏掉（硬约束："老装机逐字不变"）。
     加载参数就是"行为"里最容易悄悄改坏的那一半 —— `_get_whisper("small")` 被改成
     `_get_whisper(<配置值>)` 这种事不会有任何报错，只会变慢或变不准。
+
+    **whisper 档（2026-09-26）**：本机权重已删除，`config.DEFAULTS` 的候选项里也退役了它们，
+    老库里的值会被折成 sherpa / qwen3asr（`config.RETIRED_VALUE_FALLBACKS`）。
+    下面那条 whisper 分派的用例因此**绕过折算**（直接把设置读值打桩成 "medium"）——
+    它守的是"macOS 那类仍然提供 whisper 档的平台上，分派逐字不变"。
     """
 
+    def _force_engine(self, value):
+        """绕过读时折算，直接把 `meetingSttModel` 的读值钉成 `value`。
+
+        为什么要这么绕：`settings.update()` 写进库的 "medium" 会被
+        `config.RETIRED_VALUE_FALLBACKS` 折成 qwen3asr（本机不再提供 whisper 档），
+        而这条用例要验的是**引擎分派**本身，不是折算策略。
+        """
+        real = settings.get
+
+        def fake(key, default=None):
+            if key == "meetingSttModel":
+                return value
+            return real(key, default)
+
+        p = patch.object(meeting.settings, "get", fake)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_a_retired_whisper_value_is_folded_to_the_new_engine(self):
+        """老库里选了 whisper 档 → 读出来是**新分工**里的引擎，绝不会卡在跑不起来的档上。
+
+        这条钉的是"用户不用自己去改配置"：权重已经删了，若原样读出来，那台机器
+        每场会都会在加载模型时炸。
+        """
+        settings.update({"meetingSttModel": "medium"})
+        settings._cache = None
+        self.assertEqual(settings.get("meetingSttModel"), "qwen3asr")
+        self.assertEqual(meeting.resolve_meeting_engine(settings.get("meetingSttModel"))[0],
+                         "qwen3asr")
+
     def test_whisper_uses_the_configured_model_name(self):
-        self._set_engine("medium")
+        """（仍提供 whisper 档的平台）whisper 用**配置的那个档名**去加载，不是写死的 small。"""
+        self._force_engine("medium")
         loaders = self._stub_loaders()
         loaders["_get_whisper"].return_value = object()
         p = patch.object(meeting.stt_mod, "transcribe_whisper",
@@ -438,24 +483,30 @@ class SupportedEnginesUnchangedTests(_MeetingCase):
         self.assertEqual(self._meeting_row()["status"], "transcribed")
         self.assertEqual((self._meeting_row()["error"] or ""), "")
 
-    def test_sensevoice_still_borrows_the_small_whisper_skeleton(self):
+    def test_sensevoice_without_a_whisper_skeleton_still_produces_text(self):
+        """**whisper 权重已删** → SenseVoice 借不到骨架也要照常出文字（档位如实 `estimated`）。
+
+        原来的行为是"无条件借 whisper small 做句级对齐"；现在那批权重没了，
+        正确结局是**如实降级**（按字数均摊），而不是每场会去戳一次 HuggingFace、
+        更不是整场转写崩掉。
+        """
         self._set_engine("sensevoice")
         loaders = self._stub_loaders()
-        loaders["_get_whisper"].return_value = object()
-        loaders["_get_sensevoice"].return_value = object()
-        p = patch.object(meeting, "_fallback_sv_rows",
-                         lambda sv, wm, path, idx, seg_min, cfg: [(idx, 0.0, 0.5, "乙。")])
-        p.start()
-        self.addCleanup(p.stop)
+        loaders["_get_sensevoice"].return_value = MagicMock()
+        loaders["_get_whisper"].side_effect = RuntimeError("本机没有 faster-whisper 权重")
+        sense = MagicMock()
+        sense.generate.return_value = [{"text": "甲。乙。"}]
+        loaders["_get_sensevoice"].return_value = sense
 
         meeting._transcribe_impl(self.folder)
 
-        self.assertEqual(loaders["_get_whisper"].call_args.args[0], "small",
-                         "SenseVoice 的时间骨架固定用 small（与改动前一致）")
-        self.assertTrue(loaders["_get_sensevoice"].called)
         self.assertFalse(loaders["_get_qwen3asr"].called)
-        self.assertFalse(loaders["_get_sherpa"].called)
-        self.assertEqual([ln["text"] for ln in db.get_lines(self.mid)], ["乙。"])
+        self.assertEqual([ln["text"] for ln in db.get_lines(self.mid)], ["甲。", "乙。"])
+        meta = meeting.meeting_meta(self.name)
+        self.assertEqual(meta.get("timestampsKinds"), {TIMESTAMPS_ESTIMATED: 1},
+                         "借不到骨架就该如实标「估算」")
+        self.assertTrue(any(lv == "warn" and "骨架" in msg for lv, msg in self.logs),
+                        "借不到骨架要留一句话（否则用户只会看到时间轴变糙）：%s" % self.logs)
 
     def test_qwen3asr_still_uses_the_native_sentences_with_the_forced_aligner(self):
         self._set_engine("qwen3asr")
@@ -476,14 +527,17 @@ class SupportedEnginesUnchangedTests(_MeetingCase):
         self.assertEqual([ln["text"] for ln in db.get_lines(self.mid)], ["丙。"])
 
     def test_the_reason_is_cleared_when_a_retranscribe_succeeds(self):
-        """失败原因不许留到下一次：重转成功后 `error` 必须清空，否则面板拿旧原因解释新结果。"""
+        """失败原因不许留到下一次：重转成功后 `error` 必须清空，否则面板拿旧原因解释新结果。
+
+        （重转这一半用 whisper 分派：**绕过读时折算**，见 `_force_engine`。）
+        """
         self._set_engine("paraformer")
         self._stub_loaders()
         with self.assertRaises(meeting.MeetingEngineRefused):
             meeting._transcribe_impl(self.folder)
         self.assertTrue((self._meeting_row()["error"] or "").strip())
 
-        self._set_engine("small")
+        self._force_engine("small")
         loaders = self._stub_loaders()
         loaders["_get_whisper"].return_value = object()
         with patch.object(meeting.stt_mod, "transcribe_whisper",

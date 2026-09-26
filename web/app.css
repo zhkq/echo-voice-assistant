@@ -460,6 +460,17 @@ body { min-width: 0; }
 .cap-comp-name { font-size: 13.5px; font-weight: 600; min-width: 0; }
 .cap-comp-badge { margin-left: auto; flex: 0 0 auto; }
 .cap-comp-meta { color: var(--muted); font-size: 12.5px; line-height: 1.5; margin-top: 3px; }
+/* 使用情况那一行（占用 / 上次使用 / 次数 / 保留 / 在用）：比别的元信息再暗一点，
+   它是"事实行"，不该和说明文字抢注意力。 */
+.cap-comp-meta.usage { color: #8b93a7; font-size: 12px; }
+/* 清理卡与"其余引擎"折叠区里的复选框：贴着名字，不要撑开行高。 */
+.cap-comp-main > input[type="checkbox"] { flex: 0 0 auto; margin: 0 2px 0 0; }
+/* 卡片里的**折叠区**（`foldGroup()`；2026-09-26 用户要求"其余默认折叠"）：
+   比整卡轻一档 —— 透明底 + 细左边条，收起来时只占一行标题。 */
+.mcard.fold { background: transparent; border-style: dashed; padding: 8px 10px; }
+.mcard.fold > .mcard-head { margin-bottom: 6px; }
+.mcard.fold.collapsed > .mcard-body { display: none; }
+.mcard.fold.collapsed { padding-bottom: 8px; }
 .cap-comp-acts { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; align-items: center; }
 .cap-comp-acts .btn { white-space: nowrap; }   /* 「复制命令」不许竖排 */
 /* 已就绪项的动作降级成小文字链接（灰字、悬停才亮）：不跟未就绪的「下载」主按钮抢注意力，
@@ -533,7 +544,7 @@ select.ctl, input.ctl { min-width: 0; max-width: 100%; }
 select.ctl { text-overflow: ellipsis; }
 /* 兜底：flex/grid 容器一律允许收缩（各自的子项自己再设 width） */
 .settings-form, .set-row, .set-group-body, .set-sub-body, .mcard, .mcard-body,
-.rt-list, .rt-row, .rt-add, .agent-field, .cap-online, #rtSetHost, #rtLlmHost { min-width: 0; }
+.rt-list, .rt-row, .rt-add, .agent-field, .cap-online, #rtSetHost, #rtCapHost, #rtLlmHost { min-width: 0; }
 
 /* ---------- 会议 ---------- */
 .meeting-list { display: flex; flex-direction: column; gap: 8px; max-height: 300px; overflow-y: auto; }

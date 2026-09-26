@@ -15,19 +15,24 @@
 <body>
 <header class="topbar">
   <div class="brand">ECHO<span class="sub">个人助理</span></div>
-  <!-- 顶层页签（2026-09-25 整合）：原来的「设置 / 启动 / 模型路由 / 能力」四个入口合并成
-       常规（原设置+启动）· 语音与设备 · 智能体（原模型路由）· 能力后端（原能力）；
-       同日「向导」也并进「常规」页最后一张卡（默认收起），所以顶层只剩 7 个。
-       **只有这一层**，不再有子页签。旧深链 `?view=settings|boot|failover|capabilities|wizard`
-       由 app.js 的 VIEW_ALIASES 折算到新 id（wizard 还会自动展开那张卡并滚过去）。 -->
+  <!-- 顶层页签（2026-09-26 用户定的 IA）：**配置分三类 + 一个历史位**
+       1. ECHO 通用      快捷键 · 打开/启动形式 · 运行状态（服务/端口/版本/重启停止）
+       2. 业务配置       会议（录音设备 · 分段 · 保存策略 · 转写走哪条路）· 语音指令 · 朗读反馈 · 队列
+       3. 能力与智能体   智能体选择 · 模型路由（合并卡）· 设备选择
+                         ├ 已配对后端连接情况   ├ 本地能力部署运行情况（默认只展开"配置为要用的"）
+                         └ 清理（先预览、后确认）
+       4. 历史           指令历史 · 会议历史（**这一轮只预留位置/空态**）
+       原来的「常规 / 语音与设备 / 智能体 / 能力后端」四个设置页签就是被这三类替掉的
+       （内容一项没少，只是重新分组 + 默认折叠，见 docs/设置项归属表.md）。
+       旧深链 `?view=settings|boot|voice|agent|failover|capabilities|wizard` 由 app.js 的
+       VIEW_ALIASES 折算到新 id（wizard 还会自动展开那张卡并滚过去）。 -->
   <nav class="tabs">
     <button class="tab active" data-view="dashboard">仪表盘</button>
-    <button class="tab" data-view="general">常规</button>
-    <button class="tab" data-view="voice">语音与设备</button>
-    <button class="tab" data-view="agent">智能体</button>
-    <button class="tab" data-view="capability">能力后端</button>
+    <button class="tab" data-view="general">ECHO 通用</button>
+    <button class="tab" data-view="business">业务配置</button>
+    <button class="tab" data-view="capability">能力与智能体</button>
     <button class="tab" data-view="history">历史</button>
-    <button class="tab" data-view="meetings">会议</button>
+    <button class="tab" data-view="meetings">会议记录</button>
   </nav>
 </header>
 
@@ -95,13 +100,14 @@
     </div>
   </section>
 
-  <!-- ============ 常规（原「设置」+ 原「启动」）============
-       2026-09-25：四个设置视图现在是**顶层页签**，每页顶部一条工具条（保存 + 折叠全部卡片），
-       下面的卡片与行全部由 app.js 的 loadSettings() 渲染（值来自 /api/settings 等接口）——
+  <!-- ============ ① ECHO 通用（原「常规」+「启动」）============
+       2026-09-26：配置分三类后，这一页只讲**这台机器/这个面板自己**的事：
+       快捷键 · 打开/启动形式 · 运行状态（服务/端口/版本/重启停止）。
+       卡片与行全部由 app.js 的 loadSettings() 渲染（值来自 /api/settings 等接口）——
        静态写死值会和后端漂移，这里只留空面板。 -->
   <section id="view-general" class="view hidden">
     <div class="card">
-      <div class="card-title">常规 <span class="muted">(保存到本地数据库)</span>
+      <div class="card-title">ECHO 通用 <span class="muted">(保存到本地数据库)</span>
         <span class="spacer"></span>
         <button class="btn" data-set-save="1">保存</button>
         <!-- 双箭头（2026-09-13 用户要求把文字按钮换成双箭头交互，并放到最右侧）：
@@ -121,9 +127,8 @@
          `test_capability_panel` 那条"卡片在哪个视图里"的断言靠"取到视图自己的 </section>"来切） -->
     <div class="ssetpane" data-settab-pane="general"><div id="setPaneGeneral"></div></div>
 
-    <!-- 原「启动」页签，2026-09-25 整合后只留"这台机器自己的运行态"：
-         启动摘要 + 「组件就绪 N/M → 去能力后端」指路 + 组件进程启停 + 启动日志。
-         组件/模型"装没装、缺什么、怎么装"的就绪清单**只在「能力后端」页渲染一处**
+    <!-- 运行状态这一页的"这台机器自己的运行态"：启动摘要 + 组件进程启停 + 启动日志。
+         组件/模型"装没装、缺什么、怎么装"的就绪清单**只在「能力与智能体」页渲染一处**
          （原来那份 `#bootComponents` 明细已删，理由见 app.js 的 renderBoot 注释）。 -->
     <div class="card">
       <div class="card-title">启动状态
@@ -137,7 +142,8 @@
     </div>
     <!-- 可折叠卡片（静态示例：class="collapsible" + data-collapse-id，点标题折叠/展开，
          状态记在 localStorage，见 app.js 的 toggleCollapsibleCard）。 -->
-    <div class="card collapsible" id="bootLogCard" data-collapse-id="boot-logs">
+    <div class="card collapsible" id="bootLogCard" data-collapse-id="boot-logs"
+         data-collapse-default="closed">
       <div class="card-title"><span class="set-arrow">▶</span>启动日志
         <span class="muted" style="font-size:12px">(自动刷新)</span>
         <span class="spacer"></span>
@@ -164,10 +170,12 @@
     </div>
   </section>
 
-  <!-- ============ 语音与设备 ============ -->
-  <section id="view-voice" class="view hidden">
+  <!-- ============ ② 业务配置（原「语音与设备」+ 会议/指令/队列/工作区）============
+       用户的原话："会议、语音指令等核心业务使用配置"。卡片（会议 / 语音指令 / 朗读与反馈 /
+       队列 / 工作区与归档）由 app.js 的 SET_CARDS.business 渲染。 -->
+  <section id="view-business" class="view hidden">
     <div class="card">
-      <div class="card-title">语音与设备 <span class="muted">(保存到本地数据库)</span>
+      <div class="card-title">业务配置 <span class="muted">(保存到本地数据库)</span>
         <span class="spacer"></span>
         <button class="btn" data-set-save="1">保存</button>
         <button class="btn icon" data-set-collapse="1" title="折叠全部卡片" aria-label="折叠全部卡片">
@@ -180,13 +188,18 @@
       </div>
       <div class="sset-who"></div>
     </div>
-    <div class="ssetpane" data-settab-pane="voice"><div id="setPaneVoice"></div></div>
+    <div class="ssetpane" data-settab-pane="business"><div id="setPaneBusiness"></div></div>
   </section>
 
-  <!-- ============ 智能体（原「设置 → 智能体」+ 原「模型路由」）============ -->
-  <section id="view-agent" class="view hidden">
+  <!-- ============ ③ 能力与智能体（原「智能体」+「能力后端」）============
+       用户给的这一页结构（三块）：智能体选择 · 模型路由（合并卡）· 设备选择；
+       下面是 ├ 已配对后端连接情况 ├ 本地能力部署运行情况 └ 清理。
+       一条纪律（规则②）：**一个实体只有一处状态** —— 会议转写/分离/声纹"由谁做"在
+       「业务配置 → 会议」里，引擎与设备的选择在「业务配置」/「设备选择」里，
+       这一页只讲"装没装、多大、多久没用过"与"删不删"。 -->
+  <section id="view-capability" class="view hidden">
     <div class="card">
-      <div class="card-title">智能体 <span class="muted">(保存到本地数据库)</span>
+      <div class="card-title">能力与智能体 <span class="muted">(保存到本地数据库)</span>
         <span class="spacer"></span>
         <button class="btn" data-set-save="1">保存</button>
         <button class="btn icon" data-set-collapse="1" title="折叠全部卡片" aria-label="折叠全部卡片">
@@ -199,7 +212,8 @@
       </div>
       <div class="sset-who"></div>
     </div>
-    <div class="ssetpane" data-settab-pane="agent"><div id="setPaneAgent"></div></div>
+    <!-- 智能体选择 + 设备选择（两张卡由 SET_CARDS.capability 渲染） -->
+    <div class="ssetpane" data-settab-pane="capability"><div id="setPaneCapability"></div></div>
 
     <!-- ====== 模型路由：语言模型 + 通道成员 + 派发情况 **合成一张卡**（2026-09-25 用户要求）======
          卡内分层用设置卡片同一套小节样式（`.ssec`）；7 项路由参数在「高级」里。
@@ -207,11 +221,13 @@
          静态放着就不会被 `loadSettings()` 的重绘冲掉（两边的请求是并发的，动态渲染会互相覆盖）。
          只有「高级」里的那 7 行参数由 renderSettingsPanes() 填进 `#rtSetHost`。
          卡内的「保存」= 这张卡里的全部改动（成员/优先级 + 7 项参数），页签顶部的「保存」只管
-         上面那些设置卡片（见 app.js 的 saveRouter 注释）。 -->
+         上面那些设置卡片（见 app.js 的 saveRouter 注释）。
+         2026-09-26：会议能力通道（转写/分离/声纹由谁做）**挪去「业务配置 → 会议」**了 ——
+         那是会议的配置，不是语言模型路由的配置；同一个键只有一处能改。 -->
     <div class="card collapsible" id="rtMergeCard" data-collapse-id="set-router">
       <div class="card-title"><span class="set-arrow">▶</span><span class="ic">🛰️</span>模型路由
         <span class="badge idle" id="rtBadge">检查中…</span>
-        <span class="sq" role="button" tabindex="0" aria-label="说明">?<span class="spop">这一张卡管四件事：<b>语言模型</b>（用哪个实现 + 在线服务）、<b>通道成员</b>（顺序 = 优先级）、<b>派发情况</b>（命中与成功率），以及「高级」里的 <b>7 项路由参数</b>。成员与参数的改动都由卡内的「保存」落库。</span></span>
+        <span class="sq" role="button" tabindex="0" aria-label="说明">?<span class="spop">这一张卡管三件事：<b>语言模型</b>（用哪个实现 + 在线服务）、<b>通道成员</b>（顺序 = 优先级）、<b>派发情况</b>（命中与成功率），以及「高级」里的 <b>7 项路由参数</b>。会议那条路（转写 / 分离 / 声纹由谁做）在「业务配置 → 会议」里。</span></span>
         <span class="spacer"></span>
         <a class="rt-link" id="rtDashLink" href="#" target="_blank" rel="noopener"
            title="打开路由自带页面：命中统计与切换历史">仪表盘 ↗</a>
@@ -253,67 +269,32 @@
       </div>
     </div>
 
-    <!-- 环境体检：2026-09-25 用户要求放到「智能体」页**最后一张**（内容不动；卡片由
-         renderEnvCheck() 渲染进这个静态 host，所以它始终在这一页末尾）。 -->
-    <div id="envCheckHost"></div>
-  </section>
-
-  <!-- ============ 能力后端（原「设置 → 能力后端」+ 原「能力」）============
-       每个能力只在这一处出现：先「用哪个实现」（本地引擎 / 在线服务 / 关闭），
-       再「装没装、怎么装」（组件就绪 + 下载/复制命令/官方链接）。
-       2026-09-19 用户指出三处设计重叠（模型页签 / 组件页签 / 设置里的 provider 卡片）
-       都只在讲"这台机器上每个功能由什么实现、装好了没"，故合并到这一个页签。 -->
-  <section id="view-capability" class="view hidden">
-    <div class="card">
-      <div class="card-title">能力后端 <span class="muted">(保存到本地数据库)</span>
-        <span class="spacer"></span>
-        <button class="btn" data-set-save="1">保存</button>
-        <button class="btn icon" data-set-collapse="1" title="折叠全部卡片" aria-label="折叠全部卡片">
-          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.4"
-               stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <path d="M6 11.5 12 7l6 4.5" />
-            <path d="M6 18.5 12 14l6 4.5" />
-          </svg>
-        </button>
-      </div>
-      <div class="sset-who"></div>
-    </div>
-    <div class="ssetpane" data-settab-pane="capability"><div id="setPaneCapability"></div></div>
-
-    <!-- 原「能力」页签的内容 -->
-    <div class="card">
-      <div class="card-title"><span class="ic">🧩</span>能力
-        <span class="muted" id="capOvSummary">—</span>
-        <span class="spacer"></span>
-        <!-- 按钮短一点、用 mini：窄边条里原来「一键下载缺失 + 刷新」会折成两行
-             （用户 2026-09-19："第一排的一键下载缺失和刷新再缩一下，别换行"）。完整说明进 title。 -->
-        <button class="btn mini" id="btnCapDownloadMissing"
-                title="把所有缺失、且能从上游获取的模型排成队列依次下载">下载缺失</button>
-        <button class="btn mini" id="btnCapReload" title="重新读取能力与组件状态">刷新</button>
-      </div>
-      <div class="model-ov" id="capOverview"></div>
-      <div class="muted" style="margin-top:6px;font-size:12px">
-        每个能力一处看全：<b>用哪个实现</b>（本地 / 在线 / 关闭）+ <b>装没装、怎么装</b>。
-        下拉与开关都是选中即生效；密钥只存本机、接口永不回显；标「出网」的会把数据发到外部服务。
-      </div>
-    </div>
-    <div class="card" id="capRouteCard">
-      <div class="card-title"><span class="ic">🖥️</span>后端面板（GPU 机器 / 配对）
+    <!-- ====== ├ 已配对后端连接情况（配对状态 · 健康 · 发授权/撤销入口）======
+         2026-09-26：**默认收起**（没配对时尤其没必要占地方）；真的配上了由
+         loadCapabilityRouting() 自动展开一次（见那边的注释）。 -->
+    <div class="card collapsible" id="capRouteCard" data-collapse-id="cap-pair"
+         data-collapse-default="closed">
+      <div class="card-title"><span class="set-arrow">▶</span><span class="ic">🖥️</span>已配对后端连接情况
         <span class="badge idle" id="capRouteBadge">读取中…</span>
         <span class="spacer"></span>
         <button class="btn mini" id="btnCapRouteProbe"
                 title="不等 30 秒缓存，马上把所有后端重问一遍">刷新</button>
       </div>
       <div class="card-body">
+        <div class="muted" style="font-size:12px">
+          这台机器可以把 GPU 重活（会议转写 / 说话人分离 / 声纹）交给一台带显卡的
+          ECHO 后端做。<b>音频会离开这台机器</b>，所以要不要用由你决定
+          （在「业务配置 → 会议 → 转写走哪条路」里选）。
+        </div>
         <!-- 配对：**粘一整串**（`echo://pair?host=…&code=…&fp=…`）或分开填地址+码。
              **刻意不藏**（配好之后也留着）——"换一台后端"与"第一次配对"是同一件事，
              藏起来只会让人找不到入口。 -->
         <div id="capPairBox" class="cap-pair">
           <div class="muted" style="font-size:12px">
-            这台机器可以把 GPU 重活（会议转写 / 说话人分离 / 声纹）交给一台带显卡的
-            ECHO 后端做。<b>音频会离开这台机器</b>，所以要不要用由你决定（见上面的「会议转写服务」卡）。
             管理员给你一张<b>配对码或配对串</b>（<code>echo://pair?host=…&amp;code=…&amp;fp=…</code>），
             整串粘在下面第一个框里即可；串里带指纹时会 <b>校验证书</b>，那是防中间人的一步。
+            <b>发授权（一次性配对串）与撤销客户端在管理员那台 ECHO 后端上</b> ——
+            这侧只有"配对 / 解除配对"。
           </div>
           <div class="cap-pair-row">
             <input id="capPairUrl" class="ctl grow" type="text" spellcheck="false"
@@ -327,24 +308,87 @@
           <div class="muted" id="capPairState" style="font-size:12px"></div>
         </div>
         <div id="capBackendList" class="cap-prov"></div>
-        <!-- 这一格只放一句指路：转写/分离/声纹的选择已经收进上面的「会议转写服务」卡
-             （一个单选 + 一个「会议产出」下拉 = 原来那三个键），所以这里不再放第二套下拉。
-             2026-09-25：同一个设置项两处能改，就是 2026-09-19 那次"三处都在讲同一件事"的老问题。 -->
+        <!-- 这一格放：直连地址 + 一句指路（转写走哪条路 / 分离与声纹由谁做都在「业务配置 → 会议」）。
+             同一个设置项两处能改，就是 2026-09-19 那次"三处都在讲同一件事"的老问题。 -->
         <div id="capRouteSettings" class="settings-form"></div>
       </div>
     </div>
-    <div class="model-cards" id="capKindCards"></div>
-    <div class="model-cards" id="capFuncCards"></div>
-    <div id="capEnvHost"></div>
-    <div class="muted model-foot">
-      路径是代码约定，改了加载器就找不到模型，所以原样展示。「已选但未就绪」会标红并给「去下载」。
+
+    <!-- ====== ├ 本地能力部署运行情况（**默认只展开"配置为要用的"**，其余默认折叠）======
+         每项带「占用 / 上次使用 / 使用次数」（数据来自 /api/models 的使用账本），
+         并可就地下载 / 复制安装命令。whisper 三档（权重在本机但已退役）落在
+         默认收起的「其余本地引擎」里 —— 留着，不占视野。 -->
+    <div class="card" id="capLocalCard">
+      <div class="card-title"><span class="ic">🧩</span>本地能力部署运行情况
+        <span class="muted" id="capOvSummary">—</span>
+        <span class="spacer"></span>
+        <!-- 按钮短一点、用 mini：窄边条里原来「一键下载缺失 + 刷新」会折成两行
+             （用户 2026-09-19："第一排的一键下载缺失和刷新再缩一下，别换行"）。完整说明进 title。 -->
+        <button class="btn mini" id="btnCapDownloadMissing"
+                title="把所有缺失、且能从上游获取的模型排成队列依次下载">下载缺失</button>
+        <button class="btn mini" id="btnCapReload" title="重新读取能力与组件状态">刷新</button>
+      </div>
+      <div class="model-ov" id="capOverview"></div>
+      <div class="muted" style="margin-top:6px;font-size:12px">
+        默认只展开<b>配置为要用的</b>；其余（whisper 三档、没装的）折叠在下面。<br>
+        每一行的「占用 / 上次使用 / 使用次数」来自本机使用账本（模型真的被加载或调用时才记），
+        它也是「清理」判断"近期没再用过"的依据 —— 不看文件时间，不瞎删。
+      </div>
+      <div class="model-cards" id="capKindCards"></div>
+      <div class="model-cards" id="capFuncCards"></div>
+      <div id="capEnvHost"></div>
+      <div class="settings-form" id="capModelsDirHost"></div>
+      <div id="envCheckHost"></div>
+      <div class="muted model-foot">
+        路径是代码约定，改了加载器就找不到模型，所以原样展示。「已选但未就绪」会标红并给「去下载」。
+      </div>
+    </div>
+
+    <!-- ====== └ 清理（近期没再使用的模型；**先预览、后确认**）======
+         默认**收起**：它是动作区，不是"当前生效的配置"（规则①）。标题上的徽标会写
+         "N 项建议 · 可释放 X"，所以收着也知道有没有事。 -->
+    <div class="card collapsible" id="cleanupCard" data-collapse-id="model-cleanup"
+         data-collapse-default="closed">
+      <div class="card-title"><span class="set-arrow">▶</span><span class="ic">🧹</span>清理
+        <span class="badge idle" id="cleanupBadge">读取中…</span>
+        <span class="spacer"></span>
+        <span class="muted" style="font-size:12px">先预览，确认之后才删</span>
+      </div>
+      <div class="card-body">
+        <div id="cleanupBody" class="muted">读取中…</div>
+        <div class="settings-form" id="cleanupDaysHost"></div>
+      </div>
     </div>
   </section>
 
-  <!-- ============ 历史 ============ -->
+  <!-- ============ 历史（**这一轮只预留位置/空态**）============
+       用户："后面再续上指令和会议历史"。所以这里**只做占位与指路**，
+       不新写任何历史功能：指令历史用现成的那一份（一直就有），
+       会议历史这一轮只留一句说明 + 去「会议记录」页的入口。 -->
   <section id="view-history" class="view hidden">
     <div class="card">
-      <div class="card-title">命令历史
+      <div class="card-title">历史
+        <span class="spacer"></span>
+        <span class="muted" style="font-size:12px">指令历史 · 会议历史（会议历史这一轮只预留位置）</span>
+      </div>
+      <div class="sset-who">两个历史页签的落点：<b>指令历史</b>（下面这张卡，现成功能）与
+        <b>会议历史</b>（后续版本并入这里；现在看会议记录请去「会议记录」页）。</div>
+    </div>
+    <div class="card collapsible" data-collapse-id="hist-meetings" data-collapse-default="closed">
+      <div class="card-title"><span class="set-arrow">▶</span><span class="ic">🎙️</span>会议历史
+        <span class="sbadge">后续版本</span></div>
+      <div class="card-body">
+        <div class="muted" style="font-size:12px;line-height:1.6">
+          这一轮<b>只预留位置</b>：会议历史会把"每一场会议 + 它的转写与纪要"按时间排在这里。
+          现在请用「会议记录」页看全部录音与转写（同一批数据，只是还没并到这一页）。
+        </div>
+        <div class="sacts" style="padding-top:6px">
+          <button class="btn mini" data-goto="meetings">去「会议记录」›</button>
+        </div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-title">指令历史
         <span class="spacer"></span>
         <button class="btn danger" id="btnClearCmds">清空</button>
       </div>
@@ -352,10 +396,10 @@
     </div>
   </section>
 
-  <!-- ============ 会议 ============ -->
+  <!-- ============ 会议记录（原「会议」页）============ -->
   <section id="view-meetings" class="view hidden">
     <div class="card">
-      <div class="card-title">会议列表
+      <div class="card-title">会议记录
         <span class="spacer"></span>
         <button class="btn" id="btnCompressToggle"
                 title="把历史会议的音频无损压成 FLAC：省约一半磁盘，转写文本逐字不变">压缩音频</button>

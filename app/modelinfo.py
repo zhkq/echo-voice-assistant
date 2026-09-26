@@ -81,6 +81,27 @@ def _ms_dir(model_id):
     return os.path.join(MS_CACHE, model_id.replace("/", "--"))
 
 
+#: 权重文件的形状 —— 加载器真正要读的那一类文件名。**"目录存在"不等于"已下载"**：
+#: 下载中断/失败留下的空目录会让面板显示「已就绪」，而引擎一加载就炸
+#: （pyannote 那边早就踩过这个坑，那条注释写着"空目录不能代表模型已下载"）。
+#: `.pb` 是 SenseVoice 老权重的后缀（`stt._sensevoice_dir()` 认 model.pt / model.pb）。
+_WEIGHT_SUFFIXES = (".safetensors", ".bin", ".pt", ".pth", ".pb", ".onnx", ".npz", ".ckpt")
+
+
+def _has_weights(root, prefix="model."):
+    """`root` 下（含 `snapshots/<rev>/` 多层结构与 HF 缓存里的符号链接）有没有权重文件。
+
+    就绪判据的**唯一**形状：问"加载器要读的那个文件在不在"，而不是"这个目录在不在"。
+    """
+    if not root or not os.path.isdir(root):
+        return False
+    for _cur, _dirs, files in os.walk(root):
+        for name in files:
+            if name.startswith(prefix) and name.endswith(_WEIGHT_SUFFIXES):
+                return True
+    return False
+
+
 def _pkg_available(name):
     """仅探测包能否 import（find_spec 不真正加载，避免拖慢面板/占用显存）。"""
     try:
@@ -90,11 +111,17 @@ def _pkg_available(name):
 
 
 def _sensevoice_model_dir():
-    """本地 models/sensevoice（含多层 snapshots）或 ModelScope 缓存，返回落地目录或 None。"""
-    if _first_stem_dir_with_files(os.path.join(models_dir(), "sensevoice"), ["model."]):
-        return os.path.join(models_dir(), "sensevoice")
-    if os.path.isdir(_ms_dir("iic/SenseVoiceSmall")):
-        return _ms_dir("iic/SenseVoiceSmall")
+    """本地 models/sensevoice（含多层 snapshots）或 ModelScope 缓存，返回落地目录或 None。
+
+    **两处都要真有权重**：`models/sensevoice` 下光有目录不算（下载中断会留下空目录），
+    ModelScope 缓存同理 —— 判据必须与"加载器到时候会不会炸"一致（`_has_weights`）。
+    """
+    local = os.path.join(models_dir(), "sensevoice")
+    if _first_stem_dir_with_files(local, ["model."]):
+        return local
+    ms = _ms_dir("iic/SenseVoiceSmall")
+    if _has_weights(ms):
+        return ms
     return None
 
 
@@ -112,17 +139,32 @@ def _whisper_hub_dir(name):
     return os.path.join(models_dir(), "hub", f"models--Systran--faster-whisper-{name}")
 
 
+def _whisper_landings(name):
+    """whisper 每个档位**实际会落地**的三个位置（顺序 = 优先级）：
+
+      ① `models/faster-whisper/<档>/`      —— `stt._whisper_dir()` 认的本地目录（拷贝来的）；
+      ② `models/hub/models--Systran--faster-whisper-<档>/` —— HF 缓存（`HF_HOME` 指向 models）；
+      ③ `~/.cache/modelscope/models/Systran--faster-whisper-<档>/` —— **ModelScope 缓存**。
+
+    ③ 是漏掉的那一个（2026-09-26 抓到的 bug）：面板的下载按钮对 whisper 走
+    `_snapshot(ms_id=ms_ref, hf_id=ref)` —— **ModelScope 优先**，所以它下到的是 ③，
+    而就绪判据只查 ① ②。于是真下完了 72 MB，面板仍然写「未安装」。
+    这条判据必须跟着"下载真的下到哪"走，否则"就绪"这个词就是假的。
+    """
+    return [
+        os.path.join(models_dir(), "faster-whisper", name),
+        _whisper_hub_dir(name),
+        _ms_dir("Systran/faster-whisper-%s" % name),
+    ]
+
+
 def _ready_whisper(name):
-    """两种落地都算就绪：
-       ① stt._whisper_dir() 认的本地目录 models/faster-whisper/<档>/model.bin；
-       ② HF 缓存 models/hub/models--Systran--faster-whisper-<档>/snapshots/*/model.bin（面板下载的产物）。"""
-    if os.path.isfile(os.path.join(models_dir(), "faster-whisper", name, "model.bin")):
-        return True
-    hub = _whisper_hub_dir(name)
-    for _root, _dirs, files in os.walk(hub) if os.path.isdir(hub) else ():
-        if "model.bin" in files:
-            return True
-    return False
+    """三个落点里**任意一处真有权重**就算就绪（见 `_whisper_landings`）。
+
+    为什么必须是"真有权重"而不是"目录在"：`faster_whisper.WhisperModel` 拿到一个空目录
+    也是当场抛异常，与"没下载"在用户眼里没区别 —— 谎报就绪只会把人引到别处去找问题。
+    """
+    return any(_has_weights(p) for p in _whisper_landings(name))
 
 
 def _ready_sherpa():
@@ -171,7 +213,12 @@ def _pyannote_command():
 
 
 def _ready_qwen(model_id):
-    return os.path.isdir(_ms_dir(model_id))
+    """ModelScope 缓存里落地**并且真有权重**才算。
+
+    原来只看 `os.path.isdir` —— 一个建好了但没下完（或下砸了）的空目录会被报成
+    「已就绪」，而 funasr 一加载就炸。对齐器也走这条判据（`_PROBES["qwen3asr"]` 两个都问）。
+    """
+    return _has_weights(_ms_dir(model_id))
 
 
 def _cmd_chain(*parts):
@@ -291,21 +338,32 @@ def _target_path(entry):
     if i == "kws":
         return os.path.join(models_dir(), "wakeword", "kws-zh-en-3m")
     if i.startswith("whisper-"):
-        tier = i.split("-", 1)[1]
-        local = os.path.join(models_dir(), "faster-whisper", tier)
-        return local if os.path.isdir(local) else _whisper_hub_dir(tier)
+        # 三个落点里**第一个真实存在的**（顺序见 `_whisper_landings`）。不把三处相加：
+        # 同一档可能在 HF 与 ModelScope 缓存里各有一份，相加会把"本机占用"翻倍。
+        landings = _whisper_landings(i.split("-", 1)[1])
+        for p in landings:
+            if os.path.isdir(p):
+                return p
+        return landings[0]
     return ""
 
 
 def _measure_paths(entry):
     """本地占用的统计范围。pyannote 只统计真正要用的三个 -local 目录，
-    否则会把同目录下的 faster-whisper-* 冗余副本（5GB）也算进去。"""
+    否则会把同目录下的 faster-whisper-* 冗余副本（5GB）也算进去。
+
+    qwen3asr 这一档**由两个模型组成**（ASR + 强制对齐器），只量一个会把 3.6 GB 报成
+    1.8 GB —— 面板上就成了"下了一半"，而实际是齐的（2026-09-26 实测：强制对齐器
+    `Qwen--Qwen3-ForcedAligner-0.6B` 就在盘上，却一个字节都没被算进去）。
+    """
     i = entry["id"]
     if i == "pyannote":
         p = os.path.join(models_dir(), "pyannote")
         return [os.path.join(p, n) for n in ("pyannote-segmentation-3.0-local",
                                              "pyannote-wespeaker-local",
                                              "pyannote-plda-local")]
+    if i == "qwen3asr":
+        return [_ms_dir("Qwen/Qwen3-ASR-0.6B"), _ms_dir("Qwen/Qwen3-ForcedAligner-0.6B")]
     path = _target_path(entry)
     return [path] if path else []
 
@@ -429,12 +487,26 @@ def _next_step_fields(entry) -> dict:
 
 
 def inventory():
-    """返回清单 + 就绪状态 + 本地实际占用（MB）。任何异常都不抛，按未就绪处理。
+    """返回清单 + 就绪状态 + 本地实际占用（MB）+ **使用情况**（2026-09-26 加）。
 
     未就绪的条目额外带 ``dependencyReady`` / ``installCommand`` / ``nextStep`` /
     ``notReadyReason``：面板要能直接说出"下一步点什么"，而不是只显示一个红徽标
     （同事 2026-09-25：装完依赖后界面停在"模型文件还没下载"，看着像卡死）。
+
+    使用情况四个字段（`lastUsedAt` / `useCount` / `pinned` / `pinnedAt`）来自
+    `app/model_usage.py` 的账本；`inUse` / `inUseReasons` 是"现在谁在用"的判据 ——
+    面板的「本地能力」区据此决定**默认展开哪些**（配置为要用的默认展开，其余默认折叠），
+    「清理」卡据此保护不该删的项。**读账本失败一律当"没用过"**，不让附加信息拖垮清单。
     """
+    from app import model_usage
+    try:
+        usage = model_usage.usage_map()
+    except Exception:
+        usage = {}
+    try:
+        in_use = model_usage.in_use_ids()
+    except Exception:
+        in_use = {}
     items = []
     for e in CATALOG:
         probe = _probe_for(e)
@@ -443,7 +515,14 @@ def inventory():
         except Exception:
             ready = False
         local = sum(_dir_mb(p) for p in _measure_paths(e) if os.path.isdir(p))
-        row = dict(e, ready=ready, local_mb=local)
+        u = usage.get(e["id"]) or {}
+        reasons = list(in_use.get(e["id"]) or [])
+        row = dict(e, ready=ready, local_mb=local,
+                   lastUsedAt=str(u.get("lastUsedAt") or ""),
+                   useCount=int(u.get("useCount") or 0),
+                   pinned=bool(u.get("pinned")),
+                   pinnedAt=str(u.get("pinnedAt") or ""),
+                   inUse=bool(reasons), inUseReasons=reasons)
         if not ready:
             try:
                 row.update(_next_step_fields(e))
@@ -465,7 +544,13 @@ _JOB_LOCK = threading.Lock()
 
 
 def _watch_paths(mid):
-    """下载进度只统计这些目录的体积增长（不依赖库的进度回调）。"""
+    """这一档的下载**实际会落**的目录（进度按它们的体积增长算，不依赖库的进度回调）。
+
+    ⚠ 必须与"`_download_worker` 真的把它下到哪"一致。whisper 以前只盯着
+    `models/hub`，而它那条路走的是 `_snapshot(ms_id=ms_ref, …)` —— **ModelScope 优先**、
+    落 `~/.cache/modelscope/models`。于是真下了 72 MB，进度一路 0，完成时还报
+    `downloaded_mb: 0`（message 却是"下载完成"，自相矛盾，2026-09-26 实测）。
+    """
     if mid == "sensevoice":
         return [os.path.join(MS_CACHE, "iic--SenseVoiceSmall"),
                 os.path.join(MS_CACHE, "iic--speech_fsmn_vad_zh-cn-16k-common-pytorch")]
@@ -473,15 +558,66 @@ def _watch_paths(mid):
         return [os.path.join(MS_CACHE, "Qwen--Qwen3-ASR-0.6B"),
                 os.path.join(MS_CACHE, "Qwen--Qwen3-ForcedAligner-0.6B")]
     if mid.startswith("whisper-"):
-        tier = mid.split("-", 1)[1]
-        return [os.path.join(models_dir(), "hub", f"models--Systran--faster-whisper-{tier}")]
+        # 三个落点都要盯：ModelScope 缓存（面板下载的落点）与 HF 缓存都在其中。
+        return _whisper_landings(mid.split("-", 1)[1])
     if mid == "sherpa":
         return [os.path.join(models_dir(), "sherpa-onnx-streaming")]
+    if mid == "pyannote":
+        # 与面板的「本机占用」**同一个范围**（只算真正要用的三个 -local 目录）：
+        # 那一层目录里还躺着别的模型的冗余副本（本机实测旁边就有 189 MB 的 sherpa
+        # 副本），整个目录算进来会把 31 MB 的模型报成 221 MB —— 那同样是"回报不实"。
+        return _measure_paths(_by_id("pyannote"))
     return []
 
 
 def _downloaded_mb(mid):
-    return sum(_dir_mb(p) for p in _watch_paths(mid) if os.path.isdir(p))
+    """这一档**已经落到盘上**的 MB；**算不出来就返回 `None`（"未知"），不许拿 0 冒充**。
+
+    为什么要 `None`：`0` 是一个断言（"盘上就是 0 字节"），而"这个落点我压根没找到"
+    是完全另一回事。从前两者混在一起，于是"真下了 72 MB"与"一个字节都没下"在
+    `/api/models` 上是同一个数字 —— 面板据此画进度条，用户看到的是"卡在 0%"。
+
+    判据：**只要有一个落点目录存在**就算"能从盘上算出来"（哪怕此刻真是 0 字节，
+    那也是真数）；一个都不存在 = 落点还没有 → `None`。
+    """
+    paths = [p for p in _watch_paths(mid) if os.path.isdir(p)]
+    if not paths:
+        return None
+    return sum(_dir_mb(p) for p in paths)
+
+
+def model_paths(mid):
+    """这个模型**可能落地的全部目录**（下载落点 ∪ 占用统计口径 ∪ 就绪检测目录）。
+
+    公开函数：清理（`app/model_cleanup.py`）要用它拿到"这一项到底占了哪几个位置"——
+    `models\\` 与本机 ModelScope 缓存**两处都要覆盖**，只删一处会留下半份权重，
+    下次加载照样从残留里读、看起来"删了没效果"。
+
+    为什么是**并集**（2026-09-26 实测发现的两处漏网）：
+
+      * `_watch_paths()` 管的是"**下载**会下到哪"（whisper 三个落点、sensevoice 的两个
+        ModelScope 目录…），但它**没有** kws 这一档；
+      * `_measure_paths()` / `_target_path()` 管的是"**面板量占用**时看哪"（kws 的
+        `models/wakeword/kws-zh-en-3m`、以及拷进来的 `models/sensevoice`、`models/pyannote/*`），
+        但它对 whisper 只取**第一个存在**的落点。
+
+    任何一边单独用都会漏：漏了 kws 就是"面板说有 39 MB、清理说本机没有"。
+    所以并起来、去重、保持顺序（靠前的优先）—— 判据只有一个：**这一项真的占了哪些目录**。
+    """
+    entry = _by_id(mid)
+    paths = list(_watch_paths(mid))
+    if entry:
+        paths += list(_measure_paths(entry))
+    seen, out = set(), []
+    for p in paths:
+        if not p:
+            continue
+        key = os.path.normcase(os.path.abspath(p))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(p)
+    return out
 
 
 #: pyannote 三件套：HF 上**同名仓库是 gated 的**（要同意条款 + Token），而 ModelScope 上
@@ -574,7 +710,9 @@ def _download_worker(entry):
     def watch():
         while not stop.is_set():
             mb = _downloaded_mb(mid)
-            pct = min(99, int(mb * 100 / expected)) if expected else 0
+            # 算不出字节（落点还没出现）时百分比**也**是"未知"：拿 0 顶上等于说
+            # "下载进度是 0%"，而那时候我们其实什么都不知道。
+            pct = min(99, int(mb * 100 / expected)) if (expected and mb is not None) else None
             _JOBS[mid].update(downloaded_mb=mb, percent=pct)
             stop.wait(2)
 
@@ -614,12 +752,17 @@ def _download_worker(entry):
                                     allow=entry.get("allow") or None)
         elif mid == "pyannote":
             source_used = download_pyannote()
+        # 完成时**再量一次真实字节**（不是拿 watch 线程最后一拍）：watch 每 2 秒一拍，
+        # 最后那点尾巴可能落在两次采样之间。量不出来就报 None（"大小未知"）。
+        final_mb = _downloaded_mb(mid)
         _JOBS[mid].update(status="done", percent=100,
                           message=("下载完成（来自 %s）" % source_used) if source_used else "下载完成",
                           source=source_used,
                           done_at=time.strftime("%H:%M:%S"),
-                          downloaded_mb=_downloaded_mb(mid))
-        print(f"[modelinfo] {mid} 下载完成，{_downloaded_mb(mid)} MB（源：{source_used or '本地脚本'}）")
+                          downloaded_mb=final_mb)
+        print(f"[modelinfo] {mid} 下载完成，"
+              f"{'大小未知（落点目录没找到）' if final_mb is None else '%d MB' % final_mb}"
+              f"（源：{source_used or '本地脚本'}）")
     except Exception as e:
         msg = f"{type(e).__name__}: {e}"
         hint = _failure_hint(mid, msg)
@@ -627,8 +770,11 @@ def _download_worker(entry):
             # 只报两句英文异常，用户不知道下一步干什么（A4）—— 缺依赖时把"装什么 + 装完
             # 再点一次下载"直接附在后面（同事 2026-09-25 实测那条路）。
             msg = "%s\n怎么办：%s" % (msg, hint)
+        # 失败也要如实报**已经落了多少**：`0` 会让人以为一个字节都没下来（其实可能
+        # 下了 700 MB 才断），而 None 才是"不知道"。
         _JOBS[mid].update(status="failed", message=msg,
-                          done_at=time.strftime("%H:%M:%S"))
+                          done_at=time.strftime("%H:%M:%S"),
+                          downloaded_mb=_downloaded_mb(mid))
         print(f"[modelinfo] {mid} 下载失败: {msg}")
     finally:
         stop.set()
@@ -688,7 +834,9 @@ def start_download(mid, force=False):
         if _ACTIVE["id"]:
             return False, f"已有下载在进行：{_ACTIVE['id']}"
         _ACTIVE["id"] = mid
-        _JOBS[mid] = {"id": mid, "status": "running", "percent": 0, "downloaded_mb": 0,
+        # `downloaded_mb` 起手是 **None（"未知"）而不是 0**：这一刻我们还没量过盘，
+        # 0 是一个"盘上就是 0 字节"的断言（第一拍量的结果可能是 72 MB）。
+        _JOBS[mid] = {"id": mid, "status": "running", "percent": None, "downloaded_mb": None,
                       "message": "下载中…", "started_at": time.strftime("%H:%M:%S"), "done_at": ""}
     threading.Thread(target=_download_worker, args=(entry,), daemon=True).start()
     return True, f"已开始下载 {entry['name']}"

@@ -342,9 +342,21 @@ DEFAULTS = {
                             description="auto=cuda 优先，失败回退 CPU",
                             value_type="str", options=["auto", "cpu", "cuda"]),
     "sttModel":        dict(value="sensevoice", grp="model", label="命令转写引擎",
-                            description="sensevoice 最快（中文短命令），qwen3asr 更准（需下载模型），sherpa 流式，whisper 模型按名",
+                            description="语音指令用哪个引擎。sherpa = 兜底（安装器保证它在，"
+                                        "流式、最快，中英都认）；sensevoice = 质量更好（中文短命令推荐，"
+                                        "需 funasr）；qwen3asr = 最准但吃显存（需 GPU）。"
+                                        "**whisper 各档已不再提供**（权重已从本机删除）——"
+                                        "老库里选过 whisper 的会按兜底 sherpa 读（改了不会有惊喜）",
                             value_type="str",
-                            options=["sensevoice", "qwen3asr", "sherpa", "tiny", "base", "small", "medium", "large"]),
+                            options=["sherpa", "sensevoice", "qwen3asr"]),
+    # 「清理」的阈值（2026-09-26）：只影响**建议**，不影响任何加载路径。
+    # 为什么把它做成设置而不是写死 90：用户说"近期没再使用的模型就清掉吧"，
+    # 但"近期"是他的判断（三个月 vs 半年取决于磁盘有多紧），所以给一个能改的数。
+    "modelCleanupDays": dict(value=90, grp="model", label="清理阈值（天）",
+                             description="「能力与智能体 → 清理」把**超过这么多天没用过**的本地模型"
+                                         "列为建议删除（0 = 不按时间过滤）。只是建议：删要你点头，"
+                                         "正在用的、当前配置选中的、打了「保留」钉子的一律不动。",
+                             value_type="int"),
     # ---------- 语音命令 → 录音与转写（二级子分组）----------
     "sttLanguage":     dict(value="zh", grp="voice", sub="record", label="转写语言",
                             description="命令与会议共用的转写语言：zh/en/ja/ko/yue，或 auto 自动识别。"
@@ -505,13 +517,23 @@ DEFAULTS = {
     "wakeSilenceFloor": dict(value=60, grp="wake", label="静音门控",
                              description="低于此音量不送入唤醒模型（省电防误触发）", value_type="int"),
     # ---------- 会议 ----------
-    "meetingSttModel":  dict(value="sensevoice", grp="model", label="会议转写引擎",
-                             description="sensevoice 最快（中文会议推荐）；small/medium/large 是 whisper；"
-                                         "qwen3asr 最准但慢约 20 倍（GPU rtf≈0.45）；"
-                                         "sherpa 是流式引擎（只装它也能用，但它不给句级时间戳 → "
-                                         "时间轴按字数估算，详情页会标「估算」）",
+    # 2026-09-26（新分工）：会议转写默认 qwen3asr —— 它给**原生句级时间轴**（档位 exact），
+    # 而 SenseVoice/sherpa 都得借时间骨架或按字数摊。whisper 档已退役（权重删除）。
+    "meetingSttModel":  dict(value="qwen3asr", grp="model", label="会议转写引擎",
+                             description="**本机**跑会议转写时用哪个引擎（「会议转写走哪条路」"
+                                         "选 ECHO 后端时这一项不生效，由后端决定）。"
+                                         "qwen3asr = 推荐：原生句级时间戳（精确），"
+                                         "分块 60 s + 批 4 的喂法下实测 rtf≈0.07（13~16 倍实时，"
+                                         "10 分钟音频约 30~47 秒）；"
+                                         "sensevoice = 更快，但它**不给句级时间戳**，"
+                                         "原本靠 whisper 骨架对齐，而 whisper 权重已删 → "
+                                         "时间轴退化为按字数估算（详情页标「估算」）；"
+                                         "sherpa = 流式、只给整段文本 → 同样按字数估算。"
+                                         "**时间戳来自哪条路**：后端 qwen3asr / 本机 qwen3asr = 精确；"
+                                         "本机 sensevoice / sherpa = 估算。"
+                                         "whisper 各档已不再提供（老库里的值按 qwen3asr 读）",
                              value_type="str",
-                             options=["sensevoice", "qwen3asr", "sherpa", "small", "medium", "large"]),
+                             options=["sherpa", "sensevoice", "qwen3asr"]),
     "meetingSegmentMinutes": dict(value=10, grp="meeting", label="分段分钟",
                                   description="录音每 N 分钟存一个文件", value_type="int"),
     "meetingAutoSummarize": dict(value=True, grp="meeting", label="自动生成纪要",
@@ -525,22 +547,42 @@ DEFAULTS = {
                                      description="默认关闭。开启后每场会议**转写完成**时自动把音频段"
                                                  "无损压成 FLAC（省约一半磁盘、转写文本逐字不变）。"
                                                  "手动入口在「会议」页", value_type="bool"),
+    # 2026-09-26（概念纠正）：会议转写 = 转写 + 说话人分离 + 声纹识别，**三件都是标配**
+    # （本地跑或走 ECHO 后端一样）。"分成两次调用"只是现有模型能力不足的实现细节，
+    # **不是**用户要理解的开关 —— 所以 meetingDiarize 这个"要不要分离"的二选一被废弃。
+    # 谁来做分离/声纹改由「模型路由 → 会议能力通道」按槽决定（capabilityDiarizeBackend /
+    # capabilityEmbedBackend），见 docs/3.0-设计总览与组件关系.md §6.5。
+    # 值留在库里（兼容读取），但**任何接口都不再下发**，读的地方也一律忽略。
     "meetingDiarize":   dict(value=False, grp="model", label="区分说话人",
-                             description="本地 pyannote 分离（CPU 下较慢）", value_type="bool"),
+                             description="已弃用：会议转写一律包含说话人分离（本地或后端都会请求 "
+                                         "`diarize.turns`），「要不要分离」不再是用户设置 —— "
+                                         "分离由谁做见「模型路由 → 会议能力通道」。"
+                                         "这一项只是老配置的兼容读取，改了不会有任何效果",
+                             value_type="bool", deprecated=True),
     # ---------- 常用联系人声纹（issue #6）：改名入库 → 新会议自动认人 ----------
     # 样本是说话人嵌入（256 维），只存本机 data/echo.db；不做云端、不出网。
-    # 【默认关闭】声纹属于生物特征数据：收集与自动认人都必须由用户显式开启（opt-in）。
-    # 注意：不要用 DEFAULT_MIGRATIONS 做 True→False 的翻转 —— 那套机制每次启动都会比对
-    # 「旧默认值」，用户一旦主动开启就会被下一次启动翻回去；改默认值 + 让用户自己开即可。
+    # 【2026-09-26 概念纠正】隐私敏感的落点是**入库**（把生物特征模板写进本地库），
+    # **不是识别**：识别是标配（库为空时静默无结果，零副作用），与"要不要入库"无关。
+    # 所以：
+    #   * 识别没有开关（本键已废弃）；
+    #   * 入库有两条**都由用户主动**的路：①「改名即入库」开关（默认关，见下）；
+    #     ② 会议详情 →「说话人管理」里逐个说话人的「声纹入库」按钮（显式，与开关无关）。
+    # 注意：不要用 DEFAULT_MIGRATIONS 做布尔翻转 —— 那套机制每次启动都会比对「旧默认值」，
+    # 用户主动开启的状态会被下一次启动翻回去。
     "voiceprintEnabled": dict(value=False, grp="model", label="声纹识别常用联系人",
-                              description="默认关闭。开启后会议转写会用声纹库自动识别已入库的联系人，"
-                                          "把「说话人N」直接标成联系人名（需先开启「区分说话人」，"
-                                          "且联系人有已入库的声纹样本）；关闭时不留存任何声纹样本",
-                              value_type="bool"),
-    "voiceprintAutoEnroll": dict(value=False, grp="model", label="改名时自动入库声纹",
-                                 description="默认关闭。开启后在会议里把说话人改名为联系人时，"
-                                             "自动把该说话人本场的声音存成声纹样本（声纹库属生物特征数据，"
-                                             "样本可在会议页「说话人管理」里查看/删除）",
+                              description="已弃用：声纹识别是会议转写的标配 —— 只要声纹库里已经有"
+                                          "这个人，会议就会认出他并显示姓名，不再需要开关"
+                                          "（库为空时不会认任何人）。"
+                                          "「要不要把声音存进库」仍由你决定，见「改名即入库」"
+                                          "与会议详情里的「声纹入库」按钮",
+                              value_type="bool", deprecated=True),
+    "voiceprintAutoEnroll": dict(value=False, grp="model", label="改名即入库",
+                                 description="默认关闭。开启后在会议里把说话人**改名**成联系人时，"
+                                             "自动把这个声音存成声纹样本（模板只存本机 data/echo.db，"
+                                             "不出网）。关着时**绝不**自动入库；想入库就在会议详情的"
+                                             "「说话人管理」里点那个说话人的「声纹入库」——"
+                                             "入库的选择权始终在你手里。"
+                                             "样本可在「说话人管理」里逐条查看/删除",
                                  value_type="bool"),
     "voiceprintThreshold": dict(value=0.65, grp="model", label="声纹匹配阈值",
                                 description="余弦相似度下限（0~1）：越高越不容易认错人、也越容易漏认。"
@@ -737,19 +779,22 @@ DEFAULTS = {
         value_type="str"),
     "capabilityDiarizeBackend": dict(
         value="auto", grp="capability", label="说话人分离用哪个后端", hidden=True,
-        options=["auto", "echo-server", "local", "off"],
-        description="说话人时间轴与逐说话人嵌入。off = 不要说话人（会议照常出无说话人的转写）。"
-                    "**会议链路的默认链上没有本机**（不做兜底）：ECHO 后端不可用时这场会议就是"
-                    "没有说话人，而不是**自动**降级到本机 —— 本机与后端是两个向量空间，"
-                    "混用会认错人。想全本地跑，把这里**显式**选成「只用本机」。"
+        options=["auto", "echo-server", "local"],
+        description="会议转写**一定有**说话人分离（它是会议的必备环节，不是开关）——"
+                    "这一项决定**由谁做**：auto = 按默认链挑（ECHO 后端优先）；"
+                    "echo-server = 只用配对好的 GPU 后端；local = 只用本机的 pyannote。"
+                    "**会议链路的默认链上没有本机**（不做兜底）：ECHO 后端不可用时这场会议"
+                    "就是没有说话人（并如实告诉用户为什么），而不是**自动**降级到本机 —— "
+                    "本机与后端是两个向量空间，混用会认错人。想全本地跑就**显式**选「本机」。"
                     "**产出向量的能力只能落在能声明向量空间的后端上**（网络服务商不行）",
         value_type="str"),
     "capabilityEmbedBackend": dict(
-        value="auto", grp="capability", label="声纹提取用哪个后端", hidden=True,
-        options=["auto", "echo-server", "local", "off"],
-        description="现场注册联系人时的单条嵌入。**必须与会议里认出的说话人同源**"
+        value="auto", grp="capability", label="声纹嵌入用哪个后端", hidden=True,
+        options=["auto", "echo-server", "local"],
+        description="说话人嵌入（认人用）。**必须与会议里认出的说话人同源**"
                     "（同一个向量空间），否则余弦相似度没有意义 —— 而比错的表现是"
-                    "**认错人且不报错**，所以这条由路由强制，不靠自觉",
+                    "**认错人且不报错**，所以这条由路由强制，不靠自觉。"
+                    "auto = 按默认链挑；也可显式指定 ECHO 后端或本机",
         value_type="str"),
     # ---------- 面板 / 服务 ----------
     "panelAutoRefresh": dict(value=3, grp="panel", label="面板自动刷新秒",
@@ -848,6 +893,59 @@ DEPRECATION_MIGRATIONS = {
 }
 
 
+#: 读时归一：老库里某些键的**遗留取值**在新语义下已经没有对应意义，但既不能报错、
+#: 也不能逼用户重新做一次决定。在这里（唯一的取值出口）折成新值，`get()` 与 `all()`
+#: 走同一份 —— 面板看到什么，路由就按什么走（两处各折一次必然漂移）。
+#:
+#: 为什么不用 DEFAULT_MIGRATIONS：那套机制按"旧默认值"比对，只在值等于旧默认时改写；
+#: 而这里要处理的是**用户自己选过**的值（老面板那句「只要文字」先把它写成 "off"），
+#: 按旧默认比对根本命中不了。改库更不行 —— 用户没动手，我们不该动他的库。
+VALUE_ALIASES = {
+    # 2026-09-26：说话人分离 / 声纹嵌入从"要不要"变成"由谁做"（「会议产出」三选一已撤掉）。
+    # 老库存着的 "off"（原来等于"这场不要说话人"）不再表示"不要" —— 会议一定要分离，
+    # 所以按"没点名"处理（auto → 走默认链），而不是当成"谁都不许做"。
+    # 库里的原值一个字都不动：面板一保存就会写成 auto，用户也可以随时改回来。
+    "capabilityDiarizeBackend": {"off": "auto"},
+    "capabilityEmbedBackend": {"off": "auto"},
+}
+
+#: **已退役的可选值**：本平台已经不再提供这些取值（权重/依赖没了），但老库里可能还存着。
+#: 读时折成同功能、且**本平台保证可用**的那个取值 —— 老装机不会卡在一个跑不起来的引擎上，
+#: 面板也不会因为"下拉里没有这个值"而把它悄悄换成第一个候选项（那更糟：用户没动手，行为却变了）。
+#:
+#: 判据是"它还在本平台的候选项里吗"：还在（例如 macOS 的 whisper 档）就一个字都不折。
+RETIRED_VALUE_FALLBACKS = {
+    # 2026-09-26：whisper 权重已从本机删除（5086.5 MB），新分工是
+    # 「指令兜底 = sherpa / 指令进阶 = SenseVoice / 会议转写 = qwen3asr」。
+    #   指令：折成 sherpa（安装器保证它在，永远不会因为缺权重而转不了）；
+    #   会议：折成 qwen3asr（新默认；原生句级时间戳 exact，不再需要借 whisper 骨架）。
+    "sttModel": {"tiny": "sherpa", "base": "sherpa", "small": "sherpa",
+                 "medium": "sherpa", "large": "sherpa", "large-v3": "sherpa"},
+    "meetingSttModel": {"tiny": "qwen3asr", "base": "qwen3asr", "small": "qwen3asr",
+                        "medium": "qwen3asr", "large": "qwen3asr", "large-v3": "qwen3asr"},
+}
+
+
+def _aliased(key, value):
+    """按 `VALUE_ALIASES` / `RETIRED_VALUE_FALLBACKS` 折算一个读出来的值（没规则就原样返回）。"""
+    if not isinstance(value, str):
+        return value
+    rules = VALUE_ALIASES.get(key)
+    if rules:
+        mapped = rules.get(value.strip())
+        if mapped is not None:
+            return mapped
+    retired = RETIRED_VALUE_FALLBACKS.get(key)
+    if retired:
+        mapped = retired.get(value.strip())
+        # **只在本平台不再提供它时**才折算：候选项里还有（例如 macOS 仍提供 whisper 档）
+        # 就一个字都不动 —— 那是那台机器上真正能用的引擎。
+        if mapped is not None and value.strip() not in _effective_options(
+                key, DEFAULTS.get(key) or {}):
+            return mapped
+    return value
+
+
 def _offline_tts_engine():
     """本平台 ttsEngine 候选项里的"离线引擎"取值（win=sapi / mac=say / linux=espeak）。"""
     opts = [str(o) for o in _effective_options("ttsEngine", DEFAULTS["ttsEngine"])]
@@ -868,7 +966,9 @@ class Settings:
             self._cache = {}
             for k, meta in DEFAULTS.items():
                 # 库里没有该键时，回落值是**本平台**的默认值（D11）
-                self._cache[k] = expand_path(db.get_setting(k, _effective_default(k, meta)))
+                # 读出来再按 VALUE_ALIASES 折算（老库的遗留取值，见那边的说明）
+                self._cache[k] = _aliased(
+                    k, expand_path(db.get_setting(k, _effective_default(k, meta))))
         return self._cache
 
     def seed_defaults(self):
@@ -961,6 +1061,10 @@ class Settings:
                 continue
             r = dict(r)
             r["order"] = SETTING_ORDER.get(r["key"], len(DEFAULTS))
+            # 老库的遗留取值在这里也折算一次：`all()` 是**面板与 /api/settings 的出口**，
+            # 走的是库行而不是 `_load()` 的缓存 —— 两处不一致会造出"面板显示 off、
+            # 路由按 auto 走"这种对不上的现象。
+            r["value"] = _aliased(r["key"], r.get("value"))
             # 二级子分组（可选）：同一个 grp 内的再分节，面板渲染成可折叠的小节
             r["sub"] = meta.get("sub", "")
             if meta.get("options_from") == "audio_inputs":

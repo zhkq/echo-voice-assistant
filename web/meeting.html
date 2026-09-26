@@ -51,6 +51,11 @@ header .btns { margin-left:auto; display:flex; gap:8px; flex-wrap:wrap; }
 .cap-box .cap-slot, .cap-box .cap-be { flex:0 1 auto; min-width:0; }
 .cap-box .cap-be { color:var(--text); }
 .cap-box .cap-why, .cap-box .cap-d { min-width:0; overflow-wrap:anywhere; opacity:.85; }
+/* 「说话人分离做了没有」：**这一场有没有说话人**的答案，所以给它一整行、并着色 ——
+   没做成是警示（红），做成了是普通状态（绿点）。窄边条里同样要能收缩。 */
+.cap-box .cap-dia { margin-top:4px; min-width:0; overflow-wrap:anywhere; }
+.cap-box .cap-dia.ok { color:var(--muted); }
+.cap-box .cap-dia.bad { color:var(--err, #e5484d); }
 /* ---------- 纪要编辑 ---------- */
 #summaryBox .sm-bar { display:flex; align-items:center; gap:8px; margin:0 0 10px; padding-bottom:8px;
   border-bottom:1px solid var(--border); }
@@ -261,10 +266,12 @@ input[type=range].seek::-webkit-slider-thumb { -webkit-appearance:none; width:15
       <div class="vp-head"><b>常用联系人声纹库</b><span class="vp-meta" id="vpMeta"></span>
         <button class="btn sm" id="vpRecognize" title="用声纹库识别本场说话人（直接用转写时留存的样本，不重新转写）">🎙 识别本场</button>
       </div>
-      <div class="vp-tip">把说话人<b>改名成联系人</b>即自动入库（需开启「区分说话人」与自动入库）；
-        下次会议听到同一个人的声音，会自动把 TA 标成联系人名。样本只存本机数据库，可在这里删除。<br>
-        点「声纹入库」用的是<b>本场转写时留存</b>的样本：该场转写前没开「区分说话人」或
-        「声纹识别常用联系人」时，本场没有样本可用 —— 回列表点「重新转写」即可补齐。</div>
+      <div class="vp-tip"><b>识别是标配</b>：只要声纹库里已经有这个人，这场会议就会显示他的姓名
+        （没有开关；库里没人时安静地什么都不做）。<b>要不要入库由你决定</b> ——
+        设置里开着「改名即入库」时，改名成联系人会顺手存一份；关着时一个字都不写，
+        就点下面每个说话人右边的「声纹入库」。样本只存本机数据库、不出网，可在这里逐条删除。<br>
+        点「声纹入库」用的是<b>本场转写时留存</b>的样本：这场要是没执行说话人分离
+        （详情顶部会写明原因），本场就没有样本可用 —— 回列表点「重新转写」即可补齐。</div>
       <div id="vpList"></div>
     </div>
     <div style="display:flex; gap:8px; margin-top:12px; justify-content:flex-end">
@@ -386,12 +393,17 @@ window.addEventListener("DOMContentLoaded", () => { bindSummaryEdit(); load(); }
    **前端不重算、也不自己维护原因词汇表** —— 那样迟早和服务端说的不一样，
    而"页签说会走 GPU、实际走了本机"这种对不上，比不显示更糟。
 
+   2026-09-26：会议 = 转写 + 说话人分离 + 声纹识别（三件标配）。所以除了"用了谁"，
+   这里还必须说清**分离到底做了没有** —— 没做就红字写明 `说话人分离未执行：<原因>`，
+   绝不允许安静地产出一场"没有说话人却像正常一样"的会议（文案由服务端给）。
+
    默认只显示一行"用了谁"；降级原因折在 <details> 里，排障时才展开。 */
 function renderCapability() {
   const box = $("#capBox");
   if (!box) return;
   const cap = M && M.capability;
-  if (!cap || (!cap.picks.length && !cap.skipped.length && !cap.timestampsLabel)) {
+  const dia = cap && cap.diarize;
+  if (!cap || (!cap.picks.length && !cap.skipped.length && !cap.timestampsLabel && !dia)) {
     box.className = "hidden";
     box.innerHTML = "";
     return;
@@ -400,6 +412,19 @@ function renderCapability() {
     ? cap.picks.map((p) => `${esc(p.slotLabel)} → <b>${esc(p.backendLabel)}</b>`).join("，")
     : "（没记到实际用了谁）";
   const ts = cap.timestampsLabel ? ` · 时间轴：${esc(cap.timestampsLabel)}` : "";
+  // **分离这一条单独、显眼**：它是"这场会有没有说话人"的唯一答案。
+  let diaLine = "";
+  if (dia) {
+    if (dia.executed) {
+      diaLine = `<div class="cap-line cap-dia ok">👥 ${esc(dia.headline || "说话人分离已执行")}</div>`;
+    } else {
+      const code = dia.code ? ` · code=${esc(dia.code)}` : "";
+      const again = dia.retryable ? " · 可以重试" : "";
+      diaLine = `<div class="cap-line cap-dia bad" data-testid="diarize-missing">`
+        + `⚠ <b>${esc(dia.headline || "说话人分离未执行")}</b>${code}${again}`
+        + `${dia.detail ? `<div class="cap-d">${esc(dia.detail)}</div>` : ""}</div>`;
+    }
+  }
   const nSkip = cap.skipped.length;
   // 一行摘要 + 可展开的细节。没有跳过项时不显示那个"为什么"的入口（免得点开是空的）。
   const detail = [];
@@ -421,7 +446,7 @@ function renderCapability() {
   const body = detail.length
     ? `<details class="cap-more"><summary>细节</summary>${detail.join("")}</details>` : "";
   box.className = "cap-box";
-  box.innerHTML = `<div class="cap-line">🖥 ${used}${ts}</div>${body}`;
+  box.innerHTML = `<div class="cap-line">🖥 ${used}${ts}</div>${diaLine}${body}`;
 }
 
 /* ---------- 纪要页签 ---------- */
@@ -1117,13 +1142,13 @@ function renderVp() {
   const box = $("#vpList");
   if (!box) return;
   const v = _vp || { items: [], contacts: 0, total: 0, threshold: 0 };
-  // 「声纹入库」能不能点成功，取决于本场转写时有没有留存样本：那必须同时开启
-  // 「区分说话人」和「声纹识别常用联系人」（默认关闭）。这里把状态摆在明面上，
-  // 免得用户点了按钮只看到一句失败提示、不知道该去哪儿开。
+  // 2026-09-26：识别是标配，所以这里不再有"声纹识别已关闭"这一档；剩下要说的是
+  // （① 库里有没有样本 ② 「声纹入库」能不能点成功 —— 后者取决于本场有没有留存样本，
+  //  而那取决于这场有没有真的执行说话人分离）。
   let meta = `${v.contacts || 0} 人 · ${v.total || 0} 条样本`;
-  if (v.enabled === false) meta += " · 声纹识别已关闭（设置 → 会议 → 声纹识别常用联系人）";
-  else if (!v.total) meta += " · 尚无样本：本场需在转写前开启「区分说话人」+「声纹识别常用联系人」";
+  if (!v.total) meta += " · 尚无样本：把说话人改名成联系人（或点「声纹入库」）即可建立声纹库";
   else meta += ` · 阈值 ${v.threshold}`;
+  if (v.autoEnroll === false) meta += " · 改名即入库：关（入库请点每个说话人右边的按钮）";
   $("#vpMeta").textContent = meta;
   const rows = [];
   (v.items || []).forEach(it => (it.samples || []).forEach(sm => rows.push(`

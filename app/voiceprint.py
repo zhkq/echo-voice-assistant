@@ -12,7 +12,21 @@
   * 识别：转写每段（默认 10 分钟）时，把本段每个说话人的嵌入与样本逐条算余弦，
     每个联系人取最好成绩、全场最高者为候选；通过「阈值 + 与次优的间隔」两道门
     才自动命名（宁可不认，也别认错）。
-  * 管理：列表/删除（面板「说话人管理」+ REST API），开关与阈值在 设置 → 会议。
+  * 管理：列表/删除（面板「说话人管理」+ REST API）；阈值与间隔在设置里（高级）。
+
+## 2026-09-26 概念纠正：**识别是标配，入库才是用户的选择**
+
+原先整块功能由 `voiceprintEnabled` 一个开关管（默认关）。现在的划分是：
+
+  * **识别（认人）没有开关** —— 会议转写 = 转写 + 说话人分离 + 声纹识别，三件标配
+    （本地跑或走 ECHO 后端一样）。库里**已经有**这个人，会议就会显示他的姓名；
+    库空时 `load_matcher()` 返回 None，**静默无结果、零副作用**（一个新用户什么都不用做）。
+  * **入库由用户决定**，两条路都是显式动作：
+      ① 「改名即入库」（`voiceprintAutoEnroll`，**默认关**）：在会议里给说话人改名时
+         顺手把这个声音存进库；
+      ② 会议详情 →「说话人管理」里逐个说话人的「声纹入库」按钮（`enroll_from_meeting`），
+         **与那个开关无关** —— 关着也能入库，选择权始终在用户手里。
+  * `voiceprintEnabled` 已废弃（兼容读取、不再下发）；见 `app/config.py` 里的注释。
 
 匹配参数（默认值偏保守，可在设置里调）：
   voiceprintThreshold 默认 0.65 —— 余弦相似度下限；
@@ -20,10 +34,12 @@
 每次判定（含未通过的原因）都写日志（source=voiceprint），可用自己的真实录音校准：
 相似度普遍偏低就把阈值调低一档，出现认错人就把阈值/间隔调高。
 
-边界：
-  * 声纹样本来自 pyannote 说话人分离，只在开启「区分说话人」的会议里才有；
-    旧版本转写的会议没有样本，「识别本场」会提示重新转写。
-  * 样本只存本机 data/echo.db，不出网；删除样本不影响会议转写内容本身。
+边界（**隐私**）：
+  * 声纹模板**只存本机 `data/echo.db`，不出网**：`speaker_embeddings`（每场会议各说话人
+    的平均嵌入，跟着会议一起删）与 `voiceprints`（用户主动入库的联系人样本）。
+    这两张表都在客户端库里，服务端（ECHO 后端）不存任何内容。
+  * 会议里的样本来自说话人分离；旧版本转写的会议没有样本，「识别本场」会提示重新转写。
+  * 删除样本不影响会议转写内容本身。
 """
 import re
 
@@ -39,14 +55,19 @@ DEFAULT_MARGIN = 0.05
 
 # ---------------------------------------------------------------- 配置
 
-def enabled():
-    """声纹识别总开关（设置 → 会议）。"""
-    return bool(settings.get("voiceprintEnabled", True))
+def recognition_available():
+    """识别（认人）是**标配**，没有开关 —— 恒为真。
+
+    留着这个函数而不是把调用点删干净：面板与接口还在问"识别能不能用"，
+    而这个答案现在是常量。**不要再把它接回某个设置项** —— 那正是 2026-09-26
+    拆掉的那个"要做没有信息量的决定"（见模块 docstring）。
+    """
+    return True
 
 
 def auto_enroll():
-    """改名为联系人时是否自动入库。"""
-    return bool(settings.get("voiceprintAutoEnroll", True))
+    """改名即入库（`voiceprintAutoEnroll`，**默认关**）—— 唯一的入库开关。"""
+    return bool(settings.get("voiceprintAutoEnroll", False))
 
 
 def thresholds():
@@ -252,7 +273,7 @@ def enroll_from_meeting(meeting_id, label, name):
         return False, "会议不存在"
     vec = _as_vec(db.get_speaker_embedding(meeting_id, label))
     if vec is None:
-        return False, ("本场没有该说话人的声纹样本（转写时需开启「区分说话人」，"
+        return False, ("本场没有该说话人的声纹样本（这场的分离没有执行，"
                        "旧版本数据重新转写后再试）")
     blob, dim = pack(vec)
     db.replace_voiceprint_sample(name, blob, dim=dim,
@@ -273,15 +294,13 @@ def recognize_meeting(meeting_id):
       * 返回 {ok, message, results[], renamed, merged[]}。
     """
     empty = {"results": [], "renamed": 0, "merged": []}
-    if not enabled():
-        return {"ok": False, "message": "声纹识别已在设置里关闭（设置 → 会议）", **empty}
     meeting = db.get_meeting(meeting_id)
     if not meeting:
         return {"ok": False, "message": "会议不存在", **empty}
     emb_rows = db.get_speaker_embeddings(meeting_id)
     if not emb_rows:
         return {"ok": False,
-                "message": "本场没有留存的声纹样本（转写时未开启「区分说话人」或为旧版本数据，"
+                "message": "本场没有留存的声纹样本（这场的分离没有执行，或为旧版本数据，"
                            "重新转写后再试）", **empty}
     matcher = load_matcher()
     if matcher is None:

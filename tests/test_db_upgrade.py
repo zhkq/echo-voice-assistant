@@ -62,11 +62,20 @@ POST_1X_COLUMNS = {
     ("meetings", "error"),
 }
 
+#: 1.x **之后有意新增的表**（每加一张都在这里登记：哪张表 + 为什么）。
+#: 结构快照测试的用意是"抓到改旧表"，不是"永远不许加表" —— 但新表必须是有意的：
+#:   * model_usage（v7，2026-09-26）：本地模型的"用没用过"账本（上次使用 / 次数 /
+#:     「保留」钉子）—— 清理"近期没再使用的模型"的**唯一判据**；在那之前只能看文件
+#:     修改时间，那等于瞎删。见 app/model_usage.py 与 app/model_cleanup.py。
+POST_1X_TABLES = {"model_usage"}
+
 
 def _without_post_1x_columns(tables):
-    """把"1.x 之后有意新增的列"从结构里摘掉，剩下的应当与 1.x 真库逐列相同。"""
+    """把"1.x 之后有意新增的表与列"从结构里摘掉，剩下的应当与 1.x 真库逐列相同。"""
     out = {}
     for table, cols in tables.items():
+        if table in POST_1X_TABLES:
+            continue
         drop = {col for (t, col) in POST_1X_COLUMNS if t == table}
         out[table] = [c for c in cols if c[0] not in drop]
     return out
@@ -152,9 +161,12 @@ class SchemaSnapshotTests(_TempDbTestCase):
         for table, col in sorted(POST_1X_COLUMNS):
             self.assertIn(col, [c[0] for c in actual["tables"].get(table, [])],
                           "登记了 %s.%s 是 1.x 之后新增的列，但代码里没有它" % (table, col))
+        for table in sorted(POST_1X_TABLES):
+            self.assertIn(table, actual["tables"],
+                          "登记了 %s 是 1.x 之后新增的表，但代码里没有它" % table)
         self.assertEqual(_without_post_1x_columns(actual["tables"]), self.expected["tables"],
                          "表/列定义与真实 1.x 库分叉了（要 append 迁移，别改旧表；"
-                         "确实是有意新增的列就登记到 POST_1X_COLUMNS）")
+                         "确实是有意新增的列/表就登记到 POST_1X_COLUMNS / POST_1X_TABLES）")
         self.assertEqual(actual["indexes"], self.expected["indexes"])
 
     def test_schema_version_matches(self):
@@ -271,7 +283,8 @@ class V1UpgradeTests(_TempDbTestCase):
             names = set(_table_names(conn))
         finally:
             conn.close()
-        for table in ("meeting_sessions", "voiceprints", "speaker_embeddings"):
+        for table in ("meeting_sessions", "voiceprints", "speaker_embeddings",
+                      "model_usage"):
             with self.subTest(table=table):
                 self.assertIn(table, names)
 

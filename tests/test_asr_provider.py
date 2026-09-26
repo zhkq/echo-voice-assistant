@@ -157,6 +157,11 @@ class TranscribeImplWiringTests(unittest.TestCase):
         self.lines = []
         self.logs = []
         self.updates = []
+        self.speakers = []
+        # 2026-09-26：说话人分离是会议的**必备环节**（不再是开关），provider 那条路
+        # 也会走它。所以这里必须把**本机分离**与**落库的说话人**都换成替身 ——
+        # 不打桩会去加载本机 pyannote；而 `db.replace_speakers` 没打桩的话，
+        # 这一组"用一个假 meeting_id=1"的用例会往**真实库**里写说话人行。
         patches = [
             patch.object(meeting.db, "get_meeting_by_name",
                          lambda name: {"id": 1, "name": name}),
@@ -166,6 +171,10 @@ class TranscribeImplWiringTests(unittest.TestCase):
             patch.object(meeting.db, "add_lines",
                          lambda mid, rows: self.lines.extend(rows)),
             patch.object(meeting.db, "cleanup_empty_speakers", lambda mid: None),
+            patch.object(meeting.db, "replace_speakers",
+                         lambda mid, names: self.speakers.append(names)),
+            patch.object(meeting.db, "replace_speaker_embeddings",
+                         lambda mid, m: None),
             patch.object(meeting.db, "add_log",
                          lambda level, source, msg: self.logs.append((level, msg))),
             patch.object(meeting, "export_transcript", lambda *a, **k: None),
@@ -173,6 +182,9 @@ class TranscribeImplWiringTests(unittest.TestCase):
             patch.object(meeting, "_active_asr_provider", self._provider),
             patch.object(meeting, "_asr_provider_id", lambda: "openai-asr"),
             patch.object(meeting, "_wav_seconds", lambda path: 20.0),
+            patch("app.audio.diarize.diarize_wav_full",
+                  lambda path, max_speakers=None: ([(0.0, 20.0, "SPEAKER_00")],
+                                                   [[0.1] * 256], ["SPEAKER_00"])),
             patch.object(meeting.settings, "get",
                          lambda k, d=None: {"meetingSttModel": "sensevoice",
                                             "meetingAutoSummarize": False}.get(k, d)),
@@ -192,7 +204,12 @@ class TranscribeImplWiringTests(unittest.TestCase):
         self.assertEqual(len(self.fake.calls), 1, "每段调一次 provider")
         # db_rows 是 5 元组 (seg_index, start, end, speaker_label, text)（meeting.py:641 转换）
         self.assertEqual([r[4] for r in self.lines], ["第一句。", "第二句。"])
-        self.assertEqual(self.lines[0][3], "", "不做说话人分离时 label 为空")
+        # 2026-09-26：分离是会议的必备环节 —— provider 转写那条路**同样**会标说话人
+        # （"要不要分离"已经不是用户设置；谁做由路由决定）。
+        self.assertEqual(self.lines[0][3], "S1",
+                         "会议转写必须标说话人（分离是标配，不是开关）")
+        self.assertEqual(self.speakers, [{"S1": "说话人1"}],
+                         "本场说话人的显示名要落库")
         self.assertEqual(self.lines[0][0], 1)            # seg_index
         self.assertAlmostEqual(self.lines[-1][2], 20.0, places=1)   # 时间铺满本段
         self.assertTrue(any("provider" in m for _lv, m in self.logs))

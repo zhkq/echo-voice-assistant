@@ -116,20 +116,30 @@ def _as_list(value: Any) -> list:
     return list(value) if isinstance(value, (list, tuple)) else []
 
 
-def plan_summary(plan: Any, timestamps_kinds: Any = None) -> Optional[Dict[str, Any]]:
+def plan_summary(plan: Any, timestamps_kinds: Any = None,
+                 diarize_state: Any = None) -> Optional[Dict[str, Any]]:
     """把会议里记下的执行计划（`Plan.as_dict()` 那份）翻成面板能直接渲染的形状。
 
     **这是"这场会实际用了谁"的唯一来源。** 读的是录音时写进 `meta.json` 的快照，
     **不重新算一遍计划**：重算得到的是"现在会选谁"，与"当时选了谁"可能不同
     （配置改了、后端掉了），而人问的恰恰是后者。
 
+    `diarize_state` 是 `meta.json` 里的 `diarize`（`meeting._new_diarize_state()` 那份）：
+    **会议一定有说话人分离**（2026-09-26 概念纠正），所以"没做成"必须说得出来 ——
+    它是这次改动里最要紧的一句人话（原来那版会静默产出一场"没有说话人却像正常"的会议）。
+
     认不出来的槽 / 后端 / 原因**一律退回原始标识符**，不猜也不丢：宁可让人看到
     `asr.streaming` 这种内部词，也不要显示一个错误的翻译。
 
     整个函数**不抛异常**（输入来自盘上可能被手改坏的 `meta.json`）。
     """
+    dia = diarize_summary(diarize_state)
     if not isinstance(plan, dict):
-        return None
+        # 没有执行计划也不算"什么都没有"：分离没做成这一条照样要说（老会议没有 plan，
+        # 但新写的 `diarize` 快照是有的）。
+        return {"picks": [], "skipped": [], "candidates": {}, "notes": [],
+                "vectorSpaceId": "", "timestampsKinds": {}, "timestampsLabel": "",
+                "diarize": dia} if dia else None
     picks = []
     for slot, pick in sorted(_as_dict(plan.get("picks")).items()):
         if not isinstance(pick, dict):
@@ -161,7 +171,7 @@ def plan_summary(plan: Any, timestamps_kinds: Any = None) -> Optional[Dict[str, 
             continue                    # 数不出来就当没记过 —— 别让详情页打不开
         if n:
             kinds[str(key)] = n
-    if not (picks or skipped or kinds):
+    if not (picks or skipped or kinds or dia):
         # 什么都没记（老会议 / 走的是本机回退路径）→ 返回 None 当"没有这段信息"，
         # 而不是给面板一个空壳（空壳会渲染成"用了谁：无"，看着像出了问题）。
         return None
@@ -176,7 +186,54 @@ def plan_summary(plan: Any, timestamps_kinds: Any = None) -> Optional[Dict[str, 
         "timestampsKinds": kinds,
         "timestampsLabel": "；".join(
             "%s × %d" % (TIMESTAMPS_LABELS.get(k, k), v) for k, v in sorted(kinds.items())),
+        # 分离这一场的结论（成没成 / 不成是为什么）。**面板不许自己编这句话**。
+        "diarize": dia,
     }
+
+
+#: 「分离没做成」在面板上的固定说法。**前半句是硬契约**：任务要求会议记录与面板
+#: 都要能一眼看到「说话人分离未执行：<真原因>」，所以那个前缀单独留成常量，
+#: 用例断言它、面板直接渲染它，谁都不许改写一遍。
+DIARIZE_NOT_EXECUTED = "说话人分离未执行"
+
+
+def diarize_summary(state: Any) -> Optional[Dict[str, Any]]:
+    """`meta.json` 里的 `diarize` → 面板能直接渲染的一小块（`None` = 没这段信息）。
+
+    形状：
+      * `executed`     这一场到底标没标上说话人；
+      * `reason` / `reasonLabel`  **权威十词之一** + 它的中文（`REASON_LABELS`）——
+        只有 `executed=False` 时才有意义；
+      * `code` / `retryable`      服务端给的两档（"客户端该干什么"）；没有就是空/假；
+      * `backendLabel`  这一场的分离是谁做的（走了后端时才有）；
+      * `headline`      **给人看的那一句**（`说话人分离未执行：<原因>`）。
+
+    认不出的 `reason` **原样返回**（与 `plan_summary` 同一条纪律：宁可露出内部词，
+    也不要显示一个错误的翻译）。整个函数不抛异常（输入来自盘上可被手改坏的文件）。
+    """
+    if not isinstance(state, dict):
+        return None
+    executed = bool(state.get("executed"))
+    reason = str(state.get("reason") or "")
+    backend_id = str(state.get("backendId") or "")
+    out = {
+        "executed": executed,
+        "reason": reason,
+        "reasonLabel": REASON_LABELS.get(reason, reason),
+        "detail": str(state.get("detail") or ""),
+        "code": str(state.get("code") or ""),
+        "retryable": bool(state.get("retryable")),
+        "backendId": backend_id,
+        "backendLabel": _backend_label(backend_id) if backend_id else "",
+    }
+    if executed:
+        out["headline"] = ("说话人分离已执行"
+                           + ("（%s）" % out["backendLabel"] if out["backendLabel"] else ""))
+    else:
+        # 原因认不出时也要给一句能读的（`reason` 为空 = 老版本/手改坏的文件）
+        out["headline"] = "%s：%s" % (DIARIZE_NOT_EXECUTED,
+                                      out["reasonLabel"] or "原因未记录")
+    return out
 
 
 def _setting(key, default=None):

@@ -509,17 +509,19 @@ class OptionAndPanelWiringTests(unittest.TestCase):
         理由：LLM 的"用哪个实现"和路由的上游配置是同一件事 —— ECHO AUTO 的成员本来就在
         这一页配，分两处只会互相找不着。
 
-        本用例改过两次断言，都是"旧结构"：
+        本用例改过几次断言，都是"旧结构"：
           * 2026-09-25：那一页从「模型路由」改名成「智能体」（id `view-agent`）；
           * 2026-09-25 同日：语言模型 / 通道成员 / 派发情况**合成一张卡**（用户要求），
             所以"语言模型块排在 `rtBadge` 之前"这条不再成立（`rtBadge` 现在在卡标题里）。
             意图不变：**先"用哪个实现"，再配通道成员** —— 改成比"`rtLlmHost` 在 `rtMembers` 之前"。
+          * 2026-09-26 IA 重构：那一页叫「能力与智能体」，id 仍是 `capability`
+            （深链 `?view=agent` 由 VIEW_ALIASES 折算过去）。
         """
         js = _read(os.path.join("web", "app.js"))
         html = _read(os.path.join("web", "index.html"))
         self.assertIn('id="rtLlmHost"', html)
-        self.assertLess(html.index('id="view-agent"'), html.index('id="rtLlmHost"'),
-                        "语言模型块要在「智能体」页签里")
+        self.assertLess(html.index('id="view-capability"'), html.index('id="rtLlmHost"'),
+                        "语言模型块要在「能力与智能体」页签里")
         self.assertLess(html.index('id="rtLlmHost"'), html.index('id="rtMembers"'),
                         "「语言模型」小节要排在「通道成员」小节之前（先选用哪个，再配通道）")
         self.assertIn("function loadRouterLlm", js)
@@ -569,33 +571,50 @@ class OptionAndPanelWiringTests(unittest.TestCase):
                 if meta.get("grp") == "router" and not meta.get("deprecated")}
         self.assertEqual(declared, want, "路由参数集合与 config 的 router 组漂移了")
 
-    def test_router_settings_live_in_the_agent_tab(self):
-        """路由参数（grp=router 的 7 项）住在**顶层「智能体」页签**那张「模型路由」卡的「高级」里。
+    def test_router_settings_live_in_the_capability_tab(self):
+        """路由参数（grp=router 的 7 项）住在**顶层「能力与智能体」页签**那张「模型路由」卡的「高级」里。
 
-        这一条**改过三次断言**，三次都是"旧布局"（意图一次没变：这 7 项有且仅有一个落点）：
+        这一条**改过四次断言**，四次都是"旧布局"（意图一次没变：这 7 项有且仅有一个落点）：
           * 2026-09-19 版：它们在「设置」页里；
           * 2026-09-25 版：搬到顶部「模型路由」页签，那一页留一张指路卡；
           * 2026-09-25 整合后：四个设置视图**就是顶层页签**，指路卡连同 `#rtSetGo` 一起删掉，
             7 项落在「智能体」页「通道设置」卡的高级区（`SET_CARDS` 的 `id: "chan"`）；
-          * 2026-09-25 同日（本次）：用户要求把「语言模型 / 通道成员 / 派发情况 / 通道设置」
+          * 2026-09-25 同日：用户要求把「语言模型 / 通道成员 / 派发情况 / 通道设置」
             **合成一张卡** → `id: "chan"` 没了，那张卡改成 index.html 里的**静态**卡
             （`#rtMergeCard`，三个 host 要被 loadRouter 系列反复渲染，动态生成会和并发请求
             互相覆盖），7 行参数由 `renderSettingsPanes()` 填进它的 `#rtSetHost`，
             落库交给卡内的「保存」（`saveRouter()` → `collectSettingValues("#rtSetHost")`）。
+          * 2026-09-26（本次，IA 重构）：**会议能力通道那 3 项搬出这张卡** ——
+            用户把"转写走哪条路"归进了「业务配置 → 会议」（一个实体只有一处状态），
+            所以 `#rtCapHost` 连同 `RT_SAVE_HOSTS` 里的第二个 host 一起撤掉，
+            那两项设置（分离 / 声纹由谁做）改由 `renderMeetingServiceCard()` 画在会议卡里。
+            卡内「保存」现在只收 `#rtSetHost` 一处。
+
         所以这里守的是：①静态卡存在且带折叠标记；②7 项参数确实被填进它的高级区；
-        ③落点表不再把它们当成"未归类"（`SET_PLACED_ELSEWHERE`）；④卡内的保存会收这些行。
+        ③落点表不再把它们当成"未归类"（`SET_PLACED_ELSEWHERE`）；④卡内的保存会收这些行；
+        ⑤会议能力通道**不再**在这张卡里（有一个落点）。
         """
         js = _read(os.path.join("web", "app.js"))
         html = _read(os.path.join("web", "index.html"))
         for token in ('id="rtMergeCard"', 'data-collapse-id="set-router"', 'id="rtSetHost"'):
             self.assertIn(token, html, "index.html 缺少 %s" % token)
+        self.assertNotIn('id="rtCapHost"', html,
+                         "会议能力通道已挪去「业务配置 → 会议」，这里不该再有它的 host")
         self.assertNotIn("function loadRouterSettings", js, "指路卡那套函数应已删除，别留死代码")
         # 7 行参数由 renderSettingsPanes 填进静态卡的 #rtSetHost
         self.assertIn('renderSettingRows(settingRows([...ROUTER_KEYS]))', js,
                       "7 项路由参数要填进「模型路由」卡的高级区")
-        # 卡内的「保存」管成员 + 这 7 项参数（页签顶部的保存只收 pane 里的设置行）
-        self.assertIn('collectSettingValues("#rtSetHost")', js,
-                      "卡内的保存要把高级区那 7 项一起落库")
+        # 卡内的「保存」管成员 + 那个 host 里的设置行（页签顶部的保存只收 pane 里的设置行）
+        hosts = re.search(r"const RT_SAVE_HOSTS = \[(.*?)\];", js, re.S)
+        self.assertIsNotNone(hosts, "app.js 里应有 RT_SAVE_HOSTS（卡内保存的落点表）")
+        self.assertIn('"#rtSetHost"', hosts.group(1),
+                      "卡内保存的落点表少了 #rtSetHost —— 那 7 项改了不会落库")
+        self.assertNotIn('"#rtCapHost"', hosts.group(1),
+                         "会议能力通道已挪走，落点表里不该再留着它")
+        self.assertIn("RT_SAVE_HOSTS.forEach", js,
+                      "卡内的保存要遍历落点表收值（别只收其中一个 host）")
+        self.assertRegex(js, r"RT_SAVE_HOSTS\.forEach\(.*?collectSettingValues\(",
+                         "落点表里的每一处都要真的用 collectSettingValues 收")
         self.assertIn('collectSettingValues("[data-settab-pane]")', js,
                       "页签顶部的保存只收设置卡片（别和卡内保存抢同一件事）")
         # 落点表：这 7 项不能落进「未归类」兜底卡
@@ -606,9 +625,9 @@ class OptionAndPanelWiringTests(unittest.TestCase):
                     "routerBreakerThreshold", "routerBreakerCooldown"):
             with self.subTest(key=key):
                 self.assertIn('"%s"' % key, mp.group(1), "%s 没登记落点（会掉进未归类卡）" % key)
-        self.assertIn('id="rtMembers"', html, "成员与优先级那块仍在「智能体」页签里")
-        self.assertLess(html.index('id="view-agent"'), html.index('id="rtMembers"'),
-                        "通道成员要在「智能体」页签里")
+        self.assertIn('id="rtMembers"', html, "成员与优先级那块仍在「能力与智能体」页签里")
+        self.assertLess(html.index('id="view-capability"'), html.index('id="rtMembers"'),
+                        "通道成员要在「能力与智能体」页签里")
         self.assertIn("renderSettingRow", js, "复用同一套行渲染（样式一致）")
         self.assertIn("async function ensureSettings", js, "多个页签共用一份设置数据")
 

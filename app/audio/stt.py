@@ -125,9 +125,38 @@ def resolve_device(choice="auto"):
 # ---------------------------------------------------------------- 本地模型定位
 
 def _whisper_dir(model_name):
+    """whisper 某档的**本地权重目录**；找不到返回 ""（调用方按模型名交给 faster-whisper）。
+
+    三个落点全认（顺序 = 优先级）—— **"面板说已就绪"与"这里能加载"必须是同一份判据**
+    （2026-09-26 修复）：
+
+      ① `models/faster-whisper/<档>/`（拷进来的那种，含 model.bin）；
+      ② `models/hub/models--Systran--faster-whisper-<档>/snapshots/<rev>/`（HF 缓存；
+         `HF_HOME` 在本模块开头被定成 models 目录，所以 HF 的落点就是 `{models}/hub`）；
+      ③ `~/.cache/modelscope/models/Systran--faster-whisper-<档>/snapshots/master/`
+         （面板的下载按钮对 whisper 走 `_snapshot(ms_id=…)` —— **ModelScope 优先**，
+         所以它下到的就是这里）。
+
+    只认 ① 时实测的后果：`WhisperModel('tiny')` 在本机（权重在 ③）离线加载会抛
+    `LocalEntryNotFoundError`，而 faster-whisper 会**静默重新下载 461 MB** ——
+    面板写着「已就绪」，引擎却在偷偷重下，两头说的不是一回事。
+
+    判据仍然是"加载器要读的那个文件在不在"（`model.bin`），不是"目录在不在"：
+    空的快照目录照样让 WhisperModel 当场炸。
+    """
     name = MODEL_ALIASES.get(model_name, model_name)
     d = os.path.join(models_dir(), "faster-whisper", name)
-    return d if os.path.isfile(os.path.join(d, "model.bin")) else ""
+    if os.path.isfile(os.path.join(d, "model.bin")):
+        return d
+    ref = "Systran/faster-whisper-%s" % name
+    for resolve in (_resolve_hf_cache, _resolve_ms_cache):
+        try:
+            path = resolve(ref)
+        except Exception:
+            continue
+        if path and path != ref and os.path.isfile(os.path.join(path, "model.bin")):
+            return path
+    return ""
 
 
 def _sensevoice_dir():
@@ -335,14 +364,27 @@ def _get_qwen3asr(device="auto", model_name="Qwen/Qwen3-ASR-0.6B",
         return model
 
 
+def _ms_cache_root():
+    """本机 ModelScope 缓存根。**与 `modelinfo.MS_CACHE` 是同一份**（懒导入）。
+
+    为什么不是在这里再写一遍 `~/.cache/modelscope/models`：那是同一个事实的第二处副本 ——
+    `app/modelinfo.py` 那边是**下载落点**，这里是**加载落点**，两处一旦分叉就会重演
+    2026-09-26 那个 bug（面板按 A 下载、加载器去 B 找，找不到就联网重下）。
+    """
+    try:
+        from app import modelinfo
+        return modelinfo.MS_CACHE
+    except Exception:                                       # pragma: no cover - 兜底
+        return os.path.join(os.path.expanduser("~"), ".cache", "modelscope", "models")
+
+
 def _resolve_ms_cache(model_id):
     """把 modelscope 模型名解析为本地快照路径（存在则返回，否则返回原名）。"""
     if not model_id:
         return model_id
-    import os as _os
-    cache = _os.path.expanduser(
-        f"~/.cache/modelscope/models/{model_id.replace('/', '--')}/snapshots/master")
-    return cache if _os.path.isdir(cache) else model_id
+    cache = os.path.join(_ms_cache_root(),
+                         model_id.replace("/", "--"), "snapshots", "master")
+    return cache if os.path.isdir(cache) else model_id
 
 
 def _resolve_hf_cache(model_id):
@@ -583,6 +625,24 @@ TRANSCRIBE_ERROR = "error"     # 引擎抛异常（依赖缺失、显存不足�
 TRANSCRIBE_MISSING = "missing"  # 文件不存在
 
 
+def _note_use(engine_name, model_name):
+    """记一次"这个模型真的被用了"（账本：`app/model_usage.py` + 库里的 `model_usage` 表）。
+
+    为什么放在**这里**而不是 `_get_whisper()` 里：`_get_*` 是进程内单例，一个进程
+    只进一次 —— 拿它当"使用次数"等于"这台机器重启过几次"。真正该计的是**一次调用**：
+    `transcribe_ex()` 是命令链路与会议链路共用的唯一入口（`capabilities.local` 也走它），
+    所以一次调用 = 一次使用；`load_engine()`（boot 预热）另算一次。
+
+    **吞掉全部异常**：账本写不进去（库锁着、迁移没跑）绝不能把一次转写带崩 ——
+    使用统计是附加信息，不是转写的前置条件。
+    """
+    try:
+        from app import model_usage
+        model_usage.note_engine_used(engine_name, model_name)
+    except Exception:
+        pass
+
+
 def transcribe_ex(wav, engine="sensevoice", model="small", lang="zh", device="auto"):
     """转写单个 wav，返回 ``{"text", "status", "detail"}``。
 
@@ -595,6 +655,7 @@ def transcribe_ex(wav, engine="sensevoice", model="small", lang="zh", device="au
         return {"text": "", "status": TRANSCRIBE_MISSING, "detail": "文件不存在: %s" % wav}
 
     if engine == "sensevoice":
+        _note_use("sensevoice", "")
         try:
             sv = _get_sensevoice(device)
             res = sv.generate(input=wav, cache={}, language="auto", use_itn=True, batch_size_s=60)
@@ -605,6 +666,7 @@ def transcribe_ex(wav, engine="sensevoice", model="small", lang="zh", device="au
             return {"text": "", "status": TRANSCRIBE_ERROR, "detail": "SenseVoice: %s" % e}
 
     if engine == "sherpa":
+        _note_use("sherpa", "")
         try:
             import numpy as np
             import wave as wave_mod
@@ -636,6 +698,7 @@ def transcribe_ex(wav, engine="sensevoice", model="small", lang="zh", device="au
                 qwen_model = f"Qwen/Qwen3-ASR-{model}"
             else:
                 qwen_model = "Qwen/Qwen3-ASR-0.6B"
+            _note_use("qwen3asr", qwen_model)
             m = _get_qwen3asr(device, qwen_model)
             lang_hint = _LANG_MAP.get(str(lang).lower(), None)
             # 切片 + 分批（`_qwen3asr_transcribe` 的注释解释了为什么不能整段喂）
@@ -648,6 +711,7 @@ def transcribe_ex(wav, engine="sensevoice", model="small", lang="zh", device="au
 
     # faster-whisper
     try:
+        _note_use("whisper", model)
         wm = _get_whisper(model, device)
         segments, _info = transcribe_whisper(wm, wav, lang)
         text = " ".join("".join(seg.text for seg in segments).split())
@@ -780,6 +844,10 @@ def load_engine(engine_name, model, device="auto", forced_aligner=QWEN3_FORCED_A
             import ctranslate2  # noqa: F401  顺序安全
         except Exception:
             pass
+    # 显式加载（boot 预热）也算一次使用：它就是为了"待会儿要用"才加载的。
+    # 记在这里而不是 `_get_*` 里，是为了与 `transcribe_ex()` 的记账**不重复计**
+    # （懒加载那条路由 transcribe_ex 记账，这里只覆盖"只加载、还没转写"的那条路）。
+    _note_use(engine_name, model)
     if engine_name == "sensevoice":
         _get_sensevoice(device)
         return "sensevoice"

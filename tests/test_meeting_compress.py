@@ -130,8 +130,15 @@ class _CompressCase(unittest.TestCase):
             p = patch.object(target, kw, lambda *a, **k: None)
             p.start()
             self.addCleanup(p.stop)
-        settings.update({"meetingAutoSummarize": False, "meetingDiarize": False,
+        settings.update({"meetingAutoSummarize": False,
                          "meetingKeepRawAudio": False})
+        # 2026-09-26：分离是会议的必备环节（不再是开关）——这一组用例与分离无关，
+        # 不打桩会去加载本机 pyannote 权重（开发机上装着 → 白等几十秒）。
+        p = patch("app.audio.diarize.diarize_wav_full",
+                  lambda path, max_speakers=None: ([(0.0, 1.0, "SPEAKER_00")],
+                                                   [[0.1] * 256], ["SPEAKER_00"]))
+        p.start()
+        self.addCleanup(p.stop)
         self.name = os.path.basename(self.folder)
 
     # ---- 造料 ----------------------------------------------------------

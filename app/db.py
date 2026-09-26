@@ -24,6 +24,7 @@
   component_states  组件运行状态快照（面板轮询展示）
   logs              运行日志（面板可查，替代散落 .log 文件）
   events            事件流（审计/统计/未来移动端推送）
+  model_usage       本地模型使用账本（上次使用 / 次数 / 「保留」钉子；清理建议的唯一判据）
   api_keys          外部触点（手机 App 等）的访问密钥（预留，默认关闭）
 """
 import hashlib
@@ -282,6 +283,25 @@ MIGRATIONS = [
     #    原样返回，不需要额外改动 —— 契约由 tests/test_api_contract.py 钉住。
     (6, """
     ALTER TABLE meetings ADD COLUMN error TEXT DEFAULT '';
+    """),
+    # 7: `model_usage` —— **本地模型到底用没用过**的账本（2026-09-26）。
+    #    为什么非要有它：清理"近期没再用的模型"从前只能猜 —— 库里 `last_used_at`
+    #    只存在于 api_keys / dsh_sessions / meeting_sessions，**模型一个都没有**，
+    #    于是判据退化成"看文件修改时间"，那等于瞎删（拷进来一次 mtime 就是新的，
+    #    真用过一次也可能因为系统迁移变旧）。
+    #    一条模型 id 一行（id 与 /api/models 的 item id 一致：whisper-small / qwen3asr /
+    #    sensevoice / sherpa / pyannote）：上次使用时间 + 使用次数 + 「保留」钉子。
+    #    为什么钉子在**同一张表**：钉子就是"这一行永远不列入清理建议"，
+    #    与使用记录同生共死（模型删了记录也就没了），分两张表只会多一次 join 与一处漂移。
+    #    写入时机见 app/model_usage.py：只在该模型**真的被加载/调用**时写。
+    (7, """
+    CREATE TABLE IF NOT EXISTS model_usage (
+      model_id     TEXT PRIMARY KEY,
+      last_used_at TEXT DEFAULT '',
+      use_count    INTEGER DEFAULT 0,
+      pinned       INTEGER DEFAULT 0,
+      pinned_at    TEXT DEFAULT ''
+    );
     """),
 ]
 
@@ -1021,3 +1041,68 @@ def verify_api_key(token):
 
 def delete_api_key(key_id):
     _exec("DELETE FROM api_keys WHERE id=?", (key_id,))
+
+
+# ---------------------------------------------------------------- model_usage
+#: 本地模型的"用没用过"账本（schema v7）。**写入时机只有一个**：模型真的被加载/调用
+#: （见 `app/model_usage.py`）—— 读盘、列清单、探测就绪都**不算**使用。
+#: 时间戳一律本地时间字符串，与库里别处（`datetime('now','localtime')`）同形，
+#: 于是"跨 90 天"这类比较可以直接按字符串比，也可以用 `when` 显式喂一个历史时间
+#: （用例就是这么造"很久没用过"的现场，不必等 90 天）。
+
+def record_model_use(model_id, when=None):
+    """记一次使用：次数 +1，上次使用时间更新。返回是否真的写了。
+
+    `when` 给用例/回填用（ISO 字符串，缺省 = 现在）。**同一个模型只占一行**，
+    并发写也不会重复（PRIMARY KEY + UPSERT，写在自己的短连接里）。
+    """
+    mid = str(model_id or "").strip()
+    if not mid:
+        return False
+    if when:
+        _exec("INSERT INTO model_usage(model_id,last_used_at,use_count) VALUES(?,?,1) "
+              "ON CONFLICT(model_id) DO UPDATE SET use_count=model_usage.use_count+1, "
+              "last_used_at=excluded.last_used_at", (mid, str(when)))
+    else:
+        _exec("INSERT INTO model_usage(model_id,last_used_at,use_count) "
+              "VALUES(?,datetime('now','localtime'),1) "
+              "ON CONFLICT(model_id) DO UPDATE SET use_count=model_usage.use_count+1, "
+              "last_used_at=excluded.last_used_at", (mid,))
+    return True
+
+
+def model_usage(model_id=None):
+    """使用账本：给一个 id 返回一行（没有返回 None），不给返回全部（按 id 排序）。"""
+    if model_id:
+        return _query_one("SELECT * FROM model_usage WHERE model_id=?", (str(model_id),))
+    return _query("SELECT * FROM model_usage ORDER BY model_id")
+
+
+def set_model_pin(model_id, pinned=True, when=None):
+    """给模型打/摘「保留」钉子。钉子只影响**清理建议**，不影响加载与使用。
+
+    同时把 last_used_at 补一个值：一个"从没用过但我要留着"的模型也该在面板上有一行
+    （否则它在账本里根本不出现，"保留"就没地方显示了）。
+    """
+    mid = str(model_id or "").strip()
+    if not mid:
+        return False
+    at = str(when) if when else None
+    if at:
+        _exec("INSERT INTO model_usage(model_id,pinned,pinned_at,last_used_at) VALUES(?,?,?,'') "
+              "ON CONFLICT(model_id) DO UPDATE SET pinned=excluded.pinned, "
+              "pinned_at=excluded.pinned_at", (mid, 1 if pinned else 0, at))
+    else:
+        _exec("INSERT INTO model_usage(model_id,pinned,pinned_at) "
+              "VALUES(?,?,datetime('now','localtime')) "
+              "ON CONFLICT(model_id) DO UPDATE SET pinned=excluded.pinned, "
+              "pinned_at=excluded.pinned_at", (mid, 1 if pinned else 0))
+    return True
+
+
+def clear_model_usage(model_id=None):
+    """清掉使用记录（模型删掉之后连带清，免得账本里留着幽灵行）。"""
+    if model_id:
+        _exec("DELETE FROM model_usage WHERE model_id=?", (str(model_id),))
+    else:
+        _exec("DELETE FROM model_usage")

@@ -576,7 +576,11 @@ def start_meeting():
                 "sttDevice": cfg.get("device", "auto"),
                 "segmentMinutes": cfg.get("meetingSegmentMinutes", 10),
                 "autoSummarize": cfg.get("meetingAutoSummarize", True),
-                "diarize": cfg.get("meetingDiarize", False),
+                # 恒为真：会议转写 = 转写 + 说话人分离 + 声纹识别（三件标配，2026-09-26
+                # 概念纠正）。这个键只为**老读者**留着（老版本 ECHO 读它），
+                # 不影响任何行为 —— 谁做分离由「模型路由 → 会议能力通道」按槽决定，
+                # 不再读 `meetingDiarize`（已废弃）。
+                "diarize": True,
             },
             "segments": [],
         }
@@ -1022,24 +1026,27 @@ def _apply_capability_meta(meta: dict, cap_plan, cap_kinds) -> dict:
     return meta
 
 
-def _session_slots(cfg, need_speaker=False):
-    """本场要向能力层要哪些槽。**顺序有讲究：说话人那一族按 `diarize.turns` → `speaker.embed`**。
+#: 本场会议的**说话人那一族**要哪些槽（顺序 = 固定契约）：先 `diarize.turns`，再
+#: `speaker.embed`。L5 的向量空间锁是**沿着槽的顺序**推进的 —— 把 `speaker.embed`
+#: 排在前面，锁就由它定（同一个后端时结果一样，但语义上不对：这场会先有分离，
+#: 才谈得上"认出的这个人是谁"）。
+SPEAKER_SLOTS = ("diarize.turns", "speaker.embed")
 
-    为什么要先 `diarize.turns`：`router.plan()` 的向量空间锁（L5）是**沿着槽的顺序**
-    推进的 —— 第一个同源槽定下本场的 `vectorSpaceId`，后面的候选都按它重判。
-    把 `speaker.embed` 排在前面，锁就由它定（同一个后端时结果一样，但语义上不对：
-    这场会先有分离，才谈得上"认出的这个人是谁"）。
 
-    `speaker.embed` 只在**声纹识别真的会用**时才要（`need_speaker`）：
-    `_capability_diarize_segment` 用的是 `diarize.turns` 那条缝，本环节不消费
-    `speaker.embed` —— 把它列进来只会在面板上多出一行"跳过了谁"，而那不是这场会的真相。
+def _session_slots(cfg):
+    """本场要向能力层要哪些槽。**说话人那一族是无条件的**。
+
+    2026-09-26 概念纠正：**会议转写 = 转写 + 说话人分离 + 声纹识别，三件都是标配**
+    （本地跑或走 ECHO 后端一样）。"ASR 一次、分离一次、嵌入一次"只是现有模型能力
+    不足的实现细节，**不是**用户要理解的开关 —— 所以：
+      * 这里不再看 `meetingDiarize`（已废弃）也不再看"声纹识别开没开"（已标配）；
+      * 谁来做这三件事由路由按槽决定（`capabilityMeetingAsrBackend` /
+        `capabilityDiarizeBackend` / `capabilityEmbedBackend`）—— "要不要"变成了"由谁做"。
+
+    认人（把说话人映射到已知联系人）**不依赖任何开关**：声纹库为空时匹配器是 None，
+    那时静默无结果（零副作用，见 `app/voiceprint.py`）；库里有人就一定会认。
     """
-    slots = ["asr.text", "asr.timestamps"]
-    if bool(cfg.get("diarize")):
-        slots.append("diarize.turns")
-        if need_speaker:
-            slots.append("speaker.embed")
-    return tuple(slots)
+    return ("asr.text", "asr.timestamps") + SPEAKER_SLOTS
 
 
 def _skips_brief(plan, slot):
@@ -1063,6 +1070,53 @@ def _first_reason(plan, slot):
     from app.capabilities.router import most_informative
     best = most_informative([s for s in plan.skipped if s.slot == slot])
     return best.reason if best else "absent"
+
+
+#: 本机装不出分离时用的原因词。选 `absent` 不是随手挑的：它的中文释义就是
+#: "不在位（**本机没装这个能力**）"（`capability_admin.REASON_LABELS`）。
+DIARIZE_LOCAL_MISSING_REASON = "absent"
+
+
+def _diarize_reason_rank(reason):
+    """原因词的**信息量**排序（越小越具体）。与路由的 `REASON_PRIORITY` 同一份。"""
+    from app.capabilities.router import REASON_PRIORITY
+    try:
+        return REASON_PRIORITY.index(str(reason))
+    except ValueError:
+        return len(REASON_PRIORITY)
+
+
+def _note_diarize_missing(state, reason, detail="", code="", retryable=False):
+    """记下"这场没有说话人 + **为什么**"（只保留信息量最大的那条原因）。
+
+    `reason` 必须是那个**权威十词**之一（`capabilities.base.SKIP_REASONS`）——
+    这里**不自己编原因**：编一个词出来，面板上那句中文就没了着落，排障也接不上
+    日志里的 `reason=`。`code` / `retryable` 是服务端给的两档（"客户端该干什么"）。
+
+    为什么挑而不覆盖：一场会里"分离没做成"可能叠着好几层原因（计划里没有可用后端、
+    真调用时后端挂了、本机也没装），随手覆盖会把**具体**的那条（`blocked` /
+    `unsupported`）盖成笼统的 `absent` —— 而那正是用户排障要的第一手信息。
+    """
+    if not isinstance(state, dict):
+        return
+    reason = str(reason or "") or DIARIZE_LOCAL_MISSING_REASON
+    old = str(state.get("reason") or "")
+    if old and _diarize_reason_rank(old) <= _diarize_reason_rank(reason):
+        return
+    state["reason"] = reason
+    state["detail"] = str(detail or "")
+    state["code"] = str(code or "")
+    state["retryable"] = bool(retryable)
+
+
+def _new_diarize_state():
+    """一场会的分离状态（写进 `meta.json` 的 `diarize`），面板据此如实显示。
+
+    形状刻意与"分离成功"对称：`executed` 是结论，`reason`/`detail`/`code`/`retryable`
+    是依据。**没有"未知"这一档** —— 转写结束时它必然已经定下来（成功，或带着原因没做成）。
+    """
+    return {"executed": False, "reason": "", "detail": "", "code": "",
+            "retryable": False, "backendId": ""}
 
 
 class _CapabilitySession(object):
@@ -1172,7 +1226,7 @@ class _CapabilitySession(object):
         return iter((self.router, self.need()))
 
 
-def _capability_asr_session(cfg, need_speaker=False):
+def _capability_asr_session(cfg, need_speaker=None):
     """本场是否走**能力后端**。返回 `_CapabilitySession` 或 `None`。
 
     ## 判据：计划里**任何一个会议槽**落到本机以外的后端
@@ -1181,6 +1235,10 @@ def _capability_asr_session(cfg, need_speaker=False):
     "只问 asr.text"会漏掉一种真实配置：转写点名用本机、分离点名用 ECHO 后端
     （台式机有 GPU 转写、但没装 pyannote）。那种机器上，走哪一段代码**按槽分开**：
     `asr.text` 落本机 → 文本走原来那段本地代码；`diarize.turns` 落后端 → 分离走能力层。
+
+    `need_speaker` 是**遗留参数**：3.0 起 `speaker.embed` 与 `diarize.turns` 一样是
+    必备槽（会议标配三件），判据不再需要它。留着只是为了不悄悄改掉一个被用例引用的
+    签名 —— 传什么都不影响结果。
 
     为什么不是"永远走路由器"：那会要求本机后端与原来那段代码**逐字节等价**，
     而那段代码包含 SenseVoice 文本 + whisper 骨架的对齐、qwen3asr 的原生句子、
@@ -1193,14 +1251,13 @@ def _capability_asr_session(cfg, need_speaker=False):
     try:
         from app.capabilities import build_default_router
         router = build_default_router()
-        base_slots = _session_slots(cfg, need_speaker=False)
-        session = _CapabilitySession(router, cfg, base_slots)
+        session = _CapabilitySession(router, cfg, _session_slots(cfg))
         plan = session.plan()
-        # 带上声纹槽再规划一次（`need_speaker`）—— 判据只看"有没有落在本机之外"，
-        # 多一个槽只会让计划更完整，不会把本机结果变成远端结果。
-        if need_speaker and "diarize.turns" in base_slots:
-            session.with_speaker_slot(_session_slots(cfg, need_speaker=True))
-            plan = session.plan()
+        if need_speaker is not None:
+            # 老调用方（3.0 之前）传这个参数表达"这场要声纹槽"。现在它恒为必备，
+            # 所以只写一条 debug 便于对照，**不改判据**。
+            db.add_log("debug", "capability",
+                       "need_speaker=%r 已是遗留参数（声纹槽恒在计划里）" % (need_speaker,))
 
         live = [(s, plan.backend_for(s)) for s in session.slots]
         if not any(bid and bid != "local" for _s, bid in live):
@@ -1321,7 +1378,7 @@ def _normalize_diarize(result):
     return turns, embs, labels
 
 
-def _capability_diarize_segment(cap, seg_path):
+def _capability_diarize_segment(cap, seg_path, state=None):
     """一段音频走能力层的 `diarize.turns` → `(turns, embs, labels, plan_dict)`。
 
     形状与 `diarize_wav_full()` **逐字对齐**（见 `_normalize_diarize`）—— 会议那边
@@ -1329,29 +1386,44 @@ def _capability_diarize_segment(cap, seg_path):
 
     四种返回要分清（前三种调用方走原来那段本地代码）：
 
-      * 本场压根不做分离（槽不在会话里）→ 全 `None`；
-      * 计划把 `diarize.turns` 派给本机（**用户显式选的本机**，不是兜底）→ 全 `None`；
-      * 能力层这一槽失败 → 全 `None`（+ 一条带 `reason` 的 warn），**不冒充**成功；
+      * 这一槽**压根不在会话里**（老调用方自己拼的槽清单）→ 全 `None`；
+      * 计划把 `diarize.turns` 派给本机（**用户显式选的本机**，或这一槽谁都干不了）
+        → 全 `None`（并把"谁都干不了"的**权威原因**记进 `state`）；
+      * 能力层这一槽失败 → 全 `None`（+ 一条带 `reason`/`code` 的 warn），**不冒充**成功；
       * 拿到结果 → `(turns, embs, labels, plan.as_dict())`。
+
+    `state` 是可选的"这场为什么没有说话人"记录（见 `_note_diarize_missing`）：
+    调用方拿着它写进 `meta.json`，会议详情据此显示「说话人分离未执行：<真原因>」。
+    不传也不影响返回值（既有用例就是两参数调用的）。
 
     为什么失败之后**还允许**调用方落回本机那段代码：`_capability_asr_session` 的判据
     已经把"没配后端"的机器挡在外面了（那些机器根本进不到这里）；能进到这里而这一槽
     失败的情形只有"配了后端但这一槽用不了"（后端没这个模型 / privacy 挡住 / 熔断）。
     那时**回落到用户自己装了的本机引擎**是 §5.1 允许的"他选的主选"，不是被取消的那种
-    "自动兜底"；而且失败原因已经写进日志，不会变成"静默降级"。
+    "自动兜底"；而且失败原因已经写进日志与 `state`，不会变成"静默降级"。
     """
     if "diarize.turns" not in cap.slots:
         return None, None, None, None
-    if "diarize.turns" in cap.local_slots():
+    local = cap.local_slots()
+    if "diarize.turns" in local:
         # 这一槽的活不归能力层（用户点名了本机，或这一槽谁都干不了）。
         # **这里刻意不写 warn**：那句话说一次就够（`note_local_and_empty()` 在开会话时
         # 已经说过了，带权威 reason），8 段会议连说 8 遍只会把日志淹掉。
         # 调用方据此走原来那段 `diarize_wav_full` 代码 —— 与今天逐字一致。
+        if local.get("diarize.turns") == "empty" and state is not None:
+            # "谁都干不了"：把**计划里的权威原因**先记下来（unsupported / blocked / …）。
+            # 本机那段代码待会儿要是也不行，这条比笼统的 absent 指得准
+            # （用户要的是"为什么没用我要的那个后端"）。
+            plan = cap.plan()
+            _note_diarize_missing(state, _first_reason(plan, "diarize.turns"),
+                                  _skips_brief(plan, "diarize.turns"))
         return None, None, None, None
     try:
         res, plan = cap.call("diarize.turns", wav=seg_path)
     except Exception as e:
         reason = getattr(e, "reason", "") or "error"
+        _note_diarize_missing(state, reason, str(e), getattr(e, "code", ""),
+                              getattr(e, "retryable", False))
         db.add_log("warn", "capability",
                    "说话人分离这一槽走不了能力后端（reason=%s）：%s" % (reason, e))
         return None, None, None, None
@@ -1404,20 +1476,54 @@ def _merge_capability_plans(*plans):
     return out
 
 
-def _fallback_sv_rows(sv, wmodel, seg_path, seg_idx, seg_min, cfg):
+def _skeleton_model(cfg, meeting_name=""):
+    """**尽量**给一个 whisper 模型来做时间骨架；拿不到就返回 `None`（如实降级）。
+
+    骨架是 SenseVoice 那条路做句级对齐用的（qwen3asr 只是它原生句子缺失时的兜底）。
+    2026-09-26 起本机不再有 whisper 权重（新分工：指令=sherpa/SenseVoice、会议=qwen3asr），
+    所以这里**必须允许失败**，而且失败要是"安静的降级 + 一条日志"：
+
+      * 不去触发一次联网下载（`stt._get_whisper` 在本地目录缺失时会退回按模型名加载，
+        那会去 HuggingFace 拉权重 —— 用户没要求过这件事）；
+      * 不让整场转写因为"借不到骨架"而崩 —— 拼装层要不到骨架就按字数均摊，
+        档位如实标 `estimated`（详情页会写「估算」）。
+    """
+    try:
+        return stt_mod._get_whisper("small", cfg.get("sttDevice", "auto"))
+    except Exception as e:
+        db.add_log("warn", "meeting",
+                   "%s 借不到 whisper 时间骨架（本机已不带 whisper 权重），"
+                   "本场时间轴按字数估算；要精确时间戳请把会议引擎设为 qwen3asr：%s"
+                   % (meeting_name or "本场", e))
+        return None
+
+
+def _fallback_sv_rows(sv, wmodel, seg_path, seg_idx, seg_min, cfg, cap_kinds=None):
     """回退路径：whisper 时间戳骨架 + SenseVoice 文本字符级对齐切句（保留句级时间戳）。
 
     对齐那一步的实现已搬到 `app.capabilities.assemble`（设计 §4.4：拼装规则只写一份）。
     这里保留原有的"三段兜底"顺序 —— 骨架 + 文本 → 骨架 → 整段一行 ——
     但**交给拼装层统一判**，并把精度档位带出来（见 `_transcribe_impl` 里写进 meta 的那处）。
+
+    `wmodel` 允许是 `None`：那表示"骨架**按需**借" —— 只有主路真的没给出句子时才去加载
+    （本机已不带 whisper 权重，见 `_skeleton_model`）。借不到就当没有骨架，拼装层按字数
+    均摊、档位如实标 `estimated`。
+
+    `cap_kinds` 就地累加档位计数（与 `_sherpa_rows` / 能力层那条路同一个形状）：
+    本机 SenseVoice 这条路**也**要如实记档位，否则"骨架借不到 → 时间轴变糙"在详情页上
+    完全看不出来（用户只会觉得时间点莫名其妙）。
     """
     from app.capabilities import assemble
     wsegs = []
     try:
+        if wmodel is None:
+            wmodel = _skeleton_model(cfg)
+            if wmodel is None:
+                raise RuntimeError("本机没有可用的 whisper 权重（骨架不可用）")
         out, _info = stt_mod.transcribe_whisper(wmodel, seg_path, cfg.get("sttLanguage", "zh"))
         wsegs = [(s.start, s.end, s.text.strip()) for s in out]
     except Exception as e:
-        print("whisper 时间戳骨架失败:", e, file=sys.stderr)
+        print("whisper 时间戳骨架不可用（按字数估算时间轴）:", e, file=sys.stderr)
     sv_text = ""
     try:
         res = sv.generate(input=seg_path, cache={}, language="auto", use_itn=True, batch_size_s=60)
@@ -1426,6 +1532,9 @@ def _fallback_sv_rows(sv, wmodel, seg_path, seg_idx, seg_min, cfg):
     except Exception as e:
         print("SenseVoice 转写失败:", e, file=sys.stderr)
     got = assemble.assemble(text=sv_text, skeleton=wsegs, seg_seconds=seg_min * 60.0)
+    if cap_kinds is not None:
+        # 档位如实记：有骨架 → aligned；没有 → estimated。**不记就是让用户瞎猜**。
+        cap_kinds[got.timestamps] = cap_kinds.get(got.timestamps, 0) + 1
     return [(seg_idx, st, en, txt) for st, en, txt in got.sentences]
 
 
@@ -1502,7 +1611,10 @@ def _transcribe_impl(folder):
                                            mcfg.get("segmentMinutes", 10))),
         "autoSummarize": bool(settings.get("meetingAutoSummarize",
                                            mcfg.get("autoSummarize", True))),
-        "diarize": bool(settings.get("meetingDiarize", mcfg.get("diarize", False))),
+        # 说话人分离 / 声纹识别**不是配置项**了（2026-09-26 概念纠正，见 §6.5）：
+        # 会议转写 = 转写 + 分离 + 声纹，三件都是标配。`meetingDiarize`（已废弃）与
+        # 老 meta 里的 `diarize` 快照**一律不读** —— 读了就会把"用户当年关着"这件事
+        # 重新变成一个开关（正是这次要拆掉的东西）。谁做由路由按槽决定。
     }
     # 段发现：`meta["segments"]` 优先（录音当时的快照，含主人手工拷进来的段），
     # 兜底走 `audiofile.segment_files()` —— 它**同时认 `.wav` 与 `.flac`**，
@@ -1541,19 +1653,24 @@ def _transcribe_impl(folder):
     db_rows = []
     speaker_names = {}
     seg_min = int(cfg.get("segmentMinutes", 10))
-    diarize = bool(cfg.get("diarize", False))
+    # **分离是必备环节**（不是开关）—— 这里只有"这台机器的分离模块能不能 import"这一档
+    # 真正的可用性判断：本机装不出分离时如实记原因（absent = 本机没装这个能力），
+    # 整场转写照常出文字，但绝不让它看起来"像正常一样没有说话人"。
+    diarize = True
+    da_state = _new_diarize_state()
 
     registry = None
-    if diarize:
-        try:
-            # 这里仍然要 import，因为**本机分离那条路**（第一步没配后端）继续用它：
-            # 能力层只是"有后端时"的另一条缝，不是替换（见 `_capability_diarize_segment`）。
-            # `diarize_wav_full` 本身在下面按需导入（step 4 起它不再无条件执行）。
-            from app.audio.diarize import SpeakerRegistry
-            registry = SpeakerRegistry()
-        except Exception as e:
-            print("说话人分离模块不可用，跳过:", e, file=sys.stderr)
-            diarize = False
+    try:
+        # 这里仍然要 import，因为**本机分离那条路**（没配后端，或用户点名本机）继续用它：
+        # 能力层只是"有后端时"的另一条缝，不是替换（见 `_capability_diarize_segment`）。
+        # `diarize_wav_full` 本身在下面按需导入（step 4 起它不再无条件执行）。
+        from app.audio.diarize import SpeakerRegistry
+        registry = SpeakerRegistry()
+    except Exception as e:
+        print("说话人分离模块不可用，跳过:", e, file=sys.stderr)
+        diarize = False
+        _note_diarize_missing(da_state, DIARIZE_LOCAL_MISSING_REASON,
+                              "本机没有可用的说话人分离模块（%s）" % e)
 
     # 声纹识别（常用联系人，issue #6）：库里已有联系人样本时启用。
     # vp_names 整场累计「说话人N → 联系人名」（取相似度最高的一次），
@@ -1564,15 +1681,17 @@ def _transcribe_impl(folder):
     # 声纹判定统计：整场汇总成一行日志 —— 既避免"静默不认人"（真实故障看不出来），
     # 也是校准阈值/间隔的依据（最高相似度 + 未命中原因分布）。
     vp_stats = {"tried": 0, "hit": 0, "best": 0.0, "best_name": "", "miss": {}}
+    # 声纹识别是**标配**（2026-09-26 概念纠正）：不再有"识别开关"。库里没有联系人时
+    # `load_matcher()` 返回 None —— 那时静默无结果，零副作用（见 app/voiceprint.py）。
+    # 需要用户决定的只有"要不要**入库**"（`voiceprintAutoEnroll`，默认关）。
     if diarize:
         try:
             from app import voiceprint
-            if voiceprint.enabled():
-                vp_matcher = voiceprint.load_matcher()
-                if vp_matcher:
-                    db.add_log("debug", "voiceprint",
-                               f"{meeting_name}：声纹库已加载"
-                               f"（{db.count_voiceprint_contacts()} 位联系人）")
+            vp_matcher = voiceprint.load_matcher()
+            if vp_matcher:
+                db.add_log("debug", "voiceprint",
+                           f"{meeting_name}：声纹库已加载"
+                           f"（{db.count_voiceprint_contacts()} 位联系人）")
         except Exception as e:
             db.add_log("warn", "voiceprint", f"声纹库不可用，跳过自动识别：{e}")
 
@@ -1591,14 +1710,11 @@ def _transcribe_impl(folder):
     # "用户显式配了一个在线转写服务"（P5，既有）；能力路由是"按槽选后端"（3.0）。
     # **providerAsr 优先** —— 那是用户已经配好、且在跑的路径，不能被悄悄换掉。
     #
-    # `need_speaker`：这一场**会不会真的用声纹板**（v2 的"识别说话人是谁"）。
-    # 声纹开着但没有联系人样本时 `load_matcher()` 返回 None —— 那种情况下
-    # 不该把 `speaker.embed` 列进计划（面板上会多一行"跳过了谁"，而那不是这场会的真相）。
-    need_speaker = False
-    if diarize and vp_matcher is not None:
-        need_speaker = True
+    # `need_speaker` 从 2026-09-26 起是**遗留参数**：声纹槽（`speaker.embed`）与
+    # `diarize.turns` 一样恒在计划里（会议标配三件）。所以这里不再传它 —— 留着那个
+    # 形参只为不悄悄改掉一个被用例引用的签名；传什么都不影响判据。
     cap_session = (None if asr_provider is not None
-                   else _capability_asr_session(cfg, need_speaker=need_speaker))
+                   else _capability_asr_session(cfg))
     # 会话是**按整场**建的（"有没有槽落在本机以外"），而"这段代码走哪条路"要**按槽**定：
     #   * `asr.text` 归本机（用户点名 local，或这一槽没有可用后端）→ 文本走原来那段本地代码；
     #     **`diarize.turns` 仍可能走后端** —— 正是"台式机自己转写、分离发给 GPU"那种配置。
@@ -1639,11 +1755,15 @@ def _transcribe_impl(folder):
             db.add_log("info", "meeting",
                        "本场转写按计划走本机（分离那一槽才走后端）")
         if eng == "sensevoice":
-            # 与改动前逐字一致：文本用 SenseVoice，时间骨架借 whisper small
-            wmodel = stt_mod._get_whisper("small", cfg.get("sttDevice", "auto"))
+            # 文本用 SenseVoice；时间骨架**按需**借（`wmodel=None` → `_fallback_sv_rows` 里
+            # 才去加载，见 `_skeleton_model`）——whisper 权重已从本机删除，
+            # 不该在每场会开始时就去戳一次 HuggingFace。
+            wmodel = None
             sv = stt_mod._get_sensevoice(cfg.get("sttDevice", "auto"))
         elif eng == "qwen3asr":
-            wmodel = stt_mod._get_whisper("small", cfg.get("sttDevice", "auto"))
+            # qwen3asr 的原生句子（ForcedAligner）是主路；whisper 骨架只是它没给句子时的
+            # 兜底 —— 同样**按需**借，借不到就按字数估算（见 assemble）。
+            wmodel = None
             sv = stt_mod._get_qwen3asr(cfg.get("sttDevice", "auto"), eng_model,
                                        forced_aligner="Qwen/Qwen3-ForcedAligner-0.6B")
         elif eng == "sherpa":
@@ -1658,6 +1778,9 @@ def _transcribe_impl(folder):
             wmodel = stt_mod._get_whisper(eng_model, cfg.get("sttDevice", "auto"))
 
     diarize_fail = ""      # 分离失败只记一次：8 段会议连说 8 遍会淹没日志
+    #: 本场是否**已经**用后端做过分离（= 向量空间已锁）。锁上之后本段失败**不再回落本机**：
+    #: 一场会里混两套不可比的嵌入就是"认错人且不报错"（L5）。
+    dia_backend_used = False
     #: 3.0：把"这次每个槽用了谁、跳过了谁、为什么"与时间轴档位**写进 meta.json**。
     #: 设计 §4.4 要求执行计划按会议生成一次并落盘 —— 否则"这次为什么走了本机"
     #: 事后完全查不出来（面板与导出都只能看到一个转写结果）。
@@ -1724,9 +1847,11 @@ def _transcribe_impl(folder):
                     if sentences:
                         seg_rows = [(seg_idx, st, en, txt) for st, en, txt in sentences]
                     else:
-                        seg_rows = _fallback_sv_rows(sv, wmodel, seg_path, seg_idx, seg_min, cfg)
+                        seg_rows = _fallback_sv_rows(sv, wmodel, seg_path, seg_idx, seg_min,
+                                                     cfg, cap_kinds)
                 else:
-                    seg_rows = _fallback_sv_rows(sv, wmodel, seg_path, seg_idx, seg_min, cfg)
+                    seg_rows = _fallback_sv_rows(sv, wmodel, seg_path, seg_idx, seg_min,
+                                                 cfg, cap_kinds)
                 if not seg_rows:
                     # **静默零行是这套流程最贵的失败**：引擎抛异常只 print 到 stderr，
                     # 库里一行不留，事后完全查不出"这场为什么是空的"
@@ -1757,32 +1882,57 @@ def _transcribe_impl(folder):
                 try:
                     # 3.0（step 4）：分离先问能力路由的 `diarize.turns` 槽。
                     # 返回 None 的几种情况都退回**原来那段本机代码**（形状已经归一，见
-                    # `_normalize_diarize`）：本场没有这个槽 / 这一槽按计划归本机 /
-                    # 这一槽失败 / 本场压根没开会话（`cap_session is None` = 没配后端）。
+                    # `_normalize_diarize`）：这一槽按计划归本机 / 这一槽失败 /
+                    # 本场压根没开会话（`cap_session is None` = 没配后端）。
                     # 失败时那条 warn 已经在 `_capability_diarize_segment` 里写过了 ——
                     # 所以这里**不再重复**报错，只是走本机（最坏情况与今天逐字一致）。
                     turns_raw = embs = labels = None
+                    dia_plan = None
                     if cap_session is not None:
                         turns_raw, embs, labels, dia_plan = _capability_diarize_segment(
-                            cap_session, seg_path)
+                            cap_session, seg_path, da_state)
                         if dia_plan:
                             cap_plan = dia_plan
+                            dia_backend_used = True
                     if turns_raw is None:
-                        from app.audio.diarize import diarize_wav_full
-                        turns_raw, embs, labels = diarize_wav_full(seg_path)
-                    label_map = registry.map(embs, labels)
+                        if dia_backend_used:
+                            # ⚠️ **不再回落本机**：本场已经用后端的向量空间标过说话人了，
+                            # 这一段改用本机的空间 = 一场会里混两套不可比的嵌入（L5）——
+                            # 后果是**认错人且不报错**。所以这一段不标说话人，
+                            # 并把"为什么"如实记下来（权威原因词，面板照原样显示）。
+                            _note_diarize_missing(
+                                da_state, _first_reason(cap_session.plan(), "diarize.turns"),
+                                "本场已锁定向量空间 %s，本段不再回落到本机引擎"
+                                % (cap_session.vector_space_id or "?"))
+                        else:
+                            from app.audio.diarize import diarize_wav_full
+                            turns_raw, embs, labels = diarize_wav_full(seg_path)
+                    if turns_raw is None:
+                        # 没拿到任何分离结果：**这段不标说话人**，但整场转写照常往下走
+                        # （文字已经拿到了）。原因在 da_state 里，转写结束时写进 meta。
+                        label_map = {}
+                    else:
+                        # 这一段真的标上了说话人 → 整场的分离结论是"执行了"
+                        da_state.update(executed=True, reason="", detail="", code="",
+                                        retryable=False)
+                        da_state["backendId"] = (
+                            (dia_plan or {}).get("picks", {})
+                            .get("diarize.turns", {}).get("backendId", ""))
+                        label_map = registry.map(embs, labels)
                     key_map = {}
                     for plabel, disp in label_map.items():
                         num = re.sub(r"\D", "", disp)
                         key = "S" + num
                         key_map[plabel] = key
                         speaker_names[key] = disp
-                    turns = [(s, e, key_map[spk]) for s, e, spk in turns_raw]
-                    seg_rows = _assign_speakers(seg_rows, turns)
+                    turns = [(s, e, key_map[spk]) for s, e, spk in turns_raw or ()]
+                    if turns:
+                        seg_rows = _assign_speakers(seg_rows, turns)
                     # 声纹识别：本段每个说话人找常用联系人，整场累计（取相似度最高的一次）
                     # 注意这里不需要"注册"：`diarize.turns` 那一次调用**同时带回了每个说话人
-                    # 的嵌入**（`DiarizeResult.speakers`）—— 声纹用的就是它，与分离同源。
-                    if vp_matcher is not None:
+                    # 的嵌入**（`DiarizeResult.speakers`）—— 声纹用的就是它，与分离同源
+                    # （这正是 L5 要求"说话人这一族同源"的原因：嵌入必须与标签同一次调用）。
+                    if vp_matcher is not None and turns_raw is not None:
                         try:
                             from app import voiceprint
                             for disp, m in voiceprint.identify(embs, labels, label_map,
@@ -1816,6 +1966,11 @@ def _transcribe_impl(folder):
                 except Exception as e:
                     # 分离不可用不能连累整场转写：形状归一在下面统一做。失败原因也落库
                     # （原来只 print 到 stderr，日志里查不到"为什么这场没有说话人"）。
+                    # `absent` = "不在位（本机没装这个能力）" —— 这一条分支绝大多数就是
+                    # 本机没有 pyannote / 没有权重；若能力层已经记过更具体的原因
+                    # （blocked / unsupported…），`_note_diarize_missing` 会保住那条。
+                    _note_diarize_missing(da_state, DIARIZE_LOCAL_MISSING_REASON,
+                                          "%s: %s" % (type(e).__name__, e))
                     if not diarize_fail:
                         diarize_fail = f"{type(e).__name__}: {e}"
                         db.add_log("warn", "meeting",
@@ -1838,8 +1993,27 @@ def _transcribe_impl(folder):
             else:
                 seg_plan = cap_plan or asr_plan
             _apply_capability_meta(meta, seg_plan, cap_kinds)
+            # 分离这一场的结论（成没成、不成是为什么）**每段都落盘**：转写可能中途崩/被
+            # 重启，已完成的段也要留下"这段有没有说话人、为什么没有"。面板读的就是它。
+            meta["diarize"] = dict(da_state)
             with open(os.path.join(folder, "meta.json"), "w", encoding="utf-8") as f:
                 json.dump(meta, f, ensure_ascii=False, indent=2)
+
+    # 分离的最终结论：**没有说话人就必须说得出为什么**（这一条是硬要求 —— 静默产出
+    # "像正常一样却没有说话人"的结果比转写失败更糟：用户以为一切正常）。
+    # 原因词只有一个来源（权威十词），这里不编词、也不改词。
+    if diarize and not da_state.get("executed"):
+        why = da_state.get("reason") or DIARIZE_LOCAL_MISSING_REASON
+        da_state["reason"] = why
+        db.add_log("warn", "meeting",
+                   "%s 说话人分离未执行（reason=%s）：%s"
+                   % (meeting_name, why, da_state.get("detail") or "本场没有说话人"))
+    meta["diarize"] = dict(da_state)
+    try:
+        with open(os.path.join(folder, "meta.json"), "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        db.add_log("warn", "meeting", f"写 meta.json 失败（不影响转写结果）：{e}")
 
     # 声纹识别产物：① 同人说话人键合并（行改标到保留键）；② 留存各说话人平均声纹
     remap = ({"S" + re.sub(r"\D", "", d): "S" + re.sub(r"\D", "", t)
@@ -1852,20 +2026,23 @@ def _transcribe_impl(folder):
     if diarize and registry is not None:
         try:
             from app import voiceprint
-            # 声纹是生物特征：功能关闭时不留存任何样本（默认就是关，见 config.py 注释）。
-            # 关闭态的代价：该场会议之后点「识别本场」需要重新转写（届时再开也一样）。
-            if voiceprint.enabled():
-                emb_map = {}
-                for disp, (vec, cnt) in registry.snapshot().items():
-                    key = "S" + re.sub(r"\D", "", disp)
-                    if remap.get(key, key) != key:
-                        # 该键已被并进别的说话人（行里已经没有它）：别再留"幽灵样本"，
-                        # 否则声纹库里会出现指向不存在说话人的条目。
-                        continue
-                    blob, dim = voiceprint.pack(vec)
-                    emb_map[key] = (blob, dim, cnt)
-                if emb_map:
-                    db.replace_speaker_embeddings(meeting_id, emb_map)
+            # 本场各说话人的平均嵌入（= 本场转写时留存的样本）**一律留存**：
+            # 2026-09-26 概念纠正后，识别是标配，而"入库"的两条路（「改名即入库」与
+            # 「说话人管理 → 声纹入库」）都要用这份留存 —— 不留就等于把用户显式入库的
+            # 路也堵掉了（旧行为：只有开着识别开关才留，见 tests/test_voiceprint.py）。
+            # **隐私边界不变**：它只落本机 `data/echo.db`（`speaker_embeddings` 表，
+            # 跟着会议一起删），不出网；真正进"声纹库"（联系人样本）仍必须由用户主动。
+            emb_map = {}
+            for disp, (vec, cnt) in registry.snapshot().items():
+                key = "S" + re.sub(r"\D", "", disp)
+                if remap.get(key, key) != key:
+                    # 该键已被并进别的说话人（行里已经没有它）：别再留"幽灵样本"，
+                    # 否则声纹库里会出现指向不存在说话人的条目。
+                    continue
+                blob, dim = voiceprint.pack(vec)
+                emb_map[key] = (blob, dim, cnt)
+            if emb_map:
+                db.replace_speaker_embeddings(meeting_id, emb_map)
         except Exception as e:
             db.add_log("warn", "voiceprint", f"留存说话人声纹样本失败：{e}")
 
@@ -3152,7 +3329,8 @@ def _import_cfg():
         "sttLanguage": cfg.get("sttLanguage", "zh"),
         "segmentMinutes": cfg.get("meetingSegmentMinutes", 10),
         "autoSummarize": cfg.get("meetingAutoSummarize", True),
-        "diarize": cfg.get("meetingDiarize", False),
+        # 恒为真（见 start_meeting 里的同一条说明）：分离/声纹是会议的标配环节。
+        "diarize": True,
     }
 
 

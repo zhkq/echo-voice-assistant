@@ -101,7 +101,18 @@ class SharedDefaultsStayWindows(unittest.TestCase):
         import app.config as config
         self.assertEqual(config.DEFAULTS["device"]["value"], "auto")
         self.assertEqual(config.DEFAULTS["sttModel"]["value"], "sensevoice")
-        self.assertEqual(config.DEFAULTS["meetingSttModel"]["value"], "sensevoice")
+        # 2026-09-26 定的新分工：**会议转写 = qwen3asr**（它给原生句级时间轴，档位 exact），
+        # 所以共享基准值从 sensevoice 改成 qwen3asr —— 不是"倒退成 mac 值"。
+        # mac 那条 whisper 默认（small）只声明在 app/platform/darwin/env.py 里，
+        # 一旦被写进共享 DEFAULTS，就是本用例要挡的那类"Mac 默认值漏进 app/"。
+        self.assertEqual(config.DEFAULTS["meetingSttModel"]["value"], "qwen3asr")
+        # 基准值必须落在**共享候选项**里，否则面板选不到当前值（whisper 档退役后尤其容易漏：
+        # 默认值还在写 medium/small 这种已经不在候选里的档）。
+        for key in ("sttModel", "meetingSttModel"):
+            with self.subTest(key=key):
+                self.assertIn(config.DEFAULTS[key]["value"],
+                              config.DEFAULTS[key]["options"],
+                              "共享默认值必须是共享候选项之一（%s）" % key)
 
 
 class MacSupportStaysIsolated(unittest.TestCase):

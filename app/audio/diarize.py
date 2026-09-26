@@ -141,6 +141,15 @@ def _load_pipeline():
             except Exception as e:
                 print("嵌入模型迁移 GPU 失败，保持 CPU:", e, file=os.sys.stderr)
         _pipeline = pipe
+        # 说话人分离（pyannote 三件套）**真的加载了** —— 记一次使用（账本见
+        # app/model_usage.py；清理建议靠它区分"留着不用"与"还在用"）。
+        # 放在这里而不是上面的 `if _pipeline is not None` 早退之前：同一个进程只记一次
+        # 加载；每次实际分离由 `diarize_wav_full()` 再记一次（那是"用了"，这是"装了就用得上"）。
+        try:
+            from app import model_usage
+            model_usage.note_used("pyannote")
+        except Exception:
+            pass
         return _pipeline
 
 
@@ -165,6 +174,12 @@ def diarize_wav_full(path, max_speakers=None):
       labels     ['SPEAKER_00', ...]
     """
     pipe = _load_pipeline()
+    # 每真的分离一次都算一次使用（`_load_pipeline` 那次是"加载"，这里是"用了"）。
+    try:
+        from app import model_usage
+        model_usage.note_used("pyannote")
+    except Exception:
+        pass
     waveform, sr = _read_wav(path)
     file_dict = {"waveform": waveform, "sample_rate": sr, "uri": os.path.basename(path)}
     kwargs = {"num_speakers": max_speakers} if max_speakers else {}

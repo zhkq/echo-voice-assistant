@@ -152,37 +152,91 @@ class MatcherTest(unittest.TestCase):
 
 
 class PrivacyDefaultsTest(unittest.TestCase):
-    """声纹是生物特征：默认必须关闭（opt-in），防止默认值悄悄开始收集样本。"""
+    """2026-09-26 概念纠正：**识别是标配，入库才是用户的选择**。
 
-    def test_voiceprint_is_off_by_default(self):
-        from app.config import DEFAULTS
-        self.assertFalse(DEFAULTS["voiceprintEnabled"]["value"])
-        self.assertFalse(DEFAULTS["voiceprintAutoEnroll"]["value"])
-
-
-class RetentionGateContractTest(unittest.TestCase):
-    """没开声纹就不该留下任何声纹样本（生物特征）——用源码契约钉住这道门。
-
-    背景：转写结束本来是无条件留存各说话人的平均嵌入（便于以后「识别本场」），
-    那等于"开关关了也照样收集"。维护者要求：整块留存必须在 voiceprint.enabled() 之内。
+    隐私敏感的落点是**入库**（把生物特征模板写进本地库），不是识别 ——
+    所以这里钉的是"入库必须默认关"，而不是"整个声纹功能默认关"。
     """
 
-    def test_speaker_embeddings_retention_is_gated(self):
+    def test_enrollment_is_off_by_default(self):
+        from app.config import DEFAULTS
+        self.assertFalse(DEFAULTS["voiceprintAutoEnroll"]["value"],
+                         "「改名即入库」默认必须是关的（生物特征：写库要用户主动）")
+
+    def test_the_recognition_switch_is_gone(self):
+        """识别不再有开关：老键留着兼容读取，但已标成废弃、也不再下发。"""
+        from app.config import DEFAULTS
+        self.assertTrue(DEFAULTS["voiceprintEnabled"].get("deprecated"),
+                        "voiceprintEnabled 必须标成已废弃（识别是标配，没有开关）")
+        self.assertTrue(vp.recognition_available(),
+                        "识别能力恒为真 —— 库为空时静默无结果，零副作用")
+
+
+class EnrollmentIsAlwaysAUserActionTest(unittest.TestCase):
+    """**往声纹库写样本的两条路，都必须由用户主动**（用源码契约钉住这道门）。
+
+    背景：转写结束会无条件留存**本场**各说话人的平均嵌入（`speaker_embeddings`，
+    本地库、跟着会议一起删），好让「声纹入库」按钮用得上 —— 那是本机数据，不是
+    "联系人声纹库"。真正进库（`voiceprints` 表）只有两条路：
+
+      ① 会议里改名为联系人 —— 由 `voiceprintAutoEnroll`（默认关）把门；
+      ② 「说话人管理 → 声纹入库」按钮 / `POST /api/voiceprints/enroll` —— 显式动作。
+
+    旧实现把整块留存包在 `voiceprint.enabled()` 里（识别关着就不留样本），
+    那在今天会把 ② 也堵掉；所以那道门必须**消失**，而 ① 的门必须**还在**。
+    """
+
+    def test_retention_is_not_gated_by_a_recognition_switch(self):
         import ast
 
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         with open(os.path.join(root, "app", "meeting.py"), encoding="utf-8") as f:
-            tree = ast.parse(f.read())
+            src = f.read()
+        tree = ast.parse(src)
         gated = False
         for node in ast.walk(tree):
-            if isinstance(node, ast.If) and "voiceprint.enabled()" in ast.unparse(node.test):
-                if any(isinstance(sub, ast.Call)
-                       and "replace_speaker_embeddings" in ast.unparse(sub.func)
-                       for sub in ast.walk(node)):
+            if isinstance(node, ast.If):
+                test = ast.unparse(node.test)
+                if "enabled()" in test and any(
+                        isinstance(sub, ast.Call)
+                        and "replace_speaker_embeddings" in ast.unparse(sub.func)
+                        for sub in ast.walk(node)):
                     gated = True
-        self.assertTrue(
-            gated,
-            "app/meeting.py 里 db.replace_speaker_embeddings 必须整块位于 voiceprint.enabled() 分支内")
+        self.assertFalse(gated, "留存又被'识别开关'包起来了 —— 那会堵掉用户显式入库的路")
+        self.assertIn("replace_speaker_embeddings", src, "本场样本的留存本身必须还在")
+
+    def test_the_auto_enroll_path_is_gated_by_the_switch(self):
+        """①（改名自动入库）必须看 `auto_enroll()` —— 关着时一个字都不许写库。"""
+        import ast
+
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, "app", "api.py"), encoding="utf-8") as f:
+            tree = ast.parse(f.read())
+        checked = False
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.FunctionDef) or node.name != "speaker_rename":
+                continue
+            for sub in ast.walk(node):
+                if isinstance(sub, ast.Call) and "auto_enroll" in ast.unparse(sub.func):
+                    checked = True
+        self.assertTrue(checked, "改名那条路没看 auto_enroll()：开关就形同虚设")
+
+    def test_the_explicit_path_does_not_look_at_the_switch(self):
+        """②（显式入库）**不许**看那个开关 —— 入库的选择权在用户手里。
+
+        `enroll_from_meeting()`（端点与按钮背后那个函数）里出现 auto_enroll 就等于
+        "关着开关连按钮都点不动"，那是这次要拆掉的东西。
+        """
+        import ast
+
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, "app", "voiceprint.py"), encoding="utf-8") as f:
+            tree = ast.parse(f.read())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name == "enroll_from_meeting":
+                body = ast.unparse(node)
+                self.assertNotIn("auto_enroll", body,
+                                 "显式入库不该被「改名即入库」开关挡住")
 
 
 class IdentifyTest(unittest.TestCase):
@@ -394,19 +448,24 @@ class RecognizeTest(unittest.TestCase):
         self.assertFalse(res["ok"])
         self.assertIn("声纹库为空", res["message"])
 
-    def test_disabled_switch(self):
+    def test_recognition_does_not_depend_on_the_enroll_switch(self):
+        """2026-09-26：识别是标配 —— 库里已经有人就一定认出来，与"要不要入库"无关。
+
+        （原来这条叫 `test_disabled_switch`：`voiceprintEnabled=False` 时识别应当拒绝。
+        那个开关已经废弃了 —— 识别没有开关，所以这条钉的是**反过来的意图**。）
+        """
         self._enroll()
         mid = self._meeting("m5", ["S1"], {"S1": e(0)})
+        from app.config import settings
+        settings.update({"voiceprintAutoEnroll": False})   # 入库关着
+        settings._cache = None
         try:
-            from app.config import settings
-            settings.update({"voiceprintEnabled": False})
             res = vp.recognize_meeting(mid)
-            self.assertFalse(res["ok"])
-            self.assertIn("关闭", res["message"])
+            self.assertTrue(res["ok"], res.get("message"))
+            self.assertEqual(res["renamed"], 1)
         finally:
-            from app.config import settings
-            settings.update({"voiceprintEnabled": True})
-        self.assertTrue(vp.recognize_meeting(mid)["ok"])
+            settings.update({"voiceprintAutoEnroll": True})
+            settings._cache = None
 
 
 if __name__ == "__main__":

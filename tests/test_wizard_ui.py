@@ -50,12 +50,16 @@ class WizardUiWiringTests(unittest.TestCase):
         这条同时钉住两件事：① 新页签不能只加一半；② ``_VIEWS`` 那一行本身还在
         （2026-09-20：它被整行替换掉过，页签点进去什么都不发生）。
         2026-09-25：向导并进常规后不再登记在 ``_VIEWS`` 里（它是一张卡，不是页签）。
+        2026-09-26：IA 重构（配置分三类 + 一个历史位）后顶层是 6 个：仪表盘 /
+        ECHO 通用 / 业务配置 / 能力与智能体 / 历史 / 会议记录。
         """
         m = re.search(r"const _VIEWS = \[(.*?)\]", self.js, re.S)
         self.assertIsNotNone(m, "找不到 _VIEWS 声明 —— 它必须存在且只有一处")
         views = re.findall(r'"([a-z]+)"', m.group(1))
-        self.assertNotIn("wizard", views, "向导已并进「常规」，不该再是顶层页签")
-        self.assertEqual(len(views), 7, "整合后顶层是 7 个页签：%s" % views)
+        self.assertNotIn("wizard", views, "向导已并进「ECHO 通用」，不该再是顶层页签")
+        self.assertEqual(len(views), 6, "IA 重构后顶层是 6 个页签：%s" % views)
+        for name in ("general", "business", "capability", "history", "meetings"):
+            self.assertIn(name, views, "配置三类的页签 id 不能改名：%s" % name)
         for name in views:
             self.assertIn('id="view-%s"' % name, self.html,
                           "页签 %s 没有对应的 #view-%s 容器" % (name, name))

@@ -107,7 +107,8 @@ class CollapsibleCardWiringTests(unittest.TestCase):
     def test_static_collapsible_card_is_wired(self):
         self.assertIn('class="card collapsible"', self.html)
         self.assertIn('data-collapse-id="boot-logs"', self.html)
-        m = re.search(r'<div class="card collapsible"[^>]*data-collapse-id="boot-logs">(.*?)<div class="card-body">',
+        # 属性可能换行排（2026-09-26 给这张卡加了 data-collapse-default="closed"）
+        m = re.search(r'<div class="card collapsible"[^>]*data-collapse-id="boot-logs"[^>]*>(.*?)<div class="card-body">',
                       self.html, re.S)
         self.assertIsNotNone(m, "找不到启动日志卡的标题块")
         self.assertIn('class="set-arrow"', m.group(1), "标题里要有折叠箭头（与设置页卡片同一套视觉）")
@@ -131,10 +132,11 @@ class CollapsibleCardWiringTests(unittest.TestCase):
                       'class="mcard${cls} collapsible"'):
             with self.subTest(token=token):
                 self.assertIn(token, self.js)
-        # 动态卡片每次重绘后都要重新应用折叠状态（id 从 view-capabilities 改名为 view-capability）
+        # 动态卡片每次重绘后都要重新应用折叠状态
+        # （2026-09-26 IA 重构：四个设置页签 → 三个，id 从 voice/agent 变成 business/capability）
         self.assertIn('applyCollapsedCards($("#view-capability"))', self.js)
-        self.assertIn('["#view-general", "#view-voice", "#view-agent", "#view-capability"]', self.js,
-                      "四个设置页签的卡片都要重新应用折叠状态")
+        self.assertIn('["#view-general", "#view-business", "#view-capability"]', self.js,
+                      "三个设置页签的卡片都要重新应用折叠状态")
 
     def test_capability_top_buttons_are_compact(self):
         """顶部「下载缺失 / 刷新」要短、用 mini、同行不换行（用户实测反馈）。"""

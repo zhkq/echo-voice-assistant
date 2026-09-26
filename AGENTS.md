@@ -28,6 +28,25 @@
   —— 它会把自启动指回仓库（这正是被替换掉的那个耦合）。
 - 现状以 `scripts\switch-instance.ps1 -Status` 与 `GET /api/status` 为准，不要凭记忆。
 
+### PowerShell 5.1 的 Get-Content/Set-Content 往返会**毁掉 UTF-8 中文文件**（2026-09-26 事故）
+
+- **症状**：`(Get-Content x -Raw) -replace ... | Set-Content x -Encoding UTF8` 之后，文件里每个汉字都变成
+  `鎺у埗闈㈡澘` 这种**双编码乱码**（还平白多出 BOM）。当时一口气毁掉了 `web/app.js`
+  （5308 行 / 28 万字节）——它**没有干净副本**（工作树里还压着上一个 agent 未提交的改动，
+  git 里只有更旧的版本）。
+- **真因**：`pwsh` 工具在这台机器上跑的是 **Windows PowerShell 5.1**，`Get-Content`/`Set-Content`
+  默认按 **ANSI（cp936）**读写；UTF-8 文件先被按 GBK 解码、再按 UTF-8 编码写回 = 双编码。
+  ASCII 一个字节没变，所以"看着还能跑"，但中文全废、`git diff` 也读不出人话。
+- **铁律**：**改仓库里的文本文件只用 `edit`/`write` 工具或 Python（显式 `encoding="utf-8"`）**；
+  绝不用 PowerShell 的 `Get-Content | Set-Content` 做"读—改—写"。要批量替换就写一小段 Python。
+  含中文的 `.ps1` 必须保 BOM 或改成 ASCII 注释（5.1 按 ANSI 解析会直接语法报错，
+  本轮也踩了：`dist/_shot.ps1` 里一句中文注释就让整个脚本解析失败）。
+- **万一还是毁了**：DSH 会话记录 `~/.dsh/sessions/<cwd 名>/<session-id>/session.v4.jsonl.zstd`
+  里有**每一次 edit 的 old_string/new_string**（用 `zstandard` 解压、按行 `json.loads`，
+  参数可能是 JSON 字符串、要再解一层）。救援配方：`git show HEAD:<file>` 打底 → 按时间顺序重放
+  各会话的 edit → 判据用**纯 ASCII 行逐行比对**（坏文件只坏了非 ASCII，纯 ASCII 行必须一字不差；
+  本轮 3561 行全中，据此确认救回的就是原文件）。
+
 ### 重启/杀掉 ECHO 之前必须先看有没有正在录音的会议（2026-09-23 事故）
 
 - **事故**：为了改代码重启 ECHO，把用户**正在录的会议**打断了。ECHO 自己处理得很诚实 ——

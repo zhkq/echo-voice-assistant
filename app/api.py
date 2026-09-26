@@ -128,6 +128,18 @@ class ModelDownloadIn(BaseModel):
     force: bool = False      # 已就绪时只有 force=True 才重下（界面上的「重新下载」）
 
 
+class ModelCleanupIn(BaseModel):
+    """清理请求：**必须点名**（先预览、后确认）。`days` 省略时用设置 `modelCleanupDays`。"""
+    ids: list = []
+    days: int = 0
+
+
+class ModelPinIn(BaseModel):
+    """「保留」钉子：钉住 = 永久不列入清理建议。"""
+    id: str
+    pinned: bool = True
+
+
 class WorklogIn(BaseModel):
     # 面板「归档要求」自由文本；旧字段名 project 继续兼容（同一个语义位置）
     archive_hint: str = ""
@@ -498,9 +510,40 @@ def get_models(_auth=Depends(optional_auth)):
     """模型清单：每个功能需要哪些模型、多大、装到哪、怎么获取，以及本地就绪状态与下载进度。
 
     只读检测 + 任务状态（app/modelinfo.py），GET 不会触发任何下载；面板「设置 → 模型」据此渲染。
+    2026-09-26 起每项还带**使用情况**（`lastUsedAt` / `useCount` / `pinned` / `inUse`）——
+    它是「本地能力」区"默认展开哪些"与「清理」卡"哪些不许删"的唯一判据（见 app/model_usage.py）。
     """
     from app import modelinfo
     return {"items": modelinfo.inventory(), "jobs": modelinfo.jobs()}
+
+
+@router.get("/models/cleanup/preview")
+def get_model_cleanup_preview(days: int = 0, _auth=Depends(optional_auth)):
+    """清理**预览**：每项的名称/占用/上次使用/是否在用 + 建议删哪些。**一个字节都不动盘。**
+
+    `days` 省略（0）时用设置 `modelCleanupDays`（出厂 90 天）。
+    """
+    from app import model_cleanup
+    return model_cleanup.preview(days=days or None)
+
+
+@router.post("/models/cleanup")
+def post_model_cleanup(body: ModelCleanupIn, _auth=Depends(optional_auth)):
+    """按点名删除模型（**先预览、后确认**的那一步）。
+
+    只删 `body.ids` 里点名的那些，并且**每一项都重新过一遍保护判据**（在用 / 保留钉子 /
+    当前配置选中的一律拒绝，原因如实回）。回报里带每个模型释放的精确字节数与失败原因 ——
+    "删了什么、释放多少"不许含糊（用户要求如实回报）。
+    """
+    from app import model_cleanup
+    return model_cleanup.execute(body.ids, days=body.days or None)
+
+
+@router.post("/models/pin")
+def post_model_pin(body: ModelPinIn, _auth=Depends(optional_auth)):
+    """给模型打/摘「保留」钉子（永久不列入清理建议）。"""
+    from app import model_cleanup
+    return model_cleanup.pin(body.id, pinned=bool(body.pinned))
 
 
 @router.post("/models/download")
@@ -1020,7 +1063,7 @@ def get_meeting(mid: int, _auth=Depends(optional_auth)):
     from app import capability_admin
     meta = meeting.meeting_meta(detail["name"])
     detail["capability"] = capability_admin.plan_summary(
-        meta.get("capability"), meta.get("timestampsKinds"))
+        meta.get("capability"), meta.get("timestampsKinds"), meta.get("diarize"))
     return detail
 
 
@@ -1080,7 +1123,12 @@ def clean_short_meetings(body: CleanShortIn, _auth=Depends(optional_auth)):
 
 @router.post("/meetings/{mid}/speaker/rename")
 def speaker_rename(mid: int, body: SpeakerRenameIn, _auth=Depends(optional_auth)):
-    """说话人改名；改名为联系人（非默认名）时按设置自动把声纹入库。"""
+    """说话人改名；改名为联系人（非默认名）时按「改名即入库」开关自动把声纹入库。
+
+    2026-09-26 概念纠正：**识别是标配**（没有开关），所以这里唯一看的是
+    `voiceprintAutoEnroll`（默认关）—— 关着时**绝不**自动写库，用户要入库就点
+    「说话人管理」里的「声纹入库」按钮（`POST /voiceprints/enroll`）。
+    """
     m = db.get_meeting(mid)
     if not m:
         raise HTTPException(status_code=404, detail="会议不存在")
@@ -1088,7 +1136,7 @@ def speaker_rename(mid: int, body: SpeakerRenameIn, _auth=Depends(optional_auth)
     msg = ""
     try:
         from app import voiceprint
-        if (voiceprint.enabled() and voiceprint.auto_enroll()
+        if (voiceprint.auto_enroll()
                 and not voiceprint.is_default_name(body.name, body.label)):
             _ok, msg = voiceprint.enroll_from_meeting(mid, body.label, body.name)
     except Exception as e:
@@ -1482,21 +1530,30 @@ def api_provider_config(_auth=Depends(optional_auth)):
 
 
 # ---------------------------------------------------------------- 声纹库（常用联系人）
-# 会议里把说话人改名为联系人即自动入库（voiceprintAutoEnroll）；
+# 入库两条路，都要用户主动：① 会议里把说话人改名为联系人（需开 voiceprintAutoEnroll）；
+# ② 「说话人管理」里的「声纹入库」按钮（POST /voiceprints/enroll，**与开关无关**）。
+# **识别（认人）没有开关**：会议转写一定会拿库里的样本比对（库空则静默无结果）。
 # 库里的样本可在面板「说话人管理」查看/删除，这里是对应的 REST 入口。
 #
-# 返回约定：**业务性失败**（库里没有这个联系人、会议没有声纹样本、开关没开…）一律
+# 隐私边界：样本只落在本机 `data/echo.db`（`voiceprints` 表），不出网。
+#
+# 返回约定：**业务性失败**（库里没有这个联系人、会议没有声纹样本…）一律
 # `HTTP 200 + {"ok": false, "message": "人话原因"}`，与既有的 /api/meeting/start|stop、
 # /api/models/download 等端点保持一致（面板/手机 App/技能都按 ok 字段判成败）；
 # 只有参数校验、鉴权这类框架级错误才走 4xx（FastAPI 校验 422 / optional_auth 的 401）。
 
 @router.get("/voiceprints")
 def get_voiceprints(_auth=Depends(optional_auth)):
-    """声纹库：联系人 + 样本列表 + 当前生效参数（面板「说话人管理」渲染）。"""
+    """声纹库：联系人 + 样本列表 + 当前生效参数（面板「说话人管理」渲染）。
+
+    `enabled` 是**恒为真**的兼容字段：识别是标配（2026-09-26）。老面板读它，
+    保留是为了不把"面板以为识别被关了"这种假象造出来；新页面改用 `autoEnroll` 说话。
+    """
     from app import voiceprint
     thr, margin = voiceprint.thresholds()
     stats = voiceprint.library_stats()
-    return {"items": voiceprint.library_view(), "enabled": voiceprint.enabled(),
+    return {"items": voiceprint.library_view(),
+            "enabled": voiceprint.recognition_available(),
             "autoEnroll": voiceprint.auto_enroll(), "threshold": thr, "margin": margin,
             "contacts": stats["contacts"], "total": stats["samples"]}
 

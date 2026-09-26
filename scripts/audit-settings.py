@@ -101,9 +101,13 @@ ACK_INDIRECT = {
     # 能力路由（3.0）：槽 → 设置键的映射在 router._setting_key_for() 里，
     # 调用点拿到的是映射出来的**键名变量**（`self._get(_setting_key_for(slot))`），
     # 所以扫描看不见字面量。映射本身在 router.py 的 _setting_key_for()。
-    "capabilityMeetingAsrBackend": "app/capabilities/router.py:_setting_key_for() 映射读（asr.text/timestamps 用哪个后端）",
-    "capabilityDiarizeBackend": "app/capabilities/router.py:_setting_key_for() 映射读（说话人分离用哪个后端）",
-    "capabilityEmbedBackend": "app/capabilities/router.py:_setting_key_for() 映射读（声纹提取用哪个后端）",
+    #
+    # ⚠ capabilityMeetingAsrBackend / capabilityDiarizeBackend / capabilityEmbedBackend
+    # **不在这里**（2026-09-26）：面板新增了「会议能力通道」那一块，`web/app.js` 的
+    # `friendlyOption()` 按**键名**给这三个后端取值出中文名（`key === "capabilityDiarizeBackend"`）。
+    # 面板那一处是**直接**读，`verdict()` 的优先级里 direct 面板读压过 app 间接读，
+    # 于是这三项判成 PANEL-READ —— 名单也要跟着搬（见 `ACK_PANEL`）。
+    # 这正是这份名单的防腐机制：判据变了就搬位置，而不是两边都留着。
     # capabilityPrivacy **已经不在这里**（2026-09-24）：闸报"已不再是间接读，请从名单里删掉"。
     # 原因是它现在有一处**直接字面量**读法（app/capability_admin.py 的 `_setting("capabilityPrivacy")`），
     # 扫描看得见了。这正是这份名单的防腐机制在起作用 —— 名单里多留一项 = 掩护一处真的漏读。
@@ -117,6 +121,19 @@ ACK_INDIRECT = {
 #: 唯一消费方是面板 UI 的项（面板读它来改变自己的行为，app/ 不需要读）。
 ACK_PANEL = {
     "panelAutoRefresh": "web/app.js 的 _panelRefreshSeconds()：仪表盘/启动页/路由页的轮询间隔",
+    # 会议能力通道那 3 项（2026-09-26）：面板按**键名**给后端取值出中文名
+    # （`friendlyOption()` 的 `key === "capability…Backend"` 那两支）。
+    # 它们**同时**被 app/ 间接读 —— `app/capabilities/router.py:_setting_key_for()`
+    # 把槽映射成键名变量再 `settings.get()`，扫描看不见那个字面量。
+    # 但面板这一处是**直接**读，`verdict()` 里 direct 面板读优先，所以判 PANEL-READ、
+    # 登记在这里。**下一个人注意**：这三项不是"只有面板在读"，
+    # 真消费方仍是路由（`ACK_INDIRECT` 顶上那段注释记着这件事）。
+    "capabilityMeetingAsrBackend": "web/app.js:friendlyOption() 出「ECHO 后端/本机/网络服务商」中文名；"
+                                   "app 侧见 router._setting_key_for()（asr.text / asr.timestamps 用哪个后端）",
+    "capabilityDiarizeBackend": "web/app.js:friendlyOption() 出「自动/ECHO 后端/本机」中文名；"
+                                "app 侧见 router._setting_key_for()（说话人分离用哪个后端）",
+    "capabilityEmbedBackend": "web/app.js:friendlyOption() 出「自动/ECHO 后端/本机」中文名；"
+                              "app 侧见 router._setting_key_for()（说话人嵌入用哪个后端）",
 }
 
 

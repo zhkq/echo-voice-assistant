@@ -662,8 +662,9 @@ class PanelWiringTests(unittest.TestCase):
     def test_capability_page_is_a_first_level_tab_and_loaded(self):
         self.assertIn('data-view="capability"', self.html)
         self.assertIn('id="view-capability"', self.html)
-        self.assertIn('if (view === "capability") { loadSettings(); loadCapabilities(); }', self.js,
-                      "切到能力后端页签时必须加载（否则页面永远空白）")
+        # 2026-09-26 IA 重构：这一页叫「能力与智能体」，切过去要连路由卡一起刷新
+        self.assertIn('if (view === "capability") { loadSettings(); loadCapabilities(); loadRouter(); }',
+                      self.js, "切到「能力与智能体」页签时必须加载（否则页面永远空白）")
         # 两个旧页签已合并进来，不该再有各自的挂载点/分发
         for gone in ('data-view="models"', 'data-view="components"',
                      'id="providersHost"', 'id="componentsHost"'):

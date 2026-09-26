@@ -31,7 +31,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import app.db as db                                          # noqa: E402
 from app import paths                                        # noqa: E402
 from app.config import (DEFAULT_MIGRATIONS, DEFAULTS,        # noqa: E402
-                        Settings, settings)
+                        Settings, platform_options, settings)
 
 _TEMPLATE = {"dir": None, "db": None, "old": None}
 
@@ -289,7 +289,26 @@ class FreshSettingsInstanceTests(SeededConfigTestCase):
         settings.update({"sttModel": "medium", "meetingsDir": "D:\\会议"})
         other = Settings()
         self.assertIsNone(other._cache, "别在构造时就缓存（配置可能在别处被改）")
-        self.assertEqual(other.get("sttModel"), "medium")
+        # `medium` 是**老库里的 whisper 档**。2026-09-26 起 Windows 上 whisper 各档已退役
+        # （权重删了、候选项只剩 sherpa/sensevoice/qwen3asr），所以这个值**不该**逐字读出来：
+        # 那样老装机每次说话都会卡在加载一个不存在的模型上。本用例的意图是"老配置值仍能读出来、
+        # 不崩、并如实折算到本平台仍提供的引擎"（指令兜底 = sherpa），不是"逐字保留 medium"。
+        #
+        # 判据按"本平台提不提供该档"写，不按"这台机器现在恰好有没有那份权重"：
+        # mac 的候选项里**仍然有** whisper 档（app/platform/darwin/env.py 显式声明，那边
+        # whisper 是真能跑的引擎）→ 它必须一个字都不折。
+        offered = [str(o) for o in platform_options(
+            "sttModel", DEFAULTS["sttModel"].get("options", []))]
+        if "medium" in offered:
+            self.assertEqual(other.get("sttModel"), "medium",
+                             "本平台仍提供该档 → 一个字都不许折（RETIRED_VALUE_FALLBACKS 的判据）")
+        else:
+            self.assertEqual(other.get("sttModel"), "sherpa",
+                             "whisper 档已退役 → 折成指令兜底 sherpa")
+        self.assertEqual(other.get("sttModel"), settings.get("sttModel"),
+                         "重启等价：新实例与旧实例必须读出同一个值")
+        self.assertEqual(db.get_setting("sttModel"), "medium",
+                         "折算只发生在读时：库里的原值一个字都不动（用户没动手，我们不改他的库）")
         self.assertEqual(other.get("meetingsDir"),
                          os.path.normpath(os.path.join("D:\\", "会议"))
                          if os.name == "nt" else "D:\\会议")

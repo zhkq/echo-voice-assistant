@@ -30,6 +30,14 @@ PLATFORM_DEFAULTS = {
     "settingOptions": {
         # 离线朗读在 macOS 上是 say，不是 Windows 的 SAPI
         "ttsEngine": ["auto", "edge-tts", "say", "off"],
+        # **whisper 档在 macOS 上仍然提供**（2026-09-26）：Windows 那边已经把
+        # faster-whisper 权重删掉、并从基准候选项里退役了 whisper（新分工见
+        # app/config.py 的 RETIRED_VALUE_FALLBACKS），但 mac 的精简依赖
+        # （mac/requirements-mac.txt）不含 funasr —— whisper 是这台机器上**真能用**的引擎，
+        # 声明在这里才不会让面板的下拉里少掉它（那会让 mac 用户选不到能跑的档，
+        # 也会把"老库里的 whisper 值"误折成别的引擎）。
+        "sttModel": ["tiny", "base", "small", "medium", "large", "sherpa", "sensevoice"],
+        "meetingSttModel": ["small", "medium", "large", "sherpa", "sensevoice"],
     },
 }
 
