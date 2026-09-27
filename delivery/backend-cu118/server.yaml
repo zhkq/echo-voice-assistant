@@ -1,0 +1,46 @@
+# ECHO 能力后端（**老卡 / cu118**）—— 容器里生效的那份配置。
+#
+# 为什么要有这个文件：**`models.specs` 没有环境变量**（要改只能挂一份配置 + `--config`）。
+# compose.yaml 已经把它挂到 /etc/echo/server.yaml 并加了 `--config`，你不用手动传。
+#
+# 这份文件**只写"必须按这张卡定"的项**，其余全部仍走内置默认值 + 环境变量。
+# 优先级：内置默认值 < 这份文件 < 环境变量（server/settings.py:load）。
+# ⚠️ `models.specs` 是**整列表替换**：写了几档就只剩几档。
+server:
+  # 显存预算：超预算时服务端**拒绝**（gpu_oom）而不是 OOM，也绝不回退 CPU。
+  # 0 = 不限（出厂值）。**按卡校准**：
+  #   * 8 GB 卡（GTX 1070 / 1080、P4…）：7000 是个保守起点（桌面/显示要留 ~1 GB）；
+  #   * 4 GB 卡：3500 左右；
+  #   * 大卡（P40 24 GB / V100 32 GB）：可以给 20000。
+  # SenseVoice 权重只有 ~900 MB，所以这里的数不会成为转写的瓶颈 ——
+  # 但**首次加载的峰值**要用 /v1/health 的 vram.usedMb 看过再定稿（见 先读我.md §9）。
+  vram_budget_mb: 7000
+models:
+  # cuda | cpu。**要 cuda 而看不到 CUDA 时直接失败**，绝不回退 CPU ——
+  # 服务端一旦回退会把所有客户端一起拖慢，而且从指标上看不出原因。
+  # 老卡上这一条尤其重要：cu126 的镜像在这里会直接起不来（那正是我们要的响亮失败）。
+  device: cuda
+  specs:
+    # ---- 转写：**只有 SenseVoice** ----
+    # 为什么不是默认的 qwen3asr：① 本变体的镜像里**没有装 qwen-asr**（cu118 那一层只装
+    # funasr，装 pyannote/qwen-asr 会把 torch 2.7.1 顶掉、这块卡就废了）；② 这块卡
+    # **没有 bf16**（bf16 要 sm_80+），而 qwen3asr 那条加载路径写死按 bf16 请求
+    # （app/audio/stt.py:342）。详见 先读我.md §1。
+    - id: asr-long
+      slot: asr.long
+      impl: sensevoice
+      resident: false
+      max_concurrency: 1
+      # ⚠️ **占位估算**：跑一段真音频后按 /v1/health 的 vram.usedMb 校准，再把实测值写回来。
+      est_vram_mb: 1200
+      modelVersion: sensevoice-small
+      # 注意：**没有** asr.timestamps —— SenseVoice 不给句级时间戳，服务端**不编**
+      # estimated 时间戳（会议时间轴由客户端按字数均摊并如实标为估算）。
+      supports: [asr.text]
+    # ---- 刻意没有 diarize / speaker-embed 两档 ----
+    # 镜像里没有 pyannote.audio：4.x 要求 torch>=2.8，而带 Pascal(sm_61) 的 torch 最高
+    # 只到 2.7.1+cu118；退回 3.4.0 又没有 app/audio/diarize.py 要用的 `plda=` 形参
+    # （2026-09-28 在 GTX 1070 上实测）。所以这两档在这里**不宣告** ——
+    # 宣告一个必然 model_failed 的槽，与"缺强制对齐器却宣告 asr.timestamps"是同一种假话。
+    # 客户端侧的表现是**诚实的降级**：显示「说话人分离未执行：<真原因>」并照常出文字。
+    # 确实需要分离/声纹：换 sm_75 及以上的卡，用 cu126 那个包。

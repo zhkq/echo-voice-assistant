@@ -1,0 +1,106 @@
+# ECHO 能力后端 —— 新卡（cu126）交付包的编排。**自包含：不依赖仓库。**
+#
+# 用法（就在本目录里跑）：
+#     cp .env.example .env         # 填 ECHO_JWT_SECRET（openssl rand -hex 32）与卷路径
+#     docker compose up -d         # 镜像已在本地就直接起；没有镜像会按下面的 build 段现场构建
+#     docker compose logs -f backend
+#
+# 镜像 tag = echo-backend:0.1.0-cu126（也可用 .env 里的 ECHO_IMAGE 指向内网 registry）。
+#
+# 三个刻意的选择（理由详见 先读我.md）：
+#   * `read_only: true` —— 根文件系统只读：程序想往磁盘写东西会**直接报错**，
+#     而不是静默发生。可写的地方只有下面那两个卷 + /tmp（tmpfs）。
+#   * `8900` 发布到**所有网卡**（客户端要连它）；`8901` **只发布到宿主回环**。
+#   * 模型**只读**挂载；tmp / state 两个卷的保留策略是**相反**的，别合并（见下）。
+#
+# ⚠️ 管理面（8901）这两行是配套的，少一个都白搭：
+#   容器里必须绑 `0.0.0.0:8901` —— 绑 127.0.0.1 只对**容器自己的**回环生效，
+#   宿主（以及 `ssh -L` 隧道）根本连不上，那就是"配了管理面却进不去"。
+#   而实际可达范围由这里这行 `127.0.0.1:8901:8901` 决定：只有能登宿主回环的人进得去。
+#   所以**别**把它改成 `"8901:8901"`（那等于把管理面摊给整个网段）。
+#   启动日志里那句"管理面监听在 0.0.0.0:8901（不是回环）"的告警因此是**预期**的，别去消它。
+services:
+  backend:
+    # 现场构建这条路用的参数。新卡走 cu126（Turing 及以后：sm_75+）。
+    # ⚠️ 老卡（sm_<=7.0）**必须**换 cu118 的包 —— CUDA 13.x 只支持 sm_75+，
+    #    而 PyTorch 2.15 起连 CUDA 12.6 的 wheel 都不再发布（Maxwell/Pascal/Volta 一起被丢下）。
+    #    本包是 cu126，**别把它装到 Pascal/Volta 上**：会得到一个"看不到这块卡"的 torch。
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+      args:
+        # "1" 才装 torch / funasr / qwen-asr / transformers / pyannote.audio 那一组。
+        # 不装的话转写与说话人分离一律如实报 model_failed（那不是在跑模型）。
+        ECHO_EXTRA: "1"
+        ECHO_TORCH_INDEX: "https://download.pytorch.org/whl/cu126"
+        # 普通依赖的 pip 源（**torch 不走它**）。国内构建慢（实测 PyPI 只有一二百 kB/s、
+        # 清华镜像 26 MB/s）就把下面这行的注释打开：
+        # ECHO_PIP_INDEX: "https://pypi.tuna.tsinghua.edu.cn/simple"
+    # 内网 registry：在 .env 里写 ECHO_IMAGE=<registry>/echo-backend:0.1.0-cu126。
+    # ⚠️ tag 必须与本地实际有的那个一致 —— 否则 compose 会以为"没有镜像"而转去现场构建。
+    image: ${ECHO_IMAGE:-echo-backend:0.1.0-cu126}
+    container_name: echo-backend
+    restart: unless-stopped
+    ports:
+      - "8900:8900"                # 能力面：客户端要连
+      - "127.0.0.1:8901:8901"      # 管理面：**只发布到宿主回环**（见文件头）
+    environment:
+      ECHO_SERVER_ID: "${ECHO_SERVER_ID:-gpu-01}"
+      ECHO_LISTEN: "0.0.0.0:8900"
+      # 管理面在容器里**必须**绑通配，否则宿主进不来（暴露范围由上面那行端口映射决定）
+      ECHO_ADMIN_LISTEN: "0.0.0.0:8901"
+      ECHO_MODELS_ROOT: "${ECHO_MODELS_ROOT:-/opt/echo/models}"
+      ECHO_TMP_ROOT: "${ECHO_TMP_ROOT:-/var/echo/tmp}"
+      ECHO_STATE_ROOT: "${ECHO_STATE_ROOT:-/var/echo/state}"
+      # 总通道数 2、每客户端 1（出厂值）。**按卡校准**：8 GB 卡上两路长音频会互相挤显存。
+      ECHO_MAX_CONCURRENT: "${ECHO_MAX_CONCURRENT:-2}"
+      # 鉴权：一上网就必须打开（不打开 = 谁连上谁能用这块 GPU）。
+      # ⚠️ 打开鉴权就**必须**同时配好 ECHO_JWT_SECRET：只开前两项时服务照常起、
+      #    /v1/health 照常 200，但客户端"配对成功"之后 POST /v1/token 回
+      #    503 auth_misconfigured —— 看着像客户端坏了，其实是服务端少一项配置。
+      #    所以下面那行用 `${...:?}`：没配就**直接报错退出**，不静默起一个不鉴权的服务。
+      ECHO_AUTH_ENABLED: "${ECHO_AUTH_ENABLED:-true}"
+      ECHO_AUTH_MODE: "${ECHO_AUTH_MODE:-jwt}"
+      ECHO_JWT_SECRET: "${ECHO_JWT_SECRET:?没配 —— 先 openssl rand -hex 32，把结果写进 .env 的 ECHO_JWT_SECRET}"
+    # models.specs（要加载哪几个模型）**没有环境变量**，只能挂一份配置 + `--config`。
+    # 这份 server.yaml 就是本变体的"该加载哪些模型"清单（qwen3asr + 强制对齐器 + pyannote）。
+    # 不挂它的话容器会退回出厂默认清单 —— 那在老卡上是宣告一堆永远 model_failed 的槽。
+    command: ["python", "-m", "server.main", "--config", "/etc/echo/server.yaml"]
+    volumes:
+      # 模型：只读挂进来（几 GB，不该跟着镜像走）。目录布局见 先读我.md §4。
+      - ${ECHO_HOST_MODELS_DIR:-/srv/echo/models}:${ECHO_MODELS_ROOT:-/opt/echo/models}:ro
+      # 临时文件：丢了没关系，甚至可以换成 tmpfs
+      - ${ECHO_HOST_TMP_DIR:-/srv/echo/tmp}:${ECHO_TMP_ROOT:-/var/echo/tmp}
+      # **耐久**状态：鉴权库（客户端凭据 / 配对码 / 审计）。别换 tmpfs、别和上面那个合并，
+      # 丢了就要把所有客户端重新配对一遍。
+      - ${ECHO_HOST_STATE_DIR:-/srv/echo/state}:${ECHO_STATE_ROOT:-/var/echo/state}
+      # 本变体的配置（显存预算 + 模型清单）
+      - ./server.yaml:/etc/echo/server.yaml:ro
+    read_only: true
+    tmpfs:
+      - /tmp:size=512m,mode=1777
+    # GPU 直通：宿主装好 NVIDIA 驱动 + nvidia-container-toolkit 后即可用。
+    # 少了 toolkit，`up` 会报 could not select device driver "" with capabilities: [[gpu]]。
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    # 探针打的是**容器自己的** 127.0.0.1:8900（/v1/health 免鉴权）。
+    # ⚠️ 容器里启用 TLS 时（挂一份配了 server.tls 的配置）这个探针必须换成 https ——
+    #    否则容器会一直显示 unhealthy 而服务其实是好的。scheme 因此走一个**编排层变量**
+    #    `ECHO_HEALTH_SCHEME`（compose 插值用，**不是**容器里的运行时配置，所以不在
+    #    environment: 里，settings.py 也不读它）：用 TLS 时在 .env 里写 https。
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import ssl,urllib.request,sys; s='${ECHO_HEALTH_SCHEME:-http}'; ctx=ssl._create_unverified_context() if s=='https' else None; sys.exit(0 if urllib.request.urlopen(s+'://127.0.0.1:8900/v1/health', timeout=4, context=ctx).status == 200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 60s
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"

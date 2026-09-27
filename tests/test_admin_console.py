@@ -571,6 +571,52 @@ class WriteGuardTests(_AdminCase):
         self.assertEqual(self.audit_rows(), [])
 
 
+class WildcardAdminListenWriteTests(_AdminCase):
+    """管理面绑**通配地址**时（容器里必须这样，见 `server/compose.yaml`），同站判定仍要过。
+
+    容器方案的全部前提就是这一条：进程绑 `0.0.0.0:8901`（绑回环的话宿主与 `ssh -L`
+    都进不来），而浏览器访问的是 `http://127.0.0.1:8901`。如果 `allowed_origins()`
+    依赖 `admin_listen` 的**字面 host**，这里就会 403 —— 而现象是
+    "管理页面能打开、一按按钮就失败"，很难联想到是监听地址写法的问题。
+
+    同时钉住反面：通配监听**不许**把白名单放宽成"谁的 Origin 都收"（那才是真正的
+    安全削弱），这一点由 `Origin: http://gpu-01:8901` 与 `http://evil.example:8901`
+    两条实测挡住。
+    """
+
+    def setUp(self):
+        super().setUp()
+        # 与容器里等价：`ECHO_ADMIN_LISTEN=0.0.0.0:8901`（写配置 / 写环境变量是同一件事）
+        self.cfg.raw["server"]["admin_listen"] = "0.0.0.0:8901"
+
+    def test_a_write_with_the_loopback_origin_goes_through(self):
+        self.login()
+        r = self.ac.post("/admin/api/pairing-codes",
+                         json={"name": "容器里发的授权", "scopes": "asr"},
+                         headers=self.wheaders())
+        self.assertEqual(r.status_code, 200, r.text)
+        code = (r.json().get("pairingCode") or {}).get("url") or ""
+        self.assertIn("echo://pair?", code)
+        self.assertIn("issue-pairing-code", [a for _who, a, _t in self.audit_rows()],
+                      "写动作必须留下一条审计（操作者是登录的管理员名）")
+
+    def test_the_wildcard_listen_does_not_widen_the_origin_whitelist(self):
+        self.login()
+        for origin in ("http://evil.example:8901",     # DNS-rebinding 的正面拦截
+                       "http://gpu-01:8901",           # 本机真实网卡地址，**不是**回环
+                       "http://127.0.0.1:9999"):       # 同主机、别的端口
+            with self.subTest(origin=origin):
+                r = self.ac.post("/admin/api/pairing-codes", json={"name": "x"},
+                                 headers=self.wheaders(origin=origin))
+                self.assertEqual(r.status_code, 403, r.text)
+                self.assertIn("Origin", r.json()["detail"])
+
+    def test_the_login_page_is_reachable_and_still_needs_a_login(self):
+        """页面本身公开（否则没法登录），但数据端点照旧 401。"""
+        self.assertEqual(self.ac.get("/admin/").status_code, 200)
+        self.assertEqual(self.ac.get("/admin/api/overview").status_code, 401)
+
+
 class ReadOnlyNotLockedTests(_AdminCase):
     """**只读那半边不许被一起锁死**（第八条要求）。
 

@@ -8,6 +8,23 @@
 #   * `queue_max=0` 写死在环境里 —— 通道满了直接拒，重试由客户端负责（设计 §3.6）。
 #   * `ECHO_MAX_CONCURRENT=2` —— 2026-09-23 定；上线后用真机压测校准
 #     （看"同时 2 路时单段耗时相对 1 路涨了多少"：涨得少说明还有余量）。
+#     ⚠️ 它是**按卡校准**的：8 GB 卡上 2 路长音频会互相挤显存，别把 24 GB 卡的校准值
+#     照抄到小卡上（判据见 `server/echo-server.example.yaml` 的 specs 注释与新文档
+#     `docs/后端容器部署.md`）。
+#
+# **管理面（8901）为什么这样发布也是安全的**（这段是本次改动的核心，别删）：
+#   * 容器里绑 `0.0.0.0:8901` 是**必需的** —— 绑 127.0.0.1 只对容器自己的回环生效，
+#     宿主机（以及 `ssh -L` 隧道）根本连不上；那就是"配了管理面却进不去"。
+#   * **可达范围由端口发布决定**：`127.0.0.1:8901:8901` 只把 8901 发布到**宿主回环**，
+#     于是实际能连到它的人 = 能登录宿主回环的人（本机浏览器 / `ssh -L` 隧道），
+#     与"进程直接绑回环"完全一致 —— 网段里的别人连不上这个端口。
+#   * 因此**启动日志里那句"管理面监听在 0.0.0.0:8901（不是回环）"的告警会照常打印**：
+#     那是**预期的**，别去消掉它。进程自己确实绑在通配地址上，那句告警说的是实话；
+#     挡住外部的是宿主这一侧的发布规则，而不是进程的绑定地址。
+#   * 万一有人把这个映射改成 `"8901:8901"`（= 发布到所有网卡），上面那条结论就**不成立**了：
+#     那时管理面登录页对该网段敞开，必须靠防火墙只放运维网段（设计 §8.4）。
+#     远程运维更稳的姿势是 SSH 端口转发（见 `docs/后端容器部署.md`）：
+#         ssh -L 8901:127.0.0.1:8901 <gpu-host>   # 然后本地浏览器开 http://127.0.0.1:8901/admin/
 #
 # **两个卷的保留策略是相反的，别合并：**
 #   tmp    临时文件，丢了没关系，可以换 tmpfs 换性能
@@ -19,30 +36,82 @@ services:
       dockerfile: server/Dockerfile
       args:
         ECHO_EXTRA: "0"          # 改成 "1" 装上 torch 那组（SenseVoice / Qwen3-ASR / 说话人分离）
+        # ⚠️ **torch 的 CUDA 源要按显卡选**（构建期参数，**不是**运行时环境变量）：
+        #   默认 cu126 = Turing 及以后（sm_75+；Ampere / Ada / Hopper / Blackwell）。
+        #   **Pascal（GTX 10xx / P4 / P100…，sm_6x）与 Volta（V100，sm_70）必须换** ——
+        #   CUDA 13.x 只支持 sm_75 及以上，而 PyTorch 2.15 起连 CUDA 12.6 的 wheel 都不再发布
+        #   （Maxwell/Pascal/Volta 一起被丢下）。老卡改成：
+        #     ECHO_TORCH_INDEX: "https://download.pytorch.org/whl/cu118"
+        #     ECHO_TORCH_VERSION: "2.7.1"     # cu118 源上目前最新的一版，**建议一起钉**
+        #   详见 docs/后端容器部署.md 的「按显卡选规格」一节。
+        ECHO_TORCH_INDEX: "https://download.pytorch.org/whl/cu126"
     image: echo-backend:0.1.0
     container_name: echo-backend
     restart: unless-stopped
     ports:
-      - "8900:8900"
+      - "8900:8900"                # 能力面：客户端要连，发布到所有网卡（配好鉴权再上网）
+      # 管理面：容器里绑 0.0.0.0（见文件头），**宿主只开回环** —— 于是外部可达范围
+      # 与"绑回环"一致，而宿主自己（浏览器 / ssh -L 隧道）进得去。
+      - "127.0.0.1:8901:8901"
     environment:
       ECHO_SERVER_ID: gpu-01
       ECHO_LISTEN: "0.0.0.0:8900"
+      # 管理面在容器里**必须**绑通配，否则宿主进不来（绑回环 = 只有容器自己能用）。
+      # 不放松安全语义的理由见文件头：暴露范围由上面那行 `127.0.0.1:8901:8901` 决定。
+      ECHO_ADMIN_LISTEN: "0.0.0.0:8901"
       ECHO_MODELS_ROOT: /opt/echo/models
       ECHO_TMP_ROOT: /var/echo/tmp
       ECHO_STATE_ROOT: /var/echo/state
       ECHO_MAX_CONCURRENT: "2"
+      # ⚠️ **SenseVoice 还依赖一个"按模型名"加载的 VAD 模型**（`app/audio/stt.py:_get_sensevoice`
+      #    传的 `vad_model="fsmn-vad"`），funasr 会去 ModelScope 现拉它（约 1.7 MB）。
+      #    而根文件系统是 `read_only: true`：默认落点 `~/.modelscope` / `~/.cache/modelscope`
+      #    都写不了 → **SenseVoice 加载直接失败**（`RuntimeError: model 'fsmn-vad' is not
+      #    registered` → 每个 `/v1/asr` 都 `model_failed`）。2026-09-28 在 GTX 1070 上实测到的。
+      #    这两个变量 + 下面那个 cache 卷就是解药（缓存不进 tmp 卷：那样会让 `/v1/health` 的
+      #    `tmp.files/bytes` 恒不为 0，而"空转时归零"正是泄漏判据）。
+      MODELSCOPE_CACHE: /var/echo/cache/modelscope
+      HOME: /var/echo/cache
       # 鉴权：**一上网就必须打开**（不打开 = 谁连上谁能用你的 GPU）。
-      # 打开前先配好 ECHO_JWT_SECRET，否则服务端起不来（见 settings.py 的说明）：
+      # ⚠️ 打开鉴权就**必须**同时配好 `ECHO_JWT_SECRET`，否则症状很误导人（2026-09-27 实测）：
+      #   **服务端照常起、`/v1/health` 照常 200**，但客户端"配对成功"之后
+      #   `POST /v1/token` 回 **503 auth_misconfigured**（"auth.mode=jwt 但没配
+      #   auth.jwt_secret"）—— 看着像客户端坏了，其实是服务端少一项配置。
+      #   所以这三行要么一起打开，要么都别开：
       #   ECHO_AUTH_ENABLED: "true"
       #   ECHO_AUTH_MODE: jwt
       #   ECHO_JWT_SECRET: "<openssl rand -hex 32>"
+      #   （`scripts/prepare-backend.sh` 会把密钥生成进 `echo-backend.env`，
+      #     并写好一个把这三项接进来的 compose override。）
     volumes:
-      # 模型只读挂进来（几 GB，不该跟着镜像走）
+      # 模型只读挂进来（几 GB，不该跟着镜像走）。
+      # **容器里的目录布局不是随便放的**（照着 `scripts/prepare-backend.sh` 准备就不会错）：
+      #   /srv/echo/models/hub/models--Qwen--Qwen3-ASR-0.6B/snapshots/master/        ← 转写
+      #   /srv/echo/models/hub/models--Qwen--Qwen3-ForcedAligner-0.6B/snapshots/master/ ← 强制对齐器
+      #   /srv/echo/models/pyannote/{pyannote-segmentation-3.0-local,
+      #                              pyannote-wespeaker-local,pyannote-plda-local/plda}
+      # 为什么 Qwen 那两份要放 `hub/` 下：`app/audio/stt.py` 的 `HF_HOME` 被定成模型根
+      # （`_resolve_hf_cache` 就在 `{模型根}/hub/models--<owner>--<name>/snapshots/*` 里找），
+      # 而 ModelScope 的默认缓存落在 `~/.cache/modelscope/models` —— 容器里那是 `/root`，
+      # 在 `read_only: true` 下**既不可写、也不在这个卷里**。
+      # ⚠️ **对齐器缺了不是"降级一点"，而是让 `supports: [asr.text, asr.timestamps]` 变成假话**
+      #    （没有它 `return_time_stamps=True` 只换回一句警告，一个时间戳都没有）。
+      # 显存预算（`server.vram_budget_mb`）**没有环境变量**，容器里只能靠挂一份配置 +
+      #   `--config` 来定（`scripts/prepare-backend.sh --tls self-signed` 生成的那个
+      #   override 就是这么做的）；默认 0 = 不限。它是**按卡校准**的：
+      #   8 GB 卡实测 预算 7000 / `asr-long` 估值 4700（qwen3asr+对齐器峰值 4.6 GB）；
+      #   出厂样例给的是 24 GB 卡的 20000/3900（3900 **只算了 ASR、没算对齐器**）。
+      #   判据与算账过程见 `docs/后端容器部署.md` 与 `server/echo-server.example.yaml`。
       - /srv/echo/models:/opt/echo/models:ro
       # 临时文件：丢了没事。想更快就换成 tmpfs（见 Dockerfile 注释）
       - /srv/echo/tmp:/var/echo/tmp
       # **耐久**状态：鉴权库。别换 tmpfs、别和上面合并
       - /srv/echo/state:/var/echo/state
+      # ModelScope 的**运行期缓存**（SenseVoice 的 VAD 模型按需拉到这里，见上面那两行环境变量）。
+      # 它是"缓存"：丢了会在下一次加载模型时重新下（约 1.7 MB），**不影响鉴权**，
+      # 所以和 tmp 卷一样属于"可以丢"，但它**不能放进 tmp 卷**（理由见上面）。
+      # 预先塞一份进去就能离线用（`scripts/prepare-backend.sh` 会建这个目录）。
+      - /srv/echo/cache:/var/echo/cache
     read_only: true
     tmpfs:
       - /tmp:size=512m,mode=1777
@@ -54,9 +123,15 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
+    # 探针打的是**容器自己的** 127.0.0.1:8900（`/v1/health` 免鉴权，见设计 §9.7）。
+    # ⚠️ 容器里启用 TLS 时（挂一份配了 `server.tls.certfile/keyfile` 的配置 + `--config`），
+    #    这个探针必须跟着换成 https —— 否则容器会一直显示 unhealthy，而服务其实是好的。
+    #    scheme 因此走一个**编排层变量** `ECHO_HEALTH_SCHEME`（compose 插值用，不是容器里的
+    #    运行时配置，所以它**不在** `environment:` 里，settings.py 也不读它）：
+    #    启用 TLS 时在 `--env-file` 里写 `ECHO_HEALTH_SCHEME=https`。
     healthcheck:
       test: ["CMD", "python", "-c",
-             "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8900/v1/health', timeout=4).status == 200 else 1)"]
+             "import ssl,urllib.request,sys; s='${ECHO_HEALTH_SCHEME:-http}'; ctx=ssl._create_unverified_context() if s=='https' else None; sys.exit(0 if urllib.request.urlopen(s+'://127.0.0.1:8900/v1/health', timeout=4, context=ctx).status == 200 else 1)"]
       interval: 30s
       timeout: 5s
       start_period: 60s

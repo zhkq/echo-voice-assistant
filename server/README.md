@@ -240,6 +240,27 @@ docker compose -f server/compose.yaml up -d --build
 python scripts/smoke-echo-backend.py --base-url http://127.0.0.1:8900
 ```
 
+**一条命令的准备流程（推荐）**：`sudo bash scripts/prepare-backend.sh` —— 前置检查（驱动 /
+nvidia-container-toolkit / compose v2）、模型卷按容器布局摆好并校验（**缺强制对齐器会
+明确报警**，因为那会让 `supports: [asr.timestamps]` 变成假话）、生成 `ECHO_JWT_SECRET`、
+自签证书、起容器、建管理员、跑验收。幂等、可 `--dry-run`。
+**完整的部署路径、管理面为什么能打开、显存怎么按卡校准、排错三条** →
+**`docs/后端容器部署.md`**（那里也是唯一说明"哪些没在真机验过"的地方）。
+
+管理面（8901）在 compose 里**只发布到宿主回环**：`127.0.0.1:8901:8901`，
+而容器里绑 `0.0.0.0:8901`（绑回环的话宿主进不来），环境变量 `ECHO_ADMIN_LISTEN` 负责这一项。
+所以启动日志里那句"管理面监听在 0.0.0.0:8901（不是回环）"的告警是**预期**的，别去消掉它。
+远程运维用 `ssh -L 8901:127.0.0.1:8901 <gpu-host>`，然后本地开 `http://127.0.0.1:8901/admin/`。
+
+**老卡（Pascal，例如 GTX 1070）要注意两件事**（细节见上面那份文档的「按显卡选规格」）：
+
+1. 新 CUDA 已经不含它的架构（PyTorch 2.15 起连 CUDA 12.6 的 wheel 都不再发布），
+   所以默认源装出来的 torch **在那块卡上跑不了** —— 要用
+   `--build-arg ECHO_TORCH_INDEX=https://download.pytorch.org/whl/cu118`，
+   并建议一起钉 `--build-arg ECHO_TORCH_VERSION=2.7.1`；
+2. 这类卡**没有 bf16**，而我们的 qwen3asr 路径是按 bf16 加载的 —— **建议改配 SenseVoice**
+   （`impl: sensevoice`，权重放 `models/sensevoice/`），代价是没有句级时间戳。
+
 **两个卷的保留策略是相反的，别合并**（详见 `server/compose.yaml` 顶部）：
 
 | 卷 | 内容 | 能不能换 tmpfs |

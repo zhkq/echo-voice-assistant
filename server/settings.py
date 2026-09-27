@@ -26,6 +26,9 @@ DEFAULTS: Dict[str, Any] = {
         # 2026-09-25 起管理面**可写**（发授权 / 禁用 / 撤销 / 改权限与配额 / 轮换 secret），
         # 全部要求管理员会话 + 同站 Origin + 非简单请求标志头 `X-ECHO-Admin` + CSRF；
         # 管理员账号本身仍然只在命令行改（见 server/admin.py 开头那七道闸）。
+        # 容器里必须用 `ECHO_ADMIN_LISTEN` 覆盖成 `0.0.0.0:8901`（绑回环则宿主进不来），
+        # 而**暴露范围由 Docker 的端口发布决定**：`server/compose.yaml` 把它只发布到
+        # 宿主回环（`127.0.0.1:8901:8901`），所以实际可达范围与"绑回环"一致。
         "admin_listen": "",
         "instance_id": "default",       # 临时目录的命名空间（多实例互不清扫）
         "vram_budget_mb": 0,            # 0 = 不限制（CPU-only 或显存充足）
@@ -162,6 +165,14 @@ def _env_overrides() -> dict:
         out.setdefault("server", {})["id"] = os.environ["ECHO_SERVER_ID"]
     if os.environ.get("ECHO_LISTEN"):
         out.setdefault("server", {})["listen"] = os.environ["ECHO_LISTEN"]
+    # 管理面的监听地址。**与 `ECHO_LISTEN` 同一套写法**（空串 = 没设，保留 YAML 里的值）。
+    # 容器里的必要性：镜像里的默认值是空（管理面关着），而要开就得绑 `0.0.0.0:8901` ——
+    # 绑 `127.0.0.1` 只对**容器自己的**回环生效，宿主上根本连不上（这是"配了却进不去"）。
+    # 绑通配**不等于**对网段开放：`server/compose.yaml` 把 8901 只发布到宿主回环。
+    # 代价是 `start_admin_server` 会照常打印"监听地址不是回环"那句告警 —— 那是**预期的**，
+    # 别去消掉它：在容器外（直接跑进程）绑通配时那句话仍然是该看见的。
+    if os.environ.get("ECHO_ADMIN_LISTEN"):
+        out.setdefault("server", {})["admin_listen"] = os.environ["ECHO_ADMIN_LISTEN"]
     if os.environ.get("ECHO_TMP_ROOT"):
         out.setdefault("tmp", {})["root"] = os.environ["ECHO_TMP_ROOT"]
     if os.environ.get("ECHO_STATE_ROOT"):

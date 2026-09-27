@@ -277,9 +277,12 @@ def build_loaders(device: str = "cuda") -> Dict[str, object]:
 def default_specs() -> List[ModelSpec]:
     """出厂模型清单。
 
-    `est_vram_mb` 与 `max_concurrency` 是**占位值**（按 24 GB 卡的粗略估算），
+    `est_vram_mb` 与 `max_concurrency` 是**按卡校准**的值（换卡要重算，别把小卡的实测值
+    带到别的卡上）：`asr-long` 的 4700 是 2026-09-27 在 8 GB 卡上实测的
+    qwen3asr + 强制对齐器峰值（4.6 GB）；`diarize` 的 2600 仍是占位估算。
     上线前要用真机压测校准 —— 尤其 `max_concurrency`，它直接决定
-    "服务端总通道 2" 这个数压不压得住。
+    "服务端总通道 2" 这个数压不压得住。怎么按自己的卡算见
+    `server/echo-server.example.yaml` 的 specs 注释与 `docs/后端容器部署.md`。
 
     `vectorSpaceId` 只有产出向量的两个模型有，而且**必须相同**（见 `_EmbedEngine`）。
 
@@ -295,8 +298,12 @@ def default_specs() -> List[ModelSpec]:
     return [
         # 长音频：按需 + LRU；它**同时**给文本与句级时间戳，
         # 所以 `variant=short`（几秒音频）也落在它身上，只是慢一点。
+        # `est_vram_mb` **必须把强制对齐器算进来**（`_stt_loader` 会把它们一起加载）：
+        # 2026-09-27 在 8 GB 卡上实测 qwen3asr + 对齐器峰值 **4.6 GB** → 记 4700。
+        # 原来的 3900 是**只算 ASR** 的估值 —— 估小了不会报错，只会让池子以为
+        # "还有余量"，然后在第二次加载时溢出。换卡要重新校准（见 `echo-server.example.yaml`）。
         ModelSpec(id="asr-long", slot="asr.long", impl="qwen3asr", resident=False,
-                  max_concurrency=1, est_vram_mb=3900,
+                  max_concurrency=1, est_vram_mb=4700,
                   model_version="qwen3-asr-0.6b",
                   supports=("asr.text", "asr.timestamps")),
         # 说话人分离：**不是线程安全的**，所以并发只能 1

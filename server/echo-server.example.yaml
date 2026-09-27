@@ -13,8 +13,16 @@ server:
   # 危险动作还要 `confirm`。管理员账号本身仍只在这里建（管理面只读展示清单）：
   #     python -m server.main --new-admin ops
   admin_listen: "127.0.0.1:8901"
+  # 容器里这行会被 `ECHO_ADMIN_LISTEN=0.0.0.0:8901` 覆盖（**必需**：绑回环只有容器自己
+  # 进得去，宿主与 `ssh -L` 都连不上），而暴露范围由 `server/compose.yaml` 的
+  # `127.0.0.1:8901:8901` 决定 —— 只看宿主回环。见 `docs/后端容器部署.md`。
   instance_id: gpu01-a          # 临时目录的命名空间（多实例互不清扫对方）
-  vram_budget_mb: 20000         # 0 = 不限制；超预算**拒绝**而不是 OOM，也不回退 CPU
+  # 显存预算：**按卡校准**，0 = 不限制。超预算**拒绝**而不是 OOM，也绝不回退 CPU。
+  #   出厂样例这里给 20000 是**24 GB 卡的参考值**；本机 8 GB 卡的实测值是 **7000**。
+  #   怎么按自己的卡算：把要**可能同时驻留**的模型估显存加起来，再留出桌面/显示占用
+  #   （8 GB 卡上桌面吃掉约 1 GB+，所以预算不要顶到 8000）。
+  #   ⚠️ 容器里**没有**对应的环境变量 —— 要改得挂一份配置 + `python -m server.main --config`。
+  vram_budget_mb: 20000
   # **耐久**状态（鉴权库）放哪。空 = {ECHO}/data/server-state。
   # **故意与 `tmp.root` 分开**：tmp 是"随便删、可以挂 tmpfs"的，
   # 而鉴权库存着客户端凭据 —— 两者放一起意味着"照文档把 tmp 换成内存盘
@@ -66,6 +74,27 @@ models:
   device: cuda
   # 不写 specs 就用代码里的出厂清单（server/engines.py:default_specs）。
   # 写出来是为了能改；`est_vram_mb` 与 `max_concurrency` 都是**占位值**，上线前要压测校准。
+  #
+  # ## 这两个数是**按卡校准**的，别把小卡的实测值带到别的卡上、也别反过来
+  #
+  # `est_vram_mb` 是"这个模型常驻/加载时大约吃多少显存"，池子拿它跟 `vram_budget_mb`
+  # 对账；`max_concurrency` 是"同一份权重能同时服务几路"（`diarize` 是 1，因为它不是
+  # 线程安全的；`asr-long` 现在是 1）。
+  #
+  # 实测（2026-09-27，本机 8 GB 卡）：
+  #   * **qwen3asr + 强制对齐器的峰值是 4.6 GB** —— 所以这里的 `est_vram_mb` 要给 **4700**，
+  #     出厂样例的 3900 是**只算 ASR**的旧估值（对齐器是同一个进程里的第二份权重，
+  #     它必须在**加载时**一起进来，见 `server/engines.py:_stt_loader`）。
+  #     估小了不会报错，只会让池子以为"还有余量"而在第二次加载时溢出。
+  #   * 对应的预算是 **7000**（不是 8000）：桌面 + 显示要留出 1 GB 左右。
+  #
+  # 怎么按自己的卡算：
+  #   1. 列出**可能同时驻留**的模型（本清单里 `resident: false` 的按需加载，LRU 才会踢人，
+  #      所以"两个模型别同时常驻"是最省事的一条）；
+  #   2. 把它们的 `est_vram_mb` 加起来（对齐器算进 qwen3asr 那一项）；
+  #   3. 再留出桌面/显示占用（8 GB 卡约 1 GB+，24 GB 卡也要留一点）；
+  #   4. 剩下的写进 `vram_budget_mb`；`max_concurrent` 用真机并发压测校准。
+  #   5. 校准完把实测数字写回注释 —— 下一个换卡的人才不会又从头猜一遍。
   specs:
     # 2026-09-24 定：**v1 不做独立的短档小模型**。
     # 理由：SenseVoice 常驻要一直占着显存，而 v1 里没有任何内部调用方用它
@@ -78,7 +107,9 @@ models:
       impl: qwen3asr
       resident: false
       max_concurrency: 1
-      est_vram_mb: 3900
+      # 8 GB 卡实测 4700（qwen3asr + 强制对齐器峰值 4.6 GB）；出厂样例原来是 3900 = 只算 ASR。
+      # **必须**把对齐器算进来：`supports` 里的 `asr.timestamps` 就靠它。
+      est_vram_mb: 4700
       modelVersion: qwen3-asr-0.6b
       supports: [asr.text, asr.timestamps]
     - id: diarize               # 说话人分离：**不是线程安全的**，并发只能 1

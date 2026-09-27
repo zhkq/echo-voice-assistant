@@ -1824,6 +1824,34 @@ class EnvOverrideTests(unittest.TestCase):
         self.assertEqual(over["auth"]["jwt_secret"], "x" * 32)
         self.assertEqual(over["auth"]["pairing_enabled"], False)
 
+    def test_admin_listen_env_override_works(self):
+        """`ECHO_ADMIN_LISTEN` 必须真的覆盖 `server.admin_listen`。
+
+        容器里只能用环境变量开管理面：绑 `127.0.0.1` 的话**只有容器自己**能连，
+        宿主（以及 `ssh -L` 隧道）打不开这个页面 —— 那就成了"配了管理面却进不去"。
+        所以这个变量是"容器部署 + 管理端页面仍可用"这条路的开关。
+        """
+        self.assertEqual(str(settings_mod.load().get("server.admin_listen", "")), "",
+                         "出厂值应当是空（管理面关着）")
+        with patch.dict(os.environ, {"ECHO_ADMIN_LISTEN": "0.0.0.0:8901"}, clear=False):
+            cfg = settings_mod.load()
+        self.assertEqual(cfg.get("server.admin_listen"), "0.0.0.0:8901")
+
+    def test_admin_listen_env_is_not_read_when_empty(self):
+        """空串 = **没设**（保留 YAML 里的值），与 `ECHO_LISTEN` 同一套写法、同一套语义。
+
+        不这样写就会出现"环境里有个空变量 → 配置里那行被抹掉"这种难查的静默覆盖。
+        """
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False,
+                                         encoding="utf-8") as fh:
+            fh.write("server: {admin_listen: '127.0.0.1:8901'}\n")
+            path = fh.name
+        self.addCleanup(os.unlink, path)
+        with patch.dict(os.environ, {"ECHO_ADMIN_LISTEN": ""}, clear=False):
+            cfg = settings_mod.load(path)
+        self.assertEqual(cfg.get("server.admin_listen"), "127.0.0.1:8901",
+                         "空的环境变量不该把配置文件里的值抹掉")
+
     def test_state_root_is_not_tmp_root(self):
         """**耐久状态不许落在临时目录里**（这一条是被一个真实的数据丢失隐患逼出来的）。
 
@@ -1851,6 +1879,290 @@ class EnvOverrideTests(unittest.TestCase):
         self.assertTrue(store.path.startswith(cfg.raw["server"]["state_root"]),
                         "鉴权库落到了 %s" % store.path)
         self.assertNotIn(cfg.raw["tmp"]["root"], store.path)
+
+
+class ContainerDeploymentTests(unittest.TestCase):
+    """容器部署里两条**不能靠人记住**的事实：管理面的暴露范围、模型卷的布局。
+
+    这两类谎都很便宜、现场也都很难发现：
+
+      ① 说"管理面只发布到宿主回环"，而 `compose.yaml` 里其实是 `"8901:8901"`
+         （= 对网段敞开）。**改坏了不报错**，只是登录页从此谁都能敲。
+         而进程内那句"监听地址不是回环"的告警在容器里是**预期**的（绑回环则宿主进不来），
+         所以唯一挡住外部的就是端口发布那一行 —— 它值得有一条用例。
+      ② 说"模型放进 `models/hub/models--<owner>--<name>/snapshots/<rev>/` 就行"，
+         而加载器根本不看那个目录 —— 于是白准备几个 GB，然后报"模型加载失败"。
+         所以下面那条用例不是检查目录名，而是**拿着加载器自己去解析一遍**。
+    """
+
+    def _compose(self):
+        import yaml
+        with open(os.path.join(SERVER_DIR, "compose.yaml"), encoding="utf-8") as fh:
+            return yaml.safe_load(fh) or {}
+
+    def _backend(self):
+        svc = (self._compose().get("services") or {}).get("backend")
+        self.assertIsInstance(svc, dict, "compose.yaml 里没有 backend 服务？")
+        return svc
+
+    def test_the_admin_port_is_published_on_the_host_loopback_only(self):
+        """8901 的映射里**必须**写死宿主 IP `127.0.0.1`。
+
+        `"8901:8901"` 与 `"0.0.0.0:8901:8901"` 都会把管理面登录页摊给整个网段。
+        """
+        ports = [str(p) for p in (self._backend().get("ports") or [])]
+        admin = [p for p in ports if p.split(":")[-1].split("/")[0] == "8901"]
+        self.assertEqual(len(admin), 1, "8901 应当恰好有一条端口映射：%s" % ports)
+        self.assertTrue(admin[0].startswith("127.0.0.1:"),
+                        "8901 的映射必须是 `127.0.0.1:8901:8901`（宿主只开回环），现在是 %r"
+                        % admin[0])
+
+    def test_the_capability_port_stays_the_only_wide_open_one(self):
+        """能力面 8900 仍然是发布到所有网卡的那一个（防"顺序搬错"）。"""
+        ports = [str(p) for p in (self._backend().get("ports") or [])]
+        self.assertIn("8900:8900", ports)
+
+    def _dockerfile(self):
+        with open(os.path.join(SERVER_DIR, "Dockerfile"), encoding="utf-8") as fh:
+            return fh.read()
+
+    def _dockerfile_run_scripts(self):
+        """把每条 RUN 的正文按 Dockerfile 的 `\\` 续行规则拼成一段 shell。"""
+        scripts, buf = [], None
+        for ln in self._dockerfile().splitlines():
+            if buf is not None:
+                buf.append(ln.rstrip()[:-1].rstrip() if ln.rstrip().endswith("\\") else ln)
+                if not ln.rstrip().endswith("\\"):
+                    scripts.append(" ".join(buf))
+                    buf = None
+                continue
+            if ln.startswith("RUN "):
+                body = ln[4:]
+                if body.rstrip().endswith("\\"):
+                    buf = [body.rstrip()[:-1].rstrip()]
+                else:
+                    scripts.append(body)
+        return scripts
+
+    def test_the_dockerfile_run_scripts_are_valid_shell(self):
+        """RUN 的正文必须是合法 shell。
+
+        **这些镜像在这台机器上构建不了**（开发机没有 Docker、也没有 GPU 直通），
+        而 RUN 的失败模式里最便宜的一类是纯语法错：少一个 `;`、`if` 没配 `fi`、
+        在 `\\` 续行里塞了注释 —— 全都要等真机构建才炸，而那时的报错常常指不准那一行。
+        所以这里把每条 RUN 交给 `bash -n`（只解析、不执行）。
+
+        没有 bash 的机器跳过 —— 但**跳过要出声**（skipTest），别让"没跑"看起来像"过了"。
+        """
+        import shutil
+        import subprocess
+        bash = shutil.which("bash")
+        if not bash:
+            self.skipTest("这台机器没有 bash —— 跳过 Dockerfile RUN 的语法静态检查"
+                          "（真机构建时仍会暴露）")
+        scripts = self._dockerfile_run_scripts()
+        self.assertGreaterEqual(len(scripts), 3,
+                                "只解析到 %d 条 RUN，抽取逻辑可能坏了" % len(scripts))
+        for i, body in enumerate(scripts, 1):
+            with self.subTest(run=i):
+                with tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False,
+                                                 encoding="utf-8", newline="\n") as fh:
+                    fh.write(body + "\n")
+                    path = fh.name
+                try:
+                    rc = subprocess.run([bash, "-n", path], stdout=subprocess.DEVNULL,
+                                        stderr=subprocess.DEVNULL).returncode
+                finally:
+                    os.unlink(path)
+                self.assertEqual(rc, 0, "Dockerfile 第 %d 条 RUN 不是合法 shell：\n%s" % (i, body))
+
+    def test_the_torch_cuda_source_is_a_build_arg_not_a_runtime_env(self):
+        """老卡（Pascal/Volta）得能换 torch 的 CUDA 源 —— 而它**必须是构建期参数**。
+
+        为什么值得钉：Pascal 正在被新 CUDA 放弃（CUDA 13.x 只支持 sm_75 及以上；
+        PyTorch 2.15 起连 CUDA 12.6 的 wheel 都不再发布），所以 `pip install torch`
+        用默认源装出来的东西**在那块卡上根本跑不了**。开关做成 `ARG`（构建期）而不是
+        ENV（运行时）也是刻意的：它只在 `docker build` 那一刻有意义，
+        摆成运行时配置会让人以为改了它就能生效。
+        """
+        src = self._dockerfile()
+        self.assertIn("ARG ECHO_TORCH_INDEX=", src)
+        self.assertIn("ARG ECHO_TORCH_VERSION=", src)
+        self.assertIn('--index-url "$ECHO_TORCH_INDEX"', src,
+                      "torch 必须真的从那个源装（只声明 ARG 不改 pip 命令 = 开关是假的）")
+        self.assertIn("cu118", src, "老卡的源（cu118）要写在注释与示例里")
+        # 构建期参数不许出现在 ENV 块里（`EnvOverrideTests` 只把 ENV 当运行时配置）
+        env_lines, collecting = [], False
+        for ln in src.splitlines():
+            if ln.startswith("ENV "):
+                collecting = True
+            elif collecting and not ln.endswith("\\") and not ln.startswith(" "):
+                collecting = False
+            if collecting:
+                env_lines.append(ln)
+        self.assertNotIn("TORCH_INDEX", "\n".join(env_lines),
+                         "ECHO_TORCH_INDEX 是构建期参数，别放进 ENV（会造成『运行时配置』的假象）")
+        # compose 侧：它属于 build.args，不属于 environment
+        build = (self._backend().get("build") or {})
+        self.assertIn("ECHO_TORCH_INDEX", (build.get("args") or {}),
+                      "compose 要把 torch 源放在 build.args 里")
+        self.assertNotIn("ECHO_TORCH_INDEX", (self._backend().get("environment") or {}),
+                         "torch 源是构建期的，放进 environment 没有任何作用（只会误导人）")
+
+    def test_the_container_binds_the_admin_plane_to_the_wildcard_address(self):
+        """容器里**必须**绑 0.0.0.0 —— 绑 127.0.0.1 的话宿主（与 ssh -L）根本进不去。"""
+        env = self._backend().get("environment") or {}
+        self.assertEqual(str(env.get("ECHO_ADMIN_LISTEN") or ""), "0.0.0.0:8901")
+        self.assertTrue(str(self._backend().get("read_only")) in ("True", "true", "1"),
+                        "根文件系统只读这一条不该在改动里丢掉")
+
+    def test_a_wildcard_admin_listen_still_accepts_the_loopback_origin(self):
+        """绑通配时，浏览器访问 `http://127.0.0.1:8901` 的 Origin **必须**算同站。
+
+        这是容器方案能不能用的那条线：`allowed_origins()` 从 `server.admin_listen` 取端口，
+        而通配地址 `0.0.0.0` **不是一个 hostname** —— 它既不能被塞进白名单，
+        也不能把回环名挤掉（两种坏法都在这条里挡住）。
+        """
+        from server import admin as admin_mod
+        cfg = settings_mod.load()
+        cfg.raw["server"]["admin_listen"] = "0.0.0.0:8901"
+        origins = admin_mod.allowed_origins(cfg)
+        self.assertIn("http://127.0.0.1:8901", origins)
+        self.assertIn("http://localhost:8901", origins)
+        self.assertNotIn("http://0.0.0.0:8901", origins,
+                         "0.0.0.0 不是浏览器会用的 Origin，别当成 hostname 加进白名单")
+        self.assertNotIn("http://127.0.0.1:8900", origins,
+                         "端口要跟着管理面（8901）走，不能跟着能力面")
+        self.assertNotIn("http://gpu-01:8901", origins,
+                         "通配监听不等于「谁的 Origin 都收」—— 白名单里只该有回环名")
+
+    def test_the_documented_model_volume_layout_is_the_one_the_loader_resolves(self):
+        """模型卷的布局必须是**代码认的那个**（不是文档里编的目录树）。
+
+        `compose.yaml` 与 `docs/后端容器部署.md` 都要求把 Qwen 那两份放在
+        `{模型根}/hub/models--<owner>--<name>/snapshots/<rev>/`。这条用例把那份"要求"
+        与 `app/audio/stt.py` 真实的解析逻辑对起来：造一份假的权重树，看
+        `_resolve_local_model()` 是否**真的**解析到它；再看对齐器在位时
+        `qwen3asr_aligner()` 是否给出那个名字 —— 它决定 `supports: [asr.timestamps]`
+        是真话还是假话（没有它 funasr 只打印一句警告，时间戳一个都没有）。
+
+        **不加载任何模型**：只解析路径。
+        """
+        from app import modelinfo, paths
+        import app.audio.stt as stt
+
+        def touch(path, size=2048):
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "wb") as fh:
+                fh.write(b"\0" * size)
+
+        root = tempfile.mkdtemp(prefix="echo-container-models-")
+        asr_dir = os.path.join(root, "hub", "models--Qwen--Qwen3-ASR-0.6B",
+                               "snapshots", "master")
+        aligner_dir = os.path.join(root, "hub", "models--Qwen--Qwen3-ForcedAligner-0.6B",
+                                   "snapshots", "master")
+        for d in (asr_dir, aligner_dir):
+            touch(os.path.join(d, "config.json"), 64)
+            touch(os.path.join(d, "model.safetensors"))
+
+        empty_ms_cache = os.path.join(root, "_ms-cache-empty")
+        with patch.object(paths, "models_root", lambda: root), \
+                patch.object(modelinfo, "MS_CACHE", empty_ms_cache):
+            self.assertEqual(stt.models_dir(), root,
+                             "服务端那份模型根应当就是挂进来的只读卷")
+            self.assertEqual(stt._resolve_local_model("Qwen/Qwen3-ASR-0.6B"), asr_dir)
+            self.assertEqual(stt._resolve_local_model("Qwen/Qwen3-ForcedAligner-0.6B"),
+                             aligner_dir)
+            self.assertEqual(stt.qwen3asr_aligner(), stt.QWEN3_FORCED_ALIGNER,
+                             "对齐器权重在位时它必须被真的接上，否则 asr.timestamps 名不副实")
+
+        # 对齐器缺失时必须**如实降级**（而不是去联网下 1.7 GB）：这条是"脚本要报警"的判据
+        bare = tempfile.mkdtemp(prefix="echo-container-bare-")
+        with patch.object(paths, "models_root", lambda: bare), \
+                patch.object(modelinfo, "MS_CACHE", empty_ms_cache):
+            self.assertEqual(stt.qwen3asr_aligner(), "",
+                             "两个缓存都没有对齐器时必须降级成空（句级时间戳不可用）")
+
+    # ---- 部署脚本（scripts/prepare-backend.sh）的几条契约 -------------------------
+
+    #: 部署准备脚本。**它不是服务端代码**，但它写出来的东西（模型卷布局、override、
+    #: 密钥文件）全都被上面那些契约管着 —— 所以它自己也得被钉住几条。
+    PREPARE_SH = os.path.join(os.path.dirname(SERVER_DIR), "scripts", "prepare-backend.sh")
+
+    def _prepare_source(self):
+        self.assertTrue(os.path.isfile(self.PREPARE_SH),
+                        "部署准备脚本不见了：%s" % self.PREPARE_SH)
+        with open(self.PREPARE_SH, encoding="utf-8") as fh:
+            return fh.read()
+
+    def test_the_prepare_script_has_no_crlf(self):
+        """`.sh` 带 CRLF 在 Linux 上会以 `\\r: command not found` 之类的方式坏掉。
+
+        与 `server/**` 那条同一个道理（见 `tests/test_line_endings.py` 的说明）：
+        `.gitattributes` 里 `*.sh -text` 保住了 checkout 的行尾，但**手工编辑/工具
+        读改写**仍然可能把整份文件转成 CRLF —— 那时脚本在宿主上跑不起来，
+        而错误信息完全指不到行尾这件事上。这里只盯字节。
+        """
+        with open(self.PREPARE_SH, "rb") as fh:
+            raw = fh.read()
+        self.assertNotIn(b"\r\n", raw,
+                         "scripts/prepare-backend.sh 含 CRLF（应为 LF，否则宿主上执行会出错）")
+        self.assertTrue(raw.startswith(b"#!/usr/bin/env bash"))
+
+    def test_prepare_script_pyannote_assets_match_the_code(self):
+        """脚本里的 pyannote 清单 = `app/modelinfo.py:PYANNOTE_ASSETS`。
+
+        脚本要在**宿主机**上下载这三件套，而权威清单在代码里（面板下载走的是它）。
+        两处各写一份、又都不报错，就会变成"面板说下好了、容器里却缺一个文件" ——
+        典型的静默漂移。所以直接比对（改了脚本就要同步改代码，反之亦然）。
+        """
+        from app import modelinfo
+        src = self._prepare_source()
+        m = re.search(r'^PYANNOTE_ASSETS="(.*?)"$', src, re.S | re.M)
+        self.assertIsNotNone(m, "脚本里找不到 PYANNOTE_ASSETS=\"…\" 那段清单")
+        rows = []
+        for line in m.group(1).strip().splitlines():
+            if line.strip():
+                repo, folder, files = line.split("|")
+                rows.append((repo.strip(), folder.strip(),
+                             [f for f in files.split(",") if f]))
+        self.assertEqual(rows, [tuple(a) for a in modelinfo.PYANNOTE_ASSETS],
+                         "脚本里的 pyannote 清单与 app/modelinfo.PYANNOTE_ASSETS 不一致")
+
+    def test_prepare_script_covers_the_steps_the_doc_promises(self):
+        """文档承诺的那几步得真的在脚本里（"文档说了、脚本没做"是最便宜的一种谎）。"""
+        src = self._prepare_source()
+        for needle in ("--new-admin",           # 建管理员（账号只能 CLI 建）
+                       "--list-admins",         # 先看有没有账号（幂等，不重置口令）
+                       "ECHO_JWT_SECRET",       # 生成/沿用密钥
+                       "openssl rand -hex 32",  # 密钥生成方式
+                       "smoke-echo-backend.py",  # 验收
+                       "127.0.0.1:8901",        # 远程运维提示里的管理面地址
+                       "--dry-run"):
+            with self.subTest(needle=needle):
+                self.assertIn(needle, src)
+        self.assertIn("docker compose", src)
+        # 幂等：**已有密钥就沿用**（重生成 = 所有客户端 401）
+        self.assertIn("绝不重新生成", src)
+
+    def test_prepare_script_picks_the_torch_source_by_compute_capability(self):
+        """老卡（Pascal/Volta）那条路：脚本要**自己认卡并换 torch 源**。
+
+        文档在「按显卡选规格」里承诺了三件事，这里各钉一条：
+        ① 会读算力等级（`nvidia-smi --query-gpu=compute_cap`）；
+        ② sm_<7.5 时自动用 cu118 并钉版本；
+        ③ 会提醒"这块卡没有 bf16 → 建议 SenseVoice"。
+        —— 这三条都是**只在真机上才有意义**的判断，本机没有那块卡，
+        所以至少要把"脚本里确实有这段判断"钉住，免得文档与脚本各说各话。
+        """
+        src = self._prepare_source()
+        for needle in ("compute_cap", "cu118", "ECHO_TORCH_INDEX", "TORCH_VERSION",
+                       "bf16", "sensevoice", "--extra"):
+            with self.subTest(needle=needle):
+                self.assertIn(needle, src)
+        # 老卡的判据写成 7.5（Turing 以下），别退化成"有没有 CUDA"这种没用的判断
+        self.assertIn("_cc_major", src)
+        self.assertIn("-lt 7", src)
 
 
 class AdminCliTests(unittest.TestCase):

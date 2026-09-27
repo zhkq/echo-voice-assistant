@@ -18,6 +18,7 @@ import io
 import json
 import os
 import re
+import shutil
 import socket
 import struct
 import sys
@@ -59,6 +60,50 @@ from app.capabilities.assemble import (                                  # noqa:
 )
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+from app.capabilities import credentials as cred_mod                     # noqa: E402
+from app.capabilities import echo_server as echo_server_mod              # noqa: E402
+
+
+# ---------------------------------------------------------------- 隔离真实状态
+#
+# ⚠️ **本模块的用例一个字都不许看这台机器真实的配对状态。**（2026-09-27 修）
+#
+# `EchoServerContractTests` 起的是**本进程内**的假服务端（假引擎 + `auth.enabled=False`），
+# 而 `EchoServerClient(base_url=…)` 构造时（`creds=None`）会自己 `credentials.load()` 读
+# `{DATA}/backend.json`。这台开发机 2026-09-24 真配对过，那份凭据指向 https://127.0.0.1:8900
+# —— 于是 `_renewable()` 为真，**每个请求**（包括发给假服务端的）都要先
+# `pairing.ensure_token()` 去真后端换一次令牌：
+#
+#   * 真后端在跑 → 测试悄悄拿本机身份连了真后端、换了真令牌（还多一次真实网络往返）；
+#   * 真后端没跑 → `PairingError(offline)` → `refresh()` 返回 False → 11 条契约用例全红，
+#     报的却是"capabilities 拉不下来"，**完全指不到凭据上**
+#     （2026-09-27 实测：`[WinError 10061] 目标计算机积极拒绝` @ 127.0.0.1:8900）。
+#
+# 这就是 AGENTS.md 里"测试依赖本机真实状态"那一类（harness pid/token 事故的同一根因），
+# 所以照 `tests/test_harness_agent.py::setUpModule()` 的做法，把**可打桩的路径函数**指到
+# 临时目录：一个空的临时目录 ≡ "本机没配对"，客户端于是不带 Authorization 直接打假服务端。
+#
+# **契约断言一个字没改**：用例验的还是那份假服务端给的 capabilities（槽取交集、向量空间、
+# 错误码翻译…）。变的只是"客户端从哪里读凭据"。
+_TMP_DIR = tempfile.mkdtemp(prefix="echo-cap-test-")
+#: 打桩**之前**的真实路径 —— 护栏 `CapabilityContractIsolationTests` 拿它当判据。
+_REAL_CREDS_PATH = cred_mod.credentials_path()
+_OLD_CREDS_PATH_FN = cred_mod.credentials_path
+_OLD_SETTING_FN = echo_server_mod._setting
+
+
+def setUpModule():
+    cred_mod.credentials_path = lambda: os.path.join(_TMP_DIR, cred_mod.FILENAME)
+    # 设置里手填的令牌/地址也来自**真实** `data/config.json`（`capabilityEchoServerUrl` /
+    # `…Token`）。一并哑掉：否则"手填过令牌"的机器上，测试会把它塞进发给假服务端的请求头。
+    echo_server_mod._setting = lambda key, default=None: default
+
+
+def tearDownModule():
+    cred_mod.credentials_path = _OLD_CREDS_PATH_FN
+    echo_server_mod._setting = _OLD_SETTING_FN
+    shutil.rmtree(_TMP_DIR, ignore_errors=True)
 
 
 # ---------------------------------------------------------------- 测试素材
@@ -482,6 +527,109 @@ class EchoServerContractTests(_Contract, unittest.TestCase):
             # 显式传地址永远赢
             self.assertEqual(es.EchoServerClient(base_url="http://x:1", creds=False).base_url,
                              "http://x:1")
+
+
+class CapabilityContractIsolationTests(unittest.TestCase):
+    """护栏：本模块的客户端**不许看这台机器真实的配对状态**（2026-09-27）。
+
+    与 `test_harness_agent.py::test_harness_pid_file_is_isolated_from_the_real_one`
+    **同一意图** —— 那条钉的是"别读真实 harness 的 pid/token 文件"，这条钉的是
+    "别读真实 `{DATA}/backend.json`"。
+
+    为什么非要有这条：隔离一旦被人（顺手）去掉，红的是 11 条契约用例，报的却是
+    "capabilities 拉不下来"，**完全指不到凭据上**；而且"真后端恰好在跑"时它还会
+    静默变绿。只有这一条能把"隔离没了"变成一句直接的话。
+    """
+
+    def test_the_credentials_path_is_inside_the_module_temp_dir(self):
+        used = os.path.abspath(cred_mod.credentials_path())
+        self.assertTrue(used.startswith(os.path.abspath(_TMP_DIR)),
+                        "凭据路径没隔离到临时目录：实际是 %s" % used)
+        self.assertNotEqual(used, os.path.abspath(_REAL_CREDS_PATH),
+                            "凭据路径指回了真实的 %s —— 测试会去连真后端" % _REAL_CREDS_PATH)
+        self.assertEqual(cred_mod.FILENAME, "backend.json")
+
+    def test_the_client_reads_credentials_from_the_isolated_path(self):
+        """客户端读凭据的**唯一**来源必须是那个临时目录（这条不挑机器，永远跑）。
+
+        判据刻意不依赖"这台机器配没配过对"：往隔离路径放一份**只有本用例知道**的替身，
+        客户端就必须看得见它 —— 看不见（或看见别的）就说明它读的不是这里。
+        这条同时钉住 `echo_server._setting` 的隔离：地址也只能从替身来。
+        """
+        used = os.path.abspath(cred_mod.credentials_path())
+        if not used.startswith(os.path.abspath(_TMP_DIR)):
+            # 先判隔离再动手：这条用例**绝不**在真实凭据文件上做写操作
+            self.fail("凭据路径没隔离（%s）—— 本用例拒绝写真实凭据文件" % used)
+
+        from app.capabilities.credentials import BackendCredentials
+        cred_mod.save(BackendCredentials(base_url="http://127.0.0.1:5731",
+                                         client_id="cli-probe", secret="probe-secret"))
+        try:
+            c = echo_server_mod.EchoServerClient()      # 不给 base_url：地址也只能从替身来
+            self.assertEqual(c.base_url, "http://127.0.0.1:5731",
+                             "客户端没从隔离路径取地址 —— 它读的是别处（真设置/真凭据）")
+            self.assertIsNotNone(c._creds, "客户端没从隔离路径拿到凭据")
+            self.assertEqual(c._creds.client_id, "cli-probe")
+        finally:
+            cred_mod.clear()
+
+    @unittest.skipUnless(os.path.isfile(_REAL_CREDS_PATH),
+                         "这台机器没有真实配对凭据（{DATA}/backend.json 不存在）—— 无从泄漏")
+    def test_a_real_credentials_file_is_invisible_to_this_module(self):
+        """真实凭据**就在盘上**的时候，本模块也必须"什么都没配对"。
+
+        判据分两层，都是从"后果"那端量：`load()` 读不到它，客户端也就拼不出
+        `Authorization` 头 —— 后者正是"会去真后端换令牌"那个动作的入口。
+        """
+        self.assertIsNone(cred_mod.load(),
+                          "本模块读到了真实凭据文件 %s" % _REAL_CREDS_PATH)
+        c = echo_server_mod.EchoServerClient(base_url="http://127.0.0.1:1")
+        self.assertIsNone(c._creds, "客户端拿到了真实凭据 → 下一个请求就会去真后端换令牌")
+        self.assertFalse(c._renewable(), "客户端认为本机配过对 → 会用真实身份连真后端")
+        self.assertEqual(c._auth_header(slot="asr.text"), "",
+                         "客户端拿真实凭据拼出了 Authorization 头")
+
+    @unittest.skipUnless(os.path.isfile(_REAL_CREDS_PATH),
+                         "这台机器没有真实配对凭据（{DATA}/backend.json 不存在）—— 无从破坏")
+    def test_pairing_cycles_in_this_module_never_touch_the_real_file(self):
+        """在隔离路径上真跑一遍配对 / 解除配对，真实凭据文件必须**一个字节没变**。
+
+        为什么要真的写一遍：`credentials.save()` / `clear()` 是**会删文件**的那两个入口
+        （与 `harness_proc.forget_token()` 同类，见 AGENTS.md 的 token 事故）。只断言
+        "路径看着是临时目录"拦不住"哪天有人把隔离去掉"。
+
+        ⚠️ **判据的顺序是这条用例的一部分**：隔离断言必须在**任何写操作之前**先跑完并
+        直接失败退出 —— 否则"验证隔离"的手段本身就成了破坏手段。2026-09-27 真踩过这一次
+        （当时的变异测试把隔离拿掉，本用例先把真实 `data/backend.json` 覆盖再删掉了）。
+
+        用例末尾再收一次尾：把 save 出来的那个临时文件清掉，不留给别的用例。
+        """
+        # ① 先判隔离，不隔离就**什么都不写**、直接失败
+        used = os.path.abspath(cred_mod.credentials_path())
+        if not used.startswith(os.path.abspath(_TMP_DIR)):
+            self.fail("凭据路径没隔离（%s）—— 本用例拒绝在真实凭据文件上做写操作" % used)
+
+        with open(_REAL_CREDS_PATH, "rb") as fh:
+            before = (fh.read(), os.stat(_REAL_CREDS_PATH).st_mtime_ns)
+
+        from app.capabilities.credentials import BackendCredentials
+        try:
+            cred_mod.save(BackendCredentials(base_url="http://127.0.0.1:9",
+                                             client_id="cli-guard", secret="guard-secret"))
+            self.assertTrue(os.path.isfile(used), "save() 没落在临时目录里")
+            self.assertTrue(cred_mod.clear(), "clear() 失败")
+        finally:
+            # ② 收尾：别把配对文件留给同模块的**其它**用例（它们要求"本机没配对"）
+            for leftover in (used, used + ".tmp"):
+                try:
+                    os.remove(leftover)
+                except OSError:
+                    pass
+
+        with open(_REAL_CREDS_PATH, "rb") as fh:
+            after = (fh.read(), os.stat(_REAL_CREDS_PATH).st_mtime_ns)
+        self.assertEqual(before, after,
+                         "真实凭据文件 %s 被这次配对往返改动了" % _REAL_CREDS_PATH)
 
 
 # ================================================================ 铁律

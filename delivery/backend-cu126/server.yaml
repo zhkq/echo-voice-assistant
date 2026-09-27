@@ -1,0 +1,79 @@
+# ECHO 能力后端（**新卡 / cu126**）—— 容器里生效的那份配置。
+#
+# 为什么要有这个文件：**`models.specs` 没有环境变量**（要改只能挂一份配置 + `--config`）。
+# compose.yaml 已经把它挂到 /etc/echo/server.yaml 并加了 `--config`，你不用手动传。
+#
+# 这份文件**只写"必须按这张卡定"的项**，其余全部仍走内置默认值 + 环境变量。
+# 优先级：内置默认值 < 这份文件 < 环境变量（server/settings.py:load）。
+# ⚠️ `models.specs` 是**整列表替换**：写了几档就只剩几档。改了记得三档一起看。
+server:
+  # 显存预算：超预算时服务端**拒绝**（gpu_oom）而不是 OOM，也绝不回退 CPU。
+  # 0 = 不限（出厂值）。**这是按卡校准的数**，别把这里的 7000 带到别的卡上：
+  #   * 8 GB 卡（RTX 2080、本机 RTX 5060 实测）：7000 —— 不是 8000，桌面/显示要留 ~1 GB；
+  #   * 24 GB 卡：可以给 20000（出厂样例就是它）；
+  #   * 4 GB 卡：3500 左右，并且只能一次跑一档。
+  # 算账：qwen3asr + 强制对齐器的**实测峰值 4.6 GB**（同一个进程里的两份权重），
+  # 所以 asr-long 的 est_vram_mb 要给 4700；diarize 占位 2600。
+  # 池子会按需加载 + LRU 腾地方，所以两档不常驻是正常的。
+  vram_budget_mb: 7000
+  # 容器里没有对应的环境变量要留给这里；TLS 见 先读我.md 的"进阶"一节（默认明文 http）。
+models:
+  # cuda | cpu。**要 cuda 而看不到 CUDA 时直接失败**，绝不回退 CPU ——
+  # 服务端一旦回退会把所有客户端一起拖慢，而且从指标上看不出原因。
+  device: cuda
+  specs:
+    # ---- 转写（长音频 / 会议分段）：按需加载 + LRU ----
+    - id: asr-long
+      slot: asr.long
+      impl: qwen3asr
+      resident: false           # 8 GB 卡上**不要**常驻（resident: true 会让 diarize 加载失败）
+      max_concurrency: 1
+      # qwen3asr + 强制对齐器的实测峰值 4.6 GB（2026-09-27 本机 8 GB 卡）。
+      # **必须把对齐器算进来**：supports 里的 asr.timestamps 就靠它。
+      est_vram_mb: 4700
+      modelVersion: qwen3-asr-0.6b
+      supports: [asr.text, asr.timestamps]
+    # ---- 说话人分离：**不是线程安全的**，并发只能 1 ----
+    - id: diarize
+      slot: diarize.turns
+      impl: pyannote
+      resident: false
+      max_concurrency: 1
+      est_vram_mb: 2600
+      modelVersion: pyannote-3.1-wespeaker-v1
+      vectorSpaceId: ws-resnet34-v1
+      dim: 256
+      supports: [diarize.embeddings]
+    # ---- 说话人嵌入：与上面**必须同一个 vectorSpaceId**（向量才能互相比对）----
+    - id: speaker-embed
+      slot: speaker.embed
+      impl: pyannote-embed
+      resident: false
+      max_concurrency: 1
+      est_vram_mb: 0
+      modelVersion: wespeaker-voxceleb-resnet34-LM-v1
+      vectorSpaceId: ws-resnet34-v1   # **必须**与 diarize 相同
+      dim: 256
+#
+# ===========================================================================
+# ⚠️ Turing（compute_cap = 7.5：GTX 16xx / RTX 20xx / T4 / Titan RTX）请看这里
+# ===========================================================================
+# Turing **没有 bf16**（bf16 要 sm_80+），而 qwen3asr 那条加载路径是按 bf16 请求的
+# （`app/audio/stt.py:342`：`dtype = "bf16" if use_cuda else "fp32"`，**写死的**）。
+# 所以 Turing 上 qwen3asr 现在**跑不了** —— 改成 fp16 是**引擎层的改动，本包没做**。
+# 退路是把上面那条 `asr-long` 整条换成下面这一条（把 `- id: asr-long` 到
+# `supports: [...]` 那 8 行替换掉），并**先把 SenseVoice 权重放进模型卷**
+# （`{模型根}/sensevoice/snapshots/master/{config.yaml,model.pt}`，见 先读我.md §4）。
+# 代价：SenseVoice 不给句级时间戳，`supports` 里因此**没有** asr.timestamps
+# （会议时间轴会退化成"按字数均摊"，那是客户端如实标注的估算，不是后端编的）。
+#
+#    - id: asr-long
+#      slot: asr.long
+#      impl: sensevoice
+#      resident: false
+#      max_concurrency: 1
+#      est_vram_mb: 1200          # ⚠️ 占位估算：跑一段真音频后按 /v1/health 的 vram.usedMb 校准
+#      modelVersion: sensevoice-small
+#      supports: [asr.text]       # 注意：**没有** asr.timestamps
+#
+# 改完重启容器：`docker compose up -d --force-recreate`（配置是挂进去的）。

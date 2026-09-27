@@ -396,9 +396,31 @@ async def _reject(request: Request, exc) -> None:
     未读数据让对端收到 RST，而 RST 会丢掉对端接收缓冲里的响应体。
     实测 0.9 MB 的 body + `?model=nope` → 404 但 body 为空（2 KB 时正常）——
     而且是竞态，偶尔才复现。完整说明见 `audio.drain`。
+
+    ## ⚠️ 但**声报超大**的请求不能抽（2026-09-28 真机实测的挂死）
+
+    `Content-Length: 999MB` 而实际只发几 KB 时，`drain` 的那个 `async for` 会**一直等**
+    （它的上限要"真收到那么多字节"才触发）—— 于是这条连接挂住，客户端在自己的超时前
+    **拿不到任何响应**（实测 12 秒超时；`scripts/smoke-echo-backend.py` 的 600 秒超时
+    表现为"卡住十分钟"）。这跟 `/asr` 里那条 `payload_too_large` 的特例是同一个道理：
+    声报超大的请求**只回状态码就够**（"413 = 太大了"不需要 code 去区分），
+    而且**绝不能**为了发一个错误去读一个可能永远发不完的 body。
     """
-    await audio_mod.drain(request)
+    if not _declared_over_limit(request):
+        await audio_mod.drain(request)
     raise exc
+
+
+def _declared_over_limit(request: Request) -> bool:
+    """这次请求**声报**的长度是不是已经超过 `limits.max_upload_bytes`。"""
+    try:
+        raw = str(request.headers.get("content-length") or "").strip()
+        if not raw.isdigit():
+            return False
+        limit = int(_st(request).cfg.get("limits.max_upload_bytes", 64 * 1024 * 1024))
+        return int(raw) > limit
+    except Exception:
+        return False
 
 
 def _finish_asr(engine, wav: str, lang: str, timestamps: bool, model_id: str,

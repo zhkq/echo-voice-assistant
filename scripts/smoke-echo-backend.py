@@ -339,10 +339,15 @@ def check_auth(c: Client, pair_code: str, insecure: bool):
     status, body, _, _ = authed.json("GET", "/v1/capabilities")
     _report(status == 200, "带令牌 → GET /v1/capabilities 200")
 
+    # ⚠️ 这条必须打**受保护**的端点：`/v1/capabilities`（以及 `/v1/health`、`/v1/ready`）
+    # **刻意不打鉴权** —— 探针要在没凭据时也能用（见 routes.py 里那三个端点的说明）。
+    # 所以乱填令牌打在它们身上仍然是 200，而原来的断言正是打在这上面：
+    # 2026-09-28 在真机上跑到这条才发现（`--pair-code` 以前排在最后，从没走到过这里）。
     status, body, _, _ = Client(c.base, token="garbage", timeout=60).json(
-        "GET", "/v1/capabilities")
+        "POST", "/v1/asr", body=b"\x00" * 2048, ctype="audio/wav")
     _report(status == 401 and body.get("code") == "unauthorized",
-            "乱填令牌 → 401 unauthorized", "got %s %s" % (status, body.get("code")))
+            "乱填令牌 → 401 unauthorized（打受保护的 /v1/asr）",
+            "got %s %s" % (status, body.get("code")))
     return tok["accessToken"]
 
 
@@ -379,6 +384,13 @@ def main(argv=None) -> int:
         return 1
 
     caps = check_basic(c)
+    # ⚠️ **鉴权链必须在拒绝路径之前**（2026-09-28 真机实测踩的坑）：
+    # 拒绝路径那些探针（空 body / 错的 Content-Type / 点名不存在的模型 / mode=turns）
+    # 在**开了鉴权**的服务端上必须先通过鉴权，否则一律拿到 401 —— 那时它们验的是
+    # "没凭据会被拒"，而不是"这些错误码分得清"。原来 `--pair-code` 放在最后跑，
+    # 于是 `--pair-code` 这个参数等于白给（真机上表现为 5 项全 FAIL）。
+    if args.pair_code:
+        c.token = check_auth(c, args.pair_code, args.insecure) or c.token
     data = b""
     if not args.skip_inference:
         wav = _find_sample(args.wav)
@@ -392,8 +404,6 @@ def main(argv=None) -> int:
     check_rejections(c, data)
     if not args.skip_inference and args.pair_code == "":
         check_gate(c, data)
-    if args.pair_code:
-        check_auth(c, args.pair_code, args.insecure)
     check_cleanup(c)
 
     bad = [n for ok, n in RESULTS if not ok]
