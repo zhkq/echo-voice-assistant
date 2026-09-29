@@ -2956,6 +2956,8 @@ let _capBackendBusy = false;
 let _capBackendPoll = null;
 let _capBackendLastDone = "";
 let _capBackendPlanBusy = false;
+//: 计划里那条路（container / portable / none）——「生成 compose」按钮只该在容器路时出现。
+let _capBackendPath = "";
 
 /* 只读计划（批 2）：**点按钮之前先给人看**。走容器路还是扩展包路、哪一档、多大、缺什么、
    先验哪一步，以及 nvidia-smi / docker 的原文。它比状态那一份贵（要问 docker 与显卡），
@@ -2977,6 +2979,8 @@ async function loadBackendPlan(force) {
 function renderBackendPlan(p) {
   const host = $("#capBackendPlan");
   if (!host) return;
+  _capBackendPath = String(p.path || "");
+  renderBackendOneClick(_capBackendCache || {});      // 按钮显隐跟着计划走
   const pathLabel = { container: "容器路（Docker）", portable: "扩展包路（不用容器）",
                       none: "两条路都不成立" }[p.path] || p.path;
   const bits = [`<b>${esc(pathLabel)}</b>`];
@@ -2992,6 +2996,12 @@ function renderBackendPlan(p) {
       + ((w.missing || []).length ? `，缺：${w.missing.map(esc).join("、")}` : ""));
   }
   if ((p.missing || []).length) lines.push(`缺：${p.missing.map(esc).join("；")}`);
+  // 容器路（批 4）：compose 文件可以在这里生成（只发布到宿主回环）；「一键拉镜像 + 起」还没做。
+  if (p.path === "container") {
+    lines.push("容器路：点「生成 compose」会把本机形态的 compose.yaml 写好"
+      + "（两个端口都只发布到 127.0.0.1）；起它用 <code>docker compose up -d</code>。"
+      + "<b>拉镜像/起容器这一步还没做</b>。");
+  }
   (p.notes || []).forEach((n) => lines.push(`· ${esc(n)}`));
   (p.verify || []).forEach((v) => lines.push(`先验一步：<code>${esc(v.command)}</code>（${esc(v.why)}）`));
   (p.reasons || []).forEach((r) => lines.push(`· ${esc(r)}`));
@@ -3020,6 +3030,7 @@ async function loadBackendOneClick() {
   _capBackendBusy = true;
   try {
     const r = await api("/api/capability/backend");
+    _capBackendCache = r;
     renderBackendOneClick(r);
   } catch (e) {
     const state = $("#capBackendState");
@@ -3056,6 +3067,11 @@ function renderBackendOneClick(be) {
     // **能停的判据是"我们起的那个还在跑"**（服务端按 pid 记录判），不是"端口上有人"——
     // 端口上可能是用户手工起的实例，那个我们绝不碰。
     stopBtn.classList.toggle("hidden", !be.running);
+  }
+  // 容器路那个按钮只在**计划说该走容器路**时出现（没 Docker 的机器上它没有意义）
+  const composeBtn = $("#btnCapBackendCompose");
+  if (composeBtn) {
+    composeBtn.classList.toggle("hidden", (_capBackendPath || "") !== "container");
   }
   if (state) {
     const bits = [];
@@ -3134,12 +3150,37 @@ async function doCapabilityBackendStop() {
   } catch (e) { toast(capBackendErrorText(e), 9000); }
 }
 
+async function doCapabilityBackendCompose() {
+  const btn = $("#btnCapBackendCompose");
+  if (btn) { btn.disabled = true; }
+  try {
+    const r = await api("/api/capability/backend/compose", { method: "POST" });
+    toast(r.message || "compose 已写好", 6000);
+    const host = $("#capBackendPlan");
+    if (host) {
+      const cmds = (r.commands || []).map((c) => `${esc(c.label)}：<code>${esc(c.command)}</code>`);
+      const verify = (r.verify || []).map((v) => `· ${esc(v)}`);
+      host.innerHTML += `<div>已写到 <code>${esc(r.path || "")}</code></div>`
+        + cmds.map((c) => `<div>${c}</div>`).join("")
+        + verify.map((v) => `<div>${v}</div>`).join("");
+    }
+  } catch (e) {
+    toast(capBackendErrorText(e), 9000);
+  } finally {
+    if (btn) { btn.disabled = false; }
+  }
+}
+
 const _btnCapBackendStart = $("#btnCapBackendStart");
 if (_btnCapBackendStart) _btnCapBackendStart.addEventListener("click", doCapabilityBackendStart);
 const _btnCapBackendStop = $("#btnCapBackendStop");
 if (_btnCapBackendStop) _btnCapBackendStop.addEventListener("click", doCapabilityBackendStop);
 const _btnCapBackendReady = $("#btnCapBackendReady");
 if (_btnCapBackendReady) _btnCapBackendReady.addEventListener("click", doCapabilityBackendReady);
+const _btnCapBackendCompose = $("#btnCapBackendCompose");
+if (_btnCapBackendCompose) {
+  _btnCapBackendCompose.addEventListener("click", doCapabilityBackendCompose);
+}
 
 /** 三层就绪自测（批 3）。**这是一次真推理**（1 秒音频），所以只在人点的时候跑 ——
  *  面板轮询只显示服务端保留的"上一次结论"。 */

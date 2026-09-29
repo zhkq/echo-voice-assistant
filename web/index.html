@@ -330,6 +330,9 @@
             <button class="btn" id="btnCapBackendReady"
                     title="再跑一次三层就绪自测：/v1/health → /v1/ready → 一次真实转写（1 秒音频）">
               就绪自测</button>
+            <button class="btn hidden" id="btnCapBackendCompose"
+                    title="容器路：把本机形态的 compose.yaml 写下来（只发布到宿主回环）。不起容器 —— 起它两条命令在下面">
+              生成 compose</button>
             <span class="muted" id="capBackendState" style="font-size:12px"></span>
           </div>
           <div class="muted" id="capBackendJob" style="font-size:12px"></div>

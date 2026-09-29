@@ -174,6 +174,44 @@ def _cap_float(raw) -> float:
         return 0.0
 
 
+def check_torch_abi(python_exe: str, timeout: float = 180.0) -> Dict[str, Any]:
+    """跑一次 torch/torchaudio 的 **ABI 校验** → ``{"ok", "torch", "torchaudio", "error"}``。
+
+    判据照 `server/Dockerfile` 构建期那一条：**两者的 CUDA 源标签必须一致**（都带 `+cu126`），
+    并且 `import torchaudio` 必须通过。**版本号相等不是判据**（PyTorch 2.9 之后 torchaudio
+    停更，版本号天生对不上，见 `AGENTS.md`）。返回的 `error` 是**原文**
+    （"报校验原文"是实施方案 §4 那两行要求的）。
+
+    单独抽成一个函数，是因为**两个地方都要它**：前置探测（`runtime()`）与扩展包出包的
+    安装期校验（`scripts/build_backend_portable.py`）—— 两份实现迟早会有一份漏掉。
+    """
+    out: Dict[str, Any] = {"ok": False, "torch": "", "torchaudio": "", "error": ""}
+    if not python_exe or not os.path.isfile(str(python_exe)):
+        out["error"] = "没有解释器：%s" % (python_exe or "（空）")
+        return out
+    code = ("import torch, torchaudio, sys;"
+            "t = torch.__version__; a = torchaudio.__version__;"
+            "tc = t.split('+')[1] if '+' in t else '';"
+            "ac = a.split('+')[1] if '+' in a else '';"
+            "print(t); print(a);"
+            "sys.exit(0 if (tc and tc == ac) else 3)")
+    res = _run([str(python_exe), "-c", code], timeout=timeout)
+    lines = [ln for ln in (res.get("stdout") or "").splitlines() if ln.strip()]
+    if len(lines) >= 2:
+        out["torch"] = lines[0].strip()
+        out["torchaudio"] = lines[1].strip()
+    if res["ok"]:
+        out["ok"] = True
+        return out
+    out["error"] = (res.get("stderr") or res.get("error") or
+                    "torch/torchaudio 的 CUDA 源标签不一致").strip()[:800]
+    if res.get("code") == 3:
+        out["error"] = ("torch %s 与 torchaudio %s 不是同一个 CUDA 源（标签不一致）—— "
+                        "症状是每个 /v1/asr 都 503 model_failed"
+                        % (out["torch"] or "?", out["torchaudio"] or "?"))
+    return out
+
+
 def runtime() -> Dict[str, Any]:
     """扩展包那条路的运行时：在不在（+ 装了的话做一次 torch/torchaudio 的 ABI 校验）。
 
@@ -191,28 +229,9 @@ def runtime() -> Dict[str, Any]:
     if not exe:
         out["error"] = "还没装运行时（%s 下没有 runtime/）" % backend_proc.backend_root()
         return out
-    code = ("import torch, torchaudio, sys;"
-            "t = torch.__version__; a = torchaudio.__version__;"
-            "tc = t.split('+')[1] if '+' in t else '';"
-            "ac = a.split('+')[1] if '+' in a else '';"
-            "print(t); print(a);"
-            "sys.exit(0 if (tc and tc == ac) else 3)")
-    res = _run([exe, "-c", code], timeout=180.0)
-    lines = [ln for ln in (res.get("stdout") or "").splitlines() if ln.strip()]
-    if len(lines) >= 2:
-        out["torch"] = lines[0].strip()
-        out["torchaudio"] = lines[1].strip()
-    if res["ok"]:
-        out["abiOk"] = True
-        return out
-    out["abiOk"] = False
-    # 报**原文**（实施方案 §4："torch 装上但 ABI 不符 → 报校验原文"）
-    out["error"] = (res.get("stderr") or res.get("error") or
-                    "torch/torchaudio 的 CUDA 源标签不一致").strip()[:800]
-    if res.get("code") == 3:
-        out["error"] = ("torch %s 与 torchaudio %s 不是同一个 CUDA 源（标签不一致）—— "
-                        "症状是每个 /v1/asr 都 503 model_failed"
-                        % (out["torch"] or "?", out["torchaudio"] or "?"))
+    abi = check_torch_abi(exe)
+    out.update({"abiOk": bool(abi["ok"]), "torch": abi["torch"],
+                "torchaudio": abi["torchaudio"], "error": abi["error"]})
     return out
 
 

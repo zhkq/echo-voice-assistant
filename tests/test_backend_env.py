@@ -218,17 +218,26 @@ class ProbeTests(unittest.TestCase):
 
     def test_the_runtime_abi_check_compares_cuda_tags_not_versions(self):
         """判据是**CUDA 源标签一致**（都带 `+cu126`），不是版本号相等（AGENTS.md 记过）。"""
+        fake_python = os.path.join(self.tmp, "fake-python")
+        with open(fake_python, "w", encoding="utf-8") as fh:
+            fh.write("#!/bin/sh\n")             # 只要"这个文件在"（ABI 校验前的存在性检查）
+
         def _fake_run(argv, timeout=8.0):
             return {"ok": False, "code": 3, "stdout": "2.14.0+cu126\n2.11.0+cpu\n",
                     "stderr": "", "error": ""}
 
         with mock.patch.object(backend_env.backend_proc, "python_exe",
-                               lambda: "/fake/python"), \
+                               lambda: fake_python), \
                 mock.patch.object(backend_env, "_run", _fake_run):
             info = backend_env.runtime()
         self.assertIs(info["abiOk"], False)
         self.assertIn("不是同一个 CUDA 源", info["error"])
         self.assertIn("torch 2.14.0+cu126", info["error"])
+
+    def test_the_abi_check_rejects_a_missing_interpreter(self):
+        got = backend_env.check_torch_abi(os.path.join(self.tmp, "nope"))
+        self.assertFalse(got["ok"])
+        self.assertIn("没有解释器", got["error"])
 
     def test_the_runtime_is_reported_missing_without_a_python(self):
         with mock.patch.object(backend_env.backend_proc, "python_exe", lambda: ""):

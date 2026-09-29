@@ -328,6 +328,33 @@ def api_capability_backend_ready(diarize: bool = False, _auth=Depends(optional_a
     return {"ok": True, "message": message, "ready": backend_admin.last_ready()}
 
 
+@router.get("/capability/backend/compose")
+def api_capability_backend_compose(_auth=Depends(optional_auth)):
+    """**预览**容器路的 `compose.yaml`（批 4）：不写盘、不起容器，只给人看。
+
+    返回渲染出来的原文 + 起它的命令 + **必须做的验收**（本机 `compose config`；
+    **另一台机器** `curl http://<本机 IP>:8900/v1/health` 必须连不上 —— 那才是
+    "只绑了回环"的判据，实施方案 §5 的批 4 验收写的就是它）。
+    """
+    from app import backend_docker
+    return {"available": backend_docker.available(),
+            "path": backend_docker.compose_path(),
+            "text": backend_docker.render_compose(),
+            "commands": backend_docker.commands(),
+            "verify": backend_docker.verify_notes()}
+
+
+@router.post("/capability/backend/compose")
+def api_capability_backend_compose_write(_auth=Depends(optional_auth)):
+    """把容器路的 `compose.yaml` **写下来**（内容变了先备份）。不起容器。"""
+    from app import backend_docker
+    info = backend_docker.write_compose()
+    if not info.get("ok"):
+        raise HTTPException(status_code=400, detail=info.get("detail") or "写 compose 失败")
+    return {"ok": True, "message": info["detail"], "path": info["path"],
+            "commands": backend_docker.commands(), "verify": backend_docker.verify_notes()}
+
+
 # ---------------------------------------------------------------- 状态与配置
 @router.get("/status")
 def api_status(_auth=Depends(optional_auth)):

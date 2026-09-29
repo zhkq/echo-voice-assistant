@@ -420,6 +420,24 @@ class EndpointTests(_Isolated):
         self.assertFalse(ok)
         self.assertIn("没跑起来", message)
 
+    def test_the_compose_endpoints_preview_then_write(self):
+        """批 4：容器路的 compose —— 先**预览**（不写盘），再写（内容变了先备份）。"""
+        r = self.client.get("/api/capability/backend/compose")
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertIn("services:", body["text"])
+        self.assertIn("127.0.0.1:8900:8900", body["text"])
+        self.assertTrue(body["commands"] and body["verify"])
+        self.assertFalse(os.path.exists(body["path"]), "预览不该写盘")
+
+        r = self.client.post("/api/capability/backend/compose")
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertTrue(os.path.isfile(r.json()["path"]))
+        # 落在**临时**的后端目录里（用例隔离），而且只发布到回环
+        self.assertTrue(r.json()["path"].startswith(self.tmp))
+        with open(r.json()["path"], "r", encoding="utf-8") as fh:
+            self.assertIn("127.0.0.1:8901:8901", fh.read())
+
     def test_stop_reports_the_service_sentence(self):
         with mock.patch.object(backend_proc, "stop",
                                lambda **kw: (True, "已停止 ECHO 起的后端（pid=1）")):

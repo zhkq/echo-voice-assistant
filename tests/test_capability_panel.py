@@ -195,8 +195,8 @@ class BackendOneClickWiringTests(unittest.TestCase):
 
     def test_the_card_has_every_element_it_reaches_for(self):
         for el in ("btnCapBackendStart", "btnCapBackendStop", "btnCapBackendReady",
-                   "capBackendState", "capBackendJob", "capBackendPlan",
-                   "capBackendReady", "capBackendNotes"):
+                   "btnCapBackendCompose", "capBackendState", "capBackendJob",
+                   "capBackendPlan", "capBackendReady", "capBackendNotes"):
             with self.subTest(id=el):
                 self.assertIn('id="%s"' % el, self.html, "HTML 里没有这个元素")
                 self.assertIn(el, self.js_ids, "HTML 里有，但 JS 从来没引用它")
@@ -206,9 +206,18 @@ class BackendOneClickWiringTests(unittest.TestCase):
         for ep in ("/api/capability/backend",
                    "/api/capability/backend/start",
                    "/api/capability/backend/stop",
-                   "/api/capability/backend/ready"):
+                   "/api/capability/backend/ready",
+                   "/api/capability/backend/compose"):
             with self.subTest(endpoint=ep):
                 self.assertIn(ep, self.js, "面板没调 %s" % ep)
+
+    def test_the_compose_button_is_only_shown_on_the_container_path(self):
+        """容器路才给「生成 compose」（批 4）—— 没 Docker 的机器上它没有意义。"""
+        self.assertIn('class="btn hidden" id="btnCapBackendCompose"', self.html)
+        render = self._fn("renderBackendOneClick")
+        self.assertIn("_capBackendPath", render)
+        self.assertIn("btnCapBackendCompose", render)
+        self.assertIn("_capBackendPath = String(p.path", self._fn("renderBackendPlan"))
 
     def test_the_ready_line_is_rendered_from_the_servers_last_result(self):
         """三层就绪（批 3）：面板显示**服务端保留的上一次结论**，不自己再跑一遍真推理。"""
