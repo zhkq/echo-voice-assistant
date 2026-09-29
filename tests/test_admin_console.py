@@ -12,6 +12,9 @@
    每个动作（含失败）落审计。原来那条"管理面一个写端点都不许有"的用例改成了
    **写端点逐个登记 + 逐条实测**（`WRITE_ENDPOINTS` / `WriteGuardTests`）——
    加端点是允许的，但"忘了加防护"必须红。
+   其中"同站"= **`Origin` 的 host:port 等于这次请求自己的 `Host`，且主机名是回环名**
+   （`SameSiteWriteRuleTests` 钉那张判据表；**不是**"等于配置里 `admin_listen` 的端口"
+   —— 那条会让 `ssh -L` 隧道用户写不了，2026-09-29 修）。
 4. **只读那半边不许被一起锁死**：`/overview` 这些照旧只需要登录（不要求写请求那几个头）。
 
 写用例的通用做法：**从 `openapi()` 现读写端点**（`_AdminCase.write_requests`），
@@ -27,6 +30,7 @@ import os
 import sys
 import tempfile
 import time
+import types
 import unittest
 from unittest.mock import patch
 
@@ -36,6 +40,7 @@ from fastapi import FastAPI                                          # noqa: E40
 from fastapi.testclient import TestClient                            # noqa: E402
 
 from server import admin as admin_mod                                # noqa: E402
+from server import advertised as advertised_mod                      # noqa: E402
 from server import engines, errors, main as server_main              # noqa: E402
 from server import limits as limits_mod                              # noqa: E402
 from server import ops as ops_mod                                    # noqa: E402
@@ -81,6 +86,11 @@ WRITE_ENDPOINTS = {
     #    （请求体里的 `username` 只用来**拒绝**）。新增 / 删除 / 禁用管理员、
     # 改**别人**的口令仍然只在命令行 —— 见 `PasswordChangeConsoleTests`。
     "/admin/api/password",
+    # 对外公布地址（配对串里的 host）。2026-09-30 用户实测的 bug：容器里发出来的串
+    # 带的是 **Docker 网桥地址**（`172.18.0.2`），而"同事能连到哪台机器"只有部署的人
+    # 知道 —— 每次靠人手改串。它与运行参数同一套闸门 + 审计
+    # （action = `advertised-host-set`），值存在 state 卷（重启还在）。
+    "/admin/api/advertised-host",
 }
 
 
@@ -160,9 +170,10 @@ class SessionStoreTests(unittest.TestCase):
 class _AdminCase(unittest.TestCase):
     """一个装了管理员账号的 app（假引擎、临时库）。"""
 
-    #: 管理面测试用的 base_url。**必须是回环地址**：写请求的同站校验拿它当 `Host`，
-    #: 而 `Host: testserver`（TestClient 的默认值）不是本站 —— 那会把每个写用例
-    #: 都变成 403，而且是"测出来的 403"而不是"真的拦住了"。
+    #: 管理面测试用的 base_url。**必须是回环地址**：写请求的同站校验拿它当 `Host`
+    #: （`Origin` 必须与它同主机同端口），而 `Host: testserver`（TestClient 的默认值）
+    #: 不是回环名 —— 那会把每个写用例都变成 403，而且是"测出来的 403"而不是"真的拦住了"。
+    #: 要造"从别的端口进来"（`ssh -L` 隧道）的场景，用 `wheaders(host=…)` 覆盖 `Host`。
     ADMIN_BASE = "http://127.0.0.1:8901"
 
     def setUp(self):
@@ -223,7 +234,7 @@ class _AdminCase(unittest.TestCase):
 
     # ---- 写请求的公共头（缺一个就该被拒，所以它们是显式拼出来的）----
 
-    def wheaders(self, *, csrf=True, header=True, origin="http://127.0.0.1:8901"):
+    def wheaders(self, *, csrf=True, header=True, origin="http://127.0.0.1:8901", host=None):
         h = {}
         if csrf:
             h["X-CSRF-Token"] = self.csrf
@@ -231,6 +242,11 @@ class _AdminCase(unittest.TestCase):
             h[admin_mod.WRITE_HEADER] = "1"
         if origin:
             h["Origin"] = origin
+        if host:
+            # 覆盖 `Host`：模拟"浏览器其实是从**另一个地址**进来的"（`ssh -L` 隧道、
+            # 域名别名…）。同站判据比的就是它与 `Origin` 对不对得上，所以这是造
+            # "隧道端口 / 别的端口 / 非回环" 这几类场景的唯一手段。
+            h["Host"] = host
         return h
 
     def wpost(self, path, payload=None, **kw):
@@ -529,10 +545,99 @@ class WriteGuardTests(_AdminCase):
                 self.assertIn("Origin", r.json()["detail"])
 
     def test_the_same_host_on_another_port_is_not_the_same_site(self):
+        """同主机、别的端口 → 403。
+
+        判据是"`Origin` 的 host:port 要等于**这次请求自己的 `Host`**"：这里 `Host`
+        是 8901（TestClient 的 `base_url`），而 `Origin` 指着 9999 —— 不是同一个站。
+        **注意它不再是"`Origin` 必须等于配置里 `admin_listen` 的端口"**：那条会把
+        经 `ssh -L 18901` 进来的用户挡在门外（见 `test_a_tunnel_port_is_the_same_site`）。
+        """
         self.login()
         r = self.wpost("/admin/api/clients/cli-nope/disable",
                        origin="http://127.0.0.1:9999")
         self.assertEqual(r.status_code, 403, r.text)
+
+    def test_a_tunnel_port_is_the_same_site(self):
+        """`ssh -L 18901:127.0.0.1:8901` 那条路（文档推荐的管理面用法）**必须放行**。
+
+        浏览器眼里的本站是 `http://127.0.0.1:18901`，所以 `Host` 与 `Origin` 都是
+        它 —— 同站。这就是用户踩了两次的那个 bug：旧判据要求 `Origin` 恰好等于配置里
+        `admin_listen` 的 `:8901`，于是"发配对码 / 保存运行参数 / 改自己口令"经隧道
+        一律 403，报的还是"写请求的 Origin/Referer 不是本站（http://127.0.0.1:18901）"
+        —— 看着像安全问题，其实是判据错了；本机 8901 常被别的后端占着，换个本地端口
+        不是错。
+
+        断言到 **200 + 真的落了库**：只断言"不是 403"会放过"闸门放行了但动作失败"。
+        """
+        self.login()
+        before = self.db_state()
+        r = self.ac.post("/admin/api/pairing-codes",
+                         json={"name": "隧道里发的授权", "scopes": "asr"},
+                         headers=self.wheaders(host="127.0.0.1:18901",
+                                               origin="http://127.0.0.1:18901"))
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertIn("echo://pair?", (r.json().get("pairingCode") or {}).get("url", ""))
+        self.assertNotEqual(self.db_state(), before, "闸门放行了，但写动作没落库")
+        self.assertIn("issue-pairing-code", [a for _who, a, _t in self.audit_rows()],
+                      "写动作必须留下一条审计（操作者是登录的管理员名）")
+
+    def test_the_local_malicious_page_on_another_port_is_refused(self):
+        """**本机恶意网页**（`http://127.0.0.1:6666`）向管理面发请求 → 403。
+
+        这是新判据要防的主场景，也是"比 `Host` 相等"这条的**正面拦截**：恶意页与
+        管理面在**同一台机器、同一个主机名**上，只有端口不同 —— 浏览器发的 `Origin`
+        是 `http://127.0.0.1:6666`，而请求的 `Host` 是管理面那个端口 → 端口不等 → 拒。
+        （域名不同那条见 `test_a_cross_site_origin_is_refused`。）
+
+        两种 `Host` 都测：浏览器直连 8901，以及经隧道开在 18901 的页面被 6666 上的
+        恶意页打 —— 后者才是"用户换了端口"以后攻击者会试的形状。
+        """
+        self.login()
+        for host in ("127.0.0.1:8901", "127.0.0.1:18901"):
+            with self.subTest(host=host):
+                r = self.ac.post("/admin/api/pairing-codes", json={"name": "x"},
+                                 headers=self.wheaders(host=host,
+                                                       origin="http://127.0.0.1:6666"))
+                self.assertEqual(r.status_code, 403, r.text)
+                self.assertIn("Origin", r.json()["detail"])
+
+    def test_a_non_loopback_host_is_refused_even_when_the_origin_matches_it(self):
+        """`Host` 不是回环名 → 403，**哪怕 `Origin` 与它一模一样**。
+
+        这就是 DNS-rebinding 的形状：攻击者把 `evil.example` 解析到 `127.0.0.1`，
+        受害者的浏览器于是访问 `http://evil.example:8901` —— 这时 `Host` 与 `Origin`
+        **都是** `evil.example:8901`，只比"两者相等"是挡不住的；"主机名必须是回环名"
+        这一条才是那道闸。`10.100.0.24` 是同类的"真实网卡地址"（也不是本站）。
+
+        所以：**"允许额外受信来源"这种开关不能有** —— 一开就等于把这条判据退化成
+        "任意来源"（详见 `admin_mod.same_site_write` 的注释）。
+        """
+        self.login()
+        for host in ("evil.example:8901", "10.100.0.24:8901"):
+            with self.subTest(host=host):
+                r = self.ac.post("/admin/api/pairing-codes", json={"name": "x"},
+                                 headers=self.wheaders(host=host,
+                                                       origin="http://" + host))
+                self.assertEqual(r.status_code, 403, r.text)
+                self.assertIn("Origin", r.json()["detail"])
+
+    def test_a_referer_with_the_tunnel_port_is_accepted_too(self):
+        """`Origin` 缺失时用 `Referer` 兜底 —— 隧道端口下同样成立（**等价迁移**，不放宽）。
+
+        旧实现允许"`Origin` 缺失 + `Referer` 是本站"，新判据只是把"本站"的定义从
+        "配置里的端口"换成"请求自己的 `Host`"，这条兜底一个字都没变：
+        `Referer` 里取出来的 host:port 照样要等于 `Host`，也照样只认回环名。
+        """
+        self.login()
+        good = self.wheaders(origin=None, host="127.0.0.1:18901")
+        good["Referer"] = "http://127.0.0.1:18901/admin/"
+        r = self.ac.post("/admin/api/clients/cli-nope/disable", json={}, headers=good)
+        # 过了闸门才会走到"没有这个客户端"那句 —— 404 就是放行的证据
+        self.assertEqual(r.status_code, 404, r.text)
+        bad = self.wheaders(origin=None, host="127.0.0.1:18901")
+        bad["Referer"] = "http://127.0.0.1:6666/admin/"
+        r2 = self.ac.post("/admin/api/clients/cli-nope/disable", json={}, headers=bad)
+        self.assertEqual(r2.status_code, 403, r2.text)
 
     def test_no_origin_and_no_referer_is_refused(self):
         """两个都没有 → 403（**不猜**"看着像同源就当同源"，那正是 CSRF 的入口）。"""
@@ -597,15 +702,89 @@ class WriteGuardTests(_AdminCase):
         self.assertEqual(self.audit_rows(), [])
 
 
+class SameSiteWriteRuleTests(unittest.TestCase):
+    """`same_site_write()` 的判据表 —— **不启 app**，只喂请求头。
+
+    分层是有意的：上面 `WriteGuardTests` 从真实路由打进去（证明闸门真的挂在中间件上、
+    401/403 的顺序没变），这里只钉"哪一对 `Host`/`Origin` 算同站"这一张表。那些边角
+    （缺 `Host`、`Host` 不带端口、`127.0.0.1` 与 `localhost` 互换、默认端口归一、
+    `Origin` 存在时不看 `Referer`）用 TestClient 很难造，而它们恰恰是"放宽一点点
+    就出事"的地方。
+
+    **规则只有两条**：① `Origin`（没有就 `Referer`）的 host:port 等于这次请求自己的
+    `Host`；② `Host` 的主机名是回环名且带端口。下面每一条拒绝都对应一种真实的攻击
+    形状或一种"解析失败"，每一条放行都对应一种合法的访问方式。
+    """
+
+    @staticmethod
+    def _req(host=None, origin=None, referer=None):
+        headers = {}
+        if host is not None:
+            headers["host"] = host
+        if origin is not None:
+            headers["origin"] = origin
+        if referer is not None:
+            headers["referer"] = referer
+        return types.SimpleNamespace(headers=headers)
+
+    #: (说明, Host, Origin, Referer, 期望)
+    RULE_TABLE = (
+        # ---- 放行：浏览器从本站页面发出的请求 ----
+        ("配置端口直连（127.0.0.1:8901）", "127.0.0.1:8901", "http://127.0.0.1:8901", None, True),
+        ("ssh -L 隧道端口（18901）——用户实际用法",
+         "127.0.0.1:18901", "http://127.0.0.1:18901", None, True),
+        ("localhost 隧道", "localhost:18901", "http://localhost:18901", None, True),
+        ("IPv6 回环", "[::1]:8901", "http://[::1]:8901", None, True),
+        ("主机名大小写不敏感", "LOCALHOST:18901", "http://localhost:18901", None, True),
+        ("https 同 host:port（反代场景；旧实现也两种 scheme 都收）",
+         "127.0.0.1:8901", "https://127.0.0.1:8901", None, True),
+        ("http 省略端口 = 80", "127.0.0.1:80", "http://127.0.0.1", None, True),
+        ("Origin 缺失 + Referer 是同一站（兜底，等价迁移）",
+         "127.0.0.1:18901", None, "http://127.0.0.1:18901/admin/", True),
+        # ---- 拒绝：攻击形状 ----
+        ("本机恶意页在别的端口（要防的主场景）",
+         "127.0.0.1:8901", "http://127.0.0.1:6666", None, False),
+        ("同上，管理面经隧道开在 18901 时",
+         "127.0.0.1:18901", "http://127.0.0.1:6666", None, False),
+        ("攻击者域名解析到 127.0.0.1：Host 与 Origin **相同**也必须拒（DNS-rebinding）",
+         "evil.example:8901", "http://evil.example:8901", None, False),
+        ("真实网卡地址（不是回环）", "10.100.0.24:8901", "http://10.100.0.24:8901", None, False),
+        ("端口后缀伪装：127.0.0.1:8901.evil.example",
+         "127.0.0.1:8901", "http://127.0.0.1:8901.evil.example", None, False),
+        ("Referer 是别的站", "127.0.0.1:18901", None, "http://evil.example/admin/", False),
+        ("Origin 存在时不看 Referer（Referer 是本站也不行）",
+         "127.0.0.1:8901", "http://127.0.0.1:6666", "http://127.0.0.1:8901/admin/", False),
+        ("userinfo 伪装：http://127.0.0.1:8901@evil.example",
+         "127.0.0.1:8901", "http://127.0.0.1:8901@evil.example", None, False),
+        # ---- 拒绝：失败关闭（解析不出来 / 缺东西）----
+        ("两个回环别名互换（Host localhost / Origin 127.0.0.1）—— 失败关闭",
+         "localhost:18901", "http://127.0.0.1:18901", None, False),
+        ("没有 Host 头", None, "http://127.0.0.1:8901", None, False),
+        ("Host 不带端口", "127.0.0.1", "http://127.0.0.1", None, False),
+        ("Host 是通配地址（不是浏览器会发的值）",
+         "0.0.0.0:8901", "http://0.0.0.0:8901", None, False),
+        ("Origin 与 Referer 都没有", "127.0.0.1:8901", None, None, False),
+        ("Origin 不是 scheme://host 形状", "127.0.0.1:8901", "127.0.0.1:8901", None, False),
+        ("Origin 带路径（浏览器不会这么发）",
+         "127.0.0.1:8901", "http://127.0.0.1:8901/admin/", None, False),
+    )
+
+    def test_the_rule_table(self):
+        for why, host, origin, referer, want in self.RULE_TABLE:
+            with self.subTest(why=why, host=host, origin=origin, referer=referer):
+                req = self._req(host=host, origin=origin, referer=referer)
+                self.assertEqual(admin_mod.same_site_write(req), want, why)
+
+
 class WildcardAdminListenWriteTests(_AdminCase):
     """管理面绑**通配地址**时（容器里必须这样，见 `server/compose.yaml`），同站判定仍要过。
 
     容器方案的全部前提就是这一条：进程绑 `0.0.0.0:8901`（绑回环的话宿主与 `ssh -L`
-    都进不来），而浏览器访问的是 `http://127.0.0.1:8901`。如果 `allowed_origins()`
-    依赖 `admin_listen` 的**字面 host**，这里就会 403 —— 而现象是
-    "管理页面能打开、一按按钮就失败"，很难联想到是监听地址写法的问题。
+    都进不来），而浏览器访问的是 `http://127.0.0.1:8901`。同站判据取的是
+    **请求自己的 `Host`**（不是 `admin_listen` 的字面 host/port），所以监听写法
+    ——`0.0.0.0`、`127.0.0.1`、还是别的——**结构上**不会改变判定结果。
 
-    同时钉住反面：通配监听**不许**把白名单放宽成"谁的 Origin 都收"（那才是真正的
+    同时钉住反面：通配监听**不许**把判据放宽成"谁的 Origin 都收"（那才是真正的
     安全削弱），这一点由 `Origin: http://gpu-01:8901` 与 `http://evil.example:8901`
     两条实测挡住。
     """
@@ -625,6 +804,28 @@ class WildcardAdminListenWriteTests(_AdminCase):
         self.assertIn("echo://pair?", code)
         self.assertIn("issue-pairing-code", [a for _who, a, _t in self.audit_rows()],
                       "写动作必须留下一条审计（操作者是登录的管理员名）")
+
+    def test_a_tunnel_port_goes_through_and_the_bind_address_does_not_matter(self):
+        """绑 `0.0.0.0` + 浏览器从 `ssh -L 18901` 进来 → 放行。
+
+        这两个事实叠在一起才是用户报的那个 bug 现场：容器里**必须**绑通配，而部署的
+        人几乎总是经隧道访问（宿主 8901 常被占用）。旧判据把端口钉在 `admin_listen`
+        上，于是这种写法 403；新判据一个字节都不读配置，所以"绑什么地址"与"从哪个
+        本地端口进来"都不影响 —— 这一条同时钉住这两件事。
+
+        动作用的是**保存运行参数**（用户报的第二个写动作），断言到读回来一致：
+        证明它不只是"没被拒"，而是真的写进去了。
+        """
+        self.login()
+        r = self.ac.post("/admin/api/limits",
+                         json={"maxConcurrent": 9, "perClientConcurrent": 2, "queueMax": 3},
+                         headers=self.wheaders(host="127.0.0.1:18901",
+                                               origin="http://127.0.0.1:18901"))
+        self.assertEqual(r.status_code, 200, r.text)
+        back = self.ac.get("/admin/api/limits").json()
+        self.assertEqual(back["limits"],
+                         {"maxConcurrent": 9, "perClientConcurrent": 2, "queueMax": 3})
+        self.assertEqual(back["source"]["maxConcurrent"], "admin")
 
     def test_the_wildcard_listen_does_not_widen_the_origin_whitelist(self):
         self.login()
@@ -1958,6 +2159,236 @@ class LimitsPageTests(_AdminCase):
         self.assertIn("queueNote", self.ac.get("/admin/api/limits").text)
 
 
+class AdvertisedHostConsoleTests(_AdminCase):
+    """「对外公布地址」：容器里发出来的配对串不该是 Docker 网桥地址（2026-09-30 用户实测）。
+
+    这一组盯五件事（与 `LimitsConsoleTests` 逐条对应，因为它们是同一个形状的东西）：
+
+    1. **与其它写动作同一套闸门**：未登录 401；错 Origin / 缺 `X-ECHO-Admin` / 缺 CSRF → 403，
+       而且**被挡回来时值一个都没变**（只断言状态码是不够的）；
+    2. 保存 → 读回一致（含"来源 = 管理面"）；
+    3. 非法值 → **400 + 中文原因**，值不变、库不动；空串 = 清空（回到自动探测）；
+    4. **热生效**：保存完**下一次发码**就用它（判据是"串里那个 host 变了"，
+       不是"库里读得到"）；
+    5. **持久化**：重开库 + 一份全新 cfg 之后仍然生效（= 重启后还在）。
+    """
+
+    def _view(self):
+        r = self.ac.get("/admin/api/advertised-host")
+        self.assertEqual(r.status_code, 200, r.text)
+        return r.json()
+
+    def _save(self, value):
+        return self.wpost("/admin/api/advertised-host", {"value": value})
+
+    def _issue(self, **extra):
+        payload = {"name": "cli-x", "scopes": "asr"}
+        payload.update(extra)
+        return self.wpost("/admin/api/pairing-codes", payload)
+
+    def test_the_read_needs_a_login(self):
+        r = self.ac.get("/admin/api/advertised-host")
+        self.assertEqual(r.status_code, 401, r.text)
+        self.assertEqual(r.json()["code"], "unauthorized")
+
+    def test_every_gate_refuses_and_the_value_does_not_move(self):
+        def now():
+            return (str(self.cfg.get("server.advertised_host", "")),
+                    self.state.auth.store.advertised_override())
+
+        before = now()
+        r = self.ac.post("/admin/api/advertised-host", json={"value": "10.100.0.24"})
+        self.assertEqual(r.status_code, 401, r.text)
+        self.login()
+        for kw in ({"origin": "http://evil.example"}, {"header": False}, {"csrf": False}):
+            with self.subTest(gate=sorted(kw)):
+                r = self.wpost("/admin/api/advertised-host", {"value": "10.100.0.24"}, **kw)
+                self.assertEqual(r.status_code, 403, r.text)
+        self.assertEqual(now(), before, "被闸门挡回来的请求居然改了生效值")
+        self.assertEqual(self.state.auth.store.advertised_override(), "",
+                         "被闸门挡回来的请求居然落了库")
+
+    def test_without_it_the_source_is_the_probe_and_the_honest_note_survives(self):
+        """**没配**：来源写 `auto`，并把"这是本机探测到的"如实说出来 —— 不猜局域网 IP。"""
+        self.login()
+        got = self._view()
+        self.assertEqual(got["value"], "")
+        self.assertEqual(got["source"], "auto")
+        self.assertTrue(got["url"], "没配也得报出'此刻发码会用哪个地址'（探测结果）")
+        self.assertIn("本机探测", got["note"])
+        self.assertTrue(any("自动探测" in n or "本机探测" in n
+                            for n in [got["priorityNote"]]))
+
+    def test_the_form_note_names_all_three_deployments(self):
+        """页面那栏必须把三种形态讲清楚 —— 否则管理员会以为"填一次就全对了"。"""
+        self.login()
+        note = self._view()["formNote"]
+        for want in ("每次发码", "127.0.0.1", "局域网", "各写各的"):
+            with self.subTest(want=want):
+                self.assertIn(want, note)
+
+    def test_save_then_read_back_and_the_next_code_uses_it(self):
+        """**热生效**：判据是**下一次发码的串里那个 host 变了**。
+
+        只断言"库里读得到"的话，"发码那条路在启动时缓存了地址"这种错会照样绿 ——
+        而那正是这个 bug 最可能的回归形态。
+        """
+        self.login()
+        r = self._save("10.100.0.24")
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertTrue(body["ok"])
+        self.assertEqual(body["saved"], "10.100.0.24")
+        self.assertEqual(body["source"], "admin")
+        again = self._view()
+        self.assertEqual(again["value"], "10.100.0.24")
+        self.assertEqual(again["source"], "admin")
+        self.assertEqual(again["updatedBy"], "ops")
+        self.assertTrue(again["updatedAt"] > 0)
+        self.assertIn("host=http://10.100.0.24:8900&code=",
+                      self._issue().json()["pairingCode"]["url"])
+
+    def test_a_per_issue_override_does_not_change_the_global_value(self):
+        """同一台后端同时服务本机与远程 → 发码时**各写各的**，全局那一项不动。"""
+        self.login()
+        self.assertEqual(self._save("10.100.0.24").status_code, 200)
+        url = self._issue(advertisedHost="127.0.0.1").json()["pairingCode"]["url"]
+        self.assertIn("host=http://127.0.0.1:8900&code=", url)
+        self.assertEqual(self._view()["value"], "10.100.0.24", "按张覆盖不该改全局值")
+        # 下一张（不带覆盖）仍然用全局那一项
+        self.assertIn("host=http://10.100.0.24:8900&code=",
+                      self._issue().json()["pairingCode"]["url"])
+
+    def test_blank_clears_it_and_returns_to_the_probe(self):
+        self.login()
+        self.assertEqual(self._save("10.100.0.24").status_code, 200)
+        r = self._save("")
+        self.assertEqual(r.status_code, 200, r.text)
+        got = self._view()
+        self.assertEqual(got["value"], "")
+        self.assertEqual(got["source"], "auto", "清空之后来源必须回到自动探测")
+        self.assertFalse(self.state.auth.store.advertised_override())
+
+    def test_normalization_is_applied_on_save(self):
+        self.login()
+        for sent, want in (("http://10.100.0.24:8900/", "10.100.0.24:8900"),
+                           ("  10.100.0.24  ", "10.100.0.24")):
+            with self.subTest(sent=sent):
+                self.assertEqual(self._save(sent).status_code, 200)
+                self.assertEqual(self._view()["value"], want)
+
+    def test_junk_is_a_400_with_a_reason_and_changes_nothing(self):
+        self.login()
+        self.assertEqual(self._save("10.100.0.24").status_code, 200)
+        before = self._view()["value"]
+        for bad in ("http://", "10.100.0.24:abc", "10.100.0.24:99999", "not a host!"):
+            with self.subTest(bad=bad):
+                r = self._save(bad)
+                self.assertEqual(r.status_code, 400, r.text)
+                self.assertEqual(r.json()["code"], "bad_request")
+                self.assertTrue(r.json()["detail"], "400 必须带中文原因")
+                self.assertEqual(self._view()["value"], before, "400 却改了值")
+        # 缺 value 字段也是 400（不是"静默什么都不做"）
+        r = self.wpost("/admin/api/advertised-host", {})
+        self.assertEqual(r.status_code, 400, r.text)
+
+    def test_the_value_survives_a_restart(self):
+        """持久化：**重开库 + 一份全新 cfg**（= 重启进程）之后仍然生效。"""
+        self.login()
+        self.assertEqual(self._save("10.100.0.24:8123").status_code, 200)
+        reopened = store_mod.Store(self.cfg.get("auth.db"))
+        self.addCleanup(reopened.close)
+        fresh = settings_mod.load()
+        self.assertEqual(advertised_mod.apply_stored(fresh, reopened),
+                         {"advertised_host": "10.100.0.24:8123"})
+        self.assertEqual(fresh.get("server.advertised_host"), "10.100.0.24:8123")
+
+    def test_the_admin_value_beats_the_environment_variable(self):
+        """**优先级钉在接口上**：env 在场面时管理面保存的值仍然赢，且如实提示。
+
+        为什么必须钉：交付包的 `compose.yaml` 里就摆着 `ECHO_ADVERTISED_HOST`，
+        若 env 优先，页面上改成别的值会**静默不生效** —— 后人只会以为"改了没用"。
+        """
+        self.login()
+        with patch.dict(os.environ, {"ECHO_ADVERTISED_HOST": "10.9.9.9"}, clear=False):
+            self.assertEqual(self._save("10.100.0.24").status_code, 200)
+            got = self._view()
+            self.assertEqual(got["value"], "10.100.0.24", "env 把管理面的值盖住了")
+            self.assertEqual(got["source"], "admin")
+            self.assertEqual(got["envValues"]["ECHO_ADVERTISED_HOST"], "10.9.9.9",
+                             "env 仍然要**如实报出来**，不是装作没有")
+            self.assertTrue(any("10.9.9.9" in n for n in got["notes"]), got["notes"])
+
+    def test_an_environment_only_value_reports_env_as_the_source(self):
+        """只设了环境变量（页面上没配过）→ 来源必须是 `env`，值必须真的被用上。
+
+        构造方式：把 `_env_overrides()` 的结果**并进本用例那份 cfg** ——
+        走的是 `settings.load()` 用的**同一个**函数，所以这里验的就是真实行为
+        （而不是在测试里另写一遍"环境变量优先"的判断）。
+        """
+        self.login()
+        with patch.dict(os.environ, {"ECHO_PUBLIC_URL": "10.100.0.25"}, clear=False):
+            cfg = self.cfg
+            cfg.raw["server"]["advertised_host"] = \
+                settings_mod._env_overrides()["server"]["advertised_host"]
+            got = advertised_mod.view(cfg, self.state.auth.store)
+            self.assertEqual(got["value"], "10.100.0.25")
+            self.assertEqual(got["source"], "env")
+            self.assertIn("host=http://10.100.0.25:8900",
+                          self._issue().json()["pairingCode"]["url"])
+
+    def test_the_save_is_audited_with_the_admin_name(self):
+        self.login()
+        self._save("10.100.0.24")
+        hit = [r for r in self.audit_rows() if r[1] == "advertised-host-set"]
+        self.assertTrue(hit, self.audit_rows())
+        self.assertEqual(hit[0][0], "ops")
+        self.assertIn("advertisedHost=10.100.0.24", hit[0][2])
+
+    def test_a_rejected_save_is_audited_with_the_reason(self):
+        """非法值也要留痕（与其它写动作一致：失败的动作名带 `.failed`）。"""
+        self.login()
+        self._save("not a host!")
+        hit = [r for r in self.audit_rows() if r[1] == "advertised-host-set.failed"]
+        self.assertTrue(hit, self.audit_rows())
+        self.assertIn("advertisedHost=not a host!", hit[0][2])
+
+
+class AdvertisedHostPageTests(_AdminCase):
+    """那张卡在「客户端 / 发授权」页签里（**不进前端工具链**，只做加法）。"""
+
+    def _html(self):
+        r = self.ac.get("/admin/")
+        self.assertEqual(r.status_code, 200)
+        return r.text
+
+    def test_the_card_and_its_controls_are_on_the_page(self):
+        html = self._html()
+        for want in ("/admin/api/advertised-host", 'id="advValue"', 'id="btnAdvSave"',
+                     'id="btnAdvLocal"', 'id="btnAdvClear"', "advertisedCard",
+                     "bindAdvertised", "对外公布地址"):
+            with self.subTest(want=want):
+                self.assertIn(want, html)
+
+    def test_the_card_sits_in_the_clients_tab_next_to_the_issue_form(self):
+        """放在发码那张卡**旁边**：填它的人要回答的正是"这张码给谁用"。"""
+        html = self._html()
+        self.assertIn('data-tab="clients"', html)
+        self.assertLess(html.index("advertisedCard(adv)"), html.index("pendingCodes(codes)"))
+
+    def test_the_page_renders_the_three_deployments_note_from_the_backend(self):
+        """那句话**由后端下发**（`formNote`），页面只渲染 —— 不另抄一份。"""
+        html = self._html()
+        self.assertIn("d.formNote", html)
+        self.login()
+        self.assertIn("formNote", self.ac.get("/admin/api/advertised-host").text)
+
+    def test_the_issue_form_can_override_the_address_for_one_code(self):
+        html = self._html()
+        self.assertIn('id="pcHost"', html)
+        self.assertIn("advertisedHost", html)
+
+
 class AdminCliTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="echo-admin-cli-")
@@ -2012,6 +2443,51 @@ class AdminCliTests(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertIn("没有这个管理员", out)
         self.assertNotIn("Traceback", out)
+
+    # ---- 对外公布地址（2026-09-30）：命令行与网页**同一份实现** ----------------
+
+    def _stored(self):
+        store = store_mod.Store(os.path.join(self.tmp, "auth.db"))
+        self.addCleanup(store.close)
+        return store.advertised_override()
+
+    def test_set_show_and_clear_round_trip(self):
+        rc, out = self._run("--show-advertised-host")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("来源          auto", out, "没配时来源就该是「本机探测」")
+        self.assertIn("本机探测", out)
+
+        rc, out = self._run("--set-advertised-host", "http://10.100.0.24:8900/")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("10.100.0.24:8900", out)
+        self.assertEqual(self._stored(), "10.100.0.24:8900", "值没落进 state 卷的库里")
+
+        rc, out = self._run("--show-advertised-host")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("来源          admin", out)
+        self.assertIn("http://10.100.0.24:8900", out)
+
+        rc, out = self._run("--clear-advertised-host", "yes")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("自动探测", out)
+        self.assertEqual(self._stored(), "")
+
+    def test_a_new_code_from_the_cli_uses_the_saved_address(self):
+        """命令行**是另一个进程** —— 它必须读同一个 state 卷，否则会出现
+        "网页发出来的串对、命令行发出来的串还是探测结果"这种最难查的不一致。"""
+        self.assertEqual(self._run("--set-advertised-host", "10.100.0.24")[0], 0)
+        rc, out = self._run("--new-client", "张三的办公本", "--scopes", "asr")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("echo://pair?host=http://10.100.0.24:8900&code=", out)
+
+    def test_a_bad_value_is_reported_in_chinese_and_nothing_is_stored(self):
+        for bad in ("10.100.0.24:abc", "http://", "10.100.0.24:99999"):
+            with self.subTest(bad=bad):
+                rc, out = self._run("--set-advertised-host", bad)
+                self.assertEqual(rc, 2, out)
+                self.assertIn("改不了", out)
+                self.assertNotIn("Traceback", out)
+                self.assertEqual(self._stored(), "")
 
 
 if __name__ == "__main__":

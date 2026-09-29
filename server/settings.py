@@ -47,6 +47,30 @@ DEFAULTS: Dict[str, Any] = {
         # 方案 1 的交付路径（`compose.yaml` / 后端包）把它设成 **true**。
         # 见 `server/localpair.py` 与 `docs/3.0-设计总览与组件关系.md` §6.6。
         "local_pair": False,
+        # **对外公布地址**（2026-09-30 用户实测的 bug）：配对串里 host 写什么。
+        # 出厂值**故意是空** —— 空了才走现有的"本机探测 + 那句如实提示"，行为不变。
+        #
+        # 为什么必须有这一项：`server.listen` 出厂是通配地址 `0.0.0.0:8900`，
+        # 那对客户端没有任何意义，于是只能探测。**在容器里探测到的就是 Docker 网桥
+        # 地址**（实测 `172.18.0.2` / `172.21.0.2`），而"同事真正连得到哪台机器"
+        # 只有部署的人知道 —— 每次都靠人手改串，第一次用必然踩。
+        #
+        # ⚠️ 这一项是**"每次发码时想公布的地址"**，不是"一次性全局常量"：
+        #   * 同事要连 → 填**局域网/对外 IP**（如 `10.100.0.24`）；
+        #   * 后端就跑在客户端这台机器上（本机后端）→ 填 **`127.0.0.1`**
+        #     （本机客户端永远连得上，换网络/换 IP 都不受影响）；
+        #   * 同一台后端同时服务本机与远程 → **发码时各写各的**：本机用 `127.0.0.1`、
+        #     远程用局域网 IP（串本身带 host，两张码互不影响；见
+        #     `ops.issue_pairing_code(..., advertised=...)`）。
+        # 而且**串就是文本，手改 host 就能用**（刻意没做签名/校验，见 `ops.pairing_string`）。
+        #
+        # 接受格式（`ops.normalize_advertised_host` 归一化，非法值**报错不猜**）：
+        #   `10.100.0.24` / `10.100.0.24:8900` / `http://10.100.0.24:8900` 都行
+        #   （scheme 会被剥掉；端口不写就用 `server.listen` 的端口）。TLS 开着时
+        #   scheme 一律由 TLS 决定 —— 所以这里**不要**写成 `https://…` 去"提前开 TLS"。
+        # 环境变量：`ECHO_ADVERTISED_HOST`（别名 `ECHO_PUBLIC_URL`，两者名字不同、
+        # 含义一致；同时设时**前者优先**，并按 `priority_notes` 的口径如实提示）。
+        "advertised_host": "",
         # TLS（设计 §7.5 ① 的传输层）。**两个都填才启用 https**；
         # 只填一个是配置错误 —— `main` 会**启动就报错**，不静默降级成 http
         # （那是最糟的结果：部署的人以为连的是 https）。见 `main._tls_kwargs`。
@@ -193,6 +217,17 @@ def _env_overrides() -> dict:
     # 别去消掉它：在容器外（直接跑进程）绑通配时那句话仍然是该看见的。
     if os.environ.get("ECHO_ADMIN_LISTEN"):
         out.setdefault("server", {})["admin_listen"] = os.environ["ECHO_ADMIN_LISTEN"]
+    # 配对串里公布的地址（2026-09-30）。**空串 = 没设**（保留 YAML 里的值），
+    # 与上面几个同一套写法 —— 不然环境里一个空变量会把配置文件那行静默抹掉。
+    #
+    # 两个变量名都收：`ECHO_ADVERTISED_HOST` 是**服务端自己的口径**（与
+    # `server.advertised_host` 同名同义）；`ECHO_PUBLIC_URL` 是内网/反代部署里
+    # 更常见的叫法（用户/同事一眼知道那是"对外地址"）。同时设时前者优先 ——
+    # 一个名字只做一件事，另一个只作别名，免得"两个都设了听谁的"变成猜谜。
+    _advertised = (os.environ.get("ECHO_ADVERTISED_HOST")
+                   or os.environ.get("ECHO_PUBLIC_URL") or "")
+    if _advertised:
+        out.setdefault("server", {})["advertised_host"] = _advertised
     if os.environ.get("ECHO_TMP_ROOT"):
         out.setdefault("tmp", {})["root"] = os.environ["ECHO_TMP_ROOT"]
     if os.environ.get("ECHO_STATE_ROOT"):

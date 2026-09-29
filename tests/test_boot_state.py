@@ -97,24 +97,33 @@ class RegistrationAndSnapshotTests(_BootStateTestCase):
         self.assertEqual(s, {"total": 6, "ready": 3, "failed": 1, "running": 1, "pending": 1})
 
     def test_setup_registers_the_documented_components(self):
+        """组件清单：**没有** `stt-meeting` / `diarize`，**但 `stt-cmd` 仍在**（2026-09-29）。
+
+        客户端进程内不再承担会议转写与说话人分离，那两个组件随之删掉；
+        而**语音指令**那条链路（`stt-cmd`，铁律 L3）必须留着 —— 这条用例同时钉两件事：
+        "删干净了"与"没把该留的删掉"。
+        """
         boot.setup()
         snap = boot.snapshot()
-        self.assertEqual([c["id"] for c in snap["components"]],
-                         ["server", "dsh", "failover", "harness", "stt-cmd", "stt-meeting",
-                          "tts", "wake", "hotkey", "meeting", "diarize"])
+        ids = [c["id"] for c in snap["components"]]
+        self.assertEqual(ids,
+                         ["server", "dsh", "failover", "harness", "stt-cmd",
+                          "tts", "wake", "hotkey", "meeting"])
+        self.assertNotIn("stt-meeting", ids, "会议转写引擎组件已删（客户端不做会议转写了）")
+        self.assertNotIn("diarize", ids, "说话人分离组件已删（它只走能力后端）")
+        self.assertIn("stt-cmd", ids, "语音指令引擎是铁律 L3，必须留着")
         by_id = {c["id"]: c for c in snap["components"]}
         self.assertEqual(by_id["server"]["status"], "online", "面板服务阶段 0 就已就绪")
         self.assertFalse(by_id["server"]["can_start"])
-        self.assertEqual(by_id["stt-meeting"]["status"], "idle", "会议引擎按需加载")
-        self.assertEqual(by_id["stt-meeting"]["kind"], "model")
-        for cid in ("hotkey", "wake", "stt-cmd", "stt-meeting", "harness"):
+        self.assertEqual(by_id["stt-cmd"]["kind"], "stt")
+        for cid in ("hotkey", "wake", "stt-cmd", "harness"):
             self.assertTrue(by_id[cid]["can_stop"], "%s 应可手动停止" % cid)
         self.assertTrue(by_id["harness"]["can_start"], "独立 harness 可手动拉起")
 
     def test_setup_twice_does_not_duplicate(self):
         boot.setup()
         boot.setup()
-        self.assertEqual(boot.snapshot()["summary"]["total"], 11)
+        self.assertEqual(boot.snapshot()["summary"]["total"], 9)
 
 
 class ReportTests(_BootStateTestCase):
@@ -298,17 +307,17 @@ class ManualStartStopTests(_BootStateTestCase):
 class BootOrchestrationTests(_BootStateTestCase):
     def test_run_boot_settles_everything_and_marks_done(self):
         """全量编排：所有登记的组件都拉起后 phase=done（用"内置"组件避免加载模型）。"""
-        for cid in ("failover", "dsh", "tts", "hotkey", "meeting", "diarize",
+        for cid in ("failover", "dsh", "tts", "hotkey", "meeting",
                     "stt-cmd", "wake"):
             boot.register(cid, cid, "", start_fn=None)
         boot._run_boot()
         self.assertEqual(boot._PHASE, "done")
         snap = boot.snapshot()
         self.assertEqual(snap["summary"]["running"], 0)
-        self.assertEqual(snap["summary"]["ready"], 8)
+        self.assertEqual(snap["summary"]["ready"], 7)
 
     def test_start_all_async_returns_immediately(self):
-        for cid in ("failover", "dsh", "tts", "hotkey", "meeting", "diarize",
+        for cid in ("failover", "dsh", "tts", "hotkey", "meeting",
                     "stt-cmd", "wake"):
             boot.register(cid, cid, "", start_fn=None)
         t0 = time.time()
@@ -377,7 +386,8 @@ class SkippedAgentTests(_BootStateTestCase):
     def test_only_the_two_agents_are_ever_skipped(self):
         """skipped 只用于"二选一的智能体"，别扩散成"所有没启用的组件"。
 
-        `diarize` 的 disabled 有别的含义（模型缺失、可补救），两者不能混。
+        组件清单里**没有** `diarize`（2026-09-29 起会议分离只走能力后端），所以这里
+        顺便钉一件事：谁要是把"本机分离"接回启动页，这条会红。
         """
         boot.setup()
         with patch.object(boot, "selected_agent", return_value="harness"), \
@@ -392,7 +402,7 @@ class SkippedAgentTests(_BootStateTestCase):
         by_id = {c["id"]: c["status"] for c in boot.snapshot()["components"]}
         self.assertEqual(by_id["dsh"], "skipped")
         self.assertEqual(by_id["harness"], "skipped")
-        self.assertNotEqual(by_id["diarize"], "skipped", "diarize 的 disabled 含义不同")
+        self.assertNotIn("diarize", by_id, "说话人分离不再是本机组件（只走能力后端）")
 
 
 class FailoverDetailRefreshTests(_BootStateTestCase):

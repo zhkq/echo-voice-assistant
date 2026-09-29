@@ -128,18 +128,31 @@ def publish(cfg, auth, *, scopes: str = DEFAULT_SCOPES, client_name: str = "本�
 
     调用方：`server/main.py` 的 lifespan（每次启动一张）。失败**不该拦住启动** ——
     所以调用方自己 try/except 并只写日志（这个文件是"方便"，不是"必需"）。
+
+    ## 这条路上**不需要** `server.advertised_host`
+
+    （2026-09-30 用户定的口径）本机后端的正解是：监听 **`127.0.0.1:8900`**（只回环，
+    这台机器自己用），配对走这个文件，地址就是构造出来的回环地址 —— 与"同事能不能
+    连到这台的局域网 IP"是两个不相干的问题。
+
+    所以这里**显式**把地址定成 `local_base_url(cfg)`：即使有人为了共享形态配了
+    `ECHO_ADVERTISED_HOST=10.100.0.24`，本机那份文件里的串也仍然是回环地址。
+    不这么做的话，同一份配置在两种形态之间会打架 —— 而症状是"本机自动配对突然连不上
+    了（它拿着一个本机不该走的网卡地址）"，很难联想到是共享形态那一项在起作用。
     """
     try:
         ttl = float(ttl_s if ttl_s else cfg.get("auth.local_pair_ttl_s", DEFAULT_TTL_S))
     except Exception:
         ttl = float(DEFAULT_TTL_S)
+    loopback = local_base_url(cfg)
     info = ops_mod.issue_pairing_code(cfg, auth, name=str(client_name or ""),
                                       scopes=str(scopes or ""), ttl_s=ttl,
-                                      created_by=str(created_by or ""))
+                                      created_by=str(created_by or ""),
+                                      advertised=loopback)
     body = {
         "source": "local",
         "serverId": str(cfg.get("server.id", "") or ""),
-        "baseUrl": local_base_url(cfg),
+        "baseUrl": loopback,
         "url": info["url"],
         "code": info["code"],
         "fingerprint": info["fingerprint"],

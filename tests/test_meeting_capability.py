@@ -405,39 +405,61 @@ class DiarizeRoutingTests(_IsolatedState):
         self.assertTrue(any(m["ok"] for m in got.values()),
                         "嵌入与自己比应当命中：%s" % got)
 
-    def test_no_backend_at_all_still_diarizes_locally(self):
-        """**没配能力后端的机器**：分离仍在本机跑 —— 这张"本来就这么配的"必须保住。
+    def test_no_backend_at_all_never_diarizes_locally(self):
+        """**没配能力后端的机器**：分离**一样不做**，而且要说得出为什么（2026-09-29 反转）。
 
-        这是 §5.1 那张表里被刻意分开的两种情形之一：**没配后端** ≠ **配了但用不上**。
-        前者这台机器本来就这么跑（`meeting._transcribe_impl` 里那条
-        `elif local_diarize_ok` 分支，端到端由
-        `tests/test_meeting_speakers_standard.py::HonestDegradationTests` 钉住）；
-        后者才是 2026-09-29 要改掉的"悄悄降级"。所以这条用例与下一条**成对存在**：
-        少了它，"分离永远不跑本机"这种改错法不会被任何用例抓住。
+        ## 这条用例原来断言的是相反的语义
 
-        这里用一个**只会转写**的能力后端 + 一个**会分离**的本机会话
-        （`backend_configured=False`），验两件事：
-        ① 这一槽不归能力层 → `_capability_diarize_segment` 返回 `None`
-           （调用方据此走本机那段 `diarize_wav_full`）；
-        ② 这时 **`state` 里不许编原因、也不许标"在等后端"** —— 没配后端
-           不是"没做成"，两者的文案必须分得开。
+        旧版叫 `test_no_backend_at_all_still_diarizes_locally`，验的是"没配后端 →
+        分离仍在本机跑"。用户拍板后：**客户端进程内不再承担会议分离** ——
+        即使本机有 GPU，也以"在本机起一个能力后端"的形式完成（同一个 `echo-server`
+        取值）。所以"没配后端"与"配了却用不上"现在的**共同点**是"这一场没有说话人"，
+        区别只剩一句文案（在不在等后端）。
+
+        ## 为什么这不是"削弱断言"
+
+        旧断言盯的是"这一槽返回 None → 调用方去跑本机那段 `diarize_wav_full`"
+        （也就是说"没做"这件事在那条路上是**正常**的）。新断言在同样的返回值之外还要求：
+
+        ① 本机分离引擎 `call_count == 0`（打桩成 AssertionError，调用即红）；
+        ② `state.reason` 是**权威十词之一**、`state.detail` 非空
+           （旧版这里恰恰断言"不许编原因" —— 而"不给原因"的后果是面板显示
+           「原因未记录」，用户拿不到任何可执行的信息）；
+        ③ `waiting is False`（**没配后端 ≠ 在等后端** —— 这两种仍然要分得开）；
+        ④ 渲染出来的 headline 以硬契约 `DIARIZE_NOT_EXECUTED` 开头。
+
+        也就是说：从"沉默地交给本机"变成"不做，而且说得出为什么"，断言面更大。
         """
         import app.meeting as meeting
         from app.capabilities.local import LocalCapabilityClient
+        from app.capability_admin import DIARIZE_NOT_EXECUTED, diarize_summary
         backend = _FakeBackend()
         backend.provides = frozenset({"asr.text"})      # 只会转写 → 分离这一槽没人干
         router = CapabilityRouter([backend, LocalCapabilityClient(provides={"diarize.turns"})],
                                   settings_get=settings.get)
         cap = _session(router).with_backend_configured(False)
-        self.assertTrue(cap.diarize_slot_is_local(),
-                        "没配后端的机器：分离这一槽**该**在本机跑")
+        local = MagicMock(name="diarize_wav_full",
+                          side_effect=AssertionError("分离不该回落本机"))
+        p = patch("app.audio.diarize.diarize_wav_full", local)
+        p.start()
+        self.addCleanup(p.stop)
         state = meeting._new_diarize_state()
-        turns, _embs, _labels, plan = meeting._capability_diarize_segment(cap, self.wav, state)
-        self.assertIsNone(turns, "这一槽不归能力层 → 返回 None，由调用方走本机")
+        turns, embs, labels, plan = meeting._capability_diarize_segment(cap, self.wav, state)
+        self.assertIsNone(turns, "拿不到后端结果时必须返回 None（不许拿空数组冒充成功）")
         self.assertIsNone(plan)
+        self.assertIsNone(embs, "不许补空说话人列")
+        self.assertIsNone(labels)
+        self.assertEqual(local.call_count, 0, "本机分离引擎被调用了 —— 这正是不许发生的事")
         self.assertEqual(backend.diarize_calls, [], "这一槽不归能力层，不该去问后端")
-        self.assertEqual(state["reason"], "", "没配后端不是「没做成」，不该编一个原因")
+        self.assertFalse(state["executed"])
+        self.assertIn(state["reason"], SKIP_REASONS,
+                      "原因必须是权威十词之一：%r" % state["reason"])
+        self.assertTrue(state["detail"], "还要带上具体是什么原因（不能只有一个词）")
         self.assertFalse(state["waiting"], "没配后端 ≠ 在等后端")
+        dia = diarize_summary(state)
+        self.assertTrue(dia["headline"].startswith(DIARIZE_NOT_EXECUTED),
+                        "面板那句话必须如实：%r" % dia["headline"])
+        self.assertFalse(dia["waiting"])
 
     def test_a_configured_but_unusable_backend_never_falls_back_to_the_local_engine(self):
         """**配了后端、这一次却用不上** → 如实说"没做成"，**一次都不许碰本机引擎**。
@@ -475,8 +497,6 @@ class DiarizeRoutingTests(_IsolatedState):
         local_client = LocalCapabilityClient(provides={"diarize.turns", "speaker.embed"})
         router = CapabilityRouter([dead, local_client], settings_get=settings.get)
         cap = _session(router)
-        self.assertFalse(cap.diarize_slot_is_local(),
-                         "配了后端（哪怕连不上）就不该再在本机跑分离")
         local = MagicMock(name="diarize_wav_full",
                           side_effect=AssertionError("分离不该回落本机"))
         p = patch("app.audio.diarize.diarize_wav_full", local)
@@ -665,14 +685,16 @@ class SessionDecisionTests(_IsolatedState):
     """**什么情况下才走能力后端** —— 这条决定了"没配后端时行为不变"。"""
 
     def test_no_backend_configured_means_no_session(self):
-        """没配地址**也没配对** → 返回 None → `_transcribe_impl` 走原来那段本地代码。
+        """没配地址**也没配对** → 返回 None → 这一场**没有转写引擎**（如实失败）。
 
         **两处都要打桩**：地址有两个来源，配对凭据那条路现在也会让后端"存在"
         （`client_from_settings()`）。只堵设置那一条的话，这台机器哪天真配了对，
         这条用例就会红 —— 而它报的是"没配后端却开了 session"，指不到真正的原因。
 
-        2026-09-29：返回值语义没变（`None` = 不开会话），但多了一个**出参** `info` ——
-        它要说清"这一场为什么退回本机"。没配后端时必须报 `not-configured`，
+        2026-09-29：返回值语义没变（`None` = 不开会话），但**它现在的后果变了** ——
+        以前 None 意味着"走本机那段引擎代码"，现在客户端进程内不做会议转写，
+        所以 None 意味着"这一场转不出来"（`_transcribe_impl` 据此当场失败并说清原因）。
+        出参 `info` 仍然要说清"为什么没走成"：没配后端时必须报 `not-configured`，
         **绝不能报 `waiting-backend`**：后者是"你配了、但那台连不上"，
         说错一个词用户就会去查错的地方（见 `capability_admin.TRANSCRIBE_FALLBACK_LABELS`）。
         """
@@ -685,7 +707,8 @@ class SessionDecisionTests(_IsolatedState):
              patch.multiple("app.meeting.db", add_log=lambda *a, **k: None):
             self.assertIsNone(meeting._capability_asr_session(CFG, info=info))
         self.assertTrue(callable(credentials.load))     # 别把整个模块的入口打没了
-        self.assertEqual(info.get("transcribeEngine"), "local")
+        #: 空串 = **没有可用的转写引擎**（不是"本机转的"—— 那条路已经不存在了）
+        self.assertEqual(info.get("transcribeEngine"), "")
         self.assertEqual(info.get("fallbackReason"), "not-configured")
         self.assertFalse(info.get("backendConfigured"))
 
@@ -744,12 +767,13 @@ class SessionDecisionTests(_IsolatedState):
         self.assertEqual(sess_router.plan(need).backend_for("asr.text"), BACKEND_ECHO_SERVER)
 
     def test_configured_but_unreachable_backend_falls_back_LOUDLY(self):
-        """配了后端却连不上 → 走本机，但**必须说出来为什么**。
+        """配了后端却连不上 → 这一场**没有任何槽落到后端**，但**必须说出来为什么**。
 
-        不说的话：用户以为在用后端，实际在啃本机 CPU，现象只是"转写很慢"
-        —— 本机那条路的日志一切正常，查不出所以然。这是接线里最容易"静默退化"的一处。
+        不说的话：用户以为在用后端，实际这一场既不转写也不分离（客户端进程内已经没有
+        本机兜底），而现象只是"点了没反应"，日志里更查不出所以然。
+        这是接线里最容易"静默退化"的一处。
 
-        2026-09-29（新增断言）：这一场还必须能被认成**在等后端** ——
+        2026-09-29：这一场还必须能被认成**在等后端** ——
         `info["fallbackReason"] == "waiting-backend"` 与 `info["backendConfigured"] is True`。
         这一条是"会议状态里有一个明确的等待后端表达"的机读依据：面板把它显示成
         「等待能力后端」（`capability_admin.WAITING_BACKEND`），而不是让这场会
@@ -771,7 +795,7 @@ class SessionDecisionTests(_IsolatedState):
             self.assertIsNone(meeting._capability_asr_session(dict(CFG, diarize=True),
                                                               info=info))
         self.assertTrue([m for lv, src, m in logged
-                         if lv == "warn" and "仍走本机引擎" in m],
+                         if lv == "warn" and "一个槽都没落到它上面" in m],
                         "静默退化了，没留下原因：%s" % logged)
         self.assertTrue(any("原因" in m for _lv, _s, m in logged),
                         "日志里要写出 skip 的原因（连不上 / privacy 不允许 …）")
@@ -783,7 +807,11 @@ class SessionDecisionTests(_IsolatedState):
                         "配置里点名了后端，`backendConfigured` 必须为真")
         self.assertEqual(info.get("fallbackReason"), "waiting-backend",
                          "配了连不上的后端要报「在等后端」，而不是「没配」")
-        self.assertEqual(info.get("transcribeEngine"), "local")
+        # `transcribeEngine` 留空 = **这一场没有可用的转写引擎**（客户端已经不做会议转写，
+        # 所以绝不能报成 "local" —— 那会让面板说"本场转写由本机引擎完成"，而事实是
+        # 一个字都没转出来）。
+        self.assertEqual(info.get("transcribeEngine"), "",
+                         "没有可用的转写引擎时不许报成本机（那件事已经不存在了）")
 
     def test_a_plan_that_cannot_use_diarize_says_which_reason(self):
         """配了后端、但计划里**用不上分离** → warn 里要带得出权威原因。
@@ -830,7 +858,7 @@ class SessionDecisionTests(_IsolatedState):
                             add_log=lambda level, src, msg: logged.append((level, src, msg))):
             self.assertIsNone(meeting._capability_asr_session(CFG))
         self.assertTrue([m for lv, src, m in logged
-                         if lv == "warn" and "仍走本机引擎" in m],
+                         if lv == "warn" and "一个槽都没落到它上面" in m],
                         "只配对没填地址的机器静默退化了：%s" % logged)
 
     def test_configured_counts_pairing_too(self):

@@ -1587,10 +1587,13 @@ class AuthSchemaTests(unittest.TestCase):
         # `admin_users` / `admin_audit` 是同一天做管理面时加的（§8.4 要一套管理员账号体系）。
         # `server_limits` 是 2026-09-29 加的（运行参数要在管理面上配、且重启后还在）——
         # 它是**第三类**：不是客户端数据、也不是请求元数据，而是"这台后端怎么跑"。
+        # `server_advertised` 是 2026-09-30 加的（用户实测：容器里发出的配对串带的是
+        # Docker 网桥地址 `172.18.0.2`，同事连不上）—— 同一个第三类：
+        # "这台后端**对外**是谁"，一行一个地址串，不含任何业务概念。
         # 加表要走评审 —— 这条断言就是那道门：白名单变了，这里必须跟着改一次。
         self.assertEqual(tuple(store_mod.TABLE_WHITELIST),
                          ("clients", "pairing_codes", "calls", "admin_users", "admin_audit",
-                          "server_limits"))
+                          "server_limits", "server_advertised"))
 
 
 class AuthPairingTests(unittest.TestCase):
@@ -3583,6 +3586,176 @@ class PairingStringTests(unittest.TestCase):
         with contextlib.redirect_stdout(buf):
             server_main._print_pairing("7K2M9QX4", self._cfg())
         self.assertNotIn("通配地址", buf.getvalue(), "地址本来就对，不该多一段解释")
+
+
+class AdvertisedHostConfigTests(unittest.TestCase):
+    """**对外公布地址**（`server.advertised_host` / `ECHO_ADVERTISED_HOST`，2026-09-30）。
+
+    这一组是被一个**真事故**逼出来的：容器里 `ECHO_LISTEN=0.0.0.0:8900` 是通配地址，
+    服务端只能自己探测 —— 而容器里探测到的是 **Docker 网桥地址**（用户在两台机器上
+    各踩一次：`172.18.0.2` 与 `172.21.0.2`），同事拿到那种串必然连不上。
+    根因是"**对外可达地址只有部署的人知道**，而配置里以前没有这一项"。
+
+    三条判据：
+      1. **配了就用**（`host` / `host:port` / `http://host:port` 三种写法等价）；
+      2. **没配就一点都不变**（继续自动探测，那句如实的提示**一个字都不删**）；
+      3. **认不出来就报错**（不静默忽略 —— 配了却还在探测，正是这个 bug 的形态）。
+    """
+
+    def _cfg(self, advertised="", listen="0.0.0.0:8900", cert=""):
+        cfg = settings_mod.load()
+        cfg.raw["server"]["listen"] = listen
+        cfg.raw["server"]["advertised_host"] = advertised
+        cfg.raw["server"]["tls"] = {"certfile": cert, "keyfile": cert}
+        return cfg
+
+    # ---- ① 配了就用 ---------------------------------------------------------
+
+    def test_the_configured_address_is_what_goes_into_the_string(self):
+        """**这就是那个 bug 的修复**：串里必须是配置的地址，不是探测出来的网桥地址。"""
+        for value in ("10.100.0.24", "10.100.0.24:8900", "http://10.100.0.24:8900"):
+            with self.subTest(value=value):
+                got = ops_mod.pairing_string(self._cfg(advertised=value), "7K2M9QX4")
+                self.assertIn("host=http://10.100.0.24:8900&code=7K2M9QX4", got["url"])
+                self.assertEqual(got["note"], "", "配了地址就不该再有'这是探测到的'那句")
+
+    def test_a_port_in_the_config_wins_and_a_missing_port_falls_back_to_listen(self):
+        got = ops_mod.pairing_string(self._cfg(advertised="10.100.0.24:9999"), "X")
+        self.assertIn("host=http://10.100.0.24:9999", got["url"])
+        got2 = ops_mod.pairing_string(self._cfg(advertised="10.100.0.24",
+                                                listen="0.0.0.0:8123"), "X")
+        self.assertIn("host=http://10.100.0.24:8123", got2["url"],
+                      "配置里没写端口时该用 server.listen 的端口")
+
+    def test_the_scheme_comes_from_tls_not_from_the_configured_text(self):
+        """**行为写死**：scheme 由 TLS 决定，配置里那个 `http://`/`https://` 只被剥掉。
+
+        理由：让 `https://…` 在这里"提前生效"等于把 TLS 开关藏进地址串 ——
+        那样"填了 https 却没配证书"会发出一条连不上的串，而现象像客户端坏了。
+        """
+        cert = self._cert_file()
+        got = ops_mod.pairing_string(self._cfg(advertised="https://10.100.0.24", cert=cert), "X")
+        self.assertIn("host=https://10.100.0.24:8900", got["url"], "TLS 开着就一定是 https")
+        got2 = ops_mod.pairing_string(self._cfg(advertised="http://10.100.0.24"), "X")
+        self.assertIn("host=http://10.100.0.24:8900", got2["url"], "TLS 关着就一定是 http")
+
+    def test_the_cli_prints_the_configured_address_too(self):
+        """命令行与管理面**同一处拼串** —— 所以命令行打出来的也必须是配置的地址。"""
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            server_main._print_pairing("7K2M9QX4", self._cfg(advertised="10.100.0.24"))
+        self.assertIn("host=http://10.100.0.24:8900&code=7K2M9QX4", buf.getvalue())
+
+    def test_a_per_issue_override_beats_the_configured_value(self):
+        """同一台后端同时服务本机与远程 → **发码时各写各的**（串本身带 host）。"""
+        cfg = self._cfg(advertised="10.100.0.24")
+        self.assertIn("host=http://127.0.0.1:8900",
+                      ops_mod.pairing_string(cfg, "X", advertised="127.0.0.1")["url"])
+
+    # ---- ② 没配时的行为**一点都不变** ---------------------------------------
+
+    def test_without_it_the_probe_and_the_honest_note_are_unchanged(self):
+        """出厂（空 = 没配）：还是探测 + **那句如实的提示**，一个字都不许少。
+
+        那句提示是"诚实降级"：它承认这个地址是探测到的，并告诉人怎么换掉。
+        删掉它，用户就只剩一个连不上的串、而且看不出原因。
+        """
+        cfg = self._cfg()
+        self.assertEqual(str(settings_mod.DEFAULTS["server"]["advertised_host"]), "",
+                         "出厂值必须是空 —— 空了才走原来那条探测路")
+        got = ops_mod.pairing_string(cfg, "X")
+        self.assertIn("本机探测到", got["note"])
+        self.assertIn("同事连不上就换成他们能访问到的那台机器的主机名或 IP", got["note"])
+        self.assertTrue(got["url"].startswith("echo://pair?host=http://"),
+                        "没配就照旧探测（可能是网卡地址，也可能是占位符）：%s" % got["url"])
+
+    def test_a_placeholder_is_still_better_than_a_wrong_guess(self):
+        """探不到地址时留占位符让人自己填 —— **不许猜一个局域网 IP**。
+
+        猜错的代价：后端就跑在客户端这台机器上时（本机后端），正确值是 `127.0.0.1`，
+        而"猜一个局域网 IP"必然猜错 —— 本机客户端反倒连不上。
+        """
+        cfg = self._cfg()
+        with patch("socket.gethostbyname", side_effect=OSError("nope")):
+            got = ops_mod.pairing_string(cfg, "X")
+        self.assertIn("<这台后端的主机名或IP>", got["url"])
+
+    # ---- ③ 归一化与非法值：**明确行为** --------------------------------------
+
+    def test_normalization_accepts_the_three_documented_shapes(self):
+        for raw, want in (("10.100.0.24", "10.100.0.24"),
+                          ("10.100.0.24:8900", "10.100.0.24:8900"),
+                          ("http://10.100.0.24:8900", "10.100.0.24:8900"),
+                          ("  http://10.100.0.24:8900/  ", "10.100.0.24:8900"),
+                          ("https://gpu-01", "gpu-01"),
+                          ("[fe80::1]:8900", "[fe80::1]:8900")):
+            with self.subTest(raw=raw):
+                self.assertEqual(ops_mod.normalize_advertised_host(raw), want)
+
+    def test_an_empty_value_means_not_configured_not_an_error(self):
+        for blank in ("", "   ", None):
+            with self.subTest(blank=repr(blank)):
+                self.assertEqual(ops_mod.normalize_advertised_host(blank), "")
+
+    def test_junk_is_a_loud_error_not_a_silent_ignore(self):
+        """**静默忽略正是这个 bug 的形态**：配了却还在探测，两边看起来都没错。"""
+        for bad in ("http://", "10.100.0.24:abc", "10.100.0.24:0", "10.100.0.24:99999",
+                    "10.100.0.24:8900/x", "http://:8900", "a b"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError) as ctx:
+                    ops_mod.normalize_advertised_host(bad)
+                self.assertTrue(str(ctx.exception), "报错必须带原因（中文）")
+
+    def test_a_bad_value_in_the_config_is_reported_with_the_config_key(self):
+        cfg = self._cfg(advertised="not a host!")
+        with self.assertRaises(errors.EchoError) as ctx:
+            ops_mod.pairing_string(cfg, "X")
+        self.assertIn("advertised_host", str(ctx.exception.detail) + ctx.exception.message)
+
+    # ---- 环境变量 -----------------------------------------------------------
+
+    def test_the_env_var_is_read_and_the_alias_also_works(self):
+        with patch.dict(os.environ, {"ECHO_ADVERTISED_HOST": "10.100.0.24"}, clear=False):
+            self.assertEqual(settings_mod.load().get("server.advertised_host"), "10.100.0.24")
+        os.environ.pop("ECHO_ADVERTISED_HOST", None)
+        with patch.dict(os.environ, {"ECHO_PUBLIC_URL": "http://10.100.0.25:8900"},
+                        clear=False):
+            self.assertEqual(settings_mod.load().get("server.advertised_host"),
+                             "http://10.100.0.25:8900")
+        os.environ.pop("ECHO_PUBLIC_URL", None)
+
+    def test_the_primary_env_name_wins_over_the_alias(self):
+        env = {"ECHO_ADVERTISED_HOST": "10.1.1.1", "ECHO_PUBLIC_URL": "10.2.2.2"}
+        with patch.dict(os.environ, env, clear=False):
+            self.assertEqual(settings_mod.load().get("server.advertised_host"), "10.1.1.1",
+                             "两个都设时听 ECHO_ADVERTISED_HOST 的（不是'看运气'）")
+
+    def test_an_empty_env_var_does_not_wipe_the_yaml_value(self):
+        """空串 = 没设（与 `ECHO_LISTEN` / `ECHO_ADMIN_LISTEN` 同一套语义）。"""
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False,
+                                         encoding="utf-8") as fh:
+            fh.write("server: {advertised_host: '10.100.0.24'}\n")
+            path = fh.name
+        self.addCleanup(os.unlink, path)
+        with patch.dict(os.environ, {"ECHO_ADVERTISED_HOST": ""}, clear=False):
+            self.assertEqual(settings_mod.load(path).get("server.advertised_host"),
+                             "10.100.0.24")
+
+    def test_a_bad_config_value_stops_the_startup_instead_of_waiting_for_a_code(self):
+        """配错了要**启动就炸** —— 等到发码那一刻才报，同事已经拿到一张连不上的串了。"""
+        import server.main as main_mod
+        cfg = self._cfg(advertised="10.100.0.24:abc")
+        with self.assertRaises(SystemExit) as ctx:
+            main_mod.create_app(cfg)
+        self.assertIn("advertised_host", str(ctx.exception))
+
+    def _cert_file(self):
+        from tests.tls_test_cert import CERT_PEM
+        tmp = tempfile.mkdtemp(prefix="echo-adv-cert-")
+        path = os.path.join(tmp, "server.crt")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(CERT_PEM)
+        return path
 
 
 class TlsConfigTests(unittest.TestCase):

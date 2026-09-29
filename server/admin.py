@@ -22,6 +22,9 @@
    为什么三样都要：cookie 是 `SameSite=Strict`，但 **DNS-rebinding 不受它保护**
    —— 攻击者把域名解析到 `127.0.0.1` 时，浏览器认为这是**同站**请求，
    cookie 照发。挡住它的是(a)：那种请求的 `Origin` 是攻击者的域名，对不上。
+   (a) 里的"本站"= **`Origin` 的 host:port 等于这次请求自己的 `Host`，且 `Host`
+   是回环名**（不是"等于配置里 `admin_listen` 的端口" —— 那条会把 `ssh -L` 隧道
+   用户挡在门外，见 `same_site_write`）。
    (b) 的另一个作用见下面 `WRITE_HEADER` 的注释。
 4. **审计**：每个写动作（**含失败**）落一条 `admin_audit`，操作者是**登录的管理员名**
    （不是字符串 `cli`）。失败把原因写进 `target`（表只有四列，加列要走 §8.5 评审）。
@@ -95,6 +98,7 @@ from fastapi import APIRouter, FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from server import __version__, errors
+from server import advertised as advertised_mod
 from server import limits as limits_mod
 from server import ops as ops_mod
 from server import perfmon as perfmod
@@ -119,6 +123,10 @@ MAX_PAIRING_TTL_S = 7 * 24 * 3600
 #: 只认这几个名字是"本站"。`parse_listen` 出的 `0.0.0.0`/`::`/`*` 是通配地址，
 #: 它们不是浏览器地址栏里能出现的东西，所以换成这三个回环名。
 _LOOPBACK_NAMES = ("127.0.0.1", "localhost", "[::1]")
+
+#: 判"这个主机名是不是回环"用的别名集：比上面多一个**不带方括号**的 `::1`
+#: （`Host` 头里的 IPv6 按 RFC 要带方括号，别处偶尔会漏，认了不损失什么）。
+_LOOPBACK_ALIASES = _LOOPBACK_NAMES + ("::1",)
 
 #: 口令哈希的参数（scrypt）。**这些都是"让人算不快"的参数**：
 #: n=2^14 时一次验证约几十毫秒，暴力破解的代价因此抬高。
@@ -695,18 +703,24 @@ def create_admin_app(cfg, state, *, perf=None) -> FastAPI:
         只出现这一次，之后任何接口都不会再给（库里存的是哈希）。
         `confirm` 不是必需的 —— 发码是"多了一张待用的码"，不是破坏性动作，
         而且撤销它只需要再点一次「作废」。
+
+        `advertisedHost`（可选）= **这一张码**里公布的地址，盖过全局那一项 ——
+        同一台后端同时服务本机与远程时，本机那张给 `127.0.0.1`、远程那张给局域网 IP
+        （串本身带 host，两张码互不影响）。空 = 用「对外公布地址」那一项。
         """
         payload = await body_of(request)
         name = str(payload.get("name") or "")
         scopes = str(payload.get("scopes") or "")
         note = str(payload.get("createdBy") or payload.get("note") or "")
+        per_issue = payload.get("advertisedHost")
 
         def fn(who):
             return {"ok": True, "pairingCode": ops_mod.issue_pairing_code(
                 cfg, state.auth, name=name, scopes=scopes,
                 ttl_s=parse_ttl(payload.get("ttlSeconds"),
                                 float(cfg.get("auth.pairing_ttl_s", 900))),
-                created_by=note or ("admin:" + str(who["username"])))}
+                created_by=note or ("admin:" + str(who["username"])),
+                advertised=per_issue)}
 
         return as_write(request, "issue-pairing-code", name or "(未命名客户端)", fn)
 
@@ -896,6 +910,47 @@ def create_admin_app(cfg, state, *, perf=None) -> FastAPI:
 
         return as_write(request, "limits-set", limits_mod.audit_target(payload), fn)
 
+    # ---- 对外公布地址（读：登录即可；写：与其它写动作同一套闸门 + 审计）----
+    #
+    # 2026-09-30 用户实测的 bug：容器里发出来的配对串带的是 **Docker 网桥地址**
+    # （`echo://pair?host=http://172.18.0.2:8900&code=…`），而"同事真正连得到哪台机器"
+    # **只有部署的人知道** —— 以前每次都靠人手工改串，换个人第一次用必然踩。
+    # 所以这里开一对端点，值存在 state 卷（重启还在），落在
+    # `cfg.raw["server"]["advertised_host"]` —— 发码那条路（`ops.resolve_advertised`）
+    # 下一次就现读到（**热生效**，与运行参数同一个机制）。
+    #
+    # ⚠️ 这一项是「**每次发码时想公布的地址**」，不是一次性全局常量：
+    #   ① 同事要连 → 局域网 IP；② 本机后端 → 127.0.0.1；③ 两边都服务 → 发码时各写各的
+    #   （`POST /admin/api/pairing-codes` 的 `advertisedHost` 字段）。
+    # `formNote` 就是这三句话（**由后端下发**，页面不另抄一份）。
+
+    @api.get("/advertised-host")
+    def get_advertised_host(request: Request):
+        """当前的对外公布地址 + **来源**（admin / env / config / auto）。"""
+        current_admin(request)
+        return advertised_mod.view(cfg, store_of())
+
+    @api.post("/advertised-host")
+    async def set_advertised_host(request: Request):
+        """保存（或清空）对外公布地址。空串 = 清空 → 回到自动探测。
+
+        不合法 → **400 + 中文原因**（不静默忽略：静默忽略会让人以为配了、
+        其实还在探测 —— 那正是这次要修的那个 bug 的形态）。
+        保存**当场生效**（下一次发码就用它），并落在 state 卷里，重启后还在。
+        """
+        payload = await body_of(request)
+
+        def fn(who):
+            value = advertised_mod.set_advertised(cfg, store_of(), payload,
+                                                  updated_by=str(who.get("username") or ""))
+            out = advertised_mod.view(cfg, store_of())
+            out["ok"] = True
+            out["saved"] = value
+            return out
+
+        return as_write(request, "advertised-host-set",
+                        advertised_mod.audit_target(payload), fn)
+
     @api.get("/perf/state")
     def perf_state(request: Request):
         """是否在记录 + 采样间隔 + 已有点数。**这一次调用本身就算"有人在看"**。"""
@@ -966,29 +1021,29 @@ def parse_listen(text: str) -> tuple:
 # ---------------------------------------------------------------- 写请求的三道闸
 
 def allowed_origins(cfg, request: Optional[Request] = None) -> set:
-    """本站的 origin 白名单（`scheme://host:port`，小写）。
+    """管理面**回环本站**的 origin 集合（`scheme://host:port`，小写）—— 契约断言 / 排障用。
 
-    端口来自 `server.admin_listen`（管理面的真实监听地址）。
-    **没有配置端口时**（只有单测会直接 `create_admin_app` 而不配监听）才退一步
-    读请求自己的 `Host` —— 而且**只认回环名**：`Host: evil.example:8901` 这种
-    一个字都不采纳。这条兜底是有意的窄：DNS-rebinding 的攻击者控制不了受害者的
-    `Host` 是 `127.0.0.1` 还是自己的域名，所以"只信回环名"不会给它任何东西。
+    端口：给了 `request` 就用**请求自己的 `Host`**（浏览器真正在用的那个地址 ——
+    经 `ssh -L` 隧道时是 18901 这类别的端口）；没给就退一步用 `server.admin_listen`。
+
+    主机名**只取回环名**：`0.0.0.0`、配置里写的真实网卡地址、任意域名，一个都不进
+    —— 它们不是浏览器地址栏里能出现的"本站"。
+
+    ⚠️ 写闸门**不再**用这个集合判同站：那正是"Origin 必须恰好等于 `admin_listen`
+    端口"这个 bug 的来源（见 `same_site_write` 的长注释）。这个函数留着，是让
+    契约测试与排障输出有一份"本站应该长什么样"的清单，**不参与放行/拒绝**。
     """
-    host, port = parse_listen(cfg.get("server.admin_listen", ""))
+    _host, port = ("", 0)
+    if request is not None:
+        _host, port = parse_listen(request.headers.get("host") or "")
     if not port:
-        if request is None:
-            return set()
-        h, p = parse_listen(request.headers.get("host") or "")
-        if h not in ("127.0.0.1", "localhost", "::1", "[::1]") or not p:
-            return set()
-        host, port = h, p
-    names = list(_LOOPBACK_NAMES)
-    if host and host not in ("0.0.0.0", "::", "*", ""):
-        names.append(host)
+        _host, port = parse_listen(cfg.get("server.admin_listen", ""))
+    if not port:
+        return set()
     # 两种 scheme 都收：管理面自己是明文 http，但放在反代后面时浏览器看到的是 https。
     # 认的是**同站**这件事，scheme 不改变它是不是本站。
     return {"%s://%s:%d" % (scheme, name, port)
-            for name in set(names) for scheme in ("http", "https")}
+            for name in _LOOPBACK_NAMES for scheme in ("http", "https")}
 
 
 def origin_of(request: Request) -> str:
@@ -1007,12 +1062,110 @@ def origin_of(request: Request) -> str:
     return m.group(1).lower() if m else ""
 
 
+def _host_port(request: Request) -> tuple:
+    """这次请求自己的 `Host` 头 → `(host, port)`（主机名小写）。
+
+    缺 `Host`、没带端口、坏值一律 `("", 0)` —— 调用方按**拒绝**处理（失败关闭）。
+    小写化是必须的：`Host: LOCALHOST:8901` 与 `Origin: http://localhost:8901`
+    说的是同一件事，不该因为大小写被判成两个站。
+    """
+    host, port = parse_listen(request.headers.get("host") or "")
+    return (str(host or "").lower(), port)
+
+
+#: `scheme://host[:port]` —— 只认到端口为止（`Origin` 本来就是这种形状，
+#: `Referer` 还带路径，所以 `origin_of()` 已经先把路径切掉了）。
+_ORIGIN_RE = re.compile(
+    r"^([a-zA-Z][a-zA-Z0-9+.\-]*)://(\[[0-9A-Fa-f:.]+\]|[^:/?#]+)(?::(\d{1,5}))?$")
+
+
+def _origin_host_port(origin: str) -> tuple:
+    """`"http://127.0.0.1:18901"` → `("127.0.0.1", 18901)`。
+
+    `http` / `https` **不写端口**时按 80 / 443 归一（浏览器地址栏里的
+    `http://127.0.0.1` 就是 80 端口，`Origin` 也会省掉它）。
+    解析不出来 → `("", 0)`，调用方一律拒绝 —— 不会"解析失败=放行"。
+    """
+    m = _ORIGIN_RE.match(str(origin or "").strip())
+    if not m:
+        return ("", 0)
+    scheme, host, port = m.group(1).lower(), m.group(2).lower(), m.group(3)
+    if port:
+        return (host, int(port))
+    return (host, 443 if scheme == "https" else 80)
+
+
+def same_site_write(request: Request) -> bool:
+    """这次写请求是不是**浏览器从本站页面**发出的？—— 同站判据（2026-09-29 改）。
+
+    ## 规则（两条，缺一不可）
+
+      1. `Origin`（没有就兜底用 `Referer`，见 `origin_of`）里的 **host:port**
+         必须**等于这次请求自己的 `Host` 头**里的 host:port；
+      2. `Host` 的主机名必须是**回环名**（`127.0.0.1` / `localhost` / `[::1]`），
+         而且**带端口**。
+
+    scheme **不参与**比较：管理面自己收明文 http，放在反代后面时浏览器看到的是
+    https，而内层请求的 scheme 我们无法可靠得知（旧实现也是两种都收）。
+    比较的 host:port 一致时，`Origin` 的主机名必然也是回环名 —— 见下面两条。
+
+    ## 为什么"Host 相等 + 回环名"就等于同站
+
+    浏览器只在"页面地址与请求地址同源"时才把 `Origin` 填成那个源，而 `Host` 是
+    浏览器按**它正在访问的地址**填的。两者逐字对上（同主机、同端口），才说明这次
+    请求是那个页面发出的；再叠一层"主机名只能是回环名"，就把"攻击者自己的域名"
+    整个排除在外。
+
+    ## 为什么旧判据（必须等于 `admin_listen` 的端口）是错的
+
+    管理面只发布在宿主回环上，文档推荐的访问方式就是
+    `ssh -L 18901:127.0.0.1:8901`（本机 8901 常被别的后端占着，换个本地端口不是错）。
+    这时浏览器眼里的本站是 `http://127.0.0.1:18901`，`Host` 与 `Origin` 都是它；
+    而配置里 `admin_listen` 是 `:8901` —— 旧判据于是把**用户自己**挡在门外：
+    "发配对码 / 保存运行参数 / 改自己口令"一律 403，报的还是"不是本站"。
+    **同站 ≠ "配置里那个端口"**，同站 = "这次请求自己的 Host"。
+
+    ## 为什么这样仍然挡得住本机恶意网页（要防的主要场景）
+
+    恶意页跑在 `http://127.0.0.1:6666` 上，向管理面发请求 → 浏览器发的 `Origin`
+    是 `http://127.0.0.1:6666`，而请求的 `Host` 是 `127.0.0.1:8901`（或隧道口的
+    `127.0.0.1:18901`）→ **host 相同、端口不等 → 拒绝** ✓。
+
+    反之若这里只比"两者相等"、不要求回环名，DNS-rebinding 就能过来：攻击者把自己
+    的域名 `evil.example` 解析到 `127.0.0.1`，受害者的浏览器访问
+    `http://evil.example:8901` 时 `Host` 与 `Origin` **都是** `evil.example:8901`
+    —— 一样相等。第 2 条（只认回环名）就是专门拦它的，所以**绝不能**放宽成
+    "任意来源"。
+
+    ## 顺带
+
+    `server.admin_listen` 绑 `0.0.0.0` 还是 `127.0.0.1` 与这条判据**无关**：这里
+    一个字节都不读配置，所以"配置写法不同导致时松时紧"这一类 bug 结构上不存在。
+    """
+    host, hport = _host_port(request)
+    if not hport or host not in _LOOPBACK_ALIASES:
+        return False
+    origin = origin_of(request)
+    if not origin:
+        return False
+    ohost, oport = _origin_host_port(origin)
+    if not ohost or not oport or ohost not in _LOOPBACK_ALIASES:
+        return False
+    # 严格相等（不做 `127.0.0.1` ↔ `localhost` 的"别名互换"）：真实浏览器发出来的
+    # `Origin` 与 `Host` 本来就是同一个地址的两种写法，逐字对上才是"同一次导航"。
+    # 对不上就拒（失败关闭）—— 少一分宽松，多一分可复核。
+    return ohost == host and oport == hport
+
+
 def check_write_request(request: Request, cfg, sessions, *, cookie_name: str = COOKIE_NAME):
     """写请求的闸门。返回 `None` = 放行，否则返回一个 `EchoError`（401/403）。
 
     **顺序是有意的**：先认身份（401），再判"这次请求像不像浏览器从本站发出的"（403）。
     反过来的话，一个没登录的跨站请求会得到 403，而 403 已经泄漏了
     "这个端点存在且需要凭据"这件小事 —— 401 更诚实也更有用。
+
+    同站那一条见 `same_site_write`。`cfg` 保留在签名里是为了不改调用方（中间件），
+    但它**已经不参与**同站判定 —— 正是"拿配置里的端口当判据"害了隧道用户。
     """
     token = request.cookies.get(cookie_name) or ""
     row = sessions.get(token)
@@ -1024,10 +1177,9 @@ def check_write_request(request: Request, cfg, sessions, *, cookie_name: str = C
     if not str(request.headers.get(WRITE_HEADER) or "").strip():
         # 见 `WRITE_HEADER` 的注释：这一条不是身份校验，是"非简单请求"的标志。
         return errors.forbidden("写请求必须带 %s 头（防跨站表单的那道闸）" % WRITE_HEADER)
-    origin = origin_of(request)
-    if not origin or origin not in allowed_origins(cfg, request):
+    if not same_site_write(request):
         return errors.forbidden("写请求的 Origin/Referer 不是本站（%s）"
-                                % (origin or "缺失"))
+                                % (origin_of(request) or "缺失"))
     return None
 
 

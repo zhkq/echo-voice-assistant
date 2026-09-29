@@ -14,6 +14,8 @@
 #   6. 生成 compose override（配置挂载 / 打开鉴权 / 探针 scheme）
 #   7. `docker compose ... up -d --build`
 #   8. 建管理员（**只在还没有账号时**；管理面只开「改自己口令」这一条路，增删改别人仍是命令行）
+#      口令默认随机生成（只打印一次）；加 `--admin-password-stdin` 则用 stdin 里那一行
+#      （`--set-password`，不进 shell 历史/进程参数）—— 适合"一开始就想用记得住的口令"。
 #   9. 验收：/v1/health 期望值 + `scripts/smoke-echo-backend.py`
 #
 # 用法（在仓库根目录跑）：
@@ -48,6 +50,10 @@ MODELS_ONLY=0
 SKIP_MODELS=0
 ALLOW_MISSING_ALIGNER=0
 ADMIN_NAME=ops
+#: `--admin-password-stdin`：把 **stdin 的第一行**当成新管理员的口令（而不是让 CLI
+#: 生成一串随机的）。值 = 那个口令（全程只在 shell 变量里；**不进命令行参数**）。
+ADMIN_PASSWORD=""
+ADMIN_PASSWORD_STDIN=0
 TLS_MODE=self-signed
 SERVER_HOST=""
 VRAM_BUDGET_MB=""
@@ -101,6 +107,17 @@ usage() {
   --torch-version VER   钉 torch 版本（例如 2.7.1）。老卡上会自动补一个建议值。
   --no-torch-index      不写 torch 源（用 server/Dockerfile 里的默认）。
   --admin NAME          管理员账号名，默认 ops。
+  --admin-password-stdin
+                        首次建管理员时，**用 stdin 的第一行**当口令（而不是让 CLI 生成
+                        一串随机的、只打印一次）。推荐用法（口令不进 shell 历史、不进
+                        进程参数）：
+                          read -r -s -p '口令: ' PW; echo
+                          printf '%s' "$PW" | sudo bash scripts/prepare-backend.sh --admin-password-stdin
+                        （`%s` 后面不必自己加换行：`read -r` 读的就是一行。）
+                        单独跑这一步的话 shell 里也可以直接：
+                          docker exec -i echo-backend python -m server.main --set-password ops
+                        ⚠️ 口令仍需满足策略（至少 8 位、最多 200 位）；不合规会**非零退出
+                        且不落库**。不给这个开关 = 行为与以前完全一样（随机 + 打印一次）。
   --server-host HOST    客户端要连的地址（证书 CN/SAN 用它），默认自动探测。
   --tls MODE            self-signed（默认）| proxy | none。
   --vram-budget-mb N    写进生成的配置（8 GB 卡建议 7000）。默认不写 = 0（不限）。
@@ -129,6 +146,7 @@ while [ $# -gt 0 ]; do
         --torch-version) TORCH_VERSION="${2:?--torch-version 后面要给版本号}"; shift ;;
         --no-torch-index) NO_TORCH_INDEX=1 ;;
         --admin) ADMIN_NAME="${2:?--admin 后面要给名字}"; shift ;;
+        --admin-password-stdin) ADMIN_PASSWORD_STDIN=1 ;;
         --server-host) SERVER_HOST="${2:?--server-host 后面要给地址}"; shift ;;
         --tls) TLS_MODE="${2:?--tls 后面要给 self-signed|proxy|none}"; shift ;;
         --vram-budget-mb) VRAM_BUDGET_MB="${2:?--vram-budget-mb 后面要给数字}"; shift ;;
@@ -169,6 +187,23 @@ bad()  { ERRORS=$((ERRORS + 1)); printf '  %s[错误]%s %s\n' "$C_RED" "$C_OFF" 
 #: 与 bad 一样，但**可以**被"允许缺"的那两条路线降级成警告（见 MODEL_ERRS 的注释）
 bad_model() { MODEL_ERRS=$((MODEL_ERRS + 1)); bad "$@"; }
 die()  { bad "$@"; exit 1; }
+
+# --- `--admin-password-stdin`：口令只从 stdin 读，**绝不当参数传** --------------
+#
+# 为什么不写 `--admin-password 口令`：那会同时进 **shell 历史**与 **进程参数**
+# （`ps aux` 里谁都看得见）。所以这个开关只读 stdin 的**第一行**，之后是什么都不管。
+#
+# 两条细节：
+#   * `IFS= read -r`：保留前导/尾随空格与反斜杠（口令里的 `\` 不该被吃掉）；
+#   * 读**一行就够** —— 多读只会把调用者后面要用的输入吞掉（这个脚本自己就踩过
+#     "后台进程吃 stdin" 的坑，见 AGENTS.md）。
+# `read` 是 bash 内建：stdin 是管道/heredoc 时它照读；**只有**在没有任何输入时会失败
+# （`</dev/null`），那时报错退出，不会挂在那里等。
+if [ "$ADMIN_PASSWORD_STDIN" = 1 ]; then
+    if ! IFS= read -r ADMIN_PASSWORD; then
+        die "--admin-password-stdin 读不到 stdin（是不是接在 </dev/null 上？）—— 例：printf '%s\\n' \"\$PW\" | sudo bash $0 --admin-password-stdin"
+    fi
+fi
 
 #: 所有会改系统的动作都过这里 —— `--dry-run` 下只打印
 run() {
@@ -990,21 +1025,46 @@ if [ "$DO_UP" = 0 ]; then
     log "--no-up：跳过（容器起来后再跑这一步）"
 elif [ "$DRY_RUN" = 1 ]; then
     printf '  %s(dry-run)%s docker exec %s python -m server.main --list-admins\n' "$C_DIM" "$C_OFF" "$CONTAINER"
-    printf '  %s(dry-run)%s 若还没有账号 → docker exec %s python -m server.main --new-admin %s\n' \
-        "$C_DIM" "$C_OFF" "$CONTAINER" "$ADMIN_NAME"
+    if [ "$ADMIN_PASSWORD_STDIN" = 1 ]; then
+        printf '  %s(dry-run)%s 若还没有账号 → **口令从 stdin 读**（不进命令行历史/进程参数）：\n' \
+            "$C_DIM" "$C_OFF"
+        printf '  %s(dry-run)%s   printf %%s\\\\n "$口令" | docker exec -i %s python -m server.main --set-password %s\n' \
+            "$C_DIM" "$C_OFF" "$CONTAINER" "$ADMIN_NAME"
+    else
+        printf '  %s(dry-run)%s 若还没有账号 → docker exec %s python -m server.main --new-admin %s\n' \
+            "$C_DIM" "$C_OFF" "$CONTAINER" "$ADMIN_NAME"
+        printf '  %s(dry-run)%s 想自己指定口令就加 --admin-password-stdin（口令从 stdin 读）\n' \
+            "$C_DIM" "$C_OFF"
+    fi
 else
     admins_out="$(docker exec "$CONTAINER" python -m server.main --list-admins 2>&1)" || true
     if printf '%s' "$admins_out" | grep -q '还没有管理员账号'; then
-        log "还没有管理员账号 → 建一个（**口令只出现这一次**，当场存好）"
-        if docker exec "$CONTAINER" python -m server.main --new-admin "$ADMIN_NAME"; then
-            ok "管理员 $ADMIN_NAME 已建（口令在上面的输出里，只显示这一次）"
+        if [ "$ADMIN_PASSWORD_STDIN" = 1 ]; then
+            # ---- 指定口令那条路：`--set-password` 只从 stdin 读 ----
+            # 口令在 `ADMIN_PASSWORD` 里 → 用 printf 喂给容器的 stdin（`docker exec -i`）。
+            # **不放进命令行参数**：那样 `ps aux` 与 shell 历史里都会有。
+            log "还没有管理员账号 → 用**你给的口令**建 $ADMIN_NAME（口令从 stdin 传，不落盘）"
+            if printf '%s\n' "$ADMIN_PASSWORD" | \
+                    docker exec -i "$CONTAINER" python -m server.main --set-password "$ADMIN_NAME"; then
+                ok "管理员 $ADMIN_NAME 已建，口令就是你输入的那个（**脚本不打印它**）"
+            else
+                bad "建管理员失败（原始报错在上面）—— 口令要至少 8 位、最多 200 位；管理面登录会一直失败"
+            fi
         else
-            bad "--new-admin 失败（原始报错在上面）—— 管理面登录会一直失败"
+            log "还没有管理员账号 → 建一个（**口令只出现这一次**，当场存好）"
+            if docker exec "$CONTAINER" python -m server.main --new-admin "$ADMIN_NAME"; then
+                ok "管理员 $ADMIN_NAME 已建（口令在上面的输出里，只显示这一次）"
+                log "想一开始就用自己记得住的口令：改用 --admin-password-stdin（口令从 stdin 读）"
+            else
+                bad "--new-admin 失败（原始报错在上面）—— 管理面登录会一直失败"
+            fi
         fi
     elif [ -n "$admins_out" ]; then
-        ok "已有管理员账号 → **跳过** --new-admin（那条命令会重置同名账号的口令）"
+        ok "已有管理员账号 → **跳过**建号（--new-admin 会重置同名账号的口令）"
         printf '%s\n' "$admins_out" | sed 's/^/    /'
-        log "确实要重置口令：docker exec $CONTAINER python -m server.main --new-admin <名字>"
+        log "确实要重置口令（自己指定一个）："
+        log "    printf '%s\\n' \"\$口令\" | docker exec -i $CONTAINER python -m server.main --set-password <名字>"
+        log "    （或随机重置：docker exec $CONTAINER python -m server.main --new-admin <名字>）"
     else
         bad "读不到管理员清单（docker exec 没有输出）—— 容器起来了吗：docker ps -a"
     fi

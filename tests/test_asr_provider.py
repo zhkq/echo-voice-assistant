@@ -18,12 +18,45 @@ import shutil
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app import meeting                                      # noqa: E402
 from app.audio import stt                                    # noqa: E402
+from app.capabilities import (                               # noqa: E402
+    BACKEND_ECHO_SERVER,
+    SOURCE_LAN,
+    CapabilityClient,
+    CapabilityRouter,
+    DiarizeResult,
+    Provenance,
+)
+
+
+class _DiarizeOnlyBackend(CapabilityClient):
+    """**只做分离**的能力后端替身（转写走 provider，不归它）。
+
+    2026-09-29：说话人那一族只落在能力后端上。这一步之前，这里靠打桩
+    `app.audio.diarize.diarize_wav_full` 演"分离成功了"；那条本机路已经从会议链路上
+    断掉，所以改成用一个**只声明 `diarize.turns`** 的后端替身 ——
+    正好把"provider 转写 + 后端分离"这条真实组合钉住。
+    """
+
+    backend_id = BACKEND_ECHO_SERVER
+    source = SOURCE_LAN
+    provides = frozenset({"diarize.turns"})
+    vector_space_id = "ws-provider-spy"
+
+    def __init__(self, turns=None):
+        self.turns = list(turns or [(0.0, 20.0, "SPEAKER_00")])
+
+    def diarize(self, wav, *, max_speakers=None, **kw):
+        return DiarizeResult(turns=tuple(self.turns),
+                             speakers={"SPEAKER_00": tuple([0.1] * 256)},
+                             dim=256, vector_space_id=self.vector_space_id,
+                             provenance=Provenance(self.backend_id, "spy-dia-v1"),
+                             audio_seconds=20.0)
 
 
 class TranscribeStatusTests(unittest.TestCase):
@@ -159,9 +192,10 @@ class TranscribeImplWiringTests(unittest.TestCase):
         self.updates = []
         self.speakers = []
         # 2026-09-26：说话人分离是会议的**必备环节**（不再是开关），provider 那条路
-        # 也会走它。所以这里必须把**本机分离**与**落库的说话人**都换成替身 ——
-        # 不打桩会去加载本机 pyannote；而 `db.replace_speakers` 没打桩的话，
-        # 这一组"用一个假 meeting_id=1"的用例会往**真实库**里写说话人行。
+        # 也会走它。2026-09-29 起它**只走能力后端** —— 所以下面把本机分离打桩成
+        # "调用即红"（那条路已经不该参与会议链路），实际的说话人由
+        # `_DiarizeOnlyBackend` 出（见 `test_provider_text_lands_in_the_db_...`）。
+        # `db.replace_speakers` 必须打桩：这一组用假 meeting_id=1，不然会往**真实库**里写。
         patches = [
             patch.object(meeting.db, "get_meeting_by_name",
                          lambda name: {"id": 1, "name": name}),
@@ -182,9 +216,9 @@ class TranscribeImplWiringTests(unittest.TestCase):
             patch.object(meeting, "_active_asr_provider", self._provider),
             patch.object(meeting, "_asr_provider_id", lambda: "openai-asr"),
             patch.object(meeting, "_wav_seconds", lambda path: 20.0),
+            # 本机分离一次都不许被调到（客户端进程内已经不承担会议分离）
             patch("app.audio.diarize.diarize_wav_full",
-                  lambda path, max_speakers=None: ([(0.0, 20.0, "SPEAKER_00")],
-                                                   [[0.1] * 256], ["SPEAKER_00"])),
+                  MagicMock(side_effect=AssertionError("分离不该回落本机"))),
             patch.object(meeting.settings, "get",
                          lambda k, d=None: {"meetingSttModel": "sensevoice",
                                             "meetingAutoSummarize": False}.get(k, d)),
@@ -198,7 +232,14 @@ class TranscribeImplWiringTests(unittest.TestCase):
 
     def test_provider_text_lands_in_the_db_without_loading_local_engines(self):
         self.fake = _FakeAsr()
-        with patch.object(meeting.stt_mod, "_get_whisper",
+        # 分离那一槽只落在能力后端上（2026-09-29）：把**路由**换成"只有这个后端"，
+        # 并把 `configured()` 钉成真。`providerAsr` 那条路不经过能力层的 `asr.text`，
+        # 所以这一场是"provider 转写 + 后端分离"的真实组合。
+        from app.capabilities import echo_server
+        router = CapabilityRouter([_DiarizeOnlyBackend()], settings_get=lambda k, d=None: d)
+        with patch("app.capabilities.build_default_router", lambda **kw: router), \
+             patch.object(echo_server, "configured", lambda: True), \
+             patch.object(meeting.stt_mod, "_get_whisper",
                           side_effect=AssertionError("配了 provider 时不该加载本地模型")):
             meeting._transcribe_impl(self.folder)
         self.assertEqual(len(self.fake.calls), 1, "每段调一次 provider")

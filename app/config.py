@@ -24,6 +24,7 @@
 `docs/settings-audit.md`；接线回归测试见 `tests/test_settings_wiring.py`。
 """
 import os
+import threading
 
 from app import paths
 import app.db as db
@@ -338,6 +339,8 @@ DEFAULTS = {
     # device / sttModel / wakeEngine / meetingSttModel / meetingDiarize / voiceprint*
     # 都归 grp="model"：它们正常由面板顶部「模型」页签承载（带就绪状态与获取入口），
     # 这里的元数据是给"页签加载失败时回退显示"用的（见 web/app.js 的 MODEL_KEYS）。
+    # 2026-09-29：其中 `meetingSttModel` 已经废弃（不再下发、写入被拒），
+    # grp 只剩"老库行的兼容标记"这一层意思。
     "device":          dict(value="auto", grp="model", label="计算设备",
                             description="auto=cuda 优先，失败回退 CPU",
                             value_type="str", options=["auto", "cpu", "cuda"]),
@@ -518,22 +521,20 @@ DEFAULTS = {
                              description="低于此音量不送入唤醒模型（省电防误触发）", value_type="int"),
     # ---------- 会议 ----------
     # 2026-09-26（新分工）：会议转写默认 qwen3asr —— 它给**原生句级时间轴**（档位 exact），
-    # 而 SenseVoice/sherpa 都得借时间骨架或按字数摊。whisper 档已退役（权重删除）。
+    # 而 SenseVoice/sherpa 都得借时间骨架或按字数摊。
+    # 2026-09-29（**已废弃**）：客户端进程内不再承担会议转写与说话人分离（用户拍板）——
+    # 即使本机有 GPU，也以"在本机起一个能力后端"的形式完成。所以这一项**不再是设置**：
+    # 值留库、不出 `/api/settings`、写入被拒（与上面的 `meetingDiarize` 同一套样板）。
+    # 走哪条路由「会议」卡里的 `capabilityMeetingAsrBackend` 决定。
     "meetingSttModel":  dict(value="qwen3asr", grp="model", label="会议转写引擎",
-                             description="**本机**跑会议转写时用哪个引擎（「会议转写走哪条路」"
-                                         "选 ECHO 后端时这一项不生效，由后端决定）。"
-                                         "qwen3asr = 推荐：原生句级时间戳（精确），"
-                                         "分块 60 s + 批 4 的喂法下实测 rtf≈0.07（13~16 倍实时，"
-                                         "10 分钟音频约 30~47 秒）；"
-                                         "sensevoice = 更快，但它**不给句级时间戳**，"
-                                         "原本靠 whisper 骨架对齐，而 whisper 权重已删 → "
-                                         "时间轴退化为按字数估算（详情页标「估算」）；"
-                                         "sherpa = 流式、只给整段文本 → 同样按字数估算。"
-                                         "**时间戳来自哪条路**：后端 qwen3asr / 本机 qwen3asr = 精确；"
-                                         "本机 sensevoice / sherpa = 估算。"
-                                         "whisper 各档已不再提供（老库里的值按 qwen3asr 读）",
+                             description="已弃用：会议转写不再在客户端进程内跑（本机也不再"
+                                         "需要装它的模型）。转写走哪条路由「业务配置 → 会议」"
+                                         "的「会议转写走哪条路」决定 —— 要全本机跑，就在本机"
+                                         "起一个能力后端并选中它（取值仍是 echo-server）。"
+                                         "这一项只是老配置的兼容读取，改了不会有任何效果",
                              value_type="str",
-                             options=["sherpa", "sensevoice", "qwen3asr"]),
+                             options=["sherpa", "sensevoice", "qwen3asr"],
+                             deprecated=True),
     "meetingSegmentMinutes": dict(value=10, grp="meeting", label="分段分钟",
                                   description="录音每 N 分钟存一个文件", value_type="int"),
     "meetingAutoSummarize": dict(value=True, grp="meeting", label="自动生成纪要",
@@ -964,13 +965,15 @@ VALUE_ALIASES = {
 #: 判据是"它还在本平台的候选项里吗"：还在（例如 macOS 的 whisper 档）就一个字都不折。
 RETIRED_VALUE_FALLBACKS = {
     # 2026-09-26：whisper 权重已从本机删除（5086.5 MB），新分工是
-    # 「指令兜底 = sherpa / 指令进阶 = SenseVoice / 会议转写 = qwen3asr」。
-    #   指令：折成 sherpa（安装器保证它在，永远不会因为缺权重而转不了）；
-    #   会议：折成 qwen3asr（新默认；原生句级时间戳 exact，不再需要借 whisper 骨架）。
+    # 「指令兜底 = sherpa / 指令进阶 = SenseVoice」。指令这条链路仍然在客户端进程内跑
+    # （铁律 L3），所以这里的折算照旧有用：
+    #   指令：折成 sherpa（安装器保证它在，永远不会因为缺权重而转不了）。
     "sttModel": {"tiny": "sherpa", "base": "sherpa", "small": "sherpa",
                  "medium": "sherpa", "large": "sherpa", "large-v3": "sherpa"},
-    "meetingSttModel": {"tiny": "qwen3asr", "base": "qwen3asr", "small": "qwen3asr",
-                        "medium": "qwen3asr", "large": "qwen3asr", "large-v3": "qwen3asr"},
+    # 2026-09-29：`meetingSttModel` 这一整项**废弃**了（键已 `deprecated=True`），
+    # 读取方（`meeting.resolve_meeting_engine` / boot 的 stt-meeting 组件）全部消失，
+    # 所以它原来那条 whisper 档折算规则也一并删掉 —— 老库里的 `small` 之类会原样读出来，
+    # 但没有一行代码再看它（原值仍在库里，谁也不会被改写）。
     # 2026-09-29：客户端进程内**不再承担会议转写与说话人分离**（用户拍板）——
     # 即使本机有 GPU，也以"在本机起一个能力后端"的形式完成（同一个 echo-server 取值）。
     # 于是三个能力设置里的 `local` 一档退役：
@@ -1016,20 +1019,49 @@ def _offline_tts_engine():
 
 
 class Settings:
-    """配置门面：读改走内存缓存，写时落库。"""
+    """配置门面：读改走内存缓存，写时落库。
+
+    `_cache` 的填充与失效都在**同一把锁**里（2026-09-29 修的并发 bug）。原来
+    `_load()` 是"先把空 dict 挂在 `self._cache` 上，再逐键填"——期间**任何**
+    别的线程调 `settings.get(k)` 都会看到那份填到一半的缓存；`k` 还没轮到
+    `get()` 就落到兜底分支 `DEFAULTS[k]["value"]`，于是读到的是**静态默认值**
+    而不是库里的真值。表现（`tests/test_settings_wiring` 的「全部设置项往返」实测）：
+
+      * PUT 返回 200、库里也是新值，`settings.get(k)` 却还是旧值（默认值）；
+      * 只有**一个**键偶发红（谁正好撞进那段窗口谁红）、单跑绿、全量偶发红。
+
+    产品里随时有后台线程在读设置（唤醒/热键监听、启动期复核、面板轮询），
+    而每次 `update()` 都会把缓存置空 → 紧接着任何一次后台读都会触发一次全量
+    填充（100+ 次开库，几十毫秒）→ 那段窗口里主线程的读就会拿到默认值。
+    所以：填充与失效都持锁；读者要么拿到**完整的**旧快照，要么阻塞到**完整的**
+    新快照就绪，绝不会看见"填到一半"的缓存。
+    """
 
     def __init__(self):
         self._cache = None
+        #: 可重入锁：`_load()` 内部的 `expand_path()` / `_effective_default()` 目前
+        # 都不会回头调 `settings.get()`（已核对），但万一以后会，重入也只是拿到
+        # "填到一半"的那份（与旧行为一致），不会死锁。
+        self._lock = threading.RLock()
 
     def _load(self):
-        if self._cache is None:
-            self._cache = {}
-            for k, meta in DEFAULTS.items():
-                # 库里没有该键时，回落值是**本平台**的默认值（D11）
-                # 读出来再按 VALUE_ALIASES 折算（老库的遗留取值，见那边的说明）
-                self._cache[k] = _aliased(
-                    k, expand_path(db.get_setting(k, _effective_default(k, meta))))
-        return self._cache
+        with self._lock:
+            cache = self._cache
+            if cache is None:
+                # 先发布空 dict、再往里填：**同线程重入**时看到的是填到一半的那份
+                # （与旧行为一致），**别的线程进不来**（要拿同一把锁）。
+                cache = self._cache = {}
+                for k, meta in DEFAULTS.items():
+                    # 库里没有该键时，回落值是**本平台**的默认值（D11）
+                    # 读出来再按 VALUE_ALIASES 折算（老库的遗留取值，见那边的说明）
+                    cache[k] = _aliased(
+                        k, expand_path(db.get_setting(k, _effective_default(k, meta))))
+            return cache
+
+    def _drop_cache(self):
+        """丢缓存（与 `_load()` 同一把锁；**不要**再直接写 `self._cache = None`）。"""
+        with self._lock:
+            self._cache = None
 
     def seed_defaults(self):
         """首次启动写入默认值 + 同步元数据（不覆盖已有 value）+ 跑两类值迁移。"""
@@ -1054,7 +1086,7 @@ class Settings:
                                        options=options)
                 # 弃用项的值迁移（把"已弃用开关"表达的意图搬到还在生效的那一项上）
                 self._migrate_deprecated(key)
-        self._cache = None
+        self._drop_cache()
 
     def _migrate_deprecated(self, key):
         """把已弃用键的取值翻译成仍生效键的取值（见 DEPRECATION_MIGRATIONS）。
@@ -1186,8 +1218,11 @@ class Settings:
                     continue
             cleaned[k] = v
         if cleaned:
-            db.upsert_settings(cleaned)
-            self._cache = None
+            # 写库与"丢缓存"必须在**同一个临界区**里（否则读者可能在两者之间
+            # 用写之前的库内容重建缓存，于是写进来的值又被旧快照盖住）。
+            with self._lock:
+                db.upsert_settings(cleaned)
+                self._cache = None
         return cleaned
 
     def reset(self, key=None):
@@ -1206,7 +1241,7 @@ class Settings:
                                label=meta["label"], description=meta["description"],
                                value_type=meta["value_type"],
                                options=_effective_options(key, meta))
-        self._cache = None
+        self._drop_cache()
 
 
 settings = Settings()

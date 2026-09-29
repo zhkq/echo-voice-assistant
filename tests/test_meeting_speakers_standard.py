@@ -247,8 +247,9 @@ class _MeetingCase(_IsolatedState):
                          lambda level, src, msg: self.logs.append((level, msg)))
         p.start()
         self.addCleanup(p.stop)
-        for target, kw in ((meeting, "_boot_meeting_stt"), (meeting, "_boot_note_meeting_key"),
-                           (meeting.tts_mod, "play_beep"), (meeting.tts_mod, "beep_ok")):
+        # 启动页那两个入口（`_boot_meeting_stt` / `_boot_note_meeting_key`）**已经不存在了**
+        # （2026-09-29：会议不再有本机引擎组件），所以这里只剩提示音要哑掉 —— 用例不许出声。
+        for target, kw in ((meeting.tts_mod, "play_beep"), (meeting.tts_mod, "beep_ok")):
             p = patch.object(target, kw, lambda *a, **k: None)
             p.start()
             self.addCleanup(p.stop)
@@ -275,65 +276,93 @@ class _MeetingCase(_IsolatedState):
         return folder
 
     def _stub_local_asr(self, text="第一句。第二句。"):
-        """本机转写：**一个真模型都不加载**。
+        """**本机转写那条路已经不存在了**（2026-09-29）—— 留着这个方法只为报错清楚。
 
-        用 SenseVoice 那条路（它在默认档里，且不需要 GPU），把加载器与"文本→逐句"那一步
-        都换成替身 —— 这一组用例要验的是分离链路，不是转写引擎（引擎的护栏在
-        `tests/test_meeting_engine.py`）。
+        会议转写现在只有两条路：能力后端（`asr.text`）与显式配的在线转写
+        （`providerAsr`）。所以本文件一律用 `_configure_backend()` 造一个**只做转写**的
+        能力后端来出文字 —— 它同时把"分离没做成"这件事单独留出来验。
         """
-        p = patch.object(meeting.stt_mod, "_get_sensevoice", MagicMock(return_value=object()))
-        p.start()
-        self.addCleanup(p.stop)
-        rows = [(1, 0.0, 0.4, "第一句。"), (1, 0.4, 0.9, "第二句。")]
+        raise AssertionError(
+            "客户端进程内不再做会议转写（_stub_local_asr 已失效）—— 用 _configure_backend()")
 
-        def fake_fallback(sv, wm, path, idx, seg_min, cfg, cap_kinds=None):
-            # 签名与档位累加都照**真实现**来（`app/meeting.py::_fallback_sv_rows`）：
-            # 替身少一个参数，就会把"调用点忘了传 cap_kinds"这个 bug 挡在门外
-            # （2026-09-26：就是它让那条红用例在替身这里先炸了）。
-            if cap_kinds is not None:
-                cap_kinds["estimated"] = cap_kinds.get("estimated", 0) + 1
-            return [r for r in rows]
+    def _stub_local_diarize(self, *, raises=None):
+        """本机分离替身。**只为断言"它一次都不该被调到"**（被调用即红色）。
 
-        p = patch.object(meeting, "_fallback_sv_rows", fake_fallback)
-        p.start()
-        self.addCleanup(p.stop)
-        p = patch.object(meeting, "_skeleton_model", lambda cfg, *a: None)
-        p.start()
-        self.addCleanup(p.stop)
-        settings.update({"meetingSttModel": "sensevoice"})
-        settings._cache = None
-        return text
-
-    def _stub_local_diarize(self, turns=None, embs=None, labels=None, raises=None):
-        """本机分离替身。`raises` 用来演"本机没装 pyannote / 没权重"。"""
+        `app/audio/diarize.py` 在会议链路上已经不再被引用（2026-09-29），
+        所以这个替身默认的行为就是"被调用即断言失败"。
+        """
         def fake(path, max_speakers=None):
             if raises is not None:
                 raise raises
-            return (turns if turns is not None else [(0.0, 1.0, "SPEAKER_00")],
-                    embs if embs is not None else [[0.1] * 256],
-                    labels if labels is not None else ["SPEAKER_00"])
+            raise AssertionError("会议分离不该走本机引擎（客户端进程内已不承担它）")
         p = patch("app.audio.diarize.diarize_wav_full", fake)
         p.start()
         self.addCleanup(p.stop)
+
+    def _configure_backend(self, url="http://gpu-01:8900"):
+        """配上一个 ECHO 后端（`/api/settings` 里填地址即可，不必真连得上）。"""
+        settings.update({"capabilityEchoServerUrl": url})
+        settings._cache = None
+        real_get = settings.get
+
+        def fake_get(key, default=None):
+            # `configured()` 读的是这个键；上一条 update 已经写进库，这里只是把
+            # "这台机器配了后端"这件事钉死（与 test_meeting_capability 同一套写法）。
+            if key == "capabilityEchoServerUrl":
+                return url
+            return real_get(key, default)
+
+        p = patch.object(meeting.settings, "get", fake_get)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _use_backend(self, backend):
+        """把能力路由换成"只有这个后端"（**一个真后端都不连、一个真模型都不加载**）。"""
+        router = CapabilityRouter([backend], settings_get=lambda k, d=None: d)
+        p = patch("app.capabilities.build_default_router", lambda **kw: router)
+        p.start()
+        self.addCleanup(p.stop)
+        return router
 
     def _diarize_meta(self, name=None):
         return meeting.meeting_meta(name or self.name).get("diarize")
 
 
+class _TranscribeOnlyBackend(CapabilityClient):
+    """**只会转写、做不了分离**的后端 —— "配了后端却用不上分离"的那种机器。
+
+    与 `_FakeBackend` 的差别只有 `provides`：它明确**不**声明 `diarize.turns`，
+    于是计划里那一槽谁都干不了（`unsupported`），而转写照常出文字。
+    """
+
+    backend_id = BACKEND_ECHO_SERVER
+    source = SOURCE_LAN
+    provides = frozenset({"asr.text"})
+
+    def transcribe(self, wav, **kw):
+        return AsrResult(text="后端文本。", sentences=(), timestamps="none",
+                         provenance=Provenance(self.backend_id, "fake-v1"),
+                         audio_seconds=1.0)
+
+
 class HonestDegradationTests(_MeetingCase):
-    """分离真跑不了 → **会议仍出文字**，但必须如实说「未执行 + 真原因」。"""
+    """分离真跑不了 → **会议仍出文字**，但必须如实说「未执行 + 真原因」。
+
+    2026-09-29：文字的来源从"本机引擎替身"换成了**能力后端**（客户端进程内不再做
+    会议转写）。这一组要验的是分离链路，所以转写用一个只会转写的后端替身
+    —— 与"没配后端 = 一个字都转不出来"（见 `NoBackendAtAllTests`）是**两件不同的事**。
+    """
 
     def _run_without_any_separation(self):
-        self._stub_local_asr()
-        # 本机没有可用的分离（开发机上装着 pyannote，所以这里显式演"没装/没权重"）。
-        self._stub_local_diarize(raises=RuntimeError("没有可用的 pyannote 权重"))
-        # 也没配后端（凭据文件指向临时目录 → 不存在）。
+        self._configure_backend()
+        self._stub_local_diarize()          # 被调到就红（本机分离已经不该参与会议链路）
+        self._use_backend(_TranscribeOnlyBackend())
         meeting._transcribe_impl(self.folder)
 
     def test_the_meeting_still_produces_text(self):
         self._run_without_any_separation()
         lines = db.get_lines(self.mid)
-        self.assertEqual([ln["text"] for ln in lines], ["第一句。", "第二句。"],
+        self.assertEqual([ln["text"] for ln in lines], ["后端文本。"],
                          "分离不可用**不该**连累转写 —— 文字必须照常落库")
         self.assertEqual(db.get_meeting(self.mid)["status"], "transcribed")
 
@@ -372,9 +401,10 @@ class HonestDegradationTests(_MeetingCase):
                       "没做成的分离要有一个可断言的落点（截图/自动化都靠它）")
 
     def test_a_successful_separation_is_recorded_as_executed(self):
-        """反过来：本机分离能跑 → `executed=True`，并且**说话人真的落进转写行**。"""
-        self._stub_local_asr()
-        self._stub_local_diarize()
+        """反过来：后端分离能跑 → `executed=True`，并且**说话人真的落进转写行**。"""
+        self._configure_backend()
+        self._stub_local_diarize()          # 本机分离一次都不许被调到
+        self._use_backend(_FakeBackend())
         meeting._transcribe_impl(self.folder)
         dia = self._diarize_meta()
         self.assertTrue(dia["executed"], dia)
@@ -383,11 +413,72 @@ class HonestDegradationTests(_MeetingCase):
         self.assertTrue(labels and labels != {""}, "分离成功却没有说话人列：%s" % labels)
 
 
+class NoBackendAtAllTests(_MeetingCase):
+    """**没配能力后端**：这一场**一个字都转不出来**，而且说得清为什么（2026-09-29 新增）。
+
+    这条与上一条**并列存在**，两条都说得出理由：
+
+      * `HonestDegradationTests` —— 配了后端（能转写、不能分离）；
+      * `NoBackendAtAllTests`     —— **压根没配后端**（客户端进程内不做会议转写，
+        所以连文字都没有）。
+
+    为什么必须把"没配"单独钉一条：它是"删掉本机那条路"之后最容易出的错 ——
+    要么静默产出零行转写（用户以为录音坏了），要么回落本机（那是刚被删掉的语义）。
+    正确行为是三件事一起成立：`diarize.executed=false`、**没有任何说话人标签**、
+    面板那句 headline 以硬契约句开头。
+    """
+
+    def _run_without_any_backend(self):
+        self._stub_local_diarize()          # 被调到就红
+        rows = []
+        p = patch.multiple("app.meeting.db", add_log=lambda level, src, msg:
+                           rows.append((level, msg)))
+        p.start()
+        self.addCleanup(p.stop)
+        self.logs = rows
+        meeting._transcribe_impl(self.folder)
+
+    def test_no_backend_means_no_text_and_an_honest_error(self):
+        self._run_without_any_backend()
+        self.assertEqual(db.get_lines(self.mid), [],
+                         "没配后端却转出了文字 —— 客户端进程内已经没有会议转写这条路了")
+        row = db.get_meeting(self.mid)
+        self.assertEqual(row["status"], "error", row)
+        self.assertIn("没有转写引擎", row["error"] or "",
+                      "失败原因必须说清是「没有转写引擎」，而不是「录音失败」：%r" % row["error"])
+
+    def test_the_meeting_says_why_diarize_did_not_run(self):
+        self._run_without_any_backend()
+        dia = self._diarize_meta()
+        self.assertIsNotNone(dia, "meta.json 里必须有分离的结论（没做也要有）")
+        self.assertFalse(dia["executed"])
+        self.assertFalse(dia["waiting"], "没配后端 ≠ 在等后端")
+        self.assertIn(dia["reason"], SKIP_REASONS, dia)
+        self.assertTrue(dia["detail"], dia)
+
+    def test_the_panel_headline_starts_with_the_hard_contract(self):
+        from app import capability_admin
+        self._run_without_any_backend()
+        meta = meeting.meeting_meta(self.name)
+        run = capability_admin.execution_summary(meta.get("diarize"),
+                                                meta.get("transcribeEngine"),
+                                                meta.get("transcribeFallbackReason"))
+        self.assertIsNotNone(run)
+        self.assertEqual(run["transcribeEngine"], "",
+                         "这一场没有可用的转写引擎（不许报成 'local'）")
+        self.assertEqual(run["fallbackReason"], "not-configured")
+        self.assertEqual(run["state"], "diarize-not-executed")
+        self.assertTrue(run["headline"].startswith(capability_admin.DIARIZE_NOT_EXECUTED),
+                        run["headline"])
+        labels = {ln["speaker_label"] for ln in db.get_lines(self.mid)}
+        self.assertEqual(labels, set(), "没有任何说话人标签才对：%s" % labels)
+
+
 class VectorSpaceLockSurvivesFailureTests(_MeetingCase):
     """后端分离成功过一次 → 后面某一段失败时**不再回落本机**（L5：一场会不许混两套嵌入）。"""
 
     def test_the_local_engine_is_not_used_after_the_backend_locked_the_space(self):
-        self._stub_local_asr()
+        self._configure_backend()
         local = MagicMock(name="diarize_wav_full",
                           return_value=([(0.0, 1.0, "LOCAL")], [[0.9] * 256], ["LOCAL"]))
         p = patch("app.audio.diarize.diarize_wav_full", local)
@@ -408,9 +499,8 @@ class VectorSpaceLockSurvivesFailureTests(_MeetingCase):
             return real(wav, **kw)
 
         backend.diarize = scripted
-        router = CapabilityRouter([backend], settings_get=lambda k, d=None: d)
-        with patch("app.capabilities.build_default_router", lambda **kw: router):
-            meeting._transcribe_impl(self.folder)
+        self._use_backend(backend)
+        meeting._transcribe_impl(self.folder)
 
         self.assertEqual(local.call_count, 0,
                          "锁上向量空间后仍回落本机 —— 一场会混两套嵌入会认错人且不报错")
@@ -424,17 +514,29 @@ class VectorSpaceLockSurvivesFailureTests(_MeetingCase):
 class _DiarizeOnlyBackend(CapabilityClient):
     """**只给说话人时间轴、不给嵌入**的后端 —— 在线转写（方案 3）就是这个形状。
 
-    它同时不提供 `asr.text`：这样转写那一槽走本机替身，只有分离走它，
+    它同时提供 `asr.text`（2026-09-29 补：客户端进程内已经没有本机转写兜底了，
+    不给文字就等于整场转不出来），但**不提供 `speaker.embed`** ——
     正好把"有轮次没嵌入"那条路单独拎出来测。
     """
 
     backend_id = BACKEND_ECHO_SERVER
     source = SOURCE_LAN
-    provides = frozenset({"diarize.turns"})
+    provides = frozenset({"asr.text", "diarize.turns"})
     vector_space_id = "ws-online-v1"
 
     def __init__(self):
         self.calls = []
+
+    def transcribe(self, wav, **kw):
+        # 两句**各落在一个说话人的时间范围里**：`_assign_speakers` 按覆盖时长取最长
+        # 说话人，一句横跨整段只会被标成一个人（那是既有行为，与本条要验的
+        # "不崩、标签按后端编号"无关），两个说话人就都得落进转写行。
+        return AsrResult(text="在线转写文本。第二个人说了话。",
+                         sentences=((0.0, 0.4, "在线转写文本。"),
+                                    (0.4, 0.9, "第二个人说了话。")),
+                         timestamps="exact",
+                         provenance=Provenance(self.backend_id, "fake-online-v1"),
+                         audio_seconds=1.0)
 
     def diarize(self, wav, *, max_speakers=None, **kw):
         self.calls.append(os.path.basename(wav))
@@ -451,14 +553,16 @@ class TurnsWithoutEmbeddingsTests(_MeetingCase):
     `_normalize_diarize` 回空 `labels` → `registry.map(embs, labels)` 给出空映射 →
     紧接着 `key_map[spk]` **KeyError**（整场转写中断）。现在按后端自己的编号出显示名
     （`S0` → 说话人1），而"认人"自然不做（没有嵌入可比）。
+
+    2026-09-29：转写那一槽也由这个后端出（客户端进程内不再做会议转写），
+    而 `SpeakerRegistry` 只在**后端给了嵌入**时才建 —— 这条正是那个"不建注册表"的分支。
     """
 
     def test_labels_are_used_and_the_meeting_is_not_interrupted(self):
-        self._stub_local_asr()
+        self._configure_backend()
         backend = _DiarizeOnlyBackend()
-        router = CapabilityRouter([backend], settings_get=lambda k, d=None: d)
-        with patch("app.capabilities.build_default_router", lambda **kw: router):
-            meeting._transcribe_impl(self.folder)
+        self._use_backend(backend)
+        meeting._transcribe_impl(self.folder)
         self.assertEqual(backend.calls, ["01.wav"], "分离那一槽该走后端")
         rows = db.get_lines(self.mid)
         labels = [ln["speaker_label"] for ln in rows if ln["speaker_label"]]
@@ -613,14 +717,14 @@ class WaitingForBackendIsVisibleTests(_MeetingCase):
     **本步只表达状态**，不实现队列/重试（设计里"离线队列 / 分段 pending"那是另一件事，
     见 `docs/3.0-设计总览与组件关系.md:1086`）。
 
-    端到端跑 `_transcribe_impl`（与 `HonestDegradationTests` 同一套替身）：
-    本机转写打桩（一个真模型都不加载）、本机分离打桩成 fail（就算它可用也不许被调到），
+    端到端跑 `_transcribe_impl`：本机分离打桩成 fail（就算它可用也不许被调到），
     只把 `capabilityEchoServerUrl` 指到一个**没人监听的端口**。
+    **这一场转不出文字**（客户端进程内已经没有本机会议转写了，2026-09-29）——
+    文字那一档与 `NoBackendAtAllTests` 的区别只在"为什么"：这里是"在等后端"。
     """
 
     def _run_with_a_dead_backend(self):
-        self._stub_local_asr()
-        self._stub_local_diarize(raises=AssertionError("分离不该回落本机"))
+        self._stub_local_diarize()
         # 配了、但没人监听那个端口（用真地址，不是打桩——要验的正是"连不上"这条真路径）
         settings.update({"capabilityEchoServerUrl": "http://127.0.0.1:1"})
         settings._cache = None
@@ -631,20 +735,22 @@ class WaitingForBackendIsVisibleTests(_MeetingCase):
         meta = meeting.meeting_meta(self.name)
         self.assertEqual(meta.get("transcribeFallbackReason"), "waiting-backend",
                          "配了连不上的后端：这一场是在**等后端**，不是「没配」")
-        self.assertEqual(meta.get("transcribeEngine"), "local",
-                         "文字确实是本机引擎出的 —— 这一点也要如实记下来")
+        self.assertEqual(meta.get("transcribeEngine"), "",
+                         "这一场没有可用的转写引擎（不许报成 'local' —— 那条路已删）")
         self.assertTrue(meta["diarize"]["waiting"],
                         "分离这一槽同样要标出在等后端：%s" % meta["diarize"])
 
-    def test_the_meeting_still_produces_text_and_the_diarize_reason(self):
-        """文字照常出（本机那条路**本步暂时**还留着），分离如实说没做。"""
+    def test_the_meeting_says_it_could_not_transcribe_at_all(self):
+        """客户端进程内不再转写 → **一行文字都没有**，而且原因落库（不是"录音失败"）。"""
         self._run_with_a_dead_backend()
         lines = db.get_lines(self.mid)
-        self.assertEqual([ln["text"] for ln in lines], ["第一句。", "第二句。"])
-        self.assertEqual({ln["speaker_label"] for ln in lines}, {""},
-                         "分离没做成却出现了说话人标签：%s" % lines)
+        self.assertEqual(lines, [], "没有可用的转写引擎却转出了文字：%s" % lines)
+        row = db.get_meeting(self.mid)
+        self.assertEqual(row["status"], "error", row)
+        self.assertIn("没有转写引擎", row["error"] or "", row)
         dia = meeting.meeting_meta(self.name)["diarize"]
         self.assertFalse(dia["executed"])
+        self.assertTrue(dia["waiting"], "配了连不上的后端 = 在等后端：%s" % dia)
         self.assertIn(dia["reason"], SKIP_REASONS, dia)
 
     def test_the_panel_renders_it_from_the_servers_sentence(self):
@@ -667,7 +773,7 @@ class WaitingForBackendIsVisibleTests(_MeetingCase):
                                             meta.get("diarize"), run)
         self.assertIsNotNone(cap, "只有「在等后端」这一条信息时也不许返回 None")
         self.assertTrue(cap["run"]["waiting"])
-        self.assertEqual(cap["run"]["transcribeEngine"], "local")
+        self.assertEqual(cap["run"]["transcribeEngine"], "")
         # 前端：那一行由服务端给的 headline 渲染，且带一个可断言的落点
         with open(os.path.join(_ROOT, "web", "meeting.html"), encoding="utf-8") as fh:
             html = fh.read()

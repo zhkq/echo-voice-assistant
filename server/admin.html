@@ -379,8 +379,13 @@ function issueForm() {
       <label>有效期<select id="pcTtl">${ttls.map(([v, t]) =>
         `<option value="${v}">${t}</option>`).join("")}</select></label>
       <label>备注（谁发的）<input id="pcNote" placeholder="ops"></label>
+      <label>这一张公布的地址（留空 = 用下面那一项）<input id="pcHost"
+        placeholder="只给这一张用：127.0.0.1 或 10.100.0.24"></label>
       <button class="primary" id="btnIssue">生成配对码</button>
     </div>
+    <div class="muted" style="margin-top:6px">串里的 host <b>手改就能用</b>（就是一段文本，
+      没有签名/校验）—— 本机用 <code>127.0.0.1</code>、同事用局域网 IP，
+      同一台后端两边都服务时**发码时各写各的**（上面那个格子）。</div>
     <div class="errtxt" id="issueErr"></div></div>`;
 }
 
@@ -412,6 +417,9 @@ function clientActions(c) {
 async function viewClients() {
   const d = await api("/admin/api/clients");
   const codes = await api("/admin/api/pairing-codes");
+  // 「对外公布地址」读不到不该把这一页整个搞没（它是同一页的**另一个**接口）。
+  let adv = null;
+  try { adv = await api("/admin/api/advertised-host"); } catch (e) { adv = { error: e.message }; }
   const rows = d.clients.map((c) => [
     c.clientId, c.name || "—",
     c.disabled ? '<span class="badge off">已禁用</span>' : '<span class="badge on">正常</span>',
@@ -420,7 +428,7 @@ async function viewClients() {
     c.dailyAudioMinutes ? c.dailyAudioMinutes + " min/天" : "全局默认",
     raw(clientActions(c)),
   ]);
-  return onceCard() + issueForm() + pendingCodes(codes)
+  return onceCard() + issueForm() + advertisedCard(adv) + pendingCodes(codes)
     + `<div class="card"><h2>客户端（最近 24 小时：${d.totals.calls} 次调用，失败 ${d.totals.errors}）</h2>
     ${table(["客户端", "名字", "状态", "scopes", "版本", "最后活跃", "今日调用", "失败",
              "今日音频", "日配额", "操作"], rows)}
@@ -441,6 +449,8 @@ function bindClients() {
         const r = await wpost("/admin/api/pairing-codes", {
           name: $("#pcName").value, scopes: $("#pcScopes").value,
           ttlSeconds: Number($("#pcTtl").value), note: $("#pcNote").value,
+          // 「只给这一张用」的地址覆盖（空串 = 用「对外公布地址」那一项）。
+          advertisedHost: $("#pcHost") ? $("#pcHost").value : "",
         });
         const pc = r.pairingCode;
         ONCE = {
@@ -453,8 +463,84 @@ function bindClients() {
       } catch (e) { $("#issueErr").textContent = e.message; }
     };
   }
+  bindAdvertised();
   document.querySelectorAll("[data-act]").forEach((b) => { b.onclick = () => clientAction(b); });
   document.querySelectorAll("[data-code]").forEach((b) => { b.onclick = () => dropCode(b); });
+}
+
+/* ---------------------------------------------------------------- 对外公布地址（配对串里的 host）
+
+   需求（2026-09-30 用户实测）：容器里发出来的配对串带的是 **Docker 网桥地址**
+   （`echo://pair?host=http://172.18.0.2:8900&code=…`），同事连不上，每次都靠人手改串。
+   根治办法就是这一项 —— 放在「客户端 / 发授权」页签里，**紧挨着发码那张卡**：
+   填它的人要回答的问题正是"这张码给谁用"。
+
+   页面只负责"怎么问、怎么显示"：归一化规则、来源判定（管理面 / 环境变量 / 配置文件 /
+   自动探测）与三句话的形态说明全部由后端给（`server/advertised.py` 的 `view()`），
+   页面**一个字都不另抄**。 */
+
+let ADV_SAVED = "";             // 「已保存并生效」这句只在**下一次渲染**里出现一次
+
+function advertisedCard(d) {
+  if (!d || d.error) {
+    return `<div class="card"><h2>对外公布地址（配对串里的 host）</h2>
+      <div class="errtxt">读不到：${esc((d && d.error) || "未知错误")}</div></div>`;
+  }
+  const srcs = {
+    admin: '<span class="badge on">管理面配置</span>',
+    env: '<span class="badge idle">环境变量</span>',
+    config: '<span class="badge idle">配置文件</span>',
+    auto: '<span class="badge">本机探测</span>',
+  };
+  const envs = Object.entries(d.envValues || {})
+    .filter(([, v]) => v).map(([k, v]) => k + "=" + v).join("、") || "—";
+  const notes = (d.notes || []).map((n) => `<div class="muted">⚠️ ${esc(n)}</div>`).join("");
+  const saved = ADV_SAVED ? ` <span class="badge on">${esc(ADV_SAVED)}</span>` : "";
+  ADV_SAVED = "";
+  const changed = d.updatedAt
+    ? `<div class="muted">上次改：${esc(ts(d.updatedAt))}${d.updatedBy ? " · 由 " + esc(d.updatedBy) : ""}</div>`
+    : "";
+  return `<div class="card"><h2>对外公布地址（配对串里的 host）${saved}</h2>
+    ${table(["这一项", "此刻发码会用的地址", "来源", "环境变量"],
+            [["advertised_host", d.url || "（读不出来）", raw(srcs[d.source] || esc(d.source || "?")),
+              envs]])}
+    <div class="muted">${esc(d.formNote || "")}</div>
+    <div class="form">
+      <label>地址<input id="advValue" value="${esc(d.value || "")}"
+        placeholder="10.100.0.24 或 10.100.0.24:8900（IPv6 带方括号）"></label>
+      <button class="primary" id="btnAdvSave">保存并生效</button>
+      <button id="btnAdvLocal">填 127.0.0.1（本机用）</button>
+      <button id="btnAdvClear">清空（回到自动探测）</button>
+    </div>
+    <div class="errtxt" id="advErr"></div>
+    <div class="muted" style="margin-top:6px">保存后<b>立刻生效</b>（不用重启），
+      并写进 state 卷的库 —— 重启后还在。${esc(d.accepts || "")}</div>
+    ${notes}${changed}</div>`;
+}
+
+function bindAdvertised() {
+  const save = $("#btnAdvSave");
+  if (!save) return;
+  const err = () => $("#advErr");
+  const put = async (value) => {
+    if (err()) err().textContent = "";
+    try {
+      // 原样把输入框的字符串发过去，让后端给出**明确的中文原因**
+      await wpost("/admin/api/advertised-host", { value });
+      ADV_SAVED = "已保存并生效";
+      await render();
+    } catch (e) { if (err()) err().textContent = "保存失败：" + e.message; }
+  };
+  save.onclick = () => put($("#advValue").value);
+  const local = $("#btnAdvLocal");
+  if (local) local.onclick = () => put("127.0.0.1");
+  const clear = $("#btnAdvClear");
+  if (clear) {
+    clear.onclick = () => {
+      if (confirm("清空这一项？\n\n之后发码回到**自动探测** —— 容器里探测到的是 Docker "
+                  + "网桥地址，同事连不上。")) put("");
+    };
+  }
 }
 
 async function clientAction(btn) {

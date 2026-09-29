@@ -587,8 +587,22 @@ class ListenerLifecycleTests(unittest.TestCase):
         self.addCleanup(self._log.stop)
         runtime._hotkey = None
         runtime._wake = None
-        self.addCleanup(setattr, runtime, "_hotkey", None)
-        self.addCleanup(setattr, runtime, "_wake", None)
+        # **要么停线程、要么置空句柄**（2026-09-29 修的真泄漏）：原来只 `setattr(...None)`，
+        # 谁真起了监听器（`start_all()` 会真起 `HotkeyListener`）就等于把句柄丢了 ——
+        # 线程一直活着到整轮测试结束，还占着全局热键（后面的用例会看到
+        # "注册失败（可能被占用）"），而它读设置时会走 `Settings._load()`。
+        self.addCleanup(self._stop_listeners)
+
+    def _stop_listeners(self):
+        """把这两个位置上的监听器**真的停掉**（`start_all()` 起的是真线程）。"""
+        for attr in ("_hotkey", "_wake"):
+            listener = getattr(runtime, attr, None)
+            try:
+                if listener is not None and hasattr(listener, "shutdown"):
+                    listener.shutdown()
+            except Exception:                                     # noqa: BLE001
+                pass
+            setattr(runtime, attr, None)
 
     class _FakeListener:
         def __init__(self, *a, **kw):
@@ -630,8 +644,12 @@ class ListenerLifecycleTests(unittest.TestCase):
         self.assertIsNone(runtime._hotkey)
 
     def test_wake_is_gated_by_config(self):
+        # `start_all()` 会连**热键监听**一起起 —— 两个都得打桩，否则真起一个
+        # `HotkeyListener` 线程（win32 消息循环，句柄一丢就活到整轮测试结束）。
         with patch.object(runtime, "WakeListener", self._FakeListener), \
-                patch.object(runtime.services, "report_wake"):
+                patch.object(runtime, "HotkeyListener", self._FakeListener), \
+                patch.object(runtime.services, "report_wake"), \
+                patch.object(runtime.services, "report_hotkey"):
             with _patch_settings_get({"wakeEnabled": False}):
                 results = runtime.start_all()
             self.assertEqual(len(results), 1, "未启用唤醒时只启动热键")
@@ -644,6 +662,7 @@ class ListenerLifecycleTests(unittest.TestCase):
 
     def test_wake_disabled_reports_disabled_state(self):
         with patch.object(runtime, "WakeListener", self._FakeListener), \
+                patch.object(runtime, "HotkeyListener", self._FakeListener), \
                 patch.object(runtime.services, "report_wake") as report, \
                 patch.object(runtime.services, "report_hotkey"):
             with _patch_settings_get({"wakeEnabled": False}):

@@ -42,7 +42,16 @@ import soundfile as sf                                          # noqa: E402
 import app.db as db                                             # noqa: E402
 import app.meeting as meeting                                   # noqa: E402
 from app.audio import importer as imp                           # noqa: E402
+from app.capabilities import (                                   # noqa: E402
+    BACKEND_ECHO_SERVER,
+    SOURCE_LAN,
+    AsrResult,
+    CapabilityClient,
+    CapabilityRouter,
+    Provenance,
+)
 from app.capabilities import credentials as cred_mod            # noqa: E402
+from app.capabilities.assemble import TIMESTAMPS_EXACT          # noqa: E402
 from app.config import settings                                 # noqa: E402
 
 #: 端点用例里"一场会"的时间戳（固定住，目录名才可断言）
@@ -134,9 +143,10 @@ class _ImportCase(unittest.TestCase):
                          lambda level, src, msg: self.logs.append((level, src, msg)))
         p.start()
         self.addCleanup(p.stop)
-        # 启动页状态与提示音：用例**不许**出声，也不许去动 boot 组件
-        for target, kw in ((meeting, "_boot_meeting_stt"), (meeting, "_boot_note_meeting_key"),
-                           (meeting.tts_mod, "play_beep"), (meeting.tts_mod, "beep_ok")):
+        # 启动页状态与提示音：用例**不许**出声，也不许去动 boot 组件。
+        # （`_boot_meeting_stt` / `_boot_note_meeting_key` 2026-09-29 随会议本机引擎一起删了，
+        #  所以这里只剩提示音要哑掉。）
+        for target, kw in ((meeting.tts_mod, "play_beep"), (meeting.tts_mod, "beep_ok")):
             p = patch.object(target, kw, lambda *a, **k: None)
             p.start()
             self.addCleanup(p.stop)
@@ -287,8 +297,13 @@ class ThreeFormatsBecomeAMeetingTests(_ImportCase):
         self.assertEqual(how[0]["srcRate"], 44100)
         self.assertIn(how[0]["how"], (imp.RESAMPLE_SOXR_STREAM, imp.RESAMPLE_SOXR,
                                       imp.RESAMPLE_SCIPY, imp.RESAMPLE_LINEAR))
-        self.assertEqual(meta.get("config", {}).get("sttModel"),
-                         settings.get("meetingSttModel"))
+        # `config.sttModel` 现在是**空串**：`meetingSttModel` 已废弃（2026-09-29），
+        # 客户端进程内不再有"这场用哪个本机引擎"这件事 —— 转写走哪条路由能力路由决定。
+        # 这个键仍然写出来（老读者按固定形状取），值如实为空。
+        self.assertEqual(meta.get("config", {}).get("sttModel"), "")
+        self.assertNotIn("meetingSttModel",
+                         [r["key"] for r in settings.all(include_hidden=True)],
+                         "它已经不下发了（值留库）")
 
     def test_order_of_files_is_the_order_of_segments(self):
         """**顺序即分段**：文件顺序换了，段号跟着换（前端就靠这个表达用户选的顺序）。"""
@@ -555,8 +570,33 @@ class ChunkedConversionTests(_ImportCase):
 
 # ---------------------------------------------------------------- ⑤ 导入后能真转写
 
+class _AsrBackend(CapabilityClient):
+    """**只会转写**的能力后端替身（一个真模型都不加载）。
+
+    2026-09-29 起会议转写只有两条路（能力后端 / 显式配的在线转写），
+    而 `providerAsr` 是另一条链路的护栏（`tests/test_asr_provider.py`），
+    所以"转写代码在导入出来的这场上跑不跑得通"用这个替身来验。
+    """
+
+    backend_id = BACKEND_ECHO_SERVER
+    source = SOURCE_LAN
+    provides = frozenset({"asr.text"})
+
+    def __init__(self, text="导入的第一句", sentences=()):
+        self.calls = []
+        self._text = text
+        self._sentences = tuple(sentences)
+
+    def transcribe(self, wav, *, lang="auto", want_timestamps=False, **kw):
+        self.calls.append(os.path.basename(wav))
+        return AsrResult(text=self._text, sentences=self._sentences,
+                         timestamps=TIMESTAMPS_EXACT if self._sentences else "none",
+                         provenance=Provenance(self.backend_id, "fake-import-v1"),
+                         audio_seconds=1.0)
+
+
 class ImportThenTranscribeTests(_ImportCase):
-    """导入后**真的能转写**（打桩引擎）：行落库、状态到 `transcribed`、meta 更新。
+    """导入后**真的能转写**（打桩后端）：行落库、状态到 `transcribed`、meta 更新。
 
     这一组**保留** `_transcribe_meeting` 的替身：导入自己会起一个真转写线程，而这里
     要验的是"转写**代码**在导入出来的这场上能不能跑通"。两个一起跑会互相盖结果
@@ -564,26 +604,31 @@ class ImportThenTranscribeTests(_ImportCase):
     所以：导入那一刻隔离，转写**显式**调用。这也正是用户点「重新转写」时走的那条路。
     """
 
+    def _use_asr_backend(self, backend):
+        """把能力后端换成替身，并让这台机器"配过后端"（判据见 `echo_server.configured`）。"""
+        settings.update({"capabilityEchoServerUrl": "http://gpu-01:8900"})
+        settings._cache = None
+        router = CapabilityRouter([backend], settings_get=lambda k, d=None: d)
+        p = patch("app.capabilities.build_default_router", lambda **kw: router)
+        p.start()
+        self.addCleanup(p.stop)
+        return backend
+
     def test_imported_audio_really_gets_transcribed(self):
-        """导入的那段音频，用**真的**转写链路跑一遍（引擎打桩，不加载模型）。
+        """导入的那段音频，用**真的**转写链路跑一遍（后端打桩，不加载模型）。
 
         用 `_transcribe_impl` 而不是 `_transcribe_meeting`：后者会**起后台线程**，
         用例没法等它（Windows 上还会跟临时目录清理抢时间）。这里要验的是
         "导入出来的 01.wav 能不能被转写代码读出来并落成行"，直接同步跑最稳。
         """
-        from collections import namedtuple
-        _WSeg = namedtuple("_WSeg", "start end text")
         src = self.make("甲.wav", seconds=1.0, rate=16000, channels=1)
         ok, name = self.import_([src])
         self.assertTrue(ok, name)
 
-        loaders = self._stub_loaders()
-        loaders["_get_whisper"].return_value = object()
-        with patch.object(meeting.stt_mod, "transcribe_whisper",
-                          lambda wm, path, lang: ([_WSeg(0.0, 0.8, " 导入的第一句 ")],
-                                                  {"language": lang})):
-            meeting._transcribe_impl(self.meeting_dir(name))
+        backend = self._use_asr_backend(_AsrBackend(text="导入的第一句"))
+        meeting._transcribe_impl(self.meeting_dir(name))
 
+        self.assertEqual(backend.calls, ["01.wav"], "导入出来的那一场该被送进后端")
         row = db.get_meeting_by_name(name)
         self.assertEqual(row["status"], "transcribed")
         self.assertEqual((row["error"] or ""), "")
@@ -602,23 +647,21 @@ class ImportThenTranscribeTests(_ImportCase):
         """转写起不来 → `error` + **真原因**（不是"录音失败"这种被读歪的话）。
 
         用 `_transcribe_impl`（**只跑转写本身、不起线程**）来制造这个结局：
-        配置一个会议链路驱动不了的引擎，看它落库的原因里有没有点名那个引擎。
+        **一个后端都没配** —— 客户端进程内已经不做会议转写（2026-09-29），
+        所以这一场一个字都出不来，而落库的原因必须说得出是"没有转写引擎"
+        （给用户的下一条路是去配后端，不是去查麦克风）。
         这同时钉住"用户修好设置、点重新转写就能救回来"这条出路。
         """
         src = self.make("甲.wav", seconds=1.0, rate=16000, channels=1)
         ok, name = self.import_([src])
         self.assertTrue(ok, name)
-        self._stub_loaders()
-        settings.update({"meetingSttModel": "paraformer"})     # 会议链路驱动不了的引擎
-        self.addCleanup(settings.update, {"meetingSttModel": "sensevoice"})
-        with self.assertRaises(meeting.MeetingEngineRefused):
-            meeting._transcribe_impl(self.meeting_dir(name))
+        meeting._transcribe_impl(self.meeting_dir(name))
         row = db.get_meeting_by_name(name)
         self.assertEqual(row["status"], "error")
-        self.assertIn("paraformer", row["error"] or "")
+        self.assertIn("没有转写引擎", row["error"] or "")
         # 音频**还在**（"导入失败"与"转写失败"必须能分开）
         self.assertTrue(os.path.isfile(os.path.join(self.meeting_dir(name), "01.wav")))
-        # 而且这一场的 meta.json 里段清单还在 —— 用户修好设置后「重新转写」能救回来
+        # 而且这一场的 meta.json 里段清单还在 —— 用户配好后端后「重新转写」能救回来
         self.assertEqual(meeting.meeting_meta(name).get("segments"), ["01.wav"])
 
     def test_retranscribe_of_an_imported_meeting_still_works(self):

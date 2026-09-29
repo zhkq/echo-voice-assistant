@@ -22,7 +22,8 @@ _PHASE = "init"
 _COMPONENTS = {}   # cid -> dict
 _ORDER = []
 
-# 组件 id → (仪表盘服务组件名, 上报函数)。stt-meeting 不映射到仪表盘（仪表盘 stt=命令引擎）。
+# 组件 id → (仪表盘服务组件名, 上报函数)。**会议转写与说话人分离不再有本机组件**
+# （2026-09-29：客户端进程内不承担这两件事，它们只走能力后端），所以那份映射也随之删掉。
 _SERVICE_REPORTERS = {
     "server": services.report_server,
     "dsh": services.report_dsh,
@@ -31,7 +32,6 @@ _SERVICE_REPORTERS = {
     "wake": services.report_wake,
     "hotkey": services.report_hotkey,
     "meeting": services.report_meeting,
-    "diarize": services.report_diarize,
 }
 
 
@@ -196,10 +196,11 @@ def _spawn(cids):
 def _run_boot():
     set_phase("booting")
     # 阶段 1：轻量组件（秒级）并行 —— 模型路由先确保起来，DSH 随时可能被调用
-    _spawn(["failover", "dsh", "tts", "hotkey", "meeting", "diarize"])
+    _spawn(["failover", "dsh", "tts", "hotkey", "meeting"])
     # 阶段 1b：独立 harness（选了它才真拉起来；没选就是一行 disabled，不等它）
     _spawn(["harness"])
-    # 阶段 2：重组件（模型加载）并行 —— 命令转写常驻；会议转写按需不在此启动
+    # 阶段 2：重组件（模型加载）并行 —— **只剩命令转写**：会议转写与说话人分离
+    # 2026-09-29 起不再有本机引擎（它们只走能力后端，后端那侧自己管自己的模型）。
     _spawn(["stt-cmd", "wake"])
     # 等所有非按需组件 settle
     while True:
@@ -503,42 +504,11 @@ def _start_stt_cmd(report):
     report(status="online", detail=f"{eng} · {stt.device_label()}", substep="", progress=1.0)
 
 
-def _start_stt_meeting(report):
-    from app.config import settings
-    stt, eng, model = _stt_engine_and_model("meetingSttModel")
-    key = stt.engine_key(eng, model)
-    old = _BOOT_STT_KEYS.get("stt-meeting")
-    if old and old != key:
-        stt.unload_key(old)
-    if stt.key_loaded(key):
-        _BOOT_STT_KEYS["stt-meeting"] = key
-        report(status="online", detail=f"{eng} · {stt.device_label()}", progress=1.0)
-        return
-    report(detail=f"加载 {model if eng == 'whisper' else eng} …", substep="模型加载", progress=0.1)
-    key = stt.load_engine(eng, model, settings.get("device", "auto"))
-    _BOOT_STT_KEYS["stt-meeting"] = key
-    report(status="online", detail=f"{eng} · {stt.device_label()}", substep="", progress=1.0)
-
-
 def _stop_stt_cmd():
     from app.audio import stt
     key = _BOOT_STT_KEYS.pop("stt-cmd", None)
     if key:
         stt.unload_key(key)
-
-
-def _stop_stt_meeting():
-    from app.audio import stt
-    key = _BOOT_STT_KEYS.pop("stt-meeting", None)
-    cmd_key = _BOOT_STT_KEYS.get("stt-cmd")
-    # 会议引擎与命令引擎同模型时共享实例，停止会议引擎不卸载共享模型
-    if key and key != cmd_key:
-        stt.unload_key(key)
-
-
-def note_stt_loaded(cid, key):
-    """外部（会议转写）加载了 STT 引擎后同步 boot 记录的 key。"""
-    _BOOT_STT_KEYS[cid] = key
 
 
 def _start_tts(report):
@@ -599,30 +569,21 @@ def _start_meeting(report):
     report(status="online", detail="录音中" if st["active"] else "就绪", progress=1.0)
 
 
-def _start_diarize(report):
-    """说话人分离：复用 modelinfo 的校验（模型文件齐全才算就绪，空目录不算）。"""
-    try:
-        from app import modelinfo
-        ok = modelinfo.ready_pyannote()
-    except Exception as e:
-        # 校验本身出错（依赖/路径异常）不能静默当成"模型缺失"，否则用户只看到"缺失"没法排查
-        _log("diarize", "warn", f"说话人分离就绪校验失败: {e}")
-        ok = False
-    if ok:
-        detail = "pyannote 就绪"
-        try:      # 顺带报一下常用联系人声纹库（有样本时才显示）
-            from app import voiceprint
-            st = voiceprint.library_stats()
-            if st["samples"]:
-                detail += f" · 声纹库 {st['contacts']} 人/{st['samples']} 条"
-        except Exception:
-            pass
-        report(status="online", detail=detail, progress=1.0)
-    else:
-        report(status="disabled", detail="模型缺失（设置 → 模型 → 说话人分离）", progress=0.0)
+def _start_meeting(report):
+    from app import meeting
+    meeting.recover_orphaned_meetings()
+    st = meeting.meeting_status()
+    report(status="online", detail="录音中" if st["active"] else "就绪", progress=1.0)
 
 
-# 已加载 STT 引擎 key（stt-cmd / stt-meeting），供卸载与状态判断
+# 说明（**不是**一个空函数）：说话人分离曾是一个本机组件（`_start_diarize` 查
+# `modelinfo.ready_pyannote()`），2026-09-29 起客户端进程内不再承担会议分离 ——
+# 它只走能力后端。所以这里**没有** `diarize` 组件，`_SERVICE_REPORTERS` 里也没有它。
+# 谁要是看见 `diarize` 又出现在启动页，正确的动作是去查那条能力路由，
+# 而不是把本机 pyannote 接回来（那会在一场会里混两套不可比的嵌入 —— 认错人且不报错）。
+
+
+# 已加载 STT 引擎 key（只有 `stt-cmd`：命令转写引擎），供卸载与状态判断
 _BOOT_STT_KEYS = {}
 
 
@@ -637,10 +598,7 @@ def setup():
     register("harness", "标准版 harness", "🧩", start_fn=_start_harness,
              stop_fn=_stop_harness, can_start=True, can_stop=True)
     register("stt-cmd", "命令转写引擎（常驻）", "🎤", start_fn=_start_stt_cmd,
-             stop_fn=_stop_stt_cmd, can_start=True, can_stop=True)
-    register("stt-meeting", "会议转写引擎（按需）", "📝", start_fn=_start_stt_meeting,
-             stop_fn=_stop_stt_meeting, can_start=True, can_stop=True,
-             kind="model", status="idle", )
+             stop_fn=_stop_stt_cmd, can_start=True, can_stop=True, kind="stt")
     register("tts", "语音合成", "🔊", start_fn=_start_tts, can_start=True,
              can_stop=False)
     register("wake", "语音唤醒", "🗣️", start_fn=_start_wake, stop_fn=_stop_wake,
@@ -648,4 +606,3 @@ def setup():
     register("hotkey", "热键/媒体键", "⌨️", start_fn=_start_hotkey,
              stop_fn=_stop_hotkey, can_start=True, can_stop=True)
     register("meeting", "会议录音", "📼", start_fn=_start_meeting, can_start=False)
-    register("diarize", "说话人分离", "👥", start_fn=_start_diarize, can_start=False)

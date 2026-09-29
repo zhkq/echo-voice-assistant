@@ -38,7 +38,7 @@ import tempfile
 import time
 import unittest
 import wave
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -48,8 +48,78 @@ import soundfile as sf                                          # noqa: E402
 import app.db as db                                             # noqa: E402
 import app.meeting as meeting                                   # noqa: E402
 from app.audio import audiofile as af                           # noqa: E402
+from app.capabilities import (                                   # noqa: E402
+    BACKEND_ECHO_SERVER,
+    SOURCE_LAN,
+    AsrResult,
+    CapabilityClient,
+    CapabilityRouter,
+    DiarizeResult,
+    Provenance,
+)
 from app.capabilities import credentials as cred_mod            # noqa: E402
 from app.config import settings                                 # noqa: E402
+
+
+class _RiffSpyBackend(CapabilityClient):
+    """能力后端替身：**在它拿到路径的那一刻**读文件头，并回答一句话。
+
+    为什么需要它（2026-09-29）：这一组用例原本靠打桩 `meeting._sherpa_rows` 来观察
+    "喂给引擎的是哪条路径"，而那条本机分派已经删掉了 —— 会议转写现在只有能力后端
+    这一条路，所以"用时解码"要在这里量：**后端收到的必须是解出来的临时 WAV**。
+
+    它同时回答分离（`diarize.turns`）：这样"分离那一路拿到的是不是同一条 WAV"
+    也能在同一个替身上量出来（原来靠打桩 `app.audio.diarize.diarize_wav_full`）。
+    """
+
+    backend_id = BACKEND_ECHO_SERVER
+    source = SOURCE_LAN
+    provides = frozenset({"asr.text", "diarize.turns"})
+    vector_space_id = "ws-flac-spy"
+
+    def __init__(self, sentences=None, turns=None):
+        self.asr_paths = []            # 转写那一刻收到的路径
+        self.asr_heads = []            # 与上一条一一对应的文件头前 4 字节
+        self.diarize_paths = []
+        self.diarize_heads = []
+        self._sentences = list(sentences or [])
+        self._turns = list(turns or [(0.0, 1.0, "SPEAKER_00")])
+
+    def _snap(self, path):
+        """读前 4 字节 —— 必须在调用那一刻读（临时 WAV 出了 `decoded_segments` 就没了）。"""
+        try:
+            with open(path, "rb") as fh:
+                return fh.read(4)
+        except OSError:
+            return b""
+
+    def transcribe(self, wav, *, lang="auto", want_timestamps=False, **kw):
+        self.asr_paths.append(wav)
+        self.asr_heads.append(self._snap(wav))
+        return AsrResult(text="一句话",
+                         sentences=tuple(self._sentences), timestamps="exact",
+                         provenance=Provenance(self.backend_id, "spy-v1"),
+                         audio_seconds=1.0)
+
+    def diarize(self, wav, *, max_speakers=None, **kw):
+        self.diarize_paths.append(wav)
+        self.diarize_heads.append(self._snap(wav))
+        return DiarizeResult(turns=tuple(self._turns),
+                             speakers={"SPEAKER_00": tuple([0.1] * 256)},
+                             dim=256, vector_space_id=self.vector_space_id,
+                             provenance=Provenance(self.backend_id, "spy-dia-v1"),
+                             audio_seconds=1.0)
+
+
+def _use_backend(case, backend):
+    """把这台机器配上后端 + 把能力路由换成"只有这个后端"（不连真后端、不加载模型）。"""
+    settings.update({"capabilityEchoServerUrl": "http://gpu-01:8900"})
+    settings._cache = None
+    router = CapabilityRouter([backend], settings_get=lambda k, d=None: d)
+    p = patch("app.capabilities.build_default_router", lambda **kw: router)
+    p.start()
+    case.addCleanup(p.stop)
+    return backend
 
 
 def tone(seconds=1.0, rate=16000, freq=440.0, amp=0.3):
@@ -126,18 +196,19 @@ class _CompressCase(unittest.TestCase):
                          lambda level, src, msg: self.logs.append((level, src, msg)))
         p.start()
         self.addCleanup(p.stop)
-        for target, kw in ((meeting, "_boot_meeting_stt"), (meeting, "_boot_note_meeting_key"),
-                           (meeting.tts_mod, "play_beep"), (meeting.tts_mod, "beep_ok")):
+        # 启动页那两个入口（`_boot_meeting_stt` / `_boot_note_meeting_key`）**已经不存在了**
+        # （2026-09-29：会议不再有本机引擎组件），所以这里只剩提示音要哑掉。
+        for target, kw in ((meeting.tts_mod, "play_beep"), (meeting.tts_mod, "beep_ok")):
             p = patch.object(target, kw, lambda *a, **k: None)
             p.start()
             self.addCleanup(p.stop)
         settings.update({"meetingAutoSummarize": False,
                          "meetingKeepRawAudio": False})
-        # 2026-09-26：分离是会议的必备环节（不再是开关）——这一组用例与分离无关，
-        # 不打桩会去加载本机 pyannote 权重（开发机上装着 → 白等几十秒）。
+        # 2026-09-29：会议分离只走能力后端，本机那份**一次都不该被调到** ——
+        # 这里显式打桩成"调用即红"，而不是给它一个能跑通的假实现
+        # （后者会让"悄悄回落本机"在用例里看起来一切正常）。
         p = patch("app.audio.diarize.diarize_wav_full",
-                  lambda path, max_speakers=None: ([(0.0, 1.0, "SPEAKER_00")],
-                                                   [[0.1] * 256], ["SPEAKER_00"]))
+                  MagicMock(side_effect=AssertionError("会议分离不该走本机引擎")))
         p.start()
         self.addCleanup(p.stop)
         self.name = os.path.basename(self.folder)
@@ -294,34 +365,19 @@ class FlacRoundTripTests(_CompressCase):
 # ==================================================================== ② 引擎可用
 
 class DecodedAudioIsEngineReadyTests(_CompressCase):
-    """② 解压后引擎可用：喂给引擎的**必须是 WAV/RIFF**，不是 flac 本体。"""
+    """② 解压后引擎可用：喂给引擎的**必须是 WAV/RIFF**，不是 flac 本体。
+
+    2026-09-29：观察点从"本机 sherpa 引擎收到的路径"换成了**能力后端收到的路径**
+    （会议转写这一槽已经只有后端这一条路）。断言一个字没变软：
+    后端拿到的头 4 字节必须是 `RIFF`、后缀必须是 `.wav`、用完必须已被删掉。
+    """
 
     def setUp(self):
         super().setUp()
         # 引擎与"喂进去的路径"全打桩：一个真模型都不加载
-        self.seen = []
-        self.seen_is_riff = []
         self.transcript = [(0.0, 1.0, "第一句"), (1.0, 2.0, "第二句")]
-
-        def fake_rows(seg_path, seg_idx, seg_min, cfg, cap_kinds):
-            self.seen.append(seg_path)
-            # **在引擎那一刻**验它拿到的确实是 RIFF/WAV（临时文件在 `with` 里还活着；
-            # 退出 `decoded_segments` 才会被删 —— 出了那段再读就是"文件不存在"）。
-            try:
-                with open(seg_path, "rb") as fh:
-                    self.seen_is_riff.append(fh.read(4) == b"RIFF")
-            except OSError:
-                self.seen_is_riff.append(False)
-            return [(seg_idx, s, e, t) for s, e, t in self.transcript], ""
-
-        p = patch.object(meeting, "_sherpa_rows", fake_rows)
-        p.start()
-        self.addCleanup(p.stop)
-        p = patch.object(meeting.stt_mod, "_get_sherpa", lambda *a, **k: object())
-        p.start()
-        self.addCleanup(p.stop)
-        settings.update({"meetingSttModel": "sherpa",
-                         "meetingAutoCompressAudio": False})
+        self.backend = _RiffSpyBackend()
+        settings.update({"meetingAutoCompressAudio": False})
 
     def test_flac_segment_is_decoded_to_riff_wav_before_reaching_the_engine(self):
         self.make_meeting(segments=2, seconds=1.0)
@@ -330,18 +386,20 @@ class DecodedAudioIsEngineReadyTests(_CompressCase):
         self.fail(self.name)                       # 先压成 flac（原件删掉）
         self.assertFalse(os.path.exists(self.seg_path(1)), "前置：wav 应已被压掉")
 
+        _use_backend(self, self.backend)
         meeting._transcribe_impl(self.folder)
 
-        self.assertEqual(len(self.seen), 2, "两段都该被喂进引擎")
-        self.assertEqual(self.seen_is_riff, [True, True],
-                         "喂给引擎的必须是真 RIFF/WAV（sherpa 只认它）：%s" % self.seen)
-        for path in self.seen:
+        seen = self.backend.asr_paths
+        self.assertEqual(len(seen), 2, "两段都该被喂进引擎")
+        self.assertEqual(self.backend.asr_heads, [b"RIFF", b"RIFF"],
+                         "喂给引擎的必须是真 RIFF/WAV（sherpa 只认它）：%s" % seen)
+        for path in seen:
             self.assertTrue(path.lower().endswith(".wav"),
                             "喂给引擎的必须是 .wav：%s" % path)
             self.assertFalse(os.path.exists(path), "临时文件用完必须删除")
         # 转写结果正常落库（证明"用时解码"没有把内容弄丢）
         lines = db.get_lines(mid)
-        self.assertEqual([ln["text"] for ln in lines], ["第一句", "第二句"])
+        self.assertEqual([ln["text"] for ln in lines], ["一句话", "一句话"])
         # 时间轴不受影响：段时长按 flac 也能算出来（详情页/导出都要它）
         seg_dur = meeting._seg_duration_map(self.folder)
         self.assertEqual(sorted(seg_dur), [1, 2])
@@ -352,8 +410,9 @@ class DecodedAudioIsEngineReadyTests(_CompressCase):
         self.make_meeting(segments=1, seconds=1.0)
         mid = db.create_meeting(self.name, started_at="2026-09-20T10:00:00")
         self.addCleanup(db.delete_meeting, mid)
+        _use_backend(self, self.backend)
         meeting._transcribe_impl(self.folder)
-        self.assertEqual(self.seen, [self.seg_path(1)])
+        self.assertEqual(self.backend.asr_paths, [self.seg_path(1)])
 
     def test_corrupt_flac_raises_at_decode_time_and_keeps_the_archive(self):
         """③ 损坏/截断的 FLAC：解码**报错**，且绝不删归档文件本身。"""
@@ -371,8 +430,10 @@ class DecodedAudioIsEngineReadyTests(_CompressCase):
         # 转写这条路必须**当场失败并留痕**，而不是静悄悄出 0 行
         mid = db.create_meeting(self.name, started_at="2026-09-20T10:00:00")
         self.addCleanup(db.delete_meeting, mid)
+        _use_backend(self, self.backend)
         with self.assertRaises(af.CompressionError):
             meeting._transcribe_impl(self.folder)
+        self.assertEqual(self.backend.asr_paths, [], "解码就失败了，不该走到后端")
 
 
 # ==================================================================== ④ keepRaw
@@ -893,26 +954,17 @@ class TempDecodeHygieneTests(_CompressCase):
 class DiarizeOnFlacSegmentTests(_CompressCase):
     """② 的**第三条**调用点：说话人分离那一路也必须拿到解出来的 WAV。
 
-    为什么单独立一条（2026-09-26 复查补的）：转写那条路（`_sherpa_rows` 收到的是不是
+    为什么单独立一条（2026-09-26 复查补的）：转写那条路（后端收到的路径是不是
     RIFF）与播放那条路（接口回的是不是 WAV）本来就有用例，**唯独分离没有** ——
     而分离恰恰是三条里最容易漏的一条：它在 `_transcribe_impl` 的循环里拿的是同一个
     `seg_path`，看着"顺手就对了"；可一旦有人把 `seg_path` 换回原路径，它未必报错
-    （pyannote 那条路对容器的宽容度与 sherpa 不同），表现会是"转写正常、分离悄悄
-    与转写分家"。所以这里断言的**不是"分离成功了"**，而是"喂给分离的就是那条解出来
-    的临时 WAV，而且用完就没了"。
-    """
+    （那条路对容器的宽容度与 sherpa 不同），表现会是"转写正常、分离悄悄分家"。
+    所以这里断言的**不是"分离成功了"**，而是"喂给分离的就是那条解出来的临时 WAV，
+    而且用完就没了"。
 
-    def setUp(self):
-        super().setUp()
-        # ASR 打桩：本用例只关心分离拿到什么，不加载真模型。
-        p = patch.object(meeting, "_sherpa_rows",
-                         lambda path, idx, m, cfg, kinds: ([(idx, 0.0, 1.0, "一句话")], ""))
-        p.start()
-        self.addCleanup(p.stop)
-        p = patch.object(meeting.stt_mod, "_get_sherpa", lambda *a, **k: object())
-        p.start()
-        self.addCleanup(p.stop)
-        settings.update({"meetingSttModel": "sherpa"})
+    2026-09-29：分离也走能力后端了，所以观察点同样在后端替身上
+    （`_RiffSpyBackend.diarize`）—— 它读的就是**调用那一刻**的文件头。
+    """
 
     def test_diarize_receives_the_decoded_riff_wav_not_the_flac(self):
         self.make_meeting(segments=2, seconds=1.0)
@@ -921,23 +973,15 @@ class DiarizeOnFlacSegmentTests(_CompressCase):
         self.fail(self.name)                       # 先压成 flac（原件删掉）
         self.assertFalse(os.path.exists(self.seg_path(1)), "前置：wav 应已被压掉")
 
-        seen = []
-
-        def spy(path, max_speakers=None):
-            # 在**分离那一刻**读头：临时文件还在；出了 `decoded_segments` 就没了。
-            with open(path, "rb") as fh:
-                seen.append((path, fh.read(4)))
-            return [(0.0, 1.0, "SPEAKER_00")], [[0.1] * 256], ["SPEAKER_00"]
-
-        p = patch("app.audio.diarize.diarize_wav_full", spy)
-        p.start()
-        self.addCleanup(p.stop)
-
+        backend = _RiffSpyBackend()
+        _use_backend(self, backend)
         meeting._transcribe_impl(self.folder)
 
+        seen = backend.diarize_paths
         self.assertEqual(len(seen), 2, "两段都该被送进分离")
-        for path, head in seen:
-            self.assertEqual(head, b"RIFF", "分离拿到的必须是 RIFF/WAV，不是 flac：%s" % path)
+        self.assertEqual(backend.diarize_heads, [b"RIFF", b"RIFF"],
+                         "分离拿到的必须是 RIFF/WAV，不是 flac：%s" % seen)
+        for path in seen:
             self.assertTrue(path.lower().endswith(".wav"), path)
             self.assertFalse(os.path.exists(path), "分离用完，临时 WAV 必须已经删掉")
 

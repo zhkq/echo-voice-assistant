@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import sys
 import time
 from contextlib import asynccontextmanager
 
@@ -21,6 +22,7 @@ from fastapi.responses import JSONResponse
 
 from server import __version__, engines
 from server import admin as admin_mod
+from server import advertised as advertised_mod
 from server import auth as auth_mod
 from server import calls as calls_mod
 from server import errors as E
@@ -62,6 +64,14 @@ def build_pool(cfg) -> EnginePool:
 
 def create_app(cfg=None) -> FastAPI:
     cfg = cfg or settings_mod.load()
+    # 「对外公布地址」**配错了就在这里炸**（2026-09-30）。
+    # 为什么不等到发码那一刻：这是个手改的字面量，而"配了却无效"的症状是
+    # **同事照串连不上** —— 那时没人会想到是服务端配置里一个认不出来的地址。
+    # 服务端对"配置不对"的一贯立场是**启动就报错**（同 `_tls_kwargs` 的"只配一半"）。
+    try:
+        ops_mod.normalize_advertised_host(cfg.get("server.advertised_host", ""))
+    except ValueError as exc:
+        raise SystemExit("server.advertised_host 配错了：%s" % exc)
     # 把 app.paths 的取值源换成服务端配置 —— 这样复用客户端引擎层时，
     # 它找模型走的是**我们的**模型目录（见 settings.install_paths_seam 的说明）。
     settings_mod.install_paths_seam(cfg)
@@ -102,6 +112,29 @@ def create_app(cfg=None) -> FastAPI:
                                for k, v in sorted(over.items())))
         for note in limits_mod.priority_notes(cfg, store):
             log.info("%s", note)
+        # **对外公布地址**（2026-09-30）：管理面配过的那份压过环境变量 / 配置文件。
+        # 与运行参数同一个形状（存在 state 卷、重启还在），而且必须在**发第一张码之前**
+        # 应用 —— 本机自配对文件就在下面几行发。非法的值在 `create_app` 里已经炸过。
+        try:
+            adv = advertised_mod.apply_stored(cfg, store)
+        except Exception as e:                                 # pragma: no cover - 兜底
+            adv = {}
+            log.warning("管理面配置的对外公布地址读不出来（按环境变量 / 配置文件 / 探测跑）：%s", e)
+        if adv:
+            log.info("配对串里的地址以**管理面配置**为准：%s（存在 state 卷，改它去管理面"
+                     "「客户端 / 发授权」页签的「对外公布地址」）", adv.get("advertised_host"))
+        for note in advertised_mod.priority_notes(cfg, store):
+            log.info("%s", note)
+        # **不配会怎样**：说清楚"现在发出去的地址是本机探测到的"。
+        # 容器里探测到的就是 Docker 网桥地址（实测 172.18.0.2），同事必然连不上 ——
+        # 所以这句话必须**在日志里就能看见**，不能只藏在配对串的提示里。
+        _adv_now = advertised_mod.effective(cfg)
+        if not _adv_now and not bool(cfg.get("server.local_pair", False)):
+            log.warning("没有配 `server.advertised_host`（环境变量 ECHO_ADVERTISED_HOST）—— "
+                        "配对串里的地址只能**本机探测**：容器里探测到的是 Docker 网桥地址"
+                        "（如 172.18.0.x），同事连不上。对外服务请填**同事能访问到的那个 "
+                        "IP**（如 ECHO_ADVERTISED_HOST=10.100.0.24）；"
+                        "后端只服务本机时不需要它（走本机自配对文件，地址是 127.0.0.1）。")
         auth_obj = auth_mod.Auth(cfg, store)
         # 跨进程撤销的发现机制（设计 §7.5 ④）。**命令行 `--revoke` 是另一个进程**，
         # 没有它的话，跑着的服务会继续接受已撤销的 JWT 直到缓存自己过期。
@@ -346,7 +379,49 @@ def _show_client(store, client_id: str) -> int:
     return 0
 
 
-def _admin_cli(cfg, args) -> int:
+def read_password_from_stdin() -> str:
+    """从 **stdin** 读一行口令。返回去掉行尾的原文（**空串 = 那一行是空的 / 没有输入**）。
+
+    ## 为什么口令只走 stdin
+
+    命令行参数会同时落在两个别人看得见的地方：**shell 历史**（`~/.bash_history`、
+    审计日志、`set -x` 的 trace）与 **进程参数**（同机器上任何用户 `ps aux` 就看得到）。
+    所以这里**刻意没有** `--password xxx` 这种写法 —— 它方便一次，泄漏一辈子。
+
+    ## 无 tty 时的行为（**不卡住**）
+
+    * stdin 接着管道（`printf '%s\\n' "$PW" | …`、`docker exec -i`、`ssh -t`）：
+      一次 `readline()` 就拿到那一行，读到 `\\n` 即返回；
+    * stdin 是 `/dev/null`、已关闭、或根本没有终端：`readline()` **立刻**返回空串
+      —— 于是调用方按"口令不合规：新口令不能为空"**非零退出**，
+      **不会**挂在那里等一个永远不会来的回车。
+
+    唯一会等的情况是"人在终端前但还没敲回车"（tty 上 `readline()` 本来就会等）——
+    那正是我们想要的。提示语由调用方写 **stderr**（`stdout` 只放"这条命令说了什么"，
+    这样 `$(…)` / `| tee` 抓输出时不掺进提示）。
+    （`readline()` 读到 EOF 会抛 `EOFError`，那只在 Python 3.13+ 才这么做；这里连它
+    一起兜住 —— 拿到的仍然是空串，落到同一条"口令不能为空"的拒绝路径上。）
+
+    ⚠️ **不做"隐藏输入"那套**：`getpass` 在无 tty 时会回落成"把输入回显出来"
+    （实测 Python 会打一句 `GetPassWarning` 到 stderr），而管道进来的口令本来也不该
+    被回显。想要"看不见地输入"就用 `ssh -t` + `read -s`（见 `docs/后端容器部署.md`），
+    那是**外壳**该管的事，不是这条命令该假装有的能力。
+    """
+    try:
+        line = sys.stdin.readline()
+    except Exception:                                          # pragma: no cover - 兜底
+        return ""
+    return str(line or "").rstrip("\r\n")
+
+
+#: 「`--set-password` 到底有没有读到过 stdin」的哨兵。用 `None` 是因为
+#: 空串是一个**有意义的输入**（空口令该被口令策略挡下，而不是"跳过去"）。
+#: `--set-password` **不给默认值**是有意的：参数里不存口令，
+#: 口令只在 `main()` 里从 stdin 读一次、直接作为实参传给 `_admin_cli`。
+_PASSWORD_NOT_READ = None
+
+
+def _admin_cli(cfg, args, password: str = _PASSWORD_NOT_READ) -> int:
     """管理动作的命令行入口。
 
     **为什么是命令行而不是网页**：管理面（设计 §8.4）还没做，而
@@ -365,6 +440,14 @@ def _admin_cli(cfg, args) -> int:
     try:
         a = auth_mod.Auth(cfg, store)
         scopes = _normalize_scopes(args.scopes)
+        # 命令行是**另一个进程**，读的是同一个 state 卷 —— 所以管理面配过的
+        # 「对外公布地址」必须在这里也生效，否则会出现最难查的那种不一致：
+        # **网页上发出来的串和管理面配的地址一致，命令行发出来的却还是探测结果**。
+        # （运行参数不用在这里应用：命令行不判并发。）
+        try:
+            advertised_mod.apply_stored(cfg, store)
+        except Exception:                                      # pragma: no cover - 兜底
+            pass
 
         # ---- 先统一处理"要指定一个客户端"的动作 ----
         # 不做这一步的话，不存在的 id 会一路走到 `Auth.set_disabled` 里抛
@@ -499,6 +582,38 @@ def _admin_cli(cfg, args) -> int:
                   "（设计 §7.2 写明的取舍）。")
             return 0
 
+        if args.set_advertised_host or args.clear_advertised_host:
+            # 「对外公布地址」（2026-09-30）—— 与管理面那条路**同一份实现**
+            # （`server/advertised.py`：归一化、校验、落库）。
+            # 它落在 state 卷的库里，所以命令行改完**服务端进程下一次发码就现读**到
+            # （与运行参数同口径：管理面配置 > 环境变量 > 自动探测）。
+            try:
+                value = advertised_mod.set_advertised(
+                    cfg, store, {"value": args.set_advertised_host},
+                    updated_by=args.created_by or "cli")
+            except E.EchoError as exc:
+                print("改不了：%s" % (exc.detail or exc.message))
+                return 2
+            if value:
+                print("已把对外公布地址设成：%s" % value)
+                print("发码时配对串里的 host 就用它（端口没写的话用 listen 的端口）。")
+            else:
+                print("已清空对外公布地址 —— 回到**自动探测**（容器里探测到的是 Docker "
+                      "网桥地址，同事连不上；对外服务请填同事能访问到的 IP）。")
+            print("⚠️ 这一项是「每次发码时想公布的地址」，不是一次性全局常量："
+                  "本机后端该用 127.0.0.1，同事要连就该用局域网 IP —— "
+                  "两条路同时存在时发码各写各的。")
+            return 0
+        if args.show_advertised_host:
+            view = advertised_mod.view(cfg, store)
+            print("对外公布地址：%s" % (view["value"] or "（没配 —— 发码时本机探测）"))
+            print("来源          %s" % view["source"])
+            print("此刻发码会用  %s" % (view["url"] or "（读不出来）"))
+            if view["note"]:
+                print("              %s" % view["note"])
+            print("说明          %s" % view["formNote"])
+            return 0
+
         # ---- 管理面账号（设计 §8.4）----
         # 管理面能做的**只有一件事：改"自己"的口令**（`POST /admin/api/password`），而且
         # **必须先给出当前口令** —— 会话被劫持的人卡在这一步（口令一改，别的会话同时失效）。
@@ -513,7 +628,68 @@ def _admin_cli(cfg, args) -> int:
             store.audit("cli", "new-admin", args.new_admin)
             print("已建（或重置）管理员 %s。**口令只出现这一次**：" % args.new_admin)
             print("     %s" % pwd)
+            # 这一句是"普通运维自己记得住的口令"那条路的路标：不给它，
+            # 人只会看到一串随机串，然后回去手搓 python 脚本（2026-10-02 用户绕了两回）。
+            print("想自己指定一个记得住的口令：`python -m server.main --set-password %s`"
+                  "（**从 stdin 读**，不进命令行历史与进程参数）" % args.new_admin)
             print("管理面板：http://%s/admin/ （要先在配置里设 server.admin_listen）"
+                  % (cfg.get("server.admin_listen", "") or "127.0.0.1:8901"))
+            return 0
+
+        # ---- 指定口令（从 stdin 读；**绝不从命令行参数取**）----
+        #
+        # 为什么要有它：装完后端时 `--new-admin` 只给一串**随机**口令、只打印一次 ——
+        # 想用"自己记得住的"就只能回去手搓一段 python（`settings.load` → `auth.open_store`
+        # → `admin.hash_password` → `store.upsert_admin`）。那对普通运维是太高的一道坎，
+        # 而"记得住的口令"是**正当需求**（不是要绕过什么）。
+        #
+        # 三条边界（都是刻意的）：
+        #   ① **口令只从 stdin 来**。命令行参数会进 shell 历史（`~/.bash_history`）
+        #      与 `ps` 的进程参数 —— 那是把口令写在墙上。所以这里**没有** `--password`。
+        #   ② 走**与 `--new-admin` 完全相同的一条路**：`admin.hash_password()`（scrypt）
+        #      + `store.upsert_admin()`，没有第二套哈希。
+        #   ③ 策略**复用** `admin.password_policy_error()`（`MIN_PASSWORD_LEN` /
+        #      `MAX_PASSWORD_LEN` 就是它读的那两个常量）—— 不合规**当场退出**：
+        #      既不落库（`store.upsert_admin` 根本没被调用），也没有审计行 ——
+        #      "试了一个不合规的口令"不该在审计里留下痕迹。
+        if args.set_password:
+            # ⚠️ **不区分"没有 stdin"与"stdin 里那一行是空的"**：`readline()` 在
+            # `</dev/null`、已关闭的 fd 上返回的都是空串，与 `printf '' | …` 在**读回来
+            # 的字节**上完全一样 —— 硬要分开只能去问 `isatty()`，而那个判断在这里没有
+            # 价值（两种情况下要做的都是"拒绝并说清楚"，而不是"换一条路找口令"）。
+            # 所以只给一句话，并且它是**策略那句话**（`新口令不能为空`）：
+            # 用户真正需要知道的是"口令没成、库没动、再看一眼管道"。
+            pwd = password if password is not None else ""
+            reason = admin_mod.password_policy_error(pwd)
+            if reason:
+                # 这几行打 stdout，但**不是机器可读输出**：这条命令的全部输出就是
+                # 给人看的中文。真正要紧的是**退出码非 0**（脚本靠它判断）。
+                print("口令不合规：%s" % reason)
+                print("（没有落库 —— 库里原来那一行没动。）")
+                if not pwd:
+                    print("--set-password 只从 **stdin** 读一行，口令本身要在那一行里。例如：",
+                          file=sys.stderr)
+                    print("    ssh -t <宿主> 'docker exec -i echo-backend python -m "
+                          "server.main --set-password %s'   # 然后按提示输入"
+                          % args.set_password, file=sys.stderr)
+                    print("    printf '%%s\\n' \"$口令\" | docker exec -i echo-backend "
+                          "python -m server.main --set-password %s" % args.set_password,
+                          file=sys.stderr)
+                return 2
+            # 与 `--new-admin` **同一格语义**：**建或重置**（不存在就建）。
+            # 刻意不做成"只许改已有的"：那要多一个 `--create` 开关，而两种语义都有人
+            # 期待（"重置口令" vs "建账号并指定口令"）；`--new-admin` 本来就是 upsert，
+            # 这里跟着它走，两条路的心智模型才是同一个。
+            # ⚠️ 也别在这里加"名字打错了就自动建一个"的额外防线 —— 那一层做不了
+            # （命令行没有"谁是谁"的概念，安全边界就是 shell 权限，见模块头）。
+            store.upsert_admin(args.set_password, admin_mod.hash_password(pwd))
+            store.audit("cli", "set-password", args.set_password)
+            print("已建（或重置）管理员 %s，口令就是你输入的那个（%d 位）。"
+                  % (args.set_password, len(pwd)))
+            print("库里只有 scrypt 哈希 —— 这个口令**没有**出现在命令行参数里，"
+                  "也不会被再次打印。")
+            print("管理面板：http://%s/admin/ （容器里请先 `ssh -L 8901:127.0.0.1:8901`，"
+                  "管理面只发布在宿主回环）"
                   % (cfg.get("server.admin_listen", "") or "127.0.0.1:8901"))
             return 0
         if args.list_admins:
@@ -618,9 +794,36 @@ def main(argv=None) -> int:
                     help="配合 --stats：看最近多少小时（默认 24；0 = 全部）")
     ap.add_argument("--list-calls", type=int, default=0, metavar="N",
                     help="看最近 N 条调用元数据（**只有元数据，没有内容**）")
+    # ---- 对外公布地址（配对串里的 host；2026-09-30）----
+    # 与管理面「客户端 / 发授权」页签那张卡是同一件事的**两个出口**
+    # （`server/advertised.py` 一份实现）。
+    #
+    # ⚠️ 两个开关都用 `store_true` 会有一个很难看的坑：`args.set_advertised_host or
+    # args.clear_advertised_host` 里的**布尔 `True` 会被 `str()` 成 `"True"` 当成地址**
+    # 写进配置（写这段时当场踩到，用例抓住的）。所以清空那个也**带一个值**
+    # （`--clear-advertised-host yes`），让两者都是字符串。
+    ap.add_argument("--set-advertised-host", default="", metavar="HOST[:PORT]",
+                    help="发配对码时公布的地址（`10.100.0.24` / `10.100.0.24:8900` / "
+                         "`http://10.100.0.24:8900`）。同事要连就填局域网 IP；"
+                         "本机后端该填 127.0.0.1；不填则自动探测")
+    ap.add_argument("--clear-advertised-host", default="", metavar="yes", nargs="?",
+                    const="yes", help="清空这一项，回到自动探测")
+    ap.add_argument("--show-advertised-host", action="store_true",
+                    help="看当前对外公布地址、来源，以及此刻发码会用哪个地址")
     # ---- 管理面（设计 §8.4）的账号：管理面**只读展示**清单，所以账号只能从这里建 ----
     ap.add_argument("--new-admin", default="", metavar="NAME",
-                    help="建管理员账号（或重置其口令）；**口令只打印这一次**")
+                    help="建管理员账号（或重置其口令）；**口令是随机生成的，只打印这一次**。"
+                         "想自己指定口令用 --set-password")
+    # ⚠️ **没有 `--password`**（这是刻意的，别"顺手加上"）：口令当命令行参数会进
+    # shell 历史与 `ps` 的进程参数。要指定就 `--set-password NAME` + stdin。
+    ap.add_argument("--set-password", default="", metavar="NAME",
+                    help="建（或重置）管理员并把口令设成 **stdin 里的那一行** ——"
+                         "与 --new-admin 同一条路（scrypt 哈希 + upsert），"
+                         "区别只是口令由你给、而不是随机生成。例：`ssh -t 宿主 "
+                         "'docker exec -i echo-backend python -m server.main --set-password "
+                         "ops'`，或 `echo '口令' | docker exec -i …`。"
+                         "不合规（少于 %d 位 / 超过 %d 位 / 为空）→ 中文报错并非零退出，"
+                         "不落库" % (admin_mod.MIN_PASSWORD_LEN, admin_mod.MAX_PASSWORD_LEN))
     ap.add_argument("--list-admins", action="store_true", help="看有哪些管理员账号")
     ap.add_argument("--disable-admin", default="", metavar="NAME",
                     help="禁用一个管理员（他手上的会话下一个请求就失效）")
@@ -637,10 +840,27 @@ def main(argv=None) -> int:
     admin_actions = (args.new_client, args.new_pairing_code, args.list_clients,
                      args.list_codes, args.show_client, args.revoke, args.disable,
                      args.enable, args.set_scopes, args.rotate_secret, args.set_quota,
-                     args.stats, args.list_calls, args.new_admin, args.list_admins,
-                     args.disable_admin, args.enable_admin, args.delete_admin)
+                     args.stats, args.list_calls, args.new_admin, args.set_password,
+                     args.list_admins,
+                     args.disable_admin, args.enable_admin, args.delete_admin,
+                     args.set_advertised_host, args.clear_advertised_host,
+                     args.show_advertised_host)
     if any(admin_actions):
-        return _admin_cli(cfg, args)
+        # 两个都给了 = 用法错了（"随机生成"与"用我给的"是同一格的两种填法）。
+        # **不当场二选一**：那会把"我打错了"变成"口令不是你给的那个"，最难查的那种。
+        if args.new_admin and args.set_password:
+            ap.error("--new-admin 与 --set-password 只能给一个：前者生成随机口令，"
+                     "后者用 stdin 里那一行（想用自己记得住的口令就只给 --set-password）")
+        # **先读 stdin 再进 `_admin_cli`**：这样"没读到口令 / 口令不合规"的失败路径
+        # 一步都不会走到 `open_store()` 之后的写动作 —— 不落库、不写审计。
+        # 判定本身留在 `_admin_cli` 里（那里离 `upsert_admin` 最近，用的也是那份
+        # 与 `--new-admin` 共用的 store 对象）。
+        password = _PASSWORD_NOT_READ
+        if args.set_password:
+            print("请输入管理员 %s 的新口令（从 stdin 读一行，回车结束；"
+                  "`|` 进来的那一行同样可以）：" % args.set_password, file=sys.stderr)
+            password = read_password_from_stdin()
+        return _admin_cli(cfg, args, password)
 
     import uvicorn
     tls = _tls_kwargs(cfg)

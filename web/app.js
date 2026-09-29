@@ -1505,15 +1505,13 @@ const SET_CARDS = {
 };
 
 /* 落点表看不见、但确实有家的键（不是"漏了"，是**由别的渲染路径**画的）。
-   `meetingSttModel`（会议转写引擎）就是这一条：归属表把它放在「能力后端 / 本机」，
-   而它由「能力与智能体」页里原「能力」页签那块渲染（`capAsrLocal()` 的「会议转写」下拉，见
-   `#capKindCards`）—— 所以本文件不再重复画一遍，也不该落进「未归类」兜底卡。
-   `router*` 那 7 项同理：它们是「智能体」页那张**静态**「模型路由」卡「高级」里的行，
+   `router*` 那 7 项：它们是「智能体」页那张**静态**「模型路由」卡「高级」里的行，
    由 renderSettingsPanes() 填进 `#rtSetHost`（`SET_CARDS` 里没有这张卡，见那边的注释）。
    注：其余 model/provider 键（sttModel / ttsEngine / wakeEngine / device / voiceprint*）在
-   语音与设备页签的卡片里也有控件，那一处重叠是"四个非设置视图重做"要收口的遗留，见交接报告。 */
+   语音与设备页签的卡片里也有控件，那一处重叠是"四个非设置视图重做"要收口的遗留，见交接报告。
+   2026-09-29：`meetingSttModel` **从这里删掉了** —— 它已废弃（不再下发），
+   原先那个"会议转写"下拉（`capAsrLocal()` 里）也随之撤掉，所以它不再需要落点。 */
 const SET_PLACED_ELSEWHERE = new Set([
-  "meetingSttModel",
   "routerAutoRegister", "routerDisplayName", "routerProbeInterval",
   "routerFirstByteTimeout", "routerConnectTimeout",
   "routerBreakerThreshold", "routerBreakerCooldown",
@@ -1568,7 +1566,7 @@ const SET_SHORT_LABELS = {
   meetingWorkspaceTitle: "会议分组", inputDeviceId: "收音设备",
   commandInputDeviceId: "指令麦克风", meetingInputDeviceId: "会议麦",
   outputDeviceIds: "扬声器", commandOutputDeviceId: "指令播报",
-  meetingOutputDeviceId: "会议播报", sttModel: "转写引擎", meetingSttModel: "会议引擎",
+  meetingOutputDeviceId: "会议播报", sttModel: "转写引擎",
   wakeEngine: "唤醒方式", device: "计算设备", wakeEnabled: "启用唤醒",
   wakePaused: "唤醒暂停", wakeAliases: "唤醒别名", wakeThreshold: "唤醒阈值",
   sttLanguage: "转写语言", wakeHotkey: "唤醒热键", fallbackHotkey: "回退热键",
@@ -1614,10 +1612,10 @@ const SET_UNITS = {
 /* 下拉里的**短**选项文案（用户 2026-09-25：`sherpa-onnx 流式（推荐）`→`sherpa`、
    `SenseVoice 中文`→`SenseVoice`…）。**只改显示**：写回后端的 value 仍是原来的 id。
    2026-09-26：whisper 各档的文案删掉了 —— 权重已从本机删除、候选项里也不再有它们
-   （老库里的值由 `config.RETIRED_VALUE_FALLBACKS` 折成 sherpa / qwen3asr）。 */
+   （老库里的值由 `config.RETIRED_VALUE_FALLBACKS` 折成 sherpa）。
+   2026-09-29：`meetingSttModel` 那一行也删了（键已废弃、面板不再有它的下拉）。 */
 const SET_OPT_LABELS = {
   sttModel: { sensevoice: "SenseVoice", qwen3asr: "Qwen3-ASR", sherpa: "sherpa" },
-  meetingSttModel: { sensevoice: "SenseVoice", qwen3asr: "Qwen3-ASR", sherpa: "sherpa" },
   device: { auto: "自动", cpu: "CPU", cuda: "GPU(CUDA)" },
   wakeEngine: { sherpa: "sherpa", kws: "KWS" },
   ttsEngine: { auto: "自动", "edge-tts": "在线", sapi: "本机离线", say: "本机离线",
@@ -1641,7 +1639,7 @@ const SET_MEETING_BACKENDS = [
    2026-09-25：**设置页 v3 里它们同时也在「语音与设备」页签出现**（归属表把 model/provider
    这些键归到了那一页）；两处编辑入口的收口属于"四个非设置视图重做"那一步，见交接报告。 */
 const MODEL_KEYS = new Set([
-  "sttModel", "meetingSttModel", "device", "ttsEngine",
+  "sttModel", "device", "ttsEngine",
   "wakeEngine",
   "voiceprintAutoEnroll", "voiceprintThreshold", "voiceprintMargin",
 ]);
@@ -2130,8 +2128,7 @@ function capOnlineBlock(kind, cur) {
  */
 function capAsrLocal() {
   const stt = settingByKey("sttModel");
-  const mstt = settingByKey("meetingSttModel");
-  const curIds = [engineModelId(stt && stt.value), engineModelId(mstt && mstt.value)];
+  const curIds = [engineModelId(stt && stt.value)];
   const cur = new Set(curIds.filter(Boolean));
   const comps = capCompsOf("stt");
   const used = comps.filter((c) => cur.has(c.model_id));
@@ -2140,14 +2137,15 @@ function capAsrLocal() {
     const m = modelById(c.model_id);
     return sum + ((m && m.local_mb) || 0);
   }, 0);
-  return `<div class="cap-sub">本地引擎（这几条就是「业务配置」里选中的那两台引擎）</div>
+  // 「会议转写」那个下拉**删了**（2026-09-29）：`meetingSttModel` 已废弃 ——
+  // 会议转写不在客户端进程内跑，本机也就不再需要装它的模型。这一块只留**命令转写**。
+  return `<div class="cap-sub">本地引擎（这一条就是「业务配置」里选中的那台引擎）</div>
     <div class="cap-engine-row">
       <label>命令转写${_selectHtml("sttModel", stt && stt.options, stt && stt.value)}</label>
-      <label>会议转写${_selectHtml("meetingSttModel", mstt && mstt.options, mstt && mstt.value)}</label>
     </div>
     <div class="cap-sub">配置为要用的（${used.length} 项）</div>
     ${used.length ? capCompTable(used, curIds)
-                  : `<div class="muted" style="font-size:12px">两台引擎都走在线服务或 ECHO 后端，
+                  : `<div class="muted" style="font-size:12px">命令转写走在线服务，
                        本机没有必须装的转写引擎。</div>`}
     ${rest.length ? foldGroup("cap-engines-rest",
       `其余本地引擎（${rest.length} 项 · 留着但不常用）`,
@@ -3777,7 +3775,7 @@ function settingByKey(k) { return _settingsCache.find((s) => s.key === k) || nul
 /** 下拉里显示的人话名字（值仍是原样，避免改配置口径）。 */
 function friendlyOption(key, v) {
   const s = String(v);
-  if (key === "sttModel" || key === "meetingSttModel") {
+  if (key === "sttModel") {
     return { sensevoice: "SenseVoice 中文短命令", qwen3asr: "Qwen3-ASR 0.6B",
       sherpa: "sherpa 流式（中英）" }[s] || ("Whisper " + s);
   }
@@ -3838,22 +3836,25 @@ function _selectHtml(key, options, value) {
       `${esc(friendlyOption(key, o))}</option>`).join("") + `</select>`;
 }
 
-/** 六个功能卡片的数据模型。
+/** 功能卡片的数据模型（**命令转写 / 唤醒 / 说话人分离 / 声纹 / 计算设备**）。
  *
  * 2026-09-26（概念纠正）：「说话人分离」与「声纹」**不再是开关**——会议转写一律
- * 包含这两件事（本地或后端都一样），所以这两张卡上只有**状态与由谁做**，
- * 没有"启用"复选框：用户嫌的不是配置多，而是"要做没有信息量的决定"。
- * 声纹那张卡上唯一的开关是「改名即入库」（默认关，它往本地声纹库里写东西）。 */
+ * 包含这两件事，所以这两张卡上只有**状态与由谁做**，没有"启用"复选框：
+ * 用户嫌的不是配置多，而是"要做没有信息量的决定"。
+ * 声纹那张卡上唯一的开关是「改名即入库」（默认关，它往本地声纹库里写东西）。
+ *
+ * 2026-09-29：「会议转写」那张卡（`mstt`）删了 —— 会议转写不在客户端进程内跑，
+ * `meetingSttModel` 已废弃；转写走哪条路由「业务配置 → 会议」承载。 */
 function modelFunctions() {
   const stt = settingByKey("sttModel");
-  const mstt = settingByKey("meetingSttModel");
   const wake = settingByKey("wakeEngine");
   const dev = settingByKey("device");
   return [
     { id: "stt", icon: "🎤", name: "命令转写", settingKey: "sttModel", options: stt && stt.options,
       value: stt && stt.value, catalogId: engineModelId(stt && stt.value) },
-    { id: "mstt", icon: "📝", name: "会议转写", settingKey: "meetingSttModel", options: mstt && mstt.options,
-      value: mstt && mstt.value, catalogId: engineModelId(mstt && mstt.value) },
+    // 「会议转写」那张卡（id: "mstt"）**删了**（2026-09-29）：会议转写不再在客户端进程内跑，
+    // `meetingSttModel` 也随之废弃（值留库、不出接口、写入被拒）。要全本机跑就在本机起一个
+    // 能力后端 —— 那条路由「业务配置 → 会议」的「会议转写走哪条路」承载。
     { id: "wake", icon: "🔔", name: "唤醒", settingKey: "wakeEngine", options: wake && wake.options,
       value: wake && wake.value, catalogId: "kws" },
     // 分离与声纹：会议标配，卡上只说"由谁做"（键 = capabilityDiarizeBackend）。
@@ -3887,7 +3888,7 @@ function _loadState(f) {
   }
   if (!m) return { kind: "idle", text: "—" };
   if (m.ready) return { kind: "ok", text: "就绪" };
-  const critical = f.id === "stt" || f.id === "mstt";   // 转写引擎缺失会直接导致失败
+  const critical = f.id === "stt";   // 转写引擎缺失会直接导致失败（只剩命令转写这张卡）
   return critical ? { kind: "miss", text: "未就绪" } : { kind: "warn", text: "未安装" };
 }
 
@@ -3935,9 +3936,10 @@ function renderModelCard(f) {
     // 会议标配的卡（说话人分离）**没有"启用"复选框** —— 它一定会做，这里只选由谁做；
     // 下面那句说明就是原来那个复选框的位置（用户要知道"这不再是开关"）。
     if (f.alwaysOn) {
-      control += `<div class="mcard-meta"><b>会议一定会做说话人分离</b>（本地跑或走后端都一样，
-        不再有开关）。这里选的是<b>由谁做</b>：「自动」按默认链挑（ECHO 后端优先），
-        也可指定 ECHO 后端或本机。「本机」需要已装 pyannote；真跑不了时会议详情会明说
+      control += `<div class="mcard-meta"><b>会议一定会做说话人分离</b>（不再有开关）。
+        这里选的是<b>由谁做</b>：「自动」按默认链挑（ECHO 后端优先），
+        也可指定 ECHO 后端。<b>客户端进程内不再跑分离</b>（2026-09-29）——
+        要全本机跑就在本机起一个能力后端；真跑不了时会议详情会明说
         「说话人分离未执行：&lt;原因&gt;」，不会安静地少掉说话人。</div>`;
     }
     // 未就绪：不能只说"会失败"，要接上后端给的**下一步**（"再点一次下载"）与安装命令 ——
@@ -4861,9 +4863,10 @@ if ($("#btnImportToggle")) {
      * 只有这里有、且是运维信息的两样东西：**启动失败的真原因**（`error`/`detail`）与
        **组件进程的启停**（`can_start`/`can_stop` → /api/boot/component/{id}/{start|stop}）；
      * （下文同页）启动日志 `#bootLogs`。
-   顺带删掉的是这一块里**重复的设置编辑入口**：`sttModel` / `meetingSttModel` 两个下拉与
+   顺带删掉的是这一块里**重复的设置编辑入口**：`sttModel` 下拉与
    `ttsEngine` 的在线开关 —— 它们各自的家在「语音与设备」（命令采集 / 任务反馈）与
-   「能力后端」（语音转写 / 语音合成卡）。 */
+   「能力后端」（语音转写 / 语音合成卡）。
+   （`meetingSttModel` 那个下拉 2026-09-29 整项废弃删除 —— 它已经不在任何接口里下发。） */
 
 function bootBadgeCls(status) {
   if (status === "online" || status === "active") return "online";
@@ -4928,9 +4931,11 @@ function renderBootReadyNote() {
  *  完整名字仍在 `title` 里 —— 只改显示，不改任何值。 */
 const BOOT_SHORT_LABELS = {
   server: "面板服务", dsh: "DSH 引擎", failover: "模型路由", harness: "harness",
-  "stt-cmd": "命令转写", "stt-meeting": "会议转写", tts: "语音合成",
-  wake: "语音唤醒", hotkey: "热键", meeting: "会议录音", diarize: "说话人分离",
+  "stt-cmd": "命令转写", tts: "语音合成",
+  wake: "语音唤醒", hotkey: "热键", meeting: "会议录音",
 };
+// 2026-09-29 删掉的两项：`stt-meeting`（会议转写引擎，按需）与 `diarize`（说话人分离）——
+// 客户端进程内不再跑它们，boot 里也没有这两个组件了（见 app/boot.py）。
 
 function renderBoot(bs) {
   const s = bs.summary || {};

@@ -55,8 +55,11 @@ from typing import Any, Dict, List, Optional
 #: 不用改环境变量也不用重启"）—— 它是**第三类**：前两类是"关于客户端的管理数据"与
 #: "关于请求的元数据"，而这一张是**这台后端自己怎么跑**（总并发 / 每客户端并发 /
 #: 队列上限）。加表本来要走 §8.5 那道评审门，这一轮就是那次评审。
+#: `server_advertised` 是 2026-09-30 加的（用户实测的 bug：容器里发出的配对串带的是
+#: Docker 网桥地址 `172.18.0.2`，同事连不上）—— 与 `server_limits` 同一个第三类：
+#: "这台后端**对外**是谁"，一行一个字符串，没有任何业务概念。
 TABLE_WHITELIST = ("clients", "pairing_codes", "calls", "admin_users", "admin_audit",
-                   "server_limits")
+                   "server_limits", "server_advertised")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS clients (
@@ -137,6 +140,17 @@ CREATE INDEX IF NOT EXISTS idx_admin_audit_ts ON admin_audit(ts);
 CREATE TABLE IF NOT EXISTS server_limits (
     name       TEXT PRIMARY KEY,
     value      INTEGER NOT NULL DEFAULT 0,
+    updated_at REAL NOT NULL DEFAULT 0,
+    updated_by TEXT NOT NULL DEFAULT ''
+);
+-- 这台后端**对外公布**的地址（2026-09-30）：发配对码时 `echo://pair?host=…` 里那个 host。
+-- 为什么落库：容器里自动探测到的是 Docker 网桥地址（实测 172.18.0.2），而"同事能连到
+-- 哪台机器"只有部署的人知道 —— 所以管理面得能改，而且改了要**重启后还在**。
+-- 为什么与 `server_limits` 分开：那张表的值是整数，这个是地址串；塞进整数列只能靠编码。
+-- 列名只有 value/updated_at/updated_by（与 limits 同口径），没有任何业务概念。
+CREATE TABLE IF NOT EXISTS server_advertised (
+    name       TEXT PRIMARY KEY,
+    value      TEXT NOT NULL DEFAULT '',
     updated_at REAL NOT NULL DEFAULT 0,
     updated_by TEXT NOT NULL DEFAULT ''
 );
@@ -539,6 +553,39 @@ class Store:
                     " ON CONFLICT(name) DO UPDATE SET value=excluded.value,"
                     " updated_at=excluded.updated_at, updated_by=excluded.updated_by",
                     (str(name), int(value), now, str(updated_by or "")))
+            self._db.commit()
+
+    # ---------------------------------------------------------------- 对外公布地址（§8.5）
+
+    def advertised_override(self) -> str:
+        """管理面配过的**对外公布地址**。**空 = 从没配过** → 走 env / YAML / 自动探测。
+
+        （谁是权威值见 `server/advertised.py` 开头的优先级表。）
+        """
+        return str((self.advertised_override_row() or {}).get("value") or "")
+
+    def advertised_override_row(self) -> Dict[str, Any]:
+        """那一行（含 `updated_at` / `updated_by`，页面要显示"谁什么时候改的"）。"""
+        with self._lock:
+            row = self._db.execute(
+                "SELECT name, value, updated_at, updated_by FROM server_advertised"
+                " WHERE name='advertised_host'").fetchone()
+        return dict(row) if row else {}
+
+    def set_advertised_override(self, value: str, updated_by: str = "") -> None:
+        """写入对外公布地址（值由调用方 `advertised.parse()` 校验过，这里**不重复校验**）。
+
+        空串也照样写一行（= "管理员显式清空、回到自动探测"）——
+        与"从没配过"在读出来的结果上一致，但页面上能看出"确实有人动过它"。
+        """
+        now = time.time()
+        with self._lock:
+            self._db.execute(
+                "INSERT INTO server_advertised (name, value, updated_at, updated_by)"
+                " VALUES ('advertised_host',?,?,?)"
+                " ON CONFLICT(name) DO UPDATE SET value=excluded.value,"
+                " updated_at=excluded.updated_at, updated_by=excluded.updated_by",
+                (str(value or ""), now, str(updated_by or "")))
             self._db.commit()
 
     # ---------------------------------------------------------------- 配对码

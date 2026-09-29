@@ -294,7 +294,19 @@ class _Contract:
 
 
 class LocalContractTests(_Contract, unittest.TestCase):
-    """本机后端。用**打桩的引擎**跑契约 —— 要验的是这层的形状，不是模型准不准。"""
+    """本机后端。用**打桩的引擎**跑契约 —— 要验的是这层的形状，不是模型准不准。
+
+    2026-09-29：本机**默认只声明 `asr.text`**（服务语音指令那条链路，铁律 L3）——
+    会议转写与说话人分离不再由客户端进程内承担。所以这里分两件事来钉：
+
+      * `test_the_default_detection_only_declares_the_command_slot` —— **真实实例**
+        （`LocalCapabilityClient()`，路由拿到的那一份）只声明 `asr.text`。
+        这是"路由不会再派会议那类活给本机"的事实源。
+      * `make_client()` 仍然显式声明全部槽 —— 让 `_Contract` 里那些**形状契约**
+        （turns/embs/labels 对齐、失败要分类…）继续跑在 `diarize()` / `embed()` 上。
+        那两个方法本步**先留着**（第 5 步随模型与能力一起清），留着就该继续验形状；
+        把它们从 `provides` 里去掉、再让用例 skip 掉，等于把一个还能跑的契约静默关掉。
+    """
 
     @classmethod
     def setUpClass(cls):
@@ -308,6 +320,20 @@ class LocalContractTests(_Contract, unittest.TestCase):
         return LocalCapabilityClient(provides={
             "asr.text", "asr.timestamps", "diarize.turns",
             "diarize.embeddings", "speaker.embed"})
+
+    def test_the_default_detection_only_declares_the_command_slot(self):
+        """**默认探测**（= 路由实际拿到的那一份）只声明 `asr.text`。
+
+        `LOCAL_SLOTS` 与 `_detect_slots()` 必须是同一个集合 —— 两处各写一份的话，
+        会出现"面板说本机能分离、路由却不派给它"这种对不上的现象。
+        这条同时是"别把本机分离悄悄加回来"的闸：多一个槽都意味着会议那类活会被派给本机。
+        """
+        from app.capabilities.local import LOCAL_SLOTS, LocalCapabilityClient
+        self.assertEqual(set(LOCAL_SLOTS), {"asr.text"})
+        self.assertEqual(set(LocalCapabilityClient().provides), set(LOCAL_SLOTS))
+        for slot in ("diarize.turns", "diarize.embeddings", "speaker.embed", "asr.timestamps"):
+            self.assertNotIn(slot, LOCAL_SLOTS,
+                             "本机不该再声明 %s（会议那一族不在客户端进程内做）" % slot)
 
     def wav(self):
         return self.wav_path

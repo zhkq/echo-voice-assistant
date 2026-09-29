@@ -28,6 +28,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 import ssl
 import time
 from typing import Any, Dict, Optional
@@ -79,8 +80,17 @@ def advertised_host(listen: str, tls: bool) -> tuple:
       探不到就留一个**占位符**让人自己填 —— 宁可让人补一次，也不猜一个错的。
     * **配了 TLS 就必须写 `https://`**。客户端对不带 scheme 的地址默认按 http 处理
       （`pairing.normalize_base_url`），在 https 服务端上同样是"连不上"。
+
+    ⚠️ **这个函数只看 `listen`，不看配置**。真正发配对码那条路走
+    `resolve_advertised(cfg)`（它优先用 `server.advertised_host`）——
+    两个名字分开留着，是因为这个签名是既有的跨层契约，而且"只按监听地址算"这件事
+    本身还是对的（`localpair` 与旧调用方要的就是它）。
     """
-    raw = str(listen or "")
+    return _probe_advertised(str(listen or ""), bool(tls))
+
+
+def _probe_advertised(raw: str, tls: bool) -> tuple:
+    """`_probe` 的实现体（旧 `advertised_host` 的原样搬迁）。"""
     host, _, port = raw.rpartition(":")
     if not port:
         host, port = raw, ""
@@ -96,18 +106,149 @@ def advertised_host(listen: str, tls: bool) -> tuple:
         host = guess or "<这台后端的主机名或IP>"
         note = ("服务端监听的是通配地址 %s —— 上面这个地址是**本机探测到**的；"
                 "同事连不上就换成他们能访问到的那台机器的主机名或 IP。" % (raw or "(空)"))
+        # 2026-09-30：容器里探测到的就是 Docker 网桥地址（实测 172.18.0.2），
+        # 同事拿到那种串**必然连不上**。根治办法是配一项"对外公布地址"，所以这里
+        # 除了保留上面那句如实提示，还要把**怎么修**说出口（配置键 + 环境变量名）。
+        note += ("（对外服务时请配上 `server.advertised_host` 或环境变量 "
+                 "`ECHO_ADVERTISED_HOST=<同事能访问到的 IP>`，就不会再靠探测。）")
     return "%s://%s:%s" % ("https" if tls else "http", host, port), note
 
 
-def pairing_string(cfg, code: str, ttl_s: Optional[float] = None) -> Dict[str, Any]:
+#: `normalize_advertised_host` 认的形状：`host` / `host:port` / `[v6]` / `[v6]:port`。
+#: **刻意窄**：认不出来就报错，不猜（猜错的代价是"同事照着串连不上"，而且看不出原因）。
+_ADVERTISED_RE = re.compile(r"^(?P<host>\[[0-9A-Fa-f:.]+\]|[^\s:/\[\]]+)(?::(?P<port>\d+))?$")
+
+
+def normalize_advertised_host(raw: Any) -> str:
+    """`"http://10.100.0.24:8900/"` → `"10.100.0.24:8900"`（**归一化，非法值抛错**）。
+
+    ## 接受的格式（这是**契约**，有用例钉着）
+
+    | 写法 | 归一化成 | 说明 |
+    |---|---|---|
+    | `10.100.0.24` | `10.100.0.24` | 只给主机名/IP，端口留给调用方补（默认用 `server.listen` 的端口） |
+    | `10.100.0.24:8900` | `10.100.0.24:8900` | 连端口一起给了 |
+    | `http://10.100.0.24:8900` | `10.100.0.24:8900` | scheme 与结尾的 `/`、`?`、`#` 一并剥掉 |
+    | `[fe80::1]:8900` | `[fe80::1]:8900` | IPv6 必须带方括号（带的端口才不歧义） |
+
+    ## 三条明确的行为（都不是"随手定的"）
+
+    1. **scheme 只被剥掉、不被采纳**。发出去的串用 `http` 还是 `https` **由 TLS 决定**
+       （`server.tls.certfile` 配了就是 https，见 `_probe_advertised`）。理由：让
+       `https://…` 在这里"提前生效"等于把 TLS 开关藏在地址串里 —— 那么
+       "填了 https 但没配证书"就会发出一个连不上的串，而现象看着像客户端坏了。
+    2. **空值返回空串**（= "没配"），**不是报错** —— 没配要走自动探测那条老路。
+    3. **认不出来就抛 `ValueError`**（中文原因）。在配置里这是个手改的字面量：
+       静默忽略会让人以为配了、其实还在探测（正是这次要修的 bug 的形态）。
+       调用方把它翻成 400（管理面）/ 启动即报错（配置）/ 中文报错（命令行）。
+
+    ## 这一项是"每次发码时公布的地址"，不是一次性全局常量
+
+    同事要连 → 局域网 IP；后端就跑在客户端这台机器上 → `127.0.0.1`
+    （本机永远连得上，换网络/换 IP 都不受影响）；同一台后端两边都服务 →
+    **发码时各写各的**（`issue_pairing_code(..., advertised=...)`）。
+    配对串本身带 host，所以两张码互不影响 —— 而且**串就是文本，手改 host 就能用**
+    （刻意没做签名/校验，见 `pairing_string`）。
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    # scheme 剥掉（认不出的 scheme 一律当没写 scheme：`[^\s:/\[\]]+` 兜住剩下的部分，
+    # 所以 `ftp://x` 会得到 `x` 的 host —— 与 `http://x` 同一条路，行为一致）。
+    if "://" in text:
+        text = text.split("://", 1)[1]
+    text = text.split("?", 1)[0].split("#", 1)[0].strip().rstrip("/").strip()
+    if not text:
+        raise ValueError("对外公布地址里只有 scheme、没有主机名或 IP（给的是 %r）" % (raw,))
+    m = _ADVERTISED_RE.match(text)
+    if not m:
+        raise ValueError("对外公布地址认不出来：%r。给它 主机名/IP、"
+                         "`IP:端口`、或 `http://IP:端口` 这样的写法（IPv6 要带方括号）。"
+                         % (raw,))
+    host, port = m.group("host"), m.group("port")
+    if port is not None and not (1 <= int(port) <= 65535):
+        raise ValueError("对外公布地址里的端口要在 1 ~ 65535 之间（给的是 %s）" % port)
+    return host + (":" + port if port else "")
+
+
+def resolve_advertised(cfg, *, advertised: Any = None) -> tuple:
+    """**发配对串时那条路**：`cfg`（+ 可选的这一次的覆盖）→ `(地址, 备注)`。
+
+    优先级（与 `server/limits.py` 一个口径：管理面配过的值由 `apply_stored()`
+    先写进 `cfg.raw`，所以这里只看 `cfg`）：
+
+    | 顺序 | 来源 | 备注里怎么说 |
+    |---|---|---|
+    | 1 | 这一次的 `advertised=`（**每次发码各写各的**） | 空（调用方自己解释） |
+    | 2 | `server.advertised_host`（配置 / 环境变量 / 管理面） | 空 |
+    | 3 | **自动探测**（`server.listen` 是通配地址时） | 那句如实的提示，**一个字都不删** |
+
+    ⚠️ 第 3 档**不许**改成"猜一个局域网 IP"：后端就跑在客户端这台机器上时
+    （本机后端）那种猜法**必然猜错**（该给 `127.0.0.1`）。没配就如实说"这是探测到的"。
+    """
+    tls = bool(str(cfg.get("server.tls.certfile", "") or ""))
+    # 这一次的覆盖先过一遍同样的归一化（不合法**当场报错** —— 半路静默退回全局值
+    # 会让发码的人以为"我指定了"，而串里其实是别的地址）。
+    chosen = ""
+    if advertised not in (None, ""):
+        try:
+            chosen = normalize_advertised_host(advertised)
+        except ValueError as exc:
+            raise errors.bad_request("这一次的对外地址不合法：%s" % exc)
+    from_cfg = False
+    if not chosen:
+        try:
+            chosen = normalize_advertised_host(cfg.get("server.advertised_host", ""))
+        except ValueError as exc:
+            raise errors.EchoError(
+                500, "config_invalid",
+                "server.advertised_host 配错了：%s。改成 主机名/IP、`IP:端口` 或 "
+                "`http://IP:端口`（IPv6 带方括号），或者留空让它自动探测。" % exc,
+                detail=str(cfg.get("server.advertised_host", "")))
+        from_cfg = bool(chosen)
+    if not chosen:
+        return _probe_advertised(str(cfg.get("server.listen", "") or ""), tls)
+    # `normalize_advertised_host` 给的结果一定带方括号或只有一个冒号，所以这里按端口
+    # **是不是纯数字**来切 —— 不能只看"有没有冒号"：`10.100.0.24` 本来就没有端口，
+    # 用 `rpartition` 硬切会得到 `("", "10.100.0.24")`（那会拼出 `http://:10.100.0.24`）。
+    host, port = chosen, ""
+    head, sep, tail = chosen.rpartition(":")
+    if sep and tail.isdigit():
+        host, port = head, tail
+    if not port:
+        # 没带端口 → 用服务端自己的监听端口（客户端要连的就是那个端口）。
+        try:
+            port = str(int(cfg.get("server.listen", "").rsplit(":", 1)[1]))
+        except (IndexError, ValueError):
+            port = "8900"                  # 与 `Config.port` 的兜底同一个值
+    return "%s://%s:%s" % ("https" if tls else "http", host, port), ""
+
+
+def pairing_string(cfg, code: str, ttl_s: Optional[float] = None,
+                   advertised: Any = None) -> Dict[str, Any]:
     """一个裸配对码 → 那一整串 `echo://pair?host=…&code=…&fp=…`（设计 §7.5 ①）。
 
     **配对串只在 `server/ops.py` 这一处拼** —— 命令行与管理面都从这里拿，
     否则"网页上发出来的串"和"命令行发出来的串"迟早不一样（指纹少一个、
     scheme 少一个都会让客户端连不上，而且看不出原因）。
+
+    ## host 从哪来（2026-09-30 修的 bug）
+
+    `server.advertised_host`（配置 / `ECHO_ADVERTISED_HOST` / 管理面配过的那份）**配了就用**；
+    没配就保持原来的自动探测 —— 而探测在容器里拿到的是 **Docker 网桥地址**（实测
+    `172.18.0.2`），同事必然连不上。优先级与那句如实提示见 `resolve_advertised()`。
+
+    `advertised=` 是**这一次的覆盖**：同一台后端同时服务本机与远程时，
+    本机那张码给 `127.0.0.1`、远程那张给局域网 IP（两张码互不影响）。
+
+    ## 串是**文本**，手改 host 就能用
+
+    刻意**不做签名、不做校验、不落库**：运维手上那份串只要能连通就行 ——
+    把它做成"校验过的形式"就意味着"地址写错了只能重新发一张码"，
+    而这恰恰是最常见的情形（换网络、换 IP、把本机码转给同事）。
     """
     fp = cert_fingerprint(str(cfg.get("server.tls.certfile", "") or ""))
-    addr, note = advertised_host(str(cfg.get("server.listen", "")), bool(fp))
+    addr, note = resolve_advertised(cfg, advertised=advertised)
     suffix = ("&fp=" + fp) if fp else ""
     ttl = float(ttl_s if ttl_s else cfg.get("auth.pairing_ttl_s", 900))
     return {"url": "echo://pair?host=%s&code=%s%s" % (addr, code, suffix),
@@ -117,13 +258,17 @@ def pairing_string(cfg, code: str, ttl_s: Optional[float] = None) -> Dict[str, A
 # ---------------------------------------------------------------- 配对码
 
 def issue_pairing_code(cfg, auth, *, name: str = "", scopes: str = "",
-                       ttl_s: Optional[float] = None, created_by: str = "") -> Dict[str, Any]:
+                       ttl_s: Optional[float] = None, created_by: str = "",
+                       advertised: Any = None) -> Dict[str, Any]:
     """发一张一次性配对码。**明文只在这个返回值里出现这一次。**
 
     返回里除了明文，还带上：
       * `id` —— 这张码在库里的身份（`code_hash`，作废时用它命名）；
       * `url` —— 可以直接粘给同事的整串（含证书指纹）；
       * `expiresAt` / `ttlSeconds` —— 面板与命令行都要显示剩余时间。
+
+    `advertised` = **这一次发码想公布的地址**（覆盖 `server.advertised_host`）——
+    同一个后端同时服务本机与远程时，两张码各写各的。
     """
     store = auth.store
     # 顺手把过期的清掉：这里本来就是**写路径**，而"待用配对码"这个数字要能自证
@@ -134,7 +279,7 @@ def issue_pairing_code(cfg, auth, *, name: str = "", scopes: str = "",
         pass
     code = auth.create_pairing_code(created_by=str(created_by or ""), name=str(name or ""),
                                     scopes=normalize_scopes(scopes), ttl_s=ttl_s)
-    built = pairing_string(cfg, code, ttl_s=ttl_s)
+    built = pairing_string(cfg, code, ttl_s=ttl_s, advertised=advertised)
     return {
         "id": auth_mod.hash_pairing_code(code),   # 同一个确定性哈希（无随机盐），与库里那张码逐字相同
         "code": code,

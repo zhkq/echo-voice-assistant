@@ -102,7 +102,7 @@ class MeetingTranscribeBusy(Exception):
     "没有音频片段"这类业务失败**分开** —— 前者的语义是 **HTTP 409 Conflict**，
     后者沿用既有的 200 + `{ok:false}`。两种结局都塞进同一个 `(False, str)`，
     接口层就只能靠匹配文案来分辨，而文案一改判据就悄悄失效。
-    参照 `MeetingEngineRefused` 的同一套理由（见本文件下方）。
+    参照 `MeetingTranscribeBusy` 的同一套理由（见本文件上方）。
     """
 
     def __init__(self, message=TRANSCRIBE_BUSY_MESSAGE, kind="transcribing"):
@@ -641,7 +641,11 @@ def start_meeting():
         meta = {
             "start": now.isoformat(timespec="seconds"),
             "config": {
-                "sttModel": cfg.get("meetingSttModel", "small"),
+                #: **空串**：`meetingSttModel` 已废弃（2026-09-29，会议转写不再在客户端
+                #: 进程内跑），所以"这台机器用哪个本机引擎"这件事**没有答案**。
+                #: 键仍然写出来（老读者按 `meta["config"]` 的固定形状取，缺键比空值更容易
+                #: 让它们炸；`db.meetings.stt_model` 那一列同理留空）。
+                "sttModel": "",
                 "sttDevice": cfg.get("device", "auto"),
                 "segmentMinutes": cfg.get("meetingSegmentMinutes", 10),
                 "autoSummarize": cfg.get("meetingAutoSummarize", True),
@@ -878,96 +882,6 @@ def _ensure_speaker_column(rows):
 # 那边是**原样搬过去**的（这段逻辑在实机上跑过不少会议，重写只会引入难查的时间轴退化）。
 
 
-def _boot_meeting_stt(status, detail=""):
-    """同步 boot 页 stt-meeting 组件状态（懒导入避免循环依赖）。"""
-    try:
-        import app.boot as boot
-        boot.report("stt-meeting", status=status, detail=detail)
-    except Exception:
-        pass
-
-
-def _boot_note_meeting_key():
-    try:
-        import app.boot as boot
-        from app.audio import stt
-        eng, model = stt.resolve_engine(settings.get("meetingSttModel", "sensevoice"))
-        boot.note_stt_loaded("stt-meeting", stt.engine_key(eng, model))
-    except Exception:
-        pass
-
-
-# ---------------------------------------------------------------- 引擎分派
-
-#: 会议链路**整场文件转写**能直接驱动的本机引擎（= `meetingSttModel` 的合法引擎取值）。
-#:
-#: 判据只有一条：`_transcribe_impl` 里真的有一段代码把整个 wav 转成文字、再按
-#: `app.capabilities.assemble` 拼成逐句时间。名字列在这里、而不是散在 if/elif 里，
-#: 是为了让"驱动不了"那句报错能**自己说出支持哪些** —— 报错文案与分派逻辑必须是
-#: 同一份事实，否则改了分派忘了改文案，用户又被指到错方向（2026-09-25）。
-MEETING_LOCAL_ENGINES = ("whisper", "sensevoice", "qwen3asr", "sherpa")
-
-#: 报错文案里逐条列出"支持哪些"时用的说法（给人看，不是给代码看）。
-MEETING_ENGINE_LABELS = {
-    "whisper": "whisper 的模型名（small / medium / large / large-v3 …）",
-    "sensevoice": "sensevoice",
-    "qwen3asr": "qwen3asr",
-    "sherpa": "sherpa",
-}
-
-
-def unsupported_engine_reason(choice):
-    """会议链路驱动不了的引擎 → 一句**要素齐全**的人话（哪个引擎 / 支持哪些 / 下一步）。
-
-    三要素缺一不可，这是 2026-09-25 那次故障的教训：只报"转写失败"，用户不知道换什么；
-    只说"不支持"，用户不知道支持什么；不给下一步，用户只能重复试同一件事。
-
-    两条可执行的路都写在这里（`capabilityMeetingAsrBackend` **已经没有 auto**，
-    所以措辞是"指定"，不是"等它自动挑"）：
-      ① 把 `meetingSttModel` 改成下面列出的任一个；
-      ② 到「能力」页签把「会议转写用哪个后端」指定为「ECHO 后端」，整场交给配对的机器。
-
-    同时明说"这一场没有开始转写" —— 否则用户会以为是转了一半失败，去翻音频找问题。
-    """
-    who = str(choice or "").strip() or "（空）"
-    supported = "、".join(MEETING_ENGINE_LABELS[e] for e in MEETING_LOCAL_ENGINES)
-    return (
-        "会议转写引擎「%s」不能用于整场会议的文件转写：这条链路只支持 %s。"
-        "可执行的下一步二选一：① 到 设置 → 会议 把「会议转写引擎」改成上面任一个；"
-        "② 到 设置 → 能力 把「会议转写用哪个后端」**指定**为「ECHO 后端」"
-        "（capabilityMeetingAsrBackend=echo-server；这一项没有 auto，不会自动兜底），"
-        "让整场转写交给配对的机器。这一场**没有开始转写**，原样重试也不会成功。"
-        % (who, supported))
-
-
-def resolve_meeting_engine(choice):
-    """`meetingSttModel` → `(engine, model, problem)`。
-
-    `problem` 非空 = **这条链路驱动不了这个取值**，调用方必须当场失败并把它原样报出去。
-
-    为什么需要它（2026-09-25 用户报的真实故障，面板显示 0 行 + "麦克风没打开"）：
-    原来这里是 ``use_sv = cfg.get("sttModel") in ("sensevoice", "qwen3asr")`` … ``else:
-    _get_whisper(cfg.get("sttModel"))`` —— 于是安装器给"只装 sherpa"的默认档写的
-    ``meetingSttModel=sherpa`` 会**拿引擎名当 whisper 模型名去加载**：`WHISPER_MODELS`
-    里没有 sherpa，每段静默出 0 行，最后只落一个 ``status=error``、原因一个字都没有。
-    现在这条路径不存在了。
-
-    解析归 `stt.resolve_engine()`（与 boot、能力层本机后端 `capabilities/local.py`
-    **同一份**规则，不再各写一份"哪些值是引擎名"）；whisper 的模型名再按
-    `WHISPER_MODELS` 校验一次 —— `resolve_engine` 对认不出的值**一律回退成 whisper**，
-    不校验就等于没判（"paraformer" 会变成"加载 whisper 模型 paraformer"）。
-    """
-    from app.audio import stt
-    eng, model = stt.resolve_engine(choice)
-    if eng not in MEETING_LOCAL_ENGINES:
-        # 目前不可能（resolve_engine 只会出这四个），留个闸：真出了就响亮拒绝，
-        # 绝不落到 `else` 里"拿未知名字当 whisper 模型"。
-        return "", "", unsupported_engine_reason(choice)
-    if eng == "whisper" and model not in stt.WHISPER_MODELS:
-        return "", "", unsupported_engine_reason(choice)
-    return eng, model, ""
-
-
 def _mark_meeting_error(meeting_id, reason, **extra):
     """把一场会标成 `error` **并留下具体原因**（落 `meetings.error`，v6 加的那一列）。
 
@@ -979,16 +893,6 @@ def _mark_meeting_error(meeting_id, reason, **extra):
     fields = {"status": "error", "error": str(reason or "")[:2000]}
     fields.update(extra)
     db.update_meeting(meeting_id, **fields)
-
-
-class MeetingEngineRefused(Exception):
-    """会议链路**驱动不了配置的引擎** —— 原因已经在库里/日志里/组件状态里说清楚了。
-
-    为什么用异常、而不是让 `_transcribe_impl` 静悄悄 `return`：`_transcribe_meeting`
-    把"正常返回"当成**转写完成**（报 `idle`、加载完成提示音"叮叮"）。守卫要表达的是
-    "这一场**没有开始转写**"，如果只是 return，上层会紧接着喊一声"转写完成"、
-    还响一个成功音 —— 与刚落库的失败原因、与刚才响过的错误音**自相矛盾**。
-    """
 
 
 def _maybe_auto_compress(folder):
@@ -1029,29 +933,32 @@ def _maybe_auto_compress(folder):
 
 
 def _transcribe_meeting(folder):
-    """后台转写主入口；任何异常写入日志，不静默丢失。"""
+    """后台转写主入口；任何异常写入日志，不静默丢失。
+
+    返回 `_transcribe_impl` 给出的结果（`"transcribed"` / `"error"` / `""`）——
+    调用方据此决定要不要报"转写完成"、响不响成功提示音。**不能**把"函数正常返回"
+    当成"转写完成了"：2026-09-29 起再也没有本机引擎兜底，"没有转写引擎"是一条
+    正常的提前收口路径（原因已经落库），而它若被当成成功，用户会同时看到
+    "转写完成"和一条失败原因、还听见一声"叮叮"。
+    """
     name = os.path.basename(folder)
     meeting = db.get_meeting_by_name(name)
     mid = meeting["id"] if meeting else None
-    _boot_meeting_stt("starting", f"转写中 {name}")
     try:
-        _transcribe_impl(folder)
+        status = _transcribe_impl(folder)
         if mid:
             _clear_progress(mid)
+        if status != "transcribed":
+            # 这一场没转成（原因已经在 `_transcribe_impl` 里落库/落日志/响过错误音）。
+            # 这里**什么都不做**就是正确行为：绝不接一句"转写完成"。
+            return status
         services.report_meeting("idle", f"转写完成 {name}")
-        _boot_note_meeting_key()
-        _boot_meeting_stt("online", "转写完成 · 引擎已加载")
         tts_mod.beep_ok()          # 转写完成提示音（叮叮）
         # 可选：转写完成后自动做无损压缩（设置 `meetingAutoCompressAudio`，**默认关**）。
         # 放在提示音**之后**、且自己吞掉所有异常：压缩失败绝不能影响"这一场转写完成了"
         # 这件事，更不能把上一行的状态改回去（用户听到的是"叮叮"，界面必须是成功）。
         _maybe_auto_compress(folder)
-    except MeetingEngineRefused:
-        # 引擎驱动不了：原因、日志、组件状态、错误提示音都已经在 `_transcribe_impl`
-        # 的守卫里做完了。这里唯一要做的是**别把"转写完成"接上去** ——
-        # 否则用户同时看到"转写完成 · 引擎已加载"和一条失败原因，还听见两声提示音。
-        if mid:
-            _clear_progress(mid)
+        return status
     except Exception as e:
         import traceback
         msg = f"[{datetime.datetime.now().isoformat(timespec='seconds')}] " \
@@ -1066,23 +973,21 @@ def _transcribe_meeting(folder):
         if mid:
             _clear_progress(mid)
         services.report_meeting("error", f"转写失败 {name}")
-        _boot_meeting_stt("failed", f"转写失败 {name}")
         tts_mod.play_beep("err")   # 转写失败提示音（咚）
         print(msg, file=sys.stderr)
+        return "error"
 
 
 def _apply_capability_meta(meta: dict, cap_plan, cap_kinds) -> dict:
     """把这一场的路由结论写进 `meta`；**没走能力层时要把上一场的结论删掉**。
 
     为什么"删"这一步是必须的（2026-09-24 真机联调现场抓到）：`meta.json` 是**同一场会
-    反复重转时被覆盖写的**，而这两行只在走能力层时才写。于是"上一次走了 ECHO 后端、
-    这一次退回本机老路"（privacy 改成 none、或后端在计划阶段就用不上）之后，
-    详情页上那行仍然是上一次的 `转写文本 → ECHO 后端` —— 而这一场其实是本机转的。
-    `web/meeting.html` 里那句注释说得对：**"页签说会走 GPU、实际走了本机"这种对不上，
-    比不显示更糟。**
+    反复重转时被覆盖写**的，而这两行只在走能力层时才写。于是"上一次走了 ECHO 后端、
+    这一次没走成"（privacy 改成 none、或后端在计划阶段就用不上）之后，
+    详情页上那行仍然是上一次的 `转写文本 → ECHO 后端` —— 而这一场其实一个字都没转出来。
 
     没走能力层时**不写一个"本机"占位**：面板那块在"没有数据"时是隐藏的，
-    而这台机器为什么退回本机，日志里有那句"配了能力后端，但本场仍走本机引擎 —— 原因：…"。
+    而这台机器为什么没走成，日志里有那句"配了能力后端，但本场一个槽都没落到它上面 —— 原因：…"。
     """
     if cap_plan is not None:
         meta["capability"] = cap_plan
@@ -1141,8 +1046,10 @@ def _first_reason(plan, slot):
     return best.reason if best else "absent"
 
 
-#: 本机装不出分离时用的原因词。选 `absent` 不是随手挑的：它的中文释义就是
-#: "不在位（**本机没装这个能力**）"（`capability_admin.REASON_LABELS`）。
+#: 说话人这一族**没有任何可用后端**时用的原因词。选 `absent` 不是随手挑的：它的中文
+#: 释义就是"不在位（没有任何后端能做这一槽）"（`capability_admin.REASON_LABELS`）。
+#: 2026-09-29 之前它指的是"本机没装 pyannote"；客户端不再承担会议分离之后，
+#: 同样的词指的是"这一槽压根没人干"（本机也不再有这一档）。
 DIARIZE_LOCAL_MISSING_REASON = "absent"
 
 
@@ -1190,16 +1097,17 @@ def _new_run_info(state="", reason=""):
     """本场"到底做了什么 / 在等什么"，写进 `meta.json`（面板据此如实显示）。
 
     为什么要单独记一份（2026-09-29）：`meta["capability"]` 只在**走了能力层**时才写，
-    而走本机那条路的会议**恰好什么都没有** —— 恰恰是那种会议最需要说清两件事：
+    而没有走成的会议**恰好什么都没有** —— 恰恰是那种会议最需要说清两件事：
 
-      * **这一场的文字是本机引擎出的**（会议转写这一槽本步还留着本机回落，下一步才删）。
-        只打一条 warn 日志等于用户看不到，而"配了后端却在啃本机 CPU"是最难查的一种状态；
+      * **这一场的文字是谁出的**（`backend` / `provider`）；两者都不成立时 `state`
+        留空 = **这一场没有转写引擎**（2026-09-29 起客户端进程内不再做会议转写，
+        `_transcribe_impl` 会据此当场失败并说清原因）；
       * **在等后端**（配置里点名了能力后端、那台连不上）。设计里"离线队列 / 分段 pending"
         的设想（`docs/3.0-设计总览与组件关系.md:1086`）**本步不实现** —— 只把状态说出来。
 
-    `state` 取值：`local` / `backend` / `provider`（这一场的文字是谁出的）。
-    `reason` 取值：`waiting-backend` / `not-configured` / `route-unavailable`（为什么退回本机）。
-    `reason` 只有 `state == "local"` 时才有意义 —— 走了后端就不是"退回"。
+    `state` 取值：`backend` / `provider`（这一场的文字是谁出的；空 = 没有转写引擎）。
+    `reason` 取值：`waiting-backend` / `not-configured` / `route-unavailable`（为什么没走成）。
+    `reason` 只有 `state` 为空时才有意义 —— 走了后端就不是"没走成"。
     """
     return {"transcribeEngine": str(state or ""), "fallbackReason": str(reason or "")}
 
@@ -1261,9 +1169,9 @@ class _CapabilitySession(object):
         self.vector_space_id = str(vector_space_id or "")
         #: 这台机器**认不认**一个能力后端（设置里填了地址或配对过）。
         #:
-        #: 为什么要会话带着它（2026-09-29）：分离那一槽**只落在能力后端上**，
-        #: 所以"该不该跑本机引擎"取决于"这到底是不是一台配了后端的机器"：
-        #:   * **没配** → 这台机器本来就这么跑（分离仍在本机，与今天一致）；
+        #: 为什么要会话带着它（2026-09-29）：分离那一槽**只落在能力后端上**
+        #: （客户端进程内不再承担会议分离），于是"没有说话人"有两种，必须分开说：
+        #:   * **没配** → 这台机器本来就没有分离后端，与"等它"无关；
         #:   * **配了但用不上** → 这一场就是没有说话人，并如实说"在等后端"
         #:     （绝不回落本机：那是另一个向量空间，混用会认错人且不报错）。
         #: 默认 `True` 是给"调用方自己拼会话"的既有用法（用例注入 router）留的语义：
@@ -1285,16 +1193,16 @@ class _CapabilitySession(object):
 
         为什么需要这个：会话是**按整场**建的（"有没有槽落在本机以外"），
         而"这段代码走哪条路"是**按槽**定的。只点名了分离的机器上，
-        会话存在、但 `asr.text` 归本机 —— 那时转写必须走原来那段本地代码，
-        而不是把 `asr.text` 交给能力层再失败一次（`router.call` 在没有本机客户端时
-        只会抛 `absent`，整个转写就没了）。
+        会话存在、但 `asr.text` 归本机 —— 那时转写这一槽没人干（本机已经不在候选池里），
+        整场按"没有转写引擎"如实失败并说清原因，而不是把 `asr.text` 交给能力层再失败一次
+        （`router.call` 在没有本机客户端时只会抛 `absent`，报出来的原因离根因更远）。
 
         两种情形，**不要混为一谈**（`docs/能力路由` §5.1 专门把这两种分开）：
 
-          * `"local"` —— 计划**明确**落在本机（用户点名 local；或本机客户端在那儿、
-            默认链转到了它）。这是"他选的主选"，不是降级，日志按 info 记。
+          * `"local"` —— 计划**明确**落在本机（只剩铁律 L3 的唤醒与指令链路会命中）。
+            这是"他选的主选"，不是降级，日志按 info 记。
           * `"empty"` —— 计划里这一槽**谁都干不了**（没有注册的后端能提供它）。
-            会议这边仍然回落到本机那段代码（总比整场空着强），但**必须留一条 warn
+            会议这边**没有任何兜底**（2026-09-29 起），但**必须留一条 warn
             带权威 `reason`** —— 用户会问"我配了后端，这场为什么没有说话人"，
             而答案是 `unsupported` / `blocked`（privacy 挡住）之类的具体原因。
 
@@ -1331,16 +1239,6 @@ class _CapabilitySession(object):
                        % (slot, _first_reason(plan, slot), _skips_brief(plan, slot)))
         return out
 
-    def diarize_slot_is_local(self):
-        """分离这一槽**还该不该在本机跑**：只有"这台机器压根没配能力后端"才行。
-
-        为什么单独一个入口而不是让调用方自己判：这条判据同时被"要不要开会话"与
-        "拿到 `None` 该怎么办"两处用到，各写一遍就会出现
-        "传了 `state` 却没传对 backend_configured"这种**看起来像 bug 的假象**
-        （第一版就是这样：本机兜底静默失效，用例报的是"分离没跑"）。
-        """
-        return not self.backend_configured
-
     def call(self, slot, **kw):
         """按槽调用；成功后把锁推进到这次实际生效的向量空间。
 
@@ -1376,32 +1274,31 @@ def _capability_asr_session(cfg, need_speaker=None, info=None):
     ## 判据：计划里**任何一个会议槽**落到本机以外的后端
 
     早先这条只问 `asr.text`（step 3 只接了转写）。step 4 把分离也接上之后，
-    "只问 asr.text"会漏掉一种真实配置：转写点名用本机、分离点名用 ECHO 后端
-    （台式机有 GPU 转写、但没装 pyannote）。那种机器上，走哪一段代码**按槽分开**：
-    `asr.text` 落本机 → 文本走原来那段本地代码；`diarize.turns` 落后端 → 分离走能力层。
+    "只问 asr.text"会漏掉一种真实配置：转写那一槽没有后端能干、而分离有。
+    那种机器上照样要开会话，否则分离永远接不上后端 —— 而转写那一槽空着的后果
+    由 `_transcribe_impl` 按"这一场没有转写引擎"如实收口（2026-09-29 起客户端
+    进程内不再做会议转写，本机不再是任何一槽的兜底）。
 
     `need_speaker` 是**遗留参数**：3.0 起 `speaker.embed` 与 `diarize.turns` 一样是
     必备槽（会议标配三件），判据不再需要它。留着只是为了不悄悄改掉一个被用例引用的
     签名 —— 传什么都不影响结果。
 
-    为什么不是"永远走路由器"：那会要求本机后端与原来那段代码**逐字节等价**，
-    而那段代码包含 SenseVoice 文本 + whisper 骨架的对齐、qwen3asr 的原生句子、
-    whisper 的 segments、以及各自的空结果留痕 —— 一次性替换它风险太高，
-    收益也只是"代码好看一点"。**先把远端这条路打通**，本地那条等它被证明可靠再收。
-
-    **没配后端（也没配对）时行为逐字不变**：所有槽都落到本机 → 返回 None →
-    `_transcribe_impl` 走原来那段本地代码。
+    **没配后端（也没配对）时返回 None**：所有槽都落到"没人干" → 返回 None →
+    `_transcribe_impl` 按"这一场没有转写引擎"当场失败并说清原因（原来那里会走
+    本机引擎，那条路 2026-09-29 已删）。
 
     ## `info`（可选出参，2026-09-29）
 
     返回 None 有**两种含义完全不同的情形**，而调用方必须分得清：
 
-      * 没配后端（也没配对）→ 这台机器本来就这么跑；
-      * **配了后端但那台连不上/用不上** → 这一场是在**等后端**，必须显示成"在等"。
+      * 没配后端（也没配对）→ 这台机器本来就没有后端（`not-configured`）；
+      * **配了后端但那台连不上/用不上**（或路由根本起不来）→ 这一场是在**等后端**
+        （`waiting-backend` / `route-unavailable`），必须显示成"在等"。
 
     所以可选的 `info` 字典会被填上 `{"state": ..., "reason": ...}`（形状见
-    `_new_run_info`）：`state` 是这一场文字将来由谁出（`local`/`backend`/`provider`），
-    `reason` 是"为什么退回本机"（`waiting-backend`/`not-configured`/`route-unavailable`）。
+    `_new_run_info`）：`state` 是这一场文字将来由谁出（`backend`/`provider`，
+    两者都不成立时留空 = 这一场没有转写引擎），`reason` 是"为什么没走成它"
+    （`waiting-backend`/`not-configured`/`route-unavailable`）。
     **刻意用出参而不是改返回值**：这个函数被十几条既有用例按"返回 session 或 None"调用，
     改返回值会让它们全体变成"在验另一件事"，而这一步要收的是语义、不是签名。
     """
@@ -1409,7 +1306,7 @@ def _capability_asr_session(cfg, need_speaker=None, info=None):
         if isinstance(info, dict):
             info.update(_new_run_info(state, reason))
 
-    _fill("local", "not-configured")
+    _fill("", "not-configured")
     #: 这台机器**认不认**一个能力后端（设置里填了地址或配对过）—— 与"连得上吗"无关。
     #: 会议那边要拿它决定"分离这一槽该不该走本机引擎"（见循环里那段），
     #: 所以与 `run_info` 一起从**这里**给出来，而不是让两个地方各问一次 `configured()`。
@@ -1436,45 +1333,46 @@ def _capability_asr_session(cfg, need_speaker=None, info=None):
         live = [(s, plan.backend_for(s)) for s in session.slots]
         if not any(bid and bid != "local" for _s, bid in live):
             # 配了后端但这一轮用不上 —— **要说清楚为什么**，否则用户以为它在用后端，
-            # 实际在啃本机 CPU，而现象只是"转写很慢"（本机那条路的日志一切正常）。
+            # 实际什么都不会发生（这一场既不转写也不分离），而现象只是"没反应"。
             # 最常见的两种：后端地址配了但连不上（capabilities 拉不回来 → 不支持任何槽）、
             # 或者 privacy 设成了 none。
             #
             # 判据是 `echo_server.configured()`（设置里填了地址**或配对过**），不是只看设置：
             # "只配对、什么都没配"从 §2.7 起就是能用状态，只看设置的话那台机器掉了后端
-            # 会一声不响地退回本机 —— 而"不声不响"恰恰是这条告警要防的那件事。
+            # 会一声不响地什么都不做 —— 而"不声不响"恰恰是这条告警要防的那件事。
             if _configured:
                 why = "；".join("%s=%s[%s]" % (s, b or "-", _skips_brief(plan, s))
                                 for s, b in live)
                 db.add_log("warn", "capability",
-                           "配了能力后端，但本场仍走本机引擎 —— 原因：%s" % why)
-                # 分离这一条单独吼一声：`asr.text` 有本机兜底（走原来那段代码），
-                # 而 `diarize.turns` **没有**（§5.1）—— 用户以为配了就会有说话人，
-                # 实际这一场一个说话人标签都不会有，而表现只是"分离没生效"。
+                           "配了能力后端，但本场一个槽都没落到它上面 —— 原因：%s" % why)
+                # 分离这一条单独吼一声：`diarize.turns` **没有**本机兜底（§5.1）——
+                # 用户以为配了就会有说话人，实际这一场一个说话人标签都不会有，
+                # 而表现只是"分离没生效"。
                 if "diarize.turns" in session.slots:
                     db.add_log("warn", "capability",
                                "本场不会标说话人：说话人分离没有本机兜底（设计 §5.1），"
                                "而 %s" % _skips_brief(plan, "diarize.turns"))
                 # **在等后端**：配了、但这一轮一个槽都没落到它上面。
                 # 只记状态，不排队重试（那是另一件事，见设计 §1086 那句"离线队列/pending"）。
-                _fill("local", "waiting-backend")
+                _fill("", "waiting-backend")
             return None
         who = "，".join("%s→%s" % (s, b) for s, b in live if b) or "（没有槽被选中）"
         db.add_log("info", "capability",
                    "本场会议走能力后端：%s%s" % (
                        who, "（向量空间 %s）" % plan.vector_space_id
                        if plan.vector_space_id else ""))
-        # 走得了能力层，但**转写那一槽可能仍归本机**（分离走后端、转写走本机那种配置，
-        # 见 `local_slots()`）。那时这一场的文字还是本机出的，面板要说得出这件事。
+        # 走得了能力层，但**转写那一槽可能仍没人干**（只有分离有后端那种配置，
+        # 见 `local_slots()`）。那时这一场的文字转不出来，`_transcribe_impl`
+        # 按"这一场没有转写引擎"收口 —— 这里只把 `state` 如实填成空。
         #
         # 这里**不写 `fallbackReason`**：这一轮不是"从后端退回本机"，而是"后端在、
         # 只是转写这一槽没派给它"。真正的"在等后端"只有上面那条分支（一个槽都没落到
         # 后端上）才算 —— 两种情形在面板上必须是两句不同的话。
-        _fill("local" if session.local_slots().get("asr.text") else "backend")
+        _fill("" if session.local_slots().get("asr.text") else "backend")
         return session
     except Exception as e:
-        db.add_log("warn", "capability", f"能力路由不可用，本场回落本地引擎：{e}")
-        _fill("local", "route-unavailable")
+        db.add_log("warn", "capability", f"能力路由不可用，本场没有转写/分离后端：{e}")
+        _fill("", "route-unavailable")
         return None
 
 
@@ -1526,9 +1424,9 @@ def _capability_segment_rows(cap, seg_path, cfg, seg_idx, seg_min, cap_kinds):
 
 
 def _normalize_diarize(result):
-    """把能力层的 `DiarizeResult` 归一成 `diarize_wav_full()` 的形状。
+    """把能力层的 `DiarizeResult` 归一成会议这边落库要的 `(turns, embs, labels)` 形状。
 
-    返回 `(turns, embs, labels)`：
+    **形状与已退役的本机 `diarize_wav_full()` 逐字一致**（那正是当年敢接后端的前提）：
       * `turns`  —— `[(start, end, 局部标签), …]`（与 pyannote 同形）
       * `embs`   —— `(n, dim)` float32，**numpy 数组**（`SpeakerRegistry` 与
                     `voiceprint.identify` 直接对它做 `np.stack` / 索引）
@@ -1539,7 +1437,8 @@ def _normalize_diarize(result):
 
     ① **局部标签不一定是 `SPEAKER_xx`。** 契约只保证"这个字符串在本次响应内标识一个
        说话人"（`base.DiarizeResult` 的注释就是这么写的）。所以这里不解析、不改写标签，
-       原样交给 `SpeakerRegistry` —— 它只把标签当字典的键，显示名（`说话人N`）由它自己出。
+       原样交给调用方 —— 有嵌入时走 `SpeakerRegistry`（它只把标签当字典的键，
+       显示名由它自己出），没嵌入时走 `_labels_from_turns`（按后端编号出显示名）。
 
     ② **嵌入可能是稀疏的。** `speakers` 与 `labels` 是两条信息，只有"对得上"时
        第 i 个嵌入才属于第 i 个标签。这里**按标签取嵌入**（`speakers[k]`），
@@ -1587,31 +1486,33 @@ def _labels_from_turns(turns):
 def _capability_diarize_segment(cap, seg_path, state=None):
     """一段音频走能力层的 `diarize.turns` → `(turns, embs, labels, plan_dict)`。
 
-    形状与 `diarize_wav_full()` **逐字对齐**（见 `_normalize_diarize`）—— 会议那边
-    落库/合并/声纹识别那几段代码**一行都不用改**，这正是 step 4 敢接的前提。
+    形状与已退役的本机 `diarize_wav_full()` **逐字对齐**（见 `_normalize_diarize`）——
+    会议那边落库/合并/声纹识别那几段代码**一行都不用改**，这正是 step 4 敢接的前提。
 
     ## `None` 只有一个意思：**这一段没有说话人**
 
-    2026-09-29（用户拍板）：**分离这一槽不再回落本机**。以前返回 `None` 时调用方会去跑
-    `diarize_wav_full`，那是一条会**静默降级到另一种向量空间**的路 —— 本机与后端是两个
-    空间，混用会认错人且不报错。现在 `None` 一律表示"没做成"，原因写进 `state`
+    2026-09-29（用户拍板）：**分离这一槽只落在能力后端上**（客户端进程内那份 pyannote
+    不再承担会议分离）。所以 `None` 一律表示"没做成"，原因写进 `state`
     （`_note_diarize_missing`），面板据实显示「说话人分离未执行：<原因>」。
 
-    四种返回，**全都不再回落本机**：
+    四种返回，**全都不回落本机**：
 
       * 这一槽**压根不在会话里** → 全 `None`；
-      * 计划把 `diarize.turns` 判成没人能干 / 只归本机 → 全 `None`
+      * 计划把 `diarize.turns` 判成没人能干 → 全 `None`
         （把那一条的**权威原因**记进 `state`）；
       * 能力层这一槽失败 → 全 `None`（+ 一条带 `reason`/`code` 的 warn），**不冒充**成功；
       * 拿到结果 → `(turns, embs, labels, plan.as_dict())`。
 
-    "回不回落本机"由**调用方**决定，判据是 `cap.backend_configured`：
+    ## 两种"没有说话人"必须说成两句不同的话
 
-      * **没配能力后端**（`False`）→ 这台机器本来就这么跑，调用方走本机引擎
-        （那是"它本来就这么配的"，不是从后端降级下来）；
-      * **配了**（`True`）→ 拿到 `None` 就是**这一场没有说话人**：原因已经写进 `state`，
-        面板显示那句硬契约文案。**绝不回落本机**（另一个向量空间 = 认错人且不报错），
-        也**绝不补一列空说话人**。
+    由 `cap.backend_configured` 区分（见 `_note_diarize_missing` 的 `waiting`）：
+
+      * **没配能力后端** → 这台机器本来就没有分离后端，与"等它"无关
+        （`waiting=False`）；
+      * **配了却用不上** → 这一场是在**等后端**（`waiting=True`）。
+
+    两种都**绝不回落本机**（另一个向量空间 = 认错人且不报错），
+    也**绝不补一列空说话人**。
 
     `state` 是可选的"这场为什么没有说话人"记录（见 `_note_diarize_missing`）：
     调用方拿着它写进 `meta.json`，会议详情据此显示那句硬契约文案。
@@ -1626,19 +1527,19 @@ def _capability_diarize_segment(cap, seg_path, state=None):
         return None, None, None, None
     local = cap.local_slots()
     if "diarize.turns" in local:
-        # 这一槽的活不归能力层（计划明确判给本机，或这一槽谁都干不了）。
+        # 这一槽的活不归能力层（这一槽谁都干不了 —— 本机已经不在默认链上）。
         #
         # **这里刻意不写 warn**：那句话说一次就够（`note_local_and_empty()` 在开会话时
         # 已经说过了，带权威 reason），8 段会议连说 8 遍只会把日志淹掉。
         #
-        # 但**必须把原因记进 `state`**：调用方以前拿"返回值是 None"当"去跑本机引擎"
-        # 的信号，现在它就是"这段没有说话人"的结论本身。
-        if state is not None and cap.backend_configured:
+        # 但**必须把原因记进 `state`**：`None` 就是"这段没有说话人"的结论本身，
+        # 而面板那句硬契约要带上真原因（不给原因就会显示成"原因未记录"）。
+        if state is not None:
             # 配了后端的机器上"这一槽没人干" = 在等后端（不是"这台做不到"）——
             # 这两个结论在面板上必须是两句不同的话（见 `_note_diarize_missing`）。
             _note_diarize_missing(state, _first_reason(plan, "diarize.turns"),
                                   _skips_brief(plan, "diarize.turns"),
-                                  waiting=True)
+                                  waiting=bool(cap.backend_configured))
         return None, None, None, None
     try:
         res, done_plan = cap.call("diarize.turns", wav=seg_path)
@@ -1698,96 +1599,6 @@ def _merge_capability_plans(*plans):
     return out
 
 
-def _skeleton_model(cfg, meeting_name=""):
-    """**尽量**给一个 whisper 模型来做时间骨架；拿不到就返回 `None`（如实降级）。
-
-    骨架是 SenseVoice 那条路做句级对齐用的（qwen3asr 只是它原生句子缺失时的兜底）。
-    2026-09-26 起本机不再有 whisper 权重（新分工：指令=sherpa/SenseVoice、会议=qwen3asr），
-    所以这里**必须允许失败**，而且失败要是"安静的降级 + 一条日志"：
-
-      * 不去触发一次联网下载（`stt._get_whisper` 在本地目录缺失时会退回按模型名加载，
-        那会去 HuggingFace 拉权重 —— 用户没要求过这件事）；
-      * 不让整场转写因为"借不到骨架"而崩 —— 拼装层要不到骨架就按字数均摊，
-        档位如实标 `estimated`（详情页会写「估算」）。
-    """
-    try:
-        return stt_mod._get_whisper("small", cfg.get("sttDevice", "auto"))
-    except Exception as e:
-        db.add_log("warn", "meeting",
-                   "%s 借不到 whisper 时间骨架（本机已不带 whisper 权重），"
-                   "本场时间轴按字数估算；要精确时间戳请把会议引擎设为 qwen3asr：%s"
-                   % (meeting_name or "本场", e))
-        return None
-
-
-def _fallback_sv_rows(sv, wmodel, seg_path, seg_idx, seg_min, cfg, cap_kinds=None):
-    """回退路径：whisper 时间戳骨架 + SenseVoice 文本字符级对齐切句（保留句级时间戳）。
-
-    对齐那一步的实现已搬到 `app.capabilities.assemble`（设计 §4.4：拼装规则只写一份）。
-    这里保留原有的"三段兜底"顺序 —— 骨架 + 文本 → 骨架 → 整段一行 ——
-    但**交给拼装层统一判**，并把精度档位带出来（见 `_transcribe_impl` 里写进 meta 的那处）。
-
-    `wmodel` 允许是 `None`：那表示"骨架**按需**借" —— 只有主路真的没给出句子时才去加载
-    （本机已不带 whisper 权重，见 `_skeleton_model`）。借不到就当没有骨架，拼装层按字数
-    均摊、档位如实标 `estimated`。
-
-    `cap_kinds` 就地累加档位计数（与 `_sherpa_rows` / 能力层那条路同一个形状）：
-    本机 SenseVoice 这条路**也**要如实记档位，否则"骨架借不到 → 时间轴变糙"在详情页上
-    完全看不出来（用户只会觉得时间点莫名其妙）。
-    """
-    from app.capabilities import assemble
-    wsegs = []
-    try:
-        if wmodel is None:
-            wmodel = _skeleton_model(cfg)
-            if wmodel is None:
-                raise RuntimeError("本机没有可用的 whisper 权重（骨架不可用）")
-        out, _info = stt_mod.transcribe_whisper(wmodel, seg_path, cfg.get("sttLanguage", "zh"))
-        wsegs = [(s.start, s.end, s.text.strip()) for s in out]
-    except Exception as e:
-        print("whisper 时间戳骨架不可用（按字数估算时间轴）:", e, file=sys.stderr)
-    sv_text = ""
-    try:
-        res = sv.generate(input=seg_path, cache={}, language="auto", use_itn=True, batch_size_s=60)
-        if res:
-            sv_text = re.sub(r"<\|[^|]*\|>", "", res[0].get("text", "") or "").strip()
-    except Exception as e:
-        print("SenseVoice 转写失败:", e, file=sys.stderr)
-    got = assemble.assemble(text=sv_text, skeleton=wsegs, seg_seconds=seg_min * 60.0)
-    if cap_kinds is not None:
-        # 档位如实记：有骨架 → aligned；没有 → estimated。**不记就是让用户瞎猜**。
-        cap_kinds[got.timestamps] = cap_kinds.get(got.timestamps, 0) + 1
-    return [(seg_idx, st, en, txt) for st, en, txt in got.sentences]
-
-
-def _sherpa_rows(seg_path, seg_idx, seg_min, cfg, cap_kinds):
-    """sherpa 整段转写 → 逐句行；返回 `(rows, why)`（`why` 非空 = 这段没转出东西的原因）。
-
-    为什么这么短：sherpa 的整文件转写路径**本来就有**（`stt.transcribe_ex(engine="sherpa")`，
-    它区分 ok/empty/error/missing），会议这边缺的只是"调它 + 把整段文本拼成逐句时间"。
-
-    为什么**不去借 whisper 时间骨架**（SenseVoice 那条路借了）：骨架要 `_get_whisper("small")`，
-    而 sherpa 恰恰是"这台机器上没装 whisper/funasr"时的引擎（安装器给只装 sherpa 的默认档
-    写的就是它）—— 在那台机器上骨架必然拿不到。借了的话，同一份设置在不同机器上会给出
-    不同的时间轴档位（`aligned` vs `estimated`），而档位是要如实进 `meta.json`、上详情的。
-    所以这里固定走"按字数均摊"，档位 `estimated` —— 与 provider 转写、以及 SenseVoice
-    拿不到骨架时**同一个机制**（`assemble.assemble`），不另写一套。
-
-    `cap_kinds` 是就地累加的档位计数（`{exact: 3, estimated: 1}`），最终写进 `meta.json`。
-    """
-    from app.capabilities import assemble
-    out = stt_mod.transcribe_ex(seg_path, engine="sherpa",
-                               lang=cfg.get("sttLanguage", "zh"))
-    text = str(out.get("text") or "").strip()
-    if not text:
-        # `detail` 是引擎自己说的话（缺依赖 / 模型没就位…），优先用它 —— 只写"空结果"
-        # 会把"这段没人说话"和"sherpa 根本没装上"又混成一样，那正是要修掉的病。
-        return [], str(out.get("detail") or out.get("status") or "sherpa 返回空结果")
-    got = assemble.assemble(text=text, seg_seconds=_wav_seconds(seg_path) or seg_min * 60.0)
-    cap_kinds[got.timestamps] = cap_kinds.get(got.timestamps, 0) + 1
-    return [(seg_idx, st, en, txt) for st, en, txt in got.sentences], ""
-
-
 def _active_asr_provider():
     """会议转写是否走 provider（P5）。**只有用户显式配了 `providerAsr` 才返回实例**。
 
@@ -1813,8 +1624,8 @@ def _split_provider_text(text, seg_dur):
     拼装规则只写一份）。这里留成薄壳，因为它是被用例钉住的既有接口
     （`tests/test_asr_provider.py` 四条）—— 换实现不改契约。
 
-    为什么要搬：同一个"整段文本怎么变成逐句时间"的问题，本地引擎那条路
-    （`_fallback_sv_rows`）也有一份自己的做法。两份各自演化就会出现
+    为什么要搬：同一个"整段文本怎么变成逐句时间"的问题，已退役的本机引擎那条路
+    （原来的 `_fallback_sv_rows`）也有一份自己的做法。两份各自演化就会出现
     "同一场会议里，A 段时间轴一个精度、B 段另一个精度，而面板上看不出区别"。
     """
     from app.capabilities import assemble
@@ -1823,10 +1634,11 @@ def _split_provider_text(text, seg_dur):
 
 def _transcribe_impl(folder):
     meta = _load_json(os.path.join(folder, "meta.json"), {})
-    # 重新转写用「当前设置」，meta.json 快照仅作兜底（录音时的配置可能已过期）
+    # 重新转写用「当前设置」，meta.json 快照仅作兜底（录音时的配置可能已过期）。
+    # `meetingSttModel` 已废弃（2026-09-29，会议转写不在客户端进程内跑），所以这里
+    # **没有** "本机引擎"那一项 —— 转写走哪条路由能力路由按槽决定。
     mcfg = meta.get("config", {}) or {}
     cfg = {
-        "sttModel": settings.get("meetingSttModel", mcfg.get("sttModel", "small")),
         "sttDevice": settings.get("device", mcfg.get("sttDevice", "auto")),
         "sttLanguage": settings.get("sttLanguage", mcfg.get("sttLanguage", "zh")),
         "segmentMinutes": int(settings.get("meetingSegmentMinutes",
@@ -1851,9 +1663,9 @@ def _transcribe_impl(folder):
             reason = "这场会没有音频分段，无法转写（录音目录里没有 0*.wav / 0*.flac）"
             _mark_meeting_error(meeting["id"], reason)
             db.add_log("error", "meeting", f"{reason}：{meeting_name}")
-        return
+        return "error"
     if not meeting:
-        return
+        return ""
     meeting_id = meeting["id"]
     db.clear_meeting_lines(meeting_id)
     db.update_meeting(meeting_id, status="transcribing", error="")
@@ -1866,7 +1678,7 @@ def _transcribe_impl(folder):
     # 段号 → 盘上**实际存在**的音频文件：历史音频压成 FLAC 之后这里给的是 `.flac`。
     # 为什么一次算好、后面各处都用它：
     #   * 播放那一路（`api.meeting_audio`）按同一个规则找文件（`audiofile.resolve_segment`）；
-    #   * 分离（`diarize_wav_full`）、能力后端（`wav=seg_path`）拿到的必须**能读**；
+    #   * 能力后端（`wav=seg_path`）拿到的必须**能读**；
     #   * 时间轴的 `audio_seconds()` 也要认 flac（`_wav_seconds` 已经是它了）。
     seg_paths = _resolve_seg_paths(folder, segs)
     segs = sorted(seg_paths, key=lambda n: int(str(n).split(".")[0]))
@@ -1875,24 +1687,20 @@ def _transcribe_impl(folder):
     db_rows = []
     speaker_names = {}
     seg_min = int(cfg.get("segmentMinutes", 10))
-    # **分离是必备环节**（不是开关）—— 这里只有"这台机器的分离模块能不能 import"这一档
-    # 真正的可用性判断：本机装不出分离时如实记原因（absent = 本机没装这个能力），
-    # 整场转写照常出文字，但绝不让它看起来"像正常一样没有说话人"。
+    # **分离是必备环节**（不是开关）。2026-09-29（用户拍板）起，客户端进程内**不再**
+    # 跑会议分离 —— 说话人这一族只落在能力后端上；所以这里没有再要"本机模块能不能
+    # import"这一档：做不到就是做不到，原因由 `_capability_diarize_segment` /
+    # 下面那段"这一场没有能力后端"如实写进 `da_state`，面板显示
+    # 「说话人分离未执行：<真原因>」，绝不让它看起来"像正常一样没有说话人"。
+    #: 恒为真（只剩"要不要走这一步代码"的意思）；留着是因为它同时出现在
+    #: 落库前的最后一句结论与声纹留存两处，去掉会让那两处看起来像"可以关掉"。
     diarize = True
     da_state = _new_diarize_state()
-
+    #: 本场说话人的**显示名注册表**。**只有后端给了嵌入才建**（2026-09-29）：
+    #: `SpeakerRegistry` 的用途是"把不同段的标签缝成同一个人"，那需要向量；而后端
+    #: 只给时间轴、不给嵌入时（在线转写就是这种）走 `_labels_from_turns`，不经过它。
+    #: 惰性建还有一个好处：一场没有说话人的会议不会平白 import 本机分离栈。
     registry = None
-    try:
-        # 这里仍然要 import，因为**本机分离那条路**（没配后端，或用户点名本机）继续用它：
-        # 能力层只是"有后端时"的另一条缝，不是替换（见 `_capability_diarize_segment`）。
-        # `diarize_wav_full` 本身在下面按需导入（step 4 起它不再无条件执行）。
-        from app.audio.diarize import SpeakerRegistry
-        registry = SpeakerRegistry()
-    except Exception as e:
-        print("说话人分离模块不可用，跳过:", e, file=sys.stderr)
-        diarize = False
-        _note_diarize_missing(da_state, DIARIZE_LOCAL_MISSING_REASON,
-                              "本机没有可用的说话人分离模块（%s）" % e)
 
     # 声纹识别（常用联系人，issue #6）：库里已有联系人样本时启用。
     # vp_names 整场累计「说话人N → 联系人名」（取相似度最高的一次），
@@ -1906,26 +1714,16 @@ def _transcribe_impl(folder):
     # 声纹识别是**标配**（2026-09-26 概念纠正）：不再有"识别开关"。库里没有联系人时
     # `load_matcher()` 返回 None —— 那时静默无结果，零副作用（见 app/voiceprint.py）。
     # 需要用户决定的只有"要不要**入库**"（`voiceprintAutoEnroll`，默认关）。
-    if diarize:
-        try:
-            from app import voiceprint
-            vp_matcher = voiceprint.load_matcher()
-            if vp_matcher:
-                db.add_log("debug", "voiceprint",
-                           f"{meeting_name}：声纹库已加载"
-                           f"（{db.count_voiceprint_contacts()} 位联系人）")
-        except Exception as e:
-            db.add_log("warn", "voiceprint", f"声纹库不可用，跳过自动识别：{e}")
+    try:
+        from app import voiceprint
+        vp_matcher = voiceprint.load_matcher()
+        if vp_matcher:
+            db.add_log("debug", "voiceprint",
+                       f"{meeting_name}：声纹库已加载"
+                       f"（{db.count_voiceprint_contacts()} 位联系人）")
+    except Exception as e:
+        db.add_log("warn", "voiceprint", f"声纹库不可用，跳过自动识别：{e}")
 
-    # 本机引擎分派。**先解析、先判能不能驱动，再加载模型** —— 顺序本身就是这条修复的
-    # 一半：驱动不了的引擎必须在任何模型被加载之前就响亮失败（见 resolve_meeting_engine）。
-    #   文本优先引擎（SenseVoice / Qwen3-ASR）：Qwen3-ASR 用 ForcedAligner 原生句子+时间戳；
-    #   SenseVoice 用 whisper 时间戳骨架 + 字符级对齐切句（保留句级时间戳）；
-    #   sherpa 只给整段文本（无句级时间戳）→ 按字数均摊，档位 `estimated`。
-    eng = ""               # 本场真正驱动的本机引擎（provider / 能力后端那条路用不到）
-    eng_model = ""
-    wmodel = None
-    sv = None
     asr_provider = _active_asr_provider()          # P5：显式配了 providerAsr 才走在线/外部转写
     # 3.0 能力后端：**只有计划里至少一个会议槽落在本机以外**时才不是 None（见
     # `_capability_asr_session` 的判据）。与 providerAsr 的分工：providerAsr 是
@@ -1936,24 +1734,27 @@ def _transcribe_impl(folder):
     # `diarize.turns` 一样恒在计划里（会议标配三件）。所以这里不再传它 —— 留着那个
     # 形参只为不悄悄改掉一个被用例引用的签名；传什么都不影响判据。
     #
-    # `run_info` 是 2026-09-29 加的一小份"这一场到底做了什么/在等什么"：走本机那条路的
-    # 会议**没有** `capability` 计划，恰恰是它最需要说清"文字是本机出的""在等后端"
-    # （见 `_new_run_info`）。由 `_capability_asr_session(info=...)` 填前两格。
+    # `run_info` 是"这一场到底做了什么/在等什么"（见 `_new_run_info`）：
+    # **这场会到底能不能转**、以及"没做成是为什么"都要说得出来。
+    # 由 `_capability_asr_session(info=...)` 填前两格。
     run_info = _new_run_info()
-    cap_session = (None if asr_provider is not None
-                   else _capability_asr_session(cfg, info=run_info))
-    # 会话是**按整场**建的（"有没有槽落在本机以外"），而"这段代码走哪条路"要**按槽**定：
-    #   * `asr.text` 归本机（这一槽没有可用后端）→ 文本走原来那段本地代码；
-    #     **`diarize.turns` 仍可能走后端** —— 正是"台式机自己转写、分离发给 GPU"那种配置。
-    #   * 反过来，转写走后端而分离归本机也一样（那种机器上分离这一槽**如实说没做**）。
-    # 不这么分的话，只配了分离的机器上会拿 `asr.text` 去问一个没有本机客户端的路由，
-    # 结果是一条 `absent` 错误、**整场转写一行都没有**。
-    #
-    # `note_local_and_empty()` 就在这个岔口上说一句话：哪些槽不归能力层、为什么
-    # （空槽带权威 reason）。整场只在这里说一次。
+    #: 会话**与 provider 无关**，永远建一次（2026-09-29 修）：
+    #: 它管的是 `diarize.turns` / `speaker.embed` —— **说话人那一族只走能力层**，
+    #: 而 `providerAsr` 那条路从前把会话跳过去了（`None if provider is not None`），
+    #: 结果是"配了在线转写服务"的机器**一场都不会标说话人**（而且原因只写成
+    #: "本场没有说话人"，看不出是被跳过的）。文字仍然由 provider 出（见循环里的分支），
+    #: 会话只负责把分离那一槽接上。
+    cap_session = _capability_asr_session(cfg, info=run_info)
+    # 会话是**按整场**建的（"有没有槽落在本机以外"）。`note_local_and_empty()` 在这个
+    # 岔口上说一句话：哪些槽不归能力层、为什么（空槽带权威 reason）。整场只在这里说一次。
     cap_local = (cap_session.note_local_and_empty() if cap_session is not None
                  else {})
-    asr_is_local = cap_session is None or "asr.text" in cap_local
+    #: `asr.text` 这一槽**这一次有没有落到本机以外**。2026-09-29 起客户端进程内不再
+    #: 有会议转写引擎，所以"归本机"只可能是**这一槽没人干**（候选池空）——
+    #: 那不是一个可以继续往下走的岔路，而是"这场转不出文字"，下面按失败如实收口。
+    #: **provider 那条路不算"本机"**：文字另有出处（见下面 `run_info` 的填法）。
+    asr_is_local = (asr_provider is None
+                    and (cap_session is None or "asr.text" in cap_local))
     #: 这台机器**认不认**一个能力后端（设置里填了地址或配对过）—— 由 `_capability_asr_session`
     #: 顺手填进 `run_info`（那里本来就要问一次 `configured()`）。
     #: 分离那一槽要拿它区分两种"没有说话人"：**配了后端但用不上**（在等后端）与
@@ -1966,70 +1767,63 @@ def _transcribe_impl(folder):
     if echo_backend_configured:
         da_state["waiting"] = True
     # 本场文字的出处（写进 meta，面板据此如实显示）：
-    #   provider 那条路**本来是显式配的**，不算回落；能力后端与本地引擎两条要分清 ——
-    #   后者正是"配了后端却在啃本机 CPU"，本步（暂时还留着回落）必须让用户看得见。
+    #   provider 那条路**本来是显式配的**，不算回落；
+    #   能力后端那条路正常；
+    #   两者都没走成 = **这一场没有转写引擎**（下面按失败收口）。
     if asr_provider is not None:
         run_info.update(_new_run_info("provider"))
     elif asr_is_local:
-        run_info["transcribeEngine"] = "local"
+        #: `transcribeEngine` 留空：**不是**"本机引擎转的"（客户端已经不做会议转写了），
+        #: 而是"这一场压根没有可用的转写引擎"。`fallbackReason` 说明为什么
+        #: （`not-configured` / `waiting-backend` / `route-unavailable`），
+        #: 面板把它显示成「等待能力后端」或「没配能力后端」。
+        run_info["transcribeEngine"] = ""
     else:
         run_info.update(_new_run_info("backend"))
-    if asr_is_local and echo_backend_configured:
-        # 日志里也明说一句：面板上那句"本场转写由本机引擎完成"（`meta.json` 的
-        # `transcribeEngine=local`）在排障时要能和日志对上。本步**暂时保留**这条本机
-        # 回落（下一步删），所以更要让"它真的回落了"处处留痕，而不是只在面板上。
-        db.add_log("warn", "meeting",
-                   "%s：本场转写由**本机引擎**完成（原因 %s）—— 配了能力后端却没走成它"
-                   % (meeting_name, run_info.get("fallbackReason") or "未记录"))
+    #: 这一场能不能真的转出文字：provider 显式配了，或 `asr.text` 落到了能力后端。
+    #: 都不是就**当场失败并说清原因** —— 这是"删掉本机路径"之后唯一诚实的收尾方式
+    #: （原来这里会静默走本机引擎，用户看不出任何区别）。
+    can_transcribe = asr_provider is not None or not asr_is_local
+    if not can_transcribe:
+        why = run_info.get("fallbackReason") or "not-configured"
+        from app import capability_admin as _cap_admin
+        reason = "这一场没有转写引擎：%s。可执行的下一步二选一：" \
+                 "① 到 设置 → 会议 把「会议转写走哪条路」设为「ECHO 后端」并配对那台机器；" \
+                 "② 到 设置 → 能力 配一个在线转写服务商。" \
+                 "这一场**没有开始转写**，原样重试也不会成功。" \
+                 % _cap_admin.TRANSCRIBE_FALLBACK_LABELS.get(why, why)
+        # 分离这一档也要留下结论：**这一场没有说话人，而且说得出为什么**。
+        #
+        # 会话压根没开成时（没配后端 / 路由起不来）上面那个循环一次都不会跑，
+        # 也就没人去调 `_capability_diarize_segment` —— 那样 `da_state` 会停在
+        # "没有原因"上，面板那句硬契约退化成「说话人分离未执行：原因未记录」。
+        # 权威词由这里定：两种情形的落点都是"没有任何后端能做这一槽"（`absent`）。
+        _note_diarize_missing(
+            da_state, DIARIZE_LOCAL_MISSING_REASON,
+            "没有可用的说话人分离后端（%s）"
+            % _cap_admin.TRANSCRIBE_FALLBACK_LABELS.get(why, why))
+        db.add_log("error", "meeting", f"{meeting_name} 无法开始转写：{reason}")
+        _mark_meeting_error(meeting_id, reason,
+                            duration_seconds=meta.get("durationSeconds", 0),
+                            segments=len(segs))
+        _clear_progress(meeting_id)
+        services.report_meeting("error", f"转写失败 {meeting_name}")
+        tts_mod.play_beep("err")
+        # 如实留下"这一场为什么没有说话人"（面板那句硬契约的出口），再收工。
+        _apply_run_meta(meta, run_info, da_state)
+        try:
+            with open(os.path.join(folder, "meta.json"), "w", encoding="utf-8") as f:
+                json.dump(meta, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            db.add_log("warn", "meeting", f"写 meta.json 失败（不影响转写结果）：{e}")
+        return
     if asr_provider is not None:
         # 走 provider 时**不加载本地引擎**（省显存/省时间；也正是"没有 GPU 也能转写"的意义）
         db.add_log("info", "meeting", "本场转写走 provider（不加载本地模型）：%s"
                    % _asr_provider_id())
-    elif not asr_is_local:
-        # 走远端能力后端时**同样不加载本地引擎** —— 这正是"办公本没有 GPU 也能转写"的意义。
-        # 引擎留给"远端失败时回落本地"那条路按需加载（见循环里的兜底）。
-        db.add_log("info", "meeting", "本场转写走能力后端（不加载本地模型）")
     else:
-        eng, eng_model, eng_problem = resolve_meeting_engine(cfg.get("sttModel"))
-        if eng_problem:
-            # ① 驱动不了的引擎当场说清楚，绝不静默 ——
-            # **此刻一个模型都还没加载**，库里留的是原因，不是"转写失败"四个字。
-            db.add_log("error", "meeting",
-                       f"{meeting_name} 无法开始转写：{eng_problem}")
-            _mark_meeting_error(meeting_id, eng_problem,
-                                duration_seconds=meta.get("durationSeconds", 0),
-                                segments=len(segs))
-            _clear_progress(meeting_id)
-            _boot_meeting_stt("failed", eng_problem[:200])
-            services.report_meeting("error", f"转写失败 {meeting_name}")
-            tts_mod.play_beep("err")
-            # 抛出去，别让上层以为"跑完了"（否则紧跟一句"转写完成" + 成功提示音）。
-            raise MeetingEngineRefused(eng_problem)
-        if cap_session is not None:
-            db.add_log("info", "meeting",
-                       "本场转写按计划走本机（分离那一槽才走后端）")
-        if eng == "sensevoice":
-            # 文本用 SenseVoice；时间骨架**按需**借（`wmodel=None` → `_fallback_sv_rows` 里
-            # 才去加载，见 `_skeleton_model`）——whisper 权重已从本机删除，
-            # 不该在每场会开始时就去戳一次 HuggingFace。
-            wmodel = None
-            sv = stt_mod._get_sensevoice(cfg.get("sttDevice", "auto"))
-        elif eng == "qwen3asr":
-            # qwen3asr 的原生句子（ForcedAligner）是主路；whisper 骨架只是它没给句子时的
-            # 兜底 —— 同样**按需**借，借不到就按字数估算（见 assemble）。
-            wmodel = None
-            sv = stt_mod._get_qwen3asr(cfg.get("sttDevice", "auto"), eng_model,
-                                       forced_aligner="Qwen/Qwen3-ForcedAligner-0.6B")
-        elif eng == "sherpa":
-            # 先加载（加载失败就在**写任何东西之前**当场报错，与另外三条路同一个纪律）。
-            # 识别器本身不用往下传：`stt.transcribe_ex()` 取的是 `_get_sherpa()` 的
-            # 进程内单例，这里拿到的是同一个对象，传下去只是多一个参数。
-            # sherpa **没有句级时间戳**，也因此**不去借 whisper 骨架**：借了的话
-            # "时间轴精度"就取决于这台机器上恰好装没装 whisper，而档位必须如实
-            # （见 `_sherpa_rows` 的注释）。
-            stt_mod._get_sherpa()
-        else:
-            wmodel = stt_mod._get_whisper(eng_model, cfg.get("sttDevice", "auto"))
+        # 走远端能力后端**同样不加载本地模型** —— 这正是"办公本没有 GPU 也能转写"的意义。
+        db.add_log("info", "meeting", "本场转写走能力后端（不加载本地模型）")
 
     diarize_fail = ""      # 分离失败只记一次：8 段会议连说 8 遍会淹没日志
     #: 本场是否**已经**用后端做过分离（= 向量空间已锁）。锁上之后本段失败**不再回落本机**：
@@ -2065,7 +1859,7 @@ def _transcribe_impl(folder):
             seg_path = seg_map.get(seg_idx) or seg_paths[seg]
             percent = round(i / seg_total * 100) if seg_total else 0
             _set_progress(meeting_id, phase="转写中", seg_index=i, seg_total=seg_total,
-                          percent=percent, detail=f"第 {i}/{seg_total} 段 · {cfg.get('sttModel', '')}")
+                          percent=percent, detail=f"第 {i}/{seg_total} 段")
             seg_rows = []
             if asr_provider is not None:
                 # P5：外部/在线转写。没有词级时间戳，所以服务端返回的文本在本段时长内
@@ -2091,7 +1885,7 @@ def _transcribe_impl(folder):
                         cap_session, seg_path, cfg, seg_idx, seg_min, cap_kinds)
                     asr_plan = plan_dict          # 最近一次调用的计划（跳过的项也在这里）
                     if not seg_rows:
-                        # 空结果**显式留痕**（与本地那条路同一个纪律）：
+                        # 空结果**显式留痕**（与线上那条路同一个纪律）：
                         # 区分"这段没人说话"与"后端出了问题"
                         db.add_log("warn", "meeting",
                                    f"{meeting_name} 第{i}段没有内容"
@@ -2099,79 +1893,37 @@ def _transcribe_impl(folder):
                 except Exception as e:
                     db.add_log("error", "meeting",
                                f"{meeting_name} 第{i}段能力后端转写失败：{type(e).__name__}: {e}")
-                    # **不在段内回落到本地引擎**：一场会议里"前几段走服务端、后几段走本机"
+                    # **不在段内换引擎**：一场会议里"前几段走服务端、后几段走本机"
                     # 会让时间轴精度与文本风格前后不一致，而用户看不出来。
                     # 失败就留痕、本段不写行；整场是否重跑由人决定（见 retranscribe_meeting）。
-            elif eng == "sensevoice" or eng == "qwen3asr":
-                # Qwen3-ASR：优先用 ForcedAligner 原生时间戳（自然句子），失败回退 whisper 骨架对齐
-                if eng == "qwen3asr":
-                    lang_hint = stt_mod._LANG_MAP.get(str(cfg.get("sttLanguage", "zh")).lower(), None)
-                    _full_text, sentences = stt_mod._qwen3asr_sentences(sv, seg_path, lang_hint)
-                    if sentences:
-                        seg_rows = [(seg_idx, st, en, txt) for st, en, txt in sentences]
-                    else:
-                        seg_rows = _fallback_sv_rows(sv, wmodel, seg_path, seg_idx, seg_min,
-                                                     cfg, cap_kinds)
-                else:
-                    seg_rows = _fallback_sv_rows(sv, wmodel, seg_path, seg_idx, seg_min,
-                                                 cfg, cap_kinds)
-                if not seg_rows:
-                    # **静默零行是这套流程最贵的失败**：引擎抛异常只 print 到 stderr，
-                    # 库里一行不留，事后完全查不出"这场为什么是空的"
-                    # （2026-09-21 71 分钟那场就是这样）。
-                    db.add_log("warn", "meeting",
-                               f"{meeting_name} 第{i}段没有转出任何文字"
-                               f"（引擎 {eng}；引擎异常详情见 data/logs/echo-server.log.err）")
-            elif eng == "sherpa":
-                seg_rows, sherpa_why = _sherpa_rows(seg_path, seg_idx, seg_min, cfg, cap_kinds)
-                if not seg_rows:
-                    # 与上面两条本地路同一个纪律：空结果要留痕，并且把**引擎自己说的原因**
-                    # （依赖缺失/模型没就位/接口变了）带出来 —— sherpa 是这个仓库里最容易
-                    # "没装好却看起来在跑"的引擎（2026-09-23 实测过一次）。
-                    db.add_log("warn", "meeting",
-                               f"{meeting_name} 第{i}段没有转出任何文字（引擎 sherpa）：{sherpa_why}")
-            elif eng == "whisper":
-                try:
-                    out, _info = stt_mod.transcribe_whisper(wmodel, seg_path, cfg.get("sttLanguage", "zh"))
-                    seg_rows = [(seg_idx, s.start, s.end, s.text.strip()) for s in out]
-                except Exception as e:
-                    db.add_log("error", "meeting",
-                               f"{meeting_name} 第{i}段 whisper 转写失败：{type(e).__name__}: {e}")
-                    print("转写失败:", e, file=sys.stderr)
+            # 没有第三条岔路：2026-09-29 起客户端进程内**不再**做会议转写。
+            # 走不到这里就等于"没人能干这一槽"，而那在进循环之前已经按失败收口了。
 
             if diarize:
                 _set_progress(meeting_id, phase="说话人分离", seg_index=i, seg_total=seg_total,
                               percent=percent, detail=f"第 {i}/{seg_total} 段 · 分离说话人")
                 try:
-                    # 3.0（step 4）：分离先问能力路由的 `diarize.turns` 槽。
+                    # 3.0（step 4）：分离问能力路由的 `diarize.turns` 槽。
                     #
-                    # 2026-09-29（用户拍板）：**分离这一槽不再回落本机**（除非这台机器
-                    # 压根没配能力后端 —— 那是"它本来就这么跑"，不是从后端降级下来）。
-                    #   * 配了后端而这一槽拿不到结果 → **这段不标说话人**，原因写在
-                    #     `da_state` 里（`_capability_diarize_segment` 已经记好），
-                    #     转写结束时写进 meta，面板显示「说话人分离未执行：<真原因>」。
+                    # 2026-09-29（用户拍板）：**分离这一槽只落在能力后端上**
+                    # （客户端进程内那份 pyannote 不再承担会议分离）。
+                    #   * 拿不到结果 → **这段不标说话人**，原因写在 `da_state` 里
+                    #     （`_capability_diarize_segment` 已经记好），转写结束时写进
+                    #     meta，面板显示「说话人分离未执行：<真原因>」。
                     #     绝不回落本机：那会在一场会里混两套不可比的嵌入（L5），
                     #     而后果是**认错人且不报错**。也**绝不补一列空说话人**。
                     turns_raw = embs = labels = None
                     dia_plan = None
-                    #: 分离这一槽**还能不能跑本机**：只有"这台机器压根没配能力后端"才行
-                    #: （见 `_CapabilitySession.diarize_slot_is_local`）。
-                    local_diarize_ok = (cap_session.diarize_slot_is_local()
-                                        if cap_session is not None
-                                        else not echo_backend_configured)
                     if cap_session is not None:
                         turns_raw, embs, labels, dia_plan = _capability_diarize_segment(
                             cap_session, seg_path, da_state)
                         if dia_plan:
                             cap_plan = dia_plan
                             dia_backend_used = True
-                    elif local_diarize_ok:
-                        from app.audio.diarize import diarize_wav_full
-                        turns_raw, embs, labels = diarize_wav_full(seg_path)
                     if turns_raw is None:
                         if cap_session is not None and dia_backend_used:
                             # 本场已经用后端的向量空间标过说话人了（前几段成功）：这一段
-                            # 换本机的空间 = 一场会里混两套不可比的嵌入（L5）。所以这一段
+                            # 换回另一个空间 = 一场会里混两套不可比的嵌入（L5）。所以这一段
                             # 不标说话人，并把"为什么"如实记下来（权威原因词）。
                             # 那一槽自己的失败原因若更具体，`_note_diarize_missing`
                             # 会保住它（挑信息量最大的那条）。
@@ -2189,12 +1941,20 @@ def _transcribe_impl(folder):
                         da_state["backendId"] = (
                             (dia_plan or {}).get("picks", {})
                             .get("diarize.turns", {}).get("backendId", ""))
-                        label_map = registry.map(embs, labels) if labels \
-                            else _labels_from_turns(turns_raw)
-                        if not labels:
+                        if labels:
+                            # **只有后端真的给了嵌入才建注册表**（2026-09-29）：它的用途是
+                            # "把不同段的局部标签缝成同一个人"，那件事需要向量 ——
+                            # 没有向量时缝合无从谈起，硬调 `map()` 会给出空映射，
+                            # 而空映射的表现是**认错人且不报错**。
+                            if registry is None:
+                                from app.audio.diarize import SpeakerRegistry
+                                registry = SpeakerRegistry()
+                            label_map = registry.map(embs, labels)
+                        else:
                             # **有轮次、没嵌入**（在线转写就是这种）：标签来自整场那次
                             # 全局聚类，用自己的编号当显示名；不走注册表（没有向量可缝），
                             # 声纹比对也自然不做（见下面那条 `len(labels)` 判据）。
+                            label_map = _labels_from_turns(turns_raw)
                             db.add_log("debug", "capability",
                                        "%s 第%s段：后端给了说话人时间轴但没有嵌入"
                                        "（%d 个说话人，标签按后端编号直接用）"
@@ -2246,8 +2006,8 @@ def _transcribe_impl(folder):
                 except Exception as e:
                     # 分离不可用不能连累整场转写：形状归一在下面统一做。失败原因也落库
                     # （原来只 print 到 stderr，日志里查不到"为什么这场没有说话人"）。
-                    # `absent` = "不在位（本机没装这个能力）" —— 这一条分支绝大多数就是
-                    # 本机没有 pyannote / 没有权重；若能力层已经记过更具体的原因
+                    # `absent` = "不在位（没有任何后端能做这一槽）" —— 走到这条兜底分支
+                    # 说明上面那一步出了意料之外的错；若能力层已经记过更具体的原因
                     # （blocked / unsupported…），`_note_diarize_missing` 会保住那条。
                     _note_diarize_missing(da_state, DIARIZE_LOCAL_MISSING_REASON,
                                           "%s: %s" % (type(e).__name__, e))
@@ -2373,6 +2133,9 @@ def _transcribe_impl(folder):
                       percent=100, detail="已请求生成纪要+议题分段")
         request_summary(meeting_id, folder)
         request_topic_segments(meeting_id, folder)
+    # 结果如实交给调用方（`_transcribe_meeting` 据此决定要不要报"转写完成"）：
+    # `_mark_meeting_error` 那类提前收口的分支也走这个返回值，见上面的 `return "error"`。
+    return "transcribed" if db_rows else "error"
 
 
 def export_transcript(meeting_id, folder=None):
@@ -3616,12 +3379,13 @@ def _unique_meeting_folder(root, stamp):
 def _import_cfg():
     """导入时写进 `meta.json` 的配置快照（与 `start_meeting()` 同一组键）。
 
-    为什么照抄录音那份：`_transcribe_impl` 把 `meta["config"]` 当**兜底**读
-    （设置改了之后重转用新值，但快照能说明"导入当时这台机器是怎么配的"）。
+    为什么照抄录音那份：`meta["config"]` 是**这一场当时那台机器怎么配的**快照，
+    面板/导出要看它；键的形状必须一致，否则老读者按固定形状取会炸。
     """
     cfg = settings
     return {
-        "sttModel": cfg.get("meetingSttModel", "small"),
+        #: 空串，理由见 `start_meeting()` 里同一条注释（`meetingSttModel` 已废弃）。
+        "sttModel": "",
         "sttDevice": cfg.get("device", "auto"),
         "sttLanguage": cfg.get("sttLanguage", "zh"),
         "segmentMinutes": cfg.get("meetingSegmentMinutes", 10),

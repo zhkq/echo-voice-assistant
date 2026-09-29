@@ -118,6 +118,22 @@ class LocalPairFileTests(_ServerCase):
         self.cfg.raw["server"]["local_pair_base_url"] = "http://127.0.0.1:9999"
         self.assertEqual(localpair.local_base_url(self.cfg), "http://127.0.0.1:9999")
 
+    def test_the_local_file_ignores_the_advertised_host(self):
+        """**本机形态不需要「对外公布地址」**（2026-09-30 用户定的口径）。
+
+        同一份配置可能既服务本机、又服务同事（那时 `server.advertised_host` 填的是
+        局域网 IP）。本机这条路的地址**必须**是回环 —— 它跟"同事能不能连到这台机器的
+        局域网 IP"是两个不相干的问题。这里同时钉 `baseUrl` 与串里的 `host=`：
+        只钉前者的话，串仍会带着一个本机**不该走**的网卡地址（排障时会误导人）。
+        """
+        self.cfg.raw["server"]["advertised_host"] = "10.100.0.24"
+        body = localpair.publish(self.cfg, self.auth)
+        self.assertTrue(body["baseUrl"].startswith("http://127.0.0.1:"),
+                        "本机客户端该走回环：%s" % body["baseUrl"])
+        self.assertIn("host=http://127.0.0.1:", body["url"],
+                      "本机配对串里也不该出现局域网地址：%s" % body["url"])
+        self.assertNotIn("10.100.0.24", body["url"])
+
 
 class LocalPairClientTests(unittest.TestCase):
     """客户端侧：找文件 → 交给既有 `pair()`；失败说人话。"""

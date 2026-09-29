@@ -75,20 +75,21 @@ REASON_PRIORITY: Tuple[str, ...] = (
 )
 
 #: 默认优先级（`auto` 时用）。顺序 = 质量与可控性的折中：
-#:   ECHO 后端（可控、有向量空间） → 本机（不出机但弱） → 网络服务商（不可控）
+#:   ECHO 后端（可控、有向量空间） → 本机（只剩指令链路会走到） → 网络服务商（不可控）
 #: 注意 `wake` 与**指令**链路不走这张表（L3 把它钉在本机）。
 #:
 #: ⚠️ **会议链路的槽里没有本机**（`docs/能力路由-三后端与轻客户端.md` §5.1，
-#: 2026-09-23 的决定）：`auto` 表达的是"按默认优先挑"，**不是"末端有本机接着"**。
+#: 2026-09-23 的决定；2026-09-29 进一步把"本机"从 `local.py` 的声明里删掉）：
+#: `auto` 表达的是"按默认优先挑"，**不是"末端有本机接着"**。
 #: 为什么不兜底：本机 `diarize.*` / `speaker.embed` 一旦启用就**引入第二个
 #: `vectorSpaceId`**（§5.1.1），而混用的表现是"认错人且不报错"；后端全不可用时
-#: 会议的正确行为是**没有说话人**（`diarize` 槽为空 → 照常出无说话人的转写），
-#: 不是偷偷降级成另一种向量空间的粗结果。
+#: 会议的正确行为是**没有说话人**（`diarize` 槽为空），不是偷偷降级成另一种向量空间的粗结果。
+#: 会议转写那一槽同理：本机不再是它的兜底，没有任何后端能干就是"这一场没有转写引擎"。
 #:
-#: **"不默认本机" ≠ "禁止本机"**：用户显式把该槽设成 `local` 时照用
-#: （`_order_for` 里 `explicit != "auto"` 那条，走的是"他选的主选"而不是"兜底"）。
+#: **"不默认本机" ≠ "禁止本机"**：指令链路（`purpose="command"`）由 `_order_for` 直接
+#: 钉成 `(BACKEND_LOCAL,)`，那是铁律 L3。
 DEFAULT_ORDER: Dict[str, Tuple[str, ...]] = {
-    "asr.text": (BACKEND_ECHO_SERVER, BACKEND_LOCAL, BACKEND_ASR_PROVIDER),
+    "asr.text": (BACKEND_ECHO_SERVER, BACKEND_ASR_PROVIDER),
     "asr.timestamps": (BACKEND_ECHO_SERVER,),
     "asr.streaming": (BACKEND_LOCAL,),          # 流式是"边说边出"，只有本机做得到
     "wake": (BACKEND_LOCAL,),                   # 铁律 L3
@@ -302,8 +303,10 @@ class CapabilityRouter:
         if need.purpose == "command" and slot == "asr.text":
             return "指令链路（铁律 L3：主选必须本机）"
         if backend_id == BACKEND_LOCAL:
+            # 走到这里的只剩指令链路（会议那一族槽本机已经不再声明 + 不在默认表里）：
+            # 要么是 `_order_for` 按铁律 L3 钉的，要么是本机被显式点名（老库里的 `local`）。
             return "指定用本机" if self._get(_setting_key_for(slot), "auto") == "local" \
-                else "前面的后端不可用/没配，落到本机"
+                else "指令链路（铁律 L3）：这一槽必须本机"
         if backend_id == BACKEND_ECHO_SERVER:
             return "指定用 ECHO 后端" if self._get(_setting_key_for(slot), "auto") == "echo-server" \
                 else "默认优先 ECHO 后端（可控、有向量空间）"
@@ -464,6 +467,9 @@ def build_default_router(settings_get=None, log=None) -> CapabilityRouter:
 
     **每一个都是"配了才造"** —— 不造空壳。空壳只会让"配了却永远失败"变成一个谜，
     而"没配"与"还没实现"是两件不同的事（后者见 `base.UNIMPLEMENTED_BACKENDS`）。
+
+    本机客户端永远注册（它服务**语音指令**那条链路，铁律 L3），但 2026-09-29 起它
+    **只声明 `asr.text`**（`local.LOCAL_SLOTS`）—— 会议转写与说话人分离不再有本机候选。
     """
     from app.capabilities.local import LocalCapabilityClient
     from app.capabilities.echo_server import client_from_settings
