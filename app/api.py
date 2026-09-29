@@ -178,6 +178,18 @@ class PairLocalIn(BaseModel):
     path: str = ""
 
 
+class BackendStartIn(BaseModel):
+    """「起本机后端」（批 1d）点下去时的选项。
+
+    `replace_pairing`：这台机器已经配对到**别的**后端时，要不要覆盖那个配对。
+    默认 **False** —— 那可能是人家正在用的 GPU，悄悄换掉的表现是"我连的 GPU 忽然变了"。
+    """
+    replace_pairing: bool = False
+    #: 显存预算（MB，0 = 不限制）。写进生成的 `server.yaml`；小卡上必须填，见实施方案 §6-4。
+    vram_budget_mb: int = 0
+    device: str = "cuda"
+
+
 # ---------------------------------------------------------------- 能力路由（3.0）
 #
 # 这几个端点背后的活都在 `app/capability_admin.py`。刻意**不在 api.py 里算**：
@@ -248,6 +260,44 @@ def api_capability_unpair(_auth=Depends(optional_auth)):
     if not ok:
         raise HTTPException(status_code=400, detail=message)
     return {"ok": True, "message": message, "pair": capability_admin.pair_view()}
+
+
+# ---------------------------------------------------------------- 「起本机后端」（批 1d）
+#
+# 背后是 `app/backend_admin.py`（状态整理 + 后台线程里的编排）。三个端点的分工：
+#   GET  .../backend        现在什么状态、能点什么、为什么不能点
+#   POST .../backend/start  开始（**立刻返回**，进度在 job 里，面板轮询 GET 看它长）
+#   POST .../backend/stop   停 **ECHO 自己起的** 那个（手工起的实例不动）
+
+@router.get("/capability/backend")
+def api_capability_backend(_auth=Depends(optional_auth)):
+    """「起本机后端」卡片要的全部状态（含正在跑的那次任务的进度）。"""
+    from app import backend_admin
+    return backend_admin.view()
+
+
+@router.post("/capability/backend/start")
+def api_capability_backend_start(body: Optional[BackendStartIn] = None,
+                                 _auth=Depends(optional_auth)):
+    """开始起本机后端。**不等它做完** —— 进度看 `GET /api/capability/backend`。"""
+    from app import backend_admin
+    data = body or BackendStartIn()
+    ok, message = backend_admin.start(replace_pairing=bool(data.replace_pairing),
+                                      vram_budget_mb=int(data.vram_budget_mb or 0),
+                                      device=str(data.device or "cuda"))
+    if not ok:
+        raise HTTPException(status_code=400, detail=message)
+    return {"ok": True, "message": message, "backend": backend_admin.view()}
+
+
+@router.post("/capability/backend/stop")
+def api_capability_backend_stop(_auth=Depends(optional_auth)):
+    """停掉 ECHO 自己起的那个后端（手工起的实例一个字节都不动）。"""
+    from app import backend_admin
+    ok, message = backend_admin.stop()
+    if not ok:
+        raise HTTPException(status_code=400, detail=message)
+    return {"ok": True, "message": message, "backend": backend_admin.view()}
 
 
 # ---------------------------------------------------------------- 状态与配置

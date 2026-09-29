@@ -120,7 +120,8 @@ def describe_owner(owner: dict) -> str:
     return "%s 被 %s（pid %d）占着" % (port, label or "一个名字取不到的进程", pid)
 
 
-def port_check(ports: Optional[Sequence[int]] = None) -> Tuple[bool, str]:
+def port_check(ports: Optional[Sequence[int]] = None,
+               owners: Optional[Sequence[dict]] = None) -> Tuple[bool, str]:
     """要用的端口能不能用 → ``(ok, detail)``。**不起第二个**，也不替用户杀占用者。
 
     判据分三种（``detail`` 一律说出"是谁"）：
@@ -132,6 +133,9 @@ def port_check(ports: Optional[Sequence[int]] = None) -> Tuple[bool, str]:
       如实说出占用者，让用户决定（停它 / 换端口），**我们不替他动手**。
 
     ``ports=None`` 用本机后端的标准两个端口（8900 / 8901）。
+    ``owners``（2026-09-30）：调用方已经查过"谁在监听"时直接传进来 —— 查一次要跑
+    `netstat`（本机实测 ~0.15 s/端口），而面板每次刷新都要这份答案；**判据只有这一处**，
+    所以是"把结果传进来"，不是在调用方再算一遍（那正是两处判据会漂开的开端）。
     """
     wanted: List[int] = [int(p) for p in (ports if ports is not None
                                          else (DEFAULT_PORT, DEFAULT_ADMIN_PORT))]
@@ -139,9 +143,10 @@ def port_check(ports: Optional[Sequence[int]] = None) -> Tuple[bool, str]:
     ours_alive, _ = backend_pid.is_ours_alive()
     if ours_alive:
         ours_pid = int(backend_pid.read_pid() or 0)
+    if owners is None:
+        owners = [port_owner(p) for p in wanted]
     ours_ports, strangers = [], []
-    for port in wanted:
-        owner = port_owner(port)
+    for owner in owners:
         if int(owner.get("pid") or 0) <= 0:
             continue
         if ours_pid and int(owner["pid"]) == ours_pid:

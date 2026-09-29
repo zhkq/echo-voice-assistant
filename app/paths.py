@@ -222,9 +222,15 @@ def backend_root() -> str:
     规矩见 ``docs/后端容器-一键起-实施方案.md`` §1B/§3（"覆盖 app/server/runtime，
     ``state/`` 与 ``cache/`` 一个字节不动"）。
 
-    老式扁平安装（没有安装根）没有"兄弟目录"这一层，回落到 ``{DATA}/backend``：
-    开发树就落在这一类，行为可预期，且仍在 gitignore 的 ``data/`` 下。
+    ``capabilityBackendDir`` 可以换地方（换盘、换目录）——**与 modelsDir / meetingsDir
+    同一类：客户端挑的位置**。留空 = 按约定：新布局 ``{echoBase}/backend``，
+    老式扁平安装（开发树也算）``{DATA}/backend``。
     """
+    spec = str(_settings_get("capabilityBackendDir") or "").strip()
+    if spec:
+        resolved = resolve(spec)
+        if resolved:
+            return resolved
     return base_dir("backend") or os.path.join(data_root(), "backend")
 
 

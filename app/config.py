@@ -794,6 +794,27 @@ DEFAULTS = {
                     "Docker 的宿主路径猜不出来，猜不到时面板会如实说找不到并列出看过的位置。"
                     "见 docs/3.0-设计总览与组件关系.md §6.6",
         value_type="str"),
+    # ---------- 「帮我起本机后端」（客户端简化第 3 步 · 批 1d）----------
+    # 两个键都由「能力」页签的那张卡承载（hidden：不出现在设置表单里，但能读能写）。
+    #
+    # ⚠️ **后端的端口 / 显存预算 / 档位 / 配额 / TLS 一个都不在这里** —— 它们归后端自己的
+    # `server.yaml` 与管理面（设计 §6.6 的"设置分家"，`tests/test_capability_admin.py::
+    # BackendSettingsStayOnTheBackendTests` 盯着）。客户端要那两个端口时**去读生成出来的
+    # `server.yaml`**（`backend_setup.configured_ports()`）—— 一处权威，手工改了也算数。
+    "capabilityBackendDir": dict(
+        value="", grp="capability", label="本机后端的家", hidden=True,
+        description="「帮我起本机后端」把后端装在哪（配置 / 状态 / 临时 / 缓存都在它下面）。"
+                    "留空 = 按约定：新布局 `{ECHO_BASE}/backend`，老式扁平安装 `{DATA}/backend`。"
+                    "换盘/换目录就填这里 —— 与 `modelsDir` / `meetingsDir` 同一类："
+                    "**这是客户端挑的位置**，不是后端的设置。",
+        value_type="str"),
+    "capabilityBackendStopWithClient": dict(
+        value=False, grp="capability", label="随 ECHO 退出时停掉本机后端", hidden=True,
+        description="**默认关**：会议要求后端活到一场会结束（分钟到小时级），"
+                    "而 ECHO 重启是常事 —— 所以后端默认**留着**，与 ECHO 各自独立。"
+                    "打开它 = ECHO 退出时顺手把**自己起的**那个后端停掉"
+                    "（手工起的实例无论如何都不动）。见 docs/后端容器-一键起-实施方案.md §3",
+        value_type="bool"),
     "capabilityPrivacy": dict(
         value="lan", grp="capability", label="允许音频去哪", hidden=True,
         options=["none", "lan", "wan"],

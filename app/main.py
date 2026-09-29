@@ -125,6 +125,15 @@ async def lifespan(app: FastAPI):
     except Exception as _e:
         print(f"[meeting] 临时解码文件收尾失败（不影响退出）: {_e}")
     runtime.stop_all()
+    # **随 ECHO 退出时停掉本机后端**（默认关，见 `capabilityBackendStopWithClient`）。
+    # 放在组件停完之后：那时会议必然已经结束了，不存在"停掉正在转写的后端"。
+    # 只停 **ECHO 自己起的** 那个（判据是 pid 文件）；用户手工起的实例不动。
+    try:
+        from app import backend_admin
+        _ok, _msg = backend_admin.stop_if_configured()
+        print("[backend] " + str(_msg))
+    except Exception as _e:
+        print(f"[backend] 收尾失败（不影响退出）: {_e}")
     db.add_log("info", "server", "ECHO 服务已停止")
 
 

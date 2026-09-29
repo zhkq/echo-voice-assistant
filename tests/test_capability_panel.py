@@ -29,7 +29,9 @@ def _read(name):
 #: （删的是**元素本身**，不是放宽这条断言的意图：要点的东西仍然必须接线）。
 _WIRED_IDS = ("btnCapPair", "btnCapUnpair", "btnCapRouteProbe",
               "capPairUrl", "capPairCode", "capPairState", "capBackendList",
-              "capRouteSettings", "capRouteBadge")
+              "capRouteSettings", "capRouteBadge",
+              # 「起本机后端」（2026-09-30，实施方案 §5 的批 1d）
+              "btnCapBackendStart", "btnCapBackendStop")
 
 
 class CapabilityCardWiringTests(unittest.TestCase):
@@ -167,6 +169,96 @@ class CapabilityCardWiringTests(unittest.TestCase):
     def test_the_unpair_button_is_hidden_until_there_is_something_to_unpair(self):
         """没配对时不该有一个"解除配对"按钮杵在那儿。"""
         self.assertIn('class="btn hidden" id="btnCapUnpair"', self.html)
+
+
+class BackendOneClickWiringTests(unittest.TestCase):
+    """「起本机后端」那张小卡的接线（2026-09-30，实施方案 §5 的批 1d）。
+
+    这张卡是**唯一**能让"本机自建后端"这件事在界面上完成的地方（没有它，用户要自己写
+    `server.yaml`、自己起进程、自己找配对文件）。它的错法与其它卡片一样是**安静的**：
+    id 拼错、端点名写错、忘了在页签加载时拉一次状态、看不到进度 —— 在浏览器里全表现为
+    "点了没反应"或"永远停在准备中"。这些都看得见，所以都用静态断言钉住。
+
+    （浏览器端的真实验证见 `docs/面板布局-窄边条.md` 的无头 Edge 配方；门禁不引浏览器。）
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.js = _read("app.js")
+        cls.html = _read("index.html")
+        cls.html_ids = set(re.findall(r'id="([^"]+)"', cls.html))
+        cls.js_ids = set(re.findall(r'\$\("#([A-Za-z0-9_-]+)"\)', cls.js))
+
+    def _fn(self, name):
+        body = self.js[self.js.index("function %s(" % name):]
+        return body[:body.index("\n}\n") + 3]
+
+    def test_the_card_has_every_element_it_reaches_for(self):
+        for el in ("btnCapBackendStart", "btnCapBackendStop", "capBackendState",
+                   "capBackendJob", "capBackendNotes"):
+            with self.subTest(id=el):
+                self.assertIn('id="%s"' % el, self.html, "HTML 里没有这个元素")
+                self.assertIn(el, self.js_ids, "HTML 里有，但 JS 从来没引用它")
+
+    def test_the_panel_calls_the_three_endpoints(self):
+        """三个端点分别是"读状态 / 起 / 停" —— 少一个这张卡就残了。"""
+        for ep in ("/api/capability/backend",
+                   "/api/capability/backend/start",
+                   "/api/capability/backend/stop"):
+            with self.subTest(endpoint=ep):
+                self.assertIn(ep, self.js, "面板没调 %s" % ep)
+
+    def test_the_status_is_loaded_with_the_capability_tab(self):
+        """`loadCapabilityRouting()` 里要真的去拉这张卡的状态 —— 否则它永远是空的。"""
+        body = self.js[self.js.index("async function loadCapabilityRouting("):]
+        body = body[:body.index("\n}\n") + 3]
+        self.assertIn("loadBackendOneClick()", body)
+
+    def test_the_progress_lines_come_from_the_servers_job(self):
+        """进度**逐条来自服务端的 `job`**，面板不自己编"正在启动中…"那种没有信息量的话。
+
+        （"界面说在起、其实早失败了"就是各写一套话术的必然结果。）
+        """
+        body = self._fn("capBackendJobLines")
+        for token in ("job.steps", "stage"):
+            self.assertIn(token, body, "进度渲染没读服务端的 %s" % token)
+        render = self._fn("renderBackendOneClick")
+        for token in ("job.running", "job.doneAt", "job.message"):
+            self.assertIn(token, render, "渲染没读服务端的 %s" % token)
+
+    def test_the_stop_button_starts_hidden(self):
+        """没在跑的时候不该有一个"停掉它"杵在那儿（与服务端 `running` 一起决定显隐）。"""
+        self.assertIn('class="btn hidden" id="btnCapBackendStop"', self.html)
+        self.assertIn('classList.toggle("hidden"', self._fn("renderBackendOneClick"))
+
+    def test_a_running_job_starts_the_poller(self):
+        """起后端要等最长 60 秒（等本机配对文件）—— 没有轮询就等于没有进度。"""
+        self.assertIn("startBackendPoll()", self._fn("renderBackendOneClick"))
+        self.assertIn("stopBackendPoll()", self._fn("renderBackendOneClick"))
+        self.assertIn("setInterval", self._fn("startBackendPoll"))
+
+    def test_the_start_payload_matches_the_api_model(self):
+        """面板发的字段名要与 `BackendStartIn` 一致（跨语言最容易悄悄断的一处）。
+
+        面板现在发的是空对象（全用服务端默认值），所以这里钉两件事：
+        ① 请求体是 JSON；② 模型里那三个键就是服务端认的名字（改名字要同时改两处）。
+        """
+        from app.api import BackendStartIn
+        model = set(BackendStartIn.model_fields.keys())
+        self.assertEqual(model, {"replace_pairing", "vram_budget_mb", "device"}, model)
+        body = self._fn("doCapabilityBackendStart")
+        self.assertIn('body: "{}"', body)
+        self.assertIn("/api/capability/backend/start", body)
+
+    def test_the_stop_action_asks_before_interrupting_a_meeting(self):
+        """停后端会打断正在转写/分离的会议（不可逆）—— 必须问一句，并说清只停"我们起的"。"""
+        body = self._fn("doCapabilityBackendStop")
+        self.assertIn("confirm(", body)
+        self.assertIn("手工启动", body)
+
+    def test_the_failure_line_shows_the_servers_own_sentence(self):
+        """400 的 body 是 `{"detail": "一句人话"}` —— 面板要显示那句话。"""
+        self.assertIn("detail", self._fn("capBackendErrorText"))
 
 
 class MeetingDetailShowsThePlanTests(unittest.TestCase):

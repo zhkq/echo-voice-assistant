@@ -317,6 +317,20 @@
               检测本机后端</button>
             <span class="muted" id="capPairLocalState" style="font-size:12px"></span>
           </div>
+          <!-- 「帮我起本机后端」（2026-09-30，实施方案 §5 的批 1d）：本机还没有后端时点这个 ——
+               它会写一份只绑回环的 server.yaml、把后端起起来、再读后端写下的本机配对文件
+               自动配上。进度逐条长出来（每一步都有 ok/为什么），失败当场说清楚下一步。
+               两个按钮互斥由 JS 控制：能起的时候给「起本机后端」，起了之后给「停掉它」。 -->
+          <div class="cap-pair-row">
+            <button class="btn" id="btnCapBackendStart"
+                    title="在这台机器上起一个只绑回环的 ECHO 能力后端：写配置 → 起进程 → 自动配对">
+              起本机后端</button>
+            <button class="btn hidden" id="btnCapBackendStop"
+                    title="停掉 ECHO 自己起的那个后端（手工起的实例不会被动）">停掉它</button>
+            <span class="muted" id="capBackendState" style="font-size:12px"></span>
+          </div>
+          <div class="muted" id="capBackendJob" style="font-size:12px"></div>
+          <div class="muted" id="capBackendNotes" style="font-size:12px"></div>
           <div class="muted" id="capPairState" style="font-size:12px"></div>
         </div>
         <div id="capBackendList" class="cap-prov"></div>

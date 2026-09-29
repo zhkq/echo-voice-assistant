@@ -118,6 +118,30 @@ def loopback_base_url(port: int = backend_proc.DEFAULT_PORT) -> str:
     return "http://%s:%d" % (DEFAULT_LOOPBACK, int(port))
 
 
+def configured_ports() -> Tuple[int, int]:
+    """**从生成出来的 `server.yaml` 读**两个端口 → ``(能力面, 管理面)``。
+
+    为什么读配置而不是存成客户端设置：端口是**后端自己的设置**（设计 §6.6 的"设置分家"，
+    `tests/test_capability_admin.py::BackendSettingsStayOnTheBackendTests` 盯着客户端不许
+    出现后端专有项）。在客户端再存一份的代价是"两处都能改、改完不知道谁生效"，而且用户
+    手工把 `server.yaml` 的 `listen` 改成 8902 之后，客户端那份副本就成了假话。
+    所以：**一处权威 = 生成的那个 yaml**；没有配置文件时退回出厂端口（8900 / 8901）。
+    """
+    cfg = _read_config_file()
+    server = cfg.get("server") if isinstance(cfg, dict) else None
+    server = server if isinstance(server, dict) else {}
+
+    def _port(value, fallback):
+        try:
+            text = str(value or "").rsplit(":", 1)[-1].strip()
+            return int(text) if text else int(fallback)
+        except Exception:
+            return int(fallback)
+
+    return (_port(server.get("listen"), backend_proc.DEFAULT_PORT),
+            _port(server.get("admin_listen"), backend_proc.DEFAULT_ADMIN_PORT))
+
+
 # ---------------------------------------------------------------- jwt_secret（永不重生成）
 
 def _read_config_file() -> Dict[str, Any]:
@@ -564,7 +588,8 @@ def start(*, port: int = backend_proc.DEFAULT_PORT,
           specs: Optional[Sequence[Dict[str, Any]]] = None,
           timeout: float = PAIR_FILE_TIMEOUT, replace: bool = False,
           write_setting: bool = True, models_root_path: str = "",
-          python: str = "", cwd: str = "") -> Dict[str, Any]:
+          python: str = "", cwd: str = "",
+          on_step=None) -> Dict[str, Any]:
     """把 configure → launch → 等配对文件 → 配对 串起来 → 结果字典。
 
     返回 ``{"ok": bool, "steps": [{"name", "ok", "detail"}...], "message", …}`` ——
@@ -573,11 +598,21 @@ def start(*, port: int = backend_proc.DEFAULT_PORT,
 
     "ECHO 起的那个已经在跑"**算成功**（幂等：点两次不该报错）—— 那正是
     "后端上次起的、还在跑"的正常情形，接下来直接等配对文件 + 配对。
+
+    ``on_step``（2026-09-30 加）：每记下一步就回调一次 ``{"name","ok","detail"}``，
+    给"面板要显示实时进度"用（这个函数跑在后台线程里，一次跑十几秒到一分钟）。
+    **回调抛异常一律吞掉**：它是显示层的事，不许把起后端这件事本身带崩。
     """
     steps: List[Dict[str, Any]] = []
 
     def record(name: str, ok: bool, detail: str) -> bool:
-        steps.append({"name": name, "ok": bool(ok), "detail": str(detail)})
+        step = {"name": name, "ok": bool(ok), "detail": str(detail)}
+        steps.append(step)
+        if callable(on_step):
+            try:
+                on_step(dict(step))
+            except Exception:
+                pass
         return bool(ok)
 
     ok, detail, info = configure(port=port, admin_port=admin_port, device=device,

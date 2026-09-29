@@ -2814,6 +2814,9 @@ async function loadCapabilityRouting(force) {
     mergeSettingsRows(r.settings || []);
     renderCapPairState(r.pair, r.local);
     renderCapBackends(r.backends || []);
+    // 「起本机后端」那张小卡的现状与进度（2026-09-30，批 1d）。**与上面那份数据分开取**：
+    // 它要读端口占用（netstat）与 pid 记录，比"读一遍设置"贵，不该拖着整张卡一起慢。
+    loadBackendOneClick();
     // 「已配对后端连接情况」默认收起，**真配上了自动展开一次**（见 autoExpandOnce）
     autoExpandOnce("cap-pair", !!(r.pair && r.pair.paired));
     // 配对输入框**不隐藏**：换一台后端（先解除配对、再配一次）与"第一次配对"
@@ -2932,6 +2935,148 @@ async function doCapabilityUnpair() {
     await loadCapabilityRouting(true);
   } catch (e) { toast("解除配对失败：" + e.message); }
 }
+
+/* ---------------- 「帮我起本机后端」（2026-09-30，实施方案 §5 的批 1d） ----------------
+
+   本机还没有能力后端时，用户不该去读文档、手工写 `server.yaml`、再拼配对码：
+   点一下「起本机后端」就该把三件事做完 —— 写配置（只绑回环）、起进程、读后端写下的
+   本机配对文件自动配上。三件事各自可能失败，而且**失败原因必须当场看得见**
+   （缺运行时 / 端口被别人占着 / 起完就崩 / 配对码过期），否则用户只会看到"点了没反应"。
+
+   为什么走后台任务 + 轮询：编排里要**等后端把配对文件写出来**（最长 60 秒），
+   放在请求里就是一个挂住的请求。所以 POST 立刻返回，进度长在 `job` 里，
+   这里每 1.5 秒拉一次直到它不跑了。
+
+   `state` 的每一句都来自服务端（`/api/capability/backend`），面板**不自己编**进度话术 ——
+   与服务端各写一套，迟早出现"界面说在起、其实早失败了"。 */
+
+let _capBackendBusy = false;
+let _capBackendPoll = null;
+let _capBackendLastDone = "";
+
+async function loadBackendOneClick() {
+  const btn = $("#btnCapBackendStart");
+  if (!btn || _capBackendBusy) return;          // 卡片不在这一页 / 上一次还没回来
+  _capBackendBusy = true;
+  try {
+    const r = await api("/api/capability/backend");
+    renderBackendOneClick(r);
+  } catch (e) {
+    const state = $("#capBackendState");
+    if (state) state.textContent = "读不到本机后端的状态：" + e.message;
+  } finally {
+    _capBackendBusy = false;
+  }
+}
+
+function capBackendJobLines(job) {
+  const steps = (job && job.steps) || [];
+  const lines = steps.map((s) => `${s.ok ? "✓" : "✗"} ${esc(s.detail || s.name)}`);
+  if (job && job.running) lines.push(`… 正在：${esc(job.stage || "准备中")}`);
+  return lines;
+}
+
+function renderBackendOneClick(be) {
+  const btn = $("#btnCapBackendStart");
+  const stopBtn = $("#btnCapBackendStop");
+  const state = $("#capBackendState");
+  const notesHost = $("#capBackendNotes");
+  const jobHost = $("#capBackendJob");
+  const job = be.job || {};
+  const ports = `${be.port}/${be.adminPort}`;
+
+  if (btn) {
+    btn.disabled = !!job.running || !be.canStart;
+    btn.title = job.running
+      ? "正在起本机后端…（进度在下面）"
+      : (be.canStart ? "在这台机器上起一个只绑回环的 ECHO 能力后端（写配置 → 起进程 → 自动配对）"
+                     : (be.whyNot || "现在起不了"));
+  }
+  if (stopBtn) {
+    // **能停的判据是"我们起的那个还在跑"**（服务端按 pid 记录判），不是"端口上有人"——
+    // 端口上可能是用户手工起的实例，那个我们绝不碰。
+    stopBtn.classList.toggle("hidden", !be.running);
+  }
+  if (state) {
+    const bits = [];
+    bits.push(be.running ? `在跑：pid=${be.pid}` : "没在跑");
+    bits.push(`端口 ${ports}`);
+    const local = be.pairFile || {};
+    bits.push(local.found ? `本机配对文件在（${esc(local.baseUrl || "")}）` : "还没有本机配对文件");
+    state.innerHTML = bits.join(" · ");
+  }
+  if (jobHost) {
+    const lines = capBackendJobLines(job);
+    if (job.doneAt && !job.running) {
+      lines.push(`${job.ok ? "✓ 完成" : "✗ 没成功"}：${esc(job.message || "")}`);
+    }
+    jobHost.innerHTML = lines.length
+      ? lines.map((l) => `<div>${l}</div>`).join("") : "";
+  }
+  if (notesHost) {
+    const notes = be.notes || [];
+    notesHost.innerHTML = notes.map((n) => `<div>· ${esc(n)}</div>`).join("");
+  }
+  // 任务刚结束的那一拍：换一句 toast，并把能力页签整块重拉一遍（配对状态/后端清单都变了）。
+  if (job.doneAt && !job.running && job.doneAt !== _capBackendLastDone) {
+    _capBackendLastDone = job.doneAt;
+    toast(job.ok ? "本机后端已就绪" : ("起本机后端没成：" + (job.message || "看上面的步骤")),
+          job.ok ? 3000 : 9000);
+    if (job.ok) loadCapabilityRouting(true);
+  }
+  if (job.running) startBackendPoll();
+  else stopBackendPoll();
+}
+
+function startBackendPoll() {
+  if (_capBackendPoll) return;
+  _capBackendPoll = setInterval(loadBackendOneClick, 1500);
+}
+
+function stopBackendPoll() {
+  if (!_capBackendPoll) return;
+  clearInterval(_capBackendPoll);
+  _capBackendPoll = null;
+}
+
+/** 把后端那句 `HTTP 400: {"detail": "……"}` 拆成人话（与配对那条同一个做法）。 */
+function capBackendErrorText(e) {
+  let msg = (e && e.message) || String(e);
+  const m = /^\s*HTTP \d+:\s*(\{.*\})$/s.exec(msg);
+  if (m) { try { msg = JSON.parse(m[1]).detail || msg; } catch (_) { /* 原样 */ } }
+  return msg;
+}
+
+async function doCapabilityBackendStart() {
+  const btn = $("#btnCapBackendStart");
+  if (btn) btn.disabled = true;
+  try {
+    const r = await api("/api/capability/backend/start", { method: "POST", body: "{}" });
+    toast(r.message || "已开始起本机后端", 5000);
+    renderBackendOneClick(r.backend || {});
+  } catch (e) {
+    toast(capBackendErrorText(e), 9000);
+    await loadBackendOneClick();
+  }
+}
+
+async function doCapabilityBackendStop() {
+  // 停后端会打断正在转写/分离的会议 —— 那件事不可逆（音频还在，但那一场的转写要重来），
+  // 所以问一句。**只停 ECHO 自己起的那个**（服务端按 pid 记录判，手工起的实例不动）。
+  if (!window.confirm("停掉本机后端？\n\n正在转写或分离的会议会被打断"
+    + "（录音文件还在，可以重新转写）。ECHO 自己起的那个才会被停，"
+    + "你手工启动的实例不受影响。")) return;
+  try {
+    const r = await api("/api/capability/backend/stop", { method: "POST" });
+    toast(r.message || "已停掉本机后端");
+    renderBackendOneClick(r.backend || {});
+  } catch (e) { toast(capBackendErrorText(e), 9000); }
+}
+
+const _btnCapBackendStart = $("#btnCapBackendStart");
+if (_btnCapBackendStart) _btnCapBackendStart.addEventListener("click", doCapabilityBackendStart);
+const _btnCapBackendStop = $("#btnCapBackendStop");
+if (_btnCapBackendStop) _btnCapBackendStop.addEventListener("click", doCapabilityBackendStop);
 
 const _btnCapPair = $("#btnCapPair");
 if (_btnCapPair) _btnCapPair.addEventListener("click", doCapabilityPair);
