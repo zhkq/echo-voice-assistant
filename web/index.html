@@ -308,6 +308,15 @@
             <button class="btn hidden" id="btnCapUnpair"
                     title="让这台机器忘掉后端凭据（服务端那本清单归管理员）">解除配对</button>
           </div>
+          <!-- **方案 1：本机自动配对**（2026-09-28）。后端装在这台机器上时不用抄码：
+               后端启动会把自己的配对信息写在本机状态目录里，这里读它就走完配对。
+               找到了才可点（禁用而非隐藏 —— 点不动时要当场说清为什么）。 -->
+          <div class="cap-pair-row">
+            <button class="btn" id="btnCapPairLocal"
+                    title="方案 1：后端装在这台机器上 —— 读它写下的本机配对文件自动连上（不用抄配对码）">
+              检测本机后端</button>
+            <span class="muted" id="capPairLocalState" style="font-size:12px"></span>
+          </div>
           <div class="muted" id="capPairState" style="font-size:12px"></div>
         </div>
         <div id="capBackendList" class="cap-prov"></div>

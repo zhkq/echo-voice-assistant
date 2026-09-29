@@ -61,6 +61,13 @@ services:
       #    所以下面那行用 `${...:?}`：没配就**直接报错退出**，不静默起一个不鉴权的服务。
       ECHO_AUTH_ENABLED: "${ECHO_AUTH_ENABLED:-true}"
       ECHO_AUTH_MODE: "${ECHO_AUTH_MODE:-jwt}"
+      # **本机自配对**（2026-09-28，会议转写方案 1）：默认**开** —— 这份包面向
+      # "这台机器既跑后端、又跑客户端"的装法，同机不该让人抄配对码。启动时会在
+      # 状态卷里写一份 `local-pair.json`，客户端点「检测本机后端」读它即可。
+      # 只跑后端、客户端在别的机器上（方案 2）时可以设成 "false" —— 那个文件没人用。
+      # 客户端侧要能读到它：把 `ECHO_HOST_STATE_DIR` 的宿主路径填进客户端的
+      # 「本机配对文件路径」设置（或环境变量 `ECHO_LOCAL_PAIR_PATH`）。
+      ECHO_LOCAL_PAIR: "${ECHO_LOCAL_PAIR:-true}"
       ECHO_JWT_SECRET: "${ECHO_JWT_SECRET:?没配 —— 先 openssl rand -hex 32，把结果写进 .env 的 ECHO_JWT_SECRET}"
     # models.specs（要加载哪几个模型）**没有环境变量**，只能挂一份配置 + `--config`。
     # 这份 server.yaml 就是本变体的"该加载哪些模型"清单（qwen3asr + 强制对齐器 + pyannote）。

@@ -63,6 +63,9 @@ services:
       #    所以下面那行用 `${...:?}`：没配就**直接报错退出**，不静默起一个不鉴权的服务。
       ECHO_AUTH_ENABLED: "${ECHO_AUTH_ENABLED:-true}"
       ECHO_AUTH_MODE: "${ECHO_AUTH_MODE:-jwt}"
+      # **本机自配对**（2026-09-28，会议转写方案 1）：默认开（同机不该让人抄配对码）。
+      # 见 backend-cu126/compose.yaml 里同一项的完整说明与客户端侧要配的那个路径。
+      ECHO_LOCAL_PAIR: "${ECHO_LOCAL_PAIR:-true}"
       ECHO_JWT_SECRET: "${ECHO_JWT_SECRET:?没配 —— 先 openssl rand -hex 32，把结果写进 .env 的 ECHO_JWT_SECRET}"
     # models.specs（要加载哪几个模型）**没有环境变量**，只能挂一份配置 + `--config`。
     # 本变体的 server.yaml **只有 SenseVoice 一条转写档**，刻意**没有** diarize / speaker-embed：

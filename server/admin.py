@@ -78,6 +78,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 
 from server import __version__, errors
 from server import ops as ops_mod
+from server import perfmon as perfmod
 
 #: 写请求必须带的**非简单请求标志头**（值随便，非空即可）。
 #:
@@ -200,11 +201,16 @@ def _state_of(request: Request):
     return request.app.state.echo
 
 
-def create_admin_app(cfg, state) -> FastAPI:
+def create_admin_app(cfg, state, *, perf=None) -> FastAPI:
     """造管理面应用。`state` 就是能力面那个 `routes.State`（读它的池/配额/metrics/库）。
 
     刻意**共用同一个 State**：那些状态本来就该只有一份（池、配额账本、metrics、
     调用记录），两个 app 各造一份会出现"管理面看到的忙闲与能力面不一样"。
+
+    `perf` 是「性能」页签那个采集器（`server/perfmon.py` 的 `PerfMonitor`）。
+    **可以注入**：用例注入一个"采样函数全打桩"的替身，于是
+    **测试永远不会真的去调 `nvidia-smi`**（本仓库对"测试碰真实资源"极敏感）。
+    不传就造一个真的（采样只在按下「开始记录」且有人在看时才发生）。
     """
     sessions = SessionStore()
     throttle = _Throttle()
@@ -212,6 +218,9 @@ def create_admin_app(cfg, state) -> FastAPI:
     app.state.echo = state
     app.state.sessions = sessions
     app.state.throttle = throttle
+    perf_monitor = perf if perf is not None else perfmod.PerfMonitor(
+        server_sampler=perfmod.server_sampler_of(state))
+    app.state.perf = perf_monitor
     api = APIRouter(prefix="/admin/api")
 
     # ---- 鉴权 ----
@@ -646,6 +655,69 @@ def create_admin_app(cfg, state) -> FastAPI:
 
         return as_write(request, "rotate-secret", client_id, fn, confirm=payload)
 
+    # ---- 性能监控（写：开始 / 停止记录；读：状态与**增量**取点）----
+    #
+    # 采集与缓冲全在 `server/perfmon.py` 里（**只在内存里，一个字节都不落盘** ——
+    # 容器根文件系统是只读的，`read_only: true`）。管理面这里只做两件事：
+    #   ① 写端点走 `as_write`：会话 + 同站 Origin + `X-ECHO-Admin` + CSRF + 审计，
+    #      与其它写动作**同一套闸门**（没有新开免检端点）；
+    #   ② 读端点只需要登录（与 `/overview` 那半边一致，见 ReadOnlyNotLockedTests）。
+    #
+    # 「有人在看」是靠**这两条读端点被调用**来判定的：页面一关、轮询一停，
+    # `viewerTtlSeconds` 一到，采集线程自己退出（不再空跑）。`recording` 那个标志
+    # 留着 —— 页面再打开就接着采，不必重新按一次「开始记录」。
+    # 于是"页面关闭/切走时停止采样"这件事**不需要浏览器发关闭请求**
+    # （那种请求还得带自定义头，`sendBeacon` 发不出来）。
+
+    @api.post("/perf/start")
+    async def perf_start(request: Request):
+        """**开始记录**：1 秒一个点，只放内存。
+
+        可选 `windowSeconds`（60 ~ 7200）换窗口；**换了窗口等于丢掉旧点**
+        （环形容量变了，序列号接着往下数，客户端手上那个 `since` 不会失效）。
+        """
+        payload = await body_of(request)
+
+        def fn(who):
+            raw = payload.get("windowSeconds")
+            target = None
+            if raw not in (None, ""):
+                try:
+                    target = float(raw)
+                except (TypeError, ValueError):
+                    raise errors.bad_request("windowSeconds 要是秒数")
+            try:
+                return perf_monitor.start(window_s=target)
+            except ValueError as exc:
+                raise errors.bad_request(str(exc))
+
+        return as_write(request, "perf-start", "perf", fn)
+
+    @api.post("/perf/stop")
+    async def perf_stop(request: Request):
+        """停止记录。**已有的点不删**（图还在，只是不再长）。"""
+        return as_write(request, "perf-stop", "perf", lambda who: perf_monitor.stop())
+
+    @api.get("/perf/state")
+    def perf_state(request: Request):
+        """是否在记录 + 采样间隔 + 已有点数。**这一次调用本身就算"有人在看"**。"""
+        current_admin(request)
+        return _no_store(perf_monitor.state())
+
+    @api.get("/perf/points")
+    def perf_points(request: Request, since: str = "", limit: int = 0):
+        """**增量取点**：`since` 给序号（或 ≥1e9 的 unix 时间戳）。
+
+        * 空 `since` → 回**最近** `limit` 个（页面首屏）；
+        * 给了 `since` → 只回它**之后**的点，响应里带 `nextSince`（下一批从这里取）；
+        * 一批最多 `limit` 个（默认 300，上限 2000），被截断时 `truncated=true`。
+        """
+        current_admin(request)
+        try:
+            return _no_store(perf_monitor.points(since=since, limit=(limit or None)))
+        except ValueError as exc:
+            raise errors.bad_request(str(exc))
+
     app.include_router(api)
     app.add_exception_handler(errors.EchoError, _error_handler)
 
@@ -662,6 +734,15 @@ def _error_handler(_request: Request, exc):
     if getattr(exc, "retry_after", None) is not None:
         headers["Retry-After"] = str(int(exc.retry_after))
     return JSONResponse(status_code=exc.status, content=exc.body(), headers=headers)
+
+
+def _no_store(payload):
+    """带 `Cache-Control: no-store` 的 JSON 响应（**只给性能那两个读端点用**）。
+
+    为什么：它们是"每一秒都不一样"的读数，被任何一层缓存住都会表现成
+    "图冻在那儿了"，而那种故障看起来像采集器坏了 —— 排查方向完全错。
+    """
+    return JSONResponse(content=payload, headers={"Cache-Control": "no-store"})
 
 
 def _source_of(request: Request) -> str:
@@ -850,7 +931,8 @@ def start_admin_server(cfg, state, *, log=None):
                         "模型/客户端/调用元数据。请用防火墙只放运维网段（设计 §8.4）。",
                         host, port)
         log.info("管理面在 http://%s:%d/admin/ （**可写**：发授权 / 禁用 / 撤销 / 改 scopes / "
-                 "改配额 / 轮换 secret；全部要求管理员会话 + 同站 Origin + %s 头）",
+                 "改配额 / 轮换 secret / 性能记录（只在内存，不落盘）；"
+                 "全部要求管理员会话 + 同站 Origin + %s 头）",
                  host, port, WRITE_HEADER)
     server = uvicorn.Server(uvicorn.Config(app, host=host, port=port, log_level="warning"))
     thread = threading.Thread(target=server.run, name="echo-admin", daemon=True)

@@ -60,6 +60,19 @@
             background:var(--bg); border:1px solid var(--yellow); border-radius:6px;
             padding:8px 10px; margin-top:8px; user-select:all; }
   .errtxt { color:var(--red); font-size:12px; min-height:16px; margin-top:6px; }
+  /* 性能页签：**4 张图，一行 2 个、共 2 行**（窄屏落成 1 列，免得图变成一条线） */
+  .charts { display:grid; grid-template-columns:repeat(2, minmax(0, 1fr)); gap:12px; }
+  @media (max-width:820px) { .charts { grid-template-columns:minmax(0, 1fr); } }
+  .chart { margin-bottom:0; }
+  .chart h2 { display:flex; justify-content:space-between; align-items:baseline; gap:8px; }
+  .chart h2 .now { color:var(--muted); font-size:12px; font-weight:400; text-align:right; }
+  .chart svg { display:block; width:100%; height:auto; }
+  .legend { display:flex; gap:12px; flex-wrap:wrap; color:var(--muted); font-size:12px;
+            margin-top:4px; }
+  .swatch { display:inline-block; width:10px; height:10px; border-radius:2px;
+            margin-right:4px; vertical-align:middle; }
+  .perfbar { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+  .perfbar .stat { color:var(--muted); font-size:12px; }
 </style>
 </head>
 <body>
@@ -94,11 +107,40 @@
       <button data-tab="models">模型</button>
       <button data-tab="clients">客户端 / 发授权</button>
       <button data-tab="calls">调用</button>
+      <button data-tab="perf">性能</button>
       <button data-tab="inventory">存了什么</button>
     </div>
     <div id="view"></div>
   </main>
 </div>
+
+<!-- 「性能」页签的 4 张图（**一行 2 个、共 2 行**，见 .charts 那个 grid）。
+     放在 <template> 里是为了：① 静态 HTML 里就**真的有 4 个 svg 元素**（用例直接数得出来）；
+     ② 切页签时不重复解析一遍这段标记，克隆进去就行。 -->
+<template id="perfChartsTpl">
+  <div class="charts">
+    <div class="card chart">
+      <h2>GPU 利用率<span class="now" id="now-gpu">—</span></h2>
+      <svg id="chart-gpu" viewBox="0 0 360 150" role="img" aria-label="GPU 利用率折线图"></svg>
+      <div class="legend" id="legend-gpu"></div>
+    </div>
+    <div class="card chart">
+      <h2>显存<span class="now" id="now-vram">—</span></h2>
+      <svg id="chart-vram" viewBox="0 0 360 150" role="img" aria-label="显存折线图"></svg>
+      <div class="legend" id="legend-vram"></div>
+    </div>
+    <div class="card chart">
+      <h2>CPU<span class="now" id="now-cpu">—</span></h2>
+      <svg id="chart-cpu" viewBox="0 0 360 150" role="img" aria-label="CPU 使用率折线图"></svg>
+      <div class="legend" id="legend-cpu"></div>
+    </div>
+    <div class="card chart">
+      <h2>内存<span class="now" id="now-ram">—</span></h2>
+      <svg id="chart-ram" viewBox="0 0 360 150" role="img" aria-label="内存使用率折线图"></svg>
+      <div class="legend" id="legend-ram"></div>
+    </div>
+  </div>
+</template>
 
 <script>
 const $ = (s) => document.querySelector(s);
@@ -159,6 +201,7 @@ const left = (sec) => {
 const mb = (n) => (Number(n || 0) / 1024).toFixed(1) + " GB";
 
 function showLogin() {
+  stopPerfPoll();          // 掉线了就别再轮询（后端"有人在看"的判定也随之过期）
   $("#login").classList.remove("hidden");
   $("#app").classList.add("hidden");
 }
@@ -213,11 +256,13 @@ async function boot() {
 async function render() {
   const tab = (document.querySelector(".tabs button.active") || {}).dataset?.tab || "overview";
   const v = $("#view");
+  stopPerfPoll();          // 切走「性能」页签就不再取点（后端最多再采 viewerTtl 秒）
   try {
     if (tab === "overview") v.innerHTML = await viewOverview();
     else if (tab === "models") v.innerHTML = await viewModels();
     else if (tab === "clients") { v.innerHTML = await viewClients(); bindClients(); }
     else if (tab === "calls") v.innerHTML = await viewCalls();
+    else if (tab === "perf") { v.innerHTML = await viewPerf(); bindPerf(); }
     else { v.innerHTML = await viewInventory(); }
   } catch (e) {
     v.innerHTML = `<div class="card"><h2>读不到</h2><div class="muted">${esc(e.message)}</div></div>`;
@@ -479,6 +524,240 @@ async function viewInventory() {
       <code>.failed</code>，"被闸门挡回来"的记成 <code>write-guard</code>）。</div></div>`;
 }
 
+/* ---------------------------------------------------------------- 性能（4 张图，2×2） */
+
+/* 点只在**这个数组**里攒；服务端的环形窗口是权威（见 mergePoints）。
+   前端也不落盘：没有 localStorage / sessionStorage / IndexedDB —— 刷新即清零。
+   刷新机制是**增量轮询**：1.5 秒一次 `?since=<nextSince>`，只取新点；
+   （SSE 没必要：这里的数据本来就是"每秒一个点"，轮询的延迟上限就是一个间隔，
+   而 SSE 要额外处理断线重连与代理缓冲，换不来什么。）*/
+const PERF = { points: [], since: "", timer: null, state: null };
+
+const PERF_POLL_MS = 1500;
+const CHART_W = 360, CHART_H = 150;
+const CHART_PAD = { l: 38, r: 18, t: 10, b: 18 };
+
+const pct = (v) => (v == null || v === "" ? "—" : Number(v).toFixed(1) + "%");
+const mbText = (v) => (v == null || v === "" ? "—" : Math.round(Number(v)) + " MB");
+const deg = (v) => (v == null || v === "" ? "—" : Math.round(Number(v)) + "°C");
+const watt = (v) => (v == null || v === "" ? "—" : Number(v).toFixed(0) + " W");
+const axisNum = (v) => String(v >= 1000 ? Math.round(v) : Math.round(v * 10) / 10);
+
+function niceMax(v) {
+  v = Number(v || 0);
+  if (!(v > 0)) return 1;
+  const p = Math.pow(10, Math.floor(Math.log10(v)));
+  return Math.ceil(v / p) * p;
+}
+
+const maxOf = (vals) => {
+  const nums = vals.filter((v) => v != null && isFinite(v));
+  return nums.length ? Math.max.apply(null, nums) : 0;
+};
+
+/* 每张图的规格：系列、Y 轴上界、右上角那行小字。
+   `leftMax` 给固定上限（GPU/CPU/内存 0~100）；`leftMaxKey` 按点里那个字段取
+   （显存 = 卡的总显存）。都不给就按数据自适应。 */
+const PERF_CHARTS = [
+  { svg: "#chart-gpu", legend: "#legend-gpu", head: "#now-gpu", leftMax: 100,
+    rightMaxKey: "maxConcurrent",
+    series: [{ key: "gpuPercent", color: "#3fb950", name: "GPU 利用率 (%)" },
+             { key: "active", color: "#d29922", name: "在途请求数（右轴）", axis: "r", dash: "4 2" }],
+    readout: (p) => `${pct(p.gpuPercent)} · 温度 ${deg(p.gpuTempC)} · 功耗 ${watt(p.gpuPowerW)}` },
+  { svg: "#chart-vram", legend: "#legend-vram", head: "#now-vram", leftMaxKey: "gpuMemTotalMb",
+    series: [{ key: "gpuMemUsedMb", color: "#388bfd", name: "显卡已用 (MB)" },
+             { key: "vramUsedMb", color: "#d29922", name: "后端自报 (MB)", dash: "4 2" }],
+    readout: (p) => `${mbText(p.gpuMemUsedMb)} / ${mbText(p.gpuMemTotalMb)}`
+                    + ` · 后端自报 ${mbText(p.vramUsedMb)}` },
+  { svg: "#chart-cpu", legend: "#legend-cpu", head: "#now-cpu", leftMax: 100,
+    series: [{ key: "cpuPercent", color: "#388bfd", name: "CPU (%)" }],
+    readout: (p) => pct(p.cpuPercent) },
+  { svg: "#chart-ram", legend: "#legend-ram", head: "#now-ram", leftMax: 100,
+    series: [{ key: "memPercent", color: "#3fb950", name: "内存 (%)" }],
+    readout: (p) => `${pct(p.memPercent)} · ${mbText(p.memUsedMb)} / ${mbText(p.memTotalMb)}` },
+];
+
+function linePath(vals, seqs, g, max) {
+  const n = vals.length;
+  const step = n > 1 ? g.w / (n - 1) : 0;
+  let d = "", open = false;
+  for (let i = 0; i < n; i++) {
+    const v = vals[i];
+    if (v == null || !isFinite(v)) { open = false; continue; }
+    // 序号跳号 = 中间有点滚出了环形窗口：**断开**，不要把两个时刻连成一条假线
+    if (open && i > 0 && Number(seqs[i]) - Number(seqs[i - 1]) > 1) open = false;
+    const x = g.x0 + step * i;
+    const y = g.y0 + g.h - g.h * Math.min(1, Math.max(0, v / (max || 1)));
+    d += (open ? "L" : "M") + x.toFixed(1) + " " + y.toFixed(1) + " ";
+    open = true;
+  }
+  return d.trim();
+}
+
+const clockOf = (p) => (p && p.t ? new Date(Number(p.t) * 1000).toLocaleTimeString() : "");
+
+function drawChart(spec) {
+  const svg = $(spec.svg);
+  if (!svg) return;
+  const pts = PERF.points;
+  const seqs = pts.map((p) => p.seq);
+  const g = { x0: CHART_PAD.l, y0: CHART_PAD.t,
+              w: CHART_W - CHART_PAD.l - CHART_PAD.r, h: CHART_H - CHART_PAD.t - CHART_PAD.b };
+  const series = spec.series.map((s) => Object.assign({}, s, {
+    vals: pts.map((p) => (p[s.key] == null || p[s.key] === "" ? null : Number(p[s.key]))),
+  }));
+  const right = series.filter((s) => s.axis === "r");
+  let leftMax = 0;
+  if (typeof spec.leftMax === "number") leftMax = spec.leftMax;
+  else if (spec.leftMaxKey) {
+    const totals = pts.map((p) => Number(p[spec.leftMaxKey] || 0)).filter((v) => v > 0);
+    leftMax = totals.length ? Math.max.apply(null, totals) : 0;
+  }
+  if (!(leftMax > 0)) {
+    leftMax = niceMax(Math.max.apply(null, series.map((s) => maxOf(s.vals)).concat([0])));
+  }
+  let rightMax = 1;
+  if (right.length) {
+    rightMax = spec.rightMaxKey
+      ? Math.max(1, Math.max.apply(null, pts.map((p) => Number(p[spec.rightMaxKey] || 0)).concat([0])))
+      : niceMax(Math.max.apply(null, right.map((s) => maxOf(s.vals)).concat([1])));
+  }
+  const out = [];
+  const yb = g.y0 + g.h;
+  [0, 0.5, 1].forEach((f) => {                       // 横向网格：0 / 50% / 100%
+    const y = yb - g.h * f;
+    out.push(`<line x1="${g.x0}" y1="${y.toFixed(1)}" x2="${(g.x0 + g.w).toFixed(1)}" y2="${y.toFixed(1)}" stroke="#2a2f3a" stroke-width="1"/>`);
+    if (f !== 0.5) {
+      out.push(`<text x="${g.x0 - 3}" y="${(y + 2.5).toFixed(1)}" fill="#9aa3b2" font-size="7.5" text-anchor="end">${esc(axisNum(leftMax * f))}</text>`);
+    }
+  });
+  out.push(`<line x1="${g.x0}" y1="${g.y0}" x2="${g.x0}" y2="${yb}" stroke="#2a2f3a" stroke-width="1"/>`);
+  out.push(`<line x1="${g.x0}" y1="${yb}" x2="${(g.x0 + g.w).toFixed(1)}" y2="${yb}" stroke="#2a2f3a" stroke-width="1"/>`);
+  if (right.length) {                                // 右轴（在途请求数）：只有 0 与上限两个刻度
+    out.push(`<text x="${(g.x0 + g.w + 3).toFixed(1)}" y="${(g.y0 + 6).toFixed(1)}" fill="#d29922" font-size="7.5">${esc(axisNum(rightMax))}</text>`);
+    out.push(`<text x="${(g.x0 + g.w + 3).toFixed(1)}" y="${(yb + 2.5).toFixed(1)}" fill="#d29922" font-size="7.5">0</text>`);
+  }
+  const tl = clockOf(pts[0]), tr = clockOf(pts[pts.length - 1]);
+  if (tl) out.push(`<text x="${g.x0}" y="${CHART_H - 5}" fill="#9aa3b2" font-size="7.5">${esc(tl)}</text>`);
+  if (tr && pts.length > 1) {
+    out.push(`<text x="${(g.x0 + g.w).toFixed(1)}" y="${CHART_H - 5}" fill="#9aa3b2" font-size="7.5" text-anchor="end">${esc(tr)}</text>`);
+  }
+  series.forEach((s) => {
+    const d = linePath(s.vals, seqs, g, s.axis === "r" ? rightMax : leftMax);
+    if (d) {
+      out.push(`<path d="${d}" fill="none" stroke="${s.color}" stroke-width="1.4" stroke-linejoin="round"${s.dash ? ` stroke-dasharray="${s.dash}"` : ""}/>`);
+    }
+  });
+  svg.innerHTML = out.join("");
+  const legend = $(spec.legend);
+  if (legend) {
+    legend.innerHTML = series.map((s) => {          // 最小值 / 最大值标注（需求点名要的）
+      const nums = s.vals.filter((v) => v != null && isFinite(v));
+      const mm = nums.length
+        ? `最小 ${axisNum(Math.min.apply(null, nums))} / 最大 ${axisNum(Math.max.apply(null, nums))}`
+        : "还没有数据";
+      return `<span><i class="swatch" style="background:${s.color}"></i>${esc(s.name)}：${esc(mm)}</span>`;
+    }).join("");
+  }
+  const head = $(spec.head);
+  if (head) head.textContent = spec.readout(pts.length ? pts[pts.length - 1] : {});
+}
+
+const drawAllCharts = () => PERF_CHARTS.forEach(drawChart);
+
+function stopPerfPoll() {
+  if (PERF.timer) { clearInterval(PERF.timer); PERF.timer = null; }
+}
+
+async function viewPerf() {
+  const tpl = document.getElementById("perfChartsTpl");
+  return `<div class="card">
+    <h2>性能记录</h2>
+    <div class="perfbar">
+      <button class="primary" id="btnPerfStart">开始记录</button>
+      <button class="danger" id="btnPerfStop">停止记录</button>
+      <span class="badge idle" id="perfBadge">读状态…</span>
+      <span class="stat" id="perfStat"></span>
+    </div>
+    <div class="muted" style="margin-top:6px" id="perfNote"></div>
+  </div>${tpl ? tpl.innerHTML : ""}`;
+}
+
+function bindPerf() {
+  stopPerfPoll();
+  PERF.points = [];          // 进页签 = 重新按服务端的窗口对齐（服务端是权威）
+  PERF.since = "";
+  const start = $("#btnPerfStart"), stop = $("#btnPerfStop");
+  if (start) {
+    start.onclick = async () => {
+      try { PERF.state = await wpost("/admin/api/perf/start"); }
+      catch (e) { alert("开始记录失败：" + e.message); }
+      PERF.points = []; PERF.since = "";
+      await refreshPerf();
+    };
+  }
+  if (stop) {
+    stop.onclick = async () => {
+      try { PERF.state = await wpost("/admin/api/perf/stop"); }
+      catch (e) { alert("停止记录失败：" + e.message); }
+      await refreshPerf();
+    };
+  }
+  refreshPerf();
+  PERF.timer = setInterval(refreshPerf, PERF_POLL_MS);
+}
+
+/* 增量合并：`since` = 上一批的 `nextSince`，所以每次只回新点（不是全量重拉）。
+   服务端的环形窗口是权威 —— 已经滚出窗口的点，本地也丢掉。 */
+function mergePoints(d) {
+  const cap = Number(d.capacity || 900);
+  const from = Number(d.firstSeq || 0);
+  if (from > 0) PERF.points = PERF.points.filter((p) => Number(p.seq) >= from);
+  let last = PERF.points.length ? Number(PERF.points[PERF.points.length - 1].seq) : 0;
+  (d.series || []).forEach((p) => {
+    if (Number(p.seq) > last) { PERF.points.push(p); last = Number(p.seq); }
+  });
+  if (PERF.points.length > cap) PERF.points = PERF.points.slice(-cap);
+  if (d.nextSince != null) PERF.since = d.nextSince;
+}
+
+async function refreshPerf() {
+  if (!$("#chart-gpu")) { stopPerfPoll(); return; }   // 已经切走了
+  try {
+    const q = PERF.since === "" ? "" : "?since=" + encodeURIComponent(PERF.since);
+    const d = await api("/admin/api/perf/points" + q);
+    PERF.state = d;
+    mergePoints(d);
+    drawAllCharts();
+    const badge = $("#perfBadge");
+    if (badge) {
+      badge.className = "badge " + (d.recording ? "on" : "off");
+      badge.textContent = d.recording ? "记录中" : "已停止";
+    }
+    const stat = $("#perfStat");
+    if (stat) {
+      const last = PERF.points.length ? PERF.points[PERF.points.length - 1] : {};
+      const models = (last.modelsTotal == null ? "" :
+        ` · 模型 ${Number(last.modelsReady || 0)}/${Number(last.modelsTotal)} 就绪`);
+      stat.textContent = `已采 ${d.samples} 点 · 采样间隔 ${d.intervalSeconds}s`
+        + ` · 窗口 ${Math.round(d.windowSeconds)}s（${d.capacity} 点）`
+        + (d.dropped ? ` · 已滚出 ${d.dropped} 点` : "")
+        + models
+        + (d.sampling ? " · 正在采样" : " · 未采样（没人在看）");
+    }
+    const note = $("#perfNote");
+    if (note) {
+      note.textContent = "数据只在后端进程的内存里：不落盘，重启即清空。"
+        + `关掉或切走这个页面后 ${Math.round(d.viewerTtlSeconds)} 秒内没人取点，采样自动停`
+        + "（「记录中」这个状态留着，回来接着采）。"
+        + (d.samplerError ? ` ⚠️ 采集报错：${d.samplerError}` : "");
+    }
+  } catch (e) {
+    const stat = $("#perfStat");
+    if (stat) stat.textContent = "取点失败：" + e.message;
+  }
+}
+
 function table(head, rows) {
   if (!rows.length) return `<div class="muted">（没有数据）</div>`;
   return `<table><thead><tr>${head.map((h) => `<th>${esc(h)}</th>`).join("")}</tr></thead>
@@ -487,6 +766,16 @@ function table(head, rows) {
              : (typeof c === "string" && c.startsWith("<span") ? c : esc(c))}</td>`).join("")}</tr>`).join("")}
     </tbody></table>`;
 }
+
+/* 页面被关掉 / 切走 / 进 bfcache：**立刻停掉轮询**。后端不需要收一个"关闭"请求 ——
+   轮询一停，`viewerTtlSeconds` 一到采集线程自己就退了（而且那种关闭请求还得带
+   `X-ECHO-Admin` + CSRF 头，`sendBeacon` 根本发不出来）。切回来时重画一次。 */
+window.addEventListener("pagehide", stopPerfPoll);
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) { stopPerfPoll(); return; }
+  const tab = (document.querySelector(".tabs button.active") || {}).dataset?.tab;
+  if (tab === "perf" && !$("#app").classList.contains("hidden")) render();
+});
 
 boot();
 </script>

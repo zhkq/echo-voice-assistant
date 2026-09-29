@@ -90,6 +90,12 @@ VARIANTS = (
         "image": "echo-backend:0.1.0-cu126",
         "torch_index": "https://download.pytorch.org/whl/cu126",
         "torch_version": "",            # 该源上最新的一版
+        # 「含权重」档要拷哪几棵子树（相对模型根）。**名字就是容器里找的那个路径**，
+        # HF 缓存那种长名（`hub/models--Qwen--Qwen3-ASR-0.6B`）别改写。
+        "models": ("hub/models--Qwen--Qwen3-ASR-0.6B",
+                   "hub/models--Qwen--Qwen3-ForcedAligner-0.6B",
+                   "sensevoice",
+                   "pyannote"),
     },
     {
         "key": "cu118",
@@ -98,15 +104,29 @@ VARIANTS = (
         "image": "echo-backend:0.1.0-cu118",
         "torch_index": "https://download.pytorch.org/whl/cu118",
         "torch_version": "2.7.1",       # cu118 源上带 Pascal(sm_61) 的最后一版，**必须钉**
+        # 老卡**只要 SenseVoice**：镜像里没有 qwen-asr（会被 torch 版本校验拦住），
+        # 也没有 pyannote（4.x 要 torch>=2.8）。拷多了只是白占几个 GB。
+        "models": ("sensevoice",),
     },
 )
+
+#: 「含权重」档在包根留的说明文件名（自检与 `--check` 都靠它判断"这个包带没带权重"）。
+MODELS_NOTE = "MODELS-INCLUDED.txt"
+
+#: 含权重包超过这个体积就**提醒一声**（不是失败：权重本来就大）。
+MODELS_WARN_BYTES = 2 * 1024 ** 3
 
 #: 「后端要的两层」——与 `server/Dockerfile` 的 `COPY server/ app/` 对齐，不多不少。
 BACKEND_TREES = ("server", "app")
 #: 从仓库里单独点名的两个脚本（不是整层 scripts/：那是给客户端的，后端不需要）
 BACKEND_FILES = ("scripts/prepare-backend.sh", "scripts/smoke-echo-backend.py")
-#: 每个变体的交付目录里**必须**有的模板（缺一个就别出包）
-DELIVERY_REQUIRED = (KIT_README, "compose.yaml", ".env.example", "server.yaml")
+#: 每个变体的交付目录里**必须**有的模板（缺一个就别出包）。
+#: **这张表同时是两个变体的"不许漂"契约**：`tests/test_build_backend_kit.py` 直接派生它，
+#: 于是"某个变体多出一份只发给自己的文档"这种事会在出包与用例两处一起报错
+#: （2026-09-28：cu126 多了 `给同事Agent-构建说明.md` 而 cu118 没有，
+#:  那条红就是这么来的 —— 修法是两边都补上，而不是把判据放宽）。
+DELIVERY_REQUIRED = (KIT_README, "compose.yaml", ".env.example", "server.yaml",
+                     "给同事Agent-构建说明.md")
 
 #: 永远不打包的目录名（安全 + 体积）。`data/` 与 `models/` 是**业务数据与几 GB 权重**；
 #: `__pycache__/` `.git/` `dist/` 是构建垃圾与产物。
@@ -150,9 +170,17 @@ def load_build_kit():
 
 
 # --------------------------------------------------------------------- 排除规则
-def is_excluded(rel_parts: tuple[str, ...], name: str) -> bool:
-    """这个文件该不该进包（判据只此一处，打包与自检都走它）。"""
-    if any(part in EXCLUDE_DIRS for part in rel_parts[:-1]):
+def is_excluded(rel_parts: tuple[str, ...], name: str, *, allow_models: bool = False) -> bool:
+    """这个文件该不该进包（判据只此一处，打包与自检都走它）。
+
+    `allow_models=True` 只放行**目录名那一层的 `models`** ——「含权重」档才用得上它；
+    后缀类排除（`.db` / `.log` / `.pem` …）在权重目录里**照旧生效**，
+    免得把缓存里的垃圾或密钥一起打进去。
+    """
+    dirs = rel_parts[:-1]
+    if allow_models and dirs and dirs[0] == "models":
+        dirs = dirs[1:]
+    if any(part in EXCLUDE_DIRS for part in dirs):
         return True
     low = name.lower()
     if low in EXCLUDE_NAMES:
@@ -166,10 +194,49 @@ def is_excluded(rel_parts: tuple[str, ...], name: str) -> bool:
 
 
 # --------------------------------------------------------------------- 打包清单
-def planned_files(variant: dict) -> dict[str, Path]:
+def planned_model_files(variant: dict, models_from: Path) -> dict[str, Path]:
+    """**「含权重」档**要拷进包的文件：`models/<变体声明的那几棵子树>/**`。
+
+    缺一棵就**失败**，不做"能拷多少拷多少"：含权重包的全部意义是拿来即用，
+    少一棵子树的表现是"装完了某个引擎加载失败" —— 那种故障要到真机上才现形，
+    而真机在同事手上。
+
+    键带 `models/` 前缀（容器里按同一路径找：`ECHO_HOST_MODELS_DIR` 指向包内 `models/`）。
+    """
+    out: dict[str, Path] = {}
+    wanted = tuple(variant.get("models") or ())
+    missing = [rel for rel in wanted if not (models_from / rel).is_dir()]
+    if missing:
+        raise BuildError(
+            "「含权重」档要求模型根里这几棵子树都在，缺：%s\n"
+            "        模型根：%s\n"
+            "        变体 %s 需要：%s\n"
+            "        先把权重放齐（见 delivery/%s/先读我.md 第 4 节），"
+            "或者出**纯代码包**（不加 --with-models）。"
+            % (", ".join(missing), models_from, variant["key"], ", ".join(wanted),
+               variant["delivery"]))
+    for rel in wanted:
+        src = models_from / rel
+        for path in sorted(src.rglob("*")):
+            if not path.is_file():
+                continue
+            rel_inside = path.relative_to(models_from).as_posix()
+            # 权重目录里**照旧**走后缀/文件名排除（缓存垃圾、密钥、证书一个都不带）
+            if is_excluded(("models",) + path.relative_to(models_from).parts,
+                           path.name, allow_models=True):
+                continue
+            out["models/" + rel_inside] = path
+    if not out:
+        raise BuildError("模型根 %s 下这几棵子树里一个文件都没有：%s"
+                         % (models_from, ", ".join(wanted)))
+    return out
+
+
+def planned_files(variant: dict, models_from: Path | None = None) -> dict[str, Path]:
     """这个变体现在会打出哪些文件：`{包内相对路径: 仓库里的源文件}`。
 
     **唯一的事实源** —— 打包（stage）与过期检查（--check）都用它，所以两者不可能漂。
+    `models_from` 给了就额外把**权重**按变体声明的子树拷进来（「含权重」档）。
     """
     ddir = DELIVERY / variant["delivery"]
     if not ddir.is_dir():
@@ -179,7 +246,7 @@ def planned_files(variant: dict) -> dict[str, Path]:
         raise BuildError(f"{variant['delivery']}/ 里缺：{', '.join(missing)}")
 
     out: dict[str, Path] = {}
-    # ① 交付目录里的模板（先读我.md / compose.yaml / .env.example / server.yaml）→ 包根
+    # ① 交付目录里的模板（先读我.md / 给同事Agent-构建说明.md / compose.yaml / …）→ 包根
     for path in sorted(ddir.rglob("*")):
         if not path.is_file():
             continue
@@ -205,6 +272,9 @@ def planned_files(variant: dict) -> dict[str, Path]:
         if not path.is_file():
             raise BuildError(f"缺 {rel}")
         out[rel] = path
+    # ④ 「含权重」档：把变体声明的那几棵模型子树拷进来（默认不走这一步）
+    if models_from is not None:
+        out.update(planned_model_files(variant, Path(models_from)))
     return out
 
 
@@ -223,7 +293,8 @@ def parse_sums(text: str) -> dict[str, str]:
     return out
 
 
-def build_info_text(variant: dict, stamp: str, files: dict[str, Path], build_kit) -> str:
+def build_info_text(variant: dict, stamp: str, files: dict[str, Path], build_kit,
+                    *, models_bytes: int = 0) -> str:
     short = build_kit.git_short() or "unknown"
     dirty = "（工作区有未提交改动）" if build_kit.git_dirty() else ""
     per_tree: dict[str, int] = {}
@@ -231,6 +302,7 @@ def build_info_text(variant: dict, stamp: str, files: dict[str, Path], build_kit
         per_tree[rel.split("/")[0]] = per_tree.get(rel.split("/")[0], 0) + 1
     pinned = (f"（钉 torch=={variant['torch_version']}）" if variant["torch_version"]
               else "（该源上最新的一版）")
+    has_models = bool(models_bytes) or any(r.startswith("models/") for r in files)
     lines = [
         "# ECHO 能力后端交付包 —— this archive",
         f"variant      : {variant['key']} —— {variant['label']}",
@@ -242,21 +314,70 @@ def build_info_text(variant: dict, stamp: str, files: dict[str, Path], build_kit
         "builder      : scripts/build_backend_kit.py",
         "",
         "contents（只带后端要的两层 + 交付目录里的模板）:",
-        f"  {KIT_README} / compose.yaml / .env.example / server.yaml",
+        f"  {KIT_README} / 给同事Agent-构建说明.md / compose.yaml / .env.example / server.yaml",
         f"  server/    {per_tree.get('server', 0)} 个文件",
         f"  app/       {per_tree.get('app', 0)} 个文件",
         "  scripts/prepare-backend.sh, scripts/smoke-echo-backend.py",
         "",
-        "不含（刻意的）: data/ models/ __pycache__/ .git/ dist/ 以及任何密钥与证书。",
-        "模型不随镜像也不随包：权重从宿主**只读挂载**进容器（见 先读我.md 第 4 节）。",
+    ]
+    if has_models:
+        lines += [
+            f"**含权重**（{per_tree.get('models', 0)} 个文件，约 {models_bytes / (1 << 20):.0f} MB）:",
+            "  models/ 就在包根 —— 把它挂给容器（ECHO_HOST_MODELS_DIR 指过来）即可，",
+            f"  不用再去 ModelScope 下。清单与摆法见同目录 {MODELS_NOTE}。",
+        ]
+    else:
+        lines += [
+            "**不含权重**（纯代码包）: 模型不随镜像也不随包，",
+            "  权重从宿主**只读挂载**进容器（见 先读我.md 第 4 节）。",
+        ]
+    lines += [
+        "",
+        "不含（刻意的）: data/ __pycache__/ .git/ dist/ 以及任何密钥与证书。",
         f"装法：先读 {KIT_README}（中文，给非开发者）；逐文件校验见同目录 SHA256SUMS.txt。",
     ]
     return "\n".join(lines) + "\n"
 
 
+def models_note_text(variant: dict, files: dict[str, Path], models_bytes: int) -> str:
+    """「含权重」档包根那份说明：里面是什么、怎么挂、别做什么。"""
+    got = sorted({"/".join(r.split("/")[:2]) for r in files if r.startswith("models/")})
+    return "\n".join([
+        "# 这个包**含模型权重**（不是纯代码包）",
+        "",
+        f"变体      : {variant['key']} —— {variant['label']}",
+        f"权重体积  : 约 {models_bytes / (1 << 20):.0f} MB（{len([r for r in files if r.startswith('models/')])} 个文件）",
+        "",
+        "包内这几棵子树：",
+        *(f"  models/{name}/" for name in got),
+        "",
+        "## 怎么用（与 先读我.md 第 4 节的差别只有一步）",
+        "",
+        "权重**就在包根的 `models/`**，所以第 4 节里「从源机 rsync / 从 ModelScope 下」",
+        "这一步可以跳过 —— 把 `ECHO_HOST_MODELS_DIR` 指向**解包后的 `models/`** 即可：",
+        "",
+        "```bash",
+        f"# 在 .env 里（或直接 export）：",
+        f"ECHO_HOST_MODELS_DIR=$(pwd)/models      # 解包目录下的 models/",
+        "docker compose up -d",
+        "```",
+        "",
+        "## 别做的两件事",
+        "",
+        "1. **别把 `models/` 拷进镜像** —— 它是只读挂载进来的（换权重不必重出镜像）。",
+        "2. **别删包里的 `SHA256SUMS.txt`** —— 权重有几个 GB，传输坏了不会报错，",
+        "   只会在加载时报一个看不懂的错。校验一遍：`sha256sum -c SHA256SUMS.txt`。",
+        "",
+        "> 本变体需要哪几个引擎由 `server.yaml` 的 `models.specs` 决定；",
+        "> 权重与它不匹配时的表现是「某个 spec 一直 model_failed」，`/v1/health` 的 `models` 看得见。",
+        "",
+    ])
+
+
 # --------------------------------------------------------------------- 出包
-def stage(variant: dict, stamp: str, out: Path, build_kit) -> tuple[Path, Path]:
-    files = planned_files(variant)
+def stage(variant: dict, stamp: str, out: Path, build_kit,
+          models_from: Path | None = None) -> tuple[Path, Path]:
+    files = planned_files(variant, models_from)
     kit_dir = out / f"{KIT_PREFIX}-{variant['key']}-{stamp}"
     if kit_dir.exists():
         shutil.rmtree(kit_dir)
@@ -265,9 +386,17 @@ def stage(variant: dict, stamp: str, out: Path, build_kit) -> tuple[Path, Path]:
         dst = kit_dir / rel
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(src, dst)
+    models_bytes = sum(src.stat().st_size for rel, src in files.items()
+                       if rel.startswith("models/"))
     (kit_dir / "SHA256SUMS.txt").write_text(sums_text(files, build_kit), encoding="utf-8")
     (kit_dir / "BUILD-INFO.txt").write_text(
-        build_info_text(variant, stamp, files, build_kit), encoding="utf-8")
+        build_info_text(variant, stamp, files, build_kit, models_bytes=models_bytes),
+        encoding="utf-8")
+    if models_bytes:
+        # 「含权重」档多一份说明（怎么挂、别做什么）。它**不进 SHA256SUMS**：
+        # 那份清单列的是"从仓库拷来的文件"，生成物一向不进去（BUILD-INFO 也不进）。
+        (kit_dir / MODELS_NOTE).write_text(
+            models_note_text(variant, files, models_bytes), encoding="utf-8")
     # 顶层前缀由 build_kit.make_zip 统一加（少前缀 = 解包散落，这个坑不报错）
     zip_path = out / (kit_dir.name + ".zip")
     build_kit.make_zip(kit_dir, zip_path, kit_dir.name)
@@ -315,26 +444,41 @@ def check_compose(text: str, variant: dict) -> list[str]:
     return problems
 
 
-def verify_kit(kit_dir: Path, variant: dict, build_kit) -> list[str]:
-    """出完包后的自检。返回问题列表（空 = 通过）。"""
+def verify_kit(kit_dir: Path, variant: dict, build_kit,
+               models_from: Path | None = None) -> list[str]:
+    """出完包后的自检。返回问题列表（空 = 通过）。
+
+    `models_from` 给了就按「含权重」档来查：那份说明要在、变体声明的每棵子树都要有文件。
+    """
+    with_models = models_from is not None
     problems: list[str] = []
-    for name in DELIVERY_REQUIRED + ("BUILD-INFO.txt", "SHA256SUMS.txt"):
+    required = DELIVERY_REQUIRED + ("BUILD-INFO.txt", "SHA256SUMS.txt")
+    if with_models:
+        required += (MODELS_NOTE,)
+    for name in required:
         if not (kit_dir / name).is_file():
             problems.append(f"包根缺 {name}")
     for rel in ("server/Dockerfile", "server/requirements.txt", "server/main.py",
                 "app/audio/stt.py"):
         if not (kit_dir / rel).is_file():
             problems.append(f"缺 {rel}（后端跑不起来）")
-    # 排除项：包内**一个都不许有**（这条是安全线，别放松）
+    # 排除项：包内**一个都不许有**（这条是安全线，别放松）；含权重档只放行 models/ 顶层
     for path in kit_dir.rglob("*"):
         rel_parts = path.relative_to(kit_dir).parts
-        if path.is_file() and is_excluded(rel_parts, path.name):
+        if path.is_file() and is_excluded(rel_parts, path.name, allow_models=with_models):
             problems.append(f"包里出现了该排除的文件：{path.relative_to(kit_dir).as_posix()}")
         if path.is_dir() and path.name in EXCLUDE_DIRS:
-            problems.append(f"包里出现了该排除的目录：{path.relative_to(kit_dir).as_posix()}")
+            if not (with_models and rel_parts[:1] == ("models",)):
+                problems.append(f"包里出现了该排除的目录：{path.relative_to(kit_dir).as_posix()}")
+    if with_models:
+        for rel in (variant.get("models") or ()):
+            sub = kit_dir / "models" / rel
+            files_inside = [p for p in sub.rglob("*") if p.is_file()] if sub.is_dir() else []
+            if not files_inside:
+                problems.append(f"含权重档里 models/{rel}/ 是空的或不存在（变体声明要它）")
     problems += check_compose((kit_dir / "compose.yaml").read_text(encoding="utf-8"), variant)
     # 清单与内容必须对得上（否则 SHA256SUMS 是一句空话）
-    files = planned_files(variant)
+    files = planned_files(variant, models_from)
     sums = parse_sums((kit_dir / "SHA256SUMS.txt").read_text(encoding="utf-8"))
     if sorted(sums) != sorted(files):
         problems.append("SHA256SUMS.txt 与本次打包清单不一致")
@@ -345,7 +489,7 @@ def verify_kit(kit_dir: Path, variant: dict, build_kit) -> list[str]:
     return problems
 
 
-def check_zip(zip_path: Path, variant: dict) -> list[str]:
+def check_zip(zip_path: Path, variant: dict, *, with_models: bool = False) -> list[str]:
     """zip 层的两条硬事实：条目前缀 + 不许出现被排除的路径。"""
     import zipfile
     problems: list[str] = []
@@ -360,7 +504,7 @@ def check_zip(zip_path: Path, variant: dict) -> list[str]:
             if not rel:
                 continue
             parts = rel.split("/")
-            if is_excluded(tuple(parts), parts[-1]):
+            if is_excluded(tuple(parts), parts[-1], allow_models=with_models):
                 problems.append(f"zip 里有被排除的条目：{name}")
         if prefix + "SHA256SUMS.txt" not in names:
             problems.append("zip 里没有 SHA256SUMS.txt")
@@ -393,11 +537,16 @@ def compare_to_source(zip_path: Path, variant: dict, build_kit) -> tuple[list[st
 
     判据是 `SHA256SUMS.txt` 里的哈希 —— 它就是"包里到底装了什么"的权威清单，
     所以比时间戳猜靠谱。三路：改了 / 新增了 / 删掉了。
+
+    **含权重包里的 `models/**` 不参与这条比较**：那是"payload"，不是源码 ——
+    它本来就允许与当前机器上的权重不同（出包那台机器上放着就算数）。
     """
     files = planned_files(variant)
-    sums = parse_sums(read_zip_text(zip_path, zip_path.stem + "/SHA256SUMS.txt"))
-    if not sums:
+    all_sums = parse_sums(read_zip_text(zip_path, zip_path.stem + "/SHA256SUMS.txt"))
+    if not all_sums:
         return [f"{zip_path.name} 里没有可用的 SHA256SUMS.txt"], ""
+    model_entries = [rel for rel in all_sums if rel.startswith("models/")]
+    sums = {rel: sha for rel, sha in all_sums.items() if not rel.startswith("models/")}
     changed = [rel for rel in sorted(files)
                if rel in sums and build_kit.sha256_file(files[rel]) != sums[rel]]
     added = [rel for rel in sorted(files) if rel not in sums]
@@ -413,12 +562,15 @@ def compare_to_source(zip_path: Path, variant: dict, build_kit) -> tuple[list[st
         problems.append(f"{len(removed)} 个文件已从仓库删除：" + ", ".join(removed[:6])
                         + (" …" if len(removed) > 6 else ""))
     note = ""
+    if model_entries:
+        note = f"含权重（{len(model_entries)} 个文件，不计入源码一致性）"
     info = read_zip_text(zip_path, zip_path.stem + "/BUILD-INFO.txt")
     m = re.search(r"^git\s*:\s*([0-9a-f]+)", info, re.M)
     head = build_kit.git_short()
     if m and head:
-        note = (f"git {head}（与 HEAD 相同）" if m.group(1) == head
-                else f"包出自 git {m.group(1)}，当前 HEAD {head}")
+        git_note = (f"git {head}（与 HEAD 相同）" if m.group(1) == head
+                    else f"包出自 git {m.group(1)}，当前 HEAD {head}")
+        note = f"{note}；{git_note}" if note else git_note
     return problems, note
 
 
@@ -463,26 +615,35 @@ def parse_variants(spec: str) -> list[dict]:
     return picked
 
 
-def do_build(out: Path, variants: list[dict], stamp: str, verify: bool, build_kit) -> int:
+def do_build(out: Path, variants: list[dict], stamp: str, verify: bool, build_kit,
+             models_from: Path | None = None) -> int:
     out.mkdir(parents=True, exist_ok=True)
+    tier = "含权重" if models_from is not None else "纯代码"
     print(f"=== build-backend-kit (variants={','.join(v['key'] for v in variants)}, "
-          f"stamp={stamp}) ===")
+          f"stamp={stamp}, 档位={tier}) ===")
     print(f"  git : {build_kit.git_short() or '?'}"
           f"{' (dirty：工作区有未提交改动)' if build_kit.git_dirty() else ''}")
+    if models_from is not None:
+        print(f"  models: {models_from}")
     results = []
     for variant in variants:
-        files = planned_files(variant)
-        kit_dir, zip_path = stage(variant, stamp, out, build_kit)
+        files = planned_files(variant, models_from)
+        kit_dir, zip_path = stage(variant, stamp, out, build_kit, models_from)
         size_mb = zip_path.stat().st_size / (1 << 20)
-        print(f"  [kit  ] {zip_path.name}  ({size_mb:.2f} MB, {len(files)} 个源文件)")
+        weights = len([r for r in files if r.startswith("models/")])
+        extra = f" + {weights} 个权重文件" if weights else ""
+        print(f"  [kit  ] {zip_path.name}  ({size_mb:.2f} MB, {len(files)} 个源文件{extra})")
+        if zip_path.stat().st_size > MODELS_WARN_BYTES:
+            print(f"         [!] 超过 {MODELS_WARN_BYTES / (1 << 30):.0f} GB —— "
+                  f"拷给同事时注意盘符与传输方式（USB/内网 rsync 都比聊天工具稳）")
         results.append((variant, kit_dir, zip_path))
 
     if verify:
         print("\n=== verify ===")
         failed = False
         for variant, kit_dir, zip_path in results:
-            problems = verify_kit(kit_dir, variant, build_kit)
-            problems += check_zip(zip_path, variant)
+            problems = verify_kit(kit_dir, variant, build_kit, models_from)
+            problems += check_zip(zip_path, variant, with_models=models_from is not None)
             if problems:
                 failed = True
                 print(f"  [FAIL] {kit_dir.name}")
@@ -509,6 +670,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--out", default="", help="输出目录（默认 <repo>/dist）")
     ap.add_argument("--stamp", default="", help="覆盖时间戳（默认 now，形如 20260928-0130）")
     ap.add_argument("--no-verify", action="store_true", help="跳过出包后的自检")
+    ap.add_argument("--with-models", action="store_true",
+                    help="**含权重档**：把变体声明的那几棵模型子树打进包（默认出纯代码包）。"
+                         "权重不齐会**直接失败**，不做「能拷多少拷多少」")
+    ap.add_argument("--models-from", default="",
+                    help="模型根（默认 <repo>/models）。只与 --with-models 一起用；"
+                         "出包测试/换机时指到别处")
     args = ap.parse_args(argv)
 
     out = Path(args.out).resolve() if args.out else DIST
@@ -517,8 +684,13 @@ def main(argv: list[str] | None = None) -> int:
         build_kit = load_build_kit()
         if args.check:
             return do_check(out, variants, build_kit)
+        models_from = None
+        if args.with_models or args.models_from:
+            models_from = Path(args.models_from).resolve() if args.models_from else (ROOT / "models")
+            if not models_from.is_dir():
+                raise BuildError(f"模型根不存在：{models_from}（含权重档要它）")
         stamp = args.stamp or time.strftime("%Y%m%d-%H%M")
-        return do_build(out, variants, stamp, not args.no_verify, build_kit)
+        return do_build(out, variants, stamp, not args.no_verify, build_kit, models_from)
     except BuildError as exc:
         print(f"\n[fail] {exc}")
         return EXIT_ERROR

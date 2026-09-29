@@ -622,11 +622,21 @@ class ImportThenTranscribeTests(_ImportCase):
         self.assertEqual(meeting.meeting_meta(name).get("segments"), ["01.wav"])
 
     def test_retranscribe_of_an_imported_meeting_still_works(self):
-        """既有路径回归：导入的这场会照样能走 `retranscribe_meeting()`。"""
+        """既有路径回归：导入的这场会照样能走 `retranscribe_meeting()`。
+
+        2026-09-28 补充：这条用例原来直接对"导入刚排上、状态还停在 `transcribing`"
+        的那一行发起重新转写 —— 而**那正是新加的那道闸要拦住的情况**
+        （见 `tests/test_meeting_retranscribe_guard.py`，用户实测的重复点击 bug）。
+        这里把这场会先**收尾**成"已转写"：这条用例要说的本来就不是"转写中也能重转"，
+        而是"**导入来的会议**不该被特殊对待、照样能重转"（相对于录音那一条路）。
+        """
         src = self.make("甲.wav", seconds=1.0, rate=16000, channels=1)
         ok, name = self.import_([src])
         self.assertTrue(ok, name)
         row = db.get_meeting_by_name(name)
+        # 本类把 `_transcribe_meeting` 打了桩（见类注释），所以导入排上的那个后台转写
+        # 不会去改状态 —— 手工收尾，模拟"这一场已经转完"。
+        db.update_meeting(row["id"], status="transcribed")
         with patch.object(meeting, "_transcribe_meeting", MagicMock()) as spy:
             ok2, msg = meeting.retranscribe_meeting(row["id"])
         self.assertTrue(ok2, msg)

@@ -1088,6 +1088,36 @@ secret 会留在聊天记录里，而且管理员得一台台填。
    所以 JWT 里带 `tokenVersion`、`clients` 表里也有一个：**撤销 = 版本 +1**；
    服务端校验时比对**进程内缓存**（不每请求查库，见 §8.5 最后一段）。
 
+#### 7.4.1 本机自配对（`local-pair.json`，2026-09-28）
+
+**场景**：后端与客户端在**同一台机器**上（设计
+`docs/3.0-设计总览与组件关系.md` §6.6 的"方案 1：本机后端"）。
+这种装法不该让人抄配对码 —— 配对串是给**另一台**机器准备的，同机有文件系统就够。
+
+做法（`server/localpair.py`）：
+
+```
+启动（server.local_pair=true，交付路径默认开）
+  → ops.issue_pairing_code() 发一张码（TTL auth.local_pair_ttl_s，默认 7 天）
+  → 写到 {状态目录}/local-pair.json（**鉴权库旁边**：显式 auth.db 的目录，否则 server.state_root）
+客户端的「检测本机后端」
+  → 读那个文件 → 走**原来那条** /v1/pair → 落自己的 backend.json
+```
+
+**几条刻意的取舍**（都有用例，`tests/test_local_pair.py`）：
+
+* 文件里**只有那张一次性码**（`echo://pair?…`，与 `--new-client` 同一个拼法），
+  **不放 clientId/secret** —— 凭据仍然只落客户端那一侧（Windows 走 DPAPI）。
+* 落点跟着**鉴权库**走，不直接跟 `state_root`：`auth.db` 是测试/多实例**唯一已经隔离好的口**
+  （`tests/test_server_contract.py::_cfg` 的注释就是"在唯一的配置入口上修"），
+  否则每个进 lifespan 的用例都会往开发机真实状态目录写一张新码。
+* **默认关**（`server.local_pair=false`）：它会往鉴权库发码，而"启动是惰性的"是值钱的默认；
+  方案 1 的交付路径（`compose.yaml` / 后端包）把它设成 `true`。
+* 权限 `0600`（POSIX）；Windows 靠用户目录 ACL —— 同机能读到它的进程本来也能读到客户端的
+  `backend.json`，没有引入新暴露面。**刻意没做"回环免令牌"**：那等于本机任何进程都能白用
+  GPU，还绕开凭据信封、轮换宽限期与审计。
+* 只跑后端、客户端在别的机器上（方案 2）时把它设成 `false`：那个文件没人用。
+
 ### 7.5 令牌、撤销与本地存储（完整生命周期）
 
 #### 全部状态转换一张图
@@ -1295,6 +1325,26 @@ Windows 上至少要走 DPAPI（`CryptProtectData`）；这与"业务数据留�
 | `/v1/ready` | **就绪**（readiness） | 模型池全 failed / 显存耗尽 → 503 |
 
 混在一起会导致：模型加载中 → 被编排系统反复重启 → 永远起不来。
+
+#### 8.1.1 `/v1/health` 里给客户端的那几项（2026-09-28）
+
+它是**免凭据**的（§8.1 上表 + `tests/test_server_contract.py` 的守卫），所以客户端
+"还没配对"时也能看到后端长什么样。客户端「能力」卡的状态行与「打开后端管理面」深链
+**只读这一份**，一个数字都不自己算：
+
+| 字段 | 客户端拿它做什么 |
+|---|---|
+| `version` | 状态行「版本 x」 |
+| `vram.{budgetMb,usedMb}` | 状态行「显存 used/budget GB」 |
+| `models`（id → `ready`/`absent`/…） | 状态行「模型 N/M 就绪」 |
+| `quota.clients`（**只有数字**） | 状态行「今日已用 N 个客户端」 |
+| **`adminUrl`** | 「打开后端管理面」的深链（空 = 管理面关着） |
+
+`adminUrl` 的规则（`server/routes.py::_admin_url`）：**只有后端知道自己的管理面在哪**，
+所以由它宣告，客户端不许猜端口。绑通配地址（容器里的常规写法）时给的是**回环**地址 ——
+容器内绑 `0.0.0.0` 是必需的（否则宿主的隧道进不来），可达范围由宿主发布规则限定在回环
+（见 `docs/后端容器部署.md` §7）。客户端只在"后端就在本机"时拿它当链接用；
+远程后端那侧会改说"用 `ssh -L 8901:127.0.0.1:8901 <后端主机>`"。
 
 ### 8.2 指标清单
 
@@ -1806,6 +1856,8 @@ client_body_temp_path /var/echo/tmp/nginx;
 | `auth.clock_skew_s` | `60` | 内网机器时钟未必准 |
 | `auth.pairing_enabled` | `true` | 关掉后新机器进不来（老客户端照用） |
 | `auth.pairing_ttl_s` | `900` | 配对码 15 分钟 |
+| `auth.local_pair_ttl_s` | `604800`（7 天） | **本机自配对文件**里那张码的有效期（§7.4.1）。比上面宽得多是刻意的：那个文件是"同机以后随时来配"用的；每次启动会重发一张 |
+| `server.local_pair` | `false` | 启动时写不写 `local-pair.json`（§7.4.1）。**交付路径设 `true`**（`ECHO_LOCAL_PAIR`），因为它会往鉴权库发一张码 |
 | `auth.pair_window_s` / `pair_max_failures` | `300` / `5` | 免凭据端点的失败退避（§7.4 约定 1） |
 | `auth.cache_ttl_s` | `60` | client 行缓存多久（撤销走主动失效，**不靠它**） |
 | `auth.revoke_poll_s` | `5` | 跨进程撤销的发现间隔（§7.5 ④） |
@@ -1817,7 +1869,7 @@ client_body_temp_path /var/echo/tmp/nginx;
 只认少数几个（容器里最方便的那一层）：`ECHO_SERVER_ID` / `ECHO_LISTEN` /
 `ECHO_TMP_ROOT` / `ECHO_STATE_ROOT` / `ECHO_MODELS_ROOT` / `ECHO_DEVICE` /
 `ECHO_MAX_CONCURRENT` / `ECHO_PER_CLIENT_CONCURRENT` / `ECHO_AUTH_ENABLED` /
-`ECHO_AUTH_MODE` / `ECHO_JWT_SECRET` / `ECHO_PAIRING_ENABLED`。
+`ECHO_AUTH_MODE` / `ECHO_JWT_SECRET` / `ECHO_PAIRING_ENABLED` / `ECHO_LOCAL_PAIR`（§7.4.1）。
 
 **布尔要认得出 `"false"`**：容器编排里它是字符串，而 Python 里非空字符串都是真 ——
 直接 `bool(os.environ[...])` 会让 `ECHO_AUTH_ENABLED=false` **打开**鉴权。

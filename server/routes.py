@@ -326,11 +326,30 @@ def capabilities(request: Request):
     }
 
 
+def _admin_url(cfg) -> str:
+    """管理面的可达地址 —— **只有后端自己知道**，所以由它宣告（2026-09-28）。
+
+    为什么要在 `/v1/health` 里给客户端：3.0 的决策是"客户端只留『连哪个后端 + 凭据 +
+    允许音频去哪』，后端自己的设置归后端"（设计 §6.6）。那么客户端要能给出一个
+    「打开后端管理面」的入口，就不能靠猜端口 —— 猜错的表现是"点开是个错误页"。
+
+    绑 `0.0.0.0`（容器里的常规写法）时这里给**回环**地址：容器内绑通配是必需的，
+    可达范围由宿主发布规则限定在回环（见 `docs/后端容器部署.md` §7）。
+    **空串 = 管理面关着**（出厂值）。
+    """
+    listen = str(cfg.get("server.admin_listen", "") or "").strip()
+    if not listen:
+        return ""
+    port = listen.rsplit(":", 1)[-1].strip() or "8901"
+    return "http://127.0.0.1:%s/admin/" % port
+
+
 @router.get("/health")
 def health(request: Request):
     """**存活**探针：几乎不失败；挂了才失败。
 
     顺便暴露运行期数字 —— 尤其临时目录那三个（**不归零就是泄漏的信号**）。
+    还有 `adminUrl`：客户端「能力」卡的状态行与「打开后端管理面」按钮读的就是它。
     """
     st = _st(request)
     return {
@@ -346,6 +365,8 @@ def health(request: Request):
         "models": {m["id"]: m["state"] for m in st.pool.status()},
         # 今天各客户端用了多少分钟（**只有数字，没有内容**）。运维要看"谁在吃 GPU"。
         "quota": st.quota.snapshot(),
+        # 管理面入口（空 = 关着）。**只有后端知道自己的 admin 监听在哪**，客户端不许猜。
+        "adminUrl": _admin_url(st.cfg),
         # 此刻的仪表（进程内计数，**不查库** —— 探针每几秒被敲一次）。
         # 跨时间/跨客户端的查询在管理面与 `--stats` 里走 `calls` 表。
         "metrics": dict(st.metrics.snapshot(),

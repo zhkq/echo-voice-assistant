@@ -27,6 +27,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import os
 import socket
 import ssl
 import time
@@ -403,3 +404,133 @@ def state() -> Dict[str, Any]:
         "pairedAt": c.paired_at,
         "tokenFresh": c.token_fresh(),
     }
+
+
+# ---------------------------------------------------------------- 本机自动配对（方案 1）
+#
+# 背景（2026-09-28，见 `docs/3.0-设计总览与组件关系.md` §6.6）：ECHO 拆成
+# "客户端 + 能力后端"两段之后，"本机跑得动"的实质就是**本机装了一个后端**。
+# 那种情况下不该让人抄配对码（配对串是给**另一台**机器准备的）——同机有文件系统，
+# 握手用文件即可：后端启动写 `{state_root}/local-pair.json`，客户端读它。
+#
+# **走的仍然是下面这条 `pair()`**：文件里的 `code` 就是一个普通的一次性配对码，
+# 产物与手工粘贴配对串**完全一样**（同一个 `{DATA}/backend.json`、同一套凭据信封、
+# 同一个 TLS 指纹固定）。所以这里没有第二套配对实现，只有"码从哪来"的区别。
+
+#: 本机自配对文件的文件名（与服务端 `server/localpair.py` 的 `FILENAME` 同一个）。
+LOCAL_PAIR_FILENAME = "local-pair.json"
+
+
+def _local_pair_setting() -> str:
+    try:
+        from app.config import settings
+        return str(settings.get("capabilityLocalPairPath", "") or "").strip()
+    except Exception:
+        return ""
+
+
+def local_pair_candidates() -> list:
+    """本机配对文件的候选位置，**顺序即优先级**。
+
+    为什么是"一串候选 + 一个设置项"而不是写死一个路径：方案 1 里后端与客户端同机，
+    但后端可能是
+
+      * 同一棵树里直接跑的（dev / 源码装）→ `{DATA}/server-state/local-pair.json`；
+      * 官方后端包（compose）装的 → 状态卷通常挂在 `{ECHO_BASE}/backend/state`；
+      * 用户自己把状态卷挂在别处（Docker 的宿主路径是用户定的，**猜不出来**）。
+
+    最后那种只能靠设置 `capabilityLocalPairPath`（或环境变量 `ECHO_LOCAL_PAIR_PATH`）。
+    猜不到时的行为是"如实说找不到 + 列出看过哪些位置 + 提示可以用配对串"，
+    不是静默失败。
+    """
+    out = []
+    explicit = _local_pair_setting()
+    if explicit:
+        out.append(explicit)
+    env = os.environ.get("ECHO_LOCAL_PAIR_PATH", "").strip()
+    if env:
+        out.append(env)
+    data = base = ""
+    try:
+        from app import paths
+        data = paths.data_root()
+        base = paths.echo_base()
+    except Exception:
+        pass
+    for root in (os.path.join(data, "server-state") if data else "",
+                 os.path.join(base, "backend", "state") if base else "",
+                 os.path.join(base, "backend") if base else "",
+                 os.path.join(base, "data", "server-state") if base else ""):
+        if root:
+            out.append(os.path.join(root, LOCAL_PAIR_FILENAME))
+    seen, uniq = set(), []
+    for p in out:
+        full = os.path.abspath(os.path.expanduser(str(p)))
+        if full not in seen:
+            seen.add(full)
+            uniq.append(full)
+    return uniq
+
+
+def read_local_pair(path: str = "") -> Tuple[str, Dict[str, Any]]:
+    """找到并读出本机配对文件 → `(实际路径, 内容)`；找不到/读不出**抛人话**。"""
+    cands = [path] if path else local_pair_candidates()
+    existing = [p for p in cands if os.path.isfile(p)]
+    if not existing:
+        raise PairingError(
+            "没找到本机后端的配对文件 —— 方案 1（本机自建后端）要先在后端那台机器上"
+            "把它跑起来（后端启动时会写一份）；后端在**别的机器**上就用手工配对串。"
+            "看过的位置：%s" % ("、".join(cands[:4]) or "（没有可看的位置）"), code="absent")
+    target = existing[0]
+    try:
+        with open(target, "r", encoding="utf-8") as f:
+            body = json.load(f)
+    except Exception as e:
+        raise PairingError("本机配对文件读不出来（%s）：%s" % (target, e), code="bad_response")
+    if not isinstance(body, dict):
+        raise PairingError("本机配对文件的内容不对（%s）：不是 JSON 对象" % target,
+                           code="bad_response")
+    return target, body
+
+
+def local_pair_state() -> Dict[str, Any]:
+    """面板用：本机有没有可用的配对文件。**不含明文码**。"""
+    try:
+        target, body = read_local_pair()
+    except PairingError as e:
+        return {"found": False, "path": "", "baseUrl": "", "expired": False,
+                "expiresAt": 0.0, "message": e.message}
+    try:
+        exp = float(body.get("expiresAt") or 0)
+    except Exception:
+        exp = 0.0
+    return {"found": True, "path": target,
+            "baseUrl": str(body.get("baseUrl") or ""),
+            "expired": bool(exp and time.time() > exp),
+            "expiresAt": exp, "message": ""}
+
+
+def pair_local(*, client_name: str = "本机自动配对", save: bool = True,
+               path: str = "") -> BackendCredentials:
+    """方案 1 的握手：读本机配对文件 → 交给**原来那条** `pair()`。
+
+    过期**如实说**：那个码是一次性的、有 TTL（服务端默认 7 天），而后端**每次启动**
+    会重发一张。所以正确指引是"让后端再启动一次"，不是让人去查网络或重装。
+    """
+    target, body = read_local_pair(path)
+    base_url = str(body.get("baseUrl") or "").strip()
+    code = str(body.get("code") or "").strip()
+    if not base_url or not code:
+        raise PairingError("本机配对文件缺 baseUrl/code（%s）—— 版本对不上？" % target,
+                           code="bad_response")
+    try:
+        exp = float(body.get("expiresAt") or 0)
+    except Exception:
+        exp = 0.0
+    if exp and time.time() > exp:
+        raise PairingError(
+            "本机配对码已过期（%s 到期；后端每次启动会重发一张）—— 在后端那台机器上"
+            "重启一次后端，或手工粘一张配对串。"
+            % time.strftime("%Y-%m-%d %H:%M", time.localtime(exp)), code="expired")
+    return pair(base_url, code, client_name=client_name,
+                cert_fingerprint=str(body.get("fingerprint") or ""), save=save)

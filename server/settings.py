@@ -37,6 +37,15 @@ DEFAULTS: Dict[str, Any] = {
         # 而鉴权库存着客户端凭据 —— 放一起意味着"照文档把 tmp 换成 tmpfs
         # 就会把配过的所有客户端清空"。两种相反的保留策略不能共用一个目录。
         "state_root": "",               # 空 = {ECHO}/data/server-state
+        # **本机自配对**（2026-09-28，会议转写方案 1）：启动时在鉴权库旁边写一份
+        # `local-pair.json`，同机的客户端读它就能自动配对（不用抄配对码）。
+        # **默认关**，两个理由：
+        #   ① 对"多人共用一台 GPU 后端"（方案 2）它没有意义 —— 那台机器上没人跑客户端；
+        #   ② 它会在鉴权库里**发一张配对码**（每次启动一张），而"启动是惰性的"是
+        #      一个值钱的默认（一堆用例与排障都依赖它）。
+        # 方案 1 的交付路径（`compose.yaml` / 后端包）把它设成 **true**。
+        # 见 `server/localpair.py` 与 `docs/3.0-设计总览与组件关系.md` §6.6。
+        "local_pair": False,
         # TLS（设计 §7.5 ① 的传输层）。**两个都填才启用 https**；
         # 只填一个是配置错误 —— `main` 会**启动就报错**，不静默降级成 http
         # （那是最糟的结果：部署的人以为连的是 https）。见 `main._tls_kwargs`。
@@ -103,6 +112,12 @@ DEFAULTS: Dict[str, Any] = {
         "clock_skew_s": 60,             # 内网机器时钟未必准
         "pairing_enabled": True,        # 关掉之后新机器进不来（老的照用）
         "pairing_ttl_s": 900,           # 配对码 15 分钟
+        # **本机自配对文件**里那张码的有效期（2026-09-28，会议转写方案 1）。
+        # 比 `pairing_ttl_s` 宽得多是刻意的：那个文件就是"同机以后随时来配"用的
+        # （客户端可能在后端跑了几周之后才点「检测本机后端」）。每次后端启动都会
+        # 重发一张覆盖旧的，所以"长期不用"的代价只是重启一次后端。
+        # 见 `server/localpair.py` 与 `docs/3.0-设计总览与组件关系.md` §6.6。
+        "local_pair_ttl_s": 7 * 24 * 3600,
         "pair_window_s": 300,           # 失败退避窗口
         "pair_max_failures": 5,         # 窗口内失败几次开始退避
         "cache_ttl_s": 60,              # client 行缓存多久（撤销走主动失效，不靠它）
@@ -203,6 +218,9 @@ def _env_overrides() -> dict:
     pairing = _env_bool("ECHO_PAIRING_ENABLED")
     if pairing is not None:
         out.setdefault("auth", {})["pairing_enabled"] = pairing
+    local_pair = _env_bool("ECHO_LOCAL_PAIR")
+    if local_pair is not None:
+        out.setdefault("server", {})["local_pair"] = local_pair
     return out
 
 

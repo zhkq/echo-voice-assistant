@@ -26,6 +26,15 @@ header .btns { margin-left:auto; display:flex; gap:8px; flex-wrap:wrap; }
 .btn.primary { background:var(--accent); color:#fff; border-color:var(--accent); }
 .btn.primary:hover { filter:brightness(1.1); color:#fff; }
 .btn.danger:hover { border-color:var(--red); color:var(--red); }
+/* 转写中：「重新转写」按钮必须**看得见地被禁用**（用户 2026-09-28 实测反馈
+   "转写中还能再点、容易误触"）。只有 `disabled` 而没有样式的话，用户会以为
+   "点了没反应"而反复点 —— 那正是要避免的观感；所以给一个转圈 + 不可点光标。 */
+.btn:disabled { opacity:.55; cursor:not-allowed; }
+.btn:disabled:hover { border-color:var(--border); color:var(--text); }
+.btn.busy::before { content:""; display:inline-block; width:10px; height:10px;
+  margin-right:6px; vertical-align:-1px; border:2px solid currentColor;
+  border-top-color:transparent; border-radius:50%; animation:btnspin .8s linear infinite; }
+@keyframes btnspin { to { transform:rotate(360deg); } }
 .input { background:var(--card2); color:var(--text); border:1px solid var(--border); border-radius:8px;
   padding:7px 10px; font-size:13px; outline:none; }
 .input:focus { border-color:var(--accent); }
@@ -305,7 +314,14 @@ const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":
 
 async function api(path, opts = {}) {
   const res = await fetch(path, { headers: { "Content-Type": "application/json" }, ...opts });
-  if (!res.ok) throw new Error("HTTP " + res.status);
+  if (!res.ok) {
+    // 后端拒绝的**原因**必须原样带给用户：原来这里只抛 `HTTP 409`，
+    // 而 409 是"这场会议正在转写中，请等它完成"——丢掉那句话，用户只知道
+    // "失败了"，不知道该怎么办（FastAPI 的 `detail` 就是给人看的那句中文）。
+    let detail = "";
+    try { detail = String((await res.json()).detail || ""); } catch (e) { detail = ""; }
+    throw new Error(detail || ("HTTP " + res.status));
+  }
   return res.json();
 }
 const post = (p, body) => api(p, { method: "POST", body: JSON.stringify(body || {}) });
@@ -382,6 +398,7 @@ async function load() {
   $("#meta").textContent = `开始 ${M.started_at || ""} · ${fmtHM(M.duration_seconds)} 分钟 · ${segCount} 段 · ${st[M.status]||M.status}`;
   renderCompressionMark();
   syncTitleEditBtn();
+  syncRetranscribeBtn();
   renderCapability();
   buildTimeline();
   $("#pDur").textContent = fmtTimeH(_totalDur);
@@ -973,9 +990,60 @@ $("#pSeek").addEventListener("input", () => {
 $("#rate").addEventListener("change", () => { if (_audio) _audio.playbackRate = parseFloat($("#rate").value); });
 
 /* ---------- 操作按钮 ---------- */
+
+/* 「转写中」的按钮状态（2026-09-28）。
+   用户实测 bug 的原话："转写中，转写按钮还能再次被点击，容易误触。"
+
+   **判据只来自后端**：`GET /api/meetings/{id}` 的 `transcribing` 字段
+   （服务端 `meeting.is_transcribing()` = 进程内标记 ∪ 库里的 status）。
+   为什么不用页面本地变量（"我刚点过"）：那种变量一刷新就没了 ——
+   转写中的会重开详情页，按钮又是可点的，bug 只修了一半。
+   后端那道 409 才是防线（见 app/api.py 的 retranscribe 端点）；这一层是体验。 */
+let _txPoll = null;
+
+function syncRetranscribeBtn() {
+  const btn = $("#btnRetranscribe");
+  if (!btn) return;
+  const busy = !!(M && M.transcribing);
+  btn.disabled = busy;
+  btn.classList.toggle("busy", busy);
+  btn.textContent = busy ? "转写中…" : "重新转写";
+  btn.title = busy ? "这场会议正在转写中，请等它完成"
+                   : "用当前设置重新转写这一场（转写中不能重复发起）";
+  if (busy) startTxPoll(); else stopTxPoll();
+}
+
+/* 转写期间每 3 秒向后端问一次；**转完自动收工** —— 先停轮询，再整页 `load()`：
+   转写刚落库，转写稿与状态都变了，顺手刷新比只改按钮更对。 */
+function startTxPoll() {
+  if (_txPoll) return;
+  _txPoll = setInterval(async () => {
+    try {
+      const d = await api("/api/meetings/" + MID);
+      M = d;
+      if (d.transcribing) { syncRetranscribeBtn(); return; }
+      stopTxPoll();
+      load();
+    } catch (e) { /* 服务可能正在重连，下一轮再说 */ }
+  }, 3000);
+}
+
+function stopTxPoll() { if (_txPoll) { clearInterval(_txPoll); _txPoll = null; } }
+
 $("#btnRetranscribe").addEventListener("click", async () => {
-  try { const r = await post(`/api/meetings/${MID}/retranscribe`, {}); toast(r.message); }
-  catch (e) { toast("失败：" + e.message); }
+  const btn = $("#btnRetranscribe");
+  if (btn.disabled) return;          // 双保险的第一层；后端那道 409 才是防线
+  btn.blur();
+  try {
+    const r = await post(`/api/meetings/${MID}/retranscribe`, {});
+    toast(r.message || "已开始重新转写");
+    await load();                   // 立刻按**后端**状态把按钮改成「转写中…」
+  } catch (e) {
+    // 409（后端拦下的重复请求）也走这里：`e.message` 就是后端那句中文，原样显示。
+    const msg = String((e && e.message) || "");
+    toast(/^HTTP /.test(msg) ? "重新转写请求失败：" + msg : msg || "重新转写失败");
+    try { await load(); } catch (e2) { /* 详情也读不到时保持现状 */ }
+  }
 });
 $("#btnRegenSummary").addEventListener("click", async () => {
   try {

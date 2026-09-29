@@ -344,6 +344,36 @@ class MeetingDetailWiringTests(_Isolated):
         self.assertIsNone(r.json()["capability"])
 
 
+class BackendSettingsStayOnTheBackendTests(unittest.TestCase):
+    """**设置分家**（2026-09-28，设计 §6.6）：客户端只留"连哪个 + 凭据 + 允许音频去哪"。
+
+    后端自己的设置（监听端口 / 显存预算 / 模型档位 / 配额 / TLS / 管理员）**不许**出现在
+    客户端设置里 —— 它们已经有一处权威归属（后端的 `server.yaml` 与管理面）。
+    在客户端再放一份的代价是"两处都能改、改完不知道谁生效"，而这正是这个仓库反复踩过的坑
+    （同一个设置项三处都能改 → 2026-09-19 那轮合并）。客户端只显示**状态**（后端 `health`
+    宣告的那些数字）与一个「打开后端管理面」的入口。
+    """
+
+    #: 后端专有的词。**刻意不含 `port`** —— 客户端的 `serverPort`（面板端口）与
+    #: `harnessPort`（智能体端口）是它自己的东西，不是后端设置。
+    BACKEND_ONLY = ("vram", "admin", "tls", "cert", "quota", "budget", "spec")
+
+    def test_no_backend_side_setting_leaks_into_the_client(self):
+        from app.config import DEFAULTS
+        bad = sorted(k for k in DEFAULTS
+                     if any(w in k.lower() for w in self.BACKEND_ONLY))
+        self.assertEqual(bad, [], "客户端设置里出现了后端自己的设置项：%s" % bad)
+
+    def test_the_client_keeps_connection_credentials_and_permission(self):
+        """客户端该有的就这三类（外加"会议转写走哪条路"与本地配对文件路径）。"""
+        from app.config import DEFAULTS
+        for key in ("capabilityEchoServerUrl", "capabilityEchoServerToken",
+                    "capabilityEchoServerStaticToken", "capabilityPrivacy",
+                    "capabilityLocalPairPath"):
+            with self.subTest(key=key):
+                self.assertIn(key, DEFAULTS, "客户端少了 %s —— 连接/凭据/许可这三类要齐" % key)
+
+
 class PlanSummaryTests(unittest.TestCase):
     """`plan_summary()`：把会议里记下的执行计划翻成人话。
 

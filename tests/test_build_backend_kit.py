@@ -6,8 +6,9 @@
 后端要发给**别人的显卡环境**，而两类卡的镜像不一样（torch 从 cu126 还是 cu118 装）。
 这份护栏钉住的是"分流本身"与"文档里的关键结论"：
 
-  1. 两个变体目录都在，各自的四份模板都在（`先读我.md` / `compose.yaml` / `.env.example` /
-     `server.yaml`）—— 少一个就别出包；
+  1. 两个变体目录都在，各自的**必需模板**都在（名单从打包器的 `DELIVERY_REQUIRED` 派生：
+     `先读我.md` / `给同事Agent-构建说明.md` / `compose.yaml` / `.env.example` / `server.yaml`）
+     —— 少一个就别出包；
   2. 两份 `compose.yaml` 的**端口语义**：8900 发布到所有网卡、8901 **只**发布到宿主回环、
      `ECHO_ADMIN_LISTEN=0.0.0.0:8901`、GPU 直通段在位（这几条错一条，同事那边要么连不上
      能力面、要么管理面进不去、要么容器看不到 GPU）；
@@ -42,7 +43,6 @@ ROOT = Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 SCRIPTS = ROOT / "scripts"
 DELIVERY = ROOT / "delivery"
 VARIANTS = {"cu126": DELIVERY / "backend-cu126", "cu118": DELIVERY / "backend-cu118"}
-TEMPLATES = ("先读我.md", "compose.yaml", ".env.example", "server.yaml")
 STAMP = "20260928-0100"
 
 
@@ -57,6 +57,12 @@ def _load_backend_kit():
 
 
 backend = _load_backend_kit()
+
+#: 两个变体**允许内容不同**的文件 —— **唯一事实源是打包器的 `DELIVERY_REQUIRED`**。
+#: （2026-09-28 改成派生：以前这里抄了四个名字，于是给交付目录加文件时两边会漂 ——
+#:  那正是 2026-09-28 那条红的成因：cu126 多了一份"给同事Agent-构建说明.md"，
+#:  这份抄来的白名单不认识它，打包器也不要求 cu118 有对应的一份。）
+TEMPLATES = tuple(backend.DELIVERY_REQUIRED)
 
 
 def compose_of(key: str) -> dict:
@@ -86,13 +92,17 @@ def says_cannot(text: str, keyword: str) -> bool:
 
 
 class VariantDirectoriesExist(unittest.TestCase):
-    """两个变体目录都要在，而且四份模板齐全（模板在 git 里，不从 dist 捡）。"""
+    """两个变体目录都要在，而且**每一份必需模板**都齐全（模板在 git 里，不从 dist 捡）。
+
+    "必需"的名单只有一个来源（打包器的 `DELIVERY_REQUIRED`）—— 加文件时两边一起加，
+    不许只有某一个变体多一份文档（2026-09-28 那条红就是这么来的）。
+    """
 
     def test_both_variant_dirs_exist(self):
         for key, path in VARIANTS.items():
             self.assertTrue(path.is_dir(), f"缺交付目录 {path}")
 
-    def test_each_variant_has_the_four_templates(self):
+    def test_each_variant_has_every_required_template(self):
         for key, path in VARIANTS.items():
             for name in TEMPLATES:
                 target = path / name
@@ -445,6 +455,85 @@ class PackerProducesTheKits(unittest.TestCase):
     def test_verify_rejected_nothing(self):
         self.assertIn("[ok]", self.build_log)
         self.assertNotIn("[FAIL]", self.build_log)
+
+
+class ModelsTierTests(unittest.TestCase):
+    """后端包的**两个档位**（2026-09-28）：默认纯代码，`--with-models` 才带权重。
+
+    为什么用显式开关而不是"有就带"：权重有几个 GB，而多数交付场景**不需要**它
+    （源机上已有权重时 rsync 更快、也不占交付包的盘）。反过来，含权重档必须**完整**：
+    少一棵子树的表现是"装完了某个引擎一路 `model_failed`"，而那种故障要到同事的机器上才现形。
+    """
+
+    def _models(self, *, with_qwen=False):
+        """造一棵假模型根（几千字节，够验形状）。cu118 只要 SenseVoice。"""
+        root = Path(tempfile.mkdtemp(prefix="echo-fakemodels-"))
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        d = root / "sensevoice" / "snapshots" / "master"
+        d.mkdir(parents=True)
+        (d / "model.pt").write_bytes(b"fake-pt" * 64)
+        (d / "config.yaml").write_text("x", encoding="utf-8")
+        if with_qwen:
+            for name in ("Qwen3-ASR-0.6B", "Qwen3-ForcedAligner-0.6B"):
+                d = root / "hub" / ("models--Qwen--" + name) / "snapshots" / "abc"
+                d.mkdir(parents=True)
+                (d / "model.bin").write_bytes(b"fake-bin")
+            d = root / "pyannote" / "pyannote-segmentation-3.0-local"
+            d.mkdir(parents=True)
+            (d / "pytorch_model.bin").write_bytes(b"fake")
+        return root
+
+    def _run(self, argv):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = backend.main(argv)
+        return code, buf.getvalue()
+
+    def test_the_default_tier_carries_no_weights(self):
+        for variant in backend.VARIANTS:
+            with self.subTest(variant=variant["key"]):
+                files = backend.planned_files(variant)
+                self.assertEqual([r for r in files if r.startswith("models/")], [],
+                                 "默认档不该带权重（几个 GB，且源机 rsync 更快）")
+
+    def test_the_weights_tier_packs_what_the_variant_declares(self):
+        root = self._models(with_qwen=False)
+        with tempfile.TemporaryDirectory(prefix="echobkw-") as out:
+            code, log = self._run(["--out", out, "--stamp", STAMP, "--only", "cu118",
+                                   "--with-models", "--models-from", str(root)])
+            self.assertEqual(code, backend.EXIT_OK, log)
+            zip_path = Path(out) / f"ECHO-backend-kit-cu118-{STAMP}.zip"
+            prefix = zip_path.stem + "/"
+            with zipfile.ZipFile(zip_path) as zf:
+                names = zf.namelist()
+            self.assertIn(prefix + backend.MODELS_NOTE, names, "含权重包要有那份「怎么挂」的说明")
+            self.assertTrue([n for n in names if n.startswith(prefix + "models/sensevoice/")],
+                            "权重没进包")
+            self.assertEqual([n for n in names if "/pyannote/" in n], [],
+                             "cu118 不需要 pyannote（老卡镜像里也没有它）")
+            self.assertIn("含权重", backend.read_zip_text(zip_path, prefix + "BUILD-INFO.txt"))
+
+    def test_a_missing_subtree_is_a_loud_failure_not_a_partial_pack(self):
+        # cu126 要 Qwen + 对齐器 + pyannote，这里只给 SenseVoice
+        root = self._models(with_qwen=False)
+        with tempfile.TemporaryDirectory(prefix="echobkw2-") as out:
+            code, log = self._run(["--out", out, "--stamp", STAMP, "--only", "cu126",
+                                   "--with-models", "--models-from", str(root)])
+            self.assertEqual(code, backend.EXIT_ERROR, log)
+            self.assertIn("缺", log)
+            self.assertEqual(sorted(Path(out).glob("*.zip")), [],
+                             "失败时不许留下半个包（那比没有包更危险）")
+
+    def test_a_weights_kit_is_not_reported_stale_because_of_the_weights(self):
+        """`--check` 只比**源码** —— 权重是 payload，允许与当前机器上的不同。"""
+        root = self._models(with_qwen=True)
+        with tempfile.TemporaryDirectory(prefix="echobkw3-") as out:
+            code, log = self._run(["--out", out, "--stamp", STAMP, "--only", "cu126",
+                                   "--with-models", "--models-from", str(root)])
+            self.assertEqual(code, backend.EXIT_OK, log)
+            code, log = self._run(["--check", "--out", out, "--only", "cu126"])
+            self.assertEqual(code, backend.EXIT_OK, log)
+            self.assertIn("含权重", log, "--check 要如实说明这个包带权重")
 
 
 class CheckModeExitCodes(unittest.TestCase):

@@ -62,6 +62,11 @@ services:
       ECHO_MODELS_ROOT: /opt/echo/models
       ECHO_TMP_ROOT: /var/echo/tmp
       ECHO_STATE_ROOT: /var/echo/state
+      # **本机自配对**（2026-09-28，会议转写方案 1）：默认开 —— 这份 compose 主要给
+      # "单机双进程"（客户端与后端同一台机器）用，同机不该让人抄配对码。
+      # 客户端要读到状态卷里那份 `local-pair.json`，所以把宿主侧 `state` 卷的路径
+      # 填进客户端的「本机配对文件路径」设置（或环境变量 `ECHO_LOCAL_PAIR_PATH`）。
+      ECHO_LOCAL_PAIR: "true"
       ECHO_MAX_CONCURRENT: "2"
       # ⚠️ **SenseVoice 还依赖一个"按模型名"加载的 VAD 模型**（`app/audio/stt.py:_get_sensevoice`
       #    传的 `vad_model="fsmn-vad"`），funasr 会去 ModelScope 现拉它（约 1.7 MB）。

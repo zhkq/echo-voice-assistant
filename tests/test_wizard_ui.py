@@ -145,6 +145,17 @@ class WizardUiWiringTests(unittest.TestCase):
         self.assertIn('_bootWantWizard', self.js, "?view=wizard 老深链要落到常规并展开向导卡")
         self.assertIn("if (_bootWantWizard) gotoWizard();", block,
                       "老深链下手要真的展开向导卡")
+        # `?wizstep=<步 id>`：验收/排障/无头截图要能直接落到某一步（2026-09-28）。
+        # 没有它就只能靠人一步步点过去 —— 而无头截图点不动。
+        self.assertIn("_bootWizStep", self.js, "?wizstep= 深链没接上")
+        self.assertIn("WIZ_STEPS.findIndex((s) => s.id === _bootWizStep)", self.js,
+                      "深链要按步 id 落到那一步")
+        self.assertIn('get("wizstep")', self.js, "深链参数名要能被读到")
+        # `?view=wizard` 在**全新环境**（空 localStorage）里曾经被"默认收起"的种子当场折叠 ——
+        # 而"同事第一次打开面板"/无头截图恰恰都是全新环境（2026-09-29 实测）。
+        self.assertIn('_markCollapseDecided("wizard")', self.js,
+                      "展开向导卡之后要拦住默认收起的种子，否则深链在全新环境里等于没生效")
+        self.assertIn("function _markCollapseDecided", self.js)
         # 2026-09-25 页签整合：「能力」页签改名「能力后端」（id capability），出口跟着改
         self.assertIn('switchView("capability")', self.js, "补能力要可达")
         # 显式指定页签（?view=… / echo.gotoView）最优先，不许被默认逻辑抢走
@@ -155,6 +166,30 @@ class WizardUiWiringTests(unittest.TestCase):
         # 走完向导末页仍要写 installed-components.json（老的首装判据，install_state 也认它）
         self.assertIn('post("/api/wizard/finalize", {})', self.js,
                       "走到末页要写 installed-components.json")
+
+    def test_the_step_numbers_in_the_fix_texts_match_what_the_user_sees(self):
+        """末页/确认页里"回到向导第 N 步"用的是**界面上的编号**（= `WIZ_STEPS` 下标 + 1）。
+
+        2026-09-29 无头截图抓到的：界面上写的是「**9** 开会时的录音交给谁」，
+        而文案里是"回到向导第 8 步" —— 照它走会落在「让 ECHO 能动手」那一页。
+        设计文档里的 S 编号是 0 基的（S8 = 下标 8），**面向用户的字必须用界面编号**；
+        插一步就会漂，所以在这里按 app.js 的真顺序算。
+        """
+        ids = re.findall(r'\{ id: "([a-z]+)", name: "[^"]+", render: \w+ \}', self.js)
+        self.assertGreaterEqual(len(ids), 10, "WIZ_STEPS 没解析出来（格式变了？）")
+        ui = {sid: i + 1 for i, sid in enumerate(ids)}
+        with open(os.path.join(ROOT, "app", "wizard.py"), encoding="utf-8") as fh:
+            src = fh.read()
+        for sid, pattern in (("agent", r"回到向导第 (\d+) 步准备智能体"),
+                             ("meeting", r"回到向导第 (\d+) 步填上服务方给你的密钥"),
+                             ("offline", r"向导第 (\d+) 步装一个小号兜底")):
+            m = re.search(pattern, src)
+            self.assertIsNotNone(m, "wizard.py 里找不到 %s 那处步号文案" % sid)
+            self.assertEqual(int(m.group(1)), ui[sid],
+                             "%s：文案里的步号与界面（第 %d 步）对不上" % (sid, ui[sid]))
+        # 其余散落的步号也别越界（插/删步骤时至少不会指到一个不存在的页）
+        for num in re.findall(r"向导第 (\d+) 步", src):
+            self.assertLessEqual(int(num), len(ids), "文案指到了不存在的第 %s 步" % num)
 
     def test_every_step_has_a_renderer(self):
         steps = re.findall(r'\{ id: "[a-z]+", name: "[^"]+", render: (\w+) \}', self.js)

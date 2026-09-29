@@ -139,6 +139,10 @@ class EchoServerClient(CapabilityClient):
         self.server_name = ""
         self._caps_at = 0.0
         self._caps_error = ""
+        #: 最近一次 `/v1/health` 的原文（**只有元数据，没有任何内容**）。
+        #: 「能力」卡的状态行（版本 / 显存 / 模型 / 今日额度）与「打开后端管理面」的
+        #: 深链都读它 —— 后端自己的信息由后端宣告，客户端不猜。
+        self._health: Dict[str, Any] = {}
 
     # ---------------------------------------------------------------- 探测
 
@@ -195,10 +199,18 @@ class EchoServerClient(CapabilityClient):
         try:
             status, body = self._request("GET", "/v1/health", timeout=5)
         except CapabilityError:
+            # **连不上就把上次那份状态清掉**：拿旧数字当现状是"最绿的一种假"。
+            self._health = {}
             return False
         except Exception:
             return None
-        return bool(status == 200 and isinstance(body, dict) and body.get("ok"))
+        if status == 200 and isinstance(body, dict) and body.get("ok"):
+            # 留下原文：面板的状态行与"打开后端管理面"深链都靠它（`describe()` 会带出去）。
+            # 探针本身是**免凭据**的（设计如此），所以这里拿到的也只有元数据。
+            self._health = dict(body)
+            return True
+        self._health = {}
+        return False
 
     def describe(self) -> Dict[str, Any]:
         out = super().describe()
@@ -206,7 +218,9 @@ class EchoServerClient(CapabilityClient):
                     "limits": self.limits, "capsError": self._caps_error,
                     "paired": self._creds is not None,
                     "auth": "manual" if self._token else
-                            ("paired" if self._creds is not None else "none")})
+                            ("paired" if self._creds is not None else "none"),
+                    # 后端自己的状态（版本/显存/模型/配额/管理面入口）—— 面板直接渲染
+                    "health": dict(self._health or {})})
         return out
 
     # ---------------------------------------------------------------- 调用

@@ -85,7 +85,78 @@ _state = {
 # 录音状态锁：start/stop 必须原子化 —— 否则并发 stop（如面板按钮双击/重复请求）
 # 会同时通过 active 检查，造成重复转写 + 重复纪要（日志里出现过两次“停止录音”同秒）。
 _state_lock = threading.RLock()
-_retranscribing = {"set": set(), "lock": threading.Lock()}
+#: 「刚点过重新转写、后台线程还没轮到改库」的那一小段状态。
+#:
+#: `RLock`（**不是** `Lock`）：下面 `transcribe_busy_reason()` 必须在**同一个临界区**里
+#: 被调用（"先判后占"要原子），普通 Lock 会在那里当场自己把自己锁死。
+_retranscribing = {"set": set(), "lock": threading.RLock()}
+
+#: 「这场会议正在转写中」—— 面板按钮提示与 409 响应体**共用这一句**（只写一份）。
+TRANSCRIBE_BUSY_MESSAGE = "这场会议正在转写中，请等它完成"
+
+
+class MeetingTranscribeBusy(Exception):
+    """这场会议**已经在转写**，不能再起第二个转写任务（按会议判重）。
+
+    为什么用异常、而不是再返回一个 `(False, 文案)`：接口层必须把它与"会议不存在"、
+    "没有音频片段"这类业务失败**分开** —— 前者的语义是 **HTTP 409 Conflict**，
+    后者沿用既有的 200 + `{ok:false}`。两种结局都塞进同一个 `(False, str)`，
+    接口层就只能靠匹配文案来分辨，而文案一改判据就悄悄失效。
+    参照 `MeetingEngineRefused` 的同一套理由（见本文件下方）。
+    """
+
+    def __init__(self, message=TRANSCRIBE_BUSY_MESSAGE, kind="transcribing"):
+        super().__init__(message)
+        #: `transcribing` = 库里的状态说它在转；`retranscribing` = 刚点过、还没轮到改库
+        self.kind = kind
+        self.message = message
+
+
+def _db_says_transcribing(meeting_name):
+    """库里的 `status` 说这一场正在转写（**纯读**：不加锁、不抛异常）。"""
+    try:
+        m = db.get_meeting_by_name(meeting_name)
+    except Exception:
+        return False
+    return bool(m) and (m.get("status") or "") == "transcribing"
+
+
+def transcribe_busy_reason(meeting_name):
+    """这一场**此刻**能不能再起一个转写任务（空串 = 可以；否则是不能的原因）。
+
+    判据两份，**缺一不可** —— `app/api.py` 里下发的 `transcribing` 字段与
+    「重新转写」那道 409 闸都只读这一个函数，不许在别处再写一遍：
+
+      * `_retranscribing` 进程内标记 —— 面板刚点过「重新转写」、后台线程还没跑到
+        `_transcribe_impl` 里"把状态改成 transcribing"那一步的空档期。只看库状态会漏掉
+        这几十毫秒，而"连点两下"正好落在里面；
+      * `meetings.status == "transcribing"` —— **录音结束后的自动转写**（`stop_meeting`）
+        与**导入后的自动转写**（`import_meeting`）都只写这一处、**没有**进进程内标记。
+        这正是原来拦不住的根因：`retranscribe_meeting()` 当时只看了进程内标记。
+        它同时也是"刷新页面/换个标签页之后仍然拦得住"的那一半（内存标记会没，库不会）。
+
+    **只看这一场**：另一场会议该转写照样转写。跨会议的并发上限仍由既有的那套管
+    （`max_concurrent`），两件事不许混在一起。
+    """
+    name = str(meeting_name or "")
+    if not name:
+        return ""
+    with _retranscribing["lock"]:
+        if name in _retranscribing["set"]:
+            return "retranscribing"
+    if _db_says_transcribing(name):
+        return "transcribing"
+    return ""
+
+
+def is_transcribing(meeting_name):
+    """这一场**此刻**是否正在转写（`transcribe_busy_reason()` 的布尔面）。
+
+    面板的判据就是这个字段：`GET /api/meetings`（列表）与 `GET /api/meetings/{mid}`
+    （详情）都会下发它（见 `app/api.py`）。
+    """
+    return bool(transcribe_busy_reason(meeting_name))
+
 
 # ---------------------------------------------------------------- 音频压缩
 # 历史会议的音频段（`01.wav`…）**无损**压成 FLAC（`01.flac`，省约一半磁盘）。
@@ -135,14 +206,12 @@ def compression_state(meeting_name):
     with _state_lock:
         if _state["active"] and os.path.basename(_state["folder"] or "") == name:
             return "recording", "正在录音"
-    with _retranscribing["lock"]:
-        if name in _retranscribing["set"]:
-            return "retranscribing", "正在重新转写"
-    try:
-        m = db.get_meeting_by_name(name)
-    except Exception:
-        m = None
-    if m and (m.get("status") or "") in ("transcribing",):
+    # 「正在重新转写 / 转写中」的判据与「重新转写」那道 409 闸**共用一份**
+    # （`transcribe_busy_reason`）：两处各写一遍的话，迟早有一处忘了跟着改。
+    kind = transcribe_busy_reason(name)
+    if kind == "retranscribing":
+        return "retranscribing", "正在重新转写"
+    if kind == "transcribing":
         return "transcribing", "正在转写"
     return "", ""
 
@@ -1378,6 +1447,28 @@ def _normalize_diarize(result):
     return turns, embs, labels
 
 
+def _labels_from_turns(turns):
+    """**有轮次、没嵌入**时的标签表：`{后端给的局部标签: 显示名}`。
+
+    谁会走到这里：在线转写（`asr-provider`）—— 平台只回 `speaker_id`、不回声纹嵌入。
+    这时标签仍然有用：它来自**整场的同一次全局聚类**，在一场里自洽，所以直接拿来当
+    显示名是对的。而 `SpeakerRegistry` 的用途是"把不同段的标签缝成同一个人"，
+    没有向量就无从缝起 —— 那条路这里**不走**（2026-09-28 之前这里会 KeyError）。
+
+    只做一件事：把标签里的数字当编号（`0`/`S0`/`SPEAKER_00` 都能对上同一个稳定的
+    `说话人N`）。抽不到数字就原样用它 —— **不许按出现顺序猜编号**（那会让两段会议
+    互相串号，而串号的表现是"看起来正常、其实认错了人"）。
+    """
+    out = {}
+    for _a, _b, lab in (turns or ()):
+        lab = str(lab or "")
+        if not lab or lab in out:
+            continue
+        num = re.sub(r"\D", "", lab)
+        out[lab] = ("说话人%d" % (int(num) + 1)) if num else lab
+    return out
+
+
 def _capability_diarize_segment(cap, seg_path, state=None):
     """一段音频走能力层的 `diarize.turns` → `(turns, embs, labels, plan_dict)`。
 
@@ -1927,7 +2018,16 @@ def _transcribe_impl(folder):
                         da_state["backendId"] = (
                             (dia_plan or {}).get("picks", {})
                             .get("diarize.turns", {}).get("backendId", ""))
-                        label_map = registry.map(embs, labels)
+                        label_map = registry.map(embs, labels) if labels \
+                            else _labels_from_turns(turns_raw)
+                        if not labels:
+                            # **有轮次、没嵌入**（在线转写就是这种）：标签来自整场那次
+                            # 全局聚类，用自己的编号当显示名；不走注册表（没有向量可缝），
+                            # 声纹比对也自然不做（见下面那条 `len(labels)` 判据）。
+                            db.add_log("debug", "capability",
+                                       "%s 第%s段：后端给了说话人时间轴但没有嵌入"
+                                       "（%d 个说话人，标签按后端编号直接用）"
+                                       % (meeting_name, i, len(label_map)))
                     key_map = {}
                     for plabel, disp in label_map.items():
                         num = re.sub(r"\D", "", disp)
@@ -1941,7 +2041,7 @@ def _transcribe_impl(folder):
                     # 注意这里不需要"注册"：`diarize.turns` 那一次调用**同时带回了每个说话人
                     # 的嵌入**（`DiarizeResult.speakers`）—— 声纹用的就是它，与分离同源
                     # （这正是 L5 要求"说话人这一族同源"的原因：嵌入必须与标签同一次调用）。
-                    if vp_matcher is not None and turns_raw is not None:
+                    if vp_matcher is not None and turns_raw is not None and len(labels):
                         try:
                             from app import voiceprint
                             for disp, m in voiceprint.identify(embs, labels, label_map,
@@ -3262,7 +3362,13 @@ def regenerate_summary(meeting_id, extra_prompt=""):
 
 
 def retranscribe_meeting(meeting_id):
-    """手动重新转写一场会议（后台，并发保护）。"""
+    """手动重新转写一场会议（后台）。
+
+    **这一场已经在转写 → 抛 `MeetingTranscribeBusy`**（`app/api.py` 把它翻成 409）。
+    为什么这道闸必须在后端：两个转写线程并发跑同一场会**互相覆盖**同一份
+    `transcript.md` / `meta.json`（`_transcribe_impl` 开头还会 `clear_meeting_lines`
+    把对方正在写的结果清掉）。用户点两下就能触发，所以不能指望前端把按钮禁住。
+    """
     meeting = db.get_meeting(meeting_id)
     if not meeting:
         return False, "会议不存在"
@@ -3273,11 +3379,21 @@ def retranscribe_meeting(meeting_id):
     segs = audiofile.segment_files(folder) if os.path.isdir(folder) else []
     if not segs:
         return False, "该会议没有音频片段，无法转写"
-    with _retranscribing["lock"]:
-        if name in _retranscribing["set"]:
-            return False, "该会议已在重新转写中，请稍候"
+
+    # 正在录音的那一场不能重转（录音器正把新段写进同一个目录）。判据在 `_state_lock`
+    # 里读，与 `stop_meeting()` 写这几个字段用的是同一把锁。
+    with _state_lock:
         if _state["active"] and os.path.basename(_state["folder"] or "") == name:
             return False, "该会议正在录音中，结束后再重新转写"
+
+    # ---- 按会议判重：**后端自己拦，不靠前端自觉**（前端只是体验）----
+    # 「先判后占」必须在**同一个临界区**里：拆成"先查、再占"两步的话，两次并发请求会
+    # 双双通过判断，各起一个转写线程去写同一份 transcript.md / meta.json。
+    # 判据见 `transcribe_busy_reason()`（进程内标记 ∪ 库状态，两份都要）。
+    with _retranscribing["lock"]:
+        kind = transcribe_busy_reason(name)
+        if kind:
+            raise MeetingTranscribeBusy(TRANSCRIBE_BUSY_MESSAGE, kind)
         _retranscribing["set"].add(name)
 
     def _run():
@@ -3601,6 +3717,14 @@ def get_meeting_detail(meeting_id):
         # 所以两个页面不需要各写一套渲染逻辑，也不需要各自算一遍数字。
         # 没压过时是 None（面板据此不显示标记，与列表卡片同一判据）。
         "compression": compression_info(meeting["name"]),
+        # 「这场会**此刻**在不在转写」（2026-09-28）—— 会议详情页据此把「重新转写」
+        # 按钮禁掉、文案改成「转写中…」。
+        #
+        # 为什么必须是**接口字段**、不能由页面自己记："我刚点过"这种本地变量一刷新就没了，
+        # 于是转写中重开详情页按钮又是可点的（bug 只修了一半）。判据只有
+        # `transcribe_busy_reason()` 一份（进程内标记 ∪ 库里的 status），
+        # 所以刷新、换标签页、甚至重启面板之后，按钮状态都还是对的。
+        "transcribing": is_transcribing(meeting["name"]),
     }
 
 

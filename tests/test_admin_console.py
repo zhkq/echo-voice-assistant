@@ -19,6 +19,7 @@
 而"新加的写端点没被覆盖到"恰恰是最该被自动发现的事。
 """
 import base64
+import builtins
 import contextlib
 import io
 import json
@@ -36,11 +37,13 @@ from fastapi.testclient import TestClient                            # noqa: E40
 
 from server import admin as admin_mod                                # noqa: E402
 from server import engines, errors, main as server_main              # noqa: E402
+from server import perfmon as perfmon_mod                            # noqa: E402
 from server import routes as routes_mod                              # noqa: E402
 from server import settings as settings_mod                          # noqa: E402
 from server import store as store_mod                                # noqa: E402
 from server import auth as auth_mod                                  # noqa: E402
 from tests.test_server_contract import FAKE_SPECS, _fake_loader, _wav_bytes  # noqa: E402
+from tests.test_perfmon import _FakeHost                              # noqa: E402
 
 
 #: 管理面的写端点（**登记表**，不是白名单开关）。
@@ -60,6 +63,11 @@ WRITE_ENDPOINTS = {
     "/admin/api/clients/{client_id}/scopes",
     "/admin/api/clients/{client_id}/quota",
     "/admin/api/clients/{client_id}/rotate-secret",
+    # 「性能」页签的两个写动作（开始 / 停止记录）。**采集器全在内存里**，
+    # 但"开始记录"仍然是一个改状态的动作，所以它与其它写动作走**同一套闸门**
+    # （会话 + 同站 Origin + X-ECHO-Admin + CSRF + 审计），没有新开免检端点。
+    "/admin/api/perf/start",
+    "/admin/api/perf/stop",
 }
 
 
@@ -169,9 +177,14 @@ class _AdminCase(unittest.TestCase):
         self.client.__enter__()
         self.addCleanup(self._down)
         self.state = self.cap.state.echo
-        self.admin = admin_mod.create_admin_app(self.cfg, self.state)
+        self.admin = self.make_admin_app()
         self.ac = TestClient(self.admin, base_url=self.ADMIN_BASE)
         self.csrf = ""
+
+    def make_admin_app(self):
+        """造管理面 app。子类可以覆盖它来注入替身 —— 「性能」页签那个采集器
+        就是靠这里注入的（于是那些用例**不会真的去调 `nvidia-smi`**）。"""
+        return admin_mod.create_admin_app(self.cfg, self.state)
 
     def _restore_seam(self):
         from app import paths
@@ -629,7 +642,8 @@ class ReadOnlyNotLockedTests(_AdminCase):
         self.call_asr()          # 先有一个客户端，好让 /clients/{id} 有东西可看
         for path in ("/admin/api/overview", "/admin/api/models", "/admin/api/clients",
                      "/admin/api/clients/cli-1", "/admin/api/calls", "/admin/api/inventory",
-                     "/admin/api/me", "/admin/api/admins", "/admin/api/pairing-codes"):
+                     "/admin/api/me", "/admin/api/admins", "/admin/api/pairing-codes",
+                     "/admin/api/perf/state", "/admin/api/perf/points"):
             with self.subTest(path=path):
                 r = self.ac.get(path)                     # 没有任何写请求的头
                 self.assertEqual(r.status_code, 200, r.text)
@@ -1071,6 +1085,217 @@ class SharedImplementationTests(_AdminCase):
                           "a.set_quota(", "a.set_disabled(", "a.rotate_secret("):
             self.assertNotIn(forbidden, src,
                              "命令行又绕过 ops 直连 store/auth 了：%s" % forbidden)
+
+
+class PerfConsoleTests(_AdminCase):
+    """「性能」页签（用户 2026-09 要求：**登录后按「开始记录」才采，只放内存，用图表看**）。
+
+    采集器**整个是替身**（`tests/test_perfmon.py::_FakeHost`）—— 这个类里
+    没有一处会真的去调 `nvidia-smi` / 读 `/proc` / 用 psutil。
+    `background=False`：采不采完全由用例自己驱动（没有 sleep、没有超时抖动），
+    "1 秒一个点"那条节奏由 `tests/test_perfmon.py::BackgroundThreadTests` 管。
+    """
+
+    def make_admin_app(self):
+        self.host = _FakeHost()
+        self.perf = perfmon_mod.PerfMonitor(
+            sampler=self.host,
+            server_sampler=lambda: {"active": 1, "maxConcurrent": 2,
+                                    "vramUsedMb": 5123.0, "vramBudgetMb": 20480.0},
+            interval_s=1.0, window_s=60.0, viewer_ttl_s=10.0, background=False)
+        return admin_mod.create_admin_app(self.cfg, self.state, perf=self.perf)
+
+    def _sample(self, count, start=100.0):
+        """像页面在轮询那样驱动采集（`touch` = 有人在看，`tick` = 采一个点）。"""
+        for i in range(count):
+            self.perf.touch(start + i)
+            self.perf.tick(now=start + i)
+
+    def test_the_two_writes_are_gated_like_every_other_write(self):
+        """未登录 401；错 Origin / 缺 `X-ECHO-Admin` / 缺 CSRF → 403（与既有闸门一致）。"""
+        for path in ("/admin/api/perf/start", "/admin/api/perf/stop"):
+            with self.subTest(path=path, gate="no-session"):
+                r = self.ac.post(path, json={})
+                self.assertEqual(r.status_code, 401, r.text)
+        self.login()
+        for path in ("/admin/api/perf/start", "/admin/api/perf/stop"):
+            with self.subTest(path=path, gate="origin"):
+                r = self.wpost(path, origin="http://evil.example")
+                self.assertEqual(r.status_code, 403, r.text)
+                self.assertIn("Origin", r.json()["detail"])
+            with self.subTest(path=path, gate="header"):
+                r = self.wpost(path, header=False)
+                self.assertEqual(r.status_code, 403, r.text)
+                self.assertIn(admin_mod.WRITE_HEADER, r.json()["detail"])
+            with self.subTest(path=path, gate="csrf"):
+                r = self.wpost(path, csrf=False)
+                self.assertEqual(r.status_code, 403, r.text)
+                self.assertIn("CSRF", r.json()["detail"])
+        self.assertFalse(self.perf.recording, "被闸门挡回来的请求居然开始了记录")
+        self.assertEqual(self.host.calls, 0, "被闸门挡回来的请求居然采了点")
+
+    def test_start_records_and_the_sampler_feeds_the_points(self):
+        self.login()
+        r = self.wpost("/admin/api/perf/start")
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertTrue(r.json()["recording"])
+        self.assertTrue(r.json()["sampling"])
+        self.assertEqual(r.json()["intervalSeconds"], 1.0)
+        self.assertEqual(r.json()["capacity"], 60)
+        self._sample(4, start=1.0)
+        self.assertEqual(self.host.calls, 4)
+        got = self.ac.get("/admin/api/perf/points").json()
+        self.assertEqual(got["count"], 4)
+        self.assertTrue(got["recording"])
+        row = got["series"][-1]
+        self.assertEqual(row["gpuPercent"], 40.0)          # 打桩的假数据确实进了点
+        self.assertEqual(row["gpuMemUsedMb"], 400.0)
+        self.assertEqual(row["vramUsedMb"], 5123.0)        # 后端自报
+        self.assertEqual(row["active"], 1.0)               # 在途请求数
+
+    def test_points_are_incremental_and_stop_freezes_the_count(self):
+        self.login()
+        self.perf.start(now=100.0)
+        self._sample(5, start=100.0)
+        head = self.ac.get("/admin/api/perf/points").json()
+        self.assertEqual([p["seq"] for p in head["series"]], [1, 2, 3, 4, 5])
+        self.assertEqual(head["nextSince"], 5)
+        again = self.ac.get("/admin/api/perf/points?since=%s" % head["nextSince"]).json()
+        self.assertEqual(again["series"], [], "拿了 nextSince 再取一次不该又是全量")
+        self.assertEqual(again["nextSince"], 5)
+        self._sample(2, start=105.0)
+        inc = self.ac.get("/admin/api/perf/points?since=5").json()
+        self.assertEqual([p["seq"] for p in inc["series"]], [6, 7])
+        self.assertEqual(inc["nextSince"], 7)
+        stop = self.wpost("/admin/api/perf/stop")
+        self.assertEqual(stop.status_code, 200, stop.text)
+        self.assertFalse(stop.json()["recording"])
+        self._sample(20, start=200.0)
+        after = self.ac.get("/admin/api/perf/points").json()
+        self.assertEqual(after["samples"], 7, "停止之后还在长点")
+        self.assertEqual(self.host.calls, 7)
+
+    def test_the_ring_window_caps_the_buffer(self):
+        """**缓存上限**：窗口 60 秒（60 点）里塞 70 个点 → 缓冲不超过 60（覆盖最老的）。"""
+        self.login()
+        started = self.wpost("/admin/api/perf/start", {"windowSeconds": 60})
+        self.assertEqual(started.status_code, 200, started.text)
+        self.assertEqual(started.json()["capacity"], 60)
+        self._sample(70, start=1000.0)
+        state = self.ac.get("/admin/api/perf/state").json()
+        self.assertEqual(state["samples"], 60)
+        self.assertEqual(state["totalSampled"], 70)
+        self.assertEqual(state["dropped"], 10)
+        self.assertEqual(state["firstSeq"], 11)
+        self.assertEqual(state["lastSeq"], 70)
+        self.assertEqual(self.ac.get("/admin/api/perf/points").json()["count"], 60)
+
+    def test_an_out_of_range_window_is_a_400_and_starts_nothing(self):
+        self.login()
+        for bad in ({"windowSeconds": 10}, {"windowSeconds": 99999}, {"windowSeconds": "abc"}):
+            with self.subTest(bad=bad):
+                r = self.wpost("/admin/api/perf/start", bad)
+                self.assertEqual(r.status_code, 400, r.text)
+        self.assertFalse(self.perf.recording, "400 却已经开始了记录")
+
+    def test_a_bad_since_is_a_400(self):
+        self.login()
+        r = self.ac.get("/admin/api/perf/points?since=abc")
+        self.assertEqual(r.status_code, 400, r.text)
+        self.assertIn("since", r.json()["detail"])
+
+    def test_the_two_reads_are_not_cacheable(self):
+        """读数是"每一秒都不一样"的：被任何一层缓存住都会表现成「图冻住了」。"""
+        self.login()
+        for path in ("/admin/api/perf/state", "/admin/api/perf/points"):
+            with self.subTest(path=path):
+                r = self.ac.get(path)
+                self.assertEqual(r.status_code, 200, r.text)
+                self.assertEqual(r.headers.get("cache-control"), "no-store")
+
+    def test_start_and_stop_are_audited(self):
+        self.login()
+        self.wpost("/admin/api/perf/start")
+        self.wpost("/admin/api/perf/stop")
+        actions = [a for _who, a, _t in self.audit_rows()]
+        self.assertIn("perf-start", actions)
+        self.assertIn("perf-stop", actions)
+
+    def test_the_whole_cycle_makes_no_file_write(self):
+        """**不落盘**（需求 + 只读根文件系统的环境约束）。
+
+        注意这条断言的范围：它盯的是**采样数据**这条路 —— 从按开始到取点，
+        一个写文件的调用都不许有。写动作的**审计**行是既有机制（落的是 `admin_audit`，
+        不是性能数据），它与这里无关。
+        """
+        writes = []
+        real_open = builtins.open
+
+        def spy_open(file, mode="r", *args, **kw):
+            if any(ch in str(mode) for ch in "wax+"):
+                writes.append(("open", str(file), str(mode)))
+            return real_open(file, mode, *args, **kw)
+
+        def boom(name):
+            def fn(*a, **kw):
+                writes.append((name, str(a[:1]), ""))
+                raise AssertionError("性能这条路不许调用 %s" % name)
+            return fn
+
+        self.login()
+        with patch.object(builtins, "open", spy_open), \
+                patch.object(os, "replace", boom("os.replace")), \
+                patch.object(os, "remove", boom("os.remove")), \
+                patch.object(os, "rename", boom("os.rename")):
+            self.wpost("/admin/api/perf/start")
+            self._sample(5, start=100.0)
+            self.ac.get("/admin/api/perf/points")
+            self.ac.get("/admin/api/perf/state")
+            self.wpost("/admin/api/perf/stop")
+        self.assertEqual(writes, [], "性能这条路上出现了写文件调用：%s" % writes)
+
+
+class PerfPageTests(_AdminCase):
+    """「性能」页签的页面：**4 张图，一行 2 个、共 2 行**（需求指名要 2×2）。"""
+
+    def _html(self):
+        r = self.ac.get("/admin/")
+        self.assertEqual(r.status_code, 200)
+        return r.text
+
+    def test_there_are_exactly_four_charts(self):
+        html = self._html()
+        for cid in ("chart-gpu", "chart-vram", "chart-cpu", "chart-ram"):
+            with self.subTest(chart=cid):
+                self.assertIn('id="%s"' % cid, html)
+        self.assertEqual(html.count("<svg"), 4, "性能页签要正好 4 张折线图")
+
+    def test_the_four_charts_are_a_two_column_grid(self):
+        compact = self._html().replace(" ", "")
+        self.assertIn("grid-template-columns:repeat(2,minmax(0,1fr))", compact,
+                      "4 张图必须是「一行 2 个、两行」的栅格")
+
+    def test_the_tab_and_the_controls_are_on_the_page(self):
+        html = self._html()
+        self.assertIn('data-tab="perf"', html)
+        self.assertIn("/admin/api/perf/start", html)
+        self.assertIn("/admin/api/perf/stop", html)
+        self.assertIn("/admin/api/perf/points", html)
+        self.assertIn("?since=", html)                    # 增量取点
+        self.assertIn("mergePoints", html)
+        self.assertIn("setInterval(refreshPerf", html)     # 1.5 秒轮询
+
+    def test_it_stops_polling_when_the_page_goes_away(self):
+        html = self._html()
+        self.assertIn('addEventListener("pagehide", stopPerfPoll)', html)
+        self.assertIn("visibilitychange", html)
+
+    def test_the_page_still_has_no_external_frontend_dependency(self):
+        """服务端页面**不进前端工具链**：图表是内联 SVG，不是 chart.js/echarts。"""
+        html = self._html()
+        for bad in ("//cdn", "chart.js", "echarts", "unpkg", "jsdelivr", "type=\"module\""):
+            with self.subTest(dep=bad):
+                self.assertNotIn(bad, html)
 
 
 class AdminCliTests(unittest.TestCase):

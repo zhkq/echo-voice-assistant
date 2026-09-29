@@ -421,6 +421,55 @@ class VectorSpaceLockSurvivesFailureTests(_MeetingCase):
                         "第二段拿不到分离结果却标了说话人：%s" % labels)
 
 
+class _DiarizeOnlyBackend(CapabilityClient):
+    """**只给说话人时间轴、不给嵌入**的后端 —— 在线转写（方案 3）就是这个形状。
+
+    它同时不提供 `asr.text`：这样转写那一槽走本机替身，只有分离走它，
+    正好把"有轮次没嵌入"那条路单独拎出来测。
+    """
+
+    backend_id = BACKEND_ECHO_SERVER
+    source = SOURCE_LAN
+    provides = frozenset({"diarize.turns"})
+    vector_space_id = "ws-online-v1"
+
+    def __init__(self):
+        self.calls = []
+
+    def diarize(self, wav, *, max_speakers=None, **kw):
+        self.calls.append(os.path.basename(wav))
+        return DiarizeResult(turns=((0.0, 0.4, "S0"), (0.4, 0.9, "S1"), (0.9, 1.0, "S0")),
+                             speakers={}, dim=0, vector_space_id=self.vector_space_id,
+                             provenance=Provenance(self.backend_id, "fake-online-v1"),
+                             audio_seconds=1.0)
+
+
+class TurnsWithoutEmbeddingsTests(_MeetingCase):
+    """**有轮次、没嵌入**时会议照常标说话人（2026-09-28 修的那条 KeyError）。
+
+    在线转写只回 `speaker_id`、不回声纹嵌入。以前这条路会直接崩：
+    `_normalize_diarize` 回空 `labels` → `registry.map(embs, labels)` 给出空映射 →
+    紧接着 `key_map[spk]` **KeyError**（整场转写中断）。现在按后端自己的编号出显示名
+    （`S0` → 说话人1），而"认人"自然不做（没有嵌入可比）。
+    """
+
+    def test_labels_are_used_and_the_meeting_is_not_interrupted(self):
+        self._stub_local_asr()
+        backend = _DiarizeOnlyBackend()
+        router = CapabilityRouter([backend], settings_get=lambda k, d=None: d)
+        with patch("app.capabilities.build_default_router", lambda **kw: router):
+            meeting._transcribe_impl(self.folder)
+        self.assertEqual(backend.calls, ["01.wav"], "分离那一槽该走后端")
+        rows = db.get_lines(self.mid)
+        labels = [ln["speaker_label"] for ln in rows if ln["speaker_label"]]
+        self.assertTrue(labels, "有轮次没嵌入时也必须标上说话人 —— 原来这里直接崩")
+        self.assertEqual(set(labels) & {"S1", "S2"}, set(labels),
+                         "标签要按后端编号来（S0→S1）：%s" % labels)
+        names = {row["label"]: row["name"] for row in db.get_speakers(self.mid)}
+        self.assertEqual(names, {"S1": "说话人1", "S2": "说话人2"},
+                         "显示名要落库（面板与导出的就是它）")
+
+
 # ---------------------------------------------------------------- ⑥⑦⑧⑨⑩ 声纹
 
 class VoiceprintIsStandardTests(_IsolatedState):

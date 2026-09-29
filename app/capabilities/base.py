@@ -85,9 +85,26 @@ SOURCE_WAN = "wan"          # 网络服务商（可能是公网、也可能是�
 
 BACKEND_LOCAL = "local"
 BACKEND_ECHO_SERVER = "echo-server"
-#: 网络服务商（`providerAsr` 那一路的服务化形态）。**入口空置**：链上有它、设置里能选，
-#: 但适配器还没写 —— 选中会如实报 `absent`，不假装能用（接口规范到位后再实现）。
+#: 网络服务商（会议转写方案 3：`qwen-audio-3.1-asr-flash-filetrans`，整场异步）。
+#: **适配器还没写**：链上有它、设置里能选 —— 但"选中它"的结果必须是**说得出为什么不行**。
+#: 2026-09-28 收口：它原来被报成 `absent`（"没配这个后端"），那不是事实（用户明明点名了它），
+#: 于是人去查配对、查地址、查网络，而真答案是"这个功能还没做"。现在走
+#: `UNIMPLEMENTED_BACKENDS` 的 `unsupported` + 一句指路的原因。
+#: 决定与边界见 `docs/3.0-设计总览与组件关系.md` §6.6。
 BACKEND_ASR_PROVIDER = "asr-provider"
+
+#: **已知但还没实现**的后端：id → 一句人话原因（会一路走到面板、日志与 `meta.json`）。
+#:
+#: 为什么不直接报 `absent`：`absent` 的语义是"不在位 / 没配"，而"用户点名了它、
+#: 代码里却没有这个实现"是**另一件事**。说错原因会把人引到错的地方去。
+#:
+#: **2026-09-28 现状：这张表是空的** —— 三个后端都落地了（`local` / `echo-server` /
+#: `asr-provider`）。机制刻意留着，因为它是"新后端先占位"的标准姿势：
+#: 先让设置里能表达这个选择，再用 `unsupported` + 一句指路如实说"还没做"，
+#: 而不是让它以 `absent`（"没配"）的名义骗人去查配置。
+#: `tests/test_capabilities_contract.py::UnimplementedBackendTests` 同时盯着
+#: "表里说未实现的那些 id 确实没有客户端"（有客户端了却还留在表里 → 用例红）。
+UNIMPLEMENTED_BACKENDS: Dict[str, str] = {}
 
 #: privacy 约束的宽严（`需求.constraints.privacy`）：
 #:   none = 不出机（只许本地）｜lan = 允许内网 ｜wan = 允许更远

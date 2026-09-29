@@ -396,5 +396,80 @@ class CleanupCardWiringTests(unittest.TestCase):
         self.assertIn("modelUsageBits(modelById(", self.js, "组件行要把它渲染出来")
 
 
+class MeetingRetranscribeButtonTests(unittest.TestCase):
+    """转写中，「重新转写」按钮必须**禁用 + 文案变「转写中…」**，判据来自后端字段。
+
+    用户实测 bug（2026-09-28）的原话："转写中，转写按钮还能再次被点击，容易误触。"
+
+    这一层只是**体验**（防线在后端那道 409，见
+    `tests/test_meeting_retranscribe_guard.py`），但状态必须来自
+    `GET /api/meetings/{id}` 下发的 `transcribing` —— **不能用页面本地变量**
+    （"我刚点过"那种）：一刷新就没了，转写中的会重开详情页按钮又是可点的，
+    bug 只修了一半。
+
+    这些是**源码级**断言（本文件一贯的做法：面板没有构建步骤，靠文本契约钉住）。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.html = _read("web", "meeting.html")     # 「重新转写」按钮在详情页
+        cls.js = _read("web", "app.js")
+        cls.api = _read("app", "api.py")
+
+    @staticmethod
+    def _js_function(src, sig):
+        """从 `sig` 起、到下一个**顶格** `}` 为止（本文件的函数都是这个形状）。"""
+        i = src.index(sig)
+        return src[i:src.index("\n}", i) + 2]
+
+    def test_the_button_is_disabled_from_the_backend_field(self):
+        fn = self._js_function(self.html, "function syncRetranscribeBtn()")
+        self.assertIn("M.transcribing", fn, "按钮判据必须是后端字段 transcribing")
+        self.assertIn("btn.disabled = busy", fn, "转写中必须真的禁用（不只是改文案）")
+        self.assertIn("转写中…", fn, "文案要改成「转写中…」")
+        self.assertIn("重新转写", fn, "转完要变回「重新转写」")
+
+    def test_a_refresh_still_gets_the_right_state(self):
+        """判据来自接口 → 刷新页面也对。
+
+        证据是"`load()` 拿到详情之后会同步一次按钮"：页面打开（含刷新）时
+        `M` 是刚从后端拿的，本地变量在那一刻根本不存在。
+        """
+        load = self._js_function(self.html, "async function load()")
+        self.assertIn("syncRetranscribeBtn()", load,
+                      "加载详情后必须同步按钮状态，否则刷新页面按钮又是可点的")
+        # 转写期间要**继续问后端**（转完自动把按钮/转写稿刷新过来）
+        self.assertIn("function startTxPoll()", self.html)
+        self.assertIn("function stopTxPoll()", self.html)
+
+    def test_the_backend_actually_sends_the_field(self):
+        """后端没有这个字段的话，前端就是自己在编 —— 所以也要钉住接口那一侧。
+
+        两个来源各一处：列表在 `app/api.py` 的循环里，详情在
+        `app/meeting.py::get_meeting_detail()` 里（详情接口直接用它的返回值）。
+        """
+        self.assertIn('it["transcribing"] = meeting.is_transcribing(', self.api,
+                      "列表接口要下发 transcribing")
+        self.assertIn('"transcribing": is_transcribing(meeting["name"])',
+                      _read("app", "meeting.py"),
+                      "详情（get_meeting_detail）要下发同一个字段")
+
+    def test_the_409_reason_reaches_the_user(self):
+        """后端那句中文必须原样显示：原来 `api()` 只抛 `HTTP 409`，
+        用户看到的是"失败：HTTP 409" —— 等于没说为什么、也没说等一会儿就行。"""
+        fn = self._js_function(self.html, "async function api(path, opts = {})")
+        self.assertIn("detail", fn, "错误响应里的 detail 要取出来当消息")
+
+    def test_the_click_handler_ignores_a_disabled_button(self):
+        handler = self.html[self.html.index('$("#btnRetranscribe").addEventListener'):
+                            self.html.index('$("#btnRegenSummary").addEventListener')]
+        self.assertIn("btn.disabled", handler, "禁用态下点了不该再发请求（双保险第一层）")
+
+    def test_the_meeting_list_uses_the_same_field(self):
+        """列表卡片画不画进度条也读同一个字段（两个页面不许各有一套判据）。"""
+        fn = self._js_function(self.js, "function renderMeetingItems(")
+        self.assertIn("m.transcribing", fn)
+
+
 if __name__ == "__main__":
     unittest.main()

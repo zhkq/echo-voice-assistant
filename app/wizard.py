@@ -334,10 +334,66 @@ def load_plan(path: str = "") -> dict:
     return _normalize(data)
 
 
+#: 键名以这些后缀结尾的，**值不进计划文件**（2026-09-28 收口）。
+#:
+#: 为什么必须收：计划文件是"关掉面板还能接着改"的草稿（明文 JSON，`data/wizard-plan.json`），
+#: 而密钥只该有**一个**权威副本 —— 落在 `settings` 里（`secret=True`，接口永不回显）。
+#: 多一份明文的代价是真实的：面板可能开着共享屏幕、`data/` 可能被同步进云盘或备份。
+#:
+#: 判据用**后缀**而不是列名单：新加一个 provider 的密钥字段时不必记得来改这里。
+#: 面板上那些"该遮起来"的地方用的也是同一套后缀（`web/app.js::wizMaskSetting`）。
+SECRET_SUFFIXES = ("ApiKey", "Token", "Secret", "Password")
+
+
+def is_secret_key(name: str) -> bool:
+    """键名是不是密钥类。**大小写不敏感** —— 前端与 provider 声明里两种写法都有
+    （`llm.apiKey` 是小写 a，`capabilityAsrProviderApiKey` 是大写 A；
+    2026-09-28 按后缀硬比时正好漏掉了前者）。"""
+    low = str(name or "").lower()
+    return any(low.endswith(s.lower()) for s in SECRET_SUFFIXES)
+
+
+def _redact(value):
+    """把嵌套结构里密钥类字段的**值**抹成空串（键名照留）。
+
+    抹成空串而不是掩码字符串，是为了堵住最糟的那种失败：用户看到 `••••` 点保存，
+    于是设置里真的存了四个圆点。键名留着是因为确认页要能列出"将写入哪些键"。
+    """
+    if isinstance(value, dict):
+        return {k: ("" if (is_secret_key(k) and isinstance(v, str) and v) else _redact(v))
+                for k, v in value.items()}
+    if isinstance(value, list):
+        return [_redact(x) for x in value]
+    return value
+
+
+def _redact_built(built: dict) -> dict:
+    """`built.config` 里那几行是 `{"key": …, "value": …}` —— 密钥行只留键名。
+
+    （`build_plan()` 的 `config` 就是"要写进设置的那些行"，它同样带着明文。）
+    """
+    out = dict(built or {})
+    rows = []
+    for row in (out.get("config") or []):
+        if isinstance(row, dict) and is_secret_key(row.get("key")):
+            row = dict(row, value="")
+        rows.append(row)
+    if rows or "config" in out:
+        out["config"] = rows
+    return out
+
+
 def save_plan(data, path: str = "") -> dict:
-    """写计划（原子替换）。**只写这一个文件**：不写设置、不下载 —— 那是执行相的事。"""
+    """写计划（原子替换）。**只写这一个文件**：不写设置、不下载 —— 那是执行相的事。
+
+    **密钥不落盘**（见 `SECRET_SUFFIXES`）：`choices` 与 `built.config` 里的密钥值在这里
+    被抹掉。执行相不受影响 —— `/api/wizard/preview` 与 `/execute` 用的是**请求体里的
+    choices**（前端内存里那份），计划文件只是断点续跑的草稿。
+    """
     target = path or plan_path()
     plan = _normalize(data)
+    plan["choices"] = _redact(plan.get("choices") or {})
+    plan["built"] = _redact_built(plan.get("built") or {})
     plan["updatedAt"] = _now()
     folder = os.path.split(target)[0]
     if folder and not os.path.isdir(folder):
@@ -513,12 +569,27 @@ def llm_configured(choices: dict) -> bool:
 
     只认"填全"：半填的配置一旦写进 `providerLlm`，会把纪要**强制**从智能体切到直连
     却用不了 —— 比不配更糟。
+
+    **密钥可以来自库里**（2026-09-28）：计划文件不落密钥，所以"重开面板"之后
+    `choices.llm.apiKey` 必然是空的 —— 而"地址在计划里、密钥已经在设置里"是完全正常的
+    状态。不认这一条就会误报"不能自动写纪要"（假坏消息比没有消息更糟）。
     """
     llm = llm_choice(choices)
-    if not llm_provider_id(choices):
+    provider = llm_provider_id(choices)
+    if not provider:
         return False
-    return bool(str(llm.get("baseUrl", "") or "").strip()
-                and str(llm.get("apiKey", "") or "").strip())
+    if not str(llm.get("baseUrl", "") or "").strip():
+        return False
+    key = str(llm.get("apiKey", "") or "").strip()
+    if not key:
+        key = _settings(_declared_credential_key("llm", provider, "ApiKey"))
+    return bool(key)
+
+
+def _declared_credential_key(kind: str, provider_id: str, suffix: str) -> str:
+    """provider 自己声明的那把密钥设置键叫什么（向导不发明键名，也不猜）。"""
+    keys = _provider_spec(kind, provider_id).get("settings") or []
+    return next((str(k) for k in keys if str(k).endswith(suffix)), "")
 
 
 def minutes_capable(choices: dict) -> bool:
@@ -584,8 +655,87 @@ def _agent_backend_rows(choice: str) -> list:
     return rows
 
 
+#: 会议转写方式（2026-09-28 定，见 `docs/3.0-设计总览与组件关系.md` §6.6 与
+#: `docs/向导-分步设计.md` §2.2）。向导这一步**只写"转写走哪条路"这一个键**：
+#: 真正"连哪台后端"是一个**动作**（配对），不是设置 —— 方案 1 走
+#: `POST /api/capability/pair-local`，方案 2 走 `POST /api/capability/pair`，
+#: 两件事在向导那一步里就地完成（与面板共用同一套接口，不另造）。
+MEETING_ROUTES = ("local", "paired", "online")
+
+
+def _meeting_route_rows(choices: dict) -> tuple:
+    """`meeting.route` → `(设置行, 末页"还不能做什么"条目)`。
+
+    三条路的差别**只在怎么连上后端**：
+
+      * `local`  —— 后端装在这台机器上（方案 1）：配对靠读本机那份 `local-pair.json`；
+      * `paired` —— 后端在别的机器上（方案 2）：靠管理员给的配对串；
+      * `online` —— 在线 qwen3.1（方案 3）：**适配器还没实现**
+        （`app/capabilities/base.py::UNIMPLEMENTED_BACKENDS`）。
+
+    前两条写**同一个值** `echo-server`：本机后端与远端后端在代码里就是同一个后端
+    （`docs/3.0-设计总览与组件关系.md` §6.6 的对照表），差别只是地址从哪来。
+    第三条**一个键都不写**并进末页 —— 写下去等于把用户送进"能选却一定失败"的状态，
+    而那正是 2026-09-28 收口掉的东西（`router` 遇到它会报 `unsupported`）。
+
+    **不写 `capabilityPrivacy`**：那是用户的出网许可，不该被向导顺手放宽。
+    但它与"后端在别处"是**冲突**的（`none` 会把后端请求判成 `blocked`），
+    所以这里读一次当前值，冲突就进末页说清楚，让人自己选。
+    """
+    meet = choices.get("meeting")
+    route = str((meet or {}).get("route") or "").strip() if isinstance(meet, dict) else ""
+    if route == "online":
+        # 方案 3（在线）：**密钥必须当场填**，否则这一路在路由里根本不存在
+        # （`asr_provider.client_from_settings()` 没密钥就返回 None）。
+        rows = [{"key": "capabilityMeetingAsrBackend", "value": "asr-provider"}]
+        # 公网服务 = 对"音频出网"的**显式同意**：许可必须放宽到 wan，否则会被判 blocked。
+        # 这一条是用户选了云端才写，不是"顺手放宽"（与 local/paired 那两条相反）。
+        rows.append({"key": "capabilityPrivacy", "value": "wan"})
+        key = str((meet or {}).get("onlineApiKey") or "").strip()
+        if key:
+            rows.append({"key": "capabilityAsrProviderApiKey", "value": key})
+        base = str((meet or {}).get("onlineBaseUrl") or "").strip()
+        if base:
+            rows.append({"key": "capabilityAsrProviderBaseUrl", "value": base})
+        model = str((meet or {}).get("onlineModel") or "").strip()
+        if model:
+            rows.append({"key": "capabilityAsrProviderModel", "value": model})
+        if not key:
+            # 计划文件**不落密钥**：重开面板后这里一定是空的，而"密钥已经在库里"是
+            # 正常状态 —— 不认这一条就会在末页误报"还没填密钥"。
+            key = _settings("capabilityAsrProviderApiKey")
+        if not key:
+            return rows, [{"feature": "会议转写走在线服务",
+                           "reason": "选了在线，但**还没填密钥** —— 没密钥这一路在 ECHO 里不存在",
+                           "fix": "回到向导第 9 步填上服务方给你的密钥"
+                                  "（或者在「能力」页签的在线转写卡里填）"}]
+        return rows, [{"feature": "会议里按名字认出联系人",
+                       "reason": "在线转写只回「说话人 1/2/3」、**不回声纹** —— "
+                                 "这一档能分清谁在说，但认不出是谁",
+                       "fix": "想要认人：在后端那台机器上转（方案 2），"
+                              "或者转完之后在会议详情里手动改名"}]
+    if route in ("local", "paired"):
+        rows = [{"key": "capabilityMeetingAsrBackend", "value": "echo-server"}]
+        # 走 `wizard._settings()`（模块级、可打桩）而不是直接 import config —— 与这一层
+        # 其它读设置的地方同一条路，测试才拦得住。
+        privacy = _settings("capabilityPrivacy")
+        # `local` 也算"要出机"：回环上的后端目前与内网后端同一个 `source`
+        # （`app/capabilities/echo_server.py` 用的是 `SOURCE_LAN`），所以 privacy=none
+        # 会把它判成 blocked。这一条是**如实说**，不是替用户改许可。
+        if privacy == "none":
+            return rows, [{"feature": "把录音交给这台/那台后端转写",
+                           "reason": "你把「允许音频去哪」设成了「不出机」，而后端在进程外 —— "
+                                     "这个组合按策略会被挡住",
+                           "fix": "在「能力」卡把「允许音频去哪」改成「内网」，"
+                                  "或者改用「本机」转写引擎"}]
+        return rows, []
+    return [], [{"feature": "开会时的录音变成文字",
+                 "reason": "还没选会议转写走哪条路（本机后端 / 同事给你的后端 / 在线）",
+                 "fix": "回到向导第 9 步"}]
+
+
 def _setting_updates(choices: dict) -> list:
-    """三处位置 + provider + 智能体 → 设置项。只写用户真的填了的（空值不覆盖已有配置）。"""
+    """三处位置 + provider + 智能体 + 会议转写 → 设置项。只写用户真的填了的（空值不覆盖已有配置）。"""
     locs = dict(choices.get("locations") or {})
     rows = []
     for key, setting_key in (("models", "modelsDir"),
@@ -603,6 +753,8 @@ def _setting_updates(choices: dict) -> list:
         rows += _agent_backend_rows(agent)
     if choices.get("asrOnline"):
         rows.append({"key": "providerAsr", "value": "openai-asr"})
+    # 会议转写走哪条路（2026-09-28）：见 `_meeting_route_rows` 的说明。
+    rows += _meeting_route_rows(choices)[0]
     llm_provider = llm_provider_id(choices)
     if llm_provider:
         rows.append({"key": "providerLlm", "value": llm_provider})
@@ -733,14 +885,17 @@ def build_plan(choices: dict) -> dict:
         missing.append({"feature": "自动写会议纪要",
                         "reason": "纪要由智能体负责（归档和语音指令也走它，靠技能扩展）；"
                                   "直连一个 AI 服务是不推荐的兜底",
-                        "fix": "回到向导第 7 步准备智能体"})
+                        "fix": "回到向导第 8 步准备智能体"})
     if not str(choices.get("agent", "") or "").strip():
         missing.append({"feature": "让 ECHO 帮你动手（整理笔记、操作文件）",
-                        "reason": "还没选智能体后端", "fix": "回到向导第 7 步"})
+                        "reason": "还没选智能体后端", "fix": "回到向导第 8 步"})
     if choices.get("asrOnline"):
         missing.append({"feature": "断网时也能转写",
                         "reason": "你选了在线转写 —— 网断了就转不了",
-                        "fix": "向导第 8 步装一个小号兜底"})
+                        "fix": "向导第 10 步装一个小号兜底"})
+    # 会议转写走哪条路（2026-09-28）：没选 / 选了还没实现的在线档 / 许可与它冲突，
+    # 三种都要在末页说出来 —— 否则用户会以为"录完就会自动出文字"。
+    missing += _meeting_route_rows(choices)[1]
     return {
         "schema": PLAN_BUILD_SCHEMA,
         "builtAt": _now(),

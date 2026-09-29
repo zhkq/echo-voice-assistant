@@ -95,6 +95,18 @@ SPECIAL = {
     "capabilityEchoServerToken": ("能力与智能体 / 已配对后端", "高级", "保留（**当前无下发通道**：ROUTING_KEYS 刻意排除，怕与配对令牌混淆）"),
     "capabilityEchoServerStaticToken": ("能力与智能体 / 已配对后端", "高级", "保留（同上）"),
     "capabilityEchoServerUrl": ("能力与智能体 / 已配对后端", "高级", "保留（直连后端的地址；配对优先）"),
+    # 2026-09-28：方案 1（本机自建后端）的配对文件路径。放"已配对后端"那一格是刻意的 ——
+    # 它只影响「检测本机后端」按钮去哪儿找文件，与"会议转写走哪条路"无关。
+    "capabilityLocalPairPath": ("能力与智能体 / 已配对后端", "高级",
+                                "保留（方案 1 用：本机配对文件路径；留空按约定位置找）"),
+    # 2026-09-28：会议转写方案 3（在线）的三项。它们在「能力」页签的在线转写卡里，
+    # 与配对那两张卡分开 —— 一个是"别人给我的后端"，一个是"公网服务"，不是一回事。
+    "capabilityAsrProviderBaseUrl": ("能力与智能体 / 在线转写", "高级",
+                                     "保留（方案 3 用：千问AI平台地址；留空 = maas.qianwenaiapi.com）"),
+    "capabilityAsrProviderApiKey": ("能力与智能体 / 在线转写", "高级",
+                                    "保留（方案 3 用：密钥；填了才算配了这一路）"),
+    "capabilityAsrProviderModel": ("能力与智能体 / 在线转写", "高级",
+                                   "保留（方案 3 用：模型名；默认 filetrans 整场异步）"),
     # 已过时（代码里已有弃用迁移，老值会折进新项）
     "worklogMode": ("—", "—", "**已过时**：与 worklogEnabled 重复，代码里有弃用迁移"),
     "providerTts": ("—", "—", "**已过时**：与 ttsEngine 重复，代码里有弃用迁移"),

@@ -179,8 +179,18 @@ async function gotoWizard() {
     card.querySelector(":scope > .card-title")?.setAttribute("aria-expanded", "true");
     const collapsed = _collapsedCards();
     if (collapsed.delete("wizard")) _saveCollapsedCards(collapsed);
+    // 还要拦住"默认收起"的种子（否则全新环境里会被它当场重新折叠，见 `_markCollapseDecided`）
+    _markCollapseDecided("wizard");
   }
   try { await loadWizard(); } catch (e) { /* 拉不到就只展开；卡片自己会显示失败原因 */ }
+  // `?wizstep=<步 id>`：直接落到那一步（2026-09-28）。
+  // 为什么要有它：向导有 12 步，而"验收/排障/截图"往往只看某一步 ——
+  // 没有它就只能靠人一步步点过去，无头截图根本做不到（`?compress=1` 是同一个先例：
+  // "分享链接 / 无头截图"用的深链）。
+  if (_bootWizStep) {
+    const idx = WIZ_STEPS.findIndex((s) => s.id === _bootWizStep);
+    if (idx >= 0) { _wizStep = idx; wizRender(); }
+  }
   const after = $("#wizCard");
   if (after) after.scrollIntoView({ behavior: "smooth", block: "start" });
 }
@@ -313,6 +323,22 @@ function _seedCollapseDefaults() {
   want.forEach((id) => { collapsed.add(id); seeded.add(id); });
   _saveCollapsedCards(collapsed);
   try { localStorage.setItem(COLLAPSE_SEEDED_KEY, JSON.stringify([...seeded])); } catch (e) { /* 忽略 */ }
+}
+function _markCollapseDecided(id) {
+  /* 把一张卡记进"用户已经表过态"的标记，让 `_seedCollapseDefaults()` 不再多嘴。
+     2026-09-29 实测出来的必要一步：`applyCollapsedCards()` 在 `bootView()` **之后**跑，
+     而它每次都调一次种子函数 —— 全新环境（localStorage 空）里，
+     `?view=wizard` 刚把卡展开、紧接着种子又把它塞回折叠集合，
+     于是深链在"全新浏览器/第一次打开面板"这个**最该生效**的场合看着像没生效
+     （无头截图每次都是全新 profile，所以先在这里现形）。 */
+  if (!id) return;
+  let seeded;
+  try { seeded = new Set(JSON.parse(localStorage.getItem(COLLAPSE_SEEDED_KEY) || "[]")); }
+  catch (e) { seeded = new Set(); }
+  if (seeded.has(id)) return;
+  seeded.add(id);
+  try { localStorage.setItem(COLLAPSE_SEEDED_KEY, JSON.stringify([...seeded])); }
+  catch (e) { /* 忽略 */ }
 }
 function _cardTitleOf(el) {
   // 只认"直接子标题"：卡片里嵌套的其它标题（如设置页分组）不该触发卡片折叠
@@ -1604,7 +1630,7 @@ const SET_OPT_LABELS = {
 const SET_MEETING_BACKENDS = [
   { value: "echo-server", label: "ECHO 后端", hint: "配对好的 GPU 机器" },
   { value: "local", label: "本机", hint: "这台机器的转写引擎" },
-  { value: "asr-provider", label: "网络服务商", hint: "外部/内网服务（适配器未实现）" },
+  { value: "asr-provider", label: "网络服务商", hint: "在线 qwen3.1（会议转写方案 3）：整场异步转写，要填密钥；认不了联系人" },
 ];
 
 /* "用哪个实现"相关的配置项：从「设置」页移出，统一由顶部「能力」页签承载
@@ -2679,6 +2705,47 @@ function capBackendBadge(b) {
   return `<span class="badge idle">未知</span>`;
 }
 
+/* 后端自己的状态行 + 「打开后端管理面」（2026-09-28，设计 §6.6 的"设置分家"）。
+
+   客户端**不展示后端的设置**（端口 / 显存预算 / 模型档位 / 配额 / TLS 全归后端自己的
+   `server.yaml` 与管理面），这里只给**状态**与一个入口 —— 而且状态里的每个数字都来自
+   后端的 `/v1/health`（后端宣告），客户端一个都不算，也不猜管理面端口。
+
+   远程后端那一条要如实说清"为什么点不开"：管理面**只发布在后端那台机器的回环上**
+   （`127.0.0.1:8901`，见 `docs/后端容器部署.md` §7），所以客户端这侧只能走 ssh 隧道。 */
+function capBackendHealthLine(b) {
+  const h = b.health || {};
+  if (!h.version) return "";
+  const parts = [`版本 ${esc(h.version)}`];
+  const v = h.vram || {};
+  if (Number(v.budgetMb) > 0) {
+    parts.push(`显存 ${(Number(v.usedMb || 0) / 1024).toFixed(1)}/${(Number(v.budgetMb) / 1024).toFixed(1)} GB`);
+  }
+  const models = h.models || {};
+  const ids = Object.keys(models);
+  if (ids.length) {
+    const ready = ids.filter((k) => models[k] === "ready").length;
+    parts.push(`模型 ${ready}/${ids.length} 就绪`);
+  }
+  const q = h.quota || {};
+  const used = Object.keys(q.clients || {}).length;
+  if (used) parts.push(`今日已用 ${used} 个客户端`);
+  return `<div class="cap-be-slots">${parts.join(" · ")}</div>`;
+}
+
+function capBackendAdminRow(b) {
+  const url = String((b.health || {}).adminUrl || "");
+  if (!url) return "";
+  const loop = /^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(:\d+)?/i.test(String(b.baseUrl || ""));
+  if (loop) {
+    return `<div class="cap-be-slots"><a class="btn" href="${esc(url)}" target="_blank"
+      rel="noopener">打开后端管理面</a>
+      <span class="muted" style="font-size:12px">发授权 / 客户端 / 调用记录 / 配额都在那边</span></div>`;
+  }
+  return `<div class="cap-be-slots">管理面只发布在<b>后端那台机器</b>的回环上 —— 要看就用
+    <code>ssh -L 8901:127.0.0.1:8901 &lt;后端主机&gt;</code>，再开 <code>${esc(url)}</code>。</div>`;
+}
+
 function renderCapBackends(rows) {
   const host = $("#capBackendList");
   if (!host) return;
@@ -2692,21 +2759,44 @@ function renderCapBackends(rows) {
       <span class="cap-be-name">${esc(b.label || b.backendId)}</span>
       ${capBackendBadge(b)}
       <span class="muted" style="font-size:12px">${esc(src[b.source] || b.source || "")}${b.serverName ? " · " + esc(b.serverName) : ""}</span>
+      ${capBackendHealthLine(b)}
       <div class="cap-be-slots">能做：${esc(slots)}</div>
+      ${capBackendAdminRow(b)}
       ${extra}
     </div>`;
   }).join("");
 }
 
-function renderCapPairState(pair) {
+function renderCapPairState(pair, local) {
   const state = $("#capPairState");
-  if (!state) return;
-  if (!pair || !pair.paired) {
-    state.textContent = "还没配对 —— 这台机器只用本机引擎。";
-    return;
+  if (state) {
+    if (!pair || !pair.paired) {
+      state.textContent = "还没配对 —— 这台机器只用本机引擎。";
+    } else {
+      const token = pair.tokenFresh ? "令牌有效" : "下次调用时自动换令牌";
+      state.textContent = `已配对：${pair.serverName || pair.baseUrl}（${pair.clientId}）· ${token}`;
+    }
   }
-  const token = pair.tokenFresh ? "令牌有效" : "下次调用时自动换令牌";
-  state.textContent = `已配对：${pair.serverName || pair.baseUrl}（${pair.clientId}）· ${token}`;
+  // **方案 1：本机自动配对**（2026-09-28）。按钮与它旁边那句话都以这份状态为准：
+  // 文件不在 / 码过期 → **禁用**（不是藏起来），并当场写清为什么、以及怎么做。
+  const btn = $("#btnCapPairLocal");
+  const hint = $("#capPairLocalState");
+  if (!btn) return;
+  const info = local || {};
+  const found = !!info.found;
+  const expired = !!info.expired;
+  btn.disabled = !found || expired;
+  btn.title = found
+    ? (expired
+      ? `本机配对码已过期（${info.path}）—— 在后端那台机器上重启一次后端就会重发`
+      : `读 ${info.path} 完成配对（同机不用抄配对码）`)
+    : (info.message || "没找到本机配对文件：本机后端还没跑起来");
+  if (hint) {
+    hint.textContent = found
+      ? (expired ? "本机后端在跑，但配对信息已过期 —— 重启一次后端"
+                 : `已找到本机后端：${info.baseUrl || ""}`)
+      : "本机后端还没跑起来（后端在别的机器上 → 用上面的配对串）";
+  }
 }
 
 async function loadCapabilityRouting(force) {
@@ -2722,7 +2812,7 @@ async function loadCapabilityRouting(force) {
     // `_settingsCache` 才能被 `settingByKey/settingValue` 读到（`loadCapabilities()`
     // 刚把缓存换成了 `/api/settings` 那一份，而那里**不含 hidden 键**）。
     mergeSettingsRows(r.settings || []);
-    renderCapPairState(r.pair);
+    renderCapPairState(r.pair, r.local);
     renderCapBackends(r.backends || []);
     // 「已配对后端连接情况」默认收起，**真配上了自动展开一次**（见 autoExpandOnce）
     autoExpandOnce("cap-pair", !!(r.pair && r.pair.paired));
@@ -2806,6 +2896,33 @@ async function doCapabilityPair() {
   }
 }
 
+/** **方案 1：本机自动配对**（2026-09-28，见 `docs/3.0-设计总览与组件关系.md` §6.6）。
+ *
+ *  ECHO 拆成"客户端 + 能力后端"两段之后，"本机跑得动"的实质就是**本机装了一个后端**。
+ *  那种情况下不该让人抄配对码（配对串是给**另一台**机器准备的）：后端启动时会把
+ *  "本机怎么连我"写在自己状态目录里，这一步就是去读它 —— 换凭据走的还是同一条
+ *  `pair()`，产物与粘配对串**完全一样**。
+ *
+ *  读不到/过期时给的是**人话**（看过哪些位置、要重启后端），不是一句"失败"。 */
+async function doCapabilityPairLocal() {
+  const state = $("#capPairState");
+  const hint = $("#capPairLocalState");
+  if (state) state.textContent = "正在找本机后端…";
+  try {
+    const r = await api("/api/capability/pair-local", { method: "POST", body: "{}" });
+    toast(r.message || "已连上本机后端");
+    await loadCapabilityRouting(true);
+  } catch (e) {
+    // 与手工配对同一条规矩：400 的 body 是 {"detail": "一句人话"}，原样显示那条。
+    let msg = e.message;
+    const m = /^\s*HTTP \d+:\s*(\{.*\})$/s.exec(msg);
+    if (m) { try { msg = JSON.parse(m[1]).detail || msg; } catch (_) { /* 原样 */ } }
+    if (state) state.textContent = "本机后端没连上";
+    if (hint) hint.textContent = msg;
+    toast(msg, 8000);
+  }
+}
+
 async function doCapabilityUnpair() {
   if (!window.confirm("解除配对？\n\n这只是让这台机器忘掉后端凭据；"
     + "服务端那本客户端清单归管理员。再要用得让管理员重新发一张配对码。")) return;
@@ -2818,6 +2935,8 @@ async function doCapabilityUnpair() {
 
 const _btnCapPair = $("#btnCapPair");
 if (_btnCapPair) _btnCapPair.addEventListener("click", doCapabilityPair);
+const _btnCapPairLocal = $("#btnCapPairLocal");
+if (_btnCapPairLocal) _btnCapPairLocal.addEventListener("click", doCapabilityPairLocal);
 const _btnCapUnpair = $("#btnCapUnpair");
 if (_btnCapUnpair) _btnCapUnpair.addEventListener("click", doCapabilityUnpair);
 // `#btnCapRouteSave` 不再有了：那几行设置已经收进「会议转写服务」卡，随页签顶部的「保存」落库
@@ -3172,11 +3291,22 @@ function renderMeetingServiceCard() {
   const sel = capBackendValue();
   const radios = SET_MEETING_BACKENDS.map((b) => {
     const be = backendRow(b.value);
-    const badge = b.value === "asr-provider"
-      ? `<span class="sbadge">未实现</span>` : readyBadge(be ? be.ready : undefined);
-    return `<label class="schk" title="${esc(b.hint)}">`
+    const badge = b.unimplemented
+      ? `<span class="sbadge">未实现</span>`
+      /* 在线转写**填了密钥才存在**（`asr_provider.client_from_settings()` 没有密钥就返回 None）
+         —— 所以"后端清单里没有它"的正确说法是"没配密钥"，不是"未知"。 */
+      : (b.value === "asr-provider" && !be
+        ? `<span class="sbadge" title="在线转写要填密钥才存在：设置 → 能力 → 在线转写">没配密钥</span>`
+        : readyBadge(be ? be.ready : undefined));
+    /* 未实现的**禁用而非隐藏**（D24）：它还列在这里，但点不动，并说清为什么 ——
+       否则用户选中它之后只会拿到一句"不支持这件事"，然后去查配对/网络（2026-09-28）。 */
+    const title = b.unimplemented
+      ? `${b.hint} —— 适配器还没实现：现在选它不会生效，调用时会如实报「不支持这件事」并给出原因`
+      : b.hint;
+    return `<label class="schk" title="${esc(title)}">`
          + `<input type="radio" name="setMeetingBackend" value="${esc(b.value)}" data-merge-backend="1"`
-         + `${b.value === sel ? " checked" : ""}><span>${esc(b.label)}</span>${badge}</label>`;
+         + `${b.value === sel ? " checked" : ""}`
+         + `${b.unimplemented ? " disabled" : ""}><span>${esc(b.label)}</span>${badge}</label>`;
   }).join("");
   const priv = String(settingValue("capabilityPrivacy", "lan") || "lan");
   let consistency = `<span class="sbadge ok">一致</span>`;
@@ -4183,7 +4313,11 @@ function renderMeetingItems(el, items, opts = {}) {
     const started = m.started_at ? m.started_at.replace("T", " ").slice(0, 16) : "";
     const tx = _txStatus[m.id];
     let txHtml = "";
-    if (m.status === "transcribing") {
+    // 「这一场在转写吗」用**后端字段** `m.transcribing`（`meeting.is_transcribing`：
+    // 进程内标记 ∪ 库状态），不再只看 `m.status` —— 刚点过「重新转写」的那几十毫秒里
+    // 状态还没翻过来，只看 status 会让进度条迟一步出现。
+    // 详情页那颗「重新转写」按钮的禁用读的是**同一个字段**（web/meeting.html）。
+    if (m.transcribing) {
       const pct = tx ? (tx.percent || 0) : 3;
       const info = tx ? `${tx.detail || ""}` : "准备中…";
       txHtml = `<div class="tx-bar"><i style="width:${pct}%"></i></div>
@@ -4872,6 +5006,9 @@ initRouterUI();
    默认值尽量替用户选好（设计 §0.4）：转写方式默认本机最轻那档；AI 服务**刻意没有默认**
    （那是用户自备的，ECHO 不提供也不代管）。 */
 let _wizEnv = null, _wizComps = [], _wizBuilt = null, _wizStep = 0, _wizTimer = null;
+/* S8 那一页要显示"本机后端在不在 / 配没配上" —— 与「能力」卡同一份数据（`/api/capability`），
+   不另造接口、也不在向导里缓存第二份真相。 */
+let _wizPairState = null;
 let _wizChoices = wizBlankChoices();
 
 function wizBlankChoices() {
@@ -4882,6 +5019,11 @@ function wizBlankChoices() {
     /* S6：纪要默认走**智能体**；`llm.direct` 才是"直连兜底"的显式开关（不推荐）。
        填了地址**不等于**启用 —— 见 wizRenderLlm 的说明。 */
     llm: { direct: false, baseUrl: "", apiKey: "", model: "" },
+    /* S8（2026-09-28）：会议转写走哪条路。**配对本身是一个动作**，不在这里存码 ——
+       用户在这一页点「检测本机后端」或「配对」时就地完成（复用「能力」卡那两个接口）。
+       `onlineApiKey` / `onlineBaseUrl` 是方案 3 的两项：密钥**不在这一层做任何校验**，
+       只原样交给计划（`wizard._meeting_route_rows` 会把它写进设置；没填就进末页提醒）。 */
+    meeting: { route: "", onlineApiKey: "", onlineBaseUrl: "" },
   };
 }
 
@@ -4922,6 +5064,7 @@ const WIZ_STEPS = [
   { id: "accel", name: "用显卡加速", render: wizRenderAccel },
   { id: "llm", name: "让 ECHO 会写纪要", render: wizRenderLlm },
   { id: "agent", name: "让 ECHO 能动手", render: wizRenderAgent },
+  { id: "meeting", name: "开会时的录音交给谁", render: wizRenderMeeting },
   { id: "offline", name: "断网也能用", render: wizRenderOffline },
   { id: "confirm", name: "确认一下", render: wizRenderConfirm },
   { id: "run", name: "正在准备", render: wizRenderRun },
@@ -4943,6 +5086,7 @@ async function loadWizard() {
     ]);
     _wizEnv = env;
     _wizComps = comps.items || [];
+    await wizLoadPairState();
     _wizChoices = wizBlankChoices();
     const saved = (plan.plan && plan.plan.choices) || {};
     Object.assign(_wizChoices, saved);
@@ -4953,6 +5097,9 @@ async function loadWizard() {
     /* S6 的直连兜底字段：老计划文件里没有 llm 这一块，补成完整骨架再渲染 */
     _wizChoices.llm = Object.assign({ direct: false, baseUrl: "", apiKey: "", model: "" },
                                     saved.llm || {});
+    /* S8 的会议转写方式：老计划文件里没有这一块，补成完整骨架再渲染 */
+    _wizChoices.meeting = Object.assign({ route: "", onlineApiKey: "", onlineBaseUrl: "" },
+                                        saved.meeting || {});
     if (plan.plan && plan.plan.state === "running") _wizStep = WIZ_STEPS.findIndex((s) => s.id === "run");
     wizRender();
   } catch (e) {
@@ -5250,7 +5397,9 @@ function wizRenderLlm(host) {
            <input class="input" id="wizLlmModel" placeholder="例如 deepseek-chat"
                   value="${esc(llm.model || "")}"></label>
        </div>
-       <div class="muted">以后想改、或想配多个上游按顺序用，到「模型路由」里改。</div>
+       <div class="muted">以后想改、或想配多个上游按顺序用，到「模型路由」里改。
+          这里填的密钥<b>只在这一次向导里保留</b>：写进设置之后，重开面板这个框会是空的
+          （那时它已经在用了，不用再填一遍）。</div>
      </div>`);
   wizWhy(host);
   const go = $("#wizGoAgent", host);
@@ -5319,7 +5468,137 @@ function wizRenderAgent(host) {
   });
 }
 
-/* ---------------- S8 断网也能用 ---------------- */
+/* ---------------- S8 开会时的录音交给谁（2026-09-28，设计 §6.6） ----------------
+
+   三条路在代码里是**同一套**（都走能力路由的 asr 槽），差别只在**怎么连上后端**：
+   本机的后端 → 读本机那份配对文件自动配上；同事的后端 → 粘配对串；云端 → 还没实现。
+
+   **配对是动作、不是设置**：用户在这一页点一下就完成配对（复用「能力」卡那两个接口，
+   不另造一套），向导只在计划里记"走哪条路"。 */
+
+async function wizLoadPairState(force) {
+  try {
+    _wizPairState = await api(force ? "/api/capability/probe" : "/api/capability",
+                             force ? { method: "POST" } : undefined);
+  } catch (e) {
+    _wizPairState = null;              // 读不到就渲染成"还没配对"，不编状态
+  }
+  return _wizPairState;
+}
+
+/* 400 的 body 是 {"detail": "一句人话"}（后端就是这么回的）。原样显示那条，
+   而不是把 `HTTP 400: {...}` 糊到人脸上 —— 与「能力」卡那条配对按钮同一条规矩。 */
+function wizErrText(e) {
+  const msg = (e && e.message) || String(e || "");
+  const m = /^\s*HTTP \d+:\s*(\{.*\})$/s.exec(msg);
+  if (m) { try { return JSON.parse(m[1]).detail || msg; } catch (_) { /* 原样 */ } }
+  return msg;
+}
+
+function wizRenderMeeting(host) {
+  const sel = (_wizChoices.meeting || {}).route || "";
+  const st = _wizPairState || {};
+  const pair = st.pair || {};
+  const local = st.local || {};
+  const paired = !!pair.paired;
+  const pairedWho = paired ? (pair.serverName || pair.baseUrl || "已配对") : "";
+  const localNote = local.found
+    ? (local.expired ? "本机后端在跑，但配对信息已过期 —— 重启一次后端"
+                     : "检测到本机后端 ✓ 点左边按钮连上")
+    : "没检测到本机后端（要用它，先在本机装好后端包并启动）";
+  /* 云端这一档（2026-09-28 落地后打开）：它把**整场会议音频**发到公网，所以
+     ① 必须当场填密钥（没密钥这一路在 ECHO 里根本不存在）；
+     ② 红字写明出网与"认不了联系人" —— 这两条是产品边界，不是故障。 */
+  const onlineBox = sel === "online"
+    ? `<div class="wiz-lose">选了云端：<b>整场会议录音会上传到阿里云</b>（临时存储，48 小时后自动清理）；
+         而且云端只回「说话人 1/2/3」，<b>认不出联系人</b>（它不回声纹）。</div>
+       <div class="cap-pair-row">
+         <input id="wizOnlineKey" class="ctl grow" type="password" spellcheck="false"
+                value="${esc(((_wizChoices.meeting || {}).onlineApiKey) || "")}"
+                placeholder="服务方给你的那一串（sk-…）">
+         <input id="wizOnlineBase" class="ctl" type="text" spellcheck="false"
+                value="${esc(((_wizChoices.meeting || {}).onlineBaseUrl) || "")}"
+                placeholder="地址（留空 = 北京）" style="max-width:200px">
+       </div>
+       <div class="muted" style="font-size:12px">密钥<b>只在这一次向导里保留</b>：写进设置之后，
+         重开面板这个框会是空的（那时它已经在用了）。</div>`
+    : "";
+  host.innerHTML = wizCard("开会时的录音交给谁",
+    "会议录音要变成文字，靠的是一台<b>专门干重活的后端</b>（转写 + 分清谁在说话）。"
+    + "这一步决定这台后端在哪、怎么连上它。",
+    "会议录音照样能录，但不会变成文字 —— 面板会显示「等待后端」，那不是失败。",
+    wizOption("local", sel === "local", { label: "这台电脑自己跑", sizeMb: 0, name: "wizmeeting",
+        note: "要有独立显卡；先在本机装好后端包并启动它" })
+    + wizOption("paired", sel === "paired", { label: "用同事给我的后端", sizeMb: 0, name: "wizmeeting",
+        note: "把管理员给你的那串口令贴进来" })
+    + wizOption("online", sel === "online", { label: "用云端（在线转写）", sizeMb: 0, name: "wizmeeting",
+        note: "把录音发给阿里云转文字；本机什么都不用装，但录音会上传" })
+    + onlineBox
+    + `<div class="cap-pair-row" style="margin-top:8px">
+         <button class="btn" id="wizPairLocal" ${local.found && !local.expired ? "" : "disabled"}>检测本机后端</button>
+         <span class="muted" style="font-size:12px">${esc(localNote)}</span>
+       </div>
+       <div class="cap-pair-row">
+         <input id="wizPairString" class="ctl grow" type="text" spellcheck="false"
+                placeholder="配对串（echo://pair?host=…&code=…）">
+         <button class="btn" id="wizPairNow">配对</button>
+         <span class="muted" style="font-size:12px">${paired ? "已配对：" + esc(pairedWho) : "还没配对"}</span>
+       </div>`);
+  wizWhy(host);
+  wizBindPicks(host, (el) => {
+    // **合并而不是覆盖**：切走再切回来时，已经填好的密钥不该丢。
+    _wizChoices.meeting = Object.assign({}, _wizChoices.meeting,
+                                        { route: el.dataset.wizpick || "" });
+  });
+  const keyInput = $("#wizOnlineKey", host);
+  if (keyInput) {
+    const remember = () => {
+      _wizChoices.meeting = Object.assign({}, _wizChoices.meeting,
+                                          { onlineApiKey: keyInput.value.trim() });
+    };
+    keyInput.addEventListener("input", remember);
+    keyInput.addEventListener("change", () => { remember(); wizSaveChoices(); });
+  }
+  const baseInput = $("#wizOnlineBase", host);
+  if (baseInput) {
+    baseInput.addEventListener("change", () => {
+      _wizChoices.meeting = Object.assign({}, _wizChoices.meeting,
+                                          { onlineBaseUrl: baseInput.value.trim() });
+      wizSaveChoices();
+    });
+  }
+  const btnLocal = $("#wizPairLocal", host);
+  if (btnLocal) btnLocal.addEventListener("click", async () => {
+    btnLocal.disabled = true;
+    try {
+      const r = await api("/api/capability/pair-local", { method: "POST", body: "{}" });
+      toast(r.message || "已连上本机后端");
+      _wizChoices.meeting = { route: "local" };
+      await wizLoadPairState(true);
+      wizRender();
+    } catch (e) { toast(wizErrText(e), 8000); btnLocal.disabled = false; }
+  });
+  const btnPair = $("#wizPairNow", host);
+  if (btnPair) btnPair.addEventListener("click", async () => {
+    const raw = (($("#wizPairString", host) || {}).value || "").trim();
+    const parsed = parsePairString(raw);       // 与「能力」卡同一个解析器
+    const url = parsed ? parsed.url : raw;
+    const code = parsed ? parsed.code : "";
+    if (!url) { toast(parsed ? "配对串里没有 host —— 让管理员重发一张" : "先填后端地址或配对串"); return; }
+    if (!code) { toast("配对串里没有配对码 —— 让管理员重发一张"); return; }
+    btnPair.disabled = true;
+    try {
+      const r = await api("/api/capability/pair", { method: "POST",
+        body: JSON.stringify({ base_url: url, code: code, fingerprint: parsed.fp || "" }) });
+      toast(r.message || "配对成功");
+      _wizChoices.meeting = { route: "paired" };
+      await wizLoadPairState(true);
+      wizRender();
+    } catch (e) { toast(wizErrText(e), 8000); btnPair.disabled = false; }
+  });
+}
+
+/* ---------------- S9 断网也能用 ---------------- */
 function wizRenderOffline(host) {
   const tiny = wizComp("stt-whisper-tiny");
   host.innerHTML = wizCard("断网也能用",
@@ -5336,7 +5615,7 @@ function wizRenderOffline(host) {
   });
 }
 
-/* ---------------- S9 确认一下（唯一闸门） ---------------- */
+/* ---------------- S10 确认一下（唯一闸门） ---------------- */
 async function wizRenderConfirm(host) {
   host.innerHTML = `<div class="card"><div class="card-body">正在算一下要装什么…</div></div>`;
   try {
@@ -5379,7 +5658,7 @@ async function wizRenderConfirm(host) {
   });
 }
 
-/* ---------------- S10 正在准备 ---------------- */
+/* ---------------- S11 正在准备 ---------------- */
 async function wizRenderRun(host) {
   const draw = (st) => {
     // 失败的项要把**原因**显示出来：以前只显示"没成"两个字，而"失败"还被状态词表 bug
@@ -5417,7 +5696,7 @@ async function wizRenderRun(host) {
   _wizTimer = setInterval(tick, 2000);
 }
 
-/* ---------------- S11 你的 ECHO 现在能做什么 ---------------- */
+/* ---------------- S12 你的 ECHO 现在能做什么 ---------------- */
 async function wizRenderDone(host) {
   let st = {};
   try { st = await api("/api/wizard/state"); } catch (e) { /* 取不到就只列"怎么开始用" */ }
@@ -5463,12 +5742,14 @@ async function wizRenderDone(host) {
 let _bootView = "";
 let _bootWantWizard = false;      // 老深链/老 gotoView 明确要向导：落到常规后要展开那张卡
 let _bootWantHist = "";           // 老深链 `?view=meetings`：落到历史页后要打开"会议历史"子页签
+let _bootWizStep = "";            // `?wizstep=meeting`：向导直接落到那一步（验收/排障/截图用）
 try {
   const q = new URLSearchParams(location.search).get("view");
   const raw = q || localStorage.getItem("echo.gotoView") || "";
   const rawKey = String(raw).trim();
   const want = normView(rawKey);
-  _bootWantWizard = rawKey.toLowerCase() === "wizard";
+  _bootWantWizard = rawKey.toLowerCase() === "wizard" || !!new URLSearchParams(location.search).get("wizstep");
+  _bootWizStep = String(new URLSearchParams(location.search).get("wizstep") || "").trim();
   // 「会议记录」已并入历史：`?view=meetings` 折算成 history 之后，子页签信息就丢了，
   // 所以这里单独记一笔，bootView 里落到历史页时按它打开"会议历史"。
   _bootWantHist = (rawKey === "meetings") ? "meetings" : "";

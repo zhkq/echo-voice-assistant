@@ -470,6 +470,155 @@ class LlmCredentialsTests(_PlanTestCase):
         self.assertTrue(plan["summary"]["egress"], "在线服务必须在确认页声明出网")
 
 
+class MeetingRouteTests(_PlanTestCase):
+    """S8「开会时的录音交给谁」（2026-09-28，设计 §6.6 / 向导 §2.2）。
+
+    四条要守的：
+
+      ① 前两条路（本机后端 / 同事的后端）写**同一个** `echo-server` —— 它们在代码里
+         就是同一个后端，差别只是地址从哪来（`pair_local()` vs 配对串）；
+      ② 在线那一档**一个键都不写**，并进末页 —— 适配器还没实现，写下去就是
+         "能选却一定失败"（`base.UNIMPLEMENTED_BACKENDS`）；
+      ③ 没选也要进末页（"录完不会变成文字"必须说出来）；
+      ④ 「不出机」与"后端在进程外"是**冲突**，向导只如实说，**不许**顺手把许可放宽。
+    """
+
+    def _config(self, choices):
+        return {r["key"]: r["value"] for r in wizard.build_plan(choices)["config"]}
+
+    def test_both_connect_routes_write_the_same_backend(self):
+        for route in ("local", "paired"):
+            with self.subTest(route=route):
+                cfg = self._config({"meeting": {"route": route}})
+                self.assertEqual(cfg.get("capabilityMeetingAsrBackend"), "echo-server")
+                self.assertNotIn("capabilityPrivacy", cfg, "向导不许替用户放宽出网许可")
+
+    def test_the_online_route_writes_the_online_backend_and_the_wan_permission(self):
+        """方案 3 落地后（2026-09-28 晚）：选它要**同时**写后端与出网许可 —— 缺一个都跑不起来。
+
+        `capabilityPrivacy` 在这里写 `wan` 不是"顺手放宽"：用户**显式选了公网服务**，
+        那正是"允许音频去哪"这个许可要表达的意思（而前两条路相反，不许碰它）。
+        密钥没填时**照写设置**（用户可能稍后在面板里填），但末页要说出来。
+        """
+        plan = wizard.build_plan({"meeting": {"route": "online", "onlineApiKey": "sk-x"}})
+        cfg = {r["key"]: r["value"] for r in plan["config"]}
+        self.assertEqual(cfg.get("capabilityMeetingAsrBackend"), "asr-provider")
+        self.assertEqual(cfg.get("capabilityPrivacy"), "wan")
+        self.assertEqual(cfg.get("capabilityAsrProviderApiKey"), "sk-x")
+        reasons = " ".join(m["reason"] for m in plan["missing"])
+        self.assertIn("认不出是谁", reasons, "边界（认不了联系人）必须进末页")
+
+    def test_the_online_route_without_a_key_says_so(self):
+        # 库里也没配过密钥（**显式打桩**：默认 `_settings` 会读这台机器真实的库，
+        # 那会让这条用例在"开发机自己配了在线转写"时红）
+        wizard._settings = lambda name: ""
+        plan = wizard.build_plan({"meeting": {"route": "online"}})
+        self.assertTrue(any("密钥" in m["reason"] for m in plan["missing"]), plan["missing"])
+
+
+class SecretsNeverLandInThePlanFileTests(_PlanTestCase):
+    """**密钥不落计划文件**（2026-09-28）。
+
+    计划文件（`data/wizard-plan.json`）是"关掉面板还能接着改"的草稿 —— 明文 JSON。
+    而密钥只该有**一个**权威副本：`settings`（`secret=True`，接口永不回显）。
+    这条以前是漏的：`llm.apiKey` 与方案 ③ 的 `onlineApiKey` 都明文躺在里面
+    （`built.config` 里那份同样是明文）。
+
+    钉四件事：
+
+      * `choices` 里的密钥值不落盘（**键名照留** —— 确认页要列出"将写入哪些键"）；
+      * `built.config` 里那几行同样不落盘；
+      * 别的选择**一个都不能丢**（收口不是把计划清空）；
+      * 抹掉之后不许**误报**：库里已经有密钥时，不许再说"还没填密钥 / 不能自动写纪要"。
+    """
+
+    def setUp(self):
+        super().setUp()
+        # 计划文件写到临时目录 —— 绝不碰这台机器真实的 data/wizard-plan.json
+        self.plan_file = os.path.join(self.tmp, "wizard-plan.json")
+
+    def _saved(self, data):
+        wizard.save_plan(data, self.plan_file)
+        with open(self.plan_file, encoding="utf-8") as fh:
+            return json.load(fh)
+
+    def test_choice_secrets_never_reach_the_file(self):
+        saved = self._saved({
+            "state": "draft",
+            "choices": {
+                "agent": "agent-harness",
+                "locations": {"models": "D:/models"},
+                "llm": {"direct": True, "baseUrl": "http://x/v1", "apiKey": "sk-llm-secret",
+                        "model": "m1"},
+                "meeting": {"route": "online", "onlineApiKey": "sk-meeting-secret"},
+            }})
+        blob = json.dumps(saved, ensure_ascii=False)
+        self.assertNotIn("sk-llm-secret", blob, "LLM 密钥明文落进了计划文件")
+        self.assertNotIn("sk-meeting-secret", blob, "在线转写密钥明文落进了计划文件")
+        # 键名留着（确认页要列"将写入哪些键"），别的选择一个都不能丢
+        self.assertIn("apiKey", blob)
+        self.assertEqual(saved["choices"]["agent"], "agent-harness")
+        self.assertEqual(saved["choices"]["locations"]["models"], "D:/models")
+        self.assertEqual(saved["choices"]["llm"]["baseUrl"], "http://x/v1")
+        self.assertEqual(saved["choices"]["llm"]["model"], "m1")
+        self.assertEqual(saved["choices"]["meeting"]["route"], "online")
+
+    def test_built_config_secrets_never_reach_the_file(self):
+        built = wizard.build_plan({"meeting": {"route": "online", "onlineApiKey": "sk-online"},
+                                   "llm": {"direct": True, "baseUrl": "http://x/v1",
+                                           "apiKey": "sk-direct"}})
+        saved = self._saved({"state": "reviewing", "choices": {}, "built": built})
+        blob = json.dumps(saved, ensure_ascii=False)
+        self.assertNotIn("sk-online", blob)
+        self.assertNotIn("sk-direct", blob)
+        keys = [r["key"] for r in saved["built"]["config"]]
+        self.assertIn("capabilityAsrProviderApiKey", keys, "键名要留着，确认页靠它列清单")
+
+    def test_the_panel_can_still_write_them_at_execute_time(self):
+        """收口只针对**落盘**：执行相用的是请求体里那份 choices（前端内存），不受影响。
+
+        这条是这段收口的**前提** —— 如果 execute 也从计划文件取值，抹掉就等于装不上了。
+        """
+        choices = {"meeting": {"route": "online", "onlineApiKey": "sk-live"}}
+        built = wizard.build_plan(choices)
+        values = {r["key"]: r["value"] for r in built["config"]}
+        self.assertEqual(values.get("capabilityAsrProviderApiKey"), "sk-live",
+                         "执行相必须在内存里拿得到真实值")
+        self.assertEqual(values.get("capabilityMeetingAsrBackend"), "asr-provider")
+
+    def test_a_redacted_plan_is_not_mistaken_for_a_missing_key(self):
+        """抹掉之后**不许误报**：库里已经有密钥时，末页不能说"还没填密钥 / 不能写纪要"。"""
+        wizard._settings = lambda name: "sk-stored" if name.endswith("ApiKey") else ""
+        online = wizard.build_plan({"meeting": {"route": "online"}})
+        self.assertNotIn("还没填密钥", " ".join(m["reason"] for m in online["missing"]))
+        direct = wizard.build_plan({"llm": {"direct": True, "baseUrl": "http://x/v1"}})
+        self.assertTrue(wizard.minutes_capable({"agent": "",
+                                                "llm": {"direct": True,
+                                                        "baseUrl": "http://x/v1"}}),
+                        "库里已有密钥时不该判成「不能自动写纪要」")
+        self.assertEqual(direct["schema"], wizard.PLAN_BUILD_SCHEMA)
+
+    def test_no_route_is_reported_on_the_last_page(self):
+        feats = [m["feature"] for m in wizard.build_plan({})["missing"]]
+        self.assertTrue(any("录音变成文字" in f for f in feats), feats)
+
+    def test_privacy_none_is_a_conflict_not_a_silent_override(self):
+        wizard._settings = lambda name: "none" if name == "capabilityPrivacy" else ""
+        plan = wizard.build_plan({"meeting": {"route": "paired"}})
+        cfg = {r["key"]: r["value"] for r in plan["config"]}
+        self.assertEqual(cfg.get("capabilityMeetingAsrBackend"), "echo-server",
+                         "选择本身照写 —— 冲突要说出来，不是把选择丢掉")
+        self.assertNotIn("capabilityPrivacy", cfg, "不许顺手改成 lan（那是用户的许可）")
+        reasons = " ".join(m["reason"] + m["fix"] for m in plan["missing"])
+        self.assertIn("不出机", reasons, plan["missing"])
+
+    def test_the_step_exists_in_the_six_step_plan_schema(self):
+        """计划里 `meeting` 是**新加的一块**，老计划文件没有它 —— 缺了不许炸。"""
+        self.assertEqual(wizard.build_plan({"meeting": None})["schema"], wizard.PLAN_BUILD_SCHEMA)
+        self.assertEqual(wizard.build_plan({"meeting": "garbage"})["schema"],
+                         wizard.PLAN_BUILD_SCHEMA)
+
+
 class InstalledComponentsTests(_PlanTestCase):
     """首装判据 + 执行后真值（设计 §4/§5）。"""
 

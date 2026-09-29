@@ -52,6 +52,22 @@ class CapabilityCardWiringTests(unittest.TestCase):
         missing = sorted(card_ids - self.html_ids)
         self.assertEqual(missing, [], "JS 引用了 HTML 里不存在的 id：%s" % missing)
 
+    def test_the_backend_status_line_and_admin_link_are_rendered(self):
+        """**设置分家**的客户端那一半（2026-09-28，设计 §6.6）。
+
+        客户端只给"状态 + 一个入口"：状态里的每个数字都来自后端 `/v1/health`，
+        管理面地址由后端宣告（`adminUrl`）。**客户端不展示也不编辑后端的设置**
+        （端口 / 显存预算 / 模型档位 / 配额 / TLS）—— 那些归后端的 `server.yaml` 与管理面，
+        在客户端再放一份就是"两处都能改、改完不知道谁生效"。
+
+        远程后端那一条必须如实说清"为什么点不开"：管理面只发布在**后端那台机器**的回环上。
+        """
+        self.assertIn("capBackendHealthLine", self.js)
+        self.assertIn("capBackendAdminRow", self.js)
+        self.assertIn("adminUrl", self.js, "深链要读后端宣告的地址，不许猜端口")
+        self.assertIn("ssh -L 8901:127.0.0.1:8901", self.js,
+                      "远程后端要给出进管理面的办法，而不是留一个点不开的链接")
+
     def test_the_things_people_click_are_actually_wired(self):
         """反过来：卡里要被人点的元素，JS 必须真的引用它。
 

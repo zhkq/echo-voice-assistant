@@ -60,7 +60,7 @@ CHOICE_LABELS: Dict[str, str] = {
     "auto": "自动（按优先级挑第一个可用的）",
     "echo-server": "只用 ECHO 后端",
     "local": "只用本机",
-    "asr-provider": "只用网络服务商",
+    "asr-provider": "只用在线转写（方案 3；整场异步，**认不了联系人** —— 它不回声纹）",
     "off": "关掉（不做这件事）",
 }
 
@@ -323,6 +323,9 @@ def view(force: bool = False) -> Dict[str, Any]:
     rows.sort(key=lambda r: order.get(r.get("key"), 1e6))
     return {
         "pair": pair_view(),
+        # **本机自配对**（方案 1）：文件在不在、过期没有、看的是哪些位置。
+        # 面板据此决定「检测本机后端」按钮是否可点，以及点不了时说什么。
+        "local": local_pair_view(),
         "privacy": str(_setting("capabilityPrivacy", "lan") or "lan"),
         "backends": _backend_rows(force),
         "choices": choices,
@@ -363,6 +366,35 @@ def pair(base_url: str, code: str, client_name: str = "",
     except Exception as e:                                  # pragma: no cover - 兜底
         return False, "配对时出了意外：%s" % e
     return True, "已配对：%s（%s）" % (creds.server_name or creds.base_url, creds.client_id)
+
+
+def pair_local(path: str = "") -> tuple:
+    """**方案 1：本机自动配对**（2026-09-28）。返回 `(ok, 一句话)`。
+
+    与 `pair()` 的唯一区别是"码从哪来"：这里从一个**本机文件**里读
+    （后端每次启动写一份），而不是让人抄配对串。换凭据走的还是同一条
+    `pairing.pair()`，所以产物、凭据信封、TLS 指纹固定都与手工配对**逐字一致**。
+
+    `path` 只在排障/测试时给：正常走 `capabilityLocalPairPath` 与约定位置。
+    """
+    from app.capabilities import pairing
+    try:
+        creds = pairing.pair_local(path=path)
+    except pairing.PairingError as e:
+        return False, str(e)
+    except Exception as e:                                  # pragma: no cover - 兜底
+        return False, "本机自动配对时出了意外：%s" % e
+    return True, "已连上本机后端：%s（%s）" % (creds.server_name or creds.base_url, creds.client_id)
+
+
+def local_pair_view() -> Dict[str, Any]:
+    """面板用：本机配对文件的现状（**不含明文码**）。"""
+    from app.capabilities import pairing
+    try:
+        return pairing.local_pair_state()
+    except Exception as e:                                  # pragma: no cover - 兜底
+        return {"found": False, "path": "", "baseUrl": "", "expired": False,
+                "expiresAt": 0.0, "message": str(e)}
 
 
 def unpair() -> tuple:

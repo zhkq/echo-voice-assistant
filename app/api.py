@@ -7,7 +7,7 @@
 import json
 import os
 import tempfile
-from typing import List
+from typing import List, Optional
 
 from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, UploadFile
 from pydantic import BaseModel
@@ -173,6 +173,11 @@ class PairBackendIn(BaseModel):
     fingerprint: str = ""
 
 
+class PairLocalIn(BaseModel):
+    """**本机自动配对**（方案 1）。`path` 只在排障时给 —— 正常留空，走约定位置。"""
+    path: str = ""
+
+
 # ---------------------------------------------------------------- 能力路由（3.0）
 #
 # 这几个端点背后的活都在 `app/capability_admin.py`。刻意**不在 api.py 里算**：
@@ -214,6 +219,25 @@ def api_capability_pair(body: PairBackendIn, _auth=Depends(optional_auth)):
     if not ok:
         raise HTTPException(status_code=400, detail=message)
     return {"ok": True, "message": message, "pair": capability_admin.pair_view()}
+
+
+@router.post("/capability/pair-local")
+def api_capability_pair_local(body: Optional[PairLocalIn] = None,
+                              _auth=Depends(optional_auth)):
+    """**方案 1：本机自动配对**（2026-09-28）。
+
+    同机装了后端时，客户端不该让人抄配对码：后端启动会把配对信息写在自己状态目录里，
+    这里读它 → 走**原来那条** `pairing.pair()` → 落 `{DATA}/backend.json`。
+    产物与手工粘贴配对串**逐字一致**（同一套凭据信封、同一个 TLS 指纹固定）。
+
+    失败仍回 400 + 一句人话：找不到文件、文件过期、后端没跑起来，都是日常。
+    """
+    from app import capability_admin
+    ok, message = capability_admin.pair_local((body.path if body else "") or "")
+    if not ok:
+        raise HTTPException(status_code=400, detail=message)
+    return {"ok": True, "message": message, "pair": capability_admin.pair_view(),
+            "local": capability_admin.local_pair_view()}
 
 
 @router.post("/capability/unpair")
@@ -1050,6 +1074,13 @@ def get_meetings(limit: int = 100, offset: int = 0, _auth=Depends(optional_auth)
         except Exception:
             it["compression"] = None
         it["speakerNames"] = speaker_names.get(it["id"], [])
+        # 「这一场正在转写吗」（2026-09-28）—— 面板据此把「重新转写」按钮禁掉、
+        # 文案改成「转写中…」（`web/meeting.html`），列表卡片也用它决定画不画进度条。
+        #
+        # 判据只有 `meeting.transcribe_busy_reason()` 一份（进程内标记 ∪ 库里的 status），
+        # 所以**刷新页面、换个标签页、重开详情页，按钮状态都还是对的** ——
+        # 这一点是这次 bug 的要害：只看前端本地变量的修法，刷新一下就退回原样。
+        it["transcribing"] = meeting.is_transcribing(it["name"])
         # 「转写档位」（2026-09-26，历史 → 会议历史列表）：exact / aligned / estimated。
         # 与详情页的 `capability.timestampsLabel` **同一份翻译、同一份快照**
         # （`capability_admin.timestamps_summary`），没记过的老会议是 None → 不显示。
@@ -1289,7 +1320,24 @@ def worklog_status(_auth=Depends(optional_auth)):
 
 @router.post("/meetings/{mid}/retranscribe")
 def meeting_retranscribe(mid: int, _auth=Depends(optional_auth)):
-    ok, msg = meeting.retranscribe_meeting(mid)
+    """重新转写一场会议（后台线程）。
+
+    **这一场已经在转写 → 409 Conflict**：两个转写线程并发跑同一场会互相覆盖同一份
+    `transcript.md` / `meta.json`，所以这道闸在后端、**按会议**判重 ——
+    不依赖前端把按钮禁掉（那是体验，不是防线）。
+
+    响应体是本站统一的标准错误形状（与其余 30 处 `HTTPException` 一致）：
+
+        {"detail": "这场会议正在转写中，请等它完成"}
+
+    判据见 `meeting.transcribe_busy_reason()`（进程内标记 ∪ 库里的 status）。
+    **另一场会议不受影响** —— 跨会议的并发上限仍由既有那套管（`max_concurrent`），
+    两件事不混在一起。
+    """
+    try:
+        ok, msg = meeting.retranscribe_meeting(mid)
+    except meeting.MeetingTranscribeBusy as e:
+        raise HTTPException(status_code=409, detail=e.message)
     return {"ok": ok, "message": msg}
 
 

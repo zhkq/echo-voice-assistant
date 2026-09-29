@@ -761,6 +761,38 @@ DEFAULTS = {
                     "与上面的手工令牌同级：**填了任一个就以手工令牌为准**，"
                     "配对凭据会被绕过（所以配对之后别再留着它）",
         value_type="str", secret=True),
+    "capabilityAsrProviderBaseUrl": dict(
+        value="", grp="capability", label="在线转写地址", hidden=True,
+        description="**会议转写方案 3（在线）用**：千问AI平台的服务地址。"
+                    "留空 = `https://maas.qianwenaiapi.com`（平台只有这一个域名，没有地域之分；"
+                    "2026-09-29 对文档核过）。只有在走自建网关/代理时才需要填。"
+                    "见 docs/3.0-设计总览与组件关系.md §6.6",
+        value_type="str"),
+    "capabilityAsrProviderApiKey": dict(
+        value="", grp="capability", label="在线转写密钥", hidden=True,
+        description="千问AI平台的 API Key（`sk-ws-` 开头）。**填了才算配了这一路** —— "
+                    "没填时路由不会把它当候选。整场会议音频会上传到平台的临时存储"
+                    "（48 小时后清理），所以「允许音频去哪」必须是「内网+公网」，"
+                    "否则这一路会被策略挡住",
+        value_type="str", secret=True),
+    "capabilityAsrProviderModel": dict(
+        value="qwen-audio-3.1-asr-flash-filetrans", grp="capability", label="在线转写模型",
+        hidden=True,
+        description="默认 `qwen-audio-3.1-asr-flash-filetrans`（整场异步 + 说话人分离）。"
+                    "**它只回说话人编号、不回声纹嵌入** —— 选它时会议里认不了联系人"
+                    "（只能显示「说话人 N」），这是产品边界，不是故障。"
+                    "换成 `qwen3-asr-flash-filetrans` 也行（同样异步；时间戳行为略有不同）",
+        value_type="str"),
+    "capabilityLocalPairPath": dict(
+        value="", grp="capability", label="本机配对文件路径", hidden=True,
+        description="**方案 1（本机自建后端）用**：后端启动时会在自己的状态目录里写一份 "
+                    "`local-pair.json`，客户端「检测本机后端」读它即完成配对（同机不该让人"
+                    "抄配对码）。留空 = 按几个约定位置找（`{DATA}/server-state/`、"
+                    "`{ECHO_BASE}/backend/state/` …）。后端跑在容器里、状态卷挂在别处时"
+                    "**必须**在这里填它的宿主路径（或设环境变量 `ECHO_LOCAL_PAIR_PATH`）—— "
+                    "Docker 的宿主路径猜不出来，猜不到时面板会如实说找不到并列出看过的位置。"
+                    "见 docs/3.0-设计总览与组件关系.md §6.6",
+        value_type="str"),
     "capabilityPrivacy": dict(
         value="lan", grp="capability", label="允许音频去哪", hidden=True,
         options=["none", "lan", "wan"],
@@ -775,7 +807,13 @@ DEFAULTS = {
         # 面板还把原因显示成"麦克风没打开"。直接选一个，用不了时说得出名字。
         options=["echo-server", "local", "asr-provider"],
         description="会议链路的 asr.text。**没有 auto**：直接选一个；选中的那个用不了时会"
-                    "如实报错（说清是哪个后端、为什么），不会悄悄换别的兜底。「ECHO 后端」= 配对好的 GPU 机器；「本机」= 这台机器的转写引擎；「网络服务商」= 外部/内网服务（适配器未实现）",
+                    "如实报错（说清是哪个后端、为什么），不会悄悄换别的兜底。"
+                    "「ECHO 后端」= 配对好的 GPU 机器（本机自建的那台也算，走同一个后端）；"
+                    "「本机」= 这台机器的转写引擎；"
+                    "「网络服务商」= 在线 qwen3.1（会议转写方案 3，整场异步 + 说话人分离）—— "
+                    "**要填密钥才存在**，而且它只回说话人编号、**认不了联系人**；"
+                    "选它时「允许音频去哪」必须是「内网+公网」（会议音频会上传）。"
+                    "三条路的选择与边界见 docs/3.0-设计总览与组件关系.md §6.6",
         value_type="str"),
     "capabilityDiarizeBackend": dict(
         value="auto", grp="capability", label="说话人分离用哪个后端", hidden=True,

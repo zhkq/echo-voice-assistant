@@ -111,6 +111,19 @@ def create_app(cfg=None) -> FastAPI:
         except Exception as e:
             log.warning("管理面没起来（不影响能力面）：%s", e)
 
+        # **本机自配对文件**（2026-09-28，会议转写方案 1）：同机客户端不必抄配对码。
+        # **默认关**（`server.local_pair`）—— 它会往鉴权库发一张码，而"启动是惰性的"
+        # 是值钱的默认；方案 1 的交付路径（compose / 后端包）把它设成 true。
+        # 每次启动重发一张覆盖旧的；失败**不拦启动** —— 它是"方便"，不是"必需"。
+        if bool(cfg.get("server.local_pair", False)):
+            try:
+                from server import localpair
+                localpair.publish(cfg, auth_obj)
+                log.info("本机自配对已写好：%s（同机客户端点「检测本机后端」即可）",
+                         localpair.path(cfg))
+            except Exception as e:
+                log.warning("本机自配对文件没写成功（同机客户端仍可手工粘贴配对串）：%s", e)
+
         if not bool(cfg.get("auth.enabled", False)) and not _is_loopback(cfg.get("server.listen", "")):
             log.warning("鉴权是关的，而监听地址不是回环 —— 任何能连到这个端口的人都能用你的 GPU。"
                         "生产环境请打开 auth.enabled（配对 + 令牌见设计 §7）。")

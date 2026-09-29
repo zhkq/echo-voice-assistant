@@ -41,6 +41,7 @@ from app.capabilities.base import (
     SOURCE_LAN,
     SOURCE_LOCAL,
     SOURCE_WAN,
+    UNIMPLEMENTED_BACKENDS,
     AsrResult,
     CapabilityClient,
     CapabilityError,
@@ -228,7 +229,13 @@ class CapabilityRouter:
             for backend_id in order:
                 client = self._clients.get(backend_id)
                 if client is None:
-                    out.skipped.append(Skipped(slot, backend_id, "absent", "没配这个后端"))
+                    # **"没配"与"还没实现"是两件事**（2026-09-28）：用户点名了一个
+                    # 代码里根本不存在的实现时，报 `absent` 会把他引去查配对/地址/网络。
+                    why = UNIMPLEMENTED_BACKENDS.get(backend_id, "")
+                    if why:
+                        out.skipped.append(Skipped(slot, backend_id, "unsupported", why))
+                    else:
+                        out.skipped.append(Skipped(slot, backend_id, "absent", "没配这个后端"))
                     continue
                 if client.source not in allowed_sources:
                     out.skipped.append(Skipped(
@@ -315,11 +322,16 @@ class CapabilityRouter:
         if pick is None:
             reasons = [s for s in plan.skipped if s.slot == slot]
             best = most_informative(reasons)
+            why = "; ".join("%s(%s)" % (s.backend_id or "-", s.reason)
+                            for s in reasons) or "没配后端"
+            # **最该说的那句必须带上**：`most_informative` 挑出来的那条的 `detail`
+            # 里往往就是答案（"适配器还没实现 —— 见 §6.6"），只报 reason 等于把
+            # 唯一有用的信息丢掉（2026-09-28）。
+            if best is not None and best.detail:
+                why = "%s —— %s" % (why, best.detail)
             raise CapabilityError(
                 best.reason if best else "absent",
-                "没有任何后端能提供 %s：%s" % (
-                    slot, "; ".join("%s(%s)" % (s.backend_id or "-", s.reason)
-                                    for s in reasons) or "没配后端"),
+                "没有任何后端能提供 %s：%s" % (slot, why),
                 slot=slot)
 
         tried: List[str] = []
@@ -447,10 +459,11 @@ def _default_log(level, source, message):
 
 
 def build_default_router(settings_get=None, log=None) -> CapabilityRouter:
-    """按设置造一个路由器：本机 + （配了地址**或配过对**才有的）ECHO 后端。
+    """按设置造一个路由器：本机 + （配了地址**或配过对**才有的）ECHO 后端
+    + （填了密钥才有的）在线转写后端（`asr-provider`，2026-09-28）。
 
-    网络服务商（`asr-provider`）**入口空置**（适配器等接口规范），
-    所以这里不造它 —— 造一个空壳只会让"配了却永远失败"变成一个谜。
+    **每一个都是"配了才造"** —— 不造空壳。空壳只会让"配了却永远失败"变成一个谜，
+    而"没配"与"还没实现"是两件不同的事（后者见 `base.UNIMPLEMENTED_BACKENDS`）。
     """
     from app.capabilities.local import LocalCapabilityClient
     from app.capabilities.echo_server import client_from_settings
@@ -463,4 +476,13 @@ def build_default_router(settings_get=None, log=None) -> CapabilityRouter:
     if c is not None:
         c.refresh()                     # 拉一次 capabilities（失败不抛，只是不支持任何槽）
         clients.append(c)
+    # 在线转写（会议转写方案 3）：填了 API Key 才存在。它的能力是常量（不需要探测），
+    # 不提供 `speaker.embed`（在线那一路不返回嵌入）—— 那一条写在它自己的 `provides` 里。
+    try:
+        from app.capabilities.asr_provider import client_from_settings as _online_client
+        p = _online_client()
+    except Exception:                   # pragma: no cover - 配坏了不该拦住路由器
+        p = None
+    if p is not None:
+        clients.append(p)
     return CapabilityRouter(clients, settings_get=settings_get, log=log)

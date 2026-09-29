@@ -113,6 +113,45 @@ def _cfg(tmp_root, max_concurrent=2, per_client=1, specs=None):
     return cfg
 
 
+class AdminUrlIsAdvertisedTests(unittest.TestCase):
+    """管理面入口由**后端自己**宣告（2026-09-28，设计 §6.6 的"设置分家"）。
+
+    客户端「能力」卡要给出「打开后端管理面」的深链，而管理面只绑回环
+    （容器里是"容器内绑通配 + 宿主只发布到回环"）。**地址只有一个权威来源：后端配置** ——
+    客户端猜端口的表现是"点开是个错误页"，比"没有链接"更难查。
+    """
+
+    def _cfg(self, listen=""):
+        cfg = settings_mod.load()
+        cfg.raw["server"]["admin_listen"] = listen
+        return cfg
+
+    def test_no_admin_listen_means_no_url(self):
+        self.assertEqual(routes_mod._admin_url(self._cfg("")), "",
+                         "管理面关着时不该编一个地址出来")
+
+    def test_wildcard_still_advertises_loopback(self):
+        """容器里绑 `0.0.0.0:8901` 是**必需的**（否则宿主的隧道进不来）——
+        可达范围由宿主发布规则限定在回环，所以给客户端的地址就是回环那个。"""
+        self.assertEqual(routes_mod._admin_url(self._cfg("0.0.0.0:8901")),
+                         "http://127.0.0.1:8901/admin/")
+
+    def test_a_custom_port_is_honoured(self):
+        self.assertEqual(routes_mod._admin_url(self._cfg("127.0.0.1:18901")),
+                         "http://127.0.0.1:18901/admin/")
+
+    def test_health_actually_carries_it_and_needs_no_credentials(self):
+        """状态行与深链读的是**免凭据**的 `/v1/health` —— 还没配对时也要能看见后端长什么样。"""
+        cfg = _cfg(tempfile.mkdtemp(prefix="echo-admin-url-"))
+        cfg.raw["server"]["admin_listen"] = "127.0.0.1:8901"
+        cfg.raw["auth"]["enabled"] = True
+        cfg.raw["auth"]["tokens"] = [{"client_id": "c1", "token": "t1"}]
+        with TestClient(server_main.create_app(cfg)) as client:
+            resp = client.get("/v1/health")
+        self.assertEqual(resp.status_code, 200, "健康探针免凭据是设计的一部分")
+        self.assertEqual(resp.json().get("adminUrl"), "http://127.0.0.1:8901/admin/")
+
+
 class _AppCase(unittest.TestCase):
     """起一个用假引擎的 app（走完整 lifespan）。"""
 

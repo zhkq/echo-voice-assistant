@@ -939,3 +939,114 @@ class MeetingAsrBackendIsExplicitTests(unittest.TestCase):
         opts = set(DEFAULTS["capabilityMeetingAsrBackend"]["options"])
         self.assertEqual(opts - known, set(),
                          "选项里出现了路由不认识的后端 id：%s" % (opts - known))
+
+
+class EchoServerStatusIsCarriedTests(unittest.TestCase):
+    """「能力」卡的状态行读的是**后端自己宣告的**状态（2026-09-28，设置分家）。
+
+    `describe()["health"]` 就是 `/v1/health` 的原文：版本 / 显存 / 模型 / 今日用量 /
+    管理面入口。客户端**一个数字都不算** —— 算出来的数字迟早与后端不一致，
+    而"面板说 1.2 GB、后端实际 1.7 GB"这种偏差没人会去核。
+    """
+
+    def _client(self):
+        from app.capabilities.echo_server import EchoServerClient
+        return EchoServerClient("http://127.0.0.1:9", creds=False)
+
+    def test_describe_carries_health_verbatim(self):
+        c = self._client()
+        payload = {"ok": True, "version": "0.1.0",
+                   "vram": {"budgetMb": 7000, "usedMb": 1800},
+                   "models": {"asr-long": "ready"},
+                   "quota": {"day": "2026-09-29", "clients": {"cli-x": 3.5}},
+                   "adminUrl": "http://127.0.0.1:8901/admin/"}
+        c._request = lambda *a, **k: (200, payload)
+        self.assertIs(c.ready(), True)
+        out = c.describe()
+        self.assertEqual(out["health"], payload, "状态要原样带出去，不许在客户端加工")
+
+    def test_a_dead_backend_carries_no_stale_status(self):
+        """连不上时 `health` 必须是空的 —— 拿上一次的旧数字当现状是最坏的一种"绿"。"""
+        c = self._client()
+        c._health = {"version": "0.1.0", "vram": {"usedMb": 1800}}
+        c._request = lambda *a, **k: (0, {})
+        self.assertIs(c.ready(), False)
+        self.assertEqual(c.describe()["health"], {})
+
+    def test_a_raised_probe_also_clears_it(self):
+        c = self._client()
+        c._health = {"version": "0.1.0"}
+
+        def boom(*a, **k):
+            raise CapabilityError("offline", "连不上", backend_id="echo-server")
+
+        c._request = boom
+        self.assertIs(c.ready(), False)
+        self.assertEqual(c.describe()["health"], {})
+
+
+class UnimplementedBackendTests(unittest.TestCase):
+    """**"没配"与"还没实现"必须说成两句话**（2026-09-28 收口；当天晚些时候三个后端都落地了）。
+
+    背景：`capabilityMeetingAsrBackend` 里能选「网络服务商」，而那个适配器一度根本没写。
+    它原来被报成 `absent`（"没配这个后端"）—— 于是用户去查配对、查地址、查网络，
+    而真答案是"这个功能还没做"。
+
+    **现在的状态**：三个后端（`local` / `echo-server` / `asr-provider`）都实现了，
+    所以 `UNIMPLEMENTED_BACKENDS` 是**空的**。但机制留着 —— 它是"新后端先占位"的标准姿势。
+    于是这里的用例换成：① 表是空的；② 机制仍然有效（临时塞一条进去，路由必须报
+    `unsupported` + 那句原因，而不是 `absent`）；③ 表里的 id 确实没有客户端
+    （谁把已实现的 id 留在表里，这条就红）。
+    """
+
+    def _router(self, backend_id):
+        from app.capabilities.router import CapabilityRouter
+        return CapabilityRouter(
+            clients=(),
+            settings_get=lambda k, d=None: {"capabilityMeetingAsrBackend": backend_id}.get(k, d))
+
+    def test_the_table_is_empty_now_that_all_three_backends_exist(self):
+        from app.capabilities import base
+        self.assertEqual(dict(base.UNIMPLEMENTED_BACKENDS), {},
+                         "三个后端都落地了；要新增占位才往这张表里加")
+
+    def test_the_mechanism_still_works_for_the_next_backend(self):
+        """机制不许因为"现在没人用"被删掉：塞一条进去，路由就要说那句话。"""
+        from app.capabilities import base
+        with patch.dict(base.UNIMPLEMENTED_BACKENDS,
+                        {"ghost-backend": "这个后端还没实现 —— 见 §6.6"}):
+            plan = self._router("ghost-backend").plan(
+                Need(slots=("asr.text",), purpose="meeting"))
+            rows = [s for s in plan.skipped if s.backend_id == "ghost-backend"]
+            self.assertEqual([s.reason for s in rows], ["unsupported"],
+                             "未实现的后端不许报 absent（那是「没配」的意思）")
+            self.assertIn("还没实现", rows[0].detail)
+            with self.assertRaises(CapabilityError) as cm:
+                self._router("ghost-backend").call(
+                    "asr.text", Need(slots=("asr.text",), purpose="meeting"))
+            self.assertEqual(cm.exception.reason, "unsupported")
+            self.assertIn("还没实现", cm.exception.detail,
+                          "`call()` 只报 reason 会把唯一有用的那句丢掉")
+
+    def test_the_online_route_is_now_selectable_and_says_what_it_cannot_do(self):
+        """方案 3 的适配器落地了 —— 选项保留，但描述必须写明两条边界（出网 + 认不了人）。"""
+        from app.capability_admin import CHOICE_LABELS
+        from app.config import DEFAULTS
+        meta = DEFAULTS["capabilityMeetingAsrBackend"]
+        self.assertIn("asr-provider", meta["options"])
+        self.assertIn("认不了联系人", meta["description"])
+        self.assertIn("密钥", meta["description"])
+        self.assertIn("认不了联系人", CHOICE_LABELS["asr-provider"])
+
+    def test_the_table_matches_what_the_router_can_build(self):
+        """表里说未实现的那些 id，**现在确实造不出客户端**。
+
+        造路由器时把 ECHO 后端那一支打桩掉 —— 免得用例去读这台机器真实的配对凭据。
+        """
+        from app.capabilities import base
+        from app.capabilities.router import build_default_router
+        with patch("app.capabilities.echo_server.client_from_settings", lambda *a, **k: None):
+            ids = {c.backend_id for c in build_default_router().clients()}
+        stale = sorted(set(base.UNIMPLEMENTED_BACKENDS) & ids)
+        self.assertEqual(stale, [],
+                         "适配器已经落地了，请把 %s 从 base.UNIMPLEMENTED_BACKENDS 里删掉" % stale)
