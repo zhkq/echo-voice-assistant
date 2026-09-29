@@ -23,7 +23,7 @@ from unittest.mock import patch
 
 import yaml
 
-from app import backend_pid, backend_proc, backend_setup
+from app import backend_pid, backend_proc, backend_ready, backend_setup  # noqa: E402
 from app.capabilities import credentials as cred
 from app.capabilities import pairing
 from app.capabilities.credentials import BackendCredentials
@@ -396,7 +396,7 @@ class StartSequenceTests(_SetupCase):
         self.assertEqual(self.settings_written, [])
 
     def test_already_running_counts_as_success(self):
-        """幂等：后端上次起的、还在跑**不该**报错，而要继续等文件并配对。"""
+        """幂等：后端上次起的、还在跑**不该**报错，而要继续等文件、配对、再过就绪自测。"""
         calls = []
         with patch.object(backend_setup, "configure",
                           lambda **kw: (True, "配置已写好", {"path": "c", "pairFile": "p"})), \
@@ -405,13 +405,51 @@ class StartSequenceTests(_SetupCase):
                 patch.object(backend_setup, "wait_for_pair_file",
                              lambda **kw: (calls.append("wait") or (True, "文件在了"))), \
                 patch.object(backend_setup, "pair_if_needed",
-                             lambda **kw: (calls.append("pair") or (True, "已连上本机后端"))):
+                             lambda **kw: (calls.append("pair") or (True, "已连上本机后端"))), \
+                patch.object(backend_ready, "probe",
+                             lambda url, **kw: (calls.append("ready") or
+                                                {"ok": True, "state": "ok",
+                                                 "headline": "三层都过了"})):
             res = backend_setup.start()
         self.assertTrue(res["ok"], res)
         self.assertEqual([s["name"] for s in res["steps"]],
+                         ["configure", "launch", "pair-file", "pair", "ready"])
+        self.assertEqual(calls, ["wait", "pair", "ready"])
+        self.assertIn("三层都过", res["message"])
+        self.assertTrue(res["ready"]["ok"])
+
+    def test_the_ready_step_can_be_turned_off(self):
+        """`ready_probe=False` 时不起就绪自测（老调用方与只验前四步的用例用得上）。"""
+        with patch.object(backend_setup, "configure",
+                          lambda **kw: (True, "配置已写好", {})), \
+                patch.object(backend_setup, "launch", lambda **kw: (True, "起了")), \
+                patch.object(backend_setup, "wait_for_pair_file",
+                             lambda **kw: (True, "文件在了")), \
+                patch.object(backend_setup, "pair_if_needed",
+                             lambda **kw: (True, "已配对")):
+            res = backend_setup.start(ready_probe=False)
+        self.assertTrue(res["ok"], res)
+        self.assertEqual([s["name"] for s in res["steps"]],
                          ["configure", "launch", "pair-file", "pair"])
-        self.assertEqual(calls, ["wait", "pair"])
-        self.assertIn("已连上本机后端", res["message"])
+
+    def test_a_failed_ready_probe_fails_the_flow_with_its_own_sentence(self):
+        """就绪自测没过 → 整条流程按失败收口，并**原样用那句结论**（health 绿 ≠ 能用）。"""
+        headline = "模型就绪，但真实自测失败：模型没就绪（这一档正是那个坑）"
+        with patch.object(backend_setup, "configure",
+                          lambda **kw: (True, "配置已写好", {})), \
+                patch.object(backend_setup, "launch", lambda **kw: (True, "起了")), \
+                patch.object(backend_setup, "wait_for_pair_file",
+                             lambda **kw: (True, "文件在了")), \
+                patch.object(backend_setup, "pair_if_needed",
+                             lambda **kw: (True, "已配对")), \
+                patch.object(backend_ready, "probe",
+                             lambda url, **kw: {"ok": False, "state": "asr-failed",
+                                                "headline": headline}):
+            res = backend_setup.start()
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["message"], headline)
+        self.assertEqual(res["steps"][-1]["name"], "ready")
+        self.assertIs(res["steps"][-1]["ok"], False)
 
 
 if __name__ == "__main__":

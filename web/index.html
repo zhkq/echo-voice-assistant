@@ -323,13 +323,21 @@
                两个按钮互斥由 JS 控制：能起的时候给「起本机后端」，起了之后给「停掉它」。 -->
           <div class="cap-pair-row">
             <button class="btn" id="btnCapBackendStart"
-                    title="在这台机器上起一个只绑回环的 ECHO 能力后端：写配置 → 起进程 → 自动配对">
+                    title="在这台机器上起一个只绑回环的 ECHO 能力后端：写配置 → 起进程 → 自动配对 → 三层就绪自测">
               起本机后端</button>
             <button class="btn hidden" id="btnCapBackendStop"
                     title="停掉 ECHO 自己起的那个后端（手工起的实例不会被动）">停掉它</button>
+            <button class="btn" id="btnCapBackendReady"
+                    title="再跑一次三层就绪自测：/v1/health → /v1/ready → 一次真实转写（1 秒音频）">
+              就绪自测</button>
             <span class="muted" id="capBackendState" style="font-size:12px"></span>
           </div>
           <div class="muted" id="capBackendJob" style="font-size:12px"></div>
+          <!-- 「会怎么走 / 缺什么 / 先验哪一步」（批 2 的只读计划，见 app/backend_env.py）。
+               **点按钮之前先给人看**：走容器路还是扩展包路、哪一档、多大、要不要联网，
+               以及 nvidia-smi / docker 的原文报错；权重够不够也在这一格里（批 3）。 -->
+          <div class="muted" id="capBackendPlan" style="font-size:12px"></div>
+          <div class="muted" id="capBackendReady" style="font-size:12px"></div>
           <div class="muted" id="capBackendNotes" style="font-size:12px"></div>
           <div class="muted" id="capPairState" style="font-size:12px"></div>
         </div>

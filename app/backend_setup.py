@@ -589,6 +589,7 @@ def start(*, port: int = backend_proc.DEFAULT_PORT,
           timeout: float = PAIR_FILE_TIMEOUT, replace: bool = False,
           write_setting: bool = True, models_root_path: str = "",
           python: str = "", cwd: str = "",
+          ready_probe: bool = True, ready_timeout: float = 0.0,
           on_step=None) -> Dict[str, Any]:
     """把 configure → launch → 等配对文件 → 配对 串起来 → 结果字典。
 
@@ -602,6 +603,13 @@ def start(*, port: int = backend_proc.DEFAULT_PORT,
     ``on_step``（2026-09-30 加）：每记下一步就回调一次 ``{"name","ok","detail"}``，
     给"面板要显示实时进度"用（这个函数跑在后台线程里，一次跑十几秒到一分钟）。
     **回调抛异常一律吞掉**：它是显示层的事，不许把起后端这件事本身带崩。
+
+    ``ready_probe``（批 3，默认开）：配对之后**再过一遍三层就绪**（`/v1/health` ·
+    `/v1/ready` · 一次真实 `/v1/asr`）。为什么它是这一步的一部分而不是"等你开会时才发现"：
+    "health 全绿但每个 /v1/asr 都 503" 是这个项目真踩过的坑（权重缺失 / ABI 不符），
+    只有**一次真音频**能挡住它 —— 用户点了"起后端"就该当场知道能不能用。
+    L2 没过时**不跑 L3**（模型没就绪时那一次必然 503，还会白等一次加载超时），
+    结论里会写明"为什么没跑"。
     """
     steps: List[Dict[str, Any]] = []
 
@@ -632,4 +640,19 @@ def start(*, port: int = backend_proc.DEFAULT_PORT,
     ok, detail = pair_if_needed(port=port, replace=replace)
     if not record("pair", ok, detail):
         return {"ok": False, "steps": steps, "message": detail, **info}
+    if ready_probe:
+        from app import backend_ready
+        try:
+            res = backend_ready.probe(loopback_base_url(port),
+                                      timeout_l3=float(ready_timeout or 0.0) or
+                                      backend_ready.L3_TIMEOUT_S)
+        except Exception as e:                                    # pragma: no cover - 兜底
+            res = {"ok": False, "state": "error",
+                   "headline": "就绪自测没跑起来：%s" % e}
+        info["ready"] = res
+        if not record("ready", bool(res.get("ok")),
+                      res.get("headline") or "就绪自测"):
+            return {"ok": False, "steps": steps, "message": res.get("headline") or "", **info}
+        return {"ok": True, "steps": steps,
+                "message": res.get("headline") or detail, **info}
     return {"ok": True, "steps": steps, "message": detail, **info}

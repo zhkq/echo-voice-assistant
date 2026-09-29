@@ -374,12 +374,16 @@ def os_version(name: str = "") -> tuple:
 
 
 def gpu_info() -> dict:
-    """显卡信息（首装向导用：决定推荐哪档转写、要不要显示"用显卡加速"）。
+    """显卡信息（首装向导 + "起本机后端"的前置探测用）。
 
-    返回 ``{"vendor","name","vramMb","driver","source"}``；**探测不到就返回空字段，不猜**
-    —— 向导据此说"没检测到独立显卡"，而不是编一个型号出来。任何异常都不抛。
+    返回 ``{"vendor","name","vramMb","driver","source","computeCap","error"}``；
+    **探测不到就返回空字段，不猜** —— 向导据此说"没检测到独立显卡"，而不是编一个型号出来。
+    ``computeCap``（2026-09-30 加）：算力（如 ``7.5``），空 = 判不了；``error`` 是
+    nvidia-smi 的**原文报错**（"探不到"要说得出是哪一句报错，见实施方案 §4 那行
+    "nvidia-smi 缺失或报错 → 原文贴出"）。任何异常都不抛。
     """
-    blank = {"vendor": "", "name": "", "vramMb": 0, "driver": "", "source": ""}
+    blank = {"vendor": "", "name": "", "vramMb": 0, "driver": "", "source": "",
+             "computeCap": "", "error": ""}
     fn = _platform_fn("gpu_info")
     if not callable(fn):
         return blank

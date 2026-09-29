@@ -177,19 +177,23 @@ def gpu_info():
     import shutil
     import subprocess
 
-    out = {"vendor": "", "name": "", "vramMb": 0, "driver": "", "source": ""}
+    out = {"vendor": "", "name": "", "vramMb": 0, "driver": "", "source": "",
+           "computeCap": "", "error": ""}
     exe = shutil.which("nvidia-smi")
     if not exe:
+        out["error"] = "PATH 里没有 nvidia-smi（没装驱动，或者它不在 PATH）"
         return out
     try:
         raw = subprocess.run(
             [exe, "--query-gpu=name,memory.total,driver_version",
              "--format=csv,noheader,nounits"],
             capture_output=True, text=True, timeout=8)
-    except Exception:
+    except Exception as e:
+        out["error"] = "调 nvidia-smi 失败：%s" % e
         return out
     rows = [r for r in (raw.stdout or "").splitlines() if r.strip()]
     if not rows:
+        out["error"] = (raw.stderr or raw.stdout or "nvidia-smi 没给出任何显卡").strip()[:500]
         return out
     parts = [p.strip() for p in rows[0].split(",")]
     if len(parts) >= 3:
@@ -199,6 +203,20 @@ def gpu_info():
             vram = 0
         out.update({"vendor": "nvidia", "name": parts[0], "vramMb": vram,
                     "driver": parts[2], "source": "nvidia-smi"})
+    # 算力：单独问一次（老驱动不认 compute_cap 时，上面那份信息照样有效）。
+    # 它决定这条后端能装哪一档（sm_<7.5 装不了 pyannote 4.x → 只能转写）。
+    try:
+        cap = subprocess.run(
+            [exe, "--query-gpu=compute_cap", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=8)
+        text = (cap.stdout or "").strip().splitlines()
+        if cap.returncode == 0 and text:
+            out["computeCap"] = text[0].strip()
+        else:
+            out["error"] = (cap.stderr or cap.stdout or "").strip()[:500] or \
+                "nvidia-smi 不支持 --query-gpu=compute_cap（驱动较老）"
+    except Exception as e:
+        out["error"] = "问 compute_cap 失败：%s" % e
     return out
 
 

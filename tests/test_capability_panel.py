@@ -31,7 +31,7 @@ _WIRED_IDS = ("btnCapPair", "btnCapUnpair", "btnCapRouteProbe",
               "capPairUrl", "capPairCode", "capPairState", "capBackendList",
               "capRouteSettings", "capRouteBadge",
               # 「起本机后端」（2026-09-30，实施方案 §5 的批 1d）
-              "btnCapBackendStart", "btnCapBackendStop")
+              "btnCapBackendStart", "btnCapBackendStop", "btnCapBackendReady")
 
 
 class CapabilityCardWiringTests(unittest.TestCase):
@@ -194,19 +194,44 @@ class BackendOneClickWiringTests(unittest.TestCase):
         return body[:body.index("\n}\n") + 3]
 
     def test_the_card_has_every_element_it_reaches_for(self):
-        for el in ("btnCapBackendStart", "btnCapBackendStop", "capBackendState",
-                   "capBackendJob", "capBackendNotes"):
+        for el in ("btnCapBackendStart", "btnCapBackendStop", "btnCapBackendReady",
+                   "capBackendState", "capBackendJob", "capBackendPlan",
+                   "capBackendReady", "capBackendNotes"):
             with self.subTest(id=el):
                 self.assertIn('id="%s"' % el, self.html, "HTML 里没有这个元素")
                 self.assertIn(el, self.js_ids, "HTML 里有，但 JS 从来没引用它")
 
     def test_the_panel_calls_the_three_endpoints(self):
-        """三个端点分别是"读状态 / 起 / 停" —— 少一个这张卡就残了。"""
+        """端点分别是"读状态 / 起 / 停 / 就绪自测" —— 少一个这张卡就残了。"""
         for ep in ("/api/capability/backend",
                    "/api/capability/backend/start",
-                   "/api/capability/backend/stop"):
+                   "/api/capability/backend/stop",
+                   "/api/capability/backend/ready"):
             with self.subTest(endpoint=ep):
                 self.assertIn(ep, self.js, "面板没调 %s" % ep)
+
+    def test_the_ready_line_is_rendered_from_the_servers_last_result(self):
+        """三层就绪（批 3）：面板显示**服务端保留的上一次结论**，不自己再跑一遍真推理。"""
+        render = self._fn("renderBackendReady")
+        for token in ("headline", "state", "at"):
+            self.assertIn(token, render, "就绪那一行没读服务端的 %s" % token)
+        self.assertIn("renderBackendReady(be.ready)", self._fn("renderBackendOneClick"))
+        self.assertIn("自测中", self._fn("doCapabilityBackendReady"),
+                      "自测是一次真推理，点了要给等待反馈")
+
+    def test_the_panel_shows_the_read_only_plan_before_anything_is_clicked(self):
+        """批 2 的只读计划：**点按钮之前**就要看得见走哪条路、缺什么、先验哪一步。
+
+        （"没有 Docker 的机器点按钮得到的是扩展包路计划"这条验收，落在界面上就是这一格。）
+        """
+        self.assertIn("/api/capability/backend/plan", self.js)
+        self.assertIn('id="capBackendPlan"', self.html)
+        body = self.js[self.js.index("async function loadCapabilityRouting("):]
+        body = body[:body.index("\n}\n") + 3]
+        self.assertIn("loadBackendPlan()", body)
+        render = self._fn("renderBackendPlan")
+        for token in ("missing", "notes", "verify", "reasons"):
+            self.assertIn(token, render, "计划渲染没读 %s" % token)
 
     def test_the_status_is_loaded_with_the_capability_tab(self):
         """`loadCapabilityRouting()` 里要真的去拉这张卡的状态 —— 否则它永远是空的。"""

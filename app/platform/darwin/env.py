@@ -196,7 +196,9 @@ def gpu_info():
     macOS 上 ECHO 目前**没有**可用的加速路径（CUDA 组件只声明 win32/linux），
     所以这里如实返回"未知"，不编造型号 —— 向导据此不显示"用显卡加速"那一步。
     """
-    return {"vendor": "", "name": "", "vramMb": 0, "driver": "", "source": ""}
+    return {"vendor": "", "name": "", "vramMb": 0, "driver": "", "source": "",
+            "computeCap": "",
+            "error": "macOS 上没有 NVIDIA/CUDA 加速路径（本平台的接缝如实返回未知）"}
 
 
 def node_dirs():

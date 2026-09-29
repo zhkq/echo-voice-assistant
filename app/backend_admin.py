@@ -79,6 +79,37 @@ def stop_with_client() -> bool:
     return bool(_setting("capabilityBackendStopWithClient", False))
 
 
+#: 最近一次"三层就绪"自测的结论（批 3）。**只存结论、不存音频**；面板直接渲染它。
+#: 为什么留在这里而不是每次现跑：L3 是**一次真推理**（模型可能刚加载），
+#: 面板每 1.5 秒轮询一次现跑等于把后端打满。所以：一键起后端时跑一次、
+#: 用户点「就绪自测」时再跑一次，其余时候显示上一次的结论 + 时间。
+_READY: Dict[str, Any] = {}
+
+
+def last_ready() -> Dict[str, Any]:
+    return dict(_READY)
+
+
+def ready_probe(*, timeout_l3: float = 0.0, diarize: bool = False) -> Tuple[bool, str]:
+    """当场跑一次三层就绪自测 → ``(ok, 一句话)``，结论存进 `last_ready()`。
+
+    目标地址永远是**本机那个后端**（由生成出来的 `server.yaml` 决定），
+    而不是"当前配对到的那台"—— 这个按钮问的是"我刚起的这个能不能干活"。
+    """
+    from app import backend_ready
+    port, _admin = ports()
+    url = backend_setup.loopback_base_url(port)
+    try:
+        res = backend_ready.probe(url, timeout_l3=float(timeout_l3 or 0.0) or
+                                  backend_ready.L3_TIMEOUT_S, diarize=diarize)
+    except Exception as e:                                        # pragma: no cover - 兜底
+        res = {"ok": False, "state": "error", "baseUrl": url,
+               "headline": "就绪自测没跑起来：%s" % e}
+    global _READY
+    _READY = dict(res)
+    return bool(res.get("ok")), str(res.get("headline") or "")
+
+
 # ---------------------------------------------------------------- 进度（job）
 
 def job() -> Dict[str, Any]:
@@ -199,6 +230,7 @@ def view() -> Dict[str, Any]:
         "whyNot": why,
         "notes": notes(runtime=runtime, config_exists=config_exists, alive=alive,
                        local=local, paired=paired),
+        "ready": last_ready(),
         "job": job(),
     }
 

@@ -468,23 +468,34 @@ def gpu_info():
     只查 NVIDIA —— ECHO 目前只支持它的加速。优先问 ``nvidia-smi``（装了驱动就有），
     **不走 wmic / PowerShell**：那两个是本仓库明令收进平台接缝的 Windows 专有命令，
     而且新版 Windows 上 wmic 已被弃用。探测不到就返回空字段（不猜型号）。
+
+    ``computeCap``（2026-09-30 加，"起本机后端"的前置探测要用）：**算力决定这条后端能装哪一档** ——
+    sm_<7.5 的卡装不了 pyannote 4.x（要 torch>=2.8），所以那一档**只能转写**，
+    配置里也不许宣告 `diarize` / `speaker-embed`（见 `docs/后端容器-一键起-实施方案.md` §1B）。
+    `compute_cap` 是较新驱动才支持的查询项，老驱动会整条查询失败 —— 所以它**单独问一次**，
+    失败只影响这一个字段（`computeCap` 留空 = 判不了），并且把**原文**留在 `error` 里：
+    "探不到"要说得出是哪一句报错，而不是让人对着一个空字段猜。
     """
     import shutil
     import subprocess
 
-    out = {"vendor": "", "name": "", "vramMb": 0, "driver": "", "source": ""}
+    out = {"vendor": "", "name": "", "vramMb": 0, "driver": "", "source": "",
+           "computeCap": "", "error": ""}
     exe = shutil.which("nvidia-smi")
     if not exe:
+        out["error"] = "PATH 里没有 nvidia-smi（没装驱动，或者它不在 PATH）"
         return out
     try:
         raw = subprocess.run(
             [exe, "--query-gpu=name,memory.total,driver_version",
              "--format=csv,noheader,nounits"],
             capture_output=True, text=True, timeout=8)
-    except Exception:
+    except Exception as e:
+        out["error"] = "调 nvidia-smi 失败：%s" % e
         return out
     rows = [r for r in (raw.stdout or "").splitlines() if r.strip()]
     if not rows:
+        out["error"] = (raw.stderr or raw.stdout or "nvidia-smi 没给出任何显卡").strip()[:500]
         return out
     parts = [p.strip() for p in rows[0].split(",")]
     if len(parts) >= 3:
@@ -494,6 +505,19 @@ def gpu_info():
             vram = 0
         out.update({"vendor": "nvidia", "name": parts[0], "vramMb": vram,
                     "driver": parts[2], "source": "nvidia-smi"})
+    # 算力：单独问（老驱动不认这个查询项时，上面那份信息照样有效）
+    try:
+        cap = subprocess.run(
+            [exe, "--query-gpu=compute_cap", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=8)
+        text = (cap.stdout or "").strip().splitlines()
+        if cap.returncode == 0 and text:
+            out["computeCap"] = text[0].strip()
+        else:
+            out["error"] = (cap.stderr or cap.stdout or "").strip()[:500] or \
+                "nvidia-smi 不支持 --query-gpu=compute_cap（驱动较老）"
+    except Exception as e:
+        out["error"] = "问 compute_cap 失败：%s" % e
     return out
 
 

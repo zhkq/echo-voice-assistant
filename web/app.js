@@ -2817,6 +2817,8 @@ async function loadCapabilityRouting(force) {
     // 「起本机后端」那张小卡的现状与进度（2026-09-30，批 1d）。**与上面那份数据分开取**：
     // 它要读端口占用（netstat）与 pid 记录，比"读一遍设置"贵，不该拖着整张卡一起慢。
     loadBackendOneClick();
+    // 只读计划（批 2）：会走哪条路 / 缺什么 / 先验哪一步。同样单独取（要问 docker 与显卡）。
+    loadBackendPlan();
     // 「已配对后端连接情况」默认收起，**真配上了自动展开一次**（见 autoExpandOnce）
     autoExpandOnce("cap-pair", !!(r.pair && r.pair.paired));
     // 配对输入框**不隐藏**：换一台后端（先解除配对、再配一次）与"第一次配对"
@@ -2953,6 +2955,64 @@ async function doCapabilityUnpair() {
 let _capBackendBusy = false;
 let _capBackendPoll = null;
 let _capBackendLastDone = "";
+let _capBackendPlanBusy = false;
+
+/* 只读计划（批 2）：**点按钮之前先给人看**。走容器路还是扩展包路、哪一档、多大、缺什么、
+   先验哪一步，以及 nvidia-smi / docker 的原文。它比状态那一份贵（要问 docker 与显卡），
+   所以**只在页签渲染时拉一次**，不跟着 job 的 1.5 秒轮询跑。 */
+async function loadBackendPlan(force) {
+  const host = $("#capBackendPlan");
+  if (!host || _capBackendPlanBusy) return;
+  _capBackendPlanBusy = true;
+  try {
+    const r = await api("/api/capability/backend/plan" + (force ? "?force=true" : ""));
+    renderBackendPlan(r);
+  } catch (e) {
+    host.textContent = "读不到这台机器的后端计划：" + e.message;
+  } finally {
+    _capBackendPlanBusy = false;
+  }
+}
+
+function renderBackendPlan(p) {
+  const host = $("#capBackendPlan");
+  if (!host) return;
+  const pathLabel = { container: "容器路（Docker）", portable: "扩展包路（不用容器）",
+                      none: "两条路都不成立" }[p.path] || p.path;
+  const bits = [`<b>${esc(pathLabel)}</b>`];
+  if (p.variant) bits.push(`档位 ${esc(p.variant)}`);
+  if (p.sizeMb) bits.push(`约 ${(p.sizeMb / 1024).toFixed(1)} GB · 约 ${p.etaMinutes} 分钟`);
+  if (p.diskFreeGB !== null && p.diskFreeGB !== undefined) bits.push(`盘上还剩 ${p.diskFreeGB} GB`);
+  const lines = [`计划：${bits.join(" · ")}`];
+  // 权重够不够（批 3）：**说清看的是哪一处**，否则会出现"面板说齐了、服务端仍 503"。
+  const w = p.weights || {};
+  if (w.wanted && w.wanted.length) {
+    const ready = (w.present || []).length;
+    lines.push(`模型 ${ready}/${w.wanted.length} 就绪（看的是 ${esc(w.root || "（模型库没配）")}）`
+      + ((w.missing || []).length ? `，缺：${w.missing.map(esc).join("、")}` : ""));
+  }
+  if ((p.missing || []).length) lines.push(`缺：${p.missing.map(esc).join("；")}`);
+  (p.notes || []).forEach((n) => lines.push(`· ${esc(n)}`));
+  (p.verify || []).forEach((v) => lines.push(`先验一步：<code>${esc(v.command)}</code>（${esc(v.why)}）`));
+  (p.reasons || []).forEach((r) => lines.push(`· ${esc(r)}`));
+  host.innerHTML = lines.map((l) => `<div>${l}</div>`).join("");
+}
+
+/* 三层就绪的结论（批 3）。服务端只保留**最近一次**（L3 是一次真推理，不能每次轮询都跑），
+   所以这里显示的是"上一次自测的结论 + 什么时候跑的"，而不是又去问一遍。 */
+function renderBackendReady(ready) {
+  const host = $("#capBackendReady");
+  if (!host) return;
+  const r = ready || {};
+  if (!r.headline) { host.innerHTML = ""; return; }
+  const cls = r.ok ? "ok" : "warn";
+  const layer = { ok: "三层都过", "not-running": "后端没应答", "not-ready": "模型没就绪",
+                  "asr-failed": "真实自测失败", error: "自测没跑起来" }[r.state] || r.state || "";
+  const l3 = r.l3 || {};
+  const extra = l3.text ? ` · 自测文本：${esc(l3.text)}` : "";
+  host.innerHTML = `<div>就绪（${esc(r.at || "")}）：`
+    + `<span class="sbadge ${cls}">${esc(layer)}</span> ${esc(r.headline)}${extra}</div>`;
+}
 
 async function loadBackendOneClick() {
   const btn = $("#btnCapBackendStart");
@@ -3017,6 +3077,7 @@ function renderBackendOneClick(be) {
     const notes = be.notes || [];
     notesHost.innerHTML = notes.map((n) => `<div>· ${esc(n)}</div>`).join("");
   }
+  renderBackendReady(be.ready);
   // 任务刚结束的那一拍：换一句 toast，并把能力页签整块重拉一遍（配对状态/后端清单都变了）。
   if (job.doneAt && !job.running && job.doneAt !== _capBackendLastDone) {
     _capBackendLastDone = job.doneAt;
@@ -3077,6 +3138,26 @@ const _btnCapBackendStart = $("#btnCapBackendStart");
 if (_btnCapBackendStart) _btnCapBackendStart.addEventListener("click", doCapabilityBackendStart);
 const _btnCapBackendStop = $("#btnCapBackendStop");
 if (_btnCapBackendStop) _btnCapBackendStop.addEventListener("click", doCapabilityBackendStop);
+const _btnCapBackendReady = $("#btnCapBackendReady");
+if (_btnCapBackendReady) _btnCapBackendReady.addEventListener("click", doCapabilityBackendReady);
+
+/** 三层就绪自测（批 3）。**这是一次真推理**（1 秒音频），所以只在人点的时候跑 ——
+ *  面板轮询只显示服务端保留的"上一次结论"。 */
+async function doCapabilityBackendReady() {
+  const btn = $("#btnCapBackendReady");
+  if (btn) { btn.disabled = true; btn.textContent = "自测中…"; }
+  try {
+    const r = await api("/api/capability/backend/ready", { method: "POST" });
+    toast(r.message || "三层就绪自测通过");
+    renderBackendReady(r.ready || {});
+    await loadBackendOneClick();
+  } catch (e) {
+    toast(capBackendErrorText(e), 9000);
+    await loadBackendOneClick();
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = "就绪自测"; }
+  }
+}
 
 const _btnCapPair = $("#btnCapPair");
 if (_btnCapPair) _btnCapPair.addEventListener("click", doCapabilityPair);

@@ -30,7 +30,7 @@ from fastapi import FastAPI                                    # noqa: E402
 from fastapi.testclient import TestClient                      # noqa: E402
 
 import app.db as db                                            # noqa: E402
-from app import backend_admin, backend_pid, backend_proc, backend_setup  # noqa: E402
+from app import backend_admin, backend_env, backend_pid, backend_proc, backend_ready, backend_setup  # noqa: E402
 from app.api import router as api_router                        # noqa: E402
 from app.capabilities import credentials as cred                # noqa: E402
 from app.config import settings                                 # noqa: E402
@@ -149,7 +149,8 @@ class ViewTests(_Isolated):
         v = backend_admin.view()
         json.dumps(v, ensure_ascii=False)              # 面板要能直接下发
         for key in ("root", "port", "adminPort", "runtime", "config", "running", "pid",
-                    "ports", "pairFile", "paired", "job", "canStart", "whyNot", "notes"):
+                    "ports", "pairFile", "paired", "job", "canStart", "whyNot", "notes",
+                    "ready"):
             self.assertIn(key, v)
         self.assertFalse(v["runtime"]["ready"], "临时目录里没有 runtime/")
         self.assertFalse(v["canStart"])
@@ -365,6 +366,59 @@ class EndpointTests(_Isolated):
         self.assertTrue(body["ok"])
         self.assertIn("backend", body)
         self.assertIn("job", body["backend"])
+
+    def test_the_plan_endpoint_is_read_only_and_cached_until_forced(self):
+        """批 2 的只读计划：面板点按钮**之前**先给用户看走哪条路、缺什么、先验哪一步。"""
+        seen = {}
+
+        def _plan(force=False):
+            seen["force"] = force
+            return {"path": "portable", "variant": "cu126", "implemented": False,
+                    "whyNot": "一键安装还没做", "missing": ["后端的运行时"],
+                    "notes": ["扩展包要自带运行时"], "reasons": ["没装 Docker"],
+                    "needsNetwork": True, "sizeMb": 10240, "etaMinutes": 15,
+                    "diskFreeGB": 100.0, "verify": [], "probe": {}}
+
+        with mock.patch.object(backend_env, "plan", _plan):
+            r = self.client.get("/api/capability/backend/plan")
+            self.assertEqual(r.status_code, 200, r.text)
+            self.assertEqual(r.json()["path"], "portable")
+            self.assertIs(seen["force"], False)
+            self.client.get("/api/capability/backend/plan?force=true")
+            self.assertIs(seen["force"], True)
+
+    def test_the_ready_endpoint_runs_the_three_layer_self_test(self):
+        """批 3：`/v1/health` → `/v1/ready` → **一次真实 /v1/asr**。失败回 400 + 那句话。"""
+        seen = {}
+
+        def _probe(url, **kw):
+            seen.update({"url": url, "kw": kw})
+            return {"ok": True, "state": "ok", "at": "10:00:00",
+                    "headline": "三层都过了：…", "l3": {"text": "测试"}}
+
+        self.write_config(port=8902, admin_port=8903)
+        with mock.patch.object(backend_ready, "probe", _probe):
+            r = self.client.post("/api/capability/backend/ready")
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertIn("三层都过", r.json()["message"])
+        self.assertEqual(seen["url"], "http://127.0.0.1:8902",
+                         "自测打的是**本机那个**后端（按生成出来的配置）")
+        # 结论要留在 view() 里（面板轮询时显示上一次的结论，而不是每次都跑一次真推理）
+        self.assertIn("ready", backend_admin.view())
+        self.assertEqual(backend_admin.view()["ready"]["state"], "ok")
+
+        with mock.patch.object(backend_ready, "probe",
+                               lambda url, **kw: {"ok": False, "state": "asr-failed",
+                                                  "headline": "模型就绪，但真实自测失败：503"}):
+            r = self.client.post("/api/capability/backend/ready")
+        self.assertEqual(r.status_code, 400, r.text)
+        self.assertIn("真实自测失败", r.json()["detail"])
+
+    def test_the_ready_probe_never_raises_through_the_admin_layer(self):
+        with mock.patch.object(backend_ready, "probe", side_effect=RuntimeError("炸了")):
+            ok, message = backend_admin.ready_probe()
+        self.assertFalse(ok)
+        self.assertIn("没跑起来", message)
 
     def test_stop_reports_the_service_sentence(self):
         with mock.patch.object(backend_proc, "stop",

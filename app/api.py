@@ -276,6 +276,17 @@ def api_capability_backend(_auth=Depends(optional_auth)):
     return backend_admin.view()
 
 
+@router.get("/capability/backend/plan")
+def api_capability_backend_plan(force: bool = False, _auth=Depends(optional_auth)):
+    """**只读计划**：这台机器该走哪条路（容器 / 扩展包）、哪一档、多大、缺什么、
+    要不要联网、先验哪一步（实施方案 §2：先给人看，再点开始）。
+
+    `force=1` 不吃缓存（面板上那个"重新探一遍"）。它只读、不动任何东西，所以随时可问。
+    """
+    from app import backend_env
+    return backend_env.plan(force=bool(force))
+
+
 @router.post("/capability/backend/start")
 def api_capability_backend_start(body: Optional[BackendStartIn] = None,
                                  _auth=Depends(optional_auth)):
@@ -298,6 +309,23 @@ def api_capability_backend_stop(_auth=Depends(optional_auth)):
     if not ok:
         raise HTTPException(status_code=400, detail=message)
     return {"ok": True, "message": message, "backend": backend_admin.view()}
+
+
+@router.post("/capability/backend/ready")
+def api_capability_backend_ready(diarize: bool = False, _auth=Depends(optional_auth)):
+    """**三层就绪自测**（批 3）：`/v1/health` → `/v1/ready` → **一次真实 `/v1/asr`**。
+
+    最后那一层是这一档存在的理由：只有它挡得住"health 全绿、每个 /v1/asr 都 503"
+    那个坑（权重缺失 / torch 与 torchaudio 的 CUDA ABI 不符）。
+    `diarize=1` 时顺带问一次分离，**失败不算整体失败**（老卡本来就没有这一档）。
+
+    失败回 400 + 那句话（面板照原样显示），并且**结论照样进 `view()["ready"]`**。
+    """
+    from app import backend_admin
+    ok, message = backend_admin.ready_probe(diarize=bool(diarize))
+    if not ok:
+        raise HTTPException(status_code=400, detail=message)
+    return {"ok": True, "message": message, "ready": backend_admin.last_ready()}
 
 
 # ---------------------------------------------------------------- 状态与配置
