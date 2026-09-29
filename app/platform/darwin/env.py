@@ -89,6 +89,14 @@ def process_running(image_name: str) -> bool:
     return _posix.process_running(image_name)
 
 
+def pid_alive(pid: int) -> bool:
+    return _posix.pid_alive(pid)
+
+
+def process_label(pid: int) -> str:
+    return _posix.process_label(pid)
+
+
 def shell_open(target: str, params: str = "") -> bool:
     return _posix.shell_open(target, params, opener=("open",))
 

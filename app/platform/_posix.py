@@ -105,6 +105,48 @@ def kill_process_tree(pid: int) -> bool:
             return False
 
 
+def pid_alive(pid: int) -> bool:
+    """那个 pid 现在还在跑吗（POSIX：``os.kill(pid, 0)`` 只做存在性检查，**不发真信号**）。
+
+    返回 False 的两种情形要分清（调用方靠 pid 记录做归属，两种都不该动手）：
+      * ``ProcessLookupError`` —— 进程确实没了；
+      * 权限不足（``PermissionError``）—— 进程在，但不归我们看/发信号：这里返回 True
+        （"可能活着"），免得把"别人的进程"误判成"我们的进程已退出"而清掉记录。
+    """
+    import os
+    if int(pid) <= 0:
+        return False
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except Exception:
+        return False
+
+
+def process_label(pid: int) -> str:
+    """pid 的可执行名（``ps -p <pid> -o comm=``）；说不出来 = 空串。
+
+    只是给人看的人话（"8900 被 python3（pid 1234）占着"），不是判据。
+    """
+    import subprocess
+    if int(pid) <= 0:
+        return ""
+    for args in (["ps", "-p", str(int(pid)), "-o", "comm="],
+                 ["ps", "-p", str(int(pid)), "-o", "ucomm="]):
+        try:
+            out = (subprocess.run(args, capture_output=True, text=True,
+                                  timeout=5).stdout or "").strip()
+        except Exception:
+            continue
+        if out:
+            return out.splitlines()[0].strip()
+    return ""
+
+
 def listening_pid(port: int) -> int:
     """谁在监听本机某端口（``lsof`` 优先，退化 ``ss``）。找不到 = 0。"""
     import subprocess

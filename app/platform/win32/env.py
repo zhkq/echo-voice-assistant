@@ -117,6 +117,86 @@ def kill_process_tree(pid: int) -> bool:
         return False
 
 
+#: 探活/取名字只申请这一个权限位（"只看不动"）：权限越小，越不会在别人的进程上失败。
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+#: ``GetExitCodeProcess`` 对"还在跑"的进程返回这个值（Win32 的 ``STILL_ACTIVE``）。
+_STILL_ACTIVE = 259
+
+
+def _open_process(pid: int):
+    """打开一个"只看不动"的进程句柄 → ``(kernel32, handle)``；打不开 → ``(k32, 0)``。
+
+    为什么要设 ``restype = c_void_p``：64 位下句柄是 8 字节，不声明的话 ctypes 按 C int
+    截断，句柄就成了垃圾值 —— 表现是"探一个活着的进程说不存在"（2026-09-29 踩过）。
+    """
+    import ctypes
+    k32 = ctypes.windll.kernel32
+    k32.OpenProcess.restype = ctypes.c_void_p
+    k32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+    k32.CloseHandle.argtypes = [ctypes.c_void_p]
+    return k32, k32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, 0, int(pid))
+
+
+def pid_alive(pid: int) -> bool:
+    """那个 pid 现在还在跑吗（``OpenProcess`` + ``GetExitCodeProcess``；**只看不动**）。
+
+    **为什么不用 ``os.kill(pid, 0)``**：Windows 上 ``signal.CTRL_C_EVENT == 0``，
+    ``os.kill(pid, 0)`` 于是成了"给那个进程组发 Ctrl+C"——既不是探活，还会真的打断对端
+    （2026-09-29 实测：被探的 ``time.sleep`` 子进程当场收到 KeyboardInterrupt）。
+    权限不够（别人的进程）时返回 ``False``：拿不准就别说"活着"，见下面 ``process_label``
+    的反面说明。永不抛。
+    """
+    import ctypes
+    if int(pid) <= 0:
+        return False
+    try:
+        k32, handle = _open_process(pid)
+        if not handle:
+            return False
+        try:
+            k32.GetExitCodeProcess.argtypes = [ctypes.c_void_p,
+                                              ctypes.POINTER(ctypes.c_ulong)]
+            code = ctypes.c_ulong()
+            if not k32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return False
+            return code.value == _STILL_ACTIVE
+        finally:
+            k32.CloseHandle(handle)
+    except Exception:
+        return False
+
+
+def process_label(pid: int) -> str:
+    """pid 的可执行文件名（``python.exe`` / ``echo-server.exe``）；说不出来 = 空串。
+
+    用途是**人话**，不是判据：端口被人占了要能说"8900 被 python.exe（pid 1234）占着"，
+    而不是让人自己去 ``tasklist`` 里翻（见 ``app/backend_proc.py`` 的端口占用者）。
+    取不到名字不算错（进程刚退出、权限不够），调用方只拿 pid 也要能说清。
+    """
+    import ctypes
+    if int(pid) <= 0:
+        return ""
+    try:
+        k32, handle = _open_process(pid)
+        if not handle:
+            return ""
+        try:
+            k32.QueryFullProcessImageNameW.argtypes = [
+                ctypes.c_void_p, ctypes.c_uint32, ctypes.c_wchar_p,
+                ctypes.POINTER(ctypes.c_uint32)]
+            size = ctypes.c_uint32(1024)
+            buf = ctypes.create_unicode_buffer(1024)
+            if not k32.QueryFullProcessImageNameW(
+                    handle, 0, ctypes.cast(buf, ctypes.c_wchar_p),
+                    ctypes.byref(size)):
+                return ""
+            return os.path.basename(buf.value or "")
+        finally:
+            k32.CloseHandle(handle)
+    except Exception:
+        return ""
+
+
 def listening_pid(port: int) -> int:
     """谁在监听本机某端口（``netstat -ano``）；找不到 = 0。"""
     import subprocess

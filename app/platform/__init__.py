@@ -150,6 +150,28 @@ def listening_pid(port: int) -> int:
     return int(fn(int(port))) if callable(fn) else 0
 
 
+def pid_alive(pid: int) -> bool:
+    """那个 pid 现在还在跑吗（**只查询，绝不发信号**；永不抛）。
+
+    业务代码**不要**自己写 ``os.kill(pid, 0)``：Windows 上 ``signal.CTRL_C_EVENT == 0``，
+    那句就变成"给那个进程组发 Ctrl+C"——探活会把对端打断（2026-09-29 实测：被探的
+    ``time.sleep`` 子进程当场 KeyboardInterrupt）。平台差异收在接缝里：
+    Windows 走 ``OpenProcess`` + ``GetExitCodeProcess``，POSIX 走信号 0。
+    """
+    fn = _platform_fn("pid_alive")
+    return bool(fn(int(pid))) if callable(fn) else False
+
+
+def process_label(pid: int) -> str:
+    """pid 的可执行名（``python.exe`` / ``python3``）；说不出来 = 空串。
+
+    只是**人话**（"8900 被 python.exe（pid 1234）占着"），不是归属判据 ——
+    归属只能来自 ECHO 自己落的 pid 记录。
+    """
+    fn = _platform_fn("process_label")
+    return str(fn(int(pid)) or "") if callable(fn) else ""
+
+
 def shell_open(target: str, params: str = "") -> bool:
     """用系统 shell 打开 URL / 可执行文件（非阻塞）。"""
     fn = _platform_fn("shell_open")

@@ -83,7 +83,8 @@ def _platform_defaults() -> dict:
 
 # ------------------------------------------------- 安装根（{echoBase}）与六个兄弟目录
 
-#: 安装根下六个兄弟目录（设计 §2.2）。**名字是契约**：迁移表按它写。
+#: 安装根下的兄弟目录（设计 §2.2 的六个 + 「起本机后端」新增的 ``backend``）。
+#: **名字是契约**：迁移表按它写。``backend`` 刻意不在 ``echo-core`` 里，见 backend_root()。
 BASE_DIRS = {
     "core": "echo-core",
     "data": "data",
@@ -91,6 +92,7 @@ BASE_DIRS = {
     "dsh": "dsh",
     "meeting": "meeting",
     "aide": "aide",
+    "backend": "backend",
 }
 
 
@@ -210,6 +212,20 @@ def models_root() -> str:
     spec = _settings_get("modelsDir")
     resolved = resolve(spec) if spec else ""
     return resolved or base_dir("models") or os.path.join(echo_root(), "models")
+
+
+def backend_root() -> str:
+    """**客户端自己起的能力后端**的安装根：``{echoBase}/backend``。
+
+    为什么与 ``echo-core`` 平级、而不是塞进代码树里：升级/换代码树时**不许动它** ——
+    后端自己的 ``state/``（auth.db、local-pair.json）与 ``cache/`` 是耐久数据，
+    规矩见 ``docs/后端容器-一键起-实施方案.md`` §1B/§3（"覆盖 app/server/runtime，
+    ``state/`` 与 ``cache/`` 一个字节不动"）。
+
+    老式扁平安装（没有安装根）没有"兄弟目录"这一层，回落到 ``{DATA}/backend``：
+    开发树就落在这一类，行为可预期，且仍在 gitignore 的 ``data/`` 下。
+    """
+    return base_dir("backend") or os.path.join(data_root(), "backend")
 
 
 #: 「会议空间」工作区的出厂值（与 `meetingWorkspace` 那一项的 DEFAULTS 对应）

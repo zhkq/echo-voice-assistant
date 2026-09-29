@@ -129,6 +129,9 @@ class EveryPlatformImplementsThePrimitives(unittest.TestCase):
                   # 提示音 / 离线 TTS / 通知 / 边条候选）
                   "detach_gui_kwargs", "detach_console_kwargs", "console_shell_argv",
                   "process_running", "shell_open", "play_wav_async",
+                  # 进程归属判据（「起本机后端」批 1a/1b）：探活必须"只看不动" ——
+                  # Windows 上 os.kill(pid, 0) 是"发 Ctrl+C"，绝不能由业务代码自己写。
+                  "pid_alive", "process_label",
                   "offline_tts_speak", "offline_tts_label", "offline_tts_display",
                   "notify", "sidebar_candidates",
                   # 秘密保护（客户端凭据落盘）：Windows 用 DPAPI，POSIX 用 0600。
