@@ -464,5 +464,55 @@ class PlanSummaryTests(unittest.TestCase):
                 capability_admin.plan_summary(junk, {"exact": "not-a-number"})
 
 
+class BlockedByPrivacyIsNotUnreachableTests(unittest.TestCase):
+    """**被许可挡住 ≠ 连不上**（2026-09-29 用户拍板 A 的配套）。
+
+    会议侧从这一档起会把两种情形记成两个词（`blocked-by-privacy` / `waiting-backend`，
+    见 `app/meeting.py` 的 `_policy_blocked_only`），这一层负责把它翻成**两句不同的话**：
+    前者等多久都不会来，该做的是去改「允许音频去哪」；后者才是"等它 / 去查那台"。
+
+    说错一个词的代价与 `not-configured` 那条一模一样：用户会去查错的地方
+    （去查网络/端口/后端进程，而真答案是许可）。
+    """
+
+    def test_the_label_names_the_permission_and_the_fix(self):
+        label = capability_admin.TRANSCRIBE_FALLBACK_LABELS["blocked-by-privacy"]
+        self.assertIn("允许音频去哪", label)
+        self.assertIn("内网", label, "要给出下一步，而不只是描述现象")
+        self.assertIn("回环", label, "本机后端不受这条限制 —— 这句必须说，否则用户会以为没救")
+        self.assertNotIn("连不上", label, "它不是连不上")
+
+    def test_the_state_is_its_own_bucket(self):
+        """`blocked-by-privacy` 是**独立一档**：不加"等待能力后端"前缀（等不来）。"""
+        out = capability_admin.execution_summary(None, "", "blocked-by-privacy")
+        self.assertEqual(out["state"], "blocked-by-privacy")
+        self.assertEqual(out["fallbackReasonLabel"],
+                         capability_admin.TRANSCRIBE_FALLBACK_LABELS["blocked-by-privacy"])
+        self.assertEqual(out["headline"], out["fallbackReasonLabel"])
+        self.assertNotIn(capability_admin.WAITING_BACKEND, out["headline"])
+
+    def test_a_diarize_record_does_not_swallow_the_permission_reason(self):
+        """分离那一档排在最前（"这场没有说话人"），但**许可那句仍要跟着出现**。"""
+        dia = {"executed": False, "reason": "blocked", "waiting": False}
+        out = capability_admin.execution_summary(dia, "", "blocked-by-privacy")
+        self.assertEqual(out["state"], "diarize-not-executed")
+        self.assertIn("允许音频去哪", out["fallbackReasonLabel"])
+
+    def test_the_reason_does_not_need_a_diarize_record(self):
+        """**没有分离记录的会议**（配置里关掉了分离）也要画得出来。
+
+        那句原因本来就在 `meta.json` 里（`transcribeFallbackReason`），而原来这一行
+        只由 `diarize.waiting` 决定 —— 于是那种会议的详情页**一个字都不显示**，
+        用户只看到"转写失败"，原因得自己去翻 meta。记下来的事实必须看得见。
+        """
+        out = capability_admin.execution_summary(None, "", "waiting-backend")
+        self.assertEqual(out["state"], "waiting-backend")
+        self.assertTrue(out["headline"])
+
+    def test_it_still_says_nothing_when_there_is_nothing_to_say(self):
+        """反过来：**什么都没记** → `None`（老会议不该凭空多出一行）。"""
+        self.assertIsNone(capability_admin.execution_summary(None, "", ""))
+
+
 if __name__ == "__main__":
     unittest.main()

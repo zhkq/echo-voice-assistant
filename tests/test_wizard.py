@@ -612,6 +612,21 @@ class SecretsNeverLandInThePlanFileTests(_PlanTestCase):
         reasons = " ".join(m["reason"] + m["fix"] for m in plan["missing"])
         self.assertIn("不出机", reasons, plan["missing"])
 
+    def test_privacy_none_is_not_a_conflict_for_the_local_route(self):
+        """2026-09-29 用户拍板 A 之后，「这台电脑自己跑」与「不出机」**不再冲突**。
+
+        判据是地址：本机后端只绑回环（`app/backend_setup.py` 起的就是它），
+        所以 `echo_server.source` 把它算成 `local`，`privacy=none` 放行它。
+        向导要是还照旧警告，用户就会去把许可放宽到「内网」—— 那一步**不需要**，
+        而且一放宽，真正的内网后端也跟着被放行了。
+        """
+        wizard._settings = lambda name: "none" if name == "capabilityPrivacy" else ""
+        plan = wizard.build_plan({"meeting": {"route": "local"}})
+        self.assertEqual({r["key"]: r["value"] for r in plan["config"]}
+                         .get("capabilityMeetingAsrBackend"), "echo-server")
+        reasons = " ".join(m["reason"] + m["fix"] for m in plan["missing"])
+        self.assertNotIn("不出机", reasons, plan["missing"])
+
     def test_the_step_exists_in_the_six_step_plan_schema(self):
         """计划里 `meeting` 是**新加的一块**，老计划文件没有它 —— 缺了不许炸。"""
         self.assertEqual(wizard.build_plan({"meeting": None})["schema"], wizard.PLAN_BUILD_SCHEMA)

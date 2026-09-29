@@ -719,15 +719,17 @@ def _meeting_route_rows(choices: dict) -> tuple:
         # 走 `wizard._settings()`（模块级、可打桩）而不是直接 import config —— 与这一层
         # 其它读设置的地方同一条路，测试才拦得住。
         privacy = _settings("capabilityPrivacy")
-        # `local` 也算"要出机"：回环上的后端目前与内网后端同一个 `source`
-        # （`app/capabilities/echo_server.py` 用的是 `SOURCE_LAN`），所以 privacy=none
-        # 会把它判成 blocked。这一条是**如实说**，不是替用户改许可。
-        if privacy == "none":
-            return rows, [{"feature": "把录音交给这台/那台后端转写",
-                           "reason": "你把「允许音频去哪」设成了「不出机」，而后端在进程外 —— "
-                                     "这个组合按策略会被挡住",
-                           "fix": "在「能力」卡把「允许音频去哪」改成「内网」，"
-                                  "或者改用「本机」转写引擎"}]
+        # 2026-09-29 用户拍板 A：**回环地址的后端判"本机"**（`echo_server.source` 按地址算），
+        # 所以「这台电脑自己跑」这一档与「不出机」许可**不再冲突** —— 不再警告。
+        # 「用同事给我的后端」那一档是另一台机器，`privacy=none` 仍然会把它挡成 `blocked`，
+        # 所以照旧如实说（措辞按 A 之后的事实改过：本机后端是出口，别再说"改用本机引擎"）。
+        if privacy == "none" and route == "paired":
+            return rows, [{"feature": "把录音交给同事那台后端转写",
+                           "reason": "你把「允许音频去哪」设成了「不出机」，而那台后端在别的机器上 —— "
+                                     "这个组合按策略会被挡住（面板上会说「能力后端被『允许音频去哪』挡住了」）",
+                           "fix": "在「能力」卡把「允许音频去哪」改成「内网」；"
+                                  "只想全本机跑的话，用「这台电脑自己跑」那一档 —— "
+                                  "后端只绑回环，不受这条许可限制"}]
         return rows, []
     return [], [{"feature": "开会时的录音变成文字",
                  "reason": "还没选会议转写走哪条路（本机后端 / 同事给你的后端 / 在线）",

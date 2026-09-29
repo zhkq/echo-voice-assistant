@@ -477,13 +477,15 @@ function renderCapability() {
   const ts = cap.timestampsLabel ? ` · 时间轴：${esc(cap.timestampsLabel)}` : "";
   // **这一场做了什么 / 在等什么**（服务端给的一句）。`state` 决定红/黄/常色：
   //   diarize-not-executed → 红（这场没有说话人，与下面那条 diaLine 是同一件事，不重复画）
+  //   blocked-by-privacy   → 黄（后端**连得上**，是「允许音频去哪」挡住了 —— 它等不来结果，
+  //                           所以与"在等后端"分开说，2026-09-29 用户拍板 A 的配套）
   //   waiting-backend      → 黄（在等后端）
   //   local-transcribe     → 黄（配了后端却走了本机，必须显眼）
   //   backend              → 不额外画一行（下面"用了谁"已经说清了）
   let runLine = "";
   if (run && run.headline && run.state !== "diarize-not-executed") {
-    const cls = (run.state === "waiting-backend" || run.state === "local-transcribe")
-      ? " cap-dia warn" : "";
+    const cls = (run.state === "waiting-backend" || run.state === "local-transcribe"
+      || run.state === "blocked-by-privacy") ? " cap-dia warn" : "";
     runLine = `<div class="cap-line${cls}" data-testid="cap-run" data-run-state="${esc(run.state || "")}">`
       + `🖥 <b>${esc(run.headline)}</b>`
       + `${run.fallbackReasonLabel ? `<span class="cap-d">${esc(run.fallbackReasonLabel)}</span>` : ""}`

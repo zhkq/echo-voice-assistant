@@ -1046,6 +1046,31 @@ def _first_reason(plan, slot):
     return best.reason if best else "absent"
 
 
+def _policy_blocked_only(plan) -> bool:
+    """这一轮"一个槽都没落到后端"是不是**许可**挡的（而不是连不上）？
+
+    判据（都用计划里现成的事实，不猜、不看当前设置）：
+      * 至少有一个后端被 `blocked`（privacy 不放行它）；
+      * 而且**同一个后端**没有以"用不上/连不上"那一类原因被跳过
+        （`unsupported` / `offline` / `busy` / `error` / `quota` / `circuit-open` /
+        `open-failed`）—— 只要有，真实原因就不是许可。
+
+    为什么要分这一档（2026-09-29 用户拍板）：`privacy=none` 时后端**连得上、只是不被允许**，
+    而面板原来把它说成「等待能力后端（**连不上**，本步还没有离线队列）」——
+    用户会照着这句话去查网络/端口/后端进程，方向全错。原因说错比不说更贵
+    （与 `base.UNIMPLEMENTED_BACKENDS` 那条纪律同一条）。
+    """
+    blocked_ids = {s.backend_id for s in plan.skipped
+                   if s.reason == "blocked" and s.backend_id}
+    if not blocked_ids:
+        return False
+    for s in plan.skipped:
+        if s.backend_id in blocked_ids and s.reason not in ("blocked", "absent",
+                                                            "vector-mismatch"):
+            return False
+    return True
+
+
 #: 说话人这一族**没有任何可用后端**时用的原因词。选 `absent` 不是随手挑的：它的中文
 #: 释义就是"不在位（没有任何后端能做这一槽）"（`capability_admin.REASON_LABELS`）。
 #: 2026-09-29 之前它指的是"本机没装 pyannote"；客户端不再承担会议分离之后，
@@ -1106,7 +1131,10 @@ def _new_run_info(state="", reason=""):
         的设想（`docs/3.0-设计总览与组件关系.md:1086`）**本步不实现** —— 只把状态说出来。
 
     `state` 取值：`backend` / `provider`（这一场的文字是谁出的；空 = 没有转写引擎）。
-    `reason` 取值：`waiting-backend` / `not-configured` / `route-unavailable`（为什么没走成）。
+    `reason` 取值：`waiting-backend` / `blocked-by-privacy` / `not-configured` /
+    `route-unavailable`（为什么没走成）。后两者与前者**必须分开说**：
+    `blocked-by-privacy` 是"后端连得上、只是许可不让发"（等不来，要去改「允许音频去哪」），
+    `waiting-backend` 才是"那台现在连不上"（见 `_policy_blocked_only`）。
     `reason` 只有 `state` 为空时才有意义 —— 走了后端就不是"没走成"。
     """
     return {"transcribeEngine": str(state or ""), "fallbackReason": str(reason or "")}
@@ -1293,12 +1321,14 @@ def _capability_asr_session(cfg, need_speaker=None, info=None):
 
       * 没配后端（也没配对）→ 这台机器本来就没有后端（`not-configured`）；
       * **配了后端但那台连不上/用不上**（或路由根本起不来）→ 这一场是在**等后端**
-        （`waiting-backend` / `route-unavailable`），必须显示成"在等"。
+        （`waiting-backend` / `route-unavailable`），必须显示成"在等"；
+      * **配了后端、后端也连得上，只是「允许音频去哪」不让发** → 这不是"在等"
+        （等多久都不会来），记 `blocked-by-privacy`，面板要说"去改那条许可"。
 
     所以可选的 `info` 字典会被填上 `{"state": ..., "reason": ...}`（形状见
     `_new_run_info`）：`state` 是这一场文字将来由谁出（`backend`/`provider`，
     两者都不成立时留空 = 这一场没有转写引擎），`reason` 是"为什么没走成它"
-    （`waiting-backend`/`not-configured`/`route-unavailable`）。
+    （`waiting-backend`/`blocked-by-privacy`/`not-configured`/`route-unavailable`）。
     **刻意用出参而不是改返回值**：这个函数被十几条既有用例按"返回 session 或 None"调用，
     改返回值会让它们全体变成"在验另一件事"，而这一步要收的是语义、不是签名。
     """
@@ -1354,7 +1384,10 @@ def _capability_asr_session(cfg, need_speaker=None, info=None):
                                "而 %s" % _skips_brief(plan, "diarize.turns"))
                 # **在等后端**：配了、但这一轮一个槽都没落到它上面。
                 # 只记状态，不排队重试（那是另一件事，见设计 §1086 那句"离线队列/pending"）。
-                _fill("", "waiting-backend")
+                # 2026-09-29：**被许可挡住 ≠ 连不上** —— 前者等一辈子也不会来，
+                # 面板要给的是"去改「允许音频去哪」"，所以另记一档（见 `_policy_blocked_only`）。
+                _fill("", "blocked-by-privacy" if _policy_blocked_only(plan)
+                      else "waiting-backend")
             return None
         who = "，".join("%s→%s" % (s, b) for s, b in live if b) or "（没有槽被选中）"
         db.add_log("info", "capability",
@@ -1537,9 +1570,12 @@ def _capability_diarize_segment(cap, seg_path, state=None):
         if state is not None:
             # 配了后端的机器上"这一槽没人干" = 在等后端（不是"这台做不到"）——
             # 这两个结论在面板上必须是两句不同的话（见 `_note_diarize_missing`）。
+            # **被许可挡住不算"在等"**（2026-09-29）：那种情况等到天荒地老也不会来，
+            # 原因是 `blocked`（策略），面板那句"在等后端"会把人引去查网络。
             _note_diarize_missing(state, _first_reason(plan, "diarize.turns"),
                                   _skips_brief(plan, "diarize.turns"),
-                                  waiting=bool(cap.backend_configured))
+                                  waiting=bool(cap.backend_configured)
+                                          and not _policy_blocked_only(plan))
         return None, None, None, None
     try:
         res, done_plan = cap.call("diarize.turns", wav=seg_path)
@@ -1775,8 +1811,8 @@ def _transcribe_impl(folder):
     elif asr_is_local:
         #: `transcribeEngine` 留空：**不是**"本机引擎转的"（客户端已经不做会议转写了），
         #: 而是"这一场压根没有可用的转写引擎"。`fallbackReason` 说明为什么
-        #: （`not-configured` / `waiting-backend` / `route-unavailable`），
-        #: 面板把它显示成「等待能力后端」或「没配能力后端」。
+        #: （`not-configured` / `waiting-backend` / `blocked-by-privacy` / `route-unavailable`），
+        #: 面板把它显示成「等待能力后端」/「被『允许音频去哪』挡住了」/「没配能力后端」。
         run_info["transcribeEngine"] = ""
     else:
         run_info.update(_new_run_info("backend"))

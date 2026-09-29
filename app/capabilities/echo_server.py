@@ -34,6 +34,7 @@ from app.capabilities.base import (
     SERVER_CODE_TO_REASON,
     SKIP_REASONS,
     SOURCE_LAN,
+    SOURCE_LOCAL,
     SLOTS,
     AsrResult,
     CapabilityClient,
@@ -59,6 +60,21 @@ def _setting(key, default=None):
         return settings.get(key, default)
     except Exception:
         return default
+
+
+def _is_loopback(url: str) -> bool:
+    """这个地址是不是打到本机（回环）？
+
+    **判据只有一处**：`app.netlocal.is_loopback()`（认 `127.0.0.1` / `localhost` / `::1`
+    与整个 `127.0.0.0/8`，也认 IPv6 方括号与大小写）。这里不再写第二套主机名匹配 ——
+    "两处各写一遍"正是这类判据漂移的来源。判不了（空地址/坏 URL）返回 False：
+    那按**非本机**算（保守），与 `source` 的兜底同一个方向。永不抛。
+    """
+    try:
+        from app import netlocal
+        return bool(netlocal.is_loopback(url))
+    except Exception:
+        return False
 
 
 def _creds():
@@ -114,7 +130,31 @@ class EchoServerClient(CapabilityClient):
     """
 
     backend_id = BACKEND_ECHO_SERVER
-    source = SOURCE_LAN
+
+    @property
+    def source(self) -> str:
+        """这个后端**属于哪一档** —— 它是 privacy 约束的判据（2026-09-29 用户拍板 A）。
+
+        * **回环地址**（`127.0.0.1` / `localhost` / `[::1]` / 整个 `127.0.0.0/8`）→ `SOURCE_LOCAL`：
+          音频一个字节都没离开这台机器，所以「允许音频去哪 = 不出机」**不该**把它挡住。
+          「帮我起本机后端」生成的就是这一档（只绑回环，见 `app/backend_setup.py`）。
+        * **其它地址** → `SOURCE_LAN`（原行为：单位内网那台 GPU 机）。
+
+        为什么不沿用"ECHO 后端一律算内网"的旧口径：那会把**本机的**后端判成"出机"，
+        于是最在意隐私的人（把许可设成「不出机」）反而用不了它 —— 而"要用本机后端就得
+        把许可放宽到内网"是**反向激励**：许可一放宽，真正的内网后端也跟着被放行。
+
+        ⚠️ **已知边界（写在这里，因为它没法从地址上看出来）**：地址分不出"本机服务"与
+        "本机隧道"。把远端后端用 `ssh -L 18900:远端:8900` 映射到本机回环、再填
+        `http://127.0.0.1:18900` 时，这里会判成本机（于是「不出机」放行），
+        而音频其实经隧道去了另一台机器。**用隧道的人请把「允许音频去哪」设成「内网」**
+        （面板与向导里都写着这一句）。要更硬的判据只能让**后端自己宣告**它在哪台机器
+        （`/v1/health` 已经有 `adminUrl` 这类宣告），那是另一件事。
+
+        **故意不给 setter**：以前它是类属性、谁都能改；现在它是**从地址算出来的事实**，
+        赋值只会造出"source 与实际地址不一致"的静默假象（要模拟别的档请换 base_url）。
+        """
+        return SOURCE_LOCAL if _is_loopback(self.base_url) else SOURCE_LAN
 
     def __init__(self, base_url: str = "", token: str = "", *,
                  backend_id: str = "", timeout_infer: float = INFER_TIMEOUT_S,

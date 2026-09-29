@@ -829,6 +829,42 @@ class SessionDecisionTests(_IsolatedState):
         self.assertIn("blocked", warn, "warn 里要写得出降级原因（这里是 privacy 挡住）：%s" % warn)
         self.assertTrue(any(r in warn for r in SKIP_REASONS), warn)
 
+    def test_a_backend_blocked_by_privacy_is_not_reported_as_unreachable(self):
+        """**被许可挡住 ≠ 连不上**（2026-09-29 用户拍板 A 的配套）。
+
+        `privacy=none` + 别台机器上的后端：后端连得上、只是**不被允许**。
+        旧口径在这一场报 `waiting-backend`，而面板把它翻成
+        「等待能力后端（**连不上**，本步还没有离线队列）」—— 用户于是去查网络、端口、
+        后端进程，方向全错（而这个组合等多久都不会来）。
+        """
+        import app.meeting as meeting
+        self._logged()
+        self._put(capabilityEchoServerUrl="http://gpu-01:8900",
+                  capabilityPrivacy="none")
+        info = {}
+        self.assertIsNone(meeting._capability_asr_session(dict(CFG, diarize=True),
+                                                          info=info))
+        self.assertTrue(info.get("backendConfigured"),
+                        "配置里点名了后端，`backendConfigured` 必须为真")
+        self.assertEqual(info.get("fallbackReason"), "blocked-by-privacy",
+                         "被许可挡住了，不该报成「在等后端（连不上）」（%s）" % info)
+
+    def test_a_dead_loopback_backend_is_still_waited_for_not_blocked(self):
+        """同一条判据的**反面**：回环地址的后端（本机）在 `none` 下不算被挡。
+
+        它只是**没起来**（没人监听）—— 那一档才该说「在等后端」。
+        两条一起钉住，才说明我们分的是"许可"而不是"地址长得像回环"。
+        """
+        import app.meeting as meeting
+        self._logged()
+        self._put(capabilityEchoServerUrl="http://127.0.0.1:1",
+                  capabilityPrivacy="none")
+        info = {}
+        self.assertIsNone(meeting._capability_asr_session(dict(CFG, diarize=True),
+                                                          info=info))
+        self.assertEqual(info.get("fallbackReason"), "waiting-backend",
+                         "本机后端只是没起来，不该报成被许可挡住（%s）" % info)
+
     def test_a_paired_only_machine_also_falls_back_LOUDLY(self):
         """**只配对、设置里没填地址**的机器，后端不可用时同样要留一句话。
 

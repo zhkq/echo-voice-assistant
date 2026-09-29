@@ -3310,11 +3310,16 @@ function renderMeetingServiceCard() {
   }).join("");
   const priv = String(settingValue("capabilityPrivacy", "lan") || "lan");
   let consistency = `<span class="sbadge ok">一致</span>`;
-  // 2026-09-29：三个后端取值**都不在本机**（客户端进程内不再承担会议转写/分离），
-  // 所以「不出机」许可与任何一档都对不上 —— 不再有 `sel !== "local"` 那个例外。
+  // 2026-09-29 用户拍板 A：**回环地址的后端判"本机"**（音频没离开这台机器），
+  // 所以「不出机」许可能用本机后端（`app/backend_setup.py` 起的就是这一档）；
+  // 但它**仍然挡住**内网/公网后端与在线转写。
+  // ⚠️ 地址分不出"本机服务"与"本机隧道"：把远端后端用 ssh -L 映射到本机回环的人，
+  // 请把许可设成「内网」（这句话必须写在用户看得到的地方，不能只活在代码注释里）。
   if (priv === "none") {
-    consistency = `<span class="sbadge warn" title="出网许可是「不出机」：能力后端与在线转写都会被策略挡住`
-      + `（后端会把原因报成 blocked）。要全本机跑就在本机起一个能力后端，再把它设成「内网」">许可不允许</span>`;
+    consistency = `<span class="sbadge warn" title="出网许可是「不出机」：内网/公网的后端与在线转写都会被策略挡住。`
+      + `只绑回环的本机后端（「帮我起本机后端」起的就是它）不受这条限制 —— 那是同一台机器上的进程。`
+      + `⚠️ 如果你是把远端后端用 ssh -L 隧道映射到本机回环，请把许可设成「内网」：`
+      + `地址分不出"本机服务"与"本机隧道"">许可不允许</span>`;
   } else if (priv === "lan" && sel === "asr-provider") {
     consistency = `<span class="sbadge warn" title="「内网」许可不覆盖公网服务商">许可只到内网</span>`;
   }

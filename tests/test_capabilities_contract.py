@@ -834,6 +834,77 @@ class IronLawTests(unittest.TestCase):
         self.assertEqual(b.calls, 0, "点名了 a，就不该偷偷换到 b")
 
 
+class LoopbackEchoBackendIsLocalTests(unittest.TestCase):
+    """回环地址的 ECHO 后端算 **local**（2026-09-29 用户拍板 A）。
+
+    判据是**地址**，不是"哪个类"：`EchoServerClient.source` 按 `base_url` 算 ——
+    回环 → `SOURCE_LOCAL`（音频一个字节都没离开这台机器），其它 → `SOURCE_LAN`。
+
+    为什么值得单独钉：`privacy=none`（「不出机」）是**最保守**的许可，也正是最在意隐私的
+    用户会选的那一档；而「帮我起本机后端」起的就是只绑回环那个（`app/backend_setup.py`）——
+    判错方向的表现是**静默**的：后端连得上，日志里只有一句 `blocked`，面板还说"连不上"。
+    反过来，"要用本机后端就得把许可放宽到内网"是**反向激励**：许可一放宽，
+    真正的内网后端也跟着被放行。
+
+    ⚠️ 已知边界（这里有分支钉住，因为它是**有意的取舍**）：地址分不出"本机服务"与
+    "本机隧道"——把远端后端用 `ssh -L` 映射到本机回环的人会被判成"没出机"，
+    所以面板/向导里写着"用隧道请选内网许可"（见 `web/app.js` 与 `app/wizard.py`）。
+    """
+
+    def _client(self, url):
+        """造一个真的 `EchoServerClient`（设置与凭据都打桩，不读这台机器的真实状态）。"""
+        from app.capabilities import echo_server
+        with patch.object(echo_server, "_setting", lambda k, d=None: ""), \
+                patch.object(echo_server, "_creds", lambda: None):
+            return echo_server.EchoServerClient(base_url=url)
+
+    def _plan(self, client, privacy="none"):
+        client.provides = frozenset({"asr.text"})         # 假装已经拉过能力清单
+        router = CapabilityRouter([client], settings_get=lambda k, d=None: d)
+        return router.plan(Need(slots=("asr.text",), purpose="meeting", privacy=privacy))
+
+    def test_loopback_addresses_are_local(self):
+        for url in ("http://127.0.0.1:8900", "http://localhost:8900",
+                    "https://[::1]:8900", "http://127.9.9.9:8900"):
+            with self.subTest(url=url):
+                client = self._client(url)
+                self.assertEqual(client.source, SOURCE_LOCAL,
+                                 "%s 是本机上的进程，不该被判成内网" % url)
+                self.assertEqual(client.describe()["source"], SOURCE_LOCAL,
+                                 "面板那句「在哪」读的就是这个字段")
+
+    def test_non_loopback_addresses_stay_lan(self):
+        for url in ("http://10.100.0.24:8900", "http://gpu-01:8900",
+                    "https://gpu.example.com", ""):
+            with self.subTest(url=url):
+                self.assertEqual(self._client(url).source, SOURCE_LAN)
+
+    def test_privacy_none_lets_the_local_backend_through(self):
+        """「不出机」时**本机后端仍然可用** —— 这正是这次拍板要的那件事。"""
+        plan = self._plan(self._client("http://127.0.0.1:8900"))
+        self.assertEqual(plan.backend_for("asr.text"), BACKEND_ECHO_SERVER)
+        self.assertFalse([s for s in plan.skipped if s.reason == "blocked"],
+                         "本机后端被 privacy=none 挡住了：%s" % plan.skipped)
+
+    def test_privacy_none_still_blocks_the_lan_backend(self):
+        """同一许可下，**别的机器**上的后端照旧被挡（放宽的只是"本机"这一档）。"""
+        plan = self._plan(self._client("http://10.100.0.24:8900"))
+        self.assertEqual(plan.backend_for("asr.text"), "")
+        self.assertTrue([s for s in plan.skipped if s.reason == "blocked"],
+                        "内网后端在「不出机」下必须被挡：%s" % plan.skipped)
+
+    def test_the_verdict_comes_from_the_address_not_a_settable_attribute(self):
+        """"source 由地址算出来"这条要有守卫：**不给 setter**。
+
+        以前它是类属性、谁都能改（`EchoServerClient.source = SOURCE_LAN`）——
+        那就又能造出"字段说本机、地址其实是内网"的静默不一致。
+        要模拟别的档，请换 `base_url`。
+        """
+        client = self._client("http://127.0.0.1:8900")
+        with self.assertRaises(AttributeError):
+            client.source = SOURCE_LAN
+
+
 class ServerCodeCoverageTests(unittest.TestCase):
     """**服务端每一个错误码，客户端都要有翻译。**
 

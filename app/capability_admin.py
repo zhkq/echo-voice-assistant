@@ -269,13 +269,20 @@ TRANSCRIBE_ENGINE_LABELS: Dict[str, str] = {
     "provider": "本场转写由在线转写服务完成",
 }
 
-#: 会议侧记下的"为什么这一场退回本机"的取值 → 一句人话。
+#: 「会议侧记下的"为什么这一场退回本机"的取值 → 一句人话」。
 #:
 #: `waiting-backend` 与 `not-configured` 必须分开说：前者是"你配了，但那台现在连不上"
 #: （该做的是等它 / 去查那台），后者是"你压根没配"（该做的是去配对）。说错一个词，
 #: 用户就会去查错的地方 —— 这与 `base.UNIMPLEMENTED_BACKENDS` 那条纪律是同一条。
+#:
+#: `blocked-by-privacy`（2026-09-29 用户拍板 A 之后的配套）与 `waiting-backend`
+#: **也必须分开**：那一档是"它连得上，只是**不被允许**"—— 等多久都不会来，
+#: 该做的是去改「允许音频去哪」。原来它被归进 `waiting-backend`，
+#: 面板就说成「**连不上**」，用户照着去查网络/端口/后端进程，方向全错。
 TRANSCRIBE_FALLBACK_LABELS: Dict[str, str] = {
     "waiting-backend": WAITING_BACKEND + "（连不上，本步还没有离线队列）",
+    "blocked-by-privacy": ("能力后端被「允许音频去哪」挡住了 —— 把它改成「内网」即可；"
+                           "只绑回环的本机后端不受这条限制"),
     "not-configured": "没配能力后端",
     "route-unavailable": "能力路由开不起来",
 }
@@ -293,6 +300,8 @@ def diarize_summary(state: Any) -> Optional[Dict[str, Any]]:
       * `waiting`       **在等后端**（2026-09-29）：配置里点名了能力后端、而那台
                         当时连不上/不支持/没权限。它与"分离没做成"**不是同一件事** ——
                         前者是"再等等它就有"，后者是"这一场就到此为止"；
+                        **被许可挡住（`blocked`）不算"在等"**（等不来，见 `meeting.py`
+                        的 `_policy_blocked_only`），那时这一位是 False、原因照样是 `blocked`；
       * `headline`      **给人看的那一句**（`说话人分离未执行：<原因>`）。
 
     认不出的 `reason` **原样返回**（与 `plan_summary` 同一条纪律：宁可露出内部词，
@@ -349,7 +358,9 @@ def execution_summary(diarize: Any, transcribe_engine: Any = "",
 
       * `diarize-not-executed` —— 分离没做成。**这一档排在最前**：后端连不上时它同时
         为真，而用户第一眼必须知道"这场没有说话人"（不能只看到"在等"就以为结果没事）；
-      * `waiting-backend`      —— 配置里点名了后端、那台当时不可用；
+      * `blocked-by-privacy`   —— 后端**连得上**，但被「允许音频去哪」挡住了
+        （这一档等不来结果，所以与 `waiting-backend` 分开说）；
+      * `waiting-backend`      —— 配置里点名了后端、那台当时不可用（连不上/不支持/没权限）；
       * `local-transcribe`     —— 这一场的文字是本机引擎出的（本步暂时的回落）；
       * `backend`              —— 转写与分离都走了能力后端（正常态，不额外提示）。
 
@@ -380,7 +391,17 @@ def execution_summary(diarize: Any, transcribe_engine: Any = "",
         # 硬契约那句：`说话人分离未执行：<真原因>`（原样用 `diarize_summary` 给的，
         # 不在这里重写一遍 —— 两处各写一遍，迟早出现两个版本）。
         out["headline"] = dia.get("headline") or DIARIZE_NOT_EXECUTED
-    elif waiting:
+    elif why == "blocked-by-privacy":
+        # **不看 `waiting`**：被许可挡住时 `diarize` 那侧已经不再说"在等"（见 meeting.py
+        # 的 `_policy_blocked_only`），而这一档必须**无论有没有分离记录**都说得出来 ——
+        # 否则"配了后端却一个字都没转"会退化成界面上什么都不显示。
+        out["state"] = "blocked-by-privacy"
+        out["headline"] = out["fallbackReasonLabel"]
+    elif waiting or why == "waiting-backend":
+        # `why` 也认：**没有分离记录**的会议（配置里关掉了说话人分离）同样会
+        # `fallbackReason=waiting-backend`，而原来只有 `diarize.waiting` 才画那一行 ——
+        # 那种会议在详情页上**一个字都不显示**（原因明明记在 meta 里）。
+        # 记下来的事实必须看得见，这是这一档存在的全部意义。
         out["state"] = "waiting-backend"
         out["headline"] = "%s：%s" % (WAITING_BACKEND, _fallback_reason_text(why))
     elif engine == "local":

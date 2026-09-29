@@ -152,6 +152,18 @@ class CapabilityCardWiringTests(unittest.TestCase):
         body = body[:body.index("\n}\n") + 3]
         self.assertIn("detail", body)
 
+    def test_the_privacy_none_badge_explains_the_loopback_exception(self):
+        """「不出机」许可下的口径必须写在**用户看得到的地方**（2026-09-29 用户拍板 A）。
+
+        判据是地址：只绑回环的本机后端算「本机」，所以「不出机」放行它；而**地址分不出**
+        "本机服务"与"本机隧道"—— 用 `ssh -L` 把远端后端映射到本机回环的人会被判成没出机。
+        这两句只写在代码注释里等于没有：面板上要能看见，否则用户会得出
+        "「不出机」就是用不了后端"这个错结论，去把许可放宽到内网。
+        """
+        self.assertIn("只绑回环的本机后端", self.js)
+        self.assertIn("隧道", self.js)
+        self.assertIn("ssh -L", self.js)
+
     def test_the_unpair_button_is_hidden_until_there_is_something_to_unpair(self):
         """没配对时不该有一个"解除配对"按钮杵在那儿。"""
         self.assertIn('class="btn hidden" id="btnCapUnpair"', self.html)
