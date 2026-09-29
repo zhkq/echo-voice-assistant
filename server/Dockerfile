@@ -50,8 +50,16 @@ ENV PYTHONUNBUFFERED=1 \
 WORKDIR /opt/echo
 
 # soundfile 要 libsndfile；其余全是 pip wheel（不编译）
+#
+# ⚠️ **ffmpeg 是完整档（`ECHO_EXTRA=1`）的硬依赖，不是可选项**（2026-09-28 在真机上实测）：
+#    `torchaudio`（以及 `torchcodec`）在 **import 时**要加载 FFmpeg 的 libav* 系列
+#    （libavcodec / libavformat / libavutil / libswresample…），`python:3.11-slim` 里没有，
+#    `libsndfile1` 也不带它们。症状**不在构建期、而在容器启动之后**：
+#        OSError: Could not load this library: .../torchaudio/lib/_torchaudio.abi3.so
+#    → `pyannote` 直接 import 失败 → **说话人分离整档不可用**。
+#    老卡档只装 funasr + transformers（不带 torchaudio），所以这个洞从没暴露过。
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends libsndfile1 \
+    && apt-get install -y --no-install-recommends libsndfile1 ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 # pip 的包索引（**构建期参数**，不是运行时配置）。默认就是 PyPI，行为与从前一致。
@@ -111,11 +119,27 @@ ARG ECHO_TORCH_VERSION=""
 #        2.10（PyPI 默认轮子）→ 转头把 torch 也顶上去，同样触发那条校验。
 #    新卡（不钉 torch 版本）走的是下面 else 那一支，`pyannote.audio` 仍按最新装
 #    （开发机实测的组合：torch 2.10+cu128 / pyannote 4.0.7）。
+# ⚠️ **`torchaudio` 必须与 `torch` 同一批、同一个索引装**（2026-09-28 真机实测）：
+#    完整档从前**不显式装 torchaudio**，它被 funasr 从**普通 PyPI** 被动拉进来 ——
+#    实测拉到的是 **CUDA 13 ABI 的 torchaudio 2.11**（要 `libcudart.so.13`），
+#    而 torch 是 **cu126**（只有 `libcudart.so.12`）→ `_torchaudio.abi3.so` 加载失败 →
+#    **`import torchaudio` 崩 → funasr(SenseVoice) 的模型加载也失败 → 每个 `/v1/asr`
+#    都 503 `model_failed`**（转写与说话人分离一起被打死）。
+#    cu126 索引上 torchaudio 最高只到 **2.9.1**（torchaudio 已停更），所以唯一成套的组合
+#    就是 `torch==2.9.1 + torchaudio==2.9.1`；真机按这个组合跑通：
+#      `torch 2.9.1+cu126 | torchaudio 2.9.1+cu126 | cuda avail True | pyannote 4.0.7 import OK`
+#    （随后 ASR 调用全部 200）。
+#    做法：**两者写在同一条 `pip install` 里**、都从 `ECHO_TORCH_INDEX` 装 ——
+#    torchaudio 的 wheel 写死了 `Requires-Dist: torch==<同版本>`，解析器因此会自己挑
+#    "有配套 torchaudio 的那一版 torch"（cu126 上目前 = 2.9.1），**不写死版本号**，
+#    索引更新后跟着走；`ECHO_TORCH_VERSION` 非空（老卡）时两者仍按**同一个变量**一起钉。
+#    装完会 import torchaudio 并校验它与 torch **版本一致** —— 这个坑必须在**构建期**炸，
+#    不要留到容器启动后（那时只表现为"每个 /v1/asr 都 503"，很难查到是 ABI 不匹配）。
 RUN if [ "$ECHO_EXTRA" = "1" ]; then \
         if [ -n "$ECHO_TORCH_VERSION" ]; then \
             pip install "torch==$ECHO_TORCH_VERSION" "torchaudio==$ECHO_TORCH_VERSION" --index-url "$ECHO_TORCH_INDEX" ; \
         else \
-            pip install torch --index-url "$ECHO_TORCH_INDEX" ; \
+            pip install torch torchaudio --index-url "$ECHO_TORCH_INDEX" ; \
         fi \
      && if [ -n "$ECHO_TORCH_VERSION" ]; then \
             pip install funasr transformers --index-url "$ECHO_PIP_INDEX" ; \
@@ -124,6 +148,10 @@ RUN if [ "$ECHO_EXTRA" = "1" ]; then \
                 --index-url "$ECHO_PIP_INDEX" ; \
         fi \
      && python -c "import torch; print('torch', torch.__version__, '| cuda', torch.version.cuda)" \
+     && python -c "import torchaudio; print('torchaudio', torchaudio.__version__)" \
+     && if ! python -c "import sys, torch, torchaudio; t = torch.__version__.split('+')[0]; a = torchaudio.__version__.split('+')[0]; sys.exit(0 if t == a else 1)"; then \
+            echo "ERROR: torchaudio 装不上、或与 torch 不是同一版本 —— 完整档的 funasr / pyannote 都依赖它，症状是容器起来后每个 /v1/asr 都 503 model_failed（torch/torchaudio 的 ABI 对不上）。修法见上面的注释：两者必须同批、同索引、同版本安装。" >&2 ; exit 1 ; \
+        fi \
      && if [ -n "$ECHO_TORCH_VERSION" ]; then \
             python -c "import torch,sys; sys.exit(0 if torch.__version__.startswith('$ECHO_TORCH_VERSION') else 1)" \
             || { echo "ERROR: torch 被后面的依赖改版了（想要 $ECHO_TORCH_VERSION）—— 老卡（Pascal/Volta）会因此跑不起来。请把 funasr/pyannote 那组也钉版本，或用 pip 的 --constraint 锁住 torch。" >&2 ; exit 1 ; } ; \

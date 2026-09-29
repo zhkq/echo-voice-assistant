@@ -3752,13 +3752,25 @@ def meeting_meta(meeting_name: str) -> dict:
 
 
 def delete_meeting(meeting_id):
-    """删除会议：DB 记录 + （可选）音频文件。"""
+    """删除会议：DB 记录 + （可选）音频文件。
+
+    正在录音、**正在转写**的两种会议都拒绝删除，判据与别处**共用一份**：
+      * 录音中：`_state["active"]`（录音器正往这个目录写新段）；
+      * 转写中：`is_transcribing()` = `transcribe_busy_reason()` 的布尔面（库状态 +
+        「刚点过重新转写」的进程内标记两份）。
+    转写中删除的伤害与"重复发起转写"同族：目录/库记录被抽走之后，正在跑的那个转写
+    任务**会继续往半删除的目录里写** `transcript.md` / `meta.json`（写完还没人认）。
+    """
     meeting = db.get_meeting(meeting_id)
     if not meeting:
         return False, "会议不存在"
     name = meeting["name"]
     if _state["active"] and os.path.basename(_state["folder"] or "") == name:
         return False, "该会议正在录音中，不能删除"
+    # 返回形状与上面那条**完全一致**（`(False, 中文原因)` → 接口层 200 + `{ok:false}`），
+    # 不新造第三种结局：这不是 409 那种"请求本身冲突"，而是"现在不能删"。
+    if is_transcribing(name):
+        return False, "该会议正在转写中，不能删除"
     keep_audio = settings.get("meetingKeepRawAudio", True)
     if not keep_audio:
         import shutil

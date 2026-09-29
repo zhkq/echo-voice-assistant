@@ -13,7 +13,7 @@
 `transcript.md` / `meta.json`（`_transcribe_impl` 开头还会 `clear_meeting_lines`
 把对方正在写的转写行清掉）—— 互相覆盖，是最难查的那类错。
 
-这批用例钉四件事：
+这批用例钉五件事：
 
   1. **按会议判重**：这一场在转写 → `retranscribe_meeting()` 抛
      `MeetingTranscribeBusy`、`POST /api/meetings/{mid}/retranscribe` 回 **409**
@@ -23,7 +23,10 @@
   3. **另一场会议不受影响** —— 按会议判重，不是全局禁止（跨会议的并发上限仍由
      既有的 `max_concurrent` 那套管）；
   4. 面板的 `transcribing` 字段由**列表与详情接口**下发（前端按钮禁用读它）。
-     前端那一条在 `tests/test_ia_panel.py::MeetingRetranscribeButtonTests`。
+     前端那一条在 `tests/test_ia_panel.py::MeetingRetranscribeButtonTests`；
+  5. **转写中的那一场也不许被删**（`delete_meeting()`，2026-09-28 同批发现）：
+     判据**复用** `is_transcribing()`（别再造第二份），返回形状与"正在录音不能删"
+     那条一致（`(False, 中文原因)` → 接口层 200 + `{ok:false}`）。
 
 隔离与 `tests/test_meeting_import.py` / `tests/test_meeting_compress.py` 同一套：
 `db.DATA_DIR` / `db.DB_FILE` / `settings._cache` / 凭据文件 / 会议目录全部指向
@@ -340,6 +343,90 @@ class RetranscribeEndpointTests(_GuardCase):
         items = {it["id"]: it for it in self.client.get("/api/meetings").json()["items"]}
         self.assertIn(mid, items)
         self.assertIs(items[mid]["transcribing"], True)
+
+
+# ---------------------------------------------------------------- ④ 转写中不许删
+
+class DeleteWhileTranscribingTests(_GuardCase):
+    """`delete_meeting()` 与上面同一族：**转写中**的那一场不许被删。
+
+    2026-09-28 同批发现：`delete_meeting()` 只拒绝了"正在录音"，转写中照样删 ——
+    目录与库记录被抽走，而正在跑的那个转写任务会继续往**半删除的目录**里写
+    （`transcript.md` / `meta.json`），写完还没人认。
+
+    判据**复用** `is_transcribing()`（= 库状态 + 「刚点过重新转写」的进程内标记），
+    所以两条判据各钉一遍；另外两条防"拦过头"与"改动把录音那条挤掉"。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        from app.api import router
+        api = FastAPI()
+        api.include_router(router)
+        cls.client = TestClient(api)
+
+    def test_a_transcribing_meeting_is_not_deleted(self):
+        """**这条就是 bug 的回归**：库状态那一半（`stop_meeting` / `import_meeting`
+        起的自动转写只写库状态，不进进程内标记）。
+
+        `meetingKeepRawAudio=False` 时删除会 `rmtree` 整个会议目录，所以这里把
+        "库记录还在"与"目录/音频段还在"一起钉住 —— 只看返回值的话，"返回了 False
+        但文件已经被抽走"正是要防的那种假拦截。
+        """
+        mid, _name, folder = self.make_meeting(status="transcribing")
+        with patch.object(settings, "get",
+                          lambda key, default=None: False if key == "meetingKeepRawAudio" else default):
+            ok, msg = meeting.delete_meeting(mid)
+        self.assertFalse(ok, "转写中的会议不许删")
+        self.assertEqual(msg, "该会议正在转写中，不能删除")
+        self.assertIsNotNone(db.get_meeting(mid), "被拒绝的删除不许动库记录")
+        self.assertTrue(os.path.isdir(folder), "被拒绝的删除不许抽走会议目录")
+        self.assertTrue(os.path.exists(os.path.join(folder, "01.wav")),
+                        "被拒绝的删除不许删掉音频段")
+
+    def test_the_in_process_marker_alone_also_blocks(self):
+        """另一半判据：刚点过「重新转写」、后台线程还没轮到改库的那段空档也不能删。"""
+        mid, name, _folder = self.make_meeting(status="transcribed")
+        with meeting._retranscribing["lock"]:
+            meeting._retranscribing["set"].add(name)
+        ok, msg = meeting.delete_meeting(mid)
+        self.assertFalse(ok)
+        self.assertEqual(msg, "该会议正在转写中，不能删除")
+        self.assertIsNotNone(db.get_meeting(mid))
+
+    def test_a_recording_meeting_is_still_blocked(self):
+        """回归：既有的"正在录音不能删"那条判据不许被新加的一条挤掉（两条并存）。"""
+        mid, _name, folder = self.make_meeting(status="recording")
+        meeting._state["active"] = True
+        meeting._state["folder"] = folder
+        self.addCleanup(meeting._state.update, {"active": False, "folder": None})
+        ok, msg = meeting.delete_meeting(mid)
+        self.assertFalse(ok)
+        self.assertEqual(msg, "该会议正在录音中，不能删除")
+        self.assertIsNotNone(db.get_meeting(mid))
+
+    def test_a_transcribed_meeting_is_still_deletable(self):
+        """别拦过头：没在转写的会议照旧能删（`(True, "已删除")`，库记录真的没了）。"""
+        mid, _name, _folder = self.make_meeting(status="transcribed")
+        ok, msg = meeting.delete_meeting(mid)
+        self.assertTrue(ok, msg)
+        self.assertEqual(msg, "已删除")
+        self.assertIsNone(db.get_meeting(mid))
+
+    def test_the_endpoint_keeps_the_business_failure_shape(self):
+        """接口面与"正在录音不能删"**同一种结局**：200 + `{ok:false, message}`。
+
+        不是 409 —— 409 那条语义留给"重复发起转写"那种请求冲突（见上面那个异常类），
+        "现在不能删"沿用既有的业务失败形状，不悄悄改契约。
+        """
+        mid, _name, _folder = self.make_meeting(status="transcribing")
+        r = self.client.delete("/api/meetings/%d" % mid)
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json(), {"ok": False, "message": "该会议正在转写中，不能删除"})
+        self.assertIsNotNone(db.get_meeting(mid), "被拒绝的删除不许动库记录")
 
 
 if __name__ == "__main__":

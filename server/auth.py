@@ -84,6 +84,34 @@ def new_secret() -> str:
     return secrets.token_urlsafe(32)
 
 
+#: 消费一张配对码时写进审计的动作名。
+#: **只在这里定义一次**：写的那一侧（`redeem()`）与要看它的那一侧（管理面「存了什么」
+#: 页签里那张审计表）从同一个字面量读 —— 写成 `pair-redeem` / `pair_redeem` 两份，
+#: 历史那一栏会永远是空的，而且看不出原因。
+PAIR_REDEEM_ACTION = "pair-redeem"
+
+
+def pairing_code_expired(row: Optional[Dict[str, Any]], now: Optional[float] = None) -> bool:
+    """这张配对码过期了吗 —— **全仓唯一一份判据**。
+
+    为什么要有这么一个三行的函数：这个判据至少有两个使用者 ——
+
+    * `Auth.redeem()`（`/v1/pair` 那一侧）：过期就不许兑；
+    * `ops.pending_pairing_codes()`（管理面「待用的配对码」与命令行 `--list-codes`
+      共用的那一个整理函数）：过期的**根本不列出来**。
+
+    两边各写一遍 `expires_at < time.time()` 看起来无害，但边界会漂：一处写 `<`、
+    另一处写 `<=`，同一张码就会"列表说还能用、兑的时候说已过期"。
+    那份清单的公信力就靠这一类细节，所以判据只留一份。
+
+    **边界语义**：`expires_at == now` 那一刻**仍然能用**（判据是 `<`，不是 `<=`）。
+    2026-09-29 用户实测的 bug 就是这张清单：过期的码被列在「待用」表里、徽章还写着
+    「已过期」—— 标题与内容自相矛盾。
+    """
+    now = time.time() if now is None else float(now)
+    return float((row or {}).get("expires_at") or 0) < now
+
+
 # ---------------------------------------------------------------- 客户端缓存
 
 class _Cached:
@@ -442,9 +470,11 @@ class Auth:
         row = self.store.take_pairing_code(hash_pairing_code(normalized))
         if row is None:
             raise errors.unauthorized("配对码无效、已被使用，或服务端压根没发过它")
-        if float(row.get("expires_at") or 0) < time.time():
+        if pairing_code_expired(row):
             # 已删除，所以这条其实很难走到（take 已经把行取走了）；
             # 留着是为了"以后改成软删除"时语义不变。
+            # 判据与「待用的配对码」那张清单一字不差（同一个函数）—— 列表说能用、
+            # 这里说已过期，是同一张码给出两个答案，属于 bug。
             raise errors.unauthorized("配对码已过期")
         cid = new_client_id()
         secret = new_secret()
@@ -459,6 +489,21 @@ class Auth:
         fetched = self.store.client(cid)
         if fetched:
             self.cache.put(fetched)
+        # 消费的**留痕**：这张码在 `take_pairing_code()` 里已经删掉了（"用掉即删"，
+        # 所以它不会、也不该出现在「待用的配对码」那张表里）。于是"这张码去哪了"
+        # 只能从审计里回答 —— 记下"谁发的码 / 码上带的名字 / 换出了哪个客户端"。
+        #
+        # 操作者写成 `pair:<发放者>`：这是**客户端自己**兑走的，不是某个管理员的动作，
+        # 而 `admin_audit` 只有四列（设计 §8.5，不加列）—— 用这个前缀把两类事件分开，
+        # 面板上那张审计表里一眼能认出哪一条不是人点的。
+        # **只记成功**：猜码 / 用过 / 过期都不记 —— 那是免凭据端点，记了就等于
+        # 给扫描器一个免费存储（同一理由见 `admin.audit_write` 那条注释）。
+        # 写不进去**不许**把一次已经成功的配对变成 500：客户端会重试，于是多配一次。
+        try:
+            self.store.audit("pair:" + (str(row.get("created_by") or "") or "-"),
+                             PAIR_REDEEM_ACTION, "%s | %s" % (name, cid))
+        except Exception:                                      # pragma: no cover - 兜底
+            pass
         return {"clientId": cid, "secret": secret, "name": name,
                 "scopes": scopes.split(),
                 "serverName": str(self.cfg.get("server.id", "")),

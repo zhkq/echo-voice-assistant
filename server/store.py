@@ -17,6 +17,12 @@
 | `clients` | 客户端注册与凭据（secret 只存哈希） |
 | `pairing_codes` | 待用的配对码（**用掉即删**） |
 
+> 上面那两句是 v1 的原文。2026-09-24 起按设计 §8.5 又落了 `calls`（请求元数据）
+> 与 `admin_users` / `admin_audit`（管理面账号与动作审计），2026-09-29 落了
+> `server_limits`（**这台后端自己的运行参数**：总并发 / 每客户端并发 / 队列上限，
+> 见 `server/limits.py`）。**唯一一份活清单是 `TABLE_WHITELIST`**，
+> 加表加列都要先想一想"这算不算内容"。
+
 设计 §8.5 的白名单里还有 `admin_users` / `calls` / `calls_rollup` / `model_events` /
 `admin_audit`，那是管理面与统计落地时才建的（v2/v3）。这里是**子集**，不是另一份清单 ——
 所以 `tests/test_server_contract.py::AuthSchemaTests` 同时钉两件事：
@@ -45,7 +51,12 @@ from typing import Any, Dict, List, Optional
 #: `calls` 是 2026-09-24 按设计加进来的（审计元数据，设计 §7.3 逐字定义了那十列）。
 #: `admin_users` / `admin_audit` 是同一天做管理面时加的（设计 §8.4 那五个页签要一个
 #: 管理员账号体系；审计动作表本来就在白名单里）。
-TABLE_WHITELIST = ("clients", "pairing_codes", "calls", "admin_users", "admin_audit")
+#: `server_limits` 是 2026-09-29 加的（用户要求"并发上限能在管理面里由管理员配、
+#: 不用改环境变量也不用重启"）—— 它是**第三类**：前两类是"关于客户端的管理数据"与
+#: "关于请求的元数据"，而这一张是**这台后端自己怎么跑**（总并发 / 每客户端并发 /
+#: 队列上限）。加表本来要走 §8.5 那道评审门，这一轮就是那次评审。
+TABLE_WHITELIST = ("clients", "pairing_codes", "calls", "admin_users", "admin_audit",
+                   "server_limits")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS clients (
@@ -116,6 +127,19 @@ CREATE TABLE IF NOT EXISTS admin_audit (
     target TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_admin_audit_ts ON admin_audit(ts);
+-- 服务端**自己的运行参数**（2026-09-29）：总并发 / 每客户端并发 / 队列上限。
+-- 为什么落库：这三个值的权威来源必须能**越过环境变量**（compose 默认就设了
+-- `ECHO_MAX_CONCURRENT`，否则"管理面里改了却不生效"），而要让权威值在
+-- **重启之后还在**，就只能落在 state 卷的这个库里（`tmp` 是会被清掉的）。
+-- 为什么不是"又一张客户端表"：它与客户端、与单次请求都无关 —— 它是"这台后端怎么跑"，
+-- 所以列名只有 `name`/`value`/`updated_at`/`updated_by`，没有任何业务概念。
+-- **只放运行参数**（见 `server/limits.py` 的那份清单），别把一般配置项搬进来。
+CREATE TABLE IF NOT EXISTS server_limits (
+    name       TEXT PRIMARY KEY,
+    value      INTEGER NOT NULL DEFAULT 0,
+    updated_at REAL NOT NULL DEFAULT 0,
+    updated_by TEXT NOT NULL DEFAULT ''
+);
 """
 
 #: `CREATE TABLE IF NOT EXISTS` 对**已经存在**的表不会补列 ——
@@ -489,6 +513,33 @@ class Store:
             rows = self._db.execute("SELECT * FROM admin_audit ORDER BY ts DESC LIMIT ?",
                                     (limit,)).fetchall()
         return [dict(r) for r in rows]
+
+    # ---------------------------------------------------------------- 运行参数（§8.5）
+
+    def limit_overrides(self) -> List[Dict[str, Any]]:
+        """管理面配过的运行参数（`{name, value, updated_at, updated_by}`）。
+
+        **空表 = 从没配过** —— 这时总并发等值走环境变量 / 出厂默认
+        （谁是权威值见 `server/limits.py` 开头的优先级表）。
+        """
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT name, value, updated_at, updated_by FROM server_limits"
+                " ORDER BY name").fetchall()
+        return [dict(r) for r in rows]
+
+    def set_limit_overrides(self, values: Dict[str, int], updated_by: str = "") -> None:
+        """整批写入运行参数（值由调用方 `limits.parse()` 校验过，这里**不重复校验**）。"""
+        now = time.time()
+        with self._lock:
+            for name, value in (values or {}).items():
+                self._db.execute(
+                    "INSERT INTO server_limits (name, value, updated_at, updated_by)"
+                    " VALUES (?,?,?,?)"
+                    " ON CONFLICT(name) DO UPDATE SET value=excluded.value,"
+                    " updated_at=excluded.updated_at, updated_by=excluded.updated_by",
+                    (str(name), int(value), now, str(updated_by or "")))
+            self._db.commit()
 
     # ---------------------------------------------------------------- 配对码
 

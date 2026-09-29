@@ -161,12 +161,35 @@ def revoke_pairing_code(store, code_id: str) -> Dict[str, Any]:
 
 
 def pending_pairing_codes(store, now: Optional[float] = None) -> list:
-    """待用码清单（给管理面）。**明文永远不在这里** —— 库里只有哈希。"""
+    """**待用 = 真正可用**：只列「未消费 **且** 未过期」的码。
+
+    **这一份清单是两个出口共用的**（管理面 `GET /admin/api/pairing-codes` 与命令行
+    `--list-codes`）—— 两边各自写一遍判据的话，"剩余多久 / 谁发的"迟早对不上。
+
+    两个条件分别是怎么落地的：
+
+    * **未消费**：结构性的，不需要在这里再判一次 —— `store.take_pairing_code()`
+      在 `/v1/pair` 兑换成功的那一刻就把那一行**删掉**（"用掉即删"，设计 §8.5）。
+      也就是说"已用过的码留在待用表里"这件事**不可能**来自这张表。
+      消费的留痕在审计里（`auth.PAIR_REDEEM_ACTION`），**不**在这张表里。
+    * **未过期**：必须在这里过滤（2026-09-29 用户实测的 bug）。过期的码本来就有
+      "下一次发码顺手清理"（`ops.issue_pairing_code` 里那一步），但那一步只在**发码**
+      时发生 —— 一张 13:25 到期的码，如果之后没人再发码，它会一直挂在表里，
+      而"剩余"那一列渲染出来就是「已过期」/「剩余 0.0 分钟」：
+      **标题写着「待用」、内容写着「已过期」，自相矛盾**。
+      判据只有一份：`auth.pairing_code_expired()`（`Auth.redeem()` 用的是同一个），
+      所以"列表里说还能用"与"兑换时认不认"永远是同一个答案。
+
+    `remainingSeconds` **最少报 1 秒**（不报 0）：列出来的码一定还能用，而 0 会让
+    页面按"已过期"渲染（`left(0)` 那个分支）—— 又是同一处自相矛盾。
+    """
     if store is None:
         return []
     now = time.time() if now is None else float(now)
     out = []
     for r in store.pairing_codes():
+        if auth_mod.pairing_code_expired(r, now):
+            continue                       # 过期的不进"待用"（留着由下次发码清理）
         left = float(r.get("expires_at") or 0) - now
         out.append({
             "id": str(r.get("code_hash") or ""),
@@ -175,8 +198,11 @@ def pending_pairing_codes(store, now: Optional[float] = None) -> list:
             "createdBy": str(r.get("created_by") or ""),
             "createdAt": float(r.get("created_at") or 0),
             "expiresAt": float(r.get("expires_at") or 0),
-            "remainingSeconds": max(0, int(left)),
-            "expired": left <= 0,
+            "remainingSeconds": max(1, int(left)),
+            # 这个字段现在**恒为 False**（过期的已经被上面那行滤掉了）。
+            # 留着是为了不破坏两个出口读它的既有约定（页面的徽章分支），
+            # 而且"列出来的一定没过期"这件事在响应里是**明说**的，不靠调用方自己推。
+            "expired": False,
         })
     return out
 

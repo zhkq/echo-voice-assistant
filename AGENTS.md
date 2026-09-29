@@ -28,6 +28,49 @@
   —— 它会把自启动指回仓库（这正是被替换掉的那个耦合）。
 - 现状以 `scripts\switch-instance.ps1 -Status` 与 `GET /api/status` 为准，不要凭记忆。
 
+### 远程部署的坑（SSH 喂脚本 / `docker build` / 管理员口令与 scopes）（2026-09-28 两台真机实测）
+
+- **① PowerShell 往 ssh 的 stdin 喂多行脚本时，CR 只会落在最后一行。**
+  * **症状**：最后一行恰好是一条关键命令时报**文件名里带 `\r`** 的诡异错误 ——
+    `python3 x.py\r: No such file or directory`（看着像文件不存在，其实文件在）。
+  * **根因**：PowerShell 的换行是 CRLF，而 `bash -s` 只把**最后一行**的那个 CR 留在了行内，
+    于是 `\r` 成了文件名/参数的一部分。
+  * **铁律**：脚本最后一行放一条**无害命令**（如 `echo ok`），或整体 `sed -i 's/\r$//'` 清一遍。
+- **② 后台进程会吃掉脚本剩余的 stdin。**
+  * **症状**：在 `bash -s` 里用 `nohup … &` 起了后台任务之后，**后续行被那个进程读走** ——
+    表现为 `sed` / `tail` 报出莫名其妙的"文件不存在"，而脚本本身看不出错。
+  * **根因**：后台进程继承了同一个 stdin（那个管道/heredoc），把剩下的脚本内容当自己的输入读了。
+  * **铁律**：后台任务一律 `< /dev/null`，并 `setsid` 脱离会话 —— 否则远端 SSH 一断，
+    `docker build` 会被取消（报 `context canceled`）。
+- **③ `docker build` 必须在服务端脱离会话跑。**
+  * **症状**：SSH 一断，构建就是 `context canceled`。
+  * **铁律**：`setsid nohup docker build … < /dev/null > build.log 2>&1 &`，
+    另开会话 `tail -f build.log`（与②是同一条纪律的两个面：stdin 要断、会话要脱）。
+- **④ `cfg.state_root` 是属性，不是方法。**
+  * **症状**：写成 `cfg.state_root()` 报 `'str' object is not callable`。
+  * **根因**：它是**已经算好的字符串属性**（属性名不带括号）。
+  * **铁律**：写 `cfg.state_root`；不确定就先看定义或 `type()`，别凭手感加括号。
+- **⑤ 容器根只读时 `docker cp` 必失败。**
+  * **症状**：`docker cp` 报 `rootfs is marked read-only`。
+  * **根因**：`read_only: true` 下容器根不可写，cp 的落点写不进去（与"根只读"是同一个约束）。
+  * **铁律**：要把文件送进容器，走**可写的 tmp 卷**（`/var/echo/tmp`）或打一个薄镜像层。
+- **⑥ `unzip` 不保证存在。**
+  * **症状**：单位那台 Ubuntu 上 `unzip` 直接 `command not found`。
+  * **铁律**：改用 `python3 -c 'import zipfile;zipfile.ZipFile("x.zip").extractall(".")'`。
+- **⑦ CLI 改管理员口令后，运行中的服务不一定立刻认（只记录观察到的事实，根因**还没**定位）。**
+  * **观察**：重置口令后**立刻登录仍 401**；**重启容器也仍 401**；
+    但**容器内直接打登录接口是 200**。
+  * **不要下结论**（说"缓存"或别的都还没有证据）—— 谁定位到根因谁来补这一条。
+  * **跨进程验证登录时要注意的坑**：curl 不带**同站 Origin** 等前置时，请求会在"登录"之前
+    就被同站校验挡掉，那个 401 与"口令不对"不是一回事，别把两者当同一个结论。
+- **⑧ 管理员口令 / Client scopes 的实操要点。**
+  * **症状**：给同事发配对码时 scopes 少写一项（例如漏 `diarize`）→ 客户端那个槽
+    `forbidden` → **回落本机**跑 —— 用户看到"有分离结果"，其实是**本机算的**
+    （后端根本没参与，最容易误判成"后端能用"）。
+  * **根因**：服务端按 scopes 授权，缺一项就拒那一档；客户端把它当"这档不可用"并回落本机。
+  * **铁律**：发码时按用途**写全** scopes；改 scopes 的写法是
+    `--set-scopes <CLIENT> --scopes a,b`（scopes 走**独立**的 `--scopes`，别和别的项混写）。
+
 ### PowerShell 5.1 的 Get-Content/Set-Content 往返会**毁掉 UTF-8 中文文件**（2026-09-26 事故）
 
 - **症状**：`(Get-Content x -Raw) -replace ... | Set-Content x -Encoding UTF8` 之后，文件里每个汉字都变成

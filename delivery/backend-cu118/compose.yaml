@@ -54,6 +54,16 @@ services:
       ECHO_MODELS_ROOT: "${ECHO_MODELS_ROOT:-/opt/echo/models}"
       ECHO_TMP_ROOT: "${ECHO_TMP_ROOT:-/var/echo/tmp}"
       ECHO_STATE_ROOT: "${ECHO_STATE_ROOT:-/var/echo/state}"
+      # ⚠️ **SenseVoice 还依赖一个"按模型名"加载的 VAD 模型**（`app/audio/stt.py` 传的
+      #    `vad_model="fsmn-vad"`）：funasr 会去 ModelScope **现拉**它，而根文件系统是
+      #    `read_only: true` —— 默认落点 `~/.modelscope` / `~/.cache/modelscope` 都写不了
+      #    （报 `[Errno 30] Read-only file system`）→ SenseVoice 加载直接失败 →
+      #    **每个 `/v1/asr` 都 model_failed，而 `/v1/health` 照样绿**（所以很难发现）。
+      #    2026-09-27 在 GTX 1070 上实测。这两个变量 + 下面那个 cache 卷就是解药。
+      #    缓存**不能塞进 tmp 卷**：那样 `/v1/health` 的 `tmp.files/bytes` 会恒不为 0，
+      #    而"空转时归零"正是泄漏判据。写法与注释口径同 `server/compose.yaml`。
+      MODELSCOPE_CACHE: "/var/echo/cache"
+      HOME: "/var/echo/cache"
       # 总通道数（出厂 2）。老卡上 SenseVoice 显存小，但算力也弱 —— 按真机压测校准。
       ECHO_MAX_CONCURRENT: "${ECHO_MAX_CONCURRENT:-2}"
       # 鉴权：一上网就必须打开（不打开 = 谁连上谁能用这块 GPU）。
@@ -81,6 +91,10 @@ services:
       # **耐久**状态：鉴权库（客户端凭据 / 配对码 / 审计）。别换 tmpfs、别和上面那个合并，
       # 丢了就要把所有客户端重新配对一遍。
       - ${ECHO_HOST_STATE_DIR:-/srv/echo/state}:${ECHO_STATE_ROOT:-/var/echo/state}
+      # ModelScope 的**运行期缓存**（SenseVoice 的 VAD 模型按需拉到这里，见上面那两行
+      # 环境变量）。属于"可以丢"：丢了下次加载模型会重下（约 1.7 MB），不影响鉴权 ——
+      # 但**不能并进 tmp 卷**（理由见上面）。宿主路径在 .env 的 ECHO_HOST_CACHE_DIR。
+      - ${ECHO_HOST_CACHE_DIR:-/srv/echo/cache}:/var/echo/cache
       # 本变体的配置（显存预算 + 模型清单）
       - ./server.yaml:/etc/echo/server.yaml:ro
     read_only: true

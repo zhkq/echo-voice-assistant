@@ -42,9 +42,15 @@ server:
     keyfile: ""           # 例如 /etc/echo/tls/server.key
 
 limits:
-  # 2026-09-23 定：总通道 2、每客户端 1。
+  # 出厂：总通道 **6**、每客户端 1（2026-09-23 定 2；2026-09-29 用户要求提到 6）。
   # **不排队** —— 满了直接拒（503 server_busy），重试由客户端负责。
-  max_concurrent: 2
+  #
+  # ⚠️ 这三个值的**权威来源是管理面**（管理员在「性能」页签的「运行参数」里改）：
+  #    管理面配置 > 环境变量（`ECHO_MAX_CONCURRENT` 等）> 本文件 / 出厂默认。
+  #    管理面改过的值落在 state 卷的库里，重启后仍然覆盖环境变量 ——
+  #    这是有意的（不然 compose 里那个 `ECHO_MAX_CONCURRENT` 会让页面上的改动静默失效）。
+  #    按卡校准：8 GB 卡上 6 路长音频会互相挤显存，要下调就在管理面里改（不用重启）。
+  max_concurrent: 6
   per_client_concurrent: 1
   queue_max: 0
   busy_retry_after_s: 5

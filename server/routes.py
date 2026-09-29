@@ -34,27 +34,58 @@ router = APIRouter(prefix="/v1")
 # ---------------------------------------------------------------- 并发闸门
 
 class Admission:
-    """两级闸门。**不排队** —— 拿不到就立刻按类型拒。"""
+    """两级闸门。**不排队** —— 拿不到就立刻按类型拒。
 
-    def __init__(self, max_concurrent: int, per_client: int, retry_after: int = 5):
+    ## 上限**每次现读**，不在构造时缓存
+
+    2026-09-29 起总并发能在管理面上改（`server/limits.py`），所以这里的两个上限
+    必须**每次都读当前值**：构造时抓一个整数，等于"改完要重启才生效"，
+    而需求正是"不用重启"。`limits_of` 就是那个"现读"的接缝（默认没有 → 用构造参数，
+    单测直接 `Admission(2, 1)` 时行为与以前一致）。
+
+    为什么**去掉**了 `threading.BoundedSemaphore`：信号量的容量在构造时就固定了，
+    上限改小/改大它都不会跟着变 —— 那样会出现两把尺子（一个是配置、一个是信号量），
+    而"配置说 1、信号量还有 3 个许可"这种漂移查起来极贵。改成在 `_lock` 里
+    **检查 + 占位一步做完**（本来就该如此）：判定与计数在同一个临界区，
+    既原子又能现读。
+    """
+
+    def __init__(self, max_concurrent: int, per_client: int, retry_after: int = 5,
+                 limits_of=None):
         self.max_concurrent = max(1, int(max_concurrent))
         self.per_client = max(1, int(per_client))
         self.retry_after = int(retry_after)
-        self._sem = threading.BoundedSemaphore(self.max_concurrent)
+        #: 现读上限的接缝：返回 `{"max_concurrent": n, "per_client_concurrent": n}`
+        #: （`routes.State` 传的是"读 cfg"的那个 lambda）。None = 用上面两个参数。
+        self._limits_of = limits_of
         self._lock = threading.Lock()
         self._per: dict = {}
         self._active = 0
 
+    def current(self) -> tuple:
+        """此刻生效的 `(总通道, 每客户端)`。**每次判定都调它，不缓存。**"""
+        got = None
+        if self._limits_of is not None:
+            try:
+                got = self._limits_of() or {}
+            except Exception:                                  # pragma: no cover - 兜底
+                got = None
+        if not got:
+            return (self.max_concurrent, self.per_client)
+        try:
+            return (max(1, int(got.get("max_concurrent", self.max_concurrent))),
+                    max(1, int(got.get("per_client_concurrent", self.per_client))))
+        except (TypeError, ValueError):
+            return (self.max_concurrent, self.per_client)
+
     @contextmanager
     def hold(self, client_id: str):
         with self._lock:
-            self._check_locked(client_id)
+            top, per = self.current()
+            self._check_locked(client_id, top, per)
+            # **检查与占位在同一个临界区里完成** —— 中途松手就会出现
+            # "两个请求都通过了检查、各自 +1"的超发。这也是以前那个信号量的职责。
             self._per[client_id] = self._per.get(client_id, 0) + 1
-        if not self._sem.acquire(blocking=False):
-            with self._lock:
-                self._per[client_id] = max(0, self._per.get(client_id, 1) - 1)
-            raise errors.server_busy(self.retry_after)
-        with self._lock:
             self._active += 1
         try:
             yield
@@ -62,20 +93,18 @@ class Admission:
             with self._lock:
                 self._active = max(0, self._active - 1)
                 self._per[client_id] = max(0, self._per.get(client_id, 1) - 1)
-            self._sem.release()
 
-    def _check_locked(self, client_id: str) -> None:
+    def _check_locked(self, client_id: str, top: int, per: int) -> None:
         """**只判、不占**。必须在持 `_lock` 时调用。
 
         用自己维护的 `_active` 而不是去读 `BoundedSemaphore._value` ——
         后者是 CPython 的私有实现细节，不该被我们依赖。
-        `_active` 在拿到信号量之后、释放信号量之前于锁内加减，
-        所以在任何一个静止点上它就是"此刻占着几个通道"。
+        `_active` 在锁内加减，所以在任何一个静止点上它就是"此刻占着几个通道"。
         """
-        if self._per.get(client_id, 0) >= self.per_client:
+        if self._per.get(client_id, 0) >= per:
             # 先查客户端自己：这条**重试没用**，所以给 409 而不是 503
             raise errors.client_busy()
-        if self._active >= self.max_concurrent:
+        if self._active >= top:
             raise errors.server_busy(self.retry_after)
 
     def precheck(self, client_id: str) -> None:
@@ -92,12 +121,14 @@ class Admission:
         那条路径照旧按 `client_busy` / `server_busy` 拒。**权威判定始终在 `hold`。**
         """
         with self._lock:
-            self._check_locked(client_id)
+            top, per = self.current()
+            self._check_locked(client_id, top, per)
 
     def snapshot(self) -> dict:
         with self._lock:
-            return {"active": self._active, "maxConcurrent": self.max_concurrent,
-                    "perClientConcurrent": self.per_client}
+            top, per = self.current()
+            return {"active": self._active, "maxConcurrent": top,
+                    "perClientConcurrent": per}
 
 
 # ---------------------------------------------------------------- 应用状态
@@ -122,6 +153,10 @@ class State:
             max_concurrent=cfg.max_concurrent,
             per_client=cfg.per_client_concurrent,
             retry_after=int(cfg.get("limits.busy_retry_after_s", 5)),
+            # **现读**（不是构造时缓存）：管理面改完存进同一个 `cfg`，
+            # 于是下一个请求就按新上限判 —— 不用重启容器（见 `server/limits.py`）。
+            limits_of=lambda: {"max_concurrent": cfg.max_concurrent,
+                               "per_client_concurrent": cfg.per_client_concurrent},
         )
         # 每日音频分钟数（设计 §7.2）。**进程内计数**：每请求查库会把库变成瓶颈，
         # 而配额判断正好在每个请求的最前面。代价（多实例各算一份）写在 quota.py 开头。
@@ -311,8 +346,12 @@ def capabilities(request: Request):
         "limits": {
             "maxAudioSeconds": float(cfg.get("limits.max_audio_seconds", 1800)),
             "maxUploadBytes": int(cfg.get("limits.max_upload_bytes", 0)),
+            # 这三个**每次请求都从 cfg 现读**：管理面改完立刻反映在这里
+            # （见 `server/limits.py` 与 `Admission.current`）。
             "maxConcurrent": cfg.max_concurrent,
             "perClientConcurrent": cfg.per_client_concurrent,
+            # ⚠️ `queueMax` 目前**只有宣告、没有执行者**：v1 服务端不排队（设计 §3.6），
+            # 通道满了直接 `503 server_busy`。把它配成 > 0 不会真的开始排队。
             "queueMax": int(cfg.get("limits.queue_max", 0)),
             # 全局的每日音频分钟数（0 = 不限）。**只给全局值**：这个端点免凭据，
             # 拿不到客户端身份，也就不能说"你个人还剩多少" —— 那会泄露别人的用量。

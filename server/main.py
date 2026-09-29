@@ -24,6 +24,7 @@ from server import admin as admin_mod
 from server import auth as auth_mod
 from server import calls as calls_mod
 from server import errors as E
+from server import limits as limits_mod
 from server import ops as ops_mod
 from server import routes as routes_mod
 from server import settings as settings_mod
@@ -85,6 +86,22 @@ def create_app(cfg=None) -> FastAPI:
         # 鉴权元数据的库（设计 §8.5 的两张表）。**即使 auth.enabled=false 也开** ——
         # 管理面生成配对码时要用它，而"先关鉴权把库开起来"是正常的起步顺序。
         store = auth_mod.open_store(cfg)
+        # 运行参数（总并发 / 每客户端并发 / 队列上限）的**管理面配置**（2026-09-29）。
+        # 必须在能力面开始收请求之前应用：`State` 造出来之后闸门与 `/v1/capabilities`
+        # 现读的就是这份 `cfg`，而"管理面配置 > 环境变量 > 出厂默认"这条优先级
+        # 全靠这几行（见 `server/limits.py`）。
+        try:
+            over = limits_mod.apply_stored(cfg, store)
+        except Exception as e:                                 # pragma: no cover - 兜底
+            over = {}
+            log.warning("管理面配置的运行参数读不出来（按环境变量 / 出厂默认跑）：%s", e)
+        if over:
+            log.info("运行参数以**管理面配置**为准：%s（存在 state 卷，改它去管理面"
+                     "「性能」页签的「运行参数」）",
+                     "、".join("%s=%s" % (limits_mod.BY_KEY[k]["api"], v)
+                               for k, v in sorted(over.items())))
+        for note in limits_mod.priority_notes(cfg, store):
+            log.info("%s", note)
         auth_obj = auth_mod.Auth(cfg, store)
         # 跨进程撤销的发现机制（设计 §7.5 ④）。**命令行 `--revoke` 是另一个进程**，
         # 没有它的话，跑着的服务会继续接受已撤销的 JWT 直到缓存自己过期。
@@ -265,6 +282,18 @@ def _fmt_time(ts) -> str:
     return "-" if ts <= 0 else time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
 
 
+def _fmt_remaining(seconds) -> str:
+    """剩余时间：**不到 1 分钟就报秒**。
+
+    "0.0 分钟"看着像"这张码已经不能用了"，而 `--list-codes` 里列出来的每一张都还能用
+    （`ops.pending_pairing_codes()` 已经把过期的滤掉了）—— 2026-09-29 用户实测时
+    在 .30 上看到的就是一行"剩余 0.0 分钟"，那是**过期**的行摆在"待用"表里。
+    现在那些行不再出现；剩下可能出现的 0.x 分钟就如实报秒，不再有二义。
+    """
+    sec = int(seconds or 0)
+    return ("%d 秒" % sec) if sec < 60 else ("%.1f 分钟" % (sec / 60.0))
+
+
 def _print_pairing(code, cfg, name: str = "", scopes: str = "") -> None:
     """打印配对码与那一整串 `echo://pair?…`。
 
@@ -374,16 +403,19 @@ def _admin_cli(cfg, args) -> int:
             return 0
         if args.list_codes:
             # 与管理面「待用码」那一页共用同一个整理函数（`ops.pending_pairing_codes`）——
-            # 否则两边对"剩余多久 / 谁发的"会有两套算法。
+            # 两个出口**同一份判据**：只有「未消费 且 未过期」的码会出现在这里。
+            # 所以这里不会再出现"剩余 0.0 分钟"的行（那以前是过期码的样子）。
             rows = ops_mod.pending_pairing_codes(store)
             if not rows:
                 print("（没有待用的配对码）")
             for r in rows:
-                print("%-10s 剩余 %5.1f 分钟  名字=%-16s scopes=%-16s 由 %s 发" % (
-                    "(哈希)", r["remainingSeconds"] / 60.0, r["name"] or "(对端自报)",
+                print("%-10s 剩余 %-9s 名字=%-16s scopes=%-16s 由 %s 发" % (
+                    "(哈希)", _fmt_remaining(r["remainingSeconds"]),
+                    r["name"] or "(对端自报)",
                     r["scopes"] or "(不限)", r["createdBy"] or "-"))
             if rows:
                 print("注：配对码**只存哈希**，所以这里看不到明文 —— 明文只在生成时出现过一次。")
+                print("注：用掉/过期的码不在这张表里；用掉的留痕在审计里（pair-redeem）。")
             return 0
         if args.show_client:
             return _show_client(store, args.show_client)

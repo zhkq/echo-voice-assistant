@@ -80,7 +80,8 @@
   <div class="card">
     <h2>ECHO 能力后端 · 管理面</h2>
     <div class="muted" style="font-size:12px">
-      模型、客户端、调用与「存了什么」，以及<b>发授权 / 禁用 / 撤销 / 改权限与配额 / 轮换 secret</b>。
+      模型、客户端、调用与「存了什么」，以及<b>发授权 / 禁用 / 撤销 / 改权限与配额 / 轮换 secret /
+      运行参数（并发·队列，改完立刻生效）</b>。
       写动作要登录，且只在<b>本站页面</b>里能发（跨站请求一律 403）。
     </div>
     <input id="u" placeholder="管理员用户名" autocomplete="username">
@@ -98,6 +99,7 @@
     <span class="sub" id="hdr"></span>
     <span class="spacer"></span>
     <span class="sub" id="who"></span>
+    <button id="btnPwd">修改口令</button>
     <button id="btnReload">刷新</button>
     <button id="btnLogout">登出</button>
   </header>
@@ -148,6 +150,10 @@ let CSRF = "";
 /* 「只显示这一次」的东西（新 secret / 新配对串）只活在这个变量里：
    刷新页面 = 变量没了 = 不再回显。后端也不会再给（库里只有哈希）。 */
 let ONCE = null;
+/* 改口令的策略（位数上下限）。**由 `/admin/api/admins` 带下来**（那就是权威那份，
+   见 `server/admin.py` 的 `MIN_PASSWORD_LEN`）；这里的初值只是"还没读到"时的兜底，
+   页面拿它做**提前提示**，真正的判定在服务端。 */
+let PWD = { minLength: 8, maxLength: 200 };
 
 async function api(path, opts = {}) {
   const res = await fetch(path, { credentials: "same-origin", ...opts });
@@ -194,7 +200,11 @@ const ago = (ts) => {
 const ts = (v) => (Number(v || 0) ? new Date(Number(v) * 1000).toLocaleString() : "—");
 const left = (sec) => {
   sec = Number(sec || 0);
+  // 后端只把「还能用」的码放进这张表（未用过、未过期），而且 remainingSeconds 最少报 1 ——
+  // 所以这里的"已过期"分支只是**防身**（万一某张码在响应与渲染之间到期），
+  // 正常路径上不会出现"徽章写着已过期、行却列在待用表里"。不到 1 分钟如实报秒。
   if (sec <= 0) return '<span class="badge off">已过期</span>';
+  if (sec < 60) return sec + " 秒";
   return sec < 3600 ? Math.ceil(sec / 60) + " 分钟"
                     : (sec < 86400 ? (sec / 3600).toFixed(1) + " 小时" : (sec / 86400).toFixed(1) + " 天");
 };
@@ -235,13 +245,25 @@ $("#btnLogout").onclick = async () => {
 };
 $("#btnReload").onclick = () => render();
 
+function activateTab(name) {
+  document.querySelectorAll(".tabs button").forEach((x) =>
+    x.classList.toggle("active", x.dataset.tab === name));
+  return render();
+}
 document.querySelectorAll(".tabs button").forEach((b) => {
-  b.onclick = () => {
-    document.querySelectorAll(".tabs button").forEach((x) => x.classList.remove("active"));
-    b.classList.add("active");
-    render();
-  };
+  b.onclick = () => activateTab(b.dataset.tab);
 });
+
+/* 右上角的「修改口令」= 跳到「存了什么」里那张账号卡（表单**只有一份**，
+   不存在两处各改一次、口径漂开的可能）。跳过去之后滚到它、并把光标放进
+   「当前口令」那一格 —— 这个入口的全部价值就是"不用找"。 */
+$("#btnPwd").onclick = async () => {
+  await activateTab("inventory");
+  const box = $("#pwCard");
+  if (box && box.scrollIntoView) box.scrollIntoView({ block: "center" });
+  const first = $("#pwCur");
+  if (first) first.focus();
+};
 
 async function boot() {
   try {
@@ -263,7 +285,7 @@ async function render() {
     else if (tab === "clients") { v.innerHTML = await viewClients(); bindClients(); }
     else if (tab === "calls") v.innerHTML = await viewCalls();
     else if (tab === "perf") { v.innerHTML = await viewPerf(); bindPerf(); }
-    else { v.innerHTML = await viewInventory(); }
+    else { v.innerHTML = await viewInventory(); bindPassword(); }
   } catch (e) {
     v.innerHTML = `<div class="card"><h2>读不到</h2><div class="muted">${esc(e.message)}</div></div>`;
   }
@@ -369,7 +391,9 @@ function pendingCodes(d) {
     ts(c.expiresAt),
     raw(`<button class="danger" data-code="${esc(c.id)}">作废</button>`),
   ]);
-  return `<div class="card"><h2>待用的配对码（${(d.codes || []).length}）</h2>
+  // 标题写"能用的"：这张表里**只有能用的码**（后端已经把用过 / 过期的排除掉了），
+  // 免得再出现"标题说待用、行里写着已过期"那种自相矛盾。
+  return `<div class="card"><h2>待用的配对码（能用的 ${(d.codes || []).length} 张）</h2>
     ${table(["名字", "scopes", "谁发的", "剩余", "到期时间", "操作"], rows)}
     <div class="muted" style="margin-top:6px">${esc(d.note)}</div></div>`;
 }
@@ -498,6 +522,8 @@ async function viewCalls() {
 async function viewInventory() {
   const d = await api("/admin/api/inventory");
   const acc = await api("/admin/api/admins");
+  /* 策略从后端带下来（页面不另抄一份位数），只在内存里，不落任何存储。 */
+  PWD = acc.passwordPolicy || PWD;
   const rows = Object.entries(d.tables).map(([t, cols]) =>
     [t, cols.length, cols.join(", "), d.whitelist.includes(t) ? "在白名单" : "**不在白名单**"]);
   return `<div class="card"><h2>存了什么</h2>
@@ -509,19 +535,84 @@ async function viewInventory() {
     <div class="muted" style="margin-top:8px">两个目录：临时 <code>${esc(d.tmpRoot || "(默认)")}</code>
       （可以被清理器删、可以挂 tmpfs）；耐久 <code>${esc(d.stateRoot || "(默认)")}</code>。
       <b>两种相反的保留策略，故意分开</b>。</div></div>
-  <div class="card"><h2>管理员账号（本面板只读）</h2>${table(
-    ["账号", "状态", "建号", "最后登录"],
-    acc.admins.map((a) => [a.username,
-      a.disabled ? '<span class="badge off">已禁用</span>' : '<span class="badge on">正常</span>',
-      ts(a.createdAt), ts(a.lastLogin)]))}
-    <div class="muted" style="margin-top:6px">${esc(acc.note)} —— 面板刻意不改账号：
-      改账号等于"改谁能进这扇门"，而面板本身就在这扇门里（一次会话劫持就能顺手把自己加成管理员）。</div></div>
+  ${accountsCard(acc)}
   <div class="card"><h2>最近的管理动作</h2>${table(
     ["时间", "管理员", "动作", "对象"],
     d.recentAudit.map((a) => [new Date(Number(a.ts) * 1000).toLocaleString(), a.admin,
       a.action, a.target || "—"]))}
     <div class="muted" style="margin-top:6px">写动作**含失败**都在这里（失败的动作名带
-      <code>.failed</code>，"被闸门挡回来"的记成 <code>write-guard</code>）。</div></div>`;
+      <code>.failed</code>，"被闸门挡回来"的记成 <code>write-guard</code>）。<br>
+      <b>配对码被客户端兑走</b>也记在这里（动作名 <code>pair-redeem</code>）：那几行的
+      "管理员"一列写成 <code>pair:&lt;发放者&gt;</code> —— 因为那不是谁在面板上点的，
+      而是对端拿码换走了凭据。"待用的配对码"那张表里查不到的码，答案在这里。</div></div>`;
+}
+
+/* ---------------------------------------------------------------- 管理员账号 + 改口令
+
+   立场（与 `server/admin.py` 开头那段是同一件事，别改一边忘了另一边）：
+   **新增 / 删除 / 禁用管理员、改别人的口令，一律只在命令行** —— 那是"谁能进门"的事，
+   而面板本身就在这扇门里（一次会话劫持就能顺手把自己加成管理员）。
+   面板只开**一条**口子：**改自己的口令**，而且必须先给出**当前口令**
+   （攻击者拿到会话也改不掉口令，因为他不知道当前口令）。
+
+   两句说明文案由 `/admin/api/admins` 给（`note` / `selfServiceNote`），页面只负责显示：
+   写成两处必然漂开，而这种"页面上的承诺"漂开是最贵的一种 bug。 */
+function accountsCard(acc) {
+  const P = acc.passwordPolicy || PWD;
+  const min = Number(P.minLength || 8), max = Number(P.maxLength || 200);
+  return `<div class="card" id="pwCard"><h2>管理员账号（增删仍只在命令行）</h2>${table(
+    ["账号", "状态", "建号", "最后登录"],
+    acc.admins.map((a) => [a.username + (a.username === acc.self ? "（你）" : ""),
+      a.disabled ? '<span class="badge off">已禁用</span>' : '<span class="badge on">正常</span>',
+      ts(a.createdAt), ts(a.lastLogin)]))}
+    <div class="muted" style="margin-top:6px">${esc(acc.note || "")}</div>
+    <div class="muted" style="margin-top:6px">${esc(acc.selfServiceNote || "")}</div>
+    <h2 style="margin-top:14px">修改我的口令</h2>
+    <div class="muted">只改<b>当前登录的这一个账号</b>${acc.self ? "（" + esc(acc.self) + "）" : ""}，
+      并且要先填<b>当前口令</b>。新口令至少 <b>${min}</b> 位（最多 ${max} 位）；
+      改成功之后<b>其它已登录的会话立刻失效</b>，当前这个会话保留。
+      口令只在这条请求的请求体里，**不写进浏览器存储、也不进 URL**。</div>
+    <div class="form">
+      <label>当前口令<input id="pwCur" type="password" autocomplete="current-password"></label>
+      <label>新口令<input id="pwNew" type="password" autocomplete="new-password"></label>
+      <label>确认新口令<input id="pwNew2" type="password" autocomplete="new-password"></label>
+      <button class="primary" id="btnPwSave">修改口令</button>
+    </div>
+    <div class="errtxt" id="pwErr"></div>
+    <div style="color:var(--green);font-size:13px;min-height:16px" id="pwOk"></div></div>`;
+}
+
+function bindPassword() {
+  const btn = $("#btnPwSave");
+  if (!btn) return;
+  const err = $("#pwErr"), ok = $("#pwOk");
+  const fail = (m) => { if (err) err.textContent = m; };
+  btn.onclick = async () => {
+    if (err) err.textContent = "";
+    if (ok) ok.textContent = "";
+    const cur = $("#pwCur").value, next = $("#pwNew").value, again = $("#pwNew2").value;
+    const min = Number(PWD.minLength || 8);
+    /* **客户端先把明显不合格的挡掉**（两次不一致就不发请求）——
+       但这不是保证：服务端那份（`server/admin.py` 的策略 + 当前口令校验）才算数。 */
+    if (!cur) return fail("请先填当前口令");
+    if (next.length < min) return fail("新口令至少 " + min + " 位");
+    if (next !== again) return fail("两次输入的新口令不一致");
+    if (next === cur) return fail("新口令不能与当前口令相同");
+    try {
+      const r = await wpost("/admin/api/password", { current: cur, new: next });
+      ["#pwCur", "#pwNew", "#pwNew2"].forEach((s) => { const el = $(s); if (el) el.value = ""; });
+      const revoked = Number(r.sessionsRevoked || 0);
+      if (ok) ok.textContent = "已修改口令。" + (revoked ? "另外 " + revoked + " 个登录会话已失效，" : "")
+        + "当前这个会话保留。新增 / 删除管理员仍然只能在命令行做。";
+    } catch (e) {
+      /* 失败原因（中文）由后端给：口令太短、当前口令不对、被闸门挡回来…… */
+      fail("修改失败：" + e.message);
+    }
+  };
+  ["#pwCur", "#pwNew", "#pwNew2"].forEach((s) => {
+    const el = $(s);
+    if (el) el.addEventListener("keydown", (e) => { if (e.key === "Enter") btn.click(); });
+  });
 }
 
 /* ---------------------------------------------------------------- 性能（4 张图，2×2） */
@@ -671,6 +762,9 @@ function stopPerfPoll() {
 
 async function viewPerf() {
   const tpl = document.getElementById("perfChartsTpl");
+  // 「运行参数」读不到不该把 4 张图一起搞没（它是这一页的**另一个**接口）。
+  let lim = null;
+  try { lim = await api("/admin/api/limits"); } catch (e) { lim = { error: e.message }; }
   return `<div class="card">
     <h2>性能记录</h2>
     <div class="perfbar">
@@ -680,11 +774,82 @@ async function viewPerf() {
       <span class="stat" id="perfStat"></span>
     </div>
     <div class="muted" style="margin-top:6px" id="perfNote"></div>
-  </div>${tpl ? tpl.innerHTML : ""}`;
+  </div>${limitsCard(lim)}${tpl ? tpl.innerHTML : ""}`;
+}
+
+/* ---------------------------------------------------------------- 运行参数（并发 / 队列）
+
+   需求（2026-09-29）：总通道出厂 6，而且**管理员在页面上就能改** —— 不用改环境变量、
+   不用重启。放在「性能」页签里、**就在 4 张图上方**：并发上限本来就是一个性能参数，
+   调它要看的就是旁边「在途请求数」与 GPU 利用率那两张图；而字段只有三个，
+   不值得再开一个页签（页签已经 6 个了）。
+
+   页面只负责"怎么问、怎么显示"：来源判定（管理面 / 环境变量 / 默认）与
+   "谁盖了谁"的提示全部由后端 `/admin/api/limits` 给（`server/limits.py`）。 */
+let LIMITS_SAVED = "";          // 「已保存并生效」这句只在**下一次渲染**里出现一次
+
+function limitsCard(d) {
+  if (!d || d.error) {
+    return `<div class="card"><h2>运行参数</h2>
+      <div class="errtxt">读不到：${esc((d && d.error) || "未知错误")}</div></div>`;
+  }
+  const L = d.limits || {}, S = d.source || {}, R = d.ranges || {}, LB = d.labels || {};
+  const EN = d.envValues || {}, ENN = d.envNames || {};
+  const srcBadge = (src) => src === "admin"
+    ? '<span class="badge on">管理面配置</span>'
+    : (src === "env" ? '<span class="badge idle">环境变量</span>'
+                     : '<span class="badge">出厂默认</span>');
+  const rows = Object.keys(LB).map((api) => [
+    LB[api], Number(L[api]), raw(srcBadge(S[api])),
+    EN[api] == null ? "—" : ENN[api] + "=" + EN[api],
+  ]);
+  const inputs = Object.keys(LB).map((api) => {
+    const r = R[api] || [1, 64];
+    return `<label>${esc(LB[api])}（${r[0]}~${r[1]}）
+      <input id="lim-${esc(api)}" type="number" step="1" min="${r[0]}" max="${r[1]}"
+             value="${Number(L[api])}"></label>`;
+  }).join("");
+  const notes = (d.notes || []).map((n) => `<div class="muted">⚠️ ${esc(n)}</div>`).join("");
+  const saved = LIMITS_SAVED ? ` <span class="badge on">${esc(LIMITS_SAVED)}</span>` : "";
+  LIMITS_SAVED = "";
+  const changed = d.updatedAt
+    ? `<div class="muted">上次改：${esc(ts(d.updatedAt))}${d.updatedBy ? " · 由 " + esc(d.updatedBy) : ""}</div>`
+    : "";
+  return `<div class="card"><h2>运行参数${saved}</h2>
+    <div class="muted">${esc(d.priorityNote || "")}</div>
+    ${table(["参数", "当前生效值", "来源", "环境变量"], rows)}
+    <div class="form">${inputs}
+      <button class="primary" id="btnLimits">保存并生效</button></div>
+    <div class="errtxt" id="limitsErr"></div>
+    <div class="muted" style="margin-top:6px">保存后<b>立刻生效</b>（不用重启容器），
+      并写进 state 卷的库 —— 重启后还在。每客户端并发不能大于总并发。<br>
+      ${esc(d.queueNote || "")}</div>
+    ${notes}${changed}</div>`;
+}
+
+function bindLimits() {
+  const btn = $("#btnLimits");
+  if (!btn) return;
+  btn.onclick = async () => {
+    const err = $("#limitsErr");
+    if (err) err.textContent = "";
+    try {
+      // 原样把输入框的字符串发过去，让后端给出**明确的中文原因**
+      // （空/非数 → "总并发要是整数…"，越界 → "总并发要在 1 ~ 64 之间…"）。
+      await wpost("/admin/api/limits", {
+        maxConcurrent: $("#lim-maxConcurrent").value,
+        perClientConcurrent: $("#lim-perClientConcurrent").value,
+        queueMax: $("#lim-queueMax").value,
+      });
+      LIMITS_SAVED = "已保存并生效";
+      await render();          // 就地刷新：生效值与来源重新读一遍
+    } catch (e) { if (err) err.textContent = "保存失败：" + e.message; }
+  };
 }
 
 function bindPerf() {
   stopPerfPoll();
+  bindLimits();              // 「运行参数」那张卡的保存按钮（与图在同一页签）
   PERF.points = [];          // 进页签 = 重新按服务端的窗口对齐（服务端是权威）
   PERF.since = "";
   const start = $("#btnPerfStart"), stop = $("#btnPerfStop");

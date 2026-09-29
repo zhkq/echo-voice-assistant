@@ -31,6 +31,24 @@
    之后任何接口都不再返回明文（配对码库里本来就是哈希）。
 7. **复用命令行那条路的实现**（`server/ops.py`），不在管理面里另写一套。
 
+## 账号：面板只开「自己改自己口令」这一条路（2026-09-29 用户要求）
+
+原来的立场是"**刻意不改账号**"：改账号等于"改谁能进这扇门"，而面板本身就在这扇门里
+（一次会话劫持就能顺手把攻击者自己加成管理员）。这条**继续保留**，只开一个口子：
+
+* ✅ `POST /admin/api/password`：**改自己的口令**，而且**必须同时给出当前口令**
+  （`current` 验过才允许改）。于是"一次会话劫持"不足以改掉口令 —— 攻击者不知道当前口令。
+  改的是**会话里的那个名字**，请求体里的 `username` 只用来**拒绝**（指着别人就 400）。
+* ❌ 新建 / 删除 / 禁用 / 启用管理员、改**别人**的口令：**仍然只在命令行**
+  （`--new-admin` / `--disable-admin` / `--delete-admin`）。页面上如实写着这句话
+  （文案在 `/admin/api/admins` 的 `note` / `selfServiceNote` 里，页面渲染它们，
+  不在 HTML 里另抄一份 —— 抄的那份迟早与后端漂开）。
+
+改成功后**让其它会话失效**：这里没有"会话版本号"那种机制（会话整个就在
+`SessionStore` 的进程内存里），所以用**既有手段**
+`SessionStore.drop_user(username, keep=<当前令牌>)`：别的会话下一个请求就 401，
+当前这个留着（不然刚改完就把自己踢回登录页，看着像改失败了）。
+
 ## 与能力面严格隔离（设计 §8.4）
 
 | | 能力面 | 管理面 |
@@ -77,6 +95,7 @@ from fastapi import APIRouter, FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from server import __version__, errors
+from server import limits as limits_mod
 from server import ops as ops_mod
 from server import perfmon as perfmod
 
@@ -112,6 +131,14 @@ _SCRYPT_DKLEN = 32
 SESSION_TTL_S = 8 * 3600
 
 COOKIE_NAME = "echo_admin"
+
+#: 改口令时的长度下限 / 上限（**策略只有这一份**，页面那份是从 `/admins` 读过去显示的）。
+#:
+#: 下限 8：这是"人自己选的"口令，不是 `new_password()` 那种机器生成的 16+ 位随机串；
+#: 门槛定得再高会把人逼到"写在便签上"。**上限 200**：scrypt 对超长输入照样要算，
+#: 一个几 MB 的"口令"只会变成一次免费的 CPU 消耗。
+MIN_PASSWORD_LEN = 8
+MAX_PASSWORD_LEN = 200
 
 
 # ---------------------------------------------------------------- 口令
@@ -156,6 +183,51 @@ def new_password() -> str:
     return "-".join(secrets.token_hex(3) for _ in range(3))
 
 
+def password_policy_error(new: str, current: str = "") -> str:
+    """新口令合不合策略。返回**中文原因**（空串 = 通过）。
+
+    **只在服务端判**：页面那份提前提示只是为了少一次往返，不构成保证 ——
+    任何客户端都能直接构造请求体。
+    """
+    text = str(new if new is not None else "")
+    if not text:
+        return "新口令不能为空"
+    if len(text) < MIN_PASSWORD_LEN:
+        return "新口令至少 %d 位（口令短了挡不住在线猜测）" % MIN_PASSWORD_LEN
+    if len(text) > MAX_PASSWORD_LEN:
+        return "新口令最多 %d 位" % MAX_PASSWORD_LEN
+    if current and hmac.compare_digest(text, str(current)):
+        return "新口令不能与当前口令相同"
+    return ""
+
+
+def change_admin_password(store, username: str, current: str, new: str) -> Dict[str, Any]:
+    """改**当前登录的这个管理员**的口令。返回摘要（**任何字段都不含口令**）。
+
+    与命令行那条路的差别**只有一处**：`main._admin_cli --new-admin` 是"重置"，
+    它生成一个随机口令并打印一次（能开库 = shell 权限，谁都能重置谁）；
+    这里是"本人改本人的"，所以必须先过 `current` 这一关。
+    落库走**同一个** `store.upsert_admin()`（同一个哈希函数、同一张表），
+    不另开一条写路径 —— 两条路各写一遍，迟早有一处忘了换哈希算法。
+
+    判定顺序是有意的：**先判"请求本身合不合法"（400），再验当前口令（403）**。
+    与既有端点一致（缺字段/越界 = 400，身份不够 = 401/403），
+    且不合法的请求不会白算一次 scrypt。
+    """
+    reason = password_policy_error(new, current)
+    if reason:
+        raise errors.bad_request(reason)
+    row = store.admin(username) if store is not None else None
+    if row is None or int(row.get("disabled") or 0):
+        raise errors.forbidden("这个管理员账号已不可用")
+    if not verify_password(current, row.get("password_hash") or ""):
+        # 403 而不是 400：请求本身是合法的，**是身份不够** ——
+        # 这正是"必须提供当前口令"这条闸门的落点（会话劫持者卡在这里）。
+        raise errors.forbidden("当前口令不对（改口令要先证明你是本人）")
+    store.upsert_admin(username, hash_password(new))
+    return {"ok": True, "username": username}
+
+
 # ---------------------------------------------------------------- 会话
 
 class SessionStore:
@@ -184,9 +256,15 @@ class SessionStore:
     def drop(self, token: str) -> None:
         self._by_token.pop(str(token or ""), None)
 
-    def drop_user(self, username: str) -> int:
-        """某人被禁用/删掉时，把他已有的会话一起清掉（下一个请求就掉线）。"""
-        gone = [t for t, r in self._by_token.items() if r["username"] == username]
+    def drop_user(self, username: str, *, keep: str = "") -> int:
+        """某人被禁用/删掉时，把他已有的会话一起清掉（下一个请求就掉线）。
+
+        `keep` = **留一个令牌不清**。改自己口令时用它：口令变了，别的登录会话
+        立刻失效（那正是"改口令"想达到的效果），而**手上这个留着** ——
+        否则刚改完就把自己踢回登录页，用户会以为改失败了。
+        """
+        gone = [t for t, r in self._by_token.items()
+                if r["username"] == username and t != str(keep or "")]
         for t in gone:
             self._by_token.pop(t, None)
         return len(gone)
@@ -214,10 +292,14 @@ def create_admin_app(cfg, state, *, perf=None) -> FastAPI:
     """
     sessions = SessionStore()
     throttle = _Throttle()
+    #: 改口令那条路的失败退避。**与登录那个分开**：一次"当前口令记错了"不该把
+    #: 登录也一起锁住（两个端点各自的尝试次数各自算，这也正是通行做法）。
+    pwd_throttle = _Throttle()
     app = FastAPI(title="ECHO admin console", version=__version__)
     app.state.echo = state
     app.state.sessions = sessions
     app.state.throttle = throttle
+    app.state.pwd_throttle = pwd_throttle
     perf_monitor = perf if perf is not None else perfmod.PerfMonitor(
         server_sampler=perfmod.server_sampler_of(state))
     app.state.perf = perf_monitor
@@ -487,20 +569,87 @@ def create_admin_app(cfg, state, *, perf=None) -> FastAPI:
 
     @api.get("/admins")
     def admins(request: Request):
-        """管理员账号清单（**只读**）。
+        """管理员账号清单（**只读**）+ 「我能做什么」的自述。
 
-        管理面**不改账号**（增删改口令仍然只在命令行）：改账号是"改谁能进这扇门"，
-        而面板本身就在这扇门里 —— 让面板改账号，等于给一次会话劫持配一个提权出口。
-        所以这里只把清单摊开给人看（谁、禁用没有、上次登录）。
+        管理面**不改别人**的账号：新建 / 删除 / 禁用 / 启用、以及改别人的口令
+        仍然只在命令行 —— 改账号是"改谁能进这扇门"，而面板本身就在这扇门里，
+        让面板改账号等于给一次会话劫持配一个提权出口。
+        唯一开的口子是**改自己的口令**（见 `POST /admin/api/password`），
+        而且必须带当前口令；`selfServiceNote` 就是给页面显示的那句话，
+        `passwordPolicy` 是**策略的唯一来源**（页面拿它渲染"至少 N 位"，
+        不另抄一遍数字）。
         """
-        current_admin(request)
+        who = current_admin(request)
         store = store_of()
         rows = store.admins() if store is not None else []
         return {"admins": [
             {"username": r.get("username", ""), "disabled": bool(r.get("disabled")),
              "createdAt": float(r.get("created_at") or 0),
              "lastLogin": float(r.get("last_login") or 0)} for r in rows],
-            "note": "账号的增删改只在命令行（--new-admin / --disable-admin / --delete-admin）"}
+            "self": who["username"],
+            "note": ("账号的增删改只在命令行（--new-admin / --disable-admin / "
+                     "--delete-admin）；面板只能改**自己**的口令，而且要先给出当前口令。"),
+            "selfServiceNote": ("新增 / 删除 / 禁用管理员请用命令行 —— 那是「谁能进门」的事，"
+                               "不该在门里做；一次会话劫持也不足以改掉口令"
+                               "（攻击者不知道当前口令）。"),
+            "passwordPolicy": {"minLength": MIN_PASSWORD_LEN,
+                               "maxLength": MAX_PASSWORD_LEN,
+                               "selfService": True,
+                               "otherSessionsDropped": True}}
+
+    # ---- 我的口令（写：只改自己，**必须带当前口令**）----
+    #
+    # 这条是"刻意不改账号"那个立场上唯一的例外，理由与边界见模块开头。
+    # 走 `as_write`：会话 + 同站 Origin + `X-ECHO-Admin` + CSRF + 审计
+    # （成功 `password-change`、失败 `password-change.failed` 带中文原因）。
+
+    @api.post("/password")
+    async def change_my_password(request: Request):
+        """改**当前登录的这个管理员**的口令。body：`{"current": "...", "new": "..."}`。
+
+        错误码（与既有端点一个口径）：
+
+        * 没会话 → 401；错 Origin / 缺 `X-ECHO-Admin` / 缺 CSRF → 403（写得**不合格**的
+          `new` 也一样，闸门在进端点之前就拦）；
+        * `new` 空 / 短于下限 / 超过上限 / 与 `current` 相同 → **400 + 中文原因**；
+        * **`current` 不对 → 403**（不是 400：请求本身合法，是身份不够）——
+          这条就是"会话劫持改不了口令"的落点；
+        * 请求体里带**别人**的用户名 → 400，一口回绝（见下面 `target` 那段）。
+
+        成功 → 200 `{"ok": true, "username": ..., "sessionsRevoked": N}`，
+        并且**让其它会话失效**（当前这个留着，见 `SessionStore.drop_user`）。
+        响应里**任何字段都不含口令**（哈希、明文都不）。
+        """
+        payload = await body_of(request)
+        source = _source_of(request)
+
+        def fn(who):
+            # 请求体里的 `username` **不用来选题**，只用来拒绝：
+            # 页面没有这个入口，所以"指着一个别人的名字"只可能是手搓的请求
+            # （或者某个客户端理解错了）—— 那必须被明说，而不是被静默忽略。
+            target = str(payload.get("username") or "").strip()
+            if target and target != who["username"]:
+                raise errors.bad_request(
+                    "改口令只能改当前登录的这个管理员（请求里给的是 %s）" % target)
+            # 与登录端点同源的失败退避（**各算各的**）：会话被劫持之后，
+            # "拿这个端点当 `current` 口令的在线爆破口"是剩下的那点风险。
+            pwd_throttle.check(source)
+            try:
+                out = change_admin_password(store_of(), who["username"],
+                                            str(payload.get("current") or ""),
+                                            str(payload.get("new") or ""))
+            except errors.EchoError as exc:
+                if exc.status == 403 and exc.code == "forbidden":
+                    pwd_throttle.failed(source)
+                raise
+            pwd_throttle.succeeded(source)
+            # 口令一变，**别的登录会话立刻失效**（当前这个留着）。
+            out["sessionsRevoked"] = sessions.drop_user(
+                who["username"], keep=request.cookies.get(COOKIE_NAME) or "")
+            return out
+
+        # 审计的 `target` 写"改的是谁" = 会话里那个名字（as_write 自己会再认一次身份）。
+        return as_write(request, "password-change", current_admin(request)["username"], fn)
 
     @api.get("/clients/{client_id}")
     def client_detail(request: Request, client_id: str):
@@ -522,12 +671,21 @@ def create_admin_app(cfg, state, *, perf=None) -> FastAPI:
 
     @api.get("/pairing-codes")
     def pairing_codes(request: Request):
-        """待用的配对码。**明文永远不在这里** —— 库里只有哈希（设计 §7.4 约定 2）。"""
+        """待用的配对码。**明文永远不在这里** —— 库里只有哈希（设计 §7.4 约定 2）。
+
+        这里给的是**能用的**码：`ops.pending_pairing_codes()` 已经把"已消费"与"已过期"
+        都排除掉了（判据只有一份，命令行 `--list-codes` 用的是同一个函数）。
+        2026-09-29 用户实测的 bug 就是这张表里出现了「已过期」（甚至已经兑过的）的码 ——
+        徽章写着「已过期」却列在「待用」，标题与内容自相矛盾。
+        """
         current_admin(request)
         return {"codes": ops_mod.pending_pairing_codes(store_of()),
                 "defaultTtlSeconds": int(cfg.get("auth.pairing_ttl_s", 900)),
                 "minTtlSeconds": MIN_PAIRING_TTL_S, "maxTtlSeconds": MAX_PAIRING_TTL_S,
-                "note": "配对码只存哈希：明文只在发出去的那一刻出现过一次，这里看不到。"}
+                "note": "这张表里只有能用的码（未用过、未过期）：用过的码在 /v1/pair 兑走的"
+                        "那一刻就从库里删掉了，过期的也不列在这里。想知道某张码什么时候被"
+                        "谁兑走了，看「存了什么」页签里的审计（action = pair-redeem）。"
+                        "配对码只存哈希 —— 明文只在发出去的那一刻出现过一次，这里看不到。"}
 
     @api.post("/pairing-codes")
     async def issue_pairing_code(request: Request):
@@ -697,6 +855,46 @@ def create_admin_app(cfg, state, *, perf=None) -> FastAPI:
     async def perf_stop(request: Request):
         """停止记录。**已有的点不删**（图还在，只是不再长）。"""
         return as_write(request, "perf-stop", "perf", lambda who: perf_monitor.stop())
+
+    # ---- 运行参数（读：登录即可；写：与其它写动作同一套闸门 + 审计）----
+    #
+    # 2026-09-29 用户要求："把并发能力提到 6，而且这个应该由管理员在管理页面上配"
+    # （不用改环境变量、不用重启）。所以这里加一对端点：
+    #   * `GET  /admin/api/limits` —— 生效值 + **每个值的来源**（管理面/环境变量/默认）
+    #   * `POST /admin/api/limits` —— 保存（走 `as_write`：会话 + 同站 Origin +
+    #     `X-ECHO-Admin` + CSRF + 审计 `limits-set`）
+    # 校验与落库都在 `server/limits.py` 里一份（页面与将来的命令行共用），
+    # 这里只做"怎么问、怎么回 JSON"。
+    #
+    # ⚠️ **优先级写死在 `server/limits.py`：管理面配置 > 环境变量 > 出厂默认。**
+    # 管理面存下的值盖过 `ECHO_MAX_CONCURRENT` —— 不然 compose 里那个默认变量会让
+    # 页面上的改动静默失效（见那个模块开头的说明）。`notes` 会把这件事如实说出来。
+
+    @api.get("/limits")
+    def get_limits(request: Request):
+        """此刻生效的运行参数 + 来源 + 取值范围（+ "env 被管理面盖住"的如实提示）。"""
+        current_admin(request)
+        return _no_store(limits_mod.view(cfg, store_of()))
+
+    @api.post("/limits")
+    async def set_limits(request: Request):
+        """保存运行参数。越界 / 非数 → 400 + 中文原因（**不静默夹紧**），值不变。
+
+        保存**当场生效**：`limits.set_limits` 写的就是能力面那份 `cfg`，
+        而闸门（`Admission.current`）与 `/v1/capabilities` 每次现读它。
+        持久化在同一个动作里（state 卷的 `server_limits` 表），重启后还在。
+        """
+        payload = await body_of(request)
+
+        def fn(who):
+            got = limits_mod.set_limits(cfg, store_of(), payload,
+                                        updated_by=str(who.get("username") or ""))
+            out = limits_mod.view(cfg, store_of())
+            out["ok"] = True
+            out["saved"] = {k: got[k] for k in got}
+            return out
+
+        return as_write(request, "limits-set", limits_mod.audit_target(payload), fn)
 
     @api.get("/perf/state")
     def perf_state(request: Request):
@@ -931,7 +1129,9 @@ def start_admin_server(cfg, state, *, log=None):
                         "模型/客户端/调用元数据。请用防火墙只放运维网段（设计 §8.4）。",
                         host, port)
         log.info("管理面在 http://%s:%d/admin/ （**可写**：发授权 / 禁用 / 撤销 / 改 scopes / "
-                 "改配额 / 轮换 secret / 性能记录（只在内存，不落盘）；"
+                 "改配额 / 轮换 secret / 运行参数（并发·队列，改完立刻生效） / "
+                 "改**自己**的口令（要带当前口令；增删管理员仍然只在命令行） / "
+                 "性能记录（只在内存，不落盘）；"
                  "全部要求管理员会话 + 同站 Origin + %s 头）",
                  host, port, WRITE_HEADER)
     server = uvicorn.Server(uvicorn.Config(app, host=host, port=port, log_level="warning"))

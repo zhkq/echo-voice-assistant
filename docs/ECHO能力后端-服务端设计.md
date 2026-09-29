@@ -1398,10 +1398,21 @@ Windows 上至少要走 DPAPI（`CryptProtectData`）；这与"业务数据留�
 > —— 管理面是明文 http（回环端口、不走 TLS），给 http 页面设 `Secure` 浏览器根本不会存，
 > 表现是"登录成功了，下一个请求又 401"。将来管理面走 https 时再补上。
 >
-> **刻意不做的**：管理面**不改管理员账号**（增删改口令仍只在命令行
+> **刻意不做的**：管理面**不改别人**的管理员账号（新建 / 删除 / 禁用 / 启用、
+> 以及改**别人**的口令仍只在命令行
 > `--new-admin` / `--disable-admin` / `--delete-admin`，面板最多只读展示清单）。
 > 理由：改账号等于"改谁能进这扇门"，而面板本身就在这扇门里 ——
 > 一次会话劫持就能顺手把攻击者自己加成管理员。
+>
+> **2026-09-29 的一处放宽**（用户要求"页面上还是要提供修改密码功能"）：
+> `POST /admin/api/password` 允许**改自己的口令**，但**必须同时给出当前口令**
+> （`current` 验过才允许改，不对 → **403** —— 请求本身合法，是身份不够）——
+> 会话劫持者不知道当前口令，所以"一次会话劫持足以改掉口令"这条路被堵着。
+> 口令策略：**至少 8 位**（上限 200），空 / 太短 / 与当前相同 → 400 + 中文原因；
+> 改成功后**其它登录会话立刻失效**（既有手段
+> `SessionStore.drop_user(username, keep=当前令牌)`；会话没有"版本号"那种机制，
+> 见下面那张表），并落一条审计 `password-change`（失败 `password-change.failed`）。
+> 请求体里的 `username` **只用来拒绝**（指着别人 → 400）——改的永远是会话里那一个。
 > 同样**不暴露 `auth.jwt_secret`**：任何接口都不返回它。
 >
 > 护栏：`tests/test_admin_console.py` 的 `WriteGuardTests`（**从 `openapi()` 现读**每个写端点，
@@ -1535,7 +1546,7 @@ Windows 上至少要走 DPAPI（`CryptProtectData`）；这与"业务数据留�
 | 登录限速 | 失败计数 + 指数退避 + 锁定 | 5 次 / 5 分钟退避（与 `/v1/pair` 同一形状）。**没有**"永久锁定"：锁死一个账号在单人运维的场景里就是把自己关在门外 |
 | CSRF | 管理面**只做同源**，改动用 POST + CSRF token | 同站 `Origin`/`Referer` + `X-ECHO-Admin` 非简单请求标志头 + 双提交 `X-CSRF-Token`；**默认拒绝**（中间件拦所有 `/admin/api` 的非 GET，`login` 豁免） |
 | 审计 | **管理动作也要记**（谁在什么时候撤销了哪个客户端） | `admin_audit`，**含失败**；操作者是登录的管理员名（见 §8.5 那条注） |
-| 初始账号 | 首次启动生成随机密码并**打到 stdout 一次**，强制首次登录改密；**不设默认密码** | `--new-admin` 生成随机口令并**只打印一次**（不落明文）。**没有**"强制首次改密"：管理面不改账号（改账号仍只在命令行），所以那句话落在"口令只出现一次 + 随时 `--new-admin` 重置"上 —— 这是第二处偏离，理由见 §8.4 |
+| 初始账号 | 首次启动生成随机密码并**打到 stdout 一次**，强制首次登录改密；**不设默认密码** | `--new-admin` 生成随机口令并**只打印一次**（不落明文）。**没有**"强制首次改密"：管理面不改**别人的**账号（那仍只在命令行），所以那句话落在"口令只出现一次 + 随时 `--new-admin` 重置"上 —— 这是第二处偏离，理由见 §8.4。**2026-09-29 起**面板可以改**自己**的口令（必须带当前口令，见 §8.4），因此"首次登录改密"现在是**自己做得到的事** |
 
 
 ---
@@ -1559,6 +1570,17 @@ Windows 上至少要走 DPAPI（`CryptProtectData`）；这与"业务数据留�
 | `calls_rollup` | 小时/天聚合 | `bucket` / `client_id` / `endpoint` / `count` / `errors` / `p50` / `p95` / `audio_seconds` | ⏳ |
 | `model_events` | 模型生命周期 | `ts` / `model_id` / `event`(load/evict/fail) / `duration_ms` / `vram_mb` | ⏳ |
 | `admin_audit` | 管理动作 | `ts` / `admin` / `action` / `target` | ✅ **2026-09-24 已落地** |
+| `server_limits` | **这台后端自己的运行参数**（总并发 / 每客户端并发 / 队列上限） | `name` / `value` / `updated_at` / `updated_by` | ✅ **2026-09-29 已落地** |
+
+> **`server_limits` 是第三类，写明白它为什么在白名单里（2026-09-29）。**
+> 上面那句话的判据是"请求元数据 + 客户端管理数据"，而这一张**两者都不是** ——
+> 它是"这台后端怎么跑"。之所以还是要落库：管理面要能让管理员改并发
+> （用户要求"这个应该是管理页面可以由管理员进行配置"），而这个值必须
+> **越过环境变量**（`server/compose.yaml` 默认就设了 `ECHO_MAX_CONCURRENT`，
+> 否则页面上改了会静默不生效）、并且**重启后还在**。两者同时成立就只有 state 卷这条落点。
+> 代价写在明处：白名单多了一张表，所以 `AuthSchemaTests` 里那条"白名单恰好等于这六个"
+> 的断言跟着改了一次 —— 这正是那道评审门被用了一次的样子。
+> 列只有四个、**没有任何业务概念**；加参数只加行，不加列。
 
 > **`admin_audit` 只有这四列，2026-09-25 管理面开写时也没加列。**
 > "这次动作成没成、为什么没成"编码在 `action`（成功 `revoke`、失败 `revoke.failed`）
@@ -1830,9 +1852,9 @@ client_body_temp_path /var/echo/tmp/nginx;
 | `server.state_root` | `{ECHO}/data/server-state` | ★ **耐久**状态（鉴权库）。**必须与 `tmp.root` 分开**，理由见 §9.3 |
 | `server.vram_budget_mb` | `0`（不限） | 超预算**拒绝**而不是 OOM，也绝不回退 CPU（§3.4） |
 | `server.tls.certfile` / `keyfile` | 空（http） | **两个都填**才起 https；只填一个**启动就报错**（不静默降级） |
-| `limits.max_concurrent` | **2** | 2026-09-23 定；上线后压测校准 |
-| `limits.per_client_concurrent` | **1** | 公平性：一个客户端不许占满 |
-| `limits.queue_max` | **0** | **不排队**，满了立刻拒（§3.6） |
+| `limits.max_concurrent` | **6** | 总通道。2026-09-23 定 2；**2026-09-29 提到 6**，并改成**由管理面配置**（见下方"运行参数的优先级"） |
+| `limits.per_client_concurrent` | **1** | 公平性：一个客户端不许占满（可在管理面里改，不得超过总并发） |
+| `limits.queue_max` | **0** | **不排队**，满了立刻拒（§3.6）。⚠️ 这个值现在**只有宣告、没有执行者**（`capabilities` 里报，配成 >0 不会真的排队） |
 | `limits.busy_retry_after_s` | `5` | `server_busy` 时给客户端的建议等待 |
 | `limits.max_audio_seconds` | `1800` | 半小时；超了 `413 audio_too_long` |
 | `limits.max_upload_bytes` | `64 MiB` | 声明值在读 body 前就检查（§6.5 公共约定） |
@@ -1864,12 +1886,45 @@ client_body_temp_path /var/echo/tmp/nginx;
 | `auth.default_scopes` | 空 | 空 = 配对出来的客户端**没有额外限制**（§7.2） |
 | `auth.db` | 空 = `{state_root}/echo-server-auth.db` | **刻意不回退到 `tmp.root`** |
 
+#### 运行参数的优先级（2026-09-29：总并发 6，且**由管理面配**）
+
+三个运行参数 —— `limits.max_concurrent` / `limits.per_client_concurrent` /
+`limits.queue_max` —— 的**权威值**按这个顺序取：
+
+| 顺序 | 来源 | 落在哪 | 什么时候赢 |
+|---|---|---|---|
+| 1 | **管理面配置** | 鉴权库 `server_limits` 表（state 卷，**重启后还在**） | 只要管理员在管理面里配过 |
+| 2 | 环境变量 | `ECHO_MAX_CONCURRENT` / `ECHO_PER_CLIENT_CONCURRENT` / `ECHO_QUEUE_MAX` | 没在管理面配过时 |
+| 3 | 出厂默认 / 配置文件 | `settings.DEFAULTS`（总并发 **6**）/ YAML | 都没有时 |
+
+**为什么管理面赢，而不是环境变量赢**：`server/compose.yaml` 默认就给容器设了
+`ECHO_MAX_CONCURRENT`。若 env 优先，"管理员在页面上把并发改成别的值"会**静默不生效**
+（页面显示新值、实际还是 env 那个），而排障的人会去翻代码和用例，想不到是编排层那个变量。
+代价是"env 被盖住"这件事必须**说出口**，不许静默：`GET /admin/api/limits` 的 `notes`
+与启动日志都会打印"环境变量 `ECHO_MAX_CONCURRENT=2` 已设，但当前以管理面配置的 6 为准"。
+这条优先级由用例钉着（`test_server_contract.RuntimeLimitsTests.
+test_the_admin_value_wins_over_the_environment_variable` 与
+`test_admin_console.LimitsConsoleTests.test_the_admin_value_beats_the_environment_variable`），
+免得后人把它当成 bug 再改回去。
+
+**热生效**：`server/limits.py` 把管理面的值写进**能力面同一个 `cfg`**，
+而两级闸门（`routes.Admission.current`）与 `/v1/capabilities` **每次判定都现读** ——
+所以保存完就是"下一个请求生效"，不用重启容器。
+`Admission` 里那个构造期固定容量的 `BoundedSemaphore` 因此被去掉了：
+容量固定的信号量改不了，留着就是第二把尺子（配置说 1、信号量还有 3 个许可）。
+
+**管理面接口**：`GET /admin/api/limits`（生效值 + 每个值的来源 + 取值范围 + env 提示）、
+`POST /admin/api/limits`（保存；越界/非数 → `400` + 中文原因，**不静默夹紧**；
+审计 action = `limits-set`）。写动作走的是既有那套闸门（管理员会话 + 同站
+`Origin` + `X-ECHO-Admin` + CSRF + 审计），**没有新开免检端点**。
+
 #### 环境变量
 
 只认少数几个（容器里最方便的那一层）：`ECHO_SERVER_ID` / `ECHO_LISTEN` /
 `ECHO_TMP_ROOT` / `ECHO_STATE_ROOT` / `ECHO_MODELS_ROOT` / `ECHO_DEVICE` /
-`ECHO_MAX_CONCURRENT` / `ECHO_PER_CLIENT_CONCURRENT` / `ECHO_AUTH_ENABLED` /
+`ECHO_MAX_CONCURRENT` / `ECHO_PER_CLIENT_CONCURRENT` / `ECHO_QUEUE_MAX` / `ECHO_AUTH_ENABLED` /
 `ECHO_AUTH_MODE` / `ECHO_JWT_SECRET` / `ECHO_PAIRING_ENABLED` / `ECHO_LOCAL_PAIR`（§7.4.1）。
+（`limits` 那三个会被**管理面配置覆盖**，见上一节。）
 
 **布尔要认得出 `"false"`**：容器编排里它是字符串，而 Python 里非空字符串都是真 ——
 直接 `bool(os.environ[...])` 会让 `ECHO_AUTH_ENABLED=false` **打开**鉴权。
@@ -1888,7 +1943,7 @@ client_body_temp_path /var/echo/tmp/nginx;
 |---|---|---|
 | 服务端不可达 | — | 降级链下一个后端 |
 | **该客户端自己已有请求在跑** | **`409 client_busy`**（不排队） | **不重试** —— 并发应配 1，属客户端 bug，记日志 |
-| **服务端通道满**（总 2 路） | **`503 server_busy` + `Retry-After: 5`**（**不排队**） | **系统忙，稍后再试**：退避重试（退避作用于**整个队列**） |
+| **服务端通道满**（总 6 路，管理面可改） | **`503 server_busy` + `Retry-After: 5`**（**不排队**） | **系统忙，稍后再试**：退避重试（退避作用于**整个队列**） |
 | 模型加载中 | `503 model_loading` + `Retry-After` | 等或降级（看 `estWait`） |
 | 加载失败 | `503 model_failed`；`/v1/capabilities` 标 `failed` | 跳过此后端，直到 capabilities 变化 |
 | 显存不足 | 卸载 LRU → 仍不够 → `503 gpu_oom` | **绝不回退 CPU**；降级 |
@@ -2052,6 +2107,7 @@ client_body_temp_path /var/echo/tmp/nginx;
 | 撤销后旧令牌**下一个请求**就 401（管理面同进程立刻生效） | ✅ | `ClientWriteTests.test_revoke_kills_the_token_on_the_very_next_request` |
 | 轮换 secret：新的只回显一次、旧 secret/旧令牌立刻失效、详情与列表不含哈希 | ✅ | `ClientWriteTests.test_rotate_secret_*` |
 | 每个写动作（**含失败**）一条审计，操作者是登录的管理员名 | ✅ | `AuditTests` |
+| 改口令（§8.4，2026-09-29）：**只能改自己**、**必须带当前口令**（错 → 403）、口令太短/为空/与当前相同 → 400；改完**新口令能登录、旧口令不能**，**其它会话立刻失效**（当前会话保留） | ✅ | `PasswordChangeConsoleTests`（另有 `PasswordPageTests` 钉页面：三个 `type=password` 输入框、客户端先判两次一致、策略数字来自后端） |
 | 命令行与管理面**共用同一份实现**（同一串配对串、同一批 store 方法） | ✅ | `SharedImplementationTests` |
 | 只读端点只要登录，**不要求**写请求那几个头 | ✅ | `ReadOnlyNotLockedTests` |
 | **两个 app 的路径不许交叉**（管理面无 `/v1`、能力面无 `/admin`） | ✅ | `IsolationTests` 两条 |

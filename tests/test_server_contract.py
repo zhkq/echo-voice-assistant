@@ -32,6 +32,8 @@ from fastapi.testclient import TestClient                        # noqa: E402
 
 from server import auth as auth_mod                              # noqa: E402
 from server import engines, errors, main as server_main, tmp     # noqa: E402
+from server import limits as limits_mod                          # noqa: E402
+from server import ops as ops_mod                                # noqa: E402
 from server import routes as routes_mod                          # noqa: E402
 from server import settings as settings_mod                      # noqa: E402
 from server import store as store_mod                            # noqa: E402
@@ -429,6 +431,225 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual(snap["active"], 0)
 
 
+class AdmissionLiveLimitTests(unittest.TestCase):
+    """闸门的上限**每次现读**，不在构造时缓存（2026-09-29：管理面能改并发）。
+
+    为什么单独一组：这条最容易在"重构一下，把上限缓存成属性"时被弄丢，
+    而弄丢的表现是"管理面里改了、页面也显示改了，就是**不生效**" ——
+    现场只会看到"改了没用"，然后去怀疑配置没存上。所以这里直接钉住"现读"。
+    """
+
+    def _adm(self, cfg):
+        return routes_mod.Admission(
+            cfg.max_concurrent, cfg.per_client_concurrent, retry_after=5,
+            limits_of=lambda: {"max_concurrent": cfg.max_concurrent,
+                               "per_client_concurrent": cfg.per_client_concurrent})
+
+    def test_a_changed_limit_is_seen_at_once_and_enforced(self):
+        cfg = settings_mod.load()
+        cfg.raw["limits"]["max_concurrent"] = 2
+        cfg.raw["limits"]["per_client_concurrent"] = 1
+        adm = self._adm(cfg)
+        self.assertEqual(adm.snapshot()["maxConcurrent"], 2)
+        with adm.hold("c1"):
+            with adm.hold("c2"):                     # 两路通道，两人各占一条
+                self.assertEqual(adm.snapshot()["active"], 2)
+        # 改小成 1：**同一个 Admission 对象**，不许重建
+        cfg.raw["limits"]["max_concurrent"] = 1
+        self.assertEqual(adm.snapshot()["maxConcurrent"], 1, "上限被缓存在构造时了")
+        with adm.hold("c1"):
+            with self.assertRaises(errors.EchoError) as ctx:
+                with adm.hold("c2"):
+                    pass
+            self.assertEqual(ctx.exception.code, "server_busy")
+        # 改大到 3：也不许重建
+        cfg.raw["limits"]["max_concurrent"] = 3
+        with adm.hold("c1"):
+            with adm.hold("c2"):
+                with adm.hold("c3"):
+                    self.assertEqual(adm.snapshot()["active"], 3)
+
+    def test_the_per_client_limit_is_read_live_too(self):
+        cfg = settings_mod.load()
+        cfg.raw["limits"]["max_concurrent"] = 4
+        cfg.raw["limits"]["per_client_concurrent"] = 1
+        adm = self._adm(cfg)
+        with adm.hold("c1"):
+            with self.assertRaises(errors.EchoError) as ctx:
+                with adm.hold("c1"):
+                    pass
+            self.assertEqual(ctx.exception.code, "client_busy")
+        cfg.raw["limits"]["per_client_concurrent"] = 2
+        with adm.hold("c1"):
+            with adm.hold("c1"):                     # 现在同一个客户端能有 2 路
+                self.assertEqual(adm.snapshot()["perClientConcurrent"], 2)
+
+    def test_without_the_seam_it_falls_back_to_the_constructor(self):
+        """不接现读那条线时（单测直接 `Admission(2, 1)`）行为与以前一致。"""
+        adm = routes_mod.Admission(max_concurrent=1, per_client=1)
+        adm.precheck("c1")
+        with adm.hold("c1"):
+            with self.assertRaises(errors.EchoError):
+                adm.precheck("c1")
+
+
+class RuntimeLimitsTests(unittest.TestCase):
+    """运行参数（`server/limits.py`）：取值、校验、优先级、持久化与**旧库升级**。
+
+    ⚠️ 全部用**临时目录**：`Store` 的路径、`cfg` 都是当场造的。
+    本仓库对"测试碰真实数据"极敏感 —— 这个文件里已经有过
+    "`open_store(cfg)` 默认去开开发机真实库"的事故（见 `_cfg` 的注释），
+    所以这里一处都不走默认路径。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="echo-limits-")
+        self.db = os.path.join(self.tmp, "auth.db")
+
+    def _store(self):
+        store = store_mod.Store(self.db)
+        self.addCleanup(store.close)
+        return store
+
+    def _cfg(self):
+        """全新配置（**没有**管理面写入）：这里只钉"出厂默认 / 环境变量"这一层。"""
+        return settings_mod.load()
+
+    def test_the_factory_default_is_six(self):
+        with patch.dict(os.environ, {"ECHO_MAX_CONCURRENT": ""}, clear=False):
+            cfg = self._cfg()
+            self.assertEqual(cfg.max_concurrent, 6)
+            self.assertEqual(settings_mod.DEFAULTS["limits"]["max_concurrent"], 6)
+        self.assertEqual(cfg.per_client_concurrent, 1)
+        self.assertEqual(int(cfg.get("limits.queue_max", -1)), 0)
+
+    def test_the_view_says_the_queue_limit_has_no_executor_yet(self):
+        """`queue_max` 现在**只有宣告、没有执行者**（v1 不排队）—— 必须说出来。
+
+        不说的话，页面上那个输入框会让人以为"填了 10 就会排队"，
+        而实际行为（满了直接 503）与他的预期完全相反。
+        """
+        view = limits_mod.view(self._cfg(), None)
+        self.assertIn("不会真的开始排队", view["queueNote"])
+        self.assertEqual(view["ranges"]["queueMax"], [0, 100])
+
+    def test_the_environment_variable_still_works_when_nothing_was_saved(self):
+        """没在管理面配过时，env 照旧生效（它是空 state 卷首启时的起点）。"""
+        with patch.dict(os.environ, {"ECHO_MAX_CONCURRENT": "3",
+                                     "ECHO_PER_CLIENT_CONCURRENT": "2",
+                                     "ECHO_QUEUE_MAX": "7"}, clear=False):
+            cfg = self._cfg()
+            self.assertEqual(cfg.max_concurrent, 3)
+            self.assertEqual(cfg.per_client_concurrent, 2)
+            self.assertEqual(int(cfg.get("limits.queue_max")), 7)
+            view = limits_mod.view(cfg, None)
+        self.assertEqual(view["source"]["maxConcurrent"], "env")
+        self.assertEqual(view["envValues"]["maxConcurrent"], 3)
+        self.assertEqual(view["limits"]["queueMax"], 7)
+
+    def test_the_admin_value_wins_over_the_environment_variable(self):
+        """**优先级：管理面配置 > 环境变量**（用户要的是"页面上改了就得算"）。
+
+        这条就是钉住那个陷阱的：compose 默认设了 `ECHO_MAX_CONCURRENT`，
+        若 env 优先，管理面改成别的值会**静默不生效**。选了 A（管理面优先）之后，
+        必须能同时看到两件事：生效值 = 管理面那份，以及一句**如实提示**。
+        """
+        store = self._store()
+        store.set_limit_overrides({"max_concurrent": 6}, "ops")
+        with patch.dict(os.environ, {"ECHO_MAX_CONCURRENT": "2"}, clear=False):
+            cfg = self._cfg()
+            self.assertEqual(cfg.max_concurrent, 2, "env 这一层本身仍然要生效")
+            applied = limits_mod.apply_stored(cfg, store)
+            self.assertEqual(applied, {"max_concurrent": 6})
+            self.assertEqual(cfg.max_concurrent, 6, "管理面配置必须盖过环境变量")
+            view = limits_mod.view(cfg, store)
+            self.assertEqual(view["source"]["maxConcurrent"], "admin")
+            self.assertEqual(view["limits"]["maxConcurrent"], 6)
+            # env 仍然**如实报出来**（不是装作它不存在）
+            self.assertEqual(view["envValues"]["maxConcurrent"], 2)
+            self.assertTrue(any("ECHO_MAX_CONCURRENT=2" in n and "6" in n
+                                for n in view["notes"]), view["notes"])
+
+    def test_saving_persists_and_survives_a_reopen(self):
+        """写进去的值**重开库还在**（重启后仍然生效），并且能重新应用到新 cfg 上。"""
+        store = self._store()
+        self.assertEqual(limits_mod.stored(store), {})
+        limits_mod.set_limits(self._cfg(), store,
+                              {"maxConcurrent": 9, "perClientConcurrent": 3, "queueMax": 5},
+                              updated_by="ops")
+        reopened = self._store()
+        self.assertEqual(limits_mod.stored(reopened),
+                         {"max_concurrent": 9, "per_client_concurrent": 3, "queue_max": 5})
+        rows = {r["name"]: r for r in reopened.limit_overrides()}
+        self.assertEqual(rows["max_concurrent"]["updated_by"], "ops")
+        with patch.dict(os.environ, {"ECHO_MAX_CONCURRENT": ""}, clear=False):
+            fresh = self._cfg()
+            limits_mod.apply_stored(fresh, reopened)
+            self.assertEqual(fresh.max_concurrent, 9)
+            self.assertEqual(fresh.per_client_concurrent, 3)
+
+    def test_an_old_database_gains_the_table_when_it_is_opened(self):
+        """**旧库平滑升级**：老库没有 `server_limits`，开库时补上，且原有数据一条不动。
+
+        用 `DROP TABLE` 把一个真库改回"上一版的样子"（这是最贴近现场的模拟：
+        开发机与容器里那些库都不是新建的）。
+        """
+        import sqlite3
+        store = self._store()
+        store.upsert_client("cli-old", "老客户端",
+                            auth_mod.hash_secret("s", "cli-old"), scopes="asr")
+        store.close()
+        con = sqlite3.connect(self.db)
+        con.execute("DROP TABLE server_limits")
+        con.commit()
+        con.close()
+        upgraded = store_mod.Store(self.db)          # ← 旧库在这里被升级
+        self.addCleanup(upgraded.close)
+        self.assertIn("server_limits", upgraded.tables())
+        self.assertEqual(limits_mod.stored(upgraded), {}, "旧库不该凭空多出一个'配过的'值")
+        self.assertIsNotNone(upgraded.client("cli-old"), "升级把老数据弄丢了")
+        with patch.dict(os.environ, {"ECHO_MAX_CONCURRENT": ""}, clear=False):
+            cfg = self._cfg()
+            self.assertEqual(limits_mod.apply_stored(cfg, upgraded), {})
+            self.assertEqual(cfg.max_concurrent, 6, "没配过就该是出厂默认")
+
+    def test_validation_is_strict_and_says_why(self):
+        store = self._store()
+        current = limits_mod.effective(self._cfg())
+        for bad, want in (
+            ({"maxConcurrent": 0}, "总并发"),
+            ({"maxConcurrent": 65}, "总并发"),
+            ({"maxConcurrent": "abc"}, "总并发"),
+            ({"maxConcurrent": ""}, "总并发"),
+            ({"maxConcurrent": True}, "总并发"),
+            ({"maxConcurrent": 6.5}, "总并发"),
+            ({"perClientConcurrent": 0}, "每客户端并发"),
+            ({"perClientConcurrent": 99}, "每客户端并发"),
+            ({"perClientConcurrent": 7}, "每客户端并发"),      # 大于总并发（默认 6）
+            ({"queueMax": -1}, "队列上限"),
+            ({"queueMax": 101}, "队列上限"),
+            ({"nope": 1}, "不认识的运行参数"),
+        ):
+            with self.subTest(bad=bad):
+                with self.assertRaises(errors.EchoError) as ctx:
+                    limits_mod.parse(bad, current)
+                self.assertEqual(ctx.exception.status, 400)
+                self.assertIn(want, ctx.exception.detail)
+        self.assertEqual(limits_mod.stored(store), {}, "校验失败却写进了库")
+
+    def test_an_empty_payload_is_a_400_not_a_silent_no_op(self):
+        """空请求体不是"什么都没改"的成功 —— 它多半意味着表单/前端出了问题，
+        而"回了 200 但什么都没发生"是最难查的一种。"""
+        store = self._store()
+        for empty in ({}, None):
+            with self.subTest(empty=empty):
+                with self.assertRaises(errors.EchoError) as ctx:
+                    limits_mod.set_limits(self._cfg(), store, empty)
+                self.assertEqual(ctx.exception.status, 400)
+                self.assertIn("至少一个", ctx.exception.detail)
+        self.assertEqual(limits_mod.stored(store), {})
+
+
 class AdmissionWiringTests(_AppCase):
     """闸门真的**接在路由上**（不是躺在那里没人调）。
 
@@ -661,9 +882,13 @@ class ExampleConfigTests(unittest.TestCase):
                          "示例配置与出厂清单不一致 —— 改了一边就要改另一边")
 
     def test_example_limits_match_the_decided_values(self):
-        """2026-09-23 定的数：总通道 2、每客户端 1、**不排队**。"""
+        """2026-09-29 定的数：总通道 **6**（从 2 提上来）、每客户端 1、**不排队**。
+
+        示例配置与代码默认值必须**说同一件事** —— 它们漂开过一次，症状是
+        "人照着示例改出来的服务端，与代码默认的服务端不是同一个东西"。
+        """
         cfg = self._example()
-        self.assertEqual(cfg.max_concurrent, 2)
+        self.assertEqual(cfg.max_concurrent, 6)
         self.assertEqual(cfg.per_client_concurrent, 1)
         self.assertEqual(int(cfg.get("limits.queue_max", -1)), 0)
 
@@ -1360,9 +1585,12 @@ class AuthSchemaTests(unittest.TestCase):
         """代码里的白名单与设计 §8.5 必须一致（这里只钉前后两端不漂）。"""
         # `calls` 是 2026-09-24 按设计加进来的（审计**元数据**，设计 §7.3 逐字给了那十列）。
         # `admin_users` / `admin_audit` 是同一天做管理面时加的（§8.4 要一套管理员账号体系）。
+        # `server_limits` 是 2026-09-29 加的（运行参数要在管理面上配、且重启后还在）——
+        # 它是**第三类**：不是客户端数据、也不是请求元数据，而是"这台后端怎么跑"。
         # 加表要走评审 —— 这条断言就是那道门：白名单变了，这里必须跟着改一次。
         self.assertEqual(tuple(store_mod.TABLE_WHITELIST),
-                         ("clients", "pairing_codes", "calls", "admin_users", "admin_audit"))
+                         ("clients", "pairing_codes", "calls", "admin_users", "admin_audit",
+                          "server_limits"))
 
 
 class AuthPairingTests(unittest.TestCase):
@@ -1481,6 +1709,86 @@ class AuthPairingTests(unittest.TestCase):
                 code = c.app.state.echo.auth.create_pairing_code("admin")
                 r = c.post("/v1/pair", json={"code": code})
         self.assertEqual(r.status_code, 403, r.text)
+
+
+class PendingPairingCodesTests(unittest.TestCase):
+    """「待用的配对码」= **真正可用**：未消费 **且** 未过期，而且只有一份判据。
+
+    管理面那一页（`GET /admin/api/pairing-codes` → `ops.pending_pairing_codes`）与
+    命令行（`--list-codes` → 同一个函数）**共用**这个整理函数，所以判据钉在这里，
+    两个出口各再有一条端到端的用例：
+    `tests.test_admin_console.PairingCodeWriteTests`（页面/API）与
+    `AdminCliTests.test_list_codes_hides_used_and_expired_codes`（命令行）。
+
+    2026-09-29 用户实测的 bug：那张表里出现了**已过期**的码（徽章写着「已过期」却列在
+    「待用」，标题与内容自相矛盾），而他以为是"已经配对成功的那张"。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="echo-pending-codes-")
+        self.cfg = _auth_cfg(self.tmp, enabled=True, mode="jwt",
+                             jwt_secret="unit-test-secret-0123456789abcdef")
+        self.store = auth_mod.open_store(self.cfg)
+        self.auth = auth_mod.Auth(self.cfg, self.store)
+        self.addCleanup(self.store.close)
+
+    def test_only_unused_and_unexpired_codes_are_pending(self):
+        live = self.auth.create_pairing_code("ops", name="能用的")
+        self.store.put_pairing_code("a-row-that-already-expired", -1,
+                                    created_by="ops", name="过期的")
+        used = self.auth.create_pairing_code("ops", name="用掉的")
+        self.auth.redeem(used, "对端自报的名字")
+        rows = ops_mod.pending_pairing_codes(self.store)
+        self.assertEqual([r["name"] for r in rows], ["能用的"], rows)
+        self.assertEqual(rows[0]["id"], auth_mod.hash_pairing_code(live))
+        self.assertFalse(rows[0]["expired"])
+        self.assertGreaterEqual(rows[0]["remainingSeconds"], 1,
+                                "列出来的码一定还能用，剩余秒数不该报 0")
+
+    def test_the_expiry_boundary_matches_the_redeem_side(self):
+        """过期边界：判据是 `expires_at < now`（差 1 秒过 / 差 1 秒没过），
+        而且**兑换那一侧用的是同一个函数** —— 列表说能用、兑的时候说已过期，
+        就是同一张码给出两个答案。"""
+        now = time.time()
+        self.assertFalse(auth_mod.pairing_code_expired({"expires_at": now + 1}, now))
+        self.assertTrue(auth_mod.pairing_code_expired({"expires_at": now - 1}, now))
+        # 恰好到期那一瞬仍然能用（`<`，不是 `<=`）—— 与 `Auth.redeem()` 一字不差
+        self.assertFalse(auth_mod.pairing_code_expired({"expires_at": now}, now))
+        self.store.put_pairing_code("expired-1s", -1, created_by="ops", name="过期 1 秒")
+        self.store.put_pairing_code("live-1s", 1, created_by="ops", name="还有 1 秒")
+        rows = ops_mod.pending_pairing_codes(self.store, now=now)
+        self.assertEqual([r["id"] for r in rows], ["live-1s"], rows)
+        # 清理与判据同边界：`sweep_pairing_codes()` 只删"严格已过期"的行，
+        # 不误删"正好到期（还能用）"的那一行 —— 否则下一次发码会把一张能用的码清掉。
+        self.store.put_pairing_code("at-boundary", 0, created_by="ops", name="正好到期")
+        self.store.sweep_pairing_codes(now=now)
+        left = sorted(r["code_hash"] for r in self.store.pairing_codes())
+        self.assertNotIn("expired-1s", left)
+        self.assertIn("live-1s", left, "清理误删了还能用的行")
+        self.assertIn("at-boundary", left, "清理误删了正好到期（仍然能用）的那一行")
+
+    def test_consuming_a_code_leaves_an_audit_row_not_a_pending_row(self):
+        """用掉的码**不留在这张表里**（用掉即删）；留痕走审计 —— 谁发的码、
+        码上带的名字、换出了哪个客户端。"""
+        code = self.auth.create_pairing_code("ops", name="留痕的")
+        out = self.auth.redeem(code, "对端自报的")
+        self.assertEqual(ops_mod.pending_pairing_codes(self.store), [],
+                         "用掉的码还在「待用」清单里")
+        hit = [r for r in self.store.recent_audit(20)
+               if r["action"] == auth_mod.PAIR_REDEEM_ACTION]
+        self.assertEqual(len(hit), 1, self.store.recent_audit(20))
+        self.assertIn("ops", hit[0]["admin"])
+        self.assertIn("留痕的", hit[0]["target"])
+        self.assertIn(out["clientId"], hit[0]["target"])
+
+    def test_a_failed_redeem_leaves_no_audit_row(self):
+        """**只记成功**的消费：这是免凭据端点，失败了也记就等于给扫描器一个免费存储
+        （与 `admin.audit_write` 那条"不认识是谁的请求不留痕"同一个理由）。"""
+        with self.assertRaises(errors.EchoError):
+            self.auth.redeem("ZZZZZZZZ")
+        hit = [r for r in self.store.recent_audit(20)
+               if r["action"] == auth_mod.PAIR_REDEEM_ACTION]
+        self.assertEqual(hit, [], "猜码失败也写了审计")
 
 
 class AuthTokenTests(unittest.TestCase):
@@ -2335,6 +2643,31 @@ class AdminCliTests(unittest.TestCase):
         self.assertIn("还没配对的机器", out)
         self.assertIn("剩余", out)
         self.assertIn("只存哈希", out)
+
+    def test_list_codes_hides_used_and_expired_codes(self):
+        """**命令行与页面同一份判据**（`ops.pending_pairing_codes`）：只有
+        「未消费 且 未过期」的码会出现在 `--list-codes` 里。
+
+        用户 2026-09-29 在 .30 上看到的正是命令行这一侧的样子：列表里出现"剩余 0.0 分钟"
+        的行 —— 那是**过期**的码摆在"待用"表里（页面上同一行写着「已过期」徽章）。
+        两个出口一起修，所以两个出口各有一条用例。
+        """
+        cfg = settings_mod.load(self.cfg_path)
+        store = auth_mod.open_store(cfg)
+        auth = auth_mod.Auth(cfg, store)
+        store.put_pairing_code("a-row-that-already-expired", -1,
+                               created_by="cli", name="过期的那张")
+        used = auth.create_pairing_code("cli", name="用掉的那张")
+        auth.create_pairing_code("cli", name="能用的那张")
+        auth.redeem(used)
+        store.close()
+
+        rc, out = self._run("--list-codes")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("能用的那张", out)
+        self.assertNotIn("过期的那张", out, "过期的码出现在待用清单里：\n" + out)
+        self.assertNotIn("用掉的那张", out, "用过的码出现在待用清单里：\n" + out)
+        self.assertNotIn("0.0 分钟", out, "清单里又出现了\"剩余 0.0 分钟\"的行：\n" + out)
 
     def test_show_client_prints_the_essentials(self):
         paired = self._client()

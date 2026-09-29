@@ -37,6 +37,8 @@ from fastapi.testclient import TestClient                            # noqa: E40
 
 from server import admin as admin_mod                                # noqa: E402
 from server import engines, errors, main as server_main              # noqa: E402
+from server import limits as limits_mod                              # noqa: E402
+from server import ops as ops_mod                                    # noqa: E402
 from server import perfmon as perfmon_mod                            # noqa: E402
 from server import routes as routes_mod                              # noqa: E402
 from server import settings as settings_mod                          # noqa: E402
@@ -68,6 +70,17 @@ WRITE_ENDPOINTS = {
     # （会话 + 同站 Origin + X-ECHO-Admin + CSRF + 审计），没有新开免检端点。
     "/admin/api/perf/start",
     "/admin/api/perf/stop",
+    # 运行参数（总并发 / 每客户端并发 / 队列上限）。2026-09-29 用户要求
+    # "并发上限由管理员在管理面上配" —— 它同样是改状态的动作，走同一套闸门 + 审计
+    # （action = `limits-set`）。**没有一个字是免检的**：见 `LimitsConsoleTests`。
+    "/admin/api/limits",
+    # 改**自己**的口令（2026-09-29 用户要求："页面上还是要提供修改密码功能"）。
+    # 它动的是"进这扇门的凭据"，所以除了那七道闸还自带两道锁：
+    # ① **必须带当前口令**（`current`，见 `admin_mod.change_admin_password`）——
+    #    一次会话劫持不足以改掉口令；② **只能改会话里的那一个账号**
+    #    （请求体里的 `username` 只用来**拒绝**）。新增 / 删除 / 禁用管理员、
+    # 改**别人**的口令仍然只在命令行 —— 见 `PasswordChangeConsoleTests`。
+    "/admin/api/password",
 }
 
 
@@ -778,9 +791,114 @@ class PairingCodeWriteTests(_AdminCase):
                 r = self.wpost("/admin/api/pairing-codes", {"ttlSeconds": bad})
                 self.assertEqual(r.status_code, 400, r.text)
 
-    def test_an_expired_code_is_marked_and_a_new_issue_reaps_it(self):
-        """过期的码会被下一次发码顺手清掉（`ops.issue_pairing_code` 里那一步）——
-        否则"待用配对码"这个数字会永远比实际多。
+    def test_the_pending_list_holds_only_codes_that_still_work(self):
+        """**"待用 = 真正可用"**：三张码（未用的 / 已过期的 / 已用掉的）→ 表里只剩第一张。
+
+        这是 2026-09-29 用户实测的那个 bug 的判据：他把「已经配对成功过」的码当成
+        `office-2060s` 那张，而它带着「已过期」的徽章挂在「待用」表里 ——
+        标题与内容自相矛盾。两个条件分开的坏法都会在这里红：
+
+        * 查询漏了"过期"那一半 → 第二张会出现在结果里；
+        * 消费没有真的落库（比如哪天改成软删除却忘了在查询里带条件）→ 第三张会出现。
+        """
+        self.login()
+        live = self.wpost("/admin/api/pairing-codes",
+                          {"name": "能用的", "ttlSeconds": 600}).json()["pairingCode"]
+        expired = self.wpost("/admin/api/pairing-codes",
+                             {"name": "过期的", "ttlSeconds": 60}).json()["pairingCode"]
+        used = self.wpost("/admin/api/pairing-codes",
+                          {"name": "用掉的", "ttlSeconds": 600}).json()["pairingCode"]
+        store = self.state.auth.store
+        # 把第二张推成"1 秒前刚过期"：删掉再以负 TTL 存回同一张码（不碰 store 的内部锁）
+        store.delete_pairing_code(expired["id"])
+        store.put_pairing_code(expired["id"], -1, created_by="t", name="过期的")
+        self.assertEqual(len(store.pairing_codes()), 3, "库里应当确实有三行")
+        # 第三张走真实的免凭据端点兑掉 —— 消费必须真的落库（不是只在这里打桩）
+        first = self.client.post("/v1/pair", json={"code": used["code"]})
+        self.assertEqual(first.status_code, 200, first.text)
+
+        d = self.ac.get("/admin/api/pairing-codes").json()
+        self.assertEqual([c["id"] for c in d["codes"]], [live["id"]], d["codes"])
+        row = d["codes"][0]
+        self.assertEqual(row["name"], "能用的")
+        self.assertFalse(row["expired"])
+        self.assertGreaterEqual(row["remainingSeconds"], 1,
+                                "列出来的码一定还能用，剩余秒数不该是 0")
+
+    def test_a_consumed_code_leaves_the_list_at_once_and_cannot_be_used_twice(self):
+        """回归「只能用一次」：`/v1/pair` 用掉码的那一瞬之后 ——
+        列表里立刻没有它，而且**第二次兑换必须失败**。
+
+        两个断言必须成对：只断言"列表里没了"的话，一个"把码从表里挪走但没作废"的
+        坏改法也能过；只断言"第二次失败"的话，一张还挂在"待用"表里的码也能过。
+        """
+        self.login()
+        pc = self.wpost("/admin/api/pairing-codes",
+                        {"name": "只能用一次", "ttlSeconds": 600}).json()["pairingCode"]
+        before = self.ac.get("/admin/api/pairing-codes").json()["codes"]
+        self.assertEqual([c["id"] for c in before], [pc["id"]], before)
+
+        first = self.client.post("/v1/pair", json={"code": pc["code"]})
+        self.assertEqual(first.status_code, 200, first.text)
+        self.assertTrue(first.json()["clientId"].startswith("cli-"))
+
+        after = self.ac.get("/admin/api/pairing-codes").json()["codes"]
+        self.assertEqual(after, [], "用掉的码还留在「待用」表里：%s" % (after,))
+        again = self.client.post("/v1/pair", json={"code": pc["code"]})
+        self.assertEqual(again.status_code, 401, again.text)
+        # 失败的那一次不该把行"写回来"，也不该再长出新的待用行
+        self.assertEqual(self.ac.get("/admin/api/pairing-codes").json()["codes"], [])
+
+    def test_the_expiry_boundary_is_one_second_each_way(self):
+        """过期边界：差 1 秒过 / 差 1 秒没过。判据是**同一个函数**，不靠 sleep。
+
+        后半段还钉住「清理不会误删还能用的行」：`store.sweep_pairing_codes()` 的
+        边界必须与列表判据一致（都用 `<`），否则"下一次发码顺手清理"会删掉一张
+        列表上还写着能用的码。
+        """
+        self.login()
+        store = self.state.auth.store
+        now = time.time()
+        store.put_pairing_code("expired-1s", -1, created_by="t", name="过期 1 秒")
+        store.put_pairing_code("live-1s", 1, created_by="t", name="还有 1 秒")
+        rows = ops_mod.pending_pairing_codes(store, now=now)
+        self.assertEqual([r["id"] for r in rows], ["live-1s"], rows)
+        self.assertEqual(rows[0]["remainingSeconds"], 1)
+        self.assertFalse(rows[0]["expired"])
+        # 恰好到期的那一瞬仍然算"能用" —— 与 `Auth.redeem()` 的判据一字不差（`< now`）
+        self.assertFalse(auth_mod.pairing_code_expired({"expires_at": now}, now))
+        self.assertTrue(auth_mod.pairing_code_expired({"expires_at": now - 1}, now))
+        self.assertFalse(auth_mod.pairing_code_expired({"expires_at": now + 1}, now))
+        # 清理：只删"严格已过期"的，不误删边界上那张还能用的
+        store.put_pairing_code("at-boundary", 0, created_by="t", name="正好到期")
+        store.sweep_pairing_codes(now=now)
+        left = sorted(r["code_hash"] for r in store.pairing_codes())
+        self.assertNotIn("expired-1s", left, "过期的行没有被清掉")
+        self.assertIn("at-boundary", left, "清理误删了正好到期（仍然能用）的那一行")
+        self.assertIn("live-1s", left, "清理误删了还能用的那一行")
+        # 端点那一侧同样只剩能用的：过期的绝不出现（这里是"差 1 秒过"的那张）
+        d = self.ac.get("/admin/api/pairing-codes").json()
+        self.assertNotIn("expired-1s", [c["id"] for c in d["codes"]], d["codes"])
+
+    def test_a_consumed_code_leaves_an_audit_row_instead_of_a_pending_row(self):
+        """用掉的码**不留在这张表里**；留痕在审计里（谁发的码 / 什么名字 / 换了哪个客户端）。"""
+        self.login()
+        pc = self.wpost("/admin/api/pairing-codes",
+                        {"name": "留痕的", "scopes": "asr",
+                         "note": "ops"}).json()["pairingCode"]
+        out = self.client.post("/v1/pair", json={"code": pc["code"]}).json()
+        hit = [r for r in self.audit_rows() if r[1] == auth_mod.PAIR_REDEEM_ACTION]
+        self.assertEqual(len(hit), 1, self.audit_rows())
+        admin, _action, target = hit[0]
+        self.assertIn("ops", admin, "审计里没写清是谁发的这张码：%s" % (hit[0],))
+        self.assertIn("留痕的", target)
+        self.assertIn(out["clientId"], target)
+
+    def test_an_expired_code_is_not_listed_and_a_new_issue_reaps_it(self):
+        """过期的码**不进"待用"表**，而库里那一行由下一次发码顺手清掉。
+
+        2026-09-29 之前这里断言的是"被**标记**为已过期"（表里留着、徽章写「已过期」）——
+        那正是用户报的 bug：标题说「待用」、内容说「已过期」。现在它不列出来了。
 
         这里用"删掉再以负 TTL 存回同一张码"把它推进过去，而不是 sleep 60 秒：
         用的是 store 的公开方法，不去碰它的内部锁。
@@ -790,10 +908,10 @@ class PairingCodeWriteTests(_AdminCase):
         store = self.state.auth.store
         store.delete_pairing_code(old["id"])
         store.put_pairing_code(old["id"], -1, created_by="t", name="过期的")
+        self.assertEqual([r["code_hash"] for r in store.pairing_codes()], [old["id"]],
+                         "库里应当确实有这一行（否则下面那条'被清掉'就没有意义）")
         d = self.ac.get("/admin/api/pairing-codes").json()
-        self.assertEqual(len(d["codes"]), 1)
-        self.assertTrue(d["codes"][0]["expired"])
-        self.assertEqual(d["codes"][0]["remainingSeconds"], 0)
+        self.assertEqual(d["codes"], [], "过期的码被列进了「待用」表")
         fresh = self.wpost("/admin/api/pairing-codes", {"name": "新的"}).json()["pairingCode"]
         left = [r["code_hash"] for r in store.pairing_codes()]
         self.assertEqual(left, [fresh["id"]], "过期的码没有被顺手清掉")
@@ -820,6 +938,33 @@ class PairingCodeWriteTests(_AdminCase):
         self.client.post("/v1/pair", json={"code": pc["code"]})
         r = self.wdelete("/admin/api/pairing-codes/" + pc["id"], {"confirm": pc["id"]})
         self.assertEqual(r.status_code, 404, r.text)
+
+
+class PairingPageTests(_AdminCase):
+    """页面上那两句话：这张表里**只有能用的**，以及用掉的码去哪儿看。
+
+    文字测起来像是"测文案"，但这里测的是**判据的位置**：
+    "只有能用的码"这句话必须与后端 `ops.pending_pairing_codes()` 的语义一致，
+    而"用掉的码在审计里"是用户能自己回答"我那张码到底兑没兑"的唯一入口。
+    """
+
+    def _html(self):
+        r = self.ac.get("/admin/")
+        self.assertEqual(r.status_code, 200)
+        return r.text
+
+    def test_the_pending_card_claims_only_usable_codes(self):
+        html = self._html()
+        self.assertIn("待用的配对码（能用的 ", html,
+                      "标题又成了含糊的「待用」：表里只有能用的码，就该这么说")
+        # 不到 1 分钟如实报秒（`left()` 里那一条）—— 否则 5 秒的码会渲染成"1 分钟"，
+        # 而 0 秒那一档渲染出来就是与"待用"自相矛盾的「已过期」徽章。
+        self.assertIn('sec + " 秒"', html)
+
+    def test_the_page_says_where_a_consumed_code_went(self):
+        html = self._html()
+        self.assertIn("pair-redeem", html)
+        self.assertIn("pair:&lt;发放者&gt;", html)
 
 
 class ClientWriteTests(_AdminCase):
@@ -974,10 +1119,14 @@ class ClientWriteTests(_AdminCase):
             self.assertNotIn(word, r.text)
 
     def test_the_account_list_is_read_only(self):
-        """管理员账号**只在命令行**改 —— 面板最多只读展示清单。
+        """账号的**增删改**（含改别人的口令）只在命令行 —— 面板最多只读展示清单。
 
         理由：改账号等于"改谁能进这扇门"，而面板本身就在这扇门里
         （一次会话劫持就能顺手把攻击者自己加成管理员）。
+        2026-09-29 只开了**一个**口子：改**自己**的口令，而且必须带当前口令
+        （`POST /admin/api/password`，见 `PasswordChangeConsoleTests`）——
+        所以这里仍然钉着两件事：没有任何写端点落在 `/admins` 上；
+        写端点里也没有 `{username}` 这种"指名道姓改谁"的占位符。
         """
         self.login()
         d = self.ac.get("/admin/api/admins").json()
@@ -986,6 +1135,308 @@ class ClientWriteTests(_AdminCase):
         self.assertNotIn("password_hash", json.dumps(d, ensure_ascii=False))
         for _method, path, _real in self.write_requests():
             self.assertNotIn("/admins", path)
+            self.assertNotIn("{username}", path,
+                             "写端点不许按用户名指名改账号（那正是「改别人」的入口）")
+        touched = [p for _m, p, _r in self.write_requests()
+                   if "password" in p or "/admins" in p]
+        self.assertEqual(touched, ["/admin/api/password"], touched)
+
+
+class PasswordChangeConsoleTests(_AdminCase):
+    """改**自己**的口令（2026-09-29 用户要求："页面上还是要提供修改密码功能"）。
+
+    这一组的重心不是"回了个 200"，而是四条：
+
+    1. 闸门与其它写动作**完全一致**（未登录 401；错 Origin / 缺 `X-ECHO-Admin` /
+       缺 CSRF → 403），而且被挡回来时**口令一个字节都没动**；
+    2. **必须带当前口令**（`current` 错 → 403），且**只能改会话里那一个账号**
+       （请求体里指着别人 → 400）—— 这两条就是"一次会话劫持不足以改口令"的落点；
+    3. 成功之后**新口令能登录、旧口令不能** —— 这是这条功能唯一有意义的判据
+       （只断言 200 的话，端点回 200 却没落库、或者落了个错的哈希，都会绿）；
+    4. 审计（成功 `password-change` / 失败 `password-change.failed` 带中文原因）、
+       以及"**其它会话失效、当前会话保留**"（既有手段：`SessionStore.drop_user`）。
+
+    **没做**（也刻意不做）：新建 / 删除 / 禁用管理员、改**别人**的口令 ——
+    仍然只在命令行。这条边界由 `ClientWriteTests.test_the_account_list_is_read_only`
+    与 `PasswordPageTests` 一起钉着。
+    """
+
+    NEW = "brand-new-pass"
+
+    def _hash(self, user="ops"):
+        return self.state.auth.store.admin(user)["password_hash"]
+
+    def _change(self, payload=None, **kw):
+        body = {"current": "good-pass", "new": self.NEW}
+        body.update(payload or {})
+        return self.wpost("/admin/api/password", body, **kw)
+
+    def _login_with(self, password, user="ops"):
+        """另开一个客户端（自己的 cookie 罐）打一次登录 —— 走**真的**登录那条路。"""
+        fresh = TestClient(self.admin, base_url=self.ADMIN_BASE)
+        return fresh.post("/admin/api/login", json={"username": user, "password": password})
+
+    def test_the_gates_are_the_same_as_every_other_write(self):
+        before = self._hash()
+        r = self.ac.post("/admin/api/password",
+                         json={"current": "good-pass", "new": self.NEW})
+        self.assertEqual(r.status_code, 401, r.text)
+        self.assertEqual(r.json()["code"], "unauthorized")
+        self.login()
+        for kw, want in (({"origin": "http://evil.example"}, "Origin"),
+                         ({"header": False}, admin_mod.WRITE_HEADER),
+                         ({"csrf": False}, "CSRF")):
+            with self.subTest(gate=sorted(kw)):
+                r = self._change(**kw)
+                self.assertEqual(r.status_code, 403, r.text)
+                self.assertIn(want, r.json()["detail"])
+        self.assertEqual(self._hash(), before, "被闸门挡回来的请求居然改了口令")
+        self.assertFalse(admin_mod.verify_password(self.NEW, self._hash()))
+        self.assertEqual(self._login_with(self.NEW).status_code, 401)
+
+    def test_a_wrong_current_password_is_refused_and_changes_nothing(self):
+        """`current` 不对 → **403**（不是 400），口令不变。
+
+        为什么是 403 而不是 400：请求本身没有任何毛病（那两个字段都在、都合法），
+        **是身份不够** —— 这里正是"必须提供当前口令"那道闸门的落点，
+        会话被劫持时攻击者就卡在这一步。说成 400（"请求不合法"）会把原因指错。
+        """
+        self.login()
+        before = self._hash()
+        for bad in ({"current": "wrong-pass"}, {"current": ""}, {"current": None}):
+            with self.subTest(current=bad["current"]):
+                r = self._change(bad)
+                self.assertEqual(r.status_code, 403, r.text)
+                self.assertEqual(r.json()["code"], "forbidden")
+                self.assertIn("当前口令", r.json()["detail"])
+                self.assertEqual(self._hash(), before)
+        self.assertEqual(self._login_with("good-pass").status_code, 200)
+        self.assertEqual(self._login_with(self.NEW).status_code, 401)
+
+    def test_the_new_password_must_follow_the_policy(self):
+        """空 / 太短 / 太长 / 与当前口令相同 → 400 + **中文原因**，口令不变。"""
+        self.login()
+        before = self._hash()
+        cases = (({"new": ""}, "不能为空"),
+                 ({"new": "short"}, "至少 8 位"),
+                 ({"new": "x" * 201}, "最多 200 位"),
+                 ({"new": "good-pass"}, "不能与当前口令相同"),
+                 ({"new": None}, "不能为空"))
+        for bad, want in cases:
+            with self.subTest(bad=bad):
+                r = self._change(bad)
+                self.assertEqual(r.status_code, 400, r.text)
+                self.assertEqual(r.json()["code"], "bad_request")
+                self.assertIn(want, r.json()["detail"])
+                self.assertIn("请求不合法", r.json()["message"])
+                self.assertEqual(self._hash(), before, "400 却改了口令")
+        # `new` 字段**整个没给**（与上面"给了空串/null"是两件事）
+        r = self.ac.post("/admin/api/password", json={"current": "good-pass"},
+                         headers=self.wheaders())
+        self.assertEqual(r.status_code, 400, r.text)
+        self.assertIn("不能为空", r.json()["detail"])
+        self.assertEqual(self._hash(), before, "400 却改了口令")
+
+    def test_the_minimum_length_boundary_is_exactly_the_documented_one(self):
+        """页面上写"至少 8 位"——那就得真是 8（7 位拒、8 位收）。"""
+        self.login()
+        self.assertEqual(admin_mod.MIN_PASSWORD_LEN, 8)
+        self.assertEqual(admin_mod.MAX_PASSWORD_LEN, 200)
+        self.assertEqual(self._change({"new": "7chars!"}).status_code, 400)
+        self.assertEqual(self._change({"new": "8chars!!"}).status_code, 200)
+
+    def test_only_the_logged_in_admin_can_be_targeted(self):
+        """请求体里指着**别人** → 400，一口回绝；那个人的口令一个字节都没动。
+
+        页面没有"改谁"这个入口（见 `PasswordPageTests`），所以这条路径只可能是
+        手搓的请求 —— 它必须被**明说**拒绝，而不是被静默忽略：
+        静默忽略会在某次"顺手支持一下 username 字段"的重构里变成真的改别人。
+        """
+        store = self.state.auth.store
+        store.upsert_admin("second", admin_mod.hash_password("second-pass"))
+        second_before = store.admin("second")["password_hash"]
+        self.login()
+        r = self._change({"username": "second"})
+        self.assertEqual(r.status_code, 400, r.text)
+        self.assertIn("只能改当前登录的这个管理员", r.json()["detail"])
+        self.assertIn("second", r.json()["detail"])
+        self.assertEqual(store.admin("second")["password_hash"], second_before)
+        self.assertTrue(admin_mod.verify_password("second-pass",
+                                                 store.admin("second")["password_hash"]))
+        self.assertFalse(admin_mod.verify_password(self.NEW,
+                                                  store.admin("second")["password_hash"]))
+        self.assertTrue(admin_mod.verify_password("good-pass", self._hash()),
+                        "拒绝必须发生在任何写之前 —— 连自己那份也不许动")
+        # 写上**自己**的名字是无害的（改的仍然是自己），这也说明它确实只认会话
+        self.assertEqual(self._change({"username": "ops"}).status_code, 200)
+        self.assertTrue(admin_mod.verify_password(self.NEW, self._hash()))
+
+    def test_the_new_password_logs_in_and_the_old_one_does_not(self):
+        """**这条功能的全部意义**：改完新口令进得来、旧口令进不来。"""
+        self.login()
+        r = self._change()
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertTrue(body["ok"])
+        self.assertEqual(body["username"], "ops")
+        self.assertNotIn(self.NEW, r.text, "响应里出现了口令明文")
+        row = self.state.auth.store.admin("ops")
+        self.assertTrue(row["password_hash"].startswith("scrypt$"),
+                        "存的还是明文/别的格式：%s" % row["password_hash"])
+        self.assertTrue(admin_mod.verify_password(self.NEW, row["password_hash"]))
+        self.assertFalse(admin_mod.verify_password("good-pass", row["password_hash"]))
+        # 真的走一遍登录那条路（不是只比哈希）
+        self.assertEqual(self._login_with("good-pass").status_code, 401)
+        good = self._login_with(self.NEW)
+        self.assertEqual(good.status_code, 200, good.text)
+        self.assertTrue(good.json()["csrf"])
+
+    def test_other_sessions_die_and_the_current_one_survives(self):
+        """口令一变，**别的登录会话立刻失效**，当前这个留着。
+
+        这里没有"会话版本号"那种机制（会话整个在 `SessionStore` 的进程内存里，
+        见模块开头），所以用的是**既有手段** `drop_user(username, keep=当前令牌)`。
+        留当前这个是有意的：刚改完就把自己踢回登录页，用户会以为改失败了。
+        """
+        self.login()
+        others = []
+        for _ in range(2):
+            c = TestClient(self.admin, base_url=self.ADMIN_BASE)
+            self.assertEqual(c.post("/admin/api/login",
+                                    json={"username": "ops",
+                                          "password": "good-pass"}).status_code, 200)
+            self.assertEqual(c.get("/admin/api/me").status_code, 200)
+            others.append(c)
+        r = self._change()
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["sessionsRevoked"], 2)
+        for c in others:
+            self.assertEqual(c.get("/admin/api/me").status_code, 401, "别的会话还活着")
+        self.assertEqual(self.ac.get("/admin/api/me").status_code, 200, "把自己也踢下线了")
+
+    def test_the_change_and_a_refusal_are_audited_without_the_password(self):
+        self.login()
+        self._change({"current": "wrong-pass"})
+        self._change()
+        rows = self.audit_rows()
+        ok = [r for r in rows if r[1] == "password-change"]
+        self.assertTrue(ok, rows)
+        self.assertEqual({r[0] for r in ok}, {"ops"})
+        self.assertEqual({r[2] for r in ok}, {"ops"}, "审计的 target 要写明改的是谁")
+        failed = [r for r in rows if r[1] == "password-change.failed"]
+        self.assertTrue(failed, rows)
+        self.assertIn("当前口令不对", failed[0][2])
+        dump = json.dumps(rows, ensure_ascii=False)
+        self.assertNotIn(self.NEW, dump, "审计里出现了新口令明文")
+        self.assertNotIn("good-pass", dump, "审计里出现了口令明文")
+
+    def test_repeated_wrong_current_passwords_are_throttled(self):
+        """"当前口令"不许当在线爆破口：同一来源失败 5 次后退避（429）。
+
+        这条退避与**登录**那条各算各的（`app.state.pwd_throttle`）——
+        改口令时把当前口令记错，不该顺手把登录也一起锁住。
+        """
+        self.login()
+        codes = [self._change({"current": "nope-%d" % i}).status_code for i in range(6)]
+        self.assertEqual(codes[:5], [403] * 5, codes)
+        self.assertEqual(codes[5], 429, codes)
+        self.assertEqual(self._login_with("good-pass").status_code, 200,
+                         "改口令的退避把登录也锁住了")
+        self.assertTrue(admin_mod.verify_password("good-pass", self._hash()))
+
+    def test_the_self_service_note_and_the_policy_come_from_the_backend(self):
+        """「只能改自己 + 增删仍只在命令行」的说法与位数策略**只有后端一份**。
+
+        页面是**渲染**它（`PasswordPageTests` 钉住渲染那一段），不是另抄一遍：
+        两处各写一次必然漂开，而"页面上的承诺"漂开是最贵的一种 bug。
+        """
+        self.login()
+        d = self.ac.get("/admin/api/admins").json()
+        self.assertEqual(d["self"], "ops")
+        self.assertEqual(d["passwordPolicy"]["minLength"], admin_mod.MIN_PASSWORD_LEN)
+        self.assertEqual(d["passwordPolicy"]["maxLength"], admin_mod.MAX_PASSWORD_LEN)
+        self.assertEqual((admin_mod.MIN_PASSWORD_LEN, admin_mod.MAX_PASSWORD_LEN), (8, 200))
+        self.assertIn("命令行", d["note"])
+        self.assertIn("--new-admin", d["note"])
+        self.assertIn("当前口令", d["note"])
+        for want in ("新增 / 删除 / 禁用管理员请用命令行", "谁能进门", "当前口令"):
+            with self.subTest(want=want):
+                self.assertIn(want, d["selfServiceNote"])
+
+
+class PasswordPageTests(_AdminCase):
+    """页面上的「修改口令」：表单在**账号那张卡**里，右上角另有一个入口。
+
+    为什么放账号卡里（而不是单独一个页签）：账号相关的**说明**与**出口**同处一地 ——
+    "增删仍只在命令行、只能改自己、必须带当前口令"这几句就在表单旁边，
+    改一处不会漏另一处；右上角那个入口负责"不用找"（它跳到这张卡并聚焦当前口令框）。
+
+    这一组是**静态**判据（页面文本 + 接线），不是真浏览器验证 ——
+    仓库里没有前端工具链，页面是自包含的一份 HTML（见 `_page()`）。
+    """
+
+    def _html(self):
+        r = self.ac.get("/admin/")
+        self.assertEqual(r.status_code, 200)
+        return r.text
+
+    def test_the_form_lives_in_the_account_card_and_is_wired_to_the_api(self):
+        html = self._html()
+        for want in ('id="pwCard"', 'id="pwCur"', 'id="pwNew"', 'id="pwNew2"',
+                     'id="btnPwSave"', "accountsCard", "bindPassword",
+                     'wpost("/admin/api/password"', "修改我的口令"):
+            with self.subTest(want=want):
+                self.assertIn(want, html)
+
+    def test_the_three_fields_are_password_inputs(self):
+        """三个输入框都是 `type="password"`（不把口令显示在屏幕上）。"""
+        html = self._html()
+        for field in ("pwCur", "pwNew", "pwNew2"):
+            with self.subTest(field=field):
+                idx = html.index('id="%s"' % field)
+                tag = html[idx:html.index(">", idx) + 1]
+                self.assertIn('type="password"', tag)
+                self.assertIn("autocomplete=", tag)
+
+    def test_the_two_entries_are_checked_on_the_client_before_sending(self):
+        """两次输入不一致 → **不发请求**（提示语在前，`wpost` 在后）。"""
+        html = self._html()
+        self.assertIn("两次输入的新口令不一致", html)
+        self.assertLess(html.index("两次输入的新口令不一致"),
+                        html.index('wpost("/admin/api/password"'))
+        # 后端给的中文原因原样显示（不是"HTTP 403"了事）
+        self.assertIn('fail("修改失败：" + e.message)', html)
+
+    def test_the_right_hand_entry_jumps_to_the_card(self):
+        """右上角那个入口 = 跳到账号卡 + 把光标放进「当前口令」。"""
+        html = self._html()
+        self.assertIn('id="btnPwd"', html)
+        self.assertIn('activateTab("inventory")', html)
+        self.assertIn('$("#pwCur")', html)
+
+    def test_the_page_states_the_minimum_from_the_backend_policy(self):
+        """位数写明在页面上，而且**数字来自后端**（页面不另抄一份）。"""
+        html = self._html()
+        self.assertIn("P.minLength", html)
+        self.assertIn("至少", html)
+        self.login()
+        self.assertEqual(self.ac.get("/admin/api/admins").json()["passwordPolicy"]["minLength"],
+                         admin_mod.MIN_PASSWORD_LEN)
+
+    def test_the_two_sentences_about_who_may_change_accounts_are_rendered(self):
+        """「只能改自己」「新增/删除仍只在命令行」两句都在卡片里显示（后端给、页面渲染）。"""
+        html = self._html()
+        self.assertIn("acc.note", html)
+        self.assertIn("acc.selfServiceNote", html)
+        # 卡片标题原来写的是「本面板只读」—— 现在开了改口令，那句话必须改掉（不能骗人）
+        self.assertNotIn("管理员账号（本面板只读）", html)
+
+    def test_the_password_never_touches_browser_storage_or_the_url(self):
+        html = self._html()
+        for bad in ("localStorage.setItem", "sessionStorage.setItem",
+                    "indexedDB.open", "document.cookie", "password="):
+            with self.subTest(bad=bad):
+                self.assertNotIn(bad, html)
 
 
 class AuditTests(_AdminCase):
@@ -1296,6 +1747,215 @@ class PerfPageTests(_AdminCase):
         for bad in ("//cdn", "chart.js", "echarts", "unpkg", "jsdelivr", "type=\"module\""):
             with self.subTest(dep=bad):
                 self.assertNotIn(bad, html)
+
+
+class LimitsConsoleTests(_AdminCase):
+    """「运行参数」：并发上限由管理员在页面上配（2026-09-29 用户要求）。
+
+    这一组盯五件事：
+
+    1. **与其它写动作同一套闸门**：未登录 401；错 Origin / 缺 `X-ECHO-Admin` / 缺 CSRF → 403，
+       而且**被挡回来时值一个都没变**（只断言状态码是不够的）；
+    2. 保存 → 读回一致（含"来源 = 管理面"与取值范围）；
+    3. 越界 / 非数 → **400 + 中文原因**，值不变、库不动；
+    4. **热生效**：保存完**同一个进程**的闸门立刻按新值判（判据是"真的被 503 顶回来"）；
+    5. **持久化**：重开库 + 一份全新 cfg 之后仍然生效（= 重启后还在）。
+    """
+
+    def _limits(self):
+        r = self.ac.get("/admin/api/limits")
+        self.assertEqual(r.status_code, 200, r.text)
+        return r.json()
+
+    def _save(self, payload):
+        return self.wpost("/admin/api/limits", payload)
+
+    def _saved_rows(self):
+        return {r["name"]: r["value"] for r in self.state.auth.store.limit_overrides()}
+
+    def test_the_read_needs_a_login(self):
+        r = self.ac.get("/admin/api/limits")
+        self.assertEqual(r.status_code, 401, r.text)
+        self.assertEqual(r.json()["code"], "unauthorized")
+
+    def test_every_gate_refuses_and_the_values_do_not_move(self):
+        def now():
+            return (self.cfg.max_concurrent, self.cfg.per_client_concurrent,
+                    int(self.cfg.get("limits.queue_max", -1)))
+
+        before = now()
+        # 未登录 → 401（先认身份，再判"这次请求像不像本站浏览器发的"）
+        r = self.ac.post("/admin/api/limits", json={"maxConcurrent": 9})
+        self.assertEqual(r.status_code, 401, r.text)
+        self.login()
+        for kw in ({"origin": "http://evil.example"}, {"header": False}, {"csrf": False}):
+            with self.subTest(gate=sorted(kw)):
+                r = self.wpost("/admin/api/limits", {"maxConcurrent": 9}, **kw)
+                self.assertEqual(r.status_code, 403, r.text)
+        self.assertEqual(now(), before, "被闸门挡回来的请求居然改了生效值")
+        self.assertEqual(self._saved_rows(), {}, "被闸门挡回来的请求居然落了库")
+
+    def test_the_factory_value_is_six_and_says_where_it_comes_from(self):
+        self.login()
+        got = self._limits()
+        self.assertEqual(got["limits"]["maxConcurrent"], 6)
+        self.assertEqual(got["limits"]["perClientConcurrent"], 1)
+        self.assertEqual(got["limits"]["queueMax"], 0)
+        self.assertEqual(got["source"]["maxConcurrent"], "default")
+        self.assertEqual(got["ranges"]["maxConcurrent"], [1, 64])
+        self.assertEqual(got["ranges"]["perClientConcurrent"], [1, 64])
+        self.assertEqual(got["ranges"]["queueMax"], [0, 100])
+        self.assertEqual(got["priority"], "admin")
+        self.assertIn("管理面配置", got["priorityNote"])
+
+    def test_save_then_read_back(self):
+        self.login()
+        r = self._save({"maxConcurrent": 9, "perClientConcurrent": 2, "queueMax": 3})
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertTrue(body["ok"])
+        self.assertEqual(body["limits"]["maxConcurrent"], 9)
+        self.assertEqual(body["source"]["maxConcurrent"], "admin")
+        again = self._limits()
+        self.assertEqual(again["limits"],
+                         {"maxConcurrent": 9, "perClientConcurrent": 2, "queueMax": 3})
+        self.assertEqual(again["source"]["perClientConcurrent"], "admin")
+        self.assertEqual(again["updatedBy"], "ops")
+        self.assertTrue(again["updatedAt"] > 0)
+
+    def test_a_partial_save_leaves_the_other_values_alone(self):
+        """只改总并发时，另两个不许被"顺手重置成默认"。"""
+        self.login()
+        self.assertEqual(self._save({"maxConcurrent": 10}).status_code, 200)
+        got = self._limits()
+        self.assertEqual(got["limits"]["maxConcurrent"], 10)
+        self.assertEqual(got["limits"]["perClientConcurrent"], 1)
+        self.assertEqual(got["limits"]["queueMax"], 0)
+        self.assertEqual(got["source"]["queueMax"], "default")
+
+    def test_out_of_range_is_a_400_with_a_reason_and_changes_nothing(self):
+        self.login()
+        before = self._limits()["limits"]
+        for bad, want in (({"maxConcurrent": 0}, "总并发"),
+                          ({"maxConcurrent": 65}, "总并发"),
+                          ({"maxConcurrent": "abc"}, "总并发"),
+                          ({"maxConcurrent": ""}, "总并发"),
+                          ({"perClientConcurrent": 7}, "每客户端并发"),
+                          ({"queueMax": -1}, "队列上限"),
+                          ({"queueMax": 101}, "队列上限")):
+            with self.subTest(bad=bad):
+                r = self._save(bad)
+                self.assertEqual(r.status_code, 400, r.text)
+                self.assertEqual(r.json()["code"], "bad_request")
+                self.assertIn(want, r.json()["detail"])
+                self.assertIn("请求不合法", r.json()["message"])
+                self.assertEqual(self._limits()["limits"], before, "400 却改了值")
+                self.assertEqual(self._saved_rows(), {}, "400 却落了库")
+
+    def test_a_hot_change_is_seen_by_the_gate_without_a_restart(self):
+        """**热生效**：保存之后，同一个进程的闸门立刻按新值判。
+
+        判据不是"库里读得到"，而是**真的被 503 顶回来** —— 只测 store 的话，
+        "执行的地方在启动时缓存了上限"这种错会照样绿。
+        """
+        self.login()
+        self.assertEqual(self._save({"maxConcurrent": 1, "perClientConcurrent": 1}).status_code,
+                         200)
+        self.assertEqual(self.state.admission.snapshot()["maxConcurrent"], 1)
+        with self.state.admission.hold("someone-else"):
+            r = self.call_asr()
+        self.assertEqual(r.status_code, 503, r.text)
+        self.assertEqual(r.json()["code"], "server_busy")
+        # 放开之后立刻又能用：变的是上限，不是把服务锁死了
+        after = self.call_asr()
+        self.assertEqual(after.status_code, 200, after.text)
+        # `/v1/capabilities` 也是现读（客户端据此判断"要不要等"）
+        self.assertEqual(self.client.get("/v1/capabilities").json()["limits"]["maxConcurrent"], 1)
+
+    def test_the_value_survives_a_restart(self):
+        """持久化：**重开库 + 一份全新 cfg**（= 重启进程）之后，值仍然生效。"""
+        self.login()
+        self.assertEqual(self._save({"maxConcurrent": 11, "perClientConcurrent": 2,
+                                     "queueMax": 4}).status_code, 200)
+        reopened = store_mod.Store(self.cfg.get("auth.db"))
+        self.addCleanup(reopened.close)
+        fresh = settings_mod.load()
+        fresh.raw["auth"]["db"] = self.cfg.get("auth.db")
+        self.assertEqual(limits_mod.apply_stored(fresh, reopened),
+                         {"max_concurrent": 11, "per_client_concurrent": 2, "queue_max": 4})
+        self.assertEqual(fresh.max_concurrent, 11)
+        self.assertEqual(fresh.per_client_concurrent, 2)
+        self.assertEqual(int(fresh.get("limits.queue_max")), 4)
+
+    def test_the_admin_value_beats_the_environment_variable(self):
+        """**优先级钉在接口上**：env 在场面时管理面保存的值仍然赢，且如实提示。
+
+        为什么必须钉：`server/compose.yaml` 默认就设了 `ECHO_MAX_CONCURRENT`，
+        若 env 优先，页面上改成别的值会**静默不生效** —— 后人只会以为"改了没用"。
+        """
+        self.login()
+        with patch.dict(os.environ, {"ECHO_MAX_CONCURRENT": "2"}, clear=False):
+            self.assertEqual(self._save({"maxConcurrent": 6}).status_code, 200)
+            got = self._limits()
+            self.assertEqual(got["limits"]["maxConcurrent"], 6, "env 把管理面的值盖住了")
+            self.assertEqual(got["source"]["maxConcurrent"], "admin")
+            self.assertEqual(got["envValues"]["maxConcurrent"], 2,
+                             "env 仍然要**如实报出来**，不是装作没有")
+            self.assertTrue(any("ECHO_MAX_CONCURRENT=2" in n for n in got["notes"]),
+                            got["notes"])
+            self.assertEqual(self.state.admission.snapshot()["maxConcurrent"], 6)
+
+    def test_the_save_is_audited_with_the_admin_name(self):
+        self.login()
+        self._save({"maxConcurrent": 8})
+        hit = [r for r in self.audit_rows() if r[1] == "limits-set"]
+        self.assertTrue(hit, self.audit_rows())
+        self.assertEqual(hit[0][0], "ops")
+        self.assertIn("maxConcurrent=8", hit[0][2])
+
+    def test_a_rejected_save_is_audited_with_the_reason(self):
+        """越界也要留痕（与其它写动作一致：失败的动作名带 `.failed`）。"""
+        self.login()
+        self._save({"maxConcurrent": 999})
+        hit = [r for r in self.audit_rows() if r[1] == "limits-set.failed"]
+        self.assertTrue(hit, self.audit_rows())
+        self.assertIn("maxConcurrent=999", hit[0][2])
+
+
+class LimitsPageTests(_AdminCase):
+    """「运行参数」卡在页面上（与 4 张图同一个页签，**不进前端工具链**）。"""
+
+    def _html(self):
+        r = self.ac.get("/admin/")
+        self.assertEqual(r.status_code, 200)
+        return r.text
+
+    def test_the_card_and_its_three_fields_are_on_the_page(self):
+        """三个输入框是**按后端给的范围动态生成**的（`id="lim-<api 字段名>"`），
+        所以这里钉的是那段生成逻辑 + 三个字段名都真的被发出去。"""
+        html = self._html()
+        for want in ("/admin/api/limits", 'id="btnLimits"', 'id="lim-${esc(api)}"',
+                     "limitsCard", "bindLimits", "已保存并生效",
+                     "maxConcurrent", "perClientConcurrent", "queueMax"):
+            with self.subTest(want=want):
+                self.assertIn(want, html)
+
+    def test_the_card_sits_in_the_perf_tab_above_the_charts(self):
+        """放在「性能」页签里、4 张图上方：并发上限本来就是性能参数，
+        调它要看的就是旁边那两张图（在途请求数 / GPU 利用率）。"""
+        html = self._html()
+        self.assertIn('data-tab="perf"', html)
+        self.assertIn("运行参数", html)
+        self.assertLess(html.index("${limitsCard(lim)}"),
+                        html.index("${tpl ? tpl.innerHTML"))
+
+    def test_the_page_says_the_queue_limit_has_no_executor_yet(self):
+        """**不骗人**：v1 不排队，队列上限现在只影响 capabilities 里宣告的 queueMax ——
+        这句话由后端给（`queueNote`），页面必须把它显示出来，不能只画一个输入框。"""
+        html = self._html()
+        self.assertIn("d.queueNote", html)          # 页面确实渲染了那句提示
+        self.login()
+        self.assertIn("queueNote", self.ac.get("/admin/api/limits").text)
 
 
 class AdminCliTests(unittest.TestCase):

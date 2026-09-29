@@ -6,7 +6,8 @@
 
 默认值取自 `docs/ECHO能力后端-服务端设计.md` §10：
 
-  * `max_concurrent: 2`      —— 服务端总通道（2026-09-23 定，实验后可能调）
+  * `max_concurrent: 6`      —— 服务端总通道（2026-09-23 定 2；2026-09-29 用户要求提到 6，
+    并且**改由管理面配置**：管理面的值优先于这里与环境变量，见 `server/limits.py`）
   * `per_client_concurrent: 1` —— 每客户端硬性 1（公平性：一个客户端不许占满）
   * `queue_max: 0`           —— **不排队**：通道满了直接拒，重试由客户端负责
 """
@@ -55,7 +56,11 @@ DEFAULTS: Dict[str, Any] = {
         },
     },
     "limits": {
-        "max_concurrent": 2,            # 服务端总通道
+        # 服务端总通道。**出厂 6**（2026-09-29 用户要求从 2 提上来；
+        # 按卡校准：小卡要下调就在管理面「性能」页签里改，见 `server/limits.py`）。
+        # ⚠️ 优先级：**管理面配置 > 环境变量 > 这里**。管理面改过的值存在 state 卷的库里，
+        # 重启后仍然覆盖环境变量 —— 这不是 bug，有一条用例钉着（见 `server/limits.py`）。
+        "max_concurrent": 6,
         "per_client_concurrent": 1,     # 每客户端（硬性）
         "queue_max": 0,                 # 不排队
         "busy_retry_after_s": 5,        # server_busy 时给客户端的建议等待
@@ -205,6 +210,14 @@ def _env_overrides() -> dict:
                 int(os.environ["ECHO_PER_CLIENT_CONCURRENT"])
         except ValueError:
             pass
+    # 队列上限。**它现在没有执行者**（v1 不排队，见 `server/limits.py` 末尾）——
+    # 这里读它是为了让"部署文件里写了这个变量 ⇒ 真的被读"这条契约不出现例外，
+    # 而它与上面两个一样，会被管理面配过的值覆盖。
+    if os.environ.get("ECHO_QUEUE_MAX"):
+        try:
+            out.setdefault("limits", {})["queue_max"] = int(os.environ["ECHO_QUEUE_MAX"])
+        except ValueError:
+            pass
     if os.environ.get("ECHO_DEVICE"):
         out.setdefault("models", {})["device"] = os.environ["ECHO_DEVICE"]
 
@@ -258,9 +271,9 @@ class Config:
     @property
     def max_concurrent(self) -> int:
         try:
-            return max(1, int(self.get("limits.max_concurrent", 2)))
+            return max(1, int(self.get("limits.max_concurrent", 6)))
         except (TypeError, ValueError):
-            return 2
+            return 6
 
     @property
     def per_client_concurrent(self) -> int:
