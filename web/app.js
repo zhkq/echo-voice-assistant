@@ -1626,10 +1626,12 @@ const SET_OPT_LABELS = {
   capabilityPrivacy: { none: "不出机", lan: "内网", wan: "出网" },
 };
 
-/* 会议转写/分离/声纹三个 hidden 键在界面上合成一个单选 + 一个「会议产出」下拉。 */
+/* 会议转写/分离/声纹三个 hidden 键在界面上合成一个单选 + 一个「会议产出」下拉。
+   **没有「本机」这一档**（2026-09-29，用户拍板）：客户端进程内不再承担会议转写与
+   说话人分离 —— 要全本机跑就"在本机起一个能力后端"（取值仍是 echo-server，
+   容器 / 后端扩展包两种交付方式）。老库里存的 local 由服务端读时折算，这里不列它。 */
 const SET_MEETING_BACKENDS = [
-  { value: "echo-server", label: "ECHO 后端", hint: "配对好的 GPU 机器" },
-  { value: "local", label: "本机", hint: "这台机器的转写引擎" },
+  { value: "echo-server", label: "能力后端", hint: "配对好的能力后端；本机自建的那台也算（同一个取值）" },
   { value: "asr-provider", label: "网络服务商", hint: "在线 qwen3.1（会议转写方案 3）：整场异步转写，要填密钥；认不了联系人" },
 ];
 
@@ -3310,9 +3312,11 @@ function renderMeetingServiceCard() {
   }).join("");
   const priv = String(settingValue("capabilityPrivacy", "lan") || "lan");
   let consistency = `<span class="sbadge ok">一致</span>`;
-  if (priv === "none" && sel !== "local") {
-    consistency = `<span class="sbadge warn" title="出网许可是「不出机」，而选中的后端不在本机：`
-      + `调用会被策略挡住（后端会把原因报成 blocked）">许可不允许</span>`;
+  // 2026-09-29：三个后端取值**都不在本机**（客户端进程内不再承担会议转写/分离），
+  // 所以「不出机」许可与任何一档都对不上 —— 不再有 `sel !== "local"` 那个例外。
+  if (priv === "none") {
+    consistency = `<span class="sbadge warn" title="出网许可是「不出机」：能力后端与在线转写都会被策略挡住`
+      + `（后端会把原因报成 blocked）。要全本机跑就在本机起一个能力后端，再把它设成「内网」">许可不允许</span>`;
   } else if (priv === "lan" && sel === "asr-provider") {
     consistency = `<span class="sbadge warn" title="「内网」许可不覆盖公网服务商">许可只到内网</span>`;
   }
@@ -3780,10 +3784,14 @@ function friendlyOption(key, v) {
   if (key === "device") return { auto: "自动（有 GPU 就用）", cpu: "CPU", cuda: "CUDA（GPU）" }[s] || s;
   if (key === "wakeEngine") return { sherpa: "sherpa 流式识别", kws: "KWS 关键词 spotting" }[s] || s;
   if (key === "capabilityDiarizeBackend" || key === "capabilityEmbedBackend") {
-    return { auto: "自动（按默认链挑）", "echo-server": "ECHO 后端", local: "本机" }[s] || s;
+    // **没有「本机」这一档**（2026-09-29，用户拍板）：客户端进程内不再承担会议转写与
+    // 说话人分离 —— 要全本机跑就"在本机起一个能力后端"（取值仍是 echo-server，
+    // 容器 / 后端扩展包两种交付方式）。所以这里不留 local 的死字符串。
+    return { auto: "自动（按默认链挑）", "echo-server": "能力后端" }[s] || s;
   }
   if (key === "capabilityMeetingAsrBackend") {
-    return { "echo-server": "ECHO 后端", local: "本机", "asr-provider": "网络服务商" }[s] || s;
+    return { "echo-server": "能力后端（本机自建的那台也算）",
+      "asr-provider": "网络服务商" }[s] || s;
   }
   return s;
 }
@@ -3849,8 +3857,10 @@ function modelFunctions() {
     { id: "wake", icon: "🔔", name: "唤醒", settingKey: "wakeEngine", options: wake && wake.options,
       value: wake && wake.value, catalogId: "kws" },
     // 分离与声纹：会议标配，卡上只说"由谁做"（键 = capabilityDiarizeBackend）。
+    // **没有「本机」这一档**（2026-09-29）：分离只落在能声明向量空间的后端上；
+    // 列 local 会让面板能选一个后端根本不接受的取值（那是"能存不能生效"的假配置）。
     { id: "diar", icon: "👥", name: "说话人分离", settingKey: "capabilityDiarizeBackend",
-      options: ["auto", "echo-server", "local"], value: settingValue("capabilityDiarizeBackend", "auto"),
+      options: ["auto", "echo-server"], value: settingValue("capabilityDiarizeBackend", "auto"),
       catalogId: "pyannote", alwaysOn: true },
     { id: "vp", icon: "🧬", name: "声纹", special: "voiceprint" },
     { id: "dev", icon: "💻", name: "计算设备", settingKey: "device", options: dev && dev.options,
@@ -3868,12 +3878,9 @@ function _loadState(f) {
   }
   const m = modelById(f.catalogId);
   if (f.id === "diar") {
-    // 分离由谁做决定"就绪"该怎么看：指定本机时看 pyannote 装没装；
-    // 指定/默认走后端时看后端在不在（本机没装 pyannote 与它无关，不该报红）。
-    if (String(f.value) === "local") {
-      return m && m.ready ? { kind: "ok", text: "本机就绪" }
-                          : { kind: "miss", text: "本机未装" };
-    }
+    // 分离**只有后端一条路**（2026-09-29）：客户端进程内那份 pyannote 不再承担会议分离，
+    // 所以这一格只看后端在不在。原来那句"指定本机时看 pyannote 装没装"随 local 档一起撤掉
+    // —— 本机 pyannote 与这一格已经无关（要全本机跑就"在本机起一个能力后端"）。
     const be = backendRow("echo-server");
     return (be && be.ready) ? { kind: "ok", text: "后端就绪" }
                             : { kind: "warn", text: "后端不可用" };

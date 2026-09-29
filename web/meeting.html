@@ -65,6 +65,9 @@ header .btns { margin-left:auto; display:flex; gap:8px; flex-wrap:wrap; }
 .cap-box .cap-dia { margin-top:4px; min-width:0; overflow-wrap:anywhere; }
 .cap-box .cap-dia.ok { color:var(--muted); }
 .cap-box .cap-dia.bad { color:var(--err, #e5484d); }
+/* 「在等能力后端」/「本场转写由本机引擎完成」：**不是故障、但也不是正常** ——
+   黄字（与红字区分：后端回来就好了 / 只是这一场慢），同样要能收缩。 */
+.cap-box .cap-dia.warn { color:var(--warn, #d29922); }
 /* ---------- 纪要编辑 ---------- */
 #summaryBox .sm-bar { display:flex; align-items:center; gap:8px; margin:0 0 10px; padding-bottom:8px;
   border-bottom:1px solid var(--border); }
@@ -448,13 +451,22 @@ function renderCompressionMark() {
    这里还必须说清**分离到底做了没有** —— 没做就红字写明 `说话人分离未执行：<原因>`，
    绝不允许安静地产出一场"没有说话人却像正常一样"的会议（文案由服务端给）。
 
+   2026-09-29：多了**一行「这一场到底做了什么 / 在等什么」**（`cap.run`）：
+     * 本场转写**由本机引擎完成**（转写那一槽本步还留着本机回落，下一步才删）
+       —— 只打日志等于用户看不到，而"配了后端却在啃本机 CPU"是最难查的一种状态；
+     * **在等能力后端**（配置里点名了它、那台连不上）—— 面板必须说出来，
+       否则这一场看着就像"没人说话"。
+   文案仍然全部来自服务端（`capability_admin.execution_summary`），前端只渲染。
+
    默认只显示一行"用了谁"；降级原因折在 <details> 里，排障时才展开。 */
 function renderCapability() {
   const box = $("#capBox");
   if (!box) return;
   const cap = M && M.capability;
   const dia = cap && cap.diarize;
-  if (!cap || (!cap.picks.length && !cap.skipped.length && !cap.timestampsLabel && !dia)) {
+  const run = cap && cap.run;
+  if (!cap || (!cap.picks.length && !cap.skipped.length && !cap.timestampsLabel
+               && !dia && !run)) {
     box.className = "hidden";
     box.innerHTML = "";
     return;
@@ -463,6 +475,20 @@ function renderCapability() {
     ? cap.picks.map((p) => `${esc(p.slotLabel)} → <b>${esc(p.backendLabel)}</b>`).join("，")
     : "（没记到实际用了谁）";
   const ts = cap.timestampsLabel ? ` · 时间轴：${esc(cap.timestampsLabel)}` : "";
+  // **这一场做了什么 / 在等什么**（服务端给的一句）。`state` 决定红/黄/常色：
+  //   diarize-not-executed → 红（这场没有说话人，与下面那条 diaLine 是同一件事，不重复画）
+  //   waiting-backend      → 黄（在等后端）
+  //   local-transcribe     → 黄（配了后端却走了本机，必须显眼）
+  //   backend              → 不额外画一行（下面"用了谁"已经说清了）
+  let runLine = "";
+  if (run && run.headline && run.state !== "diarize-not-executed") {
+    const cls = (run.state === "waiting-backend" || run.state === "local-transcribe")
+      ? " cap-dia warn" : "";
+    runLine = `<div class="cap-line${cls}" data-testid="cap-run" data-run-state="${esc(run.state || "")}">`
+      + `🖥 <b>${esc(run.headline)}</b>`
+      + `${run.fallbackReasonLabel ? `<span class="cap-d">${esc(run.fallbackReasonLabel)}</span>` : ""}`
+      + `</div>`;
+  }
   // **分离这一条单独、显眼**：它是"这场会有没有说话人"的唯一答案。
   let diaLine = "";
   if (dia) {
@@ -471,8 +497,12 @@ function renderCapability() {
     } else {
       const code = dia.code ? ` · code=${esc(dia.code)}` : "";
       const again = dia.retryable ? " · 可以重试" : "";
+      // `waiting`（配置里点名了后端、那台连不上）：与"这台机器做不到"是两件事，
+      // 所以在这一条上**额外**说一句在等谁（文案还是服务端给的 `waitingLabel`）。
+      const waiting = dia.waiting && (run && run.waitingLabel)
+        ? ` · <b>${esc(run.waitingLabel)}</b>` : "";
       diaLine = `<div class="cap-line cap-dia bad" data-testid="diarize-missing">`
-        + `⚠ <b>${esc(dia.headline || "说话人分离未执行")}</b>${code}${again}`
+        + `⚠ <b>${esc(dia.headline || "说话人分离未执行")}</b>${code}${again}${waiting}`
         + `${dia.detail ? `<div class="cap-d">${esc(dia.detail)}</div>` : ""}</div>`;
     }
   }
@@ -497,7 +527,7 @@ function renderCapability() {
   const body = detail.length
     ? `<details class="cap-more"><summary>细节</summary>${detail.join("")}</details>` : "";
   box.className = "cap-box";
-  box.innerHTML = `<div class="cap-line">🖥 ${used}${ts}</div>${diaLine}${body}`;
+  box.innerHTML = `<div class="cap-line">🖥 ${used}${ts}</div>${runLine}${diaLine}${body}`;
 }
 
 /* ---------- 纪要页签 ---------- */

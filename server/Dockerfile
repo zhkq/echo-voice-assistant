@@ -125,15 +125,14 @@ ARG ECHO_TORCH_VERSION=""
 #    而 torch 是 **cu126**（只有 `libcudart.so.12`）→ `_torchaudio.abi3.so` 加载失败 →
 #    **`import torchaudio` 崩 → funasr(SenseVoice) 的模型加载也失败 → 每个 `/v1/asr`
 #    都 503 `model_failed`**（转写与说话人分离一起被打死）。
-#    cu126 索引上 torchaudio 最高只到 **2.9.1**（torchaudio 已停更），所以唯一成套的组合
-#    就是 `torch==2.9.1 + torchaudio==2.9.1`；真机按这个组合跑通：
-#      `torch 2.9.1+cu126 | torchaudio 2.9.1+cu126 | cuda avail True | pyannote 4.0.7 import OK`
-#    （随后 ASR 调用全部 200）。
-#    做法：**两者写在同一条 `pip install` 里**、都从 `ECHO_TORCH_INDEX` 装 ——
-#    torchaudio 的 wheel 写死了 `Requires-Dist: torch==<同版本>`，解析器因此会自己挑
-#    "有配套 torchaudio 的那一版 torch"（cu126 上目前 = 2.9.1），**不写死版本号**，
-#    索引更新后跟着走；`ECHO_TORCH_VERSION` 非空（老卡）时两者仍按**同一个变量**一起钉。
-#    装完会 import torchaudio 并校验它与 torch **版本一致** —— 这个坑必须在**构建期**炸，
+#    ⚠️ **判据是"同一个 CUDA 源"，不是"版本号相同"**（2026-09-29 真机更正）：
+#    PyTorch 2.9 之后 **torchaudio 停更**，所以两个包的**版本号本来就对不上** ——
+#    cu126 索引上实测可用的组合是 **`torch 2.14.0+cu126` + `torchaudio 2.11.0+cu126`**
+#    （两个都带 `+cu126` = 同一个 CUDA ABI ✓，`import torchaudio` 通过、pyannote 4.0.7 正常）。
+#    真正的坑是**从普通 PyPI 拉来的 torchaudio**（没有 `+cu126`、是 cu13x 那套）→ ABI 不匹配。
+#    做法：**两者写在同一条 `pip install` 里**、都从 `ECHO_TORCH_INDEX` 装；
+#    `ECHO_TORCH_VERSION` 非空（老卡）时两者仍按**同一个变量**一起钉到同一版本。
+#    装完会 import torchaudio 并校验**两者的 CUDA 源标签一致** —— 这个坑必须在**构建期**炸，
 #    不要留到容器启动后（那时只表现为"每个 /v1/asr 都 503"，很难查到是 ABI 不匹配）。
 RUN if [ "$ECHO_EXTRA" = "1" ]; then \
         if [ -n "$ECHO_TORCH_VERSION" ]; then \
@@ -149,8 +148,8 @@ RUN if [ "$ECHO_EXTRA" = "1" ]; then \
         fi \
      && python -c "import torch; print('torch', torch.__version__, '| cuda', torch.version.cuda)" \
      && python -c "import torchaudio; print('torchaudio', torchaudio.__version__)" \
-     && if ! python -c "import sys, torch, torchaudio; t = torch.__version__.split('+')[0]; a = torchaudio.__version__.split('+')[0]; sys.exit(0 if t == a else 1)"; then \
-            echo "ERROR: torchaudio 装不上、或与 torch 不是同一版本 —— 完整档的 funasr / pyannote 都依赖它，症状是容器起来后每个 /v1/asr 都 503 model_failed（torch/torchaudio 的 ABI 对不上）。修法见上面的注释：两者必须同批、同索引、同版本安装。" >&2 ; exit 1 ; \
+     && if ! python -c "import sys, torch, torchaudio; t = torch.__version__; a = torchaudio.__version__; tc = t.split('+')[1] if '+' in t else ''; ac = a.split('+')[1] if '+' in a else ''; sys.exit(0 if (tc and tc == ac) else 1)"; then \
+            echo "ERROR: torch 与 torchaudio 不是同一个 CUDA 源（或 torchaudio 装不上）—— 完整档的 funasr / pyannote 都依赖它；症状是容器起来后每个 /v1/asr 都 503 model_failed（ABI 对不上，例如 torch 是 +cu126 而 torchaudio 是从普通 PyPI 拉来的 +cu13x）。修法：两者必须**同一条 pip、同一个 index-url** 装（本 Dockerfile 默认就是这么做的），**不要**只按版本号相等来判 —— PyTorch 2.9 之后 torchaudio 停更，版本号本来就对不上（实测可用组合：torch 2.14.0+cu126 + torchaudio 2.11.0+cu126）。" >&2 ; exit 1 ; \
         fi \
      && if [ -n "$ECHO_TORCH_VERSION" ]; then \
             python -c "import torch,sys; sys.exit(0 if torch.__version__.startswith('$ECHO_TORCH_VERSION') else 1)" \

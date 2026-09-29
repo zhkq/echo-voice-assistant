@@ -1155,7 +1155,8 @@ def _diarize_reason_rank(reason):
         return len(REASON_PRIORITY)
 
 
-def _note_diarize_missing(state, reason, detail="", code="", retryable=False):
+def _note_diarize_missing(state, reason, detail="", code="", retryable=False,
+                          waiting=None):
     """记下"这场没有说话人 + **为什么**"（只保留信息量最大的那条原因）。
 
     `reason` 必须是那个**权威十词**之一（`capabilities.base.SKIP_REASONS`）——
@@ -1165,10 +1166,17 @@ def _note_diarize_missing(state, reason, detail="", code="", retryable=False):
     为什么挑而不覆盖：一场会里"分离没做成"可能叠着好几层原因（计划里没有可用后端、
     真调用时后端挂了、本机也没装），随手覆盖会把**具体**的那条（`blocked` /
     `unsupported`）盖成笼统的 `absent` —— 而那正是用户排障要的第一手信息。
+
+    `waiting`（2026-09-29）：配置里点名了能力后端、而那台**当时不可用**。
+    它与"分离没做成"是**两件事**（前者"再等等它就有"，后者"这一场就到此为止"），
+    所以另立一个字段、**不塞进 `reason`** —— 权威十词是接口词汇，不许自造。
+    传 `None` = 不碰这一位（老调用方两三个参数照旧）。
     """
     if not isinstance(state, dict):
         return
     reason = str(reason or "") or DIARIZE_LOCAL_MISSING_REASON
+    if waiting is not None:
+        state["waiting"] = bool(waiting)
     old = str(state.get("reason") or "")
     if old and _diarize_reason_rank(old) <= _diarize_reason_rank(reason):
         return
@@ -1178,14 +1186,56 @@ def _note_diarize_missing(state, reason, detail="", code="", retryable=False):
     state["retryable"] = bool(retryable)
 
 
+def _new_run_info(state="", reason=""):
+    """本场"到底做了什么 / 在等什么"，写进 `meta.json`（面板据此如实显示）。
+
+    为什么要单独记一份（2026-09-29）：`meta["capability"]` 只在**走了能力层**时才写，
+    而走本机那条路的会议**恰好什么都没有** —— 恰恰是那种会议最需要说清两件事：
+
+      * **这一场的文字是本机引擎出的**（会议转写这一槽本步还留着本机回落，下一步才删）。
+        只打一条 warn 日志等于用户看不到，而"配了后端却在啃本机 CPU"是最难查的一种状态；
+      * **在等后端**（配置里点名了能力后端、那台连不上）。设计里"离线队列 / 分段 pending"
+        的设想（`docs/3.0-设计总览与组件关系.md:1086`）**本步不实现** —— 只把状态说出来。
+
+    `state` 取值：`local` / `backend` / `provider`（这一场的文字是谁出的）。
+    `reason` 取值：`waiting-backend` / `not-configured` / `route-unavailable`（为什么退回本机）。
+    `reason` 只有 `state == "local"` 时才有意义 —— 走了后端就不是"退回"。
+    """
+    return {"transcribeEngine": str(state or ""), "fallbackReason": str(reason or "")}
+
+
+def _apply_run_meta(meta: dict, run_info, diarize_state) -> dict:
+    """把"这一场做了什么/在等什么"写进 `meta`；旧键该删的要删。
+
+    与 `_apply_capability_meta` 同一个理由：`meta.json` 是**同一场会反复重转时被覆盖写**的。
+    上次是"配了后端、走了后端"，这次退回本机 —— 那两个字段要是只在走本机时才写，
+    详情页就会继续显示上一次的结论。所以**两条路都写**，不写就删。
+
+    `diarize` 快照也在这里一起定稿（原来那两处 `meta["diarize"] = dict(da_state)` 合并过来，
+    免得三个地方各写一遍）。
+    """
+    if isinstance(run_info, dict):
+        meta["transcribeEngine"] = str(run_info.get("transcribeEngine") or "")
+        meta["transcribeFallbackReason"] = str(run_info.get("fallbackReason") or "")
+    else:
+        meta.pop("transcribeEngine", None)
+        meta.pop("transcribeFallbackReason", None)
+    if isinstance(diarize_state, dict):
+        meta["diarize"] = dict(diarize_state)
+    return meta
+
+
 def _new_diarize_state():
     """一场会的分离状态（写进 `meta.json` 的 `diarize`），面板据此如实显示。
 
     形状刻意与"分离成功"对称：`executed` 是结论，`reason`/`detail`/`code`/`retryable`
     是依据。**没有"未知"这一档** —— 转写结束时它必然已经定下来（成功，或带着原因没做成）。
+
+    `waiting`（2026-09-29）：这一场的分离是**在等后端**（配置里点名了它、它当时不可用）。
+    它与"没做成"并存：现在确实没有说话人，但原因不是"这台机器做不到"，而是"那台没接上"。
     """
     return {"executed": False, "reason": "", "detail": "", "code": "",
-            "retryable": False, "backendId": ""}
+            "retryable": False, "backendId": "", "waiting": False}
 
 
 class _CapabilitySession(object):
@@ -1202,13 +1252,23 @@ class _CapabilitySession(object):
     `__iter__` 是为了兼容既有用法（`router, need = session`）—— 它曾经就是个二元组。
     """
 
-    __slots__ = ("router", "cfg", "slots", "vector_space_id")
+    __slots__ = ("router", "cfg", "slots", "vector_space_id", "backend_configured")
 
-    def __init__(self, router, cfg, slots, vector_space_id=""):
+    def __init__(self, router, cfg, slots, vector_space_id="", backend_configured=True):
         self.router = router
         self.cfg = cfg
         self.slots = tuple(slots)
         self.vector_space_id = str(vector_space_id or "")
+        #: 这台机器**认不认**一个能力后端（设置里填了地址或配对过）。
+        #:
+        #: 为什么要会话带着它（2026-09-29）：分离那一槽**只落在能力后端上**，
+        #: 所以"该不该跑本机引擎"取决于"这到底是不是一台配了后端的机器"：
+        #:   * **没配** → 这台机器本来就这么跑（分离仍在本机，与今天一致）；
+        #:   * **配了但用不上** → 这一场就是没有说话人，并如实说"在等后端"
+        #:     （绝不回落本机：那是另一个向量空间，混用会认错人且不报错）。
+        #: 默认 `True` 是给"调用方自己拼会话"的既有用法（用例注入 router）留的语义：
+        #: 那是在模拟一台**有后端**的机器，也是这套能力层最该守住的场景。
+        self.backend_configured = bool(backend_configured)
 
     def need(self):
         """这一次调用要用的 `Need`（带上当前锁定的向量空间）。"""
@@ -1271,6 +1331,16 @@ class _CapabilitySession(object):
                        % (slot, _first_reason(plan, slot), _skips_brief(plan, slot)))
         return out
 
+    def diarize_slot_is_local(self):
+        """分离这一槽**还该不该在本机跑**：只有"这台机器压根没配能力后端"才行。
+
+        为什么单独一个入口而不是让调用方自己判：这条判据同时被"要不要开会话"与
+        "拿到 `None` 该怎么办"两处用到，各写一遍就会出现
+        "传了 `state` 却没传对 backend_configured"这种**看起来像 bug 的假象**
+        （第一版就是这样：本机兜底静默失效，用例报的是"分离没跑"）。
+        """
+        return not self.backend_configured
+
     def call(self, slot, **kw):
         """按槽调用；成功后把锁推进到这次实际生效的向量空间。
 
@@ -1289,13 +1359,18 @@ class _CapabilitySession(object):
         self.slots = tuple(slots)
         return self
 
+    def with_backend_configured(self, value):
+        """改"这台机器认不认能力后端"（用例要构造两种机器时用，见 `backend_configured`）。"""
+        self.backend_configured = bool(value)
+        return self
+
     def __iter__(self):
         # 兼容 `router, need = session` 这种老写法（`need` 是**当场算出来的快照**，
         # 与 `call()` 里那份等价 —— 只要中间没有别的调用推进锁）。
         return iter((self.router, self.need()))
 
 
-def _capability_asr_session(cfg, need_speaker=None):
+def _capability_asr_session(cfg, need_speaker=None, info=None):
     """本场是否走**能力后端**。返回 `_CapabilitySession` 或 `None`。
 
     ## 判据：计划里**任何一个会议槽**落到本机以外的后端
@@ -1315,12 +1390,42 @@ def _capability_asr_session(cfg, need_speaker=None):
     收益也只是"代码好看一点"。**先把远端这条路打通**，本地那条等它被证明可靠再收。
 
     **没配后端（也没配对）时行为逐字不变**：所有槽都落到本机 → 返回 None →
-    `_transcribe_impl` 走原来那段本地代码（含原来的 `diarize_wav_full`）。
+    `_transcribe_impl` 走原来那段本地代码。
+
+    ## `info`（可选出参，2026-09-29）
+
+    返回 None 有**两种含义完全不同的情形**，而调用方必须分得清：
+
+      * 没配后端（也没配对）→ 这台机器本来就这么跑；
+      * **配了后端但那台连不上/用不上** → 这一场是在**等后端**，必须显示成"在等"。
+
+    所以可选的 `info` 字典会被填上 `{"state": ..., "reason": ...}`（形状见
+    `_new_run_info`）：`state` 是这一场文字将来由谁出（`local`/`backend`/`provider`），
+    `reason` 是"为什么退回本机"（`waiting-backend`/`not-configured`/`route-unavailable`）。
+    **刻意用出参而不是改返回值**：这个函数被十几条既有用例按"返回 session 或 None"调用，
+    改返回值会让它们全体变成"在验另一件事"，而这一步要收的是语义、不是签名。
     """
+    def _fill(state, reason=""):
+        if isinstance(info, dict):
+            info.update(_new_run_info(state, reason))
+
+    _fill("local", "not-configured")
+    #: 这台机器**认不认**一个能力后端（设置里填了地址或配对过）—— 与"连得上吗"无关。
+    #: 会议那边要拿它决定"分离这一槽该不该走本机引擎"（见循环里那段），
+    #: 所以与 `run_info` 一起从**这里**给出来，而不是让两个地方各问一次 `configured()`。
+    _configured = False
+    try:
+        from app.capabilities import echo_server as _echo_backend
+        _configured = bool(_echo_backend.configured())
+    except Exception:                                   # pragma: no cover - 兜底
+        _configured = False
+    if isinstance(info, dict):
+        info["backendConfigured"] = _configured
     try:
         from app.capabilities import build_default_router
         router = build_default_router()
-        session = _CapabilitySession(router, cfg, _session_slots(cfg))
+        session = _CapabilitySession(router, cfg, _session_slots(cfg),
+                                     backend_configured=_configured)
         plan = session.plan()
         if need_speaker is not None:
             # 老调用方（3.0 之前）传这个参数表达"这场要声纹槽"。现在它恒为必备，
@@ -1338,8 +1443,7 @@ def _capability_asr_session(cfg, need_speaker=None):
             # 判据是 `echo_server.configured()`（设置里填了地址**或配对过**），不是只看设置：
             # "只配对、什么都没配"从 §2.7 起就是能用状态，只看设置的话那台机器掉了后端
             # 会一声不响地退回本机 —— 而"不声不响"恰恰是这条告警要防的那件事。
-            from app.capabilities import echo_server as _echo_backend
-            if _echo_backend.configured():
+            if _configured:
                 why = "；".join("%s=%s[%s]" % (s, b or "-", _skips_brief(plan, s))
                                 for s, b in live)
                 db.add_log("warn", "capability",
@@ -1351,15 +1455,26 @@ def _capability_asr_session(cfg, need_speaker=None):
                     db.add_log("warn", "capability",
                                "本场不会标说话人：说话人分离没有本机兜底（设计 §5.1），"
                                "而 %s" % _skips_brief(plan, "diarize.turns"))
+                # **在等后端**：配了、但这一轮一个槽都没落到它上面。
+                # 只记状态，不排队重试（那是另一件事，见设计 §1086 那句"离线队列/pending"）。
+                _fill("local", "waiting-backend")
             return None
         who = "，".join("%s→%s" % (s, b) for s, b in live if b) or "（没有槽被选中）"
         db.add_log("info", "capability",
                    "本场会议走能力后端：%s%s" % (
                        who, "（向量空间 %s）" % plan.vector_space_id
                        if plan.vector_space_id else ""))
+        # 走得了能力层，但**转写那一槽可能仍归本机**（分离走后端、转写走本机那种配置，
+        # 见 `local_slots()`）。那时这一场的文字还是本机出的，面板要说得出这件事。
+        #
+        # 这里**不写 `fallbackReason`**：这一轮不是"从后端退回本机"，而是"后端在、
+        # 只是转写这一槽没派给它"。真正的"在等后端"只有上面那条分支（一个槽都没落到
+        # 后端上）才算 —— 两种情形在面板上必须是两句不同的话。
+        _fill("local" if session.local_slots().get("asr.text") else "backend")
         return session
     except Exception as e:
         db.add_log("warn", "capability", f"能力路由不可用，本场回落本地引擎：{e}")
+        _fill("local", "route-unavailable")
         return None
 
 
@@ -1475,42 +1590,58 @@ def _capability_diarize_segment(cap, seg_path, state=None):
     形状与 `diarize_wav_full()` **逐字对齐**（见 `_normalize_diarize`）—— 会议那边
     落库/合并/声纹识别那几段代码**一行都不用改**，这正是 step 4 敢接的前提。
 
-    四种返回要分清（前三种调用方走原来那段本地代码）：
+    ## `None` 只有一个意思：**这一段没有说话人**
 
-      * 这一槽**压根不在会话里**（老调用方自己拼的槽清单）→ 全 `None`；
-      * 计划把 `diarize.turns` 派给本机（**用户显式选的本机**，或这一槽谁都干不了）
-        → 全 `None`（并把"谁都干不了"的**权威原因**记进 `state`）；
+    2026-09-29（用户拍板）：**分离这一槽不再回落本机**。以前返回 `None` 时调用方会去跑
+    `diarize_wav_full`，那是一条会**静默降级到另一种向量空间**的路 —— 本机与后端是两个
+    空间，混用会认错人且不报错。现在 `None` 一律表示"没做成"，原因写进 `state`
+    （`_note_diarize_missing`），面板据实显示「说话人分离未执行：<原因>」。
+
+    四种返回，**全都不再回落本机**：
+
+      * 这一槽**压根不在会话里** → 全 `None`；
+      * 计划把 `diarize.turns` 判成没人能干 / 只归本机 → 全 `None`
+        （把那一条的**权威原因**记进 `state`）；
       * 能力层这一槽失败 → 全 `None`（+ 一条带 `reason`/`code` 的 warn），**不冒充**成功；
       * 拿到结果 → `(turns, embs, labels, plan.as_dict())`。
 
+    "回不回落本机"由**调用方**决定，判据是 `cap.backend_configured`：
+
+      * **没配能力后端**（`False`）→ 这台机器本来就这么跑，调用方走本机引擎
+        （那是"它本来就这么配的"，不是从后端降级下来）；
+      * **配了**（`True`）→ 拿到 `None` 就是**这一场没有说话人**：原因已经写进 `state`，
+        面板显示那句硬契约文案。**绝不回落本机**（另一个向量空间 = 认错人且不报错），
+        也**绝不补一列空说话人**。
+
     `state` 是可选的"这场为什么没有说话人"记录（见 `_note_diarize_missing`）：
-    调用方拿着它写进 `meta.json`，会议详情据此显示「说话人分离未执行：<真原因>」。
+    调用方拿着它写进 `meta.json`，会议详情据此显示那句硬契约文案。
     不传也不影响返回值（既有用例就是两参数调用的）。
 
-    为什么失败之后**还允许**调用方落回本机那段代码：`_capability_asr_session` 的判据
-    已经把"没配后端"的机器挡在外面了（那些机器根本进不到这里）；能进到这里而这一槽
-    失败的情形只有"配了后端但这一槽用不了"（后端没这个模型 / privacy 挡住 / 熔断）。
-    那时**回落到用户自己装了的本机引擎**是 §5.1 允许的"他选的主选"，不是被取消的那种
-    "自动兜底"；而且失败原因已经写进日志与 `state`，不会变成"静默降级"。
+    ⚠️ **绝不允许补一列空说话人**：`None` 就是 `None`。曾经有过一次教训 ——
+    为了让"每个人都有说话人列"而补一个空标签，结果库里多了一列永不为真的说话人，
+    比"没有说话人"更让人误解（见 `_ensure_speaker_column` 那段注释）。
     """
+    plan = cap.plan()
     if "diarize.turns" not in cap.slots:
         return None, None, None, None
     local = cap.local_slots()
     if "diarize.turns" in local:
-        # 这一槽的活不归能力层（用户点名了本机，或这一槽谁都干不了）。
+        # 这一槽的活不归能力层（计划明确判给本机，或这一槽谁都干不了）。
+        #
         # **这里刻意不写 warn**：那句话说一次就够（`note_local_and_empty()` 在开会话时
         # 已经说过了，带权威 reason），8 段会议连说 8 遍只会把日志淹掉。
-        # 调用方据此走原来那段 `diarize_wav_full` 代码 —— 与今天逐字一致。
-        if local.get("diarize.turns") == "empty" and state is not None:
-            # "谁都干不了"：把**计划里的权威原因**先记下来（unsupported / blocked / …）。
-            # 本机那段代码待会儿要是也不行，这条比笼统的 absent 指得准
-            # （用户要的是"为什么没用我要的那个后端"）。
-            plan = cap.plan()
+        #
+        # 但**必须把原因记进 `state`**：调用方以前拿"返回值是 None"当"去跑本机引擎"
+        # 的信号，现在它就是"这段没有说话人"的结论本身。
+        if state is not None and cap.backend_configured:
+            # 配了后端的机器上"这一槽没人干" = 在等后端（不是"这台做不到"）——
+            # 这两个结论在面板上必须是两句不同的话（见 `_note_diarize_missing`）。
             _note_diarize_missing(state, _first_reason(plan, "diarize.turns"),
-                                  _skips_brief(plan, "diarize.turns"))
+                                  _skips_brief(plan, "diarize.turns"),
+                                  waiting=True)
         return None, None, None, None
     try:
-        res, plan = cap.call("diarize.turns", wav=seg_path)
+        res, done_plan = cap.call("diarize.turns", wav=seg_path)
     except Exception as e:
         reason = getattr(e, "reason", "") or "error"
         _note_diarize_missing(state, reason, str(e), getattr(e, "code", ""),
@@ -1522,7 +1653,7 @@ def _capability_diarize_segment(cap, seg_path, state=None):
     db.add_log("debug", "capability",
                "本段说话人分离来自 %s（向量空间 %s，%d 个说话人）"
                % (res.provenance.backend_id or "?", res.vector_space_id or "?", len(labels)))
-    return turns, embs, labels, plan.as_dict()
+    return turns, embs, labels, done_plan.as_dict()
 
 
 def _merge_capability_plans(*plans):
@@ -1804,12 +1935,17 @@ def _transcribe_impl(folder):
     # `need_speaker` 从 2026-09-26 起是**遗留参数**：声纹槽（`speaker.embed`）与
     # `diarize.turns` 一样恒在计划里（会议标配三件）。所以这里不再传它 —— 留着那个
     # 形参只为不悄悄改掉一个被用例引用的签名；传什么都不影响判据。
+    #
+    # `run_info` 是 2026-09-29 加的一小份"这一场到底做了什么/在等什么"：走本机那条路的
+    # 会议**没有** `capability` 计划，恰恰是它最需要说清"文字是本机出的""在等后端"
+    # （见 `_new_run_info`）。由 `_capability_asr_session(info=...)` 填前两格。
+    run_info = _new_run_info()
     cap_session = (None if asr_provider is not None
-                   else _capability_asr_session(cfg))
+                   else _capability_asr_session(cfg, info=run_info))
     # 会话是**按整场**建的（"有没有槽落在本机以外"），而"这段代码走哪条路"要**按槽**定：
-    #   * `asr.text` 归本机（用户点名 local，或这一槽没有可用后端）→ 文本走原来那段本地代码；
+    #   * `asr.text` 归本机（这一槽没有可用后端）→ 文本走原来那段本地代码；
     #     **`diarize.turns` 仍可能走后端** —— 正是"台式机自己转写、分离发给 GPU"那种配置。
-    #   * 反过来，转写走后端而分离归本机也一样。
+    #   * 反过来，转写走后端而分离归本机也一样（那种机器上分离这一槽**如实说没做**）。
     # 不这么分的话，只配了分离的机器上会拿 `asr.text` 去问一个没有本机客户端的路由，
     # 结果是一条 `absent` 错误、**整场转写一行都没有**。
     #
@@ -1818,6 +1954,33 @@ def _transcribe_impl(folder):
     cap_local = (cap_session.note_local_and_empty() if cap_session is not None
                  else {})
     asr_is_local = cap_session is None or "asr.text" in cap_local
+    #: 这台机器**认不认**一个能力后端（设置里填了地址或配对过）—— 由 `_capability_asr_session`
+    #: 顺手填进 `run_info`（那里本来就要问一次 `configured()`）。
+    #: 分离那一槽要拿它区分两种"没有说话人"：**配了后端但用不上**（在等后端）与
+    #: **本来就没配**（这台机器本来就这么跑）。这两种在面板上必须说成两句不同的话。
+    echo_backend_configured = bool(run_info.get("backendConfigured"))
+    # 「在等后端」的状态落在分离快照上（面板那句「等待能力后端」读的就是它）：
+    # **配了后端、而这一场分离没能走后端** —— 两种走不到的情形（会话都没开成、
+    # 或开了会话但这一槽没人干）都在这里统一标掉。
+    # 反过来，"没配后端"的机器**不是**在等谁（那是它本来的样子），所以不进这一档。
+    if echo_backend_configured:
+        da_state["waiting"] = True
+    # 本场文字的出处（写进 meta，面板据此如实显示）：
+    #   provider 那条路**本来是显式配的**，不算回落；能力后端与本地引擎两条要分清 ——
+    #   后者正是"配了后端却在啃本机 CPU"，本步（暂时还留着回落）必须让用户看得见。
+    if asr_provider is not None:
+        run_info.update(_new_run_info("provider"))
+    elif asr_is_local:
+        run_info["transcribeEngine"] = "local"
+    else:
+        run_info.update(_new_run_info("backend"))
+    if asr_is_local and echo_backend_configured:
+        # 日志里也明说一句：面板上那句"本场转写由本机引擎完成"（`meta.json` 的
+        # `transcribeEngine=local`）在排障时要能和日志对上。本步**暂时保留**这条本机
+        # 回落（下一步删），所以更要让"它真的回落了"处处留痕，而不是只在面板上。
+        db.add_log("warn", "meeting",
+                   "%s：本场转写由**本机引擎**完成（原因 %s）—— 配了能力后端却没走成它"
+                   % (meeting_name, run_info.get("fallbackReason") or "未记录"))
     if asr_provider is not None:
         # 走 provider 时**不加载本地引擎**（省显存/省时间；也正是"没有 GPU 也能转写"的意义）
         db.add_log("info", "meeting", "本场转写走 provider（不加载本地模型）：%s"
@@ -1981,33 +2144,41 @@ def _transcribe_impl(folder):
                               percent=percent, detail=f"第 {i}/{seg_total} 段 · 分离说话人")
                 try:
                     # 3.0（step 4）：分离先问能力路由的 `diarize.turns` 槽。
-                    # 返回 None 的几种情况都退回**原来那段本机代码**（形状已经归一，见
-                    # `_normalize_diarize`）：这一槽按计划归本机 / 这一槽失败 /
-                    # 本场压根没开会话（`cap_session is None` = 没配后端）。
-                    # 失败时那条 warn 已经在 `_capability_diarize_segment` 里写过了 ——
-                    # 所以这里**不再重复**报错，只是走本机（最坏情况与今天逐字一致）。
+                    #
+                    # 2026-09-29（用户拍板）：**分离这一槽不再回落本机**（除非这台机器
+                    # 压根没配能力后端 —— 那是"它本来就这么跑"，不是从后端降级下来）。
+                    #   * 配了后端而这一槽拿不到结果 → **这段不标说话人**，原因写在
+                    #     `da_state` 里（`_capability_diarize_segment` 已经记好），
+                    #     转写结束时写进 meta，面板显示「说话人分离未执行：<真原因>」。
+                    #     绝不回落本机：那会在一场会里混两套不可比的嵌入（L5），
+                    #     而后果是**认错人且不报错**。也**绝不补一列空说话人**。
                     turns_raw = embs = labels = None
                     dia_plan = None
+                    #: 分离这一槽**还能不能跑本机**：只有"这台机器压根没配能力后端"才行
+                    #: （见 `_CapabilitySession.diarize_slot_is_local`）。
+                    local_diarize_ok = (cap_session.diarize_slot_is_local()
+                                        if cap_session is not None
+                                        else not echo_backend_configured)
                     if cap_session is not None:
                         turns_raw, embs, labels, dia_plan = _capability_diarize_segment(
                             cap_session, seg_path, da_state)
                         if dia_plan:
                             cap_plan = dia_plan
                             dia_backend_used = True
+                    elif local_diarize_ok:
+                        from app.audio.diarize import diarize_wav_full
+                        turns_raw, embs, labels = diarize_wav_full(seg_path)
                     if turns_raw is None:
-                        if dia_backend_used:
-                            # ⚠️ **不再回落本机**：本场已经用后端的向量空间标过说话人了，
-                            # 这一段改用本机的空间 = 一场会里混两套不可比的嵌入（L5）——
-                            # 后果是**认错人且不报错**。所以这一段不标说话人，
-                            # 并把"为什么"如实记下来（权威原因词，面板照原样显示）。
+                        if cap_session is not None and dia_backend_used:
+                            # 本场已经用后端的向量空间标过说话人了（前几段成功）：这一段
+                            # 换本机的空间 = 一场会里混两套不可比的嵌入（L5）。所以这一段
+                            # 不标说话人，并把"为什么"如实记下来（权威原因词）。
+                            # 那一槽自己的失败原因若更具体，`_note_diarize_missing`
+                            # 会保住它（挑信息量最大的那条）。
                             _note_diarize_missing(
                                 da_state, _first_reason(cap_session.plan(), "diarize.turns"),
                                 "本场已锁定向量空间 %s，本段不再回落到本机引擎"
                                 % (cap_session.vector_space_id or "?"))
-                        else:
-                            from app.audio.diarize import diarize_wav_full
-                            turns_raw, embs, labels = diarize_wav_full(seg_path)
-                    if turns_raw is None:
                         # 没拿到任何分离结果：**这段不标说话人**，但整场转写照常往下走
                         # （文字已经拿到了）。原因在 da_state 里，转写结束时写进 meta。
                         label_map = {}
@@ -2104,7 +2275,8 @@ def _transcribe_impl(folder):
             _apply_capability_meta(meta, seg_plan, cap_kinds)
             # 分离这一场的结论（成没成、不成是为什么）**每段都落盘**：转写可能中途崩/被
             # 重启，已完成的段也要留下"这段有没有说话人、为什么没有"。面板读的就是它。
-            meta["diarize"] = dict(da_state)
+            # "这一场文字是谁出的 / 在等什么"同一次写下去（`_apply_run_meta` 一并定稿）。
+            _apply_run_meta(meta, run_info, da_state)
             with open(os.path.join(folder, "meta.json"), "w", encoding="utf-8") as f:
                 json.dump(meta, f, ensure_ascii=False, indent=2)
 
@@ -2117,7 +2289,7 @@ def _transcribe_impl(folder):
         db.add_log("warn", "meeting",
                    "%s 说话人分离未执行（reason=%s）：%s"
                    % (meeting_name, why, da_state.get("detail") or "本场没有说话人"))
-    meta["diarize"] = dict(da_state)
+    _apply_run_meta(meta, run_info, da_state)
     try:
         with open(os.path.join(folder, "meta.json"), "w", encoding="utf-8") as f:
             json.dump(meta, f, ensure_ascii=False, indent=2)

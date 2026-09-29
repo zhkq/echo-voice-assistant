@@ -604,6 +604,80 @@ class VoiceprintIsStandardTests(_IsolatedState):
         self.assertIn("db.replace_speaker_embeddings", src, "留存本身必须还在")
 
 
+class WaitingForBackendIsVisibleTests(_MeetingCase):
+    """配置里点名了后端、而那台**连不上** → 会议必须说得出"在等后端"（2026-09-29）。
+
+    这一档是本步新增的：在此之前，这种会议会一路走成"本机引擎转写 + 如实说分离未执行"，
+    从界面上看像"没人说话"或"一切正常"。而真实状态是**在等后端回来**。
+
+    **本步只表达状态**，不实现队列/重试（设计里"离线队列 / 分段 pending"那是另一件事，
+    见 `docs/3.0-设计总览与组件关系.md:1086`）。
+
+    端到端跑 `_transcribe_impl`（与 `HonestDegradationTests` 同一套替身）：
+    本机转写打桩（一个真模型都不加载）、本机分离打桩成 fail（就算它可用也不许被调到），
+    只把 `capabilityEchoServerUrl` 指到一个**没人监听的端口**。
+    """
+
+    def _run_with_a_dead_backend(self):
+        self._stub_local_asr()
+        self._stub_local_diarize(raises=AssertionError("分离不该回落本机"))
+        # 配了、但没人监听那个端口（用真地址，不是打桩——要验的正是"连不上"这条真路径）
+        settings.update({"capabilityEchoServerUrl": "http://127.0.0.1:1"})
+        settings._cache = None
+        meeting._transcribe_impl(self.folder)
+
+    def test_the_run_says_the_backend_is_being_waited_for(self):
+        self._run_with_a_dead_backend()
+        meta = meeting.meeting_meta(self.name)
+        self.assertEqual(meta.get("transcribeFallbackReason"), "waiting-backend",
+                         "配了连不上的后端：这一场是在**等后端**，不是「没配」")
+        self.assertEqual(meta.get("transcribeEngine"), "local",
+                         "文字确实是本机引擎出的 —— 这一点也要如实记下来")
+        self.assertTrue(meta["diarize"]["waiting"],
+                        "分离这一槽同样要标出在等后端：%s" % meta["diarize"])
+
+    def test_the_meeting_still_produces_text_and_the_diarize_reason(self):
+        """文字照常出（本机那条路**本步暂时**还留着），分离如实说没做。"""
+        self._run_with_a_dead_backend()
+        lines = db.get_lines(self.mid)
+        self.assertEqual([ln["text"] for ln in lines], ["第一句。", "第二句。"])
+        self.assertEqual({ln["speaker_label"] for ln in lines}, {""},
+                         "分离没做成却出现了说话人标签：%s" % lines)
+        dia = meeting.meeting_meta(self.name)["diarize"]
+        self.assertFalse(dia["executed"])
+        self.assertIn(dia["reason"], SKIP_REASONS, dia)
+
+    def test_the_panel_renders_it_from_the_servers_sentence(self):
+        """面板那一行来自服务端：`execution_summary` → `plan_summary` → `meeting.html`。"""
+        from app import capability_admin
+        self._run_with_a_dead_backend()
+        meta = meeting.meeting_meta(self.name)
+        run = capability_admin.execution_summary(meta.get("diarize"),
+                                                 meta.get("transcribeEngine"),
+                                                 meta.get("transcribeFallbackReason"))
+        self.assertIsNotNone(run)
+        self.assertTrue(run["waiting"])
+        self.assertEqual(run["waitingLabel"], capability_admin.WAITING_BACKEND)
+        # 分离没做成时**那句硬契约仍然排在前面**（用户第一眼要知道这场没有说话人）
+        self.assertEqual(run["state"], "diarize-not-executed")
+        self.assertTrue(run["headline"].startswith(capability_admin.DIARIZE_NOT_EXECUTED),
+                        run["headline"])
+        cap = capability_admin.plan_summary(meta.get("capability"),
+                                            meta.get("timestampsKinds"),
+                                            meta.get("diarize"), run)
+        self.assertIsNotNone(cap, "只有「在等后端」这一条信息时也不许返回 None")
+        self.assertTrue(cap["run"]["waiting"])
+        self.assertEqual(cap["run"]["transcribeEngine"], "local")
+        # 前端：那一行由服务端给的 headline 渲染，且带一个可断言的落点
+        with open(os.path.join(_ROOT, "web", "meeting.html"), encoding="utf-8") as fh:
+            html = fh.read()
+        body = html[html.index("function renderCapability("):]
+        body = body[:body.index("\n}\n") + 3]
+        self.assertIn("cap.run", body, "面板没渲染「这一场做了什么/在等什么」那一块")
+        self.assertIn('data-testid="cap-run"', body, "那一行需要一个可断言的落点")
+        self.assertIn("run.headline", body, "headline 必须是服务端给的那句")
+
+
 def _write_wav(path, seconds=1.0):
     """写一段**真的** wav（16k 单声道 int16，与 recorder.py 的产出同格式）。"""
     n = int(16000 * seconds)

@@ -64,8 +64,12 @@ services:
       #    而"空转时归零"正是泄漏判据。写法与注释口径同 `server/compose.yaml`。
       MODELSCOPE_CACHE: "/var/echo/cache"
       HOME: "/var/echo/cache"
-      # 总通道数（出厂 2）。老卡上 SenseVoice 显存小，但算力也弱 —— 按真机压测校准。
-      ECHO_MAX_CONCURRENT: "${ECHO_MAX_CONCURRENT:-2}"
+      # 总通道数（出厂 6；每客户端另限 1）。**按卡校准**：老卡算力弱，8 GB 卡上 6 路长音频
+      # 会互相挤显存 —— 要调小**在管理面「性能」页签的「运行参数」里改，改完即时生效**
+      # （不用改这里、不用重启；写的值存在 state 卷，重启还在）。
+      # ⚠️ 这个环境变量**只是"空 state 卷首启"时的起点**：管理面配过之后，管理面那份优先。
+      #    优先级与如实提示见 `server/limits.py`（口径同 `server/compose.yaml` 文件头）。
+      ECHO_MAX_CONCURRENT: "${ECHO_MAX_CONCURRENT:-6}"
       # 鉴权：一上网就必须打开（不打开 = 谁连上谁能用这块 GPU）。
       # ⚠️ 打开鉴权就**必须**同时配好 ECHO_JWT_SECRET：只开前两项时服务照常起、
       #    /v1/health 照常 200，但客户端"配对成功"之后 POST /v1/token 回

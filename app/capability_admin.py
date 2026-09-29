@@ -56,10 +56,15 @@ ROUTING_KEYS: tuple = ("capabilityEchoServerUrl", "capabilityPrivacy") + \
     tuple(SETTING_SLOTS)
 
 #: 设置的当前值 → 客户端说的人话。
+#:
+#: **没有 `local` 这一档**（2026-09-29，用户拍板）：客户端进程内不再承担会议转写与
+#: 说话人分离 —— 要全本机跑就"在本机起一个能力后端"（取值仍是 `echo-server`）。
+#: 老库里存着的 `local` 由 `config.RETIRED_VALUE_FALLBACKS` 读时折算，
+#: 面板不会看到它（看到也是折算后的值），所以这里也不给它留死字符串。
+#: 保留 `off`：那个取值属于**别的**设置项（`worklogMode` 之类），这张表是共用的词汇表。
 CHOICE_LABELS: Dict[str, str] = {
     "auto": "自动（按优先级挑第一个可用的）",
-    "echo-server": "只用 ECHO 后端",
-    "local": "只用本机",
+    "echo-server": "只用能力后端（本机自建的那台也算）",
     "asr-provider": "只用在线转写（方案 3；整场异步，**认不了联系人** —— 它不回声纹）",
     "off": "关掉（不做这件事）",
 }
@@ -151,7 +156,8 @@ def _as_list(value: Any) -> list:
 
 
 def plan_summary(plan: Any, timestamps_kinds: Any = None,
-                 diarize_state: Any = None) -> Optional[Dict[str, Any]]:
+                 diarize_state: Any = None, run_summary: Any = None
+                 ) -> Optional[Dict[str, Any]]:
     """把会议里记下的执行计划（`Plan.as_dict()` 那份）翻成面板能直接渲染的形状。
 
     **这是"这场会实际用了谁"的唯一来源。** 读的是录音时写进 `meta.json` 的快照，
@@ -162,21 +168,31 @@ def plan_summary(plan: Any, timestamps_kinds: Any = None,
     **会议一定有说话人分离**（2026-09-26 概念纠正），所以"没做成"必须说得出来 ——
     它是这次改动里最要紧的一句人话（原来那版会静默产出一场"没有说话人却像正常"的会议）。
 
+    `run_summary` 是 `meta.json` 里"这一场到底做了什么/在等什么"（`execution_summary`）：
+    转写那一槽本步**暂时**还有本机回落，回落发生了必须看得见；后端连不上时要有
+    "在等后端"这一档。它以前不属于这里 —— 现在归这里，因为**面板只认一个出口**。
+
     认不出来的槽 / 后端 / 原因**一律退回原始标识符**，不猜也不丢：宁可让人看到
     `asr.streaming` 这种内部词，也不要显示一个错误的翻译。
 
     整个函数**不抛异常**（输入来自盘上可能被手改坏的 `meta.json`）。
     """
     dia = diarize_summary(diarize_state)
+    run = run_summary if isinstance(run_summary, dict) else None
     if not isinstance(plan, dict):
         # 没有执行计划也不算"什么都没有"：分离没做成这一条照样要说（老会议没有 plan，
         # 但新写的 `diarize` 快照是有的）。时间轴档位与 plan 是**两件独立的记录**
         # （老会议就是"有档位、没有 plan"），所以这里同样要带上它。
+        # `run` 也要带上：跑过本机引擎的会议**没有** `capability` 计划
+        # （走本机那条路时 `_apply_capability_meta` 会把上一场那份删掉），
+        # 而"本场转写由本机引擎完成 / 在等后端"恰恰是那种会议最该说的一句话。
+        if not dia and not run:
+            return None
         ts0 = timestamps_summary(timestamps_kinds) or {}
         return {"picks": [], "skipped": [], "candidates": {}, "notes": [],
                 "vectorSpaceId": "", "timestampsKinds": ts0.get("kinds") or {},
                 "timestampsLabel": ts0.get("label") or "",
-                "diarize": dia} if dia else None
+                "diarize": dia, "run": run}
     picks = []
     for slot, pick in sorted(_as_dict(plan.get("picks")).items()):
         if not isinstance(pick, dict):
@@ -204,7 +220,7 @@ def plan_summary(plan: Any, timestamps_kinds: Any = None,
     # 会议详情是同一件事的两处展示，各算一遍迟早对不上。
     ts = timestamps_summary(timestamps_kinds) or {}
     kinds = ts.get("kinds") or {}
-    if not (picks or skipped or kinds or dia):
+    if not (picks or skipped or kinds or dia or run):
         # 什么都没记（老会议 / 走的是本机回退路径）→ 返回 None 当"没有这段信息"，
         # 而不是给面板一个空壳（空壳会渲染成"用了谁：无"，看着像出了问题）。
         return None
@@ -220,6 +236,8 @@ def plan_summary(plan: Any, timestamps_kinds: Any = None,
         "timestampsLabel": ts.get("label") or "",
         # 分离这一场的结论（成没成 / 不成是为什么）。**面板不许自己编这句话**。
         "diarize": dia,
+        # 这一场"到底做了什么 / 在等什么"（含"本机引擎转的"那一条）。同样：面板只渲染。
+        "run": run,
     }
 
 
@@ -227,6 +245,40 @@ def plan_summary(plan: Any, timestamps_kinds: Any = None,
 #: 都要能一眼看到「说话人分离未执行：<真原因>」，所以那个前缀单独留成常量，
 #: 用例断言它、面板直接渲染它，谁都不许改写一遍。
 DIARIZE_NOT_EXECUTED = "说话人分离未执行"
+
+#: 「在等后端」在面板上的固定说法（2026-09-29）。
+#:
+#: 为什么要有这一档：配置里点名了能力后端、而那台**连不上**时，会议原来会一路走成
+#: "如实说分离未执行 + 本机引擎转写"，从界面上看像"这场没人说话"或"一切正常"。
+#: 但真实状态是**在等后端回来**（设计里那句"离线队列 / 分段 pending"的设想，
+#: 见 docs/3.0-设计总览与组件关系.md:1086 —— 本步**只表达状态，不实现队列/重试**）。
+WAITING_BACKEND = "等待能力后端"
+
+#: 「本场转写由本机引擎完成」在面板上的固定说法。
+#:
+#: 会议转写这一槽在 3.0 里**暂时**还留着本机回落（下一步要删），但用户必须看得见
+#: "这一场其实是这台机器自己啃的" —— 否则"配了后端"与"实际用了后端"就对不上，
+#: 而那正是这个项目里最贵的一种假象。
+TRANSCRIBED_LOCALLY = "本场转写由本机引擎完成"
+
+#: `meta.json` 的 `transcribeEngine` → 一句人话。**只认这几个取值**，
+#: 认不出的原样返回（与 `plan_summary` 同一条纪律：宁可露出内部词，也不显示一个错的翻译）。
+TRANSCRIBE_ENGINE_LABELS: Dict[str, str] = {
+    "local": TRANSCRIBED_LOCALLY,
+    "backend": "本场转写由能力后端完成",
+    "provider": "本场转写由在线转写服务完成",
+}
+
+#: 会议侧记下的"为什么这一场退回本机"的取值 → 一句人话。
+#:
+#: `waiting-backend` 与 `not-configured` 必须分开说：前者是"你配了，但那台现在连不上"
+#: （该做的是等它 / 去查那台），后者是"你压根没配"（该做的是去配对）。说错一个词，
+#: 用户就会去查错的地方 —— 这与 `base.UNIMPLEMENTED_BACKENDS` 那条纪律是同一条。
+TRANSCRIBE_FALLBACK_LABELS: Dict[str, str] = {
+    "waiting-backend": WAITING_BACKEND + "（连不上，本步还没有离线队列）",
+    "not-configured": "没配能力后端",
+    "route-unavailable": "能力路由开不起来",
+}
 
 
 def diarize_summary(state: Any) -> Optional[Dict[str, Any]]:
@@ -238,6 +290,9 @@ def diarize_summary(state: Any) -> Optional[Dict[str, Any]]:
         只有 `executed=False` 时才有意义；
       * `code` / `retryable`      服务端给的两档（"客户端该干什么"）；没有就是空/假；
       * `backendLabel`  这一场的分离是谁做的（走了后端时才有）；
+      * `waiting`       **在等后端**（2026-09-29）：配置里点名了能力后端、而那台
+                        当时连不上/不支持/没权限。它与"分离没做成"**不是同一件事** ——
+                        前者是"再等等它就有"，后者是"这一场就到此为止"；
       * `headline`      **给人看的那一句**（`说话人分离未执行：<原因>`）。
 
     认不出的 `reason` **原样返回**（与 `plan_summary` 同一条纪律：宁可露出内部词，
@@ -257,6 +312,9 @@ def diarize_summary(state: Any) -> Optional[Dict[str, Any]]:
         "retryable": bool(state.get("retryable")),
         "backendId": backend_id,
         "backendLabel": _backend_label(backend_id) if backend_id else "",
+        # 在等后端（配置里点名了它、但它当时不可用）。**不影响 `headline`**：
+        # 那句仍以"分离没做成"为准（见 `execution_summary` 的优先级说明）。
+        "waiting": bool(state.get("waiting")),
     }
     if executed:
         out["headline"] = ("说话人分离已执行"
@@ -266,6 +324,80 @@ def diarize_summary(state: Any) -> Optional[Dict[str, Any]]:
         out["headline"] = "%s：%s" % (DIARIZE_NOT_EXECUTED,
                                       out["reasonLabel"] or "原因未记录")
     return out
+
+
+def execution_summary(diarize: Any, transcribe_engine: Any = "",
+                      fallback_reason: Any = "") -> Optional[Dict[str, Any]]:
+    """这一场"到底做了什么 / 在等什么" → 面板能直接渲染的一小块。`None` = 没这段信息。
+
+    `diarize` 就是 `meta.json` 的 `diarize`（`diarize_summary` 的入参），
+    `transcribe_engine` / `fallback_reason` 是会议侧写进 `meta.json` 的两个字段
+    （见 `meeting._apply_run_meta`）。
+
+    本步（2026-09-29）为什么需要它 —— 三件事都在这一个函数里收口：
+
+      1. **转写这一槽暂时还有本机回落**（下一步才删）：回落发生了就必须**看得见**，
+         所以给出 `transcribeEngine` + `localTranscribe` + 那句人话。只打一条 warn 日志
+         等于用户看不到，而"配了后端却在啃本机 CPU"恰恰是最难查的一种状态。
+      2. **分离这一槽不再回落本机**：没做成就是 `executed=False` + 权威原因，
+         由 `diarize_summary` 给出那句硬契约文案（这里不重写一遍）。
+      3. **在等后端**（`waiting`）：配置里点名了能力后端而那台连不上。
+         本步**只表达状态**，不做队列/重试（那是另一件事，见
+         docs/3.0-设计总览与组件关系.md:1086）。
+
+    `state` 是**互斥的一档**（面板只渲染一句，不必从几句话里反推事实）：
+
+      * `diarize-not-executed` —— 分离没做成。**这一档排在最前**：后端连不上时它同时
+        为真，而用户第一眼必须知道"这场没有说话人"（不能只看到"在等"就以为结果没事）；
+      * `waiting-backend`      —— 配置里点名了后端、那台当时不可用；
+      * `local-transcribe`     —— 这一场的文字是本机引擎出的（本步暂时的回落）；
+      * `backend`              —— 转写与分离都走了能力后端（正常态，不额外提示）。
+
+    整个函数**不抛异常**（输入来自盘上可能被手改坏的 `meta.json`）。
+    """
+    dia = diarize_summary(diarize)
+    engine = str(transcribe_engine or "")
+    why = str(fallback_reason or "")
+    if not dia and not engine and not why:
+        return None
+    waiting = bool(dia and dia.get("waiting"))
+    out: Dict[str, Any] = {
+        "transcribeEngine": engine,
+        "transcribeEngineLabel": TRANSCRIBE_ENGINE_LABELS.get(engine, engine),
+        "localTranscribe": engine == "local",
+        "fallbackReason": why,
+        "fallbackReasonLabel": TRANSCRIBE_FALLBACK_LABELS.get(why, why),
+        "waiting": waiting,
+        "waitingLabel": WAITING_BACKEND if waiting else "",
+        "state": "",
+        "headline": "",
+        # 分离那一场的结论**原样带上**：面板不必再从 `plan_summary` 里找一遍
+        # （同一个事实两处取，迟早对不上）。
+        "diarize": dia,
+    }
+    if dia and not dia.get("executed"):
+        out["state"] = "diarize-not-executed"
+        # 硬契约那句：`说话人分离未执行：<真原因>`（原样用 `diarize_summary` 给的，
+        # 不在这里重写一遍 —— 两处各写一遍，迟早出现两个版本）。
+        out["headline"] = dia.get("headline") or DIARIZE_NOT_EXECUTED
+    elif waiting:
+        out["state"] = "waiting-backend"
+        out["headline"] = "%s：%s" % (WAITING_BACKEND, _fallback_reason_text(why))
+    elif engine == "local":
+        out["state"] = "local-transcribe"
+        out["headline"] = TRANSCRIBED_LOCALLY
+    elif engine:
+        out["state"] = "backend"
+        out["headline"] = out["transcribeEngineLabel"]
+    return out
+
+
+def _fallback_reason_text(value: Any) -> str:
+    """"在等后端"那句话里跟的原因：认得出就用中文，认不出就原样说（不编）。"""
+    why = str(value or "")
+    if not why:
+        return "配置里点名了它，但它现在连不上"
+    return TRANSCRIBE_FALLBACK_LABELS.get(why, why)
 
 
 def _setting(key, default=None):

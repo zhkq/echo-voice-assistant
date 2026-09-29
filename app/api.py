@@ -1142,8 +1142,14 @@ def get_meeting(mid: int, _auth=Depends(optional_auth)):
     # 已经有一份，别在面板的 JS 里再抄一份词汇表。没有这段信息时是 None（老会议）。
     from app import capability_admin
     meta = meeting.meeting_meta(detail["name"])
+    # `run` 是"这一场到底做了什么/在等什么"（转写是不是本机引擎出的、在不在等后端）。
+    # 它**不属于** `capability` 计划（走本机那条路的会议压根没有计划），但面板要看到，
+    # 所以由 `execution_summary` 单独翻好，再一并交给 `plan_summary` 出**同一个出口**。
     detail["capability"] = capability_admin.plan_summary(
-        meta.get("capability"), meta.get("timestampsKinds"), meta.get("diarize"))
+        meta.get("capability"), meta.get("timestampsKinds"), meta.get("diarize"),
+        capability_admin.execution_summary(meta.get("diarize"),
+                                           meta.get("transcribeEngine"),
+                                           meta.get("transcribeFallbackReason")))
     return detail
 
 

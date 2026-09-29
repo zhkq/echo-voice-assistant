@@ -28,6 +28,32 @@
   —— 它会把自启动指回仓库（这正是被替换掉的那个耦合）。
 - 现状以 `scripts\switch-instance.ps1 -Status` 与 `GET /api/status` 为准，不要凭记忆。
 
+### 能力后端的接口契约与依赖口径（2026-09-29 真机实测，写脚本调它踩了三次才对齐）
+
+自己写脚本 / 工具去调能力后端（`server/` 那套）时，**这三条契约必须照做**，否则会得到看似"服务坏了"的报错：
+
+- **① `POST /v1/pair` 的字段名是 `clientName`**（不是 `name`，也没有 `clientVersion`）：
+  `{"code": "<一次性码>", "clientName": "<名字>"}`。传错字段**不报错**，只会静默拿到空名字。
+- **② `POST /v1/token` 走 HTTP Basic**，凭据是 `client_id:secret`：
+  `Authorization: Basic base64("<clientId>:<secret>")`。**不要把 clientId/secret 放 JSON body** —— 那样会
+  401「未授权」，很容易被误判成"配对失败"。响应里的令牌字段是 **`accessToken`**（不是 `token`），
+  同响应还有 `expiresIn` / `scopes` / `clientId`。
+- **③ `/v1/asr` 与 `/v1/diarize` 收的是"裸音频 body"**：`Content-Type: audio/wav` + 直接把 wav 字节当请求体。
+  用 `multipart/form-data` 上传会得到 **HTTP 415 `unsupported_media`**
+  （`detail: 不认识的 Content-Type: 'multipart/form-data'`）。令牌走 `Authorization: Bearer <accessToken>`。
+
+**依赖口径（`torch` 与 `torchaudio`）**：判据是**两者的 CUDA 源标签一致**（都带 `+cu126`），**不是版本号相同** ——
+PyTorch 2.9 之后 **torchaudio 停更**，版本号天然对不上（cu126 索引上实测可用组合：`torch 2.14.0+cu126` +
+`torchaudio 2.11.0+cu126`）。真正的坑是**从普通 PyPI 拉来的无标签 torchaudio**（cu13x 那套，要 `libcudart.so.13`）
+→ `_torchaudio.abi3.so` 加载失败 → **`import torchaudio` 崩 → funasr(SenseVoice) 的模型加载也失败 →
+每个 `/v1/asr` 都 503 `model_failed`**（转写与分离一起被打死）。所以 `server/Dockerfile` 把两者写在
+**同一条 pip、同一个 index-url** 里，并在**构建期**校验"CUDA 标签一致 + `import torchaudio` 通过" ——
+这类坑必须在构建时炸，不要留到运行时表现为 503。
+
+**顺带一个能力结论（同日真机验证）**：**RTX 2060 SUPER（Turing，cap 7.5）能跑说话人分离** ——
+pyannote 4.0.7 在 cu126 上装得上也跑得动（600 秒音频约 26.7 秒，走 `/v1/diarize` 返回 200）。
+"Turing 没有 bf16 所以只能转写"这个推断**对分离不成立**（分离不吃 bf16）。
+
 ### 远程部署的坑（SSH 喂脚本 / `docker build` / 管理员口令与 scopes）（2026-09-28 两台真机实测）
 
 - **① PowerShell 往 ssh 的 stdin 喂多行脚本时，CR 只会落在最后一行。**

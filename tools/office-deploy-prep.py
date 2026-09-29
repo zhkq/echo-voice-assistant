@@ -65,7 +65,10 @@ if not os.path.exists(env_path):
         "ECHO_HOST_STATE_DIR=%s/state\n"
         "ECHO_HOST_CACHE_DIR=%s/cache\n"
         "ECHO_HEALTH_SCHEME=http\n"
-        "ECHO_MAX_CONCURRENT=2\n" % (secrets.token_hex(32), HOME, HOME, HOME, HOME))
+        # 出厂默认就是 6（`delivery/backend-*/compose.yaml` 的 `${ECHO_MAX_CONCURRENT:-6}`，
+        # 也是两个 `.env.example` 里的值）—— 这份 `.env` 只是"本机起后端"那台的起点，
+        # 别在这里另写一个数，否则本机与出厂口径就对不上了。要按卡校准就在管理面改。
+        "ECHO_MAX_CONCURRENT=6\n" % (secrets.token_hex(32), HOME, HOME, HOME, HOME))
 
 print("== compose: environment 关键行")
 for ln in comp.splitlines():

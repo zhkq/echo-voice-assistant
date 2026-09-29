@@ -941,6 +941,109 @@ class MeetingAsrBackendIsExplicitTests(unittest.TestCase):
                          "选项里出现了路由不认识的后端 id：%s" % (opts - known))
 
 
+class TheLocalValueIsRetiredTests(unittest.TestCase):
+    """三个能力设置里的 **`local` 一档退役**（2026-09-29，用户拍板）。
+
+    决定：**客户端进程内不再承担会议转写与说话人分离** —— 即使本机有 GPU，也以
+    "在本机起一个能力后端"的形式完成（取值仍是 `echo-server`：本机自建的那台后端
+    就是它）。所以这三个设置里都不该再有 `local`。
+
+    老库里存着的 `local` 走 **`RETIRED_VALUE_FALLBACKS`**（读时折算，库里的原值一个
+    字节都不改）。为什么不是另外两套机制：`DEFAULT_MIGRATIONS` 只处理"值恰好等于旧默认"，
+    而这批是**用户自己选过**的值；`DEPRECATION_MIGRATIONS` 是按触发值**搬意图**到另一个
+    键上，而这里目标是同一个键 —— 搬法不对（`config.py` 里那两段注释记着这个坑）。
+    """
+
+    KEYS = ("capabilityMeetingAsrBackend", "capabilityDiarizeBackend",
+            "capabilityEmbedBackend")
+    #: 折算规则（逐键）。会议转写折成 echo-server：用户当初选 local 想要的正是
+    #: "别出机、用本机算力"，而"本机自建的后端"就是同一个取值下的东西。
+    #: 分离/嵌入折成 auto：这两槽**默认链上本来就只有 ECHO 后端**，折成 auto 与
+    #: 当年那个 local 实际挑到的完全一致（`local` 从来没被挑中过），
+    #: 而且不会把"我不想出机"的意图反过来。
+    EXPECTED = {"capabilityMeetingAsrBackend": "echo-server",
+                "capabilityDiarizeBackend": "auto",
+                "capabilityEmbedBackend": "auto"}
+
+    def test_no_local_in_any_of_the_three_options(self):
+        from app.config import DEFAULTS, _effective_options
+        for key in self.KEYS:
+            with self.subTest(key=key):
+                meta = DEFAULTS[key]
+                self.assertNotIn("local", meta["options"],
+                                 "%s 不该再提供本机这一档" % key)
+                self.assertNotIn("local", list(_effective_options(key, meta)),
+                                 "%s 的平台候选项里还有 local" % key)
+                self.assertIn(meta["value"], meta["options"],
+                              "%s 的默认值不在选项里 → 面板选不到当前值" % key)
+
+    def test_the_remaining_options_are_real(self):
+        """选项里只剩路由真认识的取值（本机作为**后端实现**仍在，只是不再是一个可选档）。"""
+        from app.capabilities import base
+        from app.config import DEFAULTS
+        for key in self.KEYS:
+            for value in DEFAULTS[key]["options"]:
+                with self.subTest(key=key, value=value):
+                    self.assertIn(value, ("auto", base.BACKEND_ECHO_SERVER,
+                                          base.BACKEND_ASR_PROVIDER))
+
+    def test_the_retired_value_is_folded_on_read(self):
+        from app.config import RETIRED_VALUE_FALLBACKS
+        for key, want in self.EXPECTED.items():
+            with self.subTest(key=key):
+                self.assertEqual((RETIRED_VALUE_FALLBACKS.get(key) or {}).get("local"), want,
+                                 "%s 的 local 没有折算规则（老库读出来还是 local）" % key)
+
+    def test_the_folding_really_happens_at_the_read_exit(self):
+        """真的走一遍读时折算，而不是只看表。
+
+        `_aliased` 有一条"**只在本平台确实不再提供它时**才折算"的护栏（那条护栏是为了
+        macOS 仍提供的 whisper 档）。所以这里除了断言折出来的值，还要断言**它没被那条
+        护栏挡住** —— 否则哪天有人把 `local` 加回候选项，这条用例会静默变成"折了但没生效"。
+        """
+        from app.config import _aliased
+        for key, want in self.EXPECTED.items():
+            with self.subTest(key=key):
+                self.assertNotEqual(want, "local")
+                self.assertEqual(_aliased(key, "local"), want)
+
+    def test_it_is_not_done_with_the_two_migrations_that_do_not_fit(self):
+        """**不许**把这三条塞进另外两张迁移表（它们的语义都不对，见类注释）。
+
+        * `DEFAULT_MIGRATIONS`：只处理"值恰好等于旧默认"，而这批是用户自己选的值
+          —— 放进去等于**永远命中不了**，看着像做了迁移；
+        * `DEPRECATION_MIGRATIONS`：它把意图**搬到另一个键**上，而这里目标是同一个键。
+        """
+        from app.config import DEFAULT_MIGRATIONS, DEPRECATION_MIGRATIONS
+        for key in self.KEYS:
+            with self.subTest(key=key):
+                self.assertNotIn(key, DEPRECATION_MIGRATIONS,
+                                 "%s 的目标是同一个键，搬意图那套机制不适用" % key)
+                got = DEFAULT_MIGRATIONS.get(key)
+                if got is not None:                 # 只允许既有的 auto → echo-server 那条
+                    self.assertEqual(got, ("auto", "echo-server"),
+                                     "%s 的 DEFAULT_MIGRATIONS 被改成了别的东西" % key)
+
+    def test_the_folded_value_is_a_real_option(self):
+        """折算的目标**必须落在候选项里** —— 折到一个不存在的值比不折更糟
+        （面板显示不出当前值，一保存就写回空串）。"""
+        from app.config import DEFAULTS, RETIRED_VALUE_FALLBACKS, _effective_options
+        for key in self.KEYS:
+            for value, target in (RETIRED_VALUE_FALLBACKS.get(key) or {}).items():
+                with self.subTest(key=key, value=value):
+                    self.assertIn(target, list(_effective_options(key, DEFAULTS[key])),
+                                  "%s 把 %s 折算成了不在候选项里的 %s" % (key, value, target))
+
+    def test_the_shared_choice_labels_have_no_dead_local_string(self):
+        """面板文案表里不许再留着本机那一档的死字符串（留了就会有人以为还能选）。"""
+        from app.capability_admin import CHOICE_LABELS
+        self.assertNotIn("local", CHOICE_LABELS)
+        self.assertIn("echo-server", CHOICE_LABELS)
+        self.assertIn("asr-provider", CHOICE_LABELS)
+        # `off` 留着：那张表是**共用词汇表**，别的设置项（worklogMode 之类）还在用它。
+        self.assertIn("off", CHOICE_LABELS)
+
+
 class EchoServerStatusIsCarriedTests(unittest.TestCase):
     """「能力」卡的状态行读的是**后端自己宣告的**状态（2026-09-28，设置分家）。
 

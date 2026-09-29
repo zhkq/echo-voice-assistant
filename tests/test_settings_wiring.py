@@ -461,6 +461,82 @@ class DeprecationTests(unittest.TestCase):
                                      "%s 的迁移目标不能是另一个弃用项" % key)
 
 
+class RetiredLocalValueTests(unittest.TestCase):
+    """老库里存着 `local` → **读时折算，且库里的原值一个字节都不改**（2026-09-29）。
+
+    为什么必须用临时库、且必须查**库行本身**：这两条断言的一半是"我们没动用户的库"。
+    只查 `settings.get()` 的话，"折算了"与"改库了"看起来一模一样 —— 而后者是
+    **未经用户同意改了他的配置**，正是这套机制（`RETIRED_VALUE_FALLBACKS`）刻意不要的。
+    """
+
+    KEYS = ("capabilityMeetingAsrBackend", "capabilityDiarizeBackend",
+            "capabilityEmbedBackend")
+    EXPECTED = {"capabilityMeetingAsrBackend": "echo-server",
+                "capabilityDiarizeBackend": "auto",
+                "capabilityEmbedBackend": "auto"}
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="echo-retired-")
+        self._old = (db.DATA_DIR, db.DB_FILE)
+        db.DATA_DIR = self.tmp
+        db.DB_FILE = os.path.join(self.tmp, "retired.db")
+        db.init()
+        settings.seed_defaults()
+        _drop_settings_cache()
+
+    def tearDown(self):
+        db.DATA_DIR, db.DB_FILE = self._old
+        _drop_settings_cache()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _seed_local(self, key):
+        """模拟老装机：库里存着用户当年选的 `local`。"""
+        db.set_setting(key, "local")
+        _drop_settings_cache()
+
+    def test_the_read_value_is_the_folded_one(self):
+        for key, want in self.EXPECTED.items():
+            with self.subTest(key=key):
+                self._seed_local(key)
+                self.assertEqual(settings.get(key), want,
+                                 "%s 里存的 local 没被折算" % key)
+
+    def test_the_panel_exit_folds_it_too(self):
+        """面板出口（`settings.all(include_hidden=True)`）走的是**库行**，不是内存缓存 ——
+        两处各折一次必然漂移（"面板显示 local、路由按 echo-server 走"）。"""
+        for key, want in self.EXPECTED.items():
+            with self.subTest(key=key):
+                self._seed_local(key)
+                rows = {r["key"]: r["value"] for r in settings.all(include_hidden=True)}
+                self.assertEqual(rows.get(key), want,
+                                 "%s 的面板出口没折算：显示与路由会对不上" % key)
+
+    def test_the_stored_row_is_not_rewritten(self):
+        """**库里的原值不许被改写** —— 这条与上面两条同等重要。
+
+        用户没动手，我们就不该动他的库；`local` 留在库里，用户哪天想回去看也看得到
+        （而且新的语义下它照样读成折算值）。
+        """
+        for key in self.KEYS:
+            with self.subTest(key=key):
+                self._seed_local(key)
+                self.assertEqual(settings.get(key), self.EXPECTED[key])
+                # 直接问库：一个字节都不许变
+                self.assertEqual(db.get_setting(key), "local",
+                                 "%s 的库行被改写了（读时折算不许落盘）" % key)
+
+    def test_it_is_not_migrated_by_the_two_other_tables(self):
+        """`seed_defaults()` 跑一遍之后库里还是 `local`（那两张表都不该碰它）。"""
+        for key in self.KEYS:
+            with self.subTest(key=key):
+                self._seed_local(key)
+                settings.seed_defaults()
+                _drop_settings_cache()
+                self.assertEqual(db.get_setting(key), "local",
+                                 "%s 被别的迁移改写了（这套折算机制不落盘）" % key)
+                self.assertEqual(settings.get(key), self.EXPECTED[key])
+
+
 # ---------------------------------------------------------------- 5. 候选项 / 面板接线
 
 class OptionAndPanelWiringTests(unittest.TestCase):

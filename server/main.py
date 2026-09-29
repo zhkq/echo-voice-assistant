@@ -500,9 +500,13 @@ def _admin_cli(cfg, args) -> int:
             return 0
 
         # ---- 管理面账号（设计 §8.4）----
-        # 管理面**刻意不改账号**（面板上只有一份只读清单）：改账号等于"改谁能进这扇门"，
-        # 而面板本身就在这扇门里 —— 让面板改账号，就是给一次会话劫持配一个提权出口。
+        # 管理面能做的**只有一件事：改"自己"的口令**（`POST /admin/api/password`），而且
+        # **必须先给出当前口令** —— 会话被劫持的人卡在这一步（口令一改，别的会话同时失效）。
+        # 管理面**仍然不做**：新建 / 删除 / 禁用 / 启用管理员，以及改**别人**的口令 ——
+        # 那是"谁能进门"的事，不该在门里做。（面板上那份管理员清单仍是只读的。）
         # 所以建账号 / 禁用 / 删除只在这里，与其他写动作同一条出口（能开库 = shell 权限）。
+        # 口径与 `server/admin.py` 的 `selfServiceNote` 一致；用例见
+        # `tests/test_admin_console.py::PasswordChangeConsoleTests`。
         if args.new_admin:
             pwd = admin_mod.new_password()
             store.upsert_admin(args.new_admin, admin_mod.hash_password(pwd))

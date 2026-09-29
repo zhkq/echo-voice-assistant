@@ -796,7 +796,9 @@ DEFAULTS = {
     "capabilityPrivacy": dict(
         value="lan", grp="capability", label="允许音频去哪", hidden=True,
         options=["none", "lan", "wan"],
-        description="none = 不出机（只用本机引擎）；lan = 允许发到单位内网的 ECHO 后端；"
+        description="none = 不出机（会议就只能如实说「没做」——客户端进程内不再有会议转写/"
+                    "分离引擎，要全本机跑就在本机起一个能力后端）；"
+                    "lan = 允许发到单位内网的 ECHO 后端；"
                     "wan = 还允许更远的公共服务。这是**约束**，不是优先级 —— "
                     "它决定哪些后端根本不被考虑，见能力路由的 privacy 判据",
         value_type="str"),
@@ -805,34 +807,42 @@ DEFAULTS = {
         # 2026-09-25（用户）：**不给 auto** —— auto 的链末尾是本机，而默认档的本机是 sherpa，
         # 会议链路驱动不了它（拿 "sherpa" 当 whisper 模型名加载）→ 录到音频、0 行文字，
         # 面板还把原因显示成"麦克风没打开"。直接选一个，用不了时说得出名字。
-        options=["echo-server", "local", "asr-provider"],
+        # 2026-09-29（用户）：**本机这一档退役** —— 会议转写不再由客户端进程内的引擎承担，
+        # 要全本机跑就"在本机起一个能力后端"（同一个 echo-server 取值，两条交付方式见容器/扩展包）。
+        options=["echo-server", "asr-provider"],
         description="会议链路的 asr.text。**没有 auto**：直接选一个；选中的那个用不了时会"
                     "如实报错（说清是哪个后端、为什么），不会悄悄换别的兜底。"
-                    "「ECHO 后端」= 配对好的 GPU 机器（本机自建的那台也算，走同一个后端）；"
-                    "「本机」= 这台机器的转写引擎；"
+                    "「ECHO 后端」= 配对好的能力后端（**本机自建的那台也算** —— 本机要"
+                    "全本地跑就起一个后端，走同一个取值）；"
                     "「网络服务商」= 在线 qwen3.1（会议转写方案 3，整场异步 + 说话人分离）—— "
                     "**要填密钥才存在**，而且它只回说话人编号、**认不了联系人**；"
                     "选它时「允许音频去哪」必须是「内网+公网」（会议音频会上传）。"
-                    "三条路的选择与边界见 docs/3.0-设计总览与组件关系.md §6.6",
+                    "**客户端进程内那条本机转写不再是这一项的取值**（老库里的 `local` 读时"
+                    "折算成 `echo-server`，库里的原值一个字节都不改）。"
+                    "选择与边界见 docs/3.0-设计总览与组件关系.md §6.6",
         value_type="str"),
     "capabilityDiarizeBackend": dict(
         value="auto", grp="capability", label="说话人分离用哪个后端", hidden=True,
-        options=["auto", "echo-server", "local"],
+        options=["auto", "echo-server"],
         description="会议转写**一定有**说话人分离（它是会议的必备环节，不是开关）——"
                     "这一项决定**由谁做**：auto = 按默认链挑（ECHO 后端优先）；"
-                    "echo-server = 只用配对好的 GPU 后端；local = 只用本机的 pyannote。"
-                    "**会议链路的默认链上没有本机**（不做兜底）：ECHO 后端不可用时这场会议"
-                    "就是没有说话人（并如实告诉用户为什么），而不是**自动**降级到本机 —— "
-                    "本机与后端是两个向量空间，混用会认错人。想全本地跑就**显式**选「本机」。"
+                    "echo-server = 只用配对好的能力后端。"
+                    "**没有本机这一档**（2026-09-29 用户定）：分离只落在能声明向量空间的"
+                    "后端上，客户端进程内不再承担它。ECHO 后端不可用时这场会议"
+                    "**如实说「说话人分离未执行」并写明原因**（绝不补一列空说话人、"
+                    "也绝不改用另一种向量空间硬凑 —— 那会认错人且不报错）。"
+                    "本机与后端是两个向量空间，混用会认错人；"
                     "**产出向量的能力只能落在能声明向量空间的后端上**（网络服务商不行）",
         value_type="str"),
     "capabilityEmbedBackend": dict(
         value="auto", grp="capability", label="声纹嵌入用哪个后端", hidden=True,
-        options=["auto", "echo-server", "local"],
+        options=["auto", "echo-server"],
         description="说话人嵌入（认人用）。**必须与会议里认出的说话人同源**"
                     "（同一个向量空间），否则余弦相似度没有意义 —— 而比错的表现是"
                     "**认错人且不报错**，所以这条由路由强制，不靠自觉。"
-                    "auto = 按默认链挑；也可显式指定 ECHO 后端或本机",
+                    "auto = 按默认链挑；也可显式指定 ECHO 后端。"
+                    "**与分离同理，没有本机这一档**（2026-09-29）：嵌入只落在能声明"
+                    "向量空间的后端上",
         value_type="str"),
     # ---------- 面板 / 服务 ----------
     "panelAutoRefresh": dict(value=3, grp="panel", label="面板自动刷新秒",
@@ -961,6 +971,18 @@ RETIRED_VALUE_FALLBACKS = {
                  "medium": "sherpa", "large": "sherpa", "large-v3": "sherpa"},
     "meetingSttModel": {"tiny": "qwen3asr", "base": "qwen3asr", "small": "qwen3asr",
                         "medium": "qwen3asr", "large": "qwen3asr", "large-v3": "qwen3asr"},
+    # 2026-09-29：客户端进程内**不再承担会议转写与说话人分离**（用户拍板）——
+    # 即使本机有 GPU，也以"在本机起一个能力后端"的形式完成（同一个 echo-server 取值）。
+    # 于是三个能力设置里的 `local` 一档退役：
+    #   会议转写：折成 `echo-server`（本机自建的那台后端就是它，语义上正是用户当初
+    #             选 local 想要的东西：别出机、用本机的算力）；
+    #   分离/嵌入：折成 `auto`（这一档**本来就没有本机候选** —— 默认链上只有 ECHO 后端，
+    #             折成 auto 与"当年那个 local 实际挑到的"完全一致，且不会把
+    #             "我不想出机"的意图反过来）。
+    # 库里的原值一个字节都不动（读时折算，见 `_aliased`）。
+    "capabilityMeetingAsrBackend": {"local": "echo-server"},
+    "capabilityDiarizeBackend": {"local": "auto"},
+    "capabilityEmbedBackend": {"local": "auto"},
 }
 
 
