@@ -12,12 +12,12 @@
 
 | 文件 | 说明 |
 |---|---|
-| `ECHO/` | ECHO 主程序（**已经解开好了**，约 5.6 MB，必备）。交给助手去装，你不用管 |
+| `echo-core/` | ECHO 主程序（**已经解开好了**，约 5.6 MB，必备）。交给助手去装，你不用管 |
 | `echo-install/` | 安装技能：`SKILL.md`（给助手看的步骤）+ `scripts/` 里的脚本（Windows 用 `.ps1`，mac 用 `.sh`） |
 | `BUILD-INFO.txt` / `SHA256SUMS.txt` | 这个包的身份与各文件校验值（可选，想核对时用） |
 
 > mac 上**没有** `install.ps1` 那套（那是 Windows 专属）。助手会跑：
-> `ECHO/mac/setup_mac.sh`（建环境）→ 把 `ECHO/` 放到最终位置 → `mac/start_mac.sh`（启动）→
+> `echo-core/mac/setup_mac.sh`（建环境）→ 把 `echo-core/` 放到最终位置 → `mac/start_mac.sh`（启动）→
 > `echo-install/scripts/echo-install-components.sh`（按你的选择装引擎、下模型、写设置、登记）。
 > 如果你的助手说"不知道该跑哪个"，把这几条发它。
 

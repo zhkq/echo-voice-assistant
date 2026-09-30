@@ -59,6 +59,11 @@ $ErrorActionPreference = 'Stop'
 $script:StepCount = 8
 $script:LogPath = Join-Path $env:TEMP 'ECHO-install.log'
 $script:ZipPath = ''
+# 包顶层目录名。**两个名字都要认**：
+#   ECHO      = 主包 zip 自己裹的那一层（build-package.ps1 定的，历史名字）
+#   echo-core = 3.0 起 kit 里的代码目录名，与安装根里的 `<安装根>\echo-core` 同名
+#               （组 kit 时把 ECHO\ 改成了它；同事双击的那个 .bat 也在同一层）
+$script:CodeDirNames = @('echo-core', 'ECHO')
 $script:ZipTop = 'ECHO'
 $script:TreeSource = ''      # 场景 C：来源是已解开的包目录（不再有 zip）
 $script:TargetDir = ''
@@ -276,9 +281,16 @@ function Step02-Source {
     } catch {
         Warn ("读取交付包目录失败: {0}" -f $_.Exception.Message)
     } finally { Remove-Item $listFile -Force -ErrorAction SilentlyContinue }
-    if ($topDirs -contains 'ECHO') {
-        $script:ZipTop = 'ECHO'
-        Info ("zip 顶层目录: ECHO（与它同级的还有 {0} 项）" -f ($topDirs.Count - 1))
+    # 认包判据（**两个名字都认**，清单在脚本顶部 $script:CodeDirNames）：
+    #   echo-core = 3.0 起 kit 里的代码目录名（与 <安装根>\echo-core 同名）
+    #   ECHO      = 主包 zip 自己裹的那一层（历史名字，兼容）
+    $codeTop = ''
+    foreach ($name in $script:CodeDirNames) {
+        if ($topDirs -contains $name) { $codeTop = $name; break }
+    }
+    if ($codeTop) {
+        $script:ZipTop = $codeTop
+        Info ("zip 顶层目录: {0}（与它同级的还有 {1} 项）" -f $codeTop, ($topDirs.Count - 1))
     } elseif ($topDirs.Count -eq 1) {
         $script:ZipTop = $topDirs[0]
         Info ("zip 顶层目录: {0}" -f $script:ZipTop)

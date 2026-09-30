@@ -178,8 +178,15 @@ class SkillPointsAtTheRealEntryTests(unittest.TestCase):
         self.text = _read(SKILL_MD)
 
     def test_says_where_install_ps1_actually_is(self):
-        self.assertIn(r"ECHO\scripts\install.ps1", self.text,
+        """`echo-core\\` 是 2026-09-30 起 kit 里的代码目录名；老包叫 `ECHO\\`，两个都要提。
+
+        为什么必须提老名字：同一个技能也随**离线最小包**（`build_min_kit.py`，包里仍是
+        `ECHO\\`）发出去 —— 只写新名字，那份包里的 agent 就会说"找不到 install.ps1"。
+        """
+        self.assertIn(r"echo-core\scripts\install.ps1", self.text,
                       "技能文档没告诉 agent install.ps1 的实际位置")
+        self.assertIn(r"ECHO\scripts", self.text,
+                      "技能文档丢了老包（ECHO\\）的名字 —— 离线最小包还在用它")
 
     def test_says_the_program_is_already_unpacked(self):
         self.assertIn("已经解开", self.text,

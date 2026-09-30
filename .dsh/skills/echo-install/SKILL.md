@@ -10,12 +10,14 @@ whenToUse: 新机器首装 ECHO（Windows 或 macOS）；或把 ECHO 交给同�
 
 ## 0. 这个技能怎么用（也是给同事看的三句话）
 
-1. 资料夹里是**一个技能 + 一份已经解开的主程序**：`echo-install/`（本技能）与 `ECHO/`（主程序，
-   不用再解压；Windows 上资源管理器里显示成 `ECHO\`）。把整个资料夹给你的 agent。
+1. 资料夹里是**一个技能 + 一份已经解开的主程序**：`echo-install/`（本技能）与 `echo-core/`
+   （主程序，不用再解压；Windows 上资源管理器里显示成 `echo-core\`）。
+   更早出的包里那个目录叫 `ECHO\` —— **两个名字都认**（装机后代码落在 `<安装根>\echo-core`）。
+   把整个资料夹给你的 agent。
 2. 对你的 agent 说：**「按 echo-install 这个技能给我装 ECHO」**。
 3. agent 会问你几个问题（装到哪、要哪些能力），然后自己下载安装。
 
-**它不需要 git、不需要 GitHub**：代码来自资料夹里那个 `ECHO/`；依赖来自 **PyPI**；
+**它不需要 git、不需要 GitHub**：代码来自资料夹里那个 `echo-core/`；依赖来自 **PyPI**；
 模型来自 **ModelScope / hf-mirror**（ECHO 内置 `HF_ENDPOINT=https://hf-mirror.com`）。
 运行时按平台不同：**Windows** 从 python.org 取（嵌入包兜底），**macOS** 用 Homebrew 的 `python@3.11`。
 
@@ -27,8 +29,9 @@ whenToUse: 新机器首装 ECHO（Windows 或 macOS）；或把 ECHO 交给同�
 ```powershell
 # ① 离线最小包（ECHO-kit-min-*.zip）：**双击 装我.cmd 就行**；等价的命令行是
 powershell -NoProfile -ExecutionPolicy Bypass -File "<kit>\install-offline.ps1" -Root D:\ECHO
-# ② 在线工具包（ECHO-kit-*.zip）：入口在主程序里（同一个脚本），加 -Offline 就是离线那条路
-powershell -NoProfile -ExecutionPolicy Bypass -File "<kit>\ECHO\scripts\install-all.ps1" -Yes
+# ② 在线工具包（ECHO-kit-*.zip）：**双击 kit 根的 装我.cmd**
+#    （它只问一句"装到哪个目录"，然后调下面这条；资料夹里有 bundle\ 就自动加 -Offline）
+powershell -NoProfile -ExecutionPolicy Bypass -File "<kit>\echo-core\scripts\install-all.ps1" -Yes
 ```
 
 它一次走完：**就位主程序 → 建运行时 → 装核心依赖 → 装组件 → 打印面板地址**。
@@ -155,11 +158,13 @@ done
 
 ## 3. 装（都可重跑）
 
-资料夹里 `ECHO/` 是**已经解开的主程序** —— 所以这一步不再解压，只是把它放到安装目录。
+资料夹里 `echo-core/`（更早的包里叫 `ECHO/`）是**已经解开的主程序** ——
+所以这一步不再解压，只是把它放到安装目录。
 
 ### Windows ① 装主程序 + 准备运行时
 
-> **`install.ps1` 就在 `ECHO\scripts\` 里**（资料夹解开后它就在那儿），不是散在资料夹根上。
+> **`install.ps1` 就在 `echo-core\scripts\` 里**（资料夹解开后它就在那儿；更早的包里是
+> `ECHO\scripts\`），不是散在资料夹根上。
 >
 > **务必用下面这种 `powershell -File …` 的形式**（`-ExecutionPolicy Bypass` 是关键）。
 > 有同事在**已经打开的 PowerShell 会话里**直接 `& '…\install.ps1'`，而那台机器默认
@@ -168,21 +173,21 @@ done
 > 非要在当前会话里跑，就先 `Set-ExecutionPolicy -Scope Process Bypass -Force`。
 
 ```powershell
-$kit = 'C:\资料目录'          # 解开资料夹后的目录（里面有 ECHO\ 和 echo-install\）
-powershell -NoProfile -ExecutionPolicy Bypass -File "$kit\ECHO\scripts\install.ps1" `
+$kit = 'C:\资料目录'          # 解开资料夹后的目录（里面有 echo-core\（老包 ECHO\）和 echo-install\）
+powershell -NoProfile -ExecutionPolicy Bypass -File "$kit\echo-core\scripts\install.ps1" `
     -DestDir 'D:\ECHO' -Silent
 # 加 -PipIndex https://pypi.tuna.tsinghua.edu.cn/simple  可换国内 pip 镜像（慢就用它）
 ```
 
-脚本看到 `ECHO\` 同级有 `manifest.json`，就知道这是"已解开的包"，直接复制（约 10 MB，秒级）。
-若 `ECHO\` **已经在**你要装的位置（例如把资料夹直接解压到了 `D:\`、得到 `D:\ECHO`），
-把 `-DestDir` 指成它自己即可，脚本会跳过多余的复制。
+脚本看到代码目录同级有 `manifest.json`，就知道这是"已解开的包"，直接复制（约 10 MB，秒级）。
+若代码目录**已经在**你要装的位置（例如把资料夹直接解压到了 `D:\`、得到 `D:\echo-core`），
+把 `-DestDir` 指成安装根即可，脚本会跳过多余的复制。
 
 **退化路径**：如果手上只有 `ECHO-main-*.zip`（没解开），先解一层再跑同样的命令：
 
 ```powershell
 Expand-Archive -Path "$kit\ECHO-main-win-x64-*.zip" -DestinationPath $kit -Force
-# 之后同上：-File "$kit\ECHO\scripts\install.ps1" ...
+# 之后同上：-File "$kit\ECHO\scripts\install.ps1" ...（主包 zip 里那层就叫 ECHO\）
 ```
 
 主包**不含运行时**。`install.ps1` 会按三级降级找 CPython：
@@ -208,20 +213,20 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "$skill\scripts\echo-install
 ### macOS ① 建环境 + 启动
 
 ```bash
-kit="$HOME/资料目录"            # 解开资料夹后的目录（里面有 ECHO/ 和 echo-install/）
+kit="$HOME/资料目录"            # 解开资料夹后的目录（里面有 echo-core/（老包 ECHO/）和 echo-install/）
 dest="$HOME/ECHO"
 
 # 环境：Homebrew 装 python@3.11 + portaudio → 建 venv → 装 mac/requirements-mac.txt
 #       （它顺带会在有 swiftc 时编译原生浮动条；没有就跳过，用浏览器面板）
-bash "$kit/ECHO/mac/setup_mac.sh"
+bash "$kit/echo-core/mac/setup_mac.sh"
 ```
 
 ⚠️ `setup_mac.sh` 是在**资料夹原地**建 venv 的（它按脚本位置定位仓库根）。所以 mac 上的顺序是
-**先把 `ECHO/` 放到最终位置，再跑 setup**：
+**先把那个代码目录放到最终位置，再跑 setup**：
 
 ```bash
 mkdir -p "$(dirname "$dest")"
-[ -d "$dest" ] || mv "$kit/ECHO" "$dest"    # 放到最终位置（同盘 mv 是秒级）
+[ -d "$dest" ] || mv "$kit/echo-core" "$dest"   # 放到最终位置（同盘 mv 是秒级；老包是 $kit/ECHO）
 bash "$dest/mac/setup_mac.sh"               # 建 venv + 装依赖（首次几分钟）
 bash "$dest/mac/start_mac.sh"               # 后台启动，并打印面板地址
 ```
@@ -354,7 +359,8 @@ curl -s "http://127.0.0.1:$port/api/models" | ./venv/bin/python -m json.tool | h
 - **不要把两边的命令混用**：macOS 上**没有** `install.ps1`/`-DestDir` 那套（那是 Windows 专属：
   .NET/WebView2 边条、Windows 嵌入包 CPython、注册表快捷方式）；Windows 上也没有 `mac/setup_mac.sh`。
   先认平台，再挑一套。
-- **不要**让用户去 `git clone`（公司网多半连不上 GitHub）—— 代码只用资料夹里的 `ECHO/`。
+- **不要**让用户去 `git clone`（公司网多半连不上 GitHub）—— 代码只用资料夹里的
+  `echo-core/`（更早的包里叫 `ECHO/`）。
 - **不要**替用户装 CUDA/torch：体积大、和驱动绑定，让他们按需自己决定（mac 上更是没有 CUDA）。
 - **不要**把 `agentBackend` 写成组件 id（`agent-harness`）—— 那是**组件名**，设置里要用的名字是
   **`harness`**（并同时打开 `agentHarnessEnabled`）。写错了选择会**静默失效**（2026-09-20 踩过）。

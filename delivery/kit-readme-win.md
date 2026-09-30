@@ -1,6 +1,19 @@
 # ECHO 安装包（给同事）
 
-## 怎么用（三句话）
+## 怎么用（最省事：双击）
+
+1. **双击 `装我.cmd`**（就在这个文件夹里）。
+2. 它只问你一件事：**装到哪个目录** —— 回车用默认（`D:\ECHO`，没有 D 盘就是 `C:\ECHO`）。
+3. 剩下的它自己做：准备好运行环境、依赖、转写模型，写好设置、把服务起起来，
+   最后**把面板地址打印出来**（形如 `http://127.0.0.1:8970/`）。打开它就行。
+
+> 包里带 `bundle\` 时，**装的过程不下载**运行环境 / 依赖 / 模型 —— 全从包里拿。
+> **唯一还会联网的是 DSH 标准版**（智能体，走 npm 安装），这是允许的那一项。
+> 没有 `bundle\` 时那三样走联网安装（python.org / 国内 PyPI 镜像 / ModelScope）。
+
+装的过程中窗口一直开着，**出错也不会一闪而过**（末尾会停住等你按键），把那段输出发回来即可。
+
+## 也能交给 AI 助手（原来的路）
 
 1. 把这个文件夹整个交给你的 AI 助手（Claude Code / Cursor / DSH……都可以），
    告诉它：**「按 echo-install 这个技能给我装 ECHO」**。
@@ -8,31 +21,31 @@
 3. 剩下的它自己下载安装：运行时来自 **python.org**、依赖来自 **PyPI**、模型来自
    **ModelScope / hf-mirror** 镜像 —— **不需要 git，也不需要 GitHub**。
 
-## 想更快？有一条不绕助手的「快路」（一条命令）
+## 快路那条命令（不绕助手）
 
-助手那条路每一步都要联网 + 每步都要确认，慢就慢在这儿。资料夹里已经把那些步骤固化成了
-一个脚本（`ECHO\scripts\install-all.ps1`，**装的东西与助手那条路完全一样**）：
+资料夹里已经把那些步骤固化成了一个脚本（`echo-core\scripts\install-all.ps1`，
+**装的东西与助手那条路完全一样**）：
 
 ```powershell
 # 在这个文件夹里打开 PowerShell，跑这一条（-Yes = 不提问，全默认）
-powershell -NoProfile -ExecutionPolicy Bypass -File ".\ECHO\scripts\install-all.ps1" -Yes
+powershell -NoProfile -ExecutionPolicy Bypass -File ".\echo-core\scripts\install-all.ps1" -Yes
 ```
 
 它会**一次走完**：解包就位 → 建运行时 → 装核心依赖 → 装组件（sherpa 模型/设置/自检）→
 **打印面板地址**。加 `-Profile main -Wake` 会多装唤醒词；`-Agent harness` 仍会配智能体。
-
-> 如果你拿到的是 **`ECHO-kit-min-*.zip`（离线最小包）**，那就更省事：**双击 `装我.cmd`**，
-> 全程不联网（依赖与模型都在包里）。**离线包不需要联网、也不需要助手。**
+包里有 `bundle\` 时再加 `-Offline`，就是 `装我.cmd` 双击出来的那一套（不下载运行时/依赖/模型）。
 
 ## 包里有什么
 
 | 文件 | 说明 |
 |---|---|
-| `ECHO\` | ECHO 主程序（**已经解开好了**，约 10 MB，必备）。交给助手去装，你不用管 |
+| `装我.cmd` | **双击这个**：只问安装位置，然后装完并打印面板地址 |
+| `echo-core\` | ECHO 主程序（**已经解开好了**，约 10 MB，必备）。交给助手去装，你不用管 |
 | `echo-install/` | 安装技能：`SKILL.md`（给助手看的步骤）+ `scripts/` 里的脚本 |
+| `bundle\` | 可选：离线载荷（依赖 wheel + 模型 + 兜底运行环境）。有它就**装的时候不下载** |
 | `BUILD-INFO.txt` / `SHA256SUMS.txt` | 这个包的身份与各文件校验值（可选，想核对时用） |
 
-> `install.ps1` 在 **`ECHO\scripts\` 里** —— 主程序已经解开放在那儿了，助手直接用它安装，
+> `install.ps1` 在 **`echo-core\scripts\` 里** —— 主程序已经解开放在那儿了，助手直接用它安装，
 > **你不需要再解压任何东西**。如果你的助手说"找不到 install.ps1"，把这句话发给它就行。
 
 装完助手会**登记安装结果**，所以打开 ECHO 会**直接进仪表盘**（不会再把你塞进向导页）。
@@ -52,11 +65,13 @@ powershell -NoProfile -ExecutionPolicy Bypass -File ".\ECHO\scripts\install-all.
 ## 遇到问题
 
 - 助手说 **「找不到 install.ps1」**：**包没缺东西** —— 它在主程序 zip 里面，先解开主包就有
-  （`ECHO\scripts\install.ps1`）。把上面那段话发给助手即可。
+  （`echo-core\scripts\install.ps1`）。把上面那段话发给助手即可。
+- 双击 `装我.cmd` 报 **「install-all.ps1 was not found」**：整个 kit 要**连着文件夹一起**解开
+  （`echo-core\` 与 `装我.cmd` 必须同级），别只把 `.cmd` 拖出来。
 - 装的时候弹出 `You must install or update .NET` 或 `WebView2 初始化失败`：那是**右缘浮动条**要的，
   与 ECHO 本体无关 —— 助手知道怎么绕过（改用浏览器面板）。
 - 助手报 **`DLL load failed` / 「找不到指定的模块」**（装 torch、sherpa-onnx 这类组件时）：
   你的 Windows 缺 **Microsoft Visual C++ 2015-2022 运行库**。助手会自动下载安装它
   （会弹一次 UAC 授权框，点「是」）；装不了就自己装这个再让助手重跑：
   `https://aka.ms/vs/17/release/vc_redist.x64.exe`（装完可能要重启一次）。
-- 其它任何卡住/报错：**把助手那段输出原样发回来**就行。
+- 其它任何卡住/报错：**把那段输出原样发回来**就行。

@@ -16,10 +16,20 @@
 用 Python 写这份脚本本身就是对第一个坑的规避（.py 无 BOM/编码之忧），第二个坑
 由 `make_zip()` 统一加前缀来消除。
 
-两个平台都走 `-Profile main`（2026-09-22 统一，见 `--check` 的说明）：裹 `ECHO/`、
+两个平台都走 `-Profile main`（2026-09-22 统一，见 `--check` 的说明）：裹 `echo-core/`、
 带 `components/`，`manifest.json` 的 `componentManifests` 才与包内实际文件对得上。
 （`public` 档曾经声明 `components/offline-pack.json` 却没装进去 —— 一句写在交付清单
 里的假话，而 manifest 正是安装流程用来判断「这是已解开的包」的文件。）
+
+kit 长这样（同事视角）::
+
+    ECHO-kit-<stamp>/
+      ├─ 装我.cmd          **双击这个**：只问"装到哪个目录"，然后交给下面那个脚本
+      ├─ echo-core/        主程序（主包 zip 里叫 ECHO/，组 kit 时改成 echo-core/）
+      ├─ echo-install/     安装技能（交给 AI 助手那条路继续可用）
+      ├─ bundle/           可选：离线载荷（wheels + models + runtime 兜底）
+      ├─ 先读我.md / BUILD-INFO.txt / SHA256SUMS.txt
+      └─ ECHO-kit-<stamp>.zip 同名 zip（条目带顶层前缀，解开是一个文件夹）
 
 模式
 ----
@@ -70,6 +80,21 @@ BUILD_PACKAGE = ROOT / "scripts" / "build-package.ps1"
 #: kit 里给人的那份说明叫这个名字（中文名是刻意的：同事一眼知道先读它）
 KIT_README = "先读我.md"
 
+#: kit 里那份**主程序目录**叫什么。3.0 起叫 `echo-core` —— 与安装根里的代码目录
+#: （`<安装根>\echo-core`，见 `app/paths.py:echo_base()` 与 install.ps1 的 `Resolve-CoreDir`）
+#: **同名**：同事一眼知道它去哪，装机时也不用再改名。
+#:
+#: 主包 zip 自己的顶层目录仍然是 `ECHO`（那是 `build-package.ps1` 定的、`install.ps1`
+#: 按它认包），所以这里是**组 kit 时**把 `ECHO\` 改名成 `echo-core\`。老的 kit
+#: （改名之前出的）继续认 —— 见 `code_dir()`。
+CODE_DIR_NAME = "echo-core"
+LEGACY_CODE_DIR_NAME = "ECHO"
+
+#: kit 根的**双击入口**（Windows）。ASCII-only、`.cmd`：同事双击它、只回答一个问题。
+#: mac 不需要它（那边是 `.sh`，且说明里直接给了命令）。
+KIT_CMD = "装我.cmd"
+KIT_CMD_TEMPLATE = "kit-install.cmd"
+
 #: 交付矩阵。**两个平台都是 main profile** —— 平台差异只体现在 `-Platform`（改包名、
 #: manifest 的 platform，并顺带排除 mac 的 `sidebar/bin/`）与用哪份 `先读我.md`。
 PLATFORMS = (
@@ -79,6 +104,7 @@ PLATFORMS = (
         "kit_prefix": "ECHO-kit",
         "package_platform": None,               # 不传 -Platform，由构建机推断
         "readme": "kit-readme-win.md",
+        "cmd_template": KIT_CMD_TEMPLATE,       # 双击入口（只在 Windows kit 里）
     },
     {
         "key": "macos",
@@ -86,6 +112,7 @@ PLATFORMS = (
         "kit_prefix": "ECHO-kit-macos",
         "package_platform": "macos-universal",
         "readme": "kit-readme-mac.md",
+        "cmd_template": "",
     },
 )
 
@@ -197,6 +224,21 @@ def newest_main_package(dist: Path, plat: dict) -> Path | None:
 
 # ------------------------------------------------------------------- 读包内的元数据
 
+def code_dir(kit: Path) -> Path:
+    """kit 里那份**主程序目录**：新的叫 `echo-core`，老的叫 `ECHO`。
+
+    两个名字都得认（`--check` 会去比**历史**的 kit）：判断"是哪一个"看**内容**
+    （有 `app/main.py` 或 `manifest.json`），不看名字 —— 只按名字猜在
+    "目录还没解出来"时会给出一个不存在的路径，报错就变成"包里没有 manifest.json"，
+    而真实原因是"这个 kit 根本没有代码目录"。
+    """
+    for name in (CODE_DIR_NAME, LEGACY_CODE_DIR_NAME):
+        d = kit / name
+        if (d / "manifest.json").is_file() or (d / "app" / "main.py").is_file():
+            return d
+    return kit / CODE_DIR_NAME
+
+
 def read_sums(kit: Path) -> dict[str, str]:
     """读 kit 根的 SHA256SUMS.txt → {仓库相对路径: sha256}。
 
@@ -281,16 +323,16 @@ def compare_manifest(kit: Path) -> list[str]:
     `public` 档曾经声明 `components/offline-pack.json` 而包里没有它 —— 交付清单里的
     假话，而 manifest 正是安装流程用来判断「这是已解开的包」的文件。
     """
-    path = kit / "ECHO" / "manifest.json"
+    path = code_dir(kit) / "manifest.json"
     if not path.is_file():
-        return ["包里没有 ECHO/manifest.json"]
+        return ["包里没有 <代码目录>/manifest.json"]
     try:
         manifest = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         return [f"manifest.json 读不出来: {exc}"]
     problems = []
     for rel in manifest.get("componentManifests") or []:
-        if not (kit / "ECHO" / rel).is_file():
+        if not (code_dir(kit) / rel).is_file():
             problems.append(f"manifest.json 声明了 components 清单但包内没有: {rel}")
     return problems
 
@@ -360,19 +402,22 @@ def _preview(items: list[str], limit: int = 6) -> str:
 def verify_kit(kit: Path, plat: dict) -> list[str]:
     """出完包后的自检：结构 + 内容。返回问题列表（空 = 通过）。"""
     problems = []
-    if not (kit / "ECHO").is_dir():
-        problems.append("kit 里没有 ECHO/")
+    code = code_dir(kit)
+    if not code.is_dir():
+        problems.append(f"kit 里没有 {CODE_DIR_NAME}/（主程序目录）")
     if not (kit / KIT_README).is_file():
         problems.append(f"kit 里没有 {KIT_README}")
+    if plat.get("cmd_template") and not (kit / KIT_CMD).is_file():
+        problems.append(f"kit 里没有 {KIT_CMD}（同事双击的那个入口）")
     if not (kit / "BUILD-INFO.txt").is_file():
         problems.append("kit 根目录没有 BUILD-INFO.txt")
     if not (kit / "SHA256SUMS.txt").is_file():
         problems.append("kit 根目录没有 SHA256SUMS.txt")
     problems += compare_skill(kit)
     problems += compare_manifest(kit)
-    verify_dirs = [p for p in (kit / "ECHO").iterdir() if p.is_dir()] if (kit / "ECHO").is_dir() else []
+    verify_dirs = [p for p in code.iterdir() if p.is_dir()] if code.is_dir() else []
     if not verify_dirs:
-        problems.append("ECHO/ 是空的")
+        problems.append(f"{code.name}/ 是空的")
     return problems
 
 
@@ -426,14 +471,44 @@ def _dos_time(path: Path) -> tuple[int, int, int, int, int, int]:
     return (year, t.tm_mon, t.tm_mday, t.tm_hour, t.tm_min, t.tm_sec)
 
 
+def extract_main_package(main_zip: Path, kit_dir: Path) -> Path:
+    """解主包进 kit，并把代码目录改名成 `echo-core`（老的 `ECHO` 也认）→ 返回代码目录。
+
+    主包 zip 的顶层是 `ECHO/`（`build-package.ps1` 定的，`install.ps1` 按它认包）——
+    这一层改名是**组 kit 时**做的：kit 是给人看的资料夹，里面那份代码目录与安装根
+    里的 `echo-core` 同名，"它去哪"就一眼可见，也不需要谁去手工改名。
+    """
+    with zipfile.ZipFile(main_zip) as zf:
+        zf.extractall(kit_dir)
+    src, dst = kit_dir / LEGACY_CODE_DIR_NAME, kit_dir / CODE_DIR_NAME
+    if src.is_dir() and not dst.exists():
+        src.rename(dst)
+    code = code_dir(kit_dir)
+    if not (code / "app" / "main.py").is_file():
+        raise BuildError(f"主包里没有 <代码目录>/app/main.py：{main_zip.name}")
+    return code
+
+
+def copy_kit_cmd(src: Path, dst: Path) -> None:
+    """把双击入口拷进 kit 根，并**统一成 CRLF**（顺手把"必须 ASCII"变成硬检查）。
+
+    为什么不能 `shutil.copyfile`：仓库开着 `core.autocrlf`，而模板在 git 里是 LF ——
+    cmd.exe 解析 LF-only 的 `.cmd` 时，多行 `if ( … )` 块与 `goto :label` 会出问题
+    （不是"能不能跑"的风格问题，是**会静默走错分支**）。ASCII 那一半同理：同事的机器
+    码页不一定是 UTF-8，中文提示在 cmd 里会变成乱码。两条都在这里炸，不留到同事手上。
+    """
+    text = src.read_text(encoding="ascii")          # 非 ASCII → UnicodeDecodeError，响亮
+    body = text.replace("\r\n", "\n").replace("\n", "\r\n")
+    dst.write_bytes(body.encode("ascii"))
+
+
 def assemble_kit(plat: dict, main_zip: Path, stamp: str, dist: Path) -> tuple[Path, Path]:
     kit_dir = dist / f"{plat['kit_prefix']}-{stamp}"
     if kit_dir.exists():
         shutil.rmtree(kit_dir)
     kit_dir.mkdir(parents=True)
 
-    with zipfile.ZipFile(main_zip) as zf:
-        zf.extractall(kit_dir)
+    code = extract_main_package(main_zip, kit_dir)
 
     skill_dst = kit_dir / "echo-install"
     if skill_dst.exists():
@@ -446,14 +521,27 @@ def assemble_kit(plat: dict, main_zip: Path, stamp: str, dist: Path) -> tuple[Pa
         raise BuildError(f"缺少 {KIT_README} 模板：{readme}")
     shutil.copyfile(readme, kit_dir / KIT_README)
 
+    # 双击入口（Windows）：kit 根、与 先读我.md 同级。同事拿到包第一步就是这个。
+    cmd_name = ""
+    if plat.get("cmd_template"):
+        tpl = DELIVERY / plat["cmd_template"]
+        if not tpl.is_file():
+            raise BuildError(f"缺少双击入口模板：{tpl}")
+        copy_kit_cmd(tpl, kit_dir / KIT_CMD)
+        cmd_name = KIT_CMD
+
     short = git_short()
     block = [
         "",
         "kit contents (this archive)",
-        f"  ECHO/           unpacked main package (profile=main) @ {short}",
+        f"  {CODE_DIR_NAME}/           unpacked main package (profile=main) @ {short}",
         "  echo-install/   echo-install skill (SKILL.md + scripts/*.ps1|.sh)",
         f"  {KIT_README}       三句话说明（给同事看的）",
     ]
+    if cmd_name:
+        block.insert(3, f"  {cmd_name}       双击这个（只问安装位置；有 bundle\\ 就自动离线装）")
+    if (kit_dir / "bundle").is_dir():
+        block.append("  bundle/         offline payload (wheels + models + runtime fallback)")
     build_info = kit_dir / "BUILD-INFO.txt"
     if not build_info.is_file():
         raise BuildError(f"主包里没有 BUILD-INFO.txt：{main_zip.name}")

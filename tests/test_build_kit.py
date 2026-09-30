@@ -21,6 +21,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 
 ROOT = Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -357,16 +358,216 @@ class KitZipCarriesATopLevelPrefix(unittest.TestCase):
         import zipfile
         with tempfile.TemporaryDirectory(prefix="echozip-") as tmp:
             src = Path(tmp) / "ECHO-kit-20260922-2100"
-            (src / "ECHO").mkdir(parents=True)
-            (src / "ECHO" / "hello.txt").write_text("hi", encoding="utf-8")
+            (src / "echo-core").mkdir(parents=True)
+            (src / "echo-core" / "hello.txt").write_text("hi", encoding="utf-8")
             (src / "先读我.md").write_text("read me", encoding="utf-8")
             out = Path(tmp) / "kit.zip"
             build_kit.make_zip(src, out, src.name)
             with zipfile.ZipFile(out) as zf:
                 names = zf.namelist()
             self.assertTrue(all(n.startswith(src.name + "/") for n in names), names)
-            self.assertIn(f"{src.name}/ECHO/hello.txt", names)
+            self.assertIn(f"{src.name}/echo-core/hello.txt", names)
             self.assertIn(f"{src.name}/先读我.md", names)
+
+
+class TheKitShowsTheCodeDirAsEchoCore(unittest.TestCase):
+    """kit 里那份代码目录叫 `echo-core`（与 `<安装根>\\echo-core` 同名），老名字仍认。
+
+    用户 2026-09-30 的要求：**"把 kit 里的代码目录改成 echo-core（不用再改名）"** ——
+    同事解开的资料夹里那个目录名，与装机后代码真正落到的目录名一致，就不需要谁再改名，
+    也不会出现"包里的 ECHO\\ 到底要不要改成 echo-core"这种每次都要重新讨论的问题。
+    主包 zip 自己的顶层仍然是 `ECHO/`（那是 build-package.ps1 定的、install.ps1 按它认包），
+    改名发生在**组 kit** 这一步。
+    """
+
+    def test_the_constant_is_echo_core(self):
+        self.assertEqual(build_kit.CODE_DIR_NAME, "echo-core")
+        self.assertEqual(build_kit.LEGACY_CODE_DIR_NAME, "ECHO")
+
+    def _main_zip(self, tmp: Path) -> Path:
+        """造一个最小主包 zip：顶层 `ECHO/`（与 build-package.ps1 的 main 档一致）。
+
+        两个包元数据（BUILD-INFO / SHA256SUMS）在 **zip 根**，不在 `ECHO/` 里 ——
+        这是 build-package.ps1 的实际布局，组 kit 时它们要留在 kit 根。
+        """
+        src = tmp / "src" / "ECHO"
+        (src / "app").mkdir(parents=True)
+        (src / "app" / "main.py").write_text("# app\n", encoding="utf-8")
+        (src / "manifest.json").write_text('{"platform": "win-x64"}', encoding="utf-8")
+        (tmp / "src" / "BUILD-INFO.txt").write_text("git: deadbee\n", encoding="utf-8")
+        (tmp / "src" / "SHA256SUMS.txt").write_text("", encoding="utf-8")
+        out = tmp / "ECHO-main-win-x64-3.0-test.zip"
+        with zipfile.ZipFile(out, "w") as zf:
+            for base, _dirs, files in os.walk(tmp / "src"):
+                for fn in files:
+                    full = Path(base) / fn
+                    zf.write(full, full.relative_to(tmp / "src").as_posix())
+        return out
+
+    def test_extraction_renames_the_wrapper_to_echo_core(self):
+        with tempfile.TemporaryDirectory(prefix="echocore-") as tmp:
+            root = Path(tmp)
+            kit = root / "kit"
+            kit.mkdir()
+            code = build_kit.extract_main_package(self._main_zip(root), kit)
+            self.assertEqual(code.name, "echo-core")
+            self.assertTrue((kit / "echo-core" / "app" / "main.py").is_file())
+            self.assertFalse((kit / "ECHO").exists(), "老名字不该留一份")
+
+    def test_extraction_refuses_a_zip_without_the_app_package(self):
+        with tempfile.TemporaryDirectory(prefix="echocore-") as tmp:
+            root = Path(tmp)
+            bad = root / "bad.zip"
+            with zipfile.ZipFile(bad, "w") as zf:
+                zf.writestr("ECHO/manifest.json", "{}")
+            kit = root / "kit"
+            kit.mkdir()
+            with self.assertRaises(build_kit.BuildError):
+                build_kit.extract_main_package(bad, kit)
+
+    def test_an_old_kit_is_still_recognized(self):
+        """`--check` 要能读**改名之前**出的 kit（dist 里就有）。"""
+        with tempfile.TemporaryDirectory(prefix="echocore-") as tmp:
+            kit = Path(tmp)
+            (kit / "ECHO").mkdir()
+            (kit / "ECHO" / "manifest.json").write_text("{}", encoding="utf-8")
+            self.assertEqual(build_kit.code_dir(kit).name, "ECHO")
+            (kit / "echo-core").mkdir()
+            (kit / "echo-core" / "manifest.json").write_text("{}", encoding="utf-8")
+            self.assertEqual(build_kit.code_dir(kit).name, "echo-core")
+
+    def test_the_installers_accept_both_names(self):
+        """认包判据要**两个名字都认**（兼容旧的 ECHO）—— 这是三处脚本里的同一个判据。"""
+        install = (SCRIPTS / "install.ps1").read_text(encoding="utf-8")
+        self.assertIn("$script:CodeDirNames = @('echo-core', 'ECHO')", install)
+        self.assertIn("foreach ($name in $script:CodeDirNames)", install,
+                      "install.ps1 的认包清单没被用上（两处真相）")
+        install_all = (SCRIPTS / "install-all.ps1").read_text(encoding="utf-8")
+        self.assertIn("foreach ($name in @('echo-core', 'ECHO'))", install_all)
+        deploy = (SCRIPTS / "deploy-stable.ps1").read_text(encoding="utf-8")
+        self.assertIn("(echo-core|ECHO)/manifest", deploy)
+        self.assertIn("foreach ($name in @('echo-core', 'ECHO'))", deploy)
+
+
+class TheDoubleClickLauncherIsShipped(unittest.TestCase):
+    """kit 根那个双击入口：**只问安装位置**，有 `bundle\\` 就自动离线。
+
+    为什么它是一条契约（而不是"顺手加个 .cmd"）：同事拿到的就是这个包，
+    双击之后被问几次、要不要自己选档位、装完看不看得见面板地址，全由它决定。
+    用户 2026-09-30 的目标是"双击 → 只问安装位置 → 默认 DSH 标准版 → 装的时候不下载
+    运行时/依赖/模型 → 结束打印面板地址"，这五条都在这里钉住。
+    """
+
+    TEMPLATE = DELIVERY / "kit-install.cmd"
+
+    def setUp(self):
+        self.text = self.TEMPLATE.read_text(encoding="ascii")
+
+    def test_the_template_exists_and_is_ascii(self):
+        """cmd.exe 按控制台码页读 .cmd —— 纯 ASCII 才在每个码页下都对。"""
+        self.assertGreater(len(self.text), 400)
+        self.assertIn("install-all.ps1", self.text)
+        self.assertNotIn("powershell -Command", self.text, "要用 -File，别再拼命令行")
+
+    def test_only_windows_ships_it(self):
+        by_key = {p["key"]: p for p in build_kit.PLATFORMS}
+        self.assertEqual(by_key["win"]["cmd_template"], "kit-install.cmd")
+        self.assertEqual(by_key["macos"]["cmd_template"], "")
+        self.assertEqual(build_kit.KIT_CMD, "装我.cmd")
+
+    def test_it_asks_for_the_install_folder_only(self):
+        self.assertIn("set /p", self.text, "没有问安装位置")
+        self.assertEqual(self.text.count("set /p"), 1, "只许问一个问题：装到哪")
+        self.assertIn('set "DEF=D:\\ECHO"', self.text)
+
+    def test_it_defaults_to_the_minimal_profile_with_the_standard_agent(self):
+        self.assertIn("-Profile minimal -Agent harness", self.text)
+
+    def test_it_goes_offline_only_when_the_bundle_is_there(self):
+        self.assertIn('if exist "%KIT%bundle\\wheels"', self.text)
+        self.assertIn('set "ARGS=%ARGS% -Offline"', self.text)
+
+    def test_it_finds_the_code_dir_under_either_name(self):
+        self.assertIn('set "ENTRY=%KIT%echo-core\\scripts\\install-all.ps1"', self.text)
+        self.assertIn('set "ENTRY=%KIT%ECHO\\scripts\\install-all.ps1"', self.text)
+
+    def test_a_failure_is_not_flashed_away(self):
+        self.assertIn("pause", self.text)
+        self.assertIn("data\\logs\\install-all.log", self.text)
+
+    def test_copy_kit_cmd_normalizes_to_crlf(self):
+        """模板在 git 里是 LF，而 cmd.exe 对 LF-only 的 `.cmd` 会走错分支 —— 拷贝时统一 CRLF。"""
+        with tempfile.TemporaryDirectory(prefix="echocmd-") as tmp:
+            src = Path(tmp) / "tpl.cmd"
+            src.write_bytes(b"@echo off\nif exist x (\n  echo y\n)\n")
+            dst = Path(tmp) / "out.cmd"
+            build_kit.copy_kit_cmd(src, dst)
+            raw = dst.read_bytes()
+            self.assertNotIn(b"\n\n", raw)
+            self.assertEqual(raw.count(b"\r\n"), 4)
+            self.assertNotIn(b"\n", raw.replace(b"\r\n", b""))
+
+    def test_copy_kit_cmd_refuses_non_ascii(self):
+        with tempfile.TemporaryDirectory(prefix="echocmd-") as tmp:
+            src = Path(tmp) / "tpl.cmd"
+            src.write_text("@echo off\nREM 中文\n", encoding="utf-8")
+            with self.assertRaises(UnicodeDecodeError):
+                build_kit.copy_kit_cmd(src, Path(tmp) / "out.cmd")
+
+    def test_verify_kit_requires_the_launcher_for_windows(self):
+        with tempfile.TemporaryDirectory(prefix="echoverify-") as tmp:
+            kit = Path(tmp)
+            (kit / "echo-core" / "app").mkdir(parents=True)
+            (kit / "echo-core" / "app" / "main.py").write_text("#\n", encoding="utf-8")
+            (kit / "echo-core" / "manifest.json").write_text("{}", encoding="utf-8")
+            (kit / build_kit.KIT_README).write_text("read me", encoding="utf-8")
+            (kit / "BUILD-INFO.txt").write_text("git: x\n", encoding="utf-8")
+            (kit / "SHA256SUMS.txt").write_text("", encoding="utf-8")
+            shutil.copytree(SKILL, kit / "echo-install")
+            win = next(p for p in build_kit.PLATFORMS if p["key"] == "win")
+            mac = next(p for p in build_kit.PLATFORMS if p["key"] == "macos")
+            self.assertTrue(any(build_kit.KIT_CMD in p
+                                for p in build_kit.verify_kit(kit, win)))
+            self.assertEqual(build_kit.verify_kit(kit, mac), [])
+            build_kit.copy_kit_cmd(self.TEMPLATE, kit / build_kit.KIT_CMD)
+            self.assertEqual(build_kit.verify_kit(kit, win), [])
+
+    def test_the_readme_points_at_the_launcher_and_the_new_code_dir(self):
+        for name in ("kit-readme-win.md",):
+            text = (DELIVERY / name).read_text(encoding="utf-8")
+            self.assertIn(build_kit.KIT_CMD, text, f"{name} 没让同事双击那个入口")
+            self.assertIn("echo-core", text, f"{name} 还在指老目录名")
+            self.assertNotIn("ECHO\\scripts", text, f"{name} 还留着老路径")
+        mac = (DELIVERY / "kit-readme-mac.md").read_text(encoding="utf-8")
+        self.assertIn("echo-core/", mac)
+        self.assertNotIn("`ECHO/`", mac)
+
+
+class AssembleKitCopiesTheLauncher(unittest.TestCase):
+    """组包时真的把模板放进 kit 根（不是只有模板文件躺在 delivery/ 里）。"""
+
+    def test_assemble_kit_copies_the_cmd(self):
+        with tempfile.TemporaryDirectory(prefix="echoassemble-") as tmp:
+            root = Path(tmp)
+            main = root / "ECHO-main-win-x64-3.0-test.zip"
+            with zipfile.ZipFile(main, "w") as zf:
+                zf.writestr("ECHO/app/main.py", "# app\n")
+                zf.writestr("ECHO/manifest.json", "{}")
+                zf.writestr("BUILD-INFO.txt", "git: abc1234\n")
+                zf.writestr("SHA256SUMS.txt", "")
+            dist = root / "dist"
+            dist.mkdir()
+            win = next(p for p in build_kit.PLATFORMS if p["key"] == "win")
+            kit_dir, zip_path = build_kit.assemble_kit(win, main, "20260930-9999", dist)
+            self.assertTrue((kit_dir / build_kit.KIT_CMD).is_file())
+            self.assertTrue((kit_dir / "echo-core" / "app" / "main.py").is_file())
+            raw = (kit_dir / build_kit.KIT_CMD).read_bytes()
+            self.assertIn(b"\r\n", raw)
+            self.assertNotIn(b"\n\n", raw)
+            with zipfile.ZipFile(zip_path) as zf:
+                names = zf.namelist()
+            self.assertIn(f"{kit_dir.name}/{build_kit.KIT_CMD}", names)
+            self.assertIn(f"{kit_dir.name}/echo-core/app/main.py", names)
 
 
 if __name__ == "__main__":

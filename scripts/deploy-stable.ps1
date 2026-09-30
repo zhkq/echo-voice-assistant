@@ -20,8 +20,9 @@
 #   3b. picks the kit for THIS machine's platform via
 #       `build_kit.py --deploy-kit win|macos` and refuses a kit whose own
 #       manifest.json says another platform  (see the 2026-09-23 note below)
-#   4. overlays <kit>\ECHO\*        onto <DestDir>            (data\ models\ runtime-core\ untouched)
-#      copies  <kit>\echo-install\* onto <DestDir>\.dsh\skills\echo-install\
+#   4. overlays <kit>\echo-core\*   onto the target's CODE dir (data\ models\ runtime-core\ untouched)
+#      (an older kit keeps the code in <kit>\ECHO\ - both names are accepted)
+#      copies  <kit>\echo-install\* onto <code dir>\.dsh\skills\echo-install\
 #   5. verifies the target                    (compileall app + import smoke)
 #   6. restarts ECHO ONLY with -Restart       (default: takes effect at the next start)
 #
@@ -70,12 +71,13 @@ function Get-HostPlatformKey {
 }
 
 function Get-KitPlatform([string]$ZipPath) {
-    # Read ECHO/manifest.json out of the zip WITHOUT expanding it.
+    # Read <code dir>/manifest.json out of the zip WITHOUT expanding it.
+    # The code dir is "echo-core" in a 3.0 kit and "ECHO" in an older one - both are read.
     try {
         Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
         $z = [System.IO.Compression.ZipFile]::OpenRead($ZipPath)
         try {
-            $e = $z.Entries | Where-Object { $_.FullName -match '(^|/)ECHO/manifest\.json$' } |
+            $e = $z.Entries | Where-Object { $_.FullName -match '(^|/)(echo-core|ECHO)/manifest\.json$' } |
                  Select-Object -First 1
             if (-not $e) { return '' }
             $sr = New-Object System.IO.StreamReader($e.Open())
@@ -206,7 +208,15 @@ if ($DryRun) {
     Expand-Archive -LiteralPath $zip.FullName -DestinationPath $tmp -Force
 }
 $kitDir = if ($DryRun) { $null } else { (Get-ChildItem -Path $tmp -Directory | Select-Object -First 1) }
-$srcEcho = if ($kitDir) { Join-Path $kitDir.FullName 'ECHO' } else { $null }
+# The kit's code dir is "echo-core" (3.0 and later) or "ECHO" (older kits) - take whichever is there.
+$srcEcho = $null
+if ($kitDir) {
+    foreach ($name in @('echo-core', 'ECHO')) {
+        $cand = Join-Path $kitDir.FullName $name
+        if (Test-Path -LiteralPath (Join-Path $cand 'app\main.py')) { $srcEcho = $cand; break }
+    }
+    if (-not $srcEcho) { $srcEcho = Join-Path $kitDir.FullName 'echo-core' }
+}
 $srcSkill = if ($kitDir) { Join-Path $kitDir.FullName 'echo-install' } else { $null }
 
 $added = 0; $updated = 0; $same = 0
@@ -244,9 +254,9 @@ function Copy-Tree([string]$From, [string]$To, [string]$Label) {
 }
 
 if ($DryRun) {
-    Say "  [dry] would overlay the kit's ECHO\ over $destCode (data\ models\ runtime-core\ are not in the kit, so they stay)"
+    Say "  [dry] would overlay the kit's $(Split-Path $srcEcho -Leaf)\ over $destCode (data\ models\ runtime-core\ are not in the kit, so they stay)"
 } else {
-    Copy-Tree $srcEcho $destCode 'ECHO\'
+    Copy-Tree $srcEcho $destCode (Split-Path $srcEcho -Leaf)
     Copy-Tree $srcSkill $destSkill 'echo-install\'
     Ok "overlay done: $added added, $updated updated, $same unchanged"
     Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue

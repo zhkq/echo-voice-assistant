@@ -17,14 +17,18 @@
 # 用法
 # ----
 #   # 在线快路（默认 minimal：只要 sherpa，装完立刻能语音指令/转写）
-#   powershell -NoProfile -ExecutionPolicy Bypass -File <kit>\ECHO\scripts\install-all.ps1 -Yes
+#   powershell -NoProfile -ExecutionPolicy Bypass -File <kit>\echo-core\scripts\install-all.ps1 -Yes
 #
 #   # 离线包（bundle\wheels + bundle\models 随包，全程不联网）
-#   powershell -NoProfile -ExecutionPolicy Bypass -File <kit>\ECHO\scripts\install-all.ps1 `
+#   powershell -NoProfile -ExecutionPolicy Bypass -File <kit>\echo-core\scripts\install-all.ps1 `
 #       -Offline -Yes -Agent none
 #
 #   # 办公本档（sherpa + 唤醒词），智能体走标准版 harness
 #   ... -Profile main -Agent harness -Root D:\ECHO
+#
+# 同事那一份 kit 根上还有个 **双击入口**（`装我.cmd`，由 build_kit.py 从
+# delivery\kit-install.cmd 放进去）：它只问一句"装到哪个目录"，然后调本脚本
+# （`-Profile minimal -Agent harness -Yes`，发现同目录有 bundle\ 就自动加 -Offline）。
 #
 # 参数
 # ----
@@ -37,8 +41,8 @@
 #   -Offline                 离线模式：依赖只从 bundle\wheels 装（pip 带
 #                            --no-index --find-links），模型直接用 bundle\models 里的
 #   -Yes                     无人值守：不提问、全默认
-#   -KitRoot <目录>          资料夹根（里面有 ECHO\、echo-install\、bundle\）；
-#                            默认按本脚本位置推（<kit>\ECHO\scripts\install-all.ps1）
+#   -KitRoot <目录>          资料夹根（里面有 echo-core\（老 kit 是 ECHO\）、echo-install\、
+#                            bundle\）；默认按本脚本位置推（<kit>\echo-core\scripts\install-all.ps1）
 #   -BundleDir <目录>        离线载荷目录（默认 <KitRoot>\bundle）
 #   -Engines <列表>          覆盖档位的引擎，例如 -Engines sherpa,whisper-base
 #   -Wake / -NoWake          唤醒词 KWS（main 档默认开；离线包里没有 KWS 模型时自动跳过）
@@ -137,28 +141,35 @@ function Resolve-KitLayout {
 
     if ($KitRoot) {
         $script:KitRoot = (Resolve-Path -LiteralPath $KitRoot).Path
-        $script:Tree = Join-Path $script:KitRoot 'ECHO'
-        if (-not (Test-Path (Join-Path $script:Tree 'app\main.py'))) {
+        # 代码目录名两个都认：3.0 起 kit 里叫 echo-core（与 <安装根>\echo-core 同名），
+        # 老 kit 叫 ECHO（主包 zip 自己裹的那一层）。判据只有这一处。
+        foreach ($name in @('echo-core', 'ECHO')) {
+            $cand = Join-Path $script:KitRoot $name
+            if (Test-Path (Join-Path $cand 'app\main.py')) { $script:Tree = $cand; break }
+        }
+        if (-not $script:Tree) {
             # 兼容 -KitRoot 直接指到主程序目录（有人把 -KitRoot 当成 -Tree 用）
             if (Test-Path (Join-Path $script:KitRoot 'app\main.py')) {
                 $script:Tree = $script:KitRoot
                 $script:KitRoot = Split-Path $script:Tree -Parent
             } else {
-                Err ("-KitRoot 里既没有 ECHO\ 也没有 app\main.py：{0}" -f $KitRoot); exit 1
+                Err ("-KitRoot 里既没有 echo-core\ / ECHO\ 也没有 app\main.py：{0}" -f $KitRoot); exit 1
             }
         }
     } else {
-        # 本脚本在 <kit>\ECHO\scripts\ 里（主包白名单带 scripts/），父目录就是主程序目录
-        $cand = Split-Path $here -Parent                     # <kit>\ECHO 或仓库根
+        # 本脚本在 <kit>\echo-core\scripts\（3.0）或 <kit>\ECHO\scripts\（老包）里
+        # （主包白名单带 scripts/），父目录就是主程序目录
+        $cand = Split-Path $here -Parent                     # <kit>\echo-core 或仓库根
         if (Test-Path (Join-Path $cand 'app\main.py')) {
             $script:Tree = $cand
             $up = Split-Path $cand -Parent
-            if ((Split-Path $cand -Leaf) -ieq 'ECHO') { $script:KitRoot = $up }
+            $leaf = Split-Path $cand -Leaf
+            if ($leaf -ieq 'echo-core' -or $leaf -ieq 'ECHO') { $script:KitRoot = $up }
         }
     }
     if (-not $script:Tree) {
         $cand = Split-Path $here -Parent
-        Err ("没找到 ECHO 主程序（找过 {0}\app\main.py）。用 -KitRoot <资料夹> 指定。" -f $cand)
+        Err ("没找到 ECHO 主程序（找过 {0}\echo-core\app\main.py 与 {0}\ECHO\app\main.py）。用 -KitRoot <资料夹> 指定。" -f $cand)
         exit 1
     }
     Ok ("主程序: {0}" -f $script:Tree)
