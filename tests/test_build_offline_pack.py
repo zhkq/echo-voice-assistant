@@ -13,10 +13,14 @@
 import importlib.util
 import json
 import os
+import shutil
 import sys
 import tempfile
+import time
 import unittest
+import unittest.mock as mock
 import zipfile
+from pathlib import Path
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
@@ -106,6 +110,201 @@ class ZipTests(unittest.TestCase):
         """找不到就返回空串（出包时会报"找不到 CPython"），不许抛。"""
         got = packer.find_uv_python()
         self.assertIsInstance(got, str)
+
+
+# --------------------------------------------------------------- bundle 方言（B）
+# 契约在 `scripts/install-all.ps1` 的三个消费点上（`<KitRoot>\bundle` 自动探测、
+# `bundle\wheels` 的 -Offline 硬检查、`bundle\models\*` 与 `bundle\runtime\<名字>`）。
+# 这一组用例**不联网**：wheels/模型/嵌入包那三件全部打桩，钉的是"摆出来的布局对不对"
+# 与"缺东西时该不该响亮失败"。
+
+_FAKE_WHEELS = ("fastapi-0.115.0-py3-none-any.whl",
+                "uvicorn-0.30.0-py3-none-any.whl",
+                "sherpa_onnx-1.13.8-cp311-cp311-win_amd64.whl",
+                "modelscope-1.20.0-py3-none-any.whl",
+                "soundfile-0.12.1-py3-none-any.whl",
+                "pip-24.0-py3-none-any.whl",
+                "setuptools-70.0.0-py3-none-any.whl",
+                "wheel-0.43.0-py3-none-any.whl",
+                "packaging-24.0-py3-none-any.whl")
+
+
+class _BundleCase(unittest.TestCase):
+    """把 ROOT 换成一个假的仓库树（`models/` 里有流沙模型），并给三件载荷打桩。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="echobundle-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.repo = os.path.join(self.tmp, "repo")
+        model = os.path.join(self.repo, "models", "sherpa-onnx-streaming")
+        os.makedirs(model)
+        for name in ("encoder.onnx", "decoder.onnx", "joiner.onnx", "tokens.txt"):
+            with open(os.path.join(model, name), "w", encoding="utf-8") as fh:
+                fh.write("x")
+        self.patches = [
+            mock.patch.object(packer, "ROOT", self.repo),
+            mock.patch.object(packer, "pick_python", lambda override: ["fake-python"]),
+            mock.patch.object(packer, "download_wheels", self._fake_wheels),
+            mock.patch.object(packer, "copy_model", self._fake_copy_model),
+            mock.patch.object(packer, "fetch", self._fake_fetch),
+            mock.patch.object(packer, "offline_resolve_check", lambda py, d: (True, "ok")),
+            # 出包的进度打印在用例里只是噪声（断言看的是产物）
+            mock.patch.object(packer, "log", lambda msg: None),
+        ]
+        for p in self.patches:
+            p.start()
+            self.addCleanup(p.stop)
+        self.wheel_specs = []
+
+    def _fake_wheels(self, py, specs, dest, cache):
+        self.wheel_specs = list(specs)
+        os.makedirs(dest, exist_ok=True)
+        out = []
+        for name in _FAKE_WHEELS:
+            path = os.path.join(dest, name)
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("w")
+            out.append(Path(path))
+        return out
+
+    def _fake_copy_model(self, src, dest):
+        shutil.copytree(src, dest)
+
+    def _fake_fetch(self, url, dest):
+        os.makedirs(os.path.dirname(str(dest)), exist_ok=True)
+        with open(str(dest), "w", encoding="utf-8") as fh:
+            fh.write(url)
+
+    @property
+    def kit(self):
+        return os.path.join(self.tmp, "ECHO-kit-20260930-1234")
+
+
+class BundleLayoutTests(_BundleCase):
+    def test_the_layout_is_exactly_what_install_all_consumes(self):
+        out = os.path.join(self.tmp, "out")
+        code = packer.main(["--bundle", "--out", out, "--stamp", "test"])
+        self.assertEqual(code, 0)
+        b = os.path.join(out, "ECHO-bundle-test", "bundle")
+        self.assertTrue(os.path.isdir(os.path.join(b, "wheels")))
+        self.assertTrue(os.path.isfile(
+            os.path.join(b, "models", "sherpa-onnx-streaming", "tokens.txt")))
+        self.assertTrue(os.path.isfile(os.path.join(b, "runtime", packer.EMBED_NAME)))
+        self.assertTrue(os.path.isfile(os.path.join(b, "runtime", "get-pip.py")))
+        self.assertTrue(os.path.isfile(os.path.join(b, "BUNDLE-INFO.txt")))
+        # 唤醒词：本机没有 → 跳过而不是失败
+        self.assertFalse(os.path.exists(os.path.join(b, "models", "wakeword")))
+
+    def test_the_zip_carries_a_top_level_folder(self):
+        out = os.path.join(self.tmp, "out")
+        packer.main(["--bundle", "--out", out, "--stamp", "test"])
+        zip_path = os.path.join(out, "ECHO-bundle-test.zip")
+        with zipfile.ZipFile(zip_path) as zf:
+            names = zf.namelist()
+        self.assertTrue(names)
+        for n in names:
+            self.assertTrue(n.startswith("ECHO-bundle-test/"), n)
+        self.assertIn("ECHO-bundle-test/bundle/runtime/get-pip.py", names)
+
+    def test_into_writes_straight_into_the_kit_and_skips_the_zip(self):
+        """`--into <kit>`：直接进 kit 根（同事那个 .bat 就是在 kit 根发现 bundle\\ 的）。"""
+        os.makedirs(self.kit)
+        code = packer.main(["--bundle", "--into", self.kit, "--stamp", "test"])
+        self.assertEqual(code, 0)
+        self.assertTrue(os.path.isdir(os.path.join(self.kit, "bundle", "wheels")))
+        self.assertFalse(os.path.exists(os.path.join(self.kit, "bundle", "bundle")))
+        self.assertFalse(os.path.exists(self.kit + ".zip"))
+
+    def test_into_a_missing_dir_is_refused(self):
+        with self.assertRaises(packer.PackError) as ctx:
+            packer.main(["--bundle", "--into", os.path.join(self.tmp, "nope")])
+        self.assertIn("不存在", str(ctx.exception))
+
+    def test_a_second_run_rewrites_the_bundle(self):
+        """重出时**只清 bundle\\**（kit 里别的东西不许动）。"""
+        os.makedirs(self.kit)
+        with open(os.path.join(self.kit, "先读我.md"), "w", encoding="utf-8") as fh:
+            fh.write("readme")
+        packer.main(["--bundle", "--into", self.kit])
+        stale = os.path.join(self.kit, "bundle", "wheels", "stale.whl")
+        with open(stale, "w", encoding="utf-8") as fh:
+            fh.write("old")
+        packer.main(["--bundle", "--into", self.kit])
+        self.assertFalse(os.path.exists(stale))
+        self.assertTrue(os.path.isfile(os.path.join(self.kit, "先读我.md")))
+
+    def test_wheels_come_from_requirements_core_and_the_engine_map(self):
+        """wheel 清单不是手抄的：requirements-core 的行 + 技能脚本里的 ENGINE_MAP。"""
+        packer.main(["--bundle", "--out", os.path.join(self.tmp, "out")])
+        self.assertIn("sherpa-onnx>=1.10", self.wheel_specs)
+        self.assertTrue(any(s.startswith("modelscope") for s in self.wheel_specs), self.wheel_specs)
+        for bootstrap in ("pip", "setuptools", "wheel", "packaging"):
+            self.assertIn(bootstrap, self.wheel_specs, "离线装 pip 要这几个：%s" % bootstrap)
+
+
+class BundleGuardTests(_BundleCase):
+    def test_a_missing_sherpa_model_is_a_loud_failure(self):
+        shutil.rmtree(os.path.join(self.repo, "models", "sherpa-onnx-streaming"))
+        with self.assertRaises(packer.PackError) as ctx:
+            packer.main(["--bundle", "--out", os.path.join(self.tmp, "out")])
+        self.assertIn("sherpa-onnx-streaming", str(ctx.exception))
+
+    def test_a_thin_wheelhouse_is_caught_before_shipping(self):
+        """wheelhouse 缺包 → 自检就说清楚（不能留到同事那边"装到一半失败"）。"""
+        b = os.path.join(self.tmp, "b")
+        os.makedirs(os.path.join(b, "wheels"))
+        with open(os.path.join(b, "wheels", "fastapi-0.1-py3-none-any.whl"), "w") as fh:
+            fh.write("x")
+        problems = packer.verify_bundle(b)
+        self.assertTrue(any("sherpa-onnx" in p for p in problems), problems)
+        self.assertTrue(any("pip" in p for p in problems), problems)
+        self.assertTrue(any("sherpa-onnx-streaming" in p for p in problems), problems)
+
+    def test_a_failing_offline_resolve_is_a_failure(self):
+        with mock.patch.object(packer, "offline_resolve_check",
+                               lambda py, d: (False, "ERROR: No matching distribution found")):
+            with self.assertRaises(packer.PackError) as ctx:
+                packer.main(["--bundle", "--out", os.path.join(self.tmp, "out")])
+        self.assertIn("No matching distribution", str(ctx.exception))
+
+    def test_unknown_bundle_components_are_refused(self):
+        with self.assertRaises(packer.PackError) as ctx:
+            packer.main(["--bundle", "--out", os.path.join(self.tmp, "out"),
+                         "--components", "runtime-core,nope-xyz"])
+        self.assertIn("nope-xyz", str(ctx.exception))
+
+    def test_no_models_and_no_runtime_are_honoured(self):
+        out = os.path.join(self.tmp, "out")
+        code = packer.main(["--bundle", "--out", out, "--stamp", "test",
+                            "--no-models", "--no-runtime"])
+        self.assertEqual(code, 0)
+        b = os.path.join(out, "ECHO-bundle-test", "bundle")
+        self.assertTrue(os.path.isdir(os.path.join(b, "wheels")))
+        self.assertFalse(os.path.exists(os.path.join(b, "runtime")))
+        self.assertFalse(os.path.exists(os.path.join(b, "models")))
+
+
+class BundleContractWithInstallAll(unittest.TestCase):
+    """**名字是契约**：`install-all.ps1` 是按名字找这几个东西的，改名就静默装不上。"""
+
+    def setUp(self):
+        self.text = Path(ROOT, "scripts", "install-all.ps1").read_text(encoding="utf-8")
+
+    def test_the_embed_zip_name_matches_install_all(self):
+        self.assertIn(packer.EMBED_NAME, self.text,
+                      "bundle 里的嵌入包名字与 install-all.ps1 找的不一样")
+
+    def test_install_all_reads_wheels_models_and_getpip_from_the_bundle(self):
+        self.assertIn("$script:Bundle 'wheels'", self.text)
+        self.assertIn("$script:Bundle 'models", self.text)
+        self.assertIn("'runtime\\get-pip.py'", self.text)
+
+    def test_the_kit_root_bundle_is_auto_detected(self):
+        """`<KitRoot>\\bundle` 自动探测（第 183-186 行那条）——这是 .bat 能自动 -Offline 的地基。"""
+        self.assertIn("Join-Path $script:KitRoot 'bundle'", self.text)
+
+    def test_offline_hard_checks_the_wheels_dir(self):
+        self.assertIn("离线载荷里没有 wheels", self.text)
 
 
 if __name__ == "__main__":
