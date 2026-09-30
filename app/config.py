@@ -342,7 +342,10 @@ DEFAULTS = {
     # 2026-09-29：其中 `meetingSttModel` 已经废弃（不再下发、写入被拒），
     # grp 只剩"老库行的兼容标记"这一层意思。
     "device":          dict(value="auto", grp="model", label="计算设备",
-                            description="auto=cuda 优先，失败回退 CPU",
+                            description="auto=cuda 优先，失败回退 CPU。"
+                                        "**只影响客户端自己跑的引擎**（whisper / sensevoice / "
+                                        "qwen3asr / pyannote）—— 默认档的指令引擎 sherpa 是 CPU 的、"
+                                        "会议转写交给能力后端时，这一项都不用管。",
                             value_type="str", options=["auto", "cpu", "cuda"]),
     "sttModel":        dict(value="sensevoice", grp="model", label="命令转写引擎",
                             description="语音指令用哪个引擎。sherpa = 兜底（安装器保证它在，"
@@ -398,7 +401,7 @@ DEFAULTS = {
     "maxRecordMs":     dict(value=30000, grp="voice", sub="record", label="最长录音毫秒",
                             description="单次命令录音上限", value_type="int"),
     "inputDeviceId":   dict(value="", grp="voice", sub="record", label="默认输入设备",
-                            description="指令、唤醒、会议都用它；下面两项可以各自覆盖。"
+                            description="指令、唤醒、会议都用它；「指令采集」/「会议采集」两项可以各自覆盖。"
                                         "「系统默认」= 跟随 Windows 的默认麦克风。"
                                         "选项是**设备名**（不是会漂的序号）；"
                                         "配置的设备不在位时会回退到系统默认，并记一条日志。",
@@ -410,13 +413,13 @@ DEFAULTS = {
                                  label="指令/唤醒输入设备",
                                  description="语音指令（媒体键/热键/唤醒/麦克风按钮）从哪个设备收音。"
                                              "想让耳机上的媒体键触发、并用耳机麦说话，就在这里选耳机。"
-                                             "空 = 跟随上面的默认输入设备",
+                                             "空 = 跟随「默认输入设备」（高级里那一项）",
                                  value_type="str", options_from="audio_inputs"),
     "meetingInputDeviceId": dict(value="", grp="voice", sub="record",
                                  label="会议录音输入设备",
                                  description="会议从哪个设备录音。会议室里选全向麦（如 MAXHUB）"
                                              "比笔记本内置麦好得多。"
-                                             "空 = 跟随上面的默认输入设备",
+                                             "空 = 跟随「默认输入设备」（高级里那一项）",
                                  value_type="str", options_from="audio_inputs"),
     # ---------- 播放设备（扬声器）也进设备池 ----------
     # 采集那侧早就有"按用途挑设备"，播放一直是"系统默认发声"，于是会出现

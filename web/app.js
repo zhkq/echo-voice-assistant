@@ -1420,8 +1420,9 @@ const SET_CARDS = {
   /* ---------- ② 业务配置：会议 · 语音指令 · 朗读反馈 · 队列 · 工作区 ---------- */
   business: [
     { id: "meet", title: "会议",
-      hint: "录音设备、分段时长、音频落点，以及转写走哪条路（下面那条单选）。",
-      common: ["meetingInputDeviceId", "meetingSegmentMinutes", "meetingsDir"],
+      hint: "分段时长、音频落点，以及转写走哪条路（下面那条单选）。"
+          + "会议用哪个麦在「能力与智能体 → 设备选择」。",
+      common: ["meetingSegmentMinutes", "meetingsDir"],
       // 转写走哪条路（3 个能力键）就在这张卡里 —— 用户的原话是"会议（… · 转写走哪条路）"。
       // 2026-09-26 之前那 3 个键散在「模型路由 → 会议能力通道」里，这里收口成一处。
       dynAfter: () => renderMeetingServiceCard(),
@@ -1431,14 +1432,15 @@ const SET_CARDS = {
       adv: ["meetingAutoSummarize", "meetingKeepRawAudio", "meetingWorkspaceTitle",
             "meetingAutoCompressAudio", "capabilityPrivacy"] },
     { id: "cmd", title: "语音指令",
-      hint: "从说一句话到出文字：唤醒 → 收音 → 转写。",
-      common: ["wakeEnabled", "inputDeviceId", "sttModel"],
+      hint: "从说一句话到出文字：唤醒 → 收音 → 转写。"
+          + "用哪个麦（指令 / 默认）在「能力与智能体 → 设备选择」。",
+      common: ["wakeEnabled", "sttModel"],
       dynAfter: () => renderCmdEngineStatus(),
       advOrder: ["唤醒词与灵敏度", "计算与唤醒", "录音与转写", "命令与会话",
                  "声纹入库", "在线服务"],
       adv: ["wakeKeywords", "wakeAliases", "wakePaused", "wakeThreshold", "wakeCooldownSec",
             "wakeConfirmX", "wakeConfirmN", "wakeSilenceFloor", "wakeEngine",
-            "sttLanguage", "commandInputDeviceId", "silenceThreshold", "silenceHangoverMs",
+            "sttLanguage", "silenceThreshold", "silenceHangoverMs",
             "noSpeechAbortMs", "maxRecordMs", "consumeMediaKey",
             "wakeHotkey", "fallbackHotkey", "triggerKeys",
             "commandWorkspaceTitle", "commandIdleRotateHours", "commandTargetWorkspace",
@@ -1491,11 +1493,14 @@ const SET_CARDS = {
       covers: ["agentBackend", "harnessHome", "dshBaseUrl", "agentCustomPath",
                "harnessCommand", "harnessPort", "harnessToken",
                "agentCodebuddyEnabled", "agentHarnessEnabled"] },
-    { id: "dev", title: "设备选择（设备池与优先级）",
-      help: "推理设备决定转写/分离在哪算；下面三条是播放设备池 —— 任务反馈 / 语音指令 / 会议"
-          + "各自用哪个，留空 = 系统默认。",
-      common: ["device", "outputDeviceIds", "commandOutputDeviceId",
-               "meetingOutputDeviceId"] },
+    { id: "dev", title: "设备选择（采集与播放）",
+      help: "采集按用途各指定一个麦（语音指令 / 会议），留空 = 跟随系统默认麦克风；"
+          + "播放默认跟随系统，要按用途覆盖（比如「指令只从耳机出声」）就去下面的高级。"
+          + "推理设备只影响客户端自己跑的引擎（whisper / sensevoice / qwen3asr）——"
+          + "会议转写交给后端时不用管它。",
+      common: ["commandInputDeviceId", "meetingInputDeviceId", "outputDeviceIds"],
+      advOrder: ["计算与唤醒", "录音与转写", "朗读与反馈"],
+      adv: ["device", "inputDeviceId", "commandOutputDeviceId", "meetingOutputDeviceId"] },
     // 「模型路由」那张卡**不在这里**：它是 index.html 里的静态卡（语言模型 / 通道成员 /
     // 派发情况 三个 host 要被 loadRouter 系列反复渲染，重绘会和并发请求互相覆盖）。
     // 卡里那 7 项路由参数由 renderSettingsPanes() 填进 `#rtSetHost`，落点记在
@@ -1563,10 +1568,10 @@ const SET_SHORT_LABELS = {
   commandWorkspace: "指令空间", commandWorkspaceTitle: "指令分组",
   commandIdleRotateHours: "空闲轮换", commandTargetWorkspace: "目标空间",
   commandTargetSession: "目标会话", meetingsDir: "音频存放", meetingWorkspace: "会议空间",
-  meetingWorkspaceTitle: "会议分组", inputDeviceId: "收音设备",
-  commandInputDeviceId: "指令麦克风", meetingInputDeviceId: "会议麦",
-  outputDeviceIds: "扬声器", commandOutputDeviceId: "指令播报",
-  meetingOutputDeviceId: "会议播报", sttModel: "转写引擎",
+  meetingWorkspaceTitle: "会议分组", inputDeviceId: "默认采集",
+  commandInputDeviceId: "指令采集", meetingInputDeviceId: "会议采集",
+  outputDeviceIds: "默认播放", commandOutputDeviceId: "指令播放",
+  meetingOutputDeviceId: "会议播放", sttModel: "转写引擎",
   wakeEngine: "唤醒方式", device: "计算设备", wakeEnabled: "启用唤醒",
   wakePaused: "唤醒暂停", wakeAliases: "唤醒别名", wakeThreshold: "唤醒阈值",
   sttLanguage: "转写语言", wakeHotkey: "唤醒热键", fallbackHotkey: "回退热键",

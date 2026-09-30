@@ -287,17 +287,52 @@ class OneEntityOnePlaceTests(unittest.TestCase):
         # 会议卡把它画出来（SET_CARDS.business 的 dynAfter）
         self.assertRegex(self.js, r'id: "meet"[\s\S]{0,600}?dynAfter: \(\) => renderMeetingServiceCard\(\)')
 
-    def test_output_device_pool_lives_only_in_the_device_card(self):
-        """播放设备池（优先级）只在「设备选择」卡里，不在朗读反馈卡里重复一遍。"""
+    def test_the_device_card_is_capture_first(self):
+        """设备选择卡：**常用 = 两个用途麦 + 一条默认播放**；兜底麦与两条按用途播报收进高级。
+
+        2026-09-30 用户拍板："播放有默认路径就够，但是**采集需要分别明确设备**"。
+        起因是同事把「指令播报 / 会议播报」读成了麦克风 —— 那两条其实是扬声器
+        （`commandOutputDeviceId` / `meetingOutputDeviceId`），而短标签把"扬声器"三个字省掉了，
+        同一张卡里又看不到麦的入口。改法见 docs/settings-重设计方案.md §6.1。
+        """
         fb = re.search(r'id: "fb", title: "朗读与反馈"([\s\S]*?)\},', self.js).group(1)
         for key in ("outputDeviceIds", "commandOutputDeviceId", "meetingOutputDeviceId"):
             with self.subTest(key=key):
                 self.assertNotIn(key, fb, "%s 不该在朗读反馈卡里再出现一次" % key)
-        dev = re.search(r'id: "dev", title: "设备选择（设备池与优先级）"([\s\S]*?)\},', self.js).group(1)
-        for key in ("device", "outputDeviceIds", "commandOutputDeviceId",
-                    "meetingOutputDeviceId"):
+        dev = re.search(r'id: "dev", title: "设备选择（采集与播放）"([\s\S]*?)\},',
+                        self.js).group(1)
+        common = re.search(r"common:\s*\[([^\]]*)\]", dev).group(1)
+        adv = re.search(r"adv:\s*\[([^\]]*)\]", dev).group(1)
+        for key in ("commandInputDeviceId", "meetingInputDeviceId", "outputDeviceIds"):
             with self.subTest(key=key):
-                self.assertIn(key, dev)
+                self.assertIn('"%s"' % key, common,
+                              "常用行应该是：指令采集 / 会议采集 / 默认播放")
+        for key in ("device", "inputDeviceId", "commandOutputDeviceId", "meetingOutputDeviceId"):
+            with self.subTest(key=key):
+                self.assertIn('"%s"' % key, adv, "%s 应该在高级里" % key)
+        self.assertEqual(len(re.findall(r'"[A-Za-z]+"', common)), 3,
+                         "常用**只有**这三行（用户口径）：%s" % common)
+
+    def test_the_mics_are_not_placed_twice(self):
+        """挪进设备选择卡的三个麦，必须从「会议」「语音指令」两张卡里删干净（每键恰好一处）。"""
+        business = self.js[self.js.index("business: ["):self.js.index("capability: [")]
+        for key in ("inputDeviceId", "commandInputDeviceId", "meetingInputDeviceId"):
+            with self.subTest(key=key):
+                self.assertNotIn('"%s"' % key, business,
+                                 "%s 已挪到设备选择卡，business 里不该再有它" % key)
+
+    def test_the_short_labels_say_playback_or_capture(self):
+        """短标签要带"播放 / 采集"这两个词 —— 缺了它就会重演这次误读（详见 §6.1）。"""
+        block = self.js[self.js.index("const SET_SHORT_LABELS = {"):]
+        block = block[:block.index("\n};")]
+        for key, want in (("outputDeviceIds", "默认播放"),
+                          ("commandOutputDeviceId", "指令播放"),
+                          ("meetingOutputDeviceId", "会议播放"),
+                          ("commandInputDeviceId", "指令采集"),
+                          ("meetingInputDeviceId", "会议采集"),
+                          ("inputDeviceId", "默认采集")):
+            with self.subTest(key=key):
+                self.assertRegex(block, r'%s:\s*"%s"' % (key, want))
 
     def test_deprecated_switches_are_gone_from_the_panel(self):
         """`meetingDiarize` / `voiceprintEnabled` 已废弃：面板上不该再有"要不要分离/声纹"。"""

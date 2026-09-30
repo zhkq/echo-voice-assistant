@@ -213,9 +213,17 @@ powershell -ExecutionPolicy Bypass -File scripts\check-windows.ps1
 | `paths` 改动后的迁移 | 会议文件目录改了要手动点「迁移已有会议」；模型目录要自行拷贝 |
 | 已弃用项的清理 | `dshStartCommand` / `dshNodePath` / `dshPackageDir` / `worklogMode` / `providerTts` 确认彻底无人引用后可从 `DEFAULTS` 删除 |
 | 设置页长度 | 分组变多后默认全部展开，页较长；顶部已有「全部折叠/展开」，暂不改默认折叠策略 |
-| **设备选择卡改成"采集侧为主"**（2026-09-30 用户拍板，待做） | 见 §6.1 —— 播放只要一条默认路径，**采集必须按用途各指定一个麦** |
+| **设备选择卡改成"采集侧为主"**（2026-09-30 用户拍板，**已落地**） | 见 §6.1 —— 播放只要一条默认路径，**采集必须按用途各指定一个麦** |
 
-### 6.1 设备选择卡改成"采集侧为主"（2026-09-30 拍板，待做）
+### 6.1 设备选择卡改成"采集侧为主"（2026-09-30 拍板并落地）
+
+> **落地位置**：`web/app.js` 的 `SET_CARDS.dev`（常用 3 行 / 高级 4 行）与 `SET_SHORT_LABELS`
+> （六个标签改成「默认播放 / 指令播放 / 会议播放 / 指令采集 / 会议采集 / 默认采集」）；
+> `meetingInputDeviceId` 从「会议」卡、`inputDeviceId` 与 `commandInputDeviceId` 从「语音指令」卡
+> 删干净（每键恰好一处）；`app/config.py` 里四项的说明跟着改（"上面那项"改成指高级里的那一项、
+> `device` 的说明补上"只影响客户端自己跑的引擎"）；`scripts/gen-settings-map.py` 的归属表重跑；
+> 用例 `tests/test_ia_panel.py::test_the_device_card_is_capture_first` /
+> `test_the_mics_are_not_placed_twice` / `test_the_short_labels_say_playback_or_capture` 钉住。**行为零变化**。
 
 **用户原话的口径**："播放有默认路径就够，但是**采集需要分别明确设备**"。
 
@@ -230,28 +238,37 @@ powershell -ExecutionPolicy Bypass -File scripts\check-windows.ps1
 
 **要改成**（纯面板归属 + 文案；**键、取值、回退链与实现一处不动**）：
 
-| 键 | 现在画在哪 | 改成 |
-|---|---|---|
-| `device`（计算设备） | 设备选择 · 常用 | 不变 |
-| `outputDeviceIds`（扬声器优先级） | 设备选择 · 常用 | 不变 —— **播放只留这一条默认路径** |
-| `inputDeviceId`（收音设备） | 业务配置 / 语音指令 · 常用 | **挪进设备选择 · 常用**（默认麦，兜底） |
-| `commandInputDeviceId`（指令麦克风） | 业务配置 / 语音指令 · 高级 | **挪进设备选择 · 常用**（归属表里本就标着"保留（待确认归属）"，就此定下） |
-| `meetingInputDeviceId`（会议麦） | 业务配置 / 会议 · 常用 | **挪进设备选择 · 常用** |
-| `commandOutputDeviceId`（指令播报扬声器） | 设备选择 · 常用 | **收进高级**（要"指令只从耳机出声"这类才去改） |
-| `meetingOutputDeviceId`（会议播报扬声器） | 设备选择 · 常用 | **收进高级**（同上） |
+**最终落点**（用户 2026-09-30 二次收口："把默认mic，会议和指令播报这三个都改到高级，
+常用配置只有默认播放，和会议、指令采集这三个"）：
 
-* **不能真删键**：`app/audio/output.py` 还在按它们取值，删了 `audit-settings.py` 会判 DEAD、
-  老配置（已经填过按用途扬声器的人）的取值也没人读。收进高级 = 界面让位，行为不变。
-* 卡片 `hint` 改成一句："**采集**按用途各指定一个麦（指令 / 会议 / 默认兜底）；**播放**默认跟随系统，
-  要按用途覆盖就在高级里改。"
-* 短标签：麦那三条沿用「收音设备 / 指令麦克风 / 会议麦」；播报两条若在高级里仍显示，
-  补回设备名词 →「指令扬声器 / 会议扬声器」（**这次被绕就是因为它缺了这三个字**）。
+| 键 | 面板行名（短标签） | 落点 | 从哪来 |
+|---|---|---|---|
+| `outputDeviceIds` | **默认播放** | 设备选择 · **常用** | 原地 —— **播放只留这一条默认路径** |
+| `commandInputDeviceId` | **指令采集** | 设备选择 · **常用** | 语音指令 · 高级（原「指令麦克风」） |
+| `meetingInputDeviceId` | **会议采集** | 设备选择 · **常用** | 会议 · 常用（原「会议麦」） |
+| `inputDeviceId` | **默认采集** | 设备选择 · **高级** | 语音指令 · 常用（原「收音设备」；兜底麦） |
+| `commandOutputDeviceId` | **指令播放** | 设备选择 · **高级** | 设备选择 · 常用（原「指令播报」） |
+| `meetingOutputDeviceId` | **会议播放** | 设备选择 · **高级** | 设备选择 · 常用（原「会议播报」） |
+| `device` | **计算设备** | 设备选择 · **高级** | 设备选择 · 常用 |
+
+**`device`（计算设备）为什么也收进高级**（附带回答用户当天的问题"转写转入后端后客户端还要 CUDA 吗"）：
+**默认路径不需要**。`device` 只被"客户端自己跑引擎"的那条路读（`app/audio/stt.py:resolve_device()`：
+whisper 走 ctranslate2 的 cuda/float16、sensevoice 走 torch 的 `cuda:0`，还有 qwen3asr / pyannote）；
+而默认档的指令引擎是 **sherpa-onnx（CPU，`device` 对它完全不起作用）**，会议转写/分离在 3.0 里
+交给**能力后端**（GPU 在那台机器上）。所以它现在与"客户端的重活"绑定，属于高级项。
+
+* **不能真删键**：`app/audio/output.py` / `app/audio/stt.py` 还在按它们取值，删了
+  `audit-settings.py` 会判 DEAD、老配置（已经填过按用途扬声器/推理设备的人）的取值也没人读。
+  收进高级 = 界面让位，**行为零变化**。
+* 卡片 `hint` 改成："采集按用途各指定一个麦（语音指令 / 会议）；播放默认跟随系统，
+  要按用途覆盖就在高级里改。" 说得清"哪一侧在这张卡、哪一侧在另一页签"。
+* 短标签改成一组**对称词**：播放侧「默认播放 / 指令播放 / 会议播放」、采集侧
+  「指令采集 / 会议采集 / 默认采集」—— 这次被绕就是因为旧标签里没有"播放/采集"这类设备名词。
 * **每个键仍然恰好一处**（仓库硬规矩，`tests/test_ia_panel.py` / `test_panel_layout.py` 盯着）：
   挪进设备选择的三个键必须同时从「会议」「语音指令」两张卡里删掉。
-* 落地时一起改：`web/app.js` 的 `SET_CARDS.dev` 与 `SET_SHORT_LABELS`；重跑
-  `scripts/gen-settings-map.py`（`docs/设置项归属表.md` 是它生成的，"别手改表"）；
-  相关用例 `tests/test_input_devices.py`（选项来源）、`tests/test_ia_panel.py`、
-  `tests/test_panel_layout.py`。
+* 落地时一起改：`web/app.js` 的 `SET_CARDS.dev` 与 `SET_SHORT_LABELS`；`app/config.py` 里
+  四项的 `description`（"上面那项"要改成指高级里那一项）；重跑 `scripts/gen-settings-map.py`
+  （`docs/设置项归属表.md` 是它生成的，"别手改表"）；用例见上面的"落地位置"。
 
 ---
 
