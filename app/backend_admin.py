@@ -30,7 +30,7 @@ import threading
 import time
 from typing import Any, Dict, Tuple
 
-from app import backend_pid, backend_proc, backend_setup
+from app import backend_env, backend_pid, backend_proc, backend_setup
 from app.capabilities import pairing
 
 #: 一次只允许一个「起本机后端」。面板点两次不该起两个进程 ——
@@ -247,9 +247,14 @@ def start(*, replace_pairing: bool = False, vram_budget_mb: int = 0,
     面板要看进度就轮询 `view()["job"]`。
     """
     if not backend_proc.python_exe() and not python:
-        return False, ("后端的运行时还没装好（%s 下没有 runtime/）—— "
-                       "扩展包要先解包/装好；容器路还没做"
-                       % backend_proc.backend_root())
+        # 薄包那条路（用户 2026-09-30 拍板"默认薄包 + 国内可下载"）：**不在这里拒绝** ——
+        # 运行时正是这趟活要装的（第 0 步 `runtime`，见 `app/backend_fetch.py`）。
+        # 但**薄包没解开**（没有 server/requirements.txt）就先说清楚，别让人等一次必然失败的下载。
+        from app import backend_fetch
+        if not backend_fetch.plan()["sourceReady"]:
+            return False, ("后端的**薄包还没解开**：%s 下找不到 server/requirements.txt —— "
+                           "先把薄包解到那里（解好后这一趟会从国内源把运行时装上）。"
+                           % backend_proc.backend_root())
     with _JOB_LOCK:
         if _JOB["running"]:
             return False, ("已经有一个「起本机后端」在进行中（第 %d 步：%s）—— "
@@ -257,13 +262,19 @@ def start(*, replace_pairing: bool = False, vram_budget_mb: int = 0,
         _JOB.update({"running": True, "ok": None, "message": "", "steps": [],
                      "stage": "准备中", "startedAt": _now(), "doneAt": ""})
     port, admin_port = ports()
+    # 装哪一档运行时由**显卡**定（`compute_cap` → cu126/cu118…），与"计划"里那个 variant 同一判据。
+    try:
+        variant = backend_env.variant_for(backend_env.gpu())
+    except Exception:                                             # pragma: no cover - 兜底
+        variant = ""
 
     def _worker():
         try:
             res = backend_setup.start(port=port, admin_port=admin_port,
                                       device=device, vram_budget_mb=vram_budget_mb,
                                       timeout=timeout, replace=replace_pairing,
-                                      python=python, cwd=cwd, on_step=_note_step)
+                                      python=python, cwd=cwd, variant=variant,
+                                      on_step=_note_step)
         except Exception as e:                                    # pragma: no cover - 兜底
             res = {"ok": False, "message": "起后端时出了意外：%s" % e, "steps": []}
         with _JOB_LOCK:

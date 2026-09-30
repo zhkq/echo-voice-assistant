@@ -390,7 +390,7 @@ class StartSequenceTests(_SetupCase):
                           lambda **kw: (False, "写不了配置", {"path": "x"})), \
                 patch.object(backend_setup, "launch",
                              side_effect=AssertionError("不该启动")):
-            res = backend_setup.start()
+            res = backend_setup.start(fetch_runtime=False)
         self.assertFalse(res["ok"])
         self.assertEqual([s["name"] for s in res["steps"]], ["configure"])
         self.assertEqual(self.settings_written, [])
@@ -410,7 +410,7 @@ class StartSequenceTests(_SetupCase):
                              lambda url, **kw: (calls.append("ready") or
                                                 {"ok": True, "state": "ok",
                                                  "headline": "三层都过了"})):
-            res = backend_setup.start()
+            res = backend_setup.start(fetch_runtime=False)
         self.assertTrue(res["ok"], res)
         self.assertEqual([s["name"] for s in res["steps"]],
                          ["configure", "launch", "pair-file", "pair", "ready"])
@@ -427,7 +427,7 @@ class StartSequenceTests(_SetupCase):
                              lambda **kw: (True, "文件在了")), \
                 patch.object(backend_setup, "pair_if_needed",
                              lambda **kw: (True, "已配对")):
-            res = backend_setup.start(ready_probe=False)
+            res = backend_setup.start(ready_probe=False, fetch_runtime=False)
         self.assertTrue(res["ok"], res)
         self.assertEqual([s["name"] for s in res["steps"]],
                          ["configure", "launch", "pair-file", "pair"])
@@ -445,7 +445,7 @@ class StartSequenceTests(_SetupCase):
                 patch.object(backend_ready, "probe",
                              lambda url, **kw: {"ok": False, "state": "asr-failed",
                                                 "headline": headline}):
-            res = backend_setup.start()
+            res = backend_setup.start(fetch_runtime=False)
         self.assertFalse(res["ok"])
         self.assertEqual(res["message"], headline)
         self.assertEqual(res["steps"][-1]["name"], "ready")

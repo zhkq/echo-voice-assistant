@@ -2996,6 +2996,12 @@ function renderBackendPlan(p) {
       + ((w.missing || []).length ? `，缺：${w.missing.map(esc).join("、")}` : ""));
   }
   if ((p.missing || []).length) lines.push(`缺：${p.missing.map(esc).join("；")}`);
+  // 薄包那条路（默认）：运行时不随包走 —— 说清"点下去会从哪装、多大、日志在哪"。
+  if (p.path === "portable" && p.fetch) {
+    lines.push(`取运行时：${esc(p.fetch.headline || "")}`
+      + (p.fetch.approxDownloadGB ? `（约 ${p.fetch.approxDownloadGB} GB）` : "")
+      + `；日志 <code>${esc(p.fetch.log || "")}</code>`);
+  }
   // 容器路（批 4）：compose 文件可以在这里生成（只发布到宿主回环）；「一键拉镜像 + 起」还没做。
   if (p.path === "container") {
     lines.push("容器路：点「生成 compose」会把本机形态的 compose.yaml 写好"

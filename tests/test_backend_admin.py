@@ -293,7 +293,7 @@ class StartTests(_Isolated):
 
         with mock.patch.object(backend_setup, "configure",
                                lambda **kw: (False, "写不了配置", {})):
-            res = backend_setup.start(on_step=_boom)
+            res = backend_setup.start(on_step=_boom, fetch_runtime=False)
         self.assertFalse(res["ok"])
         self.assertEqual([s["name"] for s in res["steps"]], ["configure"])
         self.assertIn("写不了配置", res["message"])

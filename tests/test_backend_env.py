@@ -81,10 +81,10 @@ class PreflightTests(_Case):
                              err="PATH 里没有 docker（没装 Docker，或者它不在 PATH）")
         plan = backend_env.plan()
         self.assertEqual(plan["path"], "portable")
-        self.assertFalse(plan["implemented"], "一键装好这一步还没做（批 5），不许说能")
+        self.assertFalse(plan["implemented"], "一键装好这一步还没做（取薄包那一步），不许说能")
         joined = " ".join(plan["notes"])
-        self.assertIn("扩展包", joined)
-        self.assertIn("批 5", joined, "要说清这一步归哪一批：%s" % joined)
+        self.assertIn("薄包", joined)
+        self.assertIn("国内源", joined, "要写清运行时会从哪来：%s" % joined)
         self.assertIn("docker 原文", " ".join(plan["reasons"]))
 
     def test_docker_installed_but_not_running_is_told_apart_from_missing(self):

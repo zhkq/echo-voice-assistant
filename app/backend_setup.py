@@ -590,8 +590,9 @@ def start(*, port: int = backend_proc.DEFAULT_PORT,
           write_setting: bool = True, models_root_path: str = "",
           python: str = "", cwd: str = "",
           ready_probe: bool = True, ready_timeout: float = 0.0,
+          fetch_runtime: bool = True, variant: str = "",
           on_step=None) -> Dict[str, Any]:
-    """把 configure → launch → 等配对文件 → 配对 串起来 → 结果字典。
+    """把 **取运行时**（薄包路）→ configure → launch → 等配对文件 → 配对 → 就绪 串起来。
 
     返回 ``{"ok": bool, "steps": [{"name", "ok", "detail"}...], "message", …}`` ——
     面板（1d）把它当进度显示：**每一步都可读**，失败的那一步就是"下一步该看哪里"。
@@ -599,6 +600,11 @@ def start(*, port: int = backend_proc.DEFAULT_PORT,
 
     "ECHO 起的那个已经在跑"**算成功**（幂等：点两次不该报错）—— 那正是
     "后端上次起的、还在跑"的正常情形，接下来直接等配对文件 + 配对。
+
+    ``fetch_runtime``（2026-09-30 加，默认开）：**薄包那条路的第 0 步** ——
+    运行时不在 `runtime/` 里时，按国内源把它装上（`app/backend_fetch.py`）。
+    调用方给了 `python=` 时跳过（开发/用例用自己的解释器）。``variant`` 决定装哪一档
+    （`cu126` / `cu118` / `cu128`，空 = cu126）—— 它同时决定 torch 的 CUDA 索引。
 
     ``on_step``（2026-09-30 加）：每记下一步就回调一次 ``{"name","ok","detail"}``，
     给"面板要显示实时进度"用（这个函数跑在后台线程里，一次跑十几秒到一分钟）。
@@ -622,6 +628,21 @@ def start(*, port: int = backend_proc.DEFAULT_PORT,
             except Exception:
                 pass
         return bool(ok)
+
+    # **第 0 步：运行时**（用户 2026-09-30 拍板"默认薄包 + 国内可下载"）。
+    # 薄包只有源码 + 配置模板，几 GB 的 torch 不随包走 —— 这里按**国内源**把它装进 `runtime/`。
+    # 什么时候跳过：① 调用方显式给了 `python=`（开发/用例走自己的解释器）；② 运行时已经在了。
+    # 失败就停在这一步并把 pip 原文带出去（**"装不上"与"起了但用不了"必须分开**：
+    # 这里失败时后端根本没起，用户看到的是安装问题，不是服务问题）。
+    if fetch_runtime and not python:
+        from app import backend_fetch
+        if backend_proc.python_exe():
+            record("runtime", True, "运行时已在：%s" % backend_proc.python_exe())
+        else:
+            ok, detail = backend_fetch.ensure_runtime(
+                variant or "", on_step=lambda label: record("runtime", True, label))
+            if not record("runtime", ok, detail):
+                return {"ok": False, "steps": steps, "message": detail}
 
     ok, detail, info = configure(port=port, admin_port=admin_port, device=device,
                                  vram_budget_mb=vram_budget_mb, specs=specs,

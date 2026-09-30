@@ -499,12 +499,33 @@ def plan(force: bool = False) -> Dict[str, Any]:
         spec_hint = "asr-only"
 
     # ---- 运行时 / 权重 / 磁盘 / 端口
+    #: 薄包那条路的"取运行时"计划（`app/backend_fetch.py`）—— 只在 portable 档填，
+    #: 其余档保持 None（面板照 `null` 处理），但要**先初始化**，不然 return 时会 NameError。
+    fetch_plan: Any = None
     if path == "portable":
+        # 薄包那条路（用户 2026-09-30 拍板"默认薄包 + 国内可下载"）：
+        # 运行时**不再要求随包走** —— 点「起本机后端」时按国内源现装（`app/backend_fetch.py`）。
+        from app import backend_fetch
+        fetch_plan = fetch_plan_safe = None
+        try:
+            fetch_plan = fetch_plan_safe = backend_fetch.plan(variant)
+        except Exception as e:                                    # pragma: no cover - 兜底
+            fetch_plan_safe = {"headline": "取运行时的计划算不出来：%s" % e}
         if not rt.get("ready"):
-            missing.append("后端的运行时（%s 下没有 runtime/）" % backend_setup.backend_root())
-            notes.append("扩展包要自带运行时（随包一份 CPython + 依赖）。这一档的**出包**"
-                         "还没做（实施方案 §5 的批 5）；在那之前：手工把后端包解到 %s，"
-                         "再点「起本机后端」。" % backend_setup.backend_root())
+            if fetch_plan_safe.get("sourceReady"):
+                notes.append("运行时不在 `runtime/` 里，但**薄包已经解开** —— 点「起本机后端」"
+                             "会自动装：%s（约 %.1f GB，日志 %s）。"
+                             % (fetch_plan_safe.get("headline", ""),
+                                fetch_plan_safe.get("approxDownloadGB", 0) or 0,
+                                fetch_plan_safe.get("log", "")))
+            else:
+                missing.append("后端的**薄包**（%s 下没有 server/requirements.txt）"
+                               % backend_setup.backend_root())
+                notes.append("先把薄包（源码 + 安装脚本，几十 MB）解到 %s；解开之后"
+                             "「起本机后端」会自己从国内源把运行时装上（torch 走 %s，"
+                             "其余走清华/阿里 PyPI）。"
+                             % (backend_setup.backend_root(),
+                                fetch_plan_safe.get("torchIndex", "")))
         elif rt.get("abiOk") is False:
             notes.append("**运行时已装但 ABI 不符**（原文：%s）—— 换变体 / 清 runtime 重装。"
                          % (rt.get("error") or ""))
@@ -512,10 +533,14 @@ def plan(force: bool = False) -> Dict[str, Any]:
     w = weights(variant)
     if w["missing"]:
         missing.append("权重：" + "、".join(w["missing"]))
-        notes.append("权重看的是**客户端模型库** `%s`（缺上面那几棵）；服务端还会去它自己的 "
-                     "ModelScope 缓存找（`%s`）—— 那边有没有我们不算，所以"
-                     "「面板说齐了、服务端仍 503」是可能的。"
-                     % (w["root"], p["modelscopeCache"]))
+        notes.append("两处都找过了（%s）：上面这几棵**两处都没有**。装法：把权重放进客户端模型库，"
+                     "或让它落进 ModelScope 缓存（`%s`）。"
+                     % ("、".join("%s `%s`" % (r["label"], r["path"])
+                                  for r in (w.get("roots") or [])),
+                        p["modelscopeCache"]))
+    elif w.get("foundAt"):
+        notes.append("权重四处在哪找到的：%s。"
+                     % "；".join("%s → `%s`" % (k, v) for k, v in w["foundAt"].items()))
     need_gb = round((SIZE_MODELS_MB + SIZE_IMAGE_MB) / 1024.0, 1)
     if p["diskFreeGB"] is not None and p["diskFreeGB"] < need_gb:
         missing.append("磁盘：需要约 %.1f GB，现有 %.1f GB" % (need_gb, p["diskFreeGB"]))
@@ -527,13 +552,14 @@ def plan(force: bool = False) -> Dict[str, Any]:
                      "或换端口（改生成的 `server.yaml` 里的 `listen`/`admin_listen`）。")
 
     implemented = False
-    todo = "容器路（实施方案 §5 的批 4）"
-    how = ("现在能做的：拿交付的后端包手工 `docker compose up -d`，再回这一页点"
-           "「检测本机后端」；或者走扩展包路。")
+    todo = "容器路的自动编排（生成 compose 已就绪；拉镜像/起容器还没做）"
+    how = ("现在能做的：拿交付的后端包手工 `docker compose up -d`（compose 可以让面板生成），"
+           "再回这一页点「检测本机后端」；或者走扩展包路。")
     if path == "portable":
-        todo = "扩展包的出包与自动解包（实施方案 §5 的批 5）"
-        how = ("现在能做的：把后端包（源码 + runtime）手工解到 %s，再回这一页点"
-               "「起本机后端」。" % backend_setup.backend_root())
+        todo = "取薄包那一步的自动化（解包/下载）"
+        how = ("**薄包解好之后，一次点击就够了**：运行时会按国内源现装（torch 走 SJTU 的 CUDA "
+               "索引，其余走清华/阿里 PyPI），然后自动配置 → 起 → 配 → 三层就绪自测。"
+               "现在要人工做的只有一件事：把薄包解到 %s。" % backend_setup.backend_root())
     notes.insert(0, "「一键装好」这一步还没做：%s。%s" % (todo, how))
 
     return {
@@ -554,5 +580,6 @@ def plan(force: bool = False) -> Dict[str, Any]:
                             "不通就整条路降级成扩展包路"}]
                    if path == "container" else []),
         "weights": w,
+        "fetch": fetch_plan,
         "probe": p,
     }

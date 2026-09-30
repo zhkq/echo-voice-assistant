@@ -99,13 +99,41 @@ class PortablePackTests(_Case):
             self._stage(abi_ok=False)
         self.assertEqual(os.listdir(self.out), [], "出包失败时不该留下半个包")
 
-    def test_it_refuses_without_a_runtime_or_a_wheelhouse(self):
-        with self.assertRaises(portable.PackError) as ctx:
-            portable.stage(self.out, variant="cu126", stamp="x")
-        message = str(ctx.exception)
-        self.assertIn("runtime-from", message)
-        self.assertIn("venv", message, "要说明为什么不能拿开发机的 venv 充数")
-        self.assertIn("①", message, "要给出路")
+    def test_a_bad_runtime_in_a_thick_pack_never_produces_a_half_pack(self):
+        """厚包那条路：ABI 不合就**一点东西都不留**（连目标目录都不该建）。"""
+        with self.assertRaises(portable.PackError):
+            self._stage(abi_ok=False)
+        self.assertEqual(os.listdir(self.out), [], "出包失败时不该留下半个包")
+
+    def test_the_default_is_a_thin_pack_with_a_source_list(self):
+        """**默认出薄包**（用户 2026-09-30 拍板）：不要求随包运行时，几 GB 的 torch 不随包走 ——
+        由 `sources.json` 说清"从哪下、下什么"（国内源；目标机点按钮时现装）。"""
+        kit_dir, _zip, info = portable.stage(self.out, variant="cu126", stamp="thin-1")
+        self.assertTrue(info["thin"])
+        with open(os.path.join(kit_dir, portable.MANIFEST), encoding="utf-8") as fh:
+            manifest = json.load(fh)
+        self.assertEqual(manifest["mode"], "thin")
+        self.assertFalse(manifest["hasRuntime"], "薄包不该带运行时")
+        self.assertFalse(os.path.isdir(os.path.join(kit_dir, portable.RUNTIME_DIR)),
+                         "薄包不该有 runtime/（除非只带解释器）")
+        with open(os.path.join(kit_dir, portable.SOURCES), encoding="utf-8") as fh:
+            sources = json.load(fh)
+        self.assertIn("pytorch-wheels/cu126", sources["torchIndex"])
+        self.assertTrue(any("tuna.tsinghua" in i for i in sources["pipIndexes"]))
+        self.assertEqual(portable.verify(kit_dir), [])
+
+    def test_a_thin_pack_can_carry_just_the_interpreter(self):
+        """薄包也可以**只带解释器**（几十 MB、与卡无关）：torch 仍然按国内源现装。"""
+        kit_dir, _zip, info = portable.stage(
+            self.out, variant="cu126", stamp="thin-2",
+            python_from=self.runtime)          # 复用造的假运行时目录
+        self.assertTrue(info["thin"])
+        self.assertTrue(os.path.isfile(
+            os.path.join(kit_dir, portable.RUNTIME_DIR, "Scripts", "python.exe")))
+        with open(os.path.join(kit_dir, portable.MANIFEST), encoding="utf-8") as fh:
+            manifest = json.load(fh)
+        self.assertTrue(manifest["hasRuntime"])
+        self.assertEqual(manifest["mode"], "thin")
 
     def test_the_kit_has_source_runtime_scripts_and_a_manifest(self):
         kit_dir, zip_path, info = self._stage()

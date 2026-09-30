@@ -58,6 +58,8 @@ SCRIPTS_DIR = "scripts"
 MANIFEST = "manifest.json"
 READ_ME = "先读我.md"
 YAML_TMPL = "server.yaml.tmpl"
+#: 源清单：薄包的"另一半"（从哪下、下什么）。写进包里给人看，也是安装侧的依据。
+SOURCES = "sources.json"
 
 #: 源码里**必须进包**的顶层项（少一个都不是能跑的包）。
 #: 只有这两棵：`app/`（客户端共享的引擎层）与 `server/`（服务端）—— 说明文档由本脚本生成。
@@ -144,7 +146,8 @@ echo "下一步：回到 ECHO 面板「能力」页签点「起本机后端」�
 
 
 def render_readme(*, variant: str, port: int, admin_port: int, runtime_from: str,
-                  wheels_from: str, with_models: bool) -> str:
+                  wheels_from: str, with_models: bool, thin: bool = False,
+                  has_python: bool = False) -> str:
     return "\n".join([
         "# ECHO 能力后端（扩展包形态 / 不走容器）",
         "",
@@ -152,12 +155,15 @@ def render_readme(*, variant: str, port: int, admin_port: int, runtime_from: str
         "",
         "| | |",
         "|---|---|",
+        "| 形态 | %s |" % ("**薄包**（运行时按国内源现装）" if thin else "厚包（运行时随包）"),
         "| 变体 | %s |" % (variant or "（未指定）"),
         "| 监听 | `127.0.0.1:%d`（能力面） / `127.0.0.1:%d`（管理面）—— **只服务本机** |"
         % (int(port), int(admin_port)),
-        "| 运行时 | %s |" % (("随包带：%s" % runtime_from) if runtime_from else "**没带**（见下）"),
+        "| 运行时 | %s |" % (("随包带：%s" % runtime_from) if runtime_from
+                              else ("随包只带解释器（torch 按国内源现装）" if has_python
+                                    else "**没带** —— 点「起本机后端」时按国内源现装")),
         "| wheelhouse | %s |" % (wheels_from or "（没带）"),
-        "| 权重 | %s |" % ("随包带 `models/`" if with_models else "不带，复用目标机的模型库"),
+        "| 权重 | %s |" % ("随包带 `models/`" if with_models else "不带，复用目标机的模型库/ModelScope 缓存"),
         "",
         "## 怎么装",
         "",
@@ -254,17 +260,18 @@ def abi_check(runtime_from: str) -> Dict[str, object]:
 
 def stage(out_dir: str, *, variant: str = "", runtime_from: str = "",
           wheels_from: str = "", models_from: str = "", port: int = 8900,
-          admin_port: int = 8901, stamp: str = "") -> Tuple[str, str, Dict[str, object]]:
-    """组出扩展包 → ``(kit_dir, zip_path, info)``。**缺运行时/仓库时响亮失败。**"""
-    if not runtime_from and not wheels_from:
-        raise PackError(
-            "既没给 --runtime-from 也没给 --wheels-from：这一档要**随包一份运行时**"
-            "（实施方案 §7-1 还没拍板），脚本不替你拿开发机的 venv 充数 —— "
-            "venv 里是绝对路径与本机的 CUDA 版本，换台机器就是 import 崩 / ABI 不符。\n"
-            "三条出路：\n"
-            "  ① --runtime-from <一份完整 CPython 3.11 + 依赖的目录>（推荐，离线可用）；\n"
-            "  ② --wheels-from <wheelhouse 目录>（目标机联网/有网时 pip 装）；\n"
-            "  ③ 不带运行时，让目标机自己按文档装（那就不是「扩展包」，只是一份源码包）。")
+          admin_port: int = 8901, stamp: str = "",
+          python_from: str = "") -> Tuple[str, str, Dict[str, object]]:
+    """组出扩展包 → ``(kit_dir, zip_path, info)``。
+
+    **默认出薄包**（用户 2026-09-30 拍板："默认 = 薄包 + 国内可下载"）：
+    源码 + 配置模板 + 安装脚本 + 源清单（`sources.json`）+ 可选解释器，
+    **几 GB 的 torch 不随包走** —— 目标机点「起本机后端」时由 `app/backend_fetch.py`
+    从国内镜像现装（SJTU 的 CUDA 索引 + 清华/阿里 PyPI；可达性 2026-09-30 实测过）。
+
+    给了 `--runtime-from` 就是**厚包**（离线场景：完整运行时随包走，出包时过 ABI 闸门）。
+    """
+    thin = not runtime_from
     stamp = stamp or time.strftime("%Y%m%d-%H%M")
     name = "%s-%s" % (PACKAGE_PREFIX, stamp)
     kit_dir = os.path.join(out_dir, name)
@@ -278,12 +285,16 @@ def stage(out_dir: str, *, variant: str = "", runtime_from: str = "",
             # 双保险：`abi_check()` 自己会抛，但**出包这条路绝不允许**带着未通过的校验往下走
             raise PackError("随包运行时的 ABI 校验没通过：%s" % (abi.get("error") or abi))
     os.makedirs(kit_dir, exist_ok=False)
-    info: Dict[str, object] = {"kit": kit_dir, "variant": variant, "files": 0}
+    info: Dict[str, object] = {"kit": kit_dir, "variant": variant, "files": 0, "thin": thin}
 
     files = _copy_source(kit_dir)
-    files += ["%s/%s" % (RUNTIME_DIR, rel) for rel in
-              _copy_tree(runtime_from, os.path.join(kit_dir, RUNTIME_DIR), "runtime")] \
-        if runtime_from else []
+    if runtime_from:
+        files += ["%s/%s" % (RUNTIME_DIR, rel) for rel in
+                  _copy_tree(runtime_from, os.path.join(kit_dir, RUNTIME_DIR), "runtime")]
+    elif python_from:
+        # 薄包也可以**只带解释器**（几十 MB、与卡无关）：torch 仍然按国内源现装。
+        files += ["%s/%s" % (RUNTIME_DIR, rel) for rel in
+                  _copy_tree(python_from, os.path.join(kit_dir, RUNTIME_DIR), "python")]
     files += ["%s/%s" % (WHEELS_DIR, rel) for rel in
               _copy_tree(wheels_from, os.path.join(kit_dir, WHEELS_DIR), "wheels")] \
         if wheels_from else []
@@ -302,24 +313,42 @@ def stage(out_dir: str, *, variant: str = "", runtime_from: str = "",
     with open(os.path.join(kit_dir, READ_ME), "w", encoding="utf-8") as fh:
         fh.write(render_readme(variant=variant, port=port, admin_port=admin_port,
                                runtime_from=runtime_from, wheels_from=wheels_from,
-                               with_models=bool(models_from)))
-    files += [YAML_TMPL, READ_ME,
+                               with_models=bool(models_from), thin=thin,
+                               has_python=bool(python_from or runtime_from)))
+    # 源清单（薄包的"另一半"）：目标机上 `app/backend_fetch.py` 按它装运行时；
+    # 写进包里也是给人看的 —— "这一档从哪下、下什么"不该只活在代码里。
+    sources = {
+        "mode": "thin" if thin else "thick",
+        "variant": variant,
+        "pipIndexes": ["https://pypi.tuna.tsinghua.edu.cn/simple",
+                       "https://mirrors.aliyun.com/pypi/simple/"],
+        "torchIndexTmpl": "https://mirror.sjtu.edu.cn/pytorch-wheels/%s/",
+        "torchIndex": "https://mirror.sjtu.edu.cn/pytorch-wheels/%s/" % (variant or "cu126"),
+        "note": ("薄包：几 GB 的 torch 不随包走；目标机点「起本机后端」时按这些源现装"
+                 "（`app/backend_fetch.py`）。源可达性 2026-09-30 实测。"),
+    }
+    with open(os.path.join(kit_dir, SOURCES), "w", encoding="utf-8") as fh:
+        json.dump(sources, fh, ensure_ascii=False, indent=2)
+    files += [YAML_TMPL, READ_ME, SOURCES,
               "%s/install-windows.ps1" % SCRIPTS_DIR, "%s/install-posix.sh" % SCRIPTS_DIR]
 
     manifest = {
         "package": "backend-portable",
+        "mode": "thin" if thin else "thick",
         "variant": variant,
         "stamp": stamp,
         "port": int(port),
         "adminPort": int(admin_port),
-        "hasRuntime": bool(runtime_from),
+        "hasRuntime": bool(runtime_from or python_from),
         "hasWheels": bool(wheels_from),
         "hasModels": bool(models_from),
         "abi": {"ok": bool(abi.get("ok")), "torch": abi.get("torch", ""),
                 "torchaudio": abi.get("torchaudio", "")},
         "files": sorted(files),
         "count": len(files),
-        "note": "扩展包（不走容器）：只绑回环 + 本机自配对；jwt_secret 由客户端在那台机器上生成。",
+        "note": ("扩展包（不走容器）：只绑回环 + 本机自配对；jwt_secret 由客户端在那台机器上生成。"
+                 + ("薄包：运行时按 `sources.json` 的国内源现装（`app/backend_fetch.py`）。"
+                    if thin else "厚包：运行时随包走，出包时已过 ABI 闸门。")),
     }
     with open(os.path.join(kit_dir, MANIFEST), "w", encoding="utf-8") as fh:
         json.dump(manifest, fh, ensure_ascii=False, indent=2)
@@ -370,7 +399,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="出 ECHO 扩展包（不走容器）")
     ap.add_argument("--out", default=os.path.join(ROOT, "dist"))
     ap.add_argument("--variant", default="", help="cu126 / cu118（写进 manifest 与说明）")
-    ap.add_argument("--runtime-from", default="", help="随包运行时目录（含 Scripts/python.exe 或 bin/python3）")
+    ap.add_argument("--runtime-from", default="", help="厚包：随包一份完整运行时（含 Scripts/python.exe 或 bin/python3）")
+    ap.add_argument("--python-from", default="", help="薄包可只带解释器（几十 MB、与卡无关）")
     ap.add_argument("--wheels-from", default="", help="离线 wheelhouse 目录（可选）")
     ap.add_argument("--models-from", default="", help="权重目录（可选；不给就不带）")
     ap.add_argument("--port", type=int, default=8900)
@@ -383,7 +413,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                                         wheels_from=args.wheels_from,
                                         models_from=args.models_from,
                                         port=args.port, admin_port=args.admin_port,
-                                        stamp=args.stamp)
+                                        stamp=args.stamp, python_from=args.python_from)
     except PackError as e:
         print("[x] %s" % e, file=sys.stderr)
         return 2
