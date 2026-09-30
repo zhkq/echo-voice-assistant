@@ -17,6 +17,7 @@
 """
 import importlib.util
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -425,6 +426,36 @@ class TheKitShowsTheCodeDirAsEchoCore(unittest.TestCase):
             with self.assertRaises(build_kit.BuildError):
                 build_kit.extract_main_package(bad, kit)
 
+    def test_the_extraction_never_renames_a_directory(self):
+        """**不许**再走"先解出来、再 rename 父目录"那条路（2026-09-30 实测两次 WinError 5）。
+
+        症状：`PermissionError: [WinError 5] 拒绝访问: ...\\ECHO -> ...\\echo-core` ——
+        刚写完几百个文件就改父目录的名字，会被杀毒/索引的句柄挡下，而且失败会留下半个 kit。
+        现在的实现是**按条目改前缀**（`ECHO/…` → `echo-core/…`），没有中间态。
+        """
+        src = (SCRIPTS / "build_kit.py").read_text(encoding="utf-8")
+        body = re.search(r"def extract_main_package.*?(?=\n\ndef )", src, re.S)
+        self.assertIsNotNone(body)
+        self.assertNotIn(".rename(", body.group(0),
+                         "又开始 rename 目录了 —— 那条路在 Windows 上会随机失败")
+        self.assertIn("shutil.copyfileobj", body.group(0))
+
+    def test_a_zip_already_wrapped_in_echo_core_is_accepted(self):
+        """以后主包自己就叫 `echo-core/` 也照样能组 kit（前缀改写对两个名字都成立）。"""
+        with tempfile.TemporaryDirectory(prefix="echocore-") as tmp:
+            root = Path(tmp)
+            main = root / "main.zip"
+            with zipfile.ZipFile(main, "w") as zf:
+                zf.writestr("echo-core/app/main.py", "# app\n")
+                zf.writestr("echo-core/manifest.json", "{}")
+                zf.writestr("BUILD-INFO.txt", "git: abc\n")
+            kit = root / "kit"
+            kit.mkdir()
+            code = build_kit.extract_main_package(main, kit)
+            self.assertEqual(code.name, "echo-core")
+            self.assertTrue((kit / "echo-core" / "app" / "main.py").is_file())
+            self.assertTrue((kit / "BUILD-INFO.txt").is_file())
+
     def test_an_old_kit_is_still_recognized(self):
         """`--check` 要能读**改名之前**出的 kit（dist 里就有）。"""
         with tempfile.TemporaryDirectory(prefix="echocore-") as tmp:
@@ -568,6 +599,117 @@ class AssembleKitCopiesTheLauncher(unittest.TestCase):
                 names = zf.namelist()
             self.assertIn(f"{kit_dir.name}/{build_kit.KIT_CMD}", names)
             self.assertIn(f"{kit_dir.name}/echo-core/app/main.py", names)
+
+
+class BundleRidesAlongInTheKit(unittest.TestCase):
+    """`--bundle-from`：把离线载荷打进 Windows kit。
+
+    同事那个包里**有没有 bundle\\** 决定"装的时候下不下载"（`装我.cmd` 就是按
+    `<kit>\\bundle\\wheels` 在不在决定加不加 `-Offline` 的）。所以这条接线的判据用
+    **离线包自己的** `verify_bundle()`（一处真相），这里钉"接进来"与"不该接的要拒绝"。
+    """
+
+    def _main_zip(self, tmp: Path) -> Path:
+        main = tmp / "ECHO-main-win-x64-3.0-test.zip"
+        with zipfile.ZipFile(main, "w") as zf:
+            zf.writestr("ECHO/app/main.py", "# app\n")
+            zf.writestr("ECHO/manifest.json", "{}")
+            zf.writestr("BUILD-INFO.txt", "git: abc1234\n")
+            zf.writestr("SHA256SUMS.txt", "")
+        return main
+
+    def _bundle(self, tmp: Path, *, with_models=True, with_runtime=True) -> Path:
+        b = tmp / "bundle-src"
+        (b / "wheels").mkdir(parents=True)
+        # 载荷清单：`build_offline_pack.py --bundle` 会写它，`verify_bundle()` 也认它
+        (b / "BUNDLE-INFO.txt").write_text("# bundle 清单\n", encoding="utf-8")
+        for name in ("fastapi-0.115.0-py3-none-any.whl", "uvicorn-0.30.0-py3-none-any.whl",
+                     "sherpa_onnx-1.13.8-cp311-cp311-win_amd64.whl",
+                     "modelscope-1.20.0-py3-none-any.whl", "soundfile-0.12.1-py3-none-any.whl",
+                     "pip-24.0-py3-none-any.whl", "setuptools-70.0.0-py3-none-any.whl",
+                     "wheel-0.43.0-py3-none-any.whl", "packaging-24.0-py3-none-any.whl"):
+            (b / "wheels" / name).write_text("w", encoding="utf-8")
+        if with_models:
+            m = b / "models" / "sherpa-onnx-streaming"
+            m.mkdir(parents=True)
+            for name in ("encoder.onnx", "decoder.onnx", "joiner.onnx", "tokens.txt"):
+                (m / name).write_text("x", encoding="utf-8")
+        if with_runtime:
+            (b / "runtime").mkdir(parents=True)
+            (b / "runtime" / "python-3.11.9-embed-amd64.zip").write_text("z", encoding="utf-8")
+            (b / "runtime" / "get-pip.py").write_text("z", encoding="utf-8")
+        return b
+
+    def test_the_bundle_lands_in_the_kit_root_and_in_the_zip(self):
+        with tempfile.TemporaryDirectory(prefix="echobundlekit-") as tmp:
+            root = Path(tmp)
+            dist = root / "dist"
+            dist.mkdir()
+            win = next(p for p in build_kit.PLATFORMS if p["key"] == "win")
+            kit_dir, zip_path = build_kit.assemble_kit(
+                win, self._main_zip(root), "20260930-9999", dist,
+                bundle_from=self._bundle(root))
+            self.assertTrue((kit_dir / "bundle" / "wheels" / "fastapi-0.115.0-py3-none-any.whl").is_file())
+            self.assertTrue((kit_dir / "bundle" / "models" / "sherpa-onnx-streaming"
+                             / "tokens.txt").is_file())
+            self.assertIn("bundle/", (kit_dir / "BUILD-INFO.txt").read_text(encoding="utf-8"))
+            with zipfile.ZipFile(zip_path) as zf:
+                names = zf.namelist()
+            self.assertIn(f"{kit_dir.name}/bundle/runtime/get-pip.py", names)
+
+    def test_a_bundle_without_wheels_is_refused(self):
+        with tempfile.TemporaryDirectory(prefix="echobundlekit-") as tmp:
+            root = Path(tmp)
+            empty = root / "bundle-src"
+            empty.mkdir()
+            dist = root / "dist"
+            dist.mkdir()
+            win = next(p for p in build_kit.PLATFORMS if p["key"] == "win")
+            with self.assertRaises(build_kit.BuildError) as ctx:
+                build_kit.assemble_kit(win, self._main_zip(root), "20260930-9999", dist,
+                                       bundle_from=empty)
+            self.assertIn("wheels", str(ctx.exception))
+
+    def test_the_kit_verify_reuses_the_bundle_contract(self):
+        """缺模型/缺 runtime 的 bundle 要在**组包后**就报出来（别等同事装到一半）。"""
+        with tempfile.TemporaryDirectory(prefix="echobundlekit-") as tmp:
+            root = Path(tmp)
+            dist = root / "dist"
+            dist.mkdir()
+            win = next(p for p in build_kit.PLATFORMS if p["key"] == "win")
+            kit_dir, _zip = build_kit.assemble_kit(
+                win, self._main_zip(root), "20260930-9999", dist,
+                bundle_from=self._bundle(root, with_models=False, with_runtime=False))
+            problems = build_kit.bundle_problems(kit_dir)
+            self.assertTrue(any("sherpa-onnx-streaming" in p for p in problems), problems)
+            self.assertTrue(any("get-pip.py" in p for p in problems), problems)
+
+    def test_a_good_bundle_has_no_problems(self):
+        with tempfile.TemporaryDirectory(prefix="echobundlekit-") as tmp:
+            root = Path(tmp)
+            dist = root / "dist"
+            dist.mkdir()
+            win = next(p for p in build_kit.PLATFORMS if p["key"] == "win")
+            kit_dir, _zip = build_kit.assemble_kit(
+                win, self._main_zip(root), "20260930-9999", dist,
+                bundle_from=self._bundle(root))
+            self.assertEqual(build_kit.bundle_problems(kit_dir), [])
+
+    def test_no_bundle_means_no_bundle_checks(self):
+        with tempfile.TemporaryDirectory(prefix="echobundlekit-") as tmp:
+            self.assertEqual(build_kit.bundle_problems(Path(tmp)), [])
+
+    def test_the_bundle_is_refused_for_macos(self):
+        """wheel 是 cp311 win_amd64 的 —— 塞进 mac 的 kit 是"看着有、装的时候全不匹配"。"""
+        with tempfile.TemporaryDirectory(prefix="echobundlekit-") as tmp:
+            root = Path(tmp)
+            dist = root / "dist"
+            dist.mkdir()
+            mac = next(p for p in build_kit.PLATFORMS if p["key"] == "macos")
+            with self.assertRaises(build_kit.BuildError) as ctx:
+                build_kit.do_build(dist, [mac], "20260930-9999", True, False,
+                                   bundle_from=self._bundle(root))
+            self.assertIn("Windows", str(ctx.exception))
 
 
 if __name__ == "__main__":

@@ -40,6 +40,10 @@ kit 长这样（同事视角）::
     python scripts/build_kit.py --stamp 20260922-2100
     python scripts/build_kit.py --no-verify
 
+    # 带离线载荷的 Windows kit（同事双击 装我.cmd → 装的时候不下载运行时/依赖/模型）：
+    python scripts/build_offline_pack.py --bundle --out dist/_bundle
+    python scripts/build_kit.py --platforms win --bundle-from dist/_bundle/ECHO-bundle-<stamp>/bundle
+
 退出码
 ------
     0  正常；或 --check 判定「一致」
@@ -52,7 +56,9 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -76,6 +82,8 @@ DIST = ROOT / "dist"
 DELIVERY = ROOT / "delivery"
 SKILL_DIR = ROOT / ".dsh" / "skills" / "echo-install"
 BUILD_PACKAGE = ROOT / "scripts" / "build-package.ps1"
+#: 离线载荷的**判据**长在它里面（`verify_bundle()`）—— 组 kit 时按同一份验，不抄第二份。
+BUILD_OFFLINE = ROOT / "scripts" / "build_offline_pack.py"
 
 #: kit 里给人的那份说明叫这个名字（中文名是刻意的：同事一眼知道先读它）
 KIT_README = "先读我.md"
@@ -399,6 +407,26 @@ def _preview(items: list[str], limit: int = 6) -> str:
     return shown + (f" …（共 {len(items)} 个）" if len(items) > limit else "")
 
 
+def bundle_problems(kit: Path) -> list[str]:
+    """kit 里带了 `bundle\\` 时，用**离线包自己的判据**再验一遍（一处真相）。
+
+    为什么复用 `build_offline_pack.verify_bundle()` 而不是在这儿再写一份：那份判据就是
+    `install-all.ps1 -Offline` 的三个消费点（wheels 目录在不在、模型三件套齐不齐、
+    `runtime\\python-3.11.9-embed-amd64.zip` + `get-pip.py` 在不在）。抄一份 = 两处真相。
+    """
+    if not (kit / "bundle").is_dir():
+        return []
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "echo_build_offline_for_verify", BUILD_OFFLINE)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        return ["bundle\\" + p for p in module.verify_bundle(str(kit / "bundle"))]
+    except Exception as exc:                                       # pragma: no cover - 兜底
+        return [f"bundle\\ 验不了：{exc}"]
+
+
 def verify_kit(kit: Path, plat: dict) -> list[str]:
     """出完包后的自检：结构 + 内容。返回问题列表（空 = 通过）。"""
     problems = []
@@ -415,6 +443,7 @@ def verify_kit(kit: Path, plat: dict) -> list[str]:
         problems.append("kit 根目录没有 SHA256SUMS.txt")
     problems += compare_skill(kit)
     problems += compare_manifest(kit)
+    problems += bundle_problems(kit)
     verify_dirs = [p for p in code.iterdir() if p.is_dir()] if code.is_dir() else []
     if not verify_dirs:
         problems.append(f"{code.name}/ 是空的")
@@ -472,17 +501,33 @@ def _dos_time(path: Path) -> tuple[int, int, int, int, int, int]:
 
 
 def extract_main_package(main_zip: Path, kit_dir: Path) -> Path:
-    """解主包进 kit，并把代码目录改名成 `echo-core`（老的 `ECHO` 也认）→ 返回代码目录。
+    """解主包进 kit，并把代码目录改名成 `echo-core`（新的已经叫这个就直接用）→ 返回代码目录。
 
-    主包 zip 的顶层是 `ECHO/`（`build-package.ps1` 定的，`install.ps1` 按它认包）——
-    这一层改名是**组 kit 时**做的：kit 是给人看的资料夹，里面那份代码目录与安装根
-    里的 `echo-core` 同名，"它去哪"就一眼可见，也不需要谁去手工改名。
+    实现上**不做"先解出来、再 rename 父目录"**：Windows 上刚写完几百个文件就 rename 目录
+    会被杀毒/索引的句柄挡下 —— 实测两次 `PermissionError: [WinError 5] 拒绝访问`
+    （`ECHO` → `echo-core`），一次是 mac kit。组包不该赌这个，而且 rename 失败会留下半个 kit。
+    改成**按条目改写前缀**（`ECHO/…` → `echo-core/…`）：一次到位，没有中间态。
     """
     with zipfile.ZipFile(main_zip) as zf:
-        zf.extractall(kit_dir)
-    src, dst = kit_dir / LEGACY_CODE_DIR_NAME, kit_dir / CODE_DIR_NAME
-    if src.is_dir() and not dst.exists():
-        src.rename(dst)
+        for info in zf.infolist():
+            name = info.filename.replace("\\", "/")
+            parts = [p for p in name.split("/") if p not in ("", ".")]
+            if not parts:
+                continue
+            if parts[0] == LEGACY_CODE_DIR_NAME:
+                parts[0] = CODE_DIR_NAME
+            target = kit_dir.joinpath(*parts)
+            if info.is_dir() or name.endswith("/"):
+                target.mkdir(parents=True, exist_ok=True)
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with zf.open(info) as src, open(target, "wb") as fh:
+                shutil.copyfileobj(src, fh)
+            try:                       # 保住包内时间戳（zip 里带了；以后对账时有用）
+                stamp = time.mktime(tuple(info.date_time) + (0, 0, -1))
+                os.utime(target, (stamp, stamp))
+            except (OSError, OverflowError, ValueError):
+                pass
     code = code_dir(kit_dir)
     if not (code / "app" / "main.py").is_file():
         raise BuildError(f"主包里没有 <代码目录>/app/main.py：{main_zip.name}")
@@ -502,7 +547,8 @@ def copy_kit_cmd(src: Path, dst: Path) -> None:
     dst.write_bytes(body.encode("ascii"))
 
 
-def assemble_kit(plat: dict, main_zip: Path, stamp: str, dist: Path) -> tuple[Path, Path]:
+def assemble_kit(plat: dict, main_zip: Path, stamp: str, dist: Path,
+                 bundle_from: Path | None = None) -> tuple[Path, Path]:
     kit_dir = dist / f"{plat['kit_prefix']}-{stamp}"
     if kit_dir.exists():
         shutil.rmtree(kit_dir)
@@ -515,6 +561,15 @@ def assemble_kit(plat: dict, main_zip: Path, stamp: str, dist: Path) -> tuple[Pa
         shutil.rmtree(skill_dst)
     shutil.copytree(SKILL_DIR, skill_dst,
                     ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+
+    # 离线载荷（可选）：`build_offline_pack.py --bundle` 出的那份 bundle 目录
+    # （wheels + models + runtime 兜底）。带上它，同事双击 装我.cmd 时 install-all.ps1
+    # 会发现 `<kit>\bundle` 并自动走 -Offline —— **装的时候不下载运行时/依赖/模型**。
+    if bundle_from is not None:
+        if not (bundle_from / "wheels").is_dir():
+            raise BuildError(f"--bundle-from 里没有 wheels\\：{bundle_from}"
+                             "（那是 build_offline_pack.py --bundle 的产出）")
+        shutil.copytree(bundle_from, kit_dir / "bundle")
 
     readme = DELIVERY / plat["readme"]
     if not readme.is_file():
@@ -582,8 +637,16 @@ def do_check(dist: Path, plats: list[dict]) -> int:
 
 
 def do_build(dist: Path, plats: list[dict], stamp: str, kits_only: bool,
-             verify: bool) -> int:
+             verify: bool, bundle_from: Path | None = None) -> int:
     dist.mkdir(parents=True, exist_ok=True)
+    if bundle_from is not None:
+        # bundle 里的 wheel 是 **cp311 win_amd64** 的（目标机的 python.org 嵌入包就是它）——
+        # 塞进 mac 的 kit 会"看着有、装的时候全不匹配"。宁可不做，也别出一个骗人的包。
+        for plat in plats:
+            if plat["key"] != "win":
+                raise BuildError("--bundle-from 只给 Windows 的 kit 用（wheel 是 cp311 win_amd64；"
+                                 "mac 的依赖必须在那台机器上现装）。")
+        bundle_from = Path(bundle_from).resolve()
     if kits_only:
         mains: dict[str, Path] = {}
         for plat in plats:
@@ -598,7 +661,8 @@ def do_build(dist: Path, plats: list[dict], stamp: str, kits_only: bool,
     print(f"\n  stamp={stamp}  git={git_short()}{' (dirty)' if git_dirty() else ''}")
     results = []
     for plat in plats:
-        kit_dir, zip_path = assemble_kit(plat, mains[plat["key"]], stamp, dist)
+        kit_dir, zip_path = assemble_kit(plat, mains[plat["key"]], stamp, dist,
+                                         bundle_from=bundle_from)
         size_mb = zip_path.stat().st_size / (1 << 20)
         print(f"  [kit  ] {zip_path.name}  ({size_mb:.2f} MB)")
         results.append((plat, kit_dir, zip_path))
@@ -649,6 +713,9 @@ def main(argv: list[str] | None = None) -> int:
                     help="覆盖时间戳（默认 now，形如 20260922-2100）")
     ap.add_argument("--no-verify", action="store_true", help="跳过出包后的自检")
     ap.add_argument("--dist", default="", help="输出目录（默认 <repo>/dist）")
+    ap.add_argument("--bundle-from", default="", metavar="DIR",
+                    help="把这份离线载荷（build_offline_pack.py --bundle 的产出里的 bundle\\）"
+                         "打进 Windows kit —— 同事双击 装我.cmd 时自动走 -Offline")
     ap.add_argument("--deploy-kit", default="", metavar="PLATFORM",
                     help="只打印该平台最新 kit 的 zip 路径（不写盘；deploy-stable.ps1 用）")
     args = ap.parse_args(argv)
@@ -681,7 +748,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"=== build-kit (platforms={','.join(p['key'] for p in plats)}, "
           f"kitsOnly={args.kits_only}) ===")
     try:
-        return do_build(dist, plats, stamp, args.kits_only, not args.no_verify)
+        return do_build(dist, plats, stamp, args.kits_only, not args.no_verify,
+                        bundle_from=(Path(args.bundle_from) if args.bundle_from else None))
     except BuildError as exc:
         print(f"\n[fail] {exc}")
         return EXIT_ERROR
