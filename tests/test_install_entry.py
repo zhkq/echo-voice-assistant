@@ -28,6 +28,7 @@ import unittest
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 INSTALL_PS1 = os.path.join(ROOT, "scripts", "install.ps1")
 INSTALL_BAT = os.path.join(ROOT, "scripts", "install.bat")
+INSTALL_ALL = os.path.join(ROOT, "scripts", "install-all.ps1")
 SKILL_MD = os.path.join(ROOT, ".dsh", "skills", "echo-install", "SKILL.md")
 SH = os.path.join(ROOT, ".dsh", "skills", "echo-install", "scripts",
                   "echo-install-components.sh")
@@ -653,6 +654,69 @@ class HarnessTreeSmokeTest(unittest.TestCase):
         for path, tag in ((HarnessLocalInstallTests.PS1_HELPER, "ps1"),
                           (HarnessLocalInstallTests.SH_HELPER, "sh")):
             self.assertIn("装残", _read(path), "%s 助手没说清残树要重装" % tag)
+
+
+class OfflineBundleStaysOfflineTests(unittest.TestCase):
+    """`bundle\\` 那条路（`install-all.ps1 -Offline`）：**装的时候一个字节都不下载**。
+
+    用户 2026-09-30 的目标：同事拿到一个包 → 双击 → 只问安装位置 → 装完给面板地址，
+    而**装的时候不下载 Python 运行时 / 依赖 / 模型**（DSH 标准版是例外，它按许可走联网 npm）。
+
+    这一组钉的就是那三个"不下载"分别靠什么成立 —— 它们**全都是既有行为**，所以这里
+    只有验证、没有改动（第 677-683 行把 PIP_NO_INDEX/PIP_FIND_LINKS 钉进环境；
+    `Install-Model` 先看 `/api/models` 的 `ready`；离线时包里没有模型的引擎会被摘掉）：
+
+      1. 依赖：pip 的环境变量被钉死 → 引擎依赖也走本地 wheelhouse（不联网）；
+      2. 模型：**已经在**的模型（离线包里复制过去的那份）走"已装好，跳过"，不会再去下载；
+      3. 包里没有模型的引擎：**摘掉并说清**，不是硬失败（否则一个可选模型就能让整场安装失败）。
+    """
+
+    def setUp(self):
+        self.all_text = _read(INSTALL_ALL)
+        self.comp_text = _read(PS1_COMPONENTS)
+
+    def test_install_all_pins_pip_to_the_local_wheelhouse(self):
+        self.assertIn("$env:PIP_NO_INDEX = '1'", self.all_text)
+        self.assertIn("$env:PIP_FIND_LINKS = (Join-Path $script:Bundle 'wheels')", self.all_text)
+
+    def test_the_component_script_checks_ready_before_asking_for_a_download(self):
+        """`Install-Model` 必须**先看 `/api/models` 的 ready**，再谈下载。
+
+        这是"离线时模型已存在就不再联网下载"的唯一判据：模型是离线包里复制到
+        `<安装根>\\models\\` 的，ECHO 那份状态本来就是 ready —— 只要这里先看 ready，
+        整条离线安装就不会碰网络。
+        """
+        body = re.search(r"function Install-Model.*?\n\}", self.comp_text, re.S)
+        self.assertIsNotNone(body, "找不到 Install-Model（组件脚本改结构了？）")
+        text = body.group(0)
+        self.assertIn("$st.ready -eq $true", text)
+        self.assertIn("跳过", text)
+        self.assertLess(text.index("$st.ready -eq $true"), text.index("/api/models/download"),
+                        "先问下载、后看 ready —— 离线时会白下一次模型")
+
+    def test_an_engine_whose_model_is_missing_is_dropped_not_fatal(self):
+        """离线包里没有模型的引擎 → 摘掉 + 一句人话；**不许 exit 1**。"""
+        body = re.search(r"\$rcPy = Build-OfflineRuntime(.*?)\n\}", self.all_text, re.S)
+        self.assertIsNotNone(body, "找不到 install-all.ps1 的离线载荷那一段")
+        text = body.group(1)
+        self.assertIn("离线包里没有", text)
+        self.assertIn("$kept", text)
+        self.assertNotIn("exit 1", text)
+
+    def test_the_wakeword_model_is_optional_in_the_bundle(self):
+        """没有 `bundle\\models\\wakeword` 时唤醒词自动跳过（而不是失败）。"""
+        self.assertIn("$wantWake = $false", self.all_text)
+        self.assertIn("models\\wakeword", self.all_text)
+
+    def test_explicit_agent_harness_still_wins_over_the_offline_default(self):
+        """离线默认 `-Agent none`，但**显式给 harness 时要照做**。
+
+        为什么这条要紧：同事那个双击的 .bat 会同时传 `-Offline -Agent harness` ——
+        载荷不下载（wheels/模型/运行时全在包里），而 DSH 标准版仍按许可走联网 npm。
+        如果哪天"离线就强制 none"被写死，双击装出来的机器就没有智能体。
+        """
+        self.assertIn("if (-not $Agent) { $Agent = if ($Offline) { 'none' } else { 'harness' } }",
+                      self.all_text)
 
 
 if __name__ == "__main__":
