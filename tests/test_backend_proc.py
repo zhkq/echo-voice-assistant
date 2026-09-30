@@ -23,6 +23,8 @@ import time
 import unittest
 
 from app import backend_pid, backend_proc
+from app import db
+from app.config import settings
 
 _TMP_DIR = tempfile.mkdtemp(prefix="echo-backend-proc-test-")
 _TMP_BACKEND = tempfile.mkdtemp(prefix="echo-backend-root-test-")
@@ -30,6 +32,10 @@ _OLD_LOGS_DIR = backend_pid._logs_dir
 _OLD_BACKEND_ROOT = backend_proc.backend_root
 #: 打桩**之前**的真实 pid 路径：只用来比对"有没有被动过"
 _REAL_PID_PATH = backend_pid.pid_path()
+#: 同样是打桩之前的**真实库**路径与状态（只读比对，绝不写）
+_REAL_DB_PATH = os.path.join(db.DATA_DIR, db.DB_FILE) if not os.path.isabs(db.DB_FILE) \
+    else db.DB_FILE
+_OLD_DB = None
 
 
 def _real_pid_bytes():
@@ -40,14 +46,43 @@ def _real_pid_bytes():
         return None
 
 
+def _real_db_stat():
+    """真实库的 (大小, mtime_ns)；不存在 -> None。**只 stat，不读不写**。"""
+    try:
+        st = os.stat(_REAL_DB_PATH)
+        return (st.st_size, st.st_mtime_ns)
+    except Exception:
+        return None
+
+
 def setUpModule():
+    """隔离三样：pid/日志**文件**、后端目录、以及**数据库**。
+
+    ⚠️ 第三样是 2026-09-30 补的，补之前这里有个真事故：`backend_proc.stop()` 成功时会
+    写一条日志（`db.add_log("info", "backend", "已停止 ECHO 起的后端…")`），而本文件原来
+    只把 pid / 日志**文件**的路径指到临时目录 —— 于是每跑一次用例就往**真实的
+    `data/echo.db`** 里插一行"已停止 ECHO 起的后端（用例）pid=…"（实测累计 55 行，
+    而那 55 行说的都是**这台机器上从未发生过的停后端动作**）。
+    这与 `AGENTS.md` 记的 harness 事故是同一类：**测试不许碰真实状态**；
+    护栏用例 `IsolationTests::test_the_real_database_is_not_written` 现在钉住这一点。
+    """
+    global _OLD_DB
     backend_pid._logs_dir = lambda: _TMP_DIR
     backend_proc.backend_root = lambda: _TMP_BACKEND
+    _OLD_DB = (db.DATA_DIR, db.DB_FILE)
+    db.DATA_DIR = _TMP_DIR
+    db.DB_FILE = os.path.join(_TMP_DIR, "backend-proc.db")
+    settings._cache = None            # 缓存里可能还留着真实库的值
+    db.init()
 
 
 def tearDownModule():
+    global _OLD_DB
     backend_pid._logs_dir = _OLD_LOGS_DIR
     backend_proc.backend_root = _OLD_BACKEND_ROOT
+    if _OLD_DB:
+        db.DATA_DIR, db.DB_FILE = _OLD_DB
+    settings._cache = None
     shutil.rmtree(_TMP_DIR, ignore_errors=True)
     shutil.rmtree(_TMP_BACKEND, ignore_errors=True)
 
@@ -95,6 +130,33 @@ class IsolationTests(unittest.TestCase):
         backend_proc.stop(reason="护栏用例", ports=())
         backend_proc.port_check(())          # 空端口表：只是走一遍，绝不碰真端口
         self.assertEqual(_real_pid_bytes(), before)
+
+    def test_the_real_database_is_not_written(self):
+        """**库也要隔离**（2026-09-30 补的护栏）：`stop()` 成功时会写一条日志。
+
+        补这条之前，本文件每跑一次就往真实 `data/echo.db` 里插一行
+        "已停止 ECHO 起的后端（用例）pid=…"（累计 55 行）。这条用例同时钉两件事：
+          * 日志**真的写了**（写进被隔离的那个库）—— 不能靠"把日志关掉"来通过；
+          * 真实库的 (大小, mtime) 一个字节没变。
+        """
+        before = _real_db_stat()
+        proc = _sleep_proc()
+        self.addCleanup(_kill, proc)
+        self.assertTrue(backend_pid.write_pid(proc.pid))
+        ok, detail = backend_proc.stop(reason="护栏用例", ports=())
+        self.assertTrue(ok, detail)
+        # ① 日志写进了**被隔离**的库（证明这条路径确实会写库，而不是被静音了）
+        import sqlite3
+        conn = sqlite3.connect(db.DB_FILE)
+        try:
+            count = conn.execute("select count(*) from logs where source='backend'"
+                                 ).fetchone()[0]
+        finally:
+            conn.close()
+        self.assertGreater(count, 0, "隔离库里应该有那条日志（否则这条护栏没有意义）")
+        # ② 真实库没被动
+        self.assertEqual(_real_db_stat(), before,
+                         "用例写进真实 data/echo.db 了（%s）" % _REAL_DB_PATH)
 
 
 class StopOnlyKillsWhatEchoStartedTests(unittest.TestCase):
