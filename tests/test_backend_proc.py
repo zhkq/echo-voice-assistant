@@ -21,6 +21,7 @@ import sys
 import tempfile
 import time
 import unittest
+import unittest.mock as mock
 
 from app import backend_pid, backend_proc
 from app import db
@@ -157,6 +158,43 @@ class IsolationTests(unittest.TestCase):
         # ② 真实库没被动
         self.assertEqual(_real_db_stat(), before,
                          "用例写进真实 data/echo.db 了（%s）" % _REAL_DB_PATH)
+
+
+class InterpreterLayoutTests(unittest.TestCase):
+    """`python_exe()` 要认**三种**解释器布局（2026-09-30 补第一种）。
+
+    薄包"只带解释器"那一档塞进来的就是**独立 CPython**（uv 托管的那份 / 官方 embeddable 包）——
+    它把 `python.exe` 直接放在 `runtime/` 根下。补之前只认 venv 的 `Scripts/python.exe`，
+    于是"薄包明明带了 Python，面板却说没有解释器"（这是写完薄包才发现的口子）。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="echo-pyexe-test-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        p = mock.patch.object(backend_proc, "backend_root", lambda: self.tmp)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _touch(self, rel):
+        full = os.path.join(self.tmp, rel)
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        open(full, "w", encoding="utf-8").close()
+        return full
+
+    def test_it_accepts_the_standalone_cpython_layout(self):
+        exe = self._touch(os.path.join("runtime", "python.exe"))
+        self.assertEqual(backend_proc.python_exe(), exe)
+
+    def test_it_accepts_the_venv_layouts(self):
+        exe = self._touch(os.path.join("runtime", "Scripts", "python.exe"))
+        self.assertEqual(backend_proc.python_exe(), exe)
+        os.remove(exe)
+        exe = self._touch(os.path.join("runtime", "bin", "python3"))
+        self.assertEqual(backend_proc.python_exe(), exe)
+
+    def test_an_empty_runtime_is_not_an_interpreter(self):
+        os.makedirs(os.path.join(self.tmp, "runtime"), exist_ok=True)
+        self.assertEqual(backend_proc.python_exe(), "")
 
 
 class StopOnlyKillsWhatEchoStartedTests(unittest.TestCase):

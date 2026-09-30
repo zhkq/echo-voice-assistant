@@ -40,6 +40,17 @@ from app import backend_pid, platform, paths
 #: 本机后端的标准端口（能力面 / 管理面）。服务端出厂值见 ``server/settings.py``。
 DEFAULT_PORT = 8900
 DEFAULT_ADMIN_PORT = 8901
+
+#: **解释器在 `runtime/` 下的可能落点**（唯一判据：`python_exe()` 与出包侧的
+#: `abi_check()` / `verify()` 都用这一份 —— 2026-09-30 就是因为只写了 venv 那两种，
+#: 薄包"只带独立 CPython"时被误判成"没有解释器"）。
+PYTHON_RELS: Tuple[str, ...] = (
+    os.path.join("runtime", "python.exe"),             # 独立 CPython（uv 托管 / embeddable）
+    os.path.join("runtime", "Scripts", "python.exe"),  # Windows venv
+    os.path.join("runtime", "bin", "python3"),         # POSIX venv / 独立 CPython
+    os.path.join("runtime", "bin", "python"),
+    os.path.join("runtime", "python"),
+)
 #: 停了之后等它真的退出（杀树是异步的）与再确认一次的上限（秒）。
 STOP_TIMEOUT = 8.0
 #: 每次确认之间的间隔（秒）。
@@ -70,9 +81,14 @@ def python_exe() -> str:
     "起得来、每个 ``/v1/asr`` 都 503"，而那要到真跑一场会议才现形。
     """
     root = backend_root()
-    for rel in (os.path.join("runtime", "Scripts", "python.exe"),
-                os.path.join("runtime", "bin", "python3"),
-                os.path.join("runtime", "bin", "python")):
+    # 认三种布局（2026-09-30 补第一种）：
+    #   * `runtime/python.exe` / `runtime/python` —— **独立 CPython** 的布局（uv 托管的那份与
+    #     官方 embeddable 包都把解释器直接放在根目录）。薄包"只带解释器"那一档正是这种；
+    #     补之前认不出来 —— 表现是"薄包明明带了 Python，面板却说没有解释器"。
+    #   * `runtime/Scripts/python.exe` —— Windows venv 的布局（`uv venv` / `python -m venv`）。
+    #   * `runtime/bin/python3` / `bin/python` —— POSIX venv / 独立 CPython 的布局。
+    # 这份清单是**唯一判据**：出包侧的 `abi_check()` / `verify()` 也用它（别在两处各写一遍）。
+    for rel in PYTHON_RELS:
         cand = os.path.join(root, rel)
         if os.path.isfile(cand):
             return cand

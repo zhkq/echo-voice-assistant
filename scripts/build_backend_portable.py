@@ -237,19 +237,30 @@ def _copy_tree(src: str, dst: str, what: str) -> List[str]:
     return out
 
 
+def find_interpreter(root: str) -> str:
+    """在 `root` 下找解释器（**判据只有一份**：`app/backend_proc.PYTHON_RELS`）。
+
+    出包侧原来自己写了一份"只看 venv 那两种布局"的清单 —— 于是薄包带**独立 CPython**
+    （`runtime/python.exe`，uv 托管/embeddable 的布局）时，出包自检会说"没有解释器"，
+    而实际运行时找得到。判据收到一处，两边就不会再各说一套。
+    """
+    from app import backend_proc
+    for rel in backend_proc.PYTHON_RELS:
+        # PYTHON_RELS 里带 `runtime/` 前缀（客户端那边的口径），这里是包内的相对根
+        cand = os.path.join(root, rel[len("runtime") + 1:])
+        if os.path.isfile(cand):
+            return cand
+    return ""
+
+
 def abi_check(runtime_from: str) -> Dict[str, object]:
     """出包时的 ABI 闸门（判据与 `server/Dockerfile` 构建期同一条）。"""
-    from app import backend_env
-    exe = ""
-    for rel in (os.path.join("Scripts", "python.exe"), os.path.join("bin", "python3"),
-                os.path.join("bin", "python")):
-        cand = os.path.join(runtime_from, rel)
-        if os.path.isfile(cand):
-            exe = cand
-            break
+    from app import backend_env, backend_proc
+    exe = find_interpreter(runtime_from)
     if not exe:
-        raise PackError("runtime-from 里没找到解释器（找过 Scripts/python.exe 与 bin/python3）：%s"
-                        % runtime_from)
+        raise PackError("runtime-from 里没找到解释器（找过 %s）：%s"
+                        % ("、".join(os.path.basename(p) for p in backend_proc.PYTHON_RELS),
+                           runtime_from))
     got = backend_env.check_torch_abi(exe)
     if not got.get("ok"):
         raise PackError("随包运行时的 torch/torchaudio ABI 不符：%s\n"
@@ -381,17 +392,12 @@ def verify(kit_dir: str) -> List[str]:
     except Exception as e:
         return problems + ["manifest.json 读不出来：%s" % e]
     if manifest.get("hasRuntime"):
-        exe = ""
-        for rel in (os.path.join("Scripts", "python.exe"), os.path.join("bin", "python3"),
-                    os.path.join("bin", "python")):
-            cand = os.path.join(kit_dir, RUNTIME_DIR, rel)
-            if os.path.isfile(cand):
-                exe = cand
-                break
+        exe = find_interpreter(os.path.join(kit_dir, RUNTIME_DIR))
         if not exe:
             problems.append("manifest 说有运行时，但 runtime/ 里没有解释器")
-        elif not manifest.get("abi", {}).get("ok"):
-            problems.append("manifest 里 abi.ok 不是真 —— 出包时没跑 ABI 校验？")
+        elif manifest.get("mode") == "thick" and not manifest.get("abi", {}).get("ok"):
+            # 厚包才要求 abi.ok（薄包只带解释器，torch 是目标机现装的，出包时无从校验）
+            problems.append("厚包的 manifest 里 abi.ok 不是真 —— 出包时没跑 ABI 校验？")
     return problems
 
 
