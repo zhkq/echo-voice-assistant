@@ -217,22 +217,62 @@ class ProbeTests(unittest.TestCase):
         self.assertEqual(info["runtimes"], ["nvidia", "runc"])
 
     def test_the_runtime_abi_check_compares_cuda_tags_not_versions(self):
-        """判据是**CUDA 源标签一致**（都带 `+cu126`），不是版本号相等（AGENTS.md 记过）。"""
+        """**两个 CUDA 版**之间：标签必须一致（cu13x 的 torchaudio 配 cu126 的 torch 会崩）。
+
+        注意这里桩的是 `ok=True`（import 通过了）—— 因为"标签不一致"现在只有在 import
+        过得去的时候才谈得上比较；import 就崩的那种另有一条用例钉。
+        """
         fake_python = os.path.join(self.tmp, "fake-python")
         with open(fake_python, "w", encoding="utf-8") as fh:
             fh.write("#!/bin/sh\n")             # 只要"这个文件在"（ABI 校验前的存在性检查）
 
         def _fake_run(argv, timeout=8.0):
-            return {"ok": False, "code": 3, "stdout": "2.14.0+cu126\n2.11.0+cpu\n",
+            return {"ok": True, "code": 0, "stdout": "2.14.0+cu126\n2.11.0+cu13x\n",
                     "stderr": "", "error": ""}
 
-        with mock.patch.object(backend_env.backend_proc, "python_exe",
-                               lambda: fake_python), \
-                mock.patch.object(backend_env, "_run", _fake_run):
-            info = backend_env.runtime()
-        self.assertIs(info["abiOk"], False)
-        self.assertIn("不是同一个 CUDA 源", info["error"])
-        self.assertIn("torch 2.14.0+cu126", info["error"])
+        with mock.patch.object(backend_env, "_run", _fake_run):
+            got = backend_env.check_torch_abi(fake_python)
+        self.assertFalse(got["ok"])
+        self.assertIn("不是同一个 CUDA 源", got["error"])
+        self.assertIn("torch 2.14.0+cu126", got["error"])
+
+    def test_a_cpu_torchaudio_is_accepted_with_a_note(self):
+        """**纯 CPU 版 torchaudio 不算错**（2026-09-30 真机证据）。
+
+        dev 这台机器就是 `torch 2.10.0+cu128` + `torchaudio 2.10.0+cpu`，而它
+        **qwen3asr 与 SenseVoice 都加载成功、真转写也成功** —— 第一条判据"标签必须一致"
+        把一个能用的环境挡住了（假阳性）。现在只要求 import 通过，并把"它是 CPU 版"记成 note。
+        """
+        fake_python = os.path.join(self.tmp, "fake-python")
+        with open(fake_python, "w", encoding="utf-8") as fh:
+            fh.write("#!/bin/sh\n")
+
+        def _fake_run(argv, timeout=8.0):
+            return {"ok": True, "code": 0, "stdout": "2.10.0+cu128\n2.10.0+cpu\n",
+                    "stderr": "", "error": ""}
+
+        with mock.patch.object(backend_env, "_run", _fake_run):
+            got = backend_env.check_torch_abi(fake_python)
+        self.assertTrue(got["ok"], got)
+        self.assertIn("CPU 版", got["note"])
+
+    def test_an_import_crash_is_still_a_hard_failure(self):
+        """AGENTS.md 记的那个坑（cu13x torchaudio 要 `libcudart.so.13`）表现就是 **import 崩** ——
+        这一条必须仍然是硬失败，否则那道闸门等于没了。"""
+        fake_python = os.path.join(self.tmp, "fake-python")
+        with open(fake_python, "w", encoding="utf-8") as fh:
+            fh.write("#!/bin/sh\n")
+
+        def _fake_run(argv, timeout=8.0):
+            return {"ok": False, "code": 1, "stdout": "",
+                    "stderr": "OSError: Could not load this library: "
+                              ".../torchaudio/lib/_torchaudio.abi3.so",
+                    "error": ""}
+
+        with mock.patch.object(backend_env, "_run", _fake_run):
+            got = backend_env.check_torch_abi(fake_python)
+        self.assertFalse(got["ok"])
+        self.assertIn("_torchaudio.abi3.so", got["error"])
 
     def test_the_abi_check_rejects_a_missing_interpreter(self):
         got = backend_env.check_torch_abi(os.path.join(self.tmp, "nope"))
@@ -245,15 +285,34 @@ class ProbeTests(unittest.TestCase):
         self.assertFalse(info["ready"])
         self.assertIn("还没装运行时", info["error"])
 
-    def test_weights_list_what_is_missing_in_the_client_model_library(self):
+    def test_weights_list_what_is_missing(self):
         with tempfile.TemporaryDirectory() as tmp:
             os.makedirs(os.path.join(tmp, "sensevoice"))
             open(os.path.join(tmp, "sensevoice", "model.bin"), "wb").close()
-            with mock.patch.object(backend_env.paths, "models_root", lambda: tmp):
+            with mock.patch.object(backend_env.paths, "models_root", lambda: tmp), \
+                    mock.patch.dict(os.environ, {"MODELSCOPE_CACHE":
+                                                 os.path.join(tmp, "no-such-cache")}):
                 got = backend_env.weights("cu126")
         self.assertIn("sensevoice", got["present"])
-        self.assertIn("hub/models--Qwen--Qwen3-ASR-0.6B", got["missing"])
+        self.assertIn("qwen3asr", got["missing"])
         self.assertFalse(got["ready"])
+
+    def test_weights_also_look_in_the_modelscope_cache(self):
+        """**误报的修正**（2026-09-30 真机打脸）：只查客户端模型库会报"缺"，而它就在
+        ModelScope 缓存里（服务端日志证明加载成功）。两处都查，并说清在哪找到的。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = os.path.join(tmp, "modelscope")
+            os.makedirs(os.path.join(cache, "models", "Qwen--Qwen3-ASR-0.6B", "snapshots"))
+            open(os.path.join(cache, "models", "Qwen--Qwen3-ASR-0.6B", "snapshots", "m.bin"),
+                 "wb").close()
+            with mock.patch.object(backend_env.paths, "models_root",
+                                   lambda: os.path.join(tmp, "empty-models")), \
+                    mock.patch.dict(os.environ, {"MODELSCOPE_CACHE": cache}):
+                got = backend_env.weights("cu126")
+        self.assertIn("qwen3asr", got["present"], got)
+        self.assertIn("Qwen--Qwen3-ASR-0.6B", got["foundAt"]["qwen3asr"])
+        self.assertIn("ModelScope", got["foundAt"]["qwen3asr"])
+        self.assertTrue([r for r in got["roots"] if "ModelScope" in r["label"]], got["roots"])
 
     def test_probe_is_cached_and_force_refreshes(self):
         fake = {"vendor": "nvidia", "name": "x", "vramMb": 1, "driver": "", "source": "",

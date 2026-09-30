@@ -52,14 +52,23 @@ VRAM_MIN_MB = 8 * 1024
 #: 分离档对算力的要求：pyannote 4.x 要 torch>=2.8，而 cu118 上带 Pascal 的最后一版是 2.7.1。
 MIN_COMPUTE_CAP_FOR_DIARIZE = 7.5
 
-#: 每个变体要哪几棵权重子树（与 `scripts/build_backend_kit.py::VARIANTS["models"]` 同一份口径：
-#: 名字就是容器/服务端找的那个路径）。
-VARIANT_MODELS: Dict[str, Tuple[str, ...]] = {
-    "cu126": ("hub/models--Qwen--Qwen3-ASR-0.6B",
-              "hub/models--Qwen--Qwen3-ForcedAligner-0.6B",
-              "sensevoice",
-              "pyannote"),
-    "cu118": ("sensevoice",),
+#: 每个变体要哪几棵权重子树：`(标签, 候选相对路径…)`。
+#:
+#: **每一棵给一串候选**，因为服务端会去**两处**找，而两处的命名不一样：
+#:   * 客户端模型库（`paths.models_root()`）：HF 风格 `hub/models--Owner--Name`；
+#:   * ModelScope 缓存（`MODELSCOPE_CACHE` 或 `~/.cache/modelscope`）：`models/Owner--Name`。
+#:
+#: 2026-09-30 真机实测的教训：只看客户端模型库时，面板会**误报"缺权重"** ——
+#: 而那份权重明明就在 ModelScope 缓存里（`Qwen--Qwen3-ASR-0.6B`，1.79 GB；服务端日志写着
+#: `Qwen3ASR model loaded from C:\Users\…\.cache\modelscope\models\…`）。
+#: 误报比不说更贵：用户会去下一个**已经有的**东西。
+VARIANT_MODELS: Dict[str, Tuple[Tuple[str, Tuple[str, ...]], ...]] = {
+    "cu126": (("qwen3asr", ("hub/models--Qwen--Qwen3-ASR-0.6B", "Qwen--Qwen3-ASR-0.6B")),
+              ("forced-aligner", ("hub/models--Qwen--Qwen3-ForcedAligner-0.6B",
+                                  "Qwen--Qwen3-ForcedAligner-0.6B")),
+              ("sensevoice", ("sensevoice", "iic--SenseVoiceSmall")),
+              ("pyannote", ("pyannote",))),
+    "cu118": (("sensevoice", ("sensevoice", "iic--SenseVoiceSmall")),),
 }
 
 #: 容器路必须先验一步的那条命令（实施方案 §6-1：Windows + Docker Desktop 的 GPU 直通
@@ -175,40 +184,60 @@ def _cap_float(raw) -> float:
 
 
 def check_torch_abi(python_exe: str, timeout: float = 180.0) -> Dict[str, Any]:
-    """跑一次 torch/torchaudio 的 **ABI 校验** → ``{"ok", "torch", "torchaudio", "error"}``。
+    """跑一次 torch/torchaudio 的 **ABI 校验** → ``{"ok", "torch", "torchaudio", "error", "note"}``。
 
-    判据照 `server/Dockerfile` 构建期那一条：**两者的 CUDA 源标签必须一致**（都带 `+cu126`），
-    并且 `import torchaudio` 必须通过。**版本号相等不是判据**（PyTorch 2.9 之后 torchaudio
-    停更，版本号天生对不上，见 `AGENTS.md`）。返回的 `error` 是**原文**
-    （"报校验原文"是实施方案 §4 那两行要求的）。
+    判据（2026-09-30 按真机证据**放宽**过一次，两段）：
+
+      1. **`import torch` + `import torchaudio` 必须通过** —— 这是硬闸门。
+         `AGENTS.md` 记的那个坑（从普通 PyPI 拉来的 cu13x torchaudio 要 `libcudart.so.13`）
+         表现就是**import 直接崩**，所以这一条照样拦得住它。
+      2. **只有 torchaudio 是 CUDA 版**（版本里带 `+cuXXX`）时，才要求它的标签与 torch 一致。
+         理由是同一天的真机实测：`torch 2.10.0+cu128` + `torchaudio 2.10.0+cpu`（标签不一致）
+         **两个模型都加载成功、真转写也成功** —— 纯 CPU 版 torchaudio 只是自己不碰 GPU，
+         而 funasr(SenseVoice) / pyannote 走的是 torch 的 CUDA。按"标签必须一致"判会把
+         **能用的环境挡住**（假阳性），而假阳性会让用户去修一个不存在的故障。
+
+    返回的 `error` 是**原文**（"报校验原文"是实施方案 §4 那两行要求的）；`note` 是"过了但有话要说"。
 
     单独抽成一个函数，是因为**两个地方都要它**：前置探测（`runtime()`）与扩展包出包的
     安装期校验（`scripts/build_backend_portable.py`）—— 两份实现迟早会有一份漏掉。
     """
-    out: Dict[str, Any] = {"ok": False, "torch": "", "torchaudio": "", "error": ""}
+    out: Dict[str, Any] = {"ok": False, "torch": "", "torchaudio": "", "error": "", "note": ""}
     if not python_exe or not os.path.isfile(str(python_exe)):
         out["error"] = "没有解释器：%s" % (python_exe or "（空）")
         return out
-    code = ("import torch, torchaudio, sys;"
-            "t = torch.__version__; a = torchaudio.__version__;"
-            "tc = t.split('+')[1] if '+' in t else '';"
-            "ac = a.split('+')[1] if '+' in a else '';"
-            "print(t); print(a);"
-            "sys.exit(0 if (tc and tc == ac) else 3)")
+    code = "import torch, torchaudio; print(torch.__version__); print(torchaudio.__version__)"
     res = _run([str(python_exe), "-c", code], timeout=timeout)
     lines = [ln for ln in (res.get("stdout") or "").splitlines() if ln.strip()]
     if len(lines) >= 2:
         out["torch"] = lines[0].strip()
         out["torchaudio"] = lines[1].strip()
-    if res["ok"]:
-        out["ok"] = True
+    if not res["ok"]:
+        out["error"] = (res.get("stderr") or res.get("error") or
+                        "import torch / torchaudio 失败").strip()[:800]
         return out
-    out["error"] = (res.get("stderr") or res.get("error") or
-                    "torch/torchaudio 的 CUDA 源标签不一致").strip()[:800]
-    if res.get("code") == 3:
-        out["error"] = ("torch %s 与 torchaudio %s 不是同一个 CUDA 源（标签不一致）—— "
-                        "症状是每个 /v1/asr 都 503 model_failed"
-                        % (out["torch"] or "?", out["torchaudio"] or "?"))
+
+    def _tag(version: str) -> str:
+        """版本里的 **CUDA 源标签**（`2.10.0+cu128` → `cu128`）；不是 CUDA 版就返回空串。
+
+        只有 `cuXXX` 才算 CUDA 源标签：`2.10.0+cpu` 是纯 CPU 版（今天的实测里它能正常工作），
+        把它当成"另一个源"就会造出假阳性。
+        """
+        parts = str(version or "").split("+")
+        tag = parts[1].strip().lower() if len(parts) > 1 else ""
+        return tag if tag.startswith("cu") else ""
+
+    t_tag, a_tag = _tag(out["torch"]), _tag(out["torchaudio"])
+    if a_tag and t_tag and a_tag != t_tag:
+        out["error"] = ("torch %s 与 torchaudio %s 不是同一个 CUDA 源（标签不一致，"
+                        "两条 pip / 两个 index-url 装混了）—— 症状是每个 /v1/asr 都 503 "
+                        "model_failed" % (out["torch"] or "?", out["torchaudio"] or "?"))
+        return out
+    if not a_tag:
+        out["note"] = ("torchaudio 是 CPU 版（%s）而 torch 是 %s：funasr/pyannote 走的是 torch 的 "
+                       "CUDA，实测可用（2026-09-30）；只有「要 GPU 音频解码」的模型才会用到它的 GPU 路径"
+                       % (out["torchaudio"], out["torch"] or "?"))
+    out["ok"] = True
     return out
 
 
@@ -225,51 +254,93 @@ def runtime() -> Dict[str, Any]:
     except Exception:                                             # pragma: no cover - 兜底
         exe = ""
     out: Dict[str, Any] = {"ready": bool(exe), "path": exe, "abiOk": None,
-                           "torch": "", "torchaudio": "", "error": ""}
+                           "torch": "", "torchaudio": "", "error": "", "note": ""}
     if not exe:
         out["error"] = "还没装运行时（%s 下没有 runtime/）" % backend_proc.backend_root()
         return out
     abi = check_torch_abi(exe)
     out.update({"abiOk": bool(abi["ok"]), "torch": abi["torch"],
-                "torchaudio": abi["torchaudio"], "error": abi["error"]})
+                "torchaudio": abi["torchaudio"], "error": abi["error"],
+                "note": abi.get("note", "")})
     return out
 
 
-def weights(variant: str = "") -> Dict[str, Any]:
-    """权重够不够：按变体声明的那几棵子树，看**客户端模型库**里有没有。
-
-    **说清看的是哪一处**（实施方案 §6-3）：这里看的是 `paths.models_root()`；
-    服务端还会去它自己的 ModelScope 缓存找（`MODELSCOPE_CACHE`），**那边有没有我们不算** ——
-    两处判据混在一起说，就会出现"面板说齐了、服务端仍 503 model_failed"。
-    """
-    root = ""
+def _non_empty_dir(path: str) -> bool:
+    """目录在且**不是空的**（空目录等于没下完 —— 那种"有目录没权重"的坑 service 侧会 503）。"""
+    if not path or not os.path.isdir(path):
+        return False
     try:
-        root = paths.models_root()
+        return any(True for _ in os.scandir(path))
+    except Exception:
+        return False
+
+
+def model_roots() -> List[Tuple[str, str]]:
+    """服务端**真会去找**的那两处（按可能性排序）→ ``[(人话标签, 路径)]``。
+
+    2026-09-30 实测的两处（服务端日志与磁盘都核过）：
+      * 客户端模型库 `paths.models_root()`，HF 风格 `hub/models--Owner--Name`；
+      * ModelScope 缓存：`{MODELSCOPE_CACHE}/models/Owner--Name`（实测 qwen3asr 就在这里）。
+    """
+    out: List[Tuple[str, str]] = []
+    try:
+        out.append(("客户端模型库", paths.models_root()))
     except Exception:                                             # pragma: no cover - 兜底
-        root = ""
-    wanted = VARIANT_MODELS.get(str(variant or ""), ())
-    present, missing = [], []
-    for rel in wanted:
-        target = os.path.join(root, rel) if root else ""
-        ok = False
-        if target and os.path.isdir(target):
-            try:
-                ok = any(True for _ in os.scandir(target))
-            except Exception:
-                ok = False
-        (present if ok else missing).append(rel)
-    return {"root": root, "variant": str(variant or ""), "wanted": list(wanted),
-            "present": present, "missing": missing,
+        pass
+    base = str(os.environ.get("MODELSCOPE_CACHE") or "").strip()
+    if not base:
+        home = os.path.expanduser("~")
+        base = os.path.join(home, ".cache", "modelscope") if home else ""
+    for sub in ("models", "hub"):
+        if base:
+            out.append(("ModelScope 缓存", os.path.join(base, sub)))
+    if base:
+        out.append(("ModelScope 缓存", base))            # 有人直接把 cache 指到 models 那一层
+    seen, uniq = set(), []
+    for label, p in out:
+        key = os.path.normcase(os.path.abspath(p or ""))
+        if p and key not in seen:
+            seen.add(key)
+            uniq.append((label, p))
+    return uniq
+
+
+def weights(variant: str = "") -> Dict[str, Any]:
+    """权重够不够：按变体声明的那几棵，去**两处**找 → 说清"缺哪几棵、在哪找到的"。
+
+    ⚠️ 这条判据的由来（2026-09-30 真机打脸）：第一版只看客户端模型库，于是面板报
+    "缺 qwen3asr"，而它**就在 ModelScope 缓存里**（服务端日志证明模型加载成功）。
+    误报会让人去下一份已有的权重 —— 比不说更贵，所以现在两处都查，并把
+    `foundAt`（在哪找到的）一起交给面板：**"在哪"与"有没有"同样重要**。
+    """
+    roots = model_roots()
+    spec = VARIANT_MODELS.get(str(variant or ""), ())
+    wanted = [label for label, _cands in spec]
+    present, missing, found = [], [], {}
+    for label, cands in spec:
+        hit = ""
+        for rlabel, root in roots:
+            for rel in cands:
+                target = os.path.join(root, rel)
+                if _non_empty_dir(target):
+                    hit = "%s（%s）" % (target, rlabel)
+                    break
+            if hit:
+                break
+        (present if hit else missing).append(label)
+        if hit:
+            found[label] = hit
+    return {"root": roots[0][1] if roots else "",
+            "roots": [{"label": l, "path": p} for l, p in roots],
+            "variant": str(variant or ""), "wanted": wanted,
+            "present": present, "missing": missing, "foundAt": found,
             "ready": bool(wanted) and not missing}
 
 
 def _modelscope_cache() -> str:
-    """服务端可能会去找的那处缓存（只用来**说清我们没算它**）。"""
-    env = str(os.environ.get("MODELSCOPE_CACHE") or "").strip()
-    if env:
-        return env
-    home = os.path.expanduser("~")
-    return os.path.join(home, ".cache", "modelscope", "hub") if home else ""
+    """服务端那处 ModelScope 缓存的**原文路径**（面板上要显示"我看过哪几处"）。"""
+    roots = [p for l, p in model_roots() if "ModelScope" in l]
+    return roots[0] if roots else ""
 
 
 # ---------------------------------------------------------------- 汇总 / 计划

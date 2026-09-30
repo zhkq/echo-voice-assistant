@@ -80,6 +80,9 @@ class _ReadyCase(unittest.TestCase):
         return s
 
     def probe(self, routes, token="t0ken", **kw):
+        # 用例里默认**不等** health（wait_health=0）：桩服务端要么立刻答、要么根本不答，
+        # 等 20 秒只会让"没应答"那几条用例白等。等待本身另有一条专门的用例。
+        kw.setdefault("wait_health", 0)
         s = self.stub(routes)
         return backend_ready.probe(s.url, token=token, **kw), s
 
@@ -130,7 +133,7 @@ class ReadyProbeTests(_ReadyCase):
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
         sock.close()
-        out = backend_ready.probe("http://127.0.0.1:%d" % port, token="t")
+        out = backend_ready.probe("http://127.0.0.1:%d" % port, token="t", wait_health=0)
         self.assertFalse(out["ok"])
         self.assertEqual(out["state"], "not-running")
         self.assertIsNone(out["l2"], "L1 没过就不该再往下问")
@@ -148,15 +151,34 @@ class ReadyProbeTests(_ReadyCase):
         self.assertIn("Qwen3-ASR", out["headline"])
         self.assertIsNone(out["l3"], "模型没就绪时**不该**再跑 L3（必然 503，还白等一次加载超时）")
 
-    def test_a_200_with_empty_text_is_not_a_pass(self):
-        """后端回了 200 但一个字都没有 —— 那不是"能用"。"""
+    def test_an_empty_transcript_still_counts_as_the_engine_ran(self):
+        """**空文本不算失败**（2026-09-30 真机校准）。
+
+        自测音频是合成音调；实测里 qwen3asr 对 1 秒音调回了**空文本**、SenseVoice 回了个
+        "Yeah." —— 两者都是"引擎跑完了"。第一版把"非空文本"当判据，于是把一个**完全正常**
+        的后端判成失败（用户会去修一个不存在的问题）。
+        新的凭据是 `200 + modelId/modelVersion`（池子解析出 spec 并真的跑完了）。
+        """
         out, _s = self.probe({
             "/v1/health": (200, _HEALTH),
             "/v1/ready": (200, _READY_OK),
-            "/v1/asr": (200, {"text": "   "}),
+            "/v1/asr": (200, {"text": "   ", "sentences": [], "modelId": "asr-long",
+                              "modelVersion": "qwen3-asr-0.6b"}),
         })
-        self.assertFalse(out["ok"])
-        self.assertIn("文本是空的", out["headline"])
+        self.assertTrue(out["ok"], out)
+        self.assertTrue(out["l3"]["textEmpty"])
+        self.assertIn("合成音无文本", out["headline"])
+        self.assertIn("正常的", out["l3"]["detail"])
+
+    def test_a_200_without_any_model_identity_is_not_a_pass(self):
+        """反过来：200 但**既没有文本也没有 modelId** → 看不出引擎跑没跑，不算过。"""
+        out, _s = self.probe({
+            "/v1/health": (200, _HEALTH),
+            "/v1/ready": (200, _READY_OK),
+            "/v1/asr": (200, {"text": ""}),
+        })
+        self.assertFalse(out["ok"], out)
+        self.assertIn("看不出引擎到底跑没跑", out["headline"])
 
     def test_no_token_is_told_apart_from_a_bad_model(self):
         """被鉴权拒了、而手里又没有令牌 → 两件事都要说（别让人去查模型）。"""
@@ -168,6 +190,33 @@ class ReadyProbeTests(_ReadyCase):
         self.assertFalse(out["ok"])
         self.assertIn("没有可用令牌", out["headline"])
         self.assertIn("配对", out["headline"])
+
+    def test_it_waits_for_the_port_to_start_answering(self):
+        """**刚起好后端时的那个窗口**（2026-09-30 真机逮到）：uvicorn 先 lifespan 后绑端口，
+        而本机配对文件正是在 lifespan 里写的 —— "文件在了"之后的一小段里 `/v1/health` 是连接被拒。
+        实测那次表现为 L1/L2 报失败、几秒后 L3 却 200（自相矛盾），用户读到的是"后端没在应答"。
+        这条钉住"先等它开始应答，再判 L1"。
+        """
+        s = self.stub({
+            "/v1/health": (200, _HEALTH),
+            "/v1/ready": (200, _READY_OK),
+            "/v1/asr": (200, _ASR_OK),
+        })
+        calls = {"n": 0}
+        real = backend_ready.probe_health
+
+        def _flaky(url, timeout=backend_ready.L1_TIMEOUT_S):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return {"ok": False, "status": 0, "health": {},
+                        "detail": "连不上（连接被拒）"}
+            return real(url, timeout=timeout)
+
+        with mock.patch.object(backend_ready, "probe_health", _flaky):
+            out = backend_ready.probe(s.url, token="t0ken", wait_health=5.0)
+        self.assertTrue(out["l1"]["ok"], out)
+        self.assertGreaterEqual(calls["n"], 2, "第一次失败后应该再试一次")
+        self.assertTrue(out["ok"], out)
 
     def test_the_diarize_layer_is_optional_and_its_failure_is_not_fatal(self):
         """L4（分离）失败**不算整体失败**：老卡本来就没有这一档，如实说即可。"""
@@ -184,7 +233,7 @@ class ReadyProbeTests(_ReadyCase):
     def test_probe_never_raises_on_a_garbage_url(self):
         for url in ("", "not-a-url", "http://127.0.0.1:1", "ftp://x"):
             with self.subTest(url=url):
-                out = backend_ready.probe(url, token="t")
+                out = backend_ready.probe(url, token="t", wait_health=0)
                 self.assertIn("ok", out)
                 self.assertFalse(out["ok"])
 

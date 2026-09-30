@@ -42,6 +42,15 @@ from typing import Any, Dict, List, Optional, Tuple
 L1_TIMEOUT_S = 5.0
 L2_TIMEOUT_S = 10.0
 L3_TIMEOUT_S = 120.0
+#: 等能力端口**真的开始应答**的上限（秒）与轮询间隔。
+#:
+#: 为什么必须有它（2026-09-30 真机实测逮到）：uvicorn **先跑 lifespan、后绑端口**，
+#: 而本机配对文件正是在 lifespan 里写的 —— 所以"配对文件在了"之后的一小段里
+#: `/v1/health` 是**连接被拒**。实测那次表现为 L1/L2 报失败、几秒后 L3 却 200（自相矛盾），
+#: 而用户读到的是"后端没在应答"这种**误报**。同一类窗口在 1c 的配对那一步已经有过
+#: （`backend_setup.PAIR_READY_TIMEOUT`），这里是它的第二处。
+WAIT_HEALTH_S = 20.0
+WAIT_HEALTH_POLL_S = 0.5
 #: 自测音频：1 秒 / 16 kHz / 单声道（小到不占带宽，又足以让模型真的跑一遍）。
 SELFTEST_SECONDS = 1.0
 SELFTEST_RATE = 16000
@@ -194,20 +203,32 @@ def probe_asr(base_url: str, token: str = "", timeout: float = L3_TIMEOUT_S,
                 body = None
     text = ""
     detail = ""
+    model_id = ""
     if isinstance(body, dict):
         text = str(body.get("text") or "").strip()
+        model_id = str(body.get("modelId") or body.get("modelVersion") or "")
         detail = str(body.get("detail") or body.get("error") or "")[:500]
-    ok = status == 200 and bool(text)
+    # **判据**（2026-09-30 真机校准）：引擎**真的跑完了**才算过 —— `200 + modelId/modelVersion`
+    # 就是"池子解析出了 spec 并跑完了"的凭据（加载失败会在更早的地方变成 503 model_failed）。
+    # 文本为空**不算失败**：自测音频是合成音调，模型跑完但没出字是正常的
+    # （实测：qwen3asr 对 1 秒纯音调给空文本、SenseVoice 给了个 "Yeah." —— 两者都是"跑完了"）。
+    # 第一版把"非空文本"当判据，于是把一个**完全正常**的后端判成失败（用户会去修不存在的问题）。
+    ran = bool(status == 200 and (text or model_id))
+    ok = bool(ran)
+    text_empty = bool(status == 200 and not text)
     if not ok and not detail:
         detail = ("服务端回了 HTTP %s：%s" % (status, (raw or "")[:300])) if status \
             else "连不上 %s（%s）" % (url, raw)
-    if status == 200 and not text:
-        detail = "后端回了 200 但文本是空的（模型跑了但没出字）"
+    if status == 200 and not text and not model_id:
+        detail = "后端回了 200，但既没有文本也没有 modelId —— 看不出引擎到底跑没跑"
+    if text_empty and ok:
+        detail = "引擎跑完了（%s），但这段合成音调没有出文本 —— 这是正常的" % (model_id or "?")
     if not ok and not token and status in (401, 403):
         detail = ("被鉴权拒了（HTTP %s），而且**手里没有可用令牌**（还没配对？）—— "
                   "先配对再做自测；这两件事要分开看，不然会去查模型。%s"
                   % (status, ("服务端原话：" + detail) if detail else ""))
     return {"ok": ok, "status": status, "text": text[:200], "detail": detail,
+            "textEmpty": text_empty, "modelId": model_id,
             "token": bool(token), "selfTestWav": wav_path}
 
 
@@ -231,7 +252,7 @@ def _token_for(base_url: str) -> str:
 
 
 def probe(base_url: str, token: str = "", *, timeout_l3: float = L3_TIMEOUT_S,
-          diarize: bool = False) -> Dict[str, Any]:
+          diarize: bool = False, wait_health: float = WAIT_HEALTH_S) -> Dict[str, Any]:
     """三层就绪 + 可选的 L4（分离）→ 面板能直接渲染的一份结论。
 
     ``ok`` 只在 **L1+L2+L3 都过** 时为真。``state`` 是互斥的一档，面板只渲染一句：
@@ -240,10 +261,20 @@ def probe(base_url: str, token: str = "", *, timeout_l3: float = L3_TIMEOUT_S,
       * ``not-ready``    —— 进程在，但服务端说模型没就绪（带 `failed[]`）
       * ``asr-failed``   —— 模型就绪了，真实自测却失败（**这就是那个坑**）
       * ``ok``           —— 三层都过
+
+    ``wait_health``：**先等它开始应答**再判 L1（默认等 `WAIT_HEALTH_S` 秒）。
+    不这么做的话，"刚起好、端口还没绑上"会被报成"后端没在应答"（2026-09-30 实测）。
+    给 0 = 不等待（用例要确定性的那种场景）。
     """
     out: Dict[str, Any] = {"baseUrl": str(base_url or ""), "at": time.strftime("%H:%M:%S")}
-    l1 = probe_health(base_url)
+    deadline = time.monotonic() + max(0.0, float(wait_health or 0.0))
+    while True:
+        l1 = probe_health(base_url)
+        if l1["ok"] or time.monotonic() >= deadline:
+            break
+        time.sleep(WAIT_HEALTH_POLL_S)
     out["l1"] = l1
+    out["waitedS"] = round(max(0.0, float(wait_health or 0.0) - max(0.0, deadline - time.monotonic())), 1)
     if not l1["ok"]:
         out.update({"ok": False, "state": "not-running",
                     "headline": "后端没在应答（%s）" % (l1["detail"] or "连不上"),
@@ -264,9 +295,11 @@ def probe(base_url: str, token: str = "", *, timeout_l3: float = L3_TIMEOUT_S,
                     "headline": "模型就绪，但真实自测失败：%s（这一档正是"
                                 "「health 全绿、每个 /v1/asr 都 503」那个坑）" % l3["detail"]})
         return out
+    ok = True
     out.update({"ok": True, "state": "ok",
                 "headline": "三层都过了：/v1/health · /v1/ready · 一次真实转写（%s）"
-                            % (l3["text"][:40] or "有文本")})
+                            % (l3["text"][:40] or ("引擎跑通，合成音无文本"
+                                                  if l3.get("textEmpty") else "有文本"))})
     if diarize:
         out["l4"] = probe_diarize(base_url, token=token or _token_for(base_url),
                                   timeout=timeout_l3,
