@@ -76,6 +76,15 @@ class _Isolated(unittest.TestCase):
                               lambda k, d=None: self.settings_values.get(k, d))
         p.start()
         self.addCleanup(p.stop)
+        # 「取薄包」那一步要隔离：它默认会在**真实的** Downloads/Desktop/Documents 里找 zip，
+        # 开发机上恰好放着一个就让 canStart / notes 随人而变。
+        from app import backend_fetch
+        self.backend_fetch = backend_fetch
+        for name, value in (("search_dirs", lambda: []), ("package_source", lambda: ""),
+                            ("find_package_zip", lambda: "")):
+            p = mock.patch.object(backend_fetch, name, value)
+            p.start()
+            self.addCleanup(p.stop)
         backend_admin.reset_job()
         self.addCleanup(backend_admin.reset_job)
 
@@ -154,11 +163,24 @@ class ViewTests(_Isolated):
             self.assertIn(key, v)
         self.assertFalse(v["runtime"]["ready"], "临时目录里没有 runtime/")
         self.assertFalse(v["canStart"])
-        self.assertIn("运行时", v["whyNot"])
+        # 2026-09-30 起"起不来"的第一原因可能不是运行时，而是**薄包还没到手**
+        # （运行时正是这趟活要装的：`app/backend_fetch.py` 的第 −1 步与第 0 步）。
+        self.assertIn("薄包", v["whyNot"])
         self.assertTrue([n for n in v["notes"] if "运行时" in n],
                         "缺运行时必须在 notes 里说出来：%s" % v["notes"])
         self.assertEqual(v["port"], 8900)
         self.assertEqual(v["adminPort"], 8901)
+
+    def test_a_reachable_thin_package_makes_start_possible(self):
+        """薄包能取到（本机找得到 / 给了地址）→ 按钮**能点**，title 里写清这一趟会做什么。"""
+        with mock.patch.object(self.backend_fetch, "find_package_zip",
+                               lambda: r"D:\交付\ECHO-backend-portable-20260930-1309.zip"):
+            v = backend_admin.view()
+        self.assertTrue(v["canStart"], v["whyNot"])
+        self.assertIn("薄包", v["whyNot"])
+        self.assertIn("运行时", v["whyNot"])
+        joined = " ".join(v["notes"])
+        self.assertIn("薄包", joined)
 
     def test_a_runtime_that_exists_makes_start_possible(self):
         self.install_fake_runtime()
@@ -214,10 +236,12 @@ class ViewTests(_Isolated):
 
 
 class StartTests(_Isolated):
-    def test_start_refuses_without_a_runtime(self):
+    def test_start_refuses_when_the_thin_package_cannot_be_reached(self):
+        """薄包既不在本机、也没给地址 → **入口就拒绝**，别让人等一次注定失败的下载。"""
         ok, message = backend_admin.start()
         self.assertFalse(ok, message)
-        self.assertIn("运行时", message)
+        self.assertIn("薄包", message)
+        self.assertIn("capabilityBackendPackage", message)
 
     def test_start_refuses_while_another_job_is_running(self):
         self.install_fake_runtime()
@@ -353,7 +377,7 @@ class EndpointTests(_Isolated):
     def test_start_without_a_runtime_is_a_400_with_a_readable_line(self):
         r = self.client.post("/api/capability/backend/start", json={})
         self.assertEqual(r.status_code, 400, r.text)
-        self.assertIn("运行时", r.json()["detail"])
+        self.assertIn("薄包", r.json()["detail"])
 
     def test_start_returns_immediately_with_the_job(self):
         self.install_fake_runtime()

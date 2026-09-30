@@ -2996,7 +2996,16 @@ function renderBackendPlan(p) {
       + ((w.missing || []).length ? `，缺：${w.missing.map(esc).join("、")}` : ""));
   }
   if ((p.missing || []).length) lines.push(`缺：${p.missing.map(esc).join("；")}`);
-  // 薄包那条路（默认）：运行时不随包走 —— 说清"点下去会从哪装、多大、日志在哪"。
+  // 薄包那条路（默认）：先取薄包、再装运行时 —— 两样都**不随包走**，所以都说清"从哪来"。
+  if (p.path === "portable" && p.fetch && p.fetch.package) {
+    const pk = p.fetch.package;
+    lines.push(pk.ready
+      ? `取薄包：已经解开（<code>${esc(pk.root || "")}</code>）`
+      : (pk.source
+        ? `取薄包：${pk.explicit ? "按你指的" : "本机找到"} <code>${esc(pk.source)}</code>`
+        : `取薄包：本机没有，也没填地址 —— 放到 <code>${esc((pk.search || [])[0] || "")}</code> 之一，`
+          + `或填设置 <code>capabilityBackendPackage</code>`));
+  }
   if (p.path === "portable" && p.fetch) {
     lines.push(`取运行时：${esc(p.fetch.headline || "")}`
       + (p.fetch.approxDownloadGB ? `（约 ${p.fetch.approxDownloadGB} GB）` : "")

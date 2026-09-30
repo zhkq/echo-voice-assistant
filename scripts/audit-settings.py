@@ -116,6 +116,10 @@ ACK_INDIRECT = {
     # （同一份名单里 commandInputDeviceId / meetingInputDeviceId 就是同一个理由。）
     "commandOutputDeviceId": "app/audio/output.py:resolve_output_device() 查 OUTPUT_DEVICE_KEYS 读（指令播报用哪台扬声器）",
     "meetingOutputDeviceId": "app/audio/output.py:resolve_output_device() 查 OUTPUT_DEVICE_KEYS 读（会议播报用哪台扬声器）",
+    # 后端的薄包在哪（2026-09-30）：键名是 app/backend_fetch.py 的 PACKAGE_SETTING 常量
+    # （读法 `_setting(PACKAGE_SETTING, "")`），字面量只有那一处 —— 常量同时被几处**人话**
+    # 引用（"在设置 `capabilityBackendPackage` 里填…"），所以不在这里再抄一遍字符串。
+    "capabilityBackendPackage": "app/backend_fetch.py:package_source() 读 PACKAGE_SETTING（键名是常量）",
 }
 
 #: 唯一消费方是面板 UI 的项（面板读它来改变自己的行为，app/ 不需要读）。

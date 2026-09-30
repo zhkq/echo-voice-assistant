@@ -808,6 +808,16 @@ DEFAULTS = {
                     "换盘/换目录就填这里 —— 与 `modelsDir` / `meetingsDir` 同一类："
                     "**这是客户端挑的位置**，不是后端的设置。",
         value_type="str"),
+    "capabilityBackendPackage": dict(
+        value="", grp="capability", label="后端的薄包在哪（路径或下载地址）", hidden=True,
+        description="「起本机后端」那一步要用的**薄包**（`ECHO-backend-portable-*.zip`，"
+                    "源码 + 安装脚本，几十 MB）。留空 = 自己去常见位置找（`{ECHO_BASE}`、"
+                    "它的上一层、`{ECHO_BASE}/bundle`、下载/桌面/文档目录，以及环境变量 "
+                    "`ECHO_KIT_ROOT` 指的资料夹）—— 交付时它与客户端 kit 通常并排放着。"
+                    "填**本地 zip 路径**就就地解开；填 **http(s) 地址**就先下载再解开。"
+                    "装好一次之后这里不用再管（`{ECHO_BASE}/backend/server/requirements.txt` "
+                    "在 = 已经解开）。见 docs/3.0-PROGRESS.md §8.17",
+        value_type="str"),
     "capabilityBackendStopWithClient": dict(
         value=False, grp="capability", label="随 ECHO 退出时停掉本机后端", hidden=True,
         description="**默认关**：会议要求后端活到一场会结束（分钟到小时级），"

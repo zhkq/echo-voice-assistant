@@ -70,6 +70,15 @@ class _Case(unittest.TestCase):
                               lambda: os.path.join(tempfile.gettempdir(), "echo-be-test"))
         p.start()
         self.addCleanup(p.stop)
+        # 「取薄包」那一步也要隔离：它的搜索目录里含着**真实的** Downloads/Desktop/Documents，
+        # 开发机上恰好放着一个 `*.zip` 就会让 `implemented` 随人而变（假阳性/假阴性都算）。
+        from app import backend_fetch
+        self.backend_fetch = backend_fetch
+        for name, value in (("search_dirs", lambda: []), ("package_source", lambda: ""),
+                            ("find_package_zip", lambda: "")):
+            p = mock.patch.object(backend_fetch, name, value)
+            p.start()
+            self.addCleanup(p.stop)
 
 
 class PreflightTests(_Case):
@@ -81,11 +90,60 @@ class PreflightTests(_Case):
                              err="PATH 里没有 docker（没装 Docker，或者它不在 PATH）")
         plan = backend_env.plan()
         self.assertEqual(plan["path"], "portable")
-        self.assertFalse(plan["implemented"], "一键装好这一步还没做（取薄包那一步），不许说能")
+        self.assertTrue(plan["implemented"],
+                        "取薄包 + 取运行时都在一键路里了（2026-09-30）—— 这一档现在能一键做完")
+        self.assertEqual(plan["whyNot"], "")
+        self.assertIn("国内源", plan["fetch"]["headline"],
+                      "要写清运行时会从哪来：%s" % plan["fetch"]["headline"])
+        self.assertIn("docker 原文", " ".join(plan["reasons"]))
+
+    def _force_portable(self):
+        """把 Docker 这一路关掉 —— 只有"没有容器路"时计划才会走到扩展包（portable）那一档。"""
+        self.docker = _docker(installed=False, daemon=False, compose="", gpu_runtime=False,
+                              err="PATH 里没有 docker（没装 Docker，或者它不在 PATH）")
+
+    def test_portable_is_not_implemented_until_the_thin_package_can_be_reached(self):
+        """**薄包既不在本机、也没给地址** → 如实说不能一键，并写清"放哪/填哪"。
+
+        这一条是 `implemented` 的另一半：上一版（§8.16）它恒为 False，因为"取薄包"要人工做；
+        现在它取决于**薄包能不能到手**（本机找得到 / 设置给了路径或 URL）—— 所以这两面都要钉。
+        """
+        self._force_portable()
+        self.runtime = {"ready": False, "path": "", "abiOk": None, "torch": "",
+                        "torchaudio": "", "error": ""}
+        plan = backend_env.plan()
+        self.assertEqual(plan["path"], "portable")
+        self.assertFalse(plan["implemented"])
+        self.assertIn("薄包", plan["whyNot"])
+        self.assertTrue(any("薄包" in m for m in plan["missing"]), plan["missing"])
+        self.assertIn("capabilityBackendPackage", " ".join(plan["notes"]))
+        self.assertFalse(plan["fetch"]["willFetch"])
+
+    def test_a_package_on_this_machine_makes_it_a_one_click_path(self):
+        """本机找得到薄包（或用户填了地址）→ `implemented` 为真，且说得出**在哪找到的**。"""
+        self._force_portable()
+        self.runtime = {"ready": False, "path": "", "abiOk": None, "torch": "",
+                        "torchaudio": "", "error": ""}
+        with mock.patch.object(self.backend_fetch, "find_package_zip",
+                               lambda: r"D:\交付\ECHO-backend-portable-20260930-1309.zip"):
+            plan = backend_env.plan()
+        self.assertTrue(plan["implemented"], plan["whyNot"])
+        self.assertEqual(plan["whyNot"], "")
+        self.assertEqual(plan["fetch"]["packageSource"],
+                         r"D:\交付\ECHO-backend-portable-20260930-1309.zip")
         joined = " ".join(plan["notes"])
         self.assertIn("薄包", joined)
-        self.assertIn("国内源", joined, "要写清运行时会从哪来：%s" % joined)
-        self.assertIn("docker 原文", " ".join(plan["reasons"]))
+        self.assertIn("国内源", joined, "运行时会从哪来也要写清：%s" % joined)
+
+    def test_a_runtime_with_a_bad_abi_is_not_called_one_click(self):
+        """运行时在、但 torch/torchaudio 的 CUDA 标签不一致 → 要清掉重装，**一键做不了**。"""
+        self._force_portable()
+        self.runtime = {"ready": True, "path": "/fake/python", "abiOk": False,
+                        "torch": "2.10.0+cu128", "torchaudio": "2.10.0+cpu",
+                        "error": "标签不一致"}
+        plan = backend_env.plan()
+        self.assertFalse(plan["implemented"])
+        self.assertIn("ABI", plan["whyNot"])
 
     def test_docker_installed_but_not_running_is_told_apart_from_missing(self):
         """装了但没起来 ≠ 没装 —— 两句不同的话，下一步也不同。"""

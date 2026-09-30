@@ -135,11 +135,35 @@ def _note_step(step: Dict[str, Any]) -> None:
 
 # ---------------------------------------------------------------- 状态
 
+def _package_hint() -> Tuple[bool, str]:
+    """薄包那一步现在能不能一键走完 → ``(ok, 一句话)``。
+
+    `backend_fetch.plan()` 的 `willFetch` 就是这件事的判据（已经解开 / 本机找得到 /
+    设置或环境变量里给了路径或 URL），**不在这一层重算**——两处判据迟早会漂。
+    """
+    from app import backend_fetch
+    try:
+        p = backend_fetch.plan()
+    except Exception as e:                                        # pragma: no cover - 兜底
+        return False, "薄包的计划算不出来：%s" % e
+    if p.get("willFetch"):
+        return True, str(p.get("package", {}).get("headline") or "薄包能取到")
+    return False, ("后端的**薄包**还没有：%s。把 `%s-*.zip` 放到其中之一，或在设置 "
+                   "`%s`（或环境变量 `%s`）里填它的路径 / 下载地址。"
+                   % ("、".join(p.get("packageSearch") or []) or "（没有可看的目录）",
+                      backend_fetch.PACKAGE_PREFIX, backend_fetch.PACKAGE_SETTING,
+                      backend_fetch.PACKAGE_ENV))
+
+
 def _can_start(runtime: str, alive: bool, ports_ok: bool, ports_detail: str) -> Tuple[bool, str]:
     """现在能不能点「起本机后端」？不能的话，**为什么**（这句话直接进按钮的 title）。"""
     if not runtime:
-        return False, ("后端的运行时还没装好（%s 下没有 runtime/）—— 扩展包要先解包/装好；"
-                       "容器路还没做" % backend_proc.backend_root())
+        # 运行时还没有：只要**薄包能取到**，这一趟就还能一键走完（先取薄包 → 再从国内源装运行时）。
+        ok, hint = _package_hint()
+        if not ok:
+            return False, hint
+        return True, ("会先取薄包（%s），再按国内源把运行时装上（约 3 GB），"
+                      "然后写配置 → 起进程 → 读本机配对文件自动配对" % hint)
     if alive:
         return False, "ECHO 自己起的那个**已经在跑**了 —— 要停它请点「停掉它」"
     if not ports_ok:
@@ -152,8 +176,12 @@ def notes(*, runtime: str, config_exists: bool, alive: bool, local: Dict[str, An
     """要如实说给用户听的那几句（**没有就空着**，不凑数）。"""
     out = []
     if not runtime:
-        out.append("还没有后端的运行时（%s 下没有 runtime/）：扩展包要先解包/装好。"
-                   "容器路（Docker）还没做。" % backend_proc.backend_root())
+        ok, hint = _package_hint()
+        if ok:
+            out.append("还没有后端的运行时 —— 点一次「起本机后端」会先取薄包，"
+                       "再用国内源装运行时（torch 走 SJTU 的 CUDA 索引）。%s" % hint)
+        else:
+            out.append("还没有后端的运行时，薄包也还没到：%s" % hint)
     if not config_exists:
         out.append("还没生成过配置 —— 点一次「起本机后端」会写一份只绑回环的 "
                    "`server.yaml`（jwt_secret 只在第一次生成，之后一直沿用）。")
@@ -248,13 +276,12 @@ def start(*, replace_pairing: bool = False, vram_budget_mb: int = 0,
     """
     if not backend_proc.python_exe() and not python:
         # 薄包那条路（用户 2026-09-30 拍板"默认薄包 + 国内可下载"）：**不在这里拒绝** ——
-        # 运行时正是这趟活要装的（第 0 步 `runtime`，见 `app/backend_fetch.py`）。
-        # 但**薄包没解开**（没有 server/requirements.txt）就先说清楚，别让人等一次必然失败的下载。
-        from app import backend_fetch
-        if not backend_fetch.plan()["sourceReady"]:
-            return False, ("后端的**薄包还没解开**：%s 下找不到 server/requirements.txt —— "
-                           "先把薄包解到那里（解好后这一趟会从国内源把运行时装上）。"
-                           % backend_proc.backend_root())
+        # 薄包与运行时正是这趟活要取的（第 −1 步 `package`、第 0 步 `runtime`，
+        # 见 `app/backend_fetch.py`）。只有"薄包既不在本机、也没给地址"时才说清楚，
+        # 别让人白等一次注定失败的下载。
+        ok, hint = _package_hint()
+        if not ok:
+            return False, hint
     with _JOB_LOCK:
         if _JOB["running"]:
             return False, ("已经有一个「起本机后端」在进行中（第 %d 步：%s）—— "
@@ -287,7 +314,8 @@ def start(*, replace_pairing: bool = False, vram_budget_mb: int = 0,
             _JOB["stage"] = ""
 
     threading.Thread(target=_worker, daemon=True, name="backend-start").start()
-    return True, "已开始「起本机后端」：先写配置，再起进程，然后等本机配对文件并配对"
+    return True, ("已开始「起本机后端」：先取薄包（若还没解开）、再按国内源装运行时、"
+                  "写配置、起进程，然后等本机配对文件并配对")
 
 
 def stop(reason: str = "") -> Tuple[bool, str]:

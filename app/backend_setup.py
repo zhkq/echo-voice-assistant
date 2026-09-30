@@ -629,6 +629,18 @@ def start(*, port: int = backend_proc.DEFAULT_PORT,
                 pass
         return bool(ok)
 
+    # **第 −1 步：薄包**（2026-09-30 接进来）。在这之前"把薄包解到 {echoBase}/backend"
+    # 是**人工**的一步；现在本机找得到（或设置里给了路径/URL）就自己取。
+    # 它排在第 0 步之前是因为：**解释器可能就在薄包自带的 `runtime/` 里** ——
+    # 先问"有没有解释器"会把"薄包还没到"误报成"薄包里没有 Python"。
+    # 什么时候跳过：调用方显式给了 `python=`（开发/用例走自己的解释器）。
+    if fetch_runtime and not python:
+        from app import backend_fetch
+        ok, detail = backend_fetch.ensure_package(
+            on_step=lambda label: record("package", True, label))
+        if not record("package", ok, detail):
+            return {"ok": False, "steps": steps, "message": detail}
+
     # **第 0 步：运行时**（用户 2026-09-30 拍板"默认薄包 + 国内可下载"）。
     # 薄包只有源码 + 配置模板，几 GB 的 torch 不随包走 —— 这里按**国内源**把它装进 `runtime/`。
     # 什么时候跳过：① 调用方显式给了 `python=`（开发/用例走自己的解释器）；② 运行时已经在了。

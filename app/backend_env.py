@@ -499,32 +499,47 @@ def plan(force: bool = False) -> Dict[str, Any]:
         spec_hint = "asr-only"
 
     # ---- 运行时 / 权重 / 磁盘 / 端口
-    #: 薄包那条路的"取运行时"计划（`app/backend_fetch.py`）—— 只在 portable 档填，
+    #: 薄包那条路的"取载荷"计划（`app/backend_fetch.py`）—— 只在 portable 档填，
     #: 其余档保持 None（面板照 `null` 处理），但要**先初始化**，不然 return 时会 NameError。
     fetch_plan: Any = None
+    package_ok = False
     if path == "portable":
         # 薄包那条路（用户 2026-09-30 拍板"默认薄包 + 国内可下载"）：
-        # 运行时**不再要求随包走** —— 点「起本机后端」时按国内源现装（`app/backend_fetch.py`）。
+        #   ① **薄包本身**也在一键路里了（`backend_fetch.ensure_package`：本机找 / 按你指的
+        #      路径或 URL 取）—— 以前这一步是人工"解到 <根>\backend"；
+        #   ② 运行时**不再要求随包走** —— 点「起本机后端」时按国内源现装。
         from app import backend_fetch
         fetch_plan = fetch_plan_safe = None
         try:
             fetch_plan = fetch_plan_safe = backend_fetch.plan(variant)
         except Exception as e:                                    # pragma: no cover - 兜底
-            fetch_plan_safe = {"headline": "取运行时的计划算不出来：%s" % e}
+            fetch_plan_safe = {"headline": "取载荷的计划算不出来：%s" % e}
+        package_ok = bool(fetch_plan_safe.get("willFetch"))
+        pkg_head = str((fetch_plan_safe.get("package") or {}).get("headline") or "")
         if not rt.get("ready"):
-            if fetch_plan_safe.get("sourceReady"):
+            if fetch_plan_safe.get("packageReady"):
                 notes.append("运行时不在 `runtime/` 里，但**薄包已经解开** —— 点「起本机后端」"
                              "会自动装：%s（约 %.1f GB，日志 %s）。"
                              % (fetch_plan_safe.get("headline", ""),
                                 fetch_plan_safe.get("approxDownloadGB", 0) or 0,
                                 fetch_plan_safe.get("log", "")))
+            elif package_ok:
+                notes.append("运行时不在 `runtime/` 里；**薄包能取到**：%s。点「起本机后端」会"
+                             "先取薄包，再按国内源把运行时装上（约 %.1f GB，日志 %s）。"
+                             % (pkg_head or fetch_plan_safe.get("packageSource", ""),
+                                fetch_plan_safe.get("approxDownloadGB", 0) or 0,
+                                fetch_plan_safe.get("log", "")))
             else:
-                missing.append("后端的**薄包**（%s 下没有 server/requirements.txt）"
-                               % backend_setup.backend_root())
-                notes.append("先把薄包（源码 + 安装脚本，几十 MB）解到 %s；解开之后"
-                             "「起本机后端」会自己从国内源把运行时装上（torch 走 %s，"
-                             "其余走清华/阿里 PyPI）。"
-                             % (backend_setup.backend_root(),
+                missing.append("后端的**薄包**（%s 下没有 server/requirements.txt，"
+                               "本机也没找到 `%s-*.zip`）"
+                               % (backend_setup.backend_root(),
+                                  backend_fetch.PACKAGE_PREFIX))
+                notes.append("把薄包（源码 + 安装脚本，几十 MB）放到这些地方之一：%s；"
+                             "或在设置 `%s`（环境变量 `%s`）里填它的**路径或下载地址**。"
+                             "薄包到手之后一次点击就够了 —— 运行时会按国内源现装"
+                             "（torch 走 %s，其余走清华/阿里 PyPI）。"
+                             % ("、".join(fetch_plan_safe.get("packageSearch") or []) or "（没有可看的目录）",
+                                backend_fetch.PACKAGE_SETTING, backend_fetch.PACKAGE_ENV,
                                 fetch_plan_safe.get("torchIndex", "")))
         elif rt.get("abiOk") is False:
             notes.append("**运行时已装但 ABI 不符**（原文：%s）—— 换变体 / 清 runtime 重装。"
@@ -556,11 +571,30 @@ def plan(force: bool = False) -> Dict[str, Any]:
     how = ("现在能做的：拿交付的后端包手工 `docker compose up -d`（compose 可以让面板生成），"
            "再回这一页点「检测本机后端」；或者走扩展包路。")
     if path == "portable":
-        todo = "取薄包那一步的自动化（解包/下载）"
-        how = ("**薄包解好之后，一次点击就够了**：运行时会按国内源现装（torch 走 SJTU 的 CUDA "
-               "索引，其余走清华/阿里 PyPI），然后自动配置 → 起 → 配 → 三层就绪自测。"
-               "现在要人工做的只有一件事：把薄包解到 %s。" % backend_setup.backend_root())
-    notes.insert(0, "「一键装好」这一步还没做：%s。%s" % (todo, how))
+        # **这一档现在真的是一键了**（2026-09-30）：取薄包（本机找 / 按你指的路径或 URL 取）
+        # 与装运行时（国内源）都在 `backend_fetch` 里，后面 configure → 起 → 配对 → 三层就绪
+        # 本来就是自动的。所以缺什么，`implemented` 就看什么：
+        #   运行时已在 → 现在就能走完（除非 ABI 不符：那要清掉 runtime/ 重装，一键做不了）；
+        #   否则看**薄包能不能到手**（到手了就可以一键：取薄包 → 装运行时 → …）。
+        if rt.get("abiOk") is False:
+            implemented = False
+            todo = "运行时已装但 ABI 不符（换变体 / 清掉 runtime/ 重装）"
+            how = ("清掉 `%s` 后重来一次（那一趟会按国内源重装 torch/torchaudio）；"
+                   "或改用容器路。" % backend_fetch.runtime_dir())
+        elif rt.get("ready") or package_ok:
+            implemented = True
+            todo = ""
+            how = ""
+        else:
+            todo = "薄包还没到手（本机没找到，也没填路径/地址）"
+            how = ("把 `%s-*.zip` 放到 %s 之一，或在设置 `%s`（环境变量 `%s`）里填它的"
+                   "路径或下载地址 —— 之后一次点击就够了：取薄包 → 国内源装运行时 → "
+                   "配置 → 起 → 配对 → 三层就绪自测。"
+                   % (backend_fetch.PACKAGE_PREFIX,
+                      "、".join(fetch_plan_safe.get("packageSearch") or []) or "（没有可看的目录）",
+                      backend_fetch.PACKAGE_SETTING, backend_fetch.PACKAGE_ENV))
+    if not implemented:
+        notes.insert(0, "「一键装好」这一步还没做：%s。%s" % (todo, how))
 
     return {
         "path": path,
