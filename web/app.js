@@ -1347,6 +1347,10 @@ let _statusCache = null;        // GET /api/status（服务卡的运行信息）
 //: `_capBackendCache` 的取数时刻（TTL 用，见 refreshRunStatus）+ 底部状态的自刷新节拍
 let _capBackendAt = 0;
 let _runStatusTimer = null;
+//: 「后端」卡要不要显示**远端**（配对来的）而不是本机那个 —— 见 refreshRunStatus。
+//: 为什么要有：同事那台机器的形状是"后端在别人的 GPU 上"，只看本机那份必然显示待启动。
+let _capRoute = null;
+let _capRouteAt = 0;
 
 /* 一级分组（后端 grp）展示顺序 = 业务相关性（只在兜底卡里用到）。 */
 const SET_GROUP_ORDER = ["agent", "model", "provider", "voice", "wake", "meeting",
@@ -4145,13 +4149,38 @@ async function refreshRunStatus() {
   const st = _statusCache || {};
   const ag = st.agent || null;
   const tts = ((st.components || []).find((c) => c.name === "tts")) || null;
+  // 2026-10-05：这张卡要说的是"**转写实际走哪台**"。配对到远端时（同事那台机器的形状：
+  // 后端在别人的 GPU 上），只看本机那份必然显示"待启动"，而转写其实好好的 ——
+  // 用户实测原话："仪表盘上的后端显示没接上，但是转写成功了"。
+  if (!_capRoute || Date.now() - _capRouteAt > 5000) {
+    try { _capRoute = await api("/api/capability"); _capRouteAt = Date.now(); }
+    catch (e) { _capRoute = _capRoute || null; }
+  }
+  const remote = (() => {
+    const caps = _capRoute || {};
+    const es = ((caps.backends || []).find((b) => b.backendId === "echo-server")) || null;
+    if (!es || String(es.source || "local") === "local") return null;
+    const pair = caps.pair || {};
+    return { es: es, url: pair.baseUrl || es.baseUrl || "" };
+  })();
   const beRunning = !!(be && (be.running || (be.job && be.job.running)));
   const beReady = !!(be && ((be.runtime && be.runtime.ready) || be.ready || be.usable));
   // 三格都只出**短值**（用户的口径：后端：本机 / Agent：DSH标准版 / 语音合成：在线）
-  const beShort = beRunning ? "本机" : (beReady ? "待启动" : "未就绪");
-  const beTip = !be ? "读不到本机后端状态"
+  let beShort = beRunning ? "本机" : (beReady ? "待启动" : "未就绪");
+  let beTip = !be ? "读不到本机后端状态"
     : (beRunning ? `本机后端在跑（${be.baseUrl || "—"}）`
                  : (beReady ? "运行时已就绪，后端还没启动" : "本机后端未安装或未就绪"));
+  let beState = beRunning ? "online" : (beReady ? "idle" : "offline");
+  if (remote) {
+    // 远端才是转写真正走的那台 —— 本机那份"没跑"**不该**被报成故障（那正是让人
+    // 以为"没接上"的来源）。短值仍是两个字，细节照旧放 title。
+    const ok = !!remote.es.ready;
+    beShort = ok ? "远端" : "远端未接";
+    beState = ok ? "online" : "offline";
+    beTip = (ok ? `后端在 ${remote.url || "远端"}（配对来的远端；本机那份没在用）`
+                : `远端后端不可用（${remote.es.capsError || "读不到状态"}）`)
+      + `；本机那份：${beRunning ? "在跑" : "没跑"}`;
+  }
   const agName = ag ? (ag.displayName || ag.shortName || ag.name) : "读不到";
   const agTip = ag ? `执行智能体：${ag.displayName || ag.name}（${ag.detail || ag.status || ""}）`
                    : "读不到智能体状态";
@@ -4161,8 +4190,8 @@ async function refreshRunStatus() {
                      : "读不到语音合成组件状态";
   _bindCardLinks(host);
   host.innerHTML = [
-    _runCard("backend", "后端", beShort, beRunning ? "online" : (beReady ? "idle" : "offline"), beTip,
-             be && be.adminUrl ? { href: be.adminUrl, title: "打开后端管理页（发授权 / 看客户端 / 改配额）" } : null),
+    _runCard("backend", "后端", beShort, beState, beTip,
+             (!remote && be && be.adminUrl) ? { href: be.adminUrl, title: "打开后端管理页（发授权 / 看客户端 / 改配额）" } : null),
     _runCard("agent", "Agent", agName, ag && ag.online ? "online" : "offline", agTip,
              _agentLink(ag)),
     _runCard("tts", "语音合成", ttsShort, tts && tts.status === "online" ? "online" : "idle", ttsTip),
