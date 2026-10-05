@@ -95,7 +95,7 @@ body { min-width: 0; }
                         整页被撑宽（2026-09-19 模型路由页实测 bodyScrollW=508 / 视口 384） */
 }
 .card-title {
-  font-weight: 600; font-size: 15px; margin-bottom: 10px;
+  font-weight: 600; font-size: 15px; margin-bottom: 8px;
   display: flex; align-items: center; gap: 8px; line-height: 1.4;
   /* 标题行必须能换行 + 能缩：窄边条里"标题 + 长说明"排在 same 一行会把整页顶宽
      （长说明换行到第二行、标题文字允许被压缩/省略） */
@@ -1153,10 +1153,66 @@ body.on-history { height: 100vh; overflow-y: hidden; }
    所以下面所有新容器都带 min-width: 0，且下拉一律 `class="ctl"` 复用 select.ctl 的可收缩规则。 */
 
 .sset-who { font-size: 10.5px; color: var(--muted); margin: 6px 0 0; }
+
+  /* 声纹库（设置 → 声纹库）：紧凑列表（2026-10-02） */
+  .vp-list { margin-top: 3px; }
+  .vp-item { border-top: 1px solid var(--border); padding: 3px 0; min-width: 0; }
+  .vp-item:first-child { border-top: 0; }
+  .vp-head { display: flex; align-items: center; gap: 6px; font-size: 12px; min-width: 0; }
+  .vp-head .spacer, .vp-row .spacer { flex: 1; }
+  .vp-row { display: flex; align-items: center; gap: 5px; padding: 1px 0 1px 8px; min-width: 0; }
+  .vp-meta { font-size: 11px; color: var(--muted); overflow: hidden; text-overflow: ellipsis;
+    white-space: nowrap; min-width: 0; }
+  .vp-msg { font-size: 11px; }
+
+  
+  /* 仪表盘底部状态条（2026-10-02 用户口径：**底部一个细条**）
+     用**网格**而不是 flex：`.dashboard-grid .card` 那边有一堆 `display:flex; flex-direction:column`
+     和 `flex: 1 1 0` 的继承规则，实测会把状态条排成竖的、把三格压成 16px（截屏 + 量几何逮到的）。
+     网格列是写死的：三格各 1fr，右侧按钮列 auto；`#runStatusHost` 用 `display: contents`
+     让三格直接成为网格项。 */
+  .status-bar { min-width: 0; }
+  .dashboard-grid .card.status-bar {
+    flex: 0 0 auto; min-height: 0; padding: 2px 6px;
+    display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)) auto;
+    align-items: stretch; gap: 6px;
+  }
+  .status-bar > .sb-status { display: contents; }          /* 三格直接当网格项 */
+  /* 三格做成**小卡片**（用户 2026-10-02："变成三个小卡片试试" → 再改成两行）：
+     内嵌底色 + 边框 + 圆角；卡片内**两行**（上：灯 + 名，下：短值），与右侧按钮条等高（靠网格 stretch）。 */
+  .status-bar .sb-card { min-width: 0; display: inline-flex; flex-direction: column;
+    align-items: stretch; justify-content: center; gap: 1px;
+    padding: 3px 9px; background: var(--bg); border: 1px solid var(--border);
+    border-radius: 7px; box-shadow: inset 0 1px 0 rgba(255, 255, 255, .02); }
+  /* 第一行：灯 + 名（靠左，小一号、更灰） */
+  .status-bar .sb-card .sb-top { display: inline-flex; align-items: center; gap: 5px;
+    align-self: flex-start; min-width: 0; }
+  .status-bar .sb-card .dot { width: 7px; height: 7px; border-radius: 50%; flex: 0 0 auto; }
+  .status-bar .sb-lb { color: var(--muted); font-size: 10.5px; letter-spacing: .2px; flex: 0 0 auto; }
+  /* 第二行：短值（**靠右**，字重更重、跟状态同色 —— 用户 2026-10-02 的口径） */
+  .status-bar .sb-val { font-size: 12px; font-weight: 600; text-align: right; min-width: 0;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .status-bar .sb-card.is-online .sb-val { color: var(--green); }
+  .status-bar .sb-card.is-idle .sb-val { color: var(--yellow); }
+  .status-bar .sb-card.is-offline .sb-val { color: var(--red); }
+  /* 右侧那条：竖着三个小图标（细条的高度由它决定 ≈ 3×14 + 缝） */
+  .status-bar > .sb-ops { grid-column: 4; display: flex; flex-direction: column; justify-content: space-between;
+    gap: 1px; padding: 1px; border: 1px solid var(--border); border-radius: 6px;
+    background: var(--bg); justify-self: end; }
+  /* 三个按钮**不许被压扁**（实测 flex 列里它们会被挤到 33px 总高、第三个图标消失） */
+  .status-bar .sb-ops .btn.icon { flex: 0 0 14px; width: 22px; height: 14px; min-height: 14px;
+    padding: 0; display: grid; place-items: center; font-size: 11px; line-height: 1; }
+  .status-bar .rail-btn { position: static; flex: 0 0 14px; width: 22px; height: 14px; min-height: 14px; }
+  /* 路由块与状态文字（有内容时）另起一整行 */
+  .status-bar > .sb-fo, .status-bar > .sb-state { grid-column: 1 / -1; min-width: 0; }
+  .status-bar .sb-fo { display: flex; align-items: center; gap: 6px; }
+  .status-bar .sb-item { display: inline-flex; align-items: center; gap: 4px; color: var(--muted); }
+  .status-bar .sb-state { font-size: 11px; }
+
 .ssetpane { min-width: 0; display: flex; flex-direction: column; }
 
 /* 卡片：标题独占一行、整卡可折叠（折叠机制复用 .card.collapsible + applyCollapsedCards） */
-.settings-form .card { padding: 8px 9px; margin-bottom: 8px; }
+.settings-form .card { padding: 6px 8px; margin-bottom: 6px; }   /* 2026-10-02 紧凑 */
 .settings-form .card > .card-title { font-size: 12.5px; font-weight: 600; margin-bottom: 6px; gap: 6px; }
 .settings-form .card.closed > .card-body,
 .settings-form .card.collapsible.collapsed > .card-body { display: none; }
@@ -1164,7 +1220,7 @@ body.on-history { height: 100vh; overflow-y: hidden; }
 .sset-hint { font-size: 10.5px; color: var(--muted); margin: 0 0 4px; line-height: 1.5; }
 
 /* 行：标签与控件同一行（边条 84px，宽面板 150px） */
-.srow { display: flex; align-items: center; gap: 6px; padding: 4px 0;
+.srow { display: flex; align-items: center; gap: 6px; padding: 3px 0;
   border-top: 1px solid var(--border); min-width: 0; }
 .srow:first-child { border-top: 0; }
 .srow > .lbl { flex: 0 0 84px; min-width: 0; display: flex; align-items: center; gap: 4px;
@@ -1206,7 +1262,7 @@ body.on-history { height: 100vh; overflow-y: hidden; }
 .sq:hover .spop, .sq.open .spop { display: block; }
 
 /* 高级设置区：默认收起，点「▶ 高级」向下展开 */
-.sadv { margin-top: 5px; border-top: 1px dashed var(--border); padding-top: 4px; min-width: 0; }
+.sadv { margin-top: 4px; border-top: 1px dashed var(--border); padding-top: 3px; min-width: 0; }
 .sadvbtn { background: transparent; border: 0; color: var(--muted); font-size: 11px;
   cursor: pointer; padding: 1px 0; }
 .sadvbtn:hover { color: var(--accent); }
@@ -1215,9 +1271,26 @@ body.on-history { height: 100vh; overflow-y: hidden; }
 .sadv.open .sadvbtn .set-arrow { transform: rotate(90deg); }
 .sadvbody { display: none; margin-top: 3px; min-width: 0; }
 .sadv.open .sadvbody { display: block; }
-.ssec { font-size: 10px; color: var(--muted); letter-spacing: .4px; margin: 8px 0 2px; padding-top: 7px;
-  border-top: 1px solid var(--border); display: flex; align-items: center; gap: 4px; }
-.ssec:first-child { border-top: 0; padding-top: 2px; margin-top: 2px; }
+/* 二级分组：一张**内嵌小卡片**（头 + 内容）。2026-10-02 用户："AI组件下面的 Agent、转写服务、
+   语音合成等二级分组也改进一下样式，其他二级分组也同样改造"。
+   与仪表盘底部那三格同一套视觉语言（内嵌底色 + 1px 边框 + 圆角），由 app.js 的 `sSub()` 产出；
+   模型路由卡那 4 处是静态 HTML，手写同一套标记（`.ssec` 已全部迁走，不再有这个样式）。 */
+.ssub { background: var(--bg); border: 1px solid var(--border); border-radius: 7px;
+  padding: 2px 8px 3px; margin: 4px 0; min-width: 0; }
+.ssub-h { font-size: 10.5px; color: var(--muted); letter-spacing: .3px;
+  display: flex; align-items: center; gap: 4px; padding: 1px 0; }
+.ssub > .srow:first-of-type, .ssub > .sset-hint:first-of-type { border-top: 0; }
+/* 二级分组也能折叠（2026-10-02 用户："二级卡片也能折叠"）：点标题收起/展开，状态与整卡同一套
+   （localStorage `echo.panel.collapsedCards`）。箭头：展开时朝下（90°），收起时朝右。 */
+.ssub.collapsible > .ssub-h { cursor: pointer; user-select: none; }
+.ssub.collapsible > .ssub-h:hover { color: var(--accent); }
+/* 折叠标记在**右侧**、是**向下双箭头**（与一级卡片左侧单箭头区分）；收起时翻 180°。 */
+.ssub-h { justify-content: space-between; }
+.ssub-chev { display: inline-flex; align-items: center; color: var(--muted);
+  transition: transform .12s; flex: 0 0 auto; }
+.ssub.collapsible.collapsed > .ssub-h .ssub-chev { transform: rotate(180deg); }
+.ssub.collapsible.collapsed > .ssub-body { display: none; }
+.ssub.collapsible.collapsed { padding-bottom: 1px; }   /* 收起后别留一截空白 */
 
 /* 状态/提示 */
 .sbadge { font-size: 10px; border-radius: 99px; padding: 1px 6px; white-space: nowrap; flex: 0 0 auto;
@@ -1237,7 +1310,7 @@ body.on-history { height: 100vh; overflow-y: hidden; }
 .snote.err { background: rgba(239,91,91,.08); border-color: #5a2f34; color: #f0a0a0; }
 .snote code { background: var(--bg); border: 1px solid var(--border); border-radius: 4px;
   padding: 0 3px; font-size: 10.5px; color: #bcd6ff; overflow-wrap: anywhere; }
-.sacts { display: flex; align-items: center; gap: 5px; flex-wrap: wrap; min-width: 0; padding: 3px 0; }
+.sacts { display: flex; align-items: center; gap: 5px; flex-wrap: wrap; min-width: 0; padding: 2px 0; }
 .sacts .btn { padding: 2px 7px; font-size: 11px; }
 .sbe { display: flex; align-items: baseline; gap: 6px; flex-wrap: wrap; padding: 5px 0;
   border-top: 1px solid var(--border); min-width: 0; }
@@ -1254,3 +1327,13 @@ body.on-history { height: 100vh; overflow-y: hidden; }
 /* 新加的行同样必须能收缩（见 docs/面板布局-窄边条.md §2 与 test_panel_layout.py） */
 .ssetpane, .srow, .srow-wrap, .srow > .sctl, .schk2, .sadv, .sadvbody,
   .sacts, .sbe, .snote, .sdesc { min-width: 0; }
+
+/* 开发版牌子：只有 dev 实例会亮（见 app.js::initInstanceBadge）。默认 hidden，交付物不受影响。 */
+.badge.inst { margin-left: 6px; font-size: 10.5px; padding: 1px 6px; border-radius: 999px;
+  color: #f0b429; border: 1px solid rgba(240, 180, 41, .55); background: rgba(240, 180, 41, .10); }
+
+/* 状态小卡上的 ↗ 网页入口（后端管理页 / Agent 自己的网页；2026-10-05 用户要求） */
+.sb-go { margin-left: 4px; font-size: 10.5px; line-height: 1; color: var(--muted, #8a93a5);
+  cursor: pointer; padding: 0 2px; border-radius: 4px; }
+.sb-go:hover, .sb-go:focus { color: var(--blue, #4c9aff); background: rgba(76, 154, 255, .12); }
+.sb-card:hover .sb-go { color: var(--fg, #c9d1d9); }

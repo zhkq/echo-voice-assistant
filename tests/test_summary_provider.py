@@ -194,6 +194,22 @@ class SpawnTests(unittest.TestCase):
             meeting._spawn_provider_summary(7, self.folder)
             return _wait_for_file(os.path.join(self.folder, "summary.md"))
 
+    def _wait_for_log(self, level=None, needle=None, timeout=5.0):
+        """等某条日志出现 → bool。**别用固定 `time.sleep` 等异步效果。**
+
+        现场（2026-10-01 全量门禁）：`test_no_provider_is_logged` 起完线程只 `sleep(0.15)` 就断言，
+        而那机器当时正在被扫描刚写出的 3 GB 包 —— 150 毫秒不够，于是**单跑绿、全量红**。
+        这与 `_run` 用 `_wait_for_file` 等文件是同一个道理：断言的**含义**不变（这条日志必须出现），
+        别再赌"机器有多快"。
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            for lv, msg in list(self.logs):
+                if (level is None or lv == level) and (needle is None or needle in msg):
+                    return True
+            time.sleep(0.02)
+        return False
+
     def test_writes_summary_and_logs_success(self):
         fake = _FakeLlm()
         self.assertTrue(self._run(fake), "纪要应该落盘")
@@ -237,7 +253,8 @@ class SpawnTests(unittest.TestCase):
         with patch.object(meeting, "_llm_provider_for_summary",
                           lambda: (None, "没有可用的 LLM provider")):
             meeting._spawn_provider_summary(7, self.folder)
-            time.sleep(0.15)
+            got = self._wait_for_log(level="error")
+        self.assertTrue(got, self.logs)
         self.assertTrue(any(lv == "error" for lv, _m in self.logs), self.logs)
 
 

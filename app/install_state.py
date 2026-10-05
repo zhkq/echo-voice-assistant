@@ -307,14 +307,27 @@ def missing(report: dict = None) -> list:
         except Exception:
             pass
 
-    if want["agent"] in ("harness", "dsh"):
+    # 2026-10-04（用户实测指出）：这一项**必须看当前设置**，不能只看装机报告。
+    # 报告是装机那一刻写下的（例如 agent=harness）；用户在面板里把执行智能体改成
+    # DSH Desktop 之后报告不会变 —— 于是这里照旧去查 harness，永远报
+    # "harness 没在运行、还没装完"。用户的原话："我改成 dsh desktop 你停掉标准版，
+    # 这个是合理的，报错是因为你还在查标准版？…把这段检查目标改成跟设置一样，
+    # 或者跟仪表盘最下方的探测方式一致" —— 仪表盘底部那个 Agent 卡片看的就是
+    # `agentBackend`，所以这里也以它为准；报告只在**设置里没有**时兜底（老安装）。
+    agent_now = want["agent"]
+    try:
+        from app.config import settings as _s
+        agent_now = str(_s.get("agentBackend", "") or "").strip() or agent_now
+    except Exception:
+        pass
+    if agent_now in ("harness", "dsh"):
         # **按选中的那个适配器**判断在不在线。
         # 原来对 harness 与 dsh 都去问标准版 harness —— 而 `_harness_online()` 在
         # `harness_proc.requested()` 为假（= agentBackend 不是 harness）时**必然返回 False**，
         # 于是选了 DSH Desktop 的机器永远被告知"harness 没在运行、还没装完"
         # （2026-09-23 迁移实测撞到：Desktop 正在跑、面板仍列这一条）。
         # 与同事报过的「拿另一个适配器的状态判断」是同一个病。
-        if want["agent"] == "dsh":
+        if agent_now == "dsh":
             if not _dsh_online():
                 out.append({"feature": "智能体（会议纪要 / 归档 / 语音指令）",
                             "reason": "DSH Desktop 没在运行（你选的是桌面版）",

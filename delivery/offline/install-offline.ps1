@@ -1,11 +1,12 @@
 # =====================================================================
 # install-offline.ps1 - one-command OFFLINE install for the ECHO min kit.
 #
-# This file lives in the kit root (next to ECHO\ and bundle\).
+# This file lives in the kit root (next to echo-core\ and bundle\; older kits
+# call the code folder ECHO\ and both names are accepted).
 # It is a thin wrapper: it forwards to the real fast-path installer that
 # ships inside the main package:
 #
-#     ECHO\scripts\install-all.ps1 -Offline -Yes -Agent none ...
+#     echo-core\scripts\install-all.ps1 -Offline -Yes -Agent none ...
 #
 # Why a wrapper instead of putting the logic here:
 #   * install-all.ps1 is part of the packed tree (scripts\ is whitelisted by
@@ -42,10 +43,11 @@ $ErrorActionPreference = 'Stop'
 $here = $PSScriptRoot
 if (-not $here) { try { $here = Split-Path -Parent $PSCommandPath } catch { $here = (Get-Location).Path } }
 
-$all = Join-Path $here 'ECHO\scripts\install-all.ps1'
+$all = Join-Path $here 'echo-core\scripts\install-all.ps1'
+if (-not (Test-Path $all)) { $all = Join-Path $here 'ECHO\scripts\install-all.ps1' }
 if (-not (Test-Path $all)) {
-    Write-Host ("  [x] missing {0} - the kit looks incomplete (ECHO\scripts\install-all.ps1)" -f $all) -ForegroundColor Red
-    Write-Host '      Re-unpack the kit zip, or run ECHO\scripts\install.ps1 manually.' -ForegroundColor Yellow
+    Write-Host ("  [x] missing {0} - the kit looks incomplete (echo-core\scripts\install-all.ps1)" -f $all) -ForegroundColor Red
+    Write-Host '      Re-unpack the kit zip, or run echo-core\scripts\install.ps1 manually.' -ForegroundColor Yellow
     exit 1
 }
 if (-not (Test-Path (Join-Path $here 'bundle\wheels'))) {

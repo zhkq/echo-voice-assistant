@@ -151,26 +151,56 @@ class InstallReportTests(unittest.TestCase):
         "harness 没在运行、还没装完"。与同事报过的「拿另一个适配器的状态判断」是同一个病。
         """
         report = {"engines": [], "agent": "dsh"}
-        # Desktop 在线 + harness 必然"不在线"：不该报任何缺失
-        with patch.object(install_state, "_dsh_online", lambda: True), \
-                patch.object(install_state, "_harness_online", lambda: False), \
-                patch.object(install_state, "_node_ok", lambda: False):
-            self.assertEqual([], install_state.missing(report),
-                             "选了 Desktop 却拿 harness 的状态报缺失")
-        # Desktop 不在线：要把原因说成桌面版，别再提 harness
-        with patch.object(install_state, "_dsh_online", lambda: False):
-            miss = install_state.missing(report)
+        # 显式钉住设置（2026-10-04）：这一段现在以 `agentBackend` 为准，
+        # 不打桩就会跟着**开发机上当前的选择**跑（本机切到 dsh 时这条才碰巧过）。
+        with patch("app.config.settings.get", side_effect=lambda k, d=None: {
+                "agentBackend": "dsh"}.get(k, d)):
+            # Desktop 在线 + harness 必然"不在线"：不该报任何缺失
+            with patch.object(install_state, "_dsh_online", lambda: True), \
+                    patch.object(install_state, "_harness_online", lambda: False), \
+                    patch.object(install_state, "_node_ok", lambda: False):
+                self.assertEqual([], install_state.missing(report),
+                                 "选了 Desktop 却拿 harness 的状态报缺失")
+            # Desktop 不在线：要把原因说成桌面版，别再提 harness
+            with patch.object(install_state, "_dsh_online", lambda: False):
+                miss = install_state.missing(report)
         self.assertTrue(miss)
         self.assertIn("DSH Desktop 没在运行", miss[0]["reason"])
         self.assertNotIn("harness 没在运行", miss[0]["reason"])
 
     def test_harness_choice_still_checks_node_and_harness(self):
         report = {"engines": [], "agent": "harness"}
-        with patch.object(install_state, "_dsh_online", lambda: True), \
-                patch.object(install_state, "_node_ok", lambda: False):
-            miss = install_state.missing(report)
+        with patch("app.config.settings.get", side_effect=lambda k, d=None: {
+                "agentBackend": "harness"}.get(k, d)):
+            with patch.object(install_state, "_dsh_online", lambda: True), \
+                    patch.object(install_state, "_node_ok", lambda: False):
+                miss = install_state.missing(report)
         self.assertTrue(miss)
         self.assertIn("Node.js", miss[0]["reason"])
+
+    def test_the_live_setting_beats_a_stale_install_report(self):
+        """**报告是旧的、设置是新的**时以设置为准（2026-10-04 用户实测撞到）。
+
+        现场：装机报告写着 `agent=harness`（装机那一刻的选择），用户在面板里把执行智能体
+        改成 DSH Desktop → harness 被主动停掉（这是**对的行为**），可这段检查仍旧照报告去问
+        harness → 横幅永远说"harness 没在运行、还没装完"。
+        用户原话："我改成 dsh desktop 你停掉标准版，这个是合理的，报错是因为你还在查标准版？
+        如果是这样，你就要把这段检查目标改成跟设置一样，或者跟仪表盘最下方的探测方式一致。"
+        —— 仪表盘底部那个 Agent 卡片看的就是 `agentBackend`，所以这里也以它为准。
+        """
+        report = {"engines": [], "agent": "harness"}          # 旧报告
+        with patch("app.config.settings.get", side_effect=lambda k, d=None: {
+                "agentBackend": "dsh"}.get(k, d)):
+            with patch.object(install_state, "_dsh_online", lambda: True), \
+                    patch.object(install_state, "_harness_online", lambda: False), \
+                    patch.object(install_state, "_node_ok", lambda: False):
+                self.assertEqual([], install_state.missing(report),
+                                 "报告说 harness、设置说 dsh —— 该按设置(dsh)判，别去查 harness")
+            with patch.object(install_state, "_dsh_online", lambda: False):
+                miss = install_state.missing(report)
+        self.assertTrue(miss)
+        self.assertIn("DSH Desktop 没在运行", miss[0]["reason"])
+        self.assertNotIn("harness", miss[0]["reason"])
 
     def test_state_exposes_engine_detail(self):
         report = {"engines": ["sherpa"], "agent": "none"}

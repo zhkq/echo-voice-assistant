@@ -47,6 +47,24 @@ def _real_pid_bytes():
         return None
 
 
+def _real_rows_with(text: str) -> int:
+    """真实库里有多少行 logs 提到 `text`（库/表不存在都算 0，**永不抛**）。
+
+    为什么按内容判：真实库的 `(大小, mtime)` 会被**任何**无关写入改掉（用户正在用 ECHO
+    就会），那样这条护栏会变成"看运气"；"这条路径写的那行日志有没有落到真库"才是它的本意。
+    """
+    import sqlite3
+    try:
+        conn = sqlite3.connect("file:%s?mode=ro" % _REAL_DB_PATH.replace("\\", "/"), uri=True)
+        try:
+            return int(conn.execute("select count(*) from logs where message like ?",
+                                    ("%" + text + "%",)).fetchone()[0])
+        finally:
+            conn.close()
+    except Exception:
+        return 0
+
+
 def _real_db_stat():
     """真实库的 (大小, mtime_ns)；不存在 -> None。**只 stat，不读不写**。"""
     try:
@@ -140,7 +158,6 @@ class IsolationTests(unittest.TestCase):
           * 日志**真的写了**（写进被隔离的那个库）—— 不能靠"把日志关掉"来通过；
           * 真实库的 (大小, mtime) 一个字节没变。
         """
-        before = _real_db_stat()
         proc = _sleep_proc()
         self.addCleanup(_kill, proc)
         self.assertTrue(backend_pid.write_pid(proc.pid))
@@ -155,8 +172,11 @@ class IsolationTests(unittest.TestCase):
         finally:
             conn.close()
         self.assertGreater(count, 0, "隔离库里应该有那条日志（否则这条护栏没有意义）")
-        # ② 真实库没被动
-        self.assertEqual(_real_db_stat(), before,
+        # ② 真实库没被**这条路径**写进去 —— 按**内容**判，不按 (大小, mtime)：
+        #    2026-10-05 实测：开发机上 ECHO 正被真实使用（语音指令 / 录音 / 纪要）时，
+        #    真实库本来就在被写，按 mtime 比会**冤枉**这条用例（门禁连红两次，
+        #    查真库 logs 的时间戳才确认写它的是用户自己的操作）。
+        self.assertEqual(0, _real_rows_with("护栏用例"),
                          "用例写进真实 data/echo.db 了（%s）" % _REAL_DB_PATH)
 
 

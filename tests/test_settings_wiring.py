@@ -34,6 +34,67 @@ from app.config import (CLEAR_SECRET, DEPRECATION_MIGRATIONS,    # noqa: E402
                         DEFAULTS, SETTING_ORDER, settings)
 
 
+#: `setUpModule` 存下来的原函数（`tearDownModule` 还回去用）。
+_orig_list_agents = None
+
+
+def _no_agent_probe(probe=False):
+    """`agents.list_agents` 的替身：**不探活**。
+
+    为什么需要它（2026-10-01 实测）：`app/api.py::get_settings` 每次都会调
+    `agents.list_agents()` 往响应里塞 `agents` 字段，而它逐个智能体**真探活** ——
+    `harness` 连不上时空等满 3s 超时、`dsh` 再等 1.2s，一次 `GET /api/settings`
+    实测 **4292ms**（打桩后 **27ms**，快 160 倍）。本模块对 120 个设置项逐个
+    `PUT` + `GET`（`RoundTripTests._served_now()` 也是 GET），于是
+    "设置能不能读回来"变成了在量三个本机服务的探活超时。
+
+    **实测收益**（2026-10-01，同一台机器、连着量两遍取稳的那个数）：
+    `test_every_setting_round_trips` 单条 **355.6s → 48~50s**；
+    本模块整体 **374s → 81~89s**（省约 5 分钟，约占全量门禁的 4%）。
+    剩下那 50s 是这条用例本身在打 360 次 HTTP，与探活无关。
+
+    这个字段在本模块里**没有任何用例断言**（`/api/settings` 的 `agents` 只给面板用），
+    探活结论也与"设置读得回来"无关。返回 `None` 与 `get_settings` 里那句
+    `except Exception` 兜底时的取值一致，响应形状不变。
+
+    **铁律（和 `_quiet_side_effects` 同一类）**：测试不许让"读一次配置"顺手去探本机
+    服务/起进程 —— 那既慢又会随这台机器装了什么而变（探活结论本来就跟机器有关）。
+    """
+    return None
+
+
+def setUpModule():
+    """把"读一次配置就顺手探活本机服务"整条路哑掉（见 `_no_agent_probe`）。
+
+    **为什么是模块级而不是塞进 `_quiet_side_effects`**：那个 contextmanager 只包住
+    `PUT`，而这条用例里**读那半边**（`_served_now()` / `GET /api/settings`）在它外面，
+    实测正是读那半边占掉了 355s 里的绝大部分。放在模块级才盖得住两条路。
+
+    用**属性替换**而不是 `unittest.mock.patch` 装饰器：这里没有"进入/退出"的边界，
+    模块跑完在 `tearDownModule` 里原样还回去（与 `tests/test_harness_agent.py`
+    在 `setUpModule` 里把 pid/token 路径指到临时目录是同一种隔离手法）。
+    """
+    import app.agents as agents_mod
+    global _orig_list_agents
+    _orig_list_agents = agents_mod.list_agents
+    agents_mod.list_agents = _no_agent_probe
+
+
+def _view_block(html, view):
+    """取 `#view-<view>` 那一整段（到它自己的 `</section>` 为止）。
+
+    2026-10-02 加的（IA 重构的副产品）：以前这种"某块必须在这一页里"的断言写成
+    `assertLess(html.index('id="view-x"'), html.index('id="host"'))` —— 视图 id 一改名
+    就抛 `ValueError: substring not found`（那报错看不出"是页签被合并了"）。
+    这个助手同样只做存在性判定，但找不到视图时给的是断言失败 + 清楚的消息。
+    """
+    start = html.find('id="view-%s"' % view)
+    if start < 0:
+        raise AssertionError("index.html 里没有 #view-%s（页签被改名或合并了？）" % view)
+    end = html.find("</section>", start)
+    return html[start:end]
+
+
 def _load_audit():
     """把 scripts/audit-settings.py 当模块载入（文件名带连字符，不能直接 import）。"""
     path = os.path.join(_ROOT, "scripts", "audit-settings.py")
@@ -253,13 +314,19 @@ def _quiet_side_effects():
     **`_stt` 同理**（2026-09-23 补）：这轮 PUT 里有 `sttModel`/`meetingSttModel`，
     联动会去 `boot.start_component("stt-cmd")` —— 那是**真加载模型**（funasr/whisper，
     几 GB、几十秒），测试会被拖死甚至把显存占满。设置能不能读回来与它无关。
+
+    **`GET /api/settings` 那条读路**（`agents.list_agents()` 探活）不在这里哑 ——
+    它由本模块的 `setUpModule` 整段处理，见 `_no_agent_probe`。理由：这个
+    contextmanager 只包住 `PUT`，而实测占时间的恰恰是它**外面**的 `GET`。
     """
     with patch("app.runtime.stop_wake"), patch("app.runtime.start_wake"), \
             patch("app.router_admin.apply_settings", lambda updated: (True, "")), \
             patch("app.settings_effects._agent",
                   lambda *a, **kw: {"scope": "agent", "ok": True, "detail": ""}), \
             patch("app.settings_effects._stt",
-                  lambda *a, **kw: {"scope": "stt", "ok": True, "detail": ""}):
+                  lambda *a, **kw: {"scope": "stt", "ok": True, "detail": ""}), \
+            patch("app.settings_effects._hotkey",
+                  lambda *a, **kw: {"scope": "hotkey", "ok": True, "detail": ""}):
         yield
 
 
@@ -588,11 +655,16 @@ class OptionAndPanelWiringTests(unittest.TestCase):
         self.assertIn("if (!_panelRefreshDue()) return;", js)
 
     def test_tts_has_exactly_one_selector(self):
-        """TTS 只有一个开关：能力页签里那个 `ttsEngine` 下拉（providerTts 已弃用）。"""
+        """TTS 只有一个开关 `ttsEngine`，而且只在「设置 → AI组件 → 高级 → 能力选择」那一处。
+
+        2026-10-02：IA 重构后能力卡不再放 `data-tts-engine` 下拉（旧断言钉的正是它）。
+        """
         js = _read(os.path.join("web", "app.js"))
-        self.assertIn("data-provider-kind", js)
-        self.assertIn("data-tts-engine", js, "TTS 的选择走 ttsEngine 这一个开关")
-        self.assertNotIn('data-provider-kind="tts"', js, "不许再给 TTS 放第二个 provider 下拉")
+        self.assertNotIn("data-tts-engine", js, "能力卡里不许再有第二个 TTS 开关")
+        self.assertRegex(js, r'sSub\("语音合成", renderSettingRows\(settingRows\(\["ttsEngine"\]\)\)\)',
+                           "朗读的开关在「AI组件 → 语音合成」里（2026-10-02 按用户层级搬的）")
+        self.assertRegex(js, r'settingRows\(\["sttModel", "wakeEngine"\]\)',
+                         "「能力选择」留转写 / 唤醒引擎")
         self.assertNotIn("providerTts", js, "弃用项不该被面板引用")
 
     def test_capability_page_covers_every_capability_kind(self):
@@ -619,12 +691,16 @@ class OptionAndPanelWiringTests(unittest.TestCase):
             意图不变：**先"用哪个实现"，再配通道成员** —— 改成比"`rtLlmHost` 在 `rtMembers` 之前"。
           * 2026-09-26 IA 重构：那一页叫「能力与智能体」，id 仍是 `capability`
             （深链 `?view=agent` 由 VIEW_ALIASES 折算过去）。
+          * 2026-10-02 IA 重构：那一页并进顶层「设置」（`id="view-settings"`），
+            `#view-capability` 已删除 —— 这里改用 `_view_block()` 按新的 `#view-settings`
+            取段落（同样只做"在这页里"的存在性判定，比 `index()` 更结实：视图被拆/搬走时
+            是断言失败而不是 `ValueError`）。
         """
         js = _read(os.path.join("web", "app.js"))
         html = _read(os.path.join("web", "index.html"))
         self.assertIn('id="rtLlmHost"', html)
-        self.assertLess(html.index('id="view-capability"'), html.index('id="rtLlmHost"'),
-                        "语言模型块要在「能力与智能体」页签里")
+        self.assertIn('id="rtLlmHost"', _view_block(html, "settings"),
+                      "语言模型块要在「设置」页签里")
         self.assertLess(html.index('id="rtLlmHost"'), html.index('id="rtMembers"'),
                         "「语言模型」小节要排在「通道成员」小节之前（先选用哪个，再配通道）")
         self.assertIn("function loadRouterLlm", js)
@@ -637,18 +713,25 @@ class OptionAndPanelWiringTests(unittest.TestCase):
         self.assertIn("refreshAfterProviderChange", js)
 
     def test_capability_card_shows_status_only_once(self):
-        """能力卡的状态只显示一次（2026-09-19 用户看截图指出：下拉下面的附属、两种实现都是重复）。
+        """能力卡的状态只显示一次（2026-09-19 用户看截图指出：下拉下面的附属行、两种实现都是重复）。
 
-        * 状态并进下拉选项文字（`capOptLabel`：名字 + 出网/本地 · 就绪）；
-        * 不再有"当前 XXX · 已就绪"这种附属行，也不再有单列一遍"两种实现"的列表
-          （那两处与下拉选项、顶部概览条是同一份信息的第 2/3 份拷贝）。
+        2026-10-02：编辑控件（那个下拉）收进「设置 → AI组件 → 高级 → 能力选择」之后，卡里
+        只剩一行"当前是哪个实现" + 出网图标 + 一个「去改 ›」入口 —— 所以 `capOptLabel` /
+        `capTtsOptionLabel` 这两个"把状态并进下拉选项"的助手也随之删掉（没有下拉可并了）。
+        判据保留原意：状态只有一处、不重复列一遍、没有附属行。
         """
         js = _read(os.path.join("web", "app.js"))
-        for token in ("function capOptLabel", "function capTtsOptionLabel"):
-            self.assertIn(token, js, "状态要并进下拉选项里")
-        self.assertNotIn("当前 <b>", js, "下拉下面不该再挂一行「当前 XXX」")
+        self.assertIn("function capEgressIcon", js, "出网图标还在（状态那一行要用）")
+        for gone in ("capOptLabel", "capTtsOptionLabel"):
+            with self.subTest(gone=gone):
+                self.assertNotIn(gone, js, "%s 随下拉一起删掉了" % gone)
+        self.assertNotIn("当前 <b>", js, "不该再挂一行「当前 XXX」")
         self.assertNotIn("cap-prov-state", js, "不该再单列一遍各实现的状态")
-        self.assertNotIn("cap-prov-row", js, "下拉行不再需要标签行容器")
+        self.assertNotIn("cap-prov-row", js, "状态那一行不需要额外的标签行容器")
+        block = js[js.index("function capProviderBlock"):]
+        block = block[:block.index("function capOnlineBlock")]
+        self.assertEqual(block.count('data-goto="settings"'), 1,
+                         "改在哪里只留一个入口（去改 ›）")
 
     def test_egress_warning_is_an_icon_with_a_tooltip(self):
         """出网提醒＝黄色三角图标 + 悬停 title（2026-09-19 用户要求：别占一整行）。"""
@@ -675,9 +758,9 @@ class OptionAndPanelWiringTests(unittest.TestCase):
         self.assertEqual(declared, want, "路由参数集合与 config 的 router 组漂移了")
 
     def test_router_settings_live_in_the_capability_tab(self):
-        """路由参数（grp=router 的 7 项）住在**顶层「能力与智能体」页签**那张「模型路由」卡的「高级」里。
+        """路由参数（grp=router 的 7 项）住在承载路由卡的那个顶层页签的「模型路由」卡「高级」里。
 
-        这一条**改过四次断言**，四次都是"旧布局"（意图一次没变：这 7 项有且仅有一个落点）：
+        这一条**改过五次断言**，五次都是"旧布局"（意图一次没变：这 7 项有且仅有一个落点）：
           * 2026-09-19 版：它们在「设置」页里；
           * 2026-09-25 版：搬到顶部「模型路由」页签，那一页留一张指路卡；
           * 2026-09-25 整合后：四个设置视图**就是顶层页签**，指路卡连同 `#rtSetGo` 一起删掉，
@@ -687,11 +770,16 @@ class OptionAndPanelWiringTests(unittest.TestCase):
             （`#rtMergeCard`，三个 host 要被 loadRouter 系列反复渲染，动态生成会和并发请求
             互相覆盖），7 行参数由 `renderSettingsPanes()` 填进它的 `#rtSetHost`，
             落库交给卡内的「保存」（`saveRouter()` → `collectSettingValues("#rtSetHost")`）。
-          * 2026-09-26（本次，IA 重构）：**会议能力通道那 3 项搬出这张卡** ——
+          * 2026-09-26：**会议能力通道那 3 项搬出这张卡** ——
             用户把"转写走哪条路"归进了「业务配置 → 会议」（一个实体只有一处状态），
             所以 `#rtCapHost` 连同 `RT_SAVE_HOSTS` 里的第二个 host 一起撤掉，
             那两项设置（分离 / 声纹由谁做）改由 `renderMeetingServiceCard()` 画在会议卡里。
             卡内「保存」现在只收 `#rtSetHost` 一处。
+          * 2026-10-02（IA 重构）：**承载它的页签**从「能力与智能体」并进顶层「设置」
+            （`id="view-settings"`，`#view-capability` 已删除）。这条用例里两处
+            "必须在这一页里"的断言从 `html.index('id="view-capability"')` 比较
+            改成 `_view_block(html, "settings")` 的存在性判定 —— 断言的**意图**
+            （静态卡存在/7 项有落点/通道成员同页）一个字没动。
 
         所以这里守的是：①静态卡存在且带折叠标记；②7 项参数确实被填进它的高级区；
         ③落点表不再把它们当成"未归类"（`SET_PLACED_ELSEWHERE`）；④卡内的保存会收这些行；
@@ -728,9 +816,13 @@ class OptionAndPanelWiringTests(unittest.TestCase):
                     "routerBreakerThreshold", "routerBreakerCooldown"):
             with self.subTest(key=key):
                 self.assertIn('"%s"' % key, mp.group(1), "%s 没登记落点（会掉进未归类卡）" % key)
-        self.assertIn('id="rtMembers"', html, "成员与优先级那块仍在「能力与智能体」页签里")
-        self.assertLess(html.index('id="view-capability"'), html.index('id="rtMembers"'),
-                        "通道成员要在「能力与智能体」页签里")
+        self.assertIn('id="rtMembers"', html, "成员与优先级那块还在承载路由的那一页里")
+        # 2026-10-02：IA 重构，旧断言 `assertLess(html.index('id="view-capability"'),
+        # html.index('id="rtMembers"'))` → 新断言用 `_view_block(html, "settings")`。
+        # 理由：「能力与智能体」并进顶层「设置」（`#view-capability` 已删除），
+        # 而两张卡片都在这页里 —— 意图不变（通道成员必须和路由卡同页）。
+        self.assertIn('id="rtMembers"', _view_block(html, "settings"),
+                      "通道成员要在「设置」页签里")
         self.assertIn("renderSettingRow", js, "复用同一套行渲染（样式一致）")
         self.assertIn("async function ensureSettings", js, "多个页签共用一份设置数据")
 
@@ -859,6 +951,11 @@ def tearDownModule():
     _cfg_module = sys.modules.get("app.config")
     if _cfg_module is not None:
         _cfg_module.__dict__.pop("_cache", None)
+    # 把 setUpModule 换掉的 `list_agents` 还回去（不还的话，后面某个模块如果
+    # 依赖真实探活，报出来的会是"这里改的"，现象联想不到）。
+    if _orig_list_agents is not None:
+        import app.agents as agents_mod
+        agents_mod.list_agents = _orig_list_agents
 
 
 if __name__ == "__main__":

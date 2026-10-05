@@ -51,6 +51,15 @@ VRAM_DIARIZE_MB = 2600
 VRAM_MIN_MB = 8 * 1024
 #: 分离档对算力的要求：pyannote 4.x 要 torch>=2.8，而 cu118 上带 Pascal 的最后一版是 2.7.1。
 MIN_COMPUTE_CAP_FOR_DIARIZE = 7.5
+#: **Blackwell（RTX 50 系）要 cu128**（2026-10-01 真机定）。
+#:
+#: 起因：这台机器是 `RTX 5060 Laptop`，`compute_cap = 12.0`（sm_120），而旧判据只分
+#: "老卡 → cu118 / 其余 → cu126" —— 于是它算成 **cu126**，而 cu126 那套轮子里**没有 sm_120
+#: 的 kernel**：表现不是"装不上"，是**装上了、起来了、一跑模型就报 CUDA 错**（或每个
+#: `/v1/asr` 都 503），最难查的那一类。dev 这台能跑的正是 `torch 2.10.0+cu128`。
+#:
+#: 12.0 = Blackwell 消费级（RTX 50 系）。Hopper（9.0）在 cu126 上没问题，所以门槛定在 12。
+MIN_COMPUTE_CAP_FOR_CU128 = 12.0
 
 #: 每个变体要哪几棵权重子树：`(标签, 候选相对路径…)`。
 #:
@@ -70,6 +79,11 @@ VARIANT_MODELS: Dict[str, Tuple[Tuple[str, Tuple[str, ...]], ...]] = {
               ("pyannote", ("pyannote",))),
     "cu118": (("sensevoice", ("sensevoice", "iic--SenseVoiceSmall")),),
 }
+#: cu128（Blackwell，见 `MIN_COMPUTE_CAP_FOR_CU128`）要的权重与 cu126 **完全一样**：
+#: 差别只在 torch 的 CUDA 轮子，模型那几棵不受影响。**必须登记**——没登记时
+#: `weights("cu128")` 的 `wanted` 是空表，面板会显示"模型 0/0 就绪"（看着像齐了），
+#: 而实际上是"这一档根本没在查权重"。
+VARIANT_MODELS["cu128"] = VARIANT_MODELS["cu126"]
 
 #: 容器路必须先验一步的那条命令（实施方案 §6-1：Windows + Docker Desktop 的 GPU 直通
 #: 是这条路上最容易翻车的一步，不通就整条路降级成扩展包路）。
@@ -241,8 +255,90 @@ def check_torch_abi(python_exe: str, timeout: float = 180.0) -> Dict[str, Any]:
     return out
 
 
+#: 「运行时到底**能不能用**」快探要 import 的那几个包（约 1 秒 —— 每次点「起本机后端」
+#: 都付得起，所以它够格当那条闸门）。
+#:
+#: 判据的由来（2026-10-01 真机打脸）：薄包**只带解释器**，fastapi / uvicorn / numpy 这些
+#: 全靠"取运行时"那一步装。而当时的判据是"`runtime/` 里有没有 `python.exe`" —— 解释器在
+#: 就记「运行时已在」并**跳过装依赖**，于是后端一起来就
+#: `ModuleNotFoundError: No module named 'fastapi'` 退出（面板上只剩"后端起来后立刻退出了"）。
+#: **"有解释器"不等于"运行时能用"**：`backend_proc.python_exe()` 那条判据在别处照样对
+#: （出包自检、管理面显示"用哪个解释器"），只是**不能拿它当"就绪"**。
+SERVER_IMPORTS: Tuple[str, ...] = ("fastapi", "uvicorn")
+
+
+def check_server_deps(python_exe: str, timeout: float = 120.0) -> Dict[str, Any]:
+    """快探：这个解释器**现在就能把服务端起起来吗** → ``{"ok", "error", "output"}``。**永不抛。**
+
+    为什么探这一层：见 `SERVER_IMPORTS`（"有解释器"不等于"能用"）。
+    为什么**不**顺手探 torch / funasr：那是 `check_torch_abi` 与安装期自检的事，一次十几到
+    几十秒；这条闸门要的是"每次点都付得起"，所以刻意只 import 两个纯 Python 包。
+    """
+    out: Dict[str, Any] = {"ok": False, "error": "", "output": ""}
+    if not python_exe or not os.path.isfile(str(python_exe)):
+        out["error"] = "没有解释器：%s" % (python_exe or "（空）")
+        return out
+    code = "import %s" % ", ".join(SERVER_IMPORTS)
+    res = _run([str(python_exe), "-c", code], timeout=timeout)
+    out["output"] = "\n".join(x for x in (res.get("stdout"), res.get("stderr")) if x)
+    if res["ok"]:
+        out["ok"] = True
+        return out
+    out["error"] = (res.get("stderr") or res.get("error")
+                    or "import %s 失败" % "、".join(SERVER_IMPORTS)).strip()[:800]
+    return out
+
+
+def check_packed_torch(python_exe: str, timeout: float = 600.0) -> Dict[str, Any]:
+    """**运行时里带了 torch 时**，那份 torch 必须真的 import 得动 → ``{"ok","error","skipped"}``。
+
+    为什么要单独一条（2026-10-01 真机事故）：
+      * 离线包 = 薄包 + **装好依赖的 `runtime/`**，里面带着几 GB 的 torch；
+      * 那次出包按**目录名**递归剪掉了 `site-packages/torch/utils/data/`（还有
+        `transformers/models/`、`funasr/models/`）—— 包**看着完整**（`torch/` 在、dll 都在），
+        但 `import torch` 会在 `torch.utils.data` 那一句崩：
+        `cannot import name 'data' from partially initialized module 'torch.utils'`；
+      * 而"运行时就绪"的判据只看 fastapi/uvicorn（`check_server_deps`）→ 残包被判**就绪**
+        → **永远不会重新解包**；后端只能报"模型要求 GPU，但 torch 看不到 CUDA"
+        （**把打包问题说成显卡问题**），用户没有任何出路（本轮是我手工删 runtime 才恢复的）。
+
+    判据：`site-packages/torch` 不存在 → ``skipped=True``（薄包，依赖还没装，不算坏）；
+    存在 → `import torch, torch.utils.data, torchaudio` 必须过。
+    """
+    out: Dict[str, Any] = {"ok": True, "error": "", "output": "", "skipped": True}
+    exe = str(python_exe or "")
+    if not exe or not os.path.isfile(exe):
+        out["error"] = "没有解释器：%s" % (python_exe or "（空）")
+        out["ok"] = False
+        return out
+    probe = ("import os, sys, sysconfig\n"
+             "sp = sysconfig.get_paths()['purelib']\n"
+             "print(os.path.isdir(os.path.join(sp, 'torch')))\n")
+    res = _run([exe, "-c", probe], timeout=120.0)
+    looks_like = (res.get("stdout") or "").strip().splitlines()
+    if not res["ok"] or not looks_like:
+        # 连"有没有 torch"都问不出来：**不**在这里报坏（这是探测失败，不是包坏）
+        out["error"] = (res.get("stderr") or res.get("error") or "").strip()[:300]
+        out["ok"] = True
+        return out
+    if looks_like[-1].strip().lower() != "true":
+        return out                      # 薄包：site-packages 里没 torch → 跳过
+    out["skipped"] = False
+    code = "import torch, torch.utils.data, torchaudio"
+    got = _run([exe, "-c", code], timeout=timeout)
+    out["output"] = "\n".join(x for x in (got.get("stdout"), got.get("stderr")) if x)
+    if got["ok"]:
+        return out
+    out["ok"] = False
+    out["error"] = (got.get("stderr") or got.get("error") or "import torch 失败").strip()[:800]
+    return out
+
+
 def runtime() -> Dict[str, Any]:
-    """扩展包那条路的运行时：在不在（+ 装了的话做一次 torch/torchaudio 的 ABI 校验）。
+    """扩展包那条路的运行时：**能不能用**（解释器 + 依赖 + torch/torchaudio 的 ABI）。
+
+    ``ready`` 只说明"`runtime/` 里有个解释器"—— **它不等于能用**（见 `SERVER_IMPORTS`
+    与 `depsOk`）；要问"现在能不能起后端"看 ``usable``。
 
     ABI 校验照 `server/Dockerfile` 构建期那一条：**两者的 CUDA 源标签必须一致**
     （都带 `+cu126`），并且 `import torchaudio` 必须通过 —— 版本号相等**不是**判据
@@ -253,15 +349,24 @@ def runtime() -> Dict[str, Any]:
         exe = backend_proc.python_exe()
     except Exception:                                             # pragma: no cover - 兜底
         exe = ""
-    out: Dict[str, Any] = {"ready": bool(exe), "path": exe, "abiOk": None,
-                           "torch": "", "torchaudio": "", "error": "", "note": ""}
+    out: Dict[str, Any] = {"ready": bool(exe), "depsOk": None, "usable": False, "path": exe,
+                           "abiOk": None, "torch": "", "torchaudio": "", "error": "", "note": ""}
     if not exe:
         out["error"] = "还没装运行时（%s 下没有 runtime/）" % backend_proc.backend_root()
+        return out
+    deps = check_server_deps(exe)
+    out["depsOk"] = bool(deps["ok"])
+    if not out["depsOk"]:
+        # **依赖没装全就别再去跑 ABI 校验**：`import torch` 同样会失败，而那条会报
+        # "ABI 不符" —— 真相却是"依赖还没装"。说错原因会把人引去清 `runtime/` 重装
+        # （比不说更贵，这条本项目已经吃过好几次）。
+        out["error"] = deps["error"]
         return out
     abi = check_torch_abi(exe)
     out.update({"abiOk": bool(abi["ok"]), "torch": abi["torch"],
                 "torchaudio": abi["torchaudio"], "error": abi["error"],
                 "note": abi.get("note", "")})
+    out["usable"] = bool(abi["ok"])
     return out
 
 
@@ -386,7 +491,8 @@ def probe(force: bool = False) -> Dict[str, Any]:
         "docker": _safe(docker, {"installed": False, "daemon": False, "version": "",
                                  "compose": "", "runtimes": [], "gpuRuntime": False,
                                  "error": ""}),
-        "runtime": _safe(runtime, {"ready": False, "path": "", "abiOk": None,
+        "runtime": _safe(runtime, {"ready": False, "depsOk": None, "usable": False,
+                                   "path": "", "abiOk": None,
                                    "torch": "", "torchaudio": "", "error": ""}),
         "diskFreeGB": _safe(lambda: _free_gb(root), None),
         "portsOk": bool(ports_ok),
@@ -406,6 +512,12 @@ def variant_for(gpu_info: Dict[str, Any]) -> Tuple[str, List[str]]:
 
     算力判不了（老驱动不认 `compute_cap`）时**按新卡走**并如实说明 —— 因为"猜错成老卡"
     的后果更贵（老卡档装不了 qwen3asr，而那台机器其实跑得动）。
+
+    三档（`cu118` / `cu126` / `cu128` 的边界见各自的常量）：
+      * < 7.5  → `cu118`（Pascal/Volta：只转写）
+      * ≥ 7.5  → `cu126`
+      * ≥ 12.0 → **`cu128`**（Blackwell / RTX 50 系：cu126 的轮子里没有 sm_120 的 kernel，
+        装上去能起来、一跑模型就 CUDA 报错 —— 2026-10-01 在 RTX 5060 Laptop 上定死）。
     """
     cap = _cap_float(gpu_info.get("computeCap"))
     if not cap:
@@ -416,6 +528,11 @@ def variant_for(gpu_info: Dict[str, Any]) -> Tuple[str, List[str]]:
                          "torch>=2.8，而带 Pascal 的 cu118 最后一版是 2.7.1）—— 这一档"
                          "只装 SenseVoice、**只转写**，配置里也不宣告分离与声纹"
                          % (cap, MIN_COMPUTE_CAP_FOR_DIARIZE)]
+    if cap >= MIN_COMPUTE_CAP_FOR_CU128:
+        return "cu128", ["算力 %.1f ≥ %.1f：**Blackwell（RTX 50 系）要 cu128** —— cu126 那套"
+                         "轮子里没有 sm_120 的 kernel（症状是**装得上、起得来、一跑模型就 CUDA "
+                         "报错**）；torch/torchaudio 这一档不钉版本，从 SJTU 的 cu128 索引取最新"
+                         % (cap, MIN_COMPUTE_CAP_FOR_CU128)]
     return "cu126", ["算力 %.1f ≥ %.1f：新卡档（qwen3asr + 对齐器 + pyannote）"
                      % (cap, MIN_COMPUTE_CAP_FOR_DIARIZE)]
 
@@ -541,6 +658,15 @@ def plan(force: bool = False) -> Dict[str, Any]:
                              % ("、".join(fetch_plan_safe.get("packageSearch") or []) or "（没有可看的目录）",
                                 backend_fetch.PACKAGE_SETTING, backend_fetch.PACKAGE_ENV,
                                 fetch_plan_safe.get("torchIndex", "")))
+        elif rt.get("depsOk") is False:
+            # **解释器在、依赖没装全**（2026-10-01 真机：薄包只带解释器，旧判据在这里记
+            # 「运行时已在」→ 跳过装依赖 → 后端一起来就 `ModuleNotFoundError: fastapi`）。
+            # 这一档**仍然是一键**：点下去会走 `backend_fetch.ensure_runtime` 把依赖补齐，
+            # 所以 `implemented` 不必为它降级 —— 只是话要说准，不能再说"运行时已在"。
+            notes.append("运行时的**解释器在**（`%s`），但依赖没装全（`%s` import 不过）—— "
+                         "点「起本机后端」会按国内源把依赖补齐。原文：%s"
+                         % (rt.get("path"), "、".join(SERVER_IMPORTS), rt.get("error") or ""))
+            missing.append("运行时的依赖（%s）" % "、".join(SERVER_IMPORTS))
         elif rt.get("abiOk") is False:
             notes.append("**运行时已装但 ABI 不符**（原文：%s）—— 换变体 / 清 runtime 重装。"
                          % (rt.get("error") or ""))
@@ -576,12 +702,16 @@ def plan(force: bool = False) -> Dict[str, Any]:
         # 本来就是自动的。所以缺什么，`implemented` 就看什么：
         #   运行时已在 → 现在就能走完（除非 ABI 不符：那要清掉 runtime/ 重装，一键做不了）；
         #   否则看**薄包能不能到手**（到手了就可以一键：取薄包 → 装运行时 → …）。
+        # 与上面那段说明同一个判据（**别退回"解释器在就算就绪"**）：
+        #   ① 运行时能用（解释器 + 依赖；ABI 坏的那种上面已经挡掉）→ 点一下就走完；
+        #   ② 否则看**薄包能不能到手** —— 它同时管两件事：解释器不在时提供解释器，
+        #      解释器在而**依赖没装全**时提供 `server/requirements.txt`（装什么靠它）。
         if rt.get("abiOk") is False:
             implemented = False
             todo = "运行时已装但 ABI 不符（换变体 / 清掉 runtime/ 重装）"
             how = ("清掉 `%s` 后重来一次（那一趟会按国内源重装 torch/torchaudio）；"
                    "或改用容器路。" % backend_fetch.runtime_dir())
-        elif rt.get("ready") or package_ok:
+        elif (rt.get("ready") and rt.get("depsOk") is not False) or package_ok:
             implemented = True
             todo = ""
             how = ""

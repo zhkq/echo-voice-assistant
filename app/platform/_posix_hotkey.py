@@ -29,7 +29,8 @@ _NAMED = {
 }
 
 #: 与 Windows 版保持同一组配置键（注册顺序也一致，便于两边对照）
-HOTKEY_SETTING_KEYS = ("wakeHotkey", "fallbackHotkey", "panelHotkey")
+HOTKEY_SETTING_KEYS = ("wakeHotkey", "fallbackHotkey", "panelHotkey",
+                      "meetingStartHotkey", "meetingStopHotkey")   # 会议热键（默认空 → 跳过）
 
 
 def _to_pynput(combo):

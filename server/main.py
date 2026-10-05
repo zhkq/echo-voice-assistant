@@ -19,6 +19,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+from server.jsonx import SafeJSONResponse
 
 from server import __version__, engines
 from server import admin as admin_mod
@@ -210,7 +211,8 @@ def create_app(cfg=None) -> FastAPI:
             except Exception:
                 pass
 
-    app = FastAPI(title="ECHO capability backend", version=__version__, lifespan=lifespan)
+    app = FastAPI(title="ECHO capability backend", version=__version__, lifespan=lifespan,
+                    default_response_class=SafeJSONResponse)
 
     @app.middleware("http")
     async def _record_call(request: Request, call_next):

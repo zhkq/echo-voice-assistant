@@ -96,6 +96,7 @@ from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
+from server.jsonx import SafeJSONResponse
 
 from server import __version__, errors
 from server import advertised as advertised_mod
@@ -303,7 +304,8 @@ def create_admin_app(cfg, state, *, perf=None) -> FastAPI:
     #: 改口令那条路的失败退避。**与登录那个分开**：一次"当前口令记错了"不该把
     #: 登录也一起锁住（两个端点各自的尝试次数各自算，这也正是通行做法）。
     pwd_throttle = _Throttle()
-    app = FastAPI(title="ECHO admin console", version=__version__)
+    app = FastAPI(title="ECHO admin console", version=__version__,
+                    default_response_class=SafeJSONResponse)
     app.state.echo = state
     app.state.sessions = sessions
     app.state.throttle = throttle

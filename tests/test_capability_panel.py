@@ -51,7 +51,11 @@ class CapabilityCardWiringTests(unittest.TestCase):
         """
         card_ids = {i for i in self.js_ids if i.startswith(("cap", "btnCap"))}
         self.assertTrue(card_ids, "一个能力卡的元素都没引用到？")
-        missing = sorted(card_ids - self.html_ids)
+        # 运行时由 JS 造出来的 id（**不是拼错**）：
+        #   capBackendHost = 「转写服务 → 后端设置」里的占位，由 renderAiCardCommon() 画出来，
+        #   随后静态卡 `#capRouteCard` 被搬进它（2026-10-02 用户给的层级）。
+        dyn_ids = {"capBackendHost"}
+        missing = sorted(card_ids - self.html_ids - dyn_ids)
         self.assertEqual(missing, [], "JS 引用了 HTML 里不存在的 id：%s" % missing)
 
     def test_the_backend_status_line_and_admin_link_are_rendered(self):
@@ -81,17 +85,25 @@ class CapabilityCardWiringTests(unittest.TestCase):
                 self.assertIn('id="%s"' % el, self.html, "HTML 里没有这个元素")
                 self.assertIn(el, self.js_ids, "HTML 里有，但 JS 从来没引用它（点了没反应）")
 
-    def test_the_card_lives_inside_the_capabilities_tab(self):
-        """**不新开页签**，长在「能力后端」页签里（2026-09-25 整合后就是顶层页签之一）。
+    def test_the_card_lives_inside_the_settings_tab(self):
+        """**不新开页签**，长在承载能力配置的那个顶层页签里。
 
         用户 2026-09-19 定的规矩："每个能力只在这一处出现" —— 当时的模型页签 / 组件页签 /
         设置里的 provider 卡片三处都在讲同一件事，因此被合并。这条断言守的是同一个意图，
-        只是页签 id 从 `view-capabilities` 改名成了 `view-capability`。
+        只是承载它的页签改名过两次：`view-capabilities` → `view-capability`（2026-09-25）。
+
+        2026-10-02：IA 重构，「能力与智能体」并进顶层「设置」页，旧断言找
+        `id="view-capability"` → 新断言找 `id="view-settings"`（GPU 后端卡仍在那一页里）。
+        理由：`#view-capability` 已随合并删除，硬编码旧 id 会让用例直接抛 ValueError ——
+        而它要守的意图（这张卡有且只有一个页签容器）没变。
         """
-        start = self.html.index('id="view-capability"')
+        start = self.html.index('id="view-settings"')
         end = self.html.index("</section>", start)
         self.assertIn('id="capRouteCard"', self.html[start:end],
-                      "GPU 后端卡跑到「能力」页签外面去了")
+                      "GPU 后端卡跑到「设置」页签外面去了")
+        # 它**只在**这一页（并页签时最容易出的错是复制一份到新页签）
+        self.assertEqual(self.html.count('id="capRouteCard"'), 1,
+                         "GPU 后端卡只能有一处")
 
     def test_load_capabilities_actually_loads_the_card(self):
         """`loadCapabilities()` 必须真的去取这块的数据 —— 否则卡片永远是"读取中…"。"""
@@ -350,6 +362,49 @@ class MeetingDetailShowsThePlanTests(unittest.TestCase):
                 i = flat.index(sel + "{")
                 self.assertIn("min-width:0", flat[i:i + 400],
                               "%s 缺 min-width:0（窄边条里会顶宽）" % sel)
+
+
+class PanelStateDeclarationTests(unittest.TestCase):
+    """面板状态变量（`_xxx`）**必须先声明再赋值** —— `app.js` 第 2 行是 `"use strict"`。
+
+    为什么值得当门禁钉（2026-10-01 的 bug）：`_capBackendCache` 从没被声明过，于是
+    `loadBackendOneClick()` 在**赋值那一行**抛 `ReferenceError`、`renderBackendPlan()`
+    在**读它那一行**也抛；两处都在 `try` 里，浏览器上只剩「读不到本机后端的状态」与
+    「读不到这台机器的后端计划」两句话 —— **功能没坏、显示坏了**，而且只有真点开那一页
+    才看得见（正是本文件头说的那一类"安静的坏"）。
+
+    非严格模式下面这种写法会**悄悄造一个全局**、什么错都不报；`"use strict"` 把它变成
+    当场抛错 —— 所以这条闸门只在 `"use strict"` 的前提下才有意义，第 2 行那句话也一并钉住。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.js = _read("app.js")
+
+    def test_the_file_is_strict_so_an_undeclared_assignment_throws(self):
+        head = "\n".join(self.js.splitlines()[:5])
+        self.assertIn('"use strict"', head,
+                      'app.js 开头必须是 "use strict"：否则下面那条检查形同虚设')
+
+    def test_every_underscore_state_name_is_declared(self):
+        assigned = {}
+        for i, line in enumerate(self.js.splitlines(), 1):
+            m = re.match(r"\s*(_[A-Za-z0-9_$]+)\s*=(?!=)", line)
+            if m:
+                assigned.setdefault(m.group(1), []).append(i)
+        declared = set()
+        for line in self.js.splitlines():
+            m = re.match(r"\s*(?:let|const|var)\s+(.*)", line)
+            if m:
+                declared.update(re.findall(r"(_[A-Za-z0-9_$]*)", m.group(1)))
+        # 非空校验：正则被改到抓不到东西时，这条断言会失败而不是"永远绿"
+        self.assertGreater(len(assigned), 30,
+                           "一条 `_x = …` 赋值都没抓到？正则或写法变了：%s" % sorted(assigned))
+        undeclared = {k: v for k, v in assigned.items() if k not in declared}
+        self.assertEqual(undeclared, {},
+                         "这些面板状态名字**没声明**就被赋值了（严格模式下会当场抛 "
+                         "ReferenceError，异常多半被 try 吞成一句「读不到…」）：%s"
+                         % undeclared)
 
 
 if __name__ == "__main__":

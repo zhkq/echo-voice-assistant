@@ -13,6 +13,7 @@
   * POST /api/meetings/{id}/speaker/rename 改名自动入库（默认名不入库）
   * POST /api/meetings/{id}/speaker/recognize 识别本场（改名 + 重导出 transcript.md）
 """
+import io
 import os
 import shutil
 import sys
@@ -162,3 +163,48 @@ class ApiVoiceprintTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+    # ---------------- 试听（GET /voiceprints/{vid}/audition，2026-10-02 加）----------------
+    # 用户要求"声纹库要有列表和删除、试听等功能"。试听口径：播**源会议里那个说话人的那一段**；
+    # 拿不到音频时必须**说清原因**（面板要如实显示"为什么听不了"），不许 500、也不许空文件。
+
+    def test_audition_says_why_when_the_sample_is_gone(self):
+        r = self.client.get("/api/voiceprints/9999/audition")
+        self.assertEqual(r.status_code, 200)
+        j = r.json()
+        self.assertFalse(j["ok"])
+        self.assertIn("不存在", j["reason"])
+
+    def test_audition_says_why_when_the_source_audio_is_gone(self):
+        """源会议目录被清理过 → 必须点名"清理"，不能含糊成"听不了"。"""
+        mid = self._meeting("m-aud-gone", ["S1"], {"S1": e(0)})
+        self.client.post("/api/voiceprints/enroll",
+                         json={"meeting_id": mid, "label": "S1", "name": "李总"})
+        vid = self.client.get("/api/voiceprints").json()["items"][0]["samples"][0]["id"]
+        shutil.rmtree(os.path.join(meeting_mod.meetings_dir(), "m-aud-gone"))
+        j = self.client.get(f"/api/voiceprints/{vid}/audition").json()
+        self.assertFalse(j["ok"])
+        self.assertIn("清理", j["reason"])
+
+    def test_audition_cuts_the_speakers_segment_as_wav(self):
+        """正常路径：一段真 wav + 段内时间戳 → 回 audio/wav。
+
+        时间语义（2026-10-02 实测）：`lines.start/end` 是**段内**时间（每段各自从 0 起）。
+        """
+        import soundfile as sf
+        mid = self._meeting("m-aud-ok", ["S1"], {"S1": e(0)})
+        folder = os.path.join(meeting_mod.meetings_dir(), "m-aud-ok")
+        sr = 16000
+        tone = (0.05 * np.sin(2 * np.pi * 440 * np.arange(sr * 3) / sr)).astype("float32")
+        sf.write(os.path.join(folder, "01.wav"), tone, sr)          # 3 秒
+        db.clear_meeting_lines(mid)
+        db.add_lines(mid, [(1, 0.5, 1.5, "S1", "S1 说了一句")])      # 0.5~1.5s（±0.25 留白）
+        self.client.post("/api/voiceprints/enroll",
+                         json={"meeting_id": mid, "label": "S1", "name": "王总"})
+        vid = self.client.get("/api/voiceprints").json()["items"][0]["samples"][0]["id"]
+        r = self.client.get(f"/api/voiceprints/{vid}/audition")
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(r.headers["content-type"].startswith("audio/wav"), r.headers)
+        self.assertGreater(len(r.content), 1000, "切出来的 wav 太小，八成是空文件")
+        with sf.SoundFile(io.BytesIO(r.content)) as fh:
+            self.assertAlmostEqual(fh.frames / fh.samplerate, 1.5, delta=0.35)   # 1.0s + 两侧留白

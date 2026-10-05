@@ -15,6 +15,7 @@
 让任何一条断言变色。
 """
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -22,7 +23,7 @@ import unittest.mock as mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from app import backend_env                                  # noqa: E402
+from app import backend_env, backend_fetch                      # noqa: E402
 
 
 def _gpu(ok=True, cap="8.6", vram=8192, err=""):
@@ -47,7 +48,8 @@ class _Case(unittest.TestCase):
         self.addCleanup(backend_env.reset_cache)
         self.gpu = _gpu()
         self.docker = _docker()
-        self.runtime = {"ready": True, "path": "/fake/python", "abiOk": True,
+        self.runtime = {"ready": True, "depsOk": True, "usable": True, "path": "/fake/python",
+                        "abiOk": True,
                         "torch": "2.14.0+cu126", "torchaudio": "2.11.0+cu126", "error": ""}
         self.disk_free = 100.0
         self.weights = {"root": "/models", "variant": "cu126", "wanted": ["sensevoice"],
@@ -109,7 +111,8 @@ class PreflightTests(_Case):
         现在它取决于**薄包能不能到手**（本机找得到 / 设置给了路径或 URL）—— 所以这两面都要钉。
         """
         self._force_portable()
-        self.runtime = {"ready": False, "path": "", "abiOk": None, "torch": "",
+        self.runtime = {"ready": False, "depsOk": None, "usable": False, "path": "",
+                        "abiOk": None, "torch": "",
                         "torchaudio": "", "error": ""}
         plan = backend_env.plan()
         self.assertEqual(plan["path"], "portable")
@@ -122,7 +125,8 @@ class PreflightTests(_Case):
     def test_a_package_on_this_machine_makes_it_a_one_click_path(self):
         """本机找得到薄包（或用户填了地址）→ `implemented` 为真，且说得出**在哪找到的**。"""
         self._force_portable()
-        self.runtime = {"ready": False, "path": "", "abiOk": None, "torch": "",
+        self.runtime = {"ready": False, "depsOk": None, "usable": False, "path": "",
+                        "abiOk": None, "torch": "",
                         "torchaudio": "", "error": ""}
         with mock.patch.object(self.backend_fetch, "find_package_zip",
                                lambda: r"D:\交付\ECHO-backend-portable-20260930-1309.zip"):
@@ -138,12 +142,55 @@ class PreflightTests(_Case):
     def test_a_runtime_with_a_bad_abi_is_not_called_one_click(self):
         """运行时在、但 torch/torchaudio 的 CUDA 标签不一致 → 要清掉重装，**一键做不了**。"""
         self._force_portable()
-        self.runtime = {"ready": True, "path": "/fake/python", "abiOk": False,
+        self.runtime = {"ready": True, "depsOk": True, "usable": False, "path": "/fake/python",
+                        "abiOk": False,
                         "torch": "2.10.0+cu128", "torchaudio": "2.10.0+cpu",
                         "error": "标签不一致"}
         plan = backend_env.plan()
         self.assertFalse(plan["implemented"])
         self.assertIn("ABI", plan["whyNot"])
+
+    def test_a_half_installed_runtime_is_not_called_ready_but_is_still_one_click(self):
+        """**2026-10-01 真机那个 bug 的面板面**：解释器在、依赖没装全、薄包在手。
+
+        旧判据（`rt["ready"] = bool(python_exe())`）在这里会说「运行时已在」；
+        现在要**如实说"只装了一半"**，且**不能**报成"ABI 不符"（那会把人引去清 `runtime/`
+        重装，而真相是依赖还没装）。同时它**仍然是一键**：点下去 `ensure_runtime` 会把依赖补齐。
+        """
+        self._force_portable()
+        self.runtime = {"ready": True, "depsOk": False, "usable": False,
+                        "path": r"D:\ECHO\backend\runtime\python.exe", "abiOk": None,
+                        "torch": "", "torchaudio": "",
+                        "error": "ModuleNotFoundError: No module named 'fastapi'"}
+        # 真机上薄包就在手里（已被解到 `{backend}/`）—— 装依赖要用它的 requirements.txt
+        with mock.patch.object(self.backend_fetch, "find_package_zip",
+                               lambda: r"D:\交付\ECHO-backend-portable-20260930-1309.zip"):
+            plan = backend_env.plan()
+        joined = " ".join(plan["notes"])
+        self.assertIn("依赖没装全", joined)
+        self.assertIn("fastapi", joined, "要把 import 失败的原文带出来：%s" % joined)
+        self.assertNotIn("ABI", joined, "依赖没装全时**不许**报成 ABI 不符：%s" % joined)
+        self.assertNotIn("运行时已装但 ABI 不符", plan["whyNot"])
+        self.assertTrue([m for m in plan["missing"] if "依赖" in m], plan["missing"])
+        self.assertTrue(plan["implemented"], plan["whyNot"])
+        self.assertEqual(plan["whyNot"], "")
+
+    def test_a_half_installed_runtime_without_a_pack_says_the_pack_is_the_blocker(self):
+        """解释器在、依赖没装全、**薄包也拿不到** → 一键做不了，而卡点**是薄包**。
+
+        为什么这一档不能算"一键"：装依赖要用薄包里的 `server/requirements.txt`（装什么靠它）。
+        说成"点一下就好"会让人点完得到一个"薄包还没解开"的失败 —— 那一句该在点之前就说。
+        """
+        self._force_portable()
+        self.runtime = {"ready": True, "depsOk": False, "usable": False,
+                        "path": r"D:\ECHO\backend\runtime\python.exe", "abiOk": None,
+                        "torch": "", "torchaudio": "",
+                        "error": "ModuleNotFoundError: No module named 'fastapi'"}
+        plan = backend_env.plan()
+        self.assertFalse(plan["implemented"])
+        self.assertIn("薄包", plan["whyNot"])
+        self.assertIn("依赖没装全", " ".join(plan["notes"]),
+                      "卡点虽是薄包，也要把「运行时装了一半」这件事说清楚")
 
     def test_docker_installed_but_not_running_is_told_apart_from_missing(self):
         """装了但没起来 ≠ 没装 —— 两句不同的话，下一步也不同。"""
@@ -199,6 +246,34 @@ class PreflightTests(_Case):
         plan = backend_env.plan()
         self.assertEqual(plan["variant"], "cu126")
         self.assertIn("算力判不了", " ".join(plan["reasons"]))
+
+    def test_blackwell_gets_cu128(self):
+        """**RTX 50 系（Blackwell，sm_120）要 cu128**（2026-10-01 在 RTX 5060 Laptop 上定）。
+
+        旧判据只有"老卡 → cu118 / 其余 → cu126"，于是这台 5060（`compute_cap 12.0`）算成
+        cu126 —— 而 cu126 那套轮子里**没有 sm_120 的 kernel**：症状是"装得上、起得来、
+        一跑模型就 CUDA 报错"，最难查的一类。dev 这台能跑的正是 `torch 2.10.0+cu128`。
+        """
+        self.gpu = _gpu(cap="12.0")
+        plan = backend_env.plan()
+        self.assertEqual(plan["variant"], "cu128")
+        joined = " ".join(plan["reasons"])
+        self.assertIn("cu128", joined)
+        self.assertIn("sm_120", joined, "理由要说清「为什么」（换个人看得懂）：%s" % joined)
+
+    def test_hopper_still_gets_cu126(self):
+        """门槛定在 12.0：Hopper（9.0）在 cu126 上没问题，别一起推去 cu128。"""
+        self.assertEqual(backend_env.variant_for(_gpu(cap="9.0"))[0], "cu126")
+        self.assertEqual(backend_env.variant_for(_gpu(cap="8.6"))[0], "cu126")
+
+    def test_cu128_looks_for_the_same_weights_as_cu126(self):
+        """cu128 也要**登记权重子树**：没登记时 `weights("cu128")` 的 `wanted` 是空表，
+        面板会显示"模型 0/0 就绪"（看着像齐了），而实际上是这一档根本没在查。"""
+        self.assertEqual([lbl for lbl, _c in backend_env.VARIANT_MODELS["cu128"]],
+                         [lbl for lbl, _c in backend_env.VARIANT_MODELS["cu126"]])
+        self.assertIn("cu128", backend_env.VARIANT_MODELS)
+        self.assertIn("cu128", backend_fetch.VARIANT_EXTRAS,
+                      "取运行时那一侧也要认这一档（否则装不了 torch）")
 
     def test_disk_and_weights_are_reported_with_the_place_we_looked(self):
         self.disk_free = 1.0
@@ -343,6 +418,87 @@ class ProbeTests(unittest.TestCase):
         self.assertFalse(info["ready"])
         self.assertIn("还没装运行时", info["error"])
 
+    # ---------------------------------------------------------------- 「能不能用」快探
+    # 判据的由来（2026-10-01 真机）：薄包**只带解释器**，fastapi/uvicorn 要靠"取运行时"装。
+    # 旧判据"`runtime/` 里有没有 python.exe"会记「运行时已在」→ 跳过装依赖 → 后端一起来就
+    # `ModuleNotFoundError: No module named 'fastapi'` 退出。**"有解释器"不等于"能用"。**
+
+    def test_the_deps_probe_asks_for_the_right_imports(self):
+        seen = {}
+
+        def _fake_run(argv, timeout=8.0):
+            seen["argv"] = argv
+            return {"ok": True, "code": 0, "stdout": "", "stderr": "", "error": ""}
+
+        fake = os.path.join(self.tmp, "fake-python")
+        open(fake, "w", encoding="utf-8").close()
+        with mock.patch.object(backend_env, "_run", _fake_run):
+            got = backend_env.check_server_deps(fake)
+        self.assertTrue(got["ok"], got)
+        self.assertEqual(seen["argv"][:2], [fake, "-c"])
+        for name in backend_env.SERVER_IMPORTS:
+            self.assertIn(name, seen["argv"][2])
+        self.assertIn("fastapi", backend_env.SERVER_IMPORTS,
+                      "这一条就是那个 bug 的判据：fastapi 必须在探的清单里")
+
+    def test_the_deps_probe_carries_the_import_error_verbatim(self):
+        """探不过时要把**原文**带出来（"说错原因会把人引去查错东西"）。"""
+        def _fake_run(argv, timeout=8.0):
+            return {"ok": False, "code": 1, "stdout": "",
+                    "stderr": "ModuleNotFoundError: No module named 'fastapi'", "error": ""}
+
+        fake = os.path.join(self.tmp, "fake-python")
+        open(fake, "w", encoding="utf-8").close()
+        with mock.patch.object(backend_env, "_run", _fake_run):
+            got = backend_env.check_server_deps(fake)
+        self.assertFalse(got["ok"])
+        self.assertIn("No module named 'fastapi'", got["error"])
+
+    def test_the_deps_probe_rejects_a_missing_interpreter(self):
+        got = backend_env.check_server_deps(os.path.join(self.tmp, "nope"))
+        self.assertFalse(got["ok"])
+        self.assertIn("没有解释器", got["error"])
+
+    def test_a_half_installed_runtime_never_reaches_the_abi_check(self):
+        """**依赖没装全时不许去跑 ABI 校验**：`import torch` 也会失败，而那条会报
+        "ABI 不符" —— 真相是"依赖还没装"。说错原因会把人引去清 `runtime/` 重装。"""
+        fake = os.path.join(self.tmp, "fake-python")
+        open(fake, "w", encoding="utf-8").close()
+
+        def _must_not_run(*a, **kw):                                  # pragma: no cover
+            raise AssertionError("依赖没装全时不该跑 ABI 校验")
+
+        def _fake_run(argv, timeout=8.0):
+            return {"ok": False, "code": 1, "stdout": "",
+                    "stderr": "ModuleNotFoundError: No module named 'fastapi'", "error": ""}
+
+        with mock.patch.object(backend_env.backend_proc, "python_exe", lambda: fake), \
+                mock.patch.object(backend_env, "_run", _fake_run), \
+                mock.patch.object(backend_env, "check_torch_abi", _must_not_run):
+            info = backend_env.runtime()
+        self.assertTrue(info["ready"], "解释器在 —— 这一栏照旧")
+        self.assertFalse(info["depsOk"])
+        self.assertFalse(info["usable"], "**能用**才是就绪的判据")
+        self.assertIsNone(info["abiOk"], "没跑到那一步就不该给个 ABI 结论")
+        self.assertIn("No module named 'fastapi'", info["error"])
+
+    def test_a_runtime_is_usable_only_when_the_deps_and_the_abi_both_pass(self):
+        fake = os.path.join(self.tmp, "fake-python")
+        open(fake, "w", encoding="utf-8").close()
+        abi = {"ok": True, "torch": "2.14.0+cu126", "torchaudio": "2.11.0+cu126",
+               "error": "", "note": ""}
+        with mock.patch.object(backend_env.backend_proc, "python_exe", lambda: fake), \
+                mock.patch.object(backend_env, "_run",
+                                  lambda argv, timeout=8.0: {"ok": True, "code": 0,
+                                                             "stdout": "", "stderr": "",
+                                                             "error": ""}), \
+                mock.patch.object(backend_env, "check_torch_abi",
+                                  lambda exe, timeout=180.0: abi):
+            info = backend_env.runtime()
+        self.assertTrue(info["depsOk"])
+        self.assertTrue(info["abiOk"])
+        self.assertTrue(info["usable"])
+
     def test_weights_list_what_is_missing(self):
         with tempfile.TemporaryDirectory() as tmp:
             os.makedirs(os.path.join(tmp, "sensevoice"))
@@ -405,6 +561,82 @@ class ProbeTests(unittest.TestCase):
             deep = os.path.join(tmp, "a", "b", "c")
             self.assertIsInstance(backend_env._free_gb(deep), float)
         self.assertIsNone(backend_env._free_gb("\x00bad\x00path"))
+
+
+class PackedTorchTests(unittest.TestCase):
+    """**运行时里带了 torch，就必须 import 得动**（2026-10-01 真机事故的护栏）。
+
+    现场：离线包被打包过滤剪掉了 `torch/utils/data`（还连带 `transformers/models`、
+    `funasr/models`），而"运行时就绪"只看 fastapi/uvicorn → 残包被判就绪 →
+    **永远不会重新解包** → 后端报"模型要求 GPU，但 torch 看不到 CUDA"（把打包问题说成显卡问题）。
+    这一组钉住两半：① 探针本身认得出"带了却 import 不动"；② `ensure_runtime` 不再提前返回。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="echo-packed-torch-")
+        self.addCleanup(lambda: shutil.rmtree(self.tmp, ignore_errors=True))
+        self.exe = os.path.join(self.tmp, "python.exe")
+        with open(self.exe, "wb") as fh:
+            fh.write(b"x")
+
+    def _run_returns(self, *, has_torch, second_ok, stderr=""):
+        calls = []
+
+        def _fake(argv, timeout=None):
+            calls.append(argv)
+            if len(calls) == 1:
+                return {"ok": True, "stdout": "True\n" if has_torch else "False\n", "stderr": ""}
+            return {"ok": second_ok, "stdout": "", "stderr": stderr}
+
+        return calls, _fake
+
+    def test_a_thin_runtime_without_torch_is_not_called_broken(self):
+        """薄包只有解释器：`site-packages/torch` 不在 → 跳过（不能把薄包判成坏包）。"""
+        _calls, fake = self._run_returns(has_torch=False, second_ok=False)
+        with mock.patch.object(backend_env, "_run", fake):
+            got = backend_env.check_packed_torch(self.exe)
+        self.assertTrue(got["ok"])
+        self.assertTrue(got["skipped"])
+
+    def test_a_runtime_whose_torch_cannot_import_is_reported_with_the_real_error(self):
+        err = ("ImportError: cannot import name 'data' from partially initialized module "
+               "'torch.utils' (most likely due to a circular import)")
+        calls, fake = self._run_returns(has_torch=True, second_ok=False, stderr=err)
+        with mock.patch.object(backend_env, "_run", fake):
+            got = backend_env.check_packed_torch(self.exe)
+        self.assertFalse(got["ok"])
+        self.assertIn("torch.utils", got["error"])
+        self.assertFalse(got["skipped"])
+        self.assertIn("torch.utils.data", calls[1][2], "第二次探针必须把子包也 import 上")
+
+    def test_a_healthy_torch_passes(self):
+        _calls, fake = self._run_returns(has_torch=True, second_ok=True)
+        with mock.patch.object(backend_env, "_run", fake):
+            got = backend_env.check_packed_torch(self.exe)
+        self.assertTrue(got["ok"])
+        self.assertFalse(got["skipped"])
+
+    def test_ensure_runtime_does_not_stop_at_a_broken_torch(self):
+        """核心那半句：torch 坏了 → **不许**提前返回"运行时已在"，要往下走去重解包。"""
+        from app import backend_fetch
+        calls = []
+
+        def _steps(msg):
+            calls.append(msg)
+
+        with mock.patch.object(backend_env.backend_proc, "python_exe", lambda: self.exe), \
+                mock.patch.object(backend_env, "check_server_deps",
+                                  lambda *_a, **_k: {"ok": True, "error": ""}), \
+                mock.patch.object(backend_env, "check_packed_torch",
+                                  lambda *_a, **_k: {"ok": False, "error": "torch.utils 崩了",
+                                                     "skipped": False}), \
+                mock.patch.object(backend_fetch, "find_offline_zip", lambda *_a, **_k: None), \
+                mock.patch.object(backend_fetch, "find_package_zip", lambda *_a, **_k: None), \
+                mock.patch.object(backend_fetch, "_run_pip",
+                                  lambda *_a, **_k: (False, "测试里不联网")):
+            ok, detail = backend_fetch.ensure_runtime(on_step=_steps)
+        self.assertFalse(ok, "残 runtime 不该被当成就绪")
+        self.assertTrue(any("torch 不完整" in m for m in calls), calls)
 
 
 if __name__ == "__main__":

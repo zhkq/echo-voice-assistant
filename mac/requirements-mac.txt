@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 # ECHO macOS 精简依赖（不含 Windows 专属/重型可选组件）
 # 安装：venv/bin/python -m pip install -r mac/requirements-mac.txt
 #

@@ -41,6 +41,7 @@ import hashlib
 import json
 import os
 import shutil
+import subprocess
 import sys
 import time
 import zipfile
@@ -66,8 +67,24 @@ SOURCES = "sources.json"
 SOURCE_ITEMS = ("app", "server")
 
 #: 打包**绝不**带的东西（安全 + 体积）：与容器档同一条纪律。
-EXCLUDE_DIRS = {"__pycache__", ".git", ".github", ".idea", ".vscode",
-                "data", "models", "dist", "logs", "venv", "runtime-core", "tests", "docs"}
+#: ⚠️ 这两张表**必须分开**，而且**只对"仓库那棵树"按名字排**（2026-10-01 真机事故）。
+#:
+#: 事故：原来只有一张表，`_copy_tree()`（拷运行时）也照它按**目录名**递归剪 —— 于是
+#: `site-packages/torch/utils/data/`、`transformers/models/`、`funasr/models/` 全被剪掉。
+#: 出包自检**看不出来**（它只看 ABI 元数据），装到目标机上才炸：
+#: `ImportError: cannot import name 'data' from partially initialized module 'torch.utils'`
+#: → 服务端只能报"模型要求 GPU，但 torch 看不到 CUDA"（**把编码/打包问题说成了显卡问题**）。
+#: 教训：`data` / `models` / `tests` / `docs` / `logs` / `dist` 这些名字在**真实的 Python 包里遍地都是**
+#: （`torch.utils.data`、`transformers.models`、`sklearn.datasets.data`…），**绝不能按名字在任意深度剪**。
+#: 判据：`tests/test_backend_pack.py::CopyFilterTests`（嵌套的 `data/`、`models/` 必须留下）。
+EXCLUDE_DIRS_SOURCE = {"__pycache__", ".git", ".github", ".idea", ".vscode",
+                       "data", "models", "dist", "logs", "venv", "runtime-core", "tests", "docs"}
+#: 拷**运行时**时只剪这两样（第三方包里叫 `data`/`models`/`tests` 的目录是真代码，剪了就坏）。
+EXCLUDE_DIRS_TREE = {"__pycache__", ".git"}
+#: **任何深度**都不带（缓存/版本库元数据，跟"哪个目录"无关）。
+ALWAYS_EXCLUDE_DIRS = {"__pycache__", ".git"}
+#: 兼容旧名字（外面有引用/用例），语义 = 源码树那张表。
+EXCLUDE_DIRS = EXCLUDE_DIRS_SOURCE
 
 
 class PackError(RuntimeError):
@@ -191,7 +208,12 @@ def render_readme(*, variant: str, port: int, admin_port: int, runtime_from: str
 # ---------------------------------------------------------------- 出包
 
 def _copy_source(dst: str) -> List[str]:
-    """把源码拷进包（按 `EXCLUDE_DIRS` 过滤）→ 返回相对路径清单。"""
+    """把源码拷进包（按 `EXCLUDE_DIRS_SOURCE` 过滤）→ 返回相对路径清单。
+
+    **只在被拷那一层的根上按名字剪**（`app/data` 剪掉，但 `app/<某个包>/data` 留着）——
+    按名字在任意深度剪就是 2026-10-01 那个把 `torch/utils/data` 吃掉的 bug。
+    `__pycache__` / `.git` 这类**任何深度都不该带**的，另有一张表，任意深度都剪。
+    """
     out: List[str] = []
     for item in SOURCE_ITEMS:
         src = os.path.join(ROOT, item)
@@ -204,7 +226,15 @@ def _copy_source(dst: str) -> List[str]:
             out.append(item)
             continue
         for base, dirs, files in os.walk(src):
-            dirs[:] = [d for d in dirs if d not in EXCLUDE_DIRS]
+            at_root = os.path.normcase(os.path.abspath(base)) == os.path.normcase(os.path.abspath(src))
+            keep = []
+            for d in dirs:
+                if d in ALWAYS_EXCLUDE_DIRS:
+                    continue
+                if at_root and d in EXCLUDE_DIRS_SOURCE:
+                    continue
+                keep.append(d)
+            dirs[:] = keep
             for fn in files:
                 if fn.endswith((".pyc", ".pyo")):
                     continue
@@ -218,13 +248,14 @@ def _copy_source(dst: str) -> List[str]:
 
 
 def _copy_tree(src: str, dst: str, what: str) -> List[str]:
+    """整棵树照搬（**运行时**用这条）→ 只剪 `EXCLUDE_DIRS_TREE`（`__pycache__`/`.git`）。"""
     if not src:
         return []
     if not os.path.isdir(src):
         raise PackError("%s 不存在：%s" % (what, src))
     out: List[str] = []
     for base, dirs, files in os.walk(src):
-        dirs[:] = [d for d in dirs if d not in EXCLUDE_DIRS]
+        dirs[:] = [d for d in dirs if d not in EXCLUDE_DIRS_TREE]
         for fn in files:
             full = os.path.join(base, fn)
             rel = os.path.relpath(full, src)
@@ -235,6 +266,63 @@ def _copy_tree(src: str, dst: str, what: str) -> List[str]:
     if not out:
         raise PackError("%s 是空的：%s（空的运行时/仓库等于没带）" % (what, src))
     return out
+
+
+#: 出包自检要**真 import** 的东西：包里带了哪个就查哪个（薄包只有解释器，一个都不查）。
+#:
+#: 为什么必须有这条（2026-10-01 真机事故）：`_copy_tree()` 曾经按**目录名**递归剪，
+#: 把 `torch/utils/data`、`transformers/models`、`funasr/models` 一起剪掉了，而**当时所有自检都过**
+#: —— 它们只看 ABI 元数据与文件数。装到目标机上才炸，还伪装成显卡问题：
+#: `ImportError: cannot import name 'data' from partially initialized module 'torch.utils'`
+#: → 服务端报"模型要求 GPU，但 torch 看不到 CUDA"。
+#: 判据一句话：**包里带了什么，就必须能从包里 import 动什么。**
+IMPORT_PROBES = (
+    ("torch", "import torch, torch.utils.data"),
+    ("torchaudio", "import torchaudio"),
+    ("transformers", "import transformers.models"),
+    ("funasr", "import funasr"),
+    ("fastapi", "import fastapi, uvicorn"),
+    ("uvicorn", "import uvicorn"),
+    ("pyannote.audio", "import pyannote.audio"),
+)
+
+
+def site_packages_of(pack_dir: str) -> str:
+    """包里的 `site-packages`（Windows 是 `Lib`、类 Unix 是 `lib`，大小写都认）；找不到给空串。"""
+    runtime = os.path.join(pack_dir, RUNTIME_DIR)
+    if not os.path.isdir(runtime):
+        return ""
+    for base, dirs, _files in os.walk(runtime):
+        for d in list(dirs):
+            if d.lower() == "site-packages":
+                return os.path.join(base, d)
+        if base[len(runtime):].count(os.sep) > 3:      # 别把整棵树走完
+            dirs[:] = []
+    return ""
+
+
+def import_check(pack_dir: str) -> List[str]:
+    """**从打好的包里**真 import 一遍 → 返回查过的包名；带了却 import 不动就抛 `PackError`。"""
+    exe = find_interpreter(os.path.join(pack_dir, RUNTIME_DIR))
+    sp = site_packages_of(pack_dir)
+    if not exe or not sp:
+        return []
+    checked: List[str] = []
+    env = dict(os.environ)
+    env["PYTHONUTF8"] = "1"        # 与 `app/backend_fetch._pip_env()` 同一条：别让 locale 搅进来
+    for pkg, code in IMPORT_PROBES:
+        if not os.path.isdir(os.path.join(sp, *pkg.split("."))):
+            continue
+        checked.append(pkg)
+        proc = subprocess.run([exe, "-c", code], capture_output=True, text=True,
+                              timeout=900, cwd=pack_dir, env=env)
+        if proc.returncode != 0:
+            raise PackError(
+                "包里带了 `%s`，但**从这个包里** import 不动它 —— 这是残包，绝不能发出去：\n"
+                "    %s\n%s\n"
+                "（最可能的原因：拷运行时时按目录名递归剪掉了真代码 —— 见 `EXCLUDE_DIRS_TREE` 的注释）"
+                % (pkg, code, ((proc.stdout or "") + (proc.stderr or "")).strip()[-800:]))
+    return checked
 
 
 def find_interpreter(root: str) -> str:
@@ -313,6 +401,42 @@ def stage(out_dir: str, *, variant: str = "", runtime_from: str = "",
         files += ["models/%s" % rel for rel in
                   _copy_tree(models_from, os.path.join(kit_dir, "models"), "models")]
 
+    # **随包的解释器必须"能装东西"**（2026-10-01 真机实测的两个缺陷，都出在这一步）：
+    #   ① uv 托管的 CPython 带着 `Lib/EXTERNALLY-MANAGED`（PEP 668）→ 目标机上 pip **一律拒绝安装**
+    #      （`This environment is externally managed`，看着像权限/网络问题）；
+    #   ② 那份 pip 还可能是**残缺**的（实测 `No module named 'pip._internal.models'`）。
+    # 应用侧会兜一遍（`app/backend_fetch.ensure_pip`），但**出包时就该是干净的** ——
+    # 别让每台目标机都去修同一个缺陷（而且那是"点一下就好"这条路上最该少的环节）。
+    if runtime_from or python_from:
+        rt = os.path.join(kit_dir, RUNTIME_DIR)
+        exe = find_interpreter(rt)
+        if not exe:
+            raise PackError("随包的 runtime 里没有解释器（找过 PYTHON_RELS 那五种布局）：%s" % rt)
+        from app import backend_fetch
+        removed = backend_fetch.unmark_externally_managed(exe)
+        for path in removed:
+            rel = os.path.relpath(path, kit_dir).replace("\\", "/")
+            files = [f for f in files if f != rel]
+        ok, detail = backend_fetch.ensure_pip(exe)
+        if not ok:
+            # **不留半个包**（与前面那道 ABI 闸门同一条纪律）：那种包会被当成"能用的包"发出去。
+            shutil.rmtree(kit_dir, ignore_errors=True)
+            raise PackError("随包运行时的 pip 用不了，也没能就地修好（装上以后就装不了依赖）：\n%s"
+                            % detail)
+        info["runtimePrepared"] = {"markersRemoved": len(removed), "pip": detail}
+        if removed:
+            print("      [i] 摘掉 PEP 668 标记 %d 个（不摘掉的话目标机上 pip 拒绝安装）" % len(removed))
+        # **带没带是一回事，带的东西能不能 import 是另一回事**（2026-10-01 事故：残包看不出残，
+        # 装上以后伪装成"显卡不能用"）。这里从**包内**真跑一遍；不行就响亮失败、不留半个包。
+        try:
+            checked = import_check(kit_dir)
+        except PackError:
+            shutil.rmtree(kit_dir, ignore_errors=True)
+            raise
+        if checked:
+            info["importChecked"] = checked
+            print("      [i] 从包里真 import 过：%s" % "、".join(checked))
+
     with open(os.path.join(kit_dir, YAML_TMPL), "w", encoding="utf-8") as fh:
         fh.write(render_server_yaml(port=port, admin_port=admin_port))
     scripts = os.path.join(kit_dir, SCRIPTS_DIR)
@@ -328,15 +452,22 @@ def stage(out_dir: str, *, variant: str = "", runtime_from: str = "",
                                has_python=bool(python_from or runtime_from)))
     # 源清单（薄包的"另一半"）：目标机上 `app/backend_fetch.py` 按它装运行时；
     # 写进包里也是给人看的 —— "这一档从哪下、下什么"不该只活在代码里。
+    # `torchIndexes` 是**一串**（2026-10-01）：一个源抖了就换下一个，直接取自
+    # `app/backend_fetch.py`（那里是唯一真相，别在这里再抄一份）。
+    from app import backend_fetch
+    torch_indexes = backend_fetch.torch_indexes(variant)
     sources = {
         "mode": "thin" if thin else "thick",
         "variant": variant,
         "pipIndexes": ["https://pypi.tuna.tsinghua.edu.cn/simple",
                        "https://mirrors.aliyun.com/pypi/simple/"],
         "torchIndexTmpl": "https://mirror.sjtu.edu.cn/pytorch-wheels/%s/",
-        "torchIndex": "https://mirror.sjtu.edu.cn/pytorch-wheels/%s/" % (variant or "cu126"),
+        "torchIndex": torch_indexes[0],
+        "torchIndexes": torch_indexes,
         "note": ("薄包：几 GB 的 torch 不随包走；目标机点「起本机后端」时按这些源现装"
-                 "（`app/backend_fetch.py`）。源可达性 2026-09-30 实测。"),
+                 "（`app/backend_fetch.py`）。torch 的索引**按 torchIndexes 的顺序试**，"
+                 "第一个通就不再往下（2026-10-01：SJTU 会间歇性撞 SSL，只有一个源时"
+                 "用户看到的就是「装 torch 失败」）。源可达性 2026-09-30 实测。"),
     }
     with open(os.path.join(kit_dir, SOURCES), "w", encoding="utf-8") as fh:
         json.dump(sources, fh, ensure_ascii=False, indent=2)
@@ -395,9 +526,17 @@ def verify(kit_dir: str) -> List[str]:
         exe = find_interpreter(os.path.join(kit_dir, RUNTIME_DIR))
         if not exe:
             problems.append("manifest 说有运行时，但 runtime/ 里没有解释器")
-        elif manifest.get("mode") == "thick" and not manifest.get("abi", {}).get("ok"):
-            # 厚包才要求 abi.ok（薄包只带解释器，torch 是目标机现装的，出包时无从校验）
-            problems.append("厚包的 manifest 里 abi.ok 不是真 —— 出包时没跑 ABI 校验？")
+        else:
+            if manifest.get("mode") == "thick" and not manifest.get("abi", {}).get("ok"):
+                # 厚包才要求 abi.ok（薄包只带解释器，torch 是目标机现装的，出包时无从校验）
+                problems.append("厚包的 manifest 里 abi.ok 不是真 —— 出包时没跑 ABI 校验？")
+            # **PEP 668 标记不许随包走**（2026-10-01）：带着它目标机上 pip 一律拒绝安装。
+            # 这条只看文件在不在，很便宜；真正的"pip 能不能用"在 `stage()` 里已经验过一遍。
+            from app import backend_fetch
+            markers = backend_fetch.external_markers(exe)
+            if markers:
+                problems.append("随包运行时里还留着 EXTERNALLY-MANAGED（pip 会拒绝安装）：%s"
+                                % "、".join(os.path.relpath(p, kit_dir) for p in markers))
     return problems
 
 

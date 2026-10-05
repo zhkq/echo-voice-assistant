@@ -15,6 +15,7 @@
 否则一个 20 MB 上传会把通道占几十秒，而真正稀缺的是 GPU。
 """
 from __future__ import annotations
+import math
 
 import threading
 import time
@@ -32,6 +33,24 @@ router = APIRouter(prefix="/v1")
 
 
 # ---------------------------------------------------------------- 并发闸门
+
+def _finite_turns(turns):
+    """pyannote 的 turn → 可 JSON 的 turn，**丢掉非有限值**（2026-10-05 真机事故）。
+
+    极短/静音/合成音输入时 pyannote 会给 NaN 的 start/end；`round(nan, 3)` 仍是 nan，
+    而 Starlette 的 JSONResponse 是 `allow_nan=False` → 整个 `/v1/diarize` 变成 HTTP 500
+    （客户端记"分离失败"，会议那一步走不下去）。NaN 的 turn 本身没有意义 → 丢掉。
+    """
+    out = []
+    for a, b, s in (turns or []):
+        try:
+            fa, fb = float(a), float(b)
+        except Exception:                                        # pragma: no cover - 兜底
+            continue
+        if math.isfinite(fa) and math.isfinite(fb):
+            out.append({"start": round(fa, 3), "end": round(fb, 3), "speaker": str(s)})
+    return out
+
 
 class Admission:
     """两级闸门。**不排队** —— 拿不到就立刻按类型拒。
@@ -611,8 +630,7 @@ async def diarize(request: Request, mode: str = "segment", maxSpeakers: int = 0,
         # 客户端比较两批嵌入的**唯一**依据（不是模型名）
         "vectorSpaceId": spec.vector_space_id,
         "dim": int(spec.dim or 0),
-        "turns": [{"start": round(float(a), 3), "end": round(float(b), 3), "speaker": str(s)}
-                  for a, b, s in (turns or [])],
+        "turns": _finite_turns(turns),
         "speakers": speakers,
         "audioSeconds": round(seconds, 2),
         "durationMs": int((time.time() - t0) * 1000),

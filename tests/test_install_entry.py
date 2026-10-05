@@ -21,6 +21,7 @@
 """
 import fnmatch
 import os
+import pathlib
 import re
 import sys
 import unittest
@@ -724,6 +725,184 @@ class OfflineBundleStaysOfflineTests(unittest.TestCase):
         """
         self.assertIn("if (-not $Agent) { $Agent = if ($Offline) { 'none' } else { 'harness' } }",
                       self.all_text)
+
+
+class BackendChoiceTests(unittest.TestCase):
+    """安装流程**后面**那句「后端怎么来」（用户 2026-10-01 要的）。
+
+    为什么钉它：这一步是唯一"装完客户端之后还要问人"的环节，也是"同事装一个包 → 零下载"
+    这条路上后端那一半的入口。它坏了不会有任何报错 —— 只会**没人问**，于是每台新机器都在
+    `capabilityPrivacy` / 配对 / 离线包上各走各的。
+
+    契约（都是**文本断言**，与这份测试文件里其它安装脚本用例同一个手法）：
+      ① 参数存在且默认 `ask`；
+      ② 排在组件之后、收尾之前（那会儿服务已经起来，配对与「起本机后端」才立刻生效）；
+      ③ **`-Yes` 不抑制它**（`-Yes` 免的是"装到哪个目录"，这一问是用户明确要的）；
+      ④ 非交互（脚本化/CI）时**跳过**，不许静默替用户配对；
+      ⑤ 两条路各自的落点：`/api/capability/pair` 与 `/api/capability/backend/start`；
+      ⑥ **离线包优先**（`ECHO-backend-offline-*`），有就不下载；
+      ⑦ 这一步**不许改退出码**（后端是可选项，装客户端本身是好的）。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.text = _read(INSTALL_ALL)
+
+    def test_the_switch_exists_and_defaults_to_asking(self):
+        self.assertIn("[ValidateSet('ask', 'pair', 'local', 'skip')][string]$Backend = 'ask'",
+                      self.text)
+        self.assertIn("[string]$BackendPair = ''", self.text)
+        self.assertIn("[string]$BackendDir = ''", self.text)
+
+    def test_it_runs_after_the_components_and_before_the_summary(self):
+        i_comp = self.text.index("$compExit = Invoke-ComponentsScript")
+        i_back = self.text.index("Invoke-BackendStep -Dir $BackendDir")
+        i_show = self.text.index("Show-Result -ComponentsExit $compExit")
+        self.assertLess(i_comp, i_back, "后端那一步要排在组件**之后**")
+        self.assertLess(i_back, i_show, "后端那一步要在收尾摘要**之前**（摘要里要有它的结论）")
+        self.assertIn("$script:BackendSummary", self.text)
+
+    def test_yes_does_not_suppress_this_one_question(self):
+        """`-Yes` 免的是"装到哪个目录"；这一问是用户明确要求的一步，**照问**。
+
+        判据：问不问只看"是不是交互控制台"（`[Console]::IsInputRedirected`），
+        `$Backend -eq 'ask'` 那一段里**不许**出现 `$Yes`。
+        """
+        m = re.search(r"if \(\$mode -eq 'ask'\) \{(.*?)\n    \}", self.text, re.S)
+        self.assertIsNotNone(m, "找不到问后端那一段")
+        block = m.group(1)
+        self.assertIn("Read-Host", block, "这一段就是那个问题本身")
+        self.assertNotIn("$Yes", block, "-Yes 不该把这一问也免掉")
+
+    def test_a_non_interactive_run_skips_instead_of_guessing(self):
+        """脚本化/CI：没人能贴配对串 —— **静默改用户的配对才是真错**（模块头第 2 条纪律）。"""
+        self.assertIn("IsInputRedirected", self.text)
+        m = re.search(r"if \(\$mode -eq 'ask' -and -not \$interactive\) \{(.*?)\n    \}",
+                      self.text, re.S)
+        self.assertIsNotNone(m, "找不到非交互那一段")
+        self.assertIn("$mode = 'skip'", m.group(1))
+
+    def test_pairing_goes_through_the_same_endpoint_the_panel_uses(self):
+        self.assertIn("/api/capability/pair", self.text)
+        self.assertIn("base_url", self.text)
+        self.assertIn("fingerprint", self.text)
+        # 配对串的解析要与面板同一个口径（web/app.js::parsePairString）
+        self.assertIn("ConvertFrom-EchoPairString", self.text)
+        for key in ("'host'", "'url'", "'code'", "'fp'", "'fingerprint'"):
+            self.assertIn(key, self.text, "配对串的键少了 %s" % key)
+
+    def test_local_means_unpack_and_trigger_the_download_only_when_needed(self):
+        """本机跑：解薄包 → **有离线包就直接复制启用**（不下载）→ 没有才触发下载。"""
+        self.assertIn("ECHO-backend-offline-*.zip", self.text)
+        self.assertIn("ECHO-backend-portable-*.zip", self.text)
+        self.assertIn("/api/capability/backend/start", self.text)
+        i_off = self.text.index("if ($off) {")
+        i_thin = self.text.index("} elseif ($thin) {")
+        self.assertLess(i_off, i_thin, "离线包那一档要**排在薄包之前**（有离线包就零下载）")
+        self.assertIn("零下载", self.text)
+
+    def test_it_uses_the_same_readiness_judgement_as_the_app(self):
+        """"运行时能用"的判据与 `backend_env.check_server_deps` 同一条：解释器 + 能 import。
+
+        只看 `runtime\\python.exe` 在不在，就会把"只装了半个运行时"报成就绪 ——
+        那正是 2026-10-01 真机的那个 bug。
+        """
+        self.assertIn("import fastapi, uvicorn", self.text)
+        self.assertIn("Test-BackendRuntimeUsable", self.text)
+
+    def test_a_broken_backend_step_never_fails_the_install(self):
+        """后端是可选项：这一步只 Warn/Info + 写摘要，**不许 exit**。"""
+        body = self.text[self.text.index("function Invoke-BackendStep"):]
+        body = body[:body.index("\n# ---------------------------------------------------------------- 入口")]
+        self.assertNotIn("exit ", body, "后端那一步不许结束安装进程：%s"
+                         % [ln.strip() for ln in body.splitlines() if "exit " in ln][:5])
+
+    def test_the_launcher_passes_the_delivery_folder_along(self):
+        """松的"装我.cmd + 几个 zip"形态：后端的两个 zip 就在脚本旁边，
+        所以 `-BackendDir` 必须指向脚本自己那一层（否则找不到、只能靠 Python 侧去猜落点）。"""
+        cmd = _read(os.path.join(ROOT, "delivery", "kit-install.cmd"), encoding="ascii")
+        self.assertIn('-BackendDir "%HERE%"', cmd)
+        self.assertIn("ECHO-backend-offline-*.zip", cmd,
+                      "脚本里要说清它旁边该放哪两个 zip（那是交付契约）")
+
+
+    def test_the_offline_pack_branch_also_starts_the_backend(self):
+        """**解包 ≠ 能用**：离线包那条分支必须**也**触发起后端并等就绪。
+
+        现场（2026-10-01 真机，用户装了新版）：选了"本机自己跑"，离线包解开了、运行时也就位了
+        （日志写着「后端运行时已就位（**零下载**）」），但 `D:\\ECHO\\backend` 里**没有 server.yaml、
+        没有 state/、连 backend.log 都没生成** —— 也就是说**根本没启动**。用户装完立刻转写：
+
+            会议状态 error：没有可用的后端…
+
+        （`capabilityMeetingAsrBackend` 只有 `echo-server`/`asr-provider` 两档 —— 会议转写**必须**
+        有一个后端，客户端进程内的 sherpa 只服务语音助手那条路。所以"离线包已就位但没起"= 装完不能用。）
+
+        判据（文本断言）：两条分支都走 `Start-LocalBackendNow`（它内部 `POST /api/capability/backend/start`
+        并轮询 `GET /api/capability/backend` 直到 `job.running` 为假）。
+        """
+        self.assertIn("function Start-LocalBackendNow", self.text, "两条分支要共用一个'起并等就绪'的助手")
+        self.assertIn("/api/capability/backend/start", self.text)
+        self.assertIn("/api/capability/backend\" -f $port", self.text.replace("'", "\""),
+                      "等就绪要轮询状态接口")
+        calls = self.text.count("Start-LocalBackendNow ")
+        self.assertGreaterEqual(calls, 3, "离线包（可用/不可用两条子路）与薄包都要调用它，实际 %d 处" % calls)
+        i_off = self.text.index("if ($off) {")
+        i_thin = self.text.index("} elseif ($thin) {")
+        offline_part = self.text[i_off:i_thin]
+        self.assertIn("Start-LocalBackendNow", offline_part,
+                      "**离线包分支里必须有它** —— 少了这一下就是「装完就转写必然失败」")
+
+    def test_it_waits_for_readiness_instead_of_pretending_success(self):
+        """等就绪要有**上限**，超时就如实说"还在起"，不许假装成功（也不能无限等）。"""
+        self.assertIn("AddSeconds(480)", self.text, "等待上限 8 分钟")
+        self.assertIn("还在装/起", self.text)
+
+class RequirementsFilesAreLocaleSafe(unittest.TestCase):
+    """pip `-r` 读的清单文件：**含非 ASCII 就必须在第一两行有 PEP263 编码声明**。
+
+    现场（2026-10-01 真机，第一次真跑"装运行时"那一步才炸）：
+
+        pip install -r server/requirements.txt
+        UnicodeDecodeError: 'gbk' codec can't decode byte 0xab in position 17
+
+    根因：那份文件是「**UTF-8 中文注释 + 没有 BOM、没有 coding 声明**」，而 pip 的
+    `_internal/utils/encoding.py::auto_decode()` 在既没 BOM 也没 cookie 时**按 locale 解码**
+    （中文 Windows = cp936）→ 撞上 UTF-8 字节就崩。报错完全看不出是编码问题，
+    看着像"包坏了"或"网不通"，很容易被引去查错地方。
+
+    为什么这条值得专门钉：`requirements-core.txt` 早就有那行声明，**只有 `server/` 这份漏了** ——
+    典型的一份文件一处漏，而它恰好在"另一条路"上（后端运行时），平时跑不到。
+    """
+
+    #: 这些目录里的清单不是"我们要 pip 的"（第三方/产物）
+    SKIP = ("venv/", ".venv/", "node_modules/", "dist/", "_offline-cache/", ".git/")
+
+    def _files(self):
+        out = []
+        root = pathlib.Path(ROOT)
+        for pat in ("**/*requirements*.txt", "**/constraints*.txt"):
+            for path in root.rglob(pat.split("/")[-1]):
+                rel = path.relative_to(root).as_posix()
+                if any(s in rel + "/" for s in self.SKIP):
+                    continue
+                out.append((path, rel))
+        return sorted(set(out), key=lambda x: x[1])
+
+    def test_any_non_ascii_requirements_file_declares_its_encoding(self):
+        checked, bad = [], []
+        for path, rel in self._files():
+            raw = path.read_bytes()
+            if not any(b > 127 for b in raw):
+                continue
+            checked.append(rel)
+            head = raw.decode("utf-8", "ignore").splitlines()[:2]
+            if not any("coding" in ln and ("=" in ln or ":" in ln) for ln in head):
+                bad.append(rel)
+        self.assertGreaterEqual(len(checked), 3,
+                                "只扫到 %d 个含中文的清单文件，扫描范围可能配错了" % len(checked))
+        self.assertEqual(bad, [], "这些清单含非 ASCII 却没有 PEP263 声明"
+                                  "（中文 Windows 上 pip 会按 cp936 解码并崩）：%s" % bad)
 
 
 if __name__ == "__main__":

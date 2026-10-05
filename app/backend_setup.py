@@ -290,12 +290,33 @@ def _indent(text: str, spaces: int = 2) -> str:
     return "\n".join(pad + line if line.strip() else line for line in str(text).splitlines())
 
 
+
+
+def listen_host() -> str:
+    """`server.yaml` 里 `listen:` 用的**地址部分**（2026-10-05 用户要求做成配置）。
+
+    默认 `127.0.0.1`（只本机）；设为 `0.0.0.0` 就是"局域网都能连"。端口**永远**是出厂那个
+    （`backend_proc.DEFAULT_PORT`）：用户明确说过不改端口，而且端口一改，"一处权威 = 生成的
+    yaml"那条判据就会与客户端设置打架（见 `configured_ports()` 的说明）。
+    """
+    try:
+        from app.config import settings
+        raw = str(settings.get("capabilityBackendListen", "") or "").strip()
+    except Exception:                                        # pragma: no cover - 兜底
+        raw = ""
+    if not raw:
+        return DEFAULT_LOOPBACK
+    # 允许写成 `host:port`（与命令行 `--listen` 同形）—— 只取地址部分，端口一律用出厂值。
+    host = raw.rsplit(":", 1)[0] if raw.count(":") == 1 else raw
+    return host.strip().strip("[]") or DEFAULT_LOOPBACK
+
 def render_config(*, port: int = backend_proc.DEFAULT_PORT,
                   admin_port: int = backend_proc.DEFAULT_ADMIN_PORT,
                   jwt_secret: str = "", device: str = "cuda",
                   vram_budget_mb: int = 0,
                   models_root_path: str = "",
-                  specs: Optional[Sequence[Dict[str, Any]]] = None) -> str:
+                  specs: Optional[Sequence[Dict[str, Any]]] = None,
+                  bind_host: str = "") -> str:
     """渲染 ``server.yaml`` 全文（纯函数：不读不写盘，方便用例比对内容）。"""
     lines: List[str] = [
         "# ECHO 能力后端 —— 由客户端「帮我起本机后端」自动生成（app/backend_setup.py）。",
@@ -309,7 +330,7 @@ def render_config(*, port: int = backend_proc.DEFAULT_PORT,
         "server:",
         "  id: %s" % _yaml_scalar("echo-local"),
         "  # 只服务本机：能力面与运维面都只听回环（改一处不改另一处 = 管理面仍对网段开着）",
-        "  listen: %s" % _yaml_scalar("%s:%d" % (DEFAULT_LOOPBACK, int(port))),
+        "  listen: %s" % _yaml_scalar("%s:%d" % ((bind_host or DEFAULT_LOOPBACK), int(port))),
         "  admin_listen: %s" % _yaml_scalar("%s:%d" % (DEFAULT_LOOPBACK, int(admin_port))),
         "  instance_id: %s" % _yaml_scalar("local"),
         "  # 0 = 不限制（按卡校准的预算由「起后端」的探测步骤给，小卡上必须填）",
@@ -385,7 +406,7 @@ def configure(*, port: int = backend_proc.DEFAULT_PORT,
     info["secretNote"] = secret_note
     text = render_config(port=port, admin_port=admin_port, jwt_secret=secret,
                          device=device, vram_budget_mb=vram_budget_mb, specs=specs,
-                         models_root_path=info["modelsRoot"])
+                         models_root_path=info["modelsRoot"], bind_host=listen_host())
     path = config_path()
     old = ""
     if os.path.isfile(path):
@@ -602,7 +623,9 @@ def start(*, port: int = backend_proc.DEFAULT_PORT,
     "后端上次起的、还在跑"的正常情形，接下来直接等配对文件 + 配对。
 
     ``fetch_runtime``（2026-09-30 加，默认开）：**薄包那条路的第 0 步** ——
-    运行时不在 `runtime/` 里时，按国内源把它装上（`app/backend_fetch.py`）。
+    运行时**不能用**时按国内源把它装上（`app/backend_fetch.py`）。
+    "不能用"包含两种：① `runtime/` 里没有解释器；② **解释器在、依赖没装全**
+    （薄包只带解释器，2026-10-01 真机就是这一档 —— 判据见 `ensure_runtime` 的 ⚠️ 段）。
     调用方给了 `python=` 时跳过（开发/用例用自己的解释器）。``variant`` 决定装哪一档
     （`cu126` / `cu118` / `cu128`，空 = cu126）—— 它同时决定 torch 的 CUDA 索引。
 
@@ -643,18 +666,19 @@ def start(*, port: int = backend_proc.DEFAULT_PORT,
 
     # **第 0 步：运行时**（用户 2026-09-30 拍板"默认薄包 + 国内可下载"）。
     # 薄包只有源码 + 配置模板，几 GB 的 torch 不随包走 —— 这里按**国内源**把它装进 `runtime/`。
-    # 什么时候跳过：① 调用方显式给了 `python=`（开发/用例走自己的解释器）；② 运行时已经在了。
+    # 什么时候跳过：① 调用方显式给了 `python=`（开发/用例走自己的解释器）；② 运行时**真的能用**。
+    # ⚠️ ②的判据在 `backend_fetch.ensure_runtime` 里，是"解释器 **+ fastapi/uvicorn 都能 import**"
+    # —— **不是**"`runtime/` 里有个 python.exe"。后者是本模块原来的写法，2026-10-01 在真机上
+    # 打脸：薄包只带解释器，于是"解释器在"→记「运行时已在」→**跳过装依赖**→后端一起来就
+    # `ModuleNotFoundError: No module named 'fastapi'` 退出，面板上只剩"后端起来后立刻退出了"。
     # 失败就停在这一步并把 pip 原文带出去（**"装不上"与"起了但用不了"必须分开**：
     # 这里失败时后端根本没起，用户看到的是安装问题，不是服务问题）。
     if fetch_runtime and not python:
         from app import backend_fetch
-        if backend_proc.python_exe():
-            record("runtime", True, "运行时已在：%s" % backend_proc.python_exe())
-        else:
-            ok, detail = backend_fetch.ensure_runtime(
-                variant or "", on_step=lambda label: record("runtime", True, label))
-            if not record("runtime", ok, detail):
-                return {"ok": False, "steps": steps, "message": detail}
+        ok, detail = backend_fetch.ensure_runtime(
+            variant or "", on_step=lambda label: record("runtime", True, label))
+        if not record("runtime", ok, detail):
+            return {"ok": False, "steps": steps, "message": detail}
 
     ok, detail, info = configure(port=port, admin_port=admin_port, device=device,
                                  vram_budget_mb=vram_budget_mb, specs=specs,

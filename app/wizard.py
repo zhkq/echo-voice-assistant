@@ -215,7 +215,18 @@ def recommend(env: dict) -> dict:
     gpu = env.get("gpu") or {}
     vram = int(gpu.get("vramMb") or 0)
     node = env.get("node") or {}
-    agent_ready = bool((env.get("agents") or {}).get("harness", {}).get("online"))
+    # 2026-10-04：和 install_state 那条同源 —— 问**用户当前选的那个**适配器，
+    # 而不是永远问 harness（选了 DSH Desktop 时 harness 会被主动停掉，问它必然 False）。
+    try:
+        from app.config import settings as _s
+        _active = str(_s.get("agentBackend", "") or "").strip()
+    except Exception:
+        _active = ""
+    _agents_env = env.get("agents") or {}
+    if _active in _agents_env:
+        agent_ready = bool((_agents_env.get(_active) or {}).get("online"))
+    else:
+        agent_ready = bool((_agents_env.get("harness") or {}).get("online"))
     return {
         "engine": "stt-sherpa",
         "engineReason": "不需要独立显卡、体积也小，先把「录音能变成文字」这件事拿到手",

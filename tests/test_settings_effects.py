@@ -19,12 +19,23 @@ class DispatchTests(unittest.TestCase):
         with patch.object(settings_effects, "_wake") as w, \
                 patch.object(settings_effects, "_router") as r, \
                 patch.object(settings_effects, "_agent") as a, \
-                patch.object(settings_effects, "_stt") as s:
+                patch.object(settings_effects, "_stt") as s, \
+                patch.object(settings_effects, "_hotkey") as h:
             w.return_value = {"scope": "wake", "ok": True, "detail": ""}
             r.return_value = {"scope": "router", "ok": True, "detail": ""}
             a.return_value = {"scope": "agent", "ok": True, "detail": ""}
             s.return_value = {"scope": "stt", "ok": True, "detail": ""}
-            self.assertEqual([e["scope"] for e in settings_effects.apply(["panelHotkey"])], [])
+            h.return_value = {"scope": "hotkey", "ok": True, "detail": ""}
+            # 2026-10-02：改热键**要**重挂监听（组合键是监听器启动时读一次注册的，
+            # 不重挂就是"设置里改了、按下去没反应"）。旧断言在这里期望 `[]`。
+            # 注意 `_hotkey` **必须一起打桩**：不打的话这里会真起一个全局热键监听线程
+            # （AGENTS 记过这个漏线程的坑）。
+            self.assertEqual([e["scope"] for e in settings_effects.apply(["panelHotkey"])],
+                             ["hotkey"])
+            self.assertEqual([e["scope"] for e in settings_effects.apply(["meetingStartHotkey"])],
+                             ["hotkey"])
+            self.assertEqual([e["scope"] for e in settings_effects.apply(["panelAutoRefresh"])], [],
+                             "没动的键不许连带触发")
             self.assertEqual([e["scope"] for e in settings_effects.apply(["wakeEnabled"])], ["wake"])
             self.assertEqual([e["scope"] for e in settings_effects.apply(["wakeKeywords"])], ["wake"])
             self.assertEqual([e["scope"] for e in settings_effects.apply(["routerProbeInterval"])],

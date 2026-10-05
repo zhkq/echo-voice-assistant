@@ -162,7 +162,8 @@ class HotkeyListener(threading.Thread):
         若 panelHotkey 与 wake/fallback 撞车，注册会失败并记录在返回列表里。
         """
         registered = []
-        for key in ("wakeHotkey", "fallbackHotkey", "panelHotkey"):
+        for key in ("wakeHotkey", "fallbackHotkey", "panelHotkey",
+                    "meetingStartHotkey", "meetingStopHotkey"):   # 会议热键（默认空 → 跳过）
             combo = self.settings_get(key, "")
             parsed = parse_hotkey_combo(combo)
             if not parsed:

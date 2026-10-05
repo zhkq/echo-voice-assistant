@@ -143,7 +143,13 @@ if ($dirty.Count -gt 0 -and -not $AllowDirty) {
     $dirty | Select-Object -First 12 | ForEach-Object { Say "      $_" }
     exit 2
 }
-Ok 'working tree is clean'
+if ($dirty.Count -gt 0) {
+    # -AllowDirty: say it honestly - "clean" would be a lie, and this line is the only
+    # record of WHAT was deployed (a dirty working copy, not a commit).
+    Warn2 "working tree is DIRTY ($($dirty.Count) changed paths) - -AllowDirty was given, deploying the working copy as-is"
+} else {
+    Ok 'working tree is clean'
+}
 
 # ---- 3) build the kit ------------------------------------------------------
 if ($NoBuild) {
@@ -254,7 +260,11 @@ function Copy-Tree([string]$From, [string]$To, [string]$Label) {
 }
 
 if ($DryRun) {
-    Say "  [dry] would overlay the kit's $(Split-Path $srcEcho -Leaf)\ over $destCode (data\ models\ runtime-core\ are not in the kit, so they stay)"
+    # 2026-10-04 BUG (fixed here): dry-run never expands the kit, so $srcEcho is null and
+    # Split-Path threw "Cannot bind argument to parameter 'Path' because it is null":
+    # i.e. the very mode you are told to run FIRST was the one that crashed. Report the
+    # kit's intended code dir name instead (echo-core for a 3.0 kit, ECHO for an older one).
+    Say "  [dry] would overlay the kit's code dir over $destCode (data\ models\ runtime-core\ are not in the kit, so they stay)"
 } else {
     Copy-Tree $srcEcho $destCode (Split-Path $srcEcho -Leaf)
     Copy-Tree $srcSkill $destSkill 'echo-install\'
@@ -292,19 +302,52 @@ if ($Restart) {
             Where-Object { $_.CommandLine -like "*$DestDir*" -and $_.CommandLine -match 'app\.main' } |
             ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
         Start-Sleep -Seconds 3
-        $vbs = Join-Path $DestDir 'scripts\echo-startup.vbs'
-        if (Test-Path -LiteralPath $vbs) {
-            & wscript.exe $vbs
-            $waited = 0
-            while ($waited -lt $WaitSeconds) {
-                Start-Sleep -Seconds 3; $waited += 3
-                try {
-                    $null = Invoke-RestMethod -Uri "http://127.0.0.1:$port/api/status" -TimeoutSec 5
-                    Ok "ECHO is back on port $port (${waited}s)"; break
-                } catch { }
+        # 2026-10-04 BUG (fixed here): the vbs lives under the CODE dir in a 3.0 install
+        # ($DestDir\echo-core\scripts\echo-startup.vbs), but this looked only at
+        # $DestDir\scripts\ - so a real deploy KILLED ECHO (line 301) and then printed
+        # "no echo-startup.vbs" and left the service DOWN. Try the code dir first, then
+        # the install root (older flat layouts).
+        # 2026-10-04 BUG (fixed here): this used to rely ONLY on
+        # `wscript.exe <code>\scripts\echo-startup.vbs` - and in a real run that did NOT bring
+        # ECHO back (process dead, port empty, only "did not answer within 120s"). A deploy that
+        # leaves the service DOWN is the worst possible outcome, so try the tree's OWN launcher
+        # first (`scripts\start.ps1 -Background`, the same detached one the desktop kit uses),
+        # and keep the vbs as a fallback.
+        $startPs1 = Join-Path $destCode 'scripts\start.ps1'
+        if (Test-Path -LiteralPath $startPs1) {
+            Start-Process -FilePath 'powershell' -WindowStyle Hidden -ArgumentList @(
+                '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $startPs1, '-Background'
+            ) | Out-Null
+        } else {
+            Warn2 "no scripts\start.ps1 under $destCode - falling back to the vbs"
+        }
+        $waited = 0
+        while ($waited -lt $WaitSeconds) {
+            Start-Sleep -Seconds 3; $waited += 3
+            try {
+                $null = Invoke-RestMethod -Uri "http://127.0.0.1:$port/api/status" -TimeoutSec 5
+                Ok "ECHO is back on port $port (${waited}s)"; break
+            } catch { }
+        }
+        if ($waited -ge $WaitSeconds) {
+            $vbs = Join-Path $destCode 'scripts\echo-startup.vbs'
+            if (-not (Test-Path -LiteralPath $vbs)) { $vbs = Join-Path $DestDir 'scripts\echo-startup.vbs' }
+            if (Test-Path -LiteralPath $vbs) {
+                Warn2 "start.ps1 did not bring it back in ${WaitSeconds}s - trying the vbs"
+                & wscript.exe $vbs
+                $waited = 0
+                while ($waited -lt $WaitSeconds) {
+                    Start-Sleep -Seconds 3; $waited += 3
+                    try {
+                        $null = Invoke-RestMethod -Uri "http://127.0.0.1:$port/api/status" -TimeoutSec 5
+                        Ok "ECHO is back on port $port (via vbs, ${waited}s)"; break
+                    } catch { }
+                }
             }
-            if ($waited -ge $WaitSeconds) { Warn2 "ECHO did not answer within ${WaitSeconds}s - check data\logs" }
-        } else { Warn2 "no echo-startup.vbs under $DestDir\scripts" }
+        }
+        if ($waited -ge $WaitSeconds) {
+            Fail "ECHO is STILL DOWN after the deploy - run scripts\start.ps1 -Background in $destCode"
+        }
     }
 } else {
     Say 'ECHO was NOT restarted (no -Restart): the new code loads at the next start.'

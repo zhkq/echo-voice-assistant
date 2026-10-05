@@ -1823,6 +1823,75 @@ def voiceprint_delete_name(name: str = "", _auth=Depends(optional_auth)):
     return {"ok": ok, "message": msg}
 
 
+@router.get("/voiceprints/{vid}/audition")
+def voiceprint_audition(vid: int, _auth=Depends(optional_auth)):
+    """试听一条声纹：把**源会议里那个说话人的那一段**切出来，回一个 wav。
+
+    为什么不直接回整段会议音频：会议按 `meetingSegmentMinutes` 切段（默认一段 10 分钟），
+    整段放出来根本听不出是谁。实测（2026-10-02）`lines.start/end` 是**段内**时间
+    （每个 `seg_index` 各自从 0 起），所以直接在 `resolve_segment()` 取到的那一段里切。
+
+    切不出来时**说清为什么**（源会议目录已清理 / 源音频没了 / 找不到那一行），
+    按 `/voiceprints` 那套约定回 `{ok:false, reason}` —— 面板要如实显示"为什么听不了"，
+    不要给空文件、也不要 500。
+    """
+    from fastapi.responses import FileResponse
+    from app.audio import audiofile
+    import soundfile as sf
+
+    row = db.get_voiceprint(vid)
+    if not row:
+        return {"ok": False, "reason": "样本不存在"}
+    name = str(row.get("meeting_name") or "")
+    label = str(row.get("source_label") or "")
+    if not name:
+        return {"ok": False, "reason": "这条样本没记源会议，无法试听"}
+    folder = os.path.join(meeting.meetings_dir(), name)
+    if not os.path.isdir(folder):
+        return {"ok": False, "reason": "源会议目录已清理（%s）" % name}
+
+    # 找"这个说话人"的第一行 → 知道在第几段、段内什么时间
+    seg_index, start, end = 0, 0.0, 0.0
+    mtg = db.get_meeting_by_name(name)
+    if mtg:
+        for ln in db.get_lines(mtg["id"]):
+            if (str(ln.get("speaker_label") or "") == label
+                    and float(ln.get("end") or 0) > float(ln.get("start") or 0)):
+                seg_index = int(ln.get("seg_index") or 0)
+                start, end = float(ln.get("start") or 0.0), float(ln.get("end") or 0.0)
+                break
+    path = audiofile.resolve_segment(folder, seg_index) if seg_index else None
+    if not path:
+        segs = audiofile.list_segments(folder)
+        path = segs[0] if segs else None
+    if not path:
+        return {"ok": False, "reason": "源音频文件已清理（%s）" % name}
+    if audiofile.is_flac(path):
+        path = audiofile.decode_to_wav(path)
+
+    # 切 12 秒以内（带一点前后留白）；时间对不上就退化成"这一段的前 12 秒"，
+    # 宁可听到人声，也不要因为时间戳问题回一个空文件。
+    CAP, PAD = 12.0, 0.25
+    try:
+        info = sf.info(path)
+    except Exception as exc:  # noqa: BLE001 —— 文件坏了要如实说
+        return {"ok": False, "reason": "源音频读不了（%s）：%s" % (name, audiofile._short(exc))}
+    a = max(0.0, start - PAD)
+    b = min(info.duration, (end or (start + CAP)) + PAD)
+    if b - a < 0.3 or b - a > CAP * 2:
+        a, b = 0.0, min(info.duration, CAP)
+
+    tmp = tempfile.mkdtemp(prefix="echo-vp-audition-")
+    out = os.path.join(tmp, "audition.wav")
+    with sf.SoundFile(path) as fh:
+        fh.seek(int(a * fh.samplerate))
+        data = fh.read(int((b - a) * fh.samplerate), dtype="float32")
+    sf.write(out, data, info.samplerate)
+    return FileResponse(out, media_type="audio/wav",
+                        filename="voiceprint-%d.wav" % vid,
+                        background=BackgroundTask(audiofile.remove_tree, tmp))
+
+
 # ---------------------------------------------------------------- 控制
 @router.post("/control/dsh/start")
 def control_dsh_start(_auth=Depends(optional_auth)):
@@ -1872,9 +1941,23 @@ def control_wake_stop(_auth=Depends(optional_auth)):
 
 @router.post("/control/echo/stop")
 def control_echo_stop(_auth=Depends(optional_auth)):
+    """关闭 ECHO 服务（面板 仪表盘 → 操作区 的「关闭 ECHO」）。
+
+    与 `/system/restart` **同一把闸**（2026-10-02）：正在处理的命令、正在录的会议都不许关 ——
+    以前这个端点谁都拦，脚本/面板一调就停，而"录音到一半被停"正是 2026-09-23 那次事故的形状。
+    """
+    if assistant.is_busy():
+        return {"ok": False, "message": "有命令正在处理中，请稍后再关闭"}
+    try:
+        from app import meeting
+        st = meeting.meeting_status()
+        if st.get("active"):
+            return {"ok": False, "message": "正在录音中，请先结束录音"}
+    except Exception:
+        pass
     import threading
     threading.Timer(0.5, manager.echo_stop_self).start()
-    return {"ok": True, "message": "ECHO 服务即将停止"}
+    return {"ok": True, "message": "ECHO 服务即将关闭"}
 
 
 @router.post("/control/stt/unload")
@@ -1964,3 +2047,14 @@ def list_keys(_auth=Depends(optional_auth)):
 def delete_key(kid: int, _auth=Depends(optional_auth)):
     db.delete_api_key(kid)
     return {"ok": True}
+
+
+@router.get("/instance")
+def api_instance(_auth=Depends(optional_auth)):
+    """这台 ECHO 是哪个实例（dev / stable / 未知）—— 只读，给面板挂牌子用。
+
+    2026-10-04：两个面板长得一样，用户分不清开的是哪一棵。名字来自本机的切换器配置
+    （`~/.echo-instances.json`）；客户机上没有 → 名字为空 → 面板不挂牌子（交付物不受影响）。
+    """
+    from app import instance_id
+    return instance_id.info()

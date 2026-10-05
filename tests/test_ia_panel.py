@@ -43,25 +43,40 @@ class IATabsTests(unittest.TestCase):
         cls.html = _read("web", "index.html")
 
     def test_three_config_tabs_plus_history(self):
+        # 2026-10-02：IA 重构，旧断言 `_VIEWS` 含 general/business/capability/history
+        # → 新断言 `_VIEWS` 含 settings/business/history（「ECHO 通用」+「能力与智能体」
+        # 合并成一个顶层「设置」页，`#view-general`/`#view-capability` 与它们的宿主
+        # `#setPaneGeneral`/`#setPaneCapability` 都已删除；`#view-settings` +
+        # `#setPaneSettings` 是唯一落点）。
+        # 理由：合并后同一件事不再有两个页签，符合「一个实体只有一处状态」。
         views = re.search(r"const _VIEWS = \[(.*?)\]", self.js, re.S).group(1)
-        for name in ("general", "business", "capability", "history"):
+        for name in ("settings", "business", "history"):
             self.assertIn('"%s"' % name, views, "少了 %s 页签" % name)
-        for gone in ("voice", "agent"):
-            self.assertNotIn('"%s"' % gone, views, "旧设置页签 %s 应已被三类替掉" % gone)
-        # 旧的四个设置页签容器必须消失（内容挪进新页签，不是复制一份）
+        for gone in ("general", "capability", "voice", "agent"):
+            self.assertNotIn('"%s"' % gone, views,
+                             "旧设置页签 %s 应已被「设置 / 业务配置」替掉" % gone)
+        # 合并掉的旧页签容器必须消失（内容挪进新页签，不是复制一份）
         for gone in ('id="view-voice"', 'id="view-agent"', 'id="setPaneVoice"',
-                     'id="setPaneAgent"'):
+                     'id="setPaneAgent"', 'id="view-general"', 'id="view-capability"',
+                     'id="setPaneGeneral"', 'id="setPaneCapability"'):
             self.assertNotIn(gone, self.html, "%s 应已删除" % gone)
-        for want in ('id="view-business"', 'id="setPaneBusiness"',
-                     'id="view-capability"', 'id="setPaneCapability"'):
+        for want in ('id="view-settings"', 'id="setPaneSettings"',
+                     'id="view-business"', 'id="setPaneBusiness"'):
             self.assertIn(want, self.html, "index.html 缺少 %s" % want)
 
     def test_old_deep_links_are_folded_to_the_new_tabs(self):
+        # 2026-10-02：IA 重构，旧断言 settings/boot/wizard → "general"、
+        # agent/failover/capabilities → "capability" → 新断言 general/boot/wizard/
+        # capability/capabilities/agent/failover/model/models → "settings"。
+        # 理由：`general` 与 `capability` 都不再是顶层页签，老书签要落到合并后的「设置」。
         """书签/深链不能因为重构就失效（`?view=voice` 等）。"""
         aliases = re.search(r"const VIEW_ALIASES = \{(.*?)\};", self.js, re.S).group(1)
-        for old, new in (("settings", "general"), ("boot", "general"), ("wizard", "general"),
-                         ("voice", "business"), ("agent", "capability"),
-                         ("failover", "capability"), ("capabilities", "capability")):
+        for old, new in (("general", "settings"), ("boot", "settings"), ("wizard", "settings"),
+                         ("capability", "settings"), ("capabilities", "settings"),
+                         ("agent", "settings"), ("failover", "settings"),
+                         ("model", "settings"), ("models", "settings"),
+                         ("voice", "business"),
+                         ("commands", "history"), ("meetings", "history")):
             with self.subTest(old=old):
                 self.assertRegex(aliases, r"%s:\s*\"%s\"" % (old, new),
                                  "%s 没有折算到 %s" % (old, new))
@@ -71,21 +86,37 @@ class IATabsTests(unittest.TestCase):
 
         2026-09-26（第二轮）：这一页原来是"后续版本"说明 + 一个去「会议记录」的入口。
         现在子页签、两个列表宿主、清空按钮、筛选与「加载更多」都在这一页里。
+
+        2026-10-02：IA 重构，旧断言只钉"视图内那条 `.tabs-sm` 是可见的子页签"
+        → 新断言多钉一件事：两个 `data-htab` 按钮出现在**顶层** `<nav class="tabs">` 里
+        （`指令历史` / `会议历史` 是两个顶层页签）。
+
+       2026-10-03：用户圈出"历史 / 说过的指令 · 开过的会"那张头卡是**多余的残留** →
+        连它里面藏着的 `.tabs-sm` 一起删了。所以视图里**不再有** `data-htab` 按钮
+        （驱动它们的只有顶层那两个页签），旧断言里"视图内仍有 `.tabs-sm hidden`"随之作废。
         """
         body = _view_body(self.html, "history")
-        for want in ('data-htab="commands"', 'data-htab="meetings"',
-                     'id="htab-commands"', 'id="htab-meetings"'):
+        for want in ('id="htab-commands"', 'id="htab-meetings"'):
             self.assertIn(want, body, "历史页缺少 %s" % want)
-        for gone in ("后续版本", "只预留位置", 'data-goto="meetings"'):
-            self.assertNotIn(gone, body, "历史页不该再是占位（%s）" % gone)
+        for gone in ("后续版本", "只预留位置", 'data-goto="meetings"',
+                     'class="tabs-sm', '说过的指令'):
+            with self.subTest(gone=gone):
+                self.assertNotIn(gone, body, "历史页不该再留着这个残留（%s）" % gone)
         # 两个子页签各自的列表宿主、清空按钮都在这一页里（ID 不许搬家到别处）
         for want in ('id="historyList"', 'id="btnClearCmds"', 'id="meetingList"'):
             self.assertIn(want, body, "历史页缺少 %s" % want)
-        # 子页签复用会议详情页那套控件（**不新造控件**）
-        self.assertIn('class="tabs-sm"', body)
-        self.assertIn('class="tab-sm active" data-htab="commands"', body)
         self.assertIn("function switchHistoryTab(", self.js)
         self.assertIn('$$("[data-htab]")', self.js)
+        # 2026-10-02：顶层那两个历史页签（带 data-htab 的 .tab）驱动**同一个** #view-history
+        nav = self.html[self.html.index('<nav class="tabs">'):]
+        nav = nav[:nav.index("</nav>")]
+        self.assertEqual(nav.count('data-view="history"'), 2,
+                         "顶层要有两个 history 页签（指令历史 / 会议历史）")
+        for htab in ("commands", "meetings"):
+            self.assertIn('data-view="history" data-htab="%s"' % htab, nav,
+                          "顶层缺少 data-htab=%s 的历史页签" % htab)
+        self.assertEqual(self.html.count('id="view-history"'), 1,
+                         "两个顶层历史页签共用同一个 #view-history（不是复制一份视图）")
 
 
 class MeetingRecordsMergedIntoHistoryTests(unittest.TestCase):
@@ -95,6 +126,9 @@ class MeetingRecordsMergedIntoHistoryTests(unittest.TestCase):
     必然出现"同一场会议两处状态"，而用户的规矩是「一个实体只有一处状态」。
     所以这里钉的不是"某个函数还在"，而是**没有第二份**：
     一个列表宿主、一个渲染函数、一处状态字段。
+
+    2026-10-02（IA 重构）：两个历史子页提到**顶层**（顶层按钮 5 个，但 `_VIEWS` 是 4 项
+    —— 两个按钮共用 `#view-history`，靠 `data-htab` 区分子页）。
     """
 
     @classmethod
@@ -102,11 +136,20 @@ class MeetingRecordsMergedIntoHistoryTests(unittest.TestCase):
         cls.js = _read("web", "app.js")
         cls.html = _read("web", "index.html")
 
-    def test_top_level_tabs_are_five_and_meetings_is_gone(self):
+    def test_top_level_tabs_are_four_views_and_meetings_is_gone(self):
+        # 2026-10-02：IA 重构，旧断言 `_VIEWS == ["dashboard", "general", "business",
+        # "capability", "history"]`（5 项）→ 新断言 4 项，且两项历史页签共用 `history`。
+        # 理由：「ECHO 通用」+「能力与智能体」合并成 `settings`；`指令历史`/`会议历史`
+        # 是两个**顶层**页签但都指向同一个 `#view-history`（靠 `data-htab` 区分子页），
+        # 所以 `_VIEWS` 里只有 4 项，而顶层按钮有 5 个。
         views = re.findall(r'"([a-z]+)"',
                            re.search(r"const _VIEWS = \[(.*?)\]", self.js, re.S).group(1))
-        self.assertEqual(views, ["dashboard", "general", "business", "capability", "history"],
-                         "并进历史后顶层应当是 5 个页签：%s" % views)
+        self.assertEqual(views, ["dashboard", "settings", "business", "history"],
+                         "合并后 _VIEWS 应当是 4 项（历史只算一项）：%s" % views)
+        nav = self.html[self.html.index('<nav class="tabs">'):]
+        nav = nav[:nav.index("</nav>")]
+        self.assertEqual(len(re.findall(r'<button class="tab[ "]', nav)), 5,
+                         "顶层按钮应当是 5 个（仪表盘/设置/业务配置/指令历史/会议历史）")
         self.assertNotIn('data-view="meetings"', self.html, "「会议记录」不再是顶层页签")
         self.assertNotIn('id="view-meetings"', self.html,
                          "独立的会议视图已删（内容整页并入历史页，不是复制一份）")
@@ -248,7 +291,10 @@ class FoldingTests(unittest.TestCase):
 
     def test_other_heavy_areas_are_closed_by_default(self):
         """其余几处"内容太多"的地方也默认收起：启动日志 / 运行环境 / 已配对后端 / 清理。"""
-        for cid in ("boot-logs", "cap-env", "cap-pair", "model-cleanup"):
+        # 2026-10-02：`cap-pair`（已配对后端连接情况）搬进「AI组件 → 转写服务 → 后端设置」
+        # 并**改成默认展开** —— 用户要在这儿直接看到本机的启停/安装（"本机的话展示启停、安装"），
+        # 默认收起等于还要多点一下。其余几处照旧默认收起。
+        for cid in ("boot-logs", "cap-env", "model-cleanup"):
             with self.subTest(id=cid):
                 m = re.search(r'data-collapse-id="%s"[^>]*>' % re.escape(cid), self.html, re.S)
                 if m:
@@ -288,19 +334,23 @@ class OneEntityOnePlaceTests(unittest.TestCase):
         self.assertRegex(self.js, r'id: "meet"[\s\S]{0,600}?dynAfter: \(\) => renderMeetingServiceCard\(\)')
 
     def test_the_device_card_is_capture_first(self):
-        """设备选择卡：**常用 = 两个用途麦 + 一条默认播放**；兜底麦与两条按用途播报收进高级。
+        """设备卡：**常用 = 两个用途麦 + 一条默认播放**；兜底麦与两条按用途播报收进高级。
 
         2026-09-30 用户拍板："播放有默认路径就够，但是**采集需要分别明确设备**"。
         起因是同事把「指令播报 / 会议播报」读成了麦克风 —— 那两条其实是扬声器
         （`commandOutputDeviceId` / `meetingOutputDeviceId`），而短标签把"扬声器"三个字省掉了，
         同一张卡里又看不到麦的入口。改法见 docs/settings-重设计方案.md §6.1。
+
+        2026-10-02：IA 重构，旧断言找的是 `id: "dev", title: "设备选择（采集与播放）"`
+        （那时它在 `SET_CARDS.capability` 组里）→ 新断言只按 `id: "dev"` 认卡，
+        标题已简化为「设备」，卡片落在 `SET_CARDS.settings` 组里。
+        理由：卡片标题不含"采集与播放"了，断言不该钉标题文案（钉的是卡里的键布局）。
         """
         fb = re.search(r'id: "fb", title: "朗读与反馈"([\s\S]*?)\},', self.js).group(1)
         for key in ("outputDeviceIds", "commandOutputDeviceId", "meetingOutputDeviceId"):
             with self.subTest(key=key):
                 self.assertNotIn(key, fb, "%s 不该在朗读反馈卡里再出现一次" % key)
-        dev = re.search(r'id: "dev", title: "设备选择（采集与播放）"([\s\S]*?)\},',
-                        self.js).group(1)
+        dev = re.search(r'id: "dev", title: "设备"([\s\S]*?)\},', self.js).group(1)
         common = re.search(r"common:\s*\[([^\]]*)\]", dev).group(1)
         adv = re.search(r"adv:\s*\[([^\]]*)\]", dev).group(1)
         for key in ("commandInputDeviceId", "meetingInputDeviceId", "outputDeviceIds"):
@@ -314,12 +364,20 @@ class OneEntityOnePlaceTests(unittest.TestCase):
                          "常用**只有**这三行（用户口径）：%s" % common)
 
     def test_the_mics_are_not_placed_twice(self):
-        """挪进设备选择卡的三个麦，必须从「会议」「语音指令」两张卡里删干净（每键恰好一处）。"""
-        business = self.js[self.js.index("business: ["):self.js.index("capability: [")]
+        """挪进设备卡的三个麦，必须从「会议转写」「语音指令」两张卡里删干净（每键恰好一处）。
+
+        2026-10-02：IA 重构，旧断言取的是 `business: [` 到 `capability: [` 之间那段
+        （那时 `SET_CARDS` 有三组）→ 新断言取 `SET_CARDS.business` 组**整段**
+        （到 `SET_CARDS` 对象结束为止，`capability` 组已不存在，不能再拿它当右边界）。
+        理由：分组从三组变两组，旧右边界 `capability: [` 在文件里已找不到（用例会直接抛错）。
+        """
+        block = self.js[self.js.index("const SET_CARDS = {"):]
+        block = block[:block.index("\nconst SET_PLACED_ELSEWHERE")]
+        business = block[block.index("business: ["):]
         for key in ("inputDeviceId", "commandInputDeviceId", "meetingInputDeviceId"):
             with self.subTest(key=key):
                 self.assertNotIn('"%s"' % key, business,
-                                 "%s 已挪到设备选择卡，business 里不该再有它" % key)
+                                 "%s 已挪到设备卡，business 里不该再有它" % key)
 
     def test_the_short_labels_say_playback_or_capture(self):
         """短标签要带"播放 / 采集"这两个词 —— 缺了它就会重演这次误读（详见 §6.1）。"""
@@ -344,19 +402,39 @@ class OneEntityOnePlaceTests(unittest.TestCase):
         self.assertIn("voiceprintAutoEnroll", self.js)
         self.assertIn("改名即入库", self.js)
 
-    def test_settings_cards_are_regrouped_into_three_tabs(self):
-        """卡片分组 = 三类（业务配置 5 张、能力与智能体 2 张 + 静态卡）。"""
+    def test_settings_cards_are_regrouped_into_two_tabs(self):
+        """卡片分组：**设置 7 张 + 业务配置 5 张**（两组，不是三组）。
+
+        2026-10-02：IA 重构，旧断言 `SET_CARDS` 三组
+        `["general", "business", "capability"]`（business 5 张、capability 2 张）
+        → 两组 `["settings", "business"]`；「通用」与「能力与智能体」并成一个顶层「设置」页，
+        原 capability 的「智能体」「设备选择」两张卡并进 settings（`id: "ai"` / `id: "dev"`）。
+        同日第二轮（用户《ECHO边条页签功能设计》定稿后）：
+          * 「运行状态」卡从设置里**撤掉** —— 内容搬到仪表盘的「运行情况」（服务/端口/版本）
+            与「操作区」（重启/关闭），一个动作只留一处入口；
+          * 「工作区与归档」卡**并进 `id: "ai"` 卡的高级区**（用户把这一族嵌套在 AI组件→Agent 下）。
+        所以 settings 现在 **5 张**：通用 / AI 组件 / 快捷键 / 设备 / 声纹库；
+        `business` 仍是 5 张（会议转写 / 语音指令 / 唤醒 / 朗读与反馈 / 队列）。
+        """
         block = self.js[self.js.index("const SET_CARDS = {"):]
         block = block[:block.index("\nconst SET_PLACED_ELSEWHERE")]
         groups = re.findall(r"^  (\w+): \[", block, re.M)
-        self.assertEqual(groups, ["general", "business", "capability"],
-                         "SET_CARDS 只该有三组：%s" % groups)
-        biz = block[block.index("business: ["):block.index("capability: [")]
+        self.assertEqual(groups, ["settings", "business"],
+                         "SET_CARDS 只该有两组：%s" % groups)
+        setgrp = block[block.index("settings: ["):block.index("business: [")]
+        self.assertEqual(len(re.findall(r'\{ id: "', setgrp)), 5,
+                         "设置应当是 5 张卡（通用/AI组件/快捷键/设备/声纹库）")
+        biz = block[block.index("business: ["):]
         self.assertEqual(len(re.findall(r'\{ id: "', biz)), 5,
-                         "业务配置应当是 5 张卡（会议/语音指令/朗读与反馈/队列/工作区与归档）")
-        cap = block[block.index("capability: ["):]
-        self.assertEqual(len(re.findall(r'\{ id: "', cap)), 2,
-                         "能力与智能体应当是 2 张设置卡（智能体/设备选择）")
+                         "业务配置应当是 5 张卡（会议转写/语音指令/唤醒/朗读与反馈/队列）")
+        for card_id in ("ai", "dev"):
+            with self.subTest(card=card_id):
+                self.assertIn('{ id: "%s"' % card_id, setgrp,
+                              "原「能力与智能体」的智能体/设备选择卡应并进设置：%s" % card_id)
+        # 两张卡已按用户结构收掉：运行状态 → 仪表盘；工作区与归档 → 并进 AI 组件
+        for gone_id in ('{ id: "svc"', '{ id: "ws"'):
+            with self.subTest(gone=gone_id):
+                self.assertNotIn(gone_id, setgrp, "这张卡已经收掉了：%s" % gone_id)
 
     def test_every_visible_setting_has_exactly_one_home(self):
         """**每个可见设置项都要有落点** —— 否则它会掉进「未归类」兜底卡。

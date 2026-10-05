@@ -146,9 +146,14 @@ class CollapsibleCardWiringTests(unittest.TestCase):
                 self.assertIn(token, self.js)
         # 动态卡片每次重绘后都要重新应用折叠状态
         # （2026-09-26 IA 重构：四个设置页签 → 三个，id 从 voice/agent 变成 business/capability）
-        self.assertIn('applyCollapsedCards($("#view-capability"))', self.js)
-        self.assertIn('["#view-general", "#view-business", "#view-capability"]', self.js,
-                      "三个设置页签的卡片都要重新应用折叠状态")
+        # 2026-10-02：IA 重构，旧断言 `applyCollapsedCards($("#view-capability"))` +
+        # `["#view-general", "#view-business", "#view-capability"]` → 新断言
+        # `applyCollapsedCards($("#view-settings"))` + `["#view-settings", "#view-business"]`。
+        # 理由：「通用」与「能力与智能体」并成一个顶层「设置」页，两个旧 id 都已删除；
+        # 意图不变（**每个设置页签的卡片重绘后都要重新应用折叠状态**）。
+        self.assertIn('applyCollapsedCards($("#view-settings"))', self.js)
+        self.assertIn('["#view-settings", "#view-business"]', self.js,
+                      "两个设置页签的卡片都要重新应用折叠状态")
 
     def test_capability_top_buttons_are_compact(self):
         """顶部「下载缺失 / 刷新」要短、用 mini、同行不换行（用户实测反馈）。"""

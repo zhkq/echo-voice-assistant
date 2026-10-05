@@ -20,6 +20,15 @@ def _read(path):
         return fh.read()
 
 
+def _view_block(html, view):
+    """取 `#view-<view>` 那一整段（到它自己的 `</section>` 为止）。"""
+    start = html.find('id="view-%s"' % view)
+    if start < 0:
+        raise AssertionError("index.html 里没有 #view-%s（页签被改名或合并了？）" % view)
+    end = html.find("</section>", start)
+    return html[start:end]
+
+
 class WizardUiWiringTests(unittest.TestCase):
 
     def setUp(self):
@@ -32,16 +41,21 @@ class WizardUiWiringTests(unittest.TestCase):
         这条改过断言（旧结构）：原来钉 `data-view="wizard"` + `id="view-wizard"`；
         现在钉"那张卡在常规页里、带折叠标记、且默认收起"以及"宿主还在"——
         意图不变：**向导必须有真实的落点，点得进去、渲染得出**。
+
+        2026-10-02：IA 重构，旧断言 `assertLess(html.index('id="view-general"'), …)`
+        → 新断言 `_view_block(html, "settings")` 里必须能找到那张卡。
+        理由：「通用」并进顶层「设置」（`#view-general` 已删除，旧写法会直接抛
+        `ValueError`），而向导卡仍要留在承载它的那一页里。
         """
         self.assertNotIn('data-view="wizard"', self.html, "向导不再是顶层页签")
         self.assertNotIn('id="view-wizard"', self.html, "独立的向导视图已删")
         self.assertIn('id="wizCard"', self.html, "向导卡必须存在")
         self.assertIn('data-collapse-id="wizard"', self.html, "向导卡要能折叠（状态记 localStorage）")
         self.assertIn('data-collapse-default="closed"', self.html, "向导卡默认收起（11 步摊开太长）")
-        self.assertLess(self.html.index('id="view-general"'), self.html.index('id="wizCard"'),
-                        "向导卡要在「常规」页里")
-        self.assertLess(self.html.index('id="bootLogCard"'), self.html.index('id="wizCard"'),
-                        "向导卡要在常规页**最后一张**（启动日志之后）")
+        settings_view = _view_block(self.html, "settings")
+        self.assertIn('id="wizCard"', settings_view, "向导卡要在「设置」页里")
+        self.assertLess(settings_view.index('id="bootLogCard"'), settings_view.index('id="wizCard"'),
+                        "向导卡要在设置页**最后一张**（启动日志之后）")
         self.assertIn('id="wizHost"', self.html, "向导的渲染宿主必须存在")
 
     def test_declared_views_all_have_a_container(self):
@@ -53,28 +67,46 @@ class WizardUiWiringTests(unittest.TestCase):
         2026-09-26：IA 重构（配置分三类 + 一个历史位）后顶层是 6 个。
         2026-09-26（第二轮）：「会议记录」**整体并入「历史 → 会议历史」**（同一个实体，
         只留一处渲染），顶层因此是 5 个：仪表盘 / ECHO 通用 / 业务配置 / 能力与智能体 / 历史。
+        2026-10-02（IA 重构）：「ECHO 通用」+「能力与智能体」合并成「设置」，而
+        `指令历史`/`会议历史` 提到顶层但**共用** `#view-history`（靠 `data-htab` 区分子页）
+        —— 所以 `_VIEWS` 是 4 项（旧断言是 5 项），顶层按钮是 5 个。
         """
         m = re.search(r"const _VIEWS = \[(.*?)\]", self.js, re.S)
         self.assertIsNotNone(m, "找不到 _VIEWS 声明 —— 它必须存在且只有一处")
         views = re.findall(r'"([a-z]+)"', m.group(1))
-        self.assertNotIn("wizard", views, "向导已并进「ECHO 通用」，不该再是顶层页签")
+        self.assertNotIn("wizard", views, "向导是一张卡（在「设置」页里），不该再是顶层页签")
         self.assertNotIn("meetings", views, "会议记录已并入「历史」，不该再是顶层页签")
-        self.assertEqual(len(views), 5, "并入后顶层是 5 个页签：%s" % views)
-        for name in ("general", "business", "capability", "history"):
-            self.assertIn(name, views, "配置三类的页签 id 不能改名：%s" % name)
+        self.assertNotIn("general", views, "「ECHO 通用」已并进「设置」，不该再是顶层页签")
+        self.assertNotIn("capability", views, "「能力与智能体」已并进「设置」，不该再是顶层页签")
+        self.assertEqual(len(views), 4, "合并后顶层是 4 项（历史只算一项）：%s" % views)
+        for name in ("dashboard", "settings", "business", "history"):
+            self.assertIn(name, views, "页签 id 不能改名：%s" % name)
         for name in views:
             self.assertIn('id="view-%s"' % name, self.html,
                           "页签 %s 没有对应的 #view-%s 容器" % (name, name))
+        # 两个历史顶层按钮共用同一个 #view-history（不是各来一份视图）
+        nav = self.html[self.html.index('<nav class="tabs">'):]
+        nav = nav[:nav.index("</nav>")]
+        hist_btns = re.findall(r'data-view="([a-z]+)"', nav)
+        self.assertEqual(hist_btns, ["dashboard", "settings", "business", "history", "history"],
+                         "顶层按钮：仪表盘/设置/业务配置/指令历史/会议历史（两个 history）：%s"
+                         % hist_btns)
+        self.assertEqual(self.html.count('id="view-history"'), 1,
+                         "两个历史页签只有一份 #view-history")
 
     def test_switch_view_dispatches_to_the_wizard_loader(self):
-        """切到「常规」要顺带把向导卡的数据拉起来（否则展开那张卡是空白）。
+        """切到承载向导卡的那一页要顺带把向导卡的数据拉起来（否则展开那张卡是空白）。
 
         2026-09-25：`switchView()` 里那句从 `if (name === …)` 改成 `if (view === …)`；
         同日向导并进常规，分派从 `if (view === "wizard") loadWizard();`
         变成 `if (view === "general") { …; loadWizard(); }` —— 意图不变：
         **切到承载向导的那一页时要真的加载向导**。
+
+        2026-10-02：IA 重构，旧断言钉 `if (view === "general")` → 新断言钉
+        `if (view === "settings")`。理由：「通用」并进顶层「设置」，
+        `general` 现在只是 `VIEW_ALIASES` 里的老书签名，不会再出现在 `dataset.view` 上。
         """
-        self.assertRegex(self.js, r'if \(view === "general"\) \{[^}]*loadWizard\(\);')
+        self.assertRegex(self.js, r'if \(view === "settings"\) \{[^}]*loadWizard\(\);')
         self.assertIn("async function loadWizard()", self.js)
 
     def test_wizard_calls_only_the_wizard_endpoints_and_saves_choices(self):

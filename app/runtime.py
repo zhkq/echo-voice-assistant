@@ -194,6 +194,28 @@ def open_panel_window():
         return False
 
 
+def meeting_hotkey(action):
+    """会议热键（2026-10-02 用户要求：开始/结束录制各一个键）。
+
+    与 `/api/meeting/start|stop` 走**同一对函数**（不在这里另写状态判断），
+    结果也照端点那样报一次 `services.report_meeting(...)` —— 否则面板上"会议"那颗灯
+    会与实际状态不同步。任何异常都只记日志：热键回调在监听线程里，抛出去会把它带停。
+    """
+    from app import meeting
+    try:
+        if action == "start":
+            ok, msg = meeting.start_meeting()
+            services.report_meeting("active" if ok else "idle", msg)
+        else:
+            ok, msg = meeting.stop_meeting()
+            services.report_meeting("transcribing" if ok else "idle", msg)
+        print(f"[hotkey] 会议{'开始' if action == 'start' else '结束'}录制：{'ok' if ok else '失败'} · {msg}")
+        return ok
+    except Exception as e:  # noqa: BLE001 —— 热键线程不许被带停
+        print(f"[hotkey] 会议{action} 失败: {e}")
+        return False
+
+
 def _hotkey_cb(source, detail):
     """hotkey: wakeHotkey/fallbackHotkey → 录音命令流；panelHotkey → 切换仪表盘；
     mediakey: vol_up… → 录音命令流。
@@ -210,6 +232,8 @@ def _hotkey_cb(source, detail):
                 toggle_sidebar()
             else:
                 open_panel_window()
+        elif detail in ("meetingStartHotkey", "meetingStopHotkey"):
+            meeting_hotkey("start" if detail == "meetingStartHotkey" else "stop")
         else:
             assistant.capture("hotkey")
     elif source == "mediakey":

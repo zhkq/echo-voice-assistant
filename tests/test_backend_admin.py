@@ -43,11 +43,20 @@ def _app():
 
 
 class _Isolated(unittest.TestCase):
-    """把"这台机器真实的状态"隔在外面：库、凭据、pid/日志、后端目录、设置值。"""
+    """把"这台机器真实的状态"隔在外面：库、凭据、pid/日志、后端目录、设置值、**端口占用**。"""
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="echo-backend-admin-")
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        # **"谁占着 8900/8901"也是这台机器的真实状态，必须一起隔掉**（2026-10-01 全量门禁实测）：
+        # 装过 ECHO 的机器上很可能**真有一个后端在跑**（用户装了就会跑），于是 `canStart` 变 False，
+        # 用例红在环境上而不是代码上 —— 那句 `端口被占：8900 被 python.exe（pid …）占着` 就是这么来的。
+        # 要测"被别人占着"的情形，请在**那个用例里**显式打桩（本文件里只有"探针炸了"那一条需要）。
+        for _name, _value in (("port_owner", lambda _p: None),
+                              ("port_check", lambda _ports, **_kw: (True, "端口空着（用例里不依赖真机）"))):
+            _p = mock.patch.object(backend_proc, _name, _value)
+            _p.start()
+            self.addCleanup(_p.stop)
         self._old_db = (db.DATA_DIR, db.DB_FILE)
         db.DATA_DIR = self.tmp
         db.DB_FILE = os.path.join(self.tmp, "admin.db")

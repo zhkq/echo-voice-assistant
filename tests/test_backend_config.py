@@ -23,7 +23,7 @@ from unittest.mock import patch
 
 import yaml
 
-from app import backend_pid, backend_proc, backend_ready, backend_setup  # noqa: E402
+from app import backend_env, backend_fetch, backend_pid, backend_proc, backend_ready, backend_setup  # noqa: E402
 from app.capabilities import credentials as cred
 from app.capabilities import pairing
 from app.capabilities.credentials import BackendCredentials
@@ -77,8 +77,16 @@ class _SetupCase(unittest.TestCase):
 
 class ConfigContentTests(_SetupCase):
     def test_loopback_and_local_pair_are_written(self):
-        """写出来的 yaml：只绑回环 + local_pair: true + 状态/临时/模型指对地方。"""
-        ok, detail, info = self.configure()
+        """写出来的 yaml：只绑回环 + local_pair: true + 状态/临时/模型指对地方。
+
+        ⚠️ 2026-10-05：`listen` 现在是**配置**（`capabilityBackendListen`）——这里必须先把设置
+        钉回环，否则**本机**把它设成 0.0.0.0（想让同事连）时这条会红（"把用户状态当常量"）。
+        默认值与"局域网"那两条在 `tests/test_backend_listen.py` 里钉。
+        """
+        with patch("app.config.settings.get",
+                   side_effect=lambda k, d=None: "127.0.0.1"
+                   if k == "capabilityBackendListen" else d):
+            ok, detail, info = self.configure()
         self.assertTrue(ok, detail)
         cfg = self.config()
         self.assertEqual(cfg["server"]["listen"], "127.0.0.1:8900")
@@ -384,6 +392,40 @@ class LaunchTests(_SetupCase):
 
 
 class StartSequenceTests(_SetupCase):
+    def test_the_runtime_step_never_trusts_a_bare_interpreter(self):
+        """**2026-10-01 真机那个 bug 的编排面**：`runtime/` 里有 `python.exe` ≠ 能起后端。
+
+        旧代码在这一步是 ``if backend_proc.python_exe(): record("runtime", True, "运行时已在")``
+        —— 于是**根本不调** `ensure_runtime`、依赖一个都不装，后端一起来就以
+        ``ModuleNotFoundError: No module named 'fastapi'`` 退出，面板上只剩"后端起来后立刻退出了"。
+        这条用例钉的就是：**有解释器也照样走 `ensure_runtime`**（判据在它里面，见
+        `backend_env.check_server_deps`），并且这一步的话要说成"只装了一半"。
+        """
+        called = []
+
+        def _fake_ensure(variant="", on_step=None):
+            called.append(variant)
+            if on_step:
+                on_step("运行时只装了一半（解释器在、fastapi import 不过）→ 按国内源补齐")
+            return True, "运行时装好了：torch 2.14.0+cu126"
+
+        # 「取薄包」那一步（它排在运行时之前）也要桩掉：它的搜索目录里含着**真实的**
+        # Downloads/Desktop，开发机上恰好放着一个 `*.zip` 就会让这条用例随人而变。
+        with patch.object(backend_proc, "python_exe", lambda: "/fake/python"), \
+                patch.object(backend_fetch, "ensure_package",
+                             lambda on_step=None: (True, "薄包已在：X")), \
+                patch.object(backend_fetch, "ensure_runtime", _fake_ensure), \
+                patch.object(backend_setup, "configure",
+                             lambda **kw: (False, "写不了配置", {})):
+            res = backend_setup.start()
+        self.assertFalse(res["ok"])
+        self.assertEqual(called, [""], "有解释器也必须走 ensure_runtime（判据在它里面）")
+        self.assertEqual([s["name"] for s in res["steps"]],
+                         ["package", "runtime", "runtime", "configure"])
+        said = " ".join(s["detail"] for s in res["steps"] if s["name"] == "runtime")
+        self.assertIn("只装了一半", said)
+        self.assertNotIn("运行时已在", said)
+
     def test_a_failed_configure_stops_the_sequence(self):
         """第一步失败就返回：不启动、不配对、不多写任何设置。"""
         with patch.object(backend_setup, "configure",

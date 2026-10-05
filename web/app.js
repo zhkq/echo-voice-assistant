@@ -97,7 +97,7 @@ function confirmDialog(message, { okText = "确定", cancelText = "取消", dang
    2026-09-26（第二轮）：**「会议记录」整体并入「历史 → 会议历史」** —— 顶层 6 → 5。
    为什么并：那是同一个实体（同一批 meetings 行、同一个目录）。两个页签并存就等于
    同一场会议有两处状态，而用户的规矩是「一个实体只有一处状态」。 */
-const _VIEWS = ["dashboard", "general", "business", "capability", "history"];
+const _VIEWS = ["dashboard", "settings", "business", "history"];
 
 /* 历史页内部的两个子页签（**不是顶层页签**，所以不进 `_VIEWS`）：
    `commands` = 指令历史，`meetings` = 会议历史。用 `.tab-sm` 那套控件。 */
@@ -118,10 +118,12 @@ let _histTab = "commands";
    （内容一项没少，只是重新分组 + 默认折叠，见 docs/设置项归属表.md）。
    深链折算： */
 const VIEW_ALIASES = {
-  settings: "general", boot: "general", wizard: "general",
+  // 2026-10-02：老页签（通用 / 能力与智能体）并进「设置」；老书签一律落那儿。
+  general: "settings", boot: "settings", wizard: "settings",
+  capability: "settings", capabilities: "settings", agent: "settings",
+  failover: "settings", model: "settings", models: "settings",
   voice: "business", "语音与设备": "business", meetingsettings: "business",
-  failover: "capability", model: "capability", models: "capability",
-  capabilities: "capability", agent: "capability",
+  commands: "history",
   // 「会议记录」不再是顶层页签（2026-09-26 第二轮）：老书签/老链接一律落到
   // 「历史」，再由 switchView 打开"会议历史"子页签（见那里的 `rawName`）。
   meetings: "history", "会议记录": "history",
@@ -151,22 +153,30 @@ function switchView(name) {
   $$(".view").forEach((v) => v.classList.add("hidden"));
   const host = $(`#view-${view}`);
   if (host) host.classList.remove("hidden");
-  $$(".tab").forEach((t) => t.classList.toggle("active", t.dataset.view === view));
+  $$(".tab").forEach((t) => {
+    const on = t.dataset.view === view
+      && (view !== "history" || !t.dataset.htab || t.dataset.htab === _histTab);
+    t.classList.toggle("active", on);
+  });
   // 历史页是"整页一个列表"：整页不滚、列表自己滚（CSS 的 `body.on-history`）。
   // 不给它一个确定高度的话，列表会把整页撑长、「加载更多」被推到最下面（实测 126 条
   // = 6000px 的页面）。其它页签照旧整页滚动，行为一字不变。
   document.body.classList.toggle("on-history", view === "history");
   if (view === "dashboard") { refreshDashboard(); loadTargets(); }
-  // 三个设置页签共用一份设置数据：loadSettings() 一次把三页的卡片都画出来（切页不重拉）。
-  // 「ECHO 通用」里还挂着启动状态与**安装向导**卡，所以那一页要多拉两样。
-  if (view === "general") { loadSettings(); loadBoot(); loadBootLogs(); loadWizard(); }
+  // 两个设置页签共用一份设置数据：loadSettings() 一次把两页的卡片都画出来（切页不重拉）。
+  // 「设置」里还挂着启动状态 / 启动日志 / 安装向导 / 能力与路由那几块，所以那一页要多拉几样。
+  if (view === "settings") {
+    // 「设置」= 原「通用」+「能力与智能体」+ 高级那几组：一次把要用的都拉齐（切页不重拉）。
+    loadSettings(); loadBoot(); loadBootLogs(); loadWizard(); loadCapabilities(); loadRouter();
+    loadVoiceprints();
+  }
   if (view === "business") { loadSettings(); loadQueueCard(); }
-  if (view === "capability") { loadSettings(); loadCapabilities(); loadRouter(); }
   // 历史页：`?view=meetings` / `data-goto="meetings"` 这类老入口要落进"会议历史"子页签，
   // 其余情况沿用用户上次看的那一个（默认指令历史）。
   if (view === "history") switchHistoryTab(rawName === "meetings" ? "meetings" : _histTab);
 }
-$$(".tab").forEach((t) => t.addEventListener("click", () => switchView(t.dataset.view)));
+$$(".tab").forEach((t) => t.addEventListener("click", () =>
+  switchView(t.dataset.htab || t.dataset.view)));   // 两个历史页签靠 data-htab 选子页
 
 /** 打开「常规」页最后那张「安装向导」卡（原 `switchView("wizard")` 的去处）。
  *  三件事一起做，缺一样用户体验就是"点了没反应"：切到常规 → **展开**那张卡（并把它从
@@ -294,9 +304,12 @@ function renderStartupNotes(st) {
      * `.mcard` —— 标题 `.mcard-head`，内容 `.mcard-body`（能力页签里动态渲染的卡片）。
    与设置页的分组折叠是**两套存储**：一个记分组、一个记卡片，互不影响。 */
 const CARD_COLLAPSE_KEY = "echo.panel.collapsedCards";
-const COLLAPSE_TITLE_SEL = ".card.collapsible > .card-title, .mcard.collapsible > .mcard-head";
-const COLLAPSE_ANY_SEL = ".card.collapsible, .mcard.collapsible";
-const COLLAPSE_TITLE_CHILD = ":scope > .card-title, :scope > .mcard-head";
+// 二级分组小卡片（`.ssub`）也能折叠（2026-10-02 用户："二级卡片也能折叠"）：
+// 就是把它们并进同一套选择器 —— 状态照旧存在 localStorage，箭头/aria/键盘一起复用。
+const COLLAPSE_TITLE_SEL = ".card.collapsible > .card-title, .mcard.collapsible > .mcard-head,"
+  + " .ssub.collapsible > .ssub-h";
+const COLLAPSE_ANY_SEL = ".card.collapsible, .mcard.collapsible, .ssub.collapsible";
+const COLLAPSE_TITLE_CHILD = ":scope > .card-title, :scope > .mcard-head, :scope > .ssub-h";
 
 function _collapsedCards() {
   try { return new Set(JSON.parse(localStorage.getItem(CARD_COLLAPSE_KEY) || "[]")); }
@@ -708,11 +721,12 @@ function renderRouterStats() {
  *   「能力与智能体」（id 仍是 `capability`），选择器跟着改。） */
 function _rtBusy() {
   const a = document.activeElement;
-  const sec = $("#view-capability");
+  const sec = $("#view-settings");
   return !!(a && sec && a !== document.body && sec.contains(a));
 }
 
 async function loadRouter() {
+  applyRouterVisibility();
   try {
     const v = await api("/api/router/status");
     _rtView = v;
@@ -942,6 +956,7 @@ $$("[data-goto-link='agent']").forEach((a) =>
 
 async function refreshDashboard() {
   refreshFailoverCard();            // 模型路由小卡片（独立容错，不阻塞主刷新）
+  refreshRunStatus().catch(() => {});   // 「运行情况」四行（后端/Agent/语音合成/路由）
   // 智能体 Web 界面小图标（独立 harness）：跟着仪表盘刷新一起更新，失败不阻塞
   refreshAgentsForDashboard().catch(() => {});
   try {
@@ -1329,11 +1344,14 @@ let _capView = null;            // GET /api/capability 的最近一次返回（�
 let _compsCache = null;         // GET /api/components（常规页那条"组件就绪 N/M"的摘要用）
 let _routerView = null;         // GET /api/router/status（通道设置的状态行）
 let _statusCache = null;        // GET /api/status（服务卡的运行信息）
+//: `_capBackendCache` 的取数时刻（TTL 用，见 refreshRunStatus）+ 底部状态的自刷新节拍
+let _capBackendAt = 0;
+let _runStatusTimer = null;
 
 /* 一级分组（后端 grp）展示顺序 = 业务相关性（只在兜底卡里用到）。 */
-const SET_GROUP_ORDER = ["agent", "model", "voice", "wake", "meeting",
-  "worklog", "panel", "paths", "router", "dsh"];
-const SET_GROUP_NAMES = { agent: "智能体", model: "模型与引擎", voice: "语音命令",
+const SET_GROUP_ORDER = ["agent", "model", "provider", "voice", "wake", "meeting",
+  "worklog", "panel", "paths", "router", "dsh"];   // 2026-10-02：provider 一族可见了（AI组件 → 在线服务）
+const SET_GROUP_NAMES = { agent: "智能体", model: "模型与引擎", provider: "在线服务", voice: "语音命令",
   wake: "唤醒词", meeting: "会议", worklog: "纪要归档",
   panel: "面板与服务", paths: "存储路径", router: "模型路由", dsh: "DSH 服务" };
 
@@ -1348,83 +1366,118 @@ const SET_SUB_NAMES = { record: "录音与转写", command: "命令与会话",
 /* 3 个新页签（顺序即顶层页签顺序；第四位留给「历史」）。
    三个设置页签（2026-09-26 IA 重构后**就是顶层页签**）。`who` 是每页顶部那句"这一页管什么"，
    由 renderSettingsPanes() 填进 index.html 里那个空 `.sset-who`（单一出处，别在两处写标题）。 */
+/* 顶层页签（2026-10-02 第二次 IA 重构，按用户给的《ECHO边条页签功能设计》）：
+     1 仪表盘 · 2 设置 · 3 业务配置 · 4 指令历史 · 5 会议历史
+   这里只管**两个设置页签**（仪表盘/历史不归它管）。`who` 是每页顶部那句"这一页管什么"，
+   由 renderSettingsPanes() 填进 index.html 里那个空 `.sset-who`（单一出处，别在两处写标题）。 */
 const SET_TABS = [
-  { id: "general", who: "快捷键 · 打开/启动形式 · 运行状态（服务 / 端口 / 版本 / 重启停止）" },
-  { id: "business", who: "会议 · 语音指令 · 朗读与反馈 · 队列 · 工作区与归档" },
-  { id: "capability", who: "智能体选择 · 模型路由 · 设备选择；下面是已配对后端、本地能力与清理" },
+  { id: "settings", who: "通用 · AI 组件 · 快捷键 · 设备 · 声纹库 · 高级（组件/日志/体检/向导）" },
+  { id: "business", who: "会议转写 · 语音指令 · 唤醒 · 朗读与反馈 · 队列" },
 ];
 
-/* 高级设置区里的小节标题：只给**没有后端 sub** 的键起名；
-   有 sub 的键用 SET_SUB_NAMES（后端自己声明的分组）。
-   键名一律是 DEFAULTS 的真实键 —— 写错就是"这一项从界面上消失"，所以有一条自检兜底。 */
+/* 高级设置区里的小节标题（只给**没有后端 sub、也不靠卡片 advDefault**的键起名）。
+   规则与 `sAdvSection()` 一字不差：SET_ADV_SEC[键] || SET_SUB_NAMES[sub] || 卡片 advDefault || "其他"。 */
 const SET_ADV_SEC = {
+  // 设置 → 通用 → 高级（用户给的是一节「面板鉴权」，四项都挂在它下面）
+  apiAuthEnabled: "面板鉴权", panelAutoRefresh: "面板鉴权", serverPort: "面板鉴权",
+  dashboardShowRouter: "面板鉴权",
+  // 设置 → 快捷键 → 高级（用户这条留空；这里放"唤醒暂停 + 拦截媒体键"）
+  wakePaused: "唤醒与媒体键", consumeMediaKey: "唤醒与媒体键",
+  // 设置 → 声纹库 → 高级
+  voiceprintThreshold: "匹配阈值", voiceprintMargin: "匹配阈值",
+  // 设置 → AI组件 → Agent 的参数（由 renderAgentCardAdv 自己分小节，这里只兜住别掉进"其他"）
+  device: "计算与唤醒",
+  // 业务配置 → 会议转写
+  meetingAutoSummarize: "录音与产出", meetingKeepRawAudio: "录音与产出",
+  meetingAutoCompressAudio: "录音与产出", meetingWorkspaceTitle: "录音与产出",
+  capabilityPrivacy: "出网许可",
   // 业务配置 → 语音指令
-  wakeKeywords: "唤醒词与灵敏度", wakeAliases: "唤醒词与灵敏度",
-  wakePaused: "唤醒词与灵敏度", wakeThreshold: "唤醒词与灵敏度",
-  wakeCooldownSec: "唤醒词与灵敏度", wakeConfirmX: "唤醒词与灵敏度",
-  wakeConfirmN: "唤醒词与灵敏度", wakeSilenceFloor: "唤醒词与灵敏度",
-  device: "计算与唤醒", wakeEngine: "计算与唤醒",
-  // 2026-09-26：声纹识别是标配（没有开关）；用户能决定的只有"改名要不要顺手入库"，
-  // 所以这一节只剩它 + 两个阈值（认错人时唯一能调的东西）。见 docs/3.0-设计总览 §6.5。
-  voiceprintAutoEnroll: "声纹入库",
-  voiceprintThreshold: "声纹入库", voiceprintMargin: "声纹入库",
+  sttLanguage: "录音与转写", silenceThreshold: "录音与转写", silenceHangoverMs: "录音与转写",
+  noSpeechAbortMs: "录音与转写", maxRecordMs: "录音与转写",
+  commandWorkspaceTitle: "命令与会话", commandIdleRotateHours: "命令与会话",
+  commandTargetWorkspace: "命令与会话", commandTargetSession: "命令与会话",
+  userLocation: "命令与会话", sendEnvContext: "命令与会话",
   providerAsr: "在线服务", providerAsrBaseUrl: "在线服务", providerAsrModel: "在线服务",
   providerAsrApiKey: "在线服务", providerLlm: "在线服务", providerLlmBaseUrl: "在线服务",
   providerLlmModel: "在线服务", providerLlmApiKey: "在线服务",
-  // 业务配置 → 会议（保存策略）
-  meetingAutoSummarize: "录音与产出", meetingKeepRawAudio: "录音与产出",
-  // 压缩那条也归这里：不写它就会掉进 `sAdvSection()` 的 `"其他"` 兜底小节
-  // （`SET_CARDS.business` 的 `会议` 卡 `advOrder` 只有「录音与产出 / 出网许可」）
-  // —— 表现是开关**在**、但挂在一个叫「其他」的小节下，与它的两个同类分了家。
-  meetingAutoCompressAudio: "录音与产出",
-  meetingWorkspaceTitle: "录音与产出", capabilityPrivacy: "出网许可",
-  // 业务配置 → 工作区与归档
+  // 业务配置 → 唤醒
+  wakeKeywords: "唤醒词与灵敏度", wakeAliases: "唤醒词与灵敏度",
+  wakeThreshold: "唤醒词与灵敏度", wakeCooldownSec: "唤醒词与灵敏度",
+  wakeConfirmX: "唤醒词与灵敏度", wakeConfirmN: "唤醒词与灵敏度",
+  wakeSilenceFloor: "唤醒词与灵敏度", wakeEngine: "唤醒引擎",
+  // 业务配置 → 朗读与反馈
+  voiceConfirm: "朗读与反馈", voiceBrief: "朗读与反馈", maxBriefChars: "朗读与反馈",
+  minimalReply: "朗读与反馈", minimalReplyChars: "朗读与反馈", minimalReplyHint: "朗读与反馈",
+  // 业务配置 → 工作区与归档（纪要归档那一族在"高级"卡里）
   worklogEnabled: "纪要归档", worklogEnsureSessionAccess: "纪要归档",
   worklogVaultRoot: "纪要归档", worklogPrompt: "纪要归档",
-  // ECHO 通用 → 快捷键与打开方式
-  apiAuthEnabled: "面板鉴权",
 };
 
-/* 卡片结构（v3）。字段含义：
-     id     卡片标识（折叠状态按它记：data-collapse-id="set-<id>"）
-     title  卡片标题（**独占一行**，点它折叠整卡）
-     hint   标题下一句说明（可选）
-     help   标题右侧的 `?` 浮窗（可选）
-     common 常用参数：键数组，或一个返回 HTML 的函数（需要状态/按钮的卡用它）
-     adv    高级设置区的键数组（默认收起）
-     advOrder 高级区里的小节顺序（缺省按声明顺序）
-     advNote  高级区里某小节的补充说明：{小节名: html}
-     note   卡片末尾的常显说明（可选） */
+/* 卡片结构（v3）。字段含义（与旧版一致）：
+     id 卡片标识（折叠状态按它记）｜ title 卡片标题（点它折叠整卡）｜ hint 标题下一句（**一句话**）
+     help 标题右侧 `?` 浮窗｜ common 常用键数组（或返回 HTML 的函数）｜ adv 高级键数组（默认收起）
+     advOrder 高级小节顺序｜ advNote 小节补充说明｜ note 卡片末尾常显说明｜
+     covers 由函数代管的键（落点表看不见它们）｜ dynAfter 卡内附加块（函数） */
 const SET_CARDS = {
-  /* ---------- ① ECHO 通用：快捷键 · 打开/启动形式 · 运行状态 ---------- */
-  general: [
-    { id: "ui", title: "快捷键与打开方式",
-      hint: "面板自己怎么打开、用哪个键、启动时什么样。",
-      common: ["panelHotkey", "panelOpenMode", "panelAutoStart",
-               "panelStartCollapsed", "panelAutoRefresh"],
+  /* ---------- ② 设置：通用 · AI组件 · 快捷键 · 设备 · 声纹库 ---------- */
+  settings: [
+    { id: "gen", title: "通用",
+      hint: "面板怎么打开、怎么刷新。",
+      common: ["panelAutoStart", "panelStartCollapsed", "panelOpenMode"],
       advOrder: ["面板鉴权"],
-      adv: ["apiAuthEnabled"],
-      advNote: {
-        "面板鉴权": () => `<div class="snote info"><span>ⓘ</span><span>`
-          + `语音指令的快捷键（唤醒热键 / 回退热键 / 媒体键）在「业务配置 → 语音指令」里 —— `
-          + `它们属于"怎么说话"，不属于"怎么打开面板"。</span></div>`,
-      } },
-    { id: "svc", title: "运行状态",
-      help: "这一台机器自己的运行态（服务 / 端口 / 版本 / 重启停止）。" +
-            "组件与模型的就绪清单只在「能力与智能体」页渲染一处。",
-      common: () => renderServiceCard(),
-      advOrder: ["端口"],
-      advDefault: "端口",
-      adv: ["serverPort"] },
+      adv: ["apiAuthEnabled", "panelAutoRefresh", "serverPort", "dashboardShowRouter"] },
+    { id: "ai", title: "AI 组件",
+      hint: "用哪个能力：谁来执行、转写用本机还是在线、朗读用在线还是本机。",
+      common: () => renderAiCardCommon(),
+      covers: ["agentBackend", "harnessHome", "dshBaseUrl", "agentCustomPath",
+               "harnessCommand", "harnessPort", "harnessToken",
+               "agentCodebuddyEnabled", "agentHarnessEnabled",
+               "capabilityMeetingAsrBackend", "capabilityDiarizeBackend",
+               "capabilityEmbedBackend",
+               // 高级里"能力选择/在线服务"那两节也是函数画的（renderSettingRows），落点表看不见 → 显式登记
+               "sttModel", "ttsEngine", "wakeEngine",
+               "providerAsr", "providerAsrBaseUrl", "providerAsrModel", "providerAsrApiKey",
+               "providerLlm", "providerLlmBaseUrl", "providerLlmModel", "providerLlmApiKey",
+               // 工作区与归档那 6 项也是函数画的（见上面的 adv）
+               "commandWorkspace", "meetingWorkspace", "worklogEnabled",
+               "worklogEnsureSessionAccess", "worklogVaultRoot", "worklogPrompt",
+                 // 工作区那两个"分组名"也由函数画（会议分组 / 指令分组）
+                 "meetingWorkspaceTitle", "commandWorkspaceTitle"],
+      // 高级 = ① 选中那个智能体自己的参数（函数画）+ ② **能力选择**那批（引擎/在线服务）。
+      // 用户第 3 条：AI组件 = "能力选择上的配置"（在线还是本机），业务特征（要不要复述…）在业务配置页。
+      advOrder: ["能力选择"],
+        // 高级只留"开关与实现"：产品开关 /（转写·唤醒引擎）/ 在线服务。
+        // 工作区、归档、语音合成、每个 agent 的参数都按用户给的层级搬到**常用区**的二级分组里了。
+        adv: () => renderAgentCardAdv()
+          + sSub("能力选择", renderSettingRows(settingRows(["sttModel", "wakeEngine"])))
+        + sSub("在线服务",
+               renderSettingRows(settingRows(["providerAsr", "providerAsrBaseUrl",
+                                              "providerAsrModel", "providerAsrApiKey",
+                                              "providerLlm", "providerLlmBaseUrl",
+                                              "providerLlmModel", "providerLlmApiKey"]))) },
+    { id: "keys", title: "快捷键",
+      hint: "面板、指令各用哪个键。",
+      common: ["panelHotkey", "wakeHotkey", "fallbackHotkey", "triggerKeys",
+               "meetingStartHotkey", "meetingStopHotkey"],
+      advOrder: ["唤醒与媒体键"],
+      adv: ["wakePaused", "consumeMediaKey"] },
+    { id: "dev", title: "设备",
+      hint: "哪个麦收音、从哪个设备出声。",
+      common: ["commandInputDeviceId", "meetingInputDeviceId", "outputDeviceIds"],
+      advOrder: ["计算与唤醒", "录音与转写", "朗读与反馈"],
+      adv: ["device", "inputDeviceId", "commandOutputDeviceId", "meetingOutputDeviceId"] },
+    { id: "vp", title: "声纹库",
+      hint: "谁能被认出来；改名要不要顺手入库。",
+      common: () => renderVoiceprintCard(),
+      covers: ["voiceprintAutoEnroll"],
+      advOrder: ["匹配阈值"],
+      adv: ["voiceprintThreshold", "voiceprintMargin"] },
   ],
-  /* ---------- ② 业务配置：会议 · 语音指令 · 朗读反馈 · 队列 · 工作区 ---------- */
+  /* ---------- ③ 业务配置：会议转写 · 语音指令 · 唤醒 · 朗读与反馈 · 队列 ---------- */
   business: [
-    { id: "meet", title: "会议",
-      hint: "分段时长、音频落点，以及转写走哪条路（下面那条单选）。"
-          + "会议用哪个麦在「能力与智能体 → 设备选择」。",
+    { id: "meet", title: "会议转写",
+      hint: "分段时长与音频落点；转写走哪条路在下面那条单选。",
       common: ["meetingSegmentMinutes", "meetingsDir"],
-      // 转写走哪条路（3 个能力键）就在这张卡里 —— 用户的原话是"会议（… · 转写走哪条路）"。
-      // 2026-09-26 之前那 3 个键散在「模型路由 → 会议能力通道」里，这里收口成一处。
       dynAfter: () => renderMeetingServiceCard(),
       covers: ["capabilityMeetingAsrBackend", "capabilityDiarizeBackend",
                "capabilityEmbedBackend"],
@@ -1432,80 +1485,31 @@ const SET_CARDS = {
       adv: ["meetingAutoSummarize", "meetingKeepRawAudio", "meetingWorkspaceTitle",
             "meetingAutoCompressAudio", "capabilityPrivacy"] },
     { id: "cmd", title: "语音指令",
-      hint: "从说一句话到出文字：唤醒 → 收音 → 转写。"
-          + "用哪个麦（指令 / 默认）在「能力与智能体 → 设备选择」。",
-      common: ["wakeEnabled", "sttModel"],
+      hint: "从说一句话到出文字的业务行为：静音判多久、最长录多久、发到哪个空间。",
+      common: [],
       dynAfter: () => renderCmdEngineStatus(),
-      advOrder: ["唤醒词与灵敏度", "计算与唤醒", "录音与转写", "命令与会话",
-                 "声纹入库", "在线服务"],
-      adv: ["wakeKeywords", "wakeAliases", "wakePaused", "wakeThreshold", "wakeCooldownSec",
-            "wakeConfirmX", "wakeConfirmN", "wakeSilenceFloor", "wakeEngine",
-            "sttLanguage", "silenceThreshold", "silenceHangoverMs",
-            "noSpeechAbortMs", "maxRecordMs", "consumeMediaKey",
-            "wakeHotkey", "fallbackHotkey", "triggerKeys",
+      advOrder: ["录音与转写", "命令与会话"],
+      adv: ["sttLanguage", "silenceThreshold", "silenceHangoverMs",
+            "noSpeechAbortMs", "maxRecordMs",
             "commandWorkspaceTitle", "commandIdleRotateHours", "commandTargetWorkspace",
-            "commandTargetSession", "userLocation", "sendEnvContext",
-            "voiceprintAutoEnroll", "voiceprintThreshold", "voiceprintMargin",
-            "providerAsr", "providerAsrBaseUrl", "providerAsrModel", "providerAsrApiKey",
-            "providerLlm", "providerLlmBaseUrl", "providerLlmModel", "providerLlmApiKey"],
-      advNote: {
-        "录音与转写": () => `<div class="snote info"><span>ⓘ</span><span>`
-          + `「允许使用虚拟/接力输入设备」（<code>allowVirtualInputDevice</code>）默认关闭，`
-          + `而且**不在任何接口的下发范围内**（它标了 hidden、也不在 /api/capability 的 settings 里），`
-          + `所以这里没有开关：确实要用（如回环测试）需直接改配置库。打开它可能把系统音频服务卡死，`
-          + `这就是它默认拒绝的原因。</span></div>`,
-        "声纹入库": () => `<div class="snote info"><span>ⓘ</span><span>`
-          + `<b>识别是标配</b>：只要声纹库里已经有这个人，会议就会显示他的姓名 —— `
-          + `没有开关（库里没人时它安静地什么都不做）。<b>要不要入库由你决定</b>：`
-          + `这里的「改名即入库」是"随手存"，关着时一个字都不会写；`
-          + `想精准控制就关掉它，在会议详情的「说话人管理」里逐个点「声纹入库」。`
-          + `模板只存本机库，不出网。</span></div>`,
-      } },
+            "commandTargetSession", "userLocation", "sendEnvContext"] },
+    { id: "wake", title: "唤醒",
+      hint: "叫醒它的词与灵敏度。",
+      common: ["wakeEnabled"],
+      advOrder: ["唤醒词与灵敏度", "唤醒引擎"],
+      adv: ["wakeKeywords", "wakeAliases", "wakePaused", "wakeThreshold", "wakeCooldownSec",
+            "wakeConfirmX", "wakeConfirmN", "wakeSilenceFloor", "wakeEngine"] },
     { id: "fb", title: "朗读与反馈",
-      hint: "播报与提示音：任务做完怎么告诉你。（播放设备池在「能力与智能体 → 设备选择」）",
-      common: ["ttsEngine"],
+      hint: "做完事怎么告诉你：要不要复述、要不要语音简报。",
+      common: [],
       dynAfter: () => renderTtsStatus(),
       advOrder: ["朗读与反馈", "提示音与通知"],
       adv: ["voiceConfirm", "voiceBrief", "maxBriefChars", "minimalReply", "minimalReplyChars",
             "minimalReplyHint",
             "beepOnStart", "beepOnDone", "beepOnSend", "notifyOnSend"] },
     { id: "queue", title: "队列",
-      hint: "正在处理的命令与最近几条；完整历史在「历史 → 指令历史」里。",
+      hint: "正在处理的命令与最近几条。",
       common: () => renderQueueCard() },
-    { id: "ws", title: "工作区与归档",
-      help: "语音指令与会议纪要生成的会话会登记到这两个目录下 —— 智能体侧栏按目录分组，"
-          + "所以「指令空间」和「会议工作区」会各聚成一个分组。目录不存在时会自动建；"
-          + "换成自己的目录后，旧会话仍留在原处。",
-      common: ["commandWorkspace", "meetingWorkspace"],
-      advOrder: ["纪要归档"],
-      adv: ["worklogEnabled", "worklogEnsureSessionAccess", "worklogVaultRoot",
-            "worklogPrompt"] },
-  ],
-  /* ---------- ③ 能力与智能体：智能体选择 · 设备选择（模型路由是下面那张静态卡） ---------- */
-  capability: [
-    { id: "agent", title: "智能体",
-      help: "命令与会议纪要交给哪个智能体执行。选中即启用；它的参数在「高级」里。",
-      common: () => renderAgentCardCommon(),
-      adv: () => renderAgentCardAdv(),
-      // 这两块是**函数**渲染的（要状态/按钮），落点表看不见它们 → 键在这里显式声明，
-      // 「未归类」兜底卡才不会把它们当成没人管的设置项
-      // （纪要归档那一族 2026-09-26 挪到「业务配置 → 工作区与归档」，所以不在这里了）
-      covers: ["agentBackend", "harnessHome", "dshBaseUrl", "agentCustomPath",
-               "harnessCommand", "harnessPort", "harnessToken",
-               "agentCodebuddyEnabled", "agentHarnessEnabled"] },
-    { id: "dev", title: "设备选择（采集与播放）",
-      help: "采集按用途各指定一个麦（语音指令 / 会议），留空 = 跟随系统默认麦克风；"
-          + "播放默认跟随系统，要按用途覆盖（比如「指令只从耳机出声」）就去下面的高级。"
-          + "推理设备只影响客户端自己跑的引擎（whisper / sensevoice / qwen3asr）——"
-          + "会议转写交给后端时不用管它。",
-      common: ["commandInputDeviceId", "meetingInputDeviceId", "outputDeviceIds"],
-      advOrder: ["计算与唤醒", "录音与转写", "朗读与反馈"],
-      adv: ["device", "inputDeviceId", "commandOutputDeviceId", "meetingOutputDeviceId"] },
-    // 「模型路由」那张卡**不在这里**：它是 index.html 里的静态卡（语言模型 / 通道成员 /
-    // 派发情况 三个 host 要被 loadRouter 系列反复渲染，重绘会和并发请求互相覆盖）。
-    // 卡里那 7 项路由参数由 renderSettingsPanes() 填进 `#rtSetHost`，落点记在
-    // SET_PLACED_ELSEWHERE 里；卡内的「保存」= saveRouter()（成员 + 参数）。
-    // 会议能力通道（转写/分离/声纹由谁做）**已挪到「业务配置 → 会议」**（一个实体一处状态）。
   ],
 };
 
@@ -1529,18 +1533,7 @@ const SET_PLACED_ELSEWHERE = new Set([
 /* 说明留在明面上的项（用户规则：只有"不可逆 / 会出网 / 生物特征"这类不平铺进 `?`）。
    其余项的 `description` 一律收进行尾的 `?` 浮窗。
    **明面上留的是短句**（SET_LOUD_NOTE），完整说明仍在 `?` 里 —— 平铺一整段正是用户要治的"啰嗦"。 */
-const SET_LOUD_DESC = new Set([
-  "apiAuthEnabled",              // 不可逆：开启后本地面板也连不上
-  "allowVirtualInputDevice",     // 不可逆：可能把系统音频服务卡死
-  "sendEnvContext",              // 出网：把环境上下文发给模型
-  "providerAsrBaseUrl", "providerAsrModel", "providerAsrApiKey",   // 出网：音频
-  "providerLlmBaseUrl", "providerLlmApiKey",                       // 出网：文本与密钥
-  "capabilityPrivacy",           // 出网许可（约束上面三个后端）
-  "ttsEngine",                   // edge-tts 会把文本发给服务商
-  "meetingAutoSummarize",        // 转写全文会发给模型
-  "voiceprintAutoEnroll",        // 生物特征：会往声纹库里写样本（识别本身没有开关了）
-  "worklogVaultRoot",            // 会往你的笔记库里写东西
-]);
+const SET_LOUD_DESC = new Set([]);   // 2026-10-02 用户要求：说明一律走 `?` 悬浮，不再露在明面
 const SET_LOUD_NOTE = {
   apiAuthEnabled: "开启后连本地面板也要令牌：开了就没法从面板关回来，确认了再点保存。",
   allowVirtualInputDevice: "虚拟/接力麦可能把系统音频服务卡死（macOS 实测过），默认拒绝。",
@@ -1749,8 +1742,23 @@ function agentDetailHtml() {
     : "";
   const warn = cur.available ? "" :
     `<div class="snote warn"><span>⚠</span><span>探测未通过时无法用它执行命令；按上面的提示处理后点「检测」重试。</span></div>`;
-  return `<div class="sset-hint">${esc(cur.description || "")}</div>`
+  return (cur.description ? sHelp(cur.description) : "")
     + fields.join("") + note + warn;
+}
+
+/** 模型路由只在 Agent = 标准版 harness（DSH）时才有工作价值（用户 2026-10-02：
+ *  "模型路由的编辑入口放在 AI组件的 agent 下，目前仅在选择 dsh 时该组件才有工作的价值"）。
+ *  别的智能体自带自己的模型/路由，这一卡跟它们无关 —— 收起来，只留一句指路。
+ *  ⚠️ 卡片是**静态 DOM**（见 index.html 的注释：动态重绘会和并发的路由请求互相覆盖），
+ *  所以这里只切 hidden，不搬 DOM。 */
+function applyRouterVisibility() {
+  const card = $("#rtMergeCard");
+  if (!card) return;
+  const cur = (_agentsCache || []).find((a) => a.active) || null;
+  const isDsh = !!cur && cur.name === "harness";
+  card.classList.toggle("hidden", !isDsh);
+  // 2026-10-03：原来这里还会在卡片被收起时补一句"模型路由：只有 Agent 选标准版 harness 时才需要它…"
+  // —— 用户看了截图说那是**多余的残留**，删掉（卡都不显示了，再挂一句解释就是噪音）。
 }
 
 /** 拉取智能体可用性；probe=true 时做重探测（会真的执行 CLI 探测）。 */
@@ -1831,7 +1839,7 @@ const CAP_META = {
   asr: { icon: "🎤", title: "语音转写", note: "命令口述与会议录音都走它；本地引擎与在线服务二选一" },
   tts: { icon: "🔊", title: "语音合成", note: "朗读复述确认、语音简报与提示语；off = 完全不朗读" },
 };
-// 注：TTS 候选项的显示名由 capTtsOptionLabel() 现算（名字 + 出网/就绪），
+// 注：TTS 当前的实现名由 capTtsCurrentName() 现算（ttsEngine → 中文名），
 // 不在这里维护一份静态映射 —— 静态映射拿不到运行时的就绪状态，就会逼出第二行状态文字。
 
 /** 某类能力的可装组件（本平台适用的）。 */
@@ -1975,73 +1983,11 @@ function foldGroup(id, title, body, opts) {
 }
 
 /** 在线服务的一个字段（地址/模型名/密钥）。密钥沿用服务端遮罩：空 = 不改。 */
-function capCfgField(key) {
-  const s = ((_capCache.cfg || {}).settings || []).find((x) => x.key === key);
-  if (!s) return "";
-  const id = "cap-" + key;
-  if (s.secret) {
-    return `<div class="set-row" style="margin:0">
-      <label for="${id}">${esc(s.label)}</label>
-      <div style="display:flex;gap:6px;align-items:center">
-        <input type="password" class="ctl" id="${id}" data-key="${key}" data-secret="1" style="flex:1"
-          value="" autocomplete="new-password"
-          placeholder="${s.hasValue ? "已配置（留空 = 不改）" : "未配置"}">
-        <button type="button" class="btn" data-clear-secret="${key}"
-          style="flex:0 0 auto;padding:2px 8px;font-size:12px" title="清空这个密钥">清除</button>
-      </div>
-    </div>`;
-  }
-  return `<div class="set-row" style="margin:0">
-    <label for="${id}">${esc(s.label)}</label>
-    <input class="ctl" id="${id}" data-key="${key}" value="${esc(s.value || "")}">
-    <div class="desc">${esc(s.description || "")}</div>
-  </div>`;
-}
 
 /** 在线服务预设：一键把公开的地址与模型名填进字段（密钥仍要自己填）。 */
-function capPresets(kind) {
-  const all = (_capCache.presets || {}).presets || [];
-  const mine = all.filter((p) => (p.kind || "llm") === kind);
-  if (!mine.length) return "";
-  return `<div class="set-row" style="margin:0"><label>在线服务预设</label>
-      <div style="display:flex;flex-wrap:wrap;gap:6px">` +
-    mine.map((p) => {
-      const idx = all.indexOf(p);
-      return `<button type="button" class="btn" data-preset-index="${idx}"
-        style="padding:3px 10px;font-size:12px" title="${esc(p.note || "")}">${esc(p.name)}</button>`;
-    }).join("") +
-    `</div><div class="desc">点一下把<b>地址与模型名</b>填进上面的字段；密钥请手动填（接口永不回显）；` +
-    `内网网关的地址属单位内部信息，需自己填。</div></div>`;
-}
-
-/** 下拉里那一项的显示名：名字 + （出网/本地 · 就绪）。
-
-    状态**只在这一处说**：下面再挂一行"当前 XXX · 已就绪"是纯重复
-    （2026-09-19 用户看着截图直接指出："下拉框下面的附属没有意义"）。
-    选中的那一项在收起状态下就是一行文字，用户照样看得见状态。
- */
-function capOptLabel(name, p) {
-  if (!p) return name;
-  const bits = [p.egress ? "出网" : "本地"];
-  if (p.ready === true) bits.push("已就绪");
-  else if (p.ready === false) bits.push("未就绪");
-  return `${name}（${bits.join(" · ")}）`;
-}
 
 /** TTS 的候选项显示名。TTS 选的是 `ttsEngine`（不是 provider id），所以名字要自己拼：
     "离线引擎"这一档带上本机离线实现的名字，状态也带出来（否则它会没有任何状态显示）。 */
-function capTtsOptionLabel(engine, provs) {
-  const edge = provs.find((p) => p.id === "edge-tts");
-  const offline = provs.find((p) => p.id !== "edge-tts");
-  if (engine === "off") return "关闭朗读（不出声）";
-  if (engine === "edge-tts") return capOptLabel("edge-tts（微软在线）", edge);
-  if (engine === "auto") {
-    return (edge && edge.ready === false)
-      ? "自动（edge-tts 未就绪 → 走离线）"
-      : "自动（优先 edge-tts，失败回退离线）";
-  }
-  return capOptLabel(`本机离线合成（${engine}）`, offline);
-}
 
 /** 当前选中的实现会不会出网：``{on, note}``（note = "发什么、给谁"）。
     判断只有这一处：卡片上那个黄色三角图标由它决定，弹不弹、说什么都在这里。 */
@@ -2083,46 +2029,40 @@ function capEgressIcon(kind) {
  *  都是同一份状态的第三、第四份拷贝（用户实测反馈）；出网说明也从一整行收成三角图标。
  */
 function capProviderBlock(kind) {
-  const provs = ((_capCache.prov || {}).providers || []).filter((p) => p.kind === kind);
-  if (!provs.length) return "";
-  const isTts = kind === "tts";
-  const cur = isTts ? null : (provs.find((p) => p.active) || provs[0]);
-  let select = "";
-  if (isTts) {
-    // TTS 的"用哪个"就是 ttsEngine（含 off）：选项从设置元数据来，避免再造一个开关
-    const meta = settingByKey("ttsEngine");
-    const opts = (meta && meta.options) || [];
-    select = `<select class="ctl" data-tts-engine="1" title="朗读用哪个实现" aria-label="朗读用哪个实现">` +
-      opts.map((o) =>
-        `<option value="${esc(o)}" ${String(o) === String(meta && meta.value) ? "selected" : ""}>` +
-        `${esc(capTtsOptionLabel(o, provs))}</option>`).join("") + `</select>`;
-  } else {
-    select = `<select class="ctl" data-provider-kind="${esc(kind)}" title="用哪个实现" aria-label="用哪个实现">` +
-      provs.map((p) =>
-        `<option value="${esc(p.id)}" ${p.active ? "selected" : ""}>` +
-        `${esc(capOptLabel(p.name, p))}</option>`).join("") + `</select>`;
-  }
-  return `<div class="cap-prov">
-      <div class="cap-pick">${select}${capEgressIcon(kind)}</div>
+    const provs = ((_capCache.prov || {}).providers || []).filter((p) => p.kind === kind);
+    if (!provs.length) return "";
+    const cur = kind === "tts" ? null : (provs.find((p) => p.active) || provs[0]);
+    // 2026-10-02（用户："AI组件那边的各项内容都是能力选择上的配置；业务设置里的是业务特征"）：
+    // 这一块**不再放编辑控件** —— "用哪个实现"（sttModel / ttsEngine / wakeEngine / provider*
+    // 以及在线服务那几项）统一在「设置 → AI组件 → 高级 → 能力选择 / 在线服务」里改。
+    // 这里只说**是什么**，外加一个跳过去的入口（一个实体只有一处可改）。
+    const name = kind === "tts" ? capTtsCurrentName() : ((cur && (cur.name || cur.id)) || "—");
+    return `<div class="cap-prov">
+      <div class="cap-pick"><span class="smono" title="当前用哪个实现">${esc(name)}</span>${capEgressIcon(kind)}
+        <span class="spacer"></span>
+        <button type="button" class="btn mini" data-goto="settings"
+                title="去「设置 → AI组件 → 高级 → 能力选择」改">去改 ›</button></div>
       ${capOnlineBlock(kind, cur)}
     </div>`;
-}
+  }
 
 /** 选中在线实现时就地展开它需要的地址/模型/密钥（+ 预设 + 保存）。 */
 function capOnlineBlock(kind, cur) {
-  const ONLINE = { asr: { prefix: "providerAsr", on: "openai-asr" },
-                   llm: { prefix: "providerLlm", on: "openai-llm" } };
-  const o = ONLINE[kind];
-  if (!o || !cur || cur.id !== o.on) return "";
-  return `<div class="cap-online">
-      ${capCfgField(o.prefix + "BaseUrl")}${capCfgField(o.prefix + "Model")}${capCfgField(o.prefix + "ApiKey")}
-      ${capPresets(kind)}
-      <div style="display:flex;gap:8px;align-items:center;padding-top:4px">
-        <button type="button" class="btn" data-cap-save="1">保存在线服务设置</button>
-        <span class="muted" style="font-size:12px">密钥留空 = 不改；下拉选择是选中即生效</span>
-      </div>
+    const ONLINE = { asr: { prefix: "providerAsr", on: "openai-asr" },
+                     llm: { prefix: "providerLlm", on: "openai-llm" } };
+    const o = ONLINE[kind];
+    if (!o || !cur || cur.id !== o.on) return "";
+    // 只读：改这些在「设置 → AI组件 → 高级 → 在线服务」（同一批键的唯一可改处）。
+    // 密钥接口永不回显，所以这里只说"已配 / 未配"。
+    const row = (label, text) => `<div class="srow"><div class="lbl"><span class="lt">${esc(label)}</span></div>
+      <div class="sctl"><span class="smono">${esc(text || "—")}</span></div></div>`;
+    return `<div class="cap-online">
+      ${row("地址", String(settingValue(o.prefix + "BaseUrl", "") || "") || "（服务商默认）")}
+      ${row("模型", String(settingValue(o.prefix + "Model", "") || ""))}
+      ${row("密钥", cur.ready ? "已配" : "未配")}
+      <div class="muted" style="font-size:12px">改这些在「设置 → AI组件 → 高级 → 在线服务」。</div>
     </div>`;
-}
+  }
 
 /** 转写卡的本地面：三个引擎入口 + 本地模型分两堆（**配置为要用的** / 其余折叠）。
  *
@@ -2144,9 +2084,9 @@ function capAsrLocal() {
   }, 0);
   // 「会议转写」那个下拉**删了**（2026-09-29）：`meetingSttModel` 已废弃 ——
   // 会议转写不在客户端进程内跑，本机也就不再需要装它的模型。这一块只留**命令转写**。
-  return `<div class="cap-sub">本地引擎（这一条就是「业务配置」里选中的那台引擎）</div>
+  return `<div class="cap-sub">本地引擎（这一条就是「AI组件」里选中的那台引擎）</div>
     <div class="cap-engine-row">
-      <label>命令转写${_selectHtml("sttModel", stt && stt.options, stt && stt.value)}</label>
+      <label>命令转写<span class="smono" title="改在 设置 → AI组件 → 高级 → 能力选择">${esc(capEngineName("sttModel"))}</span></label>
     </div>
     <div class="cap-sub">配置为要用的（${used.length} 项）</div>
     ${used.length ? capCompTable(used, curIds)
@@ -2422,7 +2362,7 @@ async function loadQueueCard() {
 
 /** 能力页签的事件绑定（一个页面一次，重绘不用重绑）。 */
 function bindCapCards() {
-  const host = $("#view-capability");
+  const host = $("#view-settings");
   if (!host || host.dataset.bound) return;
   host.dataset.bound = "1";
   host.addEventListener("change", async (e) => {
@@ -2431,7 +2371,6 @@ function bindCapCards() {
     if (el.dataset.mset) { key = el.dataset.mset; val = el.value; }
     else if (el.dataset.mbool) { key = el.dataset.mbool; val = el.checked; }
     else if (el.dataset.mnum) { key = el.dataset.mnum; val = parseFloat(el.value) || 0; }
-    else if (el.dataset.ttsEngine) { key = "ttsEngine"; val = el.value; }
     else return;
     try {
       const r = await api("/api/settings", { method: "PUT", body: JSON.stringify({ values: { [key]: val } }) });
@@ -2442,24 +2381,6 @@ function bindCapCards() {
     } catch (err) { toast("更新失败：" + err.message); }
   });
   host.addEventListener("click", async (e) => {
-    const save = e.target.closest("[data-cap-save]");
-    if (save) {
-      const values = {};
-      $$("#view-capability [data-key]").forEach((el) => {
-        const key = el.dataset.key;
-        const meta = (((_capCache.cfg || {}).settings) || []).find((x) => x.key === key);
-        if (!meta) return;
-        if (meta.secret) { if (el.value && el.value.trim()) values[key] = el.value; return; }
-        values[key] = el.value;
-      });
-      if (!Object.keys(values).length) { toast("没有需要保存的改动"); return; }
-      try {
-        const r = await api("/api/settings", { method: "PUT", body: JSON.stringify({ values }) });
-        toastSaved(r, "已保存 " + Object.keys(values).length + " 项");
-        loadCapabilities();
-      } catch (err) { toast("保存失败：" + err.message); }
-      return;
-    }
     const dl = e.target.closest("[data-msdl]");
     if (dl) {
       dl.disabled = true;
@@ -2492,7 +2413,6 @@ function bindCapCards() {
     const rl = e.target.closest("[data-cap-reload]");
     if (rl) { loadCapabilities(); return; }
     const preset = e.target.closest("[data-preset-index]");
-    if (preset) { await capApplyPreset(preset.dataset.presetIndex); return; }
     // 清理：取消「保留」钉子 / 真删（真删走 runModelCleanup，里面有确认对话框）
     const pin = e.target.closest("[data-pin-toggle]");
     if (pin) {
@@ -2529,84 +2449,24 @@ async function loadRouterLlm() {
     await ensureProviderData(true);
     await ensureSettings(true);
     host.innerHTML = capProviderBlock("llm");
-    bindRouterLlm(host);
   } catch (e) {
     host.innerHTML = `<div class="muted" style="font-size:12px">读取失败：${esc(e.message)}</div>`;
   }
 }
 
 /** 语言模型块的事件绑定（一次性，重绘不用重绑）。 */
-function bindRouterLlm(host) {
-  if (host.dataset.bound) return;
-  host.dataset.bound = "1";
-  host.addEventListener("click", async (e) => {
-    const save = e.target.closest("[data-cap-save]");
-    if (!save) return;
-    const values = {};
-    $$("#rtLlmHost [data-key]").forEach((el) => {
-      const key = el.dataset.key;
-      const meta = (((_capCache.cfg || {}).settings) || []).find((x) => x.key === key);
-      if (!meta) return;
-      if (meta.secret) { if (el.value && el.value.trim()) values[key] = el.value; return; }
-      values[key] = el.value;
-    });
-    if (!Object.keys(values).length) { toast("没有需要保存的改动"); return; }
-    try {
-      const r = await api("/api/settings", { method: "PUT", body: JSON.stringify({ values }) });
-      toastSaved(r, "已保存 " + Object.keys(values).length + " 项");
-      loadRouterLlm();
-    } catch (err) { toast("保存失败：" + err.message); }
-  });
-}
 
 /** 某个"用哪个实现"选择变化后，刷新**当前正在看的**那一页。 */
 function refreshAfterProviderChange() {
   const tab = $(".tab.active");
   const view = tab && tab.dataset ? normView(tab.dataset.view) : "";
   // 「能力与智能体」一页里既有语言模型块（路由卡）也有能力/本地能力块，两处一起刷
-  if (view === "capability") { loadRouter(); loadCapabilities(); return; }
+  if (view === "settings") { loadRouter(); loadCapabilities(); return; }   // 2026-10-02：能力页已并进「设置」
   loadSettings();
 }
 
-/* 选 provider：立即写配置（与"命令目标"下拉同一种交互：选中即持久化）。
-   TTS 不走这里：它的开关是 ttsEngine（见 bindCapCards 的 data-tts-engine）。 */
-document.addEventListener("change", async (e) => {
-  const kind = e.target && e.target.dataset ? e.target.dataset.providerKind : "";
-  if (!kind) return;
-  const key = "provider" + kind.charAt(0).toUpperCase() + kind.slice(1);
-  try {
-    const r = await api("/api/settings", { method: "PUT", body: JSON.stringify({ values: { [key]: e.target.value } }) });
-    toastSaved(r, "已切换到：" + e.target.value);
-    const r2 = await api("/api/settings");
-    _settingsCache = r2.settings || _settingsCache;
-    refreshAfterProviderChange();
-  } catch (err) { toast("切换失败：" + err.message); }
-});
 
 /** 在线服务预设：填进字段（不直接保存，让用户过一眼再点保存）；未选中在线实现时先切过去。 */
-async function capApplyPreset(idx) {
-  const all = ((_capCache.presets || {}).presets) || [];
-  const p = all[Number(idx)];
-  if (!p) return;
-  const kind = p.kind === "asr" ? "asr" : "llm";
-  const prefix = kind === "asr" ? "providerAsr" : "providerLlm";
-  const onlineId = kind === "asr" ? "openai-asr" : "openai-llm";
-  // 两处字段落点：语言模型块在「模型路由」卡（`#rtLlmHost`），语音转写块在「本地能力」区
-  // （`#view-capability`）。按当前页签找 —— 2026-09-26 起这两块同在「能力与智能体」一页。
-  const scope = ($(".tab.active") || {}).dataset?.view === "capability"
-    ? (kind === "llm" ? "#rtLlmHost" : "#view-capability") : "#view-capability";
-  const fieldEl = (key) => $(`${scope} [data-key="${key}"]`);
-  if (!p.base_url && !p.model) { toast("这个预设需要你自己填地址（属单位内部信息）"); return; }
-  if (!fieldEl(prefix + "BaseUrl")) {                 // 在线实现未选中 → 先切过去
-    try {
-      await api("/api/settings", { method: "PUT", body: JSON.stringify({ values: { [prefix]: onlineId } }) });
-    } catch (err) { toast("切换 provider 失败：" + err.message); return; }
-    await refreshAfterProviderChange();
-  }
-  if (p.base_url && fieldEl(prefix + "BaseUrl")) fieldEl(prefix + "BaseUrl").value = p.base_url;
-  if (p.model && fieldEl(prefix + "Model")) fieldEl(prefix + "Model").value = p.model;
-  toast("已填入地址与模型名，请补密钥后点「保存在线服务设置」");
-}
 
 /** 读取能力页签的全部数据并渲染。失败时把模型相关设置退回设置页（唯一入口不能断）。 */
 async function loadCapabilities() {
@@ -2662,7 +2522,7 @@ async function loadCapabilities() {
     // GPU 后端卡（能力路由）。**排在主清单之后**：它是一次轻量请求，
     // 主清单失败也要能看到后端状态（反过来也一样，两边各自兜自己的错）。
     await loadCapabilityRouting();
-    applyCollapsedCards($("#view-capability"));   // 应用上次的卡片折叠状态（动态卡片要重绘后应用）
+    applyCollapsedCards($("#view-settings"));   // 应用上次的卡片折叠状态（动态卡片要重绘后应用）
     const active = modelsRes.jobs && modelsRes.jobs.active;
     if (active && !_capPoll) _capPoll = setInterval(loadCapabilities, 1500);
     else if (!active && _capPoll) { clearInterval(_capPoll); _capPoll = null; }
@@ -2963,6 +2823,14 @@ let _capBackendLastDone = "";
 let _capBackendPlanBusy = false;
 //: 计划里那条路（container / portable / none）——「生成 compose」按钮只该在容器路时出现。
 let _capBackendPath = "";
+//: 最近一次 `/api/capability/backend` 的响应（`loadBackendOneClick` 存下来的那一份）。
+//: 为什么要存：**计划那一格渲染时要重画那张卡片**（按钮显隐跟着计划走）——
+//: `renderBackendPlan()` 会拿它再调一次 `renderBackendOneClick()`。
+//: ⚠️ 必须在这里声明：本文件第 2 行是 `"use strict"`，给**未声明**的名字赋值会**直接抛
+//: ReferenceError** —— 2026-10-01 就是这样：`loadBackendOneClick` 在赋值那行抛、
+//: `renderBackendPlan` 在读它那行抛，两个都在 `try` 里，于是面板上只剩
+//: 「读不到本机后端的状态」与「读不到这台机器的后端计划」两句话（功能其实没坏，只是显示坏了）。
+let _capBackendCache = null;
 
 /* 只读计划（批 2）：**点按钮之前先给人看**。走容器路还是扩展包路、哪一档、多大、缺什么、
    先验哪一步，以及 nvidia-smi / docker 的原文。它比状态那一份贵（要问 docker 与显卡），
@@ -3468,8 +3336,6 @@ function renderServiceCard() {
       <div class="sctl"><span class="smono">${esc(info || "读取中…")}</span></div></div>
     ${recWarn}${portNote}
     <div class="sacts" style="padding-top:6px">
-      <button class="btn danger" id="btnRestartEcho"
-        title="停止并重新启动 ECHO 服务进程">重启 ECHO 服务</button>
       <button class="btn" data-scroll="#bootLogCard" title="滚到下面那张「启动日志」卡">启动日志 ↓</button>
       <span class="muted" id="restartState" style="font-size:11px"></span>
     </div>`;
@@ -3506,6 +3372,40 @@ function renderTtsStatus() {
 function agentByKey(key) {
   return SET_META_PATCH.find((m) => m.key === key) || { key: key, label: key };
 }
+
+/** 「AI 组件」卡的**常用区**（2026-10-02 用户给的层级）：
+ *    Agent ── 选择开关（选谁 + 它自己的参数：端口 / CLI…）/ 工作区 / 归档
+ *    转写服务 ── 转写走哪条路 · 分离与声纹由谁做 + **后端设置**（本机：启停·安装 / 网络：配对·连接状态）
+ *    语音合成 ── 选择开关（在线 / 本地 / 关闭）
+ *  `#capBackendHost` 是占位：静态卡 `#capRouteCard` 在 renderSettingsPanes() 末尾被搬进来
+ *  （那些控件有一堆按 id 找的加载器，搬节点最省事）。 */
+function renderAiCardCommon() {
+  return sSub("Agent",
+      sSub("选择开关", renderAgentCardCommon() + agentDetailHtml())
+      + sSub("工作区", renderSettingRows(settingRows(
+          ["meetingWorkspace", "meetingWorkspaceTitle",
+           "commandWorkspace", "commandWorkspaceTitle"])))
+      + sSub("归档", renderSettingRows(settingRows(["worklogVaultRoot", "worklogPrompt"]))))
+    + sSub("转写服务",
+      renderMeetingServiceCard()
+      + sSub("后端设置", `<div id="capBackendHost"></div>`))
+    + sSub("语音合成", renderSettingRows(settingRows(["ttsEngine"])));
+}
+
+/** 转写服务 → 后端设置：**本机后端**看启停/安装，**网络后端**看配对/连接状态
+ *  （用户 2026-10-02："本机的话展示启停、安装；网络后端展示配对和连接状态"）。
+ *  取值口径：`echo-server` = 能力后端（本机自建的那台也算同一个取值）→ 本机那半边。 */
+function applyTranscribeSettingsVisibility(explicit) {
+  // ⚠️ `explicit`：**刚点了单选**时必须用它，不能读设置缓存 —— 保存是异步的，
+  // 那一刻 `_settingsCache` 还是旧值，结果就是"切了没反应"（2026-10-02 截图逮到）。
+  const sel = String(explicit || settingValue("capabilityMeetingAsrBackend", "echo-server")
+                     || "echo-server");
+  const local = sel !== "asr-provider";
+  const pair = $("#capPairSettings"), loc = $("#capLocalSettings");
+  if (pair) pair.classList.toggle("hidden", local);
+  if (loc) loc.classList.toggle("hidden", !local);
+}
+
 function renderAgentCardCommon() {
   const cur = (_agentsCache || []).find((a) => a.active) || null;
   const opts = (_agentsCache || []).map((a) =>
@@ -3547,16 +3447,13 @@ function renderAgentCardAdv() {
   const out = [];
   const switches = (_agentsCache || []).filter((a) => a.configKey);
   if (switches.length) {
-    out.push(`<div class="ssec">产品开关</div>`);
-    out.push(switches.map((a) => {
+    out.push(sSub("产品开关", switches.map((a) => {
       const meta = agentByKey(a.configKey);
       return `<label class="schk" title="${esc(meta.description || "")}">
         <input type="checkbox" data-agent-enable="${esc(a.name)}" data-setkey="${esc(a.configKey)}"
           ${a.enabled ? "checked" : ""}><span>${esc(meta.label || a.displayName)}</span></label>`;
-    }).join(""));
+    }).join("")));
   }
-  out.push(`<div class="ssec">当前智能体的参数</div>`);
-  out.push(agentDetailHtml());
   out.push(`<div class="snote info"><span>ⓘ</span><span>DSH Desktop 2.x 由它自己的宿主进程托管，
     所以 <code>dshStartCommand</code> / <code>dshNodePath</code> / <code>dshPackageDir</code>
     这三项在配置里已标为**已过时**（任何接口都不再下发，面板也就没有它们的行）；
@@ -3612,8 +3509,7 @@ function renderMeetingServiceCard() {
   }
   const dia = String(settingValue("capabilityDiarizeBackend", "auto") || "auto");
   const diaWhere = (SET_MEETING_BACKENDS.find((b) => b.value === dia) || {}).label || "自动（按默认链挑）";
-  return `<div class="ssec">转写走哪条路</div>
-    <div class="sras" data-setkey="capabilityMeetingAsrBackend">
+  return sSub("转写走哪条路", `<div class="sras" data-setkey="capabilityMeetingAsrBackend">
       ${radios}
       <div class="snote info" style="margin-top:4px"><span>ⓘ</span><span>
         <b>会议转写 = 转写 + 说话人分离 + 声纹识别</b>，三件一起，本地跑或走后端都一样
@@ -3624,9 +3520,9 @@ function renderMeetingServiceCard() {
     <div class="srow"><div class="lbl"><span class="lt" title="许可一致性">调用许可</span>
       ${sHelp("「允许音频去哪」决定哪些后端根本不被考虑（见高级）。这里只做一致性提示。")}</div>
       <div class="sctl">${consistency}</div>
-    </div>
-    <div class="ssec">分离与声纹由谁做</div>
-    ${renderSettingRows(settingRows(["capabilityDiarizeBackend", "capabilityEmbedBackend"]))}`;
+    </div>`)
+    + sSub("分离与声纹由谁做",
+           renderSettingRows(settingRows(["capabilityDiarizeBackend", "capabilityEmbedBackend"])));
 }
 
 /* 2026-09-25：原来的 `renderBackendCard()` / `renderEchoBackendFace()` / `renderLocalBackendFace()`
@@ -3637,17 +3533,116 @@ function renderMeetingServiceCard() {
    再摆一张自绘的「后端面板」卡就是同一件事的第二个副本。 */
 
 /* ---- 4 个页签的渲染 ---- */
+/* ---- 声纹库（设置 → 声纹库）：列表 / 删除 / 试听 ----
+   2026-10-02 用户要求："声纹库要有列表和删除、试听等功能"。
+   试听口径与后端 `/voiceprints/{vid}/audition` 对齐：播**源会议里那个说话人的那一段**；
+   源音频已清理时后端回 `{ok:false, reason}`，这里**原样显示原因**（不给一个按不出声的假按钮）。 */
+// 声纹库这一块**自己的**模块级缓存（能力卡那边另有一个**函数级** `_vpCache`，别混用：
+// 本文件第 2 行是 "use strict"，未声明就赋值会当场 ReferenceError）。
+let _vpLibCache = null;
+let _vpAudio = null;              // 正在播的那个 audio（换一条就停掉上一条）              // 正在播的那个 audio（换一条就停掉上一条）
+
+function _vpWhen(s) { return String(s || "").replace("T", " ").slice(0, 16); }
+
+function renderVoiceprintCard() {
+  const out = [renderSettingRows(settingRows(["voiceprintAutoEnroll"]))];
+  const d = _vpLibCache;
+  if (!d) { out.push(`<div class="muted" style="font-size:12px">声纹库读取中…</div>`); return out.join(""); }
+  const items = d.items || [];
+  out.push(`<div class="srow"><div class="lbl"><span class="lt">库里</span></div>
+    <div class="sctl"><span class="smono">${items.length} 人 · ${Number(d.total) || 0} 条样本</span>
+    <button class="btn mini" data-vp-refresh="1">刷新</button></div></div>`);
+  if (d.error) {
+    out.push(`<div class="snote warn"><span>⚠</span><span>读不到声纹库：${esc(d.error)}</span></div>`);
+    return out.join("");
+  }
+  if (!items.length) {
+    out.push(`<div class="snote info"><span>ⓘ</span><span>库还空着：在会议详情的「说话人管理」里点「声纹入库」，`
+      + `或打开上面的「改名即入库」后直接改名。</span></div>`);
+    return out.join("");
+  }
+  out.push(`<div class="vp-list">` + items.map((it) => {
+    const samples = (it.samples || []).map((sm) => `<div class="vp-row">
+      <span class="vp-meta" title="来源会议 · 入库时间">${esc(sm.meeting_name || "—")} · ${esc(_vpWhen(sm.created_at))}</span>
+      <span class="spacer"></span>
+      <button class="btn mini" data-vp-play="${sm.id}" title="播源会议里这个说话人的那一段">试听</button>
+      <button class="btn mini" data-vp-del="${sm.id}">删除</button>
+      <span class="muted vp-msg" data-vp-msg="${sm.id}"></span></div>`).join("");
+    return `<div class="vp-item"><div class="vp-head"><b>${esc(it.name)}</b>
+      <span class="muted">${it.count} 条</span><span class="spacer"></span>
+      <button class="btn mini" data-vp-delname="${esc(it.name)}">删掉这个人</button></div>${samples}</div>`;
+  }).join("") + `</div>`);
+  return out.join("");
+}
+
+/** 拉声纹库并**只重画这一张卡**（不整页重绘 —— 旁边别的卡共用同一批接口）。 */
+async function loadVoiceprints() {
+  try { _vpLibCache = await api("/api/voiceprints"); }
+  catch (e) { _vpLibCache = { items: [], total: 0, error: String((e && e.message) || e) }; }
+  const host = $("#setCard-vp .card-body");
+  if (host) host.innerHTML = renderVoiceprintCard();
+}
+
+function _vpMsg(id, text) {
+  const el = document.querySelector(`[data-vp-msg="${id}"]`);
+  if (el) el.textContent = text || "";
+}
+
+/** 试听：先看响应是 JSON（=后端说"听不了"+原因）还是音频；是音频就放。 */
+async function _vpPlay(id) {
+  _vpMsg(id, "取音频…");
+  try {
+    const res = await fetch(`/api/voiceprints/${id}/audition`);
+    const type = res.headers.get("content-type") || "";
+    if (type.includes("application/json")) {
+      const j = await res.json();
+      _vpMsg(id, j.reason || "这条听不了");
+      return;
+    }
+    const url = URL.createObjectURL(await res.blob());
+    if (_vpAudio) { _vpAudio.pause(); URL.revokeObjectURL(_vpAudio.src); }
+    _vpAudio = new Audio(url);
+    _vpAudio.addEventListener("ended", () => { _vpMsg(id, ""); URL.revokeObjectURL(url); });
+    await _vpAudio.play();
+    _vpMsg(id, "播放中…");
+  } catch (e) { _vpMsg(id, "播放失败：" + String((e && e.message) || e)); }
+}
+
+document.addEventListener("click", async (e) => {
+  const t = e.target.closest("[data-vp-play],[data-vp-del],[data-vp-delname],[data-vp-refresh]");
+  if (!t) return;
+  if (t.dataset.vpPlay) { await _vpPlay(Number(t.dataset.vpPlay)); return; }
+  if (t.dataset.vpRefresh) { await loadVoiceprints(); return; }
+  if (t.dataset.vpDel) {
+    if (!confirm("删除这条声纹样本？（只删本机库里的模板，不影响会议记录）")) return;
+    const r = await api(`/api/voiceprints/${Number(t.dataset.vpDel)}`, { method: "DELETE" });
+    toast(r.message || (r.ok ? "已删除" : "删除失败"));
+    await loadVoiceprints();
+    return;
+  }
+  if (t.dataset.vpDelname) {
+    const name = t.dataset.vpDelname;
+    if (!confirm(`删掉「${name}」的全部声纹样本？`)) return;
+    const r = await api(`/api/voiceprints?name=${encodeURIComponent(name)}`, { method: "DELETE" });
+    toast(r.message || (r.ok ? "已删除" : "删除失败"));
+    await loadVoiceprints();
+  }
+});
+
 function renderCard(card) {
-  const body = [
-    card.hint ? `<div class="sset-hint">${esc(card.hint)}</div>` : "",
-    renderGroupBody(card),
-  ].join("");
+  // 2026-10-02（用户：布局紧凑 + 说明一律走 `?` 悬浮）：
+  // 卡片标题下那句 `hint` **不再占一行**，并进标题右侧 `?` 的浮窗（与 `help` 合成一段）。
+  const tip = [card.help, card.hint].filter(Boolean).join("　");
+  const body = renderGroupBody(card);
   const open = _sadvOpen.has(card.id) ? " open" : "";
   void open;
+  // 2026-10-03 用户："设置页和业务配置页点开后默认全折叠"
+  // 默认值（`data-collapse-default`）只在**用户没表过态**时生效一次（见 _seedCollapseDefaults），
+  // 所以这不会把用户手动展开过的卡再收回去。子分组（`.ssub`）不跟着收：展开卡片后一眼看到内容。
   return `<div class="card collapsible" id="setCard-${esc(card.id)}"
-      data-collapse-id="set-${esc(card.id)}">
+      data-collapse-id="set-${esc(card.id)}" data-collapse-default="closed">
     <div class="card-title"><span class="set-arrow">▶</span><span>${esc(card.title)}</span>
-      ${card.help ? sHelp(card.help) : ""}</div>
+      ${tip ? sHelp(tip) : ""}</div>
     <div class="card-body">${body}</div>
   </div>`;
 }
@@ -3668,6 +3663,27 @@ function renderGroupBody(card) {
        </div>`;
 }
 /** 高级区里的小节：只有 ≥2 个小节时才画小节标题（一节到底就别多一行头）。 */
+/** 二级分组：包成一张**内嵌小卡片**（2026-10-02 用户："AI组件下面的 Agent、转写服务、
+ *  语音合成等二级分组也改进一下样式，其他二级分组也同样改造"）。
+ *  用法：`sSub("能力选择", rowsHtml)` —— 头 + 内容一起包，所有二级分组共用这一套视觉。
+ *  单小节（不分头）的地方**不要**包：那样会多出一层没标题的框，反而更碎。 */
+//: 二级卡片的折叠标记：**右侧向下双箭头**（用户 2026-10-02："改成右侧向下双箭头，
+//: 这样可以跟一级卡片有点区别"）—— 一级卡片是标题左侧那个单箭头 `▶`。
+const SSUB_CHEV = `<span class="ssub-chev" aria-hidden="true">`
+  + `<svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor"`
+  + ` stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">`
+  + `<path d="M6 6.5 12 11l6-4.5"/><path d="M6 13.5 12 18l6-4.5"/></svg></span>`;
+
+function sSub(title, body) {
+  // 可折叠（点标题收起/展开，状态记在 localStorage，与整卡一套机制）；
+  // `data-collapse-id` 用标题做 slug —— 渲染顺序是确定的，所以 id 稳定；
+  // 默认**展开**（二级分组是内容，不该默认藏起来）。
+  const id = "ssub-" + String(title || "").replace(/\s+/g, "-");
+  return `<div class="ssub collapsible" data-collapse-id="${esc(id)}">`
+    + `<div class="ssub-h"><span>${esc(title)}</span>${SSUB_CHEV}</div>`
+    + `<div class="ssub-body">${body || ""}</div></div>`;
+}
+
 function renderAdvSections(card, items) {
   const names = [];
   const bySec = {};
@@ -3679,10 +3695,11 @@ function renderAdvSections(card, items) {
   const order = (card.advOrder || []).filter((n) => bySec[n]);
   const all = order.concat(names.filter((n) => !order.includes(n)));
   const showHead = all.length > 1;
-  return all.map((n) => {
-    const note = (card.advNote && card.advNote[n]) ? card.advNote[n]() : "";
-    return (showHead ? `<div class="ssec">${esc(n)}</div>` : "")
-         + renderSettingRows(bySec[n]) + note;
+  return all.map((nm) => {
+    const note = (card.advNote && card.advNote[nm]) ? card.advNote[nm]() : "";
+    const body = renderSettingRows(bySec[nm]) + note;
+    // 只有一个小节时不加头（也就不包框）：那种卡本来就"一眼到底"，多一层框更碎。
+    return showHead ? sSub(nm, body) : body;
   }).join("");
 }
 /** 「未归类」兜底卡：`SET_CARDS` 没写到的设置项仍然会出现（新键不会静默消失）。
@@ -3701,8 +3718,7 @@ function renderFallbackCards() {
     <div class="card-body">
       <div class="snote warn"><span>⚠</span><span>这些设置项还没写进 <code>SET_CARDS</code> 的落点表
         （见 <code>docs/设置项归属表.md</code>）：先把它们摆出来，再去补归属，别让它们消失。</span></div>
-      ${grps.map((g) => `<div class="ssec">${esc(SET_GROUP_NAMES[g] || g)}</div>`
-        + renderSettingRows(byGrp[g])).join("")}
+      ${grps.map((g) => sSub(SET_GROUP_NAMES[g] || g, renderSettingRows(byGrp[g]))).join("")}
     </div></div>`;
 }
 /** 落点表声明覆盖的键（普通行 + 动态渲染的卡用 `covers` 显式列出 + 用说明代替控件的键）。 */
@@ -3723,8 +3739,8 @@ function _placedKeys() {
 
 /** 渲染三个页签里的设置卡片（数据已在 `_settingsCache` / `_agentsCache` / `_capView` / …）。
  *
- *  2026-09-26 IA 重构后：三个 pane 分别长在 `#view-general / #view-business /
- *  #view-capability` 里，**没有子页签那一层** —— 一次 loadSettings() 把三页都画好，
+ *  2026-09-26 IA 重构后：三个 pane 分别长在 `#view-settings / #view-business`
+ *  #view-settings` 里（2026-10-02：通用/能力与智能体并成一个「设置」页），一次 loadSettings() 把两页都画好，
  *  切页签只是显示/隐藏（数据不重拉）。
  *  会议能力通道（`#rtCapHost`）同日撤掉：转写/分离/声纹由谁做现在由
  *  `renderMeetingServiceCard()` 画在「业务配置 → 会议」里 —— 一个实体只有一处状态。 */
@@ -3732,18 +3748,26 @@ function renderSettingsPanes() {
   const html = {};
   SET_TABS.forEach((t) => {
     html[t.id] = (SET_CARDS[t.id] || []).map((c) => renderCard(c));
-    const who = $(`#view-${t.id} .sset-who`);      // 每页顶部那句"这一页管什么"
+    const who = $(`#view-${t.id} .sset-who`);      // 兼容：老视图里那个可见的"这一页管什么"
     if (who) who.textContent = t.who || "";
+    // 2026-10-02（紧凑）：这句说明**不再显示在界面上**，收进页头那个 `?` 的悬浮里。
+    const q = $(`#view-${t.id} #setWhoQ .spop`);
+    if (q) q.textContent = t.who || "";
   });
-  html.general.push(renderFallbackCards());
+    if (html.settings) html.settings.push(renderFallbackCards());
   const hosts = {
-    general: "#setPaneGeneral", business: "#setPaneBusiness",
-    capability: "#setPaneCapability",
+    settings: "#setPaneSettings", business: "#setPaneBusiness",
   };
   Object.keys(hosts).forEach((id) => {
     const host = $(hosts[id]);
     if (host) host.innerHTML = (html[id] || []).join("");
   });
+  // 「转写服务 → 后端设置」是**搬进来的静态卡** `#capRouteCard`：配对/本机启停/安装那些控件
+  // 全是静态 DOM + 一堆按 id 找的加载器，搬节点最省事、ids 一个不变（2026-10-02 用户结构）。
+  // 搬完按「本机后端 / 网络后端」分别显示（见 applyTranscribeSettingsVisibility）。
+  const beHost = $("#capBackendHost"), beCard = $("#capRouteCard");
+  if (beHost && beCard && beCard.parentElement !== beHost) beHost.appendChild(beCard);
+  applyTranscribeSettingsVisibility();
   // 「模型路由」卡（index.html 里**静态**的）里的 7 项路由参数：
   // 卡本身不能由 JS 生成（它的 host 会被 loadRouter()/loadRouterLlm() 渲染，重绘会和
   // 并发请求互相覆盖），所以这里只把那些行填进它的 `#rtSetHost`；
@@ -3759,7 +3783,7 @@ function renderSettingsPanes() {
     const host = $("#envCheckHost");
     if (host) renderEnvCheck(host);
   } catch (e) { /* 体检卡片失败不能拖垮设置页 */ }
-  ["#view-general", "#view-business", "#view-capability"]
+  ["#view-settings", "#view-business"]
     .forEach((sel) => applyCollapsedCards($(sel)));
   _syncSettingsCollapseAll();
 }
@@ -3872,10 +3896,11 @@ document.addEventListener("click", async (e) => {
    不跟着这条单选走 —— 这正是"选了后端也没有说话人"那次事故的根因（一个控件替三个槽做主）。 */
 document.addEventListener("change", async (e) => {
   const rb = e.target.closest("[data-merge-backend]");
-  if (rb) {
-    await saveMeetingBackend(rb.value);
-    return;
-  }
+    if (rb) {
+      await saveMeetingBackend(rb.value);
+      applyTranscribeSettingsVisibility(rb.value);   // 本机 ⇄ 网络：后端设置那两块跟着换
+      return;
+    }
   const sel = e.target.closest("[data-agent-select]");
   if (sel) {
     /* 选中即启用：产品自带的"启用开关"（agentCodebuddyEnabled / agentHarnessEnabled）一并打开。
@@ -4024,7 +4049,169 @@ async function restartEcho(btn) {
 document.addEventListener("click", (e) => {
   const btn = e.target.closest("#btnRestartEcho");
   if (btn) restartEcho(btn);
+  const stopBtn = e.target.closest("#btnStopEcho");
+  if (stopBtn) stopEcho(stopBtn);
 });
+
+/* ---------------- 仪表盘底部的状态条（2026-10-02 用户要求）----------------
+   用户原话："运行情况和操作区做成仪表盘最下方的一个小横条，用状态灯和图标表达"。
+   所以这里只出**状态灯 + 短名**（细节全在 title，悬停才出），动作只留图标按钮（在 HTML 里）。
+   数据全取现成的：`_statusCache`（/api/status 的 agent + components）、`_capBackendCache`（后端）、
+   `_routerView`（/api/router/status）。缺哪一项显示灰灯 + "读不到"，**不让整块消失**。 */
+
+/** 状态条里的一格小卡片：状态灯 + 短名 + **短值**（用户要的是"后端：本机"这种一眼能读的）。
+ *  细节（端口、URL、原因）全在 title 里，悬停才出。 */
+  /** 「Agent」卡上的 ↗ 该去哪（2026-10-05 用户要求）。
+   *  标准版 harness 在跑 → 让**服务端**开它（那条 URL 的 token 查询参数是密钥；按 app/api.py 的口径，
+   *  token 不许下发给前端）；其余（DSH Desktop 是 cookie 鉴权的同端口 GUI、或没在跑）→
+   *  面板自己的「智能体」页，永远不落到死链。 */
+  function _agentLink(ag) {
+    const name = String((ag && (ag.name || ag.agent)) || "");
+    if (name === "harness" && ag && ag.online) {
+      return { post: "/api/control/harness/browser", title: "在浏览器打开标准版 harness 界面" };
+    }
+    return { href: "?view=agent", title: "去「智能体」页看它是哪个、怎么切" };
+  }
+
+  /** 把卡上的 ↗ 接上（**只绑一次**，事件委托）。
+   *  `data-go-href`：绝对地址 → 新标签；面板内的相对地址 → 当前标签。
+   *  `data-go-post`：先 POST（服务端拼好带 token 的 URL 并自己开浏览器），再开返回的 url。 */
+  function _bindCardLinks(host) {
+    if (!host || host.dataset.goBound === "1") return;
+    host.dataset.goBound = "1";
+    const go = (node) => {
+      const el = node && node.closest ? node.closest(".sb-go") : null;
+      if (!el) return;
+      const href = el.getAttribute("data-go-href") || "";
+      const post = el.getAttribute("data-go-post") || "";
+      if (post) {
+        api(post, { method: "POST", body: {} }).then((r) => {
+          if (r && r.ok === false) alert(r.message || "打不开");
+          else if (r && r.url && window.open) window.open(r.url, "_blank", "noopener");
+        }).catch(() => {});
+        return;
+      }
+      if (!href) return;
+      if (/^https?:/i.test(href)) window.open(href, "_blank", "noopener");
+      else window.location.href = href;
+    };
+    host.addEventListener("click", (e) => { go(e.target); });
+    host.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" || e.key === " ") { e.preventDefault(); go(e.target); }
+    });
+  }
+
+function _runCard(key, label, value, state, tip, go) {
+  // 两行：上面「灯 + 名」，下面短值（2026-10-02 用户要试两行效果；细节仍在 title 里）。
+  // `go`（可选，2026-10-05 用户要求）：`{href}` 或 `{post}` —— 卡上多一个小 ↗ 网页入口，
+  // 点它去"对应的网页"（后端管理页 / Agent 自己的界面；绑定见 _bindCardLinks）。
+  let link = "";
+  if (go && (go.href || go.post)) {
+    link = `<span class="sb-go" role="link" tabindex="0"`
+      + ` data-go-href="${esc(go.href || "")}"`
+      + ` data-go-post="${esc(go.post || "")}"`
+      + ` title="${esc(go.title || "打开对应的网页")}">↗</span>`;
+  }
+  return `<span class="sb-card is-${esc(state || "unknown")}" data-run="${esc(key)}" `
+    + `title="${esc(tip || (label + "：" + value))}">`
+    + `<span class="sb-top"><span class="dot ${esc(state || "unknown")}"></span>`
+    + `<span class="sb-lb">${esc(label)}</span>${link}</span>`
+    + `<span class="sb-val">${esc(value || "—")}</span></span>`;
+}
+
+
+
+
+async function refreshRunStatus() {
+  const host = $("#runStatusHost");
+  if (!host) return;
+  // 仪表盘只依赖一个设置项（dashboardShowRouter），但开机第一屏可能就是仪表盘 ——
+  // 那时 _settingsCache 还是空的，settingValue() 会一律回落到默认值（关）。
+  // 所以用之前先确保设置加载过一次。**不能**反过来在 loadSettings 里调本函数（会成环）。
+  if (!_settingsCache || !_settingsCache.length) {
+    try { await loadSettings(); } catch (e) { /* 读不到就按默认处理 */ }
+  }
+  // 2026-10-04：**带 TTL 地重读**。原来 `if (!be)` 一旦缓存过就再也不取 —— 而后端会被
+  // 另一棵树 / 部署脚本 / 桌面工具包起停（"各自的后端、不同时启动"是日常操作），
+  // 于是卡片永远停在"页面加载那一刻"的状态（用户实测：刷新一下才对）。
+  let be = _capBackendCache;
+  if (!be || Date.now() - _capBackendAt > 5000) {
+    try {
+      be = await api("/api/capability/backend");
+      _capBackendCache = be;
+      _capBackendAt = Date.now();
+    } catch (e) { be = be || null; }
+  }
+  const st = _statusCache || {};
+  const ag = st.agent || null;
+  const tts = ((st.components || []).find((c) => c.name === "tts")) || null;
+  const beRunning = !!(be && (be.running || (be.job && be.job.running)));
+  const beReady = !!(be && ((be.runtime && be.runtime.ready) || be.ready || be.usable));
+  // 三格都只出**短值**（用户的口径：后端：本机 / Agent：DSH标准版 / 语音合成：在线）
+  const beShort = beRunning ? "本机" : (beReady ? "待启动" : "未就绪");
+  const beTip = !be ? "读不到本机后端状态"
+    : (beRunning ? `本机后端在跑（${be.baseUrl || "—"}）`
+                 : (beReady ? "运行时已就绪，后端还没启动" : "本机后端未安装或未就绪"));
+  const agName = ag ? (ag.displayName || ag.shortName || ag.name) : "读不到";
+  const agTip = ag ? `执行智能体：${ag.displayName || ag.name}（${ag.detail || ag.status || ""}）`
+                   : "读不到智能体状态";
+  const engine = String(settingValue("ttsEngine") || "auto");
+  const ttsShort = ({ off: "关闭", "edge-tts": "在线", auto: "自动" })[engine] || "本机";
+  const ttsTip = tts ? `语音合成：${ttsShort}（${tts.detail || tts.status || ""}）`
+                     : "读不到语音合成组件状态";
+  _bindCardLinks(host);
+  host.innerHTML = [
+    _runCard("backend", "后端", beShort, beRunning ? "online" : (beReady ? "idle" : "offline"), beTip,
+             be && be.adminUrl ? { href: be.adminUrl, title: "打开后端管理页（发授权 / 看客户端 / 改配额）" } : null),
+    _runCard("agent", "Agent", agName, ag && ag.online ? "online" : "offline", agTip,
+             _agentLink(ag)),
+    _runCard("tts", "语音合成", ttsShort, tts && tts.status === "online" ? "online" : "idle", ttsTip),
+  ].join("");
+  applyDashboardRouterVisibility();
+  // 自己养一个 5 秒节拍：后端状态是被别处改的，这条不该等用户手动刷新
+  // （2026-10-04 用户原话："我刷新后边条就对了" —— 那就别让他刷新）。
+  if (!_runStatusTimer) {
+    _runStatusTimer = setInterval(() => {
+      const dash = $("#view-dashboard");
+      if (dash && !dash.classList.contains("hidden")) refreshRunStatus().catch(() => {});
+    }, 5000);
+  }
+}
+
+
+function applyDashboardRouterVisibility() {
+  const on = !!settingValue("dashboardShowRouter");
+  const fo = $("#foWrap");
+  if (fo) fo.classList.toggle("hidden", !on);
+  // 状态条里那一盏"路由"灯跟着一起收（按 data-run 找，不再依赖"最后一个 .srow"这种脆弱判据）
+  if (!on) document.querySelectorAll('#runStatusHost [data-run="router"]').forEach((el) => el.remove());
+}
+
+
+/** 关闭 ECHO（仪表盘 → 操作区）。服务端**会拒**（正在录音 / 命令还在处理）——
+ *  这里把它给的理由原样显示出来，不要自己编一句"失败"。 */
+async function stopEcho(btn) {
+  btn.blur();
+  if (btn.disabled) return;
+  if (!(await confirmDialog("确定关闭 ECHO 服务？关闭后语音指令与会议录音都不可用，需要手动再启动。",
+                            { okText: "关闭", danger: true }))) return;
+  btn.disabled = true;
+  const state = $("#restartState");
+  try {
+    const r = await post("/api/control/echo/stop", {});
+    if (!r.ok) {
+      toast(r.message || "关闭请求被拒绝");
+      if (state) state.textContent = r.message || "";
+      return;
+    }
+    toast(r.message || "正在关闭…");
+    if (state) state.textContent = "服务正在关闭，这个页面稍后会连不上。";
+  } catch (err) {
+    toast("请求失败：" + err.message);
+  } finally {
+    btn.disabled = false;
+  }
+}
 
 /* ---------------- 模型清单小工具 ---------------- */
 function fmtMb(mb) {
@@ -5248,7 +5435,7 @@ function renderBoot(bs) {
     ops.innerHTML = `<div class="sset-hint">没有可启停的组件（后端没给 can_start/can_stop）。</div>`;
     return;
   }
-  ops.innerHTML = `<div class="ssec">组件进程（启停）</div>` + list.map((c) => {
+  ops.innerHTML = sSub("组件进程（启停）", list.map((c) => {
     const cls = bootBadgeCls(c.status);
     const btns = [];
     if (c.can_start) {
@@ -5266,7 +5453,7 @@ function renderBoot(bs) {
       <div class="lbl"><span class="lt" title="${esc(c.label || c.id)}">${c.icon || ""} ${esc(short)}</span></div>
       <div class="sctl"><span class="badge ${cls}">${STATUS_TEXT[c.status] || c.status || ""}</span>
         <span class="sacts">${btns.join("")}</span></div></div>${why}`;
-  }).join("");
+  }).join(""));
   $$("#bootOps [data-boot]").forEach((btn) => btn.addEventListener("click", async (e) => {
     const [cid, act] = e.currentTarget.dataset.boot.split(":");
     try {
@@ -6118,8 +6305,29 @@ setInterval(() => {
   const view = v ? normView(v.dataset.view) : "";
   // `boot` 的内容现在在「常规」页、`failover` 的内容在「智能体」页（2026-09-25 页签整合）
   if (view === "dashboard") refreshDashboard();
-  else if (view === "general") { loadBoot(); loadBootLogs(); }
+  else if (view === "settings") { loadBoot(); loadBootLogs(); }
   else if (view === "agent" && !_rtDirty && !_rtBusy()) loadRouter();
 }, _PANEL_TICK_MS);
 // 转写进度轮询（会议列表进度条）
 setInterval(pollTranscribe, 2000);
+
+
+/* ---------------- 开发版牌子（仅 dev；交付物不受影响） ----------------
+   用户 2026-10-04："开发版有标志就行，这样不影响交付物"。
+   实例名来自本机 `~/.echo-instances.json`（客户机没有 → 不显示）。
+   只有 name == "dev" 才亮牌子，稳定版与客户机**什么都不做**。 */
+let _instBadgeTried = false;
+async function initInstanceBadge() {
+  if (_instBadgeTried) return;
+  _instBadgeTried = true;
+  let info = null;
+  try { info = await api("/api/instance"); } catch (e) { return; }
+  if (!info || !info.badge) return;                 // 非开发版：保持隐藏、标题也不动
+  const el = $("#instBadge");
+  if (!el) return;
+  el.textContent = info.badge;
+  el.title = `这是开发版（${info.root || ""}）—— 与稳定版面板长得一样，别搞混`;
+  el.classList.remove("hidden");
+  document.title = `ECHO · ${info.badge}`;
+}
+document.addEventListener("DOMContentLoaded", () => { initInstanceBadge().catch(() => {}); });

@@ -361,12 +361,21 @@ class SecretHandlingTests(unittest.TestCase):
         rows = self._config_endpoint().get("/api/providers/config").json()["settings"]
         return {r["key"]: r for r in rows}[key]
 
-    def test_generic_form_no_longer_carries_the_secrets(self):
-        """这九个键是 hidden 的：通用设置表单里**看不到**它们（统一由卡片承载）。"""
+    def test_the_ai_card_never_echoes_a_secret(self):
+        """密钥进了「设置 → AI组件 → 高级 → 在线服务」，但**值永远不回显**。
+
+        2026-10-02（IA 重构）：旧断言是"这九个键 hidden → 通用表单里看不到它们"，随本次
+        重构作废（provider 一族已放出来，由 AI组件 承载）。**真正要守的不变量不是"藏起来"，
+        而是"密钥不出出口"**：`/api/settings` 下发这几项时 `value` 必须是空串（面板只据此
+        知道"配没配"），真值只在服务端 `settings.get()` 里用于拼请求头 —— 下面几条用例钉着
+        这一点（`test_config_endpoint_masks_secrets` / `test_settings_get_still_returns_the_real_value`）。
+        """
         settings.update({"providerLlmApiKey": self.SECRET})
-        keys = {r["key"] for r in settings.all()}
-        for key in ("providerLlmApiKey", "providerAsrApiKey", "providerAsrBaseUrl"):
-            self.assertNotIn(key, keys, "通用表单不该再出现 provider 配置（两套界面）")
+        rows = {r["key"]: r for r in settings.all()}
+        self.assertIn("providerLlmApiKey", rows, "现在它由 AI组件 承载 → 要下发这一行")
+        self.assertEqual(rows["providerLlmApiKey"].get("value"), "",
+                         "下发的 value 必须是空串（密钥不回显）")
+        self.assertTrue(rows["providerLlmApiKey"].get("secret"), "要标成 secret，面板才会画密码框")
 
     def test_config_endpoint_masks_secrets(self):
         settings.update({"providerLlmApiKey": self.SECRET})
@@ -642,6 +651,12 @@ class PanelWiringTests(unittest.TestCase):
     id 改成 `#view-capability`，分发也从 `switchView()` 里的 if 链变成了
     `if (view === "capability") { loadSettings(); loadCapabilities(); }`。
     这条守的仍是同一件事：**那个页签存在、切过去真的会加载**。
+
+    2026-10-02 变化（IA 重构，同样只改布局断言）：那个页签并进顶层「设置」
+    （`#view-settings`，`#view-capability` 已删除；老深链 `?view=capability` 由
+    `VIEW_ALIASES` 折算过去），分发现在是
+    `if (view === "settings") { … loadCapabilities(); loadRouter(); }`。
+    意图不变：**能力卡的落点存在、切过去真的会加载**。
     """
 
     @classmethod
@@ -660,15 +675,22 @@ class PanelWiringTests(unittest.TestCase):
         self.assertIn("/api/components?includeBlocked=true", self.js)
 
     def test_capability_page_is_a_first_level_tab_and_loaded(self):
-        self.assertIn('data-view="capability"', self.html)
-        self.assertIn('id="view-capability"', self.html)
-        # 2026-09-26 IA 重构：这一页叫「能力与智能体」，切过去要连路由卡一起刷新
-        self.assertIn('if (view === "capability") { loadSettings(); loadCapabilities(); loadRouter(); }',
-                      self.js, "切到「能力与智能体」页签时必须加载（否则页面永远空白）")
+        # 2026-10-02：IA 重构，旧断言 `data-view="capability"` + `id="view-capability"` +
+        # 分发串 `if (view === "capability") { loadSettings(); loadCapabilities(); loadRouter(); }`
+        # → 新断言 `data-view="settings"` + `id="view-settings"` + 分发串
+        # `if (view === "settings") { … loadCapabilities(); loadRouter(); }`。
+        # 理由：「能力与智能体」并进顶层「设置」页（老书签 `?view=capability` 由
+        # VIEW_ALIASES 折算到 settings），这一页仍要在切过去时把能力/路由一起拉起来。
+        self.assertIn('data-view="settings"', self.html)
+        self.assertIn('id="view-settings"', self.html)
+        self.assertRegex(self.js, r'if \(view === "settings"\) \{[^}]*loadCapabilities\(\);',
+                         "切到承载能力卡的「设置」页签时必须加载（否则页面永远空白）")
+        self.assertRegex(self.js, r'if \(view === "settings"\) \{[^}]*loadRouter\(\);',
+                         "同一页里那张「模型路由」静态卡也要一起刷新")
         # 两个旧页签已合并进来，不该再有各自的挂载点/分发
         for gone in ('data-view="models"', 'data-view="components"',
                      'id="providersHost"', 'id="componentsHost"'):
-            self.assertNotIn(gone, self.html, "%s 应已被「能力后端」页签合并" % gone)
+            self.assertNotIn(gone, self.html, "%s 应已被合并进「设置」页签" % gone)
         self.assertNotIn("loadProviders()", self.js)
         self.assertNotIn("loadModels()", self.js.split("function downloadMissingModels")[0])
 
@@ -680,28 +702,48 @@ class PanelWiringTests(unittest.TestCase):
                 self.assertIn('id="%s"' % host, self.html, "index.html 缺少 #%s" % host)
                 self.assertIn('$("#%s")' % host, self.js, "app.js 没有用 #%s" % host)
 
-    def test_capability_page_owns_the_editing_ui(self):
-        """用户实测指出「同一个功能两套界面」→ 配置项 hidden、编辑搬进能力页签。"""
-        self.assertIn("保存在线服务设置", self.js)
-        self.assertIn("data-cap-save", self.js, "页签要有自己的保存按钮")
-        self.assertIn("data-provider-kind", self.js)
-        self.assertIn("data-tts-engine", self.js, "TTS 的选择就是 ttsEngine（唯一开关）")
+    def test_the_capability_cards_only_show_status(self):
+        """能力卡**只显示状态**，编辑统一在「设置 → AI组件 → 高级 → 能力选择 / 在线服务」。
 
-    def test_provider_settings_are_hidden_from_the_generic_form(self):
-        """这八个键**不再**出现在通用设置表单里（否则又变成两套界面）。"""
+        2026-10-02（用户："AI组件那边的各项内容都是能力选择上的配置，业务设置里的配置是
+        业务特征的设置"）：能力卡里那些编辑控件 —— `data-provider-kind`（providerAsr/Llm 下拉）、
+        `data-tts-engine`（ttsEngine 下拉）、在线服务字段 `capCfgField` + `data-cap-save` 保存按钮、
+        预设 `capPresets`/`capApplyPreset`、以及 `capAsrLocal` 里的 `sttModel` 下拉 —— **全部收掉**。
+        旧断言要求的正是它们（"能力页签承载用哪个实现"），那是本次 IA 重构作废的口径。
+        现在这里只讲"装没装、多大、怎么装"，外加一句指路。
+        """
+        for gone in ("data-provider-kind", "data-tts-engine", "data-cap-save",
+                     "capCfgField", "capPresets", "capApplyPreset", "capTtsOptionLabel"):
+            with self.subTest(gone=gone):
+                self.assertNotIn(gone, self.js, "%s 是第二个编辑入口，应当已经收掉" % gone)
+        self.assertIn("AI组件 → 高级", self.js, "要留一句指路：改在哪里")
+
+    def test_provider_settings_live_in_the_ai_card(self):
+        """这 8 个 provider 键**现在由「设置 → AI组件 → 高级 → 在线服务」承载**（可见、可改）。
+
+        2026-10-02（用户："AI组件那边的各项内容都是能力选择上的配置，业务设置里的配置是
+        业务特征的设置"）：旧断言要求它们 `hidden=True`（"隐藏 + 由能力页签的卡片承载"），
+        那条口径随本次 IA 重构作废 —— 能力卡已改成**只读状态 + 一句指路**，编辑统一回到
+        设置页。所以这里反过来钉：**可见**，并且**挂在 `ai` 那张卡里**（那两节是函数画的，
+        所以键记在 `covers` 上）。`providerTts` 例外：与 ttsEngine 重复，仍 hidden+deprecated。
+        """
         from app.config import DEFAULTS
+        ai = self.js[self.js.index('{ id: "ai", title: "AI 组件"'):]
+        ai = ai[:ai.index('{ id: "keys"')]
         for key in ("providerAsr", "providerLlm",
                     "providerLlmBaseUrl", "providerLlmApiKey", "providerLlmModel",
                     "providerAsrBaseUrl", "providerAsrApiKey", "providerAsrModel"):
             with self.subTest(key=key):
                 meta = DEFAULTS.get(key)
                 self.assertIsNotNone(meta, "%s 必须存在" % key)
-                self.assertTrue(meta.get("hidden"),
-                                "%s 应由「能力」页签承载，不出现在通用表单" % key)
+                self.assertFalse(meta.get("hidden"),
+                                 "%s 现在是 AI组件 里的可见设置项（改在线服务就在那里）" % key)
                 self.assertEqual(meta["grp"], "provider")
                 self.assertTrue(meta["label"] and meta["description"])
+                self.assertIn('"%s"' % key, ai, "%s 要挂在 AI组件 卡里" % key)
         # providerTts 更进一步：与 ttsEngine 重复 → 已弃用（既不出现在表单，也不出现在页签）
         self.assertTrue(DEFAULTS["providerTts"].get("deprecated"))
+        self.assertTrue(DEFAULTS["providerTts"].get("hidden"))
 
     def test_provider_config_endpoint_serves_them_masked(self):
         """卡片要靠这个端点拿到值；密钥仍是遮罩过的；TTS 那格只给只读的 ttsEngine。"""

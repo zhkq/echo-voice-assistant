@@ -57,12 +57,22 @@ class _Case(unittest.TestCase):
     def _stage(self, **kw):
         # ABI 闸门默认打桩成"过"（真跑要一个真解释器；那条判据单独测）
         abi_ok = kw.pop("abi_ok", True)
+        # 随包解释器也打桩（`ensure_pip` 要**跑真解释器**，而这里的 exe 是个文本文件）。
+        # 它自己的行为（摘 PEP 668 标记 / 离线装回 pip）在 `PipPrepTests` 里单独测。
+        pip_ok = kw.pop("pip_ok", True)
+        from app import backend_fetch
+        kwargs = {"variant": "cu126", "stamp": "20260930-0300"}
+        if "python_from" not in kw:
+            kwargs["runtime_from"] = self.runtime
+        kwargs.update(kw)
         with mock.patch.object(portable, "abi_check",
                                lambda runtime_from: ({"ok": abi_ok, "torch": "2.14.0+cu126",
                                                       "torchaudio": "2.11.0+cu126"}
-                                                     if abi_ok else {})):
-            return portable.stage(self.out, variant="cu126",
-                                  runtime_from=self.runtime, stamp="20260930-0300", **kw)
+                                                     if abi_ok else {})), \
+                mock.patch.object(backend_fetch, "ensure_pip",
+                                  lambda exe, on_step=None: ((True, "pip 可用（桩）") if pip_ok
+                                                             else (False, "externally managed，修不好"))):
+            return portable.stage(self.out, **kwargs)
 
 
 class PortablePackTests(_Case):
@@ -120,13 +130,17 @@ class PortablePackTests(_Case):
             sources = json.load(fh)
         self.assertIn("pytorch-wheels/cu126", sources["torchIndex"])
         self.assertTrue(any("tuna.tsinghua" in i for i in sources["pipIndexes"]))
+        # torch 的索引**是一串**（2026-10-01）：一个源抖了就换下一个。
+        # 契约是"清单里的第一个 == 主源"，而且与 `app/backend_fetch.py` **同源**（别在这里手抄）。
+        self.assertEqual(sources["torchIndex"], sources["torchIndexes"][0])
+        self.assertGreaterEqual(len(sources["torchIndexes"]), 2, sources["torchIndexes"])
+        from app import backend_fetch
+        self.assertEqual(sources["torchIndexes"], backend_fetch.torch_indexes("cu126"))
         self.assertEqual(portable.verify(kit_dir), [])
 
     def test_a_thin_pack_can_carry_just_the_interpreter(self):
         """薄包也可以**只带解释器**（几十 MB、与卡无关）：torch 仍然按国内源现装。"""
-        kit_dir, _zip, info = portable.stage(
-            self.out, variant="cu126", stamp="thin-2",
-            python_from=self.runtime)          # 复用造的假运行时目录
+        kit_dir, _zip, info = self._stage(python_from=self.runtime)
         self.assertTrue(info["thin"])
         self.assertTrue(os.path.isfile(
             os.path.join(kit_dir, portable.RUNTIME_DIR, "Scripts", "python.exe")))
@@ -184,6 +198,181 @@ class PortablePackTests(_Case):
             text = fh.read()
         self.assertIn("还没验过", text)
         self.assertIn("另一台机器", text)
+
+
+class PipPrepTests(_Case):
+    """**随包解释器必须"能装东西"**（2026-10-01 真机实测的两个缺陷，都出在出包这一步）。
+
+    薄包的 `runtime/` 是搬过来的 uv 托管 CPython：① 带着 `Lib/EXTERNALLY-MANAGED`（PEP 668）
+    → 目标机上 pip **一律拒绝安装**；② 它的 pip 还可能是**残缺**的。应用侧会兜一遍
+    （`backend_fetch.ensure_pip`），但出包时**就该是干净的** —— 别让每台机器修同一个缺陷。
+    """
+
+    def test_the_build_strips_the_pep668_marker(self):
+        marker = os.path.join(self.runtime, "Lib", "EXTERNALLY-MANAGED")
+        os.makedirs(os.path.dirname(marker), exist_ok=True)
+        with open(marker, "w", encoding="utf-8") as fh:
+            fh.write("This environment is externally managed\n")
+        kit_dir, _zip, info = self._stage()
+        shipped = os.path.join(kit_dir, portable.RUNTIME_DIR, "Lib", "EXTERNALLY-MANAGED")
+        self.assertFalse(os.path.exists(shipped),
+                         "带着这个标记，目标机上 pip 会拒绝安装（看着像权限问题）")
+        self.assertGreaterEqual(info["runtimePrepared"]["markersRemoved"], 1)
+        with open(os.path.join(kit_dir, portable.MANIFEST), encoding="utf-8") as fh:
+            manifest = json.load(fh)
+        self.assertFalse([f for f in manifest["files"] if "EXTERNALLY-MANAGED" in f],
+                         "标记已删，就不该还留在清单里")
+        self.assertEqual(portable.verify(kit_dir), [])
+
+    def test_verify_flags_a_marker_that_still_ships(self):
+        """护栏：哪天有人在拷贝之后又把标记放回去（或换了实现），自检要挡住。"""
+        kit_dir, _zip, _info = self._stage()
+        marker = os.path.join(kit_dir, portable.RUNTIME_DIR, "Lib", "EXTERNALLY-MANAGED")
+        os.makedirs(os.path.dirname(marker), exist_ok=True)
+        with open(marker, "w", encoding="utf-8") as fh:
+            fh.write("x\n")
+        problems = portable.verify(kit_dir)
+        self.assertTrue([p for p in problems if "EXTERNALLY-MANAGED" in p], problems)
+
+    def test_a_pip_that_cannot_be_fixed_stops_the_pack(self):
+        """随包运行时**装不了依赖**的包不该出（那种包到目标机上就是"点一下没反应"）。"""
+        with self.assertRaises(portable.PackError) as ctx:
+            self._stage(pip_ok=False)
+        self.assertIn("pip", str(ctx.exception))
+        leftovers = os.listdir(self.out)
+        self.assertTrue(all(not d.startswith(portable.PACKAGE_PREFIX) for d in leftovers),
+                        "出包失败时不该留下半个包：%s" % leftovers)
+
+
+class CopyFilterTests(unittest.TestCase):
+    """拷运行时时**只许**剪缓存/版本库元数据（2026-10-01 真机事故的回归用例）。
+
+    事故：`_copy_tree()` 曾经套用"仓库那棵树"的排除表（里面有裸的 `data` / `models` / `tests` / `docs`），
+    而它是**按目录名在任意深度剪**的 —— 于是 `site-packages/torch/utils/data/`、
+    `transformers/models/`、`funasr/models/` 被整目录剪掉。当时所有出包自检都过（它们只看 ABI 元数据），
+    装到目标机上才炸，而且**伪装成显卡问题**：
+
+        ImportError: cannot import name 'data' from partially initialized module 'torch.utils'
+        → 服务端报"模型要求 GPU，但 torch 看不到 CUDA"
+
+    判据：**第三方包里叫 `data`/`models`/`tests`/`docs`/`logs`/`dist` 的目录是真代码，必须留下**；
+    `__pycache__` / `.git` 才是任何深度都不带的。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="echo-pack-copy-")
+        self.addCleanup(lambda: shutil.rmtree(self.tmp, ignore_errors=True))
+        self.src = os.path.join(self.tmp, "src")
+        self.dst = os.path.join(self.tmp, "dst")
+        for rel in ("Lib/site-packages/torch/utils/data/deep/__init__.py",
+                    "Lib/site-packages/transformers/models/bert/modeling_bert.py",
+                    "Lib/site-packages/funasr/models/asr/model.py",
+                    "Lib/site-packages/sklearn/datasets/data/iris.csv",
+                    "Lib/site-packages/somedep/tests/test_x.py",
+                    "Lib/site-packages/somedep/docs/index.md",
+                    "Lib/site-packages/somedep/logs/run.log",
+                    "Lib/site-packages/somedep/dist/build.json",
+                    "Lib/site-packages/somedep/__pycache__/cached.pyc",
+                    "Lib/site-packages/somedep/keep.py",
+                    "python.exe"):
+            path = os.path.join(self.src, *rel.split("/"))
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "wb") as fh:
+                fh.write(b"x")
+
+    def _copied(self):
+        portable._copy_tree(self.src, self.dst, "runtime")
+        got = set()
+        for base, _dirs, files in os.walk(self.dst):
+            for fn in files:
+                got.add(os.path.relpath(os.path.join(base, fn), self.dst).replace("\\", "/"))
+        return got
+
+    def test_nested_package_dirs_that_share_a_repo_dir_name_are_kept(self):
+        got = self._copied()
+        for must in ("Lib/site-packages/torch/utils/data/deep/__init__.py",
+                     "Lib/site-packages/transformers/models/bert/modeling_bert.py",
+                     "Lib/site-packages/funasr/models/asr/model.py",
+                     "Lib/site-packages/sklearn/datasets/data/iris.csv",
+                     "Lib/site-packages/somedep/tests/test_x.py",
+                     "Lib/site-packages/somedep/docs/index.md",
+                     "Lib/site-packages/somedep/logs/run.log",
+                     "Lib/site-packages/somedep/dist/build.json"):
+            self.assertIn(must, got, "这条被剪掉了 —— 就是那次残包事故的形状：%s" % must)
+
+    def test_caches_are_still_dropped(self):
+        got = self._copied()
+        self.assertNotIn("Lib/site-packages/somedep/__pycache__/cached.pyc", got)
+        self.assertIn("Lib/site-packages/somedep/keep.py", got)
+
+    def test_the_two_tables_are_deliberately_different(self):
+        """源码树那张表可以按名字剪（`app/data` 是数据不是代码）；运行时那张**不行**。"""
+        self.assertIn("data", portable.EXCLUDE_DIRS_SOURCE)
+        for name in ("data", "models", "tests", "docs", "logs", "dist"):
+            self.assertNotIn(name, portable.EXCLUDE_DIRS_TREE,
+                             "运行时那张表里出现 %r 就会再剪出残包" % name)
+
+
+class ImportCheckTests(unittest.TestCase):
+    """出包自检必须**从打好的包里真 import**（不是只看元数据/文件数）。
+
+    真跑子进程、真 import：解释器用 `sys.executable`（跑用例的那个 venv，**真的能用**），
+    包目录通过探针里的 `sys.path.insert` 指到伪造的 site-packages —— 这样"import 得动/不动"
+    是真实发生的，不靠打桩假装。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="echo-pack-import-")
+        self.addCleanup(lambda: shutil.rmtree(self.tmp, ignore_errors=True))
+        self.pack = os.path.join(self.tmp, "pack")
+        self.sp = os.path.join(self.pack, "runtime", "Lib", "site-packages")
+        os.makedirs(self.sp, exist_ok=True)
+        self._find = mock.patch.object(portable, "find_interpreter",
+                                       lambda _root: sys.executable)
+        self._find.start()
+        self.addCleanup(self._find.stop)
+
+    def _probe(self, name):
+        code = "import sys; sys.path.insert(0, r'%s'); import %s" % (self.sp, name)
+        return ((name, code),)
+
+    def test_a_pack_that_ships_a_broken_package_fails_loudly(self):
+        """包里有这个包、却 import 不动 → 必须抛（那次残包本该在这里被拦住）。"""
+        pkg = os.path.join(self.sp, "brokenpkg")
+        os.makedirs(pkg, exist_ok=True)
+        with open(os.path.join(pkg, "__init__.py"), "w", encoding="utf-8") as fh:
+            fh.write("raise ImportError(\"cannot import name 'data' from 'torch.utils'\")\n")
+        with mock.patch.object(portable, "IMPORT_PROBES", self._probe("brokenpkg")):
+            with self.assertRaises(portable.PackError) as ctx:
+                portable.import_check(self.pack)
+        text = str(ctx.exception)
+        self.assertIn("brokenpkg", text)
+        self.assertIn("残包", text)
+        self.assertIn("EXCLUDE_DIRS_TREE", text, "报错要指到那次事故的根因上")
+
+    def test_a_pack_that_does_not_ship_a_package_does_not_check_it(self):
+        """薄包只有解释器：**没带的包一个都不查**（不然薄包永远出不来）。"""
+        with mock.patch.object(portable, "IMPORT_PROBES",
+                               (("torch", "import torch"), ("funasr", "import funasr"))):
+            self.assertEqual(portable.import_check(self.pack), [])
+
+    def test_a_healthy_package_is_reported_as_checked(self):
+        pkg = os.path.join(self.sp, "okpkg")
+        os.makedirs(pkg, exist_ok=True)
+        with open(os.path.join(pkg, "__init__.py"), "w", encoding="utf-8") as fh:
+            fh.write("VALUE = 1\n")
+        with mock.patch.object(portable, "IMPORT_PROBES", self._probe("okpkg")):
+            self.assertEqual(portable.import_check(self.pack), ["okpkg"])
+
+    def test_the_real_probe_list_covers_the_packages_that_were_mangled(self):
+        """真表里必须盯着这次被剪坏的那几个（少一个，同类残包就能再溜过去）。"""
+        names = [pkg for pkg, _code in portable.IMPORT_PROBES]
+        for pkg in ("torch", "torchaudio", "transformers", "funasr", "fastapi"):
+            self.assertIn(pkg, names)
+        torch_code = dict(portable.IMPORT_PROBES)["torch"]
+        self.assertIn("torch.utils.data", torch_code, "`torch.utils.data` 就是被剪掉的那个")
+        transformers_code = dict(portable.IMPORT_PROBES)["transformers"]
+        self.assertIn("transformers.models", transformers_code)
 
 
 if __name__ == "__main__":

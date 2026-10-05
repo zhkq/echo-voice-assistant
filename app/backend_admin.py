@@ -243,6 +243,9 @@ def view() -> Dict[str, Any]:
         "root": backend_setup.backend_root(),
         "port": int(port), "adminPort": int(admin_port),
         "baseUrl": backend_setup.loopback_base_url(port),
+        #: 面板「后端」小卡上的 ↗ 入口（2026-10-05 用户要求）。管理面**只绑回环**是设计
+        #: （见 server/admin.py 开头的三条），所以如实写 127.0.0.1；端口取"一处权威"。
+        "adminUrl": "http://127.0.0.1:%d/admin/" % int(admin_port),
         "runtime": {"ready": bool(runtime), "path": runtime},
         "config": {"path": config_path, "exists": config_exists},
         "running": bool(alive),

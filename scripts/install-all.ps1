@@ -75,7 +75,11 @@ param(
     [string]$PipIndex = '',
     [string]$NotesDir = '',
     [switch]$NoShortcuts,
-    [switch]$SkipStart
+    [switch]$SkipStart,
+    # ---- 后端（会议转写那台 GPU 服务）怎么来：用户 2026-10-01 要求安装流程后面多问这一句
+    [ValidateSet('ask', 'pair', 'local', 'skip')][string]$Backend = 'ask',
+    [string]$BackendPair = '',
+    [string]$BackendDir = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -90,6 +94,8 @@ $script:TargetRoot = ''     # 安装根
 $script:CoreDir = ''        # 代码目录
 $script:StepNo = 0
 $script:TotalSteps = 7
+#: 后端那一步的结论（`Invoke-BackendStep` 写，`Show-Result` 读）—— 收尾摘要里如实带一行。
+$script:BackendSummary = ''
 
 # ---------------------------------------------------------------- 输出
 function Log {
@@ -610,6 +616,7 @@ function Show-Result {
         Warn ("服务没起来（或 -SkipStart）—— 面板地址（起来后）: {0}" -f $url)
         Info ("手动启动：powershell -NoProfile -ExecutionPolicy Bypass -File `"{0}\scripts\start.ps1`"" -f $script:CoreDir)
     }
+    if ($script:BackendSummary) { Info $script:BackendSummary }
     Write-Host '  ────────────────────────────────────────────────' -ForegroundColor DarkGray
     Write-Host ''
     EndStep '收尾'
@@ -627,6 +634,313 @@ function Show-Result {
     }
 }
 
+# ---------------------------------------------------------------- 后端：会议转写那台 GPU 服务
+# 用户 2026-10-01 定的：安装流程**后面**要多问一句"后端怎么来"。三种答法：
+#   ① 用别人给的后端 → 贴配对串（`echo://pair?host=…&code=…`）→ 当场配对（POST /api/capability/pair）；
+#   ② 本机跑 → 把交付目录里的后端包解开到 `<安装根>\backend`：**有离线包就直接复制启用
+#      （零下载）**，只有薄包就把它放好，然后**触发下载**（POST /api/capability/backend/start，
+#      它会在后台按国内源装运行时，面板「能力」里看得见进度）；
+#   ③ 先不配 → 以后在面板里弄。
+#
+# 三条纪律（都有代价，别改成"看着更省事"的写法）：
+#   1. **这一步永远不让安装失败**：后端是"会议转写往哪走"的可选项，装客户端本身是好的 ——
+#      报错要响亮，但退出码照旧由组件那一步决定（`Show-Result` 里如实写一行）。
+#   2. **不静默改用户的配对**：本机跑这条路只**准备文件**，起后端/配对交给 `backend/start`
+#      那个入口（它自己会判断"已配对到别的后端 → 不覆盖"）。配对串那条路是用户当场给的，
+#      属于明确意图，可以直接配。
+#   3. **不做第二份"找包/认包"实现**：搜落点、认内容、离线包优先这几条判据都在
+#      `app/backend_fetch.py` 里（含用例）。这里只做"用户指的那几个 zip 就在这个目录里"。
+
+function ConvertFrom-EchoPairString {
+    # 与面板同一个解析器（`web/app.js::parsePairString`）：`echo://pair?host=…&code=…&fp=…`。
+    # 认三个键（host|url、code、fp|fingerprint），`+` 当空格（form 编码那一套），未知键忽略。
+    # 没带 scheme 时**把整串当地址**（有人只贴 `http://10.100.0.24:8900`）。
+    param([string]$Text)
+    $out = @{ Url = ''; Code = ''; Fp = '' }
+    $t = ('{0}' -f $Text).Trim()
+    if (-not $t) { return $out }
+    $m = [regex]::Match($t, '^echo://pair\b[^?]*\?(.*)$', 'IgnoreCase')
+    if (-not $m.Success) { $out.Url = $t; return $out }
+    foreach ($kv in $m.Groups[1].Value.Split('&')) {
+        $i = $kv.IndexOf('=')
+        if ($i -lt 0) { continue }
+        $k = [System.Uri]::UnescapeDataString($kv.Substring(0, $i)).Trim().ToLower()
+        $v = [System.Uri]::UnescapeDataString($kv.Substring($i + 1).Replace('+', ' ')).Trim()
+        switch ($k) {
+            'host'        { $out.Url = $v }
+            'url'         { $out.Url = $v }
+            'code'        { $out.Code = $v }
+            'fp'          { $out.Fp = $v }
+            'fingerprint' { $out.Fp = $v }
+        }
+    }
+    return $out
+}
+
+function Find-BackendZip {
+    # 在**用户指的那个目录**（交付目录）里找一个后端包。名字只用来粗筛，**内容判据在 Python 侧**；
+    # 但"名字一个都对不上"时不该静默跳过，所以这里也认那几种人工改名（汇总目录里那份被改成了
+    # `3-本机GPU后端包-20MB.zip`）。
+    param([string]$Dir, [string[]]$Patterns)
+    if (-not $Dir -or -not (Test-Path -LiteralPath $Dir)) { return '' }
+    foreach ($p in $Patterns) {
+        $hit = Get-ChildItem -LiteralPath $Dir -Filter $p -File -ErrorAction SilentlyContinue |
+               Sort-Object Name | Select-Object -First 1
+        if ($hit) { return $hit.FullName }
+    }
+    return ''
+}
+
+function Expand-BackendPackage {
+    # 把后端包解开到 `<安装根>\backend`。**只搬白名单里的顶层项**，与
+    # `app/backend_fetch.py::PACKAGE_DIR_ITEMS` 同一条口径 —— 那个目录里同时住着
+    # `server.yaml`（我们生成的配置）、`state/`（鉴权库与本机配对文件）、`logs/`：
+    # 整包倒进去迟早拿包里的模板覆盖掉用户的配置。
+    # 解压走系统自带 `tar`（与 install.ps1 同一条路：受限语言模式下 Add-Type 会被拦）。
+    param([string]$Zip, [string]$Backend)
+    $tmp = Join-Path $Backend ('tmp\pkg-' + (Get-Date -Format 'HHmmss') + '-' + (Get-Random -Maximum 9999))
+    New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+    try {
+        $r = Invoke-Native 'tar' @('-xf', $Zip, '-C', $tmp)
+        if ($r.code -ne 0) { return (($false), ("解不开（tar 退出码 {0}）：{1}" -f $r.code, $r.out)) }
+        # 载荷根 = zip 里那层顶层目录（认 `<名>\server\requirements.txt`）；没有就用 tmp 本身
+        $payload = ''
+        if (Test-Path (Join-Path $tmp 'server\requirements.txt')) { $payload = $tmp }
+        else {
+            foreach ($sub in @(Get-ChildItem -LiteralPath $tmp -Directory -ErrorAction SilentlyContinue)) {
+                if (Test-Path (Join-Path $sub.FullName 'server\requirements.txt')) {
+                    $payload = $sub.FullName; break
+                }
+            }
+        }
+        if (-not $payload) { return (($false), '这个 zip 里没有后端包（找不到 server\requirements.txt）') }
+        foreach ($name in @('app', 'server', 'runtime', 'wheels', 'scripts', 'models')) {
+            $src = Join-Path $payload $name
+            if (-not (Test-Path -LiteralPath $src)) { continue }
+            $dst = Join-Path $Backend $name
+            New-Item -ItemType Directory -Force -Path $dst | Out-Null
+            # 用 robocopy 合并（与 build-package.ps1 同一个工具）：`Copy-Item -Recurse` 在目标
+            # 已存在时会把整个目录**套进去**（`runtime\runtime`），而这里是"合并进已有目录"。
+            # robocopy 的退出码 0~7 都算成功（1 = 有文件被复制），>=8 才是真失败。
+            $rc = Invoke-Native 'robocopy' @($src, $dst, '/E', '/NFL', '/NDL', '/NJH', '/NJS', '/NP', '/R:1', '/W:1')
+            if ($rc.code -ge 8) { return (($false), ("合并失败（robocopy 退出码 {0}）：{1}" -f $rc.code, $rc.out)) }
+        }
+        foreach ($name in @('server.yaml.tmpl', 'sources.json', 'manifest.json', 'MODELS-INCLUDED.txt')) {
+            $src = Join-Path $payload $name
+            if (Test-Path -LiteralPath $src) { Copy-Item -LiteralPath $src -Destination $Backend -Force }
+        }
+    } finally {
+        Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    return (($true), 'OK')
+}
+
+function Test-BackendRuntimeUsable {
+    # 与 `app/backend_env.check_server_deps` **同一条判据**：解释器在 **且** fastapi/uvicorn
+    # 都能 import。这是"运行时到底能不能用"的唯一口径 —— 只看 `runtime\python.exe` 在不在
+    # 会把"只装了半个运行时"报成就绪（2026-10-01 真机就是这么坑的）。
+    param([string]$Backend)
+    foreach ($rel in @('runtime\python.exe', 'runtime\Scripts\python.exe', 'runtime\bin\python3',
+                       'runtime\bin\python')) {
+        $py = Join-Path $Backend $rel
+        if (-not (Test-Path -LiteralPath $py)) { continue }
+        $r = Invoke-Native $py @('-c', 'import fastapi, uvicorn')
+        if ($r.code -eq 0) { return (($true), $py) }
+        return (($false), ("{0}（import 失败：{1}）" -f $py, $r.out))
+    }
+    return (($false), 'runtime\ 里没有解释器')
+}
+
+function Get-EchoOwnPort {
+    # 端口以**我们自己**那份为准（`Start-EchoOwnService` 已经把它写进 $env:ECHO_PORT）
+    if ($script:OwnPort) { return $script:OwnPort }
+    if ($env:ECHO_PORT) { try { return [int]$env:ECHO_PORT } catch { } }
+    return (Get-EchoPort)
+}
+
+function Start-LocalBackendNow {
+    <#
+      触发「起本机后端」并**等它就绪** —— 离线包那条分支原来只解包不启动，于是
+      "装完就转写"必然撞「没有可用的后端」（2026-10-01 真机：用户装完就转写，失败）。
+      走的是面板同一个入口（`POST /api/capability/backend/start` → 取运行时 → configure →
+      起 → 配对 → 三层自测），跑在服务端的后台任务里。
+    #>
+    param([string]$Why = '')
+    $port = Get-EchoOwnPort
+    try {
+        $null = Invoke-RestMethod -Uri ("http://127.0.0.1:{0}/api/capability/backend/start" -f $port) `
+                -Method Post -ContentType 'application/json' -Body '{}' -TimeoutSec 30
+    } catch {
+        Warn ("触发「起本机后端」没成功：{0}" -f $_.Exception.Message)
+        Info ("装完在面板点一下就行：http://127.0.0.1:{0}/ →「能力 → 起本机后端」" -f $port)
+        return $false
+    }
+    if ($Why) { Info ("已触发「起本机后端」（{0}）—— 等它就绪…" -f $Why) }
+    # 等任务结束（**最多 8 分钟**：模型加载要时间；超时就如实说"还在起"，不假装成功）
+    $deadline = (Get-Date).AddSeconds(480)
+    while ((Get-Date) -lt $deadline) {
+        Start-Sleep -Seconds 5
+        $st = $null
+        try { $st = Invoke-RestMethod -Uri ("http://127.0.0.1:{0}/api/capability/backend" -f $port) -TimeoutSec 20 } catch { continue }
+        if (-not $st.job.running) {
+            if ($st.job.ok) { Ok ("后端就绪：{0}" -f $st.job.message); return $true }
+            Warn ("后端没能就绪：{0}" -f $st.job.message)
+            Info ("看进度/重试：http://127.0.0.1:{0}/ →「能力」页签" -f $port)
+            return $false
+        }
+    }
+    Warn '后端还在装/起（超过 8 分钟）—— 面板「能力」页签能看到进度'
+    Info ("稍等一下再转写：http://127.0.0.1:{0}/" -f $port)
+    return $false
+}
+
+function Invoke-BackendStep {
+    param([string]$Dir)
+    Step '后端：会议转写用的 GPU 服务怎么来'
+    $script:BackendSummary = ''
+    $mode = $Backend
+    $interactive = $true
+    try { if ([Console]::IsInputRedirected) { $interactive = $false } } catch { $interactive = $false }
+    if ($SkipStart) {
+        Warn '-SkipStart：没起服务，这一步跳过（起来之后在面板「能力 → 起本机后端」里选）'
+        $mode = 'skip'
+    }
+    if ($mode -eq 'ask' -and -not $interactive) {
+        # 脚本化/CI：没人能贴配对串，**静默改用户的配对才是真错**（模块头第 2 条纪律）
+        Info '控制台不是交互的 → 这一步跳过（要它就用 -Backend pair|local 明确给值）'
+        $mode = 'skip'
+    }
+    if ($mode -eq 'ask') {
+        Write-Host ''
+        Write-Host '    会议转写要一台 GPU 机器。这台机器怎么用后端？' -ForegroundColor White
+        Info '1) 用别人给的后端 —— 我有配对串（echo://pair?...）'
+        Info '2) 本机自己跑 —— 从交付目录解压后端包（有这个包的 zip 才选它）'
+        Info '3) 先不配 —— 以后在面板「能力」里弄'
+        $ans = ''
+        try { $ans = Read-Host '    选 1 / 2 / 3（回车 = 3）' } catch { }
+        switch (('{0}' -f $ans).Trim()) {
+            '1' { $mode = 'pair' }
+            '2' { $mode = 'local' }
+            default { $mode = 'skip' }
+        }
+    }
+    if ($mode -eq 'pair' -and -not $BackendPair) {
+        try { $BackendPair = Read-Host '    贴入配对串（echo://pair?host=…&code=…）' } catch { }
+    }
+    Log 'BACKEND' ("mode={0} dir={1} pair={2}" -f $mode, $Dir,
+                   $(if ($BackendPair) { '有' } else { '无' }))
+
+    if ($mode -eq 'pair') {
+        $p = ConvertFrom-EchoPairString $BackendPair
+        if (-not $p.Url) { Warn '没读到地址（配对串里应当有 host=…）—— 这一步跳过，去面板里弄'; $mode = 'skip' }
+        elseif (-not $p.Code) { Warn '配对串里没有 code=… —— 让管理员重发一张'; $mode = 'skip' }
+        else {
+            $port = Get-EchoOwnPort
+            $body = @{ base_url = $p.Url; code = $p.Code; fingerprint = $p.Fp } | ConvertTo-Json
+            try {
+                $resp = Invoke-RestMethod -Uri ("http://127.0.0.1:{0}/api/capability/pair" -f $port) `
+                                          -Method Post -ContentType 'application/json; charset=utf-8' `
+                                          -Body ([System.Text.Encoding]::UTF8.GetBytes($body)) -TimeoutSec 60
+                Ok ("已配对：{0}" -f ($resp.message))
+                $script:BackendSummary = ("后端：已配对到 {0}" -f $p.Url)
+                # 「允许音频去哪」是 none 时，**远端后端会被自己的许可挡下**（会议侧记
+                # blocked-by-privacy，面板显示成"连不上"）。向导里也是这么办的：改成内网并说清。
+                try {
+                    $st = Invoke-RestMethod -Uri ("http://127.0.0.1:{0}/api/settings" -f $port) -TimeoutSec 20
+                    if (('{0}' -f $st.capabilityPrivacy) -eq 'none') {
+                        $put = @{ capabilityPrivacy = 'lan' } | ConvertTo-Json
+                        $null = Invoke-RestMethod -Uri ("http://127.0.0.1:{0}/api/settings" -f $port) `
+                                -Method Put -ContentType 'application/json; charset=utf-8' `
+                                -Body ([System.Text.Encoding]::UTF8.GetBytes($put)) -TimeoutSec 30
+                        Info '「允许音频去哪」原来是「不出机」，已改成「内网」—— 不然刚配的远端后端会被挡下'
+                    }
+                } catch { Info '（没读到「允许音频去哪」这一项，跳过它）' }
+            } catch {
+                $msg = $_.Exception.Message
+                try {
+                    $sr = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
+                    $txt = $sr.ReadToEnd() | ConvertFrom-Json
+                    if ($txt.detail) { $msg = $txt.detail }
+                } catch { }
+                Warn ("配对没成功：{0}" -f $msg)
+                Info '面板 →「能力」里可以重贴一次；配对串是一次性的，过期就让管理员重发'
+                $script:BackendSummary = ("后端：配对没成功（{0}）" -f $msg)
+            }
+        }
+    }
+
+    if ($mode -eq 'local') {
+        # 交付目录：显式给的 > 脚本自己那一层（松的"装我.cmd + 几个 zip"就是这个形态）
+        $dirs = @()
+        if ($Dir) { $dirs += $Dir }
+        if ($PSScriptRoot) { $dirs += (Split-Path $PSScriptRoot -Parent) }
+        $dirs += $script:KitRoot
+        $dirs = @($dirs | Where-Object { $_ } | Select-Object -Unique)
+        $thinPat = @('ECHO-backend-portable-*.zip', 'ECHO-backend-portable*.zip',
+                     '*本机GPU后端包*.zip', '*后端包*.zip')
+        $offPat = @('ECHO-backend-offline-*.zip', 'ECHO-backend-offline*.zip',
+                    '*后端离线包*.zip', '*backend-offline*.zip')
+        $off = ''
+        foreach ($d in $dirs) { $off = Find-BackendZip -Dir $d -Patterns $offPat; if ($off) { break } }
+        $thin = ''
+        foreach ($d in $dirs) { $thin = Find-BackendZip -Dir $d -Patterns $thinPat; if ($thin) { break } }
+        $backend = Join-Path $script:TargetRoot 'backend'
+        New-Item -ItemType Directory -Force -Path $backend | Out-Null
+        if ($off) {
+            Info ("离线包：{0}" -f $off)
+            $okz, $why = Expand-BackendPackage -Zip $off -Backend $backend
+            if (-not $okz) { Warn ("离线包没能启用（{0}）" -f $why) }
+            else {
+                $usable, $py = Test-BackendRuntimeUsable -Backend $backend
+                if ($usable) {
+                    Ok ("后端运行时已就位（**零下载**）：{0}" -f $py)
+                    # **解包≠能用**：还得把它起起来并等就绪 —— 否则用户装完立刻转写会撞
+                    # 「没有可用的后端」（离线包这条路原来就缺这一下）。
+                    if (Start-LocalBackendNow '离线包已启用，零下载') {
+                        $script:BackendSummary = '后端：本机跑（离线包已启用，已起来并就绪）'
+                    } else {
+                        $script:BackendSummary = '后端：本机跑（离线包已启用，起来时没就绪 —— 面板看进度）'
+                    }
+                } else {
+                    Warn ("离线包解开了，但运行时还不能用：{0}" -f $py)
+                    # 运行时不可用有两类：包里缺东西 / 本机还差点依赖。**都让它自己补**：
+                    # 服务端那一步会先试本机离线包、再按国内源补（`ensure_runtime`）。
+                    if (Start-LocalBackendNow '离线包已解开，缺的由服务端补齐') {
+                        $script:BackendSummary = '后端：本机跑（离线包 + 服务端补齐后已就绪）'
+                    } else {
+                        $script:BackendSummary = '后端：本机跑（离线包解开了，依赖还要补一次）'
+                    }
+                }
+            }
+        } elseif ($thin) {
+            Info ("薄包：{0}" -f $thin)
+            $okz, $why = Expand-BackendPackage -Zip $thin -Backend $backend
+            if (-not $okz) { Warn ("薄包没能解开（{0}）" -f $why) }
+            else {
+                Ok '薄包已就位（自带解释器；依赖还没装）'
+                # **触发下载**：这一下就是"没有离线包时才下载"（同一个入口，见 `Start-LocalBackendNow`）。
+                if (Start-LocalBackendNow "薄包已就位，缺的运行时按国内源装（约 3 GB）") {
+                    $script:BackendSummary = '后端：本机跑（已按国内源装好并起来）'
+                } else {
+                    $script:BackendSummary = '后端：本机跑（薄包已就位，运行时要面板点一下才装完）'
+                }
+            }
+        } else {
+            Warn ("交付目录里没有后端包（找过：{0}）" -f ($dirs -join '、'))
+            Info '要给这台机器跑后端，把 `ECHO-backend-portable-*.zip`（薄包）或'
+            Info '`ECHO-backend-offline-*.zip`（离线包，零下载）放在装我.cmd 旁边再跑一次'
+            Info '（或者以后在面板「能力 → 起本机后端」里点，它会自己在本机找/按设置里的地址下）'
+            $script:BackendSummary = '后端：没配（交付目录里没有后端包）'
+        }
+    }
+
+    if ($mode -eq 'skip') {
+        Info '后端这一步跳过 —— 以后随时可以在面板「能力」页签里配'
+        if (-not $script:BackendSummary) { $script:BackendSummary = '后端：没配（面板里随时可配）' }
+    }
+    EndStep '后端'
+}
+
 # ---------------------------------------------------------------- 入口
 Write-Host ''
 Write-Host '  ============================================' -ForegroundColor Cyan
@@ -641,8 +955,8 @@ if (-not $Agent) { $Agent = if ($Offline) { 'none' } else { 'harness' } }
 if ($Engines.Count -eq 0) { $Engines = @('sherpa') }
 $engineList = @($Engines | Where-Object { $_ } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
 $wantWake = (($Profile -eq 'main') -or $Wake) -and -not $NoWake
-# 步号只为让人看得懂进度：离线那条路多三步（运行时/核心依赖/模型）
-$script:TotalSteps = if ($Offline) { 8 } else { 5 }
+# 步号只为让人看得懂进度：离线那条路多三步（运行时/核心依赖/模型），后端那一步两边都有
+$script:TotalSteps = if ($Offline) { 9 } else { 6 }
 
 Resolve-KitLayout
 
@@ -694,6 +1008,11 @@ if ($Offline) {
 }
 
 $compExit = Invoke-ComponentsScript -EngineList $engineList -WantWake $wantWake
+# 「后端怎么来」排在组件之后、收尾之前：此刻服务已经起来了（`$env:ECHO_PORT` 钉死），
+# 配对与「起本机后端」都能立刻生效；结果再由 `Show-Result` 一起打进摘要。
+# ⚠️ 这一步**不许改退出码**：后端是可选项，装客户端本身是好的（`Invoke-BackendStep` 里
+# 只 Warn/Info + 写 `$script:BackendSummary`）。
+Invoke-BackendStep -Dir $BackendDir
 Show-Result -ComponentsExit $compExit
 if ($compExit -ne 0) { exit $compExit }
 exit 0

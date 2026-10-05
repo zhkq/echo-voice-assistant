@@ -380,6 +380,19 @@ DEFAULTS = {
     # 2026-09-12 实测 DSH Desktop 2.0.9 里插件（ESM 动态 import）取不到 electron 的
     # app/BrowserWindow/screen（只有 net/systemPreferences），插件侧的 globalShortcut
     # 不可用，因此把"打开仪表盘"的热键落在 ECHO 进程里。
+    # 会议热键（2026-10-02 用户要求：开始/结束录制各给一个键）。
+    # **默认空 = 不注册**：两边实现都会跳过空组合键（win32 的 `if not parsed: continue`、
+    # posix 的 `if not hk: continue`），所以出厂不会凭空占用户的键位。
+    "meetingStartHotkey": dict(value="", grp="meeting", label="开始录制热键",
+                               description="全局热键开始会议录音（留空 = 不注册）", value_type="str"),
+    "meetingStopHotkey":  dict(value="", grp="meeting", label="结束录制热键",
+                               description="全局热键结束会议录音（留空 = 不注册）", value_type="str"),
+    # 仪表盘上要不要显示「模型路由」（2026-10-02 用户要求，**默认关**）。
+    # 关着时仪表盘「运行情况」里的路由那一行与路由统计块都不显示 —— 路由只有
+    # Agent = 标准版 harness 时才真正参与工作（见 web/app.js 的 applyRouterVisibility）。
+    "dashboardShowRouter": dict(value=False, grp="panel", label="仪表盘显示模型路由",
+                                description="在仪表盘「运行情况」里显示模型路由那一行与统计块",
+                                value_type="bool"),
     "panelHotkey":     dict(value="Ctrl+Shift+E", grp="panel", label="仪表盘热键",
                             description="全局热键切换 ECHO 仪表盘（由 ECHO 服务进程注册）", value_type="str"),
     "panelOpenMode":   dict(value="sidebar", grp="panel", label="仪表盘打开方式",
@@ -701,11 +714,16 @@ DEFAULTS = {
     # ---------- 能力 provider（P5 / D25：ASR / LLM / TTS 各选一个）----------
     # 留空 = 用该 kind 的默认实现（本地转写引擎 / ECHO AUTO 多上游路由 / 本平台离线朗读）。
     # 可选项是**运行时**注册出来的（见 GET /api/providers），所以这里不写死 options。
-    "providerAsr": dict(value="", grp="provider", label="转写 provider", hidden=True,
+        # 2026-10-02（IA 重构）：provider 这一族**从 hidden 放出来** —— 用户的口径是
+    # "AI组件那边的各项内容都是能力选择上的配置（用在线还是本机）"，所以这些键现在由
+    # 「设置 → AI组件 → 高级 → 在线服务」承载，必须经 /api/settings 下发才渲染得出来。
+    # 旧口径（同日早先）是"隐藏 + 由能力页签的卡片承载"，那张卡已经改成只读状态显示了。
+    # `providerTts` 例外：它与 ttsEngine 重复，**保持 hidden + deprecated**。
+    "providerAsr": dict(value="", grp="provider", label="转写 provider", hidden=False,
                         description="留空 = 默认的本地转写引擎。在下方「能力 provider」卡片里选，"
                                     "或在这里填 provider id（见 GET /api/providers）",
                         value_type="str"),
-    "providerLlm": dict(value="", grp="provider", label="语言模型 provider", hidden=True,
+    "providerLlm": dict(value="", grp="provider", label="语言模型 provider", hidden=False,
                         description="留空 = ECHO AUTO（多上游派发路由）。配了它，纪要不依赖 agent 也能生成；"
                                     "在下方「能力 provider」卡片里选",
                         value_type="str"),
@@ -720,27 +738,27 @@ DEFAULTS = {
     # 这三项就是"配一个在线 LLM"的全部输入；配好把 providerLlm 指向 openai-llm 即生效。
     # 内网网关地址**不写进仓库**（属单位内部信息，见 REFACTOR-PLAN §13.4）：
     # 面板给"内网网关"预设时留空 base_url，让用户自己填。
-    "providerLlmBaseUrl": dict(value="", grp="provider", label="在线 LLM 地址", hidden=True,
+    "providerLlmBaseUrl": dict(value="", grp="provider", label="在线 LLM 地址", hidden=False,
                                description="OpenAI 兼容端点的根地址，例如 https://api.deepseek.com/v1"
                                            "（内网网关填单位自己的地址；留空 = 不用在线 LLM）。"
                                            "可用下方「能力 provider」卡片的预设一键填入",
                                value_type="str"),
-    "providerLlmApiKey": dict(value="", grp="provider", label="在线 LLM 密钥", hidden=True,
+    "providerLlmApiKey": dict(value="", grp="provider", label="在线 LLM 密钥", hidden=False,
                               description="只保存在本机数据库；接口（含面板）永不回显。"
                                           "留空 = 不改；要清空请点「清除」。数据去向见「在线 LLM 地址」",
                               value_type="str", secret=True),
-    "providerLlmModel": dict(value="", grp="provider", label="在线 LLM 模型名", hidden=True,
+    "providerLlmModel": dict(value="", grp="provider", label="在线 LLM 模型名", hidden=False,
                              description="留空 = 用服务端默认（如 deepseek-chat / gpt-4o-mini）",
                              value_type="str"),
-    "providerAsrBaseUrl": dict(value="", grp="provider", label="在线转写地址", hidden=True,
+    "providerAsrBaseUrl": dict(value="", grp="provider", label="在线转写地址", hidden=False,
                                description="OpenAI 兼容的 /audio/transcriptions 根地址"
                                            "（例如 https://api.openai.com/v1）；留空 = 不用在线转写",
                                value_type="str"),
-    "providerAsrApiKey": dict(value="", grp="provider", label="在线转写密钥", hidden=True,
+    "providerAsrApiKey": dict(value="", grp="provider", label="在线转写密钥", hidden=False,
                               description="只保存在本机数据库；接口永不回显。留空 = 不改；要清空请点「清除」。"
                                           "注意：会议音频会整段上传到该服务",
                               value_type="str", secret=True),
-    "providerAsrModel": dict(value="", grp="provider", label="在线转写模型名", hidden=True,
+    "providerAsrModel": dict(value="", grp="provider", label="在线转写模型名", hidden=False,
                              description="留空 = whisper-1（OpenAI 兼容服务的默认转写模型）",
                              value_type="str"),
     # ---------- 能力路由（3.0）：每个槽用哪个后端 ----------
@@ -810,6 +828,18 @@ DEFAULTS = {
                     "留空 = 按约定：新布局 `{ECHO_BASE}/backend`，老式扁平安装 `{DATA}/backend`。"
                     "换盘/换目录就填这里 —— 与 `modelsDir` / `meetingsDir` 同一类："
                     "**这是客户端挑的位置**，不是后端的设置。",
+        value_type="str"),
+    "capabilityBackendListen": dict(
+        value="127.0.0.1", grp="capability", label="本机后端监听在哪个地址", hidden=True,
+        description="「起本机后端」生成 `server.yaml` 时写进 `listen:` 的**地址部分**"
+                    "（端口仍是出厂那个，不受这一项影响）。留 `127.0.0.1` = 只有这台机器"
+                    "自己能用（默认、最安全）；填 `0.0.0.0` = **局域网里任何机器都能连到"
+                    "8900** —— 同事要用你这台 GPU 时选它。填 0.0.0.0 时务必保持"
+                    "`auth.enabled` 打开（出厂就是开的），并且只在管理面给同事发"
+                    "**配对码**：谁拿到码谁就能用你的显卡。管理面（8901）**始终只绑回环**，"
+                    "不受这一项影响；配对串里写给同事的那个地址在管理面"
+                    "「客户端 / 发授权」页签里设（存在后端自己的 state 里，不由这里生成）。"
+                    "2026-10-05 用户要求「把开启局域网访问变成配置」。",
         value_type="str"),
     "capabilityBackendPackage": dict(
         value="", grp="capability", label="后端的薄包在哪（路径或下载地址）", hidden=True,

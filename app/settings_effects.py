@@ -42,6 +42,29 @@ def _wake_device_keys() -> set:
         return {"inputDeviceId", "commandInputDeviceId"}
 
 
+#: 改这些键要**重挂**全局热键监听（组合键在监听器启动时注册一次）。
+_HOTKEY_KEYS = frozenset((
+    "panelHotkey", "wakeHotkey", "fallbackHotkey",
+    "meetingStartHotkey", "meetingStopHotkey",
+))
+
+
+def _hotkey() -> dict:
+    """全局热键跟着设置重挂（停掉再按新组合键注册）。
+
+    与 `_wake()` 同一套写法：失败只回报、不抛（PUT 的成功与否由设置本身决定）。
+    """
+    try:
+        from app import runtime
+        runtime.stop_hotkey()
+        ok, msg = runtime.start_hotkey()
+        return {"scope": "hotkey", "ok": bool(ok),
+                "detail": "已按新设置重挂热键监听：%s" % msg}
+    except Exception as exc:
+        return {"scope": "hotkey", "ok": False,
+                "detail": "%s: %s" % (type(exc).__name__, exc)}
+
+
 def apply(updated, *, harness_timeout=None) -> list:
     """按"哪些键变了"做联动。
 
@@ -56,6 +79,12 @@ def apply(updated, *, harness_timeout=None) -> list:
     # 表现成"设置改了没用"。（_wake() 自己判断 wakeEnabled，没开就不动。）
     if any(k.startswith("wake") for k in keys) or any(k in _wake_device_keys() for k in keys):
         out.append(_wake())
+
+    # 全局热键：组合键是**监听器启动时读一次**注册的，改完不重挂就还是老的 ——
+    # 表现是"设置里改了热键，按下去没反应"（2026-10-02 补；以前只有 wake* 那条，
+    # 且它只看 wakeEnabled，所以「仪表盘热键」与新的「会议热键」都得重启 ECHO 才生效）。
+    if any(k in _HOTKEY_KEYS for k in keys):
+        out.append(_hotkey())
 
     if any(k.startswith("router") for k in keys):
         out.append(_router(updated))

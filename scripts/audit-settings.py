@@ -64,7 +64,10 @@ WRITE_PATTERNS = (
 # 它既不出现在 app/ 里，也不是"写进去没人读"。把它们混进 PANEL-ONLY 会把真问题淹掉。
 PANEL_READ_PATTERNS = (
     r'settingByKey\s*\(\s*["\']%s["\']',
-    r'settingsValue\s*\(\s*["\']%s["\']',
+    # 面板里的读法有两代名字：settingValue（现在用的）与 settingsValue（旧写法）——
+    # 2026-10-02 之前只写了后者（多一个 s），于是任何**只**用 settingValue 读的键
+    # 都被判成 PANEL-ONLY「写进去没人读」（dashboardShowRouter 就这么被误判的）。
+    r'setting[s]?Value\s*\(\s*["\']%s["\']',
     r'settingFrom\s*\([^)]*["\']%s["\']',
     r'key\s*===\s*["\']%s["\']',
 )
@@ -72,6 +75,11 @@ PANEL_READ_PATTERNS = (
 #: `--check` 的人工确认名单 —— 名字必须在这里出现，否则算未确认（新增项会被拦下）。
 #: 每条都写"谁在读它"，因为正是"看不出谁在读"才需要这份名单。
 ACK_INDIRECT = {
+    # 会议热键（2026-10-02）：两个平台各有一份注册清单，实现里是
+    # `for key in (...): combo = self.settings_get(key, "")` —— 读的是**循环变量**，
+    # 静态扫描只看得见清单里的字面量。派发在 app/runtime.py::_hotkey_cb。
+    "meetingStartHotkey": "app/platform/win32/hotkey.py 与 app/platform/_posix_hotkey.py 的注册清单里按循环变量读；app/runtime.py::meeting_hotkey() 落实开始录音",
+    "meetingStopHotkey": "同上（同一份清单）；app/runtime.py::meeting_hotkey() 落实结束录音",
     # 智能体注册表：类属性 config_key 决定启用开关，`is_enabled` 用变量读（不是字面量）
     "agentCodebuddyEnabled": "app/agents/__init__.py:111 is_enabled() 按类的 config_key 读",
     # provider 选择：providers 层用 `"provider%s" % kind.capitalize()` 拼键名读
@@ -125,6 +133,9 @@ ACK_INDIRECT = {
 #: 唯一消费方是面板 UI 的项（面板读它来改变自己的行为，app/ 不需要读）。
 ACK_PANEL = {
     "panelAutoRefresh": "web/app.js 的 _panelRefreshSeconds()：仪表盘/启动页/路由页的轮询间隔",
+    # 2026-10-02：仪表盘要不要显示「模型路由」。只在面板里读
+    # （web/app.js:applyDashboardRouterVisibility / refreshRunStatus），后端不看它。
+    "dashboardShowRouter": "web/app.js:applyDashboardRouterVisibility() 决定仪表盘「运行情况」里路由那一行与统计块的显隐",
     # 会议能力通道那 3 项（2026-09-26）：面板按**键名**给后端取值出中文名
     # （`friendlyOption()` 的 `key === "capability…Backend"` 那两支）。
     # 它们**同时**被 app/ 间接读 —— `app/capabilities/router.py:_setting_key_for()`

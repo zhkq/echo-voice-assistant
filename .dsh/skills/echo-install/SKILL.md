@@ -210,6 +210,35 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "$skill\scripts\echo-install
 > 用**显式路径**（如上），别用 `$PSScriptRoot`：那条命令是在**你自己的终端**里执行的，
 > 内联运行时 `$PSScriptRoot` 是空的，会拼出 `\scripts\...` 这种不存在的路径。
 
+### Windows ③ 后端（会议转写那台 GPU 机器）怎么来 —— **必须问用户，别替他决定**
+
+装完客户端不等于会议能转写：转写默认走**能力后端**。装的时候（或装完）要问一句，
+三个答案对应三种做法（2026-10-01 起 `install-all.ps1` 自己会问；**交互式控制台**里它会问，
+脚本化跑要显式给参数）：
+
+```powershell
+# ① 用别人给的后端：贴配对串（管理员发的 echo://pair?host=…&code=…）
+powershell -NoProfile -ExecutionPolicy Bypass -File "$kit\echo-core\scripts\install-all.ps1" `
+    -Yes -Backend pair -BackendPair 'echo://pair?host=10.100.0.24:8900&code=XXXX'
+
+# ② 本机自己跑（这台有 NVIDIA 卡）：把后端包放在 -BackendDir 指的目录里
+#    —— 有 ECHO-backend-offline-*.zip（离线包）就**零下载**，只有薄包才会联网装依赖
+powershell -NoProfile -ExecutionPolicy Bypass -File "$kit\echo-core\scripts\install-all.ps1" `
+    -Yes -Backend local -BackendDir 'D:\交付目录'
+
+# ③ 先不配（以后在面板「能力」页签里弄）
+... -Yes -Backend skip
+```
+
+* **别替用户选**：后端决定"会议音频去哪"，是隐私档（`capabilityPrivacy`）的邻居问题 ——
+  见「隐私」那一段。选①时脚本会顺带把 `none` 改成 `lan` 并说明，因为远端后端会被 `none` 挡下。
+* **配对串是一次性的**：它换来的凭据落在 `{DATA}\backend.json`（配对**不写设置**）。
+  过期/用过了就让管理员重发一张，别自己拼一个。
+* **本机跑要判"运行时能不能用"，不是"`runtime\python.exe` 在不在"**：薄包只带解释器，
+  依赖要靠"取运行时"那一步装。判据是 `import fastapi, uvicorn` 过（`app/backend_env.check_server_deps`）。
+* **RTX 50 系（Blackwell，算力 12.0）要 cu128**（cu126 没有 sm_120 的 kernel：装得上、
+  起得来、一跑模型就 CUDA 报错）。`app/backend_env.variant_for()` 已经按算力分档，别手改档位。
+
 ### macOS ① 建环境 + 启动
 
 ```bash
