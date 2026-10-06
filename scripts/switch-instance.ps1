@@ -250,11 +250,47 @@ if (-not $DryRun) {
 }
 
 # 2) stop the others (fast path; the supervisor would only warn by default)
+#
+#    IMPORTANT (2026-10-06): stop the OTHER tree's **local capability backend** too,
+#    BEFORE stopping its ECHO. Ports 8900/8901 are shared by both trees and only one
+#    backend runs at a time - if we leave the old tree's backend holding them, the new
+#    tree comes up against a backend that does not recognise its client and every
+#    transcription fails with `unauthorized` (the panel said "starting" / "PENDING",
+#    which sent people looking for a startup problem that did not exist).
+#    We use the owning tree's own API while it is still up; anything it cannot stop is
+#    left for the target's `backend/take-over` (which kills by config-path ownership).
+function Stop-BackendViaApi([string]$root, [switch]$Dry) {
+    if ($Dry) { return $false }
+    $p = Get-EchoPortFromFile $root
+    if (-not ($p -gt 0)) { return $false }
+    if (-not (Test-EchoPortListening $p)) { return $false }
+    try {
+        $r = Invoke-RestMethod -Uri "http://127.0.0.1:$p/api/capability/backend/stop" `
+             -Method Post -ContentType 'application/json' -Body '{}' -TimeoutSec 60
+        if ($r -and $r.ok) {
+            for ($i = 0; $i -lt 20; $i++) {
+                Start-Sleep -Milliseconds 500
+                if (-not (Test-NetConnection -ComputerName 127.0.0.1 -Port 8900 `
+                        -InformationLevel Quiet -WarningAction SilentlyContinue)) { break }
+            }
+            return $true
+        }
+    } catch { }
+    return $false
+}
+
 foreach ($n in $names) {
     if ($n -eq $target) { continue }
     Say "  stop $n"
+    $otherRoot = Get-EchoInstanceRoot $cfg $n
+    if (Stop-BackendViaApi $otherRoot -Dry:$DryRun) {
+        Ok "  stopped $n's local backend (ports 8900/8901 released)"
+    } elseif (-not $DryRun) {
+        Say "  ($n's backend was not running, or could not be stopped via its API;"
+        Say "   the target will take it over by config-path ownership)"
+    }
     $stopLog = { param($m) Say $m }
-    if (-not (Stop-EchoInstance -Root (Get-EchoInstanceRoot $cfg $n) -Name $n `
+    if (-not (Stop-EchoInstance -Root $otherRoot -Name $n `
                 -SkipMeetingCheck:$Force -DryRun:$DryRun -Log $stopLog)) {
         Fail 'aborted (use -Force to override, or stop the meeting first)'
         exit 1
@@ -295,6 +331,34 @@ if ($tprocs.Count -gt 0 -and (Test-EchoPortListening $port)) {
                             -DryRun:$DryRun -Log $startLog
     if ($p -eq 0) { exit 1 }
     if ($p -gt 0) { $port = $p }
+}
+
+Say ''
+# 4) make the local backend follow the switch (2026-10-06).
+#    The target tree must run its OWN backend: the client credential lives in
+#    <data>/backend.json and each backend has its own client database, so a backend
+#    from the other tree answers `unauthorized` even though the port is reachable.
+#    `take-over` stops whatever foreign backend still holds 8900/8901 (ownership is
+#    decided by the process command line's `--config <root>`, never by guesswork),
+#    starts this tree's own, and REUSES the existing pairing - no re-pairing needed.
+$invoked = $false
+if (-not $DryRun -and $port -gt 0) {
+    for ($i = 0; $i -lt 30; $i++) {
+        try {
+            $r = Invoke-RestMethod -Uri "http://127.0.0.1:$port/api/capability/backend/take-over" `
+                 -Method Post -ContentType 'application/json' -Body '{}' -TimeoutSec 120
+            if ($r) { Ok "backend follow-up: $($r.message)"; $invoked = $true }
+            break
+        } catch {
+            Start-Sleep -Seconds 2
+        }
+    }
+    if (-not $invoked) {
+        Warn2 "could not reach $target's panel to sync the backend - open the panel"
+        Warn2 "and press the backend tile (it takes over automatically)."
+    }
+} elseif ($DryRun) {
+    Say "  [dry] would call $target's /api/capability/backend/take-over"
 }
 
 Say ''

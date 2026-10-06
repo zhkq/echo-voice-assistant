@@ -208,25 +208,96 @@ def _is_loopback(url) -> bool:
         return False
 
 
+def usability() -> Dict[str, Any]:
+    """**配对的那台后端能不能用我**（`ready` / `code` / 一句话原因）。
+
+    为什么要有这个（2026-10-06）：面板原来只回答"那个进程是不是我起的"。于是
+    "8900 上跑着另一棵树的后端"这种情况被判成「待启动」，而真相是
+    **配对还在、地址也通、只是那台后端不认这个客户端**（`code=unauthorized`）。
+    用户看到"待启动"，就去查"为什么没起来"，而该做的是**把后端换成自己的**。
+
+    判据复用能力路由那一份（`app.capabilities.router`）——**不另起一套探测**：
+    它已经知道"配对到哪台、那台认不认我、为什么不认"，而且它正是转写真正走的那条路。
+    读不到就返回空 code（面板不会因此报错，只是说不出原因）。
+    """
+    try:
+        from app.capabilities.router import build_default_router, Need
+        r = build_default_router()
+        plan = r.plan(Need(slots=("asr.text",), purpose="meeting"))
+        pick = plan.picks.get("asr.text")
+        # 先看它有没有被 skip 掉：`skipped` 里那条的 `reason` 就是机器可读的 code
+        # （`unauthorized` / `blocked` / `forbidden` / `offline`），`detail` 是人话。
+        for s in plan.skipped:
+            if s.slot == "asr.text" and getattr(s, "backend_id", "") == "echo-server":
+                return {"backendId": "echo-server", "ready": False,
+                        "code": str(getattr(s, "reason", "") or ""),
+                        "note": str(getattr(s, "detail", "") or "")}
+        if pick is not None:
+            return {"backendId": pick.backend_id, "ready": True, "code": "",
+                    "note": pick.reason}
+        return {"backendId": "", "ready": False, "code": "",
+                "note": "没有任何后端能提供 asr.text"}
+    except Exception as e:                                        # pragma: no cover - 兜底
+        return {"backendId": "", "ready": False, "code": "",
+                "note": "读不出可用性：%s: %s" % (type(e).__name__, e)}
+
+
+#: `usability()["code"]` → 给用户看的处置建议。
+#: 这张表是"说错原因就会把人引错方向"的防呆：`unauthorized` **不是**"连不上"，
+#: 而是"那台后端不认这个客户端"（换树没换后端时的典型症状）。
+_USABILITY_ADVICE = {
+    "unauthorized": "那台后端不认本机的客户端凭据（换树时最常见：8900 上跑的是另一棵树的后端）。"
+                    "点「接管后端」换成本棵树自己的即可 —— 凭据不用重新配对。",
+    "blocked": "被「允许音频去哪」的许可挡住了（不是连不上）：去设置里把许可放宽，或改用本机后端。",
+    "forbidden": "那台后端按 scopes 拒了这一档：在它的管理面把这个客户端的 scopes 补全。",
+    "offline": "连不上那台后端（它没在跑，或地址不对）。",
+}
+
+
+def usability_note(info: Dict[str, Any]) -> str:
+    """把 `usability()` 翻成一句可直接显示的话。"""
+    if info.get("ready"):
+        return ""
+    code = str(info.get("code") or "")
+    advice = _USABILITY_ADVICE.get(code)
+    if advice:
+        return advice
+    note = str(info.get("note") or "").strip()
+    if note:
+        return note
+    return ""
+
+
 def view() -> Dict[str, Any]:
     """面板要的全部状态。**一次算完**（面板不用自己拼，也不许自己猜）。"""
     port, admin_port = ports()
     runtime = backend_proc.python_exe()
     config_path = backend_setup.config_path()
-    alive, note = backend_pid.is_ours_alive()
-    pid = int(backend_pid.read_pid() or 0) if alive else 0
     #: 端口占用**只查一次**（每次 netstat 约 0.15 s/端口，面板会反复问这个接口），
     #: 然后把结果同时交给"能不能起"的判据与面板显示 —— 一处查、一处判。
+    #:
+    #: `with_root=True`：**顺带问出"这个后端属于哪棵树"**（2026-10-06）。多花 1~2 ms，
+    #: 但它把"待启动"这句误导性的话换成了可操作的答案 ——
+    #: "8900 上是另一棵树的后端，点接管"。
     owners = []
     for p in (port, admin_port):
         try:
-            owners.append(backend_proc.port_owner(p))
+            owners.append(backend_proc.port_owner(p, with_root=True))
         except Exception:                                         # pragma: no cover - 兜底
             owners.append({"port": int(p), "pid": 0, "label": ""})
+    #: 占着端口的**另一棵树的后端**（本棵树没有它的 pid 记录，但命令行证明它是 ECHO 后端）。
+    #: 面板据此给「接管」入口；`port_check` 也会把它与"不明进程"分开报。
+    foreign = next((o for o in owners if o.get("foreign")), None)
+    # ⚠️ **顺序要紧**（2026-10-06）：`port_check` 会**认领**"本棵树的后端在跑、只是 pid 记录
+    # 不在"那种情形（ECHO 重启过就是这样，见 `port_check` 的说明），而认领 = 把 pid 写进
+    # 归属记录。所以归属必须**在它之后**读 —— 反过来的话第一次刷新仍会说「待启动」，
+    # 用户得刷两次才自愈，而那句"待启动"正是他报上来的问题。
     try:
         ports_ok, ports_detail = backend_proc.port_check((port, admin_port), owners=owners)
     except Exception as e:                                        # pragma: no cover - 兜底
         ports_ok, ports_detail = True, "端口状态读不出来：%s" % e
+    alive, note = backend_pid.is_ours_alive()
+    pid = int(backend_pid.read_pid() or 0) if alive else 0
     try:
         local = pairing.local_pair_state()
     except Exception:                                             # pragma: no cover - 兜底
@@ -239,12 +310,24 @@ def view() -> Dict[str, Any]:
                   "pairedAt": 0.0, "tokenFresh": False}
     config_exists = os.path.isfile(config_path)
     can, why = _can_start(runtime, alive, ports_ok, ports_detail)
+    use = usability()
+    use_note = usability_note(use)
+    all_notes = notes(runtime=runtime, config_exists=config_exists, alive=alive,
+                      local=local, paired=paired)
+    if use_note:
+        all_notes.append(use_note)
+    if foreign:
+        all_notes.append(
+            "端口上跑的是**另一棵树**的后端（%s）—— 点「接管后端」会停掉它并起本棵树"
+            "自己的；凭据是同一份，**不需要重新配对**。" % foreign.get("root"))
     return {
         "root": backend_setup.backend_root(),
         "port": int(port), "adminPort": int(admin_port),
         "baseUrl": backend_setup.loopback_base_url(port),
         #: 面板「后端」小卡上的 ↗ 入口（2026-10-05 用户要求）。管理面**只绑回环**是设计
         #: （见 server/admin.py 开头的三条），所以如实写 127.0.0.1；端口取"一处权威"。
+        #: ⚠️ 端口被**另一棵树**占着时，这个地址通向的是**别人的**管理面（凭据同源所以能登录）
+        #: —— 面板要据此提示，别让"能登录"变成"后端没问题"的错觉。
         "adminUrl": "http://127.0.0.1:%d/admin/" % int(admin_port),
         "runtime": {"ready": bool(runtime), "path": runtime},
         "config": {"path": config_path, "exists": config_exists},
@@ -254,13 +337,20 @@ def view() -> Dict[str, Any]:
         "ports": owners,
         "portsOk": bool(ports_ok),
         "portsDetail": ports_detail,
+        #: 占着端口的是**另一棵树的后端**（面板据此给「接管」按钮）。
+        "foreign": foreign or {},
+        "foreignBackend": bool(foreign),
+        #: **配对的那台能不能用我** —— 这才是"转写到底行不行"的判据；
+        #: `running` 只说明"有个进程在跑"（可能是别人的）。
+        "usable": use,
+        "usableNote": use_note,
+        "canTakeOver": bool(foreign),
         "pairFile": local,
         "paired": paired,
         "stopWithClient": stop_with_client(),
         "canStart": bool(can),
         "whyNot": why,
-        "notes": notes(runtime=runtime, config_exists=config_exists, alive=alive,
-                       local=local, paired=paired),
+        "notes": all_notes,
         "ready": last_ready(),
         "job": job(),
     }
@@ -338,3 +428,81 @@ def stop_if_configured() -> Tuple[bool, str]:
     if not stop_with_client():
         return True, "「随 ECHO 退出时停掉本机后端」是关的，不动它"
     return stop(reason="ECHO 退出（设置里打开了「随 ECHO 退出时停掉本机后端」）")
+
+
+def take_over(*, vram_budget_mb: int = 0, device: str = "cuda",
+              timeout: float = backend_setup.PAIR_FILE_TIMEOUT) -> Tuple[bool, str]:
+    """**接管后端**：停掉占着端口的另一棵树的后端，换成当前这棵树自己的。
+
+    为什么需要它（2026-10-06，用户报的真实 bug）：开发版与稳定版是**轮流跑**的，
+    但端口（8900/8901）两棵树共用。原来切实例只换 ECHO、**不换后端**，于是新树起来后
+    8900 上跑的还是旧树的后端 —— 现象是面板「待启动」、箭头能进（那是别人的管理面）、
+    而转写拿 `unauthorized`（**不是连不上，是那台不认这个客户端**）。
+    用户的原话："切换脚本和启停脚本都要同步考虑后端的切换"。
+
+    归属判据（**只停"确实是 ECHO 后端但不是本棵树的"那一个**）：
+      * 命令行里必须有 ``-m server.main --config <目录>``（证明它是 ECHO 的后端）；
+      * 那个目录**不等于**本棵树的后端目录（否则它是我们自己的，走 ``stop()``）。
+    两条都不满足时**绝不动手** —— 用户手工起的、别的软件的，一律留给用户
+    （见 ``app/backend_pid.py`` 开头那条铁律："归属只能来自可靠判据，不许猜一个来停"）。
+
+    配对**不需要重做**：客户端凭据（``backend.json``）里的 ``base_url`` 仍是本机回环地址，
+    起完自己的后端后 ``pair_if_needed()`` 会走"已经配对到本机后端 → 跳过"那条路
+    （实测：clients 表行数 13→13，不新建客户端）。若那台新后端确实不认这份凭据，
+    才由 ``start()`` 的编排去配一次。
+    """
+    with _JOB_LOCK:
+        if _JOB["running"]:
+            return False, ("「起本机后端」正在进行中（第 %d 步：%s）—— 等它做完再接管"
+                           % (len(_JOB["steps"]), _JOB["stage"] or "准备中"))
+    port, admin_port = ports()
+    mine = backend_setup.backend_root()
+    victims = []
+    for p in (port, admin_port):
+        try:
+            o = backend_proc.port_owner(p, with_root=True)
+        except Exception:                                         # pragma: no cover - 兜底
+            continue
+        if int(o.get("pid") or 0) > 0 and o.get("foreign") and o.get("root"):
+            victims.append(o)
+    if victims:
+        seen, uniq = set(), []
+        for o in victims:
+            if o["pid"] in seen:
+                continue
+            seen.add(o["pid"])
+            uniq.append(o)
+        for o in uniq:
+            killed = False
+            try:
+                from app import platform as _platform
+                killed = bool(_platform.kill_process_tree(int(o["pid"])))
+            except Exception:                                     # pragma: no cover - 兜底
+                killed = False
+            if not killed:
+                return False, ("接管失败：停不掉 pid %d（%s，属于 %s）—— 请手工停它，"
+                               "或用桌面工具包的「15-后端-清掉孤儿」"
+                               % (o["pid"], o.get("label") or "进程", o.get("root")))
+            try:
+                from app import db
+                db.add_log("info", "backend",
+                           "接管后端：已停掉另一棵树的后端 pid=%d（%s），本棵树的后端目录是 %s"
+                           % (o["pid"], o.get("root"), mine))
+            except Exception:
+                pass
+        # 端口要空下来才起——被杀进程释放端口有几毫秒的窗口
+        for _ in range(20):
+            left = [backend_proc.port_owner(p) for p in (port, admin_port)]
+            if not any(int(x.get("pid") or 0) > 0 for x in left):
+                break
+            time.sleep(0.25)
+    ok, msg = start(vram_budget_mb=vram_budget_mb, device=device, timeout=timeout)
+    if not ok:
+        return False, "已停掉旧后端，但起本棵树的后端失败：%s" % msg
+    if victims:
+        # 报 `uniq` 而不是 `victims`：同一个后端进程同时占着数据口与管理口，
+        # 用未去重的列表会拼出"pid 31712、pid 31712"（2026-10-06 真机实测看到过）。
+        return True, ("已接管：停掉另一棵树的后端（%s），正在起本棵树自己的（%s）。"
+                      "凭据是同一份，配对会自动复用，不需要重新配对。"
+                      % ("、".join("pid %d" % v["pid"] for v in uniq), mine or "（未配置）"))
+    return True, "端口上本来就没有别的树的后端，已直接起本棵树自己的（%s）" % (mine or "（未配置）")

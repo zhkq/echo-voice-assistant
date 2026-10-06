@@ -30,6 +30,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -107,10 +108,15 @@ def _resolve_exe(argv: Sequence[str]) -> str:
 
 # ---------------------------------------------------------------- 端口占用者
 
-def port_owner(port: int) -> dict:
+def port_owner(port: int, *, with_root: bool = False) -> dict:
     """谁在监听 ``port``：``{"port": int, "pid": int, "label": str}``；没人监听则 ``pid=0``。
 
     只**问**，不动手：占用者可能是同事的后端、用户手工起的实例、甚至是别的软件。
+
+    ``with_root=True`` 时多问一次"那个进程的命令行里 ``--config`` 指向哪个后端目录"
+    （``+1~2 ms``，本机实测 1.0 ms；这是归属判据，见 ``backend_owner()``）。
+    **默认关**：面板每次刷新都要调本函数，而归属只在真需要判断时才问
+    （面板走的是 ``backend_owner()``，它自己会带上）。
     """
     pid = 0
     try:
@@ -123,17 +129,120 @@ def port_owner(port: int) -> dict:
             label = str(platform.process_label(pid) or "")
         except Exception:
             label = ""
-    return {"port": int(port), "pid": pid, "label": label}
+    out = {"port": int(port), "pid": pid, "label": label}
+    if with_root and pid > 0:
+        root = ""
+        try:
+            root = _backend_root_from_cmdline(platform.process_command_line(pid) or "")
+        except Exception:
+            root = ""
+        if root:
+            out["root"] = root
+            out["is_ours"] = _same_path(root, backend_root())
+            out["foreign"] = not out["is_ours"]
+    return out
+
+
+def _backend_root_from_cmdline(cmdline: str) -> str:
+    """从命令行里取出这个后端**自己的目录**：``-m server.main --config <root>/server.yaml``。
+
+    为什么这是归属的**唯一外部判据**（2026-10-06）：后端进程长得一模一样（同一个解释器、
+    同一套依赖），唯一带标识的就是 ``--config`` 指向哪棵树的目录。用户 AGENTS.md 那条
+    （"唯一可靠判据 = pid 文件 + 命令行的 ``--config <该树的后端目录>``"）与桌面工具包
+    ``Get-BackendPid`` 用的都是它。
+
+    取不到返回空串 —— 调用方必须把"说不出来"当成一种合法答案。
+    """
+    text = cmdline or ""
+    if "server.main" not in text:
+        return ""
+    m = re.search(r"--config\s+(?:\"([^\"]+)\"|'([^']+)'|(\S+))", text)
+    if not m:
+        return ""
+    cfg = next((g for g in m.groups() if g), "")
+    if not cfg:
+        return ""
+    try:
+        return os.path.dirname(os.path.abspath(cfg))
+    except Exception:
+        return ""
+
+
+def _same_path(a: str, b: str) -> bool:
+    try:
+        return os.path.normcase(os.path.normpath(a or "")) == \
+               os.path.normcase(os.path.normpath(b or ""))
+    except Exception:
+        return False
+
+
+def backend_owner(owner: Optional[dict] = None) -> dict:
+    """占用端口的那个后端**属于哪棵树**。
+
+    返回 ``{pid, root, is_ours, foreign, note}``：
+      * ``is_ours=True``  —— 命令行里的 ``--config`` 目录就是**当前这棵树**的
+        （与 ``backend_root()`` 同一个值）。这才是"我能用这个后端"的判据；
+      * ``foreign=True``  —— 它属于**别的安装**（开发版/稳定版另一棵，或用户手工起的）；
+      * 两者都 False     —— 说明"不是后端"或"说不出来"，只有 pid 可供参考。
+
+    为什么必须区分（2026-10-06 的真实事故）：dev 面板显示「待启动」、点箭头能进后端
+    管理页、而会议转写报"等待能力后端"。真相是 8900 上跑着**稳定版的后端**，
+    dev 客户端拿自己的凭据过去只会拿到 ``unauthorized`` —— **不是连不上，是凭据不属于它**。
+    原来的判据只问"这个 pid 是不是记在我那份 pid 文件里"，于是这种情况一律被说成
+    "待启动"，把用户引去查启动，而真正该做的是**换掉这台后端**。
+    """
+    info = owner if owner is not None else port_owner(port_of_interest())
+    pid = int(info.get("pid") or 0)
+    out = {"pid": pid, "root": "", "is_ours": False, "foreign": False, "note": ""}
+    if pid <= 0:
+        out["note"] = "没有进程在监听"
+        return out
+    cmdline = ""
+    try:
+        from app import platform as _platform
+        cmdline = str(_platform.process_command_line(pid) or "")
+    except Exception:
+        cmdline = ""
+    root = _backend_root_from_cmdline(cmdline)
+    if not root:
+        out["note"] = ("pid %d 在监听，但命令行里没有 server.main --config（不是 ECHO 后端，"
+                       "或者读不到它的命令行）" % pid)
+        return out
+    out["root"] = root
+    mine = backend_root()
+    if _same_path(root, mine):
+        out["is_ours"] = True
+        out["note"] = "pid=%d 的后端目录正是本棵树的 %s" % (pid, root)
+    else:
+        out["foreign"] = True
+        out["note"] = ("pid=%d 的后端属于**另一棵树**（%s），不是本棵树的 %s"
+                       % (pid, root, mine or "（未配置）"))
+    return out
+
+
+def port_of_interest() -> int:
+    """本机后端的数据口（可被打桩；只为 ``backend_owner()`` 的默认参数服务）。"""
+    return int(DEFAULT_PORT)
 
 
 def describe_owner(owner: dict) -> str:
-    """把 ``port_owner()`` 的结果说成人话：``8900 被 python.exe（pid 1234）占着``。"""
+    """把 ``port_owner()``／``backend_owner()`` 的结果说成人话。
+
+    带归属信息时会多点名一句"属于哪棵树、是不是本棵树的" —— 这正是用户排障需要的
+    那句话（"8900 被 python.exe（pid 1234）占着" 还不够，得说清**它是谁的**）。
+    """
     port = owner.get("port", 0)
     pid = int(owner.get("pid") or 0)
     if pid <= 0:
         return "%s 空着" % port
     label = str(owner.get("label") or "").strip()
-    return "%s 被 %s（pid %d）占着" % (port, label or "一个名字取不到的进程", pid)
+    base = "%s 被 %s（pid %d）占着" % (port, label or "一个名字取不到的进程", pid)
+    root = str(owner.get("root") or "").strip()
+    if not root:
+        return base
+    if owner.get("is_ours"):
+        return base + "（就是本棵树的：%s）" % root
+    return base + "（属于另一棵树：%s）" % root
 
 
 def port_check(ports: Optional[Sequence[int]] = None,
@@ -145,6 +254,8 @@ def port_check(ports: Optional[Sequence[int]] = None,
     * 端口空着 → ``(True, "… 空着")``；
     * 占用者**就是 ECHO 自己起的那个**（占用的 pid == pid 记录里那条，且那条确实活着）
       → ``(True, …)``：不冲突，**已经在跑了**（调用方据此直接进入配对，而不是再起一个）；
+    * 占用者是**本棵树的后端，但 pid 记录丢了**（2026-10-06 补）→ ``(True, "…已经在跑")``
+      **并就地认领它**。见下面那段；
     * 占用者是别人（同事的后端 / 用户手工起的实例 / 别的软件）→ ``(False, …)``：
       如实说出占用者，让用户决定（停它 / 换端口），**我们不替他动手**。
 
@@ -152,6 +263,24 @@ def port_check(ports: Optional[Sequence[int]] = None,
     ``owners``（2026-09-30）：调用方已经查过"谁在监听"时直接传进来 —— 查一次要跑
     `netstat`（本机实测 ~0.15 s/端口），而面板每次刷新都要这份答案；**判据只有这一处**，
     所以是"把结果传进来"，不是在调用方再算一遍（那正是两处判据会漂开的开端）。
+
+    ## 为什么要多那一类（2026-10-06 用户实测的现场）
+
+    用户原话：**"后端管理页面能进，语音能转写，但是仪表盘的状态显示待启动"**。
+
+    真相是**归属记录活不过 ECHO 那一次进程**：pid 文件写的是"**这个 ECHO 进程**起的后端"，
+    而 ECHO 重启之后，端口上那个后端还活着（父进程变成旧的 ECHO，已成孤儿），
+    新 ECHO 手里没有 pid 记录。于是：
+
+    * `is_ours_alive()` → False → `view()["running"]` = False → 仪表盘那格说「待启动」；
+    * 而**能力路由根本不看归属记录**，转写照旧成功、管理页照旧能进 —— 用户看到的就是这个矛盾；
+    * 更糟的是**点"启动"还会被自己挡住**：这一类原来落进 `strangers`，
+      面板说"这不是 ECHO 起的后端…请先停掉它或换端口"，而那明明就是本棵树自己的后端。
+
+    判据已经有了：`port_owner(with_root=True)` 会按**命令行**（`--config <目录>`）算出
+    `is_ours`（与桌面工具包 `Get-BackendPid` 同一判据），这里只是**用它**。
+    认领 = 把这个 pid 写进归属记录 —— 从这一刻起它是"我们起的"，后面的启停/接管都自洽了；
+    写不进去（目录不可写）也不影响判定，只是下一次还得再认一次。
     """
     wanted: List[int] = [int(p) for p in (ports if ports is not None
                                          else (DEFAULT_PORT, DEFAULT_ADMIN_PORT))]
@@ -160,19 +289,45 @@ def port_check(ports: Optional[Sequence[int]] = None,
     if ours_alive:
         ours_pid = int(backend_pid.read_pid() or 0)
     if owners is None:
-        owners = [port_owner(p) for p in wanted]
-    ours_ports, strangers = [], []
+        owners = [port_owner(p, with_root=True) for p in wanted]
+    ours_ports, other_tree, strangers, unmanaged = [], [], [], []
     for owner in owners:
         if int(owner.get("pid") or 0) <= 0:
             continue
         if ours_pid and int(owner["pid"]) == ours_pid:
             ours_ports.append(owner)
+        elif owner.get("foreign"):
+            # **另一棵树的后端**：既不是"我起的"，也不是"不相干的陌生人"。
+            # 分开报的理由：这两种的处置完全不同 —— 前者有明确的换法（接管，见 take_over），
+            # 后者只能问用户（我们不替人杀不明进程）。混成一句"被占"就把可操作的答案淹掉了。
+            other_tree.append(owner)
+        elif owner.get("is_ours"):
+            # **本棵树的后端在跑，只是 pid 记录不在**（ECHO 重启过 → 记录随旧进程没了）。
+            # 命令行已经证明它是我们的，所以既不是陌生人、也不是"另一棵树"。
+            unmanaged.append(owner)
         else:
             strangers.append(owner)
+    if other_tree:
+        return False, ("端口被**另一棵树的后端**占着：%s。开发版与稳定版轮流跑，"
+                       "切换时后端要跟着换 —— 点「接管后端」（停掉它、起本棵树自己的、"
+                       "配对复用同一份凭据，不需要重新配对）"
+                       % "；".join(describe_owner(o) for o in other_tree))
     if strangers:
         return False, ("端口被占：%s。这不是 ECHO 起的后端 —— 同机只跑一个后端，"
                        "请先停掉它或换端口（ECHO 不会替你停别人的进程）"
                        % "；".join(describe_owner(o) for o in strangers))
+    if unmanaged:
+        # 就地认领：把这个 pid 写进归属记录。写不进去不是错误（只是下次还得再认一次）——
+        # 这一类的重点在**判定**：后端已经在跑、而且就是我们这棵树的，别再起第二个，
+        # 更别把它当成陌生人挡下来（用户看到的就是"点启动被自己挡住"）。
+        for o in unmanaged:
+            try:
+                backend_pid.write_pid(int(o["pid"]))
+            except Exception:
+                pass
+        return True, ("本棵树的后端已经在跑（%s），不再起第二个"
+                      "（归属记录原本不在 —— ECHO 重启过就这样，已认领它）"
+                      % "；".join(describe_owner(o) for o in unmanaged))
     if ours_ports:
         return True, ("ECHO 起的后端已经在跑（%s），不再起第二个"
                       % "；".join(describe_owner(o) for o in ours_ports))

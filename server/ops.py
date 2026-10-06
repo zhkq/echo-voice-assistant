@@ -257,9 +257,15 @@ def pairing_string(cfg, code: str, ttl_s: Optional[float] = None,
 
 # ---------------------------------------------------------------- 配对码
 
+#: 本机自动配对那张码的 `created_by` 签名。**待用列表据此把它排除** ——
+#: 它是机器对机器的握手凭据，不是给人抄的（见 `pending_pairing_codes` 的说明）。
+#: 与 `server/localpair.py::publish(created_by=...)` 的默认值必须一致。
+LOCAL_PAIR_CREATED_BY = "local-pair"
+
+
 def issue_pairing_code(cfg, auth, *, name: str = "", scopes: str = "",
                        ttl_s: Optional[float] = None, created_by: str = "",
-                       advertised: Any = None) -> Dict[str, Any]:
+                       advertised: Any = None, client_id: str = "") -> Dict[str, Any]:
     """发一张一次性配对码。**明文只在这个返回值里出现这一次。**
 
     返回里除了明文，还带上：
@@ -269,6 +275,9 @@ def issue_pairing_code(cfg, auth, *, name: str = "", scopes: str = "",
 
     `advertised` = **这一次发码想公布的地址**（覆盖 `server.advertised_host`）——
     同一个后端同时服务本机与远程时，两张码各写各的。
+
+    `client_id`（2026-10-06）：这张码发给**一个已知客户端** —— 兑换时复用那个身份、
+    只轮换 secret（见 `Auth.redeem()`），而不是新建一行。空 = 照旧新建。
     """
     store = auth.store
     # 顺手把过期的清掉：这里本来就是**写路径**，而"待用配对码"这个数字要能自证
@@ -278,7 +287,8 @@ def issue_pairing_code(cfg, auth, *, name: str = "", scopes: str = "",
     except Exception:
         pass
     code = auth.create_pairing_code(created_by=str(created_by or ""), name=str(name or ""),
-                                    scopes=normalize_scopes(scopes), ttl_s=ttl_s)
+                                    scopes=normalize_scopes(scopes), ttl_s=ttl_s,
+                                    client_id=str(client_id or ""))
     built = pairing_string(cfg, code, ttl_s=ttl_s, advertised=advertised)
     return {
         "id": auth_mod.hash_pairing_code(code),   # 同一个确定性哈希（无随机盐），与库里那张码逐字相同
@@ -327,6 +337,23 @@ def pending_pairing_codes(store, now: Optional[float] = None) -> list:
 
     `remainingSeconds` **最少报 1 秒**（不报 0）：列出来的码一定还能用，而 0 会让
     页面按"已过期"渲染（`left(0)` 那个分支）—— 又是同一处自相矛盾。
+
+    ## 本机自动配对的码**不算待用**（2026-10-06 用户给的判据）
+
+    用户原话："配对完也不应该是待用状态……**发出后没有被用的码才叫待用**"。
+
+    本机那张码（`created_by == "local-pair"`）是**机器对机器**的握手凭据，不是给人抄的：
+    客户端一旦拿到凭据就**直接跳过配对**（`app/backend_setup.py::pair_if_needed()` 的
+    跳过分支），**永远不会来兑换它**。所以它挂在"待用"里是假的 —— 那一页该显示的是
+    "有人拿到、还没用掉"的码。
+
+    而且它**不是**"没用过的码"：写进 `local-pair.json` 那一刻它就已经被这台机器"用"了
+    （那个文件本身就是它的消费凭据），只是没走 `/v1/pair` 那条删除路径。
+    复用逻辑（`localpair._reusable_code`）保证同一时刻至多一张，所以这里滤掉不会
+    让数量失真，只会让那一页回到它该有的语义。
+
+    人工发的码（命令行 `--new-pairing-code`、管理面发码）`created_by` 是 `cli` / 管理员
+    用户名，**不受影响** —— 那些正是该被"待用"追踪的。
     """
     if store is None:
         return []
@@ -335,6 +362,9 @@ def pending_pairing_codes(store, now: Optional[float] = None) -> list:
     for r in store.pairing_codes():
         if auth_mod.pairing_code_expired(r, now):
             continue                       # 过期的不进"待用"（留着由下次发码清理）
+        if str(r.get("created_by") or "") == LOCAL_PAIR_CREATED_BY:
+            # 本机自动配对用的那张：不是给人在待用列表里操作的（见上面那段）。
+            continue
         left = float(r.get("expires_at") or 0) - now
         out.append({
             "id": str(r.get("code_hash") or ""),

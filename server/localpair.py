@@ -122,12 +122,111 @@ def _atomic_write(target: str, text: str) -> None:
         raise
 
 
+def _current_client_id() -> str:
+    """读**客户端自己那份**凭据里的 `client_id`（`{DATA}/backend.json`）。
+
+    用途：本机配对是"已知机器换凭据"，发码时带上它，兑换时就**复用同一个身份**
+    （`Auth.redeem()` 里那条 reuse 分支）—— 这是"一台机器一个 client_id"的根治点。
+
+    做成**尽力而为**：读不到就返回空串（照旧新建一个客户端）。
+    容器形态下后端读不到客户端的文件系统，那时自然退化成旧行为 ——
+    **不能因为读不到就让配对失败**（本机配对的可用性比身份复用重要）。
+    """
+    try:
+        import json
+
+        from app import paths as app_paths
+    except Exception:
+        return ""
+    for cand in (os.path.join(app_paths.data_root(), "backend.json"),
+                 os.path.join(app_paths.data_root(), "data", "backend.json")):
+        try:
+            with open(cand, "r", encoding="utf-8") as fh:
+                body = json.load(fh)
+            cid = str(body.get("client_id") or "").strip()
+            if cid:
+                return cid
+        except Exception:
+            continue
+    return ""
+
+
+def _local_client_already_paired(cfg) -> bool:
+    """**不要用这个函数**（保留为反面教材，见下）。
+
+    它想回答"本机客户端是不是已经有凭据了"，于是去读**客户端那侧**的
+    `{DATA}/backend.json`。这在单机形态成立，但**后端可以跑在容器里**（另一套文件系统，
+    见 `docs/后端容器-一键起-实施方案.md`）—— 那时它永远读不到，判据恒为 False，
+    于是"配对完还有待用码"这个问题会**在容器形态下原样复现**，而且更难查。
+
+    正确的落点在服务端能看见的那一侧：**待用列表本身**（见 `ops.pending_pairing_codes`
+    对 `local-pair` 的处理）。所以这个函数不再被调用。
+    """
+    return False
+
+
+def _reusable_code(cfg, auth) -> Optional[Dict[str, Any]]:
+    """能不能**复用上一张**本机配对码？能就返回它（含明文），否则 ``None``。
+
+    为什么要复用（2026-10-06，用户报的现场）：原来每次后端启动都 `publish()` 一张新码，
+    而客户端那边 `pair_if_needed()` 一旦判定"已配对到本机回环地址"就**直接跳过** ——
+    它压根不会来兑换这张码。于是**每启动一次后端就多一张没人用的码**，管理面
+    「待用配对码」那一页跟着涨（本机实测：dev 攒了 16 张），而那页按设计本该是
+    "与实际库一致"的自证页（`store.sweep_pairing_codes()` 的注释就是为这个写的）。
+
+    判据（两条都成立才复用）：
+      1. 上一次写下的那张码**仍在库里**（没被兑换走 —— 兑换时行会被删掉）；
+      2. 它**还没过期**。
+    不成立就照旧发新的（客户端凭据坏了/被清掉时会真的来兑换，那时必须有一张新码）。
+
+    复用时**重写文件**（刷新 `createdAt`），但**不延长 TTL** —— 保持"7 天后必须重启
+    换新"这条既有性质，免得码在文件里无限续期。
+    """
+    prev = read(cfg)
+    if not isinstance(prev, dict):
+        return None
+    code = str(prev.get("code") or "").strip()
+    if not code:
+        return None
+    try:
+        exp = float(prev.get("expiresAt") or 0)
+    except Exception:
+        exp = 0.0
+    if exp <= 0 or exp <= time.time():
+        return None
+    try:
+        from server import auth as auth_mod
+        want = auth_mod.hash_pairing_code(code)
+        store = auth.store
+        live = {str(r.get("code_hash") or "") for r in store.pairing_codes()}
+    except Exception:
+        return None
+    if want not in live:
+        return None
+    return {
+        "source": "local",
+        "serverId": str(cfg.get("server.id", "") or ""),
+        "baseUrl": str(prev.get("baseUrl") or local_base_url(cfg)),
+        "url": str(prev.get("url") or ""),
+        "code": code,
+        "fingerprint": str(prev.get("fingerprint") or ""),
+        "note": str(prev.get("note") or ""),
+        "scopes": str(prev.get("scopes") or DEFAULT_SCOPES),
+        "createdAt": time.time(),
+        "expiresAt": exp,
+    }
+
+
 def publish(cfg, auth, *, scopes: str = DEFAULT_SCOPES, client_name: str = "本机客户端",
             ttl_s: Optional[float] = None, created_by: str = "local-pair") -> Dict[str, Any]:
     """发一张本机配对码并写到文件。返回文件内容（**含明文码**，只此一次）。
 
     调用方：`server/main.py` 的 lifespan（每次启动一张）。失败**不该拦住启动** ——
     所以调用方自己 try/except 并只写日志（这个文件是"方便"，不是"必需"）。
+
+    ⚠️ **每次启动"叫一次"，不等于每次启动"发一张新码"**（2026-10-06 改）：
+    上一张还在库里且没过期时**复用它**（见 `_reusable_code`）。否则每启动一次就多一张
+    没人兑换的码，"待用配对码"那页会随启动次数增长 —— 而它本该是自证页。
 
     ## 这条路上**不需要** `server.advertised_host`
 
@@ -140,6 +239,10 @@ def publish(cfg, auth, *, scopes: str = DEFAULT_SCOPES, client_name: str = "本�
     不这么做的话，同一份配置在两种形态之间会打架 —— 而症状是"本机自动配对突然连不上
     了（它拿着一个本机不该走的网卡地址）"，很难联想到是共享形态那一项在起作用。
     """
+    reused = _reusable_code(cfg, auth)
+    if reused is not None:
+        _atomic_write(path(cfg), json.dumps(reused, ensure_ascii=False, indent=2) + "\n")
+        return reused
     try:
         ttl = float(ttl_s if ttl_s else cfg.get("auth.local_pair_ttl_s", DEFAULT_TTL_S))
     except Exception:
@@ -148,7 +251,8 @@ def publish(cfg, auth, *, scopes: str = DEFAULT_SCOPES, client_name: str = "本�
     info = ops_mod.issue_pairing_code(cfg, auth, name=str(client_name or ""),
                                       scopes=str(scopes or ""), ttl_s=ttl,
                                       created_by=str(created_by or ""),
-                                      advertised=loopback)
+                                      advertised=loopback,
+                                      client_id=_current_client_id())
     body = {
         "source": "local",
         "serverId": str(cfg.get("server.id", "") or ""),

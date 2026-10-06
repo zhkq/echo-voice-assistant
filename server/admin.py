@@ -683,19 +683,25 @@ def create_admin_app(cfg, state, *, perf=None) -> FastAPI:
     def pairing_codes(request: Request):
         """待用的配对码。**明文永远不在这里** —— 库里只有哈希（设计 §7.4 约定 2）。
 
-        这里给的是**能用的**码：`ops.pending_pairing_codes()` 已经把"已消费"与"已过期"
-        都排除掉了（判据只有一份，命令行 `--list-codes` 用的是同一个函数）。
-        2026-09-29 用户实测的 bug 就是这张表里出现了「已过期」（甚至已经兑过的）的码 ——
-        徽章写着「已过期」却列在「待用」，标题与内容自相矛盾。
+        这里给的是**能用的**码：`ops.pending_pairing_codes()` 已经把"已消费"、"已过期"
+        与**本机自动配对那张**都排除掉了（判据只有一份，命令行 `--list-codes` 用的是同一个
+        函数）。2026-09-29 用户实测的 bug 就是这张表里出现了「已过期」（甚至已经兑过的）的码
+        —— 徽章写着「已过期」却列在「待用」，标题与内容自相矛盾。
+        2026-10-06 用户又给了一条判据：*"发出后没有被用的码才叫待用"* ——
+        本机那张码是机器对机器的握手凭据（客户端一旦有凭据就跳过配对，永远不会来兑换），
+        挂在"待用"里是假的，所以也不再列。
         """
         current_admin(request)
         return {"codes": ops_mod.pending_pairing_codes(store_of()),
                 "defaultTtlSeconds": int(cfg.get("auth.pairing_ttl_s", 900)),
                 "minTtlSeconds": MIN_PAIRING_TTL_S, "maxTtlSeconds": MAX_PAIRING_TTL_S,
-                "note": "这张表里只有能用的码（未用过、未过期）：用过的码在 /v1/pair 兑走的"
-                        "那一刻就从库里删掉了，过期的也不列在这里。想知道某张码什么时候被"
-                        "谁兑走了，看「存了什么」页签里的审计（action = pair-redeem）。"
-                        "配对码只存哈希 —— 明文只在发出去的那一刻出现过一次，这里看不到。"}
+                "note": "这张表里只有**能用的**码（未用过、未过期）：用过的码在 /v1/pair 兑走的"
+                        "那一刻就从库里删掉了，过期的也不列在这里。"
+                        "本机自动配对用的那张也不列 —— 它不是给人抄的，客户端自己会走本机"
+                        "配对文件，永远不会来兑换它。"
+                        "想知道某张码什么时候被谁兑走了，看「存了什么」页签里的审计"
+                        "（action = pair-redeem）。配对码只存哈希 —— 明文只在发出去的那一刻"
+                        "出现过一次，这里看不到。"}
 
     @api.post("/pairing-codes")
     async def issue_pairing_code(request: Request):

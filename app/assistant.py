@@ -465,6 +465,20 @@ def _capture_worker(source):
             _handle_meeting_intent(text, intent, source)
             return
 
+        # 回顾意图分流（2026-10-06）：说"我们来回顾今天"就切进回顾模式。
+        # **放在会议之后**：两者都是"模式切换"型口令，而会议那两条是既有行为，
+        # 不能因为新增回顾而改变匹配优先级（"开始记录"不该被回顾抢走）。
+        if wants_review_start(text):
+            # 先把当前这条命令流结掉，再把 busy 让给回顾线程 ——
+            # 否则 `start_review` 里的 `_set_busy` 会因为我们自己占着锁而失败。
+            db.add_log("info", "assistant", f"识别到回顾意图：{text[:40]}")
+            _release_busy()
+            if not start_review(source):
+                # 起不来（重复触发/未就绪）：`start_review` 已经用语音说明了原因，
+                # 这里只需要把 busy 状态收干净
+                db.add_log("warn", "assistant", "回顾模式未能启动")
+            return
+
         # 语音路径的目标 = 面板「命令目标」下拉保存的选择（没选就是默认命令会话）
         target = _configured_command_target(get_client())
 
@@ -475,6 +489,218 @@ def _capture_worker(source):
 
         _dispatch(text, source, *target)
     finally:
+        _release_busy()
+
+
+# ================================================================== 每日回顾模式
+#
+# 与单轮 `capture()` 的区别（这是本模式存在的唯一理由）：
+#   * **一次触发、多轮对话**：录音 → 提交 → 朗读反馈 → 再录音……直到用户说"结束回顾"；
+#   * 每轮把"原始转写"整段交给 DSH 的 daily-review 技能，ECHO **不改写**；
+#   * 只朗读技能声明的【播报】段（`daily_review.extract_broadcast` 三层兜底），
+#     语音反馈必须短 —— 用户 2026-10-06 明确要求。
+#
+# 并发：整场回顾占住 `_busy`（`phase` 用 "review"），期间媒体键/唤醒触发的普通命令
+# 会被 `_set_busy` 挡掉。这是有意的：回顾期间麦克风是"给它用的"，插一条别的命令
+# 只会把两边的录音搅在一起。
+#
+# 麦克风：复用普通命令那条路的 `record_command`（前台独占），只是把时长上限与
+# 静音窗口换成回顾自己的设置项。**播报期间不收音**（TTS 不占麦锁，但本模式的循环
+# 是"录完才播"，天然避让）—— 不做 AEC，见设计文档 §7.1。
+_review_running = threading.Event()
+_review_stop = threading.Event()      # 置位 = 请本场回顾收尾退出
+
+
+def review_running() -> bool:
+    """本场语音回顾是否正在进行（面板/API 用）。"""
+    return _review_running.is_set()
+
+
+def wants_review_start(text) -> bool:
+    """这句话是不是"我们来回顾今天"。"""
+    try:
+        from app import daily_review
+        return daily_review.wants_start(text)
+    except Exception:
+        return False
+
+
+def start_review(source="wake") -> bool:
+    """进入每日回顾模式（后台线程，立即返回）。
+
+    与 `capture()` 一样是"触发即返回"；重复触発只提示不重入。
+    """
+    from app import daily_review
+    ok, why = daily_review.ready()
+    if not ok:
+        # 没配好就**当场说出来**：用户已经在车里等着说话了，
+        # 沉默是最差的结果（他会以为坏了，然后反复喊唤醒词）。
+        db.add_log("warn", "assistant", f"每日回顾不可用：{why}")
+        try:
+            providers_mod.speak_text("回顾还没配好，你回面板看一眼设置。", timeout=15)
+        except Exception:
+            pass
+        return False
+    if _review_running.is_set():
+        print("[assistant] 回顾已在进行中，忽略本次触发")
+        return False
+    if not _set_busy("review"):
+        try:
+            providers_mod.speak_text("我这会儿正忙，等我说完再来。", timeout=15)
+        except Exception:
+            pass
+        return False
+    _review_stop.clear()
+    _review_running.set()
+    threading.Thread(target=_review_worker, args=(source,), daemon=True).start()
+    return True
+
+
+def stop_review() -> bool:
+    """请求结束本场回顾（用户说"结束回顾"或面板按停）。返回是否真的停了一场。"""
+    if not _review_running.is_set():
+        return False
+    _review_stop.set()
+    # 正在录音时也要让它立刻松麦（record_command 在帧边界检查 stop_event）
+    _capture_stop.set()
+    return True
+
+
+def _review_speak(text, timeout=60):
+    """朗读一句（失败只记日志，不打断整场回顾）。
+
+    **最后一道长度闸**：`daily_review.extract_broadcast` 已经按 `dailyReviewBroadcastChars`
+    截过，但这里是"无论如何都不会念长稿"的兜底 —— 用户 2026-10-06 明确要求语音反馈简短，
+    而这条链路上任何一环（技能输出异常、设置被改成很大的值）都不该让车里听到一整篇。
+
+    上限取 **`min(dailyReviewBroadcastChars, maxBriefChars)`**：
+      * 用 `dailyReviewBroadcastChars` 是因为"回顾的播报预算"就该由回顾自己定；
+      * 再夹一层 `maxBriefChars` 是为了尊重用户对"整机简报长度"的总设定；
+      * 两者都取小 —— 任何一个被调到很大都不该让兜底失效（本用例就是被这条逮住的）。
+    """
+    if not text:
+        return
+    try:
+        from app import daily_review
+        spoken = str(text).strip()
+        cap = min(daily_review.broadcast_limit_chars(),
+                  max(60, int(settings.get("maxBriefChars", 200) or 200)))
+        if len(spoken) > cap:
+            cut = spoken[:cap]
+            dot = max(cut.rfind("。"), cut.rfind("？"), cut.rfind("！"),
+                      cut.rfind("?"), cut.rfind("!"))
+            spoken = (cut[:dot + 1] if dot > cap // 2 else cut + "……")
+            db.add_log("warn", "assistant",
+                       f"回顾播报稿超过 {cap} 字，已截断（原文 {len(text)} 字）")
+        providers_mod.speak_text(spoken, timeout=timeout)
+    except Exception as e:
+        db.add_log("warn", "assistant", f"回顾朗读失败：{type(e).__name__}: {e}")
+
+
+def _review_worker(source):
+    """回顾模式主循环：录一轮 → 交给 DSH → 念播报 → 再来一轮，直到用户喊停。"""
+    from app import daily_review
+
+    cfg = settings
+    turns = 0
+    try:
+        db.add_log("info", "assistant", f"每日回顾开始 (source={source})")
+        os.makedirs(CAPTURES_DIR, exist_ok=True)
+
+        # 会话与权限**在开场前**准备好：这两步要几秒，放在第一轮之后会让用户干等
+        client = get_client()
+        acc_ok, acc_why = daily_review.ensure_access(client)
+        if not acc_ok:
+            db.add_log("warn", "assistant", f"回顾会话权限校正未成功：{acc_why}")
+        sid, wid, info = daily_review.ensure_session(client)
+        if not sid:
+            db.add_log("error", "assistant", "回顾会话没能建立")
+            _review_speak("回顾会话没建起来，你回面板看一眼。")
+            return
+        db.add_log("info", "assistant", f"今天的回顾会话：{sid}（工作区 {info.get('workspace')}）")
+
+        if cfg.get("beepOnStart", True):
+            tts_mod.play_beep("start")
+        _review_speak("好，开始今天的回顾，你讲。")
+
+        while not _review_stop.is_set():
+            turns += 1
+            wav = os.path.join(
+                CAPTURES_DIR,
+                f"review-{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}.wav")
+            set_phase("listening")
+            _capture_stop.clear()
+            _capture_active.set()
+            try:
+                ok = record_command(
+                    wav,
+                    max_ms=daily_review.record_limit_ms(),
+                    silence_threshold=float(cfg.get("silenceThreshold", 0.012)),
+                    hangover_ms=daily_review.silence_ms(),
+                    no_speech_abort_ms=int(cfg.get("noSpeechAbortMs", 4000)),
+                    device_id=recorder.resolve_input_device("command"),
+                    level_cb=lambda v: _capture_level.__setitem__("value", float(v)),
+                    stop_event=_capture_stop,
+                )
+            finally:
+                _capture_active.clear()
+            set_phase("transcribing")
+            if cfg.get("beepOnDone", True):
+                tts_mod.play_beep("done")
+
+            if _review_stop.is_set():
+                break
+            if not ok:
+                # 这一轮没听到内容：提示一次，继续等他讲（**不退出整场**）
+                db.add_log("info", "assistant", f"回顾第 {turns} 轮没听到内容")
+                if turns == 1:
+                    _review_speak("我没听到，你再说一次。")
+                else:
+                    _review_speak("这一轮我没听清，接着说，或者说结束回顾。")
+                continue
+
+            text, note, status = _transcribe_command(wav, cfg)
+            if not text:
+                if status == ASR_ERROR:
+                    db.add_log("error", "assistant", f"回顾转写失败（{note}）")
+                    _review_speak(asr_failure_hint(note))
+                    break
+                db.add_log("warn", "assistant", f"回顾转写为空（{note}）")
+                _review_speak("这一轮我没听清，接着说。")
+                continue
+            db.add_log("info", "assistant", f"回顾第 {turns} 轮识别：{text[:80]}（{note}）")
+            print(f"[assistant] 回顾识别: {text}")
+
+            # 结束口令：这一轮的内容**不再提交**（用户是在说"停"，不是口述内容）
+            if daily_review.wants_stop(text):
+                db.add_log("info", "assistant", "用户要求结束回顾")
+                break
+
+            set_phase("running")
+            out = daily_review.submit(text, client=client)
+            spoken = out.get("spoken") or ""
+            if out.get("ok"):
+                db.add_log("info", "assistant",
+                           f"回顾第 {turns} 轮完成（{out.get('seconds')}s，"
+                           f"播报来源={out.get('source')}）")
+            else:
+                db.add_log("warn", "assistant",
+                           f"回顾第 {turns} 轮失败：{out.get('error')}")
+            _review_speak(spoken)
+            # 下一轮前清掉"让出麦克风"的残留标记，避免上一轮的 stop 影响下一轮录音
+            _capture_stop.clear()
+
+        # 收尾：用户主动喊停才说结束语（异常退出不说，免得听起来像成功了）
+        if _review_stop.is_set():
+            _review_speak("好，今天的回顾就到这儿。")
+        db.add_log("info", "assistant", f"每日回顾结束（共 {turns} 轮）")
+    except Exception as e:
+        db.add_log("error", "assistant", f"每日回顾异常：{type(e).__name__}: {e}")
+        _review_speak("回顾出了点问题，你回面板看一眼。")
+    finally:
+        _review_running.clear()
+        _capture_stop.clear()
+        set_phase(None)
         _release_busy()
 
 

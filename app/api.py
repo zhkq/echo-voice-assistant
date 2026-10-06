@@ -85,6 +85,15 @@ class CaptureIn(BaseModel):
     source: str = "api"
 
 
+class DailyReviewStartIn(BaseModel):
+    force_new: bool = False
+
+
+class DailyReviewSubmitIn(BaseModel):
+    text: str
+    force_new: bool = False
+
+
 class SettingsIn(BaseModel):
     values: dict
 
@@ -306,6 +315,26 @@ def api_capability_backend_stop(_auth=Depends(optional_auth)):
     """停掉 ECHO 自己起的那个后端（手工起的实例一个字节都不动）。"""
     from app import backend_admin
     ok, message = backend_admin.stop()
+    if not ok:
+        raise HTTPException(status_code=400, detail=message)
+    return {"ok": True, "message": message, "backend": backend_admin.view()}
+
+
+@router.post("/capability/backend/take-over")
+def api_capability_backend_take_over(body: Optional[BackendStartIn] = None,
+                                     _auth=Depends(optional_auth)):
+    """**接管后端**：停掉占着端口的「另一棵树的后端」，换成当前这棵树自己的。
+
+    为什么单开一个端点而不是复用 start（2026-10-06 用户报的 bug）：开发版与稳定版
+    轮流跑、**共用 8900/8901**，而切实例时后端不会跟着换 —— 于是新树起来后端口上
+    跑的还是旧树的后端，转写拿 `unauthorized`，面板却说「待启动」。
+    这个端点做的是"停旧 → 起自己的 → 配对照旧跳过（不重新配对）"。
+    **只停命令行证明是 ECHO 后端、且目录属于别的树的那个**；不明进程绝不动手。
+    """
+    from app import backend_admin
+    data = body or BackendStartIn()
+    ok, message = backend_admin.take_over(vram_budget_mb=int(data.vram_budget_mb or 0),
+                                          device=str(data.device or "cuda"))
     if not ok:
         raise HTTPException(status_code=400, detail=message)
     return {"ok": True, "message": message, "backend": backend_admin.view()}
@@ -633,6 +662,58 @@ def post_capture(body: CaptureIn, _auth=Depends(optional_auth)):
 @router.get("/assistant/busy")
 def get_busy(_auth=Depends(optional_auth)):
     return {"busy": assistant.is_busy(), "owner": assistant._busy_owner["name"]}
+
+
+# ---------------------------------------------------------------- 每日回顾
+# 面板侧的三个入口。**语音那条路由**（车里说"我们来回顾今天"）走 assistant 的回顾模式，
+# 不经过这里 —— 这里只让用户能在面板上把"今天这条会话"准备好、看状态、或者中途喊停。
+@router.get("/daily-review")
+def get_daily_review(_auth=Depends(optional_auth)):
+    """回顾状态：开关、就绪原因、今天那条会话、笔记库与工作区。
+
+    只读：**不建会话、不改 DSH 权限**（那两件事有副作用，不该被一次 GET 触发）。
+    """
+    from app import daily_review
+    st = daily_review.status()
+    st["running"] = assistant.review_running()
+    return st
+
+
+@router.post("/daily-review/start")
+def post_daily_review_start(body: DailyReviewStartIn = None, _auth=Depends(optional_auth)):
+    """准备今天的回顾会话（幂等）。`force_new=true` 时当天也重建。"""
+    from app import daily_review
+    force = bool(body and body.force_new)
+    res = daily_review.start(force_new=force)
+    if not res.get("ok"):
+        raise HTTPException(status_code=400, detail=res.get("error") or "回顾未就绪")
+    return res
+
+
+@router.post("/daily-review/submit")
+def post_daily_review_submit(body: DailyReviewSubmitIn, _auth=Depends(optional_auth)):
+    """把一段文本当作"今日口述"提交给回顾会话（面板调试与文本兜底用）。
+
+    返回里的 `spoken` 就是**会被念出来的那句话** —— 面板拿它显示，用户能当场看到
+    "车里将听到什么"，这是调播报长度最直接的入口。
+    """
+    from app import daily_review
+    text = (body.text or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="口述内容为空")
+    out = daily_review.submit(text, force_new=bool(body.force_new))
+    if not out.get("ok"):
+        # 400 还是 200：这里刻意**返回 200 + ok=false**，因为"没等到回复"不是客户端错误，
+        # 而且面板要能显示 spoken（那句给用户听的话）。
+        return out
+    return out
+
+
+@router.post("/daily-review/stop")
+def post_daily_review_stop(_auth=Depends(optional_auth)):
+    """停掉正在进行的语音回顾（等价于用户说"结束回顾"）。"""
+    stopped = assistant.stop_review()
+    return {"ok": True, "stopped": stopped}
 
 
 # ---------------------------------------------------------------- 服务运维

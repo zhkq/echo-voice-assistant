@@ -69,11 +69,22 @@ if (-not (Test-Path $pyw)) { Write-Host "pythonw missing: $pyw" -ForegroundColor
 
 # ECHO refuses to start when the port is already taken (anti-duplicate guard), so
 # "probe then start" can never race with an existing instance.
-# ECHO port: ECHO_PORT env -> data\echo-port.txt -> 8970.
-# Probing the hardcoded 8970 default made this supervisor blind to ECHO once the port
-# moved to 18060, so it spawned a duplicate instance on every loop iteration
-# (2026-09-15: ~80s cycle for hours). Same resolution order as launch-desktop.ps1.
+#
+# Port resolution (2026-10-06): ONE resolver for every script - `scripts\echo-port.py`.
+# Order: config serverPort -> echo-port.txt -> ECHO_PORT (last resort) -> 8970.
+# Why not "ECHO_PORT first" (what this used to do): that variable is inherited from ANY
+# parent (a terminal, a scheduled task, a persistent user variable) and may point at the
+# OTHER tree or at a long-dead port - the log then says "resolved port=18060" while ECHO
+# is really on 8970, and the restart confirms a port nobody is listening on.
+# The config IS the user's choice, so it wins; echo-port.txt is what ECHO actually bound.
 function Resolve-EchoPort([string]$root) {
+    $resolver = Join-Path $PSScriptRoot 'echo-port.py'
+    if ((Test-Path $resolver) -and (Test-Path $py)) {
+        try {
+            $out = (& $py $resolver --data-root $root 2>$null | Select-Object -First 1)
+            if ($out -match '^\d+$') { return [int]$out }
+        } catch { }
+    }
     if ($env:ECHO_PORT) { try { if ([int]$env:ECHO_PORT -gt 0) { return [int]$env:ECHO_PORT } } catch { } }
     $f = Join-Path $root 'data\echo-port.txt'
     if (Test-Path $f) {

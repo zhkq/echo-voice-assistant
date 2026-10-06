@@ -166,9 +166,26 @@ def process_label(pid: int) -> str:
     """pid 的可执行名（``python.exe`` / ``python3``）；说不出来 = 空串。
 
     只是**人话**（"8900 被 python.exe（pid 1234）占着"），不是归属判据 ——
-    归属只能来自 ECHO 自己落的 pid 记录。
+    归属由 ``backend_proc.backend_owner()`` 看命令行里的 ``--config`` 路径决定
+    （那条路径指向哪棵树的后端目录，就是哪棵树的后端）。
     """
     fn = _platform_fn("process_label")
+    return str(fn(int(pid)) or "") if callable(fn) else ""
+
+
+def process_command_line(pid: int) -> str:
+    """pid 的**完整命令行**；说不出来 = 空串（永不抛）。
+
+    这是"这个后端属于哪棵树"的**唯一可靠外部判据**（配合各自的 pid 文件）：
+    后端进程的命令行里带 ``-m server.main --config <后端目录>``，那个目录属于谁就是谁。
+    光看 pid 文件不够 —— 后端可能是**另一棵树**起的，本树压根没有那条记录
+    （2026-10-06 的真实事故：dev 面板显示"待启动"，而 8900 上是稳定版的后端，
+    dev 客户端拿自己的凭据过去只会拿到 ``unauthorized``）。
+
+    取不到是**合法结果**（权限不足 / 进程刚退出 / 系统结构不符）：调用方必须能接受
+    "说不出来"，不许退化成"猜一个来停"（见 ``app/backend_pid.py`` 开头那条铁律）。
+    """
+    fn = _platform_fn("process_command_line")
     return str(fn(int(pid)) or "") if callable(fn) else ""
 
 

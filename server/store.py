@@ -169,6 +169,12 @@ _ADDED_COLUMNS = {
         ("secret_rotated_at", "REAL NOT NULL DEFAULT 0"),
         ("prev_secret_hash", "TEXT NOT NULL DEFAULT ''"),
         ("prev_secret_expires_at", "REAL NOT NULL DEFAULT 0"),
+        # **已撤销标记**（2026-10-06）。撤销原本只是 `token_version += 1`，行留在表里 ——
+        # 那是对的（`revoke()` 的注释：那一行是管理员的账）。但没有标记时，管理面的
+        # 「客户端」列表会把**历次配对动作**留下的行全平铺出来：本机每重新配对一次就多一行
+        # （用户实测 dev 12 行全叫"本机客户端"），而那一页的语义是"成功配对的客户端"。
+        # 有了这一列，列表默认只显示**未撤销**的，历史仍可查（`include_revoked`）。
+        ("revoked_at", "REAL NOT NULL DEFAULT 0"),
     ),
     "pairing_codes": (
         ("name", "TEXT NOT NULL DEFAULT ''"),
@@ -260,10 +266,24 @@ class Store:
                                    (client_id,)).fetchone()
         return dict(row) if row else None
 
-    def clients(self) -> List[Dict[str, Any]]:
+    def clients(self, *, include_revoked: bool = False) -> List[Dict[str, Any]]:
+        """客户端行。**默认不含"已撤销"的**（2026-10-06）。
+
+        为什么默认不收起来（用户给的口径："客户端下列出的应该是**成功配对的客户端**列表，
+        不是配对动作"）：本机每重新配对一次就会新建一个客户端（`Auth.redeem()` 里
+        `new_client_id()`），于是列表里堆着一串"曾经配过、已经不再用"的行 —— dev 实测
+        12 行全叫「本机客户端」。它们每一行都真的配成功过，所以列表并非说谎，但它把
+        "历史配对动作"和"现在在用"平铺在一起，读起来像有 12 个客户端。
+
+        行**不删**（`revoke()` 的注释：那一行是管理员的账），`include_revoked=True`
+        时照旧全都返回 —— 排查"这台机器配过几次"仍然查得到。
+        """
         with self._lock:
-            rows = self._db.execute(
-                "SELECT * FROM clients ORDER BY created_at").fetchall()
+            sql = "SELECT * FROM clients"
+            if not include_revoked:
+                sql += " WHERE COALESCE(revoked_at, 0) = 0"
+            sql += " ORDER BY created_at"
+            rows = self._db.execute(sql).fetchall()
         return [dict(r) for r in rows]
 
     def touch(self, client_id: str) -> None:
@@ -291,15 +311,36 @@ class Store:
         **这是撤销能"立即生效"的全部机制** —— 不删行，只把版本推上去。
         删行会让"这个客户端存在过"这件事消失（审计要用），而且并发下
         "读不到"和"已撤销"在客户端看来是同一个 401，但原因不同。
+
+        2026-10-06 补：**同时盖上 `revoked_at`**。撤销过的客户端不该继续占着
+        管理面「客户端」列表 —— 那一页要的是"成功配对的客户端"（用户给的口径），
+        而本机每重新配对一次就多一行（dev 实测 12 行全叫"本机客户端"）。
+        行**不删**，只是默认不再列出来（`Store.clients(include_revoked=True)` 仍可查）。
         """
         with self._lock:
+            now = time.time()
             self._db.execute(
-                "UPDATE clients SET token_version = token_version + 1, updated_at=? "
-                "WHERE client_id=?", (time.time(), client_id))
+                "UPDATE clients SET token_version = token_version + 1, "
+                "revoked_at = CASE WHEN revoked_at > 0 THEN revoked_at ELSE ? END, "
+                "updated_at=? WHERE client_id=?", (now, now, client_id))
             self._db.commit()
             row = self._db.execute("SELECT token_version FROM clients WHERE client_id=?",
                                    (client_id,)).fetchone()
         return int(row["token_version"]) if row else 0
+
+    def revive(self, client_id: str) -> bool:
+        """把"已撤销"标记清掉（**不动** `token_version`）。
+
+        为什么需要：标记只是"从列表里收起来"，不是永久判决。误标一次要能回退，
+        而且回退不该顺带把凭据又弄得不能用（版本号不归它管）。
+        返回"确实清掉了一个标记吗"。
+        """
+        with self._lock:
+            cur = self._db.execute(
+                "UPDATE clients SET revoked_at=0, updated_at=? WHERE client_id=? AND revoked_at>0",
+                (time.time(), str(client_id or "")))
+            self._db.commit()
+        return bool(cur.rowcount)
 
     def set_disabled(self, client_id: str, disabled: bool) -> None:
         with self._lock:
@@ -591,22 +632,28 @@ class Store:
     # ---------------------------------------------------------------- 配对码
 
     def put_pairing_code(self, code_hash: str, ttl_s: float, created_by: str = "",
-                         name: str = "", scopes: str = "") -> None:
+                         name: str = "", scopes: str = "", client_id: str = "") -> None:
         """存一张待用的配对码。
 
         `name` / `scopes` 是**这张码将要创建的那个客户端**的身份 ——
         设计 §7.4 的"管理员新建客户端时填名字与 scope"就落在这里。
         不带着走的话，兑换出来的客户端只能拿到全局默认 scopes，
         "给这台机器只开 asr"就没法表达。
+
+        `client_id`（2026-10-06 启用）—— **这张码属于哪个已存在的客户端**。
+        空 = 照旧"兑换时新建一个客户端"（给陌生机器发码的语义）。
+        非空 = 兑换时**复用那个身份、只轮换 secret**（给已知机器换凭据的语义）。
+        这一列在建表时就有，但一直恒为空，于是"同一台机器每重新配对一次就多一个
+        client_id"（dev 实测 12 行全叫「本机客户端」）——「一台机器一个身份」的根治点在这。
         """
         now = time.time()
         with self._lock:
             self._db.execute(
                 "INSERT INTO pairing_codes "
-                "(code_hash, created_at, expires_at, created_by, name, scopes) "
-                "VALUES (?,?,?,?,?,?)",
+                "(code_hash, created_at, expires_at, created_by, name, scopes, client_id) "
+                "VALUES (?,?,?,?,?,?,?)",
                 (code_hash, now, now + float(ttl_s), created_by, str(name or ""),
-                 str(scopes or "")))
+                 str(scopes or ""), str(client_id or "")))
             self._db.commit()
 
     def take_pairing_code(self, code_hash: str) -> Optional[Dict[str, Any]]:

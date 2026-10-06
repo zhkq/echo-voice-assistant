@@ -170,7 +170,10 @@ function switchView(name) {
     loadSettings(); loadBoot(); loadBootLogs(); loadWizard(); loadCapabilities(); loadRouter();
     loadVoiceprints();
   }
-  if (view === "business") { loadSettings(); loadQueueCard(); }
+  if (view === "business") {
+    loadSettings(); loadQueueCard();
+    bindDailyReviewCard(); loadDailyReviewCard();
+  }
   // 历史页：`?view=meetings` / `data-goto="meetings"` 这类老入口要落进"会议历史"子页签，
   // 其余情况沿用用户上次看的那一个（默认指令历史）。
   if (view === "history") switchHistoryTab(rawName === "meetings" ? "meetings" : _histTab);
@@ -1351,12 +1354,17 @@ let _runStatusTimer = null;
 //: 为什么要有：同事那台机器的形状是"后端在别人的 GPU 上"，只看本机那份必然显示待启动。
 let _capRoute = null;
 let _capRouteAt = 0;
+//: 「后端」那一格现在能不能**接管**（2026-10-06）：端口被另一棵树的后端占着、
+//: 或者后端在但凭据用不了时置 true —— 此时点那一格 = 停旧的后端 + 起本棵树自己的。
+//: 为什么用模块级变量而不是闭包：点击监听是**常驻**的（`bindBackendTakeOver` 只绑一次），
+//: 而 `refreshRunStatus` 每 5 秒重画一次格子 —— 判定结果得跨重画传下去。
+let _beTakeOver = false;
 
 /* 一级分组（后端 grp）展示顺序 = 业务相关性（只在兜底卡里用到）。 */
 const SET_GROUP_ORDER = ["agent", "model", "provider", "voice", "wake", "meeting",
-  "worklog", "panel", "paths", "router", "dsh"];   // 2026-10-02：provider 一族可见了（AI组件 → 在线服务）
+  "review", "worklog", "panel", "paths", "router", "dsh"];   // 2026-10-02：provider 一族可见了（AI组件 → 在线服务）
 const SET_GROUP_NAMES = { agent: "智能体", model: "模型与引擎", provider: "在线服务", voice: "语音命令",
-  wake: "唤醒词", meeting: "会议", worklog: "纪要归档",
+  wake: "唤醒词", meeting: "会议", review: "每日回顾", worklog: "纪要归档",
   panel: "面板与服务", paths: "存储路径", router: "模型路由", dsh: "DSH 服务" };
 
 /* 二级小节（后端 sub）：**包含在**所属卡片里，不是与它并列的卡片。
@@ -1412,6 +1420,12 @@ const SET_ADV_SEC = {
   // 业务配置 → 朗读与反馈
   voiceConfirm: "朗读与反馈", voiceBrief: "朗读与反馈", maxBriefChars: "朗读与反馈",
   minimalReply: "朗读与反馈", minimalReplyChars: "朗读与反馈", minimalReplyHint: "朗读与反馈",
+  // 业务配置 → 每日回顾
+  dailyReviewWorkspace: "回顾与登记", dailyReviewWorkspaceTitle: "回顾与登记",
+  dailyReviewVaultRoot: "回顾与登记", dailyReviewEnsureSessionAccess: "回顾与登记",
+  dailyReviewSilenceMs: "语音节奏", dailyReviewMaxRecordSec: "语音节奏",
+  dailyReviewReplyTimeoutSec: "语音节奏", dailyReviewBroadcastChars: "播报稿",
+  dailyReviewPrompt: "播报稿",
   // 业务配置 → 工作区与归档（纪要归档那一族在"高级"卡里）
   worklogEnabled: "纪要归档", worklogEnsureSessionAccess: "纪要归档",
   worklogVaultRoot: "纪要归档", worklogPrompt: "纪要归档",
@@ -1514,6 +1528,15 @@ const SET_CARDS = {
     { id: "queue", title: "队列",
       hint: "正在处理的命令与最近几条。",
       common: () => renderQueueCard() },
+    { id: "review", title: "每日回顾",
+      hint: "下班口述今天 → DSH 整理并登记工作日志 → 语音追问；语音反馈要短。",
+      common: ["dailyReviewEnabled"],
+      dynAfter: () => renderDailyReviewCard(),
+      advOrder: ["回顾与登记", "语音节奏", "播报稿"],
+      adv: ["dailyReviewWorkspace", "dailyReviewWorkspaceTitle", "dailyReviewVaultRoot",
+            "dailyReviewEnsureSessionAccess",
+            "dailyReviewSilenceMs", "dailyReviewMaxRecordSec", "dailyReviewReplyTimeoutSec",
+            "dailyReviewBroadcastChars", "dailyReviewPrompt"] },
   ],
 };
 
@@ -2356,6 +2379,95 @@ function renderQueueCard() {
   return `<div id="setQueueHost">${queueBodyHtml()}</div>`;
 }
 
+
+/* ---------------------------------------------------------------- 每日回顾卡
+   用户 2026-10-06 的新功能：下班口述 → DSH 整理并登记工作日志 → 语音追问。
+   这一卡不重复"设置行"（那些在卡片高级区里），只回答两个面板才答得出的问题：
+     ① 现在能不能用（开关/笔记库/今天那条会话）；
+     ② **把一段文字当作口述试跑一次，会念出来的是什么** —— 这是调播报长度最直接的入口，
+        因为车里听到什么完全由技能那段【播报】决定，光看设置调不出来。 */
+let _reviewCache = null;
+
+function reviewBodyHtml() {
+  const st = _reviewCache;
+  if (!st) return `<div class="snote">读不到回顾状态。</div>`;
+  const ready = st.ready;
+  const tone = ready ? "" : "warn";
+  const bits = [];
+  bits.push(ready ? "已就绪" : `不可用：${esc(st.reason || "未知原因")}`);
+  if (st.vault) bits.push(`笔记库：${esc(st.vault)}`);
+  if (st.workspace) bits.push(`工作区：${esc(st.workspace)}`);
+  if (st.sessionId) bits.push(`今天会话：${esc(String(st.sessionId).slice(0, 18))}…`);
+  const running = !!st.running;
+  return `<div class="snote ${tone}"><span>${ready ? "✓" : "⚠"}</span><span>${bits.join("　·　")}</span></div>
+    <div class="sacts" style="margin:6px 0">
+      <button class="btn" data-rv="start" ${ready ? "" : "disabled"}>准备今天这次回顾</button>
+      <button class="btn" data-rv="stop" ${running ? "" : "disabled"}>结束正在进行的回顾</button>
+    </div>
+    <div class="snote"><span>试跑</span><span>把下面这段当"今日口述"发给 DSH，
+      回给你的**播报稿**就是车里会听到的那句（用来调长度最直接）。</span></div>
+    <textarea id="rvText" rows="3" style="width:100%" placeholder="例：今天上午跟供应商对了设备到货，下午把绩效表填完了"></textarea>
+    <div class="sacts" style="margin:6px 0">
+      <button class="btn" data-rv="submit" ${ready ? "" : "disabled"}>提交并看播报稿</button>
+    </div>
+    <div id="rvOut"></div>`;
+}
+
+function renderDailyReviewCard() {
+  return `<div id="setReviewHost">${reviewBodyHtml()}</div>`;
+}
+
+async function loadDailyReviewCard() {
+  const host = $("#setReviewHost");
+  if (!host) return;
+  try { _reviewCache = await api("/api/daily-review"); } catch (e) { _reviewCache = null; }
+  host.innerHTML = reviewBodyHtml();
+}
+
+/** 回顾卡的事件绑定（走**委托**：卡片会整块重绘，绑在宿主上就不会丢）。 */
+function bindDailyReviewCard() {
+  const host = $("#view-business");
+  if (!host || host.dataset.rvBound) return;
+  host.dataset.rvBound = "1";
+  host.addEventListener("click", async (e) => {
+    const el = e.target.closest("[data-rv]");
+    if (!el) return;
+    const act = el.dataset.rv;
+    const out = $("#rvOut");
+    el.disabled = true;
+    try {
+      if (act === "start") {
+        const r = await post("/api/daily-review/start", { force_new: false });
+        toast(r && r.ok ? "今天的回顾会话已就绪" : "没能建立回顾会话");
+      } else if (act === "stop") {
+        await post("/api/daily-review/stop", {});
+        toast("已请求结束这场回顾");
+      } else if (act === "submit") {
+        const text = ($("#rvText") || {}).value || "";
+        if (!text.trim()) { toast("先写一段口述"); return; }
+        if (out) out.innerHTML = `<div class="snote">正在等 DSH 整理…（可能十几秒）</div>`;
+        const r = await post("/api/daily-review/submit", { text: text });
+        // **两个字段分开显示**：spoken 是"会被念出来的"，reply 是完整整理稿。
+        // 合成一段显示的话，用户无法判断"念出来会不会太长"——那正是这一卡要回答的问题。
+        if (out) {
+          out.innerHTML = `<div class="snote ${r.ok ? "" : "warn"}">
+              <span>${r.ok ? "语音会念这句" : "本次没成功"}</span>
+              <span>${esc(r.spoken || "(空)")}${r.source && r.source !== "broadcast"
+                ? `　<span class="dim">（技能没按【播报】契约输出，已用 ${esc(r.source)} 兜底）</span>` : ""}</span>
+            </div>
+            ${r.error ? `<div class="snote warn"><span>原因</span><span>${esc(r.error)}</span></div>` : ""}
+            <details><summary>完整整理稿</summary><pre style="white-space:pre-wrap">${esc(r.reply || "")}</pre></details>`;
+        }
+      }
+    } catch (err) {
+      if (out) out.innerHTML = `<div class="snote warn"><span>失败</span><span>${esc(err.message)}</span></div>`;
+    } finally {
+      el.disabled = false;
+      loadDailyReviewCard();
+    }
+  });
+}
+
 async function loadQueueCard() {
   const host = $("#setQueueHost");
   if (!host) return;
@@ -2683,6 +2795,11 @@ async function loadCapabilityRouting(force) {
     mergeSettingsRows(r.settings || []);
     renderCapPairState(r.pair, r.local);
     renderCapBackends(r.backends || []);
+    // **配对到哪儿变了 → 「本机 / 网络」那两块要跟着重算**（2026-10-06）。
+    // `applyTranscribeSettingsVisibility()` 的判据是 `pair.baseUrl`（回环 = 本机后端），
+    // 而它平时只在"设置页重绘"与"点那个单选"时被调用 —— 首帧可能还没拿到配对数据。
+    // 这里补一次，保证"刚配对完/刚解除配对"之后界面立刻是对的。
+    try { applyTranscribeSettingsVisibility(); } catch (e) { /* 显示层的事，不拖垮加载 */ }
     // 「起本机后端」那张小卡的现状与进度（2026-09-30，批 1d）。**与上面那份数据分开取**：
     // 它要读端口占用（netstat）与 pid 记录，比"读一遍设置"贵，不该拖着整张卡一起慢。
     loadBackendOneClick();
@@ -3399,16 +3516,45 @@ function renderAiCardCommon() {
 /** 转写服务 → 后端设置：**本机后端**看启停/安装，**网络后端**看配对/连接状态
  *  （用户 2026-10-02："本机的话展示启停、安装；网络后端展示配对和连接状态"）。
  *  取值口径：`echo-server` = 能力后端（本机自建的那台也算同一个取值）→ 本机那半边。 */
+/** 这个后端地址是不是"本机"（回环）？
+ *
+ *  口径与 `app/capabilities/echo_server.py::source` 一致（`127.0.0.0/8` / `localhost` / `[::1]`）——
+ *  那里用它判"算不算出网"，这里用它判"后端在本机还是在网络"。**同一件事实，两处判据要一样**。
+ */
+function _isLoopbackUrl(u) {
+  const t = String(u || "").trim().toLowerCase();
+  if (!t) return false;
+  try {
+    const h = new URL(t).hostname.replace(/^\[|\]$/g, "");
+    return h === "localhost" || h === "::1" || /^127\./.test(h);
+  } catch (e) {
+    return /^(https?:\/\/)?(localhost|127\.|\[::1\])/.test(t);
+  }
+}
+
 function applyTranscribeSettingsVisibility(explicit) {
   // ⚠️ `explicit`：**刚点了单选**时必须用它，不能读设置缓存 —— 保存是异步的，
   // 那一刻 `_settingsCache` 还是旧值，结果就是"切了没反应"（2026-10-02 截图逮到）。
   const sel = String(explicit || settingValue("capabilityMeetingAsrBackend", "echo-server")
                      || "echo-server");
-  const local = sel !== "asr-provider";
+  // ⚠️ 这两组的显示**不该由 `sel` 决定**（2026-10-06 用户实测："找不到配对的位置"）。
+  // `sel` 是「转写走哪条路」= 用哪个**实现**（能力后端 vs 在线 qwen3.1），
+  // 而"后端在本机还是在网络"是**另一件事** —— 两者正交：
+  // 选了"能力后端"的人**恰恰最需要配对框**（他就是要连一台能力后端）。
+  // 原来的条件 `local = sel !== "asr-provider"` 把配对框在**默认配置**下藏了起来，
+  // 与 `index.html` 里"刻意不藏……藏起来只会让人找不到入口"的注释正好相反。
+  //
+  // 现在的判据是**配对到哪儿**（`/api/capability` 的 `pair.baseUrl`）：
+  //   * 配对到回环 → 「本机」：出现"起/停本机后端、检测本机后端"那一组；
+  //   * 配对到网络地址（或还没配对）→ 「网络」：出现配对框（地址可改）+ 配对状态。
+  const pairBase = ((_capRouteCache || {}).pair || {}).baseUrl || "";
+  const localPaired = _isLoopbackUrl(pairBase);
   const pair = $("#capPairSettings"), loc = $("#capLocalSettings");
-  if (pair) pair.classList.toggle("hidden", local);
-  if (loc) loc.classList.toggle("hidden", !local);
-}
+  // 配对框**一直留着**：换一台后端与第一次配对是同一件事，藏起来只会让人找不到入口
+  // （`index.html` 那段注释就是这么写的）。用户 2026-10-06 也要求"可以让人修改服务端 ip"。
+  if (pair) pair.classList.remove("hidden");
+  if (loc) loc.classList.toggle("hidden", !localPaired);
+}}
 
 function renderAgentCardCommon() {
   const cur = (_agentsCache || []).find((a) => a.active) || null;
@@ -4171,6 +4317,24 @@ async function refreshRunStatus() {
     : (beRunning ? `本机后端在跑（${be.baseUrl || "—"}）`
                  : (beReady ? "运行时已就绪，后端还没启动" : "本机后端未安装或未就绪"));
   let beState = beRunning ? "online" : (beReady ? "idle" : "offline");
+  // 2026-10-06：**先看"配对的那台能不能用我"，再看"我起没起它"**。
+  // 现场：dev 面板显示「待启动」、点 ↗ 能进管理页、而会议转写报"等待能力后端"——
+  // 真相是 8900 上跑着**稳定版的后端**，客户端拿自己的凭据过去只会拿到 `unauthorized`。
+  // 原来那句"待启动"把人引去查启动，而该做的是**把后端换成自己的**（见下面的接管按钮）。
+  _beTakeOver = false;
+  if (!remote && be && be.foreignBackend) {
+    _beTakeOver = true;
+    beShort = "别人的";
+    beState = "idle";
+    beTip = `8900 上跑的是**另一棵树的后端**（${(be.foreign || {}).root || "?"}）——`
+      + `本机转写会用不了（凭据不属于它）。点这一格可以接管：停掉它、起本棵树自己的。`;
+  } else if (!remote && be && be.usable && !be.usable.ready && be.usableNote) {
+    // 有后端在跑/在就绪，但**它不能用我** —— 这句才是真正的病根，不能让"待启动"盖住它
+    _beTakeOver = !!be.canStart;   // 能起（端口空着/是我们的）时才给接管入口
+    beShort = "不可用";
+    beState = "offline";
+    beTip = `后端在（${be.root || "?"}），但用不了：${be.usableNote}`;
+  }
   if (remote) {
     // 远端才是转写真正走的那台 —— 本机那份"没跑"**不该**被报成故障（那正是让人
     // 以为"没接上"的来源）。短值仍是两个字，细节照旧放 title。
@@ -4196,6 +4360,7 @@ async function refreshRunStatus() {
              _agentLink(ag)),
     _runCard("tts", "语音合成", ttsShort, tts && tts.status === "online" ? "online" : "idle", ttsTip),
   ].join("");
+  bindBackendTakeOver(host);
   applyDashboardRouterVisibility();
   // 自己养一个 5 秒节拍：后端状态是被别处改的，这条不该等用户手动刷新
   // （2026-10-04 用户原话："我刷新后边条就对了" —— 那就别让他刷新）。
@@ -4207,6 +4372,31 @@ async function refreshRunStatus() {
   }
 }
 
+
+/* 「后端」那一格的**接管**入口（2026-10-06）。
+   点它 = POST /api/capability/backend/take-over：停掉占着 8900 的**另一棵树的后端**，
+   起本棵树自己的，配对复用同一份凭据（不重新配对）。
+   只在 `_beTakeOver` 为真时响应 —— 否则点这一格什么也不做（它本来只是状态显示）。
+   为什么绑在宿主上而不是卡片上：`refreshRunStatus` 每 5 秒重画格子，绑卡片会丢监听。 */
+function bindBackendTakeOver(host) {
+  if (!host || host.dataset.beBound === "1") return;
+  host.dataset.beBound = "1";
+  host.addEventListener("click", async (e) => {
+    const card = e.target.closest ? e.target.closest('[data-run="backend"]') : null;
+    if (!card || !_beTakeOver) return;
+    if (card.querySelector(".sb-go") && e.target.closest(".sb-go")) return;  // ↗ 交给链接处理器
+    if (!window.confirm("接管后端？\n\n会停掉当前占着 8900 的另一棵树的后端，"
+                        + "然后起本棵树自己的。凭据是同一份，不需要重新配对。")) return;
+    try {
+      const r = await post("/api/capability/backend/take-over", {});
+      toast(r && r.message ? r.message : "已开始接管");
+    } catch (err) {
+      toast("接管失败：" + err.message);
+    }
+    _capBackendAt = 0;          // 让下一拍立刻重取状态
+    refreshRunStatus().catch(() => {});
+  });
+}
 
 function applyDashboardRouterVisibility() {
   const on = !!settingValue("dashboardShowRouter");

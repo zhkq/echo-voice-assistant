@@ -411,6 +411,9 @@ class StartSequenceTests(_SetupCase):
 
         # 「取薄包」那一步（它排在运行时之前）也要桩掉：它的搜索目录里含着**真实的**
         # Downloads/Desktop，开发机上恰好放着一个 `*.zip` 就会让这条用例随人而变。
+        # `source` 是 2026-10-06 加的"同步后端源码"那一步（见 `app/backend_source.py`）：
+        # 后端跑的是**部署副本**，所以在仓库里改后端代码不会自动生效 —— 这一步把它补上。
+        # 它排在 `runtime` 之后、`configure` 之前，所以步骤序列里要有它。
         with patch.object(backend_proc, "python_exe", lambda: "/fake/python"), \
                 patch.object(backend_fetch, "ensure_package",
                              lambda on_step=None: (True, "薄包已在：X")), \
@@ -421,7 +424,7 @@ class StartSequenceTests(_SetupCase):
         self.assertFalse(res["ok"])
         self.assertEqual(called, [""], "有解释器也必须走 ensure_runtime（判据在它里面）")
         self.assertEqual([s["name"] for s in res["steps"]],
-                         ["package", "runtime", "runtime", "configure"])
+                         ["package", "runtime", "runtime", "source", "configure"])
         said = " ".join(s["detail"] for s in res["steps"] if s["name"] == "runtime")
         self.assertIn("只装了一半", said)
         self.assertNotIn("运行时已在", said)

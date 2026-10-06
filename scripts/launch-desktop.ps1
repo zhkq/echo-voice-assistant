@@ -52,12 +52,24 @@ if (-not (Test-Path $py)) { $py = Join-Path $root 'venv\Scripts\python.exe' }
 $pyAlt = $env:ECHO_PYTHON   # 可选：非 ASCII 路径下的解释器覆盖，见 docs/DEPLOY.md
 if ($pyAlt -and (Test-Path $pyAlt)) { $py = $pyAlt }
 
-# ECHO 面板端口：优先级 ECHO_PORT 环境变量 → data\echo-port.txt → 默认 8970。
+# ECHO 面板端口：**配置 serverPort → echo-port.txt → ECHO_PORT（仅兜底）→ 8970**。
 # 为什么需要：Windows 动态端口段（默认 1024-15000）会被 Hyper-V/WSL 划为保留段且
 # 每次重启漂移，落在其中的端口 bind 会失败（Errno 13），届时必须换端口——
 # 脚本若还盯着旧端口，双击快捷方式就会打开一个空页面。
-# echo-port.txt 由 ECHO 启动时写出（app/main.py），是端口的权威来源。
+# echo-port.txt 由 ECHO 启动时写出（app/main.py），是"实际听了哪儿"的权威来源。
+#
+# 2026-10-06：**解析顺序改成配置优先**，并把解析交给唯一一处 `scripts\echo-port.py`。
+# 原来 `ECHO_PORT` 排第一，而它会从任何父进程继承进来（终端、计划任务、开发机上的
+# 持久用户变量）；它一旦指着**另一棵树**或一个早已废弃的端口，这里就会打开一个死端口
+# —— 日志里那句 "resolved ECHO port=18060" 就是这么来的。
 function Resolve-EchoPort([string]$root) {
+    $resolver = Join-Path $PSScriptRoot 'echo-port.py'
+    if ((Test-Path $resolver) -and (Test-Path $py)) {
+        try {
+            $out = (& $py $resolver --data-root $root 2>$null | Select-Object -First 1)
+            if ($out -match '^\d+$') { return [int]$out }
+        } catch { }
+    }
     if ($env:ECHO_PORT) { try { if ([int]$env:ECHO_PORT -gt 0) { return [int]$env:ECHO_PORT } } catch { } }
     $f = Join-Path $root 'data\echo-port.txt'
     if (Test-Path $f) {

@@ -104,13 +104,18 @@ if (-not (Test-Path $pyw)) { SupLog "pythonw missing: $pyw"; exit 1 }
 $outLog = Join-Path $logDir 'echo-server.log'
 $errLog = "$outLog.err"
 
-# ECHO port: ECHO_PORT env -> data\echo-port.txt -> 8970.
-# Hardcoding 8970 was a real bug (2026-09-15): once the port moved to 18060 the probe
-# below could never see the live ECHO, so the supervisor spawned a duplicate instance
-# every ~80s for hours (each duplicate exits on ECHO's own anti-duplicate guard).
-# Resolution order matches scripts\launch-desktop.ps1, which was fixed when the
-# hardcoded port was removed; this file was missed.
+# Port resolution (2026-10-06): ONE resolver for every script - `scripts\echo-port.py`.
+# Order: config serverPort -> echo-port.txt -> ECHO_PORT (last resort) -> 8970.
+# Putting ECHO_PORT first was wrong: it is inherited from any parent and may point at the
+# OTHER tree or a dead port, which is how this file's probe could miss the live ECHO.
 function Resolve-EchoPort([string]$root) {
+    $resolver = Join-Path $PSScriptRoot 'echo-port.py'
+    if ((Test-Path $resolver) -and (Test-Path $py)) {
+        try {
+            $out = (& $py $resolver --data-root $root 2>$null | Select-Object -First 1)
+            if ($out -match '^\d+$') { return [int]$out }
+        } catch { }
+    }
     if ($env:ECHO_PORT) { try { if ([int]$env:ECHO_PORT -gt 0) { return [int]$env:ECHO_PORT } } catch { } }
     $f = Join-Path $root 'data\echo-port.txt'
     if (Test-Path $f) {

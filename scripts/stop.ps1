@@ -92,6 +92,34 @@ try {
     Write-Step "WARNING: could not scan processes ($($_.Exception.Message)); only the pid file was used"
 }
 
+# ---- 3) our own local capability backend (added 2026-10-06) ----
+# Ports 8900/8901 are shared by BOTH installs (dev and stable run one at a time), so a
+# backend left running after ECHO stops keeps the other tree from starting its own - the
+# next switch then comes up against a backend that answers `unauthorized`.
+# Ownership is decided the SAME way as for ECHO above: read the process command line and
+# require `-m server.main --config <this tree's backend dir>`. The other tree's backend
+# never matches this path, so it is left alone (see the AGENTS.md rule: only stop what is
+# provably ours, never guess a victim).
+$beRoot = Join-Path $base 'backend'
+try {
+    $procs = Get-CimInstance Win32_Process -Filter "Name like 'python%'" -ErrorAction Stop
+    foreach ($p in $procs) {
+        $cmd = [string]$p.CommandLine
+        if ($cmd -notmatch 'server\.main') { continue }
+        if ($cmd -notmatch [regex]::Escape($beRoot)) { continue }
+        Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
+        Write-Step "stopped local capability backend (pid $($p.ProcessId), config under $beRoot)"
+    }
+    # clear the ownership record so a later start is not fooled by a stale pid
+    $bePid = Join-Path $base 'data\logs\backend.pid'
+    if (Test-Path $bePid) {
+        Remove-Item $bePid -Force -ErrorAction SilentlyContinue
+        Write-Step 'cleared the backend pid record'
+    }
+} catch {
+    Write-Step "WARNING: could not scan for the local backend ($($_.Exception.Message))"
+}
+
 if ($stopped.Count -eq 0) {
     Write-Step 'ECHO was not running (or could not be identified)'
     exit 1

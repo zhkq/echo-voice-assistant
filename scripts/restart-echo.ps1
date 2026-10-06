@@ -42,10 +42,27 @@ function Write-Log([string]$message) {
     Add-Content -Path $log -Value $line -Encoding UTF8
 }
 
-# ECHO port: ECHO_PORT env -> data\echo-port.txt -> 8970 (was hardcoded to 8970, which
-# stopped matching the live service once the port moved to 18060 - the restart then
-# "confirmed" a port nobody was listening on).
+# 端口解析：**配置 serverPort → echo-port.txt → ECHO_PORT（仅兜底）→ 8970**。
+# 交给唯一一处 `scripts\echo-port.py`。
+#
+# 2026-10-06（用户报的现场）：面板上的重启按钮走本脚本，而它原来把 `ECHO_PORT`
+# **排在第一**。那个变量会从任何父进程继承进来（终端 / 计划任务 / 开发机上的持久
+# 用户变量），可能指着**另一棵树**或一个早已废弃的端口 —— 于是日志里
+# `resolved ECHO port=18060`，而 ECHO 实际在 8970，重启去等一个没人监听的端口。
+# 判定顺序改为"配置优先"：配置就是用户的显式选择，echo-port.txt 是它实际绑上的。
 function Resolve-EchoPort([string]$root) {
+    $resolver = Join-Path $PSScriptRoot 'echo-port.py'
+    if (Test-Path $resolver) {
+        $py = Join-Path $root 'venv\Scripts\python.exe'
+        if (-not (Test-Path $py)) { $py = Join-Path $root 'runtime-core\python.exe' }
+        if (-not (Test-Path $py)) { $py = $env:ECHO_PYTHON }
+        if ($py -and (Test-Path $py)) {
+            try {
+                $out = (& $py $resolver --data-root $root 2>$null | Select-Object -First 1)
+                if ($out -match '^\d+$') { return [int]$out }
+            } catch { }
+        }
+    }
     if ($env:ECHO_PORT) { try { if ([int]$env:ECHO_PORT -gt 0) { return [int]$env:ECHO_PORT } } catch { } }
     $f = Join-Path $root 'data\echo-port.txt'
     if (Test-Path $f) {
@@ -124,4 +141,25 @@ $deadline = (Get-Date).AddSeconds($PortWaitSeconds)
 while ((Get-Date) -lt $deadline -and -not (Test-EchoPort $port)) { Start-Sleep -Milliseconds 400 }
 if (Test-EchoPort $port) { Write-Log "ECHO is listening again" }
 else { Write-Log "WARNING: ECHO not listening yet after ${PortWaitSeconds}s" }
+
+# Make the local capability backend follow this tree (added 2026-10-06).
+# Ports 8900/8901 are shared by both installs, so after a restart the running backend may
+# belong to the OTHER tree - reachable, but it answers `unauthorized` to this tree's client
+# (the panel used to show "starting", which pointed at the wrong problem).
+# `take-over` settles it either way: it stops a FOREIGN backend (ownership by the process
+# command line's `--config <root>`, never a guess), starts this tree's own when needed, and
+# REUSES the existing pairing - no re-pairing. A backend already belonging to this tree is
+# left untouched.
+if (Test-EchoPort $port) {
+    for ($i = 0; $i -lt 15; $i++) {
+        try {
+            $r = Invoke-RestMethod -Uri "http://127.0.0.1:$port/api/capability/backend/take-over" `
+                 -Method Post -ContentType 'application/json' -Body '{}' -TimeoutSec 120
+            if ($r) { Write-Log ("backend follow-up: " + $r.message) }
+            break
+        } catch {
+            Start-Sleep -Seconds 2
+        }
+    }
+}
 Write-Log "===== restart done ====="

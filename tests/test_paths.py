@@ -356,6 +356,37 @@ class EchoRootOverrideTests(unittest.TestCase):
         self.assertEqual(config.expand_path(""), "")
         self.assertIsNone(config.expand_path(None))
 
+    def test_expand_path_does_not_rewrite_text_templates(self):
+        """含占位符的**文本模板**不许被 normpath 改字（2026-10-06 修的真实 bug）。
+
+        现场：`expand_path('【播报】x【/播报】 … {transcript}')` 返回的是
+        `'【播报】x【\\播报】 … {transcript}'` —— `】/` 被 `os.path.normpath` 折成了 `】\\`。
+        触发条件是"**含 `{占位符}` 且带斜杠**"，所以受影响的是一整类"模板类"设置
+        （提示词模板里既写占位符、又写中文与斜杠），而它**静默**发生：
+        写进去是好的、读回来已变形，面板上看不出、日志里也没有。
+
+        判据分两侧：文本模板必须逐字不变；真正的路径项必须继续被规范化
+        （否则 `{ECHO}/models` 会留成混合分隔符，与用户手填的反斜杠路径比较时还要额外容错）。
+        """
+        from app import config
+        bs = chr(92)
+        templates = [
+            "【播报】x【/播报】 … {transcript}",
+            "{vault}|{date}|{chars}",
+            "归档要求：笔记库根目录：{vault}\n会议标题：{title}\n文件：a/b.md",
+            "路径 C:" + bs + "a" + bs + "b 与 {transcript}",
+        ]
+        for tpl in templates:
+            with self.subTest(tpl=tpl):
+                self.assertEqual(config.expand_path(tpl), tpl,
+                                 "文本模板被 normpath 改字了：%r" % tpl)
+
+        # 路径项行为不变（这两条与上面的 old-behaviour 断言同源，这里再钉一次语义）
+        self.assertEqual(config.expand_path("sensevoice"), "sensevoice")
+        expanded = config.expand_path("{ECHO}/models")
+        self.assertNotIn("/", expanded.replace(os.sep, ""),
+                         "路径项仍应被规范化掉正斜杠：%r" % expanded)
+
     def test_data_root_is_resolved_by_the_paths_layer(self):
         """``db.py`` / ``manager.py`` 的数据根必须来自 paths 层，不许各推导一遍。
 

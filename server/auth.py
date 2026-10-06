@@ -357,6 +357,9 @@ class Auth:
         # 由 `main.lifespan` 起停，测试里手动 `poll_once()`。
         self.watcher = RevocationWatcher(
             store, self.cache, interval_s=float(cfg.get("auth.revoke_poll_s", 5)))
+        #: `last_seen` 的节流表（client_id → 上次写库的时刻）。见 `_touch()`。
+        self._touch_at: Dict[str, float] = {}
+        self._touch_lock = threading.Lock()
 
     # ---- 开关 --------------------------------------------------------------
 
@@ -428,7 +431,40 @@ class Auth:
         if int(row.get("disabled") or 0):
             raise errors.forbidden("这个客户端已被禁用")
         self._check_scope(row, need_scope)
+        self._touch(cid)
         return row
+
+    def _touch(self, client_id: str) -> None:
+        """记一次"这个客户端还活着"（写 `clients.last_seen`），**按间隔节流**。
+
+        为什么需要（2026-10-06 用户给的判据：*"既然列表以客户端为单位，那就需要最后活跃
+        时间，发起调用时更新"*）：`Store.touch()` 早就写好了，注释也写着"刻意不每请求写
+        —— 由调用方节流"，但**全仓没有任何调用点** —— 于是 `last_seen` 恒为 0，
+        管理面「最后活跃」那一列永远显示 `—`，看起来像"这些客户端从没活动过"，
+        而实际上本机客户端刚刚调用了几十次。
+
+        节流是必需的：认证路径每个请求都走，而一次写库要抢 `Store._lock`。
+        间隔取 `auth.touch_interval_s`（默认 60 秒）—— 管理面看的是"分钟级"的活跃度，
+        没必要每个请求都落一次盘。**进程内**记上次写的时间就够（多实例各写各的，
+        最后一次写入赢，对"最后活跃"这个语义完全够用）。
+
+        写失败**绝不能**让一次已经通过的认证变成 500：那会把"记活跃度"这种附带动作
+        升级成可用性问题。
+        """
+        try:
+            interval = float(self.cfg.get("auth.touch_interval_s", 60) or 60)
+        except Exception:
+            interval = 60.0
+        now = time.time()
+        with self._touch_lock:
+            last = self._touch_at.get(client_id, 0.0)
+            if last and (now - last) < interval:
+                return
+            self._touch_at[client_id] = now
+        try:
+            self.store.touch(client_id)
+        except Exception:                                          # pragma: no cover - 兜底
+            pass
 
     def _check_scope(self, client: Dict[str, Any], need_scope: str) -> None:
         if not need_scope:
@@ -444,7 +480,8 @@ class Auth:
     # ---- 配对（§7.4）-------------------------------------------------------
 
     def create_pairing_code(self, created_by: str = "", name: str = "",
-                            scopes: str = "", ttl_s: Optional[float] = None) -> str:
+                            scopes: str = "", ttl_s: Optional[float] = None,
+                            client_id: str = "") -> str:
         """生成一次性配对码，**明文只在这里返回这一次**。
 
         `name` / `scopes` 是**这张码将要创建的那个客户端**的身份（设计 §7.4 的
@@ -455,11 +492,16 @@ class Auth:
         `ttl_s` 不给就用 `auth.pairing_ttl_s`（出厂 15 分钟）。管理面的「发授权」
         表单要能选更长的有效期（例如给外地同事发一天的码），那只是**同一个入口
         的一个入参**，所以参数加在这里，而不是让管理面自己写一遍落库。
+
+        `client_id`（2026-10-06）：这张码是发给**一个已知客户端**的 —— 兑换时复用那个
+        身份、只轮换 secret，而不是新建一个。本机自动配对走的就是这条路（它当然知道
+        自己是哪个 client_id）。空 = 照旧新建（给陌生机器发码）。
         """
         code = new_pairing_code()
         ttl = float(self.cfg.get("auth.pairing_ttl_s", 900)) if ttl_s is None else float(ttl_s)
         self.store.put_pairing_code(hash_pairing_code(code), ttl,
-                                    created_by=created_by, name=name, scopes=scopes)
+                                    created_by=created_by, name=name, scopes=scopes,
+                                    client_id=client_id)
         return code
 
     def redeem(self, code: str, client_name: str = "") -> Dict[str, Any]:
@@ -485,7 +527,23 @@ class Auth:
         # 那份清单就不再是清点了。管理员没填（`--new-pairing-code`）时才用自报的。
         name = str(row.get("name") or "") or client_name or "未命名客户端"
         scopes = str(row.get("scopes") or "") or str(self.cfg.get("auth.default_scopes", "") or "")
-        self.store.upsert_client(cid, name, hash_secret(secret, cid), scopes=scopes)
+        # **复用身份**（2026-10-06 根治）：码上带了 `client_id` 就说明它是发给一个
+        # **已知客户端**的（本机自动配对走这条路）—— 那就只轮换 secret，**不新建一行**。
+        #
+        # 为什么这是根治：原来每兑换一次都 `new_client_id()`，于是同一台机器每重新配对一次
+        # 就多一个客户端（dev 实测 12 行全叫「本机客户端」），管理面那份"成功配对的客户端"
+        # 清单被历次配对动作淹没。`pairing_codes.client_id` 这一列建表时就有，一直空着。
+        #
+        # 安全边界：能拿到这张码的人本来就能换到一份凭据，复用身份**不扩大**这个面
+        # （换来的仍然只是那一个客户端的凭据），而码依然是"一次性、按 TTL 过期"的。
+        # 指定的 client_id 已不存在时（被删 / 换了后端）**回落到新建** ——
+        # 不能因为一个陈旧提示就让客户端配不上对。
+        reuse = str(row.get("client_id") or "").strip()
+        if reuse and self.store.client(reuse) is not None:
+            cid = reuse
+            self.store.rotate_secret(cid, hash_secret(secret, cid))
+        else:
+            self.store.upsert_client(cid, name, hash_secret(secret, cid), scopes=scopes)
         fetched = self.store.client(cid)
         if fetched:
             self.cache.put(fetched)

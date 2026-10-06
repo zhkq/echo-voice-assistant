@@ -97,7 +97,29 @@ def apply(updated, *, harness_timeout=None) -> list:
     if any(k in _STT_KEYS for k in keys):
         out.append(_stt(updated))
 
+    # 每日回顾：改开关或路径要**当场确认能不能用**（笔记库在不在、会话能不能建），
+    # 而不是等用户下班在车里说了才发现"回顾还没配好"。
+    # 只做检查、不建会话：建会话属于"用户真的要回顾"才做的事，不该被一次 PUT 触发。
+    if any(k.startswith("dailyReview") for k in keys):
+        out.append(_daily_review())
+
     return out
+
+
+def _daily_review() -> dict:
+    """每日回顾设置变更后的就绪检查（**只读**：不建会话、不改 DSH 权限）。"""
+    try:
+        from app import daily_review
+        ok, why = daily_review.ready()
+        if not ok:
+            return {"scope": "daily_review", "ok": False, "detail": why}
+        st = daily_review.status()
+        return {"scope": "daily_review", "ok": True,
+                "detail": "每日回顾已就绪：笔记库 %s；工作区 %s" % (
+                    st.get("vault") or "(未配置)", st.get("workspace") or "(未配置)")}
+    except Exception as exc:
+        return {"scope": "daily_review", "ok": False,
+                "detail": "%s: %s" % (type(exc).__name__, exc)}
 
 
 def _wake() -> dict:

@@ -1784,6 +1784,42 @@ class PendingPairingCodesTests(unittest.TestCase):
         self.assertIn("留痕的", hit[0]["target"])
         self.assertIn(out["clientId"], hit[0]["target"])
 
+    def test_the_local_auto_pair_code_is_not_listed_as_pending(self):
+        """**本机自动配对那张码不算待用**（2026-10-06 用户给的判据）。
+
+        原话："配对完也不应该是待用状态……**发出后没有被用的码才叫待用**"。
+
+        本机那张码是机器对机器的握手凭据：客户端一旦有凭据就跳过配对，**永远不会来兑换**，
+        所以它挂在"待用"里是假的（本机实测 dev 那棵树攒了 16 张，页面上看着像有 16 张码
+        等人用，其实一张都不会被用）。
+
+        判据分两侧：`local-pair` 那张**不出现**；人工发的（`cli` / 管理员）**照常出现**
+        —— 后者正是"待用"该追踪的东西。
+        """
+        self.store.put_pairing_code("local-auto", 3600,
+                                    created_by=ops_mod.LOCAL_PAIR_CREATED_BY,
+                                    name="本机客户端")
+        self.store.put_pairing_code("by-human", 3600, created_by="cli", name="给同事的")
+        rows = ops_mod.pending_pairing_codes(self.store)
+        self.assertEqual([r["id"] for r in rows], ["by-human"],
+                         "本机自动配对的码不该进「待用」；人工发的必须还在")
+        # 它**仍在库里**（不是被删掉）—— 客户端真需要配对时还得用它
+        live = {r["code_hash"] for r in self.store.pairing_codes()}
+        self.assertIn("local-auto", live, "本机那张码被删了 —— 客户端重新配对时会拿不到码")
+
+    def test_a_code_for_a_missing_client_falls_back_to_creating_one(self):
+        """码上指的客户端已经不在了 → **回落新建**，不让客户端配不上对。
+
+        "复用"是优化不是前提：指定了一个不存在的 client_id（换了后端 / 被删），
+        仍然必须能配对成功，否则那台机器就彻底进不来了。
+        """
+        n0 = len(self.store.clients())
+        code = self.auth.create_pairing_code("ops", name="新来的", client_id="cli-nonexistent")
+        out = self.auth.redeem(code, "对端自报")
+        self.assertTrue(out["clientId"].startswith("cli-"))
+        self.assertNotEqual(out["clientId"], "cli-nonexistent")
+        self.assertEqual(len(self.store.clients()), n0 + 1, "该新建一个")
+
     def test_a_failed_redeem_leaves_no_audit_row(self):
         """**只记成功**的消费：这是免凭据端点，失败了也记就等于给扫描器一个免费存储
         （与 `admin.audit_write` 那条"不认识是谁的请求不留痕"同一个理由）。"""
@@ -1792,6 +1828,39 @@ class PendingPairingCodesTests(unittest.TestCase):
         hit = [r for r in self.store.recent_audit(20)
                if r["action"] == auth_mod.PAIR_REDEEM_ACTION]
         self.assertEqual(hit, [], "猜码失败也写了审计")
+
+    def test_a_revoked_client_leaves_the_list_but_stays_in_the_store(self):
+        """**撤销 = 从列表里收起来 + 行留着**（2026-10-06 用户给的口径）。
+
+        原话："客户端下列出的应该是**成功配对的客户端**列表，不是配对动作"。
+
+        现场：本机每重新配对一次，`Auth.redeem()` 就 `new_client_id()` 建一个新客户端，
+        于是列表里堆着一串"曾经配过、已经不再用"的行（dev 实测 12 行全叫「本机客户端」）。
+        撤销原本只把 `token_version + 1`，**行还在、列表照样显示**，所以点"撤销"解决不了它。
+
+        判据三侧：① 默认列表里没有它；② `include_revoked=True` 还查得到（**不删行** ——
+        `revoke()` 的注释写明那一行是管理员的账）；③ `revive()` 能收回来，且**不动版本号**
+        （标记只是"收起来"，不是判决，也不该顺带让凭据失效）。
+        """
+        code = self.auth.create_pairing_code("ops", name="本机的")
+        out = self.auth.redeem(code, "本机自报")
+        cid = out["clientId"]
+        self.assertIn(cid, [r["client_id"] for r in self.store.clients()])
+
+        self.store.revoke(cid)
+        self.assertNotIn(cid, [r["client_id"] for r in self.store.clients()],
+                         "撤销后仍出现在客户端列表里")
+        hidden = {r["client_id"]: r for r in self.store.clients(include_revoked=True)}
+        self.assertIn(cid, hidden, "撤销把行删掉了 —— 那一行是管理员的账，不能删")
+        self.assertGreater(float(hidden[cid]["revoked_at"]), 0, "没有盖上撤销时间戳")
+
+        before = int(hidden[cid]["token_version"])
+        self.assertTrue(self.store.revive(cid), "复位没生效")
+        self.assertIn(cid, [r["client_id"] for r in self.store.clients()])
+        after = {r["client_id"]: r for r in self.store.clients()}[cid]
+        self.assertEqual(int(after["token_version"]), before,
+                         "复位动了 token_version —— 标记只是收起来，不该改凭据状态")
+        self.assertFalse(self.store.revive(cid), "已经复位过的还能再复位一次")
 
 
 class AuthTokenTests(unittest.TestCase):
@@ -1822,6 +1891,67 @@ class AuthTokenTests(unittest.TestCase):
         self.assertEqual(claims["sub"], self.client_id)
         self.assertEqual(claims["ver"], 1)
         self.assertIn("jti", claims)
+
+    def test_a_code_carrying_a_client_id_reuses_that_identity(self):
+        """**一台机器一个 client_id**（2026-10-06 根治）。
+
+        现场：`Auth.redeem()` 里 `cid = new_client_id()` —— **每兑换一次就新建一个**。
+        本机每重新配对一次就多一行客户端（dev 实测 12 行全叫「本机客户端」），
+        管理面那份"成功配对的客户端"清单被历次配对动作淹没。
+
+        `pairing_codes.client_id` 这一列建表时就有，一直空着 —— 它就是为这件事留的：
+        发码时记下"这张码属于哪个客户端"，兑换时**复用那个身份、只轮换 secret**。
+
+        判据三侧：① 兑换后的 client_id **与原来相同**；② 客户端**行数不增**；
+        ③ secret 真的换了（旧的不再能换令牌）—— 复用身份不等于"沿用旧凭据"。
+        """
+        n0 = len(self.store.clients())
+        code = self.auth.create_pairing_code("ops", name="还是它", client_id=self.client_id)
+        out = self.auth.redeem(code, "本机自报")
+        self.assertEqual(out["clientId"], self.client_id, "身份没复用 —— 又新建了一个客户端")
+        self.assertEqual(len(self.store.clients()), n0, "客户端行数涨了")
+
+        def basic(secret):
+            return "Basic " + base64.b64encode(
+                ("%s:%s" % (self.client_id, secret)).encode()).decode()
+
+        self.auth.token_for(basic(out["secret"]))          # 新 secret 能用
+        with self.assertRaises(errors.EchoError):          # 旧的不能用了（轮换语义）
+            self.auth.token_for(basic(self.secret))
+
+    def test_a_request_updates_last_seen_but_throttles_the_write(self):
+        """**发起调用要更新"最后活跃"**（2026-10-06 用户给的判据）。
+
+        现场：`Store.touch()` 早就写好了（注释还说"由调用方节流"），但**全仓没有调用点** ——
+        于是 `last_seen` 恒为 0，管理面「最后活跃」永远显示 `—`，看起来像"这些客户端从没
+        活动过"，而本机客户端其实刚调用了几十次。
+
+        判据两侧：① 走一次 `authenticate()` 之后 `last_seen` 真的变了；
+        ② **同一秒内的第二次调用不再写库** —— 认证路径每个请求都走，
+        不节流等于每个请求抢一次 `Store._lock`。
+        """
+        self.assertEqual(float(self.store.client(self.client_id)["last_seen"]), 0.0,
+                         "初始 last_seen 不该非零")
+        self.auth.authenticate(self._bearer())          # 第一次：写
+        first = float(self.store.client(self.client_id)["last_seen"])
+        self.assertGreater(first, 0.0, "认证通过了却没记最后活跃")
+
+        # 第二次：节流窗口内，不该再写（把库里那列**人为改小**再调一次来验）
+        self.store._db.execute("UPDATE clients SET last_seen=? WHERE client_id=?",
+                               (123.0, self.client_id))
+        self.store._db.commit()
+        self.auth.authenticate(self._bearer())
+        self.assertEqual(float(self.store.client(self.client_id)["last_seen"]), 123.0,
+                         "节流没生效 —— 每个请求都在写库")
+
+        # 间隔过了就必须再写（否则"最后活跃"会永远停在第一次）。
+        # 直接清掉节流状态来模拟"间隔已过" —— 比改配置再依赖它被读到更可靠
+        # （配置对象的读取路径有自己的缓存，不该让这条用例去赌它）。
+        with self.auth._touch_lock:
+            self.auth._touch_at.clear()
+        self.auth.authenticate(self._bearer())
+        self.assertGreater(float(self.store.client(self.client_id)["last_seen"]), 123.0,
+                           "过了节流间隔仍不更新")
 
     def test_wrong_secret_is_refused(self):
         other = "Basic " + base64.b64encode(

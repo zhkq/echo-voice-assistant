@@ -78,6 +78,11 @@ def process_label(pid: int) -> str:
     return _posix.process_label(pid)
 
 
+def process_command_line(pid: int) -> str:
+    """pid 的完整命令行（Linux 走 ``/proc/<pid>/cmdline``）—— 归属判据要用它。"""
+    return _posix.process_command_line(pid)
+
+
 def shell_open(target: str, params: str = "") -> bool:
     return _posix.shell_open(target, params, opener=("xdg-open",))
 

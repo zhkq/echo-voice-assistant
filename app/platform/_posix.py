@@ -147,6 +147,42 @@ def process_label(pid: int) -> str:
     return ""
 
 
+def process_command_line(pid: int) -> str:
+    """pid 的**完整命令行**（取不到 = 空串，永不抛）。
+
+    用途与 Windows 那份一致：判断"占用 8900 的后端属于哪棵树"要看命令行的
+    ``--config <后端目录>``（见 ``app/backend_proc.py`` 的归属判据）。
+
+    Linux 优先读 ``/proc/<pid>/cmdline``（NUL 分隔，无外部依赖、最快）；
+    macOS 没有 procfs，退化用 ``ps -ww -o command=``（``-ww`` 是关键：不加会被截断，
+    而我们要找的正是命令行**后半段**的 ``--config`` 路径）。
+    """
+    import subprocess
+    pid = int(pid)
+    if pid <= 0:
+        return ""
+    proc_cmdline = "/proc/%d/cmdline" % pid
+    try:
+        with open(proc_cmdline, "rb") as fh:
+            raw = fh.read()
+        if raw:
+            parts = [p.decode("utf-8", "replace") for p in raw.split(b"\x00") if p]
+            if parts:
+                return " ".join(parts)
+    except Exception:
+        pass
+    for args in (["ps", "-ww", "-p", str(pid), "-o", "command="],
+                 ["ps", "-p", str(pid), "-o", "args="]):
+        try:
+            out = (subprocess.run(args, capture_output=True, text=True,
+                                  timeout=5).stdout or "").strip()
+        except Exception:
+            continue
+        if out:
+            return out.splitlines()[0].strip()
+    return ""
+
+
 def listening_pid(port: int) -> int:
     """谁在监听本机某端口（``lsof`` 优先，退化 ``ss``）。找不到 = 0。"""
     import subprocess

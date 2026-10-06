@@ -46,9 +46,17 @@ ECHO_ROOT = paths.echo_root()
 def expand_path(value):
     """展开配置值里的 {ECHO} / {DATA} 占位符；非字符串原样返回。
 
-    展开后统一走 os.path.normpath：占位符写的是正斜杠（`{ECHO}/data/meetings`），
-    直接拼接会得到 `C:\\...\\ECHO-public/data/meetings` 这种混合分隔符——Windows
-    能用，但日志里难看，且与用户手填的反斜杠路径比较时还需要额外容错。
+    **只对"看起来像路径"的值做 ``os.path.normpath``**（2026-10-06 修的真实 bug）：
+    原来是无条件 normpath，于是**任何含 ``{占位符}`` 且带斜杠的文本设置都会被改字** ——
+    实测 `expand_path('【播报】x【/播报】 … {transcript}')` 返回
+    `'【播报】x【\\播报】 … {transcript}'`：`】/` 被 normpath 折成了 `】\\`。
+    受影响的正是"模板类"设置（提示词模板里通常既写占位符、又写中文与斜杠），
+    而它**静默**发生：写进去是好的、读回来已变形，面板上看不出、日志里也没有。
+
+    原本为什么无条件 normpath：占位符写的是正斜杠（`{ECHO}/data/meetings`），
+    直接拼出来是 `C:\\...\\ECHO-public/data/meetings` 这种混合分隔符 —— Windows 能用，
+    但日志里难看，且与用户手填的反斜杠路径比较时还要额外容错。
+    所以真正的路径项必须继续 normpath，**只有文本模板要放过**（判据见 `_looks_like_path`）。
 
     取值是**调用时**问路径层（不是模块常量），所以 ECHO_ROOT / ECHO_DATA 这类
     环境变量在进程内改了也立刻生效——测试和多实例隔离依赖这一点。
@@ -57,7 +65,27 @@ def expand_path(value):
         return value
     out = (value.replace("{ECHO}", paths.echo_root())
                 .replace("{DATA}", paths.data_root()))
-    return os.path.normpath(out)
+    if _looks_like_path(value):
+        return os.path.normpath(out)
+    return out
+
+
+def _looks_like_path(value: str) -> bool:
+    """这个配置值该不该按路径规范化（见 ``expand_path`` 的说明）。
+
+    判据刻意保守：**只有在"明显不是模板"时才 normpath**，因为 normpath 的代价是改字，
+    而漏掉一次 normpath 只是路径分隔符不统一（Windows 照样能用）。
+
+    * 多行 → 一定是文本（模板/提示词），不是路径；
+    * 去掉 `{ECHO}`/`{DATA}` 之后还剩花括号 → 是文本模板（例如用户模板里别的占位符）；
+    * 其余照旧 normpath（`{ECHO_BASE}/meeting`、`C:\\a\\b`、`sensevoice` 都走这条）。
+    """
+    if "\n" in value or "\r" in value:
+        return False
+    rest = value.replace("{ECHO}", "").replace("{DATA}", "")
+    if "{" in rest or "}" in rest:
+        return False
+    return bool(value.strip())
 
 
 #: 清空密钥用的哨兵值（`Settings.update()` 认它；面板「清除」按钮送它）。
@@ -263,6 +291,31 @@ _WORKLOG_PROMPT_V1 = (
     "2) 幂等：若该幂等键已登记过，跳过重复写入；\n"
     "3) 纪要全文读 {md_path}，不要凭标题推测内容；\n"
     "4) 完成后只回复一句话说明归档结果（写到哪个文件）。")
+
+
+#: 「每日回顾」送入 DSH 的指令模板（2026-10-06）。
+# 设计要点：
+#   * **原始转写是唯一真相**：把 ASR 原文整段交下去，ECHO 不做改写、不做摘要，
+#     技能才能回答"我第二段怎么说的"；
+#   * **播报契约写在指令里**：车内听到什么由技能显式声明（【播报】…【/播报】），
+#     而不是让 ECHO 从一篇整理稿里猜哪句该念（猜必然截错）；
+#   * 长度硬约束同时写进指令（技能侧）与设置项（ECHO 侧）：两侧都拦一道。
+_DAILY_REVIEW_PROMPT_V1 = (
+    "【每日回顾】\n"
+    "笔记库根目录：{vault}\n"
+    "当前时间：{date} {time}（星期{weekday}）\n"
+    "\n"
+    "【今日口述·原始转写】\n"
+    "{transcript}\n"
+    "【/原始转写】\n"
+    "\n"
+    "请按 daily-review 技能执行：整理成工作日志条目并登记进笔记库，然后做遗漏检查与追问。\n"
+    "要求：\n"
+    "1) 原始转写是唯一真相，不要用你的改写覆盖它；\n"
+    "2) 登记前先读当天日志（已存在则追加，不要覆盖），并读昨天日志的待办小节做遗漏检查；\n"
+    "3) 不要臆造专项目录，目录确实存在才挂双向链接；\n"
+    "4) 本回合必须输出恰好一段【播报】…【/播报】：口语化、无 Markdown、"
+    "两句话以内 + 最多一个问题（它是要被念出来的，超过 {chars} 字会被截断）。")
 
 
 #: 由「能力 provider」卡片**附带展示**的非 provider 组配置项。
@@ -624,6 +677,59 @@ DEFAULTS = {
                                               "只对 ECHO 自己创建的工作区生效，"
                                               "你手动改过名字的一律以你的为准",
                                   value_type="str"),
+    # ---------- 每日回顾（开车时的语音回顾 → DSH 整理 → 登记工作日志）----------
+    # 设计（docs/每日回顾-设计.md）：ECHO 只做"语音编排 + 播报"，
+    # 整理/登记/追问的智力全在 DSH 的 daily-review 技能里。
+    #
+    # 三条路径各归其位，**不互相绑死**：
+    #   * 工作区（= 会话 cwd）= {echoBase}/review —— 会话落点与侧栏分组；
+    #   * 笔记库根目录 = 用户自己的 Obsidian 库 —— 技能读历史日志、写 01-工作日志；
+    #   * 两者不是同一个目录，所以**必须**把 DSH 新会话默认权限校正为全盘访问
+    #     （笔记库在工作区之外）。这正是 worklogEnsureSessionAccess 干的事
+    #     （app/worklog.py:91），这里沿用同一个机制，只是开关分开。
+    "dailyReviewEnabled": dict(value=False, grp="review", label="启用每日回顾",
+                               description="开启后可语音发起「回顾今天」：口述 → DSH 整理并登记工作日志 → 语音追问",
+                               value_type="bool"),
+    "dailyReviewWorkspace": dict(value="{ECHO_BASE}/review", grp="review",
+                                 label="回顾会话工作区",
+                                 description="每日回顾的 DSH 会话建在这个目录对应的工作区里，"
+                                             "从而归入侧栏的「每日回顾」分组。{ECHO}/{ECHO_BASE} 都可用",
+                                 value_type="str"),
+    "dailyReviewWorkspaceTitle": dict(value="每日回顾", grp="review", label="回顾分组名",
+                                      description="上面那个工作区在 DSH 侧栏里显示的分组名。"
+                                                  "只对 ECHO 自己创建的工作区生效，"
+                                                  "你手动改过名字的一律以你的为准",
+                                      value_type="str"),
+    "dailyReviewVaultRoot": dict(value="", grp="review", label="回顾用笔记库根目录",
+                                 description="技能读历史日志与待办、写 01-工作日志 的根目录。"
+                                             "留空则沿用「笔记库根目录」（纪要归档那一项）",
+                                 value_type="str"),
+    "dailyReviewEnsureSessionAccess": dict(value=True, grp="review",
+                                           label="回顾前校正会话权限",
+                                           description="回顾要写笔记库，而笔记库在回顾会话的工作区之外，"
+                                                       "权限不足会被沙箱拦下并拖到超时；开启则把 DSH "
+                                                       "新会话默认权限校正为全盘访问（与纪要归档同一机制）",
+                                           value_type="bool"),
+    "dailyReviewMaxRecordSec": dict(value=120, grp="review", label="单次口述上限（秒）",
+                                    description="一段口述最长录多久；到点强制收轮交给 DSH",
+                                    value_type="int"),
+    "dailyReviewSilenceMs": dict(value=1400, grp="review", label="静音收轮（毫秒）",
+                                 description="说完后静音多久算这一段讲完。太短会把思考停顿切断，"
+                                             "太长会让你以为没听见",
+                                 value_type="int"),
+    "dailyReviewReplyTimeoutSec": dict(value=180, grp="review", label="等 DSH 整理上限（秒）",
+                                       description="回顾涉及读日志、写日志、追问，比单轮问答慢",
+                                       value_type="int"),
+    "dailyReviewBroadcastChars": dict(value=120, grp="review",
+                                      label="播报稿字数上限",
+                                      description="技能给的【播报】段超过这个字数就截断并告警；"
+                                                  "语音反馈不能冗长（用户 2026-10-06 明确要求）",
+                                      value_type="int"),
+    "dailyReviewPrompt": dict(value=_DAILY_REVIEW_PROMPT_V1, grp="review",
+                              label="回顾提交模板",
+                              description="送入 DSH 的回顾指令模板；占位符："
+                                          "{vault} {date} {time} {weekday} {transcript}",
+                              value_type="str"),
     # ---------- 纪要归档（工作日志 / 笔记库）----------
     # 设计：ECHO 只负责"把材料备齐 + 定位笔记库"，至于写到哪个目录、日志长什么样、
     # 有哪些专项与例会，全部由用户自己的归档技能（skill）决定。因此这里只有 4 项，

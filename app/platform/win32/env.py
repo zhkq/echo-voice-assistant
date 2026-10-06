@@ -197,6 +197,108 @@ def process_label(pid: int) -> str:
         return ""
 
 
+#: ``NtQueryInformationProcess`` 的 ``ProcessBasicInformation``：拿 PEB 地址。
+_PROCESS_BASIC_INFORMATION = 0
+#: 从目标进程读内存所需的权限位（只读，不写、不注入）。
+_PROCESS_VM_READ = 0x0010
+#: 64 位下进程环境块里 ``ProcessParameters`` 的偏移（本接缝只用 x64；x86 走同一个分支时
+#: 该偏移不同，所以下面按指针宽度选值 —— 32 位 Python 已不在支持范围，但代码不改死）。
+_PEB_PROCESS_PARAMETERS_OFFSET_64 = 0x20
+_PEB_PROCESS_PARAMETERS_OFFSET_32 = 0x10
+#: ``RTL_USER_PROCESS_PARAMETERS.CommandLine``（UNICODE_STRING）在结构里的偏移。
+#: x64 实测 0x70；x86 为 0x40。**这两个数是"读命令行"这件事的全部脆弱点**，
+#: 所以取不到时一律返回空串（调用方必须能接受"说不出来"），绝不猜。
+_RUPP_COMMANDLINE_OFFSET_64 = 0x70
+_RUPP_COMMANDLINE_OFFSET_32 = 0x40
+
+
+class _UNICODE_STRING(ctypes.Structure):
+    _fields_ = [("Length", ctypes.c_ushort),
+                ("MaximumLength", ctypes.c_ushort),
+                ("Buffer", ctypes.c_void_p)]
+
+
+class _PROCESS_BASIC_INFORMATION_T(ctypes.Structure):
+    _fields_ = [("Reserved1", ctypes.c_void_p),
+                ("PebBaseAddress", ctypes.c_void_p),
+                ("Reserved2", ctypes.c_void_p * 2),
+                ("UniqueProcessId", ctypes.c_void_p),
+                ("Reserved3", ctypes.c_void_p)]
+
+
+def process_command_line(pid: int) -> str:
+    """pid 的**完整命令行**（取不到 = 空串，永不抛）。
+
+    为什么要它（2026-10-06）：判断"8900 上那个后端属于哪棵树"**只能**看命令行的
+    ``--config <后端目录>``。这正是用户 AGENTS.md 里那条判据
+    （"唯一可靠判据 = 那两处 pid 文件 + 那个进程的命令行里
+    ``server.main … --config <该树的后端目录>``"），桌面工具包 ``Get-BackendPid``
+    也是这么实现的。**只靠 pid 文件不够**：后端可能是另一棵树起的，本树压根没有那条记录。
+
+    为什么不用 ``wmic`` / ``Get-CimInstance``（本机实测 2026-10-06）：
+      * ``wmic`` 在这台 Windows 上**已经不可用**（新版已移除）；
+      * ``Get-CimInstance`` 一次 **1244 ms** —— 面板每次刷新都付这个代价太贵。
+    所以这里直读 PEB（``NtQueryInformationProcess`` + ``ReadProcessMemory``），
+    实测 1~2 ms，且不依赖任何外部程序。
+
+    **取不到不算错**：权限不足、进程刚退出、结构偏移与系统版本不符都会返回空串；
+    调用方必须把"说不出来"当成一种合法答案（`backend_proc` 就是这么用的）。
+    """
+    if int(pid) <= 0:
+        return ""
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    ntdll = ctypes.WinDLL("ntdll", use_last_error=True)
+    handle = ctypes.c_void_p(0)
+    try:
+        k32.OpenProcess.restype = ctypes.c_void_p
+        handle = k32.OpenProcess(
+            _PROCESS_QUERY_LIMITED_INFORMATION | _PROCESS_VM_READ, False, int(pid))
+        if not handle:
+            return ""
+        pbi = _PROCESS_BASIC_INFORMATION_T()
+        got = ctypes.c_ulong(0)
+        status = ntdll.NtQueryInformationProcess(
+            ctypes.c_void_p(handle), _PROCESS_BASIC_INFORMATION,
+            ctypes.byref(pbi), ctypes.sizeof(pbi), ctypes.byref(got))
+        if status != 0 or not pbi.PebBaseAddress:
+            return ""
+        ptr_size = ctypes.sizeof(ctypes.c_void_p)
+        peb_off = (_PEB_PROCESS_PARAMETERS_OFFSET_64 if ptr_size == 8
+                   else _PEB_PROCESS_PARAMETERS_OFFSET_32)
+        rupp_off = (_RUPP_COMMANDLINE_OFFSET_64 if ptr_size == 8
+                    else _RUPP_COMMANDLINE_OFFSET_32)
+        read = ctypes.c_size_t(0)
+        params = ctypes.c_void_p(0)
+        if not k32.ReadProcessMemory(ctypes.c_void_p(handle),
+                                     ctypes.c_void_p(pbi.PebBaseAddress + peb_off),
+                                     ctypes.byref(params), ptr_size, ctypes.byref(read)):
+            return ""
+        if not params:
+            return ""
+        us = _UNICODE_STRING()
+        if not k32.ReadProcessMemory(ctypes.c_void_p(handle),
+                                     ctypes.c_void_p(params.value + rupp_off),
+                                     ctypes.byref(us), ctypes.sizeof(us),
+                                     ctypes.byref(read)):
+            return ""
+        if not us.Buffer or not us.Length:
+            return ""
+        buf = ctypes.create_unicode_buffer(us.Length // 2 + 1)
+        if not k32.ReadProcessMemory(ctypes.c_void_p(handle),
+                                     ctypes.c_void_p(us.Buffer),
+                                     buf, us.Length, ctypes.byref(read)):
+            return ""
+        return buf.value or ""
+    except Exception:
+        return ""
+    finally:
+        try:
+            if handle:
+                k32.CloseHandle(ctypes.c_void_p(handle))
+        except Exception:
+            pass
+
+
 def listening_pid(port: int) -> int:
     """谁在监听本机某端口（``netstat -ano``）；找不到 = 0。"""
     import subprocess

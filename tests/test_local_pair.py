@@ -78,6 +78,41 @@ class LocalPairFileTests(_ServerCase):
         with self.assertRaises(Exception):
             self.auth.redeem(body["code"], "第二次")
 
+    def test_restarting_the_backend_does_not_pile_up_pairing_codes(self):
+        """**每次启动叫一次 publish，不等于每次发一张新码**（2026-10-06 修）。
+
+        现场（用户报的）：本机客户端一旦判定"已配对到本机回环地址"就**跳过配对** ——
+        它压根不来兑换这张码。而原来每次后端启动都发一张新的，于是每启动一次就多一张
+        没人用的码，管理面「待用配对码」那页跟着涨（本机实测 dev 攒到 16 张）。
+        那页按设计是"与实际库一致"的自证页，所以这不是纯显示问题。
+
+        判据**同时看两个面**：文件里的明文码不变，且**库里行数不增**。
+        只看明文会漏掉"每次发新码但文件总是最后一张"的实现。
+        """
+        first = localpair.publish(self.cfg, self.auth)
+        n1 = len(self.store.pairing_codes())
+        for _ in range(3):                      # 再"启动"三次
+            again = localpair.publish(self.cfg, self.auth)
+            self.assertEqual(again["code"], first["code"], "又发了一张新码 —— 会越积越多")
+        self.assertEqual(len(self.store.pairing_codes()), n1,
+                         "配对码行数涨了：每次启动都在发新码")
+        self.assertEqual(n1, 1, "本机自动配对同一时刻只该有 1 张码")
+
+    def test_a_redeemed_code_is_replaced_by_a_fresh_one(self):
+        """码被兑换走后**必须补一张新的** —— 那时客户端是真的需要它。
+
+        复用不能变成"永远指着同一张已经不存在的码"：客户端凭据损坏/被清时会真的来兑换，
+        那时若文件里是一张查无此码的死码，本机自动配对就彻底断了。
+        """
+        first = localpair.publish(self.cfg, self.auth)
+        self.auth.redeem(first["code"], "本机自动配对")
+        second = localpair.publish(self.cfg, self.auth)
+        self.assertNotEqual(second["code"], first["code"], "兑换后没有换新码")
+        self.assertEqual(len(self.store.pairing_codes()), 1)
+        # 新码必须仍然能用（不是随便回了个字符串）
+        got = self.auth.redeem(second["code"], "本机自动配对")
+        self.assertTrue(got.get("clientId"), "换出来的新码兑换不了：%s" % got)
+
     def test_ttl_comes_from_the_server_setting(self):
         self.cfg.raw["auth"]["local_pair_ttl_s"] = 123.0
         body = localpair.publish(self.cfg, self.auth)

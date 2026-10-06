@@ -390,15 +390,43 @@ def _clear_pid():
         pass
 
 
-#: 这两个端口属于 ECHO 自己与 DSH Desktop，harness 不许占（占了就会互相打架）
-RESERVED_PORTS = {43120, 18060}
+#: DSH Desktop 的端口。它属于**别人**（DSH 装的），所以是常量。
+DSH_DESKTOP_PORT = 43120
+
+
+def reserved_ports():
+    """harness 不许占的端口：DSH Desktop 的 + **ECHO 自己实际在听的**。
+
+    为什么 ECHO 那个**不能写死**（2026-10-06 修）：这里原本是
+    ``RESERVED_PORTS = {43120, 18060}``，而 18060 是开发树上一次"临时改的首选端口"
+    漂移出来的值。开发版与稳定版**共用同一个面板端口**（它们是轮流跑的，
+    见 ``scripts/switch-instance.ps1`` 的说明），而首选端口被占时 ``main.py`` 还会
+    让位到邻近端口 —— 所以"ECHO 的端口"是个**运行时事实**，不是常量。
+    写死的后果：真实端口变了它认不出来（漏报），或者把别人的端口当成自己的（误报）。
+
+    取实际端口的判据复用 ``ports.active_port()``（``echo-port.txt`` 优先）——
+    与边条/脚本用的是同一份事实，不另起一套。
+    """
+    out = {DSH_DESKTOP_PORT}
+    try:
+        from app import ports as _ports
+        preferred = int(settings.get("serverPort", 8970) or 8970)
+        p = int(_ports.active_port(preferred))
+        if 0 < p <= 65535:
+            out.add(p)
+    except Exception:
+        pass
+    return out
 
 
 def port_conflict():
     """端口是不是撞了 Desktop / ECHO 自己？返回一句人话（正常返回空串）。"""
-    if port() in RESERVED_PORTS:
-        return ("harness 端口 %d 被 DSH Desktop（43120）或 ECHO 自己（18060）占用，"
-                "请换成别的端口（默认 43199）" % port())
+    reserved = reserved_ports()
+    if port() in reserved:
+        return ("harness 端口 %d 被 DSH Desktop（%d）或 ECHO 自己（%s）占用，"
+                "请换成别的端口（默认 43199）"
+                % (port(), DSH_DESKTOP_PORT,
+                   "/".join(str(p) for p in sorted(reserved - {DSH_DESKTOP_PORT})) or "—"))
     return ""
 
 

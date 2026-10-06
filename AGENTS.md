@@ -556,7 +556,10 @@ pyannote 4.0.7 在 cu126 上装得上也跑得动（600 秒音频约 26.7 秒，
      权重的真实体积（本机实测）：Qwen3-ASR 1793 MB + ForcedAligner 1755 MB +
      SenseVoice 897 MB + VAD 4 MB + pyannote 221 MB ≈ **4.7 GB**。
 - **尺寸对照**（用来一眼看出包对不对）：
-  `client` ≈ 307 MB（kit 286 + 薄包 21）；`full-local` ≈ 8 GB（再加 3.1 GB 离线包 + 4.7 GB 权重）。
+  `client` ≈ 307 MB（kit 286 + 薄包 21）**——但 `dist` 里存在后端离线包时，`assemble` 会按默认
+  把它一起带上，于是这一层是 ≈3.4 GB**（2026-10-06 实测；要"纯客户端"得先移走离线包，
+  `--scenario` 目前没有"不带离线包"的开关 —— 这是已知的小缺口）；
+  `full-local` ≈ 8 GB（再加 3.1 GB 离线包 + 4.7 GB 权重）。
   **kit 只有个位数 MB = 一定是裸包** ✓。
 - **判据**：`tests/test_delivery_standard.py`（裸包/只带 wheel/合格/坏了都覆盖；
   `full-local` 的权重判据；CLI 面 ✓）。**别把这些判据放松** —— 它挡的是一次真实回退 ✓。

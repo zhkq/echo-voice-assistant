@@ -644,14 +644,40 @@ class HarnessProcTests(unittest.TestCase):
             harness_proc.forget_token()
 
     def test_reserved_ports_are_refused(self):
-        """不许占 Desktop 的 43120 / ECHO 自己的 18060 —— 占了就是互相打架。"""
-        for p in (43120, 18060):
+        """不许占 Desktop 的 43120 与 **ECHO 自己实际在听的那个端口** —— 占了就是互相打架。
+
+        2026-10-06 改：这里原来写死 `(43120, 18060)`。18060 是开发树上一次"临时改的首选
+        端口"漂移出来的值，而产品出厂默认是 **8970**，且首选被占时 `main.py` 还会让位
+        （实际端口由 `echo-port.txt` 决定）。所以判据必须问 `reserved_ports()`
+        —— 写死等于把"这台机器当前碰巧的端口"当成产品行为（这正是 `docs/跨平台约定.md`
+        里那条"环境泄漏"的老毛病）。
+        """
+        from app import harness_proc
+        reserved = harness_proc.reserved_ports()
+        self.assertIn(harness_proc.DSH_DESKTOP_PORT, reserved, "Desktop 的端口必须在保留集里")
+        for p in sorted(reserved):
             with self.subTest(port=p):
                 with patch.object(harness_proc, "port", lambda p=p: p):
                     self.assertTrue(harness_proc.port_conflict())
                     ok, msg = harness_proc.ensure_running()
                     self.assertFalse(ok)
                     self.assertIn("端口", msg)
+
+    def test_the_echo_reserved_port_follows_the_running_port(self):
+        """ECHO 那一项必须**跟着实际端口走**，不能写死。
+
+        判据：伪造一个 `echo-port.txt` 说 ECHO 在 9123，`reserved_ports()` 就该含 9123。
+        这条挡的是"把某个开发机上的端口当成常量"这类漂移。
+        """
+        from app import ports as ports_mod
+        tmp = tempfile.mkdtemp(prefix="echo-resvport-")
+        try:
+            ports_mod.write_port_file(tmp, 9123)
+            with patch.object(ports_mod, "active_port",
+                              lambda default=8970, data_root=None: 9123):
+                self.assertIn(9123, harness_proc.reserved_ports())
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
 
     def test_status_detail_speaks_plainly(self):
         with patch.object(harness_proc, "online", lambda timeout=1.0: False), \

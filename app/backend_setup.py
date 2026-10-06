@@ -680,6 +680,23 @@ def start(*, port: int = backend_proc.DEFAULT_PORT,
         if not record("runtime", ok, detail):
             return {"ok": False, "steps": steps, "message": detail}
 
+    # **第 0.5 步：同步后端源码**（2026-10-06 加，见 `app/backend_source.py` 的文件头）。
+    # 后端跑的是**部署副本**（`{backend}/server/`，来自薄包构建那一刻的快照），
+    # 所以在仓库里改后端代码**不会**自动生效 —— 实测差距 5 个文件、全是当天改的，
+    # 症状是"明明修好了却还是老样子"。
+    # 只在**源码树存在且确有差异**时才动手：装好的机器上没有源码树 → 这一步自动跳过；
+    # 没有差异时连备份都不做（否则每次启动都堆一份）。
+    # **失败不拦**：跑旧代码的后端也好过"因为同步失败所以起不来"（如实记一步就是了）。
+    if fetch_runtime and not python:
+        try:
+            from app import backend_source
+            _root = backend_root()
+            res = backend_source.sync(_root) if _root else {"ok": True, "copied": [],
+                                                           "detail": "没有后端目录"}
+            record("source", bool(res.get("ok")), res.get("detail") or "已是最新")
+        except Exception as e:                                        # pragma: no cover - 兜底
+            record("source", True, "同步源码这一步没跑起来（%s）—— 继续用部署副本里那份" % e)
+
     ok, detail, info = configure(port=port, admin_port=admin_port, device=device,
                                  vram_budget_mb=vram_budget_mb, specs=specs,
                                  models_root_path=models_root_path,

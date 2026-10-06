@@ -233,8 +233,16 @@ ECHO 的 API（默认 8970，权威值见 `data\echo-port.txt`）与模型路由
 > `meetingAutoSummarize`（转写全文会发给 DSH 配置的模型服务）。
 ## 附：端口一览
 
+> **统一原则（2026-10-06 定）**：开发版与稳定版是**轮流跑**的（`scripts/switch-instance.ps1`
+> 切换），所以它们**共用同一套端口与相对路径**，只有**安装位置**不同。
+> 表里凡是"默认"都是两棵树共用的出厂值；改了就以各自的 `data\echo-port.txt` 为准。
+> 谁在跑由 `echo.pid` / 安装根判定，**不要靠端口区分**——
+> 历史上 dev 面板曾被单独改成 18060，结果面板、快捷方式、脚本 fallback、
+> `harness_proc.RESERVED_PORTS` 四处都跟着漂移。
+
 | 端口 | 用途 |
 |---|---|
-| 8970（默认，可改） | ECHO 服务 + 控制面板 + REST API。改过就以 `data\echo-port.txt` 为准（本机为 18060） |
-| 8899（默认，可改） | 模型路由（可选，见 [dsh-failover/README.md](../dsh-failover/README.md)）；改 `dsh-failover/config.json` 的 `port`（本机为 18061） |
+| 8970（默认，两棵树共用） | ECHO 服务 + 控制面板 + REST API。**权威值永远是各自的 `data\echo-port.txt`**：首选端口被占或落在 Windows 保留段时 `main.py` 会让位到邻近端口并把它写回该文件 |
+| 8899（默认）/ 18061 | 模型路由（可选，见 [dsh-failover/README.md](../dsh-failover/README.md)）；端口在 `dsh-failover/config.json` 的 `port`（本机当时是 18061）。**这一项仍是每棵树一份值，尚未统一** |
+| 8900 / 8901 | 能力后端的数据口 / 管理口（`app/backend_setup.py` 里写死，两棵树共用）。**同机只跑一个**，且必须与当前那棵树配对；切树后若后端没跟着换，客户端会拿到 `unauthorized`（不是"连不上"） |
 | 43120 | DSH Desktop 本地 API（ECHO 连它执行指令） |

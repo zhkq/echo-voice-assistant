@@ -83,7 +83,8 @@ def _platform_defaults() -> dict:
 
 # ------------------------------------------------- 安装根（{echoBase}）与六个兄弟目录
 
-#: 安装根下的兄弟目录（设计 §2.2 的六个 + 「起本机后端」新增的 ``backend``）。
+#: 安装根下的兄弟目录（设计 §2.2 的六个 + 「起本机后端」新增的 ``backend``，
+#: 以及「每日回顾」新增的 ``review`` —— 它**不是**数据目录，而是回顾会话的工作区）。
 #: **名字是契约**：迁移表按它写。``backend`` 刻意不在 ``echo-core`` 里，见 backend_root()。
 BASE_DIRS = {
     "core": "echo-core",
@@ -92,6 +93,7 @@ BASE_DIRS = {
     "dsh": "dsh",
     "meeting": "meeting",
     "aide": "aide",
+    "review": "review",
     "backend": "backend",
 }
 
@@ -202,6 +204,29 @@ def command_root() -> str:
     if spec not in _WORKSPACE_FACTORY_VALUES:
         return resolve(spec) or ""
     return base_dir("aide") or os.path.join(echo_root(), "data", "command")
+
+
+#: 「每日回顾」工作区的**出厂值** —— 意思同样是"自动挑"。
+_REVIEW_FACTORY_VALUES = ("", "{ECHO_BASE}/review")
+
+
+def review_workspace_root() -> str:
+    """每日回顾会话的工作区：新布局 ``{echoBase}/review``，老布局 `{ECHO}/review`。
+
+    **为什么与 ``meeting``/``aide`` 平级、而不是塞进它们任何一边**：
+      * 塞进 ``aide``（指令空间）→ 回顾会话会和日常指令会话混在一个侧栏分组里，
+        而两者的语义完全不同（一个是随口指令、一个是当晚的结构化回顾）；
+      * 塞进 ``meeting``（会议空间）→ 更不对，回顾不是一场会议。
+
+    **与笔记库的关系**：笔记库**不是**这个工作区。回顾要写笔记库（在工作区之外），
+    靠的是"把 DSH 新会话默认权限校正为全盘访问"（见 app/daily_review.py）。
+    刻意**不**把工作区设成笔记库：那样等于把整个 Obsidian 库交给 agent 当工作区，
+    边界过宽，而且侧栏分组名会跟用户已有的库工作区打架。
+    """
+    spec = str(_settings_get("dailyReviewWorkspace") or "").strip()
+    if spec not in _REVIEW_FACTORY_VALUES:
+        return resolve(spec) or ""
+    return base_dir("review") or os.path.join(echo_root(), "review")
 
 
 def models_root() -> str:
