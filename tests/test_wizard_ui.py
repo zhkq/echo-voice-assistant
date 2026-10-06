@@ -88,11 +88,17 @@ class WizardUiWiringTests(unittest.TestCase):
         nav = self.html[self.html.index('<nav class="tabs">'):]
         nav = nav[:nav.index("</nav>")]
         hist_btns = re.findall(r'data-view="([a-z]+)"', nav)
-        self.assertEqual(hist_btns, ["dashboard", "settings", "business", "history", "history"],
-                         "顶层按钮：仪表盘/设置/业务配置/指令历史/会议历史（两个 history）：%s"
-                         % hist_btns)
+        # 2026-10-06：加了「回顾历史」→ 三个页签共用 `#view-history`，所以这里有三个
+        # "history"。**按意图断言**（每个视图名都要有容器、且历史只有一份），
+        # 而不是钉死"history 出现几次" —— 后者每加一个子页签都要改一次，
+        # 而它想防的是"新页签只加了一半"（那由下面的容器存在性检查兜住）。
+        self.assertEqual(sorted(set(hist_btns)),
+                         ["business", "dashboard", "history", "settings"],
+                         "顶层视图名只该有这四个（history 由多个子页签共用）：%s" % hist_btns)
+        self.assertGreaterEqual(hist_btns.count("history"), 2,
+                                "历史至少要有个子页签（指令/会议/回顾）：%s" % hist_btns)
         self.assertEqual(self.html.count('id="view-history"'), 1,
-                         "两个历史页签只有一份 #view-history")
+                         "多个历史页签只有一份 #view-history")
 
     def test_switch_view_dispatches_to_the_wizard_loader(self):
         """切到承载向导卡的那一页要顺带把向导卡的数据拉起来（否则展开那张卡是空白）。
