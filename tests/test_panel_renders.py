@@ -53,6 +53,12 @@ REQUIRED_IDS = (
     "capPairSettings",     # 网络后端：配对设置（地址可改）
     "capLocalSettings",    # 本机后端：检测/起/停
     "capKindCards",        # 能力卡容器
+    # 每日回顾（2026-10-06）：仪表盘那张卡 + 「回顾历史」页签的两个宿主。
+    # 它们是新加的界面 —— 漏掉一个用户就"找不到入口"，所以钉在这里。
+    "reviewCard",          # 仪表盘的「每日回顾」卡
+    "reviewHistList",      # 回顾历史：列表
+    "reviewHistDetail",    # 回顾历史：详情
+    "htab-reviews",        # 回顾历史那个子页签的容器
 )
 
 
@@ -82,16 +88,22 @@ class PanelRendersTests(unittest.TestCase):
                       "见文件头那段）。先起 ECHO：powershell -File scripts\\start.ps1 -Background"
                       % BASE)
 
+        # **临时种两条回顾**：只验元素存在是查不出"列表渲染不出来"的（空态与有数据
+        # 走的是两条分支）。种进去 → 渲染 → 断言列表/详情出得来 → 一定清掉。
+        # 为什么用真库（而不是替身）：这条检查的全部意义就是"用户看到的那条路"。
+        seeded = self._seed_reviews()
+
         profile = tempfile.mkdtemp(prefix="echo-edge-")
         try:
             r = subprocess.run(
                 [edge, "--headless=new", "--disable-gpu", "--no-first-run",
                  "--user-data-dir=" + profile, "--virtual-time-budget=4000",
-                 "--dump-dom", BASE + "/"],
+                 "--dump-dom", BASE + "/?view=reviews"],
                 capture_output=True, timeout=300)
             dom = (r.stdout or b"").decode("utf-8", "replace")
         finally:
             shutil.rmtree(profile, ignore_errors=True)
+            self._unseed_reviews(seeded)
 
         self.assertGreater(len(dom), 20000, "DOM 太小（%d 字节）—— 页面可能没渲染" % len(dom))
 
@@ -106,6 +118,44 @@ class PanelRendersTests(unittest.TestCase):
         for label in ("本机后端", "网络后端"):
             self.assertIn(label, dom, "看不到「%s」这个选项" % label)
 
+        # **回顾那两个界面真的渲染出内容了**（不是只有空壳）
+        self.assertIn("每日回顾", dom, "仪表盘上没看到「每日回顾」卡片")
+        self.assertIn("回顾历史", dom, "没看到「回顾历史」页签")
+        self.assertIn("2077-", dom, "回顾历史的列表里没有刚才种进去的那天（列表没渲染）")
+
         # 静态资源不该 404（harness 之外最容易踩的：改了文件名忘了同步）
         for bad in ("ReferenceError", "is not defined"):
             self.assertNotIn(bad, dom, "页面里出现了 '%s' —— 运行时错误" % bad)
+
+    #: 种/清回顾数据用的日期：**故意用未来**，一眼能认出是测试造的，
+    #: 也几乎不可能与用户真实回顾的那天撞上。
+    SEED_DATE = "2077-01-02"
+
+    def _seed_reviews(self):
+        """往真库种两条回顾（一成功一失败）。返回 id 列表供清理。"""
+        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        import app.db as db
+        ids = []
+        ids.append(db.add_command("测试：今天修了后端归属", source="review", status="done",
+                                  session_id="seed-sess",
+                                  meta={"review": True, "date": self.SEED_DATE,
+                                        "kind": "review:" + self.SEED_DATE}))
+        db.update_command(ids[-1], brief="后端归属修好了。", reply="整理稿", duration_ms=1200)
+        ids.append(db.add_command("测试：还有一件事没做", source="review", status="failed",
+                                  meta={"review": True, "date": self.SEED_DATE,
+                                        "kind": "review:" + self.SEED_DATE}))
+        db.update_command(ids[-1], error="DSH 在超时内没有回复", duration_ms=180000)
+        # `ts` 是 `datetime('now')` —— 种不出指定的日期，所以直接把 ts 改到那天
+        for i in ids:
+            db._exec("UPDATE commands SET ts=? WHERE id=?", (self.SEED_DATE + " 21:30:00", i))
+        return ids
+
+    def _unseed_reviews(self, ids):
+        """**一定清掉**（哪怕断言失败）—— 这条用例不该在用户库里留东西。"""
+        try:
+            sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+            import app.db as db
+            for i in ids:
+                db._exec("DELETE FROM commands WHERE id=?", (i,))
+        except Exception:                                          # pragma: no cover - 兜底
+            pass

@@ -96,23 +96,26 @@ class IATabsTests(unittest.TestCase):
         （驱动它们的只有顶层那两个页签），旧断言里"视图内仍有 `.tabs-sm hidden`"随之作废。
         """
         body = _view_body(self.html, "history")
-        for want in ('id="htab-commands"', 'id="htab-meetings"'):
+        for want in ('id="htab-commands"', 'id="htab-meetings"', 'id="htab-reviews"'):
             self.assertIn(want, body, "历史页缺少 %s" % want)
         for gone in ("后续版本", "只预留位置", 'data-goto="meetings"',
                      'class="tabs-sm', '说过的指令'):
             with self.subTest(gone=gone):
                 self.assertNotIn(gone, body, "历史页不该再留着这个残留（%s）" % gone)
-        # 两个子页签各自的列表宿主、清空按钮都在这一页里（ID 不许搬家到别处）
-        for want in ('id="historyList"', 'id="btnClearCmds"', 'id="meetingList"'):
+        # 三个子页签各自的列表宿主、清空按钮都在这一页里（ID 不许搬家到别处）
+        for want in ('id="historyList"', 'id="btnClearCmds"', 'id="meetingList"',
+                     'id="reviewHistList"', 'id="reviewHistDetail"'):
             self.assertIn(want, body, "历史页缺少 %s" % want)
         self.assertIn("function switchHistoryTab(", self.js)
         self.assertIn('$$("[data-htab]")', self.js)
         # 2026-10-02：顶层那两个历史页签（带 data-htab 的 .tab）驱动**同一个** #view-history
         nav = self.html[self.html.index('<nav class="tabs">'):]
         nav = nav[:nav.index("</nav>")]
-        self.assertEqual(nav.count('data-view="history"'), 2,
-                         "顶层要有两个 history 页签（指令历史 / 会议历史）")
-        for htab in ("commands", "meetings"):
+        # 2026-10-06：用户要求"会议历史后面要增加一个回顾历史页签" → 三个页签，
+        # 仍然共用**同一个** #view-history（靠 data-htab 区分子页）。
+        self.assertEqual(nav.count('data-view="history"'), 3,
+                         "顶层要有三个 history 页签（指令历史 / 会议历史 / 回顾历史）")
+        for htab in ("commands", "meetings", "reviews"):
             self.assertIn('data-view="history" data-htab="%s"' % htab, nav,
                           "顶层缺少 data-htab=%s 的历史页签" % htab)
         self.assertEqual(self.html.count('id="view-history"'), 1,
@@ -148,8 +151,8 @@ class MeetingRecordsMergedIntoHistoryTests(unittest.TestCase):
                          "合并后 _VIEWS 应当是 4 项（历史只算一项）：%s" % views)
         nav = self.html[self.html.index('<nav class="tabs">'):]
         nav = nav[:nav.index("</nav>")]
-        self.assertEqual(len(re.findall(r'<button class="tab[ "]', nav)), 5,
-                         "顶层按钮应当是 5 个（仪表盘/设置/业务配置/指令历史/会议历史）")
+        self.assertEqual(len(re.findall(r'<button class="tab[ "]', nav)), 6,
+                         "顶层按钮应当是 6 个（仪表盘/设置/业务配置/指令历史/会议历史/回顾历史）")
         self.assertNotIn('data-view="meetings"', self.html, "「会议记录」不再是顶层页签")
         self.assertNotIn('id="view-meetings"', self.html,
                          "独立的会议视图已删（内容整页并入历史页，不是复制一份）")

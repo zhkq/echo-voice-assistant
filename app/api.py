@@ -716,6 +716,38 @@ def post_daily_review_stop(_auth=Depends(optional_auth)):
     return {"ok": True, "stopped": stopped}
 
 
+# ---- 回顾历史（2026-10-06）：给仪表盘那张卡与「回顾历史」页签 ----
+#
+# 数据来自 `commands` 表里 `source='review'` 的行（见 `daily_review._persist` 的说明：
+# 复用它而不是另建表 —— 字段正好对，且已有索引与分页）。一轮回顾 = 一行。
+@router.get("/daily-review/summary")
+def get_daily_review_summary(_auth=Depends(optional_auth)):
+    """仪表盘那张卡要的**一小口**：今天做没做、最近一次是什么。
+
+    刻意与 `/daily-review/history` 分开：卡片每次刷新都会问，让它读几百行历史不合适。
+    """
+    from app import daily_review
+    return daily_review.history_summary()
+
+
+@router.get("/daily-review/history")
+def get_daily_review_history(limit: int = 60, _auth=Depends(optional_auth)):
+    """回顾历史**按天**倒序（每天一行：轮数、最后一次时间、当天最新播报）。"""
+    from app import daily_review
+    return daily_review.history_list(limit=limit)
+
+
+@router.get("/daily-review/history/{date}")
+def get_daily_review_history_detail(date: str, _auth=Depends(optional_auth)):
+    """某一天的回顾详情：每一轮的原文 + 播报 + 状态，以及当天工作日志的路径。
+
+    日期坏格式返回 **200 + ok=false**（与 `/daily-review/submit` 同一个口径：
+    那不是客户端错误，面板要能拿到 `error` 直接显示）。
+    """
+    from app import daily_review
+    return daily_review.history_detail(date)
+
+
 # ---------------------------------------------------------------- 服务运维
 @router.get("/models")
 def get_models(_auth=Depends(optional_auth)):

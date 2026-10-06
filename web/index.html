@@ -36,6 +36,7 @@
     <button class="tab" data-view="business">业务配置</button>
     <button class="tab" data-view="history" data-htab="commands">指令历史</button>
     <button class="tab" data-view="history" data-htab="meetings">会议历史</button>
+  <button class="tab" data-view="history" data-htab="reviews">回顾历史</button>
   </nav>
 </header>
 
@@ -83,6 +84,23 @@
           <div class="muted" id="meetingInfo">未在录音</div>
         </div>
         <div class="meeting-list" id="recentMeetings"></div>
+      </div>
+
+      <!-- 每日回顾（2026-10-06 用户要求："仪表盘要有一个回顾卡片"）。
+           它和上面两张卡一样是"一件事的入口 + 最近一次"：
+           状态徽章（今天已回顾 / 还没 / 未启用）+ 最近一次播报摘要 + 两个动作。
+           **不放进度条**：回顾是语音多轮交互，进度在「设置 → AI组件」那张小卡里。 -->
+      <div class="card span-2" id="reviewCard">
+        <div class="card-title"><span class="ic">📔</span>每日回顾
+          <span class="badge idle" id="reviewBadge">读取中…</span>
+          <a class="more" id="gotoReviews" href="#">历史 ›</a>
+        </div>
+        <div class="card-body row">
+          <button class="btn big" id="btnReviewNow">开始回顾</button>
+          <button class="btn hidden" id="btnReviewStop">结束回顾</button>
+          <div class="muted" id="reviewInfo">—</div>
+        </div>
+        <div class="muted review-last" id="reviewLast"></div>
       </div>
 
       <!-- 运行情况 + 操作区：仪表盘最下方**一条小横条**（2026-10-02 用户要求：不要两张卡片组，
@@ -548,6 +566,23 @@
           点一场看<b>转写</b>、纪要与导出（详情页右上角的「⬇ 离线HTML」）。
         </div>
         <div id="meetingList" class="meeting-list"></div>
+      </div>
+    </div>
+
+    <!-- ---------- ③ 回顾历史（2026-10-06 用户要求："会议历史后面要增加一个回顾历史页签"） ----------
+         一天一行（那一轮几段口述、当天最新的播报）；点开看当天每一轮的原文与播报，
+         并能直接打开 Obsidian 工作日志 —— 那才是整理后的成果。 -->
+    <div id="htab-reviews" class="htab hidden">
+      <div class="card">
+        <div class="card-title">回顾历史
+          <span class="muted" style="font-size:12px" id="reviewHistCount">—</span>
+          <span class="spacer"></span>
+          <button class="btn mini" id="btnReviewReload" title="重新读取">刷新</button>
+        </div>
+        <div class="card-body">
+          <div id="reviewHistList" class="cmd-list"></div>
+          <div id="reviewHistDetail" class="review-detail hidden"></div>
+        </div>
       </div>
     </div>
   </section>

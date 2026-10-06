@@ -135,13 +135,21 @@ function normView(name) {
 
 /** 历史页两个子页签的切换（**同一实体只有一处渲染**：
  *  指令列表只有 `#historyList`、会议列表只有 `#meetingList`，切页签只是显示/隐藏）。 */
+/* 历史页的三个子页签（2026-10-06 加「回顾历史」）。
+   原来是"不是会议就是指令"的二元写法（`name === "meetings" ? "meetings" : "commands"`），
+   加第三个页签时必须改成白名单 —— 否则任何未知值都会**静默落到指令历史**，
+   深链 `?view=reviews` 会看起来"点了没反应"。 */
+const HIST_TABS = ["commands", "meetings", "reviews"];
+
 function switchHistoryTab(name) {
-  _histTab = (name === "meetings") ? "meetings" : "commands";
+  _histTab = HIST_TABS.indexOf(String(name)) >= 0 ? String(name) : "commands";
   $$("[data-htab]").forEach((b) => b.classList.toggle("active", b.dataset.htab === _histTab));
-  const cmd = $("#htab-commands"), mtg = $("#htab-meetings");
-  if (cmd) cmd.classList.toggle("hidden", _histTab !== "commands");
-  if (mtg) mtg.classList.toggle("hidden", _histTab !== "meetings");
+  HIST_TABS.forEach((t) => {
+    const el = $("#htab-" + t);
+    if (el) el.classList.toggle("hidden", _histTab !== t);
+  });
   if (_histTab === "meetings") { loadMeetings(); refreshMeetingHeader(); }
+  else if (_histTab === "reviews") loadReviewHistory();
   else loadHistory();
 }
 $$("[data-htab]").forEach((b) =>
@@ -960,6 +968,8 @@ $$("[data-goto-link='agent']").forEach((a) =>
 async function refreshDashboard() {
   refreshFailoverCard();            // 模型路由小卡片（独立容错，不阻塞主刷新）
   refreshRunStatus().catch(() => {});   // 「运行情况」四行（后端/Agent/语音合成/路由）
+  bindReviewCard();                 // 每日回顾：绑定一次（内部幂等），再刷新内容
+  refreshReviewCard().catch(() => {});
   // 智能体 Web 界面小图标（独立 harness）：跟着仪表盘刷新一起更新，失败不阻塞
   refreshAgentsForDashboard().catch(() => {});
   try {
@@ -1350,6 +1360,15 @@ let _statusCache = null;        // GET /api/status（服务卡的运行信息）
 //: `_capBackendCache` 的取数时刻（TTL 用，见 refreshRunStatus）+ 底部状态的自刷新节拍
 let _capBackendAt = 0;
 let _runStatusTimer = null;
+//: 每日回顾（2026-10-06）：仪表盘那张卡的摘要缓存 + 首页那点状态 + 历史列表/详情缓存。
+//: 分开三个变量是因为它们的**刷新时机不同**：摘要是每 5 秒一拍（与运行情况同拍），
+//: 而历史只在打开那个页签时拉一次（历史不会自己变）。
+let _reviewCard = null;         // GET /api/daily-review/summary
+let _reviewHome = null;         // GET /api/daily-review（开关/就绪原因）
+let _reviewHist = null;         // GET /api/daily-review/history
+let _reviewDetail = null;       // GET /api/daily-review/history/<date>
+let _reviewOpenDate = "";       // 详情展开的是哪一天（点第二次收起）
+let _reviewTimer = null;        // 仪表盘那张卡的 5 秒节拍（与运行情况同拍）
 //: 「后端」卡要不要显示**远端**（配对来的）而不是本机那个 —— 见 refreshRunStatus。
 //: 为什么要有：同事那台机器的形状是"后端在别人的 GPU 上"，只看本机那份必然显示待启动。
 let _capRoute = null;
@@ -4414,8 +4433,247 @@ async function refreshRunStatus() {
 }
 
 
-/* 「后端」那一格的**接管**入口（2026-10-06）。
-   点它 = POST /api/capability/backend/take-over：停掉占着 8900 的**另一棵树的后端**，
+/* ================= 每日回顾（2026-10-06，用户要求）=================
+
+   两处界面：
+     ① 仪表盘一张卡（`#reviewCard`）：今天做没做 + 最近一次播报摘要 + 「开始回顾」；
+     ② 「历史 → 回顾历史」页签：按天列表 + 某天的逐轮详情 + 打开工作日志。
+
+   **数据全在 ECHO 自己这边**：`commands` 表里 `source='review'` 的行（见
+   `app/daily_review._persist` 的说明 —— 复用它而不是另建表，字段正好对）。
+   刻意**不去读 DSH 的会话文件**（zstd 压缩的 jsonl、格式会变）。
+
+   为什么摘要与历史分开两个接口：卡片每 5 秒问一次（与运行情况同拍），
+   让它读几百行历史不合适；历史只在打开页签时拉一次。 */
+
+/** 仪表盘那张回顾卡：三态 + 两个动作。
+ *
+ *  状态口径（与 `/api/daily-review/summary` 一一对应）：
+ *    * 未启用（或没配笔记库）→ 说清缺什么，并把人送去设置；
+ *    * 今天已回顾 → 显示今天几轮 + 最近一条播报；
+ *    * 今天还没回顾 → 鼓动开始（按钮就是「开始回顾」）。
+ */
+async function refreshReviewCard() {
+  const badge = $("#reviewBadge"), info = $("#reviewInfo"), last = $("#reviewLast");
+  if (!badge) return;
+  // 首页那点状态（开关/就绪原因）与摘要分开取：前者变了要立刻反映（用户刚改过设置）
+  try { _reviewHome = await api("/api/daily-review"); } catch (e) { _reviewHome = null; }
+  try { _reviewCard = await api("/api/daily-review/summary"); }
+  catch (e) { _reviewCard = null; }
+
+  const home = _reviewHome || {}, sum = _reviewCard || {};
+  const on = !!home.enabled;
+  const readyOk = !!home.ready;
+  const running = !!home.running;
+
+  const btnNow = $("#btnReviewNow"), btnStop = $("#btnReviewStop");
+  const show = (el, yes) => { if (el) el.classList.toggle("hidden", !yes); };
+  // 运行中：按钮换成「结束回顾」（与「设置」那张小卡的行为一致）
+  show(btnNow, !running);
+  show(btnStop, running);
+  if (btnNow) btnNow.disabled = !on;
+
+  let state = "idle", short = "还没回顾", tip = "";
+  if (!on) {
+    state = "offline"; short = "未启用"; tip = "每日回顾没打开 —— 在「设置 → AI组件」里启用";
+  } else if (!readyOk) {
+    state = "offline"; short = "未就绪"; tip = home.reason || "回顾还没配好";
+  } else if (running) {
+    state = "online"; short = "进行中"; tip = "正在回顾（在车里说，或点「结束回顾」）";
+  } else if (sum.todayTurns > 0) {
+    state = "online"; short = "今天已回顾"; tip = `今天 ${sum.todayTurns} 轮`;
+  } else {
+    state = "idle"; short = "今天还没回顾"; tip = "点「开始回顾」，或在车里说「我们来回顾今天」";
+  }
+  badge.textContent = short;
+  badge.className = "badge " + state;
+  badge.title = tip;
+
+  if (info) {
+    if (!on) info.innerHTML = `回顾没启用 —— <a href="#" data-goto-link="settings">去设置里打开 ›</a>`;
+    else if (!readyOk) info.textContent = home.reason || "回顾还没配好";
+    else if (running) info.textContent = "正在回顾…（说完一段等它整理，再说下一段）";
+    else info.textContent = sum.todayTurns > 0
+      ? `今天已经回顾 ${sum.todayTurns} 轮${sum.todayFailed ? `（${sum.todayFailed} 轮没成）` : ""}`
+      : "今天还没回顾";
+  }
+  if (last) {
+    const brief = String(sum.lastBrief || "").trim();
+    const when = String(sum.lastAt || "").slice(5, 16);       // MM-DD HH:MM
+    const text = String(sum.lastText || "").trim();
+    if (!brief && !text) {
+      last.textContent = "";
+    } else {
+      last.innerHTML = `最近一次 ${esc(when)}：`
+        + `<b>${esc(brief || "（那次没拿到播报）")}</b>`
+        + (text ? `<span class="muted"> · 我说的是「${esc(text)}」</span>` : "");
+      if (String(sum.lastStatus || "") === "failed") last.innerHTML += ` <span class="sbadge warn">那次失败了</span>`;
+    }
+  }
+}
+
+async function doReviewStart() {
+  const btn = $("#btnReviewNow");
+  if (btn) btn.disabled = true;
+  try {
+    const r = await post("/api/daily-review/start", { force_new: false });
+    toast(r && r.session_id ? "回顾会话已就绪 —— 在车里说，或用麦克风" : "回顾已开始");
+  } catch (e) {
+    toast("开始回顾失败：" + e.message, 4200);
+  }
+  refreshReviewCard().catch(() => {});
+}
+
+async function doReviewStop() {
+  try { await post("/api/daily-review/stop", {}); toast("已请求结束回顾"); }
+  catch (e) { toast("结束回顾失败：" + e.message, 4200); }
+  refreshReviewCard().catch(() => {});
+}
+
+/* ---- 「回顾历史」页签 ---- */
+
+async function loadReviewHistory(force) {
+  const list = $("#reviewHistList"), cnt = $("#reviewHistCount");
+  if (!list) return;
+  if (!_reviewHist || force) {
+    list.innerHTML = `<div class="muted" style="font-size:12px">读取中…</div>`;
+    try { _reviewHist = await api("/api/daily-review/history"); }
+    catch (e) {
+      _reviewHist = null;
+      list.innerHTML = `<div class="muted" style="font-size:12px">读不到回顾历史：${esc(e.message)}</div>`;
+      return;
+    }
+  }
+  const items = (_reviewHist && _reviewHist.items) || [];
+  if (cnt) cnt.textContent = items.length ? `${items.length} 天` : "—";
+  if (!items.length) {
+    // 空态要说清"去哪儿开始"，不能只说"没有"
+    list.innerHTML = `<div class="muted" style="font-size:12px">还没有回顾记录 ——
+        在<b>仪表盘</b>的「每日回顾」卡上点「开始回顾」，或在车里说「我们来回顾今天」。</div>`;
+    const d = $("#reviewHistDetail");
+    if (d) { d.classList.add("hidden"); d.innerHTML = ""; }
+    return;
+  }
+  list.innerHTML = items.map((it) => {
+    const when = esc(String(it.lastAt || "").slice(5, 16));
+    const open = _reviewOpenDate === it.date;
+    return `<div class="cmd-item review-day${open ? " open" : ""}" data-review-date="${esc(it.date)}">
+        <div class="head">
+          <b>${esc(it.date)}</b>
+          <span class="muted">· ${it.turns} 轮${it.failed ? ` · <span class="sbadge warn">${it.failed} 轮失败</span>` : ""}
+            · 最后 ${when}</span>
+        </div>
+        <div class="text">${esc(it.brief || "（那天没有播报记录）")}</div>
+      </div>`;
+  }).join("");
+}
+
+/** 某一天的详情：逐轮的原文 + 播报（+ 那一轮的错误），外加"打开工作日志"。 */
+async function openReviewDay(date) {
+  const host = $("#reviewHistDetail");
+  if (!host) return;
+  if (_reviewOpenDate === date) {                 // 再点一次收起
+    _reviewOpenDate = ""; _reviewDetail = null;
+    host.classList.add("hidden"); host.innerHTML = "";
+    loadReviewHistory();
+    return;
+  }
+  _reviewOpenDate = date;
+  host.classList.remove("hidden");
+  host.innerHTML = `<div class="muted" style="font-size:12px">读取 ${esc(date)} 的详情…</div>`;
+  try { _reviewDetail = await api("/api/daily-review/history/" + encodeURIComponent(date)); }
+  catch (e) {
+    host.innerHTML = `<div class="muted" style="font-size:12px">读不到详情：${esc(e.message)}</div>`;
+    return;
+  }
+  const d = _reviewDetail || {};
+  if (!d.ok) { host.innerHTML = `<div class="muted" style="font-size:12px">${esc(d.error || "读不到")}</div>`; return; }
+  const turns = d.turns || [];
+  // ⚠️ **不提供"打开日志"按钮**（2026-10-06 夜里定的）：ECHO 没有"用系统程序打开任意路径"
+  // 的接口，而为了一个按钮新增一个能执行 shell 的入口不值得（安全面换便利，且这类接口
+  // 一旦有了就会被别处复用）。改成**显示完整路径 + 复制**：
+  // Obsidian 用户本来就在 Obsidian 里工作，粘过去一步就到位。
+  const noteRow = d.vaultNote
+    ? `<div class="review-note">
+         <button class="btn mini" id="btnCopyVaultNote" data-note="${esc(d.vaultNote)}">复制日志路径</button>
+         <span class="muted" style="font-size:12px">${d.vaultNoteExists
+           ? "整理后的条目录在：" : "这次的工作日志还没生成（DSH 可能没写完）："}
+           <code class="smono">${esc(d.vaultNote)}</code></span>
+       </div>`
+    : "";
+  host.innerHTML = `
+    <div class="review-detail-head">
+      <b>${esc(d.date)}</b>
+      <span class="muted">共 ${turns.length} 轮</span>
+      <span class="spacer"></span>
+      <button class="btn mini" id="btnReviewDetailClose">收起</button>
+    </div>
+    ${noteRow}
+    ${turns.length ? turns.map((t, i) => `
+      <div class="review-turn">
+        <div class="review-turn-head">
+          <b>第 ${i + 1} 轮</b>
+          <span class="muted">${esc(String(t.at || "").slice(11, 19))} · ${t.seconds}s</span>
+          ${t.status === "failed" ? `<span class="sbadge warn">失败</span>` : ""}
+        </div>
+        <div class="review-said"><span class="muted">我说：</span>${esc(t.text || "")}</div>
+        ${t.brief ? `<div class="review-brief"><span class="muted">播报：</span>${esc(t.brief)}</div>` : ""}
+        ${t.error ? `<div class="muted" style="font-size:12px">错误：${esc(t.error)}</div>` : ""}
+      </div>`).join("")
+      : `<div class="muted" style="font-size:12px">这一天没有可显示的轮次。</div>`}`;
+  loadReviewHistory();          // 重画列表让"选中的那天"高亮
+}
+
+/* 每日回顾的绑定（一次，重绘不用重绑 —— 与 `bindBackendTakeOver` 同一个理由：
+   卡里的内容由 `refreshReviewCard` 每 5 秒重画，绑在按钮上会丢监听）。 */
+function bindReviewCard() {
+  const now = $("#btnReviewNow"), stop = $("#btnReviewStop"), go = $("#gotoReviews");
+  if (now) now.addEventListener("click", doReviewStart);
+  if (stop) stop.addEventListener("click", doReviewStop);
+  if (go) go.addEventListener("click", (e) => { e.preventDefault(); switchHistoryTab("reviews"); switchView("history"); });
+
+  // 「回顾历史」：列表用**事件委托**（每次重画都换新节点，绑在容器上就不会丢）
+  const list = $("#reviewHistList"), host = $("#reviewHistDetail");
+  if (list && list.dataset.bound !== "1") {
+    list.dataset.bound = "1";
+    list.addEventListener("click", (e) => {
+      const day = e.target.closest ? e.target.closest("[data-review-date]") : null;
+      if (day) openReviewDay(day.dataset.reviewDate);
+    });
+  }
+  if (host && host.dataset.bound !== "1") {
+    host.dataset.bound = "1";
+    host.addEventListener("click", async (e) => {
+      if (e.target.closest && e.target.closest("#btnReviewDetailClose")) {
+        _reviewOpenDate = ""; _reviewDetail = null;
+        host.classList.add("hidden"); host.innerHTML = "";
+        loadReviewHistory();
+        return;
+      }
+      // 「复制日志路径」：**不替用户打开**（ECHO 没有"用系统程序打开任意路径"的接口，
+      // 而夜里为这个加一个能执行 shell 的入口不值得 —— 见 openReviewDay 里的说明）。
+      // 复制走与别处**同一个**内联写法（`navigator.clipboard.writeText`）：
+      // 本来该抽成一个 `copyText()` 助手，但那要同时改另外三处，夜里不划算。
+      const cp = e.target.closest ? e.target.closest("#btnCopyVaultNote") : null;
+      if (cp && cp.dataset.note) {
+        try { await navigator.clipboard.writeText(cp.dataset.note); toast("已复制工作日志路径"); }
+        catch (err) { toast("复制失败：" + err.message, 3600); }
+      }
+    });
+  }
+  const reload = $("#btnReviewReload");
+  if (reload) reload.addEventListener("click", () => loadReviewHistory(true));
+
+  // 与「运行情况」同拍（5 秒）—— 但只在仪表盘可见时问，别在后台空转
+  if (!_reviewTimer) {
+    _reviewTimer = setInterval(() => {
+      const dash = $("#view-dashboard");
+      if (dash && !dash.classList.contains("hidden")) refreshReviewCard().catch(() => {});
+    }, 5000);
+  }
+}
+
+/* 「后端」那一格的**接管**入口（2026-10-06）。   点它 = POST /api/capability/backend/take-over：停掉占着 8900 的**另一棵树的后端**，
    起本棵树自己的，配对复用同一份凭据（不重新配对）。
    只在 `_beTakeOver` 为真时响应 —— 否则点这一格什么也不做（它本来只是状态显示）。
    为什么绑在宿主上而不是卡片上：`refreshRunStatus` 每 5 秒重画格子，绑卡片会丢监听。 */

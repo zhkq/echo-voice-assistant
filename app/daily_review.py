@@ -415,7 +415,158 @@ def submit(transcript: str, client=None, force_new=False, timeout=0):
         db.add_log("warn", "daily_review", f"回顾提交失败：{type(e).__name__}: {e}")
     finally:
         out["seconds"] = round(time.time() - t0, 1)
+        try:
+            _persist(transcript, out)
+        except Exception as e:                                     # pragma: no cover - 兜底
+            # **落库失败不许影响这次回顾**：用户已经在车里听到播报了，
+            # 记不进去只该在日志里留一句（历史页少一条，比"回顾失败"轻得多）。
+            db.add_log("warn", "daily_review", f"回顾落库失败：{type(e).__name__}: {e}")
     return out
+
+
+#: `commands.source` 里给回顾用的标记。**复用它而不是另建一张表**（2026-10-06 的决定）：
+#: `commands` 的字段正好对得上 —— `text` 是我口述的原文、`reply` 是整理结果、
+#: `brief` 是播报（`spoken`）、还有 `session_id/duration_ms/error/meta`，
+#: 而且它已经有 `idx_commands_ts` 索引与分页查询。另建表等于把这些再抄一遍。
+REVIEW_SOURCE = "review"
+
+
+def _persist(transcript: str, out: dict) -> int:
+    """把**一轮**回顾写进 `commands`（源标记 `source='review'`）。返回那行的 id。
+
+    为什么一轮一条（而不是一天一条）：回顾是**多轮**的 —— 每轮用户说一段、DSH 整理一次。
+    一轮一条最自然，也最有信息量（哪一轮说了什么、播报了什么都在）。
+    历史页按 `date` 分组展示（见 `history_list()`），所以"按天看"的体验不受影响。
+
+    `meta` 里放 `date`（`YYYY-MM-DD`）与 `kind`（`review:YYYY-MM-DD`，即那条 DSH 会话的
+    登记键）—— 前者让"按天取"是一次简单的等值查询，后者让排障时能直接对上会话。
+    失败也记（`status='failed'` + `error`）：**"哪几次回顾失败了"必须查得到**，
+    否则用户说"昨天那次没记上"时无从判断。
+    """
+    import app.db as db
+
+    ok = bool(out.get("ok"))
+    now = time.localtime()
+    date = time.strftime("%Y-%m-%d", now)
+    row_id = db.add_command(
+        transcript,
+        source=REVIEW_SOURCE,
+        status="done" if ok else "failed",
+        session_id=str(out.get("session_id") or ""),
+        meta={"review": True, "date": date, "kind": today_kind(),
+              "workspace": str(out.get("workspace") or ""),
+              "spokenSource": str(out.get("source") or "")})
+    db.update_command(
+        row_id,
+        reply=str(out.get("reply") or ""),
+        brief=str(out.get("spoken") or ""),
+        duration_ms=int(round(float(out.get("seconds") or 0) * 1000)),
+        error="" if ok else str(out.get("error") or ""))
+    return int(row_id)
+
+
+def _rows_for_date(date: str) -> list:
+    """某一天的全部回顾轮次（按时间正序 —— 详情页要按"先说的在前"读）。"""
+    import app.db as db
+    return db._query(                                            # noqa: SLF001 - 同包内部工具
+        "SELECT * FROM commands WHERE source=? AND ts LIKE ? ORDER BY ts ASC, id ASC",
+        (REVIEW_SOURCE, str(date) + "%"))
+
+
+def history_list(limit: int = 60) -> dict:
+    """回顾历史：**按天倒序**，每天给出轮数、最后一次的时间与播报摘要。
+
+    一天一行（而不是一轮一行）—— 用户问"回顾历史"时想看的是**哪天做了回顾、
+    那天说了什么**；一天几十轮的原始记录堆在列表里没法看。轮次留给详情页。
+    """
+    import app.db as db
+    rows = db._query(                                            # noqa: SLF001
+        "SELECT id, ts, brief, error, status, session_id FROM commands "
+        "WHERE source=? ORDER BY ts DESC, id DESC", (REVIEW_SOURCE,))
+    days, order = {}, []
+    for d in rows:
+        date = str(d.get("ts") or "")[:10]
+        if not date:
+            continue
+        if date not in days:
+            days[date] = {"date": date, "turns": 0, "failed": 0,
+                          "lastAt": str(d.get("ts") or ""),
+                          "brief": "", "sessionId": ""}
+            order.append(date)
+        item = days[date]
+        item["turns"] += 1
+        if str(d.get("status") or "") == "failed":
+            item["failed"] += 1
+        # 摘要取**当天最新一条有内容的播报**：行是按 `ts DESC` 来的，所以"这一天第一次出现"
+        # 就是最新那条 —— 只在第一次填，别被后面（更早）的覆盖掉。
+        # ⚠️ 这里**不**退回 `text`：`brief` 是"念给用户听的那句"，列表里混入口述原文
+        # 会让"摘要"这一列时而是播报、时而是原文，读起来像两种东西。
+        if item["turns"] == 1 and str(d.get("brief") or "").strip():
+            item["brief"] = str(d["brief"]).strip()
+        if not item["sessionId"]:
+            item["sessionId"] = str(d.get("session_id") or "")
+    items = [days[d] for d in order][: max(1, int(limit or 60))]
+    return {"items": items, "total": len(order), "today": time.strftime("%Y-%m-%d")}
+
+
+def history_detail(date: str) -> dict:
+    """某天的回顾详情：每一轮的原文 + 播报 + 状态，外加当天工作日志的路径与是否在。
+
+    `vaultNote` 是**最终成果所在**（DSH 技能把整理好的条目写进 Obsidian 工作日志）——
+    面板给一个"打开它"的按钮，用户就能从"我说了什么"跳到"记成了什么"。
+    """
+    import os
+
+    date = str(date or "").strip()
+    if len(date) != 10 or date[4] != "-" or date[7] != "-":
+        return {"ok": False, "error": "日期格式要是 YYYY-MM-DD", "date": date}
+    rows = _rows_for_date(date)
+    turns = []
+    for r in rows:
+        turns.append({
+            "id": int(r.get("id") or 0),
+            "at": str(r.get("ts") or ""),
+            "text": str(r.get("text") or ""),
+            "reply": str(r.get("reply") or ""),
+            "brief": str(r.get("brief") or ""),
+            "status": str(r.get("status") or ""),
+            "error": str(r.get("error") or ""),
+            "seconds": round(float(r.get("duration_ms") or 0) / 1000.0, 1),
+            "sessionId": str(r.get("session_id") or ""),
+        })
+    vault = vault_root()
+    note = ""
+    if vault:
+        note = os.path.join(vault, "01-工作日志", date + ".md")
+    return {"ok": True, "date": date, "turns": turns, "count": len(turns),
+            "vault": vault, "vaultNote": note,
+            "vaultNoteExists": bool(note and os.path.isfile(note))}
+
+
+def history_summary() -> dict:
+    """仪表盘那张卡片要的**一小口**数据：今天做没做、最近一次是什么。
+
+    刻意不返回列表（那张卡只显示一行摘要）—— 卡片拉全量历史会让仪表盘
+    每次刷新都读一遍几百行。
+    """
+    import app.db as db
+    today = time.strftime("%Y-%m-%d")
+    t = db._query_one(                                           # noqa: SLF001
+        "SELECT COUNT(*) AS n, SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) AS f "
+        "FROM commands WHERE source=? AND ts LIKE ?",
+        (REVIEW_SOURCE, today + "%")) or {}
+    last_d = db._query_one(                                      # noqa: SLF001
+        "SELECT ts, brief, status, text FROM commands WHERE source=? "
+        "ORDER BY ts DESC, id DESC LIMIT 1", (REVIEW_SOURCE,)) or {}
+    return {
+        "today": today,
+        "todayTurns": int(t.get("n") or 0),
+        "todayFailed": int(t.get("f") or 0),
+        "lastAt": str(last_d.get("ts") or ""),
+        "lastBrief": str(last_d.get("brief") or "").strip(),
+        "lastStatus": str(last_d.get("status") or ""),
+        "lastText": str(last_d.get("text") or "").strip()[:80],
+    }
 
 
 # ------------------------------------------------------------------ 面板/API 用的高层动作

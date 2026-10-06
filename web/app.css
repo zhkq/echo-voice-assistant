@@ -1337,3 +1337,32 @@ body.on-history { height: 100vh; overflow-y: hidden; }
   cursor: pointer; padding: 0 2px; border-radius: 4px; }
 .sb-go:hover, .sb-go:focus { color: var(--blue, #4c9aff); background: rgba(76, 154, 255, .12); }
 .sb-card:hover .sb-go { color: var(--fg, #c9d1d9); }
+
+/* ================= 每日回顾（2026-10-06）=================
+   仪表盘那张卡 + 「回顾历史」页签的详情。列表主体复用 `.cmd-item`（它本来
+   就是"一条记录"的样式，见上面），这里只补回顾独有的两块：最近一次那一行、
+   以及详情里的"逐轮"呈现（口述 vs 播报要一眼分得开）。 */
+.review-last { padding: 0 12px 10px; line-height: 1.5; }
+.review-last b { font-weight: 600; }
+.review-day.open { border-color: var(--accent); }
+.review-detail { margin-top: 10px; border-top: 1px solid var(--border); padding-top: 10px; }
+.review-detail-head { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; }
+.review-detail-head .spacer { flex: 1; }
+.review-note {
+  display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+  margin-bottom: 10px; padding: 8px 10px;
+  background: var(--card2); border: 1px solid var(--border); border-radius: 8px;
+}
+.review-note code { word-break: break-all; }
+.review-turn {
+  border: 1px solid var(--border); border-radius: 8px;
+  padding: 8px 10px; margin-bottom: 8px; background: var(--card2);
+}
+.review-turn-head { display: flex; gap: 8px; align-items: center; margin-bottom: 4px; }
+/* 「我说」保留换行（口述可能多句）；「播报」是念出来的那一段，用左边竖线标出来 */
+.review-said { white-space: pre-wrap; font-size: 13.5px; line-height: 1.55; }
+.review-brief {
+  white-space: pre-wrap; font-size: 13px; line-height: 1.55;
+  margin-top: 6px; padding-left: 8px; border-left: 2px solid var(--accent);
+  color: var(--muted);
+}
