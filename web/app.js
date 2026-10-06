@@ -2113,7 +2113,7 @@ function capAsrLocal() {
   // 会议转写不在客户端进程内跑，本机也就不再需要装它的模型。这一块只留**命令转写**。
   return `<div class="cap-sub">本地引擎（这一条就是「AI组件」里选中的那台引擎）</div>
     <div class="cap-engine-row">
-      <label>命令转写<span class="smono" title="改在 设置 → AI组件 → 高级 → 能力选择">${esc(capEngineName("sttModel"))}</span></label>
+      <label>命令转写<span class="smono" title="改在 设置 → AI组件 → 高级 → 能力选择">${esc(friendlyOption("sttModel", settingValue("sttModel")))}</span></label>
     </div>
     <div class="cap-sub">配置为要用的（${used.length} 项）</div>
     ${used.length ? capCompTable(used, curIds)
