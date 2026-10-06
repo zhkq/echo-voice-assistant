@@ -3515,7 +3515,11 @@ function renderAiCardCommon() {
 
 /** 转写服务 → 后端设置：**本机后端**看启停/安装，**网络后端**看配对/连接状态
  *  （用户 2026-10-02："本机的话展示启停、安装；网络后端展示配对和连接状态"）。
- *  取值口径：`echo-server` = 能力后端（本机自建的那台也算同一个取值）→ 本机那半边。 */
+ *  取值口径：`echo-server` = 能力后端（本机自建的那台也算同一个取值）→ 本机那半边。
+ *
+ *  2026-10-06：**显示判据改成"配对到哪儿"**（见下面的说明），不再跟着那个单选走。
+ */
+
 /** 这个后端地址是不是"本机"（回环）？
  *
  *  口径与 `app/capabilities/echo_server.py::source` 一致（`127.0.0.0/8` / `localhost` / `[::1]`）——
@@ -3554,7 +3558,7 @@ function applyTranscribeSettingsVisibility(explicit) {
   // （`index.html` 那段注释就是这么写的）。用户 2026-10-06 也要求"可以让人修改服务端 ip"。
   if (pair) pair.classList.remove("hidden");
   if (loc) loc.classList.toggle("hidden", !localPaired);
-}}
+}
 
 function renderAgentCardCommon() {
   const cur = (_agentsCache || []).find((a) => a.active) || null;
