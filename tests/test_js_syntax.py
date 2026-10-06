@@ -47,6 +47,82 @@ def _node() -> str:
     return ""
 
 
+class HtmlStructureTests(unittest.TestCase):
+    """`web/*.html` 的标签必须配平（2026-10-06 加，与 JS 那条同一个由来）。
+
+    当天在 `#capRouteCard` 上连栽两次：`<div id="capLocalSettings">` 被错手塞进了
+    「解除配对」按钮里、还套在 `#capPairSettings` 内 —— 于是"本机后端"那一组
+    **两种状态下都显示不出来**，而 Python 测试、ruff、门禁**全绿**（没人解析 HTML）。
+    浏览器拿到错配的标签会"尽量猜"，于是坏的是**别的地方**，最难查。
+
+    判据只用标准库（`html.parser`）：开闭标签必须成对、不能交叉。**VOID 元素不算开标签。**
+    """
+
+    VOID = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link",
+            "meta", "param", "source", "track", "wbr"}
+
+    def _check(self, text):
+        import html.parser
+
+        void = self.VOID
+
+        class P(html.parser.HTMLParser):
+            def __init__(self):
+                super().__init__(convert_charrefs=True)
+                self.stack, self.err = [], []
+
+            def handle_starttag(self, tag, attrs):
+                if tag not in void:
+                    self.stack.append((tag, self.getpos()[0]))
+
+            def handle_endtag(self, tag):
+                if tag in void:
+                    return
+                if not self.stack:
+                    self.err.append("第%d行多一个 </%s>" % (self.getpos()[0], tag))
+                    return
+                top, ln = self.stack.pop()
+                if top != tag:
+                    self.err.append("第%d行 </%s> 与第%d行的 <%s> 不匹配"
+                                    % (self.getpos()[0], tag, ln, top))
+
+        p = P()
+        p.feed(text)
+        return p.err, [t for t, _ in p.stack]
+
+    def test_every_web_html_is_well_formed(self):
+        files = sorted(glob.glob(os.path.join(ROOT, "web", "**", "*.html"), recursive=True))
+        self.assertTrue(files, "web/ 下没有 .html —— 路径判断错了？")
+        bad = []
+        for f in files:
+            with open(f, encoding="utf-8") as fh:
+                err, unclosed = self._check(fh.read())
+            if err or unclosed:
+                bad.append("%s\n    %s%s" % (
+                    os.path.relpath(f, ROOT).replace("\\", "/"),
+                    err[:3], ("未闭合: %s" % unclosed[:5]) if unclosed else ""))
+        self.assertEqual(bad, [], "web/ 下有 HTML 标签不配平（浏览器会猜，坏在别处）：\n"
+                         + "\n".join(bad))
+
+    def test_the_html_guard_catches_the_real_bug(self):
+        """守卫要能逮住当天那个真 bug：`<div>` 塞进 `<button>` 里、`</div>` 错位。"""
+        broken = ('<div class="card"><div class="card-body">\n'
+                  '  <button id="x">解除配对<div id="local">\n'
+                  '  </button>\n'
+                  '  </div>\n'                     # 少了一个 </div>（local 那个）
+                  '  <div id="settings"></div>\n'
+                  '</div>\n')
+        err, unclosed = self._check(broken)
+        self.assertTrue(err or unclosed, "错配的 HTML 竟然被判为配平 —— 守卫是假的")
+        good = ('<div class="card"><div class="card-body">\n'
+                '  <button id="x">解除配对</button>\n'
+                '  <div id="local"></div>\n'
+                '  <div id="settings"></div>\n'
+                '</div></div>\n')
+        err2, un2 = self._check(good)
+        self.assertEqual((err2, un2), ([], []), "好的 HTML 被判成坏了：%s %s" % (err2, un2))
+
+
 class JsSyntaxTests(unittest.TestCase):
     """"**能编译**不等于**语义没被搬走**"那条教训的 JS 版：语法错了必须当场红。"""
 

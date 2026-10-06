@@ -3496,10 +3496,19 @@ function agentByKey(key) {
 
 /** 「AI 组件」卡的**常用区**（2026-10-02 用户给的层级）：
  *    Agent ── 选择开关（选谁 + 它自己的参数：端口 / CLI…）/ 工作区 / 归档
- *    转写服务 ── 转写走哪条路 · 分离与声纹由谁做 + **后端设置**（本机：启停·安装 / 网络：配对·连接状态）
+ *    转写服务 ── **后端在哪**（本机 / 网络）+ 后端设置 + 分离与声纹由谁做
  *    语音合成 ── 选择开关（在线 / 本地 / 关闭）
  *  `#capBackendHost` 是占位：静态卡 `#capRouteCard` 在 renderSettingsPanes() 末尾被搬进来
- *  （那些控件有一堆按 id 找的加载器，搬节点最省事）。 */
+ *  （那些控件有一堆按 id 找的加载器，搬节点最省事）。
+ *
+ *  ⚠️ **2026-10-06 去掉了一块重复的东西**（用户原话："现在这个设置跟业务配置重了，
+ *  不用留着，改成本机后端还是网络后端"）：这里原来渲染 `renderMeetingServiceCard()`
+ *  = 「转写走哪条路」（能力后端 / 网络服务商）那组单选 —— 而**同一个键**
+ *  （`capabilityMeetingAsrBackend`）在「业务配置 → 会议 → 转写走哪条路」已经有了，
+ *  两处编辑同一个设置，归属也不对：这里是"后端在哪"，那里才是"用哪个实现"。
+ *  现在这块只管**后端在本机还是在网络**，由「后端设置」那张卡承载
+ *  （静态卡 `#capRouteCard`，判据见 `applyTranscribeSettingsVisibility()`）。
+ */
 function renderAiCardCommon() {
   return sSub("Agent",
       sSub("选择开关", renderAgentCardCommon() + agentDetailHtml())
@@ -3508,8 +3517,9 @@ function renderAiCardCommon() {
            "commandWorkspace", "commandWorkspaceTitle"])))
       + sSub("归档", renderSettingRows(settingRows(["worklogVaultRoot", "worklogPrompt"]))))
     + sSub("转写服务",
-      renderMeetingServiceCard()
-      + sSub("后端设置", `<div id="capBackendHost"></div>`))
+      sSub("后端设置", `<div id="capBackendHost"></div>`)
+      + sSub("分离与声纹由谁做", renderSettingRows(settingRows(
+          ["capabilityDiarizeBackend", "capabilityEmbedBackend"]))))
     + sSub("语音合成", renderSettingRows(settingRows(["ttsEngine"])));
 }
 
@@ -3554,8 +3564,18 @@ function applyTranscribeSettingsVisibility(explicit) {
   const pairBase = ((_capRouteCache || {}).pair || {}).baseUrl || "";
   const localPaired = _isLoopbackUrl(pairBase);
   const pair = $("#capPairSettings"), loc = $("#capLocalSettings");
-  // 配对框**一直留着**：换一台后端与第一次配对是同一件事，藏起来只会让人找不到入口
-  // （`index.html` 那段注释就是这么写的）。用户 2026-10-06 也要求"可以让人修改服务端 ip"。
+  // **"本机后端 / 网络后端"选择器的选中态与说明**（2026-10-06 用户口径：这块改成
+  // "本机后端还是网络后端"，选网络后端就展示配对设置与服务器地址）。
+  // 选中态由**配对到的地址**推出来（回环 = 本机），不是另存一个设置 ——
+  // 它就是"事实是怎样"，不该能跟事实不一致。
+  const radios = document.querySelectorAll('input[data-cap-backend-mode="1"]');
+  for (const r of radios) r.checked = (r.value === (localPaired ? "local" : "net"));
+  const modeState = $("#capBackendModeState");
+  if (modeState) {
+    modeState.textContent = !pairBase
+      ? "还没配后端 —— 本机自己跑选「本机后端」，连别的机器选「网络后端」"
+      : (localPaired ? `当前：本机（${pairBase}）` : `当前：网络（${pairBase}）`);
+  }
   if (pair) pair.classList.remove("hidden");
   if (loc) loc.classList.toggle("hidden", !localPaired);
 }
@@ -4049,6 +4069,23 @@ document.addEventListener("click", async (e) => {
    分离/声纹**由谁做**是另外两项设置，在「模型路由 → 会议能力通道」里改（`RT_CAP_KEYS`），
    不跟着这条单选走 —— 这正是"选了后端也没有说话人"那次事故的根因（一个控件替三个槽做主）。 */
 document.addEventListener("change", async (e) => {
+  /* 「后端在哪」那条单选（本机后端 / 网络后端，2026-10-06）。
+     **它不是设置**：后端在本机还是在网络，是由**配对到的地址**决定的事实
+     （回环 = 本机），另存一个设置只会跟事实打架（"选了网络后端但其实还连着本机"）。
+     所以这里只做两件有用的事：① 把那一块重画成选中态；② 选"网络后端"时
+     把光标送到服务器地址框里，并说清下一步 —— 用户点它就是想配对/换地址。 */
+  const mode = e.target.closest("[data-cap-backend-mode]");
+  if (mode) {
+    applyTranscribeSettingsVisibility();
+    const pairBase = ((_capRouteCache || {}).pair || {}).baseUrl || "";
+    if (mode.value === "net" && !_isLoopbackUrl(pairBase)) {
+      const box = $("#capPairUrl");
+      if (box) { try { box.focus(); } catch (err) { /* 聚焦失败无所谓 */ } }
+      const st = $("#capBackendModeState");
+      if (st) st.textContent = "贴入配对串（或填服务器地址 + 配对码）后点「配对」";
+    }
+    return;
+  }
   const rb = e.target.closest("[data-merge-backend]");
     if (rb) {
       await saveMeetingBackend(rb.value);

@@ -223,35 +223,48 @@
       <div class="card-body">
         <div class="muted" style="font-size:12px">
           这台机器可以把 GPU 重活（会议转写 / 说话人分离 / 声纹）交给一台带显卡的
-          ECHO 后端做。<b>音频会离开这台机器</b>，所以要不要用由你决定
-          （在「业务配置 → 会议 → 转写走哪条路」里选）。
+        <!-- 后端在哪：**本机后端**（起/停/检测）还是**网络后端**（配对 + 服务器地址）。
+             2026-10-06 用户口径："改成本机后端还是网络后端，选择网络后端后展示配对设置和服务器地址"。
+             显示由 `applyTranscribeSettingsVisibility()` 按**配对到的地址**切（回环 = 本机）。
+             ⚠️ 下面三块必须是**兄弟**：原来 `#capLocalSettings` 被错手塞进了「解除配对」按钮里、
+             还套在 `#capPairSettings` 内 —— 于是"本机"那组在两种状态下都显示不出来。 -->
+        <div class="cap-pair-row" id="capBackendModeRow">
+          <label class="schk" title="后端装在这台机器上（只绑回环，音频不出机器）">
+            <input type="radio" name="capBackendMode" value="local" data-cap-backend-mode="1">
+            <span>本机后端</span></label>
+          <label class="schk" title="后端在另一台机器上（或是本机起的、但用网络地址访问）—— 要配对">
+            <input type="radio" name="capBackendMode" value="net" data-cap-backend-mode="1">
+            <span>网络后端</span></label>
+          <span class="muted" id="capBackendModeState" style="font-size:12px"></span>
         </div>
-        <div id="capPairSettings">
-          <!-- 配对：**粘一整串**（`echo://pair?host=…&code=…&fp=…`）或分开填地址+码。
+
+        <!-- 网络后端：配对（粘一整串 `echo://pair?…`，或分开填地址 + 码）。
              **刻意不藏**（配好之后也留着）——"换一台后端"与"第一次配对"是同一件事，
              藏起来只会让人找不到入口。 -->
-        <div id="capPairBox" class="cap-pair">
-          <div class="muted" style="font-size:12px">
-            管理员给你一张<b>配对码或配对串</b>（<code>echo://pair?host=…&amp;code=…&amp;fp=…</code>），
-            整串粘在下面第一个框里即可；串里带指纹时会 <b>校验证书</b>，那是防中间人的一步。
-            <b>发授权（一次性配对串）与撤销客户端在管理员那台 ECHO 后端上</b> ——
-            这侧只有"配对 / 解除配对"。
+        <div id="capPairSettings">
+          <div id="capPairBox" class="cap-pair">
+            <div class="muted" style="font-size:12px">
+              管理员给你一张<b>配对码或配对串</b>（<code>echo://pair?host=…&amp;code=…&amp;fp=…</code>），
+              整串粘在下面第一个框里即可；串里带指纹时会 <b>校验证书</b>，那是防中间人的一步。
+              <b>发授权（一次性配对串）与撤销客户端在管理员那台 ECHO 后端上</b> ——
+              这侧只有"配对 / 解除配对"。
+            </div>
+            <div class="cap-pair-row">
+              <input id="capPairUrl" class="ctl grow" type="text" spellcheck="false"
+                     placeholder="配对串（echo://pair?host=…）或服务器地址，例如 10.100.0.24:8900">
+              <input id="capPairCode" class="ctl" type="text" spellcheck="false"
+                     placeholder="配对码" style="max-width:140px">
+              <button class="btn" id="btnCapPair">配对</button>
+              <button class="btn hidden" id="btnCapUnpair"
+                      title="让这台机器忘掉后端凭据（服务端那本清单归管理员）">解除配对</button>
+            </div>
           </div>
-          <div class="cap-pair-row">
-            <input id="capPairUrl" class="ctl grow" type="text" spellcheck="false"
-                   placeholder="配对串（echo://pair?host=…）或后端地址，例如 10.100.0.24:8900">
-            <input id="capPairCode" class="ctl" type="text" spellcheck="false"
-                   placeholder="配对码" style="max-width:140px">
-            <button class="btn" id="btnCapPair">配对</button>
-            <button class="btn hidden" id="btnCapUnpair"
-                    title="让这台机器忘掉后端凭据（服务端那本清单归管理员）">解除配对<div id="capLocalSettings">
-          </button>
-          </div>
-          </div>
+        </div>
 
-          <!-- **方案 1：本机自动配对**（2026-09-28）。后端装在这台机器上时不用抄码：
-               后端启动会把自己的配对信息写在本机状态目录里，这里读它就走完配对。
-               找到了才可点（禁用而非隐藏 —— 点不动时要当场说清为什么）。 -->
+        <!-- 本机后端（**方案 1：本机自动配对**，2026-09-28）：后端装在这台机器上时不用抄码 ——
+             后端启动会把自己的配对信息写在本机状态目录里，这里读它就走完配对。
+             找不到时按钮禁用而非隐藏（点不动时要当场说清为什么）。 -->
+        <div id="capLocalSettings">
           <div class="cap-pair-row">
             <button class="btn" id="btnCapPairLocal"
                     title="方案 1：后端装在这台机器上 —— 读它写下的本机配对文件自动连上（不用抄配对码）">
@@ -283,11 +296,14 @@
           <div class="muted" id="capBackendPlan" style="font-size:12px"></div>
           <div class="muted" id="capBackendReady" style="font-size:12px"></div>
           <div class="muted" id="capBackendNotes" style="font-size:12px"></div>
-          <div class="muted" id="capPairState" style="font-size:12px"></div>
         </div>
+
+        <!-- 配对状态那一行：两种模式下都值得看（"连上了谁"） -->
+        <div class="muted" id="capPairState" style="font-size:12px"></div>
+
         <div id="capBackendList" class="cap-prov"></div>
         <!-- 这一格放：直连地址 + 一句指路（转写走哪条路 / 分离与声纹由谁做都在「业务配置 → 会议」）。
-             同一个设置项两处能改，就是 2026-09-19 那次"三处都在讲同一件事"的老问题。 -->
+              同一个设置项两处能改，就是 2026-09-19 那次"三处都在讲同一件事"的老问题。 -->
         <div id="capRouteSettings" class="settings-form"></div>
           </div>
       </div>
