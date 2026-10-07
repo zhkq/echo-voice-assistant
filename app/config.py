@@ -713,6 +713,16 @@ DEFAULTS = {
     "dailyReviewMaxRecordSec": dict(value=120, grp="review", label="单次口述上限（秒）",
                                     description="一段口述最长录多久；到点强制收轮交给 DSH",
                                     value_type="int"),
+    "dailyReviewSttBackend": dict(value="echo-server", grp="review", label="回顾转写走谁",
+                                  description="回顾每一轮口述用哪个引擎转成文字。"
+                                              "「能力后端」= 与**会议转写同一个引擎**"
+                                              "（在 GPU 那台算、更准）；后端不可用时自动回落本机。"
+                                              "「本机」= 与语音指令同一个引擎（sherpa）",
+                                  options=[{"value": "echo-server",
+                                            "label": "能力后端（与会议同一个引擎）"},
+                                           {"value": "local",
+                                            "label": "本机（与语音指令同一个引擎）"}],
+                                  value_type="str"),
     "dailyReviewSilenceMs": dict(value=1400, grp="review", label="静音收轮（毫秒）",
                                  description="说完后静音多久算这一段讲完。太短会把思考停顿切断，"
                                              "太长会让你以为没听见",

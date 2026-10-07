@@ -93,39 +93,62 @@ class PanelRendersTests(unittest.TestCase):
         # 为什么用真库（而不是替身）：这条检查的全部意义就是"用户看到的那条路"。
         seeded = self._seed_reviews()
 
+        # ⚠️ **要渲染两个页面**：面板是"一个视图一个视图画"的 ——
+        #   * 设置元素（`#capBackendHost` 那张搬进来的卡）只在**设置**页渲染；
+        #   * 回顾卡与历史页签在**它们自己那页**。
+        # 2026-10-07 踩过：这条用例原来用 `?view=reviews` 一个 URL 找两边的元素，
+        # 而我刚把 `reviews` 修好（以前它会错误地回落成仪表盘）→ 落在历史页上，
+        # 于是"设置元素找不到"而**红得很有道理**（错的是用例的 URL，不是代码）。
+        try:
+            dom_settings = self._render("?view=settings")
+            dom_reviews = self._render("?view=reviews")
+        finally:
+            # 种进去的数据**一定清掉**（哪怕渲染/断言失败）：不该在用户库里留东西。
+            self._unseed_reviews(seeded)
+
+        self.assertGreater(len(dom_settings), 20000,
+                           "设置页 DOM 太小（%d 字节）—— 页面可能没渲染" % len(dom_settings))
+
+        missing = [i for i in REQUIRED_IDS if ('id="%s"' % i) not in dom_settings]
+        self.assertEqual(missing, [],
+                         "设置页渲染后这些元素不在（用户就找不到它们）：%s" % missing)
+
+        # 那个"整块渲染中断"的症状：能力卡渲染失败时页面会写这句
+        for name, dom in (("设置页", dom_settings), ("回顾历史页", dom_reviews)):
+            self.assertNotIn("能力清单加载失败", dom,
+                             "%s 出现了「能力清单加载失败」—— 某一步渲染抛异常中断了" % name)
+            # 静态资源不该 404（harness 之外最容易踩的：改了文件名忘了同步）
+            for bad in ("ReferenceError", "is not defined"):
+                self.assertNotIn(bad, dom, "%s 出现了 '%s' —— 运行时错误" % (name, bad))
+
+        # 「本机后端 / 网络后端」的字面（用户按这两个词找入口）
+        for label in ("本机后端", "网络后端"):
+            self.assertIn(label, dom_settings, "看不到「%s」这个选项" % label)
+
+        # **回顾那两个界面真的渲染出内容了**（不是只有空壳）
+        self.assertIn("每日回顾", dom_settings, "仪表盘/设置里没看到「每日回顾」卡片")
+        self.assertIn("回顾历史", dom_reviews, "没看到「回顾历史」页签")
+        # 2026-10-07 的 bug 就在这一条上：`?view=reviews` 以前会**错误回落成仪表盘**
+        # （`reviews` 没登记进 VIEW_ALIASES），于是"点回顾历史跳不走"。
+        # 判据：落到历史页时 `#htab-reviews` 必须是**可见**的那一个（不带 hidden）。
+        self.assertRegex(dom_reviews, r'id="htab-reviews"(?![^>]*\bhidden\b)[^>]*>',
+                         "?view=reviews 没有落到「回顾历史」子页签（它被 hidden 挡着）")
+        self.assertIn("2077-", dom_reviews,
+                      "回顾历史的列表里没有刚才种进去的那天（列表没渲染）")
+
+    def _render(self, query):
+        """无头 Edge 渲染一次真实页面，返回 DOM 文本。"""
+        edge = _edge()
         profile = tempfile.mkdtemp(prefix="echo-edge-")
         try:
             r = subprocess.run(
                 [edge, "--headless=new", "--disable-gpu", "--no-first-run",
-                 "--user-data-dir=" + profile, "--virtual-time-budget=4000",
-                 "--dump-dom", BASE + "/?view=reviews"],
+                 "--user-data-dir=" + profile, "--virtual-time-budget=6000",
+                 "--dump-dom", BASE + "/" + query],
                 capture_output=True, timeout=300)
-            dom = (r.stdout or b"").decode("utf-8", "replace")
+            return (r.stdout or b"").decode("utf-8", "replace")
         finally:
             shutil.rmtree(profile, ignore_errors=True)
-            self._unseed_reviews(seeded)
-
-        self.assertGreater(len(dom), 20000, "DOM 太小（%d 字节）—— 页面可能没渲染" % len(dom))
-
-        missing = [i for i in REQUIRED_IDS if ('id="%s"' % i) not in dom]
-        self.assertEqual(missing, [], "渲染后这些元素不在（用户就找不到它们）：%s" % missing)
-
-        # 那个"整块渲染中断"的症状：能力卡渲染失败时页面会写这句
-        self.assertNotIn("能力清单加载失败", dom,
-                         "页面里出现了「能力清单加载失败」—— 某一步渲染抛异常中断了")
-
-        # 「本机后端 / 网络后端」的字面（用户按这两个词找入口）
-        for label in ("本机后端", "网络后端"):
-            self.assertIn(label, dom, "看不到「%s」这个选项" % label)
-
-        # **回顾那两个界面真的渲染出内容了**（不是只有空壳）
-        self.assertIn("每日回顾", dom, "仪表盘上没看到「每日回顾」卡片")
-        self.assertIn("回顾历史", dom, "没看到「回顾历史」页签")
-        self.assertIn("2077-", dom, "回顾历史的列表里没有刚才种进去的那天（列表没渲染）")
-
-        # 静态资源不该 404（harness 之外最容易踩的：改了文件名忘了同步）
-        for bad in ("ReferenceError", "is not defined"):
-            self.assertNotIn(bad, dom, "页面里出现了 '%s' —— 运行时错误" % bad)
 
     #: 种/清回顾数据用的日期：**故意用未来**，一眼能认出是测试造的，
     #: 也几乎不可能与用户真实回顾的那天撞上。

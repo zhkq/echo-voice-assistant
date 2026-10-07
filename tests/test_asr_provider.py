@@ -372,5 +372,108 @@ class CommandTranscribeTests(unittest.TestCase):
         self.assertIn("status=empty", note)
 
 
+class ReviewUsesTheMeetingEngineTests(unittest.TestCase):
+    """每日回顾的转写**走能力后端**（与会议同一个引擎）—— 2026-10-07 用户要求。
+
+    为什么必须改：回顾每轮是**成段自述**，而本机 sherpa 是给短口令调的小流式模型。
+    同一段真实录音（10:26:44 那轮）两个引擎的实测对比：
+
+        能力后端：测试一下今天的每日回顾。我今天主要的工作就是，把每日回顾界面功能
+                  完善了一下，同时呢，又修复了一个后端启动时的bug。
+        sherpa  ：小测试试一下今天天的美丽每日回回国回顾我今天今天主要的工作就是把
+                  阿美美美如日回馈回回回回顾葵顾裤哦哦界面界面功能完完善上了一下…
+
+    后者有明显重复/错字，直接拖累 DSH 整理出的原文。**这条对比就是本用例存在的理由。**
+    """
+
+    def setUp(self):
+        from app import assistant
+        self.assistant = assistant
+        self.logs = []
+        p = patch.object(assistant.db, "add_log",
+                         lambda level, source, msg: self.logs.append((level, msg)))
+        p.start()
+        self.addCleanup(p.stop)
+
+    # ---- 路由选择 ----
+
+    def test_default_is_the_backend(self):
+        self.assertEqual(self.assistant.review_stt_prefer({"dailyReviewSttBackend": "echo-server"}),
+                         "backend")
+
+    def test_explicit_local_is_respected(self):
+        self.assertEqual(self.assistant.review_stt_prefer({"dailyReviewSttBackend": "local"}),
+                         "local")
+
+    def test_unknown_values_fall_back_to_the_backend(self):
+        """空值/写错的值都按默认（后端）—— 别因为一个笔误悄悄退回低质量那条路。"""
+        for bad in ("", "whatever", None):
+            with self.subTest(v=bad):
+                self.assertEqual(self.assistant.review_stt_prefer({"dailyReviewSttBackend": bad}),
+                                 "backend")
+
+    # ---- 真的调用 ----
+
+    def _backend_ok(self, text):
+        return patch.object(self.assistant, "_transcribe_via_backend",
+                            lambda wav, cfg, lang="auto": {"text": text,
+                                                           "status": stt.TRANSCRIBE_OK,
+                                                           "detail": "backend=echo-server"})
+
+    def test_backend_text_is_used_and_the_local_engine_is_not_called(self):
+        with patch("app.providers.asr_if_configured", lambda: (None, "未配置")), \
+                self._backend_ok("测试一下今天的每日回顾"), \
+                patch.object(self.assistant.stt_mod, "transcribe_ex",
+                             side_effect=AssertionError("后端成了就不该再跑本机引擎")):
+            text, note, status = self.assistant._transcribe_command(
+                "a.wav", {"sttModel": "sherpa"}, prefer="backend")
+        self.assertEqual(text, "测试一下今天的每日回顾")
+        self.assertEqual(status, self.assistant.ASR_OK)
+        self.assertIn("backend=echo-server", note)
+        self.assertNotIn("sherpa", note, "note 不该谎报成走了本机引擎")
+
+    def test_backend_failure_falls_back_to_local_and_says_so(self):
+        """后端没成**必须回落本机**（后端没起来时回顾仍要能用），
+        而且要把"本来想走后端"写进 note —— 否则日志里只剩 engine=sherpa，
+        看不出"该走后端却没走成"（那正是排障第一问）。"""
+        def boom(wav, cfg, lang="auto"):
+            return {"text": "", "status": stt.TRANSCRIBE_ERROR,
+                    "detail": "能力后端没配对、也没在设置里填地址"}
+
+        with patch("app.providers.asr_if_configured", lambda: (None, "未配置")), \
+                patch.object(self.assistant, "_transcribe_via_backend", boom), \
+                patch.object(self.assistant.stt_mod, "transcribe_ex",
+                             lambda *a, **kw: {"text": "本机转出来的", "status": stt.TRANSCRIBE_OK,
+                                               "detail": ""}):
+            text, note, status = self.assistant._transcribe_command(
+                "a.wav", {"sttModel": "sherpa"}, prefer="backend")
+        self.assertEqual(text, "本机转出来的", "回落要真的给出文本")
+        self.assertEqual(status, self.assistant.ASR_OK)
+        self.assertIn("回落本机", note)
+        self.assertIn("engine=sherpa", note)
+        self.assertTrue(any(lvl == "warn" for lvl, _ in self.logs), "回落要留一条 warn 日志")
+
+    def test_local_prefer_never_touches_the_backend(self):
+        with patch("app.providers.asr_if_configured", lambda: (None, "未配置")), \
+                patch.object(self.assistant, "_transcribe_via_backend",
+                             side_effect=AssertionError("选了本机就不该问后端")), \
+                patch.object(self.assistant.stt_mod, "transcribe_ex",
+                             lambda *a, **kw: {"text": "本机的", "status": stt.TRANSCRIBE_OK,
+                                               "detail": ""}):
+            text, _note, status = self.assistant._transcribe_command(
+                "a.wav", {"sttModel": "sherpa"}, prefer="local")
+        self.assertEqual(text, "本机的")
+        self.assertEqual(status, self.assistant.ASR_OK)
+
+    def test_the_review_worker_asks_the_routing_helper(self):
+        """接线判据：`_review_worker` 必须把偏好传下去（忘了传 = 这个功能等于没做）。"""
+        import io
+        import os
+        src = io.open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                   "app", "assistant.py"), encoding="utf-8").read()
+        self.assertIn("prefer=review_stt_prefer(cfg)", src,
+                      "回顾那一步没把转写偏好传下去")
+
+
 if __name__ == "__main__":
     unittest.main()

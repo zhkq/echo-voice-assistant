@@ -326,8 +326,69 @@ ASR_EMPTY = "empty"    # 引擎正常，但这段没听到内容（该提示"再
 ASR_ERROR = "error"    # 引擎/依赖/模型出问题（该提示"引擎没装/报错"，**不能**说"没听清"）
 
 
-def _transcribe_command(wav, cfg):
+def _transcribe_via_backend(wav, cfg, lang="auto"):
+    """用**能力后端**转写（与会议转写同一个引擎）—— 回顾那条路用它。
+
+    返回与本地引擎同样的形状 `{"text","status","detail"}`（`status` 取 `stt_mod.TRANSCRIBE_*`），
+    这样 `_transcribe_command` 的上层判断一行都不用改。
+
+    **为什么值得单独走这条**（用户 2026-10-07 的要求）：回顾每轮是**成段的自述**，
+    而本地 sherpa 是给短口令调的小流式模型 —— 实测同一段话出来是
+    "今天天的美丽每日回回国回顾我今天今天主要的工作就是…"（重复、错字），
+    交给 DSH 整理的原文质量直接受影响。会议那条路用的后端 Qwen3-ASR 明显更准。
+
+    **失败一律回落本机**（不抛）：后端没起来 / 没配对 / 显存不够时，回顾仍然要能用 ——
+    用户可能正是"为了省显存没开后端"才用它，那时报错等于把功能关掉。
+    """
+    try:
+        from app.capabilities import echo_server as _echo_backend
+    except Exception as e:                                     # pragma: no cover - 导入护栏
+        return {"text": "", "status": stt_mod.TRANSCRIBE_ERROR,
+                "detail": "后端客户端导入失败：%s" % e}
+    try:
+        if not _echo_backend.configured():
+            return {"text": "", "status": stt_mod.TRANSCRIBE_ERROR,
+                    "detail": "能力后端没配对、也没在设置里填地址"}
+        client = _echo_backend.client_from_settings()
+        if client is None:
+            return {"text": "", "status": stt_mod.TRANSCRIBE_ERROR,
+                    "detail": "拿不到能力后端客户端"}
+        res = client.transcribe(wav, lang=lang, variant="long")
+        text = " ".join((getattr(res, "text", "") or "").split())
+        if not text:
+            return {"text": "", "status": stt_mod.TRANSCRIBE_EMPTY,
+                    "detail": "后端返回空文本"}
+        return {"text": text, "status": stt_mod.TRANSCRIBE_OK,
+                "detail": "backend=%s" % getattr(res, "backend_id", "echo-server")}
+    except Exception as e:
+        # 回落由调用方做；这里如实说"后端没成"，不假装成功
+        return {"text": "", "status": stt_mod.TRANSCRIBE_ERROR,
+                "detail": "能力后端转写失败：%s: %s" % (type(e).__name__, e)}
+
+
+def review_stt_prefer(cfg=None):
+    """回顾转写走哪条路 —— 由设置 `dailyReviewSttBackend` 决定（默认走能力后端）。
+
+    单独抽出来是为了**一处判据、可测**：面板/日志/`_review_worker` 都问它，
+    免得"设置说的是 A、代码走的是 B"这种漂移（今天已经在别处踩过一次）。
+    """
+    cfg = cfg or settings
+    try:
+        val = str(cfg.get("dailyReviewSttBackend", "echo-server") or "").strip()
+    except Exception:
+        return "backend"
+    # 只有显式选「本机」才不走后端；空值/未知值都按默认（后端）处理 ——
+    # 默认值的语义是"跟会议同一个引擎"，而设置项写错时不该悄悄退回低质量那条路。
+    return "local" if val == "local" else "backend"
+
+
+def _transcribe_command(wav, cfg, prefer=""):
     """命令转写：显式配了 `providerAsr` 就走 provider（P5），否则走本地引擎。
+
+    `prefer="backend"` 时**先试能力后端**（与会议同一个引擎），失败回落本机 ——
+    只有每日回顾用它（设置项 `dailyReviewSttBackend`），语音指令那条路保持原样
+    （要的是低延迟，不该等后端）。参数名不叫 `engine`：下面 `engine` 是
+    `sttModel` 的值，同名会把这次偏好悄悄覆盖掉。
 
     返回 ``(text, note, status)``：`note` 说明"走了谁 / 为什么没有文本"，供日志；
     `status` ∈ ``ok/empty/error``。
@@ -350,6 +411,18 @@ def _transcribe_command(wav, cfg):
             return text, note, ASR_OK if text else ASR_EMPTY
         except Exception as e:
             return "", "provider=%s 失败：%s" % (why, e), ASR_ERROR
+    # 回顾那条路：**先用能力后端**（与会议同一个引擎）。失败**回落本机**，并把
+    # "后端为什么不成"写进 note —— 否则日志里只剩"engine=sherpa"，
+    # 看不出"本来想走后端但没走成"（那正是排障时要问的第一件事）。
+    backend_note = ""
+    if prefer == "backend":
+        be = _transcribe_via_backend(wav, cfg, lang=cfg.get("sttLanguage", "zh"))
+        be_text = " ".join((be.get("text") or "").split())
+        if be.get("status") == stt_mod.TRANSCRIBE_OK and be_text:
+            return be_text, str(be.get("detail") or "能力后端"), ASR_OK
+        backend_note = "后端没成（%s），回落本机；" % (be.get("detail") or be.get("status"))
+        db.add_log("warn", "assistant",
+                   "回顾转写走后端没成功，已回落本机：%s" % (be.get("detail") or be.get("status")))
     engine = cfg.get("sttModel", "sensevoice")
     stt_engine, stt_model = "whisper", engine
     if engine == "sensevoice":
@@ -361,9 +434,9 @@ def _transcribe_command(wav, cfg):
                                     lang=cfg.get("sttLanguage", "zh"),
                                     device=cfg.get("device", "auto"))
     except Exception as e:                     # transcribe_ex() 自己不抛，这里只是护栏
-        return "", "engine=%s 失败：%s" % (stt_engine, e), ASR_ERROR
+        return "", backend_note + "engine=%s 失败：%s" % (stt_engine, e), ASR_ERROR
     text = " ".join((res.get("text") or "").split())
-    note = "engine=%s status=%s" % (stt_engine, res.get("status"))
+    note = backend_note + "engine=%s status=%s" % (stt_engine, res.get("status"))
     if res.get("detail"):
         note += " detail=%s" % res["detail"]
     if res.get("status") != stt_mod.TRANSCRIBE_OK or not text:
@@ -659,7 +732,9 @@ def _review_worker(source):
                     _review_speak("这一轮我没听清，接着说，或者说结束回顾。")
                 continue
 
-            text, note, status = _transcribe_command(wav, cfg)
+            # 回顾这轮：默认走**能力后端**（与会议同一个引擎）—— 成段自述用短口令那个
+            # 小流式模型效果差（实测有明显重复/错字，直接拖累 DSH 整理出的原文）。
+            text, note, status = _transcribe_command(wav, cfg, prefer=review_stt_prefer(cfg))
             if not text:
                 if status == ASR_ERROR:
                     db.add_log("error", "assistant", f"回顾转写失败（{note}）")

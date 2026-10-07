@@ -19,11 +19,13 @@ import shutil
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _ROOT)
 
 import app.db as db                                                # noqa: E402
+from app import assistant                                         # noqa: E402
 from app import daily_review                                      # noqa: E402
 from app.config import settings                                   # noqa: E402
 
@@ -478,6 +480,77 @@ class ApiTests(_Base):
         r1 = self.client.post("/api/daily-review/stop")
         self.assertEqual(r1.status_code, 200)
         self.assertIn("stopped", r1.json())
+
+    # ---- 「真的开始」那个按钮（2026-10-07 用户实测暴露的缺口）----
+    #
+    # 现场：*"我点了开始回顾，提示了回顾已经开始但是没有其他反应了"*。
+    # 根因：面板两个按钮都调 `/start`，而它**只建会话、什么都不跑**；
+    # 真正开麦克风进回顾模式的是 `assistant.start_review()`。所以这里钉住：
+    # **点了按钮必须真的进回顾模式**，而且进不去时要说明原因。
+
+    def test_go_actually_enters_review_mode(self):
+        """`/go` 不能只建会话 —— 必须调到 `assistant.start_review()`。"""
+        self._patch_client(_FakeClient())
+        called = []
+        with mock.patch.object(assistant, "start_review",
+                               lambda source="wake": called.append(source) or True), \
+             mock.patch.object(assistant, "review_running", lambda: True):
+            r = self.client.post("/api/daily-review/go", json={})
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        self.assertTrue(body["ok"], body.get("error"))
+        self.assertEqual(called, ["web"], "必须真的进了回顾模式（source=web）")
+        self.assertTrue(body["running"], "回给面板的 running 要是真状态，否则面板会干等")
+        self.assertEqual(body["error"], "")
+
+    def test_go_prepares_the_session_too(self):
+        """进回顾模式之前要先把当天那条会话准备好（否则第一轮就报"会话没建起来"）。"""
+        self._patch_client(_FakeClient())
+        with mock.patch.object(assistant, "start_review", lambda source="wake": True), \
+             mock.patch.object(assistant, "review_running", lambda: True):
+            body = self.client.post("/api/daily-review/go", json={}).json()
+        self.assertEqual(body["sessionId"], "session-abc")
+
+    def test_go_says_why_when_the_assistant_is_busy(self):
+        """助手正忙（在跑命令/在录音）时进不去 —— **要说清是谁占着**，
+        不能让面板沉默（那正是这次现场的体感："没有其他反应"）。"""
+        self._patch_client(_FakeClient())
+        with mock.patch.object(assistant, "start_review", lambda source="wake": False), \
+             mock.patch.object(assistant, "review_running", lambda: False), \
+             mock.patch.dict(assistant._busy_owner, {"name": "hotkey"}):
+            body = self.client.post("/api/daily-review/go", json={}).json()
+        self.assertFalse(body["running"])
+        self.assertIn("hotkey", body["error"])
+        self.assertIn("正忙", body["error"])
+
+    def test_go_reports_when_not_configured(self):
+        """没配好时（未启用 / 没笔记库）**不建会话、不进模式**，并把原因带回去。"""
+        settings.update({"dailyReviewEnabled": False})
+        self._patch_client(_FakeClient())
+        called = []
+        with mock.patch.object(assistant, "start_review",
+                               lambda source="wake": called.append(source) or True):
+            r = self.client.post("/api/daily-review/go", json={})
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        self.assertFalse(body["ok"])
+        self.assertIn("未启用", body["error"])
+        self.assertEqual(called, [], "没配好就不该进回顾模式")
+
+    def test_go_refuses_while_a_meeting_is_recording(self):
+        """正在录会议时**当场拒绝**：回顾要独占麦克风，而录音设备不排他 ——
+        否则要等到第一轮录音才失败，用户看到的是"点了没反应"（2026-10-07 的体感）。"""
+        from app import meeting
+        self._patch_client(_FakeClient())
+        called = []
+        with mock.patch.object(meeting, "meeting_status", lambda: {"active": True}), \
+             mock.patch.object(assistant, "start_review",
+                               lambda source="wake": called.append(source) or True):
+            body = self.client.post("/api/daily-review/go", json={}).json()
+        self.assertFalse(body["ok"])
+        self.assertFalse(body["running"])
+        self.assertIn("会议", body["error"])
+        self.assertEqual(called, [], "在录会议时不该去抢麦克风")
 
 
 if __name__ == "__main__":

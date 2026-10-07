@@ -127,6 +127,12 @@ const VIEW_ALIASES = {
   // 「会议记录」不再是顶层页签（2026-09-26 第二轮）：老书签/老链接一律落到
   // 「历史」，再由 switchView 打开"会议历史"子页签（见那里的 `rawName`）。
   meetings: "history", "会议记录": "history",
+  // 2026-10-07：**`reviews` 必须登记**。三个历史子页签（指令/会议/回顾）共用
+  // `#view-history`，而页签点击走的是 `switchView(t.dataset.htab || t.dataset.view)`
+  // —— 不登记的话 `normView("reviews")` 原样返回、`_VIEWS` 里又没有它，
+  // `switchView` 就把它**回落成 dashboard**：用户点「回顾历史」会跳到仪表盘
+  // （现场原话："点击没反应，没能跳转到每日回顾的历史页"）。
+  reviews: "history",
 };
 function normView(name) {
   const n = String(name || "");
@@ -182,9 +188,14 @@ function switchView(name) {
     loadSettings(); loadQueueCard();
     bindDailyReviewCard(); loadDailyReviewCard();
   }
-  // 历史页：`?view=meetings` / `data-goto="meetings"` 这类老入口要落进"会议历史"子页签，
-  // 其余情况沿用用户上次看的那一个（默认指令历史）。
-  if (view === "history") switchHistoryTab(rawName === "meetings" ? "meetings" : _histTab);
+  // 历史页：`?view=meetings` / `?view=reviews` / `data-goto="meetings"` 这类入口要落进
+  // 对应的子页签，其余情况沿用用户上次看的那一个（默认指令历史）。
+  // ⚠️ 判据要用 **`rawName`**（点击时的原值，如 `"reviews"`），不能用 `VIEW_ALIASES[rawName]`
+  // —— 别名表把它们都折成 `"history"`，那样三个子页签就分不出来了（2026-10-07 的 bug）。
+  if (view === "history") {
+    const sub = (rawName === "meetings" || rawName === "reviews") ? rawName : _histTab;
+    switchHistoryTab(sub);
+  }
 }
 $$(".tab").forEach((t) => t.addEventListener("click", () =>
   switchView(t.dataset.htab || t.dataset.view)));   // 两个历史页签靠 data-htab 选子页
@@ -1554,6 +1565,9 @@ const SET_CARDS = {
       advOrder: ["回顾与登记", "语音节奏", "播报稿"],
       adv: ["dailyReviewWorkspace", "dailyReviewWorkspaceTitle", "dailyReviewVaultRoot",
             "dailyReviewEnsureSessionAccess",
+            // 2026-10-07：回顾转写走谁（默认与**会议**同一个引擎）。放在「回顾与登记」
+            // 这一节里 —— 它决定"你说的原文有多准"，是回顾自己的事，不是全局设置。
+            "dailyReviewSttBackend",
             "dailyReviewSilenceMs", "dailyReviewMaxRecordSec", "dailyReviewReplyTimeoutSec",
             "dailyReviewBroadcastChars", "dailyReviewPrompt"] },
   ],
@@ -2418,9 +2432,17 @@ function reviewBodyHtml() {
   if (st.workspace) bits.push(`工作区：${esc(st.workspace)}`);
   if (st.sessionId) bits.push(`今天会话：${esc(String(st.sessionId).slice(0, 18))}…`);
   const running = !!st.running;
-  return `<div class="snote ${tone}"><span>${ready ? "✓" : "⚠"}</span><span>${bits.join("　·　")}</span></div>
+  // 运行中要说清"现在该干什么" —— 用户点了按钮之后如果面板没变化，他会以为没生效
+  // （2026-10-07 的现场："提示了回顾已经开始但是没有其他反应了"）。
+  const runningNote = running
+    ? `<div class="snote"><span>🎙</span><span><b>正在回顾</b> —— 对着麦克风讲今天做了什么，
+        讲完停一下；它会整理并念一句短的，然后你可以接着说下一段。
+        说完点「结束正在进行的回顾」。</span></div>`
+    : "";
+  return `${runningNote}
+    <div class="snote ${tone}"><span>${ready ? "✓" : "⚠"}</span><span>${bits.join("　·　")}</span></div>
     <div class="sacts" style="margin:6px 0">
-      <button class="btn" data-rv="start" ${ready ? "" : "disabled"}>准备今天这次回顾</button>
+      <button class="btn" data-rv="start" ${ready ? "" : "disabled"}>${running ? "正在回顾…" : "开始回顾（开麦克风）"}</button>
       <button class="btn" data-rv="stop" ${running ? "" : "disabled"}>结束正在进行的回顾</button>
     </div>
     <div class="snote"><span>试跑</span><span>把下面这段当"今日口述"发给 DSH，
@@ -2456,8 +2478,12 @@ function bindDailyReviewCard() {
     el.disabled = true;
     try {
       if (act === "start") {
-        const r = await post("/api/daily-review/start", { force_new: false });
-        toast(r && r.ok ? "今天的回顾会话已就绪" : "没能建立回顾会话");
+        // 这里也是"真的开始"（与仪表盘那个按钮同一条路）—— 用户点的都是「开始回顾」，
+        // 两处不该一个开麦、一个只建会话（2026-10-07 的现场就是这个不一致）。
+        const r = await post("/api/daily-review/go", {});
+        toast(r && r.running
+          ? "回顾已开始 —— 对着麦克风讲，讲完停一下它就整理"
+          : ((r && r.error) || "回顾没能开始"), r && r.running ? 3600 : 5200);
       } else if (act === "stop") {
         await post("/api/daily-review/stop", {});
         toast("已请求结束这场回顾");
@@ -4512,12 +4538,24 @@ async function refreshReviewCard() {
   }
 }
 
+/* 面板上的「开始回顾」走 `/go`（**真的开始**），不是 `/start`。
+   2026-10-07 用户实测："我点了开始回顾，提示了回顾已经开始但是没有其他反应了" ——
+   因为 `/start` 只建当天那条会话、什么都不会跑；进入回顾模式（开麦克风、一轮轮口述、
+   念播报）是 `assistant.start_review()`，而两个按钮都只调了 `/start`。
+   `/go` 把"准备会话 + 进入回顾模式"一起做掉，并回 `running` 供这里显示状态。 */
 async function doReviewStart() {
   const btn = $("#btnReviewNow");
   if (btn) btn.disabled = true;
   try {
-    const r = await post("/api/daily-review/start", { force_new: false });
-    toast(r && r.session_id ? "回顾会话已就绪 —— 在车里说，或用麦克风" : "回顾已开始");
+    const r = await post("/api/daily-review/go", {});
+    if (r && r.running) {
+      toast("回顾已开始 —— 对着麦克风讲，讲完停一下它就整理");
+    } else if (r && r.error) {
+      // 进不去要说清**为什么**（多数是"助手正忙"）：面板沉默 = 用户以为坏了
+      toast(r.error, 5200);
+    } else {
+      toast("回顾没能开始，看一下设置里那张回顾卡的原因", 5200);
+    }
   } catch (e) {
     toast("开始回顾失败：" + e.message, 4200);
   }
@@ -6759,9 +6797,12 @@ try {
   const want = normView(rawKey);
   _bootWantWizard = rawKey.toLowerCase() === "wizard" || !!new URLSearchParams(location.search).get("wizstep");
   _bootWizStep = String(new URLSearchParams(location.search).get("wizstep") || "").trim();
-  // 「会议记录」已并入历史：`?view=meetings` 折算成 history 之后，子页签信息就丢了，
-  // 所以这里单独记一笔，bootView 里落到历史页时按它打开"会议历史"。
-  _bootWantHist = (rawKey === "meetings") ? "meetings" : "";
+  // 历史子页签在折算成 history 之后就丢了，所以这里**单独记一笔**，bootView 落到历史页时
+  // 按它打开对应子页签。
+  // ⚠️ 2026-10-07：这里原来只认 `meetings` —— 加了「回顾历史」后 `?view=reviews` 虽然
+  // 能落到历史页（VIEW_ALIASES 折算对了），却**停在「指令历史」**上（子页签这一笔丢了）。
+  // 判据写成白名单，以后再加子页签只要往 HIST_TABS 里加一处。
+  _bootWantHist = (rawKey === "meetings" || rawKey === "reviews") ? rawKey : "";
   if (localStorage.getItem("echo.gotoView")) localStorage.removeItem("echo.gotoView");
   if (want && _VIEWS.includes(want)) _bootView = want;
   // `?compress=1`（分享链接 / 无头截图）同样要落到「会议历史」那一页 —— 否则被展开的

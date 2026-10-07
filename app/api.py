@@ -716,6 +716,49 @@ def post_daily_review_stop(_auth=Depends(optional_auth)):
     return {"ok": True, "stopped": stopped}
 
 
+@router.post("/daily-review/go")
+def post_daily_review_go(_auth=Depends(optional_auth)):
+    """**真的开始一场回顾**（面板上那个按钮）—— 与 `/start` 不是一回事。
+
+    2026-10-07 用户实测："我点了开始回顾，提示了回顾已经开始但是没有其他反应了"。
+
+    真因：`/start` 只**建当天那条会话**（`daily_review.start()`），什么都不会跑；
+    真正进入回顾模式（开麦克风、一轮轮录口述、念播报）的是 `assistant.start_review()`
+    —— 而面板**两个**按钮都只调了 `/start`。所以用户看到一句提示之后，
+    既没有录音、也没有任何下一步。**"准备好会话"与"开始回顾"是两个动作，
+    按钮要的是后者。**
+
+    返回里带 `running`，面板据此显示"正在回顾"而不是干等。
+
+    **已知边界**：助手正忙（正在跑一条命令 / 正在录音 / 正在开会议）时进不去 ——
+    这与语音那条路（喊"我们来回顾今天"）是**同一个** `_set_busy` 闸，不许绕过；
+    它会念一句"我这会儿正忙"，面板用 `busyOwner` 说清是谁占着。
+    """
+    from app import daily_review
+    # **先挡"正在录会议"**：回顾要独占麦克风，而 `record_command` 直接开设备、不排他 ——
+    # 真在开会时点这个按钮，会等到第一轮录音才失败，用户看到的是"点了、没反应"
+    # （2026-10-07 那次现场的体感）。这类冲突要在**按下按钮时就**说清。
+    # 判据与"重启 ECHO 前先看有没有在录音"是同一条（`meeting_status()["active"]`）。
+    try:
+        from app import meeting
+        if meeting.meeting_status().get("active"):
+            return {"ok": False, "running": False,
+                    "error": "正在开会议录音，回顾要独占麦克风 —— 先结束录音再来。"}
+    except Exception:
+        pass
+    res = daily_review.start()
+    res["running"] = False
+    if not res.get("ok"):
+        return res
+    res["started"] = bool(assistant.start_review(source="web"))
+    res["running"] = assistant.review_running()
+    res["busyOwner"] = assistant._busy_owner["name"]
+    if not res["running"]:
+        res["error"] = ("助手现在正忙（%s），没进回顾模式 —— 等它忙完再点一次。"
+                        % (assistant._busy_owner["name"] or "未知"))
+    return res
+
+
 # ---- 回顾历史（2026-10-06）：给仪表盘那张卡与「回顾历史」页签 ----
 #
 # 数据来自 `commands` 表里 `source='review'` 的行（见 `daily_review._persist` 的说明：

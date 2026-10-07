@@ -160,12 +160,31 @@ class MeetingRecordsMergedIntoHistoryTests(unittest.TestCase):
             self.assertNotIn(gone, self.html)
 
     def test_old_deep_link_folds_to_the_meeting_history_sub_tab(self):
-        """老书签 `?view=meetings` 不许失效：落到历史页**并自动打开「会议历史」**。"""
+        """老书签 `?view=meetings` 不许失效：落到历史页**并自动打开「会议历史」**。
+
+        2026-10-07：加了「回顾历史」子页签后，这行从
+        `switchHistoryTab(rawName === "meetings" ? "meetings" : _histTab)`
+        改成白名单写法 `(rawName === "meetings" || rawName === "reviews") ? rawName : _histTab`
+        —— 老入口行为**一字不变**，同时让 `?view=reviews` 也能落到它自己那页。
+        断言跟着改成认这个**意图**，而不是钉死那一行字面。
+        """
         aliases = re.search(r"const VIEW_ALIASES = \{(.*?)\};", self.js, re.S).group(1)
         self.assertRegex(aliases, r'meetings:\s*"history"', "meetings 没有折算到 history")
+        # 2026-10-07（用户实测"回顾历史点击没反应，跳不过去"）：三个历史子页签共用
+        # `#view-history`，而页签点击走 `switchView(data-htab)` —— `reviews` 不登记
+        # 就会被当成未知视图**回落成 dashboard**。
+        self.assertRegex(aliases, r'reviews:\s*"history"',
+                         "reviews 没有折算到 history（点「回顾历史」会跳到仪表盘）")
         self.assertIn("_bootWantHist", self.js, "深链要记住「落到会议历史子页签」")
-        self.assertIn('switchHistoryTab(rawName === "meetings" ? "meetings" : _histTab)', self.js,
-                      "switchView 要把老入口落到第二个子页签")
+        # ⚠️ 这条是 2026-10-07 的**第二个**同类 bug：页签点击那条路我登记了 `reviews`，
+        # 却漏了**首屏深链**那条 —— `?view=reviews` 落到历史页后**停在「指令历史」**上
+        # （`_bootWantHist` 只认 meetings）。用户报的是"点击没反应"，两条路都得通。
+        self.assertRegex(self.js, r'_bootWantHist\s*=\s*\(rawKey === "meetings"\s*\|\|\s*rawKey === "reviews"\)',
+                         "首屏深链没把 reviews 记进子页签（?view=reviews 会停在指令历史）")
+        self.assertRegex(self.js, r'rawName === "meetings"\s*\|\|\s*rawName === "reviews"',
+                         "switchView 要把老入口落到对应的子页签（会议/回顾都要）")
+        self.assertRegex(self.js, r'switchHistoryTab\(sub\)',
+                         "switchView 要用算好的子页签名去切")
 
     def test_one_entity_one_place(self):
         """**同一实体只有一处渲染**：会议条目的 DOM 与渲染函数各只有一份。"""
