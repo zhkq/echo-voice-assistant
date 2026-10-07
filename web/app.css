@@ -31,9 +31,27 @@ body {
        所以只能靠"细窄 + 压暗 + 轨道透明"把它弱化到不刺眼。 */
 * { scrollbar-width: thin; scrollbar-color: rgba(104,116,155,.75) transparent; }
 
-/* 长列表：滚动槽位固定，避免"有滚动条/没滚动条"时内容左右跳 */
-#historyList, #meetingList, .boot-log, .paras, .seg-list, .lines, .sess-text,
-.modal-body, .settings-form { scrollbar-gutter: stable; }
+/* ================= 滚动条**不显示**（2026-10-07 用户要求）=================
+   用户原话："可以多显示几条，但是我不想出滚动条，有办法吗"。
+
+   上面那段记录过一个死路：原生滚动条**两端的箭头按钮**用 `::-webkit-scrollbar-button
+   { display:none }` 压不掉。所以"既保留滚动、又让滚动条彻底不见"只剩一条路：
+   **把滚动条自身宽度设成 0**（`::-webkit-scrollbar { width/height: 0 }`）。
+   它不会禁用滚动 —— 鼠标滚轮、触摸板、键盘、拖动都照常，只是没有那条可见的槽。
+
+   为什么用 `::-webkit-*` 而不是标准属性：标准属性只有 `thin` 一档粗细（见上），
+   **没有**"0 宽"这个取值；而 ECHO 面板的宿主是 Edge/Chromium（DSH 边条与桌面版），
+   这套伪元素可用。Firefox 那侧保持上面的 `thin`（退化成"很细"，不会难看）。
+
+   副作用与取舍：**滚动条没了，"这里还能往下滚"的视觉提示也没了**。所以：
+   长列表顶部/底部本来就有内容被截断的视觉线索，且 `.tabs` 那条横向页签保留
+   **右缘淡出遮罩**（见窄屏那段）来提示"还能横着滚"。
+   ⚠️ 别把 `overflow` 一起设成 hidden —— 那是"内容被裁掉"，与"滚动条不可见"是两回事。 */
+*::-webkit-scrollbar { width: 0; height: 0; }
+*::-webkit-scrollbar-thumb { background: transparent; }
+*::-webkit-scrollbar-track { background: transparent; }
+/* 连角落那块小方块也不留（横竖都有滚动内容时会出现） */
+*::-webkit-scrollbar-corner { background: transparent; }
 /* 历史/会议整页列表与文字留一点间距，滚动条不贴着卡片边框 */
 #historyList, #meetingList { padding-right: 6px; }
 
@@ -1055,7 +1073,15 @@ body.on-history { height: 100vh; overflow-y: hidden; }
   /* 会议列表：**跟着卡片长**（2026-10-07 用户："中间的空间留给会议"）。
      卡片是唯一的弹性项，所以列表这里不再设上限 —— 有多少空间就显示多少条，
      真的多到放不下时**列表内滚**（`overflow-y:auto` 兜底）。 */
-  .dashboard-grid .meeting-list { flex: 1 1 auto; min-height: 0; overflow-y: auto; }
+  /* 会议列表：**填满会议卡的剩余高度**（"多显示几条"）。
+     ⚠️ 必须显式写 `max-height: none` —— 基础规则 `.meeting-list` 里有
+     `max-height: 300px`（那是给会议**历史页**用的上限），它在这里照样生效：
+     `flex: 1 1 auto` 想让列表长高，却被那条上限卡在 300px
+     （2026-10-07 实测：卡 856px，列表只有 300px ≈ 5 条，剩下 480px 成了卡内空白）。
+     溢出时列表内滚（滚动条已被全局隐藏，见文件顶部那段）。 */
+  .dashboard-grid .meeting-list {
+    flex: 1 1 auto; min-height: 0; max-height: none; overflow-y: auto;
+  }
   /* 每日回顾那条摘要：**可滚**而不是裁掉（用户："没显示全可以加个滚动条"） */
   .dashboard-grid .review-last { max-height: 46px; overflow-y: auto; }
 

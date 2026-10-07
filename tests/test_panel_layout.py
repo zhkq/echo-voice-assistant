@@ -92,6 +92,39 @@ class PanelLayoutContractTests(unittest.TestCase):
         self.assertIn("max-height", rl, "回顾摘要缺少高度上限")
         self.assertIn("overflow-y: auto", rl, "回顾摘要要能自己滚")
 
+    def test_scrollbars_are_invisible_but_scrolling_still_works(self):
+        """"不出滚动条"（2026-10-07 用户要求）—— 但**保留滚动能力**。
+
+        用户原话："可以多显示几条，但是我不想出滚动条，有办法吗"。
+
+        本文件顶部那段注释记过一个死路：原生滚动条**两端的箭头按钮**用
+        `::-webkit-scrollbar-button { display:none }` 压不掉，所以过去只能"细窄 + 压暗"。
+        真正"看不见"只有一条路：**把滚动条自身宽度设成 0**（`::-webkit-scrollbar
+        { width: 0 }`）—— 面板宿主是 Edge/Chromium，这套伪元素可用。
+
+        ⚠️ 两个**不许**（这条测试真正要防的）：
+          * 不许把 `overflow` 改成 `hidden` 来"消灭滚动条" —— 那是**把内容裁掉**，
+            与"还能滚、只是看不见条"完全不是一回事；
+          * 不许留 `scrollbar-gutter: stable` —— 那会给不可见的滚动条**留一条空槽**。
+
+        另外钉住"会议列表要填满卡片"：基础规则 `.meeting-list { max-height: 300px }`
+        是给会议**历史页**用的，在这一层必须被 `max-height: none` 解掉，
+        否则卡里会空出几百像素（实测：卡 856px、列表只有 300px ≈ 5 条）。
+        """
+        self.assertRegex(self.css, r"\*::-webkit-scrollbar\s*\{[^}]*width:\s*0",
+                         "缺少「滚动条宽 0」的规则（滚动条又会露出来）")
+        self.assertRegex(self.css, r"\*::-webkit-scrollbar\s*\{[^}]*height:\s*0",
+                         "横向滚动条同样要设 0（页签那一排会横向滚）")
+        self.assertNotIn("scrollbar-gutter", self.css,
+                         "别再给不可见的滚动条留槽位（会白留一条缝）")
+        for sel in (".dashboard-grid .meeting-list", ".dashboard-grid .review-last",
+                    ".cmd-list"):
+            with self.subTest(sel=sel):
+                self.assertIn("overflow-y: auto", self._props(sel),
+                              "%s 的 overflow 被改成别的了 —— 内容是滚还是被裁？" % sel)
+        self.assertIn("max-height: none", self._props(".dashboard-grid .meeting-list"),
+                      "会议列表要能长满卡片（基础规则的 max-height:300px 会把它卡住）")
+
     def test_body_is_a_shrinkable_flex_column(self):
         self._assert_has("body", "min-width: 0")
 
