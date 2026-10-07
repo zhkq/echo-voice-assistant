@@ -154,31 +154,64 @@ class PanelRendersTests(unittest.TestCase):
     #: 也几乎不可能与用户真实回顾的那天撞上。
     SEED_DATE = "2077-01-02"
 
+    def _live_db_path(self):
+        """**面板正在用的那个库**文件路径 —— 必须问它，不能假定。
+
+        ⚠️ 2026-10-07 踩过（而且它同时是用户报的一个现象的根因）：
+        dev 与稳定版**各有自己的库**（`C:\\echo-dev\\data\\echo.db` /
+        `D:\\ECHO\\data\\echo.db`），同机同时只跑一个实例。这条用例原来用
+        `app.db.DB_FILE`（= **dev** 的库）播种 —— 测试进程从 dev 代码树启动时它永远是 dev，
+        可**面板当时跑的是稳定版**，于是"种了却读不到"，测试红得莫名其妙。
+        更糟的是：这个前提坏了以后**红的地方不是坏的地方**（代码其实没问题）。
+
+        所以先问接口 `/api/paths/env` 的 DATA 根（那是**面板自己**算出来的），
+        用它拼库路径。这样"跑 dev / 跑稳定版"都成立。
+        """
+        with urllib.request.urlopen(BASE + "/api/paths/env", timeout=20) as r:
+            env = json.loads(r.read().decode("utf-8"))
+        for root in env.get("roots", []):
+            if root.get("name") == "DATA":
+                return os.path.join(root["path"], "echo.db")
+        raise AssertionError("接口没给 DATA 根，拿不到库路径：%s" % env)
+
     def _seed_reviews(self):
-        """往真库种两条回顾（一成功一失败）。返回 id 列表供清理。"""
-        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-        import app.db as db
+        """往**面板正在用的库**种两条回顾（一成功一失败）。返回 id 列表供清理。
+
+        刻意**不 import `app.db`**：那会把库解析成"本测试进程所在那棵树"的库
+        （见 `_live_db_path` 的说明），而这个测试必须落到面板那一个上。
+        用原生 `sqlite3` 直接写，与面板无关。
+        """
+        import sqlite3
+        path = self._live_db_path()
         ids = []
-        ids.append(db.add_command("测试：今天修了后端归属", source="review", status="done",
-                                  session_id="seed-sess",
-                                  meta={"review": True, "date": self.SEED_DATE,
-                                        "kind": "review:" + self.SEED_DATE}))
-        db.update_command(ids[-1], brief="后端归属修好了。", reply="整理稿", duration_ms=1200)
-        ids.append(db.add_command("测试：还有一件事没做", source="review", status="failed",
-                                  meta={"review": True, "date": self.SEED_DATE,
-                                        "kind": "review:" + self.SEED_DATE}))
-        db.update_command(ids[-1], error="DSH 在超时内没有回复", duration_ms=180000)
-        # `ts` 是 `datetime('now')` —— 种不出指定的日期，所以直接把 ts 改到那天
-        for i in ids:
-            db._exec("UPDATE commands SET ts=? WHERE id=?", (self.SEED_DATE + " 21:30:00", i))
+        conn = sqlite3.connect(path, timeout=20)
+        try:
+            for text, status, brief, err in (
+                    ("测试：今天修了后端归属", "done", "后端归属修好了。", ""),
+                    ("测试：还有一件事没做", "failed", "", "DSH 在超时内没有回复")):
+                cur = conn.execute(
+                    "INSERT INTO commands(ts,source,text,status,session_id,brief,error,meta) "
+                    "VALUES(?,?,?,?,?,?,?,?)",
+                    (self.SEED_DATE + " 21:30:00", "review", text, status, "seed-sess",
+                     brief, err, json.dumps({"review": True, "date": self.SEED_DATE,
+                                             "kind": "review:" + self.SEED_DATE})))
+                ids.append(cur.lastrowid)
+            conn.commit()
+        finally:
+            conn.close()
         return ids
 
     def _unseed_reviews(self, ids):
         """**一定清掉**（哪怕断言失败）—— 这条用例不该在用户库里留东西。"""
         try:
-            sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-            import app.db as db
-            for i in ids:
-                db._exec("DELETE FROM commands WHERE id=?", (i,))
+            import sqlite3
+            path = self._live_db_path()
+            conn = sqlite3.connect(path, timeout=20)
+            try:
+                for i in ids:
+                    conn.execute("DELETE FROM commands WHERE id=?", (i,))
+                conn.commit()
+            finally:
+                conn.close()
         except Exception:                                          # pragma: no cover - 兜底
             pass
