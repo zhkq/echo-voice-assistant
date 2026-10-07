@@ -54,6 +54,36 @@ class PanelLayoutContractTests(unittest.TestCase):
         """`main` 必须有确定宽度：否则交叉轴 auto 外边距会让它按 max-content 排版（整页出血）。"""
         self._assert_has("main", "width: 100%", "min-width: 0", "margin: 12px auto")
 
+    def test_dashboard_cards_are_content_sized_not_stretched(self):
+        """仪表盘卡片**按内容定高**，不许被拉伸出"卡内死空白"（2026-10-07 用户实测）。
+
+        现场（新增「每日回顾」卡之后）：*"会议卡片高度不够，每日回顾没显示全，
+        可以加个滚动条"* —— 截图里看得更清楚：会议列表 4 条之后一大块空白、
+        回顾卡下面也空一截。真因是这套"整页按视口高度纵向均分"的 flex：
+        `grid{flex:1}` + `card{flex:1 1 0}` 让**每张卡都吃掉一份剩余空间**，
+        多一张卡就多一份空白，而内容并不会因此变高。
+
+        判据（窄屏那套规则里）：
+          * 网格不许 `flex: 1`（按内容、能收缩：`flex: 0 1 auto`）；
+          * 卡片不许 `flex: 1 1 0`（`flex: 0 0 auto`）；
+          * 网格要能滚（原来 `overflow: hidden` 会把超出视口的内容**裁掉**）。
+        """
+        grid = self._props(".dashboard-grid")
+        self.assertNotIn("flex: 1;", grid,
+                         "网格又被写成 flex:1 了 —— 它会拉伸卡片、在卡内留死空白")
+        self.assertIn("flex: 0 1 auto", grid, "网格该按内容定高（可收缩、不拉伸）")
+        self.assertIn("overflow-y: auto", grid,
+                      "网格要能滚：overflow:hidden 会把超出视口的内容裁掉")
+        cards = self._props(".dashboard-grid .card")
+        self.assertNotIn("flex: 1 1 0", cards, "卡片又被写成 flex:1 1 0 了（会拉伸）")
+        self.assertIn("flex: 0 0 auto", cards, "卡片该按内容定高")
+        # 三个列表都要自带"上限 + 滚动"，装不下时自己滚而不是被裁
+        for sel in (".dashboard-grid .meeting-list", ".dashboard-grid .review-last"):
+            with self.subTest(sel=sel):
+                body = self._props(sel)
+                self.assertIn("max-height", body, "%s 缺少高度上限" % sel)
+                self.assertIn("overflow-y: auto", body, "%s 要能自己滚（用户要求加滚动条）" % sel)
+
     def test_body_is_a_shrinkable_flex_column(self):
         self._assert_has("body", "min-width: 0")
 
