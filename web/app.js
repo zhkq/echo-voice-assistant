@@ -4947,12 +4947,18 @@ function _loadState(f) {
   }
   const m = modelById(f.catalogId);
   if (f.id === "diar") {
-    // 分离**只有后端一条路**（2026-09-29）：客户端进程内那份 pyannote 不再承担会议分离，
-    // 所以这一格只看后端在不在。原来那句"指定本机时看 pyannote 装没装"随 local 档一起撤掉
-    // —— 本机 pyannote 与这一格已经无关（要全本机跑就"在本机起一个能力后端"）。
+    // 分离**只有后端一条路**（2026-09-29）：客户端进程内那份 pyannote 不再承担会议分离。
+    // ⚠️ 但"后端在跑"**不等于**"分离能用"（2026-10-07 用户实测踩到）：
+    //    后端要的 pyannote 三件套**权重缺失**时，后端照样起得来、`/v1/health` 也活着，
+    //    只有 `models.diarize` 会是 `failed`；而那时这张卡写着"后端就绪"，
+    //    用户以为能用，实际每场会议都**没有说话人**。
+    //    所以这一格的两个条件**缺一不可**：后端在跑 **且** 分离权重在位。
+    //    （权重判据用目录里的实际文件：`ready_pyannote()` / 面板的 `models` 清单同源。）
     const be = backendRow("echo-server");
-    return (be && be.ready) ? { kind: "ok", text: "后端就绪" }
-                            : { kind: "warn", text: "后端不可用" };
+    const weights = !!(m && m.ready);
+    if (!be || !be.ready) return { kind: "warn", text: "后端不可用" };
+    if (!weights) return { kind: "warn", text: "缺分离权重" };
+    return { kind: "ok", text: "就绪" };
   }
   if (!m) return { kind: "idle", text: "—" };
   if (m.ready) return { kind: "ok", text: "就绪" };

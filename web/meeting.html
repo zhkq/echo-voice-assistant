@@ -197,6 +197,23 @@ input[type=range].seek::-webkit-slider-thumb { -webkit-appearance:none; width:15
 .vp-row .btn { margin-left:auto; flex-shrink:0; }
 .vp-empty { color:var(--muted); font-size:12.5px; }
 
+/* ---------- 说话人聚合建议（声纹库下方那一块） ---------- */
+.agg-block { margin-top:14px; border-top:1px solid var(--border); padding-top:10px; }
+.agg-head { display:flex; align-items:center; gap:8px; margin-bottom:6px; flex-wrap:wrap; }
+.agg-head b { font-size:14px; }
+.agg-head .btn { margin-left:auto; }
+.agg-tip { color:var(--muted); font-size:12px; line-height:1.6; margin-bottom:8px; }
+.agg-row { border:1px solid var(--border); border-radius:8px; padding:8px; margin-bottom:8px; }
+.agg-members { display:flex; flex-wrap:wrap; align-items:center; gap:6px; margin-bottom:6px; }
+.agg-chip { display:inline-flex; align-items:center; gap:4px; font-size:12.5px;
+            background:rgba(127,127,127,.10); border-radius:6px; padding:2px 6px; }
+.agg-src { color:var(--muted); max-width:170px; overflow:hidden;
+           text-overflow:ellipsis; white-space:nowrap; }
+.agg-seg { color:var(--muted); font-size:11.5px; }
+.agg-sim { margin-left:auto; color:var(--muted); font-size:12px; }
+.agg-apply { display:flex; gap:8px; }
+.agg-apply .input { flex:1; }
+
 /* ---------- 工作日志专题选择浮层 ---------- */
 #wlOverlay { position:fixed; inset:0; background:rgba(0,0,0,.5); display:none; align-items:center; justify-content:center; z-index:60; }
 #wlOverlay.show { display:flex; }
@@ -289,6 +306,20 @@ input[type=range].seek::-webkit-slider-thumb { -webkit-appearance:none; width:15
         点「声纹入库」用的是<b>本场转写时留存</b>的样本：这场要是没执行说话人分离
         （详情顶部会写明原因），本场就没有样本可用 —— 回列表点「重新转写」即可补齐。</div>
       <div id="vpList"></div>
+    </div>
+    <!-- 说话人聚合建议（2026-10-07 用户要求）：放在声纹库列表**下方**。
+         为什么需要：分离是**按场独立**聚类的，同一个人在不同会议里拿到互不相干的标签
+         （这场 S1、下场 S3），一场里也可能被切成两簇。库里有每场每个说话人的平均嵌入，
+         所以"这些人是不是同一个"可以先算出来 —— 但**要不要并、并成谁**必须由人定，
+         所以每条都给「试听」，确认是同一人再改名入库。 -->
+    <div class="agg-block">
+      <div class="agg-head"><b>说话人聚合建议</b><span class="vp-meta" id="aggMeta"></span>
+        <button class="btn sm" id="aggRefresh" title="重新计算（相似度按声纹阈值）">↻ 重新计算</button>
+      </div>
+      <div class="agg-tip">这些是<b>很可能是同一个人</b>的说话人（跨会议、或同一场被切成两簇）。
+        先<b>试听</b>确认，填上姓名再点「合并并入库」：会把这几处统一改名，并把声纹存进常用联系人。
+        <b>不确认就别并</b> —— 并错了会把两个人当成一个人。</div>
+      <div id="aggList"></div>
     </div>
     <div style="display:flex; gap:8px; margin-top:12px; justify-content:flex-end">
       <button class="btn" id="spkClose">关闭</button>
@@ -1235,6 +1266,7 @@ $("#btnSpeakers").addEventListener("click", () => {
   }).join("") || '<div class="empty">无说话人数据</div>';
   $("#spkOverlay").classList.add("show");
   loadVp();
+  loadAgg();          // 聚合建议与声纹库一起加载（同一块的上下两段）
   $$("#spkList input").forEach(inp => inp.addEventListener("change", async () => {
     try {
       const r = await post(`/api/meetings/${M.id}/speaker/rename`, { label: inp.dataset.label, name: inp.value });
@@ -1308,6 +1340,83 @@ $("#vpRecognize").addEventListener("click", async () => {
     loadVp();
   } catch (e) { toast("失败：" + e.message); }
 });
+
+/* ---------- 说话人聚合建议（跨会议"同一个人被拆成好几簇"） ---------- */
+let _agg = null;
+
+async function loadAgg() {
+  try {
+    _agg = await api("/api/speakers/agg/suggestions?limit=3");
+    renderAgg();
+  } catch (e) {
+    // 读不到时**不静默**：这一块是"要不要认人"的入口，坏了要让用户看见
+    const box = $("#aggList");
+    if (box) box.innerHTML = `<div class="vp-empty">聚合建议读不到：${esc(e.message || e)}</div>`;
+  }
+}
+
+function renderAgg() {
+  const box = $("#aggList");
+  if (!box) return;
+  const a = _agg || { items: [], scanned: 0, threshold: 0 };
+  const meta = `${a.items.length} 条建议 · 比对了 ${a.scanned} 个说话人 · 相似度阈值 ${a.threshold}`;
+  $("#aggMeta").textContent = meta;
+  if (!a.items.length) {
+    box.innerHTML = '<div class="vp-empty">（暂时没有可聚合的：要么每场都只有一个人，要么都已经认过人了）</div>';
+    return;
+  }
+  // 只列前 3 条（用户要求"合并建议 1–3"），但**不截断成员**：并就该整组并。
+  box.innerHTML = a.items.slice(0, 3).map((it) => `
+    <div class="agg-row" data-agg="${esc(it.id)}">
+      <div class="agg-members">
+        ${it.members.map((m) => `
+          <span class="agg-chip">
+            <span class="chip" style="background:${spkColor(m.label)}">${esc(m.label)}</span>
+            <span class="agg-src">${esc(m.meetingName)}</span>
+            <span class="agg-seg">${m.segments} 段</span>
+            <button class="btn sm" data-aud="${m.meetingId}:${esc(m.label)}"
+                    title="听一下这个人（12 秒以内）">🔊</button>
+          </span>`).join("")}
+        <span class="agg-sim">相似度 ${it.best}</span>
+      </div>
+      <div class="agg-apply">
+        <input class="input" data-name placeholder="填联系人姓名（如 张总）">
+        <button class="btn sm" data-do="${esc(it.id)}">合并并入库</button>
+      </div>
+    </div>`).join("");
+
+  $$("#aggList [data-aud]").forEach((b) => b.addEventListener("click", () => {
+    const [mid, label] = String(b.dataset.aud).split(":");
+    // 试听走 <audio>：服务端切的是一小段 wav（切不出来会回 JSON，这时浏览器报解码失败，
+    // 所以再加一层提示，避免"点了没反应"）。
+    const url = `/api/speakers/agg/audition?meeting_id=${encodeURIComponent(mid)}&label=${encodeURIComponent(label)}`;
+    const au = new Audio(url);
+    au.play().catch(() => toast("听不了这一段（源音频可能已清理）"));
+    toast("试听 " + label + "…");
+  }));
+
+  $$("#aggList [data-do]").forEach((b) => b.addEventListener("click", async () => {
+    const row = b.closest(".agg-row");
+    const name = ((row.querySelector("[data-name]") || {}).value || "").trim();
+    if (!name) { toast("先填联系人姓名再合并"); return; }
+    const it = (a.items || []).find((x) => x.id === b.dataset.do);
+    if (!it) return;
+    try {
+      const r = await post("/api/speakers/agg/apply",
+                           { members: it.members.map((m) => ({ meetingId: m.meetingId, label: m.label })),
+                             name });
+      toast(r.message || (r.ok ? "已合并入库" : "没成功"));
+      if (r.ok) {
+        // 并的是**跨会议**的说话人：本场要是在里面，本页得刷新才能看到新名字
+        const hit = (r.detail && r.detail.renamed || []).some((x) => Number(x.meetingId) === Number(M.id));
+        if (hit) load();
+        loadVp(); loadAgg();
+      }
+    } catch (e) { toast("失败：" + e.message); }
+  }));
+}
+
+$("#aggRefresh").addEventListener("click", () => { $("#aggMeta").textContent = "计算中…"; loadAgg(); });
 </script>
 </body>
 </html>

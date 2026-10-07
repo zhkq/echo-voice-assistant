@@ -855,8 +855,12 @@ def post_model_pin(body: ModelPinIn, _auth=Depends(optional_auth)):
 def post_model_download(body: ModelDownloadIn, _auth=Depends(optional_auth)):
     """下载指定模型（后台线程，立即返回；进度用 GET /api/models 轮询）。
 
-    pyannote 只提供复制命令，不支持从此接口触发下载。
-    source=copy 的模型仍返回拷贝说明。
+    ⚠️ 2026-10-07 更正一句**过时的注释**：这里原来写着"pyannote 只提供复制命令，
+    不支持从此接口触发下载" —— 那是 HF gated 时代的说法。现在 pyannote 条目是
+    `source="modelscope"`、`downloadable` 也没关，`_download_worker` 里**有它的分支**
+    （`download_pyannote()` 走 ModelScope 匿名下三件套），所以这个接口**能下**它。
+
+    只有 `source="copy"` 或 `downloadable=False` 的条目才仍返回拷贝说明。
 
     **被"缺依赖"拒掉时，把"怎么修"一起返回**（同事 2026-09-25 实测）：只有一句
     "缺依赖"时用户不知道该装什么、也不知道装完要回来再点一次下载。所以这里多给三个
@@ -1973,6 +1977,43 @@ def get_voiceprints(_auth=Depends(optional_auth)):
             "contacts": stats["contacts"], "total": stats["samples"]}
 
 
+# ---------------------------------------------------------------- 说话人聚合建议
+# 面板「说话人管理」里、声纹库列表**下方**那一块（2026-10-07 用户要求）。
+# 背景：pyannote 是**按场独立**聚类的，同一个人在不同会议里拿到互不相干的标签
+# （这场 S1、下场 S3），一场里也可能被切成两簇。库里有每场每个说话人的平均嵌入，
+# 所以"这些人是不是同一个"可以先算出来，再用**试听**让用户确认、一次改名入库。
+
+@router.get("/speakers/agg/suggestions")
+def speaker_agg_suggestions(threshold: float = 0.0, limit: int = 8,
+                            _auth=Depends(optional_auth)):
+    """跨会议说话人聚合建议（只读；`threshold<=0` 用与声纹识别同一个阈值）。
+
+    只**建议**，不自动合并 —— 认人这件事必须由用户拍板（也要能先试听）。
+    """
+    from app import speaker_agg
+    return speaker_agg.suggestions(threshold=(threshold or None), limit=limit)
+
+
+class SpeakerAggApplyIn(BaseModel):
+    """把建议里勾中的几个说话人并成一个联系人（并**自动入库**）。"""
+    members: List[dict] = []
+    name: str = ""
+
+
+@router.post("/speakers/agg/apply")
+def speaker_agg_apply(body: SpeakerAggApplyIn, _auth=Depends(optional_auth)):
+    """把若干"同一个人"的说话人并成一个联系人：**逐场改名 + 声纹入库**。
+
+    与会议详情页的"改名"**刻意不同**：那一处的改名叫「去个名」，用户常常只是随手看一眼；
+    这里点在"聚合建议"里、还先试听过，**意图明确就是要建联系人**，
+    所以这里**无论如何都入库**（不看 `voiceprintAutoEnroll`）——
+    否则用户按提示改完名、声纹库里却没有，下一次还得再认一遍。
+    """
+    from app import speaker_agg
+    ok, msg, detail = speaker_agg.apply(body.members, body.name, enroll=True)
+    return {"ok": ok, "message": msg, "detail": detail}
+
+
 @router.post("/voiceprints/enroll")
 def voiceprint_enroll(body: VoiceprintEnrollIn, _auth=Depends(optional_auth)):
     """把某场会议某说话人的声纹入库（改名自动入库之外的显式入口）。"""
@@ -1997,29 +2038,24 @@ def voiceprint_delete_name(name: str = "", _auth=Depends(optional_auth)):
     return {"ok": ok, "message": msg}
 
 
-@router.get("/voiceprints/{vid}/audition")
-def voiceprint_audition(vid: int, _auth=Depends(optional_auth)):
-    """试听一条声纹：把**源会议里那个说话人的那一段**切出来，回一个 wav。
+def _speaker_clip(meeting_name: str, label: str, filename: str = "audition.wav"):
+    """切出"某场会议里某个说话人"的一小段音频，回一个可播放的文件。
 
-    为什么不直接回整段会议音频：会议按 `meetingSegmentMinutes` 切段（默认一段 10 分钟），
-    整段放出来根本听不出是谁。实测（2026-10-02）`lines.start/end` 是**段内**时间
-    （每个 `seg_index` 各自从 0 起），所以直接在 `resolve_segment()` 取到的那一段里切。
+    **抽出来共用**（2026-10-07）：声纹试听（按 vid）与聚合建议试听（按 meeting+label）
+    要的是同一件事，复制第二份必然漂移。调用方负责把 vid / meeting_id 解析成
+    `(meeting_name, label)`。
 
-    切不出来时**说清为什么**（源会议目录已清理 / 源音频没了 / 找不到那一行），
-    按 `/voiceprints` 那套约定回 `{ok:false, reason}` —— 面板要如实显示"为什么听不了"，
-    不要给空文件、也不要 500。
+    返回 ``FileResponse`` 或 ``{"ok": False, "reason": ...}``（业务性失败一律 HTTP 200，
+    与 `/voiceprints` 那套约定一致：面板要能如实显示"为什么听不了"）。
     """
     from fastapi.responses import FileResponse
     from app.audio import audiofile
     import soundfile as sf
 
-    row = db.get_voiceprint(vid)
-    if not row:
-        return {"ok": False, "reason": "样本不存在"}
-    name = str(row.get("meeting_name") or "")
-    label = str(row.get("source_label") or "")
+    name = str(meeting_name or "")
+    label = str(label or "")
     if not name:
-        return {"ok": False, "reason": "这条样本没记源会议，无法试听"}
+        return {"ok": False, "reason": "没记源会议，无法试听"}
     folder = os.path.join(meeting.meetings_dir(), name)
     if not os.path.isdir(folder):
         return {"ok": False, "reason": "源会议目录已清理（%s）" % name}
@@ -2048,7 +2084,7 @@ def voiceprint_audition(vid: int, _auth=Depends(optional_auth)):
     CAP, PAD = 12.0, 0.25
     try:
         info = sf.info(path)
-    except Exception as exc:  # noqa: BLE001 —— 文件坏了要如实说
+    except Exception as exc:
         return {"ok": False, "reason": "源音频读不了（%s）：%s" % (name, audiofile._short(exc))}
     a = max(0.0, start - PAD)
     b = min(info.duration, (end or (start + CAP)) + PAD)
@@ -2061,9 +2097,37 @@ def voiceprint_audition(vid: int, _auth=Depends(optional_auth)):
         fh.seek(int(a * fh.samplerate))
         data = fh.read(int((b - a) * fh.samplerate), dtype="float32")
     sf.write(out, data, info.samplerate)
-    return FileResponse(out, media_type="audio/wav",
-                        filename="voiceprint-%d.wav" % vid,
+    return FileResponse(out, media_type="audio/wav", filename=filename,
                         background=BackgroundTask(audiofile.remove_tree, tmp))
+
+
+@router.get("/speakers/agg/audition")
+def speaker_agg_audition(meeting_id: int, label: str = "", _auth=Depends(optional_auth)):
+    """试听"聚合建议里的某一条"（按会议 + 说话人标签，不需要它已经入库）。
+
+    为什么需要它：聚合建议是**入库之前**的事 —— 用户要先听一下"这两个是不是同一个人"，
+    才决定并成一个联系人。按 vid 的那条试听只能听**已入库**的样本，覆盖不到这里。
+    """
+    m = db.get_meeting(meeting_id)
+    if not m:
+        return {"ok": False, "reason": "会议不存在"}
+    return _speaker_clip(str(m.get("name") or ""), label,
+                         filename="speaker-%s-%s.wav" % (meeting_id, label or "x"))
+
+
+@router.get("/voiceprints/{vid}/audition")
+def voiceprint_audition(vid: int, _auth=Depends(optional_auth)):
+    """试听一条声纹：把**源会议里那个说话人的那一段**切出来，回一个 wav。
+
+    为什么不是整段会议音频：会议按 `meetingSegmentMinutes` 切段（默认 10 分钟），
+    整段放出来根本听不出是谁。真正的切片逻辑在 `_speaker_clip()`（与聚合建议试听共用）。
+    """
+    row = db.get_voiceprint(vid)
+    if not row:
+        return {"ok": False, "reason": "样本不存在"}
+    return _speaker_clip(str(row.get("meeting_name") or ""),
+                         str(row.get("source_label") or ""),
+                         filename="voiceprint-%d.wav" % vid)
 
 
 # ---------------------------------------------------------------- 控制

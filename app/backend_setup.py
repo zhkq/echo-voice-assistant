@@ -717,7 +717,12 @@ def start(*, port: int = backend_proc.DEFAULT_PORT,
     if ready_probe:
         from app import backend_ready
         try:
-            res = backend_ready.probe(loopback_base_url(port),
+            # `diarize=True` 带上 **L4（分离）**：2026-10-07 用户实测踩到，
+            # "后端起来了"不等于"分离能用" —— pyannote 三件套权重缺失时，
+            # 后端照常起、`/v1/health` 也是 200，只有 `models.diarize` 是 `failed`。
+            # 那时安装结论写着"就绪"，用户以为分离可用，实际每场会议都没有说话人。
+            # L4 失败**不算整体失败**（老卡本来就没这一档），只把原因如实带进 headline。
+            res = backend_ready.probe(loopback_base_url(port), diarize=True,
                                       timeout_l3=float(ready_timeout or 0.0) or
                                       backend_ready.L3_TIMEOUT_S)
         except Exception as e:                                    # pragma: no cover - 兜底
