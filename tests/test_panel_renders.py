@@ -174,6 +174,20 @@ class PanelRendersTests(unittest.TestCase):
                 return os.path.join(root["path"], "echo.db")
         raise AssertionError("接口没给 DATA 根，拿不到库路径：%s" % env)
 
+    def _assert_seed_cleaned(self, ids):
+        """用例收尾校验：种子行必须真没了（见 `_unseed_reviews` 的说明）。"""
+        import sqlite3
+        path = self._live_db_path()
+        conn = sqlite3.connect(path, timeout=20)
+        try:
+            left = [r[0] for r in conn.execute(
+                "SELECT id FROM commands WHERE id IN (%s)" % ",".join("?" * len(ids)),
+                tuple(ids))]
+        finally:
+            conn.close()
+        if left:
+            raise AssertionError("用例结束时种子行仍在真库里：%s" % left)
+
     def _seed_reviews(self):
         """往**面板正在用的库**种两条回顾（一成功一失败）。返回 id 列表供清理。
 
@@ -202,16 +216,48 @@ class PanelRendersTests(unittest.TestCase):
         return ids
 
     def _unseed_reviews(self, ids):
-        """**一定清掉**（哪怕断言失败）—— 这条用例不该在用户库里留东西。"""
+        """**一定清掉**（哪怕断言失败）—— 这条用例不该在用户库里留东西。
+
+        ⚠️ 2026-10-07 事故：这里原来 `except Exception: pass`（**静默吞掉**），
+        于是两条 `SEED_DATE=2077-01-02` 的种子行**留在了稳定版的真库里**，
+        而回顾历史按日期倒序 → **2077 永远排最前** → 用户真实的回顾被挤下去，
+        面板上表现成"回顾没有运行结果"（`lastBrief` 空、`lastStatus=failed`）。
+        用户困惑了很久，我也查了两轮才定位。
+
+        所以现在**不再吞异常**：删完立刻按 id 复查，数目不符就抛 ——
+        宁可测试红，也不要往用户的库里留脏数据。
+        """
+        import sqlite3
+        path = self._live_db_path()
+        conn = sqlite3.connect(path, timeout=20)
         try:
-            import sqlite3
-            path = self._live_db_path()
-            conn = sqlite3.connect(path, timeout=20)
-            try:
-                for i in ids:
-                    conn.execute("DELETE FROM commands WHERE id=?", (i,))
-                conn.commit()
-            finally:
-                conn.close()
-        except Exception:                                          # pragma: no cover - 兜底
-            pass
+            for i in ids:
+                conn.execute("DELETE FROM commands WHERE id=?", (i,))
+            conn.commit()
+            left = [r[0] for r in conn.execute(
+                "SELECT id FROM commands WHERE id IN (%s)" % ",".join("?" * len(ids)),
+                tuple(ids))]
+        finally:
+            conn.close()
+        if left:
+            raise AssertionError("种子行没清干净，残留在用户库里：%s（库：%s）" % (left, path))
+
+    def test_no_future_seed_rows_left_in_the_live_db(self):
+        """真库里不许留下任何"未来日期"的行（那一定是测试造的）。
+
+        为什么单独钉一条：上面的清理是**过程**判据，这条是**结果**判据 ——
+        哪怕将来某次清理路径改了、或别的用例也来种数据，只要库里出现未来行就会红。
+        """
+        import sqlite3
+        path = self._live_db_path()
+        conn = sqlite3.connect(path, timeout=20)
+        try:
+            rows = list(conn.execute(
+                "SELECT id, ts, source, substr(text,1,40) FROM commands "
+                "WHERE ts LIKE '2077%' OR ts LIKE '2099%' OR ts >= '2100' ORDER BY id"))
+        finally:
+            conn.close()
+        self.assertEqual(
+            rows, [],
+            "真库里出现了未来日期的行（只可能是测试造的残留，会把真实回顾挤出列表）：\n"
+            + "\n".join(str(r) for r in rows))
