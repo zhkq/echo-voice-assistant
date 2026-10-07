@@ -14,6 +14,7 @@
   3. **配对不重做**：接管后走的是"已配对到本机回环地址 → 跳过"，不新建客户端。
 """
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -291,6 +292,51 @@ class UsabilityTests(unittest.TestCase):
         note = backend_admin.usability_note({"ready": False, "code": "whatever",
                                              "note": "原始说明"})
         self.assertEqual(note, "原始说明")
+
+
+class BackendModeTests(unittest.TestCase):
+    """`view()["mode"]`：**配对到的是本机还是网络**（2026-10-07 用户的口径）。
+
+    它决定启动脚本该怎么处理后端：
+
+    * `local`   → 拉起本机后端（take-over）
+    * `network` → **只探测**那台服务，**别去动本机进程**
+
+    为什么要一个**显式字段**而不是让脚本自己看 `paired.baseUrl`：判据是"地址是不是回环"，
+    而回环有一堆写法（`127.0.0.1` / `localhost` / `[::1]` / 整段 `127.0.0.0/8`）。
+    让每个调用方各写一遍 `startswith("http://127.0.0.1")` 迟早漂开 ——
+    正确判据只有一处（`netlocal.is_loopback`）。
+    """
+
+    def setUp(self):
+        # `view()` 会去问端口/进程/配对文件——这里只关心 `mode` 那一行，
+        # 把它的输入（`pairing.state`）换成替身，其余照真跑（它们对 mode 无影响）。
+        self.tmp = tempfile.mkdtemp(prefix="echo-mode-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def _mode(self, paired_state):
+        with mock.patch.object(backend_admin.pairing, "state", lambda: paired_state):
+            return backend_admin.view().get("mode")
+
+    def test_loopback_pairing_is_local(self):
+        for url in ("http://127.0.0.1:8900", "http://localhost:8900",
+                    "http://127.0.0.5:8900", "https://[::1]:8900"):
+            with self.subTest(url=url):
+                self.assertEqual(self._mode({"paired": True, "baseUrl": url}), "local",
+                                 "回环地址该判成本机：%s" % url)
+
+    def test_a_backend_on_another_machine_is_network(self):
+        for url in ("http://192.168.1.170:8900", "http://10.100.0.24:8900",
+                    "https://gpu.example.com:8900"):
+            with self.subTest(url=url):
+                self.assertEqual(self._mode({"paired": True, "baseUrl": url}), "network",
+                                 "别的机器的地址该判成网络：%s" % url)
+
+    def test_not_paired_yet_counts_as_local(self):
+        """还没配对时按本机处理 —— 新装的机器就是这样，而此时"该起哪台"的答案
+        是"起本机那台"（用户从没表达过要用别人的）。"""
+        self.assertEqual(self._mode({"paired": False, "baseUrl": ""}), "local")
+        self.assertEqual(self._mode({}), "local")
 
 
 if __name__ == "__main__":

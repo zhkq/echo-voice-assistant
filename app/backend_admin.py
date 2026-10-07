@@ -347,6 +347,18 @@ def view() -> Dict[str, Any]:
         "canTakeOver": bool(foreign),
         "pairFile": local,
         "paired": paired,
+        #: **后端在哪**：`local`（配对到本机回环，或还没配对）还是 `network`（配对到别的机器）。
+        #:
+        #: 为什么要一个显式字段（而不是让调用方自己看 `paired.baseUrl`）：判据是"地址是不是
+        #: 回环"，而回环有一堆写法（`127.0.0.1` / `localhost` / `[::1]` / 整段 `127.0.0.0/8`）。
+        #: 让每个调用方各写一遍 `startswith("http://127.0.0.1")` 迟早漂开 —— 这个文件里就
+        #: 已经有一处这么写的（见上面 `_is_loopback` 的邻居），而正确判据在 `netlocal.is_loopback`。
+        #:
+        #: 它决定**启动脚本该怎么处理后端**（用户 2026-10-07 的口径）：
+        #:   * `local`   → 拉起本机后端（take-over）
+        #:   * `network` → **只探测**那台服务，**别去动本机进程**（本机后端这时候不是它要用的）
+        "mode": "network" if (paired.get("paired") and not _is_loopback(paired.get("baseUrl")))
+                else "local",
         "stopWithClient": stop_with_client(),
         "canStart": bool(can),
         "whyNot": why,
