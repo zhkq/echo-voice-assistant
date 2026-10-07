@@ -581,22 +581,31 @@ def post_harness_browser(_auth=Depends(optional_auth)):
                                "「标准版 harness」，ECHO 会自动拉起它"}
         return {"ok": False, "message": "独立 harness 没在监听 %s（看 data/logs/harness.log）"
                                         % harness_proc.base_url()}
-    tok = harness_proc.token()
-    note = ""
-    if not tok:
-        # 手里没有 token（例如实例是上一轮 ECHO 拉起的）→ 让它重启一次换一枚新的：
-        # 浏览器必须带 token 才能真正进界面（我们那枚密钥 Cookie 给不了浏览器）。
-        tok, note = harness_proc.ensure_token()
+    # ⚠️ **必须验证这枚 token 真能登录**，不能只看"手里有没有"（2026-10-07 用户实测）：
+    # 原来 `ensure_token()` 拿到就返回，于是 🌐 会打开一个**登不进去**的页面 ——
+    # 用户只看到 `dsh web authentication required`，而面板还回 ok=true 说"已打开"。
+    # 判据 = DSH 的登录协议本身：`GET /?token=…` 回 **303** 才算能用（见 token_works）。
+    tok, note = harness_proc.token(), ""
+    if not harness_proc.token_works(tok):
+        tok, note = harness_proc.ensure_token()        # 没有/失效 → 重启 harness 换一枚
+    if not tok or not harness_proc.token_works(tok):
+        why = note or "手里这枚 token 已失效（harness 可能被换过）"
+        msg = ("拿不到**能用**的登录 token：%s。"
+               "把这个 harness 停掉让 ECHO 重新拉起一次再试" % why)
+        if not (harness_proc.started_by_echo() or harness_proc.load_saved_token()):
+            msg = ("这个 harness 不是 ECHO 起的（没有 pid 记录），拿不到登录 token："
+                   "把它停掉让 ECHO 重新拉起，或把启动时打印的 token 填到设置里")
+        return {"ok": False, "message": msg}
     if not harness_proc.online():
         return {"ok": False, "message": "独立 harness 没在监听 %s（%s）"
                                         % (harness_proc.base_url(), note or "看 data/logs/harness.log")}
-    url = harness_proc.base_url() + ("/?token=%s" % tok if tok else "/")
+    url = harness_proc.base_url() + "/?token=%s" % tok
     if not echo_platform.shell_open(url):
         return {"ok": False, "message": "打开浏览器失败（%s）" % harness_proc.base_url()}
-    msg = "已在浏览器打开 %s" % harness_proc.base_url()
-    if not tok:
-        msg += "（没拿到登录 token：%s）" % (note or "建议在设置里填一次")
-    return {"ok": True, "url": harness_proc.base_url(), "message": msg}
+    # 响应里**不带 token**（它是密钥，不下发到页面/历史）；但要说清"带的是有效凭据"，
+    # 否则用户没法判断"这次打开的到底登得进去吗"。
+    return {"ok": True, "url": harness_proc.base_url(),
+            "message": "已在浏览器打开 %s（已带登录凭据）" % harness_proc.base_url()}
 
 
 @router.post("/settings/reset")

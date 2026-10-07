@@ -890,26 +890,39 @@ class HarnessBrowserOpenTests(unittest.TestCase):
         opened = []
         with patch.object(harness_proc, "online", lambda timeout=1.0: True), \
                 patch.object(harness_proc, "base_url", lambda: "http://127.0.0.1:43199"), \
-                patch.object(harness_proc, "token", lambda: "tok-abc"), \
+                patch.object(harness_proc, "token", lambda: "tok-abc0123456789"), \
+                patch.object(harness_proc, "token_works", lambda t, timeout=6.0: len(str(t or "")) >= harness_proc.MIN_TOKEN_LEN), \
                 patch("app.platform.shell_open",
                       lambda url, params="": opened.append(url) or True):
             body = self.client.post("/api/harness/browser").json()
         self.assertTrue(body["ok"], body)
-        self.assertEqual(opened, ["http://127.0.0.1:43199/?token=tok-abc"],
+        self.assertEqual(opened, ["http://127.0.0.1:43199/?token=tok-abc0123456789"],
                          "要用带 token 的 URL 打开（浏览器才能直接进界面）")
-        self.assertNotIn("tok-abc", str(body), "响应里不许回 token")
+        self.assertNotIn("tok-abc0123456789", str(body), "响应里不许回 token")
 
-    def test_online_without_token_still_opens(self):
-        """能拿到家目录密钥铸 Cookie 的场景：没有 token 时打开裸地址也够用。"""
+    def test_without_a_usable_token_it_does_not_open_a_dead_page(self):
+        """**没有可用 token 时不打开浏览器**，而是明确报错（2026-10-07 用户实测）。
+
+        原来这条用例叫 `test_online_without_token_still_opens`，断言"打开裸地址"——
+        可那正是用户撞到的那句英文报错（`dsh web authentication required`），
+        而且面板还回 ok=true 说"已打开"，用户完全无从判断。
+        现在：拿不到能登录的凭据 → 不弹窗口 + 说清怎么办。
+        """
         opened = []
         with patch.object(harness_proc, "online", lambda timeout=1.0: True), \
+                patch.object(harness_proc, "requested", lambda: True), \
                 patch.object(harness_proc, "base_url", lambda: "http://127.0.0.1:43199"), \
                 patch.object(harness_proc, "token", lambda: ""), \
+                patch.object(harness_proc, "token_works", lambda t, timeout=6.0: False), \
+                patch.object(harness_proc, "ensure_token",
+                             lambda timeout=45.0: ("", "这个 harness 不是 ECHO 起的")), \
+                patch.object(harness_proc, "started_by_echo", lambda: False), \
                 patch("app.platform.shell_open",
                       lambda url, params="": opened.append(url) or True):
             body = self.client.post("/api/harness/browser").json()
-        self.assertTrue(body["ok"], body)
-        self.assertEqual(opened, ["http://127.0.0.1:43199/"])
+        self.assertFalse(body["ok"], body)
+        self.assertEqual(opened, [], "拿不到能登录的凭据就不该弹浏览器")
+        self.assertIn("token", body["message"])
 
     def test_offline_tells_you_what_to_do_without_opening(self):
         opened = []
@@ -924,7 +937,8 @@ class HarnessBrowserOpenTests(unittest.TestCase):
     def test_shell_failure_is_reported(self):
         with patch.object(harness_proc, "online", lambda timeout=1.0: True), \
                 patch.object(harness_proc, "base_url", lambda: "http://127.0.0.1:43199"), \
-                patch.object(harness_proc, "token", lambda: "t"), \
+                patch.object(harness_proc, "token", lambda: "t0123456789abcdef"), \
+                patch.object(harness_proc, "token_works", lambda t, timeout=6.0: len(str(t or "")) >= harness_proc.MIN_TOKEN_LEN), \
                 patch("app.platform.shell_open", lambda url, params="": False):
             body = self.client.post("/api/harness/browser").json()
         self.assertFalse(body["ok"])
@@ -938,12 +952,27 @@ class HarnessBrowserOpenTests(unittest.TestCase):
                 patch.object(harness_proc, "base_url", lambda: "http://127.0.0.1:43199"), \
                 patch.object(harness_proc, "ensure_token",
                              lambda timeout=45.0: ("fresh-token-0123456789", "已重新拉起并拿到新 token")), \
+                patch.object(harness_proc, "token_works", lambda t, timeout=6.0: len(str(t or "")) >= harness_proc.MIN_TOKEN_LEN), \
                 patch.object(harness_proc, "token", lambda: ""), \
+                patch.object(harness_proc, "started_by_echo", lambda: True), \
+                patch.object(harness_proc, "load_saved_token", lambda: ""), \
                 patch("app.platform.shell_open",
                       lambda url, params="": opened.append(url) or True):
             body = self.client.post("/api/harness/browser").json()
         self.assertTrue(body["ok"], body)
         self.assertIn("token=fresh-token-0123456789", opened[0])
+
+    def test_token_works_rejects_empty_and_short(self):
+        """`token_works` 的**语义**：空串/太短的必须判 False，不去发请求。
+
+        为什么单独钉（2026-10-07 踩到）：我在别的用例里把它打桩成"永远 True"，
+        结果 `token_works("") -> True` —— "手里没有 token"那条分支被误判成通过，
+        测试红在一个**错误的分支**上。判据本身必须先把这件事说死。
+        """
+        self.assertFalse(harness_proc.token_works(""))
+        self.assertFalse(harness_proc.token_works("short"))
+        # 够长的才真去发请求（这里只断言"不因为格式被拒"，不断言网络结果）
+        self.assertIsInstance(harness_proc.token_works("x" * harness_proc.MIN_TOKEN_LEN), bool)
 
     def test_ensure_token_keeps_an_existing_one(self):
         with patch.object(harness_proc, "token", lambda: "already-here-0123456"):

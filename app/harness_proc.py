@@ -34,6 +34,8 @@ import shutil
 import subprocess
 import threading
 import time
+import urllib.error
+import urllib.parse
 import urllib.request
 
 from app import paths, services
@@ -175,6 +177,51 @@ MIN_TOKEN_LEN = 16
 
 def _looks_like_token(value) -> bool:
     return len(str(value or "").strip()) >= MIN_TOKEN_LEN
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """**不跟随**跳转的 opener —— 验证 DSH 登录 token 时必须用它。
+
+    为什么：DSH 的登录就是"303 + Set-Cookie"这一跳（见 `HarnessAgent._login()`）。
+    用默认 opener 会跟着跳到 `/`，而 urllib 跟随时**不带 cookiejar 就丢掉那句
+    Set-Cookie**，于是我们看到的是一张正常页面、却判不出"token 到底对不对"。
+    这里让它停在 303 上，看状态码本身就是判据。
+    """
+
+    def redirect_request(self, *args, **kwargs):    # noqa: D102
+        return None
+
+
+def token_works(tok, timeout=6.0):
+    """这枚 token **现在还能不能登录**？（真发一次请求验证，而不是"手里有"就当能用）
+
+    为什么需要（2026-10-07 用户实测踩到）：面板的 🌐 把 URL 交给系统浏览器，
+    而 `ensure_token()` 原来只检查"手里有没有 token"——**从不验证它还能不能用**。
+    一旦那枚 token 失效（harness 被换过 / token 属于另一个实例 / 手填的填错），
+    🌐 就打开一个**登不进去**的页面：用户只看到一句
+    `dsh web authentication required`，而面板照样回 `ok: true` 说"已打开"。
+
+    判据就是 DSH 自己的登录协议（与 `HarnessAgent._login()` 注释里那份一致）：
+        GET /?token=<token>  →  **303 See Other** + Set-Cookie   ← 有效
+        其它（200 直接给页面 / 401）                              ← 无效
+    ⚠️ 不能用 `online()` 判：它把 401 也算"在线"（它只探活）。
+
+    超时短（默认 6 秒）：这是用户**点了按钮在等**的路径，宁可快点说"这枚不行"。
+    """
+    tok = str(tok or "").strip()
+    if not tok:
+        return False
+    url = "%s/?token=%s" % (base_url(), urllib.parse.quote(tok, safe=""))
+    req = urllib.request.Request(url, method="GET")
+    # **绝不跟随跳转**：跟随会丢掉这一步拿到的 Set-Cookie，于是"有效"被误判成"无效"。
+    opener = urllib.request.build_opener(_NoRedirect())
+    try:
+        with opener.open(req, timeout=timeout) as r:
+            return int(getattr(r, "status", 0) or 0) == 303
+    except urllib.error.HTTPError as e:
+        return int(getattr(e, "code", 0) or 0) == 303
+    except Exception:
+        return False
 
 
 def token():
