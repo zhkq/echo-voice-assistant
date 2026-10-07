@@ -6862,6 +6862,24 @@ async function bootView() {
 }
 bootView();
 applyHistoryTabOrder();     // 历史三个子页签按 HIST_TAB_ORDER 排（会议 · 指令 · 回顾）
+/* **首屏也要把历史子页签的状态统一**（2026-10-07 用户实测："我测了一条指令，
+   从网页端看不到"）。原来只有 `switchView("history")` 会调 `switchHistoryTab()`，
+   而首屏走的是仪表盘 —— 于是三样状态各说各话：
+     * 容器可见性：静态 HTML 默认 `#htab-commands` 可见（另两个带 `hidden`）；
+     * 高亮：`switchView()` 按 `_histTab`（初值 `meetings`）算 → **一个页签都不亮**；
+     * 列表：没人调 `loadHistory()` → `#historyList` 空着。
+   用户看到的就是"历史页可见 + 没有高亮 + 指令列表空白"，点一下「指令」才恢复。
+   这里按**统一口径**初始化一次（高亮 + 可见容器 + 拉数据），并把它记进 `_histTab`。 */
+function initHistoryTab() {
+  if (_bootWantHist) { switchHistoryTab(_bootWantHist); return; }
+  // 默认取**当前可见的那个容器**（静态 HTML 已经写明了答案，不去猜用户意图）
+  const visible = HIST_TAB_ORDER.find((t) => {
+    const el = $("#htab-" + t);
+    return el && !el.classList.contains("hidden");
+  });
+  switchHistoryTab(visible || HIST_TAB_DEFAULT);
+}
+initHistoryTab();
 applyCollapsedCards();      // 应用上次的卡片折叠状态（设置页与各页签的可折叠卡片）
 
 /* ---------------- 自动刷新：间隔取自设置 panelAutoRefresh ----------------
