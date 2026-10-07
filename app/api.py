@@ -568,12 +568,18 @@ def get_agents(probe: bool = False, _auth=Depends(optional_auth)):
 def post_harness_browser(_auth=Depends(optional_auth)):
     """在浏览器里打开独立 harness 的 Web 界面（仪表盘「超级助理」名字后那个小图标）。
 
-    为什么由**服务端**打开、而不是把 URL 交给页面：harness 的登录靠启动时那条带
-    `?token=…` 的 URL，token 是密钥 —— 经接口下发等于把它写进浏览器历史和前端内存。
-    这里服务端拼好 URL 直接调系统 shell，响应只回**不含 token** 的地址供提示。
+    **登录一律走签名 Cookie，先写 Cookie 再开页面**（2026-10-07 用户实测后定的）：
+
+    为什么不再用 `?token=…`：token **跟着那个进程**，ECHO 每重启一次 harness 就换一枚。
+    旧 token 打开的页面**能加载、但鉴权不过** —— 侧栏没有「工作区」、没有会话列表，
+    而且**没有任何提示**，用户只能看到一片空白（连查两轮才定位到这条）。
+    签名 Cookie 的密钥在**文件**里（`<家目录>/.credentials.yaml`），**不随重启失效**，
+    所以一次点开长期可用。
+
+    仍由**服务端**打开、而不是把凭据下发给页面：Cookie 是密钥，经接口下发等于把它
+    写进前端内存与浏览器历史。响应里只回地址，不回凭据。
     """
     from app import harness_proc
-    from app import platform as echo_platform
     if not harness_proc.online():
         if not harness_proc.requested():
             return {"ok": False,
@@ -581,31 +587,34 @@ def post_harness_browser(_auth=Depends(optional_auth)):
                                "「标准版 harness」，ECHO 会自动拉起它"}
         return {"ok": False, "message": "独立 harness 没在监听 %s（看 data/logs/harness.log）"
                                         % harness_proc.base_url()}
-    # ⚠️ **必须验证这枚 token 真能登录**，不能只看"手里有没有"（2026-10-07 用户实测）：
-    # 原来 `ensure_token()` 拿到就返回，于是 🌐 会打开一个**登不进去**的页面 ——
-    # 用户只看到 `dsh web authentication required`，而面板还回 ok=true 说"已打开"。
-    # 判据 = DSH 的登录协议本身：`GET /?token=…` 回 **303** 才算能用（见 token_works）。
-    tok, note = harness_proc.token(), ""
+    url = harness_proc.base_url() + "/"
+
+    # ① 正路：密钥铸 Cookie → 独立 profile 的 Edge 注入 Cookie 后打开
+    cookie = harness_proc.secret_cookie()
+    detail = ""
+    if cookie:
+        from app import browser_open
+        ok, detail = browser_open.open_with_cookie(url, cookie)
+        if ok:
+            return {"ok": True, "url": url,
+                    "message": "已打开 %s（已自动登录）" % url}
+    else:
+        detail = "读不到 harness 家目录里的 browser-session 密钥（%s）" % harness_proc.home()
+
+    # ② 退路：拿不到密钥时，仍然可以用**验证过的** token URL 打开（会随重启失效）
+    from app import platform as echo_platform
+    tok = harness_proc.token()
     if not harness_proc.token_works(tok):
-        tok, note = harness_proc.ensure_token()        # 没有/失效 → 重启 harness 换一枚
-    if not tok or not harness_proc.token_works(tok):
-        why = note or "手里这枚 token 已失效（harness 可能被换过）"
-        msg = ("拿不到**能用**的登录 token：%s。"
-               "把这个 harness 停掉让 ECHO 重新拉起一次再试" % why)
-        if not (harness_proc.started_by_echo() or harness_proc.load_saved_token()):
-            msg = ("这个 harness 不是 ECHO 起的（没有 pid 记录），拿不到登录 token："
-                   "把它停掉让 ECHO 重新拉起，或把启动时打印的 token 填到设置里")
-        return {"ok": False, "message": msg}
-    if not harness_proc.online():
-        return {"ok": False, "message": "独立 harness 没在监听 %s（%s）"
-                                        % (harness_proc.base_url(), note or "看 data/logs/harness.log")}
-    url = harness_proc.base_url() + "/?token=%s" % tok
-    if not echo_platform.shell_open(url):
-        return {"ok": False, "message": "打开浏览器失败（%s）" % harness_proc.base_url()}
-    # 响应里**不带 token**（它是密钥，不下发到页面/历史）；但要说清"带的是有效凭据"，
-    # 否则用户没法判断"这次打开的到底登得进去吗"。
-    return {"ok": True, "url": harness_proc.base_url(),
-            "message": "已在浏览器打开 %s（已带登录凭据）" % harness_proc.base_url()}
+        tok, note = harness_proc.ensure_token()
+        if not harness_proc.token_works(tok):
+            return {"ok": False,
+                    "message": "打不开：%s；也拿不到能用的登录 token（%s）"
+                               % (detail or "Cookie 注入失败", note or "已失效")}
+    if echo_platform.shell_open(url + "?token=%s" % tok):
+        return {"ok": True, "url": url,
+                "message": "已打开 %s（用登录 token；重启 ECHO 后需再点一次）" % url}
+    return {"ok": False, "message": "打开浏览器失败（%s）%s"
+                                    % (url, ("；%s" % detail) if detail else "")}
 
 
 @router.post("/settings/reset")

@@ -56,6 +56,15 @@ def no_window_creationflags() -> int:
     return getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
 
 
+def user_data_dir() -> str:
+    """本机应用数据目录（``%LOCALAPPDATA%``；取不到时退回家目录下的 AppData\\Local）。"""
+    import os
+    base = os.environ.get("LOCALAPPDATA")
+    if base:
+        return base
+    return os.path.join(os.path.expanduser("~"), "AppData", "Local")
+
+
 def detach_gui_kwargs() -> dict:
     """让 GUI 子进程脱离父进程组（边条：``echo-sidebar.exe``）。
 
@@ -97,6 +106,31 @@ def process_running(image_name: str) -> bool:
         return image_name.lower() in out.lower()
     except Exception:
         return False
+
+
+def pids_of(image_name: str) -> list:
+    """按镜像名列出 pid（``tasklist``；查不到/失败 = 空列表，永不抛）。
+
+    为什么要它（2026-10-07）：打开 DSH 界面要**只清掉用我们自己 profile 的浏览器实例**，
+    不能把用户正开着的窗口一起关掉 —— "先按名字取 pid、再看各自命令行" 是唯一安全做法。
+    """
+    import subprocess
+    try:
+        out = subprocess.run(
+            ["tasklist", "/FI", "IMAGENAME eq %s" % image_name, "/NH", "/FO", "CSV"],
+            capture_output=True, text=True, timeout=6,
+            creationflags=no_window_creationflags()).stdout or ""
+    except Exception:
+        return []
+    pids = []
+    for line in out.splitlines():
+        parts = [p.strip().strip('"') for p in line.split('","')]
+        if len(parts) >= 2 and parts[0].lower() == str(image_name).lower():
+            try:
+                pids.append(int(parts[1]))
+            except Exception:
+                continue
+    return pids
 
 
 def kill_process_tree(pid: int) -> bool:

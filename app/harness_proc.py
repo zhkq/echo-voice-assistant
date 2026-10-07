@@ -256,6 +256,32 @@ def online(timeout=1.0):
         return False
 
 
+def secret_cookie():
+    """用 harness **自己家目录**里的 browser-session 密钥铸一枚签名 Cookie（拿不到返回 ""）。
+
+    这是"给浏览器登录"的**正路**（2026-10-07 定，用户实测促成）：
+
+      * **token 会随进程失效** —— ECHO 每重启一次 harness 就换一枚，
+        旧 token 打开页面会"能加载但鉴权不过"（侧栏没有工作区/会话，且无提示）；
+      * **Cookie 跟着密钥文件**（`<家目录>/.credentials.yaml`），**不随重启失效**。
+
+    算法与 `HarnessAgent._secret_cookie()` 完全同一套（都走 `dsh_agent._make_cookie`），
+    刻意**共用**而不是各写一份：两边不一致时会出现"ECHO 自己好用、浏览器打不开"这种鬼现象。
+    """
+    try:
+        from app.agents.dsh_agent import _load_browser_secret, _make_cookie
+    except Exception:
+        return ""
+    try:
+        path = os.path.join(home(), ".credentials.yaml")
+        secret = _load_browser_secret(path)
+        if not secret:
+            return ""
+        return _make_cookie(base_url(), secret_b64=secret)
+    except Exception:
+        return ""
+
+
 def started_by_echo():
     return bool(_proc_pid and _proc is not None and _proc.poll() is None)
 

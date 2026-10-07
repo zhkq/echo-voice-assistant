@@ -125,6 +125,9 @@ class EveryPlatformImplementsThePrimitives(unittest.TestCase):
                   "agent_cli_candidates", "tcp_excluded_port_range_output",
                   "hf_executable", "shell_script",
                   "acquire_named_lock", "named_lock_held", "release_named_lock",
+                  # 应用数据目录 + 按名取 pid（2026-10-07 加）：打开 DSH 界面要用**独立浏览器
+                  # profile**，而 `%LOCALAPPDATA%` / XDG 这类取值本身就是平台差异，必须住接缝里。
+                  "user_data_dir", "pids_of",
                   # P3 剩余搬迁新增的运行时原语（子进程 / 进程查询 / 打开窗口 /
                   # 提示音 / 离线 TTS / 通知 / 边条候选）
                   "detach_gui_kwargs", "detach_console_kwargs", "console_shell_argv",

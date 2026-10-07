@@ -51,6 +51,30 @@ def no_window_creationflags() -> int:
     return 0
 
 
+def user_data_dir() -> str:
+    """应用数据目录（XDG：``$XDG_DATA_HOME``，缺省 ``~/.local/share``）。"""
+    import os
+    return os.environ.get("XDG_DATA_HOME") or os.path.join(
+        os.path.expanduser("~"), ".local", "share")
+
+
+def pids_of(image_name: str) -> list:
+    """按进程名列出 pid（``pgrep``；查不到/失败 = 空列表，永不抛）。"""
+    import subprocess
+    try:
+        out = subprocess.run(["pgrep", "-f", str(image_name)],
+                             capture_output=True, text=True, timeout=6).stdout or ""
+    except Exception:
+        return []
+    pids = []
+    for line in out.splitlines():
+        try:
+            pids.append(int(line.strip()))
+        except Exception:
+            continue
+    return pids
+
+
 # ------------------------------------------------------------------ 运行时替换（P3）
 # Linux 不是当前交付目标，但接缝要齐（守卫测试会断言三个平台实现同一组原语）。
 

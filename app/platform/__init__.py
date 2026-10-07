@@ -76,6 +76,32 @@ def no_window_creationflags() -> int:
     return int(fn()) if callable(fn) else 0
 
 
+def user_data_dir() -> str:
+    """本平台放"应用数据"的目录（Windows=%LOCALAPPDATA%，POSIX=$XDG_DATA_HOME 或 ~/.local/share）。
+
+    为什么要收进接缝：业务代码里出现 `os.environ["LOCALAPPDATA"]` 就是平台分支，
+    而门禁 `tests/test_path_seam.py` 明令平台差异只能住在这里（D12）。
+    """
+    fn = _platform_fn("user_data_dir")
+    if callable(fn):
+        return str(fn())
+    return os.path.join(os.path.expanduser("~"), ".local", "share")
+
+
+def pids_of(image_name: str) -> list:
+    """按映像名列出 pid（查不到 = 空列表，永不抛）。
+
+    为什么需要（2026-10-07）：打开 DSH 界面要**只清掉用我们自己 profile 的浏览器实例**，
+    不能把用户正开着的窗口一起关掉 —— 而"按 pid 挑、再看命令行"是唯一安全做法
+    （`process_running` 只回答"在不在"，`process_command_line` 又要先知道 pid）。
+    """
+    fn = _platform_fn("pids_of")
+    try:
+        return list(fn(image_name)) if callable(fn) else []
+    except Exception:
+        return []
+
+
 def isolates_audio_capture() -> bool:
     """音频采集是否必须隔离到可回收的子进程。
 

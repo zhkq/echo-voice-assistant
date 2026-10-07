@@ -875,16 +875,65 @@ class ClientFollowsSelectionTests(unittest.TestCase):
 class HarnessBrowserOpenTests(unittest.TestCase):
     """仪表盘那个"用浏览器打开它的 Web 端"的小图标（2026-09-19 用户要求）。
 
-    要点：URL 里的 token 是密钥 → **服务端拼好直接调系统浏览器**，响应里只回不含 token 的地址。
+    **登录一律优先走签名 Cookie**（2026-10-07 用户实测后改）：用家目录里的
+    `browser-session` 密钥铸 Cookie，**先写 Cookie 再开页面** —— 因为 token
+    **跟着进程死、ECHO 每重启一次 harness 就换一枚**，旧 token 打开的页面
+    "能加载但鉴权不过"（侧栏没有工作区/会话，且没有任何提示，用户只能看到空白）。
+    token URL 只作退路（读不到密钥时）。
+
+    要点：凭据是密钥 → **服务端自己打开**，响应里只回地址、不回凭据。
     """
 
     def setUp(self):
         from fastapi import FastAPI
         from fastapi.testclient import TestClient
         from app.api import router
+        #: 这个类里所有用例都**不许有真副作用**（2026-10-07 踩到：端点在 token 之前
+        #: 先调 `secret_cookie()`，而开发机上能真读出密钥 → 用例**真的开了浏览器**，
+        #: 断言还全落空）。所以缺省把"有没有密钥"和"注入后打开"两件事都打桩。
+        #: `browser_open` 是函数内 import，所以要 patch 那个模块自己的属性。
+        from unittest.mock import patch as _patch
+        self._secret_patch = _patch.object(harness_proc, "secret_cookie", lambda: "")
+        self._secret_patch.start()
+        self.addCleanup(self._secret_patch.stop)
+        import app.browser_open as _bo
+        self._open_patch = _patch.object(_bo, "open_with_cookie",
+                                        lambda url, cookie, timeout=60.0: (False, "测试里不开窗口"))
+        self._open_patch.start()
+        self.addCleanup(self._open_patch.stop)
         app = FastAPI()
         app.include_router(router)
         self.client = TestClient(app)
+
+    def test_cookie_path_opens_without_any_token(self):
+        """**正路**：能用家目录密钥铸 Cookie 时，先写 Cookie 再打开 —— 不碰 token。
+
+        这条钉的是 2026-10-07 用户实测促成的改动：token 跟着进程死、每次重启都换，
+        所以打开浏览器**不该依赖 token**。
+        """
+        opened = []
+        with patch.object(harness_proc, "secret_cookie", lambda: "dsh-auth-x=secret123"), \
+                patch("app.browser_open.open_with_cookie",
+                      lambda url, cookie, timeout=60.0:
+                      (opened.append((url, cookie)) or (True, "已打开并登录"))):
+            body = self.client.post("/api/harness/browser").json()
+        self.assertTrue(body["ok"], body)
+        self.assertEqual(len(opened), 1)
+        url, cookie = opened[0]
+        self.assertTrue(url.endswith(":43199/"), url)
+        self.assertEqual(cookie, "dsh-auth-x=secret123")
+        self.assertNotIn("secret123", str(body), "响应里不许回凭据")
+        self.assertIn("已自动登录", body["message"])
+
+    def test_cookie_injection_failure_is_honest(self):
+        """Cookie 注入失败时不许谎报成功（今天就是被"ok:true 但登不进去"坑的）。"""
+        with patch.object(harness_proc, "secret_cookie", lambda: "dsh-auth-x=secret123"), \
+                patch("app.browser_open.open_with_cookie",
+                      lambda url, cookie, timeout=60.0: (False, "Edge 调试端口没开")):
+            body = self.client.post("/api/harness/browser").json()
+        # 会退到 token 路；token 也没有 → 应当**明确失败**并带上原因
+        self.assertFalse(body["ok"], body)
+        self.assertIn("Edge 调试端口没开", body["message"])
 
     def test_opens_the_browser_with_the_token_url(self):
         opened = []
