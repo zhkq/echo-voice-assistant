@@ -1012,21 +1012,32 @@ body.on-history { height: 100vh; overflow-y: hidden; }
      列表各自带上限与滚动条，装不下时整页滚 —— 不再有死空白。 */
   main { margin: 4px auto; min-height: calc(100vh - 54px); display: flex; flex-direction: column; }
   #view-dashboard { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+  /* 网格**撑满**仪表盘视图：这样"余量"才有地方落（落到会议卡上）。
+     ⚠️ 必须与 `#meetingCard` 那条 `flex: 1 1 auto` 配套 ——
+     只让卡片长、而网格不长的结果是"卡片的余量 = 0"：
+     2026-10-07 实测过一次（网格 834px 而 `#view-dashboard` 1310px，中间 476px 谁也没拿到）。 */
   .dashboard-grid {
-    flex: 0 1 auto; display: flex; flex-direction: column; gap: 8px;
+    flex: 1 1 auto; display: flex; flex-direction: column; gap: 8px;
     min-height: 0;
-    overflow-y: auto;                  /* 内容比视口高时**整页滚**（原来 overflow:hidden 会裁掉内容） */
+    /* 会议卡已经有自己的溢出滚动；网格只兜底（内容真比视口高时才滚） */
+    overflow-y: auto;
     scrollbar-width: thin;
   }
   .dashboard-grid .card {
     flex: 0 0 auto; min-height: 0; margin-bottom: 0;
     display: flex; flex-direction: column;
   }
-  /* 纵向配比（2026-09-12 用户要求）：指令卡按内容固定高度（历史只保留 2 条）；
-     会议卡与回顾卡同样**按内容定高**（2026-10-07 改），不再互相"吃剩余空间"。 */
-  #cmdCard { flex: 0 0 auto; }                       /* 按内容定高：标题+输入+目标+2 条历史 */
-  #meetingCard { flex: 0 0 auto; }                   /* 按内容定高（列表自带上限+滚动） */
-  #reviewCard { flex: 0 0 auto; }                    /* 按内容定高（摘要自带上限+滚动） */
+  /* 纵向配比（2026-10-07 用户定：**顺序是「超级助理 → 会议 → 每日回顾 → 状态栏」，
+     中间的余量留给会议**）：
+       * 超级助理卡按内容定高（标题+输入+目标+2 条历史）；
+       * **会议卡是唯一吃余量的那张**（`flex: 1 1 auto`），它的列表跟着卡片长；
+       * 每日回顾卡与底部状态栏按内容定高，自然贴着会议卡下面。
+     ⚠️ 这与上一版相反（上一版三张卡都按内容定高）—— 那一版把余量留在了页面底部，
+     用户实测后要求把中间的空间给会议。 */
+  #cmdCard { flex: 0 0 auto; }                       /* 按内容定高 */
+  #meetingCard { flex: 1 1 auto; min-height: 0; }    /* **吃掉中间余量** */
+  #reviewCard { flex: 0 0 auto; }                    /* 按内容定高（摘要自带上限） */
+  #statusBar { flex: 0 0 auto; }                     /* 钉在会议卡下面（不是视口底） */
   /* 底部一行：容器按内容定高；模型路由卡在行内吃掉除箭头外的宽度（28 箭头 + 6 间距） */
   #foWrap { flex: 0 0 auto; margin-bottom: 0; }
   #failoverCard { flex: 1 1 auto; min-width: 0; }
@@ -1041,11 +1052,10 @@ body.on-history { height: 100vh; overflow-y: hidden; }
   .dashboard-grid .target-row { flex-shrink: 0; }
   /* 指令历史：固定容纳 2 条（单条约 78px：badge 行 20 + 正文 27 + 内边距/边框），超出裁掉不滚动 */
   .dashboard-grid .cmd-list { flex: 0 0 auto; max-height: 164px; overflow: hidden; }
-  /* 会议列表：**带上限地自己滚**（2026-10-07 改）。
-     原来写 `flex: 1 1 0` 是"吃掉卡片剩余高度" —— 那是为"整页均分"那套服务的；
-     现在卡片按内容定高，用 flex:1 会让列表与卡片互相追平、又生出空白。
-     这里给它一个够放 4 条的高度上限（单条约 76px），装不下时**列表内滚**。 */
-  .dashboard-grid .meeting-list { flex: 0 0 auto; max-height: 316px; overflow-y: auto; }
+  /* 会议列表：**跟着卡片长**（2026-10-07 用户："中间的空间留给会议"）。
+     卡片是唯一的弹性项，所以列表这里不再设上限 —— 有多少空间就显示多少条，
+     真的多到放不下时**列表内滚**（`overflow-y:auto` 兜底）。 */
+  .dashboard-grid .meeting-list { flex: 1 1 auto; min-height: 0; overflow-y: auto; }
   /* 每日回顾那条摘要：**可滚**而不是裁掉（用户："没显示全可以加个滚动条"） */
   .dashboard-grid .review-last { max-height: 46px; overflow-y: auto; }
 
