@@ -117,8 +117,44 @@ function Start-EchoOnce([switch]$Quiet) {
     return $p
 }
 
+# Make the local capability backend follow this tree (added 2026-10-07).
+#
+# WHY: after a MACHINE REBOOT the user clicks "1-" + dev launcher (this script, -Background)
+# and then sees the panel's backend tile stay RED ("pending start") forever --- because the
+# capability backend is a SEPARATE process and **nothing here started it**. The
+# 2026-10-06 fix added this follow-up to restart-echo.ps1 only (the panel's restart
+# button), so "restart" brought the backend back but "start" did not. Same ports
+# (8900/8901) and same ownership rule as there: `take-over` stops a FOREIGN backend
+# and starts this tree's own; a backend already belonging to this tree is left alone;
+# pairing is REUSED either way (no re-pairing).
+#
+# It is sent only AFTER ECHO answers on its port, and the call is deliberately short:
+# starting the backend takes tens of seconds (model load), and ECHO reports that
+# progress in its own job --- the panel shows it. We must NOT block the launcher.
+function Start-EchoBackendFollowUp([int]$port) {
+    for ($i = 0; $i -lt 40; $i++) {
+        Start-Sleep -Milliseconds 500
+        if (Test-EchoPort $port) { break }
+    }
+    if (-not (Test-EchoPort $port)) { return }
+    try {
+        $r = Invoke-RestMethod -Uri "http://127.0.0.1:$port/api/capability/backend/take-over" `
+            -Method Post -ContentType 'application/json' -Body '{}' -TimeoutSec 120
+        if ($r -and $r.message) {
+            Add-Content -Path (Join-Path $logDir 'restart.log') `
+                -Value ("[{0}] backend follow-up: {1}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $r.message) `
+                -Encoding UTF8
+        }
+    } catch {
+        Add-Content -Path (Join-Path $logDir 'restart.log') `
+            -Value ("[{0}] backend follow-up failed: {1}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $_) `
+            -Encoding UTF8
+    }
+}
+
 if ($Background -and -not $Supervise) {
     [void](Start-EchoOnce)
+    Start-EchoBackendFollowUp (Resolve-EchoPort $base)
     exit 0
 }
 
