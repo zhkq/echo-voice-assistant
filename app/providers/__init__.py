@@ -218,14 +218,35 @@ def speak_text(text, timeout=60):
     选择一个 TTS 实现的开关只剩 `ttsEngine` 一个 —— `off` 关闭朗读、`edge-tts` 走微软在线、
     本平台离线引擎走系统合成、`auto` 优先在线失败回退离线。provider 注册表仍列出
     edge-tts / 离线朗读并各自报就绪状态（面板据此显示"当前实现 + 会不会出网"），
-    但**不再由它决定用哪个**。失败不抛异常（朗读失败不该影响主流程），只把原因打出来。
+    但**不再由它决定用哪个**。失败不抛异常（朗读失败不该影响主流程），**但要留痕**。
+
+    ⚠️ 2026-10-07：**"只 print 不写日志"是一个真 bug，已修**。现场是稳定版用户
+    *"听到了提示音，但是没有听到朗读结果"* —— 声音该念没念，而**日志里一个字都没有**；
+    真相是稳定版运行时缺 `edge_tts`（`auto` 的在线那档），每次朗读都失败在这里。
+    用户没有任何途径知道（提示音照响、命令照完成、面板全绿）。
+    判据只能是"引擎真的能出声"：所以这里失败时**写 warn 日志**，
+    并把**要念的文本**也带上 —— 至少让用户能在面板上读到本该听到的内容。
     """
     try:
         from app.audio import tts
-        return bool(tts.speak(text, tts_engine(), timeout))
+        ok = bool(tts.speak(text, tts_engine(), timeout))
+        if not ok:
+            _log_speak_failure(text, "引擎返回 False（未出声）")
+        return ok
     except Exception as e:
         print("[providers] 朗读失败：%s" % e)
+        _log_speak_failure(text, "%s: %s" % (type(e).__name__, e))
         return False
+
+
+def _log_speak_failure(text, why):
+    """朗读失败写一条 warn 日志（带要念的文本）—— 别让它静默消失。"""
+    try:
+        from app import db
+        db.add_log("warn", "tts",
+                   "朗读失败：%s｜本该念出：%s" % (why, str(text or "")[:120]))
+    except Exception:                                          # pragma: no cover - 兜底
+        pass
 
 
 def speak_async(text, timeout=60):

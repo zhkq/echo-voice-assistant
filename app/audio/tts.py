@@ -268,17 +268,33 @@ _PROBE_TTL = 300         # 探针结果有效期（秒）
 
 
 def probe_online(force=False):
-    """探测在线 TTS（edge-tts）可达性。
+    """探测在线 TTS（edge-tts）**能不能真的用**：包在 + 网络通。返回 True/False。
 
-    用 TCP 连接 speech.platform.bing.com:443（3 秒超时）判断；
+    ⚠️ 2026-10-07 加包检查（原来只测网络 —— 那正是"假绿"的根源）：
+    现场是稳定版用户"听到了提示音、但没听到朗读"，而启动日志却写着
+    `[tts] 语音合成 就绪（在线 · edge-tts）` —— 真相是那个运行时**没装 `edge_tts`**，
+    每次朗读都在 `No module named 'edge_tts'` 上失败。
+    只测 TCP 的判据在"网通、包缺"时报就绪，用户因此完全无从判断。
+
+    顺序：**先查包**（本地、快、缺了不必再连网），再测 TCP 可达性（3 秒）；
     结果缓存 _PROBE_TTL 秒，force=True 强制重测。
-    返回 True/False。
     """
     global _edge_ok, _edge_probe_ts
     now = time.monotonic()
     if not force and _edge_ok is not None and now - _edge_probe_ts < _PROBE_TTL:
         return _edge_ok
     ok = False
+    # ① 包在不在 —— "引擎能不能出声"的必要条件，与网络无关
+    try:
+        import importlib.util
+        if importlib.util.find_spec("edge_tts") is None:
+            with _edge_ok_lock:
+                _edge_ok = False
+                _edge_probe_ts = time.monotonic()
+            return False
+    except Exception:
+        pass                                    # 查不了就退化成"只看网络"（老行为）
+    # ② 网络可达性
     try:
         import socket
         s = socket.create_connection((_EDGE_HOST, 443), timeout=3)
