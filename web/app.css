@@ -1342,8 +1342,18 @@ body.on-history { height: 100vh; overflow-y: hidden; }
    仪表盘那张卡 + 「回顾历史」页签的详情。列表主体复用 `.cmd-item`（它本来
    就是"一条记录"的样式，见上面），这里只补回顾独有的两块：最近一次那一行、
    以及详情里的"逐轮"呈现（口述 vs 播报要一眼分得开）。 */
-.review-last { padding: 0 12px 10px; line-height: 1.5; }
-.review-last b { font-weight: 600; }
+/* 压扁后的两行（2026-10-07 用户："每日回顾高度压扁一些，仅保留最近1条"）：
+   正文原来是 `.card-body`（自带下边距）+ `big` 按钮 + 三行摘要，现在是
+   「按钮 + 状态」一行 + 「最近一条播报」一行。行高与内边距都收窄。 */
+.review-card .card-title { padding-bottom: 4px; }
+.review-line { display: flex; align-items: center; gap: 8px; padding: 0 12px 2px; }
+.review-line .muted { font-size: 12px; }
+.review-last {
+  padding: 0 12px 6px; line-height: 1.35; font-size: 12px;
+  /* 播报可能长（技能没按契约截断时）：**最多两行**，超出省略 —— 卡片不许被一条撑高 */
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+  overflow: hidden;
+}
 .review-day.open { border-color: var(--accent); }
 .review-detail { margin-top: 10px; border-top: 1px solid var(--border); padding-top: 10px; }
 .review-detail-head { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; }

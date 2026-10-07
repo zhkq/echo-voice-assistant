@@ -34,9 +34,12 @@
     <button class="tab active" data-view="dashboard">仪表盘</button>
     <button class="tab" data-view="settings">设置</button>
     <button class="tab" data-view="business">业务配置</button>
-    <button class="tab" data-view="history" data-htab="commands">指令历史</button>
-    <button class="tab" data-view="history" data-htab="meetings">会议历史</button>
-  <button class="tab" data-view="history" data-htab="reviews">回顾历史</button>
+    <!-- 历史三个子页签（2026-10-07 用户改名与排序："会议、指令、回顾"）。
+         顺序 = 用户日常使用频率，不再按"先有谁后加谁"排。
+         驱动见 app.js 的 `HIST_TAB_ORDER`（同一处判据，页签顺序变了也要跟着改）。 -->
+    <button class="tab" data-view="history" data-htab="meetings">会议</button>
+    <button class="tab" data-view="history" data-htab="commands">指令</button>
+    <button class="tab" data-view="history" data-htab="reviews">回顾</button>
   </nav>
 </header>
 
@@ -87,18 +90,18 @@
       </div>
 
       <!-- 每日回顾（2026-10-06 用户要求："仪表盘要有一个回顾卡片"）。
-           它和上面两张卡一样是"一件事的入口 + 最近一次"：
-           状态徽章（今天已回顾 / 还没 / 未启用）+ 最近一次播报摘要 + 两个动作。
-           **不放进度条**：回顾是语音多轮交互，进度在「设置 → AI组件」那张小卡里。 -->
-      <div class="card span-2" id="reviewCard">
+           2026-10-07 用户："每日回顾高度压扁一些，仅保留最近1条" ——
+           所以正文**只有一行**：按钮 + 最近一条的播报摘要（连着状态一起说），
+           状态徽章与「历史 ›」在标题行。**不放进度条**：进度在「设置 → AI组件」那张小卡里。 -->
+      <div class="card span-2 review-card" id="reviewCard">
         <div class="card-title"><span class="ic">📔</span>每日回顾
           <span class="badge idle" id="reviewBadge">读取中…</span>
           <a class="more" id="gotoReviews" href="#">历史 ›</a>
         </div>
-        <div class="card-body row">
-          <button class="btn big" id="btnReviewNow">开始回顾</button>
-          <button class="btn hidden" id="btnReviewStop">结束回顾</button>
-          <div class="muted" id="reviewInfo">—</div>
+        <div class="review-line">
+          <button class="btn mini" id="btnReviewNow">开始回顾</button>
+          <button class="btn mini hidden" id="btnReviewStop">结束回顾</button>
+          <span class="muted" id="reviewInfo">—</span>
         </div>
         <div class="muted review-last" id="reviewLast"></div>
       </div>
@@ -458,45 +461,10 @@
        `.tabs-sm` 一起删了 —— 两个顶层页签已经把"这是哪一页"说清了，那张卡是纯残留
        （用户："这三个红框是多余的残留，清理掉"）。 -->
   <section id="view-history" class="view hidden">
-    <!-- ---------- ① 指令历史 ---------- -->
-    <div id="htab-commands" class="htab">
-      <div class="card">
-        <div class="card-title">指令历史
-          <span class="muted" style="font-size:12px" id="cmdHistCount">—</span>
-          <span class="spacer"></span>
-          <button class="btn danger" id="btnClearCmds">清空</button>
-        </div>
-        <div class="card-body">
-          <!-- 过滤：关键词 + 时间范围。**在服务端过滤**（`GET /api/commands?q=&since=`）——
-               历史会有几千条，在"已加载的这一页"上过滤会让"加载更多"的语义错位。
-               行沿用设置卡那套 `.srow`（标签与控件同行、边条 84px，能收缩）。 -->
-          <div class="srow">
-            <div class="lbl"><span class="lt">筛选</span></div>
-            <div class="sctl">
-              <input class="ctl" type="text" id="cmdFilter" placeholder="关键词（指令或回复里）">
-              <select class="ctl" id="cmdRange" title="只看这段时间里的指令">
-                <option value="">全部时间</option>
-                <option value="1">今天</option>
-                <option value="7">近 7 天</option>
-                <option value="30">近 30 天</option>
-              </select>
-              <button class="btn mini" id="btnCmdFilter">查询</button>
-            </div>
-          </div>
-          <div id="historyList" class="cmd-list"></div>
-          <!-- 分页：一次 50 条，这里按 offset 追加。条数由服务端给的 total 决定，
-               面板不自己数（`hidden` 表示"已经到底了"）。 -->
-          <div class="sacts" style="padding-top:6px">
-            <button class="btn mini hidden" id="btnCmdMore">加载更多</button>
-          </div>
-        </div>
-      </div>
-    </div>
-
-    <!-- ---------- ② 会议历史（原顶层「会议记录」页整页并入；操作入口一个都没少） ---------- -->
+    <!-- ---------- ① 会议（原顶层「会议记录」页整页并入；操作入口一个都没少） ---------- -->
     <div id="htab-meetings" class="htab hidden">
       <div class="card">
-        <div class="card-title">会议历史
+        <div class="card-title">会议
           <span class="spacer"></span>
           <button class="btn" id="btnCompressToggle"
                   title="把历史会议的音频无损压成 FLAC：省约一半磁盘，转写文本逐字不变">压缩音频</button>
@@ -569,12 +537,47 @@
       </div>
     </div>
 
-    <!-- ---------- ③ 回顾历史（2026-10-06 用户要求："会议历史后面要增加一个回顾历史页签"） ----------
+    <!-- ---------- ② 指令 ---------- -->
+    <div id="htab-commands" class="htab">
+      <div class="card">
+        <div class="card-title">指令
+          <span class="muted" style="font-size:12px" id="cmdHistCount">—</span>
+          <span class="spacer"></span>
+          <button class="btn danger" id="btnClearCmds">清空</button>
+        </div>
+        <div class="card-body">
+          <!-- 过滤：关键词 + 时间范围。**在服务端过滤**（`GET /api/commands?q=&since=`）——
+               历史会有几千条，在"已加载的这一页"上过滤会让"加载更多"的语义错位。
+               行沿用设置卡那套 `.srow`（标签与控件同行、边条 84px，能收缩）。 -->
+          <div class="srow">
+            <div class="lbl"><span class="lt">筛选</span></div>
+            <div class="sctl">
+              <input class="ctl" type="text" id="cmdFilter" placeholder="关键词（指令或回复里）">
+              <select class="ctl" id="cmdRange" title="只看这段时间里的指令">
+                <option value="">全部时间</option>
+                <option value="1">今天</option>
+                <option value="7">近 7 天</option>
+                <option value="30">近 30 天</option>
+              </select>
+              <button class="btn mini" id="btnCmdFilter">查询</button>
+            </div>
+          </div>
+          <div id="historyList" class="cmd-list"></div>
+          <!-- 分页：一次 50 条，这里按 offset 追加。条数由服务端给的 total 决定，
+               面板不自己数（`hidden` 表示"已经到底了"）。 -->
+          <div class="sacts" style="padding-top:6px">
+            <button class="btn mini hidden" id="btnCmdMore">加载更多</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ---------- ③ 回顾（2026-10-06 用户要求："会议历史后面要增加一个回顾历史页签"） ----------
          一天一行（那一轮几段口述、当天最新的播报）；点开看当天每一轮的原文与播报，
          并能直接打开 Obsidian 工作日志 —— 那才是整理后的成果。 -->
     <div id="htab-reviews" class="htab hidden">
       <div class="card">
-        <div class="card-title">回顾历史
+        <div class="card-title">回顾
           <span class="muted" style="font-size:12px" id="reviewHistCount">—</span>
           <span class="spacer"></span>
           <button class="btn mini" id="btnReviewReload" title="重新读取">刷新</button>

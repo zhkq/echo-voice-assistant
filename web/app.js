@@ -99,9 +99,16 @@ function confirmDialog(message, { okText = "确定", cancelText = "取消", dang
    同一场会议有两处状态，而用户的规矩是「一个实体只有一处状态」。 */
 const _VIEWS = ["dashboard", "settings", "business", "history"];
 
-/* 历史页内部的两个子页签（**不是顶层页签**，所以不进 `_VIEWS`）：
-   `commands` = 指令历史，`meetings` = 会议历史。用 `.tab-sm` 那套控件。 */
-let _histTab = "commands";
+/* 历史页内部的三个子页签（**不是顶层页签**，所以不进 `_VIEWS`）：
+   `meetings` = 会议 · `commands` = 指令 · `reviews` = 回顾。
+   顺序与默认值见下面的 `HIST_TAB_ORDER` / `HIST_TAB_DEFAULT`（2026-10-07 用户改名重排后
+   第一个是「会议」，所以打开历史页没指明子页签时落到会议）。 */
+let _histTab = "meetings";
+
+/*: 仪表盘「近期会议」显示几条（2026-10-07 用户："改成显示最新四条"）。
+    **两处**要用它：首屏 `refreshDashboard()` 与每 5 秒的 `refreshMeetingPanel()` ——
+    原来两处各写一个字面量（4 与 5），只改一处就会"看起来没生效"（真踩过）。 */
+const DASH_MEETINGS_LIMIT = 4;
 
 /* 旧入口 → 新页签（深链/书签/别处硬编码的兼容层）：
    2026-09-26 用户定的设置信息架构（IA）= **三类 + 一个历史位**：
@@ -139,16 +146,37 @@ function normView(name) {
   return VIEW_ALIASES[n] || n;
 }
 
-/** 历史页两个子页签的切换（**同一实体只有一处渲染**：
- *  指令列表只有 `#historyList`、会议列表只有 `#meetingList`，切页签只是显示/隐藏）。 */
-/* 历史页的三个子页签（2026-10-06 加「回顾历史」）。
-   原来是"不是会议就是指令"的二元写法（`name === "meetings" ? "meetings" : "commands"`），
-   加第三个页签时必须改成白名单 —— 否则任何未知值都会**静默落到指令历史**，
-   深链 `?view=reviews` 会看起来"点了没反应"。 */
-const HIST_TABS = ["commands", "meetings", "reviews"];
+/* 历史页的三个子页签。
+   2026-10-06 加「回顾」时把"不是会议就是指令"的二元写法改成了白名单 ——
+   否则任何未知值都会**静默落到指令**，深链 `?view=reviews` 看起来"点了没反应"。
+
+   2026-10-07：用户把这排页签改名并重排成 **会议 · 指令 · 回顾**
+   （"指令历史，会议历史，回顾历史，改为 会议、指令、回顾"）——
+   顺序 = 日常使用频率，不再按"先有谁后加谁"。`HIST_TAB_ORDER` 是**唯一的顺序判据**：
+   顶层按钮与三个容器的顺序都按它排（容器在 `#view-history` 里是纵向 flex，谁在前谁在上）。 */
+const HIST_TAB_ORDER = ["meetings", "commands", "reviews"];
+const HIST_TABS = HIST_TAB_ORDER;          // 兼容旧名（同义词，别再各写一份顺序）
+//: 打开历史页、又没有指明子页签时落到哪一个 —— 取顺序里的第一个（"会议"）。
+const HIST_TAB_DEFAULT = HIST_TAB_ORDER[0];
+
+/** 按 `HIST_TAB_ORDER` 排页签与容器（DOM 顺序改了也不用记得两处都改）。 */
+function applyHistoryTabOrder() {
+  const nav = document.querySelector("nav.tabs");
+  if (nav) {
+    const btns = Array.from(nav.querySelectorAll("[data-htab]"));
+    btns.sort((a, b) => HIST_TAB_ORDER.indexOf(a.dataset.htab)
+                        - HIST_TAB_ORDER.indexOf(b.dataset.htab));
+    btns.forEach((b) => nav.appendChild(b));   // appendChild 会移动已有节点
+  }
+  const host = $("#view-history");
+  if (host) {
+    const boxes = HIST_TAB_ORDER.map((t) => $("#htab-" + t)).filter(Boolean);
+    boxes.forEach((b) => host.appendChild(b));
+  }
+}
 
 function switchHistoryTab(name) {
-  _histTab = HIST_TABS.indexOf(String(name)) >= 0 ? String(name) : "commands";
+  _histTab = HIST_TABS.indexOf(String(name)) >= 0 ? String(name) : HIST_TAB_DEFAULT;
   $$("[data-htab]").forEach((b) => b.classList.toggle("active", b.dataset.htab === _histTab));
   HIST_TABS.forEach((t) => {
     const el = $("#htab-" + t);
@@ -1028,8 +1056,8 @@ async function refreshDashboard() {
     const cmds = await api("/api/commands?limit=2");
     // 点击任意一条 → 跳到「历史」页签并定位到这条的完整详情（issue #2）
     renderCmdList($("#recentCmds"), cmds.items, false, { click: "history" });
-    // 近期会议（最近 5 条）
-    const meets = await api("/api/meetings?limit=5");
+    // 近期会议（2026-10-07 用户："仪表盘会议列表改成显示最新四条"）
+    const meets = await api("/api/meetings?limit=" + DASH_MEETINGS_LIMIT);
     renderMeetingItems($("#recentMeetings"), meets.items);
   } catch (e) {
     // 顶栏不再有"运行时长 · 空闲"这类常驻状态；连不上时给整页加红色标记（正常时不可见），
@@ -2404,7 +2432,7 @@ function queueBodyHtml() {
     <div class="cmd-list">${rows}</div>
     <div class="sacts" style="padding-top:6px">
       <button class="btn mini" data-goto="history">全部历史 ›</button>
-      <button class="btn mini" data-goto="meetings">会议历史 ›</button>
+      <button class="btn mini" data-goto="meetings">会议 ›</button>
     </div>`;
 }
 
@@ -4515,25 +4543,30 @@ async function refreshReviewCard() {
   badge.className = "badge " + state;
   badge.title = tip;
 
+  // 压扁后正文只有两行：这一行说**状态**（外加"现在该干什么"），下一行只放**最近 1 条**。
+  // 所以在运行中时这里把"你讲、讲完停一下"说清楚 —— 那句话原来占单独一行。
   if (info) {
     if (!on) info.innerHTML = `回顾没启用 —— <a href="#" data-goto-link="settings">去设置里打开 ›</a>`;
     else if (!readyOk) info.textContent = home.reason || "回顾还没配好";
-    else if (running) info.textContent = "正在回顾…（说完一段等它整理，再说下一段）";
-    else info.textContent = sum.todayTurns > 0
-      ? `今天已经回顾 ${sum.todayTurns} 轮${sum.todayFailed ? `（${sum.todayFailed} 轮没成）` : ""}`
-      : "今天还没回顾";
+    else if (running) info.textContent = "正在回顾 —— 对着麦克风讲，讲完停一下";
+    else if (sum.todayTurns > 0) {
+      info.textContent = `今天已回顾 ${sum.todayTurns} 轮`
+        + (sum.todayFailed ? `（${sum.todayFailed} 轮没成）` : "");
+    } else info.textContent = "今天还没回顾";
   }
+  // **只保留最近 1 条**（用户 2026-10-07："仅保留最近1条"）。摘要就是那一句播报 ——
+  // 它是"念给你听过的话"，比口述原文短、也正是回顾的产出。
   if (last) {
     const brief = String(sum.lastBrief || "").trim();
     const when = String(sum.lastAt || "").slice(5, 16);       // MM-DD HH:MM
-    const text = String(sum.lastText || "").trim();
-    if (!brief && !text) {
+    if (!brief) {
       last.textContent = "";
+      last.classList.add("hidden");
     } else {
-      last.innerHTML = `最近一次 ${esc(when)}：`
-        + `<b>${esc(brief || "（那次没拿到播报）")}</b>`
-        + (text ? `<span class="muted"> · 我说的是「${esc(text)}」</span>` : "");
-      if (String(sum.lastStatus || "") === "failed") last.innerHTML += ` <span class="sbadge warn">那次失败了</span>`;
+      last.classList.remove("hidden");
+      last.innerHTML = `<span class="dim">最近一次 ${esc(when)}</span>：${esc(brief)}`
+        + (String(sum.lastStatus || "") === "failed"
+           ? ` <span class="sbadge warn">那次失败了</span>` : "");
     }
   }
 }
@@ -5451,7 +5484,10 @@ async function pollTranscribe() {
     renderMeetingItems($("#meetingList"), r.items, { full: true });
     refreshMeetingHeader();          // 停留在会议列表页时按钮也要跟着录音状态变
   } else if (v.dataset.view === "dashboard") {
-    const r = await api("/api/meetings?limit=5");
+    // ⚠️ 这个数字必须与 `refreshDashboard()` 里那一处**一致**（2026-10-07 踩过：
+    // 只改了首屏那处、漏了这里每 5 秒的轮询重画 → 用户看到的一直是 5 条）。
+    // 所以走同一个常量，别再各写一个字面量。
+    const r = await api("/api/meetings?limit=" + DASH_MEETINGS_LIMIT);
     renderMeetingItems($("#recentMeetings"), r.items);
   }
 }
@@ -6825,6 +6861,7 @@ async function bootView() {
   renderInstallNotice();
 }
 bootView();
+applyHistoryTabOrder();     // 历史三个子页签按 HIST_TAB_ORDER 排（会议 · 指令 · 回顾）
 applyCollapsedCards();      // 应用上次的卡片折叠状态（设置页与各页签的可折叠卡片）
 
 /* ---------------- 自动刷新：间隔取自设置 panelAutoRefresh ----------------

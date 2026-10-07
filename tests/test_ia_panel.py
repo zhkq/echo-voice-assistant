@@ -186,6 +186,45 @@ class MeetingRecordsMergedIntoHistoryTests(unittest.TestCase):
         self.assertRegex(self.js, r'switchHistoryTab\(sub\)',
                          "switchView 要用算好的子页签名去切")
 
+    def test_the_dashboard_meeting_count_has_one_source(self):
+        """仪表盘「近期会议」显示几条 —— **只许有一个判据**（2026-10-07 踩过）。
+
+        现场：用户要"显示最新四条"，我只改了首屏那处字面量，**漏了每 5 秒的轮询重画**
+        （它写的是 5）→ 用户看到的永远是 5 条，等于改了没生效。
+        所以这个数字走 `DASH_MEETINGS_LIMIT`，两处调用都引用它；这里钉住这一点。
+        """
+        self.assertEqual(self.js.count("const DASH_MEETINGS_LIMIT"),
+                         1, "显示条数只许有一处声明")
+        self.assertRegex(self.js, r"DASH_MEETINGS_LIMIT\s*=\s*4",
+                         "需求是「最新四条」")
+        # 两处取数都必须用常量（不许再出现写死的 4/5）
+        self.assertEqual(self.js.count('limit=" + DASH_MEETINGS_LIMIT'), 2,
+                         "首屏与轮询两处都要用常量（少一处就会覆盖另一处）")
+        self.assertNotIn('/api/meetings?limit=5"', self.js,
+                         "还有写死的 5：它会把仪表盘重画成 5 条")
+
+    def test_history_sub_tabs_are_named_and_ordered_meetings_commands_reviews(self):
+        """三个历史子页签的**文案与顺序**：会议 · 指令 · 回顾（2026-10-07 用户改名重排）。
+
+        顺序有两处表现（顶层按钮 + `#view-history` 里的容器，后者是纵向 flex），
+        所以两处都要按同一个 `HIST_TAB_ORDER` 排 —— 否则按钮顺序与内容顺序对不上。
+        """
+        want = ["meetings", "commands", "reviews"]
+        self.assertRegex(self.js, r"HIST_TAB_ORDER\s*=\s*\[" + r".*?".join(
+            '"%s"' % t for t in want),
+            "顺序判据应当是 会议 → 指令 → 回顾")
+        # 文案：顶层按钮
+        nav = self.html[self.html.index('<nav class="tabs">'):]
+        nav = nav[:nav.index("</nav>")]
+        for htab, label in (("meetings", "会议"), ("commands", "指令"), ("reviews", "回顾")):
+            self.assertRegex(nav, r'data-htab="%s">%s<' % (htab, label),
+                             "顶层页签「%s」的文案应是「%s」" % (htab, label))
+        self.assertNotIn("指令历史", nav, "旧名「指令历史」应已改掉")
+        self.assertNotIn("会议历史<", nav, "旧名「会议历史」应已改掉")
+        # 容器顺序也要对上（纵向 flex：谁在前谁在上）
+        boxes = re.findall(r'id="htab-(\w+)"', self.html)
+        self.assertEqual(boxes, want, "容器顺序要和页签顺序一致：%s" % boxes)
+
     def test_one_entity_one_place(self):
         """**同一实体只有一处渲染**：会议条目的 DOM 与渲染函数各只有一份。"""
         self.assertEqual(self.html.count('id="meetingList"'), 1,
