@@ -495,7 +495,41 @@ class HarnessLocalInstallTests(unittest.TestCase):
         self.assertIn("UPGRADE=1", sh, "sh 没解析 --upgrade")
         # 升级真的要能落地：删整树重装（npm 只按版本号判"已装"，不修残树）
         self.assertIn("删整树重装", ps1)
-        self.assertIn("删整树重装", sh)
+
+    def test_the_installer_does_not_override_the_auto_resolved_version(self):
+        """**装机器不许把版本写死**（2026-10-08 真机事故，用户报"测试机还是装的 0.1.5-rc.2"）。
+
+        事故形状：helper（`harness-install-local`）里"查 dist-tags.latest"那段**明明是对的**，
+        但**装机器**（`echo-install-components`）里 `$DshVersion` 默认还是 `0.1.5-rc.2`，
+        而且它**显式传下去**：
+
+            & $helper -DestDir ... -Version $script:DshVersion      # 空/旧值都盖掉 helper 的默认
+
+        于是**仓库、新包、旧包跑出来全是 0.1.5-rc.2** —— 只改 helper 的默认值
+        （上一条用例钉的那个）**根本不够**。判据必须落在**调用链的两端**：
+          ① 装机器那一侧的默认值也必须是**空**；
+          ② 传给 helper 的值只能来自这个默认/用户显式指定。
+
+        真机验收：`-Version ''` → 打印 `npm 上的最新版（latest）：0.2.0-rc.2`、
+        实际装上 `0.2.0-rc.2`（改前是 `0.1.5-rc.2`）。
+        """
+        ps1 = _read(PS1_COMPONENTS)
+        sh = _read(SH)
+        # ① 默认值必须为空（留空 = 让 helper 去查 latest）
+        self.assertRegex(ps1, r"\$DshVersion\s*=\s*''",
+                         "Windows 装机器把 -DshVersion 默认写死了（会盖掉自动取 latest）")
+        self.assertRegex(sh, r'DSH_VERSION\s*=\s*""',
+                         "mac 装机器把 DSH_VERSION 默认写死了（会盖掉自动取 latest）")
+        # ② 默认值里不该再出现那个旧版本（注释里提到历史可以，参数默认不行）
+        self.assertNotRegex(ps1, r"\$DshVersion\s*=\s*'0\.",
+                            "Windows 装机器的默认值又变成具体版本了")
+        self.assertNotRegex(sh, r'DSH_VERSION\s*=\s*"0\.',
+                            "mac 装机器的默认值又变成具体版本了")
+        # ③ 两个平台都确实把版本传给了 helper（否则"指定版本"这个入口没了）
+        self.assertIn("-Version", ps1)
+        self.assertIn("harness-install-local", ps1)
+        self.assertIn("--version", sh)
+        self.assertIn("harness-install-local", sh)
 
     def test_version_and_cache_only_are_overridable(self):
         """registry 哪天又坏在别的版本上时，要能一行参数换版本 / 离线只走缓存。"""

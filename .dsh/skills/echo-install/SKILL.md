@@ -327,6 +327,18 @@ bash "$kit/echo-install/scripts/echo-install-components.sh" \
 > （原状是 `0.1.5-rc.2` 写死，而当时 latest 已经是 `0.2.0-rc.2`，新装机器永远拿旧版）。
 > 查不到 registry（断网 / 源没配）时退回一个内置兜底版本并**明确告警**，不让安装整个失败。
 >
+> ⚠️ **"默认取 latest"要说两处都改才算修好（2026-10-08 真机事故）**：
+> `harness-install-local.*`（助手）里那段查 latest 的代码**当时其实是对的**，
+> 但**装机器** `echo-install-components.*` 里 `$DshVersion` / `DSH_VERSION` 的默认值
+> 还是写死的 `0.1.5-rc.2`，而且它**显式传下去**（`& $helper … -Version $script:DshVersion`）
+> —— 直接盖掉助手的默认。于是**仓库、新包、旧包跑出来全是 `0.1.5-rc.2`**，
+> 只看助手那段会误判为"已经修好了"（我上一轮就这么误判了一次）。
+> **判据**：装机器两个平台的默认值都必须是**空**（`tests/test_install_entry.py`
+> `test_the_installer_does_not_override_the_auto_resolved_version` 钉住），
+> 真机跑一次看到 `npm 上的最新版（latest）：<版本>` 才算数。
+> 空值传下去是安全的：助手用 `if (-not $Version)` / `if [ -z "$VERSION" ]` 判，
+> 空串与"没传"走同一条路。
+>
 > **升级标准版**（三件事都一样：删整树 → 重装 → 过完整性自检 + 冒烟测试）：
 >
 > ```powershell

@@ -21,8 +21,13 @@
 #   -Diarize               装说话人分离（pyannote，需 HF 授权，重依赖）
 #   -AccelCuda             装 CUDA 版 torch（需 N 卡）
 #   -Agent <名>            智能体后端：harness(默认,= DSH 标准版) / dsh / none
-#   -DshVersion <版本>     标准版本地安装的版本（默认 0.1.5-rc.2）。npm 装不下来时
-#                          会从 npx 缓存里找**同版本**那份复制（见 harness-install-local.ps1）
+#   -DshVersion <版本>     标准版本地安装的版本。**默认空 = 装 npm 上的 latest**
+#                          （2026-10-08 修：原来这里默认 `0.1.5-rc.2`，而且下面会把它
+#                          **显式传给** harness-install-local.ps1 —— 于是 helper 里
+#                          "查 dist-tags.latest" 那段永远不生效：仓库、新包、旧包
+#                          跑出来都是 0.1.5-rc.2。真正修好必须两处一起改。）
+#                          显式传值 = 指定版本（升级/降级入口）。npm 装不下来时会从
+#                          npx 缓存里找**同版本**那份复制（见 harness-install-local.ps1）
 #   -PinHarnessCommand     把本地入口的绝对路径写进设置 harnessCommand（默认**不写**：
 #                          ECHO 自己会优先本地入口，node 换版本不用改配置）
 #   -ModelsDir / -MeetingsDir / -NotesDir   三处位置（留空=默认；-NotesDir 填了会开归档）
@@ -41,7 +46,7 @@ param(
     [switch]$Diarize,
     [switch]$AccelCuda,
     [string]$Agent = 'harness',
-    [string]$DshVersion = '0.1.5-rc.2',
+    [string]$DshVersion = '',
     [switch]$PinHarnessCommand,
     [string]$ModelsDir = '',
     [string]$MeetingsDir = '',
