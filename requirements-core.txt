@@ -48,3 +48,15 @@ sherpa-onnx>=1.10
 # 下完（内网走它最稳），而且它有国内源；两者都不拖 torch（L1 安全，Requires-Dist 逐条核过）。
 # 这条同时由 tests/test_install_entry.py 的"每个 STT 引擎必须带下载客户端"守着。
 modelscope>=1.9
+# 2026-10-08：**唤醒的拼音容错层需要它，而它从来没进过任何依赖清单**（真机事故）。
+#
+# 现场：`app/audio/wake.py::_pinyin()` 用 `from pypinyin import lazy_pinyin`，
+# 失败时 `except` 静默返回 `[整段文本]`；而 `requirements-core.txt` /
+# `requirements.txt` / `pyproject.toml` **三处都没有 pypinyin**。
+# 后果（两层，都是静默的）：
+#   ① dev 机 venv 里恰好有 → 能唤醒；**客户机没有 → 唤不醒**，且不报错；
+#   ② 退化后 `_pinyin()` 返回**整段文本一个元素**，拼音容错等于死代码
+#      （只剩逐字全等，同音字一律漏掉："小李"被识别成"小理"就不认）。
+# 加它的代价：纯 Python、无 torch、约 1 MB、与 sherpa-onnx 同为 Apache/MIT 系，
+# **不碰铁律 L1**（不含 torch 系）。`tests/test_default_profile.py` 会盯体积预算。
+pypinyin>=0.50

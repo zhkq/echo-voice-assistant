@@ -100,6 +100,95 @@ class RealChatterDoesNotWakeTests(unittest.TestCase):
                              wake._pinyin(wake._norm("回升升回回回升"))))
 
 
+class PinyinDependencyTests(unittest.TestCase):
+    """**`pypinyin` 必须进依赖清单**（2026-10-08 真机事故，这条是它的守门人）。
+
+    现场：`wake.py::_pinyin()` 用 `from pypinyin import lazy_pinyin`，
+    失败时 `except` **静默**返回 `[整段文本]`；而 `requirements-core.txt` /
+    `requirements.txt` / `pyproject.toml` **三处都没有 pypinyin**。后果：
+      * dev 机 venv 里恰好有 → 能唤醒；**客户机没有 → 唤不醒**，且不报错；
+      * 退化后拼音容错层等于死代码，只剩逐字全等（同音字一律漏）。
+
+    为什么必须有这条用例：这个洞**不是代码写错**，而是"机制依赖了一个从没被登记过的包" ——
+    没有守门人时，它只会在**客户机**上以"唤不醒"的形式现形，开发机永远看不到。
+    """
+
+    ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    def test_requirements_core_lists_pypinyin(self):
+        """**必须有一行真的声明**，不能只是注释里提到 —— 否则"注释在、包不在"照样骗过检查。
+
+        （我第一版就是断言 `"pypinyin" in body`，结果**注释里那句说明**让用例失去意义；
+        去掉真实声明行它也绿。改成解析"非注释的 requirement 行"。）
+        """
+        req = os.path.join(self.ROOT, "requirements-core.txt")
+        with open(req, encoding="utf-8") as fh:
+            declared = []
+            for line in fh:
+                s = line.strip()
+                if not s or s.startswith("#"):
+                    continue
+                name = s.split(">=")[0].split("==")[0].split(">")[0].strip().lower()
+                declared.append(name)
+        self.assertIn("pypinyin", declared,
+                      "requirements-core.txt 没有**声明** pypinyin（注释里提到不算）—— "
+                      "客户机上拼音层会是死代码，而且没有报错")
+
+    def test_it_is_not_a_torch_dependency(self):
+        """铁律 L1：默认档不含 torch。pypinyin 必须是纯 Python（不能顺带拖 torch）。"""
+        req = os.path.join(self.ROOT, "requirements-core.txt")
+        with open(req, encoding="utf-8") as fh:
+            for line in fh:
+                s = line.strip().lower()
+                if s.startswith("#") or not s:
+                    continue
+                self.assertNotIn("torch", s, "默认档清单里出现了 torch 系：%s" % line.strip())
+
+    def test_the_module_reports_whether_pinyin_is_available(self):
+        """`pinyin_available()` 必须存在 —— 否则"退化了"这件事没人能看出来。"""
+        self.assertTrue(hasattr(wake, "pinyin_available"))
+        self.assertIsInstance(wake.pinyin_available(), bool)
+
+    def test_degraded_mode_does_not_break_matching(self):
+        """没有 pypinyin 时：不许让"连续匹配"去比 4 个音节 vs 1 个元素（那会永不命中）。
+
+        `hit()` 必须在 `pinyin_available()` 为假时**跳过拼音这条路**，
+        只保留逐字匹配 —— 精度差但**至少能唤醒**。
+        """
+        import builtins
+        real = builtins.__import__
+
+        def fake(name, *a, **k):
+            if name == "pypinyin":
+                raise ImportError("模拟客户机：没装 pypinyin")
+            return real(name, *a, **k)
+
+        class _Rec:
+            def __init__(self, text):
+                self.text = text
+
+            def create_stream(self):
+                return object()
+
+            def get_result(self, _s):
+                return self.text
+
+            def reset(self, _s):
+                pass
+
+        builtins.__import__ = fake
+        try:
+            self.assertFalse(wake.pinyin_available())
+            # 逐字命中仍然有效（唤醒词原样出现在文本里）
+            d = wake._StreamDetector(_Rec("回声回声"), ["回声回声"])
+            self.assertTrue(d.hit(), "没有 pypinyin 时连逐字匹配都不工作了")
+            # 同音字（拼音才认得出）此时认不出 —— 这是已知代价，不是崩溃
+            d2 = wake._StreamDetector(_Rec("回生回生"), ["回声回声"])
+            self.assertFalse(d2.hit())
+        finally:
+            builtins.__import__ = real
+
+
 class DetectorWiringTests(unittest.TestCase):
     """`_StreamDetector.hit()` 必须真的走**连续**判据（而不是又退回子序列）。"""
 

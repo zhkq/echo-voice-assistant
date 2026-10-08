@@ -52,12 +52,44 @@ def _norm(s):
     return re.sub(r"[\s，。、,.!?！？·\-'\"（）()\[\]「」『』:：;；_~、]+", "", s)
 
 
+#: `pypinyin` 缺失时**只警告一次**（它决定拼音层是否可用；缺了会静默退化）。
+_PINYIN_WARNED = threading.Event()
+
+
+def pinyin_available():
+    """`pypinyin` 能不能用（**客户机上它曾经一直是 False**，见下）。
+
+    2026-10-08 实测查到的事故：`pypinyin` **从未写进任何依赖清单**
+    （`requirements-core.txt` / `requirements.txt` / `pyproject.toml` 都没有），
+    而 `_pinyin()` 用 `except` 把导入失败**静默吞掉**。后果分两层：
+      * dev 机（venv 里恰好有）能唤醒、**客户机上唤不醒**，且**没有任何报错**；
+      * 退化后 `_pinyin()` 返回**整段文本一个元素**，拼音容错层等于死代码。
+    修法两条一起上：① 依赖清单补 `pypinyin`（根治）；② 这里如实暴露状态 +
+    `_StreamDetector` 走"逐字子串"兜底（让**已经发出去的旧装机**不至于完全唤不醒）。
+    """
+    try:
+        import pypinyin                                            # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
 def _pinyin(text):
-    """文本 -> 拼音音节列表（无声调）。非中文按原样小写保留。"""
+    """文本 -> 拼音音节列表（无声调）。非中文按原样小写保留。
+
+    ⚠️ 返回**是不是拼音**取决于 `pypinyin` 在不在（见 `pinyin_available`）。
+    没有它时返回 `[整段小写文本]` —— 所以调用方**不能假设这是音节序列**，
+    必须先用 `pinyin_available()` 判（`_StreamDetector.hit()` 就是这么做的）。
+    """
     try:
         from pypinyin import lazy_pinyin
         return [s for s in lazy_pinyin(str(text or "")) if s]
     except Exception:
+        if _PINYIN_WARNED is not None and not _PINYIN_WARNED.is_set():
+            _PINYIN_WARNED.set()
+            print("[wake] 没装 pypinyin —— 拼音容错层不可用（只剩逐字匹配）。"
+                  "装它：pip install pypinyin（依赖清单已补，见 requirements-core.txt）",
+                  flush=True)
         return [str(text or "").lower()]
 
 
@@ -173,6 +205,14 @@ class _StreamDetector:
             if kw and kw in text:
                 self._reset()
                 return True
+        # ---- 拼音这条路：**只在 pypinyin 可用时**才走 ----
+        #  没有 pypinyin 时 `_pinyin()` 返回的是 `[整段小写文本]`（一个元素），
+        #  拿它做音节匹配既无意义、又会让"连续匹配"**永远返回 None**
+        #  （needle 好几个音节 > haystack 一个元素）→ **唤醒彻底失效**。
+        #  所以退化时改走"逐字子串"：精度差，但**至少能唤醒**，而且状态是可见的
+        #  （`pinyin_available()` + 那条一次性告警）。根治见 requirements-core.txt。
+        if not pinyin_available():
+            return False        # 逐字匹配已在上面 `kw in text` 做过，这里不重复
         rp = _pinyin(text)
         for kp in self.kw_pinyin:
             if not kp or len(kp) < 2:
