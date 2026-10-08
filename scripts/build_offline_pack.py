@@ -112,7 +112,14 @@ EMBED_URL = "https://www.python.org/ftp/python/3.11.9/" + EMBED_NAME
 GETPIP_URL = "https://bootstrap.pypa.io/get-pip.py"
 #: bundle 自检要求"必须在"的 wheel（少一个，目标机上那一步就一定失败）：
 #: 前五个是默认档跑起来要的，最后四个是**离线把 pip 装上**要的（嵌入包不带 pip/ensurepip）。
+#:
+#: 2026-10-08 补 `pypinyin`：它是**唤醒的拼音容错层**要用的（`wake.py::_pinyin`），
+#: 而它**从来没进过任何依赖清单** —— 结果客户机上导入失败被 `except` 静默吞掉，
+#: 表现为"开发机能唤醒、客户机唤不醒"。光把它写进 `requirements-core.txt` 只盖住
+#: "在线装/薄包"那条路，**离线装是从这个 wheelhouse 拿包**的，所以必须在这里也钉住：
+#: 少了它，出包时**当场失败**，而不是等用户在客户机上发现唤不醒。
 BUNDLE_REQUIRED_WHEELS = ("fastapi", "uvicorn", "sherpa-onnx", "modelscope", "soundfile",
+                          "pypinyin",
                           "pip", "setuptools", "wheel", "packaging")
 #: 模型目录里必须有的三件 onnx + 词表（判据与 build_min_kit.verify_kit 一致）。
 MODEL_REQUIRED_FILES = (("encoder", ".onnx"), ("decoder", ".onnx"), ("joiner", ".onnx"))
