@@ -824,6 +824,108 @@ class ClientFollowsSelectionTests(unittest.TestCase):
         self.assertEqual(row["agent"], "harness")
         self.assertEqual(row["session_id"], "session-harness")
 
+    # ---------------------------------------------------------------- 空闲轮换
+    # 2026-10-08 用户定：单位的 DeepSeek 上下文有限，**换话题的时间阈值缩到 15 分钟**
+    # （`commandIdleRotateHours` 默认 4 → 0.25）。这三条把规则钉住，
+    # 免得以后有人调默认值时把这条约定悄悄改回去。
+
+    @staticmethod
+    def _patch_idle_key(hours):
+        """**只**覆盖 commandIdleRotateHours，其余设置透传真值。
+
+        ⚠️ 不能用 `lambda k, d=None: hours if k == "…" else d` 一把梭 ——
+        那等于把所有设置打回默认值，连 `commandTargetWorkspace` 都没了，
+        于是 `ensure_command_session` 里"会话不在配置工作区"那条**强制轮换**
+        会先触发，测的就不是空闲轮换了（这坑真踩过一次）。
+        """
+        from app.config import settings as _real
+        real_get = _real.get
+
+        def fake(key, default=None):
+            if key == "commandIdleRotateHours":
+                return hours
+            return real_get(key, default)
+        return patch("app.agents.dsh_agent.settings.get", fake)
+
+    def _idle_session(self, minutes):
+        """造一个"上次使用在 N 分钟前"的命令会话，并**让工作区判据不插手**。
+
+        ⚠️ `ensure_command_session` 有**两条**轮换判据，而第二条（"会话不在配置的
+        默认工作区"）**不看空闲、也不看延续词**，直接轮换。若不管它，这几条用例
+        测的就不是空闲轮换了 —— 实测就踩到了：`session_cwd()` 是**活的 RPC**，
+        在开发机上返回真实会话目录，与 `paths.command_root()` 不匹配 → 每条都"轮换"。
+        所以这里把 `session_cwd` 打桩成**目标工作区**，把那条判据隔离掉。
+        """
+        import datetime as _dt
+        db.upsert_session("command", "session-idle", "命令会话", agent="harness")
+        when = (_dt.datetime.now() - _dt.timedelta(minutes=minutes)
+                ).strftime("%Y-%m-%d %H:%M:%S")
+        db._exec("UPDATE dsh_sessions SET last_used_at=? WHERE kind='command'", (when,))
+        from app import paths as _paths
+        from app.agents.harness_agent import HarnessAgent as _HA
+        p = patch.object(_HA, "session_cwd", lambda self, sid: _paths.command_root())
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_default_threshold_is_fifteen_minutes(self):
+        """默认值就是 15 分钟 —— 这条是用户的明确要求，不许被调回去。"""
+        from app.config import DEFAULTS
+        spec = DEFAULTS["commandIdleRotateHours"]
+        self.assertEqual(float(spec["value"]), 0.25,
+                         "命令会话空闲轮换默认值应为 0.25 小时（15 分钟）")
+        self.assertEqual(spec.get("value_type"), "float")
+
+    def test_idle_past_threshold_rotates(self):
+        """空闲 20 分钟（> 15）+ 新话题 → 换新会话。"""
+        from app.agents.harness_agent import HarnessAgent
+        self._idle_session(20)
+        new = {"n": 0}
+
+        def fake_new(self, ws):
+            new["n"] += 1
+            return "session-rotated"
+
+        with patch.object(HarnessAgent, "_new_default_session", fake_new), \
+                self._patch_idle_key(0.25):
+            a = HarnessAgent()
+            sid = a.ensure_command_session("明天天气怎么样")
+        self.assertEqual(sid, "session-rotated", "空闲超过 15 分钟应当换新会话")
+        self.assertEqual(new["n"], 1)
+
+    def test_continuation_word_keeps_the_same_session(self):
+        """空闲 20 分钟但说了「继续…」→ **不换**（同一话题要能接着说）。"""
+        from app.agents.harness_agent import HarnessAgent
+        self._idle_session(20)
+        new = {"n": 0}
+
+        def fake_new(self, ws):
+            new["n"] += 1
+            return "session-rotated"
+
+        with patch.object(HarnessAgent, "_new_default_session", fake_new), \
+                self._patch_idle_key(0.25):
+            a = HarnessAgent()
+            sid = a.ensure_command_session("继续刚才那个")
+        self.assertEqual(sid, "session-idle", "要求延续时不该换会话")
+        self.assertEqual(new["n"], 0)
+
+    def test_under_threshold_keeps_the_same_session(self):
+        """空闲 5 分钟（< 15）→ 不换。"""
+        from app.agents.harness_agent import HarnessAgent
+        self._idle_session(5)
+        new = {"n": 0}
+
+        def fake_new(self, ws):
+            new["n"] += 1
+            return "session-rotated"
+
+        with patch.object(HarnessAgent, "_new_default_session", fake_new), \
+                self._patch_idle_key(0.25):
+            a = HarnessAgent()
+            sid = a.ensure_command_session("明天天气怎么样")
+        self.assertEqual(sid, "session-idle", "没到阈值不该换")
+        self.assertEqual(new["n"], 0)
+
     def test_meeting_session_is_also_owner_scoped(self):
         db.upsert_meeting_session(7, "m-session", "ws-1", agent="dsh")
         self.assertIsNotNone(db.get_meeting_session(7, agent="dsh"))
