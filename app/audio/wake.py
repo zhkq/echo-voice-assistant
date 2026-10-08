@@ -84,7 +84,11 @@ def _syl_match(a, b):
 
 
 def _subseq(needle, haystack):
-    """needle 是否为 haystack 的子序列（模糊音节匹配，容忍同音/近音与插入）。"""
+    """（已退役，保留给排障用）`needle` 是否为 `haystack` 的**子序列**（容忍插入）。
+
+    ⚠️ **不要在新代码里用它做唤醒判据**（2026-10-08）：它容许"音节按顺序出现过"，
+    中间可以夹任意无关音节 —— 实测这是误唤醒的主因。唤醒判据请用 `_contiguous()`。
+    """
     i = 0
     for h in haystack:
         if i < len(needle) and _syl_match(h, needle[i]):
@@ -92,13 +96,49 @@ def _subseq(needle, haystack):
     return i == len(needle)
 
 
+def _contiguous(needle, haystack):
+    """`needle` 是否为 `haystack` 里**一段连续**的音节序列；命中时返回 `(起, 止)`。
+
+    与 `_subseq()` 的唯一区别，也是关键区别：**音节之间不容许插入**。
+      旧判据（子序列）：`回声回声` = hui sheng hui sheng，
+        识别成 "hui … sheng … hui … sheng"（中间夹任意内容）**也算命中**
+        —— 日常对话里 `会/回`、`生/声/省` 高频出现，于是极易误触发。
+      新判据（连续）：这 4 个音节必须**挨着**出现，"开了hui议sheng产hui报sheng"这类不再命中。
+
+    逐音节仍容许**一个**近音/同音位（`_syl_match`，如 yuan≈yun），因为识别器对
+    同音字经常给错字面 —— 那是"同一句话的另一种写法"，不是"另一个词"。
+
+    返回 `(起, 止)` 而不是布尔：调用方可以据此判定"命中的这段是否贴近句首/停顿"
+    （见 `_StreamDetector.hit()` 的说明），这是进一步压误唤醒的抓手。
+    """
+    if not needle or not haystack or len(needle) > len(haystack):
+        return None
+    n = len(needle)
+    for i in range(len(haystack) - n + 1):
+        if all(_syl_match(haystack[i + k], needle[k]) for k in range(n)):
+            return (i, i + n)
+    return None
+
+
 class _StreamDetector:
     """流式 ASR + 文字/拼音匹配唤醒检测。
 
     匹配策略（由严到松，命中即触发）：
-      1) 精确文本匹配（含同音别名）
-      2) 拼音子序列匹配 —— 容忍同音字与插入，如「回声回声」被识别成
-         「回升升回回回升」时拼音序列 hui-sheng-hui-sheng 仍能命中。
+      1) 精确文本匹配（含同音别名）；
+      2) **连续**拼音音节匹配（`_contiguous`）—— 唤醒词的音节必须挨着出现。
+
+    **2026-10-08 改（用户报"误识频率很高"）**：原来第 2 条用的是 `_subseq()`
+    （子序列：音节按顺序出现过即可、中间容许任意插入）。唤醒词「回声回声」只有
+    4 个音节、且 `会/回/汇`、`生/声/省/胜` 在日常对话里高频出现，于是
+    "只要这段对话里先后出现过这几个音"就会唤醒 —— 这是误唤醒的主因。
+    换成 `_contiguous()` 之后，那 4 个音节必须**连续**出现。
+
+    ⚠️ **路过的坑（别再试）**：我一度想加"命中的片段必须贴近句首"这道闸门
+    （利用 `_contiguous` 返回的区间）。它**在真实流式文本上不可靠**：识别结果是
+    **累积**的，`lead` 常常是 0（起音被切出一个独立音节、或 reset 粒度比预想细），
+    于是**正常喊唤醒词也会被挡掉** —— 拿"漏唤醒"换"少误唤醒"，方向错了。
+    要再压误唤醒，正确做法是**多帧确认**（连续 X 帧命中），那是下一步的事
+    （现有 `wakeConfirmX/N` 两个设置项**读了但从未使用**，见 `_run_impl`）。
     """
 
     def __init__(self, rec, keywords):
@@ -135,7 +175,11 @@ class _StreamDetector:
                 return True
         rp = _pinyin(text)
         for kp in self.kw_pinyin:
-            if kp and len(kp) >= 2 and _subseq(kp, rp):
+            if not kp or len(kp) < 2:
+                continue
+            # 连续匹配即可（**不再要求贴句首**：那个代理判据在累积文本上会把正常
+            # 唤醒也挡掉，见类注释里"路过的坑"）。
+            if _contiguous(kp, rp) is not None:
                 self._reset()
                 return True
         return False
