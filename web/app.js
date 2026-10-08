@@ -4950,7 +4950,14 @@ let _sttCache = null;         // /api/stt/status
 // （否则页签一出错，界面上就再没有入口改回转写引擎/朗读实现/设备了）
 let _capTabOk = true;
 
-const _ENGINE_MODEL_ID = { sensevoice: "sensevoice", qwen3asr: "qwen3asr", sherpa: "sherpa" };
+//: 引擎取值 → 模型清单 id。
+//  ⚠️ **`sttModel` 的每个取值都必须在这张表里**（2026-10-08 修）：
+//  漏了 `sensevoice-onnx`（它现在是**默认**）时，`engineModelId()` 返回空 →
+//  `capAsrLocal()` 的「配置为要用的」算不出该项 → 那张卡片**掉进折叠的「其余本地引擎」**，
+//  而用户看到的"当前"就成了别的引擎（测试机实测：明明默认是 sensevoice-onnx，
+//  面板却显示 sherpa 流式）。新增引擎取值时**同步加这一行**。
+const _ENGINE_MODEL_ID = { "sensevoice-onnx": "sensevoice-onnx", sensevoice: "sensevoice",
+                           qwen3asr: "qwen3asr", sherpa: "sherpa" };
 
 /** 引擎值 → 模型清单 id。
  *
@@ -4972,8 +4979,11 @@ function settingByKey(k) { return _settingsCache.find((s) => s.key === k) || nul
 function friendlyOption(key, v) {
   const s = String(v);
   if (key === "sttModel") {
-    return { sensevoice: "SenseVoice 中文短命令", qwen3asr: "Qwen3-ASR 0.6B",
-      sherpa: "sherpa 流式（中英）" }[s] || ("Whisper " + s);
+    // 名字表里**必须包含当前默认值**（`sensevoice-onnx`）—— 漏了会显示成
+    // "Whisper sensevoice-onnx"（那个 `|| ("Whisper " + s)` 是给已退役的 whisper 档留的）。
+    return { "sensevoice-onnx": "SenseVoice ONNX（int8 · 默认）",
+      sensevoice: "SenseVoice 中文短命令（funasr，要 torch）",
+      qwen3asr: "Qwen3-ASR 0.6B", sherpa: "sherpa 流式（中英）" }[s] || ("Whisper " + s);
   }
   if (key === "device") return { auto: "自动（有 GPU 就用）", cpu: "CPU", cuda: "CUDA（GPU）" }[s] || s;
   if (key === "wakeEngine") return { sherpa: "sherpa 流式识别", kws: "KWS 关键词 spotting" }[s] || s;

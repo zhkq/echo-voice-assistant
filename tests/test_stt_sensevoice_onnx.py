@@ -13,11 +13,13 @@
 """
 import io
 import os
+import re
 import sys
 import unittest
 from unittest.mock import patch
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT)
 
 from app.audio import stt                                          # noqa: E402
 from app import modelinfo, components                              # noqa: E402
@@ -46,6 +48,33 @@ class DefaultEngineTests(unittest.TestCase):
         self.assertIn("sensevoice-onnx", DEFAULTS["sttModel"]["options"])
         # sherpa 必须**留在选项里**：唤醒用它，且是缺模型时的兜底
         self.assertIn("sherpa", DEFAULTS["sttModel"]["options"])
+
+    def test_every_engine_option_is_known_to_the_panel(self):
+        """**`sttModel` 的每个取值都必须在面板的两张表里**（2026-10-08 测试机实测的 bug）。
+
+        现场：包里客户端默认已经是 `sensevoice-onnx`，但测试机面板显示"当前 = sherpa 流式"。
+        根因是 `web/app.js` 里两张**手写映射表**都漏了它：
+          * `_ENGINE_MODEL_ID` 漏 → `engineModelId("sensevoice-onnx")` 返回空 →
+            `capAsrLocal()` 的「配置为要用的」算不出该项 → 那张卡**掉进折叠的「其余本地引擎」**，
+            于是用户看到别的引擎像是"当前"；
+          * `friendlyOption("sttModel", …)` 漏 → 名称回落到 `"Whisper " + s`（认不出来）。
+        **新增任何引擎取值都要同步加这两处** —— 这个 bug 是静默的（不报错、只显示错）。
+        """
+        js = io.open(os.path.join(ROOT, "web", "app.js"), encoding="utf-8").read()
+        # ① _ENGINE_MODEL_ID 表里要有每一个取值
+        m = re.search(r"_ENGINE_MODEL_ID\s*=\s*\{(.*?)\}", js, re.S)
+        self.assertIsNotNone(m, "找不到 _ENGINE_MODEL_ID 定义")
+        table = m.group(1)
+        for opt in DEFAULTS["sttModel"]["options"]:
+            self.assertIn('"%s"' % opt, table,
+                          "面板 _ENGINE_MODEL_ID 缺 %r —— 它的卡片会被折进「其余本地引擎」" % opt)
+        # ② friendlyOption 的名称表里也要有（避免回落到 "Whisper …"）
+        k = js.find('if (key === "sttModel")')
+        self.assertGreater(k, 0, "找不到 friendlyOption 的 sttModel 分支")
+        branch = js[k:k + 500]
+        for opt in DEFAULTS["sttModel"]["options"]:
+            self.assertTrue(('"%s"' % opt) in branch or ("%s:" % opt) in branch,
+                            "面板显示名表缺 %r（会显示成 'Whisper %s'）" % (opt, opt))
 
     def test_engine_key_is_stable(self):
         self.assertEqual(stt.engine_key("sensevoice-onnx", ""), "sensevoice-onnx")
