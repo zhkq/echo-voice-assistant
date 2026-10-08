@@ -191,6 +191,34 @@ def _sherpa_files():
     return (os.path.join(d, enc), os.path.join(d, dec), os.path.join(d, joi), tok)
 
 
+def sensevoice_onnx_files():
+    """`sensevoice-onnx` 引擎要的三份文件；缺任一份返回 ``None``。
+
+    目录形态（与 DSH 官方语音插件下的那份**同一个模型**，可互换）::
+
+        {modelsDir}/sensevoice-onnx/
+            model.int8.onnx    ← int8 量化，约 228 MB
+            tokens.txt
+            silero_vad.onnx    ← 语音活动检测（长音频切段用）
+
+    为什么选 **int8 ONNX** 这一档（2026-10-08 实测后定）：
+      * 它**不需要 torch / funasr** —— 走 `sherpa_onnx`，而这个包本来就是语音链路的
+        必装依赖（流式唤醒用它），所以客户端**一个字节的依赖都不用加**；
+      * 模型 228 MB，而不是 funasr/fp32 那条路的 893 MB 权重 + 118 MB torch 轮子（≈1 GB）；
+      * 实测 8 秒指令 **0.31 秒（RTF 0.04）**，与 funasr 版几乎逐字相同。
+    """
+    d = os.path.join(models_dir(), "sensevoice-onnx")
+    if not os.path.isdir(d):
+        return None
+    model = next((f for f in os.listdir(d)
+                  if f.startswith("model") and f.endswith(".onnx")), "")
+    tok = os.path.join(d, "tokens.txt")
+    if not (model and os.path.isfile(tok)):
+        return None
+    return (os.path.join(d, model), tok,
+            os.path.join(d, "silero_vad.onnx"))
+
+
 # ---------------------------------------------------------------- 引擎单例
 
 _ENGINES = {}
@@ -199,6 +227,115 @@ _ENGINE_LOCK = threading.Lock()
 
 def _clean_sv_text(t):
     return re.sub(r"<\|[^|]*\|>", "", t or "").strip()
+
+
+def _get_sensevoice_onnx(device="auto"):
+    """加载 **int8 ONNX 版 SenseVoice**（走 sherpa-onnx，不需要 torch/funasr）。
+
+    这是 2026-10-08 之后**语音指令的默认引擎**（`sttModel` 的出厂值）。
+
+    两个关键取舍（都实测过）：
+
+    * **为什么用 ONNX 而不是 funasr 那一档**：同一个模型，funasr 版要 torch
+      （客户端装完 +2.9 GB、包 +≈1 GB），ONNX 版只要 228 MB 且复用已有的
+      `sherpa_onnx` 包 —— 客户端**零新增依赖**。实测 8 秒指令 0.31 秒（RTF 0.04），
+      文本与 funasr 版几乎逐字相同。
+    * **为什么带 VAD 切段**：SenseVoice 是**离线整段**模型。不切段直接喂 10 分钟音频会
+      得到"3 个字"这种荒唐结果（实测过，长度远超它的训练分布）。用 Silero VAD 先切成
+      语音段、逐段识别、再按段序拼起来，长音频才稳。
+
+    `device` 只在有 CUDA 的 sherpa-onnx 构建里才起作用；CPU 上 RTF≈0.04～0.4，
+    无独显机器也能跑。加载失败由调用方回落（见 `transcribe_ex` 的兜底链）。
+    """
+    key = "sensevoice-onnx"
+    with _ENGINE_LOCK:
+        if key in _ENGINES:
+            return _ENGINES[key]
+        files = sensevoice_onnx_files()
+        if not files:
+            raise RuntimeError("SenseVoice ONNX 模型未就绪: "
+                               + os.path.join(models_dir(), "sensevoice-onnx"))
+        model, tokens, vad = files
+        import sherpa_onnx
+        provider = "cpu"
+        try:
+            # 有 CUDA 版 sherpa-onnx 才用 cuda；否则保持 cpu（不要因为一个设置值起不来）
+            if device and device != "cpu" and "cuda" in getattr(
+                    sherpa_onnx, "get_available_providers", lambda: [])():
+                provider = "cuda"
+        except Exception:
+            provider = "cpu"
+        rec = sherpa_onnx.OfflineRecognizer.from_sense_voice(
+            model=model, tokens=tokens, num_threads=4,
+            language="auto", use_itn=True, provider=provider, debug=False)
+        cfg = None
+        if os.path.isfile(vad):
+            try:
+                vcfg = sherpa_onnx.VadModelConfig()
+                vcfg.silero_vad.model = vad
+                vcfg.silero_vad.threshold = 0.5
+                vcfg.silero_vad.min_silence_duration = 0.25
+                vcfg.silero_vad.min_speech_duration = 0.25
+                vcfg.sample_rate = 16000
+                cfg = sherpa_onnx.VoiceActivityDetector(vcfg, buffer_size_in_seconds=60)
+            except Exception as e:                     # VAD 不可用不是致命：退回整段识别
+                print(f"[stt] SenseVoice ONNX：VAD 初始化失败（{e}），退回整段识别",
+                      file=sys.stderr)
+                cfg = None
+        _ENGINES[key] = (rec, cfg)
+        return _ENGINES[key]
+
+
+def _sensevoice_onnx_transcribe(wav, device="auto"):
+    """跑一次 ONNX SenseVoice：有 VAD 就切段逐段识别，没有就整段。"""
+    import numpy as np
+    import wave as wave_mod
+
+    rec, vad_cfg = _get_sensevoice_onnx(device)
+    with wave_mod.open(wav, "rb") as f:
+        sr = f.getframerate()
+        raw = f.readframes(f.getnframes())
+    samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+    if sr != 16000:                                            # VAD 只认 16k
+        step = max(1, int(round(sr / 16000.0)))
+        samples = samples[::step]
+        sr = 16000
+
+    def _one(buf):
+        st = rec.create_stream()
+        st.accept_waveform(sr, buf)
+        rec.decode_stream(st)
+        return _clean_sv_text(getattr(st.result, "text", "") or "")
+
+    if vad_cfg is None:
+        return _one(samples)
+
+    texts = []
+    window = 512
+    for i in range(0, len(samples), window):
+        vad_cfg.accept_waveform(samples[i:i + window])
+        while not vad_cfg.empty():
+            seg = vad_cfg.front
+            buf = np.array(seg.samples, dtype=np.float32)
+            vad_cfg.pop()
+            if len(buf) >= int(0.2 * sr):                       # 太短的段丢掉
+                t = _one(buf)
+                if t:
+                    texts.append(t)
+    # 收尾：把最后一段（还没触发静音判定的）也识别掉
+    try:
+        vad_cfg.flush()
+        while not vad_cfg.empty():
+            seg = vad_cfg.front
+            buf = np.array(seg.samples, dtype=np.float32)
+            vad_cfg.pop()
+            if len(buf) >= int(0.2 * sr):
+                t = _one(buf)
+                if t:
+                    texts.append(t)
+    except Exception:
+        pass
+    return "".join(texts)
 
 
 def _get_whisper(model_name="small", device="auto"):
@@ -665,6 +802,33 @@ def transcribe_ex(wav, engine="sensevoice", model="small", lang="zh", device="au
             print(f"[stt] SenseVoice 转写失败: {e}", file=sys.stderr)
             return {"text": "", "status": TRANSCRIBE_ERROR, "detail": "SenseVoice: %s" % e}
 
+    if engine == "sensevoice-onnx":
+        # 默认引擎的**兜底**（2026-10-08）：装了 ECHO 但**还没下**那 228 MB ONNX 模型的
+        # 机器上，`sttModel` 的出厂值已经是它 —— 这时不能哑掉，要自动回落到 sherpa
+        # （安装器保证 sherpa 一定在），并且**把原因说清楚**，否则用户只看到
+        # "按了说话没反应"（1.x 的老毛病）。
+        if not sensevoice_onnx_files():
+            if _sherpa_files():
+                print("[stt] SenseVoice ONNX 模型未就绪 → 本次回落 sherpa "
+                      f"（缺 {os.path.join(models_dir(), 'sensevoice-onnx')}）",
+                      file=sys.stderr)
+                engine = "sherpa"
+            else:
+                return {"text": "", "status": TRANSCRIBE_ERROR,
+                        "detail": "SenseVoice ONNX 与 sherpa 模型都未就绪"
+                                  "（去 设置 → 模型 下载转写引擎）"}
+        else:
+            _note_use("sensevoice-onnx", "")
+            try:
+                text = _sensevoice_onnx_transcribe(wav, device)
+                return _result(text, "SenseVoice ONNX")
+            except Exception as e:
+                # 这条路的失败**要落到日志**：它是**默认引擎**，静默失败会让
+                # "按了说话没反应"变成一个查不出的问题。
+                print(f"[stt] SenseVoice ONNX 转写失败: {e}", file=sys.stderr)
+                return {"text": "", "status": TRANSCRIBE_ERROR,
+                        "detail": "SenseVoice ONNX: %s" % e}
+
     if engine == "sherpa":
         _note_use("sherpa", "")
         try:
@@ -800,7 +964,16 @@ def engine_status():
 
 def resolve_engine(choice):
     """把配置值解析成 (engine_name, model)。"""
-    choice = (choice or "sensevoice").strip()
+    #: 出厂默认 = **int8 ONNX 版 SenseVoice**（2026-10-08 用户定）。
+    #  为什么换掉 sherpa 流式：中文上流式解码会反复吐没定稿的假设，表现就是**叠字**
+    #  （实测同段音频叠字分 852，而 SenseVoice 是 82）。而 ONNX 版不需要 torch、
+    #  只多 228 MB、复用已有的 sherpa_onnx 包，8 秒指令 0.31 秒 —— 体积与延迟都守得住。
+    #  ⚠️ sherpa **继续留着**：语音唤醒的主路用的就是它的流式 transducer
+    #  （`wake.py::_make_stream_detector` → `_get_sherpa()`），SenseVoice 是离线整段
+    #  模型，替不了"边说边判"。
+    choice = (choice or "sensevoice-onnx").strip()
+    if choice == "sensevoice-onnx":
+        return "sensevoice-onnx", ""
     if choice == "sensevoice":
         return "sensevoice", "sensevoice"
     if choice == "sherpa":
@@ -820,6 +993,8 @@ def engine_key(engine_name, model, forced_aligner=QWEN3_FORCED_ALIGNER):
     qwen3asr 的 key 里带**对齐器**：带与不带是两份权重、两个实例
     （所以 `forced_aligner` 不是可有可无的装饰，它是 key 的一部分）。
     """
+    if engine_name == "sensevoice-onnx":
+        return "sensevoice-onnx"
     if engine_name == "sensevoice":
         return "sensevoice"
     if engine_name == "sherpa":

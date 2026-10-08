@@ -51,6 +51,14 @@
     }
   },
   {
+    "id": "stt-sensevoice-onnx",
+    "pack": {
+      "kind": "files",
+      "items": [{ "from": "models/sensevoice-onnx", "to": "models/sensevoice-onnx" }],
+      "approx_mb": 230
+    }
+  },
+  {
     "id": "stt-sensevoice",
     "pack": {
       "kind": "files",

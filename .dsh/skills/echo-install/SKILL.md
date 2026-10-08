@@ -317,10 +317,43 @@ bash "$kit/echo-install/scripts/echo-install-components.sh" \
 > 但这类事故会复发，而 npx 慢是必然的，所以 ③ 保留。
 > 缓存里没有时脚本会**先让 npx 把缓存填上再复制**（全新机器的 `_npx` 缓存是空的 ——
 > 同事这次就是这种情况）；填不上才回退 npx。版本不一致会**明确告警**（仍可用）。
-> 想指定别的版本：`-DshVersion <版本>` / `--dsh-version <版本>`。
 > 单独修装坏的标准版：直接跑 `harness-install-local.ps1 -DestDir <安装目录>`（Windows）或
 > `bash harness-install-local.sh --dest <安装目录>`（macOS），加 `-FromCache` / `--from-cache`
 > 可跳过 npm 走缓存复制（离线也能装）。
+
+> **版本与升级（2026-10-08 用户要求：装最新版、别写死旧版本、要给升级方法）**
+>
+> 脚本**默认自动取 npm 上的 `dist-tags.latest`** —— 不再写死版本号
+> （原状是 `0.1.5-rc.2` 写死，而当时 latest 已经是 `0.2.0-rc.2`，新装机器永远拿旧版）。
+> 查不到 registry（断网 / 源没配）时退回一个内置兜底版本并**明确告警**，不让安装整个失败。
+>
+> **升级标准版**（三件事都一样：删整树 → 重装 → 过完整性自检 + 冒烟测试）：
+>
+> ```powershell
+> # Windows：升到最新
+> powershell -File .dsh\skills\echo-install\scripts\harness-install-local.ps1 `
+>     -DestDir D:\ECHO -Upgrade
+> # 升/降到指定版本
+> powershell -File ...\harness-install-local.ps1 -DestDir D:\ECHO -Upgrade -Version 0.2.0-rc.2
+> ```
+> ```bash
+> # macOS
+> bash .dsh/skills/echo-install/scripts/harness-install-local.sh --dest ~/ECHO --upgrade
+> bash .../harness-install-local.sh --dest ~/ECHO --upgrade --version 0.2.0-rc.2
+> ```
+>
+> ⚠️ **为什么升级必须有 `-Upgrade` / `--upgrade` 这个开关**：脚本开头有"已装好就直接用"的
+> 快路径（那是为了冷启动快），**不加开关时它会把升级静默吃掉** —— 用户跑升级、脚本回一句
+> "标准版已经在本机（跳过下载）"，看日志像是成功了，实际还是旧版。所以现在：
+>
+> | 情况 | 不加 `-Upgrade` | 加 `-Upgrade` |
+> |---|---|---|
+> | 已装版本 == 目标版本 | 跳过（真无事可做） | 跳过 |
+> | 已装版本 != 目标版本 | **提示**有新版 + 给出升级命令，**不擅自覆盖** | 删整树重装（升级） |
+>
+> 升级前建议先停掉标准版 harness（`POST /api/agent/stop` 或面板上的停），
+> 否则 Windows 上 `node_modules` 可能被占用、删不掉（脚本会如实报"清不掉…先停掉再重跑"）。
+
 
 三个要点（都是 2026-09-21 实测踩出来的）：
 

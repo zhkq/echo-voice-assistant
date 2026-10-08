@@ -634,6 +634,12 @@ class BundleRidesAlongInTheKit(unittest.TestCase):
             m.mkdir(parents=True)
             for name in ("encoder.onnx", "decoder.onnx", "joiner.onnx", "tokens.txt"):
                 (m / name).write_text("x", encoding="utf-8")
+            # 2026-10-08：默认档还要 `sensevoice-onnx`（指令转写的默认引擎）。
+            # 校验器要求它是**对的** —— 缺了会在出包时响亮报错，所以这里也要造出来。
+            sv = b / "models" / "sensevoice-onnx"
+            sv.mkdir(parents=True)
+            for name in ("model.int8.onnx", "tokens.txt", "silero_vad.onnx"):
+                (sv / name).write_text("x", encoding="utf-8")
         if with_runtime:
             (b / "runtime").mkdir(parents=True)
             (b / "runtime" / "python-3.11.9-embed-amd64.zip").write_text("z", encoding="utf-8")

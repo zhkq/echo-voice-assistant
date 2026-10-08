@@ -29,7 +29,9 @@
 set -u
 
 DEST=""
-VERSION="0.1.5-rc.2"
+# 留空 = 自动取 npm 上的 latest（2026-10-08 用户要求：装最新版，别写死旧版本）。
+VERSION=""
+UPGRADE=0
 FROM_CACHE=0
 CACHE_DIR=""
 NODE_BIN=""
@@ -40,7 +42,8 @@ usage() {
   cat <<'EOF'
 用法：harness-install-local.sh --dest <ECHO 安装目录> [选项]
   --dest <目录>        必填。ECHO 安装目录（标准版装到 <目录>/harness/dsh）
-  --version <版本>     @deepseek-ai/dsh 版本，默认 0.1.5-rc.2
+  --version <版本>     @deepseek-ai/dsh 版本；**默认自动取 npm 上的 latest**
+  --upgrade            已装好也强制重装（= 升级入口；配合 --version 升/降到指定版本）
   --from-cache         跳过 npm，直接从 npx 缓存复制（离线 / registry 坏掉时用）
   --cache-dir <目录>   显式指定 npx 缓存根（默认问 `npm config get cache`）
   --node <路径>        显式指定 node（默认自己找）
@@ -53,6 +56,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --dest)         DEST="$2"; shift 2 ;;
     --version)      VERSION="$2"; shift 2 ;;
+    --upgrade)      UPGRADE=1; shift ;;
     --from-cache)   FROM_CACHE=1; shift ;;
     --cache-dir)    CACHE_DIR="$2"; shift 2 ;;
     --node)         NODE_BIN="$2"; shift 2 ;;
@@ -82,6 +86,56 @@ say()  { echo "  $*"; _log "  $*"; }
 ok()   { echo "  [ok]   $*"; _log "[ok]   $*"; }
 warn() { echo "  [warn] $*"; _log "[warn] $*"; }
 err()  { echo "  [fail] $*" >&2; _log "[fail] $*"; }
+
+#: 查不到 npm registry 时的兜底版本（只是兜底，不是"我们要装的版本"）。
+#  全新机器上 npm 可能还没配好源 / 断网，这时不能因为"查不到最新版"就整个失败。
+FALLBACK_VERSION="0.2.0-rc.2"
+
+# 取 npm 上 @deepseek-ai/dsh 的 dist-tags.latest。
+# 为什么认 dist-tag 不自己排 semver：预发布号（rc/alpha）的排序很绕，而且
+# "哪个是给用户的"是仓库方的判断（dist-tag），不该由我们猜。查不到返回空串。
+resolve_latest_version() {
+  command -v npm >/dev/null 2>&1 || return 0
+  local v
+  v="$(npm view @deepseek-ai/dsh dist-tags.latest 2>/dev/null | head -1 | tr -d '"\r[:space:]')"
+  case "$v" in
+    [0-9]*.[0-9]*.[0-9]*) printf '%s' "$v" ;;
+    *) : ;;
+  esac
+}
+
+#: 把版本号排成可比较的数字串（只用于"有没有更新版"的提示，不做依赖解析）。
+#  正式版给 stage=9、预发布按 alpha<beta<rc<其它 排，序号补零对齐后按字典序比。
+version_rank() {
+  local v="$1" major minor patch stage pre tag
+  major="$(printf '%s' "$v" | sed -n 's/^\([0-9]*\)\..*/\1/p')"
+  minor="$(printf '%s' "$v" | sed -n 's/^[0-9]*\.\([0-9]*\)\..*/\1/p')"
+  patch="$(printf '%s' "$v" | sed -n 's/^[0-9]*\.[0-9]*\.\([0-9]*\).*/\1/p')"
+  [ -n "$major" ] || major=0
+  [ -n "$minor" ] || minor=0
+  [ -n "$patch" ] || patch=0
+  stage=9
+  pre=0
+  tag="$(printf '%s' "$v" | sed -n 's/^[0-9]*\.[0-9]*\.[0-9]*-\([A-Za-z]*\).*/\1/p' | tr 'A-Z' 'a-z')"
+  if [ -n "$tag" ]; then
+    case "$tag" in
+      alpha) stage=0 ;;
+      beta)  stage=1 ;;
+      rc)    stage=2 ;;
+      *)     stage=3 ;;
+    esac
+    pre="$(printf '%s' "$v" | sed -n 's/.*\.\([0-9]*\)$/\1/p')"
+    [ -n "$pre" ] || pre=0
+  fi
+  printf '%03d.%03d.%03d.%d.%03d' "$major" "$minor" "$patch" "$stage" "$pre"
+}
+
+# 已装版本是否比目标旧（= 有新版可升）。
+is_newer_version() {
+  [ -n "$1" ] || return 1
+  [ -n "$2" ] || return 0
+  [ "$(version_rank "$1")" \> "$(version_rank "$2")" ]
+}
 
 resolve_node() {
   if [ -n "$NODE_BIN" ] && [ -x "$NODE_BIN" ]; then echo "$NODE_BIN"; return 0; fi
@@ -158,6 +212,19 @@ fill_cache() {
   [ -n "$(cache_trees)" ]
 }
 
+# ---- 版本：默认取 npm 上的 latest（2026-10-08 用户要求：别写死旧版本）----
+if [ -z "$VERSION" ]; then
+  _latest="$(resolve_latest_version)"
+  if [ -n "$_latest" ]; then
+    VERSION="$_latest"
+    say "npm 上的最新版（latest）：$VERSION"
+  else
+    VERSION="$FALLBACK_VERSION"
+    warn "查不到 npm registry 上的最新版，退回内置版本 $VERSION"
+    warn "  （想指定版本：--version <版本号>；想升级：--upgrade）"
+  fi
+fi
+
 say "安装目录：$DEST"
 say "标准版版本：$VERSION"
 
@@ -173,8 +240,28 @@ ENTRY="$TARGET/node_modules/@deepseek-ai/dsh/lib/bin.js"
 
 if [ -s "$ENTRY" ] && [ -z "$(tree_broken "$TARGET")" ]; then
   # "装好了"不能只看 bin.js 在不在 —— 必须过完整性自检 + 冒烟测试（见 tree_broken 的注释）
-  ok "标准版已经在本机（跳过下载；完整性自检 + 冒烟测试都过）"
-else
+  # ---- 「装好了」不等于「装的是你要的那个版本」（2026-10-08 升级支持）----
+  # 原来这里直接 ok 跳过 —— 于是升级永远静默无效。现在读已装版本分三种情况：
+  #   ① 同版本 → 真跳过；② 不同 + --upgrade → 删整树重装；③ 不同 + 没 --upgrade → 如实提示。
+  INSTALLED="$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+    "$TARGET/node_modules/@deepseek-ai/dsh/package.json" 2>/dev/null | head -1)"
+  [ -n "$INSTALLED" ] || INSTALLED="（读不到）"
+  if [ "$INSTALLED" = "$VERSION" ]; then
+    ok "标准版已经在本机，版本 $INSTALLED（跳过下载；完整性自检 + 冒烟测试都过）"
+  elif [ "$UPGRADE" = "1" ]; then
+    warn "升级标准版：$INSTALLED → $VERSION（按 --upgrade 删整树重装）"
+    rm -rf "$TARGET/node_modules" "$TARGET/package-lock.json" 2>/dev/null || true
+    NEED_INSTALL=1
+  else
+    ok "标准版已经在本机，版本 $INSTALLED（完整性自检 + 冒烟测试都过）"
+    if is_newer_version "$VERSION" "$INSTALLED"; then
+      say "  注意：registry 上还有更新的版本 $VERSION（本机 $INSTALLED）"
+      say "  升级到最新：加 --upgrade 重跑本脚本"
+      say "  升级到指定版本：--upgrade --version <版本号>"
+    fi
+  fi
+fi
+if [ ! -s "$ENTRY" ] || [ -n "$(tree_broken "$TARGET")" ] || [ "${NEED_INSTALL:-0}" = "1" ]; then
   mkdir -p "$TARGET"
   if [ -s "$ENTRY" ]; then
     # bin.js 在却没过自检 = 上次装残了 → **整树删掉重装**：npm 只按版本号判断"这个包已装"，

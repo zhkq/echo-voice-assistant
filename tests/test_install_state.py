@@ -224,6 +224,13 @@ class InstallReportTests(unittest.TestCase):
                 self.assertIn(spec["stt"], stt_mod.WHISPER_MODELS, engine)
             elif engine == "sherpa":
                 self.assertEqual("sherpa", got_engine)
+            elif engine == "sensevoice-onnx":
+                # 2026-10-08：指令转写的默认引擎。它的 pip 模块是 **sherpa_onnx**
+                # （不是 funasr）—— 那条"不需要 torch"的取舍就体现在这里。
+                self.assertEqual("sensevoice-onnx", got_engine)
+                self.assertEqual("sherpa_onnx", spec["module"],
+                                 "sensevoice-onnx 必须复用 sherpa_onnx，"
+                                 "别改成 funasr（会把 torch 拖进客户端）")
             elif engine == "sensevoice":
                 self.assertEqual("sensevoice", got_engine)
             elif engine == "qwen3asr":

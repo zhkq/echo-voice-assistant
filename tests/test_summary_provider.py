@@ -90,7 +90,7 @@ class DecisionTests(unittest.TestCase):
         fake = _FakeLlm()
         for chosen in ("openai-llm", "echo-auto"):
             with self._settings(chosen), \
-                    patch("app.manager.dsh_ready", lambda: True), \
+                    patch("app.manager.agent_ready", lambda: True), \
                     patch.object(meeting, "_llm_provider_for_summary", lambda: (fake, chosen)):
                 use, why = meeting.direct_llm_decision()
             self.assertFalse(use, "providerLlm=%r 时也不该绕过 agent" % chosen)
@@ -98,7 +98,7 @@ class DecisionTests(unittest.TestCase):
 
     def test_agent_available_keeps_the_old_path(self):
         with self._settings(""), \
-                patch("app.manager.dsh_ready", lambda: True), \
+                patch("app.manager.agent_ready", lambda: True), \
                 patch.object(meeting, "_llm_provider_for_summary", lambda: (_FakeLlm(), "echo-auto")):
             use, why = meeting.direct_llm_decision()
         self.assertFalse(use, "agent 可用时不该抢它的活（老用户行为零变化）")
@@ -106,7 +106,7 @@ class DecisionTests(unittest.TestCase):
 
     def test_no_agent_but_provider_ready_switches_to_direct(self):
         with self._settings(""), \
-                patch("app.manager.dsh_ready", lambda: False), \
+                patch("app.manager.agent_ready", lambda: False), \
                 patch.object(meeting, "_llm_provider_for_summary",
                              lambda: (_FakeLlm(), "echo-auto")):
             use, why = meeting.direct_llm_decision()
@@ -115,7 +115,7 @@ class DecisionTests(unittest.TestCase):
 
     def test_neither_available_falls_back_to_agent_path(self):
         with self._settings(""), \
-                patch("app.manager.dsh_ready", lambda: False), \
+                patch("app.manager.agent_ready", lambda: False), \
                 patch.object(meeting, "_llm_provider_for_summary",
                              lambda: (None, "没有可用的 LLM provider")):
             use, why = meeting.direct_llm_decision()
@@ -129,17 +129,49 @@ class DecisionTests(unittest.TestCase):
         """
         for chosen in ("", "ghost", "echo-auto", "openai-llm"):
             with self._settings(chosen), \
-                    patch("app.manager.dsh_ready", lambda: True):
+                    patch("app.manager.agent_ready", lambda: True):
                 use, why = meeting.direct_llm_decision()
             self.assertFalse(use, "providerLlm=%r 不该影响判定" % chosen)
         # agent 不可用时仍然认 provider（P5 的兜底）
         with self._settings("ghost"), \
-                patch("app.manager.dsh_ready", lambda: False), \
+                patch("app.manager.agent_ready", lambda: False), \
                 patch.object(meeting, "_llm_provider_for_summary",
                              lambda: (None, "没有可用的 LLM provider")):
             use, why = meeting.direct_llm_decision()
         self.assertFalse(use, "兜底 provider 取不到时保持 agent 路（由原路径报错）")
         self.assertTrue(why)
+
+
+    def test_the_configured_agent_wins_over_the_desktop_probe(self):
+        """**2026-10-08 事故的回归用例**：判据必须是"选中的智能体"，不是"桌面版进程"。
+
+        现场：用户选的是**标准版 harness**、桌面版没开。`direct_llm_decision()` 当时问的是
+        `manager.dsh_ready()`（写死 `get_desktop_client().ping()`）→ **恒判"DSH 未就绪"**
+        → 纪要与分段**全部绕开智能体**走直连 LLM。用户原话：
+        "会议纪要分段应该发给配置好的智能体，也就是 dsh 标准版进行呀"。
+
+        这个 bug 特别隐蔽：直连那条路**也能出纪要**，面板上看"有纪要"像是正常的，
+        只有对比内容质量才发现智能体根本没参与。
+        """
+        with self._settings(""), \
+                patch("app.manager.dsh_ready", lambda: False), \
+                patch("app.manager.agent_ready", lambda: True), \
+                patch.object(meeting, "_llm_provider_for_summary",
+                             lambda: (_FakeLlm(), "echo-auto")):
+            use, why = meeting.direct_llm_decision()
+        self.assertFalse(use, "选中的智能体就绪时，就不该走直连（哪怕桌面版没开）")
+        self.assertNotIn("未就绪", why)
+
+    def test_no_selected_agent_still_falls_back_to_direct(self):
+        """兜底路不能被这次改动弄丢：选中的智能体也不可用时才走直连。"""
+        with self._settings(""), \
+                patch("app.manager.dsh_ready", lambda: False), \
+                patch("app.manager.agent_ready", lambda: False), \
+                patch.object(meeting, "_llm_provider_for_summary",
+                             lambda: (_FakeLlm(), "echo-auto")):
+            use, why = meeting.direct_llm_decision()
+        self.assertTrue(use, "两条路都不通时才该退回直连兜底")
+        self.assertIn("echo-auto", why)
 
 
 class MaterialTests(unittest.TestCase):

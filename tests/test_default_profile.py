@@ -157,12 +157,22 @@ class DefaultProfileTests(unittest.TestCase):
         """声明的大小 = 组件之和 + 额外项；而且要落在 §1.1 的预算里。
 
         这条防的是"数字变成口号"：改了组件、忘了改合计，用例会红。
+
+        **2026-10-08 预算从 700 提到 950**：默认档加了 `stt-sensevoice-onnx`
+        （int8 ONNX 版 SenseVoice，230 MB）—— 用户明确要求把指令转写的默认引擎换成它
+        （中文叠字实测 73 vs 流式 852）。它**不带 torch**（复用已有的 sherpa_onnx），
+        所以 L1 铁律没被破坏，涨的只是体积。原来那个 ≈606 MB 的预算是按
+        「runtime-core + stt-sherpa + wake-kws」算的，现在：
+          * `wake-kws` 移到了 offline 档（唤醒默认关闭，启用时再下）；
+          * 加了 230 MB 的默认转写引擎。
+        上限留 950 而不是正好 796：给"再进一个 100~150 MB 的 torch-free 组件"留余量，
+        但**仍然拦得住** 896 MB 的 funasr 版 SenseVoice 这类会破坏 L1 的东西。
         """
         comp = sum(int(self.pack[c]["pack"].get("approx_mb") or 0)
                    for c in self.default["components"])
         total = comp + int(self.default.get("extraMb") or 0)
-        self.assertLessEqual(total, 700,
-                             "默认档声明 %d MB，超了 §1.1 的 ≈606 MB 预算" % total)
+        self.assertLessEqual(total, 950,
+                             "默认档声明 %d MB，超了 §1.1 的预算" % total)
         self.assertGreaterEqual(total, 500,
                                 "默认档只有 %d MB？比 §1.1 说的少太多，八成是漏了组件"
                                 % total)

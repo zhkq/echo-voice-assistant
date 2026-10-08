@@ -411,14 +411,19 @@ DEFAULTS = {
                                         "qwen3asr / pyannote）—— 默认档的指令引擎 sherpa 是 CPU 的、"
                                         "会议转写交给能力后端时，这一项都不用管。",
                             value_type="str", options=["auto", "cpu", "cuda"]),
-    "sttModel":        dict(value="sensevoice", grp="model", label="命令转写引擎",
-                            description="语音指令用哪个引擎。sherpa = 兜底（安装器保证它在，"
-                                        "流式、最快，中英都认）；sensevoice = 质量更好（中文短命令推荐，"
-                                        "需 funasr）；qwen3asr = 最准但吃显存（需 GPU）。"
+    "sttModel":        dict(value="sensevoice-onnx", grp="model", label="命令转写引擎",
+                            description="语音指令用哪个引擎。**sensevoice-onnx = 默认**"
+                                        "（int8 ONNX 版 SenseVoice，约 228 MB，"
+                                        "**不需要 torch/funasr**，复用已有的 sherpa-onnx 运行时；"
+                                        "中文短命令实测 RTF 0.04，叠字远少于流式）；"
+                                        "sherpa = 流式（最快、体积最小，但中文上**叠字**明显，"
+                                        "留作没下 ONNX 模型时的兜底）；"
+                                        "sensevoice = funasr 版（质量与 ONNX 版相当，但**要 torch**，"
+                                        "客户端要多装 2.9 GB）；qwen3asr = 最准但吃显存（需 GPU）。"
                                         "**whisper 各档已不再提供**（权重已从本机删除）——"
                                         "老库里选过 whisper 的会按兜底 sherpa 读（改了不会有惊喜）",
                             value_type="str",
-                            options=["sherpa", "sensevoice", "qwen3asr"]),
+                            options=["sensevoice-onnx", "sherpa", "sensevoice", "qwen3asr"]),
     # 「清理」的阈值（2026-09-26）：只影响**建议**，不影响任何加载路径。
     # 为什么把它做成设置而不是写死 90：用户说"近期没再使用的模型就清掉吧"，
     # 但"近期"是他的判断（三个月 vs 半年取决于磁盘有多紧），所以给一个能改的数。
@@ -1156,9 +1161,13 @@ VALUE_ALIASES = {
 #: 判据是"它还在本平台的候选项里吗"：还在（例如 macOS 的 whisper 档）就一个字都不折。
 RETIRED_VALUE_FALLBACKS = {
     # 2026-09-26：whisper 权重已从本机删除（5086.5 MB），新分工是
-    # 「指令兜底 = sherpa / 指令进阶 = SenseVoice」。指令这条链路仍然在客户端进程内跑
-    # （铁律 L3），所以这里的折算照旧有用：
-    #   指令：折成 sherpa（安装器保证它在，永远不会因为缺权重而转不了）。
+    # 「指令兜底 = sherpa / 指令默认 = sensevoice-onnx（2026-10-08 起）」。
+    # 指令这条链路仍然在客户端进程内跑（铁律 L3），所以这里的折算照旧有用：
+    #   指令：折成 **sherpa**（安装器保证它在，永远不会因为缺权重而转不了）。
+    #   为什么不折成新的默认 sensevoice-onnx：老库/老装机上那份 228 MB 的 ONNX 模型
+    #   **可能还没下**，折过去会得到一个"有设置但引擎加载不了"的状态；而 `transcribe_ex`
+    #   对 `sensevoice-onnx` 有一条**运行时兜底**（模型缺失时自动回落 sherpa），
+    #   所以读取默认值的那条路不需要在这里再兜一层。
     "sttModel": {"tiny": "sherpa", "base": "sherpa", "small": "sherpa",
                  "medium": "sherpa", "large": "sherpa", "large-v3": "sherpa"},
     # 2026-09-29：`meetingSttModel` 这一整项**废弃**了（键已 `deprecated=True`），

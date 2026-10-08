@@ -3051,15 +3051,19 @@ def direct_llm_decision():
     """
     try:
         from app import manager
-        agent_ok = bool(manager.dsh_ready())
+        # ⚠️ 必须问 `agent_ready()`（**当前选中的**智能体），不能问 `dsh_ready()`
+        # （那只回答"DSH 桌面版进程在不在"）。2026-10-08 事故：用户选的是标准版 harness、
+        # 桌面版没开，于是这里恒判"未就绪"，纪要与分段**全部绕开智能体**走直连 LLM。
+        # 用户原话："会议纪要分段应该发给配置好的智能体，也就是 dsh 标准版进行呀"。
+        agent_ok = bool(manager.agent_ready())
     except Exception:
         agent_ok = False
     if agent_ok:
-        return False, "agent 可用（DSH 就绪）"
+        return False, "agent 可用（选中的智能体就绪）"
     inst, pid = _llm_provider_for_summary()
     if inst is None:
         return False, "agent 不可用且没有可用的 LLM provider"
-    return True, "agent 不可用（DSH 未就绪），改用 LLM provider %s" % pid
+    return True, "agent 不可用（选中的智能体未就绪），改用 LLM provider %s" % pid
 
 
 def _provider_summary_text(folder):
@@ -3373,6 +3377,24 @@ def retranscribe_meeting(meeting_id):
         finally:
             with _retranscribing["lock"]:
                 _retranscribing["set"].discard(name)
+            # 重转结束**也要走一次自动压缩**（2026-10-08 修）。
+            #
+            # 为什么必须补这一刀：`_maybe_auto_compress()` 原来只在**首次转写完成**那一条路
+            # （`_transcribe_meeting` 里）被调用。重转时那一刻的状态是"正在重新转写"，
+            # `compression_state()` 按纪律跳过（转写正在读那些文件）—— 那一跳之后就**再没有
+            # 任何补偿**，于是重转过的会议**永远压不了**。
+            #
+            # 现场（2026-10-08 用户问"压缩没执行完吗"）：昨晚重转的 10 场全部只有 wav、
+            # 没有 flac，日志里 10 条 `自动压缩跳过 …：正在重新转写`，面板上也就没有
+            # 「已压缩」标记 —— 看着像"压缩坏了"，其实是从来没轮到过它。
+            #
+            # 放在 `discard` **之后**：判据（`transcribe_busy_reason`）看的就是这个标记，
+            # 先清再压才判得出"可以压"。自己吞掉所有异常（`_maybe_auto_compress` 内部已吞），
+            # 绝不能因为压缩失败影响"这场转写好了"这件事。
+            try:
+                _maybe_auto_compress(folder)
+            except Exception:
+                pass
 
     threading.Thread(target=_run, daemon=True).start()
     return True, f"已开始重新转写（{name}）"

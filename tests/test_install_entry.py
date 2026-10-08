@@ -286,6 +286,13 @@ class EngineTableAlignmentTests(unittest.TestCase):
                               f"{value} 不是合法的 whisper 档名")
             elif engine == "sherpa":
                 self.assertEqual(("sherpa", ""), (got_engine, got_model))
+            elif engine == "sensevoice-onnx":
+                # 2026-10-08：指令转写的**默认**引擎（int8 ONNX 版 SenseVoice）。
+                # 它**不**走 funasr/torch —— 那条取舍是本方案体积优势的全部来源。
+                self.assertEqual(("sensevoice-onnx", ""), (got_engine, got_model))
+                self.assertEqual("sherpa_onnx", info["module"],
+                                 f"{engine} 的 module 必须是 sherpa_onnx，"
+                                 "改成 funasr 会把 torch 拖进客户端")
             elif engine == "sensevoice":
                 self.assertEqual("sensevoice", got_engine)
             elif engine == "qwen3asr":
@@ -455,7 +462,40 @@ class HarnessLocalInstallTests(unittest.TestCase):
             text = _read(path)
             self.assertIn("_npx", text, f"{tag} 助手没有「从 npx 缓存复制」那条路")
             self.assertIn("node-pty", text, f"{tag} 助手缺完整性自检（半残包要拦下）")
-            self.assertIn("0.1.5-rc.2", text, f"{tag} 助手的默认版本漂了")
+            # ⚠️ 这条断言 2026-10-08 改过：原来钉的是"默认版本必须是 0.1.5-rc.2"，
+            # 而用户的要求正好相反 —— **别写死版本，装 npm 上的最新版**。
+            # 现在钉的是"有一条自动取 latest 的路 + 一个兜底版本"，两个平台都要有。
+            self.assertIn("dist-tags.latest", text,
+                          f"{tag} 助手没有「自动取 npm latest」这条路（又写死版本了？）")
+            self.assertIn("0.2.0-rc.2", text, f"{tag} 助手没了兜底版本")
+
+    def test_default_version_is_resolved_not_hardcoded(self):
+        """**2026-10-08 用户要求**：装最新版，别写死旧版本；同时要有升级入口。
+
+        原状：`param(... $Version = '0.1.5-rc.2')` / `VERSION="0.1.5-rc.2"` 写死，
+        而当时 npm 的 latest 已经是 0.2.0-rc.2 —— 新装机器永远拿到旧版。
+        三件事必须都在两个平台上：
+          ① 默认留空 → 查 `dist-tags.latest`；
+          ② 查不到时有兜底版本（全新机器断网也不能整个失败）；
+          ③ 有升级入口（`-Upgrade` / `--upgrade`），否则"装好了"那条快路径
+             会把升级**静默吃掉**（这正是原来的病）。
+        """
+        ps1 = _read(self.PS1_HELPER)
+        sh = _read(self.SH_HELPER)
+        for text, tag in ((ps1, "ps1"), (sh, "sh")):
+            self.assertIn("dist-tags.latest", text, f"{tag} 没有自动取 latest")
+        self.assertIn("FallbackVersion", ps1, "ps1 没有兜底版本")
+        self.assertIn("FALLBACK_VERSION", sh, "sh 没有兜底版本")
+        # 默认值必须是空（留空 = 自动取最新），不能再写死一个具体版本当默认
+        self.assertRegex(ps1, r"\$Version\s*=\s*''", "ps1 的 -Version 默认值不是空")
+        self.assertRegex(sh, r'VERSION\s*=\s*""', "sh 的 VERSION 默认值不是空")
+        # 升级入口
+        self.assertIn("$Upgrade", ps1, "ps1 缺 -Upgrade（升级会被「已装好」快路径吃掉）")
+        self.assertIn("--upgrade", sh, "sh 缺 --upgrade")
+        self.assertIn("UPGRADE=1", sh, "sh 没解析 --upgrade")
+        # 升级真的要能落地：删整树重装（npm 只按版本号判"已装"，不修残树）
+        self.assertIn("删整树重装", ps1)
+        self.assertIn("删整树重装", sh)
 
     def test_version_and_cache_only_are_overridable(self):
         """registry 哪天又坏在别的版本上时，要能一行参数换版本 / 离线只走缓存。"""

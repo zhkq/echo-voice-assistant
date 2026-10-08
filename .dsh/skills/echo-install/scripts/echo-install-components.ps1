@@ -99,6 +99,9 @@ $ENGINE_MAP = @{
     # 默认档必然卡在"模型下不下来"（同事 2026-09-25 实测报告 §4.1 B）。
     # 这条由 tests/test_install_entry.py 的 DownloadClientTests 守着，别再漏。
     'sherpa'           = @{ pip = @('sherpa-onnx', 'modelscope');         model = 'sherpa';           stt = 'sherpa';   module = 'sherpa_onnx' }
+    # 2026-10-08：指令转写的**默认**引擎。pip 只要 sherpa-onnx（**不要 torch/funasr**）——
+    # 这正是它的意义：复用已必装的 sherpa_onnx，客户端零新增依赖，模型只有 228 MB 的 int8 ONNX。
+    'sensevoice-onnx'  = @{ pip = @('sherpa-onnx', 'modelscope');         model = 'sensevoice-onnx';  stt = 'sensevoice-onnx'; module = 'sherpa_onnx' }
     'whisper-tiny'     = @{ pip = @('faster-whisper', 'huggingface-hub'); model = 'whisper-tiny';     stt = 'tiny';     module = 'faster_whisper' }
     'whisper-base'     = @{ pip = @('faster-whisper', 'huggingface-hub'); model = 'whisper-base';     stt = 'base';     module = 'faster_whisper' }
     'whisper-small'    = @{ pip = @('faster-whisper', 'huggingface-hub'); model = 'whisper-small';    stt = 'small';    module = 'faster_whisper' }

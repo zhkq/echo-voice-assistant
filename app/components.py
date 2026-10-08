@@ -109,14 +109,30 @@ def _builtin() -> List[dict]:
              size_mb=2500, platforms=["win32", "linux"], min_os={},   # mac 上不出现
              detect={"python": "torch", "exe": None},
              source="pypi", how="按显卡驱动安装 torch 的 CUDA 版（面板不代装）；无 N 卡不要装"),
+        dict(id="stt-sensevoice-onnx", kind="stt", name="SenseVoice ONNX（默认引擎）",
+             optional=False, required=True,
+             purpose="**语音指令的默认转写引擎**：int8 ONNX 版 SenseVoice，"
+                     "**不需要 torch/funasr**，复用已必装的 sherpa-onnx 运行时。"
+                     "2026-10-08 实测：叠字 73（流式 sherpa 是 852）、整段 16.9 秒"
+                     "（比 sherpa 还快，因为带 Silero VAD 只识别有人在说话的段）。"
+                     "**取代原来的「流式做转写」** —— 但 sherpa 那份流式模型**仍要留**，"
+                     "语音唤醒的主路就用它（SenseVoice 是离线整段模型，替不了边说边判）",
+             size_mb=230, platforms=["win32", "macos", "linux"], min_os={},
+             model_id="sensevoice-onnx", pkg="sherpa-onnx", source="hf-mirror",
+             ref="csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17",
+             how="面板下载或自行拷贝到 models/sensevoice-onnx，要三份文件："
+                 "model.int8.onnx（228 MB）+ tokens.txt + silero_vad.onnx（1.7 MB，"
+                 "长音频切段用；缺了退回整段识别，10 分钟音频会只出几个字）"),
         dict(id="stt-sensevoice", kind="stt", name="SenseVoice 中文短命令", optional=True, required=False,
              purpose="语音命令与会议转写的默认引擎（自带标点）",
              size_mb=896, platforms=["win32", "macos", "linux"], min_os={},
              model_id="sensevoice", pkg="funasr", source="modelscope", ref="iic/SenseVoiceSmall",
              how="面板下载或自行拷贝到 models/sensevoice；需 funasr + torch"),
         dict(id="stt-sherpa", kind="stt", name="sherpa-onnx 流式转写", optional=False, required=True,
-             purpose="**语音指令的转写引擎（必装）**：免 torch 的轻量流式转写。"
-                     "指令转写不允许依赖服务端可用性，所以它不能是可选件",
+             purpose="**语音唤醒的主路（必装）+ 指令转写的兜底**：免 torch 的轻量流式转写。"
+                     "指令那条已改由 sensevoice-onnx 承担（中文叠字少得多），"
+                     "但唤醒必须用它 —— `wake.py` 的默认实现是「流式转写再匹配唤醒词」，"
+                     "KWS 对自然语音（'嘿尼欧'）识别不了。",
              size_mb=189, platforms=["win32", "macos", "linux"], min_os={},
              model_id="sherpa", pkg="sherpa-onnx", source="modelscope",
              how="面板下载或自行拷贝到 models/sherpa-onnx-streaming；"

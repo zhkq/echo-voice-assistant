@@ -23,6 +23,8 @@ from app import components, modelinfo                            # noqa: E402
 #: modelinfo 的 id -> 组件清单的 id（不含 whisper，它按档位拼）
 ID_MAP = {
     "sensevoice": "stt-sensevoice",
+    # 2026-10-08：指令转写的**默认**引擎（int8 ONNX 版 SenseVoice，不需要 torch/funasr）
+    "sensevoice-onnx": "stt-sensevoice-onnx",
     "sherpa": "stt-sherpa",
     "qwen3asr": "stt-qwen3asr",
     "kws": "wake-kws",
@@ -83,7 +85,7 @@ class CatalogAlignmentTests(unittest.TestCase):
         self.assertEqual(bad, [], "同一组件的体积在两份清单里差太多：%s" % bad)
 
     def test_required_components_are_runtime_and_the_command_engine(self):
-        """必装项 = 运行时核心 + **语音指令的转写引擎**。
+        """必装项 = 运行时核心 + **语音指令的转写引擎** + **唤醒主路的引擎**。
 
         D23 的原意是"模型都该由向导按环境逐项问，不该默认必装" —— 这条**仍然成立**，
         所以**会议转写模型（sensevoice / whisper / qwen3asr）依旧全部可选**。
@@ -98,15 +100,22 @@ class CatalogAlignmentTests(unittest.TestCase):
              ModuleNotFoundError，面板一声不响、DSH 什么都没收到。
              用户根本不知道该去装什么。
 
-        例外**只开给这一个**（它同时是 pip 引擎与模型，且是指令链路必需品）；
-        下面第二条断言就是这条例外的边界。
+        2026-10-08 的第二条例外：`stt-sensevoice-onnx` 成了**指令转写的默认引擎**
+        （中文叠字远少于流式 sherpa，实测 73 : 852）。它同样落在"装机就得有、否则
+        默认引擎没有模型"这条上 —— 缺了会**静默回落到流式 sherpa**，用户只会觉得
+        "识别质量怎么又回去了"。所以它也必须是必装。
+
+        而 `stt-sherpa` **不能因此删掉**：语音唤醒 `wakeEnabled` 默认虽关，但一旦启用，
+        走的就是它的流式 transducer（`wake.py::_make_stream_detector`）——
+        SenseVoice 是**离线整段**模型，替不了"边说边判"。
         """
         req = [i["id"] for i in components.load_manifests() if i.get("required")]
-        self.assertEqual(req, ["runtime-core", "stt-sherpa"])
+        self.assertEqual(req, ["runtime-core", "stt-sensevoice-onnx", "stt-sherpa"])
         models_required = [i["id"] for i in components.load_manifests()
                            if i.get("required") and i.get("kind") in MODEL_KINDS]
-        self.assertEqual(models_required, ["stt-sherpa"],
-                         "除语音指令引擎外，不许再有模型类组件变成必装（D23 仍然有效）")
+        self.assertEqual(models_required, ["stt-sensevoice-onnx", "stt-sherpa"],
+                         "必装的模型类组件只许是『默认指令引擎』与『唤醒主路引擎』"
+                         "（D23 仍然有效：会议模型一律可选）")
 
     def test_model_components_declare_model_id(self):
         """模型类组件必须写明 `model_id`（2026-09-19 合并「模型/组件」页签时加的）。

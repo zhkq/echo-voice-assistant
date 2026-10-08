@@ -29,7 +29,14 @@
 # =====================================================================
 param(
     [Parameter(Mandatory = $true)][string]$DestDir,
-    [string]$Version = '0.1.5-rc.2',
+    # 留空 = **自动取 npm 上的 latest**（2026-10-08 用户要求：装最新版，别写死旧版本）。
+    # 三种用法：
+    #   新装：        -DestDir <目录>
+    #   升到最新：    -DestDir <目录> -Upgrade
+    #   升/降到指定： -DestDir <目录> -Upgrade -Version <版本号>
+    [string]$Version = '',
+    # 已装好也**强制重装**（= 升级入口）。不给它时，已装且完好就跳过，只在有新版时**提示**。
+    [switch]$Upgrade,
     [switch]$FromCache,
     [string]$CacheDir = '',
     [string]$NodeExe = '',
@@ -72,6 +79,41 @@ function Resolve-Npm {
         if ($c) { return $c.Source }
     }
     return ''
+}
+
+#: 查不到 npm registry 时的兜底版本（**只是兜底，不是"我们要装的版本"**）。
+#  为什么留一个写死的值：全新机器上 npm 可能还没配好源 / 断网，这时**不能**因为
+#  "查不到最新版"就整个失败 —— 退回一个已知可用的版本，装完照样能用。
+#  ⚠️ 它**必须定期跟一下**，但它不再是主路径（2026-10-08 用户要求：装最新的，别写死旧版本）。
+$script:FallbackVersion = '0.2.0-rc.2'
+
+function Resolve-LatestVersion([string]$Npm, [switch]$Quiet) {
+    <#
+      取 npm 上 @deepseek-ai/dsh 的 **latest** 版本。
+
+      为什么要有它（2026-10-08 用户原话）：
+        "安装脚本中 dsh 标准版应该装最新的版本，不要写死旧版本，
+         同时也要提供 dsh 升级的方法。"
+      原来 `param($Version = '0.1.5-rc.2')` 写死，而当时 npm 的 latest 已经是 0.2.0-rc.2
+      —— 新装机器拿到的永远是旧版，用户得自己去查版本号。
+
+      判据：`npm view @deepseek-ai/dsh dist-tags.latest`（**认 dist-tag，不自己排序**）。
+      为什么不让脚本自己按 semver 排：预发布号（rc/alpha）的排序规则很绕，
+      而且"哪个是给用户的稳定版"是**仓库方的判断**（dist-tag），不是我们猜的。
+      网络/registry 不可用时返回 ''，由调用方退回 `$FallbackVersion` 并**明确告警**。
+    #>
+    if (-not $Npm) { return '' }
+    try {
+        $raw = & $Npm 'view' '@deepseek-ai/dsh' 'dist-tags.latest' 2>$null
+        $v = ([string]($raw | Select-Object -First 1)).Trim().Trim('"')
+        if ($v -match '^\d+\.\d+\.\d+') {
+            if (-not $Quiet) { Say ("npm 上的最新版（latest）：{0}" -f $v) }
+            return $v
+        }
+        return ''
+    } catch {
+        return ''
+    }
 }
 
 function Test-HarnessTree([string]$Target) {
@@ -260,6 +302,23 @@ function Fill-NpxCache([string]$Version) {
     return $false
 }
 
+# ---- 版本：默认取 npm 上的 latest（2026-10-08 用户要求：别写死旧版本）----
+#  三种情况都要**说清楚**，不要静默：
+#    ① 没传 -Version → 查 latest，查到就用；
+#    ② 查不到（断网/源没配/npm 不在）→ 退回内置 $FallbackVersion 并**告警**；
+#    ③ 显式传了 -Version → 用它（这也是**升级/降级到指定版本**的入口）。
+if (-not $Version) {
+    $npmForVersion = Resolve-Npm
+    $latest = Resolve-LatestVersion -Npm $npmForVersion
+    if ($latest) {
+        $Version = $latest
+    } else {
+        $Version = $script:FallbackVersion
+        Warn ("查不到 npm registry 上的最新版，退回内置版本 {0}" -f $Version)
+        Warn "  （想指定版本：-Version <版本号>；想升级：见下文「升级标准版」）"
+    }
+}
+
 Say ("标准版版本：{0}" -f $Version)
 
 $node = Resolve-Node
@@ -268,6 +327,54 @@ if (-not $node) {
     exit 1
 }
 Ok ("node: {0}" -f $node)
+
+function Get-InstalledVersion([string]$Target) {
+    # 读已装那份标准版的版本号（读不到返回 ''）。
+    $pj = Join-Path $Target 'node_modules\@deepseek-ai\dsh\package.json'
+    if (-not (Test-Path -LiteralPath $pj)) { return '' }
+    try {
+        return [string]((Get-Content -LiteralPath $pj -Raw | ConvertFrom-Json).version)
+    } catch { return '' }
+}
+
+function Get-VersionRank([string]$V) {
+    <#
+      把 `0.2.0-rc.2` 这种预发布号排成一个可比较的整数数组。
+
+      为什么要自己排：**预发布号不是 semver 的普通大小关系**（`0.2.0-rc.2` 名义上小于
+      `0.2.0`），而这里的用途只是"本机这份和 registry 上那份是不是同一个"以及
+      "粗略判断谁新" —— 用来**决定要不要提示升级**，不是拿来做依赖解析。
+      真正的"哪个是给用户的稳定版"由 npm 的 dist-tag 决定（见 `Resolve-LatestVersion`）。
+    #>
+    $m = [regex]::Match([string]$V, '^(\d+)\.(\d+)\.(\d+)(?:-([A-Za-z]+)\.?(\d+)?)?')
+    if (-not $m.Success) { return @(0, 0, 0, 0) }
+    $major = [int]$m.Groups[1].Value
+    $minor = [int]$m.Groups[2].Value
+    $patch = [int]$m.Groups[3].Value
+    # 正式版（没有预发布段）排在预发布之前：给 stage 一个更小的序数
+    $stage = 9
+    $pre = 0
+    if ($m.Groups[4].Success) {
+        $tag = $m.Groups[4].Value.ToLower()
+        $stage = switch -Regex ($tag) { 'alpha' { 0 } 'beta' { 1 } 'rc' { 2 } default { 3 } }
+        if ($m.Groups[5].Success) { $pre = [int]$m.Groups[5].Value }
+    }
+    return @($major, $minor, $patch, $stage, $pre)
+}
+
+function Test-NewerVersion([string]$Candidate, [string]$Current) {
+    # Candidate 是否比 Current 新（只用于"有新版可升"的提示，不参与依赖解析）。
+    if (-not $Candidate) { return $false }
+    if (-not $Current) { return $true }
+    $a = Get-VersionRank $Candidate
+    $b = Get-VersionRank $Current
+    for ($i = 0; $i -lt [Math]::Max($a.Count, $b.Count); $i++) {
+        $x = if ($i -lt $a.Count) { $a[$i] } else { 0 }
+        $y = if ($i -lt $b.Count) { $b[$i] } else { 0 }
+        if ($x -ne $y) { return ($x -gt $y) }
+    }
+    return $false
+}
 
 function Test-Entry {
     # "装好了"的判据**不能只看 bin.js 在不在** —— 必须过完整性自检 + 冒烟测试。
@@ -280,8 +387,35 @@ function Test-Entry {
 }
 
 if (Test-Entry) {
-    Ok '标准版已经在本机（跳过下载；完整性自检 + 冒烟测试都过）'
-} else {
+    # ---- 「已经装好了」不等于「装的是你要的那个版本」（2026-10-08 升级支持）----
+    # 原来这里直接 Ok 跳过 —— 于是**升级永远静默无效**：用户跑升级命令，脚本说
+    # "标准版已经在本机（跳过下载）"，实际还是旧版。现在读一次已装版本，分三种情况：
+    #   ① 同版本           → 真的跳过（无事可做）；
+    #   ② 不同 + -Upgrade  → 删整树重装（升级）；
+    #   ③ 不同 + 没 -Upgrade → **如实提示**有新版、并给出升级命令（不擅自覆盖用户的安装）。
+    $installedVer = Get-InstalledVersion $target
+    if (-not $installedVer) { $installedVer = '（读不到）' }
+    if ($installedVer -eq $Version) {
+        Ok ("标准版已经在本机，版本 {0}（跳过下载；完整性自检 + 冒烟测试都过）" -f $installedVer)
+    } elseif ($Upgrade) {
+        Warn ("升级标准版：{0} → {1}（按 -Upgrade 删整树重装）" -f $installedVer, $Version)
+        $nm = Join-Path $target 'node_modules'
+        if (-not (Remove-Tree $nm)) {
+            Err ("清不掉 {0}（可能被占用）—— 先停掉标准版 harness 再重跑" -f $nm)
+            exit 1
+        }
+        Remove-Item -LiteralPath (Join-Path $target 'package-lock.json') -Force -ErrorAction SilentlyContinue
+        # 落到下面的安装流程
+    } else {
+        Ok ("标准版已经在本机，版本 {0}（完整性自检 + 冒烟测试都过）" -f $installedVer)
+        if (Test-NewerVersion $Version $installedVer) {
+            Say ("  注意：registry 上还有更新的版本 {0}（本机 {1}）" -f $Version, $installedVer)
+            Say ("  升级到最新：加 -Upgrade 重跑本脚本")
+            Say ("  升级到指定版本：-Upgrade -Version <版本号>")
+        }
+    }
+}
+if (-not (Test-Entry)) {
     try { New-Item -ItemType Directory -Force -Path $target | Out-Null } catch { }
     if (Test-Path -LiteralPath $entry) {
         # bin.js 在却没过自检 = 上一次装残了。**先整树删掉再装** ——

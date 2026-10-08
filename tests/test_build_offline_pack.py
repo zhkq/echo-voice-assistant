@@ -141,6 +141,14 @@ class _BundleCase(unittest.TestCase):
         for name in ("encoder.onnx", "decoder.onnx", "joiner.onnx", "tokens.txt"):
             with open(os.path.join(model, name), "w", encoding="utf-8") as fh:
                 fh.write("x")
+        # 2026-10-08：默认档现在**还要** `sensevoice-onnx`（指令转写的默认引擎），
+        # 假仓库里得有它，否则出包会在"组件要的模型不在仓库里"处响亮失败 ——
+        # 那条失败本身是对的（正是它拦住了"包里没模型就发出去"），所以这里补料而不是放松判据。
+        sv = os.path.join(self.repo, "models", "sensevoice-onnx")
+        os.makedirs(sv)
+        for name in ("model.int8.onnx", "tokens.txt", "silero_vad.onnx"):
+            with open(os.path.join(sv, name), "w", encoding="utf-8") as fh:
+                fh.write("x")
         self.patches = [
             mock.patch.object(packer, "ROOT", self.repo),
             mock.patch.object(packer, "pick_python", lambda override: ["fake-python"]),

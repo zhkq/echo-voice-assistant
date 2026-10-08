@@ -35,8 +35,10 @@ uv → py -3.11 → python.org 嵌入包）、再 pip 装依赖、再下模型�
     <kit>\bundle\
       wheels\                              必需（-Offline 硬检查这个目录在不在）
                                            → pip install --no-index --find-links bundle\wheels -r requirements-core.txt
-      models\sherpa-onnx-streaming\        模型，原样复制到 <安装根>\models\
-      models\wakeword\                     唤醒词（-Wake 才要；本机没有就**跳过并说清**）
+      models\sherpa-onnx-streaming\        模型，原样复制到 <安装根>\models\（唤醒主路 + 指令兜底）
+      models\sensevoice-onnx\              指令转写的**默认**引擎（int8 ONNX，约 230 MB）
+      models\wakeword\                     唤醒词 —— **默认不打**（wakeEnabled 出厂就是关的；
+                                           启用唤醒时在面板里下；见 DEFAULT_BUNDLE_COMPONENTS）
       runtime\python-3.11.9-embed-amd64.zip  第④级兜底建运行时（tar 解压，名字必须一字不差）
       runtime\get-pip.py                     配套：python get-pip.py --no-index --find-links wheels
 
@@ -84,7 +86,9 @@ SPEC_PATH = os.path.join(ROOT, "components", "offline-pack.json")
 REQUIREMENTS = "requirements-core.txt"          # 规格里 runtime-core 用的那份
 DEFAULT_INDEX = "https://pypi.tuna.tsinghua.edu.cn/simple"
 #: kit 的 `manifest.json.requiredComponents` 就是这两个 —— 默认打它俩，装完即自足。
-DEFAULT_COMPONENTS = ("runtime-core", "stt-sherpa")
+#: 2026-10-08：指令转写的默认引擎改成 `stt-sensevoice-onnx`，所以它也得进默认档
+#: （否则新装机上默认引擎没有模型，`transcribe_ex` 会回落到 sherpa —— 能跑但叠字多）。
+DEFAULT_COMPONENTS = ("runtime-core", "stt-sherpa", "stt-sensevoice-onnx")
 PACKAGE_PREFIX = "ECHO-离线组件合集"
 #: 装完必须能 import 的这些（少一个都说明这份运行时不能用）
 IMPORT_CHECK = ("fastapi, uvicorn, pydantic, yaml, numpy, sounddevice, soundfile, soxr,"
@@ -93,10 +97,14 @@ IMPORT_CHECK = ("fastapi, uvicorn, pydantic, yaml, numpy, sounddevice, soundfile
 # ---- bundle 方言（契约见模块头 B）------------------------------------------------
 #: bundle 的包名前缀（`--into` 之外，产出 `<out>/ECHO-bundle-<stamp>/bundle/…`）。
 BUNDLE_PREFIX = "ECHO-bundle"
-#: 默认打进 bundle 的组件 id（wake-kws 本机没有模型时**跳过并说清**，不算失败）。
-DEFAULT_BUNDLE_COMPONENTS = ("runtime-core", "stt-sherpa", "wake-kws")
-#: 模型类组件里"缺了就跳过"的（只有 sherpa 流式模型是**必需**的：默认档就是它）。
-OPTIONAL_MODEL_COMPONENTS = ("wake-kws",)
+#: 默认打进 bundle 的组件 id。
+#: **`wake-kws` 故意不在默认档**（2026-10-08 用户定）：语音唤醒 `wakeEnabled` 默认就是
+#: **关**的，而这份唤醒模型 39.7 MB —— 关着的功能不该占离线包的体积。
+#: 启用唤醒时在面板「设置 → 模型」里下载它（目录条目 `kws`）。
+DEFAULT_BUNDLE_COMPONENTS = ("runtime-core", "stt-sherpa", "stt-sensevoice-onnx")
+#: 模型类组件里"缺了就跳过"的（**`stt-sherpa` 与 `stt-sensevoice-onnx` 都是必需的**：
+#: 前者是唤醒主路 + 指令兜底，后者是默认转写引擎；两个都缺就没法转了）。
+OPTIONAL_MODEL_COMPONENTS = ()
 #: 嵌入包与 get-pip 的**名字必须与 install-all.ps1 里写的一字不差**（它按名字找）：
 #: `$zip = Join-Path $script:Bundle 'runtime\python-3.11.9-embed-amd64.zip'`。
 EMBED_NAME = "python-3.11.9-embed-amd64.zip"
@@ -433,9 +441,15 @@ def verify_bundle(bundle_dir: str, *, want_models: bool = True,
         if not any(fn.startswith(norm) for fn in names):
             problems.append("bundle\\wheels 里缺 %s" % need)
     if want_models:
+        # 2026-10-08：默认档现在有**两个**转写模型，判据各不相同 ——
+        #   * sherpa 流式：encoder*/decoder*/joiner* 三个 onnx + tokens.txt（唤醒主路 + 指令兜底）
+        #   * sensevoice-onnx：model*.onnx + tokens.txt + silero_vad.onnx（指令默认引擎）
+        # 少任一份都要在**出包时**就报出来：等装到同事机器上才发现"默认引擎没模型"，
+        # 表现是识别质量悄悄退回流式的叠字，最难查。
         d = os.path.join(bundle_dir, "models", "sherpa-onnx-streaming")
         if not os.path.isdir(d):
-            problems.append("bundle\\models 里没有 sherpa-onnx-streaming（默认档就靠它转写）")
+            problems.append("bundle\\models 里没有 sherpa-onnx-streaming"
+                            "（语音唤醒的主路 + 指令转写兜底都靠它）")
         else:
             have = os.listdir(d)
             for pre, suf in MODEL_REQUIRED_FILES:
@@ -443,6 +457,18 @@ def verify_bundle(bundle_dir: str, *, want_models: bool = True,
                     problems.append("模型目录缺 %s*%s" % (pre, suf))
             if "tokens.txt" not in have:
                 problems.append("模型目录缺 tokens.txt")
+        d2 = os.path.join(bundle_dir, "models", "sensevoice-onnx")
+        if not os.path.isdir(d2):
+            problems.append("bundle\\models 里没有 sensevoice-onnx"
+                            "（默认转写引擎，缺了会静默回落到流式 sherpa）")
+        else:
+            have2 = os.listdir(d2)
+            if not any(fn.startswith("model") and fn.endswith(".onnx") for fn in have2):
+                problems.append("sensevoice-onnx 目录缺 model*.onnx")
+            for need in ("tokens.txt", "silero_vad.onnx"):
+                if need not in have2:
+                    # VAD 缺了不致命（退回整段识别），但长音频会退化成几个字 —— 要报
+                    problems.append("sensevoice-onnx 目录缺 %s" % need)
     if want_runtime:
         rt = os.path.join(bundle_dir, "runtime")
         for name in (EMBED_NAME, "get-pip.py"):

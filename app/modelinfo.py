@@ -260,8 +260,22 @@ CATALOG = [
              _cmd_chain(interpreter.pip_install_command("qwen-asr", "transformers"),
                         interpreter.python_command("-c", _QWEN3ASR_PY)))),
 
+    dict(id="sensevoice-onnx", group="转写引擎", name="SenseVoice ONNX（默认引擎，int8）",
+         purpose="**语音指令的默认转写引擎**；离线整段识别 + Silero VAD 切段，"
+                 "**不需要 torch/funasr**（复用已必装的 sherpa-onnx 运行时）",
+         size="~230 MB",
+         target="models/sensevoice-onnx/（model.int8.onnx + tokens.txt + silero_vad.onnx）",
+         source="auto",
+         # 与 DSH 官方语音插件用的**同一个模型**（sherpa-onnx 作者 csukuangfj 的仓库），
+         # 所以两边下下来的文件可以互换 —— 已经装过 DSH 语音插件的机器上等于零下载。
+         ref="csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17",
+         allow=["model.int8.onnx", "tokens.txt"],
+         how="拉 int8 一份（228 MB）而不是 fp32（937 MB）—— int8 实测效果与 funasr/fp32 版"
+             "几乎逐字相同，而体积只有四分之一。Silero VAD（1.7 MB）另从一个仓库拉，"
+             "它是**长音频的必需件**：缺了会退回整段识别，10 分钟音频只出几个字。"),
     dict(id="sherpa", group="转写引擎", name="sherpa-onnx 流式 zipformer（中英）",
-         purpose="流式转写；唤醒词功能也用它", size="~189 MB",
+         purpose="**语音唤醒的主路**（默认 wakeEngine=sherpa 走的就是它）+ 指令转写的兜底",
+         size="~189 MB",
          target="models/sherpa-onnx-streaming/（encoder*/decoder*/joiner*.onnx + bpe.model + tokens.txt）",
          source="auto", ref="csukuangfj/sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20",
          # ModelScope 上同一个模型在作者本人的账号下（pkufool = csukuangfj 的 MS 账号）。
@@ -534,7 +548,7 @@ def inventory():
 
 # ---------------------------------------------------------------- 下载（面板按钮）
 # pyannote 仅提供可复制的官方下载命令，由用户在终端执行。
-_EXPECTED_MB = {"sensevoice": 900, "qwen3asr": 3600, "sherpa": 190,
+_EXPECTED_MB = {"sensevoice": 900, "sensevoice-onnx": 230, "qwen3asr": 3600, "sherpa": 190,
                 "whisper-tiny": 75, "whisper-base": 141, "whisper-small": 464,
                 "whisper-medium": 1500, "whisper-large-v3": 2950}
 
@@ -745,6 +759,27 @@ def _download_worker(entry):
             _snapshot(ms_id="Qwen/Qwen3-ForcedAligner-0.6B")
         elif mid.startswith("whisper-"):
             source_used = _snapshot(ms_id=entry.get("ms_ref") or "", hf_id=entry["ref"])
+        elif mid == "sensevoice-onnx":
+            # 主模型 + 词表：直接落到目标目录（只拉 int8 那两份，别把 937 MB 的 fp32 也拖下来）
+            dest = os.path.join(models_dir(), "sensevoice-onnx")
+            source_used = _snapshot(hf_id=entry["ref"], local_dir=dest,
+                                    allow=entry.get("allow") or None)
+            # Silero VAD 在另一个仓库（sherpa-onnx 的 vad 目录），单独拉一次。
+            # 失败**不让整次下载失败**：没有 VAD 仍能整段识别（只是长音频会差），
+            # 而"模型下好了却因为 VAD 下不动而报失败"更难查。
+            try:
+                _snapshot(hf_id="csukuangfj/vad", local_dir=os.path.join(dest, "_vad_tmp"),
+                          allow=["silero_vad.onnx"])
+                _src = os.path.join(dest, "_vad_tmp", "silero_vad.onnx")
+                if os.path.isfile(_src):
+                    import shutil as _sh
+                    _sh.move(_src, os.path.join(dest, "silero_vad.onnx"))
+                _tmp = os.path.join(dest, "_vad_tmp")
+                if os.path.isdir(_tmp):
+                    import shutil as _sh2
+                    _sh2.rmtree(_tmp, ignore_errors=True)
+            except Exception as e:
+                print(f"[modelinfo] Silero VAD 下载失败（长音频切段会缺失，可重试）: {e}")
         elif mid == "sherpa":
             # 只拉代码认的那几个文件名，直接落到目标目录（local_dir），省掉 400MB 的 fp32 与测试音频
             source_used = _snapshot(ms_id=entry.get("ms_ref") or "", hf_id=entry["ref"],

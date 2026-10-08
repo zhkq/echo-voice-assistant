@@ -423,12 +423,13 @@ def _transcribe_command(wav, cfg, prefer=""):
         backend_note = "后端没成（%s），回落本机；" % (be.get("detail") or be.get("status"))
         db.add_log("warn", "assistant",
                    "回顾转写走后端没成功，已回落本机：%s" % (be.get("detail") or be.get("status")))
-    engine = cfg.get("sttModel", "sensevoice")
-    stt_engine, stt_model = "whisper", engine
-    if engine == "sensevoice":
-        stt_engine = "sensevoice"
-    elif engine == "sherpa":
-        stt_engine = "sherpa"
+    engine = cfg.get("sttModel", "sensevoice-onnx")
+    # ⚠️ 这里以前是**手工 if/elif**，只认 sensevoice / sherpa，其余一律落到 whisper ——
+    # 于是 2026-10-08 把默认值改成 `sensevoice-onnx` 之后，**语音指令会被当成 whisper**
+    # （而 whisper 权重早就删了）→ 每次转写都失败，且报的是"engine=whisper"这种误导信息。
+    # 现在改成调**唯一权威**的映射函数 `stt.resolve_engine()`：新加引擎只需要在
+    # `stt.py` 里加一个分支，这里不会再漏。
+    stt_engine, stt_model = stt_mod.resolve_engine(engine)
     try:
         res = stt_mod.transcribe_ex(wav, engine=stt_engine, model=stt_model,
                                     lang=cfg.get("sttLanguage", "zh"),

@@ -178,7 +178,7 @@ esac
 
 engine_known() {
   case "$1" in
-    sherpa|whisper-tiny|whisper-base|whisper-small|whisper-medium|whisper-large-v3|sensevoice|qwen3asr)
+    sherpa|sensevoice-onnx|whisper-tiny|whisper-base|whisper-small|whisper-medium|whisper-large-v3|sensevoice|qwen3asr)
       return 0 ;;
     *) return 1 ;;
   esac
@@ -192,6 +192,8 @@ engine_pip() {
     # （whisper-* 顺带带 hf-hub、sensevoice/qwen3asr 顺带带 modelscope）。
     # 与 Windows 侧逐字对应，由 tests/test_install_entry.py 的 DownloadClientTests 守着。
     sherpa)   echo "sherpa-onnx modelscope" ;;
+    # 2026-10-08：指令转写的**默认**引擎。只要 sherpa-onnx（**不要 torch/funasr**）。
+    sensevoice-onnx) echo "sherpa-onnx modelscope" ;;
     whisper-tiny|whisper-base|whisper-small|whisper-medium|whisper-large-v3)
               echo "faster-whisper huggingface-hub" ;;
     sensevoice) echo "funasr modelscope torch" ;;
@@ -205,6 +207,7 @@ engine_pip() {
 engine_model() {
   case "$1" in
     sherpa)     echo "sherpa" ;;
+    sensevoice-onnx) echo "sensevoice-onnx" ;;
     whisper-*)  echo "$1" ;;
     sensevoice) echo "sensevoice" ;;
     qwen3asr)   echo "qwen3asr" ;;
@@ -215,6 +218,7 @@ engine_model() {
 engine_stt() {
   case "$1" in
     sherpa)           echo "sherpa" ;;
+    sensevoice-onnx)  echo "sensevoice-onnx" ;;
     whisper-tiny)     echo "tiny" ;;
     whisper-base)     echo "base" ;;
     whisper-small)    echo "small" ;;
@@ -231,6 +235,9 @@ engine_stt() {
 engine_module() {
   case "$1" in
     sherpa)     echo "sherpa_onnx" ;;
+    # 2026-10-08：指令转写的默认引擎。module 填 **sherpa_onnx**（不是 funasr）——
+    # 那条"不需要 torch"的取舍就落在这里，改错了会让客户端多装 2.9 GB。
+    sensevoice-onnx) echo "sherpa_onnx" ;;
     whisper-*)  echo "faster_whisper" ;;
     sensevoice) echo "funasr" ;;
     qwen3asr)   echo "qwen_asr" ;;

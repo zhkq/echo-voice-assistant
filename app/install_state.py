@@ -30,6 +30,10 @@ REPORT_SCHEMA = "echo-install-report/1"
 #: 这是**权威表**：`echo-install-components.ps1`、`echo-install-components.sh` 各有一份镜像，
 #: 由 `tests/test_install_entry.py` 断言三者一致（含与 app/audio/stt.py 的合法性对齐）。
 ENGINE_SPECS = {
+    # 2026-10-08：`sensevoice-onnx` 是**语音指令的默认引擎**。它的 `module` 填
+    # `sherpa_onnx` 而不是 funasr —— 这正是它的全部意义：**不需要 torch/funasr**，
+    # 复用已必装的 sherpa_onnx（唤醒也要它）。别改回 funasr，否则客户端要多装 2.9 GB。
+    "sensevoice-onnx":  {"module": "sherpa_onnx",     "model": "sensevoice-onnx",  "stt": "sensevoice-onnx", "label": "SenseVoice ONNX（默认）"},
     "sherpa":           {"module": "sherpa_onnx",     "model": "sherpa",           "stt": "sherpa",   "label": "sherpa-onnx 流式转写"},
     "whisper-tiny":     {"module": "faster_whisper",  "model": "whisper-tiny",     "stt": "tiny",     "label": "Whisper tiny"},
     "whisper-base":     {"module": "faster_whisper",  "model": "whisper-base",     "stt": "base",     "label": "Whisper base"},
