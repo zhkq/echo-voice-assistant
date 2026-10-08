@@ -87,6 +87,53 @@ class WhisperLandingTests(_ModelDirsCase):
                          str(self.ms_cache / "Systran--faster-whisper-small"))
 
 
+class EveryEntryHasAMeasuredPathTests(_ModelDirsCase):
+    """**每个目录型条目都必须量得到路径**（2026-10-08 测试机实测的 bug）。
+
+    现场：`/api/models` 里 `id=sensevoice-onnx` 的 `local_mb` **恒为 0**（`ready=True`），
+    而磁盘上明明有 **230.2 MB** —— 面板那张卡因此显示"占用 0 MB"，
+    和同页 sherpa 的"占用 189 MB"对不上，看起来像"模型没下全"。
+
+    根因：`_target_path()` 里**漏了 `sensevoice-onnx` 这一支**（`sensevoice` / `qwen3asr` /
+    `sherpa` / `pyannote` / `kws` / `whisper-*` 都有），于是 `_measure_paths()` 返回空列表。
+    形状与 `_PROBES` 漏登记**同一类**：判据表漏一项，界面就撒一个**不报错**的谎。
+
+    这条用例是**结构性**的：遍历整个目录型目录（CATALOG），逐个断言
+    `_measure_paths()` **非空** —— 以后新增引擎/模型条目忘了加那一支，这里当场红。
+    （`qwen3asr` 走 `_ms_dir` 也算在内：它在 ModelScope 缓存里，但也必须给出路径。）
+    """
+
+    def test_no_catalog_entry_measures_an_empty_path_list(self):
+        empty = []
+        for entry in modelinfo.CATALOG:
+            try:
+                paths = modelinfo._measure_paths(entry)
+            except Exception as e:                              # pragma: no cover
+                empty.append("%s（异常 %s）" % (entry.get("id"), e))
+                continue
+            if not paths:
+                empty.append(str(entry.get("id")))
+        self.assertEqual(empty, [],
+                         "这些条目的 _measure_paths() 是空的 → 面板会显示『占用 0 MB』：%s"
+                         % empty)
+
+    def test_sensevoice_onnx_points_at_its_real_directory(self):
+        """正对事故那条：它必须指向 `<models>/sensevoice-onnx`。"""
+        entry = modelinfo._by_id("sensevoice-onnx")
+        self.assertEqual(modelinfo._target_path(entry),
+                         os.path.join(str(self.models_root), "sensevoice-onnx"))
+
+    def test_local_mb_reflects_the_files_on_disk(self):
+        """文件放进去之后，`local_mb` 必须跟着变（而不是恒 0）。"""
+        d = Path(str(self.models_root)) / "sensevoice-onnx"
+        d.mkdir(parents=True)
+        (d / "model.int8.onnx").write_bytes(b"\0" * (2 * 1048576))
+        (d / "tokens.txt").write_bytes(b"\0" * (1 * 1048576))
+        row = [r for r in modelinfo.inventory() if r["id"] == "sensevoice-onnx"][0]
+        self.assertEqual(row["local_mb"], 3,
+                         "占用没跟上磁盘（事故那样恒为 0）：%s" % row)
+
+
 class CacheWeightsAreRequiredTests(_ModelDirsCase):
     """「目录在」不等于「装好了」：ModelScope 缓存里光有目录不算就绪。
 

@@ -367,6 +367,13 @@ def _target_path(entry):
         return _ms_dir("Qwen/Qwen3-ASR-0.6B")
     if i == "sherpa":
         return os.path.join(models_dir(), "sherpa-onnx-streaming")
+    if i == "sensevoice-onnx":
+        # ⚠️ 这一支**必须与 `sensevoice_onnx_files()` 用的是同一个目录**（2026-10-08 修）：
+        # 漏了它时 `_measure_paths()` 返回空 → `/api/models` 的 `local_mb` 恒为 **0**，
+        # 于是面板那张卡显示"占用 0 MB"，而磁盘上明明有 230 MB（与同页 sherpa 的
+        # "占用 189 MB" 对不上，看起来像"模型没下全"）。形状与 `_PROBES` 漏登记同一类：
+        # **判据表漏一项，界面就撒一个不报错的谎**。
+        return os.path.join(models_dir(), "sensevoice-onnx")
     if i == "pyannote":
         return os.path.join(models_dir(), "pyannote")
     if i == "kws":
