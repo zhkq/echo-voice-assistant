@@ -20,6 +20,8 @@ PAGE = os.path.join(ROOT, "web", "meeting.html")
 class SpeakerAggUiTests(unittest.TestCase):
     def setUp(self):
         self.html = io.open(PAGE, encoding="utf-8").read()
+        self.panel = io.open(os.path.join(ROOT, "web", "app.js"), encoding="utf-8").read()
+        self.css = io.open(os.path.join(ROOT, "web", "app.css"), encoding="utf-8").read()
 
     def test_block_sits_below_the_voiceprint_list(self):
         """位置判据（用户明确要求："放到声纹库列表下方"）。"""
@@ -57,6 +59,63 @@ class SpeakerAggUiTests(unittest.TestCase):
         m = re.search(r"agg/apply[^\n]*\n([^\n]*\n){0,4}", self.html)
         self.assertIsNotNone(m)
         self.assertIn("name", m.group(0))
+
+
+class PanelVoiceprintAggEntryTests(unittest.TestCase):
+    """**设置 → 声纹库**里也要有聚合建议的入口（2026-10-08 用户要求）。
+
+    为什么要单独钉：这一块是"不用先开一场会议就能认人"的唯一入口。
+    认证件面（开会话/试听/入库）与会议页那块**共用同一批端点**，
+    所以判据要落在"面板真的接上了"而不是"又写了一份"。
+    """
+
+    def setUp(self):
+        self.panel = io.open(os.path.join(ROOT, "web", "app.js"), encoding="utf-8").read()
+        self.css = io.open(os.path.join(ROOT, "web", "app.css"), encoding="utf-8").read()
+
+    def test_voiceprint_card_appends_the_agg_block(self):
+        """声纹卡渲染时要把聚合块拼在**声纹库列表之后**。"""
+        body = self.panel[self.panel.find("function renderVoiceprintCard()"):]
+        body = body[:body.find("\n}\n") + 3]
+        i_list = body.find("vp-list")
+        i_agg = body.find("renderVpAggBlock()")
+        self.assertGreater(i_agg, -1, "声纹卡没有拼上聚合块（renderVpAggBlock）")
+        self.assertGreater(i_agg, i_list, "聚合块必须在声纹库列表**之后**（用户指定位置）")
+
+    def test_uses_the_three_endpoints(self):
+        for ep in ("/api/speakers/agg/suggestions", "/api/speakers/agg/audition",
+                   "/api/speakers/agg/apply"):
+            self.assertIn(ep, self.panel, "面板没接上 %s" % ep)
+
+    def test_has_audition_and_merge_controls(self):
+        for attr in ("data-vpagg-play", "data-vpagg-do", "data-vpagg-refresh",
+                     "data-vpagg-name"):
+            self.assertIn(attr, self.panel, "面板缺控件 %s" % attr)
+
+    def test_caps_at_three_in_the_panel_too(self):
+        self.assertRegex(self.panel, r"items\s*\|\|\s*\[\]\)\.slice\(0,\s*3\)",
+                         "设置里那块没有把建议限制在 3 条")
+
+    def test_loaded_when_settings_opens(self):
+        """打开设置页时要一起拉 —— 否则那一块永远显示"读取中…"。"""
+        i = self.panel.find('if (view === "settings")')
+        self.assertGreater(i, -1)
+        seg = self.panel[i:i + 700]
+        self.assertIn("loadVoiceprints()", seg)
+        self.assertIn("loadVpAgg()", seg, "打开设置页没有触发聚合建议加载")
+
+    def test_has_its_own_css(self):
+        """观感要有（否则密集列表里是一坨没样式的文字）。"""
+        for cls in (".agg-block", ".agg-item", ".agg-chip", ".agg-apply"):
+            self.assertIn(cls, self.css, "app.css 缺样式 %s" % cls)
+
+    def test_merge_warns_before_merging(self):
+        """并错=把两个人当成一个，且会改名入库 —— 必须先确认。"""
+        # 要找的是**处理分支**（`t.dataset.vpaggDo`），不是模板里那个 attribute ——
+        # 先命中模板的话，判据就退化成"按钮画出来了"，管不到"点下去会不会先问"。
+        i = self.panel.find("t.dataset.vpaggDo")
+        self.assertGreater(i, -1, "找不到合并按钮的处理分支")
+        self.assertIn("confirm(", self.panel[i:i + 1500], "设置里合并前没有二次确认")
 
 
 if __name__ == "__main__":

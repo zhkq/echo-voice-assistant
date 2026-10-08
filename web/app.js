@@ -211,6 +211,9 @@ function switchView(name) {
     // 「设置」= 原「通用」+「能力与智能体」+ 高级那几组：一次把要用的都拉齐（切页不重拉）。
     loadSettings(); loadBoot(); loadBootLogs(); loadWizard(); loadCapabilities(); loadRouter();
     loadVoiceprints();
+    // 聚合建议与声纹库**同一张卡**（列表下方）：分开拉是为了让"库"先出现、
+    // 建议那条（要算相似度、可能慢一点）后补上，而不是整张卡一起等。
+    loadVpAgg();
   }
   if (view === "business") {
     loadSettings(); loadQueueCard();
@@ -3787,7 +3790,10 @@ function renderMeetingServiceCard() {
 // 声纹库这一块**自己的**模块级缓存（能力卡那边另有一个**函数级** `_vpCache`，别混用：
 // 本文件第 2 行是 "use strict"，未声明就赋值会当场 ReferenceError）。
 let _vpLibCache = null;
-let _vpAudio = null;              // 正在播的那个 audio（换一条就停掉上一条）              // 正在播的那个 audio（换一条就停掉上一条）
+let _vpAudio = null;              // 正在播的那个 audio（换一条就停掉上一条）
+//: 聚合建议的缓存（设置 → 声纹库 下方那一块；与会议详情页那块同一批端点）
+let _vpAggCache = null;
+let _vpAggAudio = null;
 
 function _vpWhen(s) { return String(s || "").replace("T", " ").slice(0, 16); }
 
@@ -3805,20 +3811,66 @@ function renderVoiceprintCard() {
   }
   if (!items.length) {
     out.push(`<div class="snote info"><span>ⓘ</span><span>库还空着：在会议详情的「说话人管理」里点「声纹入库」，`
-      + `或打开上面的「改名即入库」后直接改名。</span></div>`);
+      + `或打开上面的「改名即入库」后直接改名。下面是<b>聚合建议</b>，那里能一次给好几场里的同一个人命名。</span></div>`);
+  } else {
+    out.push(`<div class="vp-list">` + items.map((it) => {
+      const samples = (it.samples || []).map((sm) => `<div class="vp-row">
+        <span class="vp-meta" title="来源会议 · 入库时间">${esc(sm.meeting_name || "—")} · ${esc(_vpWhen(sm.created_at))}</span>
+        <span class="spacer"></span>
+        <button class="btn mini" data-vp-play="${sm.id}" title="播源会议里这个说话人的那一段">试听</button>
+        <button class="btn mini" data-vp-del="${sm.id}">删除</button>
+        <span class="muted vp-msg" data-vp-msg="${sm.id}"></span></div>`).join("");
+      return `<div class="vp-item"><div class="vp-head"><b>${esc(it.name)}</b>
+        <span class="muted">${it.count} 条</span><span class="spacer"></span>
+        <button class="btn mini" data-vp-delname="${esc(it.name)}">删掉这个人</button></div>${samples}</div>`;
+    }).join("") + `</div>`);
+  }
+  // 声纹库列表**下方**：跨会议聚合建议（2026-10-07 用户要求在设置里也开一个入口）。
+  // 与会议详情页那一块**同一批端点**（/api/speakers/agg/*），只是这里不需要先开一场会议。
+  out.push(renderVpAggBlock());
+  return out.join("");
+}
+
+/** 设置 → 声纹库 里那一块「说话人聚合建议」（列表下方）。 */
+function renderVpAggBlock() {
+  const a = _vpAggCache;
+  const out = [];
+  out.push(`<div class="agg-block">
+    <div class="agg-head"><b>说话人聚合建议</b>
+      <span class="muted" id="vpAggMeta">${a ? `${(a.items || []).length} 条建议 · 阈值 ${a.threshold}` : "读取中…"}</span>
+      <span class="spacer"></span>
+      <button class="btn mini" data-vpagg-refresh="1" title="重新计算（相似度按声纹匹配阈值）">重新计算</button></div>
+    <div class="agg-tip">这些是<b>很可能是同一个人</b>的说话人（跨会议、或同一场被切成两簇）。
+      先<b>试听</b>确认，填上姓名再点「合并并入库」：会把这几处统一改名并存入上面的声纹库。
+      <b>不确认就别并</b> —— 并错了会把两个人当成一个人。</div>`);
+  if (!a) {
+    out.push(`<div class="muted" style="font-size:11px">计算中…</div></div>`);
     return out.join("");
   }
-  out.push(`<div class="vp-list">` + items.map((it) => {
-    const samples = (it.samples || []).map((sm) => `<div class="vp-row">
-      <span class="vp-meta" title="来源会议 · 入库时间">${esc(sm.meeting_name || "—")} · ${esc(_vpWhen(sm.created_at))}</span>
-      <span class="spacer"></span>
-      <button class="btn mini" data-vp-play="${sm.id}" title="播源会议里这个说话人的那一段">试听</button>
-      <button class="btn mini" data-vp-del="${sm.id}">删除</button>
-      <span class="muted vp-msg" data-vp-msg="${sm.id}"></span></div>`).join("");
-    return `<div class="vp-item"><div class="vp-head"><b>${esc(it.name)}</b>
-      <span class="muted">${it.count} 条</span><span class="spacer"></span>
-      <button class="btn mini" data-vp-delname="${esc(it.name)}">删掉这个人</button></div>${samples}</div>`;
-  }).join("") + `</div>`);
+  if (a.error) {
+    out.push(`<div class="snote warn"><span>⚠</span><span>聚合建议读不到：${esc(a.error)}</span></div></div>`);
+    return out.join("");
+  }
+  const items = (a.items || []).slice(0, 3);      // 建议 1–3 条（用户要求）
+  if (!items.length) {
+    out.push(`<div class="muted" style="font-size:11px">暂时没有可聚合的：`
+      + `要么每场都只有一个人，要么都已经认过人了。</div></div>`);
+    return out.join("");
+  }
+  out.push(items.map((it) => `<div class="agg-item" data-aggid="${esc(it.id)}">
+    <div class="agg-members">
+      ${it.members.map((m) => `<span class="agg-chip">
+        <span class="agg-src" title="${esc(m.meetingName)}">${esc(m.meetingName)}</span>
+        <b>${esc(m.label)}</b><span class="agg-seg">${m.segments} 段</span>
+        <button class="btn mini" data-vpagg-play="${m.meetingId}:${esc(m.label)}"
+                title="听一下这个人">试听</button></span>`).join("")}
+      <span class="agg-sim">相似度 ${it.best}</span>
+    </div>
+    <div class="agg-apply">
+      <input class="input" data-vpagg-name placeholder="填联系人姓名（如 张总）">
+      <button class="btn mini" data-vpagg-do="${esc(it.id)}">合并并入库</button>
+      <span class="agg-msg" data-vpagg-msg="${esc(it.id)}"></span>
+    </div></div>`).join("") + `</div>`);
   return out.join("");
 }
 
@@ -3828,6 +3880,39 @@ async function loadVoiceprints() {
   catch (e) { _vpLibCache = { items: [], total: 0, error: String((e && e.message) || e) }; }
   const host = $("#setCard-vp .card-body");
   if (host) host.innerHTML = renderVoiceprintCard();
+}
+
+/** 拉聚合建议（设置 → 声纹库 下方那一块）。失败**不静默**：那是"要不要认人"的入口。 */
+async function loadVpAgg() {
+  try { _vpAggCache = await api("/api/speakers/agg/suggestions?limit=3"); }
+  catch (e) { _vpAggCache = { items: [], total: 0, error: String((e && e.message) || e) }; }
+  const host = $("#setCard-vp .card-body");
+  if (host) host.innerHTML = renderVoiceprintCard();
+}
+
+function _vpAggMsg(id, text) {
+  const el = document.querySelector(`[data-vpagg-msg="${id}"]`);
+  if (el) el.textContent = text || "";
+}
+
+/** 聚合建议里的试听：**按会议+标签**取（那个人可能还没入库）。 */
+async function _vpAggPlay(mid, label) {
+  try {
+    const res = await fetch(`/api/speakers/agg/audition?meeting_id=${encodeURIComponent(mid)}`
+      + `&label=${encodeURIComponent(label)}`);
+    const type = res.headers.get("content-type") || "";
+    if (type.includes("application/json")) {
+      const j = await res.json();
+      toast(j.reason || "这一段听不了（源音频可能已清理）");
+      return;
+    }
+    const url = URL.createObjectURL(await res.blob());
+    if (_vpAggAudio) { _vpAggAudio.pause(); URL.revokeObjectURL(_vpAggAudio.src); }
+    _vpAggAudio = new Audio(url);
+    _vpAggAudio.addEventListener("ended", () => URL.revokeObjectURL(url));
+    await _vpAggAudio.play();
+    toast(`试听 ${label}…`);
+  } catch (e) { toast("播放失败：" + String((e && e.message) || e)); }
 }
 
 function _vpMsg(id, text) {
@@ -3856,10 +3941,53 @@ async function _vpPlay(id) {
 }
 
 document.addEventListener("click", async (e) => {
-  const t = e.target.closest("[data-vp-play],[data-vp-del],[data-vp-delname],[data-vp-refresh]");
+  const t = e.target.closest("[data-vp-play],[data-vp-del],[data-vp-delname],[data-vp-refresh],"
+    + "[data-vpagg-refresh],[data-vpagg-play],[data-vpagg-do]");
   if (!t) return;
   if (t.dataset.vpPlay) { await _vpPlay(Number(t.dataset.vpPlay)); return; }
   if (t.dataset.vpRefresh) { await loadVoiceprints(); return; }
+  // ---- 聚合建议（设置 → 声纹库 下方那一块）----
+  if (t.dataset.vpaggRefresh) {
+    const meta = $("#vpAggMeta");
+    if (meta) meta.textContent = "计算中…";
+    await loadVpAgg();
+    return;
+  }
+  if (t.dataset.vpaggPlay) {
+    const [mid, label] = String(t.dataset.vpaggPlay).split(":");
+    await _vpAggPlay(mid, label);
+    return;
+  }
+  if (t.dataset.vpaggDo) {
+    const id = t.dataset.vpaggDo;
+    const item = ((_vpAggCache || {}).items || []).find((x) => x.id === id);
+    if (!item) return;
+    const inp = document.querySelector(`.agg-item[data-aggid="${id}"] [data-vpagg-name]`);
+    const name = ((inp && inp.value) || "").trim();
+    if (!name) { toast("先填联系人姓名再合并"); return; }
+    if (!confirm(`把这几处并成「${name}」并存入声纹库？\n（会在各自会议里改名，可用「删掉这个人」撤销）`)) return;
+    _vpAggMsg(id, "合并中…");
+    try {
+      const r = await api("/api/speakers/agg/apply", {
+        method: "POST",
+        body: JSON.stringify({
+          members: item.members.map((m) => ({ meetingId: m.meetingId, label: m.label })),
+          name,
+        }),
+      });
+      toast(r.message || (r.ok ? "已合并入库" : "没成功"));
+      if (r.ok) {
+        // 入了库 → 上面那张声纹库列表要跟着变；建议里那条也该消失（它已经被认人了）
+        _vpLibCache = null;
+        await loadVoiceprints();     // 内部会把聚合块一起重画
+      } else {
+        _vpAggMsg(id, r.message || "失败");
+      }
+    } catch (err) {
+      _vpAggMsg(id, "失败：" + String((err && err.message) || err));
+    }
+    return;
+  }
   if (t.dataset.vpDel) {
     if (!confirm("删除这条声纹样本？（只删本机库里的模板，不影响会议记录）")) return;
     const r = await api(`/api/voiceprints/${Number(t.dataset.vpDel)}`, { method: "DELETE" });

@@ -1214,6 +1214,25 @@ body.on-history { height: 100vh; overflow-y: hidden; }
     white-space: nowrap; min-width: 0; }
   .vp-msg { font-size: 11px; }
 
+  /* 说话人聚合建议（设置 → 声纹库 下方；会议详情页那一块同一套观感） */
+  .agg-block { margin-top: 10px; border-top: 1px solid var(--border); padding-top: 8px; }
+  .agg-head { display: flex; align-items: center; gap: 6px; font-size: 12px; margin-bottom: 4px; }
+  .agg-head .spacer { flex: 1; }
+  .agg-tip { font-size: 11px; color: var(--muted); line-height: 1.6; margin-bottom: 6px; }
+  .agg-item { border: 1px solid var(--border); border-radius: 6px; padding: 6px;
+    margin-bottom: 6px; min-width: 0; }
+  .agg-members { display: flex; flex-wrap: wrap; align-items: center; gap: 5px;
+    margin-bottom: 5px; font-size: 12px; }
+  .agg-chip { display: inline-flex; align-items: center; gap: 4px;
+    background: rgba(127, 127, 127, .10); border-radius: 5px; padding: 1px 5px; min-width: 0; }
+  .agg-src { color: var(--muted); max-width: 150px; overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap; }
+  .agg-seg { color: var(--muted); font-size: 11px; }
+  .agg-sim { margin-left: auto; color: var(--muted); font-size: 11px; }
+  .agg-apply { display: flex; gap: 6px; align-items: center; }
+  .agg-apply .input { flex: 1; min-width: 0; }
+  .agg-msg { font-size: 11px; color: var(--muted); }
+
   
   /* 仪表盘底部状态条（2026-10-02 用户口径：**底部一个细条**）
      用**网格**而不是 flex：`.dashboard-grid .card` 那边有一堆 `display:flex; flex-direction:column`
