@@ -406,7 +406,13 @@ class ReviewUsesTheMeetingEngineTests(unittest.TestCase):
                          "local")
 
     def test_unknown_values_fall_back_to_the_backend(self):
-        """空值/写错的值都按默认（后端）—— 别因为一个笔误悄悄退回低质量那条路。"""
+        """空值/写错的值都按"后端"处理。
+
+        为什么未知值走**后端**而不是本机（2026-10-08 默认值改成 `local` 时复核过）：
+        这一支只处理"值本身没法解读"，而"设为空"最可能是用户把设置清掉了 ——
+        那时**保持与历史一致的保守行为**（后端 = 与会议同引擎）比按本机跑更安全；
+        真正的默认值来自 `config.py` / 库里的 `local`，不经过这一支。
+        """
         for bad in ("", "whatever", None):
             with self.subTest(v=bad):
                 self.assertEqual(self.assistant.review_stt_prefer({"dailyReviewSttBackend": bad}),
