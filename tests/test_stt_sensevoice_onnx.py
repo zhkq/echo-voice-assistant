@@ -114,6 +114,48 @@ class VadSegmentationTests(unittest.TestCase):
 
 
 class CatalogAndDeliveryTests(unittest.TestCase):
+    def test_every_catalog_entry_has_a_readiness_probe(self):
+        """**每个目录条目都要能拿到就绪判据** —— 漏了会表现成"文件明明在、面板说没就位"。
+
+        2026-10-08 部署到稳定版当天就踩了：`_PROBES` 里没有 `sensevoice-onnx`，
+        面板报 `ready=False / local_mb=0 / 模型文件还没就位`，而三份文件都在
+        `D:\\ECHO\\models\\sensevoice-onnx` —— 用户会去白重下那 228 MB。
+        "判据没登记"与"模型真缺失"在界面上长得一模一样，只能靠这条守卫兜住。
+
+        ⚠️ 判据钉在 **`_probe_for(entry)`**（真正的分派点）上，不是 `_PROBES`：
+        `_PROBES` 查不到时它还有 whisper 那条按档位拼的兜底，只看 `_PROBES`
+        会把 whisper 各档误报成"没有判据"。
+        """
+        bad = []
+        for e in modelinfo.CATALOG:
+            p = modelinfo._probe_for(e)
+            if not callable(p):
+                bad.append(e.get("id"))
+        self.assertEqual(bad, [],
+                         "这些模型条目拿不到就绪判据（面板会把它们报成未就位）：%s" % bad)
+
+    def test_the_onnx_entry_is_reachable_through_the_real_dispatch(self):
+        """新条目要能从**真实分派点**走到它的判据上（而不是只存在于某张表里）。"""
+        e = {x.get("id"): x for x in modelinfo.CATALOG}.get("sensevoice-onnx")
+        self.assertIsNotNone(e)
+        self.assertTrue(modelinfo._probe_for(e) is modelinfo._ready_sensevoice_onnx,
+                        "sensevoice-onnx 没有接到它自己的就绪判据上")
+
+    def test_the_probe_does_not_require_torch(self):
+        """ONNX 版的就绪判据**不许**依赖 torch/funasr —— 那正是它存在的理由。
+
+        用**行为**验，不用读源码（源码里 docstring 提到 torch 会被误判）：
+        把 torch/funasr 的可用性打桩掉，判据仍应为 True。
+        """
+        with patch.object(modelinfo, "_pkg_available",
+                          lambda name: name == "sherpa_onnx"), \
+                patch.object(modelinfo, "_ready_sensevoice", lambda: False), \
+                patch("app.audio.stt.sensevoice_onnx_files",
+                      lambda: ("m.onnx", "tokens.txt", "vad.onnx")):
+            self.assertTrue(modelinfo._ready_sensevoice_onnx(),
+                            "torch/funasr 缺失时 ONNX 版仍应判就绪 ——"
+                            " 这句红了说明判据里混进了 torch/funasr 依赖")
+
     def test_catalog_entry_exists_with_the_three_files(self):
         entries = {e.get("id"): e for e in modelinfo.CATALOG}
         e = entries.get("sensevoice-onnx")

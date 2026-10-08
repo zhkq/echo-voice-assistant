@@ -134,6 +134,22 @@ def _ready_sensevoice():
             and _pkg_available("funasr") and _pkg_available("torch"))
 
 
+def _ready_sensevoice_onnx():
+    """int8 ONNX 版 SenseVoice 的就绪判据（2026-10-08 起的默认引擎）。
+
+    判据 = **三份文件齐全** + `sherpa_onnx` 这个包在：
+      * 模型/词表缺 → 根本加载不了；
+      * **Silero VAD 也要求**（长音频没它会退化成"整段识别"，10 分钟只出几个字）；
+      * 包不在 → 加载时 ModuleNotFoundError（2026-09-23 那次"模型齐全、面板却说已就绪、
+        每次指令都静默失败"就是同一个病，别再犯）。
+
+    ⚠️ 这里**刻意不查 torch/funasr** —— 那正是选 ONNX 版的意义（免 torch）。
+    哪天有人把判据写成 `_pkg_available("funasr")`，默认档的机器会全部变成"未就绪"。
+    """
+    from app.audio import stt as _stt
+    return bool(_stt.sensevoice_onnx_files()) and _pkg_available("sherpa_onnx")
+
+
 def _whisper_hub_dir(name):
     """HF 缓存目录（面板点下载落这里；stt 按名字加载时也读这个缓存）。"""
     return os.path.join(models_dir(), "hub", f"models--Systran--faster-whisper-{name}")
@@ -331,6 +347,10 @@ CATALOG += [
 
 _PROBES = {
     "sensevoice": _ready_sensevoice,
+    # 2026-10-08：默认引擎。**漏了这一条**会让面板报「模型文件还没就位 / local_mb=0」，
+    # 而文件明明在（部署到稳定版当天就踩了）——"就绪判据没登记"与"模型真缺失"
+    # 在面板上长得一模一样，用户会去重下那 228 MB。
+    "sensevoice-onnx": _ready_sensevoice_onnx,
     "qwen3asr": lambda: _ready_qwen("Qwen/Qwen3-ASR-0.6B") and _ready_qwen("Qwen/Qwen3-ForcedAligner-0.6B"),
     "sherpa": _ready_sherpa,
     "pyannote": ready_pyannote,
