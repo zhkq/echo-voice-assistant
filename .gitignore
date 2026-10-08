@@ -83,3 +83,6 @@ __probe__/
 # 它不是 ECHO 的东西（ECHO 只用 **用户家目录** 下的 ~/.workbuddy 找 node），忽略掉即可。
 .workbuddy/
 
+# Superseded delivery packs (multi-GB zips kept locally for reference, never in git).
+_old-packs/
+
