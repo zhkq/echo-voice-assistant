@@ -94,23 +94,36 @@ class PackError(RuntimeError):
 # ---------------------------------------------------------------- 服务器配置模板
 
 def render_server_yaml(port: int = 8900, admin_port: int = 8901,
-                       root: str = "{ECHO_BASE}/backend") -> str:
-    """扩展包的 `server.yaml` 模板：**只绑回环** + 本机自配对（与容器档同一套口径）。
+                       root: str = "{ECHO_BASE}/backend",
+                       bind_host: str = "127.0.0.1") -> str:
+    """扩展包的 `server.yaml` 模板：出厂**只绑回环** + 本机自配对。
 
-    占位符只有 `{ROOT}`（安装脚本把它替换成实际落点）——**不在这里生成 jwt_secret**：
-    那是"起本机后端"那一步的活（`app/backend_setup.ensure_secret()`：已有的一律沿用，
-    绝不重生成），在出包时就写死一份会在所有人之间**共用同一个密钥**。
+    占位符（安装脚本替换）：
+      * `{ROOT}`        → 实际落点
+      * `{LISTEN_HOST}` → 能力面的监听地址；安装脚本按 `--listen` 或默认 `127.0.0.1` 替换
+
+    **2026-10-08 修**：原来这里把 `listen` 写死成 `127.0.0.1` —— 而客户端那条路
+    （`app/backend_setup.render_config()`）是认设置 `capabilityBackendListen` 的
+    （`0.0.0.0` = 局域网可连）。于是同一个概念两条路两种行为：**用户把局域网打开之后，
+    只要重装一次扩展包，安装脚本用这份模板重新生成 yaml，局域网就被关回去了**
+    （同事实测"局域网访问丢了"就是这个）。
+
+    ⚠️ **不写 `advertised_host`**：客户端那条路只在"有 LAN/隧道"时才加这一句
+    （见 `app/backend_setup.render_config()` 的说明）。在模板里写死
+    `advertised_host: 127.0.0.1` 会在局域网形态下**对外公布回环地址**，
+    别的机器据此配对必然连不上 —— 那正是该注释要避免的第二个坑。
     """
     return "\n".join([
         "# ECHO 能力后端（扩展包形态）—— 安装脚本会把这份模板落到 {ROOT}/server.yaml。",
-        "# 只服务本机：两个地址都只听回环；同机配对走后端自己写的 local-pair.json。",
+        "# 出厂只服务本机（能力面听回环）；要让局域网可连，在面板里改「本机后端监听在哪个地址」，",
+        "# 或把下面 listen 的地址改成全网卡通配地址后重启后端。",
+        "# 同机配对走后端自己写的 local-pair.json。",
         "# jwt_secret 由客户端的「起本机后端」在那台机器上生成并**持久沿用**（不在这里写死）。",
         "server:",
-        "  listen: \"127.0.0.1:%d\"" % int(port),
+        "  listen: \"%s:%d\"" % (bind_host or "127.0.0.1", int(port)),
         "  admin_listen: \"127.0.0.1:%d\"" % int(admin_port),
         "  state_root: \"%s/state\"" % root,
         "  local_pair: true",
-        "  advertised_host: \"127.0.0.1\"",
         "tmp:",
         "  root: \"%s/tmp\"" % root,
         "models:",
@@ -127,8 +140,8 @@ def render_server_yaml(port: int = 8900, admin_port: int = 8901,
 
 
 INSTALL_PS1 = r"""# ECHO 扩展包安装（Windows / PowerShell）。
-# 把这份包的内容拷到 {ROOT}，并生成 server.yaml（只绑回环）。
-param([string]$Root = "", [string]$ModelsRoot = "")
+# 把这份包的内容拷到 {ROOT}；server.yaml **只在没有时才生成**（已有的一律保留）。
+param([string]$Root = "", [string]$ModelsRoot = "", [string]$Listen = "")
 $ErrorActionPreference = "Stop"
 $src = Split-Path -Parent $PSScriptRoot
 if (-not $Root) { $Root = Join-Path (Split-Path -Parent $src) "backend" }
@@ -138,25 +151,45 @@ foreach ($d in @("app", "server", "runtime", "wheels", "scripts")) {
   $from = Join-Path $src $d
   if (Test-Path $from) { Copy-Item -Recurse -Force $from (Join-Path $Root $d) }
 }
-$tmpl = Get-Content -Raw (Join-Path $src "server.yaml.tmpl")
-$tmpl = $tmpl.Replace("{ROOT}", $Root).Replace("{MODELS_ROOT}", $ModelsRoot)
-Set-Content -Encoding UTF8 -Path (Join-Path $Root "server.yaml") -Value $tmpl
+$yaml = Join-Path $Root "server.yaml"
+if (Test-Path $yaml) {
+  # ⚠️ **不覆盖已有配置**（2026-10-08 修）。原来每次都从模板重新生成 ——
+  # 用户手工/从面板把 listen 改成 0.0.0.0（局域网可连）或改了模型路径，
+  # **重装一次就全被抹掉**，而表现是"局域网访问丢了"（同事实测）。
+  Write-Host "server.yaml 已存在，保留不动：$yaml" -ForegroundColor Yellow
+} else {
+  if (-not $Listen) { $Listen = "127.0.0.1" }
+  $tmpl = Get-Content -Raw (Join-Path $src "server.yaml.tmpl")
+  $tmpl = $tmpl.Replace("{ROOT}", $Root).Replace("{MODELS_ROOT}", $ModelsRoot).
+                Replace("{LISTEN_HOST}", $Listen)
+  Set-Content -Encoding UTF8 -Path $yaml -Value $tmpl
+  Write-Host "已生成 server.yaml（listen=$Listen）" -ForegroundColor Green
+}
 Write-Host "已装到 $Root" -ForegroundColor Green
 Write-Host "下一步：回到 ECHO 面板「能力」页签点「起本机后端」（或「就绪自测」）。"
 """
 
 INSTALL_SH = r"""#!/bin/sh
 # ECHO 扩展包安装（Linux / macOS）。
+# server.yaml **只在没有时才生成**（已有的一律保留）。
 set -e
 src="$(cd "$(dirname "$0")/.." && pwd)"
 root="${1:-$(dirname "$(dirname "$src")")/backend}"
 models="${2:-$(dirname "$(dirname "$src")")/models}"
+listen="${3:-127.0.0.1}"
 mkdir -p "$root"
 for d in app server runtime wheels scripts; do
   [ -e "$src/$d" ] && cp -R "$src/$d" "$root/"
 done
-sed -e "s#{ROOT}#$root#g" -e "s#{MODELS_ROOT}#$models#g" \
-    "$src/server.yaml.tmpl" > "$root/server.yaml"
+if [ -f "$root/server.yaml" ]; then
+  # ⚠️ 不覆盖已有配置（理由同 Windows 侧：重装会抹掉用户的 listen / 模型路径）
+  echo "server.yaml 已存在，保留不动：$root/server.yaml"
+else
+  sed -e "s#{ROOT}#$root#g" -e "s#{MODELS_ROOT}#$models#g" \
+      -e "s#{LISTEN_HOST}#$listen#g" \
+      "$src/server.yaml.tmpl" > "$root/server.yaml"
+  echo "已生成 server.yaml（listen=$listen）"
+fi
 echo "已装到 $root"
 echo "下一步：回到 ECHO 面板「能力」页签点「起本机后端」（或「就绪自测」）。"
 """
@@ -360,7 +393,8 @@ def abi_check(runtime_from: str) -> Dict[str, object]:
 def stage(out_dir: str, *, variant: str = "", runtime_from: str = "",
           wheels_from: str = "", models_from: str = "", port: int = 8900,
           admin_port: int = 8901, stamp: str = "",
-          python_from: str = "") -> Tuple[str, str, Dict[str, object]]:
+          python_from: str = "", listen_host: str = "127.0.0.1",
+          ) -> Tuple[str, str, Dict[str, object]]:
     """组出扩展包 → ``(kit_dir, zip_path, info)``。
 
     **默认出薄包**（用户 2026-09-30 拍板："默认 = 薄包 + 国内可下载"）：
@@ -438,7 +472,8 @@ def stage(out_dir: str, *, variant: str = "", runtime_from: str = "",
             print("      [i] 从包里真 import 过：%s" % "、".join(checked))
 
     with open(os.path.join(kit_dir, YAML_TMPL), "w", encoding="utf-8") as fh:
-        fh.write(render_server_yaml(port=port, admin_port=admin_port))
+        fh.write(render_server_yaml(port=port, admin_port=admin_port,
+                                    bind_host=listen_host))
     scripts = os.path.join(kit_dir, SCRIPTS_DIR)
     os.makedirs(scripts, exist_ok=True)
     with open(os.path.join(scripts, "install-windows.ps1"), "w", encoding="utf-8") as fh:
@@ -551,6 +586,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--port", type=int, default=8900)
     ap.add_argument("--admin-port", type=int, default=8901)
     ap.add_argument("--stamp", default="")
+    #: 包内模板 `listen:` 用的地址（出厂 127.0.0.1；要给局域网用就传 0.0.0.0）。
+    #: ⚠️ 安装脚本**只在 server.yaml 不存在时**才用它 —— 已有配置一律保留，
+    #: 所以这个参数不会覆盖目标机上用户已经调好的配置。
+    ap.add_argument("--listen", default="127.0.0.1",
+                    help="包内 server.yaml 的监听地址（默认 127.0.0.1；局域网用 0.0.0.0）")
     args = ap.parse_args(argv)
     try:
         kit_dir, zip_path, info = stage(args.out, variant=args.variant,
@@ -558,7 +598,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                                         wheels_from=args.wheels_from,
                                         models_from=args.models_from,
                                         port=args.port, admin_port=args.admin_port,
-                                        stamp=args.stamp, python_from=args.python_from)
+                                        stamp=args.stamp, python_from=args.python_from,
+                                        listen_host=args.listen)
     except PackError as e:
         print("[x] %s" % e, file=sys.stderr)
         return 2

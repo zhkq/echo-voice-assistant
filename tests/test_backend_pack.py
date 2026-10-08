@@ -183,6 +183,35 @@ class PortablePackTests(_Case):
         # **不在这里写死 jwt_secret**（那会让所有人共用同一把密钥）
         self.assertIn('jwt_secret: ""', text)
 
+    def test_the_template_can_bind_all_interfaces_when_asked(self):
+        """`--listen` 能显式改成全网卡地址（2026-10-08）。
+
+        为什么要有这条：原来模板把 `listen` **写死**成回环，而客户端那条路
+        （`app/backend_setup.render_config()`）认设置 `capabilityBackendListen`
+        —— 于是"用户在面板上把局域网打开"之后，**只要重装一次扩展包，
+        安装脚本用模板重新生成 yaml，局域网就被关回去了**（同事实测）。
+
+        出厂仍只绑回环（上面那条守门用例盯着）；这一条钉的是"显式要求时必须能改"。
+        """
+        text = portable.render_server_yaml(port=8900, admin_port=8901, root="{ROOT}",
+                                           bind_host="0.0.0.0")
+        self.assertIn('listen: "0.0.0.0:8900"', text)
+        # 运维面**永远**只绑回环（改一处不改另一处 = 管理面对网段开着）
+        self.assertIn('admin_listen: "127.0.0.1:8901"', text)
+
+    def test_the_installer_never_overwrites_an_existing_server_yaml(self):
+        """安装脚本**不许覆盖已有的 server.yaml**（否则重装就把用户的配置抹了）。
+
+        这是"局域网访问丢了"的另一半：即使模板对了，只要安装脚本每次都覆盖，
+        用户的 listen / 模型路径照样丢。判据落在**两个平台**的安装脚本里。
+        """
+        for name, body in (("install-windows.ps1", portable.INSTALL_PS1),
+                           ("install-posix.sh", portable.INSTALL_SH)):
+            self.assertIn("server.yaml", body, name)
+            has_branch = ("Test-Path $yaml" in body) or ("-f \"$root/server.yaml\"" in body)
+            self.assertTrue(has_branch, "%s 没有『已存在就保留』的分支" % name)
+            self.assertIn("保留不动", body, "%s 保留了但没有如实告知用户" % name)
+
     def test_verify_lists_what_is_missing(self):
         kit_dir, _zip, _info = self._stage()
         os.remove(os.path.join(kit_dir, portable.READ_ME))
