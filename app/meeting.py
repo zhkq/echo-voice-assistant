@@ -2347,10 +2347,41 @@ def _summary_session(client, meeting_id):
     row = db.get_meeting_session(meeting_id, agent=getattr(client, "name", ""))
     if row and row.get("session_id"):
         sid = row["session_id"]
-        with _MEETING_SESSIONS_LOCK:
-            _MEETING_SESSIONS[meeting_id] = sid
-        db.touch_meeting_session(meeting_id)
-        return sid
+        # ⚠️ **路径接缝校验**（2026-10-08 真实事故）：注册在库里的会话，它的 cwd
+        # 可能**已经不等于**当前配置的会议工作区了 —— 场景有两类，都会发生：
+        #   ① 用户改了「会议文件目录」；
+        #   ② 有人用**另一棵树**的代码 + 这棵树的数据根跑了一次（我自己就这么踩的：
+        #      dev 代码算出 `C:\echo-dev\data\meetings`，于是会话被建到 dev 目录，
+        #      而库里那条注册被**改写**成那个会话）。
+        # 原来这里直接 `return sid`，于是**错的工作区会被永远复用**，用户在侧栏里
+        # 看到"纪要会话不在会议分组里"，而且怎么重生成都不好。
+        # 判据：拿不到 cwd 时（后端不认识这个会话）也当"不可用"，重建一个 ——
+        # 重建的代价只是多一个会话，而复用一个错分组的会话会让用户**每次都要手动找**。
+        try:
+            cur = ""
+            for it in (client.list_sessions() or []):
+                if str(it.get("sessionId") or "") == str(sid):
+                    cur = str(it.get("cwd") or "")
+                    break
+            ok = (not cur) or (os.path.normcase(os.path.normpath(cur))
+                               == os.path.normcase(os.path.normpath(ws)))
+        except Exception:
+            ok = True                      # 探测失败时保持旧行为（别把能用的会话丢掉）
+        if ok:
+            with _MEETING_SESSIONS_LOCK:
+                _MEETING_SESSIONS[meeting_id] = sid
+            db.touch_meeting_session(meeting_id)
+            return sid
+        db.add_log("warn", "meeting",
+                   "本场登记的纪要会话不在当前会议工作区（现 %s ≠ 目标 %s）——"
+                   "重建一个新会话，免得落在错误的分组里" % (cur, ws))
+        # 把那个错分组的旧会话**顺手归档并从库里删掉** —— 否则它一直挂在侧栏里
+        # （用户会看到"多出来一个不属于任何分组的会议会话"），而且库里那条脏注册
+        # 留着也没意义。`_drop_summary_session()` 就是干这个的（内含 DSH 侧归档）。
+        try:
+            _drop_summary_session(meeting_id)
+        except Exception as e:
+            db.add_log("warn", "meeting", "清理旧纪要会话失败（可忽略）：%s" % e)
 
     # 新建：优先走工作区（保证出现在 DSH「会议工作区」分组里）
     sid, workspace_id, how = "", "", ""
