@@ -996,5 +996,68 @@ class RequirementsFilesAreLocaleSafe(unittest.TestCase):
                                   "（中文 Windows 上 pip 会按 cp936 解码并崩）：%s" % bad)
 
 
+class OfflineRuntimeAbiTests(unittest.TestCase):
+    """交付安装器必须**判运行时 ABI**（2026-10-09 真机事故：同事的 kit 卡在 `[3/9]`）。
+
+    现场：`ERROR: Could not find a version that satisfies the requirement PyYAML>=6.0
+    (from versions: none)`。而包里那份 `pyyaml-6.0.3-cp311-cp311-win_amd64.whl`
+    **是完整可用的**（zip 能开、`METADATA` 写着 `Name: PyYAML / Version: 6.0.3`）。
+    真因是 **pip 对 ABI 不匹配的轮子静默忽略** —— 那台机器上跑 pip 的解释器不是 CPython 3.11。
+
+    旧脚本有两条路会走到这一步，而且**都不说真相**、反而报"多半是 bundle\\wheels 里缺 wheel"：
+
+      ① 复用已有的 `runtime-core` **不看版本**；
+      ② 候选里的 `python` / `python3` **没有版本约束** → 建出 3.12/3.13 的运行时被直接采信，
+         于是包里那份 3.11.9 嵌入包**永远轮不到**。
+
+    门禁里没有 Windows 真机，所以这里是**文本断言**（与 `BackendChoiceTests` 同一手法）。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.text = _read(INSTALL_ALL)
+
+    def test_the_abi_judgement_is_311_and_64bit(self):
+        self.assertIn("function Test-RuntimeAbi", self.text, "没有 ABI 判据函数")
+        self.assertIn("$script:WantPyMinor = 11", self.text, "判据必须钉 3.11")
+        # 探针本身要量位宽（win_amd64 轮子在 32 位解释器上一样被忽略）
+        self.assertIn("calcsize", self.text, "ABI 探针要同时量位宽")
+        body = self.text[self.text.index("function Test-RuntimeAbi"):]
+        body = body[:body.index("\nfunction ")]
+        self.assertIn("[int]$Matches[4] -eq 64", body)
+
+    def test_reusing_an_existing_runtime_goes_through_the_gate(self):
+        i = self.text.index("$py = Test-RuntimePython $rcDir")
+        block = self.text[i:i + 900]
+        self.assertIn("Test-RuntimeAbi $py", block,
+                      "复用已有的 runtime-core 必须先判 ABI —— 2026-10-09 事故的头一条")
+        self.assertIn("Move-BadRuntimeAside", block, "ABI 不对的要搬开，别让它下一次又被复用")
+
+    def test_each_venv_candidate_is_checked_too(self):
+        i = self.text.index("foreach ($cand in @(@('py', @('-3.11'))")
+        block = self.text[i:i + 1400]
+        self.assertIn("Test-RuntimeAbi $made", block,
+                      "`python` / `python3` 没有版本约束 —— 建完必须过闸，否则包里那份 3.11.9 永远轮不到")
+
+    def test_the_failure_message_names_the_real_cause_first(self):
+        """失败时**先判 ABI、再怪 wheel**：那句"多半是缺 wheel"曾把人引去查错地方。"""
+        i = self.text.index("核心依赖安装失败")
+        block = self.text[i:i + 1600]
+        self.assertIn("Test-RuntimeAbi $Py", block, "失败分支里要先判 ABI")
+        self.assertNotIn("多半是 bundle\\wheels 里缺 wheel", block,
+                         "那句误导性提示已经删掉（真因多半是 ABI 不匹配，不是缺 wheel）")
+
+    def test_the_probe_cannot_be_mangled_by_powershell(self):
+        """探针里**不许有双引号**：WinPS 5.1 把参数交给原生命令时会吃掉它们
+        （实测 `print("x")` 传过去变成 `print(x)` → SyntaxError）——那样这个闸会**永远判失败**，
+        比没有闸更糟。2026-10-09 我自己先写了个带引号的探针，验活时真撞上了。
+        """
+        head = "$script:RuntimeAbiProbe = '"
+        i = self.text.index(head) + len(head)
+        probe = self.text[i:self.text.index("'", i)]
+        self.assertNotIn('"', probe, "探针里有双引号 —— WinPS 5.1 会把它吃掉")
+        self.assertIn("calcsize", probe, "探针要量位宽")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -323,6 +323,59 @@ function Install-EmbeddedFromBundle([string]$RcDir) {
     return $py
 }
 
+# ---------------------------------------------------------------- 运行时 ABI 闸
+# 离线包里的**二进制轮子**是给固定 ABI 编的：`cp311` + `win_amd64`（出包时按目标解释器定死，
+# 见 scripts/build_offline_pack.py 的 wheelhouse）。而 **pip 对 ABI 不匹配的轮子是静默忽略的** ——
+# 于是"运行时不是 3.11"这件事会表现成「bundle\wheels 里缺 wheel：No matching distribution
+# found for PyYAML」，报错还把人往"缺 wheel"上引（**红的地方不是坏的地方**）。
+#
+# 2026-10-09 真机事故（同事的 kit 卡在 [3/9] 装核心依赖）根因就是这一层没判 ABI：
+#   ① 复用了目标机上**已有的**非 3.11 runtime-core；
+#   ② 候选里 `python` / `python3` **没有版本约束**，本机 python 是 3.12/3.13 时照样被采信，
+#      于是包里那份 3.11.9 嵌入包**永远轮不到**。
+# 判据只有一条：解释器必须是 CPython 3.11（64 位）。下面两个函数是**唯一**判据。
+$script:WantPyMajor = 3
+$script:WantPyMinor = 11
+# 探针**故意不含引号、不含空格**：WinPS 5.1 把参数交给原生命令时会吃掉内嵌引号
+# （实测：`print("x")` 传过去变成 `print(x)` → SyntaxError）——那样这个闸会**永远判失败**，
+# 比没有闸更糟。所以用 chr() 拼字符：46='.'、80='P'。输出形如 `3.11.15.64`（主.次.微.位宽）。
+$script:RuntimeAbiProbe = 'import sys,struct;print(chr(46).join([str(sys.version_info[0]),str(sys.version_info[1]),str(sys.version_info[2]),str(struct.calcsize(chr(80))*8)]))'
+
+function Get-RuntimeAbi([string]$Py) {
+    # 人能读的 ABI 描述（判不出来回空串）。用 -c 探，不依赖 pip。
+    if (-not $Py) { return '' }
+    $r = Invoke-Native $Py @('-c', $script:RuntimeAbiProbe)
+    if ($r.code -ne 0) { return '' }
+    $out = ("$($r.out)").Trim()
+    if ($out -match '^(\d+)\.(\d+)\.(\d+)\.(\d+)$') {
+        return ("CPython {0}.{1}.{2}（{3} 位）" -f $Matches[1], $Matches[2], $Matches[3], $Matches[4])
+    }
+    return ''
+}
+
+function Test-RuntimeAbi([string]$Py) {
+    # 唯一判据：CPython 3.11 + 64 位。位宽也判 —— win_amd64 轮子在 32 位解释器上一样被忽略。
+    if (-not $Py) { return $false }
+    $r = Invoke-Native $Py @('-c', $script:RuntimeAbiProbe)
+    if ($r.code -ne 0) { return $false }
+    $out = ("$($r.out)").Trim()
+    if ($out -notmatch '^(\d+)\.(\d+)\.(\d+)\.(\d+)$') { return $false }
+    return ([int]$Matches[1] -eq $script:WantPyMajor -and
+            [int]$Matches[2] -eq $script:WantPyMinor -and
+            [int]$Matches[4] -eq 64)
+}
+
+function Move-BadRuntimeAside([string]$RcDir) {
+    # ABI 不对的 runtime-core：**搬开而不是删掉**（留证据；也免得下一次又被复用到）。
+    # 搬不动就删（它是派生产物，重建不要紧）。
+    $bad = $RcDir + '.incompatible-' + (Get-Date -Format 'yyyyMMddHHmmss')
+    try { Move-Item $RcDir $bad -Force; return $bad }
+    catch {
+        Remove-Item $RcDir -Recurse -Force -ErrorAction SilentlyContinue
+        return '(已删除)'
+    }
+}
+
 function Build-OfflineRuntime {
     # 离线建运行时：三级降级，**每一级都不联网**。
     #   ① 已经就绪（重跑） ② uv 的缓存 CPython（uv venv，离线可命中缓存）
@@ -332,10 +385,21 @@ function Build-OfflineRuntime {
     $rcDir = Join-Path $script:TargetRoot 'runtime-core'
     $py = Test-RuntimePython $rcDir
     if ($py) {
-        Ok ("runtime-core 已就绪: {0}" -f $py)
-        if (-not (Assert-Pip $py)) { Err '这个运行时没有可用的 pip'; exit 1 }
-        EndStep '运行时'
-        return $py
+        if (Test-RuntimeAbi $py) {
+            Ok ("runtime-core 已就绪: {0}（{1}）" -f $py, (Get-RuntimeAbi $py))
+            if (-not (Assert-Pip $py)) { Err '这个运行时没有可用的 pip'; exit 1 }
+            EndStep '运行时'
+            return $py
+        }
+        # **ABI 不对就别复用**（2026-10-09 事故的头一条）：复用它的结果是 pip 静默忽略
+        # 所有 cp311 轮子，最后报"缺 wheel"。搬开它、重建一个 —— 别让用户去猜。
+        $abi = Get-RuntimeAbi $py
+        if (-not $abi) { $abi = '判不出 ABI 的解释器' }
+        Warn ("已有的 runtime-core 是 {0}，但离线包的二进制轮子只认 CPython {1}.{2}（win_amd64）" -f
+              $abi, $script:WantPyMajor, $script:WantPyMinor)
+        $moved = Move-BadRuntimeAside $rcDir
+        Warn ("  复用它会得到「bundle\wheels 里缺 wheel」这种**指错地方**的报错；已把它搬到 {0}，现在重建" -f $moved)
+        $py = ''
     }
     $made = ''
     $uv = Get-Command uv -ErrorAction SilentlyContinue
@@ -347,13 +411,24 @@ function Build-OfflineRuntime {
         if ($made) { Ok 'uv 这条路成了' } else { Warn 'uv 没成（缓存里没有 CPython 3.11）—— 下一级' }
     }
     if (-not $made) {
+        # **候选顺序有讲究**：`py -3.11` 是钉死版本的；`python` / `python3` **没有版本约束**，
+        # 它们是 2026-10-09 事故的第二条来源（本机 python 是 3.12/3.13 时建出一个 ABI 不对的
+        # 运行时，而脚本当时**直接采信**，于是包里那份 3.11.9 嵌入包永远轮不到）。
+        # 现在每个候选建完都要过 ABI 闸：不过就清掉、换下一级（下一级正是包里那份 3.11.9）。
         foreach ($cand in @(@('py', @('-3.11')), @('python', @()), @('python3', @()))) {
             $exe = Get-Command $cand[0] -ErrorAction SilentlyContinue
             if (-not $exe) { continue }
             Info ("② 用 {0} 建 venv（本机 Python，不联网）..." -f $cand[0])
+            if (Test-Path $rcDir) { Remove-Item $rcDir -Recurse -Force -ErrorAction SilentlyContinue }
             $r = Invoke-Native $exe.Source ($cand[1] + @('-m', 'venv', $rcDir))
             if ($r.out) { Write-Host ("      " + $r.out) -ForegroundColor DarkGray }
             $made = Test-RuntimePython $rcDir
+            if ($made -and -not (Test-RuntimeAbi $made)) {
+                Warn ("{0} 建出来的运行时是 {1}，不是 CPython {2}.{3} —— 离线包的二进制轮子会被 pip 静默忽略，换下一级" -f
+                      $cand[0], (Get-RuntimeAbi $made), $script:WantPyMajor, $script:WantPyMinor)
+                Remove-Item $rcDir -Recurse -Force -ErrorAction SilentlyContinue
+                $made = ''
+            }
             if ($made) { break }
         }
     }
@@ -390,7 +465,20 @@ function Install-CoreDepsOffline([string]$Py) {
     } finally { $ErrorActionPreference = $prevEA }
     if ($code -ne 0) {
         Err ("核心依赖安装失败（pip 返回 {0}）—— 这一步失败就是它，别往下猜" -f $code)
-        Err ("  多半是 bundle\wheels 里缺 wheel；看上面的 `"No matching distribution`" 是哪一行")
+        # **先判 ABI，再怪 wheel**（2026-10-09 事故）：pip 对 ABI 不匹配的轮子是静默忽略的，
+        # 于是"运行时不是 3.11"会表现成"缺 wheel" —— 那句提示曾把人引去查错地方。
+        if (-not (Test-RuntimeAbi $Py)) {
+            $abi = Get-RuntimeAbi $Py
+            if (-not $abi) { $abi = '判不出 ABI 的解释器' }
+            Err ("  真正的原因多半在这里：这个运行时是 {0}，而 bundle\wheels 里的二进制轮子只认 CPython {1}.{2}（win_amd64）" -f
+                 $abi, $script:WantPyMajor, $script:WantPyMinor)
+            Err '  pip 会**静默忽略**那些轮子，于是第一个二进制依赖（PyYAML）报 "from versions: none"。'
+            Err ("  补救：删掉 {0} 后重跑（会用包里自带的 python-3.11.9 嵌入包），或本机装 Python 3.11（勾 Add to PATH）后重跑" -f
+                 (Join-Path $script:TargetRoot 'runtime-core'))
+        } else {
+            Err ("  运行时的 ABI 是对的（{0}）—— 那就真是 bundle\wheels 里缺 wheel：看上面 `"No matching distribution`" 是哪一行" -f
+                 (Get-RuntimeAbi $Py))
+        }
         exit 1
     }
     $im = Invoke-Native $Py @('-c', 'import fastapi, uvicorn')
