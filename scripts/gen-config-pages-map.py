@@ -199,8 +199,19 @@ def option_text(key: str, meta: dict, ui: dict) -> str:
     if not opts:
         return ""
     short = (ui.get("SET_OPT_LABELS") or {}).get(key) or {}
-    return " / ".join("%s（%s）" % (short.get(o, o), o) if short.get(o) not in (None, o) else str(o)
-                      for o in opts)
+    out = []
+    for o in opts:
+        # options 有**两种写法**：裸字符串，或 `{"value","label"}`。
+        # 2026-10-09 修：后者一直让本脚本崩在 `short.get(o)`（dict 当键 →
+        # `TypeError: unhashable type: 'dict'`）—— 于是 `docs/配置页结构.md` 从
+        # `dailyReviewSttBackend` 换成 dict 写法那天起就再也 regenerate 不了（**不报错给用户看**，
+        # 只是脚本 exit 1）。两种写法都要认。
+        value = o.get("value") if isinstance(o, dict) else o
+        label = (o.get("label") if isinstance(o, dict) else None) or short.get(value) or str(value)
+        label = str(label)
+        key_text = str(value)
+        out.append(("%s（%s）" % (label, key_text)) if label != key_text else key_text)
+    return " / ".join(out)
 
 
 def value_text(key: str, meta: dict) -> str:

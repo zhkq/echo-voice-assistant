@@ -59,10 +59,13 @@ class VoiceprintCardTests(unittest.TestCase):
         self.assertIn("声纹入库", fn)
 
     def test_delete_calls_the_existing_endpoints(self):
-        i = self.js.index('document.addEventListener("click", async (e) => {')
-        # 别用 `index("});", i)` 收尾：这段里内层事件分支自己就有 `});`，会切在中间。
-        # 直接取一段足够长的窗口（这个委托处理器约 1 KB）。
-        handler = self.js[i:i + 2200]
+        # 2026-10-09 修：原来是"从签名那串起取 2200 字"的**魔法窗口** ——
+        # 委托处理器长到超过 2200 字（后来加了聚合建议那几支）之后，`?name=` 那一段就被切在
+        # 窗口外，报出来是"缺 encodeURIComponent(name)"（**红的地方不是坏的地方**）。
+        # 改成**从这一支自己的分支**起取一小段：判据落在被断言的那件事上，
+        # 不再随别处增长而失效（`web/app.js` 里那一支就在下面几行）。
+        i = self.js.index("if (t.dataset.vpDelname)")
+        handler = self.js[i:i + 400]
         self.assertIn('method: "DELETE"', handler)
         self.assertIn("encodeURIComponent(name)", handler, "按联系人删要走 ?name=")
 

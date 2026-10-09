@@ -100,7 +100,10 @@ class SharedDefaultsStayWindows(unittest.TestCase):
     def test_runtime_defaults_are_windows_values(self):
         import app.config as config
         self.assertEqual(config.DEFAULTS["device"]["value"], "auto")
-        self.assertEqual(config.DEFAULTS["sttModel"]["value"], "sensevoice")
+        # 2026-10-08（5088f95d）：指令转写默认引擎换成 **int8 ONNX 版 SenseVoice**
+        # （`sensevoice-onnx`，免 torch、+230 MB）—— 这条断言当时漏改，于是门禁一直红着一条
+        # （2026-10-09 补齐）。**意图不变**：基准值必须是 Windows 档，且落在共享候选项里。
+        self.assertEqual(config.DEFAULTS["sttModel"]["value"], "sensevoice-onnx")
         # 2026-09-26 定的新分工：**会议转写 = qwen3asr**（它给原生句级时间轴，档位 exact），
         # 所以共享基准值从 sensevoice 改成 qwen3asr —— 不是"倒退成 mac 值"。
         # mac 那条 whisper 默认（small）只声明在 app/platform/darwin/env.py 里，
