@@ -258,6 +258,84 @@ def speak(text, engine="auto", timeout=60):
     return False
 
 
+# ---------------------------------------------------------------- 只合成、不播（手机/手表触点用）
+class TtsError(RuntimeError):
+    """合成失败（**带原因**）—— API 要如实回报，别让"没声音"变成无头案。"""
+
+
+class TtsOff(TtsError):
+    """朗读被关掉了（`ttsEngine=off`）。
+
+    与"合成失败"是**两件事**：API 用 **409** 区分它（否则"我关了朗读"会显示成"合成坏了"）。
+    """
+
+
+def _edge_bytes(text, timeout=30):
+    """edge-tts 合成到 mp3 **字节**（不播）。失败返回 None。"""
+    import asyncio
+    import edge_tts
+    mp3 = os.path.join(tempfile.gettempdir(), f"echo-tts-bytes-{os.getpid()}.mp3")
+    try:
+        async def _gen():
+            await edge_tts.Communicate(text, _EDGE_VOICE).save(mp3)
+        asyncio.run(asyncio.wait_for(_gen(), timeout=min(timeout, 20)))
+        if os.path.isfile(mp3) and os.path.getsize(mp3) > 0:
+            with open(mp3, "rb") as fh:
+                return fh.read()
+        return None
+    except Exception:
+        return None
+    finally:
+        try:
+            if os.path.isfile(mp3):
+                os.remove(mp3)
+        except Exception:
+            pass
+
+
+def synthesize(text, engine="auto", timeout=60):
+    """**只合成、不播放** → ``(mime, bytes)``。
+
+    为什么要单独一个入口（2026-10-09 手机/手表触点）：`speak()` 的语义是"在**本机喇叭**播"，
+    而手机 / 手表要的是"**把音频字节拿走**，我自己播"。两条路的合成细节（在线 edge / 离线 SAPI /
+    格式）完全一样 —— 所以复用同一套分支，只把最后一跳从"播放"换成"取字节"
+    （**不在 api 层重写合成逻辑**，见 docs/手机触点-App设计.md §3 新增 3）。
+
+    返回的 mime 由引擎决定：edge-tts → ``audio/mpeg``；离线引擎 → ``audio/wav``。
+    失败抛 :class:`TtsError`；``engine="off"`` 抛 :class:`TtsOff`（调用方映射成 409）。
+    """
+    global _edge_broken
+    if engine == "off":
+        raise TtsOff("ttsEngine=off")
+    if not (text or "").strip():
+        raise TtsError("文本为空")
+    offline = _offline_engine_ids()
+    use_offline = (engine in offline
+                   or (engine == "auto" and _edge_broken)
+                   or (engine == "auto" and probe_online() is False))
+    if not use_offline:
+        data = _edge_bytes(text, timeout)
+        if data:
+            return ("audio/mpeg", data)
+        _edge_broken = True
+        if engine == "edge-tts":
+            raise TtsError("edge-tts 合成失败：在线引擎不可用或返回空音频")
+    # 离线这条路：**写到临时 wav 再读字节**（平台接缝只提供"合成到文件"，与播放共用实现）
+    fd, path = tempfile.mkstemp(prefix="echo-tts-", suffix=".wav")
+    os.close(fd)
+    try:
+        ok = echo_platform.offline_tts_render(text, path, timeout)
+        if ok and os.path.isfile(path) and os.path.getsize(path) > 44:
+            with open(path, "rb") as fh:
+                return ("audio/wav", fh.read())
+        raise TtsError("离线引擎（%s）没能合成出音频" % echo_platform.offline_tts_label())
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
 # ---------------------------------------------------------------- 在线 TTS 探针
 
 _EDGE_HOST = "speech.platform.bing.com"

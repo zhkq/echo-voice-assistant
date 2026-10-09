@@ -239,6 +239,17 @@ def offline_tts_label() -> str:
     return str(fn()) if callable(fn) else "sapi"
 
 
+def offline_tts_render(text: str, path: str, timeout: int = 60) -> bool:
+    """离线合成**到文件**（不播）—— 手机/手表要"把音频字节拿走"时走这条。
+
+    与 `offline_tts_speak()` 的区别只有最后一跳：那个是"播到本机喇叭"，这个是"写进文件"。
+    各平台实现不同（Windows = System.Speech 的 `SetOutputToWaveFile`；
+    macOS = `say -o`；Linux = `espeak-ng -w`），所以由接缝分派。
+    """
+    fn = _platform_fn("offline_tts_render")
+    return bool(fn(text, path, timeout)) if callable(fn) else False
+
+
 def offline_tts_display() -> str:
     """离线 TTS 的可读名字（面板文案，如 `Windows 慧慧`）。"""
     fn = _platform_fn("offline_tts_display")

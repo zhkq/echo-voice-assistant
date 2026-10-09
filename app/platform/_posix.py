@@ -259,6 +259,39 @@ def offline_tts_speak(text: str, timeout: int = 60,
     return False
 
 
+def offline_tts_render(text: str, path: str, timeout: int = 60,
+                       renderers=(("say", ["-o", None, "--data-format=LEI16@22050"]),
+                                  ("espeak-ng", ["-w", None]),
+                                  ("espeak", ["-w", None]))) -> bool:
+    """离线合成**到文件**（对应 Windows 的 `SetOutputToWaveFile`；不播）。
+
+    为什么需要它（2026-10-09 手机/手表触点）：`offline_tts_speak()` 的语义是"在本机喇叭播"，
+    而手机/手表要的是"**把音频字节拿走**" —— 引擎一样，只是最后一跳不同。
+
+    各平台"写到文件"的开关不同（macOS `say -o`、Linux `espeak-ng -w`；`spd-say` 没有），
+    所以用 `renderers` 描述成 `(可执行文件, 参数模板)`：模板里的 `None` 位置换成 `path`。
+    哪个平台给哪份清单由各自的 `env.py` 决定。
+    """
+    import os
+    import subprocess
+    if not (text or "").strip():
+        return False
+    for exe, args in renderers:
+        argv = [exe] + [path if a is None else a for a in args] + [text]
+        try:
+            proc = subprocess.run(argv, timeout=timeout,
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            continue
+        try:
+            # > 44 字节：wav 头本身就要 44 字节，"只有头"等于没合成出东西
+            if proc.returncode == 0 and os.path.isfile(path) and os.path.getsize(path) > 44:
+                return True
+        except OSError:
+            continue
+    return False
+
+
 # ------------------------------------------------------------------ 秘密保护（凭据落盘）
 #
 # 与 Windows 那侧（DPAPI，绑用户账户）对称：POSIX 上**没有等价的"绑用户"系统服务**，

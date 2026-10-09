@@ -12,7 +12,7 @@ import re
 import tempfile
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Request, UploadFile
+from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Request, Response, UploadFile
 from pydantic import BaseModel
 from starlette.background import BackgroundTask
 
@@ -145,6 +145,17 @@ class CommandIn(BaseModel):
 
 class CaptureIn(BaseModel):
     source: str = "api"
+
+
+class TtsIn(BaseModel):
+    """`POST /api/tts` 的入参（手机 / 手表触点）。
+
+    格式**不由调用方选**：edge-tts 出 mp3、离线引擎出 wav，响应头的 `Content-Type` 会说清
+    （手机侧两个都能播）。**不加 `format` 参数**是故意的 —— 一个改不动的旋钮比没有更坏。
+    """
+    text: str = ""
+    #: 留空 = 用设置里的 `ttsEngine`；显式给 `off` → **409**（与"合成失败"分开）
+    engine: str = ""
 
 
 class DailyReviewStartIn(BaseModel):
@@ -704,6 +715,79 @@ def post_command(body: CommandIn, _auth=Depends(optional_auth)):
                                   workspace=body.workspace or None,
                                   session_id=body.session_id or None)
     return {"ok": ok, "message": msg}
+
+
+@router.post("/assistant/voice-command")
+async def assistant_voice_command(request: Request,
+                                  engine: str = "",
+                                  lang: str = "",
+                                  _auth=Depends(optional_auth)):
+    """**裸 wav → 一句话**（手机 / 手表的一步到位入口）：转写 → 下发给智能体。
+
+    为什么要有它（设计 §3 新增 2）：手机侧两步也能拼
+    （`POST /api/stt/transcribe` + `POST /api/assistant/command`），但多一次往返；
+    这里在**服务端**把那两步串起来，**不新增业务逻辑**。
+
+    约定与能力后端一致（AGENTS.md 记过这条坑）：**裸音频 body + `Content-Type: audio/wav`**，
+    **不是** multipart（那在这套里会得到 415）。
+
+    `source` 记 `"mobile"` —— 库里注释与面板翻译表早就备好这个值，手机/手表是第一处真用它的人。
+    回包给 `commandId`：手机拿到就能去 `GET /api/commands?limit=` 轮询那一条的 status
+    （设计 §7 的关键时序）。
+    """
+    body = await request.body()
+    if not body:
+        raise HTTPException(status_code=422,
+                            detail="请求体为空：请把 wav 字节直接当 body 发（Content-Type: audio/wav）")
+    if len(body) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="音频不能超过 512 MB")
+    tmp_in = tmp_wav = ""
+    try:
+        fd, tmp_in = tempfile.mkstemp(prefix="echo-voice-", suffix=".bin")
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(body)
+        fd2, tmp_wav = tempfile.mkstemp(prefix="echo-voice-", suffix=".wav")
+        os.close(fd2)
+        from starlette.concurrency import run_in_threadpool
+        try:
+            await run_in_threadpool(_audio_to_wav16k, tmp_in, tmp_wav)
+        except Exception as exc:
+            # **入参不对就说入参不对**（2026-10-09，用例逮到的）：multipart 传进来的 body
+            # 不是音频字节，`_audio_to_wav16k` 会报 "Format not recognised" —— 若把它当
+            # "转写失败(502)"报出去，调用方会去查引擎，而真正该改的是请求形状。
+            raise HTTPException(
+                status_code=422,
+                detail="音频解码失败（%s）：请把 wav 字节**直接当 body** 发"
+                       "（Content-Type: audio/wav），不要用 multipart/form-data" % type(exc).__name__)
+        text = await run_in_threadpool(
+            stt_mod.transcribe, tmp_wav,
+            engine or str(settings.get("sttModel", "sensevoice") or "sensevoice"),
+            "small", lang or str(settings.get("sttLanguage", "zh") or "zh"), "auto")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        db.add_log("warn", "api", "voice-command 转写失败：%s: %s" % (type(exc).__name__, exc))
+        raise HTTPException(status_code=502,
+                            detail="转写失败：%s: %s" % (type(exc).__name__, exc))
+    finally:
+        for p in (tmp_in, tmp_wav):
+            try:
+                if p:
+                    os.remove(p)
+            except OSError:
+                pass
+    if not (text or "").strip():
+        raise HTTPException(status_code=422, detail="未能识别出文本（音频过短或无语音）")
+    ok, msg = assistant.send_text(text.strip(), source="mobile")
+    cmd_id = None
+    try:
+        rows = db.list_commands(limit=1)
+        if rows:
+            cmd_id = rows[0].get("id")
+    except Exception:
+        pass
+    return {"ok": bool(ok), "message": msg, "text": text.strip(),
+            "commandId": cmd_id, "source": "mobile"}
 
 
 @router.get("/dsh/targets")
@@ -2283,6 +2367,38 @@ def control_tts_test(_auth=Depends(optional_auth)):
     from app import providers as providers_mod
     providers_mod.speak_async("你好，我是 ECHO 语音助手，当前语音合成正常。")
     return {"ok": True, "message": "已开始测试播报"}
+
+
+@router.post("/tts")
+def post_tts(body: TtsIn, _auth=Depends(optional_auth)):
+    """合成一句话 → **音频字节**（`audio/mpeg` 或 `audio/wav`）。
+
+    与上面 `POST /api/control/tts/test` 的区别：那条是"在**本机喇叭**播"，这条是"**把字节给你**"
+    —— 手机 / 手表自己播（设计 §3 新增 3）。两条共用 `app/audio/tts.py` 的同一套合成逻辑。
+
+    失败**必须留痕**（`warn/tts`），并且分三档说清：
+      * **422** = 文本为空；
+      * **409** = **朗读被关掉**（`ttsEngine=off`）—— "我关了"与"坏了"不能混为一谈
+        （这正是设计里那条判据：静默成功最坏）；
+      * **502** = 合成真的失败（附原因）。
+    """
+    text = (body.text or "").strip()
+    if not text:
+        raise HTTPException(status_code=422, detail="text 不能为空")
+    engine = (body.engine or "").strip() or str(settings.get("ttsEngine", "auto") or "auto")
+    try:
+        mime, data = tts_mod.synthesize(text, engine=engine)
+    except tts_mod.TtsOff:
+        raise HTTPException(status_code=409,
+                            detail="朗读被关掉了（ttsEngine=off）：打开它，或显式指定别的引擎")
+    except tts_mod.TtsError as exc:
+        db.add_log("warn", "tts", "合成失败（engine=%s）：%s" % (engine, exc))
+        raise HTTPException(status_code=502, detail="合成失败：%s" % exc)
+    if not data:
+        db.add_log("warn", "tts", "合成返回空音频（engine=%s）" % engine)
+        raise HTTPException(status_code=502, detail="合成返回空音频")
+    return Response(content=data, media_type=mime,
+                    headers={"Cache-Control": "no-store", "X-Echo-Tts-Engine": engine})
 
 
 @router.post("/control/mic/test")

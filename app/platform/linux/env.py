@@ -121,6 +121,16 @@ def offline_tts_speak(text: str, timeout: int = 60) -> bool:
         text, timeout, engines=(("spd-say",), ("espeak-ng",), ("espeak",)))
 
 
+def offline_tts_render(text: str, path: str, timeout: int = 60) -> bool:
+    """离线合成**到文件**（`espeak-ng -w`；不播）。
+
+    `spd-say` 没有"写到文件"的开关，所以这里只用 espeak 系 —— 它俩一装就是一整套。
+    """
+    return _posix.offline_tts_render(
+        text, path, timeout,
+        renderers=(("espeak-ng", ["-w", None]), ("espeak", ["-w", None])))
+
+
 def offline_tts_label() -> str:
     """引擎短名（进状态文案；Windows 那边是 `sapi`）。"""
     return "espeak"

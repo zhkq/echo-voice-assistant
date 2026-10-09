@@ -139,6 +139,13 @@ def offline_tts_speak(text: str, timeout: int = 60) -> bool:
     return _posix.offline_tts_speak(text, timeout, engines=(("say",),))
 
 
+def offline_tts_render(text: str, path: str, timeout: int = 60) -> bool:
+    """离线合成**到文件**（`say -o`；不播）。触点要"音频字节"时走这条。"""
+    return _posix.offline_tts_render(
+        text, path, timeout,
+        renderers=(("say", ["-o", None, "--data-format=LEI16@22050"]),))
+
+
 def offline_tts_label() -> str:
     """引擎短名（进状态文案；Windows 那边是 `sapi`）。"""
     return "say"

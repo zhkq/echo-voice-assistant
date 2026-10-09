@@ -116,6 +116,38 @@ def _speak_once(text):
         return False
 
 
+def render_to_file(text, path, timeout=60):
+    """合成**到 wav 文件**（不播）—— 给"把音频字节返回给手机/手表"用（2026-10-09 触点）。
+
+    与 `speak()` 共用同一套 PowerShell（连"挑中文音色"那段都一样），只有两处不同：
+      * `SetOutputToWaveFile(<path>)` 取代"直接播到默认设备"；
+      * **一次性子进程**（不占常驻那份）—— 免得与正在朗读的那一次抢同一个 SAPI 实例。
+    失败返回 False（永不抛）。
+    """
+    if not (text or "").strip():
+        return False
+    # 路径进 PowerShell 字面串：单引号包起来，内部的单引号按 PS 规则翻倍
+    safe = str(path or "").replace("'", "''")
+    ps = (
+        "Add-Type -AssemblyName System.Speech; "
+        "[Console]::InputEncoding = New-Object System.Text.UTF8Encoding($false); "
+        "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
+        "$zh = @($s.GetInstalledVoices() | Where-Object { $_.Enabled -and "
+        "$_.VoiceInfo.Culture.Name -like 'zh*' })[0]; "
+        "if ($zh) { $s.SelectVoice($zh.VoiceInfo.Name) }; "
+        "$s.Rate = 1; $s.SetOutputToWaveFile('%s'); "
+        "$s.Speak([Console]::In.ReadToEnd()); $s.Dispose()" % safe
+    )
+    try:
+        p = subprocess.Popen(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+            stdin=subprocess.PIPE, creationflags=no_window_creationflags())
+        p.communicate(text.encode("utf-8"), timeout=timeout)
+        return p.returncode == 0
+    except Exception:
+        return False
+
+
 def speak(text, timeout=60):
     """朗读文本：常驻进程优先，失败回退一次性子进程。永不抛异常。"""
     if not (text or "").strip():

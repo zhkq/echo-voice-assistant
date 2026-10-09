@@ -403,6 +403,19 @@ def offline_tts_speak(text: str, timeout: int = 60) -> bool:
         return False
 
 
+def offline_tts_render(text: str, path: str, timeout: int = 60) -> bool:
+    """离线合成**到文件**（SAPI / System.Speech 的 `SetOutputToWaveFile`；不播）。
+
+    手机/手表触点要的是"把音频字节拿走"（见 `app/audio/tts.py::synthesize`），
+    而 `offline_tts_speak()` 只会播到本机默认设备 —— 所以另开这一条。
+    """
+    try:
+        from app.platform.win32 import sapi
+        return bool(sapi.render_to_file(text, path, timeout))
+    except Exception:
+        return False
+
+
 def offline_tts_label() -> str:
     """离线 TTS 的引擎短名（= 1.x 配置里的 `sapi`，状态文案用）。"""
     return "sapi"

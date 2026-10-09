@@ -7,10 +7,17 @@
 > 本文是**设计**，不是实现。每一步都标了"现状 / 要新增 / 判据"，可以直接照它开工。
 > 全部事实都来自代码（带 `路径:行号`），不靠印象。
 >
-> **实现状态（2026-10-09）**：§3 新增 1、§4 配对流程、§5 步 1 / 步 2、§6-A 的拒收清单
-> **已实现**（`app/netguard.py` / `app/phone_pair.py` / `app/api.py` / `web/app.js` / `web/app.css`，
-> 判据在 `tests/test_phone_pairing.py`）。**二维码推迟到阶段 3**（三条理由见 §4）。
-> 手表那条路见 [手表触点-可行性分析-Watch4Pro.md](手表触点-可行性分析-Watch4Pro.md)。
+> **实现状态（2026-10-09）**：
+> * **阶段 0/1**：§3 新增 1、§4 配对流程、§5 步 1 / 步 2、§6-A 的拒收清单 **已实现**
+>   （`app/netguard.py` / `app/phone_pair.py` / `app/api.py` / `web/app.js` / `web/app.css`，
+>   判据 `tests/test_phone_pairing.py` 34 条）。**二维码推迟到阶段 3**（三条理由见 §4）。
+> * **阶段 2 + §3 新增 2**：`POST /api/tts`（返回音频字节）与
+>   `POST /api/assistant/voice-command`（裸 wav → 一句话）**已实现**
+>   （`app/audio/tts.py` / `app/platform/*` / `app/api.py`，判据 `tests/test_tts_audio_api.py` 11 条；
+>   真合成实测见 §3 新增 3）。
+> * 手机形态已定：**Mate 50 Pro / HarmonyOS 4.2 → 装 APK**（§7 的 Kotlin 路线成立，且不需要开发者账号）；
+>   手表 Watch 4 Pro / **HarmonyOS 4.3** → 先走 §3-A 通知档（理由见手表分析 §6）。
+> * 手表那条路见 [手表触点-可行性分析-Watch4Pro.md](手表触点-可行性分析-Watch4Pro.md)。
 
 ---
 
@@ -158,13 +165,23 @@ POST /api/assistant/voice-command     （新增，兼容两档）
 * **`source` 填什么**：`"mobile"` —— 库里注释与面板翻译表都早已备好（`db.py:115`、`web/app.js:1132`），
   且**目前没有任何代码写这个值**，手机正好是第一处。
 
+> ✅ **2026-10-09 已实现**（`app/api.py::assistant_voice_command`）。落地时有三处**与草稿不同**，
+> 都记在这里，免得后人以为漏做：
+>   * 出参**没有 `session`**（草稿里那个字段没有可靠来源）→ 给的是 **`commandId`**：
+>     手机拿它去 `GET /api/commands?limit=` 轮询那一条的 status（§7 的关键时序）；
+>   * 入参是**裸 body**（`Content-Type: audio/wav`），**不是 multipart**（与能力后端同一条约定）；
+>     multipart 会被**如实拒成 422** 并点明契约 —— 而不是报成"转写失败 502"把调用方引去查引擎；
+>   * 识别不出文本 → **422**（不是"成功但空"）；引擎真失败 → **502** 且写 `warn/api` 日志。
+>
+> 判据：`tests/test_tts_audio_api.py::VoiceCommandEndpointTests`（4 条）。
+
 ### 新增 3：把一句话念出来（返回音频）
 
 ```
 POST /api/tts                 （新增）
-  入参: {"text": "...", "engine": "auto"（可选）, "format": "mp3"（默认，或 wav）}
-  出参: 音频字节（Content-Type: audio/mpeg | audio/wav）
-        失败时: 4xx/5xx + {"detail": "..."}（说清是"没装 edge-tts"还是"引擎返回空"）
+  入参: {"text": "...", "engine": ""}    ← engine 留空 = 用设置里的 `ttsEngine`
+  出参: 音频字节（Content-Type: audio/mpeg | audio/wav，**由引擎决定**）
+        失败: 422 文本为空 ｜ 409 朗读被关掉（ttsEngine=off）｜ 502 合成失败（附原因 + 写 warn/tts）
 ```
 
 * **复用**：`app/audio/tts.py` 的合成路径。现状是"合成后**直接本机播放并删掉临时文件**"
@@ -175,6 +192,16 @@ POST /api/tts                 （新增）
   新接口的失败**必须**同样留痕，否则手机端"没声音"又会变成无头案。
 * **判据**：`POST /api/tts` 返回的字节，能被 `soundfile` 解码出**非空**波形；
   且当 `ttsEngine=off` 时返回 **409**（不是静默成功）——"关了朗读"与"合成失败"必须能区分。
+
+> ✅ **2026-10-09 已实现**（`app/api.py::post_tts` + `app/audio/tts.py::synthesize`）。落地取舍：
+>   * **没有 `format` 参数**（草稿里有）：格式由引擎决定（edge → mp3、离线 → wav），
+>     响应头 `Content-Type` 会说清 —— 一个**改不动的旋钮**比没有更坏，手机侧两种都能播；
+>   * "合成到文件"落在**平台接缝**上（`offline_tts_render`：Windows = System.Speech 的
+>     `SetOutputToWaveFile`；macOS = `say -o`；Linux = `espeak-ng -w`）—— 与 `speak()`
+>     共用同一套引擎选择，只换最后一跳；
+>   * 除用例（`tests/test_tts_audio_api.py`，11 条）外还做了**真合成实测**：
+>     `engine=sapi` → `audio/wav` 289,746 字节 / **6.57 秒** / 22.05 kHz；
+>     `engine=auto` → `audio/mpeg`（走 edge-tts，**说明这条网络通**）37,440 字节 / 6.24 秒。
 
 ### 明确**不新增**的
 
@@ -342,7 +369,7 @@ POST /api/tts                 （新增）
 |---|---|---|---|
 | **0** | ECHO 侧：`serverBindMode` + netguard 只放行本机地址、**强制联动 `apiAuthEnabled`** | ✅ 已实现 | `tests/test_phone_pairing.py::GuardMiddlewareTests`（默认档 403 / lan 档 200 / 别的内网机器与公网 403） |
 | **1** | ECHO 侧：`/api/pair/phone`（发 6 位码）+ `/claim` + 面板卡片 + 已配设备列表 | ✅ 已实现（**无二维码**，见 §4） | 码兑换一次即失效；错 20 次锁；令牌能 `GET /api/status` |
-| **2** | ECHO 侧：`/api/tts`（返回音频，不播）+ 失败留痕 | ⬜ 待做 | `curl` 回来的是能解码的非空音频；`ttsEngine=off` 时 409 |
+| **2** | ECHO 侧：`/api/tts`（返回音频，不播）+ 失败留痕 | ✅ 已实现 | `tests/test_tts_audio_api.py`（11 条）；真合成实测：sapi→wav 6.57s / auto→mp3 6.24s |
 | **3** | App 骨架：**输入地址 + 6 位码**配对 + 状态自检 + 文字命令（先不碰音频；**二维码在这一期一起做**） | ⬜ 待做 | 手机打字发一条命令，能在主机 `GET /api/commands` 看到 `source=mobile` |
 | **4** | App 语音：录音 → `/api/assistant/voice-command` → 轮询 → `/api/tts` 播放；含打断 | ⬜ 待做 | 手机说一句“明天天气怎么样”，听到播报 |
 | **5** | 体验：桌面小组件、前台服务、离线队列、错误人话化；**顺手加通知渠道 → 手表输出档**（手表分析 §3-A） | ⬜ 待做 | 断网提示能说清“是没网还是没配对”；手机通知能让手表震动显示 |
@@ -352,6 +379,10 @@ POST /api/tts                 （新增）
 > **“已实现”的判据不是“代码写完了”**：阶段 0/1 的每条判据都在 `tests/test_phone_pairing.py`
 > （34 条：配对码寿命/一次性/限次、守卫四格、联动三条、接口契约，外加面板接线与
 > “拒收清单路径没漂移”的防腐烂断言）。
+>
+> **另外**：§3 的「新增 2」（`POST /api/assistant/voice-command`，语音一步到位）也已在
+> 2026-10-09 落地 —— 它原本压在阶段 4 上，但手机与手表都要它，而实现只是把现成的
+> STT + 下发两步在服务端串起来，所以提前做了（判据 `tests/test_tts_audio_api.py`）。
 
 ---
 
