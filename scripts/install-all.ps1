@@ -377,10 +377,13 @@ function Move-BadRuntimeAside([string]$RcDir) {
 }
 
 function Build-OfflineRuntime {
-    # 离线建运行时：三级降级，**每一级都不联网**。
-    #   ① 已经就绪（重跑） ② uv 的缓存 CPython（uv venv，离线可命中缓存）
-    #   ③ 本机 Python 3.11（py / python，venv + ensurepip 自带 wheel）
-    #   ④ 包里的 python.org 嵌入包 + get-pip.py
+    # 离线建运行时：**每一级都不联网**。顺序就是判据（2026-10-09 事故后重排）：
+    #   ① 已经就绪（重跑）—— **必须过 ABI 闸**（CPython 3.11 + 64 位）
+    #   ② 版本钉死的两条：uv 的缓存 CPython 3.11 / `py -3.11`
+    #   ③ **包里的 python.org 3.11.9 嵌入包 + get-pip.py** —— 目标机**没有 Python**、
+    #      或只有**低版本**（3.9/3.10/2.7）时走的就是这条；它**永远是对的**
+    #   ④ 兜底：本机 `python` / `python3`（**没有版本约束**，必须过 ABI 闸；
+    #      只在包里缺嵌入包时才轮到 —— 排在 ③ 之后就不会让低版本机器白建 venv）
     Step '建运行时（离线：只看本机与包里的载荷）'
     $rcDir = Join-Path $script:TargetRoot 'runtime-core'
     $py = Test-RuntimePython $rcDir
@@ -411,11 +414,12 @@ function Build-OfflineRuntime {
         if ($made) { Ok 'uv 这条路成了' } else { Warn 'uv 没成（缓存里没有 CPython 3.11）—— 下一级' }
     }
     if (-not $made) {
-        # **候选顺序有讲究**：`py -3.11` 是钉死版本的；`python` / `python3` **没有版本约束**，
-        # 它们是 2026-10-09 事故的第二条来源（本机 python 是 3.12/3.13 时建出一个 ABI 不对的
-        # 运行时，而脚本当时**直接采信**，于是包里那份 3.11.9 嵌入包永远轮不到）。
-        # 现在每个候选建完都要过 ABI 闸：不过就清掉、换下一级（下一级正是包里那份 3.11.9）。
-        foreach ($cand in @(@('py', @('-3.11')), @('python', @()), @('python3', @()))) {
+        # 这一级只试**钉死版本**的那个（`py -3.11`）。**没有版本约束的 `python` / `python3`
+        # 已挪到嵌入包之后**（2026-10-09）：它们正是那次事故的来源（本机 python 是 3.12/3.13 时
+        # 建出 ABI 不对的运行时却被直接采信，于是包里那份 3.11.9 **永远轮不到**）。
+        # 放到后面的另一个好处：**低版本机器不会白建** —— 3.9/3.10 上 `python -m venv` 要跑十来秒、
+        # 还必然被闸枪毙；Microsoft Store 那个 python 桩甚至会弹出应用商店。
+        foreach ($cand in @(@('py', @('-3.11')))) {
             $exe = Get-Command $cand[0] -ErrorAction SilentlyContinue
             if (-not $exe) { continue }
             Info ("② 用 {0} 建 venv（本机 Python，不联网）..." -f $cand[0])
@@ -424,7 +428,7 @@ function Build-OfflineRuntime {
             if ($r.out) { Write-Host ("      " + $r.out) -ForegroundColor DarkGray }
             $made = Test-RuntimePython $rcDir
             if ($made -and -not (Test-RuntimeAbi $made)) {
-                Warn ("{0} 建出来的运行时是 {1}，不是 CPython {2}.{3} —— 离线包的二进制轮子会被 pip 静默忽略，换下一级" -f
+                Warn ("{0} 建出来的运行时是 {1}，不是 CPython {2}.{3} —— 换下一级" -f
                       $cand[0], (Get-RuntimeAbi $made), $script:WantPyMajor, $script:WantPyMinor)
                 Remove-Item $rcDir -Recurse -Force -ErrorAction SilentlyContinue
                 $made = ''
@@ -437,7 +441,28 @@ function Build-OfflineRuntime {
         $made = Install-EmbeddedFromBundle $rcDir
     }
     if (-not $made) {
-        Err '离线建不出运行时：本机没有 uv 缓存、没有 Python 3.11，包里也没有 runtime\python-3.11.9-embed-amd64.zip'
+        # **④ 最后才试"没有版本约束"的本机 python**：走到这里说明包里**没有**嵌入包
+        # （薄包 / 被裁过的包），只剩这条路 —— 所以仍然要过 ABI 闸；不合格就让它明确失败，
+        # 别变成"装完却 import 不到"或者"缺 wheel"那种指错地方的报错。
+        foreach ($cand in @(@('python', @()), @('python3', @()))) {
+            $exe = Get-Command $cand[0] -ErrorAction SilentlyContinue
+            if (-not $exe) { continue }
+            Info ("④ 用 {0} 建 venv（本机 Python，**没有版本约束**）..." -f $cand[0])
+            if (Test-Path $rcDir) { Remove-Item $rcDir -Recurse -Force -ErrorAction SilentlyContinue }
+            $r = Invoke-Native $exe.Source ($cand[1] + @('-m', 'venv', $rcDir))
+            if ($r.out) { Write-Host ("      " + $r.out) -ForegroundColor DarkGray }
+            $made = Test-RuntimePython $rcDir
+            if ($made -and -not (Test-RuntimeAbi $made)) {
+                Warn ("{0} 建出来的运行时是 {1}，不是 CPython {2}.{3} —— 跳过" -f
+                      $cand[0], (Get-RuntimeAbi $made), $script:WantPyMajor, $script:WantPyMinor)
+                Remove-Item $rcDir -Recurse -Force -ErrorAction SilentlyContinue
+                $made = ''
+            }
+            if ($made) { break }
+        }
+    }
+    if (-not $made) {
+        Err '离线建不出运行时：本机没有 uv 缓存、没有 Python 3.11（本机 python/python3 也不是 3.11），包里也没有 runtime\python-3.11.9-embed-amd64.zip'
         Err '  补救：① 用带 bundle\runtime 的完整离线包（build_min_kit.py 出的那个）；或'
         Err '        ② 本机装一个 Python 3.11（python.org，勾 Add to PATH）后重跑；或'
         Err '        ③ 改用在线模式（去掉 -Offline）'

@@ -1037,7 +1037,22 @@ class OfflineRuntimeAbiTests(unittest.TestCase):
         i = self.text.index("foreach ($cand in @(@('py', @('-3.11'))")
         block = self.text[i:i + 1400]
         self.assertIn("Test-RuntimeAbi $made", block,
-                      "`python` / `python3` 没有版本约束 —— 建完必须过闸，否则包里那份 3.11.9 永远轮不到")
+                      "`py -3.11` 建完也要过闸（版本钉死≠一定对：还可能是 32 位）")
+
+    def test_the_bundled_3119_embed_comes_before_an_unpinned_python(self):
+        """顺序就是判据（2026-10-09 重排）：**无版本约束的 `python` / `python3` 必须排在
+        包里那份 3.11.9 之后**。
+
+        低版本机器（3.9/3.10/2.7）上，unpinned 候选要么建出 ABI 不对的运行时（被闸枪毙、
+        白建十来秒），要么根本没有 `venv` 模块；Microsoft Store 那个 python 桩甚至会弹出
+        应用商店。而包里的嵌入包**永远是对的** —— 先试它，低版本机器就**根本不会去试**。
+        """
+        i_embed = self.text.index("③ 用包里的 python.org 嵌入包")
+        i_unpinned = self.text.index("foreach ($cand in @(@('python', @()), @('python3', @())))")
+        self.assertLess(i_embed, i_unpinned, "嵌入包必须排在无版本约束的 python 候选之前")
+        block = self.text[i_unpinned:i_unpinned + 1400]
+        self.assertIn("Test-RuntimeAbi $made", block,
+                      "兜底那一级也要过 ABI 闸（薄包场景下它是唯一的路）")
 
     def test_the_failure_message_names_the_real_cause_first(self):
         """失败时**先判 ABI、再怪 wheel**：那句"多半是缺 wheel"曾把人引去查错地方。"""
