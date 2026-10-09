@@ -8,6 +8,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+import unittest.mock as mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -28,6 +29,28 @@ def _mk_meeting(root, name):
 class PathsApiTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        # ⚠️ **用例隔离**（2026-10-09）：开发机的真实设置里 `apiAuthEnabled=true`
+        # —— 配对手机时切到 `lan` 档会被**强制**打开鉴权，而且 lan 期间关不掉
+        # （见 tests/test_phone_pairing.py）。本类用的是**裸 TestClient**：不带令牌、
+        # 对端也不是回环（`is_loopback_peer` 对 "testclient" 判不出 → fail closed），
+        # 于是每一个 `/api/*` 都 401，四条用例全红 —— **而接口本身没坏**。
+        # 这正是本仓库记过的"红的地方不是坏的地方"：漏的不是接口，是**用例没屏蔽机器状态**。
+        #
+        # 做法：在**内存里**把这一项遮成 False。刻意**不写库** ——
+        # `settings.update({"serverBindMode": "loopback", "apiAuthEnabled": False})`
+        # 那种写法（别的用例在用）会改**用户的真实设置**，万一崩在中间就把
+        # 手机那条路（LAN + 鉴权）弄断了。这里的补丁随用例结束自动还原。
+        real_get = settings.get
+
+        def _get(key, *a, **kw):
+            if key == "apiAuthEnabled":
+                return False
+            return real_get(key, *a, **kw)
+
+        cls._auth_patch = mock.patch.object(settings, "get", side_effect=_get)
+        cls._auth_patch.start()
+        cls.addClassCleanup(cls._auth_patch.stop)
+
         app = FastAPI()
         app.include_router(router)
         cls.client = TestClient(app)
@@ -40,6 +63,18 @@ class PathsApiTests(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def test_the_class_shields_itself_from_the_machines_auth_setting(self):
+        """开关鉴权**只在本类内被遮住**，不改机器状态。
+
+        这条用例是给后人看的：看到本类"凭空"把 `apiAuthEnabled` 读成 False 时，
+        要知道那是**故意的隔离**，不是设置丢了。
+        """
+        self.assertFalse(settings.get("apiAuthEnabled"),
+                         "本类内应当看不到鉴权（否则所有 /api/* 都会 401）")
+        # 别的键必须照常透传（补丁只拦这一个 key）
+        self.assertIsInstance(settings.get("serverPort"), int)
+        self.assertEqual(settings.get("一个不存在的键", "兜底"), "兜底")
 
     def test_env_endpoint_reports_every_root(self):
         r = self.client.get("/api/paths/env")
