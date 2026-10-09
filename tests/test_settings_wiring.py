@@ -286,8 +286,19 @@ class GroupingTests(unittest.TestCase):
 # ---------------------------------------------------------------- 3. 往返读写
 
 def _probe_value(meta, current):
-    """给某个设置项造一个「与当前值不同」的探测值（按 value_type）。"""
+    """给某个设置项造一个「与当前值不同」的探测值（按 value_type）。
+
+    **有 `options` 的项必须用合法取值探测**（2026-10-09）：往枚举项里灌
+    `"loopback__probe__"` 这种垃圾，测到的不是"能不能往返"，而是"校验会不会拒收" ——
+    后者是另一件事（`_couple_bind_mode` 与用例各自钉它）。灌垃圾还会让
+    "写进去却被拒收"表现成"往返坏了"，红的地方不是坏的地方。
+    """
     vt = meta["value_type"]
+    opts = [o.get("value") if isinstance(o, dict) else str(o)
+            for o in (meta.get("options") or [])]
+    if opts:
+        pick = next((o for o in opts if str(o) != str(current)), opts[0])
+        return [pick] if vt == "list" else pick
     if vt == "bool":
         return (not bool(current))
     if vt == "int":
@@ -406,6 +417,9 @@ class RoundTripTests(unittest.TestCase):
                 continue
             with self.subTest(key=key):
                 want = _probe_value(meta, settings.get(key))
+                # 本项开始前记下"绑定档 + 鉴权"这一对（`serverBindMode` 那一支要整体复原）
+                before_bind = settings.get("serverBindMode")
+                before_auth = settings.get("apiAuthEnabled", False)
                 with _quiet_side_effects():
                     r = self.client.put("/api/settings", json={"values": {key: want}})
                 self.assertEqual(r.status_code, 200, r.text)
@@ -415,10 +429,25 @@ class RoundTripTests(unittest.TestCase):
                     # 打开它以后所有接口都要 Bearer 令牌（这是它的作用）——后面的读检查会被
                     # 401 挡掉，所以这里验证完"写入生效/匿名被拒"就把它关回去。关回去走配置层：
                     # 走接口同样会 401（本地面板此时也拿不到令牌），这正是这一项的双刃性。
+                    # 注意本用例的 TestClient 对端是 `"testclient"`（不是回环 IP），
+                    # 因此**吃不到** `optional_auth` 的"本机调用豁免" —— 豁免那条路
+                    # 由 tests/test_phone_pairing.py 用 `client=("127.0.0.1", …)` 单独钉。
                     self.assertEqual(self.client.get("/api/settings").status_code, 401,
                                      "打开鉴权后匿名请求必须被拒")
                     settings.update({key: False})
                     self.assertFalse(settings.get(key))
+                    continue
+                if key == "serverBindMode":
+                    # 这一项**会联动另一项**（`lan` ⇒ `apiAuthEnabled=true`，
+                    # 见 `app/config.py::Settings._couple_bind_mode`），所以按"有副作用"的那一类
+                    # 处理：验完"写进去读得回来"就**整体复原**。
+                    # 不复原的话，鉴权会一直开着，而本用例的对端不是回环 → 后面每一项 PUT
+                    # 都会被 401 挡掉（那会红成一片，且红的地方不是坏的地方）。
+                    with _quiet_side_effects():
+                        settings.update({"serverBindMode": before_bind,
+                                         "apiAuthEnabled": before_auth})
+                    self.assertEqual(settings.get("serverBindMode"), before_bind)
+                    self.assertEqual(settings.get("apiAuthEnabled"), before_auth)
                     continue
                 if meta.get("hidden"):
                     continue

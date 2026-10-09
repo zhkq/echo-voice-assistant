@@ -1055,12 +1055,33 @@ def list_events(limit=200):
 #   * 校验用 hmac.compare_digest 逐行恒定时比较（不把 token 交给 SQL 比较，
 #     也不让命中行数/比较时长成为侧信道）。
 
-def add_api_key(name, scopes=None):
+def _mint_token():
+    """一把新令牌的明文（**只在创建时出现这一次**）。"""
     import secrets
-    token = "echo_" + secrets.token_hex(24)
+    return "echo_" + secrets.token_hex(24)
+
+
+def add_api_key(name, scopes=None):
+    """新建密钥，**只回明文 token**（老契约，不要改返回值：调用方与用例都按它写）。
+
+    要拿到 id 的用 :func:`add_api_key_row` —— 手机/手表配对那条链要把 id 回给设备，
+    好让用户在面板的「已配设备」列表里对上"这是哪一台"。
+    """
+    return add_api_key_row(name, scopes)["token"]
+
+
+def add_api_key_row(name, scopes=None):
+    """新建密钥并把**这一行**回出来（含 id 与明文 token，不含 token_hash）。"""
+    token = _mint_token()
+    digest = _hash_token(token)
     _exec("INSERT INTO api_keys(name,token_hash,scopes) VALUES(?,?,?)",
-          (name, _hash_token(token), _json_dumps(scopes or ["read"])))
-    return token
+          (name, digest, _json_dumps(scopes or ["read"])))
+    rows = _query("SELECT id,name,scopes,enabled,created_at FROM api_keys WHERE token_hash=?",
+                  (digest,))
+    row = (rows[0] if rows else {}) or {}
+    row["scopes"] = _json_loads(row.get("scopes"), [])
+    row["token"] = token
+    return row
 
 
 def list_api_keys():

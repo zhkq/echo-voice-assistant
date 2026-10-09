@@ -103,7 +103,26 @@ def apply(updated, *, harness_timeout=None) -> list:
     if any(k.startswith("dailyReview") for k in keys):
         out.append(_daily_review())
 
+    # 手机 / 手表触点（2026-10-09）：`serverBindMode` / `serverLanHost` 改了要**丢掉地址缓存**。
+    # 不丢的话守卫会拿着旧地址最长 30 秒（`netguard.own_names()` 的 TTL）—— 表现是
+    # "刚把地址改好，手机却还是连不上（或被 403）"，而且从界面上完全看不出原因。
+    # 注意：真正换监听地址**必须重启 ECHO**（绑哪块网卡在启动时定）；这里只是让**判定**立刻跟上。
+    if any(k in ("serverBindMode", "serverLanHost") for k in keys):
+        out.append(_netguard_cache())
+
     return out
+
+
+def _netguard_cache() -> dict:
+    """让"本机自己的地址/主机名"缓存跟着设置失效。"""
+    try:
+        from app import netguard
+        netguard.forget_own_names()
+        return {"scope": "netguard", "ok": True,
+                "detail": "已按新的绑定档 / 对外地址重算本机地址（换监听地址仍需重启 ECHO）"}
+    except Exception as exc:
+        return {"scope": "netguard", "ok": False,
+                "detail": "%s: %s" % (type(exc).__name__, exc)}
 
 
 def _daily_review() -> dict:

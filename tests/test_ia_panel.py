@@ -464,7 +464,7 @@ class OneEntityOnePlaceTests(unittest.TestCase):
         self.assertIn("改名即入库", self.js)
 
     def test_settings_cards_are_regrouped_into_two_tabs(self):
-        """卡片分组：**设置 5 张 + 业务配置 6 张**（两组，不是三组）。
+        """卡片分组：**设置 6 张 + 业务配置 6 张**（两组，不是三组）。
 
         2026-10-02：IA 重构，旧断言 `SET_CARDS` 三组
         `["general", "business", "capability"]`（business 5 张、capability 2 张）
@@ -479,6 +479,12 @@ class OneEntityOnePlaceTests(unittest.TestCase):
         2026-10-06：「每日回顾」新增 **第 6 张**业务卡（`id: "review"`）——
         语音口述 → DSH 整理并登记工作日志 → 语音追问，是独立于「语音指令」的一条业务链路
         （见 docs/每日回顾-设计.md）。
+
+        2026-10-09（手机 / 手表触点）：设置页新增 **第 6 张卡 `id: "phone"`** ——
+        「允许局域网访问」「对手机公布的地址」+ 一次性配对码 + 已配设备**必须同屏**：
+        拆开的话用户得自己拼「开了档才能配对」与「地址错了连不上」这两句，
+        而这两件事恰好是这条路最容易踩的坑（见 docs/手机触点-App设计.md §5 步 2）。
+        它不是一个新页签、也不改上面那些卡的分组 —— 只是同页多一张卡。
         """
         block = self.js[self.js.index("const SET_CARDS = {"):]
         block = block[:block.index("\nconst SET_PLACED_ELSEWHERE")]
@@ -486,16 +492,14 @@ class OneEntityOnePlaceTests(unittest.TestCase):
         self.assertEqual(groups, ["settings", "business"],
                          "SET_CARDS 只该有两组：%s" % groups)
         setgrp = block[block.index("settings: ["):block.index("business: [")]
-        self.assertEqual(len(re.findall(r'\{ id: "', setgrp)), 5,
-                         "设置应当是 5 张卡（通用/AI组件/快捷键/设备/声纹库）")
+        self.assertEqual(len(re.findall(r'\{ id: "', setgrp)), 6,
+                         "设置应当是 6 张卡（通用/AI组件/快捷键/设备/声纹库/手机·手表）")
         biz = block[block.index("business: ["):]
         self.assertEqual(len(re.findall(r'\{ id: "', biz)), 6,
                          "业务配置应当是 6 张卡（会议转写/语音指令/唤醒/朗读与反馈/队列/每日回顾）")
-        for card_id in ("ai", "dev", "review"):
+        for card_id, where in (("ai", setgrp), ("dev", setgrp), ("phone", setgrp), ("review", biz)):
             with self.subTest(card=card_id):
-                self.assertIn('{ id: "%s"' % card_id,
-                              setgrp if card_id in ("ai", "dev") else biz,
-                              "卡片缺失：%s" % card_id)
+                self.assertIn('{ id: "%s"' % card_id, where, "卡片缺失：%s" % card_id)
         # 两张卡已按用户结构收掉：运行状态 → 仪表盘；工作区与归档 → 并进 AI 组件
         for gone_id in ('{ id: "svc"', '{ id: "ws"'):
             with self.subTest(gone=gone_id):

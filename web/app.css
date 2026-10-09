@@ -1441,3 +1441,23 @@ body.on-history { height: 100vh; overflow-y: hidden; }
   margin-top: 6px; padding-left: 8px; border-left: 2px solid var(--accent);
   color: var(--muted);
 }
+
+/* ---------------- 手机 / 手表触点（2026-10-09，docs/手机触点-App设计.md 阶段 1） ----------------
+   配对码必须**大**：它是要拿到另一台设备上（手机 / 手表）手输的，字号小了必然抄错。
+   其余三块（状态徽章 / 设备表 / 提示）全部复用既有视觉（`.badge` / `.snote` / `.ssub-h`），
+   这里只加"这一张卡特有"的几行 —— 少写样式就少一处漂移。 */
+.phone-badge-row { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+.phone-badge-row .spacer { flex: 1; }
+.phone-pair { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; margin: 10px 0 6px; }
+.phone-code {
+  font-family: ui-monospace, Consolas, monospace; font-size: 30px; font-weight: 700;
+  letter-spacing: 6px; padding: 6px 14px 6px 18px; border-radius: 10px;
+  border: 1px dashed var(--border); background: var(--card2); color: var(--text);
+}
+.phone-pair-side { display: flex; flex-direction: column; gap: 6px; align-items: flex-start; }
+.phone-dev {
+  display: flex; align-items: center; gap: 10px; padding: 6px 0; font-size: 13px;
+  border-bottom: 1px dashed var(--border);
+}
+.phone-dev .spacer { flex: 1; }
+.phone-dev-name { font-weight: 600; }

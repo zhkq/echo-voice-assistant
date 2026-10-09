@@ -251,7 +251,21 @@ def main():
     if not ports.write_port_file(db.DATA_DIR, port):
         print("[warn] 写入 echo-port.txt 失败", flush=True)
     print(f"ECHO 服务启动: http://127.0.0.1:{port}")
-    uvicorn.run(app, host="127.0.0.1", port=port, log_level="info")
+    # 监听地址按 `serverBindMode` 决定（2026-10-09 手机 / 手表触点）：
+    #   loopback（默认）→ 只绑 127.0.0.1；
+    #   lan            → 绑 0.0.0.0（回环照旧可用），**来源守卫仍是权威**：
+    #                    Host 必须是本机自己的地址、且对端不是公网（app/netguard.py）。
+    # 这里只做"绑哪"，不做"放不放行" —— 判据一处（netguard），免得两处漂移。
+    from app import netguard
+    if netguard.lan_mode_enabled():
+        lan_ip = netguard.preferred_address()
+        print("[lan] 局域网访问已开，告诉手机/手表的地址: %s" % (
+            "http://%s:%d" % (lan_ip, port) if lan_ip
+            else "**本机没有可用的私有地址** —— 请手选「对手机公布的地址」"))
+        print("[lan] API 鉴权已强制打开：不带 Bearer 令牌的请求一律 401")
+        uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
+    else:
+        uvicorn.run(app, host="127.0.0.1", port=port, log_level="info")
 
 
 if __name__ == "__main__":

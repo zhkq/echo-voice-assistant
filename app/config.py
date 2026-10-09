@@ -345,6 +345,25 @@ DEFAULTS = {
     # 2026-09-19 用户实测："下面的 dsh 没必要吧，或者把端口挪上去"。
     "serverPort":      dict(value=8970, grp="panel", label="ECHO 面板端口",
                             description="控制面板与 API 的监听端口（8890 曾被系统保留段占用，改用 8970）", value_type="int"),
+    "serverBindMode":  dict(value="loopback", grp="panel", label="允许局域网访问",
+                            options=["loopback", "lan"],
+                            description="loopback = 只绑 127.0.0.1（**默认，最安全**，等于谁也别想从网上连）;"
+                                        "lan = 同时绑局域网，手机 / 手表这些触点才连得上。"
+                                        "开 lan 会**自动打开**「API 鉴权」并**在 lan 期间拒绝关掉它**"
+                                        "（局域网上没有令牌的请求 = 谁都下得了命令、删得了会议），"
+                                        "要关鉴权就先把这一项切回 loopback。"
+                                        "**改完必须重启 ECHO** 才换监听地址；"
+                                        "来源判定在 app/netguard.py：Host 必须是**本机自己的地址**"
+                                        "**且**对端不是公网地址（两条都判，缺一条就是洞）",
+                            value_type="str"),
+    "serverLanHost":   dict(value="", grp="panel", label="对手机公布的地址",
+                            description="配对时告诉手机 / 手表连**哪个**地址。多网卡（VPN / Hyper-V / WSL "
+                                        "虚拟网卡）并存时这一项是必须手选的：自动挑错了，"
+                                        "现象是「配对成功但连不上」。"
+                                        "只填 IP（不要带 `http://`、也不要带端口）；"
+                                        "留空 = 自动挑默认路由那块网卡。"
+                                        "它同时被当作「算本机自己」的 Host 白名单之一（见 netguard）",
+                            value_type="str"),
     # ---------- 语音命令 → 命令与会话（二级子分组，见 grp/sub 的说明）----------
     "commandWorkspace": dict(value="{ECHO_BASE}/aide", grp="voice", sub="command",
                              label="命令会话工作区",
@@ -1381,6 +1400,43 @@ class Settings:
         """已弃用的配置键（供诊断/清理脚本使用）。"""
         return [k for k, meta in DEFAULTS.items() if meta.get("deprecated")]
 
+    #: 允许的绑定档（取值不在这两个里 = 拒收，别写进库）
+    _BIND_MODES = ("loopback", "lan")
+
+    def _couple_bind_mode(self, cleaned):
+        """`serverBindMode=lan` ⇒ `apiAuthEnabled=true` 的**硬联动**（唯一联动点）。
+
+        为什么必须硬联动（2026-10-09 手机 / 手表触点）：局域网上"没有令牌的请求"等于
+        随便一台内网设备都能下命令、删会议、改设置 —— 而「开了局域网、没开鉴权」这个组合
+        从面板上**看不出来**是危险的。所以不靠提醒，靠强制。
+
+        三条规则：
+          1. 改成 `lan` 时自动补上 `apiAuthEnabled=true`（在返回的 `updated` 里看得见）；
+          2. `lan` 生效期间**拒收** `apiAuthEnabled=false`（想关鉴权就先切回 `loopback`）；
+          3. 同一次请求里"切回 loopback + 关鉴权"允许（否则关不掉）。
+
+        联动**只在这里**：面板、向导、安装脚本、CLI 全都走 `update()`，
+        写在 `PUT /api/settings` 里就一定会被绕过。
+        """
+        mode = cleaned.get("serverBindMode")
+        if mode is not None:
+            mode = str(mode).strip().lower()
+            if mode in self._BIND_MODES:
+                cleaned["serverBindMode"] = mode
+            else:
+                cleaned.pop("serverBindMode", None)          # 取值不认识：拒收
+                mode = None
+        effective = mode if mode is not None else str(
+            self.get("serverBindMode", "loopback") or "").strip().lower()
+        if effective != "lan":
+            return cleaned
+        if cleaned.get("apiAuthEnabled") is False:
+            cleaned.pop("apiAuthEnabled", None)              # 规则 2
+        if (cleaned.get("apiAuthEnabled") is not True
+                and self.get("apiAuthEnabled", False) is not True):
+            cleaned["apiAuthEnabled"] = True                 # 规则 1
+        return cleaned
+
     def update(self, mapping):
         """批量更新配置（校验 key 存在；类型按 value_type 强转）。
 
@@ -1421,6 +1477,17 @@ class Settings:
                     skipped.append(k)          # 空 = 不改（防面板整批回传把密钥清掉）
                     continue
             cleaned[k] = v
+        # 绑定档 ⇒ 鉴权 的硬联动（见 `_couple_bind_mode` 的规则表）：
+        # 这一段**必须在写库之前**，否则库里会短暂留下"开了局域网却没开鉴权"的组合。
+        cleaned = self._couple_bind_mode(cleaned)
+        if (cleaned.get("apiAuthEnabled") is True
+                and self.get("apiAuthEnabled", False) is not True):
+            try:
+                db.add_log("info", "settings",
+                           "开局域网访问（serverBindMode=lan）→ 已自动打开 API 鉴权："
+                           "局域网内不带令牌的请求一律 401")
+            except Exception:
+                pass
         if cleaned:
             # 写库与"丢缓存"必须在**同一个临界区**里（否则读者可能在两者之间
             # 用写之前的库内容重建缓存，于是写进来的值又被旧快照盖住）。

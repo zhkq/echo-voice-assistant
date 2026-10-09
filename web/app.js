@@ -1396,6 +1396,13 @@ $("#gotoMeetings").addEventListener("click", (e) => { e.preventDefault(); switch
    `SET_GROUP_ORDER` / `SET_GROUP_NAMES` / `SET_SUB_NAMES` 保留下来给兜底用（grp 词汇表）。 */
 let _settingsCache = [];        // 设置元数据全集（可见行 + provider/能力/智能体的 hidden 行）
 let _capView = null;            // GET /api/capability 的最近一次返回（含 hidden 的能力键与后端清单）
+//: 手机 / 手表触点（2026-10-09，docs/手机触点-App设计.md 阶段 1）：绑定现状 + 已配设备。
+//: **一个缓存**，因为它们在界面上就是同一张卡（「手机 / 手表」）。
+//: `_phoneError` 单独记：读不到时要说清"是不是经局域网地址打开的面板"（开了鉴权后只有回环免令牌）。
+let _phoneState = null;
+let _phoneKeys = null;
+let _phoneError = "";
+let _phoneTimer = 0;            // 配对码倒计时（1 秒一拍；没有待兑换的码时是 0）
 let _compsCache = null;         // GET /api/components（常规页那条"组件就绪 N/M"的摘要用）
 let _routerView = null;         // GET /api/router/status（通道设置的状态行）
 let _statusCache = null;        // GET /api/status（服务卡的运行信息）
@@ -1505,6 +1512,17 @@ const SET_CARDS = {
       common: ["panelAutoStart", "panelStartCollapsed", "panelOpenMode"],
       advOrder: ["面板鉴权"],
       adv: ["apiAuthEnabled", "panelAutoRefresh", "serverPort", "dashboardShowRouter"] },
+    /* 手机 / 手表触点（2026-10-09）。为什么单独一张卡：这两项**只有放在一起才讲得通** ——
+       "开了档才能配对"、"地址错了连不上"，拆到别处用户就得自己拼。
+       配对码与设备列表由 `renderPhoneCard()` 画在 `dynAfter` 里（数据来自 /api/pair/phone）。 */
+    { id: "phone", title: "手机 / 手表",
+      hint: "手机和手表当 ECHO 的前置触点：先允许局域网访问，再发一张一次性配对码给设备。",
+      help: "两步：① 把「允许局域网访问」改成 lan 并**重启 ECHO**（监听地址在启动时定，"
+          + "改了不重启不生效）；② 点「生成配对码」，在设备上输入那 6 位数字兑换。"
+          + "开了 lan 会**自动打开 API 鉴权**（局域网上没有令牌的请求等于谁都能下命令），"
+          + "而**本机面板不受影响**。手机/手表能做的也有边界：**不能**停 ECHO、重启、删会议、改设置。",
+      common: ["serverBindMode", "serverLanHost"],
+      dynAfter: () => `<div id="phoneCardHost">${phoneCardInner()}</div>` },
     { id: "ai", title: "AI 组件",
       hint: "用哪个能力：谁来执行、转写用本机还是在线、朗读用在线还是本机。",
       common: () => renderAiCardCommon(),
@@ -4119,6 +4137,161 @@ function _placedKeys() {
  *  切页签只是显示/隐藏（数据不重拉）。
  *  会议能力通道（`#rtCapHost`）同日撤掉：转写/分离/声纹由谁做现在由
  *  `renderMeetingServiceCard()` 画在「业务配置 → 会议」里 —— 一个实体只有一处状态。 */
+/* ---------------------------------------------------------------- 手机 / 手表触点
+   （2026-10-09，docs/手机触点-App设计.md 阶段 1；手表那条见 docs/手表触点-可行性分析-Watch4Pro.md §4）
+
+   三个决定，都是为了"用户永远看得见自己在哪一步"：
+     * 卡里**只有一个数据源**：`GET /api/pair/phone`（现状）+ `GET /api/keys`（已配设备）；
+     * 按钮走 `data-phone-*` **委托**（这张卡是动态渲染的，按 id 绑定会在重绘后失效 ——
+       那正是"点了没反应"的经典成因）；
+     * 出错**把服务端那句原话说出来**（`_errText`）：409 里写的是"先开局域网访问"这类
+       可执行的原因，把它吞成"生成失败"就等于让用户自己猜。 */
+
+/** 把 `api()` 抛出的 `HTTP 409: {"detail":"…"}` 还原成人话（有 detail 就用它）。 */
+function _errText(err) {
+  const raw = String((err && err.message) || err || "");
+  const m = raw.match(/\{[\s\S]*\}\s*$/);
+  if (m) {
+    try {
+      const body = JSON.parse(m[0]);
+      if (body && body.detail) return String(body.detail);
+    } catch (e) { /* 不是 JSON：原样回 */ }
+  }
+  return raw;
+}
+
+/** 卡片**内容**（纯渲染：只读 `_phoneState` / `_phoneKeys`，不取数、不碰 DOM）。
+ *  拆成"内容"与"刷进去"两个函数，是因为 `dynAfter` 是在**拼 HTML 字符串**的时候被调用的 ——
+ *  那一刻 `#phoneCardHost` 还没进 DOM，在里面写 host 必然是空操作（"卡里一片空白"的成因）。 */
+function phoneCardInner() {
+  const st = _phoneState || null;
+  const ready = !!(st && st.bindMode === "lan");
+  const out = [];
+  out.push(`<div class="phone-badge-row"><span class="badge ${
+    !st ? "idle" : (ready ? "online" : "idle")}">${
+    !st ? "读取中…" : (ready ? "已开放局域网" : "仅本机")}</span>
+    <span class="spacer"></span>
+    <button class="btn mini" data-phone-refresh="1">刷新</button></div>`);
+  if (!st) {
+    out.push(`<div class="muted" style="font-size:12px">${esc(_phoneError || "读取中…")}</div>`);
+    return out.join("");
+  }
+  // ① 绑定现状 —— 手机现在**连不连得上**，只看这一句
+  if (st.bindMode !== "lan") {
+    out.push(`<div class="snote warn"><span>⚠</span><span>现在是「只绑本机」档：
+      <b>手机 / 手表连不上</b>这台机器。把上面「允许局域网访问」改成 <code>lan</code> 保存，
+      然后<b>重启 ECHO</b>（监听地址在启动时定）。</span></div>`);
+  } else {
+    out.push(`<div class="snote"><span>ℹ</span><span>局域网已开放，告诉设备的地址：
+      <code>${esc(st.baseUrl || "（本机没有可用的私有地址）")}</code>
+      ${st.lockedSeconds > 0 ? `　·　配对码<b>限流中</b>，约 ${st.lockedSeconds} 秒后可再试` : ""}</span></div>`);
+  }
+  // ② 配对码
+  const pend = st.pending || {};
+  out.push(`<div class="phone-pair">
+      <div class="phone-code" id="phoneCode">${esc(pend.code || "‒‒‒‒‒‒")}</div>
+      <div class="phone-pair-side">
+        <div class="muted" id="phoneCodeMeta" style="font-size:12px">${
+          pend.code ? `剩余 ${pend.secondsLeft} 秒` : "没有待兑换的码"}</div>
+        <button class="btn" data-phone-issue="1"${st.bindMode === "lan" ? "" : " disabled"}>生成配对码</button>
+      </div>
+    </div>
+    <div class="muted" style="font-size:12px">在设备上输入这 6 位数字兑换（手表不扫码也能用）。
+      码<b>只能用一次</b>，5 分钟内有效；错了太多次会暂时锁住。</div>`);
+  // ③ 已配设备
+  const keys = _phoneKeys || [];
+  out.push(`<div class="ssub-h" style="margin-top:10px"><span>已配设备（${keys.length}）</span></div>`);
+  if (!keys.length) {
+    out.push(`<div class="muted" style="font-size:12px">还没有设备配过这台 ECHO。</div>`);
+  } else {
+    out.push(keys.map((k) => `<div class="phone-dev">
+        <span class="phone-dev-name">${esc(k.name || "未命名")}</span>
+        <span class="muted">${esc((k.scopes || []).join("/"))} ·
+          ${k.last_used_at ? "最近使用 " + esc(k.last_used_at) : "从未使用"}</span>
+        <span class="spacer"></span>
+        <button class="btn mini" data-phone-revoke="${esc(k.id)}">撤销</button>
+      </div>`).join(""));
+  }
+  return out.join("");
+}
+
+/** 把内容刷进卡片（数据到了之后调它 —— **不重绘整页**，免得把别的卡一起重来一遍）。 */
+function renderPhoneCard() {
+  const host = $("#phoneCardHost");
+  if (host) host.innerHTML = phoneCardInner();
+}
+
+function _phoneTick() {
+  if (_phoneTimer) { clearInterval(_phoneTimer); _phoneTimer = 0; }
+  const pend = _phoneState && _phoneState.pending;
+  if (!pend || !pend.secondsLeft) return;
+  _phoneTimer = setInterval(() => {
+    const p = _phoneState && _phoneState.pending;
+    const meta = $("#phoneCodeMeta");
+    if (!p) { clearInterval(_phoneTimer); _phoneTimer = 0; return; }
+    p.secondsLeft = Math.max(0, (p.secondsLeft || 0) - 1);
+    if (meta) meta.textContent = p.secondsLeft > 0 ? `剩余 ${p.secondsLeft} 秒` : "已过期，请重新生成";
+    if (p.secondsLeft <= 0) { clearInterval(_phoneTimer); _phoneTimer = 0; }
+  }, 1000);
+}
+
+async function loadPhoneCard() {
+  let st = null;
+  let keys = null;
+  try {
+    st = await api("/api/pair/phone");
+  } catch (err) {
+    _phoneError = "读不到配对状态：" + _errText(err)
+      + "（若本页是经局域网地址打开的，请改用 http://127.0.0.1:端口 打开面板："
+      + "开了鉴权之后只有本机回环不必带令牌）";
+  }
+  try {
+    keys = await api("/api/keys");
+  } catch (err) { /* 设备列表读不到不影响配对码 */ }
+  if (st) { _phoneState = st; _phoneError = ""; }
+  if (keys) _phoneKeys = keys.items || [];
+  renderPhoneCard();
+  _phoneTick();
+}
+
+async function doPhoneIssue(btn) {
+  if (btn) btn.disabled = true;
+  try {
+    const r = await post("/api/pair/phone", {});
+    _phoneState = Object.assign({}, _phoneState || {}, {
+      baseUrl: r.baseUrl || (_phoneState || {}).baseUrl || "",
+      pending: { code: r.code, secondsLeft: r.ttlSeconds, expiresAt: r.expiresAt },
+    });
+    _phoneError = "";
+    toast("配对码已生成，5 分钟内有效");
+  } catch (err) {
+    toast(_errText(err));
+  }
+  renderPhoneCard();
+  _phoneTick();
+}
+
+async function doPhoneRevoke(id) {
+  if (!window.confirm("撤销这台设备？它下次调用会得 401，需要重新配对。")) return;
+  try {
+    await api("/api/keys/" + encodeURIComponent(id), { method: "DELETE" });
+    toast("已撤销");
+  } catch (err) {
+    toast("撤销失败：" + _errText(err));
+  }
+  await loadPhoneCard();
+}
+
+/* 三个按钮的委托（重绘后不用重绑；与设置区其它按钮同一套做法）。 */
+document.addEventListener("click", async (e) => {
+  const issue = e.target.closest("[data-phone-issue]");
+  if (issue) { await doPhoneIssue(issue); return; }
+  const revoke = e.target.closest("[data-phone-revoke]");
+  if (revoke) { await doPhoneRevoke(revoke.dataset.phoneRevoke); return; }
+  const refresh = e.target.closest("[data-phone-refresh]");
+  if (refresh) { await loadPhoneCard(); return; }
+});
+
 function renderSettingsPanes() {
   const html = {};
   SET_TABS.forEach((t) => {
@@ -4191,6 +4364,9 @@ async function loadSettings() {
     _statusCache = stRes;
     renderSettingsPanes();
     renderBootReadyNote();            // 摘要行用的就是 _compsCache，重绘后要跟着更新
+    // 手机 / 手表卡（2026-10-09）：先渲染"读取中"，取到配对现状与设备列表再刷那一块
+    // （**不 await**：这张卡慢/失败都不该拖住整个设置页）
+    loadPhoneCard();
   } catch (e) { toast("加载设置失败：" + e.message); }
 }
 

@@ -1,22 +1,25 @@
 # -*- coding: utf-8 -*-
 """api.py — ECHO REST API（面板 / 手机 App / DSH skill / CLI 的统一入口）
 
-鉴权：settings.apiAuthEnabled=false（默认）时全开放（仅本机）；
-开启后除 /api/status 外均要求 `Authorization: Bearer <token>`（api_keys 表）。
+鉴权：`apiAuthEnabled=false`（默认）时全开放（此时只绑回环，见 `app/netguard.py`）；
+开启后**网上来的**请求都要 `Authorization: Bearer <token>`（`api_keys` 表），
+而**本机回环**的请求仍然不必带令牌 —— 否则本地面板自己就瞎了（面板是静态页，没有令牌可带，
+于是连"生成配对码"都点不动）。判据见 `optional_auth()`。
 """
 import json
 import os
+import re
 import tempfile
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Request, UploadFile
 from pydantic import BaseModel
 from starlette.background import BackgroundTask
 
 import app.db as db
 from app import __version__ as _ECHO_VERSION
 from app.config import settings
-from app import assistant, manager, meeting, runtime, services, worklog
+from app import assistant, manager, meeting, netguard, phone_pair, ports, runtime, services, worklog
 from app.audio import recorder
 from app.audio import stt as stt_mod
 from app.audio import tts as tts_mod
@@ -49,15 +52,74 @@ def _audio_to_wav16k(src_path, dst_path):
 
 
 # ---------------------------------------------------------------- 鉴权
-def optional_auth(authorization: str = Header(default="")):
+#: 网上来的调用**一律拒收**的动作（手机 / 手表触点，设计 §6-A 的"默认拒绝"）。
+#: 判据是"**这次调用不是从本机发起的**"，不是"令牌叫什么名字" —— 换个名字就能绕过的判据不算判据。
+#: 清单**刻意保持短**：每一条都要能说出"手机凭什么不该做这件事"。
+#: （`clean-short` 与 `settings/reset` 是同两类的**批量/一键**版本 ——
+#:   只挡单个删除/单键修改，等于留了两个更狠的入口。）
+_NETWORK_DENIED = (
+    ("POST", re.compile(r"^/api/control/echo/stop$"), "不允许从手机/手表停掉 ECHO"),
+    ("POST", re.compile(r"^/api/system/restart$"), "不允许从手机/手表重启 ECHO"),
+    ("DELETE", re.compile(r"^/api/meetings/[^/]+$"), "不允许从手机/手表删除会议"),
+    ("POST", re.compile(r"^/api/meetings/clean-short$"), "不允许从手机/手表批量删会议"),
+    ("PUT", re.compile(r"^/api/settings$"), "不允许从手机/手表改设置"),
+    ("POST", re.compile(r"^/api/settings/reset$"), "不允许从手机/手表重置设置"),
+)
+
+
+def _is_loopback_call(request: Request) -> bool:
+    """这次请求**确实来自本机**（Host 是回环 **且** 对端是回环）。
+
+    为什么两条都要判（2026-10-09 手机触点）：
+
+      * 只看 Host：DNS Rebinding 会骗过它（恶意域名解析到本机，浏览器发的 Host 是那个域名）——
+        那种请求会先被 `netguard.local_only_guard` 拦掉，这里是第二道；
+      * 只看对端：同机上任何进程都算"本机" —— 本机进程就是这台机器的用户自己，可以接受。
+
+    判不出对端时按"**不是**本机"处理（见 `netguard.is_loopback_peer()` 的 fail-closed 说明）。
+    """
+    host = request.headers.get("host", "")
+    peer = getattr(getattr(request, "client", None), "host", "") or ""
+    if not netguard.is_loopback_host(host):
+        return False
+    return netguard.is_loopback_peer(peer)
+
+
+def _network_denied(request: Request) -> str:
+    """网上来的调用是否命中拒收清单；命中就回一句能直接显示给用户的原因。"""
+    path = request.url.path.rstrip("/") or "/"
+    for method, pattern, why in _NETWORK_DENIED:
+        if request.method == method and pattern.match(path):
+            return "forbidden: %s（本机面板不受影响）" % why
+    return ""
+
+
+def optional_auth(request: Request, authorization: str = Header(default="")):
+    """默认档（`apiAuthEnabled=false`）全开放；打开后要求 Bearer 令牌。
+
+    **本机调用豁免**（2026-10-09 手机触点）：从回环发起的请求不必带令牌。不这么做的话，
+    `serverBindMode=lan` 强制打开鉴权之后**本地面板自己就瞎了**（面板是静态页，没有令牌可带），
+    用户连"生成配对码"都点不动 —— 而这一项要挡的本来就是**网上的人**。
+    判据只有一处：`_is_loopback_call()`。
+
+    **网上来的调用**另有一张拒收清单（`_NETWORK_DENIED`）：手机 / 手表这类触点
+    不该能停服、重启、删会议、改设置 —— 令牌丢了也不至于把机器搞没。
+    """
     if not settings.get("apiAuthEnabled", False):
         return None
+    from_this_machine = _is_loopback_call(request)
     token = ""
     if authorization.startswith("Bearer "):
         token = authorization[7:].strip()
     row = db.verify_api_key(token) if token else None
+    if row is None and from_this_machine:
+        return None                      # 本机 + 不带令牌 → 放行（回环本来就是本机用户）
     if not row:
         raise HTTPException(status_code=401, detail="无效或缺失 API 密钥")
+    if not from_this_machine:
+        denied = _network_denied(request)
+        if denied:
+            raise HTTPException(status_code=403, detail=denied)
     return row
 
 
@@ -165,6 +227,16 @@ class VoiceprintEnrollIn(BaseModel):
 
 
 class KeyCreateIn(BaseModel):
+    name: str = "mobile"
+
+
+class PhoneClaimIn(BaseModel):
+    """设备用一张**一次性配对码**换令牌（手机 / 手表触点）。
+
+    `name` 是设备自报的名字，只用来在面板的「已配设备」列表里认出"这是哪一台"
+    （默认 `mobile`，与 `KeyCreateIn.name` 同一个默认值）。
+    """
+    code: str = ""
     name: str = "mobile"
 
 
@@ -2264,6 +2336,95 @@ def get_logs(limit: int = 200, level: str = "", source: str = "", _auth=Depends(
 @router.get("/events")
 def get_events(limit: int = 100, _auth=Depends(optional_auth)):
     return {"items": db.list_events(limit=min(limit, 500))}
+
+
+# ---------------------------------------------------------------- 手机 / 手表触点：配对
+# 设计：docs/手机触点-App设计.md §3/§4。2026-10-09 改成"**短码 → 兑换**"两步：
+# 令牌不再出现在二维码里（拍到截图 = 拿到一把无寿命的凭据），而**没有摄像头**的设备
+# （HUAWEI WATCH 4 Pro）也照样能配。理由与算术见 app/phone_pair.py 顶部。
+
+def _phone_base_url() -> str:
+    """该告诉手机 / 手表连哪个地址（**没有可用地址就回空串，不许编一个**）。
+
+    端口取 `ports.active_port()`（**实际**在听的那个），不是配置里的首选值：
+    端口让过位的时候（Windows 保留段 / 被占用），写配置值会让手机连到没人听的端口上，
+    现象是"配对成功但一直连不上"（2026-09-20 面板就踩过同一个坑）。
+    """
+    host = netguard.preferred_address()
+    if not host:
+        return ""
+    port = ports.active_port(int(settings.get("serverPort", 8970) or 8970), db.DATA_DIR)
+    return "http://%s:%d" % (host, port) if port else ""
+
+
+def _pair_state() -> dict:
+    """配对这件事的**全部现状**（面板一处取全，免得三个接口各画一半）。"""
+    return {
+        "bindMode": str(settings.get("serverBindMode", "loopback") or "loopback"),
+        "lanHost": str(settings.get("serverLanHost", "") or ""),
+        "addresses": netguard.local_addresses(),
+        "baseUrl": _phone_base_url(),
+        "pending": phone_pair.pending(),
+        "lockedSeconds": phone_pair.locked_for(),
+        "apiAuthEnabled": bool(settings.get("apiAuthEnabled", False)),
+    }
+
+
+@router.get("/pair/phone")
+def phone_pair_state(_auth=Depends(optional_auth)):
+    """面板用：现在能不能配对、该显示哪个码与哪个地址。**只读，不改任何状态。**"""
+    return _pair_state()
+
+
+@router.post("/pair/phone")
+def phone_pair_issue(request: Request, _auth=Depends(optional_auth)):
+    """生成一张一次性配对码（**只有坐在这台机器前的人能做**）。
+
+    为什么必须回环（设计 §3 新增 1）：配对码的语义是"给设备发钥匙"，
+    能发钥匙的必须是这台机器的主人。网上来的请求**即使带着有效令牌**也不给新码 ——
+    否则一把泄露的令牌就能无限复制凭据。
+
+    为什么 loopback 档不给生成：档位没开时手机根本连不上，生成一张用不了的码只会让用户
+    以为"配好了却连不上"（这正是本仓库最忌讳的那种错）。**如实说原因，指到该改哪一项。**
+    """
+    if not _is_loopback_call(request):
+        raise HTTPException(status_code=403,
+                            detail="配对码只能在 ECHO 这台机器上生成（本机面板）")
+    if not netguard.lan_mode_enabled():
+        raise HTTPException(status_code=409,
+                            detail="「允许局域网访问」还没开，手机连不上这台机器："
+                                   "请把它切成 lan（会自动打开 API 鉴权）并重启 ECHO")
+    base = _phone_base_url()
+    if not base:
+        raise HTTPException(status_code=409,
+                            detail="本机没有可用的私有地址：多网卡机器请在设置里手选"
+                                   "「对手机公布的地址」（编一个地址给手机 = 它一定连不上）")
+    issued = phone_pair.issue()
+    return {"ok": True, "code": issued["code"], "expiresAt": issued["expiresAt"],
+            "ttlSeconds": issued["ttlSeconds"], "baseUrl": base,
+            "addresses": netguard.local_addresses(),
+            "pairString": "echo://phone?host=%s&code=%s" % (base.split("://", 1)[-1],
+                                                            issued["code"])}
+
+
+@router.post("/pair/phone/claim")
+def phone_pair_claim(body: PhoneClaimIn):
+    """设备用配对码换令牌。**唯一一个不带令牌的接口**（也是唯一能从网上调的配对口）。
+
+    守卫是三条（算术见 `app/phone_pair.py` 顶部）：码只有 6 位、5 分钟寿命、用掉即删，
+    外加失败限次（连错 20 次锁 5 分钟）。**故意不做"回环限制"** ——
+    那会让手机 / 手表根本连不上，而这个接口存在的前提就是"设备在网络上"。
+
+    令牌只在这里、只回这一次：库里存的是 sha256，之后无从取回（丢了就删掉重配）。
+    """
+    name = (body.name or "").strip() or "mobile"
+    ok, why = phone_pair.claim(body.code)
+    if not ok:
+        raise HTTPException(status_code=403, detail=why)
+    row = db.add_api_key_row(name, scopes=["device"])
+    return {"ok": True, "token": row.get("token", ""), "keyId": row.get("id"),
+            "name": row.get("name", name), "baseUrl": _phone_base_url(),
+            "note": "令牌只出现这一次，请设备侧立刻存进安全存储"}
 
 
 # ---------------------------------------------------------------- API 密钥（移动端预留）
