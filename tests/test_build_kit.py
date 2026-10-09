@@ -44,6 +44,42 @@ def _load_build_kit():
 build_kit = _load_build_kit()
 
 
+def _load_offline_pack():
+    """把 `scripts/build_offline_pack.py` 当模块加载（只为了拿它的**必需 wheel 契约**）。"""
+    path = SCRIPTS / "build_offline_pack.py"
+    spec = importlib.util.spec_from_file_location("build_offline_pack_contract", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+_packer = _load_offline_pack()
+
+#: 假 bundle 里**贴近真名**的那几份 wheel（报错里看到的是真包名，好读）。
+_NAMED_WHEELS = ("fastapi-0.115.0-py3-none-any.whl", "uvicorn-0.30.0-py3-none-any.whl",
+                 "sherpa_onnx-1.13.8-cp311-cp311-win_amd64.whl",
+                 "modelscope-1.20.0-py3-none-any.whl", "soundfile-0.12.1-py3-none-any.whl",
+                 "pip-24.0-py3-none-any.whl", "setuptools-70.0.0-py3-none-any.whl",
+                 "wheel-0.43.0-py3-none-any.whl", "packaging-24.0-py3-none-any.whl")
+
+
+def _bundle_wheel_names():
+    """夹具的 wheel 清单 = 真名清单 **+ `BUNDLE_REQUIRED_WHEELS` 里还没覆盖的**。
+
+    2026-10-09：白名单补 `pypinyin` 时这份手抄清单没跟上，`verify_bundle()` 报
+    "缺 pypinyin"，于是 `test_a_good_bundle_has_no_problems` 红 —— 红的不是出包逻辑，
+    是夹具过期。按契约补齐之后，白名单再加必需包这里自动跟上（真名那份仍然保留，
+    因为 `test_the_bundle_lands_in_the_kit_root_and_in_the_zip` 断言的就是 fastapi 那个真名）。
+    """
+    have = [n.replace("_", "-").lower() for n in _NAMED_WHEELS]
+    out = list(_NAMED_WHEELS)
+    for need in _packer.BUNDLE_REQUIRED_WHEELS:
+        if need.replace("_", "-").lower() not in have:
+            out.append("%s-1.0.0-py3-none-any.whl" % need)
+    return tuple(out)
+
+
 class DeliveryTemplatesLiveInGit(unittest.TestCase):
     """`先读我.md` 模板必须在仓库里，不能靠从 dist 里捡。"""
 
@@ -623,11 +659,7 @@ class BundleRidesAlongInTheKit(unittest.TestCase):
         (b / "wheels").mkdir(parents=True)
         # 载荷清单：`build_offline_pack.py --bundle` 会写它，`verify_bundle()` 也认它
         (b / "BUNDLE-INFO.txt").write_text("# bundle 清单\n", encoding="utf-8")
-        for name in ("fastapi-0.115.0-py3-none-any.whl", "uvicorn-0.30.0-py3-none-any.whl",
-                     "sherpa_onnx-1.13.8-cp311-cp311-win_amd64.whl",
-                     "modelscope-1.20.0-py3-none-any.whl", "soundfile-0.12.1-py3-none-any.whl",
-                     "pip-24.0-py3-none-any.whl", "setuptools-70.0.0-py3-none-any.whl",
-                     "wheel-0.43.0-py3-none-any.whl", "packaging-24.0-py3-none-any.whl"):
+        for name in _bundle_wheel_names():
             (b / "wheels" / name).write_text("w", encoding="utf-8")
         if with_models:
             m = b / "models" / "sherpa-onnx-streaming"

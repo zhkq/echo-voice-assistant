@@ -118,15 +118,35 @@ class ZipTests(unittest.TestCase):
 # 这一组用例**不联网**：wheels/模型/嵌入包那三件全部打桩，钉的是"摆出来的布局对不对"
 # 与"缺东西时该不该响亮失败"。
 
-_FAKE_WHEELS = ("fastapi-0.115.0-py3-none-any.whl",
-                "uvicorn-0.30.0-py3-none-any.whl",
-                "sherpa_onnx-1.13.8-cp311-cp311-win_amd64.whl",
-                "modelscope-1.20.0-py3-none-any.whl",
-                "soundfile-0.12.1-py3-none-any.whl",
-                "pip-24.0-py3-none-any.whl",
-                "setuptools-70.0.0-py3-none-any.whl",
-                "wheel-0.43.0-py3-none-any.whl",
-                "packaging-24.0-py3-none-any.whl")
+#: 假 wheelhouse 里**贴近真名**的那几份（可读性：报错里看到的是真包名）。
+_FAKE_WHEELS_NAMED = ("fastapi-0.115.0-py3-none-any.whl",
+                      "uvicorn-0.30.0-py3-none-any.whl",
+                      "sherpa_onnx-1.13.8-cp311-cp311-win_amd64.whl",
+                      "modelscope-1.20.0-py3-none-any.whl",
+                      "soundfile-0.12.1-py3-none-any.whl",
+                      "pip-24.0-py3-none-any.whl",
+                      "setuptools-70.0.0-py3-none-any.whl",
+                      "wheel-0.43.0-py3-none-any.whl",
+                      "packaging-24.0-py3-none-any.whl")
+
+
+def _fake_wheels():
+    """夹具的 wheel 清单 = 上面那份真名清单 **+ `BUNDLE_REQUIRED_WHEELS` 里还没覆盖的**。
+
+    为什么不再手抄（2026-10-09）：白名单补 `pypinyin` 之后这份手抄清单没跟上，
+    `verify_bundle()` 于是报"bundle\\wheels 里缺 pypinyin"，**6 条用例一起红** ——
+    而红的不是出包逻辑，是夹具过期（典型"红的地方不是坏的地方"）。
+    按契约补齐之后，白名单再加必需包，这里自动跟上。
+    """
+    have = [n.replace("_", "-").lower() for n in _FAKE_WHEELS_NAMED]
+    out = list(_FAKE_WHEELS_NAMED)
+    for need in packer.BUNDLE_REQUIRED_WHEELS:
+        if need.replace("_", "-").lower() not in have:
+            out.append("%s-1.0.0-py3-none-any.whl" % need)
+    return tuple(out)
+
+
+_FAKE_WHEELS = _fake_wheels()
 
 
 class _BundleCase(unittest.TestCase):
