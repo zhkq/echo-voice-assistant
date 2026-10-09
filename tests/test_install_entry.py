@@ -951,12 +951,29 @@ class RequirementsFilesAreLocaleSafe(unittest.TestCase):
 
     #: 这些目录里的清单不是"我们要 pip 的"（第三方/产物）
     SKIP = ("venv/", ".venv/", "node_modules/", "dist/", "_offline-cache/", ".git/")
+    #: 走目录时**直接剪掉**的名字（与上面同源，但用于 `os.walk` 的 dirnames 剪枝）
+    SKIP_DIRS = ("venv", ".venv", "node_modules", "dist", "_offline-cache", ".git")
 
     def _files(self):
+        # 2026-10-09 修：原来用 `Path.rglob` —— 它**在走目录的过程中**碰到断链
+        # （Windows Junction 指向已被删掉的目标）会直接抛 `FileNotFoundError`，
+        # 把整条门禁带红。而"门禁崩在 walk 到一个毁掉的 node_modules 链上"与
+        # "清单文件有没有编码声明"毫无关系（典型**红的地方不是坏的地方**）。
+        # 现场：把标准版 harness 从 0.1.5-rc.2 换成 0.2.0-rc.2 之后，
+        # `data/harness/profiles/**/node_modules` 里留下 83 个断链，这条用例就崩了。
+        # 改成 `os.walk` + `onerror`（吞掉不可读目录）并**剪掉**本来就不看的目录：
+        # 既robust，又不必真进 node_modules 那几万个小文件。
         out = []
         root = pathlib.Path(ROOT)
-        for pat in ("**/*requirements*.txt", "**/constraints*.txt"):
-            for path in root.rglob(pat.split("/")[-1]):
+        for dirpath, dirnames, filenames in os.walk(str(root), onerror=lambda _e: None):
+            dirnames[:] = [d for d in dirnames if d not in self.SKIP_DIRS]
+            for fn in filenames:
+                low = fn.lower()
+                if not low.endswith(".txt"):
+                    continue
+                if "requirements" not in low and not low.startswith("constraints"):
+                    continue
+                path = pathlib.Path(dirpath) / fn
                 rel = path.relative_to(root).as_posix()
                 if any(s in rel + "/" for s in self.SKIP):
                     continue
