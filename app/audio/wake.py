@@ -391,6 +391,17 @@ class WakeListener(threading.Thread):
                 continue
             try:
                 fire = False
+                #: 诊断（2026-10-09）：`ECHO_WAKE_DEBUG=1` 时每 ~2s 打一行"这一段的
+                #: 帧数 / rms 分布 / 过门控帧数 / 识别文本"。**默认关闭** —— 为什么需要它：
+                #: "麦打开了但永不命中"这个症状，代码里**每一步都没有日志**
+                #: （门控丢帧不打、识别出的文本不打），于是只能靠猜。开着它就能一次看清
+                #: 是"音频没进来"、"门控全丢"还是"进来但识别不出字"。
+                _dbg = str(os.environ.get("ECHO_WAKE_DEBUG", "")).strip() not in ("", "0", "false")
+                if _dbg:
+                    print("[wake-dbg] 开始采集（每 2 秒一行统计）", flush=True)
+                _dbg_n = _dbg_pass = 0
+                _dbg_rms = 0.0
+                _dbg_next = time.time() + 2.0
                 with input_stream(device if device is not None else -1,
                                   blocksize=BLOCK, background=True) as mic:
                     print(f"[wake] 麦克风就绪 (device={mic.device})", flush=True)
@@ -400,6 +411,11 @@ class WakeListener(threading.Thread):
                         x, _ = mic.read(BLOCK)
                         x = x.reshape(-1)
                         rms = float(np.sqrt((x.astype(np.float32) ** 2).mean()))
+                        if _dbg:
+                            _dbg_n += 1
+                            _dbg_rms = max(_dbg_rms, rms)
+                            if rms >= silence_floor:
+                                _dbg_pass += 1
                         hit = False
                         if rms >= silence_floor:
                             silent_run = 0
@@ -412,6 +428,20 @@ class WakeListener(threading.Thread):
                             if silent_run > 20:
                                 silent_run = 0
                                 detector.reset()
+                        if _dbg and time.time() >= _dbg_next:
+                            try:
+                                _txt = _norm(getattr(detector, "rec", None)
+                                             and detector.rec.get_result(detector.stream) or "")
+                            except Exception:
+                                _txt = "（读不到）"
+                            print("[wake-dbg] 帧=%d 过门控=%d(%.0f%%) 峰值rms=%.1f "
+                                  "门限=%.0f 识别文本=%r"
+                                  % (_dbg_n, _dbg_pass,
+                                     100.0 * _dbg_pass / max(_dbg_n, 1),
+                                     _dbg_rms, silence_floor, _txt), flush=True)
+                            _dbg_n = _dbg_pass = 0
+                            _dbg_rms = 0.0
+                            _dbg_next = time.time() + 2.0
                         recent.append(hit)
                         if not hit:
                             continue
