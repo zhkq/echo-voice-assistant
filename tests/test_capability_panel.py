@@ -85,6 +85,38 @@ class CapabilityCardWiringTests(unittest.TestCase):
                 self.assertIn('id="%s"' % el, self.html, "HTML 里没有这个元素")
                 self.assertIn(el, self.js_ids, "HTML 里有，但 JS 从来没引用它（点了没反应）")
 
+    def test_the_moved_card_survives_settings_rerenders(self):
+        """「已配对后端连接情况」卡是**克隆**进占位的，不是搬节点（2026-10-09 修）。
+
+        现场（用户原话）：*"设置-ai组件-转写服务-后端设置下没有内容，那个位置应该是选择
+        本机还是网络，如果选择网络，就有配对情况或者配对框"* —— 他描述的正是这张卡的内容。
+
+        真因：`renderSettingsPanes()` 里 `host.innerHTML = …` 会把 `#capBackendHost`
+        **连同搬进去的静态卡一起销毁** —— 于是**第二次**重绘跑完之后 `$("#capRouteCard")`
+        在文档里再也不存在，那张卡（本机/网络单选 + 配对框 + 启停）就永久消失了。
+        判据因此三条：克隆而不是搬、模板变量要先声明、克隆上的按钮要重新接线。
+        """
+        fn = self.js[self.js.index("function renderSettingsPanes() {"):]
+        fn = fn[:fn.index("\n}")]
+        self.assertIn("cloneNode(true)", fn, "要克隆进占位 —— 搬进去会被 innerHTML 销毁")
+        self.assertNotIn("parentElement !== beHost", fn, "「搬节点」那条判据必须已经删掉")
+        self.assertIn("_capRouteCardTpl", fn, "重绘前存模板、重绘后放克隆")
+        # 克隆之后原节点必须摘掉，否则同 id 并存（卡出现两遍，而 $("#…") 只命中第一个）
+        self.assertIn("capCardNow.remove()", fn,
+                      "原节点与克隆会同 id 并存 —— 必须把原节点移出文档")
+        self.assertIn("bindCapabilityCardControls()", fn,
+                      "克隆出来的按钮不带监听，必须重新接线（否则配对/检测/解除全是死按钮）")
+        # 模板变量必须先声明：`"use strict"` 下漏声明 = ReferenceError，而外面裹着 try
+        # → 表现成"静默的坏显示"（这正是本仓库 2026-10-01 那次事故的形状）
+        self.assertRegex(self.js, r"let _capRouteCardTpl = null",
+                         "面板状态变量先 let 再赋值（PanelStateDeclarationTests 也扫这条）")
+        # 接线函数得真的接那四个按钮
+        bf = self.js[self.js.index("function bindCapabilityCardControls() {"):]
+        bf = bf[:bf.index("\n}")]
+        for bid in ("btnCapPair", "btnCapPairLocal", "btnCapUnpair", "btnCapRouteProbe"):
+            with self.subTest(button=bid):
+                self.assertIn(bid, bf, "克隆之后这个按钮就没人接了")
+
     def test_the_card_lives_inside_the_settings_tab(self):
         """**不新开页签**，长在承载能力配置的那个顶层页签里。
 

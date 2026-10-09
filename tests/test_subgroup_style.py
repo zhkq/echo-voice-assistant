@@ -146,12 +146,25 @@ class AiCardHierarchyTests(unittest.TestCase):
                 self.assertIn('"%s"' % key, fn, "归档少了 %s" % key)
 
     def test_the_backend_settings_host_gets_the_static_card(self):
-        """「后端设置」是个占位；静态卡 `#capRouteCard` 在渲染末尾被搬进去（ids 不变）。"""
+        """「后端设置」是个占位；静态卡 `#capRouteCard` 在渲染末尾被**克隆**进去（ids 不变）。
+
+        ⚠️ **2026-10-09 改的：原来是"搬节点"（`appendChild(beCard)`），那是错的。**
+        上面那行 `host.innerHTML = …` 会把 `#capBackendHost` 连同搬进去的卡**一起销毁**
+        —— 于是第二次重绘之后 `$("#capRouteCard")` 在文档里再也不存在，这张卡
+        （本机/网络单选 + 配对框 + 启停）就永久消失。用户报的正是这个：
+        *"设置-ai组件-转写服务-后端设置下没有内容"*。
+        现在：重绘前存一份模板、重绘后放一份**新克隆**，并重新接线（克隆不带监听）。
+        """
         self.assertIn('sSub("后端设置", `<div id="capBackendHost"></div>`)', self.js)
         panes = self.js[self.js.index("Object.keys(hosts).forEach"):]
         panes = panes[:panes.index("const rp =")]
         self.assertIn('$("#capBackendHost")', panes)
-        self.assertIn('appendChild(beCard)', panes, "要把静态卡搬进去，而不是复制一份")
+        self.assertIn("cloneNode(true)", panes,
+                      "要**克隆**进占位 —— 搬节点会被上面的 innerHTML 销毁（2026-10-09 实测）")
+        self.assertNotIn("appendChild(beCard)", panes,
+                         "「搬节点」那条已经废弃：那张卡会被重绘销毁、永久消失")
+        self.assertIn("_capRouteCardTpl", panes, "克隆用的模板要存在")
+        self.assertIn("bindCapabilityCardControls()", panes, "克隆上的按钮要重新接线")
         self.assertIn("applyTranscribeSettingsVisibility();", panes)
 
     def test_local_and_network_halves_switch_by_the_radio(self):

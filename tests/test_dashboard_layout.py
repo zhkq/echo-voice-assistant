@@ -146,6 +146,38 @@ class DashboardLayoutTests(unittest.TestCase):
         self.assertIn("is-${esc(state", fn, "卡片要带状态类（值才能按状态上色）")
         self.assertNotIn('class="spacer"', self.bar, "flex 时代的占位元素在网格里会抢走一格")
 
+    def test_the_router_row_cannot_collide_with_the_button_column(self):
+        """路由块与按钮列**各行其位** —— 2026-10-09 用户实测："打开 dashboardShowRouter 之后布局乱了"。
+
+        真因两条（都是"自动放置"惹的，改的时候别再交回去）：
+
+        ① `.sb-fo` 原来只写 `grid-column: 1 / -1`，**行号交给自动放置**；`.sb-ops` 是
+           `grid-column: 4`，行号也自动。两者谁先占行会随 DOM/内容变 —— 于是挤进同一行互相压
+           （截图里路由文字与「详情 ›」叠在一起、按钮列被顶歪）。→ 两边都写死 `grid-row`。
+        ② `.fo-right` 的 `flex: 1 1 100%` 是给**独立卡片**用的（让各通道计数独占第二行），
+           复用到状态条这条横排里就索要整行宽度，把「详情 ›」挤到 0 宽、文字竖着断行。
+           → 状态条里改成按内容收缩。
+        """
+        css = _read_css()
+        fo = css[css.index(".status-bar > .sb-fo {"):]
+        fo = fo[:fo.index("}")]
+        self.assertIn("grid-row: 2", fo, "路由块的行号要写死（否则会和按钮列撞行）")
+        self.assertIn("grid-column: 1 / -1", fo, "路由块占整行")
+
+        ops = css[css.index(".status-bar > .sb-ops {"):]
+        ops = ops[:ops.index("}")]
+        self.assertIn("grid-row: 1", ops, "按钮列固定在第 1 行")
+        self.assertIn("grid-column: 4", ops)
+
+        right = css[css.index(".status-bar .sb-fo .fo-right {"):]
+        right = right[:right.index("}")]
+        self.assertIn("flex: 0 1 auto", right,
+                      "状态条里的通道计数要按内容收缩，不能索要整行（否则挤坏「详情 ›」）")
+
+        more = css[css.index(".status-bar .sb-fo .more {"):]
+        more = more[:more.index("}")]
+        self.assertIn("white-space: nowrap", more, "「详情 ›」不许被折成两行")
+
     def test_the_actions_are_icon_buttons_with_exactly_one_entry_each(self):
         """动作只留图标按钮；每个动作在整个页面里**恰好一处**（这条同时防重复 id）。"""
         for bid in ("btnRestartEcho", "btnStopEcho", "btnRailCollapse"):

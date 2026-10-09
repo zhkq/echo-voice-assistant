@@ -3047,6 +3047,13 @@ let _capBackendPath = "";
 //: 「读不到本机后端的状态」与「读不到这台机器的后端计划」两句话（功能其实没坏，只是显示坏了）。
 let _capBackendCache = null;
 
+//: 「已配对后端连接情况」静态卡（`#capRouteCard`）的**模板**。
+//: 用户 2026-10-09 实测的空白就是因为原来"搬节点"进了会被 innerHTML 重建的占位 ——
+//: 那张卡一被销毁就再也没了。现在改成"重绘前存模板、重绘后放克隆"（见 renderSettingsPanes）。
+//: ⚠️ 声明在这儿是**必须的**：文件开头是 `"use strict"`，漏声明就是 ReferenceError，
+//: 而它外面通常裹着 try，表现会变成"读不到……"那种**静默的坏显示**。
+let _capRouteCardTpl = null;
+
 /* 只读计划（批 2）：**点按钮之前先给人看**。走容器路还是扩展包路、哪一档、多大、缺什么、
    先验哪一步，以及 nvidia-smi / docker 的原文。它比状态那一份贵（要问 docker 与显卡），
    所以**只在页签渲染时拉一次**，不跟着 job 的 1.5 秒轮询跑。 */
@@ -3303,15 +3310,29 @@ async function doCapabilityBackendReady() {
   }
 }
 
-const _btnCapPair = $("#btnCapPair");
-if (_btnCapPair) _btnCapPair.addEventListener("click", doCapabilityPair);
-const _btnCapPairLocal = $("#btnCapPairLocal");
-if (_btnCapPairLocal) _btnCapPairLocal.addEventListener("click", doCapabilityPairLocal);
-const _btnCapUnpair = $("#btnCapUnpair");
-if (_btnCapUnpair) _btnCapUnpair.addEventListener("click", doCapabilityUnpair);
-// `#btnCapRouteSave` 不再有了：那几行设置已经收进「会议转写服务」卡，随页签顶部的「保存」落库
-const _btnCapRouteProbe = $("#btnCapRouteProbe");
-if (_btnCapRouteProbe) _btnCapRouteProbe.addEventListener("click", () => loadCapabilityRouting(true));
+/* 「已配对后端连接情况」那张静态卡（`#capRouteCard`）里的按钮接线。
+ *
+ * ⚠️ **必须在每次重绘之后重新接一遍**（2026-10-09 修）：这张卡会被**克隆**进
+ * 「转写服务 → 后端设置」的占位 `#capBackendHost`（见 renderSettingsPanes 里的说明），
+ * 而克隆出来的节点**不带**原来的事件监听 —— 只在这里接一次的话，
+ * 重绘之后「配对 / 检测本机后端 / 解除配对 / 刷新」就全是点了没反应的死按钮。
+ * 每次都作用在刚生成的**新节点**上，所以不会重复触发。
+ *
+ * 单选（本机后端 / 网络后端）走的是**事件委托**（见下面 data-cap-backend-mode 那段），
+ * 不受克隆影响 —— 两套机制并存是有意的，别为了"统一"把这条改成委托：
+ * `tests/test_capability_panel.py` 钉着"这些人点的元素必须被 JS 引用到"。 */
+function bindCapabilityCardControls() {
+  const btnPair = $("#btnCapPair");
+  if (btnPair) btnPair.addEventListener("click", doCapabilityPair);
+  const btnPairLocal = $("#btnCapPairLocal");
+  if (btnPairLocal) btnPairLocal.addEventListener("click", doCapabilityPairLocal);
+  const btnUnpair = $("#btnCapUnpair");
+  if (btnUnpair) btnUnpair.addEventListener("click", doCapabilityUnpair);
+  // `#btnCapRouteSave` 不再有了：那几行设置已经收进「会议转写服务」卡，随页签顶部的「保存」落库
+  const btnProbe = $("#btnCapRouteProbe");
+  if (btnProbe) btnProbe.addEventListener("click", () => loadCapabilityRouting(true));
+}
+bindCapabilityCardControls();
 
 
 
@@ -4303,6 +4324,27 @@ function renderSettingsPanes() {
     if (q) q.textContent = t.who || "";
   });
     if (html.settings) html.settings.push(renderFallbackCards());
+  // 「转写服务 → 后端设置」是**搬进来的静态卡** `#capRouteCard`：配对/本机启停/安装那些控件
+  // 全是静态 DOM + 一堆按 id 找的加载器，搬节点最省事、ids 一个不变（2026-10-02 用户结构）。
+  //
+  // ⚠️ **2026-10-09 改成"克隆"而不是"搬节点"**（用户实测：设置 → AI 组件 → 转写服务 →
+  // 「后端设置」下面是空的）。真因就在下面那行 `host.innerHTML = …`：
+  // 它会把 `#capBackendHost` **连同搬进去的静态卡一起销毁** —— 于是**第二次**
+  // renderSettingsPanes() 跑完之后 `$("#capRouteCard")` 在文档里再也不存在，
+  // 那张卡（本机/网络单选 + 配对框 + 启停）就永久消失了。
+  // 现在：重绘前存一份模板，重绘后往占位里放一份**新克隆**，
+  // 并给克隆上的按钮**重新接线**（`bindCapabilityCardControls`，克隆不带监听）。
+  //
+  // ⚠️ 克隆之后**必须把原节点从文档里摘掉**：`#capRouteCard` 在 index.html 里是
+  // `#setPaneSettings` 的**兄弟**（不归它管），不摘就会和放进去的克隆**同 id 并存** ——
+  // 卡在页面上出现两遍，而 `$("#…")` 只命中第一个（等于操作了看不见的那份）。
+  // 原来"搬节点"顺手做掉了这件事，改成克隆就得显式做。
+  const capCardNow = $("#capRouteCard");
+  if (capCardNow) {
+    _capRouteCardTpl = capCardNow.cloneNode(true);
+    const capHostNow = $("#capBackendHost");
+    if (!capHostNow || !capHostNow.contains(capCardNow)) capCardNow.remove();
+  }
   const hosts = {
     settings: "#setPaneSettings", business: "#setPaneBusiness",
   };
@@ -4310,11 +4352,9 @@ function renderSettingsPanes() {
     const host = $(hosts[id]);
     if (host) host.innerHTML = (html[id] || []).join("");
   });
-  // 「转写服务 → 后端设置」是**搬进来的静态卡** `#capRouteCard`：配对/本机启停/安装那些控件
-  // 全是静态 DOM + 一堆按 id 找的加载器，搬节点最省事、ids 一个不变（2026-10-02 用户结构）。
-  // 搬完按「本机后端 / 网络后端」分别显示（见 applyTranscribeSettingsVisibility）。
-  const beHost = $("#capBackendHost"), beCard = $("#capRouteCard");
-  if (beHost && beCard && beCard.parentElement !== beHost) beHost.appendChild(beCard);
+  const beHost = $("#capBackendHost");
+  if (beHost && _capRouteCardTpl) beHost.appendChild(_capRouteCardTpl.cloneNode(true));
+  bindCapabilityCardControls();
   applyTranscribeSettingsVisibility();
   // 「模型路由」卡（index.html 里**静态**的）里的 7 项路由参数：
   // 卡本身不能由 JS 生成（它的 host 会被 loadRouter()/loadRouterLlm() 渲染，重绘会和
