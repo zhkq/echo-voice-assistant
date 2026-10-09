@@ -86,3 +86,8 @@ __probe__/
 # Superseded delivery packs (multi-GB zips kept locally for reference, never in git).
 _old-packs/
 
+# 本机工具链（2026-10-09）：JDK / Android SDK / Gradle 都是**下载来的**安装包，
+# 1.26 GB / 1.2 万个文件，与 venv/、harness/ 同一类，绝不入库 —— 换台机器重装即可。
+# 它只服务 android/ 那个 App 的本地构建（android/ 本身要不要入库另说，见提交说明）。
+.tools/
+
