@@ -2043,6 +2043,12 @@ def api_install_report(body: InstallReportIn, _auth=Depends(optional_auth)):
     return {"ok": True, "saved": saved, "state": install_state.state()}
 
 
+class PickFolderIn(BaseModel):
+    """「浏览…」的入参：窗口标题 + 起始目录（都可有可无）。"""
+    title: str = ""
+    initial: str = ""
+
+
 class InstallModeIn(BaseModel):
     mode: str = ""
     note: str = ""
@@ -2095,6 +2101,22 @@ def api_skills_install(_auth=Depends(optional_auth)):
     """把随包技能补进各 DSH 家目录的 `skills/`（幂等；已存在的一律跳过）。"""
     from app import skills_setup
     return skills_setup.install()
+
+
+# ---------------------------------------------------------------- 原生选择器（2026-10-11）
+# 首次启用向导 S2 要用户指 Obsidian 笔记库 —— 手敲一长串路径很难受，给一个「浏览…」。
+# **只有回环调用能给**（面板在本机；在别人连过来的会话里弹窗是错的），
+# **取消不是失败**，超时/没有图形会话/不支持的系统都优雅失败（绝不 500、绝不挂住）。
+# 细节与那四条约束见 `app/dialog.py` 的模块说明。
+
+
+@router.post("/dialog/pick-folder")
+def api_pick_folder(body: PickFolderIn, request: Request, _auth=Depends(optional_auth)):
+    """弹一个"选文件夹"的原生窗口，把用户选的结果回给面板。"""
+    if not _is_loopback_call(request):
+        raise HTTPException(status_code=403, detail="这个接口只给本机面板用（选择器只能在本机弹）")
+    from app import dialog
+    return dialog.pick_folder(title=body.title, initial=body.initial)
 
 
 # ---------------------------------------------------------------- 能力 provider（P5 / D25）
