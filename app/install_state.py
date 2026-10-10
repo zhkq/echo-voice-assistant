@@ -89,6 +89,171 @@ def save_report(payload: dict, path: str = "") -> dict:
     return data
 
 
+# ---------------------------------------------------------------- 安装模式（首次 vs 升级）
+#
+# 为什么要单独记一笔，而不是去"猜数据形状"（2026-10-10 用户口径）：
+#   面板要分清两种人 ——
+#     * **首次安装** → 进「首次启用向导」（配 DSH/模型 key、笔记库、三个技能）；
+#     * **升级安装** → 直接进工作状态，**向导入口只留在「设置」里**，顶部不提示。
+#   而"数据目录里有东西"分不出这两者：全新装完、服务一起来就会建库写设置，
+#   于是刚装好的机器看起来也像老机器。**唯一知道真相的是安装器**（它自己判断了
+#   是全新目录还是覆盖已有目录），所以由它写下来。
+#
+#   `first-run.json` 与老的 `installed-components.json` **分开**：后者是旧向导末页写的，
+#   语义是"旧向导走完了"，而新的首次启用向导管的是另一批事（笔记库/技能），
+#   两者不能互相顶替（2026-09-21 那次回归就是判据用错了更窄的一个函数）。
+#: 安装模式登记（安装器写）
+MODE_FILE = "install-mode.json"
+#: 「首次启用向导」走完的凭据（新向导写）
+FIRST_RUN_FILE = "first-run.json"
+
+MODE_FRESH = "fresh"
+MODE_UPGRADE = "upgrade"
+
+
+def mode_path(path: str = "") -> str:
+    return path or os.path.join(_data_root(), MODE_FILE)
+
+
+def first_run_path(path: str = "") -> str:
+    return path or os.path.join(_data_root(), FIRST_RUN_FILE)
+
+
+def _read_json(target: str) -> dict:
+    try:
+        with open(target, encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _write_json(target: str, payload: dict) -> dict:
+    folder = os.path.dirname(target)
+    if folder:
+        os.makedirs(folder, exist_ok=True)
+    tmp = target + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, ensure_ascii=False, indent=2)
+    os.replace(tmp, target)
+    return payload
+
+
+def install_mode(path: str = "") -> str:
+    """`fresh` / `upgrade`；**没登记过返回空串**（不猜 —— 空串由 :func:`onboarding` 兜底）。"""
+    m = str(_read_json(mode_path(path)).get("mode") or "").strip().lower()
+    return m if m in (MODE_FRESH, MODE_UPGRADE) else ""
+
+
+def save_install_mode(mode: str, *, note: str = "", path: str = "") -> dict:
+    """记下"这次是全新装还是覆盖已有目录"。安装器在**装之前**探测、装完写。"""
+    m = str(mode or "").strip().lower()
+    if m not in (MODE_FRESH, MODE_UPGRADE):
+        raise ValueError("mode 只能是 fresh / upgrade：%r" % (mode,))
+    return _write_json(mode_path(path), {
+        "mode": m,
+        "note": str(note or ""),
+        "savedAt": time.strftime("%Y-%m-%d %H:%M:%S"),
+    })
+
+
+def first_run_done(path: str = "") -> bool:
+    """「首次启用向导」走完了没有。
+
+    **只认 JSON 布尔 `true`**（`"yes"` / `1` / `"true"` 一律不算）：写失败时宁可再弹一次
+    （用户点一下就好），也不要"因为读到一个真值就以为走完了" —— 那会让新用户
+    永远配不上笔记库与技能。
+    """
+    return _read_json(first_run_path(path)).get("done") is True
+
+
+def mark_first_run_done(*, mode: str = "", path: str = "") -> dict:
+    return _write_json(first_run_path(path), {
+        "done": True,
+        "mode": str(mode or install_mode(path) or ""),
+        "savedAt": time.strftime("%Y-%m-%d %H:%M:%S"),
+    })
+
+
+def existing_content() -> dict:
+    """安装根里**已经有什么** —— "这是升级"的旁证（**只读、绝不抛**）。
+
+    两个用途：① 安装模式没登记时（老版本升上来的机器）兜底判断；
+    ② 安装器/面板要把"继承了哪些东西"说清楚（会议数据是事故级，必须能核对）。
+    """
+    out = {"dsh": False, "db": False, "rows": 0, "meetings": 0, "vault": ""}
+    try:
+        from app import paths
+        home = paths.dsh_home_root()
+        out["dsh"] = bool(home) and os.path.isdir(home) and any(
+            os.path.exists(os.path.join(home, n))
+            for n in ("settings.yaml", "skills", "sessions", "storages"))
+    except Exception:
+        pass
+    try:
+        import sqlite3
+        from app import paths
+        db = os.path.join(paths.data_root(), "echo.db")
+        if os.path.isfile(db):
+            out["db"] = True
+            # 只读打开：**绝不**顺手建库/迁移（探测不该改机器状态）
+            uri = "file:%s?mode=ro" % db.replace("\\", "/")
+            con = sqlite3.connect(uri, uri=True)
+            try:
+                for table in ("commands", "meetings"):
+                    try:
+                        out["rows"] += int(
+                            con.execute("SELECT COUNT(*) FROM %s" % table).fetchone()[0])
+                    except Exception:
+                        pass
+            finally:
+                con.close()
+    except Exception:
+        pass
+    try:
+        from app import paths
+        root = paths.meetings_root()
+        if root and os.path.isdir(root):
+            out["meetings"] = len([n for n in os.listdir(root)
+                                   if os.path.isdir(os.path.join(root, n))])
+    except Exception:
+        pass
+    try:
+        from app.config import settings
+        out["vault"] = str(settings.get("worklogVaultRoot", "") or "").strip()
+    except Exception:
+        pass
+    return out
+
+
+def onboarding(path: str = "") -> dict:
+    """**首次启用向导该不该自动弹** —— 面板只问这一个判据（别在 JS 里再算一遍）。
+
+    判据（2026-10-10 用户口径）：
+      1. 走过一次 → 不再弹；
+      2. **升级安装 → 不弹**（入口只留「设置」里）：明确登记 `upgrade` 优先；
+         没登记时用"已有内容"兜底（老版本升上来的机器）；
+      3. 其余 → 弹。**注意包含"技能刚装完的全新机器"** —— 技能不负责配笔记库与
+         三个技能，所以 `declared()` 不能拿来当首装判据（2026-09-21 那次正是如此）。
+    """
+    mode = install_mode(path)
+    done = first_run_done(path)
+    ex = existing_content()
+    if mode == MODE_UPGRADE:
+        should, reason = False, "登记为升级安装 —— 直接进工作状态，向导入口在设置里"
+    elif mode == MODE_FRESH:
+        should = not done
+        reason = "登记为全新安装" + ("（向导已走过）" if done else "")
+    else:
+        looks_old = bool(ex["dsh"] or ex["db"] or ex["meetings"] or ex["vault"])
+        should = (not done) and not looks_old
+        reason = ("没登记安装模式，按已有内容判为升级" if looks_old
+                  else "没登记安装模式，看着是全新安装")
+    return {"shouldOnboard": bool(should), "mode": mode, "firstRunDone": done,
+            "reason": reason, "existing": ex}
+
+
+
 def _wizard_file_exists() -> bool:
     """老安装（向导装的）靠 installed-components.json 登记 —— 它也算"登记过"。"""
     try:

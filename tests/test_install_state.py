@@ -623,7 +623,18 @@ class MissingDependencyGuidanceTests(unittest.TestCase):
         app = FastAPI()
         app.include_router(router)
         client = TestClient(app)
-        with patch.object(modelinfo, "_pkg_available", lambda name: False):
+        # ⚠️ **用例隔离**（2026-10-10）：开发机的真实设置里 `apiAuthEnabled=true`
+        # （配对手机时切 `lan` 档被强制打开）。裸 TestClient 不带令牌 → 一律 401，
+        # 这条用例就会为**机器状态**变红（与 `tests/test_api_paths.py` 同一类问题）。
+        # 在**内存里**遮住这一项，不写库（写库会动用户真实设置）。
+        from app.config import settings as _settings
+        _real_get = _settings.get
+
+        def _get(key, *a, **kw):
+            return False if key == "apiAuthEnabled" else _real_get(key, *a, **kw)
+
+        with patch.object(_settings, "get", side_effect=_get), \
+                patch.object(modelinfo, "_pkg_available", lambda name: False):
             r = client.post("/api/models/download", json={"id": "sensevoice"})
         self.assertEqual(200, r.status_code, r.text)
         data = r.json()

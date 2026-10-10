@@ -1989,14 +1989,19 @@ def api_wizard_state(_auth=Depends(optional_auth)):
 
 @router.get("/wizard/first-run")
 def api_wizard_first_run(_auth=Depends(optional_auth)):
-    """是不是首装（还没写过 ``data/installed-components.json``）。
+    """**首次启用向导**该不该自动弹（面板启动时就问它）。
 
-    **刻意做成最轻的一个接口**：面板启动时就要问它，所以这里只做一次
-    ``os.path.isfile`` —— 不能顺手拉 ``/api/wizard/env``（那个要探网，1.5 s 起）。
-    面板据此自动进向导（设计 §0/§1：首装必须进向导，不得跳过）。
+    **刻意做成最轻的一个接口**：不能顺手拉 ``/api/wizard/env``（那个要探网，1.5 s 起）。
+    `shouldOnboard` 由 `install_state.onboarding()` 一处判定 —— 面板**不许**再自己算一遍：
+      * 首次安装（含"技能刚装完"的全新机器）→ 弹；
+      * **升级安装 → 不弹**（直接进工作状态，向导入口只在「设置」里）。
+
+    `firstRun` 保留旧的窄判据（只看旧向导那个文件），只为兼容；**新代码请用
+    `shouldOnboard`** —— 拿 `firstRun` 当"该不该弹向导"正是 2026-09-21 那次回归。
     """
-    from app import wizard
-    return {"firstRun": wizard.first_run(), "installed": wizard.installed_path()}
+    from app import install_state, wizard
+    info = install_state.onboarding()
+    return dict(info, firstRun=wizard.first_run(), installed=wizard.installed_path())
 
 
 @router.post("/wizard/finalize")
@@ -2036,6 +2041,40 @@ def api_install_report(body: InstallReportIn, _auth=Depends(optional_auth)):
     from app import install_state
     saved = install_state.save_report(body.report or {})
     return {"ok": True, "saved": saved, "state": install_state.state()}
+
+
+class InstallModeIn(BaseModel):
+    mode: str = ""
+    note: str = ""
+
+
+@router.get("/install/mode")
+def api_install_mode_get(_auth=Depends(optional_auth)):
+    """这次是**全新安装**还是**升级安装**（`fresh` / `upgrade`；没登记过是空串）。
+
+    为什么要有它（2026-10-10）：面板据此决定**要不要弹首次启用向导** ——
+    全新装要弹（新用户得配笔记库与三个技能），升级装不弹（直接进工作状态）。
+    判据只能来自安装器：它才知道自己是装进空目录还是覆盖已有目录。
+    """
+    from app import install_state
+    return {"mode": install_state.install_mode(),
+            "firstRunDone": install_state.first_run_done(),
+            "existing": install_state.existing_content()}
+
+
+@router.post("/install/mode")
+def api_install_mode_put(body: InstallModeIn, _auth=Depends(optional_auth)):
+    """安装器登记安装模式（`fresh` / `upgrade`）。装**之前**探测、装完写。
+
+    安装器也可以直接写 ``<数据根>/install-mode.json``（同一个文件、同样格式）——
+    那条路不依赖服务已经起来，是无人值守安装的主路。
+    """
+    from app import install_state
+    try:
+        saved = install_state.save_install_mode(body.mode, note=body.note)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    return {"ok": True, "saved": saved, "onboarding": install_state.onboarding()}
 
 
 # ---------------------------------------------------------------- 能力 provider（P5 / D25）
