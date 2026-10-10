@@ -127,5 +127,45 @@ class InstallTests(unittest.TestCase):
                         "另一个家目录必须照装")
 
 
+class InstallerWiringTests(unittest.TestCase):
+    """安装器必须①写下安装模式、②把随包技能装进去（2026-10-11）。
+
+    脚本逻辑是 PowerShell、跑起来要真装一遍，所以按仓库惯例断言**脚本契约**
+    （`tests/test_install_entry.py` 是同一套做法）。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        with open(os.path.join(_ROOT, "scripts", "install-all.ps1"), encoding="utf-8-sig") as fh:
+            cls.ps = fh.read()
+
+    def test_it_probes_and_records_the_install_mode(self):
+        self.assertIn("function Invoke-InstallModeProbe", self.ps)
+        self.assertIn("install-mode.json", self.ps, "要写 <数据根>\\install-mode.json")
+        self.assertIn("$null = Invoke-InstallModeProbe", self.ps,
+                      "**装之前**就要探测（事后分不出全新还是升级）")
+        # 两种模式都要判，且升级必须由"已有内容"推出来
+        self.assertIn("'upgrade'", self.ps)
+        self.assertIn("'fresh'", self.ps)
+
+    def test_the_mode_file_is_written_without_a_bom(self):
+        """PS 5.1 的 `Set-Content -Encoding UTF8` 会写 BOM，而 ECHO 读的是严格 utf-8。
+
+        这里钉住"用 .NET 写、显式 UTF8Encoding($false)"这条 —— 少一个 `$false` 就多一个 BOM。
+        """
+        self.assertIn("UTF8Encoding($false)", self.ps)
+        self.assertNotIn("Set-Content -Path $modeFile", self.ps)
+
+    def test_it_installs_the_shipped_skills_once_the_service_is_up(self):
+        self.assertIn("function Invoke-SkillsSetup", self.ps)
+        self.assertIn("/api/skills/setup", self.ps)
+        # 必须在服务起来**之后**（端口是那时才有的），所以顺序上要晚于 Start-EchoOwnService
+        self.assertLess(self.ps.index("Start-EchoOwnService"),
+                        self.ps.index("Invoke-SkillsSetup"),
+                        "技能那一步要在服务起来之后")
+        # 用户自己的同名技能不许被覆盖 —— 这里只是把"保留"如实报出来
+        self.assertIn("skipped", self.ps)
+
+
 if __name__ == "__main__":
     unittest.main()

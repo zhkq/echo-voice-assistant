@@ -1057,6 +1057,68 @@ function Invoke-BackendStep {
 # ---------------------------------------------------------------- 入口
 Write-Host ''
 Write-Host '  ============================================' -ForegroundColor Cyan
+function Invoke-InstallModeProbe {
+    # 2026-10-11（用户口径）：**安装器负责分辨"全新安装"还是"升级安装"**，并写下来。
+    # 为什么必须由安装器决定：全新装完、服务一起来几秒内就会建库写设置，所以事后再去
+    # "看数据目录空不空"分不出这两者。面板读 <数据根>\install-mode.json 决定要不要进
+    # 「首次启用向导」（fresh）还是直接进工作状态（upgrade）。
+    Step '安装模式探测（全新 / 升级）'
+    $root = $script:TargetRoot
+    $data = Join-Path $root 'data'
+    $hasDsh = $false
+    foreach ($p in @((Join-Path $root 'dsh\home'), (Join-Path $data 'harness'))) {
+        foreach ($n in @('settings.yaml', '.credentials.yaml', 'skills', 'sessions')) {
+            if (Test-Path (Join-Path $p $n)) { $hasDsh = $true }
+        }
+    }
+    $db = Join-Path $data 'echo.db'
+    $hasDb = Test-Path $db
+    $meetings = 0
+    foreach ($m in @((Join-Path $root 'meeting'), (Join-Path $data 'meetings'))) {
+        if (Test-Path $m) {
+            $meetings += @(Get-ChildItem $m -Directory -ErrorAction SilentlyContinue).Count
+        }
+    }
+    $mode = if ($hasDsh -or $hasDb -or ($meetings -gt 0)) { 'upgrade' } else { 'fresh' }
+    if ($hasDsh) { Info '已有 DSH 家目录 —— 智能体那一步会按「已装好即跳过」处理（升级 DSH 需显式指定）' }
+    if ($hasDb) { Info ('已有数据库 {0} —— 配置与业务数据都会继承（不删、不覆盖）' -f $db) }
+    if ($meetings -gt 0) { Ok ('已有 {0} 场会议 —— 会议数据继承' -f $meetings) }
+    $modeFile = Join-Path $data 'install-mode.json'
+    try {
+        New-Item -ItemType Directory -Force -Path $data | Out-Null
+        $json = ([ordered]@{ mode = $mode; note = ("dsh={0} db={1} meetings={2}" -f $hasDsh, $hasDb, $meetings)
+                             at = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') } | ConvertTo-Json)
+        # **不写 BOM**：PS 5.1 的 `Set-Content -Encoding UTF8` 会加 BOM，而 ECHO 那边读的是
+        # 严格 utf-8（虽然也做了 utf-8-sig 兜底，两个方向都堵上更稳）。
+        [System.IO.File]::WriteAllText($modeFile, $json, (New-Object System.Text.UTF8Encoding($false)))
+        Ok ('安装模式 = {0}（已写 {1}）' -f $mode, $modeFile)
+    } catch {
+        Warn ('写安装模式失败（不影响安装）：{0}' -f $_.Exception.Message)
+    }
+    EndStep '安装模式'
+    return $mode
+}
+
+function Invoke-SkillsSetup {
+    # 2026-10-11（用户指出的坑）：随包技能在 <代码目录>\.dsh\skills\，而 agent 是从
+    # **DSH_HOME\skills\** 读技能 —— 两个不同的目录，所以新装的机器上连随包的
+    # meeting-record 都没生效。交给 ECHO 自己搬（它**只补缺、绝不覆盖**用户已有的同名技能）。
+    Step '装随包技能（回顾 / 归档 / 录音）'
+    $port = Get-EchoOwnPort
+    if (-not $port) { Warn '没拿到面板端口 —— 这一步跳过；装完在面板里也能补'; EndStep '技能'; return }
+    try {
+        $r = Invoke-RestMethod -Uri ("http://127.0.0.1:{0}/api/skills/setup" -f $port) `
+                               -Method Post -ContentType 'application/json' -Body '{}' -TimeoutSec 60
+        if (@($r.installed).Count) { Ok ('已装 {0} 项：{1}' -f @($r.installed).Count, (@($r.installed) -join ' / ')) }
+        if (@($r.skipped).Count) { Info ('已有自己的版本，保留不动：{0}' -f (@($r.skipped) -join ' / ')) }
+        if (@($r.absent).Count) { Warn ('包里缺这些技能（包没打全）：{0}' -f (@($r.absent) -join ' / ')) }
+        if (@($r.errors).Count) { Warn ('有几项没装成：{0}' -f (@($r.errors) -join '；')) }
+    } catch {
+        Warn ('装随包技能失败：{0}（面板 → 能力 里能看到，也能补）' -f $_.Exception.Message)
+    }
+    EndStep '技能'
+}
+
 Write-Host '   ECHO 个人语音助理 - 一键安装（快路，不绕 agent）' -ForegroundColor White
 Write-Host ("   模式: {0}   档位: {1}" -f $(if ($Offline) { '离线（不联网）' } else { '在线' }), $Profile) -ForegroundColor Gray
 Write-Host '  ============================================' -ForegroundColor Cyan
@@ -1068,10 +1130,14 @@ if (-not $Agent) { $Agent = if ($Offline) { 'none' } else { 'harness' } }
 if ($Engines.Count -eq 0) { $Engines = @('sherpa') }
 $engineList = @($Engines | Where-Object { $_ } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
 $wantWake = (($Profile -eq 'main') -or $Wake) -and -not $NoWake
-# 步号只为让人看得懂进度：离线那条路多三步（运行时/核心依赖/模型），后端那一步两边都有
-$script:TotalSteps = if ($Offline) { 9 } else { 6 }
+# 步号只为让人看得懂进度：离线那条路多三步（运行时/核心依赖/模型），后端那一步两边都有；
+# 2026-10-11 又多了两步：安装模式探测（开头）+ 装随包技能（服务起来之后）。
+$script:TotalSteps = if ($Offline) { 11 } else { 8 }
 
 Resolve-KitLayout
+
+# **装之前**就把"这是全新还是升级"定下来并写盘（事后分不出来：新装完几秒就有库与设置了）。
+$null = Invoke-InstallModeProbe
 
 # 离线：先备好运行时/依赖/模型，再让 install.ps1 走 -SkipRuntime 那条路
 $rcPy = ''
@@ -1107,6 +1173,10 @@ Install-TreeAndShortcuts
 # （端口推断顺序见 Start-EchoOwnService 的说明）。
 if (-not $SkipStart) { $null = Start-EchoOwnService }
 else { Warn '-SkipStart：不起服务（组件那一步会自己起，端口按安装根的 data\echo-port.txt）'; Remove-Item env:ECHO_PORT -ErrorAction SilentlyContinue }
+
+# 服务起来了才能问它"技能装到哪" —— 随包技能必须落到 DSH 家目录的 skills\ 下才生效
+# （它们跟着代码树走，两者不是同一个目录，见 app/skills_setup.py 的说明）。
+if (-not $SkipStart) { Invoke-SkillsSetup }
 
 # 离线：组件脚本自己也会 `pip install`（引擎依赖）。它的命令行里不会带 --no-index，
 # 所以这里把 pip 的**环境变量**钉死 —— pip 认 PIP_NO_INDEX / PIP_FIND_LINKS，

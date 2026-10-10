@@ -120,8 +120,11 @@ def first_run_path(path: str = "") -> str:
 
 
 def _read_json(target: str) -> dict:
+    # `utf-8-sig`：**必须容忍 BOM** —— 安装器是 PowerShell 5.1，`Set-Content -Encoding UTF8`
+    # 会写 BOM；带 BOM 的 JSON 用严格 utf-8 读会直接抛，于是"安装模式"静默变回空串
+    # （2026-10-11 特意两个方向都堵上：PS 那边写不带 BOM，这边读也容忍）。
     try:
-        with open(target, encoding="utf-8") as fh:
+        with open(target, encoding="utf-8-sig") as fh:
             data = json.load(fh)
         return data if isinstance(data, dict) else {}
     except Exception:
