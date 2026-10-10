@@ -38,7 +38,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from app import paths, services
+from app import paths, platform, services
 from app.config import settings
 
 #: 默认端口：避开 DSH Desktop 的 43120（两者可以同时在跑，互不干扰）
@@ -254,6 +254,85 @@ def online(timeout=1.0):
         return True
     except Exception:
         return False
+
+
+def _same_path(a: str, b: str) -> bool:
+    try:
+        return (os.path.normcase(os.path.normpath(str(a or "")))
+                == os.path.normcase(os.path.normpath(str(b or ""))))
+    except Exception:
+        return False
+
+
+def _entry_from_cmdline(cmdline: str) -> str:
+    """从命令行里挑出 harness 的入口（``…/lib/bin.js``）；挑不出返回 ""。"""
+    for tok in re.split(r"\s+", str(cmdline or "").strip()):
+        t = tok.strip('"').strip("'")
+        low = t.lower()
+        if low.endswith(("bin.js", "bin.mjs")) and "dsh" in low:
+            return t
+    return ""
+
+
+def owner() -> dict:
+    """谁在监听 harness 端口 —— **只问，不动手**。
+
+    返回 ``{"port", "pid", "label", "entry", "ours"}``；没人监听时 ``pid=0``。
+
+    为什么需要它（2026-10-10 用户实测两次 500）：`ensure_running()` 原来只问 `online()`
+    ——"端口有人应答"就算数，于是**切到稳定版之后复用了 dev 的 harness**。两棵树的家目录不同，
+    工作区/会话 id 全对不上：点「开始回顾」→ `session/create` → `workspace/not-found` → 500。
+    这与"后端归属"是同一个病（见 `backend_proc.port_owner` 与 AGENTS.md 那条铁律）。
+
+    判据（与后端同一套）：
+      ① pid 记录对得上 → 就是 ECHO 自己拉的那个（最硬）；
+      ② 否则读它的命令行里那个 ``lib/bin.js``，和**本棵树**的 `local_entry()` 比；
+      ③ **判不出就 `ours=True`（不拦）** —— 拦错会把正常的复用挡在门外（npx 起的实例
+         命令行里没有本机路径，这种就是判不出）。
+    """
+    p = port()
+    out = {"port": p, "pid": 0, "label": "", "entry": "", "ours": True}
+    try:
+        pid = int(platform.listening_pid(p))
+    except Exception:
+        pid = 0
+    if pid <= 0:
+        return out
+    out["pid"] = pid
+    try:
+        out["label"] = str(platform.process_label(pid) or "")
+    except Exception:
+        out["label"] = ""
+    # ① ECHO 自己拉起来的那个（pid 记录）—— 最硬的判据
+    try:
+        if int(_load_pid() or 0) == pid:
+            return out
+    except Exception:
+        pass
+    # ② 命令行里的入口 vs 本棵树的入口
+    try:
+        want = str(local_entry() or "")
+    except Exception:
+        want = ""
+    try:
+        cmd = str(platform.process_command_line(pid) or "")
+    except Exception:
+        cmd = ""
+    got = _entry_from_cmdline(cmd)
+    out["entry"] = got
+    if not want or not got:
+        return out                      # 判不出 → 不拦（见 docstring ③）
+    out["ours"] = _same_path(got, want)
+    return out
+
+
+def foreign_owner() -> dict:
+    """端口上那个 harness **确实**是另一棵树的 → 返回它的信息；否则 ``{}``。
+
+    "确实"= `owner()` 判出了 pid、且判出 `ours=False`。判不出一律不当外人。
+    """
+    o = owner()
+    return o if (o.get("pid") and not o.get("ours")) else {}
 
 
 def secret_cookie():
@@ -561,6 +640,16 @@ def ensure_running(timeout=None):
         return False, conflict
     with _lock:
         if online():
+            # ⚠️ **不能只看"端口有人应答"**（2026-10-10 用户实测两次 500）：端口是两棵树共用的，
+            # 于是切到稳定版之后这里直接把 **dev 的 harness** 认成"已在运行"，而两棵树的家目录
+            # 不同 → 工作区/会话 id 全对不上（`workspace/not-found` → 点「开始回顾」500）。
+            # 判出是别人的就**拒绝复用**，并明确说清是谁占着 —— 判不出照旧复用（见 owner()）。
+            foe = foreign_owner()
+            if foe:
+                return False, (
+                    "%s 上跑的是**另一棵树**的 harness（pid %s，入口 %s）—— 本棵树要用自己那份。"
+                    "先把它停掉（或让切换器切一次，它会把 harness 一起带过来）再重试。"
+                    % (base_url(), foe.get("pid"), foe.get("entry") or "?"))
             return True, "独立 harness 已在运行（%s）" % base_url()
         now = time.monotonic()
         if now - _last_launch < LAUNCH_COOLDOWN:

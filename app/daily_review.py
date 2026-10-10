@@ -307,7 +307,18 @@ def ensure_session(client=None, force_new=False):
 
     if not sid:
         if wid:
-            sid = client.create_session(workspace_id=wid)
+            try:
+                sid = client.create_session(workspace_id=wid)
+            except Exception as e:
+                # ⚠️ **工作区失配不该变成 500**（2026-10-10 用户实测修）。
+                # `dsh_agent._workspace_registry_path()` 的注释早就写明这条路：
+                # "拿到别的后端的旧 workspaceId，建会话时报 not-found → **回退 cwd**"。
+                # 但这里原来把异常直接放走，于是下面那行 `cwd=` 兜底**永远走不到** ——
+                # 现场：切到稳定版后 ECHO 复用了 dev 的 harness，本树的工作区在那边不存在，
+                # 点「开始回顾」直接 500（日志里是 workspace/not-found）。
+                db.add_log("warn", "daily_review",
+                           f"按 workspace({wid}) 建回顾会话失败：{e} —— 丢掉它，按目录重建")
+                wid = ""
         if not sid:
             sid = client.create_session(cwd=ws_path or None)
         if sid:

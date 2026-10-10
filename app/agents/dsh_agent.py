@@ -260,22 +260,32 @@ class DshAgent(AgentAdapter):
         return str((self._registry_workspaces().get(workspace_id) or {}).get("title") or "")
 
     def find_workspace(self, path):
-        """按目录路径找工作区 id（大小写与结尾斜杠容错）。找不到返回 ""。"""
+        """按目录路径找工作区 id（大小写与结尾斜杠容错）。找不到返回 ""。
+
+        ⚠️ **注册表是权威**（2026-10-10 修）：会话记录里的 `workspaceId` 只当**线索** ——
+        它可能指向一个**已经不存在**的工作区（换过后端 / 换过 DSH 家目录 / storage 被重建），
+        拿去 `session/create` 就是 `workspace/not-found`。
+        原来判据 ① 命中就直接返回、**没有验证**，这正是 2026-10-10"点开始回顾 → 500"的一半原因
+        （另一半在 `daily_review.ensure_session` 那行没兜底）。
+        """
         if not path:
             return ""
         want = os.path.normcase(os.path.normpath(path))
-        # ① 会话列表里带 workspaceId 的会话（最直接：反映 DSH 当前认知）
-        try:
-            for it in self.list_sessions():
-                if it.get("workspaceId") and \
-                        os.path.normcase(os.path.normpath(it.get("cwd") or "")) == want:
-                    return it["workspaceId"]
-        except Exception:
-            pass
-        # ② 兜底：直接读 **本后端自己** 的工作区注册表（只读，不改写）
-        for wid, w in self._registry_workspaces().items():
+        reg = self._registry_workspaces()
+        # ① 本后端自己的注册表 —— 权威（只读，不改写 DSH 的文件）
+        for wid, w in reg.items():
             if os.path.normcase(os.path.normpath(w.get("path") or "")) == want:
                 return wid
+        # ② 会话列表里的 workspaceId：**只有注册表也认它**（或注册表压根读不到）才算数，
+        #    否则就是别处留下的旧 id。
+        try:
+            for it in self.list_sessions():
+                wid = it.get("workspaceId")
+                if wid and os.path.normcase(os.path.normpath(it.get("cwd") or "")) == want:
+                    if not reg or wid in reg:
+                        return wid
+        except Exception:
+            pass
         return ""
 
     def ensure_workspace(self, path, title=""):

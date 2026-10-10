@@ -77,6 +77,17 @@ class _FakeClient:
         return self.reply, True
 
 
+class _MismatchClient(_FakeClient):
+    """`create_session(workspace_id=…)` 会失败（工作区不存在），按 cwd 才成功。"""
+
+    def create_session(self, cwd=None, workspace_id=None):
+        self.calls.append(("create_session", cwd, workspace_id))
+        if workspace_id:
+            raise RuntimeError("DSH RPC session/create 返回错误: workspace/not-found "
+                               'workspace "ebf15c43" not found')
+        return "session-fallback"
+
+
 class _Base(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="echo-review-")
@@ -223,6 +234,27 @@ class SessionTests(_Base):
         daily_review.ensure_session(client)
         daily_review.ensure_session(client)
         self.assertEqual(len([c for c in client.calls if c[0] == "create_session"]), 2)
+
+
+class WorkspaceMismatchTests(_Base):
+    """工作区失配**不能变成 500**（2026-10-10 用户实测，两次撞上）。
+
+    现场：切到稳定版之后 ECHO 复用了 dev 的 harness，本树那个 workspace 在对方家里不存在
+    → `session/create` 报 `workspace/not-found` → 点「开始回顾」直接 500。
+    `dsh_agent._workspace_registry_path()` 的注释早就写明这条路该"回退 cwd"，
+    但 `ensure_session` 原来把异常直接放走 —— 下面那个 `cwd=` 兜底永远走不到。
+    """
+
+    def test_it_falls_back_to_cwd_instead_of_raising(self):
+        c = _MismatchClient()
+        sid, wid, info = daily_review.ensure_session(c)          # 关键：不许抛
+        self.assertEqual(sid, "session-fallback", "应当按 cwd 重建会话")
+        self.assertEqual(wid, "", "失效的 workspace 必须被丢掉")
+        tries = [x for x in c.calls if x[0] == "create_session"]
+        self.assertEqual(len(tries), 2, tries)
+        self.assertEqual(tries[0][2], "ws-1", "第一次按 workspace 试")
+        self.assertIsNone(tries[1][2], "第二次不带 workspace（按 cwd）")
+        self.assertTrue(tries[1][1], "按 cwd 兜底时要带路径")
 
 
 class SubmitTests(_Base):

@@ -137,16 +137,44 @@ class HarnessAgent(DshAgent):
         return self._cookie
 
     def rpc(self, method, args=None, timeout=15):
-        """401/403 时重登一次再试（cookie 过期不该让一次命令白跑）。"""
+        """401/403 时重登一次再试（cookie 过期不该让一次命令白跑）；
+        **连不上时把 harness 拉起来再试一次**。
+
+        为什么要自己拉（2026-10-10 用户实测两次 500）：`harness_proc.ensure_running()`
+        只有 **boot** 与 **"应用智能体设置"** 两处调用 —— 回顾/助手/会议/归档**谁都不管
+        harness 在不在跑**。于是切树之后（旧那份已停、新的没起）点「开始回顾」，
+        拿到的就是 `<urlopen error [WinError 10061] 目标计算机积极拒绝>` → 500。
+
+        只对**连接层失败**兜底：HTTP 4xx/5xx 与 RPC 业务错误照旧原样抛（那些不是"没起来"），
+        所以 harness 正常时这条路径没有任何额外开销。
+        """
         try:
             return super().rpc(method, args, timeout=timeout)
         except DshError as e:
             msg = str(e)
-            if "HTTP 401" not in msg and "HTTP 403" not in msg:
+            if "HTTP 401" in msg or "HTTP 403" in msg:
+                self._cookie = self._login()
+                self._cookie_ts = time.time()
+                return super().rpc(method, args, timeout=timeout)
+            if not self._looks_offline(e):
                 raise
-            self._cookie = self._login()
-            self._cookie_ts = time.time()
+            ok, note = harness_proc.ensure_running()
+            if not ok:
+                raise DshError("%s（自动拉起 harness 没成功：%s）" % (e, note)) from e
             return super().rpc(method, args, timeout=timeout)
+
+    @staticmethod
+    def _looks_offline(e):
+        """连接层失败？（**HTTP 错误要先排掉** —— `HTTPError` 也是 `URLError` 的子类，
+        不排掉的话 401/403 会被当成"没起来"，转而去重启一个好好的 harness。）"""
+        cause = getattr(e, "__cause__", None)
+        if isinstance(cause, urllib.error.HTTPError):
+            return False
+        if isinstance(cause, (urllib.error.URLError, ConnectionError)):
+            return True
+        text = str(e)
+        return ("Connection refused" in text or "10061" in text
+                or "urlopen error" in text or "拒绝" in text)
 
     # ------------------------------------------------------------- 可用性
 

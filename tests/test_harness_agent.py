@@ -450,11 +450,29 @@ class HarnessProcTests(unittest.TestCase):
             srv.shutdown()
 
     def test_ensure_running_is_idempotent_when_online(self):
+        # 2026-10-10：`ensure_running()` 在 online 时**还要问一句"端口上那个是不是本棵树的"**
+        # （`foreign_owner()` → `platform.listening_pid()`，Windows 上走 netstat）。
+        # 这条用例断的是"**不会再拉一个**"，所以把归属探针也打桩 —— 否则 netstat 那次 Popen
+        # 会被下面那个一把抓的 mock 记成"拉了新进程"（假红，而且掩盖真问题）。
         with patch.object(harness_proc, "online", lambda timeout=1.0: True), \
+                patch.object(harness_proc, "foreign_owner", lambda: {}), \
                 patch("subprocess.Popen") as popen:
             ok, msg = harness_proc.ensure_running()
         self.assertTrue(ok)
         self.assertIn("已在运行", msg)
+        popen.assert_not_called()
+
+    def test_ensure_running_refuses_a_foreign_harness(self):
+        """端口上是**别的树**的 harness → 不复用，并说清是谁占着（2026-10-10 用户实测）。"""
+        foe = {"pid": 7936, "entry": r"C:\echo-dev\harness\dsh\node_modules\...\bin.js"}
+        with patch.object(harness_proc, "online", lambda timeout=1.0: True), \
+                patch.object(harness_proc, "port_conflict", lambda: None), \
+                patch.object(harness_proc, "foreign_owner", lambda: foe), \
+                patch("subprocess.Popen") as popen:
+            ok, msg = harness_proc.ensure_running()
+        self.assertFalse(ok, "别人的 harness 不算'已在运行'")
+        self.assertIn("另一棵树", msg)
+        self.assertIn("7936", msg)
         popen.assert_not_called()
 
     def test_ensure_running_reports_missing_npx(self):
