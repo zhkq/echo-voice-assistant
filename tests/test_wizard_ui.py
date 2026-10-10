@@ -187,8 +187,10 @@ class WizardUiWiringTests(unittest.TestCase):
         self.assertIn('api("/api/install/state")', self.js, "横幅读的是安装状态接口")
         # 横幅要给出两条明确去处，而不是只报个错
         self.assertIn("gotoWizard()", self.js, "手动向导仍要可达（横幅那个按钮）")
-        self.assertIn('wiz.addEventListener("click", () => gotoWizard())', self.js,
-                      "横幅的「手动向导」要真的接到 gotoWizard")
+        # 2026-10-11：横幅那个按钮改接**新三步向导**（`gotoOnboard`）——旧 13 步那张卡仍在设置里，
+        # 走 `?view=wizard` 的老深链照样能到（见上面那几条）。
+        self.assertIn('wiz.addEventListener("click", () => gotoOnboard(0))', self.js,
+                      "横幅的按钮要真的接到新三步向导")
         self.assertIn('_bootWantWizard', self.js, "?view=wizard 老深链要落到常规并展开向导卡")
         self.assertIn("if (_bootWantWizard) gotoWizard();", block,
                       "老深链下手要真的展开向导卡")
@@ -227,7 +229,7 @@ class WizardUiWiringTests(unittest.TestCase):
         self.assertIn('=== "upgrade"', fn, "判据是「登记为升级安装」")
         self.assertRegex(fn, r'\$\{upgrade \? "" :',
                          "升级时那个按钮必须**不渲染**（不是靠 CSS 藏）")
-        self.assertIn("installGoWizard", fn, "非升级时仍要保留手动入口")
+        self.assertIn("installGoOnboard", fn, "非升级时仍要保留手动入口")
 
     def test_the_step_numbers_in_the_fix_texts_match_what_the_user_sees(self):
         """末页/确认页里"回到向导第 N 步"用的是**界面上的编号**（= `WIZ_STEPS` 下标 + 1）。

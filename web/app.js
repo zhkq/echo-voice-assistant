@@ -317,13 +317,13 @@ async function renderInstallNotice() {
       <div class="muted">${how}</div>
       ${items ? `<ul>${items}</ul>` : ""}
       <div><button class="btn" id="installGoCap">看还缺什么</button>
-           ${upgrade ? "" : `<button class="btn ghost" id="installGoWizard">手动向导</button>`}</div>
+           ${upgrade ? "" : `<button class="btn ghost" id="installGoOnboard">首次启用向导</button>`}</div>
     </div>`;
   const cap = $("#installGoCap", box);
   if (cap) cap.addEventListener("click", () => switchView("capability"));
-  const wiz = $("#installGoWizard", box);
+  const wiz = $("#installGoOnboard", box);
   // 「向导」不再是页签：切到常规 + 展开那张卡 + 滚过去（见 gotoWizard）
-  if (wiz) wiz.addEventListener("click", () => gotoWizard());
+  if (wiz) wiz.addEventListener("click", () => gotoOnboard(0));
 }
 
 /* ---------------- 启动自愈提示（A3，2026-09-22） ----------------
@@ -7215,6 +7215,230 @@ try {
   }
 } catch (e) { /* 忽略 */ }
 
+/* ---------------- 首次启用向导 S1/S2/S3（2026-10-11 用户口径）----------------
+   第一次用 ECHO 要走三步：**配模型 → 指笔记库 → 初始化技能**。
+   升级安装**不进**这里（服务端 `onboarding().shouldOnboard` 为假），入口只在设置里。
+
+   为什么不加第 5 个顶层页签：`_VIEWS` 只有 dashboard/settings/business/history 四个，
+   加一个会动导航与一批固定用例。这里与 `gotoWizard()` **同形**：切到「设置」、
+   展开这张卡、滚过去；卡片本身在运行时建（`renderInstallNotice()` 是同一先例）。
+
+   三步各自去问服务端要判据，**不在前端自己算**：
+     S1 配模型   → POST /api/wizard/test-agent（真让智能体答一句话）
+     S2 指笔记库 → POST /api/dialog/pick-folder（原生选择器）+ /api/dialog/check-vault
+     S3 初始化技能 → POST /api/skills/setup（只补缺、绝不覆盖用户已有的）
+     完成        → POST /api/wizard/first-run（登记"走过一次"，以后不再自动弹）
+*/
+let _onboardStep = 0;
+const _onboard = { modelOk: false, reply: "", note: "", vault: "", vaultIsVault: false, skills: null };
+
+const ONBOARD_STEPS = [
+  { id: "model", name: "配好模型", draw: onboardRenderModel },
+  { id: "vault", name: "指笔记库", draw: onboardRenderVault },
+  { id: "skills", name: "初始化技能", draw: onboardRenderSkills },
+];
+
+const ONBOARD_OBSIDIAN_URL = "https://obsidian.md/download";
+
+function onboardCard() {
+  let card = $("#onboardCard");
+  if (card) return card;
+  const host = ($("#wizCard") && $("#wizCard").parentNode) || document.querySelector("#view-settings");
+  if (!host) return null;
+  card = document.createElement("div");
+  card.className = "card collapsible";
+  card.id = "onboardCard";
+  card.dataset.collapseId = "onboard";
+  card.innerHTML = '<div class="card-title" aria-expanded="true">首次启用向导'
+    + '<span class="sbadge">3 步</span></div><div class="card-body">'
+    + '<div class="snote info"><span>ⓘ</span><span>第一次用 ECHO 按这三步走一遍就行：'
+    + '<b>配模型</b> → <b>指笔记库</b> → <b>初始化技能</b>。'
+    + '升级安装的机器不用走（数据与设置都继承了）。</span></div>'
+    + '<div id="onboardPanel"></div></div>';
+  host.insertBefore(card, host.firstChild);
+  return card;
+}
+
+function gotoOnboard(step) {
+  switchView("settings");
+  const card = onboardCard();
+  if (card) {
+    card.classList.remove("collapsed");
+    const t = card.querySelector(":scope > .card-title");
+    if (t) t.setAttribute("aria-expanded", "true");
+    const collapsed = _collapsedCards();
+    if (collapsed.delete("onboard")) _saveCollapsedCards(collapsed);
+    try { _markCollapseDecided("onboard"); } catch (e) { /* 老版本没有这个函数 */ }
+  }
+  if (typeof step === "number") _onboardStep = Math.max(0, Math.min(ONBOARD_STEPS.length - 1, step));
+  renderOnboard();
+  const after = $("#onboardCard");
+  if (after && after.scrollIntoView) after.scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+function onboardStepBar() {
+  return '<div class="srow"><div class="lbl"><span class="lt">第 ' + (_onboardStep + 1)
+    + ' / ' + ONBOARD_STEPS.length + ' 步 · ' + esc(ONBOARD_STEPS[_onboardStep].name) + '</span></div>'
+    + '<div class="sctl muted">' + ONBOARD_STEPS.map((s, i) => (i === _onboardStep ? '● ' : '○ ') + esc(s.name)).join("　") + '</div></div>';
+}
+
+function renderOnboard() {
+  const box = $("#onboardPanel");
+  if (!box) return;
+  const back = _onboardStep > 0
+    ? '<button class="btn ghost" id="onboardBack">上一步</button>' : "";
+  box.innerHTML = onboardStepBar() + ONBOARD_STEPS[_onboardStep].draw()
+    + '<div class="srow"><div class="lbl"></div><div class="sctl">' + back
+    + '<button class="btn ghost" id="onboardSkip">跳过这一步</button></div></div>';
+  if ($("#onboardBack")) $("#onboardBack").addEventListener("click", () => gotoOnboard(_onboardStep - 1));
+  if ($("#onboardSkip")) $("#onboardSkip").addEventListener("click", () => {
+    if (_onboardStep < ONBOARD_STEPS.length - 1) gotoOnboard(_onboardStep + 1); else onboardFinish();
+  });
+  if ($("#onboardTestAgent")) $("#onboardTestAgent").addEventListener("click", onboardTestAgent);
+  if ($("#onboardNextModel")) $("#onboardNextModel").addEventListener("click", () => gotoOnboard(1));
+  if ($("#onboardPick")) $("#onboardPick").addEventListener("click", onboardPickFolder);
+  if ($("#onboardVault")) $("#onboardVault").addEventListener("input", (e) => { _onboard.vault = e.target.value.trim(); });
+  if ($("#onboardNextVault")) $("#onboardNextVault").addEventListener("click", onboardSaveVault);
+  if ($("#onboardInstallSkills")) $("#onboardInstallSkills").addEventListener("click", onboardInstallSkills);
+  if ($("#onboardFinish")) $("#onboardFinish").addEventListener("click", onboardFinish);
+}
+
+/* ---- S1：配模型（判据 = 真的让智能体答一句话）---- */
+function onboardRenderModel() {
+  const agent = _agentsCache && _agentsCache.find((a) => a.active);
+  const now = agent ? (agent.displayName || agent.name) : "（还没选）";
+  const chip = _onboard.modelOk
+    ? '<div class="snote info"><span>✅</span><span>模型答话了：' + esc(_onboard.reply) + '</span></div>'
+    : (_onboard.note ? '<div class="snote warn"><span>⚠</span><span>' + esc(_onboard.note) + '</span></div>' : "");
+  return '<div class="srow"><div class="lbl"><span class="lt">当前智能体</span></div>'
+    + '<div class="sctl">' + esc(now) + '　<button class="btn ghost" id="onboardGoAgent">去设置智能体</button></div></div>'
+    + '<div class="snote info"><span>ⓘ</span><span>模型 key / 命令是在 <b>DSH 标准版</b>里配的'
+    + '（或者用 DSH 桌面版，它自己带）。点下面这个按钮会<b>真的让模型答一句话</b>'
+    + '（一次很短的调用，会花一点点 token）。</span></div>'
+    + '<div class="srow"><div class="lbl"></div><div class="sctl">'
+    + '<button class="btn" id="onboardTestAgent">测试模型是否可用</button>'
+    + '<button class="btn ghost" id="onboardNextModel">下一步</button></div></div>' + chip;
+}
+
+async function onboardTestAgent() {
+  const btn = $("#onboardTestAgent");
+  if (btn) { btn.disabled = true; btn.textContent = "正在问模型…"; }
+  try {
+    const r = await post("/api/wizard/test-agent", {});
+    _onboard.modelOk = !!(r && r.ok);
+    _onboard.reply = (r && r.reply) || "";
+    _onboard.note = (r && r.message) || "";
+    _onboard.agent = (r && r.agent) || "";
+  } catch (e) {
+    _onboard.modelOk = false;
+    _onboard.note = "测试没成功：" + (e && e.message ? e.message : e);
+  }
+  renderOnboard();
+}
+
+/* ---- S2：指笔记库（原生选择器 + 服务端校验）---- */
+function onboardRenderVault() {
+  const ok = _onboard.vaultIsVault;
+  const chip = _onboard.vault
+    ? (ok ? '<div class="snote info"><span>✅</span><span>这里就是一个 Obsidian 库（有 <code>.obsidian</code>）</span></div>'
+          : '<div class="snote warn"><span>⚠</span><span>这个目录里没有 <code>.obsidian</code> —— 不是 Obsidian 库也能用，'
+            + '我们会直接按目录放笔记；但如果你打算用 Obsidian，建议选到库根目录。</span></div>')
+    : "";
+  return '<div class="srow"><div class="lbl"><span class="lt">笔记库在哪</span>'
+    + sHelp("ECHO 的每日回顾与纪要归档都往这里写。选 Obsidian 库的**根目录**（里面有 .obsidian 的那个）。") + '</div>'
+    + '<div class="sctl"><input class="ctl" id="onboardVault" value="' + esc(_onboard.vault)
+    + '" placeholder="例如 D:\\OneDrive\\文档\\我的库"></div></div>'
+    + '<div class="srow"><div class="lbl"></div><div class="sctl">'
+    + '<button class="btn ghost" id="onboardPick">浏览…</button>'
+    + '<a class="btn ghost" href="' + ONBOARD_OBSIDIAN_URL + '" target="_blank" rel="noreferrer">还没装 Obsidian？去下载</a>'
+    + '<button class="btn" id="onboardNextVault">下一步</button></div></div>'
+    + '<div class="snote info"><span>ⓘ</span><span>「浏览…」只在**本机**弹窗（面板就在这台机器上）。'
+    + '如果它打不开（没有图形会话 / 不是 Windows），直接把路径粘到上面那个框里也一样。</span></div>' + chip;
+}
+
+async function onboardPickFolder() {
+  const btn = $("#onboardPick");
+  if (btn) { btn.disabled = true; btn.textContent = "等你选…"; }
+  try {
+    const r = await post("/api/dialog/pick-folder", { title: "选你的 Obsidian 笔记库（库根目录）", initial: _onboard.vault });
+    if (r && r.ok && r.path) {
+      _onboard.vault = r.path;
+      await onboardCheckVault(r.path);
+    } else if (r && r.cancelled) {
+      _onboard.note = "";                      // **取消不是失败**：什么都不说，继续让用户手敲
+    } else {
+      _onboard.note = (r && r.message) || "选择器打不开，直接粘贴路径即可";
+    }
+  } catch (e) {
+    _onboard.note = "选择器打不开（" + (e && e.message ? e.message : e) + "）—— 直接粘贴路径即可";
+  }
+  renderOnboard();
+}
+
+async function onboardCheckVault(path) {
+  try {
+    const r = await post("/api/dialog/check-vault", { path: path });
+    _onboard.vaultIsVault = !!(r && r.isVault);
+    if (r && !r.ok) _onboard.note = r.message || "这个路径看起来不对";
+  } catch (e) { /* 校验失败不挡路 */ }
+}
+
+async function onboardSaveVault() {
+  const el = $("#onboardVault");
+  const path = ((el && el.value) || _onboard.vault || "").trim();
+  if (!path) { _onboard.note = "先填上笔记库路径（或点「浏览…」）"; renderOnboard(); return; }
+  _onboard.vault = path;
+  await onboardCheckVault(path);
+  try {
+    await post("/api/settings", { values: { worklogVaultRoot: path, dailyReviewVaultRoot: path } });
+    _onboard.note = "";
+    gotoOnboard(2);
+    return;
+  } catch (e) {
+    _onboard.note = "保存失败：" + (e && e.message ? e.message : e);
+  }
+  renderOnboard();
+}
+
+/* ---- S3：初始化技能 ---- */
+function onboardRenderSkills() {
+  const s = _onboard.skills;
+  let chip = "";
+  if (s) {
+    const parts = [];
+    if ((s.installed || []).length) parts.push("已装 " + s.installed.length + " 项");
+    if ((s.skipped || []).length) parts.push("保留你自己已有的 " + s.skipped.length + " 项");
+    if ((s.absent || []).length) parts.push("包里缺 " + s.absent.join("、"));
+    chip = '<div class="snote ' + (s.ok ? "info" : "warn") + '"><span>' + (s.ok ? "✅" : "⚠")
+      + '</span><span>' + esc(parts.join("；") || "没有需要装的") + '</span></div>';
+  }
+  return '<div class="snote info"><span>ⓘ</span><span>三个技能直接决定 ECHO 能不能干活：'
+    + '<b>开启录音</b>、<b>每日回顾</b>、<b>会议归档</b>。'
+    + '装完它们就在你的 DSH 家目录里；<b>你自己改过的同名技能不会被覆盖</b>。'
+    + '每人的登记规则不同 —— 技能<b>第一次用到时会问你一句</b>，然后记进 '
+    + '<code>&lt;笔记库&gt;/.echo/profile.md</code>。</span></div>'
+    + '<div class="srow"><div class="lbl"></div><div class="sctl">'
+    + '<button class="btn" id="onboardInstallSkills">初始化这三个技能</button>'
+    + '<button class="btn ghost" id="onboardFinish">完成，开始用</button></div></div>' + chip;
+}
+
+async function onboardInstallSkills() {
+  const btn = $("#onboardInstallSkills");
+  if (btn) { btn.disabled = true; btn.textContent = "正在装…"; }
+  try {
+    _onboard.skills = await post("/api/skills/setup", {});
+  } catch (e) {
+    _onboard.skills = { ok: false, absent: ["（装失败了：" + (e && e.message ? e.message : e) + "）"] };
+  }
+  renderOnboard();
+}
+
+async function onboardFinish() {
+  try { await post("/api/wizard/first-run", {}); } catch (e) { /* 登记失败不挡人 */ }
+  switchView("dashboard");
+  renderInstallNotice();
+}
+
 async function bootView() {
   // 2026-10-11（用户口径）：**首次安装**进「首次启用向导」（配 DSH/模型 key、笔记库、
   // 三个技能）；**升级安装**直接进工作状态，向导入口只留在设置里。
@@ -7227,7 +7451,7 @@ async function bootView() {
       if (on && on.shouldOnboard) {
         switchView("settings");
         renderInstallNotice();
-        gotoWizard();
+        gotoOnboard(0);   // 首装：进**新**三步向导（旧 13 步那张卡仍在设置里，供手动用）
         return;
       }
     } catch (e) {

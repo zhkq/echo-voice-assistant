@@ -2043,6 +2043,11 @@ def api_install_report(body: InstallReportIn, _auth=Depends(optional_auth)):
     return {"ok": True, "saved": saved, "state": install_state.state()}
 
 
+class CheckVaultIn(BaseModel):
+    """S2 校验用：用户（或选择器）给的目录。"""
+    path: str = ""
+
+
 class PickFolderIn(BaseModel):
     """「浏览…」的入参：窗口标题 + 起始目录（都可有可无）。"""
     title: str = ""
@@ -2186,6 +2191,41 @@ def api_wizard_test_agent(_auth=Depends(optional_auth)):
                            "可以到 设置 → 智能体 点「检测」看细节" % elapsed}
     return {"ok": True, "agent": name, "reply": text[:200], "done": bool(done),
             "elapsed": elapsed, "reason": "", "message": ""}
+
+
+# ---------------------------------------------------------------- 首次启用向导（2026-10-11）
+# S2 的「浏览…」选完目录要**校验一下**（服务端才知道那个目录里有没有 .obsidian）；
+# 走完三步要**登记一次**（以后不再自动弹）。两件都是只读/轻量，且失败一律不抛。
+
+
+@router.post("/dialog/check-vault")
+def api_check_vault(body: CheckVaultIn, _auth=Depends(optional_auth)):
+    """看一眼这个目录像不像 Obsidian 库（**只读**；判不出来也照样能用）。
+
+    `isVault` 只表示"里面有 `.obsidian`"。**不是库也能用**（我们按目录放笔记）——
+    所以这不是"校验失败"，面板不该因此拦住用户。
+    """
+    import os as _os
+    path = str(body.path or "").strip()
+    if not path:
+        return {"ok": False, "isVault": False, "message": "还没填路径"}
+    exists = _os.path.isdir(path)
+    is_vault = bool(exists and _os.path.isdir(_os.path.join(path, ".obsidian")))
+    note = ""
+    if not exists:
+        note = "这个路径不是一个目录（也可能还没建）"
+    elif not is_vault:
+        note = "里面没有 .obsidian —— 不是 Obsidian 库也能用，我们会直接按目录放笔记"
+    return {"ok": True, "exists": exists, "isVault": is_vault, "path": path, "message": note}
+
+
+@router.post("/wizard/first-run")
+def api_wizard_mark_first_run(_auth=Depends(optional_auth)):
+    """登记"首次启用向导走过一次"（`first-run.json`）。走完三步才调 —— 之后不再自动弹。"""
+    from app import install_state
+    saved = install_state.mark_first_run_done()
+    return {"ok": True, "saved": saved, "onboarding": install_state.onboarding()}
+
 
 
 
