@@ -82,3 +82,18 @@ class EchoStopGuardTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# --- 2026-10-11: 门禁在**开发者这台机器**上跑时 apiAuthEnabled=true（配对过手机，
+# 且 serverBindMode=lan 不让关），而裸 TestClient 的对端是 "testclient"、netguard 判不出
+# 回环 → fail closed → /api/* 一律 401，用例却期望 200。这里在**内存里**遮掉这一项
+# （绝不写库 —— 写库会动用户真实的配对设置），说明见 tests/auth_off.py。
+from tests.auth_off import install_for_module as _auth_off_install
+
+
+def setUpModule():
+    _auth_off_install(globals())
+
+
+def tearDownModule():
+    _auth_off_install(globals())

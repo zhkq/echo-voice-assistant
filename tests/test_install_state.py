@@ -129,6 +129,12 @@ class InstallReportTests(unittest.TestCase):
         report = {"engines": ["qwen3asr"], "agent": "none"}
         # 依赖探测注入成"没有"，模型探测注入成"就绪" → 必须报"缺依赖"
         with patch.object(install_state, "_module_ok", lambda name: False), \
+                patch.object(install_state, "_node_ok", lambda: True), \
+                patch.object(install_state, "_harness_online", lambda: True), \
+                patch.object(install_state, "_dsh_online", lambda: True), \
+                patch.object(install_state, "_node_ok", lambda: True), \
+                patch.object(install_state, "_harness_online", lambda: True), \
+                patch.object(install_state, "_dsh_online", lambda: True), \
                 patch.object(install_state, "_model_ready", lambda mid: True):
             miss = install_state.missing(report)
         self.assertTrue(miss)
@@ -207,6 +213,12 @@ class InstallReportTests(unittest.TestCase):
         with patch.object(install_state, "load_report", lambda path="": report), \
                 patch.object(install_state, "declared", lambda path="": True), \
                 patch.object(install_state, "_module_ok", lambda name: True), \
+                patch.object(install_state, "_node_ok", lambda: True), \
+                patch.object(install_state, "_harness_online", lambda: True), \
+                patch.object(install_state, "_dsh_online", lambda: True), \
+                patch.object(install_state, "_node_ok", lambda: True), \
+                patch.object(install_state, "_harness_online", lambda: True), \
+                patch.object(install_state, "_dsh_online", lambda: True), \
                 patch.object(install_state, "_model_ready", lambda mid: mid == "sherpa"):
             st = install_state.state()
         self.assertTrue(st["declared"])

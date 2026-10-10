@@ -18,6 +18,8 @@
 import os
 import shutil
 
+from app import paths
+
 #: 随包分发的技能：`.dsh/skills/<名字>/` → `<DSH_HOME>/skills/<名字>/`
 #:
 #: 清单刻意**短**：只放"功能直接相关、且不含个人/单位信息"的骨架。
@@ -27,14 +29,12 @@ SHIPPED = ("meeting-record", "daily-review", "meeting-archive")
 
 
 def code_skills_root() -> str:
-    """技能**源**目录：`<代码目录>/.dsh/skills`。
+    """技能**源**目录：`<安装根>/.dsh/skills`。
 
-    用本文件自己的位置推（`app/skills_setup.py` → 上两级 = 代码目录），
-    **不写任何绝对路径** —— 开发树是 `C:\\echo-dev`、稳定版是 `D:\\ECHO\\echo-core`，
-    客户机又是别的地方，写死任何一处都会在另一处错。
+    委托给 `paths.shipped_skills_root()` —— **安装根只能由 pp/paths.py 推导**（D29），
+    别在这里用 `__file__` 或写死盘符（`tests/test_path_seam.py` 会红）。
     """
-    here = os.path.dirname(os.path.abspath(__file__))          # <code>/app
-    return os.path.join(os.path.dirname(here), ".dsh", "skills")
+    return paths.shipped_skills_root()
 
 
 def target_homes() -> list:

@@ -28,6 +28,7 @@ from unittest.mock import patch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import app.db as db                                              # noqa: E402
+from tests.auth_off import install_for_module as _auth_off_install  # noqa: E402
 from app import harness_proc                                     # noqa: E402
 from app.config import DEFAULTS, settings                         # noqa: E402
 
@@ -75,6 +76,7 @@ def setUpModule():
     _boot._ROUTER_RECHECK_ENABLED = False
 
 
+    _auth_off_install(globals())   # 2026-10-11: 见 tests/auth_off.py
 def tearDownModule():
     harness_proc._pid_path = _OLD_PID_PATH
     harness_proc._token_path = _OLD_TOKEN_PATH
@@ -90,6 +92,7 @@ def tearDownModule():
     shutil.rmtree(_TMP_DIR, ignore_errors=True)
 
 
+    _auth_off_install(globals())   # 2026-10-11: 见 tests/auth_off.py
 class _HarnessStub(BaseHTTPRequestHandler):
     """最小假 harness：`/?token=` 换 Cookie；`/api/*` 校验 Cookie 并回 JSON-RPC 信封。"""
 
@@ -1033,6 +1036,7 @@ class HarnessBrowserOpenTests(unittest.TestCase):
         """
         opened = []
         with patch.object(harness_proc, "secret_cookie", lambda: "dsh-auth-x=secret123"), \
+                patch.object(harness_proc, "online", lambda timeout=1.0: True), \
                 patch("app.browser_open.open_with_cookie",
                       lambda url, cookie, timeout=60.0:
                       (opened.append((url, cookie)) or (True, "已打开并登录"))):
@@ -1048,6 +1052,7 @@ class HarnessBrowserOpenTests(unittest.TestCase):
     def test_cookie_injection_failure_is_honest(self):
         """Cookie 注入失败时不许谎报成功（今天就是被"ok:true 但登不进去"坑的）。"""
         with patch.object(harness_proc, "secret_cookie", lambda: "dsh-auth-x=secret123"), \
+                patch.object(harness_proc, "online", lambda timeout=1.0: True), \
                 patch("app.browser_open.open_with_cookie",
                       lambda url, cookie, timeout=60.0: (False, "Edge 调试端口没开")):
             body = self.client.post("/api/harness/browser").json()

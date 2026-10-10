@@ -32,6 +32,11 @@ ALLOWED_FILES = {
     "manager.py",              # message text only
     "worklog.py",              # _SESSION_STORE (P6)
     "agents/dsh_agent.py",     # CREDENTIALS_PATH + workspace registry (P6)
+    # 2026-10-11: shipped_skills_root() —— 这是**代码/安装根里的** .dsh\\skills（随包技能的
+    # **源**目录，主包白名单里有 .dsh），**不是** DSH 家目录；agent 读技能的地方是 DSH_HOME。
+    # 放在 paths 层正是为了让它只有一个来源（D29），业务代码（app/skills_setup.py）改为调它。
+    # 总数没有增加（仍在 ALLOWED_TOTAL 之内）。
+    "paths.py",
 }
 ALLOWED_TOTAL = 8
 

@@ -513,3 +513,15 @@ def preflight() -> dict:
             pass
         out["roots"].append(item)
     return out
+
+
+def shipped_skills_root() -> str:
+    """随包分发的技能**源**目录：`<代码/安装根>/.dsh/skills`（2026-10-11）。
+
+    与 DSH 家目录**不是一回事**：那是 agent 读技能的地方（`DSH_HOME/skills`，
+    由 `llm_router.dsh_homes()` 与 `harness_proc.home()` 给出）。随包的技能跟着
+    **代码树**走（主包白名单里有 `.dsh`），必须有人把它们搬过去 —— 见 `app/skills_setup.py`。
+
+    放在这一层是因为**安装根只能由本模块推导**（D29）；别在业务代码里用 `__file__` 或写死路径。
+    """
+    return os.path.join(echo_root(), ".dsh", "skills")
