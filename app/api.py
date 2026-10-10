@@ -2119,6 +2119,76 @@ def api_pick_folder(body: PickFolderIn, request: Request, _auth=Depends(optional
     return dialog.pick_folder(title=body.title, initial=body.initial)
 
 
+
+# ---------------------------------------------------------------- S1 的「下一步」（2026-10-11）
+# 用户口径：首次启用向导 S1 点「下一步」要**测试模型是否可用**。
+# 为什么不能只回"配置已保存"：`available(probe=...)` 只证明进程/凭据在，**不证明模型答得出来**
+# （2026-10-10 实测：harness 在跑、凭据也对，但会话开在别棵树的工作区上照样失败）。
+# 唯一判据就是"让当前智能体答一句话"，所以这里真开一个会话、真问一句。
+# ⚠️ 这条会**花钱**（一次极短的模型调用），面板必须把这件事告诉用户。
+
+#: 极短的探针提示词 —— 既要便宜，又要让用户一眼看懂"模型真的答了"。
+TEST_AGENT_PROMPT = "请只回复两个字：可用"
+TEST_AGENT_TIMEOUT = 45
+
+
+@router.post("/wizard/test-agent")
+def api_wizard_test_agent(_auth=Depends(optional_auth)):
+    """让**当前智能体**答一句话，作为"模型可用"的判据。
+
+    返回 ``{ok, agent, reply, done, elapsed, reason, message}``：
+    ``reason`` 为 ``no-agent`` / ``unavailable`` / ``session`` / ``error`` / ``no-reply``；
+    失败一律**不抛**（面板要拿它显示人话，而不是一句 500）。
+    """
+    import time as _time
+    from app import agents as _agents
+
+    name = ""
+    try:
+        name = str(_agents.active_name() or "")
+    except Exception:
+        name = ""
+    try:
+        a = _agents.active_agent()
+    except Exception as e:
+        return {"ok": False, "agent": name, "reason": "no-agent",
+                "message": "拿不到当前智能体：%s" % str(e)[:160]}
+    if a is None:
+        return {"ok": False, "agent": name, "reason": "no-agent",
+                "message": "还没有可用的智能体 —— 先到 设置 → 智能体 里选一个（标准版 harness 或 DSH 桌面版）"}
+
+    # 先看"在不在"，省得白等几十秒（注：这一步**不带** probe，probe 有副作用）
+    try:
+        ok, why = a.available()
+        if not ok:
+            return {"ok": False, "agent": name, "reason": "unavailable",
+                    "message": str(why or "当前智能体不可用")[:300]}
+    except Exception:
+        pass                                     # 问不出来就往下试，别因为探针坏了挡住测试
+
+    t0 = _time.monotonic()
+    try:
+        sid = a.create_session()
+    except Exception as e:
+        return {"ok": False, "agent": name, "reason": "session",
+                "message": "开会话失败：%s" % str(e)[:200]}
+    try:
+        reply, done = a.ask(sid, TEST_AGENT_PROMPT, timeout=TEST_AGENT_TIMEOUT, poll=0.5)
+    except Exception as e:
+        return {"ok": False, "agent": name, "reason": "error",
+                "message": "提问失败：%s" % str(e)[:200]}
+    elapsed = round(_time.monotonic() - t0, 1)
+    text = str(reply or "").strip()
+    if not text:
+        return {"ok": False, "agent": name, "reason": "no-reply", "done": bool(done),
+                "elapsed": elapsed,
+                "message": "智能体没有回话（等 %.0f 秒）—— 多半是模型/命令还没配好；"
+                           "可以到 设置 → 智能体 点「检测」看细节" % elapsed}
+    return {"ok": True, "agent": name, "reply": text[:200], "done": bool(done),
+            "elapsed": elapsed, "reason": "", "message": ""}
+
+
+
 # ---------------------------------------------------------------- 能力 provider（P5 / D25）
 # ASR / LLM / TTS 三类能力的统一清单：谁在生效、是不是要出网（egress）、就绪与否。
 # 与 /api/components 的分工：**components = 装什么**（模型/引擎/运行时的安装与就绪），
