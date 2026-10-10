@@ -112,6 +112,24 @@ Invoke-Step 'compileall app server mac scripts' $py @('-m', 'compileall', '-q', 
 Invoke-Step 'import smoke (entry modules)' $py @('-c', "import app.main, app.api, app.db, app.pathutil, app.modelinfo, app.llm_router, app.audio.tts, app.audio.wake, app.netguard; print('import smoke OK')")
 Invoke-Step 'platform contract tests' $py @('-m', 'unittest', '-q', 'tests.test_platform_contract')
 if (-not $Quick) {
+    # NOTE (2026-10-11): an attempt to make this step hermetic by pointing ECHO_DATA at a
+    # throwaway root was REVERTED. It did fix the 16 machine-state reds caused by the
+    # developer machine having apiAuthEnabled=true (see the note below), but it broke 14
+    # OTHER tests, and those breakages are worse because they silently change what is being
+    # tested:
+    #   * tests that assert the DEFAULT path derivation (`paths.data_root()` ==
+    #     `<echo_root>/data`, the six siblings, ...) no longer see the default;
+    #   * `test_control_echo.test_refuses_while_a_command_is_running` asserts the
+    #     network-denied behavior - with a loopback-ish/isolated setup the exemption hides
+    #     the very refusal it checks.
+    # So the honest fix is per-file: shield `apiAuthEnabled` IN MEMORY in the files that use
+    # a bare TestClient (same pattern as tests/test_api_paths.py and tests/test_install_state.py)
+    # instead of moving the data root under every test's feet. Tracked as remaining work.
+    #
+    # WHY those 16 go red on a paired machine: `optional_auth` reads the REAL settings; with
+    # `apiAuthEnabled=true` (kept on by `serverBindMode=lan`) every bare `TestClient` request
+    # arrives from the peer "testclient", which `netguard` fails CLOSED on (not an IP -> not
+    # loopback) -> `/api/*` answers 401 where the test expects 200.
     $runner = Join-Path $root 'scripts\check-parallel.py'
     if ($Parallel -and -not $Sequential -and (Test-Path $runner)) {
         $runnerArgs = @($runner)

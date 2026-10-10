@@ -394,9 +394,31 @@ class ReadyDetectionTests(unittest.TestCase):
 class ComponentsApiTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        # 2026-10-11：这个类原来**靠开发机的 `data/echo.db` 存在**才过 —— 门禁一旦用隔离的
+        # `ECHO_DATA` 跑（`scripts/check-windows.ps1` 现在这么做），没有库就直接
+        # `sqlite3.OperationalError: no such table: settings`。用例必须自己建库
+        # （与 `tests/test_daily_review.py::_Base` 同一套做法）。
+        from app import db
+        from app.config import settings
+        cls.tmp = tempfile.mkdtemp(prefix="echo-components-")
+        cls._old = (db.DATA_DIR, db.DB_FILE)
+        db.DATA_DIR = cls.tmp
+        db.DB_FILE = os.path.join(cls.tmp, "test.db")
+        db.init()
+        try:
+            settings.seed_defaults()
+        except Exception:
+            pass
         app = FastAPI()
         app.include_router(router)
         cls.client = TestClient(app)
+
+    @classmethod
+    def tearDownClass(cls):
+        from app import db
+        db.DATA_DIR, db.DB_FILE = cls._old
+        import shutil
+        shutil.rmtree(cls.tmp, ignore_errors=True)
 
     def test_components_endpoint(self):
         r = self.client.get("/api/components")
