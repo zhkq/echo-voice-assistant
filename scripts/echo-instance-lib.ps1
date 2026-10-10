@@ -141,6 +141,18 @@ function Get-EchoInstanceProcs([string]$root, $procs) {
         if ($nm -match '^python' -and $cl -like "*$r\dsh-failover\proxy.py*" -and
             $p.ProcessId -ne $PID) {
             $kind = 'router'
+        } elseif ($nm -match '^node' -and $cl -like "*$r\*" -and
+                  $cl -like '*@deepseek-ai\dsh\lib\bin.js*') {
+            # 2026-10-10: the STANDALONE HARNESS (node) must follow its tree like every
+            # other process here. Both trees use port 43199, and ECHO's
+            # ensure_running() used to reuse whoever answered on that port - so after a
+            # switch the new tree kept talking to the OLD tree's harness, whose
+            # DSH_HOME has different workspace ids: `session/create` ->
+            # `workspace/not-found` -> the panel showed a 500 on "start daily review"
+            # (user hit it twice).
+            # Matches both layouts: <root>\dsh\app\node_modules\... (new) and
+            # <root>\harness\dsh\node_modules\... (old).
+            $kind = 'harness'
         } elseif ($nm -match '^(powershell|pwsh)' -and $cl -notlike '*-command*' -and
                   $cl -like '*-file*' -and $cl -like "*$r\scripts\startup.ps1*" -and
                   $p.ProcessId -ne $PID) {
