@@ -74,8 +74,11 @@ class PickFolderTests(unittest.TestCase):
         """① 不能顺带闪一个控制台窗口；② 参数走环境变量（JSON），不许拼进脚本里。"""
         r = _runner(0, b"C:\\vault")
         dialog.pick_folder(title="选笔记库", initial="D:\\one", runner=r)
-        self.assertEqual("powershell", r.calls["argv"][0])
-        self.assertIn("-STA", r.calls["argv"], "FolderBrowserDialog 需要 STA")
+        # 起 shell 走**接缝**（`platform.console_shell_argv`），业务代码里不许写死 `"powershell"`
+        # —— 这条既是 D12，也让 macOS 以后能自己实现一份。
+        from app import platform as echo_platform
+        self.assertEqual(list(echo_platform.console_shell_argv("x"))[:1], list(r.calls["argv"])[:1],
+                         "argv 应当来自接缝")
         self.assertNotIn("选笔记库", " ".join(r.calls["argv"]),
                          "标题不许拼进命令行（中文/引号会出问题）")
         import json

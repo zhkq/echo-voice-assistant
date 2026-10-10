@@ -76,6 +76,18 @@ def no_window_creationflags() -> int:
     return int(fn()) if callable(fn) else 0
 
 
+def has_native_folder_picker() -> bool:
+    """有没有"让用户指一个目录"的原生选择器（目前只有 Windows 实现）。
+
+    为什么要收进接缝：`app/dialog.py` 需要按平台决定"能不能弹窗"，而在业务代码里写
+    `sys.platform` / `os.name` 就是平台分支 —— 门禁 `tests/test_path_seam.py` 明令
+    平台差异只能住在这里（D12）。各平台在 `app/platform/<os>/env.py` 里各实现一份，
+    没实现的默认 False（**优雅失败**，面板回落成手敲路径）。
+    """
+    fn = _platform_fn("has_native_folder_picker")
+    return bool(fn()) if callable(fn) else False
+
+
 def user_data_dir() -> str:
     """本平台放"应用数据"的目录（Windows=%LOCALAPPDATA%，POSIX=$XDG_DATA_HOME 或 ~/.local/share）。
 

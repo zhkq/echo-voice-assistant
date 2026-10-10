@@ -778,3 +778,8 @@ def restrict_file(path: str) -> None:
     业务代码只写一句 `platform.restrict_file(path)`，不必知道哪几个平台需要它。
     """
     return None
+
+
+def has_native_folder_picker() -> bool:
+    """Windows 有 `System.Windows.Forms.FolderBrowserDialog`（见 app/dialog.py）。"""
+    return True

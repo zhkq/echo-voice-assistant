@@ -18,7 +18,6 @@ from __future__ import annotations
 import json
 import os
 import subprocess
-import sys
 
 #: 等用户选目录的上限（秒）。用户可能一边找一边想，别太短；但也不能无限等 ——
 #: 超过就回 "timeout"，前端回落手敲。
@@ -44,8 +43,15 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) {
 
 
 def supported() -> bool:
-    """有没有实现（目前只有 Windows；macOS 上还没写，接口回 `unsupported` 而不是 500）。"""
-    return sys.platform.startswith("win")
+    """有没有实现（目前只有 Windows；macOS 上还没写，接口回 `unsupported` 而不是 500）。
+
+    按平台问**接缝**（`app/platform/`），不在业务代码里写 `sys.platform`（D12）。
+    """
+    try:
+        from app import platform as echo_platform
+        return bool(echo_platform.has_native_folder_picker())
+    except Exception:
+        return False
 
 
 def _no_window() -> int:
@@ -101,7 +107,15 @@ def pick_folder(title: str = "", initial: str = "", timeout: int = PICK_TIMEOUT,
                          ensure_ascii=False)
     env = dict(os.environ)
     env["ECHO_PICK_JSON"] = payload
-    argv = ["powershell", "-NoProfile", "-STA", "-NonInteractive", "-Command", _PS]
+    # 起 shell 一律走接缝（Windows=PowerShell / POSIX=/bin/sh）—— 业务代码里不许出现
+    # `"powershell"` 这种字面量（`tests/test_path_seam.py` 钉着；同一条纪律见 D12）。
+    # ⚠️ 不需要 `-STA`：**Windows PowerShell 5.1 默认就是 STA**，FolderBrowserDialog 要的正是它。
+    try:
+        from app import platform as echo_platform
+        argv = list(echo_platform.console_shell_argv(_PS))
+    except Exception as e:                                  # noqa: BLE001
+        return {"ok": False, "cancelled": False, "reason": "unsupported",
+                "message": "起不了本机 shell：%s" % str(e)[:160]}
     run = runner or _default_runner
     try:
         res = run(argv, env, timeout)
