@@ -297,21 +297,27 @@ async function renderInstallNotice() {
     return;
   }
   const rep = st.report || {};
+  // 2026-10-11（用户口径）：**升级安装的顶部不留向导入口** —— 入口只在「设置 → 常规」那张卡里。
+  // 判据来自服务端（`install_state.install_mode()`），不在前端再猜一遍。
+  const upgrade = String(st.installMode || "") === "upgrade";
   const items = miss.slice(0, 4).map((m) =>
     `<li>${esc(m.feature || "")} —— ${esc(m.reason || "")}${m.fix ? `<span class="muted">（${esc(m.fix)}）</span>` : ""}</li>`).join("");
   const head = st.declared
     ? `安装已登记${rep.savedAt ? "（" + esc(rep.savedAt) + "）" : ""}，但还有 ${miss.length} 项没就绪`
     : `这台机器还没登记安装完成`;
-  const how = st.declared
-    ? `可以现在补：面板 → 能力；或让助手再跑一次 echo-install 技能（已装好的会跳过）。`
-    : `推荐做法：把分享包里的 <code>echo-install</code> 文件夹交给你的 AI 助手，说「按 echo-install 这个技能给我装 ECHO」。<b>没有助手</b>也可以点下面的「手动向导」按界面走一遍。`;
+  const how = upgrade
+    ? `这是**升级安装**：数据与设置都已继承，面板直接可用。要补装什么就走「面板 → 能力」；
+       想再走一遍安装向导：设置 → 常规 → 安装向导。`
+    : (st.declared
+      ? `可以现在补：面板 → 能力；或让助手再跑一次 echo-install 技能（已装好的会跳过）。`
+      : `推荐做法：把分享包里的 <code>echo-install</code> 文件夹交给你的 AI 助手，说「按 echo-install 这个技能给我装 ECHO」。<b>没有助手</b>也可以点下面的「手动向导」按界面走一遍。`);
   box.dataset.state = "warn";
   box.innerHTML = `<div class="install-notice">
       <div><b>${head}</b></div>
       <div class="muted">${how}</div>
       ${items ? `<ul>${items}</ul>` : ""}
       <div><button class="btn" id="installGoCap">看还缺什么</button>
-           <button class="btn ghost" id="installGoWizard">手动向导</button></div>
+           ${upgrade ? "" : `<button class="btn ghost" id="installGoWizard">手动向导</button>`}</div>
     </div>`;
   const cap = $("#installGoCap", box);
   if (cap) cap.addEventListener("click", () => switchView("capability"));
@@ -7210,6 +7216,24 @@ try {
 } catch (e) { /* 忽略 */ }
 
 async function bootView() {
+  // 2026-10-11（用户口径）：**首次安装**进「首次启用向导」（配 DSH/模型 key、笔记库、
+  // 三个技能）；**升级安装**直接进工作状态，向导入口只留在设置里。
+  // 判据**只问服务端**（`/api/wizard/first-run` 的 `shouldOnboard` = `install_state.onboarding()`）——
+  // 前端再算一遍必然与它漂移（2026-09-21 那次"技能装完还进向导"就是判据写窄了）。
+  // 老书签/深链（`?view=…` / `?wizstep=…`）**优先**：用户明确指定就别抢首屏。
+  if (!_bootView && !_bootWantWizard) {
+    try {
+      const on = await api("/api/wizard/first-run");
+      if (on && on.shouldOnboard) {
+        switchView("settings");
+        renderInstallNotice();
+        gotoWizard();
+        return;
+      }
+    } catch (e) {
+      /* 问不到就不抢首屏 —— 宁可少进一次向导，也不要把面板挡在门外 */
+    }
+  }
   if (_bootView) {
     if (_bootWantHist) _histTab = _bootWantHist;
     switchView(_bootView);

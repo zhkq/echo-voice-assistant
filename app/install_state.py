@@ -526,6 +526,10 @@ def state(path: str = "") -> dict:
         "declared": declared(path),
         "report": report,
         "wanted": wanted(report),
+        # 安装模式与"首次启用向导走过没"（2026-10-11）：面板横幅据此决定要不要给
+        # 「手动向导」按钮 —— **升级安装的入口只留在「设置」里**（用户口径）。
+        "installMode": install_mode(),
+        "firstRunDone": first_run_done(),
         "engines": [{"id": e, "label": (ENGINE_SPECS.get(e) or {}).get("label", e),
                      "moduleOk": _module_ok((ENGINE_SPECS.get(e) or {}).get("module", "")),
                      "modelReady": _model_ready((ENGINE_SPECS.get(e) or {}).get("model", ""))}

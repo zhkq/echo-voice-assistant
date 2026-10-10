@@ -2077,6 +2077,26 @@ def api_install_mode_put(body: InstallModeIn, _auth=Depends(optional_auth)):
     return {"ok": True, "saved": saved, "onboarding": install_state.onboarding()}
 
 
+# ---------------------------------------------------------------- 随包技能（2026-10-11）
+# 随包的技能跟着**代码树**走（`<代码目录>/.dsh/skills/`），而 agent 从 **`DSH_HOME/skills/`**
+# 读技能 —— 两个不同目录，所以必须有人"搬"一次。安装器与首次启用向导都调这里，
+# **只补缺、绝不覆盖**（用户可能自己调过同名技能）。
+
+
+@router.get("/skills/setup")
+def api_skills_status(_auth=Depends(optional_auth)):
+    """随包技能在各 DSH 家目录里的现状（**只读**）。"""
+    from app import skills_setup
+    return skills_setup.status()
+
+
+@router.post("/skills/setup")
+def api_skills_install(_auth=Depends(optional_auth)):
+    """把随包技能补进各 DSH 家目录的 `skills/`（幂等；已存在的一律跳过）。"""
+    from app import skills_setup
+    return skills_setup.install()
+
+
 # ---------------------------------------------------------------- 能力 provider（P5 / D25）
 # ASR / LLM / TTS 三类能力的统一清单：谁在生效、是不是要出网（egress）、就绪与否。
 # 与 /api/components 的分工：**components = 装什么**（模型/引擎/运行时的安装与就绪），

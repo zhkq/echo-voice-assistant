@@ -120,10 +120,14 @@ class WizardUiWiringTests(unittest.TestCase):
                     "/api/wizard/execute", "/api/wizard/state",
                     "/api/wizard/finalize"):
             self.assertIn(url, self.js, "向导要用 %s" % url)
-        # `/api/wizard/first-run` **不在**这个清单里：2026-09-21 起面板不再用它决定页签
-        # （那正是"技能装完还被塞进向导"的原因），接口本身留着给别的调用方/老客户端。
-        self.assertNotIn("/api/wizard/first-run", self.js,
-                         "面板不该再用 first-run 决定进哪个页签")
+        # `/api/wizard/first-run` **在**这个清单里（2026-10-11 起）：面板用它问
+        # "这台机器该不该进首次启用向导"。⚠️ 注意它**不等于** 09-21 那个做法：
+        # 那时是拿**旧的窄判据 `firstRun`**（只看 installed-components.json）当理由，
+        # 于是技能装完还进向导；现在用的是 `shouldOnboard`
+        # = `install_state.onboarding()`（升级安装不弹、走过不弹、技能装完的全新机器仍要弹）。
+        self.assertIn("/api/wizard/first-run", self.js, "首装判据要问服务端")
+        self.assertIn("shouldOnboard", self.js,
+                      "要用 shouldOnboard —— 不许退回只看 firstRun")
         # 决策相只写计划（PUT /api/wizard/plan），不直接写设置、不直接触发下载
         self.assertIn('api("/api/wizard/plan", {', self.js)
 
@@ -154,25 +158,30 @@ class WizardUiWiringTests(unittest.TestCase):
         self.assertIn("wizSaveChoices", block, "改动要存进计划文件（关掉面板不丢）")
         self.assertNotIn("wizGoLlm", self.js, "不该再有「跳去模型路由」当唯一入口")
 
-    def test_boot_never_forces_the_wizard(self):
-        """**首装不再自动进向导**（2026-09-21 改，取代原来的
-        `test_first_install_enters_the_wizard_automatically`）。
+    def test_boot_enters_the_wizard_only_on_a_first_install(self):
+        """**首次安装进向导；升级安装不进**（2026-10-11 用户口径，取代 09-21 那条"永不自动进"）。
 
-        为什么改：安装现在由助手按 `echo-install` 技能完成（见 `docs/安装-技能优先.md`），
-        而"首装"的判据 `installed-components.json` **只有向导末页才写** —— 于是技能装完，
-        用户打开面板还是被塞进向导页（2026-09-21 同事实测反馈）。
-        新的契约：默认进仪表盘；"登记了没有 / 还缺什么"由顶部横幅说清；
-        向导保留但降级为手动入口（`?view=wizard`），永不自动弹出。
+        2026-09-21 当初为什么把自动进入**整个关掉**：安装改由助手按 `echo-install` 技能完成，
+        而那时的"首装"判据是 `installed-components.json` —— **只有旧向导末页才写** ——
+        于是技能装完，用户打开面板还是被塞进向导页（同事实测反馈）。
 
-        2026-09-25：向导并进「常规」最后一张卡后，手动入口从 `switchView("wizard")`
-        改成 `gotoWizard()`（切常规 + 展开那张卡 + 滚过去），`?view=wizard` 也走同一条路
-        （`_bootWantWizard`）。意图不变：**手动可达、且不自动弹出**。
+        现在用户要它回来，但**判据换了**，所以不会再犯：
+          * 判据**只在服务端**：`/api/wizard/first-run` 的 `shouldOnboard`
+            = `install_state.onboarding()` —— 走过一次不弹；**登记为 upgrade 不弹**；
+            没登记时用"已有内容"兜底；其余（含"技能刚装完的全新机器"）弹。
+          * **不再拿 `firstRun`（旧判据）当进向导的理由** —— 那正是 09-21 那次的病根。
+          * 显式页签 / 老深链（`?view=…`、`?wizstep=…`）依然最优先。
+        升级安装的**顶部不留向导按钮**（入口只在「设置 → 常规」）—— 见下面横幅那几条断言。
         """
         block = self.js[self.js.index("async function bootView()"):]
         block = block[:block.index("\n}")]
-        self.assertNotIn("wizard/first-run", block,
-                         "bootView 不该再拿 first-run 当进向导的理由")
-        self.assertIn('switchView("dashboard")', block, "默认进仪表盘")
+        self.assertIn("wizard/first-run", block, "首装要问服务端该不该进向导")
+        self.assertIn("shouldOnboard", block,
+                      "判据是 shouldOnboard（唯一判定在 install_state.onboarding）")
+        self.assertNotIn("on.firstRun", block,
+                         "**不许**再拿旧的 firstRun 当进向导的理由（09-21 的病根）")
+        self.assertIn('switchView("settings")', block, "向导卡在「常规」里，要切过去")
+        self.assertIn('switchView("dashboard")', block, "不是首装就默认进仪表盘")
         self.assertIn("renderInstallNotice()", block, "要用安装状态横幅说清下一步")
         self.assertIn("async function renderInstallNotice()", self.js)
         self.assertIn('api("/api/install/state")', self.js, "横幅读的是安装状态接口")
@@ -204,6 +213,21 @@ class WizardUiWiringTests(unittest.TestCase):
         # 走完向导末页仍要写 installed-components.json（老的首装判据，install_state 也认它）
         self.assertIn('post("/api/wizard/finalize", {})', self.js,
                       "走到末页要写 installed-components.json")
+
+    def test_the_banner_hides_the_wizard_button_on_an_upgrade(self):
+        """**升级安装：顶部不留向导入口**（2026-10-11 用户口径）。
+
+        用户原话："向导入口对于升级用户别保留在顶部，在设置里就行"。
+        判据来自服务端（`install_state.install_mode()` → `/api/install/state` 的
+        `installMode`），前端不自己猜；升级时那半个按钮**根本不渲染**（不是藏起来）。
+        """
+        fn = self.js[self.js.index("async function renderInstallNotice()"):]
+        fn = fn[:fn.index("\n}")]
+        self.assertIn("st.installMode", fn, "横幅要按服务端给的安装模式分叉")
+        self.assertIn('=== "upgrade"', fn, "判据是「登记为升级安装」")
+        self.assertRegex(fn, r'\$\{upgrade \? "" :',
+                         "升级时那个按钮必须**不渲染**（不是靠 CSS 藏）")
+        self.assertIn("installGoWizard", fn, "非升级时仍要保留手动入口")
 
     def test_the_step_numbers_in_the_fix_texts_match_what_the_user_sees(self):
         """末页/确认页里"回到向导第 N 步"用的是**界面上的编号**（= `WIZ_STEPS` 下标 + 1）。
