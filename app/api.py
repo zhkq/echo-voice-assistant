@@ -483,6 +483,20 @@ def api_status(_auth=Depends(optional_auth)):
         services.report_dsh("online" if dsh_ok else "offline",
                             "API 可访问" if dsh_ok else "未运行")
     components = services.snapshot()
+    # 2026-10-11（用户实测的"状态格陈旧 online 谎报"）：**harness 的状态行要在读取时校准一次**。
+    # 上面那两行的设计是"状态取自组件表、不在这里探活"（对，高频轮询 + codebuddy 那种
+    # 探一次就起一个进程的适配器不能被拖进来），但 harness 的探活只是**一次 HTTP 探测**
+    # （`online()`，1 秒超时、不起进程）。不校准的后果是：**别人把 harness 停了**
+    # （切换器切树 / 手工杀 / 它自己崩了）之后没有任何人重写那一行，于是 43199 明明空着，
+    # 面板与折叠条还一直显示"运行中" —— 用户实测撞到过。
+    # ⚠️ 只有 harness 走这条（dsh 的探活已经在上面 `report_dsh` 里做过；codebuddy 绝不能碰）。
+    if selected == "harness":
+        try:
+            from app import harness_proc
+            harness_proc.sync_status()
+            components = services.snapshot()
+        except Exception:
+            pass                       # 校准失败就用旧值，绝不因为一句话的状态把接口弄挂
     # 当前选中的智能体：折叠条/面板据此显示"我用的那个"，而不是永远盯着 DSH Desktop。
     # 状态取自组件表（boot 与各适配器往里写）；**不在这里探活** —— 这个接口被高频轮询，
     # 而 codebuddy 那种"每次调用起一个进程"的适配器探一次就是要起进程。
