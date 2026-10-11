@@ -235,7 +235,8 @@ def onboarding(path: str = "") -> dict:
     判据（2026-10-10 用户口径）：
       1. 走过一次 → 不再弹；
       2. **升级安装 → 不弹**（入口只留「设置」里）：明确登记 `upgrade` 优先；
-         没登记时用"已有内容"兜底（老版本升上来的机器）；
+         没登记时用「真内容」兜底 —— 注意「有库」不算老机器（刚装完也有库，2026-10-11
+         用户实测的坑），要看命令/会议的行数与笔记库设置；
       3. 其余 → 弹。**注意包含"技能刚装完的全新机器"** —— 技能不负责配笔记库与
          三个技能，所以 `declared()` 不能拿来当首装判据（2026-09-21 那次正是如此）。
     """
@@ -248,7 +249,16 @@ def onboarding(path: str = "") -> dict:
         should = not done
         reason = "登记为全新安装" + ("（向导已走过）" if done else "")
     else:
-        looks_old = bool(ex["dsh"] or ex["db"] or ex["meetings"] or ex["vault"])
+        # 2026-10-11 用户实测：「用交付包装完，但没看到向导」——根因就在这一行。
+        # 原来只看 `db`/`dsh` **在不在**：而**刚装完的机器一样有库**（服务一起来就建
+        # `echo.db`）、也照样有 DSH 家目录，于是全新安装被误判成升级 -> 不进向导。
+        # 判据必须看**里面有没有真东西**：
+        #   * `rows`（commands + meetings 行数）> 0 -> 这台机器用过；
+        #   * `meetings`（会议目录数）> 0 -> 有真数据（事故级，必须保留）；
+        #   * `vault`（笔记库设置）非空 -> 用户配过。
+        # 空库 + 有家目录 = 刚装完 -> **算全新**（该进向导）。
+        looks_old = bool(int(ex.get("rows") or 0) > 0 or int(ex.get("meetings") or 0) > 0
+                         or ex.get("vault"))
         should = (not done) and not looks_old
         reason = ("没登记安装模式，按已有内容判为升级" if looks_old
                   else "没登记安装模式，看着是全新安装")

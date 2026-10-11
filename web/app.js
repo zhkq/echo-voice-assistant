@@ -7192,6 +7192,10 @@ let _bootView = "";
 let _bootWantWizard = false;      // 老深链/老 gotoView 明确要向导：落到常规后要展开那张卡
 let _bootWantHist = "";           // 老深链 `?view=meetings`：落到历史页后要打开"会议历史"子页签
 let _bootWizStep = "";            // `?wizstep=meeting`：向导直接落到那一步（验收/排障/截图用）
+//: `?view=onboard`：**手动进「首次启用向导」**。为什么要它（2026-10-11 实测）：
+//  判据一旦判成升级（或用户上次没走完就关了），向导就没有任何入口 —— 想走也走不了。
+//  这个深链与「设置」里那个按钮一起，保证**永远可达**。
+let _bootWantOnboard = false;
 try {
   const q = new URLSearchParams(location.search).get("view");
   const raw = q || localStorage.getItem("echo.gotoView") || "";
@@ -7199,6 +7203,7 @@ try {
   const want = normView(rawKey);
   _bootWantWizard = rawKey.toLowerCase() === "wizard" || !!new URLSearchParams(location.search).get("wizstep");
   _bootWizStep = String(new URLSearchParams(location.search).get("wizstep") || "").trim();
+  _bootWantOnboard = rawKey.toLowerCase() === "onboard";
   // 历史子页签在折算成 history 之后就丢了，所以这里**单独记一笔**，bootView 落到历史页时
   // 按它打开对应子页签。
   // ⚠️ 2026-10-07：这里原来只认 `meetings` —— 加了「回顾历史」后 `?view=reviews` 虽然
@@ -7445,6 +7450,13 @@ async function bootView() {
   // 判据**只问服务端**（`/api/wizard/first-run` 的 `shouldOnboard` = `install_state.onboarding()`）——
   // 前端再算一遍必然与它漂移（2026-09-21 那次"技能装完还进向导"就是判据写窄了）。
   // 老书签/深链（`?view=…` / `?wizstep=…`）**优先**：用户明确指定就别抢首屏。
+  // `?view=onboard` 最优先（手动进新三步向导）
+  if (_bootWantOnboard) {
+    switchView("settings");
+    renderInstallNotice();
+    gotoOnboard(0);
+    return;
+  }
   if (!_bootView && !_bootWantWizard) {
     try {
       const on = await api("/api/wizard/first-run");

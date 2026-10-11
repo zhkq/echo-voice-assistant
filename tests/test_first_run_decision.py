@@ -111,13 +111,29 @@ class FirstRunDecisionTests(unittest.TestCase):
         self.assertFalse(got["shouldOnboard"])
 
     def test_unregistered_machine_is_judged_by_what_is_already_there(self):
-        """老版本升上来的机器没有登记 → 用"已有内容"兜底。"""
+        """老版本升上来的机器没有登记 → 用「**真内容**」兜底。
+
+        ⚠️ 2026-10-11 用户实测把这条改了：原来 `dsh` / `db` **在不在**也算升级 ——
+        但**刚装完的机器一样有库**（服务一起来就建 `echo.db`）和 DSH 家目录，
+        于是全新安装被判成升级、**向导不弹**（用户原话：「用交付包装完，但没看到向导，
+        所以没法走昨晚设计的三步」）。现在只认"里面有没有真东西"：
+        `rows`（命令/会议行数）/ `meetings`（会议目录数）/ `vault`（配过笔记库）。
+        """
         empty = {"dsh": False, "db": False, "rows": 0, "meetings": 0, "vault": ""}
         self.assertTrue(self._onboard(existing=empty)["shouldOnboard"], "空目录 = 全新")
-        for key in ("dsh", "db", "meetings", "vault"):
+        # **刚装完**：库在、家目录在，但里面都是空的 → 必须算全新（该进向导）
+        for key in ("dsh", "db"):
             with self.subTest(key=key):
                 ex = dict(empty)
-                ex[key] = True if key != "meetings" else 3
+                ex[key] = True
+                got = self._onboard(existing=ex)
+                self.assertTrue(got["shouldOnboard"],
+                                "刚装完（只有 %s）该进向导：%s" % (key, got))
+        # 有**真内容**才算升级
+        for key, val in (("rows", 3), ("meetings", 3), ("vault", "D:\\vault")):
+            with self.subTest(key=key):
+                ex = dict(empty)
+                ex[key] = val
                 got = self._onboard(existing=ex)
                 self.assertFalse(got["shouldOnboard"], "有 %s 就是升级：%s" % (key, got))
 
@@ -187,6 +203,36 @@ class ExistingContentProbeTests(unittest.TestCase):
 
         self.assertTrue(got["db"])
         self.assertEqual(got["rows"], 0)
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class EmptyInstallIsNotAnUpgradeTests(unittest.TestCase):
+    """**刚装完的机器不能被判成升级**（2026-10-11 用户实测：装完没看到向导）。
+
+    根因：兜底判据原来只看 `data/echo.db` **在不在** —— 而服务一起来就会建库，
+    于是全新安装被误判成升级、向导不弹。判据必须看**里面有没有真东西**。
+    """
+
+    def _onboard(self, *, rows=0, meetings=0, vault="", db=True, dsh=True):
+        empty = {"dsh": dsh, "db": db, "rows": rows, "meetings": meetings, "vault": vault}
+        with patch.object(install_state, "install_mode", lambda path="": ""), \
+                patch.object(install_state, "first_run_done", lambda path="": False), \
+                patch.object(install_state, "existing_content", lambda: dict(empty)):
+            return install_state.onboarding()
+
+    def test_an_empty_db_is_not_an_old_machine(self):
+        got = self._onboard()                      # 库在、家目录在，但里面是空的
+        self.assertTrue(got["shouldOnboard"], got)
+        self.assertIn("全新", got["reason"])
+
+    def test_real_data_still_means_upgrade(self):
+        for kw in ({"rows": 3}, {"meetings": 1}, {"vault": "D:\\vault"}):
+            with self.subTest(**kw):
+                self.assertFalse(self._onboard(**kw)["shouldOnboard"],
+                                 "有真数据 / 配过笔记库 → 按升级处理（用户口径）")
 
 
 if __name__ == "__main__":
