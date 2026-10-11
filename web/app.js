@@ -7469,19 +7469,28 @@ async function onboardCheckVault(path) {
   } catch (e) { /* 校验失败不挡路 */ }
 }
 
-async function onboardSaveVault() {
-  const el = $("#onboardVault");
-  const path = ((el && el.value) || _onboard.vault || "").trim();
-  if (!path) { _onboard.note = "先填上笔记库路径（或点「浏览…」）"; renderOnboard(); return; }
-  _onboard.vault = path;
-  await onboardCheckVault(path);
+async async function onboardSaveVault() {
+  // 2026-10-11（用户实测："这一步的浏览正常了…但点击下一步没反应"）：两个毛病都在这一小段里：
+  //   ① `/api/settings` 是 **PUT**（app/api.py 的 `@router.put("/settings")`），我原来用了 `post`
+  //      -> 405，而 405 被下面的 catch 吃掉、只写了一句 note（在卡片下方，容易看不见）；
+  //   ② `await onboardCheckVault(path)` **在 try 外面** —— 它一旦抛（探测接口失败/网络抖动），
+  //      异常直接冒出去，点击**什么都不会发生** = 用户说的"没反应"。
+  // 现在：全程 try/catch + **先给可见反馈**（"正在保存…"）+ 用面板统一的那种 PUT 写法。
   try {
-    await post("/api/settings", { values: { worklogVaultRoot: path, dailyReviewVaultRoot: path } });
+    const el = $("#onboardVault");
+    const path = ((el && el.value) || _onboard.vault || "").trim();
+    if (!path) { _onboard.note = "先填上笔记库路径（或点「浏览…」）"; renderOnboard(); return; }
+    _onboard.vault = path;
+    _onboard.note = "正在保存…";
+    renderOnboard();
+    try { await onboardCheckVault(path); } catch (e) { /* 探测失败不该挡住保存 */ }
+    await api("/api/settings", { method: "PUT",
+      body: JSON.stringify({ values: { worklogVaultRoot: path, dailyReviewVaultRoot: path } }) });
     _onboard.note = "";
     gotoOnboard(2);
     return;
   } catch (e) {
-    _onboard.note = "保存失败：" + (e && e.message ? e.message : e);
+    _onboard.note = "保存失败：" + ((e && e.message) || e) + "（路径：" + (_onboard.vault || "") + "）";
   }
   renderOnboard();
 }
