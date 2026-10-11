@@ -289,6 +289,26 @@ async function renderInstallNotice() {
     if (!main) return;
     main.insertBefore(box, main.firstChild);
   }
+  // 2026-10-11（用户第二次实测："装完了，DSH 版本也对了，但向导还是没看到"）：
+  // **服务端说该进向导时，顶部必须有一条看得见的入口**。
+  // 为什么不能只靠"自动进入"：它可能因为显式深链（`?view=…` 按设计优先）、老页面还在跑旧 JS、
+  // 或 `gotoOnboard()` 里某处抛异常（被我 catch 吞了）而**什么都没发生**；而原来那条横幅在
+  // "装得完整"时是隐藏的 —— 于是用户找不到任何入口（设置里那张卡也不一定会被翻到）。
+  // 这里做一个**硬保证**：只要 `shouldOnboard` 为真，就渲染这条 + 一个按钮。
+  try {
+    const on = await api("/api/wizard/first-run");
+    if (on && on.shouldOnboard) {
+      box.dataset.state = "warn";
+      box.innerHTML = `<div class="install-notice">
+          <div><b>这台机器还没走「首次启用向导」</b></div>
+          <div class="muted">配模型 → 指笔记库 → 初始化技能（这三个技能直接决定 ECHO 能不能干活）。</div>
+          <div><button class="btn" id="installGoOnboard2">首次启用向导</button></div>
+        </div>`;
+      const go = $("#installGoOnboard2", box);
+      if (go) go.addEventListener("click", () => gotoOnboard(0));
+      return;
+    }
+  } catch (e) { /* 问不到就按下面的老逻辑走 */ }
   const miss = st.missing || [];
   if (st.declared && !miss.length) {
     // 装好了就别占地方；只在"能力"页给一句可查的结论（那里才是补能力的地方）
