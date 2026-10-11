@@ -35,7 +35,18 @@ MAX_RESTARTS_PER_HOUR = 3
 #: 失败退避的基数（秒）：第 n 次失败后退避 BASE * 2^(n-1)。
 BACKOFF_BASE = 60
 
+#: 「明确停过」之后多久不再自动拉起（秒）。
+#:
+#: 为什么需要它（2026-10-11 实测出来的）：没有这一条，看门狗会**跟用户自己的「停止后端」对着干**
+#: —— 用户点了停止（或运维按 AGENTS.md 的纪律"跑门禁前先停后端"），30 秒后它又给拉起来：
+#:   * 用户的意图被无声推翻（点了没反应，过一会儿又回来了）；
+#:   * 全量门禁要求 8900/8901 **空着**，于是门禁根本没法跑。
+#: 语义：**明确停 = 这一次听你的**；30 分钟后或你重新点「启动」就恢复自动看护。
+PAUSE_AFTER_STOP = 1800
+
 _STATE = {
+    "paused_until": 0.0,  # 「明确停过」的退避截止（0 = 没有）
+    "paused_note": "",
     "checks": 0,          # 看过几次
     "ok": 0,              # 看到"两个口都在"
     "restarts": [],       # 每次真的动手的时间戳
@@ -105,6 +116,27 @@ def healthy() -> tuple:
     return True, "两个口都在听"
 
 
+def pause(reason: str = "用户明确停掉了后端", seconds: int = PAUSE_AFTER_STOP) -> float:
+    """记一次「明确停过」—— 这段时间内看门狗**不自动拉起**（听用户的）。返回截止时间戳。"""
+    until = time.time() + max(0, int(seconds))
+    with _LOCK:
+        _STATE["paused_until"] = until
+        _STATE["paused_note"] = "%s（%d 分钟内不自动拉起）" % (reason, int(seconds) // 60)
+    log.info("backend_watch: 收到明确停止 —— %s", _STATE["paused_note"])
+    return until
+
+
+def paused(now: float = None) -> str:
+    """现在是否处于"明确停过"的退避期；是则返回原因，否则空串。"""
+    now = float(now if now is not None else time.time())
+    with _LOCK:
+        until = float(_STATE.get("paused_until") or 0.0)
+        note = _STATE.get("paused_note") or ""
+    if until and now < until:
+        return note or "明确停过"
+    return ""
+
+
 def busy() -> str:
     """现在**不该动手**的理由；空串 = 能动。"""
     try:
@@ -148,11 +180,17 @@ def tick(now: float = None) -> dict:
     want, why_want = wanted()
     if not want:
         return done("skip", "这份后端不归我管：%s" % why_want)
+    why_paused = paused(now)
+    if why_paused:
+        return done("skip", "你明确停过：%s —— 不自动拉起" % why_paused)
 
     ok, why = healthy()
     if ok:
         with _LOCK:
             _STATE["ok"] += 1
+            # 它现在是好的 → 之前那次"明确停"的退避没意义了（用户可能又点起来了）
+            _STATE["paused_until"] = 0.0
+            _STATE["paused_note"] = ""
         return done("ok", why)
 
     why_busy = busy()
@@ -188,6 +226,8 @@ def state(now: float = None) -> dict:
         return {"checks": _STATE["checks"], "ok": _STATE["ok"],
                 "restarts": len(_restarts_recent(now)),
                 "last": dict(_STATE["last"]), "note": _STATE["note"],
+                "paused": bool(_STATE.get("paused_until") and now < _STATE["paused_until"]),
+                "pausedNote": _STATE.get("paused_note") or "",
                 "interval": WATCH_INTERVAL, "maxPerHour": MAX_RESTARTS_PER_HOUR}
 
 
