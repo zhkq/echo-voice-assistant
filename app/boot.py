@@ -195,6 +195,17 @@ def _spawn(cids):
 
 def _run_boot():
     set_phase("booting")
+    # 本地能力后端的**看门狗**（2026-10-11 用户："如果配置是本地后端，watchdog 也应该监控后端"）。
+    # 为什么在这里起：ECHO 就是那个"起了后端"的人（pid 记在 <数据根>/logs/backend.pid），
+    # 而 `scripts/echo-supervisor.ps1` 只管实例、完全不看后端 —— 后端掉了一半（进程活着、
+    # 8900 不再监听，2026-10-11 08:5x 用户实测）就没人管。只碰 ECHO 自己起的那份，
+    # 会议在录时不打断，有退避与每小时上限，见 app/backend_watch.py。
+    try:
+        from app import backend_watch
+        backend_watch.start()
+    except Exception:
+        pass
+
     # 阶段 1：轻量组件（秒级）并行 —— 模型路由先确保起来，DSH 随时可能被调用
     _spawn(["failover", "dsh", "tts", "hotkey", "meeting"])
     # 阶段 1b：独立 harness（选了它才真拉起来；没选就是一行 disabled，不等它）
