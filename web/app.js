@@ -211,6 +211,9 @@ function switchView(name) {
     // 「设置」= 原「通用」+「能力与智能体」+ 高级那几组：一次把要用的都拉齐（切页不重拉）。
     loadSettings(); loadBoot(); loadBootLogs(); loadWizard(); loadCapabilities(); loadRouter();
     loadVoiceprints();
+    // 向导卡要在设置页**常驻**（重绘会冲掉它）：现在 + 重绘之后各确保一次。
+    onboardEnsureCard();
+    setTimeout(onboardEnsureCard, 600);
     // 聚合建议与声纹库**同一张卡**（列表下方）：分开拉是为了让"库"先出现、
     // 建议那条（要算相似度、可能慢一点）后补上，而不是整张卡一起等。
     loadVpAgg();
@@ -7284,6 +7287,13 @@ function onboardCard() {
   return card;
 }
 
+function onboardEnsureCard() {
+  // 2026-10-11（用户实测："向导页一晃而过就进入设置页面了"）：向导卡**建出来了**，
+  // 但设置页随后重绘 / 重新应用折叠状态，把它冲掉了 —— 用户只看到一闪。
+  // 这个函数幂等：卡在就只重画内容，不在就重建。**任何会重绘设置页的路径之后都要调它。**
+  try { onboardCard(); renderOnboard(); } catch (e) { /* 建不出来就算了，别把面板弄挂 */ }
+}
+
 function gotoOnboard(step) {
   switchView("settings");
   const card = onboardCard();
@@ -7299,6 +7309,11 @@ function gotoOnboard(step) {
   renderOnboard();
   const after = $("#onboardCard");
   if (after && after.scrollIntoView) after.scrollIntoView({ behavior: "smooth", block: "start" });
+  // 设置页的重绘是**异步**的（loadSettings → renderSettingsPanes → applyCollapsedCards），
+  // 都在本函数之后才把 DOM 换成最终样子 —— 所以隔一会儿再确保两次，卡就不会被冲掉。
+  setTimeout(onboardEnsureCard, 400);
+  setTimeout(() => { onboardEnsureCard(); const c = $("#onboardCard");
+    if (c && c.scrollIntoView) c.scrollIntoView({ behavior: "smooth", block: "start" }); }, 1200);
 }
 
 function onboardStepBar() {
@@ -7469,7 +7484,7 @@ async function bootView() {
   // 自动进入可能因为三种原因不发生 —— 显式深链（`?view=…` 按设计优先）、浏览器缓存了旧
   // app.js、或判据判成升级；而**装得完整时顶部横幅是隐藏的**，于是用户连手动入口都没有。
   // 这里在首屏就把卡建出来并渲染（设置页里可见、可点），任何情况下都能走到这三步。
-  try { onboardCard(); renderOnboard(); } catch (e) { /* 建不出来就只靠自动进入 */ }
+  onboardEnsureCard();
   // 2026-10-11（用户口径）：**首次安装**进「首次启用向导」（配 DSH/模型 key、笔记库、
   // 三个技能）；**升级安装**直接进工作状态，向导入口只留在设置里。
   // 判据**只问服务端**（`/api/wizard/first-run` 的 `shouldOnboard` = `install_state.onboarding()`）——
