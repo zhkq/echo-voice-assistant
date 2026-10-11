@@ -108,13 +108,16 @@ if (-not (Test-Path -LiteralPath $Target)) {
     }
 }
 try {
+    # Probe by creating and removing a DIRECTORY: a normal user may not be allowed to
+    # create a FILE directly in a volume root (C:\), but creating C:\<name> is fine -
+    # testing with a file would report a false "cannot write".
     $parent = Split-Path -Parent $Target
-    if (-not (Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Force -Path $parent | Out-Null }
+    if (-not $parent) { $parent = $Target }
     $probe = Join-Path $parent ('.echo-write-test-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
-    Set-Content -LiteralPath $probe -Value 'x' -ErrorAction Stop
-    Remove-Item -LiteralPath $probe -Force -ErrorAction SilentlyContinue
-    Ok ('can write next to ' + $Target)
-} catch { Bad ('cannot write to ' + (Split-Path -Parent $Target) + ' - run as an account that can, or pick another target') }
+    New-Item -ItemType Directory -Path $probe -ErrorAction Stop | Out-Null
+    Remove-Item -LiteralPath $probe -Recurse -Force -ErrorAction SilentlyContinue
+    Ok ('can create folders under ' + $parent)
+} catch { Bad ('cannot create a folder under ' + (Split-Path -Parent $Target) + ' - run as an account that can, or pick another target') }
 
 # ---------------------------------------------------------------- ports / old processes
 Head 'Ports and leftovers'
@@ -155,8 +158,8 @@ if ($npmCmd) {
 foreach ($h in @('registry.npmjs.org', 'github.com')) {
     try {
         $r = Test-NetConnection -ComputerName $h -Port 443 -InformationLevel Quiet -WarningAction SilentlyContinue
-        if ($r) { Ok ("TCP $h:443 reachable") } else { Warn2 ("TCP $h:443 NOT reachable") }
-    } catch { Warn2 ("could not test $h:443") }
+        if ($r) { Ok ("TCP ${h}:443 reachable") } else { Warn2 ("TCP ${h}:443 NOT reachable") }
+    } catch { Warn2 ("could not test ${h}:443") }
 }
 
 # ---------------------------------------------------------------- optional extras
@@ -172,7 +175,8 @@ if ($script:Bad -eq 0 -and $script:Warn -eq 0) { Write-Host '  ALL GOOD - ready 
 elseif ($script:Bad -eq 0) { Write-Host ("  USABLE, but read the " + $script:Warn + " warning(s) above.") -ForegroundColor Yellow }
 else { Write-Host ("  " + $script:Bad + " hard problem(s) and " + $script:Warn + " warning(s) - fix the [fail] lines first.") -ForegroundColor Red }
 Write-Host ''
-Write-Host '  Next: double-click 装我.cmd in the delivery folder.' -ForegroundColor Cyan
+Write-Host '  Next: double-click the install .cmd in this same folder (the one whose' -ForegroundColor Cyan
+Write-Host '        name is Chinese for "install me").' -ForegroundColor Cyan
 if (Test-Path -LiteralPath $Target) {
     $items = @(Get-ChildItem -LiteralPath $Target -Force -ErrorAction SilentlyContinue)
     if ($items.Count -gt 0) {
