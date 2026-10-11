@@ -74,9 +74,24 @@ function Resolve-Node {
 }
 
 function Resolve-Npm {
+    # 1) PATH 上有没有（装了官方 node 的机器都走这条）
     foreach ($n in @('npm.cmd', 'npm.exe', 'npm')) {
         $c = Get-Command $n -ErrorAction SilentlyContinue
         if ($c) { return $c.Source }
+    }
+    # 2) **去 node 旁边找一遍**（2026-10-11 实测：新机器为什么装成旧版）
+    #    现场：机器上的 node 是打包版（`...\.workbuddy\binaries\node\versions\<v>\node.exe`），
+    #    而 `npm.cmd` / `npx.cmd` **就在 node.exe 旁边**，只是不在 PATH 里 ——
+    #    `Get-Command npm` 找不到 -> 判定"没找到 npm" -> 跳过 npm 安装 ->
+    #    只能从 npx 缓存复制**旧版本**（实测：想要 0.2.0-rc.2，装成 0.1.5-rc.2）。
+    #    `Resolve-Node` 已经知道 node 在哪，顺着它找就一定找得到。
+    $node = Resolve-Node
+    if ($node) {
+        $dir = Split-Path -Parent $node
+        foreach ($n in @('npm.cmd', 'npm.exe', 'npm')) {
+            $p = Join-Path $dir $n
+            if (Test-Path -LiteralPath $p) { return $p }
+        }
     }
     return ''
 }
