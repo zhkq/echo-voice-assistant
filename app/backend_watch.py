@@ -92,28 +92,61 @@ def wanted() -> tuple:
     return False, "既没有 pid 记录，也没有指向本机的配对 —— 不碰"
 
 
-def healthy() -> tuple:
-    """两个口都在听吗？``(健康?, 一句话)``。
+def port_state() -> list:
+    """每个口现在是**谁**在听：``[{label, port, pid, ours, foreign}, ...]``（只读）。
 
-    为什么**两个都要**：用户实测的那个形态就是"只有 8901 在听" —— 只探一个口会判成健康，
-    于是 8900 掉了永远没人管。
+    归属判据复用 `backend_proc.port_owner(with_root=True)` —— 它从命令行里的
+    `--config <树>\server.yaml` 认出"这是哪棵树的后端"（与桌面工具包、`backend_proc` 同一套）。
     """
+    rows = []
     try:
-        from app import backend_setup, platform
+        from app import backend_setup, backend_proc
         data_port, admin_port = backend_setup.configured_ports()
     except Exception as e:                                   # noqa: BLE001
-        return True, "读不到端口配置（%s）—— 不猜，先放过" % str(e)[:80]
-    bad = []
+        return [{"label": "配置", "port": 0, "pid": 0, "ours": False, "foreign": False,
+                 "note": "读不到端口配置：%s" % str(e)[:80]}]
     for label, port in (("数据口", data_port), ("管理口", admin_port)):
+        info = {}
         try:
-            pid = int(platform.listening_pid(int(port)) or 0)
+            info = backend_proc.port_owner(int(port), with_root=True) or {}
         except Exception:
-            pid = 0
-        if pid <= 0:
-            bad.append("%s %s 没在听" % (label, port))
-    if bad:
-        return False, "；".join(bad)
-    return True, "两个口都在听"
+            info = {}
+        pid = int(info.get("pid") or 0)
+        rows.append({"label": label, "port": int(port), "pid": pid,
+                     "ours": bool(pid and info.get("is_ours")),
+                     "foreign": bool(pid and info.get("foreign"))})
+    return rows
+
+
+def healthy() -> tuple:
+    """``(健康?, 一句话, 原因类别)``；类别 ∈ ``"" | "missing" | "foreign" | "unknown"``。
+
+    **两个口都在听还不够**：2026-10-11 实测，门禁泄漏的一个 **dev 树**后端占着 8900/8901，
+    只探端口的判据把稳定版的后端判成"健康"（而真后端是停的）；反过来，端口被别人占着时
+    去拉起只会失败。所以这里把"不是本棵树的在听"单独判成 ``foreign`` —— 上层据此**不瞎拉**、
+    而是如实报"需要你看一眼"。
+    """
+    rows = port_state()
+    if rows and rows[0].get("note"):
+        return True, rows[0]["note"], "unknown"       # 读不到配置就不猜，先放过
+    missing = [r for r in rows if not r["pid"]]
+    if missing:
+        return False, "；".join("%s %d 没在听" % (r["label"], r["port"]) for r in missing), "missing"
+    unknown = [r for r in rows if not r["ours"] and not r["foreign"]]
+    foreign = [r for r in rows if r["foreign"]]
+    if unknown or (foreign and len(foreign) == len(rows)):
+        # 判不出归属（比如命令行里没有 --config 的进程）→ 当作"不是我们的"，别去拉
+        bad = foreign or unknown
+        return (False,
+                "；".join("%s %d 被**别的**进程占着（pid %d，不是本棵树的）"
+                          % (r["label"], r["port"], r["pid"]) for r in bad),
+                "foreign")
+    if foreign:
+        return (False,
+                "；".join("%s %d 被**别的**进程占着（pid %d，不是本棵树的）"
+                          % (r["label"], r["port"], r["pid"]) for r in foreign),
+                "foreign")
+    return True, "两个口都在听，且都是本棵树的后端", ""
 
 
 def pause(reason: str = "用户明确停掉了后端", seconds: int = PAUSE_AFTER_STOP) -> float:
@@ -184,7 +217,10 @@ def tick(now: float = None) -> dict:
     if why_paused:
         return done("skip", "你明确停过：%s —— 不自动拉起" % why_paused)
 
-    ok, why = healthy()
+    ok, why, why_kind = healthy()
+    if (not ok) and why_kind == "foreign":
+        # 端口被别人的/残留的进程占着 —— **别去拉**（只会失败），如实报出来让人看一眼。
+        return done("foreign", "%s —— 不是本棵树的后端，拉起也会失败，需要你看一眼" % why)
     if ok:
         with _LOCK:
             _STATE["ok"] += 1
@@ -226,6 +262,7 @@ def state(now: float = None) -> dict:
         return {"checks": _STATE["checks"], "ok": _STATE["ok"],
                 "restarts": len(_restarts_recent(now)),
                 "last": dict(_STATE["last"]), "note": _STATE["note"],
+                "ports": port_state(),
                 "paused": bool(_STATE.get("paused_until") and now < _STATE["paused_until"]),
                 "pausedNote": _STATE.get("paused_note") or "",
                 "interval": WATCH_INTERVAL, "maxPerHour": MAX_RESTARTS_PER_HOUR}
