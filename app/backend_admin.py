@@ -320,6 +320,12 @@ def view() -> Dict[str, Any]:
         all_notes.append(
             "端口上跑的是**另一棵树**的后端（%s）—— 点「接管后端」会停掉它并起本棵树"
             "自己的；凭据是同一份，**不需要重新配对**。" % foreign.get("root"))
+    watch = {}
+    try:
+        from app import backend_watch
+        watch = backend_watch.state()      # 看门狗在盯着它（用户 2026-10-11 要求）
+    except Exception:
+        watch = {}
     return {
         "root": backend_setup.backend_root(),
         "port": int(port), "adminPort": int(admin_port),
@@ -332,6 +338,7 @@ def view() -> Dict[str, Any]:
         "runtime": {"ready": bool(runtime), "path": runtime},
         "config": {"path": config_path, "exists": config_exists},
         "running": bool(alive),
+        "watch": watch,
         "pid": pid,
         "note": note,
         "ports": owners,

@@ -20,7 +20,7 @@ class _Case(unittest.TestCase):
     def setUp(self):
         backend_watch._STATE.update(checks=0, ok=0, restarts=[], last={}, note="")
 
-    def _tick(self, *, owned=True, healthy=(True, "两个口都在听"), busy="",
+    def _tick(self, *, wanted=(True, "ECHO 起的（有 pid 记录）"), healthy=(True, "两个口都在听"), busy="",
               start_result=(True, "已开始「起本机后端」"), now=1000.0):
         calls = {"start": 0}
 
@@ -28,7 +28,7 @@ class _Case(unittest.TestCase):
             calls["start"] += 1
             return start_result
 
-        with patch.object(backend_watch, "owned", lambda: owned), \
+        with patch.object(backend_watch, "wanted", lambda: wanted), \
                 patch.object(backend_watch, "healthy", lambda: healthy), \
                 patch.object(backend_watch, "busy", lambda: busy), \
                 patch("app.backend_admin.start", _start):
@@ -37,12 +37,20 @@ class _Case(unittest.TestCase):
 
 
 class RulesTests(_Case):
-    def test_it_never_touches_a_backend_echo_did_not_start(self):
-        """**铁律 1**：没有 pid 记录 = 不归我们管 —— 判不出归属就不动手。"""
-        out, calls = self._tick(owned=False, healthy=(False, "数据口 8900 没在听"))
+    def test_it_never_touches_a_backend_that_is_not_ours(self):
+        """**铁律 1**：既没有 pid 记录、也没有本机配对 = 不归我们管 —— 判不出就不动手。"""
+        out, calls = self._tick(wanted=(False, "既没有 pid 记录，也没有指向本机的配对 —— 不碰"),
+                                healthy=(False, "数据口 8900 没在听"))
         self.assertEqual("skip", out["action"], out)
         self.assertEqual(0, calls["start"], "别人的后端一个指头都不许碰")
-        self.assertIn("不是 ECHO 起的", out["detail"])
+        self.assertIn("不归我管", out["detail"])
+
+    def test_the_pid_record_alone_is_enough(self):
+        """**pid 记录会被"过期清理"抹掉**（2026-10-11 真机复现）→ 还要认"本机配对还在"这一条。"""
+        import inspect
+        src = inspect.getsource(backend_watch.wanted)
+        self.assertIn("pairFile", src, "要认本机配对（不能只认 pid 记录）")
+        self.assertIn("loopback", src)
 
     def test_a_healthy_backend_is_left_alone(self):
         out, calls = self._tick()

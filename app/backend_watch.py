@@ -46,13 +46,39 @@ _LOCK = threading.Lock()
 _THREAD = None
 
 
-def owned() -> bool:
-    """这份后端是不是 **ECHO 起的**（有 pid 记录）—— 归属判据只有这一处。"""
+def wanted() -> tuple:
+    """该不该由 ECHO 看着它：``(要?, 依据)``。
+
+    ⚠️ **不能只认 pid 记录**（这是我第一版的错，2026-10-11 真机复现出来了）：进程一被杀，
+    别的代码路径（`backend_admin.view()` 的"过期清理"）会**把 pid 文件删掉**，
+    于是看门狗以为"不是我起的"、什么都不做 —— 而那一刻恰恰是最该动手的时候。
+    所以判据是**两条任一**：
+
+      ① 有 pid 记录（ECHO 起的，最快路径）；
+      ② **本机配对还在**（`backend_admin.view()` 的 `pairFile`/`paired` 说后端地址是回环）——
+         这表示"当前用的就是这个本机后端"，它掉了当然该拉回来。
+
+    两条都不成立（没有 pid 记录、也没有指向本机的配对）→ **不碰**：可能是用户自己起的、
+    或用的远端后端，那不是我们该管的。
+    """
     try:
         from app import backend_pid
-        return int(backend_pid.read_pid() or 0) > 0
+        if int(backend_pid.read_pid() or 0) > 0:
+            return True, "ECHO 起的（有 pid 记录）"
     except Exception:
-        return False
+        pass
+    try:
+        from app import backend_admin
+        v = backend_admin.view() or {}
+        pf = v.get("pairFile") or {}
+        pr = v.get("paired") or {}
+        url = str(pf.get("baseUrl") or pr.get("baseUrl") or "")
+        loopback = ("127.0.0.1" in url) or ("localhost" in url) or ("[::1]" in url)
+        if (pf.get("found") or pr.get("paired")) and loopback:
+            return True, "本机配对还在（%s）" % url
+    except Exception:
+        pass
+    return False, "既没有 pid 记录，也没有指向本机的配对 —— 不碰"
 
 
 def healthy() -> tuple:
@@ -119,8 +145,9 @@ def tick(now: float = None) -> dict:
             log.warning("backend_watch: %s (%s)", action, detail)
         return out
 
-    if not owned():
-        return done("skip", "这份后端不是 ECHO 起的（没有 pid 记录）—— 不碰别人的进程")
+    want, why_want = wanted()
+    if not want:
+        return done("skip", "这份后端不归我管：%s" % why_want)
 
     ok, why = healthy()
     if ok:
