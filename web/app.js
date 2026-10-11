@@ -7469,7 +7469,7 @@ async function onboardCheckVault(path) {
   } catch (e) { /* 校验失败不挡路 */ }
 }
 
-async async function onboardSaveVault() {
+async function onboardSaveVault() {
   // 2026-10-11（用户实测："这一步的浏览正常了…但点击下一步没反应"）：两个毛病都在这一小段里：
   //   ① `/api/settings` 是 **PUT**（app/api.py 的 `@router.put("/settings")`），我原来用了 `post`
   //      -> 405，而 405 被下面的 catch 吃掉、只写了一句 note（在卡片下方，容易看不见）；
