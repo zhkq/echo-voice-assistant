@@ -96,6 +96,25 @@ function Resolve-Npm {
     return ''
 }
 
+#: 与 Resolve-Npm 同一套路：**npx 也可能只躺在 node 旁边**（打包版 node 就是这种，
+#  2026-10-11 实测：新机器上 npx 不在 PATH 里 -> 填 npx 缓存那一步直接失败 ->
+#  只能装缓存里的旧版本）。填缓存是"拿到 latest 版本"的关键一步，所以这里必须找得到。
+function Resolve-Npx {
+    foreach ($n in @('npx.cmd', 'npx.exe', 'npx')) {
+        $c = Get-Command $n -ErrorAction SilentlyContinue
+        if ($c) { return $c.Source }
+    }
+    $node = Resolve-Node
+    if ($node) {
+        $dir = Split-Path -Parent $node
+        foreach ($n in @('npx.cmd', 'npx.exe', 'npx')) {
+            $p = Join-Path $dir $n
+            if (Test-Path -LiteralPath $p) { return $p }
+        }
+    }
+    return ''
+}
+
 #: 查不到 npm registry 时的兜底版本（**只是兜底，不是"我们要装的版本"**）。
 #  为什么留一个写死的值：全新机器上 npm 可能还没配好源 / 断网，这时**不能**因为
 #  "查不到最新版"就整个失败 —— 退回一个已知可用的版本，装完照样能用。
@@ -289,6 +308,7 @@ function Fill-NpxCache([string]$Version) {
         }
         if ($npx) { break }
     }
+    if (-not $npx) { $npx = Resolve-Npx }   # 2026-10-11: 先在 node 旁边找一遍
     if (-not $npx) {
         $c = Get-Command npx -ErrorAction SilentlyContinue
         if ($c) { $npx = $c.Source }
