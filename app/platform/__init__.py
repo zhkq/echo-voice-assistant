@@ -64,6 +64,20 @@ def _platform_fn(name):
         return None
 
 
+def inline_shell_argv(script: str) -> list:
+    """把一段**脚本文本**交给本机 shell 执行（Windows=PowerShell `-Command`，POSIX=`sh -c`）。
+
+    与 `console_shell_argv()` 的区别很要命：那个是**按文件路径**交的（`-File <路径>`），
+    本函数按**文本**交。2026-10-11 实测：把脚本文本当 `-File` 传，PowerShell 直接报
+    "Processing -File '…' failed because the file does not have a '.ps1' extension"
+    —— 于是"选目录"的原生窗口**永远打不开**（用户实测："浏览按钮没打开文件浏览窗"）。
+    """
+    fn = _platform_fn("inline_shell_argv")
+    if callable(fn):
+        return list(fn(str(script or "")))
+    return ["sh", "-c", str(script or "")]
+
+
 def display_name() -> str:
     """系统名（状态文案用）。"""
     fn = _platform_fn("display_name")

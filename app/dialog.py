@@ -107,12 +107,12 @@ def pick_folder(title: str = "", initial: str = "", timeout: int = PICK_TIMEOUT,
                          ensure_ascii=False)
     env = dict(os.environ)
     env["ECHO_PICK_JSON"] = payload
-    # 起 shell 一律走接缝（Windows=PowerShell / POSIX=/bin/sh）—— 业务代码里不许出现
-    # `"powershell"` 这种字面量（`tests/test_path_seam.py` 钉着；同一条纪律见 D12）。
-    # ⚠️ 不需要 `-STA`：**Windows PowerShell 5.1 默认就是 STA**，FolderBrowserDialog 要的正是它。
+    # 起 shell 一律走接缝（同一条纪律见 D12）。**必须用"按文本"的那个原语**：
+    # `console_shell_argv()` 是按文件路径的（`-File`），拿它传脚本文本会报
+    # "does not have a '.ps1' extension" —— 窗口永远打不开（2026-10-11 用户实测）。
     try:
         from app import platform as echo_platform
-        argv = list(echo_platform.console_shell_argv(_PS))
+        argv = list(echo_platform.inline_shell_argv(_PS))
     except Exception as e:                                  # noqa: BLE001
         return {"ok": False, "cancelled": False, "reason": "unsupported",
                 "message": "起不了本机 shell：%s" % str(e)[:160]}

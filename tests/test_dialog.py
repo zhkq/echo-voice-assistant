@@ -77,8 +77,13 @@ class PickFolderTests(unittest.TestCase):
         # 起 shell 走**接缝**（`platform.console_shell_argv`），业务代码里不许写死 `"powershell"`
         # —— 这条既是 D12，也让 macOS 以后能自己实现一份。
         from app import platform as echo_platform
-        self.assertEqual(list(echo_platform.console_shell_argv("x"))[:1], list(r.calls["argv"])[:1],
-                         "argv 应当来自接缝")
+        argv = list(r.calls["argv"])
+        # 必须是"按文本"交脚本（`-Command`），不能是 `-File` —— 后者会让窗口永远打不开
+        # （2026-10-11 用户实测："浏览按钮没打开文件浏览窗"）。
+        self.assertIn("-Command", argv, argv)
+        self.assertNotIn("-File", argv, argv)
+        self.assertTrue(argv[-1].strip().startswith("$ErrorActionPreference"), "脚本要原样带在最后")
+        self.assertEqual(list(echo_platform.inline_shell_argv("x"))[:4], argv[:4], "argv 应当来自接缝")
         self.assertNotIn("选笔记库", " ".join(r.calls["argv"]),
                          "标题不许拼进命令行（中文/引号会出问题）")
         import json

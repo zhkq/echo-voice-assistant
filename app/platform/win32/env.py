@@ -790,3 +790,14 @@ def restrict_file(path: str) -> None:
 def has_native_folder_picker() -> bool:
     """Windows 有 `System.Windows.Forms.FolderBrowserDialog`（见 app/dialog.py）。"""
     return True
+
+
+def inline_shell_argv(script: str) -> list:
+    """把脚本文本交给 Windows PowerShell 执行。
+
+    为什么显式带 `-STA`：`FolderBrowserDialog` 需要单线程单元（`app/dialog.py` 用它选目录）。
+    Windows PowerShell 5.1 的控制台宿主默认就是 STA，但**不能靠默认值** —— 一旦将来跑在
+    PowerShell 7（默认 MTA）下，不带 `-STA` 的窗口会直接失败，而且报错很难懂。
+    """
+    return ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
+            "-STA", "-Command", str(script or "")]
