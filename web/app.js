@@ -7313,7 +7313,13 @@ function onboardHide() {
 }
 
 /* 临时最小化去配智能体：藏起覆盖层 + 跳「设置 → 智能体」+ 右下角留一颗「继续」胶囊。 */
-function onboardMinimize() {
+async function onboardMinimize() {
+  // 2026-10-11（用户实测）：这个按钮的本意是「去把智能体配好」，而**模型/命令的配置在
+  // **DSH 标准版自己的界面**里 —— 只把面板跳到「设置」是不够的。
+  // 用户原话："点击去设置智能体，没有弹开新网页打开 dsh 标准版，跳到设置页面了"。
+  // 所以两件事一起做：① 让服务端把标准版界面用**系统浏览器**打开
+  // （`POST /api/harness/browser`，它拼好带 token 的地址并调系统默认浏览器）；
+  // ② 向导最小化、留在 ECHO 设置页，右下角留「继续首次启用向导」。
   onboardHide();
   _onboardMinimized = true;
   switchView("settings");
@@ -7324,6 +7330,20 @@ function onboardMinimize() {
   chip.style.cssText = "position:fixed;right:18px;bottom:18px;z-index:10000";
   chip.addEventListener("click", () => { onboardEnsureCard(); renderOnboard(); onboardShow(); });
   document.body.appendChild(chip);
+  // ① 打开 DSH 标准版界面（失败就如实说，并指路「设置 → 智能体」里的手动入口）
+  try {
+    const r = await api("/api/harness/browser", { method: "POST" });
+    if (!r || r.ok === false) {
+      _onboard.note = "没能自动打开标准版界面"
+        + (r && r.detail ? ("：" + r.detail) : "")
+        + "。也可以在「设置 → 智能体」里点「用浏览器打开标准版」手动打开。";
+      renderOnboard();
+    }
+  } catch (e) {
+    _onboard.note = "没能自动打开标准版界面（" + (e && e.message ? e.message : e)
+      + "）。也可以在「设置 → 智能体」里点「用浏览器打开标准版」手动打开。";
+    renderOnboard();
+  }
 }
 
 function onboardEnsureCard() {
