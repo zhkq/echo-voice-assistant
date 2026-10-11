@@ -23,6 +23,8 @@
 from __future__ import annotations
 
 import logging
+import os
+import sys
 import threading
 import time
 
@@ -277,9 +279,33 @@ def _loop():
         time.sleep(WATCH_INTERVAL)
 
 
+def disabled() -> str:
+    """该不该**不起**看门狗：返回原因，空串 = 可以起。
+
+    两条（2026-10-11 实测出来的，都很硬）：
+    1. **测试进程里一律不起**。某个用例把线程起在了测试进程里（`boot._run_boot` 会在启动时调
+       本函数），于是看门狗**尽职地真去拉后端** → 泄漏了一个真实 dev 后端的进程（`--config`
+       指向真实数据根），并且它与测试抢同一个 sqlite → `database is locked`，
+       门禁因此红了（`test_providers::...` 那条）。
+       用例必须自己打桩；看门狗**不在测试里干活**。
+    2. `ECHO_NO_BACKEND_WATCH=1` 显式关掉 —— 这也顺便永久解决了
+       「跑门禁前先停后端」与「看门狗看到停就拉」的冲突（门禁可以带这个变量跑）。
+    """
+    env = str(os.environ.get("ECHO_NO_BACKEND_WATCH", "") or "").strip().lower()
+    if env and env not in ("0", "false", "no"):
+        return "ECHO_NO_BACKEND_WATCH 显式关掉了"
+    if "unittest" in sys.modules or "pytest" in sys.modules or os.environ.get("PYTEST_CURRENT_TEST"):
+        return "跑在测试进程里（用例不该真去拉后端）"
+    return ""
+
+
 def start() -> bool:
-    """起看门狗线程（幂等）。ECHO 启动时调一次。"""
+    """起看门狗线程（幂等）。ECHO 启动时调一次；测试进程里**不起**（见 :func:`disabled`）。"""
     global _THREAD
+    why = disabled()
+    if why:
+        log.info("backend_watch 未启动：%s", why)
+        return False
     if _THREAD and _THREAD.is_alive():
         return False
     _THREAD = threading.Thread(target=_loop, daemon=True, name="backend-watch")

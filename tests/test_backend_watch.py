@@ -160,6 +160,19 @@ class RulesTests(_Case):
         self.assertEqual(0, calls["start"], "别人的进程占着端口时拉起必然失败 —— 不许瞎拉")
         self.assertIn("需要你看一眼", out["detail"])
 
+    def test_it_refuses_to_start_inside_a_test_process(self):
+        """**测试进程里一律不起** —— 实测：它会在测试进程里尽职地真去拉后端，泄漏一个进程、
+        还把测试的 sqlite 锁住（`database is locked`，门禁因此红）。"""
+        why = backend_watch.disabled()
+        self.assertTrue(why, "测试进程里必须被认出来")
+        self.assertIn("测试进程", why)
+        self.assertFalse(backend_watch.start(), "不许在测试进程里起线程")
+
+    def test_the_env_switch_disables_it(self):
+        """`ECHO_NO_BACKEND_WATCH=1` 显式关掉 —— 门禁可以用它避开"停了又被拉起来"。"""
+        with patch.dict("os.environ", {"ECHO_NO_BACKEND_WATCH": "1"}):
+            self.assertIn("显式关掉", backend_watch.disabled())
+
     def test_state_is_readable_and_honest(self):
         st = backend_watch.state()
         for k in ("checks", "ok", "restarts", "last", "note", "interval", "maxPerHour"):
