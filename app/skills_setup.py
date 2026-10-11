@@ -80,6 +80,23 @@ def _sources() -> dict:
     return out
 
 
+def all_skills(home: str) -> list:
+    """这个 DSH 家目录里**所有**技能名（不只是随包清单里的）。
+
+    为什么要它（2026-10-11 用户反馈）：向导说"保留你自己已有的 3 项"，而用户翻开 DSH 看到
+    **4 个**技能 —— 第 4 个（如 `diagnose-windows-sandbox-acl`）是 DSH 那边的，不在我们的清单里。
+    "3 项"本身没错，但不说清"还有哪些不是我们的"就会让人以为漏装了。所以如实列出来。
+    """
+    out = []
+    try:
+        root = os.path.join(home, "skills")
+        if os.path.isdir(root):
+            out = sorted(n for n in os.listdir(root) if os.path.isdir(os.path.join(root, n)))
+    except Exception:
+        out = []
+    return out
+
+
 def status() -> dict:
     """**只读**：每个家目录里，这几个技能各自是"已就位"还是"缺"。"""
     src = _sources()
@@ -90,8 +107,11 @@ def status() -> dict:
         for name in SHIPPED:
             d = os.path.join(home, "skills", name)
             per[name] = "ok" if os.path.isdir(d) else "missing"
+        every = all_skills(home)
         rows.append({"home": home, "skills": per,
-                     "missing": [n for n, v in per.items() if v == "missing"]})
+                     "missing": [n for n, v in per.items() if v == "missing"],
+                     "all": every,
+                     "others": [n for n in every if n not in SHIPPED]})
     return {
         "source": code_skills_root(),
         "shipped": list(SHIPPED),
@@ -135,6 +155,8 @@ def install() -> dict:
         "ok": not errors and not absent,
         "installed": installed,
         "skipped": skipped,
+        "others": sorted({n for h in homes for n in all_skills(h) if n not in SHIPPED}
+                         - {n for n in absent}),
         "absent": absent,
         "errors": errors,
         "homes": homes,

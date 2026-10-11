@@ -1,3 +1,10 @@
+function onboardEnsureCard() {
+  try {
+    onboardCard();
+    if (_onboardNeeded && !_onboardMinimized) { renderOnboard(); onboardShow(); }
+  } catch (e) { /* 建不出来就算了，别把面板弄挂 */ }
+}
+
 /* ECHO 控制面板前端逻辑（原生 JS，无构建链） */
 "use strict";
 
@@ -7258,6 +7265,8 @@ try {
      完成        → POST /api/wizard/first-run（登记"走过一次"，以后不再自动弹）
 */
 let _onboardStep = 0;
+let _onboardMinimized = false;   // 用户点「去设置智能体」临时最小化
+let _onboardNeeded = false;      // 服务端说"该走向导"（完成前为 true：覆盖层一直挡着）
 const _onboard = { modelOk: false, reply: "", note: "", vault: "", vaultIsVault: false, skills: null };
 
 const ONBOARD_STEPS = [
@@ -7269,22 +7278,59 @@ const ONBOARD_STEPS = [
 const ONBOARD_OBSIDIAN_URL = "https://obsidian.md/download";
 
 function onboardCard() {
-  let card = $("#onboardCard");
-  if (card) return card;
-  const host = ($("#wizCard") && $("#wizCard").parentNode) || document.querySelector("#view-settings");
-  if (!host) return null;
-  card = document.createElement("div");
-  card.className = "card collapsible";
-  card.id = "onboardCard";
-  card.dataset.collapseId = "onboard";
-  card.innerHTML = '<div class="card-title" aria-expanded="true">首次启用向导'
-    + '<span class="sbadge">3 步</span></div><div class="card-body">'
-    + '<div class="snote info"><span>ⓘ</span><span>第一次用 ECHO 按这三步走一遍就行：'
-    + '<b>配模型</b> → <b>指笔记库</b> → <b>初始化技能</b>。'
-    + '升级安装的机器不用走（数据与设置都继承了）。</span></div>'
-    + '<div id="onboardPanel"></div></div>';
-  host.insertBefore(card, host.firstChild);
-  return card;
+  // 2026-10-11（用户第 1 条反馈）：向导必须是**整页、且挡住整个 ECHO** 的覆盖层 ——
+  // 原来它只是「设置」里的一张卡：既会被设置页重绘冲掉，用户也能绕过它。
+  // 现在：fixed 全屏 + 锁滚动 + 只有最后一步的「完成」能出去（每步仍可跳过）。
+  let ov = $("#onboardOverlay");
+  if (!ov) {
+    ov = document.createElement("div");
+    ov.id = "onboardOverlay";
+    ov.setAttribute("role", "dialog");
+    ov.setAttribute("aria-modal", "true");
+    ov.style.cssText = "position:fixed;inset:0;z-index:9999;background:rgba(20,22,26,.72);"
+      + "display:flex;align-items:flex-start;justify-content:center;overflow:auto;padding:24px 12px";
+    ov.innerHTML = '<div class="card" id="onboardCard" style="max-width:820px;width:100%">'
+      + '<div class="card-title">首次启用向导<span class="sbadge">3 步</span></div>'
+      + '<div class="card-body">'
+      + '<div class="snote info"><span>ⓘ</span><span>第一次用 ECHO 按这三步走一遍：'
+      + '<b>配模型</b> → <b>指笔记库</b> → <b>初始化技能</b>。'
+      + '走完之前不能正式使用（每一步都可以跳过）。</span></div>'
+      + '<div id="onboardPanel"></div></div></div>';
+    document.body.appendChild(ov);
+  }
+  return $("#onboardCard");
+}
+
+function onboardShow() {
+  const ov = $("#onboardOverlay");
+  if (!ov) return;
+  ov.style.display = "flex";
+  document.body.style.overflow = "hidden";     // 锁滚动 = 挡住整个面板
+  _onboardMinimized = false;
+  const chip = $("#onboardResume");
+  if (chip) chip.remove();
+}
+
+function onboardHide() {
+  const ov = $("#onboardOverlay");
+  if (ov) ov.style.display = "none";
+  document.body.style.overflow = "";
+  const chip = $("#onboardResume");
+  if (chip) chip.remove();
+}
+
+/* 临时最小化去配智能体：藏起覆盖层 + 跳「设置 → 智能体」+ 右下角留一颗「继续」胶囊。 */
+function onboardMinimize() {
+  onboardHide();
+  _onboardMinimized = true;
+  switchView("settings");
+  let chip = document.createElement("button");
+  chip.id = "onboardResume";
+  chip.className = "btn";
+  chip.textContent = "⟵ 继续首次启用向导";
+  chip.style.cssText = "position:fixed;right:18px;bottom:18px;z-index:10000";
+  chip.addEventListener("click", () => { onboardEnsureCard(); renderOnboard(); onboardShow(); });
+  document.body.appendChild(chip);
 }
 
 function onboardEnsureCard() {
@@ -7295,25 +7341,11 @@ function onboardEnsureCard() {
 }
 
 function gotoOnboard(step) {
-  switchView("settings");
   const card = onboardCard();
-  if (card) {
-    card.classList.remove("collapsed");
-    const t = card.querySelector(":scope > .card-title");
-    if (t) t.setAttribute("aria-expanded", "true");
-    const collapsed = _collapsedCards();
-    if (collapsed.delete("onboard")) _saveCollapsedCards(collapsed);
-    try { _markCollapseDecided("onboard"); } catch (e) { /* 老版本没有这个函数 */ }
-  }
   if (typeof step === "number") _onboardStep = Math.max(0, Math.min(ONBOARD_STEPS.length - 1, step));
   renderOnboard();
-  const after = $("#onboardCard");
-  if (after && after.scrollIntoView) after.scrollIntoView({ behavior: "smooth", block: "start" });
-  // 设置页的重绘是**异步**的（loadSettings → renderSettingsPanes → applyCollapsedCards），
-  // 都在本函数之后才把 DOM 换成最终样子 —— 所以隔一会儿再确保两次，卡就不会被冲掉。
-  setTimeout(onboardEnsureCard, 400);
-  setTimeout(() => { onboardEnsureCard(); const c = $("#onboardCard");
-    if (c && c.scrollIntoView) c.scrollIntoView({ behavior: "smooth", block: "start" }); }, 1200);
+  onboardShow();
+  if (card && card.scrollIntoView) card.scrollIntoView({ behavior: "smooth", block: "start" });
 }
 
 function onboardStepBar() {
@@ -7334,6 +7366,7 @@ function renderOnboard() {
   if ($("#onboardSkip")) $("#onboardSkip").addEventListener("click", () => {
     if (_onboardStep < ONBOARD_STEPS.length - 1) gotoOnboard(_onboardStep + 1); else onboardFinish();
   });
+  if ($("#onboardGoAgent")) $("#onboardGoAgent").addEventListener("click", onboardMinimize);
   if ($("#onboardTestAgent")) $("#onboardTestAgent").addEventListener("click", onboardTestAgent);
   if ($("#onboardNextModel")) $("#onboardNextModel").addEventListener("click", () => gotoOnboard(1));
   if ($("#onboardPick")) $("#onboardPick").addEventListener("click", onboardPickFolder);
@@ -7447,7 +7480,10 @@ function onboardRenderSkills() {
   if (s) {
     const parts = [];
     if ((s.installed || []).length) parts.push("已装 " + s.installed.length + " 项");
-    if ((s.skipped || []).length) parts.push("保留你自己已有的 " + s.skipped.length + " 项");
+    if ((s.skipped || []).length) parts.push("保留你已有的 " + s.skipped.length + " 个（"
+      + s.skipped.map((x) => String(x).split("@")[0]).join("、") + "）");
+    if ((s.others || []).length) parts.push("你库里还有 " + s.others.length
+      + " 个技能不在本向导清单内：" + s.others.join("、"));
     if ((s.absent || []).length) parts.push("包里缺 " + s.absent.join("、"));
     chip = '<div class="snote ' + (s.ok ? "info" : "warn") + '"><span>' + (s.ok ? "✅" : "⚠")
       + '</span><span>' + esc(parts.join("；") || "没有需要装的") + '</span></div>';
@@ -7475,6 +7511,8 @@ async function onboardInstallSkills() {
 
 async function onboardFinish() {
   try { await post("/api/wizard/first-run", {}); } catch (e) { /* 登记失败不挡人 */ }
+  _onboardNeeded = false;                       // 走完了：不再挡
+  onboardHide();
   switchView("dashboard");
   renderInstallNotice();
 }
@@ -7501,9 +7539,10 @@ async function bootView() {
     try {
       const on = await api("/api/wizard/first-run");
       if (on && on.shouldOnboard) {
+        _onboardNeeded = true;         // 完成前一直挡着（用户第 1 条：配完前不能正式使用）
         switchView("settings");
         renderInstallNotice();
-        gotoOnboard(0);   // 首装：进**新**三步向导（旧 13 步那张卡仍在设置里，供手动用）
+        gotoOnboard(0);
         return;
       }
     } catch (e) {
