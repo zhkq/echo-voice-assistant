@@ -18,7 +18,8 @@ class _Case(unittest.TestCase):
     """每个用例前把状态清干净（模块级计数会跨用例留着）。"""
 
     def setUp(self):
-        backend_watch._STATE.update(checks=0, ok=0, restarts=[], last={}, note="")
+        backend_watch._STATE.update(checks=0, ok=0, restarts=[], last={}, note="",
+                                    paused_until=0.0, paused_note="")
 
     def _tick(self, *, wanted=(True, "ECHO 起的（有 pid 记录）"), healthy=(True, "两个口都在听"), busy="",
               start_result=(True, "已开始「起本机后端」"), now=1000.0):
@@ -114,6 +115,24 @@ class RulesTests(_Case):
         self.assertFalse(ok, why)
         self.assertEqual([8900, 8901], seen, "两个口都要探")
         self.assertIn("8900", why)
+
+    def test_an_explicit_stop_is_respected(self):
+        """**明确停过就别马上拉**：否则用户点了「停止后端」，30 秒后它又自己回来
+        （而且"跑门禁前先停后端"这条纪律也就不成立了 —— 8900/8901 抢不到空）。"""
+        import time as _t
+        backend_watch.pause("你点了「停止后端」", seconds=1800)
+        out, calls = self._tick(healthy=(False, "数据口 8900 没在听"), now=_t.time() + 10)
+        self.assertEqual("skip", out["action"], out)
+        self.assertEqual(0, calls["start"], "明确停过的这段时间里不许自动拉起")
+        self.assertIn("明确停过", out["detail"])
+        self.assertTrue(backend_watch.state()["paused"])
+
+    def test_a_healthy_backend_clears_the_pause(self):
+        import time as _t
+        backend_watch.pause("x", seconds=60)
+        out, _ = self._tick(now=_t.time() + 120)          # 退避过期 + 它现在是好的
+        self.assertEqual("ok", out["action"], out)
+        self.assertFalse(backend_watch.state()["paused"], "它好了就该把退避清掉")
 
     def test_state_is_readable_and_honest(self):
         st = backend_watch.state()

@@ -397,6 +397,14 @@ def api_capability_backend_start(body: Optional[BackendStartIn] = None,
 def api_capability_backend_stop(_auth=Depends(optional_auth)):
     """停掉 ECHO 自己起的那个后端（手工起的实例一个字节都不动）。"""
     from app import backend_admin
+    # 2026-10-11：**明确停 = 听用户的** —— 通知看门狗别在 30 秒后又把它拉回来。
+    # 没有这一条会有两个后果：① 用户点「停止后端」被无声推翻（过一会儿它又起来了）；
+    # ② 按 AGENTS.md 的纪律"跑门禁前先停后端"时，8900/8901 抢不到空 → 门禁根本没法跑。
+    try:
+        from app import backend_watch
+        backend_watch.pause("你点了「停止后端」")
+    except Exception:
+        pass
     ok, message = backend_admin.stop()
     if not ok:
         raise HTTPException(status_code=400, detail=message)
