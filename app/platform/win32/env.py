@@ -337,8 +337,15 @@ def listening_pid(port: int) -> int:
     """谁在监听本机某端口（``netstat -ano``）；找不到 = 0。"""
     import subprocess
     try:
+        # 2026-10-11：**必须锁住编码/容错**。netstat 的输出在本机是 OEM/GBK 字节，
+        # 而 	ext=True 不带 encoding 时会跟着"当前模式"走 —— 一旦进程处于 UTF-8 模式
+        # （python -X utf8 / PYTHONUTF8=1），reader 线程就按 UTF-8 解 → 抛
+        # UnicodeDecodeError → 本函数返回 0 →"端口空着"（实测：	est_backend_proc 里
+        # 4 条端口归属用例单跑必红、门禁却绿，差别就在跑用例时加没加 -X utf8）。
+        # 我们要解析的 TCP 行本身是 ASCII，所以 errors=replace 完全安全。
         out = subprocess.run(["netstat", "-ano", "-p", "tcp"],
                              capture_output=True, text=True, timeout=10,
+                             encoding="utf-8", errors="replace",
                              creationflags=no_window_creationflags()).stdout or ""
     except Exception:
         return 0
