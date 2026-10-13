@@ -115,6 +115,14 @@ function Resolve-Npx {
     return ''
 }
 
+#: 国内镜像。**为什么要在装之前就把它拿出来**（2026-10-13 同事实测，见 AGENTS.md）：
+#  官方 registry 在装 koffi 这类带原生模块的包时，若 `@koromix/koffi-<平台>` 预构建包
+#  没就位，koffi 的 install 脚本会**退化成现场编译**（调 cmake/VS 工具链，普通机器没有）
+#  -> npm install 直接失败。镜像源上预构建包齐全、且国内不超时，所以让 npm 优先走它。
+#  ⚠️ 顺序是"先官方、镜像只做比较/兜底"：镜像同步官方有延迟，官方源有更新时不该被镜像拖住。
+$script:MirrorRegistry = 'https://registry.npmmirror.com'
+$script:LiveRegistry = 'https://registry.npmjs.org'
+
 #: 查不到 npm registry 时的兜底版本（**只是兜底，不是"我们要装的版本"**）。
 #  为什么留一个写死的值：全新机器上 npm 可能还没配好源 / 断网，这时**不能**因为
 #  "查不到最新版"就整个失败 —— 退回一个已知可用的版本，装完照样能用。
@@ -148,6 +156,133 @@ function Resolve-LatestVersion([string]$Npm, [switch]$Quiet) {
     } catch {
         return ''
     }
+}
+
+function Compare-VersionNumber([string]$A, [string]$B) {
+    #: 比较两个版本号字符串（A > B 返回 1，A < B 返回 -1，相等返回 0）。
+    #  用途：两个 registry 各报一个 latest 时，挑**更新的那个**装。
+    #  为什么不复用自己的 Test-NewerVersion：那个是为"提示升级"写的、只在预发布号上做
+    #  粗略排序；这里要的是严格比较，所以按 semver 的正牌算法来（预发布段 < 同版本正式版）。
+    $pa = [regex]::Match([string]$A, '^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.\-]+))?')
+    $pb = [regex]::Match([string]$B, '^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.\-]+))?')
+    if (-not $pa.Success) { return -1 }
+    if (-not $pb.Success) { return 1 }
+    for ($i = 1; $i -le 3; $i++) {
+        $x = [int]$pa.Groups[$i].Value; $y = [int]$pb.Groups[$i].Value
+        if ($x -ne $y) { return $(if ($x -gt $y) { 1 } else { -1 }) }
+    }
+    $ra = $pa.Groups[4].Value
+    $rb = $pb.Groups[4].Value
+    if (-not $ra -and -not $rb) { return 0 }
+    if (-not $ra) { return 1 }        # 无预发布段 = 正式版，比预发布版新
+    if (-not $rb) { return -1 }
+    $ida = $ra.Split('.')
+    $idb = $rb.Split('.')
+    for ($i = 0; $i -lt [Math]::Max($ida.Count, $idb.Count); $i++) {
+        if ($i -ge $ida.Count) { return -1 }
+        if ($i -ge $idb.Count) { return 1 }
+        $sa = $ida[$i]; $sb = $idb[$i]
+        $na = 0; $nb = 0
+        $aNum = [int]::TryParse($sa, [ref]$na)
+        $bNum = [int]::TryParse($sb, [ref]$nb)
+        if ($aNum -and $bNum) { if ($na -ne $nb) { return $(if ($na -gt $nb) { 1 } else { -1 }) } continue }
+        if ($aNum -ne $bNum) { return $(if ($aNum) { -1 } else { 1 }) }   # 数字标识符 < 字母标识符
+        $c = [string]::CompareOrdinal($sa, $sb)
+        if ($c -ne 0) { return $(if ($c -gt 0) { 1 } else { -1 }) }
+    }
+    return 0
+}
+
+function Resolve-InstallSource([string]$Npm, [string]$ForVersion, [switch]$Quiet) {
+    <#
+      决定这次 `npm install` 走哪个 registry，返回 @{ Version=...; Registry=... }。
+
+      背景（2026-10-13 同事新机器实测，见 AGENTS.md）：npm install @0.2.0-rc.2 在官方
+      registry 上装 koffi 时，它的 install 脚本试图**现场编译**原生模块，而子进程里
+      `node` 不在 PATH（cmd 报 "'node' 不是内部或外部命令"）-> 整次安装失败 ->
+      脚本回退到 npx 缓存复制。修 PATH 是治本，但**预构建包是不是就位**决定"要不要编译"，
+      所以顺手把源也选对：官方源和镜像各查一次 latest，**谁新用谁**；官方查不到（超时/
+      被墙）就用镜像；显式传了 -Version 时，只要该版本在镜像上有，就用镜像装（国内更快）。
+
+      返回的 Registry 为 '' 表示"不传 --registry，按本机 npm 自己的配置来"（用户在
+      内网源/自定义源上时，尊重他本机的配置，别硬塞公网源）。
+    #>
+    if (-not $Npm) { return [pscustomobject]@{ Version = ''; Registry = '' } }
+
+    $live = ''
+    $mirror = ''
+    try {
+        $raw = & $Npm 'view' '@deepseek-ai/dsh' 'dist-tags.latest' ("--registry={0}" -f $script:LiveRegistry) 2>$null
+        $live = ([string]($raw | Select-Object -First 1)).Trim().Trim('"')
+        if ($live -notmatch '^\d+\.\d+\.\d+') { $live = '' }
+    } catch { $live = '' }
+    try {
+        $raw = & $Npm 'view' '@deepseek-ai/dsh' 'dist-tags.latest' ("--registry={0}" -f $script:MirrorRegistry) 2>$null
+        $mirror = ([string]($raw | Select-Object -First 1)).Trim().Trim('"')
+        if ($mirror -notmatch '^\d+\.\d+\.\d+') { $mirror = '' }
+    } catch { $mirror = '' }
+
+    $version = ''
+    $registry = ''
+    if ($ForVersion) {
+        $version = $ForVersion
+        if ($mirror) { $registry = $script:MirrorRegistry }
+    } elseif ($live -and $mirror) {
+        if ((Compare-VersionNumber $mirror $live) -gt 0) { $version = $mirror; $registry = $script:MirrorRegistry }
+        else { $version = $live; $registry = $script:LiveRegistry }
+    } elseif ($live) {
+        $version = $live; $registry = $script:LiveRegistry
+    } elseif ($mirror) {
+        $version = $mirror; $registry = $script:MirrorRegistry
+    }
+    if (-not $Quiet -and $registry) {
+        Say ("安装源：{0}（官方 latest={1}，镜像 latest={2}）" -f $registry, $(if ($live) { $live } else { '查不到' }), $(if ($mirror) { $mirror } else { '查不到' }))
+    }
+    return [pscustomobject]@{ Version = $version; Registry = $registry }
+}
+
+function Select-CachedTree($Trees, [string]$Version, [switch]$AllowMismatch) {
+    <#
+      从 npx 缓存里的若干棵树里挑一棵。
+      能这样选就不会乱选：**同版本优先**，其次（只在允许时）拿最新的不同版本。
+    #>
+    $trees = @($Trees)
+    if ($trees.Count -eq 0) { return $null }
+    $exact = @($trees | Where-Object { $_.Version -eq $Version })
+    if ($exact.Count -gt 0) {
+        return ($exact | Sort-Object Time -Descending | Select-Object -First 1)
+    }
+    if (-not $AllowMismatch) { return $null }
+    $pick = $trees | Sort-Object Time -Descending | Select-Object -First 1
+    Warn ("缓存里没有 {0}，退而用 {1}（版本不同，但比 npx 快得多）" -f $Version, $pick.Version)
+    return $pick
+}
+
+function Resolve-NativeCheck([string]$NodeBin) {
+    <#
+      返回 node-addon-check.js 的路径；没有就返回 ''（调用方跳过这道检查）。
+
+      每一句都是为了不误伤：
+        * 只在**本 skill 的 scripts\** 找：预置的脚本随 skill 走，找不到就说明这份安装
+          是旧版 skill 铺的，跳过检查比瞎报错强（向后兼容，不破坏老机器的安装）；
+        * $PSScriptRoot 可能为空（脚本被 dot-source 或按字符串跑），所以先判空再查。
+    #>
+    if (-not $PSScriptRoot) { return '' }
+    $candidate = Join-Path $PSScriptRoot 'node-addon-check.js'
+    if (Test-Path -LiteralPath $candidate) { return $candidate }
+    return ''
+}
+
+function Get-CachedTree([string]$Version, [switch]$AllowMismatch) {
+    # 「在缓存里找一棵可用的树」：先翻现有缓存，翻不到就主动填一次再翻。
+    $trees = Get-NpxCacheTrees -Root $CacheDir
+    $pick = Select-CachedTree $trees -Version $Version -AllowMismatch:$AllowMismatch
+    if ($pick) { return $pick }
+    if (Fill-NpxCache -Version $Version) {
+        $trees = Get-NpxCacheTrees -Root $CacheDir
+        $pick = Select-CachedTree $trees -Version $Version -AllowMismatch:$AllowMismatch
+    }
+    return $pick
 }
 
 function Test-HarnessTree([string]$Target) {
@@ -337,21 +472,21 @@ function Fill-NpxCache([string]$Version) {
     return $false
 }
 
-# ---- 版本：默认取 npm 上的 latest（2026-10-08 用户要求：别写死旧版本）----
+# ---- 版本 + 源：默认取 npm 上的 latest（2026-10-08 用户要求：别写死旧版本）----
 #  三种情况都要**说清楚**，不要静默：
-#    ① 没传 -Version → 查 latest，查到就用；
-#    ② 查不到（断网/源没配/npm 不在）→ 退回内置 $FallbackVersion 并**告警**；
+#    ① 没传 -Version → 官方/镜像各查一次 latest，**谁新用谁**；
+#    ② 都查不到（断网/源没配/npm 不在）→ 退回内置 $FallbackVersion 并**告警**；
 #    ③ 显式传了 -Version → 用它（这也是**升级/降级到指定版本**的入口）。
-if (-not $Version) {
-    $npmForVersion = Resolve-Npm
-    $latest = Resolve-LatestVersion -Npm $npmForVersion
-    if ($latest) {
-        $Version = $latest
-    } else {
-        $Version = $script:FallbackVersion
-        Warn ("查不到 npm registry 上的最新版，退回内置版本 {0}" -f $Version)
-        Warn "  （想指定版本：-Version <版本号>；想升级：见下文「升级标准版」）"
-    }
+#  $UseRegistry 单独记"这次 npm install 要显式指定哪个源"：
+#    为空 = 不传 --registry，按本机 npm 自己的配置走（尊重内网/自定义源）。
+$latestInfo = Resolve-InstallSource -Npm (Resolve-Npm) -ForVersion $Version
+$UseRegistry = $latestInfo.Registry
+if (-not $Version -and $latestInfo.Version) {
+    $Version = $latestInfo.Version
+} elseif (-not $Version) {
+    $Version = $script:FallbackVersion
+    Warn ("查不到 npm registry 上的最新版，退回内置版本 {0}" -f $Version)
+    Warn "  （想指定版本：-Version <版本号>；想升级：见下文「升级标准版」）"
 }
 
 Say ("标准版版本：{0}" -f $Version)
@@ -379,7 +514,7 @@ function Get-VersionRank([string]$V) {
       为什么要自己排：**预发布号不是 semver 的普通大小关系**（`0.2.0-rc.2` 名义上小于
       `0.2.0`），而这里的用途只是"本机这份和 registry 上那份是不是同一个"以及
       "粗略判断谁新" —— 用来**决定要不要提示升级**，不是拿来做依赖解析。
-      真正的"哪个是给用户的稳定版"由 npm 的 dist-tag 决定（见 `Resolve-LatestVersion`）。
+      真正的"哪个是给用户的稳定版"由 npm 的 dist-tag 决定（见 `Resolve-InstallSource`）。
     #>
     $m = [regex]::Match([string]$V, '^(\d+)\.(\d+)\.(\d+)(?:-([A-Za-z]+)\.?(\d+)?)?')
     if (-not $m.Success) { return @(0, 0, 0, 0) }
@@ -476,8 +611,23 @@ if (-not (Test-Entry)) {
             Warn '没找到 npm —— 跳过 npm，直接试 npx 缓存复制'
         } else {
             Say ("用 npm 安装 @deepseek-ai/dsh@{0}（一次性，可能要几分钟；请勿中断）..." -f $Version)
+            # **本次修复的核心一行**（2026-10-13 同事新机器实测，见 AGENTS.md）：
+            #   npm 的生命周期脚本是交给 `cmd.exe /d /s /c node ...` 执行的，而打包版 node 常常
+            #   **不在 PATH 里**（`...\.workbuddy\binaries\node\versions\<v>\node.exe`）。于是
+            #   koffi 的 install 脚本（`node ./cnoke.cjs ...`）一上来就 9009：
+            #     'node' 不是内部或外部命令，也不是可运行的程序或批处理文件
+            #   -> 原生模块没法就位 -> 整个 npm install 失败 -> 白退到 npx 缓存那条路。
+            #   **必须改的是"传给子进程的环境"，不是本进程的**：即使宿主把环境重置过，
+            #   只要 spawn 时带上这份 PATH，npm 起的 cmd 就一定找得到 node。
+            #   同 Fill-NpxCache 里的做法（那里早就这么修了，npm 这处当初漏了）。
             $old = $env:CODEBUDDY_SAFE_DELETE_ENABLED
             $env:CODEBUDDY_SAFE_DELETE_ENABLED = '0'
+            $oldPath = $env:PATH
+            $nodeDir = Split-Path -Parent $node
+            if ($nodeDir) { $env:PATH = $nodeDir + ';' + $env:PATH }
+            # 源：优先镜像（预构建包齐全、不超时）。不传时按本机 npm 配置走。
+            $npmArgs = @('install', ("@deepseek-ai/dsh@{0}" -f $Version), '--no-audit', '--no-fund', '--loglevel=error', '--save-exact')
+            if ($UseRegistry) { $npmArgs += ("--registry={0}" -f $UseRegistry); Say ("  源：{0}" -f $UseRegistry) }
             Push-Location $target
             try {
                 # native 命令把进度/警告写在 **stderr**；而 `$ErrorActionPreference = 'Stop'` 下
@@ -489,8 +639,7 @@ if (-not (Test-Entry)) {
                 $prevEap = $ErrorActionPreference
                 $ErrorActionPreference = 'Continue'
                 try {
-                    & $npm install ("@deepseek-ai/dsh@{0}" -f $Version) `
-                        --no-audit --no-fund --loglevel=error 2>&1 |
+                    & $npm @npmArgs 2>&1 |
                         ForEach-Object { Write-Host ("      " + $_) -ForegroundColor DarkGray; LogLine ("      " + $_) }
                     $npmExit = $LASTEXITCODE
                 } finally {
@@ -503,6 +652,7 @@ if (-not (Test-Entry)) {
                 Warn ("npm 执行异常：{0}" -f $_.Exception.Message)
             } finally {
                 Pop-Location
+                $env:PATH = $oldPath
                 if ($null -eq $old) { Remove-Item Env:\CODEBUDDY_SAFE_DELETE_ENABLED -ErrorAction SilentlyContinue }
                 else { $env:CODEBUDDY_SAFE_DELETE_ENABLED = $old }
             }
@@ -514,31 +664,18 @@ if (-not (Test-Entry)) {
     if (-not (Test-Entry)) {
         Warn 'npm 这条路没装上（这个版本的依赖图曾出过 registry 事故，见 AGENTS.md）'
         Say '  改用 npx 缓存里那份已经能跑的树 ...'
-        $trees = Get-NpxCacheTrees -Root $CacheDir
-        $pick = $null
-        $exact = @($trees | Where-Object { $_.Version -eq $Version })
-        if ($exact.Count -gt 0) {
-            $pick = $exact | Sort-Object Time -Descending | Select-Object -First 1
-        } elseif ($trees.Count -gt 0) {
-            $pick = $trees | Sort-Object Time -Descending | Select-Object -First 1
-            Warn ("缓存里没有 {0}，退而用 {1}（版本不同，但比 npx 快得多）" -f $Version, $pick.Version)
-        }
+        # 版本闸门（2026-10-13 同事新机器实测）：用户要的是 latest，而缓存里**恰好**有别的
+        # 版本时，原来的写法会静默拿最新的那棵不同版本的树装上 —— 于是"装最新版"变成"装缓存里
+        # 随便哪个版本"，用户完全不知道。现在：只有缓存里**有这个版本**才自动用；
+        # 没有就明确报错、并告诉用户出路（-FromCache 是"我知道版本可能不同"的显式授权）。
+        $allowMismatch = [bool]$FromCache
+        $pick = Get-CachedTree -Version $Version -AllowMismatch:$allowMismatch
         if (-not $pick) {
-            # 全新机器上缓存往往是空的（同事实测）→ 先自己填一次再找
-            if (Fill-NpxCache -Version $Version) {
-                $trees = Get-NpxCacheTrees -Root $CacheDir
-                $exact = @($trees | Where-Object { $_.Version -eq $Version })
-                if ($exact.Count -gt 0) {
-                    $pick = $exact | Sort-Object Time -Descending | Select-Object -First 1
-                } elseif ($trees.Count -gt 0) {
-                    $pick = $trees | Sort-Object Time -Descending | Select-Object -First 1
-                    Warn ("缓存里没有 {0}，退而用 {1}（版本不同，但比 npx 快得多）" -f $Version, $pick.Version)
-                }
-            }
-        }
-        if (-not $pick) {
-            Err 'npx 缓存里也没有可用的标准版 —— 回退 npx：首次启动要多等 1-2 分钟'
-            Say '  想装本地入口：先 `npx -y @deepseek-ai/dsh web` 跑一次（把缓存填上）再重跑本脚本'
+            $trees = @(Get-NpxCacheTrees -Root $CacheDir)
+            Err ("npx 缓存里没有 {0}（缓存里有：{1}）" -f $Version, $(if ($trees.Count -gt 0) { (($trees | ForEach-Object { $_.Version }) -join '、') } else { '空' }))
+            Say '  出路一：确认网络/源之后重跑本脚本（npm 那条路是首选）'
+            Say '  出路二：就是要用缓存里那个别的版本 -> 加 -FromCache 重跑（会明确告警版本不同）'
+            Say '  出路三：先 `npx -y @deepseek-ai/dsh web` 跑一次把缓存填上再重跑本脚本'
             exit 1
         }
         Say ("  缓存树：{0}（版本 {1}）" -f $pick.NodeModules, $pick.Version)
@@ -560,6 +697,34 @@ if ($broken.Count -gt 0) {
     Err ("标准版安装不完整：{0}" -f ($broken -join '、'))
     Say ("  修法：删掉 {0} 后重跑本脚本" -f $target)
     exit 1
+}
+
+# ---- 原生模块闸门（2026-10-13 新增，见 AGENTS.md）----
+# 为什么光有上面那道冒烟测试还不够：`node bin.js --version` 只走 CLI 的入口链，**碰不到**
+# koffi —— 而 koffi 是 dsh-fs / dsh-subprocess-local / dsh-session-persistence-jsonl /
+# dsh-sandbox-windows-acl 的原生依赖，正是**跑 pwsh、跑子进程**的必经之路。
+# 场景：npm 装到一半在 koffi 上失败（cmake 缺、杀软拦、PATH 找不到 node），而 npx 缓存那条路
+# 恰好补上一棵能跑的树 -> 旧脚本照样打印"已就绪"。必须**真 require 一次**才算数。
+$nativeCheck = Resolve-NativeCheck $node
+if ($nativeCheck) {
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $ncOut = & $node $nativeCheck $target 2>&1
+        $ncCode = $LASTEXITCODE
+    } catch {
+        $ncOut = @($_.Exception.Message); $ncCode = -1
+    } finally { $ErrorActionPreference = $prevEap }
+    if ($ncCode -ne 0) {
+        Err '原生模块自检没过（koffi 之类加载不了 —— 典型原因：npm 装到一半在它上面失败）'
+        foreach ($line in @($ncOut | Select-Object -Last 5)) { Say ("  " + $line) }
+        Say ("  修法：删掉 {0} 后重跑本脚本（脚本会重走 npm install）" -f (Join-Path $target 'node_modules'))
+        exit 1
+    }
+    Ok ("原生模块自检通过：{0}" -f (($ncOut | Select-Object -Last 1) -join ''))
+} else {
+    # 老机器上这份 skill 可能还没有 node-addon-check.js：跳过而不是报错，别把旧安装搞坏。
+    LogLine '跳过原生模块自检（本 skill 里没有 node-addon-check.js）'
 }
 
 $cmd = '"{0}" "{1}" web' -f $node, $entry

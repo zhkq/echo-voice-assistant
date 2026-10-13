@@ -37,6 +37,13 @@ CACHE_DIR=""
 NODE_BIN=""
 COMMAND_FILE=""
 LOG_FILE=""
+# 镜像源。**为什么装之前就要把源定下来**（2026-10-13 同事新机器实测，见 AGENTS.md）：
+#   koffi 这类带原生模块的包，若 `@koromix/koffi-<平台>` 预构建包没就位，它的 install 脚本
+#   会**现场编译**（调 cmake/编译器）—— 而 npm 生命周期脚本是交给 shell 跑的，子进程 PATH
+#   里常常没有 node（托管式 node：Homebrew/nvm/WorkBuddy），一上来就 "'node' 不是内部或
+#   外部命令" -> 整个 npm install 失败。镜像源上预构建包齐全、且国内不超时，故默认走镜像。
+DEFAULT_REGISTRY="https://registry.npmmirror.com"
+REGISTRY=""
 
 usage() {
   cat <<'EOF'
@@ -49,6 +56,8 @@ usage() {
   --node <路径>        显式指定 node（默认自己找）
   --command-file <路径> 成功后把启动命令写进这个文件
   --log-file <路径>    每一步同时追加到这个日志（安装器的 install-*.log）
+  --registry <URL>     装包时显式用这个 registry（默认镜像 https://registry.npmmirror.com；
+                       koffi 在这上面能直接吃到预构建二进制，不会退化成现场编译）
 EOF
 }
 
@@ -62,6 +71,7 @@ while [ $# -gt 0 ]; do
     --node)         NODE_BIN="$2"; shift 2 ;;
     --command-file) COMMAND_FILE="$2"; shift 2 ;;
     --log-file)     LOG_FILE="$2"; shift 2 ;;
+    --registry)     REGISTRY="$2"; shift 2 ;;
     -h|--help)      usage; exit 0 ;;
     *) echo "未知参数：$1" >&2; usage >&2; exit 2 ;;
   esac
@@ -278,7 +288,15 @@ if [ ! -s "$ENTRY" ] || [ -n "$(tree_broken "$TARGET")" ] || [ "${NEED_INSTALL:-
     say "按要求跳过 npm，直接用 npx 缓存"
   elif command -v npm >/dev/null 2>&1; then
     say "用 npm 安装 @deepseek-ai/dsh@$VERSION（一次性，可能要几分钟；请勿中断）..."
-    ( cd "$TARGET" && npm install "@deepseek-ai/dsh@$VERSION" --no-audit --no-fund 2>&1 | sed 's/^/      /' ) || true
+    # **本次修复的核心**（2026-10-13 同事新机器实测，见 AGENTS.md）：
+    #   npm 的生命周期脚本由子 shell 执行，而托管式 node 常常**不在 PATH 里**。于是 koffi
+    #   的 install 脚本（`node ./cnoke.cjs ...`）一上来就找不到 node -> 原生模块装不上 ->
+    #   整个 npm install 失败 -> 白退到 npx 缓存那条路。这里把 node 所在目录**前置**到
+    #   子进程 PATH，npm 起的 shell 就一定找得到 node（与 Windows 版同一处理）。
+    NPM_REG="${REGISTRY:-$DEFAULT_REGISTRY}"
+    say "  源：$NPM_REG"
+    ( cd "$TARGET" && PATH="$(dirname "$NODE"):$PATH" npm install "@deepseek-ai/dsh@$VERSION" \
+        --no-audit --no-fund --registry "$NPM_REG" --save-exact 2>&1 | sed 's/^/      /' ) || true
   else
     warn "没找到 npm —— 跳过 npm，直接试 npx 缓存复制"
   fi
@@ -328,6 +346,25 @@ if [ -n "$BROKEN" ]; then
   err "标准版安装不完整：$(printf '%s' "$BROKEN" | tr '\n' ' ')"
   say "  修法：删掉 $TARGET 后重跑本脚本"
   exit 1
+fi
+
+# ---- 原生模块闸门（2026-10-13 新增，见 AGENTS.md）----
+# 为什么光有上面的冒烟测试不够：`node bin.js --version` 走的是 CLI 入口链，**碰不到** koffi
+# —— 而它是 dsh-fs / dsh-subprocess / dsh-session-persistence-jsonl 的原生依赖，正是跑子
+# 进程的必经之路。npm 装到它上面失败、又恰好补上一棵"看起来能用"的树时，旧脚本照样报"已就绪"。
+# 必须**真 require 一次**。没有这个自检文件（老机器上的旧技能）就跳过，别把旧安装搞坏。
+NATIVE_CHECK="$(dirname "$0")/node-addon-check.js"
+if [ -f "$NATIVE_CHECK" ]; then
+  if NC_OUT="$("$NODE" "$NATIVE_CHECK" "$TARGET" 2>&1)"; then
+    ok "原生模块自检通过：$NC_OUT"
+  else
+    err "原生模块自检没过（koffi 之类加载不了 —— 典型原因：npm 装到一半在它上面失败）"
+    printf '%s\n' "$NC_OUT" | tail -5 | sed 's/^/  /'
+    say "  修法：删掉 $TARGET/node_modules 后重跑本脚本（脚本会重走 npm install）"
+    exit 1
+  fi
+else
+  _log "跳过原生模块自检（本技能里没有 node-addon-check.js）"
 fi
 
 CMD="\"$NODE\" \"$ENTRY\" web"

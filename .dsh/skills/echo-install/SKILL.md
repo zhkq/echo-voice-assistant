@@ -55,7 +55,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "<kit>\echo-core\scripts\ins
 
 | 要问什么 | 推荐 | 为什么问 |
 |---|---|---|
-| **装到哪个目录** | Windows `D:\ECHO`（没 D 盘就用空间最大的盘）；macOS `~/ECHO` | ⚠ **必须纯英文路径**，别放桌面、中文路径或云同步目录 —— 转写引擎读中文路径会出问题 |
+| **装到哪个目录** | Windows `D:\ECHO`（没 D 盘就用空间最大的盘）；macOS `~/ECHO` | ⚠ **必须纯英文路径**，别放桌面/中文/OneDrive/iCloud —— 转写引擎读中文路径会出问题 |
 | **转写方式**（可多选，见下表） | **`sherpa`**（边听边出字，189 MB，**不需要独显**） | 这是唯一"装完立刻能用又不吃显卡"的一档 |
 | **要不要唤醒词**（喊一声就开始） | 不要 | 要常开麦克风，有隐私成本；模型 40 MB |
 | **要不要说话人分离**（会议里区分谁在说） | 不要（除非会议真的要区分谁在说） | 现在可一键装（ModelScope 匿名可下）；**使用条款请用户自行确认** |
@@ -320,6 +320,23 @@ bash "$kit/echo-install/scripts/echo-install-components.sh" \
 > 单独修装坏的标准版：直接跑 `harness-install-local.ps1 -DestDir <安装目录>`（Windows）或
 > `bash harness-install-local.sh --dest <安装目录>`（macOS），加 `-FromCache` / `--from-cache`
 > 可跳过 npm 走缓存复制（离线也能装）。
+>
+> **2026-10-13 修：② 这条路以前会失败在 koffi 上（同事新机器实测）**。三处改动：
+> 1. **给 npm 的子进程前置 PATH**（`node.exe` 所在目录）—— npm 的生命周期脚本由
+>    `cmd.exe`/子 shell 执行，而打包版 node（WorkBuddy）不在 PATH 里，koffi 的 install
+>    脚本 `node ./cnoke.cjs …` 直接 9009（`'node' 不是内部或外部命令`）→ 原生模块装不上
+>    → 整个 npm install 失败。**这一处以前只有"填 npx 缓存"那条路修过，npm 这处漏了。**
+> 2. **装包默认走镜像**（`--registry=https://registry.npmmirror.com`，可用 `-Registry` /
+>    `--registry` 覆盖）：koffi 在有预构建包时**不需要编译器**，镜像上预构建齐全且不超时；
+>    取版本时官方与镜像各查一次、**谁新用谁**（镜像同步有延迟，官方更新时不被拖住）。
+> 3. **加原生模块闸门**（`node-addon-check.js`，与脚本同目录）：真 `require` 一次
+>    `koffi` / `node-pty`。为什么必须在 CLI 冒烟之外单加一步 —— `node bin.js --version`
+>    走不到 koffi，而 koffi 是 `dsh-fs` / `dsh-subprocess-local` /
+>    `dsh-session-persistence-jsonl` / `dsh-sandbox-windows-acl` 的原生依赖，**跑 pwsh 和
+>    子进程的必经之路**；它坏了旧脚本照样打印"已就绪"。现在自检不过就 **exit 1**，
+>    不再静默降级。旧技能里没有这个文件时**跳过**（老机器不受影响）。
+> 4. 顺带把 ③ 的**版本闸门**收紧：缓存里没有目标版本时**不再静默拿别的版本顶上**，
+>    而是明确报错并给三条出路（重跑 npm / 加 `-FromCache` 授权版本不同 / 先填缓存）。
 
 > **版本与升级（2026-10-08 用户要求：装最新版、别写死旧版本、要给升级方法）**
 >
@@ -418,6 +435,7 @@ curl -s "http://127.0.0.1:$port/api/models" | ./venv/bin/python -m json.tool | h
 | 智能体没起来（纪要/归档/指令不能用） | 需要 **Node.js**：装 Node 后重跑第 3 步的组件脚本（`-Agent harness` / `--agent harness`）—— 脚本会把标准版**永久装到 `<安装目录>/harness/dsh`** 并写好 `harnessCommand`，ECHO 直接拉起（冷启动约 10 秒）；或改用已装的 DSH 桌面版。**注意**：node 装在托管目录（如 WorkBuddy）里、不在系统 PATH 时，ECHO 自己会探测（2026-09-22 起）；若 `harnessCommand` 里是 `npx …`（回退路径），第一次启动仍要等 1-2 分钟 |
 | npm 报 `SAFE_DELETE_BULK_CONFIRM_REQUIRED` | 宿主（WorkBuddy 等）的安全删除 shim 拦了批量删除。装 dsh 时带 `CODEBUDDY_SAFE_DELETE_ENABLED=0`；**别中途 kill npx/npm**，否则包会装残（`node-pty` 缺 `index.js`） |
 | npm 装 dsh 报 `ETARGET / No matching version found for …documentpreview@^0.1.5-rc.3` | 这是 **registry 侧的依赖图事故**（不是你的机器问题）：`0.1.5-rc.2` 有个子包依赖 `^0.1.5-rc.3`，而那个 rc.3 当时没发布。**2026-09-22 晚复测已恢复**（rc.3 已发布），先直接重跑一次多半就好了。仍不行时脚本会自动改走 **npx 缓存复制**（缓存空会先让 npx 填上，再复制）；也可直接 `harness-install-local.ps1 -DestDir <安装目录> -FromCache`（macOS：`bash harness-install-local.sh --dest <安装目录> --from-cache`）。日志里会写明用了哪份缓存树、版本是否一致 |
+| npm 装 dsh 报 **`npm error path …\node_modules\koffi` + `command … cmd.exe /d /s /c node ./cnoke.cjs …` + `'node' 不是内部或外部命令`**（乱码显示成「锟斤拷」也是它） | **koffi 的原生模块装不上**：npm 的 install 脚本交给 `cmd.exe` 跑，而打包版 node（WorkBuddy 的 `…\.workbuddy\binaries\node\versions\<v>\node.exe`）**不在 PATH 里**，`node` 这个裸命令名解析不到（9009）。2026-10-13 已修：脚本会**给 npm 的子进程前置 `node.exe` 所在目录**，并默认走镜像让 koffi 直接吃预构建二进制。**见到旧日志时怎么处理**：直接重跑组件脚本即可（新版会走对）；确认装对了看有没有 `[ok] 原生模块自检通过：koffi@…（预构建：有）` —— 没有这行就说明这份技能是旧的。手工验证：`node <技能目录>\scripts\node-addon-check.js <安装根>\harness\dsh`（Windows；macOS 把斜杠换回去），或在安装目录里 `node -e "require('koffi')"` |
 | 改设置报 `422 … ["body","values"] Field required` | `PUT /api/settings` 的 body 必须包一层：`{"values": {"harnessCommand": "…"}}`；`agentBackend` 写 `harness`（不是组件名 `agent-harness`）并同时开 `agentHarnessEnabled` |
 | `pip` 慢 / 超时 | Windows 加 `-PipIndex https://pypi.tuna.tsinghua.edu.cn/simple`；mac 加 `--pip-index https://pypi.tuna.tsinghua.edu.cn/simple`，重跑（已装好的会跳过） |
 | 模型下载慢或卡住 | 挑更小的档位（如 `whisper-tiny`）；下载在 ECHO 服务里继续跑，可不盯；进度看面板 → 能力 |
