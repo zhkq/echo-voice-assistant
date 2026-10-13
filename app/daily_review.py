@@ -399,6 +399,8 @@ def submit(transcript: str, client=None, force_new=False, timeout=0):
             out["source"] = "fallback"
             return out
 
+        # 提示词内容由设置 `dailyReviewPrompt` 决定（**代码不再按轮次改写它**：
+        # 2026-10-13 用户提醒"稳定版已经在回顾过程中迭代过" —— 尊重那份模板）。
         prompt = build_prompt(transcript, vault=vault)
         client.prompt(sid, prompt)
         reply, done = client.wait_for_reply(
@@ -614,6 +616,8 @@ def status():
         "vault": vault_root(),
         "kind": today_kind(),
         "sessionId": session_id,
+        #: 前置环节（技能第 0 步）现状 —— 面板据此显示"正在收集今天的素材"（2026-10-13）
+        "pre": pre_state(),
     }
 
 
@@ -633,3 +637,261 @@ def start(force_new=False):
             "workspace": info.get("workspace", ""),
             "access": acc_why, "accessOk": acc_ok,
             "error": "" if sid else "没能建立回顾会话"}
+
+
+# ---------------------------------------------------------------- 前置环节（技能第 0 步）
+
+#: 前置环节的默认指令（对应技能 `daily-review` 的「第 0 步：自动收集当天素材」）。
+#: **刻意不含 `{transcript}`** —— 这一步跑在用户口述**之前**，那时还没有口述。
+#: 想改文案可以设隐藏设置 `dailyReviewPrePrompt`；读不到就用这一份（不定义也能跑）。
+DEFAULT_PRE_PROMPT = (
+    "【每日回顾·前置环节】\n"
+    "笔记库根目录：{vault}\n当前时间：{date} {time}（星期{weekday}）\n\n"
+    "**现在还没到我口述这一步**（我人在车里，稍后单独说）。请按 daily-review 技能的"
+    "「第 0 步：自动收集当天素材」先把今天（{date}）的素材收集好：\n"
+    "① 扫当天文件（企微 / 微信 / 桌面临时 / WPS 缓存，`scan_cache.py --days 1`），按归属登记；\n"
+    "② 检查 `02-会议记录/ECHO自动纪要/{date}_*.md`，按 meeting-archive 的判定归档；\n"
+    "【今天 ECHO 侧的会议（**纪要在这里，不在笔记库**）】\n{meetings}\n\n"
+    "⚠️ 笔记库 `02-会议记录/ECHO自动纪要/` 里今天可能**还没有文件** —— 那是「归档的结果」、"
+    "不是「今天没开会」：请以上面这份清单为准（纪要文件路径已给出，直接读它），"
+    "按 meeting-archive 的规则归档/**再**登记。\n"
+    "③ 汇总计数（文件登记数 / 其中专项数、会议归档数 / 其中例会数）留着给我后面播报用。\n"
+    "这一步**静默执行**：不用问我问题、不用等我口述；遇到异常静默跳过、别中断流程。\n"
+    "⚠️ 技能的 0-0 那句开场确认**不用回**（ECHO 已经念过了）—— 请直接在**这一轮里**把"
+    "0-A / 0-B 做完，最后只回一句「前置环节完成 + 计数」；"
+    "**不要在开场确认之后就结束这一轮**。")
+
+def today_meetings(now=None) -> list:
+    """今天的会议（**ECHO 侧**）：时间 / 标题 / 目录 / 纪要文件。
+
+    为什么前置环节需要它（2026-10-13 用户实测："第一轮没搜到今天的会议和纪要"）：
+    技能第 0 步的 0-B 让智能体去**笔记库**找 `02-会议记录/ECHO自动纪要/{date}_*.md`，
+    而当天会议刚结束时那里还没有文件（实测当天 0 个）；纪要在 ECHO 这边 ——
+    `{meetingWorkspace}/<名字>/summary.md`。**只报路径不够，得把真实位置告诉它。**
+    """
+    import json as _json
+    import os as _os
+    now = now or datetime.datetime.now()
+    day = now.strftime("%Y-%m-%d")
+    try:
+        from app import meeting as meeting_mod
+        root = meeting_mod.meetings_dir()
+        names = sorted(_os.listdir(root))
+    except Exception:                                        # noqa: BLE001 - 读不到就当今天没有
+        return []
+    out = []
+    for name in names:
+        if not name.startswith(day):
+            continue
+        d = _os.path.join(root, name)
+        if not _os.path.isdir(d):
+            continue
+        title = ""
+        try:
+            with open(_os.path.join(d, "meta.json"), encoding="utf-8") as fh:
+                title = str((_json.load(fh) or {}).get("title") or "")
+        except Exception:                                    # noqa: BLE001
+            title = ""
+        summ = _os.path.join(d, "summary.md")
+        has = _os.path.isfile(summ)
+        out.append({"name": name,
+                    "time": name.split("_")[-1].replace("-", ":")[:5],
+                    "title": title, "dir": d,
+                    "summary": summ if has else "", "hasSummary": has})
+    return out
+
+
+def meetings_block(now=None) -> str:
+    """把今天的会议列成给智能体看的清单（一条一行，含**纪要文件的绝对路径**）。"""
+    ms = today_meetings(now)
+    if not ms:
+        return "（今天 ECHO 里没有会议目录）"
+    lines = []
+    for m in ms:
+        s = ("纪要：%s" % m["summary"]) if m["hasSummary"] else "纪要：还没生成（只有录音与转写）"
+        lines.append("- %s %s ｜目录：%s ｜%s"
+                     % (m["time"], m["title"] or m["name"], m["dir"], s))
+    return "\n".join(lines)
+
+
+#: 前置环节的探测节奏。**故意不做成设置**：用户口径是"不用太限定上线秒数，但不能卡死"。
+PRE_MAX_S = 900.0     # 最长探测 15 分钟（一次当天素材扫描的正常上限远小于它）
+PRE_POLL_S = 3.0      # 每 3 秒主动探一次（不是一次长阻塞等到底）
+PRE_ETA_S = 60        # 开场播报里的预估时长（技能 0-0 的原话就是"大概需要一分钟"）
+#: 前置环节的**完成标记**。⚠️ 判完成只认它：`wait_for_reply` 的 `done` 只是"**本轮**结束了"，
+#: 而技能 0-0 要求智能体先回一句开场确认（很可能就在那一轮结束）—— 2026-10-13 实测就是这么
+#: 判早了 35.5 秒（素材还在扫，用户已经开始口述）。
+PRE_DONE_MARK = "前置环节完成"
+PRE_NUDGE_MAX = 3     # 追问上限（本轮结束却没带完成标记时）
+PRE_NUDGE_TEXT = (
+    "【前置环节·继续】刚才那一轮结束了，但第 0 步还没做完（扫当天文件 + 会议纪要归档）。"
+    "请继续把它做完；**全部做完后只回一句**「前置环节完成 + 计数」，不要再问问题。")
+
+_PRE = {"phase": "", "startedAt": 0.0, "seconds": 0.0, "finished": False,
+        "etaSec": PRE_ETA_S, "error": "", "nudges": 0}
+
+
+def pre_state() -> dict:
+    """前置环节的现状（面板读）。**纯读**，不触发任何动作。"""
+    st = dict(_PRE)
+    if st["phase"] == "pre" and st["startedAt"]:
+        st["elapsed"] = round(time.time() - st["startedAt"], 1)
+    else:
+        st["elapsed"] = st["seconds"]
+    return st
+
+
+def build_pre_prompt(vault="", now=None) -> str:
+    """拼前置环节那条指令。占位符机制与 `build_prompt` **同一套**（函数式替换，只扫模板）。"""
+    now = now or datetime.datetime.now()
+    values = {
+        "vault": vault or "",
+        "date": now.strftime("%Y-%m-%d"),
+        "time": now.strftime("%H:%M"),
+        "weekday": "一二三四五六日"[now.weekday()],
+        "chars": str(broadcast_limit_chars()),
+        # 今天的会议清单（时间/标题/目录/纪要绝对路径）—— 见 today_meetings 的说明
+        "meetings": meetings_block(now),
+    }
+    tpl = str(settings.get("dailyReviewPrePrompt", "") or "").strip() or DEFAULT_PRE_PROMPT
+    text = re.sub(r"\{(\w+)\}", lambda m: values.get(m.group(1), m.group(0)), tpl)
+    if "{meetings}" not in tpl:
+        # 自定义模板没带 `{meetings}`：**照样把今天的会议清单附在后面**。否则技能第 0-B 步
+        # 又会去笔记库 `02-会议记录/ECHO自动纪要/` 找当天文件，而那里当天是空的（实测 0 个），
+        # 会议纪要其实在 ECHO 侧 —— 这正是"第一轮没搜到今天的会议和纪要"的原因之一。
+        text += ("\n\n【今天 ECHO 侧的会议（纪要在这里，不在笔记库）】\n"
+                 + values["meetings"]
+                 + "\n⚠️ 笔记库 `02-会议记录/ECHO自动纪要/` 里今天可能还没有文件 —— "
+                   "那是「归档的结果」，不是「今天没开会」：以上面清单为准，"
+                   "按 meeting-archive 的规则归档/再登记。")
+    return text
+
+
+def pre_eta_text(seconds=None) -> str:
+    """预估时长说成人话。"""
+    s = int(seconds or PRE_ETA_S)
+    if s < 90:
+        return "大概一分钟"
+    if s < 150:
+        return "大概一两分钟"
+    return "大概 %d 分钟" % max(2, int(round(s / 60.0)))
+
+
+def pre_ack_text(eta=None) -> str:
+    """开场那句：**我开始了什么 + 大概多久**（技能 0-0 要求"让 ECHO 先出声"）。
+
+    这句话由 ECHO 自己念（`preflight(on_ack=…)`），**不等智能体先回话** —— 否则用户要等到
+    扫描做完才听见声音，正是"点了没反应"的那种体验。
+    """
+    return ("好，我先扫一下今天的素材：企微、微信、桌面和 WPS 的当天文件，"
+            "还有 ECHO 的会议纪要；%s。扫完就开始录你说的内容。" % pre_eta_text(eta))
+
+
+def preflight(client=None, force_new=False, on_ack=None, on_progress=None) -> dict:
+    """**前置环节（技能第 0 步）**：确保会话 → 发指令 → **主动探测**到本轮做完。
+
+    串行（2026-10-13 用户拍板）：素材收集做完才开麦录口述 —— 技能里写的就是
+    "在接收用户口述之前"先扫。开场**立刻回调 `on_ack(text)`**，免得用户不知道有没有触发。
+
+    探测纪律：每 `PRE_POLL_S` 秒探一次、最长 `PRE_MAX_S`；`wait_for_reply` 的 `done`
+    就是"本轮最终回复到了"（`app/agents/base.py`）。
+      * 探到完成 → `finished=True`；
+      * 到点 / 探测出错 → `finished=False` + `timed_out`/`error` **如实返回**，
+        由调用方带一句说明进入口述 —— **绝不卡死、也绝不假装扫完了**。
+    """
+    import app.db as db
+
+    _PRE.update(phase="pre", startedAt=time.time(), seconds=0.0, finished=False,
+                etaSec=PRE_ETA_S, error="", nudges=0)
+    out = {"ok": False, "session_id": "", "ack": pre_ack_text(), "finished": False,
+           "timed_out": False, "seconds": 0.0, "reply": "", "error": ""}
+
+    def _fail(msg):
+        out["error"] = msg
+        out["seconds"] = round(time.time() - _PRE["startedAt"], 1)
+        _PRE.update(phase="failed", seconds=out["seconds"], finished=False, error=msg)
+        db.add_log("warn", "daily_review", "前置环节没跑起来：%s" % msg)
+        return out
+
+    if callable(on_ack):
+        try:
+            on_ack(out["ack"])              # **先出声**
+        except Exception:                    # noqa: BLE001 - 出声失败不拖垮流程
+            pass
+
+    ok, why = ready()
+    if not ok:
+        return _fail(why)
+    try:
+        client = client or _client()
+    except Exception as e:                   # noqa: BLE001
+        return _fail("取智能体客户端失败：%s" % e)
+    try:
+        acc_ok, acc_why = ensure_access(client)
+        if not acc_ok:
+            db.add_log("warn", "daily_review", "前置环节：会话权限校正未成功：%s" % acc_why)
+    except Exception as e:                   # noqa: BLE001
+        db.add_log("warn", "daily_review", "前置环节：会话权限校正异常：%s" % e)
+    try:
+        sid, wid, info = ensure_session(client, force_new=force_new)
+    except Exception as e:                   # noqa: BLE001
+        return _fail("建立回顾会话失败：%s" % e)
+    out["session_id"] = sid
+    if not sid:
+        return _fail("没能建立回顾会话（DSH 未返回 sessionId）")
+    try:
+        client.prompt(sid, build_pre_prompt(vault=vault_root()))
+    except Exception as e:                   # noqa: BLE001
+        return _fail("发前置指令失败：%s" % e)
+
+    deadline = time.time() + PRE_MAX_S
+    silent_done = 0                          # 连续"本轮结束了但没带完成标记"
+    nudges = 0
+    while time.time() < deadline:
+        try:
+            reply, done = client.wait_for_reply(sid, timeout=PRE_POLL_S)
+        except Exception as e:               # noqa: BLE001 - 探测出错也不许卡住
+            out["error"] = "探测前置环节失败：%s" % e
+            db.add_log("warn", "daily_review", out["error"])
+            break
+        if reply:
+            out["reply"] = reply
+            if PRE_DONE_MARK in reply:       # **只认显式标记**（见 PRE_DONE_MARK 的说明）
+                out["finished"] = True
+                out["ok"] = True
+                break
+        if done:
+            # `done` 只说明**这一轮**结束了：技能 0-0 的开场确认、或工具调用之间的空档
+            # 都会造成它。没带完成标记 = 还没做完 → 追问一次让它接着做（有上限）。
+            silent_done += 1
+            if silent_done >= 1 and nudges < PRE_NUDGE_MAX:
+                nudges += 1
+                db.add_log("info", "daily_review",
+                           "前置环节：本轮结束但没带「%s」标记，追问第 %d 次"
+                           % (PRE_DONE_MARK, nudges))
+                try:
+                    client.prompt(sid, PRE_NUDGE_TEXT)
+                except Exception as e:       # noqa: BLE001 - 追问失败不致命
+                    db.add_log("warn", "daily_review", "前置环节追问失败：%s" % e)
+                    break
+                silent_done = 0
+                continue
+        if callable(on_progress):
+            try:
+                on_progress(round(time.time() - _PRE["startedAt"], 1))
+            except Exception:                # noqa: BLE001
+                pass
+    else:
+        out["timed_out"] = True
+        out["error"] = "前置环节在 %d 秒内没等到「%s」标记" % (int(PRE_MAX_S), PRE_DONE_MARK)
+    out["nudges"] = nudges
+    _PRE["nudges"] = nudges
+
+    out["seconds"] = round(time.time() - _PRE["startedAt"], 1)
+    _PRE.update(phase="done" if out["finished"] else "timeout", seconds=out["seconds"],
+                finished=out["finished"], error=out["error"])
+    db.add_log("info" if out["finished"] else "warn", "daily_review",
+               "前置环节%s（%.1fs）%s" % ("完成" if out["finished"] else "未完成",
+                                        out["seconds"],
+                                        "" if out["finished"] else "：" + out["error"]))
+    return out

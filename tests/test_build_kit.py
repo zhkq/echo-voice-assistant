@@ -272,6 +272,27 @@ class DeployStableUsesTheKitSelector(unittest.TestCase):
         self.assertIn("$destSkill", self.text)
         self.assertIn("Copy-Tree $srcSkill $destSkill", self.text)
 
+    def test_records_the_install_mode_for_the_target(self):
+        """部署到**已有安装**就是升级 —— 这条路必须把安装模式登记下来（2026-10-12）。
+
+        为什么是一条契约：`deploy-stable.ps1` 以前只覆盖代码，从不写
+        `<数据根>\\install-mode.json`，于是"我升级的稳定版"没有安装标志可读，
+        面板只能拿"已有什么内容"去猜「全新还是升级」。用户那台机器上猜对了
+        （有库、有会议），可状态从没落到盘上 —— "这标志怎么没初始化"这种问题
+        只能靠人翻代码回答。判据与 `install-all.ps1` 的 `Invoke-InstallModeProbe`
+        同一套（dsh 家目录 / 库 / 会议目录），同一个文件、同一种格式。
+        """
+        self.assertIn("install-mode.json", self.text, "要写 <数据根>\\install-mode.json")
+        self.assertIn("$deployMode", self.text, "要先算出 fresh / upgrade")
+        self.assertIn("'upgrade'", self.text)
+        self.assertIn("'fresh'", self.text)
+        # 同一个口径：dsh 家目录 / 库 / 会议目录，三者有其一就是升级
+        for probe in ("dsh\\home", "harness", "echo.db", "meetings"):
+            self.assertIn(probe, self.text, "安装模式探测少了 %s 这一项" % probe)
+        # 干跑不许写盘
+        self.assertRegex(self.text, r"if \(\$DryRun\) \{\s*Say \"  \[dry\] would write .*install-mode\.json",
+                         "dry-run 只报计划，不许写文件")
+
 
 class StalenessJudgement(unittest.TestCase):
     """`--check` 的判据：包里记的哈希 vs 仓库现在的内容。"""

@@ -244,6 +244,12 @@ input[type=range].seek::-webkit-slider-thumb { -webkit-appearance:none; width:15
   <div class="btns">
     <input id="summaryExtra" class="input" style="width:220px" placeholder="重新生成纪要的追加要求（可选）">
     <button class="btn" id="btnRetranscribe">重新转写</button>
+    <!-- 「强制重试」（2026-10-13）：只在**后端说这场在转、而它的结论是「等待能力后端」**时
+         出现 —— 那种状态是"失败只记状态、不排队重试"留下的死结：它自己永远转不完，
+         普通「重新转写」又被 409 挡着，用户只能重启 ECHO。后端判据见
+         `meeting.transcribe_is_orphan()`：真有人跑着时 force 一样 409。 -->
+    <button class="btn" id="btnForceRetranscribe" style="display:none"
+            title="这场会卡在「等待能力后端」——强制重试会接管这个残留状态并重新发起（真在转写时仍会被拒）">强制重试</button>
     <button class="btn primary" id="btnRegenSummary">重新生成纪要</button>
     <button class="btn" id="btnWorklog" title="把会议纪要写入 Obsidian 工作日志并归档">📝 写工作日志</button>
     <button class="btn" id="btnExport" title="生成离线 HTML 文件（含纪要/分段/转写，可分享）">⬇ 离线HTML</button>
@@ -1073,6 +1079,14 @@ function syncRetranscribeBtn() {
   btn.textContent = busy ? "转写中…" : "重新转写";
   btn.title = busy ? "这场会议正在转写中，请等它完成"
                    : "用当前设置重新转写这一场（转写中不能重复发起）";
+  /* 「强制重试」只在一种签名下出现：**后端说它在转、而这一场的结论是「在等能力后端」**。
+     那是 `_transcribe_impl` 里"只记状态、不排队重试"留下的死结（自己不会好、普通重转被
+     409 挡住，用户只能重启 ECHO）。判据取服务端给的 `capability.run.state` ——
+     不在前端另编一套（面板与后端两处各判一次，迟早对不上）。 */
+  const stuck = busy && !!(M && M.capability && M.capability.run &&
+                           M.capability.run.state === "waiting-backend");
+  const fb = $("#btnForceRetranscribe");
+  if (fb) { fb.style.display = stuck ? "" : "none"; fb.disabled = !stuck; }
   if (busy) startTxPoll(); else stopTxPoll();
 }
 
@@ -1105,6 +1119,23 @@ $("#btnRetranscribe").addEventListener("click", async () => {
     // 409（后端拦下的重复请求）也走这里：`e.message` 就是后端那句中文，原样显示。
     const msg = String((e && e.message) || "");
     toast(/^HTTP /.test(msg) ? "重新转写请求失败：" + msg : msg || "重新转写失败");
+    try { await load(); } catch (e2) { /* 详情也读不到时保持现状 */ }
+  }
+});
+
+/* 「强制重试」（2026-10-13）：按钮由 `syncRetranscribeBtn()` 控显隐 —— 只在"后端说它在转、
+   而这一场的结论是「在等能力后端」"时出现。`?force=1` 的兜底在后端判据里：
+   **真有人跑着时一样 409**，所以它不是"绕过并发保护"的入口，只是解开残留那个死结。 */
+$("#btnForceRetranscribe").addEventListener("click", async () => {
+  const fb = $("#btnForceRetranscribe");
+  fb.blur();
+  try {
+    const r = await post(`/api/meetings/${MID}/retranscribe?force=1`, {});
+    toast(r.message || "已强制重新转写");
+    await load();
+  } catch (e) {
+    const msg = String((e && e.message) || "");
+    toast(/^HTTP /.test(msg) ? "强制重试失败：" + msg : msg || "强制重试失败");
     try { await load(); } catch (e2) { /* 详情也读不到时保持现状 */ }
   }
 });

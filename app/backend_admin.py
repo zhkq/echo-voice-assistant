@@ -191,7 +191,7 @@ def notes(*, runtime: str, config_exists: bool, alive: bool, local: Dict[str, An
     if paired.get("paired") and not str(paired.get("baseUrl") or "").startswith(
             ("http://127.0.0.1", "http://localhost", "https://127.0.0.1", "https://localhost")):
         out.append("这台机器现在配对的是 %s（**不是本机后端**）—— 起本机后端不会覆盖它，"
-                   "要改用本机那个请先「解除配对」。" % paired.get("baseUrl"))
+                   "要改用本机那个请先「解绑」。" % paired.get("baseUrl"))
     if str(_setting("capabilityPrivacy", "lan") or "lan") == "none" and \
             paired.get("paired") and not _is_loopback(paired.get("baseUrl")):
         out.append("「允许音频去哪」= 不出机，而现在配对的后端在别的机器上 —— "

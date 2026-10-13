@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  启动图标 = 面板「折叠边条」那个 logo 的形状（web/rail.html 的 .logo）：
+  蓝色渐变方块 + 白色 EC/HO 2×2 字母。
+    背景层 = @drawable/ic_launcher_background（渐变，铺满，形状交给启动器裁）
+    前景层 = @mipmap/ic_launcher_foreground（白色字母，**只落在中央安全区**）
+  两层都由 android/tools/make_launcher_icon.py 生成，别手工改 PNG。
+-->
+<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+    <background android:drawable="@drawable/ic_launcher_background" />
+    <foreground android:drawable="@mipmap/ic_launcher_foreground" />
+    <monochrome android:drawable="@mipmap/ic_launcher_foreground" />
+</adaptive-icon>

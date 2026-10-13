@@ -1,0 +1,5 @@
+<resources>
+    <!-- 面板只有深色，手机端也固定深色：用平台深色主题，免得系统栏/窗口底色跟卡片打架。
+         配对页与主页都在 Compose 里自己画底色（Theme.kt 的 EchoPalette.Bg）。 -->
+    <style name="Theme.EchoContact" parent="android:Theme.Material.NoActionBar" />
+</resources>

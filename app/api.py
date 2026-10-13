@@ -344,6 +344,26 @@ def api_capability_pair_local(body: Optional[PairLocalIn] = None,
             "local": capability_admin.local_pair_view()}
 
 
+class SetAddressIn(BaseModel):
+    """只改地址的入参（`base_url`：`域名:端口` 或 `http(s)://域名:端口`）。"""
+    base_url: str = ""
+
+
+@router.post("/capability/address")
+def api_capability_address(body: SetAddressIn, _auth=Depends(optional_auth)):
+    """**只改后端地址**（保留配对凭据，不重新配对）—— 2026-10-13 用户要求。
+
+    场景：同一台后端换了访问地址（IP → 域名、换网段、前面加反代）。重新配对要管理员
+    再发一张一次性码、服务端还会多一条客户端记录，没必要。
+    **失败回 400 + 一句人话**（与 `/capability/pair` 同一形状）。
+    """
+    from app import capability_admin
+    ok, message = capability_admin.set_base_url(body.base_url)
+    if not ok:
+        raise HTTPException(status_code=400, detail=message)
+    return {"ok": True, "message": message, "pair": capability_admin.pair_view()}
+
+
 @router.post("/capability/unpair")
 def api_capability_unpair(_auth=Depends(optional_auth)):
     """解除配对（只忘掉本机凭据）。"""
@@ -1786,7 +1806,8 @@ def worklog_status(_auth=Depends(optional_auth)):
 
 
 @router.post("/meetings/{mid}/retranscribe")
-def meeting_retranscribe(mid: int, _auth=Depends(optional_auth)):
+def meeting_retranscribe(mid: int, force: bool = False,
+                         _auth=Depends(optional_auth)):
     """重新转写一场会议（后台线程）。
 
     **这一场已经在转写 → 409 Conflict**：两个转写线程并发跑同一场会互相覆盖同一份
@@ -1800,9 +1821,15 @@ def meeting_retranscribe(mid: int, _auth=Depends(optional_auth)):
     判据见 `meeting.transcribe_busy_reason()`（进程内标记 ∪ 库里的 status）。
     **另一场会议不受影响** —— 跨会议的并发上限仍由既有那套管（`max_concurrent`），
     两件事不混在一起。
+
+    `?force=1`（2026-10-13）：**只用于解开一种死结** —— 库里的 status 停在
+    `transcribing`、但**没有任何转写线程在跑**（"在等后端"的失败只记状态、不重试，
+    于是那一场永远转不了、也永远点不动「重新转写」）。判据在
+    `meeting.transcribe_is_orphan()`：真有线程在跑时 `force` 一样回 409，
+    所以这个开关**不是**"绕过并发保护"的入口。面板的「强制重试」按钮带的它。
     """
     try:
-        ok, msg = meeting.retranscribe_meeting(mid)
+        ok, msg = meeting.retranscribe_meeting(mid, force=force)
     except meeting.MeetingTranscribeBusy as e:
         raise HTTPException(status_code=409, detail=e.message)
     return {"ok": ok, "message": msg}

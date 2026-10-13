@@ -369,6 +369,22 @@ def execution_summary(diarize: Any, transcribe_engine: Any = "",
     dia = diarize_summary(diarize)
     engine = str(transcribe_engine or "")
     why = str(fallback_reason or "")
+    # 这一场的文字**是能力后端出的** → 那台当时**可用**：`fallbackReason` 与
+    # `diarize.waiting` 里任何"没走成 / 在等它"的**旧结论一律过期**。
+    #
+    # 2026-10-13 现场：一场会先"配了后端但连不上"、meta 里留下 `waiting=True` +
+    # `transcribeFallbackReason=waiting-backend`（**同一次失败一起写下的两个字段**）；
+    # 后来配上后端**重转成功**，详情页于是同时显示「说话人分离已执行（ECHO 后端）」与
+    # 「等待能力后端：配置里点名了它，但它现在连不上」—— 转写稿明明就摆在那儿。
+    # **两个必须一起清**：只清一个，另一个照样把这一行画成「等待能力后端」。
+    #
+    # 写入侧同批修了（`meeting._finalize_waiting_flag()`），但盘上那些老 meta
+    # 不会因为代码更新而自动重写 —— 所以读侧必须自己兜住。
+    if engine == "backend":
+        why = ""
+        if dia:
+            dia = dict(dia)          # 不改调用方给的那份（`diarize_summary` 的产物）
+            dia["waiting"] = False
     if not dia and not engine and not why:
         return None
     waiting = bool(dia and dia.get("waiting"))
@@ -550,11 +566,51 @@ def local_pair_view() -> Dict[str, Any]:
                 "expiresAt": 0.0, "message": str(e)}
 
 
+def set_base_url(base_url: str) -> tuple:
+    """**只改后端地址、不重新配对**（2026-10-13 用户要求）。
+
+    场景：同一台后端换了个访问地址（IP → 域名、换网段、前面加反代）。重新配对要管理员
+    再发一张一次性码，还会让服务端多出一条客户端记录 —— 而这里换的只是"去哪儿找它"。
+
+    **保留** `client_id` / `secret` / 证书固定（`cert_pem` / `cert_fingerprint`）：服务端
+    没变，凭据照旧有效（JWT 的 `sub` 就是 clientId）。如果新地址面对的其实是**另一台**
+    后端（或中间人），握手时会被证书固定挡住并如实报错 —— 那正是**不**顺手清掉证书的理由；
+    真换了后端就重新配对一次。
+
+    `base_url` 只填 `域名:端口` 也行（`pairing.normalize_base_url` 会补 `http://`）；
+    要 https 就把 scheme 写全。
+    """
+    from app.capabilities import credentials, pairing
+    try:
+        creds = credentials.load()
+    except Exception as e:                                   # noqa: BLE001
+        return False, "读不到配对凭据：%s" % str(e)[:80]
+    if creds is None or not (creds.client_id or creds.base_url):
+        return False, "这台机器还没配对过 —— 先用配对码配一次，之后就能只改地址"
+    try:
+        url = pairing.normalize_base_url(base_url)
+    except pairing.PairingError as e:
+        return False, str(e)
+    except Exception as e:                                   # pragma: no cover - 兜底
+        return False, "地址认不出来：%s" % str(e)[:80]
+    if not url:
+        return False, "地址认不出来：填 `域名:端口` 或 `http(s)://域名:端口` 都行"
+    old = str(creds.base_url or "")
+    if url == old:
+        return True, "地址没变（还是 %s）" % url
+    creds.base_url = url
+    try:
+        credentials.save(creds)
+    except Exception as e:                                   # pragma: no cover - 兜底
+        return False, "写凭据失败：%s" % str(e)[:120]
+    return True, "后端地址已改为 %s（凭据没动，不用重新配对）" % url
+
+
 def unpair() -> tuple:
     """解除配对（只忘掉本机凭据；服务端那本账归管理员）。"""
     from app.capabilities import pairing
     if pairing.unpair():
-        return True, "已解除配对。要再用这台后端，得让管理员重新发一张配对码"
+        return True, "已解绑。要再用这台后端，得让管理员重新发一张配对码"
     return False, "凭据文件删不掉（可能正被占用），请稍后再试"
 
 

@@ -693,9 +693,21 @@ def _review_worker(source):
             return
         db.add_log("info", "assistant", f"今天的回顾会话：{sid}（工作区 {info.get('workspace')}）")
 
+        # ---- 前置环节（技能第 0 步：自动收集当天素材）**串行跑在口述之前** ----
+        # 2026-10-13 用户口径：点「开始回顾」后先收集素材，**开场立刻出声**告诉他
+        # "我开始了什么 + 大概多久"（免得不知道有没有触发），**主动探测**到做完再开麦；
+        # 探不到就带一句说明进入口述 —— 不卡死、也不假装扫完了。
+        pre = daily_review.preflight(client=client, on_ack=_review_speak)
+        if pre.get("finished"):
+            db.add_log("info", "assistant",
+                       "前置环节完成（%.1fs）" % (pre.get("seconds") or 0.0))
+        else:
+            db.add_log("warn", "assistant",
+                       "前置环节未完成：%s" % (pre.get("error") or "未知"))
+            _review_speak("素材还在扫，先开始说你的内容。")
         if cfg.get("beepOnStart", True):
             tts_mod.play_beep("start")
-        _review_speak("好，开始今天的回顾，你讲。")
+        _review_speak("扫完了，开始今天的回顾，你讲。")
 
         while not _review_stop.is_set():
             turns += 1

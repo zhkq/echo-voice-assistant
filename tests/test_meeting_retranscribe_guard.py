@@ -143,6 +143,19 @@ class _GuardCase(unittest.TestCase):
         spy = MagicMock(side_effect=fake)
         return spy, release
 
+    def _quiet_tail(self):
+        """把转写线程收尾里**唯一会碰库**的一步（自动压缩）哑掉。
+
+        为什么必须哑：`retranscribe_meeting` 起的线程在 `discard` 之后还会跑
+        `_maybe_auto_compress()`，而它开库写日志 —— 用例结束得比它快时，它会拿着
+        **下一批用例的库**去写（本仓库踩过这种跨用例污染：红的地方不是坏的地方，
+        本次实测症状是下一个类 `db.init()` 报 `database is locked`）。
+        替身转写不产生真实音频，压缩本来也无事可做 —— 哑掉它不影响任何判据。
+        """
+        p = patch.object(meeting, "_maybe_auto_compress", MagicMock())
+        p.start()
+        self.addCleanup(p.stop)
+
 
 # ---------------------------------------------------------------- ① 判据本身
 
@@ -343,6 +356,113 @@ class RetranscribeEndpointTests(_GuardCase):
         items = {it["id"]: it for it in self.client.get("/api/meetings").json()["items"]}
         self.assertIn(mid, items)
         self.assertIs(items[mid]["transcribing"], True)
+
+    def test_force_starts_an_orphaned_transcription(self):
+        """`?force=1`（2026-10-13）：库里停在 transcribing、但**没有线程在跑** → 接管。
+
+        这条死结的由来：一次"在等后端"的失败只记状态、不排队重试
+        （`_capability_asr_session` 那条路），于是这一场永远转不完、也永远点不动
+        「重新转写」（409 挡着）—— 用户只能重启 ECHO 才能再转一次。
+        """
+        mid, name, _folder = self.make_meeting(status="transcribing")
+        spy, release = self._blocking_transcribe()
+        self._quiet_tail()
+        with patch.object(meeting, "_transcribe_meeting", spy):
+            r = self.client.post("/api/meetings/%d/retranscribe?force=1" % mid)
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertTrue(r.json()["ok"], r.text)
+        self.assertTrue(self._wait_until(lambda: spy.call_count == 1),
+                        "强制重试没有真的起转写任务")
+        release.set()
+        self.assertTrue(self._wait_until(lambda: not meeting.transcribe_is_live(name)),
+                        "接管起来的那个任务没跑完就结束了")
+
+    def test_force_keeps_the_business_failure_shape(self):
+        """force 只解"残留"这一种冲突，**不改业务失败的形状**（没有音频仍是 200+ok:false）。"""
+        mid, _name, _folder = self.make_meeting(status="transcribing", with_audio=False)
+        r = self.client.post("/api/meetings/%d/retranscribe?force=1" % mid)
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertFalse(r.json()["ok"])
+
+
+# ---------------------------------------------------------------- ③b 强制接管残留
+
+class ForceTakeoverTests(_GuardCase):
+    """`force=True`（2026-10-13）：**只**解开"库里写着在转、但没有线程在跑"的死结。
+
+    用户现场：一次"在等后端"的失败把会议状态永久留在 `transcribing` —— 库里那份判据
+    （`transcribe_busy_reason`）于是永远说"在转写中"，`POST …/retranscribe` 被 409 挡住，
+    用户只能**重启 ECHO** 才能再转。这一批钉四件事：
+
+      1. 残留**能**被接管（force 起得来任务）；
+      2. 不带 force 时残留**照样 409**（既有判据不许被悄悄放宽）；
+      3. **真有线程在跑时 force 一样 409** —— 它绕过的只有"残留"，不是并发保护本身；
+      4. **刚点过还没轮到改库**（`_retranscribing`）force 也不许 —— 并发保护的另一半。
+    """
+
+    def _patch_transcribe(self, spy):
+        p = patch.object(meeting, "_transcribe_meeting", spy)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_an_orphan_can_be_taken_over(self):
+        mid, name, _folder = self.make_meeting(status="transcribing")
+        self.assertFalse(meeting.transcribe_is_live(name), "前提：没有任何线程在跑它")
+        self.assertTrue(meeting.transcribe_is_orphan(name),
+                        "库里说在转 + 内存里没人跑 = 残留，可接管")
+        self.assertEqual(meeting.transcribe_busy_reason(name), "transcribing",
+                         "前提：保守判据仍然说它在转（那道闸本身不许被 force 改松）")
+        spy, release = self._blocking_transcribe()
+        self._patch_transcribe(spy)
+        self._quiet_tail()
+        ok, msg = meeting.retranscribe_meeting(mid, force=True)
+        self.assertTrue(ok, msg)
+        self.assertTrue(self._wait_until(lambda: spy.call_count == 1),
+                        "强制重转没有真的起任务")
+        release.set()
+        self.assertTrue(self._wait_until(lambda: not meeting.transcribe_is_live(name)),
+                        "接管起来的那个任务没跑完就结束了")
+
+    def test_without_force_the_orphan_is_still_blocked(self):
+        mid, _name, _folder = self.make_meeting(status="transcribing")
+        with self.assertRaises(meeting.MeetingTranscribeBusy) as ctx:
+            meeting.retranscribe_meeting(mid)
+        self.assertEqual(ctx.exception.kind, "transcribing")
+
+    def test_force_still_blocks_while_a_thread_is_really_running(self):
+        mid, name, _folder = self.make_meeting(status="transcribing")
+        with meeting._retranscribing["lock"]:
+            meeting._live_transcribes.add(name)
+        self.addCleanup(meeting._live_transcribes.discard, name)
+        self.assertFalse(meeting.transcribe_is_orphan(name),
+                         "有线程在跑就不是残留 —— force 不许在这里开口子")
+        with self.assertRaises(meeting.MeetingTranscribeBusy):
+            meeting.retranscribe_meeting(mid, force=True)
+
+    def test_force_does_not_bypass_the_just_clicked_marker(self):
+        """`_retranscribing`（刚点过、线程还没轮到改库）是并发保护的另一半 —— force 也不许绕。"""
+        mid, name, _folder = self.make_meeting(status="transcribed")
+        with meeting._retranscribing["lock"]:
+            meeting._retranscribing["set"].add(name)
+        with self.assertRaises(meeting.MeetingTranscribeBusy) as ctx:
+            meeting.retranscribe_meeting(mid, force=True)
+        self.assertEqual(ctx.exception.kind, "retranscribing")
+
+    def test_the_takeover_is_recorded_in_the_log(self):
+        """接管**必须留痕**：事后要能查出"什么时候、把哪一场的残留接走了"。"""
+        mid, name, _folder = self.make_meeting(status="transcribing")
+        spy, release = self._blocking_transcribe()
+        self._patch_transcribe(spy)
+        self._quiet_tail()
+        with patch.object(meeting.db, "add_log") as log:
+            ok, _msg = meeting.retranscribe_meeting(mid, force=True)
+        self.assertTrue(ok)
+        release.set()
+        self.assertTrue(self._wait_until(lambda: not meeting.transcribe_is_live(name)),
+                        "接管起来的那个任务没跑完就结束了")
+        said = " ".join(str(c) for c in log.call_args_list)
+        self.assertIn("强制重转", said)
+        self.assertIn(name, said)
 
 
 # ---------------------------------------------------------------- ④ 转写中不许删

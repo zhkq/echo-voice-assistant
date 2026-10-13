@@ -91,6 +91,22 @@ _state_lock = threading.RLock()
 #: 被调用（"先判后占"要原子），普通 Lock 会在那里当场自己把自己锁死。
 _retranscribing = {"set": set(), "lock": threading.RLock()}
 
+#: 「这一场此刻**真的**有一个转写线程在跑」—— **任何入口起的都算**（录音结束自动转写、
+#: 导入后自动转写、手动重转），在所有入口的收口处 `_transcribe_meeting()` 里登记。
+#:
+#: 与 `_retranscribing` 的分工，别混：
+#:   * `_retranscribing` = "**手动重转**刚点过、后台线程还没轮到改库"那一小段（判重要用它）；
+#:   * 这一份 = "本进程里确实有线程在跑它"，用来分辨一种**库里看不出来**的情形：
+#:     `meetings.status == "transcribing"` 但**没有**任何线程在跑（残留）。
+#:
+#: 为什么必须分出来（2026-10-13 现场）：一次"在等后端"的失败把状态永久留在 `transcribing`
+#: —— 库里那份判据（`transcribe_busy_reason`）于是**永远**说"在转写中"，
+#: 连「重新转写」都被 409 挡住，用户只能重启 ECHO 才能再转。有了这份标记，
+#: `retranscribe_meeting(force=True)` 才敢在"没人真在跑"时接管那个残留。
+#: 锁与 `_retranscribing` **共用同一把**（RLock，可重入）—— 两个集合总是一起被读，
+#: 各配一把锁只会多出一个能写错的组合。
+_live_transcribes = set()
+
 #: 「这场会议正在转写中」—— 面板按钮提示与 409 响应体**共用这一句**（只写一份）。
 TRANSCRIBE_BUSY_MESSAGE = "这场会议正在转写中，请等它完成"
 
@@ -156,6 +172,32 @@ def is_transcribing(meeting_name):
     （详情）都会下发它（见 `app/api.py`）。
     """
     return bool(transcribe_busy_reason(meeting_name))
+
+
+def transcribe_is_live(meeting_name):
+    """本进程里**此刻真有**一个转写线程在跑这一场（见 `_live_transcribes`）。
+
+    与 `is_transcribing()` **不是一回事**，别互相替代：后者是"按保守判据说它在转"
+    （库里那份为真就为真），前者是"内存里确实有人"。`force` 接管残留时只信这一份。
+    """
+    with _retranscribing["lock"]:
+        return str(meeting_name or "") in _live_transcribes
+
+
+def transcribe_is_orphan(meeting_name):
+    """库里写着 `transcribing`、但本进程里**没有**线程在跑它 = 残留，可强制接管。
+
+    为什么"内存里没人"就能断定是残留：ECHO 由"服务端口占用探测"拦住重复实例
+    （见 `recover_orphaned_meetings()` 的说明），能走到这里的实例必然唯一，
+    所以不存在"另一个进程正转着它"。剩下的两种成因都是残留：
+    进程崩过（本该被启动恢复清成 `interrupted`，但那次恢复之后才留下的状态它管不到），
+    或一次"在等后端"的失败把状态永久留在了 `transcribing`
+    （2026-10-13 现场，见 `_live_transcribes` 的说明）。
+    """
+    name = str(meeting_name or "")
+    if not name or transcribe_is_live(name):
+        return False
+    return _db_says_transcribing(name)
 
 
 # ---------------------------------------------------------------- 音频压缩
@@ -944,6 +986,12 @@ def _transcribe_meeting(folder):
     name = os.path.basename(folder)
     meeting = db.get_meeting_by_name(name)
     mid = meeting["id"] if meeting else None
+    # 登记"这一场真有线程在跑"（**所有入口**都汇到这里：录音结束自动转写、导入后自动转写、
+    # 手动重转）。`force` 接管残留的判据就是这个标记 —— 见 `transcribe_is_orphan()`。
+    # 放 try **外面**、用 finally 保证摘掉：崩了也必须摘，否则这一场会被永远判成"有人跑"，
+    # 那比残留更难查（连 force 都救不回来，只能重启）。
+    with _retranscribing["lock"]:
+        _live_transcribes.add(name)
     try:
         status = _transcribe_impl(folder)
         if mid:
@@ -976,6 +1024,10 @@ def _transcribe_meeting(folder):
         tts_mod.play_beep("err")   # 转写失败提示音（咚）
         print(msg, file=sys.stderr)
         return "error"
+    finally:
+        # 无论转成、转败、还是抛出去，这一场都**不再有**线程在跑它了（对应上面那句登记）。
+        with _retranscribing["lock"]:
+            _live_transcribes.discard(name)
 
 
 def _apply_capability_meta(meta: dict, cap_plan, cap_kinds) -> dict:
@@ -1159,6 +1211,29 @@ def _apply_run_meta(meta: dict, run_info, diarize_state) -> dict:
     if isinstance(diarize_state, dict):
         meta["diarize"] = dict(diarize_state)
     return meta
+
+
+def _finalize_waiting_flag(run_info, da_state) -> dict:
+    """收尾时按**这一轮的事实**给「在等后端」定稿（2026-10-13）。
+
+    规则只有一条：这一场的文字**是能力后端出的**（`transcribeEngine == "backend"`）
+    → 那台当时**可用**，"在等后端"当场不成立，必须清掉。
+
+    为什么非清不可（用户现场）：一场会先"配了后端但连不上"、在 meta 里留下
+    `waiting=True`；后来配上后端**重转成功** —— 详情页于是同时显示「说话人分离已执行」
+    与「等待能力后端：配置里点名了它，但它现在连不上」，两个结论直接互相打架
+    （转写稿明明就摆在那儿）。`waiting` 的语义是"那台**当时**不可用"，
+    与"这一轮真的用了它"不可能同时为真；`_transcribe_impl` 开头那句
+    `if echo_backend_configured: da_state["waiting"] = True` 是**占位**（那时还不知道
+    这一槽落没落到后端），定稿就是这里。
+
+    只清 `waiting`，不动 `executed`/`reason`：分离真没做成时那几项目必须如实留着
+    （面板那一档排在「在等」前面，见 `capability_admin.execution_summary`）。
+    """
+    if isinstance(da_state, dict) and \
+            str((run_info or {}).get("transcribeEngine") or "") == "backend":
+        da_state["waiting"] = False
+    return da_state
 
 
 def _new_diarize_state():
@@ -2085,6 +2160,7 @@ def _transcribe_impl(folder):
         db.add_log("warn", "meeting",
                    "%s 说话人分离未执行（reason=%s）：%s"
                    % (meeting_name, why, da_state.get("detail") or "本场没有说话人"))
+    _finalize_waiting_flag(run_info, da_state)
     _apply_run_meta(meta, run_info, da_state)
     try:
         with open(os.path.join(folder, "meta.json"), "w", encoding="utf-8") as f:
@@ -2579,44 +2655,82 @@ def _fix_timeline_block(block_lines):
     return [_fix_timeline_line(ln) for ln in block_lines]
 
 
+#: flowchart/graph 里的 `title:` / `title 文本` 行（都非法，见 _split_flowchart_title）。
+#: 刻意**不**匹配 `title["标题节点"]` / `titleX` 这类真节点名：`\s*:?` 之后必须紧跟行尾或空白。
+_MM_TITLE_LINE = re.compile(r"^\s*title\s*:?(?:\s+(.*))?\s*$")
+
+
+def _split_flowchart_title(block):
+    """把 flowchart/graph 块里的 `title: …` 行摘出来 → ``(正文行, 标题文本)``。
+
+    2026-10-13 实测（无头 Edge + 面板自带 `web/vendor/mermaid.min.js`，逐块 `mermaid.parse`）：
+    **flowchart 不认 `title:` 语句** —— 这一场的纪要因此整张图报错：
+        `flowchart TD` + `title: 多模态智能体快速生成流程` →
+        ``Parse error on line 2 … Expecting 'SEMI','NEWLINE','EOF',… got 'UNICODE_TEXT'``
+    （同一个词在 `timeline` 里是合法的，所以老逻辑只给 timeline 补过 title 的冒号。）
+
+    两种修法实测都能解析，但**只有提成 frontmatter 才画得出标题**：
+      * 丢掉 title 行 → 解析通过，SVG 里没有标题文字；
+      * 提到块首 `---\\ntitle: …\\n---` → 解析通过，SVG 里就是那段标题（**本函数采用这种**）。
+    """
+    body, title = [], ""
+    for ln in block:
+        m = _MM_TITLE_LINE.match(ln)
+        if m:
+            text = (m.group(1) or "").strip().strip('"')
+            if text and not title:
+                title = text
+            # 有没有文本都摘掉：这行本身就会让 flowchart 解析失败
+            continue
+        body.append(ln)
+    return body, title
+
+
+def _fix_mermaid_block(block):
+    """按图型修一个 mermaid 代码块（**整块**处理，不是逐行）。
+
+    为什么必须整块：flowchart 的 `title:` 要提到**块首**的 frontmatter —— 逐行流式时
+    `flowchart TD` 早就写进结果里了，再看到 title 就没法回头插。
+    """
+    if not block:
+        return []
+    kind = block[0].strip()
+    if re.match(r"^(graph|flowchart)\b", kind):
+        body, title = _split_flowchart_title(block)
+        fixed = [_fix_flowchart_line(ln) for ln in body]
+        return (["---", "title: %s" % title, "---"] + fixed) if title else fixed
+    if re.match(r"^timeline\b", kind):
+        return _fix_timeline_block(block)
+    return list(block)
+
+
 def _sanitize_mermaid(md_text):
     """修复 LLM 生成的 markdown 中 mermaid 图表的渲染错误（防 Obsidian/网页报错）。
     处理 ```mermaid 代码块：
-      - graph/flowchart：给含括号等符号的节点/边标签补引号（_fix_flowchart_line）
-      - timeline：给缺冒号的 `title` 行补冒号（_fix_timeline_line）
+      - graph/flowchart：给含括号等符号的节点/边标签补引号（_fix_flowchart_line）；
+        并把非法的 `title:` 行提成 frontmatter（`_split_flowchart_title`）
+      - timeline：给缺冒号的 `title` 行补冒号、时间戳冒号换点号（_fix_timeline_line）
     非代码区与其它图型的代码块原样保留。"""
+    lines = md_text.split("\n")
     out_lines = []
-    in_code = False
-    kind_wait = False
-    diagram_kind = ""
-    for raw in md_text.split("\n"):
-        line = raw
-        s = line.strip()
-        if s.startswith("```"):
-            if not in_code:
-                rest = s[3:].strip()
-                if rest.startswith("mermaid"):
-                    in_code = True
-                    kind_wait = True
-                    diagram_kind = ""
-            else:
-                in_code = False
-                diagram_kind = ""
-                kind_wait = False
+    i = 0
+    n = len(lines)
+    while i < n:
+        line = lines[i]
+        if re.match(r"^```\s*mermaid\b", line.strip()):
             out_lines.append(line)
+            i += 1
+            block = []
+            while i < n and not lines[i].strip().startswith("```"):
+                block.append(lines[i])
+                i += 1
+            out_lines.extend(_fix_mermaid_block(block))
+            if i < n:                       # 结束围栏（文件被截断时可能没有）
+                out_lines.append(lines[i])
+                i += 1
             continue
-        if in_code:
-            if kind_wait:
-                kind_wait = False
-                diagram_kind = s
-            if re.match(r"^(graph|flowchart)\b", diagram_kind):
-                out_lines.append(_fix_flowchart_line(line))
-            elif re.match(r"^timeline\b", diagram_kind):
-                out_lines.append(_fix_timeline_line(line))
-            else:
-                out_lines.append(line)
-        else:
-            out_lines.append(line)
+        out_lines.append(line)
+        i += 1
     return "\n".join(out_lines)
 
 
@@ -3159,8 +3273,11 @@ def _spawn_provider_summary(meeting_id, folder, out_name="summary.md", extra="")
                                "纪要 provider 回复疑似占位/意图话（非实质纪要），本次不回写"
                                f"{'，保留原文件' if had_old and len(old) > 30 else '（无旧有效内容）'}")
                     return
+                # 与 agent 路径**同一套落盘纪律**（`_SUMMARY_REQUIREMENTS` 那段注释说的：
+                # 复制一份就等于将来只修好一条路）：剪开场白/元数据 + 修 mermaid。
+                body = _sanitize_mermaid(_strip_summary_head(reply) + "\n")
                 with open(path, "w", encoding="utf-8") as fh:
-                    fh.write(reply)
+                    fh.write(body)
                 db.add_log("info", "meeting",
                            f"纪要已生成（provider={pid}）：{os.path.basename(path)}")
             except Exception as e:
@@ -3270,6 +3387,80 @@ def _looks_placeholder(text):
     return bool(pats.search(t))
 
 
+#: 模型的开场白（第一段常见的那种）。**只用来剪行首连续的几句**，绝不碰正文。
+_SUMMARY_CHATTER_RE = re.compile(
+    r"^(now i\b|i have\b|i've\b|i'll\b|i will\b|let me\b|here'?s\b|here is\b|"
+    r"sure[,，、]|okay[,，、]|"
+    r"好的|好，|以下是|下面是|我将|我来|我先|正在|让我|先读|稍等)",
+    re.I)
+
+#: 结构化元数据 JSON 的字段名（`request_topic_segments` 那一份的四个键）。
+_META_JSON_KEYS = ("标题", "简介", "摘要", "分段")
+
+#: 分隔线/空行（元数据块与正文之间那一层）
+_MD_SEPARATORS = ("", "---", "***", "___")
+
+
+def _is_meta_json(text):
+    """这段文本是不是那份「结构化元数据 JSON」？判据 = 能解析成对象且带元数据字段。"""
+    obj = _try_load_json(text)
+    return isinstance(obj, dict) and any(k in obj for k in _META_JSON_KEYS)
+
+
+def _meta_fence_end(lines):
+    """找**正文之前**那个"内容是元数据 JSON"的围栏块 → ``(起, 止+1)``；没有 → ``None``。
+
+    为什么必须限定"正文之前"：纪要正文里也可能有 ```json 例子，若它也带「标题」这类键，
+    按"第一个元数据块"去剪就会把真纪要整段吃掉。所以一旦先遇到一级标题（`# …`）就收手。
+    """
+    i = 0
+    while i < len(lines):
+        s = lines[i].strip()
+        if re.match(r"^#\s+\S", s):
+            return None
+        if s.startswith("```"):
+            j = i + 1
+            buf = []
+            while j < len(lines) and not lines[j].strip().startswith("```"):
+                buf.append(lines[j])
+                j += 1
+            if j < len(lines) and _is_meta_json("\n".join(buf)):
+                return (i, j + 1)
+            i = j + 1
+            continue
+        i += 1
+    return None
+
+
+def _strip_summary_head(text):
+    """剪掉纪要回复开头**不该出现在 summary.md 的东西**：开场白 + 结构化元数据 JSON。
+
+    2026-10-13 用户实测（原话："会议纪要上面也展示结构化内容了"）：那一场的 summary.md 开头是
+      ``Now I have the full transcript. Let me analyze it and generate both the structured
+       metadata JSON and the meeting minutes markdown.``
+      + ``## 结构化元数据 JSON`` + 一个 ```json 块（标题/简介/摘要/分段）
+    —— **与 topics.md 几乎一模一样的那份元数据**。元数据有它自己的落点
+    （`request_topic_segments` → topics.md），纪要靠它就变成"面板上先给你看一坨 JSON"。
+
+    保守边界（宁可少剪，绝不误删正文）：
+      * 只剪两类：**正文之前**的元数据围栏块、以及**行首连续**的开场白；
+      * 开场白遇到正文（标题/表格/列表/引用/代码）立刻停；
+      * 剪不动就原样返回（`cut == 0`）。
+    """
+    lines = (text or "").split("\n")
+    hit = _meta_fence_end(lines)
+    cut = hit[1] if hit else 0
+    while cut < len(lines) and lines[cut].strip() in _MD_SEPARATORS:
+        cut += 1
+    while cut < len(lines) and _SUMMARY_CHATTER_RE.match(lines[cut].strip()):
+        cut += 1
+        while cut < len(lines) and lines[cut].strip() in _MD_SEPARATORS:
+            cut += 1
+    if cut <= 0:
+        return text
+    return "\n".join(lines[cut:]).lstrip("\n")
+
+
 def _spawn_summary_waiter(meeting_id, folder, out_name, prompt_text, label):
     """发 prompt 到纪要会话（工作区每次会议新会话 / 或固定会话），后台线程等回复并写入文件。
 
@@ -3319,7 +3510,15 @@ def _spawn_summary_waiter(meeting_id, folder, out_name, prompt_text, label):
                     else:
                         content = content_raw + "\n"  # 未能提取 JSON 时按原文回写（可人工修正）
                 else:
-                    content = _sanitize_mermaid(content_raw + "\n")  # markdown 纪要
+                    # 两条纪律：① 剪掉回复开头的开场白/结构化元数据（元数据归 topics.md）；
+                    # ② 修 mermaid 语法。顺序不能反 —— 先剪再修，免得把元数据块里的
+                    # ```json 当成 mermaid 处理。
+                    trimmed = _strip_summary_head(content_raw)
+                    if trimmed != content_raw:
+                        db.add_log("info", "meeting",
+                                   f"{label}：已剪掉回复开头的开场白/结构化元数据"
+                                   f"（{len(content_raw) - len(trimmed)} 字）")
+                    content = _sanitize_mermaid(trimmed + "\n")  # markdown 纪要
                 with open(path, "w", encoding="utf-8") as f:
                     f.write(content)
                 db.add_log("info", "meeting", f"{label}已写入 {out_name}（{len(content)} 字，"
@@ -3367,13 +3566,20 @@ def regenerate_summary(meeting_id, extra_prompt=""):
                 else "发送请求失败（agent 与 LLM provider 都不可用？）")
 
 
-def retranscribe_meeting(meeting_id):
+def retranscribe_meeting(meeting_id, force=False):
     """手动重新转写一场会议（后台）。
 
     **这一场已经在转写 → 抛 `MeetingTranscribeBusy`**（`app/api.py` 把它翻成 409）。
     为什么这道闸必须在后端：两个转写线程并发跑同一场会**互相覆盖**同一份
     `transcript.md` / `meta.json`（`_transcribe_impl` 开头还会 `clear_meeting_lines`
     把对方正在写的结果清掉）。用户点两下就能触发，所以不能指望前端把按钮禁住。
+
+    `force=True`（2026-10-13）：**只在"库里写着在转、但本进程没人真在跑"时接管**
+    （判据 `transcribe_is_orphan()`）—— 那是**残留**，不是"正在转"。
+    为什么需要这条路：一次"在等后端"的失败会把状态永久留在 `transcribing`
+    （`_transcribe_impl` 那条路只记状态、不排队重试），而库里那份判据（按设计）
+    会把「重新转写」永远挡在 409 外 —— 用户只能重启 ECHO 才能再转一次。
+    真有人跑着时 `force` **照样 409**：它绕过的只有"残留"这一种，不是并发保护本身。
     """
     meeting = db.get_meeting(meeting_id)
     if not meeting:
@@ -3399,7 +3605,15 @@ def retranscribe_meeting(meeting_id):
     with _retranscribing["lock"]:
         kind = transcribe_busy_reason(name)
         if kind:
-            raise MeetingTranscribeBusy(TRANSCRIBE_BUSY_MESSAGE, kind)
+            # `force` 只对**残留**开口子：库里写着在转、而本进程**没有任何线程在跑它**
+            # （判据 `transcribe_is_orphan()`；它在这同一把锁里读同一份标记）。
+            # 其余情形（刚点过还没轮到改库、真有线程在跑）**照样 409** ——
+            # 并发保护本身不能被 force 绕过去，否则就退回 2026-09-28 那个互相覆盖的 bug。
+            if not (force and transcribe_is_orphan(name)):
+                raise MeetingTranscribeBusy(TRANSCRIBE_BUSY_MESSAGE, kind)
+            db.add_log("warn", "meeting",
+                       "强制重转 %s：库里写着 transcribing，但没有任何转写线程在跑"
+                       "（残留状态，按新任务接管）" % name)
         _retranscribing["set"].add(name)
 
     def _run():

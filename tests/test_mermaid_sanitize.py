@@ -76,5 +76,64 @@ class PromptLessonTests(unittest.TestCase):
         self.assertIn("他人说话", req, "要给出反例，模型才看得懂")
 
 
+class FlowchartTitleTests(unittest.TestCase):
+    """flowchart 里的 `title:` 行（2026-10-13 用户实测："下面还有个图渲染失败"）。
+
+    那一场的 `summary.md` 里有张图这么写：
+
+        flowchart TD
+            title: 多模态智能体快速生成流程
+            A["开始"] --> ...
+
+    用面板自带 mermaid 实测（无头 Edge + `mermaid.parse`）报：
+
+        Parse error on line 2: ...flowchart TD title: 多模态智能体快速生成流程 A["
+        Expecting 'SEMI','NEWLINE','EOF',... got 'UNICODE_TEXT'
+
+    即 **flowchart 不认 `title:` 语句**（`timeline` 才认 —— 所以老逻辑只给 timeline 补冒号）。
+    修法：提成块首 frontmatter。实测这正是唯一**既解析通过、又真把标题画出来**的写法
+    （直接丢掉 title 行也能解析，但 SVG 里就没有标题文字了）。
+    """
+
+    SRC = _mm('flowchart TD\n    title: 多模态智能体快速生成流程\n'
+              '    A["开始"] --> B["选择输入图片类型"]')
+
+    def test_title_becomes_block_frontmatter(self):
+        out = meeting._sanitize_mermaid(self.SRC)
+        self.assertIn("---\ntitle: 多模态智能体快速生成流程\n---", out,
+                      "要提成 frontmatter：实测这样 mermaid 才既解析通过又画得出标题")
+        self.assertNotIn("    title: 多模态", out, "块里不许再留那行非法语句")
+
+    def test_the_rest_of_the_block_still_survives(self):
+        out = meeting._sanitize_mermaid(self.SRC)
+        self.assertIn("flowchart TD", out)
+        self.assertIn('A["开始"] --> B["选择输入图片类型"]', out)
+
+    def test_a_node_actually_named_title_is_not_eaten(self):
+        """别把真节点 `title[...]` / `titleX` 当标题行摘掉。"""
+        out = meeting._sanitize_mermaid(_mm('flowchart TD\n    title["标题节点"] --> B["结束"]'))
+        self.assertIn('title["标题节点"]', out)
+        self.assertNotIn("---", out, "没有标题行就不该凭空加 frontmatter")
+
+    def test_timeline_title_keeps_using_the_timeline_rule(self):
+        """timeline 的 title 是**合法**语句，不许被提到 frontmatter 里去。"""
+        out = meeting._sanitize_mermaid(_mm('timeline\ntitle 录音设备技术特征对比\n消费级麦克风 : 主打通话清晰'))
+        self.assertIn("title: 录音设备技术特征对比", out)
+        self.assertNotIn("---\ntitle:", out)
+
+
+class HeadingWithoutTitleTests(unittest.TestCase):
+    """`graph` 写法与"本来就没有 title"的块：行为一字不变。"""
+
+    def test_graph_kind_is_handled_too(self):
+        out = meeting._sanitize_mermaid(_mm('graph LR\n    title: 流程\n    A[初验(出验)证书] --> B[结束]'))
+        self.assertIn("---\ntitle: 流程\n---", out)
+        self.assertIn('A["初验(出验)证书"]', out, "补引号的本事不能在整块改写时丢掉")
+
+    def test_no_title_no_frontmatter(self):
+        src = _mm('flowchart TD\n    A --> B')
+        self.assertEqual(meeting._sanitize_mermaid(src), src)
+
+
 if __name__ == "__main__":
     unittest.main()

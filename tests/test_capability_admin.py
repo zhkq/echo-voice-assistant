@@ -514,5 +514,100 @@ class BlockedByPrivacyIsNotUnreachableTests(unittest.TestCase):
         self.assertIsNone(capability_admin.execution_summary(None, "", ""))
 
 
+class UsedBackendIsNotWaitingForItTests(unittest.TestCase):
+    """文字**是能力后端出的** → 那一行不许再说「在等后端」（2026-10-13）。
+
+    用户现场：一场会先"配了后端但连不上"、meta 里留下 `diarize.waiting=True` 与
+    `transcribeFallbackReason=waiting-backend`（**同一次失败一起写下的两个字段**）；
+    后来配上后端**重转成功**，详情页于是同时显示「分离已执行（ECHO 后端）」与
+    「等待能力后端：配置里点名了它，但它现在连不上」—— 转写稿明明就摆在那儿。
+
+    判据只看"这一场的文字是谁出的"：`transcribeEngine == "backend"`。
+    **写入侧**同批修了（`meeting._finalize_waiting_flag()`），但盘上的老 meta
+    不会因为代码更新而自动重写 —— 所以读侧必须自己兜住，而且**两个字段都要清**
+    （只清一个，另一个照样把这一行画成「等待能力后端」）。
+    """
+
+    def test_it_is_reported_as_backend_not_as_waiting(self):
+        dia = {"executed": True, "reason": "", "waiting": True}
+        out = capability_admin.execution_summary(dia, "backend", "waiting-backend")
+        self.assertIs(out["waiting"], False, out)
+        self.assertEqual(out["waitingLabel"], "")
+        self.assertEqual(out["fallbackReason"], "",
+                         "文字是后端出的 → 「为什么没走成」这条旧原因必须一起清掉")
+        self.assertEqual(out["state"], "backend",
+                         "后端出的文字不许再说成「在等后端」：%s" % out)
+        self.assertEqual(out["headline"], out["transcribeEngineLabel"])
+        self.assertFalse(out["diarize"]["waiting"],
+                         "发射出去的那份 diarize 快照也要自洽：%s" % out["diarize"])
+
+    def test_it_does_not_mutate_the_caller_snapshot(self):
+        """读的时候**不许改调用方那份** `diarize`（它可能是盘上 meta 的引用）。"""
+        dia = {"executed": True, "reason": "", "waiting": True}
+        capability_admin.execution_summary(dia, "backend", "waiting-backend")
+        self.assertTrue(dia["waiting"], "调用方那份被就地改了：%s" % dia)
+
+    def test_a_waiting_record_survives_when_the_backend_did_not_do_it(self):
+        """没走后端的那一轮**不许**被上一条顺手改掉（那是真"在等"）。"""
+        dia = {"executed": False, "reason": "offline", "waiting": True}
+        out = capability_admin.execution_summary(dia, "", "waiting-backend")
+        self.assertIs(out["waiting"], True)
+        self.assertEqual(out["waitingLabel"], capability_admin.WAITING_BACKEND)
+        self.assertEqual(out["fallbackReason"], "waiting-backend")
+
+
+class SetBaseUrlTests(unittest.TestCase):
+    """**只改地址、不重新配对**（2026-10-13 用户要求）。
+
+    判据三条：① 只换 `base_url`，`client_id` / `secret` / 证书固定**一个字节都不动**
+    （动了服务端就会多一条客户端、老凭据作废）；② 没配对过 = 业务失败（回一句人话）；
+    ③ 地址没变时不写盘（幂等）。
+    """
+
+    def _creds(self):
+        from app.capabilities import credentials
+        return credentials.BackendCredentials(
+            base_url="http://221.216.62.2:8900", client_id="cli-1", secret="sec",
+            server_name="gpu-office-2060s", cert_pem="PEM", cert_fingerprint="sha256:aa")
+
+    def test_it_swaps_only_the_address(self):
+        from unittest.mock import patch
+        from app import capability_admin
+        from app.capabilities import credentials
+        saved = {}
+        with patch.object(credentials, "load", lambda: self._creds()), \
+                patch.object(credentials, "save", lambda c: saved.update(c=c)):
+            ok, msg = capability_admin.set_base_url("aeros.zetone.cn:8900")
+        self.assertTrue(ok, msg)
+        c = saved.get("c")
+        self.assertIsNotNone(c, "要真的落盘")
+        self.assertEqual(c.base_url, "http://aeros.zetone.cn:8900")
+        self.assertEqual(c.client_id, "cli-1", "clientId 不许变")
+        self.assertEqual(c.secret, "sec", "secret 不许变")
+        self.assertEqual(c.cert_pem, "PEM", "证书固定不许被顺手清掉")
+        self.assertIn("不用重新配对", msg)
+
+    def test_no_credentials_is_a_business_failure(self):
+        from unittest.mock import patch
+        from app import capability_admin
+        from app.capabilities import credentials
+        with patch.object(credentials, "load", lambda: None):
+            ok, msg = capability_admin.set_base_url("aeros.zetone.cn:8900")
+        self.assertFalse(ok)
+        self.assertIn("还没配对", msg)
+
+    def test_a_same_address_is_idempotent(self):
+        from unittest.mock import patch
+        from app import capability_admin
+        from app.capabilities import credentials
+        saved = {}
+        with patch.object(credentials, "load", lambda: self._creds()), \
+                patch.object(credentials, "save", lambda c: saved.update(c=c)):
+            ok, msg = capability_admin.set_base_url("http://221.216.62.2:8900")
+        self.assertTrue(ok, msg)
+        self.assertEqual(saved, {}, "地址没变就不该写盘")
+        self.assertIn("没变", msg)
+
+
 if __name__ == "__main__":
     unittest.main()

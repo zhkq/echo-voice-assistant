@@ -309,5 +309,72 @@ class WizardUiWiringTests(unittest.TestCase):
             self.assertIn('key: "%s"' % key, self.js, "三处位置里的 %s 不能少" % key)
 
 
+class TheOnboardOverlayNeverShowsItselfTests(unittest.TestCase):
+    """三步「首次启用向导」是全屏覆盖层：**建 ≠ 弹**，弹不弹只由服务端判据说。
+
+    2026-10-12 用户实测："稳定版设置页面总是跳出首次启用向导"。根因不在判据
+    （`install_state.onboarding()` 一直是对的：升级安装 → `shouldOnboard=false`），
+    而在前端：`onboardCard()` 建节点时写了 `display:flex`，于是"把卡建出来"当场就等于
+    "弹窗"；而 `bootView()` 与 `switchView("settings")` 都会建卡 —— 服务端的判据压根没参与，
+    于是每次打开/刷新面板，向导都盖上来。三条契约钉在这里：
+
+      1. **建成即隐藏**：`onboardCard()` 只能写 `display:none`（显形是 `onboardShow()` 的职责）；
+      2. **显示要过判据**：`onboardEnsureCard()` 只在 `_onboardNeeded`（服务端说要走向导）
+         且用户没最小化时才 `onboardShow()`；
+      3. **同名函数只许有一个定义** —— 稳定版那棵树上曾在**第 1 行**多出一份"带守卫"的副本
+         （想热修却插到了文件开头，没改到真函数），而 JS 里**后一份声明赢**，
+         于是那次热修**完全没生效**，症状照旧。这类"改了等于没改"只能靠这条断言挡住。
+      4. **看得见的入口不能少**：覆盖层不再自己冒出来之后，「设置 → 安装向导」里那一条
+         手动入口就是升级用户唯一能点到的路（横幅按用户口径不给按钮）。
+    """
+
+    def setUp(self):
+        self.js = _read(APP_JS)
+        self.html = _read(INDEX)
+
+    def _fn(self, name):
+        body = self.js[self.js.index("function %s()" % name):]
+        return body[:body.index("\n}\n")]
+
+    @staticmethod
+    def _code_only(src):
+        """掐掉 `//` 行注释再做断言：注释里会**引用**旧写法（"原来是 display:flex"），
+        拿它当"代码里还有 display:flex"会误报。这两个函数的字符串里不含 `//`，所以
+        行内掐注释在这个切片里是安全的。"""
+        return "\n".join(re.sub(r"//.*$", "", line) for line in src.split("\n"))
+
+    def test_the_overlay_is_created_hidden(self):
+        body = self._code_only(self._fn("onboardCard"))
+        self.assertIn('"display:none;align-items', body,
+                      "覆盖层必须建成隐藏的：建卡时要写 display:none")
+        self.assertNotIn("display:flex", body,
+                         "建卡时不许直接写成可见 —— 那等于无条件弹向导")
+
+    def test_showing_it_still_goes_through_the_server_verdict(self):
+        body = self._fn("onboardEnsureCard")
+        self.assertIn("_onboardNeeded", body, "显形前必须过服务端判据")
+        self.assertIn("_onboardMinimized", body, "用户最小化过就别再盖上来")
+        self.assertIn("onboardShow()", body, "需要时才显示（而不是建出来就显示）")
+
+    def test_there_is_exactly_one_definition(self):
+        self.assertEqual(self.js.count("function onboardEnsureCard"), 1,
+                         "同名函数重复定义时**后一份赢**，插在文件开头的那种热修会静默失效")
+
+    def test_settings_offer_a_visible_entry(self):
+        """覆盖层建成隐藏之后，**必须**留下一处看得见的入口。
+
+        升级安装不自动弹，顶部横幅按用户口径也**不渲染**那个按钮 —— 入口就只剩
+        「设置 → 安装向导」里这一条（外加 `?view=onboard` 深链）。少了它，
+        "入口在设置里就行"就成了空话，用户又回到"想走向导却找不到入口"。
+        """
+        self.assertIn('id="wizGoOnboard"', self.html,
+                      "设置页要有新三步向导的按钮（覆盖层不再自己弹了）")
+        self.assertIn("function bindOnboardEntry", self.js, "按钮要有人接线")
+        body = self._fn("bindOnboardEntry")
+        self.assertIn("wizGoOnboard", body, "接线的就是那个按钮")
+        self.assertIn("gotoOnboard(0)", body, "点了要真的进新三步向导")
+        self.assertIn("bindOnboardEntry();", self.js, "切到设置页时要把按钮接上")
+
+
 if __name__ == "__main__":
     unittest.main()

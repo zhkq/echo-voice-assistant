@@ -783,6 +783,45 @@ class WaitingForBackendIsVisibleTests(_MeetingCase):
         self.assertIn('data-testid="cap-run"', body, "那一行需要一个可断言的落点")
         self.assertIn("run.headline", body, "headline 必须是服务端给的那句")
 
+    # ---- 「在等后端」的**定稿**（2026-10-13）--------------------------------
+    # `_transcribe_impl` 开头那句 `if echo_backend_configured: waiting=True` 是**占位**
+    # （那时还不知道这一槽落没落到后端）；一轮走完之后由 `_finalize_waiting_flag()` 按
+    # **事实**收口。现场是：先"等后端"失败、后来配上后端重转成功，而详情页同时显示
+    # 「分离已执行」与「等待能力后端：连不上」。
+
+    def test_a_run_that_used_the_backend_clears_the_waiting_flag(self):
+        da = meeting._new_diarize_state()
+        da["executed"] = True
+        da["waiting"] = True
+        meeting._finalize_waiting_flag({"transcribeEngine": "backend"}, da)
+        self.assertFalse(da["waiting"],
+                         "文字是后端出的 → 那台当时可用，不许再说「在等它」：%s" % da)
+        self.assertTrue(da["executed"], "只清 waiting，不动别人")
+
+    def test_it_does_not_touch_a_run_that_did_not_use_the_backend(self):
+        """没走后端的那一轮一个字都不许动（那才是真"在等"）。"""
+        for engine in ("", "provider", "local"):
+            da = meeting._new_diarize_state()
+            da["waiting"] = True
+            meeting._finalize_waiting_flag({"transcribeEngine": engine}, da)
+            self.assertTrue(da["waiting"], "engine=%r 时不该被清掉" % engine)
+
+    def test_the_impl_finalizes_the_flag_before_writing_meta(self):
+        """AST 闸：`_transcribe_impl` 的收尾**必须**调用它 —— 少这一句这条修复等于没接上。"""
+        import ast
+        with open(meeting.__file__, encoding="utf-8") as fh:
+            tree = ast.parse(fh.read())
+        impl = None
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name == "_transcribe_impl":
+                impl = node
+        self.assertIsNotNone(impl, "找不到 _transcribe_impl")
+        called = [ast.unparse(n.func) for n in ast.walk(impl)
+                  if isinstance(n, ast.Call)]
+        self.assertIn("_finalize_waiting_flag", called,
+                      "收尾没调用 `_finalize_waiting_flag()`：老 meta 的 `waiting=True` "
+                      "会被一直留着，详情页继续自相矛盾")
+
 
 def _write_wav(path, seconds=1.0):
     """写一段**真的** wav（16k 单声道 int16，与 recorder.py 的产出同格式）。"""

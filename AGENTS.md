@@ -582,3 +582,42 @@ pyannote 4.0.7 在 cu126 上装得上也跑得动（600 秒音频约 26.7 秒，
   同理：`python -m server.main --list-calls/--list-clients` 这类 CLI 能跑通，本身就说明后端代码是好的 ✓
   —— 排障时先跑它们，比读日志快。
 
+### 「谁该被看护 / 谁该被拉起」必须由**配置**回答，不能由记录回答（2026-10-13 同一天逮到三次）
+
+同一类错误的三个变体：**拿"曾经有过"的痕迹当"现在还需要"的证据**。
+
+- **看门狗（`app/backend_watch.py`）**：旧判据是 `backend_pid.read_pid() > 0`（"ECHO 起过它"）
+  → 一台**改用网络后端**的机器上，那个本机后端被**永远看护**：杀了 30 秒又被拉回来，
+  一直占着 8900/8901，谁也不知道它为什么还在（用户的原话是"有没有起不必要的应用"）。
+  **现在的判据按配置走**（`wanted()`）：
+  ① 三个槽（`capabilityMeetingAsrBackend` / `capabilityDiarizeBackend` /
+  `capabilityEmbedBackend`）**都不要**能力后端 → 不守；
+  ② 这棵树**连的是谁**（配对文件 `data/backend.json` 的 `base_url` 优先，兜底隐藏设置
+  `capabilityEchoServerUrl`）：回环 → 守；**远端 → 不守**（pid 记录只**如实报出来**，
+  不当成"要守"的理由 —— 它只是"曾起过"的痕迹）；
+  ③ 没有配对线索时：**pid 记录 + 本机后端配置齐**（runtime ready + `server.yaml` 在）才算。
+  `state()["wanted"]` 把结论给面板读；⚠️ **`state()` 不许现算 `wanted()`** ——
+  `wanted()` 要调 `backend_admin.view()`，而 `view()` 反过来读 `state()`，现算就是**无限递归**。
+- **`dsh_homes()` 的判据放宽了，写入侧必须跟着放宽。** 判据 2026-09-25 就认了"只有
+  `.credentials.yaml` 的家目录"（**标准版 harness 从不写 `settings.yaml`**），但两个写入器
+  （`llm_router._sync_settings_ruamel` / `_sync_settings_text`）都假设那个文件已存在 →
+  `FileNotFoundError` → 每次启动 **9 条** `[boot] ECHO AUTO 注册失败`、ECHO AUTO 永远注册不上
+  （用户 2026-10-13 报的就是这个，目标是"ECHO 自己的 DSH 标准版"）。
+  **修法**：文件不存在 = **空文档，从零建出来**（两条路都要改）。**只改一半的修复比不改更难查**
+  —— 判据说"这是家目录"，写入说"这文件不存在"。
+  判据：`tests/test_dsh_multi_home.py::RegistrationTests`（ruamel 路 + 文本兜底路各一条）。
+- **工具包 `Get-PairingInfo`（`C:\Users\zhkq\Desktop\ECHO\_echo-tools.ps1`）**：原来**先问面板端口**
+  —— 两棵树共用 8970，树没起来时**答话的是另一棵树**（于是 dev 被标成"配对到网络后端"，
+  而它自己的配对文件写着 `127.0.0.1`）→ `switch-dev` 会**跳过 dev 真需要的本机后端**。
+  **配对文件优先**，且只在 `Get-EchoUp` 确认"就是这棵树"时才问面板。
+- **判"多余进程"不许只看"它自己没在监听"。** `pythonw.exe … proxy.py` 是 **trampoline**：
+  真正在服务的是它 re-exec 出来的 `python.exe` 子进程（同一个脚本、同一秒、**只有子进程听 8899**，
+  日志还落在启动器的 stdout 里）—— 和 ECHO 自己那对（`pythonw -m app.main` → `python -m app.main`）
+  是**同一形态**。把它当"空闲残留"杀掉会连**模型路由**一起搞坏。
+  判据：**这个进程树里有没有人监听**，不是"这个进程自己有没有监听"。
+- **配套的后端归属判据**（同一天早先）：看门狗守不守、工具包搬不搬本机后端，都只认**配置 + 配对文件**；
+  "停掉本机后端"要走产品接口（`POST /api/capability/backend/stop`），它会写"你明确停过"的退避
+  （`PAUSE_AFTER_STOP=30 分钟`）并删掉 `backend.pid`；**按 pid 杀**则会留下 pid 记录 →
+  看门狗判据①又把它拉回来（工具包 `Stop-BackendByPid` 已补上删记录这一刀）。
+
+

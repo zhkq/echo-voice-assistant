@@ -105,10 +105,10 @@ const _VIEWS = ["dashboard", "settings", "business", "history"];
    第一个是「会议」，所以打开历史页没指明子页签时落到会议）。 */
 let _histTab = "meetings";
 
-/*: 仪表盘「近期会议」显示几条（2026-10-07 用户："改成显示最新四条"）。
+/*: 仪表盘「近期会议」显示几条（2026-10-07 用户："改成显示最新四条"；2026-10-13 又调成 **5 条**（用户："首页可以显示 5 条会议"））。
     **两处**要用它：首屏 `refreshDashboard()` 与每 5 秒的 `refreshMeetingPanel()` ——
     原来两处各写一个字面量（4 与 5），只改一处就会"看起来没生效"（真踩过）。 */
-const DASH_MEETINGS_LIMIT = 4;
+const DASH_MEETINGS_LIMIT = 5;
 
 /* 旧入口 → 新页签（深链/书签/别处硬编码的兼容层）：
    2026-09-26 用户定的设置信息架构（IA）= **三类 + 一个历史位**：
@@ -212,6 +212,8 @@ function switchView(name) {
     loadSettings(); loadBoot(); loadBootLogs(); loadWizard(); loadCapabilities(); loadRouter();
     loadVoiceprints();
     // 向导卡要在设置页**常驻**（重绘会冲掉它）：现在 + 重绘之后各确保一次。
+    // （"常驻"= 内容备好、可点得到；**不是**把它弹出来 —— 弹不弹看 `_onboardNeeded`。）
+    bindOnboardEntry();
     onboardEnsureCard();
     setTimeout(onboardEnsureCard, 600);
     // 聚合建议与声纹库**同一张卡**（列表下方）：分开拉是为了让"库"先出现、
@@ -1088,7 +1090,7 @@ async function refreshDashboard() {
     const cmds = await api("/api/commands?limit=2");
     // 点击任意一条 → 跳到「历史」页签并定位到这条的完整详情（issue #2）
     renderCmdList($("#recentCmds"), cmds.items, false, { click: "history" });
-    // 近期会议（2026-10-07 用户："仪表盘会议列表改成显示最新四条"）
+    // 近期会议（2026-10-07 用户："仪表盘会议列表改成显示最新四条"；2026-10-13 改成 5 条）
     const meets = await api("/api/meetings?limit=" + DASH_MEETINGS_LIMIT);
     renderMeetingItems($("#recentMeetings"), meets.items);
   } catch (e) {
@@ -1576,6 +1578,9 @@ const SET_CARDS = {
         // 工作区、归档、语音合成、每个 agent 的参数都按用户给的层级搬到**常用区**的二级分组里了。
         adv: () => renderAgentCardAdv()
           + sSub("能力选择", renderSettingRows(settingRows(["sttModel", "wakeEngine"])))
+        // 2026-10-13：会议转写走哪条路（能力后端 / 网络服务商）从常用区搬到这里 ——
+        // 常用区那两组单选看着像一回事，而它是"用哪个实现"，与「能力选择」同类。
+        + renderMeetingBackendChoice()
         + sSub("在线服务",
                renderSettingRows(settingRows(["providerAsr", "providerAsrBaseUrl",
                                               "providerAsrModel", "providerAsrApiKey",
@@ -2803,11 +2808,6 @@ if (_btnCapDlMissing) _btnCapDlMissing.addEventListener("click", () => downloadM
    3. 配对失败**显示成一句人话**（后端也是这么回的），不是一串 HTTP 报错。 */
 let _capRouteCache = null;
 
-function capBackendBadge(b) {
-  if (b.ready === true) return `<span class="badge online">可用</span>`;
-  if (b.ready === false) return `<span class="badge offline">不可用</span>`;
-  return `<span class="badge idle">未知</span>`;
-}
 
 /* 后端自己的状态行 + 「打开后端管理面」（2026-09-28，设计 §6.6 的"设置分家"）。
 
@@ -2817,91 +2817,31 @@ function capBackendBadge(b) {
 
    远程后端那一条要如实说清"为什么点不开"：管理面**只发布在后端那台机器的回环上**
    （`127.0.0.1:8901`，见 `docs/后端容器部署.md` §7），所以客户端这侧只能走 ssh 隧道。 */
-function capBackendHealthLine(b) {
-  const h = b.health || {};
-  if (!h.version) return "";
-  const parts = [`版本 ${esc(h.version)}`];
-  const v = h.vram || {};
-  if (Number(v.budgetMb) > 0) {
-    parts.push(`显存 ${(Number(v.usedMb || 0) / 1024).toFixed(1)}/${(Number(v.budgetMb) / 1024).toFixed(1)} GB`);
-  }
-  const models = h.models || {};
-  const ids = Object.keys(models);
-  if (ids.length) {
-    const ready = ids.filter((k) => models[k] === "ready").length;
-    parts.push(`模型 ${ready}/${ids.length} 就绪`);
-  }
-  const q = h.quota || {};
-  const used = Object.keys(q.clients || {}).length;
-  if (used) parts.push(`今日已用 ${used} 个客户端`);
-  return `<div class="cap-be-slots">${parts.join(" · ")}</div>`;
-}
-
 function capBackendAdminRow(b) {
+  // 管理面地址由后端宣告（`adminUrl`，客户端不猜端口）。**怎么进去那句说明收进 `title`**
+  // —— 远程后端的管理面只发布在它那台机器的回环上，这一点不看不知道，但不必占版面。
   const url = String((b.health || {}).adminUrl || "");
   if (!url) return "";
   const loop = /^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(:\d+)?/i.test(String(b.baseUrl || ""));
-  if (loop) {
-    return `<div class="cap-be-slots"><a class="btn" href="${esc(url)}" target="_blank"
-      rel="noopener">打开后端管理面</a>
-      <span class="muted" style="font-size:12px">发授权 / 客户端 / 调用记录 / 配额都在那边</span></div>`;
-  }
-  return `<div class="cap-be-slots">管理面只发布在<b>后端那台机器</b>的回环上 —— 要看就用
-    <code>ssh -L 8901:127.0.0.1:8901 &lt;后端主机&gt;</code>，再开 <code>${esc(url)}</code>。</div>`;
+  // 2026-10-13 用户口径：**只有本地后端才展示这个入口** —— 远端后端的管理面只发布在
+  // 它自己那台机器的回环上（`ssh -L` 那一套是排障手段，不该在界面上摆一个点不开的按钮）。
+  if (!loop) return "";
+  return `<div class="cap-be-slots"><a class="btn" href="${esc(url)}" target="_blank"
+    rel="noopener" title="发授权 / 客户端 / 调用记录 / 配额都在那边">打开后端管理面</a></div>`;
 }
 
 function renderCapBackends(rows) {
+  /* 2026-10-13 第三轮（用户按截图指出）：清单那两行（本机 / ECHO 后端 + 可用徽标 + 来源）
+     也算没用 —— 这里**只留管理面入口**这一个控件。配对到谁由上面的单选与地址框表达，
+     "有没有后端"由卡片标题上的徽标表达。 */
   const host = $("#capBackendList");
   if (!host) return;
-  if (!rows.length) { host.innerHTML = ""; return; }
-  const src = { local: "这台机器", lan: "内网", wan: "公网" };
-  host.innerHTML = rows.map((b) => {
-    const slots = (b.slotsLabeled || []).map((s) => s.label).join("、") || "（什么都没声明）";
-    const extra = b.capsError
-      ? `<div class="cap-be-slots">读不到能力清单：${esc(b.capsError)}</div>` : "";
-    return `<div class="cap-be-row">
-      <span class="cap-be-name">${esc(b.label || b.backendId)}</span>
-      ${capBackendBadge(b)}
-      <span class="muted" style="font-size:12px">${esc(src[b.source] || b.source || "")}${b.serverName ? " · " + esc(b.serverName) : ""}</span>
-      ${capBackendHealthLine(b)}
-      <div class="cap-be-slots">能做：${esc(slots)}</div>
-      ${capBackendAdminRow(b)}
-      ${extra}
-    </div>`;
-  }).join("");
+  const list = rows || [];
+  if (!list.length) { host.innerHTML = ""; return; }
+  const paired = list.find((b) => b.backendId === "echo-server") || list[0];
+  host.innerHTML = capBackendAdminRow(paired);
 }
 
-function renderCapPairState(pair, local) {
-  const state = $("#capPairState");
-  if (state) {
-    if (!pair || !pair.paired) {
-      state.textContent = "还没配对 —— 这台机器只用本机引擎。";
-    } else {
-      const token = pair.tokenFresh ? "令牌有效" : "下次调用时自动换令牌";
-      state.textContent = `已配对：${pair.serverName || pair.baseUrl}（${pair.clientId}）· ${token}`;
-    }
-  }
-  // **方案 1：本机自动配对**（2026-09-28）。按钮与它旁边那句话都以这份状态为准：
-  // 文件不在 / 码过期 → **禁用**（不是藏起来），并当场写清为什么、以及怎么做。
-  const btn = $("#btnCapPairLocal");
-  const hint = $("#capPairLocalState");
-  if (!btn) return;
-  const info = local || {};
-  const found = !!info.found;
-  const expired = !!info.expired;
-  btn.disabled = !found || expired;
-  btn.title = found
-    ? (expired
-      ? `本机配对码已过期（${info.path}）—— 在后端那台机器上重启一次后端就会重发`
-      : `读 ${info.path} 完成配对（同机不用抄配对码）`)
-    : (info.message || "没找到本机配对文件：本机后端还没跑起来");
-  if (hint) {
-    hint.textContent = found
-      ? (expired ? "本机后端在跑，但配对信息已过期 —— 重启一次后端"
-                 : `已找到本机后端：${info.baseUrl || ""}`)
-      : "本机后端还没跑起来（后端在别的机器上 → 用上面的配对串）";
-  }
-}
 
 async function loadCapabilityRouting(force) {
   const host = $("#capRouteSettings");
@@ -2916,7 +2856,6 @@ async function loadCapabilityRouting(force) {
     // `_settingsCache` 才能被 `settingByKey/settingValue` 读到（`loadCapabilities()`
     // 刚把缓存换成了 `/api/settings` 那一份，而那里**不含 hidden 键**）。
     mergeSettingsRows(r.settings || []);
-    renderCapPairState(r.pair, r.local);
     renderCapBackends(r.backends || []);
     // **配对到哪儿变了 → 「本机 / 网络」那两块要跟着重算**（2026-10-06）。
     // `applyTranscribeSettingsVisibility()` 的判据是 `pair.baseUrl`（回环 = 本机后端），
@@ -2937,15 +2876,10 @@ async function loadCapabilityRouting(force) {
     // 这一格放两样：**ECHO 后端的地址**（本机直连时用）+ **一句指路**。
     // 转写走哪条路 / 分离与声纹由谁做都收进了「业务配置 → 会议」卡（一个实体一处状态），
     // 所以这里不再摆第二套下拉 —— 那正是 2026-09-19 那次"同一个设置项两处能改"的老问题。
-    host.innerHTML = renderSettingRows(settingRows(["capabilityEchoServerUrl"]))
-      + `<div class="muted" style="font-size:12px;padding-top:6px">
-      <b>会议转写走哪条路</b>（本机 / ECHO 后端 / 网络服务商）与<b>分离、声纹由谁做</b>都在
-      「业务配置 → 会议」卡里改；「允许音频去哪」也在那张卡的「高级」里。
-      这一页管<b>配对</b>与<b>后端清单</b>（配对状态 · 健康 · 刷新）。<br>
-      <b>发授权（一次性配对串）与撤销客户端</b>在<b>管理员那台 ECHO 后端</b>上 ——
-      客户端这侧只有"配对 / 解除配对"（忘掉本机凭据），服务端那本客户端清单不归这里管。
-      排障用的两个令牌（<code>capabilityEchoServerToken</code> /
-      <code>capabilityEchoServerStaticToken</code>）刻意不在这里：填了会盖过配对凭据。</div>`;
+    // 2026-10-13（用户："留上面的就行"）：`后端地址`（隐藏设置 `capabilityEchoServerUrl`）
+    // 那一行去掉 —— 它是"显式指定地址、**优先于配对**"的旧入口，留着会静默改道；
+    // "换地址"这件事现在由配对行里的「改地址」按钮承担（保留凭据、不重新配对）。
+    host.innerHTML = "";
     const n = (r.backends || []).filter((b) => b.backendId !== "local").length;
     if (badge) {
       badge.textContent = n ? `${n} 个后端` : "只用本机";
@@ -2979,11 +2913,29 @@ function parsePairString(text) {
   return out;
 }
 
+async function doCapabilitySetAddr() {
+  const raw = (($("#capPairHost") || {}).value || "").trim();
+  if (!raw) { toast("先在上面的地址格里填后端地址（例如 aeros.zetone.cn:8900）"); return; }
+  try {
+    const r = await api("/api/capability/address", {
+      method: "POST", body: JSON.stringify({ base_url: raw }),
+    });
+    toast(r.message || "地址已改", 6000);
+    await loadCapabilityRouting(true);
+  } catch (e) {
+    toast(capBackendErrorText(e), 9000);
+    try { await loadCapabilityRouting(true); } catch (e2) { /* 保持现状 */ }
+  }
+}
+
 async function doCapabilityPair() {
   const raw = (($("#capPairUrl") || {}).value || "").trim();
+  const hostBox = (($("#capPairHost") || {}).value || "").trim();
   const boxCode = (($("#capPairCode") || {}).value || "").trim();
   const parsed = parsePairString(raw);
-  const url = parsed ? parsed.url : raw;
+  // 2026-10-13：地址与配对码各有一格（配对串那一格只吃整串）；
+  // 兼容"有人把普通地址填在配对串那一格"的老习惯。
+  const url = parsed ? parsed.url : (hostBox || raw);
   const code = (parsed && parsed.code) ? parsed.code : boxCode;
   const fp = parsed ? parsed.fp : "";
   const state = $("#capPairState");
@@ -3038,13 +2990,13 @@ async function doCapabilityPairLocal() {
 }
 
 async function doCapabilityUnpair() {
-  if (!window.confirm("解除配对？\n\n这只是让这台机器忘掉后端凭据；"
+  if (!window.confirm("解绑？\n\n这只是让这台机器忘掉后端凭据；"
     + "服务端那本客户端清单归管理员。再要用得让管理员重新发一张配对码。")) return;
   try {
     const r = await api("/api/capability/unpair", { method: "POST" });
-    toast(r.message || "已解除配对");
+    toast(r.message || "已解绑");
     await loadCapabilityRouting(true);
-  } catch (e) { toast("解除配对失败：" + e.message); }
+  } catch (e) { toast("解绑失败：" + e.message); }
 }
 
 /* ---------------- 「帮我起本机后端」（2026-09-30，实施方案 §5 的批 1d） ----------------
@@ -3083,6 +3035,10 @@ let _capBackendCache = null;
 //: 而它外面通常裹着 try，表现会变成"读不到……"那种**静默的坏显示**。
 let _capRouteCardTpl = null;
 
+/* 折叠块机制（`capDetails` / `bindCapDetails` 与那份「哪些块开着」的状态）随卡片简化一起下线
+   （2026-10-13 第二轮：卡片里只留配置项，说明性文字一律不平铺，也就没有「折叠」的必要了）。
+   需要「要看才看」的内容：控件 `title`（悬浮）或 `?` 浮窗（`.sq` + `.spop`）。 */
+
 /* 只读计划（批 2）：**点按钮之前先给人看**。走容器路还是扩展包路、哪一档、多大、缺什么、
    先验哪一步，以及 nvidia-smi / docker 的原文。它比状态那一份贵（要问 docker 与显卡），
    所以**只在页签渲染时拉一次**，不跟着 job 的 1.5 秒轮询跑。 */
@@ -3101,66 +3057,13 @@ async function loadBackendPlan(force) {
 }
 
 function renderBackendPlan(p) {
+  /* 计划（容器路还是扩展包路 / 多大 / 多久 / 缺什么）**既不摊开也不折叠**
+     —— 2026-10-13 第二轮用户口径："仅保留配置项，就行，说明性文字都不需要展示"。
+     这个函数现在只管一件事：让按钮显隐跟着计划走（容器路才出「生成 compose」）。 */
+  _capBackendPath = String((p || {}).path || "");
+  renderBackendOneClick(_capBackendCache || {});
   const host = $("#capBackendPlan");
-  if (!host) return;
-  _capBackendPath = String(p.path || "");
-  renderBackendOneClick(_capBackendCache || {});      // 按钮显隐跟着计划走
-  const pathLabel = { container: "容器路（Docker）", portable: "扩展包路（不用容器）",
-                      none: "两条路都不成立" }[p.path] || p.path;
-  const bits = [`<b>${esc(pathLabel)}</b>`];
-  if (p.variant) bits.push(`档位 ${esc(p.variant)}`);
-  if (p.sizeMb) bits.push(`约 ${(p.sizeMb / 1024).toFixed(1)} GB · 约 ${p.etaMinutes} 分钟`);
-  if (p.diskFreeGB !== null && p.diskFreeGB !== undefined) bits.push(`盘上还剩 ${p.diskFreeGB} GB`);
-  const lines = [`计划：${bits.join(" · ")}`];
-  // 权重够不够（批 3）：**说清看的是哪一处**，否则会出现"面板说齐了、服务端仍 503"。
-  const w = p.weights || {};
-  if (w.wanted && w.wanted.length) {
-    const ready = (w.present || []).length;
-    lines.push(`模型 ${ready}/${w.wanted.length} 就绪（看的是 ${esc(w.root || "（模型库没配）")}）`
-      + ((w.missing || []).length ? `，缺：${w.missing.map(esc).join("、")}` : ""));
-  }
-  if ((p.missing || []).length) lines.push(`缺：${p.missing.map(esc).join("；")}`);
-  // 薄包那条路（默认）：先取薄包、再装运行时 —— 两样都**不随包走**，所以都说清"从哪来"。
-  if (p.path === "portable" && p.fetch && p.fetch.package) {
-    const pk = p.fetch.package;
-    lines.push(pk.ready
-      ? `取薄包：已经解开（<code>${esc(pk.root || "")}</code>）`
-      : (pk.source
-        ? `取薄包：${pk.explicit ? "按你指的" : "本机找到"} <code>${esc(pk.source)}</code>`
-        : `取薄包：本机没有，也没填地址 —— 放到 <code>${esc((pk.search || [])[0] || "")}</code> 之一，`
-          + `或填设置 <code>capabilityBackendPackage</code>`));
-  }
-  if (p.path === "portable" && p.fetch) {
-    lines.push(`取运行时：${esc(p.fetch.headline || "")}`
-      + (p.fetch.approxDownloadGB ? `（约 ${p.fetch.approxDownloadGB} GB）` : "")
-      + `；日志 <code>${esc(p.fetch.log || "")}</code>`);
-  }
-  // 容器路（批 4）：compose 文件可以在这里生成（只发布到宿主回环）；「一键拉镜像 + 起」还没做。
-  if (p.path === "container") {
-    lines.push("容器路：点「生成 compose」会把本机形态的 compose.yaml 写好"
-      + "（两个端口都只发布到 127.0.0.1）；起它用 <code>docker compose up -d</code>。"
-      + "<b>拉镜像/起容器这一步还没做</b>。");
-  }
-  (p.notes || []).forEach((n) => lines.push(`· ${esc(n)}`));
-  (p.verify || []).forEach((v) => lines.push(`先验一步：<code>${esc(v.command)}</code>（${esc(v.why)}）`));
-  (p.reasons || []).forEach((r) => lines.push(`· ${esc(r)}`));
-  host.innerHTML = lines.map((l) => `<div>${l}</div>`).join("");
-}
-
-/* 三层就绪的结论（批 3）。服务端只保留**最近一次**（L3 是一次真推理，不能每次轮询都跑），
-   所以这里显示的是"上一次自测的结论 + 什么时候跑的"，而不是又去问一遍。 */
-function renderBackendReady(ready) {
-  const host = $("#capBackendReady");
-  if (!host) return;
-  const r = ready || {};
-  if (!r.headline) { host.innerHTML = ""; return; }
-  const cls = r.ok ? "ok" : "warn";
-  const layer = { ok: "三层都过", "not-running": "后端没应答", "not-ready": "模型没就绪",
-                  "asr-failed": "真实自测失败", error: "自测没跑起来" }[r.state] || r.state || "";
-  const l3 = r.l3 || {};
-  const extra = l3.text ? ` · 自测文本：${esc(l3.text)}` : "";
-  host.innerHTML = `<div>就绪（${esc(r.at || "")}）：`
-    + `<span class="sbadge ${cls}">${esc(layer)}</span> ${esc(r.headline)}${extra}</div>`;
+  if (host) host.innerHTML = "";
 }
 
 async function loadBackendOneClick() {
@@ -3172,18 +3075,11 @@ async function loadBackendOneClick() {
     _capBackendCache = r;
     renderBackendOneClick(r);
   } catch (e) {
-    const state = $("#capBackendState");
-    if (state) state.textContent = "读不到本机后端的状态：" + e.message;
+    // 2026-10-13 第二轮口径：卡片里不放任何叙述 —— 取数失败改成一句 toast。
+    toast("读不到本机后端的状态：" + e.message, 9000);
   } finally {
     _capBackendBusy = false;
   }
-}
-
-function capBackendJobLines(job) {
-  const steps = (job && job.steps) || [];
-  const lines = steps.map((s) => `${s.ok ? "✓" : "✗"} ${esc(s.detail || s.name)}`);
-  if (job && job.running) lines.push(`… 正在：${esc(job.stage || "准备中")}`);
-  return lines;
 }
 
 function renderBackendOneClick(be) {
@@ -3193,12 +3089,11 @@ function renderBackendOneClick(be) {
   const notesHost = $("#capBackendNotes");
   const jobHost = $("#capBackendJob");
   const job = be.job || {};
-  const ports = `${be.port}/${be.adminPort}`;
 
   if (btn) {
     btn.disabled = !!job.running || !be.canStart;
     btn.title = job.running
-      ? "正在起本机后端…（进度在下面）"
+      ? "正在起本机后端…（完成时会弹提示）"
       : (be.canStart ? "在这台机器上起一个只绑回环的 ECHO 能力后端（写配置 → 起进程 → 自动配对）"
                      : (be.whyNot || "现在起不了"));
   }
@@ -3212,27 +3107,20 @@ function renderBackendOneClick(be) {
   if (composeBtn) {
     composeBtn.classList.toggle("hidden", (_capBackendPath || "") !== "container");
   }
-  if (state) {
-    const bits = [];
-    bits.push(be.running ? `在跑：pid=${be.pid}` : "没在跑");
-    bits.push(`端口 ${ports}`);
-    const local = be.pairFile || {};
-    bits.push(local.found ? `本机配对文件在（${esc(local.baseUrl || "")}）` : "还没有本机配对文件");
-    state.innerHTML = bits.join(" · ");
+  /* 2026-10-13 第二轮口径：**卡片里只留配置项，一句说明性文字都不显示**。
+     状态行 / 进度 / 步骤 / 说明都不再渲染；"为什么起不了"挂到按钮的 `title`（悬浮才看），
+     结果与失败走 toast（见下面 job 收尾与 loadBackendOneClick 的 catch）。
+     三个容器（`#capBackendState` / `#capBackendJob` / `#capBackendNotes`）保留在 DOM 里
+     —— 别的代码与用例仍引用它们 —— 但一律清空。 */
+  const notes = be.notes || [];
+  const blocked = (!be.running && !be.canStart)
+    || (!!job.doneAt && !job.running && job.ok === false);
+  if (btn && blocked && notes.length) {
+    btn.title = (be.whyNot || btn.title || "") + "：" + notes.join("；");
   }
-  if (jobHost) {
-    const lines = capBackendJobLines(job);
-    if (job.doneAt && !job.running) {
-      lines.push(`${job.ok ? "✓ 完成" : "✗ 没成功"}：${esc(job.message || "")}`);
-    }
-    jobHost.innerHTML = lines.length
-      ? lines.map((l) => `<div>${l}</div>`).join("") : "";
-  }
-  if (notesHost) {
-    const notes = be.notes || [];
-    notesHost.innerHTML = notes.map((n) => `<div>· ${esc(n)}</div>`).join("");
-  }
-  renderBackendReady(be.ready);
+  if (state) { state.textContent = ""; state.title = be.running ? `pid=${be.pid}` : ""; }
+  if (jobHost) jobHost.innerHTML = "";
+  if (notesHost) notesHost.innerHTML = "";
   // 任务刚结束的那一拍：换一句 toast，并把能力页签整块重拉一遍（配对状态/后端清单都变了）。
   if (job.doneAt && !job.running && job.doneAt !== _capBackendLastDone) {
     _capBackendLastDone = job.doneAt;
@@ -3316,6 +3204,13 @@ const _btnCapBackendStop = $("#btnCapBackendStop");
 if (_btnCapBackendStop) _btnCapBackendStop.addEventListener("click", doCapabilityBackendStop);
 const _btnCapBackendReady = $("#btnCapBackendReady");
 if (_btnCapBackendReady) _btnCapBackendReady.addEventListener("click", doCapabilityBackendReady);
+// 「只改地址、不重新配对」（2026-10-13）。与这张卡其它按钮同一条纪律：**每次重绘之后重接**
+// （它会被克隆进「转写服务 → 后端设置」，克隆节点不带原来的监听）。
+const _btnCapSetAddr = $("#btnCapSetAddr");
+if (_btnCapSetAddr && !_btnCapSetAddr.dataset.wired) {
+  _btnCapSetAddr.dataset.wired = "1";
+  _btnCapSetAddr.addEventListener("click", doCapabilitySetAddr);
+}
 const _btnCapBackendCompose = $("#btnCapBackendCompose");
 if (_btnCapBackendCompose) {
   _btnCapBackendCompose.addEventListener("click", doCapabilityBackendCompose);
@@ -3328,8 +3223,8 @@ async function doCapabilityBackendReady() {
   if (btn) { btn.disabled = true; btn.textContent = "自测中…"; }
   try {
     const r = await api("/api/capability/backend/ready", { method: "POST" });
+    // 结果就是一次性消息 —— 走 toast（卡片里不再留"上一次自测的结论"那一行）。
     toast(r.message || "三层就绪自测通过");
-    renderBackendReady(r.ready || {});
     await loadBackendOneClick();
   } catch (e) {
     toast(capBackendErrorText(e), 9000);
@@ -3661,9 +3556,12 @@ function renderAiCardCommon() {
            "commandWorkspace", "commandWorkspaceTitle"])))
       + sSub("归档", renderSettingRows(settingRows(["worklogVaultRoot", "worklogPrompt"]))))
     + sSub("转写服务",
-      sSub("后端设置", `<div id="capBackendHost"></div>`)
-      + sSub("分离与声纹由谁做", renderSettingRows(settingRows(
-          ["capabilityDiarizeBackend", "capabilityEmbedBackend"]))))
+      // 2026-10-13 用户口径（第五张截图）：转写服务下面只有这一张卡，**不再多套一层
+      // 「后端设置」** —— 静态卡 `#capRouteCard` 直接落进这个占位，卡片自己的标题就叫
+      // 「后端设置」（见 index.html）。「转写走哪条路」仍不在这里（挪进了高级 → 能力选择）。
+      `<div id="capBackendHost"></div>`)
+    // 2026-10-13 用户口径：「分离与声纹由谁做」**不再是配置项**（会议标配，取值恒为
+    // echo-server），转写卡里那一份去掉；它仍然在「业务配置 → 会议」卡里（一处状态）。
     + sSub("语音合成", renderSettingRows(settingRows(["ttsEngine"])));
 }
 
@@ -3714,14 +3612,26 @@ function applyTranscribeSettingsVisibility(explicit) {
   // 它就是"事实是怎样"，不该能跟事实不一致。
   const radios = document.querySelectorAll('input[data-cap-backend-mode="1"]');
   for (const r of radios) r.checked = (r.value === (localPaired ? "local" : "net"));
-  const modeState = $("#capBackendModeState");
-  if (modeState) {
-    modeState.textContent = !pairBase
-      ? "还没配后端 —— 本机自己跑选「本机后端」，连别的机器选「网络后端」"
-      : (localPaired ? `当前：本机（${pairBase}）` : `当前：网络（${pairBase}）`);
-  }
+  // 2026-10-13 第二轮：这一行的状态文字不再平铺 —— 选中态由单选按钮自己表达
+  // （哪个亮着就是哪一档），"还没配后端"这种情况由禁用态与 `?` 浮窗说明覆盖。
   if (pair) pair.classList.remove("hidden");
   if (loc) loc.classList.toggle("hidden", !localPaired);
+  // 2026-10-13（用户口径）：**配对 / 解除配对在同一个位置**，按"配没配上"二选一显示
+  // （原来两个按钮同时可见，看着像两个功能）。
+  const paired = !!(((_capRouteCache || {}).pair || {}).paired);
+  const bPair = $("#btnCapPair"), bUnpair = $("#btnCapUnpair");
+  if (bPair) bPair.classList.toggle("hidden", paired);
+  if (bUnpair) bUnpair.classList.toggle("hidden", !paired);
+  // 配对之后**地址行回填后端地址**（`#capPairHost`，只填空的，不覆盖用户正在输的）；
+  // `后端地址`（`capabilityEchoServerUrl`）那一栏同步展示配对到的网址:端口 —— **只展示**。
+  const hostBox = $("#capPairHost");
+  if (hostBox && pairBase && !hostBox.value) {
+    hostBox.value = pairBase.replace(/^https?:\/\//, "");
+  }
+  // 2026-10-13 用户要求：**只改地址、不重新配对** —— 配对后多一个「改地址」按钮
+  // （它把上面那一格的值写进配对凭据的 base_url，clientId/secret 一个字节都不动）。
+  const bAddr = $("#btnCapSetAddr");
+  if (bAddr) bAddr.classList.toggle("hidden", !paired);
 }
 
 function renderAgentCardCommon() {
@@ -3790,6 +3700,17 @@ function renderAgentCardAdv() {
    "开会时这些活谁干"是**会议**的配置，不是语言模型路由的配置。
    界面上每一行只写自己那个键（曾经"一个下拉同时写三个键"，表现是"选了后端也没说话人"）。 */
 function renderMeetingServiceCard() {
+  /* 2026-10-13 用户口径（第三张截图）：这块原来画的三样 ——「转写走哪条路」单选、
+     「调用许可」提示、「分离与声纹由谁做」两个下拉 —— 在「设置 → AI 组件 → 转写服务」
+     里已经有了（见 renderAiCardCommon 调的 renderMeetingBackendChoice），业务配置里
+     不再重复显示。本卡只剩 common 的「分段时长 / 音频存放」与「高级」两节。 */
+  return "";
+}
+
+/** 「转写走哪条路」单选（能力后端 / 网络服务商）—— 从「业务配置 → 会议」搬进
+ *  「设置 → AI 组件 → 转写服务」（2026-10-13 用户口径：一个选择只在一处）。
+ *  徽标是**状态**（就绪 / 没配密钥 / 未实现）不是说明，留；ⓘ 那段长说明不留。 */
+function renderMeetingBackendChoice() {
   const sel = capBackendValue();
   const radios = SET_MEETING_BACKENDS.map((b) => {
     const be = backendRow(b.value);
@@ -3810,13 +3731,11 @@ function renderMeetingServiceCard() {
          + `${b.value === sel ? " checked" : ""}`
          + `${b.unimplemented ? " disabled" : ""}><span>${esc(b.label)}</span>${badge}</label>`;
   }).join("");
+  /* 许可一致性徽标（从会议卡那行「调用许可」搬过来）：它是**状态**（一致 / 许可不允许），
+     不是说明文字；⚠️ 那句"只绑回环的本机后端不受这条限制 / ssh -L 隧道请选内网"必须留着
+     —— 地址分不出"本机服务"与"本机隧道"，用户很容易把许可卡在「不出机」上（2026-09-29 拍板）。 */
   const priv = String(settingValue("capabilityPrivacy", "lan") || "lan");
   let consistency = `<span class="sbadge ok">一致</span>`;
-  // 2026-09-29 用户拍板 A：**回环地址的后端判"本机"**（音频没离开这台机器），
-  // 所以「不出机」许可能用本机后端（`app/backend_setup.py` 起的就是这一档）；
-  // 但它**仍然挡住**内网/公网后端与在线转写。
-  // ⚠️ 地址分不出"本机服务"与"本机隧道"：把远端后端用 ssh -L 映射到本机回环的人，
-  // 请把许可设成「内网」（这句话必须写在用户看得到的地方，不能只活在代码注释里）。
   if (priv === "none") {
     consistency = `<span class="sbadge warn" title="出网许可是「不出机」：内网/公网的后端与在线转写都会被策略挡住。`
       + `只绑回环的本机后端（「帮我起本机后端」起的就是它）不受这条限制 —— 那是同一台机器上的进程。`
@@ -3825,22 +3744,9 @@ function renderMeetingServiceCard() {
   } else if (priv === "lan" && sel === "asr-provider") {
     consistency = `<span class="sbadge warn" title="「内网」许可不覆盖公网服务商">许可只到内网</span>`;
   }
-  const dia = String(settingValue("capabilityDiarizeBackend", "auto") || "auto");
-  const diaWhere = (SET_MEETING_BACKENDS.find((b) => b.value === dia) || {}).label || "自动（按默认链挑）";
   return sSub("转写走哪条路", `<div class="sras" data-setkey="capabilityMeetingAsrBackend">
-      ${radios}
-      <div class="snote info" style="margin-top:4px"><span>ⓘ</span><span>
-        <b>会议转写 = 转写 + 说话人分离 + 声纹识别</b>，三件一起，本地跑或走后端都一样
-        （"分两次调用"只是实现细节）。这一条单选管<b>转写</b>；下面两条定
-        <b>分离与声纹由谁做</b>（现在分离是 ${esc(diaWhere)}）。分离要是真跑不了，
-        会议详情会明说「说话人分离未执行：&lt;原因&gt;」——不会安静地少掉说话人。</span></div>
-    </div>
-    <div class="srow"><div class="lbl"><span class="lt" title="许可一致性">调用许可</span>
-      ${sHelp("「允许音频去哪」决定哪些后端根本不被考虑（见高级）。这里只做一致性提示。")}</div>
-      <div class="sctl">${consistency}</div>
-    </div>`)
-    + sSub("分离与声纹由谁做",
-           renderSettingRows(settingRows(["capabilityDiarizeBackend", "capabilityEmbedBackend"])));
+      ${radios}${consistency}
+    </div>`);
 }
 
 /* 2026-09-25：原来的 `renderBackendCard()` / `renderEchoBackendFace()` / `renderLocalBackendFace()`
@@ -4527,8 +4433,6 @@ document.addEventListener("change", async (e) => {
     if (mode.value === "net" && !_isLoopbackUrl(pairBase)) {
       const box = $("#capPairUrl");
       if (box) { try { box.focus(); } catch (err) { /* 聚焦失败无所谓 */ } }
-      const st = $("#capBackendModeState");
-      if (st) st.textContent = "贴入配对串（或填服务器地址 + 配对码）后点「配对」";
     }
     return;
   }
@@ -5807,9 +5711,7 @@ function renderMeetingItems(el, items, opts = {}) {
     // （`capability_admin.timestamps_summary`，与详情页同一份翻译、同一份快照）。
     // 老会议没记过 → `null` → 这一格不出现（不编"估算"）。
     const ts = full ? m.timestamps : null;
-    const tsTag = (ts && (ts.short || ts.label))
-      ? `<span class="m-ts" title="句级时间轴：${esc(ts.label || "")}">时间轴 ${esc(ts.short || ts.label)}</span>`
-      : "";
+
     // 录音/转写失败（PR #11 起会明确标 error）：显示**后端记下的真实原因**。
     //
     // 2026-09-25 改：原来这里是一句**硬编码**的"没录到音频：麦克风没打开（被占用/权限）
@@ -5825,26 +5727,33 @@ function renderMeetingItems(el, items, opts = {}) {
     // 数字**全部来自后端**（`meta.json` 里的真实前后字节），面板一个数都不自己算：
     // 估算值只在压缩前的预览里出现，两个数混在一起用户就分不清"预览"与"实况"了。
     const cp = m.compression;
+    // 2026-10-13（用户口径）：条目**精简** —— 只在 meta 那行留一个短标记 `↓49%`，
+    // 完整数字（原 / 现 / 省、原件删没删）收进 `title`：悬浮能看全，平时不占两行版面。
     const compTag = (cp && cp.beforeBytes)
-      ? `<span class="m-compress" title="音频已无损压缩为 FLAC${cp.deletedRaw ? "（原始 WAV 已删除）" : "（按「保留原始音频」设置未删原件）"}">已压缩：原 ${esc(cp.beforeText)} → 现 ${esc(cp.afterText)}（省 ${cp.savedPercent}%）</span>`
+      ? `<span class="m-compress" title="音频已无损压缩为 FLAC${cp.deletedRaw ? "（原始 WAV 已删除）" : "（按「保留原始音频」设置未删原件）"}：原 ${esc(cp.beforeText)} → 现 ${esc(cp.afterText)}（省 ${cp.savedPercent}%）">↓${cp.savedPercent}%</span>`
       : "";
-    // `已压缩` 也进 m-meta 那一行（列表窄的时候不至于撑宽卡片）
-    const compMeta = compTag ? `<div class="m-meta">${compTag}</div>` : "";
-    // 「看转写 ›」：直接落到详情页的**转写**页签（转写文本查看的入口）。
+    // 时间轴档位同理：只留一个小标记（精确 / 对齐 / 估算），完整说明在 `title` 里。
+    // 原来那句「时间轴 精确 × 6」里的 `× 6` 与 meta 行的「6 段」是同一个数，重复了。
+    const tsChip = (ts && (ts.short || ts.label))
+      ? `<span class="m-ts" title="句级时间轴：${esc(ts.label || "")}">${esc(ts.short || ts.label)}</span>`
+      : "";
+    // 「看转写 ›」：直接落到详情页的**转写**页签（转写文本查看的入口），与标题同行、靠右。
     // 导出（离线 HTML）沿用详情页右上角那颗按钮，**不在这里再造一个导出**。
     const acts = full
       ? `<div class="m-acts"><a class="m-open" data-open="${m.id}" data-tab="transcript">看转写 ›</a></div>`
       : "";
+    // 状态徽标**与标题同行**（原来它独占左侧一列，标题被推右、窄边条里很浪费）。
     return `<div class="meeting-item" data-id="${m.id}">
-      <span class="badge ${meetingBadgeCls(m.status)}">${MEETING_STATUS_TEXT[m.status] || STATUS_TEXT[m.status] || m.status}</span>
       <div class="grow">
-        ${nameHtml}
-        <div class="m-meta">${esc(started)} · ${fmtHM(dur)} · ${m.segments || 0} 段 ${hasSummary}${spkTag}</div>
-        ${tsTag ? `<div class="m-meta">${tsTag}</div>` : ""}
-        ${compMeta}
+        <div class="m-head">
+          ${nameHtml}
+          <span class="badge ${meetingBadgeCls(m.status)}">${MEETING_STATUS_TEXT[m.status] || STATUS_TEXT[m.status] || m.status}</span>
+          ${hasSummary}
+          ${acts}
+        </div>
+        <div class="m-meta">${esc(started)} · ${fmtHM(dur)} · ${m.segments || 0} 段${spkTag}${compTag}${tsChip}</div>
         ${txHtml}
         ${errHint}
-        ${acts}
       </div>
     </div>`;
   }).join("");
@@ -7280,8 +7189,13 @@ function onboardCard() {
     ov.id = "onboardOverlay";
     ov.setAttribute("role", "dialog");
     ov.setAttribute("aria-modal", "true");
+    // ⚠️ **建成隐藏**（`display:none`）：覆盖层只有 `onboardShow()` 能让它显形。
+    // 2026-10-12（用户实测："稳定版设置页面总是跳出首次启用向导"）：这里原来是 `display:flex`
+    // —— "把卡建出来"当场就等于"弹窗"，而 `bootView()` 与 `switchView("settings")` 都会建卡，
+    // 于是服务端判据（`shouldOnboard=false`，升级安装）根本没参与，向导每次开面板都盖上来。
+    // **建 ≠ 弹**：这两件事必须分开，见 `onboardEnsureCard()`。
     ov.style.cssText = "position:fixed;inset:0;z-index:9999;background:rgba(20,22,26,.72);"
-      + "display:flex;align-items:flex-start;justify-content:center;overflow:auto;padding:24px 12px";
+      + "display:none;align-items:flex-start;justify-content:center;overflow:auto;padding:24px 12px";
     ov.innerHTML = '<div class="card" id="onboardCard" style="max-width:820px;width:100%">'
       + '<div class="card-title">首次启用向导<span class="sbadge">3 步</span></div>'
       + '<div class="card-body">'
@@ -7350,7 +7264,14 @@ function onboardEnsureCard() {
   // 2026-10-11（用户实测："向导页一晃而过就进入设置页面了"）：向导卡**建出来了**，
   // 但设置页随后重绘 / 重新应用折叠状态，把它冲掉了 —— 用户只看到一闪。
   // 这个函数幂等：卡在就只重画内容，不在就重建。**任何会重绘设置页的路径之后都要调它。**
-  try { onboardCard(); renderOnboard(); } catch (e) { /* 建不出来就算了，别把面板弄挂 */ }
+  //
+  // 2026-10-12：**"确保卡在"不许等于"把它弹出来"** —— 这里只负责把内容备好（节点建成隐藏，
+  // 见 `onboardCard()`）。要不要盖在用户脸上只由两件事决定：服务端说要走向导（`_onboardNeeded`），
+  // 且用户没点过「去设置智能体」最小化。首屏/设置页反复弹向导的根因就在这里。
+  try {
+    onboardCard(); renderOnboard();
+    if (_onboardNeeded && !_onboardMinimized) onboardShow();
+  } catch (e) { /* 建不出来就算了，别把面板弄挂 */ }
 }
 
 function gotoOnboard(step) {
@@ -7359,6 +7280,18 @@ function gotoOnboard(step) {
   renderOnboard();
   onboardShow();
   if (card && card.scrollIntoView) card.scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+/** 「设置 → 安装向导」里那个看得见的手动入口（`#wizGoOnboard`）：接到**新三步向导**上。
+ *
+ *  2026-10-12 补：覆盖层改成"建成隐藏"之后（修掉"每次开面板都弹向导"），**入口必须显式给一处** ——
+ *  升级安装不自动弹、顶部横幅又刻意不渲染那个按钮（用户口径："入口在设置里就行"），
+ *  没有这条按钮，"设置里"就是句空话，只能靠 `?view=onboard` 深链。
+ *  节点是静态的（不在 `#setPaneSettings` 里，不会被重绘），所以用 `.onclick =` **幂等**赋值，
+ *  重复调用不会叠监听。 */
+function bindOnboardEntry() {
+  const go = $("#wizGoOnboard");
+  if (go) go.onclick = () => gotoOnboard(0);
 }
 
 function onboardStepBar() {

@@ -12,6 +12,7 @@ import os
 import re
 import sys
 import unittest
+from html.parser import HTMLParser
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -22,13 +23,62 @@ def _read(name):
     with open(os.path.join(_ROOT, "web", name), encoding="utf-8") as fh:
         return fh.read()
 
+
+# ---------------------------------------------------------------- 结构判据（html.parser）
+# 有几条判据只能按**结构**判（"这块有没有被 .muted 包住"、"两块是不是兄弟"）。
+# 数 `</div>` 那种写法在"少一个/多一个"时同样会数平 —— 2026-10-13 的事故就是这么发生的：
+# 那个 `<div class="muted">` 从未闭合，整块后端设置被吞进 12px 灰字，而文件里的 div 数**仍然平衡**。
+_VOID_TAGS = {"br", "input", "img", "meta", "link", "hr", "source", "col"}
+
+
+class _HtmlTree(HTMLParser):
+    """够用的解析器：记住每个 `id` 的**祖先链**，以及每段文字所在的位置。"""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.stack = []
+        self.by_id = {}
+        self.texts = []
+
+    def handle_starttag(self, tag, attrs):
+        d = dict(attrs)
+        if d.get("id"):
+            self.by_id[d["id"]] = list(self.stack)
+        self.stack.append((tag, (d.get("class") or "").split(), d.get("id") or ""))
+        if tag in _VOID_TAGS:
+            self.stack.pop()
+
+    def handle_startendtag(self, tag, attrs):
+        self.handle_starttag(tag, attrs)
+        if tag not in _VOID_TAGS:
+            self.handle_endtag(tag)
+
+    def handle_endtag(self, tag):
+        for i in range(len(self.stack) - 1, -1, -1):
+            if self.stack[i][0] == tag:
+                del self.stack[i:]
+                return
+
+    def handle_data(self, data):
+        t = data.strip()
+        if t:
+            self.texts.append((list(self.stack), t))
+
+
+def _inside(chain, cls):
+    return any(cls in classes for _tag, classes, _id in chain)
+
+
+def _chain(chain):
+    return " > ".join("%s%s" % (t, ("." + ".".join(c)) if c else "") for t, c, _i in chain)
+
 #: 这张卡里**要被人点的**元素（必须真接上事件，否则点了没反应）。
 #: 2026-09-25 移除了 `btnCapRouteSave`：转写/分离/声纹三项（+ 出网许可、后端地址）已经收进
 #: 本页顶部的「会议转写服务」卡（一个单选 + 一个「会议产出」下拉 = 原来那三个键），
 #: 那张卡的行随页签顶部的「保存」落库，所以这个"第二套下拉的保存按钮"被删掉了
 #: （删的是**元素本身**，不是放宽这条断言的意图：要点的东西仍然必须接线）。
 _WIRED_IDS = ("btnCapPair", "btnCapUnpair", "btnCapRouteProbe",
-              "capPairUrl", "capPairCode", "capPairState", "capBackendList",
+              "capPairUrl", "capPairHost", "capPairCode", "btnCapSetAddr", "capPairState", "capBackendList",
               "capRouteSettings", "capRouteBadge",
               # 「起本机后端」（2026-09-30，实施方案 §5 的批 1d）
               "btnCapBackendStart", "btnCapBackendStop", "btnCapBackendReady")
@@ -58,21 +108,23 @@ class CapabilityCardWiringTests(unittest.TestCase):
         missing = sorted(card_ids - self.html_ids - dyn_ids)
         self.assertEqual(missing, [], "JS 引用了 HTML 里不存在的 id：%s" % missing)
 
-    def test_the_backend_status_line_and_admin_link_are_rendered(self):
-        """**设置分家**的客户端那一半（2026-09-28，设计 §6.6）。
+    def test_the_backend_admin_link_is_rendered_and_the_hint_lives_in_a_title(self):
+        """**设置分家**的客户端那一半（2026-09-28，设计 §6.6；2026-10-13 第二轮收紧）。
 
-        客户端只给"状态 + 一个入口"：状态里的每个数字都来自后端 `/v1/health`，
-        管理面地址由后端宣告（`adminUrl`）。**客户端不展示也不编辑后端的设置**
-        （端口 / 显存预算 / 模型档位 / 配额 / TLS）—— 那些归后端的 `server.yaml` 与管理面，
-        在客户端再放一份就是"两处都能改、改完不知道谁生效"。
-
-        远程后端那一条必须如实说清"为什么点不开"：管理面只发布在**后端那台机器**的回环上。
+        客户端只给**一个入口**：管理面地址由后端宣告（`adminUrl`），客户端不猜端口、
+        也不展示/编辑后端的设置（端口 / 显存 / 档位 / 配额 / TLS 全归后端 `server.yaml`
+        与管理面）。**远程后端"怎么进去"那句（管理面只发布在它那台机器的回环上）挂
+        `title`** —— 2026-10-13 用户口径："仅保留配置项，说明性文字都不需要展示"。
         """
-        self.assertIn("capBackendHealthLine", self.js)
         self.assertIn("capBackendAdminRow", self.js)
         self.assertIn("adminUrl", self.js, "深链要读后端宣告的地址，不许猜端口")
-        self.assertIn("ssh -L 8901:127.0.0.1:8901", self.js,
-                      "远程后端要给出进管理面的办法，而不是留一个点不开的链接")
+        # 2026-10-13：远端后端**不再展示**管理面入口（点不开），所以那句 ssh 办法也从
+        # app.js 里拿掉了 —— 这里只钉"入口只在本地后端出现"（见下面那条）。
+        row = self.js[self.js.index("function capBackendAdminRow("):]
+        row = row[:row.index("\n}\n") + 3]
+        self.assertIn("title=", row, "那句说明必须在 title 里")
+        self.assertNotIn("capBackendHealthLine", self.js,
+                         "版本/显存/模型数那行健康数字已按新口径下线")
 
     def test_the_things_people_click_are_actually_wired(self):
         """反过来：卡里要被人点的元素，JS 必须真的引用它。
@@ -214,6 +266,59 @@ class CapabilityCardWiringTests(unittest.TestCase):
         """没配对时不该有一个"解除配对"按钮杵在那儿。"""
         self.assertIn('class="btn hidden" id="btnCapUnpair"', self.html)
 
+    def test_pair_and_unpair_share_one_slot(self):
+        """**配对 / 解除配对 / 保存 在同一行**（2026-10-13 用户口径）。
+
+        三行结构：① 配对串；② 地址（单独一行 —— 与配对码挤一行时窄边条里会折成三行）；
+        ③ 配对码 + 「配对 / 解除配对」+「保存」（保存 = 只改地址，保留凭据）。
+        JS 按"配没配上"二选一显示配对与解除配对（原来两个同时可见，看着像两个功能）。
+        """
+        box = self.html[self.html.index('id="capPairBox"'):]
+        rows = box.split('class="cap-pair-row"')[1:]
+        self.assertGreaterEqual(len(rows), 3, "配对框三行：配对串 / 地址 / 配对码+按钮")
+        self.assertIn("capPairUrl", rows[0], "配对串要**单独一行**")
+        self.assertNotIn("capPairCode", rows[0], "配对码不该和配对串挤在一起")
+        self.assertIn("capPairHost", rows[1], "地址单独一行")
+        self.assertIn("capPairCode", rows[2], "配对码与按钮一行")
+        self.assertIn("btnCapPair", rows[2])
+        self.assertIn("btnCapUnpair", rows[2])
+        self.assertIn("btnCapSetAddr", rows[2], "「保存」（只改地址）要和它们同一行")
+        self.assertIn(">保存</button>", rows[2], "按钮文案是「保存」")
+        body = self.js[self.js.index("function applyTranscribeSettingsVisibility("):]
+        body = body[:body.index("\n}\n") + 3]
+        self.assertIn('bPair.classList.toggle("hidden", paired)', body)
+        self.assertIn('bUnpair.classList.toggle("hidden", !paired)', body)
+
+    def test_the_paired_address_is_shown_in_the_address_fields(self):
+        """配对完成后：地址行回填后端地址，`后端地址`那栏展示配对到的网址:端口（只展示）。"""
+        body = self.js[self.js.index("function applyTranscribeSettingsVisibility("):]
+        body = body[:body.index("\n}\n") + 3]
+        self.assertIn("capPairHost", body, "地址行要回填")
+        self.assertIn("pairBase", body)
+        # 2026-10-13 用户："留上面的就行" —— `后端地址`（capabilityEchoServerUrl）那栏去掉，
+        # 换地址改由配对行里的「改地址」按钮承担（保留凭据，不重新配对）。
+        self.assertNotIn("set-capabilityEchoServerUrl", body)
+        self.assertIn("btnCapSetAddr", body, "配对后要出现「改地址」按钮")
+
+    def test_the_admin_link_only_shows_for_a_local_backend(self):
+        """「打开后端管理面」只在**本地后端**（回环）时展示（2026-10-13 用户口径）。"""
+        row = self.js[self.js.index("function capBackendAdminRow("):]
+        row = row[:row.index("\n}\n") + 3]
+        self.assertIn("if (!loop) return", row, "远端后端不许摆一个点不开的入口")
+
+    def test_the_two_mandatory_backend_rows_are_no_longer_config_items(self):
+        """「分离与声纹由谁做」是必备内容，不再是配置项 —— 转写卡里那份去掉。
+
+        它的家仍在「业务配置 → 会议」卡（`tests/test_ia_panel.py` 钉着"会议卡一处"），
+        所以这里判**只剩一处**。
+        """
+        self.assertEqual(self.js.count('sSub("分离与声纹由谁做"'), 0,
+                         "两侧都不该再有它（会议标配，不是配置项）")
+        # 2026-10-13：不再多套一层「后端设置」—— 静态卡直接落进转写服务下的占位，
+        # 卡自己的标题就叫「后端设置」。
+        self.assertNotIn('sSub("后端设置"', self.js)
+        self.assertIn('<div id="capBackendHost"></div>', self.js)
+
 
 class BackendOneClickWiringTests(unittest.TestCase):
     """「起本机后端」那张小卡的接线（2026-09-30，实施方案 §5 的批 1d）。
@@ -240,7 +345,7 @@ class BackendOneClickWiringTests(unittest.TestCase):
     def test_the_card_has_every_element_it_reaches_for(self):
         for el in ("btnCapBackendStart", "btnCapBackendStop", "btnCapBackendReady",
                    "btnCapBackendCompose", "capBackendState", "capBackendJob",
-                   "capBackendPlan", "capBackendReady", "capBackendNotes"):
+                   "capBackendPlan", "capBackendNotes"):
             with self.subTest(id=el):
                 self.assertIn('id="%s"' % el, self.html, "HTML 里没有这个元素")
                 self.assertIn(el, self.js_ids, "HTML 里有，但 JS 从来没引用它")
@@ -261,48 +366,50 @@ class BackendOneClickWiringTests(unittest.TestCase):
         render = self._fn("renderBackendOneClick")
         self.assertIn("_capBackendPath", render)
         self.assertIn("btnCapBackendCompose", render)
-        self.assertIn("_capBackendPath = String(p.path", self._fn("renderBackendPlan"))
+        self.assertIn("_capBackendPath = String((p || {}).path", self._fn("renderBackendPlan"))
 
-    def test_the_ready_line_is_rendered_from_the_servers_last_result(self):
-        """三层就绪（批 3）：面板显示**服务端保留的上一次结论**，不自己再跑一遍真推理。"""
-        render = self._fn("renderBackendReady")
-        for token in ("headline", "state", "at"):
-            self.assertIn(token, render, "就绪那一行没读服务端的 %s" % token)
-        self.assertIn("renderBackendReady(be.ready)", self._fn("renderBackendOneClick"))
-        self.assertIn("自测中", self._fn("doCapabilityBackendReady"),
-                      "自测是一次真推理，点了要给等待反馈")
-
-    def test_the_panel_shows_the_read_only_plan_before_anything_is_clicked(self):
-        """批 2 的只读计划：**点按钮之前**就要看得见走哪条路、缺什么、先验哪一步。
-
-        （"没有 Docker 的机器点按钮得到的是扩展包路计划"这条验收，落在界面上就是这一格。）
-        """
+    def test_the_ready_result_is_reported_by_a_toast(self):
+        """三层就绪（批 3）：仍是**服务端跑的那一次真推理**，但结果不再平铺一行
+        （2026-10-13 第二轮：卡片里只留配置项）—— 改走 toast，也不许面板自己再跑一遍。"""
+        self.assertNotIn("renderBackendReady", self.js)
+        body = self._fn("doCapabilityBackendReady")
+        self.assertIn("toast(", body)
+        self.assertIn("/api/capability/backend/ready", body)
+    def test_the_plan_is_still_fetched_but_renders_nothing(self):
+        """批 2 的只读计划仍在拉（按钮显隐靠它），但**卡片里不再渲染计划文字**
+        —— 2026-10-13 第二轮用户口径："仅保留配置项，说明性文字都不需要展示"。
+        "起不了为什么"由按钮 `title` 负责（见 `BackendCardHasNoFlatProseTests`）。"""
         self.assertIn("/api/capability/backend/plan", self.js)
         self.assertIn('id="capBackendPlan"', self.html)
         body = self.js[self.js.index("async function loadCapabilityRouting("):]
         body = body[:body.index("\n}\n") + 3]
         self.assertIn("loadBackendPlan()", body)
         render = self._fn("renderBackendPlan")
-        for token in ("missing", "notes", "verify", "reasons"):
-            self.assertIn(token, render, "计划渲染没读 %s" % token)
-
+        self.assertIn("_capBackendPath", render, "按钮显隐还要看计划")
+        for gone in ("missing", "notes", "verify", "reasons", "capDetails("):
+            self.assertNotIn(gone, render, "计划还在渲染 %r" % gone)
     def test_the_status_is_loaded_with_the_capability_tab(self):
         """`loadCapabilityRouting()` 里要真的去拉这张卡的状态 —— 否则它永远是空的。"""
         body = self.js[self.js.index("async function loadCapabilityRouting("):]
         body = body[:body.index("\n}\n") + 3]
         self.assertIn("loadBackendOneClick()", body)
 
-    def test_the_progress_lines_come_from_the_servers_job(self):
-        """进度**逐条来自服务端的 `job`**，面板不自己编"正在启动中…"那种没有信息量的话。
+    def test_the_progress_is_not_rendered_and_the_reason_hangs_on_the_button(self):
+        """进度**不再平铺**（2026-10-13 第二轮口径），但"为什么起不了"要够得着。
 
-        （"界面说在起、其实早失败了"就是各写一套话术的必然结果。）
+        判据三条：
+          * 逐条进度与折叠块一起下线（`capBackendJobLines` / `capDetails("job"` 都不在）；
+          * 服务端的 `job` 仍被读 —— 用它决定按钮禁用与**完成/失败的 toast**；
+          * 真起不来时把 `be.notes`（"为什么"）挂到**按钮的 `title`** 上（悬浮可见）。
         """
-        body = self._fn("capBackendJobLines")
-        for token in ("job.steps", "stage"):
-            self.assertIn(token, body, "进度渲染没读服务端的 %s" % token)
+        self.assertNotIn("capBackendJobLines", self.js)
         render = self._fn("renderBackendOneClick")
         for token in ("job.running", "job.doneAt", "job.message"):
             self.assertIn(token, render, "渲染没读服务端的 %s" % token)
+        self.assertIn("be.notes", render)
+        self.assertIn("btn.title", render, "起不了的原因要挂在按钮的 title 上")
+        self.assertNotIn("capDetails(", render)
+        self.assertIn('jobHost.innerHTML = ""', render, "进度容器要清空")
 
     def test_the_stop_button_starts_hidden(self):
         """没在跑的时候不该有一个"停掉它"杵在那儿（与服务端 `running` 一起决定显隐）。"""
@@ -437,6 +544,137 @@ class PanelStateDeclarationTests(unittest.TestCase):
                          "这些面板状态名字**没声明**就被赋值了（严格模式下会当场抛 "
                          "ReferenceError，异常多半被 try 吞成一句「读不到…」）：%s"
                          % undeclared)
+
+
+class BackendCardStaysTerseTests(unittest.TestCase):
+    """「AI 组件 → 转写服务 → 后端设置」不摊长解释（2026-10-13 用户口径）。
+
+    用户原话："后端设置的内容太臃肿了，不用那么多解释，必要的说明也要用问号标记悬浮展示"。
+    所以这一块钉三件事：
+
+      1. 说明走**问号浮窗**（`.sq` + `.spop`）—— 仓库现成的样式与全局点击委托，
+         悬浮或点一下都出得来，不新增机制；
+      2. 卡片里的**裸文字都是短的**（控件名 / 状态 / 占位符），长句必须在 `.spop` 里；
+      3. `#capBackendModeRow` 等控件**不许被 `.muted` 包住** —— 2026-10-13 顺手挖出来的事故：
+         那块说明的 `<div class="muted" style="font-size:12px">` **从未闭合**，把整个后端设置
+         （单选、配对框、启停按钮、plan/notes）全吞进了 12px 灰字里，句子还断在半截
+         （"…交给一台带显卡的"）。这条按**结构**判，不靠数 `</div>`。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.html = _read("index.html")
+        cls.tree = _HtmlTree()
+        cls.tree.feed(cls.html)
+        cls.tree.close()
+
+    def _region(self):
+        return self.html[self.html.index('id="capRouteCard"'):self.html.index('id="capLocalCard"')]
+
+    def test_the_explanations_live_in_question_mark_popovers(self):
+        region = self._region()
+        self.assertGreaterEqual(region.count('class="spop"'), 2,
+                                "这块的说明要收进 `?` 浮窗（用户 2026-10-13 的口径）")
+        self.assertIn('class="sq"', region, "浮窗要有问号触发器")
+        # 不再平铺：这两句原来就是裸着的长说明
+        self.assertNotIn("整串粘在下面第一个框里即可", region, "这句该进浮窗了")
+        self.assertIn("整串粘在第一个框里即可", region, "浮窗里要留一句能看懂的（配对串怎么用）")
+
+    def test_no_long_bare_prose_is_left_in_the_card(self):
+        region = self._region()
+        ids = set(re.findall(r'id="([A-Za-z0-9_-]+)"', region))
+        self.assertTrue(ids, "卡片区没解析出 id，锚点变了？")
+        offenders = []
+        for chain, text in self.tree.texts:
+            if not any(i in ids for _t, _c, i in chain):
+                continue
+            if _inside(chain, "spop"):
+                continue
+            if len(text) > 40:
+                offenders.append(text[:60])
+        self.assertEqual(offenders, [],
+                         "卡片里还有裸着的长说明（要收进 `?` 浮窗）：%s" % offenders)
+
+    def test_the_controls_are_not_buried_in_a_muted_wrapper(self):
+        for el in ("capBackendModeRow", "capPairSettings", "capLocalSettings"):
+            chain = self.tree.by_id.get(el)
+            self.assertIsNotNone(chain, "index.html 里没有 #%s" % el)
+            self.assertFalse(_inside(chain, "muted"),
+                             "#%s 被 .muted 包住了 —— 整块会变成小号灰字（2026-10-13 的事故）" % el)
+
+    def test_pair_and_local_blocks_are_siblings(self):
+        """两块必须是**兄弟**（同一个父节点）。
+
+        历史事故（2026-09-25，`tests/test_js_syntax.py` 也记着）：`#capLocalSettings` 被错手
+        塞进了「解除配对」按钮里、还套在 `#capPairSettings` 内 —— 于是"本机"那一组在
+        两种状态下都显示不出来，而代码看着"没问题"。
+        """
+        a = self.tree.by_id["capPairSettings"]
+        b = self.tree.by_id["capLocalSettings"]
+        self.assertEqual(a[:-1], b[:-1],
+                         "这两块不是兄弟 —— 显示条件会互相打架：\n  %s\n  %s"
+                         % (_chain(a[:-1]), _chain(b[:-1])))
+
+
+class BackendCardHasNoFlatProseTests(unittest.TestCase):
+    """「后端设置」卡片**只留配置项**，说明性文字一律不平铺（2026-10-13 第二轮用户口径）。
+
+    用户原话："后端设置卡片还需要进一步简化，仅保留配置项就行，说明性文字都不需要展示"。
+    上一轮已经把长解释收进 `?` 浮窗、把过程收进折叠块；这一轮**连折叠块也不要了** ——
+    卡片里只留控件（模式单选 / 配对输入 / 配对·检测·启停·compose·自测 / 管理面入口）
+    与状态徽标。信息去哪儿了：控件的 `title`（悬浮）、`?` 浮窗、以及 toast（结果/失败）。
+
+    这里钉四条：
+      1. 状态行 / 进度 / 步骤 / 说明 / 计划**都不再渲染**（容器保留但清空）；
+      2. "为什么起不了"进按钮 `title`（否则用户点完只有一个禁用按钮，什么都不知道）；
+      3. 计划只用来决定按钮显隐（容器路才出「生成 compose」），不渲染任何文字；
+      4. 折叠块机制（`capDetails` / `bindCapDetails`）随之下线 —— 没有内容可折了。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.js = _read("app.js")
+        cls.html = _read("index.html")
+
+    def _fn(self, name):
+        body = self.js[self.js.index("function %s(" % name):]
+        return body[:body.index("\n}\n") + 3]
+
+    def test_the_prose_containers_are_cleared_not_filled(self):
+        body = self._fn("renderBackendOneClick")
+        self.assertIn('state.textContent = ""', body, "状态行要清空")
+        self.assertIn('jobHost.innerHTML = ""', body, "进度要清空")
+        self.assertIn('notesHost.innerHTML = ""', body, "说明要清空")
+        for gone in ("capDetails(", "job.stage", "✓ 完成", "端口 ${ports}"):
+            self.assertNotIn(gone, body, "卡片里还在平铺 %r" % gone)
+
+    def test_the_blocked_reason_hangs_on_the_button(self):
+        body = self._fn("renderBackendOneClick")
+        self.assertIn("be.whyNot", body)
+        self.assertIn("notes.join", body)
+        self.assertIn("btn.title", body)
+
+    def test_the_plan_only_drives_button_visibility(self):
+        body = self._fn("renderBackendPlan")
+        self.assertIn("_capBackendPath", body, "按钮显隐还要跟着计划走")
+        self.assertIn('host.innerHTML = ""', body, "计划那行文字不再渲染")
+        for gone in ("capDetails(", "计划：", "etaMinutes"):
+            self.assertNotIn(gone, body, "计划还在渲染 %r" % gone)
+
+    def test_the_ready_result_is_a_toast_not_a_line(self):
+        self.assertNotIn("renderBackendReady", self.js, "就绪结论那一行已下线（改走 toast）")
+        body = self._fn("doCapabilityBackendReady")
+        self.assertIn("toast(", body, "自测结果必须仍然报出来（只是改走 toast）")
+
+    def test_the_collapsed_block_mechanism_is_gone(self):
+        for fn in ("capDetails", "bindCapDetails"):
+            self.assertNotIn("function %s(" % fn, self.js, "%s 已随折叠块下线" % fn)
+        self.assertNotIn("_capOpenBlocks", self.js)
+
+    def test_the_mode_row_no_longer_writes_a_state_sentence(self):
+        self.assertNotIn("capBackendModeState", self.js)
+        self.assertNotIn("capBackendModeState", self.html,
+                         "那个状态 span 已从静态卡里删掉")
 
 
 if __name__ == "__main__":

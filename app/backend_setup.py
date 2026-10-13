@@ -582,7 +582,7 @@ def pair_if_needed(*, port: int = backend_proc.DEFAULT_PORT,
                           % (current.base_url, current.client_id))
         if not replace:
             return False, ("这台机器现在配对的是 %s（不是本机后端）—— 要用本机后端请先"
-                           "「解除配对」，或明确选择覆盖它" % (current.base_url or "（没有地址）"))
+                           "「解绑」，或明确选择覆盖它" % (current.base_url or "（没有地址）"))
     path = pair_file_path()
     if not os.path.isfile(path):
         return False, "本机配对文件还不存在（%s）—— 后端起来了吗？" % path

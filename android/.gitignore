@@ -1,0 +1,17 @@
+# Android / Gradle 构建产物
+.gradle/
+build/
+app/build/
+captures/
+
+# 本机专属：SDK 路径（每台机器不一样，不进版本库）
+local.properties
+
+# IDE
+.idea/
+*.iml
+.DS_Store
+
+# 签名材料（真要用时自己放，绝不入库）
+*.jks
+*.keystore

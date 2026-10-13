@@ -272,6 +272,48 @@ if ($DryRun) {
     Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
 }
 
+# ---- 4b) record the install mode -------------------------------------------
+# 2026-10-12 why this exists: deploying into an EXISTING install IS an upgrade, but this path
+# never recorded that - <data>\install-mode.json stayed missing, so the panel had no install
+# mode to read and had to GUESS "fresh vs upgrade" from the content it happened to find. On
+# the user's machine the guess came out right (there was data), but the state was never
+# written down, and the missing flag kept the question "is this a fresh install?" open.
+# Same file, same format and same probe as install-all.ps1's Invoke-InstallModeProbe, so the
+# panel (/api/install/mode) and the first-run wizard read ONE truth. `fresh` only when the
+# destination really is empty (a first install into an empty dir).
+$destData = Join-Path $DestDir 'data'
+$hasDsh = $false
+foreach ($p in @((Join-Path $DestDir 'dsh\home'), (Join-Path $destData 'harness'))) {
+    foreach ($n in @('settings.yaml', '.credentials.yaml', 'skills', 'sessions')) {
+        if (Test-Path -LiteralPath (Join-Path $p $n)) { $hasDsh = $true }
+    }
+}
+$hasDb = Test-Path -LiteralPath (Join-Path $destData 'echo.db')
+$meetings = 0
+foreach ($m in @((Join-Path $DestDir 'meeting'), (Join-Path $destData 'meetings'))) {
+    if (Test-Path -LiteralPath $m) {
+        $meetings += @(Get-ChildItem -LiteralPath $m -Directory -ErrorAction SilentlyContinue).Count
+    }
+}
+$deployMode = if ($hasDsh -or $hasDb -or ($meetings -gt 0)) { 'upgrade' } else { 'fresh' }
+if ($DryRun) {
+    Say "  [dry] would write $destData\install-mode.json (mode=$deployMode)"
+} else {
+    try {
+        New-Item -ItemType Directory -Force -Path $destData | Out-Null
+        $modeJson = ([ordered]@{ mode = $deployMode
+                                 note = ("deploy-stable: dsh={0} db={1} meetings={2}" -f $hasDsh, $hasDb, $meetings)
+                                 at = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') } | ConvertTo-Json)
+        # No BOM on purpose: ECHO reads this file as UTF-8, and PS 5.1's
+        # Set-Content -Encoding UTF8 would prepend one (same note as install-all.ps1).
+        [System.IO.File]::WriteAllText((Join-Path $destData 'install-mode.json'), $modeJson,
+                                       (New-Object System.Text.UTF8Encoding($false)))
+        Ok "install mode recorded: $deployMode"
+    } catch {
+        Warn2 "could not write install-mode.json: $($_.Exception.Message)"
+    }
+}
+
 # ---- 5) verify the target --------------------------------------------------
 $destPy = Join-Path $DestDir 'runtime-core\Scripts\python.exe'
 if (-not (Test-Path -LiteralPath $destPy)) { $destPy = Join-Path $DestDir 'runtime-core\python.exe' }

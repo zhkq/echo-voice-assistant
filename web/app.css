@@ -597,6 +597,14 @@ select.ctl { text-overflow: ellipsis; }
 .meeting-item .m-acts { margin-top: 5px; min-width: 0; }
 .meeting-item .m-open { color: var(--accent); font-size: 12px; cursor: pointer; white-space: nowrap; }
 .meeting-item .m-open:hover { text-decoration: underline; }
+/* 2026-10-13（用户口径）：会议条目**精简美化** —— 状态徽标与标题同行、右侧直接放「看转写 ›」，
+   日期/时长/段数/人数 + 两个短标记挤一行。原来徽标独占左侧一列，下面还各占一行
+   「时间轴 精确 × N」「已压缩：原 … → 现 …（省 …%）」（这两行的完整内容现在收进 title）。 */
+.meeting-item .m-head { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.meeting-item .m-head .m-name { min-width: 0; flex: 0 1 auto; }
+.meeting-item .m-head > .badge { flex: 0 0 auto; }
+.meeting-item .m-head .m-acts { margin: 0 0 0 auto; }
+.meeting-item .m-meta { display: flex; flex-wrap: wrap; align-items: baseline; }
 /* 指令历史多出来的那一行：耗时 / 后端 / 来源（2026-09-26 第二轮） */
 .cmd-item .cmd-detail { color: var(--muted); font-size: 11.5px; margin: 2px 0 4px;
   overflow-wrap: anywhere; min-width: 0; }
@@ -1183,10 +1191,28 @@ body.on-history { height: 100vh; overflow-y: hidden; }
    默认 min-width:auto 会被内容顶住不让收缩）。 */
 .cap-pair-row { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; min-width: 0; padding: 6px 0; }
 .cap-pair-row > .ctl { min-width: 0; max-width: 100%; }
+/* 配对行里的**地址**要够宽：上面那条 `min-width: 0` 的优先级高于 `.grow` 的 160px，
+   于是地址框被挤瘪到只剩几十像素 —— 2026-10-13 用户截图里那一格只露出 "00"
+   （回填地址 `…:8900` 的尾巴，看着像另一个莫名其妙的输入框）。id 选择器优先，压住它。 */
+#capPairHost { flex: 1 1 180px; min-width: 150px; }
 .cap-be-row { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; min-width: 0;
   padding: 6px 0; border-top: 1px solid var(--border); }
 .cap-be-row > .cap-be-name { font-weight: 600; min-width: 0; }
 .cap-be-slots { font-size: 12px; color: var(--muted); min-width: 0; }
+
+/* 「细节」折叠：后端设置那一片的**过程与前置条件**都收在这里（2026-10-13 用户口径：
+   "这些内容不是必须的"）。平铺只留结论，点开才占版面；折叠状态由 JS 记住
+   （`_capOpenBlocks`）——否则 1.5 秒一次的进度轮询会把 innerHTML 重建，用户刚点开就自己合上。 */
+.cap-more { margin: 2px 0 0; }
+.cap-more > summary { cursor: pointer; color: var(--muted); font-size: 11px; list-style: none;
+  display: inline-block; padding: 1px 0; }
+.cap-more > summary::-webkit-details-marker { display: none; }
+.cap-more > summary::before { content: "▸ "; }
+.cap-more[open] > summary::before { content: "▾ "; }
+.cap-more > summary:hover { color: var(--accent); }
+.cap-more .cap-more-body { margin: 1px 0 4px 12px; color: var(--muted); font-size: 11.5px;
+  line-height: 1.6; min-width: 0; overflow-wrap: anywhere; }
+.cap-more .cap-more-body code { font-size: 11px; }
 
 /* ---------- 设置区 v3（2026-09-25 重设计 · 边条优先）------------
    规格：`docs/设置项归属表.md`（106 项逐条落点）+ `docs/设置页重设计-样张.html`（视觉）。

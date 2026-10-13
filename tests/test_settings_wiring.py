@@ -801,8 +801,10 @@ class OptionAndPanelWiringTests(unittest.TestCase):
             落库交给卡内的「保存」（`saveRouter()` → `collectSettingValues("#rtSetHost")`）。
           * 2026-09-26：**会议能力通道那 3 项搬出这张卡** ——
             用户把"转写走哪条路"归进了「业务配置 → 会议」（一个实体只有一处状态），
-            所以 `#rtCapHost` 连同 `RT_SAVE_HOSTS` 里的第二个 host 一起撤掉，
-            那两项设置（分离 / 声纹由谁做）改由 `renderMeetingServiceCard()` 画在会议卡里。
+            所以 `#rtCapHost` 连同 `RT_SAVE_HOSTS` 里的第二个 host 一起撤掉。
+            （2026-10-13 再次搬动：用户看图指出业务配置那块与设置页重复 →
+            「转写走哪条路」改由 `renderAiCardCommon()` 画在「设置 → AI 组件 → 转写服务」；
+            「分离与声纹由谁做」是会议标配，不再是配置项，两侧都不再渲染。）
             卡内「保存」现在只收 `#rtSetHost` 一处。
           * 2026-10-02（IA 重构）：**承载它的页签**从「能力与智能体」并进顶层「设置」
             （`id="view-settings"`，`#view-capability` 已删除）。这条用例里两处

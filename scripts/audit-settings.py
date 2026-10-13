@@ -115,6 +115,11 @@ ACK_INDIRECT = {
     # `friendlyOption()` 按**键名**给这三个后端取值出中文名（`key === "capabilityDiarizeBackend"`）。
     # 面板那一处是**直接**读，`verdict()` 的优先级里 direct 面板读压过 app 间接读，
     # 于是这三项判成 PANEL-READ —— 名单也要跟着搬（见 `ACK_PANEL`）。
+    # 2026-10-13：capabilityMeetingAsrBackend / capabilityDiarizeBackend /
+    # capabilityEmbedBackend **已从这份名单里搬走** —— 它们的判据变了（不再是"面板间接读"）：
+    # 「转写走哪条路」改由「设置 → AI 组件 → 转写服务」直接画（`renderMeetingBackendChoice`），
+    # 分离/声纹两项是会议标配、不再是配置项（两侧都不渲染）。名单里多留一项 = 掩护一处真的漏读。
+
     # 这正是这份名单的防腐机制：判据变了就搬位置，而不是两边都留着。
     # capabilityPrivacy **已经不在这里**（2026-09-24）：闸报"已不再是间接读，请从名单里删掉"。
     # 原因是它现在有一处**直接字面量**读法（app/capability_admin.py 的 `_setting("capabilityPrivacy")`），
@@ -143,12 +148,11 @@ ACK_PANEL = {
     # 但面板这一处是**直接**读，`verdict()` 里 direct 面板读优先，所以判 PANEL-READ、
     # 登记在这里。**下一个人注意**：这三项不是"只有面板在读"，
     # 真消费方仍是路由（`ACK_INDIRECT` 顶上那段注释记着这件事）。
-    "capabilityMeetingAsrBackend": "web/app.js:friendlyOption() 出「ECHO 后端/本机/网络服务商」中文名；"
-                                   "app 侧见 router._setting_key_for()（asr.text / asr.timestamps 用哪个后端）",
-    "capabilityDiarizeBackend": "web/app.js:friendlyOption() 出「自动/ECHO 后端/本机」中文名；"
-                                "app 侧见 router._setting_key_for()（说话人分离用哪个后端）",
-    "capabilityEmbedBackend": "web/app.js:friendlyOption() 出「自动/ECHO 后端/本机」中文名；"
-                              "app 侧见 router._setting_key_for()（说话人嵌入用哪个后端）",
+    #
+    # 2026-10-13：这三项**已从这份名单搬走**（判据变了，见上面那条纪律）——
+    # 「转写走哪条路」改由「设置 → AI 组件 → 转写服务」直接画
+    # （`renderMeetingBackendChoice()`）；分离/声纹两项是会议标配、不再是配置项
+    # （两侧都不再渲染）。名单里多留一项 = 掩护一处真的漏读。
 }
 
 

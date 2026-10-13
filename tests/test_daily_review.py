@@ -585,5 +585,222 @@ class ApiTests(_Base):
         self.assertEqual(called, [], "在录会议时不该去抢麦克风")
 
 
+class PreflightTests(unittest.TestCase):
+    """前置环节（技能第 0 步）：串行、先出声、主动探测、**绝不卡死**（2026-10-13 用户口径）。"""
+
+    def _isolate(self):
+        from unittest.mock import patch
+        return patch.multiple(
+            daily_review,
+            ready=lambda: (True, ""),
+            ensure_access=lambda *a, **k: (True, ""),
+            ensure_session=lambda *a, **k: ("S1", "W1", {"workspace": "W1"}),
+            vault_root=lambda: "V",
+        )
+
+    def test_the_pre_prompt_follows_skill_step_0_and_never_carries_a_transcript(self):
+        p = daily_review.build_pre_prompt(vault="V")
+        for token in ("前置环节", "第 0 步", "scan_cache.py", "会议记录", "静默"):
+            with self.subTest(token=token):
+                self.assertIn(token, p, "前置指令要照着技能的第 0 步写")
+        self.assertNotIn("{transcript}", p, "前置环节跑在口述**之前**，不该有口述占位符")
+        self.assertIn("V", p, "占位符要替换")
+
+    def test_the_ack_says_what_starts_and_how_long(self):
+        a = daily_review.pre_ack_text(60)
+        self.assertIn("企微", a)
+        self.assertIn("会议纪要", a)
+        self.assertIn("一分钟", a, "要说预估时长")
+        self.assertIn("6 分钟", daily_review.pre_ack_text(360))
+
+    def test_preflight_speaks_first_then_probes_until_the_turn_is_done(self):
+        class C:
+            def __init__(self):
+                self.prompts = []
+                self.polls = 0
+
+            def prompt(self, sid, text):
+                self.prompts.append((sid, text))
+
+            def wait_for_reply(self, sid, timeout=0):
+                self.polls += 1
+                if self.polls < 2:
+                    return ("", False)          # 还在扫，什么回复都还没有
+                # 第二次探测才等到**完成标记**（`done` 本身不算数，见 PRE_DONE_MARK）
+                return ("前置环节完成：文件 3（专项 1）、会议 1（例会 0）", True)
+
+        c = C()
+        ack = []
+        with self._isolate():
+            out = daily_review.preflight(client=c, on_ack=ack.append)
+        self.assertTrue(out["finished"], out)
+        self.assertTrue(out["ok"])
+        self.assertEqual(len(ack), 1, "开场必须先出声（用户要知道有没有触发）")
+        self.assertIn("前置环节", c.prompts[0][1], "要往当天会话发前置指令")
+        self.assertGreaterEqual(c.polls, 2, "要主动探到本轮做完为止")
+
+    def test_a_turn_that_ends_without_the_marker_gets_nudged_not_accepted(self):
+        """**判完成只认显式标记**（2026-10-13 实测：`done` 在 35.5s 就到了，素材还在扫）。
+
+        技能 0-0 要求智能体先回一句开场确认 —— 它很可能就在那一轮结束。所以：
+        本轮结束但没带「前置环节完成」→ 追问让它接着做；直到标记出现才算完。
+        """
+        class C:
+            def __init__(self):
+                self.prompts = []
+
+            def prompt(self, sid, text):
+                self.prompts.append(text)
+
+            def wait_for_reply(self, sid, timeout=0):
+                if len(self.prompts) < 2:
+                    return ("好，我先扫一下今天的文件和会议，大概需要一分钟。", True)
+                return ("前置环节完成：文件 5（专项 2）、会议 2（例会 1）", True)
+
+        c = C()
+        with self._isolate():
+            out = daily_review.preflight(client=c)
+        self.assertTrue(out["finished"], out)
+        self.assertEqual(len(c.prompts), 2, "第一轮没带标记 → 要追问一次")
+        self.assertIn("前置环节完成", c.prompts[1], "追问里要写清完成标记")
+        self.assertEqual(out.get("nudges"), 1)
+
+    def test_preflight_never_hangs_when_the_probe_breaks(self):
+        class C:
+            def prompt(self, sid, text):
+                pass
+
+            def wait_for_reply(self, sid, timeout=0):
+                raise RuntimeError("探测炸了")
+
+        with self._isolate():
+            out = daily_review.preflight(client=C())
+        self.assertFalse(out["finished"])
+        self.assertIn("探测", out["error"])
+        self.assertEqual(daily_review.pre_state()["phase"], "timeout")
+
+    def test_preflight_reports_not_ready_instead_of_raising(self):
+        from unittest.mock import patch
+        with patch.object(daily_review, "ready", lambda: (False, "没配笔记库")):
+            out = daily_review.preflight(client=object())
+        self.assertFalse(out["ok"])
+        self.assertIn("没配笔记库", out["error"])
+        self.assertEqual(daily_review.pre_state()["phase"], "failed")
+
+    def test_the_worker_runs_the_preflight_before_it_starts_recording(self):
+        """**串行**：前置环节必须在 `record_command()` 之前（技能："在接收用户口述之前"）。"""
+        src = _read("app", "assistant.py") if "_read" in globals() else None
+        if src is None:
+            import os
+            src = open(os.path.join(os.path.dirname(os.path.dirname(
+                os.path.abspath(__file__))), "app", "assistant.py"), encoding="utf-8").read()
+        w = src[src.index("def _review_worker("):]
+        w = w[:w.index("\ndef ")]
+        self.assertIn("preflight(", w, "回顾开场要过前置环节")
+        self.assertLess(w.index("preflight("), w.index("record_command("),
+                        "前置环节要跑在开麦之前（串行）")
+
+
+class MeetingsBlockTests(unittest.TestCase):
+    """前置环节要知道**今天的会议在哪**（2026-10-13 用户："第一轮没搜到今天的会议和纪要"）。
+
+    技能 0-B 查的是笔记库 `02-会议记录/ECHO自动纪要/{date}_*.md` —— 当天会议刚结束时
+    那里还没有文件（实测 0 个）；纪要其实在 ECHO 的 `{meetingWorkspace}/<名字>/summary.md`。
+    """
+
+    DAY = "2026-10-13"
+
+    def setUp(self):
+        import os
+        import shutil
+        import tempfile
+        self.tmp = tempfile.mkdtemp(prefix="echo-meet-")
+        d = os.path.join(self.tmp, self.DAY + "_15-26-20")
+        os.makedirs(d)
+        with open(os.path.join(d, "meta.json"), "w", encoding="utf-8") as fh:
+            fh.write('{"title": "AI能力平台方案评审"}')
+        with open(os.path.join(d, "summary.md"), "w", encoding="utf-8") as fh:
+            fh.write("# 纪要\n今天评审了 AI 能力平台方案。")
+        os.makedirs(os.path.join(self.tmp, self.DAY + "_11-06-47"))   # 这场没生成纪要
+        self._shutil = shutil
+        self._os = os
+
+    def tearDown(self):
+        self._shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _env(self):
+        """打桩：会议目录指到临时目录 + 会话/权限/落库都不碰真实环境。"""
+        import contextlib
+        from unittest.mock import patch
+        from app import meeting as meeting_mod
+        stack = contextlib.ExitStack()
+        stack.enter_context(patch.object(meeting_mod, "meetings_dir", lambda: self.tmp))
+        stack.enter_context(patch.object(daily_review, "ready", lambda: (True, "")))
+        stack.enter_context(patch.object(daily_review, "vault_root", lambda: "V"))
+        stack.enter_context(patch.object(daily_review, "ensure_access", lambda *a, **k: (True, "")))
+        stack.enter_context(patch.object(daily_review, "ensure_session",
+                                        lambda *a, **k: ("S1", "W1", {"workspace": "W1"})))
+        stack.enter_context(patch.object(daily_review, "_persist", lambda *a, **k: None))
+        return stack
+
+    def _now(self):
+        import datetime
+        return datetime.datetime(2026, 10, 13, 20, 0)
+
+    def test_the_block_gives_paths_and_says_which_have_minutes(self):
+        with self._env():
+            ms = daily_review.today_meetings(now=self._now())
+            block = daily_review.meetings_block(now=self._now())
+        self.assertEqual(len(ms), 2)
+        self.assertIn("summary.md", block, "要把纪要文件的路径写进去")
+        self.assertIn("AI能力平台方案评审", block)
+        self.assertIn("还没生成", block, "没纪要的那场要如实说")
+
+    def test_the_pre_prompt_carries_the_meeting_list_and_the_vault_warning(self):
+        with self._env():
+            p = daily_review.build_pre_prompt(vault="V", now=self._now())
+        self.assertNotIn("{meetings}", p, "占位符要替换掉")
+        self.assertIn("ECHO 侧的会议", p, "要告诉它会议清单来自 ECHO 侧")
+        self.assertIn("今天没开会", p, "要写明：笔记库里没有 ≠ 今天没开会")
+        self.assertIn("summary.md", p, "纪要路径要落到指令里")
+
+    def test_the_meeting_block_is_appended_even_with_a_custom_template(self):
+        """自定义了 `dailyReviewPrePrompt`（没带 `{meetings}`）也要**照样附上**今天的会议清单。
+
+        理由：技能 0-B 查的笔记库目录当天是空的（实测今天 0 个），清单只来自 ECHO 侧；
+        自定义模板若把它挤掉，这个坑会原样回来。
+        """
+        from unittest.mock import patch
+        with self._env(), patch.object(
+                daily_review.settings, "get",
+                side_effect=lambda k, d=None: ("自定义前置模板 {vault}"
+                                               if k == "dailyReviewPrePrompt" else d)):
+            p = daily_review.build_pre_prompt(vault="V", now=self._now())
+        self.assertIn("自定义前置模板", p)
+        self.assertIn("ECHO 侧的会议", p, "自定义模板下也要附清单")
+        self.assertIn("summary.md", p)
+
+    class _C:
+        """一个够用的会话桩：记住发出去的 prompt，回一句带【播报】的答复。"""
+
+        def __init__(self):
+            self.prompts = []
+
+        def prompt(self, sid, text):
+            self.prompts.append(text)
+
+        def wait_for_reply(self, sid, timeout=0):
+            return ("【播报】好。【/播报】", True)
+
+    def test_submit_sends_the_configured_template_untouched(self):
+        """提示词内容**由设置决定**，代码不按轮次改写它（用户提醒：稳定版已迭代过模板）。"""
+        c = self._C()
+        with self._env():
+            out = daily_review.submit("一段口述", client=c)
+        self.assertTrue(out.get("ok"), out)
+        self.assertEqual(len(c.prompts), 1)
+        self.assertIn("一段口述", c.prompts[0], "转写原样带进去")
+
+
 if __name__ == "__main__":
     unittest.main()

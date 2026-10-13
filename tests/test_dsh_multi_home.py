@@ -179,6 +179,46 @@ class RegistrationTests(_Isolated):
                 self.assertEqual(len(payload["credentials"]), len(made),
                                  "homes.json 要列出每个家目录的凭据库，路由进程照它找密钥")
 
+    def test_it_creates_settings_yaml_for_a_home_that_never_had_one(self):
+        """**只装标准版就是这个形态**：`settings.yaml` 按设计不存在，注册要把它**建出来**。
+
+        2026-10-13 用户报的现场（ECHO 自己那套标准版）：家目录只有 `.credentials.yaml`，
+        而两个写入器都假设 `settings.yaml` 已存在 —— ruamel 那条直接 `open()` →
+        FileNotFoundError，文本兜底 `read_text()` 又静默返回 False，`_verify_settings()`
+        于是报「settings.yaml 解析失败：FileNotFoundError」，每次启动刷 9 条注册失败、
+        ECHO AUTO 永远注册不上。`dsh_homes()` 那一半 2026-09-25 就认这种家目录了
+        （见 `HomeDiscoveryTests.test_a_home_with_only_credentials_is_a_home_too` 结尾那句
+        "那是 sync() 的事"）—— **写的那一半当时没跟上**。
+        """
+        h = self.tmp / "harness-creds-only"
+        h.mkdir()
+        (h / ".credentials.yaml").write_text("dsh: {token: T-only-creds}\n", encoding="utf-8")
+        self.use_homes(desktop=None, harness=h)
+        self.assertFalse((h / "settings.yaml").exists(), "前提：它从来没有 settings.yaml")
+
+        ok, detail = llm_router.sync()
+        self.assertTrue(ok, detail)
+        created = h / "settings.yaml"
+        self.assertTrue(created.is_file(), "注册必须把它建出来：%s" % detail)
+        doc = yaml.safe_load(created.read_text(encoding="utf-8"))
+        route = doc["llm-pi-ai"]["providers"]["echo-auto"]
+        self.assertEqual(route["baseURL"], "http://127.0.0.1:18899")
+        self.assertTrue(route["models"], "模型列表是空的")
+        self.assertTrue(llm_router._read_token(h / ".credentials.yaml"), "没拿到令牌")
+
+    def test_the_text_fallback_also_starts_from_a_missing_file(self):
+        """没有 ruamel 时走文本兜底 —— 它同样要能从"文件不存在"起步（**两条路都得修**）。"""
+        h = self.tmp / "harness-creds-only"
+        h.mkdir()
+        (h / ".credentials.yaml").write_text("dsh: {token: T}\n", encoding="utf-8")
+        self.use_homes(desktop=None, harness=h)
+        with patch.object(llm_router, "_sync_settings_ruamel", lambda path=None: False):
+            ok, detail = llm_router.sync()
+        self.assertTrue(ok, detail)
+        doc = yaml.safe_load((h / "settings.yaml").read_text(encoding="utf-8"))
+        self.assertEqual(doc["llm-pi-ai"]["providers"]["echo-auto"]["baseURL"],
+                         "http://127.0.0.1:18899")
+
     def test_existing_token_is_reused_and_unified(self):
         """两个家目录令牌不一致时以**先存在的**（桌面版）为基准，别把原值换掉。"""
         d = self.make_home("desktop-home", "T-desktop")

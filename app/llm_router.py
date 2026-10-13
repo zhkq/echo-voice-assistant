@@ -377,8 +377,17 @@ def _sync_settings_ruamel(path=None) -> bool:
         yaml = YAML()
         yaml.preserve_quotes = True
         yaml.width = 4096
-        with open(path, encoding="utf-8") as f:
-            doc = yaml.load(f)
+        # 家目录里**可能根本没有** settings.yaml：标准版 harness 只写 `.credentials.yaml`、
+        # 从不写它（2026-09-25 同事实测报告 §4.3 F —— `dsh_homes()` 的判据为此专门加了
+        # `.credentials.yaml` 这一半）。那种情况**不是错误**：从空文档起步把它建出来就是。
+        # 老代码在这里无条件 `open(path)` → FileNotFoundError → 整个注册判失败，
+        # 于是"只用标准版"（正是 ECHO 自己的那套）的机器 ECHO AUTO 100% 注册不上，
+        # 每次启动还刷 9 条失败日志（2026-10-13 用户报的就是这个）。
+        if path.is_file():
+            with open(path, encoding="utf-8") as f:
+                doc = yaml.load(f)
+        else:
+            doc = None
         if doc is None:
             doc = CommentedMap()
         sec = doc.get("llm-pi-ai")
@@ -426,10 +435,16 @@ def _render_block(entry: dict, indent: int = 4) -> list:
 def _sync_settings_text(path=None) -> bool:
     """文本兜底：在 llm-pi-ai.providers 块的末尾插入/替换 echo-auto 段。"""
     path = Path(path or SETTINGS)
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except Exception:
-        return False
+    # 文件不存在 = 从**空文件**起步（与 ruamel 那条路同一个理由：标准版 harness 家目录里
+    # 按设计没有 settings.yaml，那不是错误）。下面"文件末尾追加 llm-pi-ai 段"那条分支
+    # 正好用得上空 lines。
+    if path.is_file():
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except Exception:
+            return False
+    else:
+        lines = []
 
     def indent_of(s: str) -> int:
         return len(s) - len(s.lstrip(" "))

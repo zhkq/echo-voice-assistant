@@ -51,12 +51,14 @@ class SubgroupStyleTests(unittest.TestCase):
 
     def test_hand_drawn_groups_are_wrapped_too(self):
         """函数自绘的几处（渲染器管不到的）也一处处套上了。"""
-        for call in ('sSub("产品开关"', 'sSub("转写走哪条路"', 'sSub("分离与声纹由谁做"',
+        for call in ('sSub("产品开关"', 'sSub("转写走哪条路"',
                      'sSub("能力选择"', 'sSub("在线服务"',
                      'sSub("组件进程（启停）"',
                      # 2026-10-02 用户给的层级：AI 组件 = Agent / 转写服务 / 语音合成（各自再分小组）
                      'sSub("Agent"', 'sSub("选择开关"', 'sSub("工作区"', 'sSub("归档"',
-                     'sSub("转写服务"', 'sSub("后端设置"', 'sSub("语音合成"'):
+                     # 2026-10-13：`sSub("后端设置"` 从名单里去掉 —— 转写服务下面不再
+                     # 多套一层（静态卡直接落在 `#capBackendHost`，卡自己的标题就是它）。
+                     'sSub("转写服务"', 'sSub("语音合成"'):
             with self.subTest(call=call):
                 self.assertIn(call, self.js, "漏了：" + call)
         self.assertIn('sSub(SET_GROUP_NAMES[g] || g', self.js, "「未归类」兜底卡的按组渲染也要套")
@@ -121,7 +123,9 @@ class AiCardHierarchyTests(unittest.TestCase):
         fn = fn[:fn.index("\n}")]
         order = [fn.index('sSub("Agent"'), fn.index('sSub("转写服务"'), fn.index('sSub("语音合成"')]
         self.assertEqual(order, sorted(order), "三组的顺序：Agent → 转写服务 → 语音合成")
-        for group in ("选择开关", "工作区", "归档", "后端设置"):
+        # 「后端设置」2026-10-13 起**不是**二级分组了：静态卡直接挂在「转写服务」下，
+        # 卡片标题就是它（用户口径：下面只有一张卡，没必要多一级）。
+        for group in ("选择开关", "工作区", "归档"):
             with self.subTest(group=group):
                 self.assertIn('sSub("%s"' % group, fn, "少了二级分组：" + group)
 
@@ -155,7 +159,11 @@ class AiCardHierarchyTests(unittest.TestCase):
         *"设置-ai组件-转写服务-后端设置下没有内容"*。
         现在：重绘前存一份模板、重绘后放一份**新克隆**，并重新接线（克隆不带监听）。
         """
-        self.assertIn('sSub("后端设置", `<div id="capBackendHost"></div>`)', self.js)
+        # 2026-10-13：宿主**直接**挂在「转写服务」下（不再 `sSub("后端设置", …)`）
+        self.assertIn('sSub("转写服务",', self.js)
+        self.assertRegex(self.js, r'\`<div id="capBackendHost"></div>\`\)')
+        self.assertNotIn('sSub("后端设置"', self.js,
+                         "转写服务下面只有一张卡，不再套第二层")
         panes = self.js[self.js.index("Object.keys(hosts).forEach"):]
         panes = panes[:panes.index("const rp =")]
         self.assertIn('$("#capBackendHost")', panes)

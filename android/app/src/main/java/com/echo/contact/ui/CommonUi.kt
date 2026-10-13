@@ -1,0 +1,219 @@
+package com.echo.contact.ui
+
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.VolumeUp
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.runtime.Composable
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import com.echo.contact.data.dto.CommandItem
+import com.echo.contact.ui.theme.EchoPalette
+
+/** 状态点：颜色照面板 `.dot` 规则（见 [EchoPalette.statusColor]）。 */
+@Composable
+internal fun StatusDot(color: Color, size: Int = 10) {
+    Box(modifier = Modifier.size(size.dp).background(color, CircleShape))
+}
+
+/** 面板的卡片长相：深底 + 1px 描边 + 10px 圆角。 */
+@Composable
+internal fun EchoCard(
+    modifier: Modifier = Modifier,
+    container: Color = EchoPalette.Card,
+    content: @Composable () -> Unit,
+) {
+    Card(
+        modifier = modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(10.dp),
+        colors = CardDefaults.cardColors(containerColor = container),
+        border = BorderStroke(1.dp, EchoPalette.Border),
+    ) {
+        Box(modifier = Modifier.padding(14.dp)) { content() }
+    }
+}
+
+/** 卡片标题行：状态点 + 标题 + （右侧）状态词。 */
+@Composable
+internal fun CardHeader(
+    title: String,
+    dotColor: Color,
+    trailing: String = "",
+    trailingColor: Color = EchoPalette.Muted,
+) {
+    Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+        StatusDot(dotColor)
+        Spacer(Modifier.size(8.dp))
+        Text(title, style = MaterialTheme.typography.titleSmall)
+        Spacer(Modifier.weight(1f))
+        if (trailing.isNotBlank()) {
+            Text(trailing, style = MaterialTheme.typography.labelLarge, color = trailingColor)
+        }
+    }
+}
+
+/** 一行小字（次要说明）。 */
+@Composable
+internal fun MutedLine(text: String, color: Color = EchoPalette.Muted, maxLines: Int = 3) {
+    Text(
+        text,
+        style = MaterialTheme.typography.labelSmall,
+        color = color,
+        maxLines = maxLines,
+        overflow = TextOverflow.Ellipsis,
+    )
+}
+
+/** 组件的英文名 → 面板上那句中文（未知名字原样显示）。 */
+internal fun componentLabel(name: String): String = when (name) {
+    "server" -> "服务"
+    "dsh" -> "DSH"
+    "harness" -> "智能体"
+    "stt" -> "语音识别"
+    "tts" -> "语音合成"
+    "wake" -> "唤醒词"
+    "hotkey" -> "热键"
+    "meeting" -> "会议"
+    "diarize" -> "说话人分离"
+    else -> name
+}
+
+/** 组件状态 → 面板上那句短词。 */
+internal fun shortStatus(status: String): String = when (status.lowercase()) {
+    "online" -> "在线"
+    "active" -> "进行中"
+    "ready" -> "就绪"
+    "offline" -> "离线"
+    "error" -> "故障"
+    "idle" -> "空闲"
+    "disabled" -> "未启用"
+    "skipped" -> "未使用"
+    "unknown", "" -> "未知"
+    else -> status
+}
+
+/** 指令状态 → 人话（db.py:117 的生命周期：pending→sent→running→done/failed）。 */
+internal fun commandStatusLabel(status: String?): String = when (status) {
+    "pending" -> "排队中"
+    "sent" -> "已发送"
+    "running" -> "执行中"
+    "done" -> "完成"
+    "failed" -> "失败"
+    null, "" -> ""
+    else -> status
+}
+
+/** 指令状态 → 灯色。 */
+internal fun commandStatusColor(status: String?): Color = when (status) {
+    "done" -> EchoPalette.Green
+    "failed" -> EchoPalette.Red
+    "running", "sent", "pending" -> EchoPalette.Purple
+    else -> EchoPalette.Muted
+}
+
+/**
+ * 指令历史的一行。**指令页与仪表盘"最近指令"共用**，所以抽出来。
+ * `onSpeak` / `onOpenSession` 传 null 就不显示对应的入口。
+ */
+@Composable
+internal fun CommandRow(
+    item: CommandItem,
+    onSpeak: ((String) -> Unit)? = null,
+    onOpenSession: ((CommandItem) -> Unit)? = null,
+) {
+    val status = item.status
+    EchoCard {
+        Column {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    item.text ?: "(空指令)",
+                    style = MaterialTheme.typography.bodyMedium,
+                    modifier = Modifier.weight(1f),
+                    maxLines = 3,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                if (!status.isNullOrBlank()) {
+                    Spacer(Modifier.size(8.dp))
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        StatusDot(commandStatusColor(status), size = 8)
+                        Spacer(Modifier.size(4.dp))
+                        Text(
+                            commandStatusLabel(status),
+                            style = MaterialTheme.typography.labelSmall,
+                            color = EchoPalette.Muted,
+                        )
+                    }
+                }
+            }
+
+            val meta = listOfNotNull(
+                item.ts?.takeIf { it.isNotBlank() },
+                item.source?.takeIf { it.isNotBlank() },
+            ).joinToString(" · ")
+            if (meta.isNotEmpty()) {
+                Spacer(Modifier.height(3.dp))
+                MutedLine(meta, maxLines = 1)
+            }
+
+            item.error?.takeIf { it.isNotBlank() }?.let { err ->
+                Spacer(Modifier.height(5.dp))
+                Text(
+                    err,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = EchoPalette.Red,
+                    maxLines = 4,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+
+            item.reply?.takeIf { it.isNotBlank() }?.let { reply ->
+                Spacer(Modifier.height(5.dp))
+                Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        reply,
+                        style = MaterialTheme.typography.bodySmall,
+                        maxLines = 8,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f),
+                    )
+                    onSpeak?.let { speak ->
+                        IconButton(onClick = { speak(reply) }) {
+                            Icon(
+                                Icons.Default.VolumeUp,
+                                contentDescription = "朗读",
+                                modifier = Modifier.size(18.dp),
+                            )
+                        }
+                    }
+                }
+            }
+
+            // 会话入口：只有拿到 session_id 的才给（没会话就没得看）
+            if (onOpenSession != null && !item.sessionId.isNullOrBlank()) {
+                TextButton(onClick = { onOpenSession(item) }) {
+                    Text("看会话", style = MaterialTheme.typography.labelMedium)
+                }
+            }
+        }
+    }
+}

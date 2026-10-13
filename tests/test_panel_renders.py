@@ -113,6 +113,17 @@ class PanelRendersTests(unittest.TestCase):
         self.assertEqual(missing, [],
                          "设置页渲染后这些元素不在（用户就找不到它们）：%s" % missing)
 
+        # 2026-10-12（用户实测："设置页面总是跳出首次启用向导"）：面板**自己不许弹**这个向导。
+        # 它是全屏覆盖层，只有"用户点了入口"或"服务端说该走向导（shouldOnboard）"时才该出现。
+        # 这条只能真渲染才抓得到 —— 静态断言看见的是 `onboardCard()` 里有 `display:none`，
+        # 而当时的 bug 是"建节点时就写成 display:flex"（建 ≠ 弹）：
+        # 真渲染出来就是 `style="… display: flex; …"` 盖在整页上。
+        overlay = re.search(r'id="onboardOverlay"[^>]*style="([^"]*)"', dom_settings)
+        if overlay:
+            self.assertIn("display:none", overlay.group(1).replace(" ", ""),
+                          "面板一打开就把「首次启用向导」盖了上来（用户没点过任何入口）。"
+                          "覆盖层必须建成 display:none，显形只走 onboardShow()")
+
         # 那个"整块渲染中断"的症状：能力卡渲染失败时页面会写这句
         for name, dom in (("设置页", dom_settings), ("回顾历史页", dom_reviews)):
             self.assertNotIn("能力清单加载失败", dom,

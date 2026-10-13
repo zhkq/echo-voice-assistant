@@ -9,9 +9,11 @@
 面板显示"不可用"是**对的**；看着像在跑的是桌面工具包那张表，那一处已经修了。）
 
 **三条铁律**（前两条是这一晚反复踩出来的纪律）：
-1. **只碰 ECHO 自己那份**：判据 `backend_pid.read_pid() > 0`（ECHO 起过它）。判不出归属、
-   或压根没有 pid 记录 → **一律不动手**，只留一句"不归我管"（判不出就不动的原则同
-   `backend_proc` 的归属判据）。
+1. **只碰该碰的那份，而"该不该碰"由配置回答**（2026-10-13 用户："守护内容需要根据
+   配置项确认"）：三个槽都不要能力后端、或这棵树配的是**远端**后端 → **不守**
+   （pid 记录只是"曾起过"的痕迹，不是"还需要"的证据）；配对指向回环、或没有配对但
+   本机后端配置齐且有 pid 记录 → 守。判不出归属 → **不动手**，只留一句"不归我管"
+   （判不出就不动的原则同 `backend_proc` 的归属判据）。
 2. **不打断用户**：会议在录音、或已有一次"起本机后端"的任务在跑 → 这一轮什么都不做，
    下一轮再说（同 AGENTS.md"动手前先看 `meeting.active`"）。
 3. **有退避与上限**：失败按 60s → 120s → 240s… 退避，**一小时内最多 3 次**；超了就不再自动拉，
@@ -22,8 +24,10 @@
 """
 from __future__ import annotations
 
+import io
 import logging
 import os
+import re
 import sys
 import threading
 import time
@@ -54,44 +58,142 @@ _STATE = {
     "restarts": [],       # 每次真的动手的时间戳
     "last": {},           # 最近一次 tick 的结果
     "note": "",           # 给人看的一句话（超限、不归我管…）
+    #: 最近一次"该不该守"的结论（tick 里算一次、面板直接读它）。
+    #: 为什么由 tick 存而不是让 state() 现算：`wanted()` 要调 `backend_admin.view()`，
+    #: 而 `view()` 反过来会读 `state()` —— 现算就是无限递归（2026-10-13）。
+    "wanted": {},
 }
 _LOCK = threading.Lock()
 _THREAD = None
 
 
-def wanted() -> tuple:
-    """该不该由 ECHO 看着它：``(要?, 依据)``。
+def _slot_wants_capability() -> tuple:
+    """三个槽里**有没有人**要能力后端：``(要?, 依据)``。
 
-    ⚠️ **不能只认 pid 记录**（这是我第一版的错，2026-10-11 真机复现出来了）：进程一被杀，
-    别的代码路径（`backend_admin.view()` 的"过期清理"）会**把 pid 文件删掉**，
-    于是看门狗以为"不是我起的"、什么都不做 —— 而那一刻恰恰是最该动手的时候。
-    所以判据是**两条任一**：
+    配置项是权威（2026-10-13 用户："守护内容需要根据配置项确认"）：
+      * `capabilityMeetingAsrBackend == "echo-server"` -> 会议转写的 asr.text 要能力后端；
+      * `capabilityDiarizeBackend != "off"` -> 说话人分离要（**分离只落在能力后端上**，
+        没有"本机引擎"那一档，见 config.py 里那一项的说明）；
+      * `capabilityEmbedBackend != "off"` -> 声纹嵌入同理。
 
-      ① 有 pid 记录（ECHO 起的，最快路径）；
-      ② **本机配对还在**（`backend_admin.view()` 的 `pairFile`/`paired` 说后端地址是回环）——
-         这表示"当前用的就是这个本机后端"，它掉了当然该拉回来。
-
-    两条都不成立（没有 pid 记录、也没有指向本机的配对）→ **不碰**：可能是用户自己起的、
-    或用的远端后端，那不是我们该管的。
+    三个都不要 = 这台机器根本不用能力后端，守它的本机后端毫无意义。
+    读不到配置时**不拿它当理由**（返回要=True）：判不出来时"守"比"不守"安全
+    —— 不守会让一个正在用的后端掉了没人管。
     """
+    want = []
     try:
-        from app import backend_pid
-        if int(backend_pid.read_pid() or 0) > 0:
-            return True, "ECHO 起的（有 pid 记录）"
-    except Exception:
-        pass
+        from app.config import settings
+        asr = str(settings.get("capabilityMeetingAsrBackend", "") or "").strip().lower()
+        dia = str(settings.get("capabilityDiarizeBackend", "") or "").strip().lower()
+        emb = str(settings.get("capabilityEmbedBackend", "") or "").strip().lower()
+        if asr == "echo-server":
+            want.append("会议转写走 ECHO 后端")
+        if dia and dia != "off":
+            want.append("说话人分离走能力后端")
+        if emb and emb != "off":
+            want.append("声纹嵌入走能力后端")
+    except Exception as e:                                   # noqa: BLE001
+        return True, "读不到槽配置（%s）—— 不拿它当理由" % str(e)[:60]
+    if not want:
+        return False, "配置里三个槽都不要能力后端"
+    return True, "；".join(want)
+
+
+def _backend_target() -> tuple:
+    """这棵树**现在连的是谁**：``(url, 来源说明)``；url 空 = 没有线索。
+
+    配对文件优先（AGENTS.md：后端地址的真正来源是配对文件 `data/backend.json`，
+    隐藏设置 `capabilityEchoServerUrl` 只作兜底）。顺带回报"本机后端配置齐不齐"
+    —— 那是"有 pid 记录但没有任何配对线索"时唯一能用的配置判据。
+    """
+    configured = ""
     try:
         from app import backend_admin
         v = backend_admin.view() or {}
-        pf = v.get("pairFile") or {}
         pr = v.get("paired") or {}
-        url = str(pf.get("baseUrl") or pr.get("baseUrl") or "")
-        loopback = ("127.0.0.1" in url) or ("localhost" in url) or ("[::1]" in url)
-        if (pf.get("found") or pr.get("paired")) and loopback:
-            return True, "本机配对还在（%s）" % url
+        pf = v.get("pairFile") or {}
+        url = str(pr.get("baseUrl") or pf.get("baseUrl") or "")
+        if url:
+            return url, "配对"
+        ok = (bool((v.get("runtime") or {}).get("ready"))
+              and bool((v.get("config") or {}).get("exists")))
+        configured = "本机后端已配置" if ok else "本机后端没配置齐"
     except Exception:
         pass
-    return False, "既没有 pid 记录，也没有指向本机的配对 —— 不碰"
+    # 配对文件自己读一遍：`backend_admin.view()` 在实例没起来时给不出配对 URL，而这时
+    # 隐藏设置 `capabilityEchoServerUrl` 可能还是**旧的**（2026-10-13 实测：dev 树的配对
+    # 文件写的是远端、设置里却还留着 127.0.0.1，于是判成"该守"）。AGENTS.md 的口径是
+    # **后端地址的真正来源是配对文件**，所以它排在设置前面。
+    try:
+        import json as _json
+        from app import paths as _paths
+        p = os.path.join(str(_paths.data_root()), "data", "backend.json")
+        if os.path.isfile(p):
+            with io.open(p, encoding="utf-8") as fh:
+                url = str((_json.load(fh) or {}).get("base_url") or "")
+            if url:
+                return url, "配对"
+    except Exception:
+        pass
+    try:
+        from app.config import settings
+        url = str(settings.get("capabilityEchoServerUrl", "") or "").strip()
+        if url:
+            return url, "设置"
+    except Exception:
+        pass
+    return "", configured
+
+
+def _is_loopback(url: str) -> bool:
+    return bool(re.match(r"^https?://(127(\.\d+){3}|localhost|\[::1\])(:|/|$)",
+                         str(url or ""), re.I))
+
+
+def wanted() -> tuple:
+    """该不该由 ECHO 看着它：``(要?, 依据)``。
+
+    **判据按配置项来**（2026-10-13 用户："守护内容需要根据配置项确认"）。三条，按序：
+
+      ① 三个槽（`capabilityMeetingAsrBackend` / `capabilityDiarizeBackend` /
+         `capabilityEmbedBackend`）**都不要能力后端** -> 本机后端对这台机器没用：不守；
+      ② 这棵树**连的是谁**（配对文件的 `baseUrl`，兜底 `capabilityEchoServerUrl`）：
+         * **回环** -> 用的就是本机后端，该守（pid 记不记得都算）；
+         * **远端** -> **不该守**：本机后端与它无关。**这里即使有 pid 记录也不拉**
+           —— pid 记录只证明"ECHO 曾经起过它"，不证明"现在还需要它"
+           （2026-10-13 现场：改用网络后端的机器上，那个本机后端被 pid 记录永远看护着，
+           没人知道它为什么还占着 8900/8901，杀了 30 秒后又被拉回来）；
+      ③ 既没有配对、也没有设置：**有 pid 记录 且 本机后端配置齐**（runtime 可用 +
+         server.yaml 在）才算"我们起的"；判不出就不动手。
+
+    与旧版的差别只有一处、但很关键：**pid 记录不再是充分条件**。"需不需要"这件事
+    只能由配置回答（旧版把它当成充分条件，正是 2026-10-13 那次"多余的本机后端"的成因）。
+    """
+    want_slots, why_slots = _slot_wants_capability()
+    if not want_slots:
+        return False, "%s —— 本机后端不需要（配置说了算）" % why_slots
+
+    pid = 0
+    try:
+        from app import backend_pid
+        pid = int(backend_pid.read_pid() or 0)
+    except Exception:
+        pid = 0
+
+    url, source = _backend_target()
+    if url:
+        if _is_loopback(url):
+            return True, "%s指向本机后端（%s）" % (source, url)
+        why = "%s指向远端后端（%s）—— 本机后端不需要" % (source, url)
+        if pid > 0:
+            why += "；但还留着 pid 记录（pid %d）：它只是「曾起过」的痕迹，建议停掉（9-backend-stop）" % pid
+        return False, why
+
+    if pid > 0 and source == "本机后端已配置":
+        return True, "有 pid 记录（pid %d），且本机后端配置齐" % pid
+    if pid > 0:
+        return False, "有 pid 记录（pid %d）但%s —— 不碰" % (pid, source or "没有任何配对线索")
+    return False, "既没有配对、也没有 pid 记录 —— 不碰"
 
 
 def port_state() -> list:
@@ -213,6 +315,9 @@ def tick(now: float = None) -> dict:
         return out
 
     want, why_want = wanted()
+    with _LOCK:
+        # 存下来给 state()/面板读：state() 不能现算（会经 backend_admin.view() 递归回来）。
+        _STATE["wanted"] = {"want": bool(want), "why": why_want, "at": now}
     if not want:
         return done("skip", "这份后端不归我管：%s" % why_want)
     why_paused = paused(now)
@@ -265,6 +370,7 @@ def state(now: float = None) -> dict:
                 "restarts": len(_restarts_recent(now)),
                 "last": dict(_STATE["last"]), "note": _STATE["note"],
                 "ports": port_state(),
+                "wanted": dict(_STATE.get("wanted") or {}),
                 "paused": bool(_STATE.get("paused_until") and now < _STATE["paused_until"]),
                 "pausedNote": _STATE.get("paused_note") or "",
                 "interval": WATCH_INTERVAL, "maxPerHour": MAX_RESTARTS_PER_HOUR}

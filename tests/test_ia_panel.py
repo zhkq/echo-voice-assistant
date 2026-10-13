@@ -195,8 +195,9 @@ class MeetingRecordsMergedIntoHistoryTests(unittest.TestCase):
         """
         self.assertEqual(self.js.count("const DASH_MEETINGS_LIMIT"),
                          1, "显示条数只许有一处声明")
-        self.assertRegex(self.js, r"DASH_MEETINGS_LIMIT\s*=\s*4",
-                         "需求是「最新四条」")
+        # 2026-10-13 用户："首页可以显示 5 条会议" —— 数字从 4 改成 5
+        self.assertRegex(self.js, r"DASH_MEETINGS_LIMIT\s*=\s*5",
+                         "需求是「最新五条」")
         # 两处取数都必须用常量（不许再出现写死的 4/5）
         self.assertEqual(self.js.count('limit=" + DASH_MEETINGS_LIMIT'), 2,
                          "首屏与轮询两处都要用常量（少一处就会覆盖另一处）")
@@ -382,17 +383,30 @@ class OneEntityOnePlaceTests(unittest.TestCase):
         cls.js = _read("web", "app.js")
         cls.html = _read("web", "index.html")
 
-    def test_meeting_channel_choice_lives_only_in_the_meeting_card(self):
-        """转写走哪条路 / 分离与声纹由谁做 = 会议卡一处。"""
+    def test_the_meeting_backend_choice_lives_in_the_ai_card_now(self):
+        """「转写走哪条路」= **设置卡一处**（2026-10-13 用户口径：业务配置里不再重复）。
+
+        原来它画在「业务配置 → 会议」卡（`renderMeetingServiceCard()`）；用户按截图指出
+        那块在设置里已经有了 → 搬进「设置 → AI 组件 → 转写服务」（`renderAiCardCommon()`
+        调的 `renderMeetingBackendChoice()`），会议卡不再画任何后端选择。
+
+        「分离与声纹由谁做」两项**不再是配置项**（会议标配，取值恒为 echo-server）——
+        两侧都不再渲染，所以这里只钉这两件事。
+        """
         self.assertNotIn('id="rtCapHost"', self.html, "路由卡里的会议能力通道已撤销")
+        ai = self.js[self.js.index("function renderAiCardCommon()"):]
+        ai = ai[:ai.index("\n}\n")]
+        self.assertNotIn("renderMeetingBackendChoice()", ai,
+                         "常用区不再画它（与「后端设置」那组单选重复，2026-10-13 第四张截图）")
+        # 它挪进高级 → 能力选择（`SET_CARDS` 的 ai.adv），仍然是 AI 组件卡的一部分
+        self.assertIn("+ renderMeetingBackendChoice()", self.js)
+        self.assertIn('sSub("能力选择"', self.js)
         svc = self.js[self.js.index("function renderMeetingServiceCard()"):]
         svc = svc[:svc.index("\n}\n")]
         for key in ("capabilityMeetingAsrBackend", "capabilityDiarizeBackend",
                     "capabilityEmbedBackend"):
             with self.subTest(key=key):
-                self.assertIn(key, svc, "会议卡要承载 %s" % key)
-        # 会议卡把它画出来（SET_CARDS.business 的 dynAfter）
-        self.assertRegex(self.js, r'id: "meet"[\s\S]{0,600}?dynAfter: \(\) => renderMeetingServiceCard\(\)')
+                self.assertNotIn(key, svc, "业务配置里不该再画 %s" % key)
 
     def test_the_device_card_is_capture_first(self):
         """设备卡：**常用 = 两个用途麦 + 一条默认播放**；兜底麦与两条按用途播报收进高级。

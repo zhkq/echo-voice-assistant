@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!--
+      Android 11+ 的「包可见性」坑：不声明这些，App 会**看不到**系统里的东西，
+      而症状全都长得像"这台设备没装"：
+        · TTS_SERVICE          → TextToSpeech 找引擎（否则报"没有朗读引擎"）
+        · RecognitionService   → SpeechRecognizer.isRecognitionAvailable() 与列服务
+        · action.RECOGNIZE_SPEECH → **识别界面那个 Activity**。
+          它和上面那条是**两回事**：服务归服务、界面归界面。
+          只声明服务那一条时，isRecognitionAvailable() 会正常返回 true，
+          但拉起系统识别界面会抛 ActivityNotFoundException
+          （2026-10-09 用户真机上就是这个症状 —— 漏的正是这一条）。
+    -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.TTS_SERVICE" />
+        </intent>
+        <intent>
+            <action android:name="android.speech.RecognitionService" />
+        </intent>
+        <intent>
+            <action android:name="android.speech.action.RECOGNIZE_SPEECH" />
+        </intent>
+    </queries>
+
+    <application
+        android:name=".EchoContactApp"
+        android:label="@string/app_name"
+        android:icon="@mipmap/ic_launcher"
+        android:theme="@style/Theme.EchoContact"
+        android:supportsRtl="true"
+        android:usesCleartextTraffic="true"
+        android:allowBackup="true"
+        tools:targetApi="34">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:theme="@style/Theme.EchoContact">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <service
+            android:name=".service.ListenService"
+            android:exported="false"
+            android:foregroundServiceType="microphone" />
+
+    </application>
+
+</manifest>

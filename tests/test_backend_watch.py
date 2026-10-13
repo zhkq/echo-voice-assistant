@@ -5,7 +5,9 @@
 钉住的是那三条铁律 —— **不碰别人的**、**不打断会议**、**退避与上限**。
 """
 import os
+import shutil
 import sys
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -46,12 +48,19 @@ class RulesTests(_Case):
         self.assertEqual(0, calls["start"], "别人的后端一个指头都不许碰")
         self.assertIn("不归我管", out["detail"])
 
-    def test_the_pid_record_alone_is_enough(self):
-        """**pid 记录会被"过期清理"抹掉**（2026-10-11 真机复现）→ 还要认"本机配对还在"这一条。"""
+    def test_the_pairing_is_read_not_only_the_pid_record(self):
+        """**pid 记录会被"过期清理"抹掉**（2026-10-11 真机复现）→ 还要认"本机配对还在"。
+
+        2026-10-13 起判据改成配置驱动，`wanted()` 拆成 `_slot_wants_capability()` /
+        `_backend_target()` / `_is_loopback()` 三处，所以这一条改成看**模块**里有没有那条
+        配对判据（函数体的字面量搬家了，判据本身没搬）；行为面由
+        `WantedIsConfigDrivenTests` 钉住 —— 回环配对、**没有** pid 记录时照样守。
+        """
         import inspect
-        src = inspect.getsource(backend_watch.wanted)
+        src = inspect.getsource(backend_watch)
         self.assertIn("pairFile", src, "要认本机配对（不能只认 pid 记录）")
-        self.assertIn("loopback", src)
+        self.assertIn("def _is_loopback", src, "回环判据只许有一处（三处各写一遍迟早对不上）")
+        self.assertIn("pid 记录不再是充分条件", inspect.getsource(backend_watch.wanted))
 
     def test_a_healthy_backend_is_left_alone(self):
         out, calls = self._tick()
@@ -177,6 +186,98 @@ class RulesTests(_Case):
         st = backend_watch.state()
         for k in ("checks", "ok", "restarts", "last", "note", "interval", "maxPerHour"):
             self.assertIn(k, st)
+        self.assertIn("wanted", st, "面板要能看到「最后一次该不该守」的结论")
+
+
+class WantedIsConfigDrivenTests(_Case):
+    """看门狗"守不守"由**配置项**决定（2026-10-13 用户："守护内容需要根据配置项确认"）。
+
+    旧版只有一条判据 `backend_pid.read_pid() > 0`（ECHO 起过它）—— 于是**改用网络后端的
+    机器上，那个本机后端被 pid 记录永远看护着**：杀了 30 秒又被拉回来，一直占着 8900/8901
+    （2026-10-13 现场）。新版按配置回答：三个槽要不要能力后端 + 这棵树连的是谁
+    （配对文件优先，隐藏设置兜底）+ 本机后端配置齐不齐。这一批把每条判据逐一钉住。
+    """
+
+    def _wanted(self, *, pair_url="", paired=True, runtime=True, cfg_exists=True, pid=0,
+                slots=("echo-server", "auto", "auto"), echo_url=""):
+        # Isolate the PAIRING FILE too: `_backend_target()` reads `<data root>/data/backend.json`
+        # itself, and this machine really is paired (with a network backend) - reading that
+        # would turn every "no clue" case into a false "remote".
+        tmp = tempfile.mkdtemp(prefix="echo-watch-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        view = {
+            "pairFile": {"found": bool(pair_url), "baseUrl": pair_url},
+            "paired": {"paired": paired, "baseUrl": pair_url},
+            "runtime": {"ready": runtime},
+            "config": {"exists": cfg_exists},
+        }
+        conf = {"capabilityMeetingAsrBackend": slots[0],
+                "capabilityDiarizeBackend": slots[1],
+                "capabilityEmbedBackend": slots[2],
+                "capabilityEchoServerUrl": echo_url}
+        with patch("app.backend_admin.view", lambda: view), \
+                patch("app.paths.data_root", lambda: tmp), \
+                patch("app.backend_pid.read_pid", lambda: pid), \
+                patch("app.config.settings.get", lambda k, d=None: conf.get(k, d)):
+            return backend_watch.wanted()
+
+    def test_a_remote_pairing_is_not_guarded_even_with_a_pid_record(self):
+        """**这条就是 2026-10-13 的回归**：配的是远端后端，pid 记录不许再把它变成"该守"。"""
+        want, why = self._wanted(pair_url="http://221.216.62.2:8900", pid=28876)
+        self.assertFalse(want, why)
+        self.assertIn("远端", why)
+        self.assertIn("28876", why, "要如实报出那个残留记录，人才知道去哪停")
+
+    def test_a_loopback_pairing_is_guarded_without_any_pid_record(self):
+        """配对指向回环 = 用的就是本机后端 → 该守（pid 记录有没有都不影响）。"""
+        want, why = self._wanted(pair_url="http://127.0.0.1:8900", pid=0)
+        self.assertTrue(want, why)
+        self.assertIn("本机后端", why)
+
+    def test_no_pairing_but_a_pid_record_and_a_configured_backend_is_guarded(self):
+        """没有任何配对线索时，pid 记录 + 本机后端配置齐 才算"我们起的"。"""
+        want, why = self._wanted(pair_url="", paired=False, pid=99,
+                                 runtime=True, cfg_exists=True)
+        self.assertTrue(want, why)
+        self.assertIn("99", why)
+
+    def test_a_pid_record_without_a_configured_backend_is_not_guarded(self):
+        """有 pid 记录但本机后端没配置齐 → 判不出，不许动手。"""
+        want, why = self._wanted(pair_url="", paired=False, pid=99,
+                                 runtime=False, cfg_exists=True)
+        self.assertFalse(want, why)
+        want2, _why2 = self._wanted(pair_url="", paired=False, pid=99,
+                                    runtime=True, cfg_exists=False)
+        self.assertFalse(want2)
+
+    def test_no_pairing_and_no_pid_record_is_not_guarded(self):
+        want, why = self._wanted(pair_url="", paired=False, pid=0)
+        self.assertFalse(want, why)
+        self.assertIn("不碰", why)
+
+    def test_slots_that_need_no_capability_backend_win_over_everything(self):
+        """三个槽都不要能力后端 → 本机后端毫无用处：哪怕配对在回环、还有 pid 记录也不守。"""
+        want, why = self._wanted(pair_url="http://127.0.0.1:8900", pid=123,
+                                 slots=("asr-provider", "off", "off"))
+        self.assertFalse(want, why)
+        self.assertIn("三个槽都不要", why)
+
+    def test_the_hidden_setting_is_the_fallback_without_a_pairing(self):
+        """没有配对记录时看隐藏设置 `capabilityEchoServerUrl`：远端 → 不守。"""
+        want, why = self._wanted(pair_url="", paired=False, pid=5,
+                                 echo_url="http://10.100.0.24:8900")
+        self.assertFalse(want, why)
+        self.assertIn("设置", why)
+
+    def test_tick_records_the_decision_for_the_panel(self):
+        """`tick()` 把结论存进 state（面板读它）—— `state()` 自己不能现算：会递归。"""
+        out, calls = self._tick(wanted=(False, "配对指向远端后端（http://10.100.0.24:8900）"),
+                                healthy=(False, "数据口 8900 没在听", "missing"))
+        st = backend_watch.state(now=1000.0)
+        self.assertEqual("skip", out["action"], out)
+        self.assertEqual(0, calls["start"], "配置说不需要时，一个指头都不许动")
+        self.assertIs(st["wanted"]["want"], False)
+        self.assertIn("远端", st["wanted"]["why"])
 
 
 if __name__ == "__main__":

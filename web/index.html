@@ -235,15 +235,13 @@
          2026-09-26：**默认收起**（没配对时尤其没必要占地方）；真的配上了由
          loadCapabilityRouting() 自动展开一次（见那边的注释）。 -->
     <div class="card collapsible" id="capRouteCard" data-collapse-id="cap-pair">
-      <div class="card-title"><span class="set-arrow">▶</span><span class="ic">🖥️</span>已配对后端连接情况
+      <div class="card-title"><span class="set-arrow">▶</span><span class="ic">🖥️</span>后端设置
         <span class="badge idle" id="capRouteBadge">读取中…</span>
         <span class="spacer"></span>
         <button class="btn mini" id="btnCapRouteProbe"
                 title="不等 30 秒缓存，马上把所有后端重问一遍">刷新</button>
       </div>
       <div class="card-body">
-        <div class="muted" style="font-size:12px">
-          这台机器可以把 GPU 重活（会议转写 / 说话人分离 / 声纹）交给一台带显卡的
         <!-- 后端在哪：**本机后端**（起/停/检测）还是**网络后端**（配对 + 服务器地址）。
              2026-10-06 用户口径："改成本机后端还是网络后端，选择网络后端后展示配对设置和服务器地址"。
              显示由 `applyTranscribeSettingsVisibility()` 按**配对到的地址**切（回环 = 本机）。
@@ -256,7 +254,10 @@
           <label class="schk" title="后端在另一台机器上（或是本机起的、但用网络地址访问）—— 要配对">
             <input type="radio" name="capBackendMode" value="net" data-cap-backend-mode="1">
             <span>网络后端</span></label>
-          <span class="muted" id="capBackendModeState" style="font-size:12px"></span>
+          <!-- 2026-10-13 用户口径："后端设置的内容太臃肿了，不用那么多解释，必要的说明也要用
+               问号标记悬浮展示" —— 这一块的解释一律收进 `?` 浮窗（`.sq` + `.spop`，
+               悬浮或点一下都出得来，见 app.css 与 app.js 的全局点击委托）。 -->
+          <span class="sq" role="button" tabindex="0" aria-label="本机后端与网络后端的区别">?<span class="spop">这台机器可以把 GPU 重活（会议转写 / 说话人分离 / 声纹）交给一台带显卡的机器做：<b>本机后端</b>＝那台就是本机（只绑回环，音频不出机器）；<b>网络后端</b>＝在另一台机器上，要配对一次。换后端＝换凭据，所以要重新配对。</span></span>
         </div>
 
         <!-- 网络后端：配对（粘一整串 `echo://pair?…`，或分开填地址 + 码）。
@@ -264,20 +265,28 @@
              藏起来只会让人找不到入口。 -->
         <div id="capPairSettings">
           <div id="capPairBox" class="cap-pair">
-            <div class="muted" style="font-size:12px">
-              管理员给你一张<b>配对码或配对串</b>（<code>echo://pair?host=…&amp;code=…&amp;fp=…</code>），
-              整串粘在下面第一个框里即可；串里带指纹时会 <b>校验证书</b>，那是防中间人的一步。
-              <b>发授权（一次性配对串）与撤销客户端在管理员那台 ECHO 后端上</b> ——
-              这侧只有"配对 / 解除配对"。
-            </div>
+            <!-- 配对串：**一整条单行**（管理员给的就是一整串，粘一次就够）。 -->
             <div class="cap-pair-row">
               <input id="capPairUrl" class="ctl grow" type="text" spellcheck="false"
-                     placeholder="配对串（echo://pair?host=…）或服务器地址，例如 10.100.0.24:8900">
+                     placeholder="配对串（echo://pair?host=…&amp;code=…&amp;fp=…）">
+            </div>
+            <!-- 或者分开填：**地址一行、配对码 + 按钮一行**（窄边条里地址与配对码挤在一行会
+                 折成三行，看着乱 —— 2026-10-13 用户口径：地址单独一行，「保存」跟配对码同行）。 -->
+            <div class="cap-pair-row">
+              <input id="capPairHost" class="ctl grow" type="text" spellcheck="false"
+                     placeholder="后端地址（改这里 + 点「保存」即可换 IP/域名，不用重新配对）">
+            </div>
+            <div class="cap-pair-row">
               <input id="capPairCode" class="ctl" type="text" spellcheck="false"
                      placeholder="配对码" style="max-width:140px">
               <button class="btn" id="btnCapPair">配对</button>
               <button class="btn hidden" id="btnCapUnpair"
-                      title="让这台机器忘掉后端凭据（服务端那本清单归管理员）">解除配对</button>
+                      title="让这台机器忘掉后端凭据（服务端那本清单归管理员）">解绑</button>
+              <!-- 「保存」= **只把上面那格里的地址存进配对凭据**（保留 clientId / secret，
+                   不用重新配对）—— 同一台后端换访问地址（IP → 域名 / 换网段 / 加反代）时用。 -->
+              <button class="btn hidden" id="btnCapSetAddr"
+                      title="保存后端地址（保留配对凭据，不用重新配对）">保存</button>
+              <span class="sq" role="button" tabindex="0" aria-label="配对串怎么来">?<span class="spop">管理员给你一张<b>配对码或配对串</b>（<code>echo://pair?host=…&amp;code=…&amp;fp=…</code>）：整串粘在第一个框里即可。串里带指纹时会<b>校验证书</b>（防中间人）。<b>发授权（一次性配对串）与撤销客户端在管理员那台 ECHO 后端上</b> —— 这侧只有「配对 / 解绑 / 保存地址」（保存地址 = 只换去哪找它，凭据不动）。</span></span>
             </div>
           </div>
         </div>
@@ -315,8 +324,7 @@
                **点按钮之前先给人看**：走容器路还是扩展包路、哪一档、多大、要不要联网，
                以及 nvidia-smi / docker 的原文报错；权重够不够也在这一格里（批 3）。 -->
           <div class="muted" id="capBackendPlan" style="font-size:12px"></div>
-          <div class="muted" id="capBackendReady" style="font-size:12px"></div>
-          <div class="muted" id="capBackendNotes" style="font-size:12px"></div>
+            <div class="muted" id="capBackendNotes" style="font-size:12px"></div>
         </div>
 
         <!-- 配对状态那一行：两种模式下都值得看（"连上了谁"） -->
@@ -326,7 +334,6 @@
         <!-- 这一格放：直连地址 + 一句指路（转写走哪条路 / 分离与声纹由谁做都在「业务配置 → 会议」）。
               同一个设置项两处能改，就是 2026-09-19 那次"三处都在讲同一件事"的老问题。 -->
         <div id="capRouteSettings" class="settings-form"></div>
-          </div>
       </div>
     </div>
 
@@ -418,6 +425,15 @@
         <span class="muted" style="font-size:12px">第一次装、或以后想补能力时走一遍；不装也能用，缺什么顶部横幅会说</span>
       </div>
       <div class="card-body">
+        <!-- 2026-10-12：新版「首次启用向导」（3 步：配模型 → 指笔记库 → 初始化技能）的手动入口。
+             它是**全屏覆盖层**，只由 `onboardShow()` 显形（建卡 ≠ 弹窗，见 app.js 的
+             `onboardCard()`）；而升级安装不自动弹、顶部横幅也刻意不给按钮 ——
+             少了这一处，用户就只能靠 `?view=onboard` 深链才走得到它。 -->
+        <div class="srow">
+          <div class="lbl"><span class="lt">首次启用向导（3 步）</span>
+            <span class="muted">配模型 → 指笔记库 → 初始化技能。新机器第一次用；以后想再走一遍也可以。</span></div>
+          <div class="sctl"><button class="btn ghost" id="wizGoOnboard">走一遍</button></div>
+        </div>
         <div id="wizHost"></div>
       </div>
     </div>
@@ -467,10 +483,10 @@
         <div class="card-title">会议
           <span class="spacer"></span>
           <button class="btn" id="btnCompressToggle"
-                  title="把历史会议的音频无损压成 FLAC：省约一半磁盘，转写文本逐字不变">压缩音频</button>
-          <button class="btn" id="btnImportToggle" title="把已有的录音（wav/flac/mp3/ogg）导入成一场会议">导入录音</button>
+                  title="把历史会议的音频无损压成 FLAC：省约一半磁盘，转写文本逐字不变">压缩</button>
+          <button class="btn" id="btnImportToggle" title="把已有的录音（wav/flac/mp3/ogg）导入成一场会议">导入</button>
           <button class="btn" id="btnMeetingFromList">开始录音</button>
-          <button class="btn danger" id="btnCleanShort" title="删除 2 分钟以内的会议录音（含音频）">清理短录音</button>
+          <button class="btn danger" id="btnCleanShort" title="删除 2 分钟以内的会议录音（含音频）">清理</button>
         </div>
         <!-- 历史音频无损压缩（FLAC）：入口在标题栏，展开后**先算给你看**
              （可压缩 N 场 / 能省 X）→ 用户确认 → 才动手；进度复用上面的 tx-bar。 -->
