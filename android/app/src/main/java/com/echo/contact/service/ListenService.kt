@@ -82,7 +82,14 @@ class ListenService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        when (intent?.action) {
+        if (intent == null) {
+            // 进程被杀之后，`START_STICKY` 会带一个 **null intent** 把服务拉回来。
+            // 这时**绝不能自动开麦**（见类注释取舍 2）：麦克风只能由用户点头开。
+            ListenState.reset(ListenState.Phase.OFF, "服务被系统重启过，要用请再打开开关")
+            stopSelf()
+            return START_NOT_STICKY
+        }
+        when (intent.action) {
             ACTION_STOP -> {
                 stopEverything("用户停掉了后台听写")
                 return START_NOT_STICKY
@@ -96,7 +103,8 @@ class ListenService : Service() {
                 }
             }
         }
-        // 系统回收后重建：只重建服务壳，**不自动开麦**（见类注释的取舍 2）
+        // 用户在开着听写的情况下把 App 划掉：服务继续听（这正是"后台"的意义），
+        // 系统回收后也只重建服务壳 —— 开麦仍然只由用户的开关决定（见上面 null intent 那条）
         return START_STICKY
     }
 
@@ -209,8 +217,13 @@ class ListenService : Service() {
             return failAndStop("麦克风初始化失败：可能被别的应用占着")
         }
 
-        val segmenter = VoiceSegmenter(sampleRate = SAMPLE_RATE)
-        val idle = IdleAutoStop()
+        val tuning = ListenPrefs.load(this)
+        val segmenter = VoiceSegmenter(
+            sampleRate = SAMPLE_RATE,
+            silenceThreshold = tuning.silenceThreshold,
+            hangoverMs = tuning.hangoverMs,
+        )
+        val idle = IdleAutoStop(tuning.idleAutoStopMs)
         idle.start(System.currentTimeMillis())
         val frame = ShortArray(FRAME_SAMPLES)
         try {
@@ -258,6 +271,13 @@ class ListenService : Service() {
                 return note("刚才那句没发出去：$why")
             }
             ListenState.countSegment()
+            // 把"它听成什么"写出来：车里最常问的就是这句（听错了要立刻能看出来）
+            val heard = body.text.orEmpty()
+            if (heard.isNotBlank()) {
+                val line = "听到了：${heard.take(NOTIFICATION_TEXT_MAX)}"
+                ListenState.set(ListenState.Phase.THINKING, line)
+                refreshNotification(ListenState.Phase.THINKING, line)
+            }
             val reply = awaitReply(api, body.commandId)
             if (reply.isNullOrBlank()) {
                 return note("ECHO 没在 90 秒内回话（那句可能还在跑）")

@@ -30,6 +30,7 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Slider
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
@@ -46,8 +47,10 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import com.echo.contact.service.ListenPrefs
 import com.echo.contact.service.ListenService
 import com.echo.contact.service.ListenState
+import com.echo.contact.service.ListenTuning
 import com.echo.contact.ui.theme.EchoPalette
 
 /**
@@ -211,6 +214,44 @@ fun CommandsTab(vm: MainViewModel) {
                     }
                     Spacer(Modifier.height(4.dp))
                     MutedLine("开着就能锁屏说话：说完停一下自动交给 ECHO，回复由手机念出来")
+
+                    // ---- 听写参数（可调）----
+                    // 这套判据是在安静房间里定的，战场却是车里（发动机/风噪/音乐）：
+                    // 门限与收尾静音都可能要重定，所以给三个旋钮，改完下次开听写生效。
+                    var showTuning by remember { mutableStateOf(false) }
+                    var tuning by remember { mutableStateOf(ListenPrefs.load(context)) }
+                    TextButton(onClick = { showTuning = !showTuning }) {
+                        Text(if (showTuning) "收起参数" else "调参数（车里噪声大就调这里）")
+                    }
+                    if (showTuning) {
+                        TuningRow(
+                            label = "说话门限 ${"%.3f".format(tuning.silenceThreshold)}",
+                            value = tuning.silenceThreshold.toFloat(),
+                            range = ListenTuning.MIN_SILENCE_THRESHOLD.toFloat()..
+                                ListenTuning.MAX_SILENCE_THRESHOLD.toFloat(),
+                            onChange = { tuning = tuning.copy(silenceThreshold = it.toDouble()) },
+                            onDone = { ListenPrefs.save(context, tuning) },
+                            hint = "调大 = 车里的底噪不容易被当成说话",
+                        )
+                        TuningRow(
+                            label = "说完静音 ${"%.1f".format(tuning.hangoverMs / 1000.0)} 秒",
+                            value = tuning.hangoverMs.toFloat(),
+                            range = ListenTuning.MIN_HANGOVER_MS.toFloat()..
+                                ListenTuning.MAX_HANGOVER_MS.toFloat(),
+                            onChange = { tuning = tuning.copy(hangoverMs = it.toInt()) },
+                            onDone = { ListenPrefs.save(context, tuning) },
+                            hint = "调小 = 反应更快；调大 = 给思考停顿留余量",
+                        )
+                        TuningRow(
+                            label = "没人说话 ${tuning.idleAutoStopMin} 分钟自动停",
+                            value = tuning.idleAutoStopMin.toFloat(),
+                            range = ListenTuning.MIN_IDLE_AUTO_STOP_MIN.toFloat()..
+                                ListenTuning.MAX_IDLE_AUTO_STOP_MIN.toFloat(),
+                            onChange = { tuning = tuning.copy(idleAutoStopMin = it.toInt()) },
+                            onDone = { ListenPrefs.save(context, tuning) },
+                            hint = "省电用；改了下次开听写生效",
+                        )
+                    }
                 }
             }
         }
@@ -409,6 +450,33 @@ private fun SubmitCard(submit: SubmitState, onSpeak: (String) -> Unit) {
                 }
             }
         }
+    }
+}
+
+/**
+ * 一个参数旋钮：一行标签 + 滑杆 + 一句"调大/调小会怎样"。
+ *
+ * `onDone`（松手时）才落盘：拖动过程中每一帧都写 SharedPreferences 是白费，
+ * 而松手即存又能让"我调完了"这件事立刻生效于**下一次**开听写。
+ */
+@Composable
+private fun TuningRow(
+    label: String,
+    value: Float,
+    range: ClosedFloatingPointRange<Float>,
+    onChange: (Float) -> Unit,
+    onDone: () -> Unit,
+    hint: String,
+) {
+    Column(modifier = Modifier.fillMaxWidth()) {
+        Text(label, style = MaterialTheme.typography.labelMedium)
+        Slider(
+            value = value,
+            onValueChange = onChange,
+            onValueChangeFinished = onDone,
+            valueRange = range,
+        )
+        MutedLine(hint, maxLines = 1)
     }
 }
 
