@@ -621,3 +621,25 @@ pyannote 4.0.7 在 cu126 上装得上也跑得动（600 秒音频约 26.7 秒，
   看门狗判据①又把它拉回来（工具包 `Stop-BackendByPid` 已补上删记录这一刀）。
 
 
+
+
+### 清理 `dist/` 与旧包时：**每种包的最新一份必须留住**（2026-10-14 用户定的规矩）
+
+- **用户原话**："以后清理的时候各种包最新版本都要留一份，避免下次出包时需要不必要的重新下载"。
+- **必须留（每类至少一份，而且要留最新那一份）**：
+  * `ECHO-kit-<最新戳>.zip` —— 客户端 kit（**带载荷**那份；它的解压目录可删，zip 要留）
+  * `ECHO-backend-portable-<最新戳>.zip` —— 后端薄包
+  * `ECHO-backend-offline-<最新戳>.zip` —— 后端离线包（做过就留；3.1 GB，`full-local`/"零下载"的唯一底料）
+  * `ECHO-main-<平台>-<版本>-<最新戳>.zip`(+`.sha256`) —— 主包
+  * `dist\_bundle\ECHO-bundle-<最新戳>\bundle\` —— **bundle 缓存**（wheels + models；`build_kit.py --bundle-from` 直接吃它）
+- **可以删**：更早的 kit / 主包 zip 与它们的**解压目录**、`ECHO-backend-portable-<更早>*` 目录
+  （实测每个 **5.4 GB**）、`dist\_superseded`、`dist\offline`、`_offline-cache`、`shots`/`compress-shots`、
+  `_edgepro*`、`_bundle` 里更早的 bundle（目录与 zip 都要清）、`__pycache__`、零散临时脚本/截图。
+- **为什么**：bundle 缓存里是**模型 + 轮子**（2026-10-14 实测：models 229 MB + wheels 68 MB + runtime 12.9 MB），
+  删了下次出 kit 就得重新下载/重打；离线包 3.1 GB 删掉则 `full-local` 交付要整个重做。
+  那次清理把 `dist` 从 **41.36 GB 降到 3.95 GB**（删 37.4 GB）**正是靠"每类只留最新一份"**。
+- **判据（清理完自检）**：上列五类**各至少一份且是最新的**；`dist` 里不该再出现上一版的 kit/主包/解压目录；
+  ⚠️ `ECHO-kit-*.zip` 只有个位数 MB = **裸包**（缺 `bundle/` 载荷）—— 那不是"要留的最新一份"，是**该删的坏包**
+  （2026-10-14 实测踩过：另一个会话重出的 kit 只有 7.3 MB，载荷全丢）。
+- **顺带**：清理**不可逆** —— 删之前先把"要留的清单"打印出来核对；GitHub 上的旧 release 可以删
+  （**tag 保留**，`git checkout v2.1.5` 照旧可用），但**别把本地那份唯一的离线包也一起删掉**。
