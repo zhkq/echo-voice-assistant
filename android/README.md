@@ -4,7 +4,7 @@
 
 - 包名 / applicationId：`com.echo.contact`
 - 应用名：ECHO 触点
-- 当前范围：**阶段3**（骨架 + 配对 + 文字指令 + 历史）。**录音（阶段4）尚未实现**。
+- 当前范围：**阶段3（配对/四分区）+ 阶段4（语音链路）+ 阶段5（常驻听写，2026-10-15）**。
 
 ---
 
@@ -33,7 +33,8 @@ android/
         │   │   │   ├── EchoApi.kt           # Retrofit 接口定义（路径自带 api/ 前缀）
         │   │   │   ├── PairStore.kt         # EncryptedSharedPreferences 存令牌
         │   │   │   └── dto/Dtos.kt          # 与后端逐字段对齐的 DTO
-        │   │   ├── service/ListenService.kt # 阶段4 占位（现在不录音）
+        │   │   ├── service/ListenService.kt # 常驻听写（阶段5）：前台服务 + 静音分段
+        │   │   ├── service/ListenState.kt   # 听写状态与通知文案（纯逻辑，可 JVM 单测）
         │   │   └── ui/                      # PairViewModel / MainViewModel / 两个 Compose 页 / Theme
         │   └── res/                         # strings / themes / colors / 图标
         └── test/java/com/echo/contact/
@@ -566,17 +567,16 @@ C:\echo-dev\venv\Scripts\python.exe android\tools\real_backend_harness.py `
 
 ## 7. 已经做完 vs 还没做
 
-**已完成（阶段 3 + 阶段 4 的语音链路）**：配对、四分区界面（仪表盘/指令/会议/回顾）、
+**已完成（阶段 3 + 阶段 4 的语音链路 + 阶段 5 常驻听写）**：配对、四分区界面（仪表盘/指令/会议/回顾）、
 文字指令 + 实时轮询、**语音指令**（录 wav → ECHO 转写 → 下发 → 手机念）、
 历史与筛选、看会话、会议（状态/开始停止/转写进度/列表/**正文与纪要**）、
-回顾（**手机口述**、念播报、按天历史）、朗读试听、启动图标。
+回顾（**手机口述**、念播报、按天历史）、朗读试听、启动图标、
+**后台听写**（前台服务里一直听：锁屏/切走都能用，一句说完自动发出去并把回复念出来）。
 
 **还没做**（都不影响明天测）：
 
-- `service/ListenService.kt` 仍然是**占位**（`onStartCommand` 立刻 `stopSelf`）。
-  现在的录音是**前台界面里的临时录音**（`AudioRecord` 直接采），没有常驻服务 ——
-  对"按一下说一句"够用；要做**后台/锁屏也能录**（比如连着蓝牙耳机开车时）才需要它，
-  那时要补前台通知 + `FOREGROUND_SERVICE_MICROPHONE` 的合规声明。
+- **免提自激**：听写期间"正在念回复"那几秒是**不收音**的（见 §8 的取舍），
+  要做到"边播边听"需要 AEC（回声消除）—— 现在没做，所以念的时候你插话会丢。
 - **会议音频播放**没做：`/meetings/{id}/audio?seg=N` 能取（还支持 Range），
   但手机上逐段听一小时会议不是这里该干的事；目前只给了正文与纪要。
 - **指令历史分页**：现在是**真正的 offset 翻页**（"加载更早的"）。
@@ -586,3 +586,46 @@ C:\echo-dev\venv\Scripts\python.exe android\tools\real_backend_harness.py `
   而轮询刷新头部时**不能把用户翻出来的更早那些行打回 30 条**。
 - **手表**：本仓库那份可行性分析里的路径 A/B/C 都还只是分析，没动。
 - **出网/公网访问**：见上面那节分析，等用户定方向。
+
+---
+
+## 8. 阶段5：常驻听写（2026-10-15）
+
+**它解决什么**：界面里那次"按住说一句"是**前台临时录音**，界面一走就没了。
+而真实场景是**开车**：手机在支架上/兜里、接着蓝牙耳机，人要的是"抬手说一句就行"。
+
+**怎么工作**（`service/ListenService.kt`）：
+
+```
+前台服务（麦克风型） → AudioRecord(16k 单声道) → VoiceSegmenter（静音分段）
+   → POST /api/assistant/voice-command（裸 wav）拿 commandId
+   → 轮询 GET /api/commands?limit=5（1.5 秒一次，最多 90 秒）
+   → 手机系统 TTS 念 brief/reply
+```
+
+- **分段判据**在 `audio/VoiceSegmenter.kt`：**纯 Kotlin、不碰 Android API**，
+  于是能用 JVM 单测逐帧钉住（`VoiceSegmenterTest`，8 条）：
+  门限用 RMS（默认 0.012，与面板同口径）、静音 1200 ms 收尾、太短（<300 ms）丢弃、
+  说太久（>15 s）强制切、**前导静音只留 400 ms 预卷**（否则干等的十几秒会原样进 wav）。
+- **状态与文案**在 `service/ListenState.kt`（同样是纯逻辑，`ListenStateTest` 6 条）：
+  档位是 OFF / STARTING / LISTENING / THINKING / SPEAKING / FAILED，
+  通知与界面上那两行字由 `textsOf(phase, detail, segments)` 统一给 ——
+  **锁屏时那是用户判断"它到底在干什么"的唯一依据**，所以逐档钉住、标题不许撞车。
+- **界面入口**：指令页第二张卡「后台听写」开关；打开时按需要 RECORD_AUDIO 与
+  POST_NOTIFICATIONS（通知权限**给不给都开**，不给只是看不到常驻通知）。
+- 通知里有「停止听写」，`exported=false`，`foregroundServiceType="microphone"`。
+
+**三个刻意的取舍**（写清楚，免得后来者以为是漏了）：
+
+1. **处理 / 朗读期间不收音**（服务里的 `paused`）：否则手机把自己念的回复又听一遍，
+   会自激成"自问自答"。代价是念回复的那几秒你说的话会丢 —— 换来的是不会自激。
+   要做到"边播边听"需要 AEC，见 §7「还没做」。
+2. **不自动重启开麦**：`START_STICKY` 只重建服务壳；麦克风这种东西，
+   **用户没点头就不该自己开**。被系统回收了就由用户在通知/界面里再点一次。
+3. **连不上就如实说**：网络错误 / 后端 4xx / 转写为空，都写进通知正文与状态
+   （"说完没反应"是最难查的体验），且**不因此停掉整个服务** —— 继续听下一句。
+
+**没验到的**（与前面几节同一个口径，如实写）：本轮加了 14 条 JVM 单测（8+6）与
+`assembleDebug` 编译通过，但**仍然没有真机**：
+前台服务在真机上的麦克风占用、锁屏后的存活、Android 14 对麦克风型前台服务的
+合规判定（必须在前台且已授权才允许开），这三条只有装机才能验。

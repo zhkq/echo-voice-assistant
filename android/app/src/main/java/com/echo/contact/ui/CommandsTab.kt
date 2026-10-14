@@ -2,6 +2,7 @@ package com.echo.contact.ui
 
 import android.Manifest
 import android.content.pm.PackageManager
+import android.os.Build
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
@@ -30,6 +31,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -44,6 +46,8 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import com.echo.contact.service.ListenService
+import com.echo.contact.service.ListenState
 import com.echo.contact.ui.theme.EchoPalette
 
 /**
@@ -92,6 +96,49 @@ fun CommandsTab(vm: MainViewModel) {
         ActivityResultContracts.RequestPermission()
     ) { granted -> if (granted) vm.startRecording() }
 
+    // ---- 后台听写（阶段5）：服务在前台服务里常驻听，锁屏/切走都能用 ----
+    val listenPhase by ListenState.phase.collectAsState()
+    val listenDetail by ListenState.detail.collectAsState()
+    val listenSegments by ListenState.segments.collectAsState()
+    val listening = listenPhase != ListenState.Phase.OFF && listenPhase != ListenState.Phase.FAILED
+    val (listenTitle, listenBody) = ListenState.textsOf(listenPhase, listenDetail, listenSegments)
+
+    // 通知权限**给不给都开**：不给只是看不到那条常驻通知，听写本身照跑
+    val notifLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { ListenService.start(context) }
+
+    val listenPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (!granted) return@rememberLauncherForActivityResult
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            context.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            notifLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+        } else {
+            ListenService.start(context)
+        }
+    }
+
+    fun startBackgroundListen() {
+        val micOk = context.checkSelfPermission(Manifest.permission.RECORD_AUDIO) ==
+            PackageManager.PERMISSION_GRANTED
+        if (!micOk) {
+            listenPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+            return
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            context.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            notifLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+        } else {
+            ListenService.start(context)
+        }
+    }
+
     LazyColumn(
         modifier = Modifier.fillMaxSize(),
         contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 24.dp),
@@ -130,6 +177,40 @@ fun CommandsTab(vm: MainViewModel) {
                     }
                     Spacer(Modifier.height(4.dp))
                     MutedLine("录音交给 ECHO 转写（手机上显示的是它听成什么）")
+                }
+            }
+        }
+
+        // ---- 后台听写（阶段5）----
+        // 与上面那个"按住说话"是两条路：这条活在**前台服务**里，界面切走/锁屏照听，
+        // 一句说完自己发出去、把回复念出来 —— 开车时人不用碰手机。
+        item {
+            EchoCard {
+                Column {
+                    CardHeader(
+                        title = "后台听写",
+                        dotColor = if (listening) EchoPalette.Red else EchoPalette.Muted,
+                        trailing = if (listening) "在听" else "关",
+                        trailingColor = if (listening) EchoPalette.Red else EchoPalette.Muted,
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Switch(
+                            checked = listening,
+                            onCheckedChange = { on ->
+                                if (on) startBackgroundListen() else ListenService.stop(context)
+                            },
+                        )
+                        Spacer(Modifier.size(10.dp))
+                        Column(modifier = Modifier.fillMaxWidth()) {
+                            Text(listenTitle, style = MaterialTheme.typography.bodyMedium)
+                            if (listenBody.isNotBlank()) {
+                                MutedLine(listenBody, maxLines = 3)
+                            }
+                        }
+                    }
+                    Spacer(Modifier.height(4.dp))
+                    MutedLine("开着就能锁屏说话：说完停一下自动交给 ECHO，回复由手机念出来")
                 }
             }
         }
