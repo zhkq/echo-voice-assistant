@@ -643,3 +643,39 @@ pyannote 4.0.7 在 cu126 上装得上也跑得动（600 秒音频约 26.7 秒，
   （2026-10-14 实测踩过：另一个会话重出的 kit 只有 7.3 MB，载荷全丢）。
 - **顺带**：清理**不可逆** —— 删之前先把"要留的清单"打印出来核对；GitHub 上的旧 release 可以删
   （**tag 保留**，`git checkout v2.1.5` 照旧可用），但**别把本地那份唯一的离线包也一起删掉**。
+
+### 每日回顾「前置环节」每轮都「已停止」：小窗口轮询撞上 `wait_for_reply` 的超时取消（2026-10-14 真机事故）
+
+- **症状**：点「开始回顾」→ DSH 会话里**每一轮都显示「已停止」**（工具结果报
+  `glob was aborted before completion`），前置环节追问 3 次后**干等到 900 秒超时**；
+  车里听不到任何东西。用户原话："每日回顾功能无法工作了"。
+- **根因**（取证在 DSH 会话事件里，不靠猜）：`daily_review.preflight` 用
+  `wait_for_reply(sid, timeout=PRE_POLL_S=3)` **每 3 秒轮询一次**，而 `dsh_agent.wait_for_reply`
+  在"这个窗口里没等到**新的**助手文本"时会 `self.cancel(session_id)` 收尾。前置环节是一条
+  **几分钟的长活**（扫企微/微信/桌面/WPS 缓存、读当天纪要归档），于是**每几秒被打断一次**。
+  * 判据①：会话里 `turn/end` 的 `reason={"kind":"aborted","reason":{"kind":"user"}}` ——
+    DSH 里只有 `session/cancel` 会产生它（`dsh-api-session-controller` 的
+    `cancel()` → `agent.cancel({kind:'user'}, …)`）；
+  * 判据②：`tool/result` 是 `aborted before completion (tool timeout or caller cancellation)`；
+  * 判据③：ECHO 日志里连续 3 条「本轮结束但没带标记，追问第 N 次」= `wait_for_reply`
+    每次都在取消之后才返回 `done=True`。
+- **修法**（`app/agents/{base,dsh_agent,codebuddy}.py` + `app/daily_review.py`）：
+  * `wait_for_reply(..., cancel_on_timeout=False)`：**"分小段轮询等长活"的调用方必须传它**；
+    默认 `True` 保留给"发一条、等一轮"的调用方（语音命令、回顾提交）。
+  * 前置环节判"本轮结束"要**连续 `PRE_IDLE_POLLS=2` 次空闲**（工具调用间隙 `running` 会闪断），
+    助手文本**跨窗口保留**，追问用尽**如实退出**（不再空等 900 秒），`should_stop` 一置位就收尾。
+  * 教训一句话：`wait_for_reply` 的"超时取消"是**为单轮问答设计的副作用** ——
+    谁拿它做长活轮询，谁就会被自己的等待打断。
+- **用户同日另外两条口径（一并做了）**：
+  * **续说轮次用短模板**：第 2 段起走 `dailyReviewPromptNext`（内置 `daily_review.DEFAULT_NEXT_PROMPT`），
+    只带"转写（顶在最前）+ 登记 + 播报契约"，不再重复首轮那套长篇要求（用户："用户的转写要求不突出"）；
+  * **轮次等待按进展判完成**（`daily_review.wait_for_turn`）：会话空闲连续 2 次且拿到文本才算完成；
+    还在跑就继续等（"没动静"只提醒一句、**不掐断**），硬上限 `ROUND_HARD_MAX_S=900`（15 分钟）。
+    设置项 `dailyReviewReplyTimeoutSec` 的语义随之从"每轮最大等待"改成"多久没动静提醒你一句"。
+- **判据（护栏，别再放松）**：`tests/test_agent_reply_wait.py`（默认仍取消 / 传 False 绝不取消）、
+  `tests/test_daily_review.py` 的 `PreflightTests`（不许取消、空闲确认、停止即时生效、追问用尽如实退出）、
+  `RoundTemplatesTests`（续说短模板、转写顶到最前）、`RoundWaitTests`（长活不掐断、硬上限、空闲无文本立刻返回）。
+- **附带挖到的坑**：**没在 `DEFAULTS` 里声明的"隐藏设置"其实改不动** —— `Settings.update()` 有一句
+  `if k not in DEFAULTS: continue`，PUT 会被**静默丢掉**。`dailyReviewPrePrompt` 的注释原来写着
+  "想改文案可以设隐藏设置 dailyReviewPrePrompt"，**那句是不成立的**；现已把 `dailyReviewPrePrompt` /
+  `dailyReviewPromptNext` 都声明成 `hidden=True`（值留空 = 用代码里的内置模板）。新加隐藏项照这个来。

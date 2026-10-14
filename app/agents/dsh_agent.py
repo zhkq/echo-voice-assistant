@@ -651,7 +651,7 @@ class DshAgent(AgentAdapter):
             db.upsert_session(kind, sid, name or kind, agent=self.name)
         return sid
 
-    def wait_for_reply(self, session_id, timeout=90, poll=0.5):
+    def wait_for_reply(self, session_id, timeout=90, poll=0.5, cancel_on_timeout=True):
         """发送后轮询会话事件，等待助手最终回复。
 
         返回 (reply, done)：
@@ -660,6 +660,12 @@ class DshAgent(AgentAdapter):
 
         信号1：session.list 中该会话 running=false
         信号2：事件 seq 停止推进且已取到回复
+
+        ⚠️ `reply` **只看本次调用之后的新消息**（`sent_seq` 之上的事件）。所以
+        timeout 很小、被反复调用时，"本窗口没有新助手文本"是很常见的 ——
+        `cancel_on_timeout=False` 就是给这种调用方的（超时只代表"这一段没新消息"，
+        不许把正在干活的会话取消掉）。2026-10-14 真机事故：每日回顾的前置环节用 3 秒
+        窗口轮询，默认的取消把它每几秒打断一次，于是"每日回顾不工作"。
         """
         sent_seq = None
         try:
@@ -724,8 +730,9 @@ class DshAgent(AgentAdapter):
                 break
             if (not saw_turn_end) and done_now and reply and stable >= 8:
                 break
-        if reply is None:
-            # 超时未收到回复：取消当前轮，避免会话被卡住影响下一条命令
+        if reply is None and cancel_on_timeout:
+            # 超时未收到回复：取消当前轮，避免会话被卡住影响下一条命令。
+            # 小窗口轮询的调用方要传 cancel_on_timeout=False（见 docstring）。
             try:
                 self.cancel(session_id)
             except Exception:

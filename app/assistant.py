@@ -697,17 +697,24 @@ def _review_worker(source):
         # 2026-10-13 用户口径：点「开始回顾」后先收集素材，**开场立刻出声**告诉他
         # "我开始了什么 + 大概多久"（免得不知道有没有触发），**主动探测**到做完再开麦；
         # 探不到就带一句说明进入口述 —— 不卡死、也不假装扫完了。
-        pre = daily_review.preflight(client=client, on_ack=_review_speak)
+        pre = daily_review.preflight(client=client, on_ack=_review_speak,
+                                     should_stop=_review_stop.is_set)
         if pre.get("finished"):
             db.add_log("info", "assistant",
                        "前置环节完成（%.1fs）" % (pre.get("seconds") or 0.0))
         else:
             db.add_log("warn", "assistant",
                        "前置环节未完成：%s" % (pre.get("error") or "未知"))
-            _review_speak("素材还在扫，先开始说你的内容。")
-        if cfg.get("beepOnStart", True):
-            tts_mod.play_beep("start")
-        _review_speak("扫完了，开始今天的回顾，你讲。")
+        if _review_stop.is_set():
+            # 前置环节期间用户按了停（或喊了停）：**不要再念**"开始今天的回顾" ——
+            # 那听起来像没听见他。直接走下面的收尾分支说结束语。
+            db.add_log("info", "assistant", "前置环节期间用户结束了回顾")
+        else:
+            if not pre.get("finished"):
+                _review_speak("素材还在扫，先开始说你的内容。")
+            if cfg.get("beepOnStart", True):
+                tts_mod.play_beep("start")
+            _review_speak("扫完了，开始今天的回顾，你讲。")
 
         while not _review_stop.is_set():
             turns += 1
@@ -765,7 +772,18 @@ def _review_worker(source):
                 break
 
             set_phase("running")
-            out = daily_review.submit(text, client=client)
+            # 等待期间报一次"还在整理"（用户 2026-10-14："回顾动作耗时都比较长"）——
+            # 不打字/不说话地干等，车里会以为又卡了。只报一次，避免唠叨。
+            _wait_note = {"said": False}
+
+            def _round_progress(seconds, _stalled=False, _note=_wait_note):
+                if _note["said"] or seconds < 60:
+                    return
+                _note["said"] = True
+                _review_speak("这一段我还在整理，你稍等一下。")
+
+            out = daily_review.submit(text, client=client, turn=turns,
+                                      on_wait=_round_progress)
             spoken = out.get("spoken") or ""
             if out.get("ok"):
                 db.add_log("info", "assistant",

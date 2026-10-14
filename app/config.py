@@ -766,8 +766,12 @@ DEFAULTS = {
                                  description="说完后静音多久算这一段讲完。太短会把思考停顿切断，"
                                              "太长会让你以为没听见",
                                  value_type="int"),
-    "dailyReviewReplyTimeoutSec": dict(value=180, grp="review", label="等 DSH 整理上限（秒）",
-                                       description="回顾涉及读日志、写日志、追问，比单轮问答慢",
+    "dailyReviewReplyTimeoutSec": dict(value=180, grp="review",
+                                       label="等 DSH 整理：多久没动静提醒（秒）",
+                                       description="回顾涉及读日志、写日志、追问，比单轮问答慢，"
+                                                   "所以**不按固定秒数掐断**：ECHO 会一直探会话进展，"
+                                                   "只要还在出事件就继续等；这段没动静就提醒你一句。"
+                                                   "单轮硬上限 15 分钟",
                                        value_type="int"),
     "dailyReviewBroadcastChars": dict(value=120, grp="review",
                                       label="播报稿字数上限",
@@ -775,10 +779,33 @@ DEFAULTS = {
                                                   "语音反馈不能冗长（用户 2026-10-06 明确要求）",
                                       value_type="int"),
     "dailyReviewPrompt": dict(value=_DAILY_REVIEW_PROMPT_V1, grp="review",
-                              label="回顾提交模板",
-                              description="送入 DSH 的回顾指令模板；占位符："
-                                          "{vault} {date} {time} {weekday} {transcript}",
+                              label="首次回顾模板",
+                              description="当天**第一段**口述送入 DSH 的指令模板；占位符："
+                                          "{vault} {date} {time} {weekday} {transcript}。"
+                                          "后续（续说）用短模板 dailyReviewPromptNext —— "
+                                          "只带转写、登记与播报契约（用户 2026-10-14 口径）",
                               value_type="str"),
+    # 续说轮次的短模板（2026-10-14 用户口径："不用带首次回顾那么复杂的系统提示词，
+    # 用户的转写要求不突出"）。**隐藏项**：不出现在设置页，但仍可经 PUT /api/settings 改
+    # （留空 = 用 `daily_review.DEFAULT_NEXT_PROMPT` 那一份内置短模板）。
+    # 为什么留空而不是把文案抄一份在这儿：文案跟 `build_prompt` 的兜底逻辑放一起，
+    # 只有一处会漂移；这里再抄一份必然对不上。
+    "dailyReviewPromptNext": dict(value="", grp="review",
+                                  label="续说回顾模板（隐藏）",
+                                  description="当天第 2 段起（续说）用的短模板，占位符与首次模板相同；"
+                                              "留空 = 用内置短模板。不出现在设置页",
+                                  value_type="str", hidden=True),
+    # 前置环节（技能第 0 步）的指令模板。同样是**隐藏项**：留空 = 用
+    # `daily_review.DEFAULT_PRE_PROMPT`。
+    # ⚠️ 2026-10-14 修：它原来**没在 DEFAULTS 里声明**，而 `Settings.update()` 有一句
+    # `if k not in DEFAULTS: continue` —— 于是"想改文案可以设隐藏设置 dailyReviewPrePrompt"
+    # 那句注释**根本不成立**（PUT 会被静默丢掉）。要能被改，就必须在这里声明成 hidden。
+    "dailyReviewPrePrompt": dict(value="", grp="review",
+                                 label="回顾前置环节模板（隐藏）",
+                                 description="点「开始回顾」后先跑素材收集（技能第 0 步）那条指令的模板，"
+                                             "占位符：{vault} {date} {time} {weekday} {chars} {meetings}；"
+                                             "留空 = 用内置模板。不出现在设置页",
+                                 value_type="str", hidden=True),
     # ---------- 纪要归档（工作日志 / 笔记库）----------
     # 设计：ECHO 只负责"把材料备齐 + 定位笔记库"，至于写到哪个目录、日志长什么样、
     # 有哪些专项与例会，全部由用户自己的归档技能（skill）决定。因此这里只有 4 项，

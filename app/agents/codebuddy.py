@@ -260,7 +260,9 @@ class CodeBuddyAgent(AgentAdapter):
         self._pending = (session_id, text)
         return True
 
-    def wait_for_reply(self, session_id, timeout=90, poll=0.5):
+    def wait_for_reply(self, session_id, timeout=90, poll=0.5, cancel_on_timeout=True):
+        # `cancel_on_timeout` 收下但不用：CodeBuddy 是"调用即完成"的无状态后端，
+        # 没有"把驻留会话取消掉"这回事（`cancel()` 本身就是 no-op）。
         pending = getattr(self, "_pending", None)
         if not pending:
             return None, True

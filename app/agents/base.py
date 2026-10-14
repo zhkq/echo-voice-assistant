@@ -85,8 +85,15 @@ class AgentAdapter:
         """发送一条指令。"""
         raise NotImplementedError
 
-    def wait_for_reply(self, session_id, timeout=90, poll=0.5):
-        """等待本轮最终回复，返回 (reply, done)。"""
+    def wait_for_reply(self, session_id, timeout=90, poll=0.5, cancel_on_timeout=True):
+        """等待本轮最终回复，返回 (reply, done)。
+
+        `cancel_on_timeout=False` = **这一段时间没等到回复也不许取消会话**。
+        什么时候要它（2026-10-14 真机事故，见 `daily_review.preflight`）：调用方只是
+        "每几秒探一探"（例如每日回顾的前置环节在等一条要跑几分钟的长活），
+        这时"本窗口没有新消息"**不代表**智能体卡住了 —— 默认的取消收尾会把正在干活的
+        智能体一秒一秒地打断，活永远干不完。
+        """
         raise NotImplementedError
 
     def cancel(self, session_id):

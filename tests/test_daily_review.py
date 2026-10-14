@@ -72,8 +72,8 @@ class _FakeClient:
         self.prompted.append(text)
         return True
 
-    def wait_for_reply(self, session_id, timeout=90, poll=0.5):
-        self.calls.append(("wait_for_reply", session_id, timeout))
+    def wait_for_reply(self, session_id, timeout=90, poll=0.5, cancel_on_timeout=True):
+        self.calls.append(("wait_for_reply", session_id, timeout, cancel_on_timeout))
         return self.reply, True
 
 
@@ -292,11 +292,15 @@ class SubmitTests(_Base):
 
     def test_timeout_speaks_a_sentence_instead_of_silence(self):
         class _NoReply(_FakeClient):
-            def wait_for_reply(self, session_id, timeout=90, poll=0.5):
+            def wait_for_reply(self, session_id, timeout=90, poll=0.5,
+                               cancel_on_timeout=True):
                 return "", False
 
         self._patch_client(_NoReply())
-        out = daily_review.submit("说了点东西")
+        # 这一档测的是"永远不结束"的极端：把硬上限压小，别让用例真的等 15 分钟
+        with mock.patch.object(daily_review, "ROUND_HARD_MAX_S", 0.3), \
+             mock.patch.object(daily_review, "ROUND_POLL_S", 0.02):
+            out = daily_review.submit("说了点东西")
         self.assertFalse(out["ok"])
         self.assertTrue(out["spoken"].strip(), "超时也必须给用户一句话")
         self.assertIn("超时", out["error"])
@@ -329,6 +333,122 @@ class SubmitTests(_Base):
         rows = db._query("SELECT * FROM logs WHERE source='daily_review' ORDER BY id DESC")
         self.assertTrue(any("播报" in (r["message"] or "") for r in rows),
                         "未按契约输出时必须在日志里留痕")
+
+
+class RoundTemplatesTests(_Base):
+    """首轮用完整模板、**续说轮次用短模板**（2026-10-14 用户口径）。"""
+
+    def _patch_client(self, client):
+        self._orig = daily_review._client
+        daily_review._client = lambda: client
+        self.addCleanup(lambda: setattr(daily_review, "_client", self._orig))
+
+    def test_the_first_round_keeps_the_full_briefing(self):
+        first = daily_review.build_prompt("第一段", vault="V", turn=1)
+        self.assertIn("不要臆造专项目录", first)
+        self.assertIn("第一段", first)
+
+    def test_later_rounds_use_the_short_template_and_put_the_transcript_first(self):
+        first = daily_review.build_prompt("第一段", vault="V", turn=1)
+        nxt = daily_review.build_prompt("第二段", vault="V", turn=2)
+        self.assertNotIn("不要臆造专项目录", nxt, "续说轮次不该再背首轮那套长要求")
+        self.assertIn("第二段", nxt)
+        self.assertIn("【播报】", nxt, "播报契约每轮都要有")
+        self.assertLess(nxt.index("第二段"), nxt.index("【播报】"),
+                        "用户转写要顶在最前面（用户口径：转写要求不突出）")
+        self.assertLess(len(nxt), len(first), "续说模板必须更短")
+
+    def test_the_next_template_is_overridable_by_a_hidden_setting(self):
+        settings.update({"dailyReviewPromptNext": "短模板 {transcript} / {vault}"})
+        try:
+            out = daily_review.build_prompt("原话", vault="V", turn=3)
+        finally:
+            settings.update({"dailyReviewPromptNext": ""})
+        self.assertEqual(out, "短模板 原话 / V")
+
+    def test_submit_carries_the_turn_into_the_template(self):
+        client = _FakeClient()
+        self._patch_client(client)
+        daily_review.submit("第二段口述", turn=2)
+        self.assertIn("【每日回顾·续说】", client.prompted[0])
+
+    def test_submit_derives_the_turn_from_todays_rows(self):
+        """手机/面板那条路是"一次一个请求"，轮次靠**今天已落库的条数**推出来。"""
+        client = _FakeClient()
+        self._patch_client(client)
+        daily_review.submit("第一段")
+        daily_review.submit("第二段")
+        self.assertIn("【每日回顾】", client.prompted[0])
+        self.assertIn("【每日回顾·续说】", client.prompted[1])
+
+
+class RoundWaitTests(_Base):
+    """轮次等待：**按会话进展判完成**，不是"到点就开下一轮"（2026-10-14 用户口径）。
+
+    现场：一轮真跑 4 分钟（读日志 + 写日志 + 追问）→ 固定 180 秒上限一到就判"没回复"，
+    而智能体还在干活 —— 紧接着开麦录下一轮，下一段口述插进正在跑的轮次里。
+    """
+
+    def test_it_keeps_waiting_while_the_session_is_still_working(self):
+        """长时间在跑的会话不许被掐断；"没动静"只提醒，仍然接着等。"""
+
+        class C:
+            def __init__(self):
+                self.polls = 0
+
+            def wait_for_reply(self, sid, timeout=0, poll=0.5, cancel_on_timeout=True):
+                self.polls += 1
+                if self.polls < 6:
+                    return ("", False)       # 还在跑（读日志/写日志/调工具）
+                return ("【播报】记好了。【/播报】", True)
+
+        c = C()
+        notes = []
+        with mock.patch.object(daily_review, "ROUND_POLL_S", 0.01), \
+             mock.patch.object(daily_review, "ROUND_HARD_MAX_S", 5.0):
+            out = daily_review.wait_for_turn(c, "S1", stall_s=0.02,
+                                             on_wait=lambda *a: notes.append(a))
+        self.assertTrue(out["done"], out)
+        self.assertIn("记好了", out["reply"])
+        self.assertGreaterEqual(c.polls, 6, "一轮没结束就要接着探，不许提前放弃")
+        self.assertTrue(notes, "等待期间要给面板/语音一个进展回调")
+
+    def test_it_gives_up_at_the_hard_cap_with_a_sentence(self):
+        class C:
+            def wait_for_reply(self, sid, timeout=0, poll=0.5, cancel_on_timeout=True):
+                return ("", False)           # 永远不结束（真卡死）
+
+        with mock.patch.object(daily_review, "ROUND_POLL_S", 0.01), \
+             mock.patch.object(daily_review, "ROUND_HARD_MAX_S", 0.2):
+            out = daily_review.wait_for_turn(C(), "S1", stall_s=0.05)
+        self.assertFalse(out["done"])
+        self.assertIn("超时", out["error"])
+
+    def test_it_finishes_at_the_first_text_when_the_turn_ends(self):
+        class C:
+            def wait_for_reply(self, sid, timeout=0, poll=0.5, cancel_on_timeout=True):
+                return ("【播报】好了。【/播报】", True)
+
+        with mock.patch.object(daily_review, "ROUND_POLL_S", 0.01):
+            out = daily_review.wait_for_turn(C(), "S1", stall_s=5)
+        self.assertTrue(out["done"], out)
+        self.assertEqual(out["reply"], "【播报】好了。【/播报】")
+
+    def test_an_idle_turn_without_any_text_is_reported_instead_of_waited_out(self):
+        """会话结束了却一条文本都没有 = 这一轮没结果，**立刻**如实返回（不空等 15 分钟）。"""
+
+        class C:
+            def wait_for_reply(self, sid, timeout=0, poll=0.5, cancel_on_timeout=True):
+                return ("", True)
+
+        with mock.patch.object(daily_review, "ROUND_POLL_S", 0.01), \
+             mock.patch.object(daily_review, "ROUND_START_GRACE_S", 0.05), \
+             mock.patch.object(daily_review, "ROUND_HARD_MAX_S", 5.0):
+            out = daily_review.wait_for_turn(C(), "S1", stall_s=5,
+                                             hard_max_s=5.0)
+        self.assertFalse(out["done"])
+        self.assertIn("没拿到整理结果", out["error"])
+        self.assertLess(out["seconds"], 1.0, "空闲无文本应当立刻返回，不该等满硬上限")
 
 
 class SettingsTests(_Base):
@@ -598,6 +718,11 @@ class PreflightTests(unittest.TestCase):
             vault_root=lambda: "V",
         )
 
+    def _fast(self, max_s=5.0):
+        """把探测节奏压到毫秒级 —— 用例不该真的等 3 秒 × N 次（更不该等 900 秒）。"""
+        from unittest.mock import patch
+        return patch.multiple(daily_review, PRE_POLL_S=0.01, PRE_MAX_S=max_s)
+
     def test_the_pre_prompt_follows_skill_step_0_and_never_carries_a_transcript(self):
         p = daily_review.build_pre_prompt(vault="V")
         for token in ("前置环节", "第 0 步", "scan_cache.py", "会议记录", "静默"):
@@ -618,12 +743,15 @@ class PreflightTests(unittest.TestCase):
             def __init__(self):
                 self.prompts = []
                 self.polls = 0
+                self.cancels = []
 
             def prompt(self, sid, text):
                 self.prompts.append((sid, text))
 
-            def wait_for_reply(self, sid, timeout=0):
+            def wait_for_reply(self, sid, timeout=0, poll=0.5, cancel_on_timeout=True):
                 self.polls += 1
+                if not cancel_on_timeout:
+                    self.cancels.append(cancel_on_timeout)
                 if self.polls < 2:
                     return ("", False)          # 还在扫，什么回复都还没有
                 # 第二次探测才等到**完成标记**（`done` 本身不算数，见 PRE_DONE_MARK）
@@ -652,7 +780,7 @@ class PreflightTests(unittest.TestCase):
             def prompt(self, sid, text):
                 self.prompts.append(text)
 
-            def wait_for_reply(self, sid, timeout=0):
+            def wait_for_reply(self, sid, timeout=0, poll=0.5, cancel_on_timeout=True):
                 if len(self.prompts) < 2:
                     return ("好，我先扫一下今天的文件和会议，大概需要一分钟。", True)
                 return ("前置环节完成：文件 5（专项 2）、会议 2（例会 1）", True)
@@ -670,7 +798,7 @@ class PreflightTests(unittest.TestCase):
             def prompt(self, sid, text):
                 pass
 
-            def wait_for_reply(self, sid, timeout=0):
+            def wait_for_reply(self, sid, timeout=0, poll=0.5, cancel_on_timeout=True):
                 raise RuntimeError("探测炸了")
 
         with self._isolate():
@@ -686,6 +814,106 @@ class PreflightTests(unittest.TestCase):
         self.assertFalse(out["ok"])
         self.assertIn("没配笔记库", out["error"])
         self.assertEqual(daily_review.pre_state()["phase"], "failed")
+
+    def test_the_probe_never_lets_the_backend_cancel_the_running_turn(self):
+        """2026-10-14 真机事故的护栏：小窗口轮询**不许**取消会话。
+
+        现场：`wait_for_reply(timeout=3)` 在"这 3 秒没有**新的**助手文本"时会
+        `session/cancel` 收尾，而前置环节是一条几分钟的长活（扫缓存 + 读纪要）——
+        于是智能体每几秒被「已停止」一次（工具报 `aborted before completion`），
+        永远走不到「前置环节完成」，ECHO 追问 3 次后干等 15 分钟。
+        """
+
+        class C:
+            def __init__(self):
+                self.prompts = []
+                self.polls = 0
+                self.cancel_flags = []
+                self.cancel_calls = 0
+
+            def prompt(self, sid, text):
+                self.prompts.append(text)
+
+            def wait_for_reply(self, sid, timeout=0, poll=0.5, cancel_on_timeout=True):
+                self.cancel_flags.append(cancel_on_timeout)
+                self.polls += 1
+                if self.polls < 2:
+                    return ("", False)       # 还在跑：这段窗口里没有新的助手文本
+                return ("前置环节完成：文件 2（专项 0）、会议 1（例会 0）", True)
+
+            def cancel(self, sid):
+                self.cancel_calls += 1
+
+        c = C()
+        with self._isolate():
+            out = daily_review.preflight(client=c)
+        self.assertTrue(out["finished"], out)
+        self.assertTrue(c.cancel_flags, "前置环节必须真的探过")
+        self.assertEqual(set(c.cancel_flags), {False},
+                         "探测一律 cancel_on_timeout=False（否则会打断正在干活的会话）")
+        self.assertEqual(c.cancel_calls, 0, "回顾期间不许取消会话")
+
+    def test_a_running_turn_is_never_nudged(self):
+        """会话还在跑（done=False）时**不许追问** —— 追问会插进正在干的活里。"""
+
+        class C:
+            def __init__(self):
+                self.prompts = []
+
+            def prompt(self, sid, text):
+                self.prompts.append(text)
+
+            def wait_for_reply(self, sid, timeout=0, poll=0.5, cancel_on_timeout=True):
+                return ("", False)           # 长活在跑：没有新文本，也没有结束
+
+        c = C()
+        with self._isolate(), self._fast(max_s=0.3):
+            out = daily_review.preflight(client=c)
+        self.assertFalse(out["finished"])
+        self.assertTrue(out["timed_out"], out)
+        self.assertEqual(len(c.prompts), 1, "只该有前置指令那一条，不许有追问")
+
+    def test_nudges_are_exhausted_and_reported_instead_of_waiting_15_minutes(self):
+        """追问用尽就**如实收尾** —— 不许让用户对着"没反应"干等 15 分钟。"""
+
+        class C:
+            def __init__(self):
+                self.prompts = []
+
+            def prompt(self, sid, text):
+                self.prompts.append(text)
+
+            def wait_for_reply(self, sid, timeout=0, poll=0.5, cancel_on_timeout=True):
+                return ("好的，我先看看。", True)   # 每轮都结束，但从不带完成标记
+
+        c = C()
+        with self._isolate(), self._fast(max_s=5.0):
+            out = daily_review.preflight(client=c)
+        self.assertFalse(out["finished"])
+        self.assertEqual(out["nudges"], daily_review.PRE_NUDGE_MAX)
+        self.assertEqual(len(c.prompts), 1 + daily_review.PRE_NUDGE_MAX)
+        self.assertIn("追问", out["error"])
+        self.assertFalse(out["timed_out"], "是「追问用尽」收尾，不是空等到 900 秒")
+
+    def test_stop_request_ends_the_probe_at_once(self):
+        """用户按停 / 喊停后**当轮收尾**（原来要等满 15 分钟才轮到 while 看停止标志）。"""
+
+        class C:
+            def __init__(self):
+                self.prompts = []
+
+            def prompt(self, sid, text):
+                self.prompts.append(text)
+
+            def wait_for_reply(self, sid, timeout=0, poll=0.5, cancel_on_timeout=True):
+                return ("", False)
+
+        c = C()
+        with self._isolate(), self._fast(max_s=30.0):
+            out = daily_review.preflight(client=c, should_stop=lambda: True)
+        self.assertFalse(out["finished"])
+        self.assertIn("结束", out["error"])
+        self.assertEqual(len(c.prompts), 1, "停止之后不该再发任何东西")
 
     def test_the_worker_runs_the_preflight_before_it_starts_recording(self):
         """**串行**：前置环节必须在 `record_command()` 之前（技能："在接收用户口述之前"）。"""

@@ -215,11 +215,41 @@ def wants_stop(text: str) -> bool:
     return any(p in t for p in STOP_PATTERNS)
 
 
-def build_prompt(transcript: str, vault: str = "", now=None) -> str:
+#: 「续说轮次」的指令模板（2026-10-14 用户口径：*"不用带首次回顾那么复杂的系统提示词，
+#: 用户的转写要求不突出"*）。
+#:
+#: 第一轮那份 `dailyReviewPrompt` 里有四条长篇要求（读历史、双向链接、遗漏检查……）——
+#: 那是**开场**才需要的口径；第 2 轮起用户只是接着补一句，长要求会把"我这段说了什么"
+#: 淹没掉，技能反而容易跑偏。所以续说轮次只给三件事：**转写（唯一真相）+ 登记 + 播报契约**。
+#: 其余规则本来就在 `daily-review` 技能里写着，不必每轮重复。
+#:
+#: 想改文案可以设隐藏设置 `dailyReviewPromptNext`（与 `dailyReviewPrePrompt` 同一套做法：
+#: 读不到就用这一份，不定义也能跑）。
+DEFAULT_NEXT_PROMPT = (
+    "【每日回顾·续说】\n"
+    "笔记库根目录：{vault}\n"
+    "当前时间：{date} {time}（星期{weekday}）\n"
+    "\n"
+    "【我刚才说的（原始转写，唯一真相，不要改写）】\n"
+    "{transcript}\n"
+    "【/原始转写】\n"
+    "\n"
+    "请按 daily-review 技能把**这一段**登记进工作日志（已有内容只追加、别覆盖），"
+    "需要的话顺带补一句待办。\n"
+    "本回合只回一段【播报】…【/播报】：口语化、无 Markdown、两句话以内 + 最多一个问题"
+    "（超过 {chars} 字会被截断）。")
+
+
+def build_prompt(transcript: str, vault: str = "", now=None, turn: int = 1) -> str:
     """按模板拼出送入 DSH 的回顾指令。
 
     **原始转写原样带下去**（不摘要、不改写）—— 它是唯一真相，技能要能对着原话回答
     "我第二段到底怎么说的"。
+
+    `turn` 决定用哪一份模板（见 `DEFAULT_NEXT_PROMPT`）：
+      * `turn <= 1`（当天第一次口述）→ `dailyReviewPrompt`：完整口径；
+      * `turn >= 2`（续说）→ `dailyReviewPromptNext`（缺省 = `DEFAULT_NEXT_PROMPT`）：
+        短、且把用户转写顶到最前面。
 
     **占位符用单次遍历替换，不是顺序 `str.replace`**（2026-10-06 实测抓到的两个 bug）：
     ① 顺序替换时，`{transcript}` 若排在 `{weekday}` / `{chars}` 前面，那么**用户口述里**
@@ -240,7 +270,16 @@ def build_prompt(transcript: str, vault: str = "", now=None) -> str:
         "chars": str(broadcast_limit_chars()),
         "transcript": transcript or "",
     }
-    tpl = str(settings.get("dailyReviewPrompt", "") or "").strip()
+    try:
+        first = int(turn or 1) <= 1
+    except (TypeError, ValueError):
+        first = True
+    if first:
+        tpl = str(settings.get("dailyReviewPrompt", "") or "").strip()
+    else:
+        # ⚠️ 键名写成字面量：`scripts/audit-settings.py` 按 `settings.get("键")` 做静态审计，
+        # 包一层变量会让它被判成"写进去没人读"（tests/test_settings_wiring.py 会红）。
+        tpl = str(settings.get("dailyReviewPromptNext", "") or "").strip() or DEFAULT_NEXT_PROMPT
     if not tpl:
         # 模板被清空时的兜底：最少要保证"转写 + 播报契约"两件事都在
         tpl = (
@@ -354,12 +393,152 @@ def ensure_access(client=None):
     return worklog.ensure_dsh_default_access()
 
 
-def submit(transcript: str, client=None, force_new=False, timeout=0):
+# ------------------------------------------------- 轮次等待：按"会话进展"判完成
+#
+# 2026-10-14 用户口径（原话）："目前你配置了每轮等待的最大时长，但是回顾动作耗时都比较长，
+# 你能不能通过探测会话进展来确定会话是否执行完成，而不是直接开启下一轮"。
+#
+# 原来的做法是 `wait_for_reply(sid, timeout=dailyReviewReplyTimeoutSec)` 一把等 180 秒：
+#   * 一轮真的跑了 4 分钟（读日志 + 写日志 + 追问）→ 180 秒到点，ECHO 判"没回复"，
+#     但**智能体还在干活** —— 紧接着就开麦录下一轮，下一段口述插进正在跑的轮次里；
+#   * 反过来，秒回的那种也要空等到窗口结束（`wait_for_reply` 的判定框是"turn/end + 文本稳定"，
+#     基本能早退，但一旦漏判就是干等）。
+#
+# 现在改成**探测会话进展**：
+#   ① 会话空闲连续 `ROUND_IDLE_POLLS` 次 + 已拿到助手文本 → 完成；
+#   ② 空闲了却一条文本都没有 → 这一轮没结果，如实返回（不空等）；
+#   ③ **还在跑就继续等**（读日志/写日志/调工具都算进展）；沉默超过
+#      `dailyReviewReplyTimeoutSec`（语义改为"多久没动静就提醒用户一句"）只在日志与
+#      `on_wait` 回调里报一次，**不掐断**；
+#   ④ 硬上限 `ROUND_HARD_MAX_S`（15 分钟）到了才放弃 —— 真卡死也要给用户一句话。
+#
+# 全程 `cancel_on_timeout=False`：等待本身绝不许取消会话（2026-10-14 的前置环节事故，
+# 见 `preflight` 的说明）。
+ROUND_POLL_S = 3.0          # 每 3 秒探一次"这一轮做完没有"
+ROUND_IDLE_POLLS = 2        # 连续两次空闲才算做完（工具调用间隙 `running` 会闪断）
+ROUND_HARD_MAX_S = 900.0    # 单轮硬上限：15 分钟
+ROUND_START_GRACE_S = 12.0  # 指令刚发下去时的宽限：还没开始跑就先别判"没结果"
+
+
+def _probe_reply(client, session_id, timeout, poll=ROUND_POLL_S):
+    """调 `wait_for_reply`，**逐级退让**到替身/老适配器也能用。
+
+    `cancel_on_timeout=False` 是 2026-10-14 才加的（见 `preflight`）：不认这个参数的
+    适配器/测试替身要能照常工作，所以从"参数最全"试到"只有 timeout"。
+    """
+    for kwargs in ({"timeout": timeout, "poll": poll, "cancel_on_timeout": False},
+                   {"timeout": timeout, "poll": poll},
+                   {"timeout": timeout}):
+        try:
+            return client.wait_for_reply(session_id, **kwargs)
+        except TypeError:
+            continue
+    return client.wait_for_reply(session_id, timeout)
+
+
+def _session_cursor(client, session_id):
+    """会话当前的事件游标（seq）—— "有没有新进展"的信号；取不到返回 None。
+
+    走公开的 `history()`（`DshAgent` 用 `session/page` 读出来的 seq）；没有这个方法的
+    后端（CodeBuddy 那种一调用就完事的）返回 None，等待逻辑会自动退化成"只看空闲/文本"。
+    """
+    fn = getattr(client, "history", None)
+    if not callable(fn):
+        return None
+    try:
+        events = fn(session_id, max_messages=3)
+        if events:
+            return (events[-1].get("event") or {}).get("seq")
+    except Exception:                                            # noqa: BLE001 - 游标只是加速信号
+        return None
+    return None
+
+
+def wait_for_turn(client, session_id, stall_s=0, hard_max_s=0, on_wait=None) -> dict:
+    """等**这一轮**的会话真的做完（按进展判），返回 dict —— **不抛异常、不取消会话**。
+
+    返回：`{reply, done, seconds, idle, progress, stalled, error}`
+      * `reply` —— 本轮最后一条助手文本（跨窗口累积，不会因为"窗口没新消息"丢掉）；
+      * `done`  —— 会话空闲且拿到了文本（= 这一轮真的做完了）；
+      * `stalled` —— 期间出现过"超过 `stall_s` 没动静"（只用于**提醒**，不掐断）；
+      * `error` —— 没拿到结果时的人话原因。
+    """
+    import app.db as db
+
+    stall = float(stall_s or reply_timeout_s())
+    hard = float(hard_max_s or ROUND_HARD_MAX_S)
+    t0 = time.time()
+    last_progress = t0
+    last_cursor = _session_cursor(client, session_id)
+    best = ""
+    idle = 0
+    moves = 0
+    warned = False
+    out = {"reply": "", "done": False, "seconds": 0.0, "idle": 0,
+           "progress": 0, "stalled": False, "error": ""}
+    while True:
+        now = time.time()
+        if now - t0 >= hard:
+            out["error"] = "等整理超时（超过 %.0f 秒硬上限，会话可能卡住了）" % hard
+            break
+        if now - last_progress >= stall and not warned:
+            # 只提醒一次：**不掐断**（长活可能就是一个工具在跑，没有中间事件）
+            warned = True
+            out["stalled"] = True
+            db.add_log("warn", "daily_review",
+                       "等整理时已有 %d 秒没有任何新进展（会话 %s）——继续等，不掐断"
+                       % (int(now - last_progress), session_id))
+        left = min(ROUND_POLL_S, max(0.5, hard - (now - t0)))
+        try:
+            reply, done = _probe_reply(client, session_id, left)
+        except Exception as e:                                   # noqa: BLE001 - 探测出错不许卡住
+            out["error"] = "等整理时探测失败：%s" % e
+            break
+        if reply:
+            best = reply
+            last_progress = time.time()
+        cur = _session_cursor(client, session_id)
+        if cur is not None and cur != last_cursor:
+            last_cursor = cur
+            moves += 1
+            last_progress = time.time()
+        idle = idle + 1 if done else 0
+        if callable(on_wait):
+            try:
+                on_wait(round(time.time() - t0, 1), out["stalled"])
+            except Exception:                                    # noqa: BLE001 - 提醒失败不致命
+                pass
+        if idle >= ROUND_IDLE_POLLS:
+            if best:
+                out["done"] = True
+            elif moves == 0 and (time.time() - t0) < ROUND_START_GRACE_S:
+                pass            # 指令刚发下去、会话还没开始跑：再等一轮，别急着判"没结果"
+            else:
+                out["error"] = "本轮会话结束了，但没拿到整理结果（智能体没输出文本）"
+            if out["done"] or out["error"]:
+                break
+    out["reply"] = best
+    out["idle"] = idle
+    out["progress"] = moves
+    out["seconds"] = round(time.time() - t0, 1)
+    db.add_log("info" if out["done"] else "warn", "daily_review",
+               "等整理%s（%.1fs，事件 %d 次%s）"
+               % ("完成" if out["done"] else "未完成", out["seconds"], moves,
+                  "" if out["done"] else "：" + out["error"]))
+    return out
+
+
+def submit(transcript: str, client=None, force_new=False, timeout=0,
+           turn=0, on_wait=None):
     """把一段口述交给今天的回顾会话，返回结果 dict（**不抛异常**）。
 
     返回：`{ok, session_id, workspace, reply, spoken, source, error, seconds}`
       * `spoken` —— 要念出来的话（已经过三层兜底）
       * `source` —— `broadcast` / `first_paragraph` / `fallback`，用于排障
+
+    `turn`：当天的第几段口述（1 = 第一次）。**不传（0）就按今天已经落库的轮数自动算**，
+    于是"续说"自动用短模板（见 `build_prompt` / `DEFAULT_NEXT_PROMPT`）。
+    `on_wait(seconds, stalled)`：等待期间的回调（面板/语音用它报一句"还在整理"）。
     """
     import app.db as db
 
@@ -399,28 +578,36 @@ def submit(transcript: str, client=None, force_new=False, timeout=0):
             out["source"] = "fallback"
             return out
 
-        # 提示词内容由设置 `dailyReviewPrompt` 决定（**代码不再按轮次改写它**：
-        # 2026-10-13 用户提醒"稳定版已经在回顾过程中迭代过" —— 尊重那份模板）。
-        prompt = build_prompt(transcript, vault=vault)
+        # 提示词内容由设置 `dailyReviewPrompt`（首轮）/ `dailyReviewPromptNext`（续说）决定
+        # （**代码不再按轮次改写它**：2026-10-13 用户提醒"稳定版已经在回顾过程中迭代过"
+        # —— 尊重那份模板）。轮次只用来**选哪一份模板**：第 2 段起用短的那份。
+        try:
+            turn_no = int(turn or 0)
+        except (TypeError, ValueError):
+            turn_no = 0
+        if turn_no <= 0:
+            turn_no = len(_rows_for_date(time.strftime("%Y-%m-%d", time.localtime()))) + 1
+        prompt = build_prompt(transcript, vault=vault, turn=turn_no)
         client.prompt(sid, prompt)
-        reply, done = client.wait_for_reply(
-            sid, timeout=timeout or reply_timeout_s())
-        out["reply"] = reply or ""
-        if not reply:
-            out["error"] = "DSH 在超时内没有回复"
+        wait = wait_for_turn(client, sid, stall_s=timeout or reply_timeout_s(),
+                             on_wait=on_wait)
+        out["reply"] = wait.get("reply") or ""
+        if not out["reply"]:
+            out["error"] = wait.get("error") or "DSH 在超时内没有回复"
             out["spoken"] = "这次整理没等到结果，等会儿再试一次。"
             out["source"] = "fallback"
             db.add_log("warn", "daily_review",
-                       f"回顾超时（{timeout or reply_timeout_s()}s，done={done}）会话 {sid}")
+                       "回顾没有结果：%s（会话 %s，等 %.1fs）"
+                       % (out["error"], sid, wait.get("seconds") or 0.0))
             return out
-        spoken, source = extract_broadcast(reply)
+        spoken, source = extract_broadcast(out["reply"])
         out["spoken"] = spoken
         out["source"] = source
         out["ok"] = True
         if source != "broadcast":
             # 技能没按契约输出：必须留下痕迹，否则"念错内容"永远查不出来
             db.add_log("warn", "daily_review",
-                       f"技能未按【播报】契约输出（本次用 {source} 兜底）：{reply[:120]}")
+                       f"技能未按【播报】契约输出（本次用 {source} 兜底）：{out['reply'][:120]}")
     except Exception as e:
         out["error"] = f"{type(e).__name__}: {e}"
         out["spoken"] = "回顾出了点问题，你回面板看一眼。"
@@ -723,6 +910,10 @@ PRE_ETA_S = 60        # 开场播报里的预估时长（技能 0-0 的原话就
 #: 判早了 35.5 秒（素材还在扫，用户已经开始口述）。
 PRE_DONE_MARK = "前置环节完成"
 PRE_NUDGE_MAX = 3     # 追问上限（本轮结束却没带完成标记时）
+#: 判"**本轮真的结束了**"要连续探到几次"会话空闲"。
+#: 为什么不是一次：工具调用之间 `running` 会短暂闪断（`dsh_agent.wait_for_reply` 的
+#: 注释早就写明这点），一次就追问会把追问插进还在干活的轮次里。
+PRE_IDLE_POLLS = 2
 PRE_NUDGE_TEXT = (
     "【前置环节·继续】刚才那一轮结束了，但第 0 步还没做完（扫当天文件 + 会议纪要归档）。"
     "请继续把它做完；**全部做完后只回一句**「前置环节完成 + 计数」，不要再问问题。")
@@ -787,7 +978,8 @@ def pre_ack_text(eta=None) -> str:
             "还有 ECHO 的会议纪要；%s。扫完就开始录你说的内容。" % pre_eta_text(eta))
 
 
-def preflight(client=None, force_new=False, on_ack=None, on_progress=None) -> dict:
+def preflight(client=None, force_new=False, on_ack=None, on_progress=None,
+              should_stop=None) -> dict:
     """**前置环节（技能第 0 步）**：确保会话 → 发指令 → **主动探测**到本轮做完。
 
     串行（2026-10-13 用户拍板）：素材收集做完才开麦录口述 —— 技能里写的就是
@@ -798,6 +990,20 @@ def preflight(client=None, force_new=False, on_ack=None, on_progress=None) -> di
       * 探到完成 → `finished=True`；
       * 到点 / 探测出错 → `finished=False` + `timed_out`/`error` **如实返回**，
         由调用方带一句说明进入口述 —— **绝不卡死、也绝不假装扫完了**。
+
+    ⚠️ **探测里绝不许取消会话**（`cancel_on_timeout=False`）—— 2026-10-14 真机事故：
+    前置环节是一条**几分钟**的长活（扫企微/微信/桌面/WPS 缓存、读当天纪要归档），
+    而 `wait_for_reply` 默认在"这个小窗口里没等到**新的**助手文本"时会 `session/cancel`
+    收尾。于是现场每 3 秒轮询就打断一次正在干活的智能体：
+      * DSH 会话里每一轮都显示「已停止」，`turn/end` 的 reason 是 `aborted/user`；
+      * 工具结果报 `glob was aborted before completion (tool caller cancellation)`；
+      * 智能体永远走不到「前置环节完成」，ECHO 追问 3 次后**空等到 15 分钟**，
+        用户看到的就是"每日回顾不工作了"。
+    同一现场还暴露出另外三处，一并按"不能卡死、也不许打断"的口径修掉：
+      * 判"本轮结束"必须**连续 `PRE_IDLE_POLLS` 次空闲**（工具间隙会闪断）；
+      * 助手文本**跨窗口保留**（`wait_for_reply` 只看本窗口的新消息，追问那一轮
+        完成标记可能落在一个"没有新文本"的窗口里）；
+      * `should_stop()` 为真（用户按停/喊停）**当轮收尾**，不再空等到 15 分钟。
     """
     import app.db as db
 
@@ -845,11 +1051,15 @@ def preflight(client=None, force_new=False, on_ack=None, on_progress=None) -> di
         return _fail("发前置指令失败：%s" % e)
 
     deadline = time.time() + PRE_MAX_S
-    silent_done = 0                          # 连续"本轮结束了但没带完成标记"
+    idle = 0                                 # 连续"会话空闲"的次数（见 PRE_IDLE_POLLS）
     nudges = 0
     while time.time() < deadline:
+        if callable(should_stop) and should_stop():
+            out["error"] = "用户结束了这次回顾"
+            break
+        left = min(PRE_POLL_S, max(0.5, deadline - time.time()))
         try:
-            reply, done = client.wait_for_reply(sid, timeout=PRE_POLL_S)
+            reply, done = _probe_reply(client, sid, left, poll=PRE_POLL_S)
         except Exception as e:               # noqa: BLE001 - 探测出错也不许卡住
             out["error"] = "探测前置环节失败：%s" % e
             db.add_log("warn", "daily_review", out["error"])
@@ -860,12 +1070,12 @@ def preflight(client=None, force_new=False, on_ack=None, on_progress=None) -> di
                 out["finished"] = True
                 out["ok"] = True
                 break
-        if done:
-            # `done` 只说明**这一轮**结束了：技能 0-0 的开场确认、或工具调用之间的空档
-            # 都会造成它。没带完成标记 = 还没做完 → 追问一次让它接着做（有上限）。
-            silent_done += 1
-            if silent_done >= 1 and nudges < PRE_NUDGE_MAX:
+        idle = idle + 1 if done else 0
+        if idle >= PRE_IDLE_POLLS:
+            if nudges < PRE_NUDGE_MAX:
+                # 这一轮真的结束了（连续空闲），却没带完成标记 → 追问一次让它接着做
                 nudges += 1
+                idle = 0
                 db.add_log("info", "daily_review",
                            "前置环节：本轮结束但没带「%s」标记，追问第 %d 次"
                            % (PRE_DONE_MARK, nudges))
@@ -874,8 +1084,11 @@ def preflight(client=None, force_new=False, on_ack=None, on_progress=None) -> di
                 except Exception as e:       # noqa: BLE001 - 追问失败不致命
                     db.add_log("warn", "daily_review", "前置环节追问失败：%s" % e)
                     break
-                silent_done = 0
                 continue
+            # 追问用尽且会话已经闲着：**如实收尾**，别让用户对着"没反应"等满 15 分钟
+            out["error"] = ("前置环节追问 %d 次仍未拿到「%s」标记"
+                            % (PRE_NUDGE_MAX, PRE_DONE_MARK))
+            break
         if callable(on_progress):
             try:
                 on_progress(round(time.time() - _PRE["startedAt"], 1))
