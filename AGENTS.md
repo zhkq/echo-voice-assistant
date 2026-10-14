@@ -555,6 +555,11 @@ pyannote 4.0.7 在 cu126 上装得上也跑得动（600 秒音频约 26.7 秒，
      它**必须自带权重**（`--models-from` 出的那份；不带就拒绝，因为"零下载"是它的语义）✓。
      权重的真实体积（本机实测）：Qwen3-ASR 1793 MB + ForcedAligner 1755 MB +
      SenseVoice 897 MB + VAD 4 MB + pyannote 221 MB ≈ **4.7 GB**。
+  4. **交付层要带手机触点 APK**（用户 2026-10-15："apk 也放到交付包里"）：`build_delivery.py`
+     自动带 `dist\ECHO-android-*.apk`，没有就退回 `android\app\build\outputs\…\app-debug.apk`
+     （**debug 包就是现在能直接装的形态**，`android/README.md` 的构建命令就是 `assembleDebug`），
+     落进资料夹时命名 `ECHO-android-app-debug.apk`，并写进 `清单.txt`；找不到**只警告不拦**
+     （`--no-apk` 可显式不带，`--apk PATH` 可指定）。判据：`tests/test_delivery_standard.py::ApkInDeliveryTests`。
 - **尺寸对照**（用来一眼看出包对不对）：
   `client` ≈ 307 MB（kit 286 + 薄包 21）**——但 `dist` 里存在后端离线包时，`assemble` 会按默认
   把它一起带上，于是这一层是 ≈3.4 GB**（2026-10-06 实测；要"纯客户端"得先移走离线包，

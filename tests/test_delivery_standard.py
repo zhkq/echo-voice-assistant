@@ -96,6 +96,59 @@ class WeightsGuardTests(unittest.TestCase):
             bd.Path(_fake_backend(self.tmp, with_weights=True))))
 
 
+class ApkInDeliveryTests(unittest.TestCase):
+    """手机触点 APK 要真的进交付层（2026-10-15 用户："apk 也放到交付包里"）。
+
+    手机那条路（`android/`，包名 `com.echo.contact`）是交付层里唯一的"非 PC"触点：
+    资料夹给它一份 APK，同事拷到手机点了就装 —— 少了它，交付里就只有主机那一半。
+    """
+
+    def setUp(self):
+        import shutil
+        import tempfile
+        self.tmp = tempfile.mkdtemp(prefix="echo-deliv-apk-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.dist = os.path.join(self.tmp, "dist")
+        self.out = os.path.join(self.tmp, "out")
+        os.makedirs(self.dist)
+        os.makedirs(self.out)
+
+    def _apk(self, name="app-debug.apk"):
+        p = os.path.join(self.dist, name)
+        with io.open(p, "wb") as fh:
+            fh.write(b"PK\x03\x04 fake apk")
+        return p
+
+    def test_it_defaults_to_the_newest_versioned_apk_in_dist(self):
+        import time
+        self._apk("ECHO-android-old.apk")
+        time.sleep(0.02)
+        self._apk("ECHO-android-new.apk")
+        self.assertEqual(bd.default_apk(bd.Path(self.dist)).name, "ECHO-android-new.apk")
+
+    def test_the_delivered_name_says_it_is_the_phone_package(self):
+        self.assertEqual(bd.apk_dest_name(bd.Path("app-debug.apk")),
+                         "ECHO-android-app-debug.apk")
+        self.assertEqual(bd.apk_dest_name(bd.Path("ECHO-android-x.apk")),
+                         "ECHO-android-x.apk")
+
+    def test_a_layer_actually_carries_the_apk_and_says_so(self):
+        kit = bd.Path(_fake_kit(self.dist, with_bundle=True))
+        dest, out_zip = bd.assemble("20260101-0000", bd.Path(self.dist), kit_zip=kit,
+                                    apk_zip=bd.Path(self._apk()), make_the_zip=False,
+                                    out_dir=bd.Path(self.out))
+        self.assertIsNone(out_zip)
+        self.assertTrue((dest / "ECHO-android-app-debug.apk").is_file())
+        self.assertIn("ECHO-android-app-debug.apk",
+                      (dest / "清单.txt").read_text(encoding="utf-8"))
+
+    def test_no_apk_keeps_it_out(self):
+        kit = bd.Path(_fake_kit(self.dist, with_bundle=True))
+        dest, _ = bd.assemble("20260101-0001", bd.Path(self.dist), kit_zip=kit,
+                              no_apk=True, make_the_zip=False, out_dir=bd.Path(self.out))
+        self.assertEqual([p.name for p in dest.iterdir() if p.suffix == ".apk"], [])
+
+
 class WordingTests(unittest.TestCase):
     """标准要**写得出来**：场景名与配方都在，报错里要能直接照着做。"""
 
@@ -115,7 +168,8 @@ class WordingTests(unittest.TestCase):
 
     def test_cli_surface(self):
         src = _read("scripts", "build_delivery.py")
-        for flag in ("--scenario", "--allow-no-bundle", "--allow-downloads"):
+        for flag in ("--scenario", "--allow-no-bundle", "--allow-downloads",
+                     "--apk", "--no-apk"):
             with self.subTest(flag=flag):
                 self.assertIn(flag, src)
 

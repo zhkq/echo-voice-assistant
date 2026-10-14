@@ -232,6 +232,13 @@ $env:JAVA_HOME = 'C:\echo-dev\.tools\jdk\jdk-17.0.20.1+1'
 
 产物：`app\build\outputs\apk\debug\app-debug.apk`
 
+**交付层里也会带一份 APK**（用户 2026-10-15："apk 也放到交付包里"）：`scripts\build_delivery.py`
+自动把上面这个产物（或 `dist\ECHO-android-*.apk`，有的话优先用它）拷进交付资料夹，命名
+`ECHO-android-app-debug.apk`，并写进 `清单.txt` —— 同事拿到资料夹就有主机和手机两半。
+找不到 APK 时它**只警告不拦**（真要不带用 `--no-apk`，要指定别的包用 `--apk PATH`）。
+所以**出交付层之前先跑一次上面的 `assembleDebug`**；判据在
+`tests/test_delivery_standard.py::ApkInDeliveryTests`。
+
 跑单测（纯 JVM，不需要设备）：
 
 ```powershell

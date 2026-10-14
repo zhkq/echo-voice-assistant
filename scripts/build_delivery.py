@@ -167,6 +167,18 @@ BUNDLE_REQUIRED_ENTRIES = ("bundle/wheels", "bundle/models/sherpa-onnx-streaming
 #: `full-local` = 再加后端离线包，且它**必须自带权重** —— 否则"那台机器零下载"就是空话。
 SCENARIOS = ("client", "full-local")
 
+#: 手机触点（Android）的 APK —— 交付层里**要带上**（用户 2026-10-15："apk 也放到交付包里"）。
+#:
+#: 现在只有 debug 包是有意的：`android/README.md` §构建 就是 `:app:assembleDebug`，
+#: 产物 `android/app/build/outputs/apk/debug/app-debug.apk`（约 17 MB，能直接装到手机）。
+#: 带包的判据分两层：① `dist\ECHO-android-*.apk`（出过包就用最新那份）；② 退回 Gradle 产物目录
+#: （debug 优先、release 其次，最后兜底扫 `outputs\` 下任何 apk）。
+#: **找不到不算错**：交付层照样出，只是 清单.txt 里不会有那一行（手机包本来是可选的触点）。
+APK_DIST_GLOB = "ECHO-android-*.apk"
+APK_GRADLE_OUTPUTS = ("android/app/build/outputs/apk/debug/app-debug.apk",
+                      "android/app/build/outputs/apk/release/app-release.apk")
+APK_DEST_PREFIX = "ECHO-android-"
+
 #: 标准配方（帮助文本与报错里共用同一份，别抄第二遍）
 STANDARD_HOWTO = (
     "标准做法（2026-10-05 定）：客户端包要自带载荷，否则同事装的时候要联网下运行时/依赖/模型。\n"
@@ -218,7 +230,8 @@ def offline_pack_has_weights(zip_path: Path) -> bool:
         return False
 
 
-def write_manifest(dest: Path, kit: Path, thin: Path | None, offline: Path | None) -> None:
+def write_manifest(dest: Path, kit: Path, thin: Path | None, offline: Path | None,
+                   apk: Path | None = None) -> None:
     lines = [
         "这份资料夹里有什么（双击 `装我.cmd` 就装，不用手工解压）",
         "=" * 56,
@@ -232,6 +245,9 @@ def write_manifest(dest: Path, kit: Path, thin: Path | None, offline: Path | Non
     if thin:
         lines.append("%-28s 后端**薄包**：只带解释器，依赖要么从离线包装、要么联网下"
                      % thin.name)
+    if apk:
+        lines.append("%-28s 手机触点 APK（Android）：拷到手机点一下装，配对后当遥控器用"
+                     % apk.name)
     if not thin and not offline:
         lines.append("（没有后端 zip：装完在面板「能力 → 起本机后端」里配）")
     lines += [
@@ -265,8 +281,35 @@ def default_kit_zip(dist: Path) -> Path | None:
     return sorted(hits, key=lambda p: p.name)[-1] if hits else None
 
 
+def default_apk(dist: Path) -> Path | None:
+    """带哪个手机触点 APK（没有就 None —— 交付层照样出，只是不带手机包）。
+
+    顺序：`dist` 里版本化的 `ECHO-android-*.apk` → Gradle 的 debug/release 产物 →
+    `android/app/build/outputs/` 下任何 apk（Gradle 升级换了路径也不至于静默丢掉）。
+    """
+    hits = [p for p in dist.glob(APK_DIST_GLOB) if p.is_file()]
+    if hits:
+        return max(hits, key=lambda p: (p.stat().st_mtime, p.name))
+    for rel in APK_GRADLE_OUTPUTS:
+        p = ROOT / rel
+        if p.is_file():
+            return p
+    outs = ROOT / "android" / "app" / "build" / "outputs"
+    any_apk = [p for p in outs.rglob("*.apk") if p.is_file()] if outs.is_dir() else []
+    return max(any_apk, key=lambda p: p.stat().st_mtime) if any_apk else None
+
+
+def apk_dest_name(apk: Path) -> str:
+    """交付层里那份 APK 的名字：**带上来源文件名**，一眼看得出是哪次构建的产物。
+
+    `app-debug.apk` → `ECHO-android-app-debug.apk`；已经是 `ECHO-` 开头的原样保留。
+    """
+    return apk.name if apk.name.startswith("ECHO-") else APK_DEST_PREFIX + apk.name
+
+
 def assemble(stamp: str, dist: Path, kit_zip: Path | None = None,
              backend_zip: Path | None = None, offline_zip: Path | None = None,
+             apk_zip: Path | None = None, no_apk: bool = False,
              make_the_zip: bool = True, out_dir: Path | None = None,
              scenario: str = "client", allow_no_bundle: bool = False,
              allow_downloads: bool = False) -> tuple[Path, Path | None]:
@@ -284,6 +327,13 @@ def assemble(stamp: str, dist: Path, kit_zip: Path | None = None,
             "或用 --kit 指定一个 —— 资料夹里少了它，装我.cmd 就成了空壳。")
     thin = backend_zip or newest_matching(dist, BACKEND_THIN_GLOBS)
     offline = offline_zip or newest_matching(dist, BACKEND_OFFLINE_GLOBS)
+    apk = None if no_apk else (apk_zip or default_apk(dist))
+    if apk is not None and not apk.is_file():
+        raise DeliveryError("给的 APK 不存在：%s" % apk)
+    if apk is None and not no_apk:
+        print("[!] 没找到手机触点 APK（dist\\ECHO-android-*.apk 或 "
+              "android\\app\\build\\outputs\\…\\*.apk）—— 这一层不带手机包。\n"
+              "     要带上就先打一个：cd android && .\\gradlew.bat :app:assembleDebug")
 
     # ---- 自检（在写任何东西之前）
     launcher = DELIVERY / build_kit.KIT_CMD_TEMPLATE
@@ -350,9 +400,13 @@ def assemble(stamp: str, dist: Path, kit_zip: Path | None = None,
             shutil.copy2(thin, dest / thin.name)
         if offline:
             shutil.copy2(offline, dest / offline.name)
+        apk_dest = None
+        if apk:
+            apk_dest = dest / apk_dest_name(apk)
+            shutil.copy2(apk, apk_dest)
         if README_TEMPLATE.is_file():
             shutil.copy2(README_TEMPLATE, dest / build_kit.KIT_README)
-        write_manifest(dest, kit, thin, offline)
+        write_manifest(dest, kit, thin, offline, apk_dest)
         out_zip = parent / ("%s-%s.zip" % (PKG_PREFIX, stamp)) if make_the_zip else None
         if out_zip is not None:
             build_kit.make_zip(dest, out_zip, dest.name)      # 条目带顶层前缀（缺了会散成一堆）
@@ -363,7 +417,7 @@ def assemble(stamp: str, dist: Path, kit_zip: Path | None = None,
 
 
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description="组一份交付资料夹（一个脚本 + 1~3 个 zip）")
+    ap = argparse.ArgumentParser(description="组一份交付资料夹（一个脚本 + 1~3 个 zip + 手机触点 APK）")
     ap.add_argument("--dist", default=str(DIST))
     ap.add_argument("--stamp", default="")
     ap.add_argument("--kit", default="", help="客户端 kit zip（默认取 dist 里最新的 Windows 那份）")
@@ -377,6 +431,11 @@ def main(argv: list[str] | None = None) -> int:
                     help="允许出没有 bundle 的裸 kit（只给排障用；正式交付不要用）")
     ap.add_argument("--allow-downloads", action="store_true",
                     help="full-local 时允许后端离线包不带权重（那台机器要联网下模型）")
+    ap.add_argument("--apk", default="", metavar="PATH",
+                    help="手机触点 APK（默认取 dist\\ECHO-android-*.apk；没有就取 "
+                         "android\\app\\build\\outputs 下最新的那份）")
+    ap.add_argument("--no-apk", action="store_true",
+                    help="交付层里不放手机触点 APK")
     ap.add_argument("--out", default="", metavar="DIR",
                     help="把交付那一层建在 DIR 下（用户的交付目录，如 D:\\ECHO-delivery）："
                          "得到 DIR\\ECHO-delivery-<日期>-<时分>\\装我.cmd + 客户端包 + 后端薄包。"
@@ -397,6 +456,8 @@ def main(argv: list[str] | None = None) -> int:
             kit_zip=Path(args.kit).resolve() if args.kit else None,
             backend_zip=Path(args.backend).resolve() if args.backend else None,
             offline_zip=Path(args.backend_offline).resolve() if args.backend_offline else None,
+            apk_zip=Path(args.apk).resolve() if args.apk else None,
+            no_apk=bool(args.no_apk),
             make_the_zip=not args.no_zip,
             out_dir=Path(args.out) if args.out else None)
     except DeliveryError as e:
