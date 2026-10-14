@@ -614,6 +614,9 @@ C:\echo-dev\venv\Scripts\python.exe android\tools\real_backend_harness.py `
 - **界面入口**：指令页第二张卡「后台听写」开关；打开时按需要 RECORD_AUDIO 与
   POST_NOTIFICATIONS（通知权限**给不给都开**，不给只是看不到常驻通知）。
 - 通知里有「停止听写」，`exported=false`，`foregroundServiceType="microphone"`。
+- **省电自动停**（`service/IdleAutoStop.kt`，纯逻辑 + 5 条单测）：一直没人说话 **20 分钟**
+  就自己停，原因写进卡片（"听了 20 分钟也没听到你说话，先停了省电"）。
+  **只有"真的送出一段"才算有动静** —— 否则开车放一路音乐就永远停不下来。
 
 **三个刻意的取舍**（写清楚，免得后来者以为是漏了）：
 
@@ -625,7 +628,7 @@ C:\echo-dev\venv\Scripts\python.exe android\tools\real_backend_harness.py `
 3. **连不上就如实说**：网络错误 / 后端 4xx / 转写为空，都写进通知正文与状态
    （"说完没反应"是最难查的体验），且**不因此停掉整个服务** —— 继续听下一句。
 
-**没验到的**（与前面几节同一个口径，如实写）：本轮加了 14 条 JVM 单测（8+6）与
-`assembleDebug` 编译通过，但**仍然没有真机**：
+**没验到的**（与前面几节同一个口径，如实写）：本轮加了 19 条 JVM 单测（分段 8 + 状态文案 6 +
+省电自动停 5）与 `assembleDebug` 编译通过，但**仍然没有真机**：
 前台服务在真机上的麦克风占用、锁屏后的存活、Android 14 对麦克风型前台服务的
 合规判定（必须在前台且已授权才允许开），这三条只有装机才能验。

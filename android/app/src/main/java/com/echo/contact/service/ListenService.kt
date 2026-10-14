@@ -63,6 +63,9 @@ import kotlin.coroutines.resume
  *    真被回收了，由用户在通知/界面里再点一次。
  * 3. **连不上就如实说**：网络错误、后端 4xx、转写为空，都会写进通知正文与状态，
  *    不静默吞掉（"说完没反应"是最难查的体验）。
+ * 4. **一直没人说话就自己停**（[IdleAutoStop]，默认 20 分钟）：开着的是麦克风型前台服务，
+ *    用户忘了关就是一晚上耗电 + 第二天还挂着"在听"。**只有真的送出一段才算有动静**，
+ *    免得放一路音乐/风声就永远停不下来；停下来时原因写到卡片上（别让它"自己断了"）。
  */
 class ListenService : Service() {
 
@@ -207,6 +210,8 @@ class ListenService : Service() {
         }
 
         val segmenter = VoiceSegmenter(sampleRate = SAMPLE_RATE)
+        val idle = IdleAutoStop()
+        idle.start(System.currentTimeMillis())
         val frame = ShortArray(FRAME_SAMPLES)
         try {
             ar.startRecording()
@@ -220,11 +225,18 @@ class ListenService : Service() {
                 }
                 if (n <= 0) {
                     delay(20)
-                    continue
+                } else if (!paused) {
+                    val pcm = segmenter.feed(frame, n)
+                    if (pcm != null) {
+                        idle.markActivity(System.currentTimeMillis())
+                        handleSegment(api, pcm, engine)
+                    }
                 }
-                if (paused) continue
-                val pcm = segmenter.feed(frame, n) ?: continue
-                handleSegment(api, pcm, engine)
+                // 一直没人说话 → 自己停下省电（原因要写出来，别让它"自己断了"）
+                if (!paused && idle.shouldStop(System.currentTimeMillis())) {
+                    stopWithReason(idle.stopReason(System.currentTimeMillis()))
+                    return
+                }
             }
         } finally {
             runCatching { ar.stop() }
@@ -315,6 +327,13 @@ class ListenService : Service() {
         ListenState.reset(ListenState.Phase.FAILED, msg)
         refreshNotification(ListenState.Phase.FAILED, msg)
         stopEverything(msg, keepState = true)
+    }
+
+    /** **正常**收尾（不是出错）：原因留在状态里，界面回来能看到为什么自己停了。 */
+    private fun stopWithReason(reason: String) {
+        ListenState.reset(ListenState.Phase.OFF, reason)
+        refreshNotification(ListenState.Phase.OFF, reason)
+        stopEverything(reason, keepState = true)
     }
 
     private fun stopEverything(reason: String, keepState: Boolean = false) {
