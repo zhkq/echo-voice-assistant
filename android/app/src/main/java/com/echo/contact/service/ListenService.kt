@@ -35,8 +35,6 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withTimeoutOrNull
-import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.RequestBody.Companion.toRequestBody
 import kotlin.coroutines.resume
 
 /**
@@ -260,29 +258,32 @@ class ListenService : Service() {
     /** 一段说完了：上传 → 等回复 → 念出来。**不抛异常**（失败也要继续听下一句）。 */
     private suspend fun handleSegment(api: EchoApi, pcm: ByteArray, engine: SystemTts) {
         paused = true
+        val flow = ListenFlow(api)
         try {
             ListenState.set(ListenState.Phase.THINKING, "刚录到一句，正在让 ECHO 转写…")
             refreshNotification(ListenState.Phase.THINKING, "刚录到一句，正在让 ECHO 转写…")
             val wav = WavWriter.wrap(pcm, SAMPLE_RATE, 1, BITS)
-            val resp = api.voiceCommand(wav.toRequestBody(WAV_MEDIA_TYPE.toMediaType()))
-            val body = resp.body()
-            if (!resp.isSuccessful || body?.ok != true) {
-                val why = body?.message ?: "HTTP ${resp.code()}"
-                return note("刚才那句没发出去：$why")
+            val heard = when (val first = flow.submit(wav)) {
+                is ListenFlow.Outcome.Heard -> first
+                is ListenFlow.Outcome.Failed -> return note("刚才那句没发出去：${first.message}")
+                // 上传这一步不该回 Reply（Reply 只从 awaitReply 来）；写出来是为了穷尽分支
+                is ListenFlow.Outcome.Reply -> return note("这次没拿到结果")
             }
             ListenState.countSegment()
             // 把"它听成什么"写出来：车里最常问的就是这句（听错了要立刻能看出来）
-            val heard = body.text.orEmpty()
-            if (heard.isNotBlank()) {
-                val line = "听到了：${heard.take(NOTIFICATION_TEXT_MAX)}"
+            if (heard.text.isNotBlank()) {
+                val line = "听到了：${heard.text.take(NOTIFICATION_TEXT_MAX)}"
                 ListenState.set(ListenState.Phase.THINKING, line)
                 refreshNotification(ListenState.Phase.THINKING, line)
+            } else {
+                ListenState.set(ListenState.Phase.THINKING, "正在等 ECHO 回话…")
+                refreshNotification(ListenState.Phase.THINKING, "正在等 ECHO 回话…")
             }
-            val reply = awaitReply(api, body.commandId)
-            if (reply.isNullOrBlank()) {
-                return note("ECHO 没在 90 秒内回话（那句可能还在跑）")
+            when (val result = flow.awaitReply(heard.commandId)) {
+                is ListenFlow.Outcome.Reply -> speak(engine, result.text)
+                is ListenFlow.Outcome.Failed -> note(result.message)
+                is ListenFlow.Outcome.Heard -> note("这次没拿到结果")
             }
-            speak(engine, reply)
         } catch (e: Exception) {
             note("刚才那句出错：${e.message ?: e.javaClass.simpleName}")
         } finally {
@@ -292,35 +293,6 @@ class ListenService : Service() {
                 refreshNotification(ListenState.Phase.LISTENING, "")
             }
         }
-    }
-
-    /**
-     * 等那条指令的结果。
-     *
-     * 为什么要轮询而不是直接拿 `voice-command` 的返回：那条只回 `{ok, message, text, commandId}`，
-     * 智能体的答复是**异步**落到 `commands` 表里的（与界面那条路同一个口径：
-     * `MainViewModel.awaitResult`）。手机上没有推送通道，轮询是唯一稳的办法。
-     */
-    private suspend fun awaitReply(api: EchoApi, commandId: Int?, timeoutMs: Long = 90_000): String? {
-        if (commandId == null) return null
-        ListenState.set(ListenState.Phase.THINKING, "正在等 ECHO 回话…")
-        refreshNotification(ListenState.Phase.THINKING, "正在等 ECHO 回话…")
-        val deadline = System.currentTimeMillis() + timeoutMs
-        while (System.currentTimeMillis() < deadline && currentCoroutineContext().isActive) {
-            val item = try {
-                api.listCommands(mapOf("limit" to "5")).body()?.items?.firstOrNull { it.id == commandId }
-            } catch (e: Exception) {
-                null
-            }
-            if (item != null) {
-                when (item.status) {
-                    "done" -> return item.brief?.takeIf { it.isNotBlank() } ?: item.reply
-                    "failed" -> return "ECHO 那边失败了：${item.error ?: "没给原因"}"
-                }
-            }
-            delay(POLL_MS)
-        }
-        return null
     }
 
     private suspend fun speak(engine: SystemTts, text: String) {
@@ -383,9 +355,7 @@ class ListenService : Service() {
 
         /** 100 ms 一帧：分段按毫秒算，帧长只影响延迟与开销。 */
         private const val FRAME_SAMPLES = SAMPLE_RATE / 10
-        private const val POLL_MS = 1500L
         private const val NOTIFICATION_TEXT_MAX = 80
-        private const val WAV_MEDIA_TYPE = "audio/wav"
 
         /** 开听写（调用方**必须**先拿到 RECORD_AUDIO 权限）。 */
         fun start(context: Context) {
