@@ -125,7 +125,11 @@ fun MeetingsTab(vm: MainViewModel) {
                         TextButton(onClick = { vm.loadMeetings() }, enabled = !busy) { Text("刷新") }
                     }
                     Spacer(Modifier.height(4.dp))
-                    MutedLine("录音用的是**电脑那支麦克风**，手机只负责遥控。")
+                    MutedLine(
+                        "现在录的是电脑那支麦克风的声音（手机只负责开始/停止）。" +
+                            "让手机当麦克风来录，是下一步要做的。",
+                        maxLines = 2,
+                    )
                     note?.let {
                         Spacer(Modifier.height(4.dp))
                         MutedLine(it, color = EchoPalette.Yellow)

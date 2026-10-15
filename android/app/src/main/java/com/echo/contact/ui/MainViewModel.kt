@@ -24,6 +24,7 @@ import com.echo.contact.data.dto.ReviewHistoryDetail
 import com.echo.contact.data.dto.StatusResponse
 import com.echo.contact.data.dto.TranscribeProgress
 import com.echo.contact.data.dto.TtsRequest
+import com.echo.contact.service.SpeakPrefs
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -276,8 +277,19 @@ class MainViewModel(app: Application) : BaseViewModel(app) {
      * 念一句话。两条路：
      *  - [TtsEngine.System]：本机合成（可能离线、零往返）；
      *  - [TtsEngine.Echo]：`POST /api/tts` 拿字节再播（音色与电脑一致，必须有网）。
+     *
+     * **默认走设置里选的那个**（`SpeakPrefs`，默认手机念）：自动念的地方
+     * （指令回复、回顾播报、会议播报）一个都不再写死引擎 —— 以前写死成
+     * [TtsEngine.System]，用户在设置里选了"ECHO 念"也没用（2026-10-15 正式版修的）。
      */
-    fun speak(text: String, engine: TtsEngine = TtsEngine.System) {
+    fun preferredEngine(): TtsEngine =
+        if (SpeakPrefs.load(getApplication()) == SpeakPrefs.ENGINE_ECHO) {
+            TtsEngine.Echo
+        } else {
+            TtsEngine.System
+        }
+
+    fun speak(text: String, engine: TtsEngine = preferredEngine()) {
         val content = text.trim()
         if (content.isEmpty()) return
         stopSpeaking()
@@ -311,8 +323,10 @@ class MainViewModel(app: Application) : BaseViewModel(app) {
                 }
                 val mime = resp.body()?.contentType()?.toString()
                 val file = withContext(Dispatchers.IO) { echoPlayer.cache(bytes, mime) }
-                val engine = resp.headers()["X-Echo-Tts-Engine"].orEmpty()
-                if (engine.isNotBlank()) _speakNote.value = "ECHO 引擎：$engine"
+                // 别叫 `engine` —— 那是本函数的参数（选哪条路念），这里说的是
+                // **服务端**实际用了哪个 TTS 引擎（回给面板看的）。
+                val echoEngine = resp.headers()["X-Echo-Tts-Engine"].orEmpty()
+                if (echoEngine.isNotBlank()) _speakNote.value = "ECHO 引擎：$echoEngine"
                 echoPlayer.play(file) { _speaking.value = false }
             } catch (e: IOException) {
                 _speakNote.value = "无法连接：${e.message}"
@@ -648,7 +662,7 @@ class MainViewModel(app: Application) : BaseViewModel(app) {
                 _speakNote.value = "$date 没有可念的播报"
                 return@launch
             }
-            speak(parts.joinToString("\n"), TtsEngine.System)
+            speak(parts.joinToString("\n"))
         }
     }
 
@@ -712,12 +726,12 @@ class MainViewModel(app: Application) : BaseViewModel(app) {
                         _reviewSubmittingNote.value =
                             "整理完成（${"%.1f".format(b.seconds)} 秒，来源 ${b.source}）"
                         // spoken 就是"会被念出来的那句话"，直接念
-                        b.spoken.takeIf { it.isNotBlank() }?.let { speak(it, TtsEngine.System) }
+                        b.spoken.takeIf { it.isNotBlank() }?.let { speak(it) }
                     }
                 }
                 // 无论成没成，都要把口语那句念出来（服务端在三层兜底里都给了 spoken）
                 if (b?.ok != true && !b?.spoken.isNullOrBlank()) {
-                    speak(b!!.spoken, TtsEngine.System)
+                    speak(b!!.spoken)
                 }
             } catch (e: IOException) {
                 _reviewSubmittingNote.value = "无法连接（或等超时了）：${e.message}"
@@ -832,7 +846,7 @@ class MainViewModel(app: Application) : BaseViewModel(app) {
                 _speakNote.value = "还没有可念的回顾播报"
                 return@launch
             }
-            speak(parts.joinToString("\n"), TtsEngine.System)
+            speak(parts.joinToString("\n"))
         }
     }
 
@@ -1028,7 +1042,7 @@ class MainViewModel(app: Application) : BaseViewModel(app) {
                 // 念用手机引擎 —— 2026-10-09 定的口径（ECHO 那条要 1.3 秒起，还依赖联网）。
                 val done = _submit.value
                 if (done.phase == SubmitPhase.Done && done.reply.isNotBlank()) {
-                    speak(done.reply, TtsEngine.System)
+                    speak(done.reply)
                 }
             } catch (e: HttpException) {
                 fail(parseHttp(e))

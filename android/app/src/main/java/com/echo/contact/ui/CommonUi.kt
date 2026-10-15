@@ -36,6 +36,25 @@ internal fun StatusDot(color: Color, size: Int = 10) {
     Box(modifier = Modifier.size(size.dp).background(color, CircleShape))
 }
 
+/**
+ * 「连不上 ECHO」那张卡（从旧仪表盘搬来，现在挂在说话页顶上）。
+ *
+ * 为什么留一条**具体的排查提示**而不是只说"失败"：这条路的故障几乎全是环境问题
+ * （不同 Wi-Fi、防火墙、走了中继但中继没开），用户看一句"检查这几样"比看错误码有用。
+ */
+@Composable
+internal fun ErrorCard(message: String) {
+    EchoCard(container = EchoPalette.ErrorContainer) {
+        Column {
+            CardHeader(title = "连不上 ECHO", dotColor = EchoPalette.Red)
+            Spacer(Modifier.height(4.dp))
+            Text(message, style = MaterialTheme.typography.bodySmall)
+            Spacer(Modifier.height(4.dp))
+            MutedLine("检查：手机和电脑同一 Wi-Fi？电脑防火墙放行了 8970？或者在电脑上开「允许手机经后端中转」、把中继地址填到配对页。")
+        }
+    }
+}
+
 /** 面板的卡片长相：深底 + 1px 描边 + 10px 圆角。 */
 @Composable
 internal fun EchoCard(
