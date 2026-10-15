@@ -37,6 +37,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -75,9 +76,14 @@ fun MeetingRecordingScreen(vm: MainViewModel) {
     val st by vm.meetingRecording.collectAsState()
     val busy by vm.meetingActionBusy.collectAsState()
     val note by vm.meetingsNote.collectAsState()
+    // 「手机当麦克风」那条路：电平与段数都是**本地**的（见 MeetingMicService）
+    val mic by com.echo.contact.service.MeetingMicService.state.collectAsState()
+    val phoneMic = mic.active
 
-    // 只在界面可见时轮询（离开组合就停）：别让一个看不见的界面一直发请求
-    LaunchedEffect(Unit) {
+    // 只在界面可见时轮询（离开组合就停）：别让一个看不见的界面一直发请求。
+    // **手机麦那条路不用轮询电平** —— 本地就有，顺得多。
+    LaunchedEffect(phoneMic) {
+        if (phoneMic) return@LaunchedEffect
         while (true) {
             vm.pollMeetingStatus()
             delay(POLL_MS)
@@ -85,6 +91,7 @@ fun MeetingRecordingScreen(vm: MainViewModel) {
     }
 
     // 不熄屏（录音时屏幕灭掉最容易让人以为没录）
+    val context = LocalContext.current
     val view = LocalView.current
     DisposableEffect(Unit) {
         view.keepScreenOn = true
@@ -93,12 +100,12 @@ fun MeetingRecordingScreen(vm: MainViewModel) {
 
     // 电平平滑：攻击快（跟得上说话）、回落慢（看着像声浪在退）
     var shown by remember { mutableStateOf(0f) }
-    val target = st.level.coerceIn(0.0, 1.0).toFloat()
+    val target = (if (phoneMic) mic.level else st.level.toFloat()).coerceIn(0f, 1f)
     LaunchedEffect(target) {
         shown = smoothLevel(shown, target)
     }
 
-    val paused = st.paused
+    val paused = if (phoneMic) mic.paused else st.paused
     val accent = if (paused) EchoPalette.Yellow else EchoPalette.Red
 
     Surface(modifier = Modifier.fillMaxSize(), color = EchoPalette.Bg) {
@@ -127,9 +134,16 @@ fun MeetingRecordingScreen(vm: MainViewModel) {
             )
             Spacer(Modifier.height(4.dp))
             MutedLine(
-                buildString {
-                    append("已录 ${st.segments} 段")
-                    st.folder?.takeIf { it.isNotBlank() }?.let { append("　·　$it") }
+                if (phoneMic) {
+                    buildString {
+                        append("手机麦克风 · 已送 ${mic.sent} 段")
+                        if (mic.pending > 0) append(" · ${mic.pending} 段待重传")
+                    }
+                } else {
+                    buildString {
+                        append("电脑麦克风 · 已录 ${st.segments} 段")
+                        st.folder?.takeIf { it.isNotBlank() }?.let { append("　·　$it") }
+                    }
                 },
                 maxLines = 1,
             )
@@ -170,8 +184,11 @@ fun MeetingRecordingScreen(vm: MainViewModel) {
 
             Spacer(Modifier.height(10.dp))
             MutedLine(
-                if (paused) "恢复后接着录；暂停这段是空白，会议详情里能看到暂停区间"
-                else "声音来自电脑那支麦克风（手机只是触点）",
+                when {
+                    paused -> "恢复后接着录；暂停这段是空白，会议详情里能看到暂停区间"
+                    phoneMic -> "声音来自**这台手机的麦克风**，按段传给电脑落盘；电脑那边只负责存储与转写"
+                    else -> "声音来自电脑那支麦克风（手机只是触点）"
+                },
                 maxLines = 2,
             )
             note?.takeIf { it.isNotBlank() }?.let {
@@ -191,7 +208,15 @@ fun MeetingRecordingScreen(vm: MainViewModel) {
                 horizontalArrangement = Arrangement.spacedBy(12.dp),
             ) {
                 OutlinedButton(
-                    onClick = { vm.toggleMeetingPause() },
+                    onClick = {
+                        if (phoneMic) {
+                            // 手机麦那条路：静音 = 本地丢帧 + 不上传（并把区间报给电脑）
+                            com.echo.contact.service.MeetingMicService.setPaused(context, !paused)
+                            vm.toggleMeetingPause()
+                        } else {
+                            vm.toggleMeetingPause()
+                        }
+                    },
                     enabled = !busy,
                     modifier = Modifier.weight(1f).height(56.dp),
                 ) {
@@ -204,7 +229,14 @@ fun MeetingRecordingScreen(vm: MainViewModel) {
                     Text(if (paused) "恢复" else "静音")
                 }
                 Button(
-                    onClick = { vm.stopMeeting() },
+                    onClick = {
+                        if (phoneMic) {
+                            // 手机麦：先让服务把欠的段补传、并让电脑结束这场会议
+                            com.echo.contact.service.MeetingMicService.stop(context)
+                        } else {
+                            vm.stopMeeting()
+                        }
+                    },
                     enabled = !busy,
                     colors = ButtonDefaults.buttonColors(containerColor = EchoPalette.Red),
                     modifier = Modifier.weight(1f).height(56.dp),
@@ -215,7 +247,9 @@ fun MeetingRecordingScreen(vm: MainViewModel) {
                 }
             }
             Spacer(Modifier.height(8.dp))
-            MutedLine("结束后电脑会自动转写、出纪要（手机在会议页能看到进度）",
+            MutedLine(
+                if (phoneMic) "结束后手机把剩下的段补传完，电脑再转写、出纪要"
+                else "结束后电脑会自动转写、出纪要（手机在会议页能看到进度）",
                 maxLines = 2, color = EchoPalette.Muted)
             Spacer(Modifier.height(6.dp))
         }

@@ -86,6 +86,11 @@ _state = {
     #: 全屏录音界面里有「静音/恢复」按钮，语义就是这两个键）。
     "paused": False,
     "pauses": [],
+    #: 采集源：`pc`（电脑的麦，默认）| `phone`（手机按段传上来的，2026-10-15）。
+    #: 它决定三件事：停止时要不要收录音器、手机能不能传段、界面上那句"声音来自哪支麦"。
+    "source": "pc",
+    #: 手机那条路的已收段数（pc 那条用录音器自己的清单；这里只是给状态接口一个数）
+    "seg_count": 0,
 }
 # 录音状态锁：start/stop 必须原子化 —— 否则并发 stop（如面板按钮双击/重复请求）
 # 会同时通过 active 检查，造成重复转写 + 重复纪要（日志里出现过两次“停止录音”同秒）。
@@ -645,11 +650,14 @@ def meeting_status():
         "startedAt": _state["started_at"],
         "level": _state["level"],
         "error": _state["error"],
-        # 手机那个全屏录音界面靠这三个显示进度（2026-10-15）
+        # 手机那个全屏录音界面靠这几个显示进度（2026-10-15）
         "paused": bool(_state.get("paused")),
         "pauses": list(_state.get("pauses") or []),
-        #: 已经写出来的段数（录音器内存里的清单；崩了的话它就是"当前已落盘的段"）
-        "segments": len(getattr(rec, "segments", []) or []),
+        #: 已经写出来的段数：本机麦那条用录音器内存里的清单；手机那条用收到段的计数
+        "segments": (len(getattr(rec, "segments", []) or []) if rec is not None
+                     else int(_state.get("seg_count") or 0)),
+        #: 采集源（pc / phone）—— 手机界面据此显示"声音来自哪支麦"
+        "source": str(_state.get("source") or "pc"),
     }
 
 
@@ -667,12 +675,16 @@ def _save_meta(folder, meta):
 
 
 def _pause_common(by=""):
-    """暂停/恢复的公共前置检查：返回 `(recorder, folder, meta, err)`。"""
-    if not _state["active"] or _state.get("recorder") is None:
+    """暂停/恢复的公共前置检查：返回 `(recorder, folder, meta, err)`。
+
+    ⚠️ **手机麦那条路没有 recorder**（音频是手机传上来的）—— 但"暂停"这件事仍然成立：
+    手机那边停止上传，电脑这边记下暂停区间。所以判据是"有没有在录音"，不是"有没有 recorder"。
+    """
+    if not _state["active"] or not _state.get("folder"):
         return None, None, None, "现在没有在录音"
     folder = _state["folder"]
     meta = _load_json(os.path.join(folder, "meta.json"), {})
-    return _state["recorder"], folder, meta, ""
+    return _state.get("recorder"), folder, meta, ""
 
 
 def pause_meeting(by=""):
@@ -684,8 +696,12 @@ def pause_meeting(by=""):
         recorder, folder, meta, err = _pause_common(by)
         if err:
             return False, err
-        if not recorder.pause() or _state.get("paused"):
+        if _state.get("paused"):
             return True, "已经在暂停着（这段时间不会录进会议）"
+        if recorder is not None:
+            # 本机麦那条路：让录音器**停止写盘**（它把这段音频丢掉，电平记 0）。
+            # 手机麦那条路没有 recorder —— 静音由手机那边停止上传实现，这边只记区间。
+            recorder.pause()
         now = datetime.datetime.now().isoformat(timespec="seconds")
         _state["paused"] = True
         entry = {"from": now, "to": "", "by": str(by or "")}
@@ -704,8 +720,10 @@ def resume_meeting(by=""):
         recorder, folder, meta, err = _pause_common(by)
         if err:
             return False, err
-        if not recorder.resume() or not _state.get("paused"):
+        if not _state.get("paused"):
             return True, "本来就没暂停"
+        if recorder is not None:
+            recorder.resume()
         now = datetime.datetime.now().isoformat(timespec="seconds")
         _state["paused"] = False
         pauses = _state.setdefault("pauses", [])
@@ -743,6 +761,96 @@ def recover_orphaned_meetings():
 
 
 # ---------------------------------------------------------------- 录音
+
+def _new_meeting_folder_and_meta(cfg):
+    """建目录 + 起始 meta（两条录音路共用：本机麦 / 手机麦）。"""
+    now = datetime.datetime.now()
+    folder = os.path.join(meetings_dir(), now.strftime("%Y-%m-%d_%H-%M-%S"))
+    os.makedirs(folder, exist_ok=True)
+    meta = {
+        "start": now.isoformat(timespec="seconds"),
+        "config": {
+            "sttModel": "",
+            "sttDevice": cfg.get("device", "auto"),
+            "segmentMinutes": cfg.get("meetingSegmentMinutes", 10),
+            "autoSummarize": cfg.get("meetingAutoSummarize", True),
+            "diarize": True,
+        },
+        "segments": [],
+        "pauses": [],
+    }
+    with open(os.path.join(folder, "meta.json"), "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+    return folder, meta
+
+
+def start_meeting_phone():
+    """**手机当麦克风**的那条录音：电脑不开麦，只负责落盘、转写、存储。
+
+    用户 2026-10-15 的口径：*"手机发起的指令，手机收，电脑是配合执行和存储"* ——
+    那么"从手机发起录音"时，采集就该是**手机那支麦**（手机在会议室、电脑可能合着盖）。
+
+    与 `start_meeting()` 的区别只有一处：**不建 MeetingRecorder**（不碰电脑的声卡），
+    音频由手机按段 POST 上来（`append_meeting_segment`）。其余（目录/meta/库/事件）完全一样，
+    所以转写、压缩、纪要、议题那些下游一条都不用改。
+    """
+    with _state_lock:
+        if _state["active"]:
+            return False, "会议录音已在进行中"
+        folder, meta = _new_meeting_folder_and_meta(settings)
+        meta["source"] = "phone"
+        with open(os.path.join(folder, "meta.json"), "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
+        meeting_id = db.create_meeting(
+            os.path.basename(folder), started_at=meta["start"],
+            stt_model=meta["config"]["sttModel"], stt_device=meta["config"]["sttDevice"],
+            diarize=1 if meta["config"]["diarize"] else 0)
+        _state.update(active=True, folder=folder, recorder=None,
+                      started_at=meta["start"], error="", paused=False, pauses=[],
+                      source="phone")
+        db.add_event("meeting_started", {"meeting": os.path.basename(folder),
+                                         "id": meeting_id, "source": "phone"})
+        db.add_log("info", "meeting", f"开始录音（手机麦克风）: {os.path.basename(folder)}")
+        return True, os.path.basename(folder)
+
+
+def append_meeting_segment(data, name=""):
+    """手机传上来的一段音频 → 落成 `NN.wav`。返回 `(ok, 段名或原因)`。
+
+    判据（都在这一处，别在 api 层再写一遍）：
+      * 必须在"手机麦"那场录音里（本机麦那条路不接受外来段，否则两路音频会混进同一场）；
+      * **必须是 WAV**（`RIFF` 头）：下游转写按 wav 读，塞个 mp3 进去会在转写时报一句
+        很难追的错；
+      * 段名按现有段号往下排（手机那边只保证顺序，编号由电脑定 —— 电脑才是"存储"那一方）。
+    """
+    with _state_lock:
+        if not _state["active"] or not _state["folder"]:
+            return False, "现在没有在录音"
+        if _state.get("source") != "phone":
+            return False, "这场录音用的是电脑的麦克风，手机不用传音频"
+        if not data or len(data) < 44 or bytes(data[:4]) != b"RIFF":
+            return False, "这段不是 WAV（或太短）：手机那边该传裸 wav 字节"
+        folder = _state["folder"]
+        meta = _load_json(os.path.join(folder, "meta.json"), {})
+        segs = list(meta.get("segments") or [])
+        idx = 0
+        for s in segs:
+            try:
+                idx = max(idx, int(str(s).split(".")[0]))
+            except Exception:                                      # noqa: BLE001
+                pass
+        seg_name = name or ("%02d.wav" % (idx + 1))
+        if not seg_name.lower().endswith(audiofile.WAV_EXT):
+            seg_name += audiofile.WAV_EXT
+        with open(os.path.join(folder, seg_name), "wb") as f:
+            f.write(data)
+        if seg_name not in segs:
+            segs.append(seg_name)
+        meta["segments"] = sorted(segs, key=lambda n: int(str(n).split(".")[0]))
+        _save_meta(folder, meta)
+        _state["seg_count"] = len(meta["segments"])       # 状态接口据此给手机显示进度
+        return True, seg_name
+
 
 def start_meeting():
     with _state_lock:
@@ -852,11 +960,13 @@ def stop_meeting():
         # 事后看不出"暂停到什么时候"）
         was_paused = bool(_state.get("paused"))
         pauses = list(_state.get("pauses") or [])
-        if not recorder.stop():
+        # 手机麦那条路**没有 recorder**（音频是手机一段段传上来的）：跳过"释放麦克风"，
+        # 直接进落盘/转写那一段 —— 下游（段列表/转写/压缩/纪要）两条路完全一样。
+        if recorder is not None and not recorder.stop():
             err = "麦克风尚未释放，录音正在停止；请勿重复开麦，持续异常请重启 ECHO"
             _state.update(error=err, level=0.0)
             return False, err
-        _state.update(active=False, level=0.0, recorder=None, paused=False)
+        _state.update(active=False, level=0.0, recorder=None, paused=False, seg_count=0)
 
         meta_path = os.path.join(folder, "meta.json")
         meta = _load_json(meta_path, {})
@@ -872,7 +982,7 @@ def stop_meeting():
         # 那段会被**静默忽略**（`_transcribe_impl` 优先用 meta["segments"]，非空就不看目录）。
         extra = [f for f in audiofile.segment_files(folder)
                  if f.lower().endswith(audiofile.WAV_EXT)]
-        segs = sorted(set(recorder.segments) | set(extra),
+        segs = sorted(set(getattr(recorder, "segments", []) or []) | set(extra),
                       key=lambda n: int(str(n).split(".")[0]))
         meta["end"] = datetime.datetime.now().isoformat(timespec="seconds")
         meta["segments"] = segs
@@ -885,7 +995,7 @@ def stop_meeting():
         _state["folder"] = None
 
         meeting = db.get_meeting_by_name(os.path.basename(folder))
-        if recorder.error and segs:
+        if recorder is not None and recorder.error and segs:
             if meeting:
                 db.update_meeting(meeting["id"], ended_at=meta["end"],
                                   duration_seconds=meta["durationSeconds"],

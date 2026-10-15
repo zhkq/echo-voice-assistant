@@ -1403,11 +1403,36 @@ async def stt_sentences(file: UploadFile = File(...),
 
 
 # ---------------------------------------------------------------- 会议
+@router.post("/meeting/segment")
+async def meeting_segment(request: Request, _auth=Depends(optional_auth)):
+    """手机上传**一段**会议音频（裸 wav 字节）—— "手机当麦克风"那条路（2026-10-15）。
+
+    为什么按段传而不是实时流：手机那头"录满一段就发"，50 秒一段 ≈ 1.6 MB，
+    走中继（单次上限 12 MB）很稳；断了重传这一段就行，不会把整场拖垮。
+    **段号由电脑定**（手机只保证顺序）—— 电脑才是"存储"那一方。
+    """
+    data = await request.body()
+    if not data:
+        raise HTTPException(status_code=422, detail="空的音频段")
+    ok, msg = meeting.append_meeting_segment(data)
+    if not ok:
+        raise HTTPException(status_code=409, detail=msg)
+    return {"ok": True, "message": msg,
+            "segments": meeting.meeting_status().get("segments", 0)}
+
+
 @router.post("/meeting/start")
-def meeting_start(_auth=Depends(optional_auth)):
-    ok, msg = meeting.start_meeting()
+def meeting_start(source: str = "pc", _auth=Depends(optional_auth)):
+    """开始录音。`source=pc`（默认，用电脑的麦）/ `source=phone`（手机传段上来）。
+
+    用户 2026-10-15 的口径：手机发起的事该由手机采集 —— 所以手机那个界面发起时传
+    `phone`，电脑那边**不开麦**，只负责落盘、转写、存储。
+    """
+    src = (source or "pc").strip().lower()
+    ok, msg = (meeting.start_meeting_phone() if src == "phone"
+               else meeting.start_meeting())
     services.report_meeting("active" if ok else "idle", msg)
-    return {"ok": ok, "message": msg}
+    return {"ok": ok, "message": msg, "source": src if ok else ""}
 
 
 @router.post("/meeting/stop")

@@ -20,6 +20,7 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -56,6 +57,7 @@ fun MeetingsTab(vm: MainViewModel) {
     val audioState by vm.audioState.collectAsState()
     val audioPlaying by vm.audioPlaying.collectAsState()
     val showingRecording by vm.showRecordingScreen.collectAsState()
+    val localCtx = androidx.compose.ui.platform.LocalContext.current
 
     // 全屏录音界面（用户 2026-10-15 要的：电平 + 结束 + 静音/恢复）。
     // 放在最前面：录音时它盖住整个页签；「返回」只关界面、**不停录音**。
@@ -129,6 +131,12 @@ fun MeetingsTab(vm: MainViewModel) {
                             ) { Text("停止录音") }
                         } else {
                             Button(onClick = { vm.startMeeting() }, enabled = !busy) { Text("开始录音") }
+                            // 用户 2026-10-15 的口径：手机发起的事该由手机采集。这条 =
+                            // 手机当麦克风（电脑不开麦，只落盘/转写/存储）。
+                            OutlinedButton(
+                                onClick = { com.echo.contact.service.MeetingMicService.start(localCtx); vm.openRecordingScreen() },
+                                enabled = !busy,
+                            ) { Text("用手机麦克风") }
                         }
                         if (active) {
                             // 录音中：能随时回到那个全屏界面（电平 + 静音/结束）

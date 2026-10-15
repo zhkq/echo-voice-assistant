@@ -59,6 +59,11 @@
             android:exported="false"
             android:foregroundServiceType="microphone" />
 
+        <!-- 手机当麦克风：会议录音在手机侧采集、按段传给电脑（用户 2026-10-15 的口径） -->
+        <service
+            android:name=".service.MeetingMicService"
+            android:exported="false"
+            android:foregroundServiceType="microphone" />
     </application>
 
 </manifest>

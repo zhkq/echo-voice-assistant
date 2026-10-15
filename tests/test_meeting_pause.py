@@ -116,6 +116,12 @@ class MeetingPauseTests(unittest.TestCase):
                                   started_at=None, level=0.0, error="",
                                   paused=False, pauses=[])
 
+        # 别让 stop_meeting() 真的去起转写线程：那会在用例结束（临时库已拆）之后才跑，
+        # 报一堆 no such table: meetings —— 那是测试卫生问题，不是被测行为。
+        self._orig_transcribe = meeting_mod._transcribe_meeting
+        meeting_mod._transcribe_meeting = lambda *a, **kw: None
+        self.addCleanup(lambda: setattr(meeting_mod, '_transcribe_meeting', self._orig_transcribe))
+
         def _clean():
             meeting_mod._state.update(active=False, folder=None, recorder=None,
                                       paused=False, pauses=[])
