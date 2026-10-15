@@ -1,0 +1,39 @@
+# ECHO 后端对外只开这一个 HTTPS 口（8443），明文 8900 只留给本机/容器网络。
+#
+# 证书由 acme.sh 用**阿里云 DNS-01** 签发并自动续期（见同目录 README）—— 这里只做
+# "终结 TLS + 反代"，**刻意不用 Caddy 自己的 ACME**：官方镜像不带 DNS provider 插件，
+# 要用就得 xcaddy 自编，升级时最容易出问题。
+#
+# 用法（在那台跑 echo-backend 的机器上）：
+#   docker run -d --name echo-caddy --restart unless-stopped -p 8443:8443 \
+#     -v /opt/echo-tls/certs:/certs:ro \
+#     -v /opt/echo-tls/Caddyfile:/etc/caddy/Caddyfile:ro caddy:2
+
+{
+	# 管理面（8901）**永远不要**出现在这里 —— 它只该走 ssh 隧道。
+	admin off
+	email you@example.com
+}
+
+echoserver.zhkq.online:8443 {
+	tls /certs/echoserver.crt /certs/echoserver.key
+
+	# 数据面：手机 / 电脑 / 中继都打这里
+	reverse_proxy 127.0.0.1:8900 {
+		# 中继有长轮询（主机侧一次最多等 25 秒，调用超时按 570 秒算），
+		# 别让反代提前掐断连接 —— 这是"中继偶发断开"的一个常见来源。
+		transport http {
+			read_timeout 600s
+			write_timeout 600s
+		}
+		# 会议音频按段上传：单段可达十几 MB（客户端上限 12 MB），别按默认小上限拦
+		request_body {
+			max_size 32MB
+		}
+	}
+
+	log {
+		output file /var/log/caddy/echo-access.log
+		format json
+	}
+}
