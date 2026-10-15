@@ -754,3 +754,40 @@ pyannote 4.0.7 在 cu126 上装得上也跑得动（600 秒音频约 26.7 秒，
 - **部署**：后端要带 `server/relay.py`（薄包已重出：`dist\ECHO-backend-portable-20261015-1051.zip`，
   或只换 `relay.py` + `main.py` 两个文件重启容器）；中枢是**单进程内存态**，
   **后端必须单 worker**（`Dockerfile` 的 CMD 就是一个进程），多 worker 会随机 503。
+
+## 后端 TLS 落地（2026-10-16 凌晨）：入口变 https，两个产品缺口待修
+
+**做了什么**：能力后端的公网入口从明文 `http://echoserver.zhkq.online:8900` 换成
+`https://echoserver.zhkq.online:8900` —— **复用已放通的 8900**，不需要网管加 NAT 规则
+（原计划的 8443 方案卡在"上游 NAT 只放通 443 与 8900"）。证书 Let's Encrypt（DNS-01，
+阿里云 RAM 凭据），宿主无 cron → **用户级 systemd timer** 自动续期；Caddy 容器
+（**host 网络**，`request_body` 必须放**站点级**、`admin` 用 unix socket、
+`caddy reload` **必须 `--force`** 才重读静态证书 —— 这三条都是实测踩出来的）。
+明文口收口：compose 里 `"8900:8900"` → `"127.0.0.1:8902:8900"`，Caddy 监听 `*:8900`
+反代 `127.0.0.1:8902`。判据：Windows 侧 `https://…:8900/v1/health` → **200 且
+`ssl_verify_result=0`**（公网 CA，未加 `-k`）；明文 8900 → 000；稳定版 `paired.baseUrl`
+变 https、clientId 不变、`ready=true`、中继 40 秒内 `connected=true`。
+逐一命令/备份/回滚见 `C:\Users\zhkq\.echo-tls\ECHO-TLS-REMOTE-RECORD.md`。
+
+### ⚠️ 缺口 1：`POST /api/capability/address` 不补证书固定（http→https 必撞）
+
+改完立刻是 `后端 配的是 https，但本机没有它的证书（缺 certPem）——拒绝连接`，
+`usable.ready=False`。产品**没有"只补证书不重新配对"的入口**（面板「改地址」只调
+`/capability/address`；要证书只有 `/capability/pair`，那要一次性配对码、**会换新 clientId**、
+scopes 还得重发）。当晚的绕法：用 `pairing.pair()` 里**逐字同一段**
+（`fetch_cert_pem`→`fingerprint_of`→`credentials.save`）补 pin，**保住 clientId/secret/scopes/hostId**。
+**该修**：`/capability/address` 在 scheme 变 https（或带 `fp=`）时自动抓取并固定证书 ——
+否则每次换地址都得重新配对，而重新配对会换 clientId（中继 hostId 跟着变，手机侧地址也废）。
+
+### ⚠️ 缺口 2：配对串**永远带不出 https**
+
+`server_advertised.advertised_host` 只认 `host[:port]`（`ops.normalize_advertised_host`），
+客户端 `normalize_base_url` 见没有 scheme 就补 `http://` → **别人粘配对串会配到明文地址**
+（现在明文被 Caddy 回 400）。**该修**：公布地址带上 scheme（或"远程场景默认 https"）。
+过渡期办法：**手填** `https://echoserver.zhkq.online:8900`。
+
+### 另一条：明文后端告警部署了但**没生效**
+
+`boot.backend_security_note()`（2026-10-16 加的）取的是 `_base_url_from_settings()`，
+而这台机器上它先拿到**本机配对文件**的 `127.0.0.1:8900` → 被判回环而静默 ✗。**该修**：
+告警要看**实际用于网络调用**的那个地址（remote 配对），不是本机那份。
