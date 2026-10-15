@@ -148,6 +148,38 @@ fun MeetingRecordingScreen(vm: MainViewModel) {
                 maxLines = 1,
             )
 
+            // ---- 待重传：**可视化 + 手动重传**（用户 2026-10-16 要的）----
+            // 以前这段只写在通知里，界面上看不到、也没法手动重传 —— 录音最怕"看着在录、其实丢了"。
+            if (phoneMic && mic.pending > 0) {
+                Spacer(Modifier.height(8.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        "待重传 ${mic.pending} 段",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = EchoPalette.Yellow,
+                        fontWeight = FontWeight.SemiBold,
+                        modifier = Modifier.weight(1f),
+                    )
+                    OutlinedButton(
+                        onClick = {
+                            // 复用服务里那一条重传路（不在这里另写上传逻辑）
+                            com.echo.contact.service.MeetingMicService.retryPendingNow(context)
+                        },
+                    ) { Text("立即重传") }
+                }
+            }
+            // 重传结果如实写在界面上（成功/失败/没配好都说，别静默）
+            if (phoneMic && mic.retryNote.isNotBlank()) {
+                MutedLine(
+                    "重传：${mic.retryNote}",
+                    color = if (mic.pending > 0) EchoPalette.Yellow else EchoPalette.Green,
+                    maxLines = 2,
+                )
+            }
+
             Spacer(Modifier.height(28.dp))
 
             // ---- 电平：中间高两边低的柱状"声浪" ----

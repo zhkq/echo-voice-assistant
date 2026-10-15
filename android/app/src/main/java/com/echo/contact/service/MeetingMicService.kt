@@ -68,12 +68,23 @@ class MeetingMicService : Service() {
         const val ACTION_PAUSE = "com.echo.contact.MEETING_MIC_PAUSE"
         const val ACTION_RESUME = "com.echo.contact.MEETING_MIC_RESUME"
 
+        /** 「立即重传」：界面上那个按钮走它（**复用** `retryPending`，不另写一份上传逻辑）。 */
+        const val ACTION_RETRY = "com.echo.contact.MEETING_MIC_RETRY"
+
         private const val CHANNEL_ID = "echo_meeting_mic"
         private const val NOTIF_ID = 4211
         private const val SAMPLE_RATE = 16000
         private const val FRAME_SAMPLES = 1600                     // 100ms
-        /** 一段多少秒（≈1MB，走中继很稳）。 */
-        private const val SEGMENT_SECONDS = 30
+
+        /**
+         * 一段多长，**由偏好决定**（设置页那三个 15/30/60）。
+         *
+         * 为什么**默认 30 秒**：一段 ≈1 MB（16kHz 单声道 16bit ≈ 32 KB/s），
+         * 走中继（单次上限 12 MB）很稳；再长一点，一次失败要重传的就多；
+         * 再短一点，段数太多、每段都有一次往返开销。改偏好**下次开录生效**
+         * （正在录的这一场按开录时读到的档，中途换档不会把已缓冲的那半段切碎）。
+         */
+        private fun segmentSeconds(context: Context): Int = AppPrefs.segmentSeconds(context)
 
         fun start(context: Context) {
             val i = Intent(context, MeetingMicService::class.java).setAction(ACTION_START)
@@ -91,6 +102,29 @@ class MeetingMicService : Service() {
         }
 
         /**
+         * **立即重传**（界面上的按钮）。
+         *
+         * 内部与自动重传走**同一条路**（[retryPending]）—— 上传协议、重试顺序、状态口径都只有一份，
+         * 另写一份迟早漂移。这里只多做两件界面要求的事：
+         *  1. **立刻**给出"正在重传 N 段…"（`startService` 是异步的，不等它回来再说话）；
+         *  2. 没有待传的段时说清楚"现在没有待重传的段"，而不是让按钮看着没反应。
+         */
+        fun retryPendingNow(context: Context) {
+            val app = context.applicationContext
+            val n = File(app.cacheDir, "meeting-mic")
+                .listFiles { f -> f.name.endsWith(".wav") }?.size ?: 0
+            if (n == 0) {
+                _state.value = _state.value.copy(pending = 0, retryNote = "现在没有待重传的段")
+            } else {
+                _state.value = _state.value.copy(retryNote = "正在重传 $n 段…")
+            }
+            runCatching {
+                app.startService(
+                    Intent(app, MeetingMicService::class.java).setAction(ACTION_RETRY))
+            }
+        }
+
+        /**
          * 界面读这个（**不需要 bind** —— 全屏录音界面在"手机麦"这条路上显示**本地**电平，
          * 比电脑那条隔一跳网络的顺得多）。
          */
@@ -101,6 +135,14 @@ class MeetingMicService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var job: Job? = null
     private var record: AudioRecord? = null
+
+    /**
+     * 手动重传（[ACTION_RETRY]）要用的作用域：**只在真的按下按钮时**才建。
+     * 平时它不该存在 —— 服务被系统停掉之后，一个还活着的 scope 会继续发请求，
+     * 那是最难查的一类"它为什么还在传"。
+     */
+    @Volatile private var retryScope: CoroutineScope? = null
+    @Volatile private var retryBusy = false
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -116,6 +158,7 @@ class MeetingMicService : Service() {
                 _state.value = _state.value.copy(paused = false)
                 notifyState()
             }
+            ACTION_RETRY -> retryPendingNow()
             else -> {
                 // 被系统重启带回来的 null intent：**不自动开麦**（与听写服务同一条纪律）
                 stopSelf()
@@ -152,7 +195,8 @@ class MeetingMicService : Service() {
         } catch (e: Exception) {
             return failAndStop("联系不上电脑：${e.message}")
         }
-        _state.value = _state.value.copy(active = true, error = "", sent = 0, pending = 0)
+        _state.value = _state.value.copy(
+            active = true, error = "", sent = 0, pending = 0, retryNote = "")
 
         val minBuf = AudioRecord.getMinBufferSize(
             SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
@@ -171,7 +215,9 @@ class MeetingMicService : Service() {
         record = ar
 
         val frame = ShortArray(FRAME_SAMPLES)
-        val samplesPerSegment = SAMPLE_RATE * SEGMENT_SECONDS
+        // 每段多长**读偏好**（设置页那三个 15/30/60）；开录时读一次，
+        // 中途改偏好不会把已经在缓冲的那半段切碎（界面文案写着"改完下次开录生效"）
+        val samplesPerSegment = SAMPLE_RATE * segmentSeconds(this)
         var buffer = ArrayList<Short>(samplesPerSegment)
         try {
             ar.startRecording()
@@ -246,7 +292,26 @@ class MeetingMicService : Service() {
     private fun pendingFiles(): List<File> =
         pendingDir().listFiles { f -> f.name.endsWith(".wav") }?.sortedBy { it.name } ?: emptyList()
 
-    private suspend fun retryPending(api: com.echo.contact.data.EchoApi) {
+    /**
+     * 把欠的段按顺序再传一遍。
+     *
+     * **失败就停在这**（`break`）而不是跳过它继续传后面的：会议音频的**先后顺序**就是内容本身，
+     * 跳过一段先把后面的送上去，转写出来就是乱的。留着下次再试，顺序永远不破。
+     *
+     * `retryBusy`：手动重传在跑时，采音循环里的那一轮**跳过**（否则同一段可能被同时传两次，
+     * 会议里就多出一段重复音频）。自己发起的时候不要重入保护成死锁 —— 所以只有别人在跑时才跳过。
+     *
+     * [note]：要不要把结果写进 `MicState.retryNote`。**只有用户按了「立即重传」才写** ——
+     * 自动重传是后台的常事（每段上传前都会重试一轮），每次都往界面上写一句
+     * "重传完成"，那一行就会被常驻的套话占住，反而看不出手动重传的真实结果。
+     * 不论写不写 note，`pending` 段数**每次都如实更新**（那是界面与通知都在看的事实）。
+     */
+    private suspend fun retryPending(
+        api: com.echo.contact.data.EchoApi,
+        note: Boolean = false,
+    ) {
+        if (retryBusy) return
+        var failed = false
         for (f in pendingFiles()) {
             try {
                 val r = api.meetingSegment(f.readBytes().toRequestBody("audio/wav".toMediaType()))
@@ -254,14 +319,58 @@ class MeetingMicService : Service() {
                     f.delete()
                     _state.value = _state.value.copy(sent = _state.value.sent + 1)
                 } else {
-                    return                      // 还是不行：留着，下次再试（保顺序）
+                    failed = true
+                    break                       // 还是不行：留着，下次再试（保顺序）
                 }
             } catch (e: Exception) {
-                return
+                failed = true
+                break
             }
         }
-        _state.value = _state.value.copy(pending = pendingFiles().size)
+        val left = pendingFiles().size
+        _state.value = _state.value.copy(
+            pending = left,
+            retryNote = if (!note) _state.value.retryNote
+            else if (left == 0) "重传完成，都送出去了"
+            else if (failed) "还有 $left 段没重传成功（还留着，下轮接着试）"
+            else "还有 $left 段待重传",
+        )
+        notifyState()
     }
+
+    /**
+     * 界面上那个「立即重传」按下的入口（[ACTION_RETRY]）。
+     *
+     * 与自动重传**同一条路**（[retryPending]），这里只负责：配对没配好就说清楚，
+     * 然后把这一次重传的**结果**如实写进 `retryNote`（别静默）。
+     */
+    private fun retryPendingNow() {
+        if (retryBusy) return
+        val baseUrl = PairStore.baseUrl(this)
+        if (!PairStore.isPaired(this) || baseUrl.isNullOrBlank()) {
+            _state.value = _state.value.copy(retryNote = "还没配对：先配对才能重传")
+            notifyState()
+            return
+        }
+        val api = ApiClient.create(baseUrl)
+        retryBusy = true
+        // 上一次的结果先清掉：留着上一轮的"重传完成"会让人以为这次也完了（还没开始呢）
+        _state.value = _state.value.copy(retryNote = "")
+        ensureRetryScope().launch {
+            try {
+                retryPending(api, note = true)
+            } catch (e: Exception) {
+                _state.value = _state.value.copy(retryNote = "重传出错：${e.message}")
+                notifyState()
+            } finally {
+                retryBusy = false
+            }
+        }
+    }
+
+    /** 手动重传的作用域（用完就在 [onDestroy] 里取消 —— 不留一个还在发请求的活作用域）。 */
+    private fun ensureRetryScope(): CoroutineScope =
+        retryScope ?: CoroutineScope(SupervisorJob() + Dispatchers.IO).also { retryScope = it }
 
     private fun stopEverything(reason: String) {
         val j = job
@@ -295,6 +404,10 @@ class MeetingMicService : Service() {
     override fun onDestroy() {
         runCatching { record?.release() }
         record = null
+        // 手动重传那个作用域也要一起收掉：服务没了还留着它，就会"服务已停、请求还在飞"
+        retryScope?.cancel()
+        retryScope = null
+        retryBusy = false
         scope.cancel()
         super.onDestroy()
     }
@@ -330,7 +443,6 @@ class MeetingMicService : Service() {
     }
 
     private fun buildNotification(): Notification {
-        val st = _state.value
         val intent = Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         val flags = PendingIntent.FLAG_UPDATE_CURRENT or
             (if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) PendingIntent.FLAG_IMMUTABLE else 0)
@@ -338,21 +450,32 @@ class MeetingMicService : Service() {
         val stopPi = PendingIntent.getService(
             this, 1,
             Intent(this, MeetingMicService::class.java).setAction(ACTION_STOP), flags)
-        val text = when {
-            st.error.isNotBlank() -> st.error
-            st.paused -> "已静音（这段不会录进会议）"
-            st.pending > 0 -> "在录（手机麦克风）· 已送 ${st.sent} 段 · ${st.pending} 段待重传"
-            else -> "在录（手机麦克风）· 已送 ${st.sent} 段"
-        }
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.mipmap.ic_launcher)
             .setContentTitle("ECHO 会议录音")
-            .setContentText(text)
+            .setContentText(notificationText(_state.value))
             .setOngoing(true)
             .setContentIntent(pi)
             .addAction(0, "结束", stopPi)
             .build()
     }
+}
+
+/**
+ * 通知里那一行字（**纯函数**，JVM 可测）。
+ *
+ * 为什么值得单独抽出来并有判据：这一行是"录音到底有没有丢东西"的**唯一**出口 ——
+ * 优先级写错了就会在最该说话的时候沉默：
+ *  * 有**错误**先说错误（"有一段缓存不下来，可能真的丢了"绝不能被"在录 · 已送 3 段"盖掉）；
+ *  * 静音其次；
+ *  * 然后是待重传（这条也在界面上写着，见 `MeetingRecordingScreen`）；
+ *  * 最后才是"一切正常"。
+ */
+internal fun notificationText(st: MicState): String = when {
+    st.error.isNotBlank() -> st.error
+    st.paused -> "已静音（这段不会录进会议）"
+    st.pending > 0 -> "在录（手机麦克风）· 已送 ${st.sent} 段 · ${st.pending} 段待重传"
+    else -> "在录（手机麦克风）· 已送 ${st.sent} 段"
 }
 
 /** 手机录音那条路的状态（界面读它）。 */
@@ -365,6 +488,13 @@ data class MicState(
     /** 还没送出去的段数（>0 就说明有音频躺在缓存里等重传）。 */
     val pending: Int = 0,
     val error: String = "",
+    /**
+     * 上一次重传的**结果**（"重传完成，都送出去了" / "还有 2 段没重传成功（还留着，下轮接着试）"）。
+     *
+     * 为什么要有它：界面上按了「立即重传」之后，如果只让 `pending` 变个数字，
+     * 用户分不清"传成功了"和"按了没反应"。所以结果**明写在这一行**（别静默）。
+     */
+    val retryNote: String = "",
 )
 
 /** 一段 PCM（短整型）→ 小端字节。纯函数，JVM 可测。 */

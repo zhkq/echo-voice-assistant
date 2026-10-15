@@ -42,6 +42,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.echo.contact.audio.InputDevices
+import com.echo.contact.audio.OutputDevices
 import com.echo.contact.service.AppPrefs
 import com.echo.contact.service.ListenPrefs
 import com.echo.contact.service.ListenTuning
@@ -76,8 +77,11 @@ fun SettingsScreen(vm: MainViewModel, onBack: () -> Unit, onUnpair: () -> Unit) 
     var tuning by remember { mutableStateOf(ListenPrefs.load(context)) }
     var mediaKeys by remember { mutableStateOf(AppPrefs.mediaKeys(context)) }
     var inputId by remember { mutableStateOf(AppPrefs.inputDeviceId(context)) }
+    var outputId by remember { mutableStateOf(AppPrefs.outputDeviceId(context)) }
+    var segmentSeconds by remember { mutableStateOf(AppPrefs.segmentSeconds(context)) }
     // 设备列表与版本号"进页面取一次"：它们是系统状态，不该跟着组合重组反复查
     val inputs = remember { InputDevices.list(context) }
+    val outputs = remember { OutputDevices.list(context) }
     val appVersion = remember { appVersionText(context) }
 
     LazyColumn(
@@ -135,13 +139,13 @@ fun SettingsScreen(vm: MainViewModel, onBack: () -> Unit, onUnpair: () -> Unit) 
             }
         }
 
-        // ---------------------------------------------------------------- 设备
+        // ---------------------------------------------------------------- 设备（输入麦 / 输出 / 段长）
         item {
             EchoCard {
                 Column {
                     CardHeader(title = "设备", dotColor = EchoPalette.Muted)
                     Spacer(Modifier.height(6.dp))
-                    MutedLine("录音用哪支麦克风。现在：" + InputDevices.describe(context), maxLines = 3)
+                    MutedLine("**输入**：录音用哪支麦克风。现在：" + InputDevices.describe(context), maxLines = 3)
                     Spacer(Modifier.height(6.dp))
                     DeviceChoiceRow(
                         label = "跟随系统",
@@ -166,14 +170,78 @@ fun SettingsScreen(vm: MainViewModel, onBack: () -> Unit, onUnpair: () -> Unit) 
                     }
                     Spacer(Modifier.height(4.dp))
                     MutedLine("改完下次开听写生效（正在听时换麦要重开采集）。", maxLines = 2)
+
                     Spacer(Modifier.height(6.dp))
                     HorizontalDivider(color = EchoPalette.Border)
                     Spacer(Modifier.height(6.dp))
+
+                    // ---- 输出设备：只做实际能做到的（手机念没有接口，所以那条路跟随系统）----
+                    MutedLine("**输出**（回复从哪儿放）现在：" + OutputDevices.describe(context), maxLines = 3)
+                    Spacer(Modifier.height(6.dp))
+                    DeviceChoiceRow(
+                        label = "跟随系统",
+                        selected = outputId == AppPrefs.FOLLOW_SYSTEM,
+                        buttonLabel = "用它",
+                        onClick = {
+                            outputId = AppPrefs.FOLLOW_SYSTEM
+                            AppPrefs.saveOutputDeviceId(context, outputId)
+                        },
+                    )
+                    outputs.forEach { d ->
+                        DeviceChoiceRow(
+                            label = OutputDevices.labelOf(d),
+                            selected = outputId == d.id,
+                            buttonLabel = "优先用它",
+                            onClick = {
+                                outputId = d.id
+                                AppPrefs.saveOutputDeviceId(context, outputId)
+                            },
+                        )
+                    }
+                    if (outputs.isEmpty()) {
+                        MutedLine("现在看不到可用输出设备（系统会给一个默认的）", maxLines = 2)
+                    }
+                    // 如实说清限制：**这是界面上必须写的话，不是只写在注释里**
                     MutedLine(
-                        "输出设备：跟随系统。手机念那条路走系统 TTS，没有指定输出设备的接口；" +
-                            "ECHO 念那条路能设，但蓝牙/听筒的最终路由仍由系统定 —— " +
-                            "所以这里只写实际做到的，不摆一个选了也没用的控件。",
-                        maxLines = 5,
+                        "限制（如实）：① 「手机念」跟随系统 —— 系统 TTS 没有指定输出设备的接口，" +
+                            "所以上面这些选择对它不起作用；② 「ECHO 念」能优先用你选的这支，" +
+                            "但蓝牙/听筒的最终路由由系统定（写着「优先」，不是「一定用它」）；" +
+                            "③ 选的那支不在了会回落系统默认，就在上面那行如实写着。",
+                        maxLines = 6,
+                    )
+                    Spacer(Modifier.height(4.dp))
+                    MutedLine("改完下次念生效（正在播的那句不会中途换设备）。", maxLines = 2)
+
+                    Spacer(Modifier.height(6.dp))
+                    HorizontalDivider(color = EchoPalette.Border)
+                    Spacer(Modifier.height(6.dp))
+
+                    // ---- 「手机当麦克风」每段多长 ----
+                    MutedLine("**手机当麦克风**：每段 ${segmentSeconds} 秒（改完下次开录生效）", maxLines = 2)
+                    Spacer(Modifier.height(6.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        for (sec in AppPrefs.SEGMENT_SECONDS_CHOICES) {
+                            if (sec == segmentSeconds) {
+                                Button(onClick = {}) { Text("$sec 秒") }
+                            } else {
+                                OutlinedButton(onClick = {
+                                    // 单选的三档都走 AppPrefs 的夹取（判据只有一处），这里不自己判
+                                    segmentSeconds = AppPrefs.normalizeSegmentSeconds(sec)
+                                    AppPrefs.saveSegmentSeconds(context, segmentSeconds)
+                                }) { Text("$sec 秒") }
+                            }
+                        }
+                    }
+                    MutedLine(
+                        "一段 ≈ 秒数×32KB：长一点段数少，但一次失败要重传的就大；" +
+                            "短一点重传轻，但请求多。默认 30 秒 ≈1 MB，走中继很稳。",
+                        maxLines = 3,
+                    )
+                    Spacer(Modifier.height(4.dp))
+                    MutedLine(
+                        "发不出去的段会留在手机缓存里，下次上传前自动重试 —— " +
+                            "录音界面上能看到「待重传 N 段」并按「立即重传」。",
+                        maxLines = 3,
                     )
                 }
             }
@@ -376,9 +444,19 @@ fun SettingsScreen(vm: MainViewModel, onBack: () -> Unit, onUnpair: () -> Unit) 
     }
 }
 
-/** 一行设备选项：选中的标「正在用」，其余给「用这支」。 */
+/**
+ * 一行设备选项：选中的标「正在用」，其余给一个按钮。
+ *
+ * [buttonLabel] 默认是输入麦那边的「用这支」；输出那边写「用它 / 优先用它」——
+ * 因为输出只是**偏好**（`MediaPlayer.setPreferredDevice`），写"正在用"会造成"一定在用它"的错觉。
+ */
 @Composable
-private fun DeviceChoiceRow(label: String, selected: Boolean, onClick: () -> Unit) {
+private fun DeviceChoiceRow(
+    label: String,
+    selected: Boolean,
+    onClick: () -> Unit,
+    buttonLabel: String = "用这支",
+) {
     Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
         Text(
             label,
@@ -390,7 +468,7 @@ private fun DeviceChoiceRow(label: String, selected: Boolean, onClick: () -> Uni
         if (selected) {
             Text("正在用", style = MaterialTheme.typography.labelSmall, color = EchoPalette.Green)
         } else {
-            TextButton(onClick = onClick) { Text("用这支") }
+            TextButton(onClick = onClick) { Text(buttonLabel) }
         }
     }
 }

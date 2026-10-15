@@ -52,4 +52,38 @@ class MeetingMicPcmTest {
     fun `n 为 0 时不该炸`() {
         assertEquals(0f, rms(ShortArray(10), 0), 0.0001f)
     }
+
+    // ---- 通知里那一行字（"录音到底有没有丢东西"的唯一出口）----
+
+    @Test
+    fun `待重传的段数要出现在通知里`() {
+        val s = notificationText(MicState(active = true, sent = 4, pending = 2))
+        assertTrue("用户不在界面里时，通知是唯一能看到'还有段没送出去'的地方：$s",
+            s.contains("2 段待重传"))
+        assertTrue("已送段数也要在：$s", s.contains("已送 4 段"))
+    }
+
+    @Test
+    fun `错误优先于静音与待重传`() {
+        // "有一段缓存不下来，可能真的丢了"绝不能被"在录 · 已送 3 段"盖掉 ——
+        // 那是真的丢音频，优先级写错就等于在最该说话的时候沉默
+        val s = notificationText(
+            MicState(active = true, paused = true, sent = 3, pending = 5, error = "有一段缓存不下来"))
+        assertEquals("有一段缓存不下来", s)
+    }
+
+    @Test
+    fun `静音优先于待重传`() {
+        val s = notificationText(MicState(active = true, paused = true, pending = 5))
+        assertTrue("静音这件事更要紧（这段时间本来就不会录进会议）：$s", s.contains("已静音"))
+        assertTrue("但也不能把这个状态说成'在录'：$s", !s.contains("在录"))
+    }
+
+    @Test
+    fun `一切正常时只报已送段数`() {
+        val s = notificationText(MicState(active = true, sent = 7))
+        assertTrue(s, s.contains("在录"))
+        assertTrue(s, s.contains("已送 7 段"))
+        assertTrue("没有欠的段就不该出现'待重传'：$s", !s.contains("待重传"))
+    }
 }
