@@ -251,8 +251,10 @@ def speak(text, engine="auto", timeout=60):
         return _speak_offline(text)
     ok = _speak_edge(text, timeout)
     if ok:
+        sync_status()          # 在线成了 → 面板那句可能就是"自动（在线）"
         return True
     _edge_broken = True
+    sync_status()              # 在线真失败了 → 立刻如实写"自动（离线）"，别等下次校准
     if engine != "edge-tts":
         return _speak_offline(text)
     return False
@@ -316,8 +318,10 @@ def synthesize(text, engine="auto", timeout=60):
     if not use_offline:
         data = _edge_bytes(text, timeout)
         if data:
+            sync_status()      # 在线成了 → 面板那句可能就是"自动（在线）"
             return ("audio/mpeg", data)
         _edge_broken = True
+        sync_status()          # 在线真失败了 → 立刻如实写"自动（离线）"
         if engine == "edge-tts":
             raise TtsError("edge-tts 合成失败：在线引擎不可用或返回空音频")
     # 离线这条路：**写到临时 wav 再读字节**（平台接缝只提供"合成到文件"，与播放共用实现）
@@ -402,6 +406,100 @@ def tts_online_status():
 def speak_async(text, engine="auto"):
     """后台线程朗读，不阻塞调用方。"""
     threading.Thread(target=speak, args=(text, engine), daemon=True).start()
+
+
+# ---------------------------------------------------------------- 诚实的状态标签
+#
+# 2026-10-15 用户实测：面板底部那格「语音合成」写着**自动**，而实际上在线那条路
+# （edge-tts）已经被微软服务端 403 拒了、每次朗读都在偷偷走本机离线引擎 ——
+# 面板那句"自动"是按**设置值**映射出来的（`web/app.js` 的 ttsShort），**没问现实**。
+# 这一节把"现实"做成一句话，而**判据只有这一处**（别在面板/接口里各拼一遍）。
+
+#: 上次报给 `services` 的标签；**只有变了才写库**（否则每次轮询都写一次，白白占库）。
+_reported_label = None
+
+
+def describe(engine, online_ok, offline_label="本机离线", offline_ids=("sapi",)):
+    """``(设置里选的引擎, 在线现在能用吗, 离线引擎名)`` → 一句诚实的标签。
+
+    **纯函数**：不读设置、不探网络、不写库 —— 所以每一档都能在
+    `tests/test_tts_status.py` 里逐条钉住。
+
+    ⚠️ 第一段必须是**短值**：面板底部那三格只显示 ``detail.split(" · ")[0]``
+    （用户要的是"自动（在线）/自动（离线）"），`` · `` 之后才是解释。
+    """
+    eng = str(engine or "auto").strip() or "auto"
+    off = str(offline_label or "本机离线")
+    off_ids = set(offline_ids or ())
+    if eng == "off":
+        return "已关闭 · 朗读被关掉了（ttsEngine=off），谁都不会念"
+    if eng in off_ids or eng == off:
+        return "本机离线 · %s" % off
+    if eng == "edge-tts":
+        if online_ok:
+            return "在线 · edge-tts"
+        return "在线（不可达） · 在线合成连不上，会自动回退 %s" % off
+    # 其余（含 auto、以及认不出来的值）都按"自动"讲 —— 与 `auto` 的实际分支一致
+    if online_ok:
+        return "自动（在线） · 首选 edge-tts，失败会回退 %s" % off
+    return "自动（离线） · 在线不可用（连不上或刚失败过），现在用 %s" % off
+
+
+def online_usable():
+    """在线那条路**现在**能用吗 = 探针通过（包在 + 端口通，带 300 秒缓存）**且**
+    没有刚刚真实失败过。
+
+    两个条件都要（2026-10-15 的真事故）：探针只测"包在 + 端口通"，
+    **测不出**"TCP 通、WebSocket 握手被服务端 403 拒"那一种；
+    而 ``_edge_broken`` 正是**真实调用**失败留下的证据。
+    """
+    try:
+        if _edge_broken:
+            return False
+        return bool(probe_online())
+    except Exception:
+        return False
+
+
+def engine_label(engine=None):
+    """按设置 + 现状给那句诚实标签（``engine=None`` = 读设置）。**不写库。**"""
+    if engine is None:
+        try:
+            from app.config import settings
+            engine = settings.get("ttsEngine", "auto")
+        except Exception:
+            engine = "auto"
+    try:
+        offline_label = str(echo_platform.offline_tts_label() or "本机离线")
+    except Exception:
+        offline_label = "本机离线"
+    try:
+        off_ids = tuple(_offline_engine_ids())
+    except Exception:
+        off_ids = ("sapi",)
+    return describe(engine, online_usable(), offline_label, offline_ids=off_ids)
+
+
+def sync_status(force=False):
+    """把这句标签写进组件状态（**标签没变就不写库**）。
+
+    三处调用点缺一不可：
+      * `boot._start_tts` —— 启动时那一行；
+      * `speak()` / `synthesize()` 真实调用成功/失败之后 —— 于是"刚失败"会在
+        **几百毫秒内**反映到面板，而不是等谁想起来再校准；
+      * `api.api_status` —— 读状态时校准一次（与 harness 那行同一个手法，2026-10-11 加的）。
+    """
+    global _reported_label
+    label = engine_label()
+    if not force and label == _reported_label:
+        return label
+    _reported_label = label
+    try:
+        from app import services
+        services.report_tts("online", label)
+    except Exception:                                             # 状态写不进去也不能影响朗读
+        pass
+    return label
 
 
 def beep_ok():

@@ -542,18 +542,13 @@ def _stop_stt_cmd():
 def _start_tts(report):
     from app.config import settings
     from app.audio import tts
-    from app import platform as echo_platform
     eng = settings.get("ttsEngine", "auto")
-    online = tts.probe_online()
-    offline = echo_platform.offline_tts_display()
-    # 离线引擎的配置值按平台不同（Windows=sapi / macOS=say / Linux=espeak）
-    offline_ids = {"sapi", str(echo_platform.offline_tts_label() or "")}
-    if eng in offline_ids:
-        detail = "离线 · %s" % offline
-    elif eng == "edge-tts":
-        detail = "在线 · edge-tts" if online else "在线(不可达，将回退 %s)" % offline
-    else:
-        detail = "在线 · edge-tts" if online else "离线 · %s（在线不可达）" % offline
+    # 那句状态**只有一处判据**（`tts.describe` / `tts.engine_label`）：它同时看"探针"与
+    # "真实调用有没有刚失败过"，而且 `auto` 会明确写成「自动（在线）/自动（离线）」——
+    # 以前这里自己拼 `online = probe_online()`，于是"TCP 通、但 WebSocket 握手被 403"
+    # 时它照样报「在线 · edge-tts」（2026-10-15 用户实测：面板写着自动/在线，
+    # 每次朗读其实都在跑本机离线引擎）。
+    detail = tts.engine_label(eng)
     report(status="online", detail=detail, progress=1.0)
 
 

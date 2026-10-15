@@ -4750,8 +4750,15 @@ async function refreshRunStatus() {
   const agTip = ag ? `执行智能体：${ag.displayName || ag.name}（${ag.detail || ag.status || ""}）`
                    : "读不到智能体状态";
   const engine = String(settingValue("ttsEngine") || "auto");
-  const ttsShort = ({ off: "关闭", "edge-tts": "在线", auto: "自动" })[engine] || "本机";
-  const ttsTip = tts ? `语音合成：${ttsShort}（${tts.detail || tts.status || ""}）`
+  // 2026-10-15 用户："语音合成卡片现在显示的是自动，改成自动（在线），或者自动（离线）"。
+  // 短值优先取**服务端那句诚实的 detail**（`app/audio/tts.py::describe` 给的，第一段就是短值）
+  // —— 原来这里只按 `ttsEngine` 的**设置值**映射，等于没问现实：在线链路断了
+  // （edge-tts 被服务端 403）面板照样写"自动"，而每次朗读其实都在跑本机离线引擎。
+  // 兜底那套映射留给"组件状态还没上报"的窗口（例如刚开机第一屏）。
+  const ttsDetail = String((tts && tts.detail) || "");
+  const ttsShort = ttsDetail ? ttsDetail.split(" · ")[0]
+    : (({ off: "关闭", "edge-tts": "在线", auto: "自动" })[engine] || "本机");
+  const ttsTip = tts ? `语音合成：${tts.detail || ttsShort}`
                      : "读不到语音合成组件状态";
   _bindCardLinks(host);
   host.innerHTML = [

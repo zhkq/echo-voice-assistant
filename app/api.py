@@ -532,6 +532,17 @@ def api_status(_auth=Depends(optional_auth)):
             components = services.snapshot()
         except Exception:
             pass                       # 校准失败就用旧值，绝不因为一句话的状态把接口弄挂
+    # 2026-10-15（用户实测的"语音合成写着自动、其实是离线"）：**tts 那一行也要在读时校准**。
+    # 同一个形状、同一个理由：那句 detail 由 `auto` 到底走在线还是离线决定，而 boot 只在
+    # 启动时写一次 —— 之后在线链路断了（edge-tts 被服务端 403）面板还一直写"在线 · edge-tts"。
+    # 判据只有一处（`tts.describe`）：探针（包 + 端口，300 秒缓存）+ **真实调用有没有刚失败过**；
+    # 而且**标签没变就不写库**（这个接口是高频轮询的）。
+    try:
+        from app.audio import tts as tts_mod
+        tts_mod.sync_status()
+        components = services.snapshot()
+    except Exception:
+        pass                           # 同上：状态写不进去也绝不让接口挂
     # 当前选中的智能体：折叠条/面板据此显示"我用的那个"，而不是永远盯着 DSH Desktop。
     # 状态取自组件表（boot 与各适配器往里写）；**不在这里探活** —— 这个接口被高频轮询，
     # 而 codebuddy 那种"每次调用起一个进程"的适配器探一次就是要起进程。
