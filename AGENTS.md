@@ -791,3 +791,28 @@ scopes 还得重发）。当晚的绕法：用 `pairing.pair()` 里**逐字同�
 `boot.backend_security_note()`（2026-10-16 加的）取的是 `_base_url_from_settings()`，
 而这台机器上它先拿到**本机配对文件**的 `127.0.0.1:8900` → 被判回环而静默 ✗。**该修**：
 告警要看**实际用于网络调用**的那个地址（remote 配对），不是本机那份。
+## 更正 + 三个新发现（2026-10-16 早，A1/A3 那件事的实证复盘）
+
+**更正上一节「明文后端告警部署了但没生效」的根因**：我原先写"它先拿到本机配对文件的
+`127.0.0.1:8900` 所以被判回环"——**这句是错的**。子代理按代码+真机数据实证：
+`echo_server._base_url_from_settings(use_credentials=False)` **不读配对文件**，而这台机器
+`D:\ECHO\data\echo.db` 里 `capabilityEchoServerUrl` 是**空串** → 旧代码直接 `return ""` 静默 ✗。
+修法不变（改用**实际调用那条路**：`_base_url_from_settings()` 默认参数 =
+`client_from_settings()` / `EchoServerClient.base_url` / `backend_endpoint()` 同一份解析），
+但"为什么静默"必须记对，否则下一个人会去查错地方。
+
+**新发现 1（优先级不一致，未修）**：`docs/设置项归属表.md` 与 `backend_watch._backend_target()`
+都写"**配对优先**"，而真实调用是 `_base_url_from_settings()` 的"**隐藏设置优先**、其次配对文件"。
+告警已按**真实**调用走（否则告警与实际连的地址会不一致）并有用例钉住；
+真要统一口径得改 `_base_url_from_settings()` 的优先级（影响面大，另开一轮）。
+
+**新发现 2（一次网络抖动会把可用状态改成不可用，未修）**：`POST /api/capability/address`
+现在是"**先** `set_base_url()` 落盘、**再**抓证书补 pin"→ 抓证书失败时地址已改、证书没有、
+`ready=False` ✗。更稳的是"**先抓证书、成功才落地址**"（需要动 `app/capability_admin.py`）。
+
+**新发现 3（功能没入口）**：补 pin 的接口已支持配对串里的 `fp=`（指纹，用来防中间人），
+但面板「改地址」那格**没有**填指纹的地方 → 这个防中间人的能力目前用不上（`web/app.js` 未动）。
+
+**A1 的行为变化（有意，已钉用例）**：https 且本地缺证书时**重提同一地址**会顺手补 pin
+（旧实现回 200"地址没变"继续坏着）；证书已在时仍是纯 no-op。https→https **换主机**会重取证书
+（TOFU：证书里没有"这是哪台机器"的可靠记录，不重取就会撞"服务端换证书了？重新配对一次"的误导句）。
