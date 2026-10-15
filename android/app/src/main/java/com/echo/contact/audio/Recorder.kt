@@ -26,9 +26,15 @@ class Recorder {
 
     @Volatile private var recording = false
 
-    /** 开始录音。返回 false 表示设备不给开麦（原因由调用方去看权限/占用）。 */
+    /**
+     * 开始录音。返回 false 表示设备不给开麦（原因由调用方去看权限/占用）。
+     *
+     * `device` = 用户在「设置 → 设备」里指定的那支麦（null = 跟随系统）。
+     * `setPreferredDevice` 的语义是**偏好**，系统可以不听 —— 所以这里不承诺"一定用它"，
+     * 调用方（界面）负责把"现在实际用哪支"说清楚（见 `InputDevices.describe`）。
+     */
     @SuppressLint("MissingPermission")   // 权限由界面先要到；这里只负责开麦
-    fun start(): Boolean {
+    fun start(device: android.media.AudioDeviceInfo? = null): Boolean {
         if (recording) return true
         val minBuf = AudioRecord.getMinBufferSize(SAMPLE_RATE, CHANNEL, ENCODING)
         if (minBuf <= 0) return false
@@ -48,6 +54,8 @@ class Recorder {
             runCatching { ar.release() }
             return false
         }
+        // 用户指定的那支麦（null = 跟随系统）。失败不当错误：偏好而已，系统可以不听
+        if (device != null) runCatching { ar.setPreferredDevice(device) }
 
         val out = ByteArrayOutputStream(SAMPLE_RATE * 2 * 8)
         record = ar

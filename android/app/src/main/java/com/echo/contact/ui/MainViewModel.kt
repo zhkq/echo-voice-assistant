@@ -3,6 +3,7 @@ package com.echo.contact.ui
 import android.app.Application
 import androidx.lifecycle.viewModelScope
 import com.echo.contact.audio.EchoTtsPlayer
+import com.echo.contact.audio.InputDevices
 import com.echo.contact.audio.MeetingAudio
 import com.echo.contact.audio.MeetingAudioPlayer
 import com.echo.contact.audio.Recorder
@@ -981,7 +982,10 @@ class MainViewModel(app: Application) : BaseViewModel(app) {
         if (_recording.value) return true
         _voiceText.value = ""
         _submit.value = SubmitState()
-        val ok = recorder.start()
+        // 用户在「设置 → 设备」里指定的那支麦（null = 跟随系统）。取不到就跟随系统 ——
+        // 选的那支不在了是他的事，不该让"说一句"开不了麦（`InputDevices.describe` 会如实说）
+        val mic = runCatching { InputDevices.preferredInput(getApplication()) }.getOrNull()
+        val ok = recorder.start(mic)
         if (!ok) {
             _speakNote.value = "开不了麦克风：可能被别的应用占着，或权限没给"
             return false

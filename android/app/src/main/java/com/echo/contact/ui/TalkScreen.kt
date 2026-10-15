@@ -156,6 +156,9 @@ fun TalkScreen(vm: MainViewModel) {
             item { ErrorCard(statusError ?: "连不上 ECHO") }
         }
 
+        // ---- ⓪ 服务状态（用户口径里的三类主要功能之一；小卡片 + 状态灯，点开看组件）----
+        item { EchoStatusCard(vm) }
+
         // ---- ① 主操作（唯一的一件大事）----
         item {
             EchoCard {

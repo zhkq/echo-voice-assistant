@@ -23,6 +23,7 @@ import androidx.core.content.ContextCompat
 import com.echo.contact.MainActivity
 import com.echo.contact.R
 import com.echo.contact.audio.EchoCancel
+import com.echo.contact.audio.InputDevices
 import com.echo.contact.audio.SystemTts
 import com.echo.contact.audio.VoiceSegmenter
 import com.echo.contact.audio.WavWriter
@@ -176,9 +177,14 @@ class ListenService : Service() {
      * 而 API 21+ 的框架类足够用 —— 本项目 minSdk 26。
      *
      * ⚠️ 会话只在服务活着时存在：耳机键**不能**把没开过的听写叫起来（见 `ListenKeys` 的说明）。
+     *
+     * **能不能用是 App 自己的选项**（`AppPrefs.mediaKeys`，设置 → 按键与快捷方式）：
+     * 关掉就**不建会话** —— 连"按一下有反应"都不该有。这条只在服务启动时读一次，
+     * 所以设置页写着"改完下次开听写生效"（与听写参数同一个口径）。
      */
     private fun ensureMediaSession() {
         if (mediaSession != null) return
+        if (!AppPrefs.mediaKeys(this)) return
         val session = MediaSession(this, MEDIA_SESSION_TAG)
         session.setFlags(
             MediaSession.FLAG_HANDLES_MEDIA_BUTTONS or
@@ -340,6 +346,20 @@ class ListenService : Service() {
             runCatching { ar.release() }
             return failAndStop("麦克风初始化失败：可能被别的应用占着")
         }
+        // 用户指定的那支麦（App 自己的选项，见 `InputDevices`）：**设置偏好**，并如实回报。
+        // `setPreferredDevice` 的语义就是"偏好"——系统可以不听（蓝牙尤其会），所以这里不承诺
+        // "一定用它"；选的那支不在了就回落系统默认，并把原因写进启动说明。
+        val micNote = if (AppPrefs.inputDeviceId(this) == AppPrefs.FOLLOW_SYSTEM) {
+            ""
+        } else {
+            val picked = InputDevices.preferredInput(this)
+            if (picked == null) {
+                "你选的那支麦克风不在了 —— 已回落到系统默认"
+            } else {
+                val ok = runCatching { ar.setPreferredDevice(picked) }.getOrDefault(false)
+                if (ok) "麦克风：${InputDevices.labelOf(picked)}" else "系统没接受指定的麦克风，用了默认那支"
+            }
+        }
         aec = if (wanted == EchoCancel.Mode.FULL_DUPLEX) EchoCancel.attach(ar) else null
         fullDuplex = aec != null
         val startNote = when {
@@ -347,6 +367,7 @@ class ListenService : Service() {
             tuning.keepListeningWhileSpeaking -> "这台设备不支持回声消除，念回复时先不收音"
             else -> ""
         }
+        val startNotes = listOf(startNote, micNote).filter { it.isNotBlank() }
 
         val segmenter = VoiceSegmenter(
             sampleRate = SAMPLE_RATE,
@@ -359,8 +380,10 @@ class ListenService : Service() {
         val frame = ShortArray(FRAME_SAMPLES)
         try {
             ar.startRecording()
-            ListenState.set(ListenState.Phase.LISTENING, startNote)
-            refreshNotification(ListenState.Phase.LISTENING, startNote)
+            // 两条启动说明合成一句（全双工 + 麦克风偏好可能都有），别一条盖掉另一条
+            val note = startNotes.joinToString(" · ")
+            ListenState.set(ListenState.Phase.LISTENING, note)
+            refreshNotification(ListenState.Phase.LISTENING, note)
             updateMediaSessionState()
             while (currentCoroutineContext().isActive) {
                 val n = try {
