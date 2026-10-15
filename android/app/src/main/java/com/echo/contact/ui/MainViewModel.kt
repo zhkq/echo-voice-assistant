@@ -67,6 +67,47 @@ data class SubmitState(
 }
 
 /**
+ * 通知 extra → 「打开哪场会议 / 落到列表 + 一句提示」的**决策**（纯函数，单测钉住）。
+ *
+ * 为什么要有这个函数、而不是在 ViewModel 里写几行：这段逻辑有三条容易写错、
+ * 又最难在真机上每次都验到的分支 ——
+ *  ① 没有目标（普通通知、或老版本的通知）→ **回首页，不打扰**；
+ *  ② 有名字、列表里也真有 → 打开那场详情；
+ *  ③ 有名字、但列表里**没有**（会议被删了 / 列表被翻页截断）→
+ *    **落到会议列表并如实说"没找到"**。第 ③ 条按需求是硬要求：
+ *    静默什么都不发生是最糟的体验（用户还以为 App 卡了）。
+ * 做成纯函数就能在 JVM 里把三条都钉住。
+ */
+object MeetingOpenPlan {
+
+    /** 打开某场会议详情。 */
+    data class Open(val id: Int, val name: String)
+
+    /** 落到会议列表，并（可选地）说一句为什么没能打开那场。 */
+    data class Fallback(val message: String?)
+
+    /** 会议名 → id 的匹配规则只有一条：**完全相等**。 */
+    fun matchId(meetings: List<MeetingItem>, name: String): Int? =
+        meetings.firstOrNull { it.name == name }?.id
+
+    /**
+     * [extra] = `EventNotify.EXTRA_MEETING` 的值（可能为 null/空白）。
+     * ⚠️ "空白"要当成"没有目标"：`Intent.getStringExtra` 在键不存在时本来给 null，
+     * 但不能指望调用方总是传 null（手工 `putExtra("")` 完全可能）。
+     */
+    fun decide(extra: String?, meetings: List<MeetingItem>): Any {
+        val name = extra?.trim().orEmpty()
+        if (name.isEmpty()) return Fallback(message = null)   // 普通通知：回首页，不用解释
+        val id = matchId(meetings, name)
+            ?: return Fallback(message = "没找到那场会议（$name）；可能已经被删掉了，下面是现有会议")
+        return Open(id = id, name = name)
+    }
+}
+
+/** 一次「按名字打开会议」的请求；[seq] 让重放/重复投递的同一个目标不会重复触发。 */
+data class MeetingOpenRequest(val name: String, val seq: Long)
+
+/**
  * 主页（仪表盘）：整机状态 + 发文字指令 + 指令历史。
  *
  * **为什么要轮询**：`POST /api/assistant/command` 立刻返回 `{ok: true, message: "已提交"}`
@@ -76,6 +117,68 @@ data class SubmitState(
  * 所以"发完刷一次"必然刷到空结果 —— 必须盯着那一条直到它有结论。
  */
 class MainViewModel(app: Application) : BaseViewModel(app) {
+
+    // ---- 页签 + 通知带来的"要打开哪场会议"（任务 B8）----
+    //
+    // 页签为什么放进 ViewModel：通知点进来时要"先切到会议页、再打开详情"，
+    // 而 MainActivity 拿不到 Compose 里那个 `tab` 局部状态。放在这里两边都能读写，
+    // 也顺带让"回到首页"这类跳转有个统一入口。
+
+    /** 0=说话 1=会议 2=回顾。 */
+    private val _tab = MutableStateFlow(0)
+    val tab: StateFlow<Int> = _tab.asStateFlow()
+
+    fun selectTab(index: Int) {
+        if (index in 0..2) _tab.value = index
+    }
+
+    /**
+     * 通知里带的会议名 → 界面（`HomeScreen` 收一次就调 [openMeetingByName]）。
+     *
+     * 冷启动与热启动**走同一条路**：`MainActivity` 在 `onCreate`（冷启动）或
+     * `onNewIntent`（热启动）里调 [requestOpenMeeting]，这里发一个**只消费一次**的请求；
+     * 界面拿到就切到会议页并打开详情。用 [MeetingOpenRequest.seq] 而不是"清成 null"：
+     * StateFlow 同值不重发，而 seq 每次递增，重复投递能被幂等地识别掉。
+     */
+    private val _meetingOpen = MutableStateFlow<MeetingOpenRequest?>(null)
+    val meetingOpen: StateFlow<MeetingOpenRequest?> = _meetingOpen.asStateFlow()
+
+    private var meetingOpenSeq = 0L
+
+    /**
+     * 按会议名打开那场会议详情（**复用** [openMeeting]，不另写一份加载逻辑）。
+     *
+     * 顺序是有讲究的：
+     *  ① 先切到会议页 —— 落到列表时用户要看见列表与那句提示；
+     *  ② **重新拉一次列表**（通知可能是几小时前的，本地那份已经旧了）；
+     *  ③ 按名字找 id：找到就 [openMeeting]；找不到就**如实说"没找到"**，
+     *    并把页面留在会议列表（绝不静默什么都不发生）。
+     */
+    fun openMeetingByName(raw: String) {
+        _tab.value = 1
+        viewModelScope.launch {
+            try {
+                val resp = api().meetings(limit = MEETING_LOOKUP_LIMIT)
+                if (resp.isSuccessful) {
+                    resp.body()?.items?.let { _meetings.value = it }
+                } else {
+                    _meetingsNote.value = "拉会议列表失败：${parseError(resp)}"
+                }
+            } catch (e: Exception) {
+                // 拉不到列表就没法在本地认出那场会议 —— 原因说出来，别让点击像掉进黑洞
+                _meetingsNote.value = "拉会议列表失败：${e.message}"
+            }
+            when (val plan = MeetingOpenPlan.decide(raw, _meetings.value)) {
+                is MeetingOpenPlan.Open -> {
+                    _meetingsNote.value = null
+                    openMeeting(plan.id)
+                }
+                is MeetingOpenPlan.Fallback -> {
+                    _meetingsNote.value = plan.message
+                }
+            }
+        }
+    }
 
     // ---- 仪表盘：整机状态 ----
     /** `GET /api/status` 解析后的结果；null = 还没拿到。 */
@@ -1312,5 +1415,66 @@ class MainViewModel(app: Application) : BaseViewModel(app) {
 
         /** 一次识别最长听多久（兜底，防止永远卡在"在听…"）。 */
         const val SESSION_LIMIT_MS = 15_000L
+
+        /**
+         * 按通知里的会议名找那场会议时，一次拉多少条。
+         *
+         * 为什么给 50（比列表页的 20 大）：会议名是**时间戳**（`2026-10-15_15-36-48`），
+         * 用户点的那条通知是最近几天的事，50 条足够覆盖；给太大只是白拉。
+         * 找不到就落到列表 + 一句实话（见 [MeetingOpenPlan.decide]）。
+         */
+        const val MEETING_LOOKUP_LIMIT = 50
+    }
+}
+
+/**
+ * **通知 → 界面**的那一次交接（进程级，故意是 object）。
+ *
+ * 为什么用 object 而不是构造参数：`MainActivity` 每次是**新实例**，而
+ * `HomeScreen` 里的 `viewModel()` 拿到的 ViewModel 与 Activity 不是同一个作用域链；
+ * `Activity.onCreate` 里 `setContent` 之前写入、`HomeScreen` 组合时读一次 ——
+ * 中间没有任何异步（都在主线程），所以这个交接是可靠的。
+ *
+ * 冷启动（onCreate）与热启动（onNewIntent）都往这里写，界面只有**一条**消费路径，
+ * 两条路不会各写一份逻辑（这正是需求里"复用而不是新写一份"的意思）。
+ */
+object MeetingOpenStore {
+
+    /** 收到的最新一次打开请求；null = 从没收到过。 */
+    var pending: MeetingOpenRequest? = null
+        private set
+
+    /**
+     * 序号是**进程级**的计数器，不是"当前请求里带的那个"。
+     *
+     * 为什么不能写成 `(pending?.seq ?: 0) + 1`：一次 `consume()` 之后 `pending` 就是 null 了，
+     * 下一次 `put` 又从 1 开始 —— 界面若按"这是个新序号"去重，就会把第二次点通知
+     * 当成旧请求丢掉（同一个会议名连点两下，第二下没反应）。序号只增不减才安全。
+     */
+    private var seq = 0L
+
+    /**
+     * 记下"要点通知里的那场会议"。
+     * [MeetingOpenRequest.seq] 每次递增：同一个会议名再点一次也会被界面识别成**新的一次**
+     * （StateFlow 同值不重发），而配置变化后界面重放同一个值也不会重复打开。
+     */
+    fun put(name: String) {
+        val trimmed = name.trim()
+        if (trimmed.isEmpty()) return
+        seq += 1
+        pending = MeetingOpenRequest(trimmed, seq)
+    }
+
+    /** 取一次（界面拿到就消费掉）。 */
+    fun consume(): MeetingOpenRequest? {
+        val it = pending
+        pending = null
+        return it
+    }
+
+    /** 测试用：清干净（序号也归零，免得用例之间互相影响）。 */
+    fun clear() {
+        pending = null
+        seq = 0L
     }
 }

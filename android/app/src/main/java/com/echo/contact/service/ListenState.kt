@@ -94,4 +94,51 @@ object ListenState {
         }
         return title to body
     }
+
+    // ------------------------------------------------------------------ 首页那根常驻细条
+
+    /**
+     * 常驻细条要显示的两行字：[label] 是**相位词**，[text] 是最近一次的具体文案。
+     *
+     * 是纯数据（不带颜色）：颜色是界面的事（`StatusDot` 要 `Compose Color`），
+     * 这里只管"说什么" —— 这样整个函数能在 JVM 单测里逐档钉住。
+     */
+    data class Strip(val label: String, val text: String)
+
+    /**
+     * 相位 → 首页细条文案（**纯函数**，`ListenStateTest` 钉住）。
+     *
+     * 返回 null = **不显示**（[Phase.OFF]）：首页不该常驻一条"什么都没在发生"的空条。
+     *
+     * 为什么不用 [textsOf] 的标题：那条是**通知标题**，措辞是通知语境
+     * （"说完停一下我就发出去"、括号里写"通知里的「继续」"）——
+     * 搬到首页细条上会指错地方。所以另给一组短词，只保留"在听/在等/在念/已暂停/出错"的区分。
+     * ⚠️ 两套文案必须**逐档都分得开**（`ListenStateTest` 有一条专门盯着"别都说在听"）。
+     *
+     * [detail] 优先：暂停的原因（"按了耳机键：先不听了，再按一下继续"）来自服务，
+     * 比任何默认话术都准 —— 用户要看的正是"为什么停了"。
+     */
+    fun stripOf(phase: Phase, detail: String, segments: Int): Strip? {
+        if (phase == Phase.OFF) return null
+        val label = when (phase) {
+            Phase.STARTING -> "正在开麦"
+            Phase.LISTENING -> "在听"
+            Phase.THINKING -> "正在等 ECHO"
+            Phase.SPEAKING -> "正在念"
+            Phase.PAUSED -> "已暂停"
+            Phase.FAILED -> "已停下"          // 出错停了：原因在 detail 里，这里说"停下了"
+            Phase.OFF -> return null
+        }
+        val text = when {
+            detail.isNotBlank() -> detail
+            phase == Phase.LISTENING && segments > 0 -> "本次已经听出去 $segments 句"
+            phase == Phase.LISTENING -> "说一句就行，我送出去"   // 还没送出过一句也要有话说，别留一条半截的细条
+            phase == Phase.STARTING -> "第一次开麦可能要一两秒"
+            phase == Phase.THINKING -> "在等它回话"
+            phase == Phase.PAUSED -> "麦克风没在采音"
+            phase == Phase.FAILED -> "出错了"
+            else -> ""
+        }
+        return Strip(label, text)
+    }
 }

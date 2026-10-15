@@ -44,9 +44,13 @@
         android:allowBackup="true"
         tools:targetApi="34">
 
+        <!-- singleTop：通知点进来是"派一份新 intent 给已在跑的 Activity"（onNewIntent），
+             而不是再叠一个新实例 —— 没有它时，"App 就在最前 + 点通知"会在返回栈里多一层
+             （会议照样打开，但返回要多按一次）。MainActivity 的 onNewIntent 就是为这条路写的。 -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
+            android:launchMode="singleTop"
             android:theme="@style/Theme.EchoContact">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
