@@ -3437,6 +3437,35 @@ def _provider_summary_text(folder):
     return text
 
 
+def _notify_summary_ready(meeting_id, folder, body):
+    """纪要**真的成稿**之后，才通知手机「纪要好了」（`GET /api/events/feed`，2026-10-16）。
+
+    ⚠️ **为什么挂在"文件已写出来"这一刻，而不是"请求已发出/会话刚建立"那里**：
+    `meeting_summary_ready` 到了手机就是一条"会议纪要好了"的通知，用户点开就要看到正文。
+    而纪要由 DSH 异步生成（agent 路径），DSH 用不了时才切直连 LLM 兜底 —— 这条路中间有
+    **好几处会走不到落盘**：等回复超时（`_spawn_summary_waiter` 的 `reply` 为空）、
+    回复过短或只是"我这就去写"的占位话（`_looks_placeholder`）、provider 不可用、异常。
+    在这些点上发事件 = **假报**：通知响了、点开却是空的（或者还是上一版），用户只会以为
+    纪要丢了 —— 而且面板上没有"失败"可看，只剩一条来自手机的假消息。这是我们能犯的
+    最坏的一类错，所以宁可晚发、绝不早发。
+    判据只有一条：**刚刚那次写入真的落下了非空白正文**（见下 `body.strip()`），
+    且调用方确认写的就是 `summary.md`（`topics.md` 那种产物不算"纪要好了"）。
+    两条路（agent 路径 / 直连 LLM 路径）都在**写盘成功之后**调这里。
+
+    `body` = 刚写进 `summary.md` 的内容。为什么要再看一眼它：剪掉开场白/结构化元数据之后
+    理论上可能只剩空白（回复整段就是一个元数据 JSON 围栏），那种"写了个空文件"同样**不发**。
+    """
+    if not (body or "").strip():
+        db.add_log("warn", "meeting",
+                   "纪要为空白（只有开场白/元数据），不发「纪要好了」事件，免得假报")
+        return False
+    # payload 字段与 `meeting_transcribed` / `meeting_stopped` 保持一致（安卓按
+    # `payload["meeting"]` 取名字，见 android 的 EventNotify.summarize）。
+    db.add_event("meeting_summary_ready", {
+        "meeting": os.path.basename(os.path.normpath(folder)), "id": meeting_id})
+    return True
+
+
 def _spawn_provider_summary(meeting_id, folder, out_name="summary.md", extra=""):
     """后台线程：把转写内联交给 LLM provider，写成纪要文件（P5）。
 
@@ -3485,6 +3514,11 @@ def _spawn_provider_summary(meeting_id, folder, out_name="summary.md", extra="")
                     fh.write(body)
                 db.add_log("info", "meeting",
                            f"纪要已生成（provider={pid}）：{os.path.basename(path)}")
+                # 直连兜底路径也要通知手机（否则"没装 agent 的机器"永远收不到「纪要好了」）。
+                # 位置：`write` 之后 —— 上面每一条 `return`（provider 不可用/回复过短/占位话）
+                # 都发生在写盘之前，正好天然"不发"；理由见 `_notify_summary_ready`。
+                if out_name == "summary.md":
+                    _notify_summary_ready(meeting_id, folder, body)
             except Exception as e:
                 # 直连路径的失败必须留痕：否则面板上表现为"点了没反应"（1.x 的老毛病）
                 db.add_log("error", "meeting", f"直连纪要失败：{e}")
@@ -3728,6 +3762,13 @@ def _spawn_summary_waiter(meeting_id, folder, out_name, prompt_text, label):
                     f.write(content)
                 db.add_log("info", "meeting", f"{label}已写入 {out_name}（{len(content)} 字，"
                            f"{'JSON' if out_name == 'topics.md' and obj is not None else '文本'}）")
+                if out_name == "summary.md":
+                    # ⚠️ 必须在**写盘成功之后**发 —— 别往上挪到 `client.prompt()` 那边：
+                    # 那只是"请求发出去了"，而这条路有一大半到不了成稿（等回复超时、只回了
+                    # 占位话），提前发就是**假报**（通知响了、点开没内容）。上面那两条
+                    # `return`（超时 / 占位话）都发生在写盘之前，所以天然不发。
+                    # 完整理由见 `_notify_summary_ready` 的注释。
+                    _notify_summary_ready(meeting_id, folder, content)
                 # 元数据成稿后：用结构化「标题」字段写入 meetings.title，
                 # 会议列表与工作日志「会议纪要：<名称>」用它，更清晰（2026-09-10 起）。
                 if out_name == "topics.md":
