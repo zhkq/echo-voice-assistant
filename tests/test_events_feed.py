@@ -1,12 +1,16 @@
 # -*- coding: utf-8 -*-
-"""事件游标 `GET /api/events`（手机订阅"电脑上发生了什么"）。
+"""事件游标 `GET /api/events/feed`（手机订阅"电脑上发生了什么"）。
 
 2026-10-15：用户要"手机收"—— 会议转写好了、纪要好了、指令有回复了，手机该**自己知道**，
-而不是让人回去翻页面。这一组钉两件事：
+而不是让人回去翻页面。这一组钉三件事：
 
   1. **游标语义**：`since < 0` 只给游标、不推历史（新装的手机不该被历史事件淹一遍）；
      `since >= 0` 给"id 大于它"的新事件，**正序、不重复**（重复推 = 手机上同一条通知刷屏）；
-  2. **长轮询真的会等**（`wait`），而不是立刻空手回来 —— 否则手机只能一秒一次空转。
+  2. **长轮询真的会等**（`wait`），而不是立刻空手回来 —— 否则手机只能一秒一次空转；
+  3. **不许遮住老路由**：`/api/events`（面板看"最近 N 条"那个）必须原样还在 ——
+     我第一版把新接口就叫 `/events`，同路径同方法时**先注册的赢**，面板那条就会被换成
+     另一种形状（2026-10-15 活体测试时想通的：当时 8970 上跑的是稳定版旧代码，
+     恰好没被伤到；现在用一条用例把这件事钉住）。
 """
 import os
 import sys
@@ -40,7 +44,7 @@ class EventsFeedTests(unittest.TestCase):
         self.client = TestClient(app)
 
     def _get(self, **params):
-        return self.client.get("/api/events", params=params,
+        return self.client.get("/api/events/feed", params=params,
                                headers={"Authorization": "Bearer %s" % self.token})
 
     def tearDown(self):
@@ -49,8 +53,23 @@ class EventsFeedTests(unittest.TestCase):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def test_it_needs_a_token(self):
-        r = self.client.get("/api/events")
+        r = self.client.get("/api/events/feed")
         self.assertEqual(401, r.status_code, "事件流是网上来的调用，必须带令牌")
+
+    def test_the_panel_event_list_is_not_shadowed(self):
+        """老的 `/api/events`（面板看"最近 N 条"）必须原样可用。
+
+        同路径同方法时 FastAPI **先注册的赢** —— 新接口要是也叫 `/events`，面板那一格
+        拿到的就是"游标形状"的数据（有 cursor、但只有增量）。旧那条只回 `{items: [...]}`，
+        所以判据是**没有 cursor 键**。
+        """
+        db.add_event("meeting_stopped", {"meeting": "panel"})
+        r = self.client.get("/api/events",
+                            headers={"Authorization": "Bearer %s" % self.token})
+        self.assertEqual(200, r.status_code)
+        body = r.json()
+        self.assertIn("items", body)
+        self.assertNotIn("cursor", body, "老的 /api/events 被新接口遮住了")
 
     # ---- 库那一层 ----------------------------------------------------
 

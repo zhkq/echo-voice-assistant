@@ -1447,10 +1447,16 @@ def meeting_status(_auth=Depends(optional_auth)):
     return meeting.meeting_status()
 
 
-@router.get("/events")
+@router.get("/events/feed")
 def api_events(since: int = -1, wait: float = 0.0, limit: int = 50,
                _auth=Depends(optional_auth)):
-    """事件游标 —— 手机订阅"电脑上发生了什么"（会议录完了 / 转写好了 / 指令有回复了…）。
+    """事件游标（**给手机订阅用**）—— "电脑上发生了什么"（会议录完了 / 转写好了 / 有回复了…）。
+
+    ⚠️ **路径是 `/events/feed`，不是 `/events`**：后者早就有了（下面 `get_events`，
+    给面板看"最近 N 条"那一个）。我第一版写成 `/events` 会把那条**遮住**（同路径同方法，
+    先注册的赢）—— 面板那本地图就换成另一种形状了。2026-10-15 活体测试时想通的
+    （当时 8970 上跑的是稳定版旧代码，恰好没被伤到；判据见 `tests/test_events_feed.py`
+    的 `test_the_panel_event_list_is_not_shadowed`）。
 
     语义（写死，免得两边理解不一致）：
 
