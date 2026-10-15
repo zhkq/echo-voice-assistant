@@ -3466,6 +3466,64 @@ def _notify_summary_ready(meeting_id, folder, body):
     return True
 
 
+def _existing_summary_len(path):
+    """已有纪要文件的**非空白内容长度**（不存在/读不到/全空白 → 0）。
+
+    三处要用同一件事（两条路的"占位话"告警 + `_write_summary_body` 的落盘判据），
+    所以只在这里读一次 —— 口径不一样就会出现"日志说没有旧内容、判据却认为有"这种自相矛盾。
+    """
+    try:
+        old = open(path, encoding="utf-8").read() if os.path.isfile(path) else ""
+    except OSError:
+        # 读不到（权限/坏文件）当作"没有旧内容"：不因为一次读故障就拒写。
+        old = ""
+    return len((old or "").strip())
+
+
+def _write_summary_body(path, body, label="纪要"):
+    """两条纪要路**共用的落盘判据**（2026-10-16 数据丢失修复）。
+
+    **修的是什么**：两条路（agent 的 `_spawn_summary_waiter` / 直连 LLM 的
+    `_spawn_provider_summary`）在写盘前只挡"回复过短"与 `_looks_placeholder`，
+    但模型整段只回**开场白 + 一段元数据 JSON** 时（长度 > 80，占位判据**拦不住**），
+    经"剪开场白/去元数据"（`_strip_summary_head`）之后正文可能**只剩空白** ——
+    而旧代码照样 `open(path, "w")`，**把旧的、可能正是用户想要的那份纪要覆盖成空白** ✗。
+    在"重新生成纪要"这条路上，用户丢掉的是**自己已经看过的那份纪要**，且当场没有任何提示。
+    判据原来在两处各写一遍（"复制一份 = 将来只修好一条路"），所以抽到这里。
+
+    **取舍（为什么是"不覆盖"而不是"清空"）**：宁可留着一份**旧的、用户认得**的纪要并告警，
+    也绝不把好内容换成空白 —— 保留的代价只是"这次没生成成功"（用户重试即可），
+    覆盖的代价是**不可逆的内容丢失**（老纪要没有第二份副本）。两害相权，取"保留 + 告警"。
+    告警**不许静默**：面板/日志里必须留下"这次生成拿到空白内容，已保留原有纪要"。
+
+    三种情形：
+      1. 新正文**非空白** → 照旧写盘，返回 True；
+      2. 新正文**空白** 且 目标文件**已有非空白内容** → **不覆盖**（一个字都不动）+ warn，返回 False；
+      3. 新正文**空白** 且 目标文件**本来就没内容/不存在** → 没有可丢的东西，保持原有行为
+         （**仍然写**，即留下一个空白文件），但**如实**记一条 warn 说明本次未产出 ——
+         空白文件在面板/手机上本来就"不算有纪要"（`_notify_summary_ready` 也不会为它发事件），
+         所以这里的选择是"不改行为、只把话说清楚"，而不是顺手改成"不写文件"。
+
+    返回：True = 真的写了（调用方可以继续发「纪要好了」/记成功日志）；False = 没写。
+    """
+    path = str(path)
+    old_len = _existing_summary_len(path)
+    if not (body or "").strip():
+        if old_len > 0:
+            db.add_log("warn", "meeting",
+                       f"{label}生成拿到空白正文（只有开场白/元数据），**已保留原有纪要、不覆盖**："
+                       f"{os.path.basename(path)}（旧纪要 {old_len} 字）——"
+                       "宁可留着旧的并告警，也别把好内容换成空白（这次没生成成功，可重试）")
+            return False
+        # 本来就没有可保留的内容：照旧写（保持行为不变），但如实记为"本次未产出"。
+        db.add_log("warn", "meeting",
+                   f"{label}生成拿到空白正文（只有开场白/元数据），本次**未产出有效内容**"
+                   f"（没有旧纪要可保留）：{os.path.basename(path)}")
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(body)
+    return True
+
+
 def _spawn_provider_summary(meeting_id, folder, out_name="summary.md", extra=""):
     """后台线程：把转写内联交给 LLM provider，写成纪要文件（P5）。
 
@@ -3492,31 +3550,28 @@ def _spawn_provider_summary(meeting_id, folder, out_name="summary.md", extra="")
                 reply = inst.chat([{"role": "system", "content": "你是会议纪要助手。"},
                                    {"role": "user", "content": prompt}], timeout=300)
                 path = os.path.join(folder, out_name)
-                had_old = os.path.isfile(path)
-                old = ""
-                if had_old:
-                    try:
-                        old = open(path, encoding="utf-8").read().strip()
-                    except OSError:
-                        old = ""
+                old_len = _existing_summary_len(path)
                 if not (reply and len(reply.strip()) > 10):
                     db.add_log("warn", "meeting", "纪要 provider 回复过短，本次不回写")
                     return
                 if _looks_placeholder(reply):
                     db.add_log("warn", "meeting",
                                "纪要 provider 回复疑似占位/意图话（非实质纪要），本次不回写"
-                               f"{'，保留原文件' if had_old and len(old) > 30 else '（无旧有效内容）'}")
+                               f"{'，保留原文件' if old_len > 30 else '（无旧有效内容）'}")
                     return
                 # 与 agent 路径**同一套落盘纪律**（`_SUMMARY_REQUIREMENTS` 那段注释说的：
                 # 复制一份就等于将来只修好一条路）：剪开场白/元数据 + 修 mermaid。
                 body = _sanitize_mermaid(_strip_summary_head(reply) + "\n")
-                with open(path, "w", encoding="utf-8") as fh:
-                    fh.write(body)
+                # 落盘判据（共用的那个）：新正文空白就**不覆盖**已有纪要（只告警）——
+                # 见 `_write_summary_body` 的注释（这是数据丢失那道闸）。
+                if not _write_summary_body(path, body):
+                    # 没写就不发事件：否则通知响了、点开还是旧内容（或空白）= 假报。
+                    return
                 db.add_log("info", "meeting",
                            f"纪要已生成（provider={pid}）：{os.path.basename(path)}")
                 # 直连兜底路径也要通知手机（否则"没装 agent 的机器"永远收不到「纪要好了」）。
-                # 位置：`write` 之后 —— 上面每一条 `return`（provider 不可用/回复过短/占位话）
-                # 都发生在写盘之前，正好天然"不发"；理由见 `_notify_summary_ready`。
+                # 位置：`write` 之后 —— 上面每一条 `return`（provider 不可用/回复过短/占位话/
+                # 空白不覆盖）都发生在写盘之前，正好天然"不发"；理由见 `_notify_summary_ready`。
                 if out_name == "summary.md":
                     _notify_summary_ready(meeting_id, folder, body)
             except Exception as e:
@@ -3725,23 +3780,18 @@ def _spawn_summary_waiter(meeting_id, folder, out_name, prompt_text, label):
                 db.add_log("info", "meeting", f"已请求{label} ({os.path.basename(folder)})")
                 reply, _done = client.wait_for_reply(sid, timeout=240, poll=2)
                 path = os.path.join(folder, out_name)
-                had_old = os.path.isfile(path)
-                old = ""
-                if had_old:
-                    try:
-                        old = open(path, encoding="utf-8").read().strip()
-                    except OSError:
-                        old = ""
+                old_len = _existing_summary_len(path)
                 if not (reply and len(reply.strip()) > 10):
                     db.add_log("warn", "meeting", f"{label} 超时未收到回复")
                     return
                 if _looks_placeholder(reply):
                     db.add_log("warn", "meeting",
                                f"{label} 回复疑似占位/意图话（非实质纪要），本次不回写"
-                               f"{'，保留原文件' if had_old and len(old) > 30 else '（无旧有效内容）'}")
+                               f"{'，保留原文件' if old_len > 30 else '（无旧有效内容）'}")
                     return
                 content_raw = reply.strip()
                 # 写盘内容：调用1（summary.md）为 markdown 纪要；调用2（topics.md）为元数据 JSON
+                obj = None
                 if out_name == "topics.md":
                     obj = _try_load_json(content_raw)
                     if obj is not None:
@@ -3758,16 +3808,20 @@ def _spawn_summary_waiter(meeting_id, folder, out_name, prompt_text, label):
                                    f"{label}：已剪掉回复开头的开场白/结构化元数据"
                                    f"（{len(content_raw) - len(trimmed)} 字）")
                     content = _sanitize_mermaid(trimmed + "\n")  # markdown 纪要
-                with open(path, "w", encoding="utf-8") as f:
-                    f.write(content)
+                # 落盘判据（与直连路径**同一个函数**）：新正文空白就**不覆盖**已有纪要（只告警）。
+                # 为什么必须挡在这里：上面那两条守卫（非空且 > 10 字、`_looks_placeholder`）挡不住
+                # "开场白 + 元数据 JSON"这种长回复，而 `_strip_summary_head` 剪完之后可能只剩空白 ——
+                # 旧代码会照样 `open(..., "w")` 把用户原来那份好纪要覆盖掉 ✗（见 `_write_summary_body`）。
+                if not _write_summary_body(path, content, label=label):
+                    return
                 db.add_log("info", "meeting", f"{label}已写入 {out_name}（{len(content)} 字，"
                            f"{'JSON' if out_name == 'topics.md' and obj is not None else '文本'}）")
                 if out_name == "summary.md":
                     # ⚠️ 必须在**写盘成功之后**发 —— 别往上挪到 `client.prompt()` 那边：
                     # 那只是"请求发出去了"，而这条路有一大半到不了成稿（等回复超时、只回了
-                    # 占位话），提前发就是**假报**（通知响了、点开没内容）。上面那两条
-                    # `return`（超时 / 占位话）都发生在写盘之前，所以天然不发。
-                    # 完整理由见 `_notify_summary_ready` 的注释。
+                    # 占位话、剪完只剩空白），提前发就是**假报**（通知响了、点开没内容）。
+                    # 上面那几条 `return`（超时 / 占位话 / 空白不覆盖）都发生在写盘之前，
+                    # 所以天然不发。完整理由见 `_notify_summary_ready` 的注释。
                     _notify_summary_ready(meeting_id, folder, content)
                 # 元数据成稿后：用结构化「标题」字段写入 meetings.title，
                 # 会议列表与工作日志「会议纪要：<名称>」用它，更清晰（2026-09-10 起）。
