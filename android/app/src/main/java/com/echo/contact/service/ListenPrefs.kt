@@ -18,6 +18,7 @@ object ListenPrefs {
     private const val KEY_THRESHOLD = "silence_threshold"
     private const val KEY_HANGOVER = "hangover_ms"
     private const val KEY_IDLE_MIN = "idle_auto_stop_min"
+    private const val KEY_FULL_DUPLEX = "keep_listening_while_speaking"
 
     fun load(context: Context): ListenTuning {
         val p = context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
@@ -27,6 +28,9 @@ object ListenPrefs {
                 ?: d.silenceThreshold,
             hangoverMs = p.getString(KEY_HANGOVER, null)?.toIntOrNull() ?: d.hangoverMs,
             idleAutoStopMin = p.getString(KEY_IDLE_MIN, null)?.toIntOrNull() ?: d.idleAutoStopMin,
+            keepListeningWhileSpeaking = p.getBoolean(
+                KEY_FULL_DUPLEX, d.keepListeningWhileSpeaking,
+            ),
         ).clamped()
     }
 
@@ -37,6 +41,7 @@ object ListenPrefs {
             .putString(KEY_THRESHOLD, t.silenceThreshold.toString())
             .putString(KEY_HANGOVER, t.hangoverMs.toString())
             .putString(KEY_IDLE_MIN, t.idleAutoStopMin.toString())
+            .putBoolean(KEY_FULL_DUPLEX, t.keepListeningWhileSpeaking)
             .apply()
     }
 }

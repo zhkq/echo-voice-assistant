@@ -33,6 +33,9 @@ object ListenState {
         /** 正在念回复。 */
         SPEAKING,
 
+        /** 用户按了暂停（耳机键或通知）：服务还活着，但麦克风不采了。 */
+        PAUSED,
+
         /** 出错停了（原因在 detail 里）。 */
         FAILED,
     }
@@ -77,6 +80,7 @@ object ListenState {
             Phase.LISTENING -> "在听：说完停一下我就发出去"
             Phase.THINKING -> "正在交给 ECHO…"
             Phase.SPEAKING -> "正在念回复"
+            Phase.PAUSED -> "已暂停（按耳机键或通知里的「继续」）"
             Phase.FAILED -> "后台听写出错了"
         }
         val body = when {
@@ -84,6 +88,7 @@ object ListenState {
             phase == Phase.LISTENING && segments > 0 -> "本次已经听出去 $segments 句"
             phase == Phase.THINKING -> "在等它回话，稍等"
             phase == Phase.STARTING -> "第一次开麦可能要一两秒"
+            phase == Phase.PAUSED -> "麦克风没在采；再按一下耳机键就继续"
             phase == Phase.OFF -> "点开开关就开始听"
             else -> ""
         }

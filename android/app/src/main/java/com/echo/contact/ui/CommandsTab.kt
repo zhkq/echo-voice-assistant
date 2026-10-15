@@ -251,6 +251,24 @@ fun CommandsTab(vm: MainViewModel) {
                             onDone = { ListenPrefs.save(context, tuning) },
                             hint = "省电用；改了下次开听写生效",
                         )
+                        // 全双工：念回复时也收音（能插话打断）。需要设备有 AEC，不支持就自动退回。
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Switch(
+                                checked = tuning.keepListeningWhileSpeaking,
+                                onCheckedChange = {
+                                    tuning = tuning.copy(keepListeningWhileSpeaking = it)
+                                    ListenPrefs.save(context, tuning)
+                                },
+                            )
+                            Spacer(Modifier.size(10.dp))
+                            Column(modifier = Modifier.fillMaxWidth()) {
+                                Text("念回复时也继续听", style = MaterialTheme.typography.bodyMedium)
+                                MutedLine(
+                                    "能开口打断它；需要这台手机支持回声消除，" +
+                                        "不支持会自动退回「念时不收音」"
+                                )
+                            }
+                        }
                     }
                 }
             }

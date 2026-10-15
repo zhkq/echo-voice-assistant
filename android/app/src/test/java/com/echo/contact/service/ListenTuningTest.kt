@@ -19,7 +19,19 @@ class ListenTuningTest {
         assertEquals(0.012, d.silenceThreshold, 0.0001)
         assertEquals(1200, d.hangoverMs)
         assertEquals(20, d.idleAutoStopMin)
+        assertEquals(
+            "全双工默认必须关：它依赖设备 AEC，属于要真机确认过再开的档",
+            false,
+            d.keepListeningWhileSpeaking,
+        )
         assertEquals(d, d.clamped())
+    }
+
+    @Test
+    fun `全双工开关过钳制后保持原值`() {
+        val t = ListenTuning(keepListeningWhileSpeaking = true, hangoverMs = 99_999).clamped()
+        assertEquals(true, t.keepListeningWhileSpeaking)
+        assertEquals(ListenTuning.MAX_HANGOVER_MS, t.hangoverMs)
     }
 
     @Test

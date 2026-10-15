@@ -19,12 +19,21 @@ data class ListenTuning(
     val silenceThreshold: Double = DEFAULT_SILENCE_THRESHOLD,
     val hangoverMs: Int = DEFAULT_HANGOVER_MS,
     val idleAutoStopMin: Int = DEFAULT_IDLE_AUTO_STOP_MIN,
+    /**
+     * **念回复时也继续听**（全双工）。
+     *
+     * 默认关：它需要这台设备支持回声消除（AEC），否则手机把自己念的话又听一遍（自激）。
+     * 开着时服务会先探 AEC —— 探不到就**如实降级**成"念的时候不收音"，
+     * 并把降级原因写在状态里（见 `EchoCancel`）。
+     */
+    val keepListeningWhileSpeaking: Boolean = DEFAULT_KEEP_LISTENING_WHILE_SPEAKING,
 ) {
 
     fun clamped(): ListenTuning = ListenTuning(
         silenceThreshold = silenceThreshold.coerceIn(MIN_SILENCE_THRESHOLD, MAX_SILENCE_THRESHOLD),
         hangoverMs = hangoverMs.coerceIn(MIN_HANGOVER_MS, MAX_HANGOVER_MS),
         idleAutoStopMin = idleAutoStopMin.coerceIn(MIN_IDLE_AUTO_STOP_MIN, MAX_IDLE_AUTO_STOP_MIN),
+        keepListeningWhileSpeaking = keepListeningWhileSpeaking,
     )
 
     val idleAutoStopMs: Long get() = idleAutoStopMin.coerceAtLeast(1) * 60_000L
@@ -49,5 +58,8 @@ data class ListenTuning(
 
         const val MIN_IDLE_AUTO_STOP_MIN = 1
         const val MAX_IDLE_AUTO_STOP_MIN = 120
+
+        /** 全双工默认**关**：它依赖设备 AEC，属于"要真机确认过再开"的那一档。 */
+        const val DEFAULT_KEEP_LISTENING_WHILE_SPEAKING = false
     }
 }

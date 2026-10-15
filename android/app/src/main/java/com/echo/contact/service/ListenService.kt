@@ -12,12 +12,17 @@ import android.content.pm.ServiceInfo
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
+import android.media.audiofx.AcousticEchoCanceler
+import android.media.session.MediaSession
+import android.media.session.PlaybackState
 import android.os.Build
 import android.os.IBinder
+import android.view.KeyEvent
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import com.echo.contact.MainActivity
 import com.echo.contact.R
+import com.echo.contact.audio.EchoCancel
 import com.echo.contact.audio.SystemTts
 import com.echo.contact.audio.VoiceSegmenter
 import com.echo.contact.audio.WavWriter
@@ -74,6 +79,21 @@ class ListenService : Service() {
     /** 处理 + 朗读期间置位：这期间读到的音频**不喂给分段器**（见类注释的取舍 1）。 */
     @Volatile private var paused = false
 
+    /** 回声消除实例（全双工时才有）：拿不到就是 null，也就是半双工。 */
+    private var aec: AcousticEchoCanceler? = null
+
+    /** 本次是否跑在全双工（念回复时也收音）。半双工时 `handleSegment` 会置 `paused`。 */
+    @Volatile private var fullDuplex = false
+
+    /** 用户主动暂停（耳机键/通知按钮）：服务还活着，但不采音。与 [paused] 是两回事。 */
+    @Volatile private var userPaused = false
+
+    /** 媒体会话（耳机/车机键的入口），只在服务活着时存在。 */
+    private var mediaSession: MediaSession? = null
+
+    /** 省电计时器（`runLoop` 里建，`setUserPaused` 要用它把"刚继续"算成有动静）。 */
+    private var idle: IdleAutoStop? = null
+
     /** 只在线程里改，避免每次读帧都刷通知。 */
     @Volatile private var lastText: String = ""
 
@@ -90,6 +110,15 @@ class ListenService : Service() {
         when (intent.action) {
             ACTION_STOP -> {
                 stopEverything("用户停掉了后台听写")
+                return START_NOT_STICKY
+            }
+            // 通知里的「暂停 / 继续」：服务已经在跑才有意义；不在跑就把这次启动退掉。
+            ACTION_PAUSE -> {
+                if (job != null) setUserPaused(true) else stopSelf()
+                return START_NOT_STICKY
+            }
+            ACTION_RESUME -> {
+                if (job != null) setUserPaused(false) else stopSelf()
                 return START_NOT_STICKY
             }
             else -> {
@@ -135,7 +164,91 @@ class ListenService : Service() {
             stopSelf()
             return false
         }
+        ensureMediaSession()
         return true
+    }
+
+    /**
+     * 媒体会话：让**耳机线控键 / 车机媒体键**能控制听写（暂停 ↔ 继续、停止）。
+     *
+     * 为什么用框架自带的 `android.media.session.MediaSession` 而不是 androidx 的
+     * `MediaSessionCompat`：这一条不需要引入新依赖（`androidx.media` 不在本项目的依赖里），
+     * 而 API 21+ 的框架类足够用 —— 本项目 minSdk 26。
+     *
+     * ⚠️ 会话只在服务活着时存在：耳机键**不能**把没开过的听写叫起来（见 `ListenKeys` 的说明）。
+     */
+    private fun ensureMediaSession() {
+        if (mediaSession != null) return
+        val session = MediaSession(this, MEDIA_SESSION_TAG)
+        session.setFlags(
+            MediaSession.FLAG_HANDLES_MEDIA_BUTTONS or
+                MediaSession.FLAG_HANDLES_TRANSPORT_CONTROLS
+        )
+        session.setCallback(object : MediaSession.Callback() {
+            override fun onPlay() {
+                handleKey(KeyEvent.KEYCODE_MEDIA_PLAY)
+            }
+
+            override fun onPause() {
+                handleKey(KeyEvent.KEYCODE_MEDIA_PAUSE)
+            }
+
+            override fun onStop() {
+                handleKey(KeyEvent.KEYCODE_MEDIA_STOP)
+            }
+
+            // 有些车机只发裸 KeyEvent（不走 onPlay/onPause），这条兜住它
+            override fun onMediaButtonEvent(mediaButtonIntent: Intent): Boolean {
+                val ev = mediaButtonIntent.getParcelableExtra<KeyEvent>(Intent.EXTRA_KEY_EVENT)
+                if (ev != null && ev.action == KeyEvent.ACTION_UP) {
+                    handleKey(ev.keyCode)
+                    return true
+                }
+                return super.onMediaButtonEvent(mediaButtonIntent)
+            }
+        })
+        session.isActive = true
+        mediaSession = session
+        updateMediaSessionState()
+    }
+
+    /** 耳机/车机键来了：按 [ListenKeys] 的映射执行（没在跑就什么都不做）。 */
+    private fun handleKey(keyCode: Int) {
+        when (ListenKeys.actionFor(keyCode, job != null, userPaused)) {
+            ListenKeys.Action.PAUSE -> setUserPaused(true)
+            ListenKeys.Action.RESUME -> setUserPaused(false)
+            ListenKeys.Action.STOP -> stopEverything("耳机键停掉了后台听写")
+            null -> Unit
+        }
+    }
+
+    /** 用户主动暂停/继续（耳机键或通知按钮）。**与"处理中暂时不收音"是两回事**。 */
+    private fun setUserPaused(pausedNow: Boolean) {
+        userPaused = pausedNow
+        if (pausedNow) {
+            ListenState.set(ListenState.Phase.PAUSED, "按了耳机键：先不听了，再按一下继续")
+        } else {
+            idle?.markActivity(System.currentTimeMillis()) // 别刚继续就判"没人说话"
+            ListenState.set(ListenState.Phase.LISTENING, "")
+        }
+        updateMediaSessionState()
+        val (phase, detail) = ListenState.phase.value to ListenState.detail.value
+        refreshNotification(phase, detail)
+    }
+
+    private fun updateMediaSessionState() {
+        val session = mediaSession ?: return
+        val state = if (userPaused) PlaybackState.STATE_PAUSED else PlaybackState.STATE_PLAYING
+        val actions = PlaybackState.ACTION_PLAY or PlaybackState.ACTION_PAUSE or
+            PlaybackState.ACTION_PLAY_PAUSE or PlaybackState.ACTION_STOP
+        runCatching {
+            session.setPlaybackState(
+                PlaybackState.Builder()
+                    .setActions(actions)
+                    .setState(state, PlaybackState.PLAYBACK_POSITION_UNKNOWN, 1f)
+                    .build()
+            )
+        }
     }
 
     private fun createChannel() {
@@ -163,6 +276,13 @@ class ListenService : Service() {
             Intent(this, ListenService::class.java).setAction(ACTION_STOP),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
+        // 暂停/继续：这是开车时最常用的那个键（耳机线控按一下 = 同一条）
+        val togglePaused = PendingIntent.getService(
+            this, 2,
+            Intent(this, ListenService::class.java)
+                .setAction(if (userPaused) ACTION_RESUME else ACTION_PAUSE),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_echo_mic)
             .setContentTitle(title)
@@ -171,6 +291,7 @@ class ListenService : Service() {
             .setSilent(true)
             .setShowWhen(false)
             .setContentIntent(open)
+            .addAction(0, if (userPaused) "继续" else "暂停", togglePaused)
             .addAction(0, "停止听写", stop)
             .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
             .build()
@@ -200,11 +321,16 @@ class ListenService : Service() {
         val engine = SystemTts(this).also { it.init() }
         tts = engine
 
+        // ---- 采集源与回声消除（决定"念回复时能不能继续听"）----
+        // 用户在参数里要全双工**且**这台设备有 AEC 才走全双工；否则半双工（念时不收音）。
+        // 拿不到 AEC 时**如实降级并说出来** —— 悄悄降级会让用户以为"开了全双工"。
+        val tuning = ListenPrefs.load(this)
+        val wanted = EchoCancel.decide(tuning.keepListeningWhileSpeaking, EchoCancel.available())
         val minBuf = AudioRecord.getMinBufferSize(SAMPLE_RATE, CHANNEL, ENCODING)
         if (minBuf <= 0) return failAndStop("这台设备给不出可用的录音缓冲（16k 单声道）")
         val ar = try {
             AudioRecord(
-                MediaRecorder.AudioSource.VOICE_RECOGNITION,
+                EchoCancel.sourceFor(wanted),
                 SAMPLE_RATE, CHANNEL, ENCODING, minBuf * 2,
             )
         } catch (e: Exception) {
@@ -214,20 +340,28 @@ class ListenService : Service() {
             runCatching { ar.release() }
             return failAndStop("麦克风初始化失败：可能被别的应用占着")
         }
+        aec = if (wanted == EchoCancel.Mode.FULL_DUPLEX) EchoCancel.attach(ar) else null
+        fullDuplex = aec != null
+        val startNote = when {
+            fullDuplex -> "全双工：念回复时也听着（回声消除已开）"
+            tuning.keepListeningWhileSpeaking -> "这台设备不支持回声消除，念回复时先不收音"
+            else -> ""
+        }
 
-        val tuning = ListenPrefs.load(this)
         val segmenter = VoiceSegmenter(
             sampleRate = SAMPLE_RATE,
             silenceThreshold = tuning.silenceThreshold,
             hangoverMs = tuning.hangoverMs,
         )
-        val idle = IdleAutoStop(tuning.idleAutoStopMs)
-        idle.start(System.currentTimeMillis())
+        val idleTimer = IdleAutoStop(tuning.idleAutoStopMs)
+        idleTimer.start(System.currentTimeMillis())
+        idle = idleTimer
         val frame = ShortArray(FRAME_SAMPLES)
         try {
             ar.startRecording()
-            ListenState.set(ListenState.Phase.LISTENING)
-            refreshNotification(ListenState.Phase.LISTENING, "")
+            ListenState.set(ListenState.Phase.LISTENING, startNote)
+            refreshNotification(ListenState.Phase.LISTENING, startNote)
+            updateMediaSessionState()
             while (currentCoroutineContext().isActive) {
                 val n = try {
                     ar.read(frame, 0, frame.size)
@@ -236,28 +370,32 @@ class ListenService : Service() {
                 }
                 if (n <= 0) {
                     delay(20)
-                } else if (!paused) {
+                } else if (!paused && !userPaused) {
                     val pcm = segmenter.feed(frame, n)
                     if (pcm != null) {
-                        idle.markActivity(System.currentTimeMillis())
+                        idleTimer.markActivity(System.currentTimeMillis())
                         handleSegment(api, pcm, engine)
                     }
                 }
-                // 一直没人说话 → 自己停下省电（原因要写出来，别让它"自己断了"）
-                if (!paused && idle.shouldStop(System.currentTimeMillis())) {
-                    stopWithReason(idle.stopReason(System.currentTimeMillis()))
+                // 一直没人说话 → 自己停下省电（原因要写出来，别让它"自己断了"）。
+                // 用户主动暂停时**不算**"没人说话"：那是他要的暂停，不该被自动停掉。
+                if (!paused && !userPaused && idleTimer.shouldStop(System.currentTimeMillis())) {
+                    stopWithReason(idleTimer.stopReason(System.currentTimeMillis()))
                     return
                 }
             }
         } finally {
             runCatching { ar.stop() }
             runCatching { ar.release() }
+            idle = null
         }
     }
 
     /** 一段说完了：上传 → 等回复 → 念出来。**不抛异常**（失败也要继续听下一句）。 */
     private suspend fun handleSegment(api: EchoApi, pcm: ByteArray, engine: SystemTts) {
-        paused = true
+        // 全双工（AEC 已开）时不暂停：念回复期间照样收音，用户可以插话打断；
+        // 半双工必须暂停，否则会把手机自己念的又听一遍（自激）。
+        paused = !fullDuplex
         val flow = ListenFlow(api)
         try {
             ListenState.set(ListenState.Phase.THINKING, "刚录到一句，正在让 ECHO 转写…")
@@ -288,7 +426,8 @@ class ListenService : Service() {
             note("刚才那句出错：${e.message ?: e.javaClass.simpleName}")
         } finally {
             paused = false
-            if (ListenState.phase.value != ListenState.Phase.FAILED) {
+            // 用户在处理期间按了暂停：不要把状态改回"在听"
+            if (ListenState.phase.value != ListenState.Phase.FAILED && !userPaused) {
                 ListenState.set(ListenState.Phase.LISTENING)
                 refreshNotification(ListenState.Phase.LISTENING, "")
             }
@@ -332,6 +471,13 @@ class ListenService : Service() {
         val j = job
         job = null
         paused = false
+        userPaused = false
+        fullDuplex = false
+        idle = null
+        runCatching { mediaSession?.release() }
+        mediaSession = null
+        runCatching { aec?.release() }
+        aec = null
         runCatching { tts?.shutdown() }
         tts = null
         if (j != null) {
@@ -345,8 +491,16 @@ class ListenService : Service() {
     companion object {
         const val ACTION_START = "com.echo.contact.action.LISTEN_START"
         const val ACTION_STOP = "com.echo.contact.action.LISTEN_STOP"
+
+        /** 通知里的「暂停 / 继续」（耳机键走媒体会话，最终也落到这两个动作上）。 */
+        const val ACTION_PAUSE = "com.echo.contact.action.LISTEN_PAUSE"
+        const val ACTION_RESUME = "com.echo.contact.action.LISTEN_RESUME"
+
         const val CHANNEL_ID = "echo_listen"
         const val NOTIFICATION_ID = 0xEC40
+
+        /** 媒体会话的 tag（系统日志/调试用；耳机键就是通过它转进来的）。 */
+        private const val MEDIA_SESSION_TAG = "echo-listen"
 
         private const val SAMPLE_RATE = 16000
         private const val BITS = 16
