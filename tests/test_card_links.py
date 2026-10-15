@@ -71,8 +71,13 @@ class PanelWiringTests(unittest.TestCase):
         fn = self.js[self.js.index("function _agentLink("):]
         fn = fn[:fn.index("\n  }")]
         self.assertIn('name === "harness"', fn)
-        self.assertIn('"/api/control/harness/browser"', fn,
-                      "harness 必须走服务端端点（token 不下发）")
+        # ⚠️ 这里原来期望的是 `"/api/control/harness/browser"` —— **那条路由根本不存在**
+        # （实测 404），于是这条用例把 bug 钉成了"期望值"，仪表盘 Agent 那格的 ↗ 点了
+        # 什么也不发生，一直没人发现（2026-10-15 用户报的"agent 网页的链接"）。
+        # 正确的那条是 `/api/harness/browser`（服务端用签名 Cookie 打开标准版 harness）。
+        self.assertIn('"/api/harness/browser"', fn,
+                      "harness 必须走服务端端点（token 不下发），且必须是**真实存在**的那条路由")
+        self.assertNotIn("/api/control/harness/browser", fn, "死路由不许写回来")
         self.assertIn('"?view=agent"', fn, "其余情况要有兜底，不能是死链")
         self.assertNotIn("token=", fn, "**不许**在前端拼带 token 的 URL")
 

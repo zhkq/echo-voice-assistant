@@ -119,7 +119,9 @@ class MeetingEndpointContractTests(_IsolatedDb, unittest.TestCase):
     def test_start_success_shape(self):
         r = self.client.post("/api/meeting/start", json={})
         self.assertEqual(r.status_code, 200)
-        self.assertEqual(r.json(), {"ok": True, "message": "2026-09-19_10-00-00"})
+        # `source` 是 2026-10-15 加的：手机那条路（source=phone）要能自己确认"这场是
+        # 手机麦录的" —— 失败时回空串（没开起来就没有采集源这回事）。
+        self.assertEqual(r.json(), {"ok": True, "message": "2026-09-19_10-00-00", "source": "pc"})
 
     def test_start_busy_shape_and_message(self):
         """已在录音时的提示文案是给用户看的（技能原样回复它）。"""
@@ -128,7 +130,8 @@ class MeetingEndpointContractTests(_IsolatedDb, unittest.TestCase):
                           return_value=(False, "会议录音已在进行中")):
             r = self.client.post("/api/meeting/start", json={})
         self.assertEqual(r.status_code, 200, "业务性失败必须是 200 + ok=false")
-        self.assertEqual(r.json(), {"ok": False, "message": "会议录音已在进行中"})
+        self.assertEqual(r.json(),
+                         {"ok": False, "message": "会议录音已在进行中", "source": ""})
 
     def test_stop_success_shape(self):
         r = self.client.post("/api/meeting/stop", json={})
@@ -143,8 +146,13 @@ class MeetingEndpointContractTests(_IsolatedDb, unittest.TestCase):
 
     def test_status_keys_are_the_documented_ones(self):
         data = self.client.get("/api/meeting/status").json()
-        self.assertEqual(set(data), {"active", "folder", "startedAt", "level", "error"})
+        # `paused/pauses/segments/source` 是 2026-10-15 加的（手机那个全屏录音界面要的：
+        # 静音状态、暂停区间、已录段数、"声音来自哪支麦"）。
+        self.assertEqual(set(data), {"active", "folder", "startedAt", "level", "error",
+                                     "paused", "pauses", "segments", "source"})
         self.assertIsInstance(data["active"], bool)
+        self.assertIsInstance(data["paused"], bool)
+        self.assertIsInstance(data["segments"], int)
 
     def test_endpoints_work_without_token_by_default(self):
         """apiAuthEnabled 默认 False：技能不带 Authorization 也必须能调。"""
