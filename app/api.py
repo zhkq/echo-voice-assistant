@@ -1422,6 +1422,49 @@ def meeting_status(_auth=Depends(optional_auth)):
     return meeting.meeting_status()
 
 
+@router.get("/events")
+def api_events(since: int = -1, wait: float = 0.0, limit: int = 50,
+               _auth=Depends(optional_auth)):
+    """事件游标 —— 手机订阅"电脑上发生了什么"（会议录完了 / 转写好了 / 指令有回复了…）。
+
+    语义（写死，免得两边理解不一致）：
+
+    * `since < 0`（**默认**）：不推历史，只把当前游标给你 —— 新装的手机不该被历史事件淹一遍；
+    * `since >= 0`：给 `id > since` 的新事件（正序，最多 `limit` 条）；
+    * `wait`：没新事件时**长轮询**等一会儿（上限 25 秒），有就立刻回 —— 手机侧因此
+      不必一秒一次空转。
+
+    为什么不做推送（FCM/WS）：手机上那条最可靠的通道是"App 在跑时轮询"与
+    "常驻听写在听时顺带轮询"，而 FCM 在单位网络下不可靠、WS 又要在这条中继上再开一条流。
+    这条接口两种用法都够：`wait=25` 挂着等，或 `wait=0` 定期问。
+    """
+    import datetime as _dt
+    import time as _time
+
+    def _now_iso():
+        return _dt.datetime.now().isoformat(timespec="seconds")
+
+    deadline = _time.monotonic() + max(0.0, min(float(wait or 0.0), 25.0))
+    cursor = int(since)
+    if cursor < 0:
+        return {"items": [], "cursor": db.latest_event_id(), "serverTime": _now_iso()}
+    while True:
+        items = db.list_events_after(cursor, limit=max(1, min(int(limit or 50), 200)))
+        if items or _time.monotonic() >= deadline:
+            out = []
+            for row in items:
+                try:
+                    payload = json.loads(row.get("payload") or "{}")
+                except Exception:                                  # noqa: BLE001
+                    payload = {}
+                out.append({"id": row.get("id"), "ts": row.get("ts"),
+                            "type": row.get("type"), "payload": payload})
+            if out:
+                cursor = int(out[-1]["id"])
+            return {"items": out, "cursor": cursor, "serverTime": _now_iso()}
+        _time.sleep(0.5)
+
+
 def _meeting_actor(request: Request) -> str:
     """这次暂停/恢复是**谁**按的（进 meta 的 `pauses[].by`）。
 

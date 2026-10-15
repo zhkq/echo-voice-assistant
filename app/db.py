@@ -1048,6 +1048,29 @@ def list_events(limit=200):
     return _query("SELECT * FROM events ORDER BY id DESC LIMIT ?", (limit,))
 
 
+def list_events_after(since_id, limit=50):
+    """`id > since_id` 的事件，**按 id 升序**（老的在前）。
+
+    为什么另开一个而不是给 `list_events` 加参数：那条是"最近 N 条"（面板/排障用，倒序），
+    这条是"**游标之后**的新事件"（手机订阅用，正序）—— 两个语义混在一个函数里，
+    迟早有人按倒序去取游标。
+    """
+    try:
+        return _query("SELECT * FROM events WHERE id > ? ORDER BY id ASC LIMIT ?",
+                      (int(since_id or 0), int(limit)))
+    except Exception:
+        return []
+
+
+def latest_event_id():
+    """当前最大事件 id（新订阅者从这里开始，**不会把历史事件当成"新"推一遍**）。"""
+    rows = _query("SELECT COALESCE(MAX(id), 0) AS m FROM events")
+    try:
+        return int(rows[0]["m"] or 0) if rows else 0
+    except Exception:
+        return 0
+
+
 # ---------------------------------------------------------------- api_keys
 # 安全（2026-09-13 MEDIUM-2）：库里只存 sha256(token)，明文永不落库；
 #   * 明文只在 POST /api/keys 创建时返回一次，之后无从取回（丢了就删掉重建）；

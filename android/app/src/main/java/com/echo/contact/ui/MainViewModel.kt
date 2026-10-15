@@ -20,12 +20,14 @@ import com.echo.contact.data.dto.DailyReviewSubmitRequest
 import com.echo.contact.data.dto.DailyReviewSummary
 import com.echo.contact.data.dto.MeetingDetail
 import com.echo.contact.data.dto.MeetingItem
+import com.echo.contact.data.dto.EventItem
 import com.echo.contact.data.dto.MeetingStatus
 import com.echo.contact.data.dto.ReviewDay
 import com.echo.contact.data.dto.ReviewHistoryDetail
 import com.echo.contact.data.dto.StatusResponse
 import com.echo.contact.data.dto.TranscribeProgress
 import com.echo.contact.data.dto.TtsRequest
+import com.echo.contact.service.AppPrefs
 import com.echo.contact.service.SpeakPrefs
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -981,6 +983,51 @@ class MainViewModel(app: Application) : BaseViewModel(app) {
     /** 仪表盘那句"实时"：面板是 3 秒一次，这里对齐。 */
     fun autoRefreshTick() {
         viewModelScope.launch { fetchStatusOnce() }
+        pollEvents()
+    }
+
+    /**
+     * 取一次事件流（App 在**前台**时的那条订阅）→ 值得打扰的事件发通知。
+     *
+     * 为什么搭在状态卡那个 5 秒节拍上：那条节拍只在界面可见时跑，正好就是"App 在前台"的定义；
+     * 再单独起一个定时器只会多一份要管的东西。App 在后台、而常驻听写开着时，由
+     * `ListenService` 那条长轮询负责（见那边的说明）。
+     *
+     * 第一次（游标 < 0）**只取游标、不推历史**：不能让人打开 App 就被三十条旧通知糊脸。
+     */
+    fun pollEvents(wait: Double = 0.0) {
+        if (_eventsBusy) return
+        _eventsBusy = true
+        viewModelScope.launch {
+            try {
+                val ctx = getApplication<android.app.Application>()
+                val since = AppPrefs.eventCursor(ctx)
+                val resp = api().events(since = if (since < 0) -1 else since, wait = wait)
+                val body = resp.body()
+                if (resp.isSuccessful && body != null) {
+                    if (since < 0) {
+                        // 第一次：把游标记下来就好（不推历史）
+                        AppPrefs.saveEventCursor(ctx, body.cursor)
+                    } else {
+                        body.items.forEach { ev -> notifyEvent(ev) }
+                        if (body.cursor > since) AppPrefs.saveEventCursor(ctx, body.cursor)
+                    }
+                }
+            } catch (e: Exception) {
+                // 事件流断一下不影响任何主链路：下次节拍再来
+            }
+            _eventsBusy = false
+        }
+    }
+
+    private fun notifyEvent(ev: EventItem) {
+        val text = com.echo.contact.service.EventNotify.summarize(ev.type, ev.payload) ?: return
+        com.echo.contact.service.EventNotify.post(
+            getApplication(),
+            text.first,
+            text.second,
+            id = (ev.id % Int.MAX_VALUE).toInt(),
+        )
     }
 
     /**
@@ -1044,6 +1091,9 @@ class MainViewModel(app: Application) : BaseViewModel(app) {
     val voiceText: StateFlow<String> = _voiceText.asStateFlow()
 
     private var recordTicker: Job? = null
+
+    /** 事件流同时只跑一条（节拍可能重叠）。 */
+    private var _eventsBusy = false
 
     /** 开始录音（调用方要**先**拿到 RECORD_AUDIO 权限）。返回 false = 开不了麦。 */
     fun startRecording(): Boolean {

@@ -298,6 +298,28 @@ fun SettingsScreen(vm: MainViewModel, onBack: () -> Unit, onUnpair: () -> Unit) 
             }
         }
 
+        // ---------------------------------------------------------------- 通知
+        item {
+            EchoCard {
+                Column {
+                    CardHeader(title = "通知", dotColor = EchoPalette.Muted, trailing = "两种时机")
+                    Spacer(Modifier.height(6.dp))
+                    MutedLine(
+                        "会通知你的：会议转写好了、纪要好了、录音结束/导入、指令有结果了；" +
+                            "过程类事件（收到指令、已交给智能体）不打扰。",
+                        maxLines = 3,
+                    )
+                    Spacer(Modifier.height(4.dp))
+                    MutedLine(
+                        "什么时候收得到：① App 打开时；② 常驻听写开着时（车里那条路，长轮询）。" +
+                            "App 关着、听写也没开时**收不到** —— 没有推送通道" +
+                            "（单位网络下 FCM 不可靠，中继上再开一条流不值当）。这条边界如实写着。",
+                        maxLines = 5,
+                    )
+                }
+            }
+        }
+
         // ---------------------------------------------------------------- 权限与省电
         item {
             EchoCard {

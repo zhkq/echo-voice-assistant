@@ -381,6 +381,9 @@ class ListenService : Service() {
         val idleTimer = IdleAutoStop(tuning.idleAutoStopMs)
         idleTimer.start(System.currentTimeMillis())
         idle = idleTimer
+        // 顺带订阅事件：**App 关着、但听写开着**（车里最常见）时，"会议转写好了"
+        // 这类消息也要能到达手机。长轮询 `wait=10` 挂在 IO 作用域里，不影响采音那一路。
+        scope.launch { eventLoop() }
         val frame = ShortArray(FRAME_SAMPLES)
         try {
             ar.startRecording()
@@ -510,6 +513,49 @@ class ListenService : Service() {
     private fun note(msg: String) {
         ListenState.set(ListenState.Phase.LISTENING, msg)
         refreshNotification(ListenState.Phase.LISTENING, msg)
+    }
+
+    /**
+     * 事件订阅（**后台那条路**）：App 关着、听写开着时也要收到"转写好了"这类消息。
+     *
+     * 与 `MainViewModel.pollEvents` 共用同一份游标（`AppPrefs.eventCursor`），所以两条路
+     * **不会互相重复推送** —— 谁先取到就把游标推上去。
+     *
+     * 用 `wait=10` 长轮询：比 1 秒一次空转省电得多，而 10 秒的延迟对"会议纪要好了"这种事
+     * 完全够用。失败就退到 30 秒一轮（网络抖一下不该把这条循环打死）。
+     */
+    private suspend fun eventLoop() {
+        while (currentCoroutineContext().isActive) {
+            var ok = false
+            try {
+                // 自己建一个客户端（与 runLoop 同一个基址/令牌来源）：事件这条循环
+                // 可能比采音那一路活得更久（例如采音因设备问题退出），不该共用它的对象
+                val baseUrl = PairStore.baseUrl(this) ?: ""
+                if (baseUrl.isNotBlank()) {
+                    val api = ApiClient.create(baseUrl)
+                    val since = AppPrefs.eventCursor(this)
+                    val resp = api.events(since = if (since < 0) -1 else since, wait = 10.0)
+                    val body = resp.body()
+                    if (resp.isSuccessful && body != null) {
+                        ok = true
+                        if (since < 0) {
+                            AppPrefs.saveEventCursor(this, body.cursor)     // 第一次只记游标
+                        } else {
+                            body.items.forEach { ev ->
+                                EventNotify.summarize(ev.type, ev.payload)?.let { pair ->
+                                    EventNotify.post(this, pair.first, pair.second,
+                                        id = (ev.id % Int.MAX_VALUE).toInt())
+                                }
+                            }
+                            if (body.cursor > since) AppPrefs.saveEventCursor(this, body.cursor)
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                // 断一下不影响听写：下面退避一轮再来
+            }
+            if (!ok) delay(30_000)
+        }
     }
 
     private fun failAndStop(msg: String) {

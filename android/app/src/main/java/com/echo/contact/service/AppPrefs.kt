@@ -25,6 +25,7 @@ object AppPrefs {
     const val PREFS = "echo_app"
     const val KEY_INPUT_DEVICE = "input_device_id"
     const val KEY_MEDIA_KEYS = "media_keys"
+    const val KEY_EVENT_CURSOR = "event_cursor"
 
     /** 哨兵值：跟随系统默认（`AudioDeviceInfo.id` 从 0 起，负数不可能是真设备）。 */
     const val FOLLOW_SYSTEM = -1
@@ -43,6 +44,18 @@ object AppPrefs {
     }
 
     fun mediaKeys(context: Context): Boolean = prefs(context).getBoolean(KEY_MEDIA_KEYS, true)
+
+    /**
+     * 事件游标（`GET /api/events` 的 `since`）。
+     *
+     * `-1` = **还没订阅过** → 第一次只取游标、不推历史（新装的手机不该被旧事件淹一遍，
+     * 也不该半夜收到一条"三天前的会议转写好了"）。
+     */
+    fun eventCursor(context: Context): Long = prefs(context).getLong(KEY_EVENT_CURSOR, -1L)
+
+    fun saveEventCursor(context: Context, cursor: Long) {
+        prefs(context).edit().putLong(KEY_EVENT_CURSOR, cursor).apply()
+    }
 
     fun saveMediaKeys(context: Context, enabled: Boolean) {
         prefs(context).edit().putBoolean(KEY_MEDIA_KEYS, enabled).apply()

@@ -2310,6 +2310,12 @@ def _transcribe_impl(folder):
         db.update_meeting(meeting_id, status="transcribed",
                           duration_seconds=meta.get("durationSeconds", 0),
                           segments=len(segs), error="")
+        # 通知手机"这场转写好了"（`GET /api/events` 的订阅方；2026-10-15）。
+        # 为什么放在这里而不是"纪要也好了再说"：转写完就该能看正文了，而纪要是随后几十秒
+        # 才有的第二件事 —— 两件事各发一条，手机端能分别提示。
+        db.add_event("meeting_transcribed", {
+            "meeting": meeting_name, "id": meeting_id,
+            "durationSeconds": meta.get("durationSeconds", 0)})
     else:
         # 「一行都没有也叫 transcribed」是假话：面板显示成功、纪要写着"没内容"，
         # 真正原因（引擎异常/依赖缺失）只在 stderr 里 —— 用户看到的是"成功了但空的"。
