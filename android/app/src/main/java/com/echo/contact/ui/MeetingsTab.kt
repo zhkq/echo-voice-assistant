@@ -55,6 +55,14 @@ fun MeetingsTab(vm: MainViewModel) {
     val audioSeg by vm.audioSeg.collectAsState()
     val audioState by vm.audioState.collectAsState()
     val audioPlaying by vm.audioPlaying.collectAsState()
+    val showingRecording by vm.showRecordingScreen.collectAsState()
+
+    // 全屏录音界面（用户 2026-10-15 要的：电平 + 结束 + 静音/恢复）。
+    // 放在最前面：录音时它盖住整个页签；「返回」只关界面、**不停录音**。
+    if (showingRecording) {
+        MeetingRecordingScreen(vm)
+        return
+    }
 
     if (detail != null || detailLoading || detailNote != null) {
         MeetingDetailView(
@@ -121,6 +129,10 @@ fun MeetingsTab(vm: MainViewModel) {
                             ) { Text("停止录音") }
                         } else {
                             Button(onClick = { vm.startMeeting() }, enabled = !busy) { Text("开始录音") }
+                        }
+                        if (active) {
+                            // 录音中：能随时回到那个全屏界面（电平 + 静音/结束）
+                            TextButton(onClick = { vm.openRecordingScreen() }) { Text("全屏界面") }
                         }
                         TextButton(onClick = { vm.loadMeetings() }, enabled = !busy) { Text("刷新") }
                     }

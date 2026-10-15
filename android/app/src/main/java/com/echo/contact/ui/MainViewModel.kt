@@ -20,6 +20,7 @@ import com.echo.contact.data.dto.DailyReviewSubmitRequest
 import com.echo.contact.data.dto.DailyReviewSummary
 import com.echo.contact.data.dto.MeetingDetail
 import com.echo.contact.data.dto.MeetingItem
+import com.echo.contact.data.dto.MeetingStatus
 import com.echo.contact.data.dto.ReviewDay
 import com.echo.contact.data.dto.ReviewHistoryDetail
 import com.echo.contact.data.dto.StatusResponse
@@ -558,6 +559,12 @@ class MainViewModel(app: Application) : BaseViewModel(app) {
                     b?.ok == true -> "已开始录音：${b.message.orEmpty()}"
                     else -> b?.message ?: "没能开始录音"
                 }
+                if (b?.ok == true) {
+                    // 开起来了就直接进**全屏录音界面**（用户 2026-10-15 要的那个：
+                    // 电平 + 结束 + 静音/恢复）。失败不进 —— 界面开着却什么都没录最糟。
+                    _showRecordingScreen.value = true
+                    pollMeetingStatus()
+                }
             } catch (e: IOException) {
                 _meetingsNote.value = "无法连接：${e.message}"
             } catch (e: Exception) {
@@ -566,6 +573,67 @@ class MainViewModel(app: Application) : BaseViewModel(app) {
             _meetingActionBusy.value = false
             checkStatus()
             loadMeetings()
+        }
+    }
+
+    // ---- 全屏录音界面（手机侧）：状态轮询 + 静音/恢复（2026-10-15）----
+
+    /** 全屏录音界面要不要显示（`startMeeting` 成功后自动进；返回键只关界面不停止录音）。 */
+    private val _showRecordingScreen = MutableStateFlow(false)
+    val showRecordingScreen: StateFlow<Boolean> = _showRecordingScreen.asStateFlow()
+
+    /** 录音期间的"实时"状态（电平/暂停/段数/开始时间）。**只在界面可见时轮询。** */
+    private val _meetingRecording = MutableStateFlow(MeetingStatus())
+    val meetingRecording: StateFlow<MeetingStatus> = _meetingRecording.asStateFlow()
+
+    fun openRecordingScreen() {
+        _showRecordingScreen.value = true
+        pollMeetingStatus()
+    }
+
+    fun closeRecordingScreen() {
+        // 只关界面：录音继续（这就是"返回"该有的语义 —— 别让一个返回手势把会录断了）
+        _showRecordingScreen.value = false
+    }
+
+    /**
+     * 取一次录音状态。界面按 ~350ms 调它 —— 电平要做成"好看的动效"就得够密，
+     * 而中继上这条请求很小（一个 GET），可见时 3 次/秒是可接受的。
+     */
+    fun pollMeetingStatus() {
+        viewModelScope.launch {
+            try {
+                val resp = api().meetingStatus()
+                val body = resp.body()
+                if (resp.isSuccessful && body != null) {
+                    _meetingRecording.value = body
+                    if (!body.active) _showRecordingScreen.value = false   // 录完了就退出界面
+                }
+            } catch (e: Exception) {
+                // 轮询失败不打扰用户：电平停在上一帧，真正的错误由 checkStatus 那条报
+            }
+        }
+    }
+
+    /** 静音 / 恢复（同一个按钮两个方向）。 */
+    fun toggleMeetingPause() {
+        if (_meetingActionBusy.value) return
+        _meetingActionBusy.value = true
+        val wasPaused = _meetingRecording.value.paused
+        viewModelScope.launch {
+            try {
+                val resp = if (wasPaused) api().meetingResume() else api().meetingPause()
+                val b = resp.body()
+                _meetingsNote.value = when {
+                    !resp.isSuccessful -> parseError(resp)
+                    else -> b?.message ?: if (wasPaused) "已恢复" else "已暂停"
+                }
+            } catch (e: Exception) {
+                _meetingsNote.value = "操作失败：${e.message}"
+            }
+            _meetingActionBusy.value = false
+            pollMeetingStatus()
+            checkStatus()
         }
     }
 

@@ -416,6 +416,21 @@ class MeetingRecorder:
         # 避免"麦打不开但界面显示录音中、最后留下空会议"）
         self.error = None
         self._started = threading.Event()
+        #: 暂停 = **不写盘、不产生音频**（会议中途休息/私聊）。
+        #: 采集流**不关** —— 恢复要立刻，不能有"重开设备"的竞态（那会让你丢开头半秒）。
+        self.paused = False
+
+    def pause(self):
+        """暂停写盘。幂等，返回是否有变化（调用方据此判断"本来就暂停着"）。"""
+        changed = not self.paused
+        self.paused = True
+        return changed
+
+    def resume(self):
+        """恢复写盘。幂等，返回是否有变化。"""
+        changed = self.paused
+        self.paused = False
+        return changed
 
     def start(self):
         self.started_at = time.time()
@@ -461,6 +476,17 @@ class MeetingRecorder:
                         _log_record(stream.device, 0, True, "音频输入溢出，部分采样可能丢失")
                     a = data.astype(np.float32) / 32768.0
                     self.level = min(1.0, float(np.sqrt(np.mean(a * a))) * 30.0)
+                    if self.paused:
+                        # 暂停期间：**丢掉这段音频**（不写盘），电平记 0（面板与手机据此显示
+                        # "已暂停"）。为什么不写静音帧：那会让转写里出现"这段没人说话"的假象，
+                        # 而真相是"这段时间没在录" —— 事实记在 meta 的 `pauses` 里（见 meeting.py）。
+                        self.level = 0.0
+                        if self.level_cb:
+                            try:
+                                self.level_cb(0.0)
+                            except Exception:
+                                pass
+                        continue
                     if self.level_cb:
                         try:
                             self.level_cb(self.level)

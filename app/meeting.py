@@ -81,6 +81,11 @@ _state = {
     "started_at": None,
     "level": 0.0,
     "error": "",
+    #: 暂停（会议中途休息/私聊）：`paused` 给状态接口，`pauses` 记下区间进 meta ——
+    #: "少录了一段"必须留下痕迹，不许变成转写里莫名其妙的一段空白（2026-10-15 用户要的
+    #: 全屏录音界面里有「静音/恢复」按钮，语义就是这两个键）。
+    "paused": False,
+    "pauses": [],
 }
 # 录音状态锁：start/stop 必须原子化 —— 否则并发 stop（如面板按钮双击/重复请求）
 # 会同时通过 active 检查，造成重复转写 + 重复纪要（日志里出现过两次“停止录音”同秒）。
@@ -633,13 +638,84 @@ def transcribe_progress(meeting_id=None):
 
 
 def meeting_status():
+    rec = _state.get("recorder")
     return {
         "active": _state["active"],
         "folder": os.path.basename(_state["folder"]) if _state["folder"] else None,
         "startedAt": _state["started_at"],
         "level": _state["level"],
         "error": _state["error"],
+        # 手机那个全屏录音界面靠这三个显示进度（2026-10-15）
+        "paused": bool(_state.get("paused")),
+        "pauses": list(_state.get("pauses") or []),
+        #: 已经写出来的段数（录音器内存里的清单；崩了的话它就是"当前已落盘的段"）
+        "segments": len(getattr(rec, "segments", []) or []),
     }
+
+
+def _save_meta(folder, meta):
+    """把 meta 立刻写回磁盘（暂停/恢复时用）。
+
+    为什么要**当场**写：暂停区间是"这段时间没在录"的唯一证据，进程崩了也要留得下；
+    只在 stop 时写的话，崩溃 = 那段空白永远没人解释得清。
+    """
+    try:
+        with open(os.path.join(folder, "meta.json"), "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
+    except Exception as e:                                         # noqa: BLE001
+        db.add_log("warn", "meeting", "写 meta 失败（暂停区间可能没落盘）：%s" % e)
+
+
+def _pause_common(by=""):
+    """暂停/恢复的公共前置检查：返回 `(recorder, folder, meta, err)`。"""
+    if not _state["active"] or _state.get("recorder") is None:
+        return None, None, None, "现在没有在录音"
+    folder = _state["folder"]
+    meta = _load_json(os.path.join(folder, "meta.json"), {})
+    return _state["recorder"], folder, meta, ""
+
+
+def pause_meeting(by=""):
+    """暂停录音：**不写盘、不产生音频**，采集流不关（恢复要立刻）。
+
+    返回值 `(ok, message)` —— 调用方（手机/面板）直接把这句给人看。
+    """
+    with _state_lock:
+        recorder, folder, meta, err = _pause_common(by)
+        if err:
+            return False, err
+        if not recorder.pause() or _state.get("paused"):
+            return True, "已经在暂停着（这段时间不会录进会议）"
+        now = datetime.datetime.now().isoformat(timespec="seconds")
+        _state["paused"] = True
+        entry = {"from": now, "to": "", "by": str(by or "")}
+        pauses = _state.setdefault("pauses", [])
+        pauses.append(entry)
+        meta = meta or {}
+        meta["pauses"] = list(pauses)
+        _save_meta(folder, meta)
+        db.add_log("info", "meeting", "录音已暂停（%s）" % (by or "本机"))
+        return True, "录音已暂停：这段时间不会录进会议（恢复后接着录）"
+
+
+def resume_meeting(by=""):
+    """恢复录音：接着写新的段（暂停那段是真空白，转写里不会有假静音）。"""
+    with _state_lock:
+        recorder, folder, meta, err = _pause_common(by)
+        if err:
+            return False, err
+        if not recorder.resume() or not _state.get("paused"):
+            return True, "本来就没暂停"
+        now = datetime.datetime.now().isoformat(timespec="seconds")
+        _state["paused"] = False
+        pauses = _state.setdefault("pauses", [])
+        if pauses and not pauses[-1].get("to"):
+            pauses[-1]["to"] = now
+        meta = meta or {}
+        meta["pauses"] = list(pauses)
+        _save_meta(folder, meta)
+        db.add_log("info", "meeting", "录音已恢复")
+        return True, "录音已恢复"
 
 
 def recover_orphaned_meetings():
@@ -698,6 +774,10 @@ def start_meeting():
                 "diarize": True,
             },
             "segments": [],
+            #: 暂停区间（`{from, to, by}`）：录音中途"静音"过的那几段。
+            #: 为什么必须留痕：暂停期间**不产生音频**，转写里那段是空白 ——
+            #: 没有这份记录，谁也不知道"少了一段"是暂停还是故障。
+            "pauses": [],
         }
         with open(os.path.join(folder, "meta.json"), "w", encoding="utf-8") as f:
             json.dump(meta, f, ensure_ascii=False, indent=2)
@@ -746,7 +826,7 @@ def start_meeting():
             return False, f"无法开始录音：{err}"
 
         _state.update(active=True, folder=folder, recorder=recorder,
-                      started_at=meta["start"], error="")
+                      started_at=meta["start"], error="", paused=False, pauses=[])
         threading.Thread(target=_watch_recorder, args=(recorder,), daemon=True).start()
         db.add_event("meeting_started", {"meeting": os.path.basename(folder), "id": meeting_id})
         db.add_log("info", "meeting", f"开始录音: {os.path.basename(folder)}")
@@ -768,14 +848,23 @@ def stop_meeting():
             return False, "没有进行中的会议"
         recorder = _state["recorder"]
         folder = _state["folder"]
+        # 停止时若还在暂停：把那个开着的暂停区间收尾（否则 meta 里会留一个没有 `to` 的区间，
+        # 事后看不出"暂停到什么时候"）
+        was_paused = bool(_state.get("paused"))
+        pauses = list(_state.get("pauses") or [])
         if not recorder.stop():
             err = "麦克风尚未释放，录音正在停止；请勿重复开麦，持续异常请重启 ECHO"
             _state.update(error=err, level=0.0)
             return False, err
-        _state.update(active=False, level=0.0, recorder=None)
+        _state.update(active=False, level=0.0, recorder=None, paused=False)
 
         meta_path = os.path.join(folder, "meta.json")
         meta = _load_json(meta_path, {})
+        # 收尾那个还开着的暂停区间（停止时还在暂停）
+        end_iso = datetime.datetime.now().isoformat(timespec="seconds")
+        if was_paused and pauses and not pauses[-1].get("to"):
+            pauses[-1]["to"] = end_iso
+        meta["pauses"] = pauses
         # 段列表 = 本次录出来的 **∪ 目录里已有的 *.wav**。
         # 为什么把目录里那些也算上（2026-09-23）：把**另一段录音**（比如上一场被中断的）
         # 拷进本场目录当 `00.wav`，就应当本次一并转写 —— 用户在电话里就是这么预期的

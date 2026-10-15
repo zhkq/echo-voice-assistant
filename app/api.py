@@ -1422,6 +1422,37 @@ def meeting_status(_auth=Depends(optional_auth)):
     return meeting.meeting_status()
 
 
+def _meeting_actor(request: Request) -> str:
+    """这次暂停/恢复是**谁**按的（进 meta 的 `pauses[].by`）。
+
+    判据与配对其他路一致：**带中继标记 = 手机**（它经后端转进来的），否则按本机面板算。
+    为什么要留这个：会议中途"被静音了 5 分钟"这种事，事后得能说清是谁按的。
+    """
+    if (request.headers.get(relay_mod.RELAY_MARKER_HEADER) or "").strip():
+        return "手机"
+    return "面板"
+
+
+@router.post("/meeting/pause")
+def meeting_pause(request: Request, _auth=Depends(optional_auth)):
+    """暂停录音（**静音**）：不写盘、不产生音频，采集流不关（恢复要立刻）。
+
+    手机那个全屏录音界面上的「静音」按钮就是它；暂停区间记进 meta 的 `pauses`，
+    所以转写里那段空白**有据可查**（不是"莫名其妙少了一段"）。
+    """
+    ok, msg = meeting.pause_meeting(by=_meeting_actor(request))
+    services.report_meeting("active" if ok else "idle", msg)
+    return {"ok": ok, "message": msg}
+
+
+@router.post("/meeting/resume")
+def meeting_resume(request: Request, _auth=Depends(optional_auth)):
+    """恢复录音（接着写新的段）。"""
+    ok, msg = meeting.resume_meeting(by=_meeting_actor(request))
+    services.report_meeting("active" if ok else "idle", msg)
+    return {"ok": ok, "message": msg}
+
+
 @router.get("/transcribe/status")
 def transcribe_status(_auth=Depends(optional_auth)):
     """当前转写任务进度：{meeting_id: {phase, seg_index, seg_total, percent, detail, updated_at}}"""
