@@ -303,6 +303,114 @@ class PairingFingerprintTests(_Isolated):
         self.assertEqual(stored.cert_fingerprint, pairing.fingerprint_of(CERT_PEM))
 
 
+class AddressPinEndpointTests(_Isolated):
+    """`POST /api/capability/address` 换成 https 时**自动补证书固定**（2026-10-16 真机缺口 1）。
+
+    真机现场：公网入口从 http 换成 https 之后，用产品自己的这个接口改地址**立刻失败**
+    （`后端 配的是 https，但本机没有它的证书（缺 certPem）——拒绝连接`，`ready=False`），
+    那一晚是手工拿 `pair()` 里逐字同一段补的 pin。这里钉的是**接口自己会补**，
+    而且补的过程**不动身份**：clientId/secret 逐字不变、桩上也不会再出现第二条 `/v1/pair`
+    （scopes 与 hostId 都挂在服务端那条客户端记录上、认的就是 clientId ——
+    "没有再配对一次"就是"它们没变"的判据）。
+
+    后端全是本机桩服务器（`_Stub` / `_HttpsServer`），**不碰公网**。
+    """
+
+    def _paired_http(self):
+        """先用 http 桩配一次 —— 这就是"改地址之前"的状态。"""
+        s = self.stub([(200, _PAIR_OK)])
+        ok, msg = capability_admin.pair(s.url, "ABC123")
+        self.assertTrue(ok, msg)
+        return s
+
+    def _tls(self):
+        from tests.test_backend_tls import _HttpsServer
+        srv = _HttpsServer()
+        self.addCleanup(srv.stop)
+        return srv
+
+    def test_http_to_https_pins_the_certificate_and_keeps_the_credentials(self):
+        """① http 地址改 https：自动补 pin 成功 → 之后 `ready=True`，凭据逐字不变。"""
+        from tests.tls_test_cert import CERT_PEM
+        s = self._paired_http()
+        before = cred.load()
+        srv = self._tls()
+        r = self.client.post("/api/capability/address", json={"base_url": srv.url})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertIn("证书固定下来", r.json()["message"], "补了证书就要说出来")
+        after = cred.load()
+        self.assertEqual(after.base_url, srv.url)
+        self.assertEqual(after.cert_pem.strip(), CERT_PEM.strip(), "证书没落盘")
+        self.assertEqual(after.cert_fingerprint, pairing.fingerprint_of(CERT_PEM))
+        self.assertEqual(after.client_id, before.client_id, "clientId 不许变")
+        self.assertEqual(after.secret, before.secret, "secret 不许变")
+        self.assertEqual(after.paired_at, before.paired_at)
+        self.assertEqual([q["path"] for q in s.requests], ["/v1/pair"],
+                         "改地址又走了一遍 /v1/pair = 换了 clientId（中继 hostId 会跟着废）")
+        # 之后**真的能用**：真 https 握手 + 真固定（ready 顺带走一次 /v1/token）
+        self.assertTrue(echo_server.EchoServerClient(base_url=after.base_url).ready(),
+                        "补上证书之后应当 ready=True")
+
+    def test_an_https_address_whose_certificate_cannot_be_fetched_fails_loudly(self):
+        """② https 地址但抓不到证书 → **不静默**：400 + 具体原因，`ready` 仍是 False。"""
+        self._paired_http()
+        r = self.client.post("/api/capability/address",
+                             json={"base_url": "https://127.0.0.1:1"})   # 没人监听
+        self.assertEqual(r.status_code, 400, "抓不到证书不许当成功")
+        detail = r.json()["detail"]
+        self.assertIn("取证书", detail, detail)      # 原因要指得出是**证书**这件事
+        self.assertIn("127.0.0.1:1", detail)
+        stored = cred.load()
+        self.assertEqual(stored.cert_pem, "", "抓不到证书就不许写任何证书")
+        self.assertFalse(echo_server.EchoServerClient(base_url=stored.base_url).ready(),
+                         "缺证书时 ready 必须是 False（绝不静默跳过校验）")
+
+    def test_http_to_http_does_not_touch_any_certificate(self):
+        """③ http→http：行为不变（一个证书都不去取）。"""
+        s = self._paired_http()
+        before = cred.load()
+        calls = []
+        with mock.patch.object(pairing, "fetch_cert_pem",
+                               lambda url, **kw: calls.append(url) or "PEM"):
+            r = self.client.post("/api/capability/address",
+                                 json={"base_url": "http://10.0.0.9:8900"})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(calls, [], "http→http 不该去取证书")
+        after = cred.load()
+        self.assertEqual(after.base_url, "http://10.0.0.9:8900")
+        self.assertEqual((after.cert_pem, after.cert_fingerprint),
+                         (before.cert_pem, before.cert_fingerprint))
+        self.assertEqual((after.client_id, after.secret), (before.client_id, before.secret))
+
+    def test_the_same_address_is_still_a_no_op(self):
+        """③ 同地址重复改：行为不变（http 那一档连取都不取）。"""
+        self._paired_http()
+        before = cred.load()
+        calls = []
+        with mock.patch.object(pairing, "fetch_cert_pem",
+                               lambda url, **kw: calls.append(url) or "PEM"):
+            r = self.client.post("/api/capability/address",
+                                 json={"base_url": before.base_url})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertIn("没变", r.json()["message"])
+        self.assertEqual(calls, [], "地址没变就不该去取证书")
+        self.assertEqual(cred.load().base_url, before.base_url)
+
+    def test_the_same_https_address_with_its_certificate_is_also_a_no_op(self):
+        """③ 同地址重复改（https 且证书已在）：还是 no-op —— 不重复取、不重复写。"""
+        self._paired_http()
+        srv = self._tls()
+        self.assertEqual(self.client.post("/api/capability/address",
+                                          json={"base_url": srv.url}).status_code, 200)
+        calls = []
+        with mock.patch.object(pairing, "fetch_cert_pem",
+                               lambda url, **kw: calls.append(url) or "PEM"):
+            r = self.client.post("/api/capability/address", json={"base_url": srv.url})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertIn("没变", r.json()["message"])
+        self.assertEqual(calls, [], "证书已经在、地址也没变，不该再取一次")
+
+
 class MeetingDetailWiringTests(_Isolated):
     """会议详情接口要把**录音时那份执行计划**带出来（3.0 的最后一环）。
 

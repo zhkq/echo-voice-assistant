@@ -196,12 +196,28 @@ def _spawn(cids):
 def backend_security_note() -> str:
     """后端地址**非回环且明文 http** 时返回一句告警，否则返回空串。
 
-    纯函数（只读设置 + 一个判据），所以用例不必起整个 boot 就能钉住它 ——
+    纯函数（只读地址 + 一个判据），所以用例不必起整个 boot 就能钉住它 ——
     判据只有一条：`https://` 放过、回环放过、其余 `http://` 一律告警。
+
+    ⚠️ **地址必须取"实际用于网络调用"的那一条**（2026-10-16 修）：
+    原来这里传的是 `_base_url_from_settings(use_credentials=False)` —— 那个开关
+    **只看隐藏设置** `capabilityEchoServerUrl`，于是这台机器上它拿到的是本机那一处
+    （或干脆是空串），而真正在用、真正会把音频与令牌送出去的是**配对文件**
+    `{DATA}/backend.json` 里那台远端明文 http → 判据落在"回环/空"上 → **静默**：
+    告警部署了却一次都没出现（真机 2026-10-16 现场）。
+    现在用 `_base_url_from_settings()`（默认参数）—— 与 `client_from_settings()`、
+    `EchoServerClient.base_url`、`backend_endpoint()` **同一份解析**（设置里填的优先、
+    没填就用配对时记下的那个）。同一件事只能有一处判据，否则"告警说的"和"实际连的"
+    迟早不是同一个地址。
+
+    顺带一条口径：本机配对文件（`local-pair.json`，写的是 `http://127.0.0.1:8900`）
+    **不是网络调用用的地址**（它只用来做本机自动配对），所以它不参与这条判据。
     """
     try:
         from app.capabilities import echo_server
-        base = str(echo_server._base_url_from_settings(use_credentials=False) or "").strip()
+        # 默认参数 = 与真实调用同一条路（设置优先，其次配对文件）；**别再加
+        # `use_credentials=False`** —— 那会让判据落在一个"可能没人用"的地址上。
+        base = str(echo_server._base_url_from_settings() or "").strip()
     except Exception:                                             # noqa: BLE001
         return ""
     if not base:

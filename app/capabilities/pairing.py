@@ -119,6 +119,30 @@ def normalize_fingerprint(value: str) -> str:
     return ("sha256:" + text) if text else ""
 
 
+def pin_certificate(url: str, *, timeout: float = PAIR_TIMEOUT_S,
+                    cert_fingerprint: str = "") -> Tuple[str, str]:
+    """取回该地址的证书并固定：返回 `(cert_pem, 指纹)`；期望指纹对不上就抛。
+
+    **"取证书 + 校期望指纹"只有这一份实现**：`pair()`（配对时顺带固定）与
+    `repin_for_address()`（只改地址时补固定）都调它。原来这段写死在 `pair()` 里，
+    于是"改地址"那条路要同一段时**没有第二种写法是对的** —— 抄一份出去，两份迟早漂开
+    （一边收 `fp=`、一边不收，就是"能配对、改完地址却连不上"这种哑谜）。
+
+    给了 `cert_fingerprint`（配对串里的 `fp=sha256:…`）就必须对上 —— 那才是真正
+    防中间人的那一步；不给则是 TOFU（首次连接即信任），如实写在文档里。
+    """
+    cert_pem = fetch_cert_pem(url, timeout=timeout)
+    fp = fingerprint_of(cert_pem)
+    want = normalize_fingerprint(cert_fingerprint)
+    if want and want != fp:
+        # **对不上就停**：这正是"配对串里带指纹"的全部意义。
+        raise PairingError(
+            "服务端证书指纹与配对串里的不一致（期望 %s，实际 %s）—— "
+            "**可能是中间人**，也可能是服务端换了证书。先找管理员核对，别继续。"
+            % (want, fp), code="blocked")
+    return cert_pem, fp
+
+
 def pinned_context(cert_pem: str, *, what: str = "后端"):
     """按**固定的证书**建一个 SSL 上下文。**没有证书就抛** —— 绝不静默跳过校验。
 
@@ -290,15 +314,10 @@ def pair(base_url: str, code: str, client_name: str = "", *,
     context = None
     fp = ""
     if is_https(url):
-        cert_pem = fetch_cert_pem(url, timeout=timeout)
-        fp = fingerprint_of(cert_pem)
-        want = normalize_fingerprint(cert_fingerprint)
-        if want and want != fp:
-            # **对不上就停**：这正是"配对串里带指纹"的全部意义。
-            raise PairingError(
-                "服务端证书指纹与配对串里的不一致（期望 %s，实际 %s）—— "
-                "**可能是中间人**，也可能是服务端换了证书。先找管理员核对，别继续。"
-                % (want, fp), code="blocked")
+        # 取证书、校期望指纹就在这一句里（与"只改地址时补固定"是同一份实现，
+        # 见 `pin_certificate`）——两份实现迟早漂开。
+        cert_pem, fp = pin_certificate(url, timeout=timeout,
+                                       cert_fingerprint=cert_fingerprint)
         # 这条连接也必须走同一张证书（TOFU 之后不许换）
         context = pinned_context(cert_pem)
 
@@ -323,6 +342,92 @@ def pair(base_url: str, code: str, client_name: str = "", *,
     if save:
         cred.save(creds)
     return creds
+
+
+# ---------------------------------------------------------------- 只改地址时补证书固定
+#
+# 背景（2026-10-16 真机，缺口 1）：公网入口从 `http://echoserver.zhkq.online:8900` 换成
+# `https://echoserver.zhkq.online:8900` 之后，用产品自己的 `POST /api/capability/address`
+# 改地址**立刻失败**：
+#     后端 配的是 https，但本机没有它的证书（缺 certPem）——拒绝连接
+# 而 `usable.ready=False`。那一晚是用 `pair()` 里**逐字同一段**
+# （`fetch_cert_pem` → `fingerprint_of` → `credentials.save`）手工补的 pin ——
+# 也就是说这件事**只差接一根线**：改地址这条路本来就该顺手把证书补上。
+#
+# 为什么不能"顺手重新配对一次"：重新配对要管理员再发一张一次性码，而且会**换掉
+# clientId**（服务端多一条客户端记录；中继的 hostId 取自 clientId，手机侧地址跟着一起废）。
+# 换地址 ≠ 换身份，clientId/secret/scopes/hostId 必须一个字节都不动。
+
+
+def needs_repin(base_url: str, cert_pem: str, *, old_base_url: str = "",
+                cert_fingerprint: str = "") -> bool:
+    """现在这个地址需不需要（重新）抓一张证书固定下来？**纯判据，不联网。**
+
+    三条，按"最省事"的顺序：
+
+      ① 不是 https → 不需要。明文没有"固定证书"这回事，所以 http→http、回环那一档
+         一个字节都不动（那条纪律写在 AGENTS.md 里）。
+      ② 本地没有证书 → 需要。**这就是昨晚那面墙**：http→https 换过去时本地没有它的
+         证书，而 https **绝不允许**"没证书也连"（`pinned_context` 直接拒绝），
+         于是改完地址立刻不可用。
+      ③ 换到了**另一处**（host:port 变了）→ 需要。证书里没有"这是哪台机器"的可靠记录
+         （`pinned_context` 故意不校名：内网常按 IP/短名访问，证书上不会签它），
+         所以换了 host:port 就只能重新取一张；同一个 host 下换端口/加反代时重取也无害
+         （TOFU 一次，取回来的仍是服务端现在这张）。
+         给了期望指纹（`fp=`）却与本地存的那张不一致时同理：得去把现在这张取来看看
+         ——对不上自然会在 `pin_certificate` 里**响亮地失败**，而不是拿旧证书硬连。
+
+    `old_base_url` 留空 = 调用方不知道旧地址，那就**不**按③重取（保守：不动现有固定）。
+    """
+    if not is_https(base_url):
+        return False
+    have = str(cert_pem or "").strip()
+    if not have:
+        return True
+    want = normalize_fingerprint(cert_fingerprint)
+    if want and want != fingerprint_of(have):
+        return True
+    if not old_base_url:
+        return False
+    try:
+        return _host_port(old_base_url) != _host_port(base_url)
+    except Exception:
+        # 旧地址认不出来（残缺/手改过）→ 当成"换了一处"，重取一张最安全。
+        return True
+
+
+def repin_for_address(old_base_url: str = "", *, cert_fingerprint: str = "",
+                      timeout: float = PAIR_TIMEOUT_S, save: bool = True) -> str:
+    """改完地址之后补一次证书固定：**返回一句人话**（没做事 = 空串）；失败就抛。
+
+    调用点只有一个：`POST /api/capability/address`（`app/api.py`）。它必须走
+    `pin_certificate()` —— 与 `pair()` **同一段实现**，于是"配对时固定下来的那张"
+    与"改地址时补上的那张"是同一件东西，不会出现两套语义。
+
+    为什么失败要**抛**而不是静默：https 而本地没有对应证书 = 这台机器现在**用不了**
+    这个后端（`usable.ready=False`）。静默过去，用户得到的是一句含糊的"改好了"，
+    然后每次转写都撞同一面墙 —— 那正是 2026-10-16 真机上的现象。
+
+    **只动证书那两栏**：`client_id` / `secret` / `server_name` / `paired_at` 原样保留
+    （对象是 `credentials.load()` 读回来的那一份，只改 `cert_pem` / `cert_fingerprint`）。
+    """
+    c = cred.load()
+    if c is None:
+        return ""                       # 没配对过：改地址这条路本来就走不到这儿
+    try:
+        url = normalize_base_url(c.base_url)
+    except PairingError:
+        return ""                       # 地址本身认不出来 → 没有"补证书"可谈
+    if not needs_repin(url, c.cert_pem, old_base_url=old_base_url,
+                       cert_fingerprint=cert_fingerprint):
+        return ""
+    cert_pem, fp = pin_certificate(url, timeout=timeout,
+                                   cert_fingerprint=cert_fingerprint)
+    c.cert_pem = cert_pem
+    c.cert_fingerprint = fp
+    if save:
+        cred.save(c)
+    return "已把 %s 的证书固定下来（%s）—— clientId/secret 一个字节都没动" % (url, fp)
 
 
 def unpair() -> bool:

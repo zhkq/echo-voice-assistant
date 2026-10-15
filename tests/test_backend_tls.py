@@ -60,6 +60,17 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         else:
             self._reply({"code": "not_found"}, 404)
 
+    def do_GET(self):                                          # noqa: N802
+        # 「补上证书之后**真的能用**」这条判据需要这两个免凭据探针：
+        # `ready()` 问 `/v1/health`，`refresh()` 问 `/v1/capabilities`。
+        if self.path.startswith("/v1/health"):
+            self._reply({"ok": True, "version": "test"})
+        elif self.path.startswith("/v1/capabilities"):
+            self._reply({"server": {"id": "gpu-tls"}, "models": [], "limits": {},
+                         "slots": {"asr.long": {}}})
+        else:
+            self._reply({"code": "not_found"}, 404)
+
     def log_message(self, *a):                                 # 安静
         pass
 
@@ -150,18 +161,28 @@ class PinIsMandatoryTests(unittest.TestCase):
         self.assertIsNone(c._ssl_context())
 
 
+def _isolate_credentials(case):
+    """凭据路径打桩到临时目录 —— **绝不碰真实的 `{DATA}/backend.json`**。
+
+    顺带把"设置里手填的令牌"那条路关掉：它会让"用凭据换令牌"这条路被整个绕过，
+    而这一组用例要的正是后者。
+    """
+    tmp = tempfile.mkdtemp(prefix="echo-tls-")
+    p = patch.object(cred, "credentials_path",
+                     lambda: os.path.join(tmp, "backend.json"))
+    p.start()
+    case.addCleanup(p.stop)
+    p2 = patch("app.capabilities.echo_server._token_from_settings", lambda: "")
+    p2.start()
+    case.addCleanup(p2.stop)
+    return tmp
+
+
 class PinningEndToEndTests(unittest.TestCase):
     """真 https 服务端 + 真握手。**这一层的意义是"固定真的在生效"。**"""
 
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="echo-tls-")
-        p = patch.object(cred, "credentials_path",
-                         lambda: os.path.join(self.tmp, "backend.json"))
-        p.start()
-        self.addCleanup(p.stop)
-        p2 = patch("app.capabilities.echo_server._token_from_settings", lambda: "")
-        p2.start()
-        self.addCleanup(p2.stop)
+        _isolate_credentials(self)
         self.srv = _HttpsServer()
         self.addCleanup(self.srv.stop)
 
@@ -223,6 +244,109 @@ class PinningEndToEndTests(unittest.TestCase):
         self.assertEqual(creds.client_id, "cli-tls")
         self.assertEqual(creds.cert_pem, "", "http 不该去取证书")
         self.assertEqual(creds.cert_fingerprint, "")
+
+
+class AddressChangeRepinTests(unittest.TestCase):
+    """**只改地址时补证书固定**（2026-10-16 真机缺口 1）。
+
+    真机现场：公网入口从 `http://…:8900` 换成 `https://…:8900` 之后，用
+    `POST /api/capability/address` 改地址**立刻失败** ——
+    `后端 配的是 https，但本机没有它的证书（缺 certPem）——拒绝连接`，`usable.ready=False`。
+    那一晚是手工拿 `pair()` 里逐字同一段（`fetch_cert_pem`→`fingerprint_of`→`save`）补的 pin。
+
+    这一组钉两件事：① 改地址这条路会**自己**把证书补上（走 `pair()` 同一段实现）；
+    ② 补证书**不动身份** —— clientId/secret 一个字节都不变（重新配对会换 clientId，
+    中继的 hostId 与手机侧地址跟着一起废）。所以这里全是**真 https 握手**，不是打桩。
+    """
+
+    def setUp(self):
+        _isolate_credentials(self)
+        self.srv = _HttpsServer()
+        self.addCleanup(self.srv.stop)
+
+    def _creds_at(self, base_url, **kw):
+        c = BackendCredentials(base_url=base_url, client_id="cli-keep", secret="sec-keep",
+                               server_name="gpu-tls", **kw)
+        cred.save(c)
+        return c
+
+    def test_a_new_https_address_without_a_certificate_gets_pinned(self):
+        """**这是昨晚那面墙**：地址已经改成 https、本地没有证书 → 补上，之后真的能用。"""
+        old = "http://127.0.0.1:9"
+        self._creds_at(self.srv.url)          # = `capability_admin.set_base_url` 干的那一步
+        note = pairing.repin_for_address(old)
+        self.assertIn("证书固定下来", note)
+        stored = cred.load()
+        self.assertEqual(stored.cert_pem.strip(), CERT_PEM.strip(), "证书没落盘")
+        self.assertEqual(stored.cert_fingerprint, pairing.fingerprint_of(CERT_PEM))
+        self.assertEqual((stored.client_id, stored.secret), ("cli-keep", "sec-keep"),
+                         "补证书不许动身份")
+        # 正向：固定对了就能真连上（ready 顺带还会走一次 /v1/token，也走同一张证书）
+        from app.capabilities.echo_server import EchoServerClient
+        self.assertTrue(EchoServerClient(base_url=stored.base_url, creds=stored).ready())
+
+    def test_it_never_fetches_a_certificate_for_plain_http(self):
+        """http 那一档**一个字节都不动**（AGENTS.md：不许改 http→http 的行为）。"""
+        self._creds_at("http://127.0.0.1:9")
+        with patch.object(pairing, "fetch_cert_pem",
+                          side_effect=AssertionError("http 不该去取证书")):
+            self.assertEqual("", pairing.repin_for_address("http://127.0.0.1:9"))
+        self.assertEqual(cred.load().cert_pem, "")
+
+    def test_the_same_address_with_the_certificate_in_place_is_a_no_op(self):
+        """地址没变、证书也在 → 什么都不做（幂等：不重复取、不重复写盘）。"""
+        self._creds_at(self.srv.url)
+        self.assertIn("证书固定下来", pairing.repin_for_address("http://127.0.0.1:9"))
+        with patch.object(pairing, "fetch_cert_pem",
+                          side_effect=AssertionError("证书已经在、地址也没变，不该再取")):
+            self.assertEqual("", pairing.repin_for_address(self.srv.url))
+
+    def test_moving_to_another_place_refetches_the_certificate(self):
+        """换到**另一处**（host:port 变了）→ 旧那张可能不是它的，重取一张。
+
+        证书里没有"这是哪台机器"的可靠记录（`pinned_context` 故意不校名），
+        所以换了 host:port 只能重取 —— 不然会撞一句很费解的"服务端换证书了？"。
+        """
+        self._creds_at(self.srv.url)
+        pairing.repin_for_address("http://127.0.0.1:9")
+        calls = []
+        with patch.object(pairing, "fetch_cert_pem",
+                          lambda url, **kw: calls.append(url) or CERT_PEM):
+            note = pairing.repin_for_address("http://127.0.0.1:8900")
+        self.assertEqual(calls, [self.srv.url], "换了另一处就该去取现在这张")
+        self.assertIn("证书固定下来", note)
+
+    def test_a_mismatched_expected_fingerprint_stops_and_writes_nothing(self):
+        """`fp=` 对不上 → 抛（**可能是中间人**），而且绝不把证书写下去。"""
+        self._creds_at(self.srv.url)
+        with self.assertRaises(PairingError) as ctx:
+            pairing.repin_for_address(
+                "http://127.0.0.1:9",
+                cert_fingerprint=pairing.fingerprint_of(OTHER_CERT_PEM))
+        self.assertIn("中间人", str(ctx.exception))
+        self.assertEqual(cred.load().cert_pem, "", "指纹对不上却把证书写下去了")
+
+    def test_a_certificate_that_cannot_be_fetched_says_so(self):
+        """抓不到证书 → **如实抛**（不是一句"失败"），而且不写半个字节。
+
+        这台机器现在的状态就是 `https` + 没有证书 = **用不了这个后端**
+        （`usable.ready=False`），所以这里必须响。
+        """
+        self._creds_at("https://127.0.0.1:1")       # 没人监听
+        with self.assertRaises(PairingError) as ctx:
+            pairing.repin_for_address("http://127.0.0.1:9")
+        text = str(ctx.exception)
+        self.assertIn("取证书", text, text)
+        self.assertIn("127.0.0.1:1", text)
+        self.assertEqual(cred.load().cert_pem, "")
+
+    def test_pair_still_reuses_the_same_pinning_code(self):
+        """配对那条路仍在用同一段（抽函数的重构不许把它的指纹校验弄丢）。"""
+        fp = pairing.fingerprint_of(CERT_PEM)
+        self.assertEqual(pairing.pin_certificate(self.srv.url)[1], fp)
+        with self.assertRaises(PairingError):
+            pairing.pin_certificate(self.srv.url,
+                                    cert_fingerprint=pairing.fingerprint_of(OTHER_CERT_PEM))
 
 
 if __name__ == "__main__":

@@ -352,8 +352,13 @@ def api_capability_pair_local(body: Optional[PairLocalIn] = None,
 
 
 class SetAddressIn(BaseModel):
-    """只改地址的入参（`base_url`：`域名:端口` 或 `http(s)://域名:端口`）。"""
+    """只改地址的入参（`base_url`：`域名:端口` 或 `http(s)://域名:端口`）。
+
+    `fingerprint` 是**可选的期望证书指纹**（配对串里那串 `fp=sha256:…`）：给了就必须
+    对上（防中间人），不给就是 TOFU —— 与 `/capability/pair` 同一套语义。
+    """
     base_url: str = ""
+    fingerprint: str = ""
 
 
 @router.post("/capability/address")
@@ -363,11 +368,36 @@ def api_capability_address(body: SetAddressIn, _auth=Depends(optional_auth)):
     场景：同一台后端换了访问地址（IP → 域名、换网段、前面加反代）。重新配对要管理员
     再发一张一次性码、服务端还会多一条客户端记录，没必要。
     **失败回 400 + 一句人话**（与 `/capability/pair` 同一形状）。
+
+    2026-10-16 补（真机缺口 1）：新地址是 https 而本地**没有对应证书**时，自动补一次
+    证书固定（`pairing.repin_for_address` → 与 `pair()` 同一段 `pin_certificate`）。
+    不补的话 http→https 换过去立刻就是
+    `后端 配的是 https，但本机没有它的证书（缺 certPem）——拒绝连接`，而"补证书"
+    这件事**改地址这条路本来就该顺手做掉**：换地址 ≠ 换身份，clientId/secret/scopes/
+    hostId 全都原样保留（重新配对会换 clientId，中继 hostId 与手机侧地址一起废）。
+    抓不到证书 / 指纹对不上时**如实回 400**（具体原因进 `detail`），绝不静默成功。
     """
     from app import capability_admin
+    from app.capabilities import credentials as cred_store, pairing
+    # 改之前的地址要留一份：判断"本地固定的那张证书还认得新地址吗"要比 host:port
+    # （`pairing.needs_repin` 第③条）。「地址没变」那条分支也靠它保持原样。
+    try:
+        before = cred_store.load()
+    except Exception:                                             # noqa: BLE001
+        before = None
     ok, message = capability_admin.set_base_url(body.base_url)
     if not ok:
         raise HTTPException(status_code=400, detail=message)
+    try:
+        pin_note = pairing.repin_for_address(getattr(before, "base_url", "") or "",
+                                             cert_fingerprint=body.fingerprint)
+    except pairing.PairingError as e:
+        # 地址已经改了、证书没补上：这台机器现在配的是 https 而没有它的证书，
+        # `usable.ready` 会是 False。**必须把具体原因交出去**（连不上取证书 / 指纹
+        # 对不上……），不许写一句"失败"了事 —— 那正是真机上没人知道原因的那一幕。
+        raise HTTPException(status_code=400, detail=str(e)) from None
+    if pin_note:
+        message = "%s；%s" % (message, pin_note)
     return {"ok": True, "message": message, "pair": capability_admin.pair_view()}
 
 
