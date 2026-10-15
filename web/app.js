@@ -4623,7 +4623,15 @@ document.addEventListener("click", (e) => {
       // 于是仪表盘 Agent 那格的 ↗ 点了**什么也不发生**（实测 404，2026-10-15 用户报的
       // "agent 网页的链接要跳到 dsh 标准版的网页"）。判据在 `tests/test_panel_api_links.py`：
       // 面板里每个 post: 链接都要在路由表里。
-      return { post: "/api/harness/browser", title: "在浏览器打开标准版 harness 界面" };
+      //
+      // 网络可达（2026-10-15 用户："网页需要考虑网络可达的问题"）：这条是**服务端**开浏览器
+      // （token 不下发页面，见 app/api.py 的口径），所以它开在**那台跑 ECHO 的电脑**上 ——
+      // 面板若从别的机器/手机打开，你点完在自己这块屏上**什么也看不到**。这不是 bug，
+      // 是"凭据不下发"的代价，所以 title 里必须写明，不能让人以为点了没反应。
+      return {
+        post: "/api/harness/browser",
+        title: "在这台跑 ECHO 的电脑上打开标准版 harness 界面（从别的机器/手机看面板时，那个窗口不在这块屏上）",
+      };
     }
     return { href: "?view=agent", title: "去「智能体」页看它是哪个、怎么切" };
   }
@@ -4767,7 +4775,11 @@ async function refreshRunStatus() {
   _bindCardLinks(host);
   host.innerHTML = [
     _runCard("backend", "后端", beShort, beState, beTip,
-             (!remote && be && be.adminUrl) ? { href: be.adminUrl, title: "打开后端管理页（发授权 / 看客户端 / 改配额）" } : null),
+             (!remote && be && be.adminUrl) ? { href: be.adminUrl,
+               // 网络可达（2026-10-15）：管理面**只绑回环**（见 docs/后端容器部署.md §7），
+               // 所以这条链接只有"就在那台电脑上打开面板"时能点开；从局域网/远程打开面板时
+               // 它是死链 —— 说清楚，别让人以为是面板坏了。
+               title: "打开后端管理页（发授权 / 看客户端 / 改配额）。管理面只绑回环：只有在这台电脑上打开面板时才能点开；远程请用 ssh -L" } : null),
     _runCard("agent", "Agent", agName, ag && ag.online ? "online" : "offline", agTip,
              _agentLink(ag)),
     _runCard("tts", "语音合成", ttsShort, tts && tts.status === "online" ? "online" : "idle", ttsTip),
