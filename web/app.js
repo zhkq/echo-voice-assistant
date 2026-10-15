@@ -1552,7 +1552,7 @@ const SET_CARDS = {
           + "改了不重启不生效）；② 点「生成配对码」，在设备上输入那 6 位数字兑换。"
           + "开了 lan 会**自动打开 API 鉴权**（局域网上没有令牌的请求等于谁都能下命令），"
           + "而**本机面板不受影响**。手机/手表能做的也有边界：**不能**停 ECHO、重启、删会议、改设置。",
-      common: ["serverBindMode", "serverLanHost"],
+      common: ["serverBindMode", "serverLanHost", "relayEnabled"],
       dynAfter: () => `<div id="phoneCardHost">${phoneCardInner()}</div>` },
     { id: "ai", title: "AI 组件",
       hint: "用哪个能力：谁来执行、转写用本机还是在线、朗读用在线还是本机。",
@@ -4141,6 +4141,16 @@ function phoneCardInner() {
     out.push(`<div class="snote"><span>ℹ</span><span>局域网已开放，告诉设备的地址：
       <code>${esc(st.baseUrl || "（本机没有可用的私有地址）")}</code>
       ${st.lockedSeconds > 0 ? `　·　配对码<b>限流中</b>，约 ${st.lockedSeconds} 秒后可再试` : ""}</span></div>`);
+  }
+  // ①b 中继（2026-10-15）—— 手机与这台机器**互相连不通**时走这条路，
+  //     这时手机配对页要填的是下面这串中继地址，而不是上面那个局域网地址。
+  if (st.relayUrl) {
+    out.push(`<div class="snote"><span>⇄</span><span>手机与这台机器连不通时（公司网里常见）：
+      在手机配对页把「后端地址」填成这串<b>中继地址</b>
+      <code>${esc(st.relayUrl)}</code>（配对码照旧）。</span></div>`);
+  } else if (st.relayEnabled) {
+    out.push(`<div class="snote warn"><span>⚠</span><span>中继已打开但**还没连上**：
+      ${esc(st.relayReason || "看看后端配对与「API 鉴权」是否都就绪")}</span></div>`);
   }
   // ② 配对码
   const pend = st.pending || {};

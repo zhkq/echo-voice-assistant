@@ -899,7 +899,7 @@ def get_relay(_auth=Depends(optional_auth)):
     所以只有一次成功的 poll 之后才知道，面板得能看到"现在连没连上"。
     """
     from app import relay as relay_mod
-    return relay_mod.status()
+    return relay_mod.status(refresh_ready=True)
 
 
 # ---------------------------------------------------------------- 每日回顾
@@ -2751,7 +2751,13 @@ def _phone_base_url(request=None) -> str:
 
 
 def _pair_state() -> dict:
-    """配对这件事的**全部现状**（面板一处取全，免得三个接口各画一半）。"""
+    """配对这件事的**全部现状**（面板一处取全，免得三个接口各画一半）。
+
+    `relay*` 三项是给面板显示中继地址用的（2026-10-15）：手机与这台机器
+    **互相连不通**时，配对页要填的不是 `baseUrl`（局域网地址）而是 `relayUrl`。
+    所以这里把"开关开了没、线程在不在跑、手机该填哪串"一次给全 ——
+    面板只读这一处，不自己拼。
+    """
     return {
         "bindMode": str(settings.get("serverBindMode", "loopback") or "loopback"),
         "lanHost": str(settings.get("serverLanHost", "") or ""),
@@ -2760,6 +2766,10 @@ def _pair_state() -> dict:
         "pending": phone_pair.pending(),
         "lockedSeconds": phone_pair.locked_for(),
         "apiAuthEnabled": bool(settings.get("apiAuthEnabled", False)),
+        "relayEnabled": bool(settings.get("relayEnabled", False)),
+        "relayRunning": bool(relay_mod.STATE.get("connected")),
+        "relayUrl": relay_mod.public_url(),
+        "relayReason": relay_mod.status().get("reason", ""),
     }
 
 

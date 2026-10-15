@@ -117,14 +117,26 @@ def public_url() -> str:
     return "%s/v1/relay/%s/" % (base_url.rstrip("/"), host_id)
 
 
-def status() -> dict:
-    """给面板/接口看的一份状态（**纯读**，不触发任何动作）。"""
-    ok, why = ready()
+def status(refresh_ready: bool = False) -> dict:
+    """给面板/接口看的一份状态（纯读，不触发任何动作）。
+
+    ⚠️ **默认不现算 `ready()`**：`ready()` 会走 `backend_endpoint()`（读配对文件、
+    必要时**联网换令牌**），而面板是每几秒刷一次的 —— 让面板的一次刷新卡在网络上
+    是不能接受的。所以默认只回**上一次 poll 的缓存状态**；要"现在到底行不行"，
+    由调用方显式传 `refresh_ready=True`（`GET /api/relay` 就是这么用的）。
+    """
     out = dict(STATE)
     out["enabled"] = enabled()
-    out["ready"] = bool(ok)
-    out["reason"] = "" if ok else why
-    out["publicUrl"] = public_url() or out.get("publicUrl", "")
+    out["publicUrl"] = str(out.get("publicUrl") or "")
+    if refresh_ready:
+        ok, why = ready()
+        out["ready"] = bool(ok)
+        out["reason"] = "" if ok else why
+    else:
+        connected = bool(out.get("connected"))
+        out["ready"] = connected
+        out["reason"] = "" if connected else (
+            str(out.get("lastError") or "") or "中继还没连上（或开关没开）")
     return out
 
 
