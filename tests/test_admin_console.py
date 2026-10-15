@@ -489,7 +489,14 @@ class IsolationTests(_AdminCase):
             if set(methods) & {"post", "put", "patch", "delete"}:
                 cap_writes.add(path)
         self.assertTrue(cap_writes <= {"/v1/asr", "/v1/diarize", "/v1/speaker/embed",
-                                       "/v1/pair", "/v1/token"},
+                                       "/v1/pair", "/v1/token",
+                                       # 中继（2026-10-15）：**不是能力槽**，是"借这台服务器
+                                       # 把手机的请求转交给某台主机"的那条路。三条都要凭据
+                                       # （主机侧按 client_id 认主机，手机侧放行 /health 与 api/*、
+                                       # 鉴权在 ECHO 自己那枚令牌上），所以它们进这张白名单
+                                       # 只是"登记"，不是"敞开"。
+                                       "/v1/relay/host/poll", "/v1/relay/host/result",
+                                       "/v1/relay/status", "/v1/relay/{host_id}/{path}"},
                         "能力面出现了白名单外的 POST：%s" % sorted(cap_writes))
 
     def test_a_capability_jwt_is_useless_on_the_admin_console(self):

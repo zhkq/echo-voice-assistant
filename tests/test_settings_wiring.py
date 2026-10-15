@@ -329,6 +329,11 @@ def _quiet_side_effects():
     **`GET /api/settings` 那条读路**（`agents.list_agents()` 探活）不在这里哑 ——
     它由本模块的 `setUpModule` 整段处理，见 `_no_agent_probe`。理由：这个
     contextmanager 只包住 `PUT`，而实测占时间的恰恰是它**外面**的 `GET`。
+
+    **`_relay` 也要哑**（2026-10-15 补）：这轮 PUT 里有 `relayEnabled`，联动会去
+    `backend_endpoint()` 读**真实**的配对文件、必要时**联网换令牌**（目标就是生产那台
+    后端）—— 测试既不该碰生产，也会被它拖慢。与 `_agent` 是同一条纪律：
+    凡是走 `PUT /api/settings` 的测试，都要检查新加的联动。
     """
     with patch("app.runtime.stop_wake"), patch("app.runtime.start_wake"), \
             patch("app.router_admin.apply_settings", lambda updated: (True, "")), \
@@ -337,7 +342,9 @@ def _quiet_side_effects():
             patch("app.settings_effects._stt",
                   lambda *a, **kw: {"scope": "stt", "ok": True, "detail": ""}), \
             patch("app.settings_effects._hotkey",
-                  lambda *a, **kw: {"scope": "hotkey", "ok": True, "detail": ""}):
+                  lambda *a, **kw: {"scope": "hotkey", "ok": True, "detail": ""}), \
+            patch("app.settings_effects._relay",
+                  lambda *a, **kw: {"scope": "relay", "ok": True, "detail": ""}):
         yield
 
 

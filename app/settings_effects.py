@@ -120,22 +120,40 @@ def apply(updated, *, harness_timeout=None) -> list:
 
 
 def _relay() -> dict:
-    """中继开关变更后的起停 + 就绪检查。"""
+    """中继开关变更后的起停 + 就绪检查。
+
+    ⚠️ **不许在这里同步联网**：`ready()` 要读配对文件、必要时**换后端令牌**（网络请求），
+    而这是 `PUT /api/settings` 的那条路 —— 面板点一下开关不该卡住（后端不通时最坏等几十秒，
+    用户只会看到面板转圈）。所以：**关**是纯本地动作，同步做；**开**交给后台线程，
+    立刻回一句"正在启动"，真正的结论由面板上那行中继状态显示
+    （`/api/pair/phone` 的 `relayReason`，来自 `relay.STATE["lastError"]`）。
+    """
     try:
         from app import relay as relay_mod
         if not relay_mod.enabled():
             relay_mod.stop()
             return {"scope": "relay", "ok": True, "detail": "中继已关闭"}
-        ok, why = relay_mod.ready()
-        if not ok:
-            relay_mod.stop()
-            return {"scope": "relay", "ok": False, "detail": "中继没开起来：%s" % why}
-        relay_mod.ensure_running()
+        import threading
+        threading.Thread(target=_relay_start, name="echo-relay-start", daemon=True).start()
         return {"scope": "relay", "ok": True,
-                "detail": "中继已启动（手机用面板上那串中继地址配对）"}
+                "detail": "中继正在启动（结果见「手机 / 手表」卡上的中继状态）"}
     except Exception as exc:                                      # noqa: BLE001
         return {"scope": "relay", "ok": False,
                 "detail": "%s: %s" % (type(exc).__name__, exc)}
+
+
+def _relay_start() -> None:
+    """在后台把中继线程拉起来；**没就绪就把原因写进状态**（面板读得到）。"""
+    from app import relay as relay_mod
+    try:
+        ok, why = relay_mod.ready()
+        if not ok:
+            relay_mod.STATE["lastError"] = why
+            relay_mod.stop()
+            return
+        relay_mod.ensure_running()
+    except Exception as exc:                                      # noqa: BLE001
+        relay_mod.STATE["lastError"] = "%s: %s" % (type(exc).__name__, exc)
 
 
 def _netguard_cache() -> dict:

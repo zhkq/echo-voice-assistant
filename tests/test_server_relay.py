@@ -156,6 +156,29 @@ class _FakeAuth:
         return {"client_id": cid, "scopes": "", "token_version": 1, "disabled": 0}
 
 
+def setUpModule():
+    """快照 `app.paths` 的取值源。
+
+    `create_app()` 里的 `install_paths_seam` 是**进程内全局** Monkey-patch：
+    不还原会连累排在后面的测试文件（2026-09-24 真出过事故，护栏就是
+    `tests/test_server_contract.py::PathsSeamTests`）。这里与 `_AppCase` 同一个手法。
+    """
+    from app import paths
+    global _PATHS_SEAM
+    _PATHS_SEAM = getattr(paths, "_settings_get", None)
+
+
+def tearDownModule():
+    from app import paths
+    if _PATHS_SEAM is None:
+        try:
+            delattr(paths, "_settings_get")
+        except AttributeError:
+            pass
+    else:
+        paths._settings_get = _PATHS_SEAM
+
+
 def _app(hub=None, tokens=None):
     """建 app：**不跑 lifespan**（中继不需要模型池），state 里塞假的鉴权与中枢。"""
     app = server_main.create_app(_cfg())
@@ -186,10 +209,15 @@ class HttpSurfaceTests(unittest.TestCase):
 
     def test_status_lists_who_is_online(self):
         self.client.post("/v1/relay/host/poll", json={"wait": 0.01}, headers=HOST_HDR)
-        r = self.client.get("/v1/relay/status")
+        r = self.client.post("/v1/relay/status", headers=HOST_HDR)
         self.assertEqual(200, r.status_code)
         hosts = r.json()["hosts"]
         self.assertEqual(["host1"], [h["hostId"] for h in hosts])
+
+    def test_status_needs_a_token(self):
+        """它有主机名与 hostId（= 往哪台电脑转发的钥匙），不该匿名公开。"""
+        r = self.client.post("/v1/relay/status")
+        self.assertEqual(401, r.status_code)
 
     def test_the_host_endpoints_need_a_valid_token(self):
         for path in ("/v1/relay/host/poll", "/v1/relay/host/result"):
@@ -201,7 +229,7 @@ class HttpSurfaceTests(unittest.TestCase):
     def test_a_bearer_from_another_client_cannot_impersonate(self):
         """拿着"手机"的令牌来挂主机通道 → 认成 phone，不是 host1。"""
         self.client.post("/v1/relay/host/poll", json={"wait": 0.01}, headers=PHONE_HDR)
-        hosts = self.client.get("/v1/relay/status").json()["hosts"]
+        hosts = self.client.post("/v1/relay/status", headers=HOST_HDR).json()["hosts"]
         self.assertEqual(["phone"], [h["hostId"] for h in hosts])
 
     def test_paths_outside_the_allowlist_are_403(self):

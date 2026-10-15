@@ -307,9 +307,18 @@ def _client_ip(request: Request) -> str:
 
 # ---------------------------------------------------------------- 路由
 
-@router.get("/status")
+@router.post("/status")
 def relay_status(request: Request):
-    """谁挂在中继上（面板/管理面看这个）。**不含任何业务内容。**"""
+    """谁挂在中继上（面板/管理面/运维看这个）。**不含任何业务内容，但要凭据。**
+
+    为什么是 POST + 要凭据（而不是顺手写成免凭据的 GET）：它含**主机名与 hostId**，
+    而中继的 hostId 正是"往哪台电脑转发"的钥匙 —— 匿名公开等于给扫描器一张地图。
+    （另一条硬约束：能力面的 GET 端点在这套契约里必须是**公开**的，
+    见 `tests/test_backend_pairing.py::test_every_other_endpoint_rejects_an_anonymous_request`
+    —— 那条用例会把"匿名可达的 GET"全列出来。要凭据就得走 POST。）
+    """
+    from server.routes import client_of
+    client_of(request, need_scope="")
     return {"ok": True, "hosts": _hub(request).snapshot(),
             "callTimeoutSec": int(_hub(request).call_timeout_s)}
 
