@@ -15,6 +15,12 @@
       清单.txt                         ← 里面有什么、每个 zip 干什么用、后端那两个问题怎么答
     dist/ECHO-delivery-<stamp>.zip     ← 上面那个资料夹的 zip（`--no-zip` 可跳过）
 
+**离线包是个开关（`--no-offline`，2026-10-16 加）**：`dist/` 里躺着后端离线包（3.1 GB）时，
+默认**带**它 —— 那一层 ≈3.4 GB；但"纯客户端"那档（先配对别人的 GPU）本应只有 ≈432 MB。
+所以给了 `--no-offline`：**只影响这一层放不放离线包**，`清单.txt` 会如实写"这一层不含离线包"。
+两个场景里只有 `client` 能配它：`full-local` 的语义是"**零下载**"（必须带离线包 + 权重），
+两个一起给就是自相矛盾 —— **报错**，不静默忽略其中一个。
+
 **为什么脚本能"自己解压"**：`装我.cmd`（模板 `delivery/kit-install.cmd`）有两种形态 ——
 旁边已经解开了 `echo-core\\` 就直接装；只有 `ECHO-kit-*.zip` 就 `tar -xf` 到
 `.\\echo-kit\\` 再装。所以同事不需要右键解压，双击就完事。
@@ -231,7 +237,7 @@ def offline_pack_has_weights(zip_path: Path) -> bool:
 
 
 def write_manifest(dest: Path, kit: Path, thin: Path | None, offline: Path | None,
-                   apk: Path | None = None) -> None:
+                   apk: Path | None = None, no_offline: bool = False) -> None:
     lines = [
         "这份资料夹里有什么（双击 `装我.cmd` 就装，不用手工解压）",
         "=" * 56,
@@ -248,8 +254,16 @@ def write_manifest(dest: Path, kit: Path, thin: Path | None, offline: Path | Non
     if apk:
         lines.append("%-28s 手机触点 APK（Android）：拷到手机点一下装，配对后当遥控器用"
                      % apk.name)
+    if not offline and no_offline:
+        # 清单是同事**唯一**的"这层里有什么"的凭据：不含离线包就必须写出来。
+        # 不然他会照着"本机自己跑 = 零下载"去装，然后在网速里等 3 GB（假话比缺件更贵）。
+        lines.append("（这一层**不含后端离线包**：装了它**本机跑后端要联网下依赖** ≈3 GB"
+                     "—— 纯客户端那档足够）")
     if not thin and not offline:
         lines.append("（没有后端 zip：装完在面板「能力 → 起本机后端」里配）")
+    if no_offline:
+        lines.append("                              要「零下载」就重出一层（去掉 --no-offline，"
+                     "那层 ≈3.4 GB），或把 ECHO-backend-offline-*.zip 放进这一层")
     lines += [
         "先读我.md                     就是这份说明的展开版",
         "",
@@ -312,21 +326,39 @@ def assemble(stamp: str, dist: Path, kit_zip: Path | None = None,
              apk_zip: Path | None = None, no_apk: bool = False,
              make_the_zip: bool = True, out_dir: Path | None = None,
              scenario: str = "client", allow_no_bundle: bool = False,
-             allow_downloads: bool = False) -> tuple[Path, Path | None]:
+             allow_downloads: bool = False, no_offline: bool = False
+             ) -> tuple[Path, Path | None]:
     """组出一层交付资料夹（+ 可选的外层 zip）→ ``(dir, zip 或 None)``。失败**响亮**、不留半个包。
 
     ``out_dir``（用户 2026-10-01 要的形态）：把这一层建在**用户的交付目录**下，而不是 `dist/` ——
     `--out D:\\ECHO-delivery` 得到 `D:\\ECHO-delivery\\ECHO-delivery-<stamp>\\…`。
     **那层带日期/时间的目录名是刻意的**（用户原话："加一层交付日期编码，区分不同版本"）：
     同一个交付目录里可以并存好几版，同事拿到哪一个一眼能看出是哪天的。
+
+    ``no_offline``：**这一层**不放后端离线包（纯客户端那档：`dist/` 里躺着 3.1 GB 的离线包时，
+    默认会一起带上 → 整层 ≈3.4 GB，而"先配对别人的 GPU"那档本来只要 ≈432 MB）。
+    它**只管这一层放不放文件**，别的行为一字不变；`清单.txt` 会如实写"这一层不含离线包"
+    （否则清单就成了"说有、目录里没有"的假话）。与 `full-local` **互斥**（见下面的报错）。
     """
+    # --no-offline 与 full-local 是**互相矛盾**的两个要求：full-local 的语义就是
+    # "零下载"（必须带离线包 + 权重），而 --no-offline 要求不带。这里**明确报错**，
+    # 不静默丢掉其中一个 —— 静默的结果一定是"同事拿到一层装不上的包"（最贵的那种错）。
+    if no_offline and scenario == "full-local":
+        raise DeliveryError(
+            "--no-offline 与 --scenario full-local **互相矛盾**：full-local 的语义是"
+            "「那台机器零下载」（必须带后端离线包 + 权重），\n"
+            "     而 --no-offline 要求这一层**不带**离线包 —— 两个要求不可能同时满足。\n"
+            "     二选一：纯客户端那档就 --scenario client --no-offline（≈432 MB）；\n"
+            "     要零下载就别给 --no-offline（≈3.4 GB，再带权重就是 full-local ≈8 GB）。")
     kit = kit_zip or default_kit_zip(dist)
     if kit is None or not kit.is_file():
         raise DeliveryError(
             "没有客户端主包（kit zip）。先跑 `python scripts\\build_kit.py`，"
             "或用 --kit 指定一个 —— 资料夹里少了它，装我.cmd 就成了空壳。")
+    # `--no-offline` 就是**在这里把离线包摘掉**：后面所有分支（自检 / 复制 / 清单）看的是同一个
+    # `offline`，所以不必到处加 if —— 也就不会漏掉某一处、留下"清单说有、目录里没有"的假话。
     thin = backend_zip or newest_matching(dist, BACKEND_THIN_GLOBS)
-    offline = offline_zip or newest_matching(dist, BACKEND_OFFLINE_GLOBS)
+    offline = None if no_offline else (offline_zip or newest_matching(dist, BACKEND_OFFLINE_GLOBS))
     apk = None if no_apk else (apk_zip or default_apk(dist))
     if apk is not None and not apk.is_file():
         raise DeliveryError("给的 APK 不存在：%s" % apk)
@@ -406,7 +438,7 @@ def assemble(stamp: str, dist: Path, kit_zip: Path | None = None,
             shutil.copy2(apk, apk_dest)
         if README_TEMPLATE.is_file():
             shutil.copy2(README_TEMPLATE, dest / build_kit.KIT_README)
-        write_manifest(dest, kit, thin, offline, apk_dest)
+        write_manifest(dest, kit, thin, offline, apk_dest, no_offline=no_offline)
         out_zip = parent / ("%s-%s.zip" % (PKG_PREFIX, stamp)) if make_the_zip else None
         if out_zip is not None:
             build_kit.make_zip(dest, out_zip, dest.name)      # 条目带顶层前缀（缺了会散成一堆）
@@ -431,6 +463,15 @@ def main(argv: list[str] | None = None) -> int:
                     help="允许出没有 bundle 的裸 kit（只给排障用；正式交付不要用）")
     ap.add_argument("--allow-downloads", action="store_true",
                     help="full-local 时允许后端离线包不带权重（那台机器要联网下模型）")
+    ap.add_argument("--no-offline", action="store_true",
+                    help="这一层**不带**后端离线包 —— 纯客户端那档用（先配对别人的 GPU）。"
+                         "为什么要有它：dist 里有离线包（3.1 GB）时默认会一起带上，"
+                         "整层就从 ≈432 MB 变成 ≈3.4 GB，而「纯客户端」根本用不到那 3 GB；"
+                         "以前只能手工把离线包移出 dist（手工活，必漂）。"
+                         "它只管这一层放不放文件，别的行为一字不变，"
+                         "清单.txt 会如实写「这一层不含离线包」。"
+                         "**不能与 --scenario full-local 同时给**：那个场景的语义是"
+                         "「零下载」（必须带离线包 + 权重），两个一起给是矛盾的，会直接报错")
     ap.add_argument("--apk", default="", metavar="PATH",
                     help="手机触点 APK（默认取 dist\\ECHO-android-*.apk；没有就取 "
                          "android\\app\\build\\outputs 下最新的那份）")
@@ -453,6 +494,7 @@ def main(argv: list[str] | None = None) -> int:
             scenario=args.scenario,
             allow_no_bundle=bool(args.allow_no_bundle),
             allow_downloads=bool(args.allow_downloads),
+            no_offline=bool(args.no_offline),
             kit_zip=Path(args.kit).resolve() if args.kit else None,
             backend_zip=Path(args.backend).resolve() if args.backend else None,
             offline_zip=Path(args.backend_offline).resolve() if args.backend_offline else None,
