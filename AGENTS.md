@@ -684,3 +684,25 @@ pyannote 4.0.7 在 cu126 上装得上也跑得动（600 秒音频约 26.7 秒，
   `if k not in DEFAULTS: continue`，PUT 会被**静默丢掉**。`dailyReviewPrePrompt` 的注释原来写着
   "想改文案可以设隐藏设置 dailyReviewPrePrompt"，**那句是不成立的**；现已把 `dailyReviewPrePrompt` /
   `dailyReviewPromptNext` 都声明成 `hidden=True`（值留空 = 用代码里的内置模板）。新加隐藏项照这个来。
+
+### 中继（relay）：手机与电脑互相连不通时经能力后端中转（2026-10-15 用户拍板）
+
+- **现场**：公司内网里手机与办公电脑**互通受限**（AP 隔离 / 跨网段 / 入站被拦），
+  但两边都能连到那台能力后端（`aeros.zetone.cn:8900`）。用户原话："我们可以都连接后端来中转吗"。
+- **做法**：电脑**主动出站**去后端取活（长轮询，**不引新依赖**、可 curl 调），手机的请求经后端转进来。
+  三处：`server/relay.py`（主机取活/交结果 + 手机入口 + 白名单 + 限流）、
+  `app/relay.py`（常驻线程执行 + 退避重连）、安卓**一行不改**（配对页把地址填成中继地址即可）。
+  设置 `relayEnabled`（**默认关**，面板与服务组）+ `GET /api/relay`（状态 + 手机该填的地址）。
+- ⚠️ **一条必须成对不变的安全命门**：电脑侧转发时带 `X-Echo-Relay`，
+  而 `app/api.py::_is_loopback_call()` 见到它**不许再把回环当免检**。
+  少了任何一半，中继就是**绕过令牌的后门**（请求从 127.0.0.1 进来，本机豁免把鉴权整个跳过）。
+  判据：`tests/test_relay_host.py::LoopbackExemptionTests`。
+- 另外三条口径：**hostId 取自已认证的 client_id**（不接受自报，否则能冒充别人的主机）；
+  **只放行 `/health` 与 `/api/*`**（两处都判，且挡 `..`）；**开中继的前提是
+  `apiAuthEnabled=true`**（回环免检 + 鉴权关着 = 把电脑敞开），不满足时 `ready()` 如实说原因。
+- **这条改掉了 2026-10-09 的那个决定**（`docs/手机触点-App设计.md`："不把 ECHO 暴露到公网、
+  不做内网穿透"）—— 用户 2026-10-15 明确接受该取舍，于是做成**默认关、手动开**；
+  老文档那一处已加日期批注，以 `docs/中继-手机经后端中转.md` 为准。
+- **部署**：后端要带 `server/relay.py`（薄包已重出：`dist\ECHO-backend-portable-20261015-1051.zip`，
+  或只换 `relay.py` + `main.py` 两个文件重启容器）；中枢是**单进程内存态**，
+  **后端必须单 worker**（`Dockerfile` 的 CMD 就是一个进程），多 worker 会随机 503。

@@ -100,6 +100,13 @@ fun PairScreen(onPaired: () -> Unit) {
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.fillMaxWidth(),
             )
+            Text(
+                "连不上电脑时（公司网里手机与电脑互通受限）：在电脑上打开「允许手机经后端中转」，" +
+                    "把面板显示的那串中继地址填到这里（形如 http://后端/v1/relay/…/）。",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.fillMaxWidth(),
+            )
             Spacer(Modifier.height(12.dp))
             OutlinedTextField(
                 value = code,
