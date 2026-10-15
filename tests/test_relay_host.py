@@ -316,5 +316,45 @@ class LoopbackExemptionTests(unittest.TestCase):
         self.assertFalse(api_mod._is_loopback_call(self._req(marked, peer="203.0.113.9")))
 
 
+class PairingThroughRelayTests(unittest.TestCase):
+    """走中继配对时，回给手机的 `baseUrl` 必须是**它这次用的中继地址**。
+
+    回局域网地址的话，手机配对完立刻失联 —— 它正是因为连不上局域网才走的中继
+    （这是"配好了却一直连不上"里最难查的一种）。
+    """
+
+    def _req(self, marked=True):
+        from types import SimpleNamespace
+        headers = {"host": "127.0.0.1:8970"}
+        if marked:
+            headers[relay_mod.RELAY_MARKER_HEADER] = "1"
+        return SimpleNamespace(headers=headers, client=SimpleNamespace(host="127.0.0.1"),
+                               url=SimpleNamespace(path="/api/pair/phone/claim"))
+
+    def test_relayed_pairing_gets_the_relay_url(self):
+        from app import api as api_mod
+        from unittest import mock
+        with mock.patch.object(relay_mod, "public_url",
+                               lambda: "http://be.example:8900/v1/relay/cli-1/"):
+            self.assertEqual("http://be.example:8900/v1/relay/cli-1",
+                             api_mod._phone_base_url(self._req()))
+
+    def test_relayed_pairing_gets_nothing_when_the_relay_url_is_unknown(self):
+        """认不出中继地址时回**空串**：客户端有"服务端没给就用我自己填的"兜底，
+        宁可不给，也不能给一个连不上的局域网地址。"""
+        from app import api as api_mod
+        from unittest import mock
+        with mock.patch.object(relay_mod, "public_url", lambda: ""):
+            self.assertEqual("", api_mod._phone_base_url(self._req()))
+
+    def test_a_local_pairing_still_gets_the_lan_address(self):
+        from app import api as api_mod
+        from app import netguard, ports
+        from unittest import mock
+        with mock.patch.object(netguard, "preferred_address", lambda: "192.168.1.5"), \
+             mock.patch.object(ports, "active_port", lambda *a, **k: 8970):
+            self.assertEqual("http://192.168.1.5:8970", api_mod._phone_base_url(self._req(False)))
+
+
 if __name__ == "__main__":
     unittest.main()

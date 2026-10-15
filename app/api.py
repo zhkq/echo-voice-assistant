@@ -2721,13 +2721,28 @@ def get_events(limit: int = 100, _auth=Depends(optional_auth)):
 # 令牌不再出现在二维码里（拍到截图 = 拿到一把无寿命的凭据），而**没有摄像头**的设备
 # （HUAWEI WATCH 4 Pro）也照样能配。理由与算术见 app/phone_pair.py 顶部。
 
-def _phone_base_url() -> str:
+def _phone_base_url(request=None) -> str:
     """该告诉手机 / 手表连哪个地址（**没有可用地址就回空串，不许编一个**）。
 
     端口取 `ports.active_port()`（**实际**在听的那个），不是配置里的首选值：
     端口让过位的时候（Windows 保留段 / 被占用），写配置值会让手机连到没人听的端口上，
     现象是"配对成功但一直连不上"（2026-09-20 面板就踩过同一个坑）。
+
+    **中继进来的请求（2026-10-15）**：要告诉手机的**不是**这台机器的局域网地址
+    —— 手机与这台电脑互相连不通才走的中继，回一个局域网地址等于配对完立刻失联。
+    这时该回它**这次用的那串中继地址**（`app/relay.py::public_url()`，
+    = 后端地址 + `/v1/relay/<hostId>/`）。认不出就回空串：
+    客户端那边有"服务端没给地址就用我自己填的那个"的兜底（`PairViewModel.claim`），
+    宁可不给，也不能给一个连不上的地址。
     """
+    if request is not None and (request.headers.get(relay_mod.RELAY_MARKER_HEADER) or "").strip():
+        try:
+            url = relay_mod.public_url()
+            if url:
+                return url.rstrip("/")
+        except Exception:                                         # noqa: BLE001 - 认不出就当没有
+            pass
+        return ""
     host = netguard.preferred_address()
     if not host:
         return ""
@@ -2786,7 +2801,7 @@ def phone_pair_issue(request: Request, _auth=Depends(optional_auth)):
 
 
 @router.post("/pair/phone/claim")
-def phone_pair_claim(body: PhoneClaimIn):
+def phone_pair_claim(body: PhoneClaimIn, request: Request):
     """设备用配对码换令牌。**唯一一个不带令牌的接口**（也是唯一能从网上调的配对口）。
 
     守卫是三条（算术见 `app/phone_pair.py` 顶部）：码只有 6 位、5 分钟寿命、用掉即删，
@@ -2801,7 +2816,7 @@ def phone_pair_claim(body: PhoneClaimIn):
         raise HTTPException(status_code=403, detail=why)
     row = db.add_api_key_row(name, scopes=["device"])
     return {"ok": True, "token": row.get("token", ""), "keyId": row.get("id"),
-            "name": row.get("name", name), "baseUrl": _phone_base_url(),
+            "name": row.get("name", name), "baseUrl": _phone_base_url(request),
             "note": "令牌只出现这一次，请设备侧立刻存进安全存储"}
 
 
