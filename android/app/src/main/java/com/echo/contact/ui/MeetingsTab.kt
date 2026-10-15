@@ -276,7 +276,12 @@ private fun MeetingDetailView(
                 }
             }
             Spacer(Modifier.height(8.dp))
-            LazyColumn { item { Text(text, style = MaterialTheme.typography.bodySmall) } }
+            // 三份正文（转写/纪要/主题）都走同一个极简排版解析：标题、列表、分段、加粗。
+            // 这一页是 `Column` 打底、只有这个 LazyColumn 能滚，所以**一个 Block 一条 item**
+            // 继续懒加载；`Column + MeetingBlocks` 那种写法会在这里**滚不动**（长文直接看不到尾）。
+            LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                items(parseMeetingText(text)) { parseMeetingBlock -> MeetingBlock(parseMeetingBlock) }
+            }
         }
         return
     }
@@ -415,7 +420,9 @@ private fun MeetingDetailView(
                                 )
                             }
                         }
-                        Text(line.text, style = MaterialTheme.typography.bodySmall)
+                        // 正文按**对话**排：若行里自带 `[时间] 说话人：` 前缀就弱化前缀、
+                        // 加重内容；认不出前缀就整行当正文。原文一个字不动（只是笔画与颜色）。
+                        DialogueLine(line.text)
                     }
                 }
             }
