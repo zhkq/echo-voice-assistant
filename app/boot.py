@@ -206,6 +206,23 @@ def _run_boot():
     except Exception:
         pass
 
+    # 中继（2026-10-15）：手机与这台电脑互相连不通时，借能力后端中转。
+    # **默认关**（`relayEnabled`）—— 不开时这里什么都不做（一个请求都不发）。
+    # 它是个纯常驻线程（poll → 本机执行 → 交回），失败自己退避，不参与下面的组件 settle。
+    try:
+        from app import relay as relay_mod
+        if relay_mod.enabled():
+            ok, why = relay_mod.ready()
+            if ok:
+                relay_mod.ensure_running()
+            else:
+                db.add_log("warn", "relay", "中继没起来：%s" % why)
+    except Exception as e:                                        # noqa: BLE001 - 中继不许拦启动
+        try:
+            db.add_log("warn", "relay", "中继启动异常：%s" % e)
+        except Exception:
+            pass
+
     # 阶段 1：轻量组件（秒级）并行 —— 模型路由先确保起来，DSH 随时可能被调用
     _spawn(["failover", "dsh", "tts", "hotkey", "meeting"])
     # 阶段 1b：独立 harness（选了它才真拉起来；没选就是一行 disabled，不等它）

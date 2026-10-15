@@ -117,6 +117,20 @@ def _token_from_settings() -> str:
     return str(_setting("capabilityEchoServerStaticToken", "") or "").strip()
 
 
+def backend_endpoint(slot: str = "") -> tuple:
+    """`(后端地址, Authorization 头)` —— 给**不是能力调用**的模块复用（如主机侧中继）。
+
+    为什么要有这个公共入口：中继也要连同一台后端、用同一套凭据，而"地址从哪来、
+    令牌怎么换、401 怎么重试"这三件事**只该有一份实现**（`_base_url_from_settings`
+    + `_auth_header`）。中继自己再写一遍，两份迟早会漂移 —— 而漂移的表现是
+    "能力调用好好的、中继却 401"，查起来很贵。
+
+    返回空 Authorization 是**合法**的（服务端可能没开鉴权）；调用方不要自己猜。
+    """
+    client = EchoServerClient()
+    return client.base_url, client._auth_header(slot=slot)
+
+
 class EchoServerClient(CapabilityClient):
     """服务端的一个连接。构造时不联网 —— 联网发生在 `refresh()` / 第一次调用。
 

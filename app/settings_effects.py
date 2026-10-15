@@ -110,7 +110,32 @@ def apply(updated, *, harness_timeout=None) -> list:
     if any(k in ("serverBindMode", "serverLanHost") for k in keys):
         out.append(_netguard_cache())
 
+    # 中继（2026-10-15）：开了就起线程、关了就把线程停掉。
+    # 为什么要联动而不是"等下次启动"：开关的语义就是"现在开始中转"，
+    # 而它要**先过 ready()**（得有后端配对 + 已开 API 鉴权）—— 没过就说清为什么。
+    if "relayEnabled" in keys:
+        out.append(_relay())
+
     return out
+
+
+def _relay() -> dict:
+    """中继开关变更后的起停 + 就绪检查。"""
+    try:
+        from app import relay as relay_mod
+        if not relay_mod.enabled():
+            relay_mod.stop()
+            return {"scope": "relay", "ok": True, "detail": "中继已关闭"}
+        ok, why = relay_mod.ready()
+        if not ok:
+            relay_mod.stop()
+            return {"scope": "relay", "ok": False, "detail": "中继没开起来：%s" % why}
+        relay_mod.ensure_running()
+        return {"scope": "relay", "ok": True,
+                "detail": "中继已启动（手机用面板上那串中继地址配对）"}
+    except Exception as exc:                                      # noqa: BLE001
+        return {"scope": "relay", "ok": False,
+                "detail": "%s: %s" % (type(exc).__name__, exc)}
 
 
 def _netguard_cache() -> dict:

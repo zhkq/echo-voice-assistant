@@ -29,6 +29,7 @@ from server import calls as calls_mod
 from server import errors as E
 from server import limits as limits_mod
 from server import ops as ops_mod
+from server import relay as relay_mod
 from server import routes as routes_mod
 from server import settings as settings_mod
 from server import tmp
@@ -268,7 +269,35 @@ def create_app(cfg=None) -> FastAPI:
             info["errorCode"] = exc.code
         return JSONResponse(status_code=exc.status, content=exc.body(), headers=headers)
 
+    @app.middleware("http")
+    async def _relay_host_identity(request: Request, call_next):
+        """中继的**主机侧**端点：把 `relay_host_id` 定成**已认证的 client_id**。
+
+        为什么必须是"认证出来的"而不是请求体里自报的：中继会把手机的请求交给
+        "那台主机"，如果 hostId 能自报，任何拿到后端令牌的人都能冒充别人的主机、
+        把别人的手机流量收走。这里定完，`relay.host_poll` 只认这个值。
+        认证不通过就留空 —— 端点会回 401（**不放行**，也不猜一个 id 出来）。
+        """
+        if request.url.path.startswith("/v1/relay/host/"):
+            client_id = ""
+            st = getattr(request.app.state, "echo", None)
+            auth = getattr(st, "auth", None) if st is not None else None
+            if auth is not None:
+                try:
+                    client = auth.authenticate(
+                        request.headers.get("authorization") or "", need_scope="")
+                    client_id = str(client.get("client_id") or "")
+                except Exception:                                 # noqa: BLE001 - 401 由端点回
+                    client_id = ""
+            request.state.relay_host_id = client_id
+        return await call_next(request)
+
     app.include_router(routes_mod.router)
+    # 中继（relay）：手机与主机互相连不通时，借这台服务器中转（见 server/relay.py）。
+    # 中枢是**进程级内存态** —— 与部署形态（单进程，见 Dockerfile 的 CMD）一致；
+    # 将来改多 worker 必须换成外部登记，否则会出现"手机连 A、主机挂 B"的随机 503。
+    app.state.relay_hub = relay_mod.HUB
+    app.include_router(relay_mod.router)
     return app
 
 

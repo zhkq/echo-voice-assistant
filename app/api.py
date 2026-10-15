@@ -19,7 +19,7 @@ from starlette.background import BackgroundTask
 import app.db as db
 from app import __version__ as _ECHO_VERSION
 from app.config import settings
-from app import assistant, manager, meeting, netguard, phone_pair, ports, runtime, services, worklog
+from app import assistant, manager, meeting, netguard, phone_pair, ports, relay as relay_mod, runtime, services, worklog
 from app.audio import recorder
 from app.audio import stt as stt_mod
 from app.audio import tts as tts_mod
@@ -80,6 +80,13 @@ def _is_loopback_call(request: Request) -> bool:
     """
     host = request.headers.get("host", "")
     peer = getattr(getattr(request, "client", None), "host", "") or ""
+    # **中继进来的请求不算"本机"**（2026-10-15 relay）：
+    # 它真正的发起者是手机（可能在网上），只是最后一跳走了本机的 127.0.0.1。
+    # 少了这一条，中继就等于一个**绕过令牌的后门** —— 请求从回环进来，
+    # 下面那句 `if row is None and from_this_machine: return None` 会把鉴权整个跳过。
+    # 本机进程伪造这个头没有意义：它本来就能直接连 8970（回环豁免照旧生效）。
+    if (request.headers.get(relay_mod.RELAY_MARKER_HEADER) or "").strip():
+        return False
     if not netguard.is_loopback_host(host):
         return False
     return netguard.is_loopback_peer(peer)
@@ -878,6 +885,21 @@ def post_capture(body: CaptureIn, _auth=Depends(optional_auth)):
 @router.get("/assistant/busy")
 def get_busy(_auth=Depends(optional_auth)):
     return {"busy": assistant.is_busy(), "owner": assistant._busy_owner["name"]}
+
+
+# ---------------------------------------------------------------- 中继
+
+
+@router.get("/relay")
+def get_relay(_auth=Depends(optional_auth)):
+    """中继状态 + **手机该填的那串地址**（面板显示用）。
+
+    为什么地址要由接口给而不是让用户自己拼：`hostId` 是**后端认下来的**
+    （= 我们的 client_id，见 `server/relay.py` 的说明），我们不自报 ——
+    所以只有一次成功的 poll 之后才知道，面板得能看到"现在连没连上"。
+    """
+    from app import relay as relay_mod
+    return relay_mod.status()
 
 
 # ---------------------------------------------------------------- 每日回顾
