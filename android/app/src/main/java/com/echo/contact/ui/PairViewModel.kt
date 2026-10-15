@@ -58,10 +58,14 @@ class PairViewModel(app: Application) : BaseViewModel(app) {
         _connectionMessage.value = "正在连接…"
         viewModelScope.launch {
             try {
-                val resp = ApiClient.create(url).status()
+                // ⚠️ 打 `health`（**不要令牌**），不打 `api/status`。
+                // 2026-10-15 用户实测：过中继、或电脑开着「API 鉴权」时，`api/status` 会回 401，
+                // 而这按钮就显示"后端返回 HTTP 401" —— 看着像失败，其实地址是通的（只是还没配对、
+                // 手里没有令牌）。连通性检查就该用那条不需要凭据的探针。
+                val resp = ApiClient.create(url).health()
                 _connectionMessage.value =
                     if (resp.isSuccessful) "连通正常（HTTP ${resp.code()}）"
-                    else "后端返回 HTTP ${resp.code()}"
+                    else "通了，但后端返回 HTTP ${resp.code()}"
             } catch (e: IOException) {
                 _connectionMessage.value = "无法连接：${e.message}"
             } catch (e: Exception) {

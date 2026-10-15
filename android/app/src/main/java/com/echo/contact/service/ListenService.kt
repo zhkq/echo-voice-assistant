@@ -23,6 +23,7 @@ import androidx.core.content.ContextCompat
 import com.echo.contact.MainActivity
 import com.echo.contact.R
 import com.echo.contact.audio.EchoCancel
+import com.echo.contact.audio.EchoTtsPlayer
 import com.echo.contact.audio.InputDevices
 import com.echo.contact.audio.SystemTts
 import com.echo.contact.audio.VoiceSegmenter
@@ -76,6 +77,9 @@ class ListenService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var job: Job? = null
     private var tts: SystemTts? = null
+
+    /** 「ECHO 念」那条路的播放器（懒建；与系统 TTS 并存，按设置二选一）。 */
+    private var echoPlayer: EchoTtsPlayer? = null
 
     /** 处理 + 朗读期间置位：这期间读到的音频**不喂给分段器**（见类注释的取舍 1）。 */
     @Volatile private var paused = false
@@ -441,7 +445,7 @@ class ListenService : Service() {
                 refreshNotification(ListenState.Phase.THINKING, "正在等 ECHO 回话…")
             }
             when (val result = flow.awaitReply(heard.commandId)) {
-                is ListenFlow.Outcome.Reply -> speak(engine, result.text)
+                is ListenFlow.Outcome.Reply -> speak(engine, api, result.text)
                 is ListenFlow.Outcome.Failed -> note(result.message)
                 is ListenFlow.Outcome.Heard -> note("这次没拿到结果")
             }
@@ -457,18 +461,49 @@ class ListenService : Service() {
         }
     }
 
-    private suspend fun speak(engine: SystemTts, text: String) {
+    private suspend fun speak(engine: SystemTts, api: EchoApi, text: String) {
         if (text.isBlank()) return
+        ListenState.set(ListenState.Phase.SPEAKING, text.take(NOTIFICATION_TEXT_MAX))
+        refreshNotification(ListenState.Phase.SPEAKING, text.take(NOTIFICATION_TEXT_MAX))
+
+        // 「谁念回复」是 **App 自己的选项**（设置 → 语音）。以前这条路**写死**手机念，
+        // 于是用户选了"ECHO 念"对开车听写根本不生效（2026-10-15 发现的窟窿）。
+        // ECHO 念：`POST /api/tts` 拿字节再播；**失败如实回落手机念**并把原因写出来 ——
+        // 静默回落 = "设置了没生效"，那是最难查的一类。
+        if (SpeakPrefs.load(this) == SpeakPrefs.ENGINE_ECHO) {
+            val bytes = runCatching {
+                val resp = api.tts(com.echo.contact.data.dto.TtsRequest(text = text))
+                if (resp.isSuccessful) resp.body()?.bytes() else null
+            }.getOrNull()
+            if (bytes != null && bytes.isNotEmpty()) {
+                if (playEchoBytes(bytes)) return
+            }
+            note("ECHO 念没成，这句用手机念")
+        }
+
         if (!engine.available) {
             return note("ECHO 回话了，但这台设备的系统朗读不可用（回复在通知里）")
         }
-        ListenState.set(ListenState.Phase.SPEAKING, text.take(NOTIFICATION_TEXT_MAX))
-        refreshNotification(ListenState.Phase.SPEAKING, text.take(NOTIFICATION_TEXT_MAX))
         withTimeoutOrNull(30_000) {
             suspendCancellableCoroutine { cont ->
                 engine.speak(text) { if (cont.isActive) cont.resume(Unit) }
             }
         }
+    }
+
+    /** 播 ECHO 给的音频字节（audio/mpeg）。返回 false = 没播成（调用方回落到手机念）。 */
+    private suspend fun playEchoBytes(bytes: ByteArray): Boolean {
+        val player = echoPlayer ?: EchoTtsPlayer(this).also { echoPlayer = it }
+        val file = runCatching {
+            kotlinx.coroutines.withContext(Dispatchers.IO) { player.cache(bytes, "audio/mpeg") }
+        }.getOrNull() ?: return false
+        withTimeoutOrNull(30_000) {
+            suspendCancellableCoroutine { cont ->
+                runCatching { player.play(file) { if (cont.isActive) cont.resume(Unit) } }
+                    .onFailure { if (cont.isActive) cont.resume(Unit) }
+            }
+        }
+        return true
     }
 
     /** 失败但**继续听**：只把原因写进状态与通知（用户看得到，也不会因此丢掉整个服务）。 */
@@ -503,6 +538,8 @@ class ListenService : Service() {
         aec = null
         runCatching { tts?.shutdown() }
         tts = null
+        runCatching { echoPlayer?.stop() }
+        echoPlayer = null
         if (j != null) {
             scope.launch { j.cancelAndJoin() }
         }
