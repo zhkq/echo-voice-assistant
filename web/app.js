@@ -4619,7 +4619,11 @@ document.addEventListener("click", (e) => {
   function _agentLink(ag) {
     const name = String((ag && (ag.name || ag.agent)) || "");
     if (name === "harness" && ag && ag.online) {
-      return { post: "/api/control/harness/browser", title: "在浏览器打开标准版 harness 界面" };
+      // ⚠️ 这里的地址一度写成 api/control/harness/browser —— 那条**路由根本不存在**，
+      // 于是仪表盘 Agent 那格的 ↗ 点了**什么也不发生**（实测 404，2026-10-15 用户报的
+      // "agent 网页的链接要跳到 dsh 标准版的网页"）。判据在 `tests/test_panel_api_links.py`：
+      // 面板里每个 post: 链接都要在路由表里。
+      return { post: "/api/harness/browser", title: "在浏览器打开标准版 harness 界面" };
     }
     return { href: "?view=agent", title: "去「智能体」页看它是哪个、怎么切" };
   }
