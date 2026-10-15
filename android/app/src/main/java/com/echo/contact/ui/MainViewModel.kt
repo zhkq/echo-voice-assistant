@@ -3,10 +3,13 @@ package com.echo.contact.ui
 import android.app.Application
 import androidx.lifecycle.viewModelScope
 import com.echo.contact.audio.EchoTtsPlayer
+import com.echo.contact.audio.MeetingAudio
+import com.echo.contact.audio.MeetingAudioPlayer
 import com.echo.contact.audio.Recorder
 import com.echo.contact.audio.SpeechInput
 import com.echo.contact.audio.SystemTts
 import com.echo.contact.data.ApiClient
+import com.echo.contact.data.MeetingAudioFetcher
 import com.echo.contact.data.PairStore
 import com.echo.contact.data.dto.CommandItem
 import com.echo.contact.data.dto.CommandRequest
@@ -33,6 +36,7 @@ import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.MultipartBody
 import okhttp3.RequestBody.Companion.toRequestBody
 import retrofit2.HttpException
+import java.io.File
 import java.io.IOException
 
 /** 一条指令从"点发送"到"看到结果"的可见阶段。 */
@@ -376,6 +380,80 @@ class MainViewModel(app: Application) : BaseViewModel(app) {
     private val _meetingFile = MutableStateFlow<Pair<String, String>?>(null)   // kind to text
     val meetingFile: StateFlow<Pair<String, String>?> = _meetingFile.asStateFlow()
 
+    // ---- 会议音频分段播放（阶段6c）----
+    //
+    // 主机上录音是**按段存的**（01.flac、02.flac…），后端 `GET /meetings/{id}/audio?seg=N`
+    // 一次给一段（还支持 Range）。手机上听一段是合理的事，"把一小时会议从头播到尾"不是
+    // —— 所以这里只做"第几段 / 上一段 / 下一段"，并把"在取/在放/放完了/出错"如实显示。
+    private val audioPlayer: MeetingAudioPlayer by lazy { MeetingAudioPlayer(getApplication()) }
+
+    /** 正在放/正要放的段（0 = 没在放）；界面据此高亮与判断"上一段/下一段"。 */
+    private val _audioSeg = MutableStateFlow(0)
+    val audioSeg: StateFlow<Int> = _audioSeg.asStateFlow()
+
+    private val _audioState = MutableStateFlow("")
+    val audioState: StateFlow<String> = _audioState.asStateFlow()
+
+    private val _audioPlaying = MutableStateFlow(false)
+    val audioPlaying: StateFlow<Boolean> = _audioPlaying.asStateFlow()
+
+    private var audioJob: Job? = null
+
+    /** 放这一场会议的第 [seg] 段（1 起）。取音频 → 播；失败原因直接给界面。 */
+    fun playMeetingSegment(mid: Int, seg: Int, total: Int) {
+        audioJob?.cancel()
+        audioPlayer.onState = { state, message ->
+            _audioPlaying.value = state == MeetingAudioPlayer.State.PLAYING
+            _audioState.value = when (state) {
+                MeetingAudioPlayer.State.LOADING -> MeetingAudio.label(seg, total) + " · 正在准备…"
+                MeetingAudioPlayer.State.PLAYING -> MeetingAudio.label(seg, total) + " · 播放中"
+                MeetingAudioPlayer.State.PAUSED -> MeetingAudio.label(seg, total) + " · 已暂停"
+                MeetingAudioPlayer.State.DONE -> MeetingAudio.label(seg, total) + " · 放完了"
+                MeetingAudioPlayer.State.ERROR -> message
+                MeetingAudioPlayer.State.IDLE -> _audioState.value
+            }
+        }
+        audioJob = viewModelScope.launch {
+            _audioSeg.value = seg
+            _audioState.value = MeetingAudio.label(seg, total) + " · 正在取音频…"
+            val fetcher = MeetingAudioFetcher(
+                api(),
+                File(getApplication<Application>().cacheDir, "meeting-audio"),
+            )
+            val file = when (val out = fetcher.fetch(mid, seg)) {
+                is MeetingAudioFetcher.Outcome.Failed -> {
+                    _audioState.value = out.message
+                    _audioPlaying.value = false
+                    return@launch
+                }
+                is MeetingAudioFetcher.Outcome.Cached -> out.file
+                is MeetingAudioFetcher.Outcome.Downloaded -> out.file
+            }
+            audioPlayer.play(file, seg)
+        }
+    }
+
+    /** 暂停/继续这一段（按钮在界面上是同一个）。 */
+    fun toggleMeetingAudio() {
+        if (audioPlayer.isPlaying) audioPlayer.pause() else audioPlayer.resume()
+    }
+
+    /** 停掉并清掉这一场的音频缓存（离开详情页时调）。 */
+    fun stopMeetingAudio(clearCacheFor: Int? = null) {
+        audioJob?.cancel()
+        audioPlayer.release()
+        _audioPlaying.value = false
+        _audioSeg.value = 0
+        _audioState.value = ""
+        if (clearCacheFor != null) {
+            runCatching {
+                File(getApplication<Application>().cacheDir, "meeting-audio")
+                    .listFiles { f -> f.name.startsWith("meeting-$clearCacheFor-seg") }
+                    ?.forEach { it.delete() }
+            }
+        }
+    }
+
     fun openMeeting(id: Int) {
         _meetingDetailLoading.value = true
         _meetingDetailNote.value = null
@@ -398,6 +476,7 @@ class MainViewModel(app: Application) : BaseViewModel(app) {
     }
 
     fun closeMeeting() {
+        stopMeetingAudio()
         _meetingDetail.value = null
         _meetingDetailNote.value = null
         _meetingFile.value = null

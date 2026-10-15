@@ -52,6 +52,9 @@ fun MeetingsTab(vm: MainViewModel) {
     val detailLoading by vm.meetingDetailLoading.collectAsState()
     val detailNote by vm.meetingDetailNote.collectAsState()
     val file by vm.meetingFile.collectAsState()
+    val audioSeg by vm.audioSeg.collectAsState()
+    val audioState by vm.audioState.collectAsState()
+    val audioPlaying by vm.audioPlaying.collectAsState()
 
     if (detail != null || detailLoading || detailNote != null) {
         MeetingDetailView(
@@ -59,10 +62,15 @@ fun MeetingsTab(vm: MainViewModel) {
             loading = detailLoading,
             note = detailNote,
             file = file,
+            audioSeg = audioSeg,
+            audioState = audioState,
+            audioPlaying = audioPlaying,
             onBack = { vm.closeMeeting() },
             onCloseFile = { vm.closeMeetingFile() },
             onOpenFile = { kind -> detail?.let { vm.loadMeetingFile(it.id, kind) } },
             onSpeak = { vm.speak(it) },
+            onPlaySeg = { seg -> detail?.let { vm.playMeetingSegment(it.id, seg, it.segmentCount) } },
+            onToggleAudio = { vm.toggleMeetingAudio() },
         )
         return
     }
@@ -221,10 +229,15 @@ private fun MeetingDetailView(
     loading: Boolean,
     note: String?,
     file: Pair<String, String>?,
+    audioSeg: Int,
+    audioState: String,
+    audioPlaying: Boolean,
     onBack: () -> Unit,
     onCloseFile: () -> Unit,
     onOpenFile: (String) -> Unit,
     onSpeak: (String) -> Unit,
+    onPlaySeg: (Int) -> Unit,
+    onToggleAudio: () -> Unit,
 ) {
     // 先把"看某个文件"这一层挡在前面（点进纪要就整页看它）
     if (file != null) {
@@ -308,6 +321,48 @@ private fun MeetingDetailView(
             if (d.hasSummary) TextButton(onClick = { onOpenFile("summary") }) { Text("看纪要") }
             if (d.hasSegments) TextButton(onClick = { onOpenFile("topics") }) { Text("看主题") }
             if (d.hasTranscript) TextButton(onClick = { onOpenFile("transcript") }) { Text("看转写原文") }
+        }
+
+        // 录音分段播放（阶段6c）：主机上按段存 flac，后端用时解码成 wav；
+        // 手机只做"第几段 / 上一段 / 下一段" —— 听一小段是合理的，把一小时会议从头播到尾不是。
+        if (d.segmentCount > 0) {
+            val cur = if (audioSeg > 0) audioSeg else 1
+            Spacer(Modifier.height(6.dp))
+            EchoCard(container = EchoPalette.Card2) {
+                Column {
+                    CardHeader(
+                        title = "录音分段",
+                        dotColor = if (audioPlaying) EchoPalette.Red else EchoPalette.Muted,
+                        trailing = com.echo.contact.audio.MeetingAudio.label(cur, d.segmentCount),
+                    )
+                    Spacer(Modifier.height(6.dp))
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        TextButton(
+                            onClick = { onPlaySeg(com.echo.contact.audio.MeetingAudio.prev(cur, d.segmentCount)) },
+                            enabled = cur > 1,
+                        ) { Text("上一段") }
+                        Button(onClick = {
+                            when {
+                                audioPlaying -> onToggleAudio()   // 正在放 → 暂停
+                                audioSeg > 0 -> onPlaySeg(audioSeg) // 暂停/刚放完 → 继续（缓存命中，秒开）
+                                else -> onPlaySeg(1)
+                            }
+                        }) { Text(if (audioPlaying) "暂停" else "播放") }
+                        TextButton(
+                            onClick = { onPlaySeg(com.echo.contact.audio.MeetingAudio.next(cur, d.segmentCount)) },
+                            enabled = cur < d.segmentCount,
+                        ) { Text("下一段") }
+                    }
+                    if (audioState.isNotBlank()) {
+                        MutedLine(audioState, maxLines = 2)
+                    } else {
+                        MutedLine("一段一段听；主机上的原始录音不动")
+                    }
+                }
+            }
         }
 
         Spacer(Modifier.height(4.dp))
