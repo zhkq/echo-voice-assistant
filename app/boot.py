@@ -193,6 +193,37 @@ def _spawn(cids):
         threading.Thread(target=_run_start, args=(cid,), daemon=True).start()
 
 
+def backend_security_note() -> str:
+    """后端地址**非回环且明文 http** 时返回一句告警，否则返回空串。
+
+    纯函数（只读设置 + 一个判据），所以用例不必起整个 boot 就能钉住它 ——
+    判据只有一条：`https://` 放过、回环放过、其余 `http://` 一律告警。
+    """
+    try:
+        from app.capabilities import echo_server
+        base = str(echo_server._base_url_from_settings(use_credentials=False) or "").strip()
+    except Exception:                                             # noqa: BLE001
+        return ""
+    if not base:
+        return ""
+    low = base.lower()
+    if low.startswith("https://") or not low.startswith("http://"):
+        return ""
+    try:
+        if echo_server._is_loopback(base):
+            return ""                                             # 本机回环：明文没有暴露面
+    except Exception:                                             # noqa: BLE001
+        return ""
+    return ("后端是明文 HTTP（%s）：会议音频、指令文本与手机令牌都在明路上跑。"
+            "本机回环不受影响；对外的后端建议加 TLS（见 scripts/tls/README.md）" % base)
+
+
+def _warn_plaintext_backend():
+    note = backend_security_note()
+    if note:
+        db.add_startup_note(note)
+
+
 def _run_boot():
     set_phase("booting")
     # 本地能力后端的**看门狗**（2026-10-11 用户："如果配置是本地后端，watchdog 也应该监控后端"）。
@@ -222,6 +253,16 @@ def _run_boot():
             db.add_log("warn", "relay", "中继启动异常：%s" % e)
         except Exception:
             pass
+
+    # 明文后端告警（2026-10-16）。用户当天的原话是"中继通道有什么加密措施吗"——
+    # 查下来整条链路是明文 HTTP，而"看不见"才是真问题：面板与日志里从来没人提过这件事。
+    # 判据只有一条：**后端地址不是回环、且不是 https** → 在启动说明里写出来（面板首页那条
+    # 状态卡会显示 startupNotes）。**只告警、不改配置**：地址是用户在配对时定的，
+    # 程序不替他决定走哪条路（与 capabilityPrivacy 同一条纪律）。
+    try:
+        _warn_plaintext_backend()
+    except Exception:                                             # noqa: BLE001 - 告警不许拦启动
+        pass
 
     # 阶段 1：轻量组件（秒级）并行 —— 模型路由先确保起来，DSH 随时可能被调用
     _spawn(["failover", "dsh", "tts", "hotkey", "meeting"])
