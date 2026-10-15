@@ -2915,7 +2915,7 @@ function parsePairString(text) {
 
 async function doCapabilitySetAddr() {
   const raw = (($("#capPairHost") || {}).value || "").trim();
-  if (!raw) { toast("先在上面的地址格里填后端地址（例如 aeros.zetone.cn:8900）"); return; }
+  if (!raw) { toast("先在上面的地址格里填后端地址（例如 echoserver.zhkq.online:8900）"); return; }
   try {
     const r = await api("/api/capability/address", {
       method: "POST", body: JSON.stringify({ base_url: raw }),
