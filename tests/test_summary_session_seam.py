@@ -11,6 +11,13 @@
 判据（两条）：
   1. cwd 与当前会议工作区**不一致** → 必须重建，不能复用；
   2. cwd 一致 / 探测不到 → 保持复用（别把能用的会话丢掉）。
+
+⚠️ 前提由**用例自己**摆好（2026-10-16 补，根因见 `_run` 里那段注释）：本模块
+验的是路径接缝，所以读库那两步（`db.get_meeting` / `db.get_meeting_session`）都
+在用例内打桩 —— 它**不再依赖**进程级 `db.DB_FILE` 指向的那个库。
+为什么必须这样：真机全量门禁红时，本模块 4 条用例一起报
+`sqlite3.OperationalError: no such table: meetings`（单跑却绿），
+因为 `db.get_meeting(62)` 打在了"那一刻进程共享的库"上 —— 红的地方不是坏的地方。
 """
 import os
 import sys
@@ -67,8 +74,22 @@ class SummarySessionPathSeamTests(unittest.TestCase):
         client = _FakeClient(sessions)
         # `ws` 在 `_summary_session` 里来自 `_paths.meeting_space_root()`（函数内
         # `from app import paths as _paths`），所以打桩要打在 **app.paths** 上。
+        #
+        # ⚠️ `db.get_meeting` 也必须打桩（2026-10-16 补的**前提**，修的是"全量门禁里
+        # 本模块 7 个 error、单跑却绿"）：
+        #   `_summary_session(62)` 的第一句是 `_session_key(62)` → 整数主键 →
+        #   `db.get_meeting(62)` → `SELECT * FROM meetings WHERE id=?`。本模块**没有**
+        #   自己的库（原来靠"进程级 `db.DB_FILE` 恰好指着一个建过表的库"），所以它一直在
+        #   悄悄吃**进程共享状态**：全量跑时只要那一刻的 `db.DB_FILE` 指向的库没有
+        #   `meetings` 表（文件被删过、被别的用例换到临时库/空库、或那条路径被清掉），
+        #   4 条用例就一起报 `sqlite3.OperationalError: no such table: meetings`
+        #   —— 而"坏的地方不是红的地方"，看起来像本模块的接缝逻辑坏了。
+        #   本模块验的是**路径接缝**（cwd 归一化 / 一致性判据），不是"库能不能查会议"：
+        #   把这条读库替换成固定的一行，前提就由用例自己摆好，断言一条都没放松。
         import app.paths as paths_mod
         with patch.object(paths_mod, "meeting_space_root", lambda: self.WS), \
+                patch.object(db, "get_meeting",
+                             lambda mid: {"id": mid, "name": "2026-10-08_10-00-00"}), \
                 patch.object(db, "get_meeting_session",
                              lambda mid, agent=None: {"session_id": registered_sid}), \
                 patch.object(db, "touch_meeting_session", lambda *a, **k: None), \

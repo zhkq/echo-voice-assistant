@@ -63,6 +63,18 @@ class _GuardCase(unittest.TestCase):
     def setUpClass(cls):
         super().setUpClass()
         cls.tmp = tempfile.mkdtemp(prefix="echo-txguard-")
+        #: 本类开始之前就活着的线程 —— 用来在收尾时认出"**本类**起的转写线程"。
+        #: 为什么必须记：`tearDownClass` 要把临时库拆掉，而转写线程是
+        #: `retranscribe_meeting()` 起的**真的后台线程**（`app/meeting.py` 里
+        #: `threading.Thread(target=_run, daemon=True).start()`），它跑完
+        #: `_transcribe_meeting` 之后还要走一次 `_maybe_auto_compress()` → 开库。
+        #: 不等它跑完就 `shutil.rmtree(cls.tmp)`，它就会拿**下一个用例的库**（或
+        #: 那个已被删掉的路径 → SQLite 现建一个空库）去查，报
+        #: `sqlite3.OperationalError: no such table: …` —— 2026-10-16 实测抓到两条
+        #: （`db.DB_FILE` 已经还原成真库，而钩子记下的仍指向
+        #: `…\Temp\echo-txguard-…\guard.db`，且发生时**没有任何用例在跑**）。
+        #: 红的地方不是坏的地方，正是这种"线程活得比它用的库久"的形状。
+        cls._threads_before = set(threading.enumerate())
         cls._old_db = (db.DATA_DIR, db.DB_FILE)
         db.DATA_DIR = cls.tmp
         db.DB_FILE = os.path.join(cls.tmp, "guard.db")
@@ -85,7 +97,25 @@ class _GuardCase(unittest.TestCase):
         cls.addClassCleanup(p.stop)
 
     @classmethod
+    def _drain_transcribe_threads(cls, timeout=10.0):
+        """等本类起的后台线程跑完（**必须在拆临时库之前**）。
+
+        返回超时后仍活着的线程名（正常情况下应当是空表）。这里刻意不做成"断言"：
+        收尾的目的是不让线程带着库路径跑掉，而不是把"线程慢"变成一条假红。
+        """
+        deadline = time.time() + timeout
+        while True:
+            alive = [t for t in threading.enumerate()
+                     if t not in cls._threads_before and t.is_alive()]
+            if not alive or time.time() > deadline:
+                return [t.name for t in alive]
+            time.sleep(0.02)
+
+    @classmethod
     def tearDownClass(cls):
+        # 顺序很关键：**先**收线程（它们还会开库/读设置），**再**还原库路径、删目录。
+        # 反过来就会重演上面那种"线程拿着已删的 guard.db 去查表"。
+        cls._drain_transcribe_threads()
         db.DATA_DIR, db.DB_FILE = cls._old_db
         settings._cache = None
         shutil.rmtree(cls.tmp, ignore_errors=True)
