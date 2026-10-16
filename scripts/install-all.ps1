@@ -1103,7 +1103,9 @@ function Invoke-SkillsSetup {
     # 2026-10-11（用户指出的坑）：随包技能在 <代码目录>\.dsh\skills\，而 agent 是从
     # **DSH_HOME\skills\** 读技能 —— 两个不同的目录，所以新装的机器上连随包的
     # meeting-record 都没生效。交给 ECHO 自己搬（它**只补缺、绝不覆盖**用户已有的同名技能）。
-    Step '装随包技能（回顾 / 归档 / 录音）'
+    # 2026-10-16（用户要求把"专有名词纠错机制"内置）：同一步还写**家目录与会议工作区的
+    # AGENTS.md**（机制写在里面，agent 每个会话自动加载）—— 同样只补缺，用户自己那份一个字不动。
+    Step '装随包技能与家目录说明（AGENTS.md）'
     $port = Get-EchoOwnPort
     if (-not $port) { Warn '没拿到面板端口 —— 这一步跳过；装完在面板里也能补'; EndStep '技能'; return }
     try {
@@ -1113,6 +1115,14 @@ function Invoke-SkillsSetup {
         if (@($r.skipped).Count) { Info ('已有自己的版本，保留不动：{0}' -f (@($r.skipped) -join ' / ')) }
         if (@($r.absent).Count) { Warn ('包里缺这些技能（包没打全）：{0}' -f (@($r.absent) -join ' / ')) }
         if (@($r.errors).Count) { Warn ('有几项没装成：{0}' -f (@($r.errors) -join '；')) }
+        # 说明文件那一段（老 echo-core 没有 files 这一块 → 整段跳过，别报成失败）
+        if ($r.files) {
+            if (@($r.files.installed).Count) { Ok ('已写入说明文件 {0} 项：{1}' -f @($r.files.installed).Count, (@($r.files.installed) -join ' / ')) }
+            if (@($r.files.updated).Count) { Ok ('说明文件已升到内置默认：{0}' -f (@($r.files.updated) -join ' / ')) }
+            if (@($r.files.kept).Count) { Info ('已有你自己的说明文件，保留不动：{0}' -f (@($r.files.kept) -join ' / ')) }
+            if (@($r.files.absent).Count) { Warn ('包里缺说明文件模板（包没打全）：{0}' -f (@($r.files.absent) -join ' / ')) }
+            if (@($r.files.errors).Count) { Warn ('说明文件没写全：{0}' -f (@($r.files.errors) -join '；')) }
+        }
     } catch {
         Warn ('装随包技能失败：{0}（面板 → 能力 里能看到，也能补）' -f $_.Exception.Message)
     }

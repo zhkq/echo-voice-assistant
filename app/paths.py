@@ -525,3 +525,23 @@ def shipped_skills_root() -> str:
     放在这一层是因为**安装根只能由本模块推导**（D29）；别在业务代码里用 `__file__` 或写死路径。
     """
     return os.path.join(echo_root(), ".dsh", "skills")
+
+
+def shipped_home_defaults_root() -> str:
+    """**家目录说明文件**的模板源目录：`<代码/安装根>/.dsh/home-defaults`（2026-10-16）。
+
+    里面是给"新装机器"用的默认 `AGENTS.md`（见 `.dsh/home-defaults/AGENTS.default.md` 与
+    `.dsh/home-defaults/meeting/AGENTS.default.md`）—— 落点是：
+
+      * **DSH 家目录**的 `AGENTS.md`（agent **每个会话自动加载**的全局指令）；
+      * **会议工作区**（`meetings_root()`）的 `AGENTS.md`（在会议目录里干活时的指令）。
+
+    为什么要有它：用户 2026-10-16 把「专有名词与姓名纠错机制」落在 DSH 家目录的 `AGENTS.md`
+    与会议工作区里，而**新装的机器上这两个文件本来是不存在的**（随包技能装了、机制却没有）。
+    搬运见 `app/skills_setup.py`（只补缺 / 只升级我们自己那份的旧版本）。
+
+    与 `shipped_skills_root()` **同源**（都在 `.dsh/` 下，主包白名单里有 `.dsh`），所以这里
+    **从技能目录推导**，不再写一个 `.dsh` 字面量 —— `tests/test_dsh_home_coupling.py` 里
+    「写死 .dsh 的位置总数不许变多」那条盯着这个（越少越好）。
+    """
+    return os.path.join(os.path.dirname(shipped_skills_root()), "home-defaults")
