@@ -11,6 +11,7 @@ import com.echo.contact.data.dto.DailyReviewSummary
 import com.echo.contact.data.dto.EventFeed
 import com.echo.contact.data.dto.MeetingDetail
 import com.echo.contact.data.dto.MeetingListResponse
+import com.echo.contact.data.dto.MeetingPausesRequest
 import com.echo.contact.data.dto.MeetingSegmentResponse
 import com.echo.contact.data.dto.MeetingStartPhoneResponse
 import com.echo.contact.data.dto.MeetingStatus
@@ -243,6 +244,23 @@ interface EchoApi {
     /** 静音（暂停录音：不写盘、不产生音频；暂停区间会记进那场会议的 meta）。 */
     @POST("api/meeting/pause")
     suspend fun meetingPause(): Response<CommandResponse>
+
+    /**
+     * **上报暂停区间**（用户 2026-10-17 的第③件事；服务端由另一条线同时实现）。
+     *
+     * 与 [meetingPause] 的区别很重要，别混：
+     *  * [meetingPause] 是"**让电脑那支麦暂停**"（电脑在录的那条路，一个动作）；
+     *  * 这一条是"**把手机上这段空白告诉服务端**"—— 手机自己静音时电脑根本不知道
+     *    （它不在场），不报的话会议详情里那段时间就是一段空白，而不是"被暂停过"。
+     *
+     * 契约：JSON body `{"clientId": "...", "pauses": [{"from": .., "to": ..}]}`，
+     * 相对这一场开始时间的秒数；按 `clientId` 幂等（服务端合并去重）。
+     *
+     * ⚠️ **老服务端没有这个端点**（回 404/405）。调用方（`OfflineMeetingTransport.reportPauses`）
+     * 必须把它当成"这次没报上去"而**不是**补传失败 —— 一个可有可无的上报绝不许拖垮音频补传。
+     */
+    @POST("api/meeting/pauses")
+    suspend fun meetingPauses(@Body body: MeetingPausesRequest): Response<CommandResponse>
 
     /** 恢复录音（接着写新的段）。 */
     @POST("api/meeting/resume")

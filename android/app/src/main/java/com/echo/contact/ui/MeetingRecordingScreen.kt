@@ -128,10 +128,10 @@ fun MeetingRecordingScreen(vm: MainViewModel) {
             Spacer(Modifier.height(18.dp))
 
             // ---- 大计时 ----
-            // 离线那一场：电脑不在场，`st.startedAt` 是空的 —— 用**手机本地**记的开始时间
-            // （见 MicState.startedAt 的说明），否则这里会永远停在 `--:--`。
+            // 手机麦这条路：**开始时间永远是手机自己记的**（用户 2026-10-17 合并成一条路之后，
+            // 不再有"电脑给了 startedAt 才有值"那一档），所以这里就是 `mic.startedAt`。
             Text(
-                elapsedText(if (phoneMic && mic.offline) mic.startedAt else st.startedAt),
+                elapsedText(if (phoneMic) mic.startedAt else st.startedAt),
                 style = MaterialTheme.typography.displaySmall,
                 fontWeight = FontWeight.Light,
             )
@@ -139,15 +139,14 @@ fun MeetingRecordingScreen(vm: MainViewModel) {
             MutedLine(
                 if (phoneMic) {
                     buildString {
-                        if (mic.offline) {
-                            // 离线这一场：段**不是"送出去"的，是"缓存下来"的** —— 说清楚，
-                            // 否则"已送 0 段"会让人以为一段都没录到（其实录得好好的）。
-                            append("手机麦克风（离线录音）· 已缓存 ${mic.syncPending} 段")
-                            if (mic.syncConfirmed > 0) append("（已传 ${mic.syncConfirmed} 段）")
-                        } else {
-                            append("手机麦克风 · 已送 ${mic.sent} 段")
+                        // 这条路永远是"先落本地"：说清"已缓存几段、其中几段已经传上去了"
+                        // —— 只说"已送 N 段"会让人以为本地没有副本（其实本地那份才是本体）。
+                        append("手机麦克风 · 已缓存 ${mic.syncPending} 段")
+                        if (mic.syncConfirmed > 0) append("（已传 ${mic.syncConfirmed} 段）")
+                        if (mic.formatNote.isNotBlank()) {
+                            // 格式**如实**：退回 WAV 时要说清是哪一段、为什么（用户点名要求）
+                            append(" · ${mic.formatNote}")
                         }
-                        if (mic.pending > 0) append(" · ${mic.pending} 段待重传")
                     }
                 } else {
                     buildString {
@@ -155,12 +154,12 @@ fun MeetingRecordingScreen(vm: MainViewModel) {
                         st.folder?.takeIf { it.isNotBlank() }?.let { append("　·　$it") }
                     }
                 },
-                maxLines = 1,
+                maxLines = 2,
             )
 
-            // ---- 离线那一路：**如实的一行** + 「现在同步」（用户 2026-10-16 要的）----
-            // 这一行是"音频到底有没有传上去"的唯一出口，所以它优先于下面那句待重传：
-            // 连不上时先说"ECHO 连不上、已在手机上离线录音"，绝不说成"已上传"。
+            // ---- 音频"传上去没有"：**如实的一行** + 「现在同步」----
+            // 这一行是"音频到底有没有传上去"的唯一出口：连不上时先说"ECHO 连不上、
+            // 音频先存在这台手机里"，绝不说成"已上传"。
             if (phoneMic && mic.syncNote.isNotBlank()) {
                 Spacer(Modifier.height(8.dp))
                 Row(
@@ -184,43 +183,6 @@ fun MeetingRecordingScreen(vm: MainViewModel) {
                         ) { Text("现在同步") }
                     }
                 }
-            }
-            // 为什么进了离线（**真实原因**：探活超时 / 电脑拒绝了 / 联系不上）——
-            // 说错原因会把人引去查网线，而真相可能是"电脑那边没起后端"。
-            if (phoneMic && mic.offline && mic.offlineNote.isNotBlank()) {
-                MutedLine("原因：${mic.offlineNote}", color = EchoPalette.Muted, maxLines = 2)
-            }
-
-            // ---- 待重传：**可视化 + 手动重传**（用户 2026-10-16 要的）----
-            // 以前这段只写在通知里，界面上看不到、也没法手动重传 —— 录音最怕"看着在录、其实丢了"。
-            if (phoneMic && mic.pending > 0) {
-                Spacer(Modifier.height(8.dp))
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Text(
-                        "待重传 ${mic.pending} 段",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = EchoPalette.Yellow,
-                        fontWeight = FontWeight.SemiBold,
-                        modifier = Modifier.weight(1f),
-                    )
-                    OutlinedButton(
-                        onClick = {
-                            // 复用服务里那一条重传路（不在这里另写上传逻辑）
-                            com.echo.contact.service.MeetingMicService.retryPendingNow(context)
-                        },
-                    ) { Text("立即重传") }
-                }
-            }
-            // 重传结果如实写在界面上（成功/失败/没配好都说，别静默）
-            if (phoneMic && mic.retryNote.isNotBlank()) {
-                MutedLine(
-                    "重传：${mic.retryNote}",
-                    color = if (mic.pending > 0) EchoPalette.Yellow else EchoPalette.Green,
-                    maxLines = 2,
-                )
             }
 
             Spacer(Modifier.height(28.dp))
@@ -261,11 +223,10 @@ fun MeetingRecordingScreen(vm: MainViewModel) {
             MutedLine(
                 when {
                     paused -> "恢复后接着录；暂停这段是空白，会议详情里能看到暂停区间"
-                    // 离线时**不许**说"按段传给电脑" —— 电脑根本不在场（说了就是谎报）
-                    phoneMic && mic.offline ->
-                        "ECHO 连不上，已经在手机上离线录音：按段存在这台手机里，" +
-                            "联网后（或点「现在同步」）按顺序传上去"
-                    phoneMic -> "声音来自**这台手机的麦克风**，按段传给电脑落盘；电脑那边只负责存储与转写"
+                    // 这条路永远是"先落本地、再顺手传"：说清这一点（**不**说"离线"，
+                    // 因为在线时也一样先落本地 —— 用户 2026-10-17 的原话是"没有本质区别"）
+                    phoneMic -> "声音来自**这台手机的麦克风**：每一段先存在手机里，" +
+                        "网通就顺手传给电脑（最多滞后一段），不通就留着等联网自动补传"
                     else -> "声音来自电脑那支麦克风（手机只是触点）"
                 },
                 maxLines = 2,
@@ -289,12 +250,15 @@ fun MeetingRecordingScreen(vm: MainViewModel) {
                 OutlinedButton(
                     onClick = {
                         if (phoneMic) {
-                            // 手机麦那条路：静音 = 本地丢帧 + 不上传（并把区间记进清单/会议 meta）
+                            // 手机麦：静音 = **照常录、写进去的是全零（空白）音频**，时间轴逐字
+                            // 连续、总时长不受影响（用户 2026-10-16 深夜的口径，与电脑侧统一；
+                            // 旧的"本地丢帧"已被推翻 —— 丢帧会让手机那场的时间轴在暂停期间变短）。
+                            // 这段区间**记进清单**；恢复时会把它上报给服务端
+                            // （`POST /api/meeting/pauses`）。
+                            // ⚠️ **不**再顺手调电脑的暂停接口：这条路上电脑不在场（它只负责落盘/转写），
+                            // 调它只会拿到一个失败，而失败原因会写进界面 —— 明明静音已经生效了
+                            // （把自己的缺点说成用户的错，最不该）。
                             com.echo.contact.service.MeetingMicService.setPaused(context, !paused)
-                            // 离线时**不**去调电脑的暂停接口：`meetingPause` 必失败，
-                            // 而失败原因会写进 `meetingsNote` —— 用户看到的是"操作失败"，
-                            // 明明静音已经生效了（把自己的缺点说成用户的错，最不该）。
-                            if (!mic.offline) vm.toggleMeetingPause()
                         } else {
                             vm.toggleMeetingPause()
                         }
@@ -331,8 +295,8 @@ fun MeetingRecordingScreen(vm: MainViewModel) {
             Spacer(Modifier.height(8.dp))
             MutedLine(
                 when {
-                    phoneMic && mic.offline -> "结束后音频**先留在这台手机上**，联网后自动传（也可以点「现在同步」）"
-                    phoneMic -> "结束后手机把剩下的段补传完，电脑再转写、出纪要"
+                    phoneMic -> "结束后手机把剩下的段补齐、让 ECHO 收尾（收尾之后才开始转写）；" +
+                        "传不完的会留着，联网后自动接着传（也可以点「现在同步」）"
                     else -> "结束后电脑会自动转写、出纪要（手机在会议页能看到进度）"
                 },
                 maxLines = 2, color = EchoPalette.Muted)

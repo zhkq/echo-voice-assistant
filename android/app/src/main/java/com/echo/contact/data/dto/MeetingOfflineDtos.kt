@@ -99,6 +99,31 @@ data class MeetingSegmentResponse(
 }
 
 /**
+ * `POST /api/meeting/pauses` 的请求体（用户 2026-10-17 的第③件事）。
+ *
+ * 契约（用户拍的板，两边一致）：
+ * ```json
+ * {"clientId": "phone-...", "pauses": [{"from": 12.5, "to": 31.0}]}
+ * ```
+ *  * `from` / `to`：**相对这一场开始时间**的秒数（与电脑侧 `meta["pauses"]` 同一个语义 ——
+ *    暂停 = 不写盘、不产生音频；用相对秒而不是绝对时间，暂停之后时间轴才不会跳）；
+ *  * 按 `clientId` **幂等**（服务端合并去重）→ 客户端每次把当前的整份报一遍就行。
+ *
+ * ⚠️ 为什么这里**没有** `by`（`local`/`remote`）：契约里只有 `from`/`to`。
+ * 多发的字段会被服务端静默忽略（等于没发），而"以为它在起作用"是最难查的错法
+ * —— 契约上没有的东西，客户端不发明。
+ */
+data class MeetingPausesRequest(
+    @SerializedName("clientId") val clientId: String,
+    val pauses: List<PauseDto>,
+) {
+    data class PauseDto(
+        val from: Double = 0.0,
+        val to: Double = 0.0,
+    )
+}
+
+/**
  * `GET /api/meeting/status` 的扩展字段（**同一族**，所以放在这份 response 里）。
  *
  * `clientId` / `completed` 是**希望**服务端补上的：补传时客户端要判"ECHO 现在录的那一场

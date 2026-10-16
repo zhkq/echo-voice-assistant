@@ -191,7 +191,10 @@ object OfflineMeetingRetention {
     /** 这一份能清出多少字节（**按清单里真的有的那些段文件算**；不数目录里多出来的东西）。 */
     fun audioBytes(store: MeetingDraftStore, draft: MeetingDraft): Long =
         draft.segments.sumOf { seg ->
-            val f: File = store.segmentFile(draft.clientId, seg.seq)
+            // 按清单里记的文件名找（见 MeetingDraftStore.audioFileOf）：段可能是 `.flac`
+            // 也可能是 `.wav`（编码器不可用时退回的那一档），按 seq 拼就得先猜一个格式 ——
+            // 猜错的表现是"占用永远是 0、到期了也清不掉"，用户只看到手机越来越满
+            val f: File = store.audioFileOf(draft.clientId, seg)
             try {
                 if (f.isFile) f.length() else 0L
             } catch (e: Exception) {

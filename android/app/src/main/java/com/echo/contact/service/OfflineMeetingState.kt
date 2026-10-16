@@ -1,10 +1,16 @@
 package com.echo.contact.service
 
+import com.echo.contact.audio.SegmentEncoding
+import com.echo.contact.audio.SegmentFormat
+
 /**
- * **离线录音的状态机**（纯逻辑，JVM 逐档可测）。
+ * **手机录音的状态机**（纯逻辑，JVM 逐档可测）。
  *
- * 用户 2026-10-16 的需求：*"手机如果连不上 echo 也可以进入离线状态，离线状态可以开始录音，
- * 结束录音，录音文件缓存在 app，网络通了就可以传上去"*。
+ * 用户 2026-10-16 的需求是*"手机如果连不上 echo 也可以进入离线状态，离线状态可以开始录音，
+ * 结束录音，录音文件缓存在 app，网络通了就可以传上去"*；2026-10-17 用户又把它收成一条：
+ * *"离线录音和在线录音就没什么本质区别了"*。于是状态机里**没有**"在线/离线"两条路 ——
+ * 只有一条：**本地先写**（[OfflinePhase.RECORDING_LOCAL]），网络好不好只决定
+ * "顺手传上去的那一下"成不成（[OfflinePhase.UPLOADING] / [OfflinePhase.UNREACHABLE] / …）。
  *
  * 这里把那条路上**所有会静默出错的判断**都抽成纯函数（状态迁移、退避、选段、对账、
  * 抢占判定、文案），因为它们的错法都是"看着没事"：
@@ -17,11 +23,12 @@ package com.echo.contact.service
 // --------------------------------------------------------------------------- 状态
 
 /**
- * 离线录音的状态。
+ * 录音与补传的状态。
  *
  * 迁移（`OfflineMeetingStateTest` 逐条钉住）：
  * ```
- *  (没有清单) ──开始录音（ECHO 不可达）──▶ [RECORDING_LOCAL]
+ *  (没有清单) ──开始录音（**只动本地**，与网络无关）──▶ [RECORDING_LOCAL]
+ *  [RECORDING_LOCAL] ──每封一段顺手试传（网通）──▶ 段被服务端认下（水位前进，仍在录）
  *  [RECORDING_LOCAL] ──结束录音──▶ [WAITING_UPLOAD]
  *  [WAITING_UPLOAD] ──「现在同步」/ 自动重试──▶ [UPLOADING]
  *  [UPLOADING] ──对账通过 **且 stop 成功**──▶ [DONE]
@@ -31,19 +38,25 @@ package com.echo.contact.service
  *  [UPLOADING] ──对账不符/服务端拒绝──▶ [FAILED]（**不删缓存**、如实报原因）
  *  [FAILED] ──「现在同步」──▶ [UPLOADING]
  * ```
- * ⚠️ **DONE 的前一步必须是 `POST /api/meeting/stop`**（2026-10-16 补的收尾步骤）：
- * **没有 stop 就没有转写** —— 服务端只在 `stop_meeting()` 里把这场会收尾并发起转写，
- * 只做 start + segment 的话，音频躺在电脑上**永远不会出文字**；
- * 而且"手机麦"这场会在服务端一直占着**唯一**那条录音槽，之后电脑/手机都开不了新会。
- * 所以本文件里的 [StopOutcome] 与 `OfflineMeetingSync` 里的 stop 那一步不是"清理"，是**必需的收尾**。
+ * ⚠️ **还在录的那一份只传段、绝不收尾**：`stop` 一到，服务端就落盘并开始转写，
+ * 而这一场还在录 —— 那种"提前收尾"的后果是**后面的段永远传不上去**
+ * （清单已被标成完成，见 `OfflineMeetingSync` 里那条按 `draft.recording` 分档的判据）。
+ * ⚠️ **DONE 的前一步必须是 `POST /api/meeting/stop`**：**没有 stop 就没有转写** ——
+ * 服务端只在 `stop_meeting()` 里把这场会收尾并发起转写；只做 start + segment 的话，
+ * 音频躺在电脑上**永远不会出文字**；而且"手机麦"这场会在服务端一直占着**唯一**那条录音槽。
  * ⚠️ **没有**从任何一档"自动删掉本地音频"的迁移：清理是**另一条**、有界保留的策略
  * （见 [OfflineMeetingRetention]：只有 DONE 之后、且超过保留天数才允许清）。
  */
 enum class OfflinePhase {
-    /** 没有离线录音、也没有待补传的段。 */
+    /** 没有本机录音、也没有待补传的段。 */
     IDLE,
 
-    /** 在手机上离线录音（**完全本地**：不依赖服务端，也不需要服务端在场）。 */
+    /**
+     * 在手机上录音（**本地先写**：不依赖服务端，也不需要服务端在场）。
+     *
+     * 名字里的 LOCAL 是这条路的本体：**每一段都先落进 app 私有目录**，
+     * 之后才有"顺手传一下"这件事（在线录音也走这一档，因为"在线"只是"顺手传成功"）。
+     */
     RECORDING_LOCAL,
 
     /** 录完了、还躺在手机上等联网（失败原因在 [OfflineSyncState.note] 里）。 */
@@ -73,6 +86,27 @@ enum class OfflinePhase {
     DONE,
 }
 
+/**
+ * 一轮同步的**口径**（用户 2026-10-17 合并两条路之后新增的一档判断）。
+ *
+ * 为什么要分成两档：同一条路上有两个**时机**，而它们该做的事不同 ——
+ *  * [INCREMENTAL]：**还在录**，每封一段顺手试传。只做"建会（幂等）+ 传欠着的段"，
+ *    **不对账、绝不 stop**。正在录的会要是被收尾了，后面所有段就再也传不上去了
+ *    （服务端那份已经落盘开始转写，而本地清单会被标成"已完成"）；
+ *  * [FINALIZE]：**录完了**，补齐剩余段 → 对账 → `stop(clientId)` → DONE。
+ *
+ * ⚠️ [FINALIZE] 遇到"清单里 `ended_at` 还空着（还在录）"的那一份时**降级成 [INCREMENTAL]**：
+ * 那个降级不是可选项 —— 后台 tick（`tickFromForeground`）跑的就是 [FINALIZE]，
+ * 而它完全可能在用户还在录的时候被调到。
+ */
+enum class SyncScope {
+    /** 还在录：只把已经落盘的段机会性传上去（不对账、绝不收尾）。 */
+    INCREMENTAL,
+
+    /** 录完了：补齐 → 对账 → stop → DONE。 */
+    FINALIZE,
+}
+
 // --------------------------------------------------------------------------- 可达性
 
 /** ECHO 到底在不在。 */
@@ -98,12 +132,17 @@ fun reachabilityOf(code: Int?): Reachability =
 internal fun isReachable(code: Int?): Boolean = reachabilityOf(code) == Reachability.REACHABLE
 
 /**
- * 「ECHO 正忙（在录另一场）」—— 与"不可达"是**两件不同的事**。
+ * 「ECHO 正忙（在录别的会）」—— 与"不可达"是**两件不同的事**。
  *
- * 判据：服务端明确说了它正在录（`meeting.active == true`），且那场**不是**我们这一份
- * 清单对应的会（`localRecording == false`）。这时**不许抢占**：
+ * 判据：服务端明确说了它正在录（`meeting.active == true`），且那一场**不是**我们这一份
+ * 清单对应的会。这时**不许抢占**：
  * 用户的原话是"不要抢占电脑正在录的会议"，而抢占的后果是把别人正在录的会打断
  * （ECHO 会把它记成 `interrupted`，音频虽在但录音当场断了 —— 2026-09-23 真出过这次事故）。
+ *
+ * ⚠️ 第二个参数的名字是历史遗留（[OfflineMeetingSync.run] 现在传的是
+ * `mineRecording(active, …)` 的结论 —— "那一场是不是我自己这一份清单的会"）。
+ * 合并成一条路之后**不再有"App 自己在录"这一档**：判"是不是我的"只看
+ * 服务端回的 `clientId` 与清单是否相等（见 `OfflineMeetingSync.mineRecording` 的说明）。
  */
 fun echoBusyElsewhere(echoRecording: Boolean, localRecording: Boolean): Boolean =
     echoRecording && !localRecording
@@ -202,6 +241,53 @@ sealed interface StopOutcome {
          */
         val alreadyUploadedHint: Boolean = false,
     ) : StopOutcome
+}
+
+/**
+ * **上报暂停区间**的结局（用户 2026-10-17 的第③件事）。
+ *
+ * 为什么要单独一档结局、而且**每一档都不算补传失败**：
+ * 暂停区间是"给服务端把这段空白标出来"的**附加**信息，而补传的正文是**音频**。
+ * 老服务端根本没有 `POST /api/meeting/pauses` 这个端点（这一版它由另一条线同时在实现），
+ * 于是"没报上去"是**常态**而不是故障 —— 这时：
+ *  * **不许**让这一轮补传停下（那会让音频永远传不上去：端点不存在 ≠ 音频有问题）；
+ *  * **不许**说成"成功了"（服务端那份会议的 meta 里确实没有这段区间，
+ *    说成功会让用户以为"暂停被记下了"，而详情页里那段时间就是一段空白）；
+ *  * 只能**如实记一句**，然后继续走完 `start → segment → 对账 → stop`。
+ */
+sealed interface PauseOutcome {
+    /** 服务端收下了（[count] = 这一轮报了几条区间）。 */
+    data class Ok(val count: Int) : PauseOutcome
+
+    /**
+     * 服务端**不认识这个端点**（404/405，或回了一句"不支持"）。
+     *
+     * 这一档是"这次没报上去"，**不是错误**：继续补传，只在 `syncNote` 里记一句。
+     */
+    data class Unsupported(val note: String) : PauseOutcome
+
+    /**
+     * 别的失败（连不上 / 5xx / 服务端明确拒绝）。
+     *
+     * ⚠️ 同样**不影响补传**：暂停区间不是音频，音频该传还得传。
+     * 这一档与 [Unsupported] 分开写，是为了把**原因**说准（"端点不存在" vs "服务端出错了"）。
+     */
+    data class Failed(val failure: SyncFailure, val note: String) : PauseOutcome
+}
+
+/**
+ * 服务端那句话看起来是不是「我不认识这个端点」（**纯函数**）。
+ *
+ * 为什么要认这句话：老服务端（或反向代理）不一定回 404 —— 有些实现会用
+ * `200 + {ok:false, message:"不支持的接口"}` 表达同一件事。把它当成"补传失败"，
+ * 就会因为一个**可有可无**的上报把整场音频卡住（用户什么都没做错）。
+ */
+fun looksEndpointMissing(message: String, code: Int? = null): Boolean {
+    if (code == 404 || code == 405 || code == 501) return true
+    val m = message.trim()
+    if (m.isEmpty()) return false
+    return m.contains("不支持的接口") || m.contains("没有这个接口") || m.contains("Not Found") ||
+        m.contains("not found") || m.contains("未实现") || m.contains("not implemented")
 }
 
 /**
@@ -352,24 +438,6 @@ fun segmentsToUpload(sequences: List<Int>, acknowledged: Int): List<Int> =
     sequences.filter { it > acknowledged }.sorted()
 
 /**
- * **录音中途从联网转离线**时，清单的确认水位该怎么起（纯函数）。
- *
- * 为什么需要这一步（不写会静默地永远传不完）：接上离线那一刻，前 [sentOnline] 段
- * **已经在电脑上了** —— 但清单里没有它们（本地一个字节都没留）。若水位还是 0：
- *  * 本地最大段序号 = 1（只有转离线之后那一段）；
- *  * 服务端那一场已经是 [sentOnline] + 1 段；
- *  * 对账永远"不符" → 永远不敢标记已上传（用户看到的是"一直没传完"）。
- *
- * 把水位抬到 [sentOnline]（但**不超过**清单里已有的最大序号）之后，那个等式就成立了：
- * 本地最大序号 = 服务端的手上的段数。而多出来的那几段**不需要**本地有文件
- * （续传只查 `seq > acknowledged` 的段，它们恰好被跳过）。
- */
-fun watermarkAfterHandoff(sentOnline: Int, localSeqs: List<Int>): Int {
-    val maxLocal = localSeqs.maxOrNull() ?: 0
-    return maxOf(0, minOf(sentOnline, maxOf(0, maxLocal - 1)))
-}
-
-/**
  * 一段传成功之后，本地的确认水位（单调递增；纯函数）。
  *
  * 为什么是"逐段推水位"而不是"传完一起推"：中途断网时水位停在最后一段，
@@ -444,59 +512,22 @@ fun reconcile(localSeqs: List<Int>, server: Int?): ReconcileVerdict {
     return ReconcileVerdict.Mismatch(localCount, server, note)
 }
 
-// --------------------------------------------------------------------------- 开始/结束录音的决策
-
-/** 开始录音时的三种落点。 */
-sealed interface StartDecision {
-    /** 联网那条路（与以前一致）。 */
-    data object Online : StartDecision
-
-    /**
-     * 离线那条路。`why` 是**真实原因**（"ECHO 连不上（连接被拒）"），
-     * 界面上那句"ECHO 连不上，已在手机上离线录音"就是它 + 这句套话拼出来的。
-     */
-    data class Offline(val why: String) : StartDecision
-
-    /** 真的不能录（没配对、没麦权限）：这时才该报失败。 */
-    data class Blocked(val why: String) : StartDecision
-}
+// --------------------------------------------------------------------------- 开始/结束录音（只有一条路）
 
 /**
- * 「这次开始录音走哪条路」的**唯一**判据（纯函数）。
+ * ⚠️ 这里原来有过 `StartDecision` / `startDecision` / `StopDecision` / `stopDecision`
+ * 四个东西 —— 它们是"开始录音时按可达性分到在线/离线两条路"的判据。
  *
- * 需求原话：*"开始/结束录音时若 ECHO 不可达，不要让录音失败，而是进入离线录音"*。
- * 所以：
- *  * 没配对 → [StartDecision.Offline]（**不是**失败！配对只影响"能不能传"，不影响"能不能录"）；
- *  * 不可达 → [StartDecision.Offline]（并把原因原文带上）；
- *  * 可达 → [StartDecision.Online]（联网那条路**一个字都不改**）。
+ * 用户 2026-10-17 把这两条**合并成一条**了（*"离线录音和在线录音就没什么本质区别了"*）：
+ * 开始录音**只做一件事** —— 在本地把这场立起来（[com.echo.contact.service.MeetingRecordSession.start]），
+ * 网络好不好都不影响"能不能录"，只影响"顺手传上去的那一下"成不成；
+ * 结束录音也只做一件事 —— 本地收尾，然后走同一套"补齐 → 对账 → stop"。
  *
- * ⚠️ **没配对也允许离线录音**是有意的：用户在会议室里、手机还没跟电脑配过对，
- * 这时"能录下来"仍然远好于"报个错、什么都不录"。传不上去的原因由补传那一侧如实说。
+ * 于是那四个分叉判据**退役了**：留下它们就等于留下第二条路（谁都不知道该按哪个走）。
+ * 取代它们的是两个更硬的事实：
+ *  * 开始录音**不探活**（`MeetingMicService.startRecording` 直接建本地清单）；
+ *  * "这一场能不能录"只剩**一个**判据 —— 麦克风权限（真的没有它才该报失败）。
  */
-fun startDecision(paired: Boolean, reachable: Boolean, why: String = ""): StartDecision = when {
-    reachable -> StartDecision.Online
-    paired -> StartDecision.Offline(why.ifBlank { "ECHO 连不上" })
-    else -> StartDecision.Offline("还没配对（先把这台手机跟 ECHO 配一次，音频会先留在手机里）")
-}
-
-/** 结束录音时的两种落点。 */
-sealed interface StopDecision {
-    /** 本地就结束（离线那一场）：**不依赖服务端**。 */
-    data object FinishLocally : StopDecision
-
-    /** 顺带告诉服务端"这场录完了"（联网那一场）。 */
-    data object NotifyServer : StopDecision
-}
-
-/**
- * 「结束录音」走哪条路（纯函数）。
- *
- * 离线那一场**绝不能**把"结束"押在服务端身上：断网时 `meetingStop` 必然失败，
- * 而用户的"结束"必须立刻生效（本地不再采音、清单落盘）。服务端那场会等补传时
- * 用同一个 `clientId` 重新建起来 —— 结束时间是清单里的 `ended_at`，不是补传的时间。
- */
-fun stopDecision(recordingOffline: Boolean): StopDecision =
-    if (recordingOffline) StopDecision.FinishLocally else StopDecision.NotifyServer
 
 /** 封面统计：一份清单里"已确认 / 总共"（纯函数，界面那一行用）。 */
 fun draftProgress(draft: MeetingDraft): Pair<Int, Int> =
@@ -505,11 +536,15 @@ fun draftProgress(draft: MeetingDraft): Pair<Int, Int> =
 // --------------------------------------------------------------------------- 界面状态
 
 /**
- * 界面/通知要显示的**离线那一路**的状态（纯数据）。
+ * 界面/通知要显示的那条路的状态（纯数据）。
  *
- * 与 `MicState` 分开是刻意的：`MicState` 是"在线录音"的状态（已送 N 段 / 待重传 N 段），
- * 而离线这一路要说的东西是"**服务端根本不在场**"（已缓存 N 段 / 等联网上传）——
- * 混成一个字段组的话，那句最容易写错的文案（"已上传" vs "还没传上去"）就没有唯一出口了。
+ * 与 `MicState` 分开是刻意的：`MicState` 是"采集这一侧"的状态（在录 / 静音 / 电平 /
+ * 这一场用了几段 FLAC），而这里说的是"**音频到底传上去没有**"（已缓存 N 段 / 已传 M 段 /
+ * 等联网 / 对账完成）—— 混成一个字段组的话，那句最容易写错的文案
+ * （"已上传" vs "还没传上去"）就没有唯一出口了。
+ *
+ * ⚠️ 用户 2026-10-17 合并两条路之后，它**不再是"离线那一档"的状态**：每一次手机录音
+ * （不管当时有没有网）都走这一份，"离线"只是它在 [OfflinePhase.UNREACHABLE] 时的**原因**。
  */
 data class OfflineSyncState(
     val phase: OfflinePhase = OfflinePhase.IDLE,
@@ -548,28 +583,35 @@ data class OfflineSyncState(
 }
 
 /**
- * 离线状态 → 界面/通知那一行字（**纯函数**，`OfflineMeetingStateTest` 逐档钉住）。
+ * 录音与补传的状态 → 界面/通知那一行字（**纯函数**，`OfflineMeetingStateTest` 逐档钉住）。
  *
  * 三条铁律（每一条都对应一次真实的静默错法）：
- *  1. **没传上去绝不说"已上传"**：没对账通过之前，一律是"等联网上传 / 待同步"；
+ *  1. **没传上去绝不说"已上传"**：没对账通过之前，一律是"已缓存 / 等联网 / 还没传"；
  *  2. **不抢占**：ECHO 正在录另一场时，说的是"等这场录完再传"，**不是**"正在传"；
  *  3. **真实原因优先**：有 `note`（连不上 / 服务端拒绝 / 服务端正忙）就先说它 ——
  *     套话（"等联网上传"）把人引去查网线，而真相可能是"服务端不支持这个契约"。
+ *
+ * ⚠️ 用户 2026-10-17 合并两条路之后，这里的措辞**不再分"在线/离线"**：
+ * 这条路永远是"本地先写"，网络只影响"顺手传上去的那一下"。所以录音中那一档说的是
+ * "**本机录音中** · 已缓存 N 段（已传 M 段）"，而"ECHO 连不上"只作为**原因**出现
+ * （[OfflinePhase.UNREACHABLE] 那一档，或录音中那行末尾的 `note`）。
  */
 fun offlineStatusLine(st: OfflineSyncState): String = when (st.phase) {
     OfflinePhase.IDLE -> ""
 
     OfflinePhase.RECORDING_LOCAL -> buildString {
-        append("离线录音中 · 已缓存 ")
+        append("本机录音中 · 已缓存 ")
         append(if (st.totalSegments > 0) st.totalSegments else st.pendingSegments)
         append(" 段")
-        if (st.pendingSegments > 0) append("（${st.pendingSegments} 段还没传）")
-        append(" · 等联网上传")
+        if (st.confirmedSegments > 0) append("（已传 ${st.confirmedSegments} 段）")
+        if (st.pendingSegments > 0) append(" · ${st.pendingSegments} 段还没传")
+        // 原因（连不上 / 服务端正忙）照带：录音中也要能看出"传上去那一下为什么没成"
+        if (st.note.isNotBlank()) append(" · ").append(st.note)
     }
 
     OfflinePhase.WAITING_UPLOAD, OfflinePhase.UNREACHABLE, OfflinePhase.FAILED -> {
         val head = when (st.phase) {
-            OfflinePhase.WAITING_UPLOAD -> "离线录音已保存"
+            OfflinePhase.WAITING_UPLOAD -> "录音已存在本机"
             OfflinePhase.UNREACHABLE -> "ECHO 连不上"
             else -> "补传没成功"
         }
@@ -591,11 +633,41 @@ fun offlineStatusLine(st: OfflineSyncState): String = when (st.phase) {
     }
 
     OfflinePhase.DONE -> buildString {
-        // 两句话**必须分得开**（"没有 stop 就没有转写"是这次的根因）：
+        // 两句话**必须分得开**（"没有 stop 就没有转写"是这一整条链的根因）：
         //  * 收尾成功 → 才敢说"已开始转写"；
         //  * 没收尾（不该走到这一档，但状态可能是老版本/半路留下的）→ 不许说转写。
-        if (st.stopped) append("离线录音已补传并开始转写（${st.totalSegments} 段）")
-        else append("离线录音已上传并核对一致（${st.totalSegments} 段）· 还没收到服务端的收尾确认")
+        if (st.stopped) append("录音已补传并开始转写（${st.totalSegments} 段）")
+        else append("录音已上传并核对一致（${st.totalSegments} 段）· 还没收到服务端的收尾确认")
         append(" · 手机上的副本还留着，${st.retentionNote.ifBlank { "按保留策略到期后才会清" }}")
+        // 「暂停区间没报上去」那句必须**能出现在这一档**：它是"端点不存在"的常态，
+        // 而补传偏偏会照常走到 DONE —— 不在这里带上，用户就永远看不到它（= 没如实记）
+        if (st.note.isNotBlank()) append(" · ").append(st.note)
+    }
+}
+
+/**
+ * 一段封存之后的**如实一句话**（纯函数，用户 2026-10-17 点名要求的那句）。
+ *
+ * 用户原话：*"编码失败/设备不支持时：这一段退回 WAV …… 并在界面/日志如实体现
+ * '这段用 WAV（FLAC 编码器不可用）'"*。
+ *
+ * 三条口径：
+ *  * **编成 FLAC 就没什么要说的**（空串）—— 别用套话占住界面上那一行；
+ *  * 退回 WAV 必须说清**是哪一段、为什么**（"FLAC 编码器不可用" vs "给的字节里没有魔数"
+ *    是两件不同的事，说错会把人引去查错的地方）；
+ *  * 一旦有段退回，就把**本场累计**也说出来 —— 用户真正想知道的是"这场录音是不是
+ *    整场都退成 WAV 了"（一句"第 2 段用 WAV"看不出这件事）。
+ */
+internal fun segmentFormatNote(
+    seq: Int,
+    format: SegmentFormat,
+    reason: String,
+    wavSegments: Int,
+): String {
+    if (format == SegmentFormat.FLAC) return ""
+    val why = reason.ifBlank { SegmentEncoding.FLAC_UNAVAILABLE }
+    return buildString {
+        append("第 ").append(seq).append(" 段用 WAV（").append(why).append("）")
+        if (wavSegments > 1) append(" · 本场已有 ").append(wavSegments).append(" 段用 WAV")
     }
 }

@@ -17,10 +17,10 @@ import android.os.IBinder
 import androidx.core.app.NotificationCompat
 import com.echo.contact.MainActivity
 import com.echo.contact.R
+import com.echo.contact.audio.FlacSegmentEncoder
 import com.echo.contact.audio.InputDevices
-import com.echo.contact.audio.WavWriter
+import com.echo.contact.audio.SegmentFormat
 import com.echo.contact.data.ApiClient
-import com.echo.contact.data.EchoApi
 import com.echo.contact.data.PairStore
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -35,10 +35,6 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.runBlocking
-import kotlinx.coroutines.withTimeoutOrNull
-import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.RequestBody.Companion.toRequestBody
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -53,29 +49,49 @@ import kotlin.math.sqrt
  * 于是"从手机发起录音"时采集的是**手机这支麦**（手机在会议室、电脑可能合着盖），
  * 电脑只负责落盘、转写、存储 —— 音频按段 POST 给 `/api/meeting/segment`。
  *
- * ## 两条路：联网那条，与**离线那条**（用户 2026-10-16 加的需求）
+ * ## 只有一条路：**本地先写 + 机会性上传**（用户 2026-10-17 拍板）
  *
- * 用户原话：*"手机如果连不上 echo 也可以进入离线状态，离线状态可以开始录音，结束录音，
- * 录音文件缓存在 app，网络通了就可以传上去"*。
+ * 用户原话：*"离线录音和在线录音就没什么本质区别了"*。所以这一版**删掉了**
+ * `RecordPlan.Online` / `RecordPlan.Offline` 那条分叉，只留一套：
  *
- *  * **联网**（[RecordPlan.Online]）：与改动前**完全一致** —— 先在电脑上开一场"手机麦"会议，
- *    再按段传；传不出去的段进"待重传"（`retryPending`）。
- *  * **离线**（[RecordPlan.Offline]）：**完全本地**。段写进 app 私有目录
- *    （`filesDir/offline-meetings/<clientId>/`）+ 一份清单（[MeetingDraft]）；
- *    结束录音也不碰服务端。网络恢复后由 [OfflineMeetingSync] 按序补传、对账。
+ * ```
+ * 点录音 → 本地写段（不受任何服务端状态影响）
+ *         → 每到一段封存：顺手尝试上传（网通 + 没冲突就传；否则留着）
+ *         → 结束：补齐剩余段 → 对账 → stop(clientId) → DONE
+ * ```
  *
- * 为什么"连不上"不能是失败：会议室里没网是常态，而**会议录音一旦没录下来就永远补不回来**。
- * 所以采音这件事**绝不能依赖服务端** —— 这正是这一条路存在的全部理由。
+ * **为什么本地先写**（而不是"网通则边录边传、本地不留"）：
+ * 会议录音是**不可重录**的 —— 网络的每一次抖动都不该让一段音频变成"只存在于网络上"。
+ * 先落本地之后，任何时刻断电都有完整的一份在手，上传只是一个**幂等的可重试动作**
+ * （`(clientId, seq)` 幂等），失败也不影响录音本身。
+ *
+ * **为什么单路比双路安全**：双路时"在线那条"的失败段放在 `cacheDir/meeting-mic`、
+ * "离线那一场"放在 `filesDir/offline-meetings`，两套账、两个恢复路径、两处判据
+ * —— "录到一半网断了"正好落在那两套账的缝里。现在只有一份音频、一条补传路
+ * （`OfflineMeetingSync`），判据只有一处。
+ *
+ * **在线时的行为不变差**：网通就**边录边传**（最多滞后一段），面板/列表照旧显示
+ * "已缓存 N 段 / 已传 M 段"；面板与通知里那句"还没传上去"仍然一个字都不许含糊。
+ *
+ * ## 段的格式：FLAC，编不出来退回 WAV（用户 2026-10-17 的第①件事）
+ *
+ * 每段封存时用 `MediaCodec` 的 `audio/flac` 编（16 kHz 单声道，与原来那份 PCM 同参数），
+ * 落成 `seg-%04d.flac`，并在清单里记下**这一段真的**格式；上传时 `Content-Type` 用那一份。
+ * 编码器不可用/编码异常 → **这一段退回 WAV**（见 `SegmentEncoding`）：绝不丢音频、
+ * 绝不谎报格式，界面/通知里如实写"第 N 段用 WAV（FLAC 编码器不可用）"。
  *
  * ## 三个刻意的取舍
  *
- *  1. **按段（默认 30 秒）传**，不做实时流：一段 ≈1 MB，走中继（单次上限 12 MB）很稳；
- *     断了只重传这一段，不会把整场拖垮。
- *  2. **发不出去就留着**：没传成的段留在 `cacheDir/meeting-mic/`，下一段之前重试；
- *     离线那些段留在 `filesDir/offline-meetings/`，**确认对账通过才敢说已上传**，
- *     而且**默认不删**（宁可多留一会儿也别丢音频）。状态里如实写"还有 N 段没送出去"。
- *  3. **静音 = 本地丢帧 + 不上传**（与电脑侧"暂停不写盘"同一个语义）；这段空白照样
- *     会在会议/清单里留下暂停区间（因为暂停/恢复也报了，见 `pause`）。
+ *  1. **按段（默认 30 秒）传**，不做实时流：一段 ≈1 MB（16 kHz 单声道 ≈ 32 KB/s），
+ *     走中继（单次上限 12 MB）很稳；断了只重传这一段，不会把整场拖垮。
+ *     改成 FLAC 之后大约只要一半体积。
+ *  2. **发不出去就留着**：所有段都在 `filesDir/offline-meetings/`，
+ *     **确认对账通过（且服务端收尾）才敢说已上传**，而且**默认不删**
+ *     （宁可多留一会儿也别丢音频）。状态里如实写"还有 N 段没传上去"。
+ *  3. **静音（暂停）= 照常录、写进去的是全零**（用户 2026-10-16 深夜推翻旧的"不写盘"口径，
+ *     并选了"手机与电脑统一"；电脑侧已改完）：这一帧**照样计数、照样封段**，只是内容是零样本。
+ *     为什么必须逐字连续见 [MicCaptureLoop]；暂停区间照旧上报 `POST /api/meeting/pauses`
+ *     （用户 2026-10-17 的第③件事），而那一条**不能拖垮补传**（老服务端没这个端点时只如实记一句）。
  *
  * 前台服务（麦克风型）+ 常驻通知：Android 14 要求录音必须在可见的前台服务里做。
  */
@@ -87,36 +103,28 @@ class MeetingMicService : Service() {
         const val ACTION_PAUSE = "com.echo.contact.MEETING_MIC_PAUSE"
         const val ACTION_RESUME = "com.echo.contact.MEETING_MIC_RESUME"
 
-        /** 「立即重传」：界面上那个按钮走它（**复用** `retryPending`，不另写一份上传逻辑）。 */
-        const val ACTION_RETRY = "com.echo.contact.MEETING_MIC_RETRY"
-
         /**
-         * 「现在同步」（需求点名要的那个明确入口）：把**离线清单**里欠的段补传上去。
+         * 「现在同步」（需求点名要的那个明确入口）：把**本地还欠着的段**传上去。
          *
-         * 与 [ACTION_RETRY] 的区别：那个补的是"在线那条路发失败的段"（`cacheDir/meeting-mic/`），
-         * 这个补的是"整场离线录音"（`filesDir/offline-meetings/`）。
+         * ⚠️ 用户 2026-10-17 合并两条路之后，这里**只有一个**补传入口了：
+         * 原来那个「立即重传」（补 `cacheDir/meeting-mic` 里在线失败的段）**退役了** ——
+         * 那正是"双路"留下的第二套账，而现在**所有**段都在本地清单里，一次同步就够了。
          */
         const val ACTION_SYNC = "com.echo.contact.MEETING_MIC_SYNC"
 
         private const val CHANNEL_ID = "echo_meeting_mic"
         private const val NOTIF_ID = 4211
-        private const val SAMPLE_RATE = 16000
-        private const val FRAME_SAMPLES = 1600                     // 100ms
 
-        /**
-         * 开始录音前那次探活最多等多久。
-         *
-         * 为什么要有上限：探活是**用户按了「开始」之后**在主线程上等的一下
-         * （见 [decidePlan]）。网络不通时 `connect` 可能要十几秒才放弃，
-         * 而用户按下按钮后的等待超过两秒就已经像"卡住了"。超时 = 不可达 = 走离线，
-         * 这正是我们要的分支（宁可多走一次离线，也别让"开始录音"变成一次等待）。
-         */
-        private const val PROBE_TIMEOUT_MS = 1_500L
+        /** 日志标签（**段的格式退回 WAV 这类"如实的事"也要落进日志** —— 真机排障只能靠它）。 */
+        private const val TAG = "MeetingMic"
+        const val SAMPLE_RATE = 16000
+        const val CHANNELS = 1
+        private const val FRAME_SAMPLES = 1600                     // 100ms
 
         /**
          * 一段多长，**由偏好决定**（设置页那三个 15/30/60）。
          *
-         * 为什么**默认 30 秒**：一段 ≈1 MB（16kHz 单声道 16bit ≈ 32 KB/s），
+         * 为什么**默认 30 秒**：一段 ≈1 MB（16kHz 单声道 16bit ≈ 32 KB/s；FLAC 之后约一半），
          * 走中继（单次上限 12 MB）很稳；再长一点，一次失败要重传的就多；
          * 再短一点，段数太多、每段都有一次往返开销。改偏好**下次开录生效**
          * （正在录的这一场按开录时读到的档，中途换档不会把已缓冲的那半段切碎）。
@@ -139,41 +147,18 @@ class MeetingMicService : Service() {
         }
 
         /**
-         * **立即重传**（界面上的按钮）。
+         * 「现在同步」：让服务把**本地清单**里欠的段传上去（用户明确按的那一下）。
          *
-         * 内部与自动重传走**同一条路**（[retryPending]）—— 上传协议、重试顺序、状态口径都只有一份，
-         * 另写一份迟早漂移。这里只多做两件界面要求的事：
-         *  1. **立刻**给出"正在重传 N 段…"（`startService` 是异步的，不等它回来再说话）；
-         *  2. 没有待传的段时说清楚"现在没有待重传的段"，而不是让按钮看着没反应。
-         */
-        fun retryPendingNow(context: Context) {
-            val app = context.applicationContext
-            val n = File(app.cacheDir, "meeting-mic")
-                .listFiles { f -> f.name.endsWith(".wav") }?.size ?: 0
-            if (n == 0) {
-                _state.value = _state.value.copy(pending = 0, retryNote = "现在没有待重传的段")
-            } else {
-                _state.value = _state.value.copy(retryNote = "正在重传 $n 段…")
-            }
-            runCatching {
-                app.startService(
-                    Intent(app, MeetingMicService::class.java).setAction(ACTION_RETRY))
-            }
-        }
-
-        /**
-         * 「现在同步」：让服务把**离线清单**里欠的段传上去（用户明确按的那一下）。
-         *
-         * 与 [retryPendingNow] 同一个套路（先在界面上说一句、再让服务去干），
-         * 因为这个按钮最怕的也是"按了没反应"。这里**不受退避限制**（用户说了"现在"）。
+         * 为什么先在界面上说一句再让服务去干：`startService` 是异步的，而"按了没反应"
+         * 是这类按钮最糟的体验。这里**不受退避限制**（用户说了"现在"）。
          */
         fun syncNow(context: Context) {
             val app = context.applicationContext
             val store = MeetingDraftStore(File(app.filesDir, OFFLINE_DIR))
             val waits = store.pending()
             _state.value = _state.value.copy(
-                syncNote = if (waits.isEmpty()) "现在没有要传的离线录音"
-                else "正在同步 ${waits.size} 场离线录音（${waits.sumOf { it.pendingSegments }} 段）…")
+                syncNote = if (waits.isEmpty()) "现在没有要传的录音"
+                else "正在同步 ${waits.size} 场录音（${waits.sumOf { it.pendingSegments }} 段）…")
             runCatching {
                 app.startService(
                     Intent(app, MeetingMicService::class.java).setAction(ACTION_SYNC))
@@ -189,6 +174,10 @@ class MeetingMicService : Service() {
          *
          * ⚠️ 与 `MeetingMicService` 里的那条路**共用** [syncGate]（进程级），
          * 所以"前台轮询"和"服务自己"不会同时传同一段（同一段被存两遍就是转写里出现两遍）。
+         *
+         * ⚠️ 这里走的是 [SyncScope.FINALIZE]（"把这场传完"），而**还在录的那一份会被
+         * 自动降级**成"只传段、不收尾"（判据在 `OfflineMeetingSync.syncOne` 里）——
+         * 前台轮询完全可能在用户还在录的时候被调到。
          */
         fun tickFromForeground(context: Context) {
             val app = context.applicationContext
@@ -203,8 +192,7 @@ class MeetingMicService : Service() {
                     _state.value = _state.value.copy(
                         syncPhase = if (_state.value.active) OfflinePhase.RECORDING_LOCAL
                         else OfflinePhase.IDLE,
-                        syncNote = if (_state.value.active)
-                            "离线录音中（还没跟 ECHO 连上；音频先存在手机里）" else "")
+                        syncNote = "")
                     notifyIfRunning()
                 }
                 return
@@ -214,7 +202,7 @@ class MeetingMicService : Service() {
             // （不可达时第一件事就是探活失败 → 退避，所以不会白转）
             if (!offlineSyncDue(reachableNow = true)) return
             CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
-                runOfflineSync(app, store = store, manual = false)
+                runOfflineSync(app, store = store, manual = false, scope = SyncScope.FINALIZE)
             }
         }
 
@@ -312,42 +300,61 @@ class MeetingMicService : Service() {
         private const val MEETING_END_POLL_MS = 60_000L
 
         /**
-         * 跑一轮离线补传（**唯一**的实现：服务的 [ACTION_SYNC] 与前台 tick 都走它）。
+         * 跑一轮同步（**唯一**的实现：服务的 [ACTION_SYNC]、前台 tick、以及
+         * "每封一段顺手试一次"和"结束前的那一次"都走它）。
          *
          * 结果**如实**写进 `MicState.syncNote`/`syncPhase`：连不上、服务端拒绝、
          * 服务端正忙（等它录完再传）各说各的 —— 绝不能都说成"同步失败"。
+         *
+         * [scope] 决定这一轮做到哪一步（见 [SyncScope]）：录音中只做机会性上传，
+         * 录完了才补齐 → 对账 → stop。
          */
         internal suspend fun runOfflineSync(
             app: Context,
             store: MeetingDraftStore = MeetingDraftStore(File(app.filesDir, OFFLINE_DIR)),
             manual: Boolean = false,
             onlyClientId: String? = null,
-        ) {
+            scope: SyncScope = SyncScope.FINALIZE,
+            /**
+             * 占守卫时最多等多久（毫秒）。**只有"结束录音"那一下传非零值**：
+             * 那一刻很可能正有一轮机会性上传在跑（每封一段就顺手试一次），
+             * 而"收尾"是**不能等下一次 tick** 的（用户以为已经结束了，服务端却还没收到 stop）。
+             * 等待是**有界**的：等不到就如实说"这一次没跑"（见 [stopRetryNote]），绝不假装传完。
+             */
+            waitForGateMs: Long = 0L,
+        ): RetryOutcome {
             val baseUrl = PairStore.baseUrl(app)
             if (!PairStore.isPaired(app) || baseUrl.isNullOrBlank()) {
-                // 没配对也能**录**（离线录音不依赖服务端），但传不上去 —— 如实说
+                // 没配对也能**录**（本地先写不依赖服务端），但传不上去 —— 如实说
                 _state.value = _state.value.copy(
                     syncPhase = OfflinePhase.WAITING_UPLOAD,
                     syncNote = "还没配对：音频都在手机里，配对之后点「现在同步」就能传")
-                return
+                return RetryOutcome.Ran
             }
-            val outcome = syncGate.runExclusive {
+            val block: suspend () -> Unit = {
                 val transport = OfflineMeetingTransport(ApiClient.create(baseUrl))
                 val active = ActiveDraft.current
                 val result = OfflineMeetingSync.run(
                     transport = transport,
                     store = store,
-                    localRecording = _state.value.active &&
-                        _state.value.syncPhase == OfflinePhase.RECORDING_LOCAL,
                     activeClientId = active?.clientId,
                     onlyClientId = onlyClientId,
                     manual = manual,
                     force = manual,
+                    scope = scope,
                 )
+                // 界面上那一档：**还在录**的时候一律显示"本机录音中"（此刻最要紧的事实），
+                // 而"网通不通、传上去没传上去"由 note 与那几个数字说清（见 offlineStatusLine）。
+                // 这一档替换**只影响展示**：退避仍然按真实的 `result.phase` 算（见 syncAfterRound）。
+                val shown = if (_state.value.active) {
+                    result.copy(phase = OfflinePhase.RECORDING_LOCAL)
+                } else {
+                    result
+                }
                 // 界面上那句"本地还留着多久"（**如实**：绝不早删，但也不会无限攒）
                 val days = AppPrefs.audioRetentionDays(app)
                 OfflineMeetingSync.publish(
-                    result.toState(
+                    shown.toState(
                         active = active,
                         retentionNote = OfflineMeetingRetention.retentionNote(days)))
                 syncAfterRound(result.phase)
@@ -358,12 +365,17 @@ class MeetingMicService : Service() {
                     syncPending = result.pendingSegments,
                     syncConfirmed = result.confirmedSegments,
                     syncDrafts = result.drafts,
-                    offline = _state.value.offline || st.phase != OfflinePhase.IDLE,
+                    sent = maxOf(_state.value.sent, result.confirmedSegments),
                     error = "",
                 )
-                // 补传这一轮过去了：**顺手**按有界保留策略清一次（只清"已对账 + 已收尾 + 到期"的）
+                // 同步这一轮过去了：**顺手**按有界保留策略清一次（只清"已对账 + 已收尾 + 到期"的）
                 runCatching { purgeExpiredAudio(app, store) }
                 notifyIfRunning()
+            }
+            val outcome = if (waitForGateMs > 0) {
+                syncGate.runExclusiveWaiting(waitForGateMs) { block() }
+            } else {
+                syncGate.runExclusive { block() }
             }
             if (outcome == RetryOutcome.SkippedBusy) {
                 // 如实：这一轮**没跑**（另一轮正占着），别让人以为"传完了"
@@ -371,7 +383,18 @@ class MeetingMicService : Service() {
                     syncNote = if (manual) "上一次同步还在跑，这一次没跑（等它完再按）"
                     else _state.value.syncNote)
             }
+            return outcome
         }
+
+        /**
+         * 「结束录音时那次收尾」等待守卫的上限（毫秒）。
+         *
+         * 为什么是 10 秒：那一刻在跑的通常是**一轮机会性上传**（最多传一小把段，秒级），
+         * 10 秒足够它跑完；再长就让用户按了"结束"之后干等（那是更糟的体验）。
+         * 等不到不是失败：会如实说"这次没跑、还有 N 段留着，下次会接着试"
+         * （见 [stopRetryNote]），而且下一轮 tick 仍会把它传完。
+         */
+        const val FINALIZE_WAIT_MS = 10_000L
 
         /** 离线清单放在哪（**app 私有目录**：不依赖服务端，也不要外置存储权限）。 */
         const val OFFLINE_DIR = "offline-meetings"
@@ -508,55 +531,23 @@ class MeetingMicService : Service() {
     private var job: Job? = null
     private var record: AudioRecord? = null
 
-    /**
-     * 手动重传（[ACTION_RETRY]）要用的作用域：**只在真的按下按钮时**才建。
-     * 平时它不该存在 —— 服务被系统停掉之后，一个还活着的 scope 会继续发请求，
-     * 那是最难查的一类"它为什么还在传"。
-     */
-    @Volatile private var retryScope: CoroutineScope? = null
+    // ---- 这一场录音的现场（**进程被杀就没了；事实都在清单里**）----
 
     /**
-     * 「这一轮重传是不是我在跑」—— **唯一**的不可重入判据，由 [retryPending] 自己进出。
+     * 这一场的**本地**那一半（编码 + 落盘 + 清单）。
      *
-     * 为什么不能像上一版那样只在"手动"那一侧放个 `retryBusy`：补传有**两个**入口
-     * （界面上的「立即重传」、以及 [stopEverything] 里结束前那次尽力补传），
-     * 而两个入口都会调 [retryPending]。保护只写在其中一个上，另一个照样能同时进去
-     * —— 同一段音频被传两次，电脑侧就多存一段（转写里同一段出现两遍）。
-     * 判据放进 [retryPending] 里，就是"谁跑谁占"，与调用方是谁无关。
+     * 为什么它是这条路的本体：用户 2026-10-17 把在线/离线合并成一条之后，
+     * "录下来"这件事只有一个实现 —— 先写本地（[MeetingRecordSession]），
+     * 传上去是后面的事。于是这里没有"这一场是联网还是离线"这种字段了：
+     * 网络只影响"顺手传的那一下"成不成。
      */
-    private val retryGate = RetryGuard()
-
-    // ---- 离线那条路要用的现场（**进程被杀就没了；事实都在清单里**）----
-
-    /** 这一次是联网录还是离线录（开始录音前由 [decidePlan] 定下来）。 */
-    @Volatile private var offlineMode = false
-
-    /** 当前这一份离线清单（离线模式下才有）。 */
-    @Volatile private var activeDraft: MeetingDraft? = null
-
-    /**
-     * 在线那场会的 `startedAt`（电脑给的 ISO 时间）。
-     *
-     * 为什么在**联网**这条路上也要记它：网络可能中途断掉 —— 那时要**无缝转成离线录音**
-     * （用户不该因为"录到第 3 段时网断了"而丢掉整场）。而离线清单里的开始时间必须是
-     * **一开始那一刻**，不是转离线那一刻（否则整场的时间轴整体错位）。
-     */
-    @Volatile private var onlineStartedAt: String = ""
-
-    /** 这一次录音的开始时刻（epoch ms）：算段偏移与时长用。 */
-    @Volatile private var sessionStartMs = 0L
-
-    /** 当前暂停区间的起点（相对开始时间的秒）；null = 没在暂停。 */
-    @Volatile private var pauseStartedAtOffset: Double? = null
+    @Volatile private var session: MeetingRecordSession? = null
 
     /** 上一次"谁结束了录音"（调试与文案上下文用，见 [stopEverything]）。 */
     @Volatile private var lastStopReason: String = ""
 
-    /** 已经写进清单的暂停区间（转离线/结束时补上最后一条用）。 */
-    private val localPauses = ArrayList<DraftPause>()
-
-    /** 已经落进清单的段数（离线模式下 = 清单里的段数；在线模式下 = 只是记账）。 */
-    @Volatile private var recordedSegments = 0
+    /** 这一场已经有多少段退回了 WAV（界面/通知要如实说"不是每段都是 FLAC"）。 */
+    @Volatile private var wavSegments = 0
 
     private val draftStore: MeetingDraftStore by lazy {
         MeetingDraftStore(File(filesDir, OFFLINE_DIR))
@@ -576,17 +567,21 @@ class MeetingMicService : Service() {
             ACTION_START -> startRecording()
             ACTION_STOP -> stopEverything("用户结束了手机录音")
             ACTION_PAUSE -> {
-                markPauseStart()
+                session?.beginPause()
                 _state.value = _state.value.copy(paused = true)
                 notifyState()
             }
             ACTION_RESUME -> {
-                markPauseEnd()
+                // 恢复：收一条暂停区间，并**顺手上报**（用户 2026-10-17 的第③件事：
+                // "每新增一段暂停区间后上报一次"）。上报走同步那一轮（它天然带 start + 幂等）。
+                session?.endPause()
                 _state.value = _state.value.copy(paused = false)
                 notifyState()
+                reportPausesSoon()
             }
-            ACTION_RETRY -> retryPendingNow()
-            ACTION_SYNC -> scope.launch { runOfflineSync(this@MeetingMicService, manual = true) }
+            ACTION_SYNC -> scope.launch {
+                runOfflineSync(this@MeetingMicService, manual = true, scope = SyncScope.FINALIZE)
+            }
             else -> {
                 // 被系统重启带回来的 null intent：**不自动开麦**（与听写服务同一条纪律）
                 stopSelf()
@@ -596,6 +591,19 @@ class MeetingMicService : Service() {
         return START_STICKY
     }
 
+    /**
+     * 开始录音（用户 2026-10-17 合并两条路之后的形状）。
+     *
+     * ## 为什么这里**不探活、不建会、不看服务端脸色**
+     *
+     * 用户原话：*"离线录音和在线录音就没什么本质区别了"*。于是"开始录音"只做一件事：
+     * **在本地把这一场立起来**（清单 + 第一段以后逐段落盘）。
+     * 好处不只是"断网也能录"（那是 2026-10-16 就有的），更是**行为一致**：
+     * 网络好不好都是同一条代码路径，没有"探活超时 1.5 秒才决定走哪条路"这种分叉，
+     * 也没有"联网那条先在电脑上开一场会、失败了再退到离线"这种会留下半场会的中间态。
+     *
+     * 唯一还能让"开始录音"失败的东西是**麦克风权限**（那是真的不能录）。
+     */
     private fun startRecording() {
         if (job != null) return
         if (checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) !=
@@ -604,136 +612,63 @@ class MeetingMicService : Service() {
             failAndStop("没有麦克风权限：先在 App 里给它")
             return
         }
-        // 探活 + 决定走哪条路（**同步**做：界面紧接着要打开全屏录音界面，
-        // 而它必须知道这一场是联网还是离线 —— 见 AboutToRecord 的说明）
-        val plan = decidePlan()
-        AboutToRecord.put(plan)
-        offlineMode = plan is RecordPlan.Offline
+        // 上一条**被进程杀掉**留下的清单：按最后一段的时间收尾（如实标出这是推断），
+        // 它接下来会被后台补传捡走 —— 别让它永远停在"还在录"（那种清单谁都不敢收尾）
+        closeInterruptedDrafts()
+
+        val now = System.currentTimeMillis()
+        val s = MeetingRecordSession(
+            store = draftStore,
+            encoder = FlacSegmentEncoder(SAMPLE_RATE, CHANNELS),
+            sampleRate = SAMPLE_RATE,
+            channelCount = CHANNELS,
+        )
+        val started = s.start(MeetingDraftStore.newClientId(), MeetingDraftStore.isoOf(now))
+        session = s
+        wavSegments = 0
+        if (started.note.isNotBlank()) syncNote(started.note)
         startForegroundCompat()
-        job = scope.launch { runLoop(plan) }
+        _state.value = MicState(
+            active = true,
+            syncPhase = OfflinePhase.RECORDING_LOCAL,
+            syncNote = offlineStatusLine(OfflineSyncState(
+                phase = OfflinePhase.RECORDING_LOCAL,
+                clientId = started.draft.clientId,
+                totalSegments = started.draft.segments.size,
+                pendingSegments = started.draft.pendingSegments,
+                confirmedSegments = started.draft.confirmedSegments,
+            )),
+            startedAt = started.draft.startedAt,
+        )
+        notifyState()
+        job = scope.launch { runLoop() }
     }
 
     /**
-     * 决定这一次录音走哪条路（**唯一**的判据在 `startDecision` 里，纯函数 + 有用例）。
+     * 把**上一条被进程杀掉**的清单收尾：结束时间按最后一段推（**如实标出这是推断**）。
      *
-     * 顺序有讲究：
-     *  ① 先看有没有**上一条还在录**的清单（进程被杀过）—— 有就接着它录，
-     *     开始时间与段序号都续上（"App 重开能接着录"就是这一步）；
-     *  ② 否则探活：通 → 联网那条路；不通 → **离线**（这就是需求的核心）。
-     *
-     * 探活失败**绝不能**变成"开始录音失败"：会议室没网时那等于什么都没录。
+     * 为什么要在这里做：那种清单的 `ended_at` 是空的 → 它会被这条路的规则判成"还在录"
+     * → **永远不许收尾**（见 `SyncScope`）→ 音频永远传不到服务端、永远不出文字。
+     * 而进程已经被杀过一次，那场录音**确实已经结束**了（结束时刻只能推断）。
      */
-    private fun decidePlan(): RecordPlan {
-        val paired = PairStore.isPaired(this)
-        val baseUrl = PairStore.baseUrl(this)
-        // ① 接着上一份还没结束的清单（进程被杀/被系统回收之后重开）
+    private fun closeInterruptedDrafts() {
         val unfinished = runCatching {
-            draftStore.list().lastOrNull { it.recording && it.segments.isNotEmpty() }
-        }.getOrNull()
-        if (unfinished != null) {
-            // 上一场是被**杀掉**的：它的结束时间只能按最后一段推（**如实标出这是推断**）
-            val last = unfinished.segments.maxByOrNull { it.seq }
-            val endIso = last?.let {
-                MeetingDraftStore.isoOf(
-                    (MeetingDraftStore.epochOf(it.startedAt) ?: System.currentTimeMillis()) +
-                        (it.durationSeconds * 1000).toLong())
-            }.orEmpty()
-            val closed = unfinished.copy(
-                endedAt = endIso,
-                pauses = unfinished.pauses,      // 暂停区间原样留着（那是真实发生过的）
-            )
-            draftStore.save(closed)
-            syncNote("上一条离线录音（${closed.segments.size} 段）是被打断的，已经按最后一段的时间收了尾；" +
-                "剩下的段会继续传")
-        }
-        // ② 探活：只有**明确 2xx** 才算可达（超时/拒绝连接都算连不上）
-        val reachable = if (paired && !baseUrl.isNullOrBlank()) {
-            runBlocking {
-                withTimeoutOrNull(PROBE_TIMEOUT_MS) {
-                    runCatching {
-                        // 用 /health：它不带令牌，所以"令牌坏了"不会被误判成"服务不在"
-                        ApiClient.create(baseUrl).health().isSuccessful
-                    }.getOrDefault(false)
-                } ?: false
-            }
-        } else {
-            false
-        }
-        return when (val d = startDecision(paired, reachable, why = "ECHO 连不上（探活超时或拒绝连接）")) {
-            is StartDecision.Online -> RecordPlan.Online()
-            is StartDecision.Offline -> RecordPlan.Offline(
-                clientId = MeetingDraftStore.newClientId(), reason = d.why)
-            is StartDecision.Blocked -> RecordPlan.Offline(
-                // 这一档在这一版里走不到（没配对也允许离线录），留着是为了将来
-                // 真出现"不能录"的情况时有一个**不静默**的落点。
-                clientId = MeetingDraftStore.newClientId(), reason = d.why)
+            draftStore.list().filter { it.recording && it.segments.isNotEmpty() }
+        }.getOrDefault(emptyList())
+        unfinished.forEach { d ->
+            val last = d.segments.maxByOrNull { it.seq } ?: return@forEach
+            val endIso = MeetingDraftStore.isoOf(
+                (MeetingDraftStore.epochOf(last.startedAt) ?: System.currentTimeMillis()) +
+                    (last.durationSeconds * 1000).toLong())
+            // 结束时间**是按最后一段推出来的**（不是当时真的按了结束）—— 用**结构化**的
+            // `endedAtInferred` 记下来（而不是塞一句备注）：它必须能被每一次同步如实说出来
+            draftStore.save(d.copy(endedAt = endIso, endedAtInferred = true))
+            syncNote("上一条录音（${d.segments.size} 段）是被打断的：结束时间按最后一段推的" +
+                "（不是当时按的结束），剩下的段会继续传")
         }
     }
 
-    private suspend fun runLoop(plan: RecordPlan) {
-        val api: EchoApi? = PairStore.baseUrl(this)?.takeIf { PairStore.isPaired(this) }
-            ?.let { ApiClient.create(it) }
-
-        // ---- 联网那条路：与改动前一致（先在电脑上开一场"手机麦"会议）----
-        if (plan is RecordPlan.Online) {
-            val started = try {
-                val r = api!!.meetingStartPhone()
-                if (r.isSuccessful && r.body()?.ok == true) true
-                else {
-                    // 探活通了但开会失败：**别把录音失败掉** —— 落到离线那条路
-                    offlineMode = true
-                    AboutToRecord.put(RecordPlan.Offline(
-                        clientId = MeetingDraftStore.newClientId(),
-                        reason = "电脑没能开始这场录音（${r.body()?.message ?: "HTTP ${r.code()}"}）"))
-                    false
-                }
-            } catch (e: Exception) {
-                offlineMode = true
-                AboutToRecord.put(RecordPlan.Offline(
-                    clientId = MeetingDraftStore.newClientId(),
-                    reason = "联系不上电脑：${e.message}"))
-                false
-            }
-            if (started) {
-                onlineStartedAt = MeetingDraftStore.isoOf(System.currentTimeMillis())
-            }
-        }
-
-        val startIso = onlineStartedAt.ifBlank { MeetingDraftStore.isoOf(System.currentTimeMillis()) }
-        sessionStartMs = System.currentTimeMillis()
-        // 离线的原因（"ECHO 连不上…"）要在清掉那次交接**之前**取出来 ——
-        // 它正是界面上那句"ECHO 连不上，已在手机上离线录音"的一半（另一半是套话）。
-        val offlineReason = (AboutToRecord.plan as? RecordPlan.Offline)?.reason.orEmpty()
-        if (offlineMode) {
-            // 离线：**先把清单立起来**（还没录到一段也先立 —— 这样进程立刻被杀也留得下"这一场开始了"）
-            val p = AboutToRecord.plan
-            val clientId = (p as? RecordPlan.Offline)?.clientId ?: MeetingDraftStore.newClientId()
-            val load = draftStore.loadOrCreate(clientId, startIso)
-            activeDraft = when (load) {
-                is DraftLoad.Ok -> load.draft
-                is DraftLoad.Recovered -> {
-                    syncNote(load.note)
-                    load.draft
-                }
-            }
-            activeDraft?.let { ActiveDraft.set(it); draftStore.save(it) }
-            recordedSegments = activeDraft?.segments?.size ?: 0
-        }
-
-        _state.value = _state.value.copy(
-            active = true, error = "", sent = 0, pending = 0, retryNote = "",
-            offline = offlineMode,
-            offlineNote = offlineReason,
-            syncPhase = if (offlineMode) OfflinePhase.RECORDING_LOCAL else OfflinePhase.IDLE,
-            syncNote = if (offlineMode) "离线录音中（还没跟 ECHO 连上；音频先存在手机里）" else "",
-            syncPending = 0,
-            syncConfirmed = 0,
-            // 大计时按**本地**开始时间走（离线时电脑不在场，没人给我们 startedAt）
-            startedAt = if (offlineMode) startIso else "",
-        )
-        // 界面上"这一场"的信息（时长/模式）从这一刻起就有
-        AboutToRecord.clear()
-
+    private suspend fun runLoop() {
         val minBuf = AudioRecord.getMinBufferSize(
             SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
         if (minBuf <= 0) return failAndStop("这台设备给不出可用的录音缓冲")
@@ -754,7 +689,10 @@ class MeetingMicService : Service() {
         // 每段多长**读偏好**（设置页那三个 15/30/60）；开录时读一次，
         // 中途改偏好不会把已经在缓冲的那半段切碎（界面文案写着"改完下次开录生效"）
         val samplesPerSegment = SAMPLE_RATE * segmentSeconds(this)
-        var buffer = ArrayList<Short>(samplesPerSegment)
+        // 缓冲的容量按"装得下一整段"给（`ArrayList` 自己会增长，这个初值只是免掉几次扩容）；
+        // 段长由硬件帧长整除（100ms 帧 vs 15/30/60 秒），所以一个缓冲里通常只有一段。
+        val buffer = ArrayList<Short>(samplesPerSegment)
+        val capture = MicCaptureLoop(samplesPerSegment)
         try {
             ar.startRecording()
             notifyState()
@@ -764,18 +702,27 @@ class MeetingMicService : Service() {
                     delay(20)
                     continue
                 }
-                val level = rms(frame, n)
-                if (_state.value.paused) {
-                    // 静音：**丢帧 + 不上传**（这段时间在会议里就是空白，meta/清单里会留区间）
-                    _state.value = _state.value.copy(level = 0f)
-                    continue
-                }
-                _state.value = _state.value.copy(level = level)
-                for (i in 0 until n) buffer.add(frame[i])
-                if (buffer.size >= samplesPerSegment) {
-                    val bytes = toPcmBytes(buffer)
-                    onSegmentReady(api, bytes)
-                    buffer = ArrayList(samplesPerSegment)
+                val paused = _state.value.paused
+                // 电量条：暂停时**不动它**（上一帧的值留着往下走），而不是每 100ms 报一次 0
+                // —— 零帧也要照常计数/封段，但界面不必跟着抖。
+                if (!paused) _state.value = _state.value.copy(level = rms(frame, n))
+                // 采集语义全在这一句里（纯逻辑在 [MicCaptureLoop]）：暂停时它塞进去的是
+                // **与这一帧同长度、同格式的全零样本**，而"够一段就封段"那件事照样发生
+                // —— 所以段边界仍落在挂钟刻度上、总时长照常累计。
+                // 于是"第 N 段 = 挂钟第 N 个段长（默认 30 秒）"这条对齐关系在暂停前后都成立。
+                val feed = capture.feed(buffer, frame, n, active = !paused)
+                if (feed.sealed) {
+                    val pcm = toPcmBytes(buffer)
+                    // ① **先落本地**（编码 + 写盘 + 记清单）—— 这一步不碰网络，
+                    //    所以它绝不会因为"网断了"而失败；它失败只有一种原因：手机写不进去。
+                    //    ⚠️ 暂停期间的段也会走到这里（里面是零样本），照常编码/落盘：全零音频
+                    //    编出来还是全零，而"少一段"会让整条时间轴前移（那正是要避免的）。
+                    val seal = session?.seal(pcm)
+                    if (seal != null) publishSeal(seal)
+                    // ② 顺手试一次上传（**异步、绝不阻塞采音**：`ar.read` 是同一个协程，
+                    //    一次卡住的网络请求会把麦克风缓冲顶掉 —— 那是**真的丢音频**）
+                    triggerOpportunisticUpload()
+                    buffer.clear()
                 }
             }
         } catch (e: Exception) {
@@ -788,321 +735,79 @@ class MeetingMicService : Service() {
     }
 
     /**
-     * 一段录满了：**离线就只写本地，联网就照旧传**。
+     * 一段封存之后的**如实发布**（界面/通知那一行）。
      *
-     * 这一处是两条路的分岔口，判据只有 [offlineMode] 一个 —— 免得出现
-     * "离线了还在传"（白耗电、还可能把服务端那场会搞乱）这种半吊子状态。
+     * 三件事都要说清楚（每一件都对应一次"看着没事"的错法）：
+     *  1. **有几段还没传上去**（`syncPending`）—— 这是"音频会不会丢"的唯一出口；
+     *  2. **这一段真的用了什么格式**：退回 WAV 时必须说"第 N 段用 WAV（FLAC 编码器不可用）"
+     *     （用户 2026-10-17 点名要求），而编成 FLAC 时**什么都不说**（别用套话占住那一行）；
+     *  3. **真的可能丢音频时以 error 优先**（"有一段缓存不下来"绝不能被"已缓存 3 段"盖掉）。
      */
-    private suspend fun onSegmentReady(api: EchoApi?, bytes: ByteArray) {
-        if (offlineMode) {
-            appendToDraft(bytes)
-            return
-        }
-        if (api == null) {
-            // 没有 api（配对信息丢了）：**转离线**，别让这一段丢掉
-            switchToOffline("配对信息读不到了")
-            appendToDraft(bytes)
-            return
-        }
-        if (!uploadSegment(api, bytes)) {
-            // 发不出去：先看看是不是**整个连不上** —— 是就转离线（后面不再逐段重试）
-            if (probeUnreachable(api)) {
-                switchToOffline("录音中途 ECHO 连不上了（探活失败）")
-                appendToDraft(bytes)
-            } else {
-                // 只是这一段没成（服务端抖动/拒绝）：留着，下一段之前重试（行为与改动前一致）
-                savePending(bytes)
-            }
-        }
-    }
-
-    /** 探活一次：**只有明确非 2xx 或抛异常**才说不可达（单次抖动不转离线）。 */
-    private suspend fun probeUnreachable(api: EchoApi): Boolean = try {
-        !api.health().isSuccessful
-    } catch (e: Exception) {
-        true
-    }
-
-    /**
-     * 在线 → 离线**无缝切换**（录音中途断网）。
-     *
-     * 为什么值得单独一条路：会议可能开了一个小时，第 40 分钟才没网。这时
-     * "剩下的都录不下来"是最糟的结果（前面 39 分钟白录），而"从这里转成本地录"
-     * 只是多等一会儿补传。开始时间沿用**这一场开始的那一刻**（[onlineStartedAt]），
-     * 所以补传上去之后时间轴是连续的，看不出中间切过一次。
-     */
-    private fun switchToOffline(why: String) {
-        if (offlineMode) return
-        offlineMode = true
-        val clientId = MeetingDraftStore.newClientId()
-        val startIso = onlineStartedAt.ifBlank { MeetingDraftStore.isoOf(sessionStartMs) }
-        val load = draftStore.loadOrCreate(clientId, startIso)
-        val draft = when (load) {
-            is DraftLoad.Ok -> load.draft
-            is DraftLoad.Recovered -> {
-                syncNote(load.note)
-                load.draft
-            }
-        }
-        // 这一场已经报给电脑的那些段不在本地（它们已经在电脑上了）——
-        // 所以水位要抬到"联网时已经送出去的那几段"，否则本地最大段序号只有 1、
-        // 而服务端那一场已经有 N 段 → 对账永远不符（见 watermarkAfterHandoff）。
-        val handoff = watermarkAfterHandoff(
-            sentOnline = _state.value.sent,
-            localSeqs = draft.segments.map { it.seq },
-        )
-        activeDraft = draft.copy(
-            pauses = localPauses.toList(),
-            acknowledgedSegments = maxOf(draft.acknowledgedSegments, handoff),
-        )
-        draftStore.save(activeDraft!!)
-        ActiveDraft.set(activeDraft)
-        recordedSegments = activeDraft?.segments?.size ?: 0
-        _state.value = _state.value.copy(
-            offline = true, offlineNote = why,
+    private fun publishSeal(seal: SegmentSeal) {
+        val prev = _state.value
+        _state.value = prev.copy(
             syncPhase = OfflinePhase.RECORDING_LOCAL,
-            syncNote = "录音中途 ECHO 连不上了：后面的段先存在手机里（$why）",
-            syncPending = 0,
-            syncConfirmed = activeDraft?.confirmedSegments ?: 0,
+            syncPending = seal.draft?.pendingSegments ?: prev.syncPending,
+            syncConfirmed = seal.draft?.confirmedSegments ?: prev.syncConfirmed,
+            sent = maxOf(prev.sent, seal.draft?.confirmedSegments ?: 0),
+            formatNote = seal.note.ifBlank { prev.formatNote },
+            error = seal.error.ifBlank { prev.error },
+            syncNote = if (prev.syncNote.isBlank()) {
+                offlineStatusLine(OfflineSyncState(
+                    phase = OfflinePhase.RECORDING_LOCAL,
+                    totalSegments = seal.draft?.segments?.size ?: 0,
+                    pendingSegments = seal.draft?.pendingSegments ?: 0,
+                    confirmedSegments = seal.draft?.confirmedSegments ?: 0,
+                ))
+            } else prev.syncNote,
         )
-        notifyState()
-    }
-
-    /** 把一段写进**离线清单 + app 私有目录**（离线录音的落盘动作，**不碰网络**）。 */
-    private fun appendToDraft(pcm: ByteArray) {
-        val d = activeDraft
-        if (d == null) {
-            _state.value = _state.value.copy(error = "离线清单丢了，这一段没地方存（真的可能丢音频）")
-            return
+        if (seal.error.isNotBlank()) {
+            android.util.Log.e(TAG, "会议段封存失败：${seal.error}")
         }
-        // ⚠️ 段序号要接着**水位**往下排，而不是"本地最大序号 + 1"：中途从联网转离线时
-        // 前面那几段（seq 1..watermark）在电脑上而不在本地，序号直接从 watermark+1 起
-        // —— 否则新段会从 1 重新开始，把电脑上已有的段**覆盖/重号**（转写内容就乱了）。
-        val seq = maxOf(d.segments.maxOfOrNull { it.seq } ?: 0, d.acknowledgedSegments) + 1
-        val startedAtIso = MeetingDraftStore.isoOf(System.currentTimeMillis())
-        val offset = offsetSeconds(d.startedAt, System.currentTimeMillis())
-        val seconds = segmentSeconds(this)
-        return try {
-            val f = draftStore.segmentFile(d.clientId, seq)
-            f.parentFile?.mkdirs()
-            f.writeBytes(WavWriter.wrap(pcm, SAMPLE_RATE, 1, 16))
-            val seg = DraftSegment(
-                seq = seq,
-                file = f.name,
-                startedAt = startedAtIso,
-                startOffsetSeconds = offset,
-                durationSeconds = seconds.toDouble(),
-            )
-            val updated = d.copy(
-                segments = d.segments + seg,
-                pauses = localPauses.toList(),
-                durationSeconds = offset + seconds,
-                acknowledgedSegments = d.acknowledgedSegments,
-            )
-            activeDraft = updated
-            ActiveDraft.set(updated)
-            recordedSegments = updated.segments.size
-            if (!draftStore.save(updated)) {
-                _state.value = _state.value.copy(
-                    error = "第 $seq 段存下来了，但清单没写进去（重启后可能对不上账）")
-            }
-            publishOfflineRecording(updated)
-        } catch (e: Exception) {
-            // 连缓存都写不进去：如实报出来（这是真的丢音频）
-            _state.value = _state.value.copy(error = "有一段缓存不下来，可能真的丢了：${e.message}")
+        if (seal.note.isNotBlank()) {
+            // 日志里也留一份（用户要求"界面/日志如实体现"）：真机排障时只能靠它
+            android.util.Log.w(TAG, "会议段格式：${seal.note}")
         }
-    }
-
-    /** 离线录音期间把"录到第几段/几段还没传"发布给界面（含通知）。 */
-    private fun publishOfflineRecording(d: MeetingDraft) {
-        val st = OfflineSyncState(
-            phase = OfflinePhase.RECORDING_LOCAL,
-            clientId = d.clientId,
-            pendingSegments = d.pendingSegments,
-            confirmedSegments = d.confirmedSegments,
-            totalSegments = d.segments.size,
-            drafts = 1,
-            recordingSeconds = d.durationSeconds,
-            note = _state.value.offlineNote,
-        )
-        OfflineMeetingSync.publish(st)
-        _state.value = _state.value.copy(
-            offline = true,
-            syncPhase = OfflinePhase.RECORDING_LOCAL,
-            syncPending = d.pendingSegments,
-            syncConfirmed = d.confirmedSegments,
-            syncNote = offlineStatusLine(st),
-        )
-        notifyState()
-    }
-
-    // ---- 暂停区间（离线录音要自己记账：电脑那边根本不知道手机静音了）----
-
-    private fun markPauseStart() {
-        if (pauseStartedAtOffset == null) {
-            pauseStartedAtOffset = offsetSeconds(
-                activeDraft?.startedAt ?: onlineStartedAt.ifBlank {
-                    MeetingDraftStore.isoOf(sessionStartMs)
-                },
-                System.currentTimeMillis())
-        }
-    }
-
-    /**
-     * 暂停结束（**恢复录音**或**直接结束录音**都走这里）。
-     *
-     * 为什么"结束时还静音着"也要记一条：那段静音**确实是暂停**（没有采到音），
-     * 不记的话会议里就会凭空多出一段"没人说话"的时长，而不是标着"被暂停过"。
-     */
-    private fun markPauseEnd(nowMs: Long = System.currentTimeMillis()) {
-        val from = pauseStartedAtOffset ?: return
-        pauseStartedAtOffset = null
-        val baseIso = activeDraft?.startedAt ?: onlineStartedAt.ifBlank {
-            MeetingDraftStore.isoOf(sessionStartMs)
-        }
-        val to = maxOf(from, offsetSeconds(baseIso, nowMs))
-        localPauses += DraftPause(from = from, to = to)
-        activeDraft?.let { d ->
-            val updated = d.copy(pauses = localPauses.toList())
-            activeDraft = updated
-            ActiveDraft.set(updated)
-            draftStore.save(updated)
-        }
-    }
-
-    /** 传一段；成功返回 true。失败**不抛**（调用方决定留着重试）。 */
-    private suspend fun uploadSegment(api: EchoApi, pcm: ByteArray): Boolean {
-        retryPending(api)
-        val wav = WavWriter.wrap(pcm, SAMPLE_RATE, 1, 16)
-        return try {
-            val r = api.meetingSegment(wav.toRequestBody("audio/wav".toMediaType()))
-            if (r.isSuccessful) {
-                _state.value = _state.value.copy(sent = _state.value.sent + 1, error = "")
-                notifyState()
-                true
-            } else {
-                _state.value = _state.value.copy(
-                    error = "这一段电脑没收下（HTTP ${r.code()}），留着下轮重传")
-                false
-            }
-        } catch (e: Exception) {
-            _state.value = _state.value.copy(error = "这一段没发出去（${e.message}），留着下轮重传")
-            false
-        }
-    }
-
-    private fun pendingDir(): File = File(cacheDir, "meeting-mic").apply { mkdirs() }
-
-    private fun savePending(pcm: ByteArray) {
-        try {
-            val f = File(pendingDir(), "seg-" + System.currentTimeMillis() + ".wav")
-            f.writeBytes(WavWriter.wrap(pcm, SAMPLE_RATE, 1, 16))
-            _state.value = _state.value.copy(pending = pendingFiles().size)
-            notifyState()
-        } catch (e: Exception) {
-            // 连缓存都写不进去：如实报出来（这是真的丢音频）
-            _state.value = _state.value.copy(error = "有一段缓存不下来，可能真的丢了：${e.message}")
-        }
-    }
-
-    private fun pendingFiles(): List<File> =
-        pendingDir().listFiles { f -> f.name.endsWith(".wav") }?.sortedBy { it.name } ?: emptyList()
-
-    /**
-     * 把欠的段按顺序再传一遍。
-     *
-     * **失败就停在这**（`break`）而不是跳过它继续传后面的：会议音频的**先后顺序**就是内容本身，
-     * 跳过一段先把后面的送上去，转写出来就是乱的。留着下次再试，顺序永远不破。
-     *
-     * **不可重入**：判据在 [retryGate] 里（不是各个调用方自己的标志位）—— 「立即重传」与
-     * [stopEverything] 里"结束前的补传"是**两个**入口，保护只写在其中一个上就等于没写
-     * （两轮同时进去 → 同一段被传两次 → 电脑侧多存一段、转写里同一段出现两遍）。
-     * 并发的第二次调用**立刻**返回 [RetryOutcome.SkippedBusy]，**不排队重跑**
-     * （排队会让用户的"结束"被一次上传拖住，那是更糟的体验）。
-     *
-     * [note]：要不要把结果写进 `MicState.retryNote`。**只有用户按了「立即重传」才写** ——
-     * 自动重传是后台的常事（每段上传前都会重试一轮），每次都往界面上写一句
-     * "重传完成"，那一行就会被常驻的套话占住，反而看不出手动重传的真实结果。
-     * 不论写不写 note，`pending` 段数**每次都如实更新**（那是界面与通知都在看的事实）。
-     */
-    private suspend fun retryPending(
-        api: EchoApi,
-        note: Boolean = false,
-    ): RetryOutcome = retryGate.runExclusive { retryRound(api, note) }
-
-    /** 真传的那一轮（**调用方必须已经占住 [retryGate]** —— 见 [retryPending]）。 */
-    private suspend fun retryRound(api: EchoApi, note: Boolean) {
-        var failed = false
-        for (f in pendingFiles()) {
-            try {
-                val r = api.meetingSegment(f.readBytes().toRequestBody("audio/wav".toMediaType()))
-                if (r.isSuccessful) {
-                    f.delete()
-                    _state.value = _state.value.copy(sent = _state.value.sent + 1)
-                } else {
-                    failed = true
-                    break                       // 还是不行：留着，下次再试（保顺序）
-                }
-            } catch (e: Exception) {
-                failed = true
-                break
-            }
-        }
-        val left = pendingFiles().size
-        _state.value = _state.value.copy(
-            pending = left,
-            retryNote = if (!note) _state.value.retryNote
-            else if (left == 0) "重传完成，都送出去了"
-            else if (failed) "还有 $left 段没重传成功（还留着，下轮接着试）"
-            else "还有 $left 段待重传",
-        )
         notifyState()
     }
 
     /**
-     * 界面上那个「立即重传」按下的入口（[ACTION_RETRY]）。
+     * **顺手试一次上传**（每到一段封存之后调）。
      *
-     * 与自动重传**同一条路**（[retryPending]），这里只负责：配对没配好就说清楚，
-     * 然后把这一次重传的**结果**如实写进 `retryNote`（别静默）。
+     * ## 为什么是"异步 + 有节流 + 不排队"
      *
-     * ⚠️ 这里**不再**自己置"忙"标志：上一版是先置 `retryBusy = true` 再去调 [retryPending]，
-     * 而 [retryPending] 开头的判据一看标志是 true 就 `return` —— 于是按「立即重传」**什么都没传**，
-     * 只把上一轮的 `retryNote` 清空了（看着像"按了没反应"）。现在"忙不忙"由守卫自己回答：
-     * 进去了就真传，被挡了就如实说被挡（[RetryOutcome.SkippedBusy]）。
+     *  * **异步**：它在采集协程里被调用，而 `ar.read` 是同一个协程 —— 一次卡住的网络请求
+     *    会把麦克风缓冲顶掉（**真的丢音频**）。所以只 `launch`，绝不 `await`；
+     *  * **有节流**（[offlineSyncDue]）：连不上时按退避（2s → 4s → … → 5 分钟）再试，
+     *    不会每一段都去撞一次墙；
+     *  * **不排队**：上一轮还在传（`syncGate` 占着）就**直接跳过**这一次 ——
+     *    段已经安全躺在磁盘上了，下一段封存时再试，或者用户按「现在同步」。
+     *    排队等反而会让一串上传请求堆在录音协程后面（那是"边录边传"最不该有的形状）。
      */
-    private fun retryPendingNow() {
-        val baseUrl = PairStore.baseUrl(this)
-        if (!PairStore.isPaired(this) || baseUrl.isNullOrBlank()) {
-            _state.value = _state.value.copy(retryNote = "还没配对：先配对才能重传")
-            notifyState()
-            return
-        }
-        val api = ApiClient.create(baseUrl)
-        // 上一次的结果先清掉：留着上一轮的"重传完成"会让人以为这次也完了（还没开始呢）
-        _state.value = _state.value.copy(retryNote = "")
-        ensureRetryScope().launch {
-            try {
-                when (retryPending(api, note = true)) {
-                    // 结果（"重传完成，都送出去了" / "还有 N 段…"）已经由 retryPending 写进 retryNote
-                    RetryOutcome.Ran -> Unit
-                    RetryOutcome.SkippedBusy -> {
-                        // 如实：这一次**没跑**（不是"传完了"）。不说清楚的话，用户看到的只是
-                        // "按了按钮、那一行空着"，会以为按钮坏了或段丢了。
-                        _state.value = _state.value.copy(
-                            retryNote = "上一次重传还在跑，这一次没跑（等它完再按）")
-                        notifyState()
-                    }
-                }
-            } catch (e: Exception) {
-                _state.value = _state.value.copy(retryNote = "重传出错：${e.message}")
-                notifyState()
-            }
+    private fun triggerOpportunisticUpload() {
+        if (syncGate.running) return
+        if (!offlineSyncDue(reachableNow = true)) return
+        scope.launch {
+            runOfflineSync(this@MeetingMicService, store = draftStore,
+                manual = false, scope = SyncScope.INCREMENTAL)
         }
     }
 
-    /** 手动重传的作用域（用完就在 [onDestroy] 里取消 —— 不留一个还在发请求的活作用域）。 */
-    private fun ensureRetryScope(): CoroutineScope =
-        retryScope ?: CoroutineScope(SupervisorJob() + Dispatchers.IO).also { retryScope = it }
+    /**
+     * 「新增了一段暂停区间」之后上报一次（用户 2026-10-17 的第③件事）。
+     *
+     * 走的是同一轮同步（它天然带 `start`，而暂停上报就挂在 start 成功之后）——
+     * 于是"按 clientId 幂等 + 服务端合并去重"这条契约只需要在一处实现。
+     *
+     * ⚠️ 用 [SyncScope.INCREMENTAL]：这时通常**还在录**，绝不能顺手把这一场收尾了。
+     */
+    private fun reportPausesSoon() {
+        if (syncGate.running) return
+        scope.launch {
+            runOfflineSync(this@MeetingMicService, store = draftStore,
+                manual = false, scope = SyncScope.INCREMENTAL)
+        }
+    }
 
     private fun stopEverything(reason: String) {
         // 为什么要把这个原因记下来：结束时还静音着、或补传没传完，这两件事都要
@@ -1114,78 +819,53 @@ class MeetingMicService : Service() {
         scope.launch {
             if (j != null) j.cancelAndJoin()
 
-            // 结束时还静音着：那段静音也要记成暂停区间（否则会凭空多出一段时长）
-            if (pauseStartedAtOffset != null) markPauseEnd()
+            // ① **本地收尾立刻生效**：结束时间 + 总时长落盘（结束时还静音着的话，
+            //    最后那段暂停也在这里收进清单 —— 否则会凭空多出一段"没人说话"的时长）。
+            //    为什么先做这一步再传：用户的"结束"必须**当场**生效（本地不再采音、
+            //    清单落盘），绝不能押在一次网络请求上（断网时那会变成"按了结束没反应"）。
+            val done = runCatching { session?.finish() }.getOrNull()
+            _state.value = _state.value.copy(
+                active = false, level = 0f, paused = false,
+                syncPhase = if (done != null && !done.uploaded) OfflinePhase.WAITING_UPLOAD
+                else _state.value.syncPhase,
+                syncPending = done?.pendingSegments ?: _state.value.syncPending,
+                syncNote = offlineStatusLine(OfflineSyncState(
+                    phase = if (done != null && !done.uploaded) OfflinePhase.WAITING_UPLOAD
+                    else _state.value.syncPhase,
+                    totalSegments = done?.segments?.size ?: 0,
+                    pendingSegments = done?.pendingSegments ?: 0,
+                    confirmedSegments = done?.confirmedSegments ?: 0,
+                    note = "录完了，正在补齐剩下的段并让 ECHO 收尾",
+                )),
+            )
+            notifyState()
 
-            // ---- 离线那一场：**完全本地结束**（不依赖服务端）----
-            if (offlineMode) {
-                finishOfflineDraft()
-                // 结束之后**尽力补传一次**（网络可能刚好恢复了）；传不上去也照样留着
-                runCatching { runOfflineSync(this@MeetingMicService, manual = true) }
-                _state.value = _state.value.copy(active = false, level = 0f, paused = false)
-                stopForegroundCompat()
-                stopSelf()
-                return@launch
-            }
-
-            // ---- 联网那一场：与改动前一致（先尽力补传欠的段，再让电脑结束这场会议）----
-            try {
-                val baseUrl = PairStore.baseUrl(this@MeetingMicService) ?: ""
-                if (baseUrl.isNotBlank()) {
-                    val api = ApiClient.create(baseUrl)
-                    // 这一轮**可能被"手动重传"占着而根本没跑**（[retryPending] 不可重入）。
-                    // 不排队等它 —— 用户的"结束"不该被一次上传拖住；但也**不许静默**：
-                    // 把"这次没重传完、还有 N 段留着"如实写进 retryNote（见 [stopRetryNote]）。
-                    val outcome = retryPending(api)
-                    val left = pendingFiles().size
-                    stopRetryNote(outcome, left).takeIf { it.isNotBlank() }?.let { note ->
-                        _state.value = _state.value.copy(pending = left, retryNote = note)
-                        notifyState()
-                    }
-                    api.meetingStop()
+            // ② **补齐剩余段 → 对账 → stop(clientId)**（这条路唯一的收尾动作）。
+            //    为什么要**等**正在跑的那一轮（`waitForGateMs`）：每封一段都会顺手试一次上传，
+            //    而"结束"很可能正好撞上它 —— 直接跳过的话，这一场就要等到下一次 tick
+            //    才被收尾（用户以为已经结束了，服务端却还没收到 stop = **还没有转写**）。
+            //    等待是**有界**的（见 FINALIZE_WAIT_MS）：等不到就如实说"这一次没跑"。
+            val outcome = runCatching {
+                runOfflineSync(this@MeetingMicService, store = draftStore,
+                    manual = true, scope = SyncScope.FINALIZE,
+                    waitForGateMs = FINALIZE_WAIT_MS)
+            }.getOrDefault(RetryOutcome.Ran)
+            if (outcome == RetryOutcome.SkippedBusy) {
+                // 如实：这次收尾**没跑**（另一轮占着），还有几段留着 —— 绝不假装传完了
+                val left = session?.draft?.pendingSegments ?: 0
+                stopRetryNote(RetryOutcome.SkippedBusy, left).takeIf { it.isNotBlank() }?.let { note ->
+                    _state.value = _state.value.copy(syncNote = note)
+                    notifyState()
                 }
-            } catch (e: Exception) {
-                // 停不下来就如实写在状态里；用户的"结束"已经生效（本地不再录）
             }
-            _state.value = _state.value.copy(active = false, level = 0f, paused = false)
             stopForegroundCompat()
             stopSelf()
         }
     }
 
     /**
-     * 离线那一场的收尾：写结束时间、算时长、**落盘**，然后交给补传。
-     *
-     * 为什么结束也必须落盘：`ended_at` 是补传时要交给服务端的（会议时长/时间轴靠它）。
-     * 而"结束"这一下如果只改了内存，进程一被杀这场会就永远停在"还在录"。
+     * 「结束前那次收尾」等待守卫的上限（毫秒）。见 [MeetingMicService.Companion.FINALIZE_WAIT_MS]。
      */
-    private fun finishOfflineDraft() {
-        val d = activeDraft ?: return
-        val nowMs = System.currentTimeMillis()
-        val endedAt = MeetingDraftStore.isoOf(nowMs)
-        val duration = maxOf(d.durationSeconds, offsetSeconds(d.startedAt, nowMs))
-        val done = d.copy(
-            endedAt = endedAt,
-            durationSeconds = duration,
-            pauses = localPauses.toList(),
-        )
-        activeDraft = done
-        ActiveDraft.set(done)
-        draftStore.save(done)
-        if (_state.value.syncPhase == OfflinePhase.RECORDING_LOCAL) {
-            OfflineMeetingSync.publish(OfflineSyncState(
-                phase = OfflinePhase.WAITING_UPLOAD,
-                clientId = done.clientId,
-                pendingSegments = done.pendingSegments,
-                confirmedSegments = done.confirmedSegments,
-                totalSegments = done.segments.size,
-                drafts = 1,
-                recordingSeconds = done.durationSeconds,
-                note = "录完了，等联网上传",
-            ))
-        }
-    }
-
     private fun failAndStop(msg: String) {
         _state.value = MicState(active = false, error = msg)
         notifyState()
@@ -1193,7 +873,7 @@ class MeetingMicService : Service() {
         stopSelf()
     }
 
-    /** 记一句离线那一路的原因（不覆盖 phase）。 */
+    /** 记一句这条路的原因（不覆盖 phase）。 */
     private fun syncNote(note: String) {
         _state.value = _state.value.copy(syncNote = note)
     }
@@ -1202,13 +882,10 @@ class MeetingMicService : Service() {
         runCatching { record?.release() }
         record = null
         if (liveService === this) liveService = null
-        // 手动重传那个作用域也要一起收掉：服务没了还留着它，就会"服务已停、请求还在飞"
-        retryScope?.cancel()
-        retryScope = null
         // 服务正在消失：把守卫放掉（幂等）。被取消的那一轮即使来不及走 finally，
         // 也不会让下一场录音里这个守卫一直是"在跑"。
-        retryGate.leave()
-        // ⚠️ **刻意不清 [ActiveDraft]**：进程可能只是被系统回收，清单与音频都还在磁盘上，
+        syncGate.leave()
+        // ⚠️ **刻意不清 [ActiveDraft]/[session]**：进程可能只是被系统回收，清单与音频都还在磁盘上，
         // 下一次 `tickFromForeground` / 开录时会重新读出来。清掉反而会让"接着传"失去判据。
         scope.cancel()
         super.onDestroy()
@@ -1273,29 +950,113 @@ class MeetingMicService : Service() {
 }
 
 /**
+ * 采集循环里那唯一一句语义判断（**纯逻辑，JVM 逐条可测**）：**暂停 = 照常计数，但写全零**。
+ *
+ * 用户 2026-10-16 深夜推翻了旧的"暂停不写盘"口径，并选了"手机与电脑统一"：
+ * *"暂停区间就是空白录音，不影响会议总时长，不用剃掉"*（电脑侧 `app/audio/recorder.py`
+ * 已经改完并验过：暂停时把这一块换成 `np.zeros(...)`、走**同一行写盘**、`meta["pauses"]`
+ * 只是纯标注）。手机这一侧原来是"丢帧"（`continue`）—— 这里把它改成同一口径。
+ *
+ * ## 为什么必须逐字连续（这条最容易改错）
+ *
+ * 段是按**累计写进去的样本数**切的（`buffer.size >= samplesPerSegment`）。暂停要是"丢帧、
+ * 不计数"，后面所有段的边界就**整体前移**：一场 40 分钟、中间暂停 5 分钟，音频只有 35 分钟，
+ * "第 N 段 = 挂钟第 N 个段长"这条对齐关系当场失效（转写时间轴与音频就再也对不上）。
+ * 所以暂停期间**一个样本都不能少**：拿全零补齐，样本数照常累积、`seal` 照常触发。
+ *
+ * ## 为什么是零，而不是"接着录真实声音"
+ *
+ * 暂停就是"这段时间不留内容"。录真实声音等于暂停白按了（用户要的是"这段时间不会录进会议"）。
+ * 而**不做任何剪切/补偿**是用户明确说的"不用剃掉"—— 转写里那一段没有文字，是因为
+ * **音频本身就是空白**，不是因为我们事后去剪了它。
+ *
+ * ## 为什么全零帧也要照常封段
+ *
+ * 少封一段 = 少一段音频 = 总时长变短、后面的段号与挂钟错位。全零音频编码出来还是全零
+ * （FLAC/WAV 都无损、也都允许全零帧），所以"照常封段"不会在服务端造成任何异常输入。
+ *
+ * ## 帧长与段长是整除的
+ *
+ * 真机上帧长固定 100ms（1600 样本），而合法段长是 15/30/60 秒（240000/480000/960000 样本）
+ * —— 全部整除。所以"攒够一段就封"落下去的每一段**恰好是 `samplesPerSegment` 个样本**，
+ * 段边界与挂钟刻度一一对应（这条让判据能写成"第 N 段 = 挂钟第 N 个段长"）。
+ */
+internal class MicCaptureLoop(
+    /** 这一场的每段样本数（采样率 × 段秒数；**暂停不改变它**）。 */
+    private val samplesPerSegment: Int,
+) {
+    init {
+        require(samplesPerSegment > 0) { "每段样本数必须为正：$samplesPerSegment" }
+    }
+
+    /**
+     * 喂进**一帧**（`ar.read` 的一次结果），可能因此攒满一段。
+     *
+     * [active] = false（暂停）时：源不是麦克风那一帧，而是**与之同长度的零样本**
+     * —— 长度与格式都不变（PCM 16-bit，零样本就是全零字节），只有内容变成了零。
+     *
+     * ⚠️ **满了也不清缓冲**：`sealed = true` 是"**现在去封这一段**"的指令，
+     * 而封段的人（`runLoop`）必须先读 `buffer` 拿到那一段 PCM、封完再自己 `clear()`
+     * （这里顺手清掉的话，那一段就永远丢了 —— 这正是"看着没事"的错法）。
+     *
+     * 帧是**整帧加进去**的（与旧代码同一形状，于是**一个样本都不丢**）：真机上 100ms 帧
+     * （1600 样本）能整除每个合法段长（15/30/60 秒 = 240000/480000/960000 样本），
+     * 所以"封下去的每一段恰好是 `samplesPerSegment` 个样本"始终成立。
+     * 万一参数变成不整除（帧比一段长），行为仍与旧代码一致：样本照收，段长最多多出一帧的量。
+     */
+    fun feed(
+        buffer: ArrayList<Short>,
+        frame: ShortArray,
+        n: Int,
+        active: Boolean,
+    ): MicFeed {
+        var added = 0
+        var sealed = false
+        var left = n
+        while (left > 0) {
+            val take = minOf(left, samplesPerSegment)
+            // 真音频就照抄那一段；暂停就塞**同样多个零样本** —— 帧长与格式一个都不变
+            if (active) buffer.addAll(frame.asList().subList(n - left, n - left + take))
+            else repeat(take) { buffer.add(0) }
+            added += take
+            left -= take
+            if (buffer.size >= samplesPerSegment) {   // 攒够一段：**告诉调用方去封**（暂停期间也照样封）
+                sealed = true
+                break
+            }
+        }
+        return MicFeed(added = added, sealed = sealed)
+    }
+
+    /** [feed] 的结局：这一帧贡献了几个样本、要不要现在就封一段。 */
+    data class MicFeed(val added: Int, val sealed: Boolean)
+}
+
+/**
  * 通知里那一行字（**纯函数**，JVM 可测）。
  *
- * 为什么值得单独抽出来并有判据：这一行是"录音到底有没有丢东西"的**唯一**出口 ——
- * 优先级写错了就会在最该说话的时候沉默：
+ * 为什么值得单独抽出来并有判据：这一行是"录音到底有没有丢东西"的**唯一**出口
+ * （用户不在界面里时只看得到它）—— 优先级写错了就会在最该说话的时候沉默：
  *  * 有**错误**先说错误（"有一段缓存不下来，可能真的丢了"绝不能被"在录 · 已送 3 段"盖掉）；
- *  * 静音其次（但**离线**时"已缓存 N 段 · 等联网上传"比静音那句更要紧：那关系到音频会不会丢）；
- *  * 然后是**离线**那些段（"已缓存 N 段 · 等联网上传"）；
- *  * 再是待重传（这条也在界面上写着，见 `MeetingRecordingScreen`）；
+ *  * **录音已经结束**时先说"还在往 ECHO 传"（那时最怕用户以为"关了就完了"）；
+ *  * 静音其次（但**有段没传上去**比静音那句更要紧：那关系到音频会不会丢）；
+ *  * 然后是"已缓存 N 段 · 等联网上传"（[MeetingMicService] 那条如实的同步状态）；
+ *  * 再是"还有 N 段没传上去"；
  *  * 最后才是"一切正常"。
  *
  * ⚠️ 需求里点名的口径在这里落成一句话：**没传上去绝不说"已上传"**。
- * 所以离线那几档只会出现"已缓存 / 等联网上传 / 还没传"，不出现"已上传"
- * （唯一说"已上传"的地方是补传对账通过之后的 `DONE`，而那时是真的对上了）。
+ * 所以还没对账的那些档只会出现"已缓存 / 等联网上传 / 还没传"，不出现"已上传"
+ * （唯一说"已传/已上传"的地方是段被服务端认下之后，以及 DONE 那一档的真对账通过）。
  */
 internal fun notificationText(st: MicState): String = when {
     st.error.isNotBlank() -> st.error
-    // 离线：先说"存在手机里、还没传上去"（这件事比静音要紧得多）
-    st.offline && st.syncNote.isNotBlank() -> st.syncNote
-    st.offline && st.syncPending > 0 -> "离线录音中 · 已缓存 ${st.syncPending} 段 · 等联网上传"
-    st.offline -> "离线录音中 · 声音先存在这台手机里，等联网上传"
+    // 录完了但还在传：这时最怕用户以为"已经完事了"（其实还没出文字）
+    !st.active -> "录音已结束 · " + st.syncNote.ifBlank { "正在把剩下的段传给 ECHO…" }
+    // 有段没传上去 + 有真实原因（连不上 / 服务端拒绝）：先说它（那关系到音频会不会丢）
+    st.syncPending > 0 && st.syncNote.isNotBlank() -> st.syncNote
     st.paused -> "已静音（这段不会录进会议）"
-    st.pending > 0 -> "在录（手机麦克风）· 已送 ${st.sent} 段 · ${st.pending} 段待重传"
-    else -> "在录（手机麦克风）· 已送 ${st.sent} 段"
+    st.syncPending > 0 -> "本机录音中 · 已缓存 ${st.syncPending} 段 · 等联网上传"
+    else -> "在录（手机麦克风）· 已传 ${st.sent} 段"
 }
 
 /** 手机录音那条路的状态（界面读它）。 */
@@ -1304,55 +1065,55 @@ data class MicState(
     val paused: Boolean = false,
     /** 本地电平（0..1）—— **这条路上电平是本地算的**，比电脑那条路顺得多。 */
     val level: Float = 0f,
+    /** 服务端**已认下**的段数（界面那一行"已传 N 段"）。 */
     val sent: Int = 0,
-    /** 还没送出去的段数（>0 就说明有音频躺在缓存里等重传）。 */
-    val pending: Int = 0,
     val error: String = "",
-    /**
-     * 上一次重传的**结果**（"重传完成，都送出去了" / "还有 2 段没重传成功（还留着，下轮接着试）"）。
-     *
-     * 为什么要有它：界面上按了「立即重传」之后，如果只让 `pending` 变个数字，
-     * 用户分不清"传成功了"和"按了没反应"。所以结果**明写在这一行**（别静默）。
-     */
-    val retryNote: String = "",
 
-    // ---- 离线那条路（用户 2026-10-16 的需求）----
+    // ---- 音频"传上去没有"（**唯一**的出口是 syncNote / offlineStatusLine）----
 
-    /** 这一场是不是**离线录音**（界面据此把"声音从哪来"那句话换成离线口径）。 */
-    val offline: Boolean = false,
-    /** 为什么进了离线（"ECHO 连不上（探活超时或拒绝连接）"）：界面要**如实**说这句。 */
-    val offlineNote: String = "",
-    /** 离线那一路现在的状态（等联网 / 在传 / 等服务端 / 对账完成…）。 */
+    /** 这条路现在到哪一档（本机录音中 / 等联网 / 在传 / 等服务端 / 对账完成…）。 */
     val syncPhase: OfflinePhase = OfflinePhase.IDLE,
-    /** 离线那一路要显示的那行字（**唯一**出口：`offlineStatusLine`）。 */
+    /** 要显示的那行字（**唯一**出口：`offlineStatusLine`）。 */
     val syncNote: String = "",
-    /** 还有几段离线音频没传上去（>0 就该出现「现在同步」）。 */
+    /** 还有几段**本地音频没传上去**（>0 就该出现「现在同步」；这也是"会不会丢"的唯一判据）。 */
     val syncPending: Int = 0,
-    /** 离线那些段里已经被服务端认下几段（界面用来说"已传 M 段"）。 */
+    /** 那几段里已经被服务端认下几段（界面用来说"已传 M 段"）。 */
     val syncConfirmed: Int = 0,
-    /** 有几种离线录音在等（可能不止一场）。 */
+    /** 有几场录音在等（可能不止一场：连着录了两场，第一场还没传完）。 */
     val syncDrafts: Int = 0,
+
     /**
-     * 这一场是什么时候开始的（ISO 本地时间；离线那一场用它算大计时）。
+     * 这一场是什么时候开始的（ISO 本地时间；用它算大计时）。
      *
-     * 为什么离线要把它带上来：联网那条路的 `startedAt` 是**电脑**给的
-     * （`GET /api/meeting/status`），而离线时电脑根本不在场 —— 大计时只能按
-     * 本地清单里的开始时间算，否则它会永远停在 `--:--`。
+     * 为什么永远有值：合并成一条路之后，**开始时间永远是手机自己记的**
+     * （`start` 那一刻的本地时间）—— 不再有"电脑给了 startedAt 才有值"那一档，
+     * 所以大计时不会出现按哪个分支取值的分叉。
      */
     val startedAt: String = "",
+
+    // ---- 段的格式（用户 2026-10-17 的第①件事：FLAC，编不出来退回 WAV）----
+
+    /**
+     * 「这一段用 WAV（FLAC 编码器不可用）」这类**如实**的一句话（空 = 一切按预期）。
+     *
+     * 为什么要有它：用户点名要求"在界面/日志如实体现"。只说"已缓存 3 段"是不够的
+     * —— 用户会以为每段都是 FLAC（体积减半），而实际可能整场都退回了 WAV
+     * （这句话里带着"本场已有 N 段用 WAV"的累计，见 `segmentFormatNote`）。
+     */
+    val formatNote: String = "",
 ) {
     /** 正在补传（界面据此把「现在同步」按钮换成"正在…"，别让人连点）。 */
     val syncBusy: Boolean get() = syncPhase == OfflinePhase.UPLOADING
 }
 
 /**
- * 一轮重传（[MeetingMicService.retryPending]）的结局。
+ * 一轮同步（[MeetingMicService.runOfflineSync] / `RetryGuard`）的结局。
  *
  * 为什么要有"没跑"这一档，而不是只回 true/false：调用方需要**如实**告诉用户
  * "这一次没跑，因为另一轮正在跑" —— 只说"没成功"会让人以为音频又丢了一段。
  */
 internal enum class RetryOutcome {
-    /** 真跑了（成没成看 `MicState.pending`：>0 就是还有没送出去的段）。 */
+    /** 真跑了（成没成看这份清单的 `pendingSegments`：>0 就是还有没送出去的段）。 */
     Ran,
 
     /** **没跑** —— 另一轮已经占着守卫（不排队、不等待）。 */
@@ -1360,13 +1121,17 @@ internal enum class RetryOutcome {
 }
 
 /**
- * 「这一轮重传是不是我在跑」的**唯一**判据（纯逻辑，JVM 可测）。
+ * 「这一轮同步是不是我在跑」的**唯一**判据（纯逻辑，JVM 可测）。
  *
  * 为什么值得单独一个类并有判据：同一段音频被传两次，电脑侧就多存一段
- * （转写里同一段出现两遍），而这件事在手机这边**完全静默** —— 界面照样显示"重传完成"。
+ * （转写里同一段出现两遍），而这件事在手机这边**完全静默** —— 界面照样显示"传完了"。
  * 所以"不可重入"必须是**一处**说了算的：谁跑谁占（[runExclusive]），
- * 并发的第二个调用者**立刻**拿到 [RetryOutcome.SkippedBusy]（**不排队** ——
- * 排队会让用户的"结束"被一次上传拖住）。
+ * 并发的第二个调用者**立刻**拿到 [RetryOutcome.SkippedBusy]。
+ *
+ * 而[runExclusiveWaiting] 是同一个守卫的**有界等待**版本：只有"结束录音时那一次收尾"
+ * 用它 —— 那一刻很可能正有一轮机会性上传在跑，而"收尾"是**不能等下一次 tick** 的
+ * （用户以为已经结束了，服务端却还没收到 stop = 还没有转写）。等待有上界，
+ * 等不到就如实回 [RetryOutcome.SkippedBusy]（绝不假装传完了）。
  */
 internal class RetryGuard {
 
@@ -1390,8 +1155,8 @@ internal class RetryGuard {
     /**
      * 占着守卫跑一轮 [block]：进得去就 `Ran`，别人占着就**立刻** `SkippedBusy`（不排队）。
      *
-     * `try/finally` 是硬要求：上传抛异常时也必须放掉 —— 否则一次失败就把重传**永久锁死**
-     * （「立即重传」从此按了没反应，而 `pending` 一直不降，用户无路可走）。
+     * `try/finally` 是硬要求：上传抛异常时也必须放掉 —— 否则一次失败就把同步**永久锁死**
+     * （「现在同步」从此按了没反应，而待传段数一直不降，用户无路可走）。
      */
     suspend fun runExclusive(block: suspend () -> Unit): RetryOutcome {
         if (!tryEnter()) return RetryOutcome.SkippedBusy
@@ -1402,15 +1167,43 @@ internal class RetryGuard {
             leave()
         }
     }
+
+    /**
+     * 等守卫空出来再跑（最多等 [timeoutMs]，每 [stepMs] 看一次）。
+     *
+     * 为什么要单独有这一档（只在"结束录音"那一次收尾用）：那一刻正跑着的那一轮是
+     * **机会性上传**（每封一段都会顺手试一次），它总会结束（最坏就是这一轮的段都传完）；
+     * 而如果直接 [runExclusive] 被挡，这一场的收尾就要等到下一次 tick ——
+     * 用户以为已经结束了，服务端却还没收到 stop（= **还没有转写**）。
+     * 等不到（超时）仍然如实回 [RetryOutcome.SkippedBusy]：宁可说"这次没跑、下次接着试"，
+     * 也绝不假装传完了。
+     */
+    suspend fun runExclusiveWaiting(
+        timeoutMs: Long,
+        stepMs: Long = 100L,
+        block: suspend () -> Unit,
+    ): RetryOutcome {
+        val deadline = System.currentTimeMillis() + maxOf(0L, timeoutMs)
+        while (!tryEnter()) {
+            if (System.currentTimeMillis() >= deadline) return RetryOutcome.SkippedBusy
+            delay(stepMs)
+        }
+        try {
+            block()
+            return RetryOutcome.Ran
+        } finally {
+            leave()
+        }
+    }
 }
 
 /**
- * 「结束录音前那次补传」的结局 → 如实的一句话（**纯函数**，JVM 可测）。
+ * 「结束录音时那次收尾」的结局 → 如实的一句话（**纯函数**，JVM 可测）。
  *
- * 为什么单独抽出来：这一轮**可能被"手动重传"占着而根本没跑**。什么都不说的话，
- * 用户看到的是"我按了结束、待重传的数字还在"，却分不清是"没跑"还是"传失败了"
- * （说错原因会把人引去查网络）。返回空串 = 没有欠的段，没什么要说的
- * （别用套话占住界面上那一行）。
+ * 为什么单独抽出来：这一轮**可能被另一轮同步占着而根本没跑**（机会性上传正好在跑，
+ * 而等待也有上界）。什么都不说的话，用户看到的是"我按了结束、待传的数字还在"，
+ * 却分不清是"没跑"还是"传失败了"（说错原因会把人引去查网络）。
+ * 返回空串 = 没有欠的段，没什么要说的（别用套话占住界面上那一行）。
  */
 internal fun stopRetryNote(outcome: RetryOutcome, left: Int): String = when {
     left <= 0 -> ""

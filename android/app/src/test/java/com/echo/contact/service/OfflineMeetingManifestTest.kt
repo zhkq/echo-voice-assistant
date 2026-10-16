@@ -1,5 +1,6 @@
 package com.echo.contact.service
 
+import com.echo.contact.audio.SegmentFormat
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -180,9 +181,50 @@ class OfflineMeetingManifestTest {
         assertNotNull(store.load("x"))
     }
 
+    // ---------------------------------------------------------------- 段的格式（第①件事）
+
     @Test
-    fun `clip：只有真的传完并核对一致才标 uploaded`() {
-        val store = MeetingDraftStore(tmp.newFolder("offline"))
+    fun `每一段的格式都往返不丢（FLAC 与 WAV 混在一场里也要各自记对）`() {
+        val d = draft(segs = listOf(
+            seg(1).copy(file = "seg-0001.flac", format = SegmentFormat.FLAC),
+            seg(2).copy(file = "seg-0002.wav", format = SegmentFormat.WAV),
+        ))
+        val back = OfflineMeetingJson.decode(OfflineMeetingJson.encode(d))!!
+        assertEquals(SegmentFormat.FLAC, back.segments[0].format)
+        assertEquals(SegmentFormat.WAV, back.segments[1].format)
+        assertEquals("文件名与格式要一起往返（补传按 file 找音频）",
+            listOf("seg-0001.flac", "seg-0002.wav"), back.segments.map { it.file })
+        assertEquals("整份也要一字不差", d, back)
+    }
+
+    @Test
+    fun `老清单里没有 format 字段的段按 WAV 收（那时真的只有 WAV）`() {
+        val text = """
+            { "client_id": "phone-1", "started_at": "T",
+              "segments": [ {"seq":1,"file":"seg-0001.wav"} ] }
+        """.trimIndent()
+        val d = OfflineMeetingJson.decode(text)!!
+        assertEquals("缺字段 = 旧版本写的 = 那些段确实是 WAV；"
+            + "**不许**按后缀猜到别的格式上去（format 是发出去时用的那一项）",
+            SegmentFormat.WAV, d.segments[0].format)
+        assertNull("认不出来的格式也不许猜成 FLAC",
+            SegmentFormat.ofId("opus").takeIf { it != SegmentFormat.WAV })
+    }
+
+    @Test
+    fun `段文件名跟着格式走（补零顺序不变）`() {
+        assertEquals("seg-0001.flac", MeetingDraftStore.segmentName(1, SegmentFormat.FLAC))
+        assertEquals("seg-0012.wav", MeetingDraftStore.segmentName(12, SegmentFormat.WAV))
+        assertEquals("默认档是 WAV（老调用点的行为一个字都不变）",
+            "seg-0007.wav", MeetingDraftStore.segmentName(7))
+        // 音频文件按**清单里记的那个名字**解析 —— 所以它必须与写入时用的一致
+        val store = MeetingDraftStore(tmp.newFolder("by-name"))
+        val seg = seg(1).copy(file = "seg-0001.flac", format = SegmentFormat.FLAC)
+        assertEquals(File(store.dirOf("x"), "seg-0001.flac"), store.audioFileOf("x", seg))
+    }
+
+    @Test
+    fun `clip：只有真的传完并核对一致才标 uploaded`() {        val store = MeetingDraftStore(tmp.newFolder("offline"))
         val d = draft(segs = listOf(seg(1), seg(2)))
         val ok = store.markUploaded(d, serverMeetingId = 77)
         assertTrue(ok.uploaded)

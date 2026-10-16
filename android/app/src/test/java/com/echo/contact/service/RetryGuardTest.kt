@@ -10,12 +10,12 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * 「待重传」那条路上的**不可重入判据**（`RetryGuard`）与"结束前补传被挡了怎么说"
+ * 「同一段别传两遍」那条路上的**不可重入判据**（`RetryGuard`）与"结束前那次收尾被挡了怎么说"
  * （`stopRetryNote`）—— 两者都是纯逻辑，JVM 可测。
  *
  * 为什么这件小事值得一组用例：同一段音频被传两次**在手机这边完全静默**
- * （界面照样说"重传完成"），代价是电脑侧多存一段、转写里同一段出现两遍。
- * 而补传有**两个**入口（界面上的「立即重传」、结束录音前那次尽力补传），
+ * （界面照样说"传完了"），代价是电脑侧多存一段、转写里同一段出现两遍。
+ * 而同步有**两个**入口（每封一段顺手试一次、结束前那次收尾），
  * 保护只写在其中一个上就等于没写 —— 所以判据只能有一处，用例就钉那一处。
  */
 class RetryGuardTest {
@@ -82,7 +82,7 @@ class RetryGuardTest {
     }
 
     @Test
-    fun `异常路径也会 leave、不会把重传永久锁死`() = runBlocking {
+    fun `异常路径也会 leave、不会把同步永久锁死`() = runBlocking {
         val g = RetryGuard()
         try {
             g.runExclusive { throw IllegalStateException("上传抛了") }
@@ -91,7 +91,38 @@ class RetryGuardTest {
             assertEquals("上传抛了", e.message)
         }
         assertFalse("抛异常也要 leave()（try/finally 保证）—— 否则守卫永远是'在跑'", g.running)
-        assertTrue("所以下一轮还能进（界面上「立即重传」不会变成按了没反应）", g.tryEnter())
+        assertTrue("所以下一轮还能进（界面上「现在同步」不会变成按了没反应）", g.tryEnter())
+        g.leave()
+    }
+
+    // ---- 有界等待那一档（"结束录音"时那一次收尾用）----
+
+    @Test
+    fun `等待那一档：占着的一方放掉之后能进去并真跑`() = runBlocking {
+        val g = RetryGuard()
+        assertTrue(g.tryEnter())                 // 模拟"一轮机会性上传正在跑"
+        var ran = false
+        val t = Thread {
+            Thread.sleep(120)
+            g.leave()                            // 它跑完了
+        }
+        t.start()
+        val out = g.runExclusiveWaiting(timeoutMs = 5_000, stepMs = 20) { ran = true }
+        t.join(5_000)
+        assertEquals(RetryOutcome.Ran, out)
+        assertTrue("等到了就**必须真跑**（不然'结束'那一下的收尾就白等了）", ran)
+        assertFalse("跑完要放掉", g.running)
+    }
+
+    @Test
+    fun `等待那一档：等不到就如实回 SkippedBusy 而且不许偷偷跑`() = runBlocking {
+        val g = RetryGuard()
+        assertTrue(g.tryEnter())                 // 另一方一直占着（比如网络卡住）
+        var ran = false
+        val out = g.runExclusiveWaiting(timeoutMs = 200, stepMs = 20) { ran = true }
+        assertEquals("等不到就说'这次没跑'（绝不假装传完了）", RetryOutcome.SkippedBusy, out)
+        assertFalse("被挡就不能偷偷跑一遍", ran)
+        assertTrue("更不许把占着的那一方放掉", g.running)
         g.leave()
     }
 

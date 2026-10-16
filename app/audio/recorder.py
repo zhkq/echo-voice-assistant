@@ -416,18 +416,25 @@ class MeetingRecorder:
         # 避免"麦打不开但界面显示录音中、最后留下空会议"）
         self.error = None
         self._started = threading.Event()
-        #: 暂停 = **不写盘、不产生音频**（会议中途休息/私聊）。
-        #: 采集流**不关** —— 恢复要立刻，不能有"重开设备"的竞态（那会让你丢开头半秒）。
+        #: 暂停 = **照常录、但内容写成全零（空白）音频**（会议中途休息/私聊）。
+        #: 采集流**不关**，而且**每一块照写** —— 时间轴据此保持逐字连续
+        #: （用户 2026-10-16 深夜推翻了 2026-10-15 的"不写盘"口径；完整理由见 `_loop` 里
+        #: `if self.paused:` 那段注释）。
         self.paused = False
 
     def pause(self):
-        """暂停写盘。幂等，返回是否有变化（调用方据此判断"本来就暂停着"）。"""
+        """暂停：**继续录，但写进文件的是全零（空白）**。
+
+        幂等，返回是否有变化（调用方据此判断"本来就暂停着"）。
+        为什么不停线程/不关流：一关一开就有"丢掉开头半秒"的竞态，而且**时间轴会出现缺口**
+        —— 段与段之和会比挂钟短，段边界从此对不上挂钟（见 `_loop`）。
+        """
         changed = not self.paused
         self.paused = True
         return changed
 
     def resume(self):
-        """恢复写盘。幂等，返回是否有变化。"""
+        """恢复：接着写**真实**音频（暂停那段留在盘上的就是全零）。幂等，返回是否有变化。"""
         changed = self.paused
         self.paused = False
         return changed
@@ -477,21 +484,46 @@ class MeetingRecorder:
                     a = data.astype(np.float32) / 32768.0
                     self.level = min(1.0, float(np.sqrt(np.mean(a * a))) * 30.0)
                     if self.paused:
-                        # 暂停期间：**丢掉这段音频**（不写盘），电平记 0（面板与手机据此显示
-                        # "已暂停"）。为什么不写静音帧：那会让转写里出现"这段没人说话"的假象，
-                        # 而真相是"这段时间没在录" —— 事实记在 meta 的 `pauses` 里（见 meeting.py）。
-                        self.level = 0.0
+                        # 暂停期间：**照常写盘，但写进去的是全零（空白）**。
+                        #
+                        # 用户 2026-10-16 深夜的口径（推翻 2026-10-15 的"不写盘、不产生音频"）：
+                        #   *"暂停区间就是空白录音，不影响会议总时长，不用剃掉"*。
+                        #
+                        # 为什么必须**逐字连续**（这里是整条改动最容易改错的地方）：
+                        #   段是按"写进去的采样数"切分的（下面 `samples >= seg_samples`）。
+                        #   暂停要是像旧实现那样 `continue` 把音频丢掉，这段采样就不计数 ——
+                        #   一场 40 分钟、中间暂停 5 分钟的会只剩 35 分钟，而且**后面的段边界
+                        #   整体前移 5 分钟**（第 N 段覆盖的不再是挂钟的 10N~10N+10 分钟）。
+                        #   补零就把"这段采样"照原样记进时间轴：总长仍 = 挂钟时长，段边界
+                        #   永远落在挂钟的整段刻度上，不漂。
+                        # 为什么是**零**而不是"接着录真实声音"：暂停就是"这段时间不想留下内容"，
+                        #   写真实声音等于暂停白按了（用户要的就是"空白录音"）。
+                        # 为什么**不做剪切/补偿**：用户明确说"不用剃掉" —— 转写里那段没有文字，
+                        #   是因为音频本身就是空白，不是因为我们事后剪掉/补了它；`meta["pauses"]`
+                        #   只是**标注**（记下这几段是暂停的），不参与任何拼接或裁剪。
+                        #
+                        # 采样率/声道/位深**一个都不变**（换了格式，后面的段就没法拼了），
+                        # 连"每块多少帧"也保持一致：波形界面与段长都按这个节奏对齐。
+                        self.level = 0.0             # 电平记 0：面板与手机据此显示"已暂停"
                         if self.level_cb:
                             try:
                                 self.level_cb(0.0)
                             except Exception:
                                 pass
-                        continue
-                    if self.level_cb:
-                        try:
-                            self.level_cb(self.level)
-                        except Exception:
-                            pass
+                        # 用与真实音频**同形状、同 dtype** 的零数组替换这一块。
+                        # ⚠️ **不能**用整段缓冲区的长度去凑（`np.zeros(seg_samples)`）：
+                        # 那样写进文件的帧数就不再等于"真的过掉的时间"，时间轴会开始漂
+                        # （这里正是"逐字连续"的判据）。
+                        # `np.zeros(len(data), dtype=data.dtype)`（不是 `zeros_like`）：
+                        # 明确要零，别让日后的改动把"空白"变成"把真数据原样写着"。
+                        block = np.zeros(len(data), dtype=data.dtype)
+                    else:
+                        if self.level_cb:
+                            try:
+                                self.level_cb(self.level)
+                            except Exception:
+                                pass
+                        block = data
                     if writer is None:
                         seg_idx += 1
                         name = f"{seg_idx:02d}.wav"
@@ -505,8 +537,9 @@ class MeetingRecorder:
                     # 已写入的部分仍在磁盘上。注意 WAV 头里的长度字段由 wave 模块在
                     # close() 时才回填，所以这里是"数据已落盘、头还没定稿"；正常路径由
                     # finally 的 close_segment() 收尾（硬杀进程会留下占位长度的头，
-                    # 属已知限制，见 PR #5 的说明）。
-                    writer.writeframes(np.ascontiguousarray(data).tobytes())
+                    # 属已知限制，见 PR #5 的说明）。暂停时 block 就是上面那块零，
+                    # 走的是**同一行写盘**：时间轴因此不会因为暂停而少一帧。
+                    writer.writeframes(np.ascontiguousarray(block).tobytes())
                     audio_file.flush()
                     if name not in self.segments:
                         self.segments.append(name)

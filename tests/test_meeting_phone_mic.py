@@ -88,11 +88,19 @@ class PhoneMicTests(unittest.TestCase):
         for seg in ("01.wav", "02.wav", "03.wav"):
             self.assertTrue(os.path.isfile(os.path.join(self.tmp, name, seg)))
 
-    def test_a_non_wav_segment_is_refused(self):
+    def test_a_non_audio_segment_is_refused(self):
+        """裸 body 但**不是音频**：下游按文件真格式读，塞 mp3/垃圾进去会在转写时炸。
+
+        2026-10-16：这条接口现在**也收 FLAC**（`fLaC` 魔数，见
+        `tests/test_meeting_offline_flac.py`），所以拒绝理由从"不是 WAV"改成
+        "不是音频（WAV/FLAC 都不是）"。判据本身（**认不出的字节一律拒**）没动。
+        """
         meeting_mod.start_meeting_phone()
         ok, why = meeting_mod.append_meeting_segment(b"ID3\x04\x00\x00 this is an mp3")
         self.assertFalse(ok)
+        self.assertIn("不是音频", why)
         self.assertIn("WAV", why)
+        self.assertIn("FLAC", why)
 
     def test_the_local_mic_meeting_refuses_phone_segments(self):
         """两路音频混进同一场 = 转写里两个人同时说话 —— 必须明确拒绝。"""

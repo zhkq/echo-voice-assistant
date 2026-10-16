@@ -93,10 +93,16 @@ _state = {
     "level": 0.0,
     "error": "",
     #: 暂停（会议中途休息/私聊）：`paused` 给状态接口，`pauses` 记下区间进 meta ——
-    #: "少录了一段"必须留下痕迹，不许变成转写里莫名其妙的一段空白（2026-10-15 用户要的
-    #: 全屏录音界面里有「静音/恢复」按钮，语义就是这两个键）。
+    #: **暂停期间照常录音，写进去的是全零（空白）音频**（2026-10-16 深夜用户口径，
+    #: 推翻了 2026-10-15 的"不写盘、不产生音频"），所以 `pauses` 从此是**纯标注**
+    #: （"这几段是暂停的"），**不参与任何拼接/裁剪/补偿**（用户原话："不用剃掉"）。
     "paused": False,
     "pauses": [],
+    #: 暂停/恢复**在进程内**发生过的时刻（`[{"at": epoch, "paused": True/False}, …]`）。
+    #: ⚠️ **用例专用**（`tests/test_meeting_pause.py` 拿它把"零音频在音频文件里的位置"
+    #: 与"何时按的静音"对上，不必把 `meta` 里那对按秒取整的 `from/to` 当成真相）；
+    #: 它**不进任何接口回包**（`meeting_status()` 的键集是既有契约，不许加键）。
+    "_pause_events": [],
     #: 采集源：`pc`（电脑的麦，默认）| `phone`（手机按段传上来的，2026-10-15）。
     #: 它决定三件事：停止时要不要收录音器、手机能不能传段、界面上那句"声音来自哪支麦"。
     "source": "pc",
@@ -723,8 +729,12 @@ def _meeting_id_for(folder=""):
 def _save_meta(folder, meta):
     """把 meta 立刻写回磁盘（暂停/恢复时用）。
 
-    为什么要**当场**写：暂停区间是"这段时间没在录"的唯一证据，进程崩了也要留得下；
-    只在 stop 时写的话，崩溃 = 那段空白永远没人解释得清。
+    为什么要**当场**写：`meta["pauses"]` 是"这几段是暂停的"的**唯一凭据**，进程崩了也要
+    留得下（音频里那几段全零，事后没人解释得清是暂停还是故障）；只在 stop 时写的话，
+    崩溃 = 那段空白永远没人说得清。
+
+    ⚠️ 这份记录是**纯标注**（2026-10-16 口径）：它只说明"这几段被暂停过"，
+    **不参与任何拼接/裁剪/补偿** —— 音频本身已经是"照常录 + 写零"的连续时间轴了。
     """
     try:
         with open(os.path.join(folder, "meta.json"), "w", encoding="utf-8") as f:
@@ -746,8 +756,33 @@ def _pause_common(by=""):
     return _state.get("recorder"), folder, meta, ""
 
 
+def _record_pause_event(paused):
+    """把这一次暂停/恢复的**精确时刻**记进进程内的 `_state["_pause_events"]`（用例专用）。
+
+    为什么不能拿 `meta["pauses"]` 的 `from/to` 当真相：它们按**秒**取整
+    （`isoformat(timespec="seconds")`，那是给人和面板看的既有写法，不许改），
+    而"零音频到底从哪个采样开始"是**缓冲级**的精度 —— 差半秒就分不出
+    "补零的位置对"还是"差了半个缓冲"。所以判据另留一份**没取整**的时刻。
+    """
+    try:
+        _state.setdefault("_pause_events", []).append(
+            {"at": time.time(), "paused": bool(paused)})
+    except Exception:                                              # noqa: BLE001
+        pass
+
+
 def pause_meeting(by=""):
-    """暂停录音：**不写盘、不产生音频**，采集流不关（恢复要立刻）。
+    """暂停录音：**照常录，但写进文件的都是全零（空白）音频**；采集流不关（恢复要立刻）。
+
+    用户 2026-10-16 深夜的口径（**作废** 2026-10-15 的"不写盘、不产生音频"）：
+    *"暂停区间就是空白录音，不影响会议总时长，不用剃掉"*。所以：
+
+      * **时间轴逐字连续**：暂停那几分钟照样算进音频总长（40 分钟、暂停 5 分钟 → 音频仍是
+        40 分钟），第 N 段覆盖的仍是挂钟的 `10N ~ 10N+10` 分钟 —— 段边界**不漂**；
+      * **内容是零**：暂停区间的样本全为零（"暂停 = 不想留下内容"），不是"接着录真实声音"；
+      * **不做任何剪切/补偿**：`meta["pauses"]` 只是**标注**（`from`/`to`/`by` 照旧记录、
+        **暂停时立刻落盘**照旧），它不参与拼接/裁剪 —— 用户明确说"不用剃掉"；
+      * 接口签名与回包（`ok`/`message`）**一个字不改**（面板与手机都按它走）。
 
     返回值 `(ok, message)` —— 调用方（手机/面板）直接把这句给人看。
     """
@@ -756,13 +791,14 @@ def pause_meeting(by=""):
         if err:
             return False, err
         if _state.get("paused"):
-            return True, "已经在暂停着（这段时间不会录进会议）"
+            return True, "已经在暂停着（这段时间录进去的是空白）"
         if recorder is not None:
-            # 本机麦那条路：让录音器**停止写盘**（它把这段音频丢掉，电平记 0）。
-            # 手机麦那条路没有 recorder —— 静音由手机那边停止上传实现，这边只记区间。
+            # 本机麦那条路：让录音器**把这一块写成零**（它照常写盘、不丢采样，见 recorder）。
+            # 手机麦那条路没有 recorder —— 空白由手机那边"停止上传"实现，这边只记区间。
             recorder.pause()
         now = datetime.datetime.now().isoformat(timespec="seconds")
         _state["paused"] = True
+        _record_pause_event(True)
         entry = {"from": now, "to": "", "by": str(by or "")}
         pauses = _state.setdefault("pauses", [])
         pauses.append(entry)
@@ -770,11 +806,11 @@ def pause_meeting(by=""):
         meta["pauses"] = list(pauses)
         _save_meta(folder, meta)
         db.add_log("info", "meeting", "录音已暂停（%s）" % (by or "本机"))
-        return True, "录音已暂停：这段时间不会录进会议（恢复后接着录）"
+        return True, "录音已暂停：这段时间录进去的是空白（会议总时长不变，恢复后接着录）"
 
 
 def resume_meeting(by=""):
-    """恢复录音：接着写新的段（暂停那段是真空白，转写里不会有假静音）。"""
+    """恢复录音：接着写**真实**音频（暂停那段留在盘上的仍是全零，时间轴不断）。"""
     with _state_lock:
         recorder, folder, meta, err = _pause_common(by)
         if err:
@@ -785,6 +821,7 @@ def resume_meeting(by=""):
             recorder.resume()
         now = datetime.datetime.now().isoformat(timespec="seconds")
         _state["paused"] = False
+        _record_pause_event(False)
         pauses = _state.setdefault("pauses", [])
         if pauses and not pauses[-1].get("to"):
             pauses[-1]["to"] = now
@@ -929,6 +966,9 @@ def start_meeting_phone(origin=ORIGIN_PC):
             diarize=1 if meta["config"]["diarize"] else 0)
         _state.update(active=True, folder=folder, recorder=None,
                       started_at=meta["start"], error="", paused=False, pauses=[],
+                      # 上一场的"何时按过静音"不许粘到这一场（内存状态跨会议复用）：
+                      # 它是用例的判据，粘过来就会让"零音频的位置"对不上这一场的暂停。
+                      _pause_events=[],
                       source="phone", origin=meta["initiatedBy"],
                       # 本机麦/这条"没有 clientId"的路必须**显式**把离线补传那两个键清掉：
                       # 内存状态是跨会议复用的，漏一处就会让上一场的 id 粘到新一场上。
@@ -1119,7 +1159,9 @@ def start_meeting_phone_sync(client_id, started_at="", ended_at="", origin=ORIGI
         # 幂等索引：库一份（`start` 下次就靠它）、meta 一份（人肉排查/库丢了也能认出来）
         db.bind_meeting_client_id(cid, name)
         _state.update(active=True, folder=folder, recorder=None, started_at=start,
-                      error="", paused=False, pauses=[], source="phone",
+                      error="", paused=False, pauses=[],
+                      _pause_events=[],       # 同上：上一场的静音时刻不许粘过来
+                      source="phone",
                       origin=meta["initiatedBy"], client_id=cid, meeting_id=meeting_id,
                       seg_count=0)
         db.add_event("meeting_started", {"meeting": name, "id": meeting_id,
@@ -1143,16 +1185,82 @@ def _segment_seq_map(segs):
     return out
 
 
+#: 段能被收下的两种魔法数（**文件头的前 4 个字节**）。
+#: 为什么**按魔数认、不看 Content-Type**（2026-10-16 用户口径）：
+#:   1. 决定"这段音频后面怎么被读出来"的**是字节本身**，不是 HTTP 头 —— 转写/分离/播放
+#:      全都拿盘上那个文件去读，头里写 `audio/flac` 而 body 是 wav（或反过来）时，
+#:      按头信任会把一个**下游解不开**的文件收下盘，用户看到的是"转写莫名其妙失败"；
+#:   2. Content-Type 是客户端**可以省略/写错**的可选字段（安卓 `OkHttp` 建 body 时漏一个
+#:      参数就是 `application/octet-stream`），而魔数是协议里**没有歧义**的那一份；
+#:   3. 判据只有一份：收下时按魔数认、落盘时按同一个结论定后缀、读取时（`audiofile` 的
+#:      `SEGMENT_RE` / `resolve_segment`）本来也按后缀认 —— 三处不可能漂移。
+_MAGIC_WAV = b"RIFF"
+_MAGIC_FLAC = b"fLaC"
+
+
 def _is_wav(data):
-    """裸 body 是不是一段 WAV（`RIFF` 头 + 至少 44 字节头）—— 这个判据**只写一份**。"""
-    return bool(data) and len(data) >= 44 and bytes(data[:4]) == b"RIFF"
+    """裸 body 是不是一段 WAV（`RIFF` 头 + 至少 44 字节头）。"""
+    return bool(data) and len(data) >= 44 and bytes(data[:4]) == _MAGIC_WAV
+
+
+def _is_flac(data):
+    """裸 body 是不是一段 FLAC（`fLaC` 魔数）。
+
+    长度闸门取 44 与 wav 那条**同一条线**：刻意的取舍 —— 真正的结构校验（能不能解码出
+    帧）交给**用时解码**那条唯一的路（`audiofile.decode_to_wav`），不在这里做：
+      * 上传这条路上实时解一遍整段音频会让"逐段补传"变慢（几十 MB 的会议音频要白解一次）
+        而且失败原因反而说不清（是坏包还是没装 codec？）；
+      * 而**收下的东西不会静默丢**：`_transcribe_impl` 的解码失败会**响亮失败并留痕**
+        （`decode_to_wav` 抛 `CompressionError`，见 `test_corrupt_flac_raises_at_decode_time...`）。
+    所以"垃圾字节"在下面被拒，而"看着像但解不开"由转写如实报错 —— 两头都没有谎报。
+    """
+    return bool(data) and len(data) >= 44 and bytes(data[:4]) == _MAGIC_FLAC
+
+
+def _is_audio(data):
+    """裸 body 是不是**认得的**音频段（wav 或 flac）—— 收段这条路的唯一闸门。"""
+    return _is_wav(data) or _is_flac(data)
+
+
+def _seg_name_for(data, want):
+    """按 body 的真格式给段定名：wav → `NN.wav`、flac → `NN.flac`（编号规则两条路一样）。"""
+    return "%02d%s" % (want, audiofile.WAV_EXT if _is_wav(data) else audiofile.FLAC_EXT)
+
+
+def _stored_seg_name(segs, want):
+    """这个段号在 `meta["segments"]` 里**已经**用哪个文件名存着（没有 = 空串）。
+
+    ⚠️ 必须取盘上那个名字，不能拿**这次 body 的格式**去拼：补传重试的可能是另一种格式
+    （客户端升级后同一段改发 flac），而 `meta` 里记的是先到的那个 —— 回错了名字，
+    客户端会以为"服务端存的不是我这一份"，于是永远对不上账。
+    """
+    for nm in segs or []:
+        try:
+            idx = int(str(nm).split(".")[0])
+        except (TypeError, ValueError):
+            continue
+        if idx == int(want) and os.path.basename(str(nm)) == str(nm):
+            return str(nm)
+    return ""
 
 
 def _seg_result(ok, message, name="", duplicate=False, seq=0, folder="", meta=None,
                 client_id=""):
-    """段操作的结构化结果（`ok/message` + 对账要的那几个字段）。**唯一**的拼装处。"""
+    """段操作的结构化结果（`ok/message` + 对账要的那几个字段）。**唯一**的拼装处。
+
+    ⚠️ `name` 是**落盘的那个段名**（`NN.wav` / `NN.flac`），`message` 是给人看的那句话。
+    `api.meeting_segment` 成功时**读的是 `name`**，而段这条路上 `message` 里放的一直就是
+    段名（`_apply_segment` 的既有写法）—— 只填一个，另一个就会是空串，客户端在
+    **第一次上传**（非幂等）那条路上拿到的段名就是空的（"服务端到底收了我第几段"答不上来）。
+    所以成功时把没填的那一格补成同一个字符串：**段这条路上两者恒等**，谁读哪一格都不会空。
+    （失败时不补：那时 `name` 就该是空，`message` 是拒绝原因。）
+    """
     meta = meta if isinstance(meta, dict) else {}
     smap = _segment_seq_map(meta.get("segments") or [])
+    if ok and not name:
+        name = message
+    if ok and not message:
+        message = name
     return {
         "ok": bool(ok),
         "message": message,
@@ -1193,8 +1301,8 @@ def _duplicate_from_a_finished_meeting(client_id, seq):
     smap = _segment_seq_map((meta or {}).get("segments") or [])
     if seq not in smap:
         return None
-    return _seg_result(True, smap[seq], duplicate=True, seq=seq, folder=folder, meta=meta,
-                       client_id=cid)
+    return _seg_result(True, smap[seq], name=smap[seq], duplicate=True, seq=seq,
+                       folder=folder, meta=meta, client_id=cid)
 
 
 def _apply_segment(data, name="", client_id="", seq=0, started_at=""):
@@ -1207,22 +1315,31 @@ def _apply_segment(data, name="", client_id="", seq=0, started_at=""):
     判据（顺序即优先级）：
       * 必须在录、而且**是"你这一份"**（带了 clientId 就必须与当前那场相等）；
       * 必须是"手机麦"那场（本机麦那条路不接受外来段，否则两路音频混进同一场）；
-      * **必须是 WAV**（`RIFF` 头）：下游按 wav 读，塞个 mp3 进去会在转写时报很难追的错；
+      * **必须是认得的音频**（`RIFF` 或 `fLaC` 魔数，见 `_is_audio`）：下游按文件真格式读，
+        塞个 mp3/垃圾字节进去会在转写时报很难追的错；
       * `(clientId, seq)` **已存在 = 幂等命中**：当成功回 `duplicate`，**不许存第二遍**；
       * 没给 seq（老客户端）→ 仍由电脑按现有段号往下排（既有行为）。
+
+    WAV 那条路**逐字节不变**（`NN.wav`、同样的编号与幂等规则）；FLAC 只是多了一种
+    "认得"的格式，落盘成同名不同后缀的 `NN.flac` —— 会不会被当成重复由**段号**决定，
+    与后缀无关（`_stored_seg_name`）。
     """
     with _state_lock:
         cid = str(client_id or "").strip()
+        # **音频判据放在最前面**：它不是"这一场能不能收"的问题，而是"这到底是不是一段音频"——
+        # 无论有没有在录，塞进来的垃圾字节都该得到同一个原因（"这段不是音频"）。放后面的话，
+        # 没在录时用户会看到"现在没有在录音"，而真相是"你发的东西根本不是音频"（说错原因 =
+        # 把人引去查录音状态，那是最难查的那种误导）。
+        if not _is_audio(data):
+            return _seg_result(False, "这段不是音频（WAV/FLAC 都不是）：手机那边该传裸音频字节")
         if not _state["active"] or not _state["folder"]:
             # 没有在录：可能是"这一场**已经收尾**了，客户端在重试整条流程"
             # （`stop` 的回包丢了）。那就按 `(clientId, seq)` 去那一场里查这段在不在 ——
             # 在 = 幂等命中（当成功回 duplicate，见 `_duplicate_from_a_finished_meeting`）；
             # 不在 = 如实拒绝（这一场已经收尾，不许再往里写音频）。
-            # ⚠️ 命中也要过 WAV 判据：**不许**拿一段坏 body 冒充"我重传的是同一段"。
-            if _is_wav(data):
-                done = _duplicate_from_a_finished_meeting(cid, seq)
-                if done:
-                    return done
+            done = _duplicate_from_a_finished_meeting(cid, seq)
+            if done:
+                return done
             return _seg_result(False, "现在没有在录音")
         if cid and cid != str(_state.get("client_id") or "").strip():
             # 幂等键对不上 = 这一场不是你的（另一台设备/电脑正在录的会）：
@@ -1230,8 +1347,6 @@ def _apply_segment(data, name="", client_id="", seq=0, started_at=""):
             return _seg_result(False, "这场会议不是 clientId=%s 那一场，不能往它里面传音频" % cid)
         if _state.get("source") != "phone":
             return _seg_result(False, "这场录音用的是电脑的麦克风，手机不用传音频")
-        if not _is_wav(data):
-            return _seg_result(False, "这段不是 WAV（或太短）：手机那边该传裸 wav 字节")
         folder = _state["folder"]
         meta = _load_json(os.path.join(folder, "meta.json"), {})
         segs = list(meta.get("segments") or [])
@@ -1244,7 +1359,10 @@ def _apply_segment(data, name="", client_id="", seq=0, started_at=""):
         # 段序号"这条对账等式会失真（客户端于是永远不敢说"传完了"）。
         if want in smap:
             _state["seg_count"] = len(smap)
-            return _seg_result(True, smap[want], duplicate=True, seq=want,
+            # 回**盘上那个名字**（不是按这次 body 的格式拼的）：补传重试可能换了格式，
+            # 而 `meta` 里记的是先到的那个（见 `_stored_seg_name`）。
+            stored = _stored_seg_name(segs, want) or smap[want]
+            return _seg_result(True, stored, name=stored, duplicate=True, seq=want,
                                folder=folder, meta=meta)
         # 客户端给的时间与建会时那个不一致 → 如实记一笔（不改这场的时间轴）：
         # 时间轴以**建会那一刻**定的为准，否则后到的段能把整场会议的时间挪走。
@@ -1255,9 +1373,12 @@ def _apply_segment(data, name="", client_id="", seq=0, started_at=""):
                 db.add_log("warn", "meeting",
                            "补传的段带着与这场不同的 startedAt（%s ≠ %s）：以建会那个为准"
                            % (got, known))
-        seg_name = name or ("%02d.wav" % want)
-        if not seg_name.lower().endswith(audiofile.WAV_EXT):
-            seg_name += audiofile.WAV_EXT
+        # 后缀由 **body 的真格式** 决定（魔数，不看 Content-Type）；显式给了 `name` 的
+        # 老调用方（录音器/手机麦）照旧尊重它，只补后缀 —— 那是既有行为，一个字不改。
+        seg_name = name or _seg_name_for(data, want)
+        if not seg_name.lower().endswith(audiofile.WAV_EXT) and \
+                not seg_name.lower().endswith(audiofile.FLAC_EXT):
+            seg_name += audiofile.FLAC_EXT if _is_flac(data) else audiofile.WAV_EXT
         with open(os.path.join(folder, seg_name), "wb") as f:
             f.write(data)
         if seg_name not in segs:
@@ -1265,11 +1386,14 @@ def _apply_segment(data, name="", client_id="", seq=0, started_at=""):
         meta["segments"] = sorted(segs, key=lambda n: int(str(n).split(".")[0]))
         _save_meta(folder, meta)
         _state["seg_count"] = len(meta["segments"])       # 状态接口据此给手机显示进度
-        return _seg_result(True, seg_name, seq=want, folder=folder, meta=meta)
+        # `name` 与 `message` 都填段名：前者是 `/meeting/segment` 成功时回给客户端的那一格，
+        # 后者是**老调用方**（`append_meeting_segment` 的两元组）读的那一格 —— 两边同源。
+        return _seg_result(True, seg_name, name=seg_name, seq=want, folder=folder, meta=meta)
 
 
 def append_meeting_segment(data, name=""):
-    """（既有签名）手机传上来的一段音频 → 落成 `NN.wav`。返回 `(ok, 段名或原因)`。
+    """（既有签名）手机传上来的一段音频 → 落成 `NN.wav`（**FLAC body → `NN.flac`**）。
+    返回 `(ok, 段名或原因)`。
 
     判据见 `_apply_segment`（唯一一份）—— 这里只是把它翻成老调用方习惯的两元组。
     """
@@ -1290,6 +1414,157 @@ def append_meeting_segment_sync(data, client_id="", seq=0, started_at="", source
         db.add_log("warn", "meeting", "补传的段带了 source=%s（这场其实是「手机麦」那条路）"
                    % source)
     return r
+
+
+# ---------------------------------------------------------------- 手机补报的暂停区间
+
+#: 手机补报的暂停区间落进 `meta["pauses"]` 时用的 `by` 值。
+#: 与面板/手机静音那条路（`_meeting_actor` 给"手机"/"面板"）**同一套取值**：事后打开
+#: `meta.json` 看"这段为什么是空的"时，两种来源必须一眼分得出，不能都写成空串。
+PAUSE_BY_PHONE = "手机"
+
+
+def _pause_entry(from_v, to_v, by):
+    """把一条上报区间拼成 `meta["pauses"]` 里的那个形状（**与暂停那条路逐键相同**）。
+
+    键名沿用既有三件套 `from/to/by`，不另起名字：同一场会议的 `pauses` 里混两种形状，
+    读它的人（面板、纪要、人肉排查）就得先判形状再取值 —— 那种"能跑但难查"的债不欠。
+    """
+    return {"from": from_v, "to": to_v, "by": str(by or "")}
+
+
+def _split_entries(pauses, base_iso=""):
+    """上报的区间列表 → `(能读出来的条目, 读不出来的条数)`。
+
+    容错口径写死在这里：**坏的那条跳过并如实计数**，不因为一条坏时间就丢掉整批
+    —— 手机上"某一条时间是从坏的本地缓存里读出来的"不该让另外 39 条好区间补不上来。
+    `to` 允许缺/空（= 还没结束），与 `pause_meeting` 落盘的那个开区间同形。
+
+    `base_iso` = 这一场的开始时间（相对秒要加到它上面，见 `_pause_time`）。
+    """
+    good, bad = [], 0
+    for it in pauses or []:
+        if not isinstance(it, dict):
+            bad += 1
+            continue
+        frm = _pause_time(it.get("from", it.get("start", "")), base_iso)
+        to = _pause_time(it.get("to", it.get("end", "")), base_iso)
+        if not frm and not to:
+            bad += 1
+            continue
+        good.append(_pause_entry(frm, to, PAUSE_BY_PHONE))
+    return good, bad
+
+
+def add_meeting_pauses(pauses, client_id=""):
+    """手机**补报**它离线期间的暂停区间 → 合并进那场会议的 `meta["pauses"]`。
+
+    用户 2026-10-16 的口径：`meta["pauses"]` 是"这几段是暂停的"的**纯标注**（见 `_save_meta`
+    与 `pause_meeting`：暂停区间照常录成**全零**音频，不剪切、不影响总时长），
+    而离线补传那条路上手机是唯一知道这件事的一方 —— 联网之后它必须能**补报**，否则那一场
+    会在面板/纪要里显示成"好好地录着 / 来源不明"，而**这段时间的音频是空白**没人解释得清。
+
+    三条语义（写死，别处不要各写一份）：
+
+      * **只记标注，绝不动流程**：这里不开始/不停止/不改变任何录音状态 —— 具体地说，
+        **不碰 `_state["paused"]`、不碰 recorder、不触发转写**。补报是**事后叙述**，
+        不是"再按一次静音"。这条特别要紧：暂停那个动作在现行口径下是"接下来写进去的
+        是全零音频"（见 `pause_meeting`），一个补报请求要是顺手把它打开/关掉，
+        用户那场会**当场多出或少掉一段空白**（而且是后台补传悄悄干的，事后查不出来）。
+      * **幂等**：同一批区间重复上报不产生重复条目。判据 = **同一时刻只留一条**
+        （`(from,to)` 归一到秒后逐字相同即同一件事），不靠序号/时间戳之类的"上报批次"。
+      * **护栏**：`client_id` 与当前那场不符 → **拒绝且一个字节都不动**（与 `stop_meeting`
+        同一条纪律：错序/重试的补传不许改别人的场次）。**没有在录 / 认不出这场 → 如实
+        回 ok=false 并说清原因，绝不顺手建会**（`meeting_status` 那条路同理）。
+
+    返回 `_seg_result` 那个形状的字典（`ok/message` + 便于客户端与用例断言的几个键）。
+    """
+    with _state_lock:
+        cid = str(client_id or "").strip()
+        if not _state["active"] or not _state.get("folder"):
+            return _seg_result(False, "现在没有在录音，暂停区间只能补报给正在录的那一场"
+                                      "（服务端不会为它建会）")
+        if cid and cid != str(_state.get("client_id") or "").strip():
+            # 与 `stop_meeting` 同一条护栏，理由也同一条：这是**别人**那一场。
+            # 为什么必须"拒绝"而不是"静默忽略"：忽略了客户端会拿到"成功"，于是它把这段
+            # 空白当成"已经报上去了"、再也不重试 —— 事后没人知道那 20 分钟为什么是空的。
+            # 拒绝并说清是"对不上号"，客户端才有机会带着正确的 clientId 重来。
+            return _seg_result(False, "这场会议不是 clientId=%s 那一场（服务端正在录别的会），"
+                                      "已拒绝写入：暂停区间不会记到别人的会议上" % cid)
+        folder = _state["folder"]
+        meta = _load_json(os.path.join(folder, "meta.json"), {})
+        if not isinstance(meta, dict):
+            return _seg_result(False, "这场会议的 meta.json 读不出来，先不写暂停区间")
+        good, bad = _split_entries(pauses, base_iso=meta.get("start") or "")
+        if bad:
+            db.add_log("warn", "meeting",
+                       "补报的暂停区间里有 %d 条时间读不出来（已跳过，其余照记）" % bad)
+        # 去重键 = 归一后的 `(from, to)`：不比较 `by`（来源不是"同一件事"的判据），
+        # 也不比较毫秒/时区（`_pause_time` 已经把它们收成同一种写法）。
+        have = {(str(p.get("from") or ""), str(p.get("to") or ""))
+                for p in (meta.get("pauses") or []) if isinstance(p, dict)}
+        added = [p for p in good if (p["from"], p["to"]) not in have]
+        if added:
+            meta["pauses"] = list(meta.get("pauses") or []) + added
+            _save_meta(folder, meta)          # 与暂停那条路一样**当场落盘**（崩了也留得下）
+            db.add_log("info", "meeting",
+                       "手机补报了 %d 条暂停区间（去重后新增 %d 条）"
+                       % (len(good), len(added)))
+        out = _seg_result(True, "已记下 %d 条暂停区间（去重后新增 %d 条）" % (len(good), len(added)),
+                          folder=folder, meta=meta, client_id=cid)
+        out["pauses"] = list(meta.get("pauses") or [])
+        out["added"] = len(added)
+        out["skipped"] = bad
+        return out
+
+
+#: "数字是 epoch 秒" 还是 "相对这一场开始的秒数" 的分界线。
+#: 安卓那边的契约（`dto/MeetingOfflineDtos.kt::MeetingPausesRequest`）写的是**相对秒**
+#: （`{"from": 12.5, "to": 31.0}` —— "相对这一场开始时间的秒数"，理由正是"暂停之后时间轴
+#: 才不会跳"），而 `meta["pauses"]` 的 `from/to` 一直是**绝对本地 ISO**。
+#: 两种写法都会出现在这条接口上，所以必须按**量级**分开：一次会议不可能录到 30 天，
+#: 所以 `≤ 30 天` 的数字只能是"相对这一场开始的秒数"，更大的才是 epoch。
+#: ⚠️ 阈值写在这里、**只写一份**：客户端与服务端对"什么算相对"必须用同一个判据，
+#: 否则同一批区间在两边会算成差 2000 天（而那是静默的：`meta` 里就是一条怪 ISO）。
+PAUSE_RELATIVE_MAX_SECONDS = 30 * 24 * 3600.0
+
+
+def _pause_time(value, base_iso=""):
+    """一条上报时间的**唯一**归一入口（相对秒和绝对时间都在这里分开）。
+
+    返回 `meta["pauses"]` 里那个形状的**绝对本地 ISO**（认不出 = 空串）。
+
+    相对秒必须**加到这一场的开始时间上**：`meta` 里 `from/to` 与面板/手机按静音时写的
+    那一份是同一个语义（绝对时刻），混两种语义之后任何读它的人（面板、纪要、人肉排查）
+    都得先猜是哪一种 —— 那就是"能跑但查不出来"的债。加不上（这一场的 `start` 读不出来）
+    就退回按 epoch 解释：宁可时间戳错得看得见，也不要静默丢一条暂停区间。
+    """
+    if isinstance(value, bool):
+        return ""
+    if isinstance(value, (int, float)):
+        num = float(value)
+    else:
+        s = str(value or "").strip()
+        if not s:
+            return ""
+        try:
+            num = float(s)
+        except ValueError:
+            return _parse_client_stamp(s)            # ISO（含带时区/Z 的写法）
+    if num < 0:
+        return ""
+    if num <= PAUSE_RELATIVE_MAX_SECONDS:
+        base = _parse_client_stamp(base_iso)
+        if base:
+            try:
+                return (datetime.datetime.fromisoformat(base)
+                        + datetime.timedelta(seconds=num)).isoformat(timespec="seconds")
+            except (OverflowError, ValueError):
+                pass
+    try:
+        return datetime.datetime.fromtimestamp(num).isoformat(timespec="seconds")
+    except (OverflowError, OSError, ValueError):
+        return ""
 
 
 def start_meeting(origin=ORIGIN_PC):
@@ -1331,9 +1606,9 @@ def start_meeting(origin=ORIGIN_PC):
                 "diarize": True,
             },
             "segments": [],
-            #: 暂停区间（`{from, to, by}`）：录音中途"静音"过的那几段。
-            #: 为什么必须留痕：暂停期间**不产生音频**，转写里那段是空白 ——
-            #: 没有这份记录，谁也不知道"少了一段"是暂停还是故障。
+            #: 暂停区间（`{from, to, by}`）：录音中途"静音"过的那几段 —— **纯标注**。
+            #: 2026-10-16 起暂停 = "照常录、写全零"（见 `pause_meeting`）：音频总长与段边界
+            #: 都不受影响，这份记录只回答"这几段空白是**暂停**还是故障"，**不做任何剪切**。
             "pauses": [],
         }
         with open(os.path.join(folder, "meta.json"), "w", encoding="utf-8") as f:
@@ -1384,6 +1659,7 @@ def start_meeting(origin=ORIGIN_PC):
 
         _state.update(active=True, folder=folder, recorder=recorder,
                       started_at=meta["start"], error="", paused=False, pauses=[],
+                      _pause_events=[],       # 同上：上一场的静音时刻不许粘过来
                       origin=meta["initiatedBy"],
                       # 本机麦这条路**没有** clientId（补传只有手机那条路）——显式清掉，
                       # 免得上一场补传留下的 id 让 `stop(clientId=…)` 的护栏判错。
@@ -1450,13 +1726,17 @@ def stop_meeting(client_id=""):
         if was_paused and pauses and not pauses[-1].get("to"):
             pauses[-1]["to"] = end_iso
         meta["pauses"] = pauses
-        # 段列表 = 本次录出来的 **∪ 目录里已有的 *.wav**。
+        # 段列表 = 本次录出来的 **∪ 目录里已有的音频段**。
         # 为什么把目录里那些也算上（2026-09-23）：把**另一段录音**（比如上一场被中断的）
         # 拷进本场目录当 `00.wav`，就应当本次一并转写 —— 用户在电话里就是这么预期的
         # （"拷进去是不是结束后就自动转了"）。只认录音器自己的内存清单时，拷进去的
         # 那段会被**静默忽略**（`_transcribe_impl` 优先用 meta["segments"]，非空就不看目录）。
+        # 2026-10-16：这里**不能**只挑 `.wav` —— 手机补传的段可以是 `.flac`，只认 wav 会让
+        # "meta 丢了 / 段是主人手工拷进来的 flac"那种场次在收尾时把这些段漏掉（转写里就
+        # 少一段，而面板上看不出）。判据与转写那条路**同源**：`audiofile.segment_files()`
+        # 本来就同时认 `.wav` 与 `.flac`（见它的 `SEGMENT_RE`）。
         extra = [f for f in audiofile.segment_files(folder)
-                 if f.lower().endswith(audiofile.WAV_EXT)]
+                 if f.lower().endswith((audiofile.WAV_EXT, audiofile.FLAC_EXT))]
         segs = sorted(set(getattr(recorder, "segments", []) or []) | set(extra),
                       key=lambda n: int(str(n).split(".")[0]))
         meta["end"] = datetime.datetime.now().isoformat(timespec="seconds")

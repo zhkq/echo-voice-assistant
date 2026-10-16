@@ -1,13 +1,18 @@
 package com.echo.contact.data
 
+import com.echo.contact.audio.SegmentFormat
 import com.echo.contact.service.ActiveMeeting
 import com.echo.contact.service.CountOutcome
+import com.echo.contact.service.DraftPause
 import com.echo.contact.service.OfflineMeetingTransport
+import com.echo.contact.service.PauseOutcome
+import com.echo.contact.service.PauseRequest
 import com.echo.contact.service.SegmentOutcome
 import com.echo.contact.service.StartOutcome
 import com.echo.contact.service.StartRequest
 import com.echo.contact.service.StopOutcome
 import com.echo.contact.service.StopRequest
+import com.echo.contact.service.SyncFailure
 import com.echo.contact.service.UploadRequest
 import kotlinx.coroutines.runBlocking
 import okhttp3.mockwebserver.MockResponse
@@ -15,6 +20,7 @@ import okhttp3.mockwebserver.MockWebServer
 import okhttp3.mockwebserver.RecordedRequest
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
@@ -155,8 +161,39 @@ class OfflineMeetingWireTest {
     }
 
     @Test
-    fun `段回包只给 segments 数组时也要能算段数`() {
-        // 既有 GET /api/meeting/status 那一族的形状（最可能被复用的那个）
+    fun `传段用的是清单里记的那一份格式（FLAC 就发 audio flac）`() {
+        // 用户 2026-10-17 的第①件事：段改成 FLAC，服务端按 `fLaC` 魔数识别 ——
+        // 于是 `Content-Type` 必须跟着**清单里记的那一份**走。
+        // 写死成 audio/wav 的话，FLAC 那些段会被当成 wav 收下（= 谎报格式，转写那边解不出来）。
+        server.enqueue(json("""{"ok":true,"meetingId":42,"segmentCount":1}"""))
+
+        val out = runBlocking {
+            OfflineMeetingTransport(api()).uploadSegment(
+                UploadRequest(
+                    clientId = "phone-1", seq = 1, startedAt = "2026-10-17T09:30:00",
+                    source = "phone", wav = "fLaC".toByteArray() + ByteArray(8),
+                    format = SegmentFormat.FLAC))
+        }
+
+        val req = server.takeRequest()
+        assertEquals("这是契约的另一半（服务端按它 + 魔数认格式）",
+            "audio/flac", req.getHeader("Content-Type"))
+        assertTrue(out is SegmentOutcome.Ok)
+    }
+
+    @Test
+    fun `退回 WAV 的那些段仍然发 audio wav（两条路都要有）`() {
+        server.enqueue(json("""{"ok":true,"meetingId":42,"segmentCount":1}"""))
+        runBlocking {
+            OfflineMeetingTransport(api()).uploadSegment(
+                UploadRequest("phone-1", 1, "2026-10-17T09:30:00", "phone",
+                    ByteArray(4), format = SegmentFormat.WAV))
+        }
+        assertEquals("audio/wav", server.takeRequest().getHeader("Content-Type"))
+    }
+
+    @Test
+    fun `段回包只给 segments 数组时也要能算段数`() {        // 既有 GET /api/meeting/status 那一族的形状（最可能被复用的那个）
         server.enqueue(json("""{"ok":true,"segments":[{"seq":1},{"seq":2}]}"""))
         val out = runBlocking {
             OfflineMeetingTransport(api()).uploadSegment(
@@ -378,6 +415,89 @@ class OfflineMeetingWireTest {
         out as StopOutcome.Failed
         assertTrue("连不上当然要重试：没收到确认就不许说已经转写", out.retryable)
         assertEquals(com.echo.contact.service.SyncFailure.UNREACHABLE, out.failure)
+    }
+
+    // ---------------------------------------------------------------- 上报暂停区间（第③件事）
+
+    @Test
+    fun `上报暂停区间打的是 meeting pauses 且 body 按契约`() {
+        server.enqueue(json("""{"ok":true,"message":"收到了"}"""))
+
+        val out = runBlocking {
+            OfflineMeetingTransport(api()).reportPauses(
+                PauseRequest(clientId = "phone-20261017093000-abcd",
+                    pauses = listOf(DraftPause(12.5, 31.0), DraftPause(60.0, 61.5))))
+        }
+
+        val req = server.takeRequest()
+        assertEquals("POST", req.method)
+        assertEquals("/api/meeting/pauses", req.path!!.substringBefore('?'))
+        assertTrue("必须是 JSON body（契约里就是这么写的）：${req.getHeader("Content-Type")}",
+            req.getHeader("Content-Type")!!.startsWith("application/json"))
+        val body = req.body.readUtf8()
+        assertTrue("要按 clientId 幂等：$body", body.contains("\"clientId\":\"phone-20261017093000-abcd\""))
+        assertTrue(body, body.contains("\"from\":12.5"))
+        assertTrue(body, body.contains("\"to\":31.0"))
+        assertTrue("两条都要在：$body", body.contains("\"from\":60.0"))
+        assertFalse("契约里没有 by，客户端就不发明：$body", body.contains("\"by\""))
+        assertEquals("收下了就是成功", PauseOutcome.Ok(2), out)
+    }
+
+    @Test
+    fun `空暂停区间一个请求都不发`() {
+        val out = runBlocking {
+            OfflineMeetingTransport(api()).reportPauses(PauseRequest("c", emptyList()))
+        }
+        assertEquals(PauseOutcome.Ok(0), out)
+        assertEquals("没东西可报就别白发一次请求", 0, server.requestCount)
+    }
+
+    @Test
+    fun `老服务端没有这个端点时是'没报上去'而不是失败（404 405）`() {
+        // 这一档的后果是"补传会不会被一个可有可无的上报拖垮"：端点不存在 ≠ 音频有问题
+        server.enqueue(MockResponse().setResponseCode(404).setBody("""{"detail":"Not Found"}"""))
+        val notFound = runBlocking {
+            OfflineMeetingTransport(api()).reportPauses(
+                PauseRequest("c", listOf(DraftPause(1.0, 2.0))))
+        }
+        assertTrue("404 必须归'没这个接口'那一档：$notFound", notFound is PauseOutcome.Unsupported)
+
+        server.enqueue(MockResponse().setResponseCode(405))
+        val notAllowed = runBlocking {
+            OfflineMeetingTransport(api()).reportPauses(
+                PauseRequest("c", listOf(DraftPause(1.0, 2.0))))
+        }
+        assertTrue("405 同理：$notAllowed", notAllowed is PauseOutcome.Unsupported)
+    }
+
+    @Test
+    fun `暂停上报 5xx 与连不上都归'失败'那一档（原因要说准）`() {
+        server.enqueue(MockResponse().setResponseCode(500))
+        val broken = runBlocking {
+            OfflineMeetingTransport(api()).reportPauses(
+                PauseRequest("c", listOf(DraftPause(1.0, 2.0))))
+        }
+        assertTrue("5xx 是'它自己坏了'，不是'没这个接口'：$broken", broken is PauseOutcome.Failed)
+        assertEquals(SyncFailure.SERVER_ERROR, (broken as PauseOutcome.Failed).failure)
+
+        server.shutdown()
+        val offline = runBlocking {
+            OfflineMeetingTransport(api()).reportPauses(
+                PauseRequest("c", listOf(DraftPause(1.0, 2.0))))
+        }
+        assertTrue(offline is PauseOutcome.Failed)
+        assertEquals("连不上要说成连不上", SyncFailure.UNREACHABLE,
+            (offline as PauseOutcome.Failed).failure)
+    }
+
+    @Test
+    fun `服务端用 200+ok false 说'不支持'时也认得出来`() {
+        server.enqueue(json("""{"ok":false,"message":"不支持的接口"}"""))
+        val out = runBlocking {
+            OfflineMeetingTransport(api()).reportPauses(
+                PauseRequest("c", listOf(DraftPause(1.0, 2.0))))
+        }
+        assertTrue("有些实现会用 200 表达同一件事：$out", out is PauseOutcome.Unsupported)
     }
 
     // ---------------------------------------------------------------- 探活

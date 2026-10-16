@@ -8,7 +8,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * **离线录音的状态机与它的判据**（用户 2026-10-16 的需求）。
+ * **手机录音的状态机与它的判据**。
  *
  * 这一组用例盯的全是"会静默出错"的地方：
  *  * 连不上时**不许**变成"录音失败"（那等于什么都没录）；
@@ -16,37 +16,38 @@ import org.junit.Test
  *  * ECHO 正录着别的会时**不许**抢占；
  *  * 退避**必须有上限**（不然断网一晚上把电池和流量烧光）；
  *  * 重试要有次数上限，但**网络刚恢复时要立刻试**（用户能感知的只有这一下）。
+ *
+ * ⚠️ 2026-10-17 用户把"在线/离线两条路"**合并成一条**（*"离线录音和在线录音就没什么
+ * 本质区别了"*）之后，这里原来那几条钉"双路"的用例被**改写成钉新契约**：
+ *  * `startDecision` / `StopDecision` / `watermarkAfterHandoff` 的判据**退役**了
+ *    （它们存在的意义就是"按可达性分岔"，而那条分岔已经删掉）——
+ *    换成"录音中那一档的文案"与"暂停上报端点缺失的判定"；
+ *  * 通知文案里 `offline` 那一组字段也没了（不再有"离线模式"这个状态），
+ *    改成按"**还有几段没传上去**"说 —— 那条铁律（绝不说已上传）一个字都没放松。
  */
 class OfflineMeetingStateTest {
 
-    // ---------------------------------------------------------------- ① 不可达 → 离线
+    // ---------------------------------------------------------------- ① 不可达 → 也照样录（只有一条路）
 
     @Test
-    fun `连不上 ECHO 时走离线那条路 而不是报录音失败`() {
-        // 需求原话："开始/结束录音时若 ECHO 不可达……不要让录音失败，而是进入离线录音"
-        val d = startDecision(paired = true, reachable = false, why = "ECHO 连不上（超时）")
-        assertTrue("连不上必须是离线那一档：$d", d is StartDecision.Offline)
-        assertEquals("ECHO 连不上（超时）", (d as StartDecision.Offline).why)
-    }
-
-    @Test
-    fun `没配对也允许离线录音（配对只影响能不能传 不影响能不能录）`() {
-        val d = startDecision(paired = false, reachable = false)
-        assertTrue(d is StartDecision.Offline)
-        assertTrue("原因要如实说是没配对，而不是笼统的'连不上'：${(d as StartDecision.Offline).why}",
-            d.why.contains("配对"))
-    }
-
-    @Test
-    fun `可达时走联网那条路（行为与改动前一致）`() {
-        assertEquals(StartDecision.Online, startDecision(paired = true, reachable = true))
+    fun `开始录音不再按可达性分岔（合并成一条路之后）`() {
+        // 老版本这里是 `startDecision(paired, reachable)` 三个分支；合并之后开始录音
+        // **只有一个动作**：在本地把这一场立起来。可达性不再参与"能不能录"的判定 ——
+        // 它只影响后面"顺手传上去的那一下"。这条判据的落点在 MeetingRecordSession
+        // （见 MeetingRecordSessionTest/MeetingSinglePathTest），这里钉的是**状态机的口径**：
+        // 录音中那一档与"网通不通"无关。
+        val line = offlineStatusLine(OfflineSyncState(
+            phase = OfflinePhase.RECORDING_LOCAL, totalSegments = 2, pendingSegments = 2))
+        assertTrue("录音中就是录音中，不该出现'离线'这个模式：$line", !line.contains("离线"))
+        assertTrue(line, line.contains("本机录音中"))
+        assertTrue("网通不通只作为**原因**出现", line.contains("还没传"))
     }
 
     @Test
     fun `探活返回非 2xx 与抛异常都算不可达`() {
         assertFalse(isReachable(null))          // 抛异常（超时/拒绝连接）
         assertFalse(isReachable(0))
-        assertFalse(isReachable(401))           // 连得上但令牌不对：录音这条路一样开不了会
+        assertFalse(isReachable(401))           // 连得上但令牌不对：这条路一样开不了会
         assertFalse(isReachable(500))
         assertFalse(isReachable(302))
         assertTrue(isReachable(200))
@@ -56,10 +57,34 @@ class OfflineMeetingStateTest {
     }
 
     @Test
-    fun `结束录音在离线时完全本地 不碰服务端`() {
-        // 断网时 meetingStop 必然失败，而用户的"结束"必须立刻生效（本地不再采音、清单落盘）
-        assertEquals(StopDecision.FinishLocally, stopDecision(recordingOffline = true))
-        assertEquals(StopDecision.NotifyServer, stopDecision(recordingOffline = false))
+    fun `录音中即使连不上也不许说录音失败`() {
+        // 需求原话："开始/结束录音时若 ECHO 不可达……不要让录音失败，而是进入离线录音"
+        // 合并成一条路之后这句话更强了：**录不录得下来与服务端无关**，
+        // 状态里只有"还有几段没传上去"，没有一个"失败"档是给网络准备的。
+        val line = offlineStatusLine(OfflineSyncState(
+            phase = OfflinePhase.UNREACHABLE, pendingSegments = 3,
+            note = "ECHO 连不上（HTTP null，ConnectException）"))
+        assertTrue(line, line.contains("ECHO 连不上"))
+        assertTrue("原因照带：$line", line.contains("ConnectException"))
+        assertTrue("音频还在手机上（已缓存）：$line", line.contains("已缓存 3 段"))
+        assertFalse("**不许**说录音失败：$line", line.contains("失败"))
+    }
+
+    // ---------------------------------------------------------------- ③ 暂停上报（端点缺失的判定）
+
+    @Test
+    fun `老服务端没有暂停端点时认得出来（那一档不算失败）`() {
+        // 这一条的后果是"补传会不会被一个可有可无的上报拖垮"
+        assertTrue(looksEndpointMissing("", 404))
+        assertTrue(looksEndpointMissing("", 405))
+        assertTrue(looksEndpointMissing("", 501))
+        assertTrue("有些实现用 200 + 一句话表达同一件事",
+            looksEndpointMissing("不支持的接口", 200))
+        assertTrue(looksEndpointMissing("Not Found", 200))
+        assertFalse("5xx 是'它自己坏了'，不是'没这个接口'（原因要说准）",
+            looksEndpointMissing("", 500))
+        assertFalse("连不上不是端点不存在", looksEndpointMissing("", null))
+        assertFalse(looksEndpointMissing("参数不对", 422))
     }
 
     // ---------------------------------------------------------------- ② 不抢占
@@ -171,38 +196,29 @@ class OfflineMeetingStateTest {
         assertEquals(5, acknowledgedAfterUpload(5, 5))
     }
 
-    // ---- 录音中途"联网 → 离线"的交接（水位怎么起）----
+    // ---- 段序号接续（合并成一条路之后不再需要"中途转离线"的交接）----
 
     @Test
-    fun `中途转离线时水位要接上联网时已经送出去的段`() {
-        // 联网已经送了 6 段（它们在电脑上，本地没有），转离线之后录到第 8 段：
-        // 水位要抬到 6（不是 0），否则本地最大序号是 8、服务端那边是 8…… 看着一样？
-        // 不：水位 0 时本地"最大序号"是 8 而服务端是 8 —— 对得上，但**续传会重传 1..6**
-        // （那些本地压根没有文件，于是整份补传卡在第 1 段永远动不了）。
-        assertEquals(6, watermarkAfterHandoff(sentOnline = 6, localSeqs = listOf(7, 8)))
-    }
-
-    @Test
-    fun `中途转离线时水位不许超过清单里已有的段（否则续传会跳段）`() {
-        // 联网送了 2 段就断了，然后本地录了第 3 段：
-        //   水位抬到 2 → 本地最大 3、服务端 3 ✓
-        assertEquals(2, watermarkAfterHandoff(sentOnline = 2, localSeqs = listOf(3)))
-        // 联网送了 9 段，但本地清单里只有第 10 段（水位最多到 9 = maxLocal - 1）
-        assertEquals(9, watermarkAfterHandoff(sentOnline = 9, localSeqs = listOf(10)))
-        // 本地一段都没有时不许把水位抬起来（那时没什么可续的）
-        assertEquals(0, watermarkAfterHandoff(sentOnline = 5, localSeqs = emptyList()))
-        assertEquals(0, watermarkAfterHandoff(sentOnline = 0, localSeqs = listOf(1)))
-        // 负数/越界输入不该造出负水位
-        assertEquals(0, watermarkAfterHandoff(sentOnline = -3, localSeqs = listOf(1)))
-    }
-
-    @Test
-    fun `中途转离线之后 续传只传本地真有的那几段`() {
-        // 水位 6、本地只有 7/8 → 要传的就是 7/8（1..6 在电脑上，本地没有文件，
-        // 但续传按水位跳过了它们）
-        val seqs = listOf(7, 8)
-        val acked = watermarkAfterHandoff(sentOnline = 6, localSeqs = seqs)
-        assertEquals(listOf(7, 8), segmentsToUpload(seqs, acked))
+    fun `中途转离线那套水位交接退役了（每一段都先写本地）`() {
+        // 老版本这里钉的是 `watermarkAfterHandoff`：联网那条路把段**先发给电脑、本地不留**，
+        // 于是"录到一半断网"时补水位的算法很关键。用户 2026-10-17 把两条路合并之后，
+        // **每一段都先落本地**（见 MeetingRecordSession），那条交接的前提（"前几段只在电脑上"）
+        // 不存在了 —— 所以那个纯函数连它一起退役。
+        // 这条用例把**退役这件事本身**钉住：清单的段号只由"本地已有的最大序号"与
+        // "服务端已认下的水位"决定，取两者的大值（不会重号、也不会回退）。
+        val d = MeetingDraft(
+            clientId = "c", startedAt = "2026-10-17T09:30:00",
+            segments = (4..5).map {
+                DraftSegment(seq = it, file = "seg-000$it.flac", startedAt = "t",
+                    startOffsetSeconds = 0.0, durationSeconds = 1.0,
+                    format = com.echo.contact.audio.SegmentFormat.FLAC)
+            },
+            acknowledgedSegments = 3,
+        )
+        assertEquals("水位 3、本地 4/5 → 待传的就是 4/5（前面几段确实在服务端）",
+            listOf(4, 5), segmentsToUpload(d.segments.map { it.seq }, d.acknowledgedSegments))
+        assertEquals(5, acknowledgedAfterUpload(d.acknowledgedSegments, 5))
+        assertTrue(needsSync(d))
     }
 
     @Test
@@ -296,12 +312,12 @@ class OfflineMeetingStateTest {
     // ---------------------------------------------------------------- ⑥ 界面文案
 
     @Test
-    fun `离线录音中的那一行如实说清'已缓存几段 等联网上传'`() {
+    fun `录音中那一行如实说清'已缓存几段'且绝不说已上传`() {
         val line = offlineStatusLine(OfflineSyncState(
             phase = OfflinePhase.RECORDING_LOCAL, pendingSegments = 3, totalSegments = 3))
-        assertTrue("要出现'离线'：$line", line.contains("离线"))
+        assertTrue("这是本机录音那一档（不再是'离线模式'）：$line", line.contains("本机录音中"))
         assertTrue("要有已缓存段数：$line", line.contains("已缓存 3 段"))
-        assertTrue("要说清还在等联网：$line", line.contains("等联网上传"))
+        assertTrue("要说清还有几段没传：$line", line.contains("还没传"))
         assertFalse("**不许**出现'已上传'（那是最容易撒的谎）：$line", line.contains("已上传"))
     }
 
@@ -355,7 +371,7 @@ class OfflineMeetingStateTest {
     }
 
     @Test
-    fun `没有离线活时不该占一行`() {
+    fun `没有本机录音活时不该占一行`() {
         assertEquals("", offlineStatusLine(OfflineSyncState()))
         assertEquals("", offlineStatusLine(OfflineSyncState(phase = OfflinePhase.IDLE)))
     }
@@ -363,39 +379,52 @@ class OfflineMeetingStateTest {
     // ---------------------------------------------------------------- ⑦ 通知文案
 
     @Test
-    fun `通知里离线优先于待重传 且绝不说已上传`() {
+    fun `通知里有段没传上去时先说那件事 且绝不说已上传`() {
+        // ⚠️ 改写自"通知里离线优先于待重传"：合并成一条路之后不再有"离线模式"这个字段，
+        // 判据换成"**还有几段没传上去**"（同一个铁律：这件事比"已传 N 段"要紧得多）
         val s = notificationText(MicState(
-            active = true, offline = true, syncPending = 4,
-            syncPhase = OfflinePhase.RECORDING_LOCAL, pending = 9))
-        assertTrue("离线那件事比在线待重传更要紧：$s", s.contains("离线"))
-        assertTrue(s, s.contains("4 段"))
+            active = true, syncPending = 4, syncPhase = OfflinePhase.RECORDING_LOCAL,
+            syncNote = "本机录音中 · 已缓存 4 段 · ECHO 连不上（超时）"))
+        assertTrue("没传上去那件事最要紧：$s", s.contains("已缓存 4 段"))
+        assertTrue("真实原因照带：$s", s.contains("ECHO 连不上"))
         assertFalse(s, s.contains("已上传"))
     }
 
     @Test
-    fun `通知里错误仍然最优先（离线也不能盖掉真的可能丢音频）`() {
+    fun `通知里错误最优先（真的可能丢音频盖过一切）`() {
         val s = notificationText(MicState(
-            active = true, offline = true, syncPending = 4, error = "有一段缓存不下来，可能真的丢了"))
+            active = true, syncPending = 4, error = "有一段缓存不下来，可能真的丢了"))
         assertEquals("有一段缓存不下来，可能真的丢了", s)
     }
 
     @Test
-    fun `通知里没有离线活时行为与改动前一致`() {
-        assertTrue(notificationText(MicState(active = true, sent = 7)).contains("已送 7 段"))
-        assertTrue(notificationText(MicState(active = true, sent = 4, pending = 2)).contains("2 段待重传"))
+    fun `通知里没有欠的段时行为与改动前一致`() {
+        assertTrue(notificationText(MicState(active = true, sent = 7)).contains("已传 7 段"))
+        assertTrue(notificationText(MicState(active = true, syncPending = 2))
+            .contains("已缓存 2 段"))
         assertTrue(notificationText(MicState(active = true, paused = true)).contains("已静音"))
+    }
+
+    @Test
+    fun `通知里录完了但还在传时不许说'在录'`() {
+        // 用户按了结束之后最怕的是"关了就完了"—— 那一刻还在补传，通知必须说清楚
+        val s = notificationText(MicState(active = false, syncPending = 2,
+            syncNote = "录音已存在本机 · 已缓存 2 段 · 等联网上传"))
+        assertTrue(s, s.contains("录音已结束"))
+        assertTrue(s, s.contains("已缓存 2 段"))
+        assertFalse("已经不在录了：$s", s.contains("在录"))
     }
 
     // ---------------------------------------------------------------- ⑧ 状态迁移（逐档）
 
     @Test
     fun `状态迁移：录 → 等 → 传 → 对账完成 且每一步的文案都对`() {
-        // ① 离线录音
+        // ① 本机录音（每一段先落本地）
         var st = OfflineSyncState(phase = OfflinePhase.RECORDING_LOCAL,
             pendingSegments = 2, totalSegments = 2)
         assertTrue(st.hasWork)
-        assertTrue(offlineStatusLine(st).contains("等联网上传"))
-        // ② 录完了，等联网
+        assertTrue(offlineStatusLine(st).contains("本机录音中"))
+        // ② 录完了，还欠着
         st = st.copy(phase = OfflinePhase.WAITING_UPLOAD)
         assertTrue(offlineStatusLine(st).contains("已缓存 2 段"))
         // ③ 正在传（第 1 段已经传上去了）

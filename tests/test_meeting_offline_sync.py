@@ -310,25 +310,39 @@ class OfflineSyncTests(unittest.TestCase):
         name = self._status()["folder"]
         self.assertEqual(["01.wav", "02.wav"], self._wavs(name))
 
-    def test_a_non_wav_segment_is_still_refused(self):
-        """裸 body 但**不是** wav：既有判据不变（下游按 wav 读，塞 mp3 进去会在转写时炸）。"""
-        self._start()
+    def test_a_non_audio_segment_is_still_refused(self):
+        """裸 body 但**不是音频**：判据不放松（下游按文件真格式读，塞 mp3 进去会在转写时炸）。
+
+        ⚠️ 2026-10-16 随契约扩展改名/改断言（原来是 `test_a_non_wav_segment_is_still_refused`
+        断言 detail 里有 "WAV"）：这条接口现在**也收 FLAC**（`fLaC` 魔数），所以判据从
+        "是不是 wav"变成了"**是不是认得的音频**（wav 或 flac）"。只把 "WAV" 换成"音频"
+        会**放松**判据，所以这里把合同本身钉死：拒绝理由必须同时点名 **WAV 与 FLAC**
+        （读的人才知道"两种都不认"，而不是"我这次只是没猜对某一种"）。
+        **垃圾字节仍然必须被拒** —— 这一条一个字没松。
+        """
+        started = self._start()
         r = self._post_segment(1, wav=b"ID3\x04\x00\x00 this is an mp3")
         self.assertEqual(409, r.status_code, r.text)
-        self.assertIn("WAV", r.json()["detail"])
+        detail = r.json()["detail"]
+        self.assertIn("不是音频", detail)
+        self.assertIn("WAV", detail)
+        self.assertIn("FLAC", detail)
+        self.assertEqual([], self._wavs(started["message"]), "拒绝了就不许落盘")
 
-    def test_the_segment_is_uploaded_as_a_raw_wav_body_not_multipart(self):
-        """这条接口收的是**裸 wav body**：multipart 进来只会被当成"这段不是 WAV"拒掉。
+    def test_the_segment_is_uploaded_as_a_raw_audio_body_not_multipart(self):
+        """这条接口收的是**裸音频 body**：multipart 进来只会被当成"这段不是音频"拒掉。
 
         为什么值得钉：安卓侧对这条接口的注释就写着"别发 multipart：那条接口不收"
         （`EchoApi.meetingSegmentWithId`）—— 两边口径必须一致，谁改了这一条都要看见红。
+        2026-10-16：理由那句话从"不是 WAV"变成"不是音频"（现在 wav/flac 都收），
+        判据本身（**multipart 一律 409**）一个字没动。
         """
         self._start()
         r = self.client.post("/api/meeting/segment", params={"clientId": CID, "seq": 1},
                              files={"file": ("01.wav", _tiny_wav(), "audio/wav")},
                              headers=self._headers())
         self.assertEqual(409, r.status_code, r.text)
-        self.assertIn("WAV", r.json()["detail"])
+        self.assertIn("不是音频", r.json()["detail"])
 
     def test_a_segment_for_someone_elses_client_id_is_refused(self):
         """别把段灌进**别人**那场（两路音频混进同一场 = 转写里两个人同时说话）。"""

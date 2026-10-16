@@ -1,25 +1,28 @@
 package com.echo.contact.service
 
+import com.echo.contact.audio.SegmentFormat
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
 /**
- * **离线补传的编排**（纯逻辑：jvm 单测里注入一个假的 [OfflineTransport] 就能把
- * 顺序 / 续传 / 退避 / 对账 / 不抢占 全钉住）。
+ * **本地先写 + 机会性上传**的编排（纯逻辑：jvm 单测里注入一个假的 [OfflineTransport]
+ * 就能把顺序 / 续传 / 退避 / 对账 / 不抢占 / 上报暂停 全钉住）。
  *
  * ## 它为什么不能直接调 Retrofit
  *
  * 这条路上的错法全在**顺序与判定**上（先建会再传段、跳过已确认的、等对账通过才敢说成功、
- * 别人在录时不动手）。把这些塞进 `MeetingMicService` 会让它们只能靠真机验，
- * 而真机上"到底传没传上去"本来就难看出来。注入一个 [OfflineTransport] 之后，
- * 这一整个流程能在 JVM 里跑（`OfflineMeetingSyncTest`）。
+ * 别人在录时不动手、还在录的那一场绝不能被收尾）。把这些塞进 `MeetingMicService`
+ * 会让它们只能靠真机验，而真机上"到底传没传上去"本来就难看出来。注入一个
+ * [OfflineTransport] 之后，这一整个流程能在 JVM 里跑（`OfflineMeetingSyncTest`）。
  *
- * ## 与在线那条路的关系
+ * ## 只有一条路了（用户 2026-10-17）
  *
- * **完全不重叠**：在线那场会由 `MeetingMicService` 直接在循环里传（行为与改动前一致），
- * 这里只处理"清单里还欠着的段"。两条路共用同一个 [MeetingDraftStore] 与同一份
- * `clientId` 口径，所以"断网录了一半、网络恢复"这种混合情形也不会出现两套账。
+ * 以前这里只管"离线那一场"的补传，而联网那一场由 `MeetingMicService` 自己在循环里传 ——
+ * 两条路两套账。现在两件事合成一件：**每一段都先落本地**（`MeetingRecordSession`），
+ * 而"传上去"这件事**只有这一处**在管（[SyncScope.INCREMENTAL] 一边录一边机会性传，
+ * [SyncScope.FINALIZE] 录完之后补齐 → 对账 → stop）。于是不会再有
+ * "离线那套以为传完了、在线那套还在传同一段"这种两套账的错法。
  */
 object OfflineMeetingSync {
 
@@ -37,8 +40,6 @@ object OfflineMeetingSync {
     suspend fun run(
         transport: OfflineTransport,
         store: MeetingDraftStore,
-        /** 现在有没有人在录（App 自己开着离线录音时是 true）。 */
-        localRecording: Boolean = false,
         /** 正在录的那一份的 id（用来判断"ECHO 在录的是不是它"）。 */
         activeClientId: String? = null,
         /** 只跑这一份（用户对着某一场按「现在同步」）；null = 所有待传的。 */
@@ -47,6 +48,15 @@ object OfflineMeetingSync {
         manual: Boolean = false,
         /** 用户按了「现在同步」：**不受退避与自动次数限制**（但顺序/对账口径一个都不松）。 */
         force: Boolean = manual,
+        /**
+         * 这一轮的口径：还在录（[SyncScope.INCREMENTAL]，只传段）还是录完了
+         * （[SyncScope.FINALIZE]，补齐 → 对账 → stop）。见 [SyncScope] 的说明。
+         *
+         * 默认 [SyncScope.FINALIZE]：后台 tick 与「现在同步」都是"把这场传完"的语义，
+         * 而**还在录的那一份会被逐份降级成 INCREMENTAL**（判据在 [syncOne] 的第一行，
+         * 不靠调用方记得传对）。
+         */
+        scope: SyncScope = SyncScope.FINALIZE,
         /**
          * ③ 对账开始那一刻的回调（用例钉"调用序列"用；`null` = 不关心）。
          *
@@ -76,7 +86,7 @@ object OfflineMeetingSync {
         // ---- ② 抢占判定：ECHO 正在录**别的**会 → 等，绝不抢占 ----
         val active = transport.activeMeeting()
             ?: return offline(OfflinePhase.UNREACHABLE, drafts, manual, "读不到 ECHO 的会议状态（不算可达）")
-        val mine = mineRecording(active, localRecording, activeClientId, drafts)
+        val mine = mineRecording(active, activeClientId, drafts)
         if (echoBusyElsewhere(active.recording, mine)) {
             return offline(OfflinePhase.WAITING_MEETING_END, drafts, manual,
                 "ECHO 正在录另一场（${active.note.ifBlank { "没给名字" }}）：等它录完再传，不抢占")
@@ -88,11 +98,16 @@ object OfflineMeetingSync {
         var pending = 0
         var anyUploaded = false
         var anyStopped = false
+        var anyFinalized = false
+        /** 「暂停区间没报上去」那句（如实记下来，最后附在 note 上 —— 见 withPauseNote）。 */
+        var pauseNote = ""
         for (draft in drafts) {
-            val stage = syncOne(transport, store, draft, force, reconcileAt)
+            val stage = syncOne(transport, store, draft, force, scope, reconcileAt)
             val d = stage.draft ?: draft
             anyUploaded = anyUploaded || d.uploaded
             anyStopped = anyStopped || stage.stopped
+            anyFinalized = anyFinalized || stage.finalized
+            pauseNote = stage.pauseNote.ifBlank { pauseNote }
             confirmed += d.confirmedSegments
             total += d.segments.size
             pending += d.pendingSegments
@@ -105,14 +120,27 @@ object OfflineMeetingSync {
                     confirmedSegments = confirmed,
                     totalSegments = total,
                     pendingSegments = pending,
+                    note = withPauseNote(withPauseNote(stage.result.note, pauseNote),
+                        inferredEndNote(drafts)),
                 )
             }
         }
 
-        val done = pending == 0 || drafts.all { it.uploaded } || anyUploaded
+        // ⚠️ 还在录的那一份不算"完"：它的段可以一次不剩地传上去（pending=0），但这一场
+        // **还没收尾**（没有 stop 就没有转写）。所以"done"要求三件事同时成立：
+        // 没有一场还在录、至少有一份真的走到了收尾、而且没有欠着的段。
+        val anyRecording = drafts.any { it.recording }
+        val done = !anyRecording && ((pending == 0 && anyFinalized) || drafts.all { it.uploaded })
         // `stopped` 只在**全部完成**时才敢说是：还有一份没传完时，说"已经开始转写"就是谎报
         // （那一场服务端还没收到 stop）。
         val stopped = done && anyStopped
+        val baseNote = when {
+            done -> ""
+            pending > 0 -> "还有 $pending 段没传完，留着下次接着传"
+            // 还在录：段可以一段不剩地传上去，但**这一场还没收尾**（收尾要等用户按结束）
+            anyRecording -> "这一场还在录：已经录到的段都在服务端了，收尾（开始转写）要等你按结束"
+            else -> "段都传上去了，只差收尾（POST /api/meeting/stop）：还没开始转写"
+        }
         return OfflineSyncResult(
             phase = if (done) OfflinePhase.DONE else OfflinePhase.WAITING_UPLOAD,
             drafts = drafts.size,
@@ -120,7 +148,7 @@ object OfflineMeetingSync {
             totalSegments = total,
             pendingSegments = pending,
             stopped = stopped,
-            note = if (done) "" else "还有 $pending 段没传完，留着下次接着传",
+            note = withPauseNote(withPauseNote(baseNote, pauseNote), inferredEndNote(drafts)),
             manual = manual,
         )
     }
@@ -142,7 +170,8 @@ object OfflineMeetingSync {
     )
 
     /**
-     * 一份清单的补传：**先建会**（带 `clientId` 幂等）→ **按序传段**（可续传）→ **对账** → **stop**。
+     * 一份清单的同步：**先建会**（带 `clientId` 幂等）→ **上报暂停区间** → **按序传段**（可续传）
+     * →（只有"已经录完"才继续）**对账** → **stop**。
      *
      * 顺序**不许颠倒**（每一条都对应一次真实的静默错法）：
      *  * stop 在对账**之后**：段还没到齐就收尾，服务端会拿一份缺段的音频去转写；
@@ -150,15 +179,26 @@ object OfflineMeetingSync {
      *    （**没有 stop 就没有转写** —— 见文件头与 `OfflinePhase` 的说明）；
      *  * stop 在 `markUploaded` 之前：它失败时这一份必须**留在待办里**（退避后重试）。
      *
+     * ⚠️ **还在录的那一份（[MeetingDraft.recording]）到此为止**：只做"建会 + 报暂停 + 传段"，
+     * **绝不**对账、**绝不** stop、**绝不**标已上传。理由不是"省点事"，而是：
+     *  * 提前 stop = 服务端立刻把这一场落盘开始转写，而麦克风还在录 → **后面的段再也传不上去**
+     *    （服务端那份已经收尾，本地这份还会被标成"已完成"）；
+     *  * 提前对账也毫无意义（段数当然还没到齐），只会产生一条假的"对账不符"。
+     *  这个降级**不看调用方传了什么 scope**：后台 tick 用的就是 FINALIZE，而它完全可能
+     *  在用户还在录的时候被调到 —— 判据必须长在这里。
+     *
      * [StageResult.draft] = 更新后的清单（**已经落盘**）；
      * [StageResult.result] = 该停下时的那份结果（null = 这一份成了）；
-     * [StageResult.stopped] = 这一份的 stop 是不是真的成功了（成功路径上必为 true）。
+     * [StageResult.stopped] = 这一份的 stop 是不是真的成功了（成功路径上必为 true）；
+     * [StageResult.finalized] = 这一份**走完了**收尾那一半（INCREMENTAL / 还在录 = false）。
      */
     private suspend fun syncOne(
         transport: OfflineTransport,
         store: MeetingDraftStore,
         draft: MeetingDraft,
         force: Boolean,
+        /** 这一轮的口径（[SyncScope]）；还在录的那一份会被就地降级成 INCREMENTAL。 */
+        scope: SyncScope,
         /**
          * ③ 对账开始那一刻的回调（`null` = 不关心）。
          *
@@ -171,6 +211,7 @@ object OfflineMeetingSync {
         reconcileAt: ((MeetingDraft) -> Unit)? = null,
     ): StageResult {
         var d = draft
+        val finalize = scope == SyncScope.FINALIZE && !d.recording
 
         // ① 建会（**同一个 clientId 反复调只算一场**：幂等是服务端的责任，客户端只发同一个 id）
         val start = transport.startMeeting(
@@ -200,10 +241,42 @@ object OfflineMeetingSync {
             }
         }
 
+        // ①' ③ 上报暂停区间（**start 成功之后**；用户 2026-10-17 的第③件事）。
+        //
+        // 为什么放在 start 之后：服务端得先有这一场（按 clientId 幂等建出来的那一场），
+        // 这些区间才有地方落；而"按 clientId 幂等 + 服务端合并去重"意味着**整份重复报也没关系**
+        // ——这正是"每新增一段暂停区间后再报一次"能这么简单的原因。
+        //
+        // ⚠️ **它成不成都不许影响补传**：老服务端根本没有这个端点（另一条线在同时实现），
+        // 而"端点不存在"跟"音频有问题"是两件毫不相干的事 —— 把它当失败会让用户
+        // 因为一个可有可无的上报而永远传不上音频。所以这里只把结论**如实记进清单**
+        // （`pauseNote`，界面那条 syncNote 会带上它），然后**照常往下走**。
+        var pauseNote = d.pauseNote
+        if (d.pauses.isNotEmpty()) {
+            val pauseOutcome = try {
+                transport.reportPauses(PauseRequest(clientId = d.clientId, pauses = d.pauses))
+            } catch (e: Exception) {
+                // 补传是后台动作：不许被一个异常整条打断（真 transport 自己会吞，这一层也不假设）
+                PauseOutcome.Failed(SyncFailure.UNREACHABLE,
+                    "上报暂停区间时抛了异常：${e.javaClass.simpleName}")
+            }
+            pauseNote = when (pauseOutcome) {
+                is PauseOutcome.Ok -> ""          // 报上去了：那条"没报上去"的旧话要撤掉
+                is PauseOutcome.Unsupported -> pauseOutcome.note
+                is PauseOutcome.Failed -> pauseOutcome.note
+            }
+            if (pauseNote != d.pauseNote) {
+                d = d.copy(pauseNote = pauseNote)
+                store.save(d)
+            }
+        }
+
         // ② 按序传段：一段失败就停在这（顺序不许破），已成功的**立刻推进水位**（可续传）
         var serverCount: Int? = null
         for (seg in segmentsToUploadOf(d)) {
-            val file = store.segmentFile(d.clientId, seg.seq)
+            // **按清单里记的名字**找音频：见 audioFileOf —— 按 seq 拼就得先猜一个格式
+            // （FLAC 还是 WAV），猜错就会得到"文件不存在"，于是补传永远卡在第一段
+            val file = store.audioFileOf(d.clientId, seg)
             if (!file.isFile) {
                 // 本地没有这个文件：**不许跳过去传后面的**（顺序就是内容），也不许编空段。
                 return StageResult(d, which(OfflinePhase.FAILED, d,
@@ -220,6 +293,8 @@ object OfflineMeetingSync {
                 UploadRequest(
                     clientId = d.clientId, seq = seg.seq, startedAt = d.startedAt,
                     source = d.source, wav = bytes,
+                    // ⚠️ Content-Type 用**这一段清单里记的**格式（绝不按"我们想要 FLAC"发）
+                    format = seg.format,
                 )
             )) {
                 is SegmentOutcome.Ok -> {
@@ -241,6 +316,11 @@ object OfflineMeetingSync {
                     return StageResult(d, which(phase, d, out.note, force))
                 }
             }
+        }
+
+        // ---- 还在录（或这一轮只说"机会性上传"）：到这里就够了，绝不收尾 ----
+        if (!finalize) {
+            return StageResult(d, null, finalized = false, pauseNote = pauseNote)
         }
 
         // ③ 对账：服务端手上这一场的段数 == 本地最大段序号（段序号 1 起、连续）→ 才敢往下走
@@ -286,7 +366,7 @@ object OfflineMeetingSync {
                 val done = store.markUploaded(d)
                 store.save(done)
                 ActiveDraft.current?.takeIf { it.clientId == done.clientId }?.let { ActiveDraft.set(done) }
-                return StageResult(done, null, stopped = true)
+                return StageResult(done, null, stopped = true, finalized = true, pauseNote = pauseNote)
             }
             is StopOutcome.Failed -> {
                 // stop 没成：**不进 DONE、不删缓存**，留在待办里等退避后重试。
@@ -301,9 +381,33 @@ object OfflineMeetingSync {
                         "**还没有开始转写**，缓存留着，下次接着试"
                 }
                 val phase = if (stop.retryable) OfflinePhase.WAITING_UPLOAD else OfflinePhase.FAILED
-                return StageResult(d, which(phase, d, note, force))
+                return StageResult(d, which(phase, d, withPauseNote(note, pauseNote), force),
+                    finalized = true, pauseNote = pauseNote)
             }
         }
+    }
+
+    /**
+     * 把"暂停区间没报上去"那句附在正文后面（**不覆盖真实原因** —— 两句都要在）。
+     *
+     * 为什么要单独一个拼法：这句话是**附加信息**，任何时候都不该把它顶掉真正的原因
+     * （"服务端拒了收尾"比"暂停没报上去"要紧得多）；而它又必须能被用户看到
+     * —— 用户点名要求"如实记一句"。两句都在 = 两种事实都在。
+     */
+    internal fun withPauseNote(note: String, pauseNote: String): String =
+        listOf(note, pauseNote).filter { it.isNotBlank() }.joinToString(" · ")
+
+    /**
+     * 「这一场的结束时间是**推**出来的」那句如实的话（空 = 没有这种清单）。
+     *
+     * 什么时候会有：App 在录音时被系统杀掉，下一次开录时那条清单的 `ended_at` 只能
+     * 按最后一段推（`endedAtInferred = true`）。它不是"暂停没报上去"那种附加信息，
+     * 而是**这场会的时间轴有一处是推断的** —— 用户与排障的人都该看到。
+     */
+    internal fun inferredEndNote(drafts: List<MeetingDraft>): String {
+        val n = drafts.count { it.endedAtInferred }
+        return if (n == 0) "" else
+            "有 $n 场是被进程打断的（结束时间按最后一段推的，不是当时按的结束）"
     }
 
     /** 单份清单那一档结果（省得每处都手拼五个字段 —— 手拼必漂）。 */
@@ -334,14 +438,23 @@ object OfflineMeetingSync {
      * 判对的意义：判错成"是我的"会把**电脑正在录的会**当成自己的场子往里传段
      * （两路音频混进同一场 = 转写里两个人同时说话）；判错成"不是我的"最多多等一会儿。
      * 所以这里**宁可判不是**（只有确切相等才回 true）。
+     *
+     * ## 为什么 clientId 那一级必须**先判**（2026-10-17 合并两条路时改的）
+     *
+     * 老版本第一行是"App 自己在录 → 一律判不是"（那时自己录的会服务端根本不知道，
+     * 所以"服务端在录的必然不是我"）。合并成一条路之后**这条前提没了**：
+     * 现在每一段都会带着 `clientId` 去 `start`，服务端那条"正在录"的记录**很可能就是我自己**
+     * —— 再按老判据走，就会拿"我自己在录"去挡住"传我自己的段"，表现是
+     * **自己等自己**（一直"等这场录完再传"，而那一场就是它自己在录的）。
+     * 所以现在：**只要服务端回的 id 与清单相等，就是我自己** —— 与"我在不在录"无关。
+     * 而认不出来时（服务端没给 id、清单也没记会议 id）仍然**宁可判不是**（最多多等一会儿，
+     * 绝不会把两路音频混进别人的会）。
      */
     internal fun mineRecording(
         active: ActiveMeeting,
-        localRecording: Boolean,
         activeClientId: String?,
         drafts: List<MeetingDraft>,
     ): Boolean {
-        if (localRecording) return false
         val mine = drafts.filter { it.clientId == activeClientId }
         if (mine.isEmpty()) return false
         val aid = active.clientId.trim()
@@ -355,6 +468,10 @@ object OfflineMeetingSync {
         val result: OfflineSyncResult?,
         /** 这一份的 `stop` 是不是真的成功了（**唯一**敢说"开始转写"的判据）。 */
         val stopped: Boolean = false,
+        /** 这一份**走完了**收尾那一半（还在录 / INCREMENTAL = false，见 [SyncScope]）。 */
+        val finalized: Boolean = false,
+        /** 「暂停区间没报上去」那句如实的话（空 = 报上去了，或这一场没有暂停区间）。 */
+        val pauseNote: String = "",
     )
 
     // ---- 状态流（界面读它；与 MicState 同一个套路）----
@@ -467,17 +584,49 @@ data class UploadRequest(
     val startedAt: String,
     val source: String,
     val wav: ByteArray,
+    /**
+     * **这一段真的是哪种格式**（来自清单里 `DraftSegment.format`）。
+     *
+     * ⚠️ 传输层**必须**用它拼 `Content-Type`（`audio/flac` / `audio/wav`）：
+     * 服务端要按它 + `fLaC` 魔数认格式。写死成 `audio/wav` 的话，FLAC 那些段会被
+     * 当成 wav 收下 —— 那正是"谎报格式"（用户明确说不要），而且转写那边解不出来。
+     *
+     * 默认 WAV：老清单里没写格式的段确实就是 WAV（见 [SegmentFormat.DEFAULT]）。
+     */
+    val format: SegmentFormat = SegmentFormat.WAV,
 ) {
     // ByteArray 在 data class 里必须自己写 equals/hashCode（否则用例里的"传了哪几段"
     // 断言会永远不等 —— 那可是真的会让人误判"没传"）。
     override fun equals(other: Any?): Boolean =
         other is UploadRequest && other.clientId == clientId && other.seq == seq &&
-            other.startedAt == startedAt && other.source == source && other.wav.contentEquals(wav)
+            other.startedAt == startedAt && other.source == source &&
+            other.format == format && other.wav.contentEquals(wav)
 
     override fun hashCode(): Int =
-        (((clientId.hashCode() * 31 + seq) * 31 + startedAt.hashCode()) * 31 +
-            source.hashCode()) * 31 + wav.contentHashCode()
+        ((((clientId.hashCode() * 31 + seq) * 31 + startedAt.hashCode()) * 31 +
+            source.hashCode()) * 31 + format.hashCode()) * 31 + wav.contentHashCode()
 }
+
+/**
+ * **上报暂停区间**的请求（`POST /api/meeting/pauses`，用户 2026-10-17 的第③件事）。
+ *
+ * 契约（两边一致）：body 是
+ * ```json
+ * {"clientId": "...", "pauses": [{"from": 12.5, "to": 31.0}]}
+ * ```
+ * * `from`/`to` 是**相对这一场开始时间**的秒数（与电脑侧 `meta["pauses"]` 同一个语义：
+ *   暂停 = 不写盘、不产生音频）；
+ * * **按 `clientId` 幂等**：整份重复报也没关系（服务端会合并去重）—— 所以"每新增一条
+ *   暂停区间就再报一次"这件事不必先算差集，直接把当前的整份交上去就行。
+ *
+ * ⚠️ 为什么不发 `by`（`local`/`remote`）：用户给的契约里只有 `from`/`to`。
+ * 多发的字段会被服务端静默忽略（等于没发），而"以为它在起作用"是最难查的错法 ——
+ * 契约上没有的东西，客户端就不发明。
+ */
+data class PauseRequest(
+    val clientId: String,
+    val pauses: List<DraftPause>,
+)
 
 /**
  * 收尾那一场的请求（`POST /api/meeting/stop`）。
@@ -497,7 +646,7 @@ data class StopRequest(
 )
 
 /**
- * 补传需要的**全部**服务端能力（一个接口，方便测试注入 + 让"服务端要支持什么"一目了然）。
+ * 同步需要的**全部**服务端能力（一个接口，方便测试注入 + 让"服务端要支持什么"一目了然）。
  *
  * 实现见 `OfflineMeetingTransport`（真 HTTP，走 `EchoApi`）。
  */
@@ -512,7 +661,7 @@ interface OfflineTransport {
     /** 用缓存的开始时间 + 客户端 id 建那场会（**同一个 id 反复调只该建一场**）。 */
     suspend fun startMeeting(req: StartRequest): StartOutcome
 
-    /** 传一段（裸 wav；带上 `clientId` / `seq` 供服务端幂等）。 */
+    /** 传一段（**裸音频**：`Content-Type` 按 [UploadRequest.format]；带上 `clientId`/`seq` 供服务端幂等）。 */
     suspend fun uploadSegment(req: UploadRequest): SegmentOutcome
 
     /** 问服务端：这一场它手上有几段（对账用）。读不到就 [CountOutcome.Failed]。 */
@@ -526,4 +675,18 @@ interface OfflineTransport {
      * 少了这一步，**传上去的音频永远不会出文字**，而且之后谁都开不了新会议。
      */
     suspend fun stopMeeting(req: StopRequest): StopOutcome
+
+    /**
+     * **上报暂停区间**（`POST /api/meeting/pauses`）—— 用户 2026-10-17 的第③件事。
+     *
+     * 为什么它是端口上**唯一**一个有默认实现的能力（其余几个都没有）：它是**附加**信息，
+     * 而且老服务端**根本没有这个端点**（另一条线在同时实现）。用默认实现表达
+     * "没有这个能力"是最诚实的做法：
+     *  * 不实现它的注入式 transport（用例里的假服务端、将来的别的实现）自动得到
+     *    [PauseOutcome.Unsupported] —— **这次没报上去**，而**不影响补传**；
+     *  * 真实现（[com.echo.contact.service.OfflineMeetingTransport]）覆盖它去发请求，
+     *    并把 404/405 翻成同一档 [PauseOutcome.Unsupported]。
+     */
+    suspend fun reportPauses(req: PauseRequest): PauseOutcome =
+        PauseOutcome.Unsupported("这台服务端没有上报暂停区间的接口（这次没报上去）")
 }

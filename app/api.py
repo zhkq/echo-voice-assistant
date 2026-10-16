@@ -1455,6 +1455,7 @@ async def meeting_segment(request: Request, clientId: str = "", seq: int = 0,
         if not r["ok"]:
             raise HTTPException(status_code=409, detail=r["message"])
         return {"ok": True, "message": r["name"], "meetingId": r["meetingId"],
+                "name": r["name"],
                 "clientId": r["clientId"], "duplicate": r["duplicate"],
                 "segmentIndex": r["segmentIndex"],
                 "segmentCount": r["segmentCount"], "seqCount": r["seqCount"],
@@ -1629,6 +1630,57 @@ def meeting_pause(request: Request, _auth=Depends(optional_auth)):
     ok, msg = meeting.pause_meeting(by=_meeting_actor(request))
     services.report_meeting("active" if ok else "idle", msg)
     return {"ok": ok, "message": msg}
+
+
+@router.post("/meeting/pauses")
+async def meeting_pauses(request: Request, _auth=Depends(optional_auth)):
+    """手机**补报**离线期间的暂停区间（合并进那场会议的 `meta["pauses"]`）。
+
+    JSON body（**这是这条接口的契约，客户端照它写**）：
+
+        {"clientId": "<客户端稳定 id>",
+         "pauses": [{"from": <时间>, "to": <时间，可缺/可为空>}, …]}
+
+    `from`/`to` 收**三种**写法（服务端统一归一成 `meta["pauses"]` 里那个绝对本地 ISO；
+    `"start"/"end"` 也当别名收）：
+      * **相对这一场开始时间的秒数**（`12.5` —— 安卓侧契约就是这个，见
+        `dto/MeetingOfflineDtos.kt::MeetingPausesRequest`；≤ 30 天的一律按它算）；
+      * epoch 秒（`1750000000`）；
+      * ISO 字符串（`"2026-10-16T10:05:00"`、带时区或 `Z` 也认）。
+    分界线写在 `meeting.PAUSE_RELATIVE_MAX_SECONDS`（**只写一份**）：一次会议不可能录
+    30 天，所以"小数字"只能是相对秒。`by` 由服务端写死成「手机」（补报方就是手机）——
+    客户端**不必**发它，照 `meta` 既有三件套读就行。
+
+    语义（详见 `meeting.add_meeting_pauses`）：合并 + 幂等（重复上报不产生重复条目）+
+    **只记标注、不动任何录音流程**（不碰 `_state["paused"]`/recorder，也不触发转写）；
+    `clientId` 与当前那场不符 → 拒绝且零改动（与 `/meeting/stop` 同一护栏）；
+    没在录 → `ok=false` + 原因（**不会顺手建会**）。
+
+    为什么状态码是 **200 + `ok:false`**（护栏那条不是 4xx）：这条接口的失败绝大多数是
+    **业务性**的（"现在没在录"），与既有 `/meeting/start|stop|pause` 完全一致 —— 同一族
+    接口里有的 409 有的 200 会让客户端要写两套判据。请求本身没毛病、只是这次干不了，
+    那就如实回一句人话原因。
+    """
+    try:
+        body = await request.json()
+    except Exception:                                              # noqa: BLE001
+        raise HTTPException(status_code=422, detail="请求体必须是 JSON（见接口说明）")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=422, detail="请求体必须是 JSON 对象")
+    cid = str(body.get("clientId") or "").strip()
+    pauses = body.get("pauses")
+    if isinstance(pauses, dict):                 # 单条也认（少一层数组是最常见的客户端笔误）
+        pauses = [pauses]
+    if not isinstance(pauses, list):
+        raise HTTPException(status_code=422, detail="pauses 必须是区间数组")
+    r = meeting.add_meeting_pauses(pauses, client_id=cid)
+    # ⚠️ 这里**不调** `services.report_meeting(...)`：补报暂停是"事后叙述"，本接口
+    # **不许**开始/停止/改变任何录音状态 —— 顺手报一次组件状态就是在动流程（见
+    # `add_meeting_pauses` 的说明）。组件状态由 `/meeting/pause|resume|start|stop` 负责。
+    return {"ok": r["ok"], "message": r["message"],
+            "clientId": r["clientId"], "meetingId": r["meetingId"],
+            "pauses": r.get("pauses") or [], "added": int(r.get("added") or 0),
+            "skipped": int(r.get("skipped") or 0)}
 
 
 @router.post("/meeting/resume")

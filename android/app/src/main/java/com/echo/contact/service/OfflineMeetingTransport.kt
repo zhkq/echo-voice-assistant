@@ -1,6 +1,7 @@
 package com.echo.contact.service
 
 import com.echo.contact.data.EchoApi
+import com.echo.contact.data.dto.MeetingPausesRequest
 import com.google.gson.JsonObject
 import com.google.gson.JsonParser
 import okhttp3.MediaType.Companion.toMediaType
@@ -104,12 +105,17 @@ class OfflineMeetingTransport(private val api: EchoApi) : OfflineTransport {
 
     /**
      * 传一段。带上 `clientId` / `seq` 之后，服务端**才可能**做到幂等与对账。
+     *
+     * ⚠️ `Content-Type` 用**这一段清单里记的**格式（[UploadRequest.format]），
+     * 不是写死的 `audio/wav`：用户 2026-10-17 把段改成了 FLAC，而服务端要按
+     * `Content-Type: audio/flac` + `fLaC` 魔数识别。写死成 wav 的话，FLAC 那些段
+     * 会被当成 wav 收下 —— 那正是"谎报格式"（服务端解不出来，用户以为传上去了）。
      */
     override suspend fun uploadSegment(req: UploadRequest): SegmentOutcome = try {
-        val wav = req.wav.toRequestBody("audio/wav".toMediaType())
+        val payload = req.wav.toRequestBody(req.format.contentType.toMediaType())
         val r = api.meetingSegmentWithId(
             clientId = req.clientId, seq = req.seq, startedAt = req.startedAt,
-            source = req.source, body = wav,
+            source = req.source, body = payload,
         )
         val body = r.body()
         when {
@@ -272,6 +278,69 @@ class OfflineMeetingTransport(private val api: EchoApi) : OfflineTransport {
         StopOutcome.Failed(SyncFailure.UNREACHABLE,
             "收尾那个请求没发出去：${e.message}", retryable = true, alreadyUploadedHint = true)
     }
+
+    /**
+     * **上报暂停区间**（`POST /api/meeting/pauses`，用户 2026-10-17 的第③件事）。
+     *
+     * 契约（两边一致）：JSON body `{"clientId": "...", "pauses": [{"from": .., "to": ..}]}`。
+     * 按 `clientId` 幂等（服务端合并去重）—— 所以每次都把**当前的整份**暂停区间发上去，
+     * 不必先算差集。
+     *
+     * ## 为什么这里最重要的是"别把'端点不存在'说成失败"
+     *
+     * 老服务端（这一版它由另一条线同时在实现）**根本没有这个端点**：
+     * FastAPI 会回 404，反向代理还可能回 405/501。这些在语义上都是同一件事 ——
+     * **"这次没报上去"**，而不是"补传出错了"：
+     *  * 归到 [PauseOutcome.Unsupported] → 编排层照常走完 `start → segment → 对账 → stop`，
+     *    只在 `syncNote` 里如实记一句；
+     *  * 若把它归成"失败"，用户会因为一个**可有可无**的上报而永远传不上音频
+     *    （端点不存在 ≠ 音频有问题）。
+     *
+     * 其余失败（连不上 / 5xx / 服务端明确拒绝）也**不算补传失败**（编排层同样不管它的返回值
+     * 是不是失败），只是**原因**要说准：这一档是 [PauseOutcome.Failed]，不是 Unsupported。
+     *
+     * 空 `pauses` **一个请求都不发**：没东西可报时发一次请求既没意义，
+     * 又会让"老服务端缺端点"这件事在每一轮同步里都刷一遍日志。
+     */
+    override suspend fun reportPauses(req: PauseRequest): PauseOutcome {
+        if (req.pauses.isEmpty()) return PauseOutcome.Ok(0)
+        return try {
+            val payload = MeetingPausesRequest(
+                clientId = req.clientId,
+                pauses = req.pauses.map { MeetingPausesRequest.PauseDto(from = it.from, to = it.to) },
+            )
+            val r = api.meetingPauses(payload)
+            val text = r.body()
+            when {
+                !r.isSuccessful -> {
+                    val f = failureOf(r.code())
+                    if (looksEndpointMissing("", r.code())) {
+                        PauseOutcome.Unsupported(
+                            "这台服务端没有上报暂停区间的接口（HTTP ${r.code()}）：这次没报上去，" +
+                                "音频照常传")
+                    } else {
+                        PauseOutcome.Failed(f,
+                            "暂停区间没报上去（HTTP ${r.code()}，${failureText(f)}）：不影响音频补传")
+                    }
+                }
+                text == null -> PauseOutcome.Failed(SyncFailure.SERVER_ERROR,
+                    "暂停区间的回包是空的：这次没报上去（不影响音频补传）")
+                text.ok -> PauseOutcome.Ok(req.pauses.size)
+                looksEndpointMissing(text.message.orEmpty()) -> PauseOutcome.Unsupported(
+                    "这台服务端没有上报暂停区间的接口（${text.message.orEmpty().ifBlank { "它没说为什么" }}）：" +
+                        "这次没报上去，音频照常传")
+                else -> PauseOutcome.Failed(
+                    if (looksBusy(text.message.orEmpty())) SyncFailure.SERVER_BUSY
+                    else SyncFailure.REJECTED,
+                    "暂停区间没报上去：${text.message.orEmpty().ifBlank { "服务端没说为什么" }}" +
+                        "（不影响音频补传）")
+            }
+        } catch (e: Exception) {
+            PauseOutcome.Failed(SyncFailure.UNREACHABLE,
+                "暂停区间没报上去：${e.message}（不影响音频补传）")
+        }
+    }
+
     /** 原始 JSON → `JsonObject`（解析不了给一个空对象 —— 调用方只看得到"字段是空的"）。 */
     private fun jsonOf(raw: String): JsonObject = try {
         JsonParser.parseString(raw).takeIf { it.isJsonObject }?.asJsonObject ?: JsonObject()

@@ -1,5 +1,6 @@
 package com.echo.contact.service
 
+import com.echo.contact.audio.SegmentFormat
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -254,6 +255,35 @@ class OfflineMeetingRetentionTest {
         assertTrue("还没传上去的更不许动", store.segmentFile("pending", 1).isFile)
         assertTrue("清单本身留着（它是那一场会唯一的本地事实，才几 KB）",
             store.load("stale") != null)
+    }
+
+    @Test
+    fun `FLAC 的段照样算占用、也照样能清（第①件事之后新增的那一档）`() {
+        // 段改成 FLAC 之后最容易漏的一处：占用统计/清理如果还按 `seg-%04d.wav` 拼文件名，
+        // 表现会是"占用永远是 0、到期了也清不掉" —— 用户只看到手机越来越满，却查不出原因。
+        val store = store()
+        val flacSegs = listOf(
+            DraftSegment(1, "seg-0001.flac", "2026-10-16T10:00:00", 0.0, 30.0,
+                format = SegmentFormat.FLAC),
+            DraftSegment(2, "seg-0002.wav", "2026-10-16T10:00:30", 30.0, 30.0,
+                format = SegmentFormat.WAV),
+        )
+        val d = draft(id = "mixed", endedIso = "2026-10-01T11:00:00", uploaded = true,
+            segs = flacSegs)
+        val dir = store.dirOf("mixed").apply { mkdirs() }
+        File(dir, "seg-0001.flac").writeBytes(ByteArray(2000) { 1 })
+        File(dir, "seg-0002.wav").writeBytes(ByteArray(3000) { 2 })
+        assertTrue(store.save(d))
+
+        assertEquals("两种格式都要算进占用（否则设置页显示的占用是假的）",
+            5000L, OfflineMeetingRetention.audioBytes(store, d))
+        val plan = OfflineMeetingRetention.plan(listOf(d), now, days = 7)
+        assertEquals("到期了就该能清", 1, plan.count)
+        val out = store.purgeAudio(d)
+        assertEquals("两个文件都要删掉（`.flac` 那个最容易漏）", 2, out.files)
+        assertEquals(5000L, out.bytes)
+        assertTrue(!File(dir, "seg-0001.flac").isFile)
+        assertTrue(!File(dir, "seg-0002.wav").isFile)
     }
 
     @Test

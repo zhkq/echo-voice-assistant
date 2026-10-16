@@ -147,8 +147,9 @@ fun MeetingsTab(vm: MainViewModel) {
                     Spacer(Modifier.height(4.dp))
                     MutedLine(
                         "「开始录音」录的是电脑那支麦克风（手机只是遥控）；" +
-                            "想让手机当麦克风就点「用手机麦克风」。" +
-                            "连不上 ECHO 时它不会失败，会改成在手机上离线录音，等联网再传。",
+                            "想让手机当麦克风就点「用手机麦克风」——" +
+                            "那条路**每一段都先存在手机里**，网通就顺手传给电脑，" +
+                            "不通也不会失败，联网后自动补传。",
                         maxLines = 3,
                     )
                     note?.let {
@@ -156,10 +157,10 @@ fun MeetingsTab(vm: MainViewModel) {
                         MutedLine(it, color = EchoPalette.Yellow)
                     }
 
-                    // ---- 离线录音（用户 2026-10-16 要的）----
-                    // 手机连不上 ECHO 时，录音**不该失败**：改成在手机上离线录。
-                    // 这条卡片是录完之后唯一能看到"还有几段没传上去"的地方
-                    // （全屏录音界面在结束后就收起来了），所以它必须在这里、而且必须**如实**。
+                    // ---- 手机录音的补传进度（用户 2026-10-16 要的；2026-10-17 合并成一条路）----
+                    // 这段是**每一次手机录音**都要显示的东西（不再只是"离线那一场"）：
+                    // 录完之后全屏界面就收起来了，而"还有几段没传上去"必须还能看到 ——
+                    // 所以它必须在这里、而且必须**如实**（绝不说"已上传"）。
                     val micState = com.echo.contact.service.MeetingMicService.state
                         .collectAsState().value
                     if (micState.syncNote.isNotBlank() &&
@@ -173,14 +174,15 @@ fun MeetingsTab(vm: MainViewModel) {
                                 EchoPalette.Green else EchoPalette.Yellow,
                             maxLines = 3,
                         )
+                        // 段的格式**如实**：退回 WAV 时要说清（用户 2026-10-17 点名要求）
+                        micState.formatNote.takeIf { it.isNotBlank() }?.let {
+                            MutedLine(it, color = EchoPalette.Muted, maxLines = 2)
+                        }
                         if (micState.syncPending > 0 && !micState.syncBusy) {
                             Spacer(Modifier.height(4.dp))
                             OutlinedButton(onClick = {
                                 com.echo.contact.service.MeetingMicService.syncNow(localCtx)
-                            }) { Text("现在同步离线录音") }
-                        }
-                        micState.offlineNote.takeIf { it.isNotBlank() }?.let {
-                            MutedLine("原因：$it", color = EchoPalette.Muted, maxLines = 2)
+                            }) { Text("现在同步手机录音") }
                         }
                     }
                 }

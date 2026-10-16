@@ -1,26 +1,33 @@
 package com.echo.contact.service
 
+import com.echo.contact.audio.SegmentFormat
 import java.io.File
 import java.nio.charset.StandardCharsets
 import java.time.LocalDateTime
 import java.time.format.DateTimeFormatter
 
 /**
- * **离线会议录音的清单**（manifest）—— 用户 2026-10-16 的需求：
- * *"手机如果连不上 echo 也可以进入离线状态，离线状态可以开始录音，结束录音，
- * 录音文件缓存在 app，网络通了就可以传上去"*。
+ * **会议录音的清单**（manifest）。
  *
- * ## 为什么要有这一份清单（而不是"看着目录里有哪些 wav"）
+ * 它的来历是用户 2026-10-16 的需求：*"手机如果连不上 echo 也可以进入离线状态，
+ * 离线状态可以开始录音，结束录音，录音文件缓存在 app，网络通了就可以传上去"*；
+ * 而 2026-10-17 用户又把它推到了**唯一**那条路上 —— *"离线录音和在线录音就没什么本质区别了"*。
+ * 于是这份清单不再是"离线那一场才有的东西"：**每一次手机录音都有它**，
+ * 因为"音频先落本地"是这条路的本体（[com.echo.contact.service.MeetingRecordSession]）。
+ *
+ * ## 为什么要有这一份清单（而不是"看着目录里有哪些 wav/flac"）
  *
  * 补传时必须回答三个**只有清单才能回答**的问题：
- *  1. 这些段属于**哪一场**会议（目录里可能有几场离线录音等着传）；
+ *  1. 这些段属于**哪一场**会议（目录里可能有几场录音等着传）；
  *  2. 它们的**顺序**与**起止时间**（音频的先后顺序就是内容本身；开始时间是
  *     会议在电脑上的 `startedAt`，必须用**当时**的时间，不是补传时的时间）；
  *  3. 哪几段**已经被服务端认下**（可续传；已确认的段跳过，不再重传）。
  *
- * 还有一个不写在音频里的东西：**客户端生成的稳定 id**（[MeetingDraft.clientId]）。
- * 补传时把同一个 id 反复交给服务端，服务端只要按它幂等，就**不会建出两场会议**、
- * 也不会把同一段存两遍（见 [MeetingDraftStore] 与 `OfflineMeetingSync` 的说明）。
+ * 还有两个不写在音频里的东西：
+ *  * **客户端生成的稳定 id**（[MeetingDraft.clientId]）—— 补传时把同一个 id 反复交给服务端，
+ *    服务端只要按它幂等，就**不会建出两场会议**、也不会把同一段存两遍；
+ *  * **每一段真的格式**（[DraftSegment.format]）—— 上传时的 `Content-Type` 用它，
+ *    因为 FLAC 编码器是设备能力，"编不出来就退回 WAV"完全可能发生在同一场中间。
  *
  * ## 为什么手写 JSON 而不引 Gson
  *
@@ -30,13 +37,13 @@ import java.time.format.DateTimeFormatter
  * 而 [`com.echo.contact.service.OfflineMeetingJson`] 是唯一写法，别在别处拼字符串。
  */
 
-/** 录音来源：目前只有"手机麦"这一档会离线录。 */
+/** 录音来源：这一档是"手机麦"（电脑不开麦，只负责落盘/转写/存储）。 */
 object MeetingSource {
     const val PHONE = "phone"
 }
 
 /**
- * 一份离线录音的清单。
+ * 一场手机录音的清单。
  *
  * [serverMeetingId] 在补传时由服务端给出（`0` = 还没建/还没回来）。它**不是**幂等键 ——
  * 幂等键是 [clientId]（客户端自己生成的稳定 id）。
@@ -61,6 +68,23 @@ data class MeetingDraft(
     val acknowledgedSegments: Int = 0,
     /** 全部段都被服务端认下、且对账通过。 */
     val uploaded: Boolean = false,
+    /**
+     * 结束时间是**推断**出来的（这一场被进程杀过，结束时间按最后一段推的）。
+     *
+     * 为什么要单独一个字段（而不是在 `pauseNote` 里塞一句话）：它是**结构化的事实**，
+     * 而且必须能被**每一次**同步如实说出来 —— "这场会的结束时刻不是用户按的，
+     * 是推出来的"会影响用户对时长/时间轴的信任（详情页里那段时间就是推断的）。
+     */
+    val endedAtInferred: Boolean = false,
+    /**
+     * 上一次**上报暂停区间**（`POST /api/meeting/pauses`）的结论 —— 只在"没报上去"时非空。
+     *
+     * 为什么要落进清单（而不是只写在界面状态里）：老服务端没有这个端点，"这次没报上去"
+     * 是**常态**，而它必须能被**下一次同步**看到（服务端换新版本之后，下一次同步还会
+     * 把整份暂停区间再报一次 —— 按 clientId 幂等，重复报没关系）。只写在内存状态里的话，
+     * 进程一被杀，这件事就永远没人知道了（用户看到的是"暂停没被记下"，却说不出为什么）。
+     */
+    val pauseNote: String = "",
 ) {
     /** 还在录（没写结束时间）。 */
     val recording: Boolean get() = endedAt.isBlank()
@@ -86,6 +110,18 @@ data class DraftSegment(
     val durationSeconds: Double,
     /** 服务端已认下这一段。 */
     val uploaded: Boolean = false,
+    /**
+     * **这一段真的是哪种格式**（用户 2026-10-17：段改成 FLAC；编不出来才退回 WAV）。
+     *
+     * 为什么格式要**逐段**记在清单里（而不是整场一个设置、或按后缀猜）：
+     * FLAC 编码器是**设备能力**，同一场里完全可能"第 1 段编成了 FLAC、第 2 段编不出来只好 WAV"
+     * （编码器被系统回收、内存紧张、某一段特别短）。而上传时的 `Content-Type` 与服务端的
+     * 识别**都**依赖这个事实 —— 记错就是"谎报格式"，服务端按 `fLaC` 魔数一验就露馅。
+     * 所以清单里这一项就是**发出去时用的那一项**，没有第二处判据。
+     *
+     * 默认 [SegmentFormat.DEFAULT]（WAV）：老清单里没写格式的那些段确实就是 WAV。
+     */
+    val format: SegmentFormat = SegmentFormat.DEFAULT,
 )
 
 /**
@@ -98,7 +134,11 @@ data class PurgeOutcome(val files: Int, val bytes: Long) {
     val nothingDeleted: Boolean get() = files == 0
 }
 
-/** 一条暂停区间（与电脑侧 `meta["pauses"]` 同一个语义：暂停 = 不写盘、不产生音频）。 */
+/**
+ * 一条暂停区间（与电脑侧 `meta["pauses"]` 同一个语义 —— 但那句话在 2026-10-16 深夜被用户
+ * 推翻了：暂停**照常写盘**，写进去的是**全零（空白）音频**，时间轴逐字连续、总时长不受影响、
+ * 不做任何剪切；于是这条区间是**纯标注**（"这几段是暂停的"），不参与任何拼接/裁剪/补偿）。
+ */
 data class DraftPause(
     /** 相对**开始时间**的秒数。 */
     val from: Double,
@@ -113,11 +153,16 @@ data class DraftPause(
 }
 
 /**
- * 当前在录的那一场 —— 进程级（和 [AboutToRecord] 同口径）。
+ * 当前在录的那一场 —— 进程级。
  *
  * 为什么要放进程级：采集循环在 `MeetingMicService` 里跑，而界面（全屏录音界面）
  * 与补传逻辑都要知道"现在这一场是哪个 id、录到第几段、确认到第几段"。
  * 复用服务里的 `StateFlow` 做不到这一点 —— 那是给人看的**文案状态**，不是数据。
+ *
+ * ⚠️ 用户 2026-10-17 把"在线/离线两条路"合并成了一条（**本地先写 + 机会性上传**），
+ * 于是原来那个 `RecordPlan`（Online/Offline 两档分叉）连同它的交接对象 `AboutToRecord`
+ * **一起退役了**：现在开始录音只有一个动作 —— 在本地把这场立起来，
+ * 没有任何"先探活、再决定走哪条路"的分岔，也就没有"这一场是哪种"要交接给别人。
  */
 object ActiveDraft {
     @Volatile var current: MeetingDraft? = null
@@ -130,48 +175,6 @@ object ActiveDraft {
     fun clear() {
         current = null
     }
-}
-
-/**
- * 「这一场已经决定**要录**了」的那一次交接（进程级）。
- *
- * `MeetingMicService.start()` 是 `startForegroundService`，**异步**；界面紧接着要打开
- * 全屏录音界面，而全屏界面必须知道"这次录的是哪一种、离线那一场是哪个 id"
- * （否则它只能在服务真的开麦之后才敢显示，用户看到的是"点了没反应"）。
- * 和 `MeetingOpenStore` 同一个套路：写入在主线程、读取在组合里，中间没有异步。
- */
-object AboutToRecord {
-    @Volatile var plan: RecordPlan? = null
-        private set
-
-    fun put(plan: RecordPlan) {
-        this.plan = plan
-    }
-
-    fun consume(): RecordPlan? {
-        val it = plan
-        plan = null
-        return it
-    }
-
-    fun clear() {
-        plan = null
-    }
-}
-
-/**
- * 一次「开始录音」被分到哪条路（**纯数据**，由 `MeetingMicService` 在起服务时算出来）。
- *
- * 用户 2026-10-16 的原话是"手机如果连不上 echo 也可以进入离线状态"——
- * 于是"连不上"不再是失败，而是一个**正当的分支**：离线录音。
- * 界面上那句"ECHO 连不上，已在手机上离线录音"就是从 [offline] 这一档来的。
- */
-sealed interface RecordPlan {
-    /** 联网那条路（与以前完全一致：先在电脑上开一场"手机麦"会议）。 */
-    data class Online(val note: String = "") : RecordPlan
-
-    /** 离线那条路：**完全本地**，先在手机上把清单立起来。 */
-    data class Offline(val clientId: String, val reason: String) : RecordPlan
 }
 
 /** [MeetingDraftStore.loadOrCreate] 的结局。 */
@@ -206,9 +209,20 @@ class MeetingDraftStore(private val root: File) {
 
     fun manifestFile(clientId: String): File = File(dirOf(clientId), MANIFEST_NAME)
 
-    /** 这一段的音频文件。 */
-    fun segmentFile(clientId: String, seq: Int): File =
-        File(dirOf(clientId), segmentName(seq))
+    /** 这一段的音频文件（**按清单里记的文件名**解析 —— 见 [audioFileOf]）。 */
+    fun segmentFile(clientId: String, seq: Int, format: SegmentFormat = SegmentFormat.WAV): File =
+        File(dirOf(clientId), segmentName(seq, format))
+
+    /**
+     * 一段的音频文件：**文件名以清单里那一份为准**（`seg.file`）。
+     *
+     * 为什么不让调用方拿 `seq` 去拼文件名：拼的时候必然要选一个格式（`.flac` 还是 `.wav`），
+     * 而"选了哪个"就等于**重新猜了一次格式** —— 一旦清单里记的是 WAV（编码器不可用那一档）、
+     * 调用方却按 FLAC 去拼，就会得到"文件不存在"，于是补传永远卡在第一段（而用户什么都没做错）。
+     * 清单里 `file` 这一项是**当时真的写下去的那个名字**，用它就没有第二次猜。
+     */
+    fun audioFileOf(clientId: String, seg: DraftSegment): File =
+        File(dirOf(clientId), seg.file)
 
     /** 这个 id 对应的清单（不存在/读不动就给 null —— **别伪造一份空的**）。 */
     fun load(clientId: String): MeetingDraft? = read(manifestFile(clientId).takeIf { it.isFile })
@@ -327,7 +341,9 @@ class MeetingDraftStore(private val root: File) {
         var deleted = 0
         var bytes = 0L
         draft.segments.forEach { seg ->
-            val f = segmentFile(draft.clientId, seg.seq)
+            // **按清单里记的文件名**删（不按 seq 拼）：见 audioFileOf 的说明 ——
+            // 按 seq 拼就得先猜一个格式，猜错 = FLAC 那些段永远清不掉（占用越滚越大）
+            val f = audioFileOf(draft.clientId, seg)
             try {
                 if (f.isFile) {
                     val n = f.length()
@@ -370,7 +386,8 @@ class MeetingDraftStore(private val root: File) {
         const val MANIFEST_NAME = "manifest.json"
 
         /** 段文件名：补零 → 目录里按名字排就是**正确顺序**（人肉排障时很有用）。 */
-        fun segmentName(seq: Int): String = String.format("seg-%04d.wav", seq)
+        fun segmentName(seq: Int, format: SegmentFormat = SegmentFormat.WAV): String =
+            String.format("seg-%04d.%s", seq, format.extension)
 
         /**
          * 新的客户端 id。格式 `phone-<yyyyMMddHHmmss>-<4 位随机>`：
@@ -429,6 +446,8 @@ object OfflineMeetingJson {
         append("  \"server_meeting_id\": ").append(draft.serverMeetingId).append(",\n")
         append("  \"acknowledged_segments\": ").append(draft.acknowledgedSegments).append(",\n")
         append("  \"uploaded\": ").append(draft.uploaded).append(",\n")
+        append("  \"pause_note\": ").append(str(draft.pauseNote)).append(",\n")
+        append("  \"ended_at_inferred\": ").append(draft.endedAtInferred).append(",\n")
         append("  \"pauses\": [")
         draft.pauses.forEachIndexed { i, p ->
             if (i > 0) append(", ")
@@ -441,6 +460,7 @@ object OfflineMeetingJson {
         draft.segments.forEachIndexed { i, s ->
             append("    { \"seq\": ").append(s.seq)
             append(", \"file\": ").append(str(s.file))
+            append(", \"format\": ").append(str(s.format.id))
             append(", \"started_at\": ").append(str(s.startedAt))
             append(", \"start_offset\": ").append(num(s.startOffsetSeconds))
             append(", \"duration\": ").append(num(s.durationSeconds))
@@ -483,6 +503,8 @@ object OfflineMeetingJson {
             segments = (obj["segments"] as? List<*>).orEmpty().mapNotNull { segmentOf(it) },
             acknowledgedSegments = (obj["acknowledged_segments"] as? Number)?.toInt() ?: 0,
             uploaded = obj["uploaded"] as? Boolean ?: false,
+            pauseNote = (obj["pause_note"] as? String).orEmpty(),
+            endedAtInferred = obj["ended_at_inferred"] as? Boolean ?: false,
         )
     }
 
@@ -498,6 +520,9 @@ object OfflineMeetingJson {
             startOffsetSeconds = (o["start_offset"] as? Number)?.toDouble() ?: 0.0,
             durationSeconds = (o["duration"] as? Number)?.toDouble() ?: 0.0,
             uploaded = o["uploaded"] as? Boolean ?: false,
+            // 缺 `format` = 旧版本写的清单 = 那些段真的是 WAV（见 SegmentFormat.DEFAULT）。
+            // **不按文件名后缀猜**：文件名是给人和文件系统看的，格式这一项才是发出去时用的那个。
+            format = SegmentFormat.ofId(o["format"] as? String),
         )
     }
 

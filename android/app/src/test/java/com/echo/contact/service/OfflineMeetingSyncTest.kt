@@ -17,12 +17,16 @@ import org.junit.rules.TemporaryFolder
 import java.io.File
 
 /**
- * **离线补传的编排**（`OfflineMeetingSync`）：顺序 / 续传 / 对账 / 退避触发 / 不抢占。
+ * **本地先写 + 机会性上传的编排**（`OfflineMeetingSync`）：顺序 / 续传 / 对账 / 退避触发 /
+ * 不抢占 / 还在录不许收尾 / 上报暂停区间。
  *
  * 这一组用例用一个**假的 [OfflineTransport]**（下面 [FakeTransport]）把服务端的各种
  * 反应摆出来（连不上、忙、拒绝、少收一段、幂等命中…），于是那些"只能靠真机才能看出来"
  * 的口径在 JVM 里就能钉住 —— 而它们在真机上看不出来的原因正是：
  * **手机这边一切正常，错的是"谁先谁后"与"敢不敢说已上传"**。
+ *
+ * （"两条路合并成一条"那条主线在 `MeetingSinglePathTest` 里用**真 HTTP** 跑，
+ * 这里管的是编排层的逐条判据。）
  */
 class OfflineMeetingSyncTest {
 
@@ -67,7 +71,9 @@ class OfflineMeetingSyncTest {
      *  * 记得每一场收了哪些 `seq`（**幂等**：重复的 seq 不重复存，只回 duplicate）；
      *  * 段数是**这一场的累计段数**（不是"这一轮收了几段"）—— 真服务端报的也是它，
      *    而对账比的就是这个数（见 `reconcile` 的说明）；
-     *  * 能演"ECHO 正录着别的会""服务端拒绝""连不上""读不到状态"。
+     *  * 能演"ECHO 正录着别的会""服务端拒绝""连不上""读不到状态"；
+     *  * 能演"老服务端没有上报暂停区间的端点"（[reportPauses] 的默认实现就是那一档，
+     *    这里显式记下来，供"上报不影响补传"的判据用）。
      */
     private class FakeTransport(
         var reachCode: Int? = 200,
@@ -97,10 +103,17 @@ class OfflineMeetingSyncTest {
         var stopThrows: Boolean = false,
         /** 演"这场早就停过了"（服务端的幂等回复）。 */
         var stopAlreadyStopped: Boolean = false,
+        /** 演"老服务端没有上报暂停区间的端点"（`PauseOutcome.Unsupported`）。 */
+        var pausesUnsupported: Boolean = false,
+        /** 演"上报暂停区间时连不上/出错"。 */
+        var pausesFailure: SyncFailure? = null,
     ) : OfflineTransport {
 
         val started = mutableListOf<StartRequest>()
         val uploaded = mutableListOf<Pair<String, Int>>()
+
+        /** 上报过的暂停区间（每一轮一条 —— "整份重报"就该在这里看到重复的区间）。 */
+        val pauseReports = mutableListOf<PauseRequest>()
 
         /**
          * **调用序列**（修①的核心判据：stop 必须在最后、且只有一次）。
@@ -120,6 +133,18 @@ class OfflineMeetingSyncTest {
 
         override suspend fun activeMeeting(): ActiveMeeting? =
             if (statusUnreadable) null else active
+
+        override suspend fun reportPauses(req: PauseRequest): PauseOutcome {
+            calls += "pauses:${req.pauses.size}"
+            pauseReports += req
+            pausesFailure?.let {
+                return PauseOutcome.Failed(it, "暂停区间没报上去（${it.name}）：不影响音频补传")
+            }
+            if (pausesUnsupported) {
+                return PauseOutcome.Unsupported("这台服务端没有上报暂停区间的接口：这次没报上去")
+            }
+            return PauseOutcome.Ok(req.pauses.size)
+        }
 
         override suspend fun startMeeting(req: StartRequest): StartOutcome {
             startCalls++
@@ -201,18 +226,25 @@ class OfflineMeetingSyncTest {
         seqs: List<Int> = listOf(1, 2, 3),
         acked: Int = 0,
         uploaded: Boolean = false,
+        /** 还在录（没写结束时间）—— 那种清单**只许传段、绝不许收尾**。 */
+        recording: Boolean = false,
+        pauses: List<DraftPause> = emptyList(),
+        format: com.echo.contact.audio.SegmentFormat = com.echo.contact.audio.SegmentFormat.WAV,
     ): MeetingDraft {
         val dir = store.dirOf(id).apply { mkdirs() }
-        seqs.forEach { File(dir, MeetingDraftStore.segmentName(it)).writeBytes(ByteArray(64) { 1 }) }
+        seqs.forEach {
+            File(dir, MeetingDraftStore.segmentName(it, format)).writeBytes(ByteArray(64) { 1 })
+        }
         val d = MeetingDraft(
             clientId = id,
             startedAt = startedAt,
-            endedAt = "2026-10-16T20:33:02",
+            endedAt = if (recording) "" else "2026-10-16T20:33:02",
             durationSeconds = 90.0,
+            pauses = pauses,
             segments = seqs.map {
-                DraftSegment(seq = it, file = MeetingDraftStore.segmentName(it),
+                DraftSegment(seq = it, file = MeetingDraftStore.segmentName(it, format),
                     startedAt = startedAt, startOffsetSeconds = (it - 1) * 30.0,
-                    durationSeconds = 30.0)
+                    durationSeconds = 30.0, format = format)
             },
             acknowledgedSegments = acked,
             uploaded = uploaded,
@@ -224,14 +256,14 @@ class OfflineMeetingSyncTest {
     private fun run(
         t: OfflineTransport,
         store: MeetingDraftStore,
-        localRecording: Boolean = false,
         activeClientId: String? = null,
         manual: Boolean = false,
+        scope: SyncScope = SyncScope.FINALIZE,
         reconcileAt: ((MeetingDraft) -> Unit)? = null,
     ): OfflineSyncResult = runBlocking {
         OfflineMeetingSync.run(
-            transport = t, store = store, localRecording = localRecording,
-            activeClientId = activeClientId, manual = manual, reconcileAt = reconcileAt)
+            transport = t, store = store, activeClientId = activeClientId,
+            manual = manual, scope = scope, reconcileAt = reconcileAt)
     }
 
     // ---------------------------------------------------------------- ① 顺序 + 幂等建会
@@ -348,11 +380,12 @@ class OfflineMeetingSyncTest {
     }
 
     @Test
-    fun `中途从联网转离线的清单也能对账通过（前几段只在电脑上）`() {
-        // 用户开录时网是通的，第 7 段时断了：清单里只有本地留着的 7、8 两段，
-        // 而水位要接上"联网时已经送出去的 6 段"（见 watermarkAfterHandoff）。
-        // 这一条盯的是：那种清单**必须**能传完并对账通过 —— 否则用户看到的是
-        // "一直没传完"，而他其实什么都没做错。
+    fun `本地只留了后面几段的清单也能对账通过（水位在前）`() {
+        // ⚠️ 合并成一条路之后，"前几段只在电脑上"这种清单**不再由这条路产生**
+        // （每一段都先写本地）。但它在升级上来的老清单里真实存在过，而且这条判据本身
+        // 仍然重要：**对账比的是"本地最大段序号"，不是"本地有几段"** ——
+        // 按"有几段"去比会把每一份续传清单都判成"不符"，于是那些清单**永远传不完**
+        // （用户什么都没做错，却一直看到"还有 N 段没传上去"）。
         val store = store()
         val d = seed(store, seqs = listOf(7, 8))
         store.save(d.copy(acknowledgedSegments = 6))
@@ -855,6 +888,158 @@ class OfflineMeetingSyncTest {
         assertEquals("每一场都要收尾（漏一场 = 那一场永远不出文字，还占着录音槽）",
             listOf("earlier", "later"), t.stops.map { it.clientId })
         assertTrue(r.stopped)
+    }
+
+    // ---------------------------------------------------------------- ⑩ 合并成一条路（2026-10-17）
+
+    /**
+     * **还在录的那一份：只传段，绝不收尾**（合并两条路之后最容易写错的地方）。
+     *
+     * 为什么这条比什么都重要：`stop` 一到，服务端就落盘、写 meta、**发起转写**，
+     * 而麦克风还在录 —— 之后的段再也传不上去（服务端那份已经收尾，本地这份还会被标成
+     * "已完成"）。所以判据必须长在 `syncOne` 里，而不是靠调用方记得别传 FINALIZE：
+     * 后台 tick（`tickFromForeground`）用的就是 FINALIZE，它完全可能在用户还在录时被调到。
+     */
+    @Test
+    fun `还在录的那一份只传段 一次 stop 都不许有`() {
+        val store = store()
+        seed(store, seqs = listOf(1, 2), recording = true)
+        val t = FakeTransport()
+
+        val r = run(t, store)                       // 默认就是 FINALIZE（最"危险"的那一档）
+
+        assertEquals("两段都传上去了（边录边传）", listOf(1, 2), t.uploaded.map { it.second })
+        assertTrue("**一次 stop 都没有**：${t.calls}", t.calls.none { it == "stop" })
+        assertEquals(0, t.stops.size)
+        assertEquals("连对账都不做（段数当然还没到齐，那条'不符'是假的）",
+            listOf("start", "segment:1", "segment:2"), t.calls)
+        assertFalse("没收尾 → 不许标已上传", store.load(clientId)!!.uploaded)
+        assertTrue("还在录", store.load(clientId)!!.recording)
+        assertFalse("也不许说'开始转写'", r.stopped)
+        assertTrue("原因要说清是'还在录、收尾等结束'：${r.note}",
+            r.note.contains("还在录") && r.note.contains("按结束"))
+    }
+
+    /** [SyncScope.INCREMENTAL]：录完了的清单这一轮也只传段、不收尾（"顺手传一下"就是这个口径）。 */
+    @Test
+    fun `INCREMENTAL 只传段不收尾（录完了也一样）`() {
+        val store = store()
+        seed(store, seqs = listOf(1, 2))
+        val t = FakeTransport()
+
+        val r = run(t, store, scope = SyncScope.INCREMENTAL)
+
+        assertEquals(listOf(1, 2), t.uploaded.map { it.second })
+        assertEquals("机会性上传**永远不 stop**：${t.calls}",
+            listOf("start", "segment:1", "segment:2"), t.calls)
+        assertFalse(store.load(clientId)!!.uploaded)
+        assertFalse(r.stopped)
+        assertEquals("段都上去了，但还没收尾 —— 这不是 DONE", OfflinePhase.WAITING_UPLOAD, r.phase)
+    }
+
+    /** 同一个 `clientId` 自己那一场**不再挡自己**（合并成一条路之后必须这样）。 */
+    @Test
+    fun `自己那一场正在录时也不算抢占（合并成一条路之后）`() {
+        val store = store()
+        seed(store, seqs = listOf(1), recording = true)
+        // 服务端回的 clientId 就是我们这一份 → 那"正在录"的就是我们自己
+        val t = FakeTransport(active = ActiveMeeting(recording = true, meetingId = 7, clientId = clientId))
+
+        val r = run(t, store, activeClientId = clientId, scope = SyncScope.INCREMENTAL)
+
+        assertEquals("不许'自己等自己'（那条路线上每一段都会带 clientId 去 start）",
+            OfflinePhase.WAITING_UPLOAD, r.phase)
+        assertEquals(listOf(1), t.uploaded.map { it.second })
+    }
+
+    @Test
+    fun `结束时间是推算出来的那一场 要在结果里如实说一句`() {
+        val store = store()
+        val d = seed(store, seqs = listOf(1))
+        store.save(d.copy(endedAtInferred = true))
+        val t = FakeTransport()
+
+        val r = run(t, store)
+
+        assertEquals(OfflinePhase.DONE, r.phase)
+        assertTrue("这场会的时间轴有一处是推断的，必须说出来：${r.note}",
+            r.note.contains("被进程打断"))
+        assertTrue("而且要说清是'推的'：${r.note}", r.note.contains("推的"))
+    }
+
+    // ---- ③ 上报暂停区间（用户 2026-10-17 的第③件事）----
+
+    @Test
+    fun `start 成功之后上报暂停区间 而且是按 clientId 整份重报`() {
+        val store = store()
+        seed(store, seqs = listOf(1), pauses = listOf(DraftPause(10.0, 20.0)))
+        val t = FakeTransport()
+
+        run(t, store)
+        // 第二轮：把 uploaded 清掉重跑一次（模拟"又新增了一条暂停区间"）
+        store.save(store.load(clientId)!!.copy(uploaded = false, acknowledgedSegments = 0))
+        run(t, store)
+
+        assertEquals("两轮都报了一次（每新增一条就再报一次）", 2, t.pauseReports.size)
+        assertTrue("按 id 幂等 —— 所以每次把**当前整份**交上去，服务端合并去重",
+            t.pauseReports.all { it.clientId == clientId && it.pauses == listOf(DraftPause(10.0, 20.0)) })
+        assertEquals("上报发生在 start **之后**（服务端得先有这一场）",
+            listOf("start", "pauses:1", "segment:1", "stop",
+                "start", "pauses:1", "segment:1", "stop"), t.calls)
+    }
+
+    @Test
+    fun `没有暂停区间时一个请求都不发`() {
+        val store = store()
+        seed(store, seqs = listOf(1))
+        val t = FakeTransport()
+        run(t, store)
+        assertTrue("没东西可报就别白发一次请求（也别刷日志）：${t.calls}",
+            t.calls.none { it.startsWith("pauses") })
+    }
+
+    @Test
+    fun `老服务端没有 pauses 端点时不算失败 补传照常走到 DONE`() {
+        val store = store()
+        seed(store, seqs = listOf(1, 2), pauses = listOf(DraftPause(5.0, 9.0)))
+        val t = FakeTransport(pausesUnsupported = true)
+
+        val r = run(t, store)
+
+        assertEquals("**端点不存在跟音频没关系**：补传照常完成", OfflinePhase.DONE, r.phase)
+        assertTrue(r.stopped)
+        assertTrue(store.load(clientId)!!.uploaded)
+        assertTrue("要如实记一句：${r.note}", r.note.contains("没报上去"))
+        assertTrue("而且记进清单（下次同步还看得到）",
+            store.load(clientId)!!.pauseNote.contains("没报上去"))
+    }
+
+    @Test
+    fun `暂停上报连不上时也照样传完 只是如实记一句`() {
+        val store = store()
+        seed(store, seqs = listOf(1), pauses = listOf(DraftPause(1.0, 2.0)))
+        val t = FakeTransport(pausesFailure = SyncFailure.UNREACHABLE)
+
+        val r = run(t, store)
+
+        assertEquals(OfflinePhase.DONE, r.phase)
+        assertEquals(listOf(1), t.uploaded.map { it.second })
+        assertTrue("原因要说准（是没通，不是'端点不存在'）：${r.note}",
+            r.note.contains("没报上去"))
+    }
+
+    @Test
+    fun `暂停上报失败不许盖掉真正的原因（收尾那句最要紧）`() {
+        val store = store()
+        seed(store, seqs = listOf(1), pauses = listOf(DraftPause(1.0, 2.0)))
+        val t = FakeTransport(stopFailure = SyncFailure.UNREACHABLE,
+            pausesUnsupported = true)
+
+        val r = run(t, store)
+
+        assertTrue("收尾没成那句必须在（那是'还没有开始转写'）：${r.note}",
+            r.note.contains("还没有开始转写"))
+        assertTrue("暂停那条也要在（两句都是事实）：${r.note}", r.note.contains("没报上去"))
     }
 
     // ---------------------------------------------------------------- ⑧ 其它
