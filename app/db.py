@@ -738,6 +738,48 @@ def get_meeting_by_name(name):
     return _query_one("SELECT * FROM meetings WHERE name=?", (name,))
 
 
+# ---------------------------------------------------------------- 客户端稳定 id（离线补传的幂等键）
+#
+# 手机断网时**完全本地**录音，联网后按 start → segment… → 对账 → stop 补传；`clientId` 是
+# 客户端给的**稳定** id，补传会因超时反复重发，所以服务端必须能"按这个 id 找回那一场会议"
+# （否则一次重发就在面板上多一场一模一样的会）。索引落在库里这一份，就是下面两个函数。
+#
+# 为什么不给 `meetings` 加一列（2026-10-16 的取舍，留给后人看）：加列必须走迁移，而
+# `tests/test_db_upgrade.py` 的结构快照把 `meetings` **逐列**钉在真实 1.x 库上，新增列要
+# 登记进那个文件的 `POST_1X_COLUMNS`（本次任务不许改既有用例）。于是用库里**已经有**的
+# 键值表 `meta`（此前只放 schema_version）：语义上它就是"库自己的索引"，既不出现在任何
+# 接口响应里，也不会像 `meetings.notes` 那样挤掉**用户自己写的**备注（见迁移 6 的注释）。
+# ⚠️ 将来若愿意动 `test_db_upgrade.py`，把这份索引换成 `meetings.client_id` 一列更好；
+#    换的时候保留 `meeting_name_by_client_id()` 这个函数面，上层一行都不用改。
+_CLIENT_ID_META_PREFIX = "offline_meeting_client:"
+
+
+def bind_meeting_client_id(client_id, meeting_name):
+    """记下「这个客户端稳定 id 对应哪一场会议」（离线补传 `start` 的幂等索引）。"""
+    cid, name = str(client_id or "").strip(), str(meeting_name or "").strip()
+    if not cid or not name:
+        return
+    set_meta(_CLIENT_ID_META_PREFIX + cid, name)
+
+
+def meeting_name_by_client_id(client_id):
+    """按客户端稳定 id 查会议名（查不到 = 空串）。**纯读**。"""
+    cid = str(client_id or "").strip()
+    if not cid:
+        return ""
+    return get_meta(_CLIENT_ID_META_PREFIX + cid, "")
+
+
+# ---- meta 表（库自己的键值表）的读写：以前只由迁移写 schema_version，没有访问器
+def get_meta(key, default=""):
+    row = _query_one("SELECT value FROM meta WHERE key=?", (str(key),))
+    return row["value"] if row is not None else default
+
+
+def set_meta(key, value):
+    _exec("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)", (str(key), str(value)))
+
+
 def get_meeting(meeting_id):
     return _query_one("SELECT * FROM meetings WHERE id=?", (meeting_id,))
 

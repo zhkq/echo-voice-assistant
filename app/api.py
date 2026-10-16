@@ -1424,25 +1424,60 @@ async def stt_sentences(file: UploadFile = File(...),
 
 # ---------------------------------------------------------------- 会议
 @router.post("/meeting/segment")
-async def meeting_segment(request: Request, _auth=Depends(optional_auth)):
+async def meeting_segment(request: Request, clientId: str = "", seq: int = 0,
+                          startedAt: str = "", source: str = "",
+                          _auth=Depends(optional_auth)):
     """手机上传**一段**会议音频（裸 wav 字节）—— "手机当麦克风"那条路（2026-10-15）。
 
     为什么按段传而不是实时流：手机那头"录满一段就发"，50 秒一段 ≈ 1.6 MB，
     走中继（单次上限 12 MB）很稳；断了重传这一段就行，不会把整场拖垮。
     **段号由电脑定**（手机只保证顺序）—— 电脑才是"存储"那一方。
+
+    **离线补传（2026-10-16）**再收三个 query —— body 仍是**裸 wav**（别改成 multipart，
+    这条接口不收那种）：
+
+      * `clientId`：客户端稳定 id。带了它就按 **`(clientId, seq)` 幂等**处理
+        （补传会重发同一段；存两遍 = 转写里同一句话出现两次、对账等式也失真）；
+      * `seq`：段序号（**1 起**）。客户端靠"服务端段数 == 本地最大段序号"对账；
+      * `startedAt` / `source`：可选，只用来与建会那次**对得上号**（不一致就落一条日志，
+        时间轴以建会那一刻为准 —— 不许后到的段把整场会议的时间挪走）。
+
+    响应里给的是**累计**段数（含之前已传的），并且同时给 `segmentCount` / `seqCount` /
+    `segments`（数组）三个别名 —— 客户端要哪个都能读到，`duplicate` 说明这次是不是幂等命中。
     """
     data = await request.body()
     if not data:
         raise HTTPException(status_code=422, detail="空的音频段")
+    cid = (clientId or "").strip()
+    if cid:
+        r = meeting.append_meeting_segment_sync(data, client_id=cid, seq=seq,
+                                                started_at=startedAt, source=source)
+        if not r["ok"]:
+            raise HTTPException(status_code=409, detail=r["message"])
+        return {"ok": True, "message": r["name"], "meetingId": r["meetingId"],
+                "clientId": r["clientId"], "duplicate": r["duplicate"],
+                "segmentIndex": r["segmentIndex"],
+                "segmentCount": r["segmentCount"], "seqCount": r["seqCount"],
+                # ⚠️ 这里 `segments` 是**数组**（段序号），与不带 clientId 那条路的**计数**
+                # 同名不同型：客户端的 DTO 把它声明成数组（`List<Any?>`），给它一个数字
+                # 会让整个响应解析失败（表现成"连不上"，最容易被误判成网络问题）。
+                # 老那条路（`CommandResponse`）只读 ok/message，所以那边维持原样。
+                "segments": r["segments"]}
     ok, msg = meeting.append_meeting_segment(data)
     if not ok:
         raise HTTPException(status_code=409, detail=msg)
+    count = int(meeting.meeting_status().get("segments") or 0)
     return {"ok": True, "message": msg,
-            "segments": meeting.meeting_status().get("segments", 0)}
+            "segments": count,
+            # 两个计数别名：不带 clientId 的老客户端也不会因为多这两个键出问题
+            # （它的 DTO 只读 ok/message），但同一件事只该有一个名字，这里顺带补齐。
+            "segmentCount": count, "seqCount": count}
 
 
 @router.post("/meeting/start")
-def meeting_start(request: Request, source: str = "pc", _auth=Depends(optional_auth)):
+def meeting_start(request: Request, source: str = "pc", clientId: str = "",
+                  startedAt: str = "", endedAt: str = "",
+                  _auth=Depends(optional_auth)):
     """开始录音。`source=pc`（默认，用电脑的麦）/ `source=phone`（手机传段上来）。
 
     用户 2026-10-15 的口径：手机发起的事该由手机采集 —— 所以手机那个界面发起时传
@@ -1452,24 +1487,55 @@ def meeting_start(request: Request, source: str = "pc", _auth=Depends(optional_a
     带中继标记 = 手机），**不是按 `source`** —— 手机按「开始录音」时 `source` 也可能是
     `pc`（用电脑的麦录），那仍然是**手机发起**的任务，通知该回手机。所以这里把 origin
     显式传给会议模块，由它写进 meta、并让这场后续所有事件都带上。
+
+    **离线补传（2026-10-16）**：带 `clientId`（客户端稳定 id）+ `startedAt`（**缓存的**
+    开始时间）+ 可选 `endedAt` 时走补传那条路（**同样是 query，这条接口没有请求体**）：
+    同一个 `clientId` 反复调只建一场、回同一个 `meetingId`（重复时 `duplicate: true`），
+    会议的开始时间采用客户端给的那个（10:00 录的、11:00 才联网 → 时间轴仍是 10:00），
+    服务端另记自己收到它的时间。带了 `clientId` 就**不开电脑的声卡** —— 补传的音频是
+    手机一段段传上来的（`/meeting/segment`），这两件事在语义上互斥。
     """
     src = (source or "pc").strip().lower()
     origin = _meeting_origin(request)
+    cid = (clientId or "").strip()
+    if cid:
+        r = meeting.start_meeting_phone_sync(cid, started_at=startedAt, ended_at=endedAt,
+                                             origin=origin)
+        services.report_meeting("active" if r["ok"] else "idle", r["message"])
+        return {"ok": r["ok"], "message": r["message"],
+                "source": r["source"] if r["ok"] else "",
+                "meetingId": r["meetingId"], "duplicate": r["duplicate"],
+                "clientId": r["clientId"]}
     ok, msg = (meeting.start_meeting_phone(origin=origin) if src == "phone"
                else meeting.start_meeting(origin=origin))
     services.report_meeting("active" if ok else "idle", msg)
+    # ⚠️ 这条（不带 clientId）的响应体被 `tests/test_api_contract.py` 逐字钉着：
+    # 需要新键的那条路在上面（`clientId`），别顺手往这里加字段。
     return {"ok": ok, "message": msg, "source": src if ok else ""}
 
 
 @router.post("/meeting/stop")
-def meeting_stop(_auth=Depends(optional_auth)):
-    ok, msg = meeting.stop_meeting()
+def meeting_stop(clientId: str = "", _auth=Depends(optional_auth)):
+    """停止录音（**收尾即转写**：紧接着就会按既有流程发起转写）。
+
+    `clientId`（可选，2026-10-16）是**防误停别人会议的护栏**：手机离线补传收尾时带上
+    自己那场的 id，若与"当前正在录的那一场"不符就**拒绝且不停**（`ok=false` + 明确原因）。
+    不传它时行为与以前完全一样（面板按钮/技能都走这一条）。
+    """
+    ok, msg = meeting.stop_meeting(client_id=clientId)
     services.report_meeting("transcribing" if ok else "idle", msg)
     return {"ok": ok, "message": msg}
 
 
 @router.get("/meeting/status")
 def meeting_status(_auth=Depends(optional_auth)):
+    """当前这场录音的状态（`active/folder/startedAt/level/error/paused/pauses/segments/source`）。
+
+    离线补传那场（**有 `clientId`** 的）额外带 `clientId` 与 `meetingId`：客户端正是靠
+    `clientId` 判"ECHO 现在录的是不是我手上这一份清单的会"（判错就会把段灌进别人的会，
+    或自己把自己挡在门外一直等）。本机麦/面板那条路照旧是原来那九个键 —— 精确键集被
+    `tests/test_api_contract.py` 钉着，见 `meeting.meeting_status()` 里的同一段说明。
+    """
     return meeting.meeting_status()
 
 

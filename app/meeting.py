@@ -106,6 +106,14 @@ _state = {
     #: 事件 payload 的 `origin` 以 `meta.json` 的 `initiatedBy` 为准（`_event_origin`）——
     #: 内存这一份是"当场那次调用"的答案（落盘失败时也还留着，日志里对得上）。
     "origin": ORIGIN_PC,
+    #: **当前这场**的客户端稳定 id（离线补传那条路才有；本机麦/面板那条路恒为空串）。
+    #: 它是 `stop` 的**护栏判据**（别把别人的会停掉）与 status 的 `clientId` 来源。
+    #: ⚠️ 每条开始录音的路都必须**显式**重设它（含置空）—— 内存状态是跨会议复用的，
+    #: 漏一处就会让"上一场的 id"粘到新一场上（那正是本仓库反复踩过的状态泄漏）。
+    "client_id": "",
+    #: 当前这场在 `meetings` 表里的 id（0 = 还不知道）。
+    #: 段响应要给客户端回 `meetingId`，而它每次都要查库太浪费，所以在建会那一刻记下来。
+    "meeting_id": 0,
 }
 # 录音状态锁：start/stop 必须原子化 —— 否则并发 stop（如面板按钮双击/重复请求）
 # 会同时通过 active 检查，造成重复转写 + 重复纪要（日志里出现过两次“停止录音”同秒）。
@@ -661,7 +669,7 @@ def transcribe_progress(meeting_id=None):
 
 def meeting_status():
     rec = _state.get("recorder")
-    return {
+    st = {
         "active": _state["active"],
         "folder": os.path.basename(_state["folder"]) if _state["folder"] else None,
         "startedAt": _state["started_at"],
@@ -676,6 +684,40 @@ def meeting_status():
         #: 采集源（pc / phone）—— 手机界面据此显示"声音来自哪支麦"
         "source": str(_state.get("source") or "pc"),
     }
+    # 离线补传那一场额外带 `clientId` / `meetingId`（2026-10-16）：客户端正是靠 `clientId`
+    # 判"ECHO 现在录的是不是我手上这一份清单的会"（`OfflineMeetingSync.mineRecording` 里
+    # 它是最强判据 —— 没有它就只能比会议 id，而清单里的 id 可能还没写下来，于是**自己等自己**）。
+    #
+    # ⚠️ **只在"这场确实有 clientId"时才加这两个键**，不是无条件加：
+    # `tests/test_api_contract.py::test_status_keys_are_the_documented_ones` 把本机麦那条路的
+    # 键集**逐个**钉死了（那是既有契约，本次不许改）。于是本机麦/面板那条路照旧是原来那九个键，
+    # 而补传那场（唯一需要它的地方）拿得到 id —— 既有契约一个字不动，新能力也在。
+    if _state["active"]:
+        cid = str(_state.get("client_id") or "").strip()
+        if cid:
+            st["clientId"] = cid
+            st["meetingId"] = _meeting_id_for()
+    return st
+
+
+def _meeting_id_for(folder=""):
+    """某一场会议在库里的 id（内存里记着就直接用，否则按目录名查一次）。
+
+    `folder` 为空 = 问"**现在正在录**的那一场"；给了就是问那一场 ——
+    补传在"这场已经收尾、客户端仍在重试"那条路上要用它拿到 id（见
+    `_duplicate_from_a_finished_meeting`）。
+    """
+    mid = int(_state.get("meeting_id") or 0)
+    if mid:
+        return mid
+    target = str(folder or _state.get("folder") or "")
+    if not target:
+        return 0
+    try:
+        row = db.get_meeting_by_name(os.path.basename(target))
+    except Exception:                                              # noqa: BLE001
+        return 0
+    return int((row or {}).get("id") or 0)
 
 
 def _save_meta(folder, meta):
@@ -818,18 +860,26 @@ def _event_origin(folder=None, meta=None):
     return normalize_origin(meta.get("initiatedBy"))
 
 
-def _new_meeting_folder_and_meta(cfg, origin=ORIGIN_PC):
+def _new_meeting_folder_and_meta(cfg, origin=ORIGIN_PC, started_at="", extra=None, folder=""):
     """建目录 + 起始 meta（两条录音路共用：本机麦 / 手机麦）。
 
     `origin` = 这场会议的**发起方**（`mobile` / `pc`），落成 `initiatedBy` ——
     之后这场发出的所有事件（started/stopped/transcribed/summary_ready）都从它读
     （`_event_origin`），口径见 `normalize_origin`。
+
+    `started_at` / `extra`（2026-10-16，只给**离线补传**那条路用）：那场的开始时间是
+    **客户端缓存的**（不是"现在"），而且要多记 `clientId` / `receivedAt`。
+    `folder`（同上，2026-10-16）：补传是"一轮里连着建好几场"，目录名得由调用方先算好
+    （同一秒连开两场会撞 `meetings.name` 的 UNIQUE，见 `_unique_offline_folder`）。
+    既有两条路不传它们 → 行为与以前逐字节相同（`start` 仍是"现在"、目录名仍是时间戳）。
     """
     now = datetime.datetime.now()
-    folder = os.path.join(meetings_dir(), now.strftime("%Y-%m-%d_%H-%M-%S"))
+    folder = str(folder or "").strip() or os.path.join(
+        meetings_dir(), now.strftime("%Y-%m-%d_%H-%M-%S"))
     os.makedirs(folder, exist_ok=True)
+    start_stamp = str(started_at or "").strip() or now.isoformat(timespec="seconds")
     meta = {
-        "start": now.isoformat(timespec="seconds"),
+        "start": start_stamp,
         #: 这场会议**是谁发起的**（`mobile` / `pc`）。写给事件的 `origin` 读，
         #: 也写给人事后查（"这场到底是手机发起的还是电脑上点的"）。
         "initiatedBy": normalize_origin(origin),
@@ -843,6 +893,9 @@ def _new_meeting_folder_and_meta(cfg, origin=ORIGIN_PC):
         "segments": [],
         "pauses": [],
     }
+    for k, v in dict(extra or {}).items():
+        if v not in ("", None):
+            meta[k] = v
     with open(os.path.join(folder, "meta.json"), "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
     return folder, meta
@@ -876,7 +929,10 @@ def start_meeting_phone(origin=ORIGIN_PC):
             diarize=1 if meta["config"]["diarize"] else 0)
         _state.update(active=True, folder=folder, recorder=None,
                       started_at=meta["start"], error="", paused=False, pauses=[],
-                      source="phone", origin=meta["initiatedBy"])
+                      source="phone", origin=meta["initiatedBy"],
+                      # 本机麦/这条"没有 clientId"的路必须**显式**把离线补传那两个键清掉：
+                      # 内存状态是跨会议复用的，漏一处就会让上一场的 id 粘到新一场上。
+                      client_id="", meeting_id=meeting_id, seg_count=0)
         db.add_event("meeting_started", {"meeting": os.path.basename(folder),
                                          "id": meeting_id, "source": "phone",
                                          "origin": meta["initiatedBy"]})
@@ -884,32 +940,322 @@ def start_meeting_phone(origin=ORIGIN_PC):
         return True, os.path.basename(folder)
 
 
-def append_meeting_segment(data, name=""):
-    """手机传上来的一段音频 → 落成 `NN.wav`。返回 `(ok, 段名或原因)`。
+# ---------------------------------------------------------------- 离线补传（手机断网录、联网补传）
+#
+# 手机在断网时**完全本地**录音，联网后按 `start → segment…（可续传）→ 对账 → stop` 补传
+# （安卓侧见 `OfflineMeetingSync` / `OfflineMeetingTransport`）。服务端这一半的判据全在
+# 这一节里，**别在 api 层再写一遍**：
+#
+#   * **`clientId` 是给"重试"用的幂等键**：补传在网络不稳时会重发（超时重发、杀进程重来），
+#     所以"同一个 id 反复调 `start`"必须只建一场会 —— 否则一次重发 = 用户在面板上看到
+#     两场一模一样的会；"同一 `(clientId, seq)` 反复传"必须只在盘上留一份 —— 否则同一句
+#     话在转写里出现两遍，而且客户端"服务端段数 == 本地最大段序号"的对账等式会失真。
+#   * **`startedAt` 与"收到时间"必须都留**：会议的开始时间采用**客户端缓存的那个**
+#     （10:00 录的、11:00 才联网，时间轴仍从 10:00 起），服务端**另外**记下自己是什么时候
+#     收到这一场的（`receivedAt`）。手机时钟可能不准 —— 两者混成一个字段，事后就再也分不出
+#     "是手机时间错"还是"这台电脑时间错"。
+#   * **`stop` 带 `clientId` 是防误停别人会议的护栏**（见 `stop_meeting`）：对不上号的收尾
+#     请求绝不能把当前那场（可能是电脑正在录的会）停掉 —— 那会让用户白录一段。
 
-    判据（都在这一处，别在 api 层再写一遍）：
-      * 必须在"手机麦"那场录音里（本机麦那条路不接受外来段，否则两路音频会混进同一场）；
-      * **必须是 WAV**（`RIFF` 头）：下游转写按 wav 读，塞个 mp3 进去会在转写时报一句
-        很难追的错；
-      * 段名按现有段号往下排（手机那边只保证顺序，编号由电脑定 —— 电脑才是"存储"那一方）。
+#: 客户端稳定 id 在 `meta.json` 里的键名（库里那份索引见 `db.bind_meeting_client_id`）。
+CLIENT_ID_KEY = "clientId"
+#: 服务端**收到这一场**的时间（与客户端缓存的 `start` 分开留，别混为一谈）。
+RECEIVED_AT_KEY = "receivedAt"
+
+
+def _now_stamp():
+    return datetime.datetime.now().isoformat(timespec="seconds")
+
+
+def _parse_client_stamp(value):
+    """客户端缓存的 ISO 本地时间 → 我们能用的那个字符串（认不出 = 空串）。
+
+    为什么要过这一道：手机那边可能给带毫秒/带时区（`Z` / `+08:00`）的写法，而这个字符串
+    会进 `meta["start"]`、进库里的 `started_at`、还会被下游当时间轴读。**认不出就退回"现在"**
+    —— 宁可时间轴有偏差，也不能因为一个坏字符串建不出会（那用户就补传不上来了）。
+    """
+    s = str(value or "").strip()
+    if not s:
+        return ""
+    try:
+        dt = datetime.datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        return ""
+    if dt.tzinfo is not None:
+        dt = dt.astimezone().replace(tzinfo=None)
+    return dt.isoformat(timespec="seconds")
+
+
+def meeting_name_by_client_id(client_id):
+    """按客户端稳定 id 找会议名（查不到 = 空串）。
+
+    **库优先，再扫目录**：库里那份索引（`db.meeting_name_by_client_id`）是 O(1) 的正路；
+    目录那一遍是兜底 —— 索引是"后来才有的东西"，而这个 id 对客户端是**幂等键**，
+    索引一旦丢了（库重建/手工清过），必须还能从各场会议的 `meta.json` 认出来，
+    否则同一场会被再建一遍（用户看到两场一模一样的会，还都叫"手机录音"）。
+    """
+    cid = str(client_id or "").strip()
+    if not cid:
+        return ""
+    try:
+        name = db.meeting_name_by_client_id(cid)
+        if name and db.get_meeting_by_name(name):
+            return name
+    except Exception as e:                                         # noqa: BLE001
+        db.add_log("warn", "meeting", "按 clientId 查会议失败（改扫目录兜底）：%s" % e)
+    return _scan_name_by_client_id(cid)
+
+
+def _scan_name_by_client_id(cid):
+    """扫最近 200 个会议目录的 `meta.json` 找同一个 clientId（兜底，见上）。"""
+    try:
+        root = meetings_dir()
+        names = sorted(os.listdir(root), reverse=True)[:200]     # 目录名 = 时间戳 → 新的在前
+    except OSError:
+        return ""
+    for name in names:
+        meta = _load_json(os.path.join(root, name, "meta.json"), {})
+        if isinstance(meta, dict) and str(meta.get(CLIENT_ID_KEY) or "").strip() == cid:
+            return name
+    return ""
+
+
+def _unique_offline_folder():
+    """给补传这场挑一个**唯一**的会议目录名并建出来。返回 `(name, folder, 错误原因)`。
+
+    为什么这条路上非做不可（2026-10-16，写用例时当场撞出来的）：补传是"**一轮里连着建
+    好几场**"（客户端按开始时间顺序循环，每场一个 `start`），两场落在同一秒里很正常 ——
+    而 `meetings.name` 是 UNIQUE、目录名又是"秒级时间戳"，撞上就是
+    `sqlite3.IntegrityError` → HTTP 500 → **整轮补传当场断掉**（用户看到"补传失败"，
+    音频还都好好躺在手机里，等下次再试还是同一秒撞同一场）。
+    命名沿用既有形状（`_unique_meeting_folder` 那份，加 `_2` 后缀），并且**绝不覆盖**：
+    覆盖会把别人的录音整段冲掉 —— 那是最不可逆的一种错。
+    """
+    stamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    root = meetings_dir()
+    for i in range(1, 100):
+        name = stamp if i == 1 else "%s_%d" % (stamp, i)
+        folder = os.path.join(root, name)
+        if os.path.exists(folder):
+            continue
+        try:
+            if db.get_meeting_by_name(name) is not None:
+                continue                      # 库里有行、目录被删过：换下一个名字
+        except Exception:                                          # noqa: BLE001
+            pass
+        try:
+            os.makedirs(folder)               # exist_ok=False：谁先建谁得到它
+        except FileExistsError:
+            continue
+        except OSError as e:
+            return "", "", "无法创建会议目录（%s）：%s" % (folder, e)
+        return name, folder, ""
+    return "", "", "同一秒里有 100 场补传会议了（%s）——稍后再试" % stamp
+
+
+def start_meeting_phone_sync(client_id, started_at="", ended_at="", origin=ORIGIN_PC):
+    """离线补传那条路的**建会**：按 `clientId` 幂等 + 采用客户端缓存的开始时间。
+
+    返回一份**结构化**结果（`ok/message/meetingId/duplicate/clientId/name/source/startedAt`），
+    而不是 `(ok, 名字)`：客户端要的是"哪一场 + 这次是不是命中了幂等"（它要把 id 记进清单，
+    重复时要能确认"没有新建第二场"）。刻意与 `start_meeting_phone()` 分开 ——
+    老路径的响应体被 `tests/test_api_contract.py` **逐字**钉着，硬塞新键会把既有契约改掉。
+
+    三条判据（顺序就是优先级）：
+      1. 库里/meta 里已有这个 id 的会 → 回**那一场**（`duplicate: true`，绝不新建）；
+      2. 已经有一场在录（但不是这个 id 的）→ **不抢占**（既有行为，回"会议录音已在进行中"）；
+      3. 都不是 → 真的建一场：开始时间取客户端缓存的 `startedAt`，另外记 `receivedAt`。
+    """
+    cid = str(client_id or "").strip()
+    if not cid:
+        return {"ok": False, "message": "缺少 clientId（离线补传必须带客户端稳定 id）",
+                "meetingId": 0, "duplicate": False, "clientId": "", "name": "",
+                "source": "", "startedAt": ""}
+    with _state_lock:
+        # ① 幂等命中：同一个 id 反复调只该得到同一场
+        name = meeting_name_by_client_id(cid)
+        if name:
+            row = db.get_meeting_by_name(name) or {}
+            return {"ok": True, "message": name, "meetingId": int(row.get("id") or 0),
+                    "duplicate": True, "clientId": cid, "name": name, "source": "phone",
+                    "startedAt": str(row.get("started_at") or "")}
+        # ② 已经有一场在录（不是这个 id 的）→ 不抢占，如实回既有那句话
+        if _state["active"]:
+            return {"ok": False, "message": "会议录音已在进行中", "meetingId": 0,
+                    "duplicate": False, "clientId": cid, "name": "", "source": "",
+                    "startedAt": ""}
+        cfg = settings
+        received = _now_stamp()
+        client_start = _parse_client_stamp(started_at)
+        # 开始时间 = **客户端缓存的那个**（时间轴不被"补传的那一刻"污染）；
+        # 认不出/没给 → 退回收到时间（见 `_parse_client_stamp`）。
+        start = client_start or received
+        # 目录名先算好（同一秒里连开几场也不许撞 UNIQUE，见 `_unique_offline_folder`）
+        name, folder, err = _unique_offline_folder()
+        if err:
+            db.add_log("error", "meeting", "离线补传建会失败：%s" % err)
+            return {"ok": False, "message": err, "meetingId": 0, "duplicate": False,
+                    "clientId": cid, "name": "", "source": "", "startedAt": ""}
+        folder, meta = _new_meeting_folder_and_meta(
+            cfg, origin=origin, started_at=start, folder=folder,
+            extra={"source": "phone", CLIENT_ID_KEY: cid, RECEIVED_AT_KEY: received,
+                   # 客户端"已经录完"的时刻也如实留着（与人给的 `receivedAt` 分开）：
+                   # 这一场在手机上是 10:00–10:40 录完的，而在电脑上是 11:00 才收到。
+                   "clientEndedAt": str(ended_at or "").strip()})
+        try:
+            meeting_id = db.create_meeting(
+                name, started_at=start, stt_model=meta["config"]["sttModel"],
+                stt_device=meta["config"]["sttDevice"],
+                diarize=1 if meta["config"]["diarize"] else 0)
+        except Exception as e:                                     # noqa: BLE001
+            # 目录名的唯一性在 `_unique_offline_folder` 里先查过（而且整段都在
+            # `_state_lock` 里，没有并发的建会者），走到这儿说明是别的写库问题 ——
+            # 如实回一句人话，别把 500 抛给客户端（它会当成"服务端出错、可以重试"，
+            # 于是每次重试都在同一格上再撞一次）。
+            db.add_log("error", "meeting", "离线补传建会写库失败（%s）：%s" % (name, e))
+            return {"ok": False, "message": "补传建会写库失败：%s" % e, "meetingId": 0,
+                    "duplicate": False, "clientId": cid, "name": "", "source": "",
+                    "startedAt": ""}
+        # 幂等索引：库一份（`start` 下次就靠它）、meta 一份（人肉排查/库丢了也能认出来）
+        db.bind_meeting_client_id(cid, name)
+        _state.update(active=True, folder=folder, recorder=None, started_at=start,
+                      error="", paused=False, pauses=[], source="phone",
+                      origin=meta["initiatedBy"], client_id=cid, meeting_id=meeting_id,
+                      seg_count=0)
+        db.add_event("meeting_started", {"meeting": name, "id": meeting_id,
+                                         "source": "phone", "clientId": cid,
+                                         "origin": meta["initiatedBy"]})
+        db.add_log("info", "meeting",
+                   "开始录音（手机麦克风·离线补传）：%s（客户端开始时间 %s，服务端收到时间 %s）"
+                   % (name, start, received))
+        return {"ok": True, "message": name, "meetingId": meeting_id, "duplicate": False,
+                "clientId": cid, "name": name, "source": "phone", "startedAt": start}
+
+
+def _segment_seq_map(segs):
+    """`["01.wav", "02.wav"]` → `{1: "01.wav", 2: "02.wav"}`（认不出的名字跳过）。"""
+    out = {}
+    for s in segs or []:
+        try:
+            out[int(str(s).split(".")[0])] = s
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _is_wav(data):
+    """裸 body 是不是一段 WAV（`RIFF` 头 + 至少 44 字节头）—— 这个判据**只写一份**。"""
+    return bool(data) and len(data) >= 44 and bytes(data[:4]) == b"RIFF"
+
+
+def _seg_result(ok, message, name="", duplicate=False, seq=0, folder="", meta=None,
+                client_id=""):
+    """段操作的结构化结果（`ok/message` + 对账要的那几个字段）。**唯一**的拼装处。"""
+    meta = meta if isinstance(meta, dict) else {}
+    smap = _segment_seq_map(meta.get("segments") or [])
+    return {
+        "ok": bool(ok),
+        "message": message,
+        "name": name,
+        "duplicate": bool(duplicate),
+        #: 这一段的序号（1 起）—— "你到底收的是第几段"必须答得上来
+        "seq": int(seq or 0),
+        "segmentIndex": int(seq or 0),
+        #: 累计段序号**数组**（客户端取 length 对账；`segmentCount` 为 null 时的兜底）
+        "segments": sorted(smap),
+        #: 累计段数（**含之前已传的**，不是"本轮收了几段"）——两个别名给多档客户端解析
+        "segmentCount": len(smap),
+        "seqCount": len(smap),
+        "meetingId": _meeting_id_for(folder),
+        "clientId": str(client_id or _state.get("client_id") or ""),
+        "startedAt": str(meta.get("start") or ""),
+    }
+
+
+def _duplicate_from_a_finished_meeting(client_id, seq):
+    """这场**已经收尾**了吗？收尾过的那场里**这一段**在不在？在 → 回幂等命中（不写盘）。
+
+    为什么非要有这条路（补传会重试**整条流程**：`stop` 的回包丢了、进程被杀重来）：
+    客户端会重新走 `start`（幂等命中，同一场）→ 逐段重传 —— 而那些段其实早就在服务端的
+    目录里了。这时如实回"这一段早收下了、这次是重复"才是对的；要是回 409「现在没有在录音」，
+    客户端只会如实报"服务端拒绝"，一条**明明已经完成**的补传就永远卡在最后一步。
+    ⚠️ 这里**只读不写**：绝不往已经收尾（可能已转写好）的那场里再写音频或再触发转写。
+    """
+    cid = str(client_id or "").strip()
+    seq = int(seq or 0)
+    if not cid or seq <= 0:
+        return None
+    name = meeting_name_by_client_id(cid)
+    if not name:
+        return None
+    folder = os.path.join(meetings_dir(), name)
+    meta = _load_json(os.path.join(folder, "meta.json"), {})
+    smap = _segment_seq_map((meta or {}).get("segments") or [])
+    if seq not in smap:
+        return None
+    return _seg_result(True, smap[seq], duplicate=True, seq=seq, folder=folder, meta=meta,
+                       client_id=cid)
+
+
+def _apply_segment(data, name="", client_id="", seq=0, started_at=""):
+    """把一段音频落到**当前这场**（两条路共用的**唯一**实现）。
+
+    为什么合成一处：两条调用方要的东西不同（老的只要 `(ok, 段名)`，离线补传那条要
+    段数/幂等标记），但"什么算成功、什么算重复、段名怎么排"必须是**同一份**判据 ——
+    各写一份迟早漂移，而漂移的表现是"同一段在两种调用下行为不一样"。
+
+    判据（顺序即优先级）：
+      * 必须在录、而且**是"你这一份"**（带了 clientId 就必须与当前那场相等）；
+      * 必须是"手机麦"那场（本机麦那条路不接受外来段，否则两路音频混进同一场）；
+      * **必须是 WAV**（`RIFF` 头）：下游按 wav 读，塞个 mp3 进去会在转写时报很难追的错；
+      * `(clientId, seq)` **已存在 = 幂等命中**：当成功回 `duplicate`，**不许存第二遍**；
+      * 没给 seq（老客户端）→ 仍由电脑按现有段号往下排（既有行为）。
     """
     with _state_lock:
+        cid = str(client_id or "").strip()
         if not _state["active"] or not _state["folder"]:
-            return False, "现在没有在录音"
+            # 没有在录：可能是"这一场**已经收尾**了，客户端在重试整条流程"
+            # （`stop` 的回包丢了）。那就按 `(clientId, seq)` 去那一场里查这段在不在 ——
+            # 在 = 幂等命中（当成功回 duplicate，见 `_duplicate_from_a_finished_meeting`）；
+            # 不在 = 如实拒绝（这一场已经收尾，不许再往里写音频）。
+            # ⚠️ 命中也要过 WAV 判据：**不许**拿一段坏 body 冒充"我重传的是同一段"。
+            if _is_wav(data):
+                done = _duplicate_from_a_finished_meeting(cid, seq)
+                if done:
+                    return done
+            return _seg_result(False, "现在没有在录音")
+        if cid and cid != str(_state.get("client_id") or "").strip():
+            # 幂等键对不上 = 这一场不是你的（另一台设备/电脑正在录的会）：
+            # 往里塞音频就是"两路音频混进同一场"，必须明确拒绝。
+            return _seg_result(False, "这场会议不是 clientId=%s 那一场，不能往它里面传音频" % cid)
         if _state.get("source") != "phone":
-            return False, "这场录音用的是电脑的麦克风，手机不用传音频"
-        if not data or len(data) < 44 or bytes(data[:4]) != b"RIFF":
-            return False, "这段不是 WAV（或太短）：手机那边该传裸 wav 字节"
+            return _seg_result(False, "这场录音用的是电脑的麦克风，手机不用传音频")
+        if not _is_wav(data):
+            return _seg_result(False, "这段不是 WAV（或太短）：手机那边该传裸 wav 字节")
         folder = _state["folder"]
         meta = _load_json(os.path.join(folder, "meta.json"), {})
         segs = list(meta.get("segments") or [])
-        idx = 0
-        for s in segs:
-            try:
-                idx = max(idx, int(str(s).split(".")[0]))
-            except Exception:                                      # noqa: BLE001
-                pass
-        seg_name = name or ("%02d.wav" % (idx + 1))
+        smap = _segment_seq_map(segs)
+        want = int(seq or 0)
+        if want <= 0:
+            want = (max(smap) if smap else 0) + 1
+        # **幂等**：这一段之前就收过（补传重试）→ 当成功、**不写第二遍**。
+        # 写两遍的后果不只是浪费磁盘：转写里同一句话出现两次，且"服务端段数 == 本地最大
+        # 段序号"这条对账等式会失真（客户端于是永远不敢说"传完了"）。
+        if want in smap:
+            _state["seg_count"] = len(smap)
+            return _seg_result(True, smap[want], duplicate=True, seq=want,
+                               folder=folder, meta=meta)
+        # 客户端给的时间与建会时那个不一致 → 如实记一笔（不改这场的时间轴）：
+        # 时间轴以**建会那一刻**定的为准，否则后到的段能把整场会议的时间挪走。
+        if str(started_at or "").strip():
+            got = _parse_client_stamp(started_at)
+            known = _parse_client_stamp(meta.get("start"))
+            if got and known and got != known:
+                db.add_log("warn", "meeting",
+                           "补传的段带着与这场不同的 startedAt（%s ≠ %s）：以建会那个为准"
+                           % (got, known))
+        seg_name = name or ("%02d.wav" % want)
         if not seg_name.lower().endswith(audiofile.WAV_EXT):
             seg_name += audiofile.WAV_EXT
         with open(os.path.join(folder, seg_name), "wb") as f:
@@ -919,7 +1265,31 @@ def append_meeting_segment(data, name=""):
         meta["segments"] = sorted(segs, key=lambda n: int(str(n).split(".")[0]))
         _save_meta(folder, meta)
         _state["seg_count"] = len(meta["segments"])       # 状态接口据此给手机显示进度
-        return True, seg_name
+        return _seg_result(True, seg_name, seq=want, folder=folder, meta=meta)
+
+
+def append_meeting_segment(data, name=""):
+    """（既有签名）手机传上来的一段音频 → 落成 `NN.wav`。返回 `(ok, 段名或原因)`。
+
+    判据见 `_apply_segment`（唯一一份）—— 这里只是把它翻成老调用方习惯的两元组。
+    """
+    r = _apply_segment(data, name=name)
+    return r["ok"], (r["name"] if r["ok"] else r["message"])
+
+
+def append_meeting_segment_sync(data, client_id="", seq=0, started_at="", source=""):
+    """离线补传那条路的**传段**：`(clientId, seq)` 幂等 + 回**累计**段数（对账用）。
+
+    `source` 只用来**如实记日志**，不参与判定：这一场是不是"手机麦"那条路，由
+    `_state["source"]` 一处说了算（判据只有一处，见 `_apply_segment`）。
+    为什么还要收它：客户端会带它（契约里是可选参数），**静默忽略**会让"服务端契约没对齐"
+    变成一个查不出来的事实 —— 带了不一样的值就落一条日志。
+    """
+    r = _apply_segment(data, client_id=client_id, seq=seq, started_at=started_at)
+    if r["ok"] and str(source or "").strip() and str(source).strip().lower() != "phone":
+        db.add_log("warn", "meeting", "补传的段带了 source=%s（这场其实是「手机麦」那条路）"
+                   % source)
+    return r
 
 
 def start_meeting(origin=ORIGIN_PC):
@@ -1014,7 +1384,10 @@ def start_meeting(origin=ORIGIN_PC):
 
         _state.update(active=True, folder=folder, recorder=recorder,
                       started_at=meta["start"], error="", paused=False, pauses=[],
-                      origin=meta["initiatedBy"])
+                      origin=meta["initiatedBy"],
+                      # 本机麦这条路**没有** clientId（补传只有手机那条路）——显式清掉，
+                      # 免得上一场补传留下的 id 让 `stop(clientId=…)` 的护栏判错。
+                      client_id="", meeting_id=meeting_id, seg_count=0)
         threading.Thread(target=_watch_recorder, args=(recorder,), daemon=True).start()
         db.add_event("meeting_started", {"meeting": os.path.basename(folder), "id": meeting_id,
                                          "origin": meta["initiatedBy"]})
@@ -1031,8 +1404,22 @@ def _watch_recorder(recorder):
             stop_meeting()
 
 
-def stop_meeting():
+def stop_meeting(client_id=""):
+    """停止录音 → **照既有流程发起转写**（"收尾即转写"：补传的音频要能出文字就靠这一步）。
+
+    `client_id`（可选，2026-10-16）是**防误停别人会议的护栏**：手机离线补传在最后一步
+    收尾时会带上自己那场的 `clientId`。它与"当前正在录的那一场"对不上时必须**拒绝且不停** ——
+    否则一个错序/重试的补传就能把电脑正在录的会停掉（那场音频当场就断了，用户白录一段）。
+    **不传 `client_id` 时行为与以前逐字节相同**（面板按钮、`meeting-record` 技能、
+    暂停恢复那条路都不传它）；对不上时的拒绝理由要**说清是"对不上号"**，
+    别用"没有进行中的会议"那种话 —— 那句话在客户端眼里是"这场早就停过了，算成功"。
+    """
     with _state_lock:
+        cid = str(client_id or "").strip()
+        if cid and _state["active"] and cid != str(_state.get("client_id") or "").strip():
+            # 正在录的是**别人**那一场：拒绝收尾（护栏），并且**一个字节都不动**。
+            return False, ("这场会议不是 clientId=%s 那一场（服务端正在录别的会），"
+                           "已拒绝收尾：不会停掉别人的会议" % cid)
         if not _state["active"]:
             return False, "没有进行中的会议"
         recorder = _state["recorder"]
@@ -1047,7 +1434,10 @@ def stop_meeting():
             err = "麦克风尚未释放，录音正在停止；请勿重复开麦，持续异常请重启 ECHO"
             _state.update(error=err, level=0.0)
             return False, err
-        _state.update(active=False, level=0.0, recorder=None, paused=False, seg_count=0)
+        _state.update(active=False, level=0.0, recorder=None, paused=False, seg_count=0,
+                      # 录音槽放掉了 → 那个护栏判据（client_id）必须一起清：
+                      # 留着它，下一场"没带 clientId 的 stop"就会拿旧 id 去比。
+                      client_id="", meeting_id=0)
 
         meta_path = os.path.join(folder, "meta.json")
         meta = _load_json(meta_path, {})
@@ -1070,6 +1460,17 @@ def stop_meeting():
         segs = sorted(set(getattr(recorder, "segments", []) or []) | set(extra),
                       key=lambda n: int(str(n).split(".")[0]))
         meta["end"] = datetime.datetime.now().isoformat(timespec="seconds")
+        # 离线补传那场（有 `clientId`）：这场会议的**结束时间**该是客户端"录完"的那个
+        # （`clientEndedAt`，手机 10:40 就结束了），服务端真正收尾的时刻另记 `stoppedAt`。
+        # 理由与 `receivedAt` 完全一样：手机时钟可能不准，两个时刻**都要留**，混成一个就
+        # 再也分不出"是手机时间错"还是"这台电脑时间错"；而这一场的时间轴该是**用户手机上
+        # 那一段**（10:00 开始、40 分钟），库里 `ended_at` 若记成补传收尾那一刻，
+        # 面板/导出里的"开始 + 时长"与 `ended_at` 就对不上（`api.py` 详情与列表原样带它）。
+        if str(meta.get(CLIENT_ID_KEY) or "").strip():
+            client_end = _parse_client_stamp(meta.get("clientEndedAt"))
+            if client_end:
+                meta["stoppedAt"] = meta["end"]
+                meta["end"] = client_end
         meta["segments"] = segs
         meta["durationSeconds"] = sum(
             audiofile.audio_seconds(_resolve_seg_paths(folder, [s]).get(s) or
