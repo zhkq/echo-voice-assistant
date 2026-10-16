@@ -72,6 +72,8 @@ fun SettingsScreen(vm: MainViewModel, onBack: () -> Unit, onUnpair: () -> Unit) 
     val connected by vm.connected.collectAsState()
     val statusError by vm.statusError.collectAsState()
     val status by vm.status.collectAsState()
+    // 「上次 ECHO 念，系统接没接受你选的输出设备」—— 播放发生在 VM 里，这里只是把它显示出来
+    val ttsRoute by vm.ttsRoute.collectAsState()
 
     var engine by remember { mutableStateOf(SpeakPrefs.load(context)) }
     var tuning by remember { mutableStateOf(ListenPrefs.load(context)) }
@@ -177,6 +179,10 @@ fun SettingsScreen(vm: MainViewModel, onBack: () -> Unit, onUnpair: () -> Unit) 
 
                     // ---- 输出设备：只做实际能做到的（手机念没有接口，所以那条路跟随系统）----
                     MutedLine("**输出**（回复从哪儿放）现在：" + OutputDevices.describe(context), maxLines = 3)
+                    // 上一行是**偏好**（选了哪支、在不在），这一行是"上一次真播的时候系统怎么答的"
+                    // —— 两者一起看才是全部事实。**只**能说"系统接受了/没接受这个偏好"：
+                    // App 没有公开 API 能确认实时路由，所以永远不写"正在用蓝牙"（见 TtsRouteText）。
+                    MutedLine(TtsRouteText.line(ttsRoute), maxLines = 3)
                     Spacer(Modifier.height(6.dp))
                     DeviceChoiceRow(
                         label = "跟随系统",

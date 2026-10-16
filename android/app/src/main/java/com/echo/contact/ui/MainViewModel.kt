@@ -9,6 +9,7 @@ import com.echo.contact.audio.MeetingAudioPlayer
 import com.echo.contact.audio.Recorder
 import com.echo.contact.audio.SpeechInput
 import com.echo.contact.audio.SystemTts
+import com.echo.contact.audio.TtsRoute
 import com.echo.contact.data.ApiClient
 import com.echo.contact.data.MeetingAudioFetcher
 import com.echo.contact.data.PairStore
@@ -106,6 +107,35 @@ object MeetingOpenPlan {
 
 /** 一次「按名字打开会议」的请求；[seq] 让重放/重复投递的同一个目标不会重复触发。 */
 data class MeetingOpenRequest(val name: String, val seq: Long)
+
+/**
+ * `EchoTtsPlayer.lastRoute` → 设置页那一行**如实**的话（**纯函数**，JVM 可测）。
+ *
+ * 为什么值得抽出来并有判据：用户设了"ECHO 念优先用蓝牙"之后，**系统到底收没收下这个偏好**
+ * 原本在界面上完全看不到 —— 而"设了没生效"和"设了、系统没听"看起来一模一样
+ * （见 `EchoTtsPlayer` 里那次 `setPreferredDevice` 的真实返回）。
+ *
+ * ⚠️ **措辞的边界（这是事实限制，不是懒得写）**：Android **没有**公开 API 能让 App 确认
+ * "此刻的声音到底从哪支出去了"（`AudioManager.getDevices` 只列可用设备、不报当前路由；
+ * `MediaPlayer.setPreferredDevice` 只回"偏好收没收下"）。所以这里**只**说
+ * "系统接受了这个偏好 / 没接受"，**绝不**写"正在用蓝牙"这类 App 无法确认的话。
+ */
+object TtsRouteText {
+
+    fun line(route: TtsRoute?): String = when {
+        // 从没播过：如实说"还没有事实可讲"，而不是拿偏好冒充结果
+        route == null ->
+            "上次 ECHO 念：还没念过（念过一次后，这里会如实显示系统有没有接受你选的设备）"
+        // 没选设备（跟随系统）：这一轮 `setPreferredDevice` 压根没被调用过
+        !route.preferred ->
+            "上次 ECHO 念：没有指定输出设备（那次按系统默认播的）"
+        route.applied ->
+            "上次 ECHO 念：优先用「${route.deviceLabel}」，系统接受了这个偏好" +
+                "（是否真从它出声由系统定，App 看不到实时路由）"
+        else ->
+            "上次 ECHO 念：优先用「${route.deviceLabel}」，系统没接受（那次按系统默认播的）"
+    }
+}
 
 /**
  * 主页（仪表盘）：整机状态 + 发文字指令 + 指令历史。
@@ -230,6 +260,19 @@ class MainViewModel(app: Application) : BaseViewModel(app) {
 
     private val systemTts: SystemTts by lazy { SystemTts(getApplication()) }
     private val echoPlayer: EchoTtsPlayer by lazy { EchoTtsPlayer(getApplication()) }
+
+    /**
+     * 「上次 ECHO 念，系统怎么答的」—— 把 `EchoTtsPlayer.lastRoute` 抬到 VM 给设置页。
+     *
+     * 为什么要抬：那次 `setPreferredDevice` 的真实返回**只**记在播放器对象里，
+     * 而设置页拿不到那个对象（播放器在 VM 手里，且每次播放是同一个实例）。
+     * 这里**不新起播放路径**：只在 [speak] 里已有的那次 `echoPlayer.play(...)` 之后
+     * 把结果读出来 —— 也就是"谁真播的，谁报结果"。
+     *
+     * null = 这个 App 里还**从没**用 ECHO 念过（不是"没设置"——偏好本身在设置页那一行）。
+     */
+    private val _ttsRoute = MutableStateFlow<TtsRoute?>(null)
+    val ttsRoute: StateFlow<TtsRoute?> = _ttsRoute.asStateFlow()
 
     // ---- 手机识别（SpeechRecognizer）----
 
@@ -435,6 +478,10 @@ class MainViewModel(app: Application) : BaseViewModel(app) {
                 val echoEngine = resp.headers()["X-Echo-Tts-Engine"].orEmpty()
                 if (echoEngine.isNotBlank()) _speakNote.value = "ECHO 引擎：$echoEngine"
                 echoPlayer.play(file) { _speaking.value = false }
+                // 播的这一下**已经**问过系统了（`play` 里 `setPreferredDevice` 的真实返回）：
+                // 就在这个现成的调用点把结果读出来给设置页（不为这一行另起播放路径）。
+                // `play` 在主线程同步做完选设备这件事（本协程就在主线程），所以这里读到的是**这次**的。
+                _ttsRoute.value = echoPlayer.lastRoute
             } catch (e: IOException) {
                 _speakNote.value = "无法连接：${e.message}"
                 _speaking.value = false

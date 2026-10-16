@@ -40,6 +40,7 @@ import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.sqrt
 
 /**
@@ -142,7 +143,17 @@ class MeetingMicService : Service() {
      * 那是最难查的一类"它为什么还在传"。
      */
     @Volatile private var retryScope: CoroutineScope? = null
-    @Volatile private var retryBusy = false
+
+    /**
+     * 「这一轮重传是不是我在跑」—— **唯一**的不可重入判据，由 [retryPending] 自己进出。
+     *
+     * 为什么不能像上一版那样只在"手动"那一侧放个 `retryBusy`：补传有**两个**入口
+     * （界面上的「立即重传」、以及 [stopEverything] 里结束前那次尽力补传），
+     * 而两个入口都会调 [retryPending]。保护只写在其中一个上，另一个照样能同时进去
+     * —— 同一段音频被传两次，电脑侧就多存一段（转写里同一段出现两遍）。
+     * 判据放进 [retryPending] 里，就是"谁跑谁占"，与调用方是谁无关。
+     */
+    private val retryGate = RetryGuard()
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -298,8 +309,11 @@ class MeetingMicService : Service() {
      * **失败就停在这**（`break`）而不是跳过它继续传后面的：会议音频的**先后顺序**就是内容本身，
      * 跳过一段先把后面的送上去，转写出来就是乱的。留着下次再试，顺序永远不破。
      *
-     * `retryBusy`：手动重传在跑时，采音循环里的那一轮**跳过**（否则同一段可能被同时传两次，
-     * 会议里就多出一段重复音频）。自己发起的时候不要重入保护成死锁 —— 所以只有别人在跑时才跳过。
+     * **不可重入**：判据在 [retryGate] 里（不是各个调用方自己的标志位）—— 「立即重传」与
+     * [stopEverything] 里"结束前的补传"是**两个**入口，保护只写在其中一个上就等于没写
+     * （两轮同时进去 → 同一段被传两次 → 电脑侧多存一段、转写里同一段出现两遍）。
+     * 并发的第二次调用**立刻**返回 [RetryOutcome.SkippedBusy]，**不排队重跑**
+     * （排队会让用户的"结束"被一次上传拖住，那是更糟的体验）。
      *
      * [note]：要不要把结果写进 `MicState.retryNote`。**只有用户按了「立即重传」才写** ——
      * 自动重传是后台的常事（每段上传前都会重试一轮），每次都往界面上写一句
@@ -309,8 +323,10 @@ class MeetingMicService : Service() {
     private suspend fun retryPending(
         api: com.echo.contact.data.EchoApi,
         note: Boolean = false,
-    ) {
-        if (retryBusy) return
+    ): RetryOutcome = retryGate.runExclusive { retryRound(api, note) }
+
+    /** 真传的那一轮（**调用方必须已经占住 [retryGate]** —— 见 [retryPending]）。 */
+    private suspend fun retryRound(api: com.echo.contact.data.EchoApi, note: Boolean) {
         var failed = false
         for (f in pendingFiles()) {
             try {
@@ -343,9 +359,13 @@ class MeetingMicService : Service() {
      *
      * 与自动重传**同一条路**（[retryPending]），这里只负责：配对没配好就说清楚，
      * 然后把这一次重传的**结果**如实写进 `retryNote`（别静默）。
+     *
+     * ⚠️ 这里**不再**自己置"忙"标志：上一版是先置 `retryBusy = true` 再去调 [retryPending]，
+     * 而 [retryPending] 开头的判据一看标志是 true 就 `return` —— 于是按「立即重传」**什么都没传**，
+     * 只把上一轮的 `retryNote` 清空了（看着像"按了没反应"）。现在"忙不忙"由守卫自己回答：
+     * 进去了就真传，被挡了就如实说被挡（[RetryOutcome.SkippedBusy]）。
      */
     private fun retryPendingNow() {
-        if (retryBusy) return
         val baseUrl = PairStore.baseUrl(this)
         if (!PairStore.isPaired(this) || baseUrl.isNullOrBlank()) {
             _state.value = _state.value.copy(retryNote = "还没配对：先配对才能重传")
@@ -353,17 +373,24 @@ class MeetingMicService : Service() {
             return
         }
         val api = ApiClient.create(baseUrl)
-        retryBusy = true
         // 上一次的结果先清掉：留着上一轮的"重传完成"会让人以为这次也完了（还没开始呢）
         _state.value = _state.value.copy(retryNote = "")
         ensureRetryScope().launch {
             try {
-                retryPending(api, note = true)
+                when (retryPending(api, note = true)) {
+                    // 结果（"重传完成，都送出去了" / "还有 N 段…"）已经由 retryPending 写进 retryNote
+                    RetryOutcome.Ran -> Unit
+                    RetryOutcome.SkippedBusy -> {
+                        // 如实：这一次**没跑**（不是"传完了"）。不说清楚的话，用户看到的只是
+                        // "按了按钮、那一行空着"，会以为按钮坏了或段丢了。
+                        _state.value = _state.value.copy(
+                            retryNote = "上一次重传还在跑，这一次没跑（等它完再按）")
+                        notifyState()
+                    }
+                }
             } catch (e: Exception) {
                 _state.value = _state.value.copy(retryNote = "重传出错：${e.message}")
                 notifyState()
-            } finally {
-                retryBusy = false
             }
         }
     }
@@ -382,7 +409,15 @@ class MeetingMicService : Service() {
                 val baseUrl = PairStore.baseUrl(this@MeetingMicService) ?: ""
                 if (baseUrl.isNotBlank()) {
                     val api = ApiClient.create(baseUrl)
-                    retryPending(api)
+                    // 这一轮**可能被"手动重传"占着而根本没跑**（[retryPending] 不可重入）。
+                    // 不排队等它 —— 用户的"结束"不该被一次上传拖住；但也**不许静默**：
+                    // 把"这次没重传完、还有 N 段留着"如实写进 retryNote（见 [stopRetryNote]）。
+                    val outcome = retryPending(api)
+                    val left = pendingFiles().size
+                    stopRetryNote(outcome, left).takeIf { it.isNotBlank() }?.let { note ->
+                        _state.value = _state.value.copy(pending = left, retryNote = note)
+                        notifyState()
+                    }
                     api.meetingStop()
                 }
             } catch (e: Exception) {
@@ -407,7 +442,9 @@ class MeetingMicService : Service() {
         // 手动重传那个作用域也要一起收掉：服务没了还留着它，就会"服务已停、请求还在飞"
         retryScope?.cancel()
         retryScope = null
-        retryBusy = false
+        // 服务正在消失：把守卫放掉（幂等）。被取消的那一轮即使来不及走 finally，
+        // 也不会让下一场录音里这个守卫一直是"在跑"。
+        retryGate.leave()
         scope.cancel()
         super.onDestroy()
     }
@@ -496,6 +533,81 @@ data class MicState(
      */
     val retryNote: String = "",
 )
+
+/**
+ * 一轮重传（[MeetingMicService.retryPending]）的结局。
+ *
+ * 为什么要有"没跑"这一档，而不是只回 true/false：调用方需要**如实**告诉用户
+ * "这一次没跑，因为另一轮正在跑" —— 只说"没成功"会让人以为音频又丢了一段。
+ */
+internal enum class RetryOutcome {
+    /** 真跑了（成没成看 `MicState.pending`：>0 就是还有没送出去的段）。 */
+    Ran,
+
+    /** **没跑** —— 另一轮已经占着守卫（不排队、不等待）。 */
+    SkippedBusy,
+}
+
+/**
+ * 「这一轮重传是不是我在跑」的**唯一**判据（纯逻辑，JVM 可测）。
+ *
+ * 为什么值得单独一个类并有判据：同一段音频被传两次，电脑侧就多存一段
+ * （转写里同一段出现两遍），而这件事在手机这边**完全静默** —— 界面照样显示"重传完成"。
+ * 所以"不可重入"必须是**一处**说了算的：谁跑谁占（[runExclusive]），
+ * 并发的第二个调用者**立刻**拿到 [RetryOutcome.SkippedBusy]（**不排队** ——
+ * 排队会让用户的"结束"被一次上传拖住）。
+ */
+internal class RetryGuard {
+
+    /**
+     * 用原子量而不是 `@Volatile Boolean`：`判断 + 占用`必须是**一步**（CAS），
+     * 否则两个线程可以同时读到"没人占"然后都进去 —— 那正是要挡的那个竞态。
+     */
+    private val busy = AtomicBoolean(false)
+
+    /** 现在有没有人占着。**只用来观察/写用例**，别拿它当"我要不要进去"的判据（那是 TOCTOU）。 */
+    val running: Boolean get() = busy.get()
+
+    /** 进得去回 true；已经有人占着就回 **false**（调用方据此如实说话）。 */
+    fun tryEnter(): Boolean = busy.compareAndSet(false, true)
+
+    /** 放掉。放掉一个没被占的守卫是无害的（幂等）。 */
+    fun leave() {
+        busy.set(false)
+    }
+
+    /**
+     * 占着守卫跑一轮 [block]：进得去就 `Ran`，别人占着就**立刻** `SkippedBusy`（不排队）。
+     *
+     * `try/finally` 是硬要求：上传抛异常时也必须放掉 —— 否则一次失败就把重传**永久锁死**
+     * （「立即重传」从此按了没反应，而 `pending` 一直不降，用户无路可走）。
+     */
+    suspend fun runExclusive(block: suspend () -> Unit): RetryOutcome {
+        if (!tryEnter()) return RetryOutcome.SkippedBusy
+        try {
+            block()
+            return RetryOutcome.Ran
+        } finally {
+            leave()
+        }
+    }
+}
+
+/**
+ * 「结束录音前那次补传」的结局 → 如实的一句话（**纯函数**，JVM 可测）。
+ *
+ * 为什么单独抽出来：这一轮**可能被"手动重传"占着而根本没跑**。什么都不说的话，
+ * 用户看到的是"我按了结束、待重传的数字还在"，却分不清是"没跑"还是"传失败了"
+ * （说错原因会把人引去查网络）。返回空串 = 没有欠的段，没什么要说的
+ * （别用套话占住界面上那一行）。
+ */
+internal fun stopRetryNote(outcome: RetryOutcome, left: Int): String = when {
+    left <= 0 -> ""
+    outcome == RetryOutcome.SkippedBusy ->
+        "结束前的补传被另一轮重传占着，这一次没跑：还有 $left 段留在手机里（下次开录会接着试）"
+    else ->
+        "结束前的补传没传完：还有 $left 段留在手机里（下次开录会接着试）"
+}
 
 /** 一段 PCM（短整型）→ 小端字节。纯函数，JVM 可测。 */
 internal fun toPcmBytes(samples: List<Short>): ByteArray {
