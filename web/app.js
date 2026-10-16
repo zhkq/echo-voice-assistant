@@ -5936,6 +5936,11 @@ let _txStatus = {};   // meeting_id -> 转写进度（轮询 /api/transcribe/sta
 function meetingBadgeCls(status) {
   if (status === "recording") return "active";
   if (status === "transcribing") return "transcribing";
+  /* 「待转写」**不许染红**（2026-10-16 明确）：音频已经在盘上、后端回来就能转，
+     它不是故障（`error` 才是故障），染红会让用户以为录音丢了 —— 那正是这一轮要修掉的谎。
+     它也不是"在转"（`transcribing`）：没有任何引擎在跑。所以徽标就是 idle；
+     真正要显眼的是**原因那一行**（下面的 `errHint`，用黄色）。 */
+  if (status === "imported") return "idle";
   if (status === "error" || status === "interrupted") return "error";
   return "idle";
 }
@@ -5950,6 +5955,14 @@ function meetingBadgeCls(status) {
      * `error` 会被读成"录音失败"，而导入的音频明明在。 */
 const MEETING_STATUS_TEXT = { recording: "录音中", transcribing: "转写中", transcribed: "已转写",
   imported: "待转写", error: "录音失败", interrupted: "已中断" };
+
+/* 状态徽标的 `title`（悬浮释义）：只给**最容易被看错**的那一档写。
+   「待转写」三个字本身什么都没说 —— 用户看着它既不知道**为什么**没转、也不知道
+   **下一步做什么**（去起后端？去配后端？去改「允许音频去哪」？）。这一句话把
+   状态指向下一步，具体原因仍由下面那行 `errHint` 用**后端原话**给出。 */
+const MEETING_BADGE_TITLE = {
+  imported: "录音已完成、音频已保存；转写还没成 —— 原因见下面那行",
+};
 
 /* 会议列表条目（**全站唯一一处渲染**：仪表盘"最近几场"与「历史 → 会议历史」共用）。
    `opts.full=true` 是历史页要的完整条目 —— 多几格：转写档位 / 说话人 / 「看转写」入口。
@@ -6006,9 +6019,21 @@ function renderMeetingItems(el, items, opts = {}) {
     // 现在原因由后端落库（`meetings.error`，`GET /api/meetings` 与详情都带），面板只负责显示；
     // 后端没记下原因时也要说人话，**不许再默认成"麦克风没打开"**。
     const errText = String((m && m.error) || "").trim();
+    /* 「待转写」（`imported`）**也要把后端那句原话显示出来**（2026-10-16 修）。
+       为什么非显示不可：`meetings.error` 里那句就是"为什么没转 + 下一步做什么"
+       （例："录音已完成，音频已保存；等转写后端可用后可重新转写（原因：后端暂不可用）"），
+       而面板原来**一处都不渲染它** —— 用户只看到徽标「待转写」三个字，
+       既不知道原因也不知道该做什么（等于把人丢在半路）。
+       三个细节都是刻意的：
+         * **黄色不是红**：这不是故障（音频在、后端回来就能转），红字会让人以为录音丢了；
+         * 文案**直接用后端那句**，面板一个字都不自己编 —— 编错原因会把人引去查网络/
+           查麦克风（2026-09-25 已经栽过一次，见上面那段注释）；
+         * 后端没记原因（空串）时**不渲染空行**，不编一句"原因未知"占地方。 */
     const errHint = m.status === "error"
       ? `<div class="m-meta" style="color:var(--red)">${esc(errText || "这场会议失败了，但原因没有记下来 —— 详见 启动 → 日志")}</div>`
-      : "";
+      : (m.status === "imported" && errText
+        ? `<div class="m-meta" data-testid="waiting-reason" style="color:var(--yellow)">⏳ ${esc(errText)}</div>`
+        : "");
     // 「已压缩」标记（2026-09-26，历史音频无损压成 FLAC）。
     // 数字**全部来自后端**（`meta.json` 里的真实前后字节），面板一个数都不自己算：
     // 估算值只在压缩前的预览里出现，两个数混在一起用户就分不清"预览"与"实况"了。
@@ -6033,7 +6058,7 @@ function renderMeetingItems(el, items, opts = {}) {
       <div class="grow">
         <div class="m-head">
           ${nameHtml}
-          <span class="badge ${meetingBadgeCls(m.status)}">${MEETING_STATUS_TEXT[m.status] || STATUS_TEXT[m.status] || m.status}</span>
+          <span class="badge ${meetingBadgeCls(m.status)}"${MEETING_BADGE_TITLE[m.status] ? ` title="${esc(MEETING_BADGE_TITLE[m.status])}"` : ""}>${MEETING_STATUS_TEXT[m.status] || STATUS_TEXT[m.status] || m.status}</span>
           ${hasSummary}
           ${acts}
         </div>

@@ -68,6 +68,10 @@ header .btns { margin-left:auto; display:flex; gap:8px; flex-wrap:wrap; }
 /* 「在等能力后端」/「本场转写由本机引擎完成」：**不是故障、但也不是正常** ——
    黄字（与红字区分：后端回来就好了 / 只是这一场慢），同样要能收缩。 */
 .cap-box .cap-dia.warn { color:var(--warn, #d29922); }
+/* 「待转写」那一行（2026-10-16）：**这一场为什么没有文字**的唯一答案，所以绿/红都不对 ——
+   它不是故障（音频在盘上、后端回来就能转），也不是正常（一个字都没有）。黄字，
+   与上面那两条"在等/降级"同一个色系（`--yellow`，本页自己那份变量）。 */
+.cap-box .cap-line.warn { color:var(--yellow); }
 /* ---------- 纪要编辑 ---------- */
 #summaryBox .sm-bar { display:flex; align-items:center; gap:8px; margin:0 0 10px; padding-bottom:8px;
   border-bottom:1px solid var(--border); }
@@ -247,7 +251,11 @@ input[type=range].seek::-webkit-slider-thumb { -webkit-appearance:none; width:15
     <!-- 「强制重试」（2026-10-13）：只在**后端说这场在转、而它的结论是「等待能力后端」**时
          出现 —— 那种状态是"失败只记状态、不排队重试"留下的死结：它自己永远转不完，
          普通「重新转写」又被 409 挡着，用户只能重启 ECHO。后端判据见
-         `meeting.transcribe_is_orphan()`：真有人跑着时 force 一样 409。 -->
+         `meeting.transcribe_is_orphan()`：真有人跑着时 force 一样 409。
+         ⚠️ 2026-10-16 起：**"在等后端 / 没配后端"落的是「待转写」（`imported`），不再是
+         `transcribing`**（见 `meeting._mark_meeting_waiting`）—— 所以那颗按钮对那些会议
+         **不再出现是对的**（它们本来就点得动「重新转写」），剩下的唯一入口是"进程崩过、
+         库里残留着 transcribing"这一种残留。 -->
     <button class="btn" id="btnForceRetranscribe" style="display:none"
             title="这场会卡在「等待能力后端」——强制重试会接管这个残留状态并重新发起（真在转写时仍会被拒）">强制重试</button>
     <button class="btn primary" id="btnRegenSummary">重新生成纪要</button>
@@ -502,10 +510,21 @@ function renderCapability() {
   const cap = M && M.capability;
   const dia = cap && cap.diarize;
   const run = cap && cap.run;
+  /* **「待转写」的原因**（2026-10-16 加）：录音已完成、音频已保存，只是没有远端把它转成文字，
+     原因人话在后端的 `meetings.error`（`M.error`）。为什么这一行必须在下面那道早退**之前**
+     算出来：待转写的会议**可能连能力快照都没有**（`M.capability` 是录音时写进 meta.json 的
+     计划快照，而这一场根本没走到"用谁"那一步）—— 放到后面就等于"最需要它的那一场偏偏不显示"。
+     样式用既有的 `cap-line warn`（黄）：不是故障、也不是正常。文案**用后端那句原话**：
+     它写的就是"为什么 + 下一步做什么"，面板一个字都不自己编。 */
+  const waitingText = String((M && M.error) || "").trim();
+  const waitingLine = (M && M.status === "imported" && waitingText)
+    ? `<div class="cap-line warn" data-testid="waiting-reason">⏳ ${esc(waitingText)}</div>`
+    : "";
   if (!cap || (!cap.picks.length && !cap.skipped.length && !cap.timestampsLabel
                && !dia && !run)) {
-    box.className = "hidden";
-    box.innerHTML = "";
+    // 没有能力信息时整块隐藏 —— 除非有上面那一行要说（待转写那一场正是如此）
+    box.className = waitingLine ? "cap-box" : "hidden";
+    box.innerHTML = waitingLine;
     return;
   }
   const used = cap.picks.length
@@ -566,7 +585,7 @@ function renderCapability() {
   const body = detail.length
     ? `<details class="cap-more"><summary>细节</summary>${detail.join("")}</details>` : "";
   box.className = "cap-box";
-  box.innerHTML = `<div class="cap-line">🖥 ${used}${ts}</div>${runLine}${diaLine}${body}`;
+  box.innerHTML = `<div class="cap-line">🖥 ${used}${ts}</div>${waitingLine}${runLine}${diaLine}${body}`;
 }
 
 /* ---------- 纪要页签 ---------- */
@@ -1082,7 +1101,10 @@ function syncRetranscribeBtn() {
   /* 「强制重试」只在一种签名下出现：**后端说它在转、而这一场的结论是「在等能力后端」**。
      那是 `_transcribe_impl` 里"只记状态、不排队重试"留下的死结（自己不会好、普通重转被
      409 挡住，用户只能重启 ECHO）。判据取服务端给的 `capability.run.state` ——
-     不在前端另编一套（面板与后端两处各判一次，迟早对不上）。 */
+     不在前端另编一套（面板与后端两处各判一次，迟早对不上）。
+     ⚠️ 2026-10-16 起，"在等后端 / 没配后端"不再留 `transcribing`、而是落**待转写**
+     （`imported`）—— 那种会议不在这条判据里，也就不该出现这颗按钮（它本来就点得动
+     「重新转写」）。剩下的唯一入口是"进程崩过、库里残留着 transcribing"这一种残留。 */
   const stuck = busy && !!(M && M.capability && M.capability.run &&
                            M.capability.run.state === "waiting-backend");
   const fb = $("#btnForceRetranscribe");
@@ -1234,30 +1256,59 @@ function buildExportFileName(m) {
 /** 这场会的纪要**真的成稿**了吗：文件在 + 去掉空白还有正文。
     判据就用详情页「纪要」页签那**同一个**接口（`/api/meetings/{id}/file?kind=summary` 的
     `exists`/`content`）—— 面板**不另立一套**"什么算有纪要"，否则两处迟早说法不一。
-    读失败一律当"没好"：宁可等、宁可如实说，也不导出一个空壳。 */
+    读失败一律当"没好"：宁可等、宁可如实说，也不导出一个空壳。
+
+    顺手把**服务端对"这场纪要此刻是什么状态"的判词带回来**（`summaryState`：
+    `none` / `running` / `ready`，服务端 `meeting.summary_state()`）—— 等待逻辑全靠它说话：
+    "没有任务"与"任务在跑"是两件事，读不出来就只能写那句含糊的
+    "还没生成好（也可能还没发起生成）"，把**没有任务**的那一种也白等 30 秒（骗人）。
+    老服务端/替身不带这个字段时是空串 → 等待逻辑退回原来的保守说法（见 `waitForExportSummary`）。 */
 async function fetchExportSummary() {
   try {
     const r = await api(`/api/meetings/${M.id}/file?kind=summary`);
-    return { ok: !!(r && r.exists && (r.content || "").trim()), content: (r && r.content) || "" };
+    return { ok: !!(r && r.exists && (r.content || "").trim()), content: (r && r.content) || "",
+             state: String((r && r.summaryState) || "") };
   } catch (e) {
-    return { ok: false, content: "" };
+    return { ok: false, content: "", state: "" };
   }
 }
 
-/** 等纪要成稿（**有上限**，期间不断给可见反馈）。返回 `{ok, content, waitedMs}`。 */
+/** 等待期间那句提示。**分了两种话**，因为它们是两件不同的事：
+      * 服务端确认 `running` → "纪要**正在生成**，等它完成…"（用户知道等谁、等到什么时候）；
+      * 读不到状态（老服务端/替身）→ 退回原来那句含糊的"还没生成好，正在等它完成…"，
+        **不替服务端断言**"正在生成"（说错原因会把人引去等一个根本没在跑的任务）。 */
+function summaryWaitingToast(state, leftMs) {
+  const secs = Math.ceil(leftMs / 1000);
+  return state === "running"
+    ? `纪要正在生成，等它完成…（最多再等 ${secs} 秒）`
+    : `纪要还没生成好，正在等它完成…（最多再等 ${secs} 秒）`;
+}
+
+/** 等纪要成稿（**有上限**，期间不断给可见反馈）。返回 `{ok, content, waitedMs, state}`。
+    中途收手的第三种出口：任务在轮询期间**收口了**（失败/超时/异常都已经在服务端收口，
+    `summary_state()` 从 `running` 变回 `none`）—— 这时候立刻如实说，不必把 30 秒等满
+    （等满也只是同一句"没好"，白等就是骗人）。 */
 async function waitForExportSummary() {
   const first = await fetchExportSummary();
-  if (first.ok) return { ok: true, content: first.content, waitedMs: 0 };
+  if (first.ok) return { ok: true, content: first.content, waitedMs: 0, state: "ready" };
+  // **压根没有在跑的生成任务 → 立刻如实说，一秒都不等。**
+  // 判据来自服务端（`summary_state()`），面板不自己猜"应该会有人发起吧"。
+  if (first.state === "none") return { ok: false, content: "", waitedMs: 0, state: "none" };
   const t0 = Date.now();
+  let state = first.state;      // 每次都按**最新一次**读到的判词说话（别拿开场那一刻的旧话糊到结尾）
   while (true) {
     const leftMs = EXPORT_SUMMARY_WAIT_MS - (Date.now() - t0);
     if (leftMs <= 0) break;
-    toast(`纪要还没生成好，正在等它完成…（最多再等 ${Math.ceil(leftMs / 1000)} 秒）`);
+    toast(summaryWaitingToast(state, leftMs));
     await new Promise((r) => setTimeout(r, Math.min(EXPORT_SUMMARY_POLL_MS, leftMs)));
     const got = await fetchExportSummary();
-    if (got.ok) return { ok: true, content: got.content, waitedMs: Date.now() - t0 };
+    if (got.ok) return { ok: true, content: got.content, waitedMs: Date.now() - t0, state: "ready" };
+    if (got.state) state = got.state;
+    if (state === "none") {
+      return { ok: false, content: "", waitedMs: Date.now() - t0, state: "none" };
+    }
   }
-  return { ok: false, content: "", waitedMs: EXPORT_SUMMARY_WAIT_MS };
+  return { ok: false, content: "", waitedMs: EXPORT_SUMMARY_WAIT_MS, state: state };
 }
 
 /* 防重入：导出现在可能要**等 30 秒**（等纪要成稿），用户以为"没反应"就会再点一次 ——
@@ -1276,13 +1327,18 @@ async function downloadOfflineHtml() {
 async function _exportOfflineHtml() {
   if (!M) return;
   // ① 「纪要没完成就别存」：等它成稿（有上限），到点还没好就**如实说 + 不导出**。
-  //    注意措辞：**没有**任何可靠的"正在生成"信号可读（`summary_runs` 那行在请求发出后
-  //    就立刻被标成 done，见 `meeting.regenerate_summary()`），所以这里只说"还没生成好"，
-  //    不替服务端断言"正在生成"——说错原因会把人引去等一个根本没在跑的任务。
+  //    两种"没好"要分开说（`summaryState`，服务端 `meeting.summary_state()`）：
+  //      * `none`  = **压根没有在跑的生成任务** → 立刻告诉用户"还没发起过/上一次没成稿"
+  //        并给出下一步（去点「重新生成纪要」）。**不许**让他对着 30 秒的空等待发呆 ——
+  //        "没有任务"与"任务在跑"是两件事，混成一句"还没生成好"就是把用户丢在半路。
+  //      * 其余（`running` / 读不到状态）= 任务在跑 → 等它，并且说得准确（见上）。
   const sumFile = await waitForExportSummary();
   if (!sumFile.ok) {
-    toast("纪要 " + Math.round(EXPORT_SUMMARY_WAIT_MS / 1000)
-          + " 秒内还没生成好（也可能还没发起生成），先不导出；等它好了再点「⬇ 离线HTML」");
+    toast(sumFile.state === "none"
+      ? "这场还没有在跑的纪要生成任务（还没发起过，或上一次没成稿），先不导出；"
+        + "点上面「重新生成纪要」发起，成稿后再点「⬇ 离线HTML」"
+      : "纪要 " + Math.round(EXPORT_SUMMARY_WAIT_MS / 1000)
+        + " 秒内还没生成好，先不导出；等它好了再点「⬇ 离线HTML」");
     return;                       // ← 一个字节都不写（空纪要导出去等于骗人）
   }
   // ② 文件名：`{日期}_{标题}.html`

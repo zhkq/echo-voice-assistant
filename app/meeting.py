@@ -773,6 +773,10 @@ def recover_orphaned_meetings():
                            f"检测到中断的会议（进程重启），已标记 interrupted: {m['name']}")
         if n:
             db.add_log("info", "meeting", f"启动恢复：共标记 {n} 个中断会议")
+        # 同一次启动恢复里把**纪要**那半也收口：进程刚起来 → 本进程不可能有纪要线程在跑，
+        # 所以 `summary_runs` 里任何 pending 都是上一次崩掉留下的残留，留着就会让面板
+        # 永远显示"纪要生成中"（用户一直等一个不存在的任务）。详见 `_close_orphan_summary_runs()`。
+        _close_orphan_summary_runs()
     except Exception as e:
         db.add_log("warn", "meeting", f"会议状态恢复失败: {e}")
 
@@ -3805,13 +3809,183 @@ def _write_summary_body(path, body, label="纪要"):
     return True
 
 
+# ---------------------------------------------------------------- 「纪要正在生成」这件事
+#
+# 用户 2026-10-16 的现场：点「⬇ 离线HTML」而在等纪要时，面板**没有任何可靠的"正在生成"
+# 信号可读** —— 它只能写"还没生成好（**也可能还没发起生成**）"，于是**压根没任务**的那种
+# 也白等 30 秒。根因就在下面这条链上：`regenerate_summary()` 在 `request_summary()`
+# 派发后台线程之后**立刻** `finish_summary_run(run_id, "done")`，`summary_runs.status`
+# 永远看不到 pending —— "派发了但还没成稿"这件事在库里/接口上根本读不到。
+#
+# 这一节把它变成**可读的真实状态**，判据只有两处，各管一件事：
+#   * `_summarizing`（**内存**标记）= "本进程里真有一个线程在为这一场写 summary.md"
+#     → 面板据此说"纪要正在生成，等它完成…"（说错原因会把人引去等一个没在跑的任务）；
+#   * `summary_runs.status`（库里那份）= "这一场发起过几次生成、结果如何"的历史，
+#     现在**如实** pending → done/failed（收口由那个写盘的线程负责，见 `_finish_summary_run`）。
+# 为什么"此刻在不在跑"偏要用内存标记、不直接用库里那行：库里的行**跨进程活下来**，
+# 进程崩掉留下的 pending 与"正在跑"长得一模一样 —— 拿它当判据就会让面板对着一场
+# 早已没有任务的会议一直等下去。内存标记天然只在真有线程时存在，崩了就没有，这才是诚实的。
+_summarizing = {"lock": threading.Lock(), "set": set()}
+
+#: 「派发了、还没成稿」的纪要运行（run id）：`meeting_id → [run_id, …]`（FIFO）。
+#: `regenerate_summary()` 登记，**真正写 summary.md 的那个线程**领走并在自己的 finally 里
+#: 收口。为什么不把 run_id 作为参数一路传下去：`request_summary()` / 两个 spawn 的签名
+#: 已被别处（含用例里的替身）按位置参数调用，加参数会牵动一圈无关的调用点；
+#: 而"谁该为这次派发的成败负责"本来就只与**本进程这一次派发**有关，放在这里最小。
+_summary_run_queue = {"lock": threading.Lock(), "by_meeting": {}}
+
+
+def _begin_summarizing(meeting_id):
+    """登记"这一场有一次纪要生成在跑"。
+
+    **在起线程之前**登记（见 `_spawn_summary_waiter`）：先起线程再登记的话，
+    中间那几十毫秒里线程可能已经跑完、也可能面板正好在这时来问 —— 那段落差就是
+    "任务在跑、面板却说没有"（反过来也一样，都是在骗用户）。
+    """
+    with _summarizing["lock"]:
+        _summarizing["set"].add(meeting_id)
+
+
+def _end_summarizing(meeting_id):
+    """注销"这一场在生成纪要"（线程的任何出口都要走到：见两个 spawn 的 `finally`）。"""
+    with _summarizing["lock"]:
+        _summarizing["set"].discard(meeting_id)
+
+
+def _register_summary_run(meeting_id, run_id):
+    """登记一条**刚建出来**的纪要运行，等写 summary.md 的线程来领（`_claim_summary_run`）。"""
+    if not meeting_id or not run_id:
+        return
+    with _summary_run_queue["lock"]:
+        _summary_run_queue["by_meeting"].setdefault(meeting_id, []).append(run_id)
+
+
+def _forget_summary_run(meeting_id, run_id):
+    """把一条没能派发出去的运行从队列里摘掉（否则下一个不相干的写手会认走它）。"""
+    if not meeting_id or not run_id:
+        return
+    with _summary_run_queue["lock"]:
+        queue = _summary_run_queue["by_meeting"].get(meeting_id) or []
+        _summary_run_queue["by_meeting"][meeting_id] = [r for r in queue if r != run_id]
+
+
+def _claim_summary_run(meeting_id):
+    """领走这一场**最早**一条还没人认领的运行（没有就返回 0）。
+
+    由 spawn 那一帧调用（**不是在线程里**）：那一刻队列里最早的那条就是**这次**派发登记的，
+    归因确定；要是在线程里再查"最新的一条 pending"，两次派发挨得近时就会认到后一次头上。
+    领到之后再核一眼它**还挂着 pending**：队列里可能残留上一次派发中途失败没清干净的 id，
+    认走它就会把一条早已收口的运行再改一次状态。
+    """
+    with _summary_run_queue["lock"]:
+        queue = _summary_run_queue["by_meeting"].get(meeting_id) or []
+        run_id = queue.pop(0) if queue else 0
+    if not run_id:
+        return 0
+    try:
+        for row in db.get_summary_runs(meeting_id):
+            if row.get("id") == run_id:
+                return run_id if (row.get("status") or "") == "pending" else 0
+    except Exception:
+        return 0
+    return 0
+
+
+def _finish_summary_run(run_id, status, label="纪要"):
+    """给一条纪要运行收口（`pending → done/failed`）+ 留痕。
+
+    **每一个出口都要收口**（成功 / 超时 / 占位话 / 空白不写盘 / 异常）：留下一条永远
+    pending 的运行，就等于库里永远写着"这场纪要生成中"，而那个任务早就不存在了 ——
+    用户会一直等（这正是这一轮要修掉的那种谎）。
+    """
+    if not run_id:
+        return
+    try:
+        db.finish_summary_run(run_id, status)
+        if status != "done":
+            db.add_log("warn", "meeting",
+                       f"{label}本次没有成稿（run={run_id}）：{status}")
+    except Exception as e:                                   # noqa: BLE001
+        db.add_log("warn", "meeting", f"纪要运行状态收口失败（run={run_id}）：{e}")
+
+
+def _close_orphan_summary_runs():
+    """把**跨进程残留**的「纪要生成中」收口成 `failed`（只在启动恢复里调一次）。
+
+    为什么启动时可以"一律收口"、不用猜时间：这个函数只从
+    `recover_orphaned_meetings()` 走（进程刚起来那一刻），**本进程里不可能有纪要线程**
+    在跑 —— 所以任何 pending 都只能是上一次进程崩掉留下的残留。真实生成最长约 5 分钟
+    （agent 路 `wait_for_reply(timeout=240)`、直连路 `timeout=300`），而"还没等到就被重启"
+    的那条请求本来也已经随进程没了，同样按残留处理。
+    留着它的后果很具体：库里/面板上永远显示"纪要生成中"，而那个任务根本不存在了。
+
+    返回收口的条数（给启动日志/用例看）。
+    """
+    closed = 0
+    try:
+        for m in db.list_meetings(limit=500):
+            for run in db.get_summary_runs(m["id"]):
+                if (run.get("status") or "") != "pending":
+                    continue
+                db.finish_summary_run(run["id"], "failed")
+                closed += 1
+        if closed:
+            db.add_log("warn", "meeting",
+                       f"启动恢复：把 {closed} 条残留的「纪要生成中」收口成 failed"
+                       "（进程崩过，本进程没有线程在跑它们）")
+    except Exception as e:                                   # noqa: BLE001
+        db.add_log("warn", "meeting", f"清理残留的纪要运行失败：{e}")
+        return closed
+    return closed
+
+
+def summary_state(meeting_id, meeting_name=None):
+    """这一场的纪要**此刻**是什么状态：``"ready"`` / ``"running"`` / ``"none"``。
+
+    这是面板**唯一**该读的判据（`GET /api/meetings/{id}/file?kind=summary` 下发它，
+    「⬇ 离线HTML」等纪要时读的就是那一条）。三档各有各的用：
+      * ``"running"`` → 面板能说**准确**的话："纪要正在生成，等它完成…"；
+      * ``"none"``    → 面板**立刻**告诉用户"这场还没有在跑的生成任务（去点「重新生成纪要」）"
+                        —— **不许**白等 30 秒：等一个不存在的任务，用户既不知道在等谁，
+                        也不知道该做什么；
+      * ``"ready"``   → 已成稿，直接用（0 等待）。
+    为什么"成稿"排在"在跑"前面：重新生成时旧纪要还在盘上，那时导出拿到的仍是**可用**的
+    那份，不需要等（等的是新一版，而那不是导出必须的）。
+    """
+    name = str(meeting_name or "").strip()
+    if not name:
+        try:
+            row = db.get_meeting(meeting_id) or {}
+        except Exception:                                    # noqa: BLE001
+            row = {}
+        name = str(row.get("name") or "")
+    if name and _existing_summary_len(os.path.join(meetings_dir(), name, "summary.md")) > 0:
+        return "ready"
+    with _summarizing["lock"]:
+        if meeting_id in _summarizing["set"]:
+            return "running"
+    return "none"
+
+
 def _spawn_provider_summary(meeting_id, folder, out_name="summary.md", extra=""):
     """后台线程：把转写内联交给 LLM provider，写成纪要文件（P5）。
 
     与 agent 路径共用同一套**落盘纪律**：回复过短或疑似占位话就**不回写**
     （保留已有文件），失败写 warn 日志 —— 宁可留空让人重试，也不要把占位当纪要存下来。
+
+    另外（2026-10-16）：**写 summary.md 的这一路要负责"正在生成"的登记与收口** ——
+    登记/注销放在**起线程那一帧**（不留空档），收口放在线程自己的 `finally`（每个出口都走），
+    这样"派发了但还没成稿"在 `summary_runs` 里是**真的** pending，在 `summary_state()` 里
+    是真的 running（见本文件「纪要正在生成」那一节）。`topics.md`（议题分段）不算"纪要在生成"，
+    它不登记也不收口 —— 面板等的是 `summary.md` 那一个产物。
     """
+    is_summary = (out_name == "summary.md")
+    run_id = _claim_summary_run(meeting_id) if is_summary else 0
+    if is_summary:
+        _begin_summarizing(meeting_id)
+
     def _run():
+        outcome = "failed"      # 任何非正常出口都留 failed：超时/过短/占位话/空白/异常
         with _MEETING_LOCKS_LOCK:
             lock = _MEETING_LOCKS.setdefault(meeting_id, threading.Lock())
         with lock:
@@ -3848,6 +4022,7 @@ def _spawn_provider_summary(meeting_id, folder, out_name="summary.md", extra="")
                 if not _write_summary_body(path, body):
                     # 没写就不发事件：否则通知响了、点开还是旧内容（或空白）= 假报。
                     return
+                outcome = "done"    # 到这一步才是"纪要真的成稿"（上面每一条 return 都没写盘）
                 db.add_log("info", "meeting",
                            f"纪要已生成（provider={pid}）：{os.path.basename(path)}")
                 # 直连兜底路径也要通知手机（否则"没装 agent 的机器"永远收不到「纪要好了」）。
@@ -3858,6 +4033,13 @@ def _spawn_provider_summary(meeting_id, folder, out_name="summary.md", extra="")
             except Exception as e:
                 # 直连路径的失败必须留痕：否则面板上表现为"点了没反应"（1.x 的老毛病）
                 db.add_log("error", "meeting", f"直连纪要失败：{e}")
+            finally:
+                if is_summary:
+                    # 注销 + 给这次运行收口：**成功也收、失败也收**（超时/异常不走上面任何
+                    # 一条 return 的情形都在这里兜住）—— 留下永远 pending 的运行 = 库里
+                    # 永远写着"生成中"，而任务早没了。
+                    _end_summarizing(meeting_id)
+                    _finish_summary_run(run_id, outcome)
     threading.Thread(target=_run, daemon=True, name="summary-provider").start()
 
 
@@ -4045,8 +4227,19 @@ def _spawn_summary_waiter(meeting_id, folder, out_name, prompt_text, label):
     写入前做「占位符/超短」校验：若 DSH 只回了意图话而没给实质纪要，则**不回写**
     （保留已有的正确文件；若还没有旧文件或旧文件同样为空壳，则留待人工重试），
     避免把占位符当真纪要持久化并用于后续展示/归档。
+
+    另外（2026-10-16）：写 `summary.md` 的这一次要负责「正在生成」的**登记与收口** ——
+    登记在**起线程那一帧**（不留"任务在跑、面板却说没有"的空档），收口在线程自己的
+    `finally`（每个出口都走，失败/超时/占位话/空白都落 failed）。`topics.md` 不登记 ——
+    面板等的是纪要成稿，不是议题分段。详见本文件「纪要正在生成」那一节。
     """
+    is_summary = (out_name == "summary.md")
+    run_id = _claim_summary_run(meeting_id) if is_summary else 0
+    if is_summary:
+        _begin_summarizing(meeting_id)
+
     def _run():
+        outcome = "failed"      # 任何非正常出口都留 failed：超时/占位话/空白不写盘/异常
         with _MEETING_LOCKS_LOCK:
             lock = _MEETING_LOCKS.setdefault(meeting_id, threading.Lock())
         with lock:
@@ -4095,6 +4288,7 @@ def _spawn_summary_waiter(meeting_id, folder, out_name, prompt_text, label):
                 # 旧代码会照样 `open(..., "w")` 把用户原来那份好纪要覆盖掉 ✗（见 `_write_summary_body`）。
                 if not _write_summary_body(path, content, label=label):
                     return
+                outcome = "done"    # 纪要**真的落盘**了，这才是"生成成功"
                 db.add_log("info", "meeting", f"{label}已写入 {out_name}（{len(content)} 字，"
                            f"{'JSON' if out_name == 'topics.md' and obj is not None else '文本'}）")
                 if out_name == "summary.md":
@@ -4122,6 +4316,13 @@ def _spawn_summary_waiter(meeting_id, folder, out_name, prompt_text, label):
                     _refresh_archived_note(meeting_id)
             except Exception as e:
                 db.add_log("error", "meeting", f"{label} 生成失败: {e}")
+            finally:
+                if is_summary:
+                    # 注销"在生成中" + 给这次运行收口：**成功也收、失败也收**。
+                    # 不这样兜住的话，`wait_for_reply` 超时/异常那几条路会让运行永远 pending
+                    # （库里永远写着"生成中"、面板永远说"正在生成"，而线程早就没了）。
+                    _end_summarizing(meeting_id)
+                    _finish_summary_run(run_id, outcome, label=label)
     threading.Thread(target=_run, daemon=True).start()
 
 
@@ -4134,15 +4335,32 @@ def regenerate_summary(meeting_id, extra_prompt=""):
     if not os.path.isfile(os.path.join(folder, "transcript.md")):
         return False, "转写文件不存在，无法生成纪要"
     run_id = db.add_summary_run(meeting_id, extra_prompt)
-    if extra_prompt:
-        # 追加要求时只重生成整场纪要（带要求），议题分段保持。
-        # 2026-09-19 修：以前没把 extra_prompt 传下去 —— 那个"追加要求"框填了也没用。
-        ok = request_summary(meeting_id, folder, extra=extra_prompt)
-    else:
-        ok1 = request_summary(meeting_id, folder)
-        ok2 = request_topic_segments(meeting_id, folder)
-        ok = ok1 and ok2
-    db.finish_summary_run(run_id, "done" if ok else "failed")
+    # 登记进"等写手来领"的队列：真正写出 summary.md 的那个线程领走它、并在自己的 finally 里
+    # 收口（成功 done / 其余 failed）。见本文件「纪要正在生成」那一节。
+    _register_summary_run(meeting_id, run_id)
+    ok = False
+    try:
+        if extra_prompt:
+            # 追加要求时只重生成整场纪要（带要求），议题分段保持。
+            # 2026-09-19 修：以前没把 extra_prompt 传下去 —— 那个"追加要求"框填了也没用。
+            ok = request_summary(meeting_id, folder, extra=extra_prompt)
+        else:
+            ok1 = request_summary(meeting_id, folder)
+            ok2 = request_topic_segments(meeting_id, folder)
+            ok = ok1 and ok2
+    except Exception:
+        # 派发这一步就抛了（库/客户端出问题）：这条运行**必须收口** ——
+        # 否则库里永远写着"这场纪要生成中"，而任务根本没派出去（用户会一直等）。
+        _forget_summary_run(meeting_id, run_id)
+        db.finish_summary_run(run_id, "failed")
+        raise
+    # ⚠️ 这里**不再**立刻 `finish_summary_run(run_id, "done")`（2026-10-16 修）。
+    # 旧的写法让 `summary_runs.status` 永远看不到 pending —— "派发了但还没成稿"在库里/接口上
+    # 根本读不到，面板只能写"还没生成好（**也可能还没发起生成**）"，于是**压根没任务**的那种
+    # 也要白等 30 秒（那是在骗用户）。收口交给写盘的线程；这里只处理"根本没派发出去"：
+    if not ok:
+        _forget_summary_run(meeting_id, run_id)
+        db.finish_summary_run(run_id, "failed")
     return ok, ("已发送纪要+议题分段生成请求" if ok
                 else "发送请求失败（agent 与 LLM provider 都不可用？）")
 

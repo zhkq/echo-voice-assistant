@@ -2035,6 +2035,13 @@ def meeting_file(mid: int, kind: str = "transcript", _auth=Depends(optional_auth
     兼容旧格式：summary.md 若为老结构化 JSON 则拆包成「摘要+纪要」markdown。
     返回 {"exists", "content"}。
 
+    `kind=summary` 时**额外**返回 `summaryState`：`"ready"` / `"running"` / `"none"`
+    （2026-10-16）。为什么挂在这条接口上：面板「⬇ 离线HTML」等纪要成稿时读的就是它，
+    而它必须能分辨**"有任务在跑"与"压根没任务"** —— 分辨不出来就只能写那句含糊的
+    "还没生成好（也可能还没发起生成）"，把没有任务的那一种也白等 30 秒（骗人）。
+    判据只有一处：`meeting.summary_state()`（进程内"真有线程在跑"的标记 + 成稿判据），
+    面板不自己猜、后端也不在这里另编一套。
+
     安全（2026-09-13 HIGH-1）：kind 以前没有任何校验就直接拼进路径，`os.path.join` 遇到
     `..` 或绝对路径会整段逃出会议目录 ——
         GET /api/meetings/1/file?kind=../../../../Users/<用户名>/Documents/机密备忘
@@ -2047,11 +2054,14 @@ def meeting_file(mid: int, kind: str = "transcript", _auth=Depends(optional_auth
     m = db.get_meeting(mid)
     if not m:
         raise HTTPException(status_code=404, detail="会议不存在")
+    #: 「这一场纪要此刻怎么了」——只在摘要这条路上下发（别给另两种 kind 添噪声）。
+    state = ({"summaryState": meeting.summary_state(mid, m["name"])}
+             if kind == "summary" else {})
     path = _safe_under(meeting.meetings_dir(), _meeting_dirname(m["name"]), f"{kind}.md")
     if not path:
         raise HTTPException(status_code=400, detail="非法路径")
     if not os.path.isfile(path):
-        return {"exists": False, "content": ""}
+        return {"exists": False, "content": "", **state}
     with open(path, "r", encoding="utf-8") as f:
         content = f.read()
     if kind == "summary":
@@ -2061,8 +2071,8 @@ def meeting_file(mid: int, kind: str = "transcript", _auth=Depends(optional_auth
             abstract = (obj.get("会议摘要") or "").strip()
             minutes = (obj.get("会议纪要") or "").strip()
             sec = (f"# 会议摘要\n\n{abstract}\n\n---\n\n{minutes}" if abstract else minutes)
-            return {"exists": True, "content": sec}
-    return {"exists": True, "content": content}
+            return {"exists": True, "content": sec, **state}
+    return {"exists": True, "content": content, **state}
 
 
 @router.post("/meetings/{mid}/summary")
