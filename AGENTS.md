@@ -831,3 +831,46 @@ scopes 还得重发）。当晚的绕法：用 `pairing.pair()` 里**逐字同�
   原来"先落盘、再补 pin"→ 一次网络抖动就把可用状态改成不可用 ✗。
 * 面板「改地址」多了可选 **`fp=`（证书指纹）** 输入，文案如实写"防中途被换成另一张证书 / 留空照旧可用但
   少一层保护"。**`docs/**` 与 `delivery/*/先读我.md` 里"手填 https"的旧说明还没改**（不在当轮允许清单内）。
+## 后端 diarize 优化实测：**batch 这条路只有 9–16%，已按红线回滚**（2026-10-16）
+
+用户换卡（**RTX 2060 SUPER 8 GB → RTX 2080 Ti 22 GB**）后问"diarize 还有优化余地吗"。实测归因与结论：
+
+* **单次 600 s 分离 ≈ 18.5–20 s**，阶段占比：**分割 ~6.8 s + 嵌入 ~11.8 s + 聚类 ~0.1 s**；
+  模型加载只占 **1.17 s**（`loadMs`，`unloads: 0`）→ **`resident: true` 白改** ✗（Lead 试过又回滚：
+  常驻让两档同时在卡上跑，与 ASR 抢带宽，diarize 峰值反而抬到 42 s ✗ —— 那个 42 s 还叠加了测量探针抢锁的噪声）。
+* **pyannote 4.0.7 的 `embedding_batch_size` / `segmentation_batch_size` 默认都是 1**，
+  而 `app/audio/diarize.py` 构造 `SpeakerDiarization` 时**没传** → 600 s 音频退化成 **~1773 次单条 forward** ✓。
+  **唯一正确的传参位置是构造函数**（`instantiate(HYPERPARAMS)` 的 `default_parameters` 里没有这两个键 ✗）。
+* **显式传 `embedding_batch_size=16` 的实测收益**：微基准 **+16.1%**（18.67 → 15.67 s）、
+  线上 **+8.6~9.7%**（19.1–20.7 → 17.2–18.1 s），**质量零变化**（说话人集合/turns 完全一致 ✓），
+  显存峰值 124 MB → **874 MB**。**低于我们定的 20% 红线 → 回滚** ✗（判据与原始数据见当轮报告；
+  镜像 `echo-backend:0.1.0-cu126-bs16-20261016-2045` 仍在宿主上，要启用只需再 scp 一个文件 + 重建 ✓）。
+* **为什么没到 1.7–2×（关键）**：嵌入那一档**不是 GPU forward 受限** ✗，而是卡在每个
+  (chunk, speaker) 对的 **CPU 侧 `Audio.crop` + `nan_to_num`/`astype` + `vstack`**（1773 项，批不掉 ✗）
+  —— hook 实测嵌入只从 11.78 s → 8.70 s。**再要更快得换方向**（改那条 per-item 预处理路径，
+  或用更大的 `segmentation_step`＝**精度红线**，须先算真实会议音频的 DER ✓）。
+  GPU 侧本身已打满（采样均值 81%、持续段 85–94%、功耗 246–254 W **顶到 250 W 墙** ✓）。
+* **`segmentation_batch_size` 故意没一起改**：它在构造 `Inference` 时就固化，且分割那档（~1/3）
+  在干净条件下没实测过收益 ✗ → 保守只动嵌入（结果也没达标 ✓）。
+
+### 宿主"改后端代码"的正确姿势（本轮查实，别再猜）
+
+* **构建上下文是 `/home/zysk/echo/src/`**（含 `app/` + `server/` + `compose.yaml`），
+  **`/home/zysk/echo/backend/` 只是运行时目录**（只有 compose.yaml / .env / server.yaml ✗ 没有源码）；
+  它 compose 里的 `context: .` 现场构建跑不通，靠 `.env` 的 `ECHO_IMAGE` 指镜像 ✓。
+* **增量重建入口 = `src/Dockerfile.update`**（`FROM echo-backend:0.1.0-cu126` + 两句 COPY app/server ✓）：
+  `cd /home/zysk/echo/src && setsid nohup docker build -f Dockerfile.update -t echo-backend:<新 tag> . < /dev/null > build.log 2>&1 &`
+  —— 实测 **0.2 s、零下载**（`server/Dockerfile` 里源码 COPY 在**所有 pip 层之后** ✓，所以不会重下 torch ✓）。
+* **改完宿主源码要 `scp` 同步那一个文件**（两侧 sha256 对账 ✓）；**被否掉的改动要把宿主那份也还原** ✓
+  （否则将来一次 `Dockerfile.update` 会静默把被否的东西又发上去 ✗）。
+* 回滚 = `.env` 的 `ECHO_IMAGE` 指回旧 tag + `docker compose up -d backend` ✓（**秒级**，实测有效 ✓）。
+* 顺带两条**陈旧信息**（本轮发现，尚未改）：`.env` 的 `ECHO_SERVER_ID` 仍写 `gpu-office-2060s` ✗；
+  `server.yaml` 的注释仍按 **8 GB 卡**校准（`vram_budget_mb` 的说明、`est_vram_mb: 1800` 与它自己那句
+  "实测峰值 4.6 GB 要给 4700" 自相矛盾 ✗）。现在实际是 **22 GB 卡 + `vram_budget_mb: 16000`** ✓。
+
+### 验收数字（当时那两场真实会议）
+
+* **78（5392.6 s）重转后 = 8 个说话人**（改前库里那次是 **1 个的退化结果、仅 185/1868 行有标签** ✗
+  → 重跑本身修掉了一个真实质量问题 ✓）；**79（4333.2 s）= 4 个说话人**，标签直方图与库里逐项相同 ✓。
+* ⚠️ **质量对比只能严格说"说话人集合与人数一致"**：78 上旧代码自己就有波动（turns 194 vs 193、
+  lines 1877 vs 1866），所以"边界无实质变化"**没有**被严格证明 ✗。
