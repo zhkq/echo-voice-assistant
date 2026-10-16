@@ -1442,15 +1442,21 @@ async def meeting_segment(request: Request, _auth=Depends(optional_auth)):
 
 
 @router.post("/meeting/start")
-def meeting_start(source: str = "pc", _auth=Depends(optional_auth)):
+def meeting_start(request: Request, source: str = "pc", _auth=Depends(optional_auth)):
     """开始录音。`source=pc`（默认，用电脑的麦）/ `source=phone`（手机传段上来）。
 
     用户 2026-10-15 的口径：手机发起的事该由手机采集 —— 所以手机那个界面发起时传
     `phone`，电脑那边**不开麦**，只负责落盘、转写、存储。
+
+    用户 2026-10-16 的口径（`origin`）：**发起方按"谁调的接口"定**（`_meeting_origin`：
+    带中继标记 = 手机），**不是按 `source`** —— 手机按「开始录音」时 `source` 也可能是
+    `pc`（用电脑的麦录），那仍然是**手机发起**的任务，通知该回手机。所以这里把 origin
+    显式传给会议模块，由它写进 meta、并让这场后续所有事件都带上。
     """
     src = (source or "pc").strip().lower()
-    ok, msg = (meeting.start_meeting_phone() if src == "phone"
-               else meeting.start_meeting())
+    origin = _meeting_origin(request)
+    ok, msg = (meeting.start_meeting_phone(origin=origin) if src == "phone"
+               else meeting.start_meeting(origin=origin))
     services.report_meeting("active" if ok else "idle", msg)
     return {"ok": ok, "message": msg, "source": src if ok else ""}
 
@@ -1516,15 +1522,35 @@ def api_events(since: int = -1, wait: float = 0.0, limit: int = 50,
         _time.sleep(0.5)
 
 
+def _meeting_origin(request: Request) -> str:
+    """这次会议动作是**谁发起的** —— `"mobile"` / `"pc"`（事件 payload 的 `origin`）。
+
+    **判据 = 谁调的接口**：带中继标记 `X-Echo-Relay` 就是手机（中继是手机唯一能进来的路，
+    见 `_is_loopback_call()` 里同一条判据），否则按本机面板算。
+
+    ⚠️ **不是"音频从哪支麦来"**（用户 2026-10-16 的口径：*"手机侧发的任务，手机接受通知，
+    电脑端发起的任务不用给手机"*）：手机按「开始录音」时完全可以把 `source` 传成 `pc`
+    （人在会议室、就用电脑那支麦录）—— **那仍然是手机发起的任务**，通知必须回手机。
+    所以这里只看请求头，不看 `source` 参数。
+
+    这个值会被记进那场会议的 `meta.json`（`initiatedBy`），之后这场发出的**所有**事件
+    （started/stopped/transcribed/summary_ready/imported）都带同一个 `origin`。
+    """
+    if (request.headers.get(relay_mod.RELAY_MARKER_HEADER) or "").strip():
+        return meeting.ORIGIN_MOBILE
+    return meeting.ORIGIN_PC
+
+
 def _meeting_actor(request: Request) -> str:
     """这次暂停/恢复是**谁**按的（进 meta 的 `pauses[].by`）。
 
     判据与配对其他路一致：**带中继标记 = 手机**（它经后端转进来的），否则按本机面板算。
     为什么要留这个：会议中途"被静音了 5 分钟"这种事，事后得能说清是谁按的。
+
+    中文（`手机` / `面板`）是**给面板看**的老字段，语义别动；给机器看的那个
+    `origin`（`mobile` / `pc`）在 `_meeting_origin` 里，两者判据同源、取值各管一处。
     """
-    if (request.headers.get(relay_mod.RELAY_MARKER_HEADER) or "").strip():
-        return "手机"
-    return "面板"
+    return "手机" if _meeting_origin(request) == meeting.ORIGIN_MOBILE else "面板"
 
 
 @router.post("/meeting/pause")
@@ -1555,6 +1581,7 @@ def transcribe_status(_auth=Depends(optional_auth)):
 
 @router.post("/meetings/import")
 async def meetings_import(
+        request: Request,
         files: List[UploadFile] = File(...),
         title: str = Form(""),
         start: str = Form(""),
@@ -1634,6 +1661,9 @@ async def meetings_import(
         # 转码 + 建库 + 起转写线程都在这里；失败会带上**真原因**回来。
         pairs = list(zip(tmps, [ _upload_name(f.filename) for f in picked]))
         kw = {}
+        # 发起方（`mobile` / `pc`）：与 `/meeting/start` 同一判据（谁调的接口）。
+        # 电脑（面板）上导入的会议**不该**推手机 —— 它跟手机没关系。
+        kw["origin"] = _meeting_origin(request)
         if int(block_frames or 0) > 0:
             kw["block_frames"] = int(block_frames)
         res = await run_in_threadpool(_import_uploads, pairs, title, start, notes, kw)
@@ -1682,6 +1712,9 @@ def _import_uploads(pairs, title, start, notes, kw):
     `meta.json` 的 `importedFrom` 必须是用户认识的那个名字**（`echo-imp1234-ab12.m4a`
     这种临时名对用户毫无意义，也会把"哪个文件失败了"这件事变得没法查）。
     所以路径走 `files`、显示名走 `display_names`，一一对应。
+
+    `kw` 里带 `origin`（`mobile` / `pc`，由路由按"谁调的接口"算好）—— 它会进
+    `meta.json` 的 `initiatedBy`，让 `meeting_imported` 及其后的转写/纪要事件都带上它。
     """
     names = [n for _p, n in pairs]
     paths = [p for p, _n in pairs]

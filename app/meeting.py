@@ -74,6 +74,17 @@ except Exception:
 
 # ---------------------------------------------------------------- 状态
 
+#: 事件 payload 里 `origin` 的两个取值（**给机器看**的，与面板看的中文 `by` 分开）。
+#:
+#: * `mobile` = 手机发起的任务 → 通知该回手机；
+#: * `pc`     = 电脑（面板）发起的任务 → **不打扰手机**。
+#:
+#: 用户 2026-10-16 的口径原话："**手机侧发的任务，手机接受通知，电脑端发起的任务不用给手机**"。
+#: 而手机订阅的是**所有**事件（`GET /api/events/feed`），所以每条事件都必须自己说清
+#: "这次任务是谁发起的"，否则电脑上自己录的会、自己敲的指令也会推到手机上去。
+ORIGIN_MOBILE = "mobile"
+ORIGIN_PC = "pc"
+
 _state = {
     "active": False,
     "folder": None,
@@ -91,6 +102,10 @@ _state = {
     "source": "pc",
     #: 手机那条路的已收段数（pc 那条用录音器自己的清单；这里只是给状态接口一个数）
     "seg_count": 0,
+    #: 这场会议的**发起方**（`mobile` / `pc`，见 `normalize_origin`）。
+    #: 事件 payload 的 `origin` 以 `meta.json` 的 `initiatedBy` 为准（`_event_origin`）——
+    #: 内存这一份是"当场那次调用"的答案（落盘失败时也还留着，日志里对得上）。
+    "origin": ORIGIN_PC,
 }
 # 录音状态锁：start/stop 必须原子化 —— 否则并发 stop（如面板按钮双击/重复请求）
 # 会同时通过 active 检查，造成重复转写 + 重复纪要（日志里出现过两次“停止录音”同秒）。
@@ -762,13 +777,56 @@ def recover_orphaned_meetings():
 
 # ---------------------------------------------------------------- 录音
 
-def _new_meeting_folder_and_meta(cfg):
-    """建目录 + 起始 meta（两条录音路共用：本机麦 / 手机麦）。"""
+# ---------------------------------------------------------------- 发起方（事件的 origin）
+
+def normalize_origin(value):
+    """把任意"发起方"写法收成 `mobile` / `pc`；**认不出来就是 `pc`**。
+
+    取舍写死在这里（别处不要各写一份）：**拿不到发起方时按 `pc`** —— 保守取向，
+    宁可**不打扰手机**。手机订阅的是**所有**事件，多一条误报 = 用户在电脑前敲一句、
+    手机却响一声；少一条只是他回面板上看一眼。两种错的代价不对称，所以默认值只能选这边。
+    """
+    if str(value or "").strip().lower() == ORIGIN_MOBILE:
+        return ORIGIN_MOBILE
+    return ORIGIN_PC
+
+
+def _event_origin(folder=None, meta=None):
+    """这一场会议的**发起方**（`mobile` / `pc`）—— 它发出的所有事件共用同一个值。
+
+    **判据是"谁调的接口"**（api 层的 `_meeting_origin()`：带中继标记 `X-Echo-Relay`
+    就是手机 —— 中继是手机唯一能进来的路），**不是"音频从哪支麦来"**：
+    手机按「开始录音」时完全可能传 `source=pc`（人在会议室、就用电脑那支麦录），
+    那仍然是**手机发起**的任务 → `mobile`，通知必须回手机。
+
+    这个值在"开始"那一刻写进 `meta.json` 的 `initiatedBy`，之后停止/转写/纪要都从它读 ——
+    于是"这场是谁的任务"不会因为**谁按了停止**而变（转写本来就是电脑替他干的活）。
+
+    拿不到 `initiatedBy`（老会议、meta 坏了、测试里手搓的目录）→ `pc`（理由见
+    `normalize_origin`）。
+    """
+    if meta is None:
+        meta = _load_json(os.path.join(folder, "meta.json"), {}) if folder else {}
+    if not isinstance(meta, dict):
+        meta = {}
+    return normalize_origin(meta.get("initiatedBy"))
+
+
+def _new_meeting_folder_and_meta(cfg, origin=ORIGIN_PC):
+    """建目录 + 起始 meta（两条录音路共用：本机麦 / 手机麦）。
+
+    `origin` = 这场会议的**发起方**（`mobile` / `pc`），落成 `initiatedBy` ——
+    之后这场发出的所有事件（started/stopped/transcribed/summary_ready）都从它读
+    （`_event_origin`），口径见 `normalize_origin`。
+    """
     now = datetime.datetime.now()
     folder = os.path.join(meetings_dir(), now.strftime("%Y-%m-%d_%H-%M-%S"))
     os.makedirs(folder, exist_ok=True)
     meta = {
         "start": now.isoformat(timespec="seconds"),
+        #: 这场会议**是谁发起的**（`mobile` / `pc`）。写给事件的 `origin` 读，
+        #: 也写给人事后查（"这场到底是手机发起的还是电脑上点的"）。
+        "initiatedBy": normalize_origin(origin),
         "config": {
             "sttModel": "",
             "sttDevice": cfg.get("device", "auto"),
@@ -784,7 +842,7 @@ def _new_meeting_folder_and_meta(cfg):
     return folder, meta
 
 
-def start_meeting_phone():
+def start_meeting_phone(origin=ORIGIN_PC):
     """**手机当麦克风**的那条录音：电脑不开麦，只负责落盘、转写、存储。
 
     用户 2026-10-15 的口径：*"手机发起的指令，手机收，电脑是配合执行和存储"* ——
@@ -793,11 +851,16 @@ def start_meeting_phone():
     与 `start_meeting()` 的区别只有一处：**不建 MeetingRecorder**（不碰电脑的声卡），
     音频由手机按段 POST 上来（`append_meeting_segment`）。其余（目录/meta/库/事件）完全一样，
     所以转写、压缩、纪要、议题那些下游一条都不用改。
+
+    ⚠️ **`origin` 缺省 `pc`，不是 `mobile`**：这条路虽然形状上就是"手机传段上来"，
+    但"谁发起的"只有**调用方**知道（api 层按"谁调的接口"算：带中继标记 = 手机）——
+    调用方拿不到/没传时按口径取保守值 `pc`（**宁可不打扰手机**，见 `normalize_origin`）。
+    别把"这条路通常是手机用的"当成判据。
     """
     with _state_lock:
         if _state["active"]:
             return False, "会议录音已在进行中"
-        folder, meta = _new_meeting_folder_and_meta(settings)
+        folder, meta = _new_meeting_folder_and_meta(settings, origin=origin)
         meta["source"] = "phone"
         with open(os.path.join(folder, "meta.json"), "w", encoding="utf-8") as f:
             json.dump(meta, f, ensure_ascii=False, indent=2)
@@ -807,9 +870,10 @@ def start_meeting_phone():
             diarize=1 if meta["config"]["diarize"] else 0)
         _state.update(active=True, folder=folder, recorder=None,
                       started_at=meta["start"], error="", paused=False, pauses=[],
-                      source="phone")
+                      source="phone", origin=meta["initiatedBy"])
         db.add_event("meeting_started", {"meeting": os.path.basename(folder),
-                                         "id": meeting_id, "source": "phone"})
+                                         "id": meeting_id, "source": "phone",
+                                         "origin": meta["initiatedBy"]})
         db.add_log("info", "meeting", f"开始录音（手机麦克风）: {os.path.basename(folder)}")
         return True, os.path.basename(folder)
 
@@ -852,7 +916,13 @@ def append_meeting_segment(data, name=""):
         return True, seg_name
 
 
-def start_meeting():
+def start_meeting(origin=ORIGIN_PC):
+    """开始用**本机麦**录音。`origin` = 这场会议的发起方（`mobile` / `pc`）。
+
+    ⚠️ `origin` 与"用哪支麦"是**两件事**：手机按「开始录音」时也可以走这条路
+    （`source=pc` = 用电脑的麦录），那仍然是**手机发起**的任务 → `origin="mobile"`。
+    判据由 api 层按"谁调的接口"（带中继标记 = 手机）算好传进来，这里**不猜**。
+    """
     with _state_lock:
         if _state["active"]:
             return False, "会议录音已在进行中"
@@ -866,6 +936,9 @@ def start_meeting():
 
         meta = {
             "start": now.isoformat(timespec="seconds"),
+            #: 发起方（`mobile` / `pc`）：与"用哪支麦"无关，只看**谁调的接口**
+            #: （api 层 `_meeting_origin`）。这场后续所有事件都带同一个 `origin`。
+            "initiatedBy": normalize_origin(origin),
             "config": {
                 #: **空串**：`meetingSttModel` 已废弃（2026-09-29，会议转写不再在客户端
                 #: 进程内跑），所以"这台机器用哪个本机引擎"这件事**没有答案**。
@@ -934,9 +1007,11 @@ def start_meeting():
             return False, f"无法开始录音：{err}"
 
         _state.update(active=True, folder=folder, recorder=recorder,
-                      started_at=meta["start"], error="", paused=False, pauses=[])
+                      started_at=meta["start"], error="", paused=False, pauses=[],
+                      origin=meta["initiatedBy"])
         threading.Thread(target=_watch_recorder, args=(recorder,), daemon=True).start()
-        db.add_event("meeting_started", {"meeting": os.path.basename(folder), "id": meeting_id})
+        db.add_event("meeting_started", {"meeting": os.path.basename(folder), "id": meeting_id,
+                                         "origin": meta["initiatedBy"]})
         db.add_log("info", "meeting", f"开始录音: {os.path.basename(folder)}")
         return True, os.path.basename(folder)
 
@@ -970,6 +1045,10 @@ def stop_meeting():
 
         meta_path = os.path.join(folder, "meta.json")
         meta = _load_json(meta_path, {})
+        # 这场会议的发起方（`mobile` / `pc`）：**从 meta 读，不看"谁按了停止"** ——
+        # 手机发起的那场，用户也可能在电脑面板上按停止，那仍然是手机的任务
+        # （口径："手机侧发的任务，手机接受通知"）。读不到 = `pc`（不打扰手机）。
+        origin = _event_origin(folder, meta)
         # 收尾那个还开着的暂停区间（停止时还在暂停）
         end_iso = datetime.datetime.now().isoformat(timespec="seconds")
         if was_paused and pauses and not pauses[-1].get("to"):
@@ -1003,7 +1082,8 @@ def stop_meeting():
                                   error=f"录音中断：{recorder.error}")
             err = f"录音中断：{recorder.error}；已保留音频，可手动重新转写"
             _state.update(error=err)
-            db.add_event("meeting_stopped", {"meeting": os.path.basename(folder), "error": err})
+            db.add_event("meeting_stopped", {"meeting": os.path.basename(folder),
+                                             "error": err, "origin": origin})
             db.add_log("error", "meeting", err)
             return False, err
         if not segs:
@@ -1015,7 +1095,8 @@ def stop_meeting():
                                   duration_seconds=0, segments=0, status="error",
                                   error=f"没有录到音频：{err}")
             _state.update(error=err)
-            db.add_event("meeting_stopped", {"meeting": os.path.basename(folder), "error": err})
+            db.add_event("meeting_stopped", {"meeting": os.path.basename(folder),
+                                             "error": err, "origin": origin})
             db.add_log("error", "meeting",
                        f"录音结束但无音频（{os.path.basename(folder)}）：{err}")
             return False, f"没有录到音频：{err}"
@@ -1029,7 +1110,7 @@ def stop_meeting():
 
         # 后台转写（不阻塞）
         threading.Thread(target=_transcribe_meeting, args=(folder,), daemon=True).start()
-        db.add_event("meeting_stopped", {"meeting": os.path.basename(folder)})
+        db.add_event("meeting_stopped", {"meeting": os.path.basename(folder), "origin": origin})
         db.add_log("info", "meeting", f"停止录音，开始转写: {os.path.basename(folder)}")
         return True, os.path.basename(folder)
 
@@ -2425,7 +2506,10 @@ def _transcribe_impl(folder):
         # 才有的第二件事 —— 两件事各发一条，手机端能分别提示。
         db.add_event("meeting_transcribed", {
             "meeting": meeting_name, "id": meeting_id,
-            "durationSeconds": meta.get("durationSeconds", 0)})
+            "durationSeconds": meta.get("durationSeconds", 0),
+            # 这场是谁发起的（`mobile` / `pc`）：手机发起的才推手机。
+            # 转写虽然是电脑干的活，但它是**那场手机任务**的一部分 —— 通知该回手机。
+            "origin": _event_origin(folder, meta)})
     else:
         # 「一行都没有也叫 transcribed」是假话：面板显示成功、纪要写着"没内容"，
         # 真正原因（引擎异常/依赖缺失）只在 stderr 里 —— 用户看到的是"成功了但空的"。
@@ -3462,7 +3546,10 @@ def _notify_summary_ready(meeting_id, folder, body):
     # payload 字段与 `meeting_transcribed` / `meeting_stopped` 保持一致（安卓按
     # `payload["meeting"]` 取名字，见 android 的 EventNotify.summarize）。
     db.add_event("meeting_summary_ready", {
-        "meeting": os.path.basename(os.path.normpath(folder)), "id": meeting_id})
+        "meeting": os.path.basename(os.path.normpath(folder)), "id": meeting_id,
+        # 发起方（`mobile` / `pc`）：手机发起的那场才推手机。
+        # 从 meta 读（不是"谁点了生成纪要"）—— 纪要是那场**手机任务**的后半段。
+        "origin": _event_origin(folder)})
     return True
 
 
@@ -3999,7 +4086,7 @@ def _import_cfg():
 
 
 def import_meeting(files, *, title="", start="", notes="", started_at="", block_frames=None,
-                   display_names=None):
+                   display_names=None, origin=ORIGIN_PC):
     """把 1..N 个音频文件导入成**一场会议**（顺序即分段顺序），成功后自动开始转写。
 
     参数：
@@ -4013,6 +4100,9 @@ def import_meeting(files, *, title="", start="", notes="", started_at="", block_
                    而报错文案与 `meta.json` 里的 `importedFrom` 必须是用户认识的原文件名
                    （`echo-imp123-ab12.m4a` 这种临时名会让"哪个文件失败了"没法查）。
                    不给就按 `files[i]` 的文件名显示。
+      origin       可选：这场会议的**发起方**（`mobile` / `pc`，缺省 `pc`）—— 写进
+                   `meta.json` 的 `initiatedBy`，供 `meeting_imported`（以及后续转写/纪要）
+                   的事件带同一个 `origin`。取舍见 `normalize_origin`（拿不到就 `pc`）。
 
     返回 `(ok, name_or_reason)`；`ok=True` 时第二项是会议目录名。
 
@@ -4056,14 +4146,14 @@ def import_meeting(files, *, title="", start="", notes="", started_at="", block_
     try:
         return _import_meeting_locked(paths, title=title, start=start, notes=notes,
                                       started_at=started_at, block_frames=block_frames,
-                                      display_names=display_names)
+                                      display_names=display_names, origin=origin)
     finally:
         with _importing["lock"]:
             _importing["busy"] = False
 
 
 def _import_meeting_locked(paths, *, title, start, notes, started_at, block_frames,
-                           display_names=None):
+                           display_names=None, origin=ORIGIN_PC):
     from app.audio import importer as imp
 
     root = ensure_meetings_dir()
@@ -4125,6 +4215,9 @@ def _import_meeting_locked(paths, *, title, start, notes, started_at, block_fram
     meta = {
         "start": started_at,
         "source": "import",
+        #: 这场导入**是谁发起的**（`mobile` / `pc`）：`meeting_imported` 与后续
+        #: 转写/纪要的事件都带这个 `origin`。缺省 `pc` = 不打扰手机（见 `normalize_origin`）。
+        "initiatedBy": normalize_origin(origin),
         "importedFrom": list(shown_names),
         "importedAt": datetime.datetime.now().isoformat(timespec="seconds"),
         "durationSeconds": duration,
@@ -4180,7 +4273,8 @@ def _import_meeting_locked(paths, *, title, start, notes, started_at, block_fram
         return False, "导入失败（写 meta.json，可能是磁盘满）：%s" % e
 
     db.add_event("meeting_imported", {"meeting": name, "id": meeting_id,
-                                      "files": len(results), "seconds": duration})
+                                      "files": len(results), "seconds": duration,
+                                      "origin": _event_origin(folder, meta)})
     db.add_log("info", "meeting",
                "已导入 %d 个音频文件为一场会议：%s（%.1f 分钟，%d 段）——开始转写"
                % (len(results), name, duration / 60.0, len(results)))

@@ -891,6 +891,20 @@ def _agent_snapshot():
         return ""
 
 
+def _command_origin(source):
+    """指令来源（`commands.source`）→ 事件的 `origin`（`mobile` / `pc`）。
+
+    用户 2026-10-16 的口径：***"手机侧发的任务，手机接受通知，电脑端发起的任务不用给手机"***
+    —— 所以 `command_done` 要能说清"这条指令是不是手机发的"。只有 `mobile`
+    （`POST /api/assistant/voice-command` 那条路记的值）算手机；`web` / `desktop` /
+    `hotkey` / `api`… 全按电脑算。
+
+    **认不出来就按 `pc`**（保守取向）：宁可**不打扰手机**，也不要让电脑上敲的指令
+    在手机上响一声；两种错的代价不对称（手机那一下是打扰，漏一条他还能回面板看）。
+    """
+    return ("mobile" if str(source or "").strip().lower() == "mobile" else "pc")
+
+
 def _dispatch(text, source, workspace=None, session_id=None):
     """发送到 DSH + 等回复 + 简报 + 历史。"""
     cfg = settings
@@ -968,7 +982,10 @@ def _dispatch(text, source, workspace=None, session_id=None):
         db.update_command(cmd_id, status="done", reply=reply, brief=brief,
                           duration_ms=duration)
         db.add_log("info", "assistant", f"完成({duration}ms)，简报: {brief[:80]}")
-        db.add_event("command_done", {"id": cmd_id})
+        # `origin` 与 `command_received` 里的 `source` **同源**（都是本函数这个 `source`，
+        # 也就是写进 `commands.source` 的那个值）—— 不另查一遍库，是为了让它俩
+        # **不可能**对不上：手机能照 `command_received.source` 判断该不该提醒。
+        db.add_event("command_done", {"id": cmd_id, "origin": _command_origin(source)})
         if cfg.get("voiceBrief", True) and brief:
             providers_mod.speak_async(brief)
         return True
