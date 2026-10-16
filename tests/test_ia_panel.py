@@ -667,5 +667,191 @@ class MeetingRetranscribeButtonTests(unittest.TestCase):
         self.assertIn("m.transcribing", fn)
 
 
+class MeetingButtonFeedbackTests(unittest.TestCase):
+    """「点了永远看得出来」：录音的开/停**每一次点击都要留下看得见的话**（2026-10-16）。
+
+    真机现场：用户在面板上点「停止录音」→ **看起来什么都没发生**（会议还在录），
+    而我事后调接口一次就成功、日志里也确实有 `POST /api/meeting/stop → 200`。
+    根因不是接口，是**界面没有反馈**：
+
+      * 停止前的确认框是**有意**的（防误停，不能删）；但用户取消时旧代码直接 `return`，
+        界面上一个字都没有 → 主观上就是"点了没反应"；
+      * `POST` 返回 `{ok:false, message}`（例如"麦克风尚未释放，录音正在停止；请再点一次"）
+        时只弹了一句 2.6 秒的 toast —— 那是一句**可照做的指引**，却被忽略了；
+      * 请求 200（甚至 `ok:true`）**不等于**服务端状态真的变了：界面上的乐观更新骗过人。
+
+    这些判据全是**源码级**的（本文件一贯做法：面板没有构建步骤，靠文本契约钉住），
+    钉的是"接线还在不在"，不是"样式好不好看"。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.js = _read("web", "app.js")
+        cls.html = _read("web", "index.html")
+
+    @staticmethod
+    def _js_function(src, sig):
+        """从 `sig` 起、到下一个**顶格** `}` 为止（与上面那个测试类同一套写法）。"""
+        i = src.index(sig)
+        return src[i:src.index("\n}", i) + 2]
+
+    @staticmethod
+    def _handler(js, sel):
+        """某个按钮的 click 处理器那一段（到顶格 `});` 为止）。"""
+        i = js.index('$("#%s").addEventListener' % sel)
+        return js[i:js.index("\n});", i) + 4]
+
+    # ---------------------------------------------------------------- ① 防误停的确认框还在
+    def test_the_confirm_dialog_is_still_awaited(self):
+        """**防误停不能被删掉**：停止录音前仍然要 await 那个确认框（两个入口都要）。"""
+        for sel in ("btnMeeting", "btnMeetingFromList"):
+            with self.subTest(sel=sel):
+                h = self._handler(self.js, sel)
+                self.assertIn("if (active && !(await confirmDialog(", h,
+                              "%s：停止前必须仍被 await —— 直接停会把用户正在录的会议打断" % sel)
+                self.assertIn("确定要停止录音并开始转写吗？", h)
+                self.assertIn('okText: "停止并转写"', h)
+                self.assertIn("danger: true", h, "停止是不可逆动作，按钮要是危险色")
+
+    def test_the_confirm_dialog_is_hard_to_miss(self):
+        """确认框要**显眼**：它有标题、遮罩压得更暗、彩色描边 + 外发光、焦点落在确认键上。
+
+        为什么值得钉：真机上用户"没意识到在等他确认"，主观感受与"点了没反应"完全一样。
+        （`web/app.css` 与 `index.html` 不在这次改动范围里，所以样式只能内联写。）
+        """
+        fn = self._js_function(self.js, "function confirmDialog(")
+        self.assertIn("title = ", fn, "确认框要有一句标题：告诉用户在等什么")
+        self.assertIn("cdlg-title", fn)
+        self.assertIn("wrap.style.background", fn, "遮罩要压得更暗（.55 → 更实）")
+        self.assertIn("box.style.borderColor", fn)
+        self.assertIn("box.style.boxShadow", fn, "描边 + 外发光：一眼看出这是当前焦点")
+        self.assertIn("ok.focus()", fn, "焦点直接落在要按的那个键上")
+        # 停止那条路要把标题说成"停止录音？"，而不是笼统的"需要你确认"
+        for sel in ("btnMeeting", "btnMeetingFromList"):
+            with self.subTest(sel=sel):
+                self.assertIn('title: "停止录音？"', self._handler(self.js, sel))
+
+    # ---------------------------------------------------------------- ② 取消也必须看得见
+    def test_cancelling_says_so_in_both_places(self):
+        """取消路径必须有**可见反馈**（这次体验缺陷的根：旧代码在这里什么都不做）。"""
+        for sel in ("btnMeeting", "btnMeetingFromList"):
+            with self.subTest(sel=sel):
+                h = self._handler(self.js, sel)
+                self.assertIn("已取消，仍在录音", h)
+                # 不能只写在注释里：那句所在的**整行**要真的调显示函数（常驻状态行 + toast）
+                br = h[h.rindex("\n", 0, h.index("已取消，仍在录音")) + 1:]
+                br = br[:br.index("return;")]
+                self.assertIn("meetingNote(", br)
+                self.assertIn("toast(", br)
+                # 取消分支不能顺手调接口（取消就是取消）
+                self.assertNotIn("/api/meeting/", br)
+        self.assertGreaterEqual(self.js.count("已取消，仍在录音"), 4,
+                                "两个入口各要有一份（状态行 + toast），只修一处就是另一处还是没反应")
+
+    # ---------------------------------------------------------------- ③ 确认之后立刻有反馈
+    def test_the_button_is_disabled_with_a_pending_label(self):
+        """确认后**立刻**：按钮禁用 + 文案「正在停止…」（开始那条对称：`正在开始…`）。"""
+        fn = self._js_function(self.js, "async function meetingAction(")
+        self.assertIn("btn.disabled = true", fn, "请求期间必须真的禁用")
+        self.assertIn('active ? "正在停止…" : "正在开始…"', fn,
+                      "两条路要**对称**（别只修停止那一半）")
+        # 请求返回后恢复
+        self.assertIn("btn.disabled = false", fn)
+        self.assertIn("btn.textContent = active ? \"停止录音\" : \"开始录音\"", fn,
+                      "兜底：刷新失败也不许把按钮留在「正在停止…」上")
+
+    def test_the_periodic_refresh_does_not_wipe_the_pending_label(self):
+        """5 秒一次的状态轮询**不许**把「正在停止…」抹回「停止录音」。
+
+        不钉住这条的话：按钮刚改成「正在停止…」，下一次 `refreshDashboard()` 就把它
+        改回状态真值 —— 用户看到的又是"点了没反应"（正是这次要修的那件事）。
+        """
+        dash = self._js_function(self.js, "async function refreshDashboard(")
+        i = dash.index("if (!_meetingActionPending)")
+        seg = dash[i:dash.index("}", i)]
+        self.assertIn('$("#btnMeeting").textContent', seg,
+                      "按钮文案的改写要在「不在开/停中」这个条件里面")
+        btn = self._js_function(self.js, "function renderMeetingListBtn(")
+        self.assertIn("if (_meetingActionPending) return;", btn,
+                      "会议列表那个按钮要同样的守卫")
+
+    # ---------------------------------------------------------------- ④ 失败要说原话
+    def test_a_false_ok_prints_the_servers_own_sentence(self):
+        """`ok:false` 的 `message` 要走**醒目**通道，一字不改地显示出来。"""
+        fn = self._js_function(self.js, "async function meetingAction(")
+        self.assertIn("r.ok === false", fn, "服务端说没成就要按没成处理（别把失败伪装成成功）")
+        self.assertIn("r.message", fn, "原话来自服务端的 message 字段")
+        bad = fn[fn.index("r.ok === false"):]
+        bad = bad[:bad.index("} else {")]
+        self.assertIn("meetingNote(msg", bad, "原话要落在常驻状态行上（一字不改）")
+        self.assertIn('toastSticky("录音没成功："', bad, "并且是**不自动消失**的醒目提示")
+        # 醒目提示**复用既有的 toast()**（不另造一套显示层）：ms=0 = 不自动消失
+        st = self._js_function(self.js, "function toastSticky(")
+        self.assertIn("toast(msg, 0)", st)
+
+    def test_network_errors_and_timeouts_are_loud(self):
+        """网络异常 / 超时：一样要醒目，而且不许写成成功。
+
+        超时这一条特别重要：`fetch` 挂住时**永远不 resolve**，旧写法下界面就是
+        "点了没反应"（连失败都不给）。
+        """
+        fn = self._js_function(self.js, "async function meetingAction(")
+        catch = fn[fn.index("} catch (e) {"):]
+        catch = catch[:catch.index("} finally {")]
+        self.assertIn("e.message", catch)
+        self.assertIn("toastSticky(", catch)
+        self.assertIn("请求失败：", catch)
+        pg = self._js_function(self.js, "function postGuarded(")
+        self.assertIn("Promise.race", pg)
+        self.assertIn("请求超时", pg)
+        self.assertIn("15000", pg, "超时要有明确上限（15 秒）")
+        self.assertIn("postGuarded(path, {})", fn, "开会/停要走带超时那条路")
+        # 成功路径仍然用普通的 `toast()`（短、不打扰）—— 别把一切都变成红字
+        self.assertIn("if (msg) toast(msg);", fn)
+
+    # ---------------------------------------------------------------- ⑤ 以服务端状态为准
+    def test_the_server_state_is_the_judge(self):
+        """请求返回后要**轮询 `/api/status`**；`meeting.active` 没变就**如实说**。
+
+        为什么：界面上的乐观更新骗过人 —— 按钮与文案都变了，会议还在录。
+        """
+        fn = self._js_function(self.js, "async function verifyMeetingState(")
+        self.assertIn('api("/api/status")', fn)
+        self.assertIn("st.meeting", fn, "判据是服务端的 meeting.active，不是本地变量")
+        self.assertIn("=== wantActive", fn)
+        self.assertIn("TRIES", fn)
+        self.assertIn("for (let i = 0; i < TRIES; i++)", fn, "要有上限，不是无限轮询")
+        self.assertIn("服务端状态还没变", fn)
+        self.assertIn("再点一次", fn, "要给出下一步动作")
+        self.assertIn("重启 ECHO", fn, "持续如此要给出最后一条出路")
+        self.assertIn('"err"', fn, "如实提示要走醒目通道")
+
+    def test_both_entrances_share_one_action(self):
+        """两个入口（仪表盘 / 会议列表）走**同一份**逻辑，接口路径与参数一个都没改。"""
+        for sel in ("btnMeeting", "btnMeetingFromList"):
+            with self.subTest(sel=sel):
+                h = self._handler(self.js, sel)
+                self.assertIn("meetingAction(", h)
+                self.assertIn("verifyMeetingState(", h)
+        self.assertEqual(self.js.count('active ? "/api/meeting/stop" : "/api/meeting/start"'), 1,
+                         "开/停的路径只该有**一处**（两处就是两套逻辑，迟早漂）")
+        fn = self._js_function(self.js, "async function meetingAction(")
+        self.assertIn('active ? "/api/meeting/stop" : "/api/meeting/start"', fn)
+        self.assertIn("postGuarded(path, {})", fn, "参数仍然是空对象 —— 不许加新参数")
+
+    # ---------------------------------------------------------------- ⑥ 不改 index.html
+    def test_the_feedback_line_is_built_by_js(self):
+        """反馈行与确认框一样**由 JS 动态建**（这次没动 `web/index.html` / `app.css`）。
+
+        （这正是任务约束：对话框本来就是 JS 动态建的，保持这个方式。）
+        """
+        fn = self._js_function(self.js, "function meetingNote(")
+        self.assertIn('document.createElement("div")', fn)
+        self.assertIn('note.id = "meetingActionNote"', fn)
+        self.assertNotIn("meetingActionNote", self.html,
+                         "反馈行不该写进 index.html（改动范围外，而且会与动态建的那份重复）")
+        self.assertIn("insertAdjacentElement", fn, "要贴在按钮那一块旁边（用户视线所在）")
+
+
 if __name__ == "__main__":
     unittest.main()

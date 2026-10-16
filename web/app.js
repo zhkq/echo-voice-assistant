@@ -25,10 +25,37 @@ const post = (p, body) => api(p, { method: "POST", body: JSON.stringify(body || 
 
 function toast(msg, ms = 2600) {
   const t = $("#toast");
+  if (!t) return;
   t.textContent = msg;
-  t.classList.remove("hidden");
+  // 上一次的"醒目样式"不许留给下一条：普通提示就该是普通样子
+  t.classList.remove("hidden", "err");
+  t.style.borderWidth = "";
+  t.style.borderColor = "";
+  t.style.background = "";
+  t.title = "";
+  t.onclick = null;
   clearTimeout(t._timer);
-  t._timer = setTimeout(() => t.classList.add("hidden"), ms);
+  if (ms > 0) t._timer = setTimeout(() => t.classList.add("hidden"), ms);   // ms<=0 = 不自动消失
+}
+
+/** 醒目 + **留得住**的提示：失败 / 超时 / "服务端状态没变"这类**要用户处置**的话走这条。
+ *
+ *  为什么不能只 `toast(msg)`（2026-10-16 真机体验缺陷的根）：普通 toast 2.6 秒就飘走，
+ *  而失败提示正是这样被忽略的 —— 用户报"点了没反应"，日志里却明明有
+ *  `POST /api/meeting/stop → 200`。所以这种提示要三样一起给：
+ *  ① 红框（一眼看出"这不是成功"）；② 不自动消失（转开视线回来还在）；
+ *  ③ 点一下才关（用户自己决定看够了）。**成功路径继续用 `toast()`**（短、不打扰）。
+ *  样式写在这里而不是 `app.css`：这次的改动只允许碰 `web/app.js`（见任务约束）。 */
+function toastSticky(msg) {
+  toast(msg, 0);                     // 0 → 不自动消失
+  const t = $("#toast");
+  if (!t) return;
+  t.classList.add("err");
+  t.style.borderWidth = "2px";
+  t.style.borderColor = "var(--red)";
+  t.style.background = "#2a1a1d";
+  t.title = "点一下关闭";
+  t.onclick = () => { t.classList.add("hidden"); t.onclick = null; };
 }
 
 /** 保存设置后的提示：**联动没成功的要当场说出来**。
@@ -56,18 +83,36 @@ function toastSaved(r, fallback = "已保存") {
  *
  * @returns {Promise<boolean>} 确认=true，取消/ESC/点遮罩=false
  */
-function confirmDialog(message, { okText = "确定", cancelText = "取消", danger = false } = {}) {
+function confirmDialog(message, { okText = "确定", cancelText = "取消", danger = false,
+                                  title = "需要你确认" } = {}) {
   return new Promise((resolve) => {
     const wrap = document.createElement("div");
     wrap.className = "cdlg-mask";
+    // 遮罩压得更暗（原来 .55）：面板信息很密，遮罩不够暗时"弹了个框"看着像没弹
+    // —— 2026-10-16 的体验缺陷里，用户点了「停止录音」后**根本没意识到**在等他确认。
+    wrap.style.background = "rgba(0,0,0,.72)";
     wrap.innerHTML = `
       <div class="cdlg" role="dialog" aria-modal="true">
+        <div class="cdlg-title">${esc(title)}</div>
         <div class="cdlg-msg">${esc(message)}</div>
         <div class="cdlg-actions">
           <button class="btn" data-act="cancel">${esc(cancelText)}</button>
           <button class="btn ${danger ? "danger" : "primary"}" data-act="ok">${esc(okText)}</button>
         </div>
       </div>`;
+    // 让"它在等你确认"一眼可见：标题（"停止录音？"）+ 彩色描边 + 外发光。
+    // 内联样式而不是 `app.css`：这次的改动只允许碰 `web/app.js`（见任务约束）。
+    const box = wrap.querySelector(".cdlg");
+    const tint = danger ? "var(--red)" : "var(--accent)";
+    if (box) {
+      box.style.borderColor = tint;
+      box.style.boxShadow = `0 0 0 2px ${danger ? "rgba(239,91,91,.35)" : "rgba(79,140,255,.30)"}`
+        + ", 0 12px 40px rgba(0,0,0,.45)";
+    }
+    const head = wrap.querySelector(".cdlg-title");
+    if (head) {
+      head.style.cssText = "font-weight:700;font-size:15px;margin-bottom:8px;color:" + tint;
+    }
     const done = (answer) => {
       document.removeEventListener("keydown", onKey, true);
       wrap.remove();
@@ -85,8 +130,142 @@ function confirmDialog(message, { okText = "确定", cancelText = "取消", dang
     document.addEventListener("keydown", onKey, true);
     document.body.appendChild(wrap);
     const ok = wrap.querySelector('[data-act="ok"]');
-    if (ok) ok.focus();
+    if (ok) ok.focus();   // 焦点直接落在"要按的那个"上：不用先找框在哪
   });
+}
+
+/* ================= 会议录音按钮：「点了永远看得出来」=================
+   2026-10-16 真机体验缺陷 —— 用户在面板上点「停止录音」，**看起来什么都没发生**
+   （会议还在录），而我事后调接口一次就成功、日志里也确实有
+   `POST /api/meeting/stop → 200`。问题全在**界面没有反馈**：
+
+     * 停止前的确认框是**有意**的（防误停，不能删）；但用户取消时旧代码直接 `return`，
+       界面上一个字都没有 → 主观上就是"点了没反应"（这次的根因就是这一句 `return`）；
+     * `POST` 返回 `{ok:false, message}`（例如"麦克风尚未释放，录音正在停止；请再点一次"）
+       时只弹了一句 2.6 秒的 toast，用户根本没看见 —— 而那本来是**可照做的指引**；
+     * 请求 200 甚至 `ok:true` 都**不等于**服务端状态真的变了：界面上的乐观更新骗过人。
+
+   所以这一节的规矩：**每一次点击都要留下看得见的话**（正在… / 已取消 / 失败原话 /
+   以服务端状态为准的最终结论）。开与停走**同一份逻辑** —— 只修一处就是"另一处还是没反应"。 */
+
+/** 会议操作的**常驻反馈行**：贴在按钮那一行下面，点完还看得见（toast 会飘走）。
+ *
+ *  为什么自己建节点：`web/index.html` 与 `web/app.css` 不在这次改动的允许清单里 ——
+ *  确认框本来就是这个方式（JS 动态建），这里保持一致。
+ *  `kind`：`info`（进行中/已确认）· `warn`（取消，仍在录音）· `err`（失败 / 状态没变）。 */
+function meetingNote(msg, kind = "info", btn = null) {
+  const anchor = btn || $("#btnMeeting") || $("#btnMeetingFromList");
+  // 落点：按钮所在那一块的后面（仪表盘 = `.card-body.row` 之后；会议列表 = 标题行之后）
+  const host = anchor ? (anchor.closest(".card-body") || anchor.parentElement) : null;
+  let note = document.getElementById("meetingActionNote");
+  if (note && !note.isConnected) note = null;      // 卡片被整块重画过 → 重新建一个
+  if (!note) {
+    note = document.createElement("div");
+    note.id = "meetingActionNote";
+  }
+  if (host && note.previousElementSibling !== host) host.insertAdjacentElement("afterend", note);
+  else if (!host && !note.isConnected) document.body.appendChild(note);
+  const icon = kind === "info" ? "ⓘ" : "⚠";
+  note.className = "snote " + (kind === "err" ? "err" : kind === "warn" ? "warn" : "info");
+  note.style.fontSize = "12.5px";        // `.snote` 默认 11px：这是要人看清的话，放大一档
+  note.style.whiteSpace = "pre-wrap";
+  note.innerHTML = `<span>${icon}</span><span>${esc(msg)}</span>`;
+  note.classList.remove("hidden");
+  return note;
+}
+
+/** 带超时的 POST：**请求不返回也得说出来**（"点了没反应"最常见的一种就是请求挂住了，
+ *  fetch 一直不 resolve，界面永远等下去、一个字都没有）。
+ *
+ *  15 秒是"人还愿意等"的上限。超时后我们**照样去问服务端状态**（`verifyMeetingState`）——
+ *  请求可能已经在服务端生效了，只是响应没回来；不问了就等于替用户下结论。 */
+function postGuarded(p, body, ms = 15000) {
+  return Promise.race([
+    post(p, body),
+    new Promise((_, reject) => setTimeout(
+      () => reject(new Error(`请求超时（${Math.round(ms / 1000)} 秒没有响应）`)), ms)),
+  ]);
+}
+
+/** 会议录音的**开/停统一动作**（仪表盘 `#btnMeeting` 与会议列表 `#btnMeetingFromList` 共用）。
+ *
+ *  返回 `{wantActive, failed}`：`wantActive` = 我们期望服务端变成的 `meeting.active`，
+ *  调用方据此再走"以服务端状态为准"那一步（`verifyMeetingState`）。
+ *  `after`：请求回来后刷新界面的函数（仪表盘 = refreshDashboard；列表 = 表头 + 列表）。
+ *  **接口路径与参数一个字都没改**：仍然是 `/api/meeting/stop|start` + 空对象。 */
+let _meetingActionPending = false;   // 正在开/停：这期间 5 秒一次的轮询不许改写按钮文案
+let _meetingVerifySeq = 0;           // "以服务端为准"那一步的序号：新的点击作废旧结论
+async function meetingAction(btn, active, after) {
+  const path = active ? "/api/meeting/stop" : "/api/meeting/start";
+  _meetingActionPending = true;      // 这一小段时间里，5 秒一次的状态轮询不许改写按钮文案
+  btn.disabled = true;               // ② 确认之后立刻给反馈：禁用 + 「正在停止…」
+  btn.textContent = active ? "正在停止…" : "正在开始…";
+  meetingNote(active ? "正在停止录音，等 ECHO 回应…" : "正在开始录音，等 ECHO 回应…",
+              "info", btn);
+  let failed = false;
+  try {
+    const r = await postGuarded(path, {});
+    const msg = (r && r.message) || "";
+    if (r && r.ok === false) {
+      // ③ 服务端说"没成"就是没成：把那句**原话**摆在眼前（"麦克风尚未释放，录音正在停止；
+      //    请再点一次"本来就是给人照做的指引，以前它只是 2.6 秒的一句 toast，等于没说）
+      failed = true;
+      meetingNote(msg || "服务端没有说明原因", "err", btn);
+      toastSticky("录音没成功：" + (msg || "服务端没有说明原因"));
+    } else {
+      meetingNote(msg || (active ? "已请求停止，正在等 ECHO 确认…" : "已请求开始，正在等 ECHO 确认…"),
+                  "info", btn);
+      if (msg) toast(msg);
+    }
+  } catch (e) {
+    // 网络异常 / 超时：一样要醒目，而且**不许**把它写成成功
+    failed = true;
+    meetingNote("请求失败：" + e.message, "err", btn);
+    toastSticky("录音操作失败：" + e.message);
+  } finally {
+    _meetingActionPending = false;
+    btn.disabled = false;
+    try { await after(); } catch (e2) { /* 刷新失败不影响"请求本身成没成"的结论 */ }
+    // 兜底：万一 after() 也没刷新成功（ECHO 掉线），别把按钮永远留在「正在停止…」上
+    if (/^正在/.test(btn.textContent || "")) btn.textContent = active ? "停止录音" : "开始录音";
+  }
+  return { wantActive: !active, failed };
+}
+
+/** ④ **以服务端状态为准**：请求返回（哪怕 `ok:true`）都不等于 `meeting.active` 真的变了。
+ *
+ *  为什么必须再问一次：真机上"点了没反应"正是**界面乐观更新**骗人的那一种 ——
+ *  按钮与文案都变了，`meeting.active` 还是 true，会议还在录。
+ *  轮询 `/api/status` 有**上限**（几秒）；到点还没变就**如实说**，并把两条出路
+ *  （再点一次 / 重启 ECHO）一起写出来，而不是丢一句"操作完成"。
+ *  返回：true=已确认变了；false=到上限仍没变；null=这次结论已作废（用户又点了一次）。 */
+async function verifyMeetingState(wantActive, btn, after) {
+  const seq = ++_meetingVerifySeq;         // 新的点击会让旧结论作废，避免"旧结论盖掉新状态"
+  const TRIES = 6, GAP_MS = 700;           // ≈4.2 秒上限：够一次"释放麦克风"，又不让人干等
+  for (let i = 0; i < TRIES; i++) {
+    await new Promise((res) => setTimeout(res, GAP_MS));
+    if (seq !== _meetingVerifySeq) return null;
+    try {
+      const st = await api("/api/status");
+      if (!!(st.meeting && st.meeting.active) === wantActive) {
+        const done = wantActive ? "已确认：服务端在录音"
+                                : "已确认：服务端已停止录音（正在转写）";
+        meetingNote(done, "info", btn);
+        // 也把上一条**醒目失败**换掉：状态真的变了，别让红字留在屏幕上（例如"超时"之后
+        // 请求其实生效了 —— 那时该说"已确认"，而不是让两条互相矛盾的话同屏）
+        toast(done);
+        return true;
+      }
+    } catch (e) { /* 面板可能正在重连：继续试到上限 */ }
+    try { await after(); } catch (e2) { /* 刷新失败不影响判定 */ }
+  }
+  if (seq !== _meetingVerifySeq) return null;
+  const truth = wantActive
+    ? "服务端状态还没变：可能麦克风被占用或还没就绪，再点一次；持续如此请重启 ECHO"
+    : "服务端状态还没变：可能还在释放麦克风，再点一次；持续如此请重启 ECHO";
+  meetingNote(truth, "err", btn);
+  toastSticky(truth);
+  return false;
 }
 
 /* ================= 视图切换 ================= */
@@ -1059,8 +1238,12 @@ async function refreshDashboard() {
     $("#meetingInfo").textContent = st.meeting.active
       ? `正在录音：${st.meeting.folder}`
       : (st.meeting.error ? `上次错误：${st.meeting.error}` : "未在录音");
-    $("#btnMeeting").textContent = st.meeting.active ? "停止录音" : "开始录音";
-    $("#btnMeeting").className = "btn big " + (st.meeting.active ? "danger" : "");
+    // **正在开/停的时候不许改写按钮文案**：5 秒一次的状态轮询会把「正在停止…」抹回
+    // 「停止录音」，用户又变成"看不出点没点上"—— 那正是这次要修的体验。
+    if (!_meetingActionPending) {
+      $("#btnMeeting").textContent = st.meeting.active ? "停止录音" : "开始录音";
+      $("#btnMeeting").className = "btn big " + (st.meeting.active ? "danger" : "");
+    }
     // 录音中：显示麦克风电平波动
     // 语音命令收音阶段（busyPhase=listening）同样显示波形 —— 后端复用录音器的电平回调，不开新采样流
     const micLevel = $("#micLevel");
@@ -1377,20 +1560,30 @@ $("#btnCapture").addEventListener("click", async () => {
    点击后立即失焦（blur），否则焦点留在按钮上，之后按回车/空格会再次触发
    click —— 此时按钮文字已是「停止录音」，就会误发 /api/meeting/stop 把录音停掉。
    再加 800ms 防抖，双击/连按只生效一次（服务端 start/stop 也已有原子锁）。
-   停止录音前弹确认框，避免误停丢失录音。 */
+   **确认框留着**（防误停是有意的）；但它两侧都要有话说：取消 → 明确告诉用户还在录，
+   失败 → 原话摆出来；确认后的等待与服务端状态见 `meetingAction` / `verifyMeetingState`。 */
 let _meetingBusy = false;
 $("#btnMeeting").addEventListener("click", async (e) => {
-  e.currentTarget.blur();
+  const btn = e.currentTarget;
+  btn.blur();
   if (_meetingBusy) return;
-  const active = $("#btnMeeting").textContent === "停止录音";
-  if (active && !(await confirmDialog("确定要停止录音并开始转写吗？", { okText: "停止并转写", danger: true }))) return;
+  const active = btn.textContent === "停止录音";
+  if (active && !(await confirmDialog("确定要停止录音并开始转写吗？",
+      { okText: "停止并转写", danger: true, title: "停止录音？" }))) {
+    // ① 取消也要**说出来**：旧代码在这里直接 return、界面上一个字都没有 ——
+    //    用户主观上就是"点了没反应"（这次体验缺陷的根就在这里）
+    meetingNote("已取消，仍在录音", "warn", btn);
+    toast("已取消，仍在录音");
+    return;
+  }
   _meetingBusy = true;
+  let want = null;
   try {
-    const r = await post(active ? "/api/meeting/stop" : "/api/meeting/start", {});
-    toast(r.message);
-    refreshDashboard();
-  } catch (e2) { toast("失败：" + e2.message); }
-  finally { setTimeout(() => { _meetingBusy = false; }, 800); }
+    const r = await meetingAction(btn, active, refreshDashboard);
+    want = r.wantActive;
+  } finally { setTimeout(() => { _meetingBusy = false; }, 800); }
+  // 不 await：按钮已经恢复，用户随时可以"再点一次"（状态真没变时，那正是该做的事）
+  if (want !== null) verifyMeetingState(want, btn, refreshDashboard);
 });
 
 /* 仪表盘"全部"跳转 */
@@ -5905,6 +6098,7 @@ function renderMeetingListBtn(active) {
   const btn = $("#btnMeetingFromList");
   if (!btn) return;
   btn.dataset.active = active ? "1" : "0";
+  if (_meetingActionPending) return;   // 正在开/停：别把「正在停止…」抹回（同 refreshDashboard）
   btn.textContent = active ? "停止录音" : "开始录音";
   btn.className = "btn" + (active ? " danger" : "");
   btn.title = active ? "停止录音并开始转写" : "开始会议录音";
@@ -5924,15 +6118,21 @@ $("#btnMeetingFromList").addEventListener("click", async (e) => {
   btn.blur();
   if (_meetingListBusy) return;
   const active = btn.dataset.active === "1";
-  if (active && !(await confirmDialog("确定要停止录音并开始转写吗？", { okText: "停止并转写", danger: true }))) return;
+  if (active && !(await confirmDialog("确定要停止录音并开始转写吗？",
+      { okText: "停止并转写", danger: true, title: "停止录音？" }))) {
+    // 取消也要看得见 —— 与仪表盘那个按钮**同一个口径**（两处不一样就是"另一处还是没反应"）
+    meetingNote("已取消，仍在录音", "warn", btn);
+    toast("已取消，仍在录音");
+    return;
+  }
+  const after = async () => { await refreshMeetingHeader(); loadMeetings(); };
   _meetingListBusy = true;
+  let want = null;
   try {
-    const r = await post(active ? "/api/meeting/stop" : "/api/meeting/start", {});
-    toast(r.message);
-    await refreshMeetingHeader();
-    loadMeetings();
-  } catch (e2) { toast("失败：" + e2.message); }
-  finally { setTimeout(() => { _meetingListBusy = false; }, 800); }
+    const r = await meetingAction(btn, active, after);
+    want = r.wantActive;
+  } finally { setTimeout(() => { _meetingListBusy = false; }, 800); }
+  if (want !== null) verifyMeetingState(want, btn, after);
 });
 
 /* 清理 2 分钟以内的短会议（含音频文件） */
