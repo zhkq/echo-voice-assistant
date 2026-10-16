@@ -14,7 +14,7 @@ venv/
 models/
 
 # ---- 运行时数据（录音、数据库、历史、日志）----
-data/
+/data/
 *.db
 *.db-wal
 *.db-shm

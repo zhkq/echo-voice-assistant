@@ -555,6 +555,14 @@ class ListenService : Service() {
                 // 断一下不影响听写：下面退避一轮再来
             }
             if (!ok) delay(30_000)
+            // ---- 离线录音的补传（用户 2026-10-16："网络通了就可以传上去"）----
+            // 搭在这条**后台**循环上：App 关着、只听写开着时，这条循环是唯一还在跟 ECHO
+            // 说话的东西。它每轮都顺手看一眼"有没有欠着的离线录音"——没有就直接返回，
+            // 真发不发请求由 `MeetingMicService` 里那套退避决定（所以这里很便宜）。
+            // 失败绝不影响听写（补传是**顺带**的事，声音那一侧更要紧）。
+            runCatching {
+                MeetingMicService.tickFromForeground(this@ListenService)
+            }
         }
     }
 

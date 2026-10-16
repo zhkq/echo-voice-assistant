@@ -85,4 +85,33 @@ class AppPrefsTest {
             assertEquals("raw=$raw 再夹一次变了", once, AppPrefs.normalizeSegmentSeconds(once))
         }
     }
+
+    // ---- 离线录音本地副本的保留天数（修②）----
+
+    @Test
+    fun `保留天数的默认是 7 天`() {
+        // 默认值写在设置页上（"本地还留着 7 天的备份"），所以它也是一个判据
+        assertEquals(7, OfflineMeetingRetention.DEFAULT_RETENTION_DAYS)
+        assertTrue("默认那一档必须在可选档里（否则界面会显示一个选不中的值）",
+            OfflineMeetingRetention.RETENTION_DAY_CHOICES
+                .contains(OfflineMeetingRetention.DEFAULT_RETENTION_DAYS))
+    }
+
+    @Test
+    fun `保留天数的夹取只管这一处（AppPrefs 不另写一套）`() {
+        // 与 segmentSeconds 同一条纪律：判据只有一处（纯函数 + 有用例），
+        // 界面上那几个按钮与 `AppPrefs.audioRetentionDays` 都走它。
+        for (raw in OfflineMeetingRetention.RETENTION_DAY_CHOICES) {
+            assertEquals(raw, OfflineMeetingRetention.normalizeDays(raw))
+        }
+        assertEquals("认不出的值夹到最近的档，**不是**夹成 0（'永不清'与'立刻清'搞反了会删光音频）",
+            1, OfflineMeetingRetention.normalizeDays(3))
+    }
+
+    @Test
+    fun `保留天数那一档 0 说的是永不自动清理`() {
+        assertTrue(OfflineMeetingRetention.RETENTION_DAY_CHOICES.contains(0))
+        assertEquals("永不自动清理", OfflineMeetingRetention.label(0))
+        assertTrue(OfflineMeetingRetention.neverCleans(0))
+    }
 }

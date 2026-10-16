@@ -1134,6 +1134,14 @@ class MainViewModel(app: Application) : BaseViewModel(app) {
     fun autoRefreshTick() {
         viewModelScope.launch { fetchStatusOnce() }
         pollEvents()
+        // 离线录音的**自动补传**入口（用户 2026-10-16 的需求："网络通了就可以传上去"）。
+        // 搭在同一个节拍上：这条节拍只在界面可见时跑，正好就是"App 在前台"；
+        // 真发不发请求由服务里那套退避决定（见 MeetingMicService.tickFromForeground），
+        // 所以这里每次 tick 调它是**便宜**的（没有欠的清单就直接返回）。
+        runCatching {
+            com.echo.contact.service.MeetingMicService
+                .tickFromForeground(getApplication<Application>())
+        }
     }
 
     /**

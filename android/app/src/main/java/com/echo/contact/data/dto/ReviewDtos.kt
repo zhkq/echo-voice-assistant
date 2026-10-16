@@ -1,0 +1,118 @@
+package com.echo.contact.data.dto
+
+import com.google.gson.annotations.SerializedName
+
+/**
+ * 每日回顾相关 DTO。字段名照**活着的后端实测**（2026-10-09 抓的），不是照面板猜的：
+ *  - `GET /api/daily-review`         → `{enabled, ready, reason, agent, workspace, vault, kind, sessionId, running}`
+ *  - `GET /api/daily-review/summary` → `{today, todayTurns, todayFailed, lastAt, lastBrief, lastStatus, lastText}`
+ *  - `GET /api/daily-review/history/{date}` → `{ok, date, turns:[{id, at, text, reply, brief, status, error, seconds, sessionId}], count, vault, vaultNote, vaultNoteExists}`
+ *  - `GET /api/daily-review/history?limit=` → `{items:[{date, turns, failed, lastAt, brief, sessionId}], total, today}`
+ */
+
+/** 回顾功能本身的状态。 */
+data class DailyReviewState(
+    val enabled: Boolean = false,
+    val ready: Boolean = false,
+    val reason: String = "",
+    val agent: String = "",
+    val workspace: String = "",
+    val vault: String = "",
+    val kind: String = "",
+    @SerializedName("sessionId") val sessionId: String = "",
+    val running: Boolean = false,
+)
+
+/** 仪表盘那一小口：今天做没做、最近一次是什么。 */
+data class DailyReviewSummary(
+    val today: String = "",
+    @SerializedName("todayTurns") val todayTurns: Int = 0,
+    @SerializedName("todayFailed") val todayFailed: Int = 0,
+    @SerializedName("lastAt") val lastAt: String? = null,
+    /** **播报文本**（给耳朵听的那一版），就是要念的东西。 */
+    @SerializedName("lastBrief") val lastBrief: String? = null,
+    @SerializedName("lastStatus") val lastStatus: String? = null,
+    /** 口述原文（转写，可能有噪音），不用来念。 */
+    @SerializedName("lastText") val lastText: String? = null,
+)
+
+/** 某一天里的一轮回顾。 */
+data class ReviewTurn(
+    val id: Int = 0,
+    val at: String = "",
+    val text: String = "",
+    val reply: String = "",
+    /** 这一轮的播报（要念的就是它）。 */
+    val brief: String = "",
+    val status: String = "",
+    val error: String = "",
+    val seconds: Double = 0.0,
+    @SerializedName("sessionId") val sessionId: String = "",
+)
+
+/** 某一天的回顾详情。 */
+data class ReviewHistoryDetail(
+    val ok: Boolean = false,
+    val date: String = "",
+    val turns: List<ReviewTurn> = emptyList(),
+    val count: Int = 0,
+    val vault: String = "",
+    @SerializedName("vaultNote") val vaultNote: String? = null,
+    @SerializedName("vaultNoteExists") val vaultNoteExists: Boolean = false,
+)
+
+/** 回顾历史里的一天（`GET /api/daily-review/history` 的 `items[]`）。 */
+data class ReviewDay(
+    val date: String = "",
+    val turns: Int = 0,
+    val failed: Int = 0,
+    @SerializedName("lastAt") val lastAt: String? = null,
+    /** 当天最新那条播报。 */
+    val brief: String? = null,
+    @SerializedName("sessionId") val sessionId: String = "",
+)
+
+/** `GET /api/daily-review/history?limit=` 的响应。 */
+data class ReviewHistoryList(
+    val items: List<ReviewDay> = emptyList(),
+    val total: Int = 0,
+    val today: String = "",
+)
+
+/**
+ * `POST /api/daily-review/submit` 的入参（app/api.py:165 `DailyReviewSubmitIn`）。
+ *
+ * **这就是"手机也能做回顾"的关键**：它收的是**口述文本**（不是音频），
+ * 所以手机上录一段 → 转写成文字 → 交到这里，整理与落库都由 ECHO 干，
+ * 与"主机麦克风那条路"得到的是同一个结果。
+ */
+data class DailyReviewSubmitRequest(
+    val text: String,
+    @SerializedName("force_new") val forceNew: Boolean = false,
+)
+
+/**
+ * `POST /api/daily-review/submit` 的响应
+ * （`daily_review.py:349` 的 `{ok, session_id, workspace, reply, spoken, source, error, seconds}`）。
+ */
+data class DailyReviewSubmitResponse(
+    val ok: Boolean = false,
+    @SerializedName("session_id") val sessionId: String = "",
+    val workspace: String = "",
+    /** 智能体的完整回复。 */
+    val reply: String = "",
+    /** **要念出来的那句话**（已过三层兜底）—— 手机就念它。 */
+    val spoken: String = "",
+    /** `broadcast` / `first_paragraph` / `fallback`（排障用：技能有没有按契约输出）。 */
+    val source: String = "",
+    /** 业务性失败的原因（注意：`ok=false` 时 HTTP 仍是 **200**）。 */
+    val error: String = "",
+    val seconds: Double = 0.0,
+)
+
+/** `POST /api/stt/transcribe`（**multipart**）的响应。 */
+data class SttTranscribeResponse(
+    val text: String = "",
+    val engine: String = "",
+    val model: String = "",
+)

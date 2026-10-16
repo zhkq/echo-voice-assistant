@@ -22,6 +22,10 @@ import kotlin.math.abs
  *    这条限制写在设置页上，不只是写在这里（见 `OutputDevices`）。
  *  * [segmentSeconds]：「手机当麦克风」每段多长（15 / 30 / 60，默认 30）。
  *  * [mediaKeys]：耳机 / 车机媒体键要不要接管（默认**开**）。
+ *  * [audioRetentionDays]：离线录音补传成功之后，本地那份副本还留几天
+ *    （默认 **7 天**，`0` = **永不自动清理**）—— 见 [OfflineMeetingRetention]：
+ *    "永不删"（上一版）会把手机塞满，而"传完就删"会把用户还没核对的音频删掉。
+ *    这是**手机这一侧**的取舍（清理的是 app 私有目录），所以它该在这里，不在 ECHO 面板上。
  *
  * 用普通 prefs 而不是加密存储：这不是凭据，是偏好（与 `ListenPrefs` 同一个口径）。
  */
@@ -33,6 +37,7 @@ object AppPrefs {
     const val KEY_SEGMENT_SECONDS = "meeting_segment_seconds"
     const val KEY_MEDIA_KEYS = "media_keys"
     const val KEY_EVENT_CURSOR = "event_cursor"
+    const val KEY_AUDIO_RETENTION_DAYS = "offline_audio_retention_days"
 
     /** 哨兵值：跟随系统默认（`AudioDeviceInfo.id` 从 0 起，负数不可能是真设备）。 */
     const val FOLLOW_SYSTEM = -1
@@ -85,6 +90,23 @@ object AppPrefs {
     }
 
     fun mediaKeys(context: Context): Boolean = prefs(context).getBoolean(KEY_MEDIA_KEYS, true)
+
+    /**
+     * 离线录音**本地副本**的保留天数（读出来一定是 [OfflineMeetingRetention.RETENTION_DAY_CHOICES]
+     * 里的一档；`0` = **永不自动清理**）。
+     *
+     * 为什么默认是 7 天：见 [OfflineMeetingRetention.DEFAULT_RETENTION_DAYS]。
+     * 注意夹取**只在这里的前半段**（[OfflineMeetingRetention.normalizeDays]）——
+     * 与 [segmentSeconds] 一样，"夹到哪一档"的判据只有一处，而且是纯函数、有用例。
+     */
+    fun audioRetentionDays(context: Context): Int = OfflineMeetingRetention.normalizeDays(
+        prefs(context).getInt(KEY_AUDIO_RETENTION_DAYS,
+            OfflineMeetingRetention.DEFAULT_RETENTION_DAYS))
+
+    fun saveAudioRetentionDays(context: Context, days: Int) {
+        prefs(context).edit()
+            .putInt(KEY_AUDIO_RETENTION_DAYS, OfflineMeetingRetention.normalizeDays(days)).apply()
+    }
 
     /**
      * 事件游标（`GET /api/events` 的 `since`）。

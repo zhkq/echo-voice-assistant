@@ -20,6 +20,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -46,6 +47,9 @@ import com.echo.contact.audio.OutputDevices
 import com.echo.contact.service.AppPrefs
 import com.echo.contact.service.ListenPrefs
 import com.echo.contact.service.ListenTuning
+import com.echo.contact.service.MeetingMicService
+import com.echo.contact.service.OfflineMeetingRetention
+import com.echo.contact.service.RetentionPlan
 import com.echo.contact.service.SpeakPrefs
 import com.echo.contact.ui.theme.EchoPalette
 
@@ -81,6 +85,15 @@ fun SettingsScreen(vm: MainViewModel, onBack: () -> Unit, onUnpair: () -> Unit) 
     var inputId by remember { mutableStateOf(AppPrefs.inputDeviceId(context)) }
     var outputId by remember { mutableStateOf(AppPrefs.outputDeviceId(context)) }
     var segmentSeconds by remember { mutableStateOf(AppPrefs.segmentSeconds(context)) }
+    // ---- 离线录音的本地音频（修②：有界保留 + 手动清理入口）----
+    var retentionDays by remember { mutableStateOf(AppPrefs.audioRetentionDays(context)) }
+    var usage by remember {
+        mutableStateOf(MeetingMicService.localAudioUsage(context))
+    }
+    // 手动清理的结果**如实**写在这里（别静默：删了/没删/删失败都要说）
+    var purgeNote by remember { mutableStateOf("") }
+    // 删除**不可逆**：按一下先看出"要删的是哪几场"，再确认
+    var confirmPurge by remember { mutableStateOf(false) }
     // 设备列表与版本号"进页面取一次"：它们是系统状态，不该跟着组合重组反复查
     val inputs = remember { InputDevices.list(context) }
     val outputs = remember { OutputDevices.list(context) }
@@ -249,6 +262,71 @@ fun SettingsScreen(vm: MainViewModel, onBack: () -> Unit, onUnpair: () -> Unit) 
                             "录音界面上能看到「待重传 N 段」并按「立即重传」。",
                         maxLines = 3,
                     )
+
+                    Spacer(Modifier.height(6.dp))
+                    HorizontalDivider(color = EchoPalette.Border)
+                    Spacer(Modifier.height(6.dp))
+
+                    // ---- 离线录音的本地音频：有界保留 + **手动**清理入口（修②）----
+                    // 上一版是"永不删"（安全，但一段 ≈1MB、一小时 ≈120MB，手机会被塞满）；
+                    // 而"传完就删"又太狠（用户可能还想回头核对）。所以：**有界保留**，
+                    // 且**绝不早删** —— 只有"已上传（对账通过 + 服务端收尾）且到期"才清。
+                    Text("离线录音的本地音频", style = MaterialTheme.typography.bodyMedium)
+                    Spacer(Modifier.height(4.dp))
+                    MutedLine(
+                        "现在占 " + usage.bytesText + "，共 " + usage.drafts + " 场" +
+                            "（其中已上传 " + usage.uploadedDrafts + " 场" +
+                            "，已到期可清 " + usage.expiredDrafts + " 场）",
+                        maxLines = 2,
+                    )
+                    Spacer(Modifier.height(6.dp))
+                    MutedLine("补传成功后，本地这份副本还留多久", maxLines = 1)
+                    Spacer(Modifier.height(6.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        for (d in OfflineMeetingRetention.RETENTION_DAY_CHOICES) {
+                            if (d == retentionDays) {
+                                Button(onClick = {}) { Text(OfflineMeetingRetention.label(d)) }
+                            } else {
+                                OutlinedButton(onClick = {
+                                    // 单选都走同一个夹取（判据只有一处，且是纯函数有用例）
+                                    retentionDays = OfflineMeetingRetention.normalizeDays(d)
+                                    AppPrefs.saveAudioRetentionDays(context, retentionDays)
+                                    // 改完立刻按新档位重算"已到期可清几场"
+                                    usage = MeetingMicService.localAudioUsage(context)
+                                }) { Text(OfflineMeetingRetention.label(d)) }
+                            }
+                        }
+                    }
+                    Spacer(Modifier.height(4.dp))
+                    MutedLine(
+                        "「绝不早删」：**没传上去的一律不动**（哪怕已经放了很久）；" +
+                            "只有对账通过、服务端也收尾过（已经开始转写）的，超过保留天数才会被清。" +
+                            "选了「永不自动清理」就一份都不会自动清。",
+                        maxLines = 4,
+                    )
+                    Spacer(Modifier.height(6.dp))
+                    MutedLine(
+                        "本地还留着这份副本，" + OfflineMeetingRetention.label(retentionDays) +
+                            "；电脑上那份音频一直都在 —— 清本地副本不等于丢会议。",
+                        maxLines = 3,
+                    )
+                    Spacer(Modifier.height(6.dp))
+                    OutlinedButton(
+                        enabled = usage.expiredDrafts > 0,
+                        onClick = { confirmPurge = true },
+                    ) { Text("删除已上传的本地音频（${usage.expiredDrafts} 场）") }
+                    if (usage.expiredDrafts == 0) {
+                        Spacer(Modifier.height(2.dp))
+                        MutedLine(
+                            if (usage.drafts == 0) "现在本地没有离线录音的音频。"
+                            else "现在没有到期的（都还在保留期内，或还没传上去）。",
+                            color = EchoPalette.Muted, maxLines = 2,
+                        )
+                    }
+                    purgeNote.takeIf { it.isNotBlank() }?.let {
+                        Spacer(Modifier.height(4.dp))
+                        MutedLine(it, color = EchoPalette.Green, maxLines = 3)
+                    }
                 }
             }
         }
@@ -447,6 +525,50 @@ fun SettingsScreen(vm: MainViewModel, onBack: () -> Unit, onUnpair: () -> Unit) 
                 }
             }
         }
+    }
+
+    // ---- 删除前的确认（**删除是不可逆的**：必须让人先看出"要删的是哪几场"）----
+    // 只用 plan 算出的那些（已上传 + 已到期）；**不提供**"全部立刻删"那种按钮 ——
+    // 那等于把"绝不早删"这条铁律交给一次误触。
+    if (confirmPurge) {
+        val store = MeetingMicService.storeOf(context)
+        val plan = remember(confirmPurge, usage) {
+            OfflineMeetingRetention.plan(
+                drafts = runCatching { store.withAudio() }.getOrDefault(emptyList()),
+                nowMs = System.currentTimeMillis(),
+                days = retentionDays,
+                sizeOf = { OfflineMeetingRetention.audioBytes(store, it) },
+            )
+        }
+        AlertDialog(
+            onDismissRequest = { confirmPurge = false },
+            title = { Text("删除 ${plan.count} 场已上传的本地音频？") },
+            text = {
+                Column {
+                    MutedLine(
+                        "共 ${RetentionPlan.humanBytes(plan.bytes)}。删的是这几场（电脑上那份不受影响，" +
+                            "转写也已经开始了）：",
+                        maxLines = 3,
+                    )
+                    Spacer(Modifier.height(4.dp))
+                    plan.items.take(10).forEach { item ->
+                        MutedLine("· " + item.label, maxLines = 2)
+                    }
+                    if (plan.count > 10) MutedLine("…还有 ${plan.count - 10} 场", maxLines = 1)
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    val r = MeetingMicService.purgeUploadedNow(context)
+                    purgeNote = "删除结果：" + r.note
+                    usage = MeetingMicService.localAudioUsage(context)
+                    confirmPurge = false
+                }) { Text("删除") }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmPurge = false }) { Text("取消") }
+            },
+        )
     }
 }
 

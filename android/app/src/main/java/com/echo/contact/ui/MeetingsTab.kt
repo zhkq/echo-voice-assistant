@@ -146,13 +146,42 @@ fun MeetingsTab(vm: MainViewModel) {
                     }
                     Spacer(Modifier.height(4.dp))
                     MutedLine(
-                        "现在录的是电脑那支麦克风的声音（手机只负责开始/停止）。" +
-                            "让手机当麦克风来录，是下一步要做的。",
-                        maxLines = 2,
+                        "「开始录音」录的是电脑那支麦克风（手机只是遥控）；" +
+                            "想让手机当麦克风就点「用手机麦克风」。" +
+                            "连不上 ECHO 时它不会失败，会改成在手机上离线录音，等联网再传。",
+                        maxLines = 3,
                     )
                     note?.let {
                         Spacer(Modifier.height(4.dp))
                         MutedLine(it, color = EchoPalette.Yellow)
+                    }
+
+                    // ---- 离线录音（用户 2026-10-16 要的）----
+                    // 手机连不上 ECHO 时，录音**不该失败**：改成在手机上离线录。
+                    // 这条卡片是录完之后唯一能看到"还有几段没传上去"的地方
+                    // （全屏录音界面在结束后就收起来了），所以它必须在这里、而且必须**如实**。
+                    val micState = com.echo.contact.service.MeetingMicService.state
+                        .collectAsState().value
+                    if (micState.syncNote.isNotBlank() &&
+                        micState.syncPhase != com.echo.contact.service.OfflinePhase.IDLE
+                    ) {
+                        Spacer(Modifier.height(6.dp))
+                        MutedLine(
+                            micState.syncNote,
+                            color = if (micState.syncPhase ==
+                                com.echo.contact.service.OfflinePhase.DONE)
+                                EchoPalette.Green else EchoPalette.Yellow,
+                            maxLines = 3,
+                        )
+                        if (micState.syncPending > 0 && !micState.syncBusy) {
+                            Spacer(Modifier.height(4.dp))
+                            OutlinedButton(onClick = {
+                                com.echo.contact.service.MeetingMicService.syncNow(localCtx)
+                            }) { Text("现在同步离线录音") }
+                        }
+                        micState.offlineNote.takeIf { it.isNotBlank() }?.let {
+                            MutedLine("原因：$it", color = EchoPalette.Muted, maxLines = 2)
+                        }
                     }
                 }
             }
