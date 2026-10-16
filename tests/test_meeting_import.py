@@ -643,26 +643,37 @@ class ImportThenTranscribeTests(_ImportCase):
         self.assertEqual(meeting.meeting_meta(name).get("transcribed"), ["01.wav"])
         self.assertIn(name, self.did_transcribe, "导入时确实排过转写（替身记下了）")
 
-    def test_a_transcribe_failure_lands_in_error_with_the_real_reason(self):
-        """转写起不来 → `error` + **真原因**（不是"录音失败"这种被读歪的话）。
+    def test_a_missing_transcribe_engine_lands_in_waiting_with_the_real_reason(self):
+        """没有转写引擎 → **待转写**（`imported`）+ **真原因**（不是"录音失败"这种被读歪的话）。
 
         用 `_transcribe_impl`（**只跑转写本身、不起线程**）来制造这个结局：
         **一个后端都没配** —— 客户端进程内已经不做会议转写（2026-09-29），
-        所以这一场一个字都出不来，而落库的原因必须说得出是"没有转写引擎"
+        所以这一场一个字都出不来，而落库的原因必须说得出是"没配转写后端"
         （给用户的下一条路是去配后端，不是去查麦克风）。
         这同时钉住"用户修好设置、点重新转写就能救回来"这条出路。
+
+        ⚠️ 2026-10-16（用户口径）改过断言：这一档**不再是 `error`**。
+        原话是"停止录音不必依赖后端，可以先把数据保存好，**不叫录音失败，应该是转写失败**"
+        ——音频明明躺在磁盘上，把它标成失败就是把"音频已安全保存"谎报成"这场完了"。
+        新语义下"没配 / 连不上 / 被许可挡住"都落**待转写**（面板那一档就是这四个字），
+        只有**引擎真的报了错**才落 `error`（见 `tests/test_meeting_waiting_backend.py`）。
         """
         src = self.make("甲.wav", seconds=1.0, rate=16000, channels=1)
         ok, name = self.import_([src])
         self.assertTrue(ok, name)
         meeting._transcribe_impl(self.meeting_dir(name))
         row = db.get_meeting_by_name(name)
-        self.assertEqual(row["status"], "error")
-        self.assertIn("没有转写引擎", row["error"] or "")
-        # 音频**还在**（"导入失败"与"转写失败"必须能分开）
+        self.assertEqual(row["status"], meeting.MEETING_STATUS_WAITING,
+                         "没配后端 = 待转写（待转写那一档面板文案见 web/app.js）：%r"
+                         % (row["status"],))
+        self.assertIn("录音已完成，音频已保存", row["error"] or "")
+        self.assertIn("没配", row["error"] or "")
+        # 音频**还在**（"导入失败"与"转写没成"必须能分开）
         self.assertTrue(os.path.isfile(os.path.join(self.meeting_dir(name), "01.wav")))
         # 而且这一场的 meta.json 里段清单还在 —— 用户配好后端后「重新转写」能救回来
         self.assertEqual(meeting.meeting_meta(name).get("segments"), ["01.wav"])
+        self.assertEqual("not-configured",
+                         meeting.meeting_meta(name).get("transcribeFallbackReason"))
 
     def test_retranscribe_of_an_imported_meeting_still_works(self):
         """既有路径回归：导入的这场会照样能走 `retranscribe_meeting()`。

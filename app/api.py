@@ -2014,9 +2014,10 @@ def meeting_retranscribe(mid: int, force: bool = False,
     两件事不混在一起。
 
     `?force=1`（2026-10-13）：**只用于解开一种死结** —— 库里的 status 停在
-    `transcribing`、但**没有任何转写线程在跑**（"在等后端"的失败只记状态、不重试，
-    于是那一场永远转不了、也永远点不动「重新转写」）。判据在
-    `meeting.transcribe_is_orphan()`：真有线程在跑时 `force` 一样回 409，
+    `transcribing`、但**没有任何转写线程在跑**（进程崩过留下的残留；判据在
+    `meeting.transcribe_is_orphan()`）。2026-10-16 起"在等后端 / 没配后端"这一类
+    落**待转写**（`imported`）而不是 `transcribing`，那一档本来就点得动「重新转写」，
+    不需要这个开关。真有线程在跑时 `force` 一样回 409，
     所以这个开关**不是**"绕过并发保护"的入口。面板的「强制重试」按钮带的它。
     """
     try:

@@ -438,14 +438,19 @@ class NoBackendAtAllTests(_MeetingCase):
         self.logs = rows
         meeting._transcribe_impl(self.folder)
 
-    def test_no_backend_means_no_text_and_an_honest_error(self):
+    def test_no_backend_means_no_text_and_an_honest_waiting_state(self):
         self._run_without_any_backend()
         self.assertEqual(db.get_lines(self.mid), [],
                          "没配后端却转出了文字 —— 客户端进程内已经没有会议转写这条路了")
         row = db.get_meeting(self.mid)
-        self.assertEqual(row["status"], "error", row)
-        self.assertIn("没有转写引擎", row["error"] or "",
-                      "失败原因必须说清是「没有转写引擎」，而不是「录音失败」：%r" % row["error"])
+        # ⚠️ 2026-10-16（用户口径）改过断言：这一档**不再是 `error`** ——
+        # 音频（段 / meta / 时长）都在盘上，缺的只是"没有远端能把它转成文字"，
+        # 所以落**待转写**（`imported`，面板文案就是这四个字）。
+        # 原话："停止录音不必依赖后端，可以先把数据保存好，不叫录音失败，应该是转写失败"。
+        self.assertEqual(row["status"], meeting.MEETING_STATUS_WAITING, row)
+        self.assertIn("录音已完成，音频已保存", row["error"] or "",
+                      "原因必须说清是「没配转写后端」，而不是「录音失败」：%r" % row["error"])
+        self.assertIn("没配", row["error"] or "", row["error"])
 
     def test_the_meeting_says_why_diarize_did_not_run(self):
         self._run_without_any_backend()
@@ -741,13 +746,19 @@ class WaitingForBackendIsVisibleTests(_MeetingCase):
                         "分离这一槽同样要标出在等后端：%s" % meta["diarize"])
 
     def test_the_meeting_says_it_could_not_transcribe_at_all(self):
-        """客户端进程内不再转写 → **一行文字都没有**，而且原因落库（不是"录音失败"）。"""
+        """客户端进程内不再转写 → **一行文字都没有**，而且原因落库（不是"录音失败"）。
+
+        ⚠️ 2026-10-16（用户口径）改过状态断言：配了连不上的后端 → **待转写**，
+        不是 `error`。音频在盘上、后端只是当时不可用，"等它回来点重新转写"是真出路；
+        标成 `error` 会被读成"这场录音失败了"（用户 2026-10-16 真机上看到的就是这个 ✗）。
+        """
         self._run_with_a_dead_backend()
         lines = db.get_lines(self.mid)
         self.assertEqual(lines, [], "没有可用的转写引擎却转出了文字：%s" % lines)
         row = db.get_meeting(self.mid)
-        self.assertEqual(row["status"], "error", row)
-        self.assertIn("没有转写引擎", row["error"] or "", row)
+        self.assertEqual(row["status"], meeting.MEETING_STATUS_WAITING, row)
+        self.assertIn("录音已完成，音频已保存", row["error"] or "", row)
+        self.assertIn("后端暂不可用", row["error"] or "", row)
         dia = meeting.meeting_meta(self.name)["diarize"]
         self.assertFalse(dia["executed"])
         self.assertTrue(dia["waiting"], "配了连不上的后端 = 在等后端：%s" % dia)

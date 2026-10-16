@@ -216,8 +216,10 @@ def transcribe_is_orphan(meeting_name):
     （见 `recover_orphaned_meetings()` 的说明），能走到这里的实例必然唯一，
     所以不存在"另一个进程正转着它"。剩下的两种成因都是残留：
     进程崩过（本该被启动恢复清成 `interrupted`，但那次恢复之后才留下的状态它管不到），
-    或一次"在等后端"的失败把状态永久留在了 `transcribing`
-    （2026-10-13 现场，见 `_live_transcribes` 的说明）。
+    或更早的版本把"在等后端"的失败留在了 `transcribing`（2026-10-13 现场）。
+    ⚠️ 2026-10-16 起，"在等后端 / 没配后端"这一类**不再**留 `transcribing`，
+    而是落**待转写**（`imported`，见 `_mark_meeting_waiting`）—— 那种会议本来就
+    点得动「重新转写」，不需要 `force`。这条口子留着只为兜住"进程崩过"的残留。
     """
     name = str(meeting_name or "")
     if not name or transcribe_is_live(name):
@@ -1209,12 +1211,116 @@ def _mark_meeting_error(meeting_id, reason, **extra):
 
     `reason` 是给人看的一句话，不是"失败"两个字：面板就显示它，接口契约见
     `app/api.py` 的 `GET /api/meetings`（列表）与 `GET /api/meetings/{mid}`（详情）。
+
+    ⚠️ **只给"转写引擎真的报了错"那一档用**（2026-10-16 用户口径）。"后端连不上 / 没配 /
+    被许可挡住"不是引擎报错，而是"这一次没有远端能干活"——音频已经安全落盘，落
+    `_mark_meeting_waiting()`（待转写）。混用会让用户把"音频已保存"读成"录音失败"。
     """
     if not meeting_id:
         return
     fields = {"status": "error", "error": str(reason or "")[:2000]}
     fields.update(extra)
     db.update_meeting(meeting_id, **fields)
+
+
+#: 「这一场**音频没事，只是这次没转出文字**」在库里的状态词。
+#:
+#: 为什么复用它、不新造一个词：`imported` **已经是**库里那一档"音频在、还没有文字"
+#: （`docs/导入录音-成为一场会议.md` §6），面板两侧（`web/app.js` 的
+#: `MEETING_STATUS_TEXT`、`web/meeting.html`）都已经把它翻成「待转写」并用 `idle` 色
+#: （不是红的）画出来。新造一个词 = 面板先显示一个英文原词，而这一轮**不改面板**
+#: （另一个子代理正在改 `web/app.js`）—— 所以这里用既有词汇，语义也正好对得上。
+MEETING_STATUS_WAITING = "imported"
+
+#: 「**远端/许可**现在干不了这活」的原因词（`capabilities.base.SKIP_REASONS` 的子集）。
+#:
+#: 这一族与"引擎真的报了错"必须分开（2026-10-16 用户口径）：
+#:   * 这一族（连不上 / 熔断 / 忙 / 额度 / 没人干这一槽 / 许可挡住）→ **待转写**：
+#:     音频在盘上，等它回来或把许可改好就能重转；
+#:   * 不在这一族里的（`error` / `vector-mismatch`，以及服务端回的
+#:     `model_failed` / `gpu_oom` / `inference_timeout`… 都被 `base.SERVER_CODE_TO_REASON`
+#:     归成 `error`）→ **`error`** + 引擎原话。
+REMOTE_UNAVAILABLE_REASONS = ("offline", "circuit-open", "busy", "quota",
+                              "absent", "unsupported", "open-failed", "blocked")
+
+#: 「为什么还没转出文字」→ 用户**要做的下一步**。与原因词一对一，别在别处再写一份文案。
+_WAITING_NEXT_STEP = {
+    "waiting-backend": "后端暂不可用，等它恢复后可重新转写",
+    "blocked-by-privacy": ("转写被「允许音频去哪」挡住了 —— 把它改成「内网」之后可重新转写"
+                           "（只绑回环的本机后端不受这条限制）"),
+    "not-configured": "这台机器还没配转写后端，配好之后可重新转写",
+    "route-unavailable": "能力路由起不来，修好之后可重新转写",
+}
+
+
+def _waiting_text(reason):
+    """「这一场为什么还没转出文字」→ 一句给用户看的话（落 `meetings.error`）。
+
+    为什么前半句固定成"录音已完成，音频已保存"：**录音是本地的事，转写是远端的事**
+    （2026-10-16 用户原话："停止录音不必依赖后端，可以先把数据保存好，不叫录音失败，
+    应该是转写失败"）。两件事混在同一个状态里，就会把"音频已经安全落盘"谎报成
+    "这场录音失败了" —— 而真机上那 9 段音频完好地躺在磁盘上。
+
+    具体原因用 `capability_admin.TRANSCRIBE_FALLBACK_LABELS`（既有那一套翻译，
+    不在这里再抄一份）：`waiting-backend` 与 `not-configured` 说错一个词，
+    用户就会去查错的地方。
+    """
+    from app import capability_admin
+    why = str(reason or "not-configured")
+    label = capability_admin.TRANSCRIBE_FALLBACK_LABELS.get(why, why)
+    step = _WAITING_NEXT_STEP.get(why, "后端可用之后可重新转写")
+    return "录音已完成，音频已保存；%s（原因：%s）" % (step, label)
+
+
+def _mark_meeting_waiting(meeting_id, reason, **extra):
+    """把一场会标成**待转写**：音频在盘上，只是**这一次没有远端把它转成文字**。
+
+    `reason` 用既有那套原因词（`waiting-backend` / `blocked-by-privacy` /
+    `not-configured` / `route-unavailable`，见 `_new_run_info`）；文案见 `_waiting_text`。
+    状态词的选择理由见 `MEETING_STATUS_WAITING`。
+    """
+    if not meeting_id:
+        return
+    fields = {"status": MEETING_STATUS_WAITING,
+              "error": _waiting_text(reason)[:2000]}
+    fields.update(extra)
+    db.update_meeting(meeting_id, **fields)
+
+
+def _remote_unavailable_reason(err):
+    """一次转写调用失败 → 「远端现在干不了」的原因词；**引擎真报错**时返回空串。"""
+    reason = str(getattr(err, "reason", "") or "")
+    return reason if reason in REMOTE_UNAVAILABLE_REASONS else ""
+
+
+def _waiting_reason_for_call(plan, err):
+    """一次失败的调用该归到哪个"待转写"原因词（判据全用现成的事实，不猜）。
+
+    `blocked` 有两副面孔：**许可**不让发（`_policy_blocked_only`：连得上、只是不许）与
+    服务端回 `unauthorized`/`forbidden`。前者等多久都不会来，面板要给的是"去改「允许音频去哪」"，
+    所以单独一档 `blocked-by-privacy`；其余一律 `waiting-backend`。
+    """
+    if _remote_unavailable_reason(err) == "blocked":
+        try:
+            if plan is not None and _policy_blocked_only(plan):
+                return "blocked-by-privacy"
+        except Exception:                                   # noqa: BLE001
+            pass
+    return "waiting-backend"
+
+
+def _failure_text(err):
+    """失败对象的**原话**（落 `meetings.error`：用户要的是"引擎说了什么"，不是我们编的四个字）。
+
+    `CapabilityError.__str__` 就是给排障用的那一串（`reason | via 后端 | slot=… |
+    code=… | detail`），服务端回的 `detail` 正在里面 —— 所以直接用它，不再加工。
+    """
+    if err is None:
+        return ""
+    text = str(err).strip()
+    if not text:
+        text = type(err).__name__
+    return text[:600]
 
 
 def _maybe_auto_compress(folder):
@@ -1257,7 +1363,7 @@ def _maybe_auto_compress(folder):
 def _transcribe_meeting(folder):
     """后台转写主入口；任何异常写入日志，不静默丢失。
 
-    返回 `_transcribe_impl` 给出的结果（`"transcribed"` / `"error"` / `""`）——
+    返回 `_transcribe_impl` 给出的结果（`"transcribed"` / `"waiting"` / `"error"` / `""`）——
     调用方据此决定要不要报"转写完成"、响不响成功提示音。**不能**把"函数正常返回"
     当成"转写完成了"：2026-09-29 起再也没有本机引擎兜底，"没有转写引擎"是一条
     正常的提前收口路径（原因已经落库），而它若被当成成功，用户会同时看到
@@ -2176,13 +2282,18 @@ def _transcribe_impl(folder):
     #: （原来这里会静默走本机引擎，用户看不出任何区别）。
     can_transcribe = asr_provider is not None or not asr_is_local
     if not can_transcribe:
+        # **待转写**，不是"录音失败"（2026-10-16 用户口径）：音频（段 / meta / 时长）已经
+        # 安全落在盘上，缺的只是"这一次没有远端能把它转成文字"。原因词沿用既有那一套
+        # （`waiting-backend` / `not-configured` / `blocked-by-privacy` / `route-unavailable`），
+        # 状态落 `MEETING_STATUS_WAITING`（面板那一档就叫「待转写」）。
         why = run_info.get("fallbackReason") or "not-configured"
         from app import capability_admin as _cap_admin
-        reason = "这一场没有转写引擎：%s。可执行的下一步二选一：" \
-                 "① 到 设置 → 会议 把「会议转写走哪条路」设为「ECHO 后端」并配对那台机器；" \
-                 "② 到 设置 → 能力 配一个在线转写服务商。" \
-                 "这一场**没有开始转写**，原样重试也不会成功。" \
-                 % _cap_admin.TRANSCRIBE_FALLBACK_LABELS.get(why, why)
+        label = _cap_admin.TRANSCRIBE_FALLBACK_LABELS.get(why, why)
+        # "下一步该改哪里"仍然要说清（比状态词更能指路），但它落**日志**；面板那一句
+        # 由 `_mark_meeting_waiting()` 的文案 + meta 里的原因词给（单一来源，别写两遍）。
+        reason = ("这一场还没有转出文字：%s。可执行的下一步二选一："
+                  "① 到 设置 → 会议 把「会议转写走哪条路」设为「ECHO 后端」并配对那台机器；"
+                  "② 到 设置 → 能力 配一个在线转写服务商。" % label)
         # 分离这一档也要留下结论：**这一场没有说话人，而且说得出为什么**。
         #
         # 会话压根没开成时（没配后端 / 路由起不来）上面那个循环一次都不会跑，
@@ -2191,15 +2302,15 @@ def _transcribe_impl(folder):
         # 权威词由这里定：两种情形的落点都是"没有任何后端能做这一槽"（`absent`）。
         _note_diarize_missing(
             da_state, DIARIZE_LOCAL_MISSING_REASON,
-            "没有可用的说话人分离后端（%s）"
-            % _cap_admin.TRANSCRIBE_FALLBACK_LABELS.get(why, why))
-        db.add_log("error", "meeting", f"{meeting_name} 无法开始转写：{reason}")
-        _mark_meeting_error(meeting_id, reason,
-                            duration_seconds=meta.get("durationSeconds", 0),
-                            segments=len(segs))
+            "没有可用的说话人分离后端（%s）" % label)
+        db.add_log("warn", "meeting", f"{meeting_name} 待转写：{reason}")
+        _mark_meeting_waiting(meeting_id, why,
+                              duration_seconds=meta.get("durationSeconds", 0),
+                              segments=len(segs))
         _clear_progress(meeting_id)
-        services.report_meeting("error", f"转写失败 {meeting_name}")
-        tts_mod.play_beep("err")
+        # **不播"失败"提示音、组件状态也不报 error**：录下来这件事**成功了**，
+        # 没成的只是"这一趟转写"（咚一声会让用户以为录的东西没了）。
+        services.report_meeting("idle", "待转写 %s（%s）" % (meeting_name, why))
         # 如实留下"这一场为什么没有说话人"（面板那句硬契约的出口），再收工。
         _apply_run_meta(meta, run_info, da_state)
         try:
@@ -2207,7 +2318,7 @@ def _transcribe_impl(folder):
                 json.dump(meta, f, ensure_ascii=False, indent=2)
         except Exception as e:
             db.add_log("warn", "meeting", f"写 meta.json 失败（不影响转写结果）：{e}")
-        return
+        return "waiting"
     if asr_provider is not None:
         # 走 provider 时**不加载本地引擎**（省显存/省时间；也正是"没有 GPU 也能转写"的意义）
         db.add_log("info", "meeting", "本场转写走 provider（不加载本地模型）：%s"
@@ -2217,6 +2328,20 @@ def _transcribe_impl(folder):
         db.add_log("info", "meeting", "本场转写走能力后端（不加载本地模型）")
 
     diarize_fail = ""      # 分离失败只记一次：8 段会议连说 8 遍会淹没日志
+    #: 这一场"为什么没转出文字"的两笔**完全不同**的账（2026-10-16 用户口径）：
+    #:   * `asr_wait_fail` —— 远端/许可现在干不了（`offline` / `blocked` / …）。
+    #:     音频没事，这一场是**待转写**（等它回来 / 去改许可，重转就能成）；
+    #:   * `asr_err_fail`  —— **引擎真的报了错**（服务端回 `model_failed`/`gpu_oom`…，
+    #:     或 provider 那边抛出来）。这一档才是 `error`，并把引擎的原话带上。
+    #:   * `asr_missing`    —— 有几段没转出内容（待转写那档要如实说"差多少"）。
+    #: 只留**第一处**：整场失败时，后面每段的原因多半只是同一台后端掉了的连带，
+    #: 而第一处才是"为什么开始失败的"（用户的排障起点）。
+    asr_wait_fail = None
+    asr_err_fail = None
+    #: 那个"引擎真报错"是**能力后端**报的（而不是 provider 抛的）。有它才能分清
+    #: "那台答了话、只是干不了这活"（→ 不叫"在等它"）与"根本没连上"。
+    asr_backend_err = False
+    asr_missing = 0
     #: 本场是否**已经**用后端做过分离（= 向量空间已锁）。锁上之后本段失败**不再回落本机**：
     #: 一场会里混两套不可比的嵌入就是"认错人且不报错"（L5）。
     dia_backend_used = False
@@ -2267,6 +2392,11 @@ def _transcribe_impl(folder):
                         db.add_log("warn", "meeting",
                                    f"{meeting_name} 第{i}段转写为空（{why}）——本段不写行")
                 except Exception as e:
+                    # provider（在线转写服务）抛错 = **引擎真的报了错**：这一档该落 `error`
+                    # 并把原话带上（它与"后端连不上"是两件事，见上面那两笔账的说明）。
+                    if asr_err_fail is None:
+                        asr_err_fail = e
+                    asr_missing += 1
                     db.add_log("error", "meeting",
                                f"{meeting_name} 第{i}段转写失败（provider）：{e}")
             elif not asr_is_local:
@@ -2282,6 +2412,16 @@ def _transcribe_impl(folder):
                                    f"{meeting_name} 第{i}段没有内容"
                                    f"（档位 {got.timestamps}）——本段不写行")
                 except Exception as e:
+                    # 分成两笔账（见循环外那两笔账的说明）：远端"现在干不了"→ 待转写；
+                    # 引擎真的报了错（服务端 `model_failed`/`gpu_oom`… 归成 `error`）→ `error`。
+                    if _remote_unavailable_reason(e):
+                        if asr_wait_fail is None:
+                            asr_wait_fail = e
+                    else:
+                        if asr_err_fail is None:
+                            asr_err_fail = e
+                        asr_backend_err = True
+                    asr_missing += 1
                     db.add_log("error", "meeting",
                                f"{meeting_name} 第{i}段能力后端转写失败：{type(e).__name__}: {e}")
                     # **不在段内换引擎**：一场会议里"前几段走服务端、后几段走本机"
@@ -2431,6 +2571,34 @@ def _transcribe_impl(folder):
             with open(os.path.join(folder, "meta.json"), "w", encoding="utf-8") as f:
                 json.dump(meta, f, ensure_ascii=False, indent=2)
 
+    # ---- 这一场"到底转出来了没有 / 没转出来是为什么"（2026-10-16 用户口径）----
+    #
+    # 为什么必须在写 meta **之前**定稿：`run_info` 里此时写着「本场转写由能力后端完成」，
+    # 而那一句在"后端中途掉线、一个字都没出"时是**假话**；更糟的是
+    # `_finalize_waiting_flag()` 会按 `transcribeEngine == "backend"` 把"在等后端"清掉 ——
+    # 于是详情页同时说"转写走了后端"和"这场没有问题"（这正是真机上 09:33 那场烂尾的形状）。
+    waiting_reason = ""
+    if asr_wait_fail is not None:
+        _plan = None
+        if cap_session is not None:
+            try:
+                _plan = cap_session.plan()
+            except Exception as e:                              # noqa: BLE001
+                db.add_log("debug", "meeting", "重算计划失败（只影响原因词的细分）：%s" % e)
+        waiting_reason = _waiting_reason_for_call(_plan, asr_wait_fail)
+        # 文字这一次**没出来**（或只出来一部分）：不许再记 `transcribeEngine=backend`
+        # ——改成"没有转写引擎 + 为什么"，与开场就判出"在等后端"那条路写的是**同一套**字段。
+        run_info.update(_new_run_info("", waiting_reason))
+    elif asr_err_fail is not None and not db_rows:
+        # 引擎真的报了错、而且**一个字都没出来**：那句"这场的文字是后端出的"同样不成立。
+        # （有行的时候不动它：那一场至少真的出过文字，改这里会让 meta 与 `transcribed`
+        #   互相打架 —— 局部失败是另一件事，本次不动它的语义。）
+        run_info.update(_new_run_info("", ""))
+        if asr_backend_err:
+            # 那台**答了话**（它报错，而不是连不上）→ "在等后端（连不上）"当场不成立。
+            # 不改这一位的话，详情页会同时说"模型加载失败"与"在等那台后端：它连不上"。
+            da_state["waiting"] = False
+
     # 分离的最终结论：**没有说话人就必须说得出为什么**（这一条是硬要求 —— 静默产出
     # "像正常一样却没有说话人"的结果比转写失败更糟：用户以为一切正常）。
     # 原因词只有一个来源（权威十词），这里不编词、也不改词。
@@ -2495,6 +2663,25 @@ def _transcribe_impl(folder):
         db.replace_speakers(meeting_id, speaker_names)
     db.add_lines(meeting_id, db_rows)
     db.cleanup_empty_speakers(meeting_id)
+    if waiting_reason:
+        # **待转写**：音频在（段数/时长都在盘上），只是这一次没有远端把它转成文字。
+        #
+        # 已转出的行**保留**（能看多少是多少），但结论必须是"还没转完" —— 半场文字也报
+        # `transcribed` 是同一类谎（用户以为整场都转好了；真机上 09:33 那场就是这么烂尾的）。
+        _mark_meeting_waiting(meeting_id, waiting_reason,
+                              duration_seconds=meta.get("durationSeconds", 0),
+                              segments=len(segs))
+        db.add_log("warn", "meeting",
+                   "%s 待转写：%d/%d 段没有转出内容（%s）"
+                   % (meeting_name, asr_missing, seg_total, waiting_reason))
+        # **不播"失败"提示音、组件状态也不报 error**：录音这件事成功了（见
+        # `_mark_meeting_waiting` 的说明），没成的只是"这一趟转写"。
+        services.report_meeting("idle", "待转写 %s（%s）" % (meeting_name, waiting_reason))
+        if db_rows:
+            # 已经转出来的部分照常导出（用户有东西可看），但**不生成纪要** ——
+            # 拿半场文字去生成纪要等于把"不完整"固化成结论。
+            export_transcript(meeting_id, folder)
+        return "waiting"
     if db_rows:
         # `error=""`：转写成功了，上一次失败的原因必须清掉（否则面板会拿旧原因
         # 解释这一场的结果 —— 而那是最像"代码坏了"的一种假象）。
@@ -2514,7 +2701,13 @@ def _transcribe_impl(folder):
         # 「一行都没有也叫 transcribed」是假话：面板显示成功、纪要写着"没内容"，
         # 真正原因（引擎异常/依赖缺失）只在 stderr 里 —— 用户看到的是"成功了但空的"。
         # 2026-09-21 那场 71 分钟的会就是这么过去的（2026-09-23 复查发现）。
+        #
+        # ⚠️ 走到这里**已经排除了"远端现在干不了"那一档**（它在上面按待转写收口了）：
+        # 要么引擎真的报了错（→ 把它的**原话**带上，用户要的是它说了什么），
+        # 要么引擎好着、只是这段录音里确实没人说话。
         reason = "没有转出任何文字（转写引擎失败，或这段录音确实没人说话）"
+        if asr_err_fail is not None:
+            reason = "转写引擎报错，没有转出任何文字：%s" % _failure_text(asr_err_fail)
         db.update_meeting(meeting_id, status="error",
                           duration_seconds=meta.get("durationSeconds", 0),
                           segments=len(segs), error=reason)
@@ -2535,7 +2728,8 @@ def _transcribe_impl(folder):
         request_summary(meeting_id, folder)
         request_topic_segments(meeting_id, folder)
     # 结果如实交给调用方（`_transcribe_meeting` 据此决定要不要报"转写完成"）：
-    # `_mark_meeting_error` 那类提前收口的分支也走这个返回值，见上面的 `return "error"`。
+    # `_mark_meeting_waiting` / `_mark_meeting_error` 那类提前收口的分支也走这个返回值，
+    # 见上面的 `return "waiting"` / `return "error"`。
     return "transcribed" if db_rows else "error"
 
 
@@ -3963,10 +4157,12 @@ def retranscribe_meeting(meeting_id, force=False):
 
     `force=True`（2026-10-13）：**只在"库里写着在转、但本进程没人真在跑"时接管**
     （判据 `transcribe_is_orphan()`）—— 那是**残留**，不是"正在转"。
-    为什么需要这条路：一次"在等后端"的失败会把状态永久留在 `transcribing`
-    （`_transcribe_impl` 那条路只记状态、不排队重试），而库里那份判据（按设计）
+    为什么需要这条路：一次进程崩溃会把状态永久留在 `transcribing`
+    （`_transcribe_impl` 那条路不排队重试），而库里那份判据（按设计）
     会把「重新转写」永远挡在 409 外 —— 用户只能重启 ECHO 才能再转一次。
     真有人跑着时 `force` **照样 409**：它绕过的只有"残留"这一种，不是并发保护本身。
+    （2026-10-16 起"在等后端 / 没配后端"落**待转写**，不再是 `transcribing`，
+    所以那一档本来就点得动「重新转写」—— 见 `_mark_meeting_waiting`。）
     """
     meeting = db.get_meeting(meeting_id)
     if not meeting:
@@ -4117,12 +4313,15 @@ def import_meeting(files, *, title="", start="", notes="", started_at="", block_
       * `interrupted` 的意思已经被"录音中断"占住了（进程崩了/设备掉了），
         用它表达"导进来还没转"会让这两种完全不同的状况在日志与列表里长得一模一样；
       * `imported` 只多一个词，却把语义说准了：**音频在、还没有文字**。
-        它同时也是转写**失败**之后的落点之一吗？不是 —— 转写失败仍走 `error`
-        （带真原因），`imported` 只表示"排着队等转写"。
+        （2026-10-16 用户口径之后它还有第二种到场方式：录音结束/重转时后端**连不上或没配**，
+        那一场也停在这一档 —— 见 `_mark_meeting_waiting`。两次的意思完全一样：
+        音频在盘上，缺的只是"这一次没有远端能把它转成文字"。）
+        它**不是**"引擎真的报错"的落点 —— 那种才走 `error`（带引擎原话）。
 
     面板侧同步加了这一档的文案（`web/app.js` / `web/meeting.html`：
-    「待转写」，徽章用 `idle` 色，不是红的）。**"已导入但转写没起来"仍然要看 `error`** ——
-    那一档才有原因，`imported` 只是排队。
+    「待转写」，徽章用 `idle` 色，不是红的）。**"转写没成"的原因**两种都要看得到：
+    引擎报错看 `error` 列；"连不上/没配/被许可挡住"看这一档的 `error` 文案
+    （`_waiting_text()` 那句"录音已完成，音频已保存…"）+ meta 里的原因词。
 
     ## 顺序：先全部转码成功，再建库记录 / 写 meta
 
@@ -4253,9 +4452,11 @@ def _import_meeting_locked(paths, *, title, start, notes, started_at, block_fram
         db.update_meeting(meeting_id, notes=str(notes).strip()[:2000])
     # 段数/时长/体积先写全（**转写之前**面板就能显示"29:37 · 3 段"），
     # 状态留给下一步：`imported` = 「待转写」。见函数头的状态说明。
+    # （2026-10-16 起同一个词也是**驻留**状态：后端连不上/没配时那一场停在"待转写"，
+    #   见 `_mark_meeting_waiting` —— 语义是同一个"音频在、还没有文字"。）
     db.update_meeting(meeting_id, ended_at=started_at, duration_seconds=duration,
                       segments=len(results), audio_bytes=audio_bytes,
-                      status="imported", error="")
+                      status=MEETING_STATUS_WAITING, error="")
 
     meta["segments"] = ["%02d.wav" % i for i in range(1, len(results) + 1)]
     try:
