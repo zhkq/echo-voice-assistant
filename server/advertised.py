@@ -57,6 +57,9 @@ FORM_NOTE = (
     "（本机客户端永远连得上，换网络、IP 变了都不受影响）；"
     "③ 同一台后端同时服务本机与远程 → **发码时各写各的**（本机 127.0.0.1、远程局域网 IP，"
     "配对串本身带 host，两张码互不影响），串里的 host 手改就能用。"
+    "④ **TLS 在反代/网关上终结**（后端自己是回环明文、没配 server.tls.certfile）→ "
+    "填**对外域名/IP**就行（远程地址的 scheme 默认就是 https）；想显式点就写 "
+    "`https://echoserver.example.com:8900`。"
     "不填则沿用自动探测（容器里探测到的会是 Docker 网桥地址，同事连不上）。"
 )
 
@@ -92,7 +95,12 @@ def _newest(store) -> dict:
 
 
 def normalize(raw: Any) -> str:
-    """归一化（唯一一份实现在 `ops`）。非法值 → `ValueError`（中文原因）。"""
+    """归一化（唯一一份实现在 `ops`）。非法值 → `ValueError`（中文原因）。
+
+    ⚠️ 它只出 `host[:port]`：**显式 https 要另外保留**（见 `parse`）——
+    写路径上丢掉那个 scheme，发码那条路就再也看不出"这是 TLS 部署"
+    （2026-10-16 缺口 2）。
+    """
     return ops_mod.normalize_advertised_host(raw)
 
 
@@ -181,7 +189,10 @@ def view(cfg, store=None) -> Dict[str, Any]:
                         "覆盖环境变量，重启后仍在（存在 state 卷的库里）。",
         "formNote": FORM_NOTE,
         "accepts": "主机名/IP、`IP:端口`、或 `http://IP:端口`（IPv6 要带方括号）；"
-                   "不写端口就用 server.listen 的端口；scheme 由 TLS 决定，别在这里写 https。",
+                   "**不写 scheme 时**：局域网/本机地址按 http、**远程地址按 https**"
+                   "（公网入口现在基本都是 https）；要发明文 http 的远程地址就显式写 "
+                   "`http://主机:端口`。TLS 在反代/网关上终结时这一项照填远程域名/IP 即可 "
+                   "（配对串里就是 https）；不写端口就用 server.listen 的端口。",
         "notes": priority_notes(cfg, store),
         "updatedAt": float(newest.get("updated_at") or 0.0),
         "updatedBy": str(newest.get("updated_by") or ""),
@@ -212,15 +223,41 @@ def parse(payload: Optional[dict]) -> str:
 
     不合法一律 400 + 中文原因（**不静默忽略**）—— 静默忽略正是这次要修的 bug 的形态：
     配置里写着什么，实际却在探测，而两者看起来都没错。
+
+    ## 显式 scheme 什么时候要**留下来**（2026-10-16 缺口 2）
+
+    `normalize()` 出的是 `host[:port]`，所以"同事访问我走 https / 我就是要明文"这两句话
+    在这里会被丢掉 —— 发出去的配对串就永远是按地址**推断**的那个 scheme。TLS 在**反代/网关**
+    那层终结时（后端自己是回环明文、`server.tls.certfile` 是空的）这是**唯一**能表达它的地方，
+    所以这里按"与推断结果不一致才保留"来补回去（`ops._published_scheme` 是同一套规则）：
+
+    * `https://…` → `https://host[:port]`（远程地址的推断本来就是 https，但**局域网**地址
+      写 https 是在推翻推断 —— 那是 TLS 在反代上终止、后端就在隔壁的部署）；
+    * `http://…` 而地址是**远程**的 → `http://host[:port]`（推断是 https，必须显式推翻，
+      否则"我就是要明文"会被静默改成 https）；
+    * `http://…` 而地址是局域网/本机 → 还是 `host[:port]`（推断就是 http，**老形状不变**，
+      有用例钉着）。
     """
     if not isinstance(payload, dict) or "value" not in payload:
         raise errors.bad_request(
-            "要带 value 字段（主机名/IP、`IP:端口` 或 `http://IP:端口`；空串 = 清空，"
-            "回到自动探测）")
+            "要带 value 字段（主机名/IP、`IP:端口` 或 `http://IP:端口`；"
+            "TLS 在反代上终结时也可以写 `https://IP:端口`；空串 = 清空，回到自动探测）")
+    raw = payload.get("value")
     try:
-        return normalize(payload.get("value"))
+        host = normalize(raw)
     except ValueError as exc:
         raise errors.bad_request("%s" % exc)
+    if not host:
+        return host
+    if ops_mod.says_https(raw):
+        return "https://" + host
+    if ops_mod.says_http(raw):
+        # 端口要先切掉再判"像不像局域网"（IPv6 带方括号时也一样按最后一个冒号切）。
+        head, sep, tail = host.rpartition(":")
+        host_only = head if (sep and tail.isdigit()) else host
+        if not ops_mod.looks_local_host(host_only):
+            return "http://" + host
+    return host
 
 
 def set_advertised(cfg, store, payload: Optional[dict], *, updated_by: str = "") -> str:

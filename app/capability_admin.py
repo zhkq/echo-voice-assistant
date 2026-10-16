@@ -566,19 +566,33 @@ def local_pair_view() -> Dict[str, Any]:
                 "expiresAt": 0.0, "message": str(e)}
 
 
-def set_base_url(base_url: str) -> tuple:
-    """**只改后端地址、不重新配对**（2026-10-13 用户要求）。
+def set_base_url(base_url: str, fingerprint: str = "") -> tuple:
+    """**只改后端地址、不重新配对**（2026-10-13 用户要求）。返回 `(ok, 一句话)`。
 
     场景：同一台后端换了个访问地址（IP → 域名、换网段、前面加反代）。重新配对要管理员
     再发一张一次性码，还会让服务端多出一条客户端记录 —— 而这里换的只是"去哪儿找它"。
 
-    **保留** `client_id` / `secret` / 证书固定（`cert_pem` / `cert_fingerprint`）：服务端
-    没变，凭据照旧有效（JWT 的 `sub` 就是 clientId）。如果新地址面对的其实是**另一台**
-    后端（或中间人），握手时会被证书固定挡住并如实报错 —— 那正是**不**顺手清掉证书的理由；
-    真换了后端就重新配对一次。
+    **保留** `client_id` / `secret`：服务端没变，凭据照旧有效（JWT 的 `sub` 就是 clientId）。
+    如果新地址面对的其实是**另一台**后端（或中间人），握手时会被证书固定挡住并如实报错 ——
+    那正是**不**顺手清掉证书的理由；真换了后端就重新配对一次。
 
-    `base_url` 只填 `域名:端口` 也行（`pairing.normalize_base_url` 会补 `http://`）；
-    要 https 就把 scheme 写全。
+    ## 顺序（2026-10-16 晚复盘后改的，这条是重点）
+
+    **先按新地址抓证书并校验，成功了才落地址**：
+
+      ① 归一化新地址（`fingerprint`= 配对串里的 `fp=`，给了就必须对上）；
+      ② `pairing.prepare_repin()` —— 取证书 + 校期望指纹，**一个字节都不写盘**；
+      ③ 只有 ② 成功，才把**地址与证书一次性**写进凭据（`cert_pem` / `cert_fingerprint`）。
+
+    改之前是"先落地址、再抓证书"：抓不到证书时地址已经变了、证书还是旧的 →
+    `ready=False`。**一次网络抖动就能把一台本来可用的机器改成不可用**，而且用户看到的
+    是一句含糊的失败。现在失败一律在 ③ 之前返回：**地址与凭据逐字未变**，那台机器
+    仍然连得上旧地址（这条判据由 `tests/test_capability_admin.py` 的
+    `AddressChangeIsAtomicTests` 钉着）。
+
+    `base_url` 只填 `域名:端口` 也行（`pairing.normalize_base_url` 会补 scheme）；
+    远程地址不带 scheme 时会沿用**凭据里已记着的那个 scheme**（= 公布时给的那个），
+    没有可继承的 scheme 就**报错**而不是静默按 http 连（2026-10-16 缺口 2）。
     """
     from app.capabilities import credentials, pairing
     try:
@@ -587,23 +601,44 @@ def set_base_url(base_url: str) -> tuple:
         return False, "读不到配对凭据：%s" % str(e)[:80]
     if creds is None or not (creds.client_id or creds.base_url):
         return False, "这台机器还没配对过 —— 先用配对码配一次，之后就能只改地址"
-    try:
-        url = pairing.normalize_base_url(base_url)
-    except pairing.PairingError as e:
-        return False, str(e)
-    except Exception as e:                                   # pragma: no cover - 兜底
-        return False, "地址认不出来：%s" % str(e)[:80]
-    if not url:
-        return False, "地址认不出来：填 `域名:端口` 或 `http(s)://域名:端口` 都行"
     old = str(creds.base_url or "")
-    if url == old:
-        return True, "地址没变（还是 %s）" % url
-    creds.base_url = url
+    # 失败时都要**如实告诉人"原来那台还在"**：这条修法的全部意义就是"一次抖动不该把
+    # 一台可用的机器改坏"，所以那句"地址没动"必须说出口（不然用户会以为已经改坏了）。
+    keep = ("（地址没动，还是 %s）" % old) if old else ""
     try:
-        credentials.save(creds)
+        url = pairing.normalize_base_url(base_url, scheme_hint=pairing.scheme_of(old))
+    except pairing.PairingError as e:
+        return False, "%s%s" % (e, keep)
     except Exception as e:                                   # pragma: no cover - 兜底
-        return False, "写凭据失败：%s" % str(e)[:120]
-    return True, "后端地址已改为 %s（凭据没动，不用重新配对）" % url
+        return False, "地址认不出来：%s%s" % (str(e)[:80], keep)
+    if not url:
+        return False, "地址认不出来：填 `域名:端口` 或 `http(s)://域名:端口` 都行%s" % keep
+    # ② **先抓证书**（含 `fp=` 期望指纹校验）。失败 → 直接返回，什么都不改。
+    try:
+        cert_pem, cert_fp, pin_note = pairing.prepare_repin(
+            url, old_base_url=old, cert_pem=str(getattr(creds, "cert_pem", "") or ""),
+            cert_fingerprint=fingerprint)
+    except pairing.PairingError as e:
+        return False, "%s%s" % (e, keep)
+    except Exception as e:                                   # pragma: no cover - 兜底
+        return False, "取证书时出了意外：%s%s" % (str(e)[:120], keep)
+    # ③ 成功了才提交（地址 + 证书**一次**写下去；没变化就不写盘）。
+    changed = url != old
+    if changed:
+        creds.base_url = url
+    if cert_pem:
+        creds.cert_pem = cert_pem
+        creds.cert_fingerprint = cert_fp
+    if changed or cert_pem:
+        try:
+            credentials.save(creds)
+        except Exception as e:                               # pragma: no cover - 兜底
+            return False, "写凭据失败：%s" % str(e)[:120]
+    message = ("后端地址已改为 %s（凭据没动，不用重新配对）" % url) if changed \
+        else ("地址没变（还是 %s）" % url)
+    if pin_note:
+        message = "%s；%s" % (message, pin_note)
+    return True, message
 
 
 def unpair() -> tuple:

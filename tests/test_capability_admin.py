@@ -717,5 +717,124 @@ class SetBaseUrlTests(unittest.TestCase):
         self.assertIn("没变", msg)
 
 
+class AddressChangeIsAtomicTests(_Isolated):
+    """改地址是"**先抓证书、成功才落地址**"（2026-10-16 晚复盘，A1 缺口 1 的修法版）。
+
+    复盘的原话是"**一次网络抖动就能把一台本来可用的机器改成不可用**"：旧顺序是
+    `set_base_url()` 落盘 → 再抓证书补 pin，于是抓证书失败时**地址已经改了、证书没有**
+    → `ready=False`。这一组钉的就是那条：失败时**旧地址与旧凭据逐字未变**，
+    而且**仍然连得上旧地址**（旧地址的桩还起着）；成功时地址与 pin 一起到位。
+
+    后端全是本机桩（`_Stub` 明文 / `_HttpsServer` 真 https 握手），**不碰公网**。
+    """
+
+    def _tls(self):
+        from tests.test_backend_tls import _HttpsServer
+        srv = _HttpsServer()
+        self.addCleanup(srv.stop)
+        return srv
+
+    def _paired_http(self):
+        s = self.stub([(200, _PAIR_OK)])
+        ok, msg = capability_admin.pair(s.url, "ABC123")
+        self.assertTrue(ok, msg)
+        return s
+
+    def _paired_https(self):
+        """先配对到一台**真 https** 后端（带 `fp=` 校验证书）—— 这是"能用的旧状态"。"""
+        from tests.tls_test_cert import CERT_PEM
+        srv = self._tls()
+        ok, msg = capability_admin.pair(srv.url, "ABC123",
+                                        cert_fingerprint=pairing.fingerprint_of(CERT_PEM))
+        self.assertTrue(ok, msg)
+        return srv
+
+    def _snapshot(self):
+        """凭据的**每一个字节**（用于"逐字未变"这条判据）。"""
+        c = cred.load()
+        self.assertIsNotNone(c)
+        return {"base_url": c.base_url, "client_id": c.client_id, "secret": c.secret,
+                "server_name": c.server_name, "cert_pem": c.cert_pem,
+                "cert_fingerprint": c.cert_fingerprint, "paired_at": c.paired_at}
+
+    def test_a_failed_certificate_fetch_changes_nothing_and_the_old_address_still_works(self):
+        """① 抓不到证书 → 400，**地址与凭据逐字未变**，旧地址仍然 `ready=True`。"""
+        srv = self._paired_https()
+        before = self._snapshot()
+        r = self.client.post("/api/capability/address",
+                             json={"base_url": "https://127.0.0.1:1"})      # 没人监听
+        self.assertEqual(r.status_code, 400, "抓不到证书不许当成功")
+        detail = r.json()["detail"]
+        self.assertIn("取证书", detail, detail)          # 原因要指得出是**证书**这件事
+        self.assertIn("127.0.0.1:1", detail)
+        self.assertEqual(self._snapshot(), before,
+                         "抓证书失败却动了地址/凭据 —— 那正是'一次抖动把可用机器改坏'")
+        # 旧地址仍然可用（桩还起着）：这一条才是"保持原来的可用状态"的判据
+        self.assertTrue(echo_server.EchoServerClient(base_url=before["base_url"]).ready(),
+                        "失败之后旧地址必须仍然可用")
+        self.assertTrue(srv.url == before["base_url"])
+
+    def test_a_failed_fetch_never_writes_the_credentials_file(self):
+        """① 的加强版：失败时**一次 `save` 都不许发生**（不是"先写再回滚"）。
+
+        "先写后回滚"能通过状态断言（最终值一样），但它留下的是一个真实存在的窗口：
+        那一刻磁盘上就是"地址已改、证书没补"的坏状态 —— 进程正好在这时崩掉/被杀，
+        用户就永久拿到了那台不可用的机器。所以这条按**写盘次数**判。
+        """
+        self._paired_https()
+        first = cred.load()
+        seen = []
+        real_save = cred.save
+        with mock.patch.object(cred, "save",
+                               lambda c: seen.append(c.base_url) or real_save(c)):
+            r = self.client.post("/api/capability/address",
+                                 json={"base_url": "https://127.0.0.1:1"})
+        self.assertEqual(r.status_code, 400, r.text)
+        self.assertEqual(seen, [], "抓证书失败时一个字节都不该写")
+        self.assertEqual(cred.load().base_url, first.base_url)
+
+    def test_a_successful_change_lands_the_address_and_the_certificate_together(self):
+        """② 成功时**地址与 pin 一起到位**（http → https，还带 `fp=`），身份一个字节不动。"""
+        from tests.tls_test_cert import CERT_PEM
+        self._paired_http()
+        before = self._snapshot()
+        srv = self._tls()
+        fp = pairing.fingerprint_of(CERT_PEM)
+        r = self.client.post("/api/capability/address",
+                             json={"base_url": srv.url, "fingerprint": fp})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertIn("证书固定下来", r.json()["message"], "补了证书就要说出来")
+        after = self._snapshot()
+        self.assertEqual(after["base_url"], srv.url)
+        self.assertEqual(after["cert_pem"].strip(), CERT_PEM.strip(), "证书没落盘")
+        self.assertEqual(after["cert_fingerprint"], fp)
+        self.assertEqual((after["client_id"], after["secret"], after["paired_at"]),
+                         (before["client_id"], before["secret"], before["paired_at"]),
+                         "换地址 ≠ 换身份：clientId/secret 不许动")
+        self.assertTrue(echo_server.EchoServerClient(base_url=after["base_url"]).ready(),
+                        "地址与 pin 都到位之后应当 ready=True")
+
+    def test_a_mismatched_fingerprint_is_a_400_and_the_old_state_is_kept(self):
+        """③ `fp=` 对不上 → 400（**可能是中间人**）+ 旧状态不变、旧地址仍可用。"""
+        from tests.tls_test_cert import OTHER_CERT_PEM
+        srv = self._paired_https()
+        before = self._snapshot()
+        r = self.client.post("/api/capability/address",
+                             json={"base_url": srv.url,
+                                   "fingerprint": pairing.fingerprint_of(OTHER_CERT_PEM)})
+        self.assertEqual(r.status_code, 400, "指纹对不上不许当成功")
+        self.assertIn("中间人", r.json()["detail"])
+        self.assertEqual(self._snapshot(), before, "指纹对不上却动了地址/凭据")
+        self.assertTrue(echo_server.EchoServerClient(base_url=before["base_url"]).ready())
+
+    def test_an_unparseable_address_is_a_400_and_changes_nothing(self):
+        """地址本身认不出来时也一样：先报错，**不动旧地址**（不写盘）。"""
+        self._paired_https()
+        before = self._snapshot()
+        r = self.client.post("/api/capability/address", json={"base_url": "ftp://x/y"})
+        self.assertEqual(r.status_code, 400, r.text)
+        self.assertEqual(self._snapshot(), before)
+
+
 if __name__ == "__main__":
     unittest.main()

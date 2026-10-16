@@ -369,35 +369,25 @@ def api_capability_address(body: SetAddressIn, _auth=Depends(optional_auth)):
     再发一张一次性码、服务端还会多一条客户端记录，没必要。
     **失败回 400 + 一句人话**（与 `/capability/pair` 同一形状）。
 
-    2026-10-16 补（真机缺口 1）：新地址是 https 而本地**没有对应证书**时，自动补一次
-    证书固定（`pairing.repin_for_address` → 与 `pair()` 同一段 `pin_certificate`）。
+    2026-10-16 上午补（真机缺口 1）：新地址是 https 而本地**没有对应证书**时，自动补一次
+    证书固定（`pairing.prepare_repin` → 与 `pair()` 同一段 `pin_certificate`）。
     不补的话 http→https 换过去立刻就是
-    `后端 配的是 https，但本机没有它的证书（缺 certPem）——拒绝连接`，而"补证书"
-    这件事**改地址这条路本来就该顺手做掉**：换地址 ≠ 换身份，clientId/secret/scopes/
-    hostId 全都原样保留（重新配对会换 clientId，中继 hostId 与手机侧地址一起废）。
+    `后端 配的是 https，但本机没有它的证书（缺 certPem）——拒绝连接`。
+
+    2026-10-16 晚（复盘 A1 的行为变化）：**顺序倒过来 —— 先按新地址抓证书并校验
+    （含 `fp=` 期望指纹），成功了才落地址**。原来"先落盘、再抓证书"的坏处是：
+    一次网络抖动（或指纹对不上）之后，地址已经变了、证书还是旧的 → `ready=False`
+    —— **把一台本来可用的机器改成不可用**。现在失败一律在这一步之前返回：
+    旧地址与旧凭据**逐字未变**，那台机器仍然连得上（判据见
+    `tests/test_capability_admin.py::AddressChangeIsAtomicTests`）。
     抓不到证书 / 指纹对不上时**如实回 400**（具体原因进 `detail`），绝不静默成功。
     """
     from app import capability_admin
-    from app.capabilities import credentials as cred_store, pairing
-    # 改之前的地址要留一份：判断"本地固定的那张证书还认得新地址吗"要比 host:port
-    # （`pairing.needs_repin` 第③条）。「地址没变」那条分支也靠它保持原样。
-    try:
-        before = cred_store.load()
-    except Exception:                                             # noqa: BLE001
-        before = None
-    ok, message = capability_admin.set_base_url(body.base_url)
+    # 归一化 → 抓证书 → 校期望指纹 → **一次性**写地址与证书，全在 `set_base_url` 里；
+    # 任何一步失败时它一个字节都不写（那时回 400 + 原因就够了，这里不做回滚）。
+    ok, message = capability_admin.set_base_url(body.base_url, body.fingerprint)
     if not ok:
         raise HTTPException(status_code=400, detail=message)
-    try:
-        pin_note = pairing.repin_for_address(getattr(before, "base_url", "") or "",
-                                             cert_fingerprint=body.fingerprint)
-    except pairing.PairingError as e:
-        # 地址已经改了、证书没补上：这台机器现在配的是 https 而没有它的证书，
-        # `usable.ready` 会是 False。**必须把具体原因交出去**（连不上取证书 / 指纹
-        # 对不上……），不许写一句"失败"了事 —— 那正是真机上没人知道原因的那一幕。
-        raise HTTPException(status_code=400, detail=str(e)) from None
-    if pin_note:
-        message = "%s；%s" % (message, pin_note)
     return {"ok": True, "message": message, "pair": capability_admin.pair_view()}
 
 

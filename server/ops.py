@@ -28,6 +28,7 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import re
 import ssl
 import time
@@ -119,6 +120,63 @@ def _probe_advertised(raw: str, tls: bool) -> tuple:
 _ADVERTISED_RE = re.compile(r"^(?P<host>\[[0-9A-Fa-f:.]+\]|[^\s:/\[\]]+)(?::(?P<port>\d+))?$")
 
 
+def says_https(raw: Any) -> bool:
+    """这一项是不是**显式写了 `https://`**（2026-10-16 缺口 2：发出去的串带不出 https）。
+
+    为什么要有它、以及它为什么不算"猜"：`server.advertised_host` / 每一次的
+    `advertised=` 是两个**人写的**字面量（管理面表单 / YAML / 环境变量 / 命令行）。
+    写下 `https://` 就是一句**声明**："同事访问我走的是 TLS"。
+
+    ⚠️ 它与"没配证书却按 https 发串"的风险是**两件事**：后者是**猜**（我们不干，见
+    `resolve_advertised` 的第 3 档），前者是**部署的人说的事实**；说错了的后果是
+    客户端连一次 https 失败（可见、可查），而不是静默走明文。
+    """
+    return str(raw or "").strip().lower().startswith("https://")
+
+
+def says_http(raw: Any) -> bool:
+    """这一项是不是**显式写了 `http://`**（= 声明"我就是明文口，别替我改成 https"）。
+
+    `https://` **不算**（它不以 `http://` 开头，前缀差一个 s）—— 两个判据互不重叠。
+    """
+    return str(raw or "").strip().lower().startswith("http://")
+
+
+#: 判"本机 / 局域网"用的三条（与客户端 `pairing.looks_local_host` **同一套判据**：
+#: 回环名、内网后缀、单标签主机名、以及私有/回环/链路本地/未指定的 IP 字面量）。
+#: ⚠️ 这里有一份**客户端侧的孪生实现** ——`server/` 是可以单独部署的那一半，不能 import
+#: 客户端（与 `cert_fingerprint` 同一个取舍）。两处是否一致由跨层用例
+#: `test_server_contract.PublishedSchemeForRemoteTests.test_it_agrees_with_the_client` 钉着。
+_LOCAL_HOSTNAMES = ("localhost", "ip6-localhost", "ip6-loopback")
+_LOCAL_HOST_SUFFIXES = (".local", ".localhost", ".lan", ".internal", ".home.arpa")
+
+
+def looks_local_host(host: Any) -> bool:
+    """这个主机名/IP 像不像"本机或局域网"？**纯判据：不联网、不查 DNS、不猜。**
+
+    用途只有一个：决定**公布出去的 scheme**（见 `resolve_advertised`）——
+    局域网/本机的后端就是明文 http（那条老用法一个字节都不改），而**远程**地址按 https
+    （公网入口现在基本都是 https；写明文的那台也会被客户端拒）。判据同客户端的孪生实现：
+
+      * 回环名（`localhost` 等）、`.local` / `.lan` 这类内网后缀；
+      * **单标签主机名**（`gpu-01`）—— 内网短名，公网 DNS 里不存在；
+      * IP 字面量落在回环 / 私有 / 链路本地 / 未指定网段。
+    """
+    h = str(host or "").strip().strip("[]").lower().rstrip(".")
+    if not h:
+        # 认不出主机名（占位符 / 残缺值）：**当成局域网**，按原来的 http 发，不新增一类失败。
+        return True
+    if h in _LOCAL_HOSTNAMES or h.endswith(_LOCAL_HOST_SUFFIXES):
+        return True
+    try:
+        ip = ipaddress.ip_address(h)
+    except ValueError:
+        ip = None
+    if ip is not None:
+        return bool(ip.is_loopback or ip.is_private or ip.is_link_local or ip.is_unspecified)
+    return "." not in h
+
+
 def normalize_advertised_host(raw: Any) -> str:
     """`"http://10.100.0.24:8900/"` → `"10.100.0.24:8900"`（**归一化，非法值抛错**）。
 
@@ -133,10 +191,14 @@ def normalize_advertised_host(raw: Any) -> str:
 
     ## 三条明确的行为（都不是"随手定的"）
 
-    1. **scheme 只被剥掉、不被采纳**。发出去的串用 `http` 还是 `https` **由 TLS 决定**
-       （`server.tls.certfile` 配了就是 https，见 `_probe_advertised`）。理由：让
-       `https://…` 在这里"提前生效"等于把 TLS 开关藏在地址串里 —— 那么
-       "填了 https 但没配证书"就会发出一个连不上的串，而现象看着像客户端坏了。
+    1. **scheme 只被剥掉、不被采纳**（`host[:port]` 是这个函数的输出格式）。
+       发出去的串用 `http` 还是 `https` 由 `resolve_advertised()` 按**三条**决定：
+       ① `server.tls.certfile` 配了 → https（服务端自己终结 TLS）；
+       ② 这一项**显式写了 scheme**（`says_https` / `says_http`）→ 就按写的那个
+       （TLS 在反代/网关上终结的部署靠它表达，见 2026-10-16 缺口 2）；
+       ③ 没写 → **局域网/本机按 http、远程地址按 https**（`looks_local_host`）。
+       ⚠️ 管理面那条写路径（`advertised.parse`）会把显式的 `https://` **保留**下来，
+       否则"填了 https"到这里已经看不出痕迹了。
     2. **空值返回空串**（= "没配"），**不是报错** —— 没配要走自动探测那条老路。
     3. **认不出来就抛 `ValueError`**（中文原因）。在配置里这是个手改的字面量：
        静默忽略会让人以为配了、其实还在探测（正是这次要修的 bug 的形态）。
@@ -185,26 +247,48 @@ def resolve_advertised(cfg, *, advertised: Any = None) -> tuple:
 
     ⚠️ 第 3 档**不许**改成"猜一个局域网 IP"：后端就跑在客户端这台机器上时
     （本机后端）那种猜法**必然猜错**（该给 `127.0.0.1`）。没配就如实说"这是探测到的"。
+
+    ## scheme 由谁决定（第 1、2 档）
+
+    * `server.tls.certfile` 配了 → `https`（服务端自己终结 TLS，**一以贯之**）；
+    * 否则**显式写了 scheme** → 就按写的那个（`says_https` / `says_http`）：
+      TLS 在反代/网关那层终结的部署靠它表达（真机现场：Caddy 占公网 8900 →
+      `127.0.0.1:8902` 明文），2026-10-16 之前这一档**表达不出来**（scheme 被剥掉），
+      于是发出去的串永远是 `http://…` —— 同事粘了就连明文口（被 Caddy 回 400）；
+    * 否则**按地址本身判**（`looks_local_host`）：局域网/本机（`10.x`、`192.168.x`、
+      `gpu-01`、`127.0.0.1`）→ `http`（**局域网明文那条老用法一个字都不改**）；
+      **远程地址（公网域名 / 公网 IP）→ `https`** —— 2026-10-16 缺口 2 的另一半：
+      公网入口现在基本都是 https，而"发一条 http 串给同事"只会让他连到明文口
+      （连不上、还看不出原因）。真要在公网发明文 http 的，显式写 `http://` 就行。
+
+    ⚠️ **第 3 档（自动探测）不套这条规则**：那时我们**不知道谁能访问到我们**
+    （容器里探测到的是 Docker 网桥地址），照旧按 TLS 决定，并在 `note` 里如实说
+    "这是探测到的、请换成同事能访问到的那台机器" —— 探测结果上加一层"远程就 https"
+    的推断，等于拿一个本来就不准的地址再猜一次 scheme。
     """
     tls = bool(str(cfg.get("server.tls.certfile", "") or ""))
     # 这一次的覆盖先过一遍同样的归一化（不合法**当场报错** —— 半路静默退回全局值
     # 会让发码的人以为"我指定了"，而串里其实是别的地址）。
     chosen = ""
+    published_raw = ""
     if advertised not in (None, ""):
+        published_raw = str(advertised)
         try:
             chosen = normalize_advertised_host(advertised)
         except ValueError as exc:
             raise errors.bad_request("这一次的对外地址不合法：%s" % exc)
     from_cfg = False
     if not chosen:
+        raw_cfg = cfg.get("server.advertised_host", "")
+        published_raw = str(raw_cfg or "")
         try:
-            chosen = normalize_advertised_host(cfg.get("server.advertised_host", ""))
+            chosen = normalize_advertised_host(raw_cfg)
         except ValueError as exc:
             raise errors.EchoError(
                 500, "config_invalid",
                 "server.advertised_host 配错了：%s。改成 主机名/IP、`IP:端口` 或 "
                 "`http://IP:端口`（IPv6 带方括号），或者留空让它自动探测。" % exc,
-                detail=str(cfg.get("server.advertised_host", "")))
+                detail=str(raw_cfg))
         from_cfg = bool(chosen)
     if not chosen:
         return _probe_advertised(str(cfg.get("server.listen", "") or ""), tls)
@@ -221,7 +305,19 @@ def resolve_advertised(cfg, *, advertised: Any = None) -> tuple:
             port = str(int(cfg.get("server.listen", "").rsplit(":", 1)[1]))
         except (IndexError, ValueError):
             port = "8900"                  # 与 `Config.port` 的兜底同一个值
-    return "%s://%s:%s" % ("https" if tls else "http", host, port), ""
+    scheme = _published_scheme(tls=tls, raw=published_raw, host=host)
+    return "%s://%s:%s" % (scheme, host, port), ""
+
+
+def _published_scheme(*, tls: bool, raw: str, host: str) -> str:
+    """公布的串用哪个 scheme（三条规则见 `resolve_advertised` 的说明，**只此一份**）。"""
+    if tls:
+        return "https"
+    if says_https(raw):
+        return "https"
+    if says_http(raw):
+        return "http"
+    return "http" if looks_local_host(host) else "https"
 
 
 def pairing_string(cfg, code: str, ttl_s: Optional[float] = None,

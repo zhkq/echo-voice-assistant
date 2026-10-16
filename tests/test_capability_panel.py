@@ -677,5 +677,78 @@ class BackendCardHasNoFlatProseTests(unittest.TestCase):
                          "那个状态 span 已从静态卡里删掉")
 
 
+class AddressFingerprintEntryTests(unittest.TestCase):
+    """「改地址」那格的**可选指纹**入口（2026-10-16 缺口 3：接口早就收 `fp=`，面板没地方填）。
+
+    为什么值得用静态断言钉：这一格是**用 JS 插进既有那一行**的（卡片在
+    `renderSettingsPanes()` 里是"存模板 + 放克隆"），所以它在浏览器里的错法全是**安静的**：
+    插重复了（两个输入框，`querySelector` 只命中第一个）、插到别处去了（改地址时读到空）、
+    克隆之后没了、"填了没用"（按钮没读它）。
+
+    另外两条更要紧：**文案必须如实**（它是安全控件 —— 填了防"中途被换成另一张证书"，
+    留空照旧可用但少一层保护；说反了比没有更坏），以及**配对串里的 `fp=` 要自动带过来**
+    （否则"配对时校验过、改地址时又变回 TOFU"）。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.js = _read("app.js")
+
+    def _fn(self, name):
+        body = self.js[self.js.index("function %s(" % name):]
+        return body[:body.index("\n}\n") + 3]
+
+    def _const(self, name):
+        body = self.js[self.js.index("const %s = " % name):]
+        return body[:body.index(";") + 1]
+
+    def test_the_box_is_created_inside_the_address_row(self):
+        body = self._fn("ensureCapPairFpBox")
+        self.assertIn("capPairHost", body, "要长在「地址」那一行里（它服务的是只改地址）")
+        self.assertIn("document.createElement", body)
+        self.assertIn("data-cap-pair-fp", body, "要有一个判重的锚（克隆/重绘只留一份）")
+        self.assertIn("querySelector", body)
+        self.assertIn("placeholder", body)
+
+    def test_it_is_re_created_on_every_rebind(self):
+        # 克隆出来的节点是模板的副本（模板里有就什么都不做）—— 所以每次接线都要补一次，
+        # 否则"克隆一次之后再重绘"那一格就没了（同一个坑 2026-10-09 在整张卡上踩过）。
+        self.assertIn("ensureCapPairFpBox()", self._fn("bindCapabilityCardControls"))
+
+    def test_the_copy_says_what_it_protects_and_what_leaving_it_empty_costs(self):
+        hint = self._const("CAP_PAIR_FP_HINT")
+        body = self._fn("ensureCapPairFpBox")
+        for token in ("可选", "另一张证书", "中间人", "留空", "照旧可用", "少"):
+            with self.subTest(token=token):
+                self.assertIn(token, hint, "指纹那格必须如实写清它防什么 / 留空会怎样")
+        self.assertIn("CAP_PAIR_FP_HINT", body, "那段话要真的挂到控件上（title）")
+        self.assertIn("可选", body)                 # placeholder 上也写着"可选"
+
+    def test_the_save_sends_the_fingerprint_and_matches_the_api_model(self):
+        from app.api import SetAddressIn
+        body = self._fn("doCapabilitySetAddr")
+        self.assertIn("capPairFpValue()", body, "「保存」要真的读那一格（填了不能用 = 白填）")
+        m = re.search(r"JSON\.stringify\(\{([^}]*)\}\)", body)
+        self.assertIsNotNone(m, "没找到改地址的载荷 —— 是不是改写法了？")
+        sent = set(re.findall(r"(\w+)\s*:", m.group(1)))
+        model = set(SetAddressIn.model_fields.keys())
+        self.assertEqual(sorted(sent - model), [],
+                         "面板送了模型没有的字段（拼错了？）：%s" % sorted(sent - model))
+        for must in ("base_url", "fingerprint"):
+            self.assertIn(must, sent, "改地址必须送 %s" % must)
+
+    def test_a_pairing_string_prefills_the_fingerprint_box(self):
+        body = self._fn("doCapabilityPair")
+        self.assertIn("parsed.fp", body)
+        self.assertIn("fpBox.value", body, "串里的 fp= 要自动带进那一格")
+        self.assertIn("ensureCapPairFpBox()", body)
+
+    def test_the_address_backfill_keeps_the_scheme(self):
+        """回填地址时**不许把 scheme 抹掉**：抹掉之后点「保存」就变回明文 http（缺口 2 的一半）。"""
+        body = self._fn("applyTranscribeSettingsVisibility")
+        self.assertIn("hostBox.value = pairBase", body)
+        self.assertNotIn('replace(/^https?:\\/\\//, "")', body)
+
+
 if __name__ == "__main__":
     unittest.main()

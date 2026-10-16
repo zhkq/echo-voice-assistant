@@ -511,5 +511,77 @@ class RealServerTests(_CredCase):
         self.assertTrue(c2.describe()["paired"])
 
 
+class SchemeIsNotSilentlyDowngradedTests(unittest.TestCase):
+    """没有 scheme 的地址：**局域网照旧 http，远程不再静默降级**（2026-10-16，缺口 2）。
+
+    缺口现场：公网入口是 `https://echoserver.zhkq.online:8900`（Caddy 终结 TLS），
+    而 `normalize_base_url` 见没有 scheme 就补 `http://` → 粘一个不带 scheme 的地址
+    就配到了**明文口**（真机上被 Caddy 回 400），而且完全看不出是这个原因。
+
+    口径（三条，正是这一组钉的东西）：
+
+      ① 局域网/本机（`192.168.x.x:8900`、`10.x`、`127.0.0.1`、`gpu-01`）→ 补 `http://`
+         —— **局域网明文那条老用法一个字都不改**；
+      ② 远程 + 显式 scheme → 用显式的（`https://…` 仍然是 `https://…`）；
+      ③ 远程 + 没有 scheme → **报错**（不猜：猜 https 会把真的跑明文 http 的公网后端连错，
+         而猜 http 就是缺口 2 本身）。唯一例外是**改地址**那条路能把"公布时给的那个 scheme"
+         当提示传进来（`scheme_hint`，见 `capability_admin.set_base_url`）。
+    """
+
+    def test_a_lan_plaintext_address_keeps_the_old_http_behaviour(self):
+        for raw in ("10.100.0.24:8900", "192.168.1.5:8900", "172.20.3.4:8900",
+                    "127.0.0.1:8900", "localhost:8900", "gpu-01:8900"):
+            with self.subTest(raw=raw):
+                self.assertEqual(pairing.normalize_base_url(raw), "http://" + raw,
+                                 "局域网明文那条老用法不许被打断")
+
+    def test_a_remote_address_with_an_explicit_scheme_is_kept_as_written(self):
+        self.assertEqual(pairing.normalize_base_url("https://echoserver.zhkq.online:8900"),
+                         "https://echoserver.zhkq.online:8900")
+        self.assertEqual(pairing.normalize_base_url("http://echoserver.zhkq.online:8900"),
+                         "http://echoserver.zhkq.online:8900",
+                         "显式写 http 的人是有意的（别替他改成 https）")
+
+    def test_a_remote_address_without_a_scheme_is_refused_not_downgraded(self):
+        for raw in ("echoserver.zhkq.online:8900", "221.216.62.2:8900"):
+            with self.subTest(raw=raw):
+                with self.assertRaises(PairingError) as ctx:
+                    pairing.normalize_base_url(raw)
+                text = str(ctx.exception)
+                self.assertEqual(ctx.exception.code, "bad_request")
+                self.assertIn("https://", text, text)      # 告诉人该怎么写
+                self.assertIn(raw, text, text)             # 指得出是哪个地址
+                self.assertIn("局域网", text, text)         # 说清判据（不是"我就是不给你连"）
+
+    def test_the_published_scheme_is_used_when_it_is_handed_in_as_a_hint(self):
+        """**改地址**那条路：沿用凭据里已记着的 scheme（= 公布时给的那个），不猜。"""
+        self.assertEqual(pairing.normalize_base_url("echoserver.zhkq.online:8900",
+                                                    scheme_hint="https"),
+                         "https://echoserver.zhkq.online:8900")
+        self.assertEqual(pairing.normalize_base_url("echoserver.zhkq.online:8900",
+                                                    scheme_hint="http"),
+                         "http://echoserver.zhkq.online:8900")
+        # 局域网那一档**不看提示**（老用法不被打断：内网后端就是明文 http）
+        self.assertEqual(pairing.normalize_base_url("192.168.1.5:8900",
+                                                    scheme_hint="https"),
+                         "http://192.168.1.5:8900")
+
+    def test_scheme_of_never_invents_a_scheme(self):
+        self.assertEqual(pairing.scheme_of("https://x:8900"), "https")
+        self.assertEqual(pairing.scheme_of("http://x:8900"), "http")
+        self.assertEqual(pairing.scheme_of("echoserver.zhkq.online:8900"), "",
+                         "没写就是没有 —— 由调用方决定怎么办，不在这里补")
+
+    def test_a_published_https_string_survives_the_whole_client_path(self):
+        """跨层：服务端公布 `https://…` → 面板解析出 host → 客户端归一化**还是 https**。
+
+        这三步各自都有用例，但"粘一整串过来"用的是三步连起来的那条路
+        （`parsePairString` 只是取值，所以等价于把 host 直接交给 `normalize_base_url`）。
+        """
+        self.assertEqual(
+            pairing.normalize_base_url("https://echoserver.zhkq.online:8900"),
+            "https://echoserver.zhkq.online:8900")
+
+
 if __name__ == "__main__":
     unittest.main()

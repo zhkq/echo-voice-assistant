@@ -66,8 +66,11 @@ DEFAULTS: Dict[str, Any] = {
         #
         # 接受格式（`ops.normalize_advertised_host` 归一化，非法值**报错不猜**）：
         #   `10.100.0.24` / `10.100.0.24:8900` / `http://10.100.0.24:8900` 都行
-        #   （scheme 会被剥掉；端口不写就用 `server.listen` 的端口）。TLS 开着时
-        #   scheme 一律由 TLS 决定 —— 所以这里**不要**写成 `https://…` 去"提前开 TLS"。
+        #   （端口不写就用 `server.listen` 的端口）。发出去的 scheme 按三条定
+        #   （`ops._published_scheme`，2026-10-16 缺口 2）：`server.tls.certfile` 配了 → https；
+        #   显式写了 `http://`/`https://` → 按写的那个；都没写 → **局域网/本机按 http
+        #   （老用法不变）、远程地址按 https**（公网入口现在基本都是 https，发明文串
+        #   只会让同事连到明文口；真要在公网发明文 http 就显式写 `http://`）。
         # 环境变量：`ECHO_ADVERTISED_HOST`（别名 `ECHO_PUBLIC_URL`，两者名字不同、
         # 含义一致；同时设时**前者优先**，并按 `priority_notes` 的口径如实提示）。
         "advertised_host": "",

@@ -3949,5 +3949,145 @@ class TlsConfigTests(unittest.TestCase):
         self.assertTrue(os.path.samefile(seen.get("ssl_keyfile", ""), key))
 
 
+class PublishedSchemeForRemoteTests(unittest.TestCase):
+    """**公布地址要能带出 https**（2026-10-16，缺口 2）。
+
+    缺口现场：公网入口 `https://echoserver.zhkq.online:8900` 由 **Caddy 终结 TLS**
+    （后端自己是 `127.0.0.1:8902` 的明文）→ `server.tls.certfile` 是**空的** →
+    以前不管管理面怎么填，发出去的串永远是 `host=http://…`：同事粘了就连到明文口
+    （真机上被 Caddy 回 400），要看 https 只能手填。
+
+    判据四条：
+
+      ① **显式写了 `https://` 就按 https 发**（那是部署的人说的事实：TLS 在反代上）；
+      ② **无 scheme 的远程地址也按 https 发**（真机上那一项填的就是
+         `echoserver.zhkq.online:8900` —— 不改这一个字就该拿到 https 串）；
+      ③ **局域网明文那条老用法一个字都不改**（`192.168.x.x` / `10.x` / `127.0.0.1` /
+         内网短名 → 还是 http；显式 `http://` 的远程地址也照写）；
+      ④ 服务端自己配了证书时**仍然一律 https**（与旧行为一致，不让文本盖过事实）。
+    """
+
+    def _cfg(self, advertised="", listen="0.0.0.0:8900", cert=""):
+        cfg = settings_mod.load()
+        cfg.raw["server"]["listen"] = listen
+        cfg.raw["server"]["advertised_host"] = advertised
+        cfg.raw["server"]["tls"] = {"certfile": cert, "keyfile": cert}
+        return cfg
+
+    def _cert_file(self):
+        from tests.tls_test_cert import CERT_PEM
+        tmp = tempfile.mkdtemp(prefix="echo-adv-https-")
+        path = os.path.join(tmp, "server.crt")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(CERT_PEM)
+        return path
+
+    def test_an_explicit_https_is_published_even_without_a_local_certificate(self):
+        cfg = self._cfg(advertised="https://echoserver.zhkq.online:8900")
+        got = ops_mod.pairing_string(cfg, "7K2M9QX4")
+        self.assertIn("host=https://echoserver.zhkq.online:8900&code=7K2M9QX4", got["url"])
+        self.assertEqual(got["note"], "", "配了地址就不该再有'这是探测到的'那句")
+
+    def test_a_remote_address_without_a_scheme_is_published_as_https(self):
+        """**真机上那一项就是这么填的**（`echoserver.zhkq.online:8900`）—— 一个字不改即得 https。
+
+        ⚠️ 用例里的 IP 必须是**真·公网**：`203.0.113.x`（TEST-NET-3）这类文档网段
+        `ipaddress.is_private` 是 **True**（它们本来就不可全局路由），会被判成"局域网"。
+        所以这里用 `8.8.8.8` / `221.216.62.2`。
+        """
+        for value in ("echoserver.zhkq.online:8900", "echoserver.zhkq.online",
+                      "8.8.8.8:8900", "221.216.62.2"):
+            with self.subTest(value=value):
+                got = ops_mod.pairing_string(self._cfg(advertised=value), "X")
+                self.assertIn("host=https://", got["url"], got["url"])
+
+    def test_a_remote_address_that_explicitly_says_http_stays_plain(self):
+        """显式 `http://` 是**声明**（真有一台公网明文后端）—— 不替它改成 https。"""
+        got = ops_mod.pairing_string(self._cfg(advertised="http://8.8.8.8:8900"), "X")
+        self.assertIn("host=http://8.8.8.8:8900&code=X", got["url"])
+
+    def test_a_bare_or_plain_http_value_still_publishes_http(self):
+        """**局域网明文那条老用法**：内网地址不带 scheme、或显式写 http，都还是 http。"""
+        for value in ("192.168.1.5:8900", "192.168.1.5", "http://192.168.1.5:8900",
+                      "10.100.0.24:8900", "172.20.3.4:8900", "127.0.0.1:8900",
+                      "gpu-01:8900"):
+            with self.subTest(value=value):
+                got = ops_mod.pairing_string(self._cfg(advertised=value), "X")
+                self.assertIn("host=http://", got["url"], got["url"])
+                self.assertNotIn("https://", got["url"], got["url"])
+
+    def test_a_local_certificate_still_wins(self):
+        """配了 `server.tls.certfile` → 一律 https（哪怕这一项写的是 http）。"""
+        cert = self._cert_file()
+        got = ops_mod.pairing_string(self._cfg(advertised="http://10.100.0.24", cert=cert), "X")
+        self.assertIn("host=https://10.100.0.24:8900&code=X", got["url"])
+
+    def test_the_probe_path_is_untouched(self):
+        """没配那一项时**不套"远程就 https"**：探测到的地址照旧按 TLS 决定。
+
+        理由：那时我们根本不知道谁能访问到我们（容器里探测到的是 Docker 网桥地址），
+        在一个本来就不准的地址上再叠一层 scheme 推断，等于猜两次。
+        """
+        cfg = self._cfg()                       # advertised 空 = 探测
+        with patch("socket.gethostbyname", lambda name: "8.8.8.8"):
+            got = ops_mod.pairing_string(cfg, "X")
+        self.assertIn("host=http://8.8.8.8:8900&code=X", got["url"])
+        self.assertIn("本机探测", got["note"])
+
+    def test_the_per_issue_override_can_be_https_too(self):
+        """同一台后端同时服务"本机（明文回环）"与"公网（https 反代）"—— 两张码各写各的。"""
+        cfg = self._cfg(advertised="127.0.0.1")
+        got = ops_mod.pairing_string(cfg, "X", advertised="https://echoserver.zhkq.online:8900")
+        self.assertIn("host=https://echoserver.zhkq.online:8900&code=X", got["url"])
+        self.assertIn("host=http://127.0.0.1:8900&code=X",
+                      ops_mod.pairing_string(cfg, "X")["url"], "全局那一项不许被顺手改掉")
+
+    def test_says_https_looks_only_for_a_leading_https_scheme(self):
+        for raw in ("https://x:8900", " HTTPS://X:8900 ", "https://10.100.0.24"):
+            with self.subTest(raw=raw):
+                self.assertTrue(ops_mod.says_https(raw))
+        for raw in ("", None, "http://x:8900", "x:8900", "10.100.0.24",
+                    "https:/x", "xhttps://y"):
+            with self.subTest(raw=raw):
+                self.assertFalse(ops_mod.says_https(raw))
+
+    def test_says_http_does_not_swallow_https(self):
+        for raw in ("http://x:8900", " HTTP://X ", "http://10.100.0.24"):
+            with self.subTest(raw=raw):
+                self.assertTrue(ops_mod.says_http(raw))
+        for raw in ("", None, "https://x:8900", "x:8900", "10.100.0.24"):
+            with self.subTest(raw=raw):
+                self.assertFalse(ops_mod.says_http(raw),
+                                 "`https://` 不能被判成显式 http（前缀差一个 s）")
+
+    def test_it_agrees_with_the_client_about_what_is_local(self):
+        """**跨层**：服务端这份"像不像局域网"的判据必须与客户端那份逐例一致。
+
+        两处实现（`server/` 不能 import 客户端，见 `cert_fingerprint` 的同一个取舍）
+        一旦漂开，症状是"服务端按 https 发、客户端按 http 收"这类**看不出原因**的
+        连不上 —— 所以拿一张表逐例比，而不是各测各的。
+        """
+        from app.capabilities import pairing as client_pairing
+        cases = ["127.0.0.1", "localhost", "::1", "10.100.0.24", "172.20.3.4",
+                 "192.168.1.5", "169.254.1.1", "fe80::1", "gpu-01", "nas.local",
+                 "echoserver.zhkq.online", "8.8.8.8", "221.216.62.2", ""]
+        for host in cases:
+            with self.subTest(host=host):
+                self.assertEqual(ops_mod.looks_local_host(host),
+                                 client_pairing.looks_local_host(host))
+
+    def test_the_published_host_survives_the_client_side_normalizer(self):
+        """跨层（**这一条才是缺口的判据**）：串里那个 host 交给客户端
+        `pairing.normalize_base_url` 之后仍然是 https —— 粘一整串过去，不再是明文。"""
+        from app.capabilities import pairing
+        for value in ("echoserver.zhkq.online:8900",           # 真机上那一项的原样写法
+                      "https://echoserver.zhkq.online:8900"):
+            with self.subTest(value=value):
+                url = ops_mod.pairing_string(self._cfg(advertised=value), "X")["url"]
+                host = url.split("host=", 1)[1].split("&", 1)[0]
+                self.assertEqual(pairing.normalize_base_url(host),
+                                 "https://echoserver.zhkq.online:8900")
+
+
 if __name__ == "__main__":
     unittest.main()

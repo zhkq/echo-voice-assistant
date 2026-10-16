@@ -2497,5 +2497,78 @@ class AdminCliTests(unittest.TestCase):
                 self.assertEqual(self._stored(), "")
 
 
+class AdvertisedHostHttpsTests(_AdminCase):
+    """TLS 在**反代/网关**上终结时，管理面那格要能写 `https://…` 并真的带进配对串。
+
+    2026-10-16 缺口 2 的真机现场就是这一档：公网 8900 由 Caddy 终结 TLS，后端自己是
+    `127.0.0.1:8902` 的明文（`server.tls.certfile` 是空的）—— 于是"同事走 https"这句话
+    **只有管理面这一项能表达**，而旧实现把它剥掉了（`parse` 归一化成 `host[:port]`），
+    发出去的串永远是明文 http。
+
+    判据两条：① 显式 `https://` 存下来、发出去、`value` 里看得到；
+    ② **明文那一档一个字都不改**（`http://…` 仍然存成不带 scheme 的老形状）。
+    """
+
+    def _view(self):
+        r = self.ac.get("/admin/api/advertised-host")
+        self.assertEqual(r.status_code, 200, r.text)
+        return r.json()
+
+    def _save(self, value):
+        return self.wpost("/admin/api/advertised-host", {"value": value})
+
+    def _issue(self):
+        return self.wpost("/admin/api/pairing-codes", {"name": "cli-x", "scopes": "asr"})
+
+    def test_an_explicit_https_is_saved_and_published(self):
+        self.login()
+        r = self._save("https://echoserver.zhkq.online:8900")
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["saved"], "https://echoserver.zhkq.online:8900")
+        self.assertEqual(self._view()["value"], "https://echoserver.zhkq.online:8900",
+                         "把 https 剥掉 = 这一项就再也表达不出'TLS 在反代上'")
+        url = self._issue().json()["pairingCode"]["url"]
+        self.assertIn("host=https://echoserver.zhkq.online:8900&code=", url,
+                      "配对串里必须带 https —— 那才是'粘贴即得 https'")
+
+    def test_the_plain_http_value_keeps_its_old_stored_shape(self):
+        """明文那一档（局域网/本机后端）**逐字不变**：不写 scheme 的 `http://` 照样被归一化掉。"""
+        self.login()
+        self.assertEqual(self._save("http://10.100.0.24:8900").status_code, 200)
+        self.assertEqual(self._view()["value"], "10.100.0.24:8900")
+        self.assertIn("host=http://10.100.0.24:8900&code=",
+                      self._issue().json()["pairingCode"]["url"])
+
+    def test_an_explicit_http_on_a_remote_host_is_kept(self):
+        """**远程 + 显式 `http://`** 要留着：那是"我就是要明文口"的声明。
+
+        不留的话就会被推断改成 https（远程默认 https），于是"我说的话被静默改成反面"——
+        那正是这一轮要修的那类 bug 的形状。
+        """
+        self.login()
+        self.assertEqual(self._save("http://8.8.8.8:8900").status_code, 200)
+        self.assertEqual(self._view()["value"], "http://8.8.8.8:8900")
+        self.assertIn("host=http://8.8.8.8:8900&code=",
+                      self._issue().json()["pairingCode"]["url"])
+
+    def test_a_bare_remote_host_is_published_as_https(self):
+        """真机上那一项的原样写法（**不带 scheme**）现在就该得到 https 串。"""
+        self.login()
+        self.assertEqual(self._save("echoserver.zhkq.online:8900").status_code, 200)
+        self.assertEqual(self._view()["value"], "echoserver.zhkq.online:8900")
+        self.assertIn("host=https://echoserver.zhkq.online:8900&code=",
+                      self._issue().json()["pairingCode"]["url"])
+
+    def test_the_saved_https_survives_a_restart(self):
+        """重启后仍在（管理面配的值存在 state 卷）—— 而且**还是 https**。"""
+        self.login()
+        self.assertEqual(self._save("https://echoserver.zhkq.online:8900").status_code, 200)
+        reopened = store_mod.Store(self.cfg.get("auth.db"))
+        self.addCleanup(reopened.close)
+        fresh = settings_mod.load()
+        self.assertEqual(advertised_mod.apply_stored(fresh, reopened),
+                         {"advertised_host": "https://echoserver.zhkq.online:8900"})
+
+
 if __name__ == "__main__":
     unittest.main()

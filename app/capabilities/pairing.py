@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import ipaddress
 import json
 import os
 import socket
@@ -167,22 +168,111 @@ def pinned_context(cert_pem: str, *, what: str = "后端"):
 
 # ---------------------------------------------------------------- 地址
 
-def normalize_base_url(url: str) -> str:
+#: 「不带 scheme 时按**明文 http** 处理」这条老路只留给这些主机名（见 `looks_local_host`）。
+_LOCAL_HOSTNAMES = ("localhost", "ip6-localhost", "ip6-loopback")
+
+#: 同上的域名后缀：mDNS / 内网保留后缀。它们**必然在局域网里**，公网 CA 也不会签它们。
+_LOCAL_HOST_SUFFIXES = (".local", ".localhost", ".lan", ".internal", ".home.arpa")
+
+
+def looks_local_host(host: str) -> bool:
+    """这个主机名/IP 像不像"本机或局域网"？**纯判据：不联网、不查 DNS、不猜。**
+
+    2026-10-16（缺口 2）为什么需要它：`echo://pair?host=…` 里那个地址**从来都带 scheme**
+    （服务端 `ops.pairing_string` 拼的），但"手填一个域名:端口"那条路以前一律补 `http://`
+    —— 公网入口已经是 https 时，粘/填一个不带 scheme 的地址就会连到**明文口**
+    （真机上被 Caddy 回 400），而且看不出是这个原因。修法是：**只有确实像局域网/本机的地址**
+    才继续按 http 容错，其余的不再猜（见 `normalize_base_url`）。
+
+    判据（任何一条成立即算"局域网/本机"）：
+      * 回环名（`localhost` 等）、`.local` / `.lan` 这类内网后缀；
+      * **单标签主机名**（`gpu-01`）—— 内网短名，公网 DNS 里不存在；
+      * IP 字面量落在回环 / 私有 / 链路本地 / 未指定网段（`10.x`、`172.16-31.x`、
+        `192.168.x`、`127.x`、`169.254.x`、`::1`、`fe80::/10`、docker 网桥……）。
+    """
+    h = str(host or "").strip().strip("[]").lower().rstrip(".")
+    if not h:
+        # 认不出主机名：交给后面的 netloc 校验去报错，这里不算"远程"（不新增一类失败）。
+        return True
+    if h in _LOCAL_HOSTNAMES or h.endswith(_LOCAL_HOST_SUFFIXES):
+        return True
+    try:
+        ip = ipaddress.ip_address(h)
+    except ValueError:
+        ip = None
+    if ip is not None:
+        return bool(ip.is_loopback or ip.is_private or ip.is_link_local or ip.is_unspecified)
+    # 单标签（内部没有点）= 内网短名。**故意不查 DNS**：部署期的机器常常还没解析，
+    # 而"查不到"绝不能变成"那就当它安全/不安全"。
+    return "." not in h
+
+
+def scheme_of(url: str) -> str:
+    """这个地址写的什么 scheme（`http` / `https` / `""`）—— **不补齐、不猜**。
+
+    ⚠️ 只认这两个，别的一律返回空串：`urlsplit("echoserver.zhkq.online:8900").scheme`
+    是 **`echoserver.zhkq.online`**（那串冒号让它以为前面是 scheme）—— 照着返回，
+    "改地址"那条路就会把一个域名当成 scheme 传下去（于是永远拼不出正确的地址）。
+
+    "改地址"那条路用它把**已配对凭据里那个 scheme**当作提示传下去
+    （见 `normalize_base_url(scheme_hint=)`）：换 IP/域名不等于换 scheme，
+    而手输的新地址往往不带 scheme（面板回填的也是）—— 那时该沿用**公布时给的那个**。
+    """
+    try:
+        got = urllib.parse.urlsplit(str(url or "")).scheme.strip().lower()
+    except Exception:                                          # pragma: no cover - 兜底
+        return ""
+    return got if got in ("http", "https") else ""
+
+
+def normalize_base_url(url: str, *, scheme_hint: str = "") -> str:
     """把用户填的地址规整成 `scheme://host[:port]`（去掉尾斜杠）。
 
-    顺手接受"只填了个 IP:端口"这种最常见的手滑 —— 面板上那个输入框，
-    用户十有八九填 `10.100.0.24:8900`。报错比容错更让人烦，而这里的容错**不会猜错**：
-    没有 scheme 就补 `http://`，服务端跑 https 的人本来就会把 `https://` 写全。
+    ## 没有 scheme 时怎么办（2026-10-16 改的口径，缺口 2）
+
+    | 主机看起来是 | 结果 | 为什么 |
+    |---|---|---|
+    | 本机 / 局域网（`10.100.0.24:8900`、`gpu-01:8900`、`127.0.0.1:8900`） | 补 `http://` | **老用法一个字都不改**：局域网明文后端（还有本机后端）靠的就是它 |
+    | 远程（公网域名 / 公网 IP）+ 有 `scheme_hint` | 用 `scheme_hint` | 那就是**公布时给的那个 scheme**（已配对凭据里记着），不是现猜的 |
+    | 远程 + 没有 hint | **抛 `PairingError`** | 静默补 `http://` 正是缺口 2 那个 bug：公网入口是 https 时连到明文口，现象是"连不上/400" |
+
+    ⚠️ **为什么不"远程就默认 https"**：那是拿猜测换安全 —— 一台真的在公网上跑明文 http 的
+    后端会被我们连错（而且错误现象与"它挂了"一样）。**宁可不猜**：要么地址里写全，
+    要么用管理员给的整串（那串里的 scheme 是权威的）。文案里直接说清怎么改。
+
+    ⚠️ **与服务端"公布"那侧的口径不同，是有意的**：`server/ops.py::_published_scheme`
+    对**远程公布的地址**默认按 https 发（那是它知道自己的部署形态、而且是在"告诉别人
+    怎么连"）；客户端这一侧手里只有一串人输进来的字，猜错就是把音频发到明文口或连不上 ——
+    所以这里要么有 scheme、要么有凭据里记着的 `scheme_hint`、要么报错。
     """
     text = str(url or "").strip().rstrip("/")
     if not text:
         return ""
     if "://" not in text:
-        text = "http://" + text
+        text = _scheme_for_bare_address(text, raw=url, scheme_hint=scheme_hint) + "://" + text
     parts = urllib.parse.urlsplit(text)
     if parts.scheme not in ("http", "https") or not parts.netloc:
         raise PairingError("地址要写成 http(s)://主机:端口，收到的是 %r" % url)
     return "%s://%s" % (parts.scheme, parts.netloc)
+
+
+def _scheme_for_bare_address(text: str, *, raw: str, scheme_hint: str = "") -> str:
+    """没有 scheme 的地址该按哪个 scheme 走（`normalize_base_url` 的那张表）。"""
+    try:
+        host = urllib.parse.urlsplit("//" + text).hostname or ""
+    except ValueError:                                         # pragma: no cover - 兜底
+        host = ""
+    if looks_local_host(host):
+        return "http"
+    hint = str(scheme_hint or "").strip().lower()
+    if hint in ("http", "https"):
+        return hint
+    raise PairingError(
+        "这个地址看起来在**别的机器上**（不是局域网/本机地址），而它没写 scheme，"
+        "所以我不替它猜：%r。请写成 `https://主机:端口`——公网入口现在基本都是 https"
+        "（按明文 http 连会被拒，而且看不出是这个原因）；确实是明文 http 就显式写 "
+        "`http://`。也可以直接粘管理员给的整串 `echo://pair?host=…&code=…`，"
+        "那串里的 scheme 是权威的。" % (raw,), code="bad_request")
 
 
 # ---------------------------------------------------------------- HTTP
@@ -354,6 +444,11 @@ def pair(base_url: str, code: str, client_name: str = "", *,
 # （`fetch_cert_pem` → `fingerprint_of` → `credentials.save`）手工补的 pin ——
 # 也就是说这件事**只差接一根线**：改地址这条路本来就该顺手把证书补上。
 #
+# 而 2026-10-16 晚的复盘又指出：当时那根线是接在"**先落地址、后抓证书**"上的 ——
+# 一次网络抖动就会留下一台"地址已改、证书还是旧的"的机器（`ready=False`）。
+# 现在的分工是：`prepare_repin()`（先抓证书，**不写盘**）+ `capability_admin.set_base_url()`
+# （成功后**一次性**把地址与证书写下去）；`repin_for_address()` 只剩排障与既有用例在用。
+#
 # 为什么不能"顺手重新配对一次"：重新配对要管理员再发一张一次性码，而且会**换掉
 # clientId**（服务端多一条客户端记录；中继的 hostId 取自 clientId，手机侧地址跟着一起废）。
 # 换地址 ≠ 换身份，clientId/secret/scopes/hostId 必须一个字节都不动。
@@ -396,13 +491,41 @@ def needs_repin(base_url: str, cert_pem: str, *, old_base_url: str = "",
         return True
 
 
+def prepare_repin(url: str, *, old_base_url: str = "", cert_pem: str = "",
+                  cert_fingerprint: str = "",
+                  timeout: float = PAIR_TIMEOUT_S) -> Tuple[str, str, str]:
+    """**落地址之前**先做"要不要 / 能不能固定证书"这一步：返回 `(证书 PEM, 指纹, 一句话)`。
+
+    调用点：`capability_admin.set_base_url()`（= `POST /api/capability/address`）。
+    它必须在**写盘之前**调这里 —— 2026-10-16 复盘那条"一次网络抖动就能把一台本来可用的
+    机器改成不可用"（A1 的缺口 1 修法版）：改了地址才去抓证书，抓不到时地址已经变了、
+    证书还是旧的 → `ready=False`。现在顺序倒过来：**先抓证书 + 校期望指纹，成功了才落地址**；
+    这里失败就抛（调用方原样保留旧地址与旧凭据，那台机器仍然可用）。
+
+    ⚠️ **它一个字节都不写盘**（`credentials.save` 由调用方在成功后一次性做）——
+    这是"先抓证书、成功才落地址"能成立的前提。"抓证书 + 校指纹"这件事只有
+    `pin_certificate` 一份实现（`pair()` 与这里共用），别在别处再写一遍。
+
+    不需要补时返回 `("", "", "")`：三个都空 = 什么都没做、也没什么要说。
+    """
+    if not needs_repin(url, cert_pem, old_base_url=old_base_url,
+                       cert_fingerprint=cert_fingerprint):
+        return "", "", ""
+    cert, fp = pin_certificate(url, timeout=timeout, cert_fingerprint=cert_fingerprint)
+    return cert, fp, ("已把 %s 的证书固定下来（%s）—— clientId/secret 一个字节都没动"
+                      % (url, fp))
+
+
 def repin_for_address(old_base_url: str = "", *, cert_fingerprint: str = "",
                       timeout: float = PAIR_TIMEOUT_S, save: bool = True) -> str:
-    """改完地址之后补一次证书固定：**返回一句人话**（没做事 = 空串）；失败就抛。
+    """按**凭据里已经记着的地址**补一次证书固定：**返回一句人话**（没做事 = 空串）；失败就抛。
 
-    调用点只有一个：`POST /api/capability/address`（`app/api.py`）。它必须走
-    `pin_certificate()` —— 与 `pair()` **同一段实现**，于是"配对时固定下来的那张"
-    与"改地址时补上的那张"是同一件东西，不会出现两套语义。
+    这是 2026-10-16 上午那条修法的入口（当时是"先 `set_base_url()` 落盘、再补 pin"）。
+    ⚠️ **产品那条路（`POST /api/capability/address`）现在走 `prepare_repin` + 一次性提交**
+    ——"先落地址、后抓证书"的顺序本身就是那次复盘的病灶，别再把它接回产品路。
+    这个入口留着有两个正当用途：① 排障/脚本里"地址已经变了，把证书补上"；
+    ② `tests/test_backend_tls.py::AddressChangeRepinTests` 钉着的那套判据。
+    两处共用 `needs_repin`（要不要补）与 `pin_certificate`（怎么补），没有第二份实现。
 
     为什么失败要**抛**而不是静默：https 而本地没有对应证书 = 这台机器现在**用不了**
     这个后端（`usable.ready=False`）。静默过去，用户得到的是一句含糊的"改好了"，
@@ -418,16 +541,15 @@ def repin_for_address(old_base_url: str = "", *, cert_fingerprint: str = "",
         url = normalize_base_url(c.base_url)
     except PairingError:
         return ""                       # 地址本身认不出来 → 没有"补证书"可谈
-    if not needs_repin(url, c.cert_pem, old_base_url=old_base_url,
-                       cert_fingerprint=cert_fingerprint):
+    cert, fp, note = prepare_repin(url, old_base_url=old_base_url, cert_pem=c.cert_pem,
+                                   cert_fingerprint=cert_fingerprint, timeout=timeout)
+    if not note:
         return ""
-    cert_pem, fp = pin_certificate(url, timeout=timeout,
-                                   cert_fingerprint=cert_fingerprint)
-    c.cert_pem = cert_pem
+    c.cert_pem = cert
     c.cert_fingerprint = fp
     if save:
         cred.save(c)
-    return "已把 %s 的证书固定下来（%s）—— clientId/secret 一个字节都没动" % (url, fp)
+    return note
 
 
 def unpair() -> bool:

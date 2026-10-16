@@ -2913,12 +2913,63 @@ function parsePairString(text) {
   return out;
 }
 
+/** 「改地址」旁边的**可选指纹**输入框（2026-10-16 缺口 3）。
+ *
+ * 接口（`SetAddressIn.fingerprint`）早就收配对串里那个 `fp=sha256:…`，但面板**没有地方填**
+ * —— 于是"防中间人"那层能力在界面上等于没接上（能填才谈得上用）。
+ *
+ * ⚠️ 控件是**用 JS 插进既有那一行**的（不动 `index.html`）：卡片在
+ * `renderSettingsPanes()` 里是"存模板 + 放克隆"，所以插之前先看行里有没有
+ * （`data-cap-pair-fp`），克隆/重绘多少次都只有一份。
+ *
+ * 文案**如实**（安全控件上说反了比没有更坏）：填了 → 必须与服务端证书指纹一致，对不上
+ * 直接拒（防的正是"中途被换成另一张证书"）；留空 → 不带指纹，**照旧可用**，只是少这一层
+ * 保护（第一次见谁信谁 = TOFU）。所以 placeholder 写「可选」，title 两件事都写全。 */
+const CAP_PAIR_FP_HINT = "可选：配对串里的 fp=sha256:…。填了就按它校验证书 —— "
+  + "中途被换成另一张证书（中间人）时会直接拒绝；留空 = 不带指纹，照旧可用，"
+  + "但少了这一层保护（第一次见谁信谁）。";
+
+function capPairFpBox() {
+  return document.querySelector("[data-cap-pair-fp]");
+}
+
+/** 那一格里现在填着的指纹（没有那一格 = 空串，绝不编一个）。 */
+function capPairFpValue() {
+  const box = capPairFpBox();
+  return box ? String(box.value || "").trim() : "";
+}
+
+/** 把指纹格放进「地址」那一行（`#capPairHost` 的兄弟）—— 它服务的正是"只改地址"。 */
+function ensureCapPairFpBox() {
+  const hostBox = $("#capPairHost");
+  const row = hostBox ? hostBox.parentNode : null;
+  if (!row) return null;
+  const have = row.querySelector("[data-cap-pair-fp]");
+  if (have) return have;
+  const box = document.createElement("input");
+  box.type = "text";
+  box.className = "ctl";
+  box.spellcheck = false;
+  box.setAttribute("data-cap-pair-fp", "1");
+  box.placeholder = "证书指纹（可选）";
+  box.title = CAP_PAIR_FP_HINT;
+  box.setAttribute("aria-label", "证书指纹（可选）：填了防证书被掉包，留空则少一层保护");
+  box.style.maxWidth = "150px";
+  row.appendChild(box);
+  return box;
+}
+
 async function doCapabilitySetAddr() {
   const raw = (($("#capPairHost") || {}).value || "").trim();
-  if (!raw) { toast("先在上面的地址格里填后端地址（例如 echoserver.zhkq.online:8900）"); return; }
+  if (!raw) {
+    toast("先在上面的地址格里填后端地址：局域网写 192.168.x.x:8900，"
+      + "公网/反代写 https://主机:端口", 8000);
+    return;
+  }
+  const fp = capPairFpValue();                 // 可选：填了就必须与服务端证书对上
   try {
     const r = await api("/api/capability/address", {
-      method: "POST", body: JSON.stringify({ base_url: raw }),
+      method: "POST", body: JSON.stringify({ base_url: raw, fingerprint: fp }),
     });
     toast(r.message || "地址已改", 6000);
     await loadCapabilityRouting(true);
@@ -2937,7 +2988,12 @@ async function doCapabilityPair() {
   // 兼容"有人把普通地址填在配对串那一格"的老习惯。
   const url = parsed ? parsed.url : (hostBox || raw);
   const code = (parsed && parsed.code) ? parsed.code : boxCode;
-  const fp = parsed ? parsed.fp : "";
+  // 配对串里的 `fp=` **自动带进旁边那格指纹**（2026-10-16 缺口 3）：串里带指纹时配对就已经
+  // 校验过证书了，把它留在界面上，随后点「保存」（只改地址）也带着同一层保护 ——
+  // 否则人会以为"配对时校验过了"，改地址那一步却又变回 TOFU。
+  const fpBox = ensureCapPairFpBox();
+  if (parsed && parsed.fp && fpBox) fpBox.value = parsed.fp;
+  const fp = (parsed && parsed.fp) ? parsed.fp : capPairFpValue();
   const state = $("#capPairState");
   if (!url) { toast(parsed ? "配对串里没有 host —— 让管理员重发一张" : "先填后端地址"); return; }
   if (!code) { toast("先填配对码"); return; }
@@ -3252,6 +3308,9 @@ function bindCapabilityCardControls() {
   if (btnPairLocal) btnPairLocal.addEventListener("click", doCapabilityPairLocal);
   const btnUnpair = $("#btnCapUnpair");
   if (btnUnpair) btnUnpair.addEventListener("click", doCapabilityUnpair);
+  // 指纹格是**加在既有那一行里的控件**，所以每次接线时补一次（克隆出来的新节点上没有它，
+  // 而克隆的模板里已经有它时这里什么也不做 —— `ensureCapPairFpBox` 自己判重）。
+  ensureCapPairFpBox();
   // `#btnCapRouteSave` 不再有了：那几行设置已经收进「会议转写服务」卡，随页签顶部的「保存」落库
   const btnProbe = $("#btnCapRouteProbe");
   if (btnProbe) btnProbe.addEventListener("click", () => loadCapabilityRouting(true));
@@ -3622,11 +3681,12 @@ function applyTranscribeSettingsVisibility(explicit) {
   const bPair = $("#btnCapPair"), bUnpair = $("#btnCapUnpair");
   if (bPair) bPair.classList.toggle("hidden", paired);
   if (bUnpair) bUnpair.classList.toggle("hidden", !paired);
-  // 配对之后**地址行回填后端地址**（`#capPairHost`，只填空的，不覆盖用户正在输的）；
-  // `后端地址`（`capabilityEchoServerUrl`）那一栏同步展示配对到的网址:端口 —— **只展示**。
+  // 配对之后**地址行回填后端地址**（`#capPairHost`，只填空的，不覆盖用户正在输的）。
+  // ⚠️ 回填时**连 scheme 一起带上**（2026-10-16 缺口 2）：以前这里把 `https://` 抹掉、
+  // 只回填 `主机:端口`，再点「保存」就会被当成明文 http —— 那是这个缺口在面板上的那一半。
   const hostBox = $("#capPairHost");
   if (hostBox && pairBase && !hostBox.value) {
-    hostBox.value = pairBase.replace(/^https?:\/\//, "");
+    hostBox.value = pairBase;
   }
   // 2026-10-13 用户要求：**只改地址、不重新配对** —— 配对后多一个「改地址」按钮
   // （它把上面那一格的值写进配对凭据的 base_url，clientId/secret 一个字节都不动）。
