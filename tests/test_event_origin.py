@@ -186,9 +186,18 @@ class EventOriginTests(unittest.TestCase):
         # 进程级设置缓存要**按真实库重建后**再交出去（不能留空）：
         # `settings._cache` 是进程级的，而本类把它按**临时库**读满过（测试要 `apiAuthEnabled`
         # 是默认的 False 才能不带令牌打接口）。留空的话，下一个模块的第一次读会按**它自己的
-        # 临时库**重建 —— `tests/test_events_feed.py::test_it_needs_a_token` 依赖"缓存里是
-        # **本机真实**的 `apiAuthEnabled=true`"（它没清缓存，是既有写法），于是会红。
-        # 这里恢复的正是"没跑过本类"时的状态：缓存已按**真实库**填好。
+        # 临时库**重建。
+        #
+        # 【2026-10-16 已根治，留话给后人】这里原来还写着"`tests/test_events_feed.py`
+        # ::test_it_needs_a_token` 依赖缓存里是**本机真实**的 `apiAuthEnabled=true`，
+        # 于是会红"—— 那个耦合**已经修掉了**：那条用例现在在 `setUp` 里自己清缓存、
+        # 往自己的临时库写死 `apiAuthEnabled=True`（`settings._drop_cache()` +
+        # `db.set_setting("apiAuthEnabled", True)`），不再吃任何模块留下的状态。
+        # 所以下面这段"按真实库重建"**不再是替别人擦屁股**，它的意义只剩两条：
+        #   ① 本类自己按临时库读满过，交出去之前必须丢掉（同 `tests/test_model_cleanup.py`
+        #      的"读方自保"），否则临时库的值会漏给下一个模块；
+        #   ② 丢完顺手重建一次，让交出去的状态与"没跑过本类"时**一致**（省得靠
+        #      "下一个模块自己会不会清"来保证正确性）。
         settings._cache = None
         try:
             settings.get("apiAuthEnabled")
