@@ -1153,13 +1153,143 @@ $("#btnRegenSummary").addEventListener("click", async () => {
 $("#btnClose").addEventListener("click", () => window.close());
 $("#btnTitleEdit").addEventListener("click", editTitle);
 
-/* ---------- 离线 HTML 导出 ---------- */
+/* ---------- 离线 HTML 导出 ----------
+
+   2026-10-16 用户原话："会议纪要离线保存的时候文件名改写一下把标题带上，如果没有完成纪要，
+   就等完成再存"（澄清后："我是说离线html那个按钮"）。两件事都落在这里，口径记在下面：
+
+     * **文件名**是**给人看的**（用户会在下载目录、邮件附件、聊天记录里找它）→ 带上**这场会的
+       标题**才有用；会议目录名那种 `2026-08-21_10-00-00` 等于没写名字，人认不出是哪场会。
+     * **空纪要导出去等于骗人** —— 用户拿到一个"看着像纪要、打开却是空的"HTML，只会以为
+       ECHO 把纪要弄丢了。这与服务端 `meeting._notify_summary_ready()` 不肯提前发"纪要好了"
+       是同一条理由（宁可晚，不可假报）。所以纪要没好时**一个字节都不写**：先如实说、再等它（有上限）。
+
+   ⚠️ 本页第一行是 `"use strict"`：下面这些常量/函数都必须显式声明，未声明就赋值会当场
+   抛 ReferenceError（这坑 2026-10-01 在 `web/app.js` 里踩过）。
+*/
+
+/** 等纪要的上限与轮询间隔。**必须有上限**：无限等会让这颗按钮变成"点了再也不回来"，
+    用户既不知道在等、也没法重试；而没有反馈的等待与"点了没反应"在体感上是同一件事。 */
+const EXPORT_SUMMARY_WAIT_MS = 30000;
+const EXPORT_SUMMARY_POLL_MS = 1500;
+
+/** 会议日期（YYYY-MM-DD）——与后端 `app/meeting.py::_meeting_date()` **同一个规则**
+    （`started_at` 的前 10 位，解析不了就用今天）。为什么非要与后端一致：文件名里的日期是
+    "这场会那天"，不是"点导出的那天"——隔天补导出时两者会差一天，工作日志/归档按会议当天
+    落地，文件名却写着第二天，人就会以为归错了场。 */
+function meetingDateForFile(m) {
+  const raw = String((m && m.started_at) || "").replace("T", " ").trim();
+  const hit = /^(\d{4})-(\d{2})-(\d{2})/.exec(raw);
+  if (hit) {
+    const h = Number(hit[1]), mon = Number(hit[2]), day = Number(hit[3]);
+    const d = new Date(h, mon - 1, day);
+    // 回读一次：挡掉 `2026-02-31` 这种"格式对、日期不存在"的串（后端 strptime 同样判它无效）
+    if (d.getFullYear() === h && d.getMonth() === mon - 1 && d.getDate() === day) {
+      return hit[1] + "-" + hit[2] + "-" + hit[3];
+    }
+  }
+  const now = new Date();
+  const p = (n) => String(n).padStart(2, "0");
+  return now.getFullYear() + "-" + p(now.getMonth() + 1) + "-" + p(now.getDate());
+}
+
+/** 标题限长：太长会把下载目录里的文件名挤爆（也超出不少文件系统的可用长度）。 */
+const EXPORT_TITLE_MAX = 60;
+
+/** 文件名安全化：非法字符（`/ \ : * ? " < > |`）、控制字符（含换行/制表）、连续空白、
+    结尾的点与空格（Windows 上存不下来）一律清掉，并限长。
+    **为什么非清不可**：标题是用户/模型写的自由文本（"Q3 复盘：增长/留存"、"这个能行吗？"），
+    原样塞进 `a.download` 轻则浏览器把整串换成 `download`，重则落盘失败 ——
+    而界面上一句提示都没有，用户看到的只是"点了没反应"。 */
+function safeFileStem(s) {
+  let t = String(s == null ? "" : s)
+    .replace(/[\/\\:*?"<>|]/g, " ")
+    .replace(/[\u0000-\u001f\u007f]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/[. ]+$/, "");
+  if (t.length > EXPORT_TITLE_MAX) {
+    t = t.slice(0, EXPORT_TITLE_MAX).trim().replace(/[. ]+$/, "");
+    // `slice` 是按 UTF-16 单元切的：正好切在一个 emoji 中间就会留下**半个代理对**
+    // （文件名里显示成一个乱码方块）。标题里带 emoji 很常见，所以把半个的补掉。
+    if (/[\uD800-\uDBFF]$/.test(t)) t = t.slice(0, -1);
+  }
+  return t;
+}
+
+/** 导出文件名：`{日期}_{标题}.html`。
+
+    标题为空/只有空白（安全化之后什么都不剩）时：**不许拿会议目录名（`M.name`）冒充标题** ——
+    那会让文件名"看起来有标题"，其实还是那串时间戳，用户照样认不出是哪场会（比不写更坏，
+    因为它撒谎）。按用户口径二选一，这里选 **(b) 用日期兜底 + 在界面上如实说明用了日期**：
+    选 (a)"拒绝导出"会挡掉一个本来能用的动作，而用户这次要的是"存下来"；标题随时可以用
+    顶栏标题旁的 ✏️ 补上，补完再导一次就带上标题了。 */
+function buildExportFileName(m) {
+  const date = meetingDateForFile(m);
+  const title = safeFileStem(m && m.title);
+  if (!title) return { name: date + "_会议纪要.html", usedDateFallback: true };
+  return { name: date + "_" + title + ".html", usedDateFallback: false };
+}
+
+/** 这场会的纪要**真的成稿**了吗：文件在 + 去掉空白还有正文。
+    判据就用详情页「纪要」页签那**同一个**接口（`/api/meetings/{id}/file?kind=summary` 的
+    `exists`/`content`）—— 面板**不另立一套**"什么算有纪要"，否则两处迟早说法不一。
+    读失败一律当"没好"：宁可等、宁可如实说，也不导出一个空壳。 */
+async function fetchExportSummary() {
+  try {
+    const r = await api(`/api/meetings/${M.id}/file?kind=summary`);
+    return { ok: !!(r && r.exists && (r.content || "").trim()), content: (r && r.content) || "" };
+  } catch (e) {
+    return { ok: false, content: "" };
+  }
+}
+
+/** 等纪要成稿（**有上限**，期间不断给可见反馈）。返回 `{ok, content, waitedMs}`。 */
+async function waitForExportSummary() {
+  const first = await fetchExportSummary();
+  if (first.ok) return { ok: true, content: first.content, waitedMs: 0 };
+  const t0 = Date.now();
+  while (true) {
+    const leftMs = EXPORT_SUMMARY_WAIT_MS - (Date.now() - t0);
+    if (leftMs <= 0) break;
+    toast(`纪要还没生成好，正在等它完成…（最多再等 ${Math.ceil(leftMs / 1000)} 秒）`);
+    await new Promise((r) => setTimeout(r, Math.min(EXPORT_SUMMARY_POLL_MS, leftMs)));
+    const got = await fetchExportSummary();
+    if (got.ok) return { ok: true, content: got.content, waitedMs: Date.now() - t0 };
+  }
+  return { ok: false, content: "", waitedMs: EXPORT_SUMMARY_WAIT_MS };
+}
+
+/* 防重入：导出现在可能要**等 30 秒**（等纪要成稿），用户以为"没反应"就会再点一次 ——
+   两个并发的等待最后会各存一份同样的文件（浏览器里就是「文件 (1).html」）。
+   旧代码导出是立刻完成的，那个窗口只有几十毫秒，所以以前不需要这道闸；
+   是这次加的等待把它撑大了，因此必须在这里补上。
+   用一层薄壳包住（而不是在函数体里到处记得复位）：`finally` 保证任何出口都会解锁。 */
+let _exportRunning = false;
 async function downloadOfflineHtml() {
+  if (_exportRunning) { toast("正在导出，请稍等…"); return; }
+  _exportRunning = true;
+  try { await _exportOfflineHtml(); }
+  finally { _exportRunning = false; }
+}
+
+async function _exportOfflineHtml() {
   if (!M) return;
+  // ① 「纪要没完成就别存」：等它成稿（有上限），到点还没好就**如实说 + 不导出**。
+  //    注意措辞：**没有**任何可靠的"正在生成"信号可读（`summary_runs` 那行在请求发出后
+  //    就立刻被标成 done，见 `meeting.regenerate_summary()`），所以这里只说"还没生成好"，
+  //    不替服务端断言"正在生成"——说错原因会把人引去等一个根本没在跑的任务。
+  const sumFile = await waitForExportSummary();
+  if (!sumFile.ok) {
+    toast("纪要 " + Math.round(EXPORT_SUMMARY_WAIT_MS / 1000)
+          + " 秒内还没生成好（也可能还没发起生成），先不导出；等它好了再点「⬇ 离线HTML」");
+    return;                       // ← 一个字节都不写（空纪要导出去等于骗人）
+  }
+  // ② 文件名：`{日期}_{标题}.html`
+  const fname = buildExportFileName(M);
   toast("正在生成离线文件…");
   try {
-    const [sum, top, tr] = await Promise.all([
-      api(`/api/meetings/${M.id}/file?kind=summary`),
+    const [top, tr] = await Promise.all([
       api(`/api/meetings/${M.id}/file?kind=topics`),
       api(`/api/meetings/${M.id}/file?kind=transcript`),
     ]);
@@ -1186,7 +1316,8 @@ async function downloadOfflineHtml() {
     const stText = { recording:"录音中", transcribing:"转写中", transcribed:"已转写", imported:"待转写", error:"录音失败", interrupted:"已中断" }[M.status] || M.status;
     const data = JSON.stringify({
       name: M.title || M.name, meta: (M.started_at || "") + " · " + fmtHM(M.duration_seconds) + " · " + stText,
-      summary: sum.content || "", topics: topicsMd || "", transcript: tr.content || "",
+      // 纪要正文直接用①里**已经确认成稿**的那一份（不再多拉一次同样的接口）
+      summary: sumFile.content || "", topics: topicsMd || "", transcript: tr.content || "",
       segHtml,
     });
     const html = [
@@ -1247,10 +1378,15 @@ async function downloadOfflineHtml() {
     const blob = new Blob([html], { type: "text/html;charset=utf-8" });
     const a = document.createElement("a");
     a.href = URL.createObjectURL(blob);
-    a.download = (M.name || "会议") + "_会议纪要.html";
+    // `{日期}_{标题}.html`（见 `buildExportFileName()`：标题缺失时才回落日期兜底，
+    // 且**绝不**用会议目录名冒充标题 —— 那是给机器看的时间戳，人认不出来）
+    a.download = fname.name;
     a.click();
     setTimeout(() => URL.revokeObjectURL(a.href), 4000);
-    toast("已生成离线 HTML");
+    // 导出成功也要**看得见**（沿用面板既有的 toast/状态行），并且把**文件名念出来** ——
+    // 用户这次要改的正是文件名，不念出来就无从确认改对了；标题缺失时如实说明用了日期。
+    toast("已生成 " + fname.name + (fname.usedDateFallback
+      ? "（这场还没有标题，文件名用了日期；可用标题旁的 ✏️ 补一个）" : ""));
   } catch (e) { toast("生成失败：" + e.message); }
 }
 $("#btnExport").addEventListener("click", downloadOfflineHtml);
