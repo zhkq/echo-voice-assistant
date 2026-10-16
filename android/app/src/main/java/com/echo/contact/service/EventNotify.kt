@@ -24,6 +24,20 @@ import com.echo.contact.R
  *
  * [summarize] 是**纯函数**（JVM 可测）：哪种事件值得打扰人、说什么话，全在这里。
  *
+ * ## 两层判据：先"谁发起的任务"，再"值不值得打扰"（2026-10-16 用户口径）
+ *
+ * 用户原话：**"手机侧发的任务，手机接受通知，电脑端发起的任务不用给手机"**。
+ * 之前这里只有**一层**判据（按 `type` 挑"值得打扰的事件种类"），于是电脑上自己录的
+ * 会议、在电脑上敲的指令，只要有结果就照样推手机 —— 手机成了"电脑干活儿的播报器"，
+ * 用户会被**自己**的活儿刷屏。所以 [summarize] 现在先看事件的 `origin`：
+ * 只有 `"mobile"` 才发通知，`"pc"` 或字段缺失一律返回 null。
+ *
+ * ⚠️ **第二层（类型映射）没有被删弱，两层缺一不可**：发起方回答"这事**是给谁干的**"，
+ * 类型回答"这件事**这个人想不想立刻知道**"。手机发起的 `command_received`
+ * （过程类）仍然不打扰 —— 修掉的是"电脑的活儿推给手机"，不是"什么都推"。
+ * 顺序**必须**是先发起方、后类型：反过来先算文案再判发起方，等于白算一遍，
+ * 而且以后有人往 when 里加分支时容易忘记那道闸（闸在最前面最难绕过）。
+ *
  * ## 点通知要落到"那一场会议"（2026-10-16 补）
  *
  * 之前点开只回到首页，用户还得自己去会议列表里翻。现在"跟某场会议有关"的事件会把
@@ -95,8 +109,45 @@ object EventNotify {
     /** 测试与排障用：看看某句正文记住了哪场会议。 */
     fun rememberedMeetingFor(body: String): String? = synchronized(meetingLock) { rememberedMeeting[body] }
 
-    /** 事件 → 一句通知。返回 null = 这类事件**不值得打扰**（例如 command_sent）。 */
+    /** 事件 payload 里"谁发起了这个任务"的键。电脑侧写入，手机侧只读。 */
+    const val KEY_ORIGIN = "origin"
+
+    /** [KEY_ORIGIN] 的取值：手机发起的任务（**只有这一档才推手机通知**）。 */
+    const val ORIGIN_MOBILE = "mobile"
+
+    /** [KEY_ORIGIN] 的取值：电脑发起的任务（**不打扰手机**）。 */
+    const val ORIGIN_PC = "pc"
+
+    /**
+     * 这条事件**是谁发起的**（第一层判据的输入）。
+     *
+     * 缺失/空/不是字符串 → 按 [ORIGIN_PC] 处理（**保守不打扰**）：老事件（电脑侧
+     * 还没带上 `origin` 的那些）与脏 payload 都不该把手机叫醒 —— "宁可漏一条，
+     * 不可多吵一次"。反过来兜底成 mobile 的话，一次字段没带上就是一场刷屏。
+     *
+     * ⚠️ 这里判的是"**谁发起的任务**"，**不是**"哪台机器产生的数据"：一场
+     * **手机发起**的会议，转写/纪要是电脑算出来的，但用户是在等它的结果，
+     * 所以那些事件仍然是 `mobile`。
+     */
+    private fun initiator(payload: Map<String, Any?>): String = str(payload[KEY_ORIGIN]) ?: ORIGIN_PC
+
+    /**
+     * 事件 → 一句通知。返回 null = **不打扰**。
+     *
+     * 两层判据，**顺序固定**：
+     *  1. **谁发起的任务**（[initiator]）：只有 [ORIGIN_MOBILE] 才往下走；
+     *     [ORIGIN_PC] 或字段缺失 → null（电脑自己的活儿，手机上不弹）；
+     *  2. **值不值得打扰的种类**：`type` 不在下面那张表里 → null。
+     *
+     * 文案照旧（会议转写/纪要/录音结束/导入/指令有结果）—— **不写"（来自电脑）"之类**：
+     * 电脑来源的事件在第 1 层就不发通知了，那句话根本不该有机会出现。
+     */
     fun summarize(type: String, payload: Map<String, Any?> = emptyMap()): Pair<String, String>? {
+        // 第 1 层：发起方。放在最前面（也放在取 meeting 之前）—— 电脑的活儿
+        // 一个字都不用算，更不会顺手登记到 rememberedMeeting 里。
+        if (initiator(payload) != ORIGIN_MOBILE) return null
+        // 第 2 层：种类。这一层**没有**因为上面那道闸而放宽：
+        // 手机发起的 `command_received` / `command_sent` 照样不打扰。
         val meeting = str(payload["meeting"]) ?: str(payload["name"])
         val text = when (type) {
             "meeting_transcribed" -> "会议转写好了" to
