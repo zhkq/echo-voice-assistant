@@ -905,3 +905,85 @@ scopes 还得重发）。当晚的绕法：用 `pairing.pair()` 里**逐字同�
   → 重跑本身修掉了一个真实质量问题 ✓）；**79（4333.2 s）= 4 个说话人**，标签直方图与库里逐项相同 ✓。
 * ⚠️ **质量对比只能严格说"说话人集合与人数一致"**：78 上旧代码自己就有波动（turns 194 vs 193、
   lines 1877 vs 1866），所以"边界无实质变化"**没有**被严格证明 ✗。
+## 2026-10-17 深夜 / 18 凌晨：真机驱动的一轮修复（决策与踩坑索引）
+
+用户连续三轮真机测试逼出十几个真 bug。这里只记**容易再犯**的判断与判据，细节见对应提交与用例。
+
+### 「谁在采集」必须是事实，不能被缺省值/幂等键吞掉
+
+* 现象：手机点「开始录音」→ **电脑开麦录了** ✗、手机传的段全被拒 ✓、用户以为"手机发的会"。
+* 根因两层：① 安卓那颗按钮走的是**遥控电脑**（请求**零参数** ✗，`meetingStart()` 已**删除** ✓）；
+  ② 服务端 `src = (source or "pc")` 把"没说"读成"明说要 pc" ✗。
+* 现行判据（只此一份）：`app/api.py::_meeting_capture_source()` = **`clientId` → 显式 `source` → 发起方**（`X-Echo-Relay` = mobile ⇒ 手机麦 ✓）。
+  **手机显式 `source=pc` 仍算电脑麦** ✓（不许一刀切）。
+* 配套硬约束：**建会必须延后到"第一段音频真的落盘"之后** ✓（否则会出现"没有音频的手机麦会议" ✗ —— 空会占住服务端唯一录音槽 ✗）；
+  **结束时把不足一段的尾段封上** ✓（`MeetingTailFlush` ✓）—— **0 个样本才是唯一允许不建会的情况** ✓，且要如实说"没有录到音频" ✓。
+* 判据：`tests/test_phone_start_is_phone_source.py`（含"中继 + 零参数 → 手机麦"的真机回归条 ✓）、安卓 `MeetingPhoneStartTest` / `MeetingTailFlushTest`。
+
+### `meeting.active` 不等于"这台电脑在录音"
+
+* 手机麦会议在上传期间**服务端就是 active** ✓（在等段传完），但**电脑面板不许显示成"电脑在录"** ✗。
+* 判据：`meeting_status().source` ✓（面板 `isPhoneMicMeeting` 一处判据 ✓）；电脑那颗「开始录音」置灰 + `title` 说明 ✓，
+  **不许变成「停止录音」** ✗（否则点了会误停手机那场 ✗）。`/api/meetings` 行也要带 `source` ✓（列表与仪表盘不能一个说手机、一个说电脑 ✗）。
+* ⚠️ 状态泄漏：`start_meeting()`（电脑麦）若不显式写 `_state["source"]="pc"`，**上一场手机麦之后会继续报 phone** ✗
+  → 面板显示"手机在录"并把按钮置灰，**用户连停都停不了** ✓。这条有用例守着 ✓。
+
+### MediaCodec 产的 FLAC 是"合法但没写长度"，libsndfile 会崩
+
+* 症状：`CompressionError: 音频段01.flac解码失败：Internal psf_fseek() failed.`；旁证 meta 里
+  `durationSeconds = 1152921504606847.0`（= 2^63/8000 ✗）。
+* 根因：MediaCodec 写 FLAC 头时还不知道长度 → `STREAMINFO.total_samples=0`、`md5=0`（**规范合法** ✓）；
+  libsndfile 1.2.2 把它读成 `SF_COUNT_MAX(2^63-1)` ✗ → 逐块 seek 必失败 ✗。**文件本身是好的** ✓（ffmpeg 完整解出 ✓）。
+* 双保险（两侧都要）：
+  * **手机**：封段收尾**原地回填 36-bit `total_samples`** ✓（跨 5 字节：偏移 21 的低半字节 + 22..25 ✓、**长度不变** ✓、
+    写完重新解析自检 ✓），失败就**整段退回 WAV** ✓（`audio/FlacStreamInfo.kt` ✓）。
+  * **服务端**：解码 `libsndfile 优先 → ffmpeg 兜底` ✓；**不许放松校验** —— `-loglevel error` 下 **stderr 必须为空**
+    （实测**截断的 FLAC 会解出半截且退出码 0** ✗，只听退出码就会谎报成功 ✓）+ 用标准库 `wave` 复核位深/采样率/帧数 ✓。
+  * `audio_seconds()` 遇到哨兵值要**真解一遍量** ✓，**绝不把 1.15e15 秒写进 meta** ✗。
+* 判据：`tests/test_audiofile_mediacodec_flac.py`（**合成**样本：6 KB 正弦 + 同样的坏头 ✓，
+  真实录音不进 git ✓）、安卓 `FlacStreamInfoTest` / `MeetingSegmentFlacHeaderTest`。
+
+### 「一次探测超时 ≠ 后端不可用」（会让人白等 15 秒然后手动重转）
+
+* 现象：停会报"后端暂不可用…等它恢复后可重新转写" ✗，**48 秒后手动重转就成功** ✓，后端整晚在线 ✓。
+* 根因：每轮转写新建 router → 现场 `GET /v1/capabilities`（**timeout=15** ✗）→ 一次失败就 `provides=frozenset()` ✗ →
+  判"它什么都不提供" ✗ → `waiting-backend` ✓。**时间差正好 15 秒** ✓。
+* 现行策略：探测 **5s × 2 次（+0.4s 间隔）** ✓（比原来单次还短 ✓）；失败**不清空** `provides` ✓，
+  用**进程级上次已知能力**兜底（**上限 30 分钟** ✓ + **必须先过免凭据 `/v1/health`** ✓），
+  `supports()` 与 `provides` **分离** ✓（"上次说能干什么" vs "这轮敢不敢派活" ✓）；健康也不通 → **不派活** ✓。
+  每次失败**必须落日志** ✓（旧代码只在内存里，事后零痕迹 ✗ —— 这次就是因此只有推断 ✗）。
+* 判据：`tests/test_caps_probe_resilience.py`（含"一直失败仍如实报 waiting-backend"✓ —— **不许把它变成永远不报** ✗）。
+
+### 暂停 = 空白音频（补充：**计时必须每帧推进**，且**只有尾段允许不足一段**）
+
+* 现象：暂停时计时器冻住 ✗ → 用户误判"恢复后不到一分钟就封了第一段" ✗。
+* 真相：界面大计时在**组合体里**读挂钟、只在重组时算 ✗；而暂停时唯一每 100ms 变化的 `level` 被跳过 ✗ → 整块界面不重组 ✗。
+  **时长其实一直在累计** ✓（真机音频逐秒 RMS 已证：30s 满段 + 19.9s 尾段、暂停区全零、总长 ≈ 挂钟 ✓）。
+* 铁律：**计时/本段进度每帧（含暂停帧）推进** ✓；**正常封段必须刚好一个段长，只有结束时的尾段允许不足** ✓
+  （生产判据 `segmentLengthProblem` + `Log.e` ✓）——"暂停期间不要封段"是**口径变更**，别擅自做 ✗。
+
+### 朗读：谁发起谁念 + 只念摘要（单一出处）
+
+* 用户口径：**手机的任务手机念、电脑只执行不念** ✓；**两端都只念摘要**（详情是给人看的，不是给耳朵听的 ✓）。
+* 实现：电脑 `app/assistant.py::speak_text_for_reply()` 是**唯一出处** ✓（复用既有 `_DETAIL_SPLIT_RE → conclusion_only → brief_text` ✓），
+  电脑喇叭与回传手机的 `speakText` **同调它** ✓；安卓 `SpeakPlan` **有 `speakText` 就念它、绝不自己切** ✓（老电脑没有时才取第一段摘要 ✓）。
+* 两处兜底**故意相反**：通知拿不到 origin → 按 pc **少打扰** ✓；朗读拿不到 origin → **照念** ✓（该念却静默 = 功能坏掉 ✗）。注释两处都写明 ✓。
+
+### `meta["pauses"]` 会被 stop 静默抹掉
+
+* 现象：手机 `POST /api/meeting/pauses` **三次 200** ✓、日志也记"新增 1 条" ✓，但两场 `meta.json` 的 `pauses` 是空 ✗。
+* 根因：`add_meeting_pauses` 只写盘、**不同步 `_state`** ✗ → 10 秒后 `stop_meeting` 用内存快照**无条件覆盖** ✗。
+* 现行：补报后同步内存镜像 ✓ + stop 改成**合并盘上与内存**再写回 ✓（**只许往上加、不许覆盖** ✓）。
+* 判据：`tests/test_meeting_pauses_land_in_meta.py`（**一律从磁盘重读 meta.json** ✓，且"临时还原修复 → 用例红"验证过 ✓）。
+
+### 测试卫生：`tearDownClass` 先收线程、再还原库路径、再删目录
+
+* 见 `tests/test_meeting_retranscribe_guard.py`：后台转写线程没收就走 → `database is locked` / `no such table: settings` ✗，
+  还会把下一个类的 `setUpClass` 卡住 → **整类 7 条用例被"既不算跑过也不报错"地吞掉** ✗（门禁 `Ran 3279` vs 3286 的来源 ✓）。
+
+### 仓库 `.gitignore` 裸 `data/` 会吃掉同名源码目录（本次逮到）
+
+* 现象：`android/app/src/main/java/com/echo/contact/data/` 下 **19 个 .kt 从来没进过 git** ✗
+  （`EchoApi.kt` / DTO / `PairStore` …）→ **远端仓库根本编译不出这个 App** ✗。
+* 根因：`.gitignore` 里是裸的 **`data/`**（= 任意深度名为 data 的目录 ✗）；Git **不允许**在被排除的目录里用 `!` 反选 ✗。
+* 修法：锚定成 **`/data/`** ✓（只忽略仓库根的运行时数据 ✓），并补进那些源文件 ✓。**加目录忽略规则一律加前导 `/`** ✓。
