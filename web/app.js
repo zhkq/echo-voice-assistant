@@ -285,10 +285,10 @@ async function verifyMeetingState(wantActive, btn, after) {
 const PHONE_MIC_BUTTON_TITLE =
   "手机正在录这一场（不是这台电脑）。服务端只有一条录音槽：等手机结束/传完，才能开始新的一场";
 
-/** 这一场是不是"手机在录/在传"？`active` 只说明**这场会还开着**，不代表电脑在录音。 */
-function isPhoneMicMeeting(m) {
-  return !!(m && m.active && String(m.source || "pc").toLowerCase() === "phone");
-}
+/* ⚠️ 那份判据函数 `isPhoneMicMeeting` 在下面「会议列表」那一段（`renderMeetingItems` 旁边）：
+   它有三处调用人（仪表盘徽章/按钮、列表头那颗按钮、列表里每一行），页面里函数声明会提升，
+   写在那儿照样能用；而不写在那段里，面板的源码级用例（把该段单独抽出来真跑）会当场
+   `ReferenceError`。判据仍然**只有一份**，别在这里再抄一遍。 */
 
 /* ================= 视图切换 ================= */
 /* 页签清单：新加页签要同时在 index.html 里加
@@ -6005,6 +6005,20 @@ const MEETING_BADGE_TITLE = {
   imported: "录音已完成、音频已保存；转写还没成 —— 原因见下面那行",
 };
 
+/** 这一场是不是"手机在录/在传"？`active` 只说明**这场会还开着**，不代表电脑在录音。
+ *
+ * 判据**只有这一份**（别写第二套）：仪表盘徽章与那颗按钮、会议列表头那颗按钮、以及
+ * 会议列表里每一行的状态行，全都调它。为什么值得单拎出来说：列表原来只照 `m.status`
+ * 画「录音中」、仪表盘照 `meeting_status().source` 画「手机录音中」—— 同一场会议两处
+ * 说法相反，用户看到的正是这个不一致（面板说手机在录、列表说这台电脑在录）。
+ *
+ * `m.source` 由服务端下发（`GET /api/meetings` 每行 / `meeting_status()` 那一个键）；
+ * 缺 `source` 的老数据按 `pc`（＝与补这一格之前逐字一样）。
+ */
+function isPhoneMicMeeting(m) {
+  return !!(m && m.active && String(m.source || "pc").toLowerCase() === "phone");
+}
+
 /* 会议列表条目（**全站唯一一处渲染**：仪表盘"最近几场"与「历史 → 会议历史」共用）。
    `opts.full=true` 是历史页要的完整条目 —— 多几格：转写档位 / 说话人 / 「看转写」入口。
    仪表盘只要最近几场，保持精简（用户反复强调"默认只露在用的"，别把整页塞满）。 */
@@ -6094,12 +6108,28 @@ function renderMeetingItems(el, items, opts = {}) {
     const acts = full
       ? `<div class="m-acts"><a class="m-open" data-open="${m.id}" data-tab="transcript">看转写 ›</a></div>`
       : "";
+    /* 「手机麦那一场」在列表里也要说**手机**（2026-10-17 真机看到的不一致）：
+       这一行原来只照 `m.status === "recording"` 画「录音中」，而仪表盘读的是
+       `meeting_status().source`、说的是「手机录音中」—— 同一场会议，仪表盘说手机在录、
+       列表说这台电脑在录，用户会照着后者以为电脑在开麦（它一支麦都没开）。
+       所以判据**复用** `isPhoneMicMeeting`（`active + source=phone`，一处判据不许写第二套）：
+       列表行的 `active` 就是 `status === "recording"`（服务端那一行还开着），
+       `source` 由 `GET /api/meetings` 每行下发（老数据没有这个键 → 按 pc）。
+       电脑那场（source=pc）走的还是原来那一支，文案逐字不变。 */
+    const phoneMicRow = isPhoneMicMeeting({
+      active: m.status === "recording", source: m.source });
+    const statusText = phoneMicRow ? "手机录音中"
+      : (MEETING_STATUS_TEXT[m.status] || STATUS_TEXT[m.status] || m.status);
+    // 徽标的 `title`：手机那一场要说清"不是这台电脑"（与仪表盘那句同一个口径）。
+    const badgeTitle = MEETING_BADGE_TITLE[m.status]
+      ? MEETING_BADGE_TITLE[m.status]
+      : (phoneMicRow ? "手机正在录音（不是这台电脑）：传完才开始转写" : "");
     // 状态徽标**与标题同行**（原来它独占左侧一列，标题被推右、窄边条里很浪费）。
     return `<div class="meeting-item" data-id="${m.id}">
       <div class="grow">
         <div class="m-head">
           ${nameHtml}
-          <span class="badge ${meetingBadgeCls(m.status)}"${MEETING_BADGE_TITLE[m.status] ? ` title="${esc(MEETING_BADGE_TITLE[m.status])}"` : ""}>${MEETING_STATUS_TEXT[m.status] || STATUS_TEXT[m.status] || m.status}</span>
+          <span class="badge ${meetingBadgeCls(m.status)}"${badgeTitle ? ` title="${esc(badgeTitle)}"` : ""}>${statusText}</span>
           ${hasSummary}
           ${acts}
         </div>

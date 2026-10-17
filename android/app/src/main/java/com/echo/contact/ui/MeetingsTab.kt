@@ -57,7 +57,6 @@ fun MeetingsTab(vm: MainViewModel) {
     val audioSeg by vm.audioSeg.collectAsState()
     val audioState by vm.audioState.collectAsState()
     val audioPlaying by vm.audioPlaying.collectAsState()
-    val showingRecording by vm.showRecordingScreen.collectAsState()
     val localCtx = androidx.compose.ui.platform.LocalContext.current
 
     // 这台手机这一侧的录音状态（`MeetingMicService` 的**本地**状态）。
@@ -84,12 +83,10 @@ fun MeetingsTab(vm: MainViewModel) {
         }
     }
 
-    // 全屏录音界面（用户 2026-10-15 要的：电平 + 结束 + 静音/恢复）。
-    // 放在最前面：录音时它盖住整个页签；「返回」只关界面、**不停录音**。
-    if (showingRecording) {
-        MeetingRecordingScreen(vm)
-        return
-    }
+    // 全屏录音界面已经**上提到 HomeScreen**（2026-10-18 改成 5 页时）：
+    // 录音时它盖住整个外壳（含底部导航），不再只是"会议页里的一个子页面"。
+    // 这里不再重复判 `showRecordingScreen` —— 两个地方判同一件事，迟早出现
+    // "从会议页进是全屏、从别处进是列表"的分叉。
 
     if (detail != null || detailLoading || detailNote != null) {
         MeetingDetailView(

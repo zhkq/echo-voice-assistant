@@ -28,7 +28,8 @@ import java.nio.ByteOrder
  *
  * ## 现场（上一轮自己交代的既有缺口，这一轮成了显式退步）
  *
- * 段长默认 30 秒（`AppPrefs.segmentSeconds`，是**用户设置**）。以前 `stopEverything`
+ * 段长是**用户设置**（默认 600 秒 = 10 分钟；这一组固定用 30 秒那一档，方便把段边界数清）。
+ * 以前 `stopEverything`
  * 只做 `session.finish()`：还攒在缓冲里的样本**整段丢掉**。于是用户真机要验的
  * "**录 20 秒**看效果"既不建会、也不上传，那段录音直接消失；而旧版"电脑麦"那条路
  * 是能录的 —— 所以这是**真实的退步**，不是"功能没做"。
@@ -62,7 +63,7 @@ class MeetingTailFlushTest {
         MeetingDraftStore.epochOf(startIso) ?: error("用例前置：开始时间要能解析")
     private val rate = 16_000
     private val frameSamples = 1_600                 // 100ms，与 MeetingMicService.FRAME_SAMPLES 一致
-    private val defaultSegmentSeconds = 30            // 真机默认档（用户设置，不是被测常量）
+    private val defaultSegmentSeconds = 30            // 用户可选的 30 秒档（**默认是 600**，这里用短档跑用例）
     private var folderSeq = 0
 
     /**
@@ -171,7 +172,7 @@ class MeetingTailFlushTest {
      * 每 [tick] 走 100ms 挂钟（真机上 `ar.read` 一次就是 100ms）→ 喂一帧 → 攒满一段就封；
      * [stop] 时先 `sealFinalTail`（生产代码在 `finish()` 之前做的同一件事）再 `finish()`。
      *
-     * 段长用**真机默认的 30 秒**（不是把参数改小）：这一组要钉的正是"30 秒段长下，
+     * 段长用 30 秒这一档（**用户可选**、默认是 600）：这一组要钉的正是"30 秒段长下，
      * 20 秒/45 秒录音会不会丢"，改小段长就等于把 bug 藏起来。
      */
     private inner class Rig(
@@ -184,7 +185,7 @@ class MeetingTailFlushTest {
             store = store, encoder = encoder, sampleRate = rate, channelCount = 1,
             clock = { now })
         private val capture = MicCaptureLoop(rate * segmentSeconds)
-        private val buffer = ArrayList<Short>(rate * segmentSeconds)
+        private val buffer = PcmBuffer(rate * segmentSeconds)
 
         /** 已经攒满一段封出去的段（**不含**结束时的尾段）。 */
         val sealed = ArrayList<DraftSegment>()
@@ -206,7 +207,7 @@ class MeetingTailFlushTest {
 
         /** 结束：**先补尾段，再收尾**（顺序与 `stopEverything` 一致）。 */
         fun stop(): Pair<TailSealOutcome, MeetingDraft?> {
-            val tail = sealFinalTail(session, buffer.toList(), rate)
+            val tail = sealFinalTail(session, buffer.toShortArray(), rate)
             if (tail.seal != null && tail.error.isBlank()) {
                 tail.seal.draft?.let { sealed += it.segments.last() }
             }

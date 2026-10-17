@@ -35,7 +35,7 @@ class MeetingPauseSemanticsTest {
 
     private val rate = 16_000
     private val frameSamples = 1_600          // 100ms，与 `MeetingMicService.FRAME_SAMPLES` 一致
-    private val segmentSamples = 16_000       // 1 秒一段（真机默认 30 秒，这里只把刻度调小）
+    private val segmentSamples = 16_000       // 1 秒一段（默认 600 秒，这里只把刻度调小）
     private val bytesPerSample = 2            // PCM 16-bit
     private val startIso = "2026-10-18T09:30:00"
     private val startMs: Long = MeetingDraftStore.epochOf(startIso) ?: error("用例前置：开始时间要能解析")
@@ -59,7 +59,7 @@ class MeetingPauseSemanticsTest {
         private val session: MeetingRecordSession,
         private val samplesPerSegment: Int,
     ) {
-        private val buffer = ArrayList<Short>(samplesPerSegment)
+        private val buffer = PcmBuffer(samplesPerSegment)
         private val capture = MicCaptureLoop(samplesPerSegment)
 
         /** 已经封出去的段（按顺序）—— 用来验时间轴与段边界。 */

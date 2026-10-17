@@ -1705,10 +1705,23 @@ def _meeting_actor(request: Request) -> str:
 
 @router.post("/meeting/pause")
 def meeting_pause(request: Request, _auth=Depends(optional_auth)):
-    """暂停录音（**静音**）：不写盘、不产生音频，采集流不关（恢复要立刻）。
+    """暂停录音（**静音**）：**照常录音，写进去的是全零（空白）音频**，采集流不关（恢复要立刻）。
+
+    现行口径（2026-10-16 深夜，用户推翻了"不写盘、不产生音频"那版）：
+    *"暂停区间就是空白录音，不影响会议总时长，不用剃掉"*。所以：
+
+      * **时间轴逐字连续**：暂停那几分钟照样算进音频总长，段边界**不漂**
+        （第 N 段覆盖的仍是挂钟的 `10N ~ 10N+10` 分钟）；
+      * **内容是零**：暂停区间的样本全为零（"暂停 = 这段时间不想留下内容"）；
+      * **不做任何剪切/补偿**：转写里那一段没有文字，是因为**音频本身就是空白**，
+        不是我们事后去剪/补了它。
+
+    实现细节见 `app/audio/recorder.py::MeetingRecorder`（`pause()` 让写盘那一行换成全零，
+    采样率/声道/位深/每缓冲帧数一个都不变）。
 
     手机那个全屏录音界面上的「静音」按钮就是它；暂停区间记进 meta 的 `pauses`，
-    所以转写里那段空白**有据可查**（不是"莫名其妙少了一段"）。
+    所以转写里那段空白**有据可查**（不是"莫名其妙少了一段"）；那份记录只是标注，
+    不参与任何拼接/裁剪。
     """
     ok, msg = meeting.pause_meeting(by=_meeting_actor(request))
     services.report_meeting("active" if ok else "idle", msg)
@@ -1954,12 +1967,24 @@ def get_meetings(limit: int = 100, offset: int = 0, _auth=Depends(optional_auth)
         # 所以**刷新页面、换个标签页、重开详情页，按钮状态都还是对的** ——
         # 这一点是这次 bug 的要害：只看前端本地变量的修法，刷新一下就退回原样。
         it["transcribing"] = meeting.is_transcribing(it["name"])
+        # 这场会的录音快照（`meta.json`）：**只读一次**喂下面两格（源 + 时间轴档位）。
+        meta = meeting.meeting_meta(it["name"])
+        # 「采集源」（2026-10-17，用户真机看到的不一致）：列表原来**没有**这个键，于是
+        # 手机麦那一场在列表里只会照 `status=recording` 画成「录音中」，而仪表盘读的是
+        # `meeting_status().source`、说的是「手机录音中」——**同一场会议两处说法相反**，
+        # 用户据此以为这台电脑在录（它一支麦都没开）。面板因此必须逐行拿到同一个真相。
+        #
+        # 判据只认 `meta.json` 的 `source`（`start_meeting_phone` / 离线补传那条路写
+        # `source=phone`；本机麦那条路不写）。取不到、认不出（老会议没有这个键、导入的
+        # `source=import`）一律按 `pc` ✓ —— 保守值宁可少说"手机在录"，不能凭空说。
+        # `meeting_status()` 那份是同源信息，但它是"当前这一场"的，列表里要给每一行。
+        it["source"] = ("phone" if str(meta.get("source") or "").strip().lower() == "phone"
+                        else "pc")
         # 「转写档位」（2026-09-26，历史 → 会议历史列表）：exact / aligned / estimated。
         # 与详情页的 `capability.timestampsLabel` **同一份翻译、同一份快照**
         # （`capability_admin.timestamps_summary`），没记过的老会议是 None → 不显示。
         try:
-            it["timestamps"] = capability_admin.timestamps_summary(
-                meeting.meeting_meta(it["name"]).get("timestampsKinds"))
+            it["timestamps"] = capability_admin.timestamps_summary(meta.get("timestampsKinds"))
         except Exception:
             it["timestamps"] = None
     return {"items": items}

@@ -20,7 +20,7 @@ import kotlin.math.abs
  *  * [outputDeviceId]：ECHO 念优先从哪支放（`-1` = 跟随系统）。**只有 ECHO 念这条路认它**
  *    （`MediaPlayer.setPreferredDevice`）；手机念走系统 TTS，**没有**指定设备的接口 ——
  *    这条限制写在设置页上，不只是写在这里（见 `OutputDevices`）。
- *  * [segmentSeconds]：「手机当麦克风」每段多长（15 / 30 / 60，默认 30）。
+ *  * [segmentSeconds]：「手机当麦克风」每段多长（15 / 30 / 60 / 300 / 600，默认 **600**）。
  *  * [mediaKeys]：耳机 / 车机媒体键要不要接管（默认**开**）。
  *  * [audioRetentionDays]：离线录音补传成功之后，本地那份副本还留几天
  *    （默认 **7 天**，`0` = **永不自动清理**）—— 见 [OfflineMeetingRetention]：
@@ -43,11 +43,19 @@ object AppPrefs {
     const val FOLLOW_SYSTEM = -1
 
     /**
-     * 「每段多久」的可选档（秒）。**默认 30**，理由见 [MeetingMicService]：
-     * 一段 ≈1 MB，走中继（单次上限 12 MB）很稳，断了只重传这一段。
+     * 「每段多久」的可选档（秒）。
+     *
+     * **默认 600 秒（10 分钟）**：用户 2026-10-18 点名"跟电脑一样 10 分钟一段就行"
+     * —— 电脑侧的会议录音本来就是 10 分钟一段，手机跟它对齐，两边的段边界才有同一个含义
+     * （这也是"段长与电脑一致"这条硬约束的落点）。其它档位保留：录短会、或网络很差时，
+     * 用户可以改小，改完**下次开录生效**（见 [MeetingMicService]）。
+     *
+     * 代价要如实知道：段越长，一次失败要重传的那一段就越大（10 分钟 ≈ 19 MB 的 WAV，
+     * FLAC 之后约一半）。中继单次上限 12 MB —— 走中继且退回 WAV 时可能超限，
+     * 这一点没有藏起来（设置页与报告里都写着）。
      */
-    val SEGMENT_SECONDS_CHOICES = intArrayOf(15, 30, 60)
-    const val DEFAULT_SEGMENT_SECONDS = 30
+    val SEGMENT_SECONDS_CHOICES = intArrayOf(15, 30, 60, 300, 600)
+    const val DEFAULT_SEGMENT_SECONDS = 600
 
     /** 纯判据：只有非负的 id 才算"指定了某支麦/某支输出"，其余一律"跟随系统"。 */
     fun normalizeDeviceId(raw: Int): Int = if (raw < 0) FOLLOW_SYSTEM else raw
@@ -55,7 +63,7 @@ object AppPrefs {
     /**
      * 纯判据：把库里那个秒数**夹到最近的一档**（[SEGMENT_SECONDS_CHOICES] 里必须有它）。
      *
-     * 为什么是"夹到最近档"而不是"夹到上下界"：这是个**单选**（界面上就三个按钮），
+     * 为什么是"夹到最近档"而不是"夹到上下界"：这是个**单选**（界面上是几档按钮），
      * 库里要是躺着 45（手改过、或以后删了某一档），回落成 15 或 60 都行，
      * 但**绝不能**回落成 0/负数 —— 那会让一段都传不出去（每 0 秒切一段 = 空段刷屏）。
      * 距离平手时取**小的那一档**（`minByOrNull` 返回第一个最小值，而档位表是升序）。
@@ -81,7 +89,7 @@ object AppPrefs {
         prefs(context).edit().putInt(KEY_OUTPUT_DEVICE, normalizeDeviceId(id)).apply()
     }
 
-    /** 「手机当麦克风」每段多少秒（读出来一定是三个档之一，见 [normalizeSegmentSeconds]）。 */
+    /** 「手机当麦克风」每段多少秒（读出来一定在 [SEGMENT_SECONDS_CHOICES] 里，见 [normalizeSegmentSeconds]）。 */
     fun segmentSeconds(context: Context): Int = normalizeSegmentSeconds(
         prefs(context).getInt(KEY_SEGMENT_SECONDS, DEFAULT_SEGMENT_SECONDS))
 

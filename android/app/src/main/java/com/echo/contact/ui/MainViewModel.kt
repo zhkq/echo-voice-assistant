@@ -150,7 +150,8 @@ object TtsRouteText {
 }
 
 /**
- * 主页（仪表盘）：整机状态 + 发文字指令 + 指令历史。
+ * 五个页签共用的 ViewModel：**超级助理**（状态 + 入口）、**指令**（发文字指令 + 这一轮结果 +
+ * 历史）、**会议**、**回顾**、**设置**；外加全屏录音界面的开关。
  *
  * **为什么要轮询**：`POST /api/assistant/command` 立刻返回 `{ok: true, message: "已提交"}`
  * （app/assistant.py:783 `send_text` 把活丢进后台线程就返回），真正执行在后台：
@@ -166,12 +167,17 @@ class MainViewModel(app: Application) : BaseViewModel(app) {
     // 而 MainActivity 拿不到 Compose 里那个 `tab` 局部状态。放在这里两边都能读写，
     // 也顺带让"回到首页"这类跳转有个统一入口。
 
-    /** 0=说话 1=会议 2=回顾。 */
+    /**
+     * 当前页签（0=超级助理 1=指令 2=会议 3=回顾 4=设置；顺序见 [ECHO_TABS]）。
+     *
+     * 为什么是**五页**：用户 2026-10-18 点名"整体界面还是改成 5 页，第一页是 ECHO 超级助理…
+     * 后面跟指令、会议、回顾三个页签" —— 设置也从齿轮升成第五个页签（齿轮已撤，两个入口会打架）。
+     */
     private val _tab = MutableStateFlow(0)
     val tab: StateFlow<Int> = _tab.asStateFlow()
 
     fun selectTab(index: Int) {
-        if (index in 0..2) _tab.value = index
+        if (index in ECHO_TABS.indices) _tab.value = index
     }
 
     /**
@@ -197,7 +203,7 @@ class MainViewModel(app: Application) : BaseViewModel(app) {
      *    并把页面留在会议列表（绝不静默什么都不发生）。
      */
     fun openMeetingByName(raw: String) {
-        _tab.value = 1
+        _tab.value = EchoTab.MEETINGS.ordinal
         viewModelScope.launch {
             try {
                 val resp = api().meetings(limit = MEETING_LOOKUP_LIMIT)
@@ -731,8 +737,9 @@ class MainViewModel(app: Application) : BaseViewModel(app) {
         // 复用「手机当麦克风」那条既有入口（前台服务 + AudioRecord + 本地清单 + 补传），
         // **不**在这里另写一套录音/建会逻辑。
         com.echo.contact.service.MeetingMicService.start(app)
-        _meetingsNote.value =
-            "已开始录音：这台手机正在录（声音先存在手机里；连不上 ECHO 也照样录，联网后自动补传）"
+        // 只留一句"已开始"：细节（先存手机、联网补传、段长）都在会议页与录音界面的 ⓘ 里。
+        // 用户 2026-10-18："全屏界面里不用加这些啰嗦的说明" —— 这句也不能长回去。
+        _meetingsNote.value = "已开始录音"
         // 直接进**全屏录音界面**（电平 + 静音 + 结束）。服务是异步起来的，
         // 界面先按"还没开始"显示，状态一到就切过去 —— 失败（比如没给麦克风权限）
         // 会把原因显示在这个界面上（`MicState.error`），不会静默。

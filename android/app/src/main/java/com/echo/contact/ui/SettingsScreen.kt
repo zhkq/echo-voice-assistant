@@ -10,6 +10,8 @@ import android.os.PowerManager
 import android.provider.Settings
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -69,6 +71,7 @@ import com.echo.contact.ui.theme.EchoPalette
  *
  * 「服务状态」也不在这（它在首页那张状态卡上）：状态是天天看的，设置是偶尔改的。
  */
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun SettingsScreen(vm: MainViewModel, onBack: () -> Unit, onUnpair: () -> Unit) {
     val context = LocalContext.current
@@ -236,30 +239,42 @@ fun SettingsScreen(vm: MainViewModel, onBack: () -> Unit, onUnpair: () -> Unit) 
                     Spacer(Modifier.height(6.dp))
 
                     // ---- 「手机当麦克风」每段多长 ----
-                    MutedLine("**手机当麦克风**：每段 ${segmentSeconds} 秒（改完下次开录生效）", maxLines = 2)
+                    // 默认 600 秒：用户 2026-10-18 点名"跟电脑一样 10 分钟一段就行"
+                    // （段长与电脑一致，两边的段边界才有同一个含义）。
+                    MutedLine("**手机当麦克风**：每段 ${segmentDurationText(segmentSeconds)}（改完下次开录生效）", maxLines = 2)
                     Spacer(Modifier.height(6.dp))
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    // 档位变成 5 个：用 FlowRow 自动换行（窄屏上不会把最后一个挤出去）
+                    FlowRow(
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
                         for (sec in AppPrefs.SEGMENT_SECONDS_CHOICES) {
+                            val label = segmentChoiceLabel(sec)
                             if (sec == segmentSeconds) {
-                                Button(onClick = {}) { Text("$sec 秒") }
+                                Button(onClick = {}) { Text(label) }
                             } else {
                                 OutlinedButton(onClick = {
-                                    // 单选的三档都走 AppPrefs 的夹取（判据只有一处），这里不自己判
+                                    // 单选都走 AppPrefs 的夹取（判据只有一处），这里不自己判
                                     segmentSeconds = AppPrefs.normalizeSegmentSeconds(sec)
                                     AppPrefs.saveSegmentSeconds(context, segmentSeconds)
-                                }) { Text("$sec 秒") }
+                                }) { Text(label) }
                             }
                         }
                     }
                     MutedLine(
-                        "一段 ≈ 秒数×32KB：长一点段数少，但一次失败要重传的就大；" +
-                            "短一点重传轻，但请求多。默认 30 秒 ≈1 MB，走中继很稳。",
+                        "每 ${segmentDurationText(segmentSeconds)} 封一段；结束时不足一段会补成尾段。",
+                        maxLines = 2,
+                    )
+                    Spacer(Modifier.height(4.dp))
+                    MutedLine(
+                        "默认 10 分钟，与电脑一致。段越长，一次失败要重传的那段越大" +
+                            "（走中继时单次上限 12 MB；FLAC 编不出来退回 WAV 时更容易超限）。",
                         maxLines = 3,
                     )
                     Spacer(Modifier.height(4.dp))
                     MutedLine(
                         "发不出去的段会留在手机缓存里，下次上传前自动重试 —— " +
-                            "录音界面上能看到「待重传 N 段」并按「立即重传」。",
+                            "录音界面上的「现在同步」可以手动催一次。",
                         maxLines = 3,
                     )
 
@@ -571,6 +586,29 @@ fun SettingsScreen(vm: MainViewModel, onBack: () -> Unit, onUnpair: () -> Unit) 
         )
     }
 }
+
+/**
+ * 段长档位 → 短标签（纯函数，`SettingsSegmentChoicesTest` 钉住）。
+ *
+ * 600 秒是**默认档**，用户 2026-10-18 点名要跟电脑一致，所以它必须在界面上
+ * 一眼看出是推荐的 —— 不然用户会按旧的 30 秒习惯去选，手机与电脑的段边界就对不上。
+ */
+internal fun segmentDurationText(seconds: Int): String = when (seconds) {
+    15 -> "15 秒"
+    30 -> "30 秒"
+    60 -> "1 分钟"
+    300 -> "5 分钟"
+    600 -> "10 分钟"
+    else -> "$seconds 秒"
+}
+
+/** 按钮上的档位标签：默认那一档带上「与电脑一致（推荐）」。 */
+internal fun segmentChoiceLabel(seconds: Int): String =
+    if (seconds == AppPrefs.DEFAULT_SEGMENT_SECONDS) {
+        "${segmentDurationText(seconds)} · 与电脑一致（推荐）"
+    } else {
+        segmentDurationText(seconds)
+    }
 
 /**
  * 一行设备选项：选中的标「正在用」，其余给一个按钮。

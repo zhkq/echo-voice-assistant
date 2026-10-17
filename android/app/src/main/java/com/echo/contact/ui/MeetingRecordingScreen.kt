@@ -14,12 +14,15 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.MicOff
 import androidx.compose.material.icons.filled.Stop
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
@@ -41,7 +44,6 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
-import com.echo.contact.service.OfflinePhase
 import com.echo.contact.ui.theme.EchoPalette
 import kotlinx.coroutines.delay
 import kotlin.math.abs
@@ -51,8 +53,44 @@ import kotlin.math.max
 internal const val LEVEL_BARS = 17
 
 /**
- * **全屏会议录音界面**（用户 2026-10-15 要的）：
- * 好看的实时电平 + 结束 / 静音（暂停）· 恢复，外加已录时长与段数。
+ * 主按钮的高度（dp）。**界面与布局判据共用这一个数**：按钮不许被文字挤掉，
+ * 所以"文字区 + 这个高度 + 底部留白"必须装得进屏幕（见 [recordingButtonsVisible]）。
+ */
+internal const val RECORDING_BUTTON_HEIGHT_DP = 56
+
+/** 主界面上状态行只许有**一行**（用户 2026-10-18："简洁些就行，内容把按钮都盖住了"）。 */
+internal const val RECORDING_STATUS_MAX_LINES = 1
+
+/** 错误行是例外（录不起来必须说原因），但最多两行，且要算进按钮的高度预算。 */
+internal const val RECORDING_ERROR_MAX_LINES = 2
+
+/**
+ * 主界面里**除状态行/错误行/按钮之外**那些固定块占的高度（dp）。
+ *
+ * 来源（都是这份文件里的真实布局）：上下 padding 40 + 顶栏 48 + 标题 24 + 间距 6+18
+ * + 大计时 44 + 本段进度 18 + 状态行上方间距 4 + 电平区前间距 28 + 电平区 180
+ * + 间距 10 + 按钮下方留白 6 = 426。
+ *
+ * 为什么把它抽成一个数：旧版把 5 段解释性文字（最多十几行）全堆在按钮上方，
+ * 小屏上"文字 + 电平 + 按钮"超过了屏幕高度，于是按钮被挤出可视区
+ * （用户截图里正是"文字盖住按钮"）。现在解释性内容只放在 ⓘ 弹窗里，
+ * 主界面只留一行状态 —— 这个预算函数就是"按钮完整可见"的可测判据。
+ */
+internal const val RECORDING_BASE_AREA_DP = 426
+
+/** 一行小字的高度（dp，labelSmall/bodyMedium 一行约 16dp）。 */
+internal const val RECORDING_LINE_DP = 16
+
+/**
+ * **全屏会议录音界面**（用户 2026-10-15 要的）：好看的实时电平 + 结束 / 静音（暂停）· 恢复，
+ * 外加已录时长与段数。
+ *
+ * ## 2026-10-18 收口：主界面只给"正在录的人"看
+ *
+ * 用户原话："全屏界面里不用加这些啰嗦的说明，简洁些就行，内容把按钮都盖住了"。
+ * 所以这一版的主界面**只有一行状态**（[recordingStatusLine]），解释性内容全部收进
+ * 右上角 ⓘ 的弹窗（[recordingInfoLines]）：**主界面是给正在录的人看的，不是文档**。
+ * 大计时 / 本段进度 / 电平条 / 两个按钮一个都没少。
  *
  * ## 数据从哪来（2026-10-17 真机 bug 之后改的）
  *
@@ -102,6 +140,9 @@ fun MeetingRecordingScreen(vm: MainViewModel) {
     val paused = mic.paused
     val accent = if (paused) EchoPalette.Yellow else EchoPalette.Red
 
+    // 解释性内容默认收起来（用户 2026-10-18：主界面别被文字占满）
+    var showInfo by remember { mutableStateOf(false) }
+
     // 计时**每一秒重算一次**（用户 2026-10-17 真机问题①："暂停时计时器也不刷新时间了"）。
     //
     // 为什么不能只靠 `mic` 的状态变化：Compose 只在**状态变了**才重组，而暂停时电平是
@@ -123,17 +164,38 @@ fun MeetingRecordingScreen(vm: MainViewModel) {
             modifier = Modifier.fillMaxSize().padding(20.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
+            // ---- 顶栏：返回 / （有欠段时）现在同步 / ⓘ 说明 ----
+            // 说明性长文只在 ⓘ 里出现：主界面留给大计时、电平与按钮。
             Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                TextButton(onClick = { vm.closeRecordingScreen() }) { Text("← 返回（继续录）") }
+                TextButton(onClick = { vm.closeRecordingScreen() }) { Text("← 返回") }
                 Spacer(Modifier.weight(1f))
-                Text(
-                    // 暂停时也要把"时长还在累计"说在标题上 —— 只写"已暂停"会让人以为时间也停了
-                    if (paused) "已暂停 · 时长仍在累计" else "录音中",
-                    style = MaterialTheme.typography.titleMedium,
-                    color = accent,
-                    fontWeight = FontWeight.SemiBold,
-                )
+                if (mic.syncPending > 0) {
+                    TextButton(
+                        enabled = !mic.syncBusy,
+                        onClick = {
+                            // 复用服务里那一条补传路（不在这里另写上传逻辑）
+                            com.echo.contact.service.MeetingMicService.syncNow(context)
+                        },
+                    ) { Text(if (mic.syncBusy) "同步中…" else "现在同步") }
+                }
+                IconButton(onClick = { showInfo = true }) {
+                    Icon(
+                        Icons.Default.Info,
+                        contentDescription = "录音说明",
+                        tint = EchoPalette.Muted,
+                    )
+                }
             }
+
+            Spacer(Modifier.height(6.dp))
+            // 暂停时明确说"时长在累计"：只说"已暂停"会让人以为时间也停了
+            // （暂停 = 照常录、写全零，时间轴逐字连续 —— 用户 2026-10-16 深夜的口径）。
+            Text(
+                recordingTitle(paused),
+                style = MaterialTheme.typography.titleMedium,
+                color = accent,
+                fontWeight = FontWeight.SemiBold,
+            )
 
             Spacer(Modifier.height(18.dp))
 
@@ -153,47 +215,23 @@ fun MeetingRecordingScreen(vm: MainViewModel) {
                     MutedLine(it, maxLines = 1)
                 }
             Spacer(Modifier.height(4.dp))
-            MutedLine(
-                buildString {
-                    // 这条路永远是"先落本地"：说清"录到几段、其中几段已经传上去了"
-                    // —— 只说"已传 N 段"会让人以为本地没有副本（其实本地那份才是本体）。
-                    val total = mic.syncPending + mic.syncConfirmed
-                    append("手机麦克风 · 已缓存 ${if (total > 0) total else mic.syncPending} 段")
-                    if (mic.syncConfirmed > 0) append("（已传 ${mic.syncConfirmed} 段）")
-                    if (mic.formatNote.isNotBlank()) {
-                        // 格式**如实**：退回 WAV 时要说清是哪一段、为什么（用户点名要求）
-                        append(" · ${mic.formatNote}")
-                    }
-                },
-                maxLines = 2,
+            // ---- 唯一的精简状态行（不再堆"已缓存/已传/格式/补传说明"那一堆）----
+            Text(
+                recordingStatusLine(
+                    cached = mic.syncPending + mic.syncConfirmed,
+                    pending = mic.syncPending,
+                ),
+                style = MaterialTheme.typography.bodyMedium,
+                color = EchoPalette.Muted,
+                maxLines = RECORDING_STATUS_MAX_LINES,
             )
 
-            // ---- 音频"传上去没有"：**如实的一行** + 「现在同步」----
-            // 这一行是"音频到底有没有传上去"的唯一出口：连不上时先说"ECHO 连不上、
-            // 音频先存在这台手机里"，绝不说成"已上传"。
-            if (mic.syncNote.isNotBlank()) {
-                Spacer(Modifier.height(8.dp))
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Text(
-                        mic.syncNote,
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = if (mic.syncPhase == OfflinePhase.DONE) EchoPalette.Green
-                        else EchoPalette.Yellow,
-                        fontWeight = FontWeight.SemiBold,
-                        modifier = Modifier.weight(1f),
-                    )
-                    if (mic.syncPending > 0 && !mic.syncBusy) {
-                        OutlinedButton(
-                            onClick = {
-                                // 复用服务里那一条补传路（不在这里另写上传逻辑）
-                                com.echo.contact.service.MeetingMicService.syncNow(context)
-                            },
-                        ) { Text("现在同步") }
-                    }
-                }
+            // 录音真的起不来时（最常见是没给麦克风权限），原因必须显示在这里 ——
+            // 界面开着却什么都没录是最糟的状态，至少要说清为什么。
+            // 这是**错误**，不是解释性文字：它照旧显示在主界面（最多两行）。
+            mic.error.takeIf { it.isNotBlank() }?.let {
+                Spacer(Modifier.height(4.dp))
+                MutedLine(it, color = EchoPalette.Red, maxLines = RECORDING_ERROR_MAX_LINES)
             }
 
             Spacer(Modifier.height(28.dp))
@@ -224,35 +262,6 @@ fun MeetingRecordingScreen(vm: MainViewModel) {
                         )
                     }
                 }
-                if (paused) {
-                    Text("已静音 · 这段写空白，时长照常累计", color = EchoPalette.Yellow,
-                        style = MaterialTheme.typography.bodyMedium)
-                }
-            }
-
-            Spacer(Modifier.height(10.dp))
-            MutedLine(
-                when {
-                    // 暂停时把**三件事**说清（2026-10-17 的两个真机问题都在这一句里）：
-                    // 内容是空白 ✓、时长照常累计 ✓、段也照常在封 ✓（所以恢复后可能马上就封一段，
-                    // 那一小段是暂停期间按挂钟攒满的，不是"提前封"）。
-                    paused -> "已暂停：这段写空白，时长照常累计、段照常在封；恢复后接着录"
-                    // 这条路永远是"先落本地、再顺手传"：说清这一点（**不**说"离线"，
-                    // 因为在线时也一样先落本地 —— 用户 2026-10-17 的原话是"没有本质区别"）
-                    else -> "声音来自**这台手机的麦克风**：每一段先存在手机里，" +
-                        "网通就顺手传给电脑（最多滞后一段），不通就留着等联网自动补传"
-                },
-                maxLines = 2,
-            )
-            note?.takeIf { it.isNotBlank() }?.let {
-                Spacer(Modifier.height(4.dp))
-                MutedLine(it, color = EchoPalette.Yellow, maxLines = 2)
-            }
-            // 录音真的起不来时（最常见是没给麦克风权限），原因必须显示在这里 ——
-            // 界面开着却什么都没录是最糟的状态，至少要说清为什么。
-            mic.error.takeIf { it.isNotBlank() }?.let {
-                Spacer(Modifier.height(4.dp))
-                MutedLine(it, color = EchoPalette.Red, maxLines = 3)
             }
 
             Spacer(Modifier.weight(1f))
@@ -273,7 +282,7 @@ fun MeetingRecordingScreen(vm: MainViewModel) {
                         // （把自己的缺点说成用户的错，最不该）。
                         com.echo.contact.service.MeetingMicService.setPaused(context, !paused)
                     },
-                    modifier = Modifier.weight(1f).height(56.dp),
+                    modifier = Modifier.weight(1f).height(RECORDING_BUTTON_HEIGHT_DP.dp),
                 ) {
                     Icon(
                         if (paused) Icons.Default.Mic else Icons.Default.MicOff,
@@ -292,22 +301,127 @@ fun MeetingRecordingScreen(vm: MainViewModel) {
                         vm.closeRecordingScreen()
                     },
                     colors = ButtonDefaults.buttonColors(containerColor = EchoPalette.Red),
-                    modifier = Modifier.weight(1f).height(56.dp),
+                    modifier = Modifier.weight(1f).height(RECORDING_BUTTON_HEIGHT_DP.dp),
                 ) {
                     Icon(Icons.Default.Stop, contentDescription = null, modifier = Modifier.size(18.dp))
                     Spacer(Modifier.width(8.dp))
                     Text("结束")
                 }
             }
-            Spacer(Modifier.height(8.dp))
-            MutedLine(
-                "结束后手机把剩下的段补齐、让 ECHO 收尾（收尾之后才开始转写）；" +
-                    "传不完的会留着，联网后自动接着传（也可以点「现在同步」）",
-                maxLines = 2, color = EchoPalette.Muted)
             Spacer(Modifier.height(6.dp))
+        }
+
+        // 解释性内容收在这里：点 ⓘ 才出现，**不占主界面、不盖按钮**。
+        if (showInfo) {
+            val lines = recordingInfoLines(
+                paused = paused,
+                syncNote = mic.syncNote,
+                formatNote = mic.formatNote,
+                note = note,
+                segmentSeconds = mic.segmentSeconds,
+            )
+            AlertDialog(
+                onDismissRequest = { showInfo = false },
+                confirmButton = {
+                    TextButton(onClick = { showInfo = false }) { Text("知道了") }
+                },
+                title = { Text("录音说明") },
+                text = {
+                    Column {
+                        lines.forEach { line ->
+                            Text(
+                                line,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = EchoPalette.Muted,
+                            )
+                            Spacer(Modifier.height(6.dp))
+                        }
+                    }
+                },
+            )
         }
     }
 }
+
+/**
+ * 主界面上**唯一**那一行状态（纯函数，`RecordingUiTest` 钉住）。
+ *
+ * 用户 2026-10-18 点名的形态：`本机录音中 · 已缓存 1 段 · 1 段待传`；
+ * **没有待传就不提**（不让"0 段待传"这种废话占位置）。
+ * 缓冲里一段都没有时只留"本机录音中"——不编一个"已缓存 0 段"出来。
+ */
+internal fun recordingStatusLine(cached: Int, pending: Int): String {
+    val c = cached.coerceAtLeast(0)
+    val p = pending.coerceAtLeast(0)
+    return buildString {
+        append("本机录音中")
+        if (c > 0) append(" · 已缓存 $c 段")
+        if (p > 0) append(" · $p 段待传")
+    }
+}
+
+/**
+ * 标题（纯函数）。
+ *
+ * 暂停时直接写"已暂停 · 时长在累计"：暂停 = 照常录音、写全零、总时长不受影响，
+ * 只写"已暂停"会让人以为时间也停了（用户 2026-10-17 的真机问题①）。
+ */
+internal fun recordingTitle(paused: Boolean): String =
+    if (paused) "已暂停 · 时长在累计" else "录音中"
+
+/**
+ * 点 ⓘ 才显示的说明（纯函数）。
+ *
+ * 这些内容**不能丢**（用户 2026-10-18：解释性内容不要丢，收到帮助里或 ⓘ 里），
+ * 但它们也不该占着主界面 —— 主界面是给正在录的人看的，不是文档。
+ */
+internal fun recordingInfoLines(
+    paused: Boolean,
+    syncNote: String,
+    formatNote: String,
+    note: String?,
+    /** 当前段长（秒；0 = 还没读到设置，就按默认 10 分钟说）。 */
+    segmentSeconds: Int = 0,
+): List<String> = buildList {
+    add("返回只关这个界面，不停录音；要停就按「结束」。")
+    // 滞后多久**按当前段长说**（默认 600 秒 = 10 分钟）：说"默认 10 分钟"而用户选了 30 秒，
+    // 就是一句不准的话 —— 这个界面上的说明宁可短，也不能错。
+    val lag = if (segmentSeconds > 0) {
+        "最多滞后一个段长（当前 ${elapsedTextOf(segmentSeconds.toDouble())}）"
+    } else {
+        "最多滞后一个段长（默认 10:00）"
+    }
+    add("声音来自这台手机的麦克风：每段先存在手机里，网通就顺手传给电脑" +
+        "（$lag），不通就留着、联网后自动补传。")
+    if (paused) add("已暂停：这段写空白，时长照常累计、段照常在封；恢复后接着录。")
+    add("结束时手机把剩下的段补齐（不足一段补成尾段），ECHO 收尾后才开始转写。")
+    // 同步与格式的**如实**说明（这几条以前直接摊在主界面上）
+    syncNote.takeIf { it.isNotBlank() }?.let { add(it) }
+    formatNote.takeIf { it.isNotBlank() }?.let { add(it) }
+    note?.takeIf { it.isNotBlank() }?.let { add(it) }
+}
+
+/**
+ * 主界面文字区（除按钮外）需要的高度（dp）。`statusLines` 是状态行数、
+ * `errorLines` 是错误行数 —— 两者都是**会变化的事实**，所以要算进预算。
+ */
+internal fun recordingTextAreaDp(statusLines: Int, errorLines: Int = 0): Int =
+    RECORDING_BASE_AREA_DP +
+        (statusLines.coerceAtLeast(0) + errorLines.coerceAtLeast(0)) * RECORDING_LINE_DP
+
+/**
+ * "文字区 + 按钮"装不装得进这块屏幕（**布局断言**：按钮完整可见、不被文字挤掉）。
+ *
+ * 为什么用纯函数而不是仪器化布局测试：这个工程的门禁是 JVM 单测（没有 androidTest），
+ * 而"按钮会不会被文字挤出去"其实是**高度的加减法**。这里把布局里的真实块高度
+ * （[RECORDING_BASE_AREA_DP] / [RECORDING_LINE_DP] / [RECORDING_BUTTON_HEIGHT_DP]）
+ * 变成可测的判据：改回"把一堆说明摊在主界面"时，这条用例会先红。
+ */
+internal fun recordingButtonsVisible(
+    screenHeightDp: Int,
+    statusLines: Int,
+    errorLines: Int = 0,
+): Boolean = recordingTextAreaDp(statusLines, errorLines) + RECORDING_BUTTON_HEIGHT_DP <= screenHeightDp
 
 /**
  * 电平平滑：**攻击快、回落慢**。
@@ -387,11 +501,12 @@ internal fun elapsedLabel(stateSeconds: Double, startedAt: String?, now: Long): 
 }
 
 /**
- * "本段 00:12 / 00:30"（段长未知时回空串 —— **不编数字**）。
+ * "本段 00:12 / 10:00"（段长未知时回空串 —— **不编数字**）。
  *
  * 为什么要在界面上显示它：段是按累计样本数切的（暂停的零样本照常计数），所以
  * **暂停期间这一段也在攒**。用户看不到这件事时，恢复后立刻封一段就会被当成
  * "不到一分钟就封段了"（真机问题②）；把它摆出来，"这一段是暂停期间按挂钟攒满的"就一目了然。
+ * 段长默认 600 秒（与电脑一致），所以这里会显示 `/ 10:00`。
  */
 internal fun segmentProgressText(segmentElapsedSeconds: Double, segmentSeconds: Int): String {
     if (segmentSeconds <= 0) return ""

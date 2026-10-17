@@ -46,7 +46,7 @@ class AppPrefsTest {
     // ---- 「手机当麦克风」每段多长 ----
 
     @Test
-    fun `三个可用档位原样保留`() {
+    fun `每个可用档位都原样保留`() {
         for (sec in AppPrefs.SEGMENT_SECONDS_CHOICES) {
             assertEquals("$sec 秒是界面上真实存在的档，必须原样留着", sec,
                 AppPrefs.normalizeSegmentSeconds(sec))
@@ -56,7 +56,7 @@ class AppPrefsTest {
     @Test
     fun `认不出的秒数夹到最近的一档而不是夹到 0`() {
         // 0 / 负数会让"每 0 秒切一段" → 空段刷屏；判据必须是"落到某一档"，
-        // 而不是"夹到上下界"（夹到下界 15 就丢掉了 60 那一档的意图）
+        // 而不是"夹到上下界"（夹到下界 15 就丢掉了 600 那一档的意图）
         assertEquals(15, AppPrefs.normalizeSegmentSeconds(0))
         assertEquals(15, AppPrefs.normalizeSegmentSeconds(-30))
         assertEquals(15, AppPrefs.normalizeSegmentSeconds(14))
@@ -65,16 +65,19 @@ class AppPrefsTest {
         assertEquals(15, AppPrefs.normalizeSegmentSeconds(18))
         assertEquals(30, AppPrefs.normalizeSegmentSeconds(45))
         assertEquals(60, AppPrefs.normalizeSegmentSeconds(55))
-        assertEquals(60, AppPrefs.normalizeSegmentSeconds(9999))
+        assertEquals(300, AppPrefs.normalizeSegmentSeconds(240))
+        assertEquals(600, AppPrefs.normalizeSegmentSeconds(9999))
     }
 
     @Test
-    fun `默认是 30 秒`() {
-        // 为什么是 30：一段 ≈1MB（16kHz 单声道 16bit），走中继（单次上限 12MB）很稳。
-        // 这个默认值写在界面上（"默认 30 秒 ≈1 MB"），所以它也是一个判据
-        assertEquals(30, AppPrefs.DEFAULT_SEGMENT_SECONDS)
+    fun `默认是 600 秒 与电脑一致`() {
+        // 用户 2026-10-18 原话："手机录音 30 秒一段吗？跟电脑一样 10 分钟一段就行"。
+        // 默认值同时写在设置页上（"默认 10 分钟，与电脑一致"），所以它也是一个判据。
+        assertEquals(600, AppPrefs.DEFAULT_SEGMENT_SECONDS)
         assertTrue("默认那一档必须在可选档里（否则界面会显示一个选不中的值）",
             AppPrefs.SEGMENT_SECONDS_CHOICES.contains(AppPrefs.DEFAULT_SEGMENT_SECONDS))
+        // 10 分钟 = 600 秒；别把"10 分钟"错写成 60 秒
+        assertEquals(10 * 60, AppPrefs.DEFAULT_SEGMENT_SECONDS)
     }
 
     @Test

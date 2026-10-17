@@ -251,7 +251,7 @@ class FlacSegmentEncoder(
 
             val out = ByteArrayOutputStream(pcm.size / 2 + 64)
             val info = MediaCodec.BufferInfo()
-            val deadline = System.currentTimeMillis() + ENCODE_TIMEOUT_MS
+            val deadline = System.currentTimeMillis() + encodeTimeoutMsFor(pcm.size)
             var fed = 0
             var eosQueued = false
             var finished: ByteArray? = null
@@ -314,9 +314,23 @@ class FlacSegmentEncoder(
         const val FLAC_MIME = "audio/flac"
         const val DEFAULT_COMPRESSION_LEVEL = 5
 
-        /** 一次编码最多等多久（10 秒 ≈ 160 秒音频的编码时间，够宽；超了就退回 WAV）。 */
+        /** 编码硬超时的**底**（毫秒）。按输入大小再加（见 [encodeTimeoutMsFor]）。 */
         const val ENCODE_TIMEOUT_MS = 10_000L
 
         private const val DEQUEUE_TIMEOUT_US = 10_000L
     }
+}
+
+/**
+ * 一段编码最多等多久（毫秒），**跟着输入数据量走**。
+ *
+ * 旧的固定 10 秒是按 30 秒段标定的（≈1 MB）。段长默认改成 600 秒后输入大 20 倍，
+ * 固定 10 秒会把"还没编完"误判成"编不出来" → 无谓退回 WAV（10 分钟 ≈19 MB，
+ * 走中继时超过 12 MB 上限就传不上去）。所以预算 = 10 秒底 + 每 MB 1 秒，封顶 90 秒
+ * （真卡死也不能让封段线一直挂着）。短段的行为与旧版一致（10 秒底）。
+ */
+internal fun encodeTimeoutMsFor(pcmBytes: Int): Long {
+    if (pcmBytes <= 0) return FlacSegmentEncoder.ENCODE_TIMEOUT_MS
+    val mb = (pcmBytes + 1_048_575) / 1_048_576   // 向上取整到 MB
+    return (FlacSegmentEncoder.ENCODE_TIMEOUT_MS + mb * 1_000L).coerceAtMost(90_000L)
 }

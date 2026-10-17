@@ -235,4 +235,27 @@ class MeetingSegmentAudioTest {
             SegmentEncoding.FLAC_HEADER_NOT_FIXED == SegmentEncoding.FLAC_UNAVAILABLE)
         assertFalse(SegmentEncoding.FLAC_HEADER_NOT_FIXED == SegmentEncoding.FLAC_NOT_RECOGNIZED)
     }
+
+    // ---------------------------------------------------------------- 编码超时预算（段长 600 秒）
+
+    /**
+     * 编码超时必须**跟着数据量走**。
+     *
+     * 旧值固定 10 秒是按 30 秒段（≈1 MB）标定的。默认段长改成 600 秒后输入大 20 倍，
+     * 固定 10 秒会把"还没编完"误判成"编不出来"→ 无谓退回 WAV（19 MB，走中继超过 12 MB
+     * 上限就传不上去）。这条钉住"长段的预算更大、而且仍有上界"。
+     */
+    @Test
+    fun `编码超时预算跟着数据量走且仍有上界`() {
+        assertEquals("没有输入/空段：保持旧版的 10 秒底", 10_000L, encodeTimeoutMsFor(0))
+        // 30 秒段 ≈ 960,000 字节 → 1 MB 档，只比旧值多一点
+        assertTrue(encodeTimeoutMsFor(960_000) >= 10_000L)
+        // 600 秒段 ≈ 19,200,000 字节：必须显著大于 10 秒，否则长段永远退回 WAV
+        val long = encodeTimeoutMsFor(19_200_000)
+        assertTrue("600 秒段的编码预算太小：$long", long >= 25_000L)
+        assertTrue("预算必须有上界（卡死的编码器不能把封段线拖死）：$long", long <= 90_000L)
+        assertEquals("超大输入封顶 90 秒", 90_000L, encodeTimeoutMsFor(200 * 1024 * 1024))
+        // 单调：输入越大，预算不缩
+        assertTrue(encodeTimeoutMsFor(19_200_000) >= encodeTimeoutMsFor(960_000))
+    }
 }

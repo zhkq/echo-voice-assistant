@@ -2,6 +2,7 @@ package com.echo.contact.service
 
 import com.echo.contact.audio.SegmentEncoding
 import com.echo.contact.audio.SegmentFormat
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -121,7 +122,7 @@ class MeetingMicPcmTest {
     fun `暂停帧与真实帧同长度且内容是零`() {
         val loop = MicCaptureLoop(100)
         val real = ShortArray(10) { (it + 1).toShort() }
-        val buffer = ArrayList<Short>()
+        val buffer = PcmBuffer()
 
         val paused = loop.feed(buffer, real, 10, active = false)
 
@@ -135,7 +136,7 @@ class MeetingMicPcmTest {
     fun `暂停期间照样封段（段边界落在同一刻度上）`() {
         val loop = MicCaptureLoop(30)
         val real = ShortArray(10) { 7 }
-        val buffer = ArrayList<Short>()
+        val buffer = PcmBuffer()
         var seals = 0
 
         repeat(9) {
@@ -156,7 +157,7 @@ class MeetingMicPcmTest {
     fun `不暂停时样本照原样进缓冲（别把真音频弄丢了）`() {
         val loop = MicCaptureLoop(4)
         val real = shortArrayOf(1, 2, 3, 4)
-        val buffer = ArrayList<Short>()
+        val buffer = PcmBuffer()
 
         val feed = loop.feed(buffer, real, 4, active = true)
 
@@ -170,7 +171,7 @@ class MeetingMicPcmTest {
         // 这条不变量要一直成立 —— 这也是旧代码的形状（整帧加进去、满了才封）。
         // ⚠️ 满了之后 `feed` **不清缓冲**：封段的人要先读它拿到 PCM（纯逻辑里清了就等于丢一段）
         val loop = MicCaptureLoop(8)
-        val buffer = ArrayList<Short>()
+        val buffer = PcmBuffer()
 
         val one = loop.feed(buffer, ShortArray(6) { 1 }, 6, active = true)
         assertFalse("6 个还没满 8", one.sealed)
@@ -188,11 +189,40 @@ class MeetingMicPcmTest {
         // 这条挡的是一次真实踩到的错法：`feed` 里顺手 `clear()` → 调用方读到空缓冲 →
         // 封下去的是一段**全零**（真的丢音频），而手机上一切"看着正常"。
         val loop = MicCaptureLoop(4)
-        val buffer = ArrayList<Short>()
+        val buffer = PcmBuffer()
 
         val feed = loop.feed(buffer, shortArrayOf(1, 2, 3, 4), 4, active = true)
 
         assertTrue(feed.sealed)
         assertEquals("满了也要留着那 4 个样本让调用方去封", listOf<Short>(1, 2, 3, 4), buffer.toList())
+    }
+
+    /**
+     * `PcmBuffer` 必须与原来的 `List<Short>` 那条路产出**同一份 PCM**。
+     *
+     * 为什么要这条：默认段长改成 600 秒后，缓冲从 `ArrayList<Short>` 换成了原始 `ShortArray`
+     * （装箱的 960 万样本 ≈190 MB，手机上会 OOM）。这属于"换实现"，
+     * 一旦字节序/顺序写错，传上去的音频就是噪声，而手机这边一切"正常" —— 所以必须钉住。
+     */
+    @Test
+    fun `PcmBuffer 与 List 那条路产出同一份 PCM`() {
+        val buffer = PcmBuffer(8)
+        buffer.addSamples(shortArrayOf(1, 2, 3), 0, 3)
+        buffer.addZeros(2)
+        buffer.addSample((-2).toShort())
+
+        assertEquals(6, buffer.size)
+        assertEquals(listOf<Short>(1, 2, 3, 0, 0, -2), buffer.toList())
+        assertArrayEquals(
+            "原生缓冲与 List 版本必须逐字节一致",
+            toPcmBytes(listOf<Short>(1, 2, 3, 0, 0, -2)),
+            toPcmBytes(buffer),
+        )
+        assertEquals("本段进度：6 个样本 / 16kHz", 6.0 / 16_000, progressOf(buffer, 16_000), 1e-12)
+
+        val copy = buffer.toShortArray()
+        buffer.clear()
+        assertArrayEquals("clear 不许改到已经拷出去的尾段", shortArrayOf(1, 2, 3, 0, 0, -2), copy)
+        assertEquals("clear 之后是空的", 0, buffer.size)
     }
 }

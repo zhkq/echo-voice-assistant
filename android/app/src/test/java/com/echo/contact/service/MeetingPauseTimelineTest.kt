@@ -79,7 +79,7 @@ class MeetingPauseTimelineTest {
                 clock = { now }) else null
 
         private val capture = MicCaptureLoop(rate * segmentSeconds)
-        private val buffer = ArrayList<Short>(rate * segmentSeconds)
+        private val buffer = PcmBuffer(rate * segmentSeconds)
         private val elapsed = MeetingElapsed(clock = { now })
 
         /** 采集循环每帧刷新出来的两格状态（与 `MicState` 同名，含义相同）。 */
@@ -124,7 +124,7 @@ class MeetingPauseTimelineTest {
 
         /** 结束：先补尾段再收尾（与 `stopEverything` 同一顺序）。 */
         fun stop(): Pair<TailSealOutcome, MeetingDraft?> {
-            val tail = sealFinalTail(session, buffer.toList(), rate)
+            val tail = sealFinalTail(session, buffer.toShortArray(), rate)
             buffer.clear()
             return tail to session?.finish()
         }

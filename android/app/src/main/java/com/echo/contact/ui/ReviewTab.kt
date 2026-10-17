@@ -4,6 +4,7 @@ import android.Manifest
 import android.content.pm.PackageManager
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
@@ -19,6 +20,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.Mic
+import androidx.compose.material.icons.filled.Today
 import androidx.compose.material.icons.filled.VolumeUp
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
@@ -32,22 +34,99 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.echo.contact.data.dto.DailyReviewState
 import com.echo.contact.data.dto.DailyReviewSummary
+import com.echo.contact.data.dto.ReviewDay
 import com.echo.contact.data.dto.ReviewHistoryDetail
 import com.echo.contact.ui.theme.EchoPalette
 
+/** 回顾页顶部功能区的标题（判据见 `ReviewTabSectionsTest`）。 */
+internal const val REVIEW_FEATURE_TITLE = "回顾功能"
+
+/** 历史列表的标题。 */
+internal const val REVIEW_HISTORY_TITLE = "历史回顾"
+
+/** 历史为空时的空状态文案（用户 2026-10-18：不许退成一整页纯列表，也不能空着不说）。 */
+internal const val REVIEW_HISTORY_EMPTY = "还没有回顾历史。口述一次今天，这里就会出现第一天。"
+
 /**
- * 回顾页：**手机只做"听播报"**。
+ * 回顾页顶部的功能卡（**纯数据**，JVM 可测）。
  *
- * 为什么手机不能"开始回顾"：回顾要占用**主机那支麦克风**口述
- * （`POST /api/daily-review/go` 是在 ECHO 那台机器上开录），手机点它
- * 只会让电脑开始听 —— 那不是手机该干的事。
+ * 只放**现有能力**：今日回顾（状态 + 最近播报）、车里口述（手机自己录）、播报（念）。
+ * 没有的能力不编 —— 例如"整理某一天的日志"手机端没有这个接口，就不放。
+ */
+internal enum class ReviewFeature(val title: String) {
+    TODAY("今日回顾"),
+    DICTATE("车里口述"),
+    SPEAK("播报"),
+}
+
+internal data class ReviewFeatureTile(
+    val feature: ReviewFeature,
+    val subtitle: String,
+    val enabled: Boolean,
+)
+
+/**
+ * 功能区三张卡（纯函数，`ReviewTabSectionsTest` 钉住）。
  *
- * 念用**手机的系统 TTS**（离线、零等待），这是 2026-10-09 定的口径。
+ * `enabled=false` 只出现在"没有可念的播报"那一档：界面把它**置灰 + 写清原因**
+ * （不是藏起来 —— 藏起来用户会以为功能没了）。
+ */
+internal fun reviewFeatureTiles(
+    running: Boolean,
+    enabled: Boolean,
+    ready: Boolean,
+    todayTurns: Int,
+    hasBrief: Boolean,
+    speaking: Boolean,
+): List<ReviewFeatureTile> = listOf(
+    ReviewFeatureTile(
+        feature = ReviewFeature.TODAY,
+        subtitle = when {
+            running -> "进行中"
+            !enabled -> "未启用"
+            !ready -> "未就绪"
+            todayTurns > 0 -> "今天已回顾 $todayTurns 轮"
+            else -> "今天还没回顾"
+        },
+        // 点它 = 重读状态（这个动作永远有意义，不置灰）
+        enabled = true,
+    ),
+    ReviewFeatureTile(
+        feature = ReviewFeature.DICTATE,
+        subtitle = "录一段口述，ECHO 转写并整理",
+        enabled = true,
+    ),
+    ReviewFeatureTile(
+        feature = ReviewFeature.SPEAK,
+        subtitle = if (hasBrief) "念今天 / 最近一次的播报" else "还没有可念的播报",
+        enabled = hasBrief && !speaking,
+    ),
+)
+
+/**
+ * 历史回顾**按日期倒序**（用户 2026-10-18：下面是历史回顾列表）。
+ *
+ * 为什么界面还要再排一次：接口现在就是倒序返回的，但"展示顺序"是界面的事 ——
+ * 后端换实现或分页拼起来时不该让用户看到乱序（这条是纯函数，有判据）。
+ */
+internal fun reviewDaysDescending(days: List<ReviewDay>): List<ReviewDay> =
+    days.sortedByDescending { it.date }
+
+/**
+ * 回顾页：**顶部功能区 + 下面历史回顾列表**（用户 2026-10-18 点名的形态）。
+ *
+ * 为什么手机不能"开始主机回顾"：那要占用**主机那支麦克风**口述 —— 那不是手机该干的事。
+ * 手机走的是"自己录口述 → ECHO 转写整理 → 念播报"这条路（`vm.submitReviewDictation`），
+ * 念用手机系统 TTS（离线、零等待）。
+ *
+ * 上一版是"一张口述卡 + 一张状态卡 + 一整页列表"；这一版把三件事提成顶部功能区
+ * （今日回顾 / 车里口述 / 播报），下面才是历史 —— 与超级助理页的仪表盘形态对齐。
  */
 @Composable
 fun ReviewTab(vm: MainViewModel) {
@@ -79,68 +158,59 @@ fun ReviewTab(vm: MainViewModel) {
         return
     }
 
+    // 三个主入口都是**现有能力**（见 `reviewFeatureTiles`）
+    val tiles = reviewFeatureTiles(
+        running = review?.running == true,
+        enabled = review?.enabled == true,
+        ready = review?.ready == true,
+        todayTurns = summary?.todayTurns ?: 0,
+        hasBrief = !summary?.lastBrief.isNullOrBlank(),
+        speaking = speaking,
+    )
+    val orderedDays = reviewDaysDescending(days)
+
+    // 口述：没授权就先要（与「指令」页同一套做法），授权成功再开始
+    val startDictation: () -> Unit = {
+        val granted = context.checkSelfPermission(Manifest.permission.RECORD_AUDIO) ==
+            PackageManager.PERMISSION_GRANTED
+        if (granted) vm.startRecording() else permissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+    }
+
     LazyColumn(
         modifier = Modifier.fillMaxSize(),
         contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 24.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp),
     ) {
+        // ---- 顶部功能区（与超级助理页同一个仪表盘形态）----
         item {
-            EchoCard {
-                Column {
-                    CardHeader(
-                        title = "口述今天",
-                        dotColor = when {
-                            submitting -> EchoPalette.Purple
-                            recording -> EchoPalette.Red
-                            else -> EchoPalette.Muted
-                        },
-                        trailing = when {
-                            submitting -> "整理中…"
-                            recording -> "录音中 ${"%.1f".format(recordMs / 1000.0)} 秒"
-                            else -> ""
-                        },
-                        trailingColor = if (recording) EchoPalette.Red else EchoPalette.Purple,
-                    )
-                    Spacer(Modifier.height(8.dp))
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
-                        when {
-                            submitting -> {
-                                CircularProgressIndicator(modifier = Modifier.size(16.dp))
-                                Text("正在整理…", style = MaterialTheme.typography.bodySmall)
-                            }
-                            recording -> {
-                                Button(onClick = { vm.submitReviewDictation() }) { Text("说完了") }
-                                TextButton(onClick = { vm.cancelReviewDictation() }) { Text("取消") }
-                            }
-                            else -> {
-                                Button(onClick = {
-                                    val granted = context.checkSelfPermission(Manifest.permission.RECORD_AUDIO) ==
-                                        PackageManager.PERMISSION_GRANTED
-                                    if (granted) vm.startRecording() else permissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
-                                }) {
-                                    Icon(Icons.Default.Mic, contentDescription = null, modifier = Modifier.size(18.dp))
-                                    Spacer(Modifier.size(6.dp))
-                                    Text("说今天干了啥")
+            Text(REVIEW_FEATURE_TITLE, style = MaterialTheme.typography.titleSmall)
+        }
+        item {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                tiles.forEach { tile ->
+                    ReviewFeatureCard(
+                        tile = tile,
+                        modifier = Modifier.weight(1f).height(104.dp),
+                        onClick = {
+                            when (tile.feature) {
+                                // 重读状态与历史（现有动作，不新造）
+                                ReviewFeature.TODAY -> {
+                                    vm.loadReview()
+                                    vm.loadReviewDays()
                                 }
+                                ReviewFeature.DICTATE -> startDictation()
+                                ReviewFeature.SPEAK -> vm.speakReview()
                             }
-                        }
-                    }
-                    if (voiceText.isNotBlank()) {
-                        Spacer(Modifier.height(6.dp))
-                        MutedLine("ECHO 听成：$voiceText", maxLines = 4)
-                    }
-                    submittingNote?.let {
-                        Spacer(Modifier.height(4.dp))
-                        MutedLine(it, color = EchoPalette.Purple)
-                    }
-                    Spacer(Modifier.height(4.dp))
-                    // 这条才是手机该走的回顾路径：**手机录、ECHO 整理**。
-                    // （主机麦克风那条在车里根本听不到你说话；手机上录才成立。）
-                    MutedLine("手机上录口述 → ECHO 转写并整理 → 把播报念给你听（整理要 2–3 分钟）")
+                        },
+                    )
                 }
             }
         }
 
+        // ---- 今日回顾详情：最近一次播报 + 念 / 刷新 / 停 ----
         item {
             ReviewStatusCard(
                 review = review,
@@ -157,12 +227,28 @@ fun ReviewTab(vm: MainViewModel) {
             )
         }
 
-        item { Text("回顾历史", style = MaterialTheme.typography.titleMedium) }
+        // ---- 口述进行中 / 整理中：控制在这里（不在录音时入口是上面那张「车里口述」卡）----
+        if (recording || submitting || voiceText.isNotBlank() || submittingNote != null) {
+            item {
+                DictationCard(
+                    recording = recording,
+                    recordMs = recordMs,
+                    submitting = submitting,
+                    voiceText = voiceText,
+                    submittingNote = submittingNote,
+                    onDone = { vm.submitReviewDictation() },
+                    onCancel = { vm.cancelReviewDictation() },
+                )
+            }
+        }
 
-        if (days.isEmpty()) {
-            item { MutedLine("还没有回顾历史。") }
+        // ---- 历史回顾（按日期倒序；空时有空状态文案）----
+        item { Text(REVIEW_HISTORY_TITLE, style = MaterialTheme.typography.titleMedium) }
+
+        if (orderedDays.isEmpty()) {
+            item { MutedLine(REVIEW_HISTORY_EMPTY, maxLines = 3) }
         } else {
-            items(days, key = { it.date }) { d ->
+            items(orderedDays, key = { it.date }) { d ->
                 EchoCard {
                     Column {
                         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -194,6 +280,108 @@ fun ReviewTab(vm: MainViewModel) {
                         TextButton(onClick = { vm.openReviewDay(d.date) }) { Text("看这一天") }
                     }
                 }
+            }
+        }
+    }
+}
+
+/** 一张功能卡：图标 + 标题 + 一句状态；没有可做的事时置灰（不藏）。 */
+@Composable
+private fun ReviewFeatureCard(
+    tile: ReviewFeatureTile,
+    modifier: Modifier = Modifier,
+    onClick: () -> Unit,
+) {
+    val accent = if (tile.enabled) EchoPalette.Accent else EchoPalette.Muted
+    EchoCard(
+        modifier = modifier.then(
+            if (tile.enabled) Modifier.clickable(onClick = onClick) else Modifier
+        ),
+    ) {
+        Column {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(
+                    featureIcon(tile.feature),
+                    contentDescription = null,
+                    tint = accent,
+                    modifier = Modifier.size(18.dp),
+                )
+                Spacer(Modifier.size(6.dp))
+                Text(
+                    tile.feature.title,
+                    style = MaterialTheme.typography.labelLarge,
+                    color = accent,
+                    maxLines = 1,
+                )
+            }
+            Spacer(Modifier.height(6.dp))
+            MutedLine(tile.subtitle, maxLines = 3)
+        }
+    }
+}
+
+/** 功能 → 图标（只做外观映射）。 */
+private fun featureIcon(feature: ReviewFeature): ImageVector = when (feature) {
+    ReviewFeature.TODAY -> Icons.Default.Today
+    ReviewFeature.DICTATE -> Icons.Default.Mic
+    ReviewFeature.SPEAK -> Icons.Default.VolumeUp
+}
+
+/**
+ * 口述进行中的控制卡（只有真的在录/在整理时才出现）。
+ *
+ * 为什么入口要拆到功能区那张卡：主界面不该常驻一整张"怎么用"的说明卡；
+ * 而一旦开始录，"说完了 / 取消 / 正在整理"必须立刻可见 —— 这几件事不能藏。
+ */
+@Composable
+private fun DictationCard(
+    recording: Boolean,
+    recordMs: Long,
+    submitting: Boolean,
+    voiceText: String,
+    submittingNote: String?,
+    onDone: () -> Unit,
+    onCancel: () -> Unit,
+) {
+    EchoCard {
+        Column {
+            CardHeader(
+                title = "车里口述",
+                dotColor = when {
+                    submitting -> EchoPalette.Purple
+                    recording -> EchoPalette.Red
+                    else -> EchoPalette.Muted
+                },
+                trailing = when {
+                    submitting -> "整理中…"
+                    recording -> "录音中 ${"%.1f".format(recordMs / 1000.0)} 秒"
+                    else -> ""
+                },
+                trailingColor = if (recording) EchoPalette.Red else EchoPalette.Purple,
+            )
+            Spacer(Modifier.height(8.dp))
+            when {
+                submitting -> Row(verticalAlignment = Alignment.CenterVertically) {
+                    CircularProgressIndicator(modifier = Modifier.size(16.dp))
+                    Spacer(Modifier.size(8.dp))
+                    // 整理要一两分钟：先说清，别让用户以为卡住了
+                    Text("正在整理…（通常 2–3 分钟）", style = MaterialTheme.typography.bodySmall)
+                }
+                recording -> Row(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Button(onClick = onDone) { Text("说完了") }
+                    TextButton(onClick = onCancel) { Text("取消") }
+                }
+            }
+            if (voiceText.isNotBlank()) {
+                Spacer(Modifier.height(6.dp))
+                MutedLine("ECHO 听成：$voiceText", maxLines = 4)
+            }
+            submittingNote?.let {
+                Spacer(Modifier.height(4.dp))
+                MutedLine(it, color = EchoPalette.Purple)
             }
         }
     }
@@ -268,7 +456,7 @@ private fun ReviewStatusCard(
                 TextButton(onClick = onStopHost) { Text("停掉主机上正在进行的回顾") }
             }
             Spacer(Modifier.height(4.dp))
-            MutedLine("想口述就回上面「口述今天」—— 手机自己录，不用电脑那支麦克风。")
+            MutedLine("点上面的「车里口述」录一段 —— 手机自己录，不用电脑那支麦克风。")
         }
     }
 }

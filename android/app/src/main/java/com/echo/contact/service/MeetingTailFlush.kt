@@ -7,7 +7,7 @@ import java.util.Locale
  *
  * ## 这次修的是一次真实的退步（用户 2026-10-17 真机要验的第一个场景）
  *
- * 段长默认 30 秒（`AppPrefs.segmentSeconds`，是**用户设置**，15/30/60）。以前"结束录音"
+ * 段长默认 600 秒 = 10 分钟（`AppPrefs.segmentSeconds`，是**用户设置**，15/30/60/300/600）。以前"结束录音"
  * 只做 `session.finish()`：**还攒在缓冲里的那部分样本被直接丢掉**。于是
  * "**录 20 秒就结束**"（用户真机要验的就是这个）既不封段、也不建会、也不上传，
  * 整段录音凭空消失；而旧版"电脑麦"那条路是能录的，所以这是一次**真实的退步**。
@@ -16,7 +16,7 @@ import java.util.Locale
  *
  *  1. **有音频就必须留下**：≥ 1 个样本就封成一段（时长按**真的字节数**算）；
  *     **只有真的一个样本都没有**（一按就停 / 立刻失败 / 没给权限）才允许不建会；
- *  2. **补齐尾段 ≠ 改段长**：段长仍然是用户设置的那个（默认 30 秒），
+ *  2. **补齐尾段 ≠ 改段长**：段长仍然是用户设置的那个（默认 600 秒 = 10 分钟），
  *     这里只在**结束时**把尾巴补成一段 —— 正常录音的段边界一个都不动；
  *  3. **暂停中结束照样封**：暂停期间写进去的是零样本（用户 2026-10-16 深夜的口径：
  *     *"暂停区间就是空白录音，不影响会议总时长"*），它们**照样算时长**、照样封段
@@ -94,24 +94,38 @@ internal fun sealFinalTail(
     session: MeetingRecordSession?,
     samples: List<Short>,
     sampleRate: Int,
+): TailSealOutcome = sealFinalTail(session, samples.toShortArray(), sampleRate)
+
+/**
+ * [ShortArray] 版本（生产路径）：**不装箱**。
+ *
+ * 为什么要有它：段长默认 600 秒，尾段最多也有 960 万个样本；`List<Short>` 那条会
+ * 装箱 960 万次（≈150 MB 临时对象）。生产代码拿 `PcmBuffer.toShortArray()` 调这里，
+ * 测试用小的 `List` 调上面那个重载 —— 语义完全一样（同一个实现）。
+ */
+internal fun sealFinalTail(
+    session: MeetingRecordSession?,
+    samples: ShortArray,
+    sampleRate: Int,
 ): TailSealOutcome {
-    val seconds = TailFlush.secondsOf(samples.size, sampleRate)
-    if (session == null) return TailSealOutcome(samples.size, seconds)
-    if (!TailFlush.hasAudio(samples.size)) {
+    val count = samples.size
+    val seconds = TailFlush.secondsOf(count, sampleRate)
+    if (session == null) return TailSealOutcome(count, seconds)
+    if (!TailFlush.hasAudio(count)) {
         // 一个样本都没有：不建会（没有音频就没有这场会），但原因必须能说出来
         return TailSealOutcome(0, 0.0, note = "这次没有录到音频")
     }
     return try {
         val seal = session.seal(toPcmBytes(samples))
-        val short = if (TailFlush.isVeryShort(samples.size, sampleRate)) "（很短）" else ""
+        val short = if (TailFlush.isVeryShort(count, sampleRate)) "（很短）" else ""
         TailSealOutcome(
-            samples = samples.size,
+            samples = count,
             seconds = seconds,
             seal = seal,
             isTail = true,
             // ⚠️ 落盘失败时**不许**说"留下了"（那只在这一档是假话，见下面的 error）
             note = if (seal.error.isBlank())
-                "最后不足一段的 ${TailFlush.secondsText(samples.size, sampleRate)} 秒$short" +
+                "最后不足一段的 ${TailFlush.secondsText(count, sampleRate)} 秒$short" +
                     "也留下了（第 ${seal.seq} 段）"
             else "",
             error = seal.error,
@@ -119,7 +133,7 @@ internal fun sealFinalTail(
     } catch (e: Exception) {
         // 连封段都抛了：**绝不假装留下**（这是真的可能丢音频）
         TailSealOutcome(
-            samples = samples.size,
+            samples = count,
             seconds = seconds,
             isTail = true,
             error = "最后不足一段的音频没封存下来（可能真的丢了）：${e.message}",

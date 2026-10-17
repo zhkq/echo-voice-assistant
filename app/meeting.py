@@ -33,7 +33,7 @@ from app.audio import tts as tts_mod
 # 拼装层（设计 §4.4）：把各后端给回的东西统一成"逐句 + 时间"，并且**只在这一处**实现。
 # 模块级 import 是刻意的：它只依赖标准库 + dataclasses，没有重依赖，
 # 而且漏了它会在**第一次转写时**才炸（NameError），不如导入时就炸。
-from app.capabilities import assemble
+from app.capabilities import BACKEND_ASR_PROVIDER, assemble
 from app import services
 
 # 安装根由路径层给（含 ECHO_ROOT 覆盖）；会议目录一律走 meetings_dir()（D20/D21）。
@@ -2934,6 +2934,13 @@ def _transcribe_impl(folder):
     #: `SpeakerRegistry` 的用途是"把不同段的标签缝成同一个人"，那需要向量；而后端
     #: 只给时间轴、不给嵌入时（在线转写就是这种）走 `_labels_from_turns`，不经过它。
     #: 惰性建还有一个好处：一场没有说话人的会议不会平白 import 本机分离栈。
+    #:
+    #: **一场会议 = 一套说话人标签**（跨段一致）就靠它：后端是**按段**跑分离的，
+    #: 每段回来的局部标签（`SPEAKER_00` / `S0`）在下一段会重新编号，**不能**当身份用；
+    #: 整场只建这一次注册表，逐段拿"这一段的嵌入"与前面各段的质心比，够像才归入已有
+    #: 编号，不够像就新建一个（见 `app/audio/diarize.py::SpeakerRegistry`）。
+    #: 宁可多一个说话人，也**绝不**为了"看起来连贯"把两段的标签按编号硬并 ——
+    #: 那会把两个不同的人并成一个，而且不报错。
     registry = None
 
     # 声纹识别（常用联系人，issue #6）：库里已有联系人样本时启用。
@@ -3065,6 +3072,12 @@ def _transcribe_impl(folder):
         db.add_log("info", "meeting", "本场转写走能力后端（不加载本地模型）")
 
     diarize_fail = ""      # 分离失败只记一次：8 段会议连说 8 遍会淹没日志
+    #: "分离没给嵌入、整场无法按声纹缝合"这件事一场只说一次（同样是别淹日志）：
+    #: 它是"跨段同一性退化成段内编号"的信号，**必须可见**，但不该每段吼一遍。
+    no_embed_warned = False
+    #: 段内编号用的键序号（见循环里 `local_only` 那段）：从高位起算，
+    #: 避开正常的 `S1..Sn`（那套是跨段全局编号）。
+    scoped_key_seq = 0
     #: 这一场"为什么没转出文字"的两笔**完全不同**的账（2026-10-16 用户口径）：
     #:   * `asr_wait_fail` —— 远端/许可现在干不了（`offline` / `blocked` / …）。
     #:     音频没事，这一场是**待转写**（等它回来 / 去改许可，重转就能成）；
@@ -3114,6 +3127,9 @@ def _transcribe_impl(folder):
             _set_progress(meeting_id, phase="转写中", seg_index=i, seg_total=seg_total,
                           percent=percent, detail=f"第 {i}/{seg_total} 段")
             seg_rows = []
+            #: 这一段的说话人标签是不是**只在段内有效**（见下面"没嵌入"那条分支）。
+            #: 每段重置；只有"多段 + 没有嵌入 + 不是整场聚类的 provider"才为真。
+            local_only = False
             if asr_provider is not None:
                 # P5：外部/在线转写。没有词级时间戳，所以服务端返回的文本在本段时长内
                 # 按句切分、按字数均摊时间（比"整段一行"更接近本地引擎的输出形状）。
@@ -3219,18 +3235,51 @@ def _transcribe_impl(folder):
                                 registry = SpeakerRegistry()
                             label_map = registry.map(embs, labels)
                         else:
-                            # **有轮次、没嵌入**（在线转写就是这种）：标签来自整场那次
-                            # 全局聚类，用自己的编号当显示名；不走注册表（没有向量可缝），
+                            # **有轮次、没嵌入**（在线转写就是这种）：标签只能按后端
+                            # 自己的编号当显示名；不走注册表（没有向量可缝），
                             # 声纹比对也自然不做（见下面那条 `len(labels)` 判据）。
                             label_map = _labels_from_turns(turns_raw)
                             db.add_log("debug", "capability",
                                        "%s 第%s段：后端给了说话人时间轴但没有嵌入"
                                        "（%d 个说话人，标签按后端编号直接用）"
                                        % (meeting_name, i, len(label_map)))
+                            # 但那份编号**未必是整场唯一的**：
+                            #   * `asr-provider` 一次任务覆盖所有段，`speaker_id`
+                            #     **整场一致** → 可以直接用（这正是 §6.6 选它的形状）；
+                            #   * 别的后端是**每段各跑一次**分离，局部编号（`S0`/`S1`…）
+                            #     下一段会重新开始。这时跨段同一性**根本无从判断**：
+                            #     没有向量可缝，而按编号硬并会把段 1 的甲与段 2 的乙
+                            #     并成同一个人（比"多分"坏得多）。
+                            # 所以后一种情形把**段号写进显示名**、键也各自独立 ——
+                            # 宁可同一人在两段各算一个，也绝不把两个人并成一个。
+                            dia_backend_id = str(
+                                (((dia_plan or {}).get("picks") or {})
+                                 .get("diarize.turns") or {}).get("backendId", "") or "")
+                            local_only = (seg_total > 1
+                                          and dia_backend_id != BACKEND_ASR_PROVIDER)
+                            if local_only:
+                                label_map = {pl: "第%d段·%s" % (i, disp)
+                                             for pl, disp in label_map.items()}
+                                if not no_embed_warned:
+                                    no_embed_warned = True
+                                    db.add_log(
+                                        "warn", "capability",
+                                        "%s：后端 %s 的分离结果没有嵌入，整场无法按"
+                                        "声纹缝合说话人 —— 标签按“段号·后端编号”显示，"
+                                        "同一人在别的段可能被标成另一个名字"
+                                        "（宁可多分，不按编号硬并）"
+                                        % (meeting_name, dia_backend_id or "?"))
                     key_map = {}
                     for plabel, disp in label_map.items():
-                        num = re.sub(r"\D", "", disp)
-                        key = "S" + num
+                        if local_only:
+                            # 段内编号：**不解析显示名里的数字**（"第2段·说话人1" 会被
+                            # 拼成 "21"，不是唯一编号）。用整场递增的高位键，
+                            # 保证每段各自独立、永不与别的段撞车。
+                            scoped_key_seq += 1
+                            key = "S%d" % (1000 + scoped_key_seq)
+                        else:
+                            num = re.sub(r"\D", "", disp)
+                            key = "S" + num
                         key_map[plabel] = key
                         speaker_names[key] = disp
                     turns = [(s, e, key_map[spk]) for s, e, spk in turns_raw or ()]

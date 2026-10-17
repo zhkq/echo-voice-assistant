@@ -23,11 +23,13 @@ import com.echo.contact.audio.SegmentFormat
 import com.echo.contact.data.ApiClient
 import com.echo.contact.data.PairStore
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -35,6 +37,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -82,9 +85,10 @@ import kotlin.math.sqrt
  *
  * ## 三个刻意的取舍
  *
- *  1. **按段（默认 30 秒）传**，不做实时流：一段 ≈1 MB（16 kHz 单声道 ≈ 32 KB/s），
- *     走中继（单次上限 12 MB）很稳；断了只重传这一段，不会把整场拖垮。
- *     改成 FLAC 之后大约只要一半体积。
+ *  1. **按段（默认 600 秒 = 10 分钟，与电脑一致）传**，不做实时流：10 分钟 ≈ 19 MB 的 WAV
+ *     （16 kHz 单声道 ≈ 32 KB/s；FLAC 之后约一半），走中继（单次上限 12 MB）——
+ *     FLAC 时通常还在限内，**退回 WAV 时可能超限**（如实写在设置页，别当成"很稳"）；
+ *     断了只重传这一段，不会把整场拖垮。
  *  2. **发不出去就留着**：所有段都在 `filesDir/offline-meetings/`，
  *     **确认对账通过（且服务端收尾）才敢说已上传**，而且**默认不删**
  *     （宁可多留一会儿也别丢音频）。状态里如实写"还有 N 段没传上去"。
@@ -122,12 +126,20 @@ class MeetingMicService : Service() {
         private const val FRAME_SAMPLES = 1600                     // 100ms
 
         /**
-         * 一段多长，**由偏好决定**（设置页那三个 15/30/60）。
+         * 「结束录音」时等封段队列排空的上限（毫秒）。
          *
-         * 为什么**默认 30 秒**：一段 ≈1 MB（16kHz 单声道 16bit ≈ 32 KB/s；FLAC 之后约一半），
-         * 走中继（单次上限 12 MB）很稳；再长一点，一次失败要重传的就多；
-         * 再短一点，段数太多、每段都有一次往返开销。改偏好**下次开录生效**
-         * （正在录的这一场按开录时读到的档，中途换档不会把已缓冲的那半段切碎）。
+         * 为什么要有上界：10 分钟一段的编码可能要几秒，但**不能无限等** ——
+         * 真撞上一个卡死的编码器，"结束"必须照样返回（尾段照常封，宁可顺序冒一点风险）。
+         */
+        private const val SEAL_DRAIN_TIMEOUT_MS = 60_000L
+
+        /**
+         * 一段多长，**由偏好决定**（设置页 15/30/60/300/600 秒）。
+         *
+         * 为什么**默认 600 秒（10 分钟）**：用户 2026-10-18 点名"跟电脑一样 10 分钟一段就行"
+         * —— 段长与电脑一致，两边的段边界才有同一个含义。代价是边录边传最多滞后 10 分钟、
+         * 且一次失败要重传的那段更大（中继单次上限 12 MB，FLAC 通常够、退回 WAV 可能超）。
+         * 改偏好**下次开录生效**（正在录的这一场按开录时读到的档，中途换档不会把已缓冲的那半段切碎）。
          */
         private fun segmentSeconds(context: Context): Int = AppPrefs.segmentSeconds(context)
 
@@ -532,6 +544,30 @@ class MeetingMicService : Service() {
     private var record: AudioRecord? = null
 
     /**
+     * 一次封段任务：PCM 已经从采集缓冲**拷出来**，编码/落盘交给单消费者按序做。
+     *
+     * [ack] 非空 = 这是一个"排空标记"（不是真段）：`stopEverything` 用它等前面
+     * 排队的整段全部落完，再封尾段 —— 顺序反了尾段会排到整段前面（序号与时间轴都乱）。
+     */
+    private data class SealJob(
+        val session: MeetingRecordSession?,
+        val pcm: ByteArray,
+        val ack: CompletableDeferred<Unit>? = null,
+    )
+
+    /**
+     * 封段队列：**单消费者**保证段序（段序号不能乱），容量很小（正常时永远是空的）。
+     *
+     * 为什么编码必须搬出采集协程（2026-10-18 段长默认 600 秒时）：一段 10 分钟 ≈19 MB，
+     * FLAC 编码要好几秒；而采集协程要每 100ms 调一次 `ar.read`，停那么久
+     * = AudioRecord 的缓冲被顶掉 = **真的丢音频**（旧版 30 秒一段编码很快，
+     * 放在一起没出事；600 秒把这个停顿放大了 20 倍）。网络那一下早就是异步的，
+     * 编码这一下现在也挪开；采集循环只做"拷贝 + 入队"。
+     */
+    private val sealQueue = Channel<SealJob>(capacity = 2)
+    private var sealWorker: Job? = null
+
+    /**
      * 已经在收尾了（`stopEverything` 只该跑一次）。
      *
      * 为什么需要它：收尾现在会**把尾段缓冲封成一段**。`ACTION_STOP` 完全可能到两次
@@ -545,14 +581,15 @@ class MeetingMicService : Service() {
      * 采集循环正在攒的、**还不到一段**的样本（结束时由 [sealFinalTail] 封成尾段）。
      *
      * 为什么它必须是服务的一个字段（而不是 `runLoop` 里的局部变量）：原来的形状是
-     * "缓冲是局部的、一结束就没了" —— 而段长默认 30 秒，用户"**录 20 秒就停**"时
+     * "缓冲是局部的、一结束就没了" —— 而段长默认 600 秒（10 分钟），用户"**录 20 秒就停**"时
      * 缓冲里那 20 秒**一段都没攒满**，整段录音于是凭空消失（既不建会也不上传）。
+     * 段长越长，这条尾巴越常见（默认 10 分钟时几乎每场短会都要靠它）。
      * 现在 `stopEverything` 在 `cancelAndJoin` 之后从这里把尾巴封出去。
      *
      * ⚠️ 只在**旧那一场跑完并 join 之后**读（那时采集协程已经不再写它）；重复收到
      * `stop` 时会把它置空，避免同一段音频被封两遍（转写里同一句话出现两次）。
      */
-    @Volatile private var captureTail: ArrayList<Short>? = null
+    @Volatile private var captureTail: PcmBuffer? = null
 
     // ---- 这一场录音的现场（**进程被杀就没了；事实都在清单里**）----
 
@@ -583,6 +620,26 @@ class MeetingMicService : Service() {
         // 进程级补传（前台 tick / 听写服务那条）要能刷通知 —— 只在服务活着时有意义。
         // 用 onCreate/onDestroy 成对维护，**不**用静态强引用兜着（见 notifyIfRunning 的说明）。
         liveService = this
+        // 封段单消费者：**串行**编码/落盘（见 [sealQueue] 的说明）。
+        // 每个任务都包一层 runCatching：一个段编码抛异常不能把整条封段线弄死
+        // （弄死之后后面的段永远不落盘，而界面只会显示"在录"）。
+        sealWorker = scope.launch {
+            for (job in sealQueue) {
+                val ack = job.ack
+                if (ack != null) {
+                    ack.complete(Unit)
+                    continue
+                }
+                runCatching {
+                    val seal = job.session?.seal(job.pcm)
+                    if (seal != null) publishSeal(seal)
+                    // 每封一段顺手试一次上传（异步、绝不阻塞封段线）
+                    triggerOpportunisticUpload()
+                }.onFailure {
+                    android.util.Log.e(TAG, "封段失败（编码/落盘）：${it.message}")
+                }
+            }
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -663,7 +720,7 @@ class MeetingMicService : Service() {
         )
         val started = s.start(MeetingDraftStore.newClientId(), MeetingDraftStore.isoOf(now))
         session = s
-        // **开录时读一次**段长（设置页那三个 15/30/60）：中途改偏好不会把已经在缓冲的那半段
+        // **开录时读一次**段长（设置页 15/30/60/300/600 秒）：中途改偏好不会把已经在缓冲的那半段
         // 切碎，界面文案也写着"改完下次开录生效"。这一份同时交给 runLoop 与状态，
         // 于是"界面显示的本段进度"与"真正封段用的样本数"**永远是同一个段长**。
         val segSeconds = segmentSeconds(this)
@@ -746,7 +803,7 @@ class MeetingMicService : Service() {
      * [startedAtMs] 是**开录那一刻**的挂钟（`startRecording` 里与清单的 `started_at` 用同一个值）
      * —— 累计时长与清单里的时间轴必须是**同一把尺子**，否则界面上的计时会与会议实际时长对不上。
      *
-     * [segSeconds] 是开录时读到的那一档段长（15/30/60）。**只读一次**：中途改设置不影响
+     * [segSeconds] 是开录时读到的那一档段长（15/30/60/300/600）。**只读一次**：中途改设置不影响
      * 正在录的这一场，而且界面上的"本段进度"用的是同一个数，不会出现两边各说一套。
      */
     private suspend fun runLoop(startedAtMs: Long, segSeconds: Int) {
@@ -769,9 +826,11 @@ class MeetingMicService : Service() {
         val frame = ShortArray(FRAME_SAMPLES)
         // 段长由 `startRecording` 读好交下来（**只读一次**，见方法说明）
         val samplesPerSegment = SAMPLE_RATE * segSeconds
-        // 缓冲的容量按"装得下一整段"给（`ArrayList` 自己会增长，这个初值只是免掉几次扩容）；
-        // 段长由硬件帧长整除（100ms 帧 vs 15/30/60 秒），所以一个缓冲里通常只有一段。
-        val buffer = ArrayList<Short>(samplesPerSegment)
+        // 缓冲的容量按"装得下一整段"给。**必须是原始 ShortArray 的 [PcmBuffer]**：
+        // 默认 600 秒 = 960 万个样本，`ArrayList<Short>` 装箱后要 ≈190 MB（手机上直接 OOM），
+        // 而 PcmBuffer 只占 19 MB —— 600 秒这个默认值让"装箱"从"慢一点"变成"录不下去"。
+        // 段长由硬件帧长整除（100ms 帧 vs 各档段长 15/30/60/300/600 秒），所以一个缓冲里通常只有一段。
+        val buffer = PcmBuffer(samplesPerSegment)
         // 把它挂到服务上：**结束时**要把这里剩下的（不足一段的）样本补封成尾段
         // —— 不挂出去的话，"录 20 秒就结束"那 20 秒会跟着局部变量一起消失。
         captureTail = buffer
@@ -800,7 +859,7 @@ class MeetingMicService : Service() {
                 // 采集语义全在这一句里（纯逻辑在 [MicCaptureLoop]）：暂停时它塞进去的是
                 // **与这一帧同长度、同格式的全零样本**，而"够一段就封段"那件事照样发生
                 // —— 所以段边界仍落在挂钟刻度上、总时长照常累计。
-                // 于是"第 N 段 = 挂钟第 N 个段长（默认 30 秒）"这条对齐关系在暂停前后都成立。
+                // 于是"第 N 段 = 挂钟第 N 个段长（默认 10 分钟）"这条对齐关系在暂停前后都成立。
                 val feed = capture.feed(buffer, frame, n, active = !paused)
                 if (feed.sealed) {
                     val pcm = toPcmBytes(buffer)
@@ -808,11 +867,12 @@ class MeetingMicService : Service() {
                     //    所以它绝不会因为"网断了"而失败；它失败只有一种原因：手机写不进去。
                     //    ⚠️ 暂停期间的段也会走到这里（里面是零样本），照常编码/落盘：全零音频
                     //    编出来还是全零，而"少一段"会让整条时间轴前移（那正是要避免的）。
-                    val seal = session?.seal(pcm)
-                    if (seal != null) publishSeal(seal)
-                    // ② 顺手试一次上传（**异步、绝不阻塞采音**：`ar.read` 是同一个协程，
-                    //    一次卡住的网络请求会把麦克风缓冲顶掉 —— 那是**真的丢音频**）
-                    triggerOpportunisticUpload()
+                    //
+                    // 编码**不在这条采集协程里**：600 秒一段编码要好几秒，停这么久不 `ar.read`
+                    // = AudioRecord 缓冲被顶掉 = 真的丢音频（单消费者按序做，见 [sealQueue]）。
+                    sealQueue.send(SealJob(session, pcm))
+                    // ② 顺手试一次上传由封段线在落盘之后做（异步、绝不阻塞采音：`ar.read` 是同一个
+                    //    协程，一次卡住的网络请求会把麦克风缓冲顶掉 —— 那是**真的丢音频**）。
                     buffer.clear()
                 }
                 // ③ 这一帧的"事实"一次刷新：**累计时长（挂钟）** + 本段进度 + 电平。
@@ -954,18 +1014,23 @@ class MeetingMicService : Service() {
         scope.launch {
             if (j != null) j.cancelAndJoin()
 
+            // ① 排队里的整段先落完（**必须在尾段之前**）：不排空就封尾，尾段会抢在
+            //    整段前面拿到序号（时间轴与转写顺序都会乱）。
+            awaitSealQueueIdle()
+
             // ①' **先补齐最后不足一段的音频**（本次修的退步）。
             //
             // 为什么必须在 `finish()` **之前**：`finish()` 要写 `ended_at` 与总时长，
             // 而总时长必须包含这一小段；顺序反了这一段的时长就落在会议之外。
             //
             // ⚠️ 这是"结束时代替攒满一段补出尾段"，**不是**把段长改短：段长仍是
-            // 用户设置（设置页 15/30/60，默认 30 秒），正常录音的段边界一个都没动。
+            // 用户设置（设置页 15/30/60/300/600，默认 600 秒 = 10 分钟，与电脑一致），
+            // 正常录音的段边界一个都没动。
             // 只有"停止时还差最后一点"这种情况才会多出这样一段尾巴。
             //
             // 判据见 [sealFinalTail]：**有样本就必须留下**；只有真的一个样本都没有
             // （一按就停 / 立刻失败）才允许不建会 —— 而那时也必须如实说（见 stopNote）。
-            val tail = sealFinalTail(s, tailBuffer?.toList().orEmpty(), SAMPLE_RATE)
+            val tail = sealFinalTail(s, tailBuffer?.toShortArray() ?: ShortArray(0), SAMPLE_RATE)
             // 尾段也可能**退回 WAV** / **落盘失败**：走同一个如实发布（绝不谎报格式、绝不吞错误）
             // ⚠️ `isTail = true`：**只有这一段**允许不足一个段长（段长仍是用户设置，
             //    这里只是把"结束时还差的那一点"补成一段，见 [sealFinalTail]）。
@@ -985,7 +1050,10 @@ class MeetingMicService : Service() {
             // 一个样本都没录到（一按就停 / 立刻失败）：**不建会**，但必须如实说 ——
             // 静默是最糟的（用户会以为录上了，只是还没转写）。
             val stopNote = tailStopNote(tail, totalSegments, hadSession = s != null)
-            _state.value = _state.value.copy(
+            // 用户可能已经按了"开始录音"（stop 是异步的，而且现在还要等封段队列）：
+            // 这时**不许**把新一场的 active 覆盖成 false（否则界面显示"已结束"、
+            // 麦克风却还在录）。只有这一场仍是当前场时才发布收尾状态。
+            val stopState = _state.value.copy(
                 active = false, level = 0f, paused = false,
                 stopNote = stopNote,
                 syncPhase = when {
@@ -1004,7 +1072,10 @@ class MeetingMicService : Service() {
                     note = "录完了，正在补齐剩下的段并让 ECHO 收尾",
                 )),
             )
-            notifyState()
+            if (session === s) {
+                _state.value = stopState
+                notifyState()
+            }
 
             // ② **补齐剩余段 → 对账 → stop(clientId)**（这条路唯一的收尾动作）。
             //    为什么要**等**正在跑的那一轮（`waitForGateMs`）：每封一段都会顺手试一次上传，
@@ -1028,6 +1099,28 @@ class MeetingMicService : Service() {
             }
             stopForegroundCompat()
             stopSelf()
+        }
+    }
+
+    /**
+     * 等封段队列排空（**只在 stopEverything 里调**）。
+     *
+     * 为什么用"排空标记 + ack"而不是 `delay`：编码/落盘耗时不确定（10 分钟一段可能几秒），
+     * 睡一个固定值不是等太久就是没等够。标记会被单消费者**按序**处理，所以 ack 回到时，
+     * 前面所有整段都已经落盘。
+     *
+     * 有上界（[SEAL_DRAIN_TIMEOUT_MS]）：真撞上一个卡死的编码器，也不能让"结束"永远不返回
+     * —— 超时只记日志，随后照常封尾段（宁可顺序冒一点风险，也不能让用户以为没结束）。
+     */
+    private suspend fun awaitSealQueueIdle() {
+        val ack = CompletableDeferred<Unit>()
+        val done = withTimeoutOrNull(SEAL_DRAIN_TIMEOUT_MS) {
+            sealQueue.send(SealJob(null, ByteArray(0), ack))
+            ack.await()
+            true
+        } ?: false
+        if (!done) {
+            android.util.Log.w(TAG, "封段队列排空超时（${SEAL_DRAIN_TIMEOUT_MS}ms）：尾段照常封")
         }
     }
 
@@ -1113,6 +1206,94 @@ class MeetingMicService : Service() {
 }
 
 /**
+ * 一段 PCM 的缓冲：**原始 `ShortArray`**（不是 `ArrayList<Short>`）。
+ *
+ * ## 为什么必须换掉 `ArrayList<Short>`（2026-10-18 段长默认改 600 秒时发现的）
+ *
+ * 默认段长 600 秒 = 960 万个样本。`ArrayList<Short>` 每个元素都是**装箱**的
+ * `java.lang.Short`（对象头 + 引用 ≈20 字节）→ 一段要 ≈190 MB，Android 上直接 OOM；
+ * 而 `ShortArray` 只要 19 MB。30 秒时代（48 万样本 ≈10 MB）这个坑不明显，
+ * 600 秒把它变成了"录到第一段就崩" —— 所以这里不是优化，是让 10 分钟段长**能跑**。
+ *
+ * ## 为什么实现 `List<Short>`
+ *
+ * 判据（`progressOf` / `toPcmBytes` / 测试）本来就是按"一串样本"写的。
+ * 实现只读 `List` 让那些**小缓冲**的用法一行不用改；生产路径走 [toShortArray] /
+ * [toPcmBytes]，**不装箱**。测试里 `buffer.toList()` / `isEmpty()` 也照旧能用。
+ */
+internal class PcmBuffer(initialCapacity: Int = 0) : AbstractList<Short>() {
+
+    private var data = ShortArray(initialCapacity.coerceAtLeast(0))
+    private var count = 0
+
+    override val size: Int get() = count
+
+    override fun get(index: Int): Short {
+        if (index < 0 || index >= count) {
+            throw IndexOutOfBoundsException("index=$index size=$count")
+        }
+        return data[index]
+    }
+
+    /** 追加一个样本（暂停的零样本也走它 —— 长度与格式都不变）。 */
+    fun addSample(sample: Short) {
+        ensureCapacity(count + 1)
+        data[count++] = sample
+    }
+
+    /** 追加一帧的一部分（真音频；整帧照抄，一个样本都不丢）。 */
+    fun addSamples(frame: ShortArray, from: Int, until: Int) {
+        val n = until - from
+        if (n <= 0) return
+        ensureCapacity(count + n)
+        System.arraycopy(frame, from, data, count, n)
+        count += n
+    }
+
+    /** 追加 [n] 个零样本（暂停帧：与真实帧**同长度**，只是内容全零）。 */
+    fun addZeros(n: Int) {
+        if (n <= 0) return
+        ensureCapacity(count + n)
+        java.util.Arrays.fill(data, count, count + n, 0.toShort())
+        count += n
+    }
+
+    /**
+     * 清空。
+     *
+     * ⚠️ 只有**封段的人**（`runLoop` / 结束收尾）能调：`MicCaptureLoop.feed` 满了也不清，
+     * 否则调用方拿到的是空缓冲，封下去就是一段全零（真的丢音频，但界面看着正常）。
+     *
+     * 注意：这里继承的是只读的 `AbstractList`（不是 `AbstractMutableList`），
+     * 所以它是**本类自己的**方法（没有 `override`）。
+     */
+    fun clear() {
+        count = 0
+    }
+
+    /** 拷贝出这一段（封段要用；之后 clear 不会改到它）。 */
+    fun toShortArray(): ShortArray = data.copyOf(count)
+
+    /** 直接写成 16-bit 小端 PCM（**不装箱**；10 分钟那段就靠它）。 */
+    fun toPcmBytes(): ByteArray {
+        val out = ByteArray(count * 2)
+        for (i in 0 until count) {
+            val v = data[i].toInt()
+            out[i * 2] = (v and 0xFF).toByte()
+            out[i * 2 + 1] = ((v shr 8) and 0xFF).toByte()
+        }
+        return out
+    }
+
+    private fun ensureCapacity(need: Int) {
+        if (need <= data.size) return
+        var cap = if (data.isEmpty()) 16 else data.size
+        while (cap < need) cap *= 2
+        data = data.copyOf(cap)
+    }
+}
+
+/**
  * 采集循环里那唯一一句语义判断（**纯逻辑，JVM 逐条可测**）：**暂停 = 照常计数，但写全零**。
  *
  * 用户 2026-10-16 深夜推翻了旧的"暂停不写盘"口径，并选了"手机与电脑统一"：
@@ -1140,7 +1321,8 @@ class MeetingMicService : Service() {
  *
  * ## 帧长与段长是整除的
  *
- * 真机上帧长固定 100ms（1600 样本），而合法段长是 15/30/60 秒（240000/480000/960000 样本）
+ * 真机上帧长固定 100ms（1600 样本），而合法段长是 15–600 秒（240000/480000/960000/
+ * 4800000/9600000 样本）
  * —— 全部整除。所以"攒够一段就封"落下去的每一段**恰好是 `samplesPerSegment` 个样本**，
  * 段边界与挂钟刻度一一对应（这条让判据能写成"第 N 段 = 挂钟第 N 个段长"）。
  */
@@ -1163,12 +1345,13 @@ internal class MicCaptureLoop(
      * （这里顺手清掉的话，那一段就永远丢了 —— 这正是"看着没事"的错法）。
      *
      * 帧是**整帧加进去**的（与旧代码同一形状，于是**一个样本都不丢**）：真机上 100ms 帧
-     * （1600 样本）能整除每个合法段长（15/30/60 秒 = 240000/480000/960000 样本），
+     * （1600 样本）能整除每个合法段长（15/30/60/300/600 秒 = 240000/480000/960000/
+     * 4800000/9600000 样本），
      * 所以"封下去的每一段恰好是 `samplesPerSegment` 个样本"始终成立。
      * 万一参数变成不整除（帧比一段长），行为仍与旧代码一致：样本照收，段长最多多出一帧的量。
      */
     fun feed(
-        buffer: ArrayList<Short>,
+        buffer: PcmBuffer,
         frame: ShortArray,
         n: Int,
         active: Boolean,
@@ -1179,8 +1362,8 @@ internal class MicCaptureLoop(
         while (left > 0) {
             val take = minOf(left, samplesPerSegment)
             // 真音频就照抄那一段；暂停就塞**同样多个零样本** —— 帧长与格式一个都不变
-            if (active) buffer.addAll(frame.asList().subList(n - left, n - left + take))
-            else repeat(take) { buffer.add(0) }
+            if (active) buffer.addSamples(frame, n - left, n - left + take)
+            else buffer.addZeros(take)
             added += take
             left -= take
             if (buffer.size >= samplesPerSegment) {   // 攒够一段：**告诉调用方去封**（暂停期间也照样封）
@@ -1244,6 +1427,18 @@ internal class MeetingElapsed(
  */
 internal fun progressOf(buffer: List<Short>, sampleRate: Int): Double {
     if (sampleRate <= 0 || buffer.isEmpty()) return 0.0
+    return buffer.size.toDouble() / sampleRate
+}
+
+/**
+ * [PcmBuffer] 版本（生产路径走它）。
+ *
+ * 为什么单独一个重载：`PcmBuffer` 也是 `List<Short>`，但按 `List` 迭代会**逐样本装箱**
+ * —— 采集循环每 100ms 就要算一次进度，600 秒段长下那会是每秒几十万次装箱。
+ * 这个重载只看 `size`，一个对象都不分配。
+ */
+internal fun progressOf(buffer: PcmBuffer, sampleRate: Int): Double {
+    if (sampleRate <= 0 || buffer.size == 0) return 0.0
     return buffer.size.toDouble() / sampleRate
 }
 
@@ -1371,7 +1566,7 @@ data class MicState(
     val elapsedSeconds: Double = 0.0,
 
     /**
-     * 用户设置的一段多长（秒；15/30/60，开录那一刻读到的档）。
+     * 用户设置的一段多长（秒；15/30/60/300/600，开录那一刻读到的档）。
      *
      * 界面用它显示"本段 mm:ss / mm:ss" —— 段边界只由**累计样本数**决定，
      * 让用户看见"这一段攒到哪儿了"，就不会再有"恢复后不到一分钟就封段了"的错觉
@@ -1514,6 +1709,25 @@ internal fun toPcmBytes(samples: List<Short>): ByteArray {
     }
     return out
 }
+
+/**
+ * [ShortArray] 版本：**不装箱**（封段/尾段都用它）。
+ *
+ * 为什么要有它：10 分钟一段是 960 万个样本，走 `List<Short>` 那条会装箱 960 万次
+ * （≈150 MB 的临时对象），在手机上就是一次超长 GC 甚至 OOM。
+ */
+internal fun toPcmBytes(samples: ShortArray): ByteArray {
+    val out = ByteArray(samples.size * 2)
+    for (i in samples.indices) {
+        val v = samples[i].toInt()
+        out[i * 2] = (v and 0xFF).toByte()
+        out[i * 2 + 1] = ((v shr 8) and 0xFF).toByte()
+    }
+    return out
+}
+
+/** [PcmBuffer] 版本（生产封段路径）：直接写字节，一个样本都不装箱。 */
+internal fun toPcmBytes(buffer: PcmBuffer): ByteArray = buffer.toPcmBytes()
 
 /** 这一帧的 RMS（0..1 的粗电平，用于界面动效）。纯函数，JVM 可测。 */
 internal fun rms(frame: ShortArray, n: Int): Float {

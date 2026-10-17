@@ -61,7 +61,8 @@ import com.echo.contact.ui.theme.EchoPalette
  *     不另存一个开关（两处状态必然漂移）。
  *  2. **"手机收"要看得见**：这一轮的结果（它听成什么 + 回复）就在主操作下面，
  *     带一个重播按钮；历史再往下（默认最近几条，可展开全部、可分页）。
- *  3. **仪表盘不在这里**：整机状态/版本/组件在「设置 → 关于」，别占着首页。
+ *  3. **仪表盘不在这里**：整机状态在「超级助理」页（第 1 页）—— 那里才是"看一眼现在怎么样"的地方；
+ *     这一页只做"说一句 + 看这一轮结果 + 翻历史"，别把状态卡再复制一份过来。
  */
 @Composable
 fun TalkScreen(vm: MainViewModel) {
@@ -155,9 +156,6 @@ fun TalkScreen(vm: MainViewModel) {
         if (connected == false) {
             item { ErrorCard(statusError ?: "连不上 ECHO") }
         }
-
-        // ---- ⓪ 服务状态（用户口径里的三类主要功能之一；小卡片 + 状态灯，点开看组件）----
-        item { EchoStatusCard(vm) }
 
         // ---- ① 主操作（唯一的一件大事）----
         item {

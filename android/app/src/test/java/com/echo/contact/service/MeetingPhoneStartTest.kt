@@ -164,7 +164,7 @@ class MeetingPhoneStartTest {
         assertTrue("本地这一场必须立起来（还在录）", local.recording)
         assertEquals("这时还没有音频段", 0, local.segments.size)
 
-        // 第一段（真机默认 30 秒那一档；这里直接喂 1 秒 PCM）封存 → 才有东西可传
+        // 第一段（直接用 1 秒 PCM；段长默认 600 秒，这里不靠攒满、手工封一段）→ 才有东西可传
         s.seal(pcm(1.0))
 
         val r = sync(store, SyncScope.INCREMENTAL)
