@@ -18,8 +18,29 @@ class EchoTabsTest {
     fun `恰好 5 个页签且名称顺序是用户点名的`() {
         assertEquals("用户要的是 5 页，不多不少", 5, ECHO_TABS.size)
         assertEquals(
-            listOf("超级助理", "指令", "会议", "回顾", "设置"),
+            listOf("指令", "会议", "超级助理", "回顾", "设置"),
             ECHO_TABS.map { it.title },
+        )
+    }
+
+    @Test
+    fun `第 3 个（index 2）是超级助理且左右各两项`() {
+        // 用户原话："echo 超级助理在中间，左右各两个页签"
+        assertEquals("中间那颗必须是超级助理", EchoTab.ASSISTANT, ECHO_TABS[2])
+        assertEquals(
+            "左边两项",
+            listOf(EchoTab.COMMANDS, EchoTab.MEETINGS),
+            ECHO_TABS.subList(0, 2),
+        )
+        assertEquals(
+            "右边两项",
+            listOf(EchoTab.REVIEW, EchoTab.SETTINGS),
+            ECHO_TABS.subList(3, 5),
+        )
+        assertEquals(
+            "名字也要钉住（顺序变了用户会找不到）",
+            listOf("指令", "会议", "回顾", "设置"),
+            ECHO_TABS.filter { it != EchoTab.ASSISTANT }.map { it.title },
         )
     }
 
@@ -29,8 +50,22 @@ class EchoTabsTest {
         ECHO_TABS.forEachIndexed { index, tab ->
             assertEquals("第 ${index + 1} 页的 ordinal 应该是 $index", index, tab.ordinal)
         }
-        assertEquals(0, EchoTab.ASSISTANT.ordinal)
+        // 顺序改了之后这三条是**新的**事实：超级助理在正中间（不再是 0）
+        assertEquals("最左是能力页签「指令」", 0, EchoTab.COMMANDS.ordinal)
+        assertEquals("超级助理在正中间", 2, EchoTab.ASSISTANT.ordinal)
         assertEquals(4, EchoTab.SETTINGS.ordinal)
+    }
+
+    @Test
+    fun `起始页是超级助理且正好是底部导航中间那格`() {
+        // 启动页语义是"首页"，不是"第 0 项"：顺序改过之后 0 变成了「指令」，
+        // 所以起始值必须跟着 EchoTab 走，并且它得与底部导航的正中间那一格一致。
+        assertEquals(EchoTab.ASSISTANT, START_TAB)
+        assertEquals(
+            "起始页必须正好是导航条正中间那格（否则一启动主入口就不亮）",
+            echoCenterIndex(ECHO_TABS),
+            ECHO_TABS.indexOf(START_TAB),
+        )
     }
 
     @Test

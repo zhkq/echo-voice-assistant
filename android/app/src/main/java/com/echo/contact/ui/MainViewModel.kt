@@ -150,8 +150,9 @@ object TtsRouteText {
 }
 
 /**
- * 五个页签共用的 ViewModel：**超级助理**（状态 + 入口）、**指令**（发文字指令 + 这一轮结果 +
- * 历史）、**会议**、**回顾**、**设置**；外加全屏录音界面的开关。
+ * 五个页签共用的 ViewModel：**指令**（发文字指令 + 这一轮结果 + 历史）、**会议**、
+ * **超级助理**（状态 + 入口，底部导航正中间那颗）、**回顾**、**设置**；
+ * 外加全屏录音界面的开关。
  *
  * **为什么要轮询**：`POST /api/assistant/command` 立刻返回 `{ok: true, message: "已提交"}`
  * （app/assistant.py:783 `send_text` 把活丢进后台线程就返回），真正执行在后台：
@@ -168,12 +169,17 @@ class MainViewModel(app: Application) : BaseViewModel(app) {
     // 也顺带让"回到首页"这类跳转有个统一入口。
 
     /**
-     * 当前页签（0=超级助理 1=指令 2=会议 3=回顾 4=设置；顺序见 [ECHO_TABS]）。
+     * 当前页签（**值就是 `EchoTab.ordinal`**；顺序见 [ECHO_TABS]：
+     * 0=指令 1=会议 **2=超级助理** 3=回顾 4=设置）。
+     *
+     * ⚠️ 起始值是 [START_TAB]（= 超级助理），**不是 0**：2026-10-18 把超级助理挪到正中间之后
+     * 0 变成了「指令」，写死 0 会让 App 一启动就停在指令页 —— 首页（仪表盘）永远没人看见，
+     * 而且"从别处回首页"也会落到错的那一页。这里的语义是"回到首页"，不是"第 0 项"。
      *
      * 为什么是**五页**：用户 2026-10-18 点名"整体界面还是改成 5 页，第一页是 ECHO 超级助理…
      * 后面跟指令、会议、回顾三个页签" —— 设置也从齿轮升成第五个页签（齿轮已撤，两个入口会打架）。
      */
-    private val _tab = MutableStateFlow(0)
+    private val _tab = MutableStateFlow(START_TAB.ordinal)
     val tab: StateFlow<Int> = _tab.asStateFlow()
 
     fun selectTab(index: Int) {

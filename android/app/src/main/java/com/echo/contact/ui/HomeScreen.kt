@@ -12,20 +12,13 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Dashboard
-import androidx.compose.material.icons.filled.EventNote
-import androidx.compose.material.icons.filled.History
-import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.Refresh
-import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.NavigationBar
-import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
@@ -36,7 +29,6 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -44,12 +36,16 @@ import com.echo.contact.service.ListenState
 import com.echo.contact.ui.theme.EchoPalette
 
 /**
- * 应用外壳：**5 页**（超级助理 / 指令 / 会议 / 回顾 / 设置，用户 2026-10-18 点名）。
+ * 应用外壳：**5 页**（指令 / 会议 / **超级助理（正中间）** / 回顾 / 设置，用户 2026-10-18 点名）。
  *
  * 与上一版的区别：
  *
- *  * **第 1 页是超级助理**（仪表盘风格）：状态卡 + 三个主入口。它是"看一眼现在怎么样、
- *    要去哪一页"的地方，不是当年的"说话"页。
+ *  * **底部导航改成"中间凸起"的造型**：超级助理挪到**正中间**、做得更大更高（`EchoNavBar`），
+ *    左右各两项。为什么：用户原话是"可以考虑 echo 超级助理在中间，左右各两个页签的样式，
+ *    可以设计个造型"——原来的五颗等大、超级助理在最左边，它和别的页签长得一模一样，
+ *    **主入口要在一眼能看到的位置**，所以才有了那颗凸起的圆底座。
+ *  * **顺序只在 `EchoTabs.kt` 一处决定**：这一层只按 `ECHO_TABS` 渲染，
+ *    中间那颗由 `echoCenterTab(ECHO_TABS)` 算出来（不在界面里写死名字）。
  *  * **页签从 3 个变 5 个**：指令、会议、回顾各自一页（功能一个都没少），设置也从右上角
  *    齿轮升成第 5 页 —— 齿轮已撤掉，同一个目的地不留两个入口。
  *  * **全屏录音界面盖住整个外壳**（含底部导航）：用户要的是"全屏"，录音时不该还能点别的页签。
@@ -69,8 +65,9 @@ fun HomeScreen(onUnpair: () -> Unit) {
     val baseUrl by vm.baseUrl.collectAsState()
     // 页签由 ViewModel 持有：通知点进来时"先切到会议页"要能改它（见 openMeetingByName）。
     val tabIndex by vm.tab.collectAsState()
-    // 读不懂的 index 回落第 1 页（**不**让界面白屏）
-    val currentTab = ECHO_TABS.getOrElse(tabIndex) { EchoTab.ASSISTANT }
+    // 读不懂的 index 回落**首页**（[START_TAB]，即超级助理，不是"第 0 项"）——
+    // 顺序改了之后 0 是「指令」，所以这里跟起始页用同一个常量，别让界面白屏、也别落到错的那页。
+    val currentTab = ECHO_TABS.getOrElse(tabIndex) { START_TAB }
 
     // 常驻听写的状态（进程级 object，界面只是读）：任何页都能看见"在听/在等/在念/已暂停"。
     val listenPhase by ListenState.phase.collectAsState()
@@ -118,17 +115,14 @@ fun HomeScreen(onUnpair: () -> Unit) {
             )
         },
         bottomBar = {
-            // 恰好 5 项、顺序照 ECHO_TABS（判据在 EchoTabsTest）
-            NavigationBar {
-                ECHO_TABS.forEach { tab ->
-                    NavigationBarItem(
-                        selected = tab == currentTab,
-                        onClick = { vm.selectTab(tab.ordinal) },
-                        icon = { Icon(tabIcon(tab), contentDescription = null) },
-                        label = { Text(tab.title) },
-                    )
-                }
-            }
+            // 造型在 EchoNavBar：中间那颗（正中间 = echoCenterTab(ECHO_TABS)）凸起、更大；
+            // 顺序只照 ECHO_TABS 渲染（判据在 EchoTabsTest / EchoNavBarTest）。
+            // 它自身的高度已经含"露在条外的那一截"，所以 Scaffold 给内容的底部 padding 也包含了它
+            // —— 凸起不会盖住页面内容，更不会挡住页面底部的按钮。
+            EchoNavBar(
+                current = currentTab,
+                onSelect = { vm.selectTab(it.ordinal) },
+            )
         },
     ) { padding ->
         Column(modifier = Modifier.fillMaxSize().padding(padding)) {
@@ -152,15 +146,6 @@ fun HomeScreen(onUnpair: () -> Unit) {
             }
         }
     }
-}
-
-/** 页签 → 图标（只做外观映射；页签本身见 [EchoTab]）。 */
-private fun tabIcon(tab: EchoTab): ImageVector = when (tab) {
-    EchoTab.ASSISTANT -> Icons.Default.Dashboard
-    EchoTab.COMMANDS -> Icons.Default.Mic
-    EchoTab.MEETINGS -> Icons.Default.EventNote
-    EchoTab.REVIEW -> Icons.Default.History
-    EchoTab.SETTINGS -> Icons.Default.Settings
 }
 
 /**
