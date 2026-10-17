@@ -55,6 +55,7 @@ kit 长这样（同事视角）::
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import importlib.util
 import json
@@ -65,6 +66,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 import zipfile
 from collections import Counter
 from pathlib import Path
@@ -84,6 +86,17 @@ SKILL_DIR = ROOT / ".dsh" / "skills" / "echo-install"
 BUILD_PACKAGE = ROOT / "scripts" / "build-package.ps1"
 #: 离线载荷的**判据**长在它里面（`verify_bundle()`）—— 组 kit 时按同一份验，不抄第二份。
 BUILD_OFFLINE = ROOT / "scripts" / "build_offline_pack.py"
+
+#: 出包互斥锁（写在 dist 里，和产物放一起 —— 谁写这个目录，谁就在这个目录排队）。
+#: 为什么需要它：出包写的是**固定名字 + 分钟级时间戳**的产物
+#: （`ECHO-main-<platform>-<版本>-<yyyyMMdd-HHmm>.zip`，kit 目录/zip 也是同一个分钟 stamp）。
+#: 2026-10-17/18 连着两次：一边跑门禁一边出包，结果 `build-package.ps1` 在**所有检查都 [ok]**
+#: 之后 exit=1，真实原因是 `The file '...zip' already exists.`，重跑一下又好了 —— 这就是
+#: 两个打包抢同一批输出文件。所以把「写 dist 的那一段」串行起来：同一时刻只有一个打包在跑，
+#: 第二个**等它**并把"在等谁"打出来（绝不静默 exit=1）。
+LOCK_NAME = ".pack.lock"
+LOCK_TIMEOUT_S = 600.0      # 等别人放锁的上限（正常一次打包几秒到一两分钟）
+LOCK_STALE_S = 1800.0       # 超过这么久、且锁里的 pid 已经不在了 → 当"上次崩了"清掉
 
 #: kit 里给人的那份说明叫这个名字（中文名是刻意的：同事一眼知道先读它）
 KIT_README = "先读我.md"
@@ -156,6 +169,17 @@ def powershell_exe() -> str:
 
 
 def run(argv, cwd: Path | None = None) -> tuple[int, str]:
+    code, out, _err = run_capture(argv, cwd)
+    return code, out
+
+
+def run_capture(argv, cwd: Path | None = None) -> tuple[int, str, str]:
+    """跑一个子进程，返回 (退出码, stdout+stderr 合并, stderr)。
+
+    为什么把 stderr 单独留一份：`build-package.ps1` 的**真实报错**只落在 stderr 上，
+    而 [ok] 检查行全在 stdout。合并着看，报错会被上百行 [ok] 埋掉 —— 2026-10-17 的
+    "所有检查都是 ok，然后 exit=1" 就是这么来的（原因明明打了，但没人看得见）。
+    """
     proc = subprocess.run(
         [str(a) for a in argv],
         cwd=str(cwd or ROOT),
@@ -164,7 +188,154 @@ def run(argv, cwd: Path | None = None) -> tuple[int, str]:
         encoding="utf-8",
         errors="replace",      # PowerShell 5.1 的中文输出可能不是 UTF-8；我们只解析 ASCII
     )
-    return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
+    return proc.returncode, (proc.stdout or "") + (proc.stderr or ""), (proc.stderr or "")
+
+
+# --------------------------------------------------------------- 打包互斥（见 LOCK_NAME）
+def _pid_alive(pid: int) -> bool:
+    """这个 pid 现在还活着吗？用来判「锁是不是上一个打包崩溃留下的」。
+
+    特意不用 `os.kill(pid, 0)`：在 Windows 上它会把信号当成 TerminateProcess 的退出码，
+    也就是**真的把那个进程杀掉**（把守卫写成杀手，是这里最不能犯的错）。
+    """
+    if pid <= 0:
+        return False
+    if os.name != "nt":
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
+    import ctypes
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    STILL_ACTIVE = 259
+    kernel32 = ctypes.windll.kernel32
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        return False
+    try:
+        code = ctypes.c_ulong()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+            return False
+        return code.value == STILL_ACTIVE
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _read_lock(path: Path) -> dict[str, str]:
+    info: dict[str, str] = {}
+    try:
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            key, sep, value = line.partition("=")
+            if sep:
+                info[key.strip()] = value.strip()
+    except OSError:
+        pass
+    return info
+
+
+@contextlib.contextmanager
+def pack_lock(dist: Path, timeout: float = LOCK_TIMEOUT_S):
+    """同一时刻只允许一个打包写 `dist`；等不到就**明确说**在等谁。
+
+    为什么锁放在 `dist`：撞的是这个目录里的文件名，所以在同一个目录上排队才是对的判据
+    （换个 `--dist` 就是另一个目录、天然不冲突）。
+    为什么还要把 token 传给子进程：`build-package.ps1` 自己也有一把同样的锁（防的是直接调
+    它的脚本）；父进程已经拿住了就必须让它认出来，否则父子两个会自己等自己，等到超时还报
+    "另一个打包在跑"这种错话。
+    """
+    dist.mkdir(parents=True, exist_ok=True)
+    lock = dist / LOCK_NAME
+    token = uuid.uuid4().hex
+    deadline = time.monotonic() + max(timeout, 0.0)
+    announced = False
+    while True:
+        try:
+            fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            info = _read_lock(lock)
+            pid_text = info.get("pid", "?")
+            try:
+                pid = int(pid_text)
+            except ValueError:
+                pid = -1
+            try:
+                age = time.time() - lock.stat().st_mtime
+            except OSError:
+                continue          # 刚好被放掉了：下一圈自己拿
+            # 过期清理：时间太久的算崩了；锁里的进程已经不在了的立刻算崩了。
+            if age > LOCK_STALE_S or (pid > 0 and not _pid_alive(pid)):
+                print(f"  [warn] 清掉过期的打包锁（{age:.0f}s 前，pid={pid_text} 已不在）：{lock}",
+                      flush=True)
+                try:
+                    lock.unlink()
+                except OSError:
+                    pass
+                continue
+            if time.monotonic() > deadline:
+                raise BuildError(
+                    f"另一个打包正在跑（pid={pid_text}，{age:.0f}s 前拿的锁 {lock}），"
+                    f"等了 {timeout:.0f}s 它还没结束。\n"
+                    f"  这不是包坏了，也不是代码错了 —— 等它跑完再出包；"
+                    f"确认那个进程真的死了就删掉这把锁再重试。")
+            if not announced:
+                print(f"  [lock] 另一个打包正在跑（pid={pid_text}）—— 等它结束，"
+                      f"最多 {timeout:.0f}s…", flush=True)
+                announced = True
+            time.sleep(0.4)
+            continue
+        try:
+            os.write(fd, f"pid={os.getpid()}\ntoken={token}\n"
+                         f"started={time.strftime('%Y-%m-%dT%H:%M:%S')}\n".encode("utf-8"))
+        finally:
+            os.close(fd)
+        break
+    old = os.environ.get("ECHO_PACK_LOCK_OWNER")
+    os.environ["ECHO_PACK_LOCK_OWNER"] = token      # 子进程（build-package.ps1）靠它免二次加锁
+    try:
+        yield token
+    finally:
+        if old is None:
+            os.environ.pop("ECHO_PACK_LOCK_OWNER", None)
+        else:
+            os.environ["ECHO_PACK_LOCK_OWNER"] = old
+        try:
+            if _read_lock(lock).get("token") == token:
+                lock.unlink()
+        except OSError:
+            pass
+
+
+#: `build-package.ps1` 输出里"这就是错误"的特征词。挑出这些行放在 [fail] 后面第一屏 ——
+#: 2026-10-17 的现场是"满屏 [ok]"，真正的报错只有一行、还被追加在输出最末尾。
+_ERROR_HINTS = ("[fail]", "exception", "error", "already exists", "cannot", "denied",
+                "not found", "失败", "错误", "无法")
+
+
+#: PowerShell 把一条报错拆成的"外壳行"：只有位置/类别，不说原因。
+_SHELL_PREFIXES = ("+ ", "at ", "categoryinfo", "fullyqualifiederrorid", "at line:")
+
+
+def _shell_free(lines: list[str]) -> list[str]:
+    return [ln for ln in lines if not ln.lower().startswith(_SHELL_PREFIXES)]
+
+
+def real_reason(out: str, err: str = "", limit: int = 6) -> str:
+    """从 `build-package.ps1` 的输出里挑出**真正的错误行**（挑不出来就退回最后几行）。
+
+    优先级：**stderr 的第一行**（PowerShell 把真原因写在那里，例如
+    `The file '…zip' already exists.`）→ 合并输出里带错误特征的行 → 最后几行。
+    PowerShell 的 `+ CategoryInfo …` / `At <file>:<line>` 这类外壳行先滤掉：它们看着像
+    报错，却一个字都不说原因。
+    """
+    err_lines = [ln.strip() for ln in (err or "").splitlines() if ln.strip()]
+    err_picked = _shell_free(err_lines)
+    if err_picked:
+        return "\n".join(err_picked[-limit:])
+    lines = [ln.strip() for ln in out.splitlines() if ln.strip()]
+    hits = [ln for ln in lines if any(h in ln.lower() for h in _ERROR_HINTS)]
+    picked = _shell_free(hits)
+    return "\n".join((picked or hits or lines)[-limit:])
 
 
 def git_short() -> str:
@@ -452,17 +623,52 @@ def verify_kit(kit: Path, plat: dict) -> list[str]:
 
 # ----------------------------------------------------------------------- 出包
 
-def build_main_packages(plats: list[dict], dist: Path) -> dict[str, Path]:
+def build_main_packages(plats: list[dict], dist: Path, attempts: int = 2) -> dict[str, Path]:
+    """跑 build-package.ps1 出主包。
+
+    两处是这次（2026-10-17/18）修出来的：
+    * `-OutDir dist` —— 以前**没传**，于是 `--dist` 只影响"去哪里找结果"，包永远落在
+      `<仓库>/dist`：`--dist` 是个谎，也让"在临时目录里试打包"根本做不到。
+    * 失败时把 `build-package.ps1` 的**真实错误行**放到第一屏（并带原因重试一次）。
+      以前只有一句 `exit=1` + 一大段 [ok]，看不出为什么 —— 最该修的就是这个"看不出来"。
+    """
     built: dict[str, Path] = {}
     for plat in plats:
         argv = [powershell_exe(), "-NoProfile", "-ExecutionPolicy", "Bypass",
                 "-File", BUILD_PACKAGE, "-Profile", "main"]
         if plat["package_platform"]:
             argv += ["-Platform", plat["package_platform"]]
+        argv += ["-OutDir", str(dist)]
         print(f"  [main ] building {plat['label']} ...", flush=True)
-        code, out = run(argv)
+        code, out = 0, ""
+        err = ""
+        for attempt in range(1, max(attempts, 1) + 1):
+            code, out, err = run_capture(argv)
+            if code == 0:
+                break
+            reason = real_reason(out, err)
+            first = reason.splitlines()[0] if reason else "（输出里没有可认的错误行）"
+            print(f"  [warn] build-package.ps1 失败（{plat['label']}, exit={code}）：{first}",
+                  flush=True)
+            # 等锁超时不是"偶发"，重试只会再等一遍超时；直接把原因报上去。
+            if "another packager is already running" in out:
+                break
+            if attempt < attempts:
+                print(f"  [retry] 带原因重试（第 {attempt + 1}/{attempts} 次）…", flush=True)
+                time.sleep(1.0)
         if code != 0:
-            raise BuildError(f"build-package.ps1 失败（{plat['label']}, exit={code}）：\n{out[-3000:]}")
+            reason = real_reason(out, err) or "（输出里没有可认的错误行）"
+            if "another packager is already running" in out:
+                # ps1 自己也有一把锁（防的是"直接调它"的脚本）。真撞上时别让用户去看
+                # 英文原话猜 —— 这条路径只有"父进程没拿锁、子进程却在等"才走得到。
+                raise BuildError(
+                    "另一个打包正在跑 —— build-package.ps1 等锁超时了。\n"
+                    f"  它的原话：{reason}\n"
+                    f"  等那个打包结束再出包；确认它真的死了，就删掉 {dist / LOCK_NAME} 再重试。")
+            raise BuildError(
+                f"build-package.ps1 失败（{plat['label']}, exit={code}）\n"
+                f"  真实原因：\n    {reason}\n"
+                f"  ——— 完整输出末尾 ———\n{out[-3000:]}")
         pkg = newest_main_package(dist, plat)
         if pkg is None:
             raise BuildError(f"build-package.ps1 说成功了，但在 {dist} 里找不到 "
@@ -637,7 +843,8 @@ def do_check(dist: Path, plats: list[dict]) -> int:
 
 
 def do_build(dist: Path, plats: list[dict], stamp: str, kits_only: bool,
-             verify: bool, bundle_from: Path | None = None) -> int:
+             verify: bool, bundle_from: Path | None = None,
+             lock_timeout: float = LOCK_TIMEOUT_S) -> int:
     dist.mkdir(parents=True, exist_ok=True)
     if bundle_from is not None:
         # bundle 里的 wheel 是 **cp311 win_amd64** 的（目标机的 python.org 嵌入包就是它）——
@@ -647,6 +854,14 @@ def do_build(dist: Path, plats: list[dict], stamp: str, kits_only: bool,
                 raise BuildError("--bundle-from 只给 Windows 的 kit 用（wheel 是 cp311 win_amd64；"
                                  "mac 的依赖必须在那台机器上现装）。")
         bundle_from = Path(bundle_from).resolve()
+    # 整段（主包 + 组 kit + 自检）都在锁里：只锁住 ps1 那一步不够 —— kit 目录/zip 用的也是
+    # 同一个分钟 stamp，两个打包照样会互相 rmtree 掉对方正在写的目录。
+    with pack_lock(dist, lock_timeout):
+        return _do_build_locked(dist, plats, stamp, kits_only, verify, bundle_from)
+
+
+def _do_build_locked(dist: Path, plats: list[dict], stamp: str, kits_only: bool,
+                     verify: bool, bundle_from: Path | None) -> int:
     if kits_only:
         mains: dict[str, Path] = {}
         for plat in plats:
@@ -718,6 +933,9 @@ def main(argv: list[str] | None = None) -> int:
                          "打进 Windows kit —— 同事双击 装我.cmd 时自动走 -Offline")
     ap.add_argument("--deploy-kit", default="", metavar="PLATFORM",
                     help="只打印该平台最新 kit 的 zip 路径（不写盘；deploy-stable.ps1 用）")
+    ap.add_argument("--lock-timeout", type=float, default=LOCK_TIMEOUT_S, metavar="SEC",
+                    help=f"另一个打包正在跑时最多等它多少秒（默认 {LOCK_TIMEOUT_S:.0f}）；"
+                         f"等不到就明确报「另一个打包正在跑」，不会静默 exit=1")
     args = ap.parse_args(argv)
 
     dist = Path(args.dist).resolve() if args.dist else DIST
@@ -749,7 +967,8 @@ def main(argv: list[str] | None = None) -> int:
           f"kitsOnly={args.kits_only}) ===")
     try:
         return do_build(dist, plats, stamp, args.kits_only, not args.no_verify,
-                        bundle_from=(Path(args.bundle_from) if args.bundle_from else None))
+                        bundle_from=(Path(args.bundle_from) if args.bundle_from else None),
+                        lock_timeout=args.lock_timeout)
     except BuildError as exc:
         print(f"\n[fail] {exc}")
         return EXIT_ERROR

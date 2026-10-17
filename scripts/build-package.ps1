@@ -56,7 +56,13 @@ param(
     # PowerShell），而我们要在 Windows 上给同事准备 mac 资料夹 —— 没有这个参数，包名与清单
     # 会永远写着 win-x64（2026-09-21 加）。取值形如 macos-arm64 / macos-universal。
     [string]$Platform = '',
-    [switch]$DryRun
+    [switch]$DryRun,
+    # 等别的打包放锁的上限（秒）。正常一次打包几秒，带离线载荷也就一两分钟；
+    # 给到 10 分钟是为了"两个 build_kit 前后脚跑"时第二个能安心等，而不是直接失败。
+    [int]$LockTimeoutSeconds = 600,
+    # 超过这么久的锁按"上一个打包崩了"处理。判过期不能只看时间：锁里记着 pid，
+    # pid 已经不在就立刻算过期（见 Lock-Pack）。
+    [int]$LockStaleSeconds = 1800
 )
 
 $ErrorActionPreference = 'Stop'
@@ -66,7 +72,110 @@ if (-not $OutDir) { $OutDir = Join-Path $root 'dist' }
 function Say([string]$m)  { Write-Host "  $m" }
 function Ok([string]$m)   { Write-Host "  [ok]   $m" -ForegroundColor Green }
 function Warn([string]$m) { Write-Host "  [warn] $m" -ForegroundColor Yellow }
-function Die([string]$m)  { Write-Host "  [fail] $m" -ForegroundColor Red; exit 1 }
+function Die([string]$m)  { Write-Host "  [fail] $m" -ForegroundColor Red; Unlock-Pack; exit 1 }
+
+# ---------------------------------------------------------------- build lock
+# WHY: two packagers pointed at the SAME OutDir race on the SAME output names
+# (ECHO-<profile>-<plat>-<version>-<yyyyMMdd-HHmm>.zip is only minute-precise).
+# 2026-10-17/18: a manual build_kit.py ran next to a second packager; the loser died with
+#   Exception calling "Open": "The file '...zip' already exists."
+# *after* every check had printed [ok] -- i.e. a green log plus exit=1, twice, and an
+# immediate rerun "worked". So: one writer at a time. The second waits (and says so), and a
+# lock left behind by a crashed build is cleaned up after LockStaleSeconds.
+$lockPath = Join-Path $OutDir '.pack.lock'
+$script:myLockToken = ''
+
+function Read-LockToken([string]$path) {
+    try {
+        $m = [regex]::Match([System.IO.File]::ReadAllText($path), 'token=([0-9a-fA-F-]{8,})')
+        if ($m.Success) { return $m.Groups[1].Value }
+    } catch { }
+    return ''
+}
+
+function Unlock-Pack {
+    # 只删**自己那把**锁：过期的锁可能已经被别人（或父进程）重建成新锁了，
+    # 那把锁删了就等于把别人的互斥也一起废掉。
+    if (-not $script:myLockToken) { return }
+    try {
+        if ((Read-LockToken $lockPath) -eq $script:myLockToken) {
+            Remove-Item -LiteralPath $lockPath -Force -ErrorAction SilentlyContinue
+        }
+    } catch { }
+    $script:myLockToken = ''
+}
+
+function Lock-Pack {
+    # 父进程（build_kit.py）已经把锁拿住了：它把 token 传给我们，认这个 token 就直接过，
+    # 否则就是自己等自己（等到超时才报错，而且报的还是"另一个打包在跑"这种错话）。
+    if ($env:ECHO_PACK_LOCK_OWNER -and (Read-LockToken $lockPath) -eq $env:ECHO_PACK_LOCK_OWNER) {
+        return
+    }
+    $deadline = (Get-Date).AddSeconds($LockTimeoutSeconds)
+    $announced = $false
+    while ($true) {
+        if (-not (Test-Path -LiteralPath $lockPath)) {
+            try {
+                $token = [guid]::NewGuid().ToString()
+                $fs = [System.IO.File]::Open($lockPath, [System.IO.FileMode]::CreateNew,
+                                             [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+                try {
+                    $body = "pid=$PID`ntoken=$token`nstarted=$((Get-Date).ToString('o'))`n"
+                    $bytes = (New-Object System.Text.UTF8Encoding($false)).GetBytes($body)
+                    $fs.Write($bytes, 0, $bytes.Length)
+                    $fs.Flush()
+                } finally { $fs.Close() }
+                $script:myLockToken = $token
+                return
+            } catch {
+                # 不是"文件已存在"就说明这条路根本写不了 —— 别在这儿空等十分钟。
+                if ($_.Exception -isnot [System.IO.IOException]) {
+                    Die ("cannot create the build lock {0}: {1}" -f $lockPath, $_.Exception.Message)
+                }
+            }
+        }
+        $age = -1
+        try { $age = ((Get-Date) - (Get-Item -LiteralPath $lockPath).LastWriteTime).TotalSeconds } catch { }
+        if ($age -gt $LockStaleSeconds) {
+            Warn ("found a stale build lock ({0:N0}s old, a build probably crashed) - removing it" -f $age)
+            Remove-Item -LiteralPath $lockPath -Force -ErrorAction SilentlyContinue
+            continue
+        }
+        if ((Get-Date) -gt $deadline) {
+            $holder = ''
+            try { $holder = (([System.IO.File]::ReadAllText($lockPath)) -replace "`r?`n", ' ').Trim() } catch { }
+            Die ("another packager is already running ({0}) - gave up after {1}s waiting for {2}" -f $holder, $LockTimeoutSeconds, $lockPath)
+        }
+        if (-not $announced) {
+            Say ("another packager is already running - waiting for it (up to {0}s, lock {1})" -f $LockTimeoutSeconds, $lockPath)
+            $announced = $true
+        }
+        Start-Sleep -Milliseconds 400
+    }
+}
+
+# WHY this trap: an unexpected terminating error used to leave a log full of [ok] lines and
+# nothing but exit=1 for the caller to show -- exactly the 2026-10-17 report ("all checks
+# are ok, then build-package.ps1 exit=1"). Always print ONE line naming the real reason
+# (and where it happened), release the lock, and still exit non-zero.
+trap {
+    $msg = [string]$_.Exception.Message
+    Write-Host ''
+    Write-Host ("  [fail] " + $msg) -ForegroundColor Red
+    try {
+        $at = $_.InvocationInfo
+        if ($at -and $at.ScriptLineNumber) {
+            Write-Host ("         at " + $at.ScriptName + ":" + $at.ScriptLineNumber + "  " + ([string]$at.Line).Trim()) -ForegroundColor DarkYellow
+        }
+    } catch { }
+    Unlock-Pack
+    exit 1
+}
+
+if (-not $DryRun) {
+    if (-not (Test-Path -LiteralPath $OutDir)) { New-Item -ItemType Directory -Path $OutDir -Force | Out-Null }
+    Lock-Pack
+}
 
 Write-Host ''
 Write-Host "  === ECHO build-package (profile=$Profile, dryRun=$DryRun) ==="
@@ -274,10 +383,16 @@ if ($Profile -eq 'component' -or $Profile -eq 'offline') {
     [System.IO.File]::WriteAllLines((Join-Path $stage 'SHA256SUMS.txt'), $sums, (New-Object System.Text.UTF8Encoding($false)))
     if (-not (Test-Path $OutDir)) { New-Item -ItemType Directory -Path $OutDir -Force | Out-Null }
     $zipPath = Join-Path $OutDir ("$packName-$stamp.zip")
+    # WHY write to ".part-<pid>" and publish by rename: the stamp is minute-precise, so a
+    # rebuild started in the same minute aims at the SAME name. Publishing by rename never
+    # opens a file that another packager (or our own previous attempt) still holds, and a
+    # crash leaves a .part file instead of a half-written .zip under the real name.
+    $zipTmp = "$zipPath.part-$PID"
+    if (Test-Path -LiteralPath $zipTmp) { Remove-Item -LiteralPath $zipTmp -Force }
     Say "compressing to $zipPath"
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     Add-Type -AssemblyName System.IO.Compression   # ZipArchiveMode lives here, not in FileSystem
-    $zip = [System.IO.Compression.ZipFile]::Open($zipPath, [System.IO.Compression.ZipArchiveMode]::Create)
+    $zip = [System.IO.Compression.ZipFile]::Open($zipTmp, [System.IO.Compression.ZipArchiveMode]::Create)
     try {
         foreach ($f in (Get-ChildItem $stage -Recurse -File -Force | Sort-Object FullName)) {
             $rel = $f.FullName.Substring($stage.Length + 1).Replace('\', '/')
@@ -285,6 +400,8 @@ if ($Profile -eq 'component' -or $Profile -eq 'offline') {
                 $zip, $f.FullName, $rel, [System.IO.Compression.CompressionLevel]::Optimal)
         }
     } finally { $zip.Dispose() }
+    if (Test-Path -LiteralPath $zipPath) { Remove-Item -LiteralPath $zipPath -Force }
+    Move-Item -LiteralPath $zipTmp -Destination $zipPath -Force
     $zipHash = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLower()
     [System.IO.File]::WriteAllText("$zipPath.sha256", "$zipHash  $(Split-Path $zipPath -Leaf)`n",
         (New-Object System.Text.UTF8Encoding($false)))
@@ -295,6 +412,7 @@ if ($Profile -eq 'component' -or $Profile -eq 'offline') {
     Say ("    files   : {0}" -f $stageFiles.Count)
     Say ("    sha256  : {0}" -f $zipHash)
     Write-Host ''
+    Unlock-Pack
     exit 0
 }
 
@@ -559,6 +677,12 @@ Say ("manifest.json: kind=$Profile platform=$plat required=$($requiredIds -join 
 if (-not (Test-Path $OutDir)) { New-Item -ItemType Directory -Path $OutDir -Force | Out-Null }
 $zipName = "ECHO-$Profile-$plat-$Version-$stamp.zip"
 $zipPath = Join-Path $OutDir $zipName
+# WHY write to ".part-<pid>" and publish by rename: the stamp is minute-precise, so a rebuild
+# started in the same minute aims at the SAME name (that is exactly how two builds collided on
+# 2026-10-17/18). Renaming publishes atomically: we never open a file another packager still
+# holds, and a crash leaves a .part file instead of a half-written .zip under the real name.
+$zipTmp = "$zipPath.part-$PID"
+if (Test-Path -LiteralPath $zipTmp) { Remove-Item -LiteralPath $zipTmp -Force }
 Say "compressing to $zipPath"
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 Add-Type -AssemblyName System.IO.Compression        # ZipArchiveMode / ZipArchive live here
@@ -567,7 +691,7 @@ Add-Type -AssemblyName System.IO.Compression        # ZipArchiveMode / ZipArchiv
 # (Finder, plain unzip) then create a file literally named "mac\setup_mac.sh"
 # instead of the directory. The zip spec wants forward slashes, and this package is
 # meant to be opened on a Mac.
-$zip = [System.IO.Compression.ZipFile]::Open($zipPath, [System.IO.Compression.ZipArchiveMode]::Create)
+$zip = [System.IO.Compression.ZipFile]::Open($zipTmp, [System.IO.Compression.ZipArchiveMode]::Create)
 try {
     foreach ($f in (Get-ChildItem $stage -Recurse -File -Force | Sort-Object FullName)) {
         $rel = $f.FullName.Substring($stage.Length + 1).Replace('\', '/')
@@ -577,6 +701,8 @@ try {
 } finally {
     $zip.Dispose()
 }
+if (Test-Path -LiteralPath $zipPath) { Remove-Item -LiteralPath $zipPath -Force }
+Move-Item -LiteralPath $zipTmp -Destination $zipPath -Force
 
 # ---------------------------------------------------------------- verify output
 Say 'verifying the produced zip...'
@@ -600,4 +726,5 @@ Say ("    size    : {0} MB" -f [Math]::Round((Get-Item $zipPath).Length / 1MB, 2
 Say ("    entries : {0}" -f $entries.Count)
 Say ("    sha256  : {0}" -f $zipHash)
 Write-Host ''
+Unlock-Pack
 exit 0
