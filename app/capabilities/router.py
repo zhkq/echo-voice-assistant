@@ -245,8 +245,8 @@ class CapabilityRouter:
                     continue
                 if not client.supports(slot):
                     out.skipped.append(Skipped(
-                        slot, backend_id, "unsupported",
-                        "它只提供 %s" % (", ".join(sorted(client.provides)) or "（什么都不提供）")))
+                        slot, backend_id, _unsupported_reason(client),
+                        _unsupported_detail(client)))
                     continue
                 # 铁律 L2 / L5 的合流处：说话人这一家子**必须同源**。
                 # 详见 `base.SAME_SOURCE_SLOTS` —— 简言之：标签与嵌入分属两家就完全对不上，
@@ -424,6 +424,42 @@ def _sources_for_privacy(privacy: str) -> set:
     if level >= PRIVACY_ORDER["wan"]:
         allowed.add(SOURCE_WAN)
     return allowed
+
+
+def _unsupported_reason(client) -> str:
+    """后端这一轮用不上时，该报哪个**权威原因词**。
+
+    默认还是 `unsupported`（"它不支持这一槽"）。但当后端的能力**根本没问到**时
+    （`caps_state` 是 `unknown` / `offline`），报 `unsupported` 就是把用户往错的方向指 ——
+    面板把那句翻成"不支持这件事"，于是他会去换后端/改配置，而真相是"没问到/连不上"。
+
+    **为什么不报 `blocked`**：`meeting._policy_blocked_only()` 只认"至少一条 `blocked`、
+    且同一后端没有别的原因"——把"连不上"写成 `blocked` 会让会议报
+    `blocked-by-privacy`（"去改「允许音频去哪」"），而那正是 2026-09-29 定下来绝不能混的
+    那一档（连得上、只是不许发）。`offline` 在权威十词里、也被
+    `meeting.REMOTE_UNAVAILABLE_REASONS` 认成"远端暂时干不了"，语义正好。
+    """
+    state = str(getattr(client, "caps_state", "") or "")
+    return "offline" if state in ("unknown", "offline") else "unsupported"
+
+
+def _unsupported_detail(client) -> str:
+    """同上那条的补充说明：**"没问到它"与"它明确不提供"必须说得出区别**。
+
+    判据全用后端自己吐出来的事实（`caps_state` / `caps_error`），这里不猜：
+      * `unknown` / `offline` → 能力探测失败了，把原因原样带上（这就是排障要的第一手信息）；
+      * 其余（`empty` / `ok` / 没探测过）→ 沿用原来那句"它只提供 …"。
+    """
+    state = str(getattr(client, "caps_state", "") or "")
+    err = str(getattr(client, "caps_error", "") or "")
+    tail = ("：%s" % err) if err else "（原因未记录）"
+    if state == "unknown":
+        return "能力探测失败，没能确认它支持哪些槽" + tail
+    if state == "offline":
+        # 不写具体是"连不上"还是"凭据不能用"——那是 `caps_error` 的事（它原样跟在后面）。
+        # 这里只断言"这一轮用不上它"，免得把一个 401 说成网络故障（原因说错比不说更贵）。
+        return "这一轮用不上它（能力探测没成功）" + tail
+    return "它只提供 %s" % (", ".join(sorted(client.provides)) or "（什么都不提供）")
 
 
 def _setting_key_for(slot: str) -> str:

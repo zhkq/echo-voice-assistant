@@ -96,7 +96,11 @@ interface EchoApi {
     @GET("health")
     suspend fun health(): Response<ResponseBody>
 
-    // ---- 会议（录音在 ECHO 那台机器上做，手机只遥控 + 看）----
+    // ---- 会议（手机发起 = **手机录**；ECHO 只负责落盘/转写/存储）----
+    //
+    // 用户 2026-10-17 真机 bug 之后的口径：手机上按「开始录音」录的必须是**这台手机**的麦克风。
+    // 所以这个接口面里**没有**"让电脑开麦"那条路（旧的 `meetingStart()` 已删）：
+    // 采集源由 `source=phone` 明说，音频由 `meetingSegmentWithId` 逐段传上来。
     //
     // 注意：**不提供删除** —— `app/api.py` 的 `_NETWORK_DENIED` 把
     // `DELETE /api/meetings/{id}` 对网上来的调用一律 403。
@@ -138,37 +142,35 @@ interface EchoApi {
         @Query("seg") seg: Int,
     ): Response<ResponseBody>
 
-    // 这两条**没有请求体**（api.py:1331-1342 的签名里只有 _auth），所以不要发 body。
-    // 恒 HTTP 200，靠 `{ok, message}` 说成没成 —— 失败原因都在 message 里。
-    @POST("api/meeting/start")
-    suspend fun meetingStart(): Response<CommandResponse>
+    // ---- 建会：**只有一条路**（手机发起 = 手机录），别再把它拆成两条 ----
+    //
+    // 2026-10-17 真机 bug 的客户端半边就出在旧的 `meetingStart()`：它**一个 query 都不带**
+    // （`POST /api/meeting/start` 裸路径），服务端于是按"电脑那支麦"开了一场会 —— 手机上点
+    // 「开始录音」，录的却是电脑的麦克风（转写里混进了电脑那边的人声）。那条无参数的重载
+    // **已经删掉**（不是留着不用）：类型里没有它，就没有地方能再把"遥控电脑开麦"接回来。
+    //
+    // 现在建会只走这一条：`source=phone`（采集源 = 这台手机）+ `clientId`（幂等键）
+    // + `startedAt`（这一场**真正的**开始时间，来自本地录音清单）。
+    // 为什么不能只改服务端：请求里根本没告诉它"这是手机录的"—— 服务端没有信息可分，
+    // 只能按默认的电脑麦开；客户端不发 source，服务端再聪明也猜不出来。
 
     /**
-     * 开始录音，采集源 = **手机麦克风**（电脑不开麦，只负责落盘/转写/存储）。
+     * 建会（手机麦那条唯一的路）：把**采集源**、**幂等键**与**开始时间**一起交上去。
      *
-     * 用户 2026-10-15 的口径："手机发起的指令，手机收，电脑是配合执行和存储"。
-     */
-    @POST("api/meeting/start")
-    suspend fun meetingStartPhone(
-        @Query("source") source: String = "phone",
-    ): Response<CommandResponse>
-
-    /**
-     * 开始录音，并把**幂等键**与**开始时间**一起交上去（离线补传那条路）。
-     *
-     * 与 [meetingStartPhone] 打的是**同一个路径**，只是多带三个后端可能还不认识的 query
-     * 参数（`clientId` / `startedAt` / `source`）：
-     *  * 服务端支持 → 按 `clientId` 幂等，并采用我们缓存的 `startedAt`（**对**的时间轴）；
-     *  * 服务端还不支持 → 参数被忽略，行为退化成 [meetingStartPhone]（功能不坏，只是
-     *    时间轴会变成补传那一刻）—— 所以补传那条路**必须**容忍这个降级，
-     *    并把它如实说出来（见 `OfflineMeetingSync` 的对账说明）。
+     * 参数来自**本地录音清单**（`MeetingDraft`：由 `MeetingRecordSession` 在开录那一刻写下来）——
+     * 于是"这场会是手机在录"不是一句注释，而是请求里真有 `source=phone`、身份真有出处。
+     * 服务端支持这些 query 时按 `clientId` 幂等并采用 `startedAt`（**对**的时间轴）；
+     * 老服务端不认识时参数被忽略（功能不坏，只是时间轴变成补传那一刻）—— 补传那条路
+     * **必须**容忍这个降级并如实说出来（见 `OfflineMeetingSync` 的对账说明）。
      *
      * ⚠️ 这条**不带请求体**：后端 `POST /api/meeting/start` 的签名里只有 `_auth`
      * （`app/api.py`），给它一个 JSON body 只会白白多一份可能不被解析的东西。
-     * 于是"客户端 id / 开始时间"只能走 query —— 这也正是服务端契约要支持的那一项。
+     * 于是"采集源 / 客户端 id / 开始时间"只能走 query。
      */
     @POST("api/meeting/start")
     suspend fun meetingStartPhoneWithId(
+        // 默认值写死 `"phone"`（与 `MeetingSource.PHONE` 同一个值）：data 层不反向依赖
+        // service 层，而"默认必须是 phone"这条由 `MeetingPhoneStartTest` 的请求断言钉住。
         @Query("source") source: String = "phone",
         @Query("clientId") clientId: String,
         @Query("startedAt") startedAt: String,

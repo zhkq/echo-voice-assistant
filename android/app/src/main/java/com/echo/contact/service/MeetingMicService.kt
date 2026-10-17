@@ -531,6 +531,29 @@ class MeetingMicService : Service() {
     private var job: Job? = null
     private var record: AudioRecord? = null
 
+    /**
+     * 已经在收尾了（`stopEverything` 只该跑一次）。
+     *
+     * 为什么需要它：收尾现在会**把尾段缓冲封成一段**。`ACTION_STOP` 完全可能到两次
+     * （通知里的「结束」+ 界面上的「结束」，或系统重投），第二次再封一遍就是
+     * **同一段音频在清单里出现两遍**（转写里同一句话出现两遍）——手机这边完全静默。
+     * 所以第一下占住它，后来的一律忽略；新的一场录音开始时才放开。
+     */
+    @Volatile private var stopping = false
+
+    /**
+     * 采集循环正在攒的、**还不到一段**的样本（结束时由 [sealFinalTail] 封成尾段）。
+     *
+     * 为什么它必须是服务的一个字段（而不是 `runLoop` 里的局部变量）：原来的形状是
+     * "缓冲是局部的、一结束就没了" —— 而段长默认 30 秒，用户"**录 20 秒就停**"时
+     * 缓冲里那 20 秒**一段都没攒满**，整段录音于是凭空消失（既不建会也不上传）。
+     * 现在 `stopEverything` 在 `cancelAndJoin` 之后从这里把尾巴封出去。
+     *
+     * ⚠️ 只在**旧那一场跑完并 join 之后**读（那时采集协程已经不再写它）；重复收到
+     * `stop` 时会把它置空，避免同一段音频被封两遍（转写里同一句话出现两次）。
+     */
+    @Volatile private var captureTail: ArrayList<Short>? = null
+
     // ---- 这一场录音的现场（**进程被杀就没了；事实都在清单里**）----
 
     /**
@@ -594,6 +617,14 @@ class MeetingMicService : Service() {
     /**
      * 开始录音（用户 2026-10-17 合并两条路之后的形状）。
      *
+     * ## 这是**唯一**的录音入口（手机发起 = 手机录）
+     *
+     * 界面上那颗「开始录音」（`MeetingsTab` → `MainViewModel.startMeeting()`）与旧版
+     * 「用手机麦克风」那颗按钮**现在就是同一件事**：都只调 [MeetingMicService.start]。
+     * 旧的 `MainViewModel.startMeeting()` 发的是无参数的 `POST /api/meeting/start`
+     * （服务端于是开**电脑**那支麦）—— 真机上表现成"手机点了开始、电脑在录"，
+     * 转写里混进电脑那边的人声。那条路已经退役，**别再**在这里或 ViewModel 里把它接回来。
+     *
      * ## 为什么这里**不探活、不建会、不看服务端脸色**
      *
      * 用户原话：*"离线录音和在线录音就没什么本质区别了"*。于是"开始录音"只做一件事：
@@ -602,10 +633,17 @@ class MeetingMicService : Service() {
      * 网络好不好都是同一条代码路径，没有"探活超时 1.5 秒才决定走哪条路"这种分叉，
      * 也没有"联网那条先在电脑上开一场会、失败了再退到离线"这种会留下半场会的中间态。
      *
+     * 而且**建会请求刻意延后到第一段音频真的落盘之后**（见 [triggerOpportunisticUpload]）：
+     * 这一行的 `clientId` / `startedAt` 就是那条统一路要交上去的身份（`source=phone`）。
+     * 先建会再录音的话，服务端会出现"一场手机麦的会，一个音频段都没有"—— 空会占着
+     * 唯一那条录音槽，之后谁都开不了新会。**没有本地音频，就不该有这场会。**
+     *
      * 唯一还能让"开始录音"失败的东西是**麦克风权限**（那是真的不能录）。
      */
     private fun startRecording() {
         if (job != null) return
+        // 新的一场：上一次的"正在收尾"标记要放开（否则这一场按结束会被忽略）
+        stopping = false
         if (checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) !=
             PackageManager.PERMISSION_GRANTED
         ) {
@@ -614,7 +652,7 @@ class MeetingMicService : Service() {
         }
         // 上一条**被进程杀掉**留下的清单：按最后一段的时间收尾（如实标出这是推断），
         // 它接下来会被后台补传捡走 —— 别让它永远停在"还在录"（那种清单谁都不敢收尾）
-        closeInterruptedDrafts()
+        val interruptedNote = closeInterruptedDrafts()
 
         val now = System.currentTimeMillis()
         val s = MeetingRecordSession(
@@ -625,19 +663,23 @@ class MeetingMicService : Service() {
         )
         val started = s.start(MeetingDraftStore.newClientId(), MeetingDraftStore.isoOf(now))
         session = s
+        // 上一场已经结束：把尾段缓冲清掉（`runLoop` 马上会换上这一场自己的那一个）
+        captureTail = null
         wavSegments = 0
-        if (started.note.isNotBlank()) syncNote(started.note)
         startForegroundCompat()
+        // 这两句都是"必须让人看见"的降级说明：上一条被打断的录音、以及这一份清单读不懂
+        // 另起了一份。它们不能被下面那行"本机录音中"的状态盖掉（以前就是被盖掉的）。
+        val notices = listOf(interruptedNote, started.note).filter { it.isNotBlank() }
         _state.value = MicState(
             active = true,
             syncPhase = OfflinePhase.RECORDING_LOCAL,
-            syncNote = offlineStatusLine(OfflineSyncState(
+            syncNote = (notices + offlineStatusLine(OfflineSyncState(
                 phase = OfflinePhase.RECORDING_LOCAL,
                 clientId = started.draft.clientId,
                 totalSegments = started.draft.segments.size,
                 pendingSegments = started.draft.pendingSegments,
                 confirmedSegments = started.draft.confirmedSegments,
-            )),
+            ))).filter { it.isNotBlank() }.joinToString(" · "),
             startedAt = started.draft.startedAt,
         )
         notifyState()
@@ -650,12 +692,32 @@ class MeetingMicService : Service() {
      * 为什么要在这里做：那种清单的 `ended_at` 是空的 → 它会被这条路的规则判成"还在录"
      * → **永远不许收尾**（见 `SyncScope`）→ 音频永远传不到服务端、永远不出文字。
      * 而进程已经被杀过一次，那场录音**确实已经结束**了（结束时刻只能推断）。
+     *
+     * ⚠️ **进程被杀时补不了尾段**（`sealFinalTail` 只在用户按结束时跑）：那不足一段的
+     * 缓冲在进程里，跟着进程一起没了。这件事**必须如实说**，绝不因为"清单收尾了"
+     * 就让人以为整场都还在（见 [inferredEndNote] 与返回的提示）。
+     *
+     * 返回一句**要显示给人的话**（空 = 没有被丢弃的录音）。它会被 `startRecording`
+     * 合并进这一场的状态里 —— 以前那句 `syncNote(...)` 紧接着就被新的 `MicState` 盖掉了，
+     * 用户根本看不到（等于静默）。
      */
-    private fun closeInterruptedDrafts() {
+    private fun closeInterruptedDrafts(): String {
+        val notes = ArrayList<String>()
         val unfinished = runCatching {
-            draftStore.list().filter { it.recording && it.segments.isNotEmpty() }
+            draftStore.list().filter { it.recording }
         }.getOrDefault(emptyList())
         unfinished.forEach { d ->
+            if (d.segments.isEmpty()) {
+                // 进程在第一段攒满之前就被杀了：缓冲里的那一小段**没封存、也救不回来**。
+                // 这一份清单必须收尾（否则永远停在"还在录"），而它**没有可上传的音频**，
+                // 所以也不会建会 —— 但"这次什么都没留下"必须说出来。
+                // ⚠️ 措辞不写死"进程被杀"：麦克风起不来（`failAndStop`）也会留下这种
+                // 0 段的清单，而**原因我们此刻分不出来**（两种都说成被杀就是编原因）。
+                draftStore.save(d.copy(endedAt = d.startedAt, endedAtInferred = true))
+                notes += "上一条录音在第一段攒满之前就中断了：没有留下可上传的音频" +
+                    "（不足一段的缓冲没来得及封存）"
+                return@forEach
+            }
             val last = d.segments.maxByOrNull { it.seq } ?: return@forEach
             val endIso = MeetingDraftStore.isoOf(
                 (MeetingDraftStore.epochOf(last.startedAt) ?: System.currentTimeMillis()) +
@@ -663,9 +725,11 @@ class MeetingMicService : Service() {
             // 结束时间**是按最后一段推出来的**（不是当时真的按了结束）—— 用**结构化**的
             // `endedAtInferred` 记下来（而不是塞一句备注）：它必须能被每一次同步如实说出来
             draftStore.save(d.copy(endedAt = endIso, endedAtInferred = true))
-            syncNote("上一条录音（${d.segments.size} 段）是被打断的：结束时间按最后一段推的" +
-                "（不是当时按的结束），剩下的段会继续传")
+            notes += "上一条录音（${d.segments.size} 段）是被打断的：结束时间按最后一段推的" +
+                "（不是当时按的结束），剩下的段会继续传；" +
+                "**最后不足一段的缓冲没来得及封存**（进程被杀时补不了尾），那一小段可能丢了"
         }
+        return notes.joinToString(" · ")
     }
 
     private suspend fun runLoop() {
@@ -692,6 +756,9 @@ class MeetingMicService : Service() {
         // 缓冲的容量按"装得下一整段"给（`ArrayList` 自己会增长，这个初值只是免掉几次扩容）；
         // 段长由硬件帧长整除（100ms 帧 vs 15/30/60 秒），所以一个缓冲里通常只有一段。
         val buffer = ArrayList<Short>(samplesPerSegment)
+        // 把它挂到服务上：**结束时**要把这里剩下的（不足一段的）样本补封成尾段
+        // —— 不挂出去的话，"录 20 秒就结束"那 20 秒会跟着局部变量一起消失。
+        captureTail = buffer
         val capture = MicCaptureLoop(samplesPerSegment)
         try {
             ar.startRecording()
@@ -810,29 +877,65 @@ class MeetingMicService : Service() {
     }
 
     private fun stopEverything(reason: String) {
+        // 重复的「结束」（通知 + 界面各按了一次）不许把尾段封两遍 —— 见 [stopping]。
+        if (stopping) return
+        stopping = true
         // 为什么要把这个原因记下来：结束时还静音着、或补传没传完，这两件事都要
         // 写在状态里让人看懂 —— 而那两句话的**上下文**就是"谁结束了录音"
         // （用户按的 / 通知里的结束 / 服务被系统收掉）。别让它变成一个没人读的参数。
         lastStopReason = reason
         val j = job
         job = null
+        // 这一场自己的对象与缓冲**先抓住**：下面那段协程跑完之前，用户完全可能马上
+        // 又按一次「开始录音」—— 那时 `session`/`captureTail` 已经是下一场的了。
+        val s = session
+        val tailBuffer = captureTail
         scope.launch {
             if (j != null) j.cancelAndJoin()
+
+            // ①' **先补齐最后不足一段的音频**（本次修的退步）。
+            //
+            // 为什么必须在 `finish()` **之前**：`finish()` 要写 `ended_at` 与总时长，
+            // 而总时长必须包含这一小段；顺序反了这一段的时长就落在会议之外。
+            //
+            // ⚠️ 这是"结束时代替攒满一段补出尾段"，**不是**把段长改短：段长仍是
+            // 用户设置（设置页 15/30/60，默认 30 秒），正常录音的段边界一个都没动。
+            // 只有"停止时还差最后一点"这种情况才会多出这样一段尾巴。
+            //
+            // 判据见 [sealFinalTail]：**有样本就必须留下**；只有真的一个样本都没有
+            // （一按就停 / 立刻失败）才允许不建会 —— 而那时也必须如实说（见 stopNote）。
+            val tail = sealFinalTail(s, tailBuffer?.toList().orEmpty(), SAMPLE_RATE)
+            // 尾段也可能**退回 WAV** / **落盘失败**：走同一个如实发布（绝不谎报格式、绝不吞错误）
+            tail.seal?.let { publishSeal(it) }
+            if (tail.note.isNotBlank()) android.util.Log.i(TAG, tail.note)
+            if (tail.error.isNotBlank()) android.util.Log.e(TAG, tail.error)
+            // 这一段的缓冲已经封走了：清掉引用，**重复收到 stop 也不会再封一次**
+            // （同一段音频封成两段 = 转写里同一句话出现两遍）。
+            if (captureTail === tailBuffer) captureTail = null
 
             // ① **本地收尾立刻生效**：结束时间 + 总时长落盘（结束时还静音着的话，
             //    最后那段暂停也在这里收进清单 —— 否则会凭空多出一段"没人说话"的时长）。
             //    为什么先做这一步再传：用户的"结束"必须**当场**生效（本地不再采音、
             //    清单落盘），绝不能押在一次网络请求上（断网时那会变成"按了结束没反应"）。
-            val done = runCatching { session?.finish() }.getOrNull()
+            val done = runCatching { s?.finish() }.getOrNull()
+            val totalSegments = done?.segments?.size ?: 0
+            // 一个样本都没录到（一按就停 / 立刻失败）：**不建会**，但必须如实说 ——
+            // 静默是最糟的（用户会以为录上了，只是还没转写）。
+            val stopNote = tailStopNote(tail, totalSegments, hadSession = s != null)
             _state.value = _state.value.copy(
                 active = false, level = 0f, paused = false,
-                syncPhase = if (done != null && !done.uploaded) OfflinePhase.WAITING_UPLOAD
-                else _state.value.syncPhase,
-                syncPending = done?.pendingSegments ?: _state.value.syncPending,
-                syncNote = offlineStatusLine(OfflineSyncState(
+                stopNote = stopNote,
+                syncPhase = when {
+                    totalSegments == 0 -> OfflinePhase.IDLE
+                    done != null && !done.uploaded -> OfflinePhase.WAITING_UPLOAD
+                    else -> _state.value.syncPhase
+                },
+                syncPending = if (totalSegments == 0) 0
+                else done?.pendingSegments ?: _state.value.syncPending,
+                syncNote = if (totalSegments == 0) "" else offlineStatusLine(OfflineSyncState(
                     phase = if (done != null && !done.uploaded) OfflinePhase.WAITING_UPLOAD
                     else _state.value.syncPhase,
-                    totalSegments = done?.segments?.size ?: 0,
+                    totalSegments = totalSegments,
                     pendingSegments = done?.pendingSegments ?: 0,
                     confirmedSegments = done?.confirmedSegments ?: 0,
                     note = "录完了，正在补齐剩下的段并让 ECHO 收尾",
@@ -845,6 +948,8 @@ class MeetingMicService : Service() {
             //    而"结束"很可能正好撞上它 —— 直接跳过的话，这一场就要等到下一次 tick
             //    才被收尾（用户以为已经结束了，服务端却还没收到 stop = **还没有转写**）。
             //    等待是**有界**的（见 FINALIZE_WAIT_MS）：等不到就如实说"这一次没跑"。
+            //    ⚠️ 一个样本都没有时也照跑这一轮：它只处理**别的**还没传完的清单
+            //    （这一份没有音频段，`pending()` 不会选中它），所以**不会**建出空会。
             val outcome = runCatching {
                 runOfflineSync(this@MeetingMicService, store = draftStore,
                     manual = true, scope = SyncScope.FINALIZE,
@@ -852,7 +957,7 @@ class MeetingMicService : Service() {
             }.getOrDefault(RetryOutcome.Ran)
             if (outcome == RetryOutcome.SkippedBusy) {
                 // 如实：这次收尾**没跑**（另一轮占着），还有几段留着 —— 绝不假装传完了
-                val left = session?.draft?.pendingSegments ?: 0
+                val left = s?.draft?.pendingSegments ?: 0
                 stopRetryNote(RetryOutcome.SkippedBusy, left).takeIf { it.isNotBlank() }?.let { note ->
                     _state.value = _state.value.copy(syncNote = note)
                     notifyState()
@@ -871,11 +976,6 @@ class MeetingMicService : Service() {
         notifyState()
         stopForegroundCompat()
         stopSelf()
-    }
-
-    /** 记一句这条路的原因（不覆盖 phase）。 */
-    private fun syncNote(note: String) {
-        _state.value = _state.value.copy(syncNote = note)
     }
 
     override fun onDestroy() {
@@ -1051,7 +1151,11 @@ internal class MicCaptureLoop(
 internal fun notificationText(st: MicState): String = when {
     st.error.isNotBlank() -> st.error
     // 录完了但还在传：这时最怕用户以为"已经完事了"（其实还没出文字）
-    !st.active -> "录音已结束 · " + st.syncNote.ifBlank { "正在把剩下的段传给 ECHO…" }
+    // ⚠️ 没有补传进度可说时，**不能沉默**：结束那一刻的事实（例如"这次没有录到音频"）
+    // 要顶上来 —— 否则通知里只剩一句套话，用户以为录上了只是还没转写。
+    !st.active -> "录音已结束 · " + st.syncNote.ifBlank {
+        st.stopNote.ifBlank { "正在把剩下的段传给 ECHO…" }
+    }
     // 有段没传上去 + 有真实原因（连不上 / 服务端拒绝）：先说它（那关系到音频会不会丢）
     st.syncPending > 0 && st.syncNote.isNotBlank() -> st.syncNote
     st.paused -> "已静音（这段不会录进会议）"
@@ -1068,6 +1172,16 @@ data class MicState(
     /** 服务端**已认下**的段数（界面那一行"已传 N 段"）。 */
     val sent: Int = 0,
     val error: String = "",
+
+    /**
+     * 上一次「结束录音」时**必须说给人听的那句话**（空 = 没什么要说的）。
+     *
+     * 为什么单独一个字段（而不是塞在 [syncNote] 里）：`syncNote` 是**补传那一轮**的
+     * 状态，前台 tick 每几秒就会按真实进度重写它；而"这次没有录到音频"/
+     * "最后一段没封存下来"是**结束那一刻的事实**，不能被下一轮 tick 抹掉
+     * （抹掉 = 静默，用户会以为录上了只是还没转写）。见 [tailStopNote]。
+     */
+    val stopNote: String = "",
 
     // ---- 音频"传上去没有"（**唯一**的出口是 syncNote / offlineStatusLine）----
 

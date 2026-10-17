@@ -22,13 +22,13 @@ import com.echo.contact.data.dto.DailyReviewSummary
 import com.echo.contact.data.dto.MeetingDetail
 import com.echo.contact.data.dto.MeetingItem
 import com.echo.contact.data.dto.EventItem
-import com.echo.contact.data.dto.MeetingStatus
 import com.echo.contact.data.dto.ReviewDay
 import com.echo.contact.data.dto.ReviewHistoryDetail
 import com.echo.contact.data.dto.StatusResponse
 import com.echo.contact.data.dto.TranscribeProgress
 import com.echo.contact.data.dto.TtsRequest
 import com.echo.contact.service.AppPrefs
+import com.echo.contact.service.SpeakPlan
 import com.echo.contact.service.SpeakPrefs
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -57,7 +57,19 @@ data class SubmitState(
     val phase: SubmitPhase = SubmitPhase.Idle,
     /** 后端受理时回的那句话（`{ok, message}`），或失败原因。 */
     val message: String = "",
+    /** 整篇回复 —— **给眼睛看的**（卡片上摆着，能慢慢读、能滚）。 */
     val reply: String = "",
+    /**
+     * 这条回复**该念的那一段** —— **给耳朵听的**（用户 2026-10-17 真机：手机把详情也念了）。
+     *
+     * 由 `SpeakPlan` 一处判出来（电脑给的 `speakText` 优先；老电脑只取开头摘要；
+     * `origin=pc` 就是空 = 一个字都不念）。空串 = 不念。
+     *
+     * 为什么与 [reply] 分成两个字段，而不是念的时候再从 `reply` 里切：
+     * "念哪段"与"存哪篇"是两件事（详情照样要能回看），而"切"这个动作只要有两处实现，
+     * 迟早切出两个不一样的结果。**音频侧不再自己切正文。**
+     */
+    val speak: String = "",
     val error: String = "",
     val cmdId: Int? = null,
     val startedAt: Long = 0L,
@@ -517,17 +529,18 @@ class MainViewModel(app: Application) : BaseViewModel(app) {
         loadMeetings()
     }
 
-    // ---- 会议（录音在 ECHO 主机上做，手机只是遥控器）----
+    // ---- 会议（**手机发起 = 手机录**；那台电脑只负责落盘/转写/存储）----
+    //
+    // 用户 2026-10-17 真机 bug 之后，这里**没有**"遥控电脑开麦"那条路：
+    // 旧的 `startMeeting()` 发的是无参数的 `POST /api/meeting/start`（服务端于是开电脑的麦），
+    // 旧的 `stopMeeting()`/`toggleMeetingPause()` 也是在遥控**电脑那一场**。
+    // 三条都删了 —— 手机这边只有一个录音动作：`MeetingMicService`（本机麦克风）。
 
     private val _meetings = MutableStateFlow<List<MeetingItem>>(emptyList())
     val meetings: StateFlow<List<MeetingItem>> = _meetings.asStateFlow()
 
     private val _meetingsNote = MutableStateFlow<String?>(null)
     val meetingsNote: StateFlow<String?> = _meetingsNote.asStateFlow()
-
-    /** 开始/停止录音这类动作正在进行（按钮防连点）。 */
-    private val _meetingActionBusy = MutableStateFlow(false)
-    val meetingActionBusy: StateFlow<Boolean> = _meetingActionBusy.asStateFlow()
 
     /** 转写进度：键可能是会议 id，也可能是会议名（导入录音那条路）。 */
     private val _transcribe = MutableStateFlow<Map<String, TranscribeProgress>>(emptyMap())
@@ -695,122 +708,54 @@ class MainViewModel(app: Application) : BaseViewModel(app) {
     }
 
     /**
-     * 开始录音。**录的是电脑那支麦克风** —— 手机只是遥控。
-     * 后端恒回 200，成没成看 `{ok, message}`。
+     * 「开始录音」= **录这台手机的麦克风**（用户 2026-10-17 的口径：手机发起 = 手机录）。
+     *
+     * ## 为什么这一版只调 `MeetingMicService.start()`
+     *
+     * 旧的实现是 `api().meetingStart()`（无参数）→ 服务端按**电脑那支麦**开一场会。
+     * 真机现场就是这样：手机上按了开始，电脑那边"会议宝麦克风不可用，回退系统默认麦克风"，
+     * 录进去的是电脑房间里的人声，而手机持有者在别的屋说话的内容一个字节都没上去
+     * （日志里整场录音 **零个** `/api/meeting/segment`）。
+     *
+     * 现在这里只有一件事：让**这台手机**开始本地录音。建会请求（`source=phone` +
+     * `clientId` + `startedAt`）不由这里发 —— 它由那条统一路在**第一段音频真的落盘之后**
+     * 才发（`MeetingMicService` → `OfflineMeetingSync`）。这样既不会出现"手机发起但录的是
+     * 电脑麦"，也不会出现"建了手机麦的会、却一个音频段都没有"（那是另一种新失败模式：
+     * 服务端一场空会占着唯一那条录音槽，之后谁都开不了新会）。
+     *
+     * 连不上 ECHO 也照样录：本地先写（清单 + 段），上传只是后面的事
+     * （见 `MeetingMicService` 与 `OfflineMeetingSync` 的说明）。
      */
     fun startMeeting() {
-        if (_meetingActionBusy.value) return
-        _meetingActionBusy.value = true
-        _meetingsNote.value = null
-        viewModelScope.launch {
-            try {
-                val resp = api().meetingStart()
-                val b = resp.body()
-                _meetingsNote.value = when {
-                    !resp.isSuccessful -> parseError(resp)
-                    b?.ok == true -> "已开始录音：${b.message.orEmpty()}"
-                    else -> b?.message ?: "没能开始录音"
-                }
-                if (b?.ok == true) {
-                    // 开起来了就直接进**全屏录音界面**（用户 2026-10-15 要的那个：
-                    // 电平 + 结束 + 静音/恢复）。失败不进 —— 界面开着却什么都没录最糟。
-                    _showRecordingScreen.value = true
-                    pollMeetingStatus()
-                }
-            } catch (e: IOException) {
-                _meetingsNote.value = "无法连接：${e.message}"
-            } catch (e: Exception) {
-                _meetingsNote.value = "出错：${e.message}"
-            }
-            _meetingActionBusy.value = false
-            checkStatus()
-            loadMeetings()
-        }
+        val app = getApplication<Application>()
+        // 复用「手机当麦克风」那条既有入口（前台服务 + AudioRecord + 本地清单 + 补传），
+        // **不**在这里另写一套录音/建会逻辑。
+        com.echo.contact.service.MeetingMicService.start(app)
+        _meetingsNote.value =
+            "已开始录音：这台手机正在录（声音先存在手机里；连不上 ECHO 也照样录，联网后自动补传）"
+        // 直接进**全屏录音界面**（电平 + 静音 + 结束）。服务是异步起来的，
+        // 界面先按"还没开始"显示，状态一到就切过去 —— 失败（比如没给麦克风权限）
+        // 会把原因显示在这个界面上（`MicState.error`），不会静默。
+        _showRecordingScreen.value = true
     }
 
-    // ---- 全屏录音界面（手机侧）：状态轮询 + 静音/恢复（2026-10-15）----
+    // ---- 全屏录音界面（2026-10-15 要的：电平 + 结束 + 静音/恢复）----
+    //
+    // 界面上的电平/暂停/段数全部来自 `MeetingMicService.state`（本地），**不再**轮询
+    // `GET /api/meeting/status`：那条是"电脑那支麦"的状态。手机麦这条路即使离线，
+    // 服务端也会说 active=false —— 拿它决定"关不关界面"会把正在进行的手机录音界面关掉。
 
-    /** 全屏录音界面要不要显示（`startMeeting` 成功后自动进；返回键只关界面不停止录音）。 */
+    /** 全屏录音界面要不要显示（`startMeeting` 之后自动进；返回键只关界面不停止录音）。 */
     private val _showRecordingScreen = MutableStateFlow(false)
     val showRecordingScreen: StateFlow<Boolean> = _showRecordingScreen.asStateFlow()
 
-    /** 录音期间的"实时"状态（电平/暂停/段数/开始时间）。**只在界面可见时轮询。** */
-    private val _meetingRecording = MutableStateFlow(MeetingStatus())
-    val meetingRecording: StateFlow<MeetingStatus> = _meetingRecording.asStateFlow()
-
     fun openRecordingScreen() {
         _showRecordingScreen.value = true
-        pollMeetingStatus()
     }
 
     fun closeRecordingScreen() {
         // 只关界面：录音继续（这就是"返回"该有的语义 —— 别让一个返回手势把会录断了）
         _showRecordingScreen.value = false
-    }
-
-    /**
-     * 取一次录音状态。界面按 ~350ms 调它 —— 电平要做成"好看的动效"就得够密，
-     * 而中继上这条请求很小（一个 GET），可见时 3 次/秒是可接受的。
-     */
-    fun pollMeetingStatus() {
-        viewModelScope.launch {
-            try {
-                val resp = api().meetingStatus()
-                val body = resp.body()
-                if (resp.isSuccessful && body != null) {
-                    _meetingRecording.value = body
-                    if (!body.active) _showRecordingScreen.value = false   // 录完了就退出界面
-                }
-            } catch (e: Exception) {
-                // 轮询失败不打扰用户：电平停在上一帧，真正的错误由 checkStatus 那条报
-            }
-        }
-    }
-
-    /** 静音 / 恢复（同一个按钮两个方向）。 */
-    fun toggleMeetingPause() {
-        if (_meetingActionBusy.value) return
-        _meetingActionBusy.value = true
-        val wasPaused = _meetingRecording.value.paused
-        viewModelScope.launch {
-            try {
-                val resp = if (wasPaused) api().meetingResume() else api().meetingPause()
-                val b = resp.body()
-                _meetingsNote.value = when {
-                    !resp.isSuccessful -> parseError(resp)
-                    else -> b?.message ?: if (wasPaused) "已恢复" else "已暂停"
-                }
-            } catch (e: Exception) {
-                _meetingsNote.value = "操作失败：${e.message}"
-            }
-            _meetingActionBusy.value = false
-            pollMeetingStatus()
-            checkStatus()
-        }
-    }
-
-    fun stopMeeting() {
-        if (_meetingActionBusy.value) return
-        _meetingActionBusy.value = true
-        _meetingsNote.value = null
-        viewModelScope.launch {
-            try {
-                val resp = api().meetingStop()
-                val b = resp.body()
-                _meetingsNote.value = when {
-                    !resp.isSuccessful -> parseError(resp)
-                    b?.ok == true -> "已停止，正在转写：${b.message.orEmpty()}"
-                    else -> b?.message ?: "没能停止录音"
-                }
-            } catch (e: IOException) {
-                _meetingsNote.value = "无法连接：${e.message}"
-            } catch (e: Exception) {
-                _meetingsNote.value = "出错：${e.message}"
-            }
-            _meetingActionBusy.value = false
-            checkStatus()
-            loadMeetings()
-        }
     }
 
     // ---- 每日回顾（手机只播报；口述要占主机的麦，手机做不了）----
@@ -1319,10 +1264,13 @@ class MainViewModel(app: Application) : BaseViewModel(app) {
                     targetId = b.commandId,
                 )
                 // 语音进来的就**念出来**（这是语音交互的意义所在）；打字那条不自动念。
-                // 念用手机引擎 —— 2026-10-09 定的口径（ECHO 那条要 1.3 秒起，还依赖联网）。
+                // 念的是 `speak`（**给耳朵的那段**：电脑给的 speakText，或老电脑的开头摘要），
+                // **不是** `reply`（整篇，给眼睛看的）—— 以前这里念 `reply`，于是手机把详情也读了
+                // （用户 2026-10-17 真机："手机端朗读了全部内容，包括详情"）。
+                // 念用哪边由设置定（`SpeakPrefs`），这里只管"念哪一段"。
                 val done = _submit.value
-                if (done.phase == SubmitPhase.Done && done.reply.isNotBlank()) {
-                    speak(done.reply)
+                if (done.phase == SubmitPhase.Done && done.speak.isNotBlank()) {
+                    speak(done.speak)
                 }
             } catch (e: HttpException) {
                 fail(parseHttp(e))
@@ -1373,6 +1321,9 @@ class MainViewModel(app: Application) : BaseViewModel(app) {
                                 phase = if (failed) SubmitPhase.Failed else SubmitPhase.Done,
                                 cmdId = hit.id,
                                 reply = hit.reply.orEmpty(),
+                                // 念哪一段**只在这里判一次**（有 speakText 就念它，老电脑只念开头摘要，
+                                // 电脑发起的任务不念）—— 详情留在 `reply` 给眼睛，不进耳朵。
+                                speak = SpeakPlan.decide(hit).orEmpty(),
                                 error = hit.error.orEmpty(),
                                 message = if (failed) {
                                     hit.error?.takeIf { it.isNotBlank() } ?: "执行失败"

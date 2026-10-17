@@ -24,10 +24,11 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 import urllib.error
 import urllib.request
-from typing import Any, Dict, Optional, Set
+from typing import Any, Dict, Optional, Set, Tuple
 
 from app.capabilities.base import (
     BACKEND_ECHO_SERVER,
@@ -52,6 +53,113 @@ CAPS_TTL_S = 30.0
 #: 请求超时。上传与推理分开：上传看网速，推理看模型（服务端默认上限 900 秒）。
 UPLOAD_TIMEOUT_S = 120.0
 INFER_TIMEOUT_S = 900.0
+
+#: **探测**（`GET /v1/capabilities`）一次最多等多久。
+#:
+#: 为什么不是 15 秒（原来是 15）：`capabilities` 只是一份**静态元数据**，正常响应在
+#: 毫秒级到一秒级；15 秒是从"上传/推理"那一档抄过来的数字，对一次元数据探测没有意义。
+#: 真机现场（2026-10-17 13:18:54 停会 → 13:19:09 报错）就是这条 15 秒：停止录音后的
+#: 转写被这一次探测卡了**整 15 秒**，然后被当成"后端不可用"。
+#: 5 秒对"LAN 上的一台 GPU 机回一份 JSON"是宽裕的（正常 < 0.1 秒），
+#: 又不至于让一次抖动把用户晾在那里。
+CAPS_TIMEOUT_S = 5.0
+
+#: 一次探测最多试几次。**一次超时 ≠ 不可用**（真机上同一台后端 48 秒后手动重转就成功了，
+#: 而它全程 online）—— 所以至少要有**一次**快速重试，把"这一下抖了"和"它就是不回"分开。
+#:
+#: 为什么只重试 1 次（共 2 次）：会议停止后的转写**卡在这一步上**，重试次数越多，
+#: "明确连不上"的那种情况就等得越久（2 次 × 5 秒已经 10 秒）。而真正需要多次重试的
+#: 抖动已经被下一条"沿用上次已知能力"兜住了 —— 没必要把延迟叠在每一次上。
+CAPS_ATTEMPTS = 2
+
+#: 两次探测之间等多久。**很短**：要区分的是"这一下抖了"与"它就是不回"，
+#: 等太久没有意义（抖动是秒级的；彻底不可用时多等只是让用户多等）。
+CAPS_RETRY_DELAY_S = 0.4
+
+#: **上一次成功拿到的能力集**最多沿用多久（秒）。
+#:
+#: 为什么需要"沿用"：`meeting.py` 每轮转写都**新建一个 router**（`build_default_router()`），
+#: 于是实例自带的 `provides` 每轮都是空的 —— 探测失败一次就等于"这台后端什么都不提供"，
+#: 哪怕它刚才还在正常转写。真机那场的 "waiting-backend" 就是这么来的。
+#:
+#: 为什么给一个上限（而不是永远沿用）：一台**真的已经关掉**的后端，不能因为"上周它还在"
+#: 就一直被当成可用 —— 那样这一场会逐段去撞推理超时，而用户永远等不到一句"待转写"。
+#: 30 分钟：一段会议音频通常是 10 分钟，够覆盖一次抖动/一次面板误点；再久就不可信了
+#: （能力集是后端自己宣告的，它换了模型/换了 scopes 我们也不知道）。
+CAPS_STALE_MAX_S = 1800.0
+
+#: 探测失败之后那次**健康探针**（`GET /v1/health`）最多等多久。
+#: 它只有一个用途：区分"能力探测这一下没成，但后端活着"与"它现在真的连不上"。
+#: 免凭据、体量极小，所以比能力探测更短也可以接受。
+HEALTH_TIMEOUT_S = 5.0
+
+#: 探测结果的**状态词**（`describe()` 会原样下发给面板，`/api/capability` 里能看到）。
+#:
+#: 这几个词存在的唯一理由：**"没问到它"与"它明确不提供"不是一件事**。
+#: 混成一个"什么都不提供"，用户就会被引去换后端/改配置，而真因可能只是这一次网络抖了。
+CAPS_STATE_OK = "ok"              # 探测成功，且它声明了至少一个我们认得的槽
+CAPS_STATE_EMPTY = "empty"        # 探测**成功**，但它明确不提供任何（我们认得的）槽
+CAPS_STATE_STALE = "stale"        # 探测失败，沿用上次已知能力（健康探针通 → 这一轮照常用）
+CAPS_STATE_OFFLINE = "offline"    # 探测失败且健康探针也失败 → 这一轮**不派活**给它
+CAPS_STATE_UNKNOWN = "unknown"    # 探测失败且没有可沿用的已知能力（首次就失败）
+
+#: 进程级的"上次已知能力"。键是 `(base_url, 凭据身份)`。
+#:
+#: 为什么放在模块级而不是实例上：`build_default_router()` 每轮都造新实例
+#: （会议转写、面板每次打开都会各造一个），实例级缓存**永远不可能命中**。
+#: 这条缓存只做一件事：**探测失败时的兜底**（成功时不用它，免得让"能力"莫名其妙地旧 30 秒）。
+#: 键里带凭据身份是因为服务端会按 client scopes 决定报哪些槽 ——
+#: 换一个客户端/换一个手填令牌，能力集本来就可能不同，不能混着沿用。
+_CAPS_CACHE: Dict[Tuple[str, str], Dict[str, Any]] = {}
+_CAPS_LOCK = threading.Lock()
+#: 缓存最多留几条（一个进程里通常只有一台后端；给用例与换地址留点余量）。
+_CAPS_CACHE_MAX = 8
+
+
+def reset_caps_cache() -> None:
+    """清掉"上次已知能力"的进程级缓存。
+
+    **用例之间必须互相隔离**（否则上一条用例的成功探测会让下一条用例"探测失败"的场景
+    永远走不到兜底分支）；排障时也可以用它把状态清干净再复现。
+    """
+    with _CAPS_LOCK:
+        _CAPS_CACHE.clear()
+
+
+def _caps_cache_key(base_url: str, creds: Any, token: str) -> Tuple[str, str]:
+    """这份能力集属于"哪台后端的哪个身份"。"""
+    who = "manual-token" if token else str(getattr(creds, "client_id", "") or "")
+    return (str(base_url or "").rstrip("/"), who)
+
+
+def _caps_cache_get(key: Tuple[str, str]) -> Optional[Dict[str, Any]]:
+    with _CAPS_LOCK:
+        entry = _CAPS_CACHE.get(key)
+        return dict(entry) if entry else None
+
+
+def _caps_cache_put(key: Tuple[str, str], snapshot: Dict[str, Any]) -> None:
+    with _CAPS_LOCK:
+        if key not in _CAPS_CACHE and len(_CAPS_CACHE) >= _CAPS_CACHE_MAX:
+            oldest = min(_CAPS_CACHE, key=lambda k: float(_CAPS_CACHE[k].get("at") or 0.0))
+            _CAPS_CACHE.pop(oldest, None)
+        _CAPS_CACHE[key] = dict(snapshot)
+
+
+def _log_probe(level: str, message: str) -> None:
+    """把探测失败（或"沿用旧能力"）写进日志。**只写元数据**：地址、耗时、原因。
+
+    为什么非写不可：真机上那 15 秒只有"面板报错"这一个痕迹，日志里**一个字节都没有**
+    （`_caps_error` 只存在内存里、随后实例就被丢了）—— 于是只能靠"15 秒 + 代码里的
+    timeout=15"去**推断**根因。失败原因必须能从日志里查到，下一次才不用猜。
+
+    失败是常态（后端可能本来就关着），所以这里**永不抛**：日志写不进去不该连累转写。
+    """
+    try:
+        from app import db
+        db.add_log(level, "capability", str(message)[:2000])
+    except Exception:
+        pass
 
 
 def _setting(key, default=None):
@@ -193,6 +301,14 @@ class EchoServerClient(CapabilityClient):
         self.server_name = ""
         self._caps_at = 0.0
         self._caps_error = ""
+        #: 探测状态（见 `CAPS_STATE_*`）。面板与日志据此分清"没问到"与"明确不提供"。
+        self._caps_state = ""
+        #: 这次探测实际试了几次（重试过就是 2）。
+        self._caps_attempts = 0
+        #: 这一轮**敢不敢**派活给它。默认 True：`provides` 被外部显式填过（用例、或将来
+        #: 别的能力来源）时，`supports()` 应当照旧可用 —— 只有"探测说它现在连不上"才翻成
+        #: False（见 `supports()`）。
+        self._caps_usable = True
         #: 最近一次 `/v1/health` 的原文（**只有元数据，没有任何内容**）。
         #: 「能力」卡的状态行（版本 / 显存 / 模型 / 今日额度）与「打开后端管理面」的
         #: 深链都读它 —— 后端自己的信息由后端宣告，客户端不猜。
@@ -200,58 +316,201 @@ class EchoServerClient(CapabilityClient):
 
     # ---------------------------------------------------------------- 探测
 
-    def refresh(self, force: bool = False) -> bool:
-        """拉一次 `GET /v1/capabilities`。返回"拿到了吗"。**不抛异常。**
+    @property
+    def caps_state(self) -> str:
+        """这一份能力集是怎么来的（`ok`/`empty`/`stale`/`offline`/`unknown`）。"""
+        return self._caps_state
 
-        拿不到不算致命：`ready()` 会返回 False，路由会把这一路标成 `offline` 并跳过。
-        把探测失败做成异常，会让"面板想显示一下后端状态"变成一件要 try/except 的事。
+    @property
+    def caps_error(self) -> str:
+        """这次探测**为什么**没成（成功时是空串）。面板与日志都读它。"""
+        return self._caps_error
+
+    def supports(self, slot: str) -> bool:
+        """这一轮**能不能**把这一槽派给它。
+
+        与 `provides` 分开是必须的，因为两者回答的是不同的问题：
+          * `provides` = "它**上次说**自己能干什么"（面板要如实显示，不能因为一次探测
+            失败就改口说"它什么都不提供"）；
+          * 这里 = "这一轮**敢不敢**把活交给它"。
+
+        探测失败、健康探针也说连不上时（`offline`），这里必须是 False —— 否则一场 9 段的
+        会议会把音频一段段发出去，每段都等满推理超时（900 秒），比"待转写"糟得多。
+        而"探测失败但后端活着"（`stale`）时必须照旧 True：那正是本次要修的那种误报。
         """
-        if not self.base_url:
-            self._caps_error = "没配地址"
-            return False
-        if not force and (time.time() - self._caps_at) < CAPS_TTL_S and self.provides:
-            return True
-        try:
-            status, body = self._request("GET", "/v1/capabilities", timeout=15)
-        except CapabilityError as e:
-            self._caps_error = str(e)
-            self.provides = frozenset()
-            return False
-        if status != 200 or not isinstance(body, dict):
-            self._caps_error = "capabilities 回了 %s" % status
-            self.provides = frozenset()
-            return False
+        return bool(self._caps_usable) and slot in self.provides
 
-        self.server_name = str((body.get("server") or {}).get("id") or "")
-        self.limits = dict(body.get("limits") or {})
-        self.models = tuple(body.get("models") or [])
+    def _caps_key(self) -> Tuple[str, str]:
+        return _caps_cache_key(self.base_url, self._creds, self._token)
+
+    def _apply_caps(self, snapshot: Dict[str, Any]) -> None:
+        """把一份能力快照写回这个实例（成功探测与"沿用上次已知"走同一条路）。"""
+        self.provides = frozenset(snapshot.get("provides") or ())
+        self.vector_space_id = str(snapshot.get("vector_space_id") or "")
+        self.models = tuple(snapshot.get("models") or ())
+        self.limits = dict(snapshot.get("limits") or {})
+        self.server_name = str(snapshot.get("server_name") or "")
+        self._caps_at = float(snapshot.get("at") or 0.0)
+
+    def _snapshot(self) -> Dict[str, Any]:
+        """当前能力集的快照（写进进程级缓存；`at` 是**成功**那一刻）。"""
+        return {"provides": self.provides, "vector_space_id": self.vector_space_id,
+                "models": self.models, "limits": dict(self.limits),
+                "server_name": self.server_name, "at": time.time()}
+
+    def _parse_caps(self, body: Dict[str, Any]) -> Dict[str, Any]:
+        """`/v1/capabilities` 的响应 → 能力快照（**只翻译，不带时间戳**）。"""
+        snap: Dict[str, Any] = {}
+        snap["server_name"] = str((body.get("server") or {}).get("id") or "")
+        snap["limits"] = dict(body.get("limits") or {})
+        snap["models"] = tuple(body.get("models") or [])
 
         # ① 槽取交集：服务端的 `asr.long` 之类**不是**客户端的词汇
         raw_slots: Set[str] = set((body.get("slots") or {}).keys())
-        self.provides = frozenset(raw_slots & set(SLOTS))
+        snap["provides"] = frozenset(raw_slots & set(SLOTS))
 
         # 向量空间：把**所有**产出向量的模型都收进来。
         # 服务端保证它们只有一个值（它有护栏测试钉着）；万一不是，
         # 我们取那个"唯一值"，多于一个就**拒绝提供向量类槽** ——
         # 因为"不确定属于哪个空间"的向量拿去做余弦相似度会**认错人且不报错**。
-        spaces = {str(m.get("vectorSpaceId") or "") for m in self.models
+        spaces = {str(m.get("vectorSpaceId") or "") for m in snap["models"]
                   if m.get("vectorSpaceId")}
         if len(spaces) == 1:
-            self.vector_space_id = spaces.pop()
+            snap["vector_space_id"] = spaces.pop()
         elif len(spaces) > 1:
-            self.vector_space_id = ""
-            self.provides = frozenset(s for s in self.provides
-                                      if not s.startswith(("diarize.", "speaker.")))
+            snap["vector_space_id"] = ""
+            snap["provides"] = frozenset(s for s in snap["provides"]
+                                         if not s.startswith(("diarize.", "speaker.")))
+        else:
+            snap["vector_space_id"] = ""
+        return snap
 
-        self._caps_at = time.time()
-        self._caps_error = ""
-        return True
+    def _health_ok(self) -> bool:
+        """后端**现在**还活着吗（`/v1/health`，免凭据的轻探针）。
+
+        只在能力探测失败之后用来做一次区分：它通了 → 能力探测那一下是抖动；
+        它也不通 → 这一轮真的没有可用的后端（要如实报，但不能拿旧能力去盲派活）。
+        """
+        try:
+            return bool(self.ready())
+        except Exception:                                   # pragma: no cover - ready 不抛
+            return False
+
+    def refresh(self, force: bool = False) -> bool:
+        """拉一次 `GET /v1/capabilities`。返回"拿到了吗"。**不抛异常。**
+
+        拿不到不算致命：`ready()` 会返回 False，路由会按"这一轮用不上它"跳过。
+        把探测失败做成异常，会让"面板想显示一下后端状态"变成一件要 try/except 的事。
+
+        ## 这里的判据（2026-10-17 真机事故后改写，四条都要）
+
+        1. **一次超时 ≠ 不可用**：一次元数据探测失败**不足以**宣告这台后端不可用
+           （真机上同一台后端 48 秒后手动重转就成功了，而它全程 online）。
+           所以先快速重试（`CAPS_ATTEMPTS`），再谈"用不用得上"。
+        2. **不把 `provides` 清空**：失败时沿用**上一次成功**拿到的能力集
+           （进程级缓存，见 `_CAPS_CACHE`）。原来那句 `self.provides = frozenset()`
+           是这条事故的直接成因：一次探测失败 → "它什么都不提供" → 会议被记成
+           `waiting-backend`。
+        3. **沿用要有前提**：上次成功不能太旧（`CAPS_STALE_MAX_S`），而且要先过健康探针。
+           不设前提的话，"永远沿用"等于**永远不报** —— 一台真关掉的后端会被一直当成可用，
+           会议逐段撞推理超时，用户永远等不到"待转写"这句实话。
+        4. **区分"没问到"与"它明确不提供"**：`_caps_state` 里
+           `unknown`/`offline`/`stale` 是"没问到"（分别是 没得沿用 / 连不上 / 沿用了旧值），
+           `empty` 是"问到了、它就是没有"，`ok` 是问到了且有。面板与日志都能看到。
+        """
+        if not self.base_url:
+            self._caps_state = CAPS_STATE_UNKNOWN
+            self._caps_error = "没配地址"
+            self._caps_usable = False
+            return False
+        if not force and (time.time() - self._caps_at) < CAPS_TTL_S and self.provides:
+            return True
+
+        started = time.time()
+        errors = []
+        attempts = 0
+        for attempt in range(1, CAPS_ATTEMPTS + 1):
+            attempts = attempt
+            try:
+                status, body = self._request("GET", "/v1/capabilities",
+                                             timeout=CAPS_TIMEOUT_S)
+            except CapabilityError as e:
+                # **每一次失败都落日志**，哪怕下一次就成功了：真机上那 15 秒
+                # 在日志里一个字节都没留下，根因只能靠推断（"15 秒 + 代码 timeout=15"）。
+                # 这一次的失败原因必须查得到。
+                errors.append(str(e))
+                _log_probe("warn", "能力探测第 %d/%d 次失败 base=%s：%s"
+                           % (attempt, CAPS_ATTEMPTS, self.base_url, e))
+            except Exception as e:                          # pragma: no cover - 兜底
+                errors.append("%s: %s" % (type(e).__name__, e))
+                _log_probe("warn", "能力探测第 %d/%d 次失败 base=%s：%s: %s"
+                           % (attempt, CAPS_ATTEMPTS, self.base_url,
+                              type(e).__name__, e))
+            else:
+                if status == 200 and isinstance(body, dict):
+                    snap = self._parse_caps(body)
+                    snap["at"] = time.time()
+                    self._apply_caps(snap)
+                    # 记进进程级缓存：下一轮（新实例）探测失败时这就是"上次已知能力"。
+                    _caps_cache_put(self._caps_key(), self._snapshot())
+                    self._caps_attempts = attempts
+                    self._caps_usable = True
+                    self._caps_error = ""
+                    self._caps_state = (CAPS_STATE_OK if self.provides
+                                        else CAPS_STATE_EMPTY)
+                    return True
+                errors.append("capabilities 回了 %s" % status)
+                _log_probe("warn", "能力探测第 %d/%d 次失败 base=%s：capabilities 回了 %s"
+                           % (attempt, CAPS_ATTEMPTS, self.base_url, status))
+            if attempt < CAPS_ATTEMPTS:
+                time.sleep(CAPS_RETRY_DELAY_S)
+
+        # ---------------- 到这里就是"没问到"：重试过了，仍然失败 ----------------
+        # **不在这里清空 provides**（原因见 docstring 第 2 条）。
+        spent = time.time() - started
+        why = errors[-1] if errors else "未知原因"
+        self._caps_attempts = attempts
+        self._caps_error = "能力探测失败（%d 次，%.1f 秒）：%s" % (attempts, spent, why)
+
+        cached = _caps_cache_get(self._caps_key())
+        age = (time.time() - float(cached.get("at") or 0.0)) if cached else -1.0
+        if cached and 0.0 <= age <= CAPS_STALE_MAX_S:
+            # 有可沿用的上次已知能力：先写回去（**provides 不清空**），再看它还活不活着。
+            self._apply_caps(cached)
+            if self._health_ok():
+                # 后端活着，只是能力探测这一下没成 → 这一轮照常派活。
+                self._caps_state = CAPS_STATE_STALE
+                self._caps_usable = True
+                self._caps_error += ("；沿用 %.0f 秒前的已知能力（健康探针仍通，"
+                                     "这一轮照常派活）" % age)
+                _log_probe("warn", "能力探测失败，沿用上次已知能力 base=%s：%s"
+                           % (self.base_url, self._caps_error))
+                return False
+            # 连不上 → 不派活（否则每段音频都要等满推理超时）。
+            self._caps_state = CAPS_STATE_OFFLINE
+            self._caps_usable = False
+            self._caps_error += "；健康探针也连不上（这一轮不把活派给它）"
+        else:
+            # 首次就失败，或上次成功已经太旧（旧到不可信）→ 状态是**未知**，
+            # 不是"它不提供"。`provides` 保留上一次的值只为**如实描述**，
+            # 但 `supports()` 会因 `_caps_usable=False` 而拒绝派活。
+            self._caps_state = CAPS_STATE_UNKNOWN
+            self._caps_usable = False
+            if cached:
+                self._apply_caps(cached)
+                self._caps_error += ("；上次成功是 %.0f 分钟前，已超过 %.0f 分钟的沿用上限"
+                                     % (age / 60.0, CAPS_STALE_MAX_S / 60.0))
+            else:
+                self._caps_error += "；没有可沿用的已知能力（首次探测就失败）"
+        _log_probe("warn", "能力探测失败 base=%s：%s"
+                   % (self.base_url, self._caps_error))
+        return False
 
     def ready(self) -> Optional[bool]:
         if not self.base_url:
             return False
         try:
-            status, body = self._request("GET", "/v1/health", timeout=5)
+            status, body = self._request("GET", "/v1/health", timeout=HEALTH_TIMEOUT_S)
         except CapabilityError:
             # **连不上就把上次那份状态清掉**：拿旧数字当现状是"最绿的一种假"。
             self._health = {}
@@ -270,6 +529,17 @@ class EchoServerClient(CapabilityClient):
         out = super().describe()
         out.update({"baseUrl": self.base_url, "serverName": self.server_name,
                     "limits": self.limits, "capsError": self._caps_error,
+                    # 能力探测**是怎么来的**：`ok`/`empty` 是"问到了"，
+                    # `stale`/`offline`/`unknown` 是"没问到"（分别对应 沿用旧值 /
+                    # 连不上 / 没得沿用）。面板与 `/api/capability` 读这两个字段
+                    # 才分得清"它明确不提供"与"这一次没问到它"（2026-10-17 事故）。
+                    "capsState": self._caps_state or CAPS_STATE_UNKNOWN,
+                    "capsAttempts": int(self._caps_attempts or 0),
+                    "capsUsable": bool(self._caps_usable),
+                    # 上次成功探测是多久以前（秒；0 表示从没成功过）——
+                    # "沿用了旧能力"这句话得说得出来有多旧。
+                    "capsAgeSeconds": (int(max(0.0, time.time() - self._caps_at))
+                                       if self._caps_at else 0),
                     "paired": self._creds is not None,
                     "auth": "manual" if self._token else
                             ("paired" if self._creds is not None else "none"),

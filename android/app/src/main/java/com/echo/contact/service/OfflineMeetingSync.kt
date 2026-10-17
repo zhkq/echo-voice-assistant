@@ -407,7 +407,10 @@ object OfflineMeetingSync {
     internal fun inferredEndNote(drafts: List<MeetingDraft>): String {
         val n = drafts.count { it.endedAtInferred }
         return if (n == 0) "" else
-            "有 $n 场是被进程打断的（结束时间按最后一段推的，不是当时按的结束）"
+            "有 $n 场是被进程打断的（结束时间按最后一段推的，不是当时按的结束；" +
+                // ⚠️ 进程被杀时跑不到"补尾段"那一步：缓冲里不足一段的样本是真的丢了。
+                // 这句话必须带上 —— 只说"结束时间是推的"会让人以为音频是完整的。
+                "进程被杀时补不了尾，最后不足一段的缓冲可能没封存）"
     }
 
     /** 单份清单那一档结果（省得每处都手拼五个字段 —— 手拼必漂）。 */

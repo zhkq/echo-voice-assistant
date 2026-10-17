@@ -33,10 +33,12 @@ import androidx.compose.ui.unit.dp
 import com.echo.contact.ui.theme.EchoPalette
 
 /**
- * 会议页：状态 + 开始/停止录音 + 列表。
+ * 会议页：状态 + 开始/结束录音 + 列表。
  *
- * **录音在 ECHO 那台机器上做**（用它那支麦）—— 手机只是遥控器。
- * 这一点界面必须说清楚，否则用户会以为"手机上录"。
+ * **手机发起 = 手机录**（用户 2026-10-17 真机 bug 之后的口径）：这里的「开始录音」录的是
+ * **这台手机的麦克风**，ECHO 只负责落盘/转写/存储。所以这一页**没有**"遥控电脑开麦"那颗按钮
+ * —— 旧版有两个按钮（「开始录音」= 电脑麦、「用手机麦克风」= 手机麦），语义重复而且第一个
+ * 正是那次 bug 的来源。现在合并成一个：「开始录音」。
  *
  * **故意没有"删除会议"**：`app/api.py` 的 `_NETWORK_DENIED` 把
  * `DELETE /api/meetings/{id}` 对网上来的调用**一律 403**（"不允许从手机/手表删除会议"）。
@@ -47,7 +49,6 @@ fun MeetingsTab(vm: MainViewModel) {
     val meeting = vm.status.collectAsState().value?.meeting
     val meetings by vm.meetings.collectAsState()
     val note by vm.meetingsNote.collectAsState()
-    val busy by vm.meetingActionBusy.collectAsState()
     val transcribe by vm.transcribe.collectAsState()
     val detail by vm.meetingDetail.collectAsState()
     val detailLoading by vm.meetingDetailLoading.collectAsState()
@@ -58,6 +59,30 @@ fun MeetingsTab(vm: MainViewModel) {
     val audioPlaying by vm.audioPlaying.collectAsState()
     val showingRecording by vm.showRecordingScreen.collectAsState()
     val localCtx = androidx.compose.ui.platform.LocalContext.current
+
+    // 这台手机这一侧的录音状态（`MeetingMicService` 的**本地**状态）。
+    //
+    // ⚠️ 判"在不在录"**只**看它，不看服务端的 `meeting.active`：手机麦这条路离线也在录，
+    // 而离线时服务端只会说 active=false —— 拿它判就会把"正在录"显示成"没在录"，
+    // 或者反过来把"电脑在录"当成"手机在录"（那正是 2026-10-17 那次真机 bug 的界面部分）。
+    val micState by com.echo.contact.service.MeetingMicService.state.collectAsState()
+    val phoneRecording = micState.active
+
+    // 「开始录音」现在**就是**手机本地录音，所以要 RECORD_AUDIO：没授权先要（与「说话」页
+    // 同一套做法），授权成功再开始。否则第一次按下去只会看到"没有麦克风权限"，
+    // 而用户以为自己已经点了开始。
+    val micPermissionLauncher = androidx.activity.compose.rememberLauncherForActivityResult(
+        androidx.activity.result.contract.ActivityResultContracts.RequestPermission()
+    ) { granted -> if (granted) vm.startMeeting() }
+    val startPhoneMeeting: () -> Unit = {
+        if (localCtx.checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) ==
+            android.content.pm.PackageManager.PERMISSION_GRANTED
+        ) {
+            vm.startMeeting()
+        } else {
+            micPermissionLauncher.launch(android.Manifest.permission.RECORD_AUDIO)
+        }
+    }
 
     // 全屏录音界面（用户 2026-10-15 要的：电平 + 结束 + 静音/恢复）。
     // 放在最前面：录音时它盖住整个页签；「返回」只关界面、**不停录音**。
@@ -85,6 +110,8 @@ fun MeetingsTab(vm: MainViewModel) {
         return
     }
 
+    // 服务端那一场（"电脑在录"或"刚结束/正在转写"）。它**只**用来显示信息，
+    // 不再决定按钮 —— 录音的判据在手机这一侧（见上面的 `phoneRecording`）。
     val active = meeting?.active == true
 
     LazyColumn(
@@ -98,17 +125,46 @@ fun MeetingsTab(vm: MainViewModel) {
                     CardHeader(
                         title = "会议录音",
                         dotColor = when {
-                            !meeting?.error.isNullOrBlank() -> EchoPalette.Red
-                            active -> EchoPalette.Purple
+                            micState.error.isNotBlank() || !meeting?.error.isNullOrBlank() ->
+                                EchoPalette.Red
+                            phoneRecording || active -> EchoPalette.Purple
                             else -> EchoPalette.Muted
                         },
-                        trailing = if (active) "录音中" else "未在录音",
-                        trailingColor = if (active) EchoPalette.Purple else EchoPalette.Muted,
+                        // 状态**如实**：手机在录时就说"这台手机在录音"（在线时也一样）——
+                        // 不许再出现 2026-10-17 那种"手机上点了开始、界面却像电脑在录"的含糊。
+                        trailing = when {
+                            phoneRecording -> "这台手机在录音"
+                            active -> "电脑在录音"
+                            else -> "未在录音"
+                        },
+                        trailingColor = if (phoneRecording || active) EchoPalette.Purple
+                        else EchoPalette.Muted,
                     )
 
-                    if (active) {
+                    if (phoneRecording) {
+                        Spacer(Modifier.height(4.dp))
+                        MutedLine(
+                            "正在用**这台手机**的麦克风录音（声音先存手机里，网通就顺手传给 ECHO）",
+                            maxLines = 2,
+                        )
+                        micState.startedAt.takeIf { it.isNotBlank() }?.let {
+                            Spacer(Modifier.height(2.dp))
+                            MutedLine("开始于 $it", maxLines = 1)
+                        }
+                        // 服务端已经收下这场会之后才有 folder（离线/还没建会时是空的）
                         meeting?.folder?.takeIf { it.isNotBlank() }?.let {
-                            Spacer(Modifier.height(4.dp))
+                            Spacer(Modifier.height(2.dp))
+                            MutedLine("ECHO 上这一场：$it", maxLines = 1)
+                        }
+                    } else if (active) {
+                        // 电脑上开始的那一场：手机能看到、但**不遥控**它（不给开/停按钮）
+                        Spacer(Modifier.height(4.dp))
+                        MutedLine(
+                            "ECHO 那台电脑正在录音（**不是**这台手机）：那场在电脑上开始、也在电脑上结束",
+                            maxLines = 2,
+                        )
+                        meeting?.folder?.takeIf { it.isNotBlank() }?.let {
+                            Spacer(Modifier.height(2.dp))
                             MutedLine("正在录：$it", maxLines = 1)
                         }
                         (meeting?.startedAt)?.takeIf { it.isNotBlank() }?.let {
@@ -116,40 +172,39 @@ fun MeetingsTab(vm: MainViewModel) {
                             MutedLine("开始于 $it", maxLines = 1)
                         }
                     }
-                    meeting?.error?.takeIf { it.isNotBlank() }?.let {
+                    micState.error.takeIf { it.isNotBlank() }?.let {
+                        Spacer(Modifier.height(4.dp))
+                        MutedLine(it, color = EchoPalette.Red)
+                    }
+                    meeting?.error?.takeIf { it.isNotBlank() && !phoneRecording }?.let {
                         Spacer(Modifier.height(4.dp))
                         MutedLine("上次错误：$it", color = EchoPalette.Red)
                     }
 
                     Spacer(Modifier.height(10.dp))
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        if (active) {
+                        if (phoneRecording) {
+                            // 结束 = **统一路**：本地补齐 → 对账 → `stop(clientId)`（既有实现，
+                            // 见 `MeetingMicService.stopEverything`）。这条路上电脑只收数据，
+                            // 所以这里不调任何"让电脑停"的接口。
                             Button(
-                                onClick = { vm.stopMeeting() },
-                                enabled = !busy,
+                                onClick = { com.echo.contact.service.MeetingMicService.stop(localCtx) },
                                 colors = ButtonDefaults.buttonColors(containerColor = EchoPalette.Red),
-                            ) { Text("停止录音") }
-                        } else {
-                            Button(onClick = { vm.startMeeting() }, enabled = !busy) { Text("开始录音") }
-                            // 用户 2026-10-15 的口径：手机发起的事该由手机采集。这条 =
-                            // 手机当麦克风（电脑不开麦，只落盘/转写/存储）。
-                            OutlinedButton(
-                                onClick = { com.echo.contact.service.MeetingMicService.start(localCtx); vm.openRecordingScreen() },
-                                enabled = !busy,
-                            ) { Text("用手机麦克风") }
-                        }
-                        if (active) {
+                            ) { Text("结束录音") }
                             // 录音中：能随时回到那个全屏界面（电平 + 静音/结束）
                             TextButton(onClick = { vm.openRecordingScreen() }) { Text("全屏界面") }
+                        } else {
+                            // **唯一**的录音入口。它录的是这台手机（`MeetingMicService`），
+                            // 建会/上传/收尾都由那条统一路自己带上 source=phone 完成。
+                            Button(onClick = startPhoneMeeting) { Text("开始录音") }
                         }
-                        TextButton(onClick = { vm.loadMeetings() }, enabled = !busy) { Text("刷新") }
+                        TextButton(onClick = { vm.loadMeetings() }) { Text("刷新") }
                     }
                     Spacer(Modifier.height(4.dp))
                     MutedLine(
-                        "「开始录音」录的是电脑那支麦克风（手机只是遥控）；" +
-                            "想让手机当麦克风就点「用手机麦克风」——" +
-                            "那条路**每一段都先存在手机里**，网通就顺手传给电脑，" +
-                            "不通也不会失败，联网后自动补传。",
+                        "「开始录音」录的是**这台手机**的麦克风，ECHO 只负责落盘/转写/存储" +
+                            "（不再遥控电脑开麦）；每一段都先存在手机里 —— 网通就顺手传上去，" +
+                            "连不上也照样录，联网后自动补传。",
                         maxLines = 3,
                     )
                     note?.let {
@@ -161,8 +216,6 @@ fun MeetingsTab(vm: MainViewModel) {
                     // 这段是**每一次手机录音**都要显示的东西（不再只是"离线那一场"）：
                     // 录完之后全屏界面就收起来了，而"还有几段没传上去"必须还能看到 ——
                     // 所以它必须在这里、而且必须**如实**（绝不说"已上传"）。
-                    val micState = com.echo.contact.service.MeetingMicService.state
-                        .collectAsState().value
                     if (micState.syncNote.isNotBlank() &&
                         micState.syncPhase != com.echo.contact.service.OfflinePhase.IDLE
                     ) {
@@ -184,6 +237,13 @@ fun MeetingsTab(vm: MainViewModel) {
                                 com.echo.contact.service.MeetingMicService.syncNow(localCtx)
                             }) { Text("现在同步手机录音") }
                         }
+                    }
+                    // 结束那一刻的如实说明（例如"这次没有录到音频"）。它**不看**补传状态：
+                    // 这句话是"这一场发生了什么"，不属于"还有几段没传"那一档，
+                    // 而且不能被下一轮 tick 抹掉（抹掉就是静默）。见 `MicState.stopNote`。
+                    micState.stopNote.takeIf { it.isNotBlank() }?.let {
+                        Spacer(Modifier.height(6.dp))
+                        MutedLine(it, color = EchoPalette.Yellow, maxLines = 3)
                     }
                 }
             }

@@ -12,8 +12,9 @@ import okhttp3.RequestBody.Companion.toRequestBody
  * 为什么值得单独抽：常驻听写没有界面，用户在**车里**只听到"它有没有回话"。
  * 这一段的每个分支都对应一句必须说对的话：
  *   * 后端 422（没识别出文字）≠ 502（转写失败）≠ 连不上 —— 三种原因、三种处理；
- *   * 智能体的回答是**异步**落到 `commands` 表的，要轮询；`brief`（给嘴念的短句）
- *     优先于 `reply`（给眼睛看的整篇）；
+ *   * 智能体的回答是**异步**落到 `commands` 表的，要轮询；**念哪一段由 `SpeakPlan` 一处判**
+ *     （电脑给的 `speakText` 优先，老电脑只念开头摘要，电脑发起的任务一个字都不念）——
+ *     这里**不再**自己从 `brief`/`reply` 里挑，见那边"单一出处"的说明；
  *   * 超时要说清"可能还在跑"，不能让人以为它坏了。
  *
  * `sleep` 可注入是为了测试能瞬间跑完超时分支（真机上就是 `delay`）。
@@ -31,6 +32,15 @@ class ListenFlow(
 
         /** 拿到了要念出来的那句话。 */
         data class Reply(val text: String) : Outcome
+
+        /**
+         * 有结论，但按规则**一个字都不念**（电脑发起的任务 / 没有可念的摘要）。
+         *
+         * 这不是失败：那条指令照常是 `done`，只是没有声音。所以它必须与 [Failed] 分开 ——
+         * 混进 [Failed] 会让用户以为"ECHO 出错了"，而其实只是"这条不该在手机上念"。
+         * 原因写在 [why] 里，由调用方原样说出去（常驻听写没有界面）。
+         */
+        data class Silent(val why: String) : Outcome
 
         /** 没成：一句可以直接显示/念的人话。 */
         data class Failed(val message: String) : Outcome
@@ -70,10 +80,14 @@ class ListenFlow(
             if (item != null) {
                 when (item.status) {
                     "done" -> {
-                        val text = item.brief?.takeIf { it.isNotBlank() }
-                            ?: item.reply.orEmpty().takeIf { it.isNotBlank() }
-                            ?: return Outcome.Failed("ECHO 回了个空结果")
-                        return Outcome.Reply(text)
+                        // **念什么由 `SpeakPlan` 一处决定**（用户 2026-10-17 真机：手机把详情也念了）：
+                        //  * 电脑给了 `speakText` → 原样念它（唯一出处，这里不再自己切正文）；
+                        //  * 老电脑没给 → 只念开头那段摘要；
+                        //  * `origin=pc` → 一个字都不念（谁发起谁念）。
+                        // `reply` 那整篇仍然留在结果里给**眼睛**看，只是不再往耳朵里灌。
+                        val speak = SpeakPlan.decide(item)
+                            ?: return Outcome.Silent(SpeakPlan.silentReason(item))
+                        return Outcome.Reply(speak)
                     }
                     "failed" -> return Outcome.Failed(
                         (item.error?.takeIf { it.isNotBlank() }?.let { "ECHO 那边失败了：$it" })

@@ -271,6 +271,34 @@ def brief_text(reply, max_chars=200):
     return text.strip()
 
 
+def speak_text_for_reply(reply, max_chars=None):
+    """**电脑本机朗读要念的那段话** —— 全仓库唯一出处（`speakText` 就取它）。
+
+    为什么必须收成一处（用户 2026-10-17 真机）：*"手机端朗读了全部内容，包括详情，
+    应该跟电脑测试一样，只朗读前面的摘要"*。以前"念什么"有两套口径 —— 电脑走
+    `brief_text()`（`conclusion_only()` 在"详情如下："处切开，规则见 `_DETAIL_SPLIT_RE`），
+    而手机拿到的是整篇 `reply`，自己再切一次；两端各切一套必然漂，这次就是漂在了
+    "详情"上。现在电脑喇叭与回传给手机的 `speakText` **同调这一个函数**，不可能再分叉。
+
+    **规则不是我新发明的**：电脑上"电脑测试"一直在念的就是 `brief_text()`
+    （`app/assistant.py:248`，配套 `conclusion_only()` 在 `:234`）—— 这里只是把
+    "按 `maxBriefChars` 取上限"这一步一起收进来，行为与原来逐字一致。
+
+    为什么**不**改成 `daily_review.extract_broadcast`（【播报】块）：那是**每日回顾技能**
+    的输出契约（技能显式写【播报】…【/播报】）。普通指令的回复里没有那个块，
+    套上去只会退化成"取第一段（空行前）"，没有空行时甚至会**把详情一起返回** ——
+    那正好是用户这次抱怨的症状。
+
+    `max_chars=None` 表示按设置 `maxBriefChars`（用户可调）；显式传值只给测试/调用方钉样例。
+    """
+    if max_chars is None:
+        try:
+            max_chars = int(settings.get("maxBriefChars", 200) or 200)
+        except (TypeError, ValueError):
+            max_chars = 200
+    return brief_text(reply, max_chars=max_chars)
+
+
 # ---------------------------------------------------------------- 通知
 
 def notify(title, text):
@@ -978,16 +1006,29 @@ def _dispatch(text, source, workspace=None, session_id=None):
     reply, _done = client.wait_for_reply(sid, timeout=REPLY_TIMEOUT_S, poll=0.5)
     duration = int((time.time() - t0) * 1000)
     if reply:
-        brief = brief_text(reply, max_chars=int(cfg.get("maxBriefChars", 200)))
-        db.update_command(cmd_id, status="done", reply=reply, brief=brief,
+        # 要念的那段话：**单一出处** `speak_text_for_reply()`（规则 = 电脑一直用的
+        # `brief_text`/`conclusion_only`）。电脑喇叭念它，回传给手机的 `speakText`
+        # 也是它 —— 两端念的是**同一个字符串**，不会再出现"电脑念摘要、手机念全文"。
+        spoken = speak_text_for_reply(reply)
+        db.update_command(cmd_id, status="done", reply=reply, brief=spoken,
                           duration_ms=duration)
-        db.add_log("info", "assistant", f"完成({duration}ms)，简报: {brief[:80]}")
+        db.add_log("info", "assistant", f"完成({duration}ms)，简报: {spoken[:80]}")
         # `origin` 与 `command_received` 里的 `source` **同源**（都是本函数这个 `source`，
         # 也就是写进 `commands.source` 的那个值）—— 不另查一遍库，是为了让它俩
         # **不可能**对不上：手机能照 `command_received.source` 判断该不该提醒。
-        db.add_event("command_done", {"id": cmd_id, "origin": _command_origin(source)})
-        if cfg.get("voiceBrief", True) and brief:
-            providers_mod.speak_async(brief)
+        origin = _command_origin(source)
+        # `speakText` 是**新增键**（既有键一个都没动）：手机拿到后直接念，
+        # 不必再自己对 `reply` 切一刀 —— 那一刀正是这次"念了详情"的来源。
+        db.add_event("command_done", {"id": cmd_id, "origin": origin,
+                                      "speakText": spoken})
+        # **谁发起，谁念**（用户 2026-10-17 原话：*"电脑端同步朗读了指令答复，
+        # 应该改为手机的任务，电脑只执行不朗读"*）：
+        #   * `origin == "mobile"` → 电脑**只执行、存储、回传**（回传带 `speakText`），
+        #     不在电脑的喇叭上念出来 —— 手机发起的任务，声音该出在手机上；
+        #   * 其余（`pc`，以及拿不到来源时 `_command_origin()` 保守判成的 `pc`）→
+        #     照旧朗读，**行为不变**（既有规则：`voiceBrief` 关掉才不念）。
+        if origin != "mobile" and cfg.get("voiceBrief", True) and spoken:
+            providers_mod.speak_async(spoken)
         return True
     db.update_command(cmd_id, status="done", reply="", brief="", duration_ms=duration)
     db.add_log("warn", "assistant", f"{REPLY_TIMEOUT_S} 秒内未收到助手回复")

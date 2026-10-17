@@ -231,12 +231,21 @@ class EchoApiWireTest {
         server.enqueue(json("""{"ok":true,"message":"2026-10-09_22-00-00"}"""))
         server.enqueue(json("""{"ok":true,"message":"2026-10-09_22-00-00"}"""))
 
-        runBlocking { api().meetingStart() }
+        // 建会只剩**一条路**（`source=phone` + 幂等键 + 开始时间）。无参数的 `meetingStart()`
+        // 已经删掉 —— 2026-10-17 真机 bug 正是它引起的（服务端于是开电脑的麦）。
+        runBlocking {
+            api().meetingStartPhoneWithId(
+                clientId = "c-1", startedAt = "2026-10-17T13:40:00")
+        }
         runBlocking { api().meetingStop() }
 
         val a = server.takeRequest()
-        assertEquals("/api/meeting/start", a.path)
+        assertEquals("/api/meeting/start", a.path!!.substringBefore('?'))
         assertEquals("POST", a.method)
+        assertEquals("采集源写在 query 上（缺省就是手机）", "phone",
+            a.requestUrl!!.queryParameter("source"))
+        assertEquals("c-1", a.requestUrl!!.queryParameter("clientId"))
+        assertEquals("2026-10-17T13:40:00", a.requestUrl!!.queryParameter("startedAt"))
         assertEquals("", a.body.readUtf8())        // 后端签名里没有 body，我们也不发
         val b = server.takeRequest()
         assertEquals("/api/meeting/stop", b.path)

@@ -67,6 +67,26 @@ data class CommandItem(
     val error: String? = null,
     val backend: String? = null,
     val intent: String? = null,
+
+    /**
+     * 电脑侧产出的「**要念的那段话**」（只含摘要，与电脑本机念的是同一段文字）。
+     * 老电脑没有这个字段 → null（手机侧退回"取摘要"，见 `SpeakPlan`）。
+     *
+     * 为什么类型是 `Any?` 而不是 `String?`：这是**新字段**，电脑侧要是哪天写成
+     * 数字 / 对象 / null，Gson 对 `String` 字段会直接抛（`Expected a string but was
+     * BEGIN_OBJECT`）—— 等于**一个脏字段把整页指令历史弄崩**。用 `Any?` 接住，
+     * 判据那一侧（`SpeakPlan.decide`）只认字符串，其余一律当"没给"。
+     * `alternate` 是宽容：电脑侧要是写成 snake_case（`speak_text`），这里也认。
+     */
+    @SerializedName(value = "speakText", alternate = ["speak_text"]) val speakText: Any? = null,
+
+    /**
+     * 这条指令**是谁发起的**（`mobile` / `pc`）。老电脑没带 → null。
+     *
+     * 为什么手机要它：**谁发起谁念** —— 电脑上敲的指令不该在手机喇叭上念出来。
+     * 判据在 `SpeakPlan`（拿不到就不拦）。
+     */
+    val origin: String? = null,
 )
 
 /** `GET /api/commands?limit=&offset=&q=&since=` 的响应；`total` 是**过滤后**的总数。 */

@@ -1175,6 +1175,21 @@ def _command_row(row):
         meta = {}
     out["backend"] = str(meta.get("backend") or "")
     out["intent"] = str(meta.get("intent") or "")
+    # `speakText`：**手机要念的那段话**（2026-10-17 用户真机要求：*"手机端朗读了全部内容，
+    # 包括详情，应该跟电脑测试一样，只朗读前面的摘要"*）。
+    # 取值**只有一处**：`assistant.speak_text_for_reply()` —— 与电脑本机朗读同一个函数、
+    # 同一个结果（两端各切一套必然漂，这次就是漂在"详情"上）。
+    # 历史行里已经有 `brief`（当时电脑念的就是它，`_dispatch` 写的），优先用它：
+    # 记录就该说"**当时**念的那段"；老记录没有 brief 时按 reply 现算，规则仍是同一份。
+    # 这是**新增键**，既有键一个没改名、没删除。
+    _brief = str(out.get("brief") or "").strip()
+    out["speakText"] = _brief or assistant.speak_text_for_reply(
+        str(out.get("reply") or ""))
+    # `origin`：这条指令是**谁发起的**（`mobile` / `pc`）—— 与 `command_done.origin`
+    # **同一个判据**（`assistant._command_origin(source)`，不另写一套）。手机端靠它实现
+    # "谁发起谁念"：电脑发起的任务不该在手机喇叭上念，手机发起的才念上面那个 `speakText`。
+    # 同样是**新增键**（`source` 原样还在；老客户端不认这个键也不受影响）。
+    out["origin"] = assistant._command_origin(out.get("source"))
     # `meta` 原文仍原样带着（别处可能要看；删字段是另一种"改契约"）
     return out
 
@@ -1475,11 +1490,65 @@ async def meeting_segment(request: Request, clientId: str = "", seq: int = 0,
             "segmentCount": count, "seqCount": count}
 
 
+def _meeting_capture_source(origin, source="", client_id=""):
+    """这一场**谁在采集**（`"phone"` / `"pc"`）—— 建会前必须定下来的那个事实。
+
+    为什么要把三条线索收在**一处**（2026-10-17 真机 bug，用户原话：*"我用手机发起了一次
+    会议录音，**电脑端也变成录音状态了** … 转写内容应该是**电脑录的**"*）：
+
+    `source` 是"**谁在采集**"这个**事实**，它不能被"走哪条建会分支"顺手吞掉。原来这里是
+
+        src = (source or "pc").strip().lower()      # 缺省 pc
+        … if cid: 补传那条路（source=phone）
+          elif src == "phone": 手机麦
+          else: 本机麦
+
+    —— 缺省值 `pc` 让"**没说**"与"**明说要 pc**"变成同一件事。而真机上手机 App 的
+    「开始录音」打的正是**一个 query 都不带**的 `POST /api/meeting/start`
+    （`android/.../ui/MainViewModel.kt` 里那句 `api().meetingStart()`；另两个带
+    `@Query("source")` 的变体在真机这条路上根本没被调用）。于是服务端把"没说"读成
+    "要用电脑的麦"，建出一场**本机麦**会议：电脑开声卡录（面板跟着显示"录音中"）、
+    手机传上来的段被"本机麦不接外来段"那条护栏拒掉、最后转写里全是电脑那支麦。
+
+    所以"没说"必须与"明说 pc"分开判：**没说时唯一能定采集源的事实，是这次请求的
+    发起方**（经中继进来 = 手机，判据与 `_meeting_origin` 同源 —— 用户 2026-10-15 的
+    口径就是"手机发起的指令，手机收，电脑是配合执行和存储"）。
+
+    优先级（先到先得，**不合并**）：
+
+      1. **`clientId`**：离线补传那条路的音频只可能是手机录的 → `phone`（幂等键那条路
+         不能因为"没带 source"退回本机麦，这是同一个事实的另一种入口）；
+      2. **显式 `source`**：客户端说的算 —— `phone` → 手机麦，其它值 → 本机麦。
+         手机带 `source=pc`（人在会议室、就用电脑那支麦录）是**合法组合**，不许改判
+         （`tests/test_event_origin.py` 钉着这一格）；
+      3. **都没给** → 按发起方：`mobile`（中继进来的手机）= 手机麦，`pc`（本机面板/技能）
+         = 本机麦。
+
+    返回的是**有效采集源**，不是请求里那个字符串：调用方用它建会、也用它回包 ——
+    本机面板那条老路（不带中继标记、不带 source）仍然是 `pc`，回包一个字都没变。
+
+    ⚠️ **第 3 档与客户端是"一对"的，别只上服务端这一半**（2026-10-17 复核时留的话）：
+    当前安卓 App 的「开始录音」按钮（`ui/MainViewModel.kt::startMeeting()`）只是**遥控电脑**
+    —— 它不会在手机上录音（那是它旁边那个「用手机麦克风」按钮 / `MeetingMicService` 的事）。
+    所以这一档一旦单独上线，那次「开始录音」会变成一场**没有任何音频**的手机麦会议
+    （收尾时如实报"这场会没有音频分段，无法转写"，不会静默）。
+    客户端那一行（按钮里补 `MeetingMicService.start()`）**必须与本修复同批**；
+    若要先只动服务端，就把这一档改回 `pc`（一行），别让用户从"录错麦"变成"没录到"。
+    """
+    if str(client_id or "").strip():
+        return "phone"
+    want = str(source or "").strip().lower()
+    if want:
+        return "phone" if want == "phone" else "pc"
+    return "phone" if origin == meeting.ORIGIN_MOBILE else "pc"
+
+
 @router.post("/meeting/start")
-def meeting_start(request: Request, source: str = "pc", clientId: str = "",
+def meeting_start(request: Request, source: str = "", clientId: str = "",
                   startedAt: str = "", endedAt: str = "",
                   _auth=Depends(optional_auth)):
-    """开始录音。`source=pc`（默认，用电脑的麦）/ `source=phone`（手机传段上来）。
+    """开始录音。`source=phone`（音频由手机按段传上来，电脑**不开麦**）/
+    `source=pc`（用电脑的麦）；**不给 `source` 时按发起方定**（见 `_meeting_capture_source`）。
 
     用户 2026-10-15 的口径：手机发起的事该由手机采集 —— 所以手机那个界面发起时传
     `phone`，电脑那边**不开麦**，只负责落盘、转写、存储。
@@ -1489,6 +1558,11 @@ def meeting_start(request: Request, source: str = "pc", clientId: str = "",
     `pc`（用电脑的麦录），那仍然是**手机发起**的任务，通知该回手机。所以这里把 origin
     显式传给会议模块，由它写进 meta、并让这场后续所有事件都带上。
 
+    ⚠️ 两个参数**默认值都是"没说"**（`source=""`），不是 `"pc"`：`source` 的缺省值曾经是
+    `pc`，而真机那条路一个 query 都不带 —— "没说"被读成"明说要 pc"，于是手机发起的会
+    变成了电脑麦的会（2026-10-17 真机事故，详见 `_meeting_capture_source`）。
+    判据只在那个函数里有一份：`clientId` → 显式 `source` → 发起方。
+
     **离线补传（2026-10-16）**：带 `clientId`（客户端稳定 id）+ `startedAt`（**缓存的**
     开始时间）+ 可选 `endedAt` 时走补传那条路（**同样是 query，这条接口没有请求体**）：
     同一个 `clientId` 反复调只建一场、回同一个 `meetingId`（重复时 `duplicate: true`），
@@ -1496,7 +1570,6 @@ def meeting_start(request: Request, source: str = "pc", clientId: str = "",
     服务端另记自己收到它的时间。带了 `clientId` 就**不开电脑的声卡** —— 补传的音频是
     手机一段段传上来的（`/meeting/segment`），这两件事在语义上互斥。
     """
-    src = (source or "pc").strip().lower()
     origin = _meeting_origin(request)
     cid = (clientId or "").strip()
     if cid:
@@ -1507,12 +1580,22 @@ def meeting_start(request: Request, source: str = "pc", clientId: str = "",
                 "source": r["source"] if r["ok"] else "",
                 "meetingId": r["meetingId"], "duplicate": r["duplicate"],
                 "clientId": r["clientId"]}
-    ok, msg = (meeting.start_meeting_phone(origin=origin) if src == "phone"
+    eff = _meeting_capture_source(origin, source=source, client_id=cid)
+    if eff == "phone" and not cid and not str(source or "").strip():
+        # 唯一一个"服务端替客户端做了决定"的格子（手机发起、但一个 query 都没带）。
+        # 落一条日志，事后不必再从"有没有 recorder / meta 里有没有 source"倒推：
+        # 同时它也是**那条客户端缺口的证据** —— 这条路上手机必须自己开始录音
+        # （`MeetingMicService`），否则这场会以"没有音频分段"收场。
+        db.add_log("info", "meeting",
+                   "手机发起但没说明采集源：按发起方判成「手机麦」"
+                   "（要用电脑的麦请带 source=pc）")
+    ok, msg = (meeting.start_meeting_phone(origin=origin) if eff == "phone"
                else meeting.start_meeting(origin=origin))
     services.report_meeting("active" if ok else "idle", msg)
     # ⚠️ 这条（不带 clientId）的响应体被 `tests/test_api_contract.py` 逐字钉着：
     # 需要新键的那条路在上面（`clientId`），别顺手往这里加字段。
-    return {"ok": ok, "message": msg, "source": src if ok else ""}
+    # `eff` 是本机面板那条路的 `"pc"` —— 与改之前逐字相同。
+    return {"ok": ok, "message": msg, "source": eff if ok else ""}
 
 
 @router.post("/meeting/stop")

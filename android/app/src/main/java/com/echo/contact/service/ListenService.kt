@@ -434,8 +434,9 @@ class ListenService : Service() {
             val heard = when (val first = flow.submit(wav)) {
                 is ListenFlow.Outcome.Heard -> first
                 is ListenFlow.Outcome.Failed -> return note("刚才那句没发出去：${first.message}")
-                // 上传这一步不该回 Reply（Reply 只从 awaitReply 来）；写出来是为了穷尽分支
-                is ListenFlow.Outcome.Reply -> return note("这次没拿到结果")
+                // 上传这一步不该回 Reply / Silent（那两个只从 awaitReply 来）；写出来是为了穷尽分支
+                is ListenFlow.Outcome.Reply, is ListenFlow.Outcome.Silent ->
+                    return note("这次没拿到结果")
             }
             ListenState.countSegment()
             // 把"它听成什么"写出来：车里最常问的就是这句（听错了要立刻能看出来）
@@ -448,7 +449,12 @@ class ListenService : Service() {
                 refreshNotification(ListenState.Phase.THINKING, "正在等 ECHO 回话…")
             }
             when (val result = flow.awaitReply(heard.commandId)) {
+                // `result.text` 已经是"该念的那一段"（`SpeakPlan` 判过：电脑给的 speakText，
+                // 老电脑就只念开头摘要）—— 这里**不再**自己从 reply 里切正文。
                 is ListenFlow.Outcome.Reply -> speak(engine, api, result.text)
+                // 不念，但**要把"为什么不念"说出来**：没有界面时，"这条不念"与"它没反应"
+                // 在车里听起来一模一样（电脑发起的任务 / 回复是空的）。
+                is ListenFlow.Outcome.Silent -> note(result.why)
                 is ListenFlow.Outcome.Failed -> note(result.message)
                 is ListenFlow.Outcome.Heard -> note("这次没拿到结果")
             }

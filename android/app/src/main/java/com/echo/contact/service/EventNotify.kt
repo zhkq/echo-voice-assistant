@@ -119,6 +119,18 @@ object EventNotify {
     const val ORIGIN_PC = "pc"
 
     /**
+     * payload 里 `origin` 的**原样**取值（缺失 / 空白 / 不是字符串 → null）。
+     *
+     * 这是"`origin` 怎么读"的**唯一一处**（[initiator] 与 `SpeakPlan.originOf` 都用同一套
+     * 取值常量，别在别处再写一遍字面量）。它**故意不替调用方决定"拿不到算谁"** ——
+     * 两条路的兜底方向相反：
+     *  * 通知（[initiator]）：拿不到按 [ORIGIN_PC]（少打扰，代价不对称）；
+     *  * 念回复（`SpeakPlan`）：拿不到按手机（照念，静默等于功能坏了）。
+     * 所以这里只回答"它写了什么"，兜底留给各自的调用方。
+     */
+    fun originOf(payload: Map<String, Any?>): String? = str(payload[KEY_ORIGIN])?.lowercase()
+
+    /**
      * 这条事件**是谁发起的**（第一层判据的输入）。
      *
      * 缺失/空/不是字符串 → 按 [ORIGIN_PC] 处理（**保守不打扰**）：老事件（电脑侧
@@ -129,7 +141,7 @@ object EventNotify {
      * **手机发起**的会议，转写/纪要是电脑算出来的，但用户是在等它的结果，
      * 所以那些事件仍然是 `mobile`。
      */
-    private fun initiator(payload: Map<String, Any?>): String = str(payload[KEY_ORIGIN]) ?: ORIGIN_PC
+    private fun initiator(payload: Map<String, Any?>): String = originOf(payload) ?: ORIGIN_PC
 
     /**
      * 事件 → 一句通知。返回 null = **不打扰**。

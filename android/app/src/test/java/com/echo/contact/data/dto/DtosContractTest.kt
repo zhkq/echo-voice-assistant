@@ -4,6 +4,7 @@ import com.google.gson.Gson
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -130,5 +131,40 @@ class DtosContractTest {
         assertFalse(parsed.exists)
         assertTrue(parsed.messages.isEmpty())
         assertEquals("这条命令没有关联会话（发送失败，或当时没拿到会话）", parsed.message)
+    }
+
+    /**
+     * 电脑侧统一产出的两个新字段（2026-10-17 契约）：
+     *  * `speakText` —— "要念的那段话"（只含摘要），手机照它念，不再自己切正文；
+     *  * `origin` —— 发起方（`mobile` / `pc`），谁发起谁念。
+     *
+     * 为什么连**脏值**一起钉：Gson 对 `String` 字段遇到 JSON 对象会直接抛 —— 一个字段写错
+     * 就能把**整页指令历史**解析崩。所以这两个字段要经得起数字/对象/数组/空串。
+     */
+    @Test
+    fun `指令行的 speakText 与 origin 宽容解析`() {
+        val json = """
+            {"total": 2, "items": [
+              {"id": 1, "status": "done", "source": "mobile", "reply": "整篇回复",
+               "speakText": "只念这句。", "origin": "mobile"},
+              {"id": 2, "status": "done", "speakText": {"weird": 1}, "origin": null}
+            ]}
+        """.trimIndent()
+
+        val parsed = gson.fromJson(json, CommandListResponse::class.java)
+
+        assertEquals("只念这句。", parsed.items[0].speakText)
+        assertEquals("mobile", parsed.items[0].origin)
+        assertFalse(
+            "对象这种脏值要接住（判据那边只认字符串、当没给），不能让整页历史解析崩",
+            parsed.items[1].speakText is String,
+        )
+
+        // 电脑侧要是写成 snake_case 也认（宽容解析），老电脑根本没有这两个键 → 都是 null
+        val snake = gson.fromJson("""{"id": 3, "speak_text": "snake 也认"}""", CommandItem::class.java)
+        assertEquals("snake 也认", snake.speakText)
+        val old = gson.fromJson("""{"id": 4, "reply": "老电脑"}""", CommandItem::class.java)
+        assertNull("老电脑没有 speakText → 手机走'取摘要'退路", old.speakText)
+        assertNull("老电脑没有 origin → 拿不到就不拦（照念）", old.origin)
     }
 }

@@ -7,6 +7,7 @@ import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -101,6 +102,54 @@ class ListenFlowTest {
     fun `没有 brief 就退回 reply`(): Unit = runBlocking {
         json("""{"total":1,"items":[{"id":9,"status":"done","reply":"记好了。"}]}""")
         assertEquals("记好了。", (flow().awaitReply(9) as ListenFlow.Outcome.Reply).text)
+    }
+
+    // --------------------------------------------- 用户 2026-10-17 真机：只念摘要、不念详情
+
+    /**
+     * 有 `speakText` 就念它 —— 这条是"单一出处"的**线上判据**：
+     * 结果体里同时躺着整篇 detail，念出来的必须**恰好**是电脑给的那段。
+     */
+    @Test
+    fun `有 speakText 就念它、整篇 reply 里的详情一句都不念`(): Unit = runBlocking {
+        json(
+            """{"total":1,"items":[{"id":11,"status":"done","source":"mobile",
+               "speakText":"三件事都办好了。",
+               "reply":"三件事都办好了。\n详情如下：\n1. 客厅灯已打开，亮度 60%\n2. 空调制冷二十六度，风速自动"}]}"""
+        )
+        val out = flow().awaitReply(11)
+        assertTrue("该念 speakText 那段：$out", out is ListenFlow.Outcome.Reply)
+        out as ListenFlow.Outcome.Reply
+        assertEquals("念的必须恰好是 speakText", "三件事都办好了。", out.text)
+        for (w in listOf("60%", "风速自动", "详情如下")) {
+            assertFalse("详情是给人看的、不许念：${out.text}", out.text.contains(w))
+        }
+    }
+
+    /** 老电脑没有 `speakText`：只念第一段，后面的详情一概不念。 */
+    @Test
+    fun `老电脑没有 speakText 时只念第一段摘要`(): Unit = runBlocking {
+        json(
+            """{"total":1,"items":[{"id":12,"status":"done","source":"mobile",
+               "reply":"会议纪要整理好了。\n\n第一段讲进度：三个模块两个完成。\n第二段讲风险：接口还没对接完。"}]}"""
+        )
+        val out = flow().awaitReply(12) as ListenFlow.Outcome.Reply
+        assertEquals("会议纪要整理好了。", out.text)
+        for (w in listOf("讲进度", "讲风险", "接口")) {
+            assertFalse("详情段落不许念：${out.text}", out.text.contains(w))
+        }
+    }
+
+    /** 电脑发起的任务：手机一个字都不念，但要把"为什么不念"说出来（不是失败）。 */
+    @Test
+    fun `电脑发起的答复一个字都不念`(): Unit = runBlocking {
+        json(
+            """{"total":1,"items":[{"id":13,"status":"done","origin":"pc","source":"web",
+               "reply":"第一段。\n\n详情在后"}]}"""
+        )
+        val out = flow().awaitReply(13)
+        assertTrue("电脑的活儿不该返回要念的文字：$out", out is ListenFlow.Outcome.Silent)
+        assertTrue("得说清为什么不念", (out as ListenFlow.Outcome.Silent).why.isNotBlank())
     }
 
     @Test
