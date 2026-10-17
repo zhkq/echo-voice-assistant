@@ -18,7 +18,9 @@
      （这正是"按局部标签直接当显示名"会犯的错）；
   3. 3 段 3 个不同的人 → **3 个**标签（宁可多分，绝不错并）；
   4. 库里的 `lines.speaker_label`、`speakers` 表、导出的 `transcript.md` 三处
-     **同一套**；`meta.json` 里的分离结论与向量空间也必须是这一场的事实。
+     **同一套**；`meta.json` 里的分离结论与向量空间也必须是这一场的事实；
+  5. 匹配阈值按**真机**校准（0.80）：不同人最高见到 0.74、同一人最低见到 0.858 ——
+     0.78 的"不同人"不许并、0.85 的"同一人"仍要并（0.75 会把前者并错）。
 
 ## 隔离
 
@@ -65,6 +67,19 @@ def _one_hot(i, dim=256):
     """
     v = [0.0] * dim
     v[i] = 1.0
+    return v
+
+
+def _like(i, cos, dim=256):
+    """与 `_one_hot(i)` 的余弦**恰好等于 cos** 的单位向量（另一个维度 j=i+1 补齐）。
+
+    用来模拟真机上"不同人也有 0.74 左右相似度、同一人只有 0.85"的那种**有重叠的分布**
+    —— 只测 0/1 两个极端不能说明阈值选得对不对。
+    """
+    import math
+    v = [0.0] * dim
+    v[i] = float(cos)
+    v[i + 1] = math.sqrt(max(0.0, 1.0 - float(cos) ** 2))
     return v
 
 
@@ -335,7 +350,60 @@ class DifferentPeopleStayApartTests(_MeetingCase):
         self.assertEqual(len(names), 3, "speakers 表也必须是 3 个：%s" % names)
 
 
-# ---------------------------------------------------------------- ③ 没有嵌入时
+# ---------------------------------------------------------------- ③ 阈值校准
+
+class ThresholdCalibrationTests(_MeetingCase):
+    """阈值不是拍脑袋定的：真机上"不同人"与"同一人"的余弦**有重叠但留缝**。
+
+    2026-10-18 在会议 78/79 的原生 pyannote 嵌入上量到：
+      * 不同人：0.5845 / 0.5611 / 0.7409（最高 0.74）；
+      * 同一人（段边界文本直接接续，确定是同一人）：0.8846 / 0.8585（最低 0.858）。
+    默认 0.75 离不同人的上限只差 0.01，一次抖动就会把两个人并成一个；会议这边用
+    0.80（见 `meeting.MEETING_SPEAKER_MATCH_THRESHOLD`）。
+    """
+
+    def test_a_different_person_at_0_78_is_not_merged(self):
+        """0.78 已经高过默认 0.75，但它是**另一个人** —— 必须新建标签。"""
+        backend = _SegmentBackend({
+            "01.wav": ("S0", _one_hot(0)),          # 甲
+            "02.wav": ("S0", _like(0, 0.78)),       # 乙（与甲 0.78，仍不是同一个人）
+            "03.wav": ("S0", _one_hot(0)),          # 甲
+        })
+        self._run(backend)
+
+        per_seg = self._db_labels_by_segment()
+        self.assertNotEqual(per_seg[1] - {""}, per_seg[2] - {""},
+                            "0.78 的另一个人被并进了甲：%s" % per_seg)
+        self.assertEqual(per_seg[1] - {""}, per_seg[3] - {""},
+                         "甲在第 1/3 段应仍是同一个标签：%s" % per_seg)
+        labels = {x for v in per_seg.values() for x in v if x}
+        self.assertEqual(len(labels), 2, "应当是 2 个标签（甲、乙）：%s" % labels)
+
+    def test_a_same_person_at_0_85_is_still_merged(self):
+        """同一人跨段只有 0.85（真机最低 0.858）时仍必须归入同一个标签。
+
+        阈值不能为了"防错并"一路抬到 0.9 以上 —— 那会把同一人拆成两个说话人，
+        会议纪要里就出现两个"半个人"。
+        """
+        backend = _SegmentBackend({
+            "01.wav": ("S0", _one_hot(0)),          # 甲
+            "02.wav": ("S0", _like(0, 0.85)),       # 甲（同一人，换了一段、质量差一点）
+        })
+        self._run(backend)
+
+        per_seg = self._db_labels_by_segment()
+        self.assertEqual(per_seg[1] - {""}, per_seg[2] - {""},
+                         "0.85 的同一人被拆成了两个标签：%s" % per_seg)
+        self.assertEqual(len(self._speaker_names()), 1,
+                         "同一场会只该有一个说话人：%s" % self._speaker_names())
+
+    def test_the_threshold_keeps_a_margin_on_both_sides(self):
+        """把校准值钉死：低于 0.80 会把 0.78 的另一个人并错，高于 0.86 会拆开同一人。"""
+        self.assertGreaterEqual(meeting.MEETING_SPEAKER_MATCH_THRESHOLD, 0.80)
+        self.assertLess(meeting.MEETING_SPEAKER_MATCH_THRESHOLD, 0.86)
+
+
+# ---------------------------------------------------------------- ④ 没有嵌入时
 
 class NoEmbeddingBackendTests(_MeetingCase):
     """后端**不回嵌入**时两条相反的结论（"宁可多分不可错并"的硬边界）。
@@ -394,7 +462,7 @@ class NoEmbeddingBackendTests(_MeetingCase):
                          "provider 的编号是整场一致的，不该报退化：%s" % self.logs)
 
 
-# ---------------------------------------------------------------- ④ 三处一致
+# ---------------------------------------------------------------- ⑤ 三处一致
 
 class OneLabelSetEverywhereTests(_MeetingCase):
     """`lines` / `speakers` / `transcript.md` 是同一套；`meta` 记的是这一场的事实。"""

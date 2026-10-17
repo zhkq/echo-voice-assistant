@@ -2181,6 +2181,19 @@ def _apply_capability_meta(meta: dict, cap_plan, cap_kinds) -> dict:
 #: 才谈得上"认出的这个人是谁"）。
 SPEAKER_SLOTS = ("diarize.turns", "speaker.embed")
 
+#: 会议跨段说话人匹配阈值（余弦）—— **比 `SpeakerRegistry` 的默认 0.75 高**。
+#:
+#: 为什么是 0.80（2026-10-18 真机校准，会议 78/79 的原始 pyannote 嵌入）：
+#:   * **同一个人**跨段（段边界文本直接接续，所以确定是同一人）：
+#:     0.8846（78 段2→3）、0.8585（79 段1→2）；
+#:   * **两个不同的人**（同一段里的两个全局标签）：
+#:     0.5845（78 段1）、0.5611 / 0.7409（79 段1）。
+#: 即"不同人"最高见到 **0.74**、"同一人"最低见到 **0.858**；0.75 离不同人的上限
+#: 只差 0.01 —— 一次抖动就会把两个人并成一个（而且不报错，只是会议纪要里换了个名字）。
+#: 0.80 把两边都留出余量。**宁可多分，不可错并**：阈值再高一点（>0.86）会把同一人拆开，
+#: 那只是多一个说话人；而阈值偏低会把两个真人并成一个，用户无法察觉。
+MEETING_SPEAKER_MATCH_THRESHOLD = 0.80
+
 
 def _session_slots(cfg):
     """本场要向能力层要哪些槽。**说话人那一族是无条件的**。
@@ -3232,7 +3245,8 @@ def _transcribe_impl(folder):
                             # 而空映射的表现是**认错人且不报错**。
                             if registry is None:
                                 from app.audio.diarize import SpeakerRegistry
-                                registry = SpeakerRegistry()
+                                registry = SpeakerRegistry(
+                                    threshold=MEETING_SPEAKER_MATCH_THRESHOLD)
                             label_map = registry.map(embs, labels)
                         else:
                             # **有轮次、没嵌入**（在线转写就是这种）：标签只能按后端
