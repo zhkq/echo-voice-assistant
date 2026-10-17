@@ -139,4 +139,100 @@ class MeetingSegmentAudioTest {
         assertTrue("退回时那句如实的话必须在：${out.note}", out.note.isNotBlank())
         assertTrue(out.bytes.size == WavWriter.HEADER_SIZE + pcm.size)
     }
+
+    // ---------------------------------------------------------------- 封段收尾：回填 STREAMINFO
+
+    /*
+     * 下面这几条钉的是 2026-10-17 真机那个格式问题的**根治点**：
+     * `MediaCodec` 写 FLAC 头时还不知道总长度 → `total_samples = 0`（规范里是"未知"，
+     * 合法）→ `libsndfile` 读成 `SF_COUNT_MAX (2^63-1)` → 服务端 `psf_fseek` 崩、整段解不出来。
+     *
+     * 所以封段收尾必须**回填真的总样本数**；回填不了就**整段退回 WAV**（绝不发一个
+     * total_samples=0 的 FLAC 出去，也绝不丢音频）。
+     * 这一组走的是**生产路径** [encodeFlacSegment]（[FlacSegmentEncoder] 只是把
+     * "用 MediaCodec 编出原始字节"那一步塞给它），所以除了 MediaCodec 本身，整条都验了。
+     */
+
+    /** 一段 1 秒的 PCM（16 kHz / 单声道 / 16 bit）。 */
+    private fun oneSecondPcm(): ByteArray = ByteArray(16_000 * 2) { (it % 101).toByte() }
+
+    @Test
+    fun `封段时把 total_samples 回填成真实样本数（编码器给回来的是 0）`() {
+        val pcm = oneSecondPcm()
+        // MediaCodec 的原样输出形状：带 fLaC 魔数，但头里 total_samples = 0
+        val raw = FlacTestBytes.stream(totalSamples = 0, frameBytes = pcm.size / 4)
+
+        val out = encodeFlacSegment(pcm, 16_000, 1) { raw }
+
+        assertEquals(SegmentFormat.FLAC, out.format)
+        assertEquals("编成了就没什么要说的（别用套话占住界面那一行）", "", out.note)
+        assertTrue(looksLikeFlac(out.bytes))
+        assertEquals("头里必须写**真的**总样本数 —— 不是 0（0 就是服务端解不出来的那一档）",
+            16_000L, FlacStreamInfo.parse(out.bytes)!!.totalSamples)
+        assertEquals("回填是原地覆盖：长度一个字节都没变", raw.size, out.bytes.size)
+        assertFalse("没有退回 WAV", out.fallback)
+    }
+
+    @Test
+    fun `编码器自己猜的长度也会被真的样本数覆盖（写头时它不可能知道）`() {
+        val pcm = oneSecondPcm()
+        // 有些实现会往前猜一个数（这里故意写 999）：它不可能是对的 —— 写头时 EOS 还没到。
+        // 我们的样本数来自**真的喂进去的 PCM 字节数**，比它准。
+        val raw = FlacTestBytes.stream(totalSamples = 999, frameBytes = 32)
+
+        val out = encodeFlacSegment(pcm, 16_000, 1) { raw }
+
+        assertEquals(SegmentFormat.FLAC, out.format)
+        assertEquals("头里必须是真实样本数（不是编码器猜的那个）",
+            16_000L, FlacStreamInfo.parse(out.bytes)!!.totalSamples)
+        assertEquals("长度不变", raw.size, out.bytes.size)
+    }
+
+    @Test
+    fun `头认不出时整段退回 WAV，并如实说是回填失败（不是编码器不可用）`() {
+        val pcm = oneSecondPcm()
+        // 注入回填失败：编码器给回来的"FLAC"头不完整（真机上对应的情形：
+        // 流里没有可认的 STREAMINFO —— 那种头里写什么都是猜的）
+        val truncated = FlacTestBytes.stream(totalSamples = 0).copyOfRange(0, 20)
+
+        val out = encodeFlacSegment(pcm, 16_000, 1) { truncated }
+
+        assertEquals("回填不了就退回 WAV —— 绝不发一个 total_samples=0 的 FLAC", SegmentFormat.WAV, out.format)
+        assertTrue("要说清是回填那一步失败：${out.note}", out.note.contains("回填"))
+        assertFalse("不许拿'FLAC 编码器不可用'盖掉真实原因",
+            out.note == SegmentEncoding.FLAC_UNAVAILABLE)
+        // 退回只是换容器：PCM 逐字节一致（一个样本都不许丢）
+        val payload = out.bytes.copyOfRange(WavWriter.HEADER_SIZE, out.bytes.size)
+        assertTrue("PCM 必须一个字节不少", payload.contentEquals(pcm))
+    }
+
+    @Test
+    fun `注入回填失败（fixup 直接失败）也退回 WAV，原因原样带出去`() {
+        val out = SegmentEncoding.encode(
+            flac = { FlacTestBytes.stream(totalSamples = 0) },
+            wav = { WavWriter.wrap(pcm, 16_000, 1, 16) },
+            fixup = FlacHeaderFixup { FlacHeaderFix.Failed("注入：回填失败") },
+        )
+        assertEquals(SegmentFormat.WAV, out.format)
+        assertEquals("注入的那句原因要原样带出去（排障的人靠它找对地方）", "注入：回填失败", out.note)
+    }
+
+    @Test
+    fun `回填的 fixup 抛异常也不许把异常冒出去（退回 WAV）`() {
+        val out = SegmentEncoding.encode(
+            flac = { FlacTestBytes.stream(totalSamples = 0) },
+            wav = { WavWriter.wrap(pcm, 16_000, 1, 16) },
+            fixup = FlacHeaderFixup { error("回填这一步炸了") },
+        )
+        assertEquals("抛异常 = 这一段编不成 —— 退回 WAV，绝不丢音频", SegmentFormat.WAV, out.format)
+        assertEquals(SegmentEncoding.FLAC_HEADER_NOT_FIXED, out.note)
+    }
+
+    @Test
+    fun `回填不了的那句话与'没有编码器'是两句不同的话`() {
+        assertTrue(SegmentEncoding.FLAC_HEADER_NOT_FIXED.isNotBlank())
+        assertFalse("两件事不许混成一句（混了就把排障的人指错方向）",
+            SegmentEncoding.FLAC_HEADER_NOT_FIXED == SegmentEncoding.FLAC_UNAVAILABLE)
+        assertFalse(SegmentEncoding.FLAC_HEADER_NOT_FIXED == SegmentEncoding.FLAC_NOT_RECOGNIZED)
+    }
 }

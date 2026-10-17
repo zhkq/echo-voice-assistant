@@ -33,6 +33,11 @@ pyannote 也不能假定认 FLAC。因此定下两条铁律：
 本模块管"会议认得的 wav ↔ 归档 flac"（**存量**那条路）。两者都靠 soundfile，
 但目标相反：导入是把任意格式**归一**，本模块是把归一后的东西**无损收起**。
 
+⚠️ 2026-10-17 起，`decode_to_wav()` **不再只有 soundfile 一条路**：手机 MediaCodec 产的
+FLAC 头里总样本数未知（`total_samples=0`，合法），libsndfile 读它必失败（`Internal
+psf_fseek() failed.`），所以补了一条 **ffmpeg** 的宽容路径（见该函数的 docstring）。
+压缩那条路仍然只用 soundfile（它写出来的 FLAC 头是全的）。
+
 ## 不写进这里的东西
 
 `app/audio/stt.py` 是另一个任务在改的文件，**本模块一行都不碰它**：解码助手放在这里，
@@ -82,6 +87,16 @@ TEMP_PREFIX = "echo-dec-"
 #: 压缩时读回校验的抽样块大小（帧）。整段 `float64` 比会撑爆内存，
 #: 所以：**逐样本比**在分块里做（不整段进内存），块大小与 importer 的分块一致。
 VERIFY_BLOCK_FRAMES = 65536
+
+#: soundfile/libsndfile 对"总样本数未知"的容器报的帧数（`SF_COUNT_MAX` = 2**63-1）。
+#: 它**不是**真实帧数：拿它算时长会得到 1.15e15 秒（2026-10-17 真机 `meta.json` 里
+#: 那个 `durationSeconds: 1152921504606847.0` 就是 2**63/8000），拿它当读取循环的上界
+#: 还会让 libsndfile 去 seek 一个不存在的位置。见 `_flac_length_unknown()`。
+SF_COUNT_MAX = (1 << 63) - 1
+
+#: ffmpeg 解一个段的超时上限（秒）。16 kHz 单声道解起来是毫秒级，给足余量的唯一目的
+#: 是"卡住的子进程不许把转写线程永远挂在 decode 上"。
+FFMPEG_TIMEOUT = 1800.0
 
 #: 段号（int）。`01.wav` / `01.flac` / `1.WAV` 都归到同一个段号。
 _RESERVED_NAMES = ("meta.json", "transcript.md", "summary.md", "topics.md")
@@ -190,6 +205,13 @@ def audio_seconds(path):
 
     WAV 走标准库（快、无依赖），其它容器走 soundfile —— 转写/播放那条路要按它算
     时间轴均摊，**不能因为换了归档格式就退化成 0**。
+
+    ⚠️ **"总样本数未知"的 FLAC 不能拿 `frames` 直接除**（2026-10-17 真机取证）：
+    手机 `MediaCodec` 产的 FLAC，头里 `STREAMINFO.total_samples=0`（合法：0 = 未知），
+    libsndfile 把它报成 `SF_COUNT_MAX`（2**63-1）。真机那两场会议的 `meta.json` 里
+    `durationSeconds: 1152921504606847.0` 就是这么来的（= 2**63/8000）—— 一个**纯假数字**，
+    面板上会把一场 50 秒的会显示成宇宙年龄。这种文件只能真解一遍才知道多长：
+    宁可多解一次，也不许把哨兵值当答案（更不许把它写成 0 以外的任何猜测）。
     """
     if _is_wav(path):
         return wav_seconds(path)
@@ -197,9 +219,32 @@ def audio_seconds(path):
         import soundfile as sf
         info = sf.info(path)
         rate = int(info.samplerate or 0)
-        return (int(info.frames or 0) / float(rate)) if rate else 0.0
+        frames = int(info.frames or 0)
+        if rate <= 0:
+            return 0.0
+        if frames >= SF_COUNT_MAX:
+            return _decoded_seconds(path)
+        return frames / float(rate)
     except Exception:
         return 0.0
+
+
+def _decoded_seconds(path):
+    """真解一遍量时长（只给"头里没写总样本数"的容器用）；解不出来返回 0.0。
+
+    返回 0.0 **不是撒谎**：调用方（`meeting.stop_meeting` 写 `durationSeconds`）拿到 0
+    就是"还不知道"，而 `SF_COUNT_MAX` 那种 1.15e15 秒是**一眼假的肯定句** —— 两者对
+    用户/排障的意义完全不同（前者会被当成缺陷继续查，后者会把人带沟里）。
+    """
+    tmp = ""
+    try:
+        tmp = decode_to_wav(path, cleanup=False)
+        return wav_seconds(tmp)
+    except Exception:
+        return 0.0
+    finally:
+        if tmp:
+            _unlink(tmp)
 
 
 def probe(path):
@@ -310,6 +355,119 @@ def gc_temp(max_age=TEMP_TTL_SECONDS):
     return removed
 
 
+def ffmpeg_exe():
+    """ffmpeg 可执行文件的路径；这台机器上找不到就返回空串。
+
+    查找顺序：`ECHO_FFMPEG`（显式指定；用例与特殊安装用）→ `PATH`。
+    为什么可以依赖它：项目里本来就有这条路（`app/audio/tts.py` 的播放回退用它），
+    而**没有它**时"长度未知的 FLAC"一条都解不了（见 `_flac_length_unknown`）。
+    找不到时**不静默降级**：调用方会把"这台机器上没装 ffmpeg"写进给人看的失败原因里。
+    """
+    explicit = str(os.environ.get("ECHO_FFMPEG") or "").strip()
+    if explicit and os.path.isfile(explicit):
+        return explicit
+    return shutil.which("ffmpeg") or ""
+
+
+def _flac_length_unknown(path):
+    """这个 FLAC 头里**总样本数是 0**（= 规范里的"未知"）吗？
+
+    为什么必须提前认出来（2026-10-17 真机取证）：
+    手机用 Android `MediaCodec` 编 FLAC 时，编码器**一开头就要写 STREAMINFO**，而那时
+    它还不知道整段会有多少样本，于是 `total_samples=0`、`md5=0`（这是**合法**的 FLAC，
+    不是坏文件）。libsndfile 1.2.2 把它读成 `SF_COUNT_MAX`，随后连"读完一块、把位置记
+    回去"的那个 seek 都失败 —— 原话 `soundfile.LibsndfileError: Internal psf_fseek()
+    failed.`（落在本文件 `fh.blocks(...)` 那一行）。文件本身是**好的**：同一份样本用
+    ffmpeg 能完整解出 30 秒 / 16 kHz / 单声道，所以这里判的是"解码器太挑"，
+    **绝不能**因此把它当坏文件拒收或删掉（那样就是丢用户的音频）。
+    """
+    try:
+        import soundfile as sf
+        return int(sf.info(path).frames or 0) >= SF_COUNT_MAX
+    except Exception:
+        return False
+
+
+def _header_rate_channels(path):
+    """头里声明的 `(采样率, 声道数)`；读不出来返回 `(0, 0)`（= 不校验这一项）。"""
+    try:
+        import soundfile as sf
+        info = sf.info(path)
+        return int(info.samplerate or 0), int(info.channels or 0)
+    except Exception:
+        return 0, 0
+
+
+def _decode_with_soundfile(src, dst):
+    """第①条路（进程内、不依赖外部程序）：`src` → `dst`（16-bit PCM WAV）。
+
+    返回 `(rate, channels, frames)`。**既有校验一条都不放松**：采样率必须读得出来、
+    每一块的声道数必须与头一致、真的读到了帧；任何一条不满足就抛出去，由调用方
+    决定要不要换条路再试（而不是在这里放宽标准把它收下）。
+    """
+    import soundfile as sf
+    total = 0
+    with sf.SoundFile(src, "r") as fh:
+        rate = int(fh.samplerate or 0)
+        channels = int(fh.channels or 1)
+        if rate <= 0:
+            raise CompressionError("音频「%s」的采样率读不出来（%r）。"
+                                   % (os.path.basename(src), rate))
+        with sf.SoundFile(dst, "w", samplerate=rate, channels=channels,
+                          subtype=FLAC_SUBTYPE, format="WAV") as out:
+            for block in fh.blocks(blocksize=VERIFY_BLOCK_FRAMES, dtype="int16",
+                                   always_2d=True):
+                if block.shape[1] != channels:
+                    # 形状与头不符：宁可当场炸，也不要写出一份声道错位的 wav
+                    raise CompressionError(
+                        "音频「%s」解码时声道数变成 %d（头里写的是 %d），文件可能损坏。"
+                        % (os.path.basename(src), block.shape[1], channels))
+                out.write(block)
+                total += len(block)
+    return rate, channels, total
+
+
+def _decode_with_ffmpeg(exe, src, dst, expect=(0, 0)):
+    """第②条路（更宽容的一条）：ffmpeg `src` → `dst`（16-bit PCM WAV）。
+
+    返回 `(rate, channels, frames)`。**没有放松任何数据校验**，反而多查三条：
+      * `-loglevel error` 下 stderr 必须**一个字都没有** —— 截断的 FLAC 也能解出前半段
+        并以**退出码 0** 收场（实测：`invalid residual` / `decode_frame() failed` 全在
+        stderr 里），只听退出码就会把"缺了一半的音频"当成功、然后转写出一份
+        "少了一大段却看着正常"的文字。宁可当场失败，也不许谎报成功；
+      * 产物用标准库 `wave`（最不挑剔的读者）复核：必须 16-bit、采样率>0、帧数>0；
+      * 与头里声明的采样率/声道数一致（`expect`；头读不出来时是 `(0, 0)`，不校验）。
+    """
+    import subprocess
+    from app import platform as echo_platform
+    cmd = [exe, "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
+           "-i", src, "-vn", "-acodec", "pcm_s16le", "-f", "wav", dst]
+    proc = subprocess.run(cmd, capture_output=True, timeout=FFMPEG_TIMEOUT,
+                          creationflags=echo_platform.no_window_creationflags())
+    err = (proc.stderr or b"").decode("utf-8", "replace").strip()
+    if proc.returncode != 0 or err:
+        raise CompressionError("ffmpeg 退出码 %s%s"
+                               % (proc.returncode, ("：" + _short(err)) if err else ""))
+    with wave.open(dst, "rb") as w:
+        rate = int(w.getframerate() or 0)
+        channels = int(w.getnchannels() or 0)
+        width = int(w.getsampwidth() or 0)
+        frames = int(w.getnframes() or 0)
+    if width != 2:
+        raise CompressionError("解出来的不是 16-bit PCM（每样本 %d 字节）" % width)
+    if rate <= 0 or channels <= 0 or frames <= 0:
+        raise CompressionError("解出来是空音频（%d 帧 / %d Hz / %d 声道）"
+                               % (frames, rate, channels))
+    exp_rate, exp_channels = expect or (0, 0)
+    if exp_rate and rate != exp_rate:
+        raise CompressionError("解出来的采样率 %d Hz 与头里声明的 %d Hz 不一致"
+                               % (rate, exp_rate))
+    if exp_channels and channels != exp_channels:
+        raise CompressionError("解出来的声道数 %d 与头里声明的 %d 不一致"
+                               % (channels, exp_channels))
+    return rate, channels, frames
+
+
 def decode_to_wav(src, *, dst=None, cleanup=True):
     """把任意受支持音频（重点是 FLAC）解成 **16 kHz/单声道/16-bit PCM 的临时 WAV**。
 
@@ -324,9 +482,19 @@ def decode_to_wav(src, *, dst=None, cleanup=True):
     RIFF/WAV，而中间这段唯一的用途就是喂引擎；重编码一次换来的是**一条路**
     （whisper / SenseVoice / sherpa / pyannote / 面板播放 都读同一种文件），
     而不是"每个引擎各自试一遍能不能读 FLAC"。
-    """
-    import soundfile as sf
 
+    ## 两条解码路径（2026-10-17 加的第②条）
+
+    ① `soundfile`（libsndfile）：进程内、快、不依赖外部程序 —— **能解就一直用它**；
+    ② `ffmpeg`：更宽容的一条。加它**只因为一个真机样本**：手机 MediaCodec 编的
+       FLAC 头里总样本数未知（见 `_flac_length_unknown`），libsndfile 读它必失败，
+       而 ffmpeg 能完整解出来。
+
+    **原则不变（这条别改）**：解不出来就**如实报错 + 保留原文件 + 让转写落 error**，
+    绝不为了"让它过"而放松校验、丢掉解不出来的那部分音频。第②条同样逐条校验，
+    并且把两条路各自的原因都写进那句人话里（排障时要能看出是"文件坏了"还是
+    "这台机器上没有 ffmpeg"）。
+    """
     if not os.path.isfile(src):
         raise CompressionError("音频文件不存在：%s" % src)
     if cleanup:
@@ -336,34 +504,49 @@ def decode_to_wav(src, *, dst=None, cleanup=True):
         dst = os.path.join(_temp_dir(), tag + WAV_EXT)
     part = dst + ".part"
     _unlink(part)
+    reasons = []
+    total = 0
     try:
-        total = 0
-        with sf.SoundFile(src, "r") as fh:
-            rate = int(fh.samplerate or 0)
-            channels = int(fh.channels or 1)
-            if rate <= 0:
-                raise CompressionError("音频「%s」的采样率读不出来（%r）。"
-                                       % (os.path.basename(src), rate))
-            with sf.SoundFile(part, "w", samplerate=rate, channels=channels,
-                              subtype=FLAC_SUBTYPE, format="WAV") as out:
-                for block in fh.blocks(blocksize=VERIFY_BLOCK_FRAMES, dtype="int16",
-                                       always_2d=True):
-                    if block.shape[1] != channels:
-                        # 形状与头不符：宁可当场炸，也不要写出一份声道错位的 wav
-                        raise CompressionError(
-                            "音频「%s」解码时声道数变成 %d（头里写的是 %d），文件可能损坏。"
-                            % (os.path.basename(src), block.shape[1], channels))
-                    out.write(block)
-                    total += len(block)
+        # ① libsndfile。唯一的例外是"总样本数未知"的 FLAC：它在这条路上**一定**失败
+        #    （见 `_flac_length_unknown`），别白读一遍，直接交给 ②。
+        if not (is_flac(src) and _flac_length_unknown(src)):
+            try:
+                _rate, _channels, total = _decode_with_soundfile(src, part)
+            except CompressionError:
+                _unlink(part)
+                raise
+            except Exception as exc:                       # noqa: BLE001
+                reasons.append("libsndfile：%s" % _short(exc))
+                _unlink(part)
+        # ② ffmpeg（更宽容；也是唯一能解"长度未知的 FLAC"的那条）。
         if total <= 0:
-            raise CompressionError("音频「%s」解码出 0 帧（空文件或只有文件头）。"
-                                   % os.path.basename(src))
+            exe = ffmpeg_exe()
+            if exe:
+                try:
+                    _rate, _channels, total = _decode_with_ffmpeg(
+                        exe, src, part, expect=_header_rate_channels(src))
+                except Exception as exc:                   # noqa: BLE001
+                    reasons.append("ffmpeg：%s" % _short(exc))
+                    _unlink(part)
+            elif not reasons:
+                # ① 也没跑（长度未知的 FLAC）而本机没有 ffmpeg：原因要说清，
+                # 不然用户只看到一句"解码失败"，不知道出路是"装个 ffmpeg"或"改传 WAV"。
+                reasons.append("这种 FLAC 的头部没写总样本数，libsndfile 读不了；"
+                               "而这台机器上没有 ffmpeg（装上 ffmpeg，"
+                               "或让手机改传 WAV）")
+        if total <= 0:
+            _unlink(part)
+            _unlink(dst)
+            raise CompressionError(
+                "音频「%s」解码失败：%s"
+                % (os.path.basename(src),
+                   "；".join(reasons) or "解码出 0 帧（空文件或只有文件头）"))
         os.replace(part, dst)
     except CompressionError:
         _unlink(part)
         _unlink(dst)
         raise
-    except Exception as exc:
+    except Exception as exc:                               # noqa: BLE001
         _unlink(part)
         _unlink(dst)
         raise CompressionError("音频「%s」解码失败：%s" % (os.path.basename(src), _short(exc)))

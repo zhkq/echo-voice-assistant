@@ -1433,6 +1433,38 @@ def _pause_entry(from_v, to_v, by):
     return {"from": from_v, "to": to_v, "by": str(by or "")}
 
 
+def _merge_pauses(*groups):
+    """把多份暂停区间合并成一份：**同一个 `from` 只留一条**，有 `to` 的那条优先。
+
+    为什么按 `from` 而不是 `(from, to)` 去重：同一条区间在"刚按下暂停"和"后来恢复/收尾"
+    两个快照里是**两种写法** —— 前者 `to=""`（还开着），后者有 `to`。按 `(from, to)` 去重
+    会把它们当成两件事，于是 meta 里留下一条永远收不了尾的重复区间（读它的人分不清哪条
+    才是真的）。同一秒里按下两次暂停（中间还恢复过）在实践中不存在，这个取舍写在唯一一处。
+
+    顺序 = 各组按传入顺序拼接，先出现的 `from` 占位（后出现且带 `to` 时只把 `to` 补上去）。
+    """
+    out, where = [], {}
+    for group in groups:
+        for p in group or []:
+            if not isinstance(p, dict):
+                continue
+            frm = str(p.get("from") or "")
+            to = str(p.get("to") or "")
+            if not frm and not to:
+                continue                                  # 两头都空 = 画不出区间
+            # 有起点就按起点认；只有终点的那种（上报里允许）按终点认 —— 不能让一条
+            # 合法的"只知道到什么时候"的区间在合并时被静默丢掉。
+            key = ("from", frm) if frm else ("to", to)
+            if key in where:
+                i = where[key]
+                if frm and not str(out[i].get("to") or "") and to:
+                    out[i] = p                            # 同一件事：用**收尾了**的那条替换
+                continue
+            where[key] = len(out)
+            out.append(p)
+    return out
+
+
 def _split_entries(pauses, base_iso=""):
     """上报的区间列表 → `(能读出来的条目, 读不出来的条数)`。
 
@@ -1471,6 +1503,8 @@ def add_meeting_pauses(pauses, client_id=""):
         不是"再按一次静音"。这条特别要紧：暂停那个动作在现行口径下是"接下来写进去的
         是全零音频"（见 `pause_meeting`），一个补报请求要是顺手把它打开/关掉，
         用户那场会**当场多出或少掉一段空白**（而且是后台补传悄悄干的，事后查不出来）。
+        唯一会写的是这份**标注列表** `_state["pauses"]` 本身 —— 它是 `meta["pauses"]` 的内存
+        镜像，不同步就会在收尾时被旧快照覆盖回去（2026-10-17 真机 bug，见下面 `stop_meeting`）。
       * **幂等**：同一批区间重复上报不产生重复条目。判据 = **同一时刻只留一条**
         （`(from,to)` 归一到秒后逐字相同即同一件事），不靠序号/时间戳之类的"上报批次"。
       * **护栏**：`client_id` 与当前那场不符 → **拒绝且一个字节都不动**（与 `stop_meeting`
@@ -1510,6 +1544,12 @@ def add_meeting_pauses(pauses, client_id=""):
             db.add_log("info", "meeting",
                        "手机补报了 %d 条暂停区间（去重后新增 %d 条）"
                        % (len(good), len(added)))
+        # 内存那份也要跟着长（**只走 `_merge_pauses`**）：`meeting_status()` 用 `_state["pauses"]`
+        # 给手机画区间，而 `pause/resume/stop` 落盘时也拿它当"这一场记着的区间"。
+        # 不同步的话，这里刚写进盘里的区间会在**下一次任何落盘**时被内存那份覆盖回去 ——
+        # 2026-10-17 真机 bug 正是这条：接口 200、日志"补报了 1 条"，10 秒后 stop 又写成 `[]`。
+        # 只同步"标注列表"本身，不碰 `paused`/recorder/转写（补报不是再按一次静音）。
+        _state["pauses"] = _merge_pauses(_state.get("pauses") or [], meta.get("pauses") or [])
         out = _seg_result(True, "已记下 %d 条暂停区间（去重后新增 %d 条）" % (len(good), len(added)),
                           folder=folder, meta=meta, client_id=cid)
         out["pauses"] = list(meta.get("pauses") or [])
@@ -1661,6 +1701,13 @@ def start_meeting(origin=ORIGIN_PC):
                       started_at=meta["start"], error="", paused=False, pauses=[],
                       _pause_events=[],       # 同上：上一场的静音时刻不许粘过来
                       origin=meta["initiatedBy"],
+                      # 采集源必须**显式**重设成 pc（2026-10-17 真机挖出来的状态泄漏）：
+                      # 内存状态跨会议复用，上一场若是手机麦（`start_meeting_phone` 把它设成
+                      # "phone"），这里不写回来就会让**这一场电脑自己录的会**继续报
+                      # `source=phone` —— 面板据此显示"手机正在录音"并把「开始录音」按钮
+                      # **置灰**，而电脑其实正在录（用户连停都停不了）。
+                      # `meeting_status()` 的 `source` 是面板的唯一判据，所以它必须逐场重设。
+                      source="pc",
                       # 本机麦这条路**没有** clientId（补传只有手机那条路）——显式清掉，
                       # 免得上一场补传留下的 id 让 `stop(clientId=…)` 的护栏判错。
                       client_id="", meeting_id=meeting_id, seg_count=0)
@@ -1703,7 +1750,14 @@ def stop_meeting(client_id=""):
         # 停止时若还在暂停：把那个开着的暂停区间收尾（否则 meta 里会留一个没有 `to` 的区间，
         # 事后看不出"暂停到什么时候"）
         was_paused = bool(_state.get("paused"))
-        pauses = list(_state.get("pauses") or [])
+        meta_path = os.path.join(folder, "meta.json")
+        meta = _load_json(meta_path, {})
+        # ⚠️ 这里是**合并**，不是"拿内存那份覆盖盘上的"（2026-10-17 真机 bug 的修复点）。
+        # 手机补报的区间只落进 `meta`（补报不是"按了一次静音"，不碰 `_state["paused"]`），
+        # 旧写法 `meta["pauses"] = list(_state["pauses"])` 会把刚写进盘里的标注**静默抹掉**：
+        # 接口 200、日志写着"补报了 1 条"，收尾后的 meta 却是 `[]`（真机 21:28 那场就是这样）。
+        # 盘上那份是**已经收下的标注**，收尾只许往上加、不许丢。
+        pauses = _merge_pauses(meta.get("pauses") or [], _state.get("pauses") or [])
         # 手机麦那条路**没有 recorder**（音频是手机一段段传上来的）：跳过"释放麦克风"，
         # 直接进落盘/转写那一段 —— 下游（段列表/转写/压缩/纪要）两条路完全一样。
         if recorder is not None and not recorder.stop():
@@ -1715,8 +1769,6 @@ def stop_meeting(client_id=""):
                       # 留着它，下一场"没带 clientId 的 stop"就会拿旧 id 去比。
                       client_id="", meeting_id=0)
 
-        meta_path = os.path.join(folder, "meta.json")
-        meta = _load_json(meta_path, {})
         # 这场会议的发起方（`mobile` / `pc`）：**从 meta 读，不看"谁按了停止"** ——
         # 手机发起的那场，用户也可能在电脑面板上按停止，那仍然是手机的任务
         # （口径："手机侧发的任务，手机接受通知"）。读不到 = `pc`（不打扰手机）。

@@ -663,6 +663,10 @@ class MeetingMicService : Service() {
         )
         val started = s.start(MeetingDraftStore.newClientId(), MeetingDraftStore.isoOf(now))
         session = s
+        // **开录时读一次**段长（设置页那三个 15/30/60）：中途改偏好不会把已经在缓冲的那半段
+        // 切碎，界面文案也写着"改完下次开录生效"。这一份同时交给 runLoop 与状态，
+        // 于是"界面显示的本段进度"与"真正封段用的样本数"**永远是同一个段长**。
+        val segSeconds = segmentSeconds(this)
         // 上一场已经结束：把尾段缓冲清掉（`runLoop` 马上会换上这一场自己的那一个）
         captureTail = null
         wavSegments = 0
@@ -681,9 +685,13 @@ class MeetingMicService : Service() {
                 confirmedSegments = started.draft.confirmedSegments,
             ))).filter { it.isNotBlank() }.joinToString(" · "),
             startedAt = started.draft.startedAt,
+            // 界面要显示"本段 mm:ss / mm:ss"：段长就是**开录这一刻**读到的这一档
+            // （与 runLoop 里那一次必须同一个值，否则界面会按另一个段长报进度）
+            segmentSeconds = segSeconds,
         )
         notifyState()
-        job = scope.launch { runLoop() }
+        // 把**开录那一刻**交下去：累计时长与清单里的 `started_at` 必须是同一把尺子
+        job = scope.launch { runLoop(now, segSeconds) }
     }
 
     /**
@@ -732,7 +740,16 @@ class MeetingMicService : Service() {
         return notes.joinToString(" · ")
     }
 
-    private suspend fun runLoop() {
+    /**
+     * 采集循环。
+     *
+     * [startedAtMs] 是**开录那一刻**的挂钟（`startRecording` 里与清单的 `started_at` 用同一个值）
+     * —— 累计时长与清单里的时间轴必须是**同一把尺子**，否则界面上的计时会与会议实际时长对不上。
+     *
+     * [segSeconds] 是开录时读到的那一档段长（15/30/60）。**只读一次**：中途改设置不影响
+     * 正在录的这一场，而且界面上的"本段进度"用的是同一个数，不会出现两边各说一套。
+     */
+    private suspend fun runLoop(startedAtMs: Long, segSeconds: Int) {
         val minBuf = AudioRecord.getMinBufferSize(
             SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
         if (minBuf <= 0) return failAndStop("这台设备给不出可用的录音缓冲")
@@ -750,9 +767,8 @@ class MeetingMicService : Service() {
         record = ar
 
         val frame = ShortArray(FRAME_SAMPLES)
-        // 每段多长**读偏好**（设置页那三个 15/30/60）；开录时读一次，
-        // 中途改偏好不会把已经在缓冲的那半段切碎（界面文案写着"改完下次开录生效"）
-        val samplesPerSegment = SAMPLE_RATE * segmentSeconds(this)
+        // 段长由 `startRecording` 读好交下来（**只读一次**，见方法说明）
+        val samplesPerSegment = SAMPLE_RATE * segSeconds
         // 缓冲的容量按"装得下一整段"给（`ArrayList` 自己会增长，这个初值只是免掉几次扩容）；
         // 段长由硬件帧长整除（100ms 帧 vs 15/30/60 秒），所以一个缓冲里通常只有一段。
         val buffer = ArrayList<Short>(samplesPerSegment)
@@ -760,19 +776,27 @@ class MeetingMicService : Service() {
         // —— 不挂出去的话，"录 20 秒就结束"那 20 秒会跟着局部变量一起消失。
         captureTail = buffer
         val capture = MicCaptureLoop(samplesPerSegment)
+        // 这一场的**累计时长**（挂钟；纯逻辑在 [MeetingElapsed]）。
+        // 为什么它必须与"暂停"完全无关：暂停 = 照常录音、写全零，时间轴逐字连续、
+        // 总时长不受影响 —— 既然时间在走，界面上的计时就不能冻住（真机问题①）。
+        val elapsed = MeetingElapsed(clock = { System.currentTimeMillis() })
+        elapsed.start(startedAtMs)
         try {
             ar.startRecording()
             notifyState()
             while (currentCoroutineContext().isActive) {
                 val n = ar.read(frame, 0, frame.size)
+                // 读不到数据（被系统掐了一下、或刚起来）也要推进计时：这一格代表的是
+                // **挂钟**，不是"采到了多少"，所以它不能因为这一帧缺席而停住。
                 if (n <= 0) {
+                    _state.value = _state.value.copy(
+                        elapsedSeconds = elapsed.tick(),
+                        segmentElapsedSeconds = progressOf(buffer, SAMPLE_RATE),
+                    )
                     delay(20)
                     continue
                 }
                 val paused = _state.value.paused
-                // 电量条：暂停时**不动它**（上一帧的值留着往下走），而不是每 100ms 报一次 0
-                // —— 零帧也要照常计数/封段，但界面不必跟着抖。
-                if (!paused) _state.value = _state.value.copy(level = rms(frame, n))
                 // 采集语义全在这一句里（纯逻辑在 [MicCaptureLoop]）：暂停时它塞进去的是
                 // **与这一帧同长度、同格式的全零样本**，而"够一段就封段"那件事照样发生
                 // —— 所以段边界仍落在挂钟刻度上、总时长照常累计。
@@ -791,6 +815,20 @@ class MeetingMicService : Service() {
                     triggerOpportunisticUpload()
                     buffer.clear()
                 }
+                // ③ 这一帧的"事实"一次刷新：**累计时长（挂钟）** + 本段进度 + 电平。
+                //
+                // 为什么这三个要在**同一处**更新：界面的重组只由状态变化驱动，而暂停时
+                // 电平是**刻意不动**的（零帧不该让电平条抖）。旧版于是暂停期间一次都不重组
+                // → 计时冻住（真机问题①）。现在时长与本段进度每帧都变，界面就一直在刷新，
+                // 用户能看到"时间还在走、这一段还在攒" —— 也就不会再误判
+                // "恢复后不到一分钟就封了第一段"（其实那一段早就按挂钟攒满了，见 [MicCaptureLoop]）。
+                val cur = _state.value
+                _state.value = cur.copy(
+                    // 电平：暂停时保留上一帧的值（不每 100ms 报一次 0）
+                    level = if (paused) cur.level else rms(frame, n),
+                    elapsedSeconds = elapsed.tick(),
+                    segmentElapsedSeconds = progressOf(buffer, SAMPLE_RATE),
+                )
             }
         } catch (e: Exception) {
             _state.value = _state.value.copy(error = "采集出错：${e.message}")
@@ -809,9 +847,32 @@ class MeetingMicService : Service() {
      *  2. **这一段真的用了什么格式**：退回 WAV 时必须说"第 N 段用 WAV（FLAC 编码器不可用）"
      *     （用户 2026-10-17 点名要求），而编成 FLAC 时**什么都不说**（别用套话占住那一行）；
      *  3. **真的可能丢音频时以 error 优先**（"有一段缓存不下来"绝不能被"已缓存 3 段"盖掉）。
+     *
+     * [isTail] 只有"结束时补出来的那一段"（[sealFinalTail]）才为 true。它决定下面那条
+     * **段长判据**要不要生效 —— 见 [segmentLengthProblem] 的说明（"只有尾段允许不足一段"）。
      */
-    private fun publishSeal(seal: SegmentSeal) {
+    private fun publishSeal(seal: SegmentSeal, isTail: Boolean = false) {
         val prev = _state.value
+        // 段长判据（**正常封段**）：封下去的必须**正好是一个段长**。
+        //
+        // 为什么要在生产代码里也判一次：段是按**累计样本数**切的（暂停的零样本照常计数），
+        // 所以"封下来的每一段恰好是 samplesPerSegment 个样本"本应是恒等式。
+        // 一旦有人在采集/缓冲那里动了手脚（例如恢复时把缓冲清了、或者暂停期间丢帧），
+        // 这个恒等式就破了 —— 而破掉之后的症状**只在真机上**表现为"不到一个段长就封段了"，
+        // JVM 用例（如果只测纯函数）看不出来。所以这里在真机上也留一条响亮的日志。
+        // ⚠️ 唯一允许不足一段的是**结束时的尾段**（isTail = true）—— 用户明确要"录 20 秒就停
+        //    也不能丢那 20 秒"，那一段本来就短，不能按段长判。
+        if (!isTail && seal.error.isBlank()) {
+            val seg = seal.draft?.segments?.firstOrNull { it.seq == seal.seq }
+            if (seg != null) {
+                val problem = segmentLengthProblem(
+                    seq = seal.seq,
+                    seconds = seg.durationSeconds,
+                    segmentSeconds = prev.segmentSeconds,
+                )
+                if (problem.isNotBlank()) android.util.Log.e(TAG, problem)
+            }
+        }
         _state.value = prev.copy(
             syncPhase = OfflinePhase.RECORDING_LOCAL,
             syncPending = seal.draft?.pendingSegments ?: prev.syncPending,
@@ -906,7 +967,9 @@ class MeetingMicService : Service() {
             // （一按就停 / 立刻失败）才允许不建会 —— 而那时也必须如实说（见 stopNote）。
             val tail = sealFinalTail(s, tailBuffer?.toList().orEmpty(), SAMPLE_RATE)
             // 尾段也可能**退回 WAV** / **落盘失败**：走同一个如实发布（绝不谎报格式、绝不吞错误）
-            tail.seal?.let { publishSeal(it) }
+            // ⚠️ `isTail = true`：**只有这一段**允许不足一个段长（段长仍是用户设置，
+            //    这里只是把"结束时还差的那一点"补成一段，见 [sealFinalTail]）。
+            tail.seal?.let { publishSeal(it, isTail = true) }
             if (tail.note.isNotBlank()) android.util.Log.i(TAG, tail.note)
             if (tail.error.isNotBlank()) android.util.Log.e(TAG, tail.error)
             // 这一段的缓冲已经封走了：清掉引用，**重复收到 stop 也不会再封一次**
@@ -1133,6 +1196,88 @@ internal class MicCaptureLoop(
 }
 
 /**
+ * 这一场**已经录了多久**（挂钟，纯逻辑，JVM 逐条可测）。
+ *
+ * ## 为什么需要它（用户 2026-10-17 真机问题①："暂停时计时器也不刷新时间了"）
+ *
+ * 暂停的口径是**照常录音、写进去的是全零**（AGENTS.md「暂停语义（2026-10-16 深夜）」）：
+ * 时间轴逐字连续、**总时长不受影响**。既然时间在走，界面上的计时就必须跟着走 ——
+ * 而旧代码里界面的计时是"按当前挂钟算一次"的：界面的重组只由状态变化驱动，暂停时
+ * 电平是**刻意不刷新**的（零帧不该让电平条抖），于是整块界面在暂停期间一次都不重组，
+ * 计时看上去就冻住了。
+ *
+ * ## 为什么用"开始时刻 + 现在"而不是"累计采样数"
+ *
+ * 采样数在真机上会**少于**挂钟（麦克风被系统掐一下、编码占住采集协程都会丢帧）。
+ * 用户要看的是"这一场录了多久"，而会议的总时长（[MeetingRecordSession.finish] 里的
+ * `durationSeconds`）与清单里的 `started_at` 也是挂钟 —— **同一把尺子**，
+ * 用采样数算会让界面比会议短一截，反而制造新的"对不上"。
+ *
+ * ## 它与暂停无关（这条最容易改错）
+ *
+ * [tick] 由采集循环**每一帧**都调一次：暂停帧照常调、`ar.read` 没读到数据的那一帧也照常调。
+ * 所以"暂停期间计时停住"这件事在逻辑层就不可能发生，界面只是如实显示它。
+ */
+internal class MeetingElapsed(
+    private val clock: () -> Long = { System.currentTimeMillis() },
+) {
+    private var startedMs: Long? = null
+
+    /** 开录那一刻（与清单 `started_at` 是同一个时刻）。 */
+    fun start(atMs: Long = clock()) {
+        startedMs = atMs
+    }
+
+    /** 现在累计了多少秒（每帧调一次；**暂停也调**）。没开始过就是 0。 */
+    fun tick(nowMs: Long = clock()): Double {
+        val start = startedMs ?: return 0.0
+        return maxOf(0.0, (nowMs - start) / 1000.0)
+    }
+}
+
+/**
+ * 缓冲里已经攒了多少秒（"本段进度"那条线；纯函数，JVM 可测）。
+ *
+ * 为什么不夹到段长：调用方（界面）自己夹 —— 这里只是"缓冲里真的有多少"。
+ * 段边界由 [MicCaptureLoop] 按累计样本数决定，**暂停的零样本也算在内**，
+ * 所以这个进度在暂停期间照常增长（这正是要让用户看见的事实）。
+ */
+internal fun progressOf(buffer: List<Short>, sampleRate: Int): Double {
+    if (sampleRate <= 0 || buffer.isEmpty()) return 0.0
+    return buffer.size.toDouble() / sampleRate
+}
+
+/**
+ * **正常封段**（不是结束时的尾段）的段长判据：必须**正好是一个段长**。
+ *
+ * 为什么这是一条判据而不是一句注释：段是按**累计样本数**切的（暂停的零样本照常计数），
+ * 所以"每一段封下去都恰好是 `samplesPerSegment` 个样本"本应是恒等式。一旦有人在
+ * 采集/缓冲那里动了手脚（恢复时把缓冲清了、暂停期间丢帧、段长取错档），这个恒等式就破 ——
+ * 而症状只在**真机**上表现为"不到一个段长就封段了"（用户 2026-10-17 的问题②）。
+ *
+ * 唯一允许不足一段的是**结束时的尾段**（[sealFinalTail]）：用户要"录 20 秒就停也不能丢
+ * 那 20 秒"，那一段本来就短，所以调用方（[MeetingMicService.publishSeal]）只对非尾段判这一条。
+ *
+ * 返回空串 = 没问题（段长为 0 表示"还没读到设置"，那时不判 —— 不编一个假问题出来）。
+ */
+internal fun segmentLengthProblem(
+    seq: Int,
+    seconds: Double,
+    segmentSeconds: Int,
+    /** 允许的偏差（秒）：100ms 帧的量级，正常封段是**精确相等**，这里只留一点余量。 */
+    toleranceSeconds: Double = 0.25,
+): String {
+    if (segmentSeconds <= 0) return ""
+    // 时长读不出来（0 秒 = 清单里没有这一段）时不判：**不编一个假问题出来**
+    if (seconds <= 0.0) return ""
+    val want = segmentSeconds.toDouble()
+    if (kotlin.math.abs(seconds - want) <= toleranceSeconds) return ""
+    return "第 $seq 段只有 ${"%.2f".format(java.util.Locale.US, seconds)} 秒" +
+        "（段长设置 $segmentSeconds 秒）：正常封段必须刚好一个段长" +
+        "（暂停的零样本也算；只有结束时的尾段允许不足一段）"
+}
+
+/**
  * 通知里那一行字（**纯函数**，JVM 可测）。
  *
  * 为什么值得单独抽出来并有判据：这一行是"录音到底有没有丢东西"的**唯一**出口
@@ -1158,7 +1303,9 @@ internal fun notificationText(st: MicState): String = when {
     }
     // 有段没传上去 + 有真实原因（连不上 / 服务端拒绝）：先说它（那关系到音频会不会丢）
     st.syncPending > 0 && st.syncNote.isNotBlank() -> st.syncNote
-    st.paused -> "已静音（这段不会录进会议）"
+    // 暂停那句话说清两件事（用户 2026-10-17 的两个真机问题都出在这句话的语义上）：
+    // 内容不留在会议里 ✓，但**时间照常累计** ✓ —— 后者不写出来，用户就会以为"暂停把时长也停了"。
+    st.paused -> "已静音（这段写空白，时长仍在累计）"
     st.syncPending > 0 -> "本机录音中 · 已缓存 ${st.syncPending} 段 · 等联网上传"
     else -> "在录（手机麦克风）· 已传 ${st.sent} 段"
 }
@@ -1204,6 +1351,36 @@ data class MicState(
      * 所以大计时不会出现按哪个分支取值的分叉。
      */
     val startedAt: String = "",
+
+    // ---- 累计时长（用户 2026-10-17 真机问题①：暂停时计时器停了）----
+
+    /**
+     * 这一场**已经录了多久**（挂钟秒数，**暂停期间照样增长**）。
+     *
+     * 为什么它必须是状态里的一格、而不是"界面自己按当前时间算一次"：
+     * 界面的重组是由状态变化驱动的。旧版只有 `level` 会变（每 100ms 一次），而暂停时
+     * **电平是刻意不刷新的**（零帧不该让电平条抖），于是整块界面在暂停期间**一次都不重组**
+     * —— 用户看到的就是"按了静音，计时也停了"（真机原话）。
+     * 现在采集循环每来一帧（含暂停帧、含没读到数据的帧）都推进这一格，计时于是与暂停无关。
+     *
+     * 为什么暂停也要增长：暂停 = **照常录音、写进去的是全零**，时间轴逐字连续、
+     * 总时长不受影响（AGENTS.md「暂停语义（2026-10-16 深夜）」）；既然音频在累计、
+     * 会议总时长在累计，界面上的计时就**不能**冻住 —— 冻住会让用户误判"这段没算进时长"，
+     * 进而误判"才录了 40 秒就封段了"（真机问题②就是这么被看出来的）。
+     */
+    val elapsedSeconds: Double = 0.0,
+
+    /**
+     * 用户设置的一段多长（秒；15/30/60，开录那一刻读到的档）。
+     *
+     * 界面用它显示"本段 mm:ss / mm:ss" —— 段边界只由**累计样本数**决定，
+     * 让用户看见"这一段攒到哪儿了"，就不会再有"恢复后不到一分钟就封段了"的错觉
+     * （暂停期间零样本照常计数，所以本段进度在暂停时也照常走）。
+     */
+    val segmentSeconds: Int = 0,
+
+    /** 正在攒的这一段**已经攒了多久**（秒；暂停的零样本也算进去）。 */
+    val segmentElapsedSeconds: Double = 0.0,
 
     // ---- 段的格式（用户 2026-10-17 的第①件事：FLAC，编不出来退回 WAV）----
 

@@ -268,6 +268,28 @@ async function verifyMeetingState(wantActive, btn, after) {
   return false;
 }
 
+/* ---------------- 手机麦那一场：「录音中」不等于「这台电脑在录」----------------
+   2026-10-17 真机：手机按了「开始录音」，音频一段段传上来期间服务端**确实是 active**
+   —— 那是正常的（这场会还开着，等手机把段传完）。但电脑面板照着 `active` 翻成了
+   「录音中 / 停止录音」，用户看到的是"这台电脑在录"，而它**一支麦都没开**。
+
+   判据只用服务端 `meeting_status().source`（唯一真相，别在面板里自己猜）：
+     * `source=phone` + `active` → 手机在录/在传：**只提示，不冒充电脑录音**；
+     * `source=pc`    + `active` → 电脑自己在录：按钮照旧是「停止录音」（一个字不改）。
+
+   为什么电脑那颗「开始录音」按钮要**置灰**（而不是可点、点了让服务端拒）：
+   服务端只有**一条录音槽**，手机那场开着时点它必被拒（"会议录音已在进行中"），
+   更糟的是那颗变色的按钮会给人"再点一下电脑也能录"的错觉。置灰 + `title` 说清
+   "等手机那场结束/传完才能开新的"最不容易误解；服务端那条拒绝**仍然在**（双保险，
+   别的客户端/脚本点了照样会被如实拒绝）。 */
+const PHONE_MIC_BUTTON_TITLE =
+  "手机正在录这一场（不是这台电脑）。服务端只有一条录音槽：等手机结束/传完，才能开始新的一场";
+
+/** 这一场是不是"手机在录/在传"？`active` 只说明**这场会还开着**，不代表电脑在录音。 */
+function isPhoneMicMeeting(m) {
+  return !!(m && m.active && String(m.source || "pc").toLowerCase() === "phone");
+}
+
 /* ================= 视图切换 ================= */
 /* 页签清单：新加页签要同时在 index.html 里加
    <button class="tab" data-view="…"> 和 <section id="view-…">，否则 switchView 找不到容器。
@@ -1232,26 +1254,40 @@ async function refreshDashboard() {
     renderStartupNotes(st);                           // 启动期自愈留痕（只提示一次）
     maybeRefreshInstallNotice(st);                     // "还缺什么"横幅别停在旧结论上
     // 会议控制
+    // ⚠️ `meeting.active` 不等于"这台电脑在录音"：手机麦那条路（`source=phone`）在上传
+    // 段期间服务端也是 active（见 `isPhoneMicMeeting` 上面那段说明）。
+    const meeting = st.meeting || {};
+    const phoneMic = isPhoneMicMeeting(meeting);
+    const pcRecording = !!(meeting.active && !phoneMic);
     const mb = $("#meetingBadge");
-    mb.textContent = st.meeting.active ? "录音中" : "空闲";
-    mb.className = "badge " + (st.meeting.active ? "active" : "idle");
-    $("#meetingInfo").textContent = st.meeting.active
-      ? `正在录音：${st.meeting.folder}`
-      : (st.meeting.error ? `上次错误：${st.meeting.error}` : "未在录音");
+    mb.textContent = pcRecording ? "录音中" : (phoneMic ? "手机录音中" : "空闲");
+    mb.className = "badge " + (meeting.active ? "active" : "idle");
+    mb.title = phoneMic ? PHONE_MIC_BUTTON_TITLE : "";
+    $("#meetingInfo").textContent = pcRecording
+      ? `正在录音：${meeting.folder}`
+      : (phoneMic
+        ? `手机正在录音（不是这台电脑）：${meeting.folder || ""} · 传完才开始转写`
+        : (meeting.error ? `上次错误：${meeting.error}` : "未在录音"));
     // **正在开/停的时候不许改写按钮文案**：5 秒一次的状态轮询会把「正在停止…」抹回
     // 「停止录音」，用户又变成"看不出点没点上"—— 那正是这次要修的体验。
     if (!_meetingActionPending) {
-      $("#btnMeeting").textContent = st.meeting.active ? "停止录音" : "开始录音";
-      $("#btnMeeting").className = "btn big " + (st.meeting.active ? "danger" : "");
+      $("#btnMeeting").textContent = pcRecording ? "停止录音" : "开始录音";
+      $("#btnMeeting").className = "btn big " + (pcRecording ? "danger" : "");
+      // 手机那一场：**不许**变成"录制中/停止录音"，只置灰并说明原因（见上面那段注释）
+      $("#btnMeeting").disabled = phoneMic;
+      $("#btnMeeting").title = phoneMic ? PHONE_MIC_BUTTON_TITLE
+        : (pcRecording ? "停止录音并开始转写" : "开始会议录音");
     }
     // 录音中：显示麦克风电平波动
     // 语音命令收音阶段（busyPhase=listening）同样显示波形 —— 后端复用录音器的电平回调，不开新采样流
     const micLevel = $("#micLevel");
     const cmdLevel = $("#cmdLevel");
     const listening = !!(st.busy && st.busyPhase === "listening");
-    if (micLevel) micLevel.classList.toggle("hidden", !st.meeting.active);
+    // 波形只跟**电脑自己那支麦**走：手机那一场没有本地录音流（电平恒为 0），
+    // 照旧显示就是"这台电脑在录"的第二个假象。
+    if (micLevel) micLevel.classList.toggle("hidden", !pcRecording);
     if (cmdLevel) cmdLevel.classList.toggle("hidden", !listening);
-    if (st.meeting.active || listening) {
+    if (pcRecording || listening) {
       if (!_levelTimer) {
         _levelTimer = setInterval(async () => {
           try {
@@ -1308,6 +1344,11 @@ function fmtUptime(s, compact) {
 function liveState(st) {
   if (!st) return { text: "ECHO 离线", cls: "error", tip: "读不到 /api/status：ECHO 服务可能正在重启" };
   if (st.meeting && st.meeting.active) {
+    // 手机麦那一场：会还开着、但**不是这台电脑在录**（`isPhoneMicMeeting`）
+    if (isPhoneMicMeeting(st.meeting)) {
+      return { text: "手机录音中", cls: "active",
+               tip: "手机正在录音（不是这台电脑）" + (st.meeting.folder ? `：${st.meeting.folder}` : "") };
+    }
     return { text: "录音中", cls: "active", tip: "正在会议录音" + (st.meeting.folder ? `：${st.meeting.folder}` : "") };
   }
   if (st.busy) {
@@ -6118,22 +6159,30 @@ function openMeetingDetail(id, tab) {
 }
 
 /* 会议列表页的录音按钮：必须跟随录音状态（用户 2026-09-12 反馈——开始录音后点"全部 ›"
-   进会议列表，按钮还显示"开始录音"，点了只会重复调 start）。 */
-function renderMeetingListBtn(active) {
+   进会议列表，按钮还显示"开始录音"，点了只会重复调 start）。
+   2026-10-17：`active` **不等于**"这台电脑在录"—— 手机麦那一场（`source=phone`）在传段
+   期间也是 active，这时按钮同样**不许**变成「停止录音」，只置灰 + 说明原因
+   （判据与仪表盘那颗同一个 `isPhoneMicMeeting`）。 */
+function renderMeetingListBtn(active, source) {
   const btn = $("#btnMeetingFromList");
   if (!btn) return;
-  btn.dataset.active = active ? "1" : "0";
+  const phoneMic = isPhoneMicMeeting({ active: active, source: source });
+  const pcRecording = !!(active && !phoneMic);
+  btn.dataset.active = pcRecording ? "1" : "0";
   if (_meetingActionPending) return;   // 正在开/停：别把「正在停止…」抹回（同 refreshDashboard）
-  btn.textContent = active ? "停止录音" : "开始录音";
-  btn.className = "btn" + (active ? " danger" : "");
-  btn.title = active ? "停止录音并开始转写" : "开始会议录音";
+  btn.textContent = pcRecording ? "停止录音" : "开始录音";
+  btn.className = "btn" + (pcRecording ? " danger" : "");
+  btn.title = phoneMic ? PHONE_MIC_BUTTON_TITLE
+    : (pcRecording ? "停止录音并开始转写" : "开始会议录音");
+  btn.disabled = phoneMic;
 }
 
 /** 只读轻量状态（/api/meeting/status），用于列表页按钮与标题跟随录音状态。 */
 async function refreshMeetingHeader() {
   try {
     const st = await api("/api/meeting/status");
-    renderMeetingListBtn(!!st.active);
+    // `source` 要与 `active` 一起传：只看 active 就会把手机那场画成"电脑在录"
+    renderMeetingListBtn(!!st.active, st.source);
   } catch (e) { /* 面板/服务可能正在重连，忽略 */ }
 }
 

@@ -43,6 +43,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.echo.contact.service.OfflinePhase
 import com.echo.contact.ui.theme.EchoPalette
+import kotlinx.coroutines.delay
 import kotlin.math.abs
 import kotlin.math.max
 
@@ -101,6 +102,22 @@ fun MeetingRecordingScreen(vm: MainViewModel) {
     val paused = mic.paused
     val accent = if (paused) EchoPalette.Yellow else EchoPalette.Red
 
+    // 计时**每一秒重算一次**（用户 2026-10-17 真机问题①："暂停时计时器也不刷新时间了"）。
+    //
+    // 为什么不能只靠 `mic` 的状态变化：Compose 只在**状态变了**才重组，而暂停时电平是
+    // **刻意不刷新**的（零帧不该让电平条抖）。旧版界面唯一的每 100ms 变化就是电平 ——
+    // 于是暂停期间整块界面一次都不重组，计时看上去就冻住了（事实是时间在走、音频在累计）。
+    // 两道保障：录制循环现在每帧推进 `mic.elapsedSeconds`（挂钟，暂停也推进），
+    // 这里再加一道**每秒节拍**兜底 —— 万一某一帧没来（麦克风被系统掐一下），计时也不许停。
+    var nowTick by remember { mutableStateOf(System.currentTimeMillis()) }
+    LaunchedEffect(mic.active) {
+        if (!mic.active) return@LaunchedEffect
+        while (true) {
+            nowTick = System.currentTimeMillis()
+            delay(1_000)
+        }
+    }
+
     Surface(modifier = Modifier.fillMaxSize(), color = EchoPalette.Bg) {
         Column(
             modifier = Modifier.fillMaxSize().padding(20.dp),
@@ -110,7 +127,8 @@ fun MeetingRecordingScreen(vm: MainViewModel) {
                 TextButton(onClick = { vm.closeRecordingScreen() }) { Text("← 返回（继续录）") }
                 Spacer(Modifier.weight(1f))
                 Text(
-                    if (paused) "已暂停" else "录音中",
+                    // 暂停时也要把"时长还在累计"说在标题上 —— 只写"已暂停"会让人以为时间也停了
+                    if (paused) "已暂停 · 时长仍在累计" else "录音中",
                     style = MaterialTheme.typography.titleMedium,
                     color = accent,
                     fontWeight = FontWeight.SemiBold,
@@ -119,13 +137,21 @@ fun MeetingRecordingScreen(vm: MainViewModel) {
 
             Spacer(Modifier.height(18.dp))
 
-            // ---- 大计时 ----
+            // ---- 大计时：**挂钟**（从开始到现在，含暂停那一段）----
             // 开始时间永远是**手机自己记的**（这条路上没有"电脑给了开始时间才有值"那一档）。
             Text(
-                elapsedText(mic.startedAt),
+                elapsedLabel(mic.elapsedSeconds, mic.startedAt, nowTick),
                 style = MaterialTheme.typography.displaySmall,
                 fontWeight = FontWeight.Light,
             )
+            // 本段进度：段边界只由**累计样本数**决定（暂停的零样本也照常计数），
+            // 把"这一段攒到哪儿了"摆出来，就不会再有"恢复后不到一分钟就封段了"的错觉
+            // —— 那一段其实在暂停期间就已经按挂钟攒满了（用户 2026-10-17 真机问题②）。
+            segmentProgressText(mic.segmentElapsedSeconds, mic.segmentSeconds)
+                .takeIf { it.isNotBlank() }?.let {
+                    Spacer(Modifier.height(2.dp))
+                    MutedLine(it, maxLines = 1)
+                }
             Spacer(Modifier.height(4.dp))
             MutedLine(
                 buildString {
@@ -199,7 +225,7 @@ fun MeetingRecordingScreen(vm: MainViewModel) {
                     }
                 }
                 if (paused) {
-                    Text("已静音 —— 这段时间不会录进会议", color = EchoPalette.Yellow,
+                    Text("已静音 · 这段写空白，时长照常累计", color = EchoPalette.Yellow,
                         style = MaterialTheme.typography.bodyMedium)
                 }
             }
@@ -207,7 +233,10 @@ fun MeetingRecordingScreen(vm: MainViewModel) {
             Spacer(Modifier.height(10.dp))
             MutedLine(
                 when {
-                    paused -> "恢复后接着录；暂停这段是空白，会议详情里能看到暂停区间"
+                    // 暂停时把**三件事**说清（2026-10-17 的两个真机问题都在这一句里）：
+                    // 内容是空白 ✓、时长照常累计 ✓、段也照常在封 ✓（所以恢复后可能马上就封一段，
+                    // 那一小段是暂停期间按挂钟攒满的，不是"提前封"）。
+                    paused -> "已暂停：这段写空白，时长照常累计、段照常在封；恢复后接着录"
                     // 这条路永远是"先落本地、再顺手传"：说清这一点（**不**说"离线"，
                     // 因为在线时也一样先落本地 —— 用户 2026-10-17 的原话是"没有本质区别"）
                     else -> "声音来自**这台手机的麦克风**：每一段先存在手机里，" +
@@ -319,14 +348,61 @@ internal fun barColor(level: Float, weight: Float): Color {
 internal fun elapsedText(startedAt: String?, now: Long = System.currentTimeMillis()): String {
     val s = startedAt?.trim().orEmpty()
     if (s.isEmpty()) return "--:--"
-    val startMs = try {
-        java.time.LocalDateTime.parse(s).atZone(java.time.ZoneId.systemDefault()).toInstant().toEpochMilli()
-    } catch (e: Exception) {
-        return "--:--"
-    }
-    val secs = max(0L, (now - startMs) / 1000)
+    val startMs = epochOfLocal(s) ?: return "--:--"
+    return elapsedTextOf(max(0L, (now - startMs) / 1000).toDouble())
+}
+
+/**
+ * 秒数 → `mm:ss` / `h:mm:ss`（**唯一**的格式化处：`elapsedText`、大计时与本段进度都走它）。
+ *
+ * 为什么抽出来：计时原来只有一个入口（按开始时间 + 当前时刻算一次），而这一版还有两个
+ * 来源 —— 录制循环报上来的**挂钟秒数**（`MicState.elapsedSeconds`）与本段进度。
+ * 三处各写一遍格式，迟早会出现"大计时 01:05、本段 1:05"这种同屏不一致。
+ */
+internal fun elapsedTextOf(seconds: Double): String {
+    val secs = max(0L, seconds.toLong())
     val h = secs / 3600
     val m = (secs % 3600) / 60
     val ss = secs % 60
     return if (h > 0) String.format("%d:%02d:%02d", h, m, ss) else String.format("%02d:%02d", m, ss)
+}
+
+/**
+ * 界面上该显示的**累计时长**（用户 2026-10-17 真机问题①）。
+ *
+ * 取两个**挂钟**来源里较大的那个：
+ *  1. `stateSeconds`：录制循环每帧推进的秒数（暂停帧、没读到数据的帧也推进）；
+ *  2. 从 `startedAt` 到此刻的秒数：界面自己每秒节拍的兜底。
+ *
+ * 两者都是"从开录那一刻到现在的挂钟"，所以不会互相矛盾；取大只是为了让
+ * "某一帧没来"时显示不会往回跳。读不懂 `startedAt` 时**不编 00:00**：
+ * 只有录制循环真的报过秒数才用它，否则仍然是 `--:--`。
+ */
+internal fun elapsedLabel(stateSeconds: Double, startedAt: String?, now: Long): String {
+    val s = startedAt?.trim().orEmpty()
+    val startMs = if (s.isEmpty()) null else epochOfLocal(s)
+    if (startMs == null) return if (stateSeconds > 0.0) elapsedTextOf(stateSeconds) else "--:--"
+    val byClock = max(0.0, (now - startMs) / 1000.0)
+    return elapsedTextOf(max(max(0.0, stateSeconds), byClock))
+}
+
+/**
+ * "本段 00:12 / 00:30"（段长未知时回空串 —— **不编数字**）。
+ *
+ * 为什么要在界面上显示它：段是按累计样本数切的（暂停的零样本照常计数），所以
+ * **暂停期间这一段也在攒**。用户看不到这件事时，恢复后立刻封一段就会被当成
+ * "不到一分钟就封段了"（真机问题②）；把它摆出来，"这一段是暂停期间按挂钟攒满的"就一目了然。
+ */
+internal fun segmentProgressText(segmentElapsedSeconds: Double, segmentSeconds: Int): String {
+    if (segmentSeconds <= 0) return ""
+    val of = segmentElapsedSeconds.coerceIn(0.0, segmentSeconds.toDouble())
+    return "本段 ${elapsedTextOf(of)} / ${elapsedTextOf(segmentSeconds.toDouble())}"
+}
+
+/** ISO 本地时间 → epoch 毫秒（读不懂回 null，**绝不猜**）。 */
+private fun epochOfLocal(iso: String): Long? = try {
+    java.time.LocalDateTime.parse(iso).atZone(java.time.ZoneId.systemDefault())
+        .toInstant().toEpochMilli()
+} catch (e: Exception) {
+    null
 }
