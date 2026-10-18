@@ -32,6 +32,9 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
@@ -52,6 +55,76 @@ internal const val REVIEW_HISTORY_TITLE = "历史回顾"
 
 /** 历史为空时的空状态文案（用户 2026-10-18：不许退成一整页纯列表，也不能空着不说）。 */
 internal const val REVIEW_HISTORY_EMPTY = "还没有回顾历史。口述一次今天，这里就会出现第一天。"
+
+/**
+ * 开不了麦时那句人话（回顾口述这条路**一个字都没开始**）。
+ *
+ * 为什么写在回顾页自己这里：`startRecording()` 失败时只把原因写进 `_speakNote`
+ * （`MainViewModel.kt` 的注释自己就说了"以前只写 `_speakNote`，而没有任何界面读它"），
+ * 回顾页又把它的返回值丢了 → 用户点「车里口述」看到的是**完全没反应**。
+ * 现在这里检查返回值并就地显示（2026-10-18 复查）。
+ */
+internal const val REVIEW_MIC_BLOCKED =
+    "开不了麦克风（可能被别的应用占着，或权限没给）：这次没开始录"
+
+/**
+ * 某一天没有回顾记录时的说明。
+ *
+ * 空页也要告诉用户下一步点哪儿 —— 只写"没有记录"等于把人晾在那儿。
+ */
+internal const val REVIEW_DAY_EMPTY =
+    "这一天没有回顾记录。若是今天：返回后点「车里口述」录一段，第一条就会出现在这里。"
+
+/** 点「今日回顾」会发生什么（纯数据；判据见 `ReviewEntryActionsTest`）。 */
+internal sealed interface ReviewTodayTap {
+    /** 打开今天的详情（真的会发一次 `GET /api/daily-review/history/{date}` 并进详情页）。 */
+    data class OpenDay(val date: String) : ReviewTodayTap
+
+    /** 今天还没有回顾 / 状态还没读到：**不装样子**，就地给一句可操作的话。 */
+    data class Note(val message: String) : ReviewTodayTap
+}
+
+/**
+ * 「今日回顾」卡点下去该做什么。
+ *
+ * 为什么要有这个函数（2026-10-18 复查）：这张卡原来点下去只是
+ * `loadReview() + loadReviewDays()` —— 也就是**把状态重新拉一遍**，屏幕上什么都不变。
+ * 对一个"功能卡"来说那等于**空壳按钮**（用户看不到任何反应）。现在：
+ *   * 状态读到了、今天有轮次 → 打开今天的详情（看今天到底说了什么、播报了什么）；
+ *   * 今天还没有 / 还没读到 → 如实说一句，并顺手刷新一次状态。
+ */
+internal fun reviewTodayTap(
+    today: String,
+    summaryLoaded: Boolean,
+    todayTurns: Int,
+): ReviewTodayTap = when {
+    !summaryLoaded || today.isBlank() ->
+        ReviewTodayTap.Note("还没读到今天的回顾状态：先点「刷新」，或检查与电脑的连接")
+    todayTurns <= 0 ->
+        ReviewTodayTap.Note("今天还没有回顾：点「车里口述」录一段，第一条就会出现在这里")
+    else -> ReviewTodayTap.OpenDay(today)
+}
+
+/**
+ * 某天详情页的副标题。
+ *
+ * **刻意不说"已写入工作日志"**：接口只能给"当天那个文件在不在"（`vaultNoteExists`），
+ * 那不证明**这一轮**被写进去了 —— 那天的日志可能只是会议归档/手动记录建的。
+ * 把"文件在"说成"这一轮已写入"就是一次假成功（2026-10-18 复查改的口径）。
+ */
+internal fun reviewDaySubtitle(count: Int, vaultNoteExists: Boolean): String =
+    "$count 轮 · " + if (vaultNoteExists) "当天工作日志已存在" else "当天工作日志还没生成"
+
+/**
+ * 某一轮的"登记核实"提示（`turns[].registered`，服务端比的当天日志指纹）。
+ *
+ * `null` = 老记录（那时还没有这条核实）→ **不猜、不说话**；`true` 也不炫耀
+ * （"检测到日志变了"不等于"这一轮的内容写对了"）；`false` 才必须说。
+ */
+internal fun reviewTurnRegistryNote(registered: Boolean?): String =
+    if (registered == false) "这一轮没检测到工作日志更新（技能可能没装，或这次没有可登记的内容）"
+    else ""
+
 
 /**
  * 回顾页顶部的功能卡（**纯数据**，JVM 可测）。
@@ -76,6 +149,13 @@ internal data class ReviewFeatureTile(
  *
  * `enabled=false` 只出现在"没有可念的播报"那一档：界面把它**置灰 + 写清原因**
  * （不是藏起来 —— 藏起来用户会以为功能没了）。
+ *
+ * @param todayFailed    今天**失败**的轮数（`todayTurns` 把失败的也算进去了）。
+ *   不分开说就是"今天已回顾 3 轮"这种假繁荣：真实库里 2026-10-14 那天两轮**全失败**，
+ *   卡片却会说"已回顾 2 轮"。
+ * @param summaryLoaded  `GET /api/daily-review/summary` 到底读到了没有。
+ *   读失败时 `todayTurns`/`hasBrief` 都是默认的 0/空 —— 那不是"没有回顾"，
+ *   是"没读到"；说成"还没有可念的播报"同样是假成功（2026-10-18 复查）。
  */
 internal fun reviewFeatureTiles(
     running: Boolean,
@@ -84,6 +164,8 @@ internal fun reviewFeatureTiles(
     todayTurns: Int,
     hasBrief: Boolean,
     speaking: Boolean,
+    todayFailed: Int = 0,
+    summaryLoaded: Boolean = true,
 ): List<ReviewFeatureTile> = listOf(
     ReviewFeatureTile(
         feature = ReviewFeature.TODAY,
@@ -91,10 +173,12 @@ internal fun reviewFeatureTiles(
             running -> "进行中"
             !enabled -> "未启用"
             !ready -> "未就绪"
+            !summaryLoaded -> "还没读到今天的状态"
+            todayTurns > 0 && todayFailed > 0 -> "今天已回顾 $todayTurns 轮（$todayFailed 轮失败）"
             todayTurns > 0 -> "今天已回顾 $todayTurns 轮"
             else -> "今天还没回顾"
         },
-        // 点它 = 重读状态（这个动作永远有意义，不置灰）
+        // 点它 = 看今天的详情（有轮次）或如实说一句（没有/没读到），见 reviewTodayTap
         enabled = true,
     ),
     ReviewFeatureTile(
@@ -104,7 +188,11 @@ internal fun reviewFeatureTiles(
     ),
     ReviewFeatureTile(
         feature = ReviewFeature.SPEAK,
-        subtitle = if (hasBrief) "念今天 / 最近一次的播报" else "还没有可念的播报",
+        subtitle = when {
+            hasBrief -> "念今天 / 最近一次的播报"
+            !summaryLoaded -> "还没读到播报（点「刷新」）"
+            else -> "还没有可念的播报"
+        },
         enabled = hasBrief && !speaking,
     ),
 )
@@ -141,16 +229,31 @@ fun ReviewTab(vm: MainViewModel) {
     val submitting by vm.reviewSubmitting.collectAsState()
     val submittingNote by vm.reviewSubmittingNote.collectAsState()
     val voiceText by vm.voiceText.collectAsState()
+    // 朗读那条路的说明（没装 TTS / 没有可念的播报 / 取不到当天详情）以前写在
+    // `_speakNote` 里而**全 App 没有界面读它** → 按「播报」没声音也没提示。
+    // 这里把它显示出来（`speak()` 每次开口前会清空，所以不会挂着过期的失败原因）。
+    val speakNote by vm.speakNote.collectAsState()
+
+    // 这一页**自己**的两句反馈（不改 ViewModel 的状态机）：
+    //  · 点「今日回顾」但今天没有/没读到 → 那句话就在这儿；
+    //  · 点「车里口述」但麦开不了 → 原因也在这儿（以前是被丢掉的返回值）。
+    var localNote by remember { mutableStateOf<String?>(null) }
 
     val context = LocalContext.current
     val permissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
-    ) { granted -> if (granted) vm.startRecording() }
+    ) { granted ->
+        if (granted) {
+            // 授权拿到也可能开不了麦（被别的应用占着）：返回值必须看
+            if (!vm.startRecording()) localNote = REVIEW_MIC_BLOCKED else localNote = null
+        }
+    }
 
     if (day != null) {
         ReviewDayView(
             detail = day!!,
             speaking = speaking,
+            speakNote = speakNote,
             onSpeak = { vm.speakReviewDay(day!!.date) },
             onSpeakText = { vm.speak(it) },
             onBack = { vm.closeReviewDay() },
@@ -166,14 +269,21 @@ fun ReviewTab(vm: MainViewModel) {
         todayTurns = summary?.todayTurns ?: 0,
         hasBrief = !summary?.lastBrief.isNullOrBlank(),
         speaking = speaking,
+        todayFailed = summary?.todayFailed ?: 0,
+        summaryLoaded = summary != null,
     )
     val orderedDays = reviewDaysDescending(days)
 
-    // 口述：没授权就先要（与「指令」页同一套做法），授权成功再开始
+    // 口述：没授权就先要（与「指令」页同一套做法），授权成功再开始。
+    // **返回值要判**：`startRecording()` 返回 false = 麦打不开，这一次什么都没开始。
     val startDictation: () -> Unit = {
         val granted = context.checkSelfPermission(Manifest.permission.RECORD_AUDIO) ==
             PackageManager.PERMISSION_GRANTED
-        if (granted) vm.startRecording() else permissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+        if (granted) {
+            if (!vm.startRecording()) localNote = REVIEW_MIC_BLOCKED else localNote = null
+        } else {
+            permissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+        }
     }
 
     LazyColumn(
@@ -196,10 +306,24 @@ fun ReviewTab(vm: MainViewModel) {
                         modifier = Modifier.weight(1f).height(104.dp),
                         onClick = {
                             when (tile.feature) {
-                                // 重读状态与历史（现有动作，不新造）
-                                ReviewFeature.TODAY -> {
-                                    vm.loadReview()
-                                    vm.loadReviewDays()
+                                // 今日回顾：有轮次就**打开今天的详情**（真的发一次请求），
+                                // 没有/没读到就如实说一句 —— 不再只是"重新拉一次状态"。
+                                ReviewFeature.TODAY -> when (
+                                    val tap = reviewTodayTap(
+                                        today = summary?.today.orEmpty(),
+                                        summaryLoaded = summary != null,
+                                        todayTurns = summary?.todayTurns ?: 0,
+                                    )
+                                ) {
+                                    is ReviewTodayTap.OpenDay -> {
+                                        localNote = null
+                                        vm.openReviewDay(tap.date)
+                                    }
+                                    is ReviewTodayTap.Note -> {
+                                        localNote = tap.message
+                                        vm.loadReview()
+                                        vm.loadReviewDays()
+                                    }
                                 }
                                 ReviewFeature.DICTATE -> startDictation()
                                 ReviewFeature.SPEAK -> vm.speakReview()
@@ -210,12 +334,18 @@ fun ReviewTab(vm: MainViewModel) {
             }
         }
 
+        // 上面那句"点了但没发生任何事"的说明（今天没轮次 / 麦开不了）
+        localNote?.takeIf { it.isNotBlank() }?.let {
+            item { MutedLine(it, color = EchoPalette.Yellow, maxLines = 3) }
+        }
+
         // ---- 今日回顾详情：最近一次播报 + 念 / 刷新 / 停 ----
         item {
             ReviewStatusCard(
                 review = review,
                 summary = summary,
                 note = note,
+                speakNote = speakNote,
                 speaking = speaking,
                 onSpeak = { vm.speakReview() },
                 onRefresh = {
@@ -392,6 +522,7 @@ private fun ReviewStatusCard(
     review: DailyReviewState?,
     summary: DailyReviewSummary?,
     note: String?,
+    speakNote: String?,
     speaking: Boolean,
     onSpeak: () -> Unit,
     onRefresh: () -> Unit,
@@ -402,10 +533,13 @@ private fun ReviewStatusCard(
     val enabled = review?.enabled == true
     val ready = review?.ready == true
     val turns = summary?.todayTurns ?: 0
+    val failed = summary?.todayFailed ?: 0
     val (label, color) = when {
         running -> "进行中" to EchoPalette.Purple
         !enabled -> "未启用" to EchoPalette.Muted
         !ready -> "未就绪" to EchoPalette.Yellow
+        // 失败轮也算在 `todayTurns` 里：不分开说就是"今天已回顾 N 轮"的假繁荣
+        turns > 0 && failed > 0 -> "今天已回顾 $turns 轮（$failed 轮失败）" to EchoPalette.Yellow
         turns > 0 -> "今天已回顾 $turns 轮" to EchoPalette.Green
         else -> "今天还没回顾" to EchoPalette.Muted
     }
@@ -432,11 +566,22 @@ private fun ReviewStatusCard(
             } else if (summary != null) {
                 Spacer(Modifier.height(6.dp))
                 MutedLine("还没有回顾记录。")
+            } else {
+                // 读不到摘要 ≠ 没有回顾：这两件事以前都显示成"还没有回顾记录"
+                Spacer(Modifier.height(6.dp))
+                MutedLine("还没读到回顾状态（点「刷新」或检查与电脑的连接）", color = EchoPalette.Yellow)
             }
 
             note?.let {
                 Spacer(Modifier.height(4.dp))
                 MutedLine(it, color = EchoPalette.Yellow)
+            }
+
+            // 朗读那条路的说明：没有它，"念"没出声时用户看到的是"点了没反应"
+            // （系统 TTS 没装 / 缺中文数据 / ECHO 合成失败 / 没有可念的播报都会走到这里）
+            speakNote?.takeIf { it.isNotBlank() }?.let {
+                Spacer(Modifier.height(4.dp))
+                MutedLine(it, color = EchoPalette.Yellow, maxLines = 4)
             }
 
             Spacer(Modifier.height(8.dp))
@@ -465,6 +610,7 @@ private fun ReviewStatusCard(
 private fun ReviewDayView(
     detail: ReviewHistoryDetail,
     speaking: Boolean,
+    speakNote: String?,
     onSpeak: () -> Unit,
     onSpeakText: (String) -> Unit,
     onBack: () -> Unit,
@@ -474,16 +620,31 @@ private fun ReviewDayView(
             IconButton(onClick = onBack) { Icon(Icons.Default.ArrowBack, contentDescription = "返回") }
             Column(modifier = Modifier.weight(1f)) {
                 Text(detail.date, style = MaterialTheme.typography.titleMedium)
-                MutedLine("${detail.count} 轮" + if (detail.vaultNoteExists) " · 已写入工作日志" else "")
+                // 不说"已写入工作日志"：`vaultNoteExists` 只说明那天的文件在（见 reviewDaySubtitle）
+                MutedLine(reviewDaySubtitle(detail.count, detail.vaultNoteExists))
             }
-            IconButton(onClick = onSpeak, enabled = !speaking) {
+            IconButton(onClick = onSpeak, enabled = detail.ok && !speaking) {
                 Icon(Icons.Default.VolumeUp, contentDescription = "念这天的播报")
             }
         }
 
+        // 服务端明确回了 ok=false（坏日期 / 读不到）时**如实说**，别画成"这天没有记录"
+        if (!detail.ok) {
+            Spacer(Modifier.height(8.dp))
+            MutedLine(detail.error.ifBlank { "读不到这一天的回顾（服务端没给原因）" },
+                color = EchoPalette.Red, maxLines = 3)
+            return
+        }
+
+        // 朗读那条路的说明（没有它，"念"不出声时就是"点了没反应"）
+        speakNote?.takeIf { it.isNotBlank() }?.let {
+            Spacer(Modifier.height(6.dp))
+            MutedLine(it, color = EchoPalette.Yellow, maxLines = 3)
+        }
+
         Spacer(Modifier.height(8.dp))
         if (detail.turns.isEmpty()) {
-            MutedLine("这一天没有回顾记录。")
+            MutedLine(REVIEW_DAY_EMPTY)
             return
         }
         LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -515,6 +676,12 @@ private fun ReviewDayView(
                         if (t.error.isNotBlank()) {
                             Spacer(Modifier.height(4.dp))
                             MutedLine(t.error, color = EchoPalette.Red)
+                        }
+                        // 登记核实（服务端比的当天日志指纹）：没写进去就**说清楚**，
+                        // 别让"整理完成"顶替"已登记"。
+                        reviewTurnRegistryNote(t.registered).takeIf { it.isNotBlank() }?.let {
+                            Spacer(Modifier.height(4.dp))
+                            MutedLine(it, color = EchoPalette.Yellow, maxLines = 3)
                         }
                         if (t.text.isNotBlank()) {
                             Spacer(Modifier.height(4.dp))

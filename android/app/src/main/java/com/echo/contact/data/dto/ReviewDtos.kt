@@ -6,7 +6,8 @@ import com.google.gson.annotations.SerializedName
  * 每日回顾相关 DTO。字段名照**活着的后端实测**（2026-10-09 抓的），不是照面板猜的：
  *  - `GET /api/daily-review`         → `{enabled, ready, reason, agent, workspace, vault, kind, sessionId, running}`
  *  - `GET /api/daily-review/summary` → `{today, todayTurns, todayFailed, lastAt, lastBrief, lastStatus, lastText}`
- *  - `GET /api/daily-review/history/{date}` → `{ok, date, turns:[{id, at, text, reply, brief, status, error, seconds, sessionId}], count, vault, vaultNote, vaultNoteExists}`
+ *  - `GET /api/daily-review/history/{date}` → `{ok, date, turns:[{id, at, text, reply, brief, status, error, seconds, sessionId, registered}], count, vault, vaultNote, vaultNoteExists[, error]}`
+ *    （`error` 只在 `ok=false` 时出现；`registered` 是 2026-10-18 加的登记核实，老记录为缺省）
  *  - `GET /api/daily-review/history?limit=` → `{items:[{date, turns, failed, lastAt, brief, sessionId}], total, today}`
  */
 
@@ -48,6 +49,13 @@ data class ReviewTurn(
     val error: String = "",
     val seconds: Double = 0.0,
     @SerializedName("sessionId") val sessionId: String = "",
+    /**
+     * 这一轮有没有**真的**写进笔记库的工作日志（服务端比的当天日志指纹，2026-10-18 加）。
+     *
+     * `null` = 老记录（那时还没有这条核实）—— 界面**不许**据此说任何话；
+     * `false` = 服务端明确没检测到日志更新，界面要说清（否则"整理完成"会被当成"已登记"）。
+     */
+    val registered: Boolean? = null,
 )
 
 /** 某一天的回顾详情。 */
@@ -59,6 +67,13 @@ data class ReviewHistoryDetail(
     val vault: String = "",
     @SerializedName("vaultNote") val vaultNote: String? = null,
     @SerializedName("vaultNoteExists") val vaultNoteExists: Boolean = false,
+    /**
+     * 服务端如实给的失败原因（坏日期等）。
+     *
+     * 为什么必须有这个字段：`ok=false` 时 HTTP 仍是 **200**，而界面以前只判
+     * `isSuccessful` → 点开一个坏日期会画成"这一天没有回顾记录"（假空态）。
+     */
+    val error: String = "",
 )
 
 /** 回顾历史里的一天（`GET /api/daily-review/history` 的 `items[]`）。 */

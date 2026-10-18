@@ -241,7 +241,9 @@ fun TalkScreen(vm: MainViewModel) {
         }
 
         // ---- ② 刚才这一轮（"手机收"的落点）----
-        if (submit.phase != SubmitPhase.Idle) {
+        // 以前这里只在 `phase != Idle` 时画：一次**静默失败**（录音为空 / 麦打不开 / 上一条还没回来）
+        // 会把「这一轮」整块留空，用户眼前只剩下面的历史列表 —— 那正是"把旧指令当成这次答复"的形状。
+        if (submit.phase != SubmitPhase.Idle || submit.blocked.isNotBlank()) {
             item { SubmitCard(submit, onSpeak = { vm.speak(it) }) }
         }
 
@@ -332,6 +334,14 @@ fun TalkScreen(vm: MainViewModel) {
  *
  * 从「指令」页原样搬来的（那时它挂在历史上面），因为它才是"手机收"的主角：
  * 用户说完一句，眼睛要能马上看到"它听成了什么、回了什么"，而不是去列表里翻。
+ *
+ * ## 2026-10-18 真机 bug 之后的两条硬规矩（判据在 `SendRoundTest`）
+ *
+ *  * **这一轮到底发了哪一句**要摆在最上面（[roundHeadline]）——"ECHO 听成：…" 只在
+ *    电脑回过识别文本时才有，失败时一个字段都没有，用户分不清这条是不是自己那句；
+ *  * **回复只在 [showsReply] 为真时显示**。`Done` 是唯一能证明 `reply` 属于这一条的阶段
+ *    （它是 `awaitResult` 认领到"这一轮自己那一行"之后才写的）；`Failed` 时哪怕
+ *    `reply` 里还留着上一轮的字，也**一个字都不许**摆出来 —— 那就是"旧数据顶替"。
  */
 @Composable
 private fun SubmitCard(submit: SubmitState, onSpeak: (String) -> Unit) {
@@ -350,7 +360,7 @@ private fun SubmitCard(submit: SubmitState, onSpeak: (String) -> Unit) {
                     Spacer(Modifier.size(8.dp))
                 }
                 Text(
-                    submit.text,
+                    "这一轮：${roundHeadline(submit)}",
                     style = MaterialTheme.typography.bodyMedium,
                     fontWeight = FontWeight.Medium,
                     modifier = Modifier.weight(1f),
@@ -366,7 +376,17 @@ private fun SubmitCard(submit: SubmitState, onSpeak: (String) -> Unit) {
                 Text(submit.message, style = MaterialTheme.typography.labelSmall, color = accent)
             }
 
-            if (submit.reply.isNotBlank()) {
+            // 「刚才那次点击没发出去」：与这一轮分开说（它不改变这一轮的状态）
+            if (submit.blocked.isNotBlank()) {
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    submit.blocked,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = EchoPalette.Yellow,
+                )
+            }
+
+            if (showsReply(submit.phase) && submit.reply.isNotBlank()) {
                 Spacer(Modifier.height(8.dp))
                 Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                     Surface(

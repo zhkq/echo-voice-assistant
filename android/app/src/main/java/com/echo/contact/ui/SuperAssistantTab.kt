@@ -5,6 +5,7 @@ import android.content.pm.PackageManager
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
@@ -18,6 +19,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material.icons.filled.EventNote
@@ -28,6 +30,7 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -38,8 +41,10 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.echo.contact.service.ListenState
@@ -156,7 +161,7 @@ internal fun SuperAssistantTab(vm: MainViewModel, onOpenTab: (EchoTab) -> Unit) 
             val card = cards[index]
             FunctionCard(card, onOpenTab) {
                 when (card.kind) {
-                    HomeCardKind.COMMAND -> CommandCardBody(vm, onOpenTab)
+                    HomeCardKind.COMMAND -> CommandCardBody(card, vm, onOpenTab)
                     HomeCardKind.MEETING -> MeetingCardBody(card, micState, startMeetingWithMic)
                     HomeCardKind.REVIEW -> ReviewCardBody(
                         card = card,
@@ -226,11 +231,27 @@ private fun FunctionCard(
  *
  * 发出后的反馈也在这张卡里：一句状态 + 最近那条回复（很长就截断 + 给「去看详情」）。
  * 为什么只给"简短预览"：卡片不是详情页；完整正文在「指令」页的历史里。
+ *
+ * ## 2026-10-18 真机 bug 之后：这张卡必须能回答"到底是哪一条"
+ *
+ * 三件事缺一不可（判据在 `SendRoundTest` / `HomeCardsTest`）：
+ *  1. **把这次发的原话摆出来**（[roundHeadline]）——用户才能确认发的是自己那句；
+ *  2. **没发出去就说**（`submit.blocked` / `Failed` 的 `message`）——这是"点了没反应"的正解；
+ *  3. **回复只在 [showsReply] 为真时显示**：只有 `Done` 能证明 `reply` 是这一条的，
+ *     其它阶段一个字都不许摆 —— 否则旧回复会留下来被当成这次的答复。
  */
 @Composable
-private fun CommandCardBody(vm: MainViewModel, onOpenTab: (EchoTab) -> Unit) {
+private fun CommandCardBody(card: HomeCardSpec, vm: MainViewModel, onOpenTab: (EchoTab) -> Unit) {
     val submit by vm.submit.collectAsState()
+    val recording by vm.recording.collectAsState()
+    val recordMs by vm.recordMs.collectAsState()
     var input by remember { mutableStateOf("") }
+
+    val context = LocalContext.current
+    // 第一次按住时要录音权限：先要权限，用户再按一次。**不**在没权限时假装开始录音。
+    val commandMicLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { /* 给不给都由下一次按决定；不给会看到"开不了麦克风"那句如实的话 */ }
 
     Row(
         modifier = Modifier.fillMaxWidth(),
@@ -244,14 +265,90 @@ private fun CommandCardBody(vm: MainViewModel, onOpenTab: (EchoTab) -> Unit) {
             maxLines = 2,
             modifier = Modifier.weight(1f),
         )
-        Button(
-            onClick = {
-                val text = input
-                input = ""
-                vm.sendCommand(text)
-            },
-            enabled = input.isNotBlank(),
-        ) { Text("发送") }
+        // 按钮由 `card.buttons`（HomeCards.kt 的数据）驱动 —— 动作在数据层就没有"页签"字段，
+        // 所以这里不可能把页面换掉；判据在 HomeCardsTest（数据）+ SendRoundTest（界面接线）。
+        card.buttons.firstOrNull { it.action == HomeAction.SEND_COMMAND }?.let { button ->
+            Button(
+                onClick = {
+                    val text = input
+                    input = ""
+                    vm.sendCommand(text)
+                },
+                enabled = input.isNotBlank(),
+            ) { Text(button.label) }
+        }
+    }
+
+    card.buttons.firstOrNull { it.action == HomeAction.DICTATE_COMMAND }?.let { button ->
+        Spacer(Modifier.height(8.dp))
+        // **按住说话**：按下就开始录，松手就发（拖开手指 = 放弃）。
+        // 为什么不是"点一下开录、再点一下说完了"：卡片上只有一个位置，
+        // 两段式会让"以为说完了其实还在录"变成一个新的静默坑。
+        //
+        // ⚠️ 这里刻意**不用 `Button`**：`Button` 内部自带 `clickable`，它在指针事件的 Main pass
+        // 里比外层**先**拿到 down 并 consume 掉 —— `detectTapGestures` 默认 `requireUnconsumed`
+        // 就再也等不到按下，按住说话会变成一个点了没反应的死按钮。
+        // 所以用一个「长得像按钮」的 `Surface`：里面没有任何 clickable，gesture 一定拿得到。
+        Surface(
+            color = if (recording) EchoPalette.Red else EchoPalette.Accent,
+            shape = RoundedCornerShape(24.dp),
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(48.dp)
+                .pointerInput(Unit) {
+                    detectTapGestures(
+                        onPress = {
+                            val granted = context.checkSelfPermission(Manifest.permission.RECORD_AUDIO) ==
+                                PackageManager.PERMISSION_GRANTED
+                            if (!granted) {
+                                commandMicLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                            } else {
+                                // 只有真的开起了麦才等松手 —— 否则松手会走进"没在录音"那条提示，
+                                // 把"开不了麦"的原因盖掉（两个实话互相覆盖，等于都说了一半）
+                                if (vm.startRecording()) {
+                                    if (tryAwaitRelease()) vm.finishRecording() else vm.cancelRecording()
+                                }
+                            }
+                        },
+                    )
+                },
+        ) {
+            Row(
+                modifier = Modifier.fillMaxSize(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.Center,
+            ) {
+                Icon(
+                    Icons.Default.Mic,
+                    contentDescription = null,
+                    tint = Color.White,
+                    modifier = Modifier.size(18.dp),
+                )
+                Spacer(Modifier.size(8.dp))
+                Text(
+                    color = Color.White,
+                    text = if (recording) {
+                        "松开发送 · ${"%.1f".format(recordMs / 1000.0)} 秒"
+                    } else {
+                        button.label
+                    },
+                )
+            }
+        }
+        Spacer(Modifier.height(2.dp))
+        MutedLine("按住说话，松手就发；录不到声音会在这里说清楚", maxLines = 2)
+    }
+
+    // 「刚才那次点击没发出去」的提示：与这一轮分开摆，因为它不改变这一轮的状态
+    if (submit.blocked.isNotBlank()) {
+        Spacer(Modifier.height(6.dp))
+        Text(
+            submit.blocked,
+            style = MaterialTheme.typography.labelSmall,
+            color = EchoPalette.Red,
+            maxLines = 3,
+            overflow = TextOverflow.Ellipsis,
+        )
     }
 
     if (submit.phase != SubmitPhase.Idle) {
@@ -262,26 +359,41 @@ private fun CommandCardBody(vm: MainViewModel, onOpenTab: (EchoTab) -> Unit) {
             else -> EchoPalette.Purple
         }
         Spacer(Modifier.height(6.dp))
+        // 这一轮发的到底是哪一句（语音那条显示"电脑听成的那句"）
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                "这一轮：${roundHeadline(submit)}",
+                style = MaterialTheme.typography.labelMedium,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f),
+            )
+            Spacer(Modifier.size(8.dp))
+            Text(phaseLabel(submit.phase), style = MaterialTheme.typography.labelSmall, color = accent)
+        }
+        Spacer(Modifier.height(2.dp))
         Text(
             submit.message.ifBlank { phaseLabel(submit.phase) },
             style = MaterialTheme.typography.labelSmall,
             color = accent,
-            maxLines = 2,
+            maxLines = 3,
             overflow = TextOverflow.Ellipsis,
         )
 
-        // 最近一条回复：短的原样回显；长的不塞满卡片，给「去看详情」
-        val preview = replyPreview(submit.reply)
-        if (preview.text.isNotBlank()) {
-            Spacer(Modifier.height(6.dp))
-            Text(
-                preview.text,
-                style = MaterialTheme.typography.bodySmall,
-                maxLines = 3,
-                overflow = TextOverflow.Ellipsis,
-            )
-            if (preview.truncated) {
-                TextButton(onClick = { onOpenTab(EchoTab.COMMANDS) }) { Text("去看详情") }
+        // 最近一条回复：**只有这一轮自己的结论**才显示（短的原样回显；长的给「去看详情」）
+        if (showsReply(submit.phase)) {
+            val preview = replyPreview(submit.reply)
+            if (preview.text.isNotBlank()) {
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    preview.text,
+                    style = MaterialTheme.typography.bodySmall,
+                    maxLines = 3,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                if (preview.truncated) {
+                    TextButton(onClick = { onOpenTab(EchoTab.COMMANDS) }) { Text("去看详情") }
+                }
             }
         }
     }

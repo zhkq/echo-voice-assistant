@@ -73,6 +73,24 @@ data class SubmitState(
     val error: String = "",
     val cmdId: Int? = null,
     val startedAt: Long = 0L,
+
+    /**
+     * 这一轮的**身份**（每点一次「发送」/「说完了」就换一个新号）。
+     *
+     * 为什么要有：发送/轮询都是异步的，失败或超时之后那条**迟到**的回包会在几秒后才到。
+     * 它要是照样写 `_submit`，就会把新一轮（或者刚显示的失败原因）覆盖成上一轮的回复 ——
+     * 用户看到的就是"这不是我刚才说的那句"。写入一律走 [applyRound] / [ownsRound]。
+     */
+    val roundId: Long = 0L,
+
+    /**
+     * 「刚才那次点击**没发出去**」的原因（[withBlockedNote]）。
+     *
+     * 为什么与 [message] 分开：`message` 属于**正在路上的那一轮**（"正在提交…"），
+     * 而"上一条还没回来"时用户又点了一下 —— 这次点击确实没发出去，但也**不能**把
+     * 还在路上的那一轮擦掉。两条事实各占一个字段，谁也不冒充谁。
+     */
+    val blocked: String = "",
 ) {
     /** 还在路上（该显示转圈）。 */
     val active: Boolean
@@ -259,6 +277,24 @@ class MainViewModel(app: Application) : BaseViewModel(app) {
 
     /** 正在盯着的那次提交；再来一条就把它顶掉。 */
     private var pollJob: Job? = null
+
+    /**
+     * 「这一轮」的序号计数器（只增不减）。
+     *
+     * 每点一次「发送」/「说完了」就 +1，异步回包只写自己那一轮（[applyRound]）。
+     * 这样**迟到的旧结果不可能覆盖新的一轮** —— 见 `SendRound.kt` 的说明。
+     */
+    private var roundSeq = 0L
+
+    /** 指令列表头部刷新的节拍计数（见 [autoRefreshTick]）。 */
+    private var commandHeadTick = 0
+
+    private fun nextRoundId(): Long = ++roundSeq
+
+    /** 只在这一轮还归我时写界面；写的时候顺手清掉"刚才那次没发出去"的旧提示。 */
+    private fun writeRound(roundId: Long, next: (SubmitState) -> SubmitState) {
+        _submit.value = applyRound(_submit.value, roundId) { next(it).copy(blocked = "") }
+    }
 
     /** 状态连续失败次数：单次抖动不翻脸（自动刷新 3 秒一次）。 */
     private var statusFailStreak = 0
@@ -858,12 +894,19 @@ class MainViewModel(app: Application) : BaseViewModel(app) {
      *  - 业务失败是 **200 + ok=false**，要看 `ok` 不能只看状态码。
      */
     fun submitReviewDictation() {
-        if (!_recording.value) return
+        if (!_recording.value) {
+            // 与「说完了」同一条规矩：这次确实没提交，说出来（别让点击像掉进黑洞）
+            _reviewSubmittingNote.value = "没在录音：这次没有提交（可能已经提交过了）"
+            return
+        }
         recordTicker?.cancel()
         _recording.value = false
+        val recordedMs = recorder.elapsedMs()
         val wav = recorder.stop()
         if (wav == null) {
-            _speakNote.value = "录得太短了（不到 0.3 秒），再说一次"
+            // **必须说**：以前只写 `_speakNote`，而没有任何界面读它 → 用户看到的是"按了没反应"
+            _reviewSubmitting.value = false
+            _reviewSubmittingNote.value = recordingTooShortNote(recordedMs)
             return
         }
         _reviewSubmitting.value = true
@@ -1100,6 +1143,27 @@ class MainViewModel(app: Application) : BaseViewModel(app) {
             com.echo.contact.service.MeetingMicService
                 .tickFromForeground(getApplication<Application>())
         }
+        // 指令列表的**头部**也搭这个节拍刷新（每 [COMMAND_HEAD_EVERY_TICKS] 拍一次 ≈ 半分钟）。
+        //
+        // 为什么必须刷：这条节拍原来只刷状态与事件，`_commands` **只在 init / 手动刷新 /
+        // 发完指令的轮询里**更新过。App 放一夜之后再看，"最近的指令"第一条可能是昨天的 ——
+        // 2026-10-18 那次真机上"显示/念了前一天的『测试』"，旧列表顶替就是这个形状：
+        // 这一次发送静默失败（连请求都没出网），「这一轮」卡片整块不画，用户眼前只剩这份旧列表。
+        // 头部刷新只换新行（`mergeFreshHead`），用户翻出来的更早那些行不会被冲掉。
+        if (_submit.value.phase != SubmitPhase.Sending) {
+            commandHeadTick += 1
+            if (commandHeadTick >= COMMAND_HEAD_EVERY_TICKS) {
+                commandHeadTick = 0
+                viewModelScope.launch { refreshCommandHead() }
+            }
+        }
+    }
+
+    /** 只刷指令列表的头部（不重置分页、不动筛选）。 */
+    private suspend fun refreshCommandHead() {
+        val fresh = fetchCommands(lastLimit, lastQuery, offset = 0) ?: return
+        _commands.value = mergeFreshHead(fresh, _commands.value)
+        _commandsHasMore.value = fresh.size >= lastLimit
     }
 
     /**
@@ -1151,16 +1215,36 @@ class MainViewModel(app: Application) : BaseViewModel(app) {
      *
      * 文字这条路不回 `commandId`（只有 `/assistant/voice-command` 才回），
      * 所以靠"发送前的最大 id + 文本 + source=mobile"认领新出现的那一行（见 [pickSubmitted]）。
+     *
+     * ## 2026-10-18 真机 bug 之后的两处硬规矩
+     *
+     * ① **不许静默 return**（原来的 `if (trimmed.isEmpty()) return` 与
+     *    `if (phase == Sending) return`）：发不出去就把原因写到卡片上（[sendGate]）。
+     *    用户那次"发出去却什么都没发生"，就是因为这条路上有一个只 `return` 的出口。
+     * ② **认领下界要现取**（[claimFloorId]），不能用本地列表的最大 id ——
+     *    本地列表可能很旧，旧下界会让"发送前就存在、只是比本地列表新"的历史行
+     *    通过 `id > maxIdBefore`，然后被当成本次结果（旧数据顶替）。
+     * ③ 一次点击 = 一轮（[nextRoundId]）：迟到的回包不许写别人的轮次。
      */
     fun sendCommand(text: String) {
         val trimmed = text.trim()
-        if (trimmed.isEmpty()) return
-        // 只在"正在提交"这一瞬挡住重复点击；执行中可以再发（后端允许排队）
-        if (_submit.value.phase == SubmitPhase.Sending) return
+        when (val gate = sendGate(trimmed, _submit.value.phase, paired = _baseUrl.value.isNotBlank())) {
+            is SendGate.Blocked -> {
+                // **必须说**：这一下真的没发出去，一个请求都没发
+                _submit.value = if (gate.keepRound) {
+                    withBlockedNote(_submit.value, gate.reason)
+                } else {
+                    failedRound(nextRoundId(), text = trimmed.ifBlank { "（空指令）" }, reason = gate.reason)
+                }
+                return
+            }
+            SendGate.Go -> Unit
+        }
 
         pollJob?.cancel()
-        val maxIdBefore = _commands.value.maxOfOrNull { it.id ?: 0 } ?: 0
-        _submit.value = SubmitState(
+        val round = nextRoundId()
+        _submit.value = startingRound(
+            roundId = round,
             text = trimmed,
             phase = SubmitPhase.Sending,
             message = "正在提交…",
@@ -1169,27 +1253,48 @@ class MainViewModel(app: Application) : BaseViewModel(app) {
 
         viewModelScope.launch {
             try {
+                // ⚠️ 下界必须在**发送之前**取：发送之后电脑那边已经有这一行了
+                val maxIdBefore = claimFloorId()
                 val resp = api().sendCommand(CommandRequest(text = trimmed, source = "mobile"))
                 val body = resp.body()
                 if (resp.isSuccessful && body?.ok == true) {
-                    _submit.value = _submit.value.copy(
-                        phase = SubmitPhase.Accepted,
-                        message = body.message ?: "已提交",
-                    )
-                    pollJob = launch { awaitResult(trimmed, maxIdBefore) }
+                    writeRound(round) {
+                        it.copy(
+                            phase = SubmitPhase.Accepted,
+                            message = body.message ?: "已提交",
+                        )
+                    }
+                    if (!ownsRound(_submit.value, round)) return@launch
+                    pollJob = launch { awaitResult(trimmed, maxIdBefore, roundId = round) }
                     return@launch
                 }
                 // ok=false 也是**有原因**的（例如"已有命令流进行中，请稍候"），要原样显示
                 val msg = if (resp.isSuccessful) (body?.message ?: "指令发送失败") else parseError(resp)
-                fail(msg)
+                fail(round, msg)
             } catch (e: HttpException) {
-                fail(parseHttp(e))
+                fail(round, parseHttp(e))
             } catch (e: IOException) {
-                fail("无法连接：${e.message}")
+                fail(round, "无法连接：${e.message}")
             } catch (e: Exception) {
-                fail("发送出错：${e.message}")
+                fail(round, "发送出错：${e.message}")
             }
         }
+    }
+
+    /**
+     * 认领新行的**下界** = `max(本地列表里最大的 id, 发送前现拉一次的头部最大 id)`。
+     *
+     * 为什么现拉：`autoRefreshTick` 只刷状态与事件，**不刷指令列表**，
+     * 所以本地那份可能停在几小时前甚至昨天。用旧下界等于把"发送前已存在"的旧行
+     * 也算成新行 —— 真机上"把前一天那条当成这次的结果"就是这么来的。
+     * 拉不到（没网/没配对）就退回本地值：那种情况下 POST 本身也会失败，原因会如实显示。
+     */
+    private suspend fun claimFloorId(): Int {
+        val localMax = newestCommandId(_commands.value)
+        // 已知连不上就别再为"下界"多等一个连接超时：直接让 POST 去失败并如实报原因
+        if (_connected.value == false) return localMax
+        val remoteMax = fetchCommands(limit = 1)?.let { newestCommandId(it) } ?: 0
+        return maxOf(localMax, remoteMax)
     }
 
     // ---- 语音指令（录音 → ECHO 转写 → 下发）----
@@ -1221,7 +1326,11 @@ class MainViewModel(app: Application) : BaseViewModel(app) {
         val mic = runCatching { InputDevices.preferredInput(getApplication()) }.getOrNull()
         val ok = recorder.start(mic)
         if (!ok) {
-            _speakNote.value = "开不了麦克风：可能被别的应用占着，或权限没给"
+            // **必须说**：麦打不开 = 这一次一个字都不会发出去。
+            // 以前只写 `_speakNote`，而**没有任何界面读它**（见 SendRound.kt 的说明），
+            // 于是用户看到的就是"按了没反应"。
+            _speakNote.value = NOTE_MIC_UNAVAILABLE
+            _submit.value = failedRound(nextRoundId(), text = "（语音）", reason = NOTE_MIC_UNAVAILABLE)
             return false
         }
         _recording.value = true
@@ -1235,17 +1344,41 @@ class MainViewModel(app: Application) : BaseViewModel(app) {
         return true
     }
 
-    /** 「说完了」：停录 → 上传 ECHO 转写并下发 → 盯住那条结果。 */
+    /**
+     * 「说完了」：停录 → 上传 ECHO 转写并下发 → 盯住那条结果。
+     *
+     * ## 这条路线上每一个"不发"的出口都**必须**在卡片上留一句话（2026-10-18 真机 bug）
+     *
+     * 那次的现象是：**一个 POST 都没出网**（服务端 13:00 之后零请求），屏幕上也没有任何报错，
+     * 而用户以为"发过了、只是它答错了"。三个出口原来都是静默的：
+     *  1. `!recording` → `return`（双击「说完了」/ 状态已经被别处改掉）；
+     *  2. `recorder.stop() == null` → 只写 `_speakNote`（**没有界面读**），请求一条都没发；
+     *  3. 电脑回了 `ok=true` 但 `text` 是空的 → 以前会拿**空文本**去 `awaitResult`
+     *     认领新行，而空文本可能匹配到别的行（旧数据顶替的入口）。
+     */
     fun finishRecording() {
-        if (!_recording.value) return
-        recordTicker?.cancel()
-        _recording.value = false
-        val wav = recorder.stop()
-        if (wav == null) {
-            _speakNote.value = "录得太短了（不到 0.3 秒），再说一次"
+        if (!_recording.value) {
+            // 双击「说完了」之类：这次确实没发，如实说，别让点击像掉进黑洞
+            _submit.value = withBlockedNote(
+                _submit.value,
+                "没在录音：这次没有发出去（可能已经提交过了，看下面的结果）",
+            )
             return
         }
-        _submit.value = SubmitState(
+        recordTicker?.cancel()
+        _recording.value = false
+        val recordedMs = recorder.elapsedMs()
+        val wav = recorder.stop()
+        if (wav == null) {
+            // **必须说**：录音为空/太短 = 这一次什么都没发出去
+            val reason = recordingTooShortNote(recordedMs)
+            _speakNote.value = reason
+            _submit.value = failedRound(nextRoundId(), text = "（语音）", reason = reason)
+            return
+        }
+        val round = nextRoundId()
+        _submit.value = startingRound(
+            roundId = round,
             text = "（语音，正在转写…）",
             phase = SubmitPhase.Sending,
             message = "正在上传给 ECHO 转写…",
@@ -1253,6 +1386,9 @@ class MainViewModel(app: Application) : BaseViewModel(app) {
         )
         viewModelScope.launch {
             try {
+                // 下界照文字那条一样**发送前现取**：语音那条只靠 commandId 认行，
+                // 但老电脑不回 commandId，退回文本认领时不能再用 0 当下界（那是"认领任何一行"）。
+                val maxIdBefore = claimFloorId()
                 val body = wav.toRequestBody("audio/wav".toMediaType())
                 val resp = api().voiceCommand(body)
                 val b = resp.body()
@@ -1262,35 +1398,50 @@ class MainViewModel(app: Application) : BaseViewModel(app) {
                     } else {
                         parseError(resp)   // 422=形状不对/没识别出文本，502=转写失败
                     }
-                    fail(msg)
+                    fail(round, msg)
                     return@launch
                 }
-                _voiceText.value = b.text.orEmpty()
-                _submit.value = _submit.value.copy(
-                    text = b.text.orEmpty().ifBlank { "（语音）" },
-                    phase = SubmitPhase.Accepted,
-                    message = b.message ?: "已提交",
-                )
+                // 电脑"受理了"但没听出字：**不发、不认领**，就地让用户再说一次。
+                // 以前这里会拿空文本继续跑，等于给"旧数据顶替"留了一个入口。
+                val hearNote = voiceHearNote(b.text)
+                if (hearNote.isNotEmpty()) {
+                    writeRound(round) {
+                        it.copy(text = "（语音）", phase = SubmitPhase.Failed, message = hearNote, error = hearNote)
+                    }
+                    return@launch
+                }
+                val heard = b.text.orEmpty()
+                _voiceText.value = heard
+                writeRound(round) {
+                    it.copy(
+                        text = heard,
+                        phase = SubmitPhase.Accepted,
+                        message = b.message ?: "已提交",
+                    )
+                }
+                if (!ownsRound(_submit.value, round)) return@launch
                 awaitResult(
-                    text = b.text.orEmpty(),
-                    maxIdBefore = 0,
+                    text = heard,
+                    maxIdBefore = maxIdBefore,
                     targetId = b.commandId,
+                    roundId = round,
                 )
                 // 语音进来的就**念出来**（这是语音交互的意义所在）；打字那条不自动念。
                 // 念的是 `speak`（**给耳朵的那段**：电脑给的 speakText，或老电脑的开头摘要），
                 // **不是** `reply`（整篇，给眼睛看的）—— 以前这里念 `reply`，于是手机把详情也读了
                 // （用户 2026-10-17 真机："手机端朗读了全部内容，包括详情"）。
                 // 念用哪边由设置定（`SpeakPrefs`），这里只管"念哪一段"。
+                // ⚠️ 还必须确认这一轮**还是我的**：不然念出来的可能是被顶掉那轮的回复。
                 val done = _submit.value
-                if (done.phase == SubmitPhase.Done && done.speak.isNotBlank()) {
+                if (ownsRound(done, round) && done.phase == SubmitPhase.Done && done.speak.isNotBlank()) {
                     speak(done.speak)
                 }
             } catch (e: HttpException) {
-                fail(parseHttp(e))
+                fail(round, parseHttp(e))
             } catch (e: IOException) {
-                fail("无法连接：${e.message}")
+                fail(round, "无法连接：${e.message}")
             } catch (e: Exception) {
-                fail("上传语音出错：${e.message}")
+                fail(round, "上传语音出错：${e.message}")
             }
         }
     }
@@ -1300,21 +1451,35 @@ class MainViewModel(app: Application) : BaseViewModel(app) {
         _recording.value = false
         recorder.cancel()
         _recordMs.value = 0
+        // 主动取消不是失败，但也不能让"上一轮"留在卡上冒充这一轮
+        _submit.value = SubmitState(blocked = "这次录音取消了，没有发出去")
     }
 
-    private fun fail(msg: String) {
-        _submit.value = _submit.value.copy(phase = SubmitPhase.Failed, message = msg, error = msg)
+    /** 某一轮失败：只写**自己那一轮**（迟到的回调不会把新一轮的失败原因盖掉）。 */
+    private fun fail(roundId: Long, msg: String) {
+        writeRound(roundId) {
+            it.copy(phase = SubmitPhase.Failed, message = msg, error = msg, reply = "", speak = "")
+        }
     }
 
     /**
      * 盯住刚发的那一行：每 [POLL_INTERVAL_MS] 拉一次历史，直到它 `done`/`failed` 或超时。
      * 每一轮都把最新历史灌进 [_commands]，所以列表也是实时长的，不用手动刷新。
+     *
+     * [roundId] 是**身份**：这一轮被新的点击顶掉之后就立刻停工 ——
+     * 否则它的结论会在几秒后写到新一轮的卡片上（"显示/念的不是这一次"的另一种成因）。
      */
-    private suspend fun awaitResult(text: String, maxIdBefore: Int, targetId: Int? = null) {
+    private suspend fun awaitResult(
+        text: String,
+        maxIdBefore: Int,
+        targetId: Int? = null,
+        roundId: Long = 0L,
+    ) {
         val deadline = System.currentTimeMillis() + RESULT_TIMEOUT_MS
         var seen: CommandItem? = null
 
         while (System.currentTimeMillis() < deadline) {
+            if (roundId != 0L && !ownsRound(_submit.value, roundId)) return   // 被新一轮顶掉了
             val items = fetchCommands(POLL_LIMIT)
             if (items != null) {
                 // 刷新头部但**保留用户翻出来的更早那些行**（否则轮询会把它打回 30 条）
@@ -1330,39 +1495,53 @@ class MainViewModel(app: Application) : BaseViewModel(app) {
                     when (hit.status) {
                         "done", "failed" -> {
                             val failed = hit.status == "failed"
-                            _submit.value = _submit.value.copy(
-                                phase = if (failed) SubmitPhase.Failed else SubmitPhase.Done,
-                                cmdId = hit.id,
-                                reply = hit.reply.orEmpty(),
-                                // 念哪一段**只在这里判一次**（有 speakText 就念它，老电脑只念开头摘要，
-                                // 电脑发起的任务不念）—— 详情留在 `reply` 给眼睛，不进耳朵。
-                                speak = SpeakPlan.decide(hit).orEmpty(),
-                                error = hit.error.orEmpty(),
-                                message = if (failed) {
-                                    hit.error?.takeIf { it.isNotBlank() } ?: "执行失败"
-                                } else {
-                                    "耗时 ${"%.1f".format((hit.durationMs ?: 0) / 1000.0)} 秒"
-                                },
-                            )
+                            writeRound(roundId) {
+                                it.copy(
+                                    phase = if (failed) SubmitPhase.Failed else SubmitPhase.Done,
+                                    cmdId = hit.id,
+                                    reply = hit.reply.orEmpty(),
+                                    // 念哪一段**只在这里判一次**（有 speakText 就念它，老电脑只念开头摘要，
+                                    // 电脑发起的任务不念）—— 详情留在 `reply` 给眼睛，不进耳朵。
+                                    speak = SpeakPlan.decide(hit).orEmpty(),
+                                    error = hit.error.orEmpty(),
+                                    message = if (failed) {
+                                        hit.error?.takeIf { it.isNotBlank() } ?: "执行失败"
+                                    } else {
+                                        "耗时 ${"%.1f".format((hit.durationMs ?: 0) / 1000.0)} 秒"
+                                    },
+                                )
+                            }
                             return
                         }
-                        "running" -> _submit.value = _submit.value.copy(phase = SubmitPhase.Running, cmdId = hit.id, message = "正在执行…")
-                        "sent" -> _submit.value = _submit.value.copy(phase = SubmitPhase.Accepted, cmdId = hit.id, message = "已发送，等待执行…")
-                        else -> _submit.value = _submit.value.copy(phase = SubmitPhase.Accepted, cmdId = hit.id, message = "排队中…")
+                        "running" -> writeRound(roundId) {
+                            it.copy(phase = SubmitPhase.Running, cmdId = hit.id, message = "正在执行…")
+                        }
+                        "sent" -> writeRound(roundId) {
+                            it.copy(phase = SubmitPhase.Accepted, cmdId = hit.id, message = "已发送，等待执行…")
+                        }
+                        else -> writeRound(roundId) {
+                            it.copy(phase = SubmitPhase.Accepted, cmdId = hit.id, message = "排队中…")
+                        }
                     }
+                    // 进了"这一行还没结论"的分支后，如果这一轮已经被新的点击顶掉，也就别再轮询了
+                    if (roundId != 0L && !ownsRound(_submit.value, roundId)) return
                 }
             }
             delay(POLL_INTERVAL_MS)
         }
 
-        _submit.value = _submit.value.copy(
-            phase = SubmitPhase.Failed,
-            message = if (seen == null) {
-                "已提交，但一直没等到执行记录（点右上角刷新看看）"
-            } else {
-                "等了 ${RESULT_TIMEOUT_MS / 1000} 秒还没结论（后端最长等 300 秒，稍后再刷新）"
-            },
-        )
+        writeRound(roundId) {
+            it.copy(
+                phase = SubmitPhase.Failed,
+                reply = "",
+                speak = "",
+                message = if (seen == null) {
+                    "已提交，但一直没等到执行记录（点右上角刷新看看）"
+                } else {
+                    "等了 ${RESULT_TIMEOUT_MS / 1000} 秒还没结论（后端最长等 300 秒，稍后再刷新）"
+                },
+            )
+        }
     }
 
     private suspend fun fetchCommands(limit: Int, q: String = "", offset: Int = 0): List<CommandItem>? = try {
@@ -1443,6 +1622,15 @@ class MainViewModel(app: Application) : BaseViewModel(app) {
          * 找不到就落到列表 + 一句实话（见 [MeetingOpenPlan.decide]）。
          */
         const val MEETING_LOOKUP_LIMIT = 50
+
+        /**
+         * 指令列表头部每几拍刷一次（自动刷新一拍 5 秒 → 6 拍 ≈ 30 秒）。
+         *
+         * 为什么不每拍都刷：这条节拍还要探状态、拉事件、补传离线录音，
+         * 再加一份 30 条的指令列表会把它变成"每次都在下载历史"。半分钟够用了 ——
+         * 它要解决的只是"列表停在昨天"这种量级的陈旧，不是实时性。
+         */
+        const val COMMAND_HEAD_EVERY_TICKS = 6
     }
 }
 

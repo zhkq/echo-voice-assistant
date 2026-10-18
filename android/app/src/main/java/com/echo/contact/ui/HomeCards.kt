@@ -51,6 +51,18 @@ internal enum class HomeAction(val switchesTab: Boolean) {
     /** 在本页发出这条指令（`MainViewModel.sendCommand`）。 */
     SEND_COMMAND(false),
 
+    /**
+     * **在本页**录一段语音指令：按住 = `MainViewModel.startRecording`，
+     * 松手 = `MainViewModel.finishRecording`（就是「指令」页那颗「说一句」的两个动作）。
+     *
+     * 为什么 2026-10-18 这一版才补上：上一版这张卡只有"打字 + 发送"，
+     * **没有任何语音入口** —— 可用户说的"从手机发指令"指的就是说话。
+     * 卡片的整个卖点是"不用跳到对应功能页再开始用"，语音却是这个 App 的主动作，
+     * 于是这里必须有它，而且必须是"按住说话"（按下就录、松手就发）。
+     * 它走的还是既有那两个方法，**不新造录音路**。
+     */
+    DICTATE_COMMAND(false),
+
     /** 开始手机麦录音（`MainViewModel.startMeeting` → `MeetingMicService.start`）。 */
     START_MEETING(false),
 
@@ -162,8 +174,12 @@ internal fun homeCards(micRecording: Boolean, reviewDictating: Boolean): List<Ho
                 title = entry.title,
                 subtitle = entry.subtitle,
                 tab = entry.tab,
-                // 指令卡的"发送"在界面上还要配一个输入框；这里只描述动作
-                buttons = listOf(HomeCardButton("发送", HomeAction.SEND_COMMAND)),
+                // ⚠️ 顺序有讲究：「发送」在**最前**（它是这张卡的主按钮，判据按 `buttons.first()` 取主按钮）；
+                // 「按住说话」紧随其后 —— 用户说的"从手机发指令"多半就是说话。
+                buttons = listOf(
+                    HomeCardButton("发送", HomeAction.SEND_COMMAND),
+                    HomeCardButton("按住说话", HomeAction.DICTATE_COMMAND),
+                ),
                 linkLabel = "看全部指令",
             )
             EchoTab.MEETINGS -> HomeCardSpec(

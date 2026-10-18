@@ -206,6 +206,50 @@ class HomeCardsTest {
     }
 
     @Test
+    fun `指令卡那颗发送按钮在界面上真的接了发送动作`() {
+        // ① 数据层：指令卡的主按钮（buttons.first()）就是「发送」= SEND_COMMAND，且不切页
+        val card = homeCards(micRecording = false, reviewDictating = false)
+            .first { it.kind == HomeCardKind.COMMAND }
+        val send = card.buttons.first()
+        assertEquals("发送", send.label)
+        assertEquals(HomeAction.SEND_COMMAND, send.action)
+        assertTrue("发送必须是直接动作", effectOf(card, send) is HomeEffect.Direct)
+
+        // ② 界面层：那颗按钮的 onClick 里必须**真的**调了 vm.sendCommand。
+        //    光有 `HomeAction.SEND_COMMAND` 是"数据说了、界面没接" —— 那种卡点下去什么都不会发，
+        //    而用例全绿（2026-10-18 真机那次"发了却什么都没发生"就该由这条兜住）。
+        val source = moduleText("src/main/java/com/echo/contact/ui/SuperAssistantTab.kt")
+        val body = source.substringAfter("private fun CommandCardBody").substringBefore("private fun MeetingCardBody")
+        assertTrue(
+            "指令卡的「发送」没接 vm.sendCommand：点了什么都不会发",
+            body.contains("vm.sendCommand(text)"),
+        )
+        assertEquals(
+            "发送按钮所在的那段不该有别的切页入口（唯一的 onOpenTab 是回复太长时的「去看详情」）",
+            1,
+            Regex("onOpenTab\\(").findAll(body).count(),
+        )
+    }
+
+    @Test
+    fun `指令卡还有语音入口 而且走的是既有的开始录音与说完了`() {
+        val card = homeCards(micRecording = false, reviewDictating = false)
+            .first { it.kind == HomeCardKind.COMMAND }
+        val dictation = card.buttons.first { it.action == HomeAction.DICTATE_COMMAND }
+        assertEquals("按住说话", dictation.label)
+        assertFalse("语音入口也不许切页", dictation.action.switchesTab)
+
+        // 界面层：按住 = startRecording，松手 = finishRecording / 拖开 = cancelRecording
+        val body = moduleText("src/main/java/com/echo/contact/ui/SuperAssistantTab.kt")
+            .substringAfter("private fun CommandCardBody")
+            .substringBefore("private fun MeetingCardBody")
+        assertTrue("按下要开始录（既有入口）", body.contains("vm.startRecording()"))
+        assertTrue("松手要发（既有入口）", body.contains("vm.finishRecording()"))
+        assertTrue("拖开要放弃", body.contains("vm.cancelRecording()"))
+        assertTrue("按住手势要用 detectTapGestures + tryAwaitRelease", body.contains("tryAwaitRelease()"))
+    }
+
+    @Test
     fun `卡片标题仍可进对应页（卡片是快捷方式 不是替代）`() {
         // 点卡片标题 = 切到它对应的页签（底部 5 页导航照旧有效）
         for (card in homeCards(false, false)) {

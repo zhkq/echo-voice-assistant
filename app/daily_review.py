@@ -33,6 +33,7 @@
 from __future__ import annotations
 
 import datetime
+import json
 import os
 import re
 import threading
@@ -74,6 +75,51 @@ def vault_root() -> str:
     if v:
         return v
     return (settings.get("worklogVaultRoot", "") or "").strip()
+
+
+#: 当天工作日志相对笔记库的目录（技能契约：整理结果写在 `<vault>/01-工作日志/<date>.md`）。
+#: **只在这一处定义** —— `history_detail()` 报给用户的路径与 `submit()` 的"登记核实"
+#: 必须看同一个文件，各写一份迟早漂成两个地方。
+VAULT_NOTE_DIR = "01-工作日志"
+
+
+def vault_note_path(date: str) -> str:
+    """某一天的工作日志路径；没配笔记库（或没给日期）时返回空串。"""
+    vault = vault_root()
+    if not vault or not date:
+        return ""
+    return os.path.join(vault, VAULT_NOTE_DIR, date + ".md")
+
+
+def note_stamp(path: str):
+    """工作日志的"有没有被写过"指纹 `(mtime_ns, size)`；文件不在返回 `None`。
+
+    为什么需要它（2026-10-18 复查"回顾功能都正常不"）：真正把整理结果**登记**进笔记库的
+    是 DSH 侧的 `daily-review` 技能，ECHO 看不到那个动作，只能看**结果文件**。
+    以前这里不看结果：技能没装（或没写）时，`submit()` 照样回 `ok=true`、手机照样显示
+    "整理完成" —— 用户以为登记了，日志里其实一个字都没多（**200 假成功**）。
+    现在拿这份指纹前后比一次，把"没登记上"如实带回去（见 `submit()`）。
+    """
+    if not path:
+        return None
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    # `st_mtime_ns` 是 3.3+ 就有的；拿不到就退回秒级（只要两次比较用同一套就没问题）
+    return (int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9))), int(st.st_size))
+
+
+def _row_meta(row) -> dict:
+    """把 `commands.meta`（JSON 文本）读成 dict；坏了当空表。"""
+    raw = (row or {}).get("meta")
+    if not raw:
+        return {}
+    try:
+        got = json.loads(raw) if isinstance(raw, str) else dict(raw)
+    except (TypeError, ValueError):
+        return {}
+    return got if isinstance(got, dict) else {}
 
 
 def ready():
@@ -545,30 +591,43 @@ def submit(transcript: str, client=None, force_new=False, timeout=0,
     t0 = time.time()
     out = {"ok": False, "session_id": "", "workspace": "", "reply": "",
            "spoken": "", "source": "", "error": "", "seconds": 0.0}
-    try:
-        client = client or _client()
-    except Exception as e:
-        out["error"] = f"取智能体客户端失败：{e}"
-        return out
 
     ok, why = ready()
     vault = vault_root()
-    if not ok:
-        # 没配好也要给用户一句人话（车里看不到面板）
-        out["error"] = why
-        out["spoken"] = "回顾还没配好，你回面板看一眼设置。"
-        out["source"] = "fallback"
-        db.add_log("warn", "daily_review", f"回顾不可用：{why}")
-        return out
 
     try:
-        acc_ok, acc_why = ensure_access(client)
-        if not acc_ok:
-            db.add_log("warn", "daily_review", f"会话权限校正未成功：{acc_why}")
-    except Exception as e:
-        db.add_log("warn", "daily_review", f"会话权限校正异常：{e}")
+        # 没配好也要给用户一句人话（车里看不到面板），并且**照样落库**：
+        # 那段口述是他真说过的，历史里留一条"没成 + 原因"比悄悄丢掉强
+        # （`_persist` 的承诺就是"失败也留痕"）。
+        if not ok:
+            out["error"] = why
+            out["spoken"] = "回顾还没配好，你回面板看一眼设置。"
+            out["source"] = "fallback"
+            db.add_log("warn", "daily_review", f"回顾不可用：{why}")
+            return out
 
-    try:
+        # 「登记核实」的**前**指纹：这一轮说完之后工作日志有没有被写过（见 note_stamp 的说明）。
+        # 取在发指令之前 —— 前置环节/别的进程刚刚写过的那一下不该算到这一轮头上。
+        day = time.strftime("%Y-%m-%d", time.localtime())
+        note_path = vault_note_path(day)
+        note_before = note_stamp(note_path)
+
+        # 取客户端也放进**主 try** 里：它的失败同样要走结尾的 `finally: _persist`。
+        # 以前它是 try 之外的一个早退分支，于是"DSH 没装/没起来"这种最常见的失败
+        # 在历史里**一条都看不到** —— 用户说"昨天那次没记上"时无从判断。
+        try:
+            client = client or _client()
+        except Exception as e:                                   # noqa: BLE001
+            raise RuntimeError(f"取智能体客户端失败：{e}") from e
+
+        # 权限校正失败**不致命**（只是可能写不进笔记库），单独吞掉并留日志
+        try:
+            acc_ok, acc_why = ensure_access(client)
+            if not acc_ok:
+                db.add_log("warn", "daily_review", f"会话权限校正未成功：{acc_why}")
+        except Exception as e:                                   # noqa: BLE001
+            db.add_log("warn", "daily_review", f"会话权限校正异常：{e}")
+
         sid, wid, info = ensure_session(client, force_new=force_new)
         out["session_id"] = sid
         out["workspace"] = info.get("workspace", "")
@@ -608,6 +667,21 @@ def submit(transcript: str, client=None, force_new=False, timeout=0,
             # 技能没按契约输出：必须留下痕迹，否则"念错内容"永远查不出来
             db.add_log("warn", "daily_review",
                        f"技能未按【播报】契约输出（本次用 {source} 兜底）：{out['reply'][:120]}")
+
+        # ---- 登记核实：真的写进笔记库了吗 ----
+        # 整理结果由 DSH 技能写进 `<vault>/01-工作日志/<date>.md`，ECHO 只能看结果文件。
+        # 以前这一轮无论写没写都回 ok=true、手机显示"整理完成" —— 技能没装时用户
+        # 以为登记了，其实日志一个字都没多（**200 假成功**，比报错更坏）。
+        # 现在：检测到文件出现/变大/改时间 → registered=true；
+        # 否则 registered=false + 日志 + **在播报里如实补一句**（车里看不到面板）。
+        out["vaultNote"] = note_path
+        note_after = note_stamp(note_path)
+        out["registered"] = bool(note_path and note_after is not None and note_after != note_before)
+        if not out["registered"]:
+            db.add_log("warn", "daily_review",
+                       "这一轮没检测到工作日志更新（%s）：技能可能没装，或这次没有可登记的内容"
+                       % (note_path or "（未配置笔记库）"))
+            out["spoken"] = (out["spoken"] + "（不过工作日志没更新，可能没装回顾技能）").strip()
     except Exception as e:
         out["error"] = f"{type(e).__name__}: {e}"
         out["spoken"] = "回顾出了点问题，你回面板看一眼。"
@@ -648,14 +722,19 @@ def _persist(transcript: str, out: dict) -> int:
     ok = bool(out.get("ok"))
     now = time.localtime()
     date = time.strftime("%Y-%m-%d", now)
+    meta = {"review": True, "date": date, "kind": today_kind(),
+            "workspace": str(out.get("workspace") or ""),
+            "spokenSource": str(out.get("source") or "")}
+    # 只在这一轮真的比对过时才写 `registered`（失败轮没有"登记"可言）：
+    # 历史详情据此如实说"这一轮没写进工作日志"，而不是让用户以为都登记了。
+    if "registered" in out:
+        meta["registered"] = bool(out.get("registered"))
     row_id = db.add_command(
         transcript,
         source=REVIEW_SOURCE,
         status="done" if ok else "failed",
         session_id=str(out.get("session_id") or ""),
-        meta={"review": True, "date": date, "kind": today_kind(),
-              "workspace": str(out.get("workspace") or ""),
-              "spokenSource": str(out.get("source") or "")})
+        meta=meta)
     db.update_command(
         row_id,
         reply=str(out.get("reply") or ""),
@@ -714,15 +793,24 @@ def history_detail(date: str) -> dict:
 
     `vaultNote` 是**最终成果所在**（DSH 技能把整理好的条目写进 Obsidian 工作日志）——
     面板给一个"打开它"的按钮，用户就能从"我说了什么"跳到"记成了什么"。
-    """
-    import os
 
+    ⚠️ `vaultNoteExists` 只说明**那天那个文件在**，不证明**这一轮**被写进去了
+    （那天的日志可能只是别的来源建的）。所以每轮另有 `registered`（见 [note_stamp]），
+    界面要按它说话 —— 把"文件在"说成"这一轮已写入"就是一次假成功。
+    """
     date = str(date or "").strip()
-    if len(date) != 10 or date[4] != "-" or date[7] != "-":
+    # 严格到**日历**：`2026-13-99` 这种原来也能过（只查了长短与两个连字符），
+    # 于是它被当成一个"那天没有回顾"的正常日期返回 —— 用户以为那天真没记录。
+    try:
+        if len(date) != 10 or date[4] != "-" or date[7] != "-":
+            raise ValueError(date)
+        datetime.datetime.strptime(date, "%Y-%m-%d")
+    except (TypeError, ValueError):
         return {"ok": False, "error": "日期格式要是 YYYY-MM-DD", "date": date}
     rows = _rows_for_date(date)
     turns = []
     for r in rows:
+        meta = _row_meta(r)
         turns.append({
             "id": int(r.get("id") or 0),
             "at": str(r.get("ts") or ""),
@@ -733,11 +821,11 @@ def history_detail(date: str) -> dict:
             "error": str(r.get("error") or ""),
             "seconds": round(float(r.get("duration_ms") or 0) / 1000.0, 1),
             "sessionId": str(r.get("session_id") or ""),
+            # None = 老记录（那时还没有这条核实），界面**不要**据此说任何话
+            "registered": (bool(meta["registered"]) if "registered" in meta else None),
         })
     vault = vault_root()
-    note = ""
-    if vault:
-        note = os.path.join(vault, "01-工作日志", date + ".md")
+    note = vault_note_path(date)
     return {"ok": True, "date": date, "turns": turns, "count": len(turns),
             "vault": vault, "vaultNote": note,
             "vaultNoteExists": bool(note and os.path.isfile(note))}
@@ -779,6 +867,7 @@ def status():
     agent = ""
     session_id = ""
     workspace = ""
+    client_error = ""
     try:
         client = get_client()
         agent = getattr(client, "name", "") or ""
@@ -787,8 +876,14 @@ def status():
         row = db.get_session(today_kind(), agent=agent)
         session_id = (row or {}).get("session_id") or ""
     except Exception as e:
+        # ⚠️ 这里原来只把原因写进 `why`，却仍然回 `ready=ok`（只按设置判）——
+        # 于是面板/手机拿到 `ready=true` + 一句"取智能体客户端失败"，而界面只在
+        # `!ready` 时才显示 `reason`，那句话就被吞掉了；用户看到的是"今天还没回顾"，
+        # 点下去才失败（2026-10-18 复查发现的"假就绪"）。
+        # 智能体客户端拿不到 = 这次回顾根本提交不了，**必须**算未就绪。
+        client_error = f"取智能体客户端失败：{e}"
         if not why:
-            why = f"取智能体客户端失败：{e}"
+            why = client_error
     try:
         from app import paths
         workspace = paths.review_workspace_root()
@@ -796,7 +891,7 @@ def status():
         pass
     return {
         "enabled": enabled(),
-        "ready": ok,
+        "ready": bool(ok and not client_error),
         "reason": why,
         "agent": agent,
         "workspace": workspace,
