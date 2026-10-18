@@ -69,7 +69,9 @@ class ApiClientCacheTest {
         // 这条看着废话，但它把"为什么需要长超时"的数字钉在代码里：
         // 实测一次回顾整理要 122 秒，默认 60 秒必然先放弃。
         assertEquals(60, ApiClient.DEFAULT_READ_TIMEOUT_S)
-        assertEquals(330, ApiClient.LONG_READ_TIMEOUT_S)
+        // 330 → 960（2026-10-18 复查）：330 秒比服务端的硬上限 900 秒还短，
+        // 超过 5.5 分钟的整理会被**手机先放弃**，而电脑还在干。
+        assertEquals(960, ApiClient.LONG_READ_TIMEOUT_S)
         org.junit.Assert.assertTrue(
             "长超时必须显著大于 122 秒那次实测",
             ApiClient.LONG_READ_TIMEOUT_S > 122,

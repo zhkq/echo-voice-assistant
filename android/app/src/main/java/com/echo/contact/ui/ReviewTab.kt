@@ -75,6 +75,55 @@ internal const val REVIEW_MIC_BLOCKED =
 internal const val REVIEW_DAY_EMPTY =
     "这一天没有回顾记录。若是今天：返回后点「车里口述」录一段，第一条就会出现在这里。"
 
+// ---- 失败必须看得见（2026-10-18 复查的五处之一/之二/之三）----
+//
+// 历史接口失败时，列表是空的 —— 而空列表原来只会说"还没有回顾历史。口述一次今天…"。
+// 那是**假空态**：用户以为今天什么都没做，其实是一个字节都没读到。
+// 所以失败要有一句自己的话，并且**摆在列表那一块**（用户点的就是那里）。
+
+/** 历史接口失败时的前缀（判据见 `ReviewFailuresTest`）。 */
+internal const val REVIEW_HISTORY_FAILED = "回顾历史读取失败"
+
+/** 打开某一天失败时的前缀。 */
+internal const val REVIEW_DAY_OPEN_FAILED = "打开这一天失败"
+
+/**
+ * 拼一句"失败 + 原因"，且**永不返回空话**。
+ *
+ * 为什么不直接 `"$prefix：${e.message}"`：`e.message` 可能是 null（`UnknownHostException`
+ * 有时就是这样），那样拼出来的是一句"打开这一天失败：null"—— 看着像原因，其实什么都没说。
+ */
+internal fun reviewFailureLine(prefix: String, reason: String?): String {
+    val detail = reason?.trim().orEmpty().ifEmpty { "未知原因（没拿到错误信息）" }
+    return "$prefix：$detail"
+}
+
+// ---- 停主机回顾：服务端如实回的 `stopped` 三种话术 ----
+
+/** `stopped=true`：主机上那场回顾真的停了。 */
+internal const val REVIEW_STOPPED = "已停止主机上的回顾"
+
+/** `stopped=false`：主机上**没有**在跑的回顾 —— 别把"确认了一下"说成"停掉了"。 */
+internal const val REVIEW_STOP_NOT_RUNNING = "主机上这场回顾已经不在跑了（没有可停的）"
+
+/** 拿不到 `stopped` 字段（老服务端/回包形状不对）：退回原来那句话，**不编**。 */
+internal const val REVIEW_STOP_REQUESTED = "已请求停止主机上的回顾"
+
+/**
+ * 从 `POST /api/daily-review/stop` 的回包里取 `stopped`（`{ok, stopped}`）。
+ *
+ * 只认**真正的布尔**：`"true"` 字符串 / `0` / `1` 一律当"拿不到"（退回原话术）——
+ * 猜一个真假比说"已请求"更容易骗到人。Gson 把 JSON 的 true/false 解成 `Boolean`。
+ */
+internal fun stoppedFlag(body: Map<String, Any>?): Boolean? = body?.get("stopped") as? Boolean
+
+/** [stoppedFlag] 的结果 → 界面上那句话（三态；`null` 不编）。 */
+internal fun reviewStopNote(stopped: Boolean?): String = when (stopped) {
+    true -> REVIEW_STOPPED
+    false -> REVIEW_STOP_NOT_RUNNING
+    null -> REVIEW_STOP_REQUESTED
+}
+
 /** 点「今日回顾」会发生什么（纯数据；判据见 `ReviewEntryActionsTest`）。 */
 internal sealed interface ReviewTodayTap {
     /** 打开今天的详情（真的会发一次 `GET /api/daily-review/history/{date}` 并进详情页）。 */
@@ -222,6 +271,9 @@ fun ReviewTab(vm: MainViewModel) {
     val summary by vm.reviewSummary.collectAsState()
     val note by vm.reviewNote.collectAsState()
     val days by vm.reviewDays.collectAsState()
+    // 历史列表自己的失败原因（读取失败 / 打开某一天失败）——**必须可见**，
+    // 否则空列表就冒充"还没有回顾历史"（见 `reviewFailureLine` 的说明）。
+    val daysNote by vm.reviewDaysNote.collectAsState()
     val day by vm.reviewDay.collectAsState()
     val speaking by vm.speaking.collectAsState()
     val recording by vm.recording.collectAsState()
@@ -256,6 +308,7 @@ fun ReviewTab(vm: MainViewModel) {
             speakNote = speakNote,
             onSpeak = { vm.speakReviewDay(day!!.date) },
             onSpeakText = { vm.speak(it) },
+            onDismissSpeakNote = { vm.clearSpeakNote() },
             onBack = { vm.closeReviewDay() },
         )
         return
@@ -354,6 +407,7 @@ fun ReviewTab(vm: MainViewModel) {
                 },
                 onStop = { vm.stopSpeaking() },
                 onStopHost = { vm.stopHostReview() },
+                onDismissSpeakNote = { vm.clearSpeakNote() },
             )
         }
 
@@ -375,8 +429,17 @@ fun ReviewTab(vm: MainViewModel) {
         // ---- 历史回顾（按日期倒序；空时有空状态文案）----
         item { Text(REVIEW_HISTORY_TITLE, style = MaterialTheme.typography.titleMedium) }
 
+        // 历史接口失败 / 打开某一天失败：**就地**摆在列表这一块（用户点的就是这里）。
+        // 有这句话时下面不再画"还没有回顾历史"——那句会把"读不到"说成"没有"。
+        daysNote?.takeIf { it.isNotBlank() }?.let {
+            item { MutedLine(it, color = EchoPalette.Yellow, maxLines = 3) }
+        }
+
         if (orderedDays.isEmpty()) {
-            item { MutedLine(REVIEW_HISTORY_EMPTY, maxLines = 3) }
+            // 空列表只有在**真的读到了**（没有被失败提示占着）时才是"还没有历史"
+            if (daysNote.isNullOrBlank()) {
+                item { MutedLine(REVIEW_HISTORY_EMPTY, maxLines = 3) }
+            }
         } else {
             items(orderedDays, key = { it.date }) { d ->
                 EchoCard {
@@ -528,6 +591,7 @@ private fun ReviewStatusCard(
     onRefresh: () -> Unit,
     onStop: () -> Unit,
     onStopHost: () -> Unit,
+    onDismissSpeakNote: () -> Unit,
 ) {
     val running = review?.running == true
     val enabled = review?.enabled == true
@@ -578,10 +642,11 @@ private fun ReviewStatusCard(
             }
 
             // 朗读那条路的说明：没有它，"念"没出声时用户看到的是"点了没反应"
-            // （系统 TTS 没装 / 缺中文数据 / ECHO 合成失败 / 没有可念的播报都会走到这里）
+            // （系统 TTS 没装 / 缺中文数据 / ECHO 合成失败 / 没有可念的播报都会走到这里）。
+            // 单行 + 几秒后自动消失（`SpeakNoteLine`）：它是"这一下"的反馈，不是常驻状态。
             speakNote?.takeIf { it.isNotBlank() }?.let {
                 Spacer(Modifier.height(4.dp))
-                MutedLine(it, color = EchoPalette.Yellow, maxLines = 4)
+                SpeakNoteLine(it, onDismiss = onDismissSpeakNote)
             }
 
             Spacer(Modifier.height(8.dp))
@@ -613,6 +678,7 @@ private fun ReviewDayView(
     speakNote: String?,
     onSpeak: () -> Unit,
     onSpeakText: (String) -> Unit,
+    onDismissSpeakNote: () -> Unit,
     onBack: () -> Unit,
 ) {
     Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
@@ -639,7 +705,7 @@ private fun ReviewDayView(
         // 朗读那条路的说明（没有它，"念"不出声时就是"点了没反应"）
         speakNote?.takeIf { it.isNotBlank() }?.let {
             Spacer(Modifier.height(6.dp))
-            MutedLine(it, color = EchoPalette.Yellow, maxLines = 3)
+            SpeakNoteLine(it, onDismiss = onDismissSpeakNote)
         }
 
         Spacer(Modifier.height(8.dp))

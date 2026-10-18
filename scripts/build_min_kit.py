@@ -29,6 +29,14 @@
   所以离线路径的 `-Agent` 默认是 `none`，需要智能体时仍走联网/缓存那条路。
 * **不打 CUDA / funasr / pyannote / whisper 系模型**：那些是"离线增强档"，按需在面板里下。
 
+组 kit 也要排队（2026-10-18）
+----------------------------
+`build_kit.py` 早就有 `dist\\.pack.lock`，但本脚本直接调 `build_kit.build_main_packages()`
+绕过了 `do_build()` 那把锁 —— 同一分钟起两个组包时，后到的会在 `shutil.rmtree(kit_dir)`
+上把前一个正在写的目录删掉（产物名只精确到分钟，撞的是同一批文件名）。
+所以 stage/verify/zip **整段**都放进 **同一把** `build_kit.pack_lock`：为什么复用而不是
+另写一把，因为"谁写 dist 谁排这个目录的队"是唯一判据，两把锁关不住对方。
+
 用法
 ----
     python scripts/build_min_kit.py                  # 出主包 + 组离线最小包 + 自检
@@ -512,6 +520,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--no-runtime", action="store_true", help="不打 python.org 嵌入包")
     ap.add_argument("--no-models", action="store_true", help="不打模型（只出 wheel 包）")
     ap.add_argument("--no-verify", action="store_true", help="跳过组装后的自检")
+    # 与 build_kit.py 同一个默认值（那边是 LOCK_TIMEOUT_S=600）：等别的打包放锁的上限。
+    ap.add_argument("--lock-timeout", type=float, default=600.0, metavar="SEC",
+                    help="等另一个打包放锁的上限（秒，默认 600）")
     args = ap.parse_args(argv)
     args.engines = [e.strip() for e in args.engines.split(",") if e.strip()]
     args.allow_missing_models = bool(args.no_models)
@@ -520,21 +531,27 @@ def main(argv: list[str] | None = None) -> int:
     print(f"=== build-min-kit (stamp={args.stamp}, engines={','.join(args.engines)}) ===")
     try:
         build_kit = load_build_kit()
-        kit_dir, stats = stage_kit(args, build_kit)
-        if not args.no_verify:
-            print("\n=== verify ===")
-            problems = verify_kit(kit_dir, build_kit, args)
-            if problems:
-                print(f"  [FAIL] {kit_dir.name}")
-                for p in problems:
-                    print(f"        - {p}")
-                raise BuildError("自检没过 —— 这个包别发")
-            print(f"  [ok]   {kit_dir.name}")
-        dist = kit_dir.parent
-        zip_path = dist / (kit_dir.name + ".zip")
-        print("\n  [zip  ] 打包中（wheels/模型本身就是压缩过的，这一步只是走一遍 deflate）...")
-        build_kit.make_zip(kit_dir, zip_path, kit_dir.name)   # 复用：条目一律带 <kit>/ 前缀
-        print_summary(kit_dir, zip_path, stats)
+        # WHY the lock: 组 kit 会**删除并重建**同名的 kit 目录、再写同名的 zip，而名字只精确
+        # 到分钟。两个 build_min_kit（或一个 build_kit）同时跑，后来者会 rmtree 掉前者正在
+        # 写的目录 —— 表现是 exit=1 / 残包，却没有任何一处报错。所以整段"组 kit"排同一把锁。
+        # WHY 复用 build_kit.pack_lock：撞的是 dist 这个目录里的文件名，判据必须只有一处
+        # （另写一把锁关不住 build_kit 那边的进程）。
+        dist = Path(args.dist).resolve() if args.dist else DIST
+        with build_kit.pack_lock(dist, args.lock_timeout):
+            kit_dir, stats = stage_kit(args, build_kit)
+            if not args.no_verify:
+                print("\n=== verify ===")
+                problems = verify_kit(kit_dir, build_kit, args)
+                if problems:
+                    print(f"  [FAIL] {kit_dir.name}")
+                    for p in problems:
+                        print(f"        - {p}")
+                    raise BuildError("自检没过 —— 这个包别发")
+                print(f"  [ok]   {kit_dir.name}")
+            zip_path = kit_dir.parent / (kit_dir.name + ".zip")
+            print("\n  [zip  ] 打包中（wheels/模型本身就是压缩过的，这一步只是走一遍 deflate）...")
+            build_kit.make_zip(kit_dir, zip_path, kit_dir.name)   # 复用：条目一律带 <kit>/ 前缀
+            print_summary(kit_dir, zip_path, stats)
         return EXIT_OK
     except BuildError as exc:
         print(f"\n[fail] {exc}")

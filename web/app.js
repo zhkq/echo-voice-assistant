@@ -2802,8 +2802,12 @@ function bindDailyReviewCard() {
           ? "回顾已开始 —— 对着麦克风讲，讲完停一下它就整理"
           : ((r && r.error) || "回顾没能开始"), r && r.running ? 3600 : 5200);
       } else if (act === "stop") {
-        await post("/api/daily-review/stop", {});
-        toast("已请求结束这场回顾");
+        // 按服务端**如实回的** `stopped` 说话（与仪表盘那颗「结束回顾」同一口径）：
+        // 主机上已经没有在跑的那场时，别再让用户以为"已经请求结束了、等它收尾"。
+        const r = await post("/api/daily-review/stop", {});
+        if (r && r.stopped === true) toast("已结束这场回顾");
+        else if (r && r.stopped === false) toast("主机上这场回顾已经不在跑了");
+        else toast("已请求结束这场回顾");        // 拿不到字段就保留原话术（不替服务端下结论）
       } else if (act === "submit") {
         const text = ($("#rvText") || {}).value || "";
         if (!text.trim()) { toast("先写一段口述"); return; }
@@ -5104,6 +5108,46 @@ async function refreshRunStatus() {
    为什么摘要与历史分开两个接口：卡片每 5 秒问一次（与运行情况同拍），
    让它读几百行历史不合适；历史只在打开页签时拉一次。 */
 
+/** 仪表盘「最近一行」的**文案拼装**（`refreshReviewCard` 只负责把它放进 DOM）。
+ *
+ * 单独成一个纯函数，是为了能被 `tests/test_review_leftovers.py` **原样抠出去**
+ * 交给 node 真跑 —— 只查源码文本查不出"用户最后读到哪句话"。
+ *
+ * 服务端 `history_summary()` 的取值口径是**两套**，别把它们当成同一轮：
+ *   * `lastAt` / `lastStatus` = **最新那一轮**（什么时候做的、成没成）；
+ *   * `lastBrief` = **从最新往回找到的第一条非空播报** —— 它可能来自**更早一轮**。
+ * 接口没有告诉面板"这条播报属于哪一轮"，面板**不许猜**：最新一轮失败时那句话也可能是
+ * 这一轮自己的兜底话，成功时那一轮也可能没播。所以只在能确定是同一轮的正常情况
+ * （成功 + 有播报）沿用原来那句合成文案；一旦失败、或整段没有播报，就把**回顾（时间/状态）**
+ * 与**播报**分开说 —— 不能让一句话把两者说成同一件事：
+ *   "最近一次 10-18 10:00：{上一轮那句播报} 那次失败了" ✗
+ * 用户会以为那句播报是 10:00 说的，甚至以为"那次失败了"是在评价那句播报。
+ *
+ * 返回空串 = 这一行没什么可说（从没回顾过），调用方整行收起。
+ */
+function reviewLastLineHTML(sum) {
+  const s = sum || {};
+  const brief = String(s.lastBrief || "").trim();
+  const when = String(s.lastAt || "").slice(5, 16);       // MM-DD HH:MM
+  const status = String(s.lastStatus || "");
+  // 状态只翻译已知的两种；别的（老记录 / 空）**不替服务端补词**。
+  const stateText = status === "failed" ? "失败" : (status === "done" ? "完成" : "");
+  const at = `<span class="dim">最近一次回顾：${esc(when)}</span>`
+    + (stateText ? `（${stateText}）` : "");
+  if (!brief) {
+    // 从没回顾过：既没有时间也没有播报 → 整行收起（这不是"没有播报"，是没发生过）。
+    if (!when) return "";
+    // `lastBrief` 为空 = **连往回找都没有**一句播报，所以"那一轮没有播报"是事实、不是猜的。
+    return at + "<br>那一轮没有播报";
+  }
+  if (status === "failed") {
+    // 最新一轮失败：播报可能来自更早一轮（也可能就是这一轮的兜底话）—— 分不清，分开说。
+    return at + `<br><span class="dim">最近一次播报：</span>${esc(brief)}`;
+  }
+  // 最新一轮正常：**保持原来那句**（常用文案不为极端情况变啰嗦）。
+  return `<span class="dim">最近一次 ${esc(when)}</span>：${esc(brief)}`;
+}
+
 /** 仪表盘那张回顾卡：三态 + 两个动作。
  *
  *  状态口径（与 `/api/daily-review/summary` 一一对应）：
@@ -5161,17 +5205,11 @@ async function refreshReviewCard() {
   // **只保留最近 1 条**（用户 2026-10-07："仅保留最近1条"）。摘要就是那一句播报 ——
   // 它是"念给你听过的话"，比口述原文短、也正是回顾的产出。
   if (last) {
-    const brief = String(sum.lastBrief || "").trim();
-    const when = String(sum.lastAt || "").slice(5, 16);       // MM-DD HH:MM
-    if (!brief) {
-      last.textContent = "";
-      last.classList.add("hidden");
-    } else {
-      last.classList.remove("hidden");
-      last.innerHTML = `<span class="dim">最近一次 ${esc(when)}</span>：${esc(brief)}`
-        + (String(sum.lastStatus || "") === "failed"
-           ? ` <span class="sbadge warn">那次失败了</span>` : "");
-    }
+    // 文案怎么拼见 `reviewLastLineHTML()`：时间/状态属于最新一轮，播报可能来自更早一轮，
+    // 不能把它们拼成一句说成同一件事。
+    const html = reviewLastLineHTML(sum);
+    last.innerHTML = html;
+    last.classList.toggle("hidden", !html);
   }
 }
 
@@ -5199,9 +5237,25 @@ async function doReviewStart() {
   refreshReviewCard().catch(() => {});
 }
 
+/** 「结束回顾」之后该说哪句话 —— **按服务端回的 `stopped` 说**，不替它下结论。
+ *
+ * 服务端 `POST /api/daily-review/stop` 回的就是 `assistant.stop_review()` 的判词：
+ *   * `true`  = 刚才真的停了一场 → "已结束"；
+ *   * `false` = 主机上根本没有在跑的回顾（可能是上一轮已经结束、或用户点了两次）
+ *               → 如实说"已经不在跑了"；这时还说"已请求结束"会让用户以为主机上
+ *               还有一场在跑、在等它收尾；
+ *   * 拿不到这个字段（老服务端 / 回包异常）→ 保留原来那句"已请求结束…"：
+ *               宁可含糊，也不替服务端断言"已经结束"。
+ *
+ * 设置卡那个「结束回顾」按钮是同一套话术（见 `bindDailyReviewCard`），两处别各说一套。
+ */
 async function doReviewStop() {
-  try { await post("/api/daily-review/stop", {}); toast("已请求结束回顾"); }
-  catch (e) { toast("结束回顾失败：" + e.message, 4200); }
+  try {
+    const r = await post("/api/daily-review/stop", {});
+    if (r && r.stopped === true) toast("已结束这场回顾");
+    else if (r && r.stopped === false) toast("主机上这场回顾已经不在跑了");
+    else toast("已请求结束这场回顾");        // 拿不到字段就保留原话术（不替服务端下结论）
+  } catch (e) { toast("结束回顾失败：" + e.message, 4200); }
   refreshReviewCard().catch(() => {});
 }
 

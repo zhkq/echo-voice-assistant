@@ -17,13 +17,19 @@
 #       - use http.version=HTTP/1.1 and a big http.postBuffer, the usual cures for hangs on
 #         large pushes over flaky links/proxies.
 #
-# FALLBACK 2026-09-21: on this network `http.curloptResolve` often half-works - the probe
-#   answers 401 and the real push still dies with "Failed to connect to github.com port 443".
-#   So when a direct attempt fails, this script starts a local CONNECT proxy
-#   (scripts\gh-proxy.py - same technique as the `github-dns-bypass-push` skill) that tunnels
-#   raw TCP to a freshly probed IP while SNI/Host stay github.com, then pushes through it with
-#   `-c http.proxy=http://127.0.0.1:<port>`. Ports are ephemeral and one proxy is started per
-#   candidate IP, because a proxy pins its IP at startup and a dead IP then just returns 502.
+# FALLBACK 2026-09-21 (+ reworked 2026-10-18): on this network `http.curloptResolve` often
+#   half-works - the probe answers 401 and the real push still dies with "Failed to connect
+#   to github.com port 443" / "CONNECT tunnel failed, response 502". So when a direct attempt
+#   fails, this script re-probes a live IP right then and starts the local CONNECT proxy from
+#   the `github-dns-bypass-push` skill (`node gh-proxy.js`). The proxy tunnels raw TCP to that
+#   IP while SNI/Host stay github.com, then the push goes through it with
+#   `-c http.proxy=http://127.0.0.1:<port>`.
+#   WHY the node script from the skill: that is the copy that actually works on this network
+#   (the old Python copy had drifted and pinned its IP at startup). WHY a NEW port every time:
+#   a stale proxy may still own 8899 and keep a dead IP cached, so reusing 8899 turns every
+#   retry into the same 502. Ports are allocated fresh per attempt and every proxy is stopped
+#   in a `finally` - success or failure - because an orphan pins a dead IP and poisons the
+#   next attempt on a brand-new port.
 #   Both paths finish with an ls-remote check that origin/<branch> == local HEAD: a zero exit
 #   code has lied here before, so it is never the last word.
 #
@@ -62,6 +68,17 @@ $script:HookBlocked = $false
 
 $repoUrl = 'https://github.com/zhkq/echo-voice-assistant.git'
 
+# Command indirection. Defaults are the real tools; the ECHO_GH_PUSH_* variables exist so
+# tests can substitute stubs and so a machine with git/curl/node elsewhere can point at it.
+# WHY this matters for tests: no test may ever run a real `git push` against this repo.
+$script:GitExe = if ($env:ECHO_GH_PUSH_GIT) { $env:ECHO_GH_PUSH_GIT } else { 'git' }
+$script:CurlExe = if ($env:ECHO_GH_PUSH_CURL) { $env:ECHO_GH_PUSH_CURL } else { 'curl.exe' }
+$script:LastPushText = ''
+# Ports already handed to a proxy in this run. A fresh port is not enough on its own: the
+# OS may hand back a just-released one, and that is exactly the "stale proxy on a reused
+# port" trap this fallback must avoid.
+$script:UsedProxyPorts = @()
+
 # GitHub front IPs (they rotate - always probe, never trust a remembered one).
 # Ordered roughly by how good they historically are from CN networks, but the probe re-sorts.
 $candidates = @(
@@ -78,15 +95,19 @@ $candidates = @(
 
 function Get-ProbedIPs {
     # Returns reachable IPs sorted by latency (fastest first).
-    # 401 = receive-pack endpoint reachable and asking for credentials (normal for a private
-    # repo); 200 is accepted too in case the repo ever becomes public.
+    # ONLY 401 counts. WHY: an IP that answers a plain `GET /` or even 200 can still 502
+    # when the proxy opens a CONNECT tunnel to the receive-pack endpoint - the endpoint is
+    # the only thing git actually talks to. `--ssl-no-revoke` is required because this
+    # machine's schannel curl answers 000 when it cannot reach the revocation list.
+    # `--resolve` needs COLONS (host:443:ip); an `=` here yields a parse error whose
+    # http_code is 000, i.e. it looks exactly like "network down" (seen 2026-09-24).
     $alive = @()
     foreach ($ip in $candidates) {
-        $out = & curl.exe -s -o NUL -w "%{http_code} %{time_total}" `
-            --resolve "github.com:443:$ip" --connect-timeout 4 -m 8 `
+        $out = & $script:CurlExe -s -o NUL -w "%{http_code} %{time_total}" `
+            --ssl-no-revoke --resolve "github.com:443:$ip" --connect-timeout 4 -m 8 `
             "$repoUrl/info/refs?service=git-receive-pack" 2>$null
         $parts = ("$out").Trim() -split '\s+'
-        if ($parts.Count -ge 2 -and ($parts[0] -eq '401' -or $parts[0] -eq '200')) {
+        if ($parts.Count -ge 2 -and $parts[0] -eq '401') {
             $alive += [pscustomobject]@{ IP = $ip; Code = $parts[0]; Latency = [double]$parts[1] }
         }
     }
@@ -94,7 +115,7 @@ function Get-ProbedIPs {
 }
 
 function Test-Reachable([string]$resolve) {
-    & git -c http.sslBackend=schannel -c "http.curloptResolve=$resolve" ls-remote origin 2>&1 |
+    & $script:GitExe -c http.sslBackend=schannel -c "http.curloptResolve=$resolve" ls-remote origin 2>&1 |
         Select-Object -First 2
 }
 
@@ -117,8 +138,9 @@ function Invoke-Push([string]$resolve, [string]$branch) {
         # then compares an array against 0 -> success reported as failure (bug found
         # 2026-09-12: a no-op push printed "Everything up-to-date" yet the script said failed).
         # So capture, echo to the host, and return ONLY the exit code.
-        $lines = & git @cfg push -u origin $branch --progress 2>&1
+        $lines = & $script:GitExe @cfg push -u origin $branch --progress 2>&1
         $code = $LASTEXITCODE
+        $script:LastPushText = ($lines -join "`n")
         foreach ($line in $lines) { Write-Host $line }
         if (("$lines") -match 'push blocked') { $script:HookBlocked = $true }
         return $code
@@ -127,12 +149,38 @@ function Invoke-Push([string]$resolve, [string]$branch) {
     }
 }
 
-# ---- local CONNECT proxy fallback -------------------------------------------
+function Get-PushReason([string]$text) {
+    # Pull the one line that actually says why out of git's wall of output. WHY: the old
+    # script left a `fatal: ...` buried mid-stream and the user only saw "push failed".
+    if (-not $text) { return '(git produced no output)' }
+    $important = @()
+    foreach ($line in ($text -split "`r?`n")) {
+        $t = $line.Trim()
+        if (-not $t) { continue }
+        if ($t -match '(?i)fatal|error|failed|timed out|timeout|CONNECT tunnel|502|could not resolve|refused|denied') {
+            $important += $t
+        }
+    }
+    if ($important.Count -gt 0) { return $important[-1] }
+    $all = @(($text -split "`r?`n") | Where-Object { $_.Trim() })
+    if ($all.Count -gt 0) { return $all[-1].Trim() }
+    return '(git produced no output)'
+}
+
+# ---- local CONNECT proxy fallback (node gh-proxy.js from the skill) ----------
 # WHY: `http.curloptResolve` keeps SNI but needs git to connect STRAIGHT to the IP.
 # On this network that path often half-works: the probe answers 401 and the real push
-# still dies with "Failed to connect to github.com port 443" (hit repeatedly
-# 2026-09-21). The proxy below tunnels raw TCP to a reachable front IP while SNI stays
-# github.com, so TLS and the certificate are unchanged - only the TCP target moves.
+# still dies with "Failed to connect to github.com port 443" / "CONNECT tunnel failed,
+# response 502" (hit repeatedly 2026-09-21 and again 2026-10-18). The proxy below tunnels
+# raw TCP to a reachable front IP while SNI stays github.com, so TLS and the certificate
+# are unchanged - only the TCP target moves.
+#
+# WHY the node script in the `github-dns-bypass-push` skill: that is the copy that has
+# actually worked on this network, and it reads PORT/GH_IP from the environment, so every
+# attempt can get a brand-new port. NEVER hard-code 8899: a stale proxy may still own it
+# and keep its dead IP cached, which is why retrying on 8899 keeps returning 502.
+# Every Start-GhProxy is paired with a Stop-GhProxy in a `finally`; an orphaned proxy
+# pins a dead IP and poisons the next attempt even though it uses a new port.
 function Get-PyExe {
     # Any Python works; the repo venv / runtime-core are the likely ones. ASCII only.
     $cands = @(
@@ -157,17 +205,141 @@ function Get-FreePort {
     return $port
 }
 
+function Get-NodeExe {
+    # node: PATH first, then the managed copy used by the skill. The version directory
+    # rotates (22.22.2 -> 22.22.2-3), so read `versions\current` instead of remembering it.
+    if ($env:ECHO_GH_PUSH_NODE) {
+        if (Test-Path -LiteralPath $env:ECHO_GH_PUSH_NODE) { return $env:ECHO_GH_PUSH_NODE }
+        return ''
+    }
+    $cmd = Get-Command node -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source }
+    # Known install locations (the skill's managed copy plus the hermes one it names).
+    $known = @(
+        (Join-Path $env:LOCALAPPDATA 'hermes\node\node.exe'),
+        (Join-Path $env:ProgramFiles 'nodejs\node.exe')
+    )
+    foreach ($k in $known) {
+        if ($k -and (Test-Path -LiteralPath $k)) { return $k }
+    }
+    $vdir = Join-Path $env:USERPROFILE '.workbuddy\binaries\node\versions'
+    $current = Join-Path $vdir 'current'
+    if (Test-Path -LiteralPath $current) {
+        $ver = (Get-Content -LiteralPath $current -TotalCount 1).Trim()
+        if ($ver) {
+            $exe = Join-Path (Join-Path $vdir $ver) 'node.exe'
+            if (Test-Path -LiteralPath $exe) { return $exe }
+        }
+    }
+    return ''
+}
+
+function Get-GhProxyScript {
+    # The proxy lives in the skill, not in this repo: the skill is where it is maintained.
+    if ($env:ECHO_GH_PUSH_PROXY_JS) {
+        if (Test-Path -LiteralPath $env:ECHO_GH_PUSH_PROXY_JS) { return $env:ECHO_GH_PUSH_PROXY_JS }
+        return ''
+    }
+    $cands = @(
+        (Join-Path $env:USERPROFILE '.dsh\skills\github-dns-bypass-push\scripts\gh-proxy.js'),
+        (Join-Path $root '.dsh\skills\github-dns-bypass-push\scripts\gh-proxy.js')
+    )
+    foreach ($c in $cands) {
+        if (Test-Path -LiteralPath $c) { return $c }
+    }
+    return ''
+}
+
+function Get-NewProxyPort {
+    # Fresh and never reused: see the comment at the top of this section.
+    for ($i = 0; $i -lt 50; $i++) {
+        $port = Get-FreePort
+        if ($port -le 0 -or $port -eq 8899) { continue }
+        if ($script:UsedProxyPorts -contains $port) { continue }
+        $script:UsedProxyPorts += $port
+        return $port
+    }
+    return 0
+}
+
+function Wait-ProxyReady([int]$port, $proc, [int]$timeoutMs = 4000) {
+    $deadline = (Get-Date).AddMilliseconds($timeoutMs)
+    while ((Get-Date) -lt $deadline) {
+        if ($proc.HasExited) { return $false }
+        try {
+            $client = New-Object System.Net.Sockets.TcpClient
+            $client.Connect('127.0.0.1', $port)
+            $client.Close()
+            return $true
+        } catch {
+            Start-Sleep -Milliseconds 120
+        }
+    }
+    return $false
+}
+
+function Get-ProxyLogTail([string]$path) {
+    if (-not $path -or -not (Test-Path -LiteralPath $path)) { return '' }
+    try {
+        $lines = @(Get-Content -LiteralPath $path -ErrorAction SilentlyContinue |
+            Where-Object { $_.Trim() })
+        if ($lines.Count -gt 0) { return $lines[-1].Trim() }
+    } catch { }
+    return ''
+}
+
 function Start-GhProxy([string]$ip) {
-    $py = Get-PyExe
-    if (-not $py) { return $null }
-    $proxyScript = Join-Path $PSScriptRoot 'gh-proxy.py'
-    if (-not (Test-Path $proxyScript)) { return $null }
-    $port = Get-FreePort
-    $proc = Start-Process -FilePath $py -ArgumentList @($proxyScript, $port, $ip) `
-        -PassThru -WindowStyle Hidden
-    Start-Sleep -Milliseconds 900
-    if ($proc.HasExited) { return $null }
-    return @{ Proc = $proc; Port = $port }
+    # Returns @{ Ok = $true; Proc; Port; OutLog; ErrLog } or @{ Ok = $false; Reason }.
+    # Returning the reason (instead of $null) is deliberate: "no node" must be SAID, not
+    # silently skipped - the caller would otherwise retry direct forever with no clue.
+    $node = Get-NodeExe
+    if (-not $node) {
+        return @{ Ok = $false; Reason = 'node was not found - the CONNECT proxy fallback needs node (install node or set ECHO_GH_PUSH_NODE)' }
+    }
+    $proxyScript = Get-GhProxyScript
+    if (-not $proxyScript) {
+        return @{ Ok = $false; Reason = 'gh-proxy.js was not found - expected it at <USERPROFILE>\.dsh\skills\github-dns-bypass-push\scripts\gh-proxy.js' }
+    }
+    $port = Get-NewProxyPort
+    if ($port -le 0) {
+        return @{ Ok = $false; Reason = 'could not allocate a fresh loopback port for the proxy' }
+    }
+    $outLog = Join-Path $env:TEMP ("echo-gh-proxy-{0}.out.log" -f $port)
+    $errLog = Join-Path $env:TEMP ("echo-gh-proxy-{0}.err.log" -f $port)
+    foreach ($f in @($outLog, $errLog)) {
+        try { if (Test-Path -LiteralPath $f) { Remove-Item -LiteralPath $f -Force } } catch { }
+    }
+    # gh-proxy.js reads PORT/GH_IP from the environment. Set them only for the child, then
+    # restore: leaking GH_IP into this shell would be invisible state for the next attempt.
+    $oldPort = $env:PORT
+    $oldIp = $env:GH_IP
+    $proc = $null
+    try {
+        $env:PORT = "$port"
+        $env:GH_IP = $ip
+        $proc = Start-Process -FilePath $node -ArgumentList @($proxyScript) -PassThru `
+            -WindowStyle Hidden -RedirectStandardOutput $outLog -RedirectStandardError $errLog
+    } catch {
+        return @{ Ok = $false; Reason = ("could not start node: " + $_.Exception.Message) }
+    } finally {
+        if ($null -eq $oldPort) { Remove-Item Env:PORT -ErrorAction SilentlyContinue }
+        else { $env:PORT = $oldPort }
+        if ($null -eq $oldIp) { Remove-Item Env:GH_IP -ErrorAction SilentlyContinue }
+        else { $env:GH_IP = $oldIp }
+    }
+    if (-not (Wait-ProxyReady $port $proc 4000)) {
+        $why = Get-ProxyLogTail $errLog
+        if (-not $why) { $why = Get-ProxyLogTail $outLog }
+        if (-not $why) { $why = 'the proxy never started listening on 127.0.0.1:' + $port }
+        try { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue } catch { }
+        try { Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue |
+            ForEach-Object { Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue } } catch { }
+        foreach ($f in @($outLog, $errLog)) {
+            try { if (Test-Path -LiteralPath $f) { Remove-Item -LiteralPath $f -Force } } catch { }
+        }
+        return @{ Ok = $false; Reason = $why }
+    }
+    return @{ Ok = $true; Proc = $proc; Port = $port; OutLog = $outLog; ErrLog = $errLog }
 }
 
 function Invoke-PushViaProxy([int]$port, [string]$branch) {
@@ -182,8 +354,9 @@ function Invoke-PushViaProxy([int]$port, [string]$branch) {
     $prev = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
     try {
-        $lines = & git @cfg push -u origin $branch --progress 2>&1
+        $lines = & $script:GitExe @cfg push -u origin $branch --progress 2>&1
         $code = $LASTEXITCODE
+        $script:LastPushText = ($lines -join "`n")
         foreach ($line in $lines) { Write-Host $line }
         if (("$lines") -match 'push blocked') { $script:HookBlocked = $true }
         return $code
@@ -191,13 +364,21 @@ function Invoke-PushViaProxy([int]$port, [string]$branch) {
 }
 
 function Stop-GhProxy($px) {
-    # The process object we started is exact, but a stale listener on the port would make the
-    # NEXT attempt fail oddly, so also clear whoever is listening there.
-    try { Stop-Process -Id $px.Proc.Id -Force -ErrorAction SilentlyContinue } catch { }
+    # Both success and failure come through here (the caller has a `finally`). The process
+    # we started is exact, but also clear whoever listens on that port: a leftover listener
+    # would make the NEXT attempt fail oddly even on a different port.
+    try {
+        if ($px.Proc -and -not $px.Proc.HasExited) {
+            Stop-Process -Id $px.Proc.Id -Force -ErrorAction SilentlyContinue
+        }
+    } catch { }
     try {
         Get-NetTCPConnection -LocalPort $px.Port -State Listen -ErrorAction SilentlyContinue |
             ForEach-Object { Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue }
     } catch { }
+    foreach ($f in @($px.OutLog, $px.ErrLog)) {
+        try { if ($f -and (Test-Path -LiteralPath $f)) { Remove-Item -LiteralPath $f -Force } } catch { }
+    }
 }
 
 function Get-RemoteHead([string]$branch, [string]$resolve = '', [int]$port = 0) {
@@ -208,7 +389,7 @@ function Get-RemoteHead([string]$branch, [string]$resolve = '', [int]$port = 0) 
     $prev = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
     try {
-        $lines = & git @cfg ls-remote origin "refs/heads/$branch" 2>&1
+        $lines = & $script:GitExe @cfg ls-remote origin "refs/heads/$branch" 2>&1
         $code = $LASTEXITCODE
     } finally { $ErrorActionPreference = $prev }
     if ($code -ne 0) { return '' }
@@ -222,26 +403,33 @@ function Confirm-Push([string]$branch, [string]$resolve = '', [int]$port = 0) {
     # A zero exit code means git accepted the push, but verify the remote actually moved -
     # "$LASTEXITCODE -eq 0 with nothing on the server" is exactly the class of bug this
     # script exists to avoid, so never report success on the exit code alone.
-    $local = (git rev-parse HEAD).Trim()
+    # Returns $true ONLY when origin/<branch> == local HEAD; an unconfirmed lookup is a
+    # failure here, because "pushed but could not verify" has already lied once.
+    $local = ("$(& $script:GitExe rev-parse HEAD)").Trim()
+    if (-not $local) {
+        Write-Host '    could not read local HEAD - cannot verify the push' -ForegroundColor Red
+        return $false
+    }
     $remote = Get-RemoteHead $branch $resolve $port
     if (-not $remote) {
         Write-Host '    pushed (git exit 0), but ls-remote could not confirm the remote HEAD' -ForegroundColor Yellow
-        return
+        return $false
     }
     if ($remote -eq $local) {
         Write-Host ("    verified: origin/{0} == {1}" -f $branch, $local.Substring(0, 8)) -ForegroundColor Green
-    } else {
-        Write-Host ("    WARNING: origin/{0} is {1} but local HEAD is {2}" -f `
-            $branch, $remote.Substring(0, 8), $local.Substring(0, 8)) -ForegroundColor Red
+        return $true
     }
+    Write-Host ("    WARNING: origin/{0} is {1} but local HEAD is {2}" -f `
+        $branch, $remote.Substring(0, 8), $local.Substring(0, 8)) -ForegroundColor Red
+    return $false
 }
 
 # ---- optional commit ----
 if ($Message) {
-    git add -A
-    git commit -m $Message | Out-Null
+    & $script:GitExe add -A
+    & $script:GitExe commit -m $Message | Out-Null
     Write-Host "committed: $Message" -ForegroundColor Green
-} elseif ((git status --short | Measure-Object -Line).Lines -gt 0) {
+} elseif ((& $script:GitExe status --short | Measure-Object -Line).Lines -gt 0) {
     Write-Host 'uncommitted changes present: pass -Message "..." to include them, or commit first.' -ForegroundColor Yellow
 }
 
@@ -294,7 +482,7 @@ if (-not $SkipCheck -and -not $Verify) {
 
 
 
-$branch = git symbolic-ref --short HEAD
+$branch = ("$(& $script:GitExe symbolic-ref --short HEAD)").Trim()
 $started = Get-Date
 
 for ($attempt = 1; $attempt -le $Retries; $attempt++) {
@@ -332,11 +520,15 @@ for ($attempt = 1; $attempt -le $Retries; $attempt++) {
 
     Write-Host "=== pushing $branch -> origin (stall aborts after ${LowSpeedSeconds}s) ===" -ForegroundColor Cyan
     $code = Invoke-Push $resolve $branch
+    $directReason = Get-PushReason $script:LastPushText
     if ($code -eq 0) {
-        Confirm-Push $branch $resolve 0
-        $secs = [int]((Get-Date) - $started).TotalSeconds
-        Write-Host "push OK in ${secs}s" -ForegroundColor Green
-        exit 0
+        if (Confirm-Push $branch $resolve 0) {
+            $secs = [int]((Get-Date) - $started).TotalSeconds
+            Write-Host "push OK in ${secs}s" -ForegroundColor Green
+            exit 0
+        }
+        Write-Host '[FAIL] git exited 0, but origin/<branch> == local HEAD could not be verified - not reporting success.' -ForegroundColor Red
+        exit 1
     }
     if ($script:HookBlocked) {
         # Nothing about the network is wrong - the repo itself refused the push, so stop
@@ -346,27 +538,64 @@ for ($attempt = 1; $attempt -le $Retries; $attempt++) {
         Write-Host 'so rotating IPs or retrying cannot help. Fix the commits, then re-run.' -ForegroundColor Red
         exit 1
     }
-    Write-Host "direct attempt $attempt failed (git exit $code); trying the local CONNECT proxy" -ForegroundColor Yellow
+    Write-Host ("direct attempt {0} failed (git exit {1}): {2}" -f $attempt, $code, $directReason) -ForegroundColor Yellow
+
+    # WHY re-probe here instead of reusing $pick: an IP that answered 401 during the direct
+    # probe can blackhole the real upload a minute later. gh-proxy.js pins GH_IP at startup,
+    # so handing it a stale address only produces "CONNECT tunnel failed, response 502".
+    Write-Host '=== direct path failed: re-probing a live IP for the CONNECT proxy ===' -ForegroundColor Cyan
+    [array]$fresh = @(Get-ProbedIPs)
+    $lastReason = $directReason
     $proxyTried = $false
-    foreach ($cand in $pick) {
-        $px = Start-GhProxy $cand.IP
-        if (-not $px) { Write-Host '    no usable python / gh-proxy.py - skipping the proxy path' -ForegroundColor DarkGray; break }
-        $proxyTried = $true
-        Write-Host ("    proxy 127.0.0.1:{0} -> {1}" -f $px.Port, $cand.IP)
-        $code2 = Invoke-PushViaProxy $px.Port $branch
-        if ($code2 -eq 0) {
-            # Verify through the live proxy first, then tidy up.
-            Confirm-Push $branch '' $px.Port
-            Stop-GhProxy $px
+    $proxyOk = $false
+    if ($fresh.Count -eq 0) {
+        Write-Host '[FAIL] direct push failed, and no IP answered 401 at the receive-pack endpoint - the CONNECT proxy has nothing to tunnel to.' -ForegroundColor Red
+    } else {
+        $fresh | ForEach-Object { Write-Host ("    {0,-16} 401  {1:N2}s" -f $_.IP, $_.Latency) }
+        [array]$proxyPick = @($fresh | Select-Object -First ([Math]::Max(1, [Math]::Min($TopN, $fresh.Count))))
+        foreach ($cand in $proxyPick) {
+            $px = Start-GhProxy $cand.IP
+            if (-not $px.Ok) {
+                # No node / no gh-proxy.js / proxy never listened: say exactly which, never skip silently.
+                $lastReason = $px.Reason
+                Write-Host ("    proxy could not start: " + $px.Reason) -ForegroundColor Red
+                break
+            }
+            $proxyTried = $true
+            Write-Host ("    proxy 127.0.0.1:{0} -> {1}" -f $px.Port, $cand.IP)
+            try {
+                $code2 = Invoke-PushViaProxy $px.Port $branch
+                $lastReason = Get-PushReason $script:LastPushText
+                if ($code2 -eq 0) {
+                    # Verify through the live proxy first; a zero exit code is not proof.
+                    if (Confirm-Push $branch '' $px.Port) {
+                        $proxyOk = $true
+                    } else {
+                        $lastReason = 'git exited 0 but ls-remote did not confirm origin/<branch> == local HEAD'
+                    }
+                } else {
+                    Write-Host ("    proxy push via {0} failed (git exit {1}): {2}" -f `
+                        $cand.IP, $code2, $lastReason) -ForegroundColor Yellow
+                }
+            } finally {
+                # WHY unconditionally: a proxy left behind keeps its dead IP cached and makes
+                # the next attempt fail as a 502 even though it gets a brand-new port.
+                Stop-GhProxy $px
+            }
+            if ($proxyOk) { break }
+        }
+        if ($proxyOk) {
             $secs = [int]((Get-Date) - $started).TotalSeconds
             Write-Host "push OK via proxy in ${secs}s" -ForegroundColor Green
             exit 0
         }
-        Stop-GhProxy $px
-        Write-Host ("    proxy attempt via {0} failed (git exit {1})" -f $cand.IP, $code2)
+        if ($proxyTried) {
+            Write-Host ("[FAIL] direct push failed; the CONNECT proxy also failed (last reason: {0})" -f $lastReason) -ForegroundColor Red
+        } else {
+            Write-Host ("[FAIL] direct push failed; the CONNECT proxy could not run ({0})" -f $lastReason) -ForegroundColor Red
+        }
     }
-    if ($proxyTried) { Write-Host 'attempt via proxy failed; will re-probe and retry' -ForegroundColor Yellow }
-    else { Write-Host "attempt $attempt failed (git exit $code); will re-probe and retry" -ForegroundColor Yellow }
+    Write-Host "attempt $attempt failed; will re-probe and retry" -ForegroundColor Yellow
     Start-Sleep -Seconds 3
 }
 

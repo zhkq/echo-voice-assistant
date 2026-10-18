@@ -776,11 +776,16 @@ def history_list(limit: int = 60) -> dict:
         item["turns"] += 1
         if str(d.get("status") or "") == "failed":
             item["failed"] += 1
-        # 摘要取**当天最新一条有内容的播报**：行是按 `ts DESC` 来的，所以"这一天第一次出现"
-        # 就是最新那条 —— 只在第一次填，别被后面（更早）的覆盖掉。
+        # 摘要取**当天最新一条有内容的播报**：行是按 `ts DESC` 来的，所以从最新往回
+        # 找到的第一条非空 `brief` 就是它 —— 一旦填上就不再被后面（更早）的覆盖。
+        #
+        # 从前这里只认 `turns == 1`（当天最新那一轮）：最新一轮的 `brief` 为空时
+        # （那一轮失败、或技能没按【播报】契约输出），**那天更早的播报也一起被吃掉**，
+        # 列表看起来像"这天什么都没说"。空 `brief` 不该吃掉那天的播报。
+        # 一整天都没有播报时**如实留空**（面板据此说"这天没有播报"）—— 不编一句。
         # ⚠️ 这里**不**退回 `text`：`brief` 是"念给用户听的那句"，列表里混入口述原文
         # 会让"摘要"这一列时而是播报、时而是原文，读起来像两种东西。
-        if item["turns"] == 1 and str(d.get("brief") or "").strip():
+        if not item["brief"] and str(d.get("brief") or "").strip():
             item["brief"] = str(d["brief"]).strip()
         if not item["sessionId"]:
             item["sessionId"] = str(d.get("session_id") or "")
@@ -846,12 +851,31 @@ def history_summary() -> dict:
     last_d = db._query_one(                                      # noqa: SLF001
         "SELECT ts, brief, status, text FROM commands WHERE source=? "
         "ORDER BY ts DESC, id DESC LIMIT 1", (REVIEW_SOURCE,)) or {}
+    # `lastAt` 与 `lastBrief` 是**两个不同的问题**，取值口径也不同：
+    #
+    #   * `lastAt` 问的是"最近一次回顾**发生在什么时候**" —— 它必须是最新那一轮的
+    #     `ts`，**不该**因为那一轮 brief 为空就往前挪。挪了会让仪表盘说"最后一次回顾是
+    #     昨天"，而用户今天明明刚做过一轮（那轮失败了，但确实做过）。
+    #   * `lastBrief` 问的是"最近一次**播报说了什么**" —— 播报是念给用户听的那句。
+    #     旧实现只取最新一行的 brief ✗：最新一轮失败、或技能没按【播报】契约输出时，
+    #     brief 是空串，于是仪表盘那张"最近一次播报"卡片**整块变空**，
+    #     而更早那轮**明明播过** —— 用户看着像 ECHO 从没播报过。
+    #
+    # 所以这里从最新往回找**第一条非空 `brief`**（与 `history_list()` 同口径）。
+    # 全部为空就**如实留空**（面板据此说"还没有播报过"）—— 不拿 `text`（口述原文）顶替：
+    # "最近一次播报"里混进原文，这一格就时而是播报、时而是原文，读起来像两种东西。
+    # SQL 里把空白的判定交给 `TRIM`（空格/Tab/CR/LF 与 Python `.strip()` 对齐），
+    # 拿到的那行仍在 Python 里再 `strip()` 一次，落进接口的是干净的一句。
+    last_brief_row = db._query_one(                              # noqa: SLF001
+        "SELECT brief FROM commands WHERE source=? AND TRIM(COALESCE(brief, ''), "
+        "' ' || char(9) || char(10) || char(13)) <> '' "
+        "ORDER BY ts DESC, id DESC LIMIT 1", (REVIEW_SOURCE,)) or {}
     return {
         "today": today,
         "todayTurns": int(t.get("n") or 0),
         "todayFailed": int(t.get("f") or 0),
         "lastAt": str(last_d.get("ts") or ""),
-        "lastBrief": str(last_d.get("brief") or "").strip(),
+        "lastBrief": str(last_brief_row.get("brief") or "").strip(),
         "lastStatus": str(last_d.get("status") or ""),
         "lastText": str(last_d.get("text") or "").strip()[:80],
     }

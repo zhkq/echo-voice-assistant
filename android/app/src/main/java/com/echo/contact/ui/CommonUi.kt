@@ -22,6 +22,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -29,6 +30,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.echo.contact.data.dto.CommandItem
 import com.echo.contact.ui.theme.EchoPalette
+import kotlinx.coroutines.delay
 
 /** 状态点：颜色照面板 `.dot` 规则（见 [EchoPalette.statusColor]）。 */
 @Composable
@@ -102,6 +104,34 @@ internal fun MutedLine(text: String, color: Color = EchoPalette.Muted, maxLines:
         overflow = TextOverflow.Ellipsis,
     )
 }
+
+/**
+ * 朗读那条路的**当下反馈**（"念不出来 / 没装 TTS / ECHO 合成失败 / 没有可念的播报"…）。
+ *
+ * 为什么非得有这一行：`MainViewModel._speakNote` 以前**全 App 没有一处界面读**
+ * （只剩 ViewModel 内部赋值），于是"按了播报没声音"就是彻底静默 —— 用户只能猜。
+ * 现在回顾页（状态卡 / 详情页）与指令页、首页各摆一处（判据 `SpeakNoteVisibleTest`）。
+ *
+ * 为什么是**单行 + 自动消失**：它是"这一下"的反馈，不是状态。长期挂着会喧宾夺主，
+ * 也会让人以为"现在仍然坏着"（其实下一次朗读可能就好了）。[SPEAK_NOTE_VISIBLE_MS]
+ * 之后调 [onDismiss] 把它清掉（清除入口在 `MainViewModel.clearSpeakNote`）。
+ */
+@Composable
+internal fun SpeakNoteLine(
+    note: String?,
+    onDismiss: () -> Unit,
+    color: Color = EchoPalette.Yellow,
+) {
+    val text = note?.takeIf { it.isNotBlank() } ?: return
+    LaunchedEffect(text) {
+        delay(SPEAK_NOTE_VISIBLE_MS)
+        onDismiss()
+    }
+    MutedLine(text, color = color, maxLines = 1)
+}
+
+/** 朗读提示在界面上停多久（毫秒）：够读完一句话，又不至于一直占着版面。 */
+internal const val SPEAK_NOTE_VISIBLE_MS = 8_000L
 
 /** 组件的英文名 → 面板上那句中文（未知名字原样显示）。 */
 internal fun componentLabel(name: String): String = when (name) {

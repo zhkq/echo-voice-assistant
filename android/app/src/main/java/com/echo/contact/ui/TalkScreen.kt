@@ -69,6 +69,9 @@ fun TalkScreen(vm: MainViewModel) {
     val session by vm.session.collectAsState()
     val sessionLoading by vm.sessionLoading.collectAsState()
     val sessionNote by vm.sessionNote.collectAsState()
+    // 朗读失败/说明：以前只有 ViewModel 内部赋值，**全 App 没有一处界面读它**
+    // → 按了「念」没声音、也没提示。指令页这里摆一行（单行、几秒后自动消失）。
+    val speakNote by vm.speakNote.collectAsState()
 
     if (session != null || sessionLoading || sessionNote != null) {
         SessionView(
@@ -80,6 +83,8 @@ fun TalkScreen(vm: MainViewModel) {
             running = session?.running == true,
             messages = session?.messages.orEmpty().map { it.role.orEmpty() to it.text.orEmpty() },
             onSpeak = { vm.speak(it) },
+            speakNote = speakNote,
+            onDismissSpeakNote = { vm.clearSpeakNote() },
             onBack = { vm.closeSession() },
         )
         return
@@ -160,8 +165,7 @@ fun TalkScreen(vm: MainViewModel) {
         // ---- ① 主操作（唯一的一件大事）----
         item {
             EchoCard {
-                Column {
-                    CardHeader(
+                Column {                    CardHeader(
                         title = if (listening) "一直听着" else "说一句",
                         dotColor = when {
                             recording || listening -> EchoPalette.Red
@@ -238,6 +242,12 @@ fun TalkScreen(vm: MainViewModel) {
                     }
                 }
             }
+        }
+
+        // ---- ①½ 朗读反馈：`speak()` 写的那句在这里显形 ----
+        // 只有真的发生了（失败/没有可念的/ECHO 引擎名）才占一行；单行、几秒后自动消失。
+        speakNote?.takeIf { it.isNotBlank() }?.let {
+            item { SpeakNoteLine(it, onDismiss = { vm.clearSpeakNote() }) }
         }
 
         // ---- ② 刚才这一轮（"手机收"的落点）----
@@ -420,6 +430,8 @@ private fun SessionView(
     running: Boolean,
     messages: List<Pair<String, String>>,
     onSpeak: (String) -> Unit,
+    speakNote: String?,
+    onDismissSpeakNote: () -> Unit,
     onBack: () -> Unit,
 ) {
     Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
@@ -435,6 +447,12 @@ private fun SessionView(
                 if (cwd.isNotBlank()) MutedLine(cwd, maxLines = 1)
             }
             if (running) Text("进行中", style = MaterialTheme.typography.labelSmall, color = EchoPalette.Purple)
+        }
+
+        // 这一页上的「朗读」也会失败：同一行反馈（单行、几秒后自动消失）
+        speakNote?.takeIf { it.isNotBlank() }?.let {
+            Spacer(Modifier.height(6.dp))
+            SpeakNoteLine(it, onDismiss = onDismissSpeakNote)
         }
 
         Spacer(Modifier.height(8.dp))

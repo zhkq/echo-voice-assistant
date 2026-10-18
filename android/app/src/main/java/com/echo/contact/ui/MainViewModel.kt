@@ -558,6 +558,17 @@ class MainViewModel(app: Application) : BaseViewModel(app) {
         _speaking.value = false
     }
 
+    /**
+     * 界面上那句朗读说明/失败原因**过几秒自己消失**（`SpeakNoteLine` 的计时器到点调它）。
+     *
+     * 为什么要让界面能清：这句话是**当下这一下**的反馈（"念不出来：系统 TTS 没装"），
+     * 不是状态。一直挂着会喧宾夺主，也让人以为"现在仍然坏着"。
+     * 下一次 [speak] 开头本来也会清空，这个入口只是让界面不必等下一次朗读。
+     */
+    fun clearSpeakNote() {
+        _speakNote.value = null
+    }
+
     override fun onCleared() {
         stopSpeaking()
         runCatching { recorder.cancel() }
@@ -822,6 +833,18 @@ class MainViewModel(app: Application) : BaseViewModel(app) {
     private val _reviewDays = MutableStateFlow<List<ReviewDay>>(emptyList())
     val reviewDays: StateFlow<List<ReviewDay>> = _reviewDays.asStateFlow()
 
+    /**
+     * 历史列表那一块**自己的**失败原因（"回顾历史读取失败：…" / "打开这一天失败：…"）。
+     *
+     * 为什么必须单开一个字段（而不是继续塞 [_reviewNote]）：列表**空**的时候，
+     * 界面原来只会说"还没有回顾历史。口述一次今天…" —— 而那恰好也是**接口失败**时的样子。
+     * 用户看到的是"我今天什么都没做"（假空态），真实原因（连不上 / 401 / 解析失败）
+     * 一个字节都没出现。现在：空列表 + 这个字段 = 说失败；空列表 + 没有这个字段 =
+     * 真的没有历史。判据：`ReviewFailuresTest`。
+     */
+    private val _reviewDaysNote = MutableStateFlow<String?>(null)
+    val reviewDaysNote: StateFlow<String?> = _reviewDaysNote.asStateFlow()
+
     /** 手机提交回顾进行中（转写 + 整理可能要一两分钟）。 */
     private val _reviewSubmitting = MutableStateFlow(false)
     val reviewSubmitting: StateFlow<Boolean> = _reviewSubmitting.asStateFlow()
@@ -837,21 +860,41 @@ class MainViewModel(app: Application) : BaseViewModel(app) {
         viewModelScope.launch {
             try {
                 val resp = api().dailyReviewHistory(limit)
-                if (resp.isSuccessful) _reviewDays.value = resp.body()?.items.orEmpty()
-            } catch (_: Exception) {
-                // 历史不是主功能，静默
+                if (resp.isSuccessful) {
+                    _reviewDays.value = resp.body()?.items.orEmpty()
+                    // 成功才清掉失败提示（否则重试成功之后那句"读取失败"会一直挂着）
+                    _reviewDaysNote.value = null
+                } else {
+                    // **失败必须看得见**：以前连非 2xx 都不写，界面于是把"读不到"画成
+                    // "还没有回顾历史"（假空态：用户会以为自己今天什么都没做）。
+                    _reviewDaysNote.value =
+                        reviewFailureLine(REVIEW_HISTORY_FAILED, parseError(resp))
+                }
+            } catch (e: Exception) {
+                // 连不上/解析不了同样是失败：把原因说出来，别让空列表冒充"没有历史"
+                _reviewDaysNote.value = reviewFailureLine(REVIEW_HISTORY_FAILED, e.message)
             }
         }
     }
 
     fun openReviewDay(date: String) {
+        _reviewDaysNote.value = null
         viewModelScope.launch {
             try {
                 val resp = api().dailyReviewDay(date)
-                if (resp.isSuccessful) _reviewDay.value = resp.body()
+                if (resp.isSuccessful) {
+                    _reviewDay.value = resp.body()
+                } else {
+                    // 非 2xx（404/401/500…）以前**一个字节都不写** → 点"看这一天"像掉进黑洞
+                    _reviewDaysNote.value =
+                        reviewFailureLine(REVIEW_DAY_OPEN_FAILED, parseError(resp))
+                }
             } catch (e: IOException) {
-                _reviewNote.value = "读取失败：${e.message}"
-            } catch (_: Exception) {
+                _reviewDaysNote.value = reviewFailureLine(REVIEW_DAY_OPEN_FAILED, e.message)
+            } catch (e: Exception) {
+                // 解析异常（后端回了个不是预期形状的 JSON）也在这里：同样要说，
+                // 否则"这一天"打不开，用户只看到点了一下、什么都没发生。
+                _reviewDaysNote.value = reviewFailureLine(REVIEW_DAY_OPEN_FAILED, e.message)
             }
         }
     }
@@ -967,12 +1010,26 @@ class MainViewModel(app: Application) : BaseViewModel(app) {
         }
     }
 
-    /** 停止**主机上**正在进行的语音回顾（那是主机麦克风那条路，手机停它是有用的）。 */
+    /**
+     * 停止**主机上**正在进行的语音回顾（那是主机麦克风那条路，手机停它是有用的）。
+     *
+     * ## 为什么必须看服务端回的 `stopped`
+     *
+     * 服务端如实回的是 `{"ok": true, "stopped": <bool>}`（`app/api.py` 的
+     * `post_daily_review_stop`）——`stopped=false` 就是"主机上那场回顾已经不在跑了"。
+     * 原来这里只要 HTTP 200 就恒定说"已请求停止"，于是**明明没有可停的**也会告诉用户
+     * "已请求停止"（一次假成功：他以为停下了一场还在跑的回顾，其实什么都没有）。
+     * 现在三态照实说：true=已停止 / false=已经不在跑了 / 拿不到该字段=退回原话术（不编）。
+     */
     fun stopHostReview() {
         viewModelScope.launch {
             try {
                 val resp = api().dailyReviewStop()
-                _reviewNote.value = if (resp.isSuccessful) "已请求停止主机上的回顾" else parseError(resp)
+                _reviewNote.value = if (resp.isSuccessful) {
+                    reviewStopNote(stoppedFlag(resp.body()))
+                } else {
+                    parseError(resp)
+                }
             } catch (e: Exception) {
                 _reviewNote.value = "停止出错：${e.message}"
             }

@@ -108,6 +108,9 @@ internal fun SuperAssistantTab(vm: MainViewModel, onOpenTab: (EchoTab) -> Unit) 
     //  · 口述回顾 = `MainViewModel.recording`（与回顾页「车里口述」同一个录音器）。
     val micState by MeetingMicService.state.collectAsState()
     val dictating by vm.recording.collectAsState()
+    // 朗读失败/说明：以前全 App 没有一处界面读 `_speakNote` → 按了「念」没声音也没提示。
+    // 首页这里也摆一行（单行、几秒后自动消失）—— 语音指令的自动朗读就发生在这页。
+    val speakNote by vm.speakNote.collectAsState()
 
     val cards = homeCards(micRecording = micState.active, reviewDictating = dictating)
 
@@ -148,6 +151,12 @@ internal fun SuperAssistantTab(vm: MainViewModel, onOpenTab: (EchoTab) -> Unit) 
 
         // ① 在听（现有信息：常驻听写的相位与最近一句文案）
         item { ListenStatusCard(strip, listenPhase) }
+
+        // ①½ 朗读反馈：语音指令一旦念不出来（系统 TTS 没装 / ECHO 合成失败…），
+        // 用户就是"说了一句、什么也没听到"，这一行是唯一的真相来源。
+        speakNote?.takeIf { it.isNotBlank() }?.let {
+            item { SpeakNoteLine(it, onDismiss = { vm.clearSpeakNote() }) }
+        }
 
         // ② 三张功能卡（每张都有能直接干活的按钮）
         item {

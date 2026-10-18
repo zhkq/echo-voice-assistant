@@ -33,3 +33,40 @@ internal fun moduleText(relative: String): String {
     check(file.isFile) { "没有这个文件：$relative（模块根 = ${moduleRoot()}）" }
     return file.readText(Charsets.UTF_8)
 }
+
+/** 从模块根往上找仓库根（`android` 目录的上一层）；找不到返回 null（纯安卓检出）。 */
+internal fun repoRootOrNull(): File? {
+    var dir: File? = moduleRoot().absoluteFile
+    repeat(4) {
+        dir = dir?.parentFile
+        if (dir != null && File(dir, "app/daily_review.py").isFile) return dir
+    }
+    return null
+}
+
+/** [text] 里 [needle] 出现了几次（源码断言用；`indexOf` 循环，不依赖正则转义）。 */
+internal fun occurrencesOf(text: String, needle: String): Int {
+    if (needle.isEmpty()) return 0
+    var count = 0
+    var at = text.indexOf(needle)
+    while (at >= 0) {
+        count += 1
+        at = text.indexOf(needle, at + needle.length)
+    }
+    return count
+}
+
+/**
+ * 取一段源码：从 [signature] 那一行到 [nextSignature] 之前。
+ *
+ * 为什么按"下一个函数签名"截断：源码断言要能说"**这个函数里**不许再有静默出口"，
+ * 而不是"整个文件里搜不到某段字"——后者很容易被别处的同名写法糊过去。
+ */
+internal fun functionBody(source: String, signature: String, nextSignature: String): String {
+    val start = source.indexOf(signature)
+    check(start >= 0) { "源码里找不到 `$signature`" }
+    val end = source.indexOf(nextSignature, start)
+    check(end > start) { "在 `$signature` 之后找不到 `$nextSignature`" }
+    return source.substring(start, end)
+}
+
