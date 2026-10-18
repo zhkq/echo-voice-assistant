@@ -62,7 +62,6 @@ import com.echo.contact.ui.theme.EchoPalette
 @Composable
 fun HomeScreen(onUnpair: () -> Unit) {
     val vm: MainViewModel = viewModel()
-    val baseUrl by vm.baseUrl.collectAsState()
     // 页签由 ViewModel 持有：通知点进来时"先切到会议页"要能改它（见 openMeetingByName）。
     val tabIndex by vm.tab.collectAsState()
     // 读不懂的 index 回落**首页**（[START_TAB]，即超级助理，不是"第 0 项"）——
@@ -96,15 +95,14 @@ fun HomeScreen(onUnpair: () -> Unit) {
         topBar = {
             TopAppBar(
                 title = {
-                    Column {
-                        Text("ECHO 触点", style = MaterialTheme.typography.titleMedium)
-                        Text(
-                            baseUrl.ifBlank { "未配对" },
-                            style = MaterialTheme.typography.labelSmall,
-                            color = EchoPalette.Muted,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                        )
+                    // ⚠️ 顶栏**不再**画应用名与配对地址（2026-10-18 用户要求把它们并进首页那张卡）：
+                    // 同一个事实（连没连上、连的是谁）原来在顶栏和状态卡各画一次，
+                    // 两处迟早说不一样的话。现在全 App 只有 `HomeTopCard` 那一处画，
+                    // 顶栏只留"当前是哪一页"（首页留空 —— 首页顶部的卡本身就是标题）
+                    // 和刷新按钮。判据：`homeTopBarTitle` + `HomeCardsTest`。
+                    val title = homeTopBarTitle(currentTab)
+                    if (title.isNotEmpty()) {
+                        Text(title, style = MaterialTheme.typography.titleMedium)
                     }
                 },
                 actions = {
@@ -147,6 +145,18 @@ fun HomeScreen(onUnpair: () -> Unit) {
         }
     }
 }
+
+/**
+ * 顶栏标题 = 当前页名；**首页留空**（纯函数，`HomeCardsTest` 钉住）。
+ *
+ * 为什么首页要空着：首页顶部那张卡（`HomeTopCard`）第一行就是应用名 + 连接状态，
+ * 顶栏再写一次就成了"同一个事实两处显示"——这正是用户 2026-10-18 要求合并掉的那件事。
+ *
+ * 为什么别的页照旧显示页名：那些页没有那张卡，顶栏是它们唯一的位置提示
+ * （底部导航虽然也亮着，但页面滚起来之后顶栏那句更直接）。页名**不含**应用名，
+ * 所以"应用名只出现一处"这条不会被它破掉 —— 判据同时钉住这一点。
+ */
+internal fun homeTopBarTitle(tab: EchoTab): String = if (tab == START_TAB) "" else tab.title
 
 /**
  * 常驻听写细条（任务 B4）：一行小字 + 一个状态灯，点一下回「指令」页。

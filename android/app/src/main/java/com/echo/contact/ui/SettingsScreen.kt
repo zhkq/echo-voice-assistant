@@ -529,10 +529,10 @@ fun SettingsScreen(vm: MainViewModel, onBack: () -> Unit, onUnpair: () -> Unit) 
                         trailingColor = EchoPalette.Accent,
                     )
                     Spacer(Modifier.height(6.dp))
-                    MutedLine("ECHO 触点 $appVersion", maxLines = 1)
+                    MutedLine("$APP_TITLE $appVersion", maxLines = 1)
                     MutedLine(
                         "电脑那边是 ECHO ${status?.version ?: "（读不到）"}；" +
-                            "组件与端口在首页那张「服务状态」卡里（点一下展开）。",
+                            "组件与端口在首页顶部那张卡里（点一下展开）。",
                         maxLines = 3,
                     )
                     Spacer(Modifier.height(4.dp))

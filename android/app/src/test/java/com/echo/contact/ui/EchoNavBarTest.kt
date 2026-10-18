@@ -158,6 +158,55 @@ class EchoNavBarTest {
     }
 
     @Test
+    fun `中间那颗圆下写 ECHO，而页签名与无障碍仍是超级助理`() {
+        // 用户 2026-10-18："底部圆形 logo 下方可以写个 ECHO 或者超级助理"→ 定了 ECHO
+        // （圆下是品牌位：4 个字母放得开；「超级助理」四个汉字只能压到 9sp 以下）。
+        assertEquals("中间那颗的可见文字", "ECHO", EchoNavSpec.CENTER_LABEL)
+        assertEquals(
+            "中间那颗的可见文字必须走同一个纯函数（别再各写一遍）",
+            "ECHO",
+            navItemLabel(EchoTab.ASSISTANT, echoCenterTab(ECHO_TABS)),
+        )
+        // 显示名与语义名**故意分开**：页签名仍是「超级助理」，读屏/搜索还认得它。
+        assertEquals("页签名不许跟着显示名一起改", "超级助理", EchoTab.ASSISTANT.title)
+        assertEquals(
+            "无障碍/语义名仍是页签名",
+            "超级助理",
+            centerNavSemanticLabel(EchoTab.ASSISTANT),
+        )
+        assertTrue(
+            "语义文本必须含「超级助理」，否则读屏/搜索就找不到这一页了",
+            centerNavSemanticLabel(EchoTab.ASSISTANT).contains("超级助理"),
+        )
+        assertNotEquals(
+            "别用「把页签改名成 ECHO」这条捷径（会牵连页面标题与无障碍）",
+            EchoNavSpec.CENTER_LABEL,
+            EchoTab.ASSISTANT.title,
+        )
+    }
+
+    @Test
+    fun `左右四项的文案一个字没动（指令 会议 回顾 设置）`() {
+        val center = echoCenterTab(ECHO_TABS)
+        val sides = ECHO_TABS.filter { it != center }
+        assertEquals("左右四项还是这四页、这个顺序", listOf("指令", "会议", "回顾", "设置"), sides.map { it.title })
+        assertEquals(
+            "左右四项的可见文案不能跟着中间那颗一起变",
+            listOf("指令", "会议", "回顾", "设置"),
+            sides.map { navItemLabel(it, center) },
+        )
+        // 五格的可见文案一次钉住：只有正中间那一格是品牌位
+        assertEquals(
+            listOf("指令", "会议", "ECHO", "回顾", "设置"),
+            ECHO_TABS.map { navItemLabel(it, center) },
+        )
+        // 语义名没被改动：读屏念到左右四项仍是页签名
+        for (tab in sides) {
+            assertEquals(tab.title, centerNavSemanticLabel(tab))
+        }
+    }
+
+    @Test
     fun `落在超级助理页时中间那颗是激活态，切到别的页后仍居中`() {
         // 选中态只由 `tab == current` 决定：落在超级助理页 → 中间那颗 == current → 激活
         val onAssistant = EchoTab.ASSISTANT

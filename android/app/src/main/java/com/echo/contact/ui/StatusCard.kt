@@ -1,5 +1,8 @@
 package com.echo.contact.ui
 
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -25,35 +28,150 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import com.echo.contact.data.dto.StatusComponent
 import com.echo.contact.ui.theme.EchoPalette
 import kotlinx.coroutines.delay
 
 /** 状态卡自动刷新的节拍：面板底部那条是 5 秒，这里对齐（只在卡片可见时跑）。 */
 private const val STATUS_TICK_MS = 5_000L
 
+// ---------------------------------------------------------------------------------------------
+// 纯函数（JVM 可测）：这一张卡的三行内容全部由它们决定，界面只负责摆
+// ---------------------------------------------------------------------------------------------
+
 /**
- * **服务状态**—— 用户 2026-10-15 定的三类主要功能之一（另两类是核心功能入口、资料展示）。
+ * 连接状态灯的三档。
  *
- * 形态照面板底部那条"运行情况"：**一排状态灯 + 短值**，平时只占一张小卡；
- * 点一下展开成组件清单（9 个组件 + 版本 + 已运行时长）。
+ * **只有三档**，因为 App 只看得见三件事（`MainViewModel.connected` 就是三值）：
+ * 第一次探测还没回来 / 最近一次探测通了 / 最近一次探测没通。
+ * `ConnLevel` 刻意不叫"重连中"——见 [homeConnLight] 的说明。
+ */
+internal enum class ConnLevel { OK, DOWN, PENDING }
+
+/** 灯 + 一句话（第一行右侧那半句）。 */
+internal data class ConnLight(val label: String, val level: ConnLevel)
+
+/**
+ * 主页第一行那个"状态灯 + 连接状态"（纯函数，`HomeTopCardTest` 钉住）。
  *
- * 为什么不做成"设置 → 关于"里的一堆文字（上一版就是那样）：状态是**天天要看**的东西，
- * 而设置是偶尔改一次的；把它埋在设置里，等于每次都得点两层才看得见。
+ * [connected] 是 `MainViewModel` **现成的**三值，没有为这张卡另造一条探活路：
+ *  * `true`  = 最近一次 `/api/status` 成功 → 绿、已连接；
+ *  * `false` = 最近一次没通（或 401）→ 红、未连接。**下面那半句"自动重试"是真的**：
+ *    卡片可见时每 5 秒会再探一次（`MainViewModel.autoRefreshTick`），探通了这里就变回"已连接"；
+ *  * `null`  = 进页面后第一次探测还没回来 → 黄、连接中。
  *
- * 为什么"连不上"也在这张卡里：它就是这条链路的第 0 个状态（离线时其它灯都没意义），
- * 单独再冒一张红卡只会让首页更碎。
+ * 为什么不写一个"重连中"：App **看不到**"服务端正在重连"这个过程，它只能看到
+ * "上一次探通没通"。把"未连接"画成"重连中"就是在编一个没有数据支撑的状态
+ * （而"未连接 · 自动重试"把 App 真在做的事说清楚了）。
+ */
+internal fun homeConnLight(connected: Boolean?): ConnLight = when (connected) {
+    true -> ConnLight("已连接", ConnLevel.OK)
+    false -> ConnLight("未连接 · 自动重试", ConnLevel.DOWN)
+    null -> ConnLight("连接中…", ConnLevel.PENDING)
+}
+
+/**
+ * 第二行那段配对地址。
+ *
+ * 空 = 还没配对：**如实**说"未配对"并指出在哪配对，而不是留一行空白
+ * （空白会被当成"这条信息没有了"）。
+ */
+internal fun addressLine(baseUrl: String): String =
+    baseUrl.trim().ifBlank { "未配对：还没有配对地址（去「设置 → 连接」）" }
+
+/**
+ * 第三行"9 个组件的概要"（例：`8/9 组件正常 · 1 未启用`）。
+ *
+ * 为什么分三档而不是只数"好/坏"：真机上 9 个组件里 `dsh=skipped`、`wake=disabled`
+ * 是**常态**（那是"没启用"，不是"坏了"）。只数好坏会把一台健康的机器显示成
+ * "7/9 正常"、看着像出了两个故障。所以"未启用"单独一档、**只在有的时候**才出现。
+ *
+ * 判据（`HomeTopCardTest`）：healthy/disabled/broken 三段加起来必须等于 total ——
+ * 任何一个组件都不能被漏掉（漏掉就等于骗人说"都正常"）。
+ */
+internal data class ComponentSummary(
+    val healthy: Int,
+    val disabled: Int,
+    val broken: Int,
+    val total: Int,
+) {
+    /** 卡片第三行那句话（`total == 0` = 还没读到状态）。 */
+    val label: String
+        get() = if (total == 0) {
+            "组件状态还读不到（连上 ECHO 就有了）"
+        } else {
+            buildString {
+                append("$healthy/$total 组件正常")
+                if (disabled > 0) append(" · $disabled 未启用")
+                if (broken > 0) append(" · $broken 异常")
+            }
+        }
+}
+
+/** 组件状态 → 三档（与面板 `.dot` 同一套取值，见 `EchoPalette.statusColor`）。 */
+private val HEALTHY_STATUSES = setOf("online", "active", "ready", "ok", "done")
+private val DISABLED_STATUSES = setOf("disabled", "skipped", "idle", "paused")
+
+internal fun componentSummary(components: List<StatusComponent>): ComponentSummary {
+    var healthy = 0
+    var disabled = 0
+    var broken = 0
+    components.forEach { c ->
+        when (c.status.lowercase()) {
+            in HEALTHY_STATUSES -> healthy++
+            in DISABLED_STATUSES -> disabled++
+            else -> broken++
+        }
+    }
+    return ComponentSummary(
+        healthy = healthy,
+        disabled = disabled,
+        broken = broken,
+        total = components.size,
+    )
+}
+
+// ---------------------------------------------------------------------------------------------
+// 界面：**全 App 唯一**一处"应用名 + 连接信息"（用户 2026-10-18 要求合并）
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * 首页顶部**那唯一一张卡**：应用名 + 连接状态 + 配对地址 + 组件概要（点开是详情）。
+ *
+ * ## 为什么要把原来两处合成一处
+ *
+ * 用户原话：*"主页上端的（应用名 + 配对地址）那个可以跟下面的服务状态合并"*。
+ * 合并前，同一个事实在首页出现了两次 —— 顶部那一行（应用名 + 配对地址）和
+ * 下面那张「服务状态」卡（服务/智能体/语音合成/会议/回顾 + 9 个组件）。
+ * 两处都画"连没连上"，只是**画法不同**，于是必然有一天一处说"在线"、另一处说"连不上"
+ * （本仓库在"同一个事实两处显示"上栽过好几次）。
+ *
+ * ## 信息一个都没少（只是**收进这张卡**）
+ *
+ *  * 第一行：应用名 + 状态灯 + 连接状态（"连上/未连/连接中"，数据是现成的 `connected`）；
+ *  * 第二行：配对地址（小字、可截断；**点一下复制**，复制不到也能一眼看全）；
+ *  * 第三行：9 个组件的概要 `8/9 组件正常`；**点一下展开** —— 里面还是原来那 5 格
+ *    （服务/智能体/语音合成/会议/回顾）+ 9 个组件的逐条明细 + 版本 + 已运行时长 +
+ *    启动提示 + 刷新按钮。组件清单的渲染**复用**原来那张卡的代码，没有第二份。
+ *  * 连不上时那句排查提示（"同一 Wi-Fi？防火墙？"）仍然**常驻**（不藏在展开里）：
+ *    那是用户最需要立刻看到的一句。
  */
 @Composable
-fun EchoStatusCard(vm: MainViewModel) {
+fun HomeTopCard(vm: MainViewModel) {
     val status by vm.status.collectAsState()
     val connected by vm.connected.collectAsState()
     val statusError by vm.statusError.collectAsState()
+    val baseUrl by vm.baseUrl.collectAsState()
     val review by vm.review.collectAsState()
     val reviewSummary by vm.reviewSummary.collectAsState()
     var expanded by remember { mutableStateOf(false) }
+    var copied by remember { mutableStateOf(false) }
+
+    val context = LocalContext.current
 
     // 只在卡片可见时按节拍取状态（离开组合这个 LaunchedEffect 就取消）
     LaunchedEffect(Unit) {
@@ -62,6 +180,14 @@ fun EchoStatusCard(vm: MainViewModel) {
             vm.autoRefreshTick()
         }
     }
+
+    val light = homeConnLight(connected)
+    val lightColor = when (light.level) {
+        ConnLevel.OK -> EchoPalette.Green
+        ConnLevel.DOWN -> EchoPalette.Red
+        ConnLevel.PENDING -> EchoPalette.Yellow
+    }
+    val summary = componentSummary(status?.components.orEmpty())
 
     val server = status?.components?.firstOrNull { it.name == "server" }
     val tts = status?.components?.firstOrNull { it.name == "tts" }
@@ -85,6 +211,57 @@ fun EchoStatusCard(vm: MainViewModel) {
 
     EchoCard {
         Column {
+            // ---- ① 应用名 + 状态灯 + 连接状态（全 App 唯一一处）----
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                StatusDot(lightColor, size = 9)
+                Spacer(Modifier.size(7.dp))
+                Text(
+                    APP_TITLE,
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Medium,
+                    modifier = Modifier.weight(1f),
+                )
+                Text(
+                    light.label,
+                    style = MaterialTheme.typography.labelLarge,
+                    color = lightColor,
+                )
+            }
+
+            // ---- ② 配对地址（小字、可截断；点一下复制）----
+            Spacer(Modifier.height(5.dp))
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable {
+                        // 点一下复制：地址通常很长（中继地址尤其），而用户要把它抄到别处。
+                        // 不新开一个"看完整地址"的页面 —— 复制是这条信息唯一的用途。
+                        val ok = copyToClipboard(context, addressLine(baseUrl))
+                        copied = ok
+                    },
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    addressLine(baseUrl),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = EchoPalette.Muted,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f),
+                )
+                Spacer(Modifier.size(6.dp))
+                Text(
+                    if (copied) "已复制" else "复制",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = EchoPalette.Accent,
+                )
+            }
+
+            // ---- ③ 9 个组件的概要（紧凑；点开看详情）----
+            Spacer(Modifier.height(6.dp))
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -92,77 +269,26 @@ fun EchoStatusCard(vm: MainViewModel) {
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Text(
-                    "服务状态",
-                    style = MaterialTheme.typography.titleSmall,
-                    fontWeight = FontWeight.Medium,
+                    summary.label,
+                    style = MaterialTheme.typography.labelMedium,
+                    color = when {
+                        summary.total == 0 -> EchoPalette.Muted
+                        summary.broken > 0 -> EchoPalette.Red
+                        else -> EchoPalette.Text
+                    },
                     modifier = Modifier.weight(1f),
                 )
-                if (status != null) {
-                    MutedLine("ECHO ${status!!.version}", maxLines = 1)
-                    Spacer(Modifier.size(6.dp))
-                }
                 Icon(
                     if (expanded) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
-                    contentDescription = if (expanded) "收起" else "展开",
+                    contentDescription = if (expanded) "收起组件详情" else "展开组件详情",
                     tint = EchoPalette.Muted,
                     modifier = Modifier.size(20.dp),
                 )
             }
 
-            Spacer(Modifier.height(8.dp))
-
-            // 第一排：服务 / 智能体 / 语音合成（与面板底部那条同一口径）
-            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                StatusCell(
-                    modifier = Modifier.weight(1f),
-                    name = "服务",
-                    value = server?.let { shortStatus(it.status) } ?: "—",
-                    color = server?.let { EchoPalette.statusColor(it.status) } ?: EchoPalette.Muted,
-                )
-                StatusCell(
-                    modifier = Modifier.weight(1f),
-                    name = "智能体",
-                    value = agent?.shortName?.takeIf { it.isNotBlank() }
-                        ?: agent?.displayName?.takeIf { it.isNotBlank() } ?: "—",
-                    color = if (agent?.online == true) EchoPalette.Green else EchoPalette.Muted,
-                )
-                StatusCell(
-                    modifier = Modifier.weight(1f),
-                    name = "语音合成",
-                    // 短值取服务端那句诚实 detail 的第一段（"自动（在线）"/"自动（离线）"）
-                    value = tts?.detail?.substringBefore(" · ")?.takeIf { it.isNotBlank() }
-                        ?: tts?.let { shortStatus(it.status) } ?: "—",
-                    color = tts?.let { EchoPalette.statusColor(it.status) } ?: EchoPalette.Muted,
-                )
-            }
-            Spacer(Modifier.height(8.dp))
-            // 第二排：会议 / 回顾
-            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                StatusCell(
-                    modifier = Modifier.weight(1f),
-                    name = "会议",
-                    value = when {
-                        !meeting?.error.isNullOrBlank() -> "出错"
-                        meeting?.active == true -> "录音中"
-                        else -> "未在录音"
-                    },
-                    color = when {
-                        !meeting?.error.isNullOrBlank() -> EchoPalette.Red
-                        meeting?.active == true -> EchoPalette.Purple
-                        else -> EchoPalette.Muted
-                    },
-                )
-                StatusCell(
-                    modifier = Modifier.weight(1f),
-                    name = "回顾",
-                    value = reviewLabel,
-                    color = reviewColor,
-                )
-                Spacer(Modifier.weight(1f))
-            }
-
+            // 连不上时必须**马上**能看见一句排查提示（不藏在"展开"里）
             if (connected == false) {
-                Spacer(Modifier.height(8.dp))
+                Spacer(Modifier.height(6.dp))
                 MutedLine(
                     (statusError ?: "连不上 ECHO") +
                         "　·　检查：同一 Wi-Fi？防火墙放行 8970？或者在电脑上开「允许手机经后端中转」" +
@@ -175,11 +301,70 @@ fun EchoStatusCard(vm: MainViewModel) {
             if (expanded) {
                 Spacer(Modifier.height(10.dp))
                 HorizontalDivider(color = EchoPalette.Border)
+                Spacer(Modifier.height(8.dp))
+
+                // 第一排：服务 / 智能体 / 语音合成（与面板底部那条同一口径）
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    StatusCell(
+                        modifier = Modifier.weight(1f),
+                        name = "服务",
+                        value = server?.let { shortStatus(it.status) } ?: "—",
+                        color = server?.let { EchoPalette.statusColor(it.status) } ?: EchoPalette.Muted,
+                    )
+                    StatusCell(
+                        modifier = Modifier.weight(1f),
+                        name = "智能体",
+                        value = agent?.shortName?.takeIf { it.isNotBlank() }
+                            ?: agent?.displayName?.takeIf { it.isNotBlank() } ?: "—",
+                        color = if (agent?.online == true) EchoPalette.Green else EchoPalette.Muted,
+                    )
+                    StatusCell(
+                        modifier = Modifier.weight(1f),
+                        name = "语音合成",
+                        // 短值取服务端那句诚实 detail 的第一段（"自动（在线）"/"自动（离线）"）
+                        value = tts?.detail?.substringBefore(" · ")?.takeIf { it.isNotBlank() }
+                            ?: tts?.let { shortStatus(it.status) } ?: "—",
+                        color = tts?.let { EchoPalette.statusColor(it.status) } ?: EchoPalette.Muted,
+                    )
+                }
+                Spacer(Modifier.height(8.dp))
+                // 第二排：会议 / 回顾
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    StatusCell(
+                        modifier = Modifier.weight(1f),
+                        name = "会议",
+                        value = when {
+                            !meeting?.error.isNullOrBlank() -> "出错"
+                            meeting?.active == true -> "录音中"
+                            else -> "未在录音"
+                        },
+                        color = when {
+                            !meeting?.error.isNullOrBlank() -> EchoPalette.Red
+                            meeting?.active == true -> EchoPalette.Purple
+                            else -> EchoPalette.Muted
+                        },
+                    )
+                    StatusCell(
+                        modifier = Modifier.weight(1f),
+                        name = "回顾",
+                        value = reviewLabel,
+                        color = reviewColor,
+                    )
+                    Spacer(Modifier.weight(1f))
+                }
+
+                Spacer(Modifier.height(10.dp))
+                HorizontalDivider(color = EchoPalette.Border)
                 Spacer(Modifier.height(6.dp))
+                // 版本这一行原来在卡标题右侧（"ECHO 1.x"）—— 标题让位给应用名了，
+                // 信息搬到这里，**不删**：用户要能对上面板里的版本号。
+                MutedLine("ECHO 版本 ${status?.version ?: "（读不到）"}", maxLines = 1)
                 if (status == null) {
+                    Spacer(Modifier.height(4.dp))
                     MutedLine("正在读取状态…", maxLines = 1)
                 } else {
                     if (status!!.busy) {
+                        Spacer(Modifier.height(4.dp))
                         MutedLine(
                             "正在执行：" + listOfNotNull(
                                 status!!.busyOwner?.takeIf { it.isNotBlank() },
@@ -188,8 +373,8 @@ fun EchoStatusCard(vm: MainViewModel) {
                             color = EchoPalette.Purple,
                             maxLines = 1,
                         )
-                        Spacer(Modifier.height(4.dp))
                     }
+                    Spacer(Modifier.height(6.dp))
                     status!!.components.forEach { c ->
                         Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                             StatusDot(EchoPalette.statusColor(c.status), size = 8)
@@ -225,6 +410,12 @@ fun EchoStatusCard(vm: MainViewModel) {
             }
         }
     }
+}
+
+/** 复制配对地址；返回"到底复制没复制上"（界面据此说"已复制"，绝不假报）。 */
+private fun copyToClipboard(context: Context, text: String): Boolean {
+    val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager ?: return false
+    return runCatching { cm.setPrimaryClip(ClipData.newPlainText("ECHO 配对地址", text)) }.isSuccess
 }
 
 /** 一格：状态灯 + 名字 + 短值（照面板底部那条的三格）。 */

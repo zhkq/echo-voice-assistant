@@ -71,7 +71,9 @@ fun PairScreen(onPaired: () -> Unit) {
             verticalArrangement = Arrangement.Center,
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
-            Text("ECHO 触点", style = MaterialTheme.typography.headlineMedium)
+            // 应用名只认 [APP_TITLE]（与 `res/values/strings.xml` 的 `app_name` 同值）：
+            // 桌面图标、通知、界面三处写死成三份字符串的话，改名那天必然漏一处。
+            Text(APP_TITLE, style = MaterialTheme.typography.headlineMedium)
             Spacer(Modifier.height(8.dp))
             Text(
                 "在这台手机上连接你的 ECHO",

@@ -1,9 +1,10 @@
-# ECHO 触点（Android）
+# ECHO 超级助理（Android）
 
 手机端 App，配合本机 ECHO 语音助理后端（`app/api.py`）使用：**配对 → 发文字指令 → 看指令历史**。
 
-- 包名 / applicationId：`com.echo.contact`
-- 应用名：ECHO 触点
+- 包名 / applicationId：`com.echo.contact`（**应用名改了，包名没改** —— 改包名等于换一个 App，
+  手机上会多一个图标，配对凭据与本地录音目录也都读不到了）
+- 应用名：ECHO 超级助理（`res/values/strings.xml` 的 `app_name`，界面里用 `ui/AppIdentity.kt` 的 `APP_TITLE`）
 - 当前范围：**阶段3（配对/四分区）+ 阶段4（语音链路）+ 阶段5（常驻听写，2026-10-15）**。
 
 ---
@@ -347,7 +348,7 @@ id, ts, source, text, status, session_id, reply, brief, duration_ms, error, meta
 | 检查 | 命令 | 结果 |
 | --- | --- | --- |
 | 干净重编 + 打 APK | `clean :app:assembleDebug` | ✅ BUILD SUCCESSFUL，产出 `app-debug.apk`（约 17.9 MB） |
-| APK 元数据 | `aapt2 dump badging` | ✅ `com.echo.contact`、label `ECHO 触点`、minSdk 26 / targetSdk 34、launcher `com.echo.contact.MainActivity` |
+| APK 元数据 | `aapt2 dump badging` | ✅ `com.echo.contact`、label `ECHO 超级助理`（2026-10-18 改名后重新核过）、minSdk 26 / targetSdk 34、launcher `com.echo.contact.MainActivity` |
 | **WAV 头字节** | `:app:testDebugUnitTest` | ✅ `WavTest` 8/8（与 Python `wave` 模块**逐字节**一致） |
 | 后端 JSON ↔ DTO | `:app:testDebugUnitTest` | ✅ `DtosContractTest` 6/6 |
 | 会议/转写 DTO 契约 | `:app:testDebugUnitTest` | ✅ `MeetingDtosContractTest` 7/7（含"列表 vs 详情故意不一致"与"同名不同类型"） |

@@ -113,7 +113,21 @@ internal object EchoNavSpec {
      */
     const val CENTER_LIFT_DP = 34f
 
-    /** 中间那颗底座里图标下方那行小字（"超级助理"四个字在 56dp 圆的下面一行）。 */
+    /**
+     * 中间那颗**圆下那行可见文字**。
+     *
+     * 用户 2026-10-18："底部圆形 logo 下方可以写个 ECHO 或者超级助理，你自己排一下哪个好看都行"。
+     * 定 **`ECHO`**：**圆下是品牌位** —— 56dp 的圆本来就当 logo 用，下面配 4 个字母最像品牌标；
+     * 「超级助理」四个汉字要在同一宽度里（还得保持 9sp、不压圆、不挤左右邻居）只能压到 9sp 以下，
+     * 又小又难认。
+     *
+     * ⚠️ **显示名与语义名故意分开**：可见文字是 `ECHO`，而**页签名 / 页面标题 / 无障碍仍是
+     * [EchoTab.ASSISTANT.title]（"超级助理"）** —— 读屏与搜索还认得它。所以别把这条当成
+     * "把页签改名"去做（改 `EchoTabs.kt` 会牵连页面标题与无障碍，且这里本来就不需要动它）。
+     */
+    const val CENTER_LABEL = "ECHO"
+
+    /** 中间那颗底座下那行小字（[CENTER_LABEL] = "ECHO" 在 56dp 圆的下面一行）。 */
     const val CENTER_LABEL_SP = 9f
 
     /** 两侧四项的文字。 */
@@ -148,6 +162,31 @@ internal fun echoCenterIndex(tabs: List<EchoTab>): Int = tabs.size / 2
 
 /** 中间那颗**是哪一页**（由 [echoCenterIndex] 决定，不在任何别处写第二遍）。 */
 internal fun echoCenterTab(tabs: List<EchoTab>): EchoTab = tabs[echoCenterIndex(tabs)]
+
+/**
+ * 导航条上某一格**可见**的文案（纯函数：用例不渲染 Compose 也能断言"这五格分别写什么"）。
+ *
+ *  * **中间那颗 = 品牌位**：圆下写 [EchoNavSpec.CENTER_LABEL]（`ECHO`），**不用**页签名
+ *    「超级助理」—— 圆是 logo，下面配 4 个字母才排得开（见该常量的说明）。
+ *  * **左右四项 = 页签名**（指令/会议/回顾/设置），一个字都没动。
+ *
+ * 为什么抽成纯函数而不是在 `Text(text = ...)` 里各写一遍：这一轮最容易被"顺手改掉"的
+ * 恰恰是这行小字，而 Compose 在 JVM 门禁里渲染不了 —— 只有把它变成纯数据，
+ * `EchoNavBarTest` 才能直接钉住"中间是 ECHO、左右还是那四个"。
+ *
+ * @param center 哪一格是中间那颗（默认按 [ECHO_TABS] 算，与 [echoCenterTab] 同一个来源）。
+ */
+internal fun navItemLabel(tab: EchoTab, center: EchoTab = echoCenterTab(ECHO_TABS)): String =
+    if (tab == center) EchoNavSpec.CENTER_LABEL else tab.title
+
+/**
+ * 中间那颗的**无障碍 / 语义名**：仍是页签名「超级助理」。
+ *
+ * 为什么可见文字叫 `ECHO`、语义名却还是「超级助理」：**显示名与语义名故意分开** ——
+ * 肉眼看到的是品牌标（圆下写 ECHO），而读屏、搜索、页面标题仍用"超级助理"，
+ * 用户说"打开超级助理"时，读屏念出来的和搜到的都还是这四个字。
+ */
+internal fun centerNavSemanticLabel(tab: EchoTab): String = tab.title
 
 /**
  * 底部导航要渲染的顺序：**恒等于 [ECHO_TABS]**，与"当前选中哪一页"无关。
@@ -309,9 +348,14 @@ internal fun EchoNavBar(
 }
 
 /**
- * 中间那颗：**圆形底座 + 底座下面一行很小很小的字**。
+ * 中间那颗：**圆形底座 + 底座下面一行很小很小的字**（文字 = [EchoNavSpec.CENTER_LABEL]）。
  *
- * 文字为什么不压进圆里：圆只有 56dp，图标已经占 30dp，再塞一行 4 个汉字，
+ * 为什么圆下写 `ECHO` 而不是页签名：**圆下是品牌位**（56dp 的圆就是这 App 的 logo），
+ * 4 个字母放得开、像品牌标；「超级助理」四个汉字塞进这个宽度只能压到 9sp 以下。
+ * 页签/页面标题/无障碍**仍是**「超级助理」（[centerNavSemanticLabel]）—— 显示名与语义名
+ * 故意分开，读屏和搜索还认得它。
+ *
+ * 文字为什么不压进圆里：圆只有 56dp，图标已经占 30dp，再塞一行字，
  * 大字号（系统字体放大）时必定挤出圆外或压住图标。放在圆下面那一行，就永远不打架；
  * 代价是这行字比左右四项的文字**略高一点**（圆抬起来了，文字跟着在条的上半部），
  * 这是有意的取舍 —— 不为了对齐基线去把圆压回条里（那就没有了"凸起"）。
@@ -359,14 +403,16 @@ private fun CenterNavItem(
             ) {
                 Icon(
                     imageVector = echoTabIcon(tab),
-                    contentDescription = tab.title,
+                    // 语义名仍是页签名「超级助理」（可见文字是 ECHO，两者故意分开）
+                    contentDescription = centerNavSemanticLabel(tab),
                     modifier = Modifier.size(EchoNavSpec.CENTER_ICON_DP.dp),
                     tint = if (selected) Color.White else EchoPalette.Text,
                 )
             }
         }
         Text(
-            text = tab.title,
+            // 圆下是品牌位：ECHO（不是页签名；页签名只用于标题/无障碍）
+            text = navItemLabel(tab, center = tab),
             fontSize = EchoNavSpec.CENTER_LABEL_SP.sp,
             color = if (selected) EchoPalette.Accent else EchoPalette.Muted,
             fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
@@ -407,7 +453,8 @@ private fun SideNavItem(
         )
         Spacer(Modifier.height(2.dp))
         Text(
-            text = tab.title,
+            // 左右四项就是页签名（指令/会议/回顾/设置），与中间那颗的品牌位无关
+            text = navItemLabel(tab, center = echoCenterTab(ECHO_TABS)),
             fontSize = EchoNavSpec.SIDE_LABEL_SP.sp,
             style = MaterialTheme.typography.labelSmall,
             color = tint,

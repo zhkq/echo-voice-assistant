@@ -1,3 +1,11 @@
 <resources>
-    <string name="app_name">ECHO 触点</string>
+    <!--
+      用户 2026-10-18 中午的原话："app 的名字改成 ECHO 超级助理"。
+
+      ⚠️ 改名字**不改包名**：`applicationId` / `namespace` 仍是 `com.echo.contact`
+      （见 `app/build.gradle.kts`）—— 改了包名等于换一个 App，手机上会多出一个图标、
+      原来的配对凭据（`PairStore`）也读不到。所以这里只动"用户看得见的那个名字"：
+      桌面图标 label、系统设置里的应用名、通知头部的应用名用的都是这个 `app_name`。
+    -->
+    <string name="app_name">ECHO 超级助理</string>
 </resources>
