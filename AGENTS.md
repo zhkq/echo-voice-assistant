@@ -997,3 +997,63 @@ scopes 还得重发）。当晚的绕法：用 `pairing.pair()` 里**逐字同�
   理由：体积减半 + 已修好头的坑 ✓；用户对手机这条没有异议 ✓。
 - 顺带一条**判据教训**：`meta.json` 里"压缩率"那栏只对"事后压缩的 WAV"有意义 ✓；
   源本来就是压缩格式时显示 `-`/1.0 是**如实**，不要为了"好看"去造一个数字 ✗。
+## 2026-10-19 凌晨：真机第三/四轮的决策与坑（回顾交互 / 819 / 电平 / 推送）
+
+### 「819 度」的真根因：**上游清洗**，不是 TTS
+
+- 现象：手机和电脑都把 `8~19℃` 念成「819度」✗。
+- 真因（实证，逐字节复算命中 id 178/181/182）：`app/assistant.py::_clean_line` 里 `re.sub(r"[_~^]", "", t)` 把 `8~19` 的 `~` 当 **markdown 强调符**删掉 ✗ → `819`；`:221` 再把 `℃`→`度`。
+  **`commands.brief`（= 手机念的 `speakText`）存进库时就已经是 819** ✗ —— 所以**下游 TTS 归一化救不了** ✗，手机侧也无解 ✗（819 与真的"八百一十九"不可区分）。
+- 修：在**任何 markdown 清洗之前**先用 `_RANGE_RE` 把"数字 ~ 数字（可带 ℃|°C|度|%|％、小数、空格）"救成 `X 到 Y` ✓；`~` 的 markdown 语义**只剥成对的 `~~…~~`** ✓。
+- 双保险（仍保留 ✓）：电脑 `app/audio/speech_text.py`（挂在 `tts.speak()/synthesize()` 选引擎前）+ 安卓 `SpeechText.kt`（系统 TTS / ECHO 合成请求 / 常驻听写三处）——它们能救**还带分隔符**的形态（`60%–78%`、`1013–1017hPa` ✓），但救不了已经被清洗掉的 `~` ✗。
+- **铁律**：文本清洗类函数里，**数字之间的符号先判语义再删** ✓（`~` 在数字间是区间 ✗ 不是强调）；"看着像 markdown" 不是删除的理由 ✓。
+
+### 手机「回顾」= PC 版交互（开始 → 多轮 → 结束）
+
+- 用户口径："跟 pc 版的交互一样，开始回顾开始然后继续交互" ✓。
+- **开始只调 `POST /api/daily-review/start`** ✓（幂等建/取当天 session ✓、**不碰麦** ✓）。
+  ⛔ **不许调 `POST /api/daily-review/go`** ✗ —— 它内部是 `daily_review.start()` + `assistant.start_review()`，后者会**真的开电脑那支麦** ✗（PC 面板那个按钮才用它 ✓）。
+- 进行中：**多轮对话** ✓ —— 底部输入条（打字 → `sendCommand` / 按住说话 → 既有 `startRecording(asCommand=true)` → `voice-command` ✓），一轮**追加两条**（我说的 + ECHO 回的 ✓）→ 多轮天然是追加 ✓（判据："两轮都追加不是覆盖" ✓）。
+- 结束：`POST /api/daily-review/stop` ✓ + 用 `reviewStopNote` **三态**如实说 ✓。
+- ⚠️ **已知限制（如实说，不绕）**：回顾历史只读 `commands.source='review'`，而 `voice-command` 落 `source='mobile'` →
+  手机这条**不会进「回顾历史」** ✗ → UI 用"**刚才那一场**"只读卡兜 ✓，并写明"每一轮都在「指令」历史里" ✓。
+- 一次性口述（`submitReviewDictation` → `/daily-review/submit`，阻塞 2–3 分钟）**保留为退路** ✓，别删 ✗。
+
+### 回顾「按了发不起来」：**断在哪都没人说**
+
+- 现象：手机两个入口都点不动 ✓、电脑日志里 **零 `POST /api/stt/transcribe`** ✗（但 GET 都 200 ✓）。
+- 真因：`MainViewModel.startRecording()` 里 `if (_recording.value) return true` —— **已经在录时再按 = 静默 no-op** ✗；
+  另三档也全静默 ✗：**没给麦克风权限**（回顾页旧码 `if (granted) {…}` 外无分支）、**麦被会议录音/常驻听写占着**、**麦开了但 `read()` 一直 0 字节**；
+  失败原因还写进 `_submit`（"发指令失败" ✗）+ 全 App 无人读的 `_speakNote` ✗。
+- 修：`ui/DictationEntry.kt::dictationGate()`（**四档原因互不相同** ✓）+ `listenHoldsMic()`（只有 STARTING/LISTENING 真握麦 ✓）+ **3 秒"收不到声音"看门狗** ✓；
+  回顾口述的原因只写 `_dictateNote`（**一个 `_submit` 都不碰** ✓）；口述卡挪到功能卡下面（小屏不再被折叠线挡 ✗）。
+- **铁律**：给用户按的入口，**每一条 return 都要有可见原因** ✓；"已经在做"也是要说的状态 ✗ 不许静默 ✓。
+
+### 录音页电平（"不好看" → 重做）
+
+- 用户："电平效果感觉还是不好看" —— 一半是样式（17 格离散柱 ✗）、一半是**抖动**（原始 RMS 每 100ms 跳 ✗）。
+- 设计：**中心对称等厚胶囊** + 全宽渐变（中心蓝→紫→端头红，取主题色 ✓ 无硬编码 ✗）+ **峰值保持 800ms / 0.30 每秒回落** + **包络 0.35 攻 / 0.12 放**（**帧间时间归一** ✓ 换机手感不变 ✓）+ 暂停/极低时 **2.6s 缓慢呼吸只动亮度** ✓（长度不动 ✓ 否则就成"抖"）。
+- **`level^0.65` 视觉压缩** ✓：麦克风 RMS 本来就低（说话常 0.1–0.3），线性映射"看着没反应" —— 这是"不好看"的另一半 ✓。
+- 性能：`withFrameNanos` 只写 4 格 `mutableStateOf` + **只在 `onDrawBehind` 里读** → **整页零重组** ✓，每帧 2 个圆角矩形 + 2 根线 ✓。
+- 预算：电平带 112dp（含 64dp 条）✓，录音页总高度**只减不增** ✓；⚠️ 布局余量仅 **6dp** ✓（再加大就翻 ✗）。
+
+### 首页经中继打开 DSH 标准版网页（只读）
+
+- 服务端：`/api/status` 顶层新增 **`dshWebUrl` / `dshWebReason` / `dshWebReadOnly`**（同一份也在 `/api/pair/phone` 与 `/api/relay` ✓）；
+  值 = relay `publicUrl` + `api/relaydsh/<只读会话令牌>/` ✓；不可用时 url 空 + 人话 reason ✓ **绝不自己拼** ✗。
+- 白名单：静态 `""`/`index.html`/`assets/`/`plugins/`/`manifest`/`favicon` ✓ + **DSH RPC 方法白名单**（`session/list`、`session/page`、`settings/describe`…）✓，
+  `session/prompt`、`settings/update`、`terminal/*`、`credentials/*` **一律 403** ✓；只 GET/HEAD ✓；**没放行面板路径** ✓（面板写死绝对 `/api`，经中继打开等于把读写会话交给管理面 ✗）。
+- 安卓：**App 内 WebView** ✓ + `shouldInterceptRequest` 对**同源**补 `Authorization: Bearer <手机令牌>` ✓ ——
+  **系统浏览器必 401** ✗（中继对每个 `api/*` 都要 Authorization，浏览器不带 ✗）；令牌**只进请求头** ✓（不拼 URL、不注入 JS、日志不打 path ✓）、跨源不补 ✓、外链交系统浏览器且不带令牌 ✓。
+- 边界：DSH 实时流是 **WebSocket** ✗，中继只搬 HTTP → 这页是**快照视图** ✓（会话/历史能看 ✓，不实时推 ✗）；非 GET/HEAD 同源请求补不了头 ✓（会亮提示 ✓）。
+
+### `gh-push.ps1`：退出码可能是**假的**
+
+- 老版本确有"`Confirm-Push` 返回值被丢弃 → push 退 0 就报成功" ✗ → 已改成 **`ls-remote` 逐行解析 + ref 精确等于 `refs/heads/<branch>` + 与本地 HEAD 小写化精确相等** 才算成功 ✓（空/格式怪/多行/别的 ref/非零退出全判失败 ✓）。
+- ⚠️ **另有一个假象** ✗：从命令行以 `-File` 启动该脚本时，会出现"**1 秒、退出码 0、零输出、脚本体一行没执行**"✗（插 `Write-Host` 标记不打印、`Start-Transcript` 不生成 ✓）；同一份文件用 `python.exe` 直拉则一切正常 ✓。
+- **铁律**：验收推送**别只看退出码** ✗ → 看输出里的 **`verified: origin/<branch> == <sha>`** 或 `push OK` ✓，并 `git ls-remote` 核一次 ✓。
+
+### 测试/协作两条经验
+
+- **并发改同一棵 `android` 树会互相踩** ✗：`Conflicting overloads`、`classes.jar 被另一个构建占用` ✓ → 收尾跑门禁前先等"树安静"（mtime 静 2–3 分钟 ✓），或让 agent 在 `git worktree` 隔离副本里验证 ✓。
+- **用例按"下一个函数签名"切源码** ✓（`TestSources` 那套）：往两个函数之间插新函数会让既有用例**红** ✓ → 新代码要挑好插入点 ✓（本次已按"函数段"标出禁止插入区 ✓）。
