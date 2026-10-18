@@ -27,6 +27,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import com.echo.contact.data.dto.CommandItem
 import com.echo.contact.ui.theme.EchoPalette
@@ -62,6 +63,14 @@ internal fun ErrorCard(message: String) {
 internal fun EchoCard(
     modifier: Modifier = Modifier,
     container: Color = EchoPalette.Card,
+    /**
+     * 卡内边距。默认 14（面板那套）；首页的紧凑卡传 [HomeLayoutSpec.CARD_PADDING_DP]。
+     *
+     * 为什么要开这个口子：首页要在 360×640 上一屏放得下（用户 2026-10-18 傍晚），
+     * 每张卡省下来的 8dp 就是"放得下"与"要滚"的差别；而别的页没有这个压力，
+     * 保持原来的 14dp 不动（同一种卡在不同页长得不一样才怪）。
+     */
+    contentPadding: Dp = 14.dp,
     content: @Composable () -> Unit,
 ) {
     Card(
@@ -70,7 +79,7 @@ internal fun EchoCard(
         colors = CardDefaults.cardColors(containerColor = container),
         border = BorderStroke(1.dp, EchoPalette.Border),
     ) {
-        Box(modifier = Modifier.padding(14.dp)) { content() }
+        Box(modifier = Modifier.padding(contentPadding)) { content() }
     }
 }
 

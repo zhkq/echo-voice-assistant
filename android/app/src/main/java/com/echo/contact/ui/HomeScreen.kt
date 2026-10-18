@@ -93,24 +93,23 @@ fun HomeScreen(onUnpair: () -> Unit) {
 
     Scaffold(
         topBar = {
-            TopAppBar(
-                title = {
-                    // ⚠️ 顶栏**不再**画应用名与配对地址（2026-10-18 用户要求把它们并进首页那张卡）：
-                    // 同一个事实（连没连上、连的是谁）原来在顶栏和状态卡各画一次，
-                    // 两处迟早说不一样的话。现在全 App 只有 `HomeTopCard` 那一处画，
-                    // 顶栏只留"当前是哪一页"（首页留空 —— 首页顶部的卡本身就是标题）
-                    // 和刷新按钮。判据：`homeTopBarTitle` + `HomeCardsTest`。
-                    val title = homeTopBarTitle(currentTab)
-                    if (title.isNotEmpty()) {
-                        Text(title, style = MaterialTheme.typography.titleMedium)
-                    }
-                },
-                actions = {
-                    IconButton(onClick = { vm.refresh() }) {
-                        Icon(Icons.Default.Refresh, contentDescription = "刷新")
-                    }
-                },
-            )
+            // 2026-10-18 傍晚：用户点名"**现在顶部那个空条**全面设计"。
+            // 首页原来那条顶栏只画一个留空的标题（`homeTopBarTitle` 对首页返回空串），
+            // 整整 64dp 全是空白 —— 这一版**整块不画**（`HomeTopBar.None`），
+            // 应用名 + 连接状态只留在下面那张合并卡里（同一个事实不画两遍）。
+            // 别的页仍然有顶栏：页名 + 刷新（那些页没有合并卡，顶栏是它们唯一的位置提示）。
+            // 判据：`homeTopBar` + `HomeLayoutTest`（首页顶栏高度必须是 0）。
+            when (val bar = homeTopBar(currentTab)) {
+                HomeTopBar.None -> Unit
+                is HomeTopBar.Title -> TopAppBar(
+                    title = { Text(bar.text, style = MaterialTheme.typography.titleMedium) },
+                    actions = {
+                        IconButton(onClick = { vm.refresh() }) {
+                            Icon(Icons.Default.Refresh, contentDescription = "刷新")
+                        }
+                    },
+                )
+            }
         },
         bottomBar = {
             // 造型在 EchoNavBar：中间那颗（正中间 = echoCenterTab(ECHO_TABS)）凸起、更大；
@@ -124,9 +123,12 @@ fun HomeScreen(onUnpair: () -> Unit) {
         },
     ) { padding ->
         Column(modifier = Modifier.fillMaxSize().padding(padding)) {
-            // 不在听（OFF）就不显示：首页不该常驻一条空条；出错停了也**要显示**（如实说停下了）。
-            listenStrip?.let { strip ->
-                ListenStrip(strip, listenPhase) { vm.selectTab(EchoTab.COMMANDS.ordinal) }
+            // 常驻听写细条：**首页不画**（首页自己在内容区有一条同样的"在听"行，
+            // 两处都画就等于同一个事实显示两遍）。别的页没有那条行，所以照旧挂在最上面。
+            if (currentTab != START_TAB) {
+                listenStrip?.let { strip ->
+                    ListenStrip(strip, listenPhase) { vm.selectTab(EchoTab.COMMANDS.ordinal) }
+                }
             }
             Box(modifier = Modifier.fillMaxSize()) {
                 when (currentTab) {
@@ -157,6 +159,38 @@ fun HomeScreen(onUnpair: () -> Unit) {
  * 所以"应用名只出现一处"这条不会被它破掉 —— 判据同时钉住这一点。
  */
 internal fun homeTopBarTitle(tab: EchoTab): String = if (tab == START_TAB) "" else tab.title
+
+/**
+ * 顶栏这一块**画什么**（纯数据，`HomeLayoutTest` 钉住）。
+ *
+ * 为什么要多这一层：光有 [homeTopBarTitle] "返回空串"并不等于"没有空条"——
+ * 只要 `Scaffold` 的 `topBar` 里仍然调用 `TopAppBar`，那 64dp 就还在，
+ * 只是里面什么都没写。用户看到的正是这个"顶部空条"。
+ *
+ * 所以把顶栏做成两种**互斥**的形态：
+ *  * [None] = **整块不存在**（首页：应用名/连接状态在合并卡里，顶栏不该再占一条）；
+ *  * [Title] = 页名（其余四页：它们没有合并卡，顶栏是唯一的位置提示）。
+ *
+ * 判据（`HomeLayoutTest`）：首页必须 [None]，其余页必须是**非空**的 [Title] ——
+ * "不空"这件事是断言出来的，不是靠"标题恰好有字"碰出来的。
+ */
+internal sealed class HomeTopBar {
+    /** 不画顶栏（**整块不存在**，不是画一条空的）。 */
+    data object None : HomeTopBar()
+
+    /** 画一条顶栏，标题为 [text]（一定非空）。 */
+    data class Title(val text: String) : HomeTopBar()
+}
+
+/**
+ * 当前页的顶栏形态（纯函数）。首页 → [HomeTopBar.None]，其余页 → [HomeTopBar.Title]。
+ *
+ * 标题仍然只有一个来源（[homeTopBarTitle]），所以"首页留空"这条既有判据不会被绕过。
+ */
+internal fun homeTopBar(tab: EchoTab): HomeTopBar {
+    val title = homeTopBarTitle(tab)
+    return if (title.isBlank()) HomeTopBar.None else HomeTopBar.Title(title)
+}
 
 /**
  * 常驻听写细条（任务 B4）：一行小字 + 一个状态灯，点一下回「指令」页。
@@ -210,7 +244,7 @@ private fun ListenStrip(strip: ListenState.Strip, phase: ListenState.Phase, onCl
  * "在听下来（绿）"与"暂停了（黄）" —— 如果两种都亮绿的，"已暂停"就等于没提示，
  * 那这条细条白加了。紫色给"在工作但不是收音"（等回复/念回复），红色给出错。
  */
-private fun listenStripColor(phase: ListenState.Phase) = when (phase) {
+internal fun listenStripColor(phase: ListenState.Phase) = when (phase) {
     ListenState.Phase.STARTING, ListenState.Phase.LISTENING -> EchoPalette.Green
     ListenState.Phase.THINKING, ListenState.Phase.SPEAKING -> EchoPalette.Purple
     ListenState.Phase.PAUSED -> EchoPalette.Yellow

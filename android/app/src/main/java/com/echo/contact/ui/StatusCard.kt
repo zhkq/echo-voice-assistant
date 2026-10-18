@@ -209,7 +209,7 @@ fun HomeTopCard(vm: MainViewModel) {
         else -> EchoPalette.Muted
     }
 
-    EchoCard {
+    EchoCard(contentPadding = HomeLayoutSpec.TOP_CARD_PADDING_DP.dp) {
         Column {
             // ---- ① 应用名 + 状态灯 + 连接状态（全 App 唯一一处）----
             Row(
@@ -232,7 +232,10 @@ fun HomeTopCard(vm: MainViewModel) {
             }
 
             // ---- ② 配对地址（小字、可截断；点一下复制）----
-            Spacer(Modifier.height(5.dp))
+            // 2026-10-18 傍晚：三行之间的缝收紧到 3/4dp —— 这张卡要在 360×640 上
+            // 和下面三张功能卡一起装进一屏（预算见 `HomeLayoutSpec`），
+            // 省下来的每一 dp 都是"放得下"与"要滚"的差别。
+            Spacer(Modifier.height(3.dp))
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -261,7 +264,7 @@ fun HomeTopCard(vm: MainViewModel) {
             }
 
             // ---- ③ 9 个组件的概要（紧凑；点开看详情）----
-            Spacer(Modifier.height(6.dp))
+            Spacer(Modifier.height(4.dp))
             Row(
                 modifier = Modifier
                     .fillMaxWidth()

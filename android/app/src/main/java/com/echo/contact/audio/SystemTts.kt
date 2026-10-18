@@ -5,6 +5,7 @@ import android.provider.Settings
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import android.speech.tts.Voice
+import com.echo.contact.service.SpeechText
 import java.util.Locale
 
 /**
@@ -114,6 +115,14 @@ class SystemTts(context: Context) {
             onFinished()
             return
         }
+        // **念之前**把「8-19 度」这类数字区间归一化成「8 到 19 度」——
+        // 引擎会把 `8-19` 念成"八百一十九"（用户 2026-10-18 的原话）。
+        // 为什么放在**这一层**：它是手机上**所有**系统朗读的最后一站（界面的「念」与
+        // 常驻听写那条路都调它）。上游（`MainViewModel.speak` / `ListenService.speak`）
+        // 也要归一化一次，因为「ECHO 念」那条是把文本发给服务端的；`normalize` 幂等，
+        // 所以这里再兜一次不会多出"到 到"。
+        // ⚠️ 只改**送去合成**的那串：`text` 本身（界面上的原文）一个字都不动。
+        val spoken = SpeechText.normalize(text)
         engine.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
             override fun onStart(utteranceId: String?) = Unit
             override fun onDone(utteranceId: String?) = onFinished()
@@ -121,7 +130,7 @@ class SystemTts(context: Context) {
             override fun onError(utteranceId: String?) = onFinished()
             override fun onError(utteranceId: String?, errorCode: Int) = onFinished()
         })
-        engine.speak(text, TextToSpeech.QUEUE_FLUSH, null, "echo-tts-" + System.currentTimeMillis())
+        engine.speak(spoken, TextToSpeech.QUEUE_FLUSH, null, "echo-tts-" + System.currentTimeMillis())
     }
 
     fun stop() {

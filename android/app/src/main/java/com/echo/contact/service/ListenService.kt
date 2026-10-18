@@ -472,6 +472,10 @@ class ListenService : Service() {
 
     private suspend fun speak(engine: SystemTts, api: EchoApi, text: String) {
         if (text.isBlank()) return
+        // ⚠️ 归一化**只用在"念"的那两处**（ECHO 合成请求 / 系统引擎），
+        // 通知与状态里仍然摆**原文**：用户看到的必须还是屏幕上那句（`8-19 度`），
+        // 只有耳朵里听到的换成"8 到 19 度"（用户 2026-10-18 的原话：8-19 被念成 819）。
+        val spoken = SpeechText.normalize(text)
         ListenState.set(ListenState.Phase.SPEAKING, text.take(NOTIFICATION_TEXT_MAX))
         refreshNotification(ListenState.Phase.SPEAKING, text.take(NOTIFICATION_TEXT_MAX))
 
@@ -481,7 +485,7 @@ class ListenService : Service() {
         // 静默回落 = "设置了没生效"，那是最难查的一类。
         if (SpeakPrefs.load(this) == SpeakPrefs.ENGINE_ECHO) {
             val bytes = runCatching {
-                val resp = api.tts(com.echo.contact.data.dto.TtsRequest(text = text))
+                val resp = api.tts(com.echo.contact.data.dto.TtsRequest(text = spoken))
                 if (resp.isSuccessful) resp.body()?.bytes() else null
             }.getOrNull()
             if (bytes != null && bytes.isNotEmpty()) {
@@ -495,7 +499,7 @@ class ListenService : Service() {
         }
         withTimeoutOrNull(30_000) {
             suspendCancellableCoroutine { cont ->
-                engine.speak(text) { if (cont.isActive) cont.resume(Unit) }
+                engine.speak(spoken) { if (cont.isActive) cont.resume(Unit) }
             }
         }
     }

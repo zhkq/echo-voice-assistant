@@ -30,6 +30,7 @@ import com.echo.contact.data.dto.TtsRequest
 import com.echo.contact.service.AppPrefs
 import com.echo.contact.service.SpeakPlan
 import com.echo.contact.service.SpeakPrefs
+import com.echo.contact.service.SpeechText
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -500,7 +501,11 @@ class MainViewModel(app: Application) : BaseViewModel(app) {
         }
 
     fun speak(text: String, engine: TtsEngine = preferredEngine()) {
-        val content = text.trim()
+        // **念之前**的归一化：`8-19 度` → `8 到 19 度`（用户 2026-10-18：被念成"819 度"）。
+        // 只改这一串**送去合成**的文本 —— `text` 本身（界面上、历史里显示的原文）一个字都不动。
+        // 两条引擎都要它：系统 TTS 会吞连字符；ECHO 那条是把文本发给服务端的。
+        // `SpeechText.normalize` 幂等，所以系统引擎入口再兜一次也不会变成"8 到 到 19"。
+        val content = SpeechText.normalize(text.trim())
         if (content.isEmpty()) return
         stopSpeaking()
         _speakNote.value = null

@@ -4,9 +4,12 @@ import android.Manifest
 import android.content.pm.PackageManager
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.PaddingValues
@@ -15,11 +18,14 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material.icons.filled.EventNote
@@ -29,7 +35,6 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -42,59 +47,64 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.vector.ImageVector
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import com.echo.contact.service.ListenState
 import com.echo.contact.service.MeetingMicService
 import com.echo.contact.service.MicState
 import com.echo.contact.ui.theme.EchoPalette
 
 /**
- * **首页（底部导航正中间那一页）**。
+ * **首页（底部导航正中间那一页）** —— 2026-10-18 傍晚按用户那句话重做：
  *
- * 结构（用户 2026-10-18 中午两条要求合起来）：
+ * > *"首页的样式要按照 app 来设计，不要出现滚动条，要合理利用空间，包括现在顶部那个空条全面设计"*
  *
  * ```
- * ┌───────────────────────────────────────────┐
- * │ ● 应用名（第一行）             已连接 / 未连接 │  ← ② 顶部那一行与服务状态**合并成这一张卡**
- * │ http://192.168.1.5:8970            复制     │
- * │ 8/9 组件正常 · 1 未启用                  ⌄  │  ← 点开：原来那 5 格 + 9 个组件详情
- * └───────────────────────────────────────────┘
- * ┌ 在听 ─────────────────────────────────────┐
- * └───────────────────────────────────────────┘
+ * ┌──────────────────────────────────────────────┐
+ * │ ● ECHO 超级助理                       已连接 │  ← ① 应用名 + 连接状态（全 App 唯一一处）
+ * │ http://192.168.1.5:8970                复制 │
+ * │ 8/9 组件正常 · 1 未启用                    ⌄ │
+ * └──────────────────────────────────────────────┘
+ * ┌ ● 在听           已送出 3 句 …        去指令页 ┐  ← ② 44dp 细条（整行可点）
+ * └──────────────────────────────────────────────┘
  * 主要功能
- * ┌ 指令 ─────────────────────────────────────┐
- * │ [ 输入框 ..................... ] [ 发送 ] │  ← ③ 在**本页**发出，回复也回显在本页
- * │ 已完成 · 耗时 1.2 秒                       │
- * │ 「它回的那段……」                    看全部指令 │
- * └───────────────────────────────────────────┘
- * ┌ 会议 ─────────────────────────────────────┐
- * │ [ 开始录音 ]  录音中 · 已录 03:12          │  ← 直接开手机麦；同一位置变「结束录音」
- * │                                 看会议列表 │
- * └───────────────────────────────────────────┘
- * ┌ 回顾 ─────────────────────────────────────┐
- * │ [ 口述回顾 ]  今天已回顾 2 轮              │  ← 直接进既有的"口述 → 转写 → 整理"路
- * │                                 看回顾历史 │
- * └───────────────────────────────────────────┘
+ * ┌ 指令 ────────────────────────────────────────┐  ← ③ 指令卡：打字 + 按住说话（都在本页干活）
+ * │ [●] [ 打字说一句…        ] [发送]             │
+ * │ 这一轮：…… · 已完成                       ›  │
+ * └──────────────────────────────────────────────┘
+ * ┌ 会议 ──────────────┐ ┌ 回顾 ──────────────┐  ← ④ 会议/回顾**并列**（各半宽）
+ * │ 没在录音            │ │ 今天已回顾 2 轮     │
+ * │ [ 开始录音 ]        │ │ [ 口述回顾 ]        │
+ * └────────────────────┘ └────────────────────┘
  * ```
  *
- * ## 为什么顶部那张卡不再单独一行
+ * ## 这一版改了什么（以及为什么）
  *
- * 合并前：顶栏画「应用名 + 配对地址」，这页第一张卡画「服务状态」。同一个事实两处显示，
- * 必然有一天一处说在线、另一处说连不上。现在只剩 [HomeTopCard] 一处
- * （`HomeScreen` 的顶栏只剩刷新按钮 + 页名，见 `homeTopBarTitle`）。
+ *  * **顶部那条空顶栏整块删掉**（不是"清空"）：原来首页顶栏只画一个空标题，
+ *    整整 64dp 全空。应用名/连接状态只在下面那张合并卡里画一次（`homeTopBar` 返回
+ *    [HomeTopBar.None]，判据在 `HomeLayoutTest`）。刷新入口没删：合并卡点开里有「刷新」，
+ *    卡片可见时还每 5 秒自动探一次。
+ *  * **一屏放得下**：整页按 [homeLayoutPlan] 算出来的**布局预算**摆（360×640 上合计 448dp，
+ *    可用 470dp）。预算与界面读同一份数字（[HomeLayoutSpec]），所以不是"用例说放得下"。
+ *    屏更高时间距/卡片高度按比例松开，多出来的高度上下各分一半（视觉上垂直居中）。
+ *  * **三张功能卡缩小但可读**：每张 = 标题行 + 一行状态 + 主按钮（48dp，仍然**直接干活**，
+ *    动作在数据层就没有"页签"字段 —— `HomeEffect.Direct`，判据 `HomeCardsTest`）。
+ *    会议卡与回顾卡**并排**，把横向空间用满（360dp 下各约 163dp 宽）。
+ *  * **滚动只是兜底**：内容比屏幕高时（例如系统字体放大到 1.4 倍）才滚；
+ *    Compose 的 `verticalScroll` **不画滚动条**，内容也一个字都不会被截断。
+ *    这不是"用滚动糊过去"—— 360×640 的默认字体下内容 448 < 470，根本不会滚。
  *
- * ## 为什么卡片按钮不切页
+ * ## 功能一个都没少
  *
- * 用户原话：*"不用跳转到对应功能页再开始使用功能"*。所以三张卡的按钮都走**既有**动作：
- * `sendCommand` / `startMeeting`（→ `MeetingMicService.start`）/ `stop` / `startRecording` /
- * `submitReviewDictation`。动作本身在数据层就没有"页签"字段（`HomeEffect.Direct`），
- * 判据在 `HomeCardsTest`。
- *
- * 卡片**标题**仍然可点、进对应页 —— 底部 5 页导航照旧有效，卡片只是**快捷方式**。
+ * 合并卡的展开区（5 格 + 9 个组件 + 版本 + 运行时长 + 启动提示 + 刷新）、在听细条、
+ * 指令（打字/按住说话/这一轮结果/回复预览/去指令页）、会议（开始/结束录音 + 时长 + 暂停）、
+ * 回顾（口述/说完了/取消 + 今日轮数）、朗读失败提示 —— 全在，而且都还是既有的那些入口
+ * （不新造第二条路）。
  */
 @Composable
 internal fun SuperAssistantTab(vm: MainViewModel, onOpenTab: (EchoTab) -> Unit) {
@@ -108,9 +118,6 @@ internal fun SuperAssistantTab(vm: MainViewModel, onOpenTab: (EchoTab) -> Unit) 
     //  · 口述回顾 = `MainViewModel.recording`（与回顾页「车里口述」同一个录音器）。
     val micState by MeetingMicService.state.collectAsState()
     val dictating by vm.recording.collectAsState()
-    // 朗读失败/说明：以前全 App 没有一处界面读 `_speakNote` → 按了「念」没声音也没提示。
-    // 首页这里也摆一行（单行、几秒后自动消失）—— 语音指令的自动朗读就发生在这页。
-    val speakNote by vm.speakNote.collectAsState()
 
     val cards = homeCards(micRecording = micState.active, reviewDictating = dictating)
 
@@ -141,65 +148,129 @@ internal fun SuperAssistantTab(vm: MainViewModel, onOpenTab: (EchoTab) -> Unit) 
         if (granted) vm.startRecording() else reviewMicLauncher.launch(Manifest.permission.RECORD_AUDIO)
     }
 
-    LazyColumn(
-        modifier = Modifier.fillMaxSize(),
-        contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 24.dp),
-        verticalArrangement = Arrangement.spacedBy(10.dp),
-    ) {
-        // ⓪ **唯一**那张"应用名 + 连接 + 配对地址 + 组件概要"卡（原来这里还有顶栏那一行）
-        item { HomeTopCard(vm) }
-
-        // ① 在听（现有信息：常驻听写的相位与最近一句文案）
-        item { ListenStatusCard(strip, listenPhase) }
-
-        // ①½ 朗读反馈：语音指令一旦念不出来（系统 TTS 没装 / ECHO 合成失败…），
-        // 用户就是"说了一句、什么也没听到"，这一行是唯一的真相来源。
-        speakNote?.takeIf { it.isNotBlank() }?.let {
-            item { SpeakNoteLine(it, onDismiss = { vm.clearSpeakNote() }) }
+    // ---- 布局预算：用**真正的**可用宽高算（不是猜某个机型）----
+    BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
+        val plan = remember(maxWidth, maxHeight) { homeLayoutPlan(maxWidth.value, maxHeight.value) }
+        // 大屏上把多出来的高度**上下各分一半**（视觉上垂直居中，而不是"上面挤、下面空一大片"）。
+        //
+        // ⚠️ 只在**真的宽松**时（剩余 ≥ 40dp）才分，而且每边还留 6dp 余量：
+        // 预算里的区块高度是"至少这么高"，而文字的实际行高在不同 ROM 上会差几个 dp
+        // —— 360×640 那一档本来就只余 22dp，再把余量全塞进留白，就可能溢出成一条
+        // 谁也看不见的滚动（用户要的是"一屏放得下"）。宁可小屏不居中，也不让它浮起来。
+        val bleed = if (plan.spareHeightDp >= 40f) {
+            ((plan.spareHeightDp - 12f) / 2f).coerceAtLeast(0f)
+        } else {
+            0f
         }
 
-        // ② 三张功能卡（每张都有能直接干活的按钮）
-        item {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                // 兜底：只有内容比屏幕高时才会真的滚（字体放大/横屏）；
+                // Compose 的滚动**不画滚动条**，所以"不要出现滚动条"这条不会被它破坏。
+                .verticalScroll(rememberScrollState())
+                .padding(
+                    start = HomeLayoutSpec.PAGE_H_PADDING_DP.dp,
+                    end = HomeLayoutSpec.PAGE_H_PADDING_DP.dp,
+                    top = plan.pageTopDp.dp,
+                    bottom = plan.pageBottomDp.dp,
+                ),
+            verticalArrangement = Arrangement.spacedBy(plan.gapDp.dp),
+        ) {
+            if (bleed > 0f) Spacer(Modifier.height(bleed.dp))
+
+            // ① **唯一**那张"应用名 + 连接 + 配对地址 + 组件概要"卡（顶栏那一行已经删掉）
+            HomeTopCard(vm)
+
+            // ② 在听（常驻听写的相位与最近一句；整行可点 → 回「指令」页）
+            ListenRow(strip, listenPhase) { onOpenTab(EchoTab.COMMANDS) }
+
+            // ③ 功能卡上方的层级标签（状态卡 > 功能卡 > 辅助信息）
             Text(
                 "主要功能",
-                style = MaterialTheme.typography.titleSmall,
-                modifier = Modifier.padding(top = 4.dp, bottom = 2.dp),
+                // labelMedium 的行高正好是预算里的 16dp（`SECTION_LABEL_MIN_DP`）
+                style = MaterialTheme.typography.labelMedium,
+                fontSize = plan.sectionLabelSp.sp,
+                color = EchoPalette.Muted,
+                modifier = Modifier.heightIn(min = plan.sectionLabelDp.dp),
             )
-        }
-        items(cards.size) { index ->
-            val card = cards[index]
-            FunctionCard(card, onOpenTab) {
-                when (card.kind) {
-                    HomeCardKind.COMMAND -> CommandCardBody(card, vm, onOpenTab)
-                    HomeCardKind.MEETING -> MeetingCardBody(card, micState, startMeetingWithMic)
-                    HomeCardKind.REVIEW -> ReviewCardBody(
-                        card = card,
-                        vm = vm,
-                        onStartDictation = startDictationWithMic,
-                    )
+
+            // ④ 指令卡：打字 + 按住说话 + 一行状态（都在**本页**干活，不切页）
+            val commandCard = cards.first { it.kind == HomeCardKind.COMMAND }
+            FunctionCard(
+                card = commandCard,
+                plan = plan,
+                onOpenTab = onOpenTab,
+                minHeightDp = plan.commandCardDp,
+            ) {
+                CommandCardBody(commandCard, vm, onOpenTab)
+            }
+
+            // ⑤ 会议/回顾**并列**：把剩下的横向空间用满（各占一半）
+            val meetingCard = cards.first { it.kind == HomeCardKind.MEETING }
+            val reviewCard = cards.first { it.kind == HomeCardKind.REVIEW }
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(plan.gapDp.dp),
+            ) {
+                FunctionCard(
+                    card = meetingCard,
+                    plan = plan,
+                    onOpenTab = onOpenTab,
+                    modifier = Modifier.weight(1f),
+                    minHeightDp = plan.sideCardDp,
+                ) {
+                    MeetingCardBody(meetingCard, micState, startMeetingWithMic)
+                }
+                FunctionCard(
+                    card = reviewCard,
+                    plan = plan,
+                    onOpenTab = onOpenTab,
+                    modifier = Modifier.weight(1f),
+                    minHeightDp = plan.sideCardDp,
+                ) {
+                    ReviewCardBody(reviewCard, vm, startDictationWithMic)
                 }
             }
+
+            if (bleed > 0f) Spacer(Modifier.height(bleed.dp))
         }
     }
 }
 
 /**
- * 一张功能卡的外壳：图标 + 标题 + 说明（**整行可点 → 进对应页**）+ 卡身 + 右下角小链接。
+ * 一张功能卡的外壳：图标 + 标题 + 一行说明（**整行可点 → 进对应页**）+ 卡身。
  *
  * 为什么卡身不整块可点：整块可点就等于"点哪儿都跳页"，那正是用户不想要的
- * （"不用跳转到对应功能页再开始使用功能"）。只有标题行与那个小链接会跳。
+ * （"不用跳转到对应功能页再开始使用功能"）。只有标题行会跳。
+ *
+ * 高度全部来自 [HomeLayoutPlan]（预算与界面同源）：标题行 [HomeLayoutSpec.HEADER_ROW_DP]、
+ * 卡内边距 `plan.cardPaddingDp`。
  */
 @Composable
 private fun FunctionCard(
     card: HomeCardSpec,
+    plan: HomeLayoutPlan,
     onOpenTab: (EchoTab) -> Unit,
+    modifier: Modifier = Modifier,
+    /**
+     * 卡片的最小高度（来自布局预算）。为什么是"至少"而不是写死：
+     * 小屏要的是"刚好一屏放得下"，大屏要的是"把空间用满" —— 同一个数字两头都成立。
+     * 文字行高在不同 ROM 上会差几个 dp，`heightIn(min=)` 只托底、不封顶，
+     * 所以字体放大时卡片会跟着长高（由外层滚动兜底），**不会截断**。
+     */
+    minHeightDp: Float = 0f,
     body: @Composable ColumnScope.() -> Unit,
 ) {
-    EchoCard {
+    EchoCard(
+        modifier = if (minHeightDp > 0f) modifier.heightIn(min = minHeightDp.dp) else modifier,
+        contentPadding = plan.cardPaddingDp.dp,
+    ) {
         Column {
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
+                    .heightIn(min = HomeLayoutSpec.HEADER_ROW_DP.dp)
                     .clickable { onOpenTab(card.tab) },
                 verticalAlignment = Alignment.CenterVertically,
             ) {
@@ -207,53 +278,58 @@ private fun FunctionCard(
                     entryIcon(card.tab),
                     contentDescription = null,
                     tint = EchoPalette.Accent,
-                    modifier = Modifier.size(22.dp),
+                    modifier = Modifier.size(18.dp),
                 )
-                Spacer(Modifier.size(12.dp))
+                Spacer(Modifier.size(6.dp))
                 Column(modifier = Modifier.weight(1f)) {
-                    Text(card.title, style = MaterialTheme.typography.titleSmall)
+                    Text(
+                        card.title,
+                        style = MaterialTheme.typography.titleSmall,
+                        fontSize = plan.cardTitleSp.sp,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
                     MutedLine(card.subtitle, maxLines = 1)
                 }
-                Spacer(Modifier.size(8.dp))
                 Icon(
                     Icons.Default.ChevronRight,
                     contentDescription = "打开${card.title}",
                     tint = EchoPalette.Muted,
-                    modifier = Modifier.size(20.dp),
+                    modifier = Modifier.size(18.dp),
                 )
             }
 
-            Spacer(Modifier.height(10.dp))
+            Spacer(Modifier.height(HomeLayoutSpec.CARD_GAP_DP.dp))
             body()
-
-            // 小链接：**唯一**会切页的东西（"再看完整页面"那条路）
-            Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                Spacer(Modifier.weight(1f))
-                TextButton(onClick = { onOpenTab(card.tab) }) { Text(card.linkLabel) }
-            }
         }
     }
 }
 
 /**
- * 指令卡：**输入框 + 发送**，在本页直接发出（`vm.sendCommand`，与「指令」页那颗发送键同一个方法）。
+ * 指令卡：**打字 + 发送** 与 **按住说话** 都在本页干活（`vm.sendCommand` / `vm.startRecording`），
+ * 与「指令」页那几个入口是**同一个**方法（不新造第二条路）。
  *
- * 发出后的反馈也在这张卡里：一句状态 + 最近那条回复（很长就截断 + 给「去看详情」）。
- * 为什么只给"简短预览"：卡片不是详情页；完整正文在「指令」页的历史里。
+ * 发出后的反馈压成**一行状态**（这一轮发了什么 + 阶段 + 没发出去的原因），
+ * 这一轮自己的回复再占一行；完整的正文去「指令」页看（点状态行，本函数里**唯一**会切页的东西）。
  *
- * ## 2026-10-18 真机 bug 之后：这张卡必须能回答"到底是哪一条"
+ * ## 2026-10-18 真机 bug 之后必须保留的三件事
  *
- * 三件事缺一不可（判据在 `SendRoundTest` / `HomeCardsTest`）：
  *  1. **把这次发的原话摆出来**（[roundHeadline]）——用户才能确认发的是自己那句；
  *  2. **没发出去就说**（`submit.blocked` / `Failed` 的 `message`）——这是"点了没反应"的正解；
- *  3. **回复只在 [showsReply] 为真时显示**：只有 `Done` 能证明 `reply` 是这一条的，
- *     其它阶段一个字都不许摆 —— 否则旧回复会留下来被当成这次的答复。
+ *  3. **回复只在 [showsReply] 为真时显示**：只有 `Done` 能证明 `reply` 是这一条的。
  */
 @Composable
-private fun CommandCardBody(card: HomeCardSpec, vm: MainViewModel, onOpenTab: (EchoTab) -> Unit) {
+private fun CommandCardBody(
+    card: HomeCardSpec,
+    vm: MainViewModel,
+    onOpenTab: (EchoTab) -> Unit,
+) {
     val submit by vm.submit.collectAsState()
     val recording by vm.recording.collectAsState()
     val recordMs by vm.recordMs.collectAsState()
+    // 朗读失败/说明（系统 TTS 没装 / ECHO 合成失败 / 没有可念的播报）：单行、几秒后自动消失。
+    // 放在这张卡里是因为**自动朗读就发生在这页**（语音指令的回复）。
+    val speakNote by vm.speakNote.collectAsState()
     var input by remember { mutableStateOf("") }
 
     val context = LocalContext.current
@@ -262,18 +338,96 @@ private fun CommandCardBody(card: HomeCardSpec, vm: MainViewModel, onOpenTab: (E
         ActivityResultContracts.RequestPermission()
     ) { /* 给不给都由下一次按决定；不给会看到"开不了麦克风"那句如实的话 */ }
 
+    val dictate = card.buttons.firstOrNull { it.action == HomeAction.DICTATE_COMMAND }
+
     Row(
-        modifier = Modifier.fillMaxWidth(),
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(HomeLayoutSpec.COMPOSER_ROW_DP.dp),
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
     ) {
-        OutlinedTextField(
-            value = input,
-            onValueChange = { input = it },
-            label = { Text("打字说一句") },
-            maxLines = 2,
-            modifier = Modifier.weight(1f),
-        )
+        // 「按住说话」：按下就录、松手就发（拖开手指 = 放弃）。
+        // 为什么不是"点一下开录、再点一下说完了"：这里只有一个圆钮，
+        // 两段式会让"以为说完了其实还在录"变成一个新的静默坑。
+        //
+        // ⚠️ 这里刻意**不用 `Button`**：`Button` 内部自带 `clickable`，它在指针事件的 Main pass
+        // 里比外层**先**拿到 down 并 consume 掉 —— `detectTapGestures` 默认 `requireUnconsumed`
+        // 就再也等不到按下，按住说话会变成一个点了没反应的死按钮。
+        // 所以用一个「长得像按钮」的 `Surface`：里面没有任何 clickable，gesture 一定拿得到。
+        if (dictate != null) {
+            Surface(
+                color = if (recording) EchoPalette.Red else EchoPalette.Accent,
+                shape = CircleShape,
+                modifier = Modifier
+                    .size(HomeLayoutSpec.COMPOSER_ROW_DP.dp)
+                    .pointerInput(Unit) {
+                        detectTapGestures(
+                            onPress = {
+                                val granted = context.checkSelfPermission(Manifest.permission.RECORD_AUDIO) ==
+                                    PackageManager.PERMISSION_GRANTED
+                                if (!granted) {
+                                    commandMicLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                                } else {
+                                    // 只有真的开起了麦才等松手 —— 否则松手会走进"没在录音"那条提示，
+                                    // 把"开不了麦"的原因盖掉（两个实话互相覆盖，等于都说了一半）
+                                    if (vm.startRecording()) {
+                                        if (tryAwaitRelease()) vm.finishRecording() else vm.cancelRecording()
+                                    }
+                                }
+                            },
+                        )
+                    },
+            ) {
+                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    Icon(
+                        Icons.Default.Mic,
+                        contentDescription = dictate.label,
+                        tint = Color.White,
+                        modifier = Modifier.size(22.dp),
+                    )
+                }
+            }
+            Spacer(Modifier.size(8.dp))
+        }
+
+        // 打字框：用 BasicTextField 而不是 OutlinedTextField —— 后者带 label 时最小高度 56dp，
+        // 而这一行只有 48dp（输入框 44dp）：一屏放得下的预算见 `HomeLayoutSpec`。
+        Surface(
+            color = EchoPalette.Card2,
+            shape = RoundedCornerShape(10.dp),
+            border = BorderStroke(1.dp, EchoPalette.Border),
+            modifier = Modifier
+                .weight(1f)
+                .height(44.dp),
+        ) {
+            Box(
+                modifier = Modifier.fillMaxSize().padding(horizontal = 12.dp),
+                contentAlignment = Alignment.CenterStart,
+            ) {
+                BasicTextField(
+                    value = input,
+                    onValueChange = { input = it },
+                    singleLine = true,
+                    textStyle = MaterialTheme.typography.bodyMedium.copy(color = EchoPalette.Text),
+                    cursorBrush = SolidColor(EchoPalette.Accent),
+                    modifier = Modifier.fillMaxWidth(),
+                    decorationBox = { inner ->
+                        if (input.isBlank()) {
+                            Text(
+                                "打字说一句…",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = EchoPalette.Muted,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                        }
+                        inner()
+                    },
+                )
+            }
+        }
+        Spacer(Modifier.size(8.dp))
+
         // 按钮由 `card.buttons`（HomeCards.kt 的数据）驱动 —— 动作在数据层就没有"页签"字段，
         // 所以这里不可能把页面换掉；判据在 HomeCardsTest（数据）+ SendRoundTest（界面接线）。
         card.buttons.firstOrNull { it.action == HomeAction.SEND_COMMAND }?.let { button ->
@@ -284,175 +438,121 @@ private fun CommandCardBody(card: HomeCardSpec, vm: MainViewModel, onOpenTab: (E
                     vm.sendCommand(text)
                 },
                 enabled = input.isNotBlank(),
+                contentPadding = PaddingValues(horizontal = 12.dp),
+                modifier = Modifier.height(HomeLayoutSpec.PRIMARY_BUTTON_DP.dp),
             ) { Text(button.label) }
         }
     }
 
-    card.buttons.firstOrNull { it.action == HomeAction.DICTATE_COMMAND }?.let { button ->
-        Spacer(Modifier.height(8.dp))
-        // **按住说话**：按下就开始录，松手就发（拖开手指 = 放弃）。
-        // 为什么不是"点一下开录、再点一下说完了"：卡片上只有一个位置，
-        // 两段式会让"以为说完了其实还在录"变成一个新的静默坑。
-        //
-        // ⚠️ 这里刻意**不用 `Button`**：`Button` 内部自带 `clickable`，它在指针事件的 Main pass
-        // 里比外层**先**拿到 down 并 consume 掉 —— `detectTapGestures` 默认 `requireUnconsumed`
-        // 就再也等不到按下，按住说话会变成一个点了没反应的死按钮。
-        // 所以用一个「长得像按钮」的 `Surface`：里面没有任何 clickable，gesture 一定拿得到。
-        Surface(
-            color = if (recording) EchoPalette.Red else EchoPalette.Accent,
-            shape = RoundedCornerShape(24.dp),
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(48.dp)
-                .pointerInput(Unit) {
-                    detectTapGestures(
-                        onPress = {
-                            val granted = context.checkSelfPermission(Manifest.permission.RECORD_AUDIO) ==
-                                PackageManager.PERMISSION_GRANTED
-                            if (!granted) {
-                                commandMicLauncher.launch(Manifest.permission.RECORD_AUDIO)
-                            } else {
-                                // 只有真的开起了麦才等松手 —— 否则松手会走进"没在录音"那条提示，
-                                // 把"开不了麦"的原因盖掉（两个实话互相覆盖，等于都说了一半）
-                                if (vm.startRecording()) {
-                                    if (tryAwaitRelease()) vm.finishRecording() else vm.cancelRecording()
-                                }
-                            }
-                        },
-                    )
-                },
-        ) {
-            Row(
-                modifier = Modifier.fillMaxSize(),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.Center,
-            ) {
-                Icon(
-                    Icons.Default.Mic,
-                    contentDescription = null,
-                    tint = Color.White,
-                    modifier = Modifier.size(18.dp),
-                )
-                Spacer(Modifier.size(8.dp))
-                Text(
-                    color = Color.White,
-                    text = if (recording) {
-                        "松开发送 · ${"%.1f".format(recordMs / 1000.0)} 秒"
-                    } else {
-                        button.label
-                    },
-                )
-            }
-        }
-        Spacer(Modifier.height(2.dp))
-        MutedLine("按住说话，松手就发；录不到声音会在这里说清楚", maxLines = 2)
-    }
+    Spacer(Modifier.height(HomeLayoutSpec.CARD_GAP_DP.dp))
 
-    // 「刚才那次点击没发出去」的提示：与这一轮分开摆，因为它不改变这一轮的状态
-    if (submit.blocked.isNotBlank()) {
-        Spacer(Modifier.height(6.dp))
-        Text(
-            submit.blocked,
-            style = MaterialTheme.typography.labelSmall,
-            color = EchoPalette.Red,
-            maxLines = 3,
-            overflow = TextOverflow.Ellipsis,
-        )
+    // 一行状态：这一轮发了什么 / 阶段 / 没发出去的原因；**整行可点** → 去「指令」页看完整正文。
+    // 这是本函数里**唯一**会切页的东西（`HomeCardsTest` 按这个数字钉住）。
+    val accent = when {
+        submit.blocked.isNotBlank() -> EchoPalette.Red
+        submit.phase == SubmitPhase.Failed -> EchoPalette.Red
+        submit.phase == SubmitPhase.Done -> EchoPalette.Green
+        submit.phase != SubmitPhase.Idle -> EchoPalette.Purple
+        recording -> EchoPalette.Red
+        else -> EchoPalette.Muted
     }
-
-    if (submit.phase != SubmitPhase.Idle) {
-        val accent = when (submit.phase) {
-            SubmitPhase.Failed -> EchoPalette.Red
-            SubmitPhase.Done -> EchoPalette.Green
-            SubmitPhase.Idle -> EchoPalette.Muted
-            else -> EchoPalette.Purple
+    val statusText = when {
+        recording -> "松开就发 · ${"%.1f".format(recordMs / 1000.0)} 秒"
+        submit.blocked.isNotBlank() -> submit.blocked
+        submit.phase != SubmitPhase.Idle -> buildString {
+            append("这一轮：").append(roundHeadline(submit))
+            append(" · ").append(phaseLabel(submit.phase))
+            if (submit.message.isNotBlank()) append(" · ").append(submit.message)
         }
-        Spacer(Modifier.height(6.dp))
-        // 这一轮发的到底是哪一句（语音那条显示"电脑听成的那句"）
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Text(
-                "这一轮：${roundHeadline(submit)}",
-                style = MaterialTheme.typography.labelMedium,
-                maxLines = 2,
-                overflow = TextOverflow.Ellipsis,
-                modifier = Modifier.weight(1f),
-            )
-            Spacer(Modifier.size(8.dp))
-            Text(phaseLabel(submit.phase), style = MaterialTheme.typography.labelSmall, color = accent)
-        }
-        Spacer(Modifier.height(2.dp))
+        else -> "按住左边麦克风说一句，或打字发送"
+    }
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .heightIn(min = HomeLayoutSpec.STATUS_LINE_DP.dp)
+            .clickable { onOpenTab(card.tab) },
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
         Text(
-            submit.message.ifBlank { phaseLabel(submit.phase) },
+            statusText,
             style = MaterialTheme.typography.labelSmall,
             color = accent,
-            maxLines = 3,
+            maxLines = 1,
             overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.weight(1f),
         )
+        Text("›", style = MaterialTheme.typography.labelMedium, color = EchoPalette.Accent)
+    }
 
-        // 最近一条回复：**只有这一轮自己的结论**才显示（短的原样回显；长的给「去看详情」）
-        if (showsReply(submit.phase)) {
-            val preview = replyPreview(submit.reply)
-            if (preview.text.isNotBlank()) {
-                Spacer(Modifier.height(6.dp))
-                Text(
-                    preview.text,
-                    style = MaterialTheme.typography.bodySmall,
-                    maxLines = 3,
-                    overflow = TextOverflow.Ellipsis,
-                )
-                if (preview.truncated) {
-                    TextButton(onClick = { onOpenTab(EchoTab.COMMANDS) }) { Text("去看详情") }
-                }
-            }
+    // 最近一条回复：**只有这一轮自己的结论**才显示（`showsReply` 把关，旧回复一个字都不许摆）。
+    if (showsReply(submit.phase)) {
+        val preview = replyPreview(submit.reply)
+        if (preview.text.isNotBlank()) {
+            Text(
+                preview.text,
+                style = MaterialTheme.typography.labelSmall,
+                color = EchoPalette.Text,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
         }
     }
+
+    // 朗读失败/说明（"系统 TTS 没装" / "ECHO 合成失败" / 念不出来）：单行、几秒后自己消失。
+    // 没有它会怎样：按了播报没声音，用户只能猜。
+    SpeakNoteLine(speakNote, onDismiss = { vm.clearSpeakNote() })
 }
 
 /**
- * 会议卡：**开始录音 / 结束录音**（同一个位置换文案）+ 本次时长 + 「看会议列表」。
+ * 会议卡：**开始录音 / 结束录音**（同一个位置换文案）+ 一行状态（含本次时长与静音）。
  *
  * 数据全部来自 `MeetingMicService.state`（`MicState`）：`active` 决定按钮文案、
  * `elapsedSeconds` 就是这一场的时长（服务自己算的，界面不另算一遍）。
- * 暂停也如实说（静音区间照录、内容全零）。
+ * 暂停也如实说（静音区间照录、内容全零 —— 见 `app/audio/recorder.py` 的暂停语义）。
  */
 @Composable
 private fun MeetingCardBody(card: HomeCardSpec, mic: MicState, onStart: () -> Unit) {
     val context = LocalContext.current
 
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
-    ) {
-        card.buttons.forEach { button ->
-            when (button.action) {
-                HomeAction.START_MEETING -> Button(onClick = onStart) { Text(button.label) }
-                HomeAction.STOP_MEETING -> Button(
-                    onClick = { MeetingMicService.stop(context) },
-                    colors = ButtonDefaults.buttonColors(containerColor = EchoPalette.Red),
-                ) { Text(button.label) }
-                // 会议卡上不该有别的动作（文案与动作是一起给的，见 `meetingCardButtons`）
-                else -> Unit
-            }
+    MutedLine(meetingCardLine(mic.active, mic.elapsedSeconds, mic.paused), maxLines = 1)
+    Spacer(Modifier.height(HomeLayoutSpec.CARD_GAP_DP.dp))
+    card.buttons.forEach { button ->
+        when (button.action) {
+            HomeAction.START_MEETING -> Button(
+                onClick = onStart,
+                contentPadding = PaddingValues(horizontal = 10.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(HomeLayoutSpec.PRIMARY_BUTTON_DP.dp),
+            ) { Text(button.label) }
+
+            HomeAction.STOP_MEETING -> Button(
+                onClick = { MeetingMicService.stop(context) },
+                colors = ButtonDefaults.buttonColors(containerColor = EchoPalette.Red),
+                contentPadding = PaddingValues(horizontal = 10.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(HomeLayoutSpec.PRIMARY_BUTTON_DP.dp),
+            ) { Text(button.label) }
+
+            // 会议卡上不该有别的动作（文案与动作是一起给的，见 `meetingCardButtons`）
+            else -> Unit
         }
-        MutedLine(
-            meetingCardLine(mic.active, mic.elapsedSeconds, mic.paused),
-            maxLines = 1,
-        )
     }
 
+    // 出错 / 收尾说明**不删**：只在有的时候多一行（卡片长高了由外层滚动兜底，绝不截断）
     mic.error.takeIf { it.isNotBlank() }?.let {
-        Spacer(Modifier.height(4.dp))
-        MutedLine(it, color = EchoPalette.Red, maxLines = 2)
+        Spacer(Modifier.height(HomeLayoutSpec.CARD_GAP_DP.dp))
+        MutedLine(it, color = EchoPalette.Red, maxLines = 1)
     }
     mic.stopNote.takeIf { it.isNotBlank() }?.let {
-        Spacer(Modifier.height(4.dp))
-        MutedLine(it, color = EchoPalette.Yellow, maxLines = 2)
+        Spacer(Modifier.height(HomeLayoutSpec.CARD_GAP_DP.dp))
+        MutedLine(it, color = EchoPalette.Yellow, maxLines = 1)
     }
 }
 
 /**
- * 回顾卡：**口述回顾**（直接进既有的"录一段 → 转写 → 整理"路）+ 「看回顾历史」。
+ * 回顾卡：**口述回顾**（直接进既有的"录一段 → 转写 → 整理"路）+ 一行状态。
  *
  * 走的是 `vm.startRecording()` / `vm.submitReviewDictation()` —— 与回顾页那张
  * 「车里口述」卡**同一个**入口（`ReviewTab` 的 `startDictation`），没有第二条路。
@@ -464,70 +564,92 @@ private fun ReviewCardBody(card: HomeCardSpec, vm: MainViewModel, onStartDictati
     val submittingNote by vm.reviewSubmittingNote.collectAsState()
     val summary by vm.reviewSummary.collectAsState()
 
+    MutedLine(
+        when {
+            submitting -> "正在整理…"
+            card.buttons.any { it.action == HomeAction.SUBMIT_REVIEW } ->
+                "录音中 ${elapsedClock(recordMs / 1000.0)}"
+            (summary?.todayTurns ?: 0) > 0 -> "今天已回顾 ${summary?.todayTurns} 轮"
+            else -> "今天还没回顾"
+        },
+        maxLines = 1,
+    )
+    Spacer(Modifier.height(HomeLayoutSpec.CARD_GAP_DP.dp))
     Row(
         modifier = Modifier.fillMaxWidth(),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
     ) {
         card.buttons.forEach { button ->
             when (button.action) {
-                HomeAction.DICTATE_REVIEW -> Button(onClick = onStartDictation) { Text(button.label) }
-                HomeAction.SUBMIT_REVIEW -> Button(onClick = { vm.submitReviewDictation() }) {
-                    Text(button.label)
-                }
-                HomeAction.CANCEL_REVIEW -> TextButton(onClick = { vm.cancelReviewDictation() }) {
-                    Text(button.label)
-                }
+                HomeAction.DICTATE_REVIEW -> Button(
+                    onClick = onStartDictation,
+                    contentPadding = PaddingValues(horizontal = 10.dp),
+                    modifier = Modifier.height(HomeLayoutSpec.PRIMARY_BUTTON_DP.dp),
+                ) { Text(button.label) }
+
+                HomeAction.SUBMIT_REVIEW -> Button(
+                    onClick = { vm.submitReviewDictation() },
+                    contentPadding = PaddingValues(horizontal = 10.dp),
+                    modifier = Modifier.height(HomeLayoutSpec.PRIMARY_BUTTON_DP.dp),
+                ) { Text(button.label) }
+
+                HomeAction.CANCEL_REVIEW -> TextButton(
+                    onClick = { vm.cancelReviewDictation() },
+                    contentPadding = PaddingValues(horizontal = 8.dp),
+                    modifier = Modifier.height(HomeLayoutSpec.PRIMARY_BUTTON_DP.dp),
+                ) { Text(button.label) }
+
                 else -> Unit
             }
         }
-        MutedLine(
-            when {
-                submitting -> "正在整理…（通常 2–3 分钟）"
-                card.buttons.any { it.action == HomeAction.SUBMIT_REVIEW } ->
-                    "录音中 ${elapsedClock(recordMs / 1000.0)}"
-                (summary?.todayTurns ?: 0) > 0 -> "今天已回顾 ${summary?.todayTurns} 轮"
-                else -> "今天还没回顾"
-            },
-            maxLines = 1,
-        )
     }
 
     submittingNote?.takeIf { it.isNotBlank() }?.let {
-        Spacer(Modifier.height(4.dp))
-        MutedLine(it, color = EchoPalette.Purple, maxLines = 2)
+        Spacer(Modifier.height(HomeLayoutSpec.CARD_GAP_DP.dp))
+        MutedLine(it, color = EchoPalette.Purple, maxLines = 1)
     }
 }
 
 /**
- * 「在听」状态卡。
+ * 「在听」细条（44dp，整行可点 → 回「指令」页）。
+ *
+ * 为什么是一条**细条**而不是原来那张卡：它是一行状态（点灯 + 相位 + 最近一句），
+ * 以前占掉一张卡（≈80dp），而首页要在 360×640 上一屏放下合并卡 + 三张功能卡。
+ * 信息一个字节都没少：相位词、最近一句、以及"怎么开启"的提示都还在。
  *
  * `strip == null`（[ListenState.Phase.OFF]）= 没在听：**如实**说"没在听"，
  * 并告诉用户入口在哪（「指令」页）。不把"没在听"画成一个正在工作的绿点。
  */
 @Composable
-private fun ListenStatusCard(strip: ListenState.Strip?, phase: ListenState.Phase) {
-    val color = when (phase) {
-        ListenState.Phase.STARTING, ListenState.Phase.LISTENING -> EchoPalette.Green
-        ListenState.Phase.THINKING, ListenState.Phase.SPEAKING -> EchoPalette.Purple
-        ListenState.Phase.PAUSED -> EchoPalette.Yellow
-        ListenState.Phase.FAILED -> EchoPalette.Red
-        ListenState.Phase.OFF -> EchoPalette.Muted
-    }
-    EchoCard {
-        Column {
-            CardHeader(
-                title = "在听",
-                dotColor = color,
-                trailing = strip?.label ?: "没在听",
-                trailingColor = color,
+private fun ListenRow(strip: ListenState.Strip?, phase: ListenState.Phase, onClick: () -> Unit) {
+    val color = listenStripColor(phase)
+    Surface(
+        color = EchoPalette.Card2,
+        shape = RoundedCornerShape(10.dp),
+        border = BorderStroke(1.dp, EchoPalette.Border),
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(HomeLayoutSpec.LISTEN_ROW_DP.dp)
+            .clickable(onClick = onClick),
+    ) {
+        Row(
+            modifier = Modifier.fillMaxSize().padding(horizontal = 12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            StatusDot(color, size = 8)
+            Spacer(Modifier.size(8.dp))
+            Text(strip?.label ?: "没在听", style = MaterialTheme.typography.labelLarge)
+            Spacer(Modifier.size(8.dp))
+            Text(
+                strip?.text ?: "想开车时也一直听：去「指令」页点「一直听着」。",
+                style = MaterialTheme.typography.labelSmall,
+                color = EchoPalette.Muted,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f),
             )
-            Spacer(Modifier.height(4.dp))
-            MutedLine(
-                strip?.text
-                    ?: "想开车时也一直听：去「指令」页点「一直听着」。",
-                maxLines = 2,
-            )
+            Spacer(Modifier.size(6.dp))
+            Text("去指令页", style = MaterialTheme.typography.labelSmall, color = EchoPalette.Accent)
         }
     }
 }
