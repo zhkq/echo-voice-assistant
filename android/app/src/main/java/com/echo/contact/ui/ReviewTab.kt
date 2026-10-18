@@ -280,6 +280,10 @@ fun ReviewTab(vm: MainViewModel) {
     val recordMs by vm.recordMs.collectAsState()
     val submitting by vm.reviewSubmitting.collectAsState()
     val submittingNote by vm.reviewSubmittingNote.collectAsState()
+    // 「口述回顾」这条路自己的说明（没权限 / 麦被会议录音占着 / 被"一直听着"占着 / 开不了麦 /
+    // 已经开始录但收不到声音 / 取消了）。以前这些要么只进了 `_speakNote`（没人读），
+    // 要么在"权限没给"那条分支里**什么都不做** —— 用户看到的就是"按了没反应"。
+    val dictateNote by vm.dictateNote.collectAsState()
     val voiceText by vm.voiceText.collectAsState()
     // 朗读那条路的说明（没装 TTS / 没有可念的播报 / 取不到当天详情）以前写在
     // `_speakNote` 里而**全 App 没有界面读它** → 按「播报」没声音也没提示。
@@ -292,14 +296,11 @@ fun ReviewTab(vm: MainViewModel) {
     var localNote by remember { mutableStateOf<String?>(null) }
 
     val context = LocalContext.current
+    // 权限回调**一定**再去试一次：`startReviewDictation()` 自己查权限，
+    // 所以"用户拒绝"那条路也会在按钮旁边留下一句"没给麦克风权限"（以前是静默 return）。
     val permissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
-    ) { granted ->
-        if (granted) {
-            // 授权拿到也可能开不了麦（被别的应用占着）：返回值必须看
-            if (!vm.startRecording()) localNote = REVIEW_MIC_BLOCKED else localNote = null
-        }
-    }
+    ) { vm.startReviewDictation() }
 
     if (day != null) {
         ReviewDayView(
@@ -327,14 +328,17 @@ fun ReviewTab(vm: MainViewModel) {
     )
     val orderedDays = reviewDaysDescending(days)
 
-    // 口述：没授权就先要（与「指令」页同一套做法），授权成功再开始。
-    // **返回值要判**：`startRecording()` 返回 false = 麦打不开，这一次什么都没开始。
+    // 口述：没授权就先要（与「指令」页同一套做法），授权回来再走同一条判定。
+    // 走的是 `vm.startReviewDictation()` —— 这一条**就是**「口述回顾」的唯一入口：
+    // 它内部先判权限/占用（`dictationGate`），通过后再调既有的 `startRecording()`。
+    // 所以这里**不许**再自己判 `granted`：权限没给时也必须有话（一句话在按钮旁边）。
     val startDictation: () -> Unit = {
         val granted = context.checkSelfPermission(Manifest.permission.RECORD_AUDIO) ==
             PackageManager.PERMISSION_GRANTED
         if (granted) {
-            if (!vm.startRecording()) localNote = REVIEW_MIC_BLOCKED else localNote = null
+            vm.startReviewDictation()
         } else {
+            // 系统弹窗这一下不可能"静默"：回调里一定会再调一次并把原因说出来
             permissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
         }
     }
@@ -392,6 +396,32 @@ fun ReviewTab(vm: MainViewModel) {
             item { MutedLine(it, color = EchoPalette.Yellow, maxLines = 3) }
         }
 
+        // ---- 口述卡：**紧跟在那三张功能卡下面**（2026-10-18 真机 bug 之后挪上来的）----
+        //
+        // 为什么位置也算判据：按「车里口述」之后用户眼睛还停在上面，而这张卡原来排在
+        // 「每日回顾」状态卡**下面** —— 小屏上它在折叠线以下，"录音中 0.0 秒 / 说完了"
+        // 一个字都看不见，于是体验就是"按了没反应、再按还是没反应"。
+        //
+        // 这张卡同时负责「口述回顾」这一路的**所有**说明与原因（`dictateNote`：没给权限 /
+        // 麦被会议录音占着 / 被"一直听着"占着 / 开不了麦 / 收不到声音 / 取消了）：
+        // 它就贴在刚按的那颗按钮下面，不用去找。
+        if (recording || submitting || voiceText.isNotBlank() || submittingNote != null ||
+            dictateNote != null
+        ) {
+            item {
+                DictationCard(
+                    recording = recording,
+                    recordMs = recordMs,
+                    submitting = submitting,
+                    voiceText = voiceText,
+                    submittingNote = submittingNote,
+                    dictateNote = dictateNote,
+                    onDone = { vm.submitReviewDictation() },
+                    onCancel = { vm.cancelReviewDictation() },
+                )
+            }
+        }
+
         // ---- 今日回顾详情：最近一次播报 + 念 / 刷新 / 停 ----
         item {
             ReviewStatusCard(
@@ -409,21 +439,6 @@ fun ReviewTab(vm: MainViewModel) {
                 onStopHost = { vm.stopHostReview() },
                 onDismissSpeakNote = { vm.clearSpeakNote() },
             )
-        }
-
-        // ---- 口述进行中 / 整理中：控制在这里（不在录音时入口是上面那张「车里口述」卡）----
-        if (recording || submitting || voiceText.isNotBlank() || submittingNote != null) {
-            item {
-                DictationCard(
-                    recording = recording,
-                    recordMs = recordMs,
-                    submitting = submitting,
-                    voiceText = voiceText,
-                    submittingNote = submittingNote,
-                    onDone = { vm.submitReviewDictation() },
-                    onCancel = { vm.cancelReviewDictation() },
-                )
-            }
         }
 
         // ---- 历史回顾（按日期倒序；空时有空状态文案）----
@@ -533,6 +548,13 @@ private fun DictationCard(
     submitting: Boolean,
     voiceText: String,
     submittingNote: String?,
+    /**
+     * 「口述回顾」这一路自己的说明（没权限 / 麦被占 / 收不到声音 / 取消了）。
+     *
+     * 为什么也画在这张卡里：这张卡就是"上一次按的那颗按钮"所在的地方（「说完了 / 取消」），
+     * 用户点完「口述回顾」之后**就在看这里** —— 原因摆在这儿才不用去找。
+     */
+    dictateNote: String?,
     onDone: () -> Unit,
     onCancel: () -> Unit,
 ) {
@@ -575,6 +597,11 @@ private fun DictationCard(
             submittingNote?.let {
                 Spacer(Modifier.height(4.dp))
                 MutedLine(it, color = EchoPalette.Purple)
+            }
+            // 没开始录 / 收不到声音 / 取消了：这句一定要看得见（最多 4 行，不截成半句）
+            dictateNote?.takeIf { it.isNotBlank() }?.let {
+                Spacer(Modifier.height(4.dp))
+                MutedLine(it, color = EchoPalette.Yellow, maxLines = 4)
             }
         }
     }

@@ -39,21 +39,15 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.echo.contact.ui.theme.EchoPalette
 import kotlinx.coroutines.delay
-import kotlin.math.abs
 import kotlin.math.max
 
-/** 电平条的格数（奇数，中间高、两边低，看起来像一条"声浪"）。 */
-internal const val LEVEL_BARS = 17
-
-/**
- * 主按钮的高度（dp）。**界面与布局判据共用这一个数**：按钮不许被文字挤掉，
+/** 主按钮的高度（dp）。**界面与布局判据共用这一个数**：按钮不许被文字挤掉，
  * 所以"文字区 + 这个高度 + 底部留白"必须装得进屏幕（见 [recordingButtonsVisible]）。
  */
 internal const val RECORDING_BUTTON_HEIGHT_DP = 56
@@ -67,16 +61,28 @@ internal const val RECORDING_ERROR_MAX_LINES = 2
 /**
  * 主界面里**除状态行/错误行/按钮之外**那些固定块占的高度（dp）。
  *
- * 来源（都是这份文件里的真实布局）：上下 padding 40 + 顶栏 48 + 标题 24 + 间距 6+18
- * + 大计时 44 + 本段进度 18 + 状态行上方间距 4 + 电平区前间距 28 + 电平区 180
- * + 间距 10 + 按钮下方留白 6 = 426。
+ * 2026-10-18 深夜重做电平之后，这一串按**新版布局**重算：
+ * 上下 padding 40 + 顶栏 48 + 标题 24 + 间距 6+18 + 大计时 44 + 本段进度 18
+ * + 状态行上方间距 4 + 电平前间距 28 + 电平带 [RECORDING_LEVEL_BAND_DP]（64 + 2×24 = 112）
+ * + 按钮上方至少 10 + 按钮下方留白 6 = **358**。
+ *
+ * 旧版是 **426**（电平区占 180）。新版电平只占 112，所以页面**矮了 68dp**：
+ * 大计时 / 本段进度 / 状态行 / 两个 56dp 按钮一个都没动，多出来的空间给了
+ * 按钮上方那条 `weight(1f)`（小屏上它会被压到 0，所以预算里给它留了 10dp 的底）。
+ *
+ * 为什么固化成两个常量（而不是像旧版写一个 426）：**电平高度是"尺寸的唯一来源"**
+ * （`RECORDING_LEVEL_HEIGHT_DP`），预算必须从它**推导**出来，否则哪天电平改高度、
+ * 预算没跟着改，就会同时犯两种错 —— 小屏按钮被挤掉（预算偏小）或凭空多出一段空白（偏大）。
  *
  * 为什么把它抽成一个数：旧版把 5 段解释性文字（最多十几行）全堆在按钮上方，
  * 小屏上"文字 + 电平 + 按钮"超过了屏幕高度，于是按钮被挤出可视区
  * （用户截图里正是"文字盖住按钮"）。现在解释性内容只放在 ⓘ 弹窗里，
  * 主界面只留一行状态 —— 这个预算函数就是"按钮完整可见"的可测判据。
  */
-internal const val RECORDING_BASE_AREA_DP = 426
+internal const val RECORDING_CHROME_AREA_DP = 246
+
+/** 文字区预算 = 除电平外的固定块 + 电平带（电平高度变了，这里自动跟着变）。 */
+internal const val RECORDING_BASE_AREA_DP = RECORDING_CHROME_AREA_DP + RECORDING_LEVEL_BAND_DP
 
 /** 一行小字的高度（dp，labelSmall/bodyMedium 一行约 16dp）。 */
 internal const val RECORDING_LINE_DP = 16
@@ -128,13 +134,6 @@ fun MeetingRecordingScreen(vm: MainViewModel) {
     DisposableEffect(Unit) {
         view.keepScreenOn = true
         onDispose { view.keepScreenOn = false }
-    }
-
-    // 电平平滑：攻击快（跟得上说话）、回落慢（看着像声浪在退）
-    var shown by remember { mutableStateOf(0f) }
-    val target = mic.level.coerceIn(0f, 1f)
-    LaunchedEffect(target) {
-        shown = smoothLevel(shown, target)
     }
 
     val paused = mic.paused
@@ -236,34 +235,31 @@ fun MeetingRecordingScreen(vm: MainViewModel) {
 
             Spacer(Modifier.height(28.dp))
 
-            // ---- 电平：中间高两边低的柱状"声浪" ----
+            // ---- 电平：**从中心向两边镜像**的一条渐变带（2026-10-18 深夜重做）----
+            // 旧版是 17 根柱子的"声浪"（占 180dp，颜色三档硬切、每 100ms 跳一格）。
+            // 新版把绘制整个交给 `RecordingLevelMeter`（包络跟随 + 峰值保持 + 安静时呼吸），
+            // 这里只负责"占位"：高度 112dp = 64dp 的电平 + 上下各 24dp 的呼吸，
+            // 比旧版矮 68dp —— 页面总高度只减不增，按钮更好点（见 RECORDING_BASE_AREA_DP）。
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(180.dp)
-                    .clip(RoundedCornerShape(14.dp))
-                    .background(EchoPalette.Card2),
+                    .height(RECORDING_LEVEL_BAND_DP.dp)
+                    .clip(RoundedCornerShape(18.dp))
+                    .background(EchoPalette.Card2)
+                    .padding(horizontal = 18.dp, vertical = RECORDING_LEVEL_PADDING_DP.dp),
                 contentAlignment = Alignment.Center,
             ) {
-                Row(
-                    modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp),
-                    horizontalArrangement = Arrangement.spacedBy(6.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    for (i in 0 until LEVEL_BARS) {
-                        val weight = barWeight(i)          // 中间高、两边低
-                        val h = (8 + shown * weight * 150).dp
-                        Box(
-                            modifier = Modifier
-                                .weight(1f)
-                                .height(h)
-                                .clip(RoundedCornerShape(6.dp))
-                                .background(if (paused) EchoPalette.Muted else barColor(shown, weight)),
-                        )
-                    }
-                }
+                RecordingLevelMeter(
+                    rawLevel = mic.level,
+                    paused = paused,
+                    // 一场一个 key：换一场（重开一段）时包络与峰值一起清零 ——
+                    // 否则界面上会挂着上一场"根本没响过"的那根峰值线。
+                    sessionKey = mic.startedAt,
+                )
             }
 
+            // 按钮上方至少留 10dp（`weight(1f)` 在小屏上会被压到 0，那时按钮就贴着电平了）
+            Spacer(Modifier.height(10.dp))
             Spacer(Modifier.weight(1f))
 
             // ---- 两个主按钮：静音/恢复、结束（两条都是**这台手机**的动作）----
@@ -422,36 +418,6 @@ internal fun recordingButtonsVisible(
     statusLines: Int,
     errorLines: Int = 0,
 ): Boolean = recordingTextAreaDp(statusLines, errorLines) + RECORDING_BUTTON_HEIGHT_DP <= screenHeightDp
-
-/**
- * 电平平滑：**攻击快、回落慢**。
- *
- * 为什么不能直接用采样值：网络间隔 350ms，直接用会是一格一格跳；而"声音退下去"这件事
- * 人眼接受得很慢（真实声浪也有余响）。所以：涨的时候跟 65%，落的时候只落 25%。
- */
-internal fun smoothLevel(prev: Float, target: Float): Float {
-    val p = prev.coerceIn(0f, 1f)
-    val t = target.coerceIn(0f, 1f)
-    return if (t >= p) p + (t - p) * 0.65f else p + (t - p) * 0.25f
-}
-
-/** 中间高、两边低（0..1 的钟形）。纯函数，有判据。 */
-internal fun barWeight(index: Int, bars: Int = LEVEL_BARS): Float {
-    if (bars <= 1) return 1f
-    val mid = (bars - 1) / 2f
-    val d = abs(index - mid) / mid            // 0（中间）→ 1（两端）
-    return (1f - d * 0.75f).coerceIn(0.25f, 1f)
-}
-
-/** 颜色跟着强度走：弱=青、中=紫、强=红（与面板的状态色同一套）。 */
-internal fun barColor(level: Float, weight: Float): Color {
-    val v = (level * weight).coerceIn(0f, 1f)
-    return when {
-        v > 0.66f -> EchoPalette.Red
-        v > 0.33f -> EchoPalette.Purple
-        else -> EchoPalette.Accent
-    }
-}
 
 /**
  * `startedAt`（ISO 本地时间，如 `2026-10-15T23:40:12`）→ `mm:ss` / `hh:mm:ss`。

@@ -129,9 +129,12 @@ internal fun SuperAssistantTab(vm: MainViewModel, onOpenTab: (EchoTab) -> Unit) 
     val meetingMicLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { granted -> if (granted) vm.startMeeting() }
+    // 回顾口述：回调里**无条件**再试一次 —— `startReviewDictation()` 自己查权限，
+    // 所以"用户拒绝"也会在这张卡上留下一句原因（以前这里只有 `if (granted)`，
+    // 拒绝时什么都不显示：用户点了「口述回顾」，屏幕上没有任何反应）。
     val reviewMicLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
-    ) { granted -> if (granted) vm.startRecording() }
+    ) { vm.startReviewDictation() }
 
     // 为什么 `vm.startMeeting()` 会顺带打开全屏录音界面：那是这条**既有**入口的一部分
     // （2026-10-15 用户要的"漂亮电平 + 结束 + 静音"）。它**不是**切页签 ——
@@ -142,10 +145,20 @@ internal fun SuperAssistantTab(vm: MainViewModel, onOpenTab: (EchoTab) -> Unit) 
             PackageManager.PERMISSION_GRANTED
         if (granted) vm.startMeeting() else meetingMicLauncher.launch(Manifest.permission.RECORD_AUDIO)
     }
+    // 口述回顾：**既有**那条"录一段 → 转写 → 整理"路，只是入口换成了"两个都能说清原因"的那个。
+    // 以前这里把 `vm.startRecording()` 的返回值**扔掉了**：没给权限 / 麦被占时，
+    // 这张卡上什么都不显示 —— 用户点了「口述回顾」，屏幕上没有任何反应（2026-10-18 真机）。
+    // 现在走 `vm.startReviewDictation()`：它先判权限/占用，原因写进 `dictateNote`，
+    // 卡上就在按钮下面显示（不在别处）。录音实现还是那一个 `startRecording()`。
     val startDictationWithMic: () -> Unit = {
         val granted = context.checkSelfPermission(Manifest.permission.RECORD_AUDIO) ==
             PackageManager.PERMISSION_GRANTED
-        if (granted) vm.startRecording() else reviewMicLauncher.launch(Manifest.permission.RECORD_AUDIO)
+        if (granted) {
+            vm.startReviewDictation()
+        } else {
+            // 系统弹窗这一下不可能静默：回调里一定会再调一次并把原因说出来
+            reviewMicLauncher.launch(Manifest.permission.RECORD_AUDIO)
+        }
     }
 
     // ---- 布局预算：用**真正的**可用宽高算（不是猜某个机型）----
@@ -554,8 +567,10 @@ private fun MeetingCardBody(card: HomeCardSpec, mic: MicState, onStart: () -> Un
 /**
  * 回顾卡：**口述回顾**（直接进既有的"录一段 → 转写 → 整理"路）+ 一行状态。
  *
- * 走的是 `vm.startRecording()` / `vm.submitReviewDictation()` —— 与回顾页那张
+ * 走的是 `vm.startReviewDictation()` / `vm.submitReviewDictation()` —— 与回顾页那张
  * 「车里口述」卡**同一个**入口（`ReviewTab` 的 `startDictation`），没有第二条路。
+ * 录音实现仍然只有 `MainViewModel.startRecording()` 那一处；`startReviewDictation`
+ * 只多做一件界面必须做的事：**先把"能不能开始"判出来并给一句人话**。
  */
 @Composable
 private fun ReviewCardBody(card: HomeCardSpec, vm: MainViewModel, onStartDictation: () -> Unit) {
@@ -563,6 +578,9 @@ private fun ReviewCardBody(card: HomeCardSpec, vm: MainViewModel, onStartDictati
     val submitting by vm.reviewSubmitting.collectAsState()
     val submittingNote by vm.reviewSubmittingNote.collectAsState()
     val summary by vm.reviewSummary.collectAsState()
+    // 「口述回顾」没开始/没收到的原因（没权限 / 被会议录音占着 / 被"一直听着"占着 /
+    // 开不了麦 / 收不到声音 / 取消了）。**必须画在按钮下面** —— 这张卡就是用户按的地方。
+    val dictateNote by vm.dictateNote.collectAsState()
 
     MutedLine(
         when {
@@ -604,9 +622,19 @@ private fun ReviewCardBody(card: HomeCardSpec, vm: MainViewModel, onStartDictati
         }
     }
 
+    // 两句说明**都画在按钮下面**（这张卡就是用户按的地方，不摆到别处去）：
+    //  · dictateNote    = 这次口述**没开始**/没收到的原因（没权限、被会议录音占着、
+    //                     被"一直听着"占着、开不了麦、收不到声音、取消了）；
+    //  · submittingNote = 已经开始转写/整理之后的进度与失败原因。
+    dictateNote?.takeIf { it.isNotBlank() }?.let {
+        Spacer(Modifier.height(HomeLayoutSpec.CARD_GAP_DP.dp))
+        // 4 行：这张卡只有半个屏幕宽，3 行会把"点「允许」/去指令页停掉"那半句截掉，
+        // 而那半句恰恰是用户唯一能照做的东西。真的没有原因时它一行都不占。
+        MutedLine(it, color = EchoPalette.Yellow, maxLines = 4)
+    }
     submittingNote?.takeIf { it.isNotBlank() }?.let {
         Spacer(Modifier.height(HomeLayoutSpec.CARD_GAP_DP.dp))
-        MutedLine(it, color = EchoPalette.Purple, maxLines = 1)
+        MutedLine(it, color = EchoPalette.Purple, maxLines = 2)
     }
 }
 

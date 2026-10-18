@@ -1,6 +1,8 @@
 package com.echo.contact.ui
 
 import android.app.Application
+import android.content.pm.PackageManager
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.viewModelScope
 import com.echo.contact.audio.EchoTtsPlayer
 import com.echo.contact.audio.InputDevices
@@ -28,6 +30,8 @@ import com.echo.contact.data.dto.StatusResponse
 import com.echo.contact.data.dto.TranscribeProgress
 import com.echo.contact.data.dto.TtsRequest
 import com.echo.contact.service.AppPrefs
+import com.echo.contact.service.ListenState
+import com.echo.contact.service.MeetingMicService
 import com.echo.contact.service.SpeakPlan
 import com.echo.contact.service.SpeakPrefs
 import com.echo.contact.service.SpeechText
@@ -942,6 +946,8 @@ class MainViewModel(app: Application) : BaseViewModel(app) {
      *  - 业务失败是 **200 + ok=false**，要看 `ok` 不能只看状态码。
      */
     fun submitReviewDictation() {
+        // 这里一开始就把"上一次没开始/被占"的原因清掉：接下来这句话由转写结果说了
+        _dictateNote.value = null
         if (!_recording.value) {
             // 与「说完了」同一条规矩：这次确实没提交，说出来（别让点击像掉进黑洞）
             _reviewSubmittingNote.value = "没在录音：这次没有提交（可能已经提交过了）"
@@ -1042,8 +1048,14 @@ class MainViewModel(app: Application) : BaseViewModel(app) {
         }
     }
 
+    /**
+     * 放弃这次口述回顾。
+     *
+     * 走的是**既有**的 `cancelRecording`，但按"回顾口述"的身份走（`asCommand = false`）：
+     * 取消一次口述不该在「指令」卡上留下一句"这次录音取消了"，也不该擦掉还在路上的指令那一轮。
+     */
     fun cancelReviewDictation() {
-        cancelRecording()
+        cancelRecording(asCommand = false)
     }
 
     // ---- 指令的会话内容（面板「历史 → 看会话」）----
@@ -1378,33 +1390,132 @@ class MainViewModel(app: Application) : BaseViewModel(app) {
     /** 事件流同时只跑一条（节拍可能重叠）。 */
     private var _eventsBusy = false
 
-    /** 开始录音（调用方要**先**拿到 RECORD_AUDIO 权限）。返回 false = 开不了麦。 */
-    fun startRecording(): Boolean {
-        if (_recording.value) return true
+    /**
+     * 回顾口述这一路的**专属**说明（开不了麦 / 已经在录 / 被会议录音占着 / 被常驻听写占着 /
+     * 取消了）。界面把它摆在**按下那颗按钮的旁边**（回顾页功能区下面、首页回顾卡按钮下面）。
+     *
+     * 为什么单开一个字段、而不是继续写 `_submit`：回顾口述与发指令是**两个动作**
+     * （见 `DictationEntry.kt` 的口径）。写进 `_submit` 有两个坏处：
+     *  ① 首页/指令页那张卡会冒出一句"（语音）发失败"——用户根本不是在发指令；
+     *  ② `startRecording()` 开头的 `_submit = SubmitState()` 会**擦掉**还在路上的那一条指令。
+     */
+    private val _dictateNote = MutableStateFlow<String?>(null)
+    val dictateNote: StateFlow<String?> = _dictateNote.asStateFlow()
+
+    /** 这一次录音是"发指令"（true）还是"口述回顾"（false）—— 决定失败原因写到哪张卡上。 */
+    private var recordAsCommand = true
+
+    /** 开录前清掉「上一轮」——**只**给发指令那条路（回顾口述不许混进 `_submit`）。 */
+    private fun beginCommandRound() {
         _voiceText.value = ""
         _submit.value = SubmitState()
+    }
+
+    /** 开不了麦的那句：写进**发指令**那张卡（回顾口述走 [_dictateNote]）。 */
+    private fun noteCommandMicFailure(reason: String) {
+        // **必须说**：麦打不开 = 这一次一个字都不会发出去。
+        // 以前只写 `_speakNote`，而**没有任何界面读它**（见 SendRound.kt 的说明），
+        // 于是用户看到的就是"按了没反应"。
+        _speakNote.value = reason
+        _submit.value = failedRound(nextRoundId(), text = "（语音）", reason = reason)
+    }
+
+    /**
+     * 开始录音（调用方要**先**拿到 RECORD_AUDIO 权限）。返回 false = 开不了麦。
+     *
+     * [asCommand] = 这次录的是**发指令**（true，默认；「按住说话」/底部中间那颗）还是
+     * **口述回顾**（false；回顾页「车里口述」与首页回顾卡）。两种都走这**同一条**录音实现
+     * （不新造录音路），区别只在"失败原因写到哪张卡上"：
+     * 回顾口述不碰 `_submit` —— 那是"发指令"那一轮的地方。
+     *
+     * 回顾那条路的判定（权限/占用/已经在录）在 [startReviewDictation] 里，**不在这里**：
+     * 这里只管"真的去开麦"，这样它的函数体里一个 `_submit` / `_speakNote` 都不出现。
+     */
+    fun startRecording(asCommand: Boolean = true): Boolean {
+        if (_recording.value) return true
+        recordAsCommand = asCommand
+        _dictateNote.value = null
+        if (asCommand) beginCommandRound()
         // 用户在「设置 → 设备」里指定的那支麦（null = 跟随系统）。取不到就跟随系统 ——
         // 选的那支不在了是他的事，不该让"说一句"开不了麦（`InputDevices.describe` 会如实说）
         val mic = runCatching { InputDevices.preferredInput(getApplication()) }.getOrNull()
         val ok = recorder.start(mic)
         if (!ok) {
-            // **必须说**：麦打不开 = 这一次一个字都不会发出去。
-            // 以前只写 `_speakNote`，而**没有任何界面读它**（见 SendRound.kt 的说明），
-            // 于是用户看到的就是"按了没反应"。
-            _speakNote.value = NOTE_MIC_UNAVAILABLE
-            _submit.value = failedRound(nextRoundId(), text = "（语音）", reason = NOTE_MIC_UNAVAILABLE)
+            if (asCommand) {
+                noteCommandMicFailure(NOTE_MIC_UNAVAILABLE)
+            } else {
+                // 回顾那条路的原因由 `startReviewDictation` 按现场状态分档说（micFailReason）
+                _dictateNote.value = DICTATE_MIC_UNAVAILABLE
+            }
             return false
         }
         _recording.value = true
         _recordMs.value = 0
         recordTicker = viewModelScope.launch {
+            val startedAt = System.currentTimeMillis()
             while (_recording.value) {
-                _recordMs.value = recorder.elapsedMs()
+                val ms = recorder.elapsedMs()
+                _recordMs.value = ms
+                // 麦"开起来了"却一个字节都没读到（真机上被别的应用独占时就是这样）：
+                // 这种状态以前会一直显示"录音中 0.0 秒"，用户以为在录，说完却发不出去。
+                if (ms <= 0L && System.currentTimeMillis() - startedAt >= SILENT_MIC_MS) {
+                    recorder.cancel()
+                    _recording.value = false
+                    _recordMs.value = 0
+                    noteRecordFailure(DICTATE_SILENT)
+                    break
+                }
                 delay(100)
             }
         }
         return true
     }
+
+    /**
+     * 「口述回顾」按下去：先判定能不能开始（[dictationGate]），不能就开始说原因。
+     *
+     * 两个入口（回顾页「车里口述」、首页回顾卡「口述回顾」）都调这**一个**方法 ——
+     * 判定只有一处，文案只有一处，界面不许自己判断（2026-10-18 真机 bug：
+     * 首页那颗把 `startRecording()` 的返回值扔了，权限没给/麦被占时屏幕上什么都不显示）。
+     *
+     * 权限在这里**自己查**（不是信界面传进来的布尔）：这样"用户拒绝了权限"这条路上
+     * 也一定有一句话，不会因为某个界面忘了判断就静默。
+     */
+    fun startReviewDictation(): Boolean {
+        val gate = dictationGate(
+            hasPermission = hasMicPermission(),
+            alreadyRecording = _recording.value,
+            meetingRecording = MeetingMicService.state.value.active,
+            listening = listenHoldsMic(ListenState.phase.value),
+        )
+        if (gate is DictationGate.Blocked) {
+            _dictateNote.value = gate.reason
+            return false
+        }
+        _dictateNote.value = null
+        if (startRecording(asCommand = false)) return true
+        // 走到这里 = 麦真的建不起来：按现场状态说清是哪一档（会议/听写/别的应用）
+        _dictateNote.value = micFailReason(
+            meetingRecording = MeetingMicService.state.value.active,
+            listening = listenHoldsMic(ListenState.phase.value),
+        )
+        return false
+    }
+
+    /** 这次录音在哪张卡上说失败原因（发指令 → 指令卡；口述回顾 → [_dictateNote]）。 */
+    private fun noteRecordFailure(reason: String) {
+        if (recordAsCommand) {
+            noteCommandMicFailure(reason)
+        } else {
+            _dictateNote.value = reason
+        }
+    }
+
+    /** 现在有没有 `RECORD_AUDIO`（判定用；**不是**去要权限，要权限是界面的事）。 */
+    private fun hasMicPermission(): Boolean = ContextCompat.checkSelfPermission(
+        getApplication(),
+        android.Manifest.permission.RECORD_AUDIO,
+    ) == PackageManager.PERMISSION_GRANTED
 
     /**
      * 「说完了」：停录 → 上传 ECHO 转写并下发 → 盯住那条结果。
@@ -1508,13 +1619,23 @@ class MainViewModel(app: Application) : BaseViewModel(app) {
         }
     }
 
-    fun cancelRecording() {
+    /**
+     * 放弃这次录音（[asCommand] 同 [startRecording]：口述回顾不碰 `_submit`）。
+     *
+     * 为什么口述那条路要分开写：取消一次口述**不是**"发指令那一次失败了"，
+     * 更不能把还在路上的那条指令从卡上擦掉（它就还在等电脑回话）。
+     */
+    fun cancelRecording(asCommand: Boolean = true) {
         recordTicker?.cancel()
         _recording.value = false
         recorder.cancel()
         _recordMs.value = 0
-        // 主动取消不是失败，但也不能让"上一轮"留在卡上冒充这一轮
-        _submit.value = SubmitState(blocked = "这次录音取消了，没有发出去")
+        if (asCommand) {
+            // 主动取消不是失败，但也不能让"上一轮"留在卡上冒充这一轮
+            _submit.value = SubmitState(blocked = "这次录音取消了，没有发出去")
+        } else {
+            _dictateNote.value = DICTATE_CANCELED
+        }
     }
 
     /** 某一轮失败：只写**自己那一轮**（迟到的回调不会把新一轮的失败原因盖掉）。 */
@@ -1675,6 +1796,15 @@ class MainViewModel(app: Application) : BaseViewModel(app) {
 
         /** 一次识别最长听多久（兜底，防止永远卡在"在听…"）。 */
         const val SESSION_LIMIT_MS = 15_000L
+
+        /**
+         * 开麦之后多久**一个字节都没读到**就判定"麦被占着、什么都录不到"（[DICTATE_SILENT]）。
+         *
+         * 为什么是 3 秒：`AudioRecord.read()` 一开起来就该有数据（哪怕全零），
+         * 3 秒还一个字节都没有只有一种解释 —— 这支麦不归我们。给再长只是让用户
+         * 对着一个假的"录音中 0.0 秒"继续说话。
+         */
+        const val SILENT_MIC_MS = 3_000L
 
         /**
          * 按通知里的会议名找那场会议时，一次拉多少条。
