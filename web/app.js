@@ -4450,6 +4450,18 @@ function phoneCardInner() {
     out.push(`<div class="snote warn"><span>⚠</span><span>中继已打开但**还没连上**：
       ${esc(st.relayReason || "看看后端配对与「API 鉴权」是否都就绪")}</span></div>`);
   }
+  // ①c 经中继打开 **DSH 标准版网页**（2026-10-18 用户拍板：从"要拍板"变成"可以做了"）。
+  //     这一条是**只读**入口：地址由服务端按"真的能打开"才给（中继已连 + 标准版在跑），
+  //     拿不到就只说原因，**面板不自己拼地址**（拼出来的多半打不开）。
+  if (st.dshWebUrl) {
+    out.push(`<div class="snote"><span>🌐</span><span>手机首页「安排」入口打开的
+      <b>DSH 标准版网页</b>（经中继，<b>只读</b>）：<code>${esc(st.dshWebUrl)}</code>
+      　只能看；改设置 / 发指令 / 停服务都会被拒。中继要求每个请求带令牌，
+      所以它要在 <b>App 内嵌页</b>里打开（系统浏览器直接贴这串会被 401）。</span></div>`);
+  } else if (st.relayUrl) {
+    out.push(`<div class="snote warn"><span>🌐</span><span>经中继打开标准版网页的入口现在没有：
+      ${esc(st.dshWebReason || "DSH 标准版没有在运行")}</span></div>`);
+  }
   // ② 配对码
   const pend = st.pending || {};
   out.push(`<div class="phone-pair">

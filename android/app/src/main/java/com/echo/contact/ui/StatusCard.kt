@@ -188,6 +188,9 @@ fun HomeTopCard(vm: MainViewModel) {
         ConnLevel.PENDING -> EchoPalette.Yellow
     }
     val summary = componentSummary(status?.components.orEmpty())
+    // 「经中继打开 DSH 标准版网页」这个入口的**唯一**读取点（判据在 `DshWebEntryTest`）：
+    // URL 只来自服务端的 `dshWebUrl`，App 不拼、不写死；没给就置灰并如实说原因。
+    val dshWeb = dshWebEntryOf(status)
 
     val server = status?.components?.firstOrNull { it.name == "server" }
     val tts = status?.components?.firstOrNull { it.name == "tts" }
@@ -306,6 +309,20 @@ fun HomeTopCard(vm: MainViewModel) {
                 HorizontalDivider(color = EchoPalette.Border)
                 Spacer(Modifier.height(8.dp))
 
+                // ①' 2026-10-18 夜里新增的入口：**经中继**打开 DSH 标准版网页。
+                // 2026-10-18 深夜改成 **App 内 WebView**：中继要求 `Authorization` 头，
+                // 系统浏览器不会带（点开就是 401 JSON），补头只能由 App 自己来。
+                //
+                // 为什么放在**展开区**（而不是常驻一行）：360×640 那一档的余量只有 22dp
+                // （`HomeLayoutSpec` 的预算：内容 448 ≤ 可用 470），常驻一行至少 18+4dp，
+                // 立刻就把"一屏放得下"这条挤掉。展开区是用户主动点的，**不占**一屏预算
+                // —— 判据 `DshWebEntryTest` 用源码位置钉住它确实在 `if (expanded)` 里面。
+                DshWebEntryRow(dshWeb, context)
+
+                Spacer(Modifier.height(8.dp))
+                HorizontalDivider(color = EchoPalette.Border)
+                Spacer(Modifier.height(8.dp))
+
                 // 第一排：服务 / 智能体 / 语音合成（与面板底部那条同一口径）
                 Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                     StatusCell(
@@ -419,6 +436,77 @@ fun HomeTopCard(vm: MainViewModel) {
 private fun copyToClipboard(context: Context, text: String): Boolean {
     val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager ?: return false
     return runCatching { cm.setPrimaryClip(ClipData.newPlainText("ECHO 配对地址", text)) }.isSuccess
+}
+
+/**
+ * 入口那一行：**经中继**在 **App 内**打开 DSH 标准版网页（2026-10-18 深夜改）。
+ *
+ * ## 三条硬约束（都来自用户 2026-10-18 的要求）
+ *
+ *  1. **URL 不写死**：地址只来自服务端（`dshWebUrl`），拼法不由 App 决定 —— 见 [DshWebEntrySpec]；
+ *  2. **没有地址就置灰 + 说清楚**：一句话写明"服务端未提供中继地址"并点名期望字段，
+ *     绝不写"敬请期待"，也绝不拿 `relayUrl`（那是 API 中继根）凑数；
+ *  3. **打开失败也要说**：这一版"没打开"只剩一种情况（入口被置灰）—— 真的点下去之后，
+ *     是 App 内那个 WebView 在负责"加载失败如实说明原因"（`DshWebScreen` 的失败卡），
+ *     不再有"手机上找不到浏览器"那种黑箱。
+ *
+ * ## 为什么从系统浏览器改成 App 内 WebView
+ *
+ * 中继对 `api/` 下的每条接口都要求 `Authorization` 头，而**系统浏览器不会带手机令牌** ——
+ * 那个 `Intent.ACTION_VIEW` 点开就是一段 401 JSON（用户看到的是"页面打不开"）。
+ * 现在交给 `DshWebOpen.put(url)`，由 `HomeScreen` 画全屏的 `DshWebScreen`，
+ * 拦截器只对**同源**请求补头（规则在 `DshWebRequestPolicy`）。
+ *
+ * 「到底把哪个 URL 交出去了」这件事在 [openDshWeb]（纯函数 + 可注入 opener）里仍有判据，
+ * 这里只负责把"交给 App 内嵌页"包成 opener。
+ */
+@Suppress("UNUSED_PARAMETER")
+@Composable
+private fun DshWebEntryRow(entry: DshWebEntry, context: Context) {
+    // context 现在只有"可空处理"这一层意思（入口本身不再自己造 Intent）——
+    // 保留它是因为展开区里这一行与上面那条"复制配对地址"共用同一个 context，
+    // 将来要在这里加"复制这条地址"时不必再改签名（判据 `DshWebEntryTest` 钉着这个调用形状）。
+    var note by remember { mutableStateOf("") }
+
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                DshWebEntrySpec.TITLE,
+                style = MaterialTheme.typography.bodyMedium,
+                color = if (entry.enabled) EchoPalette.Text else EchoPalette.Muted,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            MutedLine(
+                // 可点：说明"经中继 + 只读 + 在 App 内"；不可点：说明**为什么**（含期望字段名）
+                if (entry.enabled) {
+                    DshWebEntrySpec.SUBTITLE + (note.takeIf { it.isNotBlank() }?.let { "　·　$it" } ?: "")
+                } else {
+                    entry.problem
+                },
+                color = if (entry.enabled) EchoPalette.Muted else EchoPalette.Yellow,
+                maxLines = 2,
+            )
+        }
+        Spacer(Modifier.size(6.dp))
+        TextButton(
+            enabled = entry.enabled,
+            onClick = {
+                // opener 是可注入的（判据用假 opener 断言"交出去的就是服务端那串"）；
+                // 真实这条路 = 交给 App 内嵌页（不离开 App，令牌由拦截器补在请求头上）。
+                val ok = openDshWeb(entry) { url ->
+                    DshWebOpen.put(url)
+                    true
+                }
+                note = if (ok) "" else "没打开：这个入口现在没有可用地址"
+            },
+        ) {
+            Text(DshWebEntrySpec.OPEN_LABEL, style = MaterialTheme.typography.labelLarge)
+        }
+    }
 }
 
 /** 一格：状态灯 + 名字 + 短值（照面板底部那条的三格）。 */

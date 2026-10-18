@@ -19,7 +19,7 @@ from starlette.background import BackgroundTask
 import app.db as db
 from app import __version__ as _ECHO_VERSION
 from app.config import settings
-from app import assistant, manager, meeting, netguard, phone_pair, ports, relay as relay_mod, runtime, services, worklog
+from app import assistant, manager, meeting, netguard, phone_pair, ports, relay as relay_mod, relay_web, runtime, services, worklog
 from app.audio import recorder
 from app.audio import stt as stt_mod
 from app.audio import tts as tts_mod
@@ -111,7 +111,17 @@ def optional_auth(request: Request, authorization: str = Header(default="")):
 
     **网上来的调用**另有一张拒收清单（`_NETWORK_DENIED`）：手机 / 手表这类触点
     不该能停服、重启、删会议、改设置 —— 令牌丢了也不至于把机器搞没。
+
+    **只读中继网页会话**（2026-10-18）是第一道闸，排在上面所有判断之前：
+    只要请求**明确**打着那条会话（`X-Echo-Relay-Web`），写动作就一律 403 ——
+    哪怕此时 `apiAuthEnabled` 关着、哪怕它是从回环进来的。
+    这不是"再加一层审批"，而是把"一条只读会话"按它字面的意思执行：
+    能看，不能改设置/发指令/停服务。
     """
+    if relay_mod.web_session_denied(request):
+        raise HTTPException(
+            status_code=403,
+            detail="这是经中继的只读网页会话：只能看，不能改设置/发指令/停服务")
     if not settings.get("apiAuthEnabled", False):
         return None
     from_this_machine = _is_loopback_call(request)
@@ -577,6 +587,11 @@ def api_status(_auth=Depends(optional_auth)):
     loaded_desc = ", ".join(f"{e.get('engine')}" for e in stt_st["loaded"]) or "未加载"
     services.report_stt("online" if stt_st["loaded"] else "ready",
                         f"{loaded_desc} · {stt_st['device']}")
+    # 经中继打开 DSH 标准版网页的**只读**入口（2026-10-18 用户拍板）。
+    # 地址只在"真的能打开"时非空（中继已连 + 有 publicUrl + DSH 标准版在跑）；
+    # 否则如实为空并给出原因 —— 消费者（安卓首页的「安排」入口）**不要自己拼地址**。
+    # 字段名 `dshWebUrl` 是给安卓那条线按名取的，改名要同步那边。
+    web = relay_mod.web_entry()
     return {
         "components": components,
         # 顶层 dsh = DSH **桌面版**适配器。skipped 表示"用户选了别的智能体、这个没在用"，
@@ -591,6 +606,10 @@ def api_status(_auth=Depends(optional_auth)):
         "startupNotes": db.startup_notes(),
         # 命令流当前阶段（listening/transcribing/running）：面板据此给"说话"按钮做动效
         "busyPhase": assistant._busy_owner.get("phase"),
+        # 经中继打开 DSH 标准版网页（只读）—— `dshWebReason` 说清"为什么现在是空的"
+        "dshWebUrl": str(web.get("url") or ""),
+        "dshWebReason": str(web.get("reason") or ""),
+        "dshWebReadOnly": True,
         "uptime": services.uptime(),
         "version": _echo_version(),
     }
@@ -931,6 +950,35 @@ def get_relay(_auth=Depends(optional_auth)):
     """
     from app import relay as relay_mod
     return relay_mod.status(refresh_ready=True)
+
+
+# 经中继打开 **DSH 标准版网页**（2026-10-18 用户拍板：从"要拍板才做"变成"可以做了"）。
+#
+# 路径在 `api/` 下是**被迫、也是刻意的**：中继服务端只放行 `/health` 与 `api/*`，
+# 而那一层已经部署在 echoserver 上、本轮不许改。详见 `app/relay_web.py` 顶部。
+#
+# 安全口径只有一句：**这是只读视图，不是把管理面暴露出去**。
+#   * 路径白名单 + RPC 方法白名单都在 `relay_web`（默认拒绝）；
+#   * 写接口一律拒绝（`optional_auth` 的第一道闸 + 这里的 403）；
+#   * DSH 的登录 Cookie 只在本机这一跳用，**不下发给浏览器**。
+# 全部方法都挂上（而不是只挂 GET/POST）：这样 PUT/PATCH/DELETE 会得到一句
+# 说清原因的 403，而不是一个"该方法不允许"的 405 —— 后者看着像路由写错了。
+@router.api_route("/relaydsh/{session}/{path:path}",
+                  methods=["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"])
+async def relay_dsh_web(session: str, path: str, request: Request,
+                        _auth=Depends(optional_auth)):
+    """把一条只读网页请求转给本机的 DSH 标准版（独立 harness），原样带回。"""
+    body = await request.body()
+    status, ctype, payload = relay_web.proxy(
+        session=session,
+        method=request.method,
+        path=path,
+        query=request.url.query or "",
+        body=body,
+        content_type=request.headers.get("content-type") or "",
+    )
+    return Response(content=payload, status_code=int(status),
+                    headers={"content-type": ctype})
 
 
 # ---------------------------------------------------------------- 每日回顾
@@ -3163,7 +3211,12 @@ def _pair_state() -> dict:
     **互相连不通**时，配对页要填的不是 `baseUrl`（局域网地址）而是 `relayUrl`。
     所以这里把"开关开了没、线程在不在跑、手机该填哪串"一次给全 ——
     面板只读这一处，不自己拼。
+
+    `dshWeb*`（2026-10-18）是"经中继打开 DSH 标准版网页"的**只读**入口：
+    面板把它显示出来（手机首页的「安排」入口按同一个字段取），
+    不可用时 url 为空、reason 说清缺哪一条 —— **绝不编一个打不开的地址**。
     """
+    relay_state = relay_mod.status()
     return {
         "bindMode": str(settings.get("serverBindMode", "loopback") or "loopback"),
         "lanHost": str(settings.get("serverLanHost", "") or ""),
@@ -3175,7 +3228,10 @@ def _pair_state() -> dict:
         "relayEnabled": bool(settings.get("relayEnabled", False)),
         "relayRunning": bool(relay_mod.STATE.get("connected")),
         "relayUrl": relay_mod.public_url(),
-        "relayReason": relay_mod.status().get("reason", ""),
+        "relayReason": relay_state.get("reason", ""),
+        "dshWebUrl": str(relay_state.get("webUrl") or ""),
+        "dshWebReason": str(relay_state.get("webReason") or ""),
+        "dshWebReadOnly": True,
     }
 
 

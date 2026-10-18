@@ -441,6 +441,272 @@ class GhPushProxyFallback(unittest.TestCase):
                          f"Parser.ParseFile 报错（WinPS 5.1 会解析失败）：\n{proc.stdout}\n{proc.stderr}")
 
 
+# ------------------------------- 1b. 成功判据：只有"远端该分支 == 本地 HEAD"才算成功
+# 这一组针对 2026-10-18 的实测事故：`git push` 退出码 0，但远端根本没动，脚本却报了成功。
+# 判据必须"有证据才放过"：ls-remote 的每一行都要逐字解析成 `<40位sha><空白>refs/heads/<branch>`，
+# 而且必须精确等于本地 `rev-parse HEAD`；空输出 / 格式怪 / 多个候选 / 别的 ref / 非零退出码
+# 一律判失败（exit 1 并说清原因）。下面这些用例全部用桩，**一次都不真 push**。
+_GIT_STUB2 = r'''# -*- coding: utf-8 -*-
+"""gh-push ls-remote stub: arranges WHAT THE REMOTE SAYS, per ECHO_TEST_LSREMOTE."""
+import json, os, sys, time
+args = sys.argv[1:]
+trace = os.environ["ECHO_TEST_TRACE_DIR"]
+branch = os.environ.get("ECHO_TEST_BRANCH", "feat/3.0-backend")
+local = os.environ.get("ECHO_TEST_LOCAL_SHA", "1" * 40)
+stale = os.environ.get("ECHO_TEST_STALE_SHA", "2" * 40)
+
+
+def log(event, **kw):
+    kw.update(event=event, t=time.time(), pid=os.getpid())
+    with open(os.path.join(trace, "git.log"), "a", encoding="utf-8") as f:
+        f.write(json.dumps(kw, ensure_ascii=True) + "\n")
+
+
+log("git", args=args)
+if "symbolic-ref" in args:
+    print(branch)
+    sys.exit(0)
+if "rev-parse" in args:
+    if os.environ.get("ECHO_TEST_LOCAL_MODE", "sha") == "empty":
+        sys.exit(0)                      # local HEAD unreadable: must be a failure
+    print(local)
+    sys.exit(0)
+if "ls-remote" in args:
+    mode = os.environ.get("ECHO_TEST_LSREMOTE", "match")
+    ref = "refs/heads/" + branch
+    if mode == "match":
+        print(local + "\t" + ref)
+    elif mode == "stale":
+        # push says OK, remote still on the old commit: the incident itself
+        print(stale + "\t" + ref)
+    elif mode == "empty":
+        pass
+    elif mode == "garbage":
+        print("fatal: unable to access 'https://github.com/x.git/': server closed abruptly")
+    elif mode == "warning_then_ok":
+        print("warning: redirecting to https://github.com/x.git/")
+        print(local + "\t" + ref)
+    elif mode == "two":
+        print(local + "\t" + ref)
+        print(stale + "\t" + ref)
+    elif mode == "otherbranch":
+        # same sha, but the answer is about another branch -> cannot vouch for this one
+        print(local + "\trefs/heads/main")
+    elif mode == "shortsha":
+        print(local[:39] + "\t" + ref)
+    elif mode == "noref":
+        print(local)
+    elif mode == "exit1":
+        print(local + "\t" + ref)
+        sys.exit(1)
+    sys.exit(0)
+if "status" in args:
+    sys.exit(0)
+if "push" in args:
+    proxy = [a for a in args if a.startswith("http.proxy=")]
+    kind = "proxy" if proxy else "direct"
+    fail = os.environ.get("ECHO_TEST_PROXY_FAIL" if proxy else "ECHO_TEST_DIRECT_FAIL", "0") == "1"
+    log("push", kind=kind, fail=fail, proxy=(proxy[0] if proxy else ""))
+    if fail:
+        sys.stderr.write("fatal: injected %s push failure\n" % kind)
+        sys.exit(1)
+    sys.exit(0)                          # key: push itself claims success
+sys.exit(0)
+'''
+
+
+@unittest.skipUnless(os.name == "nt", "gh-push.ps1 只在 Windows 上跑")
+class GhPushSuccessCriterion(unittest.TestCase):
+    """push 退出码 0 只是"git 说的"；成功必须由远端 HEAD == 本地 HEAD 证明。"""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(prefix="echoghok-")
+        self.tmp = Path(self._tmp.name)
+        self.trace = self.tmp / "trace"
+        self.trace.mkdir()
+        self.py = sys.executable
+
+        self.git_stub = self.tmp / "stub_git2.py"
+        self.git_stub.write_text(_GIT_STUB2, encoding="ascii")
+        self.curl_stub = self.tmp / "stub_curl.py"
+        self.curl_stub.write_text(_CURL_STUB, encoding="ascii")
+        self.proxy_stub = self.tmp / "stub_proxy.py"
+        self.proxy_stub.write_text(_PROXY_STUB, encoding="ascii")
+
+        self.git_cmd = _write_cmd(self.tmp / "git2.cmd", self.py, self.git_stub)
+        self.curl_cmd = _write_cmd(self.tmp / "curl2.cmd", self.py, self.curl_stub)
+
+    def tearDown(self):
+        for ev in _event_lines(self.trace / "proxy.log"):
+            pid = int(ev.get("pid") or 0)
+            if pid and build_kit._pid_alive(pid):
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except OSError:
+                    pass
+        self._tmp.cleanup()
+
+    # ---------------------------------------------------------------- helpers
+    def env(self, **over):
+        env = os.environ.copy()
+        env.update({
+            "ECHO_GH_PUSH_GIT": str(self.git_cmd),
+            "ECHO_GH_PUSH_CURL": str(self.curl_cmd),
+            "ECHO_GH_PUSH_NODE": self.py,
+            "ECHO_GH_PUSH_PROXY_JS": str(self.proxy_stub),
+            "ECHO_TEST_TRACE_DIR": str(self.trace),
+            "ECHO_TEST_BRANCH": "feat/3.0-backend",
+            "ECHO_TEST_LOCAL_SHA": LOCAL_SHA,
+            "ECHO_TEST_LSREMOTE": "match",
+            "ECHO_TEST_DIRECT_FAIL": "0",
+            "ECHO_TEST_PROXY_FAIL": "0",
+            "ECHO_TEST_CURL_DEFAULT": "401",
+        })
+        env.update({k: str(v) for k, v in over.items()})
+        return env
+
+    def run_push(self, **env_over):
+        env = self.env(**env_over)
+        argv = [_powershell(), "-NoProfile", "-ExecutionPolicy", "Bypass",
+                "-File", str(PS1), "-SkipCheck", "-Retries", "1", "-TopN", "1"]
+        proc = subprocess.run(argv, cwd=str(ROOT), env=env, capture_output=True,
+                              text=True, encoding="utf-8", errors="replace", timeout=180)
+        return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
+
+    def git_events(self):
+        return _event_lines(self.trace / "git.log")
+
+    def pushes(self):
+        return [e for e in self.git_events() if e.get("event") == "push"]
+
+    def ls_remotes(self):
+        return [e for e in self.git_events()
+                if e.get("event") == "git" and "ls-remote" in e.get("args", [])]
+
+    # ---------------------------------------------------------------- tests
+    def test_push_exit_zero_with_an_unchanged_remote_is_a_failure(self):
+        """事故原型：`git push` 返回 0，但远端 HEAD 还是旧提交 -> 必须 exit 1。"""
+        code, out = self.run_push(ECHO_TEST_LSREMOTE="stale")
+        self.assertEqual(code, 1, f"push 退出码 0 + 远端没动，脚本却 exit {code}\n{out[-3000:]}")
+        self.assertIn("not reporting success", out, "没有一句明确的『git 说成功但核实不了』")
+        self.assertIn("WARNING: origin/feat/3.0-backend is 22222222", out,
+                      "没有把『远端是哪个 sha / 本地是哪个 sha』打出来")
+        self.assertNotIn("push OK", out, "远端没动却说 push OK")
+        self.assertEqual(len(self.pushes()), 1, "只该推一次（没有证据就不许当成功收工）")
+
+    def test_empty_ls_remote_output_is_a_failure(self):
+        """`ls-remote` 什么都没打印（空输出不是"没变化"，是"没证据"）-> 必须 exit 1。"""
+        code, out = self.run_push(ECHO_TEST_LSREMOTE="empty")
+        self.assertEqual(code, 1, out[-3000:])
+        self.assertIn("could not be confirmed", out)
+        self.assertIn("printed nothing for refs/heads/feat/3.0-backend", out)
+        self.assertNotIn("push OK", out)
+
+    def test_unparsable_ls_remote_output_is_a_failure(self):
+        """输出格式不对（把 fatal: 那一行当输出）-> 必须 exit 1，不许当成匹配。"""
+        code, out = self.run_push(ECHO_TEST_LSREMOTE="garbage")
+        self.assertEqual(code, 1, out[-3000:])
+        self.assertIn("unparsable ls-remote output", out)
+        self.assertNotIn("push OK", out)
+
+    def test_a_warning_line_before_the_ref_is_a_failure(self):
+        """多出一行 warning：逐字解析口径下也算"格式不对"，宁可失败不许猜。"""
+        code, out = self.run_push(ECHO_TEST_LSREMOTE="warning_then_ok")
+        self.assertEqual(code, 1, out[-3000:])
+        self.assertIn("unparsable ls-remote output", out)
+        self.assertNotIn("push OK", out)
+
+    def test_short_sha_is_a_failure(self):
+        """39 位 sha（截断/拼错）不能当 40 位用 -> 必须 exit 1。"""
+        code, out = self.run_push(ECHO_TEST_LSREMOTE="shortsha")
+        self.assertEqual(code, 1, out[-3000:])
+        self.assertIn("unparsable ls-remote output", out)
+        self.assertNotIn("push OK", out)
+
+    def test_a_sha_without_a_ref_is_a_failure(self):
+        """只有 sha、没有 ref：证明不了"是哪个 ref" -> 必须 exit 1。"""
+        code, out = self.run_push(ECHO_TEST_LSREMOTE="noref")
+        self.assertEqual(code, 1, out[-3000:])
+        self.assertIn("unparsable ls-remote output", out)
+        self.assertNotIn("push OK", out)
+
+    def test_multiple_candidates_are_a_failure(self):
+        """同一个 ref 回来两行（两个 sha）：不许挑一个就算 -> 必须 exit 1。"""
+        code, out = self.run_push(ECHO_TEST_LSREMOTE="two")
+        self.assertEqual(code, 1, out[-3000:])
+        self.assertIn("refusing to guess", out)
+        self.assertNotIn("push OK", out)
+
+    def test_the_same_sha_on_another_ref_does_not_count(self):
+        """sha 一样但 ref 是 refs/heads/main：不能给 feat/3.0-backend 背书 -> exit 1。"""
+        code, out = self.run_push(ECHO_TEST_LSREMOTE="otherbranch")
+        self.assertEqual(code, 1, out[-3000:])
+        self.assertIn("instead of refs/heads/feat/3.0-backend", out)
+        self.assertNotIn("push OK", out)
+
+    def test_ls_remote_nonzero_exit_is_a_failure(self):
+        """ls-remote 退出码非 0：哪怕它顺手打印了正确的 sha，也不算核实 -> exit 1。"""
+        code, out = self.run_push(ECHO_TEST_LSREMOTE="exit1")
+        self.assertEqual(code, 1, out[-3000:])
+        self.assertIn("ls-remote exited 1", out)
+        self.assertNotIn("push OK", out)
+
+    def test_unreadable_local_head_is_a_failure(self):
+        """本地 HEAD 读不到 -> 没有可比的东西 -> exit 1（不许"没证据也放过"）。"""
+        code, out = self.run_push(ECHO_TEST_LOCAL_MODE="empty")
+        self.assertEqual(code, 1, out[-3000:])
+        self.assertIn("could not read local HEAD", out)
+        self.assertNotIn("push OK", out)
+
+    def test_dotted_slashed_branch_matches_exactly_and_succeeds(self):
+        """`feat/3.0-backend` 必须能被精确匹配（点号不许当通配符）-> exit 0 + verified。"""
+        code, out = self.run_push(ECHO_TEST_LSREMOTE="match")
+        self.assertEqual(code, 0, f"远端确实等于本地 HEAD，却报了失败：\n{out[-3000:]}")
+        self.assertIn("verified: origin/feat/3.0-backend ==", out)
+        self.assertIn("push OK", out)
+        # 查的是"这个分支的 ref"，不是一个宽泛的 refs/heads/ 前缀
+        args = self.ls_remotes()[-1]["args"]
+        self.assertIn("refs/heads/feat/3.0-backend", args, args)
+
+    def test_proxy_push_exit_zero_with_an_unchanged_remote_is_a_failure(self):
+        """代理这条路同样要核实：代理 push 退出 0 但远端没动 -> exit 1。"""
+        code, out = self.run_push(ECHO_TEST_LSREMOTE="stale", ECHO_TEST_DIRECT_FAIL="1")
+        self.assertEqual(code, 1, out[-4000:])
+        self.assertIn("CONNECT proxy also failed", out)
+        self.assertNotIn("push OK", out)
+        # 代理必须被关掉（finally 里的清理不许影响退出码，也不许留孤儿）
+        for ev in _event_lines(self.trace / "proxy.log"):
+            self.assertTrue(_wait_dead(int(ev["pid"])), f"代理进程没关：pid={ev['pid']}")
+
+    def test_proxy_success_keeps_exit_zero(self):
+        """代理路径真的核实通过时：exit 0（清理逻辑不许把成功的退出码弄丢）。"""
+        code, out = self.run_push(ECHO_TEST_LSREMOTE="match", ECHO_TEST_DIRECT_FAIL="1")
+        self.assertEqual(code, 0, out[-4000:])
+        self.assertIn("push OK via proxy", out)
+        for ev in _event_lines(self.trace / "proxy.log"):
+            self.assertTrue(_wait_dead(int(ev["pid"])), f"代理进程没关：pid={ev['pid']}")
+
+    def test_a_proxy_that_never_listens_is_a_failure(self):
+        """代理起不来（node 起来了但没监听）：必须 exit 1 并说清原因。"""
+        dead = self.tmp / "dead_proxy.py"
+        dead.write_text("import sys\nsys.exit(3)\n", encoding="ascii")
+        code, out = self.run_push(ECHO_TEST_DIRECT_FAIL="1", ECHO_GH_PUSH_PROXY_JS=str(dead))
+        self.assertEqual(code, 1, out[-4000:])
+        self.assertIn("never started listening", out)
+        self.assertIn("CONNECT proxy could not run", out)
+        self.assertNotIn("push OK", out)
+
+    def test_cleanup_is_guarded_so_it_cannot_change_the_verdict(self):
+        """`finally` 里的清理必须不可能抛：抛了要么把成功变成失败，要么把失败吞成别的。"""
+        src = PS1.read_text(encoding="ascii")
+        body = src[src.index("function Stop-GhProxy"):]
+        body = body[:body.index("\nfunction ")] if "\nfunction " in body else body
+        self.assertIn("$ErrorActionPreference = 'Continue'", body,
+                      "Stop-GhProxy 没把 ErrorActionPreference 调成 Continue，清理可能抛异常")
+        self.assertIn("} catch {", body, "Stop-GhProxy 没有兜底 catch")
+        self.assertIn("trap {", src, "缺最后的兜底：未处理的错误不许让脚本以 exit 0 收场")
+
+
 # ------------------------------------------------- 2. build_min_kit 的共享打包锁
 class MinKitUsesTheSharedPackLock(unittest.TestCase):
     """组 kit 必须进 `build_kit.pack_lock` —— 同一把锁，不是复制一份。"""

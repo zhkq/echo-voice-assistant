@@ -33,7 +33,9 @@
 from __future__ import annotations
 
 import base64
+import hmac
 import json
+import secrets
 import socket
 import threading
 import time
@@ -64,6 +66,25 @@ BACKOFF_MAX_S = 60.0
 ALLOWED_PREFIX = "api/"
 ALLOWED_EXACT = ("health",)
 
+#: 「经中继打开 DSH 标准版网页」的入口前缀（2026-10-18 用户拍板）。
+#:
+#: **为什么必须在 `api/` 下**：中继服务端（`server/relay.py::path_allowed`）只放行
+#: `/health` 与 `api/*`，而那一层**已经部署在 echoserver 上**、本轮又不许改
+#: （改了不部署 = 没改）。所以网页入口只能借 `api/` 这条**已经存在**的放行通道。
+#: 这不是"随手选的路径"：换个前缀，线上中继会直接 403，网页根本到不了这台电脑。
+WEB_ENTRY_PREFIX = "api/relaydsh/"
+
+#: 只读网页会话的可选请求头。带上它 = "我明确用那条只读会话"；
+#: 写请求（POST/PUT/PATCH/DELETE）只要带的是**有效**的这一枚，一律 403
+#: （见 `web_session_denied()` 与 `app/api.py::optional_auth` 的第一道闸）。
+#: 真正的只读边界在 `app/relay_web.py`（那个入口只放行静态页与读 RPC）——
+#: 这个头是"第二道"，防的是"拿着会话令牌去调别的写接口"。
+WEB_SESSION_HEADER = "X-Echo-Relay-Web"
+
+#: 会话寿命。过期就换一枚（旧的立刻失效）—— 地址会被手机存下来，
+#: 但"一条只读会话"不该是一张永久通票。
+WEB_SESSION_TTL_S = 12 * 3600.0
+
 #: 进程级状态（面板/接口读它；纯读不改）。
 STATE = {
     "running": False,        # 线程在跑吗
@@ -75,6 +96,15 @@ STATE = {
     "lastCallAt": 0.0,
     "lastError": "",
 }
+
+#: 「中继专用只读会话」的进程级状态（**只读，不是把管理面暴露出去**）。
+#:
+#: 一枚随机令牌 + 创建时间。它出现在 `dshWebUrl` 的**路径段**里（不是查询串）：
+#: 页面加载后的资源请求都是**文档相对**的（`./assets/…`、`api/<ns>/<method>`），
+#: 令牌作为路径段会被它们自然继承 —— 查询串则会在下一次子请求里丢掉。
+#: 这样"一条会话"才真的贯穿整页，而不是只有首屏带得上。
+_WEB_LOCK = threading.Lock()
+_WEB_SESSION = {"token": "", "at": 0.0}
 
 
 def enabled() -> bool:
@@ -117,6 +147,114 @@ def public_url() -> str:
     return "%s/v1/relay/%s/" % (base_url.rstrip("/"), host_id)
 
 
+_HARNESS_PROBE = {"at": 0.0, "ok": False}
+#: 探活缓存几秒：`/api/status` 是每几秒轮询一次的，没必要每次都真连一次 harness。
+#: 代价只是"标准版刚起来时，地址最多晚 3 秒出现"—— 比每次轮询都多一跳划算。
+_HARNESS_PROBE_CACHE_S = 3.0
+
+
+def _harness_online(timeout: float = 0.8) -> bool:
+    """DSH 标准版 harness 在监听吗（**一次本机探活**，不起进程、不带 token）。
+
+    为什么网页地址要卡这一条：地址的承诺是"点开就能看到 DSH 标准版网页"。
+    harness 没跑时把地址给出去，用户点开只会得到一句 502 —— 那是"编了一个打不开的
+    地址"，比不给更坏。所以这里如实探一次；探不到就把 `dshWebUrl` 空着 + 说明原因。
+    """
+    now = time.time()
+    if (now - float(_HARNESS_PROBE.get("at") or 0.0)) < _HARNESS_PROBE_CACHE_S:
+        return bool(_HARNESS_PROBE.get("ok"))
+    try:
+        from app import harness_proc
+        ok = bool(harness_proc.online(timeout=timeout))
+    except Exception:                                             # noqa: BLE001 - 探不了就当没跑
+        ok = False
+    _HARNESS_PROBE.update(at=now, ok=ok)
+    return ok
+
+
+def web_session(rotate: bool = False) -> str:
+    """取（必要时新建）那条「中继专用只读会话」的令牌。**可重复调用。**
+
+    `rotate=True` 立刻换一枚（旧地址立即失效，用于关掉中继/收尾）。
+    """
+    now = time.time()
+    with _WEB_LOCK:
+        token = str(_WEB_SESSION.get("token") or "")
+        born = float(_WEB_SESSION.get("at") or 0.0)
+        if rotate or not token or (now - born) > WEB_SESSION_TTL_S:
+            token = secrets.token_urlsafe(24)
+            _WEB_SESSION.update(token=token, at=now)
+        return token
+
+
+def web_session_valid(token: str) -> bool:
+    """这枚令牌**现在**是不是那条只读会话（过期即失效，比较用常量时间）。"""
+    got = str(token or "")
+    with _WEB_LOCK:
+        want = str(_WEB_SESSION.get("token") or "")
+        born = float(_WEB_SESSION.get("at") or 0.0)
+    if not want or not got:
+        return False
+    if (time.time() - born) > WEB_SESSION_TTL_S:
+        return False
+    return hmac.compare_digest(want, got)
+
+
+def web_session_denied(request) -> bool:
+    """写请求是不是**明确**打着那条只读会话来的；是 → 该拒。
+
+    只认请求头（`X-Echo-Relay-Web`）：只读会话的地址在路径里，浏览器不会把它带进
+    `/api/settings` 这种别的写接口 —— 所以"拿着会话令牌去写"必须是**显式**行为，
+    我们才拦得住；而普通手机令牌（别的设备）照旧按它自己的权限走。
+
+    ⚠️ 不含 `GET/HEAD/OPTIONS`：只读会话本身就要靠 GET 取静态页。
+    ⚠️ 不再拦 `/api/relaydsh/` 自己的 POST：那条路要放行**读** RPC（`session/list` 这种
+    就是 POST），它的白名单在 `app/relay_web.py` 里按**方法名**判，比这里按 HTTP 动词判更准。
+    """
+    try:
+        if str(getattr(request, "method", "") or "").upper() in ("GET", "HEAD", "OPTIONS"):
+            return False
+        path = str(getattr(getattr(request, "url", None), "path", "") or "")
+        if path.startswith("/api/relaydsh/"):
+            return False
+        token = str(request.headers.get(WEB_SESSION_HEADER) or "")
+        return web_session_valid(token)
+    except Exception:                                             # noqa: BLE001 - 判不出就不拦
+        return False
+
+
+def web_entry() -> dict:
+    """`{"url", "reason", "readOnly"}` —— 给手机/面板看的**只读网页入口**。
+
+    * `url` 只在"真的能打开"时非空：中继已连上 + 有 publicUrl + DSH 标准版在跑；
+    * 否则**如实为空**，`reason` 说清缺哪一条（**绝不编一个打不开的地址**）。
+    """
+    if not enabled():
+        return {"url": "", "readOnly": True,
+                "reason": "中继没打开（设置 → 中继 → 允许手机经后端中转）"}
+    if not bool(STATE.get("connected")):
+        return {"url": "", "readOnly": True,
+                "reason": str(STATE.get("lastError") or "") or "中继还没连上后端"}
+    # 地址取**缓存的那份**（每次成功 poll 都会刷新），不要在这里再走一遍
+    # `backend_endpoint()` —— 那个可能联网换令牌，而 `/api/status` 是每几秒轮询一次的。
+    base = str(STATE.get("publicUrl") or "")
+    if not base:
+        base = public_url()          # 极少见（连上了但缓存还空着）：补一次
+    if not base:
+        return {"url": "", "readOnly": True,
+                "reason": "还没有中继地址（后端没配对，或还没拿到 hostId）"}
+    if not _harness_online():
+        return {"url": "", "readOnly": True,
+                "reason": "DSH 标准版 harness 没在运行（设置 → 智能体 → 选「标准版 harness」）"}
+    return {"url": base + WEB_ENTRY_PREFIX + web_session() + "/", "readOnly": True,
+            "reason": ""}
+
+
+def web_url() -> str:
+    """只读网页入口的地址；不可用时回空串（见 `web_entry()`）。"""
+    return str(web_entry().get("url") or "")
+
+
 def status(refresh_ready: bool = False) -> dict:
     """给面板/接口看的一份状态（纯读，不触发任何动作）。
 
@@ -137,6 +275,12 @@ def status(refresh_ready: bool = False) -> dict:
         out["ready"] = connected
         out["reason"] = "" if connected else (
             str(out.get("lastError") or "") or "中继还没连上（或开关没开）")
+    # 经中继打开 DSH 标准版网页的那条**只读**入口（2026-10-18 用户拍板）。
+    # 不可用时 url 为空、reason 说清原因 —— 消费者不该自己拼一个。
+    entry = web_entry()
+    out["webUrl"] = str(entry.get("url") or "")
+    out["webReason"] = str(entry.get("reason") or "")
+    out["webReadOnly"] = True
     return out
 
 
@@ -147,6 +291,10 @@ def path_allowed(path: str) -> bool:
 
     后端已经判过一次；这里是**第二道**：万一那边放宽了、或有人直接调本模块的接口，
     这一道仍然拦得住。判据与 `server/relay.py::path_allowed` 刻意写成同形。
+
+    ⚠️ 这里的 `api/*` **已经**涵盖网页入口（`api/relaydsh/<会话>/…`）—— 那是刻意的：
+    中继服务端的放行面就只到 `api/`，网页入口必须活在那条通道里（见 `WEB_ENTRY_PREFIX`）。
+    而"入口里**只**允许哪些路径、哪些方法"是另一层（`app/relay_web.py`），不是这里。
     """
     p = str(path or "").replace("\\", "/").lstrip("/")
     if not p:
@@ -332,3 +480,7 @@ def stop() -> None:
         worker.stop()
     STATE["running"] = False
     STATE["connected"] = False
+    # 中继停了，那条只读会话的地址立刻作废：换一枚令牌 = 旧地址再也进不来。
+    # 不这么做的话，关掉中继之后旧链接在下次打开中继时又会"活过来"。
+    with _WEB_LOCK:
+        _WEB_SESSION.update(token="", at=0.0)

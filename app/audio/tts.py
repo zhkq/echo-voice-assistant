@@ -23,6 +23,7 @@ import time
 
 from app import paths
 from app import platform as echo_platform
+from app.audio import speech_text
 
 # 提示音 wav 随**代码**走（assets/ 是安装目录的一部分），所以取安装根而不是数据根；
 # 来源统一由路径层给（含 ECHO_ROOT 覆盖），本模块不再自己推导。
@@ -241,6 +242,10 @@ def speak(text, engine="auto", timeout=60):
         return False
     if engine == "off":
         return False
+    # 念法归一化（2026-10-18 用户实测）：`8~19℃` 会被念成「819 度」—— 引擎把区间分隔符
+    # 当连接符/负号吞掉了。**只改送去合成的这一串**：`commands.reply`、界面、事件里的
+    # `speakText` 一律保留原文（用户要看的也是原文），所以这里绝不回写任何东西。
+    text = speech_text.normalize(text)
     # 提示音与朗读串起来：停录提示音/发送提示音还没播完时，先等它（否则两个音叠着响）
     wait_beep_done()
     offline = _offline_engine_ids()
@@ -311,6 +316,9 @@ def synthesize(text, engine="auto", timeout=60):
         raise TtsOff("ttsEngine=off")
     if not (text or "").strip():
         raise TtsError("文本为空")
+    # 同 `speak`：手机/手表拿走的音频也要念成"…到…"（手机自己会先归一化一次，
+    # 这里是幂等的第二道 —— 谁先谁后都不该出现"8 到 到 19"）。
+    text = speech_text.normalize(text)
     offline = _offline_engine_ids()
     use_offline = (engine in offline
                    or (engine == "auto" and _edge_broken)

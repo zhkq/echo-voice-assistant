@@ -30,8 +30,10 @@
 #   retry into the same 502. Ports are allocated fresh per attempt and every proxy is stopped
 #   in a `finally` - success or failure - because an orphan pins a dead IP and poisons the
 #   next attempt on a brand-new port.
-#   Both paths finish with an ls-remote check that origin/<branch> == local HEAD: a zero exit
-#   code has lied here before, so it is never the last word.
+#   Both paths finish with a strict ls-remote check that origin/<branch> == local HEAD: a zero
+#   exit code has lied here before, so it is never the last word. 2026-10-18: the answer must be
+#   literally `<40 hex><spaces>refs/heads/<branch>` and match rev-parse HEAD exactly; empty,
+#   unparsable, multiple or other-ref answers count as failure (see Get-RemoteHeadState).
 #
 # ASCII-ONLY ON PURPOSE (same rule as start.ps1 / stop.ps1 / restart-echo.ps1): Windows
 # PowerShell 5.1 reads a BOM-less .ps1 as ANSI/GBK, and non-ASCII text then breaks parsing.
@@ -61,6 +63,16 @@ param(
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
 Set-Location $root
+
+# Last-resort guard: a failed run must NEVER end with exit code 0. Every expected failure is
+# handled explicitly below (each ends in `exit 1`), but an error that escapes those handlers
+# would otherwise end the script with whatever code the last native command left behind - and
+# a stale 0 there reads as "push OK" to every caller. Fails loudly and non-zero instead.
+trap {
+    Write-Host ''
+    Write-Host ("[FAIL] unexpected error, nothing was verified: " + $_.Exception.Message) -ForegroundColor Red
+    exit 1
+}
 
 # Set when the pre-push hook rejects the push (identity allowlist, see .githooks/pre-push).
 # That verdict is client-side and deterministic, so IP rotation and retries cannot change it.
@@ -367,60 +379,118 @@ function Stop-GhProxy($px) {
     # Both success and failure come through here (the caller has a `finally`). The process
     # we started is exact, but also clear whoever listens on that port: a leftover listener
     # would make the NEXT attempt fail oddly even on a different port.
-    try {
-        if ($px.Proc -and -not $px.Proc.HasExited) {
-            Stop-Process -Id $px.Proc.Id -Force -ErrorAction SilentlyContinue
-        }
-    } catch { }
-    try {
-        Get-NetTCPConnection -LocalPort $px.Port -State Listen -ErrorAction SilentlyContinue |
-            ForEach-Object { Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue }
-    } catch { }
-    foreach ($f in @($px.OutLog, $px.ErrLog)) {
-        try { if ($f -and (Test-Path -LiteralPath $f)) { Remove-Item -LiteralPath $f -Force } } catch { }
-    }
-}
-
-function Get-RemoteHead([string]$branch, [string]$resolve = '', [int]$port = 0) {
-    # Returns the remote SHA for $branch, or '' if the lookup itself failed.
-    $cfg = @('-c', 'http.sslBackend=schannel')
-    if ($port -gt 0) { $cfg += @('-c', "http.proxy=http://127.0.0.1:$port") }
-    elseif ($resolve) { $cfg += @('-c', "http.curloptResolve=$resolve") }
+    # WHY it may never throw (2026-10-18): this runs from a `finally`, and an exception thrown
+    # there REPLACES the outcome of the try block - cleanup would then decide the exit code.
+    # A verified push must stay exit 0 and a failed push must stay exit 1, so every step below
+    # is best-effort: ErrorActionPreference is forced to Continue and the whole body is guarded.
     $prev = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
     try {
-        $lines = & $script:GitExe @cfg ls-remote origin "refs/heads/$branch" 2>&1
+        try {
+            if ($px.Proc -and -not $px.Proc.HasExited) {
+                Stop-Process -Id $px.Proc.Id -Force -ErrorAction SilentlyContinue
+            }
+        } catch { }
+        try {
+            Get-NetTCPConnection -LocalPort $px.Port -State Listen -ErrorAction SilentlyContinue |
+                ForEach-Object { Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue }
+        } catch { }
+        foreach ($f in @($px.OutLog, $px.ErrLog)) {
+            try { if ($f -and (Test-Path -LiteralPath $f)) { Remove-Item -LiteralPath $f -Force } } catch { }
+        }
+    } catch {
+    } finally {
+        $ErrorActionPreference = $prev
+    }
+}
+
+function Get-RemoteHeadState([string]$branch, [string]$resolve = '', [int]$port = 0) {
+    # Looks up origin/refs/heads/<branch> and reports a VERDICT, not a bare string.
+    # WHY a hashtable instead of '' for failure (2026-10-18): the old function returned '' for
+    # "lookup failed", "branch missing" and "output did not parse" alike, so every one of those
+    # cases was indistinguishable from "no answer yet" at the call site. A verdict carries a
+    # reason, so an unverified push can never be mistaken for a verified one.
+    # Contract: @{ Ok = $true; Sha = '<40 lowercase hex>' } or @{ Ok = $false; Reason = '...' }.
+    #
+    # The parse is deliberately literal: one line must be exactly `<40 hex><spaces><ref>`, and
+    # the ref must be EXACTLY `refs/heads/<branch>` (branch names here contain slashes and dots,
+    # e.g. feat/3.0-backend, so no loose 'refs/heads/' prefix test and no regex on the branch).
+    # Anything else - empty output, a warning line, several entries, a different ref, a
+    # non-zero exit - is a FAILURE. "No evidence" is not evidence of success.
+    $cfg = @('-c', 'http.sslBackend=schannel')
+    if ($port -gt 0) { $cfg += @('-c', "http.proxy=http://127.0.0.1:$port") }
+    elseif ($resolve) { $cfg += @('-c', "http.curloptResolve=$resolve") }
+    $want = "refs/heads/$branch"
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $lines = @(& $script:GitExe @cfg ls-remote origin $want 2>&1)
         $code = $LASTEXITCODE
     } finally { $ErrorActionPreference = $prev }
-    if ($code -ne 0) { return '' }
-    foreach ($line in $lines) {
-        if (("$line").Trim() -match '^([0-9a-f]{40})\s+refs/heads/') { return $Matches[1] }
+    if ($code -ne 0) {
+        return @{ Ok = $false; Reason = ("git ls-remote exited {0} - the remote HEAD is unknown" -f $code) }
     }
-    return ''
+    $found = 0
+    $sha = ''
+    foreach ($raw in $lines) {
+        $text = ("$raw").Trim()
+        if (-not $text) { continue }
+        if ($text -notmatch '^([0-9a-fA-F]{40})\s+(\S+)$') {
+            # A warning, a progress line or a pkt-line dump: unparsable output is never a match.
+            return @{ Ok = $false; Reason = ("unparsable ls-remote output: " + $text) }
+        }
+        $lineSha = $Matches[1].ToLowerInvariant()
+        $lineRef = $Matches[2]
+        if ($lineRef -ne $want) {
+            # The pattern asked for one exact ref; getting a DIFFERENT one means the answer is
+            # about another branch, so it cannot vouch for this one.
+            return @{ Ok = $false; Reason = ("ls-remote answered for {0} instead of {1}" -f $lineRef, $want) }
+        }
+        $found++
+        if ($found -gt 1) {
+            return @{ Ok = $false; Reason = ("ls-remote returned {0} entries for {1} - refusing to guess" -f $found, $want) }
+        }
+        $sha = $lineSha
+    }
+    if ($found -eq 0) {
+        return @{ Ok = $false; Reason = ("git ls-remote printed nothing for " + $want) }
+    }
+    return @{ Ok = $true; Sha = $sha }
 }
 
 function Confirm-Push([string]$branch, [string]$resolve = '', [int]$port = 0) {
-    # A zero exit code means git accepted the push, but verify the remote actually moved -
-    # "$LASTEXITCODE -eq 0 with nothing on the server" is exactly the class of bug this
-    # script exists to avoid, so never report success on the exit code alone.
-    # Returns $true ONLY when origin/<branch> == local HEAD; an unconfirmed lookup is a
-    # failure here, because "pushed but could not verify" has already lied once.
-    $local = ("$(& $script:GitExe rev-parse HEAD)").Trim()
-    if (-not $local) {
-        Write-Host '    could not read local HEAD - cannot verify the push' -ForegroundColor Red
+    # A zero exit code means git accepted the push, but it does NOT mean the branch moved:
+    # an exit-0 push with an unchanged remote has already been reported as success here.
+    # So success is only ever "the remote HEAD for this branch IS the local HEAD", compared
+    # after reading both sides through their exit codes and parsing them strictly.
+    # Anything else - local HEAD unreadable, ls-remote failed, empty/odd output, more than one
+    # candidate, a different sha - returns $false. Never "probably fine".
+    $local = ''
+    $localCode = -1
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $localOut = @(& $script:GitExe rev-parse HEAD 2>&1)
+        $localCode = $LASTEXITCODE
+    } finally { $ErrorActionPreference = $prev }
+    $localText = (@($localOut | ForEach-Object { "$_" }) -join ' ').Trim()
+    if ($localCode -ne 0 -or $localText -notmatch '^[0-9a-fA-F]{40}$') {
+        Write-Host ("    could not read local HEAD (git rev-parse exit {0}: '{1}') - cannot verify the push" -f `
+            $localCode, $localText) -ForegroundColor Red
         return $false
     }
-    $remote = Get-RemoteHead $branch $resolve $port
-    if (-not $remote) {
-        Write-Host '    pushed (git exit 0), but ls-remote could not confirm the remote HEAD' -ForegroundColor Yellow
+    $local = $localText.ToLowerInvariant()
+    $state = Get-RemoteHeadState $branch $resolve $port
+    if (-not $state.Ok) {
+        Write-Host ("    pushed (git exit 0), but the remote HEAD could not be confirmed: {0}" -f $state.Reason) -ForegroundColor Yellow
         return $false
     }
-    if ($remote -eq $local) {
+    if ($state.Sha -eq $local) {
         Write-Host ("    verified: origin/{0} == {1}" -f $branch, $local.Substring(0, 8)) -ForegroundColor Green
         return $true
     }
     Write-Host ("    WARNING: origin/{0} is {1} but local HEAD is {2}" -f `
-        $branch, $remote.Substring(0, 8), $local.Substring(0, 8)) -ForegroundColor Red
+        $branch, $state.Sha.Substring(0, 8), $local.Substring(0, 8)) -ForegroundColor Red
     return $false
 }
 

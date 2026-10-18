@@ -1,5 +1,9 @@
 package com.echo.contact.ui
 
+import android.Manifest
+import android.content.pm.PackageManager
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Box
@@ -29,6 +33,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -76,6 +81,35 @@ fun HomeScreen(onUnpair: () -> Unit) {
 
     val showRecording by vm.showRecordingScreen.collectAsState()
 
+    // 「首页入口 → App 内网页」的那次交接（进程级 store，见 `DshWebOpen`）：
+    // 非空就整屏盖住外壳（含底部导航），关掉时清空。
+    val dshWebUrl by DshWebOpen.url.collectAsState()
+
+    // ---- 中间那颗「按住说话」的麦授权（2026-10-18 夜里新增）----
+    // 第一次长按才要权限（不在打开 App 时就弹）；授权后用户再按一次 —— 与首页指令卡
+    // 那颗「按住说话」的处理**一模一样**（`SuperAssistantTab.CommandCardBody` 也是这么做的）。
+    val context = LocalContext.current
+    val holdMicLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { /* 给不给都由下一次长按决定；不给会看到"开不了麦克风"那句如实的话 */ }
+
+    // 长按中间那颗 → 开录。返回 false = 这一次没开成（没权限 / 麦被别人占着 / 已经在录）。
+    //
+    // ⚠️ 这里读的是 `vm.recording.value`（StateFlow 的**当前值**），不是组合时捕获的旧值 ——
+    // 长按回调可能发生在很久之后，用捕获值就会拿"上一次"的判断去决定这一次要不要录。
+    // ⚠️ "已经在录"（例如回顾页正在口述）时**不抢麦**：抢了就等于把那段口述当成一条指令发出去。
+    val holdToTalkStart: () -> Boolean = {
+        when {
+            vm.recording.value -> false
+            context.checkSelfPermission(Manifest.permission.RECORD_AUDIO) !=
+                PackageManager.PERMISSION_GRANTED -> {
+                holdMicLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                false
+            }
+            else -> vm.startRecording()
+        }
+    }
+
     LaunchedEffect(Unit) { vm.init() }
 
     // ---- 通知带来的"打开那场会议"（冷启动/热启动都写进同一个 store）----
@@ -88,6 +122,19 @@ fun HomeScreen(onUnpair: () -> Unit) {
     // 「返回」只关这个界面、**不停录音**（这条语义没变）。
     if (showRecording) {
         MeetingRecordingScreen(vm)
+        return
+    }
+
+    // ---- App 内打开的 DSH 网页（2026-10-18 深夜，方案 a）----
+    // 为什么由**这一层**画：它要盖住整个外壳（含底部导航），与全屏录音界面同一个道理；
+    // 而入口那一行在 StatusCard 的展开区里，把"打开"这件事往下传要改一长串签名，
+    // 所以走 `DshWebOpen` 这个进程级交接（与 `MeetingOpenStore` 同一套手法）。
+    //
+    // 地址就是首页入口交过来的**服务端那串**（不拼、不改）；令牌与鉴权头全在
+    // `DshWebScreen` + `DshWebRequestPolicy` 里（只对同源补、只放请求头）。
+    val webUrl = dshWebUrl
+    if (webUrl != null) {
+        DshWebScreen(url = webUrl, onClose = { DshWebOpen.clear() })
         return
     }
 
@@ -116,9 +163,16 @@ fun HomeScreen(onUnpair: () -> Unit) {
             // 顺序只照 ECHO_TABS 渲染（判据在 EchoTabsTest / EchoNavBarTest）。
             // 它自身的高度已经含"露在条外的那一截"，所以 Scaffold 给内容的底部 padding 也包含了它
             // —— 凸起不会盖住页面内容，更不会挡住页面底部的按钮。
+            //
+            // 2026-10-18 夜里：中间那颗多了一个**按住说话**（用户原话"app 下方中间的 logo
+            // 增加一个按住说话发指令的功能"）。三个回调**直接就是**「指令」页那颗「按住说话」
+            // 与首页指令卡在用的同三个方法 —— 这里不新造第二条录音路（判据见 `NavHoldTest`）。
             EchoNavBar(
                 current = currentTab,
                 onSelect = { vm.selectTab(it.ordinal) },
+                onHoldStart = holdToTalkStart,
+                onHoldRelease = { vm.finishRecording() },
+                onHoldCancel = { vm.cancelRecording() },
             )
         },
     ) { padding ->

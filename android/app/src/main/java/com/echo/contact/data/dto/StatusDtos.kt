@@ -83,6 +83,29 @@ data class StatusResponse(
     /** 已运行秒数。 */
     val uptime: Int = 0,
     val version: String = "",
+    /**
+     * 「经中继打开 DSH 标准版网页」的完整地址（**服务端给，App 不拼、不写死**）。
+     *
+     * 契约见 `app/api.py::api_status` + `app/relay.py::web_entry()`
+     * （2026-10-18 与 PC 那条线对齐的字段名：`dshWebUrl` / `dshWebReason` / `dshWebReadOnly`）：
+     * 地址只在"真的能打开"时非空（中继已连 + 有 publicUrl + DSH 标准版在跑），
+     * 否则**空串**并附一句原因 —— 界面照 `DshWebEntrySpec` 的规矩把它显示成
+     * "置灰 + 服务端说的那句原因"，**不会**自己拼地址。
+     *
+     * 兼容几个别名：服务端那条线如果最终叫 `dsh_web_url` / `relayDshUrl` / `dshWebPage`，
+     * Gson 也能读进来（`alternate` 只在**反序列化**时生效，正是这里需要的）。
+     */
+    @SerializedName(
+        value = "dshWebUrl",
+        alternate = ["dsh_web_url", "relayDshUrl", "dshWebPage"],
+    )
+    val dshWebUrl: String? = null,
+    /** `dshWebUrl` 为空时的原因（服务端的人话："中继没打开" / "harness 没在运行" …）。 */
+    @SerializedName(value = "dshWebReason", alternate = ["dsh_web_reason"])
+    val dshWebReason: String? = null,
+    /** 这条网页会话是不是**只读**（现行恒为 `true`；缺省按 `true` 理解）。 */
+    @SerializedName(value = "dshWebReadOnly", alternate = ["dsh_web_read_only"])
+    val dshWebReadOnly: Boolean? = null,
 ) {
     /** 把秒数说成人话。 */
     fun uptimeText(): String {

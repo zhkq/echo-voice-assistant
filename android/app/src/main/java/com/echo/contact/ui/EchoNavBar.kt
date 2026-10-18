@@ -2,6 +2,9 @@ package com.echo.contact.ui
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.waitForUpOrCancellation
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -13,6 +16,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.offset
+import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.selection.selectable
@@ -28,12 +32,19 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.scale
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.onClick
+import androidx.compose.ui.semantics.role
+import androidx.compose.ui.semantics.selected
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -265,11 +276,18 @@ internal fun echoTabIcon(tab: EchoTab): ImageVector = when (tab) {
  *
  * @param current 当前页（只决定颜色，不决定位置）。
  * @param onSelect 点了某一页（调用方接 `vm.selectTab(it.ordinal)`）。
+ * @param onHoldStart 中间那颗**按住到长按阈值**时调（返回 false = 麦没开成，这一次不算录音）。
+ *   调用方接的是 `MainViewModel.startRecording()` —— 与「指令」页那颗「按住说话」**同一个入口**。
+ * @param onHoldRelease 按住之后松手（结束并发送，`MainViewModel.finishRecording()`）。
+ * @param onHoldCancel 按住之后拖开/上滑出界（`MainViewModel.cancelRecording()`）。
  */
 @Composable
 internal fun EchoNavBar(
     current: EchoTab,
     onSelect: (EchoTab) -> Unit,
+    onHoldStart: () -> Boolean,
+    onHoldRelease: () -> Unit,
+    onHoldCancel: () -> Unit,
 ) {
     val tabs = navTabs(current)
     val center = echoCenterTab(tabs)
@@ -330,6 +348,9 @@ internal fun EchoNavBar(
                 tab = center,
                 selected = center == current,
                 onClick = { onSelect(center) },
+                onHoldStart = onHoldStart,
+                onHoldRelease = onHoldRelease,
+                onHoldCancel = onHoldCancel,
                 modifier = Modifier
                     .align(Alignment.TopCenter)
                     .offset(y = -EchoNavSpec.CENTER_TOUCH_OFFSET_DP.dp),
@@ -359,66 +380,191 @@ internal fun EchoNavBar(
  * 大字号（系统字体放大）时必定挤出圆外或压住图标。放在圆下面那一行，就永远不打架；
  * 代价是这行字比左右四项的文字**略高一点**（圆抬起来了，文字跟着在条的上半部），
  * 这是有意的取舍 —— 不为了对齐基线去把圆压回条里（那就没有了"凸起"）。
+ *
+ * ## 2026-10-18 夜里：这颗圆要能**按住说话**（用户原话："app 下方中间的 logo 增加一个
+ * 按住说话发指令的功能"）
+ *
+ * 手势语义、状态机、以及"为什么不新增第二条录音路"全在 `NavHold.kt`（纯函数，`NavHoldTest` 钉住）。
+ * 这里只做三件事：把指针事件翻译成 [NavHoldKey] 喂给 [NavHoldMachine]、执行它吐出来的
+ * [NavHoldAction]、以及按住时的**手感反馈**。
+ *
+ * ⚠️ **短按不许被吃掉**：原来这颗圆是 `selectable(...)`（点一下就切页）。改成手工手势之后，
+ * 点击语义要**自己补回来**（`semantics { onClick }`）—— 否则读屏/辅助功能就点不动它了；
+ * 手势上也一样：没按满长按阈值就松手 → 走"切页"，绝不进录音。
+ *
+ * ⚠️ **反馈不许把导航条挤变形**：放大只发生在**绘制**（`Modifier.scale`，不占布局），
+ * 提示那行是**浮层**（`offset` 负值画到条外，不进 Column 的测量）—— 于是
+ * [EchoNavSpec.TOTAL_HEIGHT_DP] 一个 dp 都不用改（`HomeLayoutTest` 的一屏预算照旧）。
  */
 @Composable
 private fun CenterNavItem(
     tab: EchoTab,
     selected: Boolean,
     onClick: () -> Unit,
+    onHoldStart: () -> Boolean,
+    onHoldRelease: () -> Unit,
+    onHoldCancel: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    Column(
-        modifier = modifier
-            .width(EchoNavSpec.CENTER_TOUCH_DP.dp)
-            // 圆角裁一下：默认的水波纹是方的，套在圆底座上很难看
-            .clip(RoundedCornerShape(24.dp))
-            .selectable(selected = selected, role = Role.Tab, onClick = onClick),
-        horizontalAlignment = Alignment.CenterHorizontally,
-    ) {
-        Box(
-            modifier = Modifier.size(EchoNavSpec.CENTER_TOUCH_DP.dp),
-            contentAlignment = Alignment.Center,
+    val machine = remember { NavHoldMachine() }
+    val recording = navHoldRecording(machine.state)
+    val scale = navHoldScale(machine.state)
+    val hint = navHoldHint(machine.state)
+    val click = onClick
+    val isSelectedTab = selected
+
+    Box(modifier = modifier.width(EchoNavSpec.CENTER_TOUCH_DP.dp)) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                // 圆角裁一下：默认的水波纹是方的，套在圆底座上很难看
+                // （只裁这一列：上面那行提示是浮层，不能被裁掉，见函数说明）
+                .clip(RoundedCornerShape(24.dp))
+                // 点击语义自己补回来：读屏点它仍然等于"切到超级助理页"
+                .semantics {
+                    role = Role.Tab
+                    this.selected = isSelectedTab
+                    onClick(label = "打开${centerNavSemanticLabel(tab)}") {
+                        click()
+                        true
+                    }
+                }
+                .pointerInput(Unit) {
+                    // 为什么**不用** `detectTapGestures(onPress = …, onLongPress = …)`：
+                    // 那个组合的内部时序是"长按到点就把 press 作用域 release 掉"，
+                    // 于是 `tryAwaitRelease()` 会在**长按那一刻**返回 true —— 那就是"按住 400ms
+                    // 就直接发出去"，用户还没松手。这个坑 JVM 门禁看不见（它不跑手势），
+                    // 只有在真机上才会表现成"刚按住就把话说出去"。
+                    //
+                    // 所以这里用最原始的指针事件自己排时序，只依赖三个稳定 API：
+                    // `awaitEachGesture` / `awaitFirstDown` / `waitForUpOrCancellation`。
+                    awaitEachGesture {
+                        val down = awaitFirstDown(requireUnconsumed = false)
+                        down.consume()
+                        machine.dispatch(NavHoldKey.DOWN)          // → PRESSED（什么都还没做）
+
+                        // ① 长按阈值之内：抬起（短按）还是被取消（拖出去/被抢走）
+                        val withinTimeout = withTimeoutOrNull(NavHoldSpec.LONG_PRESS_MS) {
+                            // 用 Result 包一层，才能把"超时(null)"与"手势被取消(值为 null)"分开
+                            Result.success(waitForUpOrCancellation())
+                        }
+                        val upEarly = withinTimeout?.getOrNull()
+
+                        val acts = if (withinTimeout == null) {
+                            // ② 阈值用完 = 长按成立
+                            val started = machine.dispatch(NavHoldKey.ELAPSED_LONG_PRESS)
+                            if (NavHoldAction.START_RECORDING in started &&
+                                onHoldStart()      // 没权限 / 麦被占着 → false，这一次不算录
+                            ) {
+                                // ③ 真的在录：等手指**真的**抬起（悬停多久都不发）
+                                val after = waitForUpOrCancellation()
+                                machine.dispatch(
+                                    if (after != null) NavHoldKey.UP else NavHoldKey.CANCEL
+                                )
+                            } else {
+                                // 麦没开成：相位清回 IDLE，把这次手势吞掉（不许掉进"发空指令"）
+                                machine.abandon()
+                                waitForUpOrCancellation()
+                                emptyList()
+                            }
+                        } else {
+                            // 短按 = 抬起；取消 = 什么都不做（用户并没有"点"这一页）
+                            if (upEarly != null) upEarly.consume()
+                            machine.dispatch(
+                                if (upEarly != null) NavHoldKey.UP else NavHoldKey.CANCEL
+                            )
+                        }
+
+                        when {
+                            // 短按：松手在长按阈值之前 → 切页（原来 selectable 的行为）
+                            NavHoldAction.SWITCH_TO_CENTER_TAB in acts -> click()
+                            // 按住之后松手 → 结束并发送（既有那条提交路）
+                            NavHoldAction.FINISH_AND_SEND in acts -> onHoldRelease()
+                            // 按住之后拖开/上滑出界 → 取消（既有 cancelRecording）
+                            NavHoldAction.CANCEL_RECORDING in acts -> onHoldCancel()
+                        }
+                    }
+                },
+            horizontalAlignment = Alignment.CenterHorizontally,
         ) {
-            // 柔光：只在激活时出现（"这一页是主入口、而且你正在它上面"）
-            if (selected) {
-                Box(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .background(EchoPalette.Accent.copy(alpha = 0.18f), CircleShape),
-                )
-            }
             Box(
-                modifier = Modifier
-                    .size(EchoNavSpec.CENTER_PILL_DP.dp)
-                    .background(
-                        color = if (selected) EchoPalette.Accent else EchoPalette.Card2,
-                        shape = CircleShape,
-                    )
-                    .border(
-                        width = 1.dp,
-                        color = if (selected) EchoPalette.Accent else EchoPalette.Accent.copy(alpha = 0.45f),
-                        shape = CircleShape,
-                    ),
+                modifier = Modifier.size(EchoNavSpec.CENTER_TOUCH_DP.dp),
                 contentAlignment = Alignment.Center,
             ) {
-                Icon(
-                    imageVector = echoTabIcon(tab),
-                    // 语义名仍是页签名「超级助理」（可见文字是 ECHO，两者故意分开）
-                    contentDescription = centerNavSemanticLabel(tab),
-                    modifier = Modifier.size(EchoNavSpec.CENTER_ICON_DP.dp),
-                    tint = if (selected) Color.White else EchoPalette.Text,
-                )
+                // 柔光：激活时一直有；**按住说话时更亮一圈**（"它在听你说"）
+                if (isSelectedTab || recording) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .background(
+                                EchoPalette.Accent.copy(
+                                    alpha = if (recording) NavHoldSpec.HOLD_GLOW_ALPHA else 0.18f
+                                ),
+                                CircleShape,
+                            ),
+                    )
+                }
+                Box(
+                    modifier = Modifier
+                        .size(EchoNavSpec.CENTER_PILL_DP.dp)
+                        // 按住时圆放大：**只改绘制，不占布局** —— 否则整条导航会被撑高、挤歪
+                        // （用户点名叫的就是"别把底部导航挤变形"）。
+                        .scale(scale)
+                        .background(
+                            color = when {
+                                recording -> EchoPalette.Red
+                                isSelectedTab -> EchoPalette.Accent
+                                else -> EchoPalette.Card2
+                            },
+                            shape = CircleShape,
+                        )
+                        .border(
+                            width = 1.dp,
+                            color = when {
+                                recording -> EchoPalette.Red
+                                isSelectedTab -> EchoPalette.Accent
+                                else -> EchoPalette.Accent.copy(alpha = 0.45f)
+                            },
+                            shape = CircleShape,
+                        ),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Icon(
+                        imageVector = echoTabIcon(tab),
+                        // 语义名仍是页签名「超级助理」（可见文字是 ECHO，两者故意分开）
+                        contentDescription = centerNavSemanticLabel(tab),
+                        modifier = Modifier.size(EchoNavSpec.CENTER_ICON_DP.dp),
+                        tint = if (isSelectedTab) Color.White else EchoPalette.Text,
+                    )
+                }
             }
+            Text(
+                // 圆下是品牌位：ECHO（不是页签名；页签名只用于标题/无障碍）
+                text = navItemLabel(tab, center = tab),
+                fontSize = EchoNavSpec.CENTER_LABEL_SP.sp,
+                color = if (isSelectedTab) EchoPalette.Accent else EchoPalette.Muted,
+                fontWeight = if (isSelectedTab) FontWeight.SemiBold else FontWeight.Normal,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
         }
-        Text(
-            // 圆下是品牌位：ECHO（不是页签名；页签名只用于标题/无障碍）
-            text = navItemLabel(tab, center = tab),
-            fontSize = EchoNavSpec.CENTER_LABEL_SP.sp,
-            color = if (selected) EchoPalette.Accent else EchoPalette.Muted,
-            fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-        )
+
+        // 按住时那行提示："松手发送 · 上滑取消"。
+        // 它是**浮层**：`offset` 负值只移动绘制位置、不参与 Column 的测量 —— 所以底部导航
+        // 的高度/排版一个 dp 都不动（这正是"别把导航挤变形"这条要求的落点）。
+        if (hint != null) {
+            Text(
+                hint,
+                fontSize = 10.sp,
+                color = Color.White,
+                maxLines = 1,
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .offset(y = (-NavHoldSpec.HINT_OFFSET_DP).dp)
+                    .background(EchoPalette.Accent, RoundedCornerShape(9.dp))
+                    .padding(horizontal = 8.dp, vertical = 3.dp),
+            )
+        }
     }
 }
 
