@@ -4,6 +4,7 @@ import com.echo.contact.data.dto.CommandListResponse
 import com.echo.contact.data.dto.CommandRequest
 import com.echo.contact.data.dto.CommandResponse
 import com.echo.contact.data.dto.CommandSessionResponse
+import com.echo.contact.data.dto.DailyReviewStartResponse
 import com.echo.contact.data.dto.DailyReviewState
 import com.echo.contact.data.dto.DailyReviewSubmitRequest
 import com.echo.contact.data.dto.DailyReviewSubmitResponse
@@ -297,6 +298,21 @@ interface EchoApi {
 
     @GET("api/daily-review/history/{date}")
     suspend fun dailyReviewDay(@Path("date") date: String): Response<ReviewHistoryDetail>
+
+    /**
+     * **开始一场回顾**（与 PC 版面板那颗按钮同一个接口）：
+     * 建/取回**今天**那条回顾会话（幂等），**不碰麦克风**。
+     *
+     * ⚠️ **这条不带请求体**：后端签名里 `body` 是可选的（`app/api.py` 的
+     * `post_daily_review_start`），`force_new` 只有"当天也重建"时才需要 —— 手机这条路
+     * 不加 body，也就不会因为多带一个字段被老服务端按 422 拒掉。
+     *
+     * ⛔ **绝对不要换成 `/api/daily-review/go`**：那条会 `assistant.start_review()`，
+     * 真的开**电脑那支麦**。手机回顾要的是"开始之后用手机的麦一轮轮说"，
+     * 不是"遥控电脑开麦"（判据：`ReviewConversationTest` 的源码断言）。
+     */
+    @POST("api/daily-review/start")
+    suspend fun dailyReviewStart(): Response<DailyReviewStartResponse>
 
     /** 停掉正在进行的**主机麦克风**那条语音回顾（`assistant.stop_review()`）。 */
     @POST("api/daily-review/stop")

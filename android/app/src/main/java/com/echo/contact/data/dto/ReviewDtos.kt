@@ -125,6 +125,30 @@ data class DailyReviewSubmitResponse(
     val seconds: Double = 0.0,
 )
 
+/**
+ * `POST /api/daily-review/start` 的响应（`app/daily_review.py::start()` 的返回）。
+ *
+ * **它是"手机开始一场回顾"的那个动作**（与 PC 版面板上那颗按钮同一个接口）：
+ * 只建/取回**今天**那条回顾会话（幂等），**不碰麦克风**。
+ * 为什么不调 `/api/daily-review/go`：那条会 `assistant.start_review()`，
+ * 真的开**电脑那支麦** —— 手机点开始绝不该把电脑的麦打开。
+ *
+ * @property access   `ensure_access()` 给的人话说明（"全盘访问已开启"之类）。
+ * @property accessOk **三态**：`true`=电脑那边"写笔记库"的权限已就绪；
+ *   `false`=没就绪（整理可能变慢，界面要如实说）；`null`=老服务端没这个字段（**不猜**）。
+ *   做成可空就是为了"拿不到就不说话"，而不是把缺省值说成 `false`（fake failure）。
+ */
+data class DailyReviewStartResponse(
+    val ok: Boolean = false,
+    @SerializedName("sessionId") val sessionId: String = "",
+    @SerializedName("workspaceId") val workspaceId: String = "",
+    val workspace: String = "",
+    val access: String = "",
+    @SerializedName("accessOk") val accessOk: Boolean? = null,
+    /** `ok=false` 时的原因（`ok=true` 时是空串）。 */
+    val error: String = "",
+)
+
 /** `POST /api/stt/transcribe`（**multipart**）的响应。 */
 data class SttTranscribeResponse(
     val text: String = "",

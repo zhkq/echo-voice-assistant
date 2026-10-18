@@ -41,6 +41,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
@@ -580,6 +581,9 @@ class MainViewModel(app: Application) : BaseViewModel(app) {
 
     override fun onCleared() {
         stopSpeaking()
+        // 撤掉回顾那场的收集器：Viewmodel 都销毁了，再往一个没人看的列表里追加没有意义
+        reviewCollector?.cancel()
+        reviewCollector = null
         runCatching { recorder.cancel() }
         runCatching { systemTts.shutdown() }
         runCatching { speechInput.destroy() }
@@ -865,6 +869,55 @@ class MainViewModel(app: Application) : BaseViewModel(app) {
     private val _reviewDay = MutableStateFlow<ReviewHistoryDetail?>(null)
     val reviewDay: StateFlow<ReviewHistoryDetail?> = _reviewDay.asStateFlow()
 
+    // ---- 手机回顾 = PC 版那套交互：开始 → 多轮对话 → 结束（用户 2026-10-19 澄清）----
+    //
+    // 用户原话："我是说跟 pc 版的交互一样，开始回顾开始然后继续交互"。
+    // 所以手机不是"录一段长口述交上去"，而是：
+    //  ① 点「开始回顾」→ `POST /api/daily-review/start`（只建/取回今天的会话，**不碰麦克风**）；
+    //  ② 一轮轮"说 / 打"→ 走**既有**指令链（voice-command / assistant/command，用手机的麦）；
+    //  ③ 点「结束回顾」→ `POST /api/daily-review/stop`（三态话术 `reviewStopNote`）。
+    //
+    // 三条不能越的边界（每一条都有判据）：
+    //  * **不调 `/api/daily-review/go`**：那条会 `assistant.start_review()`，真的开**电脑那支麦**。
+    //    手机开始回顾，电脑的麦一个字节都不该被打开（人在车里，电脑不在场）。
+    //  * **不新造录音路**：真正开麦的只有 `startRecording()` 那一处；录一轮只是它的薄包装。
+    //  * **兜底不删**：一次性口述（`startReviewDictation` + `submitReviewDictation`）留着，
+    //    它降级成"不想开一场回顾时的退路"。
+    //
+    // 为什么这场对话不进"历史回顾"：那边只读 `commands.source='review'`，而手机这两条
+    // 指令链落的是 `source='mobile'` —— 所以结束之后用「刚才那一场」只读卡兜住它，
+    // 卡上写明"每一轮都在「指令」历史里"（`REVIEW_LAST_ROUNDS_NOTE`）。
+
+    /** 这一场手机回顾；null = 还没开始（或没读到）。 */
+    private val _reviewSession = MutableStateFlow<ReviewSession?>(null)
+    val reviewSession: StateFlow<ReviewSession?> = _reviewSession.asStateFlow()
+
+    /** 开始/结束/录一轮"没开始"的原因 —— **必须可见**（失败绝不能静默）。 */
+    private val _reviewSessionNote = MutableStateFlow<String?>(null)
+    val reviewSessionNote: StateFlow<String?> = _reviewSessionNote.asStateFlow()
+
+    /** 正在向电脑要那场会话（按钮转圈；这期间再点不会重复发请求）。 */
+    private val _reviewStarting = MutableStateFlow(false)
+    val reviewStarting: StateFlow<Boolean> = _reviewStarting.asStateFlow()
+
+    /**
+     * 这一场是不是已经"结束"了。
+     *
+     * 结束**不清空** `_reviewSession`：那场对话要留成「刚才那一场」只读卡（用户想回看）。
+     * 于是"结束之后迟到的指令结果不该再冒出一轮"就靠这个标志挡住（收集器里判它）。
+     */
+    private val _reviewEnded = MutableStateFlow(false)
+    val reviewEnded: StateFlow<Boolean> = _reviewEnded.asStateFlow()
+
+    /**
+     * 盯 `_submit` 的那个收集器（**一场一个**）。
+     *
+     * 为什么盯 Flow 而不是在每个出口手写"追加一条"：继续交互走既有指令链，
+     * 出口有六七处（文字/语音的成功、失败、超时、没听清…），手写必漏。
+     * 由 [reviewShouldAppend] 挡住"同一轮重复"与"还在路上"，只在**有结论**时追加两条。
+     */
+    private var reviewCollector: Job? = null
+
     fun loadReviewDays(limit: Int = 60) {
         viewModelScope.launch {
             try {
@@ -1143,6 +1196,222 @@ class MainViewModel(app: Application) : BaseViewModel(app) {
                 return@launch
             }
             speak(parts.joinToString("\n"))
+        }
+    }
+
+    /**
+     * **开始一场手机回顾**（与 PC 版那颗按钮同一个动作）。
+     *
+     * 只打 `POST /api/daily-review/start`：它建/取回**今天**那条回顾会话（幂等），
+     * **一个麦克风都不碰** —— 这是"手机点开始、电脑的麦不能开"的落点。
+     * ⛔ 不调 `/api/daily-review/go`：那条会 `assistant.start_review()`，真的开电脑那支麦。
+     *
+     * 没配对时**只写原因、一个请求都不发**：连电脑地址都没有，发出去只会变成一个超时，
+     * 而用户需要知道的是"去设置里配对"。
+     *
+     * 失败一律可见：非 2xx（`/start` 未就绪时回 400 + detail）、`ok=false`（老版本可能
+     * 回 200）、`sessionId` 为空 —— 三种都写进 [reviewSessionNote]，绝不静默。
+     */
+    fun startReviewSession() {
+        if (_reviewStarting.value) return
+        if (_reviewSession.value != null && !_reviewEnded.value) {
+            // 重复开始会把这场的对话换掉：先说清"已经在进行了"
+            _reviewSessionNote.value = REVIEW_ALREADY_RUNNING
+            return
+        }
+        if (_baseUrl.value.isBlank()) {
+            // 没配对：**不发请求**（判据见 ReviewConversationTest：这段在 dailyReviewStart 之前）
+            _reviewSessionNote.value = REVIEW_NOT_PAIRED
+            return
+        }
+        _reviewStarting.value = true
+        _reviewSessionNote.value = null
+        viewModelScope.launch {
+            try {
+                // 无请求体：后端 `body` 是可选的，手机这条路不需要 force_new
+                val resp = api().dailyReviewStart()
+                val b = resp.body()
+                when {
+                    !resp.isSuccessful -> _reviewSessionNote.value =
+                        reviewFailureLine(REVIEW_START_FAILED, parseError(resp))
+                    b == null -> _reviewSessionNote.value =
+                        reviewFailureLine(REVIEW_START_FAILED, null)
+                    !b.ok -> _reviewSessionNote.value =
+                        reviewFailureLine(REVIEW_START_FAILED, b.error)
+                    b.sessionId.isBlank() -> _reviewSessionNote.value =
+                        reviewFailureLine(REVIEW_START_FAILED, "服务端没给会话 id")
+                    else -> {
+                        _reviewEnded.value = false
+                        _reviewSession.value = ReviewSession(
+                            sessionId = b.sessionId,
+                            workspace = b.workspace,
+                            startedAt = System.currentTimeMillis(),
+                            // 本场从这一刻之后开始数：开始之前那条还在路上的指令不算这一场
+                            //（`roundId > lastRoundId` 那道闸见 reviewShouldAppend）
+                            lastRoundId = _submit.value.roundId,
+                        )
+                        // `accessOk` 是三态：只有明确 false 才提醒（拿不到就不编）
+                        _reviewSessionNote.value = if (b.accessOk == false) {
+                            "回顾已开始，但电脑那边的权限没准备好：" +
+                                b.access.ifBlank { "（服务端没给原因）" } +
+                                " —— 整理可能变慢"
+                        } else {
+                            null
+                        }
+                        startReviewCollector()
+                        // 上一场留下的"刚才那次没发出去"不属于这一场：清掉，别让新一场一开场就顶着旧提示
+                        _submit.value = _submit.value.copy(blocked = "")
+                        // 顺手把服务端状态刷新一次（就绪/今天轮数），不是主路径
+                        loadReview()
+                    }
+                }
+            } catch (e: IOException) {
+                _reviewSessionNote.value =
+                    reviewFailureLine(REVIEW_START_FAILED, "无法连接：${e.message}")
+            } catch (e: Exception) {
+                _reviewSessionNote.value =
+                    reviewFailureLine(REVIEW_START_FAILED, e.message)
+            }
+            _reviewStarting.value = false
+        }
+    }
+
+    /**
+     * **结束这一场回顾**。
+     *
+     * 本地与主机是**两件事**（[reviewEndedLine] 把它们分开说）：
+     *  * **本地**：立刻标记结束并撤掉收集器 —— 之后迟到的指令结果不该在对话里再冒一轮；
+     *    会话本身**保留**（「刚才那一场」只读卡），不把用户刚看过的对话擦掉；
+     *  * **主机**：`POST /api/daily-review/stop` 回的 `stopped` 用 [reviewStopNote] 三态
+     *    如实说（true=真停了 / false=本来就没在跑 / 拿不到=不编）。
+     */
+    fun endReviewSession() {
+        val session = _reviewSession.value
+        if (session == null) {
+            // 没开始过：这句话落在开始卡上（不能"点了结束什么都没发生"）
+            _reviewSessionNote.value = REVIEW_NO_SESSION
+            return
+        }
+        if (_reviewEnded.value) {
+            _reviewSessionNote.value = REVIEW_ALREADY_ENDED
+            return
+        }
+        if (_recording.value) {
+            // 这一轮还没说完：结束后界面会把这段录音当成"一次性口述"（另一条上传路），
+            // 那时它就不再属于这场对话了。先让用户把这一轮说完。
+            _reviewSessionNote.value = REVIEW_STILL_RECORDING
+            return
+        }
+        // **先标结束再发请求**：结束是本地事实，不该等网络往返
+        _reviewEnded.value = true
+        reviewCollector?.cancel()
+        reviewCollector = null
+        viewModelScope.launch {
+            var stopped: Boolean? = null
+            var failed: String? = null
+            try {
+                val resp = api().dailyReviewStop()
+                if (resp.isSuccessful) {
+                    stopped = stoppedFlag(resp.body())
+                } else {
+                    failed = parseError(resp)
+                }
+            } catch (e: Exception) {
+                failed = e.message ?: "无法连接"
+            }
+            val line = reviewEndedLine(session.rounds, stopped)
+            _reviewSessionNote.value = if (failed.isNullOrBlank()) {
+                line
+            } else {
+                // 本地确实结束了，但主机那边没通知成功 —— 两件事都要说
+                "$line；没能通知电脑停止：$failed"
+            }
+            loadReview()
+        }
+    }
+
+    /**
+     * 「按住说话」按下：开始**这一轮**（薄包装）。
+     *
+     * 它内部走的仍是**唯一**那处 [startRecording] —— 手机自己的麦，同一条 `voice-command`
+     * 上传链（**不新造第二条录音路**）。身份是**发指令**（`asCommand = true`）：
+     * 这一轮的结果/失败原因落进 `_submit`，[startReviewCollector] 正是靠它把"我说的 +
+     * ECHO 回的"追加成两条消息。四档"不能开始"的原因复用 [dictationGate] 的口径
+     * （[reviewRoundGate]），另加"这场还在不在"那一档。
+     */
+    fun startReviewRound(): Boolean {
+        val inSession = _reviewSession.value != null && !_reviewEnded.value
+        val gate = reviewRoundGate(
+            inSession = inSession,
+            hasPermission = hasMicPermission(),
+            alreadyRecording = _recording.value,
+            meetingRecording = MeetingMicService.state.value.active,
+            listening = listenHoldsMic(ListenState.phase.value),
+        )
+        if (gate is DictationGate.Blocked) {
+            _reviewSessionNote.value = gate.reason
+            return false
+        }
+        _reviewSessionNote.value = null
+        _dictateNote.value = null
+        if (startRecording(asCommand = true)) return true
+        // 麦真的建不起来：这一轮已经以"失败"落到 `_submit`（收集器会把原因追加进对话），
+        // 这里再按现场状态给顶部一句 —— 两边说的是同一件事，不各编一份
+        _reviewSessionNote.value = micFailReason(
+            meetingRecording = MeetingMicService.state.value.active,
+            listening = listenHoldsMic(ListenState.phase.value),
+        )
+        return false
+    }
+
+    /**
+     * 「松手 / 说完了」：收尾**这一轮**（薄包装）。
+     *
+     * 走的是既有 [finishRecording]（转写 → `voice-command` → 盯结果），结果由 [_submit]
+     * 的收集器追加成两条消息 —— 所以多轮天然是**追加**，不会互相覆盖。
+     */
+    fun finishReviewRound() {
+        if (_reviewSession.value == null || _reviewEnded.value) {
+            _reviewSessionNote.value = REVIEW_NO_SESSION
+            return
+        }
+        if (!_recording.value) {
+            // 没在录就点"说完了"：这次确实没提交，说清楚（别让点击像掉进黑洞）
+            _reviewSessionNote.value = REVIEW_NOT_RECORDING
+            return
+        }
+        finishRecording()
+    }
+
+    /**
+     * 盯住 [_submit]：这场回顾里**每有结论的一轮**追加两条消息
+     * （我说的 + ECHO 回的 / 失败原因）。
+     *
+     * 为什么盯 Flow：继续交互走既有指令链，出口很多（文字/语音的成功、失败、超时、
+     * 没听清…），在每个出口手写必然漏。`reviewShouldAppend` 负责挡住"同一轮重复"
+     * 与"还在路上"，[appendReviewRound] 只追加、不覆盖。
+     */
+    private fun startReviewCollector() {
+        reviewCollector?.cancel()
+        reviewCollector = viewModelScope.launch {
+            _submit.collect { state ->
+                val session = _reviewSession.value ?: return@collect
+                if (_reviewEnded.value) return@collect
+                if (!reviewShouldAppend(session, state.roundId, state.active)) return@collect
+                val failed = state.phase == SubmitPhase.Failed
+                val echo = if (failed) {
+                    state.error.ifBlank { state.message }
+                } else {
+                    state.reply
+                }
+                _reviewSession.value = appendReviewRound(
+                    session = session,
+                    roundId = state.roundId,
+                    mine = state.text,
+                    echo = echo,
+                    failed = failed,
+                )
+            }
         }
     }
 
@@ -1779,6 +2048,13 @@ class MainViewModel(app: Application) : BaseViewModel(app) {
         _statusError.value = null
         _baseUrl.value = ""
         _submit.value = SubmitState()
+        // 回顾那场也一起撤掉：换了电脑/重新配对之后，旧会话属于另一台机器，
+        // 继续往它里面追加只会让用户以为"还连着原来那台"。
+        reviewCollector?.cancel()
+        reviewCollector = null
+        _reviewSession.value = null
+        _reviewSessionNote.value = null
+        _reviewEnded.value = false
     }
 
     private companion object {
