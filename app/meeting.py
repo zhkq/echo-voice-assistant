@@ -3938,6 +3938,26 @@ def _fix_timeline_block(block_lines):
     return [_fix_timeline_line(ln) for ln in block_lines]
 
 
+def _fix_gantt_line(line):
+    """gantt 的标题**不能带冒号**（与 timeline 正好相反）。
+
+    2026-10-19 实测（面板自带的 `web/vendor/mermaid.min.js` = mermaid 11.17.2，
+    拿这一场（2026-10-19_13-58-42）真纪要里那一块 gantt 逐块 **render**）：
+
+      * `mermaid.parse()` **通过** —— 所以 `tests/test_mermaid_renders.py` 那种
+        "真解析一遍"的闸门漏过去了（它只 parse，不 render）；
+      * 真渲染时 `compileTask` 读 `undefined.endTime` 抛
+        ``TypeError: Cannot read properties of undefined (reading 'endTime')``，
+        面板与离线 HTML 里那张图只剩一句 ``Syntax error in text``（英文、也不说原因）；
+      * 把 `title:` 的**冒号去掉**（只改这一个字符）后同一块渲染正常（8/8 张图都出）。
+
+    所以：gantt 写成 `title 文本`。这里只修"带冒号"这一种写法；别的行原样不动
+    （gantt 的缩进、`section`、任务行都不碰 —— 这个坑只需要这一个字符）。
+    """
+    m = re.match(r"^(\s*title)\s*:\s*(.+?)\s*$", line)
+    return f"{m.group(1)} {m.group(2)}" if m else line
+
+
 #: flowchart/graph 里的 `title:` / `title 文本` 行（都非法，见 _split_flowchart_title）。
 #: 刻意**不**匹配 `title["标题节点"]` / `titleX` 这类真节点名：`\s*:?` 之后必须紧跟行尾或空白。
 _MM_TITLE_LINE = re.compile(r"^\s*title\s*:?(?:\s+(.*))?\s*$")
@@ -3984,6 +4004,9 @@ def _fix_mermaid_block(block):
         return (["---", "title: %s" % title, "---"] + fixed) if title else fixed
     if re.match(r"^timeline\b", kind):
         return _fix_timeline_block(block)
+    if re.match(r"^gantt\b", kind):
+        # 2026-10-19：gantt 的标题必须**不带**冒号，带上就只 parse 得通、渲染必崩（见 _fix_gantt_line）
+        return [_fix_gantt_line(ln) for ln in block]
     return list(block)
 
 
@@ -4438,10 +4461,14 @@ _SUMMARY_REQUIREMENTS = (
     "要引用别人的话，用全角引号或书名号——写成 “他人说话” 或 「他人说话」，"
     "不要写成 过滤\"他人说话\"等，后者会把标签提前闭合。\n"
     "**timeline 专项规范**（2026-09-12 实测：这两点写错整张图直接报错）："
-    "1) 标题必须写成 `title: 文本`（冒号不可省）；"
+    "1) **timeline** 的标题必须写成 `title: 文本`（冒号不可省）；"
     "2) **周期文本里不能含冒号**——timeline 用 `:` 分隔「周期 : 事件」，"
     "所以时间戳要写成点号形式 `00.00.12 : 发起试音`（或 `00-00-12`），"
-    "不要写 `00:00:12 : 发起试音`。"
+    "不要写 `00:00:12 : 发起试音`。\n"
+    "**gantt 专项规范**（2026-10-19 实测：gantt 与 timeline **相反**）："
+    "gantt 的标题必须写成 `title 文本`（**不能带冒号**）——"
+    "带冒号的 `title: …` 能过语法解析，但渲染阶段会崩（整张图变成 Syntax error in text），"
+    "所以别把 timeline 那条冒号规则套到 gantt 上。"
 )
 
 #: 直连 LLM 时内联的转写文本上限（字符）。超了要**明说被截断**，不能悄悄丢内容。

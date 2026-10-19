@@ -114,6 +114,17 @@ header .t-edit[hidden] { display:none; }
 #summaryBox pre.mermaid { background:var(--card2); border:1px solid var(--border); border-radius:8px;
   padding:12px; margin:10px 0; overflow-x:auto; text-align:center; }
 #summaryBox pre.mermaid svg { max-width:100%; height:auto; }
+/* ---------- 渲染失败的退路（2026-10-19） ----------
+   为什么要有这两块：面板是用户看纪要的**唯一入口**。以前任何一处渲染异常都只有
+   "白屏 / 半截 / 一句英文 Syntax error in text"，既看不到内容也不知道怎么办 ——
+   "渲染失败没有退路"是不能接受的。现在统一降级成「可见提示 + markdown/源码原文」。 */
+#summaryBox .sm-fallback { margin:10px 0; padding:8px 12px; border:1px solid #7a5f2a;
+  background:rgba(230,184,76,.10); border-radius:8px; color:#e6b84c; font-size:13px; line-height:1.7; }
+#summaryBox .sm-fallback code { background:transparent; border:none; padding:0; color:inherit; }
+#summaryBox .sm-raw, #summaryBox .mermaid-src { background:var(--card2); border:1px solid var(--border);
+  border-radius:8px; padding:12px; white-space:pre-wrap; word-break:break-word;
+  font-family:Consolas,monospace; font-size:12.5px; line-height:1.6; max-height:60vh; overflow:auto; }
+#summaryBox .sm-mm-fail { margin:10px 0; }
 .col-scroll { flex:1; overflow-y:auto; padding:12px 16px 24px; }
 #col-right { flex:3 1 0; min-width:0; border-left:1px solid var(--border); display:flex; flex-direction:column; background:var(--card); }
 .right-title { padding:10px 14px 6px; color:var(--muted); font-size:13px; font-weight:600; flex-shrink:0; }
@@ -602,6 +613,19 @@ function mdInline(s) {
 
 /** 极简 markdown 渲染（标题/表格/引用/列表/段落/Mermaid 图表），用于纪要展示。 */
 function mdToHtml(md) {
+  // mermaid 源码的**显示前**兜底修正（只改显示，**不改文件** —— 旧纪要不用重跑）。
+  // 2026-10-19 实测（面板自带的 mermaid 11.17.2 + 这一场 2026-10-19_13-58-42 的真纪要）：
+  //   `gantt` 里把标题写成 `title: 文本` 能过 `mermaid.parse()`，但真渲染时
+  //   `compileTask` 读 `undefined.endTime` 抛 TypeError → 整张图只剩一句
+  //   "Syntax error in text"。gantt 的标题必须**不带冒号**（`title 文本`），
+  //   与 timeline 正好相反（timeline 必须带冒号）。
+  // 生成端已同步修正（app/meeting.py::_fix_gantt_line），这里管的是**已经生成好的旧文件**。
+  const mmFix = (src) => {
+    const ls = String(src || "").split("\n");
+    const first = ls.findIndex((x) => x.trim());
+    if (first < 0 || !/^gantt\b/.test(ls[first].trim())) return String(src || "");
+    return ls.map((x) => x.replace(/^(\s*title)\s*:\s*(.+?)\s*$/, "$1 $2")).join("\n");
+  };
   const lines = String(md || "").split("\n");
   const out = [];
   let i = 0;
@@ -617,7 +641,7 @@ function mdToHtml(md) {
         i++;
       }
       i++; // 跳过结束 ```
-      const body = code.join("\n");
+      const body = lang === "mermaid" ? mmFix(code.join("\n")) : code.join("\n");
       out.push(lang === "mermaid"
         ? `<pre class="mermaid">${esc(body)}</pre>`
         : `<pre class="code-block">${esc(body)}</pre>`);
@@ -655,6 +679,110 @@ function mdToHtml(md) {
   return out.join("");
 }
 
+/**
+ * 大体量纪要**分段**渲染：按标题行切成 ≤ `limit` 字符的若干段。
+ *
+ * 为什么要有它（2026-10-19）：这一场的会议纪要（`meeting_note.md`）有 264 KB / 3500 行。
+ * 实测**体量本身不是**这次崩的原因（整篇 mdToHtml 只要 5 ms）—— 但它是一个真实的风险面：
+ * 一次性把整篇渲进一个 `innerHTML`，中间任何一处写法让渲染抛错，用户看到的就是**整片空白**，
+ * 而不是"坏的那一段"。按标题切段后：每段各自渲染、各自兜底，坏一段不影响其余。
+ * 切分规则（必须守住的两条）：
+ *   * **不切代码围栏内部** —— 切了会得到两个半截的 ``` 块（后半段会吞掉后面所有内容）；
+ *   * **不切表格/段落内部** —— 只在标题行前切，表格里没有标题行，天然满足。
+ * 段落按行拼回去与原文**逐字节一致**（`segs.join("\n") === src`），所以不改变渲染结果。
+ */
+function mdSplitSegments(md, limit) {
+  const src = String(md || "");
+  if (!limit || src.length <= limit) return [src];
+  const lines = src.split("\n");
+  const segs = [];
+  let cur = [], curLen = 0, inFence = false;
+  for (const ln of lines) {
+    const t = ln.trim();
+    const isFence = /^```/.test(t);
+    // 只在**围栏外**、且当前段已经够长时，遇到标题才另起一段
+    if (!inFence && curLen > 0 && curLen + ln.length > limit && /^#{1,4}\s/.test(t)) {
+      segs.push(cur.join("\n"));
+      cur = []; curLen = 0;
+    }
+    cur.push(ln); curLen += ln.length + 1;
+    if (isFence) inFence = !inFence;
+  }
+  if (cur.length) segs.push(cur.join("\n"));
+  return segs;
+}
+
+/** 渲染失败时的**退路**：可见提示 + markdown 原文（`<pre>`）。
+ *
+ * 为什么不只是"报个错"：原文本身有用 —— 能读、能复制、能拿去别处渲染；
+ * 只给一句错误等于把用户堵死。`why` 由调用方给（渲染异常 / 加载失败）。
+ */
+function mdFallback(md, err, why) {
+  const msg = String((err && (err.message || err)) || "").slice(0, 200);
+  return `<div class="sm-fallback" data-testid="summary-fallback">⚠ <b>${esc(why || "纪要渲染失败")}</b>，`
+    + `已改为显示 markdown 原文（下面这段可以直接复制，或用「✏️ 编辑纪要」改）`
+    + (msg ? `：<code>${esc(msg)}</code>` : "") + `</div>`
+    + `<pre class="sm-raw">${esc(String(md || ""))}</pre>`;
+}
+
+/** 「渲染一段 markdown，**任何异常都降级成 `<pre>` 原文**」。
+ *
+ * 为什么要包一层：`mdToHtml` 是手写解析器，输入是模型生成的自由文本 ——
+ * 坏输入迟早会出现（这次是 gantt 的 title 冒号，下次可能是别的）。
+ * 面板必须有退路，绝不能白屏/半截。`render` 参数只为让用例能**造**一次异常。
+ */
+function mdSafe(md, render) {
+  try {
+    const html = String((render || mdToHtml)(md) || "");
+    // 有内容却渲染成空 → 同样算失败（空 HTML 对用户就是"白屏"）
+    if (!html.trim() && String(md || "").trim()) throw new Error("渲染结果为空");
+    return { ok: true, html };
+  } catch (e) {
+    return { ok: false, html: mdFallback(md, e) };
+  }
+}
+
+/** 一张 mermaid 图渲染失败 → 换成「可见提示 + 源码」，不影响其它图/其它内容。
+ *
+ * 2026-10-19 现场：gantt 那一张图在面板里只剩一句英文 `Syntax error in text`，
+ * 用户既不知道哪张图坏了、也看不到它的源码，只能来问。源码就是最能自我解释的东西。
+ */
+function showMermaidSource(pre, src) {
+  const box = document.createElement("div");
+  box.className = "sm-mm-fail";
+  box.setAttribute("data-testid", "mermaid-fallback");
+  box.innerHTML = `<div class="sm-fallback">⚠ <b>这张图表没能渲染</b>`
+    + `（mermaid 语法或版本不支持）—— 已改为显示源码，其它内容不受影响。</div>`
+    + `<pre class="mermaid-src">${esc(String(src || ""))}</pre>`;
+  pre.replaceWith(box);
+}
+
+/** 把 #smPreview 里的 mermaid 源码画成图；**一张失败只降级那一张**。
+ *
+ * `suppressErrors` 只保证一张图出错不拖垮后面几张，但坏的那张会留在页面上变成
+ * "Syntax error in text"（英文、没有源码、没有原因）。所以画完后逐张验收：
+ * 没有 svg / 出现了 mermaid 的错误图元 → 换成「提示 + 源码」。
+ */
+async function renderMermaidDiagrams(pv) {
+  const nodes = [...pv.querySelectorAll("pre.mermaid")];
+  if (!nodes.length || !window.mermaid) return;
+  // mermaid.run 会把 <pre> 的内容换成 svg，源码先留一份（失败时要显示它）
+  nodes.forEach((n) => { n._mmSrc = n.textContent; });
+  try {
+    mermaid.initialize({ startOnLoad: false, theme: "dark", securityLevel: "strict" });
+    await mermaid.run({ nodes, suppressErrors: true });
+  } catch (e) { /* 整批都失败也不影响文字：下面逐张兜底 */ }
+  nodes.forEach((n) => {
+    const bad = !n.querySelector("svg") || !!n.querySelector(".error-icon, .error-text");
+    if (bad) showMermaidSource(n, n._mmSrc || "");
+  });
+  bindMermaidZoom(pv);
+}
+
+/** 一段最多多少**字符**（按 20k 算：中文 1 字 ≈ 3 字节，一段最多约 60 KB）。
+ *  260 KB 的那份会被切成 4 段左右；普通纪要（26 KB / 约 9k 字）仍然只有一段，行为不变。 */
+const MD_SEGMENT_LIMIT = 20000;
+
 /** 纪要页签 HTML：工具栏（编辑入口/状态）+ 只读预览容器。renderSummary 只重画 #smPreview。 */
 function summaryShell() {
   return `<div class="sm-bar">
@@ -676,19 +804,24 @@ async function renderSummary() {
       pv.innerHTML = '<div class="empty">暂无纪要，点击顶部"重新生成纪要"生成，或用「✏️ 编辑纪要」手写</div>';
       return;
     }
-    pv.innerHTML = mdToHtml(_summaryRaw);
-    // 渲染 mermaid 图表（pre.mermaid 元素），并支持点击放大/滚轮缩放
-    try {
-      if (window.mermaid && pv.querySelector("pre.mermaid")) {
-        mermaid.initialize({ startOnLoad: false, theme: "dark", securityLevel: "strict" });
-        // suppressErrors：某张图语法有问题时，只把那一张标成错误，不让它带崩后面几张。
-        // 2026-09-20 实测：一张 flowchart 的标签里嵌了半角引号 → 后面的 timeline/时序图也没渲染出来。
-        await mermaid.run({ nodes: pv.querySelectorAll("pre.mermaid"), suppressErrors: true });
-        bindMermaidZoom(pv);
-      }
-    } catch (e) { /* 图表渲染失败不影响纪要文本 */ }
+    // **分段渲染 + 每段兜底**：整篇（这一场 264 KB）一次塞进 innerHTML 时，中间任何一处
+    // 写法让渲染抛错，用户看到的就是整片空白。分段后坏一段只降级那一段，其余照常显示；
+    // 普通纪要（这一场 26 KB / 约 1.2 万字）只有一段，行为与以前完全一致。
+    const segs = mdSplitSegments(_summaryRaw, MD_SEGMENT_LIMIT);
+    let html = "";
+    for (const seg of segs) html += mdSafe(seg).html;   // 失败的那段自己会变成 <pre> 原文
+    pv.innerHTML = html;
+    // 渲染 mermaid 图表（pre.mermaid 元素），并支持点击放大/滚轮缩放。
+    // 单张图的失败由 renderMermaidDiagrams 统一降级成「提示 + 源码」，不再只剩一句英文报错。
+    await renderMermaidDiagrams(pv);
   } catch (e) {
-    pv.innerHTML = '<div class="empty">加载纪要失败</div>';
+    // 连"读纪要"都失败了：同样要给退路（读到过原文就显示原文），绝不白屏
+    if (_summaryRaw && _summaryRaw.trim()) {
+      pv.innerHTML = mdFallback(_summaryRaw, e, "加载纪要失败");
+    } else {
+      pv.innerHTML = `<div class="sm-fallback" data-testid="summary-fallback">⚠ <b>加载纪要失败</b>：`
+        + `${esc((e && e.message) || e)} —— 可以点顶部「重新生成纪要」重试，或用「✏️ 编辑纪要」手写。</div>`;
+    }
   }
 }
 
