@@ -56,7 +56,7 @@ ALLOWED_EXACT = ("health",)
 NO_TOKEN_REQUIRED_PREFIX = "api/pair/"
 
 #: 单次请求体上限（16 kHz 单声道 5 分钟 ≈ 9.6 MB；再大就该分片了）。
-MAX_BODY_BYTES = 12 * 1024 * 1024
+MAX_BODY_BYTES = 24 * 1024 * 1024
 
 #: 主机执行一次调用的上限。手机那条 `daily-review/submit` 实测要 120~180 秒，
 #: 所以这里必须比客户端那侧（330 s）更宽 —— **让后端先放弃，而不是客户端先放弃**。
