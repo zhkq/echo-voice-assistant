@@ -1,11 +1,33 @@
 <resources>
     <!--
-      用户 2026-10-18 中午的原话："app 的名字改成 ECHO 超级助理"。
+      用户 2026-10-19 晚的原话："新 app 已经装了，但是 app 还是叫 echo 超级助理，我今天不是让你
+      改成超级助理了吗，因为 app logo 已经有 echo 了"。
 
-      ⚠️ 改名字**不改包名**：`applicationId` / `namespace` 仍是 `com.echo.contact`
+      所以桌面上那个名字从 `ECHO 超级助理` 改成 `超级助理`。
+
+      ## 为什么去掉前面的 "ECHO"：LOGO 本身就是 ECHO 品牌位
+
+      桌面图标里已经有 ECHO 四个字母（`mipmap/ic_launcher`），名字再把它写一遍，
+      用户眼里就是"ECHO 出现了两次"。名字该回答"这是什么"，品牌由图标回答，各说各的。
+
+      ## 为什么这里的值**从今天起有意**与 App 内标题不同
+
+      * 这里（`app_name`）= **桌面/启动器显示名**，系统设置里的应用名、**通知头部的应用名**
+        也都读它 → `超级助理`（不重复 LOGO 上的品牌）；
+      * App 内标题是 `ui/AppIdentity.kt` 的 `APP_TITLE` → 仍是 `ECHO 超级助理`
+        （进了 App 之后没有图标陪着，标题得自己把品牌带上）。
+
+      两处不一样是**刻意的**，不是漏改：别哪天又"统一"回去。判据见 `AppNameTest`。
+
+      ## 两条硬约束
+
+      ⚠️ **不改包名**：`applicationId` / `namespace` 仍是 `com.echo.contact`
       （见 `app/build.gradle.kts`）—— 改了包名等于换一个 App，手机上会多出一个图标、
-      原来的配对凭据（`PairStore`）也读不到。所以这里只动"用户看得见的那个名字"：
-      桌面图标 label、系统设置里的应用名、通知头部的应用名用的都是这个 `app_name`。
+      原来的配对凭据（`PairStore`）也读不到。
+
+      ⚠️ **这个值只在这里定义一份**。别在 `values-*`（`values-zh` / `values-night` …）下
+      再放一份同名项把它盖回去：AAPT 会按语言/地区挑一份，装到手机上桌面名就跟这份文件
+      对不上了。判据：`AppNameTest` 的"app_name 只在一处定义"那条。
     -->
-    <string name="app_name">ECHO 超级助理</string>
+    <string name="app_name">超级助理</string>
 </resources>

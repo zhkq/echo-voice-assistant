@@ -71,8 +71,9 @@ fun PairScreen(onPaired: () -> Unit) {
             verticalArrangement = Arrangement.Center,
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
-            // 应用名只认 [APP_TITLE]（与 `res/values/strings.xml` 的 `app_name` 同值）：
-            // 桌面图标、通知、界面三处写死成三份字符串的话，改名那天必然漏一处。
+            // 标题只认 [APP_TITLE]（App 内标题）。桌面/通知的那个 `app_name` 是**另一份值**
+            // （`超级助理`）—— 桌面不重复 LOGO 上的 ECHO，原因见 AppIdentity.kt。
+            // 每个页面各写死一份字符串的话，改名那天必然漏一处。
             Text(APP_TITLE, style = MaterialTheme.typography.headlineMedium)
             Spacer(Modifier.height(8.dp))
             Text(
