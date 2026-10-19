@@ -148,23 +148,73 @@ function confirmDialog(message, { okText = "确定", cancelText = "取消", dang
    所以这一节的规矩：**每一次点击都要留下看得见的话**（正在… / 已取消 / 失败原话 /
    以服务端状态为准的最终结论）。开与停走**同一份逻辑** —— 只修一处就是"另一处还是没反应"。 */
 
-/** 会议操作的**常驻反馈行**：贴在按钮那一行下面，点完还看得见（toast 会飘走）。
+/** 会议那一块**右侧那一列**：时间在上、状态行在下（2026-10-19 用户口径）。
+ *
+ *  用户原话："pc 端开始录音按钮下面有一行状态，这个挪到按钮右侧跟录音时间上下并列"。
+ *  **为什么是同一列、不是拆成两列**：这两行讲的是**同一场录音** —— 上面是"这场录到哪了"
+ *  （`正在录音：<folder>`），下面是"服务端确认它真的在录"（`ⓘ 已确认：服务端在录音`）。
+ *  状态行跟着"这场录音"的信息走，眼睛不用在按钮上下方来回跳；也不占按钮那一行的宽度。
+ *
+ *  `web/index.html` / `web/app.css` 不在这次改动的允许清单里，所以这一列（以及它的竖排
+ *  样式）都由 JS 建 —— 与确认框、反馈行的做法一致。
+ *  **只对"按钮旁边就有这场录音的时间"那一块生效**：会议列表标题栏那颗按钮旁边没有
+ *  `#meetingInfo`，那里仍按原来的位置（标题行下面）贴，不硬塞进一个空列。
+ */
+function meetingSideColumn(anchor) {
+  const info = document.getElementById("meetingInfo");
+  if (!info || !anchor) return null;
+  const row = anchor.closest(".card-body") || anchor.parentElement;
+  if (!row || !row.contains(info)) return null;   // 这场录音的时间不在这一块：不硬塞
+  let col = info.parentElement;
+  if (col && col.classList && col.classList.contains("meeting-side-col")) return col;
+  col = document.createElement("div");
+  col.id = "meetingSideCol";
+  col.className = "meeting-side-col";
+  // 竖排：时间在上、状态行在**下**（同一列）。宽屏时它就是按钮右边那一列；窄屏放不下时，
+  // 靠 `.card-body.row` 既有的 `flex-wrap: wrap` **整列**落到按钮下方，而不是把这一列
+  // 压成碎片。`min-width:0` 让它能收缩（文字自己换行），`max-width:100%` 防止溢出去。
+  col.style.display = "flex";
+  col.style.flexDirection = "column";
+  col.style.alignItems = "flex-start";
+  col.style.minWidth = "0";
+  col.style.maxWidth = "100%";
+  anchor.insertAdjacentElement("afterend", col);   // 列固定在**按钮右侧**
+  col.appendChild(info);                           // 把「正在录音：<folder>」挪进去（不复制、不改文案）
+  return col;
+}
+
+/** 会议操作的**常驻反馈行**：点完还看得见（toast 会飘走）。
+ *
+ *  **放在哪里（2026-10-19 用户口径）**：不再压在按钮下方单独占一行，而是进「正在录音：
+ *  <folder>」**所在的那一列**、排在它下面 —— 两行上下并列，见 `meetingSideColumn()`。
  *
  *  为什么自己建节点：`web/index.html` 与 `web/app.css` 不在这次改动的允许清单里 ——
  *  确认框本来就是这个方式（JS 动态建），这里保持一致。
  *  `kind`：`info`（进行中/已确认）· `warn`（取消，仍在录音）· `err`（失败 / 状态没变）。 */
 function meetingNote(msg, kind = "info", btn = null) {
   const anchor = btn || $("#btnMeeting") || $("#btnMeetingFromList");
-  // 落点：按钮所在那一块的后面（仪表盘 = `.card-body.row` 之后；会议列表 = 标题行之后）
+  // 落点：仪表盘 = 按钮右侧那一列（时间下面）；会议列表 = 标题行之后
   const host = anchor ? (anchor.closest(".card-body") || anchor.parentElement) : null;
+  // 仪表盘有「正在录音：<folder>」这一列时，状态行跟着它走（同一列、时间下面）；
+  // 会议列表那颗按钮旁边没有这场录音的信息 → col 为 null，照旧贴在标题行下面。
+  const col = meetingSideColumn(anchor);
   let note = document.getElementById("meetingActionNote");
   if (note && !note.isConnected) note = null;      // 卡片被整块重画过 → 重新建一个
   if (!note) {
     note = document.createElement("div");
     note.id = "meetingActionNote";
   }
-  if (host && note.previousElementSibling !== host) host.insertAdjacentElement("afterend", note);
-  else if (!host && !note.isConnected) document.body.appendChild(note);
+  if (col) {
+    const info = document.getElementById("meetingInfo");
+    // 已经在时间下面就不动它：5 秒一次的状态刷新不该把这一行反复搬来搬去
+    if (note.parentElement !== col || note.previousElementSibling !== info) {
+      info.insertAdjacentElement("afterend", note);
+    }
+  } else if (host && note.previousElementSibling !== host) {
+    host.insertAdjacentElement("afterend", note);
+  } else if (!host && !note.isConnected) {
+    document.body.appendChild(note);
+  }
   const icon = kind === "info" ? "ⓘ" : "⚠";
   note.className = "snote " + (kind === "err" ? "err" : kind === "warn" ? "warn" : "info");
   note.style.fontSize = "12.5px";        // `.snote` 默认 11px：这是要人看清的话，放大一档
@@ -7998,6 +8048,9 @@ function initHistoryTab() {
 }
 initHistoryTab();
 applyCollapsedCards();      // 应用上次的卡片折叠状态（设置页与各页签的可折叠卡片）
+// 仪表盘「会议录音」：把「正在录音：<folder>」挪进按钮右侧那一列（**首屏就这么排**，
+// 不用等用户点一次录音才成形）。窄屏时整列随 `.card-body.row` 的 `flex-wrap` 落到下方。
+meetingSideColumn($("#btnMeeting"));
 
 /* ---------------- 自动刷新：间隔取自设置 panelAutoRefresh ----------------
    2026-09-19 审计发现这个设置项在面板上摆着却没人读（判定 DEAD），这里把它接上：
