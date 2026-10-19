@@ -1,5 +1,6 @@
 package com.echo.contact.service
 
+import com.echo.contact.data.ApiClient
 import com.echo.contact.data.EchoApi
 import com.echo.contact.data.dto.MeetingPausesRequest
 import com.google.gson.JsonObject
@@ -20,8 +21,26 @@ import okhttp3.RequestBody.Companion.toRequestBody
  * ⚠️ 这一版**不许改服务端**（另一条线在重建后端镜像），所以这里对老服务端的降级是
  * 刻意支持的：老服务端会忽略 `clientId`/`seq`/`startedAt`、也不会回段数 ——
  * 那时对账**不做假设**（[CountOutcome.Failed]），把"没法对账"如实报出来。
+ *
+ * ## 为什么构造时要**两个** EchoApi（2026-10-19 真机：传完第 1 段就停住）
+ *
+ * [api] 是普通客户端（读 60 秒），用它跑"查状态/建会/收尾"这些**必须快**的接口；
+ * [uploadApi] 是 `ApiClient.createForUpload()` 建的那个（读/写都 960 秒 + 单段总预算），
+ * **只**用来传段。一段 10 分钟的 WAV 是 ≈18.3 MB、还要过中继 —— 用 60 秒写超时的客户端传它，
+ * 第 2 段就会被"60 秒没有进展"判死，而下一轮又是从这一段的第 0 个字节重发，
+ * 于是**大段永远传不完，`seq` 永远推进不到 3，`stop` 永远不发**（用户看到的就是
+ * "传了一段，后面好像还是不行"）。
+ *
+ * [uploadApi] 默认等于 [api]：用例里注入同一个假/HTTP 客户端时行为完全不变。
  */
-class OfflineMeetingTransport(private val api: EchoApi) : OfflineTransport {
+class OfflineMeetingTransport(
+    private val api: EchoApi,
+    /**
+     * 传段专用的客户端（见类注释）。默认与 [api] 同一个实例 —— 生产代码
+     * （`MeetingMicService.runOfflineSync`）**必须**传 `ApiClient.createForUpload(baseUrl)`。
+     */
+    private val uploadApi: EchoApi = api,
+) : OfflineTransport {
 
     /**
      * 探活：`GET /health`（**唯一不带 `/api` 前缀、也不要令牌**的东西，见 `EchoApi`）。
@@ -113,7 +132,9 @@ class OfflineMeetingTransport(private val api: EchoApi) : OfflineTransport {
      */
     override suspend fun uploadSegment(req: UploadRequest): SegmentOutcome = try {
         val payload = req.wav.toRequestBody(req.format.contentType.toMediaType())
-        val r = api.meetingSegmentWithId(
+        // ⚠️ 这一段走 [uploadApi]（读/写都是长超时的那一个）：见类注释 ——
+        // 用普通客户端传 18 MB 的 WAV，第 2 段就会被 60 秒的写超时判死。
+        val r = uploadApi.meetingSegmentWithId(
             clientId = req.clientId, seq = req.seq, startedAt = req.startedAt,
             source = req.source, body = payload,
         )
@@ -143,8 +164,11 @@ class OfflineMeetingTransport(private val api: EchoApi) : OfflineTransport {
             )
         }
     } catch (e: Exception) {
-        SegmentOutcome.Failed(SyncFailure.UNREACHABLE,
-            "第 ${req.seq} 段没发出去：${e.message}", retryable = true)
+        // 失败也要**说人话**（尤其超时）：见 [uploadFailureNote] ——
+        // "这段太大/网太慢、重试中"与"服务端出错"是两件完全不同的事，
+        // 混成一句"没发出去"会让人去查错的地方。
+        SegmentOutcome.Failed(SyncFailure.UNREACHABLE, uploadFailureNote(req.seq, req.wav.size, e),
+            retryable = true)
     }
 
     /**
@@ -385,4 +409,65 @@ class OfflineMeetingTransport(private val api: EchoApi) : OfflineTransport {
         msg.contains("不允许") || msg.contains("拒绝") || msg.contains("403") ||
             msg.contains("不支持") || msg.contains("未配对") || msg.contains("鉴权") ||
             msg.contains("参数")
+}
+
+// --------------------------------------------------------------------------- 传段失败的"人话"
+
+/**
+ * 这一次上传异常是不是**超时**（纯函数）。
+ *
+ * 判据是 OkHttp 的两个事实，不是一个"猜"：
+ *  * `SocketTimeoutException`：读/写**单次操作**无进展超过 [ApiClient.UPLOAD_TIMEOUT_S]；
+ *  * 其它 `InterruptedIOException`：`callTimeout` 到了 —— 即**单段总预算**
+ *    [ApiClient.UPLOAD_CALL_TIMEOUT_S] 用完（"一直在动但永远传不完"那一档）。
+ *
+ * 为什么必须把它们**单独**认出来：超时的处理方式与"服务端拒了/连不上"完全不同 ——
+ * 超时的真相是"这段太大或网太慢，等一下再传"，而且**重试真的会有用**（同一段、同一条链路，
+ * 换个时刻可能就过了）。把它混进"没发出去"里，用户与排障的人都会去查错的地方。
+ */
+internal fun isUploadTimeout(e: Throwable): Boolean = e is java.io.InterruptedIOException
+
+/**
+ * 第 [seq] 段（[bytes] 字节）上传失败时**如实**的那句话（纯函数）。
+ *
+ * 三条口径（每一句都对应一次真实的静默错法）：
+ *  1. **超时要说"这段太大 / 网太慢，重试中"** —— 不是"同步失败"，也不是"服务端出错"；
+ *     真机现场是 18.3 MB 的 WAV 走中继，而客户端原来只有 60 秒写超时（见 [ApiClient.UPLOAD_TIMEOUT_S]）；
+ *  2. **要把"有多大"说出来**：一句"传不上去"没法让人判断"是不是我这段太长了"；
+ *  3. **要说清"已传过的段不会重传、下次从这一段接着传"** —— 否则用户以为又要从第 1 段重来
+ *     （那正是他这次最怕的事：18 MB 白传一遍）。
+ *
+ * 非超时的异常不冒充超时：原样带上异常类名与消息（那是排障唯一的线索）。
+ */
+internal fun uploadFailureNote(seq: Int, bytes: Int, e: Throwable): String {
+    val head = "第 $seq 段（${megabytesText(bytes)}）"
+    val resume = "重试中：已传过的段不会重传，下次从第 $seq 段接着传"
+    return when {
+        e is java.net.SocketTimeoutException ->
+            "$head 上传超时 —— 这段太大 / 网太慢（连续 ${ApiClient.UPLOAD_TIMEOUT_S} 秒一个字节都没传出去）。" +
+                resume
+        isUploadTimeout(e) ->
+            "$head 上传超时 —— 这段太大 / 网太慢（单段最多等 ${ApiClient.UPLOAD_CALL_TIMEOUT_S} 秒还没传完）。" +
+                resume
+        else ->
+            "$head 没发出去：${e.javaClass.simpleName}" +
+                (e.message?.let { "（$it）" } ?: "")
+    }
+}
+
+/**
+ * 字节数 → 人看的大小（纯函数，`18.3 MB` / `640 KB` / `512 B`）。
+ *
+ * 为什么要单独抽出来并用 `Locale.US`：中文系统上 `String.format` 会用本地小数分隔符，
+ * 而这句话会被用例逐字比对（也跟着日志走）—— 一处用逗号一处用点，判据就会莫名其妙地红。
+ */
+internal fun megabytesText(bytes: Int): String {
+    if (bytes <= 0) return "0 B"
+    val kb = bytes / 1024.0
+    val mb = kb / 1024.0
+    return when {
+        mb >= 1.0 -> String.format(java.util.Locale.US, "%.1f MB", mb)
+        kb >= 1.0 -> String.format(java.util.Locale.US, "%.0f KB", kb)
+        else -> "$bytes B"
+    }
 }

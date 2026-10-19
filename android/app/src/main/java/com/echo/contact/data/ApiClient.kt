@@ -34,6 +34,13 @@ object ApiClient {
     const val DEFAULT_READ_TIMEOUT_S = 60
 
     /**
+     * 默认**写**超时（秒）：普通接口的请求体都很小（几 KB 的 JSON），60 秒足够。
+     *
+     * ⚠️ 它**不是**传音频那一档该用的值 —— 见 [UPLOAD_TIMEOUT_S]。
+     */
+    const val DEFAULT_WRITE_TIMEOUT_S = 60
+
+    /**
      * 长任务用的读超时（秒）。
      *
      * 什么时候需要：`POST /api/daily-review/submit` 是**阻塞**的 ——
@@ -57,6 +64,36 @@ object ApiClient {
      */
     const val LONG_READ_TIMEOUT_S = 960
 
+    /**
+     * **传一段会议音频**用的超时（秒）—— 读与写**同一个值**，且与 [LONG_READ_TIMEOUT_S] 对齐。
+     *
+     * ## 为什么专门给"传段"一档（2026-10-19 真机：传完第 1 段就停住）
+     *
+     * 一段 10 分钟的 **WAV** 是 **≈18.3 MB**（手机 FLAC 编码失败会退回 WAV，真机就是这样），
+     * 而且要走**中继**才到电脑。它原来和"查状态""建会"那些秒回接口**共用同一个客户端**：
+     * 读 60 秒、写 **60** 秒（`build()` 里写死的）。写超时不是"整个请求体的总预算"，而是
+     * **单次 socket 写操作**的上限 —— 也就是说"整整 60 秒一个字节都没写出去"就判死。
+     * 在慢链路/中继上（中继往往先把请求体收下来再转发）这并不是异常现象，而是常态；
+     * 一旦第 2 段被这样判死，这一轮就停在"第 1 段已传、第 2 段没传"上，
+     * 而**下一轮又从同一个第 2 段重新发**（body 不能续传，见 `OfflineMeetingTransport`）：
+     * 于是"大段永远传不完 → 循环永远推进不到 seq=3 → `stop` 永远不发"。
+     *
+     * 所以：**写要和读一样长**。这不是把超时"调大一点"，而是把同一个预算的两半对齐 ——
+     * 读那头等了 16 分钟还不算失败，写这头 60 秒就放弃，那两个数字本来就不该是两套。
+     */
+    const val UPLOAD_TIMEOUT_S = LONG_READ_TIMEOUT_S
+
+    /**
+     * **一段**音频上传的**总预算**（秒）：从发出请求到拿到回包，超过就如实判超时。
+     *
+     * 为什么除了 [UPLOAD_TIMEOUT_S]（单次读写无进展的上限）还要一个总预算：
+     * 单次超时只能抓"卡住"，抓不住"一直在动但永远传不完"（链路极慢时那会一直占着
+     * 同步守卫，界面上永远"正在同步…"）。总预算给 20 分钟 = 18.3 MB 算下来
+     * **最低约 15 KB/s 也能过**，比这更慢的链路如实说"这段太大/网太慢"，
+     * 而不是无限期地假装还在传。
+     */
+    const val UPLOAD_CALL_TIMEOUT_S = 1_200
+
     /** 设置令牌来源（PairStore 提供）。在调用任何接口前先设一次。 */
     fun attachTokenProvider(provider: () -> String?) {
         tokenProvider = provider
@@ -69,19 +106,56 @@ object ApiClient {
         }
     }
 
+    /**
+     * **传段专用**的客户端（唯一一处这么建）：读/写超时都取 [UPLOAD_TIMEOUT_S]，
+     * 另外加一个总预算 [UPLOAD_CALL_TIMEOUT_S]。
+     *
+     * 为什么它必须是**另一个实例**（而不是把默认那个的超时改大）：默认客户端还服务
+     * "查状态""建会""收尾"这些**必须快**的接口 —— 一个卡住的状态查询如果也有 16 分钟
+     * 的耐心，整轮补传就会被它拖死（而用户看到的是"同步中"永远不动）。
+     * 所以：**只有传段这一条路**用这个客户端（`OfflineMeetingTransport` 的 `uploadApi`）。
+     *
+     * 缓存键里带 `upload` 是刻意的：`create(baseUrl, UPLOAD_TIMEOUT_S)` 得到的是
+     * **另一个**实例（写超时仍是 60、也没有总预算），两者不能混用。
+     */
+    fun createForUpload(baseUrl: String): EchoApi {
+        val normalized = normalizeBaseUrl(baseUrl)
+        return cache.getOrPut("$normalized|upload") {
+            build(
+                normalizedBaseUrl = normalized,
+                readTimeoutSeconds = UPLOAD_TIMEOUT_S,
+                writeTimeoutSeconds = UPLOAD_TIMEOUT_S,
+                callTimeoutSeconds = UPLOAD_CALL_TIMEOUT_S,
+            )
+        }
+    }
+
     /** 丢掉缓存的客户端（单测换端口、或想强制重建时用）。 */
     fun clearCache() {
         cache.clear()
     }
 
-    private fun build(normalizedBaseUrl: String, readTimeoutSeconds: Int): EchoApi {
+    private fun build(
+        normalizedBaseUrl: String,
+        readTimeoutSeconds: Int,
+        /** 写超时（秒）；默认 [DEFAULT_WRITE_TIMEOUT_S]。传段那一档传 [UPLOAD_TIMEOUT_S]。 */
+        writeTimeoutSeconds: Int = DEFAULT_WRITE_TIMEOUT_S,
+        /** 整个调用的总预算（秒）；`0` = 不限（OkHttp 的默认值，其它接口保持原样）。 */
+        callTimeoutSeconds: Int = 0,
+    ): EchoApi {
         val logging = HttpLoggingInterceptor().apply {
             level = HttpLoggingInterceptor.Level.BASIC
         }
         val client = OkHttpClient.Builder()
             .connectTimeout(10, TimeUnit.SECONDS)
             .readTimeout(readTimeoutSeconds.toLong(), TimeUnit.SECONDS)
-            .writeTimeout(60, TimeUnit.SECONDS)
+            .writeTimeout(writeTimeoutSeconds.toLong(), TimeUnit.SECONDS)
+            .apply {
+                // 0 = 不限（OkHttp 默认）—— 只有传段那一档才给总值，别的接口行为一个字节都不变
+                if (callTimeoutSeconds > 0) {
+                    callTimeout(callTimeoutSeconds.toLong(), TimeUnit.SECONDS)
+                }
+            }
             .addInterceptor { chain ->
                 val tok = tokenProvider()
                 val req = if (!tok.isNullOrBlank()) {

@@ -74,6 +74,20 @@ object OfflineMeetingSync {
          * 这个回调在每段**开始上传之前**报一次：已确认几段、正在传第几段。
          */
         onProgress: ((SyncProgress) -> Unit)? = null,
+        /**
+         * **每一段真的被服务端收下之后**的回调（`null` = 不关心；只影响展示）。
+         *
+         * 为什么"段开始"那一报还不够（用户 2026-10-19：*"传了一段，但是后面好像还是不行"*）：
+         * 一段 18 MB 的 WAV 传完可能要几分钟，而"已传 M/T 段"这个数字原本只在
+         * **下一段开始**之前才更新 —— 也就是**最后一段传完到整轮结束**（对账 + stop）
+         * 那段时间里，界面上的数字还是旧的（"已传 2/3"，可 3 段其实都到了）。
+         * 更糟的是"只有一段"的情况：传完的那一刻界面上**一次都不动**，
+         * 用户看到的就是"传了一段之后停住了"。
+         * 于是这一段成功之后**立刻**报一次真数（`justConfirmed` = 刚被收下的段序号）。
+         *
+         * ⚠️ 与 `onProgress` 一样**只用于展示**：任何判定都不许读它。
+         */
+        onSegmentDone: ((SyncProgress) -> Unit)? = null,
     ): OfflineSyncResult {
         val drafts = store.pending().let { list ->
             if (onlyClientId.isNullOrBlank()) list else list.filter { it.clientId == onlyClientId }
@@ -129,6 +143,21 @@ object OfflineMeetingSync {
                         confirmedSegments = done,
                         pendingSegments = (totalAll - done).coerceAtLeast(0),
                         currentSeq = seq,
+                    ))
+                },
+                onSegmentOk = if (onSegmentDone == null) null else { seq ->
+                    // 这一段**已经**被服务端收下了：数它本身进来（与"开始传"那一报的区别就在这里）。
+                    // 用 `seq <= seq` 去数清单里真有的段，而不是算 `seq - acked` ——
+                    // 清单万一有洞（老版本截断过），减法会算出一个不存在的"已传段数"。
+                    val inDraft = draft.segments.count { it.seq <= seq }
+                    val done = (baseConfirmed + inDraft).coerceIn(0, totalAll)
+                    onSegmentDone(SyncProgress(
+                        drafts = drafts.size,
+                        totalSegments = totalAll,
+                        confirmedSegments = done,
+                        pendingSegments = (totalAll - done).coerceAtLeast(0),
+                        currentSeq = seq,
+                        justConfirmed = seq,
                     ))
                 })
             val d = stage.draft ?: draft
@@ -240,6 +269,8 @@ object OfflineMeetingSync {
         reconcileAt: ((MeetingDraft) -> Unit)? = null,
         /** 每一段**开始上传之前**报一次（[run] 的 `onProgress` 用；`null` = 不关心）。 */
         onSegment: ((Int) -> Unit)? = null,
+        /** 每一段**被服务端收下之后**报一次（[run] 的 `onSegmentDone` 用；`null` = 不关心）。 */
+        onSegmentOk: ((Int) -> Unit)? = null,
     ): StageResult {
         var d = draft
         val finalize = scope == SyncScope.FINALIZE && !d.recording
@@ -303,6 +334,11 @@ object OfflineMeetingSync {
         }
 
         // ② 按序传段：一段失败就停在这（顺序不许破），已成功的**立刻推进水位**（可续传）
+        //
+        // ⚠️ **成功后必须继续下一段**（用户 2026-10-19 的"传完第 1 段就停住"）：
+        // 这个循环里**没有** `break`、也没有"传一段就跑下一件事"的分支 —— 只有
+        // ① 本地缺文件、② 服务端没收下，这两种情况才 `return`（而且都保留水位、不删音频）。
+        // 循环跑完之后才允许进对账与 `stop`（见 ③④ 的说明：**段没传完绝不 stop**）。
         var serverCount: Int? = null
         for (seg in segmentsToUploadOf(d)) {
             // 这一段马上要发了：先报一次进度（"正在传第 N 段"）—— 一个 10 分钟段的上传
@@ -342,12 +378,28 @@ object OfflineMeetingSync {
                     store.save(d)
                     ActiveDraft.current?.takeIf { it.clientId == d.clientId }?.let { ActiveDraft.set(d) }
                     out.serverCount?.let { serverCount = it }
+                    // 这一段**真的到服务端了**：立刻把真数报给界面（见 `onSegmentDone` 的说明），
+                    // 然后**继续下一段** —— 循环不 break、不 return，直到清单里该传的段都传完。
+                    onSegmentOk?.invoke(seg.seq)
                 }
                 is SegmentOutcome.Failed -> {
                     val phase = if (out.retryable) OfflinePhase.WAITING_UPLOAD else OfflinePhase.FAILED
                     // 段层面失败：**已经推进的水位保留**（那几段是真被认下的），音频一律不删
                     store.save(d.copy(uploaded = false))
-                    return StageResult(d, which(phase, d, out.note, force))
+                    // ## 为什么失败这句话里必须带上"已传过的段不会重传、下次从第 N 段接着传"
+                    //
+                    // 用户 2026-10-19 的原话是"传了一段，但是后面好像还是不行"。他真正怕的是
+                    // **又要从第 1 段重来**（那是 18 MB 白传一遍）。而这条路的真相恰恰相反：
+                    // 水位（`acknowledgedSegments`）在每段成功后**立刻落盘**，
+                    // 下一轮 `segmentsToUploadOf` 就从前几段之后开始 —— 所以这句话不是安慰，
+                    // 是这条链路本来就有的行为，只是以前**没有告诉用户**。
+                    // 混在"服务端拒了"那种原因里更不行：那时"重试"根本没意义，得说清是两回事。
+                    val resume = if (d.confirmedSegments > 0) {
+                        "；已传过的 ${d.confirmedSegments} 段不会重传，下次从第 ${seg.seq} 段接着传"
+                    } else {
+                        "；一段都还没传上去，下次从第 ${seg.seq} 段开始"
+                    }
+                    return StageResult(d, which(phase, d, out.note + resume, force))
                 }
             }
         }
@@ -591,6 +643,15 @@ data class SyncProgress(
     val pendingSegments: Int,
     /** **正在传**的段序号（1 起）。 */
     val currentSeq: Int,
+    /**
+     * 刚刚被服务端收下的段序号（`0` = 这是"某段**开始**传"那一次回调）。
+     *
+     * 为什么这一格必须有：一次"段开始"与一次"段结束"的 `currentSeq` 是**同一个数字**
+     * （第 3 段开始时的"正在传第 3 段"、与它传完时的"刚传完第 3 段"），
+     * 界面若只靠 `currentSeq` 变化去区分，就会把传完那一下**当成没变化**而漏掉刷新
+     * —— 那正是"传完最后一段之后界面停住"的形状。
+     */
+    val justConfirmed: Int = 0,
 )
 
 // --------------------------------------------------------------------------- 端口（给测试注入）

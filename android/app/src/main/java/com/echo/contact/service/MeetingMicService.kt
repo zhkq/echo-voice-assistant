@@ -409,7 +409,16 @@ class MeetingMicService : Service() {
                 return RetryOutcome.Ran
             }
             val block: suspend () -> Unit = {
-                val transport = OfflineMeetingTransport(ApiClient.create(baseUrl))
+                // ⚠️ **两个**客户端（2026-10-19 真机：传完第 1 段就停住）：
+                //  * `ApiClient.create(baseUrl)` 读 60 秒 —— 查状态/建会/收尾这些**必须快**的接口用它；
+                //  * `ApiClient.createForUpload(baseUrl)` 读/写都 960 秒 + 单段总预算 —— **只**传段。
+                //    一段 10 分钟的 WAV 是 ≈18.3 MB、还要过中继；原来它和上面那些共用 60 秒写超时的
+                //    客户端，第 2 段会被"60 秒没有进展"判死，而下一轮又从这一段的第 0 个字节重发
+                //    （body 不能续传）→ 大段永远传不完，`seq` 推不到 3，`stop` 永远不发。
+                val transport = OfflineMeetingTransport(
+                    api = ApiClient.create(baseUrl),
+                    uploadApi = ApiClient.createForUpload(baseUrl),
+                )
                 val active = ActiveDraft.current
                 // 这一轮**真的开始了**：先翻到"同步中"。
                 // 为什么必须在 `run` 之前：从用户按下列到第一段传完之间（探活 + 建会 + 读段
@@ -429,6 +438,23 @@ class MeetingMicService : Service() {
                     scope = scope,
                     // 逐段进度（只影响展示）：一轮可能几分钟，界面必须看得到"已传 M/N、第 K 段"。
                     onProgress = { p ->
+                        _state.value = _state.value.copy(
+                            syncPhase = OfflinePhase.UPLOADING,
+                            syncConfirmed = p.confirmedSegments,
+                            syncTotal = p.totalSegments,
+                            syncPending = p.pendingSegments,
+                            syncDrafts = p.drafts,
+                        )
+                        notifyIfRunning()
+                    },
+                    // 每段**真的到服务端**之后立刻刷一次真数（用户 2026-10-19：*"传了一段，后面好像还是不行"*）
+                    //
+                    // 为什么"段开始"那一报不够：一段 18 MB 的 WAV 传完要几分钟，而数字原来只在
+                    // **下一段开始**前才更新 —— 最后一段传完到整轮结束（对账 + stop）那段时间里，
+                    // 界面上还是旧数（"已传 2/3"，可 3 段其实都到了）；只有一段时更是整轮都不动。
+                    // 这里只改**数字**：文案仍然只有一处出口（`offlineStatusLine`，下一轮/结束时重写），
+                    // 免得两处各说一套。
+                    onSegmentDone = { p ->
                         _state.value = _state.value.copy(
                             syncPhase = OfflinePhase.UPLOADING,
                             syncConfirmed = p.confirmedSegments,
