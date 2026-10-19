@@ -25,14 +25,25 @@
 # on is a deliberate choice for strict single-instance enforcement.
 #
 # Log: %USERPROFILE%\.echo-supervisor.log
+#   Rotates at 2 MB into .echo-supervisor.log.1 (one backup, overwritten).
+#   Tick heartbeats are de-duplicated: written when the state changes, plus one
+#   "still healthy" summary every 10 minutes. Real events (start/stop/error/
+#   switch/instance start/autostart self-heal) are always written.
+#
+# Self-heal: the logon Startup shortcut is verified at startup and every 30
+# minutes, and rewritten if it is missing or points somewhere else. The
+# "where should it point" truth lives in echo-instance-lib.ps1 and is shared
+# with scripts\install-switcher.ps1.
 #
 # Usage
 #   powershell -File scripts\echo-supervisor.ps1                 # resident
 #   powershell -File scripts\echo-supervisor.ps1 -Once           # one pass, then exit
 #   powershell -File scripts\echo-supervisor.ps1 -Once -DryRun   # decide only, do nothing
 #
-# Autostart: switch-instance.ps1 -InstallAutostart  (repoints the Startup
-# shortcut here, so after a reboot the switch decides what comes up).
+# Autostart: scripts\install-switcher.ps1 installs this script into
+# %USERPROFILE%\.echo-switch\ and points the logon Startup shortcut at the vbs
+# there (one shared spec in echo-instance-lib.ps1). This supervisor re-checks
+# that shortcut at startup and every 30 minutes and restores it if it vanished.
 #
 # ASCII-ONLY on purpose (see echo-instance-lib.ps1).
 # =====================================================================
@@ -50,23 +61,83 @@ $ErrorActionPreference = 'Continue'
 
 $script:CfgPath = if ($Config) { $Config } else { $script:ConfigPathDefault }
 $script:LogPath = Join-Path $env:USERPROFILE '.echo-supervisor.log'
+$script:LogMaxBytes = 2MB
 $script:WarnedOthers = @{}
 $script:FirstPass = $true
 
+# --- log --------------------------------------------------------------------
+# Important events (start/stop/errors/self-heal/switch/instance start) always
+# go through SupLog and are NEVER de-duplicated. Only the per-tick heartbeat
+# goes through SupHeartbeat.
 function SupLog([string]$m, [string]$level = 'INFO') {
     $line = "[{0}] [{1}] {2}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $level, $m
     if (-not $Quiet) { Write-Host $line }
     try {
-        if ((Test-Path $script:LogPath) -and (Get-Item $script:LogPath).Length -gt 2MB) {
-            Move-Item $script:LogPath "$script:LogPath.1" -Force
-        }
+        # Rotate BEFORE appending, so even a single huge line cannot push the
+        # live log past the 2 MB bound. Keeps exactly one backup: <log>.1.
+        Invoke-EchoLogRotation -Path $script:LogPath -MaxBytes $script:LogMaxBytes | Out-Null
         Add-Content -Path $script:LogPath -Value $line -Encoding UTF8
     } catch { }
 }
 
+# --- heartbeat de-duplication -----------------------------------------------
+# The tick is every few seconds, but a steady "active 'x' healthy ..." line is
+# not an event. Write it when the state CHANGES, plus one summary every
+# $HeartbeatMinutes ("still healthy ... no state change for N min").
+$script:Heartbeat = $null
+$script:HeartbeatMinutes = 10
+
+function SupHeartbeat([string]$key, [string]$message, [string]$still = 'still healthy') {
+    $d = Get-EchoHeartbeatDecision -State $script:Heartbeat -Key $key `
+                                  -SummaryMinutes $script:HeartbeatMinutes
+    $script:Heartbeat = $d.State
+    if ($d.Kind -eq 'change') {
+        SupLog $message
+    } elseif ($d.Kind -eq 'summary') {
+        SupLog ("{0} - no state change for {1} min" -f $still, $d.Minutes)
+    }
+}
+
+# --- logon autostart self-heal ----------------------------------------------
+# 2026-10-19: "ECHO startup.lnk" had disappeared from the Startup folder, so
+# nothing started ECHO after logon. Check the link (name/target/arguments come
+# from the ONE shared spec in echo-instance-lib.ps1) at startup and every
+# $StartupCheckMinutes, and rewrite it if it is missing or points elsewhere.
+$script:StartupCheckMinutes = 30
+$script:NextStartupCheck = $null
+
+function Invoke-StartupShortcutCheck([switch]$DryRun) {
+    $script:NextStartupCheck = (Get-Date).AddMinutes($script:StartupCheckMinutes)
+    $st = Get-EchoStartupShortcutState
+    if (-not $st.Spec.LinkPath) {
+        SupLog "cannot locate the Startup folder - autostart shortcut not checked" 'WARN'
+        return
+    }
+    if (-not $st.VbsExists) {
+        SupLog "switch launcher vbs missing: $($st.Spec.VbsPath) - run scripts\install-switcher.ps1" 'WARN'
+    }
+    if (-not $st.Needed) { return }
+    if ($DryRun) {
+        SupLog "[dry] startup shortcut would be restored ($($st.Reason))" 'WARN'
+        return
+    }
+    $r = Restore-EchoStartupShortcut
+    if ($r.Changed) {
+        SupLog "startup shortcut restored ($($st.Reason))" 'WARN'
+    } else {
+        SupLog "startup shortcut could not be restored ($($r.Reason))" 'ERROR'
+    }
+}
+
 SupLog "===== echo-supervisor start (interval=${IntervalSeconds}s, dryRun=$DryRun, once=$Once) ====="
+Invoke-StartupShortcutCheck -DryRun:$DryRun
 
 function Invoke-Pass {
+    # Self-heal the logon autostart even while the config is broken: this check
+    # does not depend on which instance is active.
+    if ($null -eq $script:NextStartupCheck -or (Get-Date) -ge $script:NextStartupCheck) {
+        Invoke-StartupShortcutCheck -DryRun:$DryRun
+    }
     $cfg = Get-EchoInstanceConfig $script:CfgPath
     if (-not $cfg) {
         SupLog "no config at $($script:CfgPath) - run: switch-instance.ps1 -Init" 'ERROR'
@@ -117,12 +188,18 @@ function Invoke-Pass {
     if ($owned -and $listening) {
         $rp = @(Get-EchoInstanceProcs $root $procs | Where-Object { $_.Kind -eq 'router' -and $_.Role -ne 'stub' }).Count
         $sp = @(Get-EchoInstanceProcs $root $procs | Where-Object { $_.Kind -eq 'supervisor' }).Count
-        SupLog "active '$desired' healthy on port $port (echo=1 router=$rp supervisor=$sp)"
+        SupHeartbeat "healthy|port=$port|echo=1|router=$rp|supervisor=$sp" `
+                     "active '$desired' healthy on port $port (echo=1 router=$rp supervisor=$sp)" `
+                     "still healthy (active '$desired', port $port)"
     } elseif ($owned) {
-        SupLog "active '$desired' is booting (pid $($mine[0].PID), port $port not ready yet)"
+        $bpid = $mine[0].PID
+        SupHeartbeat "booting|pid=$bpid|port=$port" `
+                     "active '$desired' is booting (pid $bpid, port $port not ready yet)" `
+                     "still booting (active '$desired')"
     } elseif ($listening) {
         # The port is served by an instance that is NOT the active one. Starting
         # ours would only fight for the port, so just say so (rate-limited).
+        $script:Heartbeat = $null
         if (-not $script:WarnedPort) {
             $script:WarnedPort = $true
             SupLog "port $port is served by another instance, but active is '$desired'." 'WARN'
@@ -130,6 +207,7 @@ function Invoke-Pass {
         }
     } else {
         $script:WarnedPort = $false
+        $script:Heartbeat = $null
         SupLog "active '$desired' is down - starting"
         $p = Start-EchoInstance -Root $root -Name $desired -WaitSeconds $WaitSeconds -DryRun:$DryRun `
                                 -Log { param($m) SupLog $m }
@@ -168,5 +246,6 @@ while ($true) {
     if ($Once) { break }
     Start-Sleep -Seconds $IntervalSeconds
 }
+SupLog "===== echo-supervisor stop ====="
 if (-not $ok) { exit 1 }
 exit 0

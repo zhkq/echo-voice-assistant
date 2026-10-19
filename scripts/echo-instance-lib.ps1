@@ -63,6 +63,233 @@ function Get-EchoInstanceRoot($cfg, [string]$name) {
     return [string]$p.Value.root
 }
 
+# --------------------------------------------------------------- logging
+# Rotate once the log passes `MaxBytes`, keeping exactly ONE backup
+# (`<path>.1`, always overwritten). The supervisor calls this BEFORE every
+# append: a log at 1.36 MB with one line every 6 s is how 2026-10-19 happened,
+# so the bound must hold even for a single huge line.
+function Invoke-EchoLogRotation {
+    param(
+        [string]$Path,
+        [long]$MaxBytes = 2097152,
+        [switch]$DryRun
+    )
+    if (-not $Path) { return $false }
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
+    $len = [long](Get-Item -LiteralPath $Path).Length
+    if ($len -le $MaxBytes) { return $false }
+    if ($DryRun) { return $true }
+    $bak = "$Path.1"
+    if (Test-Path -LiteralPath $bak) {
+        Remove-Item -LiteralPath $bak -Force -ErrorAction SilentlyContinue
+    }
+    Move-Item -LiteralPath $Path -Destination $bak -Force
+    return $true
+}
+
+# Heartbeat de-duplication. The resident supervisor used to write
+# "active 'x' healthy ..." every 6 s forever, so the log only ever grew.
+# Kind = 'change'  -> the state really changed: write the real line
+#        'summary' -> same state for N minutes: write ONE still-healthy line
+#        'none'    -> stay quiet
+# `State` is an opaque hashtable owned by the caller; pass $null the first time
+# and store $decision.State afterwards.
+function Get-EchoHeartbeatDecision {
+    param(
+        $State,
+        [string]$Key,
+        [datetime]$Now = (Get-Date),
+        [int]$SummaryMinutes = 10
+    )
+    if ($null -eq $State -or -not ($State -is [hashtable]) -or $State['key'] -ne $Key) {
+        $fresh = @{ key = $Key; since = $Now; last = $Now; lastSummary = $Now }
+        return [pscustomobject]@{ State = $fresh; Kind = 'change'; Minutes = 0 }
+    }
+    $State['last'] = $Now
+    if ($SummaryMinutes -gt 0 -and
+        ($Now - $State['lastSummary']).TotalMinutes -ge $SummaryMinutes) {
+        $State['lastSummary'] = $Now
+        $mins = [int][Math]::Floor(($Now - $State['since']).TotalMinutes)
+        return [pscustomobject]@{ State = $State; Kind = 'summary'; Minutes = $mins }
+    }
+    return [pscustomobject]@{ State = $State; Kind = 'none'; Minutes = 0 }
+}
+
+# ------------------------------------------------- logon autostart shortcut
+# ONE source of truth for "what must the Startup shortcut point at".
+# install-switcher.ps1 creates it; echo-supervisor.ps1 re-checks/repairs it.
+# Shared on purpose: the 2026-10-19 incident was a MISSING "ECHO startup.lnk"
+# (the logon never started ECHO). A second hardcoded copy would eventually
+# disagree with the first, and the supervisor would then "repair" the shortcut
+# onto the wrong target - so both callers MUST go through this spec.
+function Get-EchoStartupShortcutSpec {
+    param(
+        [string]$StartupDir = '',
+        [string]$SwitchDir = ''
+    )
+    if (-not $StartupDir) { $StartupDir = [Environment]::GetFolderPath('Startup') }
+    # GetFolderPath('Startup') returns "" when the process runs with a redirected
+    # USERPROFILE (observed 2026-10-19 in a test harness). The roaming path is
+    # the very same folder, so fall back to it instead of building empty paths.
+    if (-not $StartupDir -and $env:APPDATA) {
+        $StartupDir = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Startup'
+    }
+    if (-not $SwitchDir)  { $SwitchDir  = Join-Path $env:USERPROFILE '.echo-switch' }
+    $vbs = Join-Path $SwitchDir 'echo-switch-startup.vbs'
+    $link = ''
+    if ($StartupDir) { $link = Join-Path $StartupDir 'ECHO startup.lnk' }
+    return [pscustomobject]@{
+        LinkPath         = $link
+        TargetPath       = (Join-Path $env:SystemRoot 'System32\wscript.exe')
+        Arguments        = ('"' + $vbs + '"')
+        VbsPath          = $vbs
+        WorkingDirectory = $SwitchDir
+        Description      = 'ECHO autostart (switch supervisor, outside the repo)'
+    }
+}
+
+# Compare paths the way Windows would, not byte-for-byte: the link may store
+# "C:\Windows\System32\wscript.exe" while we hold the short name, or the quotes
+# may differ. Anything that still launches the same program+script is CORRECT
+# and must not be rewritten.
+function ConvertTo-EchoPathKey([string]$path) {
+    if (-not $path) { return '' }
+    $p = $path.Trim()
+    if ($p.Length -ge 2 -and $p.StartsWith('"') -and $p.EndsWith('"')) {
+        $p = $p.Substring(1, $p.Length - 2)
+    }
+    try { $p = [System.IO.Path]::GetFullPath($p) } catch { }
+    return $p.TrimEnd('\').ToLowerInvariant()
+}
+
+function Get-EchoShortcutArgumentPath([string]$arguments) {
+    if (-not $arguments) { return '' }
+    $t = $arguments.Trim()
+    if ($t.StartsWith('"')) {
+        $end = $t.IndexOf('"', 1)
+        if ($end -gt 1) { return $t.Substring(1, $end - 1) }
+    }
+    return $t
+}
+
+# Thin COM seam: these two functions are the ONLY places that touch a real
+# .lnk. Everything above them is pure decision logic, so it can be exercised
+# without writing a real shortcut. That matters on this dev box: the endpoint
+# protection agent kills any process that creates a standalone .lnk outside the
+# Start Menu (tested 2026-10-19 - PowerShell just disappears, and the file is
+# removed a second later), so tests override these two names with a text-file
+# stand-in. Production keeps the real implementation below.
+function Read-EchoShortcutLink {
+    param([string]$Path)
+    $ws = New-Object -ComObject WScript.Shell
+    $lnk = $ws.CreateShortcut($Path)
+    return [pscustomobject]@{
+        TargetPath = [string]$lnk.TargetPath
+        Arguments  = [string]$lnk.Arguments
+    }
+}
+
+function Write-EchoShortcutLink {
+    param($Spec)
+    $ws = New-Object -ComObject WScript.Shell
+    $lnk = $ws.CreateShortcut($Spec.LinkPath)
+    $lnk.TargetPath = $Spec.TargetPath
+    $lnk.Arguments = $Spec.Arguments
+    $lnk.WorkingDirectory = $Spec.WorkingDirectory
+    $lnk.Description = $Spec.Description
+    $lnk.Save()
+}
+
+# Read-only verdict: Needed=$false means "leave the .lnk alone".
+function Get-EchoStartupShortcutState {
+    param(
+        [string]$StartupDir = '',
+        [string]$SwitchDir = ''
+    )
+    $spec = Get-EchoStartupShortcutSpec -StartupDir $StartupDir -SwitchDir $SwitchDir
+    $vbsExists = $false
+    if ($spec.VbsPath) { $vbsExists = (Test-Path -LiteralPath $spec.VbsPath -PathType Leaf) }
+    $state = [pscustomobject]@{
+        Spec      = $spec
+        Needed    = $false
+        Reason    = ''
+        Detail    = ''
+        VbsExists = $vbsExists
+    }
+    if (-not $spec.LinkPath) {
+        # Cannot even locate the Startup folder: report it, but never pretend
+        # to "repair" an address we do not have.
+        $state.Reason = 'no-startup-folder'
+        return $state
+    }
+    if (-not (Test-Path -LiteralPath $spec.LinkPath -PathType Leaf)) {
+        $state.Needed = $true
+        $state.Reason = 'missing'
+        return $state
+    }
+    try {
+        $actual = Read-EchoShortcutLink -Path $spec.LinkPath
+        $target = [string]$actual.TargetPath
+        $arguments = [string]$actual.Arguments
+    } catch {
+        $state.Needed = $true
+        $state.Reason = 'unreadable'
+        $state.Detail = "$_"
+        return $state
+    }
+    $state.Detail = "target=$target args=$arguments"
+    if ((ConvertTo-EchoPathKey $target) -ne (ConvertTo-EchoPathKey $spec.TargetPath)) {
+        $state.Needed = $true
+        $state.Reason = 'wrong-target'
+        return $state
+    }
+    $argPath = Get-EchoShortcutArgumentPath $arguments
+    if ((ConvertTo-EchoPathKey $argPath) -ne (ConvertTo-EchoPathKey $spec.VbsPath)) {
+        $state.Needed = $true
+        $state.Reason = 'wrong-arguments'
+        return $state
+    }
+    return $state
+}
+
+# Write the shortcut ONLY when the verdict says it is missing/wrong. Returns
+# Changed=$false when it was already correct (idempotent - a correct link is
+# never touched, so its target semantics stay whatever install-switcher meant).
+function Restore-EchoStartupShortcut {
+    param(
+        [string]$StartupDir = '',
+        [string]$SwitchDir = '',
+        [switch]$DryRun
+    )
+    $state = Get-EchoStartupShortcutState -StartupDir $StartupDir -SwitchDir $SwitchDir
+    $result = [pscustomobject]@{
+        Changed     = $false
+        WouldChange = $false
+        Reason      = $state.Reason
+        LinkPath    = $state.Spec.LinkPath
+        VbsExists   = $state.VbsExists
+    }
+    if (-not $state.Needed) { return $result }
+    if ($DryRun) { $result.WouldChange = $true; return $result }
+    $parent = Split-Path -Parent $state.Spec.LinkPath
+    if ($parent -and -not (Test-Path -LiteralPath $parent -PathType Container)) {
+        New-Item -ItemType Directory -Force -Path $parent | Out-Null
+    }
+    try {
+        Write-EchoShortcutLink -Spec $state.Spec
+    } catch {
+        $result.Reason = "save-failed: $_"
+        return $result
+    }
+    $after = Get-EchoStartupShortcutState -StartupDir $StartupDir -SwitchDir $SwitchDir
+    if ($after.Needed) {
+        $result.Reason = "save-ineffective: $($after.Reason)"
+        return $result
+    }
+    $result.Changed = $true
+    return $result
+}
+
 # --------------------------------------------------------------- probes
 # 3.0 install-base layout: an instance 'root' is the CODE dir (the command line carries
 # -File <root>\scripts\startup.ps1, which is what we match on), while data\echo.pid and

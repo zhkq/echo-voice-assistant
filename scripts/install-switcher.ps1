@@ -11,7 +11,9 @@
 # WHAT IT DOES
 #   1. copies echo-supervisor.ps1 + echo-instance-lib.ps1 into %USERPROFILE%\.echo-switch\
 #   2. writes %USERPROFILE%\.echo-switch\echo-switch-startup.vbs (self-locating, ANSI)
-#   3. repoints the Startup shortcut "ECHO startup.lnk" at that vbs
+#   3. repoints the logon Startup shortcut at that vbs (name, target and
+#      arguments all come from Get-EchoStartupShortcutSpec in the shared lib -
+#      the supervisor re-checks the very same spec and repairs a missing link)
 #   4. replaces the running (repo-based) supervisor with the new one, so exactly
 #      one loop is alive - the loop itself never restarts ECHO, it only keeps the
 #      ACTIVE instance up
@@ -31,6 +33,9 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+# The Startup shortcut's "what should it point at" is defined ONCE, in the
+# shared lib, so this installer and the supervisor can never drift apart.
+. (Join-Path $PSScriptRoot 'echo-instance-lib.ps1')
 $repoRoot = Split-Path $PSScriptRoot -Parent
 $dir = Join-Path $env:USERPROFILE '.echo-switch'
 
@@ -85,21 +90,26 @@ if ($DryRun) {
 }
 
 # --- repoint the logon autostart --------------------------------------------
-$startup = [Environment]::GetFolderPath('Startup')
-$lnkPath = Join-Path $startup 'ECHO startup.lnk'
-$legacy = Join-Path $startup 'ECHO (switch).lnk'
+# ONE truth: the spec lives in echo-instance-lib.ps1 and is shared with the
+# supervisor's self-heal check. Do NOT re-hardcode the target/arguments here.
+$spec = Get-EchoStartupShortcutSpec
+if (-not $spec.LinkPath) {
+    Fail 'cannot locate the Startup folder - autostart shortcut not written'; exit 1
+}
+$lnkPath = $spec.LinkPath
+$legacy = Join-Path (Split-Path -Parent $spec.LinkPath) 'ECHO (switch).lnk'
 if ($DryRun) {
-    Say "  [dry] would repoint $lnkPath -> wscript.exe `"$vbsPath`""
+    Say "  [dry] would repoint $lnkPath -> $($spec.TargetPath) $($spec.Arguments)"
 } else {
     $ws = New-Object -ComObject WScript.Shell
     if (Test-Path -LiteralPath $legacy) { Remove-Item -LiteralPath $legacy -Force -ErrorAction SilentlyContinue }
-    $lnk = $ws.CreateShortcut($lnkPath)
-    $lnk.TargetPath = "$env:SystemRoot\System32\wscript.exe"
-    $lnk.Arguments = "`"$vbsPath`""
-    $lnk.WorkingDirectory = $dir
-    $lnk.Description = 'ECHO autostart (switch supervisor, outside the repo)'
+    $lnk = $ws.CreateShortcut($spec.LinkPath)
+    $lnk.TargetPath = $spec.TargetPath
+    $lnk.Arguments = $spec.Arguments
+    $lnk.WorkingDirectory = $spec.WorkingDirectory
+    $lnk.Description = $spec.Description
     $lnk.Save()
-    Ok "autostart repointed: $lnkPath"
+    Ok "autostart repointed: $($spec.LinkPath)"
 }
 
 # --- exactly one supervisor loop --------------------------------------------
