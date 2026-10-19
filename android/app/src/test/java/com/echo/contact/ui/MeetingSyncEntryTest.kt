@@ -278,7 +278,14 @@ class MeetingSyncEntryTest {
         val svc = moduleText("src/main/java/com/echo/contact/service/MeetingMicService.kt")
         val body = functionBody(svc, "fun tickFromForeground(", "internal suspend fun runOfflineSync(")
         assertTrue("待传清单必须来自既有 store.pending()", body.contains("store.pending()"))
-        assertTrue("同步走既有 runOfflineSync", body.contains("runOfflineSync"))
+        // ⚠️ 2026-10-19 深夜改了这里：这条判据原来断言"tick 里直接调 runOfflineSync"，
+        // 而那正是"锁屏后被系统掐掉"的形状（App 进程里一个裸协程，没有前台、没有锁）。
+        // 现在 tick 只把活**交给前台服务**（ACTION_SYNC），同步实现本身仍然是**同一处**
+        // runOfflineSync（服务里那条）—— 判据从"调了哪个函数"改成"交给谁去跑、怎么起"。
+        assertTrue("同步交给服务里那条唯一的路（ACTION_SYNC）", body.contains("ACTION_SYNC"))
+        assertTrue("必须是**前台**方式起（startForegroundService）",
+            body.contains("startForegroundServiceCompat"))
+        assertFalse("不许再在 App 进程里裸起协程（锁屏一冻就停）", body.contains("CoroutineScope("))
         assertTrue("顺手刷新会议页那块入口的数据源", body.contains("_pendingSummary.value = pendingSummaryOf(waits)"))
         // 不许为这件事另造一个目录/一份清单
         assertFalse("不许另造清单目录", body.contains("offline-meetings-v2"))

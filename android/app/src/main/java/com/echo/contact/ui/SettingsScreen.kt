@@ -701,14 +701,15 @@ private fun openAppSettings(context: Context) {
     }
 }
 
+/**
+ * 「电池优化白名单」那一行点下去做的事。
+ *
+ * 实现搬去了 `BatteryOptimization.kt`（`openBatteryOptimizations`）：会议页「待上传」那块
+ * 也要同一个入口（用户 2026-10-19 深夜要的"去设置"），两处自然是**同一份**
+ * action/data URI —— 分开写两份迟早会漂（一处改了另一处忘）。
+ */
 private fun requestIgnoreBatteryOptimizations(context: Context) {
-    runCatching {
-        context.startActivity(
-            Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
-                Uri.fromParts("package", context.packageName, null))
-                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        )
-    }
+    openBatteryOptimizations(context)
 }
 
 /** App 自己的版本（今天问过"哪份 APK 最新"，所以关于页必须能自证是哪一版）。 */

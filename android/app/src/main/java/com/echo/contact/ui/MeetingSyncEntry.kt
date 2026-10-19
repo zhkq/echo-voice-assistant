@@ -9,6 +9,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -244,6 +245,25 @@ internal fun dispatchMeetingSync(action: MeetingSyncAction, syncNow: () -> Unit)
 }
 
 /**
+ * 会议页「待上传」那块里那句**如实**的说明（用户 2026-10-19 深夜：
+ * *"锁屏后，再解锁就要按一下重试，echo 需要后台可运行"*）。
+ *
+ * 为什么这句话必须写在这里（而不是只写在设置页）：用户是在**这块**上看到"还有 3 段没传"
+ * 的，此刻他想知道的正是"能不能锁屏走开"。所以说明与「去设置」都放在这一块，
+ * 而不是让他自己去设置页里找。
+ *
+ * 措辞刻意**不承诺**"一定能传完"：补传期间挂了前台服务与唤醒锁，但部分机型的省电策略
+ * 仍然会拦 —— 那种情况只有用户能解（加白名单），所以如实说，并给入口。
+ */
+internal const val MEETING_SYNC_BATTERY_NOTE =
+    "锁屏也能传完：补传期间会挂一条「正在上传会议录音」的常驻通知" +
+        "（前台服务 + 唤醒锁，传完就消失）。若系统仍把它拦掉（部分机型的省电策略），" +
+        "请允许本应用后台运行 / 关闭电池优化"
+
+/** 「去设置」按钮的文案。 */
+internal const val MEETING_SYNC_BATTERY_ACTION = "去设置（允许后台运行）"
+
+/**
  * 会议页里那块常驻入口（**画什么全由 [meetingSyncEntry] 决定**）。
  *
  * [onSync] 由调用方接上既有入口（`MeetingMicService.syncNow(context)`）——
@@ -257,6 +277,7 @@ internal fun MeetingSyncBlock(
 ) {
     val entry = meetingSyncEntry(pending, mic)
     if (!entry.visible) return
+    val context = androidx.compose.ui.platform.LocalContext.current
     Spacer(Modifier.height(6.dp))
     EchoCard(container = EchoPalette.Card2) {
         Column {
@@ -294,6 +315,14 @@ internal fun MeetingSyncBlock(
             if (mic.formatNote.isNotBlank()) {
                 Spacer(Modifier.height(2.dp))
                 MutedLine(mic.formatNote, color = EchoPalette.Muted, maxLines = 2)
+            }
+            // 「锁屏也能传完」+「若仍被拦，去关电池优化」（用户 2026-10-19 深夜点名要的）
+            Spacer(Modifier.height(4.dp))
+            MutedLine(MEETING_SYNC_BATTERY_NOTE, color = EchoPalette.Muted, maxLines = 5)
+            // ⚠️ **只在用户点的时候**才跳系统确认框（`ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS`）：
+            // 自动弹 = 拿注意力换设置，而且很像恶意软件的行为。
+            TextButton(onClick = { openBatteryOptimizations(context) }) {
+                Text(MEETING_SYNC_BATTERY_ACTION)
             }
             if (entry.action != MeetingSyncAction.NONE) {
                 Spacer(Modifier.height(6.dp))

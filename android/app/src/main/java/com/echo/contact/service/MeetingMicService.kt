@@ -116,8 +116,23 @@ class MeetingMicService : Service() {
          */
         const val ACTION_SYNC = "com.echo.contact.MEETING_MIC_SYNC"
 
+        /**
+         * `ACTION_SYNC` 上带的一个布尔 extra：这一轮是**后台节拍自动**发起的（不是用户按的）。
+         *
+         * 为什么要分开：两者的"话"不一样 ——
+         *  * 用户按的那一下：状态是"正在同步…"，而且**失败也要发一条通知**（他正等着结果）；
+         *  * 后台节拍：状态是"正在自动补传…"，失败**不发通知**（每几分钟弹一次"补传没成"
+         *    就是骚扰；原因在会议页那块入口里已经写着，用户点开就看得见）。
+         */
+        internal const val EXTRA_AUTO_SYNC = "com.echo.contact.EXTRA_AUTO_SYNC"
+
         private const val CHANNEL_ID = "echo_meeting_mic"
-        private const val NOTIF_ID = 4211
+
+        /**
+         * 录音那条通知的 id（`internal`：补传的前台实现要**沿用同一个 id** 才能"更新而不是
+         * 多出一条" —— 录音中顺手补传时，前台那条通知仍然必须是录音那条，见 `SyncForegroundAndroid`）。
+         */
+        internal const val NOTIF_ID = 4211
 
         /** 日志标签（**段的格式退回 WAV 这类"如实的事"也要落进日志** —— 真机排障只能靠它）。 */
         private const val TAG = "MeetingMic"
@@ -153,6 +168,37 @@ class MeetingMicService : Service() {
             context.startService(Intent(context, MeetingMicService::class.java).setAction(ACTION_STOP))
         }
 
+        /**
+         * 用**前台**方式起服务（O+ 必须 `startForegroundService`）。
+         *
+         * 为什么单独一个入口：`startForegroundService` 是一条**承诺** —— 服务必须在几秒内
+         * 调 `startForeground`，否则系统按 ANR 处理（`ForegroundServiceDidNotStartInTimeException`）。
+         * 所以每一个调用点都必须紧接着有一段"先挂前台"的代码（`ACTION_START` → `startRecording`，
+         * `ACTION_SYNC` → `syncForeground.guard`）；这里只负责"怎么起"。
+         */
+        private fun startForegroundServiceCompat(context: Context, intent: Intent) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) context.startForegroundService(intent)
+            else context.startService(intent)
+        }
+
+        /**
+         * 这些清单里**还要传的段一共多少字节**（只用来估锁的超时；读不到就按 0 算）。
+         *
+         * 为什么要按字节估：一段 10 分钟的 WAV ≈18 MB，锁的时间必须按"真的有多少要传"
+         * 算，而不是拍一个 30 分钟（见 `uploadLockTimeoutMs`）。读不到文件大小只会让
+         * 估算偏小（下一段会续锁），这是安全的方向。
+         */
+        private fun pendingBytesOf(store: MeetingDraftStore, drafts: List<MeetingDraft>): Long {
+            var total = 0L
+            drafts.forEach { d ->
+                segmentsToUploadOf(d).forEach { seg ->
+                    total += runCatching { store.audioFileOf(d.clientId, seg).length() }
+                        .getOrDefault(0L)
+                }
+            }
+            return total
+        }
+
         fun setPaused(context: Context, paused: Boolean) {
             val action = if (paused) ACTION_PAUSE else ACTION_RESUME
             context.startService(Intent(context, MeetingMicService::class.java).setAction(action))
@@ -163,6 +209,20 @@ class MeetingMicService : Service() {
          *
          * 为什么先在界面上说一句再让服务去干：`startService` 是异步的，而"按了没反应"
          * 是这类按钮最糟的体验。这里**不受退避限制**（用户说了"现在"）。
+         *
+         * ## 为什么这里必须是 `startForegroundService`（用户 2026-10-19 深夜的根因）
+         *
+         * 旧实现是 `app.startService(...)` —— 一个**后台**服务。屏幕一关，进程被冻结/掐掉，
+         * 正在传的那一段（18 MB，要几分钟）就断在那里，用户解锁后只能再按一次「重试」。
+         * 换成 `startForegroundService` 之后，服务**必须**在几秒内 `startForeground`
+         * （见 `onStartCommand` 的 `ACTION_SYNC`：那里先挂前台再发请求），
+         * 于是补传期间进程是**前台**的 —— 锁屏不会把它当后台掐掉。
+         *
+         * ## 为什么"没有待传"就**连服务都不起**
+         *
+         * "用户没在传的时候零通知"是硬要求。先起服务再发现没事可干，至少会留下一条通知
+         * （前台服务必须挂一条），而且会白白走一遍前台的生命周期。
+         * 所以判据在这里就问清楚（`shouldEnterSyncForeground` 的同一个判据）。
          */
         fun syncNow(context: Context) {
             val app = context.applicationContext
@@ -171,9 +231,11 @@ class MeetingMicService : Service() {
             _state.value = _state.value.copy(
                 syncNote = if (waits.isEmpty()) "现在没有要传的录音"
                 else "正在同步 ${waits.size} 场录音（${waits.sumOf { it.pendingSegments }} 段）…")
+            // 没东西要传：**不进前台、不起服务**（"零通知"那条判据）
+            if (!shouldEnterSyncForeground(waits.size)) return
             runCatching {
-                app.startService(
-                    Intent(app, MeetingMicService::class.java).setAction(ACTION_SYNC))
+                startForegroundServiceCompat(
+                    app, Intent(app, MeetingMicService::class.java).setAction(ACTION_SYNC))
             }
         }
 
@@ -240,9 +302,19 @@ class MeetingMicService : Service() {
          * 最常停在会议页/从通知直达会议页，那条节拍一次都不会跑（这就是"打开 App 等几分钟，
          * 一条 `/meeting/segment` 都没发"的根因）。见 [onAppOpened]。
          *
-         * 为什么不做成"起一个服务"：补传是**顺带**的事（有一份清单欠着、而且离上次尝试
-         * 够久了才真发请求），专门起一个服务只会多一份要管的东西。这里直接起一个
-         * 短命的作用域干活；服务要是没活着，本地清单照样在，下次任何一次 tick 都会接着试。
+         * ## 为什么 2026-10-19 深夜改成"把活交给服务"（不再自己起协程）
+         *
+         * 原来是这里 `CoroutineScope(SupervisorJob() + Dispatchers.IO).launch { runOfflineSync(...) }`
+         * —— 一个**挂在 App 进程里、没有任何前台服务兜着**的协程。App 进后台/锁屏之后
+         * 进程被冻结，这个协程连同正在传的那一段一起停在那里，而且**没有任何东西会告诉用户
+         * 它停了**（用户看到的就是"锁屏之后再解锁，得按一下重试"）。
+         * 现在这里只做一件事：把"该同步了"翻译成一次 `ACTION_SYNC`（**前台**服务），
+         * 于是补传期间进程是前台的、CPU/WiFi 有锁，锁屏也传得完。
+         *
+         * 三条判据一个都不能少（少了就会变成"每几秒拉一次前台服务"）：
+         *  * 没有待传 → 直接 return（**不起服务、零通知**）；
+         *  * 已经有一轮在跑（`syncGate`）→ return（不重复起）；
+         *  * 没到退避时间 → return（断网时不会把电池和流量烧光）。
          *
          * ⚠️ 与 `MeetingMicService` 里的那条路**共用** [syncGate]（进程级），
          * 所以"前台轮询"和"服务自己"不会同时传同一段（同一段被存两遍就是转写里出现两遍）。
@@ -278,8 +350,19 @@ class MeetingMicService : Service() {
             // 这一轮是**顺带**试：App 正在前台跑，所以按"此刻可达"算
             // （不可达时第一件事就是探活失败 → 退避，所以不会白转）
             if (!offlineSyncDue(reachableNow = true)) return
-            CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
-                runOfflineSync(app, store = store, manual = false, scope = SyncScope.FINALIZE)
+            runCatching {
+                startForegroundServiceCompat(
+                    app, Intent(app, MeetingMicService::class.java)
+                        .setAction(ACTION_SYNC)
+                        // 后台节拍发起的：失败不该弹通知（见 EXTRA_AUTO_SYNC 的说明）
+                        .putExtra(EXTRA_AUTO_SYNC, true))
+            }.onFailure { e ->
+                // Android 12+ 不许**从后台**起前台服务（锁屏之后这条节拍可能就撞上它）。
+                // 如实说一句：不许让用户以为"它还在传"。
+                android.util.Log.w(TAG, "起补传前台服务被系统拒绝：${e.javaClass.simpleName} ${e.message}")
+                _state.value = _state.value.copy(
+                    syncNote = "系统不允许现在开始上传（后台/锁屏限制）：解锁后会接着传")
+                notifyIfRunning()
             }
         }
 
@@ -295,6 +378,18 @@ class MeetingMicService : Service() {
 
         private fun notifyIfRunning() {
             runCatching { liveService?.notifyStatePublic() }
+        }
+
+        /**
+         * 逐段进度 → 补传前台通知（**只在服务活着、而且真的在补传时**才有效果）。
+         *
+         * 为什么包一层：`runOfflineSync` 是伴生对象里的函数（它只拿到 `Context`），
+         * 而"那条通知现在挂没挂"只有**活着的服务实例**知道。没有实例 = 没有前台 = 没有通知
+         * 可刷 —— 那就什么都不做（`SyncForeground.progress` 里 `active == false` 时本来就是空操作，
+         * 于是边录边传那种"没有补传前台"的路径不会凭空多出一条通知）。
+         */
+        private fun publishSyncProgress(p: SyncProgress) {
+            runCatching { liveService?.onSyncProgress(p) }
         }
 
         /**
@@ -446,6 +541,9 @@ class MeetingMicService : Service() {
                             syncDrafts = p.drafts,
                         )
                         notifyIfRunning()
+                        // 补传那条**前台通知**每段动一次（锁屏时用户只看得到它）：
+                        // 这一段开始传 → "已传 2/5 段（第 3 段 12.4 MB）"
+                        publishSyncProgress(p)
                     },
                     // 每段**真的到服务端**之后立刻刷一次真数（用户 2026-10-19：*"传了一段，后面好像还是不行"*）
                     //
@@ -463,6 +561,8 @@ class MeetingMicService : Service() {
                             syncDrafts = p.drafts,
                         )
                         notifyIfRunning()
+                        // 这一段**已经到服务端**了：通知里的"已传 M/N"当场就变（不是只在下一段开始才变）
+                        publishSyncProgress(p)
                     },
                 )
                 // 界面上那一档：**还在录**的时候一律显示"本机录音中"（此刻最要紧的事实），
@@ -658,6 +758,60 @@ class MeetingMicService : Service() {
     private var record: AudioRecord? = null
 
     /**
+     * 录音那条前台**是不是挂着**。
+     *
+     * 为什么补传要知道它：录音中顺手补传时，前台那条通知必须仍然是"录音"那条
+     * （换成"正在上传会议录音"用户会以为录音停了），而且**收尾时不许撤**（撤了录音就没前台了）。
+     * 见 `SyncForegroundAndroid.startForeground` / `SyncForeground.finish`。
+     */
+    @Volatile private var micForeground = false
+
+    /**
+     * 补传的"前台 + 锁"（`lazy`：服务只是被顺手拉起来做一次「现在同步」时，
+     * 到真正要进前台那一刻才建 —— 没东西要传的那条路径上它一次都不会被创建）。
+     */
+    private val syncForeground: SyncForeground by lazy {
+        SyncForeground(SyncForegroundAndroid(
+            service = this,
+            scope = scope,
+            recording = { micForeground },
+            recordingNotification = { buildNotification() },
+            recordingNotifId = NOTIF_ID,
+        ))
+    }
+
+    /**
+     * 一轮补传的结局 → 收尾通知那一句（**唯一**的转换处）。
+     *
+     * 判据全部取自 `MicState` 的最终那一档（`runOfflineSync` 结束时刚写过它）：
+     *  * `DONE` → 完成；`stopped` 才敢说"开始转写"（没有收尾就没有转写）；
+     *  * `IDLE` / 已经没有欠的段 → 没什么可说的（**不发通知**）；
+     *  * 其余 → 失败，原因用 `syncNote`（连不上 / 413 / 服务端拒收 / 对账不符，各说各的）。
+     *
+     * [quietFailure] = 后台节拍自动起的那一轮：**失败不发通知**（[SyncEnd.Quiet]）。
+     * 理由：那种轮次每几分钟就会来一次，失败通知会变成骚扰；而原因已经写在会议页那块
+     * 入口里（`syncReasonText` 分档说人话），用户点开就看得到。**成功照样要发**。
+     */
+    private fun syncEndOf(outcome: RetryOutcome, quietFailure: Boolean = false): SyncEnd {
+        if (outcome == RetryOutcome.SkippedBusy) {
+            return SyncEnd.Nothing("上一次同步还在跑，这一次没跑")
+        }
+        val st = _state.value
+        return when {
+            st.syncPhase == OfflinePhase.DONE -> SyncEnd.Done(
+                segments = st.syncConfirmed,
+                drafts = st.syncDrafts.coerceAtLeast(1),
+                // `OfflineSyncState.stopped` 在 publish 时是 `OfflineSyncResult.stopped`
+                transcribing = OfflineMeetingSync.state.value.stopped,
+            )
+            st.syncPhase == OfflinePhase.IDLE && st.syncPending == 0 ->
+                SyncEnd.Nothing("现在没有要传的录音")
+            quietFailure -> SyncEnd.Quiet(st.syncNote.ifBlank { "自动补传没成（原因见会议页）" })
+            else -> SyncEnd.Failed(st.syncNote.ifBlank { "补传没成（这次没拿到原因）" })
+        }
+    }
+
+    /**
      * 一次封段任务：PCM 已经从采集缓冲**拷出来**，编码/落盘交给单消费者按序做。
      *
      * [ack] 非空 = 这是一个"排空标记"（不是真段）：`stopEverything` 用它等前面
@@ -774,11 +928,64 @@ class MeetingMicService : Service() {
                 reportPausesSoon()
             }
             ACTION_SYNC -> scope.launch {
-                runOfflineSync(this@MeetingMicService, manual = true, scope = SyncScope.FINALIZE)
-                // 「现在同步」这个动作**可能在服务只是被顺手拉起来的时候**发生（会议页那块常驻入口
-                // 在没有录音的时候也能点）。同步跑完就把服务收掉 —— 否则每点一次就留下一个
-                // 常驻的后台服务（不进前台，纯粹白占着）。⚠️ 还在录（job != null）时**绝不能停**。
-                if (job == null) stopSelf()
+                // ## 上传是**前台任务**（用户 2026-10-19 深夜："锁屏后，再解锁就要按一下重试"）
+                //
+                // 这条分支是补传的**唯一**入口（「现在同步」按钮、通知里那颗、以及后台节拍
+                // 转过来的 `ACTION_SYNC`）。它原来只是"顺手起个后台服务"，于是：
+                // 屏幕一关 → 进程进后台被冻结/掐掉 → 正在传的那一段断在那里 → 解锁只能手点重试。
+                //
+                // 现在的形状：**一开同步就进前台 + 拿锁**（`syncForeground.guard`），
+                // 传完 / 失败 / 抛异常都在它的 `finally` 里撤干净（后台+前台一起收）。
+                // 判据见 `SyncForegroundTest`。
+                //
+                // 三条"没东西可做"的出口都必须**在进前台之前**（否则会留下一条通知）：
+                //  * 清单空了（可能就在这几毫秒里被另一条路传完了）→ 不起前台，直接收服务；
+                //  * 已经有一轮在跑（`syncGate`）→ 不重复进前台，如实说一句"这次没跑"。
+                val pending = runCatching { draftStore.pending() }.getOrDefault(emptyList())
+                // 后台节拍发起的（不是用户按的）：文案与"失败要不要发通知"都要跟着变
+                val auto = intent.getBooleanExtra(EXTRA_AUTO_SYNC, false)
+                if (!shouldEnterSyncForeground(pending.size, PairStore.isPaired(this@MeetingMicService)) ||
+                    syncGate.running
+                ) {
+                    if (syncGate.running) {
+                        _state.value = _state.value.copy(
+                            syncNote = "上一次同步还在跑，这一次没跑（等它完再按）")
+                    }
+                    if (job == null) stopSelf()
+                    return@launch
+                }
+                try {
+                    syncForeground.guard(
+                        totalSegments = pending.sumOf { it.segments.size },
+                        totalBytes = pendingBytesOf(draftStore, pending),
+                        block = {
+                            runOfflineSync(this@MeetingMicService, manual = !auto,
+                                scope = SyncScope.FINALIZE)
+                        },
+                        endOf = { outcome ->
+                            // 自动那一轮**失败不发通知**（每几分钟弹一条"补传没成"就是骚扰：
+                            // 原因在会议页那块入口里已经写着）；成功仍然要告诉用户一声。
+                            syncEndOf(outcome, quietFailure = auto)
+                        },
+                    )
+                } catch (c: kotlinx.coroutines.CancellationException) {
+                    // 服务被销毁/作用域被取消：**照原样往外抛**（不许把取消吞成"正常结束"）
+                    throw c
+                } catch (t: Throwable) {
+                    // `guard` 会把异常照原样抛回来（它只负责放锁/收前台）。
+                    // 这里**必须**接住：`scope.launch` 里漏出去的异常会走默认处理器 → **App 崩**，
+                    // 而真相只是"这一轮补传没成"（清单与音频都在，下一轮接着传）。
+                    android.util.Log.e(TAG, "补传这一轮抛了异常：${t.javaClass.simpleName} ${t.message}")
+                    _state.value = _state.value.copy(
+                        syncNote = "补传这一轮出错了（${t.javaClass.simpleName}）：音频都还在手机里，下次接着传")
+                    notifyIfRunning()
+                } finally {
+                    // 「现在同步」可能在服务只是被顺手拉起来的时候发生（会议页那块常驻入口
+                    // 在没有录音的时候也能点）。同步跑完就把服务收掉 —— 否则每点一次就留下一个
+                    // 常驻的后台服务。⚠️ 还在录（job != null）时**绝不能停**。
+                    // 收服务就顺带把前台撤了（`onDestroy` 里还有一道 releaseAll 兜底）。
+                    if (job == null) stopSelf()
+                }
             }
             else -> {
                 // 被系统重启带回来的 null intent：**不自动开麦**（与听写服务同一条纪律）
@@ -1202,10 +1409,31 @@ class MeetingMicService : Service() {
             //    等待是**有界**的（见 FINALIZE_WAIT_MS）：等不到就如实说"这一次没跑"。
             //    ⚠️ 一个样本都没有时也照跑这一轮：它只处理**别的**还没传完的清单
             //    （这一份没有音频段，`pending()` 不会选中它），所以**不会**建出空会。
+            //
+            //    ⚠️ 这一轮也走 `syncForeground.guard`：用户按完「结束」就把手机锁屏塞兜里
+            //    是**最常见**的动作，而这一轮可能要传好几分钟（最后几段 + 对账 + stop）。
+            //    录音那条前台此刻还挂着（`micForeground == true`），所以 `begin` 只是把
+            //    `dataSync` 类型补上去、拿到锁，**不会**换掉那条通知；`finish` 也不会撤它
+            //    （`foregroundOwned == false`），撤前台仍然是下面那句 `stopForegroundCompat()`。
+            val pendingNow = runCatching { draftStore.pending() }.getOrDefault(emptyList())
             val outcome = runCatching {
-                runOfflineSync(this@MeetingMicService, store = draftStore,
-                    manual = true, scope = SyncScope.FINALIZE,
-                    waitForGateMs = FINALIZE_WAIT_MS)
+                if (shouldEnterSyncForeground(pendingNow.size, PairStore.isPaired(this@MeetingMicService))) {
+                    syncForeground.guard(
+                        totalSegments = pendingNow.sumOf { it.segments.size },
+                        totalBytes = pendingBytesOf(draftStore, pendingNow),
+                        block = {
+                            runOfflineSync(this@MeetingMicService, store = draftStore,
+                                manual = true, scope = SyncScope.FINALIZE,
+                                waitForGateMs = FINALIZE_WAIT_MS)
+                        },
+                        endOf = { syncEndOf(it) },
+                    )
+                } else {
+                    // 没有待传的场：**不进前台**（"零通知"）。这一轮只是走一遍清单（几乎立刻返回）。
+                    runOfflineSync(this@MeetingMicService, store = draftStore,
+                        manual = true, scope = SyncScope.FINALIZE,
+                        waitForGateMs = FINALIZE_WAIT_MS)
+                }
             }.getOrDefault(RetryOutcome.Ran)
             if (outcome == RetryOutcome.SkippedBusy) {
                 // 如实：这次收尾**没跑**（另一轮占着），还有几段留着 —— 绝不假装传完了
@@ -1248,6 +1476,8 @@ class MeetingMicService : Service() {
     private fun failAndStop(msg: String) {
         _state.value = MicState(active = false, error = msg)
         notifyState()
+        // 起不来就撤：锁/前台一个都不许留（`releaseAll` 幂等，没拿过就是空操作）
+        syncForeground.releaseAll()
         stopForegroundCompat()
         stopSelf()
     }
@@ -1259,6 +1489,11 @@ class MeetingMicService : Service() {
         // 服务正在消失：把守卫放掉（幂等）。被取消的那一轮即使来不及走 finally，
         // 也不会让下一场录音里这个守卫一直是"在跑"。
         syncGate.leave()
+        // ⚠️ **锁一定要在这里再放一次**：`SyncForeground.guard` 的 finally 覆盖了正常路径，
+        // 但"服务被系统直接收掉"（`stopSelf` 之外的那些路）不会走那段 finally ——
+        // 一个没放掉的 PARTIAL_WAKE_LOCK 会让用户手机整夜不睡（比传不完糟得多）。
+        syncForeground.releaseAll()
+        micForeground = false
         // ⚠️ **刻意不清 [ActiveDraft]/[session]**：进程可能只是被系统回收，清单与音频都还在磁盘上，
         // 下一次 `tickFromForeground` / 开录时会重新读出来。清掉反而会让"接着传"失去判据。
         scope.cancel()
@@ -1280,6 +1515,8 @@ class MeetingMicService : Service() {
         } else {
             startForeground(NOTIF_ID, n)
         }
+        // 记下来：补传进前台时要知道"录音那条还挂着"（否则会换掉通知、结束时还会去撤它）
+        micForeground = true
     }
 
     private fun stopForegroundCompat() {
@@ -1288,6 +1525,7 @@ class MeetingMicService : Service() {
         } else {
             @Suppress("DEPRECATION") stopForeground(true)
         }
+        micForeground = false
     }
 
     private fun notifyState() {
@@ -1298,6 +1536,19 @@ class MeetingMicService : Service() {
     /** 进程级那条补传路刷通知的入口（**只**在服务活着时被调用）。 */
     internal fun notifyStatePublic() {
         notifyState()
+    }
+
+    /**
+     * 逐段进度 → 补传那条**前台通知**（用户点名的那句"已传 2/5 段（第 3 段 12.4 MB）"）。
+     *
+     * 为什么要有这个实例入口：`runOfflineSync` 在**伴生对象**里（它拿的是 `Context`，
+     * 不是服务实例），碰不到 `syncForeground`；而"刷哪条通知、要不要刷"只能由
+     * **活着的那一个服务实例**决定（没有实例 = 没有前台 = 没有通知可刷，那就什么都不做）。
+     *
+     * ⚠️ 它**只**更新通知，不参与任何判定（进度数字的判定全在 `OfflineMeetingSync`）。
+     */
+    internal fun onSyncProgress(p: SyncProgress) {
+        runCatching { syncForeground.progress(p) }
     }
 
     private fun buildNotification(): Notification {

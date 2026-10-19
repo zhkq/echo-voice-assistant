@@ -7,6 +7,20 @@
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <!--
+      补传（把手机里的会议音频往 ECHO 传）在 `MeetingMicService` 里跑成**前台服务**，
+      类型是 `dataSync`（不是录音）。Android 14 起每个用到的类型都要对应的权限，
+      少了这条，`startForeground(..., DATA_SYNC)` 会直接抛 SecurityException。
+    -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <!--
+      锁屏期间不许系统把 CPU/WiFi 降下去的许可（用户 2026-10-19 深夜："锁屏后……要按一下重试"）：
+        · WAKE_LOCK  → PARTIAL_WAKE_LOCK（带超时）+ WifiLock 都要求它；
+        · ACCESS_WIFI_STATE → 取 WifiManager 建 WiFi 锁（普通权限）。
+      ⚠️ 两者都只在**补传进行中**持有，而且都有超时（见 `SyncForeground` 的说明）。
+    -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <!-- 「设置 → 权限与省电」里的电池优化白名单：后台听写最怕被系统省电杀掉 -->
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
@@ -63,11 +77,16 @@
             android:exported="false"
             android:foregroundServiceType="microphone" />
 
-        <!-- 手机当麦克风：会议录音在手机侧采集、按段传给电脑（用户 2026-10-15 的口径） -->
+        <!-- 手机当麦克风：会议录音在手机侧采集、按段传给电脑（用户 2026-10-15 的口径）。
+             类型是**两个**，因为同一个服务有两条前台路径，按路径切：
+               · 录音 → microphone（老行为）
+               · 补传 → dataSync（Android 14 要求类型与真正在干的事对得上）
+               · 录音中顺手补传 → microphone|dataSync
+             见 `SyncForegroundAndroid` 的说明（为什么不做成两个服务）。 -->
         <service
             android:name=".service.MeetingMicService"
             android:exported="false"
-            android:foregroundServiceType="microphone" />
+            android:foregroundServiceType="microphone|dataSync" />
     </application>
 
 </manifest>

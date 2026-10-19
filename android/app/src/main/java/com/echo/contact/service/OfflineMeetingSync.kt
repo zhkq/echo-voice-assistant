@@ -130,7 +130,7 @@ object OfflineMeetingSync {
         for (draft in drafts) {
             val baseConfirmed = confirmedBefore
             val stage = syncOne(transport, store, draft, force, scope, reconcileAt,
-                onSegment = if (onProgress == null) null else { seq ->
+                onSegment = if (onProgress == null) null else { seq, bytes ->
                     // 这一段**正要开始传**：它自己还没被确认，所以只数到它前面那一小段。
                     // （原先写成 `seq - acked` 会把"正在传的这段"提前算成已传 —— 界面会
                     //  显示 1/3 却其实一段都还没到服务端，那正是"谎报进度"。）
@@ -143,6 +143,9 @@ object OfflineMeetingSync {
                         confirmedSegments = done,
                         pendingSegments = (totalAll - done).coerceAtLeast(0),
                         currentSeq = seq,
+                        // 这一段有多大：前台通知要写"第 3 段 12.4 MB"（用户点名的那句），
+                        // 而只有这里知道"正在传的是哪一段、它多少字节"。
+                        currentBytes = bytes,
                     ))
                 },
                 onSegmentOk = if (onSegmentDone == null) null else { seq ->
@@ -267,8 +270,10 @@ object OfflineMeetingSync {
          * （先 stop 再传段同样能让"stop 是最后一次调用"成立）。
          */
         reconcileAt: ((MeetingDraft) -> Unit)? = null,
-        /** 每一段**开始上传之前**报一次（[run] 的 `onProgress` 用；`null` = 不关心）。 */
-        onSegment: ((Int) -> Unit)? = null,
+        /** 每一段**开始上传之前**报一次（[run] 的 `onProgress` 用；`null` = 不关心）。
+         *  第二个参数是**这一段多少字节**（前台通知那句"第 3 段 12.4 MB"就靠它；
+         *  读不到大小就给 0 —— 通知里只报段号，**绝不编一个大小**）。 */
+        onSegment: ((Int, Long) -> Unit)? = null,
         /** 每一段**被服务端收下之后**报一次（[run] 的 `onSegmentDone` 用；`null` = 不关心）。 */
         onSegmentOk: ((Int) -> Unit)? = null,
     ): StageResult {
@@ -341,9 +346,6 @@ object OfflineMeetingSync {
         // 循环跑完之后才允许进对账与 `stop`（见 ③④ 的说明：**段没传完绝不 stop**）。
         var serverCount: Int? = null
         for (seg in segmentsToUploadOf(d)) {
-            // 这一段马上要发了：先报一次进度（"正在传第 N 段"）—— 一个 10 分钟段的上传
-            // 可能要几十秒到几分钟，没有这一步界面在这段时间里一动不动（= 看着像卡住）。
-            onSegment?.invoke(seg.seq)
             // **按清单里记的名字**找音频：见 audioFileOf —— 按 seq 拼就得先猜一个格式
             // （FLAC 还是 WAV），猜错就会得到"文件不存在"，于是补传永远卡在第一段
             val file = store.audioFileOf(d.clientId, seg)
@@ -352,6 +354,11 @@ object OfflineMeetingSync {
                 return StageResult(d, which(OfflinePhase.FAILED, d,
                     "第 ${seg.seq} 段的音频不在手机里（${seg.file}）：先别传后面的，免得顺序乱", force))
             }
+            // 这一段马上要发了：先报一次进度（"正在传第 N 段"）—— 一个 10 分钟段的上传
+            // 可能要几十秒到几分钟，没有这一步界面在这段时间里一动不动（= 看着像卡住）。
+            // 顺手把这**一段多大**报出去（前台通知那句"第 3 段 12.4 MB"要的是真数，
+            // 不是估算）；`length()` 读不到就给 0，通知里就只报段号。
+            onSegment?.invoke(seg.seq, runCatching { file.length() }.getOrDefault(0L))
             val bytes = try {
                 file.readBytes()
             } catch (e: Exception) {
@@ -652,6 +659,14 @@ data class SyncProgress(
      * —— 那正是"传完最后一段之后界面停住"的形状。
      */
     val justConfirmed: Int = 0,
+    /**
+     * 正在传的那一段**有多少字节**（`0` = 不知道）。
+     *
+     * 补传的前台通知要写"已传 2/5 段（第 3 段 12.4 MB）"（用户 2026-10-19 深夜点名的那句），
+     * 而这个数只有"正在读那一段文件"的地方知道 —— 界面那边没有清单、也读不到文件。
+     * 0 就**只报段号**，绝不编一个大小出来。
+     */
+    val currentBytes: Long = 0,
 )
 
 // --------------------------------------------------------------------------- 端口（给测试注入）
