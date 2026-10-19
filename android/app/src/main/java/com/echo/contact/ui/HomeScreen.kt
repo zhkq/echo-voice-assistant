@@ -39,6 +39,18 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.echo.contact.service.ListenState
 import com.echo.contact.ui.theme.EchoPalette
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
+
+/**
+ * App 在跑的时候多久试一次自动补传（毫秒）。
+ *
+ * 为什么是 5 秒：与首页那张状态卡原来的节拍一致（用户已经习惯"几秒内会自己动"），
+ * 而真正的发送频率由 `MeetingMicService` 的退避/守卫决定 —— 这条节拍只是"有机会再试"，
+ * 没有待传清单时它几乎零成本（一次目录扫描 + 直接返回）。
+ */
+internal const val APP_AUTO_SYNC_TICK_MS = 5_000L
 
 /**
  * 应用外壳：**5 页**（指令 / 会议 / **超级助理（正中间）** / 回顾 / 设置，用户 2026-10-18 点名）。
@@ -111,6 +123,34 @@ fun HomeScreen(onUnpair: () -> Unit) {
     }
 
     LaunchedEffect(Unit) { vm.init() }
+
+    // ---- App 级自动补传（用户 2026-10-19："打开 App 等了几分钟，一条都没发"）----
+    //
+    // 为什么触发点必须挂在**这一层（外壳）**，而不是首页那张状态卡里：
+    //  * 首页那张卡只在「超级助理」页可见（`when (currentTab)` 只组合当前页），
+    //    而录完之后用户最常停在会议页、或者从「录音结束」的通知直奔会议页 ——
+    //    那时旧的那条 tick **一次都不会跑**，一条 `/meeting/segment` 都不会发；
+    //  * 这一层五个页签都活着（全屏录音界面/内嵌网页那两条 early-return 之前就挂上了），
+    //    所以"打开 App 就会尝试同步"才成立。
+    //
+    // 两件事：
+    //  1. 第一下**不等节拍**：`onAppOpened` 会先清掉上一轮的退避（否则几小时前断网攒满
+    //     8 次自动重试之后，本进程里永远不再自动试 —— 打开 App 也没用），再走既有 tick；
+    //  2. 之后每 [APP_AUTO_SYNC_TICK_MS] 一次：真发不发请求仍由 `MeetingMicService`
+    //     那套退避/守卫决定（没有欠的清单就直接返回），所以这条节拍是便宜的。
+    LaunchedEffect(Unit) {
+        val app = context.applicationContext
+        // 读盘（清单目录）放到 IO：这是外壳的启动路径，主线程不做文件 I/O。
+        withContext(Dispatchers.IO) {
+            com.echo.contact.service.MeetingMicService.onAppOpened(app)
+        }
+        while (true) {
+            delay(APP_AUTO_SYNC_TICK_MS)
+            withContext(Dispatchers.IO) {
+                com.echo.contact.service.MeetingMicService.tickFromForeground(app)
+            }
+        }
+    }
 
     // ---- 通知带来的"打开那场会议"（冷启动/热启动都写进同一个 store）----
     // 消费一次就没了：所以转屏、重放、重复投递都不会把同一个目标打开两遍。

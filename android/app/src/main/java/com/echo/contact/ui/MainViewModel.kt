@@ -1478,14 +1478,13 @@ class MainViewModel(app: Application) : BaseViewModel(app) {
     fun autoRefreshTick() {
         viewModelScope.launch { fetchStatusOnce() }
         pollEvents()
-        // 离线录音的**自动补传**入口（用户 2026-10-16 的需求："网络通了就可以传上去"）。
-        // 搭在同一个节拍上：这条节拍只在界面可见时跑，正好就是"App 在前台"；
-        // 真发不发请求由服务里那套退避决定（见 MeetingMicService.tickFromForeground），
-        // 所以这里每次 tick 调它是**便宜**的（没有欠的清单就直接返回）。
-        runCatching {
-            com.echo.contact.service.MeetingMicService
-                .tickFromForeground(getApplication<Application>())
-        }
+        // ⚠️ 这里**不再**调 `MeetingMicService.tickFromForeground`（2026-10-19 移走）：
+        // 这个节拍只有首页那张状态卡可见时才跑（`StatusCard.HomeTopCard` 的 LaunchedEffect），
+        // 而录完之后用户最常停在会议页/从通知直达会议页 —— 那条路上一次都不会跑，
+        // 表现就是"打开 App 等几分钟，一条 /meeting/segment 都没发"。
+        // 自动补传的触发点现在是**应用外壳**（`HomeScreen` 的 LaunchedEffect：
+        // `onAppOpened` + 每几秒一次 `tickFromForeground`），五个页签都覆盖。
+        //
         // 指令列表的**头部**也搭这个节拍刷新（每 [COMMAND_HEAD_EVERY_TICKS] 拍一次 ≈ 半分钟）。
         //
         // 为什么必须刷：这条节拍原来只刷状态与事件，`_commands` **只在 init / 手动刷新 /

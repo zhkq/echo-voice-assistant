@@ -1133,4 +1133,45 @@ class OfflineMeetingSyncTest {
         val t = FakeTransport()
         assertEquals(OfflinePhase.IDLE, run(t, store).phase)
     }
+
+    // ---------------------------------------------------------------- ⑦ 逐段进度（用户 2026-10-19）
+
+    /**
+     * 一轮同步要**逐段**报进度：界面才有东西在动（否则按完「现在同步」几分钟没反应）。
+     *
+     * 三条判据：
+     *  * 每段开始前报一次，`currentSeq` 依次是 1/2/3（不是整轮结束才一次）；
+     *  * `confirmedSegments` 是**已经到服务端**的段数 —— 正在传的那一段**不许**提前算进去
+     *    （算进去就是"谎报进度"：界面显示 1/3，其实一段都还没到）；
+     *  * 总量 `totalSegments` 是这一轮要处理的总段数。
+     */
+    @Test
+    fun `同步过程中逐段报进度（已传几段、正在传第几段）`() {
+        val store = store()
+        seed(store, seqs = listOf(1, 2, 3))
+        val t = FakeTransport()
+        val seen = ArrayList<SyncProgress>()
+        runBlocking {
+            OfflineMeetingSync.run(transport = t, store = store, onProgress = { seen += it })
+        }
+        assertEquals("三段 = 三次进度回调（每段开始前一次）",
+            listOf(1, 2, 3), seen.map { it.currentSeq })
+        assertEquals("总量是这一轮要处理的段数", 3, seen[0].totalSegments)
+        assertEquals("还没传之前已确认 0 段", 0, seen[0].confirmedSegments)
+        assertEquals("第二段开始前只确认了 1 段", 1, seen[1].confirmedSegments)
+        assertEquals("第三段开始前只确认了 2 段", 2, seen[2].confirmedSegments)
+        assertEquals("待传随之减少（正在传的那段仍算待传）",
+            listOf(3, 2, 1), seen.map { it.pendingSegments })
+    }
+
+    /** 不传 `onProgress` 时一切照旧（默认 null，别的入口不被这条进度牵动）。 */
+    @Test
+    fun `不关心进度时 run 的行为一个字节都不变`() {
+        val store = store()
+        seed(store, seqs = listOf(1, 2))
+        val t = FakeTransport()
+        val r = run(t, store)
+        assertEquals(OfflinePhase.DONE, r.phase)
+        assertEquals(listOf(1, 2), t.uploaded.map { it.second })
+    }
 }

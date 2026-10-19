@@ -426,6 +426,35 @@ fun attemptsAfterReachableChange(wasUnreachable: Boolean, reachable: Boolean, at
 /** 顶层别名（设置页/用例直接读它）。 */
 fun backoffDelayMs(attempt: Int): Long = BackoffPolicy.delayMs(attempt)
 
+/**
+ * 自动重试的退避状态（三个进程级字段的**纯数据**版本，见 `MeetingMicService` 的
+ * `syncAttempts` / `syncNextAtMs` / `syncWasUnreachable`）。
+ *
+ * 之所以把它做成一个能单独构造的值：App 打开/回到前台时要把这三个字段**一起**清零，
+ * 而那件事必须能被 JVM 用例钉住（"清零之后 `shouldRetryNow` 立刻为真"）。
+ */
+data class AutoSyncBackoff(
+    val attempts: Int = 0,
+    val nextAtMs: Long? = null,
+    val wasUnreachable: Boolean = false,
+)
+
+/**
+ * 「App 刚打开（进入外壳）」时自动同步的退避状态 = **全部清零**。
+ *
+ * ## 为什么必须清零（用户 2026-10-19 的真机现场之一）
+ *
+ * 自动重试有一条"试到第 8 次就不再自动试"的上限（[BackoffPolicy.MAX_AUTO_ATTEMPTS]），
+ * 而这三个字段是**进程级**的：连着 8 轮连不上之后，[shouldRetryNow] 在本进程里**恒为 false**，
+ * 表现就是"App 开着、待传段数一直不动、界面上也没有任何'为什么不再试了'的说明"。
+ *
+ * 而"用户重新打开 App"是一次**明确的意图**（他来看结果了），语义上等同于手动重试：
+ * 这一下必须重新试一次，不能因为几小时前地铁里断过 8 次网就永远不再试。
+ * 清零是安全的：清单与音频都在磁盘上，重试只是再发一次幂等的请求。
+ */
+fun backoffOnAppOpen(): AutoSyncBackoff = AutoSyncBackoff(attempts = 0, nextAtMs = null, wasUnreachable = false)
+
+
 // --------------------------------------------------------------------------- 段选择与应用
 
 /**

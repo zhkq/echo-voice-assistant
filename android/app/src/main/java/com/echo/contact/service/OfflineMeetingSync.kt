@@ -65,6 +65,15 @@ object OfflineMeetingSync {
          * 所以注入的假 transport 记不出这个时刻 —— 见 [syncOne] 的同名参数。
          */
         reconcileAt: ((MeetingDraft) -> Unit)? = null,
+        /**
+         * **逐段**的进度回调（`null` = 不关心；只影响界面显示，不参与任何判定）。
+         *
+         * 为什么必须有它：一轮同步可能要传好几分钟（一段 10 分钟 ≈19 MB，走中继更慢），
+         * 而"已传 M / 共 N 段"原本只在**整轮结束**之后才第一次算得出来 —— 中间那几分钟
+         * 界面上什么都没变，用户刚按了「现在同步」，看到的就是"按了没反应"。
+         * 这个回调在每段**开始上传之前**报一次：已确认几段、正在传第几段。
+         */
+        onProgress: ((SyncProgress) -> Unit)? = null,
     ): OfflineSyncResult {
         val drafts = store.pending().let { list ->
             if (onlyClientId.isNullOrBlank()) list else list.filter { it.clientId == onlyClientId }
@@ -101,9 +110,29 @@ object OfflineMeetingSync {
         var anyFinalized = false
         /** 「暂停区间没报上去」那句（如实记下来，最后附在 note 上 —— 见 withPauseNote）。 */
         var pauseNote = ""
+        // 进度用的总量与"前面几份已经确认了几段"（**只用于展示**，判定一个都不依赖它）
+        val totalAll = drafts.sumOf { it.segments.size }
+        var confirmedBefore = 0
         for (draft in drafts) {
-            val stage = syncOne(transport, store, draft, force, scope, reconcileAt)
+            val baseConfirmed = confirmedBefore
+            val stage = syncOne(transport, store, draft, force, scope, reconcileAt,
+                onSegment = if (onProgress == null) null else { seq ->
+                    // 这一段**正要开始传**：它自己还没被确认，所以只数到它前面那一小段。
+                    // （原先写成 `seq - acked` 会把"正在传的这段"提前算成已传 —— 界面会
+                    //  显示 1/3 却其实一段都还没到服务端，那正是"谎报进度"。）
+                    val inDraft = (seq - 1 - draft.acknowledgedSegments).coerceAtLeast(0)
+                    val done = (baseConfirmed + draft.confirmedSegments + inDraft)
+                        .coerceIn(0, totalAll)
+                    onProgress(SyncProgress(
+                        drafts = drafts.size,
+                        totalSegments = totalAll,
+                        confirmedSegments = done,
+                        pendingSegments = (totalAll - done).coerceAtLeast(0),
+                        currentSeq = seq,
+                    ))
+                })
             val d = stage.draft ?: draft
+            confirmedBefore += d.confirmedSegments
             anyUploaded = anyUploaded || d.uploaded
             anyStopped = anyStopped || stage.stopped
             anyFinalized = anyFinalized || stage.finalized
@@ -209,6 +238,8 @@ object OfflineMeetingSync {
          * （先 stop 再传段同样能让"stop 是最后一次调用"成立）。
          */
         reconcileAt: ((MeetingDraft) -> Unit)? = null,
+        /** 每一段**开始上传之前**报一次（[run] 的 `onProgress` 用；`null` = 不关心）。 */
+        onSegment: ((Int) -> Unit)? = null,
     ): StageResult {
         var d = draft
         val finalize = scope == SyncScope.FINALIZE && !d.recording
@@ -274,6 +305,9 @@ object OfflineMeetingSync {
         // ② 按序传段：一段失败就停在这（顺序不许破），已成功的**立刻推进水位**（可续传）
         var serverCount: Int? = null
         for (seg in segmentsToUploadOf(d)) {
+            // 这一段马上要发了：先报一次进度（"正在传第 N 段"）—— 一个 10 分钟段的上传
+            // 可能要几十秒到几分钟，没有这一步界面在这段时间里一动不动（= 看着像卡住）。
+            onSegment?.invoke(seg.seq)
             // **按清单里记的名字**找音频：见 audioFileOf —— 按 seq 拼就得先猜一个格式
             // （FLAC 还是 WAV），猜错就会得到"文件不存在"，于是补传永远卡在第一段
             val file = store.audioFileOf(d.clientId, seg)
@@ -537,6 +571,27 @@ data class OfflineSyncResult(
             manual = manual,
         )
 }
+
+/**
+ * 一轮同步**进行中**的进度（给界面看；[OfflineMeetingSync.run] 的 `onProgress` 每段报一次）。
+ *
+ * 为什么要单独一档、而不是等 [OfflineSyncResult]：那一份是**整轮结束**才有的结论，而
+ * 一轮可能要几分钟（10 分钟的一段 ≈19 MB，走中继更慢）。中间那几分钟界面上必须有东西在动，
+ * 否则用户刚按完「现在同步」看到的就是"按了没反应"。
+ *
+ * ⚠️ 它**只用于展示**：任何判定（顺序/续传/对账/收尾）都不许读它 —— 那些只看
+ * `OfflineMeetingSync` 内部的清单与 transport 的返回值。
+ */
+data class SyncProgress(
+    val drafts: Int,
+    /** 这一轮要处理的总段数（界面 `已传 M / 共 N 段` 的 N）。 */
+    val totalSegments: Int,
+    /** 已经确认的段数（含前面几份清单里早就确认过的）。 */
+    val confirmedSegments: Int,
+    val pendingSegments: Int,
+    /** **正在传**的段序号（1 起）。 */
+    val currentSeq: Int,
+)
 
 // --------------------------------------------------------------------------- 端口（给测试注入）
 

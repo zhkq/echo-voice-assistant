@@ -177,8 +177,68 @@ class MeetingMicService : Service() {
             }
         }
 
+        // ---------------------------------------------------------------- 待传摘要（会议页那块入口）
+
         /**
-         * 后台补传的入口（App 在**前台**的状态轮询里每几秒调一次；还有听写服务那边）。
+         * 磁盘上**待补传清单**的摘要（会议页那块常驻入口读它；数据来自既有 `MeetingDraftStore`）。
+         *
+         * ## 为什么必须是磁盘的摘要、而不是只读 [MicState]
+         *
+         * [MicState] 是**内存**状态：App 重开 / 进程被系统杀掉之后它就是一张白纸
+         * （默认 `syncPhase = IDLE`、`syncPending = 0`）。而音频与清单都还在
+         * `filesDir/offline-meetings` 里 —— 只读内存的话，会议页那块入口会在
+         * "还有 3 段没传"的时候**整块不画**。用户 2026-10-19 说的"没有上传的地方了"
+         * 就是这件事：不是数字错了，是入口**消失了**。
+         */
+        private val _pendingSummary = MutableStateFlow(PendingSyncSummary())
+        val pendingSummary: StateFlow<PendingSyncSummary> = _pendingSummary.asStateFlow()
+
+        /**
+         * 从既有清单刷新那块摘要（[MeetingDraftStore.pending]）。
+         *
+         * 读不动就按"没有待传"算 —— 但**不抛**：这是界面/后台都会调的一条，
+         * 抛出去的表现是"开会页崩了"，而真相只是某个清单目录读不了（补传自己会另算）。
+         */
+        fun refreshPendingSummary(context: Context): PendingSyncSummary {
+            val app = context.applicationContext
+            val summary = runCatching { pendingSummaryOf(storeOf(app).pending()) }
+                .getOrDefault(PendingSyncSummary())
+            _pendingSummary.value = summary
+            return summary
+        }
+
+        /**
+         * **App 一打开（进入外壳）就试一次自动同步**（用户 2026-10-19 的第二个问题）。
+         *
+         * 为什么不能只靠首页那张状态卡的节拍：那张卡只在「超级助理」页可见，而录完之后
+         * 用户最常停在会议页（或从通知直达会议页）—— 那时旧的 tick **一次都不会跑**，
+         * 一条 `/meeting/segment` 都不会发。所以触发点必须挂在**外壳**上（见 `HomeScreen`），
+         * 而这里只有一件事：把"用户刚打开"这件事翻译成一次**允许尝试**的 tick。
+         *
+         * 三件事，缺一不可：
+         *  1. 退避清零（[backoffOnAppOpen]）：否则几小时前断网攒满 8 次之后，
+         *     本进程里 `shouldRetryNow` 恒 false —— 打开 App 也永远不再自动试；
+         *  2. 先刷新待传摘要：界面那块入口要立刻有数（不等下一轮 tick）；
+         *  3. 走**既有** [tickFromForeground]：不新造一条同步路（它内部还是
+         *     `runOfflineSync(scope = FINALIZE)`，还在录的那份会被自动降级成 INCREMENTAL）。
+         */
+        fun onAppOpened(context: Context) {
+            val app = context.applicationContext
+            val reset = backoffOnAppOpen()
+            syncAttempts = reset.attempts
+            syncNextAtMs = reset.nextAtMs ?: 0L
+            syncWasUnreachable = reset.wasUnreachable
+            refreshPendingSummary(app)
+            tickFromForeground(app)
+        }
+
+        /**
+         * 后台补传的入口（**应用外壳**每几秒调一次；还有听写服务那边）。
+         *
+         * ⚠️ 2026-10-19 起这个触发点**必须是 App 级**的（`HomeScreen` 那个 `LaunchedEffect`），
+         * 不能只挂在首页那张状态卡里 —— 那张卡只在「超级助理」页可见，而录完之后用户
+         * 最常停在会议页/从通知直达会议页，那条节拍一次都不会跑（这就是"打开 App 等几分钟，
+         * 一条 `/meeting/segment` 都没发"的根因）。见 [onAppOpened]。
          *
          * 为什么不做成"起一个服务"：补传是**顺带**的事（有一份清单欠着、而且离上次尝试
          * 够久了才真发请求），专门起一个服务只会多一份要管的东西。这里直接起一个
@@ -195,6 +255,11 @@ class MeetingMicService : Service() {
             val app = context.applicationContext
             val store = MeetingDraftStore(File(app.filesDir, OFFLINE_DIR))
             val waits = store.pending()
+            // 顺手把会议页那块入口的数据源刷新一次：**它读的是磁盘上既有清单**，
+            // 所以每一轮 tick 之后"待上传 N 段"都会跟着真实情况走（而不是等界面自己再算）。
+            // 这里直接用刚读到的 `waits`（它本来就是 `needsSync` 过滤过的同一批），
+            // 不再多扫一遍目录。
+            _pendingSummary.value = pendingSummaryOf(waits)
             if (waits.isEmpty()) {
                 // 没有欠的东西：把界面上那条"等联网上传"收掉（别留一条假的）
                 if (_state.value.syncPhase == OfflinePhase.WAITING_UPLOAD ||
@@ -346,6 +411,14 @@ class MeetingMicService : Service() {
             val block: suspend () -> Unit = {
                 val transport = OfflineMeetingTransport(ApiClient.create(baseUrl))
                 val active = ActiveDraft.current
+                // 这一轮**真的开始了**：先翻到"同步中"。
+                // 为什么必须在 `run` 之前：从用户按下列到第一段传完之间（探活 + 建会 + 读段
+                // 都可能要好几秒），界面上那块入口一直显示"待上传 N 段" + 可点的按钮
+                // —— 用户会以为没按上，于是再按一次（拿到"上一次还在跑"）。
+                _state.value = _state.value.copy(
+                    syncPhase = OfflinePhase.UPLOADING,
+                    syncNote = if (manual) "正在同步…" else "正在自动补传…",
+                )
                 val result = OfflineMeetingSync.run(
                     transport = transport,
                     store = store,
@@ -354,6 +427,17 @@ class MeetingMicService : Service() {
                     manual = manual,
                     force = manual,
                     scope = scope,
+                    // 逐段进度（只影响展示）：一轮可能几分钟，界面必须看得到"已传 M/N、第 K 段"。
+                    onProgress = { p ->
+                        _state.value = _state.value.copy(
+                            syncPhase = OfflinePhase.UPLOADING,
+                            syncConfirmed = p.confirmedSegments,
+                            syncTotal = p.totalSegments,
+                            syncPending = p.pendingSegments,
+                            syncDrafts = p.drafts,
+                        )
+                        notifyIfRunning()
+                    },
                 )
                 // 界面上那一档：**还在录**的时候一律显示"本机录音中"（此刻最要紧的事实），
                 // 而"网通不通、传上去没传上去"由 note 与那几个数字说清（见 offlineStatusLine）。
@@ -376,12 +460,16 @@ class MeetingMicService : Service() {
                     syncNote = offlineStatusLine(st).ifBlank { st.note },
                     syncPending = result.pendingSegments,
                     syncConfirmed = result.confirmedSegments,
+                    syncTotal = result.totalSegments,
                     syncDrafts = result.drafts,
                     sent = maxOf(_state.value.sent, result.confirmedSegments),
                     error = "",
                 )
                 // 同步这一轮过去了：**顺手**按有界保留策略清一次（只清"已对账 + 已收尾 + 到期"的）
                 runCatching { purgeExpiredAudio(app, store) }
+                // 这一轮把水位推了/把一场传完了：会议页那块入口的"待上传 N 段"要立刻跟上
+                // （只靠 tick 刷的话，用户点完「现在同步」会看到旧数字一会儿 —— 那很像"没反应"）。
+                refreshPendingSummary(app)
                 notifyIfRunning()
             }
             val outcome = if (waitForGateMs > 0) {
@@ -661,6 +749,10 @@ class MeetingMicService : Service() {
             }
             ACTION_SYNC -> scope.launch {
                 runOfflineSync(this@MeetingMicService, manual = true, scope = SyncScope.FINALIZE)
+                // 「现在同步」这个动作**可能在服务只是被顺手拉起来的时候**发生（会议页那块常驻入口
+                // 在没有录音的时候也能点）。同步跑完就把服务收掉 —— 否则每点一次就留下一个
+                // 常驻的后台服务（不进前台，纯粹白占着）。⚠️ 还在录（job != null）时**绝不能停**。
+                if (job == null) stopSelf()
             }
             else -> {
                 // 被系统重启带回来的 null intent：**不自动开麦**（与听写服务同一条纪律）
@@ -1535,6 +1627,14 @@ data class MicState(
     val syncPending: Int = 0,
     /** 那几段里已经被服务端认下几段（界面用来说"已传 M 段"）。 */
     val syncConfirmed: Int = 0,
+    /**
+     * 这一轮要处理的总段数（界面那条 `已传 M / 共 T 段` 里的 T）。
+     *
+     * 为什么它必须来自**本轮进度**（`SyncProgress` / `OfflineSyncResult`）而不是界面自己数：
+     * 磁盘摘要每 3 秒才刷一次，而"这一轮要传几段"只有同步自己知道（它按清单挑段）。
+     * 0 = 还没开始过一轮（界面回落到磁盘摘要的总段数）。
+     */
+    val syncTotal: Int = 0,
     /** 有几场录音在等（可能不止一场：连着录了两场，第一场还没传完）。 */
     val syncDrafts: Int = 0,
 

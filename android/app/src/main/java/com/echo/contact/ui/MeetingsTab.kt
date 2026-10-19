@@ -20,10 +20,10 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
@@ -31,6 +31,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.echo.contact.ui.theme.EchoPalette
+import kotlinx.coroutines.delay
 
 /**
  * 会议页：状态 + 开始/结束录音 + 列表。
@@ -66,6 +67,25 @@ fun MeetingsTab(vm: MainViewModel) {
     // 或者反过来把"电脑在录"当成"手机在录"（那正是 2026-10-17 那次真机 bug 的界面部分）。
     val micState by com.echo.contact.service.MeetingMicService.state.collectAsState()
     val phoneRecording = micState.active
+
+    // ---- 会议页那块**常驻**的「待上传 / 现在同步」（用户 2026-10-19）----
+    //
+    // 为什么它读的是 `pendingSummary`（磁盘上既有离线清单的摘要）而不是 `micState` 里的数字：
+    // 录完全屏界面一关、App 再一重开，`MicState` 就是一张白纸 —— 只读它的话"还有 3 段没传"
+    // 这件事在界面上根本不存在（用户原话："没有上传的地方了"）。清单才是磁盘上的事实。
+    val pendingSync by com.echo.contact.service.MeetingMicService.pendingSummary.collectAsState()
+    // 每 3 秒重读一次清单：别的入口（通知里的「现在同步」、听写服务那条 tick）也在传，
+    // 这块要跟着真实情况走；清单只有几个目录，读一次是微秒级。
+    // ⚠️ 它在**会议页**而不是录音页：录完之后用户最常来的就是这里。
+    LaunchedEffect(Unit) {
+        while (true) {
+            // 读盘放 IO：清单是几个小文件，但这是主线程上的界面节拍，不该做文件 I/O。
+            kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                com.echo.contact.service.MeetingMicService.refreshPendingSummary(localCtx)
+            }
+            delay(3_000L)
+        }
+    }
 
     // 「开始录音」现在**就是**手机本地录音，所以要 RECORD_AUDIO：没授权先要（与「说话」页
     // 同一套做法），授权成功再开始。否则第一次按下去只会看到"没有麦克风权限"，
@@ -209,32 +229,20 @@ fun MeetingsTab(vm: MainViewModel) {
                         MutedLine(it, color = EchoPalette.Yellow)
                     }
 
-                    // ---- 手机录音的补传进度（用户 2026-10-16 要的；2026-10-17 合并成一条路）----
-                    // 这段是**每一次手机录音**都要显示的东西（不再只是"离线那一场"）：
-                    // 录完之后全屏界面就收起来了，而"还有几段没传上去"必须还能看到 ——
-                    // 所以它必须在这里、而且必须**如实**（绝不说"已上传"）。
-                    if (micState.syncNote.isNotBlank() &&
-                        micState.syncPhase != com.echo.contact.service.OfflinePhase.IDLE
-                    ) {
-                        Spacer(Modifier.height(6.dp))
-                        MutedLine(
-                            micState.syncNote,
-                            color = if (micState.syncPhase ==
-                                com.echo.contact.service.OfflinePhase.DONE)
-                                EchoPalette.Green else EchoPalette.Yellow,
-                            maxLines = 3,
-                        )
-                        // 段的格式**如实**：退回 WAV 时要说清（用户 2026-10-17 点名要求）
-                        micState.formatNote.takeIf { it.isNotBlank() }?.let {
-                            MutedLine(it, color = EchoPalette.Muted, maxLines = 2)
-                        }
-                        if (micState.syncPending > 0 && !micState.syncBusy) {
-                            Spacer(Modifier.height(4.dp))
-                            OutlinedButton(onClick = {
-                                com.echo.contact.service.MeetingMicService.syncNow(localCtx)
-                            }) { Text("现在同步手机录音") }
-                        }
-                    }
+                    // ---- 待上传 / 现在同步（**常驻**；用户 2026-10-19 "没有上传的地方了"）----
+                    //
+                    // 为什么它是一张独立小卡、而不是录音状态那几行的一部分：
+                    // 录音状态是"这一刻在不在录"，而"还有几段没传上去"是**录完之后**最要紧的事实
+                    // —— 两者生命周期不同（前者一结束就归零，后者要一直留到对齐成功）。
+                    // 数据来自既有离线清单，同步走既有 `MeetingMicService.syncNow`（ACTION_SYNC
+                    // → `OfflineMeetingSync` 的 FINALIZE 那一轮），这里没有第二条同步实现。
+                    MeetingSyncBlock(
+                        pending = pendingSync,
+                        mic = micState,
+                        onSync = {
+                            com.echo.contact.service.MeetingMicService.syncNow(localCtx)
+                        },
+                    )
                     // 结束那一刻的如实说明（例如"这次没有录到音频"）。它**不看**补传状态：
                     // 这句话是"这一场发生了什么"，不属于"还有几段没传"那一档，
                     // 而且不能被下一轮 tick 抹掉（抹掉就是静默）。见 `MicState.stopNote`。

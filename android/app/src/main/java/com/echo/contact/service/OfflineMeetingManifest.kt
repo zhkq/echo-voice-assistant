@@ -756,3 +756,58 @@ internal fun needsSync(draft: MeetingDraft): Boolean = DraftUploadPlan.needsSync
  */
 internal fun segmentsToUploadOf(draft: MeetingDraft): List<DraftSegment> =
     DraftUploadPlan.segmentsFor(draft)
+
+/**
+ * 磁盘上**待补传**那几份清单的摘要（会议页那块常驻入口的数据源）。
+ *
+ * ## 为什么要有它（用户 2026-10-19：*"没有上传的地方了"*）
+ *
+ * 补传的真相一直只在两个地方：`MeetingDraftStore`（磁盘上的清单）与 `MicState`
+ * （**内存里**的同步状态）。界面以前只读后者，而后者在 App 重开/进程被杀之后是一张白纸
+ * —— 于是"磁盘上还有 3 段没传"这件事在界面上**完全不存在**（不是显示成 0，是连那一块都不画）。
+ * 这一份摘要就是"把磁盘上的事实拿出来给人看"的那个最小中间层：**一个字段都不新增存储**
+ * （数据全部来自既有 `MeetingDraftStore.pending()` 的清单）。
+ *
+ * ## 为什么带 [earliestStartedAt] 与 [recordingDrafts]
+ *
+ *  * 只报"3 段"用户不知道是哪一场 —— 补传是**按会议顺序**排队传的（见 `OfflineMeetingSync`），
+ *    最早那场的时间就是他该看到的那一场；
+ *  * [recordingDrafts] > 0 时必须说出来：那一场还在录，补传只会传段、**不会收尾**
+ *    （收尾要等用户按结束），否则用户会以为"传完了怎么还没出文字"。
+ */
+data class PendingSyncSummary(
+    /** 还有几场在等（可能不止一场：连着录了两场，第一场还没传完）。 */
+    val drafts: Int = 0,
+    /** 这几场里一共还有几段没被服务端认下（= 界面上那个 N）。 */
+    val pendingSegments: Int = 0,
+    /** 这几场一共多少段（同步进度那条"已传 M / T 段"里的 T）。 */
+    val totalSegments: Int = 0,
+    /** 最早那一场的开始时间（ISO 本地时间；空 = 没有待传）。 */
+    val earliestStartedAt: String = "",
+    /** 其中还有几场**正在录**（这些不会被收尾，见 `OfflineMeetingSync` 的降级判据）。 */
+    val recordingDrafts: Int = 0,
+) {
+    val hasPending: Boolean get() = pendingSegments > 0
+}
+
+/**
+ * 从**既有清单**算摘要（纯函数，JVM 可测）。
+ *
+ * 判据只有一处：[needsSync] —— "还没标记已上传 **且** 手里有段"。
+ * 特意**不**在这里另写一套（例如"段数 > 已确认数"）：那样两处判据迟早漂，
+ * 而漂了的表现是界面上说"没有待传"、后台却还在传某一批段。
+ */
+fun pendingSummaryOf(drafts: List<MeetingDraft>): PendingSyncSummary {
+    val waiting = drafts.filter { needsSync(it) }
+    if (waiting.isEmpty()) return PendingSyncSummary()
+    // 清单的 started_at 是 `yyyy-MM-dd'T'HH:mm:ss`（定长、本地时间），字符串序就是时间序 ——
+    // 不解析成时间再排，避免"解析失败就排到最后"这种静默的分叉。
+    val earliest = waiting.map { it.startedAt }.filter { it.isNotBlank() }.minOrNull().orEmpty()
+    return PendingSyncSummary(
+        drafts = waiting.size,
+        pendingSegments = waiting.sumOf { it.pendingSegments },
+        totalSegments = waiting.sumOf { it.segments.size },
+        earliestStartedAt = earliest,
+        recordingDrafts = waiting.count { it.recording },
+    )
+}
