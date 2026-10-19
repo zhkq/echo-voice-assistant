@@ -713,10 +713,16 @@ def _meeting_id_for(folder=""):
     补传在"这场已经收尾、客户端仍在重试"那条路上要用它拿到 id（见
     `_duplicate_from_a_finished_meeting`）。
     """
-    mid = int(_state.get("meeting_id") or 0)
-    if mid:
-        return mid
-    target = str(folder or _state.get("folder") or "")
+    mid = 0
+    current = str(_state.get("folder") or "")
+    # ⚠️ 先比"问的是不是正在录的那一场"：`_state["meeting_id"]` 只属于它。
+    # 补传那场（进程重启后仍在收段）**不是**当前 active 的那场，拿内存里的 id
+    # 会把它记成**别人**的 id（客户端据此对账，错一次就对不上了）。
+    if not folder or str(folder) == current:
+        mid = int(_state.get("meeting_id") or 0)
+        if mid:
+            return mid
+    target = str(folder or current or "")
     if not target:
         return 0
     try:
@@ -1001,6 +1007,19 @@ def start_meeting_phone(origin=ORIGIN_PC):
 CLIENT_ID_KEY = "clientId"
 #: 服务端**收到这一场**的时间（与客户端缓存的 `start` 分开留，别混为一谈）。
 RECEIVED_AT_KEY = "receivedAt"
+#: 补传"**还没传完**"的标记（2026-10-19 真机 bug 的修复点）—— 写进那场会议的 `meta.json`。
+#:
+#: 为什么必须是**落盘**的、而不是只在进程里记一个 per-client 集合：
+#:   真机那场（`2026-10-19_12-32-01`）12:32 建会，服务端夜里重启过 —— 库里那场被
+#:   `recover_orphaned_meetings()` 标成 `interrupted`，`_state` 里什么都不剩了；
+#:   手机重试 `start` 命中的是**幂等分支**（只回那一场、不碰内存态）。
+#:   于是"手机还在往里补段"这个事实，只剩 `meta.json` 能证明 —— 只放内存里的话，
+#:   重启一次 = 剩下的段**永远 409**（手机永远停在"正在同步 0/5"，音频传不进来）。
+#: 为什么不是"继续把 `_state["active"]` 置真"：这一场在**录音意义上已经结束**了
+#:   （客户端明说了 `endedAt`），把它冒充成"正在录"会让面板与状态接口谎报。
+#:   语义是"**已结束、但还在收段**" —— "收段许可"（`uploading`）与"正在录"（`active`）
+#:   是两件事，别把它们混成同一个布尔。
+UPLOADING_KEY = "uploading"
 
 
 def _now_stamp():
@@ -1093,6 +1112,45 @@ def _unique_offline_folder():
     return "", "", "同一秒里有 100 场补传会议了（%s）——稍后再试" % stamp
 
 
+def _uploading_meeting_for(client_id):
+    """`clientId` 那一场**还在补传、而且没传完**吗？是 → `(name, folder, meta)`，否则 None。
+
+    这是"**已结束、但还在收段**"那条路的唯一判据（真机 2026-10-19 的 409 就是它缺了）：
+    段要不要被收下，从此**不再只看 `_state["active"]`**（那个只会活在当前进程里），
+    还看盘上这一场有没有"没传完"的事实。
+
+    三件都要同时成立（全部读盘，进程重启也认）：
+      1. 这场是**手机麦**（`source=phone`），而且 `meta` 里的 `clientId` 就是它；
+      2. 有"没传完"的证据 —— `meta["uploading"]` 为真（`start` 带 `endedAt` 时写下、
+         `stop` 收尾时清掉），**或者**是标记引入之前建的老会议（它带着 `clientEndedAt`
+         却始终没有 `end`：那就是一场"录完了、还没收尾"的补传 —— 真机那场正是这样，
+         不认这一格就等于要求用户重录一遍）；
+      3. 它**还没收尾**（没有 `end` / `stoppedAt`）—— 已经收尾的那场绝不再往里写音频。
+
+    ⚠️ 返回的 `meta` 只是**快照**：真正写盘的是 `_write_segment`，它会重新读一次盘
+    （两次读之间别的请求刚写了一段也不会被覆盖）。
+    """
+    cid = str(client_id or "").strip()
+    if not cid:
+        return None
+    name = meeting_name_by_client_id(cid)
+    if not name:
+        return None
+    folder = os.path.join(meetings_dir(), name)
+    meta = _load_json(os.path.join(folder, "meta.json"), {})
+    if not isinstance(meta, dict) or not meta:
+        return None
+    if str(meta.get(CLIENT_ID_KEY) or "").strip() != cid:
+        return None
+    if str(meta.get("source") or "").strip().lower() != "phone":
+        return None
+    if meta.get("end") or meta.get("stoppedAt"):
+        return None
+    if not meta.get(UPLOADING_KEY) and not str(meta.get("clientEndedAt") or "").strip():
+        return None
+    return name, folder, meta
+
+
 def start_meeting_phone_sync(client_id, started_at="", ended_at="", origin=ORIGIN_PC):
     """离线补传那条路的**建会**：按 `clientId` 幂等 + 采用客户端缓存的开始时间。
 
@@ -1105,6 +1163,11 @@ def start_meeting_phone_sync(client_id, started_at="", ended_at="", origin=ORIGI
       1. 库里/meta 里已有这个 id 的会 → 回**那一场**（`duplicate: true`，绝不新建）；
       2. 已经有一场在录（但不是这个 id 的）→ **不抢占**（既有行为，回"会议录音已在进行中"）；
       3. 都不是 → 真的建一场：开始时间取客户端缓存的 `startedAt`，另外记 `receivedAt`。
+
+    **带 `ended_at` 的那条路会落一个 `meta["uploading"]=true`**（见 `UPLOADING_KEY`）：
+    客户端已经录完了，但音频还在按段往上传 —— 这场从此是"已结束、但还在收段"。
+    标记由客户端的 `stop` 收尾时清掉（`stop_meeting`），清掉之前 `segment` 一律准写
+    （哪怕进程重启过、`_state["active"]` 早就不在了）。
     """
     cid = str(client_id or "").strip()
     if not cid:
@@ -1116,6 +1179,24 @@ def start_meeting_phone_sync(client_id, started_at="", ended_at="", origin=ORIGI
         name = meeting_name_by_client_id(cid)
         if name:
             row = db.get_meeting_by_name(name) or {}
+            folder = os.path.join(meetings_dir(), name)
+            meta = _load_json(os.path.join(folder, "meta.json"), {})
+            # **重试也是"还在补传"**：真机那次 409 走的正是这一格 —— 手机重试 `start`
+            # 命中了幂等、只拿回那一场，而内存态早就没了（进程重启过）。
+            # 所以这里要把"没传完"这个事实**补记到盘上**（只在这一场**还没收尾**时补：
+            # 已经 stop 过的那场有 `end`，再补就会让收尾之后还能被写进新段）。
+            ended = str(ended_at or "").strip()
+            if ended and isinstance(meta, dict) and meta \
+                    and not meta.get("end") and not meta.get("stoppedAt"):
+                changed = False
+                if not meta.get(UPLOADING_KEY):
+                    meta[UPLOADING_KEY] = True
+                    changed = True
+                if not str(meta.get("clientEndedAt") or "").strip():
+                    meta["clientEndedAt"] = ended
+                    changed = True
+                if changed:
+                    _save_meta(folder, meta)
             return {"ok": True, "message": name, "meetingId": int(row.get("id") or 0),
                     "duplicate": True, "clientId": cid, "name": name, "source": "phone",
                     "startedAt": str(row.get("started_at") or "")}
@@ -1138,10 +1219,13 @@ def start_meeting_phone_sync(client_id, started_at="", ended_at="", origin=ORIGI
                     "clientId": cid, "name": "", "source": "", "startedAt": ""}
         folder, meta = _new_meeting_folder_and_meta(
             cfg, origin=origin, started_at=start, folder=folder,
-            extra={"source": "phone", CLIENT_ID_KEY: cid, RECEIVED_AT_KEY: received,
-                   # 客户端"已经录完"的时刻也如实留着（与人给的 `receivedAt` 分开）：
-                   # 这一场在手机上是 10:00–10:40 录完的，而在电脑上是 11:00 才收到。
-                   "clientEndedAt": str(ended_at or "").strip()})
+            extra=dict({"source": "phone", CLIENT_ID_KEY: cid, RECEIVED_AT_KEY: received,
+                        # 客户端"已经录完"的时刻也如实留着（与人给的 `receivedAt` 分开）：
+                        # 这一场在手机上是 10:00–10:40 录完的，而在电脑上是 11:00 才收到。
+                        "clientEndedAt": str(ended_at or "").strip()},
+                       # 带 `endedAt` = 客户端已经录完、但音频还在按段传来 → 记下
+                       # "补传未完成"（落盘；`stop` 收尾时清，见 `UPLOADING_KEY`）。
+                       **({UPLOADING_KEY: True} if str(ended_at or "").strip() else {})))
         try:
             meeting_id = db.create_meeting(
                 name, started_at=start, stt_model=meta["config"]["sttModel"],
@@ -1305,20 +1389,84 @@ def _duplicate_from_a_finished_meeting(client_id, seq):
                        folder=folder, meta=meta, client_id=cid)
 
 
+def _write_segment(folder, data, name="", seq=0, started_at="", client_id=""):
+    """把一段音频落进**指定那一场**（编号 / 幂等 / 落盘 / 写 meta）—— **唯一**的写入实现。
+
+    为什么拆出来（2026-10-19）：补传这条路现在有**两个落点** ——
+      ① `_state["active"]` 就是它（同进程里边录边收，既有那条路）；
+      ② 进程重启后 `active` 丢了，但盘上的 `meta["uploading"]` 还证明"没传完"
+         （见 `_uploading_meeting_for`）。
+    "段号怎么排、什么算重复、落成什么后缀"必须仍是**同一份**判据：各写一份迟早漂移，
+    而漂移的表现是"同一段在两种入口下行为不一样" —— 最难查的那种 bug。
+
+    ⚠️ 每次都**重新读一次** `meta.json`（不要把调用方的快照写回去）：两次读之间可能
+    刚有另一个请求写了一段，拿旧快照覆盖等于把人家的段**静默抹掉**。
+    """
+    meta = _load_json(os.path.join(folder, "meta.json"), {})
+    if not isinstance(meta, dict):
+        meta = {}
+    segs = list(meta.get("segments") or [])
+    smap = _segment_seq_map(segs)
+    want = int(seq or 0)
+    if want <= 0:
+        want = (max(smap) if smap else 0) + 1
+    # **幂等**：这一段之前就收过（补传重试）→ 当成功、**不写第二遍**。
+    # 写两遍的后果不只是浪费磁盘：转写里同一句话出现两次，且"服务端段数 == 本地最大
+    # 段序号"这条对账等式会失真（客户端于是永远不敢说"传完了"）。
+    if want in smap:
+        # 回**盘上那个名字**（不是按这次 body 的格式拼的）：补传重试可能换了格式，
+        # 而 `meta` 里记的是先到的那个（见 `_stored_seg_name`）。
+        stored = _stored_seg_name(segs, want) or smap[want]
+        return _seg_result(True, stored, name=stored, duplicate=True, seq=want,
+                           folder=folder, meta=meta, client_id=client_id)
+    # 客户端给的时间与建会时那个不一致 → 如实记一笔（不改这场的时间轴）：
+    # 时间轴以**建会那一刻**定的为准，否则后到的段能把整场会议的时间挪走。
+    if str(started_at or "").strip():
+        got = _parse_client_stamp(started_at)
+        known = _parse_client_stamp(meta.get("start"))
+        if got and known and got != known:
+            db.add_log("warn", "meeting",
+                       "补传的段带着与这场不同的 startedAt（%s ≠ %s）：以建会那个为准"
+                       % (got, known))
+    # 后缀由 **body 的真格式** 决定（魔数，不看 Content-Type）；显式给了 `name` 的
+    # 老调用方（录音器/手机麦）照旧尊重它，只补后缀 —— 那是既有行为，一个字不改。
+    seg_name = name or _seg_name_for(data, want)
+    if not seg_name.lower().endswith(audiofile.WAV_EXT) and \
+            not seg_name.lower().endswith(audiofile.FLAC_EXT):
+        seg_name += audiofile.FLAC_EXT if _is_flac(data) else audiofile.WAV_EXT
+    with open(os.path.join(folder, seg_name), "wb") as f:
+        f.write(data)
+    if seg_name not in segs:
+        segs.append(seg_name)
+    meta["segments"] = sorted(segs, key=lambda n: int(str(n).split(".")[0]))
+    _save_meta(folder, meta)
+    # `name` 与 `message` 都填段名：前者是 `/meeting/segment` 成功时回给客户端的那一格，
+    # 后者是**老调用方**（`append_meeting_segment` 的两元组）读的那一格 —— 两边同源。
+    return _seg_result(True, seg_name, name=seg_name, seq=want, folder=folder, meta=meta,
+                       client_id=client_id)
+
+
 def _apply_segment(data, name="", client_id="", seq=0, started_at=""):
-    """把一段音频落到**当前这场**（两条路共用的**唯一**实现）。
+    """把一段音频落到**该落的那一场**（两条路共用的**唯一**实现）。
 
     为什么合成一处：两条调用方要的东西不同（老的只要 `(ok, 段名)`，离线补传那条要
     段数/幂等标记），但"什么算成功、什么算重复、段名怎么排"必须是**同一份**判据 ——
     各写一份迟早漂移，而漂移的表现是"同一段在两种调用下行为不一样"。
 
     判据（顺序即优先级）：
-      * 必须在录、而且**是"你这一份"**（带了 clientId 就必须与当前那场相等）；
-      * 必须是"手机麦"那场（本机麦那条路不接受外来段，否则两路音频混进同一场）；
       * **必须是认得的音频**（`RIFF` 或 `fLaC` 魔数，见 `_is_audio`）：下游按文件真格式读，
         塞个 mp3/垃圾字节进去会在转写时报很难追的错；
+      * 正在录的那场 → 带了 clientId 就必须与那一场相等；且必须是"手机麦"那场
+        （本机麦那条路不接受外来段，否则两路音频混进同一场）；
+      * **不**是正在录的那场，但盘上证明它"**补传还没传完**"（`meta["uploading"]`）→
+        准写（真机 2026-10-19 的 409 就缺这一档：进程重启后 `active` 没了，而手机还在传）；
       * `(clientId, seq)` **已存在 = 幂等命中**：当成功回 `duplicate`，**不许存第二遍**；
       * 没给 seq（老客户端）→ 仍由电脑按现有段号往下排（既有行为）。
+
+    为什么"收段许可"不能只看 `_state["active"]`：那个布尔只活在**当前进程**里。补传是一场
+    "已经录完、还在按段上传"的会 —— 服务端重启一次，`active` 就没了，而"它还没传完"
+    这件事必须能从盘上读回来（见 `UPLOADING_KEY` / `_uploading_meeting_for`），否则
+    剩下的段**永远 409**、手机永远停在"正在同步 0/5"。
 
     WAV 那条路**逐字节不变**（`NN.wav`、同样的编号与幂等规则）；FLAC 只是多了一种
     "认得"的格式，落盘成同名不同后缀的 `NN.flac` —— 会不会被当成重复由**段号**决定，
@@ -1332,63 +1480,38 @@ def _apply_segment(data, name="", client_id="", seq=0, started_at=""):
         # 把人引去查录音状态，那是最难查的那种误导）。
         if not _is_audio(data):
             return _seg_result(False, "这段不是音频（WAV/FLAC 都不是）：手机那边该传裸音频字节")
-        if not _state["active"] or not _state["folder"]:
-            # 没有在录：可能是"这一场**已经收尾**了，客户端在重试整条流程"
-            # （`stop` 的回包丢了）。那就按 `(clientId, seq)` 去那一场里查这段在不在 ——
-            # 在 = 幂等命中（当成功回 duplicate，见 `_duplicate_from_a_finished_meeting`）；
-            # 不在 = 如实拒绝（这一场已经收尾，不许再往里写音频）。
-            done = _duplicate_from_a_finished_meeting(cid, seq)
-            if done:
-                return done
-            return _seg_result(False, "现在没有在录音")
-        if cid and cid != str(_state.get("client_id") or "").strip():
-            # 幂等键对不上 = 这一场不是你的（另一台设备/电脑正在录的会）：
-            # 往里塞音频就是"两路音频混进同一场"，必须明确拒绝。
-            return _seg_result(False, "这场会议不是 clientId=%s 那一场，不能往它里面传音频" % cid)
-        if _state.get("source") != "phone":
+        active = bool(_state["active"] and _state["folder"])
+        active_cid = str(_state.get("client_id") or "").strip()
+        # ① 正在录的那一场**就是你这一份**（"边录边传"的既有路径）：行为一个字不改。
+        if active and (not cid or cid == active_cid):
+            if _state.get("source") != "phone":
+                return _seg_result(False, "这场录音用的是电脑的麦克风，手机不用传音频")
+            r = _write_segment(_state["folder"], data, name=name, seq=seq,
+                               started_at=started_at, client_id=cid)
+            _state["seg_count"] = int(r.get("segmentCount") or 0)   # 状态接口显示进度
+            return r
+        # ② 不是正在录的那一场（或不是你的）→ 看它是不是"**补传还没传完**"。
+        #    这一档就是 2026-10-19 真机 409 的修复点：进程重启后 active 丢了，
+        #    但"手机还在补这一段"的事实留在盘上（`uploading`），照样准写。
+        found = _uploading_meeting_for(cid)
+        if found:
+            _, folder, _snapshot = found
+            return _write_segment(folder, data, name=name, seq=seq,
+                                  started_at=started_at, client_id=cid)
+        # ③ 还在录、但**不是**这一份（或那场是本机麦）：仍拒 —— 判据一个字不放宽
+        #    （两路音频混进同一场 = 转写里两个人同时说话）。
+        if active:
+            if cid and cid != active_cid:
+                return _seg_result(False, "这场会议不是 clientId=%s 那一场，不能往它里面传音频" % cid)
             return _seg_result(False, "这场录音用的是电脑的麦克风，手机不用传音频")
-        folder = _state["folder"]
-        meta = _load_json(os.path.join(folder, "meta.json"), {})
-        segs = list(meta.get("segments") or [])
-        smap = _segment_seq_map(segs)
-        want = int(seq or 0)
-        if want <= 0:
-            want = (max(smap) if smap else 0) + 1
-        # **幂等**：这一段之前就收过（补传重试）→ 当成功、**不写第二遍**。
-        # 写两遍的后果不只是浪费磁盘：转写里同一句话出现两次，且"服务端段数 == 本地最大
-        # 段序号"这条对账等式会失真（客户端于是永远不敢说"传完了"）。
-        if want in smap:
-            _state["seg_count"] = len(smap)
-            # 回**盘上那个名字**（不是按这次 body 的格式拼的）：补传重试可能换了格式，
-            # 而 `meta` 里记的是先到的那个（见 `_stored_seg_name`）。
-            stored = _stored_seg_name(segs, want) or smap[want]
-            return _seg_result(True, stored, name=stored, duplicate=True, seq=want,
-                               folder=folder, meta=meta)
-        # 客户端给的时间与建会时那个不一致 → 如实记一笔（不改这场的时间轴）：
-        # 时间轴以**建会那一刻**定的为准，否则后到的段能把整场会议的时间挪走。
-        if str(started_at or "").strip():
-            got = _parse_client_stamp(started_at)
-            known = _parse_client_stamp(meta.get("start"))
-            if got and known and got != known:
-                db.add_log("warn", "meeting",
-                           "补传的段带着与这场不同的 startedAt（%s ≠ %s）：以建会那个为准"
-                           % (got, known))
-        # 后缀由 **body 的真格式** 决定（魔数，不看 Content-Type）；显式给了 `name` 的
-        # 老调用方（录音器/手机麦）照旧尊重它，只补后缀 —— 那是既有行为，一个字不改。
-        seg_name = name or _seg_name_for(data, want)
-        if not seg_name.lower().endswith(audiofile.WAV_EXT) and \
-                not seg_name.lower().endswith(audiofile.FLAC_EXT):
-            seg_name += audiofile.FLAC_EXT if _is_flac(data) else audiofile.WAV_EXT
-        with open(os.path.join(folder, seg_name), "wb") as f:
-            f.write(data)
-        if seg_name not in segs:
-            segs.append(seg_name)
-        meta["segments"] = sorted(segs, key=lambda n: int(str(n).split(".")[0]))
-        _save_meta(folder, meta)
-        _state["seg_count"] = len(meta["segments"])       # 状态接口据此给手机显示进度
-        # `name` 与 `message` 都填段名：前者是 `/meeting/segment` 成功时回给客户端的那一格，
-        # 后者是**老调用方**（`append_meeting_segment` 的两元组）读的那一格 —— 两边同源。
-        return _seg_result(True, seg_name, name=seg_name, seq=want, folder=folder, meta=meta)
+        # ④ 没有在录：可能是"这一场**已经收尾**了，客户端在重试整条流程"
+        # （`stop` 的回包丢了）。那就按 `(clientId, seq)` 去那一场里查这段在不在 ——
+        # 在 = 幂等命中（当成功回 duplicate，见 `_duplicate_from_a_finished_meeting`）；
+        # 不在 = 如实拒绝（这一场已经收尾，不许再往里写音频）。
+        done = _duplicate_from_a_finished_meeting(cid, seq)
+        if done:
+            return done
+        return _seg_result(False, "现在没有在录音")
 
 
 def append_meeting_segment(data, name=""):
@@ -1404,8 +1527,8 @@ def append_meeting_segment(data, name=""):
 def append_meeting_segment_sync(data, client_id="", seq=0, started_at="", source=""):
     """离线补传那条路的**传段**：`(clientId, seq)` 幂等 + 回**累计**段数（对账用）。
 
-    `source` 只用来**如实记日志**，不参与判定：这一场是不是"手机麦"那条路，由
-    `_state["source"]` 一处说了算（判据只有一处，见 `_apply_segment`）。
+    `source` 只用来**如实记日志**，不参与判定：这一段能不能落、落到哪一场，由
+    `_apply_segment` **一处**说了算（`_state["source"]` + 盘上的 `uploading` 标记）。
     为什么还要收它：客户端会带它（契约里是可选参数），**静默忽略**会让"服务端契约没对齐"
     变成一个查不出来的事实 —— 带了不一样的值就落一条日志。
     """
@@ -1727,6 +1850,74 @@ def _watch_recorder(recorder):
             stop_meeting()
 
 
+def _finish_upload_session(client_id):
+    """收尾一场"**补传还没传完**"的会议（进程重启后 `_state` 已经丢了的那种）。
+
+    只有客户端**明说收尾**（`stop`）才允许走到这里 —— 这也是"**没传完不许转写**"的
+    唯一出口：段收得再多也不转写，一定要等这个 `stop`（否则转写拿到的是半场音频，
+    用户看到"纪要少了一半"，比没有更糟）。
+
+    与 `stop_meeting` 里"正在录"那条路**共用同一套落盘/入库/起转写语义**（段列表取
+    meta ∪ 目录、结束时间用客户端的 `clientEndedAt`、服务端收尾时刻另记 `stoppedAt`、
+    库里记 transcribing）；区别只有两个：没有 recorder 要释放、也没有 `_state` 要清
+    （它本来就没在录）。
+
+    返回 `(ok, message)`；没有这样一场（或它已经收尾）→ `None`（调用方按既有语义回话）。
+    """
+    found = _uploading_meeting_for(client_id)
+    if not found:
+        return None
+    name, folder, meta = found
+    now = _now_stamp()
+    # 段列表 = meta 里记的 **∪ 目录里真的有的**（与 `stop_meeting` 同一口径：手工拷进来的
+    # 段也算，别在收尾时静默漏掉半场音频）。同一个段号两种后缀只留一份，且**以 wav 为准**：
+    # `segment_files()` 对同号是 flac 在前、wav 在后，dict 后写覆盖前写，正好与
+    # `audiofile.resolve_segment()` 的优先级（原件 wav 优先）一致。
+    by_seq = {}
+    for s in list(meta.get("segments") or []) + list(audiofile.segment_files(folder)):
+        try:
+            by_seq[int(str(s).split(".")[0])] = s
+        except (TypeError, ValueError):
+            continue
+    segs = [by_seq[k] for k in sorted(by_seq)]
+    meta["segments"] = segs
+    meta["stoppedAt"] = now
+    client_end = _parse_client_stamp(meta.get("clientEndedAt"))
+    meta["end"] = client_end or now
+    # 收尾了 → **从这一刻起不再收段**（`_apply_segment` 只认这个标记）。
+    # 必须与 `end` 同一次写盘：先写 end 再清标记的话，中间崩一下就会留下
+    # "已经收尾、却还准收段"的一场。
+    meta.pop(UPLOADING_KEY, None)
+    meta["durationSeconds"] = sum(
+        audiofile.audio_seconds(_resolve_seg_paths(folder, [s]).get(s) or
+                                os.path.join(folder, s))
+        for s in segs)
+    _save_meta(folder, meta)
+    meeting = db.get_meeting_by_name(name)
+    origin = _event_origin(folder, meta)
+    if not segs:
+        err = "补传收尾时一个音频段都没收到"
+        if meeting:
+            db.update_meeting(meeting["id"], ended_at=meta["end"], duration_seconds=0,
+                              segments=0, status="error",
+                              error="没有录到音频：%s" % err)
+        if not _state["active"]:
+            # 只有"当前没在录"时才把原因挂到全局状态上：别把一场补传的失败原因
+            # 写到另一场**正在录**的会议头上（面板会显示成"本场录音出错"）。
+            _state.update(error=err)
+        db.add_event("meeting_stopped", {"meeting": name, "error": err, "origin": origin})
+        db.add_log("error", "meeting", "补传收尾但没有音频（%s）：%s" % (name, err))
+        return False, "没有录到音频：%s" % err
+    if meeting:
+        db.update_meeting(meeting["id"], ended_at=meta["end"],
+                          duration_seconds=meta["durationSeconds"],
+                          segments=len(segs), status="transcribing", error="")
+    threading.Thread(target=_transcribe_meeting, args=(folder,), daemon=True).start()
+    db.add_event("meeting_stopped", {"meeting": name, "origin": origin})
+    db.add_log("info", "meeting", "补传收尾（续传完成），开始转写: %s" % name)
+    return True, name
+
+
 def stop_meeting(client_id=""):
     """停止录音 → **照既有流程发起转写**（"收尾即转写"：补传的音频要能出文字就靠这一步）。
 
@@ -1736,14 +1927,30 @@ def stop_meeting(client_id=""):
     **不传 `client_id` 时行为与以前逐字节相同**（面板按钮、`meeting-record` 技能、
     暂停恢复那条路都不传它）；对不上时的拒绝理由要**说清是"对不上号"**，
     别用"没有进行中的会议"那种话 —— 那句话在客户端眼里是"这场早就停过了，算成功"。
+
+    2026-10-19 补一档（真机 409 的另一半）：**当前没有在录，但带 `clientId` 的那场
+    补传还没传完**（进程重启过）→ 走 `_finish_upload_session()` 把它正常收尾并起转写。
+    否则客户端收尾时只会听到"没有进行中的会议"（它把这句当成"早就停过了"→ 算成功），
+    音频在盘上、却**永远不会被转写**。
     """
     with _state_lock:
         cid = str(client_id or "").strip()
-        if cid and _state["active"] and cid != str(_state.get("client_id") or "").strip():
-            # 正在录的是**别人**那一场：拒绝收尾（护栏），并且**一个字节都不动**。
+        if _state["active"] and cid and cid != str(_state.get("client_id") or "").strip():
+            # 正在录的是**另一场**：绝不碰它（护栏）。但"另一台设备补传来了自己的收尾"
+            # 这件事仍然成立 —— 它自己那场（如果还没传完）照常收尾，两件事互不影响。
+            finished = _finish_upload_session(cid)
+            if finished is not None:
+                return finished
+            # 不是它的场：拒绝收尾（护栏），并且**一个字节都不动**。
             return False, ("这场会议不是 clientId=%s 那一场（服务端正在录别的会），"
                            "已拒绝收尾：不会停掉别人的会议" % cid)
         if not _state["active"]:
+            # 没在录：可能是一场**补传还没传完**的会（进程重启过，`_state` 丢了）。
+            # 只认"客户端带着自己的 clientId 来收尾"这一种 —— 不带 clientId 的 stop
+            # （面板/技能）行为照旧，绝不去替别人把一场补传结掉。
+            finished = _finish_upload_session(cid)
+            if finished is not None:
+                return finished
             return False, "没有进行中的会议"
         recorder = _state["recorder"]
         folder = _state["folder"]
@@ -1808,6 +2015,10 @@ def stop_meeting(client_id=""):
             audiofile.audio_seconds(_resolve_seg_paths(folder, [s]).get(s) or
                                     os.path.join(folder, s))
             for s in segs)
+        # 收尾了 → **从这一刻起不再收段**（`_apply_segment` 只认这个标记）。
+        # 必须与 `end`/`segments` **同一次写盘**：清晚一步，stop 之后来的 seq=4
+        # 就能被写进这场已经收尾（甚至已经转写好）的会议里。
+        meta.pop(UPLOADING_KEY, None)
         with open(meta_path, "w", encoding="utf-8") as f:
             json.dump(meta, f, ensure_ascii=False, indent=2)
         _state["folder"] = None
