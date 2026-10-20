@@ -79,7 +79,9 @@ def _run_ps(work, name, body, env_extra=None):
     proc = subprocess.run(
         [_powershell(), "-NoProfile", "-ExecutionPolicy", "Bypass",
          "-File", str(script)],
-        capture_output=True, env=env, timeout=120)
+        # 超时给得宽一点：这类用例真的起 powershell.exe，而门禁常与录音/安卓构建同时跑，
+        # 120 秒在忙机子上会偶发超时（2026-10-20 实测一次：跑满 120 秒被判失败，单跑 8 秒就过）。
+        capture_output=True, env=env, timeout=300)
     stdout = proc.stdout.decode("utf-8", "replace")
     stderr = proc.stderr.decode("utf-8", "replace")
     if proc.returncode != 0:
