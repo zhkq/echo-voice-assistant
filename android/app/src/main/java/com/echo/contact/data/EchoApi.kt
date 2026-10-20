@@ -1,5 +1,6 @@
 package com.echo.contact.data
 
+import com.echo.contact.data.dto.CommandItem
 import com.echo.contact.data.dto.CommandListResponse
 import com.echo.contact.data.dto.CommandRequest
 import com.echo.contact.data.dto.CommandResponse
@@ -55,7 +56,22 @@ interface EchoApi {
 
     /** 发一条文字指令给智能体。 */
     @POST("api/assistant/command")
-    suspend fun sendCommand(@Body body: CommandRequest): Response<CommandResponse>
+    suspend fun sendCommand(
+        @Body body: CommandRequest,
+        /**
+         * **上下文标记**（可选；`null` = 不发这个 query，老服务端/普通指令行为不变）。
+         *
+         * 回顾那一场传 `REVIEW_CONTEXT`（`"review"`）：服务端把这一轮记成
+         * `commands.source='review'`，于是它进「回顾历史」、**不进**「指令历史」。
+         * 标签不改执行 —— 指令照样发给智能体，手机照样拿结果。
+         */
+        @Query("context") context: String? = null,
+        /**
+         * **同一轮的幂等键**（可选）：同一轮被重发时服务端认出"这轮已经记过了"，
+         * 不会再产生第二条回顾记录（见 `ReviewConversation.REVIEW_REQUEST_ID`）。
+         */
+        @Query("requestId") requestId: String? = null,
+    ): Response<CommandResponse>
 
     /**
      * **语音一步到位**：裸 wav 字节当 body（`Content-Type: audio/wav`）→ 服务端转写 + 下发，
@@ -65,7 +81,13 @@ interface EchoApi {
      * multipart）。这跟 `/api/stt/transcribe` 正好相反 —— 那条才是 multipart。
      */
     @POST("api/assistant/voice-command")
-    suspend fun voiceCommand(@Body body: RequestBody): Response<VoiceCommandResponse>
+    suspend fun voiceCommand(
+        @Body body: RequestBody,
+        /** 同 [sendCommand]：回顾这一场的一轮传 `REVIEW_CONTEXT`；`null` 时不带这个 query。 */
+        @Query("context") context: String? = null,
+        /** 同 [sendCommand]：同一轮的幂等键。 */
+        @Query("requestId") requestId: String? = null,
+    ): Response<VoiceCommandResponse>
 
     /**
      * 拉指令历史（取最近若干条，含状态）。后端 `limit` 上限 500。
@@ -76,6 +98,16 @@ interface EchoApi {
      */
     @GET("api/commands")
     suspend fun listCommands(@QueryMap params: Map<String, String>): Response<CommandListResponse>
+
+    /**
+     * 按 id 取**一条**指令（含 status/reply/brief/speakText/origin）。
+     *
+     * 为什么回顾那一场必须用它：回顾轮次落 `source='review'`、**不进** `GET /api/commands`
+     * 列表（那是指令历史，两处不能重复）。可这一轮的结果还得取 —— 所以服务端留了
+     * 这一条"按 id 取一条"的路（普通指令也可以用它，但既有那条按列表认领的路没变）。
+     */
+    @GET("api/commands/{cmdId}")
+    suspend fun commandResult(@Path("cmdId") cmdId: Int): Response<CommandItem>
 
     /** 某条指令落到的 DSH 会话内容。 */
     @GET("api/commands/{cmdId}/session")

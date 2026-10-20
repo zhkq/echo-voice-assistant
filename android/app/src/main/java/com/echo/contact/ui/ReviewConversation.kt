@@ -18,14 +18,54 @@ package com.echo.contact.ui
  *  1. **开始不碰麦**：手机点"开始"只建会话；真正开麦的是"按住说话"那一轮
  *     （走**唯一**那处 `startRecording`，用**手机的麦**）。
  *  2. **继续交互走既有指令链**：语音 `voice-command` / 文字 `assistant/command` ——
- *     回顾自己**没有**第二条录音路。
- *  3. **这场对话不进"回顾历史"**：回顾历史只读 `commands.source='review'`，
- *     而手机这两条路落的是 `source='mobile'` —— 所以结束之后用「刚才那一场」
- *     只读卡兜住它，并写明"每一轮都在「指令」历史里"（[REVIEW_LAST_ROUNDS_NOTE]）。
+ *     回顾自己**没有**第二条录音路。但每一轮都带 [REVIEW_CONTEXT]：
+ *     服务端据此把它记成 `commands.source='review'` —— **回顾轮次属于回顾**，
+ *     于是它进「回顾历史」、**不再**在「指令历史」里重复一遍
+ *     （用户 2026-10-20：*"回顾的历史对话，指令里也有能不重复吗？"*）。
+ *  3. **标签不改执行**：带不带这个标记，指令照样发给智能体、结果照样回来；
+ *     它只决定这一轮算哪段历史。老服务端不认这个 query → 行为退回原样
+ *     （那些轮次落 `mobile`，也就仍出现在指令历史里）。
  *
  * 这个文件刻意**不碰 Android / ViewModel**：它是纯函数，JVM 门禁里能逐条钉住
  * （Compose 在 JVM 门禁里渲染不了，"两轮不覆盖"这种事只能靠纯逻辑断言）。
  */
+
+// ---- 回顾轮次的上下文标记 / 幂等键 ---------------------------------------------------------
+
+/**
+ * 「回顾那一场的一轮」的**上下文标记**（发给服务端的 `?context=review`）。
+ *
+ * 为什么要有它：手机回顾走的是**既有指令链**，不打招呼的话服务端只能按默认记
+ * `source='mobile'` —— 于是同一句话在「回顾页 + 指令历史」出现两次，而「回顾历史」
+ * 里反倒没有（那边只读 `source='review'`）。这个标记让服务端把轮次记进回顾历史。
+ *
+ * ⚠️ 它**只是一个标签**：不带它的普通指令、一次性口述（`/daily-review/submit`）
+ * 都不许带；带了也不改变执行（见 `EchoApi.voiceCommand` / `sendCommand` 的说明）。
+ */
+internal const val REVIEW_CONTEXT = "review"
+
+/** 幂等键里不许出现的字符（服务端只收 `[A-Za-z0-9:_.-]`）。 */
+private val REVIEW_ID_UNSAFE = Regex("[^A-Za-z0-9:_.-]")
+
+/**
+ * 这一轮的**幂等键**（`"<回顾会话 id>:<本场开始时刻>:<轮次>"`）。
+ *
+ * 为什么需要：万一同一轮被发两次（重试 / 界面重放），服务端按这个键认出"这轮已经
+ * 记过了"，不会产生第二条回顾记录。键只由**这一场 + 这一轮**决定，所以两轮内容
+ * 完全相同也仍是两个键（幂等的是"这一轮"，不是"这句话"）。
+ *
+ * ⚠️ **必须带 `startedAt`**：`round` 是 ViewModel 里的计数器，App 重启后从 1 重新数，
+ * 而"今天那条回顾会话"的 `sessionId` 当天是复用的 —— 只写 `sessionId:round` 的话，
+ * 重启后第一轮会撞上重启前某一轮的键，服务端会把它当成重复而**丢一轮真内容**。
+ * 本场开始时刻（毫秒）把两场分开；同一场里它不变，所以重发仍是同一个键。
+ *
+ * 拿不到会话 / 开始时刻 / 轮次无效 → null（不发这个参数，老服务端与老通道行为不变）。
+ */
+internal fun reviewRequestId(sessionId: String, startedAt: Long, round: Long): String? {
+    val sid = sessionId.replace(REVIEW_ID_UNSAFE, "").take(80)
+    if (sid.isEmpty() || startedAt <= 0L || round <= 0L) return null
+    return "$sid:$startedAt:$round"
+}
 
 // ---- 说话人 -------------------------------------------------------------------------------
 
@@ -126,14 +166,15 @@ internal const val REVIEW_START_HINT =
     "和 PC 版一样：点开始 → 一轮轮说或打字 → 结束。录的是这台手机的麦克风，不占电脑那支。"
 
 /**
- * 「刚才那一场」卡片上的那句**边界**（服务端契约决定的，不是偷懒）。
+ * 「刚才那一场」卡片上的那句话（2026-10-20 起：这几轮**已经进回顾历史**）。
  *
- * 回顾历史只读 `commands.source='review'`，而手机这条对话（voice-command / command）
- * 落的是 `source='mobile'` —— 所以它**不会**出现在下面的「历史回顾」里。
- * 不说清的话，用户会以为"我做了一场回顾，历史里却没有 = 丢了"。
+ * 手机回顾的每一轮现在都带 `REVIEW_CONTEXT`，服务端记 `commands.source='review'`
+ * —— 也就是说它们就在**下面的「历史回顾」**里（按天看得到原文与播报），
+ * 不在「指令」历史里重复。所以这张卡只留一句**去向**，不再把整段对话重画一遍
+ * （重画一遍等于同一个页面里又看了一次同样的内容）。
  */
 internal const val REVIEW_LAST_ROUNDS_NOTE =
-    "这场对话的每一轮都在「指令」历史里；它不会出现在下面的「历史回顾」里（那边只收电脑那支麦的回顾）。"
+    "这几轮已记入回顾历史：在下面的「历史回顾」里按天可见（不再重复进「指令」历史）。"
 
 /** 一次性口述入口的定位（降级为"退路"，不是主路径）。 */
 internal const val REVIEW_DICTATE_FALLBACK =
@@ -229,7 +270,7 @@ internal fun reviewRunningLine(todayRounds: Int, sessionRounds: Int): String =
  * 把两者合成一句"已停止"就是一次假成功（[reviewStopNote] 的三态就是为此存在的）。
  */
 internal fun reviewEndedLine(rounds: Int, stopped: Boolean?): String =
-    "这场回顾已结束：本场 $rounds 轮，每一轮都在「指令」历史里" +
+    "这场回顾已结束：本场 $rounds 轮，已记入「回顾历史」" +
         "（电脑那边：${reviewStopNote(stopped)}）"
 
 // ---- 录一轮之前的闸门（复用 dictationGate 的四档口径）--------------------------------------

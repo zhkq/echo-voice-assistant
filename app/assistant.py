@@ -856,16 +856,34 @@ def _review_worker(source):
         _release_busy()
 
 
-def send_text(text, source="web", workspace=None, session_id=None):
+def send_text(text, source="web", workspace=None, session_id=None,
+              origin="", request_id=""):
     """直接发送文本命令（面板/API/skill 入口；不录音）。返回 (ok, message)。
 
     workspace/session_id 用于指定命令发送目标（工作区/具体对话）；
     都不给时沿用面板「命令目标」下拉保存的设置，没设置才回到 ECHO 默认命令会话。
+
+    `source` 是**落库标签**（`commands.source`）。手机回顾那一场会带
+    `context=review`（见 `app/api.py` 的 `_command_tag`），于是它的轮次记
+    `source='review'` —— **回顾轮次属于回顾，不属于发指令**：这样它们进
+    「回顾历史」、不再在「指令历史」里重复一遍（用户 2026-10-20 原话：
+    *"回顾的历史对话，指令里也有能不重复吗？"*）。
+
+    ⚠️ `source` **只影响标签，不改执行**：下面 `_dispatch` 该发给谁、怎么等回复、
+    怎么落 reply/brief，一条都没变。所以 `origin` 与它**分开传**：回顾轮次的
+    发起方仍是手机（`origin="mobile"`），回传/朗读口径照旧（"谁发起谁念"）。
+
+    `request_id` 是**同一轮的幂等键**（可选）：同一轮因重试被发两次时，服务端
+    按它认出"这轮已经记过了"，不会再产生第二条回顾记录（见 api.py 的
+    `_find_review_turn`）。不带它的老客户端行为不变。
     """
     if not _set_busy(source):
         return False, "已有命令流进行中，请稍候"
     try:
-        threading.Thread(target=_dispatch, args=(text, source, workspace, session_id), daemon=True).start()
+        threading.Thread(
+            target=_dispatch,
+            args=(text, source, workspace, session_id, origin, request_id),
+            daemon=True).start()
         return True, "已提交"
     finally:
         _release_busy()
@@ -947,19 +965,43 @@ def _command_origin(source):
 
     **认不出来就按 `pc`**（保守取向）：宁可**不打扰手机**，也不要让电脑上敲的指令
     在手机上响一声；两种错的代价不对称（手机那一下是打扰，漏一条他还能回面板看）。
+
+    ⚠️ 这是**兜底判据**，不是"source 决定发起方"：`source` 只是落库标签，
+    手机回顾轮次记 `review`（回顾轮次属于回顾），而它仍是手机发起的 ——
+    所以 `send_text`/`_dispatch` 的 `origin` 是**显式入参**，没给才走这里。
     """
     return ("mobile" if str(source or "").strip().lower() == "mobile" else "pc")
 
 
-def _dispatch(text, source, workspace=None, session_id=None):
-    """发送到 DSH + 等回复 + 简报 + 历史。"""
+def _dispatch(text, source, workspace=None, session_id=None,
+              origin="", request_id=""):
+    """发送到 DSH + 等回复 + 简报 + 历史。
+
+    `source` 是 `commands.source` 的落库标签，`origin` 是**发起方**
+    （`mobile` / `pc`）。两者**不是一回事**：手机回顾那一场的轮次记
+    `source='review'`（它们属于回顾历史），但发起方仍是手机 —— 所以
+    `origin` 由调用方显式给，没给才按 `source` 推（`_command_origin`）。
+    ⚠️ 标签不影响执行：下面发给 DSH、等回复、写 reply/brief 的流程与以前逐字一致。
+    """
     cfg = settings
     set_phase("running")   # 已进入"发给 DSH 等回复"阶段（打字命令直接从这一步开始）
+    # 发起方要**先**定下来：它要跟指令行一起落库（`meta.origin`），
+    # 供 `/api/commands/{id}`（手机回顾轮次按 id 取结果）继续用同一个口径，
+    # 而不是拿 source='review' 去猜（那会猜成 pc，手机就不念这一轮的回复了）。
+    origin = str(origin or "").strip().lower()
+    if origin not in ("mobile", "pc"):
+        origin = _command_origin(source)
     client = get_client()
     # 语音路径（媒体键/唤醒/麦克风按钮）不带目标 → 沿用面板「命令目标」下拉保存的选择
     if not workspace and not session_id:
         workspace, session_id = _configured_command_target(client)
-    meta = {"workspace": workspace, "session_id": session_id}
+    meta = {"workspace": workspace, "session_id": session_id, "origin": origin}
+    if str(source or "").strip().lower() == "review":
+        # 显式记下"这是回顾轮次"（与 `daily_review._persist` 的 meta 同一套语义），
+        # 排障时一眼能分清"电脑那支麦的回顾"与"手机回顾这一场"。
+        meta["context"] = "review"
+    if request_id:
+        meta["requestId"] = str(request_id)
     backend = _agent_snapshot()
     if backend:
         meta["backend"] = backend
@@ -1031,10 +1073,8 @@ def _dispatch(text, source, workspace=None, session_id=None):
         db.update_command(cmd_id, status="done", reply=reply, brief=spoken,
                           duration_ms=duration)
         db.add_log("info", "assistant", f"完成({duration}ms)，简报: {spoken[:80]}")
-        # `origin` 与 `command_received` 里的 `source` **同源**（都是本函数这个 `source`，
-        # 也就是写进 `commands.source` 的那个值）—— 不另查一遍库，是为了让它俩
-        # **不可能**对不上：手机能照 `command_received.source` 判断该不该提醒。
-        origin = _command_origin(source)
+        # `origin` 在函数开头就定了（并随指令行落库）。这里**不再**重新推一遍：
+        # 回顾轮次的 source='review' 推不出发起方（会推成 pc），而它明明是手机发起的。
         # `speakText` 是**新增键**（既有键一个都没动）：手机拿到后直接念，
         # 不必再自己对 `reply` 切一刀 —— 那一刀正是这次"念了详情"的来源。
         db.add_event("command_done", {"id": cmd_id, "origin": origin,

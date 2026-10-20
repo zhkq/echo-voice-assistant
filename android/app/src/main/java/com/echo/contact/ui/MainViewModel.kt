@@ -884,9 +884,10 @@ class MainViewModel(app: Application) : BaseViewModel(app) {
     //  * **兜底不删**：一次性口述（`startReviewDictation` + `submitReviewDictation`）留着，
     //    它降级成"不想开一场回顾时的退路"。
     //
-    // 为什么这场对话不进"历史回顾"：那边只读 `commands.source='review'`，而手机这两条
-    // 指令链落的是 `source='mobile'` —— 所以结束之后用「刚才那一场」只读卡兜住它，
-    // 卡上写明"每一轮都在「指令」历史里"（`REVIEW_LAST_ROUNDS_NOTE`）。
+    // 2026-10-20（用户："回顾的历史对话，指令里也有能不重复吗？"）：这一场每一轮都带
+    // `context=review` → 服务端记 `commands.source='review'`，于是它们**进「回顾历史」、
+    // 不进「指令历史」**；但执行一个字都没变（标签只是标签）。代价是这些轮次不在
+    // `GET /api/commands` 列表里了，所以这一场的轮询改走 `GET /api/commands/{id}`。
 
     /** 这一场手机回顾；null = 还没开始（或没读到）。 */
     private val _reviewSession = MutableStateFlow<ReviewSession?>(null)
@@ -908,6 +909,19 @@ class MainViewModel(app: Application) : BaseViewModel(app) {
      */
     private val _reviewEnded = MutableStateFlow(false)
     val reviewEnded: StateFlow<Boolean> = _reviewEnded.asStateFlow()
+
+    /**
+     * 本场回顾里"这一轮"的**幂等键**（拿不到本场就 null）。
+     *
+     * 由 `sessionId + 本场开始时刻 + round` 组成 —— **必须带本场开始时刻**：
+     * `round` 是进程内计数器，App 重启后从 1 重数，而"今天那条回顾会话"的 id
+     * 当天是复用的；只写 `sessionId:round` 会让重启后的第一轮撞上重启前某一轮的键，
+     * 服务端就会把这一轮当成重复而**丢掉真内容**（详见 `reviewRequestId`）。
+     */
+    private fun reviewRequestIdFor(round: Long): String? {
+        val s = _reviewSession.value ?: return null
+        return reviewRequestId(s.sessionId, s.startedAt, round)
+    }
 
     /**
      * 盯 `_submit` 的那个收集器（**一场一个**）。
@@ -1327,6 +1341,9 @@ class MainViewModel(app: Application) : BaseViewModel(app) {
                 "$line；没能通知电脑停止：$failed"
             }
             loadReview()
+            // 这一场的轮次现在记在 `source='review'` 里 —— 结束之后把它们拉进
+            // 「历史回顾」列表，「刚才那一场」那句话才不会说空（列表不能停在开页那一刻）。
+            loadReviewDays()
         }
     }
 
@@ -1354,7 +1371,8 @@ class MainViewModel(app: Application) : BaseViewModel(app) {
         }
         _reviewSessionNote.value = null
         _dictateNote.value = null
-        if (startRecording(asCommand = true)) return true
+        // 带 `REVIEW_CONTEXT`：这一轮记进回顾历史（不在指令历史里重复），执行照旧。
+        if (startRecording(asCommand = true, context = REVIEW_CONTEXT)) return true
         // 麦真的建不起来：这一轮已经以"失败"落到 `_submit`（收集器会把原因追加进对话），
         // 这里再按现场状态给顶部一句 —— 两边说的是同一件事，不各编一份
         _reviewSessionNote.value = micFailReason(
@@ -1571,6 +1589,10 @@ class MainViewModel(app: Application) : BaseViewModel(app) {
      * 文字这条路不回 `commandId`（只有 `/assistant/voice-command` 才回），
      * 所以靠"发送前的最大 id + 文本 + source=mobile"认领新出现的那一行（见 [pickSubmitted]）。
      *
+     * [context]：`REVIEW_CONTEXT` = 这是**回顾那一场的一轮**。服务端据此记
+     * `source='review'`（进回顾历史、不进指令历史）；标签不改执行，指令照样发。
+     * 普通指令（指令页/首页/语音）**不传**（`null` = 不带这个 query，老行为不变）。
+     *
      * ## 2026-10-18 真机 bug 之后的两处硬规矩
      *
      * ① **不许静默 return**（原来的 `if (trimmed.isEmpty()) return` 与
@@ -1581,8 +1603,9 @@ class MainViewModel(app: Application) : BaseViewModel(app) {
      *    通过 `id > maxIdBefore`，然后被当成本次结果（旧数据顶替）。
      * ③ 一次点击 = 一轮（[nextRoundId]）：迟到的回包不许写别人的轮次。
      */
-    fun sendCommand(text: String) {
+    fun sendCommand(text: String, context: String? = null) {
         val trimmed = text.trim()
+        val reviewTurn = context == REVIEW_CONTEXT
         when (val gate = sendGate(trimmed, _submit.value.phase, paired = _baseUrl.value.isNotBlank())) {
             is SendGate.Blocked -> {
                 // **必须说**：这一下真的没发出去，一个请求都没发
@@ -1610,7 +1633,13 @@ class MainViewModel(app: Application) : BaseViewModel(app) {
             try {
                 // ⚠️ 下界必须在**发送之前**取：发送之后电脑那边已经有这一行了
                 val maxIdBefore = claimFloorId()
-                val resp = api().sendCommand(CommandRequest(text = trimmed, source = "mobile"))
+                // 同一轮的幂等键（只在回顾那一场用）：重发不会记成两条回顾
+                val requestId = if (reviewTurn) reviewRequestIdFor(round) else null
+                val resp = api().sendCommand(
+                    CommandRequest(text = trimmed, source = "mobile"),
+                    context = if (reviewTurn) REVIEW_CONTEXT else null,
+                    requestId = requestId,
+                )
                 val body = resp.body()
                 if (resp.isSuccessful && body?.ok == true) {
                     writeRound(round) {
@@ -1620,7 +1649,19 @@ class MainViewModel(app: Application) : BaseViewModel(app) {
                         )
                     }
                     if (!ownsRound(_submit.value, round)) return@launch
-                    pollJob = launch { awaitResult(trimmed, maxIdBefore, roundId = round) }
+                    // 回顾轮次**不在** `/api/commands` 列表里（它们属于回顾历史），
+                    // 所以要按 id 取结果。老服务端不认 context（`source` 不是 review）
+                    // → 退回原来的"按文本认领"，那种情况下它仍是 mobile、列表里有。
+                    val reviewCmdId = if (reviewTurn && body.source == REVIEW_CONTEXT) {
+                        body.commandId
+                    } else {
+                        null
+                    }
+                    pollJob = if (reviewCmdId != null) {
+                        launch { awaitReviewResult(reviewCmdId, roundId = round) }
+                    } else {
+                        launch { awaitResult(trimmed, maxIdBefore, roundId = round) }
+                    }
                     return@launch
                 }
                 // ok=false 也是**有原因**的（例如"已有命令流进行中，请稍候"），要原样显示
@@ -1686,6 +1727,15 @@ class MainViewModel(app: Application) : BaseViewModel(app) {
     /** 这一次录音是"发指令"（true）还是"口述回顾"（false）—— 决定失败原因写到哪张卡上。 */
     private var recordAsCommand = true
 
+    /**
+     * 这一次录音的**上下文标记**（`REVIEW_CONTEXT` = 手机回顾那一场的一轮；null = 普通）。
+     *
+     * 由 [startRecording] 的 `context` 入参写入，[finishRecording] 上传时带给服务端
+     * （`?context=review`）—— 于是这一轮记进回顾历史、不在指令历史里重复。
+     * 一次性口述（`startReviewDictation`）**不带**：它走 `/daily-review/submit`。
+     */
+    private var recordContext: String? = null
+
     /** 开录前清掉「上一轮」——**只**给发指令那条路（回顾口述不许混进 `_submit`）。 */
     private fun beginCommandRound() {
         _voiceText.value = ""
@@ -1709,12 +1759,16 @@ class MainViewModel(app: Application) : BaseViewModel(app) {
      * （不新造录音路），区别只在"失败原因写到哪张卡上"：
      * 回顾口述不碰 `_submit` —— 那是"发指令"那一轮的地方。
      *
+     * [context] = 这一轮属于哪段上下文（`REVIEW_CONTEXT` = 手机回顾那一场的一轮）。
+     * 只有 [startReviewRound] 会传它；普通语音与一次性口述都是 null（不带标记）。
+     *
      * 回顾那条路的判定（权限/占用/已经在录）在 [startReviewDictation] 里，**不在这里**：
      * 这里只管"真的去开麦"，这样它的函数体里一个 `_submit` / `_speakNote` 都不出现。
      */
-    fun startRecording(asCommand: Boolean = true): Boolean {
+    fun startRecording(asCommand: Boolean = true, context: String? = null): Boolean {
         if (_recording.value) return true
         recordAsCommand = asCommand
+        recordContext = context
         _dictateNote.value = null
         if (asCommand) beginCommandRound()
         // 用户在「设置 → 设备」里指定的那支麦（null = 跟随系统）。取不到就跟随系统 ——
@@ -1821,6 +1875,10 @@ class MainViewModel(app: Application) : BaseViewModel(app) {
         }
         recordTicker?.cancel()
         _recording.value = false
+        // 这一轮的上下文（回顾那一场 = `REVIEW_CONTEXT`；普通语音 = null）。
+        // 取完就清掉：它只属于**这一次**录音，不能漏给下一条。
+        val context = recordContext
+        recordContext = null
         val recordedMs = recorder.elapsedMs()
         val wav = recorder.stop()
         if (wav == null) {
@@ -1844,7 +1902,15 @@ class MainViewModel(app: Application) : BaseViewModel(app) {
                 // 但老电脑不回 commandId，退回文本认领时不能再用 0 当下界（那是"认领任何一行"）。
                 val maxIdBefore = claimFloorId()
                 val body = wav.toRequestBody("audio/wav".toMediaType())
-                val resp = api().voiceCommand(body)
+                // 回顾那一场的一轮：带 `context=review`（服务端记 source='review' → 进
+                // 回顾历史、不进指令历史）+ 同一轮的幂等键。普通语音两个都不带（老行为不变）。
+                val reviewTurn = context == REVIEW_CONTEXT
+                val requestId = if (reviewTurn) reviewRequestIdFor(round) else null
+                val resp = api().voiceCommand(
+                    body,
+                    context = if (reviewTurn) REVIEW_CONTEXT else null,
+                    requestId = requestId,
+                )
                 val b = resp.body()
                 if (!resp.isSuccessful || b?.ok != true) {
                     val msg = if (resp.isSuccessful) {
@@ -1874,12 +1940,19 @@ class MainViewModel(app: Application) : BaseViewModel(app) {
                     )
                 }
                 if (!ownsRound(_submit.value, round)) return@launch
-                awaitResult(
-                    text = heard,
-                    maxIdBefore = maxIdBefore,
-                    targetId = b.commandId,
-                    roundId = round,
-                )
+                // 回顾轮次不在 `/api/commands` 列表里（它们属于回顾历史）→ 按 id 取结果。
+                // 老服务端不认 context（`source` 不是 review）→ 退回原来的列表认领，
+                // 那种情况下这一轮仍是 mobile、列表里有它。
+                if (reviewTurn && b.source == REVIEW_CONTEXT && b.commandId != null) {
+                    awaitReviewResult(b.commandId, roundId = round)
+                } else {
+                    awaitResult(
+                        text = heard,
+                        maxIdBefore = maxIdBefore,
+                        targetId = b.commandId,
+                        roundId = round,
+                    )
+                }
                 // 语音进来的就**念出来**（这是语音交互的意义所在）；打字那条不自动念。
                 // 念的是 `speak`（**给耳朵的那段**：电脑给的 speakText，或老电脑的开头摘要），
                 // **不是** `reply`（整篇，给眼睛看的）—— 以前这里念 `reply`，于是手机把详情也读了
@@ -1909,6 +1982,7 @@ class MainViewModel(app: Application) : BaseViewModel(app) {
     fun cancelRecording(asCommand: Boolean = true) {
         recordTicker?.cancel()
         _recording.value = false
+        recordContext = null          // 取消的这一轮没发出去，上下文不许留给下一条
         recorder.cancel()
         _recordMs.value = 0
         if (asCommand) {
@@ -1956,37 +2030,7 @@ class MainViewModel(app: Application) : BaseViewModel(app) {
                 }
                 if (hit != null) {
                     seen = hit
-                    when (hit.status) {
-                        "done", "failed" -> {
-                            val failed = hit.status == "failed"
-                            writeRound(roundId) {
-                                it.copy(
-                                    phase = if (failed) SubmitPhase.Failed else SubmitPhase.Done,
-                                    cmdId = hit.id,
-                                    reply = hit.reply.orEmpty(),
-                                    // 念哪一段**只在这里判一次**（有 speakText 就念它，老电脑只念开头摘要，
-                                    // 电脑发起的任务不念）—— 详情留在 `reply` 给眼睛，不进耳朵。
-                                    speak = SpeakPlan.decide(hit).orEmpty(),
-                                    error = hit.error.orEmpty(),
-                                    message = if (failed) {
-                                        hit.error?.takeIf { it.isNotBlank() } ?: "执行失败"
-                                    } else {
-                                        "耗时 ${"%.1f".format((hit.durationMs ?: 0) / 1000.0)} 秒"
-                                    },
-                                )
-                            }
-                            return
-                        }
-                        "running" -> writeRound(roundId) {
-                            it.copy(phase = SubmitPhase.Running, cmdId = hit.id, message = "正在执行…")
-                        }
-                        "sent" -> writeRound(roundId) {
-                            it.copy(phase = SubmitPhase.Accepted, cmdId = hit.id, message = "已发送，等待执行…")
-                        }
-                        else -> writeRound(roundId) {
-                            it.copy(phase = SubmitPhase.Accepted, cmdId = hit.id, message = "排队中…")
-                        }
-                    }
+                    if (applyCommandHit(hit, roundId)) return
                     // 进了"这一行还没结论"的分支后，如果这一轮已经被新的点击顶掉，也就别再轮询了
                     if (roundId != 0L && !ownsRound(_submit.value, roundId)) return
                 }
@@ -2001,6 +2045,90 @@ class MainViewModel(app: Application) : BaseViewModel(app) {
                 speak = "",
                 message = if (seen == null) {
                     "已提交，但一直没等到执行记录（点右上角刷新看看）"
+                } else {
+                    "等了 ${RESULT_TIMEOUT_MS / 1000} 秒还没结论（后端最长等 300 秒，稍后再刷新）"
+                },
+            )
+        }
+    }
+
+    /**
+     * 把"这一行有结论/没结论"写进这一轮。返回 true = 已有结论（调用方该收工）。
+     *
+     * 为什么抽出来：普通指令从**列表**里认领，回顾轮次从**按 id 取**的那一条认领
+     * （它们不在指令历史列表里）。两条路的 status 映射、`speakText` 取值、
+     * 耗时文案必须**逐字一致** —— 各写一份迟早漂成"回顾的回复不念了"。
+     */
+    private fun applyCommandHit(hit: CommandItem, roundId: Long): Boolean {
+        when (hit.status) {
+            "done", "failed" -> {
+                val failed = hit.status == "failed"
+                writeRound(roundId) {
+                    it.copy(
+                        phase = if (failed) SubmitPhase.Failed else SubmitPhase.Done,
+                        cmdId = hit.id,
+                        reply = hit.reply.orEmpty(),
+                        // 念哪一段**只在这里判一次**（有 speakText 就念它，老电脑只念开头摘要，
+                        // 电脑发起的任务不念）—— 详情留在 `reply` 给眼睛，不进耳朵。
+                        speak = SpeakPlan.decide(hit).orEmpty(),
+                        error = hit.error.orEmpty(),
+                        message = if (failed) {
+                            hit.error?.takeIf { it.isNotBlank() } ?: "执行失败"
+                        } else {
+                            "耗时 ${"%.1f".format((hit.durationMs ?: 0) / 1000.0)} 秒"
+                        },
+                    )
+                }
+                return true
+            }
+            "running" -> writeRound(roundId) {
+                it.copy(phase = SubmitPhase.Running, cmdId = hit.id, message = "正在执行…")
+            }
+            "sent" -> writeRound(roundId) {
+                it.copy(phase = SubmitPhase.Accepted, cmdId = hit.id, message = "已发送，等待执行…")
+            }
+            else -> writeRound(roundId) {
+                it.copy(phase = SubmitPhase.Accepted, cmdId = hit.id, message = "排队中…")
+            }
+        }
+        return false
+    }
+
+    /**
+     * 盯住**一条已知 id** 的指令，直到它 `done`/`failed` 或超时。
+     *
+     * 回顾那一场必须走这条：那些轮次落 `source='review'`、**不进** `/api/commands`
+     * 列表（它们属于回顾历史）—— 再按列表/文本去认领就永远找不到，手机就会一直
+     * "正在执行…"。服务端为此留了 `GET /api/commands/{id}`。
+     *
+     * 与 [awaitResult] 的区别只有"从哪儿取"：这里**不刷新指令列表**（回顾轮次本来
+     * 就不该出现在列表里），状态映射与超时话术复用 [applyCommandHit]（单一出处）。
+     */
+    private suspend fun awaitReviewResult(cmdId: Int, roundId: Long = 0L) {
+        val deadline = System.currentTimeMillis() + RESULT_TIMEOUT_MS
+        var seen: CommandItem? = null
+        while (System.currentTimeMillis() < deadline) {
+            if (roundId != 0L && !ownsRound(_submit.value, roundId)) return
+            val hit = try {
+                val resp = api().commandResult(cmdId)
+                if (resp.isSuccessful) resp.body() else null
+            } catch (_: Exception) {
+                null   // 单次失败不该中断整条等待（与 awaitResult 同口径）
+            }
+            if (hit != null) {
+                seen = hit
+                if (applyCommandHit(hit, roundId)) return
+                if (roundId != 0L && !ownsRound(_submit.value, roundId)) return
+            }
+            delay(POLL_INTERVAL_MS)
+        }
+        writeRound(roundId) {
+            it.copy(
+                phase = SubmitPhase.Failed,
+                reply = "",
+                speak = "",
+                message = if (seen == null) {
+                    "已提交，但一直没等到这一轮的记录（点右上角刷新看看）"
                 } else {
                     "等了 ${RESULT_TIMEOUT_MS / 1000} 秒还没结论（后端最长等 300 秒，稍后再刷新）"
                 },

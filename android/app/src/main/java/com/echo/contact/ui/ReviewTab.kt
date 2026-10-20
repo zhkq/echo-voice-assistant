@@ -450,8 +450,9 @@ fun ReviewTab(vm: MainViewModel) {
         // 用户 2026-10-19 澄清："我是说跟 pc 版的交互一样，开始回顾开始然后继续交互"。
         // 所以这一块不是"录一段长口述"，而是一场**对话**。三块互斥：
         //  · 没开始 / 已结束 → **开始卡**（按钮 + 原因）；"失败"与"结束那句"都落在这里；
-        //  · 已结束 → 再加一张「刚才那一场」**只读卡**（这场对话不进下面的历史回顾，
-        //    见 REVIEW_LAST_ROUNDS_NOTE —— 服务端只收 source='review' 的行）；
+        //  · 已结束 → 再加一张「刚才那一场」**只读卡**（只写一句去向：这几轮已记入
+        //    下面的「历史回顾」，见 REVIEW_LAST_ROUNDS_NOTE —— 2026-10-20 起手机
+        //    回顾轮次带 context=review，服务端记 source='review'，回顾历史会收到它们）；
         //  · 进行中 → 顶部「回顾进行中」+ 轮数 + 结束按钮，下面是一来一回的消息，
         //    最下面是输入条（打字 → 既有 sendCommand；按住说话 → 这一轮）。
         if (!reviewActive) {
@@ -488,8 +489,10 @@ fun ReviewTab(vm: MainViewModel) {
                         val text = reviewInput.trim()
                         if (text.isNotEmpty()) {
                             reviewInput = ""
-                            // 继续交互走**既有**指令链（这条注释与 EchoApi 的说明是同一套）
-                            vm.sendCommand(text)
+                            // 继续交互走**既有**指令链（这条注释与 EchoApi 的说明是同一套）。
+                            // 带 context=review：服务端把这一轮记进回顾历史（回顾轮次属于
+                            // 回顾，不属于发指令）—— 于是回顾页与指令历史不再各有一份。
+                            vm.sendCommand(text, context = REVIEW_CONTEXT)
                         }
                     },
                     submit = roundSubmit,
@@ -1115,9 +1118,11 @@ private fun ReviewRoundInputBar(
 /**
  * 结束之后的**只读卡**：「刚才那一场」。
  *
- * 为什么必须有：这场对话走的是 `voice-command`/`command`，服务端落的是 `source='mobile'`，
- * 而回顾历史只读 `source='review'` —— 所以它不会出现在下面的「历史回顾」里。
- * 不在界面上兜住，用户会以为"刚做的一场丢了"（[REVIEW_LAST_ROUNDS_NOTE] 就是这句话）。
+ * 2026-10-20 起这张卡**只留一句去向**、不再把整段对话重画一遍：
+ * 手机回顾的每一轮带 `context=review`、服务端记 `source='review'`，
+ * 所以它们就在**下面的「历史回顾」**里（按天看得到原文与播报）。
+ * 同一页里再画一遍整段对话，等于让用户再看一次同样的内容（用户原话：
+ * *"回顾的历史对话，指令里也有能不重复吗？"* —— 页内重复也是重复）。
  */
 @Composable
 private fun ReviewLastSessionCard(session: ReviewSession) {
@@ -1128,11 +1133,7 @@ private fun ReviewLastSessionCard(session: ReviewSession) {
                 dotColor = EchoPalette.Muted,
                 trailing = "本场 ${session.rounds} 轮",
             )
-            session.messages.forEach { m ->
-                Spacer(Modifier.height(6.dp))
-                ReviewMessageRow(m)
-            }
-            Spacer(Modifier.height(8.dp))
+            Spacer(Modifier.height(6.dp))
             MutedLine(REVIEW_LAST_ROUNDS_NOTE, maxLines = 4)
         }
     }

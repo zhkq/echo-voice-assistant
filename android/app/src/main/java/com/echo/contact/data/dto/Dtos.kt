@@ -44,10 +44,22 @@ data class CommandRequest(
     @SerializedName("session_id") val sessionId: String = "",
 )
 
-/** `POST /api/assistant/command` 的响应体——只有 `{ok, message}`。 */
+/**
+ * `POST /api/assistant/command` 的响应体。
+ *
+ * `ok` / `message` 是既有键；下面三个是**新增键**（老服务端没有 → null/0，手机自己退回
+ * 原来的"按文本认领"那条路，行为不变）：
+ *  * `commandId` —— 这一轮那一行的 id（手机回顾轮次靠它按 id 取结果，因为那些轮次
+ *    不进 `/api/commands` 列表）；
+ *  * `source`    —— 服务端**实际落库**的标签（`review` = 回顾轮次）；
+ *  * `duplicate` —— true = 这一轮已经记过了（同一轮重发，服务端幂等忽略）。
+ */
 data class CommandResponse(
     val ok: Boolean = false,
     val message: String? = null,
+    @SerializedName("commandId") val commandId: Int? = null,
+    val source: String? = null,
+    val duplicate: Boolean? = null,
 )
 
 /**

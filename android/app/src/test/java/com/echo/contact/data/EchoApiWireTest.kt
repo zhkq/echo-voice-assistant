@@ -97,6 +97,84 @@ class EchoApiWireTest {
     }
 
     @Test
+    fun `普通指令不带 context 与 requestId（老行为不变）`() {
+        server.enqueue(json("""{"ok":true,"message":"已下发"}"""))
+
+        runBlocking { api().sendCommand(CommandRequest(text = "普通指令", source = "mobile")) }
+
+        val req = server.takeRequest()
+        assertEquals("/api/assistant/command", req.path)
+        assertNull("普通指令不该带 context", req.requestUrl!!.queryParameter("context"))
+        assertNull("普通指令不该带 requestId", req.requestUrl!!.queryParameter("requestId"))
+    }
+
+    /**
+     * **回顾那一场的一轮**：带 `context=review`（服务端据此记 `source='review'`，
+     * 进回顾历史、不进指令历史）+ 同一轮的幂等键。
+     */
+    @Test
+    fun `回顾轮次带 context review 与幂等键`() {
+        server.enqueue(
+            json("""{"ok":true,"message":"已提交","commandId":9,"source":"review"}""")
+        )
+
+        val resp = runBlocking {
+            api().sendCommand(
+                CommandRequest(text = "回顾这一轮", source = "mobile"),
+                context = "review",
+                requestId = "sess-1:1700000000000:7",
+            )
+        }
+        assertTrue(resp.isSuccessful)
+        assertEquals(9, resp.body()?.commandId)
+        assertEquals("review", resp.body()?.source)
+
+        val req = server.takeRequest()
+        assertEquals("review", req.requestUrl!!.queryParameter("context"))
+        assertEquals("sess-1:1700000000000:7", req.requestUrl!!.queryParameter("requestId"))
+        // 请求体仍是既有形状（标签走 query，不改 body 契约）
+        val sent = bodyOf(req)
+        assertEquals("回顾这一轮", sent["text"])
+        assertEquals("mobile", sent["source"])
+    }
+
+    @Test
+    fun `回顾语音轮次同样带 context review`() {
+        server.enqueue(
+            json("""{"ok":true,"message":"已提交","text":"车上说的","commandId":10,"source":"review"}""")
+        )
+
+        runBlocking {
+            api().voiceCommand(
+                byteArrayOf(1, 2, 3, 4).toRequestBody("audio/wav".toMediaType()),
+                context = "review",
+                requestId = "sess-1:1700000000000:8",
+            )
+        }
+
+        val req = server.takeRequest()
+        assertEquals("review", req.requestUrl!!.queryParameter("context"))
+        assertEquals("sess-1:1700000000000:8", req.requestUrl!!.queryParameter("requestId"))
+        assertEquals("audio/wav", req.getHeader("Content-Type"))
+    }
+
+    @Test
+    fun `按 id 取一条指令`() {
+        server.enqueue(
+            json("""{"id":42,"source":"review","text":"这一轮","status":"done",
+                "reply":"好了","origin":"mobile","speakText":"好了"}""")
+        )
+
+        val resp = runBlocking { api().commandResult(42) }
+
+        assertTrue(resp.isSuccessful)
+        assertEquals(42, resp.body()?.id)
+        assertEquals("review", resp.body()?.source)
+        assertEquals("mobile", resp.body()?.origin)
+        assertEquals("/api/commands/42", server.takeRequest().path)
+    }
+
+    @Test
     fun `空令牌时不带 Authorization 头`() {
         server.enqueue(json("""{"ok":true,"message":""}"""))
 

@@ -3,6 +3,7 @@ package com.echo.contact.ui
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -192,7 +193,7 @@ class ReviewConversationTest {
         val trueLine = reviewEndedLine(rounds = 2, stopped = true)
         assertTrue("必须说本地这场结束了", trueLine.contains("已结束"))
         assertTrue("必须说本场几轮", trueLine.contains("本场 2 轮"))
-        assertTrue("必须写明每一轮都在指令历史里", trueLine.contains("「指令」历史"))
+        assertTrue("必须写明每一轮已记入回顾历史", trueLine.contains("「回顾历史」"))
         assertTrue("主机那侧要按 stopped=true 说", trueLine.contains(reviewStopNote(true)))
 
         val falseLine = reviewEndedLine(rounds = 2, stopped = false)
@@ -218,7 +219,8 @@ class ReviewConversationTest {
         val startRound = functionBody(vm, "fun startReviewRound(", "fun finishReviewRound(")
         assertTrue(
             "录一轮没有走既有那处 startRecording（那就是第二条录音路）",
-            startRound.contains("startRecording(asCommand = true)"),
+            // 回顾这一轮还要带上 context=REVIEW_CONTEXT（判据在 ⑦ 那一组）
+            startRound.contains("startRecording(asCommand = true"),
         )
         val finishRound = functionBody(vm, "fun finishReviewRound(", "private fun startReviewCollector(")
         assertTrue("收尾这一轮要走既有的 finishRecording", finishRound.contains("finishRecording()"))
@@ -227,7 +229,7 @@ class ReviewConversationTest {
         assertFalse("ReviewTab 直接调了 startRecording", reviewTab.contains("vm.startRecording("))
         assertTrue("输入条的按住说话没接 startReviewRound", reviewTab.contains("vm.startReviewRound()"))
         assertTrue("输入条没接 finishReviewRound", reviewTab.contains("vm.finishReviewRound()"))
-        assertTrue("打字继续这一场没走既有指令链", reviewTab.contains("vm.sendCommand(text)"))
+        assertTrue("打字继续这一场没走既有指令链", reviewTab.contains("vm.sendCommand(text, context = REVIEW_CONTEXT)"))
     }
 
     @Test
@@ -271,8 +273,7 @@ class ReviewConversationTest {
     }
 
     @Test
-    fun `录一轮的闸门复用口述那四档 且多一档没在这场`() {
-        assertEquals(
+    fun `录一轮的闸门复用口述那四档 且多一档没在这场`() {        assertEquals(
             "不在回顾里要先说'先开始回顾'",
             DictationGate.Blocked(REVIEW_NO_SESSION),
             reviewRoundGate(
@@ -317,6 +318,88 @@ class ReviewConversationTest {
                 meetingRecording = false,
                 listening = false,
             ),
+        )
+    }
+
+    // ---- ⑦ 回顾轮次的标签：进回顾历史、不进指令历史（2026-10-20）---------------------
+    //
+    // 用户原话："回顾的历史对话，指令里也有能不重复吗？"
+    // 修法：这一场每一轮带 context=review（服务端记 source='review'），
+    // 于是它们进「回顾历史」、不再在「指令历史」里重复。标签**不改执行**。
+
+    @Test
+    fun `回顾这一场的两条发送路都带 context review`() {
+        // 打字继续这一场：ReviewTab 调 sendCommand(context = REVIEW_CONTEXT)
+        assertTrue(
+            "打字继续这一场没带标记",
+            reviewTab.contains("vm.sendCommand(text, context = REVIEW_CONTEXT)"),
+        )
+        // 按住说话这一轮：startReviewRound 把标记交进**唯一**那处 startRecording
+        val startRound = functionBody(vm, "fun startReviewRound(", "fun finishReviewRound(")
+        assertTrue("录一轮没带标记", startRound.contains("context = REVIEW_CONTEXT"))
+        assertTrue("录一轮没走既有开麦入口", startRound.contains("startRecording(asCommand = true"))
+
+        // 两条上传都把标记真的带给服务端（否则服务端仍按 mobile 落库 = 没修好）
+        val send = functionBody(vm, "fun sendCommand(", "private suspend fun claimFloorId(")
+        assertTrue("文字指令没把 context 发给服务端",
+            send.contains("context = if (reviewTurn) REVIEW_CONTEXT else null"))
+        val finish = functionBody(vm, "fun finishRecording(", "fun cancelRecording(")
+        assertTrue("语音轮次没把 context 发给服务端",
+            finish.contains("context = if (reviewTurn) REVIEW_CONTEXT else null"))
+        // 回顾轮次按 id 取结果（它们不在指令历史列表里）
+        assertTrue("回顾轮次没走按 id 取结果", finish.contains("awaitReviewResult("))
+        assertTrue("回顾轮次没带幂等键", finish.contains("reviewRequestIdFor("))
+    }
+
+    @Test
+    fun `普通指令与一次性口述都不带标记`() {
+        // 一次性口述走 `/daily-review/submit`，**不是**这一场的一轮：不许带标记
+        val dictate = functionBody(vm, "fun startReviewDictation(", "private fun noteRecordFailure(")
+        assertFalse("一次性口述不该带 context", dictate.contains("context = REVIEW_CONTEXT"))
+        // startRecording 的默认值必须是 null（普通语音/指令不带 = 老行为不变）
+        val startRec = functionBody(vm, "fun startRecording(", "fun startReviewDictation(")
+        assertTrue("startRecording 的 context 默认值不是 null", startRec.contains("context: String? = null"))
+        // 界面不许自己开麦（只有 ViewModel 的入口能带标记）
+        assertFalse("ReviewTab 直接调了 startRecording", reviewTab.contains("vm.startRecording("))
+    }
+
+    @Test
+    fun `幂等键由这一场与这一轮决定`() {
+        assertEquals("sess-1:1700000000000:7", reviewRequestId("sess-1", 1700000000000L, 7))
+        assertEquals(
+            "同一场同一轮必须得到同一个键（重发才能被认成同一轮）",
+            reviewRequestId("sess-1", 1700000000000L, 7),
+            reviewRequestId("sess-1", 1700000000000L, 7),
+        )
+        assertNotEquals(
+            "不同轮次是不同的键（内容相同也是两轮）",
+            reviewRequestId("sess-1", 1700000000000L, 7),
+            reviewRequestId("sess-1", 1700000000000L, 8),
+        )
+        assertNotEquals(
+            "App 重启后 round 从 1 重数：开始时刻不同就必须是不同的键（否则会丢真内容）",
+            reviewRequestId("sess-1", 111L, 1),
+            reviewRequestId("sess-1", 222L, 1),
+        )
+        assertNull("没有会话 → 不发键", reviewRequestId("", 1700000000000L, 7))
+        assertNull("没有本场开始时刻 → 不发键", reviewRequestId("sess-1", 0L, 7))
+        assertNull("轮次无效 → 不发键", reviewRequestId("sess-1", 1700000000000L, 0))
+    }
+
+    @Test
+    fun `刚才那一场只写去向 不再重画整段对话`() {
+        assertTrue(
+            "那句话没说清这几轮去哪了：$REVIEW_LAST_ROUNDS_NOTE",
+            REVIEW_LAST_ROUNDS_NOTE.contains("已记入回顾历史"),
+        )
+        assertTrue(
+            "还要说明它们不再重复进指令历史：$REVIEW_LAST_ROUNDS_NOTE",
+            REVIEW_LAST_ROUNDS_NOTE.contains("指令"),
+        )
+        // 卡里再画一遍整段对话 = 同一页里又看一次同样的内容
+        assertFalse(
+            "「刚才那一场」又把整段对话重画了一遍",
+            reviewTab.contains("session.messages.forEach"),
         )
     }
 }

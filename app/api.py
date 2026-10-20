@@ -10,6 +10,7 @@ import json
 import os
 import re
 import tempfile
+import time
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Request, Response, UploadFile
@@ -158,6 +159,91 @@ class CommandIn(BaseModel):
     source: str = "web"
     workspace: str = ""
     session_id: str = ""
+
+
+#: 语音/文字指令可以带的**上下文标记**（`?context=review`）。
+#:
+#: 与 `daily_review.REVIEW_SOURCE` 是**同一个值**（测试钉着两者相等）：回顾轮次
+#: 落在 `commands.source='review'`，于是它们进「回顾历史」、不再进「指令历史」。
+#: 用户 2026-10-20 原话：*"回顾的历史对话，指令里也有能不重复吗？"*
+REVIEW_CONTEXT = "review"
+
+#: 幂等键允许的形状（回顾轮次的 `sessionId:round`）。只收这种字符，是为了能把它
+#: 安全地拼进 `meta LIKE` 的匹配串 —— 不让一个奇怪的值把查询变成"匹配一切"。
+_REVIEW_REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9:_.\-]{1,120}$")
+
+
+def _command_tag(base_source, context):
+    """请求里的上下文标记 → **落库标签**（`commands.source`）。
+
+    * 只认 `context=review`（大小写/空白容忍）；
+    * 不带、或认不出的值 → **原样返回老来源**（老客户端一个字节都不用改，
+      语音那条仍是 `mobile`、面板文字仍是 `web`）；
+    * 标签**只管落库/归哪段历史**，不改变执行（`assistant.send_text` 照旧跑）。
+    """
+    if str(context or "").strip().lower() == REVIEW_CONTEXT:
+        return REVIEW_CONTEXT
+    return base_source
+
+
+def _max_command_id() -> int:
+    """当前最新的指令行 id（发送前取一次，用来认出"这次新增的那一行"）。"""
+    try:
+        row = db._query_one("SELECT COALESCE(MAX(id), 0) AS m FROM commands") or {}
+        return int(row.get("m") or 0)
+    except Exception:
+        return 0
+
+
+def _latest_command_id(text, source, after_id=0, timeout=2.0):
+    """等 `_dispatch` 把这一轮的指令行插进来，返回它的 id；等不到就 None。
+
+    `send_text` 是**起线程就返回**的（面板要立刻看到"已提交"），所以行是在
+    那个线程里插的。手机回顾轮次需要 `commandId` 去按 id 取结果（它不进
+    `/api/commands` 列表），因此这里短暂等一下 —— 正常情况下第一轮就命中。
+
+    **等不到就如实回 None**（老调用方本来就可能拿到 null，手机侧会退回按文本
+    认领），不拿"历史里最新那一行"顶替：那会把上一条指令的 id 冒充这一轮的。
+    """
+    deadline = time.time() + max(0.0, float(timeout or 0))
+    while True:
+        try:
+            row = db._query_one(
+                "SELECT id FROM commands WHERE text=? AND source=? AND id>? "
+                "ORDER BY id DESC LIMIT 1",
+                (text, source, int(after_id or 0)))
+        except Exception:
+            row = None
+        if row:
+            try:
+                return int(row.get("id"))
+            except Exception:
+                return None
+        if time.time() >= deadline:
+            return None
+        time.sleep(0.02)
+
+
+def _find_review_turn(request_id):
+    """按**同一轮的幂等键**找回已经落库的回顾轮次（找不到返回 None）。
+
+    为什么要有它（用户 2026-10-20 的幂等要求）：手机那一轮要是因为重试被发两次，
+    **同一条回顾不该记成两条**。回顾轮次的 meta 里带着 `requestId`，这里按它等值
+    找回来 —— 找到就不再执行、直接回那一行的 id（手机拿它继续取结果）。
+    老客户端不带键 → 这里永远返回 None，行为与以前完全一样。
+    """
+    key = str(request_id or "").strip()
+    if not _REVIEW_REQUEST_ID_RE.match(key):
+        return None
+    try:
+        # `json.dumps` 给出带引号的 JSON 字面量，与 `db._json_dumps` 的
+        # `", "`/`": "` 定界一致（键受上面的正则约束，不会有引号/通配符）。
+        token = '%"requestId": ' + json.dumps(key) + "%"
+        return db._query_one(
+            "SELECT * FROM commands WHERE source=? AND meta LIKE ? "
+            "ORDER BY id DESC LIMIT 1", (REVIEW_CONTEXT, token))
+    except Exception:
+        return None
 
 
 class CaptureIn(BaseModel):
@@ -807,19 +893,51 @@ def reset_settings(key: str = "", _auth=Depends(optional_auth)):
 
 # ---------------------------------------------------------------- 命令
 @router.post("/assistant/command")
-def post_command(body: CommandIn, _auth=Depends(optional_auth)):
+def post_command(body: CommandIn, context: str = "", requestId: str = "",
+                 _auth=Depends(optional_auth)):
+    """发一条文字指令给智能体。
+
+    `context=review`（可选）表示这是**回顾那一场的一轮**：落库记
+    `source='review'`（进回顾历史，不进指令历史）。不带/认不出 → 仍是
+    `body.source`（面板 `web`、手机 `mobile`），老客户端行为不变。
+    `requestId`（可选）是同一轮的幂等键：同一轮重复发不会产生第二条回顾记录。
+    """
     if not body.text.strip():
         raise HTTPException(status_code=400, detail="命令为空")
-    ok, msg = assistant.send_text(body.text.strip(), source=body.source,
+    text = body.text.strip()
+    source = _command_tag(body.source, context)
+    key = str(requestId or "").strip() if source == REVIEW_CONTEXT else ""
+    if key:
+        dup = _find_review_turn(key)
+        if dup:
+            # 同一个 requestId 已经记过：**不再执行**（这就是"同一轮"的定义），
+            # 回既有那一行的 id，手机照着它取结果即可。
+            return {"ok": True, "duplicate": True,
+                    "message": "这一轮已经记进回顾历史了（重复发送已忽略）",
+                    "commandId": int(dup.get("id") or 0), "source": source}
+    after_id = _max_command_id()
+    extra = {}
+    if source == REVIEW_CONTEXT:
+        # ⚠️ `source` 只是**标签**：回顾轮次仍然是"手机发起的任务"（origin 由
+        # 原来的来源算），否则手机就不念这一轮的回复了 —— 执行口径不许变。
+        extra = {"origin": assistant._command_origin(body.source or "web"),
+                 "request_id": key}
+    ok, msg = assistant.send_text(text, source=source,
                                   workspace=body.workspace or None,
-                                  session_id=body.session_id or None)
-    return {"ok": ok, "message": msg}
+                                  session_id=body.session_id or None,
+                                  **extra)
+    # 回 `commandId` 是**新增键**（老客户端不认也不受影响）：手机回顾轮次靠它
+    # 按 id 取结果 —— 那些轮次不在 `/api/commands` 列表里，按文本认领会找不到。
+    cmd_id = _latest_command_id(text, source, after_id) if ok else None
+    return {"ok": ok, "message": msg, "commandId": cmd_id, "source": source}
 
 
 @router.post("/assistant/voice-command")
 async def assistant_voice_command(request: Request,
                                   engine: str = "",
                                   lang: str = "",
+                                  context: str = "",
+                                  requestId: str = "",
                                   _auth=Depends(optional_auth)):
     """**裸 wav → 一句话**（手机 / 手表的一步到位入口）：转写 → 下发给智能体。
 
@@ -830,10 +948,25 @@ async def assistant_voice_command(request: Request,
     约定与能力后端一致（AGENTS.md 记过这条坑）：**裸音频 body + `Content-Type: audio/wav`**，
     **不是** multipart（那在这套里会得到 415）。
 
-    `source` 记 `"mobile"` —— 库里注释与面板翻译表早就备好这个值，手机/手表是第一处真用它的人。
-    回包给 `commandId`：手机拿到就能去 `GET /api/commands?limit=` 轮询那一条的 status
+    `source` 默认记 `"mobile"` —— 库里注释与面板翻译表早就备好这个值，手机/手表是第一处真用它的人。
+    `context=review`（可选）表示这一轮属于**手机回顾那一场**：落库改记
+    `source='review'`（进回顾历史、不进指令历史），但**执行一个字都不变**，
+    发起方仍是手机（`origin=mobile`）。不带它的老客户端仍记 `mobile`。
+    `requestId`（可选）是同一轮的幂等键（见 `_find_review_turn`）。
+    回包给 `commandId`：手机拿到就能按 id 轮询那一条的 status
     （设计 §7 的关键时序）。
     """
+    source = _command_tag("mobile", context)
+    key = str(requestId or "").strip() if source == REVIEW_CONTEXT else ""
+    if key:
+        dup = _find_review_turn(key)
+        if dup:
+            # 同一轮被重发：**不再转写/不再执行**，直接回既有那一行（幂等）。
+            # 连音频都不用读 —— 这一轮的结果手机已经能按 commandId 取到。
+            return {"ok": True, "duplicate": True,
+                    "message": "这一轮已经记进回顾历史了（重复发送已忽略）",
+                    "text": str(dup.get("text") or ""),
+                    "commandId": int(dup.get("id") or 0), "source": source}
     body = await request.body()
     if not body:
         raise HTTPException(status_code=422,
@@ -877,16 +1010,16 @@ async def assistant_voice_command(request: Request,
                 pass
     if not (text or "").strip():
         raise HTTPException(status_code=422, detail="未能识别出文本（音频过短或无语音）")
-    ok, msg = assistant.send_text(text.strip(), source="mobile")
-    cmd_id = None
-    try:
-        rows = db.list_commands(limit=1)
-        if rows:
-            cmd_id = rows[0].get("id")
-    except Exception:
-        pass
+    after_id = _max_command_id()
+    extra = {}
+    if source == REVIEW_CONTEXT:
+        # 回顾轮次仍是"手机发起的任务"：标签（review）与发起方（mobile）分开传，
+        # 这样 `command_done.origin` 依旧是 mobile —— 谁发起谁念 / 谁收，口径不变。
+        extra = {"origin": assistant._command_origin("mobile"), "request_id": key}
+    ok, msg = assistant.send_text(text.strip(), source=source, **extra)
+    cmd_id = _latest_command_id(text.strip(), source, after_id) if ok else None
     return {"ok": bool(ok), "message": msg, "text": text.strip(),
-            "commandId": cmd_id, "source": "mobile"}
+            "commandId": cmd_id, "source": source}
 
 
 @router.get("/dsh/targets")
@@ -1236,10 +1369,28 @@ def _command_row(row):
     # `origin`：这条指令是**谁发起的**（`mobile` / `pc`）—— 与 `command_done.origin`
     # **同一个判据**（`assistant._command_origin(source)`，不另写一套）。手机端靠它实现
     # "谁发起谁念"：电脑发起的任务不该在手机喇叭上念，手机发起的才念上面那个 `speakText`。
-    # 同样是**新增键**（`source` 原样还在；老客户端不认这个键也不受影响）。
-    out["origin"] = assistant._command_origin(out.get("source"))
+    # 但 `source` 只是**落库标签**：回顾轮次记 `review`（回顾轮次属于回顾），它照样是
+    # 手机发起的 —— 所以优先看发送当时落进 `meta.origin` 的那份快照（新行都有），
+    # 老记录没有它才按 `source` 推（推成 pc 是保守值，行为与以前一致）。
+    _origin = str(meta.get("origin") or "").strip().lower()
+    out["origin"] = (_origin if _origin in ("mobile", "pc")
+                     else assistant._command_origin(out.get("source")))
     # `meta` 原文仍原样带着（别处可能要看；删字段是另一种"改契约"）
     return out
+
+
+def _command_history_where(q="", since=""):
+    """「指令历史」的筛选条件 = 既有筛选 + **排除回顾轮次**。
+
+    回顾轮次（`source='review'`）属于「回顾历史」—— 用户 2026-10-20 原话：
+    *"回顾的历史对话，指令里也有能不重复吗？"* 两处只该出现一次。
+    这里放在 SQL 里（而不是取完再过滤）：分页与 `total` 都得跟着变，
+    否则"加载更多"会翻到过滤掉的空洞。
+    """
+    where, params = db._command_where(q, since)
+    if where:
+        return where + " AND source<>?", params + [REVIEW_CONTEXT]
+    return " WHERE source<>?", [REVIEW_CONTEXT]
 
 
 @router.get("/commands")
@@ -1251,10 +1402,31 @@ def get_commands(limit: int = 100, offset: int = 0, q: str = "", since: str = ""
     `q` 是按关键词过滤，`since`（`YYYY-MM-DD HH:MM:SS`，本地时间）是按时间过滤。
     过滤在 **SQL 里**做，`total` 因此是"过滤后一共几条" —— 面板据此决定还要不要给
     「加载更多」，不用自己数。
+
+    ⚠️ **不包含回顾轮次**（`source='review'`）：它们属于「回顾历史」，
+    在那边按天看（`/api/daily-review/history*`）。手机回顾那一场仍能拿到自己的
+    结果 —— 走 `GET /api/commands/{id}`（按 id 取一条，不进列表）。
     """
-    items = [_command_row(r) for r in
-             db.list_commands(limit=min(limit, 500), offset=max(offset, 0), q=q, since=since)]
-    return {"total": db.count_commands(q=q, since=since), "items": items}
+    where, params = _command_history_where(q, since)
+    rows = db._query(                                            # noqa: SLF001 - 同包内部工具
+        "SELECT * FROM commands" + where + " ORDER BY id DESC LIMIT ? OFFSET ?",
+        params + [min(limit, 500), max(offset, 0)])
+    total = db._query_one("SELECT COUNT(*) AS n FROM commands" + where, params)["n"]
+    return {"total": total, "items": [_command_row(r) for r in rows]}
+
+
+@router.get("/commands/{cmd_id}")
+def get_command_one(cmd_id: int, _auth=Depends(optional_auth)):
+    """按 id 取**一条**指令（含 status/reply/brief/speakText/origin）。
+
+    为什么需要它（2026-10-20）：回顾轮次落 `source='review'`、**不进**指令历史列表，
+    而手机回顾那一场仍然要等"这一轮执行完了没有、回复是什么"。按 id 直接取一行
+    既不用把回顾轮次混回列表，也不用让手机按文本去猜哪一行是它的。
+    """
+    row = db.get_command(cmd_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="命令不存在")
+    return _command_row(row)
 
 
 @router.delete("/commands")
