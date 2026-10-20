@@ -73,8 +73,9 @@ class OfflineMeetingTransport(
                 meetingId = int(obj, "meetingId", "meeting_id"),
                 source = str(obj, "source"),
                 note = str(obj, "folder"),
-                // 服务端现在**还没**这个字段（Lead 要派给 PC 侧）；读不到就是空串，
-                // 那时退化成按会议 id 判（见 OfflineMeetingSync.mineRecording）
+                // 服务端从 2026-10-16 起在"手机补传"那条路上回 `clientId`（`app/meeting.py`）。
+                // 读不到就是空串，那时退化成按会议 id 判（见 `service/MeetingOwnership.kt`：
+                // 认不出来**宁可判不是**，最多多等一会儿，绝不抢占别人的会）。
                 clientId = str(obj, "clientId", "client_id"),
             )
         }

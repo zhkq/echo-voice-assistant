@@ -56,7 +56,7 @@ data class SttStatus(
     val cuda: Boolean = false,
 )
 
-/** `meeting`：`{active, folder, startedAt, level, error}`。 */
+/** `meeting`：`{active, folder, startedAt, level, error, paused, segments, source[, clientId]}`。 */
 data class MeetingStatus(
     val active: Boolean = false,
     val folder: String? = null,
@@ -67,6 +67,24 @@ data class MeetingStatus(
     val paused: Boolean = false,
     /** 已经写出来的段数（全屏录音界面显示进度用）。 */
     val segments: Int = 0,
+    /**
+     * 采集源：`pc`（电脑那支麦）或 `phone`（**手机**录、电脑只收段）。
+     *
+     * 为什么这个字段必须接进来（2026-10-20 真机 bug）：会议页原来只判 `active`，
+     * 于是"手机录的那场还在补传"被写成"电脑在录音"。服务端一直有这个字段
+     * （`app/meeting.py::meeting_status()`），是安卓这边的 DTO 把它丢了 ——
+     * 信息在网络上走过、界面上却当它不存在。判据只用一处：`service/MeetingOwnership.kt`。
+     */
+    val source: String? = null,
+    /**
+     * 服务端认下的**客户端稳定 id**（只有"手机补传"那条路才有；电脑本机麦那条是空的）。
+     *
+     * 与 `service/MeetingOwnership.kt` 里 `LocalDraftRef.clientId` 逐字比较：
+     * 相等 = 服务端上那场是**我这份清单**建出来的（**包括我上一次启动留下的**）。
+     * 服务端只在"这一场确实有 clientId"时才带这个键，所以缺省是 `null`（不是空串）。
+     */
+    @SerializedName(value = "clientId", alternate = ["client_id"])
+    val clientId: String? = null,
 )
 
 /** `GET /api/status` 整体。 */

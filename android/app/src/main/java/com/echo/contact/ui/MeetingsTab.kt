@@ -30,6 +30,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import com.echo.contact.service.meetingOwnerNote
+import com.echo.contact.service.meetingOwnerTrailing
 import com.echo.contact.ui.theme.EchoPalette
 import kotlinx.coroutines.delay
 
@@ -68,6 +70,15 @@ fun MeetingsTab(vm: MainViewModel) {
     val micState by com.echo.contact.service.MeetingMicService.state.collectAsState()
     val phoneRecording = micState.active
 
+    // 本机清单里那几场的**身份**（`clientId`）—— 判"服务器上那场是不是我的"要用它。
+    //
+    // 为什么必须读磁盘清单、而不是拿"当前会话 id"去比：手机的会话 id 是
+    // **每次开录那一刻新生成的**（`MeetingDraftStore.newClientId()`：`phone-<时间>-<随机>`），
+    // 而且它同时是服务端的幂等键（一场录音必须有一个只属于它的 id）。
+    // 所以 App 重开 / 再开一场之后，服务端上那场是**上一次启动**留下的 id ——
+    // 用"当前会话"去比永远认不出自己（2026-10-20 真机：手机以为自己没在录、说成电脑在录音）。
+    val localDrafts by com.echo.contact.service.MeetingMicService.localDrafts.collectAsState()
+
     // ---- 会议页那块**常驻**的「待上传 / 现在同步」（用户 2026-10-19）----
     //
     // 为什么它读的是 `pendingSummary`（磁盘上既有离线清单的摘要）而不是 `micState` 里的数字：
@@ -79,6 +90,10 @@ fun MeetingsTab(vm: MainViewModel) {
     // ⚠️ 它在**会议页**而不是录音页：录完之后用户最常来的就是这里。
     LaunchedEffect(Unit) {
         while (true) {
+            // 服务端"现在在录哪一场"要**新鲜**：判归属靠它的 `source`/`clientId`，
+            // 而 `vm.status` 原来只在首页那张状态卡可见时才按节拍刷新（离开首页就冻住），
+            // 停留在会议页时读到的是几分钟前的旧会议状态 —— 那会把"早就结束了"显示成"在录"。
+            vm.refreshStatusNow()
             // 读盘放 IO：清单是几个小文件，但这是主线程上的界面节拍，不该做文件 I/O。
             kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
                 com.echo.contact.service.MeetingMicService.refreshPendingSummary(localCtx)
@@ -127,9 +142,22 @@ fun MeetingsTab(vm: MainViewModel) {
         return
     }
 
-    // 服务端那一场（"电脑在录"或"刚结束/正在转写"）。它**只**用来显示信息，
+    // 服务端那一场（"在录"或"刚结束/正在转写"）。它**只**用来显示信息，
     // 不再决定按钮 —— 录音的判据在手机这一侧（见上面的 `phoneRecording`）。
-    val active = meeting?.active == true
+    //
+    // ⚠️ `active` 只说明"ECHO 那儿有一场在录"，**不说明是谁的**（2026-10-20 真机：
+    // 服务端上是"手机那场在补传"，手机却写成「电脑在录音」）。归属只由
+    // `meetingOwnership` 判（**与"别抢占"闸共用同一个函数**，见 `service/MeetingOwnership.kt`）：
+    //  * `clientId` 在我本地清单里 → **我的**（还在录 / 拍完还在传，两种文案不同）；
+    //  * `source=pc`，或 `clientId` 真不在我清单里 → 才说电脑/另一台设备在录。
+    val owner = com.echo.contact.service.meetingOwnership(
+        active = meeting?.active == true,
+        source = meeting?.source.orEmpty(),
+        clientId = meeting?.clientId.orEmpty(),
+        local = localDrafts,
+        localRecording = phoneRecording,
+    )
+    val serverActive = owner != com.echo.contact.service.MeetingOwner.NONE
 
     LazyColumn(
         modifier = Modifier.fillMaxSize(),
@@ -144,17 +172,16 @@ fun MeetingsTab(vm: MainViewModel) {
                         dotColor = when {
                             micState.error.isNotBlank() || !meeting?.error.isNullOrBlank() ->
                                 EchoPalette.Red
-                            phoneRecording || active -> EchoPalette.Purple
+                            phoneRecording || serverActive -> EchoPalette.Purple
                             else -> EchoPalette.Muted
                         },
-                        // 状态**如实**：手机在录时就说"这台手机在录音"（在线时也一样）——
-                        // 不许再出现 2026-10-17 那种"手机上点了开始、界面却像电脑在录"的含糊。
-                        trailing = when {
-                            phoneRecording -> "这台手机在录音"
-                            active -> "电脑在录音"
-                            else -> "未在录音"
-                        },
-                        trailingColor = if (phoneRecording || active) EchoPalette.Purple
+                        // 状态**如实**（文案只有一处出口：`meetingOwnerTrailing`）：
+                        //  * 手机正在录 → "这台手机在录音"；
+                        //  * **我这场的录音还在上传** → "手机上这场的录音还在上传"（不是"录音中"，
+                        //    也不是「电脑在录音」——前者会让用户以为还在录、后者把归属说反了）；
+                        //  * 只有真是电脑/另一台设备在录，才那么说。
+                        trailing = meetingOwnerTrailing(owner),
+                        trailingColor = if (phoneRecording || serverActive) EchoPalette.Purple
                         else EchoPalette.Muted,
                     )
 
@@ -173,16 +200,29 @@ fun MeetingsTab(vm: MainViewModel) {
                             Spacer(Modifier.height(2.dp))
                             MutedLine("ECHO 上这一场：$it", maxLines = 1)
                         }
-                    } else if (active) {
-                        // 电脑上开始的那一场：手机能看到、但**不遥控**它（不给开/停按钮）
+                    } else if (serverActive) {
+                        // 服务端那场在录/在收尾，但**不是这台手机**此刻在录 —— 三种归属分开说
+                        // （说明文字与标题来自同一处判据，见 `meetingOwnerNote`）。
                         Spacer(Modifier.height(4.dp))
                         MutedLine(
-                            "ECHO 那台电脑正在录音（**不是**这台手机）：那场在电脑上开始、也在电脑上结束",
-                            maxLines = 2,
+                            meetingOwnerNote(
+                                owner,
+                                // "已传 M/T 段"取磁盘摘要（`PendingSyncSummary`）：
+                                // 它是**磁盘上的事实**，App 重开也不会归零。
+                                confirmedSegments =
+                                    (pendingSync.totalSegments - pendingSync.pendingSegments)
+                                        .coerceAtLeast(0),
+                                totalSegments = pendingSync.totalSegments,
+                            ),
+                            maxLines = 3,
                         )
                         meeting?.folder?.takeIf { it.isNotBlank() }?.let {
                             Spacer(Modifier.height(2.dp))
-                            MutedLine("正在录：$it", maxLines = 1)
+                            // 我那场**已经录完、还在传**：说"正在录"是谎（录音早停了）
+                            MutedLine(
+                                if (owner.isMine) "ECHO 上这一场：$it" else "正在录：$it",
+                                maxLines = 1,
+                            )
                         }
                         (meeting?.startedAt)?.takeIf { it.isNotBlank() }?.let {
                             Spacer(Modifier.height(2.dp))

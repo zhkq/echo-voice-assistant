@@ -128,7 +128,7 @@ data class MeetingPausesRequest(
  *
  * `clientId` / `completed` 是**希望**服务端补上的：补传时客户端要判"ECHO 现在录的那一场
  * 是不是我自己这一份清单的会"（判错会**抢占电脑正在录的会**，那是明令禁止的）。
- * 拿不到 `clientId` 时客户端退化成"按会议 id 相等"判（见 `OfflineMeetingSync.mineRecording`），
+ * 拿不到 `clientId` 时客户端退化成"按会议 id 相等"判（见 `service/MeetingOwnership.kt`），
  * 拿不到就**宁可判不是**（最多多等一会儿，不会打断别人的会）。
  */
 data class MeetingStatusExtra(

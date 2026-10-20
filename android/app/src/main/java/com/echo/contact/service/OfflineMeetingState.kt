@@ -140,9 +140,9 @@ internal fun isReachable(code: Int?): Boolean = reachabilityOf(code) == Reachabi
  * （ECHO 会把它记成 `interrupted`，音频虽在但录音当场断了 —— 2026-09-23 真出过这次事故）。
  *
  * ⚠️ 第二个参数的名字是历史遗留（[OfflineMeetingSync.run] 现在传的是
- * `mineRecording(active, …)` 的结论 —— "那一场是不是我自己这一份清单的会"）。
- * 合并成一条路之后**不再有"App 自己在录"这一档**：判"是不是我的"只看
- * 服务端回的 `clientId` 与清单是否相等（见 `OfflineMeetingSync.mineRecording` 的说明）。
+ * `meetingOwnership(...).isMine` 的结论 —— "那一场是不是我自己清单里的会"）。
+ * 合并成一条路之后**不再有"App 自己在录"这一档**：判"是不是我的"看服务端回的
+ * `clientId` **在不在我本地清单里**（`service/MeetingOwnership.kt`，与会议页显示共用那一处判据）。
  */
 fun echoBusyElsewhere(echoRecording: Boolean, localRecording: Boolean): Boolean =
     echoRecording && !localRecording

@@ -33,6 +33,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.echo.contact.data.dto.StatusComponent
+import com.echo.contact.service.meetingOwnerCell
 import com.echo.contact.ui.theme.EchoPalette
 import kotlinx.coroutines.delay
 
@@ -172,6 +173,12 @@ fun HomeTopCard(vm: MainViewModel) {
     var copied by remember { mutableStateOf(false) }
 
     val context = LocalContext.current
+
+    // 「会议」那一格也要认**归属**（2026-10-20 真机：手机说"电脑在录音"，其实是它自己那场在补传）。
+    // `meeting.active` 只说明"ECHO 那儿有一场在录"，不说明是谁的：判据只有一处
+    // （`service/MeetingOwnership.kt`，与会议页共用），这里只读结论、不自己判。
+    val micState by com.echo.contact.service.MeetingMicService.state.collectAsState()
+    val localDrafts by com.echo.contact.service.MeetingMicService.localDrafts.collectAsState()
 
     // 只在卡片可见时按节拍取状态（离开组合这个 LaunchedEffect 就取消）
     LaunchedEffect(Unit) {
@@ -353,10 +360,19 @@ fun HomeTopCard(vm: MainViewModel) {
                     StatusCell(
                         modifier = Modifier.weight(1f),
                         name = "会议",
+                        // 状态词来自**同一处**归属判据（`meetingOwnerCell`）：
+                        // 我那场已经录完、还在传 → 「上传中」；不是我那场才说「录音中」。
                         value = when {
                             !meeting?.error.isNullOrBlank() -> "出错"
-                            meeting?.active == true -> "录音中"
-                            else -> "未在录音"
+                            else -> meetingOwnerCell(
+                                com.echo.contact.service.meetingOwnership(
+                                    active = meeting?.active == true,
+                                    source = meeting?.source.orEmpty(),
+                                    clientId = meeting?.clientId.orEmpty(),
+                                    local = localDrafts,
+                                    localRecording = micState.active,
+                                ),
+                            )
                         },
                         color = when {
                             !meeting?.error.isNullOrBlank() -> EchoPalette.Red

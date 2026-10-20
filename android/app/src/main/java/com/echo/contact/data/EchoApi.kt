@@ -232,14 +232,14 @@ interface EchoApi {
     suspend fun meetingStatus(): Response<MeetingStatus>
 
     /**
-     * **同一个路径**的裸 JSON 版本 —— 离线补传读那几个服务端还没承诺的字段用
-     * （`clientId` / `meetingId` / `source`，见 `MeetingStatusExtra`）。
+     * **同一个路径**的裸 JSON 版本 —— 离线补传读 `clientId` / `meetingId` / `source` 用
+     * （见 `MeetingStatusExtra`，装配成 `OfflineMeetingSync.ActiveMeeting`）。
      *
-     * 为什么不直接给 [MeetingStatus] 加字段：那份 DTO 是面板与全屏录音界面共用的既有契约，
-     * 而这里要读的东西服务端**还没有**（另一条线在重建后端镜像）。走 DTO 的话它们会被
-     * Retrofit 的转换器静默丢掉（DTO 里没有对应属性），于是"这一场是不是我自己那一份"
-     * 永远判不出来 —— 而判错的后果是**补传自己把自己挡住**（一直"等这场录完再传"）。
-     * 两条路解析的是**同一份 JSON**，口径没有分叉。
+     * 为什么补传那条路仍然走裸 JSON（2026-10-20 起 [MeetingStatus] 已经有 `source`/`clientId` 了）：
+     * 它还要 `meetingId`，而那份 DTO 是**面板与全屏录音界面共用的既有契约** ——
+     * 给共用 DTO 加只服务补传的字段，会让"哪些字段是谁在用"越来越难说清。
+     * 两条路解析的是**同一份 JSON**，口径没有分叉；归属判据也只有一处
+     * （`service/MeetingOwnership.kt`，本文件不判归属）。
      */
     @GET("api/meeting/status")
     suspend fun meetingStatusJson(): Response<ResponseBody>

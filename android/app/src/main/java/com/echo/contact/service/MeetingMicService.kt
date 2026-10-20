@@ -256,17 +256,43 @@ class MeetingMicService : Service() {
         val pendingSummary: StateFlow<PendingSyncSummary> = _pendingSummary.asStateFlow()
 
         /**
+         * 本机清单里那几场的**身份**（会议页判"服务器上那场是不是我的"读它）。
+         *
+         * 为什么界面需要它（2026-10-20 真机）：服务端只说"当前这场录音的 `clientId` 是
+         * `phone-…`"，而"这个 id 是不是我建的"只有本地清单知道 —— 手机会话 id
+         * **每次开录都会新生成**（`MeetingDraftStore.newClientId()`），所以拿"当前会话"去比
+         * 永远认不出"上一次启动留下的那场"。这里把磁盘上**所有**清单的 id 交出去
+         * （不是只交待传的那几场）：判身份看的是"我建过没有"，与"还欠几段"是两件事。
+         *
+         * ⚠️ `null` 是**有意义的**：刚打开 App、还没来得及读磁盘时是 `null`
+         * （不是空表）—— 判归属那边要借它区分"我没有清单"与"我还不知道"。
+         * 两种都当成"没有清单"的话，界面第一帧就会把"我自己那场"说成"另一台设备在录音"。
+         */
+        private val _localDrafts = MutableStateFlow<List<LocalDraftRef>?>(null)
+        internal val localDrafts: StateFlow<List<LocalDraftRef>?> = _localDrafts.asStateFlow()
+
+        /**
          * 从既有清单刷新那块摘要（[MeetingDraftStore.pending]）。
          *
          * 读不动就按"没有待传"算 —— 但**不抛**：这是界面/后台都会调的一条，
          * 抛出去的表现是"开会页崩了"，而真相只是某个清单目录读不了（补传自己会另算）。
+         *
+         * ⚠️ 2026-10-20 起**一次读盘喂两处**：①待传摘要（会议页那块入口）；
+         * ②清单身份（[localDrafts]，判归属用）。分两次读会出现"摘要说有 3 段、
+         * 身份表里却没有那一场"的瞬间分叉。
          */
         fun refreshPendingSummary(context: Context): PendingSyncSummary {
             val app = context.applicationContext
-            val summary = runCatching { pendingSummaryOf(storeOf(app).pending()) }
-                .getOrDefault(PendingSyncSummary())
+            val all = runCatching { storeOf(app).list() }.getOrDefault(emptyList())
+            val summary = runCatching { pendingSummaryOf(all) }.getOrDefault(PendingSyncSummary())
             _pendingSummary.value = summary
+            publishLocalDrafts(all)
             return summary
+        }
+
+        /** 把"本机建过哪些会话"公开给界面（**一处**：判归属用，见 [localDrafts]）。 */
+        private fun publishLocalDrafts(drafts: List<MeetingDraft>) {
+            _localDrafts.value = drafts.map { LocalDraftRef(it.clientId, it.serverMeetingId) }
         }
 
         /**
@@ -332,6 +358,11 @@ class MeetingMicService : Service() {
             // 这里直接用刚读到的 `waits`（它本来就是 `needsSync` 过滤过的同一批），
             // 不再多扫一遍目录。
             _pendingSummary.value = pendingSummaryOf(waits)
+            // 顺手也刷一次"本机建过哪些会话"：判"服务器上那场是不是我的"要用它
+            // （`MeetingOwnership`）。**必须扫全量**（`list()`）而不是上面的 `waits`：
+            // 身份看的是"我建过没有"，`waits` 只含"还欠段"的那几场 ——
+            // 一场已经传完、只差收尾的会漏掉它，界面就会把它说成"另一台设备在录"。
+            runCatching { publishLocalDrafts(store.list()) }
             if (waits.isEmpty()) {
                 // 没有欠的东西：把界面上那条"等联网上传"收掉（别留一条假的）
                 if (_state.value.syncPhase == OfflinePhase.WAITING_UPLOAD ||

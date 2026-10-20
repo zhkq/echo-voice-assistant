@@ -1474,6 +1474,19 @@ class MainViewModel(app: Application) : BaseViewModel(app) {
         }
     }
 
+    /**
+     * 让界面**立刻**取一次 `/api/status`（不排队、不等节拍）。
+     *
+     * 为什么需要它（2026-10-20）：`/api/status` 里的 `meeting` 带着 `source`/`clientId`，
+     * 而会议页要靠它判"服务端那场是不是**我**的"。原来状态只在首页那张卡可见时按节拍刷新
+     * （`StatusCard` 的 `LaunchedEffect`），停在会议页时读到的是几分钟前的旧会议状态 ——
+     * 一会儿显示"在录"、一会儿显示"没录"，全看用户上一次在首页待了多久。
+     * 这里**只**暴露"取一次"这个动作，节拍仍然由页面自己决定（谁需要谁调）。
+     */
+    fun refreshStatusNow() {
+        viewModelScope.launch { fetchStatusOnce() }
+    }
+
     /** 仪表盘那句"实时"：面板是 3 秒一次，这里对齐。 */
     fun autoRefreshTick() {
         viewModelScope.launch { fetchStatusOnce() }

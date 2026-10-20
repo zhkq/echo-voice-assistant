@@ -40,7 +40,15 @@ object OfflineMeetingSync {
     suspend fun run(
         transport: OfflineTransport,
         store: MeetingDraftStore,
-        /** 正在录的那一份的 id（用来判断"ECHO 在录的是不是它"）。 */
+        /**
+         * 正在录的那一份的 id（`null` = 这台手机此刻没在录）。
+         *
+         * ⚠️ 2026-10-20 起它**不再**用来判"ECHO 在录的是不是我自己那场"（那份判据在
+         * `service/MeetingOwnership.kt`，看 `clientId` 在不在**本地全部清单**里）。
+         * 它只剩一个用途：区分"我这场还在录"与"我这场录完还在传"那一档文案
+         * （[meetingOwnership] 的 `localRecording`）。别拿它去判归属 ——
+         * 手机 id 每次开录都会变，App 重开之后它根本认不出"上一次启动留下的那场"。
+         */
         activeClientId: String? = null,
         /** 只跑这一份（用户对着某一场按「现在同步」）；null = 所有待传的。 */
         onlyClientId: String? = null,
@@ -107,10 +115,25 @@ object OfflineMeetingSync {
         }
 
         // ---- ② 抢占判定：ECHO 正在录**别的**会 → 等，绝不抢占 ----
+        //
+        // 判"服务端那场是不是我自己那一份清单的会"**只有一处实现**：`meetingOwnership`
+        // （会议页的归属显示读的是同一个函数）。这里原来自己写了一套"只认当前会话 id"
+        // 的比较，而手机 id **每次开录都是新的**（`MeetingDraftStore.newClientId()`）——
+        // App 重开之后那套比较必然认不出"我上一次启动留下的那场"，于是补传自己把自己挡住
+        // （一直"等这场录完再传"，而那一场就是它自己），2026-10-20 真机撞到的就是这个。
         val active = transport.activeMeeting()
             ?: return offline(OfflinePhase.UNREACHABLE, drafts, manual, "读不到 ECHO 的会议状态（不算可达）")
-        val mine = mineRecording(active, activeClientId, drafts)
-        if (echoBusyElsewhere(active.recording, mine)) {
+        // `localRecording` 只影响"我是在录 / 还在传"那一档（闸只问 `isMine`，不看它）：
+        // `activeClientId` 非空 = 这台手机此刻正录着那一份清单。
+        val owner = meetingOwnership(
+            active = active.recording,
+            source = active.source,
+            clientId = active.clientId,
+            serverMeetingId = active.meetingId,
+            local = drafts.map { LocalDraftRef(it.clientId, it.serverMeetingId) },
+            localRecording = !activeClientId.isNullOrBlank(),
+        )
+        if (echoBusyElsewhere(active.recording, owner.isMine)) {
             return offline(OfflinePhase.WAITING_MEETING_END, drafts, manual,
                 "ECHO 正在录另一场（${active.note.ifBlank { "没给名字" }}）：等它录完再传，不抢占")
         }
@@ -523,40 +546,12 @@ object OfflineMeetingSync {
         manual = manual,
     )
 
-    /**
-     * 「ECHO 正在录的那一场，是不是**我自己**这一份清单的会」。
-     *
-     * 判据刻意不用"会议名/文件夹"（那是服务端生成的时间戳，本地清单里根本没有），
-     * 而是**两级**：
-     *  1. 服务端回了 `clientId` 且与我们正在同步的清单相等 → 是（最强判据，也最不容易错）；
-     *  2. 否则比会议 id（清单里记过 `serverMeetingId` 才算）。
-     *
-     * 判对的意义：判错成"是我的"会把**电脑正在录的会**当成自己的场子往里传段
-     * （两路音频混进同一场 = 转写里两个人同时说话）；判错成"不是我的"最多多等一会儿。
-     * 所以这里**宁可判不是**（只有确切相等才回 true）。
-     *
-     * ## 为什么 clientId 那一级必须**先判**（2026-10-17 合并两条路时改的）
-     *
-     * 老版本第一行是"App 自己在录 → 一律判不是"（那时自己录的会服务端根本不知道，
-     * 所以"服务端在录的必然不是我"）。合并成一条路之后**这条前提没了**：
-     * 现在每一段都会带着 `clientId` 去 `start`，服务端那条"正在录"的记录**很可能就是我自己**
-     * —— 再按老判据走，就会拿"我自己在录"去挡住"传我自己的段"，表现是
-     * **自己等自己**（一直"等这场录完再传"，而那一场就是它自己在录的）。
-     * 所以现在：**只要服务端回的 id 与清单相等，就是我自己** —— 与"我在不在录"无关。
-     * 而认不出来时（服务端没给 id、清单也没记会议 id）仍然**宁可判不是**（最多多等一会儿，
-     * 绝不会把两路音频混进别人的会）。
-     */
-    internal fun mineRecording(
-        active: ActiveMeeting,
-        activeClientId: String?,
-        drafts: List<MeetingDraft>,
-    ): Boolean {
-        val mine = drafts.filter { it.clientId == activeClientId }
-        if (mine.isEmpty()) return false
-        val aid = active.clientId.trim()
-        if (aid.isNotEmpty()) return mine.any { it.clientId == aid }
-        return active.meetingId > 0 && mine.any { it.serverMeetingId == active.meetingId }
-    }
+    // ⚠️ 「服务端正在录的那一场是不是**我自己**的」不再有第二个实现：
+    // 判据已经搬到 `MeetingOwnership.kt::meetingOwnership()`（会议页显示读的是同一个函数）。
+    // 旧的那一份 `mineRecording(active, activeClientId, drafts)` 只认"**这一刻正在录**的那份清单"，
+    // 而手机的会话 id **每次开录都是新的** → App 重开之后认不出"上一次启动留下的那场"，
+    // 表现就是补传自己把自己挡在门外（2026-10-20 真机：手机以为自己没在录、说电脑在录）。
+    // 想看当初为什么 clientId 那一级要先判（2026-10-17 合并两条路时改的），见那个文件的类注释。
 
     /** 一份清单跑完之后的东西（`result != null` = 该停下了）。 */
     private data class StageResult(
