@@ -93,7 +93,9 @@ def _sidebar_pipe_write(command):
     边条没在跑 / 管道正忙 / 平台没有边条 —— 都不能让"停 ECHO"失败。
     通知失败只记一句日志，剩下的交给边条侧的心跳兜底（连续 3 次探不到服务它自己退）。
     """
-    if os.name != "nt":
+    # 平台判据只许一处（`app/platform/__init__.py::current()`）：这里再写一次 os.name
+    # 就是第二个判据 —— 门禁（scripts/audit-paths.py 的 PLATFORM_TOKEN）会拦，2026-09-21 实测踩到。
+    if echo_platform.current() != "win32":
         return False                      # 非 Windows 没有边条宿主，没什么可通知的
     try:
         # 以文本方式打开命名管道：客户端写完后句柄关闭 = EOF，
