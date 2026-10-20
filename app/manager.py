@@ -91,7 +91,22 @@ def echo_write_pid():
 
 
 def echo_stop_self():
-    """停止当前 ECHO 服务（供面板按钮调用）。"""
+    """停止当前 ECHO 服务（面板「关机」/ `POST /api/control/echo/stop` 的定时器都走这里）。
+
+    **退出前先请边条退出**：边条（`echo-sidebar.exe`）是被 DETACHED_PROCESS 起来的
+    **独立进程**，`os._exit()` 带不走它 —— 2026-10-21 真机 bug 的形状就是
+    "8970 已停、服务确实关了、边条还挂在屏幕上"。这里用边条**已有的**命名管道发一条
+    `quit`（`app/runtime.py:quit_sidebar`），不新造协议。
+
+    通知是**尽力而为**：边条没开、管道正忙、连 import 出问题都只记日志，
+    **绝不让"停 ECHO"失败**（停服务不能因为一个窗口关不掉而失败）。
+    服务被强杀 / 崩溃时这里根本跑不到 —— 那条路由边条侧的心跳兜底（`sidebar/Heartbeat.cs`）。
+    """
+    try:
+        from app import runtime as _runtime
+        _runtime.quit_sidebar()
+    except Exception as e:  # noqa: BLE001 —— 停止动作的最后一步，任何异常都不许挡住退出
+        print(f"[service] 通知边条退出失败（忽略，继续停服务）: {e}")
     try:
         os._exit(0)
     except SystemExit:

@@ -73,6 +73,58 @@ def _spawn_sidebar(collapsed: bool = False):
     return True
 
 
+#: 边条已有的"单实例信号"命名管道（名字必须与 `sidebar/Program.cs` 的
+#: `SidebarConfig.PipeName` 一致）。命令：toggle / rail-hide / rail-show / rail-expand / quit。
+SIDEBAR_PIPE_NAME = "echo-sidebar-toggle"
+#: Windows 命名管道路径。macOS/Linux 没有原生边条宿主（`sidebar_candidates()` 返回空表）。
+SIDEBAR_PIPE_PATH = "\\\\.\\pipe\\" + SIDEBAR_PIPE_NAME
+
+
+def _sidebar_pipe_write(command):
+    """把一条命令写进边条的命名管道 → 成功 True / 失败 False（**永不抛**）。
+
+    为什么是这条命名管道：边条是**独立进程**（`_spawn_sidebar` 用 DETACHED_PROCESS 起它），
+    它现有的 IPC 就是这条管道 —— `toggle_sidebar()` 每次都起一个新实例，而新实例干的
+    只是往这条管道里写 `toggle`（`sidebar/Program.cs:TrySignalExistingSidebar`）。
+    所以"请它退出"只是**多一条 `quit` 命令**：不新造协议、不给边条开 HTTP 端口、
+    也不用窗口消息（WebView2 是子窗口，窗口消息那套对不上）。
+
+    为什么失败要静默并返回 False：这条路径挂在**停服务**上（`manager.echo_stop_self`），
+    边条没在跑 / 管道正忙 / 平台没有边条 —— 都不能让"停 ECHO"失败。
+    通知失败只记一句日志，剩下的交给边条侧的心跳兜底（连续 3 次探不到服务它自己退）。
+    """
+    if os.name != "nt":
+        return False                      # 非 Windows 没有边条宿主，没什么可通知的
+    try:
+        # 以文本方式打开命名管道：客户端写完后句柄关闭 = EOF，
+        # 边条侧 `StreamReader.ReadToEnd()` 这才拿到整条命令（它按"读到 EOF"收命令）。
+        with open(SIDEBAR_PIPE_PATH, "w", encoding="utf-8", newline="") as pipe:
+            pipe.write(command)
+        return True
+    except Exception as e:                # noqa: BLE001 —— 见上：通知失败不影响停服务
+        print(f"[hotkey] 通知边条失败（{SIDEBAR_PIPE_PATH}）: {e}")
+        return False
+
+
+def quit_sidebar():
+    """请边条退出（ECHO **正常停止**时调用；返回通知到没通知到）。
+
+    实现在 `manager.echo_stop_self()` 里：那是"真的停 ECHO"的唯一出口
+    （面板/`POST /api/control/echo/stop` 那条路最后都落在这里）。
+
+    为什么必须由 ECHO 主动通知：边条是独立进程，ECHO 退出带不走它 ——
+    2026-10-21 的现场就是"8970 已停、echo-sidebar.exe 还挂在屏幕上"。
+    通知到了，边条会先显示"ECHO 已停止"再自己关；通知不到（边条没开）也无所谓。
+    """
+    try:
+        ok = _sidebar_pipe_write("quit")
+    except Exception as e:                # noqa: BLE001 —— 兜底：连写管道那位炸了也不许挡停服务
+        print(f"[hotkey] 通知边条退出失败（忽略）: {e}")
+        ok = False
+    print("[hotkey] " + ("已通知边条退出" if ok else "边条不在/连不上（跳过通知，由心跳兜底）"))
+    return ok
+
+
 def toggle_sidebar():
     """切换右缘边条（收起 ⇄ 展开）。
 

@@ -3231,6 +3231,11 @@ def control_echo_stop(_auth=Depends(optional_auth)):
 
     与 `/system/restart` **同一把闸**（2026-10-02）：正在处理的命令、正在录的会议都不许关 ——
     以前这个端点谁都拦，脚本/面板一调就停，而"录音到一半被停"正是 2026-09-23 那次事故的形状。
+
+    关之前还有一步"收尾"在 `manager.echo_stop_self()` 里：**请边条退出**。边条是被
+    DETACHED_PROCESS 起来的独立进程，服务停了它不会自己走（2026-10-21 真机 bug），
+    所以正常停止这条路要主动经边条已有的命名管道发 `quit`（`runtime.quit_sidebar()`）。
+    那一步**失败不挡停止** —— 只是少关一个窗口，日志里留一句。
     """
     if assistant.is_busy():
         return {"ok": False, "message": "有命令正在处理中，请稍后再关闭"}

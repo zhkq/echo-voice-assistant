@@ -16,7 +16,13 @@
 //
 // 诊断：所有异常与每次吸附都会写 %TEMP%\echo-sidebar.log（排查宽度/DIP 问题用）。
 //
+// 退出（2026-10-21 真机 bug：ECHO 停了，边条还挂在屏幕上）：
+//   * 正常停止：ECHO 经**已有的命名管道**发一条 `quit`（`app/runtime.py:quit_sidebar()` /
+//     `scripts\stop.ps1` 也会发同一条命令）→ 本进程关窗退出；
+//   * 兜底：服务被强杀 / 崩溃时没人发 quit，由心跳自己探活退出（判据见 Heartbeat.cs）。
+//
 // 用法：echo-sidebar.exe [--url=http://127.0.0.1:8970/] [--collapsed] [--width=450] [--probe]
+//                       [--signal=toggle|rail-hide|rail-show|rail-expand|quit]
 
 using System.Diagnostics;
 using System.Drawing;
@@ -31,6 +37,12 @@ namespace EchoSidebar;
 /// <summary>边条尺寸与交互常量（Program 与 SidebarForm 共用）。</summary>
 internal static class SidebarConfig
 {
+    /// <summary>
+    /// 单实例信号管道（已有的 IPC）：命令有 toggle / rail-hide / rail-show / rail-expand，
+    /// 以及 2026-10-21 加的 **quit**（请边条退出）。
+    /// 为什么复用这条管道而不是新开一套 HTTP/窗口消息：ECHO 早就在用它发 toggle，
+    /// 边条侧的监听循环也早就在跑 —— 退出只是多一个命令字，不引入新协议、新端口、新依赖。
+    /// </summary>
     public const string PipeName = "echo-sidebar-toggle";
     /// <summary>窄条显示态宽度（逻辑像素）。演进：48 → 64 → 100 → 64（2026-09-12 用户最终选 64）。</summary>
     public const int RailWidth = 64;
@@ -133,19 +145,31 @@ internal static class Program
             $"deviceDpi={DeviceDpiOf()}");
 
         // 单实例：已有边条在跑 → 通知它按 --signal 指定的动作处理，然后本进程退出。
-        // --signal 取值：toggle（默认，与热键同义）| rail-hide | rail-show | rail-expand
+        // --signal 取值：toggle（默认，与热键同义）| rail-hide | rail-show | rail-expand | quit
         //   rail-hide   折叠条收到屏右缘（只留 peek 宽）
         //   rail-show   隐藏态滑回显示态窄条
         //   rail-expand 窄条展开成仪表盘边条（与窄条底部向左箭头同义）
+        //   quit        请已有边条退出（ECHO 正常停止 / stop.ps1 发的是同一条管道命令）
         var signal = (ArgValue(args, "--signal") ?? "toggle").Trim();
         if (TrySignalExistingSidebar(signal))
         {
             Log($"existing sidebar signaled ({signal}); exiting");
             return;
         }
+        // "quit" 是"请**已有**那个边条退出"。没人接的时候必须原地退出 ——
+        // 否则手工敲 `echo-sidebar.exe --signal=quit`（或未来某个脚本这么写）会为了退出
+        // 而**新开一个窗口**（黑色幽默级 bug）。
+        if (string.Equals(signal, "quit", StringComparison.OrdinalIgnoreCase))
+        {
+            Log("quit signal: no existing sidebar to signal; nothing to do");
+            return;
+        }
 
         var form = new SidebarForm(url, collapsed, width, railPath);
         StartToggleListener(form);
+        // 兜底自愈：服务被强杀/崩溃时没人发 quit，边条自己探活退出。
+        // 放在 Application.Run 之前起，`--probe` 那条诊断路径在上面已经 return，不受影响。
+        new SidebarHeartbeat(url, () => form.CloseBecauseServiceStopped("heartbeat")).Start();
         Application.Run(form);
     }
 
@@ -227,7 +251,15 @@ internal static class Program
                     server.WaitForConnection();
                     using var reader = new StreamReader(server, Encoding.UTF8);
                     var command = reader.ReadToEnd();
-                    if (command.Contains("rail-expand", StringComparison.OrdinalIgnoreCase))
+                    // "quit" 放在最前面判：它是"请退出"，与其它命令没有交集，
+                    // 先判可以避免以后新增命令（含 "quit" 子串）时被别的分支吃掉。
+                    if (command.Contains("quit", StringComparison.OrdinalIgnoreCase))
+                    {
+                        // ECHO 正常停止的通知（app/runtime.py:quit_sidebar）或 --signal=quit。
+                        // 仍然是"先改标题说一句、2 秒后关窗"，与心跳兜底走**同一条**收尾路径。
+                        form.BeginInvoke(new Action(() => form.CloseBecauseServiceStopped("ipc quit")));
+                    }
+                    else if (command.Contains("rail-expand", StringComparison.OrdinalIgnoreCase))
                     {
                         form.BeginInvoke(new Action(() => form.ExpandFromRail("signal")));
                     }
@@ -373,6 +405,38 @@ internal sealed class SidebarForm : Form
     }
 
     private int ScaleLogical(int value) => (int)Math.Round(value * (DeviceDpi / 96.0));
+
+    // ---- 服务没了（正常停止的 quit / 心跳判定）→ 自己退，不弹错 ----
+    private bool _closingForServiceStop;
+
+    /// <summary>
+    /// 服务已经停了：先把标题改成一句人话（"ECHO 已停止"），**2 秒后**关窗退出。
+    ///
+    /// 为什么是"改标题 + 等 2 秒"而不是直接消失：用户刚点了「关机」，边条突然蒸发会让人
+    /// 怀疑是不是崩了；给一句话再看它离开更符合预期。同理**绝不弹 MessageBox**
+    /// —— 这不是错误，而且这条路径可能在无人值守（关机 / 服务崩溃）时触发。
+    /// 线程：管道监听与心跳都在后台线程 → 这里负责切回 UI 线程；重复调用只安排一次。
+    /// </summary>
+    internal void CloseBecauseServiceStopped(string reason)
+    {
+        if (IsDisposed) return;
+        if (InvokeRequired)
+        {
+            try { BeginInvoke(new Action(() => CloseBecauseServiceStopped(reason))); } catch { /* 窗体已在关 */ }
+            return;
+        }
+        if (_closingForServiceStop) return;
+        _closingForServiceStop = true;
+        Program.Log($"closing sidebar: service stopped ({reason})");
+        try { Text = "ECHO 已停止"; } catch { /* 标题只是提示，失败不影响退出 */ }
+        var timer = new System.Windows.Forms.Timer { Interval = 2000 };
+        timer.Tick += (_, _) =>
+        {
+            timer.Stop();
+            try { Close(); } catch (Exception ex) { Program.Log("close failed: " + ex.Message); }
+        };
+        timer.Start();
+    }
 
     protected override void WndProc(ref Message m)
     {

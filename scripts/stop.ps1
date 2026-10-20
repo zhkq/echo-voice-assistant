@@ -14,9 +14,14 @@
 # STOP STRATEGY (ordered, all verified before killing):
 #   1. data\echo.pid - stopped only if that pid looks like an ECHO python process
 #   2. command-line scan for '-m app.main' whose path is under this repo
+#   3. our own echo-sidebar.exe - ASK it to exit (it is a separate detached process, so
+#      killing ECHO never takes it down; see "SIDEBAR" below)
 # We do NOT blanket-kill every pythonw.exe: unrelated Python services may be running.
 param(
-    [switch]$Quiet
+    [switch]$Quiet,
+    # Restart path only: a restart starts ECHO again and the rail is meant to survive it
+    # (the rail page retries while ECHO boots), so restart-echo.ps1 passes this switch.
+    [switch]$KeepSidebar
 )
 
 $ErrorActionPreference = 'Stop'
@@ -92,7 +97,7 @@ try {
     Write-Step "WARNING: could not scan processes ($($_.Exception.Message)); only the pid file was used"
 }
 
-# ---- 3) our own local capability backend (added 2026-10-06) ----
+# ---- 4) our own local capability backend (added 2026-10-06) ----
 # Ports 8900/8901 are shared by BOTH installs (dev and stable run one at a time), so a
 # backend left running after ECHO stops keeps the other tree from starting its own - the
 # next switch then comes up against a backend that answers `unauthorized`.
@@ -119,6 +124,54 @@ try {
 } catch {
     Write-Step "WARNING: could not scan for the local backend ($($_.Exception.Message))"
 }
+
+# ---- 3) our own echo-sidebar.exe: ask it to exit (added 2026-10-21) ----
+# WHY this is needed: the sidebar is a SEPARATE process (app/runtime.py launches it with
+# DETACHED_PROCESS precisely so it survives an ECHO restart). So stopping ECHO never takes
+# it down - user report 2026-10-21: "8970 no longer listens, but the sidebar is still on
+# screen". The normal stop path (POST /api/control/echo/stop) sends the same command from
+# Python (app/runtime.py:quit_sidebar); this script has to do it itself because it kills
+# ECHO hard, so there is no Python left to notify anyone.
+#
+# HOW: reuse the sidebar's OWN IPC - the named pipe "echo-sidebar-toggle" that already
+# carries toggle / rail-hide / rail-show / rail-expand - and send one more command, "quit".
+# Nothing new is invented: no extra port, no new protocol.
+#
+# OWNERSHIP: same rule as for ECHO above - only a sidebar whose command line points into
+# THIS tree is signalled, so another install's rail is never touched. And if it does not
+# answer (older build, pipe busy), that is only a note: the sidebar's own heartbeat
+# (sidebar/Heartbeat.cs) exits it a few seconds later when the service is gone.
+function Send-SidebarQuit([string]$root) {
+    $ourSidebars = @()
+    try {
+        $procs = Get-CimInstance Win32_Process -Filter "Name like 'echo-sidebar%'" -ErrorAction Stop
+        foreach ($p in $procs) {
+            if ([string]$p.CommandLine -like "*$root\sidebar\*") { $ourSidebars += $p.ProcessId }
+        }
+    } catch {
+        Write-Step "WARNING: could not look for the sidebar ($($_.Exception.Message))"
+        return
+    }
+    foreach ($sidebarPid in $ourSidebars) {
+        $pipe = $null
+        try {
+            $pipe = New-Object System.IO.Pipes.NamedPipeClientStream -ArgumentList '.', 'echo-sidebar-toggle', ([System.IO.Pipes.PipeDirection]::Out)
+            $pipe.Connect(600)
+            $writer = New-Object System.IO.StreamWriter -ArgumentList $pipe
+            $writer.Write('quit')
+            $writer.Flush()
+            $writer.Dispose()
+            $pipe.Dispose()
+            Write-Step "asked the sidebar to exit (pid $sidebarPid)"
+        } catch {
+            Write-Step "sidebar did not take the quit command (pid $sidebarPid): $($_.Exception.Message)"
+        } finally {
+            if ($pipe) { try { $pipe.Dispose() } catch { } }
+        }
+    }
+}
+
+if (-not $KeepSidebar) { Send-SidebarQuit $root }
 
 if ($stopped.Count -eq 0) {
     Write-Step 'ECHO was not running (or could not be identified)'
