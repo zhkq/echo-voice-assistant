@@ -4,6 +4,8 @@ import com.echo.contact.audio.SegmentFormat
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 /**
  * **本地先写 + 机会性上传**的编排（纯逻辑：jvm 单测里注入一个假的 [OfflineTransport]
@@ -65,6 +67,18 @@ object OfflineMeetingSync {
          * 不靠调用方记得传对）。
          */
         scope: SyncScope = SyncScope.FINALIZE,
+        /**
+         * 同时在飞的段数上限（默认 [SegmentUploadPlan.DEFAULT_CONCURRENCY] = 3）。
+         *
+         * 为什么它是个参数而不是写死：单连接吞吐只有 30–160 KB/s（2026-10-19 实测那一场），
+         * 3 路能把链路余量吃进来；但并发上限同时是**内存上界**（每段整段读进内存，
+         * 10 分钟 FLAC ≈ 10 MB）与**乱序上界**。真机上哪天链路变了、或者要看"不并发到底
+         * 慢多少"，都要能只调这一处（[SegmentUploadPlan.normalizedConcurrency] 会夹到 1..3）。
+         *
+         * ⚠️ 它**不改任何判定**：不重传（水位只按连续前缀推进）、不乱序（服务端按 seq 落盘）、
+         * 不提前 stop（段没全成就停在这一轮）这三条一个字都没变，见 [SegmentUploadPlan]。
+         */
+        concurrency: Int = SegmentUploadPlan.DEFAULT_CONCURRENCY,
         /**
          * ③ 对账开始那一刻的回调（用例钉"调用序列"用；`null` = 不关心）。
          *
@@ -139,12 +153,22 @@ object OfflineMeetingSync {
         }
 
         // ---- ③ 一份一份地传（按开始时间升序 = 会议的自然顺序）----
+        //
+        // ⚠️ "一份一份"说的是**清单之间**：一份清单里的**段**是并发传的
+        // （[SegmentUploadPlan]，最多 3 段同时在飞）。为什么要分这两层：
+        //  * 两份清单属于两场会，并发传会让"先给哪个真实原因"变得随机，也会让服务端的
+        //    "唯一那条录音槽"语义更难说清 —— 保持串行；
+        //  * 同一份清单里的段是同一场会，服务端按 `seq` 落盘且幂等，并发传是安全的
+        //    （而且那正是"单连接 30–160 KB/s"的解法）。
         var confirmed = 0
         var total = 0
         var pending = 0
         var anyUploaded = false
         var anyStopped = false
         var anyFinalized = false
+        /** 这一轮**真的**成功 / 失败了几段（用户要看的那句"成功 2 / 失败 1"）。 */
+        var roundSucceeded = 0
+        var roundFailed = 0
         /** 「暂停区间没报上去」那句（如实记下来，最后附在 note 上 —— 见 withPauseNote）。 */
         var pauseNote = ""
         // 进度用的总量与"前面几份已经确认了几段"（**只用于展示**，判定一个都不依赖它）
@@ -152,14 +176,16 @@ object OfflineMeetingSync {
         var confirmedBefore = 0
         for (draft in drafts) {
             val baseConfirmed = confirmedBefore
-            val stage = syncOne(transport, store, draft, force, scope, reconcileAt,
-                onSegment = if (onProgress == null) null else { seq, bytes ->
-                    // 这一段**正要开始传**：它自己还没被确认，所以只数到它前面那一小段。
-                    // （原先写成 `seq - acked` 会把"正在传的这段"提前算成已传 —— 界面会
-                    //  显示 1/3 却其实一段都还没到服务端，那正是"谎报进度"。）
-                    val inDraft = (seq - 1 - draft.acknowledgedSegments).coerceAtLeast(0)
-                    val done = (baseConfirmed + draft.confirmedSegments + inDraft)
-                        .coerceIn(0, totalAll)
+            val stage = syncOne(transport, store, draft, force, scope, concurrency, reconcileAt,
+                onSegment = if (onProgress == null) null else { seq, bytes, ack ->
+                    // 这一段**正要开始传**：界面上"已传几段"必须是**真到了**的段数。
+                    // ⚠️ 并发之后不能再用 `seq - 1 - acked` 去算（那假设"它前面几段都成了"，
+                    // 而第 3 段完全可能在飞时第 2 段还在等重试）—— 那会把没到的段算成已传
+                    //（"谎报进度"：用户按完同步看到 2/3，其实只有 1 段到了服务端）。
+                    // 所以只数**清单里真有的、且水位以内**的段（水位由连续前缀推进，
+                    // 见 `SegmentUploadPlan.contiguousAcknowledged`）。
+                    val inDraft = draft.segments.count { it.seq <= ack }
+                    val done = (baseConfirmed + inDraft).coerceIn(0, totalAll)
                     onProgress(SyncProgress(
                         drafts = drafts.size,
                         totalSegments = totalAll,
@@ -171,11 +197,11 @@ object OfflineMeetingSync {
                         currentBytes = bytes,
                     ))
                 },
-                onSegmentOk = if (onSegmentDone == null) null else { seq ->
+                onSegmentOk = if (onSegmentDone == null) null else { seq, ack ->
                     // 这一段**已经**被服务端收下了：数它本身进来（与"开始传"那一报的区别就在这里）。
-                    // 用 `seq <= seq` 去数清单里真有的段，而不是算 `seq - acked` ——
-                    // 清单万一有洞（老版本截断过），减法会算出一个不存在的"已传段数"。
-                    val inDraft = draft.segments.count { it.seq <= seq }
+                    // 同样按**水位以内**的段数去数，而不是"序号小于等于刚成功那段的段"：
+                    // 并发下 seq=3 先成、seq=2 还在飞时，后者会把 2 也算成已传（那同样是谎报）。
+                    val inDraft = draft.segments.count { it.seq <= ack }
                     val done = (baseConfirmed + inDraft).coerceIn(0, totalAll)
                     onSegmentDone(SyncProgress(
                         drafts = drafts.size,
@@ -192,18 +218,23 @@ object OfflineMeetingSync {
             anyStopped = anyStopped || stage.stopped
             anyFinalized = anyFinalized || stage.finalized
             pauseNote = stage.pauseNote.ifBlank { pauseNote }
+            roundSucceeded += stage.roundSucceeded
+            roundFailed += stage.roundFailed
             confirmed += d.confirmedSegments
             total += d.segments.size
             pending += d.pendingSegments
             if (stage.result != null) {
-                // 这一份停下了（不可达 / 服务端拒绝 / 对账不符 / **stop 没成**）：**别继续下一份**
-                // —— 后面那些多半会遇到同样的问题，而用户要看到的是**第一个真实原因**。
+                // 这一份停下了（不可达 / 服务端拒绝 / 对账不符 / **stop 没成** / 段失败）：
+                // **别继续下一份** —— 后面那些多半会遇到同样的问题，而用户要看到的
+                // 是**第一个真实原因**。
                 return stage.result.copy(
                     drafts = drafts.size,
                     manual = manual,
                     confirmedSegments = confirmed,
                     totalSegments = total,
                     pendingSegments = pending,
+                    roundSucceeded = roundSucceeded,
+                    roundFailed = roundFailed,
                     note = withPauseNote(withPauseNote(stage.result.note, pauseNote),
                         inferredEndNote(drafts)),
                 )
@@ -232,6 +263,8 @@ object OfflineMeetingSync {
             totalSegments = total,
             pendingSegments = pending,
             stopped = stopped,
+            roundSucceeded = roundSucceeded,
+            roundFailed = roundFailed,
             note = withPauseNote(withPauseNote(baseNote, pauseNote), inferredEndNote(drafts)),
             manual = manual,
         )
@@ -254,8 +287,8 @@ object OfflineMeetingSync {
     )
 
     /**
-     * 一份清单的同步：**先建会**（带 `clientId` 幂等）→ **上报暂停区间** → **按序传段**（可续传）
-     * →（只有"已经录完"才继续）**对账** → **stop**。
+     * 一份清单的同步：**先建会**（带 `clientId` 幂等）→ **上报暂停区间** → **传段**
+     * （受控并发，见 [SegmentUploadPlan]；可续传）→（只有"已经录完"才继续）**对账** → **stop**。
      *
      * 顺序**不许颠倒**（每一条都对应一次真实的静默错法）：
      *  * stop 在对账**之后**：段还没到齐就收尾，服务端会拿一份缺段的音频去转写；
@@ -283,6 +316,8 @@ object OfflineMeetingSync {
         force: Boolean,
         /** 这一轮的口径（[SyncScope]）；还在录的那一份会被就地降级成 INCREMENTAL。 */
         scope: SyncScope,
+        /** 同时在飞的段数上限（见 [SegmentUploadPlan]；`1` = 串行，行为与改动前逐字相同）。 */
+        concurrency: Int,
         /**
          * ③ 对账开始那一刻的回调（`null` = 不关心）。
          *
@@ -295,10 +330,12 @@ object OfflineMeetingSync {
         reconcileAt: ((MeetingDraft) -> Unit)? = null,
         /** 每一段**开始上传之前**报一次（[run] 的 `onProgress` 用；`null` = 不关心）。
          *  第二个参数是**这一段多少字节**（前台通知那句"第 3 段 12.4 MB"就靠它；
-         *  读不到大小就给 0 —— 通知里只报段号，**绝不编一个大小**）。 */
-        onSegment: ((Int, Long) -> Unit)? = null,
-        /** 每一段**被服务端收下之后**报一次（[run] 的 `onSegmentDone` 用；`null` = 不关心）。 */
-        onSegmentOk: ((Int) -> Unit)? = null,
+         *  读不到大小就给 0 —— 通知里只报段号，**绝不编一个大小**）。
+         *  第三个参数是**此刻的连续水位**（并发下"已传几段"只能按水位数，见 [run]）。 */
+        onSegment: ((Int, Long, Int) -> Unit)? = null,
+        /** 每一段**被服务端收下之后**报一次（[run] 的 `onSegmentDone` 用；`null` = 不关心）。
+         *  第二个参数是这一段之后**连续**确认到的水位。 */
+        onSegmentOk: ((Int, Int) -> Unit)? = null,
     ): StageResult {
         var d = draft
         val finalize = scope == SyncScope.FINALIZE && !d.recording
@@ -361,77 +398,154 @@ object OfflineMeetingSync {
             }
         }
 
-        // ② 按序传段：一段失败就停在这（顺序不许破），已成功的**立刻推进水位**（可续传）
+        // ② 传段：**受控并发**（最多 N 段同时在飞；用户 2026-10-20：*"手机补传录音太慢了"*）
         //
-        // ⚠️ **成功后必须继续下一段**（用户 2026-10-19 的"传完第 1 段就停住"）：
-        // 这个循环里**没有** `break`、也没有"传一段就跑下一件事"的分支 —— 只有
-        // ① 本地缺文件、② 服务端没收下，这两种情况才 `return`（而且都保留水位、不删音频）。
-        // 循环跑完之后才允许进对账与 `stop`（见 ③④ 的说明：**段没传完绝不 stop**）。
+        // 三条铁律一条都不放松，只是把"一段一段来"换成"几段一起飞"（见 [SegmentUploadPlan]）：
+        //  * **不重传**：`segmentsToUploadOf` 已经排除水位以内的段；而水位**只按连续前缀**推进
+        //    （`contiguousAcknowledged`）—— "第 3 段成功、第 2 段失败"绝不会把水位推过 2，
+        //    下一轮仍然从第 2 段补。
+        //  * **不乱序**：到达顺序可以是乱的（服务端按 `seq` 落盘、同一段重复传是幂等的），
+        //    但**确认**（水位）永远是顺序的、单调的。
+        //  * **不提前 stop**：任何一段失败都在这里就 return（对账与 stop 都在它后面）。
+        //
+        // ⚠️ **成功后必须继续传**（用户 2026-10-19 的"传完第 1 段就停住"）：这一整块里
+        // 只有"本地缺文件"与"服务端没收下"两种失败会 return；全部段成了之后才允许进
+        // 对账与 stop（见 ③④ 的说明：**段没传完绝不 stop**）。
         var serverCount: Int? = null
-        for (seg in segmentsToUploadOf(d)) {
-            // **按清单里记的名字**找音频：见 audioFileOf —— 按 seq 拼就得先猜一个格式
-            // （FLAC 还是 WAV），猜错就会得到"文件不存在"，于是补传永远卡在第一段
-            val file = store.audioFileOf(d.clientId, seg)
-            if (!file.isFile) {
-                // 本地没有这个文件：**不许跳过去传后面的**（顺序就是内容），也不许编空段。
-                return StageResult(d, which(OfflinePhase.FAILED, d,
-                    "第 ${seg.seq} 段的音频不在手机里（${seg.file}）：先别传后面的，免得顺序乱", force))
-            }
-            // 这一段马上要发了：先报一次进度（"正在传第 N 段"）—— 一个 10 分钟段的上传
-            // 可能要几十秒到几分钟，没有这一步界面在这段时间里一动不动（= 看着像卡住）。
-            // 顺手把这**一段多大**报出去（前台通知那句"第 3 段 12.4 MB"要的是真数，
-            // 不是估算）；`length()` 读不到就给 0，通知里就只报段号。
-            onSegment?.invoke(seg.seq, runCatching { file.length() }.getOrDefault(0L))
-            val bytes = try {
-                file.readBytes()
-            } catch (e: Exception) {
-                return StageResult(d, which(OfflinePhase.FAILED, d,
-                    "读不到第 ${seg.seq} 段的音频：${e.message}", force))
+        var roundSucceeded = 0
+        var roundFailed = 0
+
+        val planned = segmentsToUploadOf(d)
+        // 本地缺文件：**先查一遍再发**。缺在哪一段，就只传它**前面**那几段，然后停在它这里。
+        //
+        // 为什么并发之后这条判据更要在（而不是"反正服务端按 seq 落盘，跳过去传也没事"）：
+        // 缺文件是**本地数据问题**（不是网络），越过它去传后面的段，服务端那份会议会多出
+        // 一段"没有前文"的音频，而水位永远卡在缺口 —— 那些字节是白传的，用户还得再等一轮。
+        val missing = planned.firstOrNull { !store.audioFileOf(d.clientId, it).isFile }
+        val toSend = if (missing == null) planned else planned.filter { it.seq < missing.seq }
+
+        if (toSend.isNotEmpty()) {
+            // 清单落盘与界面回调会从**多个**上传协程里进来：用一把锁把它们串起来。
+            // （不加锁的话两份清单会互相覆盖 —— 表现是"水位莫名其妙退回去"，
+            //   而界面上"已传 M 段"会跳来跳去、通知也会被两次并发调用挤乱。）
+            val persistLock = Mutex()
+            // 这一轮不会变的三个字段先抓出来（协程里读 `d` 会读到别人正在改的版本）
+            val cid = d.clientId
+            val startedAt = d.startedAt
+            val source = d.source
+
+            /**
+             * 真搬运：**按清单里记的名字**找音频（见 audioFileOf —— 按 seq 拼就得先猜一个格式，
+             * FLAC 还是 WAV，猜错就会得到"文件不存在"，于是补传永远卡在第一段）。
+             *
+             * 它会被**多个协程同时**调用，所以只碰不可变的入参；共享状态（清单、进度回调）
+             * 一律走 [persistLock]。
+             */
+            val shipOne = SegmentShipper { seg ->
+                val file = store.audioFileOf(cid, seg)
+                // 这一段马上要发了：先报一次进度（"正在传第 N 段"）—— 一个 10 分钟段的上传
+                // 可能要几十秒到几分钟，没有这一步界面在这段时间里一动不动（= 看着像卡住）。
+                // 顺手把这**一段多大**报出去（前台通知那句"第 3 段 12.4 MB"要的是真数，
+                // 不是估算）；`length()` 读不到就给 0，通知里就只报段号。
+                val size = runCatching { file.length() }.getOrDefault(0L)
+                persistLock.withLock { onSegment?.invoke(seg.seq, size, d.acknowledgedSegments) }
+                val bytes = try {
+                    file.readBytes()
+                } catch (e: Exception) {
+                    // 读不出来 = 重试也不会好（文件没了/权限坏了），归"服务端拒了"那一档
+                    // （不是网络问题，别让它退避重试）。
+                    return@SegmentShipper SegmentShipOutcome.Failed(seg.seq,
+                        SyncFailure.REJECTED,
+                        "读不到第 ${seg.seq} 段的音频：${e.message}", retryable = false)
+                }
+                when (val out = transport.uploadSegment(
+                    UploadRequest(
+                        clientId = cid, seq = seg.seq, startedAt = startedAt,
+                        source = source, wav = bytes,
+                        // ⚠️ Content-Type 用**这一段清单里记的**格式（绝不按"我们想要 FLAC"发）
+                        format = seg.format,
+                    )
+                )) {
+                    is SegmentOutcome.Ok -> SegmentShipOutcome.Ok(
+                        seq = seg.seq,
+                        serverMeetingId = out.serverMeetingId,
+                        serverCount = out.serverCount,
+                    )
+                    is SegmentOutcome.Failed -> SegmentShipOutcome.Failed(
+                        seq = seg.seq, failure = out.failure,
+                        note = out.note, retryable = out.retryable)
+                }
             }
 
-            when (val out = transport.uploadSegment(
-                UploadRequest(
-                    clientId = d.clientId, seq = seg.seq, startedAt = d.startedAt,
-                    source = d.source, wav = bytes,
-                    // ⚠️ Content-Type 用**这一段清单里记的**格式（绝不按"我们想要 FLAC"发）
-                    format = seg.format,
-                )
-            )) {
-                is SegmentOutcome.Ok -> {
-                    if (out.serverMeetingId > 0 && out.serverMeetingId != d.serverMeetingId) {
-                        d = d.copy(serverMeetingId = out.serverMeetingId)
+            val round = SegmentUploadPlan.run(
+                segments = toSend,
+                acknowledged = d.acknowledgedSegments,
+                concurrency = concurrency,
+                shipper = shipOne,
+                onSucceeded = { ok, ack ->
+                    persistLock.withLock {
+                        // ⚠️ **以磁盘上那份为底稿**再改，而不是拿本轮开始时的快照直接 save。
+                        //
+                        // 为什么（这条与并发直接相关）：并发让"每段成功一次落盘"在几秒内连发三次，
+                        // 而录音那一侧（`MeetingRecordSession`）在**同一时间**完全可能刚封存了
+                        // 新的一段、或刚记了一条暂停区间（它每次都先重读磁盘）。拿快照 save
+                        // 会把那条刚写进去的事实抹掉 —— 音频文件还在，但清单里没有它，
+                        // 那一段就**永远不会被补传**（这是真的丢内容，不是显示问题）。
+                        store.load(cid)?.let { onDisk -> d = onDisk }
+                        if (ok.serverMeetingId > 0 && ok.serverMeetingId != d.serverMeetingId) {
+                            d = d.copy(serverMeetingId = ok.serverMeetingId)
+                        }
+                        // **连续前缀推进水位**并立刻落盘：中途断网/进程被杀时下一轮从这里续。
+                        // （`markAcknowledged` 只前进 —— 一段晚到的成功不会把水位拉回去。）
+                        d = store.markAcknowledged(d, ack)
+                        d = d.copy(uploaded = false)      // 只要还有没传的段，就还不是"已上传"
+                        store.save(d)
+                        ActiveDraft.current?.takeIf { it.clientId == d.clientId }
+                            ?.let { ActiveDraft.set(d) }
+                        // 服务端回过的**累计段数**取**最大**的：并发下响应可能乱序回来，
+                        // 但"最大的那个"必然是"最靠后的那次处理"看到的数（= 前面那些也都在）。
+                        ok.serverCount?.let { n -> if (n > (serverCount ?: -1)) serverCount = n }
+                        // 这一段**真的到服务端了**：立刻把真数报给界面（见 `onSegmentDone` 的说明）
+                        onSegmentOk?.invoke(ok.seq, ack)
                     }
-                    // **逐段推进确认水位**并落盘：中途断网时下一轮从这里续
-                    d = store.markAcknowledged(
-                        d, acknowledgedAfterUpload(d.acknowledgedSegments, seg.seq))
-                    d = d.copy(uploaded = false)          // 只要还有没传的段，就还不是"已上传"
-                    store.save(d)
-                    ActiveDraft.current?.takeIf { it.clientId == d.clientId }?.let { ActiveDraft.set(d) }
-                    out.serverCount?.let { serverCount = it }
-                    // 这一段**真的到服务端了**：立刻把真数报给界面（见 `onSegmentDone` 的说明），
-                    // 然后**继续下一段** —— 循环不 break、不 return，直到清单里该传的段都传完。
-                    onSegmentOk?.invoke(seg.seq)
+                },
+            )
+            roundSucceeded = round.succeeded
+            roundFailed = round.failed
+
+            if (!round.allSucceeded) {
+                // 段层面失败：**已经推进的水位保留**（那几段是真被认下的），音频一律不删。
+                store.save(d.copy(uploaded = false))
+                val f = round.firstFailure
+                if (f == null) {
+                    // 计划里的段一段都没发（理论上不会发生：没失败就不会有跳过）：
+                    // 如实说"这一轮一段都没传成"，绝不冒充成功。
+                    return StageResult(d, which(OfflinePhase.WAITING_UPLOAD, d,
+                        "这一轮一段都没传成（并发调度没起作用）", force),
+                        roundSucceeded = roundSucceeded, roundFailed = roundFailed)
                 }
-                is SegmentOutcome.Failed -> {
-                    val phase = if (out.retryable) OfflinePhase.WAITING_UPLOAD else OfflinePhase.FAILED
-                    // 段层面失败：**已经推进的水位保留**（那几段是真被认下的），音频一律不删
-                    store.save(d.copy(uploaded = false))
-                    // ## 为什么失败这句话里必须带上"已传过的段不会重传、下次从第 N 段接着传"
-                    //
-                    // 用户 2026-10-19 的原话是"传了一段，但是后面好像还是不行"。他真正怕的是
-                    // **又要从第 1 段重来**（那是 18 MB 白传一遍）。而这条路的真相恰恰相反：
-                    // 水位（`acknowledgedSegments`）在每段成功后**立刻落盘**，
-                    // 下一轮 `segmentsToUploadOf` 就从前几段之后开始 —— 所以这句话不是安慰，
-                    // 是这条链路本来就有的行为，只是以前**没有告诉用户**。
-                    // 混在"服务端拒了"那种原因里更不行：那时"重试"根本没意义，得说清是两回事。
-                    val resume = if (d.confirmedSegments > 0) {
-                        "；已传过的 ${d.confirmedSegments} 段不会重传，下次从第 ${seg.seq} 段接着传"
-                    } else {
-                        "；一段都还没传上去，下次从第 ${seg.seq} 段开始"
-                    }
-                    return StageResult(d, which(phase, d, out.note + resume, force))
+                val resume = if (d.confirmedSegments > 0) {
+                    "；已传过的 ${d.confirmedSegments} 段不会重传，下次从第 ${f.seq} 段接着传"
+                } else {
+                    "；一段都还没传上去，下次从第 ${f.seq} 段开始"
                 }
+                // 用户要看的那句"成功 2 / 失败 1"：并发之后一轮里可以同时发生两件事，
+                // 只说"第 2 段失败"会让人以为只有那一段有结果（其实另外两段已经上去了）。
+                val account = "这一轮成功 ${round.succeeded} 段、失败 ${round.failed} 段" +
+                    (if (round.skippedSeqs.isNotEmpty())
+                        "（还有 ${round.skippedSeqs.size} 段因为前面失败没发）" else "")
+                val phase = if (f.retryable) OfflinePhase.WAITING_UPLOAD else OfflinePhase.FAILED
+                return StageResult(d, which(phase, d,
+                    "$account（第一处失败是第 ${f.seq} 段）：${f.note}$resume", force),
+                    roundSucceeded = roundSucceeded, roundFailed = roundFailed)
             }
+        }
+
+        if (missing != null) {
+            // 本地没有这个文件：**不许跳过去传后面的**（顺序就是内容），也不许编空段。
+            return StageResult(d, which(OfflinePhase.FAILED, d,
+                "第 ${missing.seq} 段的音频不在手机里（${missing.file}）：先别传后面的，免得顺序乱",
+                force), roundSucceeded = roundSucceeded, roundFailed = roundFailed)
         }
 
         // ---- 还在录（或这一轮只说"机会性上传"）：到这里就够了，绝不收尾 ----
@@ -563,6 +677,10 @@ object OfflineMeetingSync {
         val finalized: Boolean = false,
         /** 「暂停区间没报上去」那句如实的话（空 = 报上去了，或这一场没有暂停区间）。 */
         val pauseNote: String = "",
+        /** 这一份里**真的**成功了几段（并发之后一轮里可以两件事同时发生）。 */
+        val roundSucceeded: Int = 0,
+        /** 这一份里**真的**失败了几段。 */
+        val roundFailed: Int = 0,
     )
 
     // ---- 状态流（界面读它；与 MicState 同一个套路）----
@@ -599,6 +717,17 @@ data class OfflineSyncResult(
      * 两者混成一个字段就再也没法如实说出"传上去了但没收尾"。
      */
     val stopped: Boolean = false,
+    /**
+     * 这一轮**真的**成功了几段（并发上传之后，一轮里"有成功的"和"有失败的"可以同时成立）。
+     *
+     * 为什么要单独一档、而不是拿 [confirmedSegments] 顶着：后者是**连续水位**
+     * （"下次从哪儿续"的唯一依据）—— 并发下 `seq=3` 成功而 `seq=2` 失败时，水位只到 1，
+     * 而这一轮其实**成功了两段**。两个数说的是两件事，混在一起就会要么谎报进度、要么
+     * 让人以为白传了一段。用户要看的是这一句："这一轮成功 2 段、失败 1 段"。
+     */
+    val roundSucceeded: Int = 0,
+    /** 这一轮**真的**失败了几段（下一轮从 [confirmedSegments] 之后的那个缺口继续）。 */
+    val roundFailed: Int = 0,
     val note: String = "",
     val manual: Boolean = false,
 ) {

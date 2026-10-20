@@ -30,11 +30,16 @@ import java.net.SocketTimeoutException
  *
  * ## ① 段循环（`OfflineMeetingSync.syncOne`）—— 结果：代码本身没问题，用例把它钉死
  *
- * 循环是 `for (seg in segmentsToUploadOf(d))`：每段成功 → 推进水位（落盘）→ **继续下一段**，
- * 没有 `break`、也没有"传一段就跳到收尾"的分支；只有"本地缺文件"与"服务端没收下"才
- * `return`（两者都不动水位、不删音频、**不 stop**）。所以病根不在这里 —— 但"这里没病"
+ * 串行那一版是 `for (seg in segmentsToUploadOf(d))`：每段成功 → 推进水位（落盘）→
+ * **继续下一段**，没有 `break`、也没有"传一段就跳到收尾"的分支；只有"本地缺文件"与
+ * "服务端没收下"才 `return`（两者都不动水位、不删音频、**不 stop**）。
+ *
+ * ⚠️ 2026-10-20 起这一段改成了**受控并发**（`SegmentUploadPlan`，最多 3 段同时在飞）：
+ * "顺序"从"一段一段发"变成了"**确认**只按连续前缀推进"（见 `ParallelSegmentUploadTest`）。
+ * 这里那三条判据**一条都没丢**，只是盯的对象从"循环体"换成了"传段块"：
+ * 每段都发、最后才 stop、段没传完绝不 stop。所以病根不在这里 —— 但"这里没病"
  * 本身必须是一条**能被反复验证**的判据（下面的序列断言与源码级断言），
- * 否则下次谁改一个 `break` 进去，症状完全一样而没人看得出。
+ * 否则下次谁改一个 `break`（或把 `stop` 提到传段前面）进去，症状完全一样而没人看得出。
  *
  * ## ② 每段上传的 HTTP 超时 —— 这才是真机上的病根
  *
@@ -312,39 +317,43 @@ class OfflineMeetingSegmentLoopTest {
     // ---------------------------------------------------------------- ② 段没传完绝不 stop（源码级）
 
     /**
-     * **源码级判据**：`stop` 只可能在"段循环走完 + 对账通过"之后才被调到。
+     * **源码级判据**：`stop` 只可能在"传段走完 + 对账通过"之后才被调到。
      *
      * 为什么序列级判据不够、还得看源码：假 transport 的调用序列只能证明"这一轮没调到 stop"，
-     * 证明不了"结构上不可能调到" —— 例如有人把 `stop` 提到循环前面（"先收尾再补段"），
+     * 证明不了"结构上不可能调到" —— 例如有人把 `stop` 提到传段前面（"先收尾再补段"），
      * 在"段全成功"的用例里**照样全绿**（stop 还是只有一次、还是最后），
      * 而真机上那等于**拿一份缺段的音频去转写**。
      *
      * 三条检查（都对着源码文本，只读不改）：
-     *  1. `transport.stopMeeting(` 的位置在 `for (seg in segmentsToUploadOf(d))` **之后**；
+     *  1. `transport.stopMeeting(` 的位置在**传段那一块**（`SegmentUploadPlan.run(`）**之后**；
      *  2. 对账（`reconcileAt?.invoke(d)`）在 `stop` **之前**；
-     *  3. 循环体里**没有 `break`**（break 会直接跳到对账/stop，等于"没传完就收尾"），
-     *     并且循环体里真的有一条 `return StageResult(`（失败就在循环里停下，不往下走）。
+     *  3. 传段那一块里**没有** `stopMeeting(`，而且段失败时就在块里 `return`（不往下走到收尾）。
+     *
+     * ⚠️ 2026-10-20 起段是**受控并发**传的（`SegmentUploadPlan`），所以这里盯的
+     * "循环体"换成了"传段块"（`SegmentUploadPlan.run(` … `// ---- 还在录`）。判据本身
+     * 一个都没放松：**段没全成绝不 stop**。
      */
     @Test
-    fun `段没传完绝不 stop（源码级：stop 在段循环与对账之后）`() {
+    fun `段没传完绝不 stop（源码级：stop 在传段与对账之后）`() {
         val src = source("src/main/java/com/echo/contact/service/OfflineMeetingSync.kt")
-        val loop = src.indexOf("for (seg in segmentsToUploadOf(d))")
+        val upload = src.indexOf("SegmentUploadPlan.run(")
         val stop = src.indexOf("transport.stopMeeting(")
         val reconcile = src.indexOf("reconcileAt?.invoke(d)")
-        assertTrue("源码里找不到段循环（判据会失效，别当成通过）", loop > 0)
+        assertTrue("源码里找不到传段那一块（判据会失效，别当成通过）", upload > 0)
         assertTrue("源码里找不到 stop 调用", stop > 0)
-        assertTrue("stop 必须在段循环**之后**（否则就是拿一份缺段的音频去转写）", stop > loop)
+        assertTrue("stop 必须在传段**之后**（否则就是拿一份缺段的音频去转写）", stop > upload)
         assertTrue("对账必须在 stop 之前", reconcile > 0 && reconcile < stop)
 
-        // 循环体到"这一轮只传段、不收尾"那一档为止：里面不许 break，且失败要 return
-        val tail = src.indexOf("// ---- 还在录", loop)
-        assertTrue("找不到循环体结束的位置（注释被改了？）", tail > loop)
-        val loopBody = src.substring(loop, tail)
-        // ⚠️ 只看**代码行**（丢掉注释行）：这一段的注释里本来就会写"没有 break"这句话，
-        // 按整段文本去搜会把自己写的那句注释当成 break（这条用例第一次跑就是这样红的）。
-        val code = loopBody.lines().filterNot { it.trim().startsWith("//") }.joinToString("\n")
-        assertFalse("循环体里不许有 break：那会跳出去走到对账与 stop", code.contains("break"))
-        assertTrue("段失败必须在循环里就 return（不往下走到收尾）",
+        // 传段块到"这一轮只传段、不收尾"那一档为止：里面不许 stop，失败要在块里 return
+        val tail = src.indexOf("// ---- 还在录", upload)
+        assertTrue("找不到传段块结束的位置（注释被改了？）", tail > upload)
+        val block = src.substring(upload, tail)
+        // ⚠️ 只看**代码行**（丢掉注释行）：这一段的注释里本来就会解释"为什么不在这里 stop"，
+        // 按整段文本去搜会把自己写的那句注释当成调用（这条用例第一次就是这么红的）。
+        val code = block.lines().filterNot { it.trim().startsWith("//") }.joinToString("\n")
+        assertFalse("传段块里不许有 stop：那会跳出去在段没齐的时候收尾",
+            code.contains("transport.stopMeeting("))
+        assertTrue("段失败必须在块里就 return（不往下走到对账与收尾）",
             code.contains("return StageResult("))
     }
 

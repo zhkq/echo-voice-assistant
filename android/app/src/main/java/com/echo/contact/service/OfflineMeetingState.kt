@@ -469,8 +469,13 @@ fun segmentsToUpload(sequences: List<Int>, acknowledged: Int): List<Int> =
 /**
  * 一段传成功之后，本地的确认水位（单调递增；纯函数）。
  *
- * 为什么是"逐段推水位"而不是"传完一起推"：中途断网时水位停在最后一段，
- * 下次续传就从那里接着走（这就是"可续传"的全部实现）。
+ * ⚠️ **并发上传之后不要再用它推进水位**（2026-10-20）：它算的是 `max(水位, seq)`，
+ * 而"第 3 段成功、第 2 段失败"时 `max` 会把水位推过缺口 —— 下一轮就**跳过第 2 段**，
+ * 服务端那份会议永远缺一段（转写里少一句话、对账永远不符），用户看到的却是"已传完"。
+ *
+ * 现在唯一的水位判据是 `SegmentUploadPlan.contiguousAcknowledged`（**连续前缀**）。
+ * 这个函数留着只是因为它是"单段推进"的最朴素定义（`OfflineMeetingStateTest` 钉着它），
+ * 别在新代码里拿它算整轮水位。
  */
 fun acknowledgedAfterUpload(acknowledged: Int, seq: Int): Int = maxOf(acknowledged, seq)
 
