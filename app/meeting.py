@@ -703,6 +703,16 @@ def meeting_status():
         if cid:
             st["clientId"] = cid
             st["meetingId"] = _meeting_id_for()
+    #: **仅上传 ≠ 在录音**（2026-10-20）：这一场是"已录完、只剩收段"的手机补传时，
+    #: 多给一个 `uploading: true`，面板/客户端据此区分"电脑正在录"与"手机还在补传"
+    #: （`active && uploading` = 后者）。
+    #:
+    #: ⚠️ `active` 的语义**一个字不动**（它仍然是"内存里有一场占着"，pause/stop/
+    #: 客户端契约都按它走 —— 改成 false 会把整条既有判据改掉）。也**只在**这一档
+    #: 才加这个键：本机麦那条路的键集被 `tests/test_api_contract.py` 逐个钉着，
+    #: 无条件加 `uploading: false` 同样会破契约。
+    if _active_is_upload_only():
+        st["uploading"] = True
     return st
 
 
@@ -1149,6 +1159,34 @@ def _uploading_meeting_for(client_id):
     if not meta.get(UPLOADING_KEY) and not str(meta.get("clientEndedAt") or "").strip():
         return None
     return name, folder, meta
+
+
+def _active_is_upload_only():
+    """`_state` 里占着的那一场，是不是"**已结束、只剩收段**"的手机补传？
+
+    为什么要有这一条（2026-10-20 真机）：手机补传卡住时 `_state["active"]` 一直是真，
+    于是用户**在电脑上开录**被"会议录音已在进行中"挡住 —— 可那一场早就录完了
+    （客户端明说了 `endedAt`），电脑这边只是还在等它剩下的段。**仅上传 ≠ 在录音**。
+
+    判据全部读盘（`_uploading_meeting_for`：`source=phone` + `uploading`/`clientEndedAt`
+    + 没有 `end`），并且要求"**盘上那一场就是内存里这一场**"：不这么比的话，内存里
+    若残留着上一场补传的 `clientId`，就会把**正在录的那一场**误判成"只剩收段"，
+    于是"同一时间只能有一场真录音"这条护栏被绕开 —— 那是本条唯一不能破的约束。
+
+    ⚠️ 它只回答"**这一场**是不是只剩收段"，不回答"能不能再开一场"：后者由调用方
+    （`start_meeting`）按"新开的这一场也是真录音"再判一次。
+    """
+    if not _state["active"] or not _state.get("folder"):
+        return False
+    if str(_state.get("source") or "").strip().lower() != "phone":
+        return False
+    cid = str(_state.get("client_id") or "").strip()
+    if not cid:
+        return False
+    found = _uploading_meeting_for(cid)
+    if not found:
+        return False
+    return os.path.abspath(found[1]) == os.path.abspath(_state["folder"])
 
 
 def start_meeting_phone_sync(client_id, started_at="", ended_at="", origin=ORIGIN_PC):
@@ -1738,15 +1776,32 @@ def start_meeting(origin=ORIGIN_PC):
     判据由 api 层按"谁调的接口"（带中继标记 = 手机）算好传进来，这里**不猜**。
     """
     with _state_lock:
-        if _state["active"]:
+        # **仅上传 ≠ 在录音**（2026-10-20 真机）：占着 `_state` 的若是手机那场"已录完、
+        # 只剩收段"的补传（盘上 `meta["uploading"]` 为真、没有 `end`，见
+        # `_uploading_meeting_for` / `_active_is_upload_only`），它**不该挡住**电脑开一场
+        # **真的**录音 —— 那一场早就结束了，电脑只是还在等手机剩下的段。
+        # 不开新的口子："**同一时间只能有一场真在录**"这条一个字不放宽 ——
+        # 占着的是真录音（本机麦 / 手机边录边传 / 另一台手机）时，下面照旧拒绝。
+        takeover_upload = bool(_state["active"]) and _active_is_upload_only()
+        if _state["active"] and not takeover_upload:
             return False, "会议录音已在进行中"
         old = _state["recorder"]
         if old and old.thread and old.thread.is_alive():
             return False, "上次录音尚未退出，请稍后重试；持续异常请重启 ECHO"
         cfg = settings
         now = datetime.datetime.now()
-        folder = os.path.join(meetings_dir(), now.strftime("%Y-%m-%d_%H-%M-%S"))
-        os.makedirs(folder, exist_ok=True)
+        stamp = now.strftime("%Y-%m-%d_%H-%M-%S")
+        if takeover_upload:
+            # **不动它**：那场补传的目录 / `meta.json` / 已收下的段一个字节都不碰 ——
+            # 它后面还要接着收段、还要能自己收尾。所以新一场必须挑一个**不会撞上它**的
+            # 目录名：两场在同一秒里建的话，`exist_ok=True` 会把它的 `meta.json` 当场
+            # 覆盖成本场这份（手机剩下的段就再也落不进它自己那场了，而且事后查不出是谁）。
+            _name, folder, err = _unique_meeting_folder(meetings_dir(), stamp)
+            if err:
+                return False, err
+        else:
+            folder = os.path.join(meetings_dir(), stamp)
+            os.makedirs(folder, exist_ok=True)
 
         meta = {
             "start": now.isoformat(timespec="seconds"),

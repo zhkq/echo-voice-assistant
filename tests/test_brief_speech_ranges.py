@@ -21,6 +21,10 @@
      `~~删除线~~` → `删除线`（成对的 markdown 语义仍剥）；
   4. `10-18`、`2026-10-18`、`v2.1.7`、`最低-5度` **逐字节不变**
      （`-`/`—`/`～` 是**下游** `speech_text` 的事，这里刻意不动）；
+  4b. **行首负号**（2026-10-20）：`-5度` / `-0.5%` 的负号要留住（原来被列表符规则
+     剥成 `5度` / `0.5%`）；真正的列表项 `- 说明文字` / `-5分钟` 照旧剥 ——
+     边界三条写在 `assistant._strip_leading_bullet` 的 docstring 里，
+     判据在 `LeadingMinusTests`；
   5. `/api/commands` 行上的 `speakText` 与 `brief` **同一串**（都出自
      `speak_text_for_reply()`）；`reply` 原样不动；
   6. 幂等：同一段文本洗两遍与洗一遍相同。
@@ -180,15 +184,57 @@ class UnchangedTokensTests(unittest.TestCase):
             with self.subTest(token=token):
                 self.assertEqual(token, assistant.brief_text(token))
 
-    def test_a_leading_minus_is_still_the_old_list_marker_rule(self):
-        """行首的 `-` **本来就是**列表符（`_clean_line` 既有规则，本次没动）。
 
-        用户要求 `-5度` 逐字节不变，指的是句子里的负号（`最低-5度`，见上一条）；
-        行首这个 `-` 被当成 markdown 列表符是**改之前就有**的行为，这里只把它钉住
-        —— 本次改动既没让它变好、也没让它变坏（别有人以为这是本次引入的）。
-        """
-        self.assertEqual("5度", assistant.brief_text("-5度"))
+class LeadingMinusTests(unittest.TestCase):
+    """行首 `-`：**负号不是列表符**（2026-10-20）。
+
+    `-5度` / `-0.5%` 这类行首负数原来被列表符规则剥成裸数字（负号丢了，念成"五度"）。
+    现在按 `_clean_line` → `_strip_leading_bullet` 的三条边界判：
+
+      1. `-` 后面**紧跟**数字（可带小数）；
+      2. 数字后面是断点（到头/标点/空白）**或**只接温度/百分比单位；
+      3. 其余（`- 说明文字`、`-5分钟`、`*`/`+` 开头）**照旧**当列表符剥 ——
+         那更可能是列表项，改动它们的风险更大。
+    """
+
+    def test_a_leading_negative_number_keeps_its_minus(self):
+        """行首负号保留：`-5度` / `-0.5%` 不再被剥成 `5度` / `0.5%`。"""
+        for src, want in (
+                ("-5度", "-5度"),
+                ("-0.5%", "-0.5%"),
+                ("-5℃", "-5度"),      # 既有规则：`℃` 一律念成"度"
+                ("-5摄氏度", "-5摄氏度"),
+                ("-5 度", "-5 度"),    # 数字与单位之间有空格，仍是负号（不是一个列表项）
+                ("-5", "-5"),          # 裸负数（后面到头）
+                ("-5，明天更冷", "-5，明天更冷"),   # 数字后面是标点
+        ):
+            with self.subTest(src=src):
+                self.assertEqual(want, assistant.brief_text(src))
+
+    def test_a_negative_in_the_middle_of_a_sentence_is_untouched(self):
+        """句中的负号本来就没问题（本次不许碰）：`最低-5度` 逐字节不变。"""
+        self.assertEqual("最低-5度", assistant.brief_text("最低-5度"))
         self.assertEqual("气温 -5度", assistant.brief_text("气温 -5度"))
+
+    def test_a_real_list_item_is_still_stripped(self):
+        """真正的列表项照旧剥（`- 说明文字` 有空格；`-5分钟` 明显是列表项）。"""
+        for src, want in (
+                ("- 说明文字", "说明文字"),
+                ("-说明文字", "说明文字"),
+                ("-5分钟", "5分钟"),          # 单位不是温度/百分比 → 仍按列表剥
+                ("-5 分钟", "5 分钟"),        # 同上（数字后面跟的不是温度/百分比单位）
+                ("* 说明", "说明"),
+                ("+ 说明", "说明"),
+        ):
+            with self.subTest(src=src):
+                self.assertEqual(want, assistant.brief_text(src))
+
+    def test_it_is_idempotent_for_the_new_rule(self):
+        """负号规则也要幂等（简报可能被再洗一遍）：洗两遍 = 洗一遍。"""
+        for src in ("-5度", "-0.5%", "-5分钟", "- 说明文字"):
+            once = assistant.brief_text(src)
+            with self.subTest(src=src):
+                self.assertEqual(once, assistant.brief_text(once))
 
 
 class ApiChainTests(unittest.TestCase):

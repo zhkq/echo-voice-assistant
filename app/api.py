@@ -1839,6 +1839,10 @@ def meeting_status(_auth=Depends(optional_auth)):
     `clientId` 判"ECHO 现在录的是不是我手上这一份清单的会"（判错就会把段灌进别人的会，
     或自己把自己挡在门外一直等）。本机麦/面板那条路照旧是原来那九个键 —— 精确键集被
     `tests/test_api_contract.py` 钉着，见 `meeting.meeting_status()` 里的同一段说明。
+
+    **仅上传 ≠ 在录音**（2026-10-20）：占位的那一场若是"已录完、只剩收段"的手机补传，
+    额外带 `uploading: true`（`active` 语义不变 —— 仍是"内存里有一场占着"）。
+    消费者按 `active && uploading` 认"只剩收段"，据此知道电脑那边还能再开一场真的会。
     """
     return meeting.meeting_status()
 
