@@ -1076,3 +1076,53 @@ scopes 还得重发）。当晚的绕法：用 `pairing.pair()` 里**逐字同�
      ⚠️ 但要同步更新**布局预算用例**（`HomeLayoutTest` / `RecordingUiTest` 里那条"总高度不增"✗ 要按新口径改 ✓，
      不是删 ✗）；余量只有 6dp ✗，加高后小屏（568dp 高）仍必须按钮可见 ✓。
 4. （等用户测试结论补充）
+## 2026-10-19～20：补传马拉松的六条工程教训（都是我自己当天踩的）
+
+### ① python **文本模式**写回会把 LF 变成 CRLF，撞 `test_line_endings`（2026-10-20 门禁红）
+
+- **现场**：改 `server/relay.py` 的一个常量，用 `io.open(p, encoding="utf-8")` 读 + `io.open(p, "w")` 写 ✓ →
+  Windows 下默认 `newline=None` 会把 `\n` **翻译成 `\r\n`** ✗ → 门禁 `tests.test_line_endings.ServerTreeHasNoCrlf`
+  红 ✓（`['server\\relay.py'] != []` ✗），而**逻辑完全正确** ✓。
+- **铁律**：改仓库里已有文件的行尾 → **只读改写用 `newline=""` 或二进制** ✓：
+  `io.open(p, "w", encoding="utf-8", newline="\n")` ✓ / `open(p,"rb").read().replace(b"\r\n", b"\n")` ✓。
+  改完**立刻验**：`b.count(b"\r\n")` 应为 0 ✓（`server/`、`scripts/`、`tests/` 都被这条守门 ✓）。
+
+### ② `git commit -m "<含中文/引号的长消息>"` 会被 PowerShell 拆坏 → 用 `-F`
+
+- **现场**：`git commit -m "fix: …（用户："…"）"` 在这台机子上被拆成一堆 `pathspec` 错误 ✗
+  （`error: pathspec '还是叫' did not match…`）→ **提交没发生** ✗（但 `git add` 已生效 ✓，容易误以为提了 ✗）。
+- **铁律**：多行/含中文/含引号的提交消息**一律**：
+  `[System.IO.File]::WriteAllText("$env:TEMP\msg.txt", $msg, (New-Object System.Text.UTF8Encoding($false)))` +
+  `git commit -q -F "$env:TEMP\msg.txt"` ✓（这套本会话用了十几次 ✓ 一次没坏 ✓）。
+
+### ③ 门禁期间 **HEAD 变了 → 不许推**（否则推出没门禁过的代码 ✗）
+
+- **现场**：门禁跑 ~40 分钟 ✓，中途我又提交了几笔 ✗ → 推送脚本用的是**当前 HEAD** ✗（`git rev-parse HEAD`）→
+  差点把**未经门禁**的新提交推上去 ✗。
+- **铁律**：收口脚本必须在**开始时记 `$h = git rev-parse HEAD`** ✓，门禁后先比 `HEAD -ne $h` → **不推** ✓；
+  且**停掉**那条在旧树上跑的门禁作业（`job_kill` ✓），另起一条 ✓。
+
+### ④ `job_output(wait: true)` 会**提前返回** `[status: running]`（不是阻塞到结束 ✗）
+
+- **现场**：想用它等 10 分钟，结果 ~10 秒就回 `(no new output) [status: running]` ✗ → 白等/误判。
+- **铁律**：等长任务用 **`Start-Sleep` 轮询**（或 `powershell` 里 while + `Start-Sleep` ✓），
+  或直接 **`Start-Process` + 日志文件** ✓（本会话的 `_gate_finalNN.log` 这套最稳 ✓）。
+
+### ⑤ `[Math]::Min($a, $b)` 在 PowerShell 里会因**参数类型**报"找不到重载"
+
+- **现场**：`[Math]::Min($idx+40, $lines.Count)` → `找不到"Min"的重载，参数计数为:"2"` ✗（`$idx` 是数组/类型不匹配 ✗）。
+- **铁律**：拿不准就用 `if` 或 `[Math]::Min([int]$a, [int]$b)` ✓；更稳的是**别在 PowerShell 里算** ✓ ——
+  这种活交给一小段 python ✓（本会话后来都这么做 ✓）。
+
+### ⑥ 代理端口**不要用 8901**（那是能力后端的 admin 口 ✗）
+
+- **现场**：给 GitHub 推送代理随手挑了 `-LocalPort 8901` ✗ + 清理逻辑 `Stop-Process` 该端口 ✓ →
+  等于**可能误杀本机能力后端的 admin** ✗（本机当次没跑后端 ✓ 侥幸 ✓）。
+- **铁律**：代理/临时端口用 **98xx**（本会话后期用 9821–9825 ✓）；并且**清理只杀"自己起的那个"** ✓ ——
+  记下 `Start-Process` 返回的 pid ✓，按 pid 杀 ✓，不要按端口杀 ✗。
+
+### 补：两件与"补传"有关的**语义**（写进代码注释了，这里留索引）
+
+- **手机补传的段是 FLAC（≈10 MB/10 分钟）** ✓，盘上同名 `.wav` 是服务端解码副本 ✓ —— 判断"传多大"要看上传侧 ✓。
+- **"仅上传"不等于"在录音"** ✓（`meta["uploading"]=true` / 无 `end` ✓）：它会占住 `active` ✗ 挡住电脑建会 ✗；
+  对外要能区分 ✓，但 `active` 的既有契约**别改** ✗（改则连带动 pause/stop/客户端 ✓）。
