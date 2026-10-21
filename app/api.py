@@ -1237,7 +1237,16 @@ async def post_daily_review_turn(request: Request, _auth=Depends(optional_auth))
                 "seconds": 0.0}
 
     from app import daily_review
-    out = await run_in_threadpool(daily_review.submit, text)
+    try:
+        out = await run_in_threadpool(daily_review.submit, text)
+    except Exception as exc:
+        # `submit()` 自己承诺不抛；但线程池/进程收尾这种事不该让手机看到一个 500
+        # （它会显示成"上传失败"，而用户说的是真话、内容也真的丢了）。
+        return {"ok": False, "text": text, "session_id": "", "workspace": "",
+                "reply": "", "spoken": "回顾整理出错了，你过一会儿再说一遍。",
+                "source": "fallback",
+                "error": "回顾整理出错：%s: %s" % (type(exc).__name__, exc),
+                "seconds": 0.0}
     return {
         "ok": bool(out.get("ok")),
         "text": text,

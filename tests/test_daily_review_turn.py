@@ -180,5 +180,20 @@ class TurnGoesThroughReviewTests(_ApiBase):
         self.assertTrue(body["spoken"])
 
 
+    def test_a_broken_submit_is_reported_not_500(self):
+        self._patch_client(_FakeClient())
+        with mock.patch.object(assistant, "_transcribe_command",
+                               lambda *a, **k: ("说了一句", "fake-stt", assistant.ASR_OK)), \
+             mock.patch.object(api_mod, "_audio_to_wav16k", _write_wav), \
+             mock.patch.object(dr, "submit", side_effect=RuntimeError("线程池炸了")):
+            r = self.client.post("/api/daily-review/turn", content=b"RIFF....",
+                                 headers={"Content-Type": "audio/wav"})
+        self.assertEqual(200, r.status_code)
+        body = r.json()
+        self.assertFalse(body["ok"])
+        self.assertIn("线程池炸了", body["error"])
+        self.assertTrue(body["spoken"])
+
+
 if __name__ == "__main__":
     unittest.main()
