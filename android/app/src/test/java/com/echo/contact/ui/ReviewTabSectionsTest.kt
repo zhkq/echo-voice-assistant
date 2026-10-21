@@ -85,6 +85,6 @@ class ReviewTabSectionsTest {
         assertNotEquals("功能区与历史列表是两个区块", REVIEW_FEATURE_TITLE, REVIEW_HISTORY_TITLE)
         assertTrue("历史为空必须说话，不能空着", REVIEW_HISTORY_EMPTY.isNotBlank())
         // 空状态要告诉用户"怎么才会有"（不是一句干巴巴的"没有数据"）
-        assertTrue(REVIEW_HISTORY_EMPTY.contains("口述"))
+        assertTrue(REVIEW_HISTORY_EMPTY.contains("开始回顾"))
     }
 }

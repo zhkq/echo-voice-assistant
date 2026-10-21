@@ -4,6 +4,7 @@ import com.google.gson.Gson
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -59,6 +60,33 @@ class ReviewDtosContractTest {
         assertTrue(s.lastBrief!!.startsWith("今天记了两件事"))
         assertEquals("done", s.lastStatus)
         assertNotNull(s.lastText)
+    }
+
+    @Test
+    fun `回顾一轮的 turn 响应字段对得上`() {
+        val json = """
+            {"ok": true, "text": "今天把回顾改成走回顾接口了",
+             "session_id": "session-1", "workspace": "C:\\echo-dev\\review",
+             "reply": "已登记", "spoken": "记好了，还有吗？", "source": "broadcast",
+             "error": "", "seconds": 42.5, "registered": true}
+        """.trimIndent()
+
+        val t = gson.fromJson(json, DailyReviewTurnResponse::class.java)
+
+        assertTrue(t.ok)
+        assertEquals("今天把回顾改成走回顾接口了", t.text)
+        // `session_id` 是蛇形（不是 sessionId）—— 写错就永远是空，排障时看不出
+        assertEquals("session-1", t.sessionId)
+        assertEquals("记好了，还有吗？", t.spoken)
+        assertEquals("broadcast", t.source)
+        assertEquals(42.5, t.seconds, 0.001)
+        assertTrue("登记核实要原样读出来", t.registered == true)
+
+        val legacy = gson.fromJson(
+            """{"ok":true,"text":"x","spoken":"y"}""",
+            DailyReviewTurnResponse::class.java,
+        )
+        assertNull("老服务端没有 registered → null（不许说成 false）", legacy.registered)
     }
 
     @Test

@@ -14,7 +14,7 @@ package com.echo.contact.ui
  * | --- | --- | --- |
  * | 指令 | 发送 | `MainViewModel.sendCommand(...)`（在**本页**发出，回复也回显在本页） |
  * | 会议 | 开始录音 / 结束录音 | `MainViewModel.startMeeting()` → `MeetingMicService.start(...)`；结束走 `MeetingMicService.stop(...)` |
- * | 回顾 | 口述回顾 / 说完了 / 取消 | `MainViewModel.startRecording()` → `submitReviewDictation()`（既有那条口述整理路） |
+ * | 回顾 | 开始回顾 / 按住说话 / 说完了 / 结束 | `MainViewModel.startReviewSession()` → `startReviewRound()` / `finishReviewRound()` → `endReviewSession()`（与 PC 版同一套回顾交互；轮次走 review 接口，不进指令空间） |
  *
  * **唯一会切页的东西**是每张卡右下角那个小链接（「看全部指令 / 看会议列表 / 看回顾历史」），
  * 以及指令卡在"回复太长"时给的「去看详情」。
@@ -69,13 +69,22 @@ internal enum class HomeAction(val switchesTab: Boolean) {
     /** 结束手机麦录音（`MeetingMicService.stop`，既有唯一收尾路）。 */
     STOP_MEETING(false),
 
-    /** 开始口述回顾（`MainViewModel.startRecording`，回顾页那张「车里口述」卡同一个入口）。 */
-    DICTATE_REVIEW(false),
+    /**
+     * 开始一场**回顾**（`MainViewModel.startReviewSession()` → `/api/daily-review/start`）。
+     * 与 PC 版那颗「开始回顾」同一个动作；只建会话，**不碰麦克风**。
+     */
+    START_REVIEW(false),
 
-    /** 口述说完了 → 转写 + 交给回顾整理（`MainViewModel.submitReviewDictation`）。 */
-    SUBMIT_REVIEW(false),
+    /** 按住说这一轮（`MainViewModel.startReviewRound()` → 手机麦，松手走回顾 `/turn`）。 */
+    START_REVIEW_ROUND(false),
 
-    /** 放弃这次口述（`MainViewModel.cancelReviewDictation`）。 */
+    /** 这一轮说完了（`MainViewModel.finishReviewRound()`）。 */
+    FINISH_REVIEW_ROUND(false),
+
+    /** 结束这一场回顾（`MainViewModel.endReviewSession()` → `/api/daily-review/stop`）。 */
+    END_REVIEW(false),
+
+    /** 放弃这一轮录音（`MainViewModel.cancelReviewRound()`）。 */
     CANCEL_REVIEW(false),
 
     /** **唯一**会切页的动作：去看完整页面（卡片小链接 / 回复太长时的「去看详情」）。 */
@@ -146,27 +155,47 @@ internal fun meetingCardButtons(recording: Boolean): List<HomeCardButton> =
         listOf(HomeCardButton("开始录音", HomeAction.START_MEETING))
     }
 
-/** 回顾卡那几颗按钮：口述中 = 「说完了 / 取消」，否则 = 「口述回顾」。 */
-internal fun reviewCardButtons(dictating: Boolean): List<HomeCardButton> =
-    if (dictating) {
-        listOf(
-            HomeCardButton("说完了", HomeAction.SUBMIT_REVIEW),
-            HomeCardButton("取消", HomeAction.CANCEL_REVIEW),
-        )
-    } else {
-        listOf(HomeCardButton("口述回顾", HomeAction.DICTATE_REVIEW))
-    }
+/**
+ * 回顾卡那几颗按钮，与 PC 版同一套动作：
+ *   * 没开始 → 「开始回顾」；
+ *   * 正在准备 → 同一个位置显示「准备中…」（界面按 `starting` 置灰）；
+ *   * 进行中 → 「按住说话」+「结束」；
+ *   * 录音中 → 「说完了」+「取消」。
+ */
+internal fun reviewCardButtons(
+    reviewActive: Boolean,
+    reviewRecording: Boolean,
+    reviewStarting: Boolean,
+): List<HomeCardButton> = when {
+    reviewRecording -> listOf(
+        HomeCardButton("说完了", HomeAction.FINISH_REVIEW_ROUND),
+        HomeCardButton("取消", HomeAction.CANCEL_REVIEW),
+    )
+    reviewStarting -> listOf(HomeCardButton("准备中…", HomeAction.START_REVIEW))
+    reviewActive -> listOf(
+        HomeCardButton("按住说话", HomeAction.START_REVIEW_ROUND),
+        HomeCardButton("结束", HomeAction.END_REVIEW),
+    )
+    else -> listOf(HomeCardButton("开始回顾", HomeAction.START_REVIEW))
+}
 
 /**
  * 三张卡（顺序 = 指令 / 会议 / 回顾）。
  *
  * [micRecording] = `MeetingMicService.state.active`（手机正在录会议）；
- * [reviewDictating] = `MainViewModel.recording`（正在录口述回顾）。
+ * [reviewActive] = `reviewSession != null && !reviewEnded`（这一场还在进行）；
+ * [reviewRecording] = `MainViewModel.recording`（正在录回顾这一轮）；
+ * [reviewStarting] = 正在向电脑要今天的回顾会话。
  *
- * 两个都是**现有状态**（既不新造开关，也不猜）。两者不会同时为真：录音器是同一个，
- * 会议录音开着时回顾口述起不来（这也是为什么卡片上不需要"另一个在录"的提示）。
+ * 三者都是**现有状态**（既不新造开关，也不猜）。会议录音与回顾录音不会同时为真：
+ * 录音器是同一个，会议录音开着时回顾起不来（卡片上不需要"另一个在录"的提示）。
  */
-internal fun homeCards(micRecording: Boolean, reviewDictating: Boolean): List<HomeCardSpec> =
+internal fun homeCards(
+    micRecording: Boolean,
+    reviewActive: Boolean,
+    reviewRecording: Boolean,
+    reviewStarting: Boolean,
+): List<HomeCardSpec> =
     ASSISTANT_ENTRIES.map { entry ->
         when (entry.tab) {
             EchoTab.COMMANDS -> HomeCardSpec(
@@ -195,7 +224,11 @@ internal fun homeCards(micRecording: Boolean, reviewDictating: Boolean): List<Ho
                 title = entry.title,
                 subtitle = entry.subtitle,
                 tab = entry.tab,
-                buttons = reviewCardButtons(reviewDictating),
+                buttons = reviewCardButtons(
+                    reviewActive = reviewActive,
+                    reviewRecording = reviewRecording,
+                    reviewStarting = reviewStarting,
+                ),
                 linkLabel = "看回顾历史",
             )
             // ASSISTANT_ENTRIES 只有这三项（`EchoTabsTest` 钉住）；真走到这里说明那张表被改坏了，

@@ -9,28 +9,33 @@ import org.junit.Test
  * 首页三张**功能卡**的判据（用户 2026-10-18 中午："下方的主要功能，应该用卡片形式，
  * 里面要有功能按钮，不用跳转到对应功能页再开始使用功能"）。
  *
+ * 2026-10-22 变化（用户报"点了开始回顾，命令仍然发到指令空间"）：回顾卡不再走
+ * "口述回顾 / 说完了"那条一次性口述，而是与回顾页**同一套** PC 式动作：
+ * 开始回顾 → 按住说一轮 → 说完了 → 结束回顾。动作全部直接执行、不切页。
+ *
  * 抽成纯函数/纯数据来测的理由与 `ReviewTabSectionsTest` 一样：Compose 在 JVM 门禁里点不了，
  * 但"按钮到底直接干活还是切页"这件事本身就是**数据**（动作 + 会不会切页），
  * 所以能在 JVM 里逐条钉住 —— 不用等到真机上一个个点。
- *
- * 本轮钉住的四件事：
- *  ① 三张卡都在（指令 / 会议 / 回顾），每张都有能直接干活的按钮；
- *  ② 那些按钮的**动作是"直接执行"**（发送 / 开始录音 / 结束录音 / 口述），**不是**切页；
- *  ③ 点了按钮**不改变当前页签**（状态级断言：`tabAfterClick`）；
- *  ④ 录音态时会议卡显示「结束录音」+ 本次时长（读 `MicState` 那两个现成字段）。
  */
 class HomeCardsTest {
 
+    private fun cards(
+        micRecording: Boolean = false,
+        reviewActive: Boolean = false,
+        reviewRecording: Boolean = false,
+        reviewStarting: Boolean = false,
+    ) = homeCards(micRecording, reviewActive, reviewRecording, reviewStarting)
+
     @Test
     fun `三张功能卡齐全且顺序是用户点名的`() {
-        val cards = homeCards(micRecording = false, reviewDictating = false)
-        assertEquals(3, cards.size)
-        assertEquals(listOf("指令", "会议", "回顾"), cards.map { it.title })
+        val list = cards()
+        assertEquals(3, list.size)
+        assertEquals(listOf("指令", "会议", "回顾"), list.map { it.title })
         assertEquals(
             listOf(HomeCardKind.COMMAND, HomeCardKind.MEETING, HomeCardKind.REVIEW),
-            cards.map { it.kind },
+            list.map { it.kind },
         )
-        cards.forEach { card ->
+        list.forEach { card ->
             assertTrue("${card.title} 卡必须有能直接干活的按钮", card.buttons.isNotEmpty())
             assertTrue("${card.title} 卡少了那句说明", card.subtitle.isNotBlank())
             assertTrue("${card.title} 卡少了「去看」链接", card.linkLabel.isNotBlank())
@@ -41,11 +46,13 @@ class HomeCardsTest {
 
     @Test
     fun `每张卡的按钮对应的动作都是直接执行而不是切页`() {
-        // 闲时与"正在录"两种状态都过一遍（录音态会换按钮，不能只测一种）
-        val cards = homeCards(micRecording = false, reviewDictating = false) +
-            homeCards(micRecording = true, reviewDictating = true)
+        // 闲时、开始中、进行中、录音中四种状态都过一遍（按钮会换，不能只测一种）
+        val list = cards() + cards(reviewActive = true) +
+            cards(reviewActive = true, reviewRecording = true) +
+            cards(reviewStarting = true) +
+            cards(micRecording = true)
 
-        for (card in cards) {
+        for (card in list) {
             for (button in card.buttons) {
                 assertFalse(
                     "${card.title} 卡的「${button.label}」会切页 —— 用户明确说" +
@@ -62,24 +69,22 @@ class HomeCardsTest {
 
     @Test
     fun `三张卡的动作各自对上既有入口（不许新造）`() {
-        fun primary(recording: Boolean, dictating: Boolean, kind: HomeCardKind): HomeAction =
-            homeCards(recording, dictating).first { it.kind == kind }.buttons.first().action
+        fun primary(kind: HomeCardKind): HomeAction =
+            cards().first { it.kind == kind }.buttons.first().action
 
         // 指令卡 = MainViewModel.sendCommand（「指令」页那颗发送键同一个方法）
-        assertEquals(HomeAction.SEND_COMMAND, primary(false, false, HomeCardKind.COMMAND))
+        assertEquals(HomeAction.SEND_COMMAND, primary(HomeCardKind.COMMAND))
         // 会议卡 = MainViewModel.startMeeting → MeetingMicService.start（唯一那条手机麦录音路）
-        assertEquals(HomeAction.START_MEETING, primary(false, false, HomeCardKind.MEETING))
-        // 录音中就换成一个位置上的「结束录音」= MeetingMicService.stop（既有收尾路）
-        assertEquals(HomeAction.STOP_MEETING, primary(true, false, HomeCardKind.MEETING))
-        // 回顾卡 = MainViewModel.startRecording（回顾页「车里口述」那同一个入口）
-        assertEquals(HomeAction.DICTATE_REVIEW, primary(false, false, HomeCardKind.REVIEW))
+        assertEquals(HomeAction.START_MEETING, primary(HomeCardKind.MEETING))
+        // 回顾卡 = MainViewModel.startReviewSession（与 PC 版那颗「开始回顾」同一个动作）
+        assertEquals(HomeAction.START_REVIEW, primary(HomeCardKind.REVIEW))
     }
 
     @Test
     fun `点按钮不改变当前页签（状态级）`() {
         // 对**每一个**页签都试一遍，而不是只看"首页"：卡片在首页，但这条约束不该依赖这一点
         ECHO_TABS.forEachIndexed { current, tab ->
-            for (card in homeCards(micRecording = false, reviewDictating = false)) {
+            for (card in cards()) {
                 for (button in card.buttons) {
                     assertEquals(
                         "在第 ${current + 1} 页（${tab.title}）点了「${card.title}」卡的" +
@@ -94,7 +99,7 @@ class HomeCardsTest {
 
     @Test
     fun `只有右下角那个小链接会切页且切到自己那一页`() {
-        for (card in homeCards(micRecording = false, reviewDictating = false)) {
+        for (card in cards()) {
             val link = HomeCardButton(card.linkLabel, HomeAction.OPEN_TAB)
             val effect = effectOf(card, link)
             assertTrue("${card.title} 的小链接必须是切页动作", effect is HomeEffect.SwitchTab)
@@ -108,13 +113,11 @@ class HomeCardsTest {
 
     @Test
     fun `录音态时会议卡变成结束录音并显示本次时长`() {
-        val idle = homeCards(micRecording = false, reviewDictating = false)
-            .first { it.kind == HomeCardKind.MEETING }
+        val idle = cards().first { it.kind == HomeCardKind.MEETING }
         assertEquals(listOf("开始录音"), idle.buttons.map { it.label })
         assertEquals(HomeAction.START_MEETING, idle.buttons.single().action)
 
-        val recording = homeCards(micRecording = true, reviewDictating = false)
-            .first { it.kind == HomeCardKind.MEETING }
+        val recording = cards(micRecording = true).first { it.kind == HomeCardKind.MEETING }
         assertEquals("同一个位置换文案", listOf("结束录音"), recording.buttons.map { it.label })
         assertEquals(HomeAction.STOP_MEETING, recording.buttons.single().action)
 
@@ -142,20 +145,31 @@ class HomeCardsTest {
     }
 
     @Test
-    fun `回顾卡口述中显示说完了与取消且都是直接动作`() {
-        val idle = homeCards(micRecording = false, reviewDictating = false)
-            .first { it.kind == HomeCardKind.REVIEW }
-        assertEquals(listOf("口述回顾"), idle.buttons.map { it.label })
+    fun `回顾卡四种状态与 PC 版动作一一对应`() {
+        val idle = cards().first { it.kind == HomeCardKind.REVIEW }
+        assertEquals(listOf("开始回顾"), idle.buttons.map { it.label })
+        assertEquals(listOf(HomeAction.START_REVIEW), idle.buttons.map { it.action })
 
-        val dictating = homeCards(micRecording = false, reviewDictating = true)
-            .first { it.kind == HomeCardKind.REVIEW }
-        assertEquals(listOf("说完了", "取消"), dictating.buttons.map { it.label })
+        val starting = cards(reviewStarting = true).first { it.kind == HomeCardKind.REVIEW }
+        assertEquals("准备中不能让人以为还能再点一次", listOf("准备中…"), starting.buttons.map { it.label })
+        assertEquals(listOf(HomeAction.START_REVIEW), starting.buttons.map { it.action })
+
+        val active = cards(reviewActive = true).first { it.kind == HomeCardKind.REVIEW }
+        assertEquals(listOf("按住说话", "结束"), active.buttons.map { it.label })
         assertEquals(
-            listOf(HomeAction.SUBMIT_REVIEW, HomeAction.CANCEL_REVIEW),
-            dictating.buttons.map { it.action },
+            listOf(HomeAction.START_REVIEW_ROUND, HomeAction.END_REVIEW),
+            active.buttons.map { it.action },
         )
-        for (button in dictating.buttons) {
-            assertFalse("口述中的按钮也不许切页：${button.label}", button.action.switchesTab)
+
+        val recording = cards(reviewActive = true, reviewRecording = true)
+            .first { it.kind == HomeCardKind.REVIEW }
+        assertEquals(listOf("说完了", "取消"), recording.buttons.map { it.label })
+        assertEquals(
+            listOf(HomeAction.FINISH_REVIEW_ROUND, HomeAction.CANCEL_REVIEW),
+            recording.buttons.map { it.action },
+        )
+        for (button in active.buttons + recording.buttons) {
+            assertFalse("回顾动作也不许切页：${button.label}", button.action.switchesTab)
         }
     }
 
@@ -208,16 +222,13 @@ class HomeCardsTest {
     @Test
     fun `指令卡那颗发送按钮在界面上真的接了发送动作`() {
         // ① 数据层：指令卡的主按钮（buttons.first()）就是「发送」= SEND_COMMAND，且不切页
-        val card = homeCards(micRecording = false, reviewDictating = false)
-            .first { it.kind == HomeCardKind.COMMAND }
+        val card = cards().first { it.kind == HomeCardKind.COMMAND }
         val send = card.buttons.first()
         assertEquals("发送", send.label)
         assertEquals(HomeAction.SEND_COMMAND, send.action)
         assertTrue("发送必须是直接动作", effectOf(card, send) is HomeEffect.Direct)
 
         // ② 界面层：那颗按钮的 onClick 里必须**真的**调了 vm.sendCommand。
-        //    光有 `HomeAction.SEND_COMMAND` 是"数据说了、界面没接" —— 那种卡点下去什么都不会发，
-        //    而用例全绿（2026-10-18 真机那次"发了却什么都没发生"就该由这条兜住）。
         val source = moduleText("src/main/java/com/echo/contact/ui/SuperAssistantTab.kt")
         val body = source.substringAfter("private fun CommandCardBody").substringBefore("private fun MeetingCardBody")
         assertTrue(
@@ -233,8 +244,7 @@ class HomeCardsTest {
 
     @Test
     fun `指令卡还有语音入口 而且走的是既有的开始录音与说完了`() {
-        val card = homeCards(micRecording = false, reviewDictating = false)
-            .first { it.kind == HomeCardKind.COMMAND }
+        val card = cards().first { it.kind == HomeCardKind.COMMAND }
         val dictation = card.buttons.first { it.action == HomeAction.DICTATE_COMMAND }
         assertEquals("按住说话", dictation.label)
         assertFalse("语音入口也不许切页", dictation.action.switchesTab)
@@ -250,9 +260,22 @@ class HomeCardsTest {
     }
 
     @Test
+    fun `首页回顾卡真的接了回顾的那几个入口`() {
+        val source = moduleText("src/main/java/com/echo/contact/ui/SuperAssistantTab.kt")
+        val body = source.substringAfter("private fun ReviewCardBody").substringBefore("private fun ListenRow")
+        assertTrue("开始回顾没接 vm.startReviewSession", body.contains("vm.startReviewSession()"))
+        assertTrue("按住说话没接 onStartRound（→ startReviewRound）", body.contains("onStartRound()"))
+        assertTrue("说完了没接 vm.finishReviewRound", body.contains("vm.finishReviewRound()"))
+        assertTrue("结束没接 vm.endReviewSession", body.contains("vm.endReviewSession()"))
+        assertTrue("取消没接 vm.cancelReviewRound", body.contains("vm.cancelReviewRound()"))
+        assertFalse("首页回顾卡还在走一次性口述", body.contains("submitReviewDictation"))
+        assertFalse("首页回顾卡还在直接调指令链", body.contains("vm.sendCommand"))
+    }
+
+    @Test
     fun `卡片标题仍可进对应页（卡片是快捷方式 不是替代）`() {
         // 点卡片标题 = 切到它对应的页签（底部 5 页导航照旧有效）
-        for (card in homeCards(false, false)) {
+        for (card in cards()) {
             assertEquals(card.tab.ordinal, tabAfterClick(EchoTab.SETTINGS.ordinal, HomeEffect.SwitchTab(card.tab)))
         }
         // 而每个页签都还在（一个都没少）

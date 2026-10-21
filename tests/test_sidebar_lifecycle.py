@@ -11,10 +11,13 @@ DETACHED_PROCESS 起它（这样 ECHO 重启/被杀时它能活下来），所�
      `POST /api/control/echo/stop` 那条路最后都落在这一处）：先经边条**已有的**命名管道
      `echo-sidebar-toggle` 发一条 `quit`，再 `os._exit(0)`。通知失败（边条没开/连不上）
      **只记日志**，绝不让"停服务"失败。
-  2. **强杀 / 崩溃 → 心跳兜底**：边条自己每 5 秒探 `GET /api/status`，连续 3 次失败就自己退。
-     前 30 秒是**启动宽限期**（边条可能比服务先起来，宽限期内的失败不计数）；
-     服务恢复一次就清零。判据是 `sidebar/Heartbeat.cs` 的**纯函数**
+  2. **强杀 / 崩溃 → 心跳兜底**：边条自己每 5 秒探 `GET /health`（**不是** `/api/status`），
+     连续 3 次失败就自己退。前 30 秒是**启动宽限期**（边条可能比服务先起来，宽限期内
+     的失败不计数）；服务恢复一次就清零。判据是 `sidebar/Heartbeat.cs` 的**纯函数**
      `HeartbeatPolicy.NextFailureCount / ShouldExit`。
+     ⚠️ 2026-10-22 真机 bug：原来探 `/api/status`（业务聚合，本机实测 2.2 秒）而超时是
+     2 秒 → 每次心跳都"失败" → 边条 40 秒后自己关掉（用户："放一会它就崩了"）。
+     `/health` 是专给存活判定的空接口（无鉴权、不读业务状态）。
 
 测试策略（**不起 .NET**：边条是 WinForms 进程，测试里真拉起它只会糊一屏窗口）：
   * 心跳判据按"**C# 源码 + 从源码里读出来的常量**"核对，时序用同一套判据的 Python 对照实现跑；
@@ -63,12 +66,13 @@ def _csharp_body(src, signature):
 
 
 def _policy_constants():
-    """从 `sidebar/Heartbeat.cs` 里读心跳判据的三个常量（**唯一权威**在 C# 那边）。"""
+    """从 `sidebar/Heartbeat.cs` 里读心跳判据的几个常量（**唯一权威**在 C# 那边）。"""
     src = _read(HEARTBEAT_CS)
     out = {}
     for name, key in (("IntervalMs", "interval_ms"),
                       ("FailureThreshold", "threshold"),
-                      ("StartupGraceMs", "grace_ms")):
+                      ("StartupGraceMs", "grace_ms"),
+                      ("ProbeTimeoutMs", "probe_timeout_ms")):
         m = re.search(r"const\s+int\s+%s\s*=\s*(\d+)\s*;" % name, src)
         assert m is not None, "Heartbeat.cs 里找不到常量 %s" % name
         out[key] = int(m.group(1))
@@ -129,6 +133,23 @@ class HeartbeatPolicyTests(unittest.TestCase):
         self.assertEqual(self.cfg["interval_ms"], 5000)
         self.assertEqual(self.cfg["threshold"], 3)
         self.assertEqual(self.cfg["grace_ms"], 30000)
+        # 探测超时必须明显大于 /health 的正常耗时（0.05s），又不能让一次卡顿拖死心跳。
+        self.assertGreaterEqual(self.cfg["probe_timeout_ms"], 3000,
+                                "2 秒超时曾经把 2.2 秒的 /api/status 判成每次都失败")
+        self.assertLessEqual(self.cfg["probe_timeout_ms"], 10000)
+
+    def test_the_probe_is_health_not_the_business_status_endpoint(self):
+        """2026-10-22 真机 bug：探 `/api/status`（2.2 秒）+ 2 秒超时 = 边条每 40 秒自己关。
+
+        判据必须写在源码上：探活地址是 `/health`（无需鉴权、不读业务状态），
+        且代码里**没有**再把 `/api/status` 当存活判据。
+        """
+        src = _read(HEARTBEAT_CS)
+        self.assertIn('+ "/health"', src)
+        self.assertNotIn('+ "/api/status"', src,
+                         "心跳又探回业务聚合接口了（它比探测超时还慢）")
+        self.assertIn("HeartbeatPolicy.ProbeTimeoutMs", src,
+                      "HttpClient 的超时必须取那个常量（否则又可能比 /health 还短）")
 
     def test_the_source_says_the_same_three_things(self):
         """C# 的纯函数必须与上面的对照实现同形（否则"对照"就只是自说自话）。"""

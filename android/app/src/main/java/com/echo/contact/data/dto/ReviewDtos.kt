@@ -126,6 +126,33 @@ data class DailyReviewSubmitResponse(
 )
 
 /**
+ * `POST /api/daily-review/turn` 的响应：**手机回顾的一轮**（裸音频）。
+ *
+ * 服务端把这一轮转写后交给与 PC 回顾**同一条** `daily_review.submit()`，
+ * 所以这里既有转写原文（[text]），也有播报（[spoken]）与整理结果（[reply]）。
+ *
+ * ⚠️ 业务失败（没听清 / 智能体没回）是 **HTTP 200 + `ok=false`**，不是 4xx；
+ * 只有"音频本身不是音频"才是 4xx。这两种在界面上必须分开说。
+ *
+ * @property registered `daily_review.submit` 的登记核实：`true` 检测到工作日志更新、
+ *   `false` 明确没检测到、`null` 老服务端/这一轮没做核实。**不许把 null 说成 false**。
+ */
+data class DailyReviewTurnResponse(
+    val ok: Boolean = false,
+    /** 这一轮的转写原文（没听清时为空）。 */
+    val text: String = "",
+    @SerializedName("session_id") val sessionId: String = "",
+    val workspace: String = "",
+    val reply: String = "",
+    /** **要念出来的那句话**（PC 回顾里车里听到的就是它）。 */
+    val spoken: String = "",
+    val source: String = "",
+    val error: String = "",
+    val seconds: Double = 0.0,
+    val registered: Boolean? = null,
+)
+
+/**
  * `POST /api/daily-review/start` 的响应（`app/daily_review.py::start()` 的返回）。
  *
  * **它是"手机开始一场回顾"的那个动作**（与 PC 版面板上那颗按钮同一个接口）：

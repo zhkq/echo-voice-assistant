@@ -7,7 +7,12 @@
 //   **服务被强杀 / 崩溃 / 掉电**时没人发那条命令 —— 现场就是"8970 不再监听、
 //   echo-sidebar.exe 还挂在屏幕上"。
 //
-// 判据（每 5 秒探一次 <baseUrl>/api/status；连续 3 次失败 → 退）：
+// 判据（每 5 秒探一次 <baseUrl>/health；连续 3 次失败 → 退）：
+//   * 为什么探 `/health` 而不是 `/api/status`（2026-10-22 真机 bug）：`/api/status` 是
+//     **业务聚合**接口（组件/harness/TTS/中继都读一遍），本机实测稳定 2.2 秒；而心跳的
+//     超时是 2 秒 → **每次探测都超时** → 宽限期一过连续 3 次"失败" → 边条自己关掉。
+//     现场就是"服务明明正常，边条放一会儿就消失；快捷键又能唤出新的"。`/health` 是
+//     专给存活判定的空接口（无鉴权、不读业务状态，实测 0.05 秒），才是这个问题的答案。
 //   * 为什么探 HTTP 而不是看"窗口/鼠标/进程"：边条被收起、只留 3px、用户只是最小化，
 //     都不代表服务停了；"服务还能不能回答"才是与"服务还在不在"同一个问题。
 //   * 为什么前 30 秒的失败不算：边条可能**比服务先起来**（开机自启、ECHO 重启后由
@@ -32,6 +37,13 @@ internal static class HeartbeatPolicy
 
     /// <summary>启动宽限期（毫秒）：这段时间里的失败**不计数**（边条可能比服务先起来）。</summary>
     public const int StartupGraceMs = 30000;
+
+    /// <summary>
+    /// 单次探测的超时（毫秒）。
+    /// `/health` 实测约 0.05 秒；留 5 秒是为了机器很忙（分析/转写/构建同时跑）时也不误判。
+    /// 为什么不再用 2 秒：原来探 `/api/status`（业务聚合，2.2 秒）配 2 秒超时，等于**每次都失败**。
+    /// </summary>
+    public const int ProbeTimeoutMs = 5000;
 
     /// <summary>一次探测结果 → 下一次的"连续失败"计数。</summary>
     public static int NextFailureCount(int failures, bool reachable, long elapsedMs)
@@ -58,14 +70,14 @@ internal sealed class SidebarHeartbeat
     /// <summary>
     /// 探活用同一个 HttpClient。
     /// **UseProxy=false 是必须的**（2026-10-21 真机实测）：默认会走系统/环境里的代理，
-    /// 于是"连本机 8970"也先发给代理 —— 服务停着时每次探测都要等满 2 秒超时，
-    /// 心跳节拍从 5 秒变成 7 秒（宽限后的 3 次失败要拖到 50 秒才退）；
-    /// 而且把"探本机存活"这种请求交给外部代理根本没有意义。回环地址就该直连。
+    /// 于是"连本机 8970"也先发给代理 —— 服务停着时每次探测都要等满超时，
+    /// 心跳节拍被拉长；而且把"探本机存活"这种请求交给外部代理根本没有意义。回环地址就该直连。
     /// </summary>
     private static readonly HttpClient Http =
-        new(new HttpClientHandler { UseProxy = false }) { Timeout = TimeSpan.FromSeconds(2) };
+        new(new HttpClientHandler { UseProxy = false })
+        { Timeout = TimeSpan.FromMilliseconds(HeartbeatPolicy.ProbeTimeoutMs) };
 
-    private readonly string _statusUrl;
+    private readonly string _healthUrl;
     private readonly Action _onGaveUp;
     private Thread _worker;
 
@@ -73,9 +85,10 @@ internal sealed class SidebarHeartbeat
     /// <param name="onGaveUp">判定"服务没了"之后要做的事（宿主负责切回 UI 线程）。</param>
     public SidebarHeartbeat(string baseUrl, Action onGaveUp)
     {
-        // 探 /api/status：与面板同一个"服务活着"的口径 —— 它证明的不只是端口在听，
-        // 而是 API 层能正常回答（边条显示的就是这个面板）。
-        _statusUrl = (baseUrl ?? "").TrimEnd('/') + "/api/status";
+        // 探 `/health`：**专给存活判定**的空接口（无鉴权、不读业务状态）。
+        // 不用 `/api/status`：那是业务聚合，本机实测稳定 2.2 秒 —— 配 2 秒超时会让
+        // 每一次心跳都"失败"，40 秒后边条自己关掉（2026-10-22 用户报的"放一会就崩"）。
+        _healthUrl = (baseUrl ?? "").TrimEnd('/') + "/health";
         _onGaveUp = onGaveUp;
     }
 
@@ -99,7 +112,7 @@ internal sealed class SidebarHeartbeat
             failures = HeartbeatPolicy.NextFailureCount(failures, reachable, tickAt);
             if (!reachable && failures != before)
             {
-                Program.Log($"heartbeat: /api/status unreachable (failures={failures}, elapsed={tickAt}ms)");
+                Program.Log($"heartbeat: /health unreachable (failures={failures}, elapsed={tickAt}ms)");
             }
             if (HeartbeatPolicy.ShouldExit(tickAt, failures))
             {
@@ -117,12 +130,12 @@ internal sealed class SidebarHeartbeat
         }
     }
 
-    /// <summary>探一次 /api/status：任何异常都算"探不到"（超时、连接被拒、DNS、TLS…）。</summary>
+    /// <summary>探一次 /health：任何异常都算"探不到"（超时、连接被拒、DNS、TLS…）。</summary>
     private bool Probe()
     {
         try
         {
-            using var resp = Http.GetAsync(_statusUrl).GetAwaiter().GetResult();
+            using var resp = Http.GetAsync(_healthUrl).GetAwaiter().GetResult();
             return resp.IsSuccessStatusCode;
         }
         catch

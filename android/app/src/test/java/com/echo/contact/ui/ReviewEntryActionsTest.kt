@@ -29,7 +29,7 @@ class ReviewEntryActionsTest {
         val tap = reviewTodayTap(today = "2026-10-18", summaryLoaded = true, todayTurns = 0)
         assertTrue(tap is ReviewTodayTap.Note)
         val msg = (tap as ReviewTodayTap.Note).message
-        assertTrue("要告诉用户下一步点什么：$msg", msg.contains("口述"))
+        assertTrue("要告诉用户下一步点什么：$msg", msg.contains("开始回顾"))
         assertTrue("别只说'没有'：$msg", msg.length > 8)
     }
 
@@ -96,7 +96,7 @@ class ReviewEntryActionsTest {
     fun `开不了麦与空的一天都有可操作的文案`() {
         assertTrue(REVIEW_MIC_BLOCKED.contains("麦克风"))
         assertTrue("要说清这次没开始录：$REVIEW_MIC_BLOCKED", REVIEW_MIC_BLOCKED.contains("没开始"))
-        assertTrue("空的一天要告诉下一步：$REVIEW_DAY_EMPTY", REVIEW_DAY_EMPTY.contains("口述"))
+        assertTrue("空的一天要告诉下一步：$REVIEW_DAY_EMPTY", REVIEW_DAY_EMPTY.contains("开始回顾"))
         // 历史空态与它们不是一回事（不能混用一句话）
         assertFalse(REVIEW_HISTORY_EMPTY == REVIEW_DAY_EMPTY)
     }

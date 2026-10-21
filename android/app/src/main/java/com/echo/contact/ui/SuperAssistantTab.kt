@@ -79,7 +79,7 @@ import com.echo.contact.ui.theme.EchoPalette
  * └──────────────────────────────────────────────┘
  * ┌ 会议 ──────────────┐ ┌ 回顾 ──────────────┐  ← ④ 会议/回顾**并列**（各半宽）
  * │ 没在录音            │ │ 今天已回顾 2 轮     │
- * │ [ 开始录音 ]        │ │ [ 口述回顾 ]        │
+ * │ [ 开始录音 ]        │ │ [ 开始回顾 ]        │
  * └────────────────────┘ └────────────────────┘
  * ```
  *
@@ -115,11 +115,20 @@ internal fun SuperAssistantTab(vm: MainViewModel, onOpenTab: (EchoTab) -> Unit) 
 
     // 两个**现有**状态，决定卡片上按钮的文案（不新造开关）：
     //  · 会议录音 = `MeetingMicService` 的本地状态（手机麦那条路）；
-    //  · 口述回顾 = `MainViewModel.recording`（与回顾页「车里口述」同一个录音器）。
+    //  · 回顾 = `MainViewModel` 的那一场（与回顾页完全同一套状态机）。
     val micState by MeetingMicService.state.collectAsState()
-    val dictating by vm.recording.collectAsState()
+    val reviewSession by vm.reviewSession.collectAsState()
+    val reviewEnded by vm.reviewEnded.collectAsState()
+    val reviewStarting by vm.reviewStarting.collectAsState()
+    val reviewRecording by vm.recording.collectAsState()
 
-    val cards = homeCards(micRecording = micState.active, reviewDictating = dictating)
+    val reviewActive = reviewSession != null && !reviewEnded
+    val cards = homeCards(
+        micRecording = micState.active,
+        reviewActive = reviewActive,
+        reviewRecording = reviewRecording,
+        reviewStarting = reviewStarting,
+    )
 
     val context = LocalContext.current
 
@@ -129,12 +138,13 @@ internal fun SuperAssistantTab(vm: MainViewModel, onOpenTab: (EchoTab) -> Unit) 
     val meetingMicLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { granted -> if (granted) vm.startMeeting() }
-    // 回顾口述：回调里**无条件**再试一次 —— `startReviewDictation()` 自己查权限，
-    // 所以"用户拒绝"也会在这张卡上留下一句原因（以前这里只有 `if (granted)`，
-    // 拒绝时什么都不显示：用户点了「口述回顾」，屏幕上没有任何反应）。
+    // 回顾这一轮：按住说话要先有 RECORD_AUDIO。没授权就先要；授权回来**就开始这一轮**
+    // （与回顾页同一个 `startReviewRound`，不新造录音路）。
+    // 为什么回调里不看 `granted`：`startReviewRound()` 自己会再查一次权限并把原因说出来，
+    // 这样"用户拒绝"也会在卡片上留一句，而不是按了没反应。
     val reviewMicLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
-    ) { vm.startReviewDictation() }
+    ) { vm.startReviewRound() }
 
     // 为什么 `vm.startMeeting()` 会顺带打开全屏录音界面：那是这条**既有**入口的一部分
     // （2026-10-15 用户要的"漂亮电平 + 结束 + 静音"）。它**不是**切页签 ——
@@ -145,19 +155,15 @@ internal fun SuperAssistantTab(vm: MainViewModel, onOpenTab: (EchoTab) -> Unit) 
             PackageManager.PERMISSION_GRANTED
         if (granted) vm.startMeeting() else meetingMicLauncher.launch(Manifest.permission.RECORD_AUDIO)
     }
-    // 口述回顾：**既有**那条"录一段 → 转写 → 整理"路，只是入口换成了"两个都能说清原因"的那个。
-    // 以前这里把 `vm.startRecording()` 的返回值**扔掉了**：没给权限 / 麦被占时，
-    // 这张卡上什么都不显示 —— 用户点了「口述回顾」，屏幕上没有任何反应（2026-10-18 真机）。
-    // 现在走 `vm.startReviewDictation()`：它先判权限/占用，原因写进 `dictateNote`，
-    // 卡上就在按钮下面显示（不在别处）。录音实现还是那一个 `startRecording()`。
-    val startDictationWithMic: () -> Unit = {
+    // 回顾这一轮的开录入口：与回顾页那颗「按住说话」同一条判定/同一条录音实现。
+    val startReviewRoundWithMic: () -> Boolean = {
         val granted = context.checkSelfPermission(Manifest.permission.RECORD_AUDIO) ==
             PackageManager.PERMISSION_GRANTED
         if (granted) {
-            vm.startReviewDictation()
+            vm.startReviewRound()
         } else {
-            // 系统弹窗这一下不可能静默：回调里一定会再调一次并把原因说出来
             reviewMicLauncher.launch(Manifest.permission.RECORD_AUDIO)
+            false
         }
     }
 
@@ -242,7 +248,7 @@ internal fun SuperAssistantTab(vm: MainViewModel, onOpenTab: (EchoTab) -> Unit) 
                     modifier = Modifier.weight(1f),
                     minHeightDp = plan.sideCardDp,
                 ) {
-                    ReviewCardBody(reviewCard, vm, startDictationWithMic)
+                    ReviewCardBody(reviewCard, vm, reviewActive, startReviewRoundWithMic)
                 }
             }
 
@@ -565,28 +571,34 @@ private fun MeetingCardBody(card: HomeCardSpec, mic: MicState, onStart: () -> Un
 }
 
 /**
- * 回顾卡：**口述回顾**（直接进既有的"录一段 → 转写 → 整理"路）+ 一行状态。
+ * 回顾卡：与 PC 版**同一套动作** —— 开始 → 按住说一轮 / 打字（在回顾页）→ 结束。
  *
- * 走的是 `vm.startReviewDictation()` / `vm.submitReviewDictation()` —— 与回顾页那张
- * 「车里口述」卡**同一个**入口（`ReviewTab` 的 `startDictation`），没有第二条路。
- * 录音实现仍然只有 `MainViewModel.startRecording()` 那一处；`startReviewDictation`
- * 只多做一件界面必须做的事：**先把"能不能开始"判出来并给一句人话**。
+ * 走的是 `vm.startReviewSession()` / `vm.startReviewRound()` / `vm.finishReviewRound()` /
+ * `vm.endReviewSession()` —— 与回顾页**同一个**状态机，没有第二条路。
+ * 每一轮上传走 `/api/daily-review/turn`（语音）或 `/api/daily-review/submit`（文字），
+ * **不走指令链**（用户 2026-10-22："命令仍然发到了指令空间"）。
  */
 @Composable
-private fun ReviewCardBody(card: HomeCardSpec, vm: MainViewModel, onStartDictation: () -> Unit) {
+private fun ReviewCardBody(
+    card: HomeCardSpec,
+    vm: MainViewModel,
+    reviewActive: Boolean,
+    onStartRound: () -> Boolean,
+) {
     val recordMs by vm.recordMs.collectAsState()
-    val submitting by vm.reviewSubmitting.collectAsState()
-    val submittingNote by vm.reviewSubmittingNote.collectAsState()
+    val session by vm.reviewSession.collectAsState()
+    val starting by vm.reviewStarting.collectAsState()
+    val recording by vm.recording.collectAsState()
+    val roundBusy by vm.reviewRoundBusy.collectAsState()
+    val roundNote by vm.reviewRoundNote.collectAsState()
+    val sessionNote by vm.reviewSessionNote.collectAsState()
     val summary by vm.reviewSummary.collectAsState()
-    // 「口述回顾」没开始/没收到的原因（没权限 / 被会议录音占着 / 被"一直听着"占着 /
-    // 开不了麦 / 收不到声音 / 取消了）。**必须画在按钮下面** —— 这张卡就是用户按的地方。
-    val dictateNote by vm.dictateNote.collectAsState()
 
     MutedLine(
         when {
-            submitting -> "正在整理…"
-            card.buttons.any { it.action == HomeAction.SUBMIT_REVIEW } ->
-                "录音中 ${elapsedClock(recordMs / 1000.0)}"
+            starting -> "正在开始回顾…"
+            roundBusy -> "正在整理这一轮…"
+            reviewActive -> "回顾进行中 · 本场 ${session?.rounds ?: 0} 轮"
             (summary?.todayTurns ?: 0) > 0 -> "今天已回顾 ${summary?.todayTurns} 轮"
             else -> "今天还没回顾"
         },
@@ -599,21 +611,66 @@ private fun ReviewCardBody(card: HomeCardSpec, vm: MainViewModel, onStartDictati
     ) {
         card.buttons.forEach { button ->
             when (button.action) {
-                HomeAction.DICTATE_REVIEW -> Button(
-                    onClick = onStartDictation,
+                HomeAction.START_REVIEW -> Button(
+                    onClick = { vm.startReviewSession() },
+                    enabled = !starting,
                     contentPadding = PaddingValues(horizontal = 10.dp),
                     modifier = Modifier.height(HomeLayoutSpec.PRIMARY_BUTTON_DP.dp),
                 ) { Text(button.label) }
 
-                HomeAction.SUBMIT_REVIEW -> Button(
-                    onClick = { vm.submitReviewDictation() },
-                    contentPadding = PaddingValues(horizontal = 10.dp),
+                // 按住说话：与回顾页同一颗圆钮的手势（Button 会先 consume down，
+                // 所以这里必须用 Surface + detectTapGestures）。
+                HomeAction.START_REVIEW_ROUND -> Surface(
+                    color = if (roundBusy) EchoPalette.Muted else EchoPalette.Accent,
+                    shape = CircleShape,
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(HomeLayoutSpec.PRIMARY_BUTTON_DP.dp)
+                        .pointerInput(roundBusy) {
+                            if (roundBusy) return@pointerInput
+                            detectTapGestures(
+                                onPress = {
+                                    if (onStartRound()) {
+                                        if (tryAwaitRelease()) vm.finishReviewRound()
+                                        else vm.cancelReviewRound()
+                                    }
+                                },
+                            )
+                        },
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.Center,
+                    ) {
+                        Text(button.label, color = Color.White, style = MaterialTheme.typography.labelLarge)
+                        if (recording) {
+                            Spacer(Modifier.size(4.dp))
+                            Text(
+                                "${"%.1f".format(recordMs / 1000.0)}s",
+                                color = Color.White,
+                                style = MaterialTheme.typography.labelSmall,
+                            )
+                        }
+                    }
+                }
+
+                HomeAction.FINISH_REVIEW_ROUND -> Button(
+                    onClick = { vm.finishReviewRound() },
+                    contentPadding = PaddingValues(horizontal = 8.dp),
+                    modifier = Modifier.weight(1f).height(HomeLayoutSpec.PRIMARY_BUTTON_DP.dp),
+                ) { Text(button.label) }
+
+                HomeAction.END_REVIEW -> TextButton(
+                    onClick = { vm.endReviewSession() },
+                    enabled = !roundBusy,
+                    contentPadding = PaddingValues(horizontal = 6.dp),
                     modifier = Modifier.height(HomeLayoutSpec.PRIMARY_BUTTON_DP.dp),
                 ) { Text(button.label) }
 
                 HomeAction.CANCEL_REVIEW -> TextButton(
-                    onClick = { vm.cancelReviewDictation() },
-                    contentPadding = PaddingValues(horizontal = 8.dp),
+                    onClick = { vm.cancelReviewRound() },
+                    contentPadding = PaddingValues(horizontal = 6.dp),
                     modifier = Modifier.height(HomeLayoutSpec.PRIMARY_BUTTON_DP.dp),
                 ) { Text(button.label) }
 
@@ -622,19 +679,14 @@ private fun ReviewCardBody(card: HomeCardSpec, vm: MainViewModel, onStartDictati
         }
     }
 
-    // 两句说明**都画在按钮下面**（这张卡就是用户按的地方，不摆到别处去）：
-    //  · dictateNote    = 这次口述**没开始**/没收到的原因（没权限、被会议录音占着、
-    //                     被"一直听着"占着、开不了麦、收不到声音、取消了）；
-    //  · submittingNote = 已经开始转写/整理之后的进度与失败原因。
-    dictateNote?.takeIf { it.isNotBlank() }?.let {
-        Spacer(Modifier.height(HomeLayoutSpec.CARD_GAP_DP.dp))
-        // 4 行：这张卡只有半个屏幕宽，3 行会把"点「允许」/去指令页停掉"那半句截掉，
-        // 而那半句恰恰是用户唯一能照做的东西。真的没有原因时它一行都不占。
-        MutedLine(it, color = EchoPalette.Yellow, maxLines = 4)
-    }
-    submittingNote?.takeIf { it.isNotBlank() }?.let {
-        Spacer(Modifier.height(HomeLayoutSpec.CARD_GAP_DP.dp))
-        MutedLine(it, color = EchoPalette.Purple, maxLines = 2)
+    // 两句说明**都画在按钮下面**（这张卡就是用户按的地方）：
+    //  · roundNote   = 这一轮没开始/正在整理/失败的原因；
+    //  · sessionNote = 开始失败 / 结束那句 / 权限提示。
+    listOf(roundNote, sessionNote).forEach { line ->
+        line?.takeIf { it.isNotBlank() }?.let {
+            Spacer(Modifier.height(HomeLayoutSpec.CARD_GAP_DP.dp))
+            MutedLine(it, color = EchoPalette.Yellow, maxLines = 4)
+        }
     }
 }
 

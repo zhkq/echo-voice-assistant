@@ -2,6 +2,8 @@ package com.echo.contact.data
 
 import com.google.gson.Gson
 import kotlinx.coroutines.runBlocking
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
 import org.junit.After
@@ -119,5 +121,44 @@ class ReviewStartWireTest {
         assertEquals("", a.body.readUtf8())
         val b = server.takeRequest()
         assertEquals("/api/daily-review/stop", b.path)
+    }
+
+    /**
+     * **回顾这一轮（语音）**：`POST /api/daily-review/turn`，裸 wav body。
+     *
+     * 这条是 2026-10-22 修"命令发到指令空间"的落点：回顾轮次必须打到回顾接口，
+     * 而不是 `voice-command`（后者会把这句话发给命令目标）。
+     */
+    @Test
+    fun `回顾一轮打 turn 且请求体是裸 wav`() {
+        server.enqueue(
+            json(
+                """{"ok":true,"text":"今天把回顾改成走回顾接口了",
+                    "session_id":"session-1","workspace":"C:\\echo-dev\\review",
+                    "reply":"已登记","spoken":"记好了，还有吗？","source":"broadcast",
+                    "error":"","seconds":42.5,"registered":true}"""
+            )
+        )
+        val bytes = byteArrayOf(82, 73, 70, 70, 0, 0, 0, 0)
+
+        val resp = runBlocking {
+            api().dailyReviewTurn(bytes.toRequestBody("audio/wav".toMediaType()))
+        }
+
+        assertTrue(resp.isSuccessful)
+        val b = resp.body()!!
+        assertTrue(b.ok)
+        assertEquals("今天把回顾改成走回顾接口了", b.text)
+        assertEquals("session-1", b.sessionId)
+        assertEquals("记好了，还有吗？", b.spoken)
+        assertEquals("broadcast", b.source)
+        assertEquals(42.5, b.seconds, 0.001)
+        assertTrue("登记核实要原样读出来", b.registered == true)
+
+        val req = server.takeRequest()
+        assertEquals("/api/daily-review/turn", req.path)
+        assertEquals("POST", req.method)
+        assertEquals("audio/wav", req.getHeader("Content-Type"))
+        assertTrue("必须是裸 wav body（不是 multipart）", req.body.readByteArray().contentEquals(bytes))
     }
 }

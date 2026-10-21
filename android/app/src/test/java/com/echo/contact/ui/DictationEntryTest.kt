@@ -258,21 +258,26 @@ class DictationEntryTest {
     }
 
     @Test
-    fun `首页回顾卡的口述入口走同一个判定 且原因画在按钮下面`() {
-        val card = functionBody(homeTab, "private fun ReviewCardBody", "「在听」细条")
-        assertTrue("首页回顾卡没把 dictateNote 显示出来", card.contains("dictateNote?.takeIf { it.isNotBlank() }"))
-        assertTrue("首页回顾卡没读 dictateNote", card.contains("vm.dictateNote.collectAsState()"))
+    fun `首页回顾卡改成 PC 式回顾 且原因画在按钮下面`() {
+        // 2026-10-22：首页回顾卡与回顾页同一套动作（开始 / 按住说 / 说完了 / 结束），
+        // 不再走"口述一次交上去"那条一次性路。
+        assertTrue("首页回顾卡没把这一轮的原因显示出来",
+            homeTab.contains("listOf(roundNote, sessionNote)"))
+        assertTrue("首页回顾卡没读 reviewRoundNote",
+            homeTab.contains("vm.reviewRoundNote.collectAsState()"))
+        assertTrue("首页回顾卡没读这一场的说明",
+            homeTab.contains("vm.reviewSessionNote.collectAsState()"))
 
-        val entry = functionBody(homeTab, "val startDictationWithMic", "// ---- 布局预算")
-        assertTrue("首页「口述回顾」没走同一个判定", entry.contains("vm.startReviewDictation()"))
+        val entry = functionBody(homeTab, "val startReviewRoundWithMic", "// ---- 布局预算")
+        assertTrue("首页「按住说话」没接回顾入口", entry.contains("vm.startReviewRound()"))
         assertFalse(
-            "首页「口述回顾」还在直接调 startRecording()（返回值会被扔掉 = 静默）",
-            entry.contains("vm.startRecording()"),
+            "首页回顾卡又走回一次性口述（那会把这一轮当成独立口述）",
+            entry.contains("startReviewDictation"),
         )
-        // 授权回调也必须无条件再试一次（拒绝时才有那句话）
+        // 授权回调也要能说清"用户拒绝了"：startReviewRound 自己查权限并把原因写进 roundNote。
         assertTrue(
-            "授权回调没有无条件再试一次",
-            homeTab.contains("{ vm.startReviewDictation() }"),
+            "授权回调没有再去试一次回顾这一轮",
+            homeTab.contains("{ vm.startReviewRound() }"),
         )
     }
 

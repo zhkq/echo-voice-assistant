@@ -10,6 +10,7 @@ import com.echo.contact.data.dto.DailyReviewState
 import com.echo.contact.data.dto.DailyReviewSubmitRequest
 import com.echo.contact.data.dto.DailyReviewSubmitResponse
 import com.echo.contact.data.dto.DailyReviewSummary
+import com.echo.contact.data.dto.DailyReviewTurnResponse
 import com.echo.contact.data.dto.EventFeed
 import com.echo.contact.data.dto.MeetingDetail
 import com.echo.contact.data.dto.MeetingListResponse
@@ -59,16 +60,15 @@ interface EchoApi {
     suspend fun sendCommand(
         @Body body: CommandRequest,
         /**
-         * **上下文标记**（可选；`null` = 不发这个 query，老服务端/普通指令行为不变）。
+         * **上下文标记**（可选；`null` = 不发这个 query）。
          *
-         * 回顾那一场传 `REVIEW_CONTEXT`（`"review"`）：服务端把这一轮记成
-         * `commands.source='review'`，于是它进「回顾历史」、**不进**「指令历史」。
-         * 标签不改执行 —— 指令照样发给智能体，手机照样拿结果。
+         * 服务端仍支持 `context=review`（把落库标签改成 `source='review'`），但**手机回顾
+         * 已改走** [dailyReviewTurn] / [dailyReviewSubmit] —— 回顾轮次不该再走指令链
+         * （用户 2026-10-22："命令仍然发到了指令空间"）。普通指令不传它。
          */
         @Query("context") context: String? = null,
         /**
-         * **同一轮的幂等键**（可选）：同一轮被重发时服务端认出"这轮已经记过了"，
-         * 不会再产生第二条回顾记录（见 `ReviewConversation.REVIEW_REQUEST_ID`）。
+         * **同一轮的幂等键**（可选；服务端仍支持，手机回顾已改走回顾接口，不再使用）。
          */
         @Query("requestId") requestId: String? = null,
     ): Response<CommandResponse>
@@ -83,9 +83,9 @@ interface EchoApi {
     @POST("api/assistant/voice-command")
     suspend fun voiceCommand(
         @Body body: RequestBody,
-        /** 同 [sendCommand]：回顾这一场的一轮传 `REVIEW_CONTEXT`；`null` 时不带这个 query。 */
+        /** 同上：服务端仍兼容，但手机回顾的一轮已改走 [dailyReviewTurn]。 */
         @Query("context") context: String? = null,
-        /** 同 [sendCommand]：同一轮的幂等键。 */
+        /** 同上：服务端仍兼容，手机回顾不再使用。 */
         @Query("requestId") requestId: String? = null,
     ): Response<VoiceCommandResponse>
 
@@ -362,6 +362,22 @@ interface EchoApi {
      */
     @POST("api/daily-review/submit")
     suspend fun dailyReviewSubmit(@Body body: DailyReviewSubmitRequest): Response<DailyReviewSubmitResponse>
+
+    /**
+     * **手机回顾的一轮（语音）**：裸 wav 直接当 body → 服务端回顾转写 → 与 PC 回顾
+     * 同一条 `daily_review.submit()`（整理 / 播报 / 落 `source='review'`）。
+     *
+     * 为什么不用 `voice-command`（旧实现）：那条虽然能带 `context=review` 改落库标签，
+     * 但**执行发到的是命令目标**（DSH 指令空间），不是回顾会话 —— 用户 2026-10-22
+     * 原话："我点了之后命令仍然发到了指令空间，整个逻辑也不是跟 pc 完全一样"。
+     * 这一条是**唯一**的手机回顾轮次入口：回顾不经过指令链。
+     *
+     * ⚠️ 阻塞（服务端等智能体整理完才返回，通常 2–3 分钟），调用方要用
+     * [com.echo.contact.data.ApiClient.LONG_READ_TIMEOUT_S] 那个客户端。
+     * ⚠️ 没听清 / 智能体没回 = **200 + ok=false**，不能只看状态码。
+     */
+    @POST("api/daily-review/turn")
+    suspend fun dailyReviewTurn(@Body body: RequestBody): Response<DailyReviewTurnResponse>
 
     /**
      * 上传音频换文本（**multipart**，与 voice-command 的裸 body 正好相反）。

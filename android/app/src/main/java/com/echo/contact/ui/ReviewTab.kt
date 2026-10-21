@@ -62,7 +62,8 @@ internal const val REVIEW_FEATURE_TITLE = "回顾功能"
 internal const val REVIEW_HISTORY_TITLE = "历史回顾"
 
 /** 历史为空时的空状态文案（用户 2026-10-18：不许退成一整页纯列表，也不能空着不说）。 */
-internal const val REVIEW_HISTORY_EMPTY = "还没有回顾历史。口述一次今天，这里就会出现第一天。"
+internal const val REVIEW_HISTORY_EMPTY =
+    "还没有回顾历史。点「开始回顾」开始一场，这里就会出现第一天。"
 
 /**
  * 开不了麦时那句人话（回顾口述这条路**一个字都没开始**）。
@@ -81,7 +82,7 @@ internal const val REVIEW_MIC_BLOCKED =
  * 空页也要告诉用户下一步点哪儿 —— 只写"没有记录"等于把人晾在那儿。
  */
 internal const val REVIEW_DAY_EMPTY =
-    "这一天没有回顾记录。若是今天：返回后点「车里口述」录一段，第一条就会出现在这里。"
+    "这一天没有回顾记录。若是今天：返回后点「开始回顾」开始一场，第一条就会出现在这里。"
 
 // ---- 失败必须看得见（2026-10-18 复查的五处之一/之二/之三）----
 //
@@ -158,7 +159,7 @@ internal fun reviewTodayTap(
     !summaryLoaded || today.isBlank() ->
         ReviewTodayTap.Note("还没读到今天的回顾状态：先点「刷新」，或检查与电脑的连接")
     todayTurns <= 0 ->
-        ReviewTodayTap.Note("今天还没有回顾：点「车里口述」录一段，第一条就会出现在这里")
+        ReviewTodayTap.Note("今天还没有回顾：点「开始回顾」开始一场，第一条就会出现在这里")
     else -> ReviewTodayTap.OpenDay(today)
 }
 
@@ -264,14 +265,16 @@ internal fun reviewDaysDescending(days: List<ReviewDay>): List<ReviewDay> =
     days.sortedByDescending { it.date }
 
 /**
- * 回顾页：**顶部功能区 + 下面历史回顾列表**（用户 2026-10-18 点名的形态）。
+ * 回顾页：**顶部功能区 + 回顾对话 + 下面历史回顾列表**（用户 2026-10-18 点名的形态）。
  *
- * 为什么手机不能"开始主机回顾"：那要占用**主机那支麦克风**口述 —— 那不是手机该干的事。
- * 手机走的是"自己录口述 → ECHO 转写整理 → 念播报"这条路（`vm.submitReviewDictation`），
- * 念用手机系统 TTS（离线、零等待）。
+ * 手机回顾 = PC 版那套交互（开始 → 一轮轮说/打 → 结束），但**用手机的麦**：
+ * 点「开始回顾」只建/取回今天的回顾会话（`/api/daily-review/start`，不碰电脑的麦）；
+ * 每一轮语音走 `/api/daily-review/turn`、打字走 `/api/daily-review/submit` ——
+ * 两条都是 `daily_review.submit()` 的入口，**不进指令空间**；念用手机系统 TTS。
  *
- * 上一版是"一张口述卡 + 一张状态卡 + 一整页列表"；这一版把三件事提成顶部功能区
+ * 上一版是"一张口述卡 + 一张状态卡 + 一整页列表"；现在把三件事提成顶部功能区
  * （今日回顾 / 车里口述 / 播报），下面才是历史 —— 与超级助理页的仪表盘形态对齐。
+ * 「车里口述」保留为**退路**（一次性口述），主路径是上面的「开始回顾」。
  */
 @Composable
 fun ReviewTab(vm: MainViewModel) {
@@ -301,8 +304,9 @@ fun ReviewTab(vm: MainViewModel) {
     val sessionNote by vm.reviewSessionNote.collectAsState()
     val reviewStarting by vm.reviewStarting.collectAsState()
     val reviewEnded by vm.reviewEnded.collectAsState()
-    // 进行中那一轮的进度（转写/执行/失败原因）—— 就在 _submit 里，不再另存一份
-    val roundSubmit by vm.submit.collectAsState()
+    // 这一轮的进度/失败原因（语音上传 + 回顾整理走 /turn、/submit，不再进指令链）
+    val roundBusy by vm.reviewRoundBusy.collectAsState()
+    val roundNote by vm.reviewRoundNote.collectAsState()
     // 朗读那条路的说明（没装 TTS / 没有可念的播报 / 取不到当天详情）以前写在
     // `_speakNote` 里而**全 App 没有界面读它** → 按「播报」没声音也没提示。
     // 这里把它显示出来（`speak()` 每次开口前会清空，所以不会挂着过期的失败原因）。
@@ -454,7 +458,7 @@ fun ReviewTab(vm: MainViewModel) {
         //    下面的「历史回顾」，见 REVIEW_LAST_ROUNDS_NOTE —— 2026-10-20 起手机
         //    回顾轮次带 context=review，服务端记 source='review'，回顾历史会收到它们）；
         //  · 进行中 → 顶部「回顾进行中」+ 轮数 + 结束按钮，下面是一来一回的消息，
-        //    最下面是输入条（打字 → 既有 sendCommand；按住说话 → 这一轮）。
+        //    最下面是输入条（打字 → 回顾 submit；按住说话 → 回顾 turn）。
         if (!reviewActive) {
             item {
                 ReviewStartCard(
@@ -474,9 +478,10 @@ fun ReviewTab(vm: MainViewModel) {
                     session = session!!,
                     todayTurns = summary?.todayTurns ?: 0,
                     note = sessionNote,
-                    // 录一轮的"没开始"原因（没权限/被占/这场结束了…）也摆在顶部，
-                    // 别让用户按了按住说话却哪里都看不到原因
-                    roundNote = dictateNote,
+                    // 录一轮的"没开始"原因（没权限/被占/这场结束了…）与
+                    // 上一轮整理的进度/失败原因都摆在顶部 —— 用户就在看这里
+                    roundNote = roundNote,
+                    roundBusy = roundBusy,
                     onEnd = { vm.endReviewSession() },
                 )
             }
@@ -489,18 +494,18 @@ fun ReviewTab(vm: MainViewModel) {
                         val text = reviewInput.trim()
                         if (text.isNotEmpty()) {
                             reviewInput = ""
-                            // 继续交互走**既有**指令链（这条注释与 EchoApi 的说明是同一套）。
-                            // 带 context=review：服务端把这一轮记进回顾历史（回顾轮次属于
-                            // 回顾，不属于发指令）—— 于是回顾页与指令历史不再各有一份。
-                            vm.sendCommand(text, context = REVIEW_CONTEXT)
+                            // 打字继续这一场也走**回顾**（`/api/daily-review/submit`），
+                            // 不走 `sendCommand` —— 否则这句话会发到指令空间（用户 2026-10-22）。
+                            vm.submitReviewText(text)
                         }
                     },
-                    submit = roundSubmit,
+                    busy = roundBusy,
+                    note = roundNote,
                     recording = recording,
                     recordMs = recordMs,
                     onStartRound = { startRound() },
                     onFinishRound = { vm.finishReviewRound() },
-                    onCancelRound = { vm.cancelReviewDictation() },
+                    onCancelRound = { vm.cancelReviewRound() },
                 )
             }
         }
@@ -805,7 +810,7 @@ private fun ReviewStatusCard(
                 TextButton(onClick = onStopHost) { Text("停掉主机上正在进行的回顾") }
             }
             Spacer(Modifier.height(4.dp))
-            MutedLine("点上面的「车里口述」录一段 —— 手机自己录，不用电脑那支麦克风。")
+            MutedLine("点上面的「开始回顾」开始一场：一轮轮说或打字，和 PC 版一样。")
         }
     }
 }
@@ -960,6 +965,7 @@ private fun ReviewRunningCard(
     todayTurns: Int,
     note: String?,
     roundNote: String?,
+    roundBusy: Boolean,
     onEnd: () -> Unit,
 ) {
     EchoCard {
@@ -976,15 +982,18 @@ private fun ReviewRunningCard(
             )
             Spacer(Modifier.height(8.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
-                Button(onClick = onEnd) { Text("结束回顾") }
-                MutedLine("说一轮 / 打一句，ECHO 回一轮 —— 和 PC 版一样。", maxLines = 2)
+                Button(onClick = onEnd, enabled = !roundBusy) { Text("结束回顾") }
+                MutedLine(
+                    if (roundBusy) "这一轮正在整理…" else "说一轮 / 打一句，ECHO 回一轮 —— 和 PC 版一样。",
+                    maxLines = 2,
+                )
             }
             // 开始的注意事项（电脑权限没准备好）或结束那句
             note?.takeIf { it.isNotBlank() }?.let {
                 Spacer(Modifier.height(6.dp))
                 MutedLine(it, color = EchoPalette.Yellow, maxLines = 5)
             }
-            // 这一轮"没开始"的原因（没权限 / 麦被占 / 这场结束了…）
+            // 这一轮"没开始" / 正在整理 / 失败的原因
             roundNote?.takeIf { it.isNotBlank() }?.let {
                 Spacer(Modifier.height(4.dp))
                 MutedLine(it, color = EchoPalette.Yellow, maxLines = 4)
@@ -1011,7 +1020,9 @@ private fun ReviewMessageRow(message: ReviewMessage) {
 }
 
 /**
- * 底部输入条：打字 → 既有 `sendCommand`；按住说话 → 这一轮（`startReviewRound/finishReviewRound`）。
+ * 底部输入条：打字 → `/api/daily-review/submit`；按住说话 → 这一轮（`/api/daily-review/turn`）。
+ *
+ * 两条都**不是**指令链：回顾轮次只进回顾历史，不会发到指令空间（用户 2026-10-22）。
  *
  * 为什么"按住说话"不用 `Button`：`Button` 自带 `clickable`，会在指针事件里先 consume 掉 down，
  * `detectTapGestures` 就再也等不到按下（同 `SuperAssistantTab` 里那颗圆钮的坑）。
@@ -1021,7 +1032,8 @@ private fun ReviewRoundInputBar(
     input: String,
     onInputChange: (String) -> Unit,
     onSend: () -> Unit,
-    submit: SubmitState,
+    busy: Boolean,
+    note: String?,
     recording: Boolean,
     recordMs: Long,
     onStartRound: () -> Boolean,
@@ -1042,8 +1054,9 @@ private fun ReviewRoundInputBar(
                     placeholder = { Text("打字继续这一场回顾…", style = MaterialTheme.typography.bodySmall) },
                     maxLines = 3,
                     textStyle = MaterialTheme.typography.bodySmall,
+                    enabled = !busy,
                 )
-                Button(onClick = onSend, enabled = input.isNotBlank()) { Text("发送") }
+                Button(onClick = onSend, enabled = input.isNotBlank() && !busy) { Text("发送") }
             }
             Spacer(Modifier.height(8.dp))
             Row(
@@ -1051,9 +1064,14 @@ private fun ReviewRoundInputBar(
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 Surface(
-                    color = if (recording) EchoPalette.Red else EchoPalette.Accent,
+                    color = when {
+                        busy -> EchoPalette.Muted
+                        recording -> EchoPalette.Red
+                        else -> EchoPalette.Accent
+                    },
                     shape = CircleShape,
-                    modifier = Modifier.pointerInput(Unit) {
+                    modifier = Modifier.pointerInput(busy) {
+                        if (busy) return@pointerInput
                         detectTapGestures(
                             onPress = {
                                 // 只有真的开起了麦才等松手 —— 否则松手会走进"没在录音"那条提示，
@@ -1077,7 +1095,11 @@ private fun ReviewRoundInputBar(
                         )
                         Spacer(Modifier.width(6.dp))
                         Text(
-                            if (recording) "录音中…" else "按住说话",
+                            when {
+                                busy -> "整理中…"
+                                recording -> "录音中…"
+                                else -> "按住说话"
+                            },
                             color = Color.White,
                             style = MaterialTheme.typography.labelLarge,
                         )
@@ -1091,24 +1113,18 @@ private fun ReviewRoundInputBar(
                     TextButton(onClick = onCancelRound) { Text("取消") }
                 }
             }
-            // 这一轮的进度/失败/被挡：都在既有 SubmitState 里（不另存一份）
-            when {
-                submit.active -> {
+            // 这一轮的进度/失败/被挡：都来自 `reviewRoundNote`（不再借用 `_submit`）
+            if (busy) {
+                Spacer(Modifier.height(6.dp))
+                MutedLine(
+                    note.orEmpty().ifBlank { "ECHO 正在整理这一轮…（通常 2–3 分钟）" },
+                    color = EchoPalette.Purple,
+                    maxLines = 3,
+                )
+            } else {
+                note?.takeIf { it.isNotBlank() }?.let {
                     Spacer(Modifier.height(6.dp))
-                    MutedLine(
-                        "ECHO 正在处理这一轮：${submit.message.ifBlank { "…" }}",
-                        color = EchoPalette.Purple,
-                        maxLines = 2,
-                    )
-                }
-                submit.blocked.isNotBlank() -> {
-                    Spacer(Modifier.height(6.dp))
-                    MutedLine(submit.blocked, color = EchoPalette.Yellow, maxLines = 3)
-                }
-                submit.phase == SubmitPhase.Failed -> {
-                    Spacer(Modifier.height(6.dp))
-                    // 失败原因已经作为一条消息进了上面的对话（红色那行），这里只补一句"这一轮没成"
-                    MutedLine("这一轮没成：原因见上面那条 ECHO（红色）。", color = EchoPalette.Yellow, maxLines = 2)
+                    MutedLine(it, color = EchoPalette.Yellow, maxLines = 3)
                 }
             }
         }

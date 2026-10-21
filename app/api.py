@@ -1159,6 +1159,99 @@ def post_daily_review_submit(body: DailyReviewSubmitIn, _auth=Depends(optional_a
     return out
 
 
+@router.post("/daily-review/turn")
+async def post_daily_review_turn(request: Request, _auth=Depends(optional_auth)):
+    """**手机回顾的一轮**：裸音频 → 回顾转写 → 与 PC 回顾同一个 `daily_review.submit`。
+
+    为什么要有这一条（用户 2026-10-22）：*"我点了之后命令仍然发到了指令空间，
+    整个逻辑也不是跟 PC 完全一样"*。旧实现让每一轮走 `assistant/voice-command`
+    （带 `context=review` 只是**落库标签**变了），执行仍然发到**命令目标**：
+      * 那一轮进的是 DSH 的命令会话/指令空间，不是回顾会话；
+      * 也没走 daily-review 技能，拿不到"播报 + 登记核实"；
+      * 老服务端不认这个标签时，连标签都不算，指令历史里还会多一条。
+    这里改成与 PC 回顾**同一条下游**：`daily_review.submit()`（整理/播报/落库
+    `source='review'` 全在它里面）。所以手机这一轮：
+      * 只出现在「回顾历史」，**不会**出现在「指令历史」；
+      * 用的是回顾会话与回顾转写偏好（`dailyReviewSttBackend`），不是命令目标。
+
+    请求形状与 `/api/assistant/voice-command` 一致：**裸音频 body** +
+    `Content-Type: audio/wav`（不是 multipart）。业务失败回 **200 + ok=false**
+    （车里看不到面板，`spoken` 必须能直接念）；只有"请求体/音频本身不像音频"
+    才回 4xx —— 那两种原因不同，不能混成一句"回顾失败"。
+    """
+    body = await request.body()
+    if not body:
+        raise HTTPException(
+            status_code=422,
+            detail="请求体为空：请把 wav 字节直接当 body 发（Content-Type: audio/wav）")
+    if len(body) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="音频不能超过 512 MB")
+
+    tmp_in = tmp_wav = ""
+    from app import assistant as assistant_mod
+    try:
+        fd, tmp_in = tempfile.mkstemp(prefix="echo-review-", suffix=".bin")
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(body)
+        fd2, tmp_wav = tempfile.mkstemp(prefix="echo-review-", suffix=".wav")
+        os.close(fd2)
+        from starlette.concurrency import run_in_threadpool
+        try:
+            await run_in_threadpool(_audio_to_wav16k, tmp_in, tmp_wav)
+        except Exception as exc:
+            # 与 voice-command 同一条判据：这是**入参形状**不对，不是回顾没成。
+            raise HTTPException(
+                status_code=422,
+                detail="音频解码失败（%s）：请把 wav 字节**直接当 body** 发"
+                       "（Content-Type: audio/wav），不要用 multipart/form-data"
+                       % type(exc).__name__)
+        # 回顾那条路有自己的转写偏好（默认与会议同一个能力后端，失败回落本机）：
+        # 这里必须复用 `assistant._transcribe_command`，不能另写一套 stt 调用 ——
+        # 否则"设置说的是后端、代码走的是本机"又会漂一次。
+        try:
+            text, note, status = await run_in_threadpool(
+                assistant_mod._transcribe_command, tmp_wav, settings,
+                prefer=assistant_mod.review_stt_prefer(settings))
+        except Exception as exc:
+            # 转写实现自己抛了（不该发生，但发生了也得说人话）：这是"引擎问题"，
+            # 不是"你没说话" —— 手机上显示成后者会让人反复重说。
+            text, note, status = "", "回顾转写失败：%s: %s" % (
+                type(exc).__name__, exc), assistant_mod.ASR_ERROR
+    finally:
+        for p in (tmp_in, tmp_wav):
+            try:
+                if p:
+                    os.remove(p)
+            except OSError:
+                pass
+
+    text = (text or "").strip()
+    if not text:
+        # 没听到内容 / 转写引擎坏了：两种话不一样（后者会被误当成"你没说话"）。
+        engine_failed = status == getattr(assistant_mod, "ASR_ERROR", "error")
+        spoken = (assistant_mod.asr_failure_hint(note) if engine_failed
+                  else "这一轮我没听清，接着说。")
+        return {"ok": False, "text": "", "session_id": "", "workspace": "",
+                "reply": "", "spoken": spoken, "source": "fallback",
+                "error": str(note or ("转写引擎报错" if engine_failed else "没识别出文本")),
+                "seconds": 0.0}
+
+    from app import daily_review
+    out = await run_in_threadpool(daily_review.submit, text)
+    return {
+        "ok": bool(out.get("ok")),
+        "text": text,
+        "session_id": str(out.get("session_id") or ""),
+        "workspace": str(out.get("workspace") or ""),
+        "reply": str(out.get("reply") or ""),
+        "spoken": str(out.get("spoken") or ""),
+        "source": str(out.get("source") or ""),
+        "error": str(out.get("error") or ""),
+        "seconds": float(out.get("seconds") or 0.0),
+        "registered": out.get("registered"),
+    }
+
+
 @router.post("/daily-review/stop")
 def post_daily_review_stop(_auth=Depends(optional_auth)):
     """停掉正在进行的语音回顾（等价于用户说"结束回顾"）。"""

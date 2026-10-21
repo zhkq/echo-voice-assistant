@@ -135,7 +135,12 @@ class HomeLayoutTest {
 
     @Test
     fun `三张功能卡与底部五页导航都在`() {
-        val cards = homeCards(micRecording = false, reviewDictating = false)
+        val cards = homeCards(
+            micRecording = false,
+            reviewActive = false,
+            reviewRecording = false,
+            reviewStarting = false,
+        )
         assertEquals("三张功能卡", 3, cards.size)
         assertEquals(
             listOf(HomeCardKind.COMMAND, HomeCardKind.MEETING, HomeCardKind.REVIEW),

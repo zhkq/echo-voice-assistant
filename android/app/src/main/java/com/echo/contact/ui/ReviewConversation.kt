@@ -17,55 +17,15 @@ package com.echo.contact.ui
  *
  *  1. **开始不碰麦**：手机点"开始"只建会话；真正开麦的是"按住说话"那一轮
  *     （走**唯一**那处 `startRecording`，用**手机的麦**）。
- *  2. **继续交互走既有指令链**：语音 `voice-command` / 文字 `assistant/command` ——
- *     回顾自己**没有**第二条录音路。但每一轮都带 [REVIEW_CONTEXT]：
- *     服务端据此把它记成 `commands.source='review'` —— **回顾轮次属于回顾**，
- *     于是它进「回顾历史」、**不再**在「指令历史」里重复一遍
- *     （用户 2026-10-20：*"回顾的历史对话，指令里也有能不重复吗？"*）。
- *  3. **标签不改执行**：带不带这个标记，指令照样发给智能体、结果照样回来；
- *     它只决定这一轮算哪段历史。老服务端不认这个 query → 行为退回原样
- *     （那些轮次落 `mobile`，也就仍出现在指令历史里）。
+ *  2. **每一轮都走回顾，不走指令链**（用户 2026-10-22："命令仍然发到了指令空间"）：
+ *     语音轮次 → `POST /api/daily-review/turn`，打字轮次 → `POST /api/daily-review/submit`。
+ *     服务端用与 PC 回顾**同一条** `daily_review.submit()` 整理/播报/落 `source='review'`。
+ *     所以这些轮次只进「回顾历史」，**不会**出现在「指令历史」；也**不会**发到命令目标。
+ *  3. **只有一处录音路**：真正开麦的只有 `startRecording()`，录一轮只是它的薄包装。
  *
  * 这个文件刻意**不碰 Android / ViewModel**：它是纯函数，JVM 门禁里能逐条钉住
  * （Compose 在 JVM 门禁里渲染不了，"两轮不覆盖"这种事只能靠纯逻辑断言）。
  */
-
-// ---- 回顾轮次的上下文标记 / 幂等键 ---------------------------------------------------------
-
-/**
- * 「回顾那一场的一轮」的**上下文标记**（发给服务端的 `?context=review`）。
- *
- * 为什么要有它：手机回顾走的是**既有指令链**，不打招呼的话服务端只能按默认记
- * `source='mobile'` —— 于是同一句话在「回顾页 + 指令历史」出现两次，而「回顾历史」
- * 里反倒没有（那边只读 `source='review'`）。这个标记让服务端把轮次记进回顾历史。
- *
- * ⚠️ 它**只是一个标签**：不带它的普通指令、一次性口述（`/daily-review/submit`）
- * 都不许带；带了也不改变执行（见 `EchoApi.voiceCommand` / `sendCommand` 的说明）。
- */
-internal const val REVIEW_CONTEXT = "review"
-
-/** 幂等键里不许出现的字符（服务端只收 `[A-Za-z0-9:_.-]`）。 */
-private val REVIEW_ID_UNSAFE = Regex("[^A-Za-z0-9:_.-]")
-
-/**
- * 这一轮的**幂等键**（`"<回顾会话 id>:<本场开始时刻>:<轮次>"`）。
- *
- * 为什么需要：万一同一轮被发两次（重试 / 界面重放），服务端按这个键认出"这轮已经
- * 记过了"，不会产生第二条回顾记录。键只由**这一场 + 这一轮**决定，所以两轮内容
- * 完全相同也仍是两个键（幂等的是"这一轮"，不是"这句话"）。
- *
- * ⚠️ **必须带 `startedAt`**：`round` 是 ViewModel 里的计数器，App 重启后从 1 重新数，
- * 而"今天那条回顾会话"的 `sessionId` 当天是复用的 —— 只写 `sessionId:round` 的话，
- * 重启后第一轮会撞上重启前某一轮的键，服务端会把它当成重复而**丢一轮真内容**。
- * 本场开始时刻（毫秒）把两场分开；同一场里它不变，所以重发仍是同一个键。
- *
- * 拿不到会话 / 开始时刻 / 轮次无效 → null（不发这个参数，老服务端与老通道行为不变）。
- */
-internal fun reviewRequestId(sessionId: String, startedAt: Long, round: Long): String? {
-    val sid = sessionId.replace(REVIEW_ID_UNSAFE, "").take(80)
-    if (sid.isEmpty() || startedAt <= 0L || round <= 0L) return null
-    return "$sid:$startedAt:$round"
-}
 
 // ---- 说话人 -------------------------------------------------------------------------------
 
@@ -96,9 +56,8 @@ data class ReviewMessage(
  * @property startedAt  本场开始时间（手机时钟；只用于显示/排障，不和服务端比时间）。
  * @property messages   **追加**的消息（一轮两条），顺序就是发生顺序。
  * @property rounds     本场已完成的轮数（= `messages.size / 2`，单独存一份是为了界面直接读）。
- * @property lastRoundId 最后一条被追加进对话的**轮次身份**（`SubmitState.roundId`）。
- *   它有两个用途：① 同一轮的结果被重复回调时**不重复追加**；② 开始这场之前那条
- *   还在路上的指令（id 更小）不会被算进这一场。
+ * @property lastRoundId 最后一条被追加进对话的**轮次身份**（[SubmitState.roundId] 或
+ *   `nextRoundId()`）。它只用于排障/去重展示；追加本身由 [appendReviewRound] 完成。
  */
 data class ReviewSession(
     val sessionId: String = "",
@@ -133,6 +92,9 @@ internal const val REVIEW_NO_SESSION =
 internal const val REVIEW_NOT_RECORDING =
     "没在录音：这次没有提交（按住「按住说话」说，或已经在提交了）"
 
+/** 主动取消这一轮回顾录音（不是失败，但也要说清"这一轮没交上去"）。 */
+internal const val REVIEW_ROUND_CANCELED = "这一轮录音取消了，没有提交"
+
 /**
  * 还在录这一轮就想"结束回顾"：先说完这一轮。
  *
@@ -166,9 +128,9 @@ internal const val REVIEW_START_HINT =
     "和 PC 版一样：点开始 → 一轮轮说或打字 → 结束。录的是这台手机的麦克风，不占电脑那支。"
 
 /**
- * 「刚才那一场」卡片上的那句话（2026-10-20 起：这几轮**已经进回顾历史**）。
+ * 「刚才那一场」卡片上的那句话（这几轮**已经进回顾历史**）。
  *
- * 手机回顾的每一轮现在都带 `REVIEW_CONTEXT`，服务端记 `commands.source='review'`
+ * 手机回顾的每一轮现在都走 `daily_review.submit()`，服务端记 `source='review'`
  * —— 也就是说它们就在**下面的「历史回顾」**里（按天看得到原文与播报），
  * 不在「指令」历史里重复。所以这张卡只留一句**去向**，不再把整段对话重画一遍
  * （重画一遍等于同一个页面里又看了一次同样的内容）。
@@ -196,8 +158,8 @@ private const val REVIEW_EMPTY_FAILURE = "（这一轮失败了，但没拿到�
  * ⚠️ **追加**：[session.messages] 原样保留，只在后面接两条。这是"多轮对话"的字面要求，
  * 也是回归钉子（`ReviewConversationTest` 断言 2 轮的场次 = 4 条，不是 2 条）。
  *
- * @param roundId 这一轮的身份（`SubmitState.roundId`）—— 记进 [ReviewSession.lastRoundId]，
- *   用于挡住同一轮的重复回调。
+ * @param roundId 这一轮的身份（`nextRoundId()`）—— 记进 [ReviewSession.lastRoundId]，
+ *   只用于排障/展示；追加本身是幂等的调用方职责（ViewModel 一轮只调一次）。
  * @param mine    我说的（语音时是转写结果；拿不到文本时写"（语音）"这类占位）。
  * @param echo    ECHO 的回复；[failed]=true 时传**失败原因**。
  */
@@ -220,29 +182,6 @@ internal fun appendReviewRound(
         rounds = session.rounds + 1,
         lastRoundId = roundId,
     )
-}
-
-/**
- * 这一轮的结论该不该追加进对话。
- *
- * 两条规矩：
- *  1. **同一轮不重复**：`roundId > lastRoundId` 才追加（`StateFlow` 会把同一个值再发一次，
- *     界面切换/重放也可能再看到一次；重复追加会让一轮变成四行）。
- *  2. **还在路上的不追加**：`Sending/Accepted/Running` 时回复还没到（`active=true`），
- *     这时把"（语音，正在转写…）"当成我的原话记下来，等真结果到了又追加一条 = 一轮两条变四条。
- *
- * 用"严格大于"还有一个好处：开始这场之前那条还在路上的指令（`roundId` 更小）
- * 不会被算进这一场（ViewModel 把 `lastRoundId` 初始化成开始那一刻的轮次）。
- */
-internal fun reviewShouldAppend(
-    session: ReviewSession?,
-    roundId: Long,
-    active: Boolean,
-): Boolean {
-    if (session == null) return false
-    if (active) return false
-    if (roundId <= 0L) return false
-    return roundId > session.lastRoundId
 }
 
 // ---- 顶部那一行：今日轮数 + 本场轮数 -------------------------------------------------------
