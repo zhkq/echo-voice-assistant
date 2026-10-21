@@ -90,8 +90,12 @@ def advertised_host(listen: str, tls: bool) -> tuple:
     return _probe_advertised(str(listen or ""), bool(tls))
 
 
-def _probe_advertised(raw: str, tls: bool) -> tuple:
-    """`_probe` 的实现体（旧 `advertised_host` 的原样搬迁）。"""
+def _probe_advertised(raw: str, tls: bool, scheme_hint: str = "") -> tuple:
+    """`_probe` 的实现体（旧 `advertised_host` 的原样搬迁）。
+
+    `scheme_hint` 只用来升级到 https（管理面是 https 打开的，客户端多半也要 https）；
+    它不会把一个已配证书的服务降成 http。
+    """
     host, _, port = raw.rpartition(":")
     if not port:
         host, port = raw, ""
@@ -112,7 +116,8 @@ def _probe_advertised(raw: str, tls: bool) -> tuple:
         # 除了保留上面那句如实提示，还要把**怎么修**说出口（配置键 + 环境变量名）。
         note += ("（对外服务时请配上 `server.advertised_host` 或环境变量 "
                  "`ECHO_ADVERTISED_HOST=<同事能访问到的 IP>`，就不会再靠探测。）")
-    return "%s://%s:%s" % ("https" if tls else "http", host, port), note
+    scheme = "https" if (tls or str(scheme_hint or "").strip().lower() == "https") else "http"
+    return "%s://%s:%s" % (scheme, host, port), note
 
 
 #: `normalize_advertised_host` 认的形状：`host` / `host:port` / `[v6]` / `[v6]:port`。
@@ -233,7 +238,7 @@ def normalize_advertised_host(raw: Any) -> str:
     return host + (":" + port if port else "")
 
 
-def resolve_advertised(cfg, *, advertised: Any = None) -> tuple:
+def resolve_advertised(cfg, *, advertised: Any = None, scheme_hint: str = "") -> tuple:
     """**发配对串时那条路**：`cfg`（+ 可选的这一次的覆盖）→ `(地址, 备注)`。
 
     优先级（与 `server/limits.py` 一个口径：管理面配过的值由 `apply_stored()`
@@ -261,10 +266,25 @@ def resolve_advertised(cfg, *, advertised: Any = None) -> tuple:
       公网入口现在基本都是 https，而"发一条 http 串给同事"只会让他连到明文口
       （连不上、还看不出原因）。真要在公网发明文 http 的，显式写 `http://` 就行。
 
-    ⚠️ **第 3 档（自动探测）不套这条规则**：那时我们**不知道谁能访问到我们**
+    ⚠️ **第 3 档（自动探测）不套"远程就 https"那条推断**：那时我们**不知道谁能访问到我们**
     （容器里探测到的是 Docker 网桥地址），照旧按 TLS 决定，并在 `note` 里如实说
     "这是探测到的、请换成同事能访问到的那台机器" —— 探测结果上加一层"远程就 https"
     的推断，等于拿一个本来就不准的地址再猜一次 scheme。
+
+    唯一例外是 `scheme_hint=https`：那是"管理面这一次就是 https 打开的"这个**事实**，
+    不是对地址的推断（容器里地址是错的，但"同事要走 https"仍然成立）。
+
+    ## `scheme_hint`：这一次发码的"协议来源"（2026-10-21）
+
+    管理面经 **https 反代**打开时（TLS 在 Caddy/网关那层终结、后端自己是明文），
+    上面第 ② 条只能靠部署的人**记得在地址里写 `https://`**；忘了就会发出 `http://…`
+    —— 真机现场正是这样：同事在安装器里粘 http 串配不上，改成 https 才成功。
+
+    所以管理面那条写路径把**这一次请求的协议**（`X-Forwarded-Proto` / `Origin` /
+    `request.url.scheme`）作为提示传进来。它**只用来升级到 https**，不用来降级
+    （管理面从内网 http 直连、同事走公网 https 是常见部署；反过来不成立）。
+    优先级排在"显式 scheme"之后、"按地址推断"之前。**只影响这一次发码**，
+    不写配置、不改变自动探测的老行为。
     """
     tls = bool(str(cfg.get("server.tls.certfile", "") or ""))
     # 这一次的覆盖先过一遍同样的归一化（不合法**当场报错** —— 半路静默退回全局值
@@ -291,7 +311,8 @@ def resolve_advertised(cfg, *, advertised: Any = None) -> tuple:
                 detail=str(raw_cfg))
         from_cfg = bool(chosen)
     if not chosen:
-        return _probe_advertised(str(cfg.get("server.listen", "") or ""), tls)
+        return _probe_advertised(str(cfg.get("server.listen", "") or ""), tls,
+                                 scheme_hint=scheme_hint)
     # `normalize_advertised_host` 给的结果一定带方括号或只有一个冒号，所以这里按端口
     # **是不是纯数字**来切 —— 不能只看"有没有冒号"：`10.100.0.24` 本来就没有端口，
     # 用 `rpartition` 硬切会得到 `("", "10.100.0.24")`（那会拼出 `http://:10.100.0.24`）。
@@ -305,23 +326,35 @@ def resolve_advertised(cfg, *, advertised: Any = None) -> tuple:
             port = str(int(cfg.get("server.listen", "").rsplit(":", 1)[1]))
         except (IndexError, ValueError):
             port = "8900"                  # 与 `Config.port` 的兜底同一个值
-    scheme = _published_scheme(tls=tls, raw=published_raw, host=host)
+    scheme = _published_scheme(tls=tls, raw=published_raw, host=host,
+                               scheme_hint=scheme_hint)
     return "%s://%s:%s" % (scheme, host, port), ""
 
 
-def _published_scheme(*, tls: bool, raw: str, host: str) -> str:
-    """公布的串用哪个 scheme（三条规则见 `resolve_advertised` 的说明，**只此一份**）。"""
+def _published_scheme(*, tls: bool, raw: str, host: str = "",
+                      scheme_hint: str = "") -> str:
+    """公布的串用哪个 scheme（规则见 `resolve_advertised` 的说明，**只此一份**）。
+
+    顺序：服务端自己的证书 → 这一项显式写的 scheme → **这一次请求的协议提示** →
+    按地址推断（局域网 http / 远程 https）。
+    """
     if tls:
         return "https"
     if says_https(raw):
         return "https"
     if says_http(raw):
         return "http"
+    # 提示**只用来升级到 https**，不用来降级成 http：
+    #   * 管理面是 https 打开的 → 客户端很可能也走 https（哪怕公布的是局域网 IP）；
+    #   * 管理面是 http 打开的 → 不证明"客户端也只能走 http"（运维可能从内网直连，
+    #     而同事走公网 https 反代）。那时继续按地址推断，别把远程地址从 https 降回 http。
+    if str(scheme_hint or "").strip().lower() == "https":
+        return "https"
     return "http" if looks_local_host(host) else "https"
 
 
 def pairing_string(cfg, code: str, ttl_s: Optional[float] = None,
-                   advertised: Any = None) -> Dict[str, Any]:
+                   advertised: Any = None, scheme_hint: str = "") -> Dict[str, Any]:
     """一个裸配对码 → 那一整串 `echo://pair?host=…&code=…&fp=…`（设计 §7.5 ①）。
 
     **配对串只在 `server/ops.py` 这一处拼** —— 命令行与管理面都从这里拿，
@@ -344,7 +377,8 @@ def pairing_string(cfg, code: str, ttl_s: Optional[float] = None,
     而这恰恰是最常见的情形（换网络、换 IP、把本机码转给同事）。
     """
     fp = cert_fingerprint(str(cfg.get("server.tls.certfile", "") or ""))
-    addr, note = resolve_advertised(cfg, advertised=advertised)
+    addr, note = resolve_advertised(cfg, advertised=advertised,
+                                    scheme_hint=scheme_hint)
     suffix = ("&fp=" + fp) if fp else ""
     ttl = float(ttl_s if ttl_s else cfg.get("auth.pairing_ttl_s", 900))
     return {"url": "echo://pair?host=%s&code=%s%s" % (addr, code, suffix),
@@ -361,7 +395,8 @@ LOCAL_PAIR_CREATED_BY = "local-pair"
 
 def issue_pairing_code(cfg, auth, *, name: str = "", scopes: str = "",
                        ttl_s: Optional[float] = None, created_by: str = "",
-                       advertised: Any = None, client_id: str = "") -> Dict[str, Any]:
+                       advertised: Any = None, client_id: str = "",
+                       scheme_hint: str = "") -> Dict[str, Any]:
     """发一张一次性配对码。**明文只在这个返回值里出现这一次。**
 
     返回里除了明文，还带上：
@@ -385,7 +420,8 @@ def issue_pairing_code(cfg, auth, *, name: str = "", scopes: str = "",
     code = auth.create_pairing_code(created_by=str(created_by or ""), name=str(name or ""),
                                     scopes=normalize_scopes(scopes), ttl_s=ttl_s,
                                     client_id=str(client_id or ""))
-    built = pairing_string(cfg, code, ttl_s=ttl_s, advertised=advertised)
+    built = pairing_string(cfg, code, ttl_s=ttl_s, advertised=advertised,
+                           scheme_hint=scheme_hint)
     return {
         "id": auth_mod.hash_pairing_code(code),   # 同一个确定性哈希（无随机盐），与库里那张码逐字相同
         "code": code,

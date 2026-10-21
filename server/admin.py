@@ -721,6 +721,8 @@ def create_admin_app(cfg, state, *, perf=None) -> FastAPI:
         scopes = str(payload.get("scopes") or "")
         note = str(payload.get("createdBy") or payload.get("note") or "")
         per_issue = payload.get("advertisedHost")
+        # 这一次请求的协议（https 反代打开管理面时，串就该是 https —— 见 `publish_scheme_hint`）。
+        hint = publish_scheme_hint(request)
 
         def fn(who):
             return {"ok": True, "pairingCode": ops_mod.issue_pairing_code(
@@ -728,7 +730,7 @@ def create_admin_app(cfg, state, *, perf=None) -> FastAPI:
                 ttl_s=parse_ttl(payload.get("ttlSeconds"),
                                 float(cfg.get("auth.pairing_ttl_s", 900))),
                 created_by=note or ("admin:" + str(who["username"])),
-                advertised=per_issue)}
+                advertised=per_issue, scheme_hint=hint)}
 
         return as_write(request, "issue-pairing-code", name or "(未命名客户端)", fn)
 
@@ -814,6 +816,7 @@ def create_admin_app(cfg, state, *, perf=None) -> FastAPI:
         走的是同一条路。⚠️ 宽限期**不能用于 secret 泄漏**（旧 secret 照样进得来）。
         """
         payload = await body_of(request)
+        hint = publish_scheme_hint(request)     # 宽限期内补发的那张码也按这次请求的协议
 
         def fn(who):
             raw = payload.get("graceHours")
@@ -830,7 +833,8 @@ def create_admin_app(cfg, state, *, perf=None) -> FastAPI:
                 out["pairingCode"] = ops_mod.issue_pairing_code(
                     cfg, state.auth, name=out.get("name") or client_id,
                     scopes=out.get("scopes") or "",
-                    created_by="rotate:" + str(who["username"]))
+                    created_by="rotate:" + str(who["username"]),
+                    scheme_hint=hint)
             return out
 
         return as_write(request, "rotate-secret", client_id, fn, confirm=payload)
@@ -934,9 +938,14 @@ def create_admin_app(cfg, state, *, perf=None) -> FastAPI:
 
     @api.get("/advertised-host")
     def get_advertised_host(request: Request):
-        """当前的对外公布地址 + **来源**（admin / env / config / auto）。"""
+        """当前的对外公布地址 + **来源**（admin / env / config / auto）。
+
+        显示用的 scheme 也带这一次请求的提示 —— 页面说"此刻发码会用 https"，
+        发出去的就真的是 https（同一个 `resolve_advertised`）。
+        """
         current_admin(request)
-        return advertised_mod.view(cfg, store_of())
+        return advertised_mod.view(cfg, store_of(),
+                                   scheme_hint=publish_scheme_hint(request))
 
     @api.post("/advertised-host")
     async def set_advertised_host(request: Request):
@@ -947,11 +956,12 @@ def create_admin_app(cfg, state, *, perf=None) -> FastAPI:
         保存**当场生效**（下一次发码就用它），并落在 state 卷里，重启后还在。
         """
         payload = await body_of(request)
+        hint = publish_scheme_hint(request)
 
         def fn(who):
             value = advertised_mod.set_advertised(cfg, store_of(), payload,
                                                   updated_by=str(who.get("username") or ""))
-            out = advertised_mod.view(cfg, store_of())
+            out = advertised_mod.view(cfg, store_of(), scheme_hint=hint)
             out["ok"] = True
             out["saved"] = value
             return out
@@ -1068,6 +1078,35 @@ def origin_of(request: Request) -> str:
         return ""
     m = re.match(r"^([a-zA-Z][a-zA-Z0-9+.\-]*://[^/?#]+)", ref)
     return m.group(1).lower() if m else ""
+
+
+def publish_scheme_hint(request: Request) -> str:
+    """发配对码时该按哪个 scheme 公布 —— **这一次请求的协议**（`http` / `https` / `""`）。
+
+    为什么需要它（2026-10-21 真机）：TLS 在反代/网关上终结时，后端自己是明文，
+    `server.tls.certfile` 是空的；如果部署的人没在「对外公布地址」里显式写
+    `https://`，发出去的串就是 `http://…` —— 同事在安装器里粘它配不上，
+    把 host 改成 https 才成功。
+
+    管理面这一次请求**自己**就带着"浏览器用的是 http 还是 https"这个事实，
+    所以把它当提示（`ops._published_scheme` 的优先级排在显式 scheme 之后）。
+    取值的顺序（从最可信到兜底）：
+
+      1. `X-Forwarded-Proto`（反代/网关写的，常见是 Caddy / nginx）；
+      2. `Origin` / `Referer` 的 scheme（浏览器发的同站请求就带着它）；
+      3. `request.url.scheme`（直连时就是它；反代后面可能是内层的 http）。
+
+    只认 `http` / `https`，别的（空、`wss`、畸形值）一律返回空串 = **没有提示**，
+    后面继续按地址推断 —— 不猜、不新增一类失败。
+    """
+    proto = str(request.headers.get("x-forwarded-proto") or "").split(",")[0].strip().lower()
+    if proto in ("http", "https"):
+        return proto
+    m = re.match(r"^([a-zA-Z][a-zA-Z0-9+.\-]*)://", origin_of(request))
+    if m and m.group(1).lower() in ("http", "https"):
+        return m.group(1).lower()
+    scheme = str(getattr(getattr(request, "url", None), "scheme", "") or "").lower()
+    return scheme if scheme in ("http", "https") else ""
 
 
 def _host_port(request: Request) -> tuple:

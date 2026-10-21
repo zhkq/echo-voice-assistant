@@ -156,23 +156,30 @@ def priority_notes(cfg, store=None) -> List[str]:
     return []
 
 
-def probe_view(cfg) -> Dict[str, Any]:
+def probe_view(cfg, scheme_hint: str = "") -> Dict[str, Any]:
     """没配时**实际会发出去的**地址（探测结果，给页面显示用）。
 
     页面显示"当前对外地址"时必须是**真的那条串里的那个地址** —— 所以这里直接问
     `ops.resolve_advertised()`（与发码那条路同一个函数），而不是另算一遍。
+
+    `scheme_hint` = 当前管理页这一次请求的协议（`https` 打开时显示的就是 https）。
     """
     try:
-        url, note = ops_mod.resolve_advertised(cfg)
+        url, note = ops_mod.resolve_advertised(cfg, scheme_hint=scheme_hint)
         return {"url": url, "note": note}
     except errors.EchoError as exc:
         return {"url": "", "note": "%s" % (exc.detail or exc.message)}
 
 
-def view(cfg, store=None) -> Dict[str, Any]:
-    """`GET /admin/api/advertised-host` 的响应体：生效值 + 来源 + 三种形态的说明。"""
+def view(cfg, store=None, scheme_hint: str = "") -> Dict[str, Any]:
+    """`GET /admin/api/advertised-host` 的响应体：生效值 + 来源 + 三种形态的说明。
+
+    `scheme_hint` 让页面显示的地址与"此刻发码会用的地址"一致（同一个
+    `ops.resolve_advertised`）—— 否则 https 打开管理面、页面却显示 http，
+    人会以为这一项没生效。
+    """
     source = _source(cfg, store)
-    guessed = probe_view(cfg) if source == "auto" else {"url": "", "note": ""}
+    guessed = probe_view(cfg, scheme_hint) if source == "auto" else {"url": "", "note": ""}
     newest = _newest(store)
     return {
         "value": effective(cfg),                 # "" = 走自动探测
@@ -180,7 +187,7 @@ def view(cfg, store=None) -> Dict[str, Any]:
         "sourceNote": ("admin = 管理面配的（最优先）；env = 环境变量 ECHO_ADVERTISED_HOST / "
                        "ECHO_PUBLIC_URL；config = 配置文件里写的；auto = **没配**，"
                        "此刻那条串里的地址是本机探测出来的（容器里会是 Docker 网桥地址）。"),
-        "url": guessed.get("url") or _configured_url(cfg, store),
+        "url": guessed.get("url") or _configured_url(cfg, store, scheme_hint),
         "note": guessed.get("note", ""),
         "envNames": list(ENV_NAMES),
         "envValues": {n: (os.environ.get(n) or None) for n in ENV_NAMES},
@@ -199,10 +206,10 @@ def view(cfg, store=None) -> Dict[str, Any]:
     }
 
 
-def _configured_url(cfg, store) -> str:
+def _configured_url(cfg, store, scheme_hint: str = "") -> str:
     """配了值时，那条串里的地址（读不出来就空串 —— 页面显示"读不到"比显示错的强）。"""
     try:
-        return ops_mod.resolve_advertised(cfg)[0]
+        return ops_mod.resolve_advertised(cfg, scheme_hint=scheme_hint)[0]
     except errors.EchoError:
         return ""
 

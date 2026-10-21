@@ -249,6 +249,11 @@ def node_dirs():
     return [d for d in out if d and os.path.isdir(d)]
 
 
+def sidebar_runtime(exe="") -> str:
+    """没有原生边条宿主（macOS 的浮动框是另一套），永远返回空 = 走整窗。"""
+    return ""
+
+
 # ---------------------------------------------------------------- 秘密保护（凭据落盘）
 # POSIX 共享实现：落盘靠文件权限（见 _posix.py 里那段取舍说明）。
 

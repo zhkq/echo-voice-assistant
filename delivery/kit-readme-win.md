@@ -89,7 +89,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File ".\echo-core\scripts\install
   （`echo-core\` 与 `装我.cmd` 必须同级），别只把 `.cmd` 拖出来。**或者**：把
   `ECHO-kit-*.zip` 与 `装我.cmd` 放在同一层，双击时它会**自己解开**（从 2026-10-01 起支持）。
 - 装的时候弹出 `You must install or update .NET` 或 `WebView2 初始化失败`：那是**右缘浮动条**要的，
-  与 ECHO 本体无关 —— 助手知道怎么绕过（改用浏览器面板）。
+  与 ECHO 本体无关。**新版会自动判**：没装 .NET 就不起浮动条、直接用浏览器面板，不再弹这个框；
+  旧包见到时也不用装 .NET —— 浏览器打开 `http://127.0.0.1:<端口>/` 即可。
 - 助手报 **`DLL load failed` / 「找不到指定的模块」**（装 torch、sherpa-onnx 这类组件时）：
   你的 Windows 缺 **Microsoft Visual C++ 2015-2022 运行库**。助手会自动下载安装它
   （会弹一次 UAC 授权框，点「是」）；装不了就自己装这个再让助手重跑：

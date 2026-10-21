@@ -57,10 +57,32 @@ def _sidebar_running() -> bool:
         return False
 
 
+def _sidebar_runtime_ok(exe: str = "") -> bool:
+    """目标机有没有能跑边条的 .NET Desktop Runtime（没有就别起它）。
+
+    边条是 framework-dependent 的 .NET WinForms 程序；缺运行时的时候 **apphost
+    自己弹一个 Windows 对话框**（「You must install or update .NET」），而 `Popen`
+    当场就返回 —— 调用方以为起来了，用户以为 ECHO 要装 .NET。ECHO 本体不需要它，
+    所以这里先判：判不到就回落到浏览器面板，绝不让那个对话框弹出来。
+    """
+    try:
+        return bool(echo_platform.sidebar_runtime(exe or (sidebar_exe_path() or "")))
+    except Exception as e:                   # 接缝承诺不抛；这里只兜底
+        print(f"[hotkey] 查边条运行时不成功（按没有处理）: {e}")
+        return False
+
+
 def _spawn_sidebar(collapsed: bool = False):
-    """起一个边条进程（单实例：已在跑就等价于 toggle，所以调用前务必先判进程）。"""
+    """起一个边条进程（单实例：已在跑就等价于 toggle，所以调用前务必先判进程）。
+
+    起之前先判 .NET 运行时（`_sidebar_runtime_ok`）—— 缺运行时时**不启动**，
+    返回 False 让调用方回落到浏览器面板（见 2026-10-21 用户真机）。
+    """
     exe = sidebar_exe_path()
     if not exe:
+        return False
+    if not _sidebar_runtime_ok(exe):
+        print("[hotkey] 没装 .NET Desktop Runtime（7+）—— 边条不能起，改用浏览器面板")
         return False
     # 实际端口，不是首选端口：ECHO 让位后 echo-port.txt 才是权威（否则边条开在死端口）。
     port = ports.active_port(int(settings.get("serverPort", 8970)))
@@ -162,8 +184,18 @@ def autostart_sidebar():
             return "skip: panelAutoStart=False"
         if _sidebar_running():
             return "skip: already running"
-        if not sidebar_exe_path():
+        exe = sidebar_exe_path()
+        if not exe:
             return "skip: sidebar exe not built"
+        if not _sidebar_runtime_ok(exe):
+            # 没有 .NET Desktop Runtime：**不要**去起边条（那会弹 Windows 的安装提示）。
+            # 用户其实只想看到面板 —— 用浏览器面板顶上，并说清原因。
+            print("[hotkey] 没装 .NET Desktop Runtime（7+）—— 面板改用浏览器打开")
+            try:
+                open_panel_window()
+            except Exception as e:           # 兜底：浏览器也打不开时如实报原因
+                return f"error: {e}"
+            return "fallback: browser (no .NET desktop runtime)"
         collapsed = bool(settings.get("panelStartCollapsed", True))
         if not _spawn_sidebar(collapsed=collapsed):
             return "skip: spawn failed"

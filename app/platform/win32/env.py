@@ -469,6 +469,94 @@ def sidebar_candidates(install_root: str):
 
 # ------------------------------------------------------------------ 浏览器 / CLI 候选
 
+def _dotnet_roots():
+    """可能装着 .NET 的根目录（`<root>/shared/Microsoft.WindowsDesktop.App/<ver>`）。"""
+    out = []
+    for name in ("DOTNET_ROOT", "DOTNET_ROOT(x86)"):
+        val = str(os.environ.get(name) or "").strip()
+        if val:
+            out.append(val)
+    for name in ("ProgramFiles", "ProgramFiles(x86)"):
+        val = str(os.environ.get(name) or "").strip()
+        if val:
+            out.append(os.path.join(val, "dotnet"))
+    local = str(os.environ.get("LOCALAPPDATA") or "").strip()
+    if local:
+        out.append(os.path.join(local, "Microsoft", "dotnet"))
+    seen, uniq = set(), []
+    for p in out:
+        ap = os.path.abspath(p)
+        if ap.lower() not in seen:
+            seen.add(ap.lower())
+            uniq.append(ap)
+    return uniq
+
+
+def _version_key(text):
+    """`"7.0.20"` → `(7, 0, 20)`；认不出来 → `()`。"""
+    parts = []
+    for piece in str(text or "").split("."):
+        if not piece.isdigit():
+            return ()
+        parts.append(int(piece))
+    return tuple(parts)
+
+
+def _sidebar_roll_forward(exe):
+    """边条可执行文件旁边的 runtimeconfig 允不允许跨大版本（旧构建没有这一项）。"""
+    if not exe:
+        return ""
+    cfg = os.path.join(os.path.dirname(str(exe)), "echo-sidebar.runtimeconfig.json")
+    try:
+        import json
+        with open(cfg, "r", encoding="utf-8-sig") as fh:
+            body = json.load(fh)
+    except Exception:
+        return ""
+    opts = body.get("runtimeOptions") if isinstance(body, dict) else None
+    return str((opts or {}).get("rollForward") or "").strip()
+
+
+def sidebar_runtime(exe=""):
+    """边条能用的 .NET Desktop Runtime 版本（`""` = 别启动它，改用浏览器面板）。
+
+    ## 为什么必须先判，而不是"起起来让 Windows 弹窗"
+
+    `echo-sidebar.exe` 是 framework-dependent 的 .NET 7 WinForms 程序。目标机没装
+    Desktop Runtime 时，**apphost 自己弹**一个「You must install or update .NET」——
+    `Popen` 当场返回成功，于是调用方以为边条起来了，用户看到的却是"ECHO 要装 .NET"。
+    ECHO 本体（Python 服务 + 浏览器面板）不需要 .NET，所以这里判不到就**如实回落**。
+
+    ## 版本口径
+
+      * 旧构建（没有 `runtimeconfig.json` / 没写 `rollForward`）：只认 **7.x**
+        （默认 roll-forward 策略不会跨大版本）；
+      * 新构建（`rollForward=LatestMajor`）：7 及以上任一版本都能跑，
+        取最高的那个（.NET 7 已 EOL，机器上更常见的是 8/9/10）。
+    """
+    found = []
+    for root in _dotnet_roots():
+        shared = os.path.join(root, "shared", "Microsoft.WindowsDesktop.App")
+        try:
+            names = os.listdir(shared)
+        except OSError:
+            continue
+        for name in names:
+            key = _version_key(name)
+            if key and key[0] >= 7:
+                found.append((key, name))
+    if not found:
+        return ""
+    found.sort(reverse=True)
+    newest_key, newest = found[0]
+    roll = _sidebar_roll_forward(exe).lower()
+    if roll in ("latestmajor", "major"):
+        return newest
+    if newest_key[0] == 7:
+        return newest
+    return ""
+
+
 def chromium_candidates():
     """Chromium 系浏览器可执行文件候选（值与 1.x 逐字一致；调用方做 expandvars）。"""
     return [

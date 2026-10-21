@@ -11,10 +11,14 @@
     <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
     <EnableWindowsTargeting>true</EnableWindowsTargeting>
-    <!-- 单文件 + 依赖框架：产物是一个 exe，运行时用机器上已有的 .NET 7 Desktop Runtime -->
+    <!-- 单文件 + 依赖框架：产物是一个 exe，运行时用机器上已有的 .NET Desktop Runtime。
+         RollForward=LatestMajor：.NET 7 已 EOL，新机器上更常见的是 8/9/10；没有这一项时
+         net7.0 的应用只认 7.x，明明装了 8 也会弹「You must install or update .NET」。
+         真正的"没装运行时"由 app/runtime.py 先判并回落浏览器面板（不会弹这个框）。 -->
     <PublishSingleFile>true</PublishSingleFile>
     <SelfContained>false</SelfContained>
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <RollForward>LatestMajor</RollForward>
     <Version>0.1.0</Version>
   </PropertyGroup>
 

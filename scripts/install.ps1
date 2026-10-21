@@ -312,11 +312,28 @@ function Step03-Dest {
     } else {
         $script:TargetDir = $DestDir
     }
-    if ($script:TargetDir -notmatch '^[A-Za-z]:[\\/]') {
-        Err ("安装目录必须是盘符开头的绝对路径: {0}" -f $script:TargetDir)
+    # 与 install-all.ps1 同一条归一化：去空白 → 去引号 → 去尾反斜杠。
+    # Explorer「复制为路径」给出的 `"C:\ECHO\"` 直接当参数会把收尾引号转义掉。
+    $script:TargetDir = ([string]$script:TargetDir).Trim().Trim('"').Trim()
+    $script:TargetDir = $script:TargetDir -replace '/', '\' -replace '\\+$', ''
+    if (-not $script:TargetDir) {
+        Err '安装目录是空的 —— 给一个盘符开头的绝对路径，例如 D:\ECHO'
         exit 1
     }
-    $script:TargetDir = $script:TargetDir -replace '/', '\' -replace '\\+$', ''
+    if ($script:TargetDir -notmatch '^[A-Za-z]:[\\/]') {
+        Err ("安装目录必须是盘符开头的绝对路径: {0}（形如 D:\ECHO；不要带引号或结尾反斜杠）" -f $script:TargetDir)
+        exit 1
+    }
+    if (-not $script:DryRun) {
+        # 与 install-all.ps1 同一条：C:\ 根目录常没写权限，当场说清，别等到写 data 才报。
+        try {
+            New-Item -ItemType Directory -Force -Path $script:TargetDir -ErrorAction Stop | Out-Null
+        } catch {
+            Err ("创建不了安装目录：{0}（{1}）—— 换一个有写权限的目录（例如 D:\ECHO）" -f
+                 $script:TargetDir, $_.Exception.Message)
+            exit 1
+        }
+    }
     if ($script:TargetDir -match '[^\x00-\x7F]') {
         Warn '安装路径含中文/非 ASCII 字符！'
         Warn '  funasr/nagisa/dynet 无法读取中文路径，SenseVoice 转写会不可用。'

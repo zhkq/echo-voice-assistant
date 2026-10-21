@@ -295,6 +295,23 @@ def sidebar_candidates(install_root: str):
     return list(fn(install_root)) if callable(fn) else []
 
 
+def sidebar_runtime(exe: str = "") -> str:
+    """边条能用的 .NET Desktop Runtime 版本（`""` = 没有，调用方应回落到浏览器面板）。
+
+    为什么需要它（2026-10-21 用户真机）：`echo-sidebar.exe` 是 **framework-dependent**
+    的 .NET 7 WinForms 程序。目标机没装 .NET Desktop Runtime 时，启动它弹的是
+    Windows 的「You must install or update .NET」—— 用户看到的是"ECHO 要装 .NET"，
+    而 ECHO 本身（Python 服务 + 浏览器面板）根本不需要它。
+
+    各平台：
+      * Windows = 扫 `dotnet/shared/Microsoft.WindowsDesktop.App` 的版本目录，
+        并按可执行文件旁边的 `runtimeconfig.json` 判断能否跨大版本 roll-forward；
+      * macOS / Linux = `""`（没有原生边条宿主，本来就走整窗）。
+    """
+    fn = _platform_fn("sidebar_runtime")
+    return str(fn(exe)) if callable(fn) else ""
+
+
 def hotkey_impl():
     """当前平台的全局热键实现模块（``HotkeyListener`` + 常量）。
 

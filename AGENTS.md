@@ -1126,3 +1126,36 @@ scopes 还得重发）。当晚的绕法：用 `pairing.pair()` 里**逐字同�
 - **手机补传的段是 FLAC（≈10 MB/10 分钟）** ✓，盘上同名 `.wav` 是服务端解码副本 ✓ —— 判断"传多大"要看上传侧 ✓。
 - **"仅上传"不等于"在录音"** ✓（`meta["uploading"]=true` / 无 `end` ✓）：它会占住 `active` ✗ 挡住电脑建会 ✗；
   对外要能区分 ✓，但 `active` 的既有契约**别改** ✗（改则连带动 pause/stop/客户端 ✓）。
+
+### 2026-10-21 同事装机四问（根因与永久修法，别再逐台救火）
+
+用户原话四条：① 装在非默认路径时输入 `C:\echo` 报"路径有问题"；② 两台电脑都报要装 .NET；
+③ 安装器里选网络后端、贴配对码，http/https 都配不上；④ 服务端生成的配对串还是 http，
+改成 https 后才在 ECHO 设置里配对成功。
+
+- **① 路径 = 引号/尾反斜杠转义，不是路径本身非法。**
+  Explorer「复制为路径」给的是 `"C:\ECHO\"`；`-Root "C:\ECHO\"` 里的反斜杠会把收尾引号
+  转义掉，后面的 `-BackendDir …` 被吞进值里。**入口先归一化**：去空白/引号/尾反斜杠
+  （`delivery/kit-install.cmd` + `install-all.ps1` + `install.ps1`），再校验。
+  另外 `C:\` 根目录在受管电脑上常没写权限 —— `install-all` 现在**当场**报"创建不了安装目录"，
+  不再等到写 data 时才报一句像"包坏了"的拒绝访问。
+- **② .NET 是**边条**（`echo-sidebar.exe`，framework-dependent net7.0 WinForms）要的，ECHO 本体不要。**
+  缺运行时时 apphost 自己弹「You must install or update .NET」，而 `Popen` 当场返回成功 ——
+  以前调用方以为边条起来了。现在 `app/runtime.py::_sidebar_runtime_ok()` 先判
+  `app/platform/*/env.py::sidebar_runtime()`：没有就**不起边条**、自动用浏览器面板
+  （`autostart_sidebar` 返回 `fallback: browser …`；热键那条走 `_spawn_sidebar → open_panel_window`）。
+  构建侧加 `RollForward=LatestMajor`（.NET 7 已 EOL，8/9/10 也能跑）。**不要**再用"让用户装 .NET"
+  当答案 —— 那是把可选外壳的成本转嫁给用户。
+- **③ 配对失败先分型，再谈重试。** 安装器现在把服务端的 `detail` 原样取出来（以前只显示
+  `HTTP 400`），并按 401/403（码一次性，重发）、429（限流 5 分钟）、证书/`fp`、Docker 网桥
+  （`172.17-31.x` 同事连不上）、TCP 连不上分别给下一步。管理员串写 `http` 而实际是 HTTPS
+  反代时，**同一地址自动再试一次 https（只升不降；401/403/429 不重试）**。
+  顺带修了两处一直没生效的代码：`GET /api/settings` 是 `{settings:[{key,value}]}`（不是扁平字典）、
+  `PUT` 要包 `values` —— 所以"配对后把「不出机」改成「内网」"以前从来没成功过。
+- **④ 配对串的 scheme 不能只靠 `server.tls.certfile`。** TLS 在反代/网关上终结时后端是明文，
+  旧逻辑永远发 `http://…`。现在 `server/ops.py::_published_scheme` 多了一层**这一次管理面请求的
+  协议提示**（`X-Forwarded-Proto` → `Origin`/`Referer` → `request.url.scheme`）：
+  **只升级到 https，不降级**；显式 `https://` / 显式 `http://` 仍然优先。管理面页面显示的地址
+  与"此刻发码会用的地址"用同一个函数（否则页面说 http、发出来 https，更容易误判）。
+  **交付里的 `ECHO-backend-portable-20261015` 是旧 `server/ops.py`（没有这层）**——发给同事前
+  要重出后端包，否则服务端那一侧还是 http。

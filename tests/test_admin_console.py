@@ -2559,6 +2559,84 @@ class AdvertisedHostHttpsTests(_AdminCase):
         self.assertIn("host=https://echoserver.zhkq.online:8900&code=",
                       self._issue().json()["pairingCode"]["url"])
 
+    def test_a_https_admin_session_publishes_https_for_a_lan_address_too(self):
+        """TLS 在反代上、公布地址填的是**局域网 IP** 时，也要按这次请求的 https 发。
+
+        2026-10-21 真机：管理面经 `https://10.100.0.24:8900` 打开（Caddy 终结 TLS，
+        后端自己是明文），「对外公布地址」填 `10.100.0.24:8900` → 旧代码按"局域网
+        就是 http"发出 `http://…`，同事在安装器里粘它配不上，改成 https 才成功。
+        管理面这一次请求本来就是 https 打开的 —— 那就是最权威的提示。
+        """
+        self.login()
+        self.assertEqual(self._save("10.100.0.24:8900").status_code, 200)
+        r = self.ac.post("/admin/api/pairing-codes",
+                         json={"name": "cli-lan", "scopes": "asr"},
+                         headers=self.wheaders(origin="https://127.0.0.1:8901"))
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertIn("host=https://10.100.0.24:8900&code=",
+                      r.json()["pairingCode"]["url"])
+
+    def test_a_plain_http_admin_session_keeps_the_lan_address_plain(self):
+        """明文打开管理面时**一个字都不改**：局域网地址还是 http（老用法）。"""
+        self.login()
+        self.assertEqual(self._save("10.100.0.24:8900").status_code, 200)
+        url = self._issue().json()["pairingCode"]["url"]
+        self.assertIn("host=http://10.100.0.24:8900&code=", url)
+
+    def test_x_forwarded_proto_is_the_strongest_hint(self):
+        """反代写了 `X-Forwarded-Proto: https` 就按它 —— 哪怕 `Origin` 是内层 http。
+
+        FastAPI/uvicorn 没开 `--proxy-headers` 时 `request.url.scheme` 看到的还是
+        http；反代这个头才是部署形态的权威说法。
+        """
+        self.login()
+        self.assertEqual(self._save("10.100.0.24:8900").status_code, 200)
+        headers = self.wheaders(origin="http://127.0.0.1:8901")
+        headers["X-Forwarded-Proto"] = "https"
+        r = self.ac.post("/admin/api/pairing-codes",
+                         json={"name": "cli-fwd", "scopes": "asr"}, headers=headers)
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertIn("host=https://10.100.0.24:8900&code=",
+                      r.json()["pairingCode"]["url"])
+
+    def test_an_explicit_http_still_beats_the_request_hint(self):
+        """显式 `http://` 是部署的人写的声明 —— 不能被"管理面是 https"盖掉。
+
+        用**远程**地址测：局域网地址的显式 `http://` 本来就会被存成不带 scheme 的老形状
+        （等于"推断就是 http"），那时 https 提示把它升级是合理的；而远程地址的显式
+        `http://` 必须**逐字保留**（`advertised.parse` 也是这么做的）。
+        """
+        self.login()
+        self.assertEqual(self._save("http://8.8.8.8:8900").status_code, 200)
+        r = self.ac.post("/admin/api/pairing-codes",
+                         json={"name": "cli-http", "scopes": "asr"},
+                         headers=self.wheaders(origin="https://127.0.0.1:8901"))
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertIn("host=http://8.8.8.8:8900&code=",
+                      r.json()["pairingCode"]["url"])
+
+    def test_an_auto_probed_address_is_upgraded_to_https_when_the_admin_is_https(self):
+        """没配「对外公布地址」时也按管理面这一次的协议发。
+
+        真机上最常见的状态就是"没配"（走本机探测）；那时探测到的地址可能是 Docker
+        网桥，但"同事要走 https"这件事仍然由管理面的协议说得最准。
+        """
+        self.login()
+        r = self.ac.post("/admin/api/pairing-codes",
+                         json={"name": "cli-auto", "scopes": "asr"},
+                         headers=self.wheaders(origin="https://127.0.0.1:8901"))
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertIn("host=https://", r.json()["pairingCode"]["url"])
+
+    def test_the_page_shows_the_url_that_would_actually_be_issued(self):
+        """页面说"此刻发码会用 https"，发出去的就真是 https（同一个 resolve 函数）。"""
+        self.login()
+        self.assertEqual(self._save("10.100.0.24:8900").status_code, 200)
+        r = self.ac.get("/admin/api/advertised-host",
+                        headers={"X-Forwarded-Proto": "https"})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertIn("https://10.100.0.24:8900", r.json()["url"])
+
     def test_the_saved_https_survives_a_restart(self):
         """重启后仍在（管理面配的值存在 state 卷）—— 而且**还是 https**。"""
         self.login()

@@ -51,6 +51,6 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\install-offline.ps1 -Root 
   报错就能看见了。日志在 `<安装目录>\data\logs\install-all.log`。
 * 报 **`DLL load failed … 找不到指定的模块`**：缺 **Microsoft Visual C++ 2015-2022 运行库（x64）**，
   装 `https://aka.ms/vs/17/release/vc_redist.x64.exe` 后重跑（会弹 UAC）。
-* 报 **`WebView2 初始化失败`** / **`.NET` 提示**：那是右缘浮动条要的，与 ECHO 本体无关，
-  用浏览器打开面板即可（装完打印的那个地址）。
+* 报 **`WebView2 初始化失败`** / **`.NET` 提示**：那是右缘浮动条要的，与 ECHO 本体无关。
+  新版会自动判：没装 .NET 就不起浮动条、直接用浏览器面板（装完打印的那个地址），不再弹框。
 * 安装目录**必须是纯英文路径**（中文路径会让部分转写引擎读不出模型）。

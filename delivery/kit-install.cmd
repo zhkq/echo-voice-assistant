@@ -98,6 +98,16 @@ set "ROOT="
 set /p "ROOT=  Folder [%DEF%]: "
 if not defined ROOT set "ROOT=%DEF%"
 
+REM Normalize what people actually paste:
+REM   * Explorer's "copy as path" gives "C:\ECHO" (quotes included);
+REM   * a trailing backslash turns -Root "C:\ECHO\" into an escaped quote and
+REM     the next switch (-BackendDir ...) gets swallowed into the value.
+REM Both showed up in the field (2026-10-21: typing C:\echo reported a bad
+REM path). Strip quotes and one trailing backslash BEFORE building ARGS.
+set "ROOT=%ROOT:"=%"
+if "%ROOT:~-1%"=="\" set "ROOT=%ROOT:~0,-1%"
+if not defined ROOT set "ROOT=%DEF%"
+
 set "ARGS=-Profile minimal -Agent harness -Yes -Root "%ROOT%" -BackendDir "%HERE%""
 if exist "%KIT%bundle\wheels" (
   set "ARGS=%ARGS% -Offline"

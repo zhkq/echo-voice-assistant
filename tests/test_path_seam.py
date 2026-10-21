@@ -137,6 +137,10 @@ class EveryPlatformImplementsThePrimitives(unittest.TestCase):
                   "pid_alive", "process_label",
                   "offline_tts_speak", "offline_tts_label", "offline_tts_display",
                   "notify", "sidebar_candidates",
+                  # 边条能不能跑（2026-10-21）：.NET Desktop Runtime 没装时**不许**起
+                  # echo-sidebar.exe（否则弹 Windows 的「You must install .NET」）。
+                  # 判据是平台差异（Windows 扫 dotnet 目录，mac/Linux 恒空），必须住接缝里。
+                  "sidebar_runtime",
                   # 秘密保护（客户端凭据落盘）：Windows 用 DPAPI，POSIX 用 0600。
                   # 三平台必须同名同义 —— 否则"在 Windows 上写好的调用"到 mac 上就崩。
                   "protect_secret_kind", "protect_secret", "unprotect_secret",

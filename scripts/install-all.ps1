@@ -222,8 +222,16 @@ function Resolve-KitLayout {
             if ($ans) { $Root = $ans } else { $Root = $def }
         } else { $Root = $def }
     }
+    # 用户粘进来的往往是 Explorer「复制为路径」那种带引号、带尾反斜杠的形状；
+    # 直接进参数会变成 `"C:\ECHO\"`（反斜杠把收尾引号转义掉，下一项被吞进值里）。
+    # 归一化只做三件事：去首尾空白 → 去引号 → 去尾反斜杠。
+    $Root = ([string]$Root).Trim().Trim('"').Trim()
     $r = $Root -replace '/', '\' -replace '\\+$', ''
-    if ($r -notmatch '^[A-Za-z]:[\\/]') { Err ("安装根必须是盘符开头的绝对路径：{0}" -f $Root); exit 1 }
+    if (-not $r) { Err '安装根是空的 —— 给一个盘符开头的绝对路径，例如 D:\ECHO'; exit 1 }
+    if ($r -notmatch '^[A-Za-z]:[\\/]') {
+        Err ("安装根必须是盘符开头的绝对路径：{0}（形如 D:\ECHO；不要带引号或结尾反斜杠）" -f $r)
+        exit 1
+    }
     if ($r -match '[^\x00-\x7F]') {
         Warn ("安装路径含非 ASCII 字符：{0}" -f $r)
         Warn '  转写引擎（funasr/nagisa/dynetk 等）读中文路径会出问题 —— 强烈建议纯英文路径'
@@ -234,6 +242,15 @@ function Resolve-KitLayout {
         $r = Split-Path $r -Parent
     }
     $script:TargetRoot = $r
+    # 早一点把"这个目录到底能不能写"问清楚：C:\ 根目录在受管电脑上通常要管理员，
+    # 等到装运行时/写 data 再报"拒绝访问"就太晚了，而且现象像"安装包坏了"。
+    try {
+        New-Item -ItemType Directory -Force -Path $script:TargetRoot -ErrorAction Stop | Out-Null
+    } catch {
+        Err ("创建不了安装目录：{0}（{1}）—— 换一个有写权限的目录（例如 D:\ECHO）" -f
+             $script:TargetRoot, $_.Exception.Message)
+        exit 1
+    }
     if (Test-Path (Join-Path $r 'app\main.py')) {
         $script:CoreDir = $r
         Info '检测到代码在安装根下（老式扁平安装）：原地升级，不移动代码'
@@ -770,7 +787,11 @@ function ConvertFrom-EchoPairString {
     # 没带 scheme 时**把整串当地址**（有人只贴 `http://10.100.0.24:8900`）。
     param([string]$Text)
     $out = @{ Url = ''; Code = ''; Fp = '' }
-    $t = ('{0}' -f $Text).Trim()
+    # 从聊天/文档里复制过来时常常带引号或反引号（`echo://pair?...`）、或被 HTML 转义成
+    # `&amp;` —— 一并规整，否则它会连同这些字符被当成地址/码传给配对接口，
+    # 报错还看不出是复制的问题。
+    $t = ('{0}' -f $Text).Replace('&amp;', '&').Trim()
+    $t = $t.Trim().Trim('"').Trim("'").Trim('`').Trim()
     if (-not $t) { return $out }
     $m = [regex]::Match($t, '^echo://pair\b[^?]*\?(.*)$', 'IgnoreCase')
     if (-not $m.Success) { $out.Url = $t; return $out }
@@ -907,6 +928,85 @@ function Start-LocalBackendNow {
     return $false
 }
 
+function Get-HttpErrorInfo {
+    # `Invoke-RestMethod` 的错误体（FastAPI 的 `{"detail": "一句人话"}`）在 PS 5.1 上
+    # 藏在两个地方：`ErrorDetails.Message`（有时为空）与 `Exception.Response` 流。
+    # 少了这一步，用户只看到 `HTTP 400: {...}` 或 `远程服务器返回错误: (400)`，
+    # 而真正的原因（码过期 / 指纹不匹配 / 证书不对）全被吞掉 —— 2026-10-21 现场
+    # 同事只能报"配对失败"，我们连是哪种失败都分不出来。
+    param($Rec)
+    $status = 0
+    try { if ($Rec.Exception.Response) { $status = [int]$Rec.Exception.Response.StatusCode } } catch { }
+    $raw = ''
+    try { $raw = [string]$Rec.ErrorDetails.Message } catch { }
+    if (-not $raw) {
+        try {
+            $stream = $Rec.Exception.Response.GetResponseStream()
+            if ($stream) {
+                $sr = New-Object System.IO.StreamReader($stream)
+                $raw = $sr.ReadToEnd()
+                $sr.Close()
+            }
+        } catch { }
+    }
+    $msg = ''
+    if ($raw) {
+        try {
+            $j = $raw | ConvertFrom-Json
+            if ($j.detail) { $msg = [string]$j.detail }
+            elseif ($j.message) { $msg = [string]$j.message }
+        } catch { $msg = $raw.Trim() }
+    }
+    if (-not $msg) { $msg = [string]$Rec.Exception.Message }
+    return @{ Status = $status; Message = $msg }
+}
+
+function Invoke-EchoPair {
+    # 只做一次配对 POST，返回 `@{ ok; message; status }` —— 不抛、不决定重试。
+    param([string]$Url, [string]$Code, [string]$Fp)
+    $port = Get-EchoOwnPort
+    $body = @{ base_url = $Url; code = $Code; fingerprint = $Fp } | ConvertTo-Json
+    try {
+        $resp = Invoke-RestMethod -Uri ("http://127.0.0.1:{0}/api/capability/pair" -f $port) `
+                                  -Method Post -ContentType 'application/json; charset=utf-8' `
+                                  -Body ([System.Text.Encoding]::UTF8.GetBytes($body)) -TimeoutSec 60
+        return @{ ok = $true; message = ("{0}" -f $resp.message); status = 200 }
+    } catch {
+        $err = Get-HttpErrorInfo $_
+        Log 'PAIR' ("{0} -> HTTP {1}: {2}" -f $Url, $err.Status, $err.Message)
+        return @{ ok = $false; message = $err.Message; status = $err.Status }
+    }
+}
+
+function Test-DockerBridgeAddress {
+    # 容器里自动探测到的是 Docker 网桥（实测 172.18.0.2），同事那台**必然连不上**。
+    # 只用来给"连不上"补一句能落地的话，不参与配对判断。
+    param([string]$Url)
+    $m = [regex]::Match($Url, '^https?://(?<host>[^/:]+)')
+    if (-not $m.Success) { return $false }
+    return ($m.Groups['host'].Value -match '^172\.(1[7-9]|2[0-9]|3[01])\.')
+}
+
+function Get-PairFailureHint {
+    param([string]$Url, [string]$Message, [int]$Status)
+    if ($Status -eq 429) {
+        return '后端在限流（同一来源 5 分钟内失败 5 次）—— 等 5 分钟再试，或让管理员看一下后端日志'
+    }
+    if ($Status -eq 401 -or $Status -eq 403) {
+        return '配对码无效 / 已被使用 / 已过期 —— 配对码是一次性的，让管理员**重发一张**再试'
+    }
+    if ($Message -match '证书|指纹|fingerprint|SSL|TLS') {
+        return '证书或配对串里的 fp= 对不上 —— 让管理员重新生成一张码（串里的 fp 要与现在这张证书一致）'
+    }
+    if (Test-DockerBridgeAddress $Url) {
+        return ('这个地址看起来是 Docker 网桥（{0}），同事那台连不上 —— 让管理员在管理面把「对外公布地址」填成局域网/公网可达的 IP 或域名' -f $Url)
+    }
+    if ($Message -match '连不上|超时|timed out|拒绝|unreachable|无法连接') {
+        return ('先确认这台机器能访问 {0}（同网段 / 防火墙 / 端口），再贴一次' -f $Url)
+    }
+    return '面板 →「能力」里可以重贴一次；配对串是一次性的，过期就让管理员重发'
+}
+
 function Invoke-BackendStep {
     param([string]$Dir)
     Step '后端：会议转写用的 GPU 服务怎么来'
@@ -945,39 +1045,61 @@ function Invoke-BackendStep {
 
     if ($mode -eq 'pair') {
         $p = ConvertFrom-EchoPairString $BackendPair
-        if (-not $p.Url) { Warn '没读到地址（配对串里应当有 host=…）—— 这一步跳过，去面板里弄'; $mode = 'skip' }
-        elseif (-not $p.Code) { Warn '配对串里没有 code=… —— 让管理员重发一张'; $mode = 'skip' }
-        else {
+        if (-not $p.Url) {
+            Warn '没读到地址（配对串里应当有 host=…）—— 这一步跳过，去面板里弄'
+            $mode = 'skip'
+        } elseif (-not $p.Code) {
+            # 只贴了一个 8 位码（`7K2M9QX4`）时最容易被当成"地址已读到、码没读到"——
+            # 说清楚它缺的是**地址**，否则人会一直重贴同一张码。
+            if ($p.Url -match '^[2-9A-HJ-NP-Z]{8}$') {
+                Warn '你贴的是一张**配对码**，但还缺后端地址 —— 让管理员发**整串**（echo://pair?host=…&code=…），或在面板「能力」里分开填地址 + 码'
+            } else {
+                Warn '配对串里没有 code=… —— 让管理员重发一张（整串形如 echo://pair?host=…&code=…）'
+            }
+            $mode = 'skip'
+        } else {
             $port = Get-EchoOwnPort
-            $body = @{ base_url = $p.Url; code = $p.Code; fingerprint = $p.Fp } | ConvertTo-Json
-            try {
-                $resp = Invoke-RestMethod -Uri ("http://127.0.0.1:{0}/api/capability/pair" -f $port) `
-                                          -Method Post -ContentType 'application/json; charset=utf-8' `
-                                          -Body ([System.Text.Encoding]::UTF8.GetBytes($body)) -TimeoutSec 60
-                Ok ("已配对：{0}" -f ($resp.message))
+            $r = Invoke-EchoPair -Url $p.Url -Code $p.Code -Fp $p.Fp
+            # 管理员那张串写的是 http、实际却是 HTTPS 反代（2026-10-21 现场）时，
+            # 同一个地址再试一次 https —— 只升不降，401/403/429 不重试（码已用掉/被限流）。
+            if (-not $r.ok -and $p.Url -match '^http://' -and $r.status -notin @(401, 403, 429)) {
+                $alt = 'https://' + $p.Url.Substring(7)
+                Info ("http 没成（{0}），同一个地址再试一次 https…" -f $r.Message)
+                $r2 = Invoke-EchoPair -Url $alt -Code $p.Code -Fp $p.Fp
+                if ($r2.ok) {
+                    $p.Url = $alt
+                    $r = $r2
+                    Info '已按 https 配对成功 —— 管理员那张串写的是 http，实际是 HTTPS 反代（可以让他在管理面把对外地址写成 https://…）'
+                } else {
+                    # 两条都失败：把两边的真实原因都留下（只留一条会丢掉"到底是哪个协议不对"）。
+                    $r = @{ ok = $false; status = $r2.status
+                            message = ("http: {0}；https: {1}" -f $r.Message, $r2.Message) }
+                }
+            }
+            if ($r.ok) {
+                Ok ("已配对：{0}" -f $r.message)
                 $script:BackendSummary = ("后端：已配对到 {0}" -f $p.Url)
                 # 「允许音频去哪」是 none 时，**远端后端会被自己的许可挡下**（会议侧记
                 # blocked-by-privacy，面板显示成"连不上"）。向导里也是这么办的：改成内网并说清。
                 try {
                     $st = Invoke-RestMethod -Uri ("http://127.0.0.1:{0}/api/settings" -f $port) -TimeoutSec 20
-                    if (('{0}' -f $st.capabilityPrivacy) -eq 'none') {
-                        $put = @{ capabilityPrivacy = 'lan' } | ConvertTo-Json
+                    # `GET /api/settings` 的形状是 `{settings: [{key,value,…}]}`，**不是扁平字典**。
+                    # 以前这里读 `$st.capabilityPrivacy` 恒为 null —— 于是"改成内网"从来没生效过。
+                    $row = @($st.settings | Where-Object { $_.key -eq 'capabilityPrivacy' }) | Select-Object -First 1
+                    if ($row -and ('{0}' -f $row.value) -eq 'none') {
+                        # PUT 必须包一层 `values`（`SettingsIn`），否则是 422。
+                        $put = @{ values = @{ capabilityPrivacy = 'lan' } } | ConvertTo-Json -Depth 4
                         $null = Invoke-RestMethod -Uri ("http://127.0.0.1:{0}/api/settings" -f $port) `
                                 -Method Put -ContentType 'application/json; charset=utf-8' `
                                 -Body ([System.Text.Encoding]::UTF8.GetBytes($put)) -TimeoutSec 30
                         Info '「允许音频去哪」原来是「不出机」，已改成「内网」—— 不然刚配的远端后端会被挡下'
                     }
-                } catch { Info '（没读到「允许音频去哪」这一项，跳过它）' }
-            } catch {
-                $msg = $_.Exception.Message
-                try {
-                    $sr = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
-                    $txt = $sr.ReadToEnd() | ConvertFrom-Json
-                    if ($txt.detail) { $msg = $txt.detail }
-                } catch { }
-                Warn ("配对没成功：{0}" -f $msg)
-                Info '面板 →「能力」里可以重贴一次；配对串是一次性的，过期就让管理员重发'
-                $script:BackendSummary = ("后端：配对没成功（{0}）" -f $msg)
+                } catch { Info ("（没读到/没写成「允许音频去哪」：{0}）" -f $_.Exception.Message) }
+            } else {
+                Warn ("配对没成功：{0}" -f $r.message)
+                $hint = Get-PairFailureHint -Url $p.Url -Message $r.message -Status $r.status
+                if ($hint) { Info $hint }
+                $script:BackendSummary = ("后端：配对没成功（{0}）" -f $r.message)
             }
         }
     }

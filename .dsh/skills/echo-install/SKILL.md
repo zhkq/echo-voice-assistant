@@ -119,9 +119,10 @@ foreach ($u in 'https://pypi.org/simple/','https://www.python.org/','https://www
   "$u -> " + (curl.exe -s -o NUL -w "%{http_code}" -L --connect-timeout 6 -m 15 $u)
 }
 
-# 智能体要用 Node；边条要用 .NET 7 Desktop Runtime（没有也能用浏览器面板）
+# 智能体要用 Node。边条（右缘浮动条）才要 .NET Desktop Runtime；
+# 没装时 ECHO 会**自动改用浏览器面板**（不会弹「You must install .NET」）
 foreach ($c in 'node','npx') { $p = Get-Command $c -ErrorAction SilentlyContinue; "$c -> $(if($p){$p.Source}else{'没有'})" }
-dotnet --list-runtimes 2>$null | Select-String 'WindowsDesktop.App 7\.'
+dotnet --list-runtimes 2>$null | Select-String 'WindowsDesktop.App'
 
 # VC++ 2015-2022 运行库：torch / ctranslate2 / sherpa-onnx / onnxruntime 这些**原生扩展**都要它。
 # 干净镜像上常常没有，而报错只说 "DLL load failed … 找不到指定的模块"（同事 2026-09-21 卡在这）。
@@ -423,7 +424,9 @@ curl -s "http://127.0.0.1:$port/api/models" | ./venv/bin/python -m json.tool | h
 
 | 现象 | 怎么处理 |
 |---|---|
-| **Windows**：启动时弹 **「You must install or update .NET」** | 那是**右缘浮动条**要 .NET 7 Desktop **Runtime**（与 ECHO 本体无关）。要么装它，要么：浏览器打开 `http://127.0.0.1:<端口>/` → 设置 → 面板 → **仪表盘打开方式 = browser**，并把「启动时自动显示折叠条」关掉 |
+| **Windows**：启动时弹 **「You must install or update .NET」** | 那是**右缘浮动条**要 .NET Desktop **Runtime**（与 ECHO 本体无关）。**2026-10-21 起新版会自动判**：没装运行时就不起边条、直接用浏览器面板，不再弹这个框。旧包还能见到时：浏览器打开 `http://127.0.0.1:<端口>/` → 设置 → 面板 → **仪表盘打开方式 = browser**，并把「启动时自动显示折叠条」关掉（不是必须装 .NET） |
+| **安装路径**：输入 `C:\echo` 报「路径有问题」 | 2026-10-21 起入口会先去掉引号和结尾反斜杠（Explorer「复制为路径」给的是 `"C:\ECHO\"`，尾反斜杠会把后面那个参数的引号转义掉）。仍报错时确认：盘符开头的绝对路径、纯英文、**不要带引号**；`C:\` 根目录在受管电脑上可能没写权限，换 `D:\ECHO` |
+| **安装器里配对失败**（http / https 都不行） | 看它现在给的分类：`401/403` = 码已被用掉/过期（配对码**一次性**，让管理员重发）；`Docker 网桥` = 公布的地址是容器内网（管理面「对外公布地址」填同事能访问的 IP/域名）；`证书/fp` = 串里的指纹与现在这张证书不一致；`限流` = 等 5 分钟。新版还会把 http 串自动按 https 再试一次（TLS 在反代上时） |
 | **Windows**：`import torch` / `sherpa_onnx` / `ctranslate2` 报 **`DLL load failed … 找不到指定的模块`** | 缺 **Microsoft Visual C++ 2015-2022 运行库（x64）** —— 这些原生扩展都要它，干净镜像上常常没有（2026-09-21 同事实测）。技能的第 3 步会**自动下载安装**（弹 UAC 点「是」）；装不了就手动装 `https://aka.ms/vs/17/release/vc_redist.x64.exe` 后**重跑技能**（可能要重启一次） |
 | **Windows**：弹 **「WebView2 初始化失败」** | 缺 Edge WebView2 Runtime（Win10/11 一般自带）；同样可改用浏览器面板 |
 | **macOS**：提示「来自身份不明的开发者」/ 打不开 | **正常现象**：还没做签名与公证。右键 →「打开」，或去「系统设置 → 隐私与安全性」里允许一次 |

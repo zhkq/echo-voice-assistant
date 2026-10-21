@@ -864,6 +864,36 @@ class BackendChoiceTests(unittest.TestCase):
         self.assertIn("ConvertFrom-EchoPairString", self.text)
         for key in ("'host'", "'url'", "'code'", "'fp'", "'fingerprint'"):
             self.assertIn(key, self.text, "配对串的键少了 %s" % key)
+        # 从聊天/文档复制时带的引号/反引号要先去掉（否则连引号一起当地址）
+        self.assertIn(".Trim('\"').Trim(\"'\").Trim('`')", self.text)
+
+    def test_a_http_pairing_string_is_retried_once_over_https(self):
+        """管理员那张串写 http、实际是 HTTPS 反代时，安装期也应当能配上。
+
+        2026-10-21 真机：服务端发出来的是 `host=http://10.x:8900`，同事在安装器里
+        怎么都配不上；把 host 改成 https 后在面板里成功了。安装器这一步与面板走
+        同一个接口，所以只差"同一地址再试一次 https"（只升不降；401/403/429 不重试，
+        那说明码已经用掉/被限流，换协议没有意义）。
+        """
+        self.assertIn("同一个地址再试一次 https", self.text)
+        self.assertIn("$p.Url -match '^http://'", self.text)
+        self.assertIn("-notin @(401, 403, 429)", self.text)
+
+    def test_pairing_failures_say_which_kind_it_is(self):
+        """"配对失败"四个字不够 —— 码过期 / 证书 / Docker 网桥 / 限流，下一步完全不同。"""
+        for want in ("配对码无效 / 已被使用 / 已过期", "Docker 网桥",
+                     "限流", "证书或配对串里的 fp="):
+            self.assertIn(want, self.text, "配对失败的提示少了：%s" % want)
+
+    def test_privacy_is_read_from_the_settings_list_and_written_inside_values(self):
+        """`GET /api/settings` 是 `{settings: [{key,value}]}`；`PUT` 要包 `values`。
+
+        这两处以前都写错了（读 `$st.capabilityPrivacy` 恒为 null、PUT 发扁平字典被 422），
+        于是"配对后把「不出机」改成「内网」"从来没生效过 —— 远端后端会被自己的许可
+        挡下，现象是"配好了却连不上"。
+        """
+        self.assertIn("$st.settings | Where-Object { $_.key -eq 'capabilityPrivacy' }", self.text)
+        self.assertIn("values = @{ capabilityPrivacy = 'lan' }", self.text)
 
     def test_local_means_unpack_and_trigger_the_download_only_when_needed(self):
         """本机跑：解薄包 → **有离线包就直接复制启用**（不下载）→ 没有才触发下载。"""
@@ -931,6 +961,40 @@ class BackendChoiceTests(unittest.TestCase):
         """等就绪要有**上限**，超时就如实说"还在起"，不许假装成功（也不能无限等）。"""
         self.assertIn("AddSeconds(480)", self.text, "等待上限 8 分钟")
         self.assertIn("还在装/起", self.text)
+
+class InstallPathNormalizationTests(unittest.TestCase):
+    """安装路径的输入归一化（2026-10-21 同事反馈：输入 `C:\\echo` 报"路径有问题"）。
+
+    真机最可能的形状是 Explorer「复制为路径」给的 `"C:\\ECHO"`，或者手输时带了尾反斜杠。
+    两者都会让 `-Root "C:\\ECHO\\"` 变成"反斜杠把收尾引号转义掉、下一项被吞进值里"，
+    于是脚本收到一个带引号/带别的参数的怪路径 —— 报错还看不出是转义问题。
+    所以入口脚本必须先归一化（去引号、去尾反斜杠），再拼参数 / 再校验。
+    """
+
+    def test_the_launcher_strips_quotes_and_a_trailing_backslash(self):
+        cmd = _read(os.path.join(ROOT, "delivery", "kit-install.cmd"), encoding="ascii")
+        self.assertIn('set "ROOT=%ROOT:"=%"', cmd, "Explorer 复制的带引号路径要先去掉引号")
+        self.assertIn('if "%ROOT:~-1%"=="\\" set "ROOT=%ROOT:~0,-1%"', cmd,
+                      "尾反斜杠会把 -Root 后面的收尾引号转义掉")
+        self.assertIn("reported a bad", cmd, "注释里要留下为什么（别让下一个人再踩）")
+
+    def test_both_installers_trim_quotes_and_trailing_slashes_before_validating(self):
+        for name, path in (("install-all.ps1", INSTALL_ALL), ("install.ps1", INSTALL_PS1)):
+            with self.subTest(name=name):
+                text = _read(path)
+                self.assertIn(".Trim('\"')", text, "%s 没去引号" % name)
+                self.assertIn("-replace '\\\\+$', ''", text, "%s 没去尾反斜杠" % name)
+                self.assertIn("不要带引号", text, "%s 的报错要告诉人正确形状" % name)
+
+    def test_the_fast_path_fails_early_when_the_install_root_cannot_be_created(self):
+        """C:\\ 根目录在受管电脑上往往不能写 —— 要当场说清，别等到装运行时才报。"""
+        for name, path in (("install-all.ps1", INSTALL_ALL), ("install.ps1", INSTALL_PS1)):
+            with self.subTest(name=name):
+                text = _read(path)
+                self.assertIn("创建不了安装目录", text)
+        self.assertIn("New-Item -ItemType Directory -Force -Path $script:TargetRoot",
+                      _read(INSTALL_ALL))
+
 
 class RequirementsFilesAreLocaleSafe(unittest.TestCase):
     """pip `-r` 读的清单文件：**含非 ASCII 就必须在第一两行有 PEP263 编码声明**。

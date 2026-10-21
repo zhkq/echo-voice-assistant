@@ -409,6 +409,11 @@ class SidebarLifecycleTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="echo-sidebar-")
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        # 测试机不一定装着 .NET Desktop Runtime —— 这些用例测的是"有运行时"那条路，
+        # 所以显式把它打成"有"；"没有运行时"由下面两条专门的用例钉住。
+        rt = patch.object(runtime, "_sidebar_runtime_ok", return_value=True)
+        rt.start()
+        self.addCleanup(rt.stop)
 
     def _make_exe(self, *rel):
         path = os.path.join(self.tmp, *rel)
@@ -454,6 +459,30 @@ class SidebarLifecycleTests(unittest.TestCase):
         with patch.object(runtime, "sidebar_exe_path", return_value=None):
             self.assertFalse(runtime._spawn_sidebar())
 
+    def test_spawn_without_dotnet_runtime_is_false_and_never_starts_it(self):
+        """没有 .NET Desktop Runtime 时**不许**起 echo-sidebar.exe。
+
+        真机现象（2026-10-21）：起它 → Windows 弹「You must install or update .NET」，
+        而 `Popen` 返回成功 —— 调用方以为边条起来了，用户以为 ECHO 要装 .NET。
+        """
+        with patch.object(runtime, "sidebar_exe_path", return_value="X:\\exe"), \
+                patch.object(runtime, "_sidebar_runtime_ok", return_value=False), \
+                patch.object(runtime.subprocess, "Popen") as popen:
+            self.assertFalse(runtime._spawn_sidebar())
+        popen.assert_not_called()
+
+    def test_autostart_falls_back_to_the_browser_panel_without_dotnet(self):
+        """缺运行时 → 用浏览器面板顶上（ECHO 本体不需要 .NET），并如实说明原因。"""
+        with patch.object(runtime, "_sidebar_running", return_value=False), \
+                patch.object(runtime, "sidebar_exe_path", return_value="X:\\exe"), \
+                patch.object(runtime, "_sidebar_runtime_ok", return_value=False), \
+                patch.object(runtime, "open_panel_window", return_value=True) as open_win, \
+                _patch_settings_get({"panelOpenMode": "sidebar", "panelAutoStart": True}):
+            got = runtime.autostart_sidebar()
+            open_win.assert_called_once_with()
+        self.assertTrue(got.startswith("fallback:"), got)
+        self.assertIn(".NET", got)
+
     def test_autostart_skip_reasons(self):
         exe = self._make_exe("sidebar", "bin", "Release", "net7.0-windows", "win-x64",
                              "echo-sidebar.exe")
@@ -495,6 +524,53 @@ class SidebarLifecycleTests(unittest.TestCase):
                 patch.object(runtime, "open_panel_window", return_value=True) as open_win:
             self.assertTrue(runtime.toggle_sidebar())
         open_win.assert_called_once_with()
+
+
+class SidebarRuntimeDetectionTests(unittest.TestCase):
+    """边条的 .NET 运行时判据：**没装就别起**，别让 Windows 弹安装框。
+
+    旧构建（没有 `rollForward`）只认 7.x；新构建（`LatestMajor`）认 7+（.NET 7 已 EOL，
+    新机器上更常见 8/9/10）。判据不联网、只扫目录 + 读旁边那份 runtimeconfig。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="echo-dotnet-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def _exe(self, roll=""):
+        exe = os.path.join(self.tmp, "sidebar", "echo-sidebar.exe")
+        os.makedirs(os.path.dirname(exe), exist_ok=True)
+        with open(exe, "wb") as fh:
+            fh.write(b"x")
+        if roll:
+            import json
+            with open(os.path.join(os.path.dirname(exe),
+                                   "echo-sidebar.runtimeconfig.json"), "w",
+                      encoding="utf-8") as fh:
+                json.dump({"runtimeOptions": {"rollForward": roll}}, fh)
+        return exe
+
+    def _runtime(self, versions, roll=""):
+        from app.platform.win32 import env as win_env
+        shared = os.path.join(self.tmp, "shared", "Microsoft.WindowsDesktop.App")
+        for v in versions:
+            os.makedirs(os.path.join(shared, v), exist_ok=True)
+        env = {"DOTNET_ROOT": self.tmp, "ProgramFiles": "", "ProgramFiles(x86)": "",
+               "LOCALAPPDATA": ""}
+        with patch.dict(os.environ, env, clear=False):
+            return win_env.sidebar_runtime(self._exe(roll))
+
+    def test_a_machine_without_the_desktop_runtime_is_reported_empty(self):
+        self.assertEqual(self._runtime([]), "")
+
+    def test_an_old_build_only_accepts_dotnet_7(self):
+        self.assertEqual(self._runtime(["7.0.20"]), "7.0.20")
+        self.assertEqual(self._runtime(["8.0.1"]), "",
+                         "旧构建没写 rollForward —— 起 8.x 也会弹「请安装 .NET 7」")
+
+    def test_a_new_build_can_use_a_later_major(self):
+        self.assertEqual(self._runtime(["8.0.1"], roll="LatestMajor"), "8.0.1")
+        self.assertEqual(self._runtime(["7.0.20", "9.0.3"], roll="LatestMajor"), "9.0.3")
 
 
 class PanelWindowTests(unittest.TestCase):
