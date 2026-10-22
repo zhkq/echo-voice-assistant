@@ -2,6 +2,35 @@
 
 ## 必读：已知坑（务必牢记）
 
+### **ECHO 不直接连 LLM：所有推理只发配置的智能体**（2026-10-22 用户定调，硬约束）
+
+- **用户原话**："echo 不直接连 llm 完成动作，所有推理动作都要发配置的 agent 进行"；
+  随后两次澄清：`echo-auto` **是注册到配置好的 agent 的**、**是给对应 agent 提供内外网模型服务路由的功能，不是 echo 自己用的**。
+- **现行架构**：
+  * 纪要、总结、推理、归档、语音指令 → 一律走 `app/agents` 里**当前选中的智能体**
+    （`meeting._agent_ready_for_reasoning()` → `manager.agent_ready()`）。
+  * 没有智能体就**明确失败**：`meeting.request_summary()` / `request_topic_segments()`
+    返回 `False` 并写 error 日志；**不静默降级、不直连**。
+  * `echo-auto` 仍然存在，但只活在 **智能体这一侧**：`app/llm_router.py` 把
+    `llm-pi-ai.providers.echo-auto` 写进 DSH 家目录，`dsh-failover/` 提供路由；
+    **不是 ECHO 的 provider，不在 `/api/providers` 里**。
+- **已删除（别再复活）**：
+  * `app/providers/openai.py` 的 `OpenAICompatLlmProvider`（`openai-llm`）；
+  * `app/providers/router.py`（把 `echo-auto` 包装成 ECHO 的 LLM provider）；
+  * `providers.KINDS` 里的 `"llm"`、`base.LlmProvider`；
+  * `config.DEFAULTS` 的 `providerLlm` / `providerLlmBaseUrl` / `providerLlmApiKey` / `providerLlmModel`；
+  * `meeting.direct_llm_decision()` / `_llm_provider_for_summary()` / `_provider_summary_text()` /
+    `_spawn_provider_summary()`；
+  * 向导 S6 的"直连兜底"折叠区与 UI 的「语言模型 provider」块（`rtLlmHost` / `loadRouterLlm`）。
+- **判据**：
+  * `tests/test_summary_agent_only.py`：没有 agent 时直接 False、有 agent 时只调 `_spawn_summary_waiter`；
+  * `tests/test_failover_boot.py::ProviderBoundaryTests`：`P.specs("llm") == []`、catalog 无 `llm`；
+  * `tests/test_providers.py`：只剩 ASR/TTS 两类；
+  * `scripts/audit-settings.py --check` 不再出现 `providerLlm*`。
+- **文档**：`docs/3.0-设计总览与组件关系.md` §"必须写清的降级边界"、
+  `docs/向导-分步设计.md` §0.4/S6、`docs/设置项归属表.md` 已同步；
+  `2.0-PROGRESS` / `3.0-PROGRESS` / `REFACTOR-PLAN` 顶部有"历史、已作废"提示。
+
 ### 跑全量门禁**之前先停本机后端**（2026-10-03 实测，三条红全是它引起的）
 
 - **现场**：为了给用户试会议转写，我把本机能力后端起起来了（`POST /api/capability/backend/start`，

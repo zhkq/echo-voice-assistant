@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """provider 的接口形状（P5）
 
-三类能力各一个抽象，方法都保持**最小**：只要现有实现能塞进来、调用方能拿到明确结果。
-不做"大一统管道"——P5 的目标是"让纪要不再依赖 agent"，不是重写引擎。
+ASR / TTS 两类能力各一个抽象，方法都保持**最小**：只要现有实现能塞进来、调用方能拿到明确结果。
+不做"大一统管道"——这一层只负责"语音进、语音出"，推理不在 ECHO 内完成（见 `providers/__init__.py`）。
 
 约定（三条，全部有测试钉住）
 --------------------------
@@ -39,19 +39,6 @@ class AsrProvider(Provider):
 
         `text` 为空**不等于**失败：要带 ``reason``（例如 ``"no-speech"``）让调用方区分
         "这段没人说话"和"引擎挂了"。
-        """
-        raise NotImplementedError
-
-
-class LlmProvider(Provider):
-    """语言模型：输入聊天消息，输出回复文本。"""
-
-    @abc.abstractmethod
-    def chat(self, messages, timeout=60, **kw):
-        """``messages`` = OpenAI 风格的 ``[{"role": "user", "content": "..."}]``。
-
-        成功返回回复字符串；失败抛异常（消息里带 provider 名与原因），
-        **不返回空串冒充成功**。
         """
         raise NotImplementedError
 

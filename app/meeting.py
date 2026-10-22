@@ -4712,9 +4712,9 @@ def update_meeting_title(meeting_id, title):
     return True, name, "会议名称已保存" if name else "已清空自定义名称"
 
 
-#: 纪要的**格式要求**（两条路共用：agent 路径与直连 LLM 路径）。
-#: 放在这里而不是各写一遍 —— Mermaid 的坑是实测踩出来的（PROGRESS §27 那批），
-#: 复制一份就等于将来只修好一条路。
+#: 纪要的**格式要求**（只服务 agent 路径）。
+#: 放在这里而不是写在 prompt 里 —— Mermaid 的坑是实测踩出来的（PROGRESS §27 那批），
+#: 以后改格式只改这一处。
 _SUMMARY_REQUIREMENTS = (
     "要求：生成完整纪要：**会议背景/议题 → 各议题关键讨论与结论 → 待办事项及责任人**。\n"
     "**尽量用 Mermaid 图表表达结构与流程**：如 flowchart 表达分工/流程、"
@@ -4737,91 +4737,20 @@ _SUMMARY_REQUIREMENTS = (
     "所以别把 timeline 那条冒号规则套到 gantt 上。"
 )
 
-#: 直连 LLM 时内联的转写文本上限（字符）。超了要**明说被截断**，不能悄悄丢内容。
-_PROVIDER_TRANSCRIPT_LIMIT = 120000
-
-
-def _llm_provider_for_summary():
-    """纪要要走直连 LLM 时用的 provider 实例；取不到返回 ``(None, 原因)``（P5）。"""
-    from app import providers as providers_mod
-    try:
-        pid, inst = providers_mod.active("llm")
-    except Exception as e:
-        return None, "没有可用的 LLM provider（%s）" % e
-    return inst, pid
-
-
-def direct_llm_decision():
-    """纪要是否走**直连 LLM provider**？返回 ``(bool, 原因)``。
-
-    判据（2026-09-20 按"会议纪要只用 agent"的定调重写）：
-      1. **agent（DSH）可用 → 一律走 agent**。纪要不是"孤立地调一次大模型"：同一场会议里
-         分段与归档走的是同一个会话（日志原话"纪要/分段/归档共用此会话"），而归档还依赖
-         agent 的 skill 机制 —— 只要 agent 在，就不该把它绕过去；
-      2. agent 不可用而 LLM provider 就绪 → 直连兜底（P5 的承诺："不装 agent 也能出纪要"）；
-      3. 其它 → 保持 agent 路径（由原路径报错，不静默走一条没配好的路）。
-
-    **为什么删掉了原来"用户显式选了 `providerLlm` 就优先直连"那条判据**：
-    `providerLlm` 的默认值是 `""`，而 `""` 与 `"echo-auto"` 的**生效 provider 完全一样**
-    （`providers.default_id("llm")` 就是 `echo-auto`）。原判据看的是"原始设置非空"，于是
-    "在面板里显式选了 ECHO AUTO"这个动作会**静默把纪要从 agent 切到直连** —— 实测踩到过
-    （2026-09-19_19-18-25 那场：19:19 走 agent，次日 02:04 变成直连）。同一个 provider
-    不该有两种路由，而且用户选路由时并没想到会顺手关掉纪要的 agent 路径。
-
-    只读判断，不做任何副作用；探测失败一律按"不走直连"处理（宁可退回老路）。
-    """
-    try:
-        from app import manager
-        # ⚠️ 必须问 `agent_ready()`（**当前选中的**智能体），不能问 `dsh_ready()`
-        # （那只回答"DSH 桌面版进程在不在"）。2026-10-08 事故：用户选的是标准版 harness、
-        # 桌面版没开，于是这里恒判"未就绪"，纪要与分段**全部绕开智能体**走直连 LLM。
-        # 用户原话："会议纪要分段应该发给配置好的智能体，也就是 dsh 标准版进行呀"。
-        agent_ok = bool(manager.agent_ready())
-    except Exception:
-        agent_ok = False
-    if agent_ok:
-        return False, "agent 可用（选中的智能体就绪）"
-    inst, pid = _llm_provider_for_summary()
-    if inst is None:
-        return False, "agent 不可用且没有可用的 LLM provider"
-    return True, "agent 不可用（选中的智能体未就绪），改用 LLM provider %s" % pid
-
-
-def _provider_summary_text(folder):
-    """把整场会议的转写**内联**成一段文本（直连 LLM 没有文件读取能力）。
-
-    用 `_meeting_parts()` 汇总；超长时截断并**在文末显式说明**（不能让模型以为这就是全部）。
-    """
-    try:
-        summary_src, topics_src, transcript_src = _meeting_parts(folder)
-        text = _meeting_full_text(summary_src, topics_src, transcript_src)
-    except Exception as e:
-        raise RuntimeError("读取会议材料失败：%s" % e) from None
-    text = (text or "").strip()
-    if not text:
-        raise RuntimeError("会议目录里没有可用的转写文本（transcript.md 为空或缺失）")
-    if len(text) > _PROVIDER_TRANSCRIPT_LIMIT:
-        original_len = len(text)
-        text = text[:_PROVIDER_TRANSCRIPT_LIMIT] + (
-            "\n\n【注意】以上内容因长度限制被截断（原文 %d 字），"
-            "纪要需基于已给出的部分，并在开头注明「材料被截断」。" % original_len)
-    return text
-
-
 def _notify_summary_ready(meeting_id, folder, body):
     """纪要**真的成稿**之后，才通知手机「纪要好了」（`GET /api/events/feed`，2026-10-16）。
 
     ⚠️ **为什么挂在"文件已写出来"这一刻，而不是"请求已发出/会话刚建立"那里**：
     `meeting_summary_ready` 到了手机就是一条"会议纪要好了"的通知，用户点开就要看到正文。
-    而纪要由 DSH 异步生成（agent 路径），DSH 用不了时才切直连 LLM 兜底 —— 这条路中间有
-    **好几处会走不到落盘**：等回复超时（`_spawn_summary_waiter` 的 `reply` 为空）、
-    回复过短或只是"我这就去写"的占位话（`_looks_placeholder`）、provider 不可用、异常。
+    而纪要由**配置的智能体**异步生成，这条路中间有**好几处会走不到落盘**：等回复超时
+    （`_spawn_summary_waiter` 的 `reply` 为空）、回复过短或只是"我这就去写"的占位话
+    （`_looks_placeholder`）、没有可用智能体、异常。
     在这些点上发事件 = **假报**：通知响了、点开却是空的（或者还是上一版），用户只会以为
     纪要丢了 —— 而且面板上没有"失败"可看，只剩一条来自手机的假消息。这是我们能犯的
     最坏的一类错，所以宁可晚发、绝不早发。
     判据只有一条：**刚刚那次写入真的落下了非空白正文**（见下 `body.strip()`），
     且调用方确认写的就是 `summary.md`（`topics.md` 那种产物不算"纪要好了"）。
-    两条路（agent 路径 / 直连 LLM 路径）都在**写盘成功之后**调这里。
+    agent 路径在**写盘成功之后**调这里。
 
     `body` = 刚写进 `summary.md` 的内容。为什么要再看一眼它：剪掉开场白/结构化元数据之后
     理论上可能只剩空白（回复整段就是一个元数据 JSON 围栏），那种"写了个空文件"同样**不发**。
@@ -4843,7 +4772,7 @@ def _notify_summary_ready(meeting_id, folder, body):
 def _existing_summary_len(path):
     """已有纪要文件的**非空白内容长度**（不存在/读不到/全空白 → 0）。
 
-    三处要用同一件事（两条路的"占位话"告警 + `_write_summary_body` 的落盘判据），
+    三处要用同一件事（"占位话"告警 + `_write_summary_body` 的落盘判据），
     所以只在这里读一次 —— 口径不一样就会出现"日志说没有旧内容、判据却认为有"这种自相矛盾。
     """
     try:
@@ -4855,15 +4784,15 @@ def _existing_summary_len(path):
 
 
 def _write_summary_body(path, body, label="纪要"):
-    """两条纪要路**共用的落盘判据**（2026-10-16 数据丢失修复）。
+    """纪要的落盘判据（2026-10-16 数据丢失修复）。
 
-    **修的是什么**：两条路（agent 的 `_spawn_summary_waiter` / 直连 LLM 的
-    `_spawn_provider_summary`）在写盘前只挡"回复过短"与 `_looks_placeholder`，
+    **修的是什么**：agent 路径在写盘前只挡"回复过短"与 `_looks_placeholder`，
     但模型整段只回**开场白 + 一段元数据 JSON** 时（长度 > 80，占位判据**拦不住**），
     经"剪开场白/去元数据"（`_strip_summary_head`）之后正文可能**只剩空白** ——
     而旧代码照样 `open(path, "w")`，**把旧的、可能正是用户想要的那份纪要覆盖成空白** ✗。
     在"重新生成纪要"这条路上，用户丢掉的是**自己已经看过的那份纪要**，且当场没有任何提示。
-    判据原来在两处各写一遍（"复制一份 = 将来只修好一条路"），所以抽到这里。
+    判据原来在两处各写一遍（"复制一份 = 将来只修好一条路"），所以抽到这里；
+    2026-10-22 直连 LLM 那条路删除后，这里只服务 agent 路径。
 
     **取舍（为什么是"不覆盖"而不是"清空"）**：宁可留着一份**旧的、用户认得**的纪要并告警，
     也绝不把好内容换成空白 —— 保留的代价只是"这次没生成成功"（用户重试即可），
@@ -4918,8 +4847,8 @@ _summarizing = {"lock": threading.Lock(), "set": set()}
 
 #: 「派发了、还没成稿」的纪要运行（run id）：`meeting_id → [run_id, …]`（FIFO）。
 #: `regenerate_summary()` 登记，**真正写 summary.md 的那个线程**领走并在自己的 finally 里
-#: 收口。为什么不把 run_id 作为参数一路传下去：`request_summary()` / 两个 spawn 的签名
-#: 已被别处（含用例里的替身）按位置参数调用，加参数会牵动一圈无关的调用点；
+#: 收口。为什么不把 run_id 作为参数一路传下去：`request_summary()` / `_spawn_summary_waiter`
+#: 的签名已被别处（含用例里的替身）按位置参数调用，加参数会牵动一圈无关的调用点；
 #: 而"谁该为这次派发的成败负责"本来就只与**本进程这一次派发**有关，放在这里最小。
 _summary_run_queue = {"lock": threading.Lock(), "by_meeting": {}}
 
@@ -4936,7 +4865,7 @@ def _begin_summarizing(meeting_id):
 
 
 def _end_summarizing(meeting_id):
-    """注销"这一场在生成纪要"（线程的任何出口都要走到：见两个 spawn 的 `finally`）。"""
+    """注销"这一场在生成纪要"（线程的任何出口都要走到：见 `_spawn_summary_waiter` 的 `finally`）。"""
     with _summarizing["lock"]:
         _summarizing["set"].discard(meeting_id)
 
@@ -5003,8 +4932,8 @@ def _close_orphan_summary_runs():
 
     为什么启动时可以"一律收口"、不用猜时间：这个函数只从
     `recover_orphaned_meetings()` 走（进程刚起来那一刻），**本进程里不可能有纪要线程**
-    在跑 —— 所以任何 pending 都只能是上一次进程崩掉留下的残留。真实生成最长约 5 分钟
-    （agent 路 `wait_for_reply(timeout=240)`、直连路 `timeout=300`），而"还没等到就被重启"
+    在跑 —— 所以任何 pending 都只能是上一次进程崩掉留下的残留。真实生成最长约 4 分钟
+    （`_spawn_summary_waiter` 的 `wait_for_reply(timeout=240)`），而"还没等到就被重启"
     的那条请求本来也已经随进程没了，同样按残留处理。
     留着它的后果很具体：库里/面板上永远显示"纪要生成中"，而那个任务根本不存在了。
 
@@ -5056,93 +4985,29 @@ def summary_state(meeting_id, meeting_name=None):
     return "none"
 
 
-def _spawn_provider_summary(meeting_id, folder, out_name="summary.md", extra=""):
-    """后台线程：把转写内联交给 LLM provider，写成纪要文件（P5）。
+def _agent_ready_for_reasoning():
+    """当前配置的智能体能不能接推理？**唯一**判据（ECHO 不直连 LLM）。
 
-    与 agent 路径共用同一套**落盘纪律**：回复过短或疑似占位话就**不回写**
-    （保留已有文件），失败写 warn 日志 —— 宁可留空让人重试，也不要把占位当纪要存下来。
-
-    另外（2026-10-16）：**写 summary.md 的这一路要负责"正在生成"的登记与收口** ——
-    登记/注销放在**起线程那一帧**（不留空档），收口放在线程自己的 `finally`（每个出口都走），
-    这样"派发了但还没成稿"在 `summary_runs` 里是**真的** pending，在 `summary_state()` 里
-    是真的 running（见本文件「纪要正在生成」那一节）。`topics.md`（议题分段）不算"纪要在生成"，
-    它不登记也不收口 —— 面板等的是 `summary.md` 那一个产物。
+    只读探测，失败一律按不可用处理；调用方据此**明确失败**，不要静默改走别的路。
     """
-    is_summary = (out_name == "summary.md")
-    run_id = _claim_summary_run(meeting_id) if is_summary else 0
-    if is_summary:
-        _begin_summarizing(meeting_id)
-
-    def _run():
-        outcome = "failed"      # 任何非正常出口都留 failed：超时/过短/占位话/空白/异常
-        with _MEETING_LOCKS_LOCK:
-            lock = _MEETING_LOCKS.setdefault(meeting_id, threading.Lock())
-        with lock:
-            try:
-                inst, pid = _llm_provider_for_summary()
-                if inst is None:
-                    db.add_log("error", "meeting", "直连纪要失败：%s" % pid)
-                    return
-                text = _provider_summary_text(folder)
-                prompt = ("以下是会议转写（按片段组织，行内带[绝对时间戳]）：\n\n" + text +
-                          "\n\n" + _SUMMARY_REQUIREMENTS + "\n"
-                          "**输出约束：只输出纪要 markdown 全文**，不要寒暄、不要解释过程。")
-                if extra:
-                    prompt += "\n\n追加要求：%s" % extra
-                db.add_log("info", "meeting",
-                           f"已请求纪要（provider={pid}，{os.path.basename(folder)}）")
-                reply = inst.chat([{"role": "system", "content": "你是会议纪要助手。"},
-                                   {"role": "user", "content": prompt}], timeout=300)
-                path = os.path.join(folder, out_name)
-                old_len = _existing_summary_len(path)
-                if not (reply and len(reply.strip()) > 10):
-                    db.add_log("warn", "meeting", "纪要 provider 回复过短，本次不回写")
-                    return
-                if _looks_placeholder(reply):
-                    db.add_log("warn", "meeting",
-                               "纪要 provider 回复疑似占位/意图话（非实质纪要），本次不回写"
-                               f"{'，保留原文件' if old_len > 30 else '（无旧有效内容）'}")
-                    return
-                # 与 agent 路径**同一套落盘纪律**（`_SUMMARY_REQUIREMENTS` 那段注释说的：
-                # 复制一份就等于将来只修好一条路）：剪开场白/元数据 + 修 mermaid。
-                body = _sanitize_mermaid(_strip_summary_head(reply) + "\n")
-                # 落盘判据（共用的那个）：新正文空白就**不覆盖**已有纪要（只告警）——
-                # 见 `_write_summary_body` 的注释（这是数据丢失那道闸）。
-                if not _write_summary_body(path, body):
-                    # 没写就不发事件：否则通知响了、点开还是旧内容（或空白）= 假报。
-                    return
-                outcome = "done"    # 到这一步才是"纪要真的成稿"（上面每一条 return 都没写盘）
-                db.add_log("info", "meeting",
-                           f"纪要已生成（provider={pid}）：{os.path.basename(path)}")
-                # 直连兜底路径也要通知手机（否则"没装 agent 的机器"永远收不到「纪要好了」）。
-                # 位置：`write` 之后 —— 上面每一条 `return`（provider 不可用/回复过短/占位话/
-                # 空白不覆盖）都发生在写盘之前，正好天然"不发"；理由见 `_notify_summary_ready`。
-                if out_name == "summary.md":
-                    _notify_summary_ready(meeting_id, folder, body)
-            except Exception as e:
-                # 直连路径的失败必须留痕：否则面板上表现为"点了没反应"（1.x 的老毛病）
-                db.add_log("error", "meeting", f"直连纪要失败：{e}")
-            finally:
-                if is_summary:
-                    # 注销 + 给这次运行收口：**成功也收、失败也收**（超时/异常不走上面任何
-                    # 一条 return 的情形都在这里兜住）—— 留下永远 pending 的运行 = 库里
-                    # 永远写着"生成中"，而任务早没了。
-                    _end_summarizing(meeting_id)
-                    _finish_summary_run(run_id, outcome)
-    threading.Thread(target=_run, daemon=True, name="summary-provider").start()
+    try:
+        from app import manager
+        return bool(manager.agent_ready())
+    except Exception:
+        return False
 
 
 def request_summary(meeting_id, folder=None, extra=""):
     """生成整场会议纪要（纯 markdown，可含 Mermaid 图表），后台线程写 summary.md。
 
-    两条路（P5 起，2026-09-20 起**以 agent 为准**）：
-      * **agent 路径**（默认，只要 DSH 就绪就走它）：把 transcript.md 的**路径**交给 DSH，
-        由它用 read 工具读并撰写；分段与归档共用这个会话；
-      * **直连 LLM 路径**（兜底）：**agent 用不了**（DSH 未就绪）而 LLM provider 就绪时，
-        把转写**内联**喂给 LLM provider —— 这样"不装 agent 也能出纪要"（P5 的验收点）。
-    标题/简介/摘要/分段由第二次调用（request_topic_segments）以 JSON 提供（那次**只走 agent**）。
+    **唯一路径 = 配置的智能体**（2026-10-22 起）：
+    把 transcript.md 的**路径**交给配置的智能体，由它用 read 工具读并撰写；
+    分段与归档共用这个会话。**没有 agent 就直接返回 False** ——
+    ECHO 不再直连 LLM，也不再有"不装 agent 也能出纪要"的兜底。
 
-    ``extra`` = 追加要求（面板「重新生成」里填的那种）。**两条路都必须带上它** ——
+    标题/简介/摘要/分段由第二次调用（request_topic_segments）以 JSON 提供。
+
+    ``extra`` = 追加要求（面板「重新生成」里填的那种）。必须一路带到 prompt 里 ——
     2026-09-19 修：以前 `regenerate_summary` 把它记进 summary_runs 却没往下传，
     等于"追加要求"从来没生效过。
     """
@@ -5150,11 +5015,10 @@ def request_summary(meeting_id, folder=None, extra=""):
         meeting = db.get_meeting(meeting_id)
         folder = os.path.join(meetings_dir(), meeting["name"])
     meeting = db.get_meeting(meeting_id)
-    use_direct, why = direct_llm_decision()
-    if use_direct:
-        db.add_log("info", "meeting", "纪要走直连 LLM：%s" % why)
-        _spawn_provider_summary(meeting_id, folder, extra=extra)
-        return True
+    if not _agent_ready_for_reasoning():
+        db.add_log("error", "meeting",
+                   "没有可用的智能体，纪要未发起（ECHO 不直连 LLM；先配置/启动智能体）")
+        return False
     transcript = os.path.join(folder, "transcript.md").replace("\\", "/")
     text = (f"任务：基于会议转写文件生成会议纪要（markdown 格式）。\n"
             f"步骤：1) 用 read 工具读取文件 \"{transcript}\"（已按片段组织，"
@@ -5169,10 +5033,10 @@ def request_summary(meeting_id, folder=None, extra=""):
 
 
 def request_topic_segments(meeting_id, folder=None):
-    """请 DSH 输出结构化会议元数据 JSON（第二次调用，替代原分段+语义分段两次调用）：
+    """请**配置的智能体**输出结构化会议元数据 JSON（第二次调用，替代原分段+语义分段两次调用）：
     标题、简介、摘要、议题分段，供会议列表/工作日志/前端主题分段/归档使用。
 
-    DSH 在回复中只输出一个 JSON 对象，后台线程等待回复并写入 topics.md：
+    智能体在回复中只输出一个 JSON 对象，后台线程等待回复并写入 topics.md：
       {
         "标题": "…(<20字)",
         "简介": "…(一句话)",
@@ -5187,6 +5051,10 @@ def request_topic_segments(meeting_id, folder=None):
         meeting = db.get_meeting(meeting_id)
         folder = os.path.join(meetings_dir(), meeting["name"])
     meeting = db.get_meeting(meeting_id)
+    if not _agent_ready_for_reasoning():
+        db.add_log("error", "meeting",
+                   "没有可用的智能体，议题分段未发起（ECHO 不直连 LLM）")
+        return False
     transcript = os.path.join(folder, "transcript.md").replace("\\", "/")
     text = (f"任务：通读会议转写全文，输出本次会议的结构化元数据 JSON"
             f"（供会议列表/工作日志/主题分段展示使用）。\n"
@@ -5211,9 +5079,9 @@ def request_topic_segments(meeting_id, folder=None):
 
 
 def _looks_placeholder(text):
-    """判断 DSH 回复是否为「占位/意图」而非真实纪要正文。
+    """判断智能体回复是否为「占位/意图」而非真实纪要正文。
 
-    若 DSH 只回了一句诸如“I'll read the transcript file first.”、
+    若智能体只回了一句诸如“I'll read the transcript file first.”、
     “正在读取转写文件…”这类意图/进度话，却没有任何实质章节/要点，
     把它当成纪要写盘会造成「真纪要被占位符顶掉、之后展示不出来」。
     """
@@ -5313,7 +5181,7 @@ def _spawn_summary_waiter(meeting_id, folder, out_name, prompt_text, label):
     同一会议的多个纪要请求（整场/分段/语义分段）串行执行，防止并发同会话时
     wait_for_reply 抢到同一个回复导致输出串台。
 
-    写入前做「占位符/超短」校验：若 DSH 只回了意图话而没给实质纪要，则**不回写**
+    写入前做「占位符/超短」校验：若智能体只回了意图话而没给实质纪要，则**不回写**
     （保留已有的正确文件；若还没有旧文件或旧文件同样为空壳，则留待人工重试），
     避免把占位符当真纪要持久化并用于后续展示/归档。
 
@@ -5371,7 +5239,7 @@ def _spawn_summary_waiter(meeting_id, folder, out_name, prompt_text, label):
                                    f"{label}：已剪掉回复开头的开场白/结构化元数据"
                                    f"（{len(content_raw) - len(trimmed)} 字）")
                     content = _sanitize_mermaid(trimmed + "\n")  # markdown 纪要
-                # 落盘判据（与直连路径**同一个函数**）：新正文空白就**不覆盖**已有纪要（只告警）。
+                # 落盘判据（`_write_summary_body`）：新正文空白就**不覆盖**已有纪要（只告警）。
                 # 为什么必须挡在这里：上面那两条守卫（非空且 > 10 字、`_looks_placeholder`）挡不住
                 # "开场白 + 元数据 JSON"这种长回复，而 `_strip_summary_head` 剪完之后可能只剩空白 ——
                 # 旧代码会照样 `open(..., "w")` 把用户原来那份好纪要覆盖掉 ✗（见 `_write_summary_body`）。
@@ -5451,7 +5319,7 @@ def regenerate_summary(meeting_id, extra_prompt=""):
         _forget_summary_run(meeting_id, run_id)
         db.finish_summary_run(run_id, "failed")
     return ok, ("已发送纪要+议题分段生成请求" if ok
-                else "发送请求失败（agent 与 LLM provider 都不可用？）")
+                else "发送请求失败：没有可用的智能体（ECHO 不直连 LLM，请先配置/启动智能体）")
 
 
 def retranscribe_meeting(meeting_id, force=False):

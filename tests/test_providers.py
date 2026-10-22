@@ -29,12 +29,11 @@ from app import providers as P                              # noqa: E402
 from app.config import settings                              # noqa: E402
 from app.providers import openai as online_mod               # noqa: E402
 from app.providers import presets as presets_mod             # noqa: E402
-from app.providers import router as router_mod               # noqa: E402
 from app.providers.local import (LocalAsrProvider, LocalTtsProvider,   # noqa: E402
                                  EdgeTtsProvider)
 
 #: 凭据类**字段名**（不是值）。清单里可以出现"哪个配置项喂给哪个 provider"
-#: （那是名字，如 details.settings=["providerLlmApiKey"]），但**不许有字段专门装密钥**。
+#: （那是名字，如 details.settings=["providerAsrApiKey"]），但**不许有字段专门装密钥**。
 CRED_KEY_RE = re.compile(r"(api[_-]?key|token|secret|password|passwd|authorization)", re.I)
 
 
@@ -58,7 +57,7 @@ class RegistryShapeTests(unittest.TestCase):
         self.assertIn(("asr", "local-asr"), ids)
         self.assertIn(("tts", "local-tts"), ids)
         self.assertIn(("tts", "edge-tts"), ids)
-        self.assertIn(("llm", "echo-auto"), ids)
+        self.assertNotIn("llm", [k for k, _ in ids], "ECHO 不再有 LLM provider")
 
     def test_every_kind_has_a_default(self):
         for kind in P.KINDS:
@@ -75,8 +74,8 @@ class RegistryShapeTests(unittest.TestCase):
     def test_egress_must_be_explained(self):
         """出网 = 用户数据离开本机，必须写清"发什么、给谁"；这是规划里的硬要求。"""
         with self.assertRaises(ValueError):
-            P.ProviderSpec(id="x", kind="llm", name="x", source="online", egress=True)
-        spec = P.ProviderSpec(id="y", kind="llm", name="y", source="online",
+            P.ProviderSpec(id="x", kind="asr", name="x", source="online", egress=True)
+        spec = P.ProviderSpec(id="y", kind="asr", name="y", source="online",
                               egress=True, egress_note="发到某服务")
         self.assertTrue(spec["egress"])
 
@@ -92,12 +91,6 @@ class RegistryShapeTests(unittest.TestCase):
         self.assertTrue(spec["egress"])
         self.assertIn("微软", spec["egress_note"])
 
-    def test_echo_auto_is_online_and_mentions_multi_upstream(self):
-        spec = P.describe("llm", "echo-auto")
-        self.assertTrue(spec["egress"])
-        self.assertIn("上游", spec["egress_note"])
-        self.assertEqual(spec["details"]["model"], "echo-auto")
-
     def test_unknown_provider_raises_with_the_available_list(self):
         with self.assertRaises(KeyError) as cm:
             P.create("asr", "no-such-provider")
@@ -108,14 +101,12 @@ class ActiveSelectionTests(_NoCredentialFields, unittest.TestCase):
     def test_default_is_used_when_config_is_empty(self):
         with patch("app.config.settings.get", lambda k, d=None: ""):
             self.assertEqual(P.active_id("asr"), "local-asr")
-            self.assertEqual(P.active_id("llm"), "echo-auto")
 
     def test_config_wins(self):
         def fake_get(key, default=None):
-            return {"providerAsr": "local-asr", "providerLlm": "echo-auto"}.get(key, default)
+            return {"providerAsr": "local-asr"}.get(key, default)
         with patch("app.config.settings.get", fake_get):
             self.assertEqual(P.active_id("asr"), "local-asr")
-            self.assertEqual(P.active_id("llm"), "echo-auto")
 
     def test_unknown_configured_id_falls_back_to_default(self):
         with patch("app.config.settings.get", lambda k, d=None: "ghost-provider"):
@@ -189,101 +180,6 @@ class LocalAdapterTests(unittest.TestCase):
             self.assertFalse(LocalTtsProvider().speak("你好"))
 
 
-class _StubUpstream(BaseHTTPRequestHandler):
-    """假的 OpenAI 兼容上游：记录收到的请求，按脚本回复。"""
-
-    reply = {"choices": [{"message": {"content": "好的"}}]}
-    status = 200
-    seen = []
-
-    def do_POST(self):                                   # noqa: N802
-        length = int(self.headers.get("Content-Length") or 0)
-        body = self.rfile.read(length).decode("utf-8")
-        _StubUpstream.seen.append({"path": self.path, "body": json.loads(body or "{}"),
-                                   "auth": self.headers.get("Authorization")})
-        payload = json.dumps(_StubUpstream.reply).encode("utf-8")
-        self.send_response(_StubUpstream.status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(payload)))
-        self.end_headers()
-        self.wfile.write(payload)
-
-    def log_message(self, *a):                           # 静音
-        pass
-
-
-class EchoAutoLlmProviderTests(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.srv = HTTPServer(("127.0.0.1", 0), _StubUpstream)
-        cls.port = cls.srv.server_address[1]
-        cls.thread = threading.Thread(target=cls.srv.serve_forever, daemon=True)
-        cls.thread.start()
-        cls.base = "http://127.0.0.1:%d/v1" % cls.port
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.srv.shutdown()
-        cls.srv.server_close()
-
-    def setUp(self):
-        _StubUpstream.seen = []
-        _StubUpstream.status = 200
-        _StubUpstream.reply = {"choices": [{"message": {"content": "好的"}}]}
-
-    def test_chat_sends_openai_shape_and_returns_content(self):
-        out = router_mod.EchoAutoLlmProvider().chat(
-            [{"role": "user", "content": "你好"}], base_url=self.base, api_key="tok")
-        self.assertEqual(out, "好的")
-        sent = _StubUpstream.seen[0]
-        self.assertEqual(sent["path"], "/v1/chat/completions")
-        self.assertEqual(sent["body"]["model"], "echo-auto")
-        self.assertFalse(sent["body"]["stream"])
-        self.assertEqual(sent["auth"], "Bearer tok")
-
-    def test_http_error_raises_with_status(self):
-        _StubUpstream.status = 502
-        with self.assertRaises(RuntimeError) as cm:
-            router_mod.EchoAutoLlmProvider().chat(
-                [{"role": "user", "content": "hi"}], base_url=self.base)
-        self.assertIn("502", str(cm.exception))
-        self.assertIn("echo-auto", str(cm.exception))
-
-    def test_unreachable_router_raises_a_helpful_error(self):
-        with self.assertRaises(RuntimeError) as cm:
-            router_mod.EchoAutoLlmProvider().chat(
-                [{"role": "user", "content": "hi"}],
-                base_url="http://127.0.0.1:1/v1", timeout=1)
-        self.assertIn("路由", str(cm.exception))
-
-    def test_unknown_payload_shape_raises_not_empty_string(self):
-        _StubUpstream.reply = {"unexpected": True}
-        with self.assertRaises(RuntimeError):
-            router_mod.EchoAutoLlmProvider().chat(
-                [{"role": "user", "content": "hi"}], base_url=self.base)
-
-    def test_empty_upstream_reply_raises(self):
-        _StubUpstream.reply = {"choices": [{"message": {"content": "   "}}]}
-        with self.assertRaises(RuntimeError) as cm:
-            router_mod.EchoAutoLlmProvider().chat(
-                [{"role": "user", "content": "hi"}], base_url=self.base)
-        self.assertIn("空回复", str(cm.exception))
-
-    def test_empty_messages_is_rejected_locally(self):
-        with self.assertRaises(ValueError):
-            router_mod.EchoAutoLlmProvider().chat([])
-
-    def test_base_url_follows_the_router_port(self):
-        with patch("app.failover_proxy.proxy_port", lambda: 18899):
-            self.assertEqual(router_mod.EchoAutoLlmProvider().base_url(),
-                             "http://127.0.0.1:18899/v1")
-
-    def test_token_is_never_in_the_catalog(self):
-        with patch("app.llm_router.router_token", lambda: "SUPER-SECRET-TOKEN"):
-            cat = json.dumps(P.catalog(ready=False), ensure_ascii=False)
-        self.assertNotIn("SUPER-SECRET-TOKEN", cat)
-
-
 class ProviderApiTests(_NoCredentialFields, unittest.TestCase):
     """`GET /api/providers`：面板要用的只读清单（默认不探测）。"""
 
@@ -343,7 +239,7 @@ class SecretHandlingTests(unittest.TestCase):
 
     def test_secret_keys_are_declared_with_metadata(self):
         from app.config import DEFAULTS
-        for key in ("providerLlmApiKey", "providerAsrApiKey"):
+        for key in ("providerAsrApiKey", "providerAsrApiKey"):
             with self.subTest(key=key):
                 self.assertTrue(DEFAULTS[key].get("secret"), "%s 必须标 secret" % key)
                 self.assertEqual(DEFAULTS[key]["grp"], "provider")
@@ -370,52 +266,52 @@ class SecretHandlingTests(unittest.TestCase):
         知道"配没配"），真值只在服务端 `settings.get()` 里用于拼请求头 —— 下面几条用例钉着
         这一点（`test_config_endpoint_masks_secrets` / `test_settings_get_still_returns_the_real_value`）。
         """
-        settings.update({"providerLlmApiKey": self.SECRET})
+        settings.update({"providerAsrApiKey": self.SECRET})
         rows = {r["key"]: r for r in settings.all()}
-        self.assertIn("providerLlmApiKey", rows, "现在它由 AI组件 承载 → 要下发这一行")
-        self.assertEqual(rows["providerLlmApiKey"].get("value"), "",
+        self.assertIn("providerAsrApiKey", rows, "现在它由 AI组件 承载 → 要下发这一行")
+        self.assertEqual(rows["providerAsrApiKey"].get("value"), "",
                          "下发的 value 必须是空串（密钥不回显）")
-        self.assertTrue(rows["providerLlmApiKey"].get("secret"), "要标成 secret，面板才会画密码框")
+        self.assertTrue(rows["providerAsrApiKey"].get("secret"), "要标成 secret，面板才会画密码框")
 
     def test_config_endpoint_masks_secrets(self):
-        settings.update({"providerLlmApiKey": self.SECRET})
-        r = self._cfg_row("providerLlmApiKey")
+        settings.update({"providerAsrApiKey": self.SECRET})
+        r = self._cfg_row("providerAsrApiKey")
         self.assertEqual(r["value"], "", "卡片拿到的必须是空的")
         self.assertTrue(r["secret"])
         self.assertTrue(r["hasValue"], "要告诉卡片库里其实有值")
 
     def test_settings_get_still_returns_the_real_value(self):
         """provider 组装请求头时用的是真值 —— 遮罩只发生在出口。"""
-        settings.update({"providerLlmApiKey": self.SECRET})
-        self.assertEqual(settings.get("providerLlmApiKey"), self.SECRET)
+        settings.update({"providerAsrApiKey": self.SECRET})
+        self.assertEqual(settings.get("providerAsrApiKey"), self.SECRET)
 
     def test_empty_secret_reports_has_value_false(self):
-        settings.update({"providerLlmApiKey": ""})
-        self.assertFalse(self._cfg_row("providerLlmApiKey")["hasValue"])
+        settings.update({"providerAsrApiKey": ""})
+        self.assertFalse(self._cfg_row("providerAsrApiKey")["hasValue"])
 
     # ---- 防误清空（2026-09-19 发现的数据丢失风险）----
     def test_empty_string_never_clears_a_secret(self):
         """面板"整批保存"会把遮罩后的空串回传 —— 那**不能**当成"清空密钥"。"""
-        settings.update({"providerLlmApiKey": self.SECRET})
-        settings.update({"providerLlmApiKey": ""})
-        self.assertEqual(settings.get("providerLlmApiKey"), self.SECRET,
+        settings.update({"providerAsrApiKey": self.SECRET})
+        settings.update({"providerAsrApiKey": ""})
+        self.assertEqual(settings.get("providerAsrApiKey"), self.SECRET,
                          "空串 = 不改（否则用户一保存设置，密钥就静默没了）")
-        settings.update({"providerLlmApiKey": "   "})
-        self.assertEqual(settings.get("providerLlmApiKey"), self.SECRET)
+        settings.update({"providerAsrApiKey": "   "})
+        self.assertEqual(settings.get("providerAsrApiKey"), self.SECRET)
 
     def test_panel_like_bulk_save_keeps_the_secret(self):
         """模拟面板：把 settings.all() 里所有项原样回传（密钥是空串）→ 密钥必须还在。"""
-        settings.update({"providerLlmApiKey": self.SECRET})
+        settings.update({"providerAsrApiKey": self.SECRET})
         echoed = {r["key"]: r["value"] for r in settings.all()}
         settings.update(echoed)
-        self.assertEqual(settings.get("providerLlmApiKey"), self.SECRET)
+        self.assertEqual(settings.get("providerAsrApiKey"), self.SECRET)
 
     def test_clear_sentinel_is_the_only_way_to_wipe(self):
         from app.config import CLEAR_SECRET
-        settings.update({"providerLlmApiKey": self.SECRET})
-        settings.update({"providerLlmApiKey": CLEAR_SECRET})
-        self.assertEqual(settings.get("providerLlmApiKey"), "")
-        self.assertFalse(self._cfg_row("providerLlmApiKey")["hasValue"])
+        settings.update({"providerAsrApiKey": self.SECRET})
+        settings.update({"providerAsrApiKey": CLEAR_SECRET})
+        self.assertEqual(settings.get("providerAsrApiKey"), "")
+        self.assertFalse(self._cfg_row("providerAsrApiKey")["hasValue"])
 
     def test_non_secret_keys_still_accept_empty(self):
         """闸只对 secret 生效：普通项（如 meetingsDir）空串仍是合法值。"""
@@ -427,7 +323,7 @@ class SecretHandlingTests(unittest.TestCase):
         from fastapi import FastAPI
         from fastapi.testclient import TestClient
         from app.api import router
-        settings.update({"providerLlmApiKey": self.SECRET})
+        settings.update({"providerAsrApiKey": self.SECRET})
         app = FastAPI()
         app.include_router(router)
         client = TestClient(app)
@@ -440,12 +336,12 @@ class SecretHandlingTests(unittest.TestCase):
         from fastapi import FastAPI
         from fastapi.testclient import TestClient
         from app.api import router
-        settings.update({"providerLlmApiKey": self.SECRET})
+        settings.update({"providerAsrApiKey": self.SECRET})
         app = FastAPI()
         app.include_router(router)
         client = TestClient(app)
         payload = {r["key"]: r["value"] for r in client.get("/api/settings").json()["settings"]}
-        payload["providerLlmApiKey"] = ""                 # 遮罩后的空串（最危险的那个）
+        payload["providerAsrApiKey"] = ""                 # 遮罩后的空串（最危险的那个）
         payload["userLocation"] = "北京"
         # 整批保存若真的改了智能体/路由/唤醒那几个键，联动会去碰真实的 harness 进程、
         # dsh-failover/config.json 与 DSH 家目录（app/settings_effects.py）——
@@ -453,11 +349,11 @@ class SecretHandlingTests(unittest.TestCase):
         with patch("app.settings_effects.apply", lambda updated: []):
             r = client.put("/api/settings", json={"values": payload})
         self.assertEqual(r.status_code, 200, r.text)
-        self.assertEqual(settings.get("providerLlmApiKey"), self.SECRET,
+        self.assertEqual(settings.get("providerAsrApiKey"), self.SECRET,
                          "整批保存后密钥被清掉了 —— 这正是要防的事故")
 
     def test_secret_never_reaches_the_provider_catalog(self):
-        settings.update({"providerLlmApiKey": self.SECRET})
+        settings.update({"providerAsrApiKey": self.SECRET})
         self.assertNotIn(self.SECRET, json.dumps(P.catalog(ready=False), ensure_ascii=False))
 
 
@@ -507,39 +403,12 @@ class OnlineProviderTests(unittest.TestCase):
         _StubOpenAI.status = 200
         _StubOpenAI.reply = {"choices": [{"message": {"content": "纪要正文"}}]}
         _StubOpenAI.asr_reply = {"text": "转写文本"}
-        self.cfg = {"providerLlmBaseUrl": self.base, "providerLlmApiKey": "k-llm",
-                    "providerLlmModel": "deepseek-chat",
-                    "providerAsrBaseUrl": self.base, "providerAsrApiKey": "k-asr",
+        self.cfg = {"providerAsrBaseUrl": self.base, "providerAsrApiKey": "k-asr",
                     "providerAsrModel": ""}
         self.patcher = patch("app.config.settings.get",
                              lambda k, d=None: self.cfg.get(k, d))
         self.patcher.start()
         self.addCleanup(self.patcher.stop)
-
-    def test_llm_chat_uses_config_and_returns_content(self):
-        out = online_mod.OpenAICompatLlmProvider().chat([{"role": "user", "content": "写纪要"}])
-        self.assertEqual(out, "纪要正文")
-        sent = _StubOpenAI.seen[0]
-        self.assertEqual(sent["path"], "/v1/chat/completions")
-        self.assertEqual(sent["auth"], "Bearer k-llm")
-        self.assertIn(b"deepseek-chat", sent["body"])
-
-    def test_llm_ready_reflects_configuration(self):
-        self.assertTrue(online_mod.OpenAICompatLlmProvider().ready())
-        self.cfg["providerLlmBaseUrl"] = ""
-        self.assertFalse(online_mod.OpenAICompatLlmProvider().ready())
-
-    def test_llm_without_base_url_gives_a_clear_error(self):
-        self.cfg["providerLlmBaseUrl"] = ""
-        with self.assertRaises(RuntimeError) as cm:
-            online_mod.OpenAICompatLlmProvider().chat([{"role": "user", "content": "x"}])
-        self.assertIn("在线 LLM 地址", str(cm.exception))
-
-    def test_llm_http_error_raises(self):
-        _StubOpenAI.status = 401
-        with self.assertRaises(RuntimeError) as cm:
-            online_mod.OpenAICompatLlmProvider().chat([{"role": "user", "content": "x"}])
-        self.assertIn("401", str(cm.exception))
 
     def test_asr_uploads_multipart_with_model_and_language(self):
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as fh:
@@ -590,21 +459,15 @@ class OnlineProviderTests(unittest.TestCase):
             online_mod.OpenAICompatAsrProvider().transcribe(wav)
         self.assertIn("500", str(cm.exception))
 
-    def test_online_providers_are_registered_and_labelled(self):
-        for kind, pid in (("llm", "openai-llm"), ("asr", "openai-asr")):
-            with self.subTest(provider=pid):
-                spec = P.describe(kind, pid)
-                self.assertTrue(spec["egress"])
-                self.assertTrue(spec["egress_note"])
-                self.assertEqual(spec["source"], "online")
+    def test_online_asr_is_registered_and_labelled(self):
+        spec = P.describe("asr", "openai-asr")
+        self.assertTrue(spec["egress"])
+        self.assertTrue(spec["egress_note"])
+        self.assertEqual(spec["source"], "online")
 
     def test_asr_egress_note_mentions_audio_upload(self):
         """最容易忽略的出网：会议音频是**整段**上传的，必须写明。"""
         self.assertIn("音频", P.describe("asr", "openai-asr")["egress_note"])
-
-    def test_active_llm_can_be_pointed_at_the_online_provider(self):
-        self.cfg["providerLlm"] = "openai-llm"
-        self.assertEqual(P.active_id("llm"), "openai-llm")
 
 
 class PresetTests(unittest.TestCase):
@@ -719,7 +582,7 @@ class PanelWiringTests(unittest.TestCase):
         self.assertIn("AI组件 → 高级", self.js, "要留一句指路：改在哪里")
 
     def test_provider_settings_live_in_the_ai_card(self):
-        """这 8 个 provider 键**现在由「设置 → AI组件 → 高级 → 在线服务」承载**（可见、可改）。
+        """这 4 个 **ASR provider 键**由「设置 → AI组件 → 高级 → 在线服务」承载（可见、可改）。
 
         2026-10-02（用户："AI组件那边的各项内容都是能力选择上的配置，业务设置里的配置是
         业务特征的设置"）：旧断言要求它们 `hidden=True`（"隐藏 + 由能力页签的卡片承载"），
@@ -730,9 +593,7 @@ class PanelWiringTests(unittest.TestCase):
         from app.config import DEFAULTS
         ai = self.js[self.js.index('{ id: "ai", title: "AI 组件"'):]
         ai = ai[:ai.index('{ id: "keys"')]
-        for key in ("providerAsr", "providerLlm",
-                    "providerLlmBaseUrl", "providerLlmApiKey", "providerLlmModel",
-                    "providerAsrBaseUrl", "providerAsrApiKey", "providerAsrModel"):
+        for key in ("providerAsr", "providerAsrBaseUrl", "providerAsrApiKey", "providerAsrModel"):
             with self.subTest(key=key):
                 meta = DEFAULTS.get(key)
                 self.assertIsNotNone(meta, "%s 必须存在" % key)
@@ -755,12 +616,12 @@ class PanelWiringTests(unittest.TestCase):
         r = TestClient(app).get("/api/providers/config")
         self.assertEqual(r.status_code, 200, r.text)
         rows = {s["key"]: s for s in r.json()["settings"]}
-        for key in ("providerAsr", "providerLlm", "providerLlmBaseUrl",
-                    "providerLlmApiKey", "providerAsrApiKey"):
+        for key in ("providerAsr", "providerAsrBaseUrl",
+                    "providerAsrApiKey", "providerAsrModel"):
             self.assertIn(key, rows)
-        self.assertTrue(rows["providerLlmApiKey"]["secret"])
-        self.assertEqual(rows["providerLlmApiKey"]["value"], "")
-        self.assertIn("hasValue", rows["providerLlmApiKey"])
+        self.assertTrue(rows["providerAsrApiKey"]["secret"])
+        self.assertEqual(rows["providerAsrApiKey"]["value"], "")
+        self.assertIn("hasValue", rows["providerAsrApiKey"])
         self.assertNotIn("sk-", json.dumps(r.json()))
         # TTS：ttsEngine 以"只读"随卡片下发（卡片只显示当前实现，编辑仍在设置里）
         self.assertIn("ttsEngine", rows)

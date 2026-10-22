@@ -539,95 +539,19 @@ PHASE_ORDER = ("config", "engines", "accel", "fallback")
 
 PLAN_BUILD_SCHEMA = "echo-wizard-build/1"
 
-#: S6 就地填的三样 → provider 声明里的键名后缀（`providerLlmBaseUrl` / `…ApiKey` / `…Model`）。
-#: 按**后缀**匹配而不是写死整串：前缀（providerLlm / providerAsr）属于 provider 的命名空间。
-_CRED_FIELDS = (("baseUrl", "BaseUrl"), ("apiKey", "ApiKey"), ("model", "Model"))
-
-#: S6 打开"直连兜底"（`llm.direct`）时落到这一个（单上游直连）。
-#: 多上游派发是「ECHO AUTO」那套的事，向导不替用户改（用户显式选了 provider 就以他为准）。
-#: 注意它**不会**因为"填了地址"就自动生效 —— 见 `llm_provider_id()` 的说明。
-DEFAULT_ONLINE_LLM = "openai-llm"
-
-
-def llm_choice(choices: dict) -> dict:
-    """S6 的选择（provider + 地址/密钥/模型）。容错：不是 dict 就当没填。"""
-    llm = (choices or {}).get("llm") or {}
-    return llm if isinstance(llm, dict) else {}
-
-
-def llm_provider_id(choices: dict) -> str:
-    """S6 的**直连兜底**用哪个 provider —— **只有用户显式打开才写**，不自动默认。
-
-    2026-09-20 用户定调：纪要、归档、语音指令**默认都走智能体**（只有它有 skill 机制做
-    灵活扩展），直连大模型只是"不装智能体"时的兜底，**不推荐**。
-
-    纪要在 `meeting.direct_llm_decision()` 里本来就是 **agent-first**（agent 可用就走 agent，
-    直连只在 agent 不可用时生效）—— 所以这里的关键不是"抢不抢 agent 的活"，而是
-    **别把一个用户没做过的选择写进设置**：他只是随手填了地址，向导就替他选定
-    "没有智能体时用哪个直连 provider"，还把它写进了 `providerLlm`（一个全局的、别的功能
-    也会读的开关）。所以必须由用户明确打开。
-    """
-    llm = llm_choice(choices)
-    explicit = str(llm.get("provider", "") or "").strip()
-    if explicit:
-        return explicit
-    # 前端只表达"我要用直连兜底"（`llm.direct`）；provider id 留在后端，不进 JS。
-    return DEFAULT_ONLINE_LLM if llm.get("direct") else ""
-
-
-def llm_configured(choices: dict) -> bool:
-    """直连兜底是否**可用**：显式打开了它，且地址与密钥都填全。
-
-    只认"填全"：半填的配置一旦写进 `providerLlm`，会把纪要**强制**从智能体切到直连
-    却用不了 —— 比不配更糟。
-
-    **密钥可以来自库里**（2026-09-28）：计划文件不落密钥，所以"重开面板"之后
-    `choices.llm.apiKey` 必然是空的 —— 而"地址在计划里、密钥已经在设置里"是完全正常的
-    状态。不认这一条就会误报"不能自动写纪要"（假坏消息比没有消息更糟）。
-    """
-    llm = llm_choice(choices)
-    provider = llm_provider_id(choices)
-    if not provider:
-        return False
-    if not str(llm.get("baseUrl", "") or "").strip():
-        return False
-    key = str(llm.get("apiKey", "") or "").strip()
-    if not key:
-        key = _settings(_declared_credential_key("llm", provider, "ApiKey"))
-    return bool(key)
-
-
-def _declared_credential_key(kind: str, provider_id: str, suffix: str) -> str:
-    """provider 自己声明的那把密钥设置键叫什么（向导不发明键名，也不猜）。"""
-    keys = _provider_spec(kind, provider_id).get("settings") or []
-    return next((str(k) for k in keys if str(k).endswith(suffix)), "")
+#: 2026-10-22：S6 不再有"直连 LLM 兜底"。纪要 / 推理 / 归档一律走配置的智能体，
+#: ECHO 不直连任何 LLM；`echo-auto` 只是给智能体用的模型路由（`app/llm_router.py`）。
+#: 这里保留 `minutes_capable` 作为"末页能不能说会写纪要"的唯一判据。
 
 
 def minutes_capable(choices: dict) -> bool:
-    """「能不能自动写纪要」：**有智能体**（默认路径）或直连兜底可用。
+    """「能不能自动写纪要」：**只看有没有选智能体**。
 
     纪要不只看"有没有模型"：归档（写进笔记库）与语音指令都依赖智能体的 skill 机制，
-    所以默认路径是智能体；直连只是兜底。
+    所以唯一判据是配置的智能体；没有智能体时如实告诉用户"还差这一步"，
+    不再用直连 LLM 兜底（那条路 2026-10-22 已删除）。
     """
-    return bool(str((choices or {}).get("agent", "") or "").strip()) or llm_configured(choices)
-
-
-def _credential_rows(kind: str, provider_id: str, values: dict) -> list:
-    """把就地填的地址/密钥/模型落到**该 provider 自己声明**的设置键上（空值跳过）。
-
-    provider 声明了什么键就写什么键 —— 向导不发明键名（声明见
-    `app/providers/openai.py` 的 `details.settings`）。
-    """
-    keys = _provider_spec(kind, provider_id).get("settings") or []
-    rows = []
-    for field, suffix in _CRED_FIELDS:
-        value = str((values or {}).get(field, "") or "").strip()
-        if not value:
-            continue                       # 空值不覆盖已有配置（与下面位置项同一规矩）
-        key = next((k for k in keys if k.endswith(suffix)), "")
-        if key:
-            rows.append({"key": key, "value": value})
-    return rows
+    return bool(str((choices or {}).get("agent", "") or "").strip())
 
 
 def _agent_backend_rows(choice: str) -> list:
@@ -768,11 +692,7 @@ def _setting_updates(choices: dict) -> list:
         rows.append({"key": "providerAsr", "value": "openai-asr"})
     # 会议转写走哪条路（2026-09-28）：见 `_meeting_route_rows` 的说明。
     rows += _meeting_route_rows(choices)[0]
-    llm_provider = llm_provider_id(choices)
-    if llm_provider:
-        rows.append({"key": "providerLlm", "value": llm_provider})
-        # S6 就地填的地址/密钥/模型（键名来自 provider 自己的声明，见 _credential_rows）
-        rows += _credential_rows("llm", llm_provider, llm_choice(choices))
+    # 注意：这里**没有** providerLlm 一类写入。推理只走智能体，ECHO 不直连 LLM。
     # 其余任意设置：键名由调用方原样传入（向导不猜）
     extra = choices.get("extraSettings") or {}
     if isinstance(extra, dict):
@@ -883,11 +803,7 @@ def build_plan(choices: dict) -> dict:
         spec = _provider_spec("asr", "openai-asr")
         if spec:
             providers.append(spec)
-    llm_provider = llm_provider_id(choices)
-    if llm_provider:
-        spec = _provider_spec("llm", llm_provider)
-        if spec:
-            providers.append(spec)
+    # 没有 "llm provider" 这一项：推理只走智能体，ECHO 不直连 LLM。
 
     todo = [d for d in downloads if d.get("ready") is not True]
     total = sum(int(d.get("approxMb") or 0) for d in downloads)
@@ -896,8 +812,8 @@ def build_plan(choices: dict) -> dict:
     missing = []
     if not minutes_capable(choices):
         missing.append({"feature": "自动写会议纪要",
-                        "reason": "纪要由智能体负责（归档和语音指令也走它，靠技能扩展）；"
-                                  "直连一个 AI 服务是不推荐的兜底",
+                        "reason": "纪要、总结与归档都由**配置的智能体**完成；"
+                                  "ECHO 不直连任何 LLM，没有智能体就没有推理能力",
                         "fix": "回到向导第 8 步准备智能体"})
     if not str(choices.get("agent", "") or "").strip():
         missing.append({"feature": "让 ECHO 帮你动手（整理笔记、操作文件）",

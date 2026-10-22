@@ -468,7 +468,7 @@ class RoundTripTests(unittest.TestCase):
                     self.assertEqual(row["value"], want, "%s 接口读回的值不对" % key)
 
     def test_secrets_can_be_cleared_explicitly(self):
-        key = "providerLlmApiKey"
+        key = "providerAsrApiKey"
         with _quiet_side_effects():
             self.client.put("/api/settings", json={"values": {key: "sk-probe-123"}})
         self.assertEqual(settings.get(key), "sk-probe-123")
@@ -714,37 +714,19 @@ class OptionAndPanelWiringTests(unittest.TestCase):
                       "能力页签只放转写与朗读；语言模型在「模型路由」页签里")
         self.assertIn("capCompsOf", js, "组件按 kind 归到对应能力卡里")
 
-    def test_language_model_block_lives_in_the_agent_tab(self):
-        """语言模型（用哪个实现 + 在线服务）与路由的成员/优先级在同一页（2026-09-19 用户要求）。
+    def test_language_model_block_is_gone(self):
+        """2026-10-22：ECHO 不直连 LLM，模型路由页不再有「语言模型 provider」块。
 
-        理由：LLM 的"用哪个实现"和路由的上游配置是同一件事 —— ECHO AUTO 的成员本来就在
-        这一页配，分两处只会互相找不着。
-
-        本用例改过几次断言，都是"旧结构"：
-          * 2026-09-25：那一页从「模型路由」改名成「智能体」（id `view-agent`）；
-          * 2026-09-25 同日：语言模型 / 通道成员 / 派发情况**合成一张卡**（用户要求），
-            所以"语言模型块排在 `rtBadge` 之前"这条不再成立（`rtBadge` 现在在卡标题里）。
-            意图不变：**先"用哪个实现"，再配通道成员** —— 改成比"`rtLlmHost` 在 `rtMembers` 之前"。
-          * 2026-09-26 IA 重构：那一页叫「能力与智能体」，id 仍是 `capability`
-            （深链 `?view=agent` 由 VIEW_ALIASES 折算过去）。
-          * 2026-10-02 IA 重构：那一页并进顶层「设置」（`id="view-settings"`），
-            `#view-capability` 已删除 —— 这里改用 `_view_block()` 按新的 `#view-settings`
-            取段落（同样只做"在这页里"的存在性判定，比 `index()` 更结实：视图被拆/搬走时
-            是断言失败而不是 `ValueError`）。
+        保留的只有**给智能体用的模型路由**（通道成员/优先级 + 7 项参数）；
+        `rtLlmHost` / `loadRouterLlm` / `capProviderBlock("llm")` 都必须删除。
         """
         js = _read(os.path.join("web", "app.js"))
         html = _read(os.path.join("web", "index.html"))
-        self.assertIn('id="rtLlmHost"', html)
-        self.assertIn('id="rtLlmHost"', _view_block(html, "settings"),
-                      "语言模型块要在「设置」页签里")
-        self.assertLess(html.index('id="rtLlmHost"'), html.index('id="rtMembers"'),
-                        "「语言模型」小节要排在「通道成员」小节之前（先选用哪个，再配通道）")
-        self.assertIn("function loadRouterLlm", js)
-        self.assertIn('capProviderBlock("llm")', js, "复用同一套渲染（状态/出网图标/在线服务字段）")
-        self.assertIn("loadRouterLlm();", js.split("async function loadRouter()")[1][:1200],
-                      "切到模型路由页签时要一并渲染语言模型块")
-        self.assertNotIn('title: "语言模型"', js, "能力页签不该再有语言模型卡")
-        # 两个页签共用同一份 provider 数据（不许各拉一遍），改完实现只刷当前那一页
+        self.assertNotIn('id="rtLlmHost"', html, "语言模型 provider 块必须删除")
+        self.assertNotIn("function loadRouterLlm", js)
+        self.assertNotIn('capProviderBlock("llm")', js)
+        self.assertNotIn("loadRouterLlm();", js)
+        self.assertIn('id="rtMembers"', html, "给智能体用的通道成员仍要在")
         self.assertIn("function ensureProviderData", js)
         self.assertIn("refreshAfterProviderChange", js)
 

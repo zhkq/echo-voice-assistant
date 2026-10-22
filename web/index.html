@@ -157,9 +157,11 @@
     </div>
     <div class="ssetpane" data-settab-pane="settings"><div id="setPaneSettings"></div></div>
 
-    <!-- ====== 模型路由：语言模型 + 通道成员 + 派发情况 **合成一张卡**（2026-09-25 用户要求）======
+    <!-- ====== 模型路由：通道成员 + 派发情况 **合成一张卡**（2026-09-25 用户要求）======
+         2026-10-22：这张卡里的「语言模型 provider」块已删除。ECHO 不直连 LLM；
+         这里的成员是**给配置的智能体用的模型路由**（`echo-auto`），不是 ECHO 的推理入口。
          卡内分层用二级分组小卡片（`.ssub`，与设置卡片同一套）；7 项路由参数在「高级」里。
-         这些 host 是**静态**的：`loadRouter()` / `loadRouterLlm()` / `renderRouter*()` 都按 id 渲染 ——
+         这些 host 是**静态**的：`loadRouter()` / `renderRouter*()` 都按 id 渲染 ——
          静态放着就不会被 `loadSettings()` 的重绘冲掉（两边的请求是并发的，动态渲染会互相覆盖）。
          只有「高级」里的那 7 行参数由 renderSettingsPanes() 填进 `#rtSetHost`。
          卡内的「保存」= 这张卡里的全部改动（成员/优先级 + 7 项参数），页签顶部的「保存」只管
@@ -172,7 +174,7 @@
          data-collapse-default="closed">
       <div class="card-title"><span class="set-arrow">▶</span><span class="ic">🛰️</span>模型路由 <span class="muted">(Agent 的能力)</span>
         <span class="badge idle" id="rtBadge">检查中…</span>
-        <span class="sq" role="button" tabindex="0" aria-label="说明">?<span class="spop">这一张卡管三件事：<b>语言模型</b>（用哪个实现 + 在线服务）、<b>通道成员</b>（顺序 = 优先级）、<b>派发情况</b>（命中与成功率），以及「高级」里的 <b>7 项路由参数</b>。会议那条路（转写 / 分离 / 声纹由谁做）在「业务配置 → 会议」里。</span></span>
+        <span class="sq" role="button" tabindex="0" aria-label="说明">?<span class="spop">这一张卡管两件事：<b>通道成员</b>（顺序 = 优先级；这些是给智能体用的模型路由，不是 ECHO 自己直连 LLM）、<b>派发情况</b>（命中与成功率），以及「高级」里的 <b>7 项路由参数</b>。会议那条路（转写 / 分离 / 声纹由谁做）在「业务配置 → 会议」里。</span></span>
         <span class="spacer"></span>
         <a class="rt-link" id="rtDashLink" href="#" target="_blank" rel="noopener"
            title="打开路由自带页面：命中统计与切换历史">仪表盘 ↗</a>
@@ -181,14 +183,9 @@
         <!-- 概要行：DSH 模型是哪个 / 几路启用 / 上下文 / 注册到了哪些家目录 -->
         <div class="rt-reg muted" id="rtReg">加载中…</div>
 
-        <!-- 二级分组：与 app.js 的 `sSub()` 生成的同一套标记（头 + 内容包成一张内嵌小卡片） -->
-        <div class="ssub collapsible" data-collapse-id="ssub-语言模型">
-          <div class="ssub-h"><span>语言模型</span><span class="ssub-chev" aria-hidden="true"><svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M6 6.5 12 11l6-4.5"/><path d="M6 13.5 12 18l6-4.5"/></svg></span></div>
-          <div class="ssub-body">
-          <div class="sset-hint">生成纪要靠它；不装智能体也能出纪要。选中即生效；密钥只存本机、接口永不回显。</div>
-          <div id="rtLlmHost" class="cap-prov"></div>
-        </div>
-          </div>
+        <!-- 2026-10-22：原先这里还有「语言模型（用哪个实现 + 在线服务）」二级分组。
+             推理已全部交给配置的智能体，ECHO 不再直连 LLM；`echo-auto` 只是下面
+             「通道成员」那套给智能体用的模型路由，所以这一块整段删除。 -->
 
         <div class="ssub collapsible" data-collapse-id="ssub-通道成员">
           <div class="ssub-h"><span>通道成员（顺序 = 优先级）</span><span class="ssub-chev" aria-hidden="true"><svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M6 6.5 12 11l6-4.5"/><path d="M6 13.5 12 18l6-4.5"/></svg></span></div>

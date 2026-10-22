@@ -165,28 +165,20 @@ class StartFailoverTests(unittest.TestCase):
 
 
 class ProviderBoundaryTests(unittest.TestCase):
-    """D25 的"路由 = LLM provider 的一种实现"这条边界要可查。"""
+    """2026-10-22 边界：`echo-auto` 是**智能体的模型路由**，不是 ECHO 的 LLM provider。
 
-    def test_echo_auto_is_registered_as_a_llm_provider(self):
+    路由本体（`app.llm_router` / `dsh-failover`）仍然存在并注册进 DSH；
+    但 ECHO 的 provider 注册表里不能再出现 `llm` kind —— 否则又会有人从 ECHO 侧直连。
+    """
+
+    def test_echo_auto_is_not_an_echo_llm_provider(self):
         from app import providers as P
-        spec = P.describe("llm", "echo-auto")
-        self.assertIsNotNone(spec, "多上游派发必须以 LLM provider 的形式存在")
-        self.assertEqual(spec["kind"], "llm")
-        self.assertTrue(spec["egress"], "内容会发到上游，必须标出网")
-        self.assertIn("上游", spec["egress_note"])
-        self.assertIn("echo-auto", [p["id"] for p in P.specs("llm")])
+        self.assertEqual(P.specs("llm"), [], "ECHO 不应再注册任何 LLM provider")
+        self.assertIsNone(P.describe("llm", "echo-auto"))
 
-    def test_router_provider_is_usable_without_any_agent(self):
-        """provider 的调用面不依赖 app.agents（纪要直连那条路就靠这个）。"""
-        from app.providers import router as router_mod
-        inst = router_mod.EchoAutoLlmProvider()
-        self.assertTrue(callable(getattr(inst, "chat", None)))
-        self.assertTrue(hasattr(inst, "base_url"))
-        # ready() 只问路由进程，不碰 agent
-        with patch("app.failover_proxy.proxy_online", lambda timeout=1.0: True), \
-                patch("app.agents.get_agent",
-                      side_effect=AssertionError("provider 不该碰 agent 注册表")):
-            self.assertTrue(inst.ready())
+    def test_no_llm_kind_in_catalog(self):
+        from app import providers as P
+        self.assertNotIn("llm", [k["id"] for k in P.catalog(ready=False)["kinds"]])
 
 
 if __name__ == "__main__":

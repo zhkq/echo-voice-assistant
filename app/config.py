@@ -893,21 +893,14 @@ DEFAULTS = {
                                      "才需要填它打印出来的 token；ECHO 自己拉起时会自动获取。"
                                      "留空 = 不改动已配置的值",
                          value_type="str", hidden=True, secret=True),
-    # ---------- 能力 provider（P5 / D25：ASR / LLM / TTS 各选一个）----------
-    # 留空 = 用该 kind 的默认实现（本地转写引擎 / ECHO AUTO 多上游路由 / 本平台离线朗读）。
+    # ---------- 能力 provider（P5：ASR / TTS 各选一个）----------
+    # 留空 = 用该 kind 的默认实现（本地转写引擎 / 本平台离线朗读）。
     # 可选项是**运行时**注册出来的（见 GET /api/providers），所以这里不写死 options。
-        # 2026-10-02（IA 重构）：provider 这一族**从 hidden 放出来** —— 用户的口径是
-    # "AI组件那边的各项内容都是能力选择上的配置（用在线还是本机）"，所以这些键现在由
-    # 「设置 → AI组件 → 高级 → 在线服务」承载，必须经 /api/settings 下发才渲染得出来。
-    # 旧口径（同日早先）是"隐藏 + 由能力页签的卡片承载"，那张卡已经改成只读状态显示了。
-    # `providerTts` 例外：它与 ttsEngine 重复，**保持 hidden + deprecated**。
+    # 2026-10-22：**没有 `providerLlm*`** —— ECHO 不直接连 LLM，纪要与一切推理都发给
+    # 配置的智能体；`echo-auto` 只是给智能体用的模型路由（`app/llm_router.py`），不是 ECHO 的设置项。
     "providerAsr": dict(value="", grp="provider", label="转写 provider", hidden=False,
                         description="留空 = 默认的本地转写引擎。在下方「能力 provider」卡片里选，"
                                     "或在这里填 provider id（见 GET /api/providers）",
-                        value_type="str"),
-    "providerLlm": dict(value="", grp="provider", label="语言模型 provider", hidden=False,
-                        description="留空 = ECHO AUTO（多上游派发路由）。配了它，纪要不依赖 agent 也能生成；"
-                                    "在下方「能力 provider」卡片里选",
                         value_type="str"),
     "providerTts": dict(value="", grp="provider", label="朗读 provider", hidden=True,
                         deprecated=True,
@@ -916,22 +909,9 @@ DEFAULTS = {
                                     "（配了 providerTts 时 ttsEngine=off 关不掉朗读）。"
                                     "2026-09-19 起只保留 ttsEngine；本项的值已自动搬到 ttsEngine",
                         value_type="str"),
-    # ---- 在线服务预设（P5）：一个 OpenAI 兼容端点 + 一把密钥 ----
-    # 这三项就是"配一个在线 LLM"的全部输入；配好把 providerLlm 指向 openai-llm 即生效。
+    # ---- 在线服务预设（P5）：一个 OpenAI 兼容 ASR 端点 + 一把密钥 ----
     # 内网网关地址**不写进仓库**（属单位内部信息，见 REFACTOR-PLAN §13.4）：
     # 面板给"内网网关"预设时留空 base_url，让用户自己填。
-    "providerLlmBaseUrl": dict(value="", grp="provider", label="在线 LLM 地址", hidden=False,
-                               description="OpenAI 兼容端点的根地址，例如 https://api.deepseek.com/v1"
-                                           "（内网网关填单位自己的地址；留空 = 不用在线 LLM）。"
-                                           "可用下方「能力 provider」卡片的预设一键填入",
-                               value_type="str"),
-    "providerLlmApiKey": dict(value="", grp="provider", label="在线 LLM 密钥", hidden=False,
-                              description="只保存在本机数据库；接口（含面板）永不回显。"
-                                          "留空 = 不改；要清空请点「清除」。数据去向见「在线 LLM 地址」",
-                              value_type="str", secret=True),
-    "providerLlmModel": dict(value="", grp="provider", label="在线 LLM 模型名", hidden=False,
-                             description="留空 = 用服务端默认（如 deepseek-chat / gpt-4o-mini）",
-                             value_type="str"),
     "providerAsrBaseUrl": dict(value="", grp="provider", label="在线转写地址", hidden=False,
                                description="OpenAI 兼容的 /audio/transcriptions 根地址"
                                            "（例如 https://api.openai.com/v1）；留空 = 不用在线转写",

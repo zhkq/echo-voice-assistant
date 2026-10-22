@@ -3,12 +3,11 @@
 
 ## 修的是什么（这条风险是复核另一件事时顺出来的）
 
-纪要生成有**两条写盘点**，都在 `app/meeting.py`：
+纪要生成**只有一条写盘点**（2026-10-22 直连 LLM 已删除）：
 
-  * agent（DSH）路径 `_spawn_summary_waiter._run()`；
-  * 直连 LLM 兜底 `_spawn_provider_summary._run()`。
+  * agent（配置的智能体）路径 `_spawn_summary_waiter._run()`。
 
-两处写盘**之前**的守卫是：① 回复非空且长度 > 10；② `_looks_placeholder(reply)` 拦"占位话"。
+写盘**之前**的守卫是：① 回复非空且长度 > 10；② `_looks_placeholder(reply)` 拦"占位话"。
 **但**模型整段只回"开场白 + 一段元数据 JSON"时（长度 > 80，**占位判据拦不住**），
 经 `_strip_summary_head`（剪开场白/去元数据）之后**正文可能只剩空白** ——
 旧代码照样 `open(path, "w")`，**把旧的（很可能正是用户想要的那份）纪要覆盖成空白**。
@@ -16,8 +15,8 @@
 
 ## 修法与取舍（判据就钉在这里）
 
-抽一个两条路**共用**的落盘判据 `app/meeting.py::_write_summary_body`（"复制一份到两条路
-= 将来只修好一条"），语义三种：
+抽一个**唯一**的落盘判据 `app/meeting.py::_write_summary_body`（"复制一份 = 将来只修好
+一条"），语义三种：
 
   1. 新正文**非空白** → 照旧写盘；
   2. 新正文**空白** 且 目标文件**已有非空白内容** → **不覆盖**（一个字都不动）+ warn，
@@ -35,16 +34,16 @@
    * 任务允许两种语义，这里选**改动面最小**的那种：只把"没产出"如实记进日志
      （**不静默**），不动落盘行为；真正要防的"覆盖已有好纪要"由情形 2 挡住。
 
-## 用例覆盖（两条路都要）
+## 用例覆盖
 
-  * 已有好纪要 + 本次空白 → 原文**逐字不变** + warn 日志（两条路各一条）；
-  * 本来没有纪要 + 本次空白 → 不产生"看起来成功"的空白纪要 + **事件不发** + warn 日志（两条路各一条）；
+  * 已有好纪要 + 本次空白 → 原文**逐字不变** + warn 日志；
+  * 本来没有纪要 + 本次空白 → 不产生"看起来成功"的空白纪要 + **事件不发** + warn 日志；
   * 已有**空白**文件 + 本次空白 → 同样按"没有可保留的内容"处理（保持"写 + 告警"）；
   * 正常非空生成 → 照旧写盘、照旧发事件（**回归**，别把功能修坏）。
 
 隔离：临时库（`db.DATA_DIR` / `db.DB_FILE`）＋ 临时会议目录，**绝不写进真库/真会议目录**。
 打桩方式照 `tests/test_summary_ready_event.py`（那个文件**只读不改**）：`get_client` /
-`_summary_session` / `_llm_provider_for_summary` 三个桩，桩**覆盖线程整个生命期**
+`_summary_session` 两个桩，桩**覆盖线程整个生命期**
 （`addCleanup` 才撤），否则异步线程会去碰真的 DSH 客户端。
 """
 import os
@@ -102,18 +101,6 @@ class _FakeClient:
 
     def wait_for_reply(self, sid, timeout=0, poll=0):
         return (self.reply, True)
-
-
-class _FakeLlm:
-    """直连 LLM provider 替身（只用到 `chat`）。"""
-
-    def __init__(self, reply):
-        self.reply = reply
-        self.calls = []
-
-    def chat(self, messages, timeout=60, **kw):
-        self.calls.append({"messages": messages, "timeout": timeout})
-        return self.reply
 
 
 class SummaryBlankGuardTests(unittest.TestCase):
@@ -187,12 +174,6 @@ class SummaryBlankGuardTests(unittest.TestCase):
         self._patch("_summary_session", lambda client, mid: "sid-1")
         self._patch("_refresh_archived_note", lambda mid: None)   # 别去碰归档材料
         meeting._spawn_summary_waiter(meeting_id, self.folder, out_name, "写纪要", "纪要")
-        return before
-
-    def _start_provider_waiter(self, meeting_id, reply):
-        before = set(threading.enumerate())
-        self._patch("_llm_provider_for_summary", lambda: (_FakeLlm(reply), "openai-llm"))
-        meeting._spawn_provider_summary(meeting_id, self.folder)
         return before
 
     def _drain(self, before, timeout=5.0):
@@ -270,20 +251,6 @@ class SummaryBlankGuardTests(unittest.TestCase):
         self.assertEqual(old, self._read(), "旧纪要必须逐字不变（这是数据丢失那道闸）")
         self.assertEqual([], self._summary_events(), "没写就没成稿，不许发「纪要好了」")
 
-    def test_provider_path_keeps_the_existing_summary_byte_for_byte(self):
-        """直连 LLM 路径：同样"空白不许覆盖已有纪要" + warn。（两条路必须都有这道闸）"""
-        old = ("# %s\n\n## 旧纪要（直连路径）\n\n"
-               "同样一个字都不许变。\n" % 9203)
-        self._write_old(old)
-
-        before = self._start_provider_waiter(9203, BLANK_ENDING_REPLY)
-        got = self._wait(lambda: any("不覆盖" in m for m in self._warns()), "不覆盖那条 warn")
-        self._drain(before)
-        self.assertTrue(got, "不覆盖必须告警（不许静默）：%s" % self.logs)
-
-        self.assertEqual(old, self._read(), "旧纪要必须逐字不变（直连路径同样）")
-        self.assertEqual([], self._summary_events(), "没写就不许发「纪要好了」")
-
     # ------------------------------------------------ 2) 本来没有纪要 + 本次空白
 
     def test_agent_path_produces_nothing_that_looks_like_a_summary(self):
@@ -306,20 +273,6 @@ class SummaryBlankGuardTests(unittest.TestCase):
         self.assertFalse(self._read().strip(), "那份文件必须是空白的（没有假正文混进去）")
         self.assertFalse(any("已保留原有纪要" in m for m in self._warns()),
                          "没有旧纪要可保留时不该说「已保留」")
-        self.assertEqual([], self._summary_events(), "空白不是纪要，事件不许发")
-
-    def test_provider_path_produces_nothing_that_looks_like_a_summary(self):
-        """直连路径同理：没有旧纪要时，空白不产生"看起来成功"的纪要，事件也不发。"""
-        self.assertFalse(os.path.exists(self._path()), "前提：本来没有纪要")
-
-        before = self._start_provider_waiter(9204, BLANK_ENDING_REPLY)
-        got = self._wait(lambda: any("未产出" in m for m in self._warns()), "未产出那条 warn")
-        self._drain(before)
-        self.assertTrue(got, "空白没产出必须如实告警：%s" % self.logs)
-
-        self.assertTrue(os.path.isfile(self._path()), "情形 3 保持原行为：写下一个空白文件")
-        self.assertFalse(self._read().strip(), "那份文件必须是空白的")
-        self.assertFalse(any("已保留原有纪要" in m for m in self._warns()), self.logs)
         self.assertEqual([], self._summary_events(), "空白不是纪要，事件不许发")
 
     def test_an_existing_blank_file_is_not_a_summary_to_preserve(self):
@@ -350,15 +303,6 @@ class SummaryBlankGuardTests(unittest.TestCase):
         self.assertEqual(agent_body, self._read(), "非空正文必须照旧写盘")
         self.assertEqual(1, len(self._summary_events()),
                          "写成功照旧要发「纪要好了」：%s" % self._summary_events())
-
-        provider_body = ("# %s\n\n## 二、直连真纪要\n\n"
-                         "这是直连路径的正常产出。\n" % 9207)
-        before = self._start_provider_waiter(9207, provider_body)
-        self.assertTrue(self._wait(lambda: os.path.isfile(self._path()), "直连纪要落盘"))
-        self._drain(before)
-        # 直连路径落盘时会自己补一个结尾换行（`_strip_summary_head(reply) + "\n"`，是既有行为）。
-        self.assertEqual(provider_body + "\n", self._read(), "直连路径的非空正文照旧写盘")
-
     def test_a_real_summary_overwrites_an_old_one_as_before(self):
         """回归：正常的"重新生成"必须**照旧覆盖**旧纪要（不然这次修复就修坏了功能）。"""
         self._write_old("# 9208\n\n## 旧纪要\n\n要被新的替换掉。\n")

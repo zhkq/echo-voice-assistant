@@ -5,15 +5,14 @@
 `EventNotify.summarize()` 里**已经映射**了 `meeting_summary_ready`（标题「会议纪要好了」）。
 但电脑侧**只发过** `meeting_transcribed`（转写正文好了那条），`meeting_summary_ready`
 **从来没发过** → 手机永远收不到"纪要好了"。这次把发射点补在**纪要确认落到 `summary.md`
-之后**（`app/meeting.py::_notify_summary_ready`，两条路都接上：agent 路径
-`_spawn_summary_waiter` 与直连 LLM 兜底 `_spawn_provider_summary`）。
+之后**（`app/meeting.py::_notify_summary_ready`，agent 路径 `_spawn_summary_waiter` 写盘后）。
 
 本文件钉四件事：
   1. **写成功 → 发**：events 里出现 `meeting_summary_ready`，payload 带会议名与会议 id
      （字段名与 `meeting_transcribed` / `meeting_stopped` 一致：安卓按 `payload["meeting"]`
-     取名字），而且**两条路都要有**；
+     取名字）；
   2. **失败/没写出内容 → 一条都不发**（**这条最重要**：挡住"假报"）。失败有好几种形状：
-     等回复超时（`reply` 为空）、只回了"我这就去写"的占位话、provider 不可用、回复过短、
+     等回复超时（`reply` 为空）、只回了"我这就去写"的占位话、回复过短、
      以及"剪掉开场白/元数据之后只剩空白"（等于写了个空文件）；
   3. **`topics.md` 不算**：议题分段是同一条 waiter 写出来的另一个产物，它不是"纪要好了"；
   4. **用临时库隔离**：`db.DATA_DIR` / `db.DB_FILE` 都指到 tmp 再 `db.init()`
@@ -26,8 +25,6 @@
     这种短意图话 = **占位话**（命中 `_looks_placeholder`）。所以这一个桩同时代表成功与两种失败。
   * `meeting._summary_session` → 固定 `sid`：会话的建立与本次事件**无关**（事件不许挂在那里），
     换成假的只影响"用哪个会话发 prompt"，不影响判据。
-  * `meeting._llm_provider_for_summary` → 假 provider（或 `(None, 原因)`）：直连路径里
-    "provider 用不了"与"provider 回了什么"就是成功/失败的分界。
   * `meeting.db.add_log` → 收进列表：不往真日志写，同时给"线程走到哪一步了"留判据
     （失败路径要靠日志确认线程已经收口，才不会把"还没来得及发"误当成"不发"）。
 
@@ -116,18 +113,6 @@ class _FakeClient:
         if self.gate is not None:
             self.gate.wait(5)
         return (self.reply, self.done)
-
-
-class _FakeLlm:
-    """直连 LLM provider 替身（只用到 `chat`）。"""
-
-    def __init__(self, reply):
-        self.reply = reply
-        self.calls = []
-
-    def chat(self, messages, timeout=60, **kw):
-        self.calls.append({"messages": messages, "timeout": timeout})
-        return self.reply
 
 
 class SummaryReadyEventTests(unittest.TestCase):
@@ -239,12 +224,6 @@ class SummaryReadyEventTests(unittest.TestCase):
         meeting._spawn_summary_waiter(meeting_id, self.folder, out_name, "写纪要", "纪要")
         return before
 
-    def _start_provider_waiter(self, meeting_id, provider):
-        before = set(threading.enumerate())
-        self._patch("_llm_provider_for_summary", lambda: provider)
-        meeting._spawn_provider_summary(meeting_id, self.folder)
-        return before
-
     # ---------------------------------------------------------------- 1) 写成功 → 发
 
     def test_agent_path_sends_it_once_the_summary_is_on_disk(self):
@@ -279,17 +258,6 @@ class SummaryReadyEventTests(unittest.TestCase):
         self._wait(lambda: self._file_ready(), "summary.md 落盘")
         self._drain(before)
         self.assertEqual(1, len(self._summary_events()), "写出来之后必须补发这一条")
-
-    def test_the_direct_provider_path_also_sends_it(self):
-        """没装 agent 的机器走直连 LLM 兜底 —— 那条路也必须发，否则还是半截管道。"""
-        mid = 9103
-        before = self._start_provider_waiter(mid, (_FakeLlm(REAL_MINUTES), "openai-llm"))
-        self._wait(lambda: self._file_ready(), "直连路径写 summary.md")
-        self._drain(before)
-        events = self._summary_events()
-        self.assertEqual(1, len(events), "直连路径也要发：%s" % events)
-        self.assertEqual(os.path.basename(self.folder), events[0].get("meeting"))
-        self.assertEqual(mid, events[0].get("id"))
 
     # ---------------------------------------------------------------- 2) 失败 → 一条都不发
 
@@ -326,31 +294,6 @@ class SummaryReadyEventTests(unittest.TestCase):
         self.assertEqual([], self._summary_events(),
                          "只有元数据/开场白的空纪要也是假报，不许发")
 
-    def test_the_direct_provider_path_stays_silent_when_it_fails(self):
-        """直连路径的两种失败：provider 用不了 / 回复过短 —— 一条都不发。"""
-        before = self._start_provider_waiter(9107, (None, "没有可用的 LLM provider"))
-        self._wait(lambda: self._log_has("直连纪要失败"), "provider 不可用那条日志")
-        self._drain(before)
-        self.assertEqual([], self._summary_events(), "provider 用不了时不许发")
-
-        before = self._start_provider_waiter(9117, (_FakeLlm("好的"), "openai-llm"))
-        self._wait(lambda: self._log_has("回复过短"), "回复过短那条日志")
-        self._drain(before)
-        self.assertFalse(self._file_ready(), "过短的回复不该落盘")
-        self.assertEqual([], self._summary_events(), "过短的回复不是纪要，不许发")
-
-    def test_a_failed_provider_stays_silent(self):
-        """provider 抛异常（网络/超时）→ 落盘没发生 → 不许发。"""
-        class _Boom:
-            def chat(self, messages, timeout=60, **kw):
-                raise RuntimeError("网络断了")
-
-        before = self._start_provider_waiter(9108, (_Boom(), "openai-llm"))
-        self._wait(lambda: self._log_has("直连纪要失败"), "异常那条日志")
-        self._drain(before)
-        self.assertFalse(self._file_ready())
-        self.assertEqual([], self._summary_events())
-
     # ---------------------------------------------------------------- 3) topics.md 不算
 
     def test_writing_topics_does_not_count_as_the_summary_being_ready(self):
@@ -373,7 +316,7 @@ class SummaryReadyEventTests(unittest.TestCase):
         mid = 9110
         before = set(threading.enumerate())
         fake = _FakeClient(REAL_MINUTES)
-        self._patch("direct_llm_decision", lambda: (False, "agent 可用"))
+        self._patch("_agent_ready_for_reasoning", lambda: True)
         self._patch("get_client", lambda: fake)
         self._patch("_summary_session", lambda client, mid_: "sid-1")
         self.assertTrue(meeting.request_summary(mid, folder=self.folder))

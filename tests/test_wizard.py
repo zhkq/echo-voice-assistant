@@ -408,68 +408,6 @@ class ExecutePlanTests(_PlanTestCase):
         self.assertTrue(state["summary"].endswith("项已就绪"))
 
 
-class LlmCredentialsTests(_PlanTestCase):
-    """S6：纪要**默认走智能体**，直连大模型是**显式打开**的、不推荐的兜底。
-
-    2026-09-20 用户定调：纪要、归档、语音指令都靠智能体（只有它有 skill 机制做灵活扩展）。
-    这里最要紧的是那条**反面守卫** —— 光填地址/密钥**不许**替用户把 `providerLlm` 写下去：
-    那是个全局开关（别的功能也读），写了就等于替用户选定"没有智能体时用哪个直连 provider"。
-    键名则取自 provider **自己声明**的清单，向导不猜。
-    """
-
-    def _cfg(self, choices):
-        return {r["key"]: r["value"] for r in wizard.build_plan(choices)["config"]}
-
-    def test_filling_the_fields_alone_never_switches_to_direct_llm(self):
-        """**关键回归守卫**：填了地址与密钥、但没打开兜底开关 → 一个 providerLlm* 都不许写。"""
-        cfg = self._cfg({"llm": {"baseUrl": "http://10.1.2.3:8000/v1", "apiKey": "sk-abc"}})
-        for key in ("providerLlm", "providerLlmBaseUrl", "providerLlmApiKey", "providerLlmModel"):
-            self.assertNotIn(key, cfg,
-                             "填了字段就写 %s = 把用户从推荐的智能体路径上踢走" % key)
-
-    def test_explicit_direct_fallback_lands_on_the_declared_keys(self):
-        cfg = self._cfg({"llm": {"direct": True, "baseUrl": "http://10.1.2.3:8000/v1",
-                                 "apiKey": "sk-abc", "model": "deepseek-chat"}})
-        self.assertEqual(cfg["providerLlm"], wizard.DEFAULT_ONLINE_LLM)
-        self.assertEqual(cfg["providerLlmBaseUrl"], "http://10.1.2.3:8000/v1")
-        self.assertEqual(cfg["providerLlmApiKey"], "sk-abc")
-        self.assertEqual(cfg["providerLlmModel"], "deepseek-chat")
-
-    def test_empty_fields_do_not_overwrite_existing_config(self):
-        cfg = self._cfg({"llm": {"direct": True, "baseUrl": "http://x/v1"}})
-        self.assertEqual(cfg["providerLlmBaseUrl"], "http://x/v1")
-        self.assertNotIn("providerLlmApiKey", cfg, "没填密钥就不该写（不覆盖已有配置）")
-        self.assertNotIn("providerLlmModel", cfg)
-
-    def test_explicit_provider_wins_and_undeclared_keys_are_not_invented(self):
-        """显式选了别的 provider 就以他为准；没声明这些键的 provider 更不许瞎写。"""
-        cfg = self._cfg({"llm": {"provider": "echo-auto", "baseUrl": "http://x/v1"}})
-        self.assertEqual(cfg["providerLlm"], "echo-auto")
-        self.assertNotIn("providerLlmBaseUrl", cfg,
-                         "echo-auto 没声明 providerLlm* 这些键 → 向导不该发明键名")
-
-    def test_minutes_need_the_agent_or_an_explicit_fallback(self):
-        """「能不能写纪要」= **有智能体**（默认路径）或打开并填全了直连兜底。"""
-        def missing(choices):
-            return [m["feature"] for m in wizard.build_plan(choices)["missing"]]
-
-        self.assertIn("自动写会议纪要", missing({}), "什么都没配就该提示缺")
-        self.assertNotIn("自动写会议纪要", missing({"agent": "agent-harness"}),
-                         "有智能体就算能写纪要 —— 这就是默认路径")
-        self.assertIn("自动写会议纪要",
-                      missing({"llm": {"baseUrl": "http://x/v1", "apiKey": "k"}}),
-                      "只填字段、没打开开关 ≠ 能写纪要")
-        self.assertNotIn("自动写会议纪要",
-                         missing({"llm": {"direct": True, "baseUrl": "http://x/v1",
-                                          "apiKey": "k"}}),
-                         "打开并填全兜底才算用得上")
-
-    def test_egress_declaration_reaches_the_confirm_page(self):
-        plan = wizard.build_plan({"llm": {"direct": True, "baseUrl": "http://x/v1"}})
-        self.assertEqual([p["id"] for p in plan["providers"]], [wizard.DEFAULT_ONLINE_LLM])
-        self.assertTrue(plan["summary"]["egress"], "在线服务必须在确认页声明出网")
-
-
 class MeetingRouteTests(_PlanTestCase):
     """S8「开会时的录音交给谁」（2026-09-28，设计 §6.6 / 向导 §2.2）。
 
@@ -548,29 +486,21 @@ class SecretsNeverLandInThePlanFileTests(_PlanTestCase):
             "choices": {
                 "agent": "agent-harness",
                 "locations": {"models": "D:/models"},
-                "llm": {"direct": True, "baseUrl": "http://x/v1", "apiKey": "sk-llm-secret",
-                        "model": "m1"},
                 "meeting": {"route": "online", "onlineApiKey": "sk-meeting-secret"},
             }})
         blob = json.dumps(saved, ensure_ascii=False)
-        self.assertNotIn("sk-llm-secret", blob, "LLM 密钥明文落进了计划文件")
         self.assertNotIn("sk-meeting-secret", blob, "在线转写密钥明文落进了计划文件")
         # 键名留着（确认页要列"将写入哪些键"），别的选择一个都不能丢
-        self.assertIn("apiKey", blob)
+        self.assertIn("onlineApiKey", blob)
         self.assertEqual(saved["choices"]["agent"], "agent-harness")
         self.assertEqual(saved["choices"]["locations"]["models"], "D:/models")
-        self.assertEqual(saved["choices"]["llm"]["baseUrl"], "http://x/v1")
-        self.assertEqual(saved["choices"]["llm"]["model"], "m1")
         self.assertEqual(saved["choices"]["meeting"]["route"], "online")
 
     def test_built_config_secrets_never_reach_the_file(self):
-        built = wizard.build_plan({"meeting": {"route": "online", "onlineApiKey": "sk-online"},
-                                   "llm": {"direct": True, "baseUrl": "http://x/v1",
-                                           "apiKey": "sk-direct"}})
+        built = wizard.build_plan({"meeting": {"route": "online", "onlineApiKey": "sk-online"}})
         saved = self._saved({"state": "reviewing", "choices": {}, "built": built})
         blob = json.dumps(saved, ensure_ascii=False)
         self.assertNotIn("sk-online", blob)
-        self.assertNotIn("sk-direct", blob)
         keys = [r["key"] for r in saved["built"]["config"]]
         self.assertIn("capabilityAsrProviderApiKey", keys, "键名要留着，确认页靠它列清单")
 
@@ -591,12 +521,9 @@ class SecretsNeverLandInThePlanFileTests(_PlanTestCase):
         wizard._settings = lambda name: "sk-stored" if name.endswith("ApiKey") else ""
         online = wizard.build_plan({"meeting": {"route": "online"}})
         self.assertNotIn("还没填密钥", " ".join(m["reason"] for m in online["missing"]))
-        direct = wizard.build_plan({"llm": {"direct": True, "baseUrl": "http://x/v1"}})
-        self.assertTrue(wizard.minutes_capable({"agent": "",
-                                                "llm": {"direct": True,
-                                                        "baseUrl": "http://x/v1"}}),
-                        "库里已有密钥时不该判成「不能自动写纪要」")
-        self.assertEqual(direct["schema"], wizard.PLAN_BUILD_SCHEMA)
+        # 2026-10-22：没有智能体就没有推理能力（直连兜底已删除）。
+        self.assertFalse(wizard.minutes_capable({"agent": ""}))
+        self.assertTrue(wizard.minutes_capable({"agent": "harness"}))
 
     def test_no_route_is_reported_on_the_last_page(self):
         feats = [m["feature"] for m in wizard.build_plan({})["missing"]]
@@ -651,8 +578,8 @@ class InstalledComponentsTests(_PlanTestCase):
         target = self._installed()
         plan_file = os.path.join(self.tmp, "wizard-plan.json")
         choices = {"engines": ["stt-sherpa", "stt-whisper-base"],
-                   "llm": {"direct": True, "baseUrl": "http://x/v1",
-                           "apiKey": "sk-SECRET"}}
+                   "meeting": {"route": "online", "onlineBaseUrl": "http://x/v1",
+                               "onlineApiKey": "sk-SECRET"}}
         built = wizard.build_plan(choices)
         wizard.save_plan({"state": "running", "choices": choices, "built": built}, plan_file)
 
@@ -661,7 +588,8 @@ class InstalledComponentsTests(_PlanTestCase):
         with open(target, encoding="utf-8") as fh:
             raw = fh.read()
         self.assertNotIn("sk-SECRET", raw, "密钥**绝不能**落进这个明文文件")
-        self.assertIn("providerLlmApiKey", raw, "但要记下「写过哪些键」（只记键名）")
+        self.assertIn("capabilityAsrProviderApiKey", raw,
+                      "但要记下「写过哪些键」（只记键名）")
         self.assertNotIn("sk-SECRET", json.dumps(payload, ensure_ascii=False),
                          "返回值里也不该带密钥")
         self.assertFalse(wizard.first_run(target), "写完就不再是首装")

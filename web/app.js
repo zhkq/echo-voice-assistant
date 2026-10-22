@@ -1080,9 +1080,9 @@ async function loadRouter() {
     renderRouterMembers();
     renderRouterCandidates();
   } catch (e) { toast("加载模型路由失败：" + e.message); }
-  // 语言模型那一块（用哪个实现 + 在线服务）也在这一页（智能体）；
-  // 7 项路由参数由设置卡片渲染（同一个 pane 里，见 SET_CARDS.agent 的「通道设置」卡）
-  loadRouterLlm();
+  // 2026-10-22：这一页不再有"语言模型 provider"块。推理只走配置的智能体，
+  // `echo-auto` 只是智能体的模型路由（成员/优先级就是下面这几张卡），ECHO 不直连 LLM。
+  // 7 项路由参数由设置卡片渲染（同一个 pane 里，见 SET_CARDS.agent 的「通道设置」卡）。
 }
 
 /** 读一次设置（`_settingsCache`）。多个页签都要用（能力页签 / 模型路由页签 / 设置页），
@@ -1098,7 +1098,7 @@ async function ensureSettings(force) {
 }
 
 /* 2026-09-25（第二版）：7 项路由参数回到**这张卡自己的「保存」**名下 —— 用户要求把
-   「语言模型 / 通道成员 / 派发情况 / 通道设置」合成一张卡，卡内一处改就该一处存。
+   「通道成员 / 派发情况 / 通道设置」合成一张卡，卡内一处改就该一处存。
    所以 `#rtSetHost` 那 7 行由 renderSettingsPanes() 填，落库交给卡内的 `#rtSave`
    （见下面的 saveRouter），页签顶部的「保存」只管 pane 里那些设置卡片 —— 不会出现
    两个按钮都管同一件事。 */
@@ -1793,8 +1793,7 @@ const SET_ADV_SEC = {
   commandTargetWorkspace: "命令与会话", commandTargetSession: "命令与会话",
   userLocation: "命令与会话", sendEnvContext: "命令与会话",
   providerAsr: "在线服务", providerAsrBaseUrl: "在线服务", providerAsrModel: "在线服务",
-  providerAsrApiKey: "在线服务", providerLlm: "在线服务", providerLlmBaseUrl: "在线服务",
-  providerLlmModel: "在线服务", providerLlmApiKey: "在线服务",
+  providerAsrApiKey: "在线服务",
   // 业务配置 → 唤醒
   wakeKeywords: "唤醒词与灵敏度", wakeAliases: "唤醒词与灵敏度",
   wakeThreshold: "唤醒词与灵敏度", wakeCooldownSec: "唤醒词与灵敏度",
@@ -1849,7 +1848,6 @@ const SET_CARDS = {
                // 高级里"能力选择/在线服务"那两节也是函数画的（renderSettingRows），落点表看不见 → 显式登记
                "sttModel", "ttsEngine", "wakeEngine",
                "providerAsr", "providerAsrBaseUrl", "providerAsrModel", "providerAsrApiKey",
-               "providerLlm", "providerLlmBaseUrl", "providerLlmModel", "providerLlmApiKey",
                // 工作区与归档那 6 项也是函数画的（见上面的 adv）
                "commandWorkspace", "meetingWorkspace", "worklogEnabled",
                "worklogEnsureSessionAccess", "worklogVaultRoot", "worklogPrompt",
@@ -1867,9 +1865,7 @@ const SET_CARDS = {
         + renderMeetingBackendChoice()
         + sSub("在线服务",
                renderSettingRows(settingRows(["providerAsr", "providerAsrBaseUrl",
-                                              "providerAsrModel", "providerAsrApiKey",
-                                              "providerLlm", "providerLlmBaseUrl",
-                                              "providerLlmModel", "providerLlmApiKey"]))) },
+                                              "providerAsrModel", "providerAsrApiKey"]))) },
     { id: "keys", title: "快捷键",
       hint: "面板、指令各用哪个键。",
       common: ["panelHotkey", "wakeHotkey", "fallbackHotkey", "triggerKeys",
@@ -1968,11 +1964,9 @@ const SET_LOUD_NOTE = {
   providerAsrBaseUrl: "在线转写会把**音频**发到这个地址。",
   providerAsrModel: "在线转写会把**音频**发给所选服务商。",
   providerAsrApiKey: "密钥只存本机、接口永不回显；留空 = 不改。",
-  providerLlmBaseUrl: "在线语言模型会把**文本**发到这个地址。",
-  providerLlmApiKey: "密钥只存本机、接口永不回显；留空 = 不改。",
   capabilityPrivacy: "约束三个会议后端能去哪：不出机 / 内网 / 出网。",
   ttsEngine: "选「在线」会把要朗读的文本发给服务商；「本机离线」不出网。",
-  meetingAutoSummarize: "开启后转写全文会发给模型服务商。",
+  meetingAutoSummarize: "开启后转写全文会发给**配置的智能体**（ECHO 不直连 LLM）。",
   voiceprintAutoEnroll: "开启后**改名就把声纹存进库**（生物特征，只存本机）。关着时一个字都不写；"
     + "想入库就在会议详情里点「声纹入库」。",
   worklogVaultRoot: "纪要会写进这个目录（你的笔记库），确认路径再改。",
@@ -2008,9 +2002,8 @@ const SET_SHORT_LABELS = {
   worklogVaultRoot: "笔记库", worklogPrompt: "归档模板",
   dshBaseUrl: "DSH 地址", harnessHome: "家目录", harnessPort: "端口",
   harnessCommand: "启动命令", harnessToken: "访问 token",
-  providerAsr: "转写实现", providerLlm: "模型实现",
+  providerAsr: "转写实现",
   providerAsrBaseUrl: "转写地址", providerAsrModel: "转写模型", providerAsrApiKey: "转写密钥",
-  providerLlmBaseUrl: "LLM 地址", providerLlmModel: "LLM 模型", providerLlmApiKey: "LLM 密钥",
   capabilityEchoServerUrl: "后端地址", capabilityPrivacy: "出网许可",
   capabilityMeetingAsrBackend: "会议转写", capabilityDiarizeBackend: "说话人分离",
   capabilityEmbedBackend: "声纹提取",
@@ -2258,10 +2251,10 @@ $("#agentWebOpen")?.addEventListener("click", async (e) => {
 let _capCache = { comps: null, prov: null, cfg: null, presets: null };
 let _capPoll = null;
 
-/* 能力页签上的能力种类。**语言模型不在其中**：它的"用哪个实现"与路由的上游配置是同一件事
-   （ECHO AUTO 的成员就在「模型路由」里配），2026-09-19 用户要求整合到「模型路由」页签去。 */
+/* 能力页签上的能力种类。**没有语言模型**：2026-10-22 起 ECHO 不直连 LLM，
+   推理只走配置的智能体；`echo-auto` 只是智能体的模型路由，配置在「模型路由」页。 */
 const CAP_KINDS = ["asr", "tts"];
-// CAP_META 只描述能力页签上的卡片；语言模型那块渲染在「模型路由」页签里（见 loadRouterLlm）
+// CAP_META 只描述能力页签上的卡片（ASR / TTS）；没有 LLM 卡片。
 const CAP_META = {
   asr: { icon: "🎤", title: "语音转写", note: "命令口述与会议录音都走它；本地引擎与在线服务二选一" },
   tts: { icon: "🔊", title: "语音合成", note: "朗读复述确认、语音简报与提示语；off = 完全不朗读" },
@@ -2475,8 +2468,8 @@ function capProviderBlock(kind) {
 
 /** 选中在线实现时就地展开它需要的地址/模型/密钥（+ 预设 + 保存）。 */
 function capOnlineBlock(kind, cur) {
-    const ONLINE = { asr: { prefix: "providerAsr", on: "openai-asr" },
-                     llm: { prefix: "providerLlm", on: "openai-llm" } };
+    // 只有 ASR：LLM 不在这里选（推理只走配置的智能体，ECHO 不直连 LLM）。
+    const ONLINE = { asr: { prefix: "providerAsr", on: "openai-asr" } };
     const o = ONLINE[kind];
     if (!o || !cur || cur.id !== o.on) return "";
     // 只读：改这些在「设置 → AI组件 → 高级 → 在线服务」（同一批键的唯一可改处）。
@@ -2534,10 +2527,6 @@ function capKindCard(kind) {
   const meta = CAP_META[kind] || { icon: "•", title: kind, note: "" };
   let body = capProviderBlock(kind);
   if (kind === "asr") body += capAsrLocal();
-  if (kind === "llm") {
-    // 只留一个入口按钮：成员与优先级的说明已经在下拉下面那行「会出网」里说过了
-    body += `<div class="mcard-act"><button type="button" class="btn mini" data-goto="agent">去通道成员</button></div>`;
-  }
   // TTS 不再单列「两种实现」：那两行的状态与下拉选项里的（出网/本地 · 就绪）是同一份信息，
   // 顶部概览条也已经各给了一个点 + 名字（2026-09-19 用户实测反馈：重复）。
   return `<div class="mcard collapsible" data-collapse-id="cap-${esc(kind)}">
@@ -2549,7 +2538,7 @@ function capKindCard(kind) {
     </div></div>`;
 }
 
-/** 顶部一览：三个能力当前用的是什么 + 组件就绪计数。 */
+/** 顶部一览：两个能力（ASR/TTS）当前用的是什么 + 组件就绪计数。 */
 function renderCapOverview() {
   const host = $("#capOverview");
   const items = ((_capCache.comps || {}).items) || [];
@@ -2960,8 +2949,8 @@ function bindCapCards() {
 
 /** 读取"用哪个实现"需要的三份数据（provider 清单 / 在线服务字段 / 预设）。
  *
- *  能力页签与「模型路由」页签（语言模型那一块）共用同一份缓存 —— 两处各拉一遍不仅浪费，
- *  还会出现"一处改了另一处还是旧状态"。`force=true` 时强制刷新。 */
+ *  仅供能力页签（ASR / TTS）使用；2026-10-22 起没有「语言模型 provider」块。
+ *  `force=true` 时强制刷新。 */
 async function ensureProviderData(force) {
   if (!force && _capCache.prov) return _capCache;
   const [provRes, cfgRes, presetRes] = await Promise.all([
@@ -2973,26 +2962,11 @@ async function ensureProviderData(force) {
   return _capCache;
 }
 
-/** 语言模型那块（渲染在「模型路由」页签里）：用哪个实现 + 在线服务地址/模型/密钥。 */
-async function loadRouterLlm() {
-  const host = $("#rtLlmHost");
-  if (!host) return;
-  try {
-    await ensureProviderData(true);
-    await ensureSettings(true);
-    host.innerHTML = capProviderBlock("llm");
-  } catch (e) {
-    host.innerHTML = `<div class="muted" style="font-size:12px">读取失败：${esc(e.message)}</div>`;
-  }
-}
-
-/** 语言模型块的事件绑定（一次性，重绘不用重绑）。 */
-
 /** 某个"用哪个实现"选择变化后，刷新**当前正在看的**那一页。 */
 function refreshAfterProviderChange() {
   const tab = $(".tab.active");
   const view = tab && tab.dataset ? normView(tab.dataset.view) : "";
-  // 「能力与智能体」一页里既有语言模型块（路由卡）也有能力/本地能力块，两处一起刷
+  // 「能力与智能体」一页里有 ASR/TTS 能力块与智能体路由卡，两处一起刷。
   if (view === "settings") { loadRouter(); loadCapabilities(); return; }   // 2026-10-02：能力页已并进「设置」
   loadSettings();
 }
@@ -4662,7 +4636,7 @@ function renderSettingsPanes() {
   bindCapabilityCardControls();
   applyTranscribeSettingsVisibility();
   // 「模型路由」卡（index.html 里**静态**的）里的 7 项路由参数：
-  // 卡本身不能由 JS 生成（它的 host 会被 loadRouter()/loadRouterLlm() 渲染，重绘会和
+  // 卡本身不能由 JS 生成（它的 host 会被 loadRouter()/renderRouter*() 渲染，重绘会和
   // 并发请求互相覆盖），所以这里只把那些行填进它的 `#rtSetHost`；
   // 展开状态与动态卡共用 `_sadvOpen`。
   const rp = $("#rtSetHost");
@@ -6909,10 +6883,9 @@ function wizBlankChoices() {
   return {
     locations: { models: "", meetings: "", notes: "" },
     engines: [], wake: false, diarize: false, accel: false,
-    asrOnline: false, llmReady: false, agent: "", fallback: [],
-    /* S6：纪要默认走**智能体**；`llm.direct` 才是"直连兜底"的显式开关（不推荐）。
-       填了地址**不等于**启用 —— 见 wizRenderLlm 的说明。 */
-    llm: { direct: false, baseUrl: "", apiKey: "", model: "" },
+    asrOnline: false, agent: "", fallback: [],
+    /* S6（2026-10-22）：**没有直连 LLM 的选项**。推理只走配置的智能体；
+       这一步只负责解释"为什么下一步必须选智能体"。 */
     /* S8（2026-09-28）：会议转写走哪条路。**配对本身是一个动作**，不在这里存码 ——
        用户在这一页点「检测本机后端」或「配对」时就地完成（复用「能力」卡那两个接口）。
        `onlineApiKey` / `onlineBaseUrl` 是方案 3 的两项：密钥**不在这一层做任何校验**，
@@ -6988,9 +6961,7 @@ async function loadWizard() {
                                            saved.locations || {});
     if (!Array.isArray(_wizChoices.engines)) _wizChoices.engines = [];
     if (!Array.isArray(_wizChoices.fallback)) _wizChoices.fallback = [];
-    /* S6 的直连兜底字段：老计划文件里没有 llm 这一块，补成完整骨架再渲染 */
-    _wizChoices.llm = Object.assign({ direct: false, baseUrl: "", apiKey: "", model: "" },
-                                    saved.llm || {});
+    /* S6 已没有直连 LLM 字段（2026-10-22 删除）；旧计划里的 saved.llm 直接忽略。 */
     /* S8 的会议转写方式：老计划文件里没有这一块，补成完整骨架再渲染 */
     _wizChoices.meeting = Object.assign({ route: "", onlineApiKey: "", onlineBaseUrl: "" },
                                         saved.meeting || {});
@@ -7250,82 +7221,30 @@ function wizRenderAccel(host) {
   }));
 }
 
-/* ---------------- S6 让 ECHO 会写纪要（默认走智能体） ----------------
-   2026-09-20 用户定调：会议纪要、归档、语音指令**都走智能体**（只有它有 skill 机制做
-   灵活扩展），**不推荐**直连大模型。所以这一步的主线是"把智能体准备起来"，入口指向第 7 步；
-   直连 AI 服务收进折叠区当兜底。
-
-   为什么不能"填了地址就自动算启用"：`providerLlm` 是个**全局**开关（别的功能也读它），
-   而且纪要在 `meeting.direct_llm_decision()` 里是 **agent-first** —— 有智能体就走智能体，
-   直连只在"没有智能体"时生效。向导不该因为用户随手填了地址，就替他选定"没有智能体时
-   用哪个直连 provider"。 */
+/* ---------------- S6 让 ECHO 会写纪要（只由智能体执行） ----------------
+   2026-10-22 用户定调：ECHO **不直接连 LLM** 完成动作。纪要、总结、推理、归档、
+   语音指令全部发给**配置的智能体**。所以这一步不再提供"直连 AI 服务"的兜底，
+   只解释"为什么下一步必须选智能体"，入口指向 S7。 */
 function wizRenderLlm(host) {
   const agents = (_wizEnv && _wizEnv.agents) || {};
   const harness = agents.harness || {}, desk = agents.dsh || {};
   const ready = !!(harness.online || desk.online);
-  const llm = _wizChoices.llm || {};
-  const direct = !!llm.direct;
   host.innerHTML = wizCard("让 ECHO 会写纪要",
     "开完会，ECHO 把转写稿整理成带结论和待办的会议纪要。",
     "不能自动生成会议纪要（转写、录音、会议列表都照常可用）。",
-    `<div class="wiz-lose">这件事由<b>智能体</b>来做 —— 而且不只是写纪要：把纪要归档进你的
-       笔记库、按你的话去整理文件，也都走它。智能体用「技能」扩展，以后想加新玩法不用改 ECHO。</div>
+    `<div class="wiz-lose">这件事只由<b>配置的智能体</b>做 —— 而且不只是写纪要：把纪要归档进你的
+       笔记库、按你的话去整理文件，也都走它。ECHO 自己<b>不直连任何大模型</b>，
+       所以没有智能体就没有推理能力。</div>
      <div class="wiz-env-row"><b>智能体</b><span>${ready
         ? "已经就绪 ✓ 现在就写得了纪要"
-        : "还没准备 —— 准备好就能自动写纪要，也能归档、听指令"}</span></div>
-     <div><button class="btn" id="wizGoAgent">${ready ? "去第 7 步看看" : "去第 7 步准备智能体"}</button></div>
-     <label class="wiz-opt ${direct ? "on" : ""}">
-       <input type="checkbox" data-wizdirect="1" ${direct ? "checked" : ""}>
-       <span class="wiz-opt-body"><span class="wiz-opt-name">没有智能体？直连一个 AI 服务（不推荐）</span>
-       <span class="muted">这条路只能写纪要：<b>归档和语音指令仍然需要智能体</b>。只在你没有智能体时生效。</span></span>
-     </label>
-     <div id="wizDirectBox" class="${direct ? "" : "hidden"}">
-       <div class="wiz-fields">
-         <label class="wiz-field"><span>服务地址</span>
-           <input class="input" id="wizLlmBase" placeholder="http://内网地址/v1"
-                  value="${esc(llm.baseUrl || "")}"></label>
-         <label class="wiz-field"><span>密钥</span>
-           <input class="input" id="wizLlmKey" type="password" placeholder="服务方给你的那一串"
-                  value="${esc(llm.apiKey || "")}"></label>
-         <label class="wiz-field"><span>模型名（可留空）</span>
-           <input class="input" id="wizLlmModel" placeholder="例如 deepseek-chat"
-                  value="${esc(llm.model || "")}"></label>
-       </div>
-       <div class="muted">以后想改、或想配多个上游按顺序用，到「模型路由」里改。
-          这里填的密钥<b>只在这一次向导里保留</b>：写进设置之后，重开面板这个框会是空的
-          （那时它已经在用了，不用再填一遍）。</div>
-     </div>`);
+        : "还没准备 —— 下一步选一个智能体，它负责全部推理"}</span></div>
+     <div><button class="btn" id="wizGoAgent">${ready ? "去第 7 步看看" : "去第 7 步准备智能体"}</button></div>`);
   wizWhy(host);
   const go = $("#wizGoAgent", host);
   if (go) go.addEventListener("click", () => {
     const i = WIZ_STEPS.findIndex((s) => s.id === "agent");
     if (i >= 0) { _wizStep = i; wizRender(); }
   });
-  const directBox = $("[data-wizdirect='1']", host);
-  if (directBox) directBox.addEventListener("change", () => {
-    _wizChoices.llm = Object.assign({ direct: false, baseUrl: "", apiKey: "", model: "" },
-                                    _wizChoices.llm || {});
-    _wizChoices.llm.direct = directBox.checked;
-    const label = directBox.closest(".wiz-opt");
-    if (label) label.classList.toggle("on", directBox.checked);
-    const box = $("#wizDirectBox", host);
-    if (box) box.classList.toggle("hidden", !directBox.checked);
-    wizSaveChoices();
-  });
-  /* 三格用 change 而不是 input：逐键 PUT 计划文件没必要，失焦/下一步时存一次够了。 */
-  const bind = (sel, field) => {
-    const el = $(sel, host);
-    if (!el) return;
-    el.addEventListener("change", () => {
-      _wizChoices.llm = Object.assign({ direct: false, baseUrl: "", apiKey: "", model: "" },
-                                      _wizChoices.llm || {});
-      _wizChoices.llm[field] = el.value;
-      wizSaveChoices();
-    });
-  };
-  bind("#wizLlmBase", "baseUrl");
-  bind("#wizLlmKey", "apiKey");
-  bind("#wizLlmModel", "model");
 }
 
 /* ---------------- S7 智能体后端（默认标准 DSH） ---------------- */

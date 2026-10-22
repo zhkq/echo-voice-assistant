@@ -3032,11 +3032,12 @@ def api_wizard_mark_first_run(_auth=Depends(optional_auth)):
 
 
 
-# ---------------------------------------------------------------- 能力 provider（P5 / D25）
-# ASR / LLM / TTS 三类能力的统一清单：谁在生效、是不是要出网（egress）、就绪与否。
+# ---------------------------------------------------------------- 能力 provider（P5）
+# ASR / TTS 两类能力的统一清单：谁在生效、是不是要出网（egress）、就绪与否。
 # 与 /api/components 的分工：**components = 装什么**（模型/引擎/运行时的安装与就绪），
-# **providers = 用哪个**（能干活的能力实现，含在线服务）。P5 的"配一个在线 LLM 就能出纪要"
-# 就是靠 providerLlm 选择 ECHO AUTO 实现的。
+# **providers = 用哪个**（能干活的能力实现，含在线服务）。
+# **没有 LLM**：推理只走配置的智能体；`echo-auto` 是智能体的模型路由，
+# 由 `app/llm_router.py` 注册进 DSH，不是 ECHO 的 provider。
 
 @router.get("/providers")
 def api_providers(ready: bool = False, _auth=Depends(optional_auth)):
@@ -3044,7 +3045,7 @@ def api_providers(ready: bool = False, _auth=Depends(optional_auth)):
 
     就绪探测会碰网络（例如 edge-tts 的在线探针）与依赖（funasr 之类），所以默认关掉 ——
     面板按需传 ``ready=true``，避免每次打开设置页都打一次外网。
-    **响应里不含任何凭据**（令牌只留在进程内，见 app/providers/router.py 的说明）。
+    **响应里不含任何凭据**（令牌只留在进程内，见 `app/llm_router.py` 的说明）。
     """
     from app import providers as providers_mod
     return providers_mod.catalog(ready=bool(ready))

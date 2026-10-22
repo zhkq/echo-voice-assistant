@@ -79,7 +79,7 @@ class SubgroupStyleTests(unittest.TestCase):
 
     def test_the_static_router_card_uses_the_same_markup(self):
         """模型路由卡是静态 HTML（调不到 sSub），所以手写同一套标记。"""
-        for title in ("语言模型", "通道成员（顺序 = 优先级）", "派发情况", "路由参数"):
+        for title in ("通道成员（顺序 = 优先级）", "派发情况", "路由参数"):
             with self.subTest(title=title):
                 # 静态那几处也带上了折叠结构（2026-10-02 用户："二级卡片也能折叠"）
                 self.assertRegex(self.html,
@@ -223,12 +223,13 @@ class SubgroupCollapseTests(unittest.TestCase):
         self.assertNotIn("data-collapse-default", fn, "二级分组默认**展开**（是内容，不该默认藏）")
 
     def test_the_static_router_subcards_are_collapsible_too(self):
-        for cid in ("ssub-语言模型", "ssub-通道成员", "ssub-派发情况", "ssub-路由参数"):
+        for cid in ("ssub-通道成员", "ssub-派发情况", "ssub-路由参数"):
             with self.subTest(cid=cid):
                 self.assertIn('data-collapse-id="%s"' % cid, self.html)
-        # 静态一共 5 处：模型路由卡那 4 节 + 页面级「高级」（2026-10-02 收进去的）
-        self.assertEqual(self.html.count('class="ssub-body"'), 5,
-                         "静态这 5 处要各有一层 .ssub-body")
+        # 静态一共 4 处：模型路由卡那 3 节 + 页面级「高级」（2026-10-02 收进去的）
+        # 2026-10-22 删掉「语言模型」后 5 → 4。
+        self.assertEqual(self.html.count('class="ssub-body"'), 4,
+                         "静态这 4 处要各有一层 .ssub-body")
 
     def test_the_css_hides_the_collapsed_body_and_rotates_the_arrow(self):
         self.assertRegex(self.css, r"\.ssub\.collapsible\.collapsed > \.ssub-body \{ display: none; \}")

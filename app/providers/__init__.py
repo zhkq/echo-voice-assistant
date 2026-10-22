@@ -1,41 +1,41 @@
 # -*- coding: utf-8 -*-
-"""providers —— ASR / LLM / TTS 三类能力的统一抽象与注册表（P5 / D25）
+"""providers —— ASR / TTS 两类能力的统一抽象与注册表（P5）
 
 为什么需要这一层
 ----------------
 1.x 里"用哪个引擎"是散落的：转写走 `app/audio/stt.py` 的 `sttModel`，朗读走
-`app/audio/tts.py` 的 `ttsEngine`，而"纪要"必须经 agent（DSH）——于是**不装 agent 就出不了纪要**。
-P5 要把这三类能力收成**同一种形状**：一个 provider = 一段"能做这件事"的实现，
-带名字、来源、就绪状态、以及**是否出网**的标注。
+`app/audio/tts.py` 的 `ttsEngine`。这里把这两类能力收成**同一种形状**：
+一个 provider = 一段"能做这件事"的实现，带名字、来源、就绪状态、以及**是否出网**的标注。
 
-规划要求（REFACTOR-PLAN §10 P5 / D25）
-------------------------------------
-* kind 只有三种：`asr` / `llm` / `tts`；
-* **本地引擎与在线服务并列**：本地的（whisper/sensevoice/sherpa、SAPI/say、edge-tts）与在线的
-  （OpenAI 兼容 ASR/LLM）用同一套接口注册，用户按 kind 选一个"当前生效的"；
-* **多上游派发路由属于主包**（原 `dsh-failover/`，D25）：它作为 **LLM provider 的一种实现**
-  出现在这里（见 `providers/router.py`），不再是"agent 的附属"；
-* **出网标注**：每个 provider 必须能回答"数据会不会离开本机、去哪"（`egress` / `egress_note`），
-  面板据此提示——这是规划里反复强调的一条（用户要知道哪些内容会发给谁）。
+## 为什么没有 `llm` kind（2026-10-22 用户定调）
 
-设计要点
---------
+**ECHO 不直接连 LLM 完成动作**：纪要、总结、推理等一切"要动脑子"的事，都发给
+**配置的智能体**（DSH / harness）执行。`echo-auto` 是**给智能体用的内外网模型路由**
+（`app/llm_router.py` → DSH 的 `llm-pi-ai.providers.echo-auto`，由 `dsh-failover` 扮演），
+**不是 ECHO 自己的 LLM provider**，所以不在这里注册。
+
+历史包袱（已被本文件删除）：P5 曾有 `openai-llm`（单上游直连）与 `echo-auto` 两个 LLM
+provider，纪要在智能体不可用时直连兜底。那条路让 ECHO 绕过智能体，和"所有推理都交给
+配置的智能体"冲突；2026-10-22 起彻底删除。
+
+## 设计要点
+
 * 注册表只存**元数据 + 构造器**，不 import 重依赖：`app/audio/stt.py` 会拉 torch/funasr，
   只能在真正调用时 import（见 `providers/local.py` 的方法内部）。
 * `catalog()` 只输出**可安全展示**的信息（不含任何凭据）——面板/接口直接用。
-* "当前生效的 provider"由配置项决定（`providerAsr` / `providerLlm`；TTS 由 `ttsEngine` 派生），
+* "当前生效的 provider"由配置项决定（`providerAsr`；TTS 由 `ttsEngine` 派生），
   缺省回落到该 kind 的默认实现；找不到或没就绪时明确返回原因，不静默降级。
 """
 from __future__ import annotations
 
 import threading
 
-#: 三类能力（顺序固定：面板/CLI 展示稳定）
-KINDS = ("asr", "llm", "tts")
+#: 两类能力（顺序固定：面板/CLI 展示稳定）。
+#: **`llm` 故意不在这里**：推理只走配置的智能体，ECHO 不直接选 LLM provider。
+KINDS = ("asr", "tts")
 
 KIND_LABELS = {
     "asr": "语音转写（ASR）",
-    "llm": "语言模型（LLM）",
     "tts": "语音合成（TTS）",
 }
 
@@ -168,8 +168,9 @@ def _tts_active_id():
 def active_id(kind):
     """当前生效的 provider id：配置项 > 默认实现。
 
-    * `asr` / `llm`：配置项 ``provider<Kind>``（`providerAsr` / `providerLlm`）；
+    * `asr`：配置项 ``providerAsr``；
     * `tts`：由 ``ttsEngine`` 派生（见 `tts_engine` 的说明）——没有第二份配置。
+    * `llm` **不是**这里的 kind：推理只走配置的智能体（见模块头）。
 
     配置为空或指向不存在的 id 时回落默认，**并把原因带上**（见 `active`）。
     """
@@ -291,11 +292,10 @@ def catalog(ready=True):
 # （面板至少要能列出"清单为空"，而不是整个服务起不来）。
 from app.providers import local as _local          # noqa: E402,F401
 from app.providers import openai as _openai        # noqa: E402,F401
-from app.providers import router as _router        # noqa: E402,F401
 
 
 def _register_builtin():
-    for mod in (_local, _openai, _router):
+    for mod in (_local, _openai):
         try:
             mod.register_builtin()
         except Exception as e:                      # pragma: no cover - 防御性

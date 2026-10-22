@@ -113,8 +113,9 @@ UI_EXTRAS = {
                    "`harnessToken` / `dshBaseUrl` / `agentCustomPath`）",
          "buttons": ["检测", "浏览器打开"]},
         {"kind": "static", "card": "模型路由（合并卡，静态卡）",
-         "detail": "`#rtMergeCard`：概要行 `#rtReg`；`## 语言模型` → `#rtLlmHost`；"
-                   "`## 通道成员（顺序 = 优先级）` → `#rtMembers` + 候选下拉 `#rtCandSelect`；"
+         "detail": "`#rtMergeCard`：概要行 `#rtReg`；`## 通道成员（顺序 = 优先级）` → "
+                   "`#rtMembers` + 候选下拉 `#rtCandSelect`（这些是给智能体用的模型路由；"
+                   "2026-10-22 起没有「语言模型 provider」块）；"
                    "`## 派发情况` → `#rtStats`；右上状态徽标 `#rtBadge`、`仪表盘 ↗`。\n"
                    "**高级**：`## 路由参数` → `#rtSetHost`（7 项 `router*` 设置，由 renderSettingsPanes 填）",
          "buttons": ["＋ 加入", "保存（本卡：成员+优先级+7 项参数）", "立即探测", "重载配置", "注册到 DSH"]},
