@@ -34,6 +34,9 @@
 #   -PipIndex <url>        国内 pip 镜像，例如 https://pypi.tuna.tsinghua.edu.cn/simple
 #   -TorchIndex <url>      -AccelCuda 时 torch 走哪个索引（默认官方 cu128；PyPI 上的是 CPU 版）
 #   -SkipPip               只下模型、不装 pip 依赖
+#   -KeepSettings          升级模式：**不写任何设置**（引擎选择 / 智能体 / 路径都保持原样）
+#   -SkipModels            升级模式：不下载、不替换已有模型权重
+#   -UpgradeDsh            升级模式：用户同意了才升级 DSH 标准版（走 helper 的 -Upgrade）
 #   -WaitSeconds <秒>      等模型下载的上限（默认 1800）
 #
 # 编码：含中文，所以**必须 UTF-8 带 BOM**（WinPS 5.1 对无 BOM 的 .ps1 按 ANSI 读，
@@ -54,6 +57,14 @@ param(
     [string]$PipIndex = '',
     [string]$TorchIndex = '',
     [switch]$SkipPip,
+    # 升级模式（2026-10-23 用户口径）：只更新核心代码。
+    #   -KeepSettings：一个设置项都不写（sttModel / 会议模型 / 智能体 / 路径全保持原样）
+    #   -SkipModels  ：不下载、不替换已有模型权重
+    [switch]$KeepSettings,
+    [switch]$SkipModels,
+    # 升级模式里用户明确同意时：让 harness 本地安装脚本走 -Upgrade（否则它会按
+    # "已装好即用"的快路径跳过，等于没升级）。
+    [switch]$UpgradeDsh,
     [int]$WaitSeconds = 1800
 )
 
@@ -400,8 +411,10 @@ function Prepare-Agent {
     $cmdFile = Join-Path $env:TEMP ("echo-harness-command-{0}.txt" -f $PID)
     $out = @()
     try {
-        $out = & $helper -DestDir $script:Root -Version $script:DshVersion `
-                         -NodeExe $node -CommandFile $cmdFile -LogFile $script:InstallLog
+        $helperArgs = @('-DestDir', $script:Root, '-Version', $script:DshVersion,
+                        '-NodeExe', $node, '-CommandFile', $cmdFile, '-LogFile', $script:InstallLog)
+        if ($UpgradeDsh) { $helperArgs += '-Upgrade' }
+        $out = & $helper @helperArgs
     } catch {
         Warn ("装本地标准版时出错：{0}" -f $_.Exception.Message)
     }
@@ -509,6 +522,14 @@ if ($Diarize) {
 }
 if ($AccelCuda) { Warn 'CUDA 版 torch 体积大（约 2.5 GB），且要求 N 卡与匹配的驱动' }
 
+# 升级模式：**已有模型权重一个字节都不碰**（用户 2026-10-23 口径）。
+if ($SkipModels) {
+    Step '升级模式：不动已有模型权重'
+    Say '已有模型保持原样（不下载、不替换、不删）'
+    $models = @()
+    $needSkeleton = $false
+}
+
 # VC++ 运行库先解决：torch / ctranslate2 / sherpa-onnx / onnxruntime 都依赖它，
 # 缺了会在**装完引擎之后**才以 "DLL load failed" 的形式炸（2026-09-21 同事卡在这）。
 Step '检查 VC++ 运行库（原生扩展的前置）'
@@ -560,6 +581,10 @@ foreach ($pair in $models) {
 }
 
 # 2) 写设置（与面板同一套键）
+if ($KeepSettings) {
+    Step '写入设置（升级模式：一个设置项都不改）'
+    Say 'sttModel / meetingSttModel / 智能体 / 路径 / 唤醒词：全部保持原样'
+} else {
 Step '写入设置'
 $values = @{}
 # 只认**查得到**的引擎名，认不出就一个都不写。
@@ -600,6 +625,7 @@ if ($values.Count -gt 0) {
     try { $null = Invoke-Api -Path '/api/settings' -Method Put -Body @{ values = $values } -TimeoutSec 60; Ok '设置已写入' }
     catch { Err ("写设置失败：{0}" -f $_.Exception.Message) }
 } else { Say '没有要写的设置' }
+}
 
 # 3) 自检：**以 import / ready / online 为准**，有任何一项没成就非 0 退出（别假装成功）
 Step '自检'
@@ -684,6 +710,10 @@ if (-not $agentOk) { $failed += '智能体（harness）' }
 # 第一场会、说第一句指令才冒出来。走 ECHO 自己的接口，幂等；用户改过名的工作区不动
 # （见 app/workspaces.py）。放在 Wait-Harness 之后：workspace/create 要 DSH 正在监听。
 Step '建立 DSH 分组（会议空间 / 指令空间）'
+if ($KeepSettings -or $Agent -eq 'none') {
+    # 升级/不动智能体时：分组属于智能体侧状态，保持原样。
+    Say '智能体未改动：DSH 分组保持原样（不建、不改）'
+} else {
 try {
     $sp = Invoke-Api -Path '/api/dsh/workspaces/ensure' -Method Post -Body @{} -TimeoutSec 90
     foreach ($it in $sp.spaces) {
@@ -698,8 +728,14 @@ try {
     # 不是硬失败：ECHO 建会话时还会再建一次（那时智能体必然已就绪）
     Warn ("调 /api/dsh/workspaces/ensure 失败（不影响使用，ECHO 建会话时会自动补）：{0}" -f $_.Exception.Message)
 }
+}
 
 # 4) 登记安装 —— 这是"装完了"的凭据：面板据此不再提示未安装、也不再自动进向导
+if ($KeepSettings) {
+    # 升级模式：**保留原有的安装登记**。用空引擎/agent=none 重写会抹掉"装过什么"的记录。
+    Step '登记安装（升级模式：保留原记录）'
+    Say '原有安装登记保持原样（不重写）'
+} else {
 Step '登记安装'
 $report = @{
     installer = 'echo-install skill'
@@ -718,17 +754,28 @@ try {
     $null = Invoke-Api -Path '/api/install/report' -Method Post -Body @{ report = $report } -TimeoutSec 30
     Ok '已登记（面板不会再提示"还没装完"）'
 } catch { Warn ("登记失败（不影响使用）：{0}" -f $_.Exception.Message) }
+}
 
 # 5) 结论
 Write-Host ''
 if ($failed.Count -eq 0) {
+    if ($KeepSettings) {
+        Write-Host '  升级完成：核心代码已更新。' -ForegroundColor Green
+        Say '数据 / 设置 / 模型权重 / 后端与手表配置 / 智能体配置：一律未改动'
+        Say '面板与快捷键照旧；不需要再做任何配置。'
+        exit 0
+    }
     Write-Host '  全部就绪。怎么开始用：' -ForegroundColor White
     Say '1) 双击桌面「ECHO 个人助理」，面板会自动打开（也可以按 Ctrl+Shift+E）'
     Say '2) 对着麦克风说一句试试；开完会在「会议」里看到文字稿'
     Say '3) 以后想加能力：面板 → 能力 → 随时补（不用重装）'
     exit 0
 }
-Write-Host ("  装完了，但**有 {0} 项没就绪** —— 别当成装好了：" -f $failed.Count) -ForegroundColor Red
+if ($KeepSettings) {
+    Write-Host ("  核心代码已更新，但**有 {0} 项自检没就绪** —— 别当成升级完整了：" -f $failed.Count) -ForegroundColor Red
+} else {
+    Write-Host ("  装完了，但**有 {0} 项没就绪** —— 别当成装好了：" -f $failed.Count) -ForegroundColor Red
+}
 foreach ($f in $failed) { Say ("  - {0}" -f $f) }
 Say '补救：照上面的提示装依赖 / 重跑本脚本（已装好的会跳过）；也可以到 面板 → 能力 里重试。'
 exit 1

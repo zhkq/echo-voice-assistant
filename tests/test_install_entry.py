@@ -917,7 +917,9 @@ class BackendChoiceTests(unittest.TestCase):
     def test_a_broken_backend_step_never_fails_the_install(self):
         """后端是可选项：这一步只 Warn/Info + 写摘要，**不许 exit**。"""
         body = self.text[self.text.index("function Invoke-BackendStep"):]
-        body = body[:body.index("\n# ---------------------------------------------------------------- 入口")]
+        # 2026-10-23: 升级模式那一整段（停服务/备份/版本）插在入口之前，
+        # 它不属于后端这一步 —— 切到升级段的标题为止。
+        body = body[:body.index("\n# ---------------------------------------------------------------- 升级模式")]
         self.assertNotIn("exit ", body, "后端那一步不许结束安装进程：%s"
                          % [ln.strip() for ln in body.splitlines() if "exit " in ln][:5])
 
@@ -1136,6 +1138,82 @@ class OfflineRuntimeAbiTests(unittest.TestCase):
         probe = self.text[i:self.text.index("'", i)]
         self.assertNotIn('"', probe, "探针里有双引号 —— WinPS 5.1 会把它吃掉")
         self.assertIn("calcsize", probe, "探针要量位宽")
+
+
+class UpgradeModeTests(unittest.TestCase):
+    """2026-10-23 用户口径：**升级只更新核心代码**。
+
+    界面 + 核心功能（代码）可以换；数据库/设置、会议、已有模型权重、后端与手表配置、
+    智能体配置都不能碰。DSH 可以问一句要不要升级，但 agent 配置一个字不改。
+
+    这一组用例钉的是"行为边界"，不是措辞：真跑一次升级不在门禁里（会起服务/停服务），
+    所以断言落在**升级分支必须经过/必须绕开的那几个入口**上。
+    """
+
+    def setUp(self):
+        self.text = _read(INSTALL_ALL)
+        self.comp = _read(PS1_COMPONENTS)
+
+    def test_it_detects_upgrade_before_touching_the_tree(self):
+        self.assertIn("$script:IsUpgrade = ($installMode -eq 'upgrade')", self.text)
+        # 探测在入口、早于 Install-TreeAndShortcuts（覆盖代码）
+        i_mode = self.text.index("$installMode = Invoke-InstallModeProbe")
+        i_copy = self.text.index("Install-TreeAndShortcuts", i_mode)
+        self.assertLess(i_mode, i_copy, "安装模式必须在覆盖代码之前判出来")
+
+    def test_it_stops_echo_gracefully_and_refuses_while_recording(self):
+        self.assertIn("/api/control/echo/stop", self.text)
+        self.assertIn("meeting.active", self.text)
+        self.assertIn("正在录音", self.text)
+        # 兜底**不许**退回旧的 stop.ps1：它会顺手停掉后端（用户口径：后端不要碰），
+        # 而且旧装那份不认 -KeepBackend，未知参数会让这一步直接失败。
+        self.assertIn("手动关闭 ECHO", self.text)
+        self.assertNotIn("& powershell -NoProfile -ExecutionPolicy Bypass -File $stop", self.text)
+
+    def test_it_does_not_touch_models_or_settings(self):
+        self.assertIn("-KeepSettings", self.text)
+        self.assertIn("-SkipModels", self.text)
+        self.assertIn("-SkipPip", self.text)
+        # 升级时引擎列表必须清空 —— 组件脚本据此不写 sttModel / meetingSttModel
+        anchor = self.text.index("$installMode = Invoke-InstallModeProbe")
+        i_up = self.text.index("if ($script:IsUpgrade) {", anchor)
+        block = self.text[i_up:i_up + 1200]
+        self.assertIn("$engineList = @()", block)
+
+    def test_it_keeps_the_backend_untouched(self):
+        # 升级分支里只读状态、不调用 Invoke-BackendStep
+        i = self.text.index("# 升级**不问后端、不碰后端**")
+        i_end = self.text.index("} else {", i)
+        block = self.text[i:i_end]
+        self.assertIn("保持现有配置", block)
+        self.assertNotIn("Invoke-BackendStep", block)
+
+    def test_it_backs_up_the_database_before_overwriting(self):
+        self.assertIn(".bak-before-upgrade-", self.text)
+        self.assertIn("Backup-UpgradeDatabase", self.text)
+
+    def test_dsh_is_optional_and_only_the_program_is_updated(self):
+        self.assertIn("Ask-UpgradeDsh", self.text)
+        self.assertIn("$UpgradeDsh", self.comp)
+        self.assertIn("-Upgrade", self.comp)  # 传给 harness-install-local
+        # 设置写入必须包在"非 KeepSettings"那一支里
+        i_settings = self.comp.index("# 2) 写设置")
+        i_else = self.comp.index("} else {", i_settings)
+        i_stt = self.comp.index("$values['sttModel']")
+        self.assertGreater(i_stt, i_else, "KeepSettings 时不能走到写 sttModel 的那一支")
+
+    def test_the_launcher_recognises_an_existing_install(self):
+        cmd = _read(os.path.join(ROOT, "delivery", "kit-install.cmd"), encoding="ascii")
+        self.assertIn("Found an existing ECHO", cmd)
+        self.assertIn('if not defined EXISTING set "ARGS=%ARGS% -Yes"', cmd,
+                      "升级要交互（问 DSH），全新安装才 -Yes")
+
+    def test_the_readme_explains_what_upgrade_keeps(self):
+        text = _read(os.path.join(ROOT, "delivery", "kit-readme-win.md"))
+        self.assertIn("已经装过 ECHO", text)
+        self.assertIn("不会动", text)
+        self.assertIn("模型权重", text)
+        self.assertIn("智能体配置", text)
 
 
 if __name__ == "__main__":

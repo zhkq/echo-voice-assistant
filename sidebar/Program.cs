@@ -13,6 +13,11 @@
 //   - 左边缘留 6px 把手：拖它调宽度（WebView2 是独立子窗口，会吞掉鼠标事件，
 //     所以宽度把手必须由窗体自己那一条边来承担）；宽度会记住
 //   - 单实例：再次启动（热键）→ 收起为 48px 窄条 ⇄ 展开
+//   - **两页常驻**（2026-10-23 用户："折叠后再展开要等几秒"）：主面板与折叠条各一支
+//     WebView，收起/展开只切可见性，不再重新导航 —— 展开是即时的，不会白屏重载
+//   - **悬停才唤回 + 离开自动收回**（2026-10-23 用户：一碰就弹会挡到别的窗口滚动条）：
+//     鼠标贴右缘**停住** 600ms 才滑出（拖滚动条那种持续移动不算），
+//     滑出后若没点「展开」、鼠标离开 1.5s，自动收回到屏右缘
 //
 // 诊断：所有异常与每次吸附都会写 %TEMP%\echo-sidebar.log（排查宽度/DIP 问题用）。
 //
@@ -57,6 +62,24 @@ internal static class SidebarConfig
     internal const int RailPeekWidth = 3;
     /// <summary>鼠标进入屏右缘多少像素内就把窄条唤回（逻辑像素）。</summary>
     internal const int RailWakeMargin = 6;
+    /// <summary>
+    /// 鼠标在屏右缘**停留多久**才把窄条滑出（毫秒）。
+    /// 为什么要停留（2026-10-23 用户）：原来一碰右缘就滑出，用户**拖别的窗口滚动条**时
+    /// 会被它抢走鼠标 —— 滚动条正好在屏右缘。留一段悬停时间，正常滚动的"路过"就不会触发。
+    /// </summary>
+    internal const int RailHoverDwellMs = 600;
+    /// <summary>
+    /// 悬停滑出后，鼠标**离开窄条区域**多久自动收回（毫秒）。
+    /// 用户 2026-10-23："没有按展开按钮前，鼠标离开一段时间后再自动隐藏"——
+    /// 悬停只是"临时看一眼"，不是把边条永久钉在屏幕上；点「展开」才会变成常驻面板。
+    /// </summary>
+    internal const int RailAutoHideMs = 1500;
+    /// <summary>
+    /// 悬停计时允许的鼠标抖动（物理像素）：超过就重新计时。
+    /// 拖滚动条时鼠标会持续上下移动 —— 一直在动就不该被判定成"悬停"，
+    /// 这是"不影响操作其他窗口滚动条"的第二道保险（第一道是停留时间）。
+    /// </summary>
+    internal const int RailHoverJitterPx = 4;
     /// <summary>
     /// 窄条内容的左补偿（逻辑像素，正值=向左移）。
     /// 窄条态 WebView 从 RailGripWidth(12) 处开始，若按自身宽度居中，内容中心会落在
@@ -294,7 +317,16 @@ internal sealed class SidebarForm : Form
     private const int HTCLIENT = 1;
     private const int HTLEFT = 10;
 
+    // **两页常驻**（2026-10-23 用户："折叠后再展开要等几秒"）：
+    // 主面板与折叠条各用一支 WebView，收起/展开只切可见性 —— **不再重新导航**。
+    // 原来的做法是每次展开都 `Navigate(_baseUrl)`，而主面板首屏要聚合 /api/status、
+    // /api/settings 等（其中几个 2 秒级），于是每次都由白屏重新等一遍。
     private readonly WebView2 _web = new();
+    private readonly WebView2 _railWeb = new();
+    private bool _panelReady;          // 主面板导航成功过（失败时展开前补一次导航）
+    private bool _railReady;           // 折叠条页导航成功过
+    private int _panelRetry;           // 主面板导航重试计数
+    private System.Windows.Forms.Timer _panelRetryTimer;
     private readonly string _baseUrl;
     private readonly string _railPath;      // 折叠条页面本地路径（兜底用）
     private readonly string _railUrl;       // 折叠条页面 HTTP 地址（与 API 同源，优先使用）
@@ -311,6 +343,13 @@ internal sealed class SidebarForm : Form
     private bool _railVisible = true;                // 窄条当前是否在屏内（隐藏态只留 RailPeekWidth）
     private bool _railWakeArmed = true;              // 隐藏后必须先把鼠标移出贴边带，贴边才唤回（否则点箭头后立刻弹回）
 
+    // ---- 悬停唤回的"停留计时"（2026-10-23 用户：一碰就弹会被滚动条误触）----
+    private bool _railHovering;        // 鼠标已在贴边带里、正在累计停留时间
+    private DateTime _railHoverAt;     // 本轮停留的起点
+    private Point _railHoverAnchor;    // 起点处的鼠标位置（移动超过抖动阈值就重新计时）
+    private bool _railShownByHover;    // 这次滑出是"悬停"引起的 → 鼠标离开一段时间后自动收回
+    private DateTime? _railLeaveAt;    // 悬停滑出后，鼠标离开窄条区域的起点
+
     public SidebarForm(string url, bool collapsed, int width, string railPath = null)
     {
         _baseUrl = url;
@@ -320,6 +359,9 @@ internal sealed class SidebarForm : Form
         _startCollapsed = collapsed;
         _pendingWidth = width < SidebarConfig.MinPanelWidth ? SidebarConfig.DefaultWidth : width;
         _railVisible = true;
+        // 先把模式与位置定下来再显示：否则 Application.Run 会先把 300x300 的窗体在
+        // **左上角**闪一下，再被 InitAsync 吸到屏右缘（用户会看到窗口"跳"一次）。
+        _railMode = _startCollapsed;
 
         FormBorderStyle = FormBorderStyle.None;
         ShowInTaskbar = false;
@@ -328,18 +370,26 @@ internal sealed class SidebarForm : Form
         Text = "ECHO 仪表盘";
         BackColor = Color.FromArgb(24, 24, 27);
 
-        // 左侧留出把手：宽度 = 客户区 - 把手，WebView2 不再覆盖那条边
-        _web.Dock = DockStyle.None;
-        _web.Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right;
-        Controls.Add(_web);
-        // 窄条态下 WebView2 只占右侧，左边留给窗体做"点击展开"（它拿不到 WebView 上的鼠标事件）
-        _web.MouseDown += OnWebViewMouseDown;
+        // 左侧留出把手：宽度 = 客户区 - 把手，WebView2 不再覆盖那条边。
+        // 两支 WebView 叠在同一块客户区里，同一时刻只有一支可见（收起 = 折叠条页，
+        // 展开 = 主面板页）—— 这样收起/展开只是切可见性，不需要重新加载页面。
+        foreach (var web in new[] { _web, _railWeb })
+        {
+            web.Dock = DockStyle.None;
+            web.Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right;
+            Controls.Add(web);
+            web.MouseDown += OnWebViewMouseDown;
+        }
+        _railWeb.Visible = false;
 
         Load += async (_, _) => await InitAsync();
         Resize += (_, _) => OnResized();
         // 只有"用户拖拽结束"才是一次真正的宽度调整：Resize/Move 在程序自己设置 Bounds、
         // 子控件布局时都会触发，用它们记录用户宽度会把 --width 覆盖掉（2026-09-12 实测）。
         ResizeEnd += (_, _) => RememberUserWidth();
+
+        // 显示前先贴到屏右缘（见上面 `_railMode` 处的注释）。
+        DockToRightEdge();
     }
 
     /// <summary>用户拖拽左边框结束：记住宽度（换算回逻辑像素）并按新宽度重新贴右缘。</summary>
@@ -369,7 +419,12 @@ internal sealed class SidebarForm : Form
             var gripNow = _railMode ? 0 : ScaleLogical(SidebarConfig.GripWidth);
             var wasSliding = _docking;
             _docking = true;
-            try { _web.Bounds = new Rectangle(gripNow, 0, Math.Max(1, _railSlideWidth - gripNow), ClientSize.Height); }
+            try
+            {
+                var bounds = new Rectangle(gripNow, 0, Math.Max(1, _railSlideWidth - gripNow), ClientSize.Height);
+                _web.Bounds = bounds;
+                _railWeb.Bounds = bounds;
+            }
             finally { _docking = wasSliding; }
             return;
         }
@@ -379,7 +434,12 @@ internal sealed class SidebarForm : Form
         // 最小值 320（2026-09-12 实测：docked wanted=320，就是这么来的）。
         var wasDocking = _docking;
         _docking = true;
-        try { _web.Bounds = new Rectangle(grip, 0, Math.Max(0, ClientSize.Width - grip), ClientSize.Height); }
+        try
+        {
+            var bounds = new Rectangle(grip, 0, Math.Max(0, ClientSize.Width - grip), ClientSize.Height);
+            _web.Bounds = bounds;
+            _railWeb.Bounds = bounds;
+        }
         finally { _docking = wasDocking; }
     }
 
@@ -464,19 +524,8 @@ internal sealed class SidebarForm : Form
                 "echo-sidebar", "webview2");
             Directory.CreateDirectory(dataDir);
             var env = await Microsoft.Web.WebView2.Core.CoreWebView2Environment.CreateAsync(null, dataDir);
-            await _web.EnsureCoreWebView2Async(env);
-            _web.CoreWebView2.Settings.AreDevToolsEnabled = false;
-            _web.CoreWebView2.Settings.IsStatusBarEnabled = false;
-            // 页面 → 宿主的桥：窄条底部"隐藏箭头"用 window.chrome.webview.postMessage("rail-hide") 通知宿主。
-            // 走 WebView2 内置桥而不是绕 ECHO 的 HTTP + 命名管道，少一跳且不依赖 ECHO 在跑。
-            _web.CoreWebView2.WebMessageReceived += OnWebMessage;
-            // 折叠条页面加载失败要重试（ECHO 启动/重启期间会连不上）
-            _web.CoreWebView2.NavigationCompleted += OnNavigationCompleted;
-            _web.CoreWebView2.NewWindowRequested += (_, e) =>
-            {
-                e.Handled = true;
-                try { Process.Start(new ProcessStartInfo(e.Uri) { UseShellExecute = true }); } catch { }
-            };
+            await InitWebViewAsync(_web, env);
+            await InitWebViewAsync(_railWeb, env);
         }
         catch (Exception ex)
         {
@@ -486,13 +535,69 @@ internal sealed class SidebarForm : Form
                 "ECHO 边条", MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
 
-        _railMode = _startCollapsed;
+        _railMode = _startCollapsed;   // 构造函数里已设过；这里保留一次幂等赋值，防止以后挪动顺序
         LayoutWebView();
         DockToRightEdge();
-        LoadContent();
+        // **两页都先加载**（收起态也在后台把主面板加载好）：这样第一次展开也不用等。
+        LoadPanel();
+        LoadRail();
+        ApplyModeVisibility();
         Show();
         StartRailWatch();
         Program.Log($"shown: bounds={Bounds} rail={_railMode} pending={_pendingWidth}");
+    }
+
+    /// <summary>给一支 WebView 建 CoreWebView2 并挂上同一套事件/设置（主面板与折叠条各一份）。</summary>
+    private async Task InitWebViewAsync(WebView2 web, Microsoft.Web.WebView2.Core.CoreWebView2Environment env)
+    {
+        await web.EnsureCoreWebView2Async(env);
+        web.CoreWebView2.Settings.AreDevToolsEnabled = false;
+        web.CoreWebView2.Settings.IsStatusBarEnabled = false;
+        // 页面 → 宿主的桥：窄条底部箭头用 window.chrome.webview.postMessage(...) 通知宿主。
+        // 走 WebView2 内置桥而不是绕 ECHO 的 HTTP + 命名管道，少一跳且不依赖 ECHO 在跑。
+        web.CoreWebView2.WebMessageReceived += OnWebMessage;
+        web.CoreWebView2.NavigationCompleted += OnNavigationCompleted;
+        web.CoreWebView2.NewWindowRequested += (_, e) =>
+        {
+            e.Handled = true;
+            try { Process.Start(new ProcessStartInfo(e.Uri) { UseShellExecute = true }); } catch { }
+        };
+    }
+
+    /// <summary>
+    /// 按当前模式切换**可见的那一页**（收起 = 折叠条页；展开 = 主面板页）。
+    /// 两页都常驻，这里只切可见性 + 通知页面"你现在是不是被看着"，页面据此暂停/恢复轮询
+    /// （避免收起时主面板还在后台每 3 秒打一轮 /api/status —— 那会让 ECHO 一直忙着）。
+    /// </summary>
+    private void ApplyModeVisibility()
+    {
+        if (_railMode)
+        {
+            _web.Visible = false;
+            _railWeb.Visible = true;
+            _railWeb.BringToFront();
+            TellPage(_web, "echoSetPanelVisible", false);
+            TellPage(_railWeb, "__echoSetRailVisible", true);
+        }
+        else
+        {
+            _railWeb.Visible = false;
+            _web.Visible = true;
+            _web.BringToFront();
+            TellPage(_railWeb, "__echoSetRailVisible", false);
+            TellPage(_web, "echoSetPanelVisible", true);
+        }
+    }
+
+    /// <summary>页面可能还没加载完：用 ExecuteScriptAsync 调一个**可选**的全局函数（不存在就算了）。</summary>
+    private static void TellPage(WebView2 web, string fn, bool value)
+    {
+        try
+        {
+            web.CoreWebView2?.ExecuteScriptAsync(
+                $"window.{fn} && window.{fn}({(value ? "true" : "false")});");
+        }
+        catch (Exception ex) { Program.Log($"tell page failed ({fn}): {ex.Message}"); }
     }
 
     /// <summary>
@@ -537,6 +642,9 @@ internal sealed class SidebarForm : Form
     {
         if (!_railMode || !_railVisible) return;
         _railVisible = false;
+        _railHovering = false;
+        _railShownByHover = false;
+        _railLeaveAt = null;
         // 点箭头时鼠标正贴在屏右缘，若不先解除武装会在下一次 tick 立刻弹回来
         _railWakeArmed = !CursorNearScreenEdge();
         SlideRailTo(ToPhysical(SidebarConfig.RailPeekWidth), "hide");
@@ -547,6 +655,10 @@ internal sealed class SidebarForm : Form
     {
         if (!_railMode || _railVisible) return;
         _railVisible = true;
+        _railHovering = false;
+        // 默认是"用户自己唤回"的（不自动收回）；悬停唤回那条路会在调用后把标记重新置真。
+        _railShownByHover = false;
+        _railLeaveAt = null;
         SlideRailTo(ToPhysical(SidebarConfig.RailWidth), reason);
     }
 
@@ -633,76 +745,201 @@ internal sealed class SidebarForm : Form
 
     /// <summary>
     /// 窄条状态机（每 200ms 一次）：
-    ///   显示态 —— 不做任何事（用户 2026-09-12 取消自动隐藏，改为点底部箭头手动隐藏）。
-    ///   隐藏态 —— 只剩 3px 在屏右缘；鼠标先离开贴边带、再贴边才唤回。
+    ///   隐藏态（只剩 3px）—— 鼠标先离开贴边带、再贴边并**停住**够久才滑出
+    ///     （"停住"= 位移不超过抖动阈值；拖别的窗口滚动条时鼠标一直在动，不会误触）。
+    ///   显示态 —— 若这次是"悬停临时滑出"，鼠标离开窄条区域一段时间后自动收回；
+    ///     手动点开的、或已经按「展开」变成主面板的，都不自动收回。
     /// 为什么要"先离开再贴边"：点箭头隐藏的瞬间鼠标就在贴边带里，直接判断会立刻弹回。
     /// </summary>
     private void RailWatchTick()
     {
-        if (IsDisposed) return;
-        if (!_railMode || _railVisible) return;
+        if (IsDisposed || !_railMode) return;
 
-        if (!_railWakeArmed)
+        // ---- 隐藏态（只剩 RailPeekWidth）：要"停住"够久才滑出 ----
+        if (!_railVisible)
         {
-            if (!CursorNearScreenEdge()) _railWakeArmed = true;
-            return;
-        }
-        if (CursorNearScreenEdge()) ShowRail("cursor near screen edge");
-    }
-
-    private void LoadContent()
-    {
-        try
-        {
-            Program.Log($"load content: rail={_railMode} retry={_railRetry}");
-            if (_railMode)
+            if (!_railWakeArmed)
             {
-                // 折叠条改为经 ECHO 的 HTTP 服务加载（与 API 同源）。
-                // 为什么不能再用 file://（2026-09-13 CRITICAL-1 修复的连带改动）：
-                // API 现在有来源守卫，file:// 页面发出的请求带 Origin: null 会被 403 拒绝
-                // （守卫必须拒 null，否则 sandbox iframe 之流又能绕回来）。同源加载后连
-                // CORS 都不需要。ECHO 没起来时先重试，重试期间退回本地文件/内嵌兜底。
-                if (!string.IsNullOrEmpty(_railUrl) && _railRetry < 6)
-                {
-                    _web.CoreWebView2?.Navigate(_railUrl + "?t=" + DateTime.Now.Ticks);
-                    return;
-                }
-                if (!string.IsNullOrEmpty(_railPath) && File.Exists(_railPath))
-                {
-                    var uri = new Uri(_railPath).AbsoluteUri;
-                    // 换页/重复加载同一地址时 WebView2 不会重新导航，加个无意义 query 强制刷新
-                    _web.CoreWebView2?.Navigate(uri + "?t=" + DateTime.Now.Ticks);
-                    return;
-                }
-                _web.CoreWebView2?.NavigateToString(RailFallbackHtml(SidebarConfig.RailVisualShift));
+                _railHovering = false;
+                if (!CursorNearScreenEdge()) _railWakeArmed = true;
                 return;
             }
-            _web.CoreWebView2?.Navigate(_baseUrl);
+            if (!CursorNearScreenEdge()) { _railHovering = false; return; }
+            // 有鼠标键按着 = 正在拖拽（典型：拖别的窗口的滚动条，它正好在屏右缘）。
+            // 这种"路过"绝不能算悬停 —— 用户 2026-10-23 反馈的就是这一类误触。
+            if (Control.MouseButtons != MouseButtons.None)
+            {
+                _railHovering = false;
+                return;
+            }
+
+            var pos = Cursor.Position;
+            if (!_railHovering)
+            {
+                _railHovering = true;
+                _railHoverAt = DateTime.UtcNow;
+                _railHoverAnchor = pos;
+                return;
+            }
+            // 鼠标还在动（典型：拖别的窗口的滚动条）→ 重新计时；停住不动才叫"悬停"。
+            if (Math.Abs(pos.X - _railHoverAnchor.X) > SidebarConfig.RailHoverJitterPx ||
+                Math.Abs(pos.Y - _railHoverAnchor.Y) > SidebarConfig.RailHoverJitterPx)
+            {
+                _railHoverAt = DateTime.UtcNow;
+                _railHoverAnchor = pos;
+                return;
+            }
+            if ((DateTime.UtcNow - _railHoverAt).TotalMilliseconds >= SidebarConfig.RailHoverDwellMs)
+            {
+                _railHovering = false;
+                ShowRail("hover dwell");
+                // ShowRail 会把"临时滑出"标记清掉：这一次要重新标上，鼠标离开后才会自动收回。
+                _railShownByHover = true;
+                _railLeaveAt = null;
+                Program.Log("rail shown by hover dwell");
+            }
+            return;
         }
-        catch (Exception ex) { Program.Log("navigate failed: " + ex.Message); }
+
+        // ---- 显示态：只有"悬停临时滑出"的那一次才自动收回 ----
+        // 点过「展开」（变成主面板）就不会再走这里（Expand 会把标记清掉）。
+        if (!_railShownByHover) return;
+        if (CursorInRailBand()) { _railLeaveAt = null; return; }
+        if (_railLeaveAt == null) { _railLeaveAt = DateTime.UtcNow; return; }
+        if ((DateTime.UtcNow - _railLeaveAt.Value).TotalMilliseconds >= SidebarConfig.RailAutoHideMs)
+        {
+            Program.Log("rail auto-hide after hover leave");
+            _railLeaveAt = null;
+            _railShownByHover = false;
+            HideRail();
+        }
+    }
+
+    /// <summary>鼠标是否在"折叠条那块区域"里（宽 RailWidth、贴右缘、纵向铺满工作区）。</summary>
+    private bool CursorInRailBand()
+    {
+        var pos = Cursor.Position;
+        var area = PrimaryWorkArea();
+        return pos.X >= area.Right - ToPhysical(SidebarConfig.RailWidth)
+               && pos.Y >= area.Top && pos.Y <= area.Bottom;
+    }
+
+    /// <summary>加载**主面板**（常驻；收起态也先加载好，展开时立即可见）。失败会自动重试。</summary>
+    private void LoadPanel()
+    {
+        _panelReady = false;
+        try
+        {
+            // 带一个无意义 query：升级后 app.js/app.css 的同名 URL 可能还在 WebView 缓存里，
+            // 每次启动换个 URL 就能确保拿到新文件（与折叠条那条 `?t=` 是同一个理由）。
+            Program.Log("load panel: " + _baseUrl);
+            _web.CoreWebView2?.Navigate(CacheBusted(_baseUrl));
+        }
+        catch (Exception ex) { Program.Log("navigate panel failed: " + ex.Message); }
+    }
+
+    /// <summary>给 URL 加一个每次都不同的 query（`?t=` 或 `&t=`）。</summary>
+    private static string CacheBusted(string url)
+    {
+        if (string.IsNullOrEmpty(url)) return url;
+        return url + (url.Contains("?") ? "&" : "?") + "t=" + DateTime.Now.Ticks;
+    }
+
+    /// <summary>加载**折叠条页**（与主面板各用一支 WebView，互不覆盖）。</summary>
+    private void LoadRail()
+    {
+        _railReady = false;
+        try
+        {
+            Program.Log($"load rail: retry={_railRetry}");
+            // 折叠条改为经 ECHO 的 HTTP 服务加载（与 API 同源）。
+            // 为什么不能再用 file://（2026-09-13 CRITICAL-1 修复的连带改动）：
+            // API 现在有来源守卫，file:// 页面发出的请求带 Origin: null 会被 403 拒绝
+            // （守卫必须拒 null，否则 sandbox iframe 之流又能绕回来）。同源加载后连
+            // CORS 都不需要。ECHO 没起来时先重试，重试期间退回本地文件/内嵌兜底。
+            if (!string.IsNullOrEmpty(_railUrl) && _railRetry < 6)
+            {
+                _railWeb.CoreWebView2?.Navigate(_railUrl + "?t=" + DateTime.Now.Ticks);
+                return;
+            }
+            if (!string.IsNullOrEmpty(_railPath) && File.Exists(_railPath))
+            {
+                var uri = new Uri(_railPath).AbsoluteUri;
+                // 换页/重复加载同一地址时 WebView2 不会重新导航，加个无意义 query 强制刷新
+                _railWeb.CoreWebView2?.Navigate(uri + "?t=" + DateTime.Now.Ticks);
+                return;
+            }
+            _railWeb.CoreWebView2?.NavigateToString(RailFallbackHtml(SidebarConfig.RailVisualShift));
+        }
+        catch (Exception ex) { Program.Log("navigate rail failed: " + ex.Message); }
     }
 
     /// <summary>
-    /// 折叠条页面加载失败就重试（ECHO 可能正在启动/重启）；连续失败 6 次后 LoadContent 会
+    /// 折叠条页面加载失败就重试（ECHO 可能正在启动/重启）；连续失败 6 次后 LoadRail 会
     /// 退回本地文件或内嵌兜底页面（此时守卫会拒掉它的跨域请求，界面会显示"不可达"状态）。
+    /// </summary>
+    /// <summary>
+    /// 导航失败就重试（ECHO 可能正在启动/重启）。**两页各有各的计数**：
+    /// 折叠条是在 ECHO 起来之前就要显示的（失败 6 次后退回本地文件/内嵌兜底）；
+    /// 主面板可以一直等（收起态看不见，展开时再补），这里给 30 次 × 2 秒 ≈ 1 分钟。
     /// </summary>
     private void OnNavigationCompleted(object sender, Microsoft.Web.WebView2.Core.CoreWebView2NavigationCompletedEventArgs e)
     {
-        if (e.IsSuccess) { _railRetry = 0; return; }
-        if (!_railMode) return;
-        if (_railRetry >= 6) { Program.Log($"rail page load gave up after {_railRetry} retries ({e.WebErrorStatus})"); return; }
-        _railRetry++;
-        Program.Log($"rail page load failed ({e.WebErrorStatus}) retry={_railRetry}");
-        if (_railRetryTimer == null)
+        if (ReferenceEquals(sender, _railWeb.CoreWebView2))
         {
-            _railRetryTimer = new System.Windows.Forms.Timer { Interval = 700 };
-            _railRetryTimer.Tick += (_, _) =>
+            if (e.IsSuccess)
             {
-                _railRetryTimer.Stop();
-                if (_railMode) LoadContent();
+                _railRetry = 0;
+                _railReady = true;
+                TellPage(_railWeb, "__echoSetRailVisible", _railWeb.Visible);
+                return;
+            }
+            if (_railRetry >= 6)
+            {
+                Program.Log($"rail page load gave up after {_railRetry} retries ({e.WebErrorStatus})");
+                return;
+            }
+            _railRetry++;
+            Program.Log($"rail page load failed ({e.WebErrorStatus}) retry={_railRetry}");
+            if (_railRetryTimer == null)
+            {
+                _railRetryTimer = new System.Windows.Forms.Timer { Interval = 700 };
+                _railRetryTimer.Tick += (_, _) =>
+                {
+                    _railRetryTimer.Stop();
+                    LoadRail();
+                };
+            }
+            _railRetryTimer.Start();
+            return;
+        }
+
+        // 主面板
+        if (e.IsSuccess)
+        {
+            _panelRetry = 0;
+            _panelReady = true;
+            TellPage(_web, "echoSetPanelVisible", _web.Visible);
+            return;
+        }
+        _panelReady = false;
+        if (_panelRetry >= 30)
+        {
+            Program.Log($"panel load gave up after {_panelRetry} retries ({e.WebErrorStatus})");
+            return;
+        }
+        _panelRetry++;
+        Program.Log($"panel load failed ({e.WebErrorStatus}) retry={_panelRetry}");
+        if (_panelRetryTimer == null)
+        {
+            _panelRetryTimer = new System.Windows.Forms.Timer { Interval = 2000 };
+            _panelRetryTimer.Tick += (_, _) =>
+            {
+                _panelRetryTimer.Stop();
+                LoadPanel();
             };
         }
-        _railRetryTimer.Start();
+        _panelRetryTimer.Start();
     }
 
     // ------------------------------------------------------------- 吸附/尺寸
@@ -772,10 +1009,16 @@ internal sealed class SidebarForm : Form
         StopRailAnim();           // 动画中按热键展开：先停掉动画，否则动画会继续按窄条宽度改 Bounds
         _railMode = false;
         _railVisible = true;      // 回到展开态：窄条状态复位
+        _railHovering = false;
+        _railShownByHover = false;   // 点了展开 = 常驻面板，不再有"离开就收回"
+        _railLeaveAt = null;
         if (!Visible) Show();
+        // **主面板一直活着**：这里只切可见性，不再 `Navigate` —— 展开是即时的，
+        // 不会出现"白屏等几秒才加载完"（2026-10-23 用户反馈）。
+        ApplyModeVisibility();
+        if (!_panelReady) LoadPanel();     // 启动时 ECHO 还没起来 → 现在补一次
         BringToFront();
         Activate();
-        LoadContent();            // 先导航：面板是本地服务、毫秒级，滑动过程中已经就位
         // 与"折叠条隐藏/出现"同一套滑动动效（用户 2026-09-13 要求）：窗口左缘向左滑出面板宽度，
         // WebView 固定为面板宽度、Left 跟着窗口左缘 → 面板内容整体从屏幕右缘滑出，不重排、不闪。
         var panelW = DesiredWidth();
@@ -791,13 +1034,20 @@ internal sealed class SidebarForm : Form
         if (!_railMode) _pendingWidth = Math.Max(SidebarConfig.MinPanelWidth, (int)Math.Round(Width / DpiScale()));
         _railMode = true;
         _railVisible = true;                       // 收起后先显示，之后由底部箭头手动隐藏
+        _railHovering = false;
+        _railShownByHover = false;                 // 手动收起不算"悬停临时滑出"
+        _railLeaveAt = null;
         _railWakeArmed = !CursorNearScreenEdge();
         if (!Visible) Show();
         StartRailWatch();
-        // 滑动期间 WebView 仍按面板宽度摆放 → 用户看到的是"面板整体向右滑走"；滑完再 LoadContent()
-        // 换成窄条页，否则滑动途中就会看到被压扁成 64px 的窄条页（内容重排，很难看）。
+        // 滑动期间 WebView 仍按面板宽度摆放 → 用户看到的是"面板整体向右滑走"；滑完再切到
+        // 折叠条页（两页都常驻，切换只是可见性，不再重新导航）。
         var panelW = DesiredWidth();
-        SlideRailTo(ToPhysical(SidebarConfig.RailWidth), "collapse", panelW, LoadContent, PanelAnimSteps);
+        SlideRailTo(ToPhysical(SidebarConfig.RailWidth), "collapse", panelW, () =>
+        {
+            ApplyModeVisibility();
+            if (!_railReady) LoadRail();
+        }, PanelAnimSteps);
     }
 
     /// <summary>兜底窄条页面（找不到 web/rail.html 时用）。padLeft 为左补偿像素。</summary>

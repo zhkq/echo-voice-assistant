@@ -108,7 +108,26 @@ set "ROOT=%ROOT:"=%"
 if "%ROOT:~-1%"=="\" set "ROOT=%ROOT:~0,-1%"
 if not defined ROOT set "ROOT=%DEF%"
 
-set "ARGS=-Profile minimal -Agent harness -Yes -Root "%ROOT%" -BackendDir "%HERE%""
+REM ---- existing install? say what an upgrade will and will not touch ----
+REM WHY: colleagues re-run this same file to update. Without a word they cannot
+REM tell whether their data/models/backend pairing/agent settings survive, and
+REM the old flow used to overwrite engine + agent settings (fixed 2026-10-23).
+set "EXISTING="
+if exist "%ROOT%\echo-core\app\main.py" set "EXISTING=1"
+if exist "%ROOT%\app\main.py" set "EXISTING=1"
+if defined EXISTING (
+  echo.
+  echo   Found an existing ECHO in this folder - this run UPGRADES it.
+  echo     updates : program code only ^(UI + core features^)
+  echo     keeps   : database + settings, meetings, model weights,
+  echo               backend pairing, phone/watch settings, agent settings
+  echo     asks    : whether to upgrade DSH ^(optional; agent settings stay unchanged^)
+  echo     note    : it stops ECHO briefly; refuse if a meeting is recording.
+)
+
+REM Upgrades are interactive (they ask about DSH); fresh installs keep -Yes.
+set "ARGS=-Profile minimal -Agent harness -Root "%ROOT%" -BackendDir "%HERE%""
+if not defined EXISTING set "ARGS=%ARGS% -Yes"
 if exist "%KIT%bundle\wheels" (
   set "ARGS=%ARGS% -Offline"
   echo.

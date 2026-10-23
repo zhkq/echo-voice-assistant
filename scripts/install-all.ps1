@@ -94,6 +94,16 @@ $script:TargetRoot = ''     # 安装根
 $script:CoreDir = ''        # 代码目录
 $script:StepNo = 0
 $script:TotalSteps = 7
+#: 这次是"升级"吗（已有安装）。由 `Invoke-InstallModeProbe` 在入口处判定后写这里。
+#: 升级只更新**核心代码**：数据/设置/模型权重/后端与手表配置/智能体配置一律不动
+#: （用户 2026-10-23 口径："升级主要是核心代码更新……dsh 可以询问是否升级，
+#:  但是 agent 相关的配置别碰"）。
+$script:IsUpgrade = $false
+#: 升级前后的版本（只用于收尾那一句话；不参与任何判断）
+$script:UpgradeFromVersion = ''
+$script:UpgradeToVersion = ''
+#: 升级前的数据库备份路径（收尾里如实告诉用户）
+$script:UpgradeDbBackup = ''
 #: 后端那一步的结论（`Invoke-BackendStep` 写，`Show-Result` 读）—— 收尾摘要里如实带一行。
 $script:BackendSummary = ''
 
@@ -560,7 +570,8 @@ function Install-TreeAndShortcuts {
     } elseif ($PipIndex) {
         $argList += @('-PipIndex', $PipIndex)
     }
-    if ($NoShortcuts) { $argList += @('-SkipDesktopLnk', '-SkipStartupLnk') }
+    # 升级不动桌面/开机自启（那是用户自己的环境，不属于"核心代码"）
+    if ($NoShortcuts -or $script:IsUpgrade) { $argList += @('-SkipDesktopLnk', '-SkipStartupLnk') }
     Info ("powershell {0}" -f ($argList -join ' '))
     # 离线模式：把 pip 也钉死在本地（万一 install.ps1 里还有别的 pip 调用）
     $saved = @{}
@@ -664,7 +675,9 @@ function Start-EchoOwnService {
 
 # ---------------------------------------------------------------- 组件（技能脚本，唯一实现）
 function Invoke-ComponentsScript {
-    param([string[]]$EngineList, [bool]$WantWake)
+    param([string[]]$EngineList, [bool]$WantWake,
+          # 升级专用：不改任何设置、不碰依赖/模型；DSH 升级只在用户同意时传 UpgradeDsh
+          [switch]$KeepSettings, [switch]$SkipPip, [switch]$SkipModels, [switch]$UpgradeDsh)
     Step '装组件（依赖 / 模型 / 设置 / 自检，调技能里的同一个脚本）'
     if (-not $script:SkillDir) { Err '没有 echo-install 技能目录 —— 组件这一步跑不了'; exit 1 }
     $comp = Join-Path $script:SkillDir 'scripts\echo-install-components.ps1'
@@ -680,6 +693,10 @@ function Invoke-ComponentsScript {
     if ($Diarize) { $argv['Diarize'] = $true }
     if ($NotesDir) { $argv['NotesDir'] = $NotesDir }
     if ($PipIndex -and -not $Offline) { $argv['PipIndex'] = $PipIndex }
+    if ($KeepSettings) { $argv['KeepSettings'] = $true }
+    if ($SkipPip) { $argv['SkipPip'] = $true }
+    if ($SkipModels) { $argv['SkipModels'] = $true }
+    if ($UpgradeDsh) { $argv['UpgradeDsh'] = $true }
     $shown = ($EngineList -join ',')
     Info ("& {0} -DestDir {1} -Engines {2} -Agent {3}{4}{5}" -f `
           $comp, $script:TargetRoot, $shown, $Agent,
@@ -747,6 +764,11 @@ function Show-Result {
         Info ("手动启动：powershell -NoProfile -ExecutionPolicy Bypass -File `"{0}\scripts\start.ps1`"" -f $script:CoreDir)
     }
     if ($script:BackendSummary) { Info $script:BackendSummary }
+    if ($script:IsUpgrade) {
+        Info ("升级完成：核心代码 {0} → {1}" -f $script:UpgradeFromVersion, $script:UpgradeToVersion)
+        Info '数据 / 设置 / 模型权重 / 后端与手表配置 / 智能体配置：一律未改动'
+        if ($script:UpgradeDbBackup) { Info ("升级前数据库备份：{0}" -f $script:UpgradeDbBackup) }
+    }
     Write-Host '  ────────────────────────────────────────────────' -ForegroundColor DarkGray
     Write-Host ''
     EndStep '收尾'
@@ -758,7 +780,8 @@ function Show-Result {
     Write-Host ("  日志：{0}" -f $script:LogPath) -ForegroundColor DarkGray
     Write-Host ''
     if ($ComponentsExit -eq 0) {
-        Write-Host '  全部就绪。' -ForegroundColor Green
+        if ($script:IsUpgrade) { Write-Host '  升级完成（只更新了核心代码）。' -ForegroundColor Green }
+        else { Write-Host '  全部就绪。' -ForegroundColor Green }
     } else {
         Write-Host ("  装完了，但组件那一步有没就绪的项（退出码 {0}）—— 上面列了是哪几项。" -f $ComponentsExit) -ForegroundColor Yellow
     }
@@ -1176,6 +1199,161 @@ function Invoke-BackendStep {
     EndStep '后端'
 }
 
+# ---------------------------------------------------------------- 升级模式（只更新核心代码）
+# 用户 2026-10-23 的口径：
+#   * 升级 = **核心代码更新**（界面 + 核心功能）；
+#   * 后端 / 手表配置、已有模型权重、智能体相关配置**都不要碰**；
+#   * DSH 可以**问一句**要不要升级；不问就不动。
+# 所以升级这条路**不写任何设置项**、不下载/替换模型、不碰后端与后端配对，
+# 也不改任何 agent 配置（agentBackend / agentHarnessEnabled / harnessCommand）。
+
+function Get-AppVersion([string]$Dir) {
+    $mf = Join-Path $Dir 'manifest.json'
+    if (-not (Test-Path -LiteralPath $mf)) { return '' }
+    try {
+        $j = Get-Content -LiteralPath $mf -Raw -Encoding UTF8 | ConvertFrom-Json
+        return [string]$j.appVersion
+    } catch { return '' }
+}
+
+function Show-UpgradePlan {
+    Step '升级：只更新核心代码（数据 / 配置 / 模型 / 后端都不动）'
+    $old = Get-AppVersion $script:CoreDir
+    $new = Get-AppVersion $script:Tree
+    if (-not $old) { $old = '未知' }
+    if (-not $new) { $new = '未知' }
+    $script:UpgradeFromVersion = $old
+    $script:UpgradeToVersion = $new
+    Info ("代码目录：{0}" -f $script:CoreDir)
+    Info ("版本：{0} → {1}" -f $old, $new)
+    if ($old -ne '未知' -and $new -ne '未知' -and $old -eq $new) {
+        Info '版本相同：仍会重新覆盖代码（可用于修复被改坏的安装）'
+    }
+    Info '会更新：app / web / sidebar / scripts 等程序代码（界面与核心功能）'
+    Info '会保留：数据库与全部设置、会议与文字稿、已有模型权重、后端地址与配对、手机/手表配置、智能体配置'
+    Info '不会做：不下载/不替换模型、不重新配对后端、不写任何设置项、不改桌面与开机自启'
+    EndStep '升级计划'
+}
+
+function Stop-EchoForUpgrade {
+    Step '升级：先停 ECHO 与边条（否则代码文件被占用）'
+    # 只认**这棵树自己的**端口文件：`Get-EchoPort` 在文件缺失时会兜底 8970，
+    # 那可能正好是别的树的实例 —— 升级绝不能顺手停别人的服务。
+    $portFile = Join-Path $script:TargetRoot 'data\echo-port.txt'
+    $port = 0
+    if (Test-Path -LiteralPath $portFile) {
+        try { $port = [int]((Get-Content -LiteralPath $portFile -Raw).Trim()) } catch { $port = 0 }
+    }
+    $apiUp = ($port -gt 0 -and (Test-EchoApi $port))
+    if ($apiUp) {
+        try {
+            $st = Invoke-RestMethod -Uri ("http://127.0.0.1:{0}/api/status" -f $port) -TimeoutSec 10
+            if ($st.meeting -and $st.meeting.active) {
+                Err '这场会正在录音 —— 不能升级。先结束录音再跑一次（音频与文字稿都在，不会丢）。'
+                exit 1
+            }
+            if ($st.busy) { Err '有命令正在处理中 —— 稍后再升级。'; exit 1 }
+        } catch {
+            Warn ("读不到 /api/status（{0}）—— 继续尝试正常停止" -f $_.Exception.Message)
+        }
+        try {
+            $r = Invoke-RestMethod -Uri ("http://127.0.0.1:{0}/api/control/echo/stop" -f $port) `
+                                   -Method Post -TimeoutSec 10
+            if (-not $r.ok) {
+                # 这条路径自己也会拦"在录音/有命令"；把服务端原话带出来，别自己编原因。
+                Err ("ECHO 拒绝停止：{0}" -f $r.message)
+                exit 1
+            }
+            Info '已请求 ECHO 正常停止（它会先请边条退出）'
+        } catch {
+            # 不要退回 stop.ps1：旧装的 stop.ps1 不认 -KeepBackend，会**顺手停掉后端**
+            # （用户口径：后端不要碰）；而且未知参数会让"停服务"这一步直接失败。
+            # 宁可如实停下，让人手动关：没停掉就覆盖代码 = 半升级。
+            Err ("调 /api/control/echo/stop 失败：{0}" -f $_.Exception.Message)
+            Err '没有停掉 ECHO 就不会覆盖代码。请手动关闭 ECHO（面板「关闭」或托盘退出）后重跑一次。'
+            exit 1
+        }
+        for ($i = 0; $i -lt 40; $i++) {
+            Start-Sleep -Milliseconds 500
+            if (-not (Test-EchoApi $port)) { break }
+        }
+        if (Test-EchoApi $port) {
+            Err ("ECHO 还在监听 {0} —— 没有停掉就不覆盖代码（会留下半升级的目录）。" -f $port)
+            Err '请手动关掉 ECHO 后重跑；或先看 data\logs\echo-server.log 里它为什么没退。'
+            exit 1
+        }
+    } else {
+        Info 'ECHO 没在运行（只确认边条）'
+    }
+
+    # 边条是独立进程，会锁住 sidebar\bin\...\echo-sidebar.exe/.dll。它由 ECHO 的
+    # `/api/control/echo/stop` 顺带请退；ECHO 本来没在跑时则要自己找一次。
+    $needle = ($script:CoreDir.TrimEnd('\') + '\sidebar\').ToLower()
+    $sidebars = @(Get-CimInstance Win32_Process -Filter "Name like 'echo-sidebar%'" -ErrorAction SilentlyContinue |
+                  Where-Object { $_.CommandLine -and $_.CommandLine.ToLower().Contains($needle) })
+    if ($sidebars.Count -gt 0) {
+        # 单实例边条：它一定持有这条命名管道；发 quit 是它自己的正常退出路径。
+        try {
+            $pipe = New-Object System.IO.Pipes.NamedPipeClientStream('.', 'echo-sidebar-toggle',
+                        [System.IO.Pipes.PipeDirection]::Out)
+            $pipe.Connect(800)
+            $writer = New-Object System.IO.StreamWriter($pipe)
+            $writer.Write('quit'); $writer.Flush(); $writer.Dispose(); $pipe.Dispose()
+            Info '已请边条退出'
+        } catch {
+            Warn ("通知边条退出失败（{0}）—— 等它自己退/必要时强制" -f $_.Exception.Message)
+        }
+        for ($i = 0; $i -lt 20; $i++) {
+            Start-Sleep -Milliseconds 500
+            $sidebars = @(Get-CimInstance Win32_Process -Filter "Name like 'echo-sidebar%'" -ErrorAction SilentlyContinue |
+                          Where-Object { $_.CommandLine -and $_.CommandLine.ToLower().Contains($needle) })
+            if ($sidebars.Count -eq 0) { break }
+        }
+        if ($sidebars.Count -gt 0) {
+            Warn '边条没有自己退出 —— 只强制结束**本棵树**的边条（否则代码文件会被占用）'
+            $sidebars | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+            Start-Sleep -Seconds 1
+        }
+    }
+    Ok 'ECHO 与边条已停（后端保持运行）'
+    EndStep '停止服务'
+}
+
+function Backup-UpgradeDatabase {
+    $db = Join-Path $script:TargetRoot 'data\echo.db'
+    if (-not (Test-Path -LiteralPath $db)) { return }
+    try {
+        $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+        $dst = "$db.bak-before-upgrade-$stamp"
+        Copy-Item -LiteralPath $db -Destination $dst -Force
+        $script:UpgradeDbBackup = $dst
+        Ok ("数据库已备份：{0}" -f $dst)
+    } catch {
+        # 备份失败不挡升级（数据目录本身不会被覆盖），但必须让人看见。
+        Warn ("数据库备份失败（{0}）—— 数据目录不会被覆盖，先继续" -f $_.Exception.Message)
+    }
+}
+
+function Ask-UpgradeDsh {
+    # 只有"已装过 DSH"才值得问；默认**不升级**（回车 = 不）。
+    $hasDsh = (Test-Path (Join-Path $script:TargetRoot 'dsh\app')) -or
+              (Test-Path (Join-Path $script:TargetRoot 'dsh\home\settings.yaml')) -or
+              (Test-Path (Join-Path $script:TargetRoot 'data\harness'))
+    if (-not $hasDsh) { return $false }
+    $interactive = $true
+    try { if ([Console]::IsInputRedirected) { $interactive = $false } } catch { $interactive = $false }
+    if (-not $interactive -or $Yes) {
+        Info '非交互/无人值守：不升级 DSH（要它请加 -Agent harness 或手动跑安装技能）'
+        return $false
+    }
+    Write-Host ''
+    Write-Host '    检测到已安装 DSH 标准版（智能体）。' -ForegroundColor White
+    Info '升级只会替换 DSH 的程序文件；智能体相关的配置（选哪个智能体 / harness 命令等）一个字不改。'
+    $ans = ''
+    try { $ans = Read-Host '    要顺便升级 DSH 标准版（harness）吗？(y/N)' } catch { }
+    return (('{0}' -f $ans).Trim() -match '^(y|yes|是)$')
+}
+
 # ---------------------------------------------------------------- 入口
 Write-Host ''
 Write-Host '  ============================================' -ForegroundColor Cyan
@@ -1269,11 +1447,33 @@ $script:TotalSteps = if ($Offline) { 11 } else { 8 }
 Resolve-KitLayout
 
 # **装之前**就把"这是全新还是升级"定下来并写盘（事后分不出来：新装完几秒就有库与设置了）。
-$null = Invoke-InstallModeProbe
+$installMode = Invoke-InstallModeProbe
+$script:IsUpgrade = ($installMode -eq 'upgrade')
+$upgradeDsh = $false
+if ($script:IsUpgrade) {
+    # 升级：代码更新 + 停/起服务；数据、设置、模型、后端、手表、智能体配置都不碰。
+    $script:TotalSteps = 10
+    Show-UpgradePlan
+    Stop-EchoForUpgrade
+    Backup-UpgradeDatabase
+    # 升级不装/不换模型，也不装依赖（引擎列表清空 → 组件脚本不会去写 sttModel）。
+    $engineList = @()
+    $wantWake = $false
+    $upgradeDsh = $false
+    if (Ask-UpgradeDsh) {
+        $Agent = 'harness'
+        $upgradeDsh = $true
+        Info 'DSH 标准版：本次会升级（只换程序文件，不改任何智能体配置）'
+    } else {
+        $Agent = 'none'
+        Info 'DSH 标准版：保持现状（不升级、不检查、不改配置）'
+    }
+}
 
 # 离线：先备好运行时/依赖/模型，再让 install.ps1 走 -SkipRuntime 那条路
+# ⚠️ 升级**不走这一段**：已有运行时/依赖/模型权重一律不动。
 $rcPy = ''
-if ($Offline) {
+if ($Offline -and -not $script:IsUpgrade) {
     $rcPy = Build-OfflineRuntime
     Install-CoreDepsOffline $rcPy
     Copy-BundleModels
@@ -1303,18 +1503,19 @@ Install-TreeAndShortcuts
 
 # **先起我们自己的实例、把端口钉死**，再让组件脚本干活 —— 否则它会连到别人的 ECHO
 # （端口推断顺序见 Start-EchoOwnService 的说明）。
-if (-not $SkipStart) { $null = Start-EchoOwnService }
+# 升级时一定重新拉起：刚才为了覆盖代码把它停了，不能把用户晾在"服务没起"的状态。
+if (-not $SkipStart -or $script:IsUpgrade) { $null = Start-EchoOwnService }
 else { Warn '-SkipStart：不起服务（组件那一步会自己起，端口按安装根的 data\echo-port.txt）'; Remove-Item env:ECHO_PORT -ErrorAction SilentlyContinue }
 
 # 服务起来了才能问它"技能装到哪" —— 随包技能必须落到 DSH 家目录的 skills\ 下才生效
 # （它们跟着代码树走，两者不是同一个目录，见 app/skills_setup.py 的说明）。
-if (-not $SkipStart) { Invoke-SkillsSetup }
+if (-not $SkipStart -or $script:IsUpgrade) { Invoke-SkillsSetup }
 
 # 离线：组件脚本自己也会 `pip install`（引擎依赖）。它的命令行里不会带 --no-index，
 # 所以这里把 pip 的**环境变量**钉死 —— pip 认 PIP_NO_INDEX / PIP_FIND_LINKS，
 # 效果与 `--no-index --find-links <wheels>` 完全一样（我们自己的核心依赖那一步
 # 是显式带命令行长参数的，日志里看得见）。
-if ($Offline) {
+if ($Offline -and -not $script:IsUpgrade) {
     $env:PIP_NO_INDEX = '1'
     $env:PIP_FIND_LINKS = (Join-Path $script:Bundle 'wheels')
     $env:PIP_DISABLE_PIP_VERSION_CHECK = '1'
@@ -1322,12 +1523,35 @@ if ($Offline) {
     Log 'EXEC' ("PIP_NO_INDEX=1 PIP_FIND_LINKS={0}" -f $env:PIP_FIND_LINKS)
 }
 
-$compExit = Invoke-ComponentsScript -EngineList $engineList -WantWake $wantWake
+if ($script:IsUpgrade) {
+    # 升级：**不写任何设置、不装依赖、不碰模型**，只跑自检（组件脚本里的 -KeepSettings）。
+    # 引擎列表为空 → 组件脚本不会去写 sttModel / meetingSttModel，也不会下模型。
+    $compExit = Invoke-ComponentsScript -EngineList @() -WantWake $false `
+                    -KeepSettings -SkipPip -SkipModels -UpgradeDsh:$upgradeDsh
+} else {
+    $compExit = Invoke-ComponentsScript -EngineList $engineList -WantWake $wantWake
+}
 # 「后端怎么来」排在组件之后、收尾之前：此刻服务已经起来了（`$env:ECHO_PORT` 钉死），
 # 配对与「起本机后端」都能立刻生效；结果再由 `Show-Result` 一起打进摘要。
 # ⚠️ 这一步**不许改退出码**：后端是可选项，装客户端本身是好的（`Invoke-BackendStep` 里
 # 只 Warn/Info + 写 `$script:BackendSummary`）。
-Invoke-BackendStep -Dir $BackendDir
+if ($script:IsUpgrade) {
+    # 升级**不问后端、不碰后端**（用户口径：后端配置不要碰）。
+    Step '后端：保持现有配置（未改动）'
+    try {
+        $bp = Get-EchoOwnPort
+        if ($bp) {
+            $cap = Invoke-RestMethod -Uri ("http://127.0.0.1:{0}/api/capability" -f $bp) -TimeoutSec 20
+            $echo = @($cap.backends | Where-Object { $_.name -eq 'echo-server' }) | Select-Object -First 1
+            if ($echo) { Info ("现有后端：{0}（ready={1}）" -f $echo.name, $echo.ready) }
+        }
+    } catch { }
+    Info '后端地址、配对与「允许音频去哪」都保持原样；不重新解包、不重新配对。'
+    $script:BackendSummary = '后端：保持现有配置（未改动）'
+    EndStep '后端'
+} else {
+    Invoke-BackendStep -Dir $BackendDir
+}
 Show-Result -ComponentsExit $compExit
 if ($compExit -ne 0) { exit $compExit }
 exit 0

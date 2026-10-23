@@ -21,7 +21,11 @@ param(
     [switch]$Quiet,
     # Restart path only: a restart starts ECHO again and the rail is meant to survive it
     # (the rail page retries while ECHO boots), so restart-echo.ps1 passes this switch.
-    [switch]$KeepSidebar
+    [switch]$KeepSidebar,
+    # Upgrade path: replace the program code only. The local capability backend is NOT
+    # part of the code tree and its pairing/settings must survive untouched, so leave it
+    # running (user 2026-10-23: "backend ... configuration must not be touched").
+    [switch]$KeepBackend
 )
 
 $ErrorActionPreference = 'Stop'
@@ -106,6 +110,9 @@ try {
 # never matches this path, so it is left alone (see the AGENTS.md rule: only stop what is
 # provably ours, never guess a victim).
 $beRoot = Join-Path $base 'backend'
+if ($KeepBackend) {
+    Write-Step 'keeping the local capability backend running (-KeepBackend)'
+} else {
 try {
     $procs = Get-CimInstance Win32_Process -Filter "Name like 'python%'" -ErrorAction Stop
     foreach ($p in $procs) {
@@ -123,6 +130,7 @@ try {
     }
 } catch {
     Write-Step "WARNING: could not scan for the local backend ($($_.Exception.Message))"
+}
 }
 
 # ---- 3) our own echo-sidebar.exe: ask it to exit (added 2026-10-21) ----

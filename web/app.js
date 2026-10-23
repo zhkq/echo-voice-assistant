@@ -6241,6 +6241,8 @@ function renderMeetingItems(el, items, opts = {}) {
 }
 
 async function pollTranscribe() {
+  // 边条收起（主面板被折叠条盖住）时不轮询：宿主会在展开时补一轮（见 echoSetPanelVisible）
+  if (!_panelVisible) return;
   try {
     _txStatus = await api("/api/transcribe/status");
   } catch (e) { return; }
@@ -8002,14 +8004,35 @@ async function loadPanelPrefs() {
 }
 loadPanelPrefs();
 
-setInterval(() => {
-  if (!_panelRefreshDue()) return;
+/* ---------------- 边条收起时暂停轮询（2026-10-23 用户："折叠后再展开要等几秒"） ----------------
+   边条宿主（echo-sidebar.exe）现在把**主面板常驻在后台**：收起/展开只切可见性、不再重新
+   导航页面，所以展开是即时的。代价是页面在看不见时也会继续轮询 —— 那会让 ECHO 一直忙着
+   （/api/status 这种聚合接口本机实测 2 秒级），必须由宿主告诉页面"你现在是不是被看着"。
+   宿主在切可见性、导航完成时调 `window.echoSetPanelVisible(true|false)`；
+   展开时立刻补一轮数据（页面内容一直在，用户不会看到白屏）。 */
+let _panelVisible = true;
+
+/** 刷新当前页签（原来的内联轮询逻辑抽出来：展开时也要用它补一轮）。 */
+function refreshActiveView() {
   const v = $(".tab.active");
   const view = v ? normView(v.dataset.view) : "";
   // `boot` 的内容现在在「常规」页、`failover` 的内容在「智能体」页（2026-09-25 页签整合）
   if (view === "dashboard") refreshDashboard();
   else if (view === "settings") { loadBoot(); loadBootLogs(); }
   else if (view === "agent" && !_rtDirty && !_rtBusy()) loadRouter();
+}
+
+window.echoSetPanelVisible = function (visible) {
+  _panelVisible = !!visible;
+  if (!_panelVisible) return;
+  refreshActiveView();
+  pollTranscribe();
+};
+
+setInterval(() => {
+  if (!_panelVisible) return;
+  if (!_panelRefreshDue()) return;
+  refreshActiveView();
 }, _PANEL_TICK_MS);
 // 转写进度轮询（会议列表进度条）
 setInterval(pollTranscribe, 2000);

@@ -409,10 +409,18 @@
     if (e.data === "rail-shown") pollStatus();
   });
 
+  // 宿主（echo-sidebar.exe）告诉本页"现在是不是被看着"：主面板展开时折叠条被盖住，
+  // 没必要继续轮询（两页都常驻、只有一页可见）。可见时立即补一轮状态。
+  let _railVisible = true;
+  window.__echoSetRailVisible = function (visible) {
+    _railVisible = !!visible;
+    if (_railVisible) { pollStatus(); pollNet(); }
+  };
+
   pollStatus();
   pollNet();
-  setInterval(pollStatus, 3000);
-  setInterval(pollNet, 3000);
+  setInterval(() => { if (_railVisible) pollStatus(); }, 3000);
+  setInterval(() => { if (_railVisible) pollNet(); }, 3000);
 </script>
 </body>
 </html>
