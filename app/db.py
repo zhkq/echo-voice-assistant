@@ -531,6 +531,16 @@ def sync_setting_meta(key, grp, label, description, value_type, options):
         (grp, label, description, value_type, _json_dumps(options or []), key))
 
 
+def delete_setting(key):
+    """删除一行设置（用于清理**已彻底下线**的键；不删用户仍在用的键）。
+
+    为什么需要它：`all()` 是按**库行**出的 —— 一个已经从 DEFAULTS 删掉的键，
+    旧库里的行仍然会被返回，面板的「未归类」兜底就会把它当设置显示出来。
+    2026-10-23 真机现场：升级后多出四条 `providerLlm*` 垃圾配置。
+    """
+    _exec("DELETE FROM settings WHERE key=?", (key,))
+
+
 def all_settings():
     rows = _query("SELECT * FROM settings ORDER BY grp, key")
     for r in rows:

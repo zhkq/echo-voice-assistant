@@ -1178,6 +1178,20 @@ DEPRECATION_MIGRATIONS = {
                     ("local-tts", "ttsEngine", OFFLINE_TTS_PLACEHOLDER)),
 }
 
+#: **已彻底下线**的设置键（不是 `deprecated`：连"保留老值兼容读取"都不要了）。
+#:
+#: 为什么要专门清库行：`Settings.all()` 是按**库行**出的 —— 一个已经从 DEFAULTS 删掉的键，
+#: 旧库里的行仍然会被返回；面板的「未归类」兜底会把它当设置显示出来。
+#: 2026-10-23 真机现场：一台从旧版升级到 2.1.8 的机器，设置页多出四条「语言模型 provider /
+#: 在线 LLM 地址 / 密钥 / 模型名」的垃圾配置（`providerLlm*`）—— 就是这一条。
+#: `seed_defaults()` 每次启动清一次，幂等；值本身已无任何代码引用，删掉是安全的。
+REMOVED_SETTINGS = (
+    "providerLlm",          # 2026-10-22：ECHO 不直连 LLM，语言模型 provider 取消
+    "providerLlmBaseUrl",   # 三项是配置在线 LLM 的输入，随 providerLlm 一起下线
+    "providerLlmApiKey",
+    "providerLlmModel",
+)
+
 
 #: 读时归一：老库里某些键的**遗留取值**在新语义下已经没有对应意义，但既不能报错、
 #: 也不能逼用户重新做一次决定。在这里（唯一的取值出口）折成新值，`get()` 与 `all()`
@@ -1327,6 +1341,15 @@ class Settings:
                                        options=options)
                 # 弃用项的值迁移（把"已弃用开关"表达的意图搬到还在生效的那一项上）
                 self._migrate_deprecated(key)
+        # 清理**已彻底下线**的键（见 REMOVED_SETTINGS）：它们不在 DEFAULTS 里，
+        # 旧库里的行会被 all() 原样返回 → 面板「未归类」里出现垃圾配置。
+        existing = {r["key"] for r in db.all_settings()}
+        gone = [k for k in REMOVED_SETTINGS if k in existing]
+        for k in gone:
+            db.delete_setting(k)
+        if gone:
+            db.add_log("info", "config",
+                       "清理已下线的设置项：%s" % "、".join(gone))
         self._drop_cache()
 
     def _migrate_deprecated(self, key):
