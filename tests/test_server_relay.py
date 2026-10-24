@@ -274,6 +274,37 @@ class HttpSurfaceTests(unittest.TestCase):
         self.assertEqual(429, second.status_code)
         self.assertEqual("relay_rate_limited", second.json()["code"])
 
+    def test_cors_preflight_for_phone_audio_upload(self):
+        """手机 H5 的二进制上传：浏览器先发带 Authorization/Content-Type 的 OPTIONS。
+
+        没有 CORS 中间件时预检会落到路由上 → 405（`Allow` 里没有 OPTIONS），
+        真正的 POST 根本不会发出去。这条把"预检必须能被直接应答"钉住。
+        """
+        r = self.client.options(
+            "/v1/relay/cli-619e43/api/meeting/segment",
+            headers={
+                "Origin": "https://appassets.stepos.com",
+                "Access-Control-Request-Method": "POST",
+                "Access-Control-Request-Headers": "authorization,content-type",
+            })
+        self.assertIn(r.status_code, (200, 204), "预检不该是 405")
+        self.assertEqual("*", r.headers.get("access-control-allow-origin"))
+        self.assertIn("POST", r.headers.get("access-control-allow-methods", ""))
+        allowed_headers = r.headers.get("access-control-allow-headers", "").lower()
+        self.assertIn("authorization", allowed_headers)
+        self.assertIn("content-type", allowed_headers)
+
+    def test_real_phone_upload_response_also_carries_cors_header(self):
+        """真正的 POST（哪怕主机离线/鉴权失败）也必须带 ACAO，否则浏览器照样拦。"""
+        r = self.client.post(
+            "/v1/relay/cli-619e43/api/meeting/segment",
+            content=b"\x00" * 16,
+            headers={**PHONE_HDR,
+                     "Origin": "https://appassets.stepos.com",
+                     "Content-Type": "audio/wav"})
+        self.assertEqual(503, r.status_code, "host 没挂上：请求本身已过了 CORS 与鉴权")
+        self.assertEqual("*", r.headers.get("access-control-allow-origin"))
+
 
 class EndToEndTests(unittest.TestCase):
     """手机 → 后端 → 主机（真 HTTP、真线程）→ 手机。"""

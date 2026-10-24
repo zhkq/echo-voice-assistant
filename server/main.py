@@ -18,6 +18,7 @@ import time
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from server.jsonx import SafeJSONResponse
 
@@ -291,6 +292,29 @@ def create_app(cfg=None) -> FastAPI:
                     client_id = ""
             request.state.relay_host_id = client_id
         return await call_next(request)
+
+    # ---------------------------------------------------------------- CORS（手机 H5 上传）
+    # 手机 App 的会议录音页跑在 Android WebView 里（H5），它用 **XHR/fetch** 调
+    # `POST /v1/relay/<clientId>/api/…/segment` 上传二进制音频段。这条请求带
+    # `Authorization` 与 `Content-Type: audio/wav`，两者都不是 CORS 安全列表里的头，
+    # 所以浏览器会先发 **OPTIONS 预检**；没有 CORS 中间件时预检落到路由上 → 405
+    # （`Allow` 里没有 OPTIONS），真正的 POST 根本不会发出去。
+    #
+    # 为什么是 `allow_origins=["*"]`：鉴权走 `Authorization: Bearer`，**不用 cookie**
+    # （`allow_credentials` 保持默认 False），因此通配源不会把登录态带给第三方页面；
+    # 这条服务本来就是为了让任意来源的手机壳页面能上传音频。
+    # `allow_headers=["*"]` 必须带上 —— 预检请求的 `Access-Control-Request-Headers`
+    # 正是 `authorization,content-type`。
+    #
+    # 放在路由注册**之前**、且在其他 `@app.middleware` 之后 `add_middleware`：
+    # Starlette 后添加的中间件在外层，预检会在这里被直接应答，不会进鉴权/路由。
+    # 只增加预检应答与响应头，不改任何接口契约、鉴权或业务逻辑。
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
     app.include_router(routes_mod.router)
     # 中继（relay）：手机与主机互相连不通时，借这台服务器中转（见 server/relay.py）。
