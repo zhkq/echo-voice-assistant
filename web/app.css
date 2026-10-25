@@ -790,6 +790,13 @@ body.on-history { height: 100vh; overflow-y: hidden; }
 #historyList, #meetingList {
   flex: 1 1 auto; min-height: 0; height: auto; max-height: none; overflow-y: auto;
 }
+/* 回顾历史列表（2026-10-26 用户截图："回顾页高度有问题"）：
+   它也是 `.cmd-list`，而基础规则给了 `max-height: 320px` —— 于是只显示两三行、
+   下面留一大片死空白，还不跟着窗口长。历史页这一层必须解掉高度上限、交给 flex 撑满，
+   与指令/会议两个历史列表同一个口径。 */
+#reviewHistList {
+  flex: 1 1 auto; min-height: 0; height: auto; max-height: none; overflow-y: auto;
+}
 
 /* ---------- 启动状态 / 启动日志 ----------
    2026-09-25 整合：原来那套"每个组件一行"的 `.boot-row` 明细（图标/名称/详情/耗时/进度条/

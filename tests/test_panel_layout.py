@@ -124,6 +124,10 @@ class PanelLayoutContractTests(unittest.TestCase):
                               "%s 的 overflow 被改成别的了 —— 内容是滚还是被裁？" % sel)
         self.assertIn("max-height: none", self._props(".dashboard-grid .meeting-list"),
                       "会议列表要能长满卡片（基础规则的 max-height:300px 会把它卡住）")
+        # 回顾历史列表同样是 `.cmd-list`：基础规则的 `max-height:320px` 会让它只显示两三行、
+        # 下边留一大片空白（2026-10-26 用户截图）。历史页这一层必须解掉上限、由 flex 撑满。
+        self._assert_has("#reviewHistList", "flex: 1 1 auto", "min-height: 0",
+                         "max-height: none", "overflow-y: auto")
 
     def test_body_is_a_shrinkable_flex_column(self):
         self._assert_has("body", "min-width: 0")
