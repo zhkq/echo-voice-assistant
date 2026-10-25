@@ -5184,12 +5184,15 @@ function reviewLastLineHTML(sum) {
   return `<span class="dim">最近一次 ${esc(when)}</span>：${esc(brief)}`;
 }
 
-/** 仪表盘那张回顾卡：三态 + 两个动作。
+/** 仪表盘那张回顾卡：**手机准备/已就绪** + PC 进行中 + 今天轮数。
  *
- *  状态口径（与 `/api/daily-review/summary` 一一对应）：
+ *  状态口径：
  *    * 未启用（或没配笔记库）→ 说清缺什么，并把人送去设置；
+ *    * PC 回顾模式在跑（`running`）→ 进行中；
+ *    * 手机刚点了「开始回顾」、准备任务在跑（`pre.phase=pre`）→ 准备中（不能显示成"今天还没回顾"）；
+ *    * 今天已有会话但还 0 轮（`sessionId` 非空）→ 已就绪/准备完成（说一轮就会进历史）；
  *    * 今天已回顾 → 显示今天几轮 + 最近一条播报；
- *    * 今天还没回顾 → 鼓动开始（按钮就是「开始回顾」）。
+ *    * 连会话都还没有 → 鼓动开始。
  */
 async function refreshReviewCard() {
   const badge = $("#reviewBadge"), info = $("#reviewInfo"), last = $("#reviewLast");
@@ -5203,6 +5206,9 @@ async function refreshReviewCard() {
   const on = !!home.enabled;
   const readyOk = !!home.ready;
   const running = !!home.running;
+  const pre = home.pre || {};
+  const hasSession = !!String(home.sessionId || "").trim();
+  const preElapsed = Math.max(0, Math.round(Number(pre.elapsed) || 0));
 
   const btnNow = $("#btnReviewNow"), btnStop = $("#btnReviewStop");
   const show = (el, yes) => { if (el) el.classList.toggle("hidden", !yes); };
@@ -5218,8 +5224,20 @@ async function refreshReviewCard() {
     state = "offline"; short = "未就绪"; tip = home.reason || "回顾还没配好";
   } else if (running) {
     state = "online"; short = "进行中"; tip = "正在回顾（在车里说，或点「结束回顾」）";
+  } else if (pre.phase === "pre") {
+    // 2026-10-25：手机点开始后**先跑准备**，此时还没有任何一轮，但绝不能显示"今天还没回顾"
+    state = "online"; short = "准备中";
+    tip = `手机正在准备今天的回顾素材（已 ${preElapsed} 秒）`;
   } else if (sum.todayTurns > 0) {
     state = "online"; short = "今天已回顾"; tip = `今天 ${sum.todayTurns} 轮`;
+  } else if (hasSession && pre.phase === "done") {
+    state = "online"; short = "已就绪"; tip = "今天的回顾已准备好，还没口述";
+  } else if (hasSession && (pre.phase === "timeout" || pre.phase === "failed")) {
+    state = "online"; short = "准备未完成"; tip = pre.error || "准备没跑完，可以直接开始说";
+  } else if (hasSession && pre.phase === "stopped") {
+    state = "idle"; short = "已跳过准备"; tip = "直接开始说，说一轮就会进回顾历史";
+  } else if (hasSession) {
+    state = "online"; short = "已开始"; tip = "今天的回顾会话已建好，还没口述";
   } else {
     state = "idle"; short = "今天还没回顾"; tip = "点「开始回顾」，或在车里说「我们来回顾今天」";
   }
@@ -5233,9 +5251,24 @@ async function refreshReviewCard() {
     if (!on) info.innerHTML = `回顾没启用 —— <a href="#" data-goto-link="settings">去设置里打开 ›</a>`;
     else if (!readyOk) info.textContent = home.reason || "回顾还没配好";
     else if (running) info.textContent = "正在回顾 —— 对着麦克风讲，讲完停一下";
-    else if (sum.todayTurns > 0) {
+    else if (pre.phase === "pre") {
+      info.textContent = `手机回顾准备中 · 已用时 ${preElapsed} 秒 —— 准备好就可以开始说`;
+    } else if (sum.todayTurns > 0) {
       info.textContent = `今天已回顾 ${sum.todayTurns} 轮`
         + (sum.todayFailed ? `（${sum.todayFailed} 轮没成）` : "");
+    } else if (hasSession) {
+      // 会话已建、还没有一轮：准备完成/未完成/跳过都归这一档。
+      // **不许**再说"今天还没回顾"（用户 2026-10-25 实测：手机已开始准备，仪表盘却是空的）。
+      const head = pre.phase === "done" ? "今天的回顾已准备好"
+        : pre.phase === "timeout" || pre.phase === "failed" ? "准备没跑完"
+        : pre.phase === "stopped" ? "已跳过准备"
+        : "今天的回顾已开始";
+      const raw = String(pre.reply || "");
+      const short = raw.length > 48 ? raw.slice(0, 47) + "…" : raw;
+      const tail = short
+        ? `：${short}`
+        : "（还没有口述）—— 在手机上说一轮，就会写进「回顾历史」";
+      info.textContent = head + tail;
     } else info.textContent = "今天还没回顾";
   }
   // **只保留最近 1 条**（用户 2026-10-07："仅保留最近1条"）。摘要就是那一句播报 ——
@@ -5310,8 +5343,34 @@ async function loadReviewHistory(force) {
     }
   }
   const items = (_reviewHist && _reviewHist.items) || [];
+  // 2026-10-25：手机点了开始回顾、准备也跑完了，但**还没口述**时，历史里一条都没有 ——
+  // 用户看到的就是"仪表盘看不到回顾记录"。这里给今天一条**占位**（明确写"还没口述"），
+  // 它不是一轮记录，所以不计数、不可点开。
+  let home = _reviewHome;
+  if (!home || !home.sessionId) {
+    try { home = await api("/api/daily-review"); _reviewHome = home; } catch (e) { /* 保留旧值 */ }
+  }
+  const pre = (home && home.pre) || {};
+  const kind = String((home && home.kind) || "");
+  const today = kind.indexOf("review:") === 0 ? kind.slice(7) : "";
+  const hasToday = !!(today && items.some((it) => it.date === today));
+  let pending = "";
+  if (today && !hasToday) {
+    const phaseText = pre.phase === "pre" ? `准备中（已 ${Math.max(0, Math.round(Number(pre.elapsed) || 0))} 秒）`
+      : pre.phase === "done" ? "准备完成，还没口述"
+      : pre.phase === "timeout" || pre.phase === "failed" ? "准备未完成，还没口述"
+      : pre.phase === "stopped" ? "已跳过准备，还没口述"
+      : (home && home.sessionId) ? "回顾已开始，还没口述" : "";
+    if (phaseText) {
+      const text = pre.reply || "在手机上说一轮，ECHO 会整理并写进这里。";
+      pending = `<div class="cmd-item review-day" style="opacity:.85">
+          <div class="head"><b>${esc(today)}</b><span class="muted">· ${esc(phaseText)}</span></div>
+          <div class="text">${esc(text)}</div>
+        </div>`;
+    }
+  }
   if (cnt) cnt.textContent = items.length ? `${items.length} 天` : "—";
-  if (!items.length) {
+  if (!items.length && !pending) {
     // 空态要说清"去哪儿开始"，不能只说"没有"
     list.innerHTML = `<div class="muted" style="font-size:12px">还没有回顾记录 ——
         在<b>仪表盘</b>的「每日回顾」卡上点「开始回顾」，或在车里说「我们来回顾今天」。</div>`;
@@ -5319,7 +5378,7 @@ async function loadReviewHistory(force) {
     if (d) { d.classList.add("hidden"); d.innerHTML = ""; }
     return;
   }
-  list.innerHTML = items.map((it) => {
+  list.innerHTML = pending + items.map((it) => {
     const when = esc(String(it.lastAt || "").slice(5, 16));
     const open = _reviewOpenDate === it.date;
     return `<div class="cmd-item review-day${open ? " open" : ""}" data-review-date="${esc(it.date)}">
