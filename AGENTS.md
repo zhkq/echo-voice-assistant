@@ -1188,3 +1188,21 @@ scopes 还得重发）。当晚的绕法：用 `pairing.pair()` 里**逐字同�
   与"此刻发码会用的地址"用同一个函数（否则页面说 http、发出来 https，更容易误判）。
   **交付里的 `ECHO-backend-portable-20261015` 是旧 `server/ops.py`（没有这层）**——发给同事前
   要重出后端包，否则服务端那一侧还是 http。
+
+## 2026-10-25：手机回顾的「准备任务」（`/api/daily-review/pre`）—— 实现与判据
+
+- **用户实测**：手机点开始回顾后提示「这台电脑的 ECHO 还不支持回顾准备」。根因**不是中继**，
+  而是当时手机连的稳定版 `D:\ECHO` 跑的是 **2.1.7**，`/api/daily-review/pre` 这条路由根本不存在
+  （404）。App 按兼容矩阵降级是对的；服务端补齐三条路由后即可，**App 不用改**。
+- **新增**（`app/daily_review.py` + `app/api.py`）：
+  * `POST /api/daily-review/pre`：立即返回 `ack/topics/etaSec`，后台线程跑技能第 0 步；
+    **绝不碰麦**、不调 `assistant.start_review()`、不写回顾轮次；
+  * `GET /api/daily-review/pre`：只读轮询（App 2.5s）；`phase` ∈ `idle/pre/done/timeout/failed/stopped`；
+    只有 **`phase=done && finished=true`** 才算完成，`reply` 是「前置环节完成 + 计数」；
+  * `POST /api/daily-review/pre/stop`：只停准备（不结束会话）；
+  * `POST /api/daily-review/stop` 增加 `preStopped`（`stopped` 语义不变）。
+- **单例**：PC 的 `preflight()` 与手机 `/pre` 共用同一份 `_PRE`；PC 后到会**加入等待**，不再跑第二份。
+  `_PRE` 有锁 + `gen` 代号（停止/重开时旧线程晚到更新作废）；完成只认 `PRE_DONE_MARK`。
+  判据：`tests/test_daily_review_pre.py`（12 条）+ 现有 `tests/test_daily_review.py` 全绿。
+- **改完必须同步稳定版才生效**：手机连的是 `D:\ECHO`（稳定版），要 `scripts/deploy-stable.ps1`
+  + 重启；只跑 dev 的单测通过不代表手机能用（本轮就是这么暴露的）。

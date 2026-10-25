@@ -1129,6 +1129,40 @@ def get_daily_review(_auth=Depends(optional_auth)):
     return st
 
 
+@router.get("/daily-review/pre")
+def get_daily_review_pre(_auth=Depends(optional_auth)):
+    """**准备任务现状**（手机每 2.5 秒轮询这一条）。
+
+    只读：不建会话、不建 client、不触发任何动作。返回与 `GET /api/daily-review`
+    里的 `pre` 同一份结构（2026-10-25 手机回顾的"准备提示"就靠它）。
+    """
+    from app import daily_review
+    st = daily_review.pre_state()
+    return {"ok": True, "day": st.get("day") or "",
+            "sessionId": st.get("sessionId") or "", "pre": st}
+
+
+@router.post("/daily-review/pre")
+def post_daily_review_pre(_auth=Depends(optional_auth)):
+    """**手机开始回顾后的准备任务**：把技能第 0 步发给配置的智能体，立即返回。
+
+    * 不碰麦克风（与 `/go` 的根本区别：`/go` 会 `assistant.start_review()` 开电脑的麦）；
+    * 已在跑 → `already=true`；今天已完成 → `done=true`；都不重复发 prompt；
+    * 返回里的 `ack` / `topics` 供 App 显示"准备已开始 + 本次回顾会梳理什么"。
+    """
+    from app import daily_review
+    return daily_review.start_pre()
+
+
+@router.post("/daily-review/pre/stop")
+def post_daily_review_pre_stop(_auth=Depends(optional_auth)):
+    """只停准备（手机点「先开始说，不等准备」），**不结束回顾会话**。"""
+    from app import daily_review
+    stopped = daily_review.stop_pre()
+    return {"ok": True, "preStopped": bool(stopped),
+            "pre": daily_review.pre_state()}
+
+
 @router.post("/daily-review/start")
 def post_daily_review_start(body: DailyReviewStartIn = None, _auth=Depends(optional_auth)):
     """准备今天的回顾会话（幂等）。`force_new=true` 时当天也重建。"""
@@ -1263,9 +1297,16 @@ async def post_daily_review_turn(request: Request, _auth=Depends(optional_auth))
 
 @router.post("/daily-review/stop")
 def post_daily_review_stop(_auth=Depends(optional_auth)):
-    """停掉正在进行的语音回顾（等价于用户说"结束回顾"）。"""
+    """停掉正在进行的语音回顾（等价于用户说"结束回顾"），**一并停准备任务**。
+
+    两个字段语义分开（都是**如实**回，不猜）：
+      * `stopped`   —— PC 语音回顾是否真的停了（老字段，语义不变）；
+      * `preStopped` —— 本次调用是否真的停掉了一个在跑的准备（手机准备/PC 前置环节）。
+    """
+    from app import daily_review
     stopped = assistant.stop_review()
-    return {"ok": True, "stopped": stopped}
+    pre_stopped = daily_review.stop_pre()
+    return {"ok": True, "stopped": stopped, "preStopped": pre_stopped}
 
 
 @router.post("/daily-review/go")

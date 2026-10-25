@@ -1037,18 +1037,125 @@ PRE_NUDGE_TEXT = (
     "【前置环节·继续】刚才那一轮结束了，但第 0 步还没做完（扫当天文件 + 会议纪要归档）。"
     "请继续把它做完；**全部做完后只回一句**「前置环节完成 + 计数」，不要再问问题。")
 
-_PRE = {"phase": "", "startedAt": 0.0, "seconds": 0.0, "finished": False,
-        "etaSec": PRE_ETA_S, "error": "", "nudges": 0}
+#: 前置环节的共享状态。
+#:
+#: 2026-10-25 起它不只服务 PC 语音回顾：手机 App 通过
+#: `POST /api/daily-review/pre` 触发同一个准备任务（`start_pre()`），再用
+#: `GET /api/daily-review/pre` 轮询进度。所以：
+#:   * **一天只跑一份**：PC/手机谁先到谁拥有，另一个加入等待（`preflight` 里判断）；
+#:   * 所有读写都在 `_PRE_LOCK` 里，对外只给**完整快照**（不许看到半初始化状态）；
+#:   * `gen` 是一次运行的代号：停止/重开时旧线程晚到的更新会被丢掉。
+_PRE_LOCK = threading.RLock()
+_PRE_START_LOCK = threading.Lock()       # 串行化 start_pre() 的"检查 + 起线程"
+_PRE = {
+    "phase": "idle", "day": "", "startedAt": 0.0, "seconds": 0.0, "finished": False,
+    "etaSec": PRE_ETA_S, "error": "", "nudges": 0,
+    # 手机端要看的"准备已经开始 + 本次回顾会梳理什么"
+    "ack": "", "topics": [], "reply": "", "sessionId": "",
+    # 内部字段（不对外）
+    "gen": 0, "owner": "", "doneEvent": None, "stopEvent": None, "thread": None,
+}
+
+#: `pre_state()` 对外的字段（内部字段不外泄）。
+_PRE_PUBLIC = ("phase", "day", "startedAt", "seconds", "finished", "etaSec",
+               "error", "nudges", "ack", "topics", "reply", "sessionId")
+
+
+def _pre_today() -> str:
+    return datetime.datetime.now().strftime("%Y-%m-%d")
+
+
+def _pre_update(gen, **kw) -> None:
+    """只允许**当前那一次运行**改状态（旧线程晚到的更新丢掉）。"""
+    with _PRE_LOCK:
+        if int(_PRE.get("gen") or 0) != int(gen or 0):
+            return
+        _PRE.update(kw)
+
+
+def _pre_done(gen) -> None:
+    """把 doneEvent 置位（允许重复调用）。"""
+    with _PRE_LOCK:
+        if int(_PRE.get("gen") or 0) != int(gen or 0):
+            return
+        ev = _PRE.get("doneEvent")
+    if ev is not None:
+        ev.set()
 
 
 def pre_state() -> dict:
-    """前置环节的现状（面板读）。**纯读**，不触发任何动作。"""
-    st = dict(_PRE)
-    if st["phase"] == "pre" and st["startedAt"]:
-        st["elapsed"] = round(time.time() - st["startedAt"], 1)
-    else:
-        st["elapsed"] = st["seconds"]
+    """前置环节的现状（面板 / 手机轮询）。**纯读**，不触发任何动作。"""
+    with _PRE_LOCK:
+        st = {k: _PRE.get(k) for k in _PRE_PUBLIC}
+        topics = st.get("topics")
+        st["topics"] = list(topics) if isinstance(topics, (list, tuple)) else []
+        if st["phase"] == "pre" and st["startedAt"]:
+            st["elapsed"] = round(time.time() - float(st["startedAt"] or 0), 1)
+        else:
+            st["elapsed"] = st["seconds"]
     return st
+
+
+def _pre_result() -> dict:
+    """给 `preflight()` 的"加入已有准备"分支用的结果（与原来同形）。"""
+    st = pre_state()
+    return {"ok": bool(st["finished"]), "session_id": st.get("sessionId") or "",
+            "ack": st.get("ack") or "", "finished": bool(st["finished"]),
+            "timed_out": st["phase"] == "timeout", "seconds": st["seconds"],
+            "reply": st.get("reply") or "", "error": st.get("error") or "",
+            "nudges": st.get("nudges") or 0,
+            "stopped": st["phase"] == "stopped"}
+
+
+def _pre_begin(ack_text="", topics=None, session_id="", owner="", eta=None):
+    """开一次新的准备（调用方负责先确认没有正在跑的）。返回 `(gen, done, stop)`。"""
+    with _PRE_LOCK:
+        gen = int(_PRE.get("gen") or 0) + 1
+        done = threading.Event()
+        stop = threading.Event()
+        _PRE.update({
+            "gen": gen, "phase": "pre", "day": _pre_today(),
+            "startedAt": time.time(), "seconds": 0.0, "finished": False,
+            "etaSec": int(eta or PRE_ETA_S), "error": "", "nudges": 0,
+            "ack": ack_text or pre_ack_text(), "topics": list(topics or []),
+            "reply": "", "sessionId": session_id or "", "owner": owner or "",
+            "doneEvent": done, "stopEvent": stop, "thread": None,
+        })
+        return gen, done, stop
+
+
+def _pre_finish(gen, out) -> None:
+    """一次运行收尾：写终态 + 置 doneEvent。**幂等**（重复调用不覆盖）。"""
+    with _PRE_LOCK:
+        if int(_PRE.get("gen") or 0) != int(gen or 0):
+            return
+        if _PRE.get("doneEvent") is not None and _PRE["doneEvent"].is_set():
+            return
+        phase = str(out.get("phase") or "")
+        if not phase:
+            if out.get("finished"):
+                phase = "done"
+            elif out.get("stopped"):
+                phase = "stopped"
+            elif out.get("timed_out"):
+                phase = "timeout"
+            else:
+                phase = "timeout"
+        started = float(_PRE.get("startedAt") or 0)
+        seconds = out.get("seconds")
+        if seconds is None:
+            seconds = round(time.time() - started, 1) if started else 0.0
+        _PRE.update({
+            "phase": phase, "finished": bool(out.get("finished")),
+            "seconds": round(float(seconds or 0.0), 1),
+            "error": str(out.get("error") or ""),
+            "nudges": int(out.get("nudges") or 0),
+            "reply": str(out.get("reply") or "")[:300],
+            "thread": None,
+        })
+        ev = _PRE.get("doneEvent")
+    if ev is not None:
+        ev.set()
 
 
 def build_pre_prompt(vault="", now=None) -> str:
@@ -1097,8 +1204,50 @@ def pre_ack_text(eta=None) -> str:
             "还有 ECHO 的会议纪要；%s。扫完就开始录你说的内容。" % pre_eta_text(eta))
 
 
+def pre_phone_ack_text(eta=None) -> str:
+    """**手机版**准备开场（App 准备卡上显示的那句）。
+
+    与 PC 的 `pre_ack_text()` 分开：PC 那句是"扫完就开始录你说的内容"（它会开麦），
+    手机这句是"扫完我就提示你"（手机不会自动开麦）。**不许改 PC 的文案**。
+    """
+    return ("好，回顾准备开始了。我先扫今天的素材：企微、微信、桌面和 WPS 的当天文件，"
+            "还有今天的会议纪要；%s。扫完我就提示你。" % pre_eta_text(eta))
+
+
+def pre_topics(now=None) -> list:
+    """「本次回顾会梳理」——手机准备卡上的主要内容提示（最多 4 条，每条 ≤60 字）。
+
+    只报**类别 + 今天的会议标题**，不报文件内容；具体计数由前置环节的回复给
+    （`pre.reply`）。在 `start_pre()` 时算一次并缓存 —— 不要每次 GET 都扫盘。
+    """
+    now = now or datetime.datetime.now()
+    meetings = today_meetings(now)
+    if meetings:
+        shown = []
+        for m in meetings[:3]:
+            when = str(m.get("time") or "").strip()
+            title = str(m.get("title") or m.get("name") or "").strip()
+            flag = "（纪要已生成）" if m.get("hasSummary") else ""
+            shown.append(("%s %s%s" % (when, title, flag)).strip())
+        if len(meetings) > 3:
+            # 超过 3 场：只列前 2 场 + "等"（保证整条 ≤60 字，别让"等"被截掉）
+            shown = shown[:2]
+            line = "今天的会议（%d 场）：%s 等" % (len(meetings), " · ".join(shown))
+        else:
+            line = "今天的会议（%d 场）：%s" % (len(meetings), " · ".join(shown))
+    else:
+        line = "今天的会议：ECHO 里没有会议记录"
+    out = [
+        line,
+        "今天收到或改过的文件：企微 · 微信 · 桌面 · WPS 缓存",
+        "笔记库里今天的工作日志与待办",
+        "昨天没说完的、明天要做的",
+    ]
+    return [t if len(t) <= 60 else t[:59] + "…" for t in out]
+
+
 def preflight(client=None, force_new=False, on_ack=None, on_progress=None,
-              should_stop=None) -> dict:
+              should_stop=None, ack_text=None, _owned=False) -> dict:
     """**前置环节（技能第 0 步）**：确保会话 → 发指令 → **主动探测**到本轮做完。
 
     串行（2026-10-13 用户拍板）：素材收集做完才开麦录口述 —— 技能里写的就是
@@ -1126,15 +1275,59 @@ def preflight(client=None, force_new=False, on_ack=None, on_progress=None,
     """
     import app.db as db
 
-    _PRE.update(phase="pre", startedAt=time.time(), seconds=0.0, finished=False,
-                etaSec=PRE_ETA_S, error="", nudges=0)
-    out = {"ok": False, "session_id": "", "ack": pre_ack_text(), "finished": False,
-           "timed_out": False, "seconds": 0.0, "reply": "", "error": ""}
+    # ---- 单例：PC 语音回顾与手机 App 共用同一个准备任务（2026-10-25）----
+    # 手机先通过 `/api/daily-review/pre` 起了一个后台准备线程；PC 的 `_review_worker`
+    # 仍直接调本函数 —— 这里**加入等待**，不再跑第二份（否则会重复扫盘、互相覆盖状态）。
+    # `_owned=True` 是那后台线程自己进来：状态已由 `start_pre()` 先写好，别再 begin。
+    join_event = None
+    join_ack = ""
+    if not _owned:
+        with _PRE_LOCK:
+            if _PRE.get("phase") == "pre" and _PRE.get("doneEvent") is not None:
+                join_event = _PRE["doneEvent"]
+                join_ack = str(_PRE.get("ack") or "")
+        if join_event is not None:
+            if callable(on_ack) and join_ack:
+                try:
+                    on_ack(join_ack)         # PC 那侧还是要"先出声"
+                except Exception:            # noqa: BLE001
+                    pass
+            deadline = time.time() + PRE_MAX_S + 30
+            while not join_event.wait(0.5):
+                if callable(should_stop) and should_stop():
+                    break
+                if time.time() > deadline:
+                    break
+            return _pre_result()
+
+    if _owned:
+        with _PRE_LOCK:
+            gen = int(_PRE.get("gen") or 0)
+            stop_event = _PRE.get("stopEvent") or threading.Event()
+            out_ack = str(_PRE.get("ack") or "") or (ack_text or pre_ack_text())
+            alive = str(_PRE.get("phase") or "") == "pre"
+        if stop_event.is_set() or not alive:
+            # 线程还没开跑就被手机"先开始说"了：别再发 prompt
+            return _pre_result()
+    else:
+        gen, _done_event, stop_event = _pre_begin(
+            ack_text=ack_text or pre_ack_text(), topics=pre_topics(),
+            owner="pc" if callable(on_ack) else "sync")
+        out_ack = ack_text or pre_ack_text()
+
+    started_at = time.time()
+    with _PRE_LOCK:
+        if int(_PRE.get("gen") or 0) == int(gen or 0) and _PRE.get("startedAt"):
+            started_at = float(_PRE["startedAt"])
+
+    out = {"ok": False, "session_id": "", "ack": out_ack, "finished": False,
+           "timed_out": False, "stopped": False, "seconds": 0.0, "reply": "", "error": ""}
 
     def _fail(msg):
         out["error"] = msg
-        out["seconds"] = round(time.time() - _PRE["startedAt"], 1)
-        _PRE.update(phase="failed", seconds=out["seconds"], finished=False, error=msg)
+        out["seconds"] = round(time.time() - started_at, 1)
+        out["phase"] = "failed"
+        _pre_finish(gen, out)
         db.add_log("warn", "daily_review", "前置环节没跑起来：%s" % msg)
         return out
 
@@ -1173,8 +1366,11 @@ def preflight(client=None, force_new=False, on_ack=None, on_progress=None,
     idle = 0                                 # 连续"会话空闲"的次数（见 PRE_IDLE_POLLS）
     nudges = 0
     while time.time() < deadline:
-        if callable(should_stop) and should_stop():
-            out["error"] = "用户结束了这次回顾"
+        # 两种"停"：PC 喊停（should_stop）/ 手机点「先开始说」（stop_event）。
+        if (callable(should_stop) and should_stop()) or stop_event.is_set():
+            out["stopped"] = True
+            out["error"] = ("用户跳过了准备" if stop_event.is_set()
+                            else "用户结束了这次回顾")
             break
         left = min(PRE_POLL_S, max(0.5, deadline - time.time()))
         try:
@@ -1210,20 +1406,157 @@ def preflight(client=None, force_new=False, on_ack=None, on_progress=None,
             break
         if callable(on_progress):
             try:
-                on_progress(round(time.time() - _PRE["startedAt"], 1))
+                on_progress(round(time.time() - started_at, 1))
             except Exception:                # noqa: BLE001
                 pass
     else:
         out["timed_out"] = True
         out["error"] = "前置环节在 %d 秒内没等到「%s」标记" % (int(PRE_MAX_S), PRE_DONE_MARK)
     out["nudges"] = nudges
-    _PRE["nudges"] = nudges
+    _pre_update(gen, nudges=nudges)
 
-    out["seconds"] = round(time.time() - _PRE["startedAt"], 1)
-    _PRE.update(phase="done" if out["finished"] else "timeout", seconds=out["seconds"],
-                finished=out["finished"], error=out["error"])
+    out["seconds"] = round(time.time() - started_at, 1)
+    _pre_finish(gen, out)
     db.add_log("info" if out["finished"] else "warn", "daily_review",
                "前置环节%s（%.1fs）%s" % ("完成" if out["finished"] else "未完成",
                                         out["seconds"],
                                         "" if out["finished"] else "：" + out["error"]))
     return out
+
+
+# ---------------------------------------------------------------- 手机端：准备任务（2026-10-25）
+
+def _pre_error(msg) -> dict:
+    """`start_pre()` 的失败回包：HTTP 200 + `ok=false` + 人话（与 `/submit` 同口径）。"""
+    return {"ok": False, "started": False, "already": False, "done": False,
+            "sessionId": "", "etaSec": PRE_ETA_S, "ack": "", "topics": [],
+            "pre": pre_state(), "error": str(msg or "")}
+
+
+def _pre_ok(**kw) -> dict:
+    base = {"ok": True, "started": False, "already": False, "done": False,
+            "sessionId": "", "etaSec": PRE_ETA_S, "ack": "", "topics": [],
+            "pre": pre_state(), "error": ""}
+    base.update(kw)
+    return base
+
+
+def _pre_worker(gen, client, force_new, stop_event) -> None:
+    """后台跑一次准备（手机 `/pre` 触发的）。"""
+    try:
+        preflight(client=client, force_new=force_new,
+                  should_stop=stop_event.is_set, _owned=True)
+    except Exception as e:                       # noqa: BLE001 - 后台线程不许把状态挂在"pre"
+        with _PRE_LOCK:
+            started = float(_PRE.get("startedAt") or 0)
+            out = {"phase": "failed", "finished": False,
+                   "error": "准备任务异常：%s: %s" % (type(e).__name__, e),
+                   "seconds": round(time.time() - started, 1) if started else 0.0}
+            _pre_finish(gen, out)
+
+
+def start_pre(force_new=False) -> dict:
+    """**手机开始回顾后的准备任务**：把技能第 0 步发给配置的智能体。
+
+    与 PC 的 `preflight()` 共用同一份状态（一天只跑一份）：
+      * 已经在跑 → `already=true`（不重复发 prompt）；
+      * 今天已完成 → `done=true`（不重新扫）；
+      * 否则建/取会话、写状态、起后台 daemon 线程，**立刻返回**（响应里带
+        `ack` / `topics` / `etaSec` 给 App 做"准备已开始 + 本次回顾会梳理"提示）。
+
+    **绝不**开麦克风、不调 `assistant.start_review()`、不写回顾轮次。
+    """
+    with _PRE_START_LOCK:
+        today = _pre_today()
+        with _PRE_LOCK:
+            phase = str(_PRE.get("phase") or "")
+            same_day = str(_PRE.get("day") or "") == today
+            if same_day and phase == "pre":
+                return _pre_ok(already=True,
+                               sessionId=_PRE.get("sessionId") or "",
+                               etaSec=_PRE.get("etaSec") or PRE_ETA_S,
+                               ack=_PRE.get("ack") or pre_phone_ack_text(),
+                               topics=list(_PRE.get("topics") or []))
+            if same_day and phase == "done":
+                return _pre_ok(done=True,
+                               sessionId=_PRE.get("sessionId") or "",
+                               etaSec=_PRE.get("etaSec") or PRE_ETA_S,
+                               ack=_PRE.get("ack") or "",
+                               topics=list(_PRE.get("topics") or []))
+
+        ok, why = ready()
+        if not ok:
+            return _pre_error(why)
+        # 电脑正忙（在跑别的指令 / 会议录音）：别添乱。PC 回顾自己不算忙
+        # （它就是准备的主人；真在跑的话上面已经 `already` 了）。
+        try:
+            from app import assistant as _assistant
+            owner = str((_assistant._busy_owner or {}).get("name") or "")
+        except Exception:                        # noqa: BLE001
+            owner = ""
+        if owner and owner != "review":
+            return _pre_error("电脑正忙（%s），准备没开始" % owner)
+        try:
+            client = _client()
+        except Exception as e:                   # noqa: BLE001
+            return _pre_error("取智能体客户端失败：%s" % e)
+        try:
+            acc_ok, acc_why = ensure_access(client)
+            if not acc_ok:
+                import app.db as db
+                db.add_log("warn", "daily_review",
+                           "前置环节：会话权限校正未成功：%s" % acc_why)
+        except Exception as e:                   # noqa: BLE001
+            import app.db as db
+            db.add_log("warn", "daily_review", "前置环节：会话权限校正异常：%s" % e)
+        try:
+            sid, _wid, _info = ensure_session(client, force_new=force_new)
+        except Exception as e:                   # noqa: BLE001
+            return _pre_error("建立回顾会话失败：%s" % e)
+        if not sid:
+            return _pre_error("没能建立回顾会话（DSH 未返回 sessionId）")
+
+        topics = pre_topics()
+        ack = pre_phone_ack_text()
+        gen, _done, stop = _pre_begin(ack_text=ack, topics=topics,
+                                      session_id=sid, owner="phone")
+        thread = threading.Thread(target=_pre_worker,
+                                  args=(gen, client, force_new, stop),
+                                  daemon=True, name="daily-review-pre")
+        with _PRE_LOCK:
+            if int(_PRE.get("gen") or 0) == gen:
+                _PRE["thread"] = thread
+        thread.start()
+        return _pre_ok(started=True, sessionId=sid, ack=ack, topics=topics)
+
+
+def stop_pre() -> bool:
+    """停掉正在跑的准备（手机点「先开始说」），**不结束回顾会话**。
+
+    返回是否真的停了一个。停止最多等 ~4.5 秒（一次探测的窗口）；等不到就
+    换代强制收成 `stopped`，让旧线程晚到的更新失效 —— **绝不卡住请求**。
+    """
+    with _PRE_LOCK:
+        if str(_PRE.get("phase") or "") != "pre":
+            return False
+        gen = int(_PRE.get("gen") or 0)
+        stop_event = _PRE.get("stopEvent")
+        done_event = _PRE.get("doneEvent")
+        started = float(_PRE.get("startedAt") or 0)
+    if stop_event is not None:
+        stop_event.set()
+    if done_event is not None:
+        done_event.wait(4.5)
+    ev = None
+    with _PRE_LOCK:
+        if int(_PRE.get("gen") or 0) == gen and str(_PRE.get("phase") or "") == "pre":
+            _PRE["gen"] = gen + 1                # 换代：旧线程晚到更新全部作废
+            _PRE.update({
+                "phase": "stopped", "finished": False,
+                "seconds": round(time.time() - started, 1) if started else 0.0,
+                "error": "用户跳过了准备", "thread": None,
+            })
+            ev = _PRE.get("doneEvent")
+    if ev is not None:
+        ev.set()
+    return True

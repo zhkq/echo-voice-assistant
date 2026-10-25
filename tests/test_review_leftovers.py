@@ -230,8 +230,10 @@ class StopReviewWordingTests(unittest.TestCase):
         self.assertIn("主机上这场回顾已经不在跑了", branch)
 
         # 服务端确实在回这个字段（面板读的是事实，不是约定俗成）。
+        # 2026-10-25：结束还要一并停准备，所以回包多了 `preStopped`（两个字段分开）。
         api_src = _read("app", "api.py")
-        self.assertIn('return {"ok": True, "stopped": stopped}', api_src)
+        self.assertIn('"stopped": stopped', api_src)
+        self.assertIn('"preStopped": pre_stopped', api_src)
 
 
 # ===========================================================================
