@@ -77,6 +77,7 @@ class EngineIdMappingTests(unittest.TestCase):
 
     def test_engine_value_maps_to_catalog_id(self):
         self.assertEqual(model_usage.engine_model_id("sensevoice"), "sensevoice")
+        self.assertEqual(model_usage.engine_model_id("sensevoice-onnx"), "sensevoice-onnx")
         self.assertEqual(model_usage.engine_model_id("sherpa"), "sherpa")
         self.assertEqual(model_usage.engine_model_id("qwen3asr"), "qwen3asr")
         self.assertEqual(model_usage.engine_model_id("Qwen/Qwen3-ASR-0.6B"), "qwen3asr")
@@ -90,14 +91,17 @@ class EngineIdMappingTests(unittest.TestCase):
         self.assertEqual(model_usage.model_id_for_engine("whisper", "large"), "whisper-large-v3")
         self.assertEqual(model_usage.model_id_for_engine("qwen3asr", "Qwen/Qwen3-ASR-0.6B"),
                          "qwen3asr")
+        self.assertEqual(model_usage.model_id_for_engine("sensevoice-onnx", ""),
+                         "sensevoice-onnx")
         self.assertEqual(model_usage.model_id_for_engine("whisper", "sensevoice"), "")
 
     def test_mapping_agrees_with_the_real_catalog(self):
         """折出来的 id 必须真在出厂清单里（防止 mapping 与 CATALOG 分叉）。"""
         known = set(model_usage.known_ids())
         self.assertIn("whisper-small", known)
-        for value in ("sensevoice", "sherpa", "qwen3asr", "tiny", "base", "small",
-                      "medium", "large", "large-v3"):
+        self.assertIn("sensevoice-onnx", known)
+        for value in ("sensevoice", "sensevoice-onnx", "sherpa", "qwen3asr", "tiny", "base",
+                      "small", "medium", "large", "large-v3"):
             mid = model_usage.engine_model_id(value)
             self.assertIn(mid, known, "%s 折成了 %s，但清单里没有它" % (value, mid))
 
@@ -142,6 +146,15 @@ class TranscribeRecordsUseTests(_LedgerTestCase):
         with patch.multiple("app.audio.stt", _get_sherpa=lambda: object()):
             stt.load_engine("sherpa", "")
         self.assertEqual(model_usage.usage_of("sherpa")["useCount"], 1)
+
+    def test_load_engine_supports_the_default_onnx_engine(self):
+        """2026-10-27：`load_engine()` 漏了 `sensevoice-onnx` 分支 → boot 预热落到 whisper 报
+        `No module named 'faster_whisper'`，而实际转写懒加载正常。这里钉住 key 与账本。"""
+        from app.audio import stt
+        with patch.multiple("app.audio.stt", _get_sensevoice_onnx=lambda *a, **k: object()):
+            key = stt.load_engine("sensevoice-onnx", "")
+        self.assertEqual("sensevoice-onnx", key)
+        self.assertEqual(model_usage.usage_of("sensevoice-onnx")["useCount"], 1)
 
     def test_ledger_failure_never_breaks_transcribe(self):
         """账本写不进去（库锁着、迁移没跑）**不许**把一次转写带崩。"""

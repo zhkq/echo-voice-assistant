@@ -1026,6 +1026,12 @@ def load_engine(engine_name, model, device="auto", forced_aligner=QWEN3_FORCED_A
     if engine_name == "sensevoice":
         _get_sensevoice(device)
         return "sensevoice"
+    if engine_name == "sensevoice-onnx":
+        # 2026-10-27：原来漏了这一支，boot 预热会一路落到 whisper（报
+        # `No module named 'faster_whisper'`），而**实际转写**走 transcribe_ex 的懒加载
+        # 仍然正常 —— 日志看着像坏了、功能其实是好的。补上，让预热与懒加载同一个引擎。
+        _get_sensevoice_onnx(device)
+        return "sensevoice-onnx"
     if engine_name == "sherpa":
         _get_sherpa()
         return "sherpa"

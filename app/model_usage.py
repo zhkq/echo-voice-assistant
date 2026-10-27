@@ -34,8 +34,12 @@ from typing import Dict, List, Optional
 #: 账本总闸。测试包在导入时关掉（见模块文档最后一条），生产路径不动它。
 ENABLED = True
 
-#: 设置里的引擎值 → `/api/models` 的 item id（三个非 whisper 引擎是 1:1）。
-ENGINE_MODEL_IDS = {"sensevoice": "sensevoice", "sherpa": "sherpa", "qwen3asr": "qwen3asr"}
+#: 设置里的引擎值 → `/api/models` 的 item id（非 whisper 引擎是 1:1）。
+#: 2026-10-27 补上 `sensevoice-onnx`：出厂默认 `sttModel` 就是它，但这里漏了映射，
+#: 于是账本永远记 0 次、`in_use_ids()` 也不算它在用 —— 清理建议可能把**正在用的默认模型**
+#: 列为可删（用户实际转写用的就是它）。
+ENGINE_MODEL_IDS = {"sensevoice": "sensevoice", "sensevoice-onnx": "sensevoice-onnx",
+                    "sherpa": "sherpa", "qwen3asr": "qwen3asr"}
 
 #: 与 `app/modelinfo.py` 的 whisper 档位（CATALOG 里逐档生成）同一份口径。
 WHISPER_TIERS = ("tiny", "base", "small", "medium", "large", "large-v3")
