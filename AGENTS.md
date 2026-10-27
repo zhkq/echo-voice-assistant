@@ -1225,7 +1225,9 @@ scopes 还得重发）。当晚的绕法：用 `pairing.pair()` 里**逐字同�
 - **实测（改完）**：`/v1/capabilities` → `asr-long / impl=qwen3asr / modelVersion=qwen3-asr-0.6b /
   supports=[asr.text, asr.timestamps]`；`/v1/asr` 的 provenance 同；20 s 音频热 **1.6 s**（首载 9.7 s），
   60 s 音频热 **6.1 s**，`timestamps=exact`；diarize 仍正常（20 s 音频 1.9 s，pyannote provenance）。
-- **影响面（如实说）**：会议转写现在走 Qwen3；**回顾仍然走本机 SenseVoice**（`dailyReviewSttBackend=local`），
-  要一起切必须把设置改成 `echo-server`；语音指令仍走本机（手机 `/voice-command` 那条路本来就不上后端）。
+- **影响面（如实说）**：会议转写现在走 Qwen3；**回顾也在 2026-10-27 13:39 按用户要求切到后端**
+  （stable 的 `dailyReviewSttBackend=echo-server`，手机 `/api/daily-review/turn` 与 PC 回顾共用
+  `_transcribe_command(prefer=backend)`，所以**手机回顾也生效**；后端失败自动回落本机 SenseVoice）；
+  语音指令仍走本机（手机 `/voice-command` 那条路本来就不上后端）。
 - **判据**：后端 `/v1/capabilities` 的 `impl/modelVersion`；`/v1/asr` 返回的 `provenance.modelVersion`。
   改完先跑一段真音频再让用户试，别只看 `state=ready`（模型是按需加载的）。
