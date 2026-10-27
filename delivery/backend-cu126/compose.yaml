@@ -79,6 +79,10 @@ services:
       #    而"空转时归零"正是泄漏判据。写法与注释口径同 `server/compose.yaml`。
       MODELSCOPE_CACHE: "/var/echo/cache"
       HOME: "/var/echo/cache"
+      # Turing（RTX 20xx / GTX 16xx）跑 Qwen3-ASR 时**必须**打开这一项（2026-10-27 实测）：
+      # torch 2.14 的 native bmm_outer_product 会调 Triton 编译 C 扩展，而镜像没有 gcc →
+      # `Failed to find C compiler...`。关掉 native JIT 走 eager 即可；Ada/Ampere 可不开。
+      # TORCH_DISABLE_NATIVE_JIT: "1"
       # 总通道数（出厂 6；每客户端另限 1）。**按卡校准**：8 GB 卡上 6 路长音频会互相挤显存
       # —— 要调小**在管理面「性能」页签的「运行参数」里改，改完即时生效**
       # （不用改这里、不用重启；写的值存在 state 卷，重启还在）。

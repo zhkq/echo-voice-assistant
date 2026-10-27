@@ -1206,3 +1206,26 @@ scopes 还得重发）。当晚的绕法：用 `pairing.pair()` 里**逐字同�
   判据：`tests/test_daily_review_pre.py`（12 条）+ 现有 `tests/test_daily_review.py` 全绿。
 - **改完必须同步稳定版才生效**：手机连的是 `D:\ECHO`（稳定版），要 `scripts/deploy-stable.ps1`
   + 重启；只跑 dev 的单测通过不代表手机能用（本轮就是这么暴露的）。
+
+## 2026-10-27：GPU 后端换 Qwen3-ASR（Turing / 2080 Ti 的可用姿势）
+
+- 用户要求"把后端转写能力改成 qwen3"。远端 `gpu-office-2060s` = `10.100.0.24`（`ssh 24`，
+  RTX 2080 Ti 22 GB，sm_75），`/home/zysk/echo/backend/{server.yaml,compose.yaml}` 是实际挂进容器的配置。
+- **改法**：
+  * `server.yaml` 的 `asr-long`：`impl: qwen3asr` / `est_vram_mb: 4700` /
+    `modelVersion: qwen3-asr-0.6b` / `supports: [asr.text, asr.timestamps]`；
+  * `compose.yaml` 的 `environment` 加 **`TORCH_DISABLE_NATIVE_JIT: "1"`**；
+  * `docker compose up -d --force-recreate backend`（配置是挂进去的，必须 recreate）。
+  * 备份：`server.yaml.bak-before-qwen3-<stamp>` / `compose.yaml.bak-before-qwen3-<stamp>`。
+- **为什么必须关 native JIT**：torch 2.14 的 `torch.ops._native.bmm_outer_product`
+  在 RoPE 里会调 Triton 编译 C 扩展；镜像没有 gcc → 报
+  `Failed to find C compiler. Please specify via CC environment variable or set triton.knobs.build.impl.`。
+  关掉后走 eager 实现即可。**这不是 bf16 的问题**：同一容器里 `torch.cuda.is_bf16_supported()`
+  返回 True，Qwen3 能正常加载/推理（文档里"Turing 没有 bf16 所以跑不了 qwen3asr"的旧结论要按实测修正）。
+- **实测（改完）**：`/v1/capabilities` → `asr-long / impl=qwen3asr / modelVersion=qwen3-asr-0.6b /
+  supports=[asr.text, asr.timestamps]`；`/v1/asr` 的 provenance 同；20 s 音频热 **1.6 s**（首载 9.7 s），
+  60 s 音频热 **6.1 s**，`timestamps=exact`；diarize 仍正常（20 s 音频 1.9 s，pyannote provenance）。
+- **影响面（如实说）**：会议转写现在走 Qwen3；**回顾仍然走本机 SenseVoice**（`dailyReviewSttBackend=local`），
+  要一起切必须把设置改成 `echo-server`；语音指令仍走本机（手机 `/voice-command` 那条路本来就不上后端）。
+- **判据**：后端 `/v1/capabilities` 的 `impl/modelVersion`；`/v1/asr` 返回的 `provenance.modelVersion`。
+  改完先跑一段真音频再让用户试，别只看 `state=ready`（模型是按需加载的）。

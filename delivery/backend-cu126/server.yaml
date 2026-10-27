@@ -58,12 +58,18 @@ models:
 # ===========================================================================
 # ⚠️ Turing（compute_cap = 7.5：GTX 16xx / RTX 20xx / T4 / Titan RTX）请看这里
 # ===========================================================================
-# Turing **没有 bf16**（bf16 要 sm_80+），而 qwen3asr 那条加载路径是按 bf16 请求的
-# （`app/audio/stt.py:342`：`dtype = "bf16" if use_cuda else "fp32"`，**写死的**）。
-# 所以 Turing 上 qwen3asr 现在**跑不了** —— 改成 fp16 是**引擎层的改动，本包没做**。
-# 退路是把上面那条 `asr-long` 整条换成下面这一条（把 `- id: asr-long` 到
-# `supports: [...]` 那 8 行替换掉），并**先把 SenseVoice 权重放进模型卷**
-# （`{模型根}/sensevoice/snapshots/master/{config.yaml,model.pt}`，见 先读我.md §4）。
+# Turing 注意（2026-10-27 实测修正）：
+# 1) 硬件确实没有**原生** bf16（bf16 要 sm_80+），但本轮在 RTX 2080 Ti（sm_75）+ torch
+#    2.14.0+cu126 上 `torch.cuda.is_bf16_supported()` 返回 True，Qwen3-ASR 实际能跑。
+# 2) 跑之前**必须**在 compose 的 environment 里加 `TORCH_DISABLE_NATIVE_JIT: "1"`：
+#    torch 2.14 的 native `bmm_outer_product`（RoPE 里）会调 Triton 编译 C 扩展，
+#    本镜像没有 gcc，会报 `Failed to find C compiler. Please specify via CC environment
+#    variable or set triton.knobs.build.impl.`。关掉后走 eager 实现即可。
+# 3) 实测数字（同一张 2080 Ti / 22 GB）：20 s 音频热 1.6 s、60 s 热 6.1 s，timestamps=exact。
+#    如果某天 new torch/image 下仍加载失败，再退回下面这条 SenseVoice 兜底。
+#
+# 退路（仅当 Qwen3 仍不可用）：把上面那条 `asr-long` 整条换成下面这一条，并先把 SenseVoice
+# 权重放进模型卷（`{模型根}/sensevoice/snapshots/master/{config.yaml,model.pt}`，见 先读我.md §4）。
 # 代价：SenseVoice 不给句级时间戳，`supports` 里因此**没有** asr.timestamps
 # （会议时间轴会退化成"按字数均摊"，那是客户端如实标注的估算，不是后端编的）。
 #
