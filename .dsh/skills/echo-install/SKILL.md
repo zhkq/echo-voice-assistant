@@ -38,6 +38,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "<kit>\echo-core\scripts\ins
 其中"装组件"这一步**仍然调本技能里的
 `echo-install-components.ps1`**（引擎/模型/设置/自检只有这一份实现，两边共用）。
 参数：`-Profile minimal|main`、`-Root <安装根>`、`-Agent none|harness|dsh`、`-Yes`、`-Offline`。
+Windows 多两个（2026-10-27）：`-AskDsh`（交互问"已有 DSH 吗"）、`-DshDir <目录>`
+（直接指定已有 DSH 的安装目录；给了就不装 npm 包）。
 
 * **离线包不需要联网、也不需要 agent**：依赖来自包里的 `bundle\wheels`（pip 带
   `--no-index --find-links`），流式模型来自 `bundle\models`，运行时兜底是
@@ -279,6 +281,21 @@ bash "$kit/echo-install/scripts/echo-install-components.sh" \
 **永久装到 `<安装目录>/harness/dsh`**，冷启动约 10 秒；装不上才回退 `npx -y @deepseek-ai/dsh`）
 → 起服务 → **下载所选模型**（ModelScope 优先，回落 hf-mirror，带进度与超时）→ 写设置 →
 **自检并登记**。**幂等**：已经装好的会跳过，重跑安全。
+
+> **Windows 安装会先问一句"这台机器上已经有 DSH 吗"**（2026-10-27，双击 kit 默认带
+> `-AskDsh`）。选"没有/回车"= 按原来的方式装；选"有"= 输入一个目录，安装器在下面这些
+> 形状里探测 `@deepseek-ai/dsh/lib/bin.js`，找到就**只写 `harnessCommand`，不再下 npm 包**：
+>
+> ```text
+> <目录>\node_modules\@deepseek-ai\dsh\lib\bin.js
+> <目录>\dsh\app\node_modules\@deepseek-ai\dsh\lib\bin.js      （ECHO 3.0）
+> <目录>\harness\dsh\node_modules\@deepseek-ai\dsh\lib\bin.js  （老 ECHO）
+> <目录>\lib\bin.js                                            （直接指到 dsh 包）
+> ```
+>
+> 引号、尾部反斜杠、空格、`&`、括号、`%USERPROFILE%` 都会被安全处理；探测失败重试 3 次后
+> 可以改回新装。只复用程序入口，不碰已有 DSH 的家目录配置。无人值守/agent 路径**不传**
+> `-AskDsh` 时行为完全不变；要显式指定用 `-DshDir "<目录>"`。
 
 > 每一步的输出也会落到 **`<安装目录>/data/logs/install-<时间戳>.log`**（独立于终端）——
 > 终端被关掉、或被 agent 收走输出时，排障看这份日志就够（A6）。

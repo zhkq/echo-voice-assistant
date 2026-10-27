@@ -30,6 +30,11 @@
 #                          npx 缓存里找**同版本**那份复制（见 harness-install-local.ps1）
 #   -PinHarnessCommand     把本地入口的绝对路径写进设置 harnessCommand（默认**不写**：
 #                          ECHO 自己会优先本地入口，node 换版本不用改配置）
+#   -DshDir <目录>         已有 DSH 的安装目录（含 node_modules\@deepseek-ai\dsh\lib\bin.js
+#                          的那一层，也接受直接指到 bin.js / 包目录 / ECHO 安装根）。
+#                          给了就**不装 npm 包**，只探测 + 写 harnessCommand。
+#   -AskDsh                允许问一句"已有 DSH 吗"；用户选"有"时循环让输入目录并探测。
+#                          只在交互控制台生效；无人值守/agent 路径默认不传（行为不变）。
 #   -ModelsDir / -MeetingsDir / -NotesDir   三处位置（留空=默认；-NotesDir 填了会开归档）
 #   -PipIndex <url>        国内 pip 镜像，例如 https://pypi.tuna.tsinghua.edu.cn/simple
 #   -TorchIndex <url>      -AccelCuda 时 torch 走哪个索引（默认官方 cu128；PyPI 上的是 CPU 版）
@@ -51,6 +56,8 @@ param(
     [string]$Agent = 'harness',
     [string]$DshVersion = '',
     [switch]$PinHarnessCommand,
+    [string]$DshDir = '',
+    [switch]$AskDsh,
     [string]$ModelsDir = '',
     [string]$MeetingsDir = '',
     [string]$NotesDir = '',
@@ -82,7 +89,8 @@ if ((Split-Path $script:Root -Leaf) -ieq 'echo-core') {
     # 全新安装：代码还没到位，但 3.0 布局已经定了 —— 代码将落在 <根>\echo-core
     $script:Code = Join-Path $script:Root 'echo-core'
 }
-$script:HarnessCommand = ''    # 本地永久安装成功时填（见 Prepare-Agent）
+$script:HarnessCommand = ''    # 本地/已有 DSH 的启动命令（见 Prepare-Agent）
+$script:ExistingDsh = $false   # 用户指定了已有 DSH：必须把 harnessCommand 写进设置
 
 # A6：每一步同时留一份**独立于终端**的日志（终端关掉、输出被 agent 收走时还能回看）。
 # 落点 <安装根>\data\logs\install-<时间戳>.log；写不进去（权限/只读）就静默放弃，绝不挡安装。
@@ -354,6 +362,10 @@ function Test-DllLoadFailure([string]$Text) {
 function Resolve-NodeDir {
     # npx 可能在"托管式" node 里（同事机器上只有 WorkBuddy 的 node，且不在系统 PATH 里）。
     # 候选顺序与 ECHO 运行时的探测保持一致（见 app/platform/win32/env.py 的 node_dirs()）。
+    # 2026-10-27：先看 PATH 上的 node —— 已有 DSH 的机器可能只把 node 放 PATH，
+    # 没有 npx（也不在下面这批固定目录里）；旧逻辑会误报"没找到 node/npx"。
+    $cmd = Get-Command node -ErrorAction SilentlyContinue
+    if ($cmd -and $cmd.Source) { return (Split-Path -Parent $cmd.Source) }
     $cands = @()
     $wb = Join-Path $env:USERPROFILE '.workbuddy\binaries\node\versions'
     if (Test-Path $wb) {
@@ -373,6 +385,78 @@ function Resolve-NodeDir {
     return ''
 }
 
+function Get-DshProbeHelper {
+    # 探测逻辑只有一份（find-existing-dsh.ps1）：install 这条路与以后别的入口共用它。
+    $here = $PSScriptRoot
+    if (-not $here) { try { $here = Split-Path -Parent $PSCommandPath } catch { $here = '' } }
+    if (-not $here) { return '' }
+    return (Join-Path $here 'find-existing-dsh.ps1')
+}
+
+function Resolve-ExistingDsh {
+    param([string]$Raw, [string]$NodeExe = '')
+    $helper = Get-DshProbeHelper
+    if (-not $helper -or -not (Test-Path -LiteralPath $helper)) {
+        return [pscustomobject]@{ ok = $false; entry = ''; node = ''; command = ''; version = '';
+                                  error = ('缺 find-existing-dsh.ps1（脚本目录 {0}）' -f $helper) }
+    }
+    $out = @()
+    try {
+        # 路径当普通参数传，**不拼命令行**：引号/空格/反斜杠都交给 .ps1 的参数绑定。
+        $out = & $helper -Path $Raw -NodeExe $NodeExe 2>&1
+    } catch {
+        return [pscustomobject]@{ ok = $false; entry = ''; node = ''; command = ''; version = '';
+                                  error = $_.Exception.Message }
+    }
+    $line = @($out | ForEach-Object { "$_" } | Where-Object { $_.Trim().StartsWith('{') } |
+              Select-Object -Last 1)
+    if (-not $line) {
+        return [pscustomobject]@{ ok = $false; entry = ''; node = ''; command = ''; version = '';
+                                  error = '探测脚本没有返回结果' }
+    }
+    try { return ($line | ConvertFrom-Json) } catch {
+        return [pscustomobject]@{ ok = $false; entry = ''; node = ''; command = ''; version = '';
+                                  error = ('探测结果解析失败：{0}' -f $_.Exception.Message) }
+    }
+}
+
+function Ask-ExistingDsh {
+    # 只在 -AskDsh 且真有交互控制台时进来；无人值守/agent 默认不走这里。
+    $interactive = $true
+    try { if ([Console]::IsInputRedirected) { $interactive = $false } } catch { $interactive = $false }
+    if (-not $interactive) {
+        Warn '没有交互控制台：按"新装 DSH"继续（要指定已有目录请用 -DshDir）'
+        return $null
+    }
+    Write-Host ''
+    Write-Host '    这台机器上已经有 DSH 标准版吗？' -ForegroundColor White
+    Say '  有就选 y，然后填它的安装目录（那一层里应有 node_modules\@deepseek-ai\dsh\lib\bin.js）。'
+    Say '  直接回车 = 按新装处理（和现在一样，从 npm 装到 ECHO 的 dsh\app）。'
+    $ans = ''
+    try { $ans = Read-Host '    已有 DSH？(y/N)' } catch { }
+    if (('{0}' -f $ans).Trim() -notmatch '^(y|yes|是)$') { return $null }
+
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        $raw = ''
+        try {
+            $raw = Read-Host ('    已有 DSH 的安装目录（第 {0}/3 次；可直接粘贴"复制为路径"的结果）' -f $attempt)
+        } catch { }
+        $probe = Resolve-ExistingDsh $raw
+        if ($probe.ok) { return $probe }
+        Warn ('没探测到可用 DSH：{0}' -f $probe.error)
+        if ($attempt -lt 3) {
+            $more = ''
+            try { $more = Read-Host '    再输一次？(Y/n)' } catch { }
+            if (('{0}' -f $more).Trim() -match '^(n|no|否)$') { break }
+        }
+    }
+    $fallback = ''
+    try { $fallback = Read-Host '    3 次都没探测到。改为按"新装 DSH"继续？(Y/n)' } catch { }
+    if (('{0}' -f $fallback).Trim() -notmatch '^(n|no|否)$') { return $null }
+    return [pscustomobject]@{ ok = $false; entry = ''; node = ''; command = ''; version = '';
+                              error = '没有探测到已有的 DSH 安装目录（3 次）' }
+}
+
 function Prepare-Agent {
     # 标准版 harness **本地永久安装 + 绝对路径直连**（2026-09-22 同事实测后改）：
     #   同一台机器同一个 dsh：
@@ -383,6 +467,38 @@ function Prepare-Agent {
     #   ② 宿主（WorkBuddy 等）的安全删除 shim 拦 npm 批量删除。
     # 失败时**回退**到 npx（ECHO 的默认命令），不让安装流程卡死。
     if ($Agent -ne 'harness') { return $true }
+    Step '准备智能体（标准版 harness）'
+
+    # 2026-10-27 用户口径：安装时先问"是否已经有 DSH"。
+    #   * 已有：让用户指定目录 → 探测 → 只写 harnessCommand，**绝不**再下 npm 包；
+    #   * 新装：走下面原来的本地永久安装（行为不变）。
+    # -DshDir 是显式参数（无人值守/agent 可直接给）；-AskDsh 才允许交互提问。
+    $probe = $null
+    if ($DshDir) {
+        $probe = Resolve-ExistingDsh $DshDir
+        if (-not $probe.ok) {
+            Err ('指定的已有 DSH 目录不可用：{0}' -f $probe.error)
+            Err ('  目录：{0}' -f $DshDir)
+            Err '  期望能找到 node_modules\@deepseek-ai\dsh\lib\bin.js（或直接指到该 bin.js）。'
+            return $false
+        }
+    } elseif ($AskDsh) {
+        $probe = Ask-ExistingDsh
+        if ($probe -and -not $probe.ok) {
+            Err ('已有 DSH 没探测到：{0}' -f $probe.error)
+            Err '  重跑安装并选"新装"，或换一个含 @deepseek-ai\dsh\lib\bin.js 的目录。'
+            return $false
+        }
+    }
+    if ($probe -and $probe.ok) {
+        $script:ExistingDsh = $true
+        $script:HarnessCommand = [string]$probe.command
+        Ok ('使用已有 DSH：{0}' -f $probe.entry)
+        if ($probe.version) { Say ('  DSH 版本：{0}' -f $probe.version) }
+        Say ('  启动命令：{0}' -f $script:HarnessCommand)
+        return $true
+    }
+
     Step '准备智能体（标准版 harness：本地永久安装）'
     $nodeDir = Resolve-NodeDir
     if (-not $nodeDir) {
@@ -619,7 +735,11 @@ switch ($Agent) {
 # （WorkBuddy / nvm 升级）不用改配置 —— 写死绝对路径时那条路径一失效 harness 就起不来，
 # 而这个设置是隐藏项，用户很难自己找到。想钉死：加 -PinHarnessCommand。
 # 没装成本地入口时也不用写：ECHO 用默认 npx 命令兜底（首次慢 1-2 分钟，但能用）。
-if ($script:HarnessCommand -and $PinHarnessCommand) { $values['harnessCommand'] = $script:HarnessCommand }
+# 已有 DSH 的用户给了外部目录：**必须**写 harnessCommand，否则 ECHO 不知道去哪找。
+# 新装本地入口仍按原口径默认不写（除非显式 -PinHarnessCommand）。
+$writeCommand = ($script:HarnessCommand -and $PinHarnessCommand)
+if ($script:ExistingDsh) { $writeCommand = $true }
+if ($writeCommand) { $values['harnessCommand'] = $script:HarnessCommand }
 if ($values.Count -gt 0) {
     foreach ($k in $values.Keys) { Say ("{0} = {1}" -f $k, $values[$k]) }
     try { $null = Invoke-Api -Path '/api/settings' -Method Put -Body @{ values = $values } -TimeoutSec 60; Ok '设置已写入' }

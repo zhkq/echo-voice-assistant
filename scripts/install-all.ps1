@@ -38,6 +38,10 @@
 #                            默认 D:\ECHO（没有 D 盘就 C:\ECHO）
 #   -Agent none|harness|dsh  智能体。**离线默认 none**：离线包里不带 DSH/harness
 #                            （@deepseek-ai/dsh 是私有 npm 包，许可上不随包分发）
+#   -DshDir <目录>           已有 DSH 的安装目录（含 node_modules\@deepseek-ai\dsh\lib\bin.js
+#                            的那一层）。给了就不装 npm 包，只探测 + 写 harnessCommand。
+#   -AskDsh                 允许交互问"已有 DSH 吗"；用户选有则循环输入目录并探测。
+#                            kit 的全新安装会传；无人值守/agent 默认不传（行为不变）。
 #   -Offline                 离线模式：依赖只从 bundle\wheels 装（pip 带
 #                            --no-index --find-links），模型直接用 bundle\models 里的
 #   -Yes                     无人值守：不提问、全默认
@@ -64,6 +68,8 @@ param(
     [ValidateSet('minimal', 'main')][string]$Profile = 'minimal',
     [Alias('DestDir')][string]$Root = '',
     [ValidateSet('none', 'harness', 'dsh')][string]$Agent = '',
+    [string]$DshDir = '',
+    [switch]$AskDsh,
     [switch]$Offline,
     [switch]$Yes,
     [string]$KitRoot = '',
@@ -697,6 +703,8 @@ function Invoke-ComponentsScript {
     if ($SkipPip) { $argv['SkipPip'] = $true }
     if ($SkipModels) { $argv['SkipModels'] = $true }
     if ($UpgradeDsh) { $argv['UpgradeDsh'] = $true }
+    if ($DshDir) { $argv['DshDir'] = $DshDir }
+    if ($AskDsh) { $argv['AskDsh'] = $true }
     $shown = ($EngineList -join ',')
     Info ("& {0} -DestDir {1} -Engines {2} -Agent {3}{4}{5}" -f `
           $comp, $script:TargetRoot, $shown, $Agent,
@@ -1459,6 +1467,9 @@ if ($script:IsUpgrade) {
     # 升级不装/不换模型，也不装依赖（引擎列表清空 → 组件脚本不会去写 sttModel）。
     $engineList = @()
     $wantWake = $false
+    # 升级只问"要不要升 DSH"，不再问"已有 DSH 目录"（外部目录只用于全新安装）。
+    $DshDir = ''
+    $AskDsh = $false
     $upgradeDsh = $false
     if (Ask-UpgradeDsh) {
         $Agent = 'harness'

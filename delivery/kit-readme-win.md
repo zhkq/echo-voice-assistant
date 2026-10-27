@@ -4,14 +4,36 @@
 
 1. **双击 `装我.cmd`**（就在这个文件夹里）。
    * 如果资料夹里只有 `ECHO-kit-*.zip`（还没解开），**它会自己解开**——你不用右键解压。
-2. 它只问你一件事：**装到哪个目录** —— 回车用默认（`D:\ECHO`，没有 D 盘就是 `C:\ECHO`）。
-3. 剩下的它自己做：准备好运行环境、依赖、转写模型，写好设置、把服务起起来，
+2. 它会问：**装到哪个目录** —— 回车用默认（`D:\ECHO`，没有 D 盘就是 `C:\ECHO`）。
+3. 然后再问一句：**这台机器上已经有 DSH 吗？**
+   * **没有**（直接回车）：和以前一样，安装器会联网装 DSH 标准版。
+   * **有**：输入已有 DSH 的**安装目录**，安装器会探测里面有没有
+     `node_modules\@deepseek-ai\dsh\lib\bin.js`；探测到就**直接使用**，不再下载 DSH。
+     直接粘贴资源管理器「复制为路径」的带引号路径也可以（会自动去掉引号和尾部反斜杠）。
+4. 剩下的它自己做：准备好运行环境、依赖、转写模型，写好设置、把服务起起来，
    最后**把面板地址打印出来**（形如 `http://127.0.0.1:8970/`）。打开它就行。
-4. 快装完时它会问**一件小事：会议转写用哪台 GPU 机器**（见下）。
+5. 快装完时它会问**一件小事：会议转写用哪台 GPU 机器**（见下）。
 
 > 包里带 `bundle\` 时，**装的过程不下载**运行环境 / 依赖 / 模型 —— 全从包里拿。
-> **唯一还会联网的是 DSH 标准版**（智能体，走 npm 安装），这是允许的那一项。
+> 如果第 3 步选了「已有 DSH」，连 DSH 也不用下载；只有选「新装」时才会联网装 DSH。
 > 没有 `bundle\` 时那三样走联网安装（python.org / 国内 PyPI 镜像 / ModelScope）。
+
+## 已有 DSH 时，目录填哪一层？
+
+安装器会在你给的目录下找这几种形状（找到任意一个就用）：
+
+```text
+<你给的目录>\node_modules\@deepseek-ai\dsh\lib\bin.js
+<你给的目录>\dsh\app\node_modules\@deepseek-ai\dsh\lib\bin.js     （ECHO 3.0 自己的布局）
+<你给的目录>\harness\dsh\node_modules\@deepseek-ai\dsh\lib\bin.js （老 ECHO 布局）
+<你给的目录>\lib\bin.js                                           （直接指到 dsh 包目录）
+```
+
+也可以**直接指到 `bin.js` 文件**。路径里的空格、括号、`&`、`%USERPROFILE%` 都支持；
+带引号和尾部 `\` 也没关系。探测失败会重试 3 次，之后可以选择改回「新装」。
+
+> 这里只复用 **DSH 程序入口**；DSH 的会话/家目录仍按 ECHO 自己的 `harnessHome` 走，
+> 不会去改你已有 DSH 的配置。
 
 装的过程中窗口一直开着，**出错也不会一闪而过**（末尾会停住等你按键），把那段输出发回来即可。
 
@@ -61,8 +83,16 @@
 **装的东西与助手那条路完全一样**）：
 
 ```powershell
-# 在这个文件夹里打开 PowerShell，跑这一条（-Yes = 不提问，全默认）
+# 在这个文件夹里打开 PowerShell，跑这一条（-Yes = 不提问，全默认；DSH 也直接新装）
 powershell -NoProfile -ExecutionPolicy Bypass -File ".\echo-core\scripts\install-all.ps1" -Yes
+
+# 如果已经有 DSH，跳过下载并直接指定它的安装目录：
+#   -DshDir 接受带引号/尾部反斜杠的路径；探测逻辑与双击时的第 3 步完全相同
+powershell -NoProfile -ExecutionPolicy Bypass -File ".\echo-core\scripts\install-all.ps1" `
+    -Yes -DshDir "D:\DSH"
+
+# 想在命令行里也被问"已有 DSH 吗"：加 -AskDsh（双击安装已默认带）
+powershell ... -AskDsh
 ```
 
 它会**一次走完**：解包就位 → 建运行时 → 装核心依赖 → 装组件（sherpa 模型/设置/自检）→
@@ -73,7 +103,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File ".\echo-core\scripts\install
 
 | 文件 | 说明 |
 |---|---|
-| `装我.cmd` | **双击这个**：只问安装位置（+ 最后问一句后端怎么来），然后装完并打印面板地址 |
+| `装我.cmd` | **双击这个**：问安装位置、问是否已有 DSH、最后问后端怎么来，然后装完并打印面板地址 |
 | `ECHO-kit-*.zip` | 主程序包。**只有它、没有解开的 `echo-core\` 时**，`装我.cmd` 会自己解到 `echo-kit\` 再装 |
 | `ECHO-backend-portable-*.zip` | 可选：**后端薄包**（20 MB，源码 + 解释器）。选"本机跑后端"时要用 |
 | `ECHO-backend-offline-*.zip` | 可选：**后端离线包**（薄包 + 装好依赖的运行时）。有它 = 本机跑后端**零下载** |

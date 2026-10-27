@@ -2,11 +2,12 @@
 REM =====================================================================
 REM  ECHO - DOUBLE CLICK THIS FILE to install.
 REM
-REM  It asks ONE question (which folder to install into) and then calls
-REM  the installer that ships inside the kit:
+REM  It asks which folder to install into, whether DSH is already installed
+REM  (fresh installs pass -AskDsh; upgrades ask about upgrading DSH instead),
+REM  and later how the backend is reached. It then calls the installer:
 REM
 REM      echo-core\scripts\install-all.ps1
-REM          -Profile minimal -Agent harness -Yes -Root "<your folder>"
+REM          -Profile minimal -Agent harness -Yes -AskDsh -Root "<your folder>"
 REM      plus -Offline when bundle\ sits next to this file.
 REM
 REM  Two shapes are supported on purpose (2026-10-01):
@@ -128,6 +129,10 @@ if defined EXISTING (
 REM Upgrades are interactive (they ask about DSH); fresh installs keep -Yes.
 set "ARGS=-Profile minimal -Agent harness -Root "%ROOT%" -BackendDir "%HERE%""
 if not defined EXISTING set "ARGS=%ARGS% -Yes"
+REM Fresh install: ask whether an existing DSH is already on this machine
+REM (install-all.ps1 -AskDsh does the probing). Upgrades already ask about
+REM upgrading DSH, so they deliberately do not pass this.
+if not defined EXISTING set "ARGS=%ARGS% -AskDsh"
 if exist "%KIT%bundle\wheels" (
   set "ARGS=%ARGS% -Offline"
   echo.
