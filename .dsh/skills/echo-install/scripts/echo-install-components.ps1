@@ -420,6 +420,35 @@ function Resolve-ExistingDsh {
     }
 }
 
+function Resolve-AutoDsh {
+    param([string[]]$ExtraDir = @(), [string]$NodeExe = '')
+    $here = $PSScriptRoot
+    if (-not $here) { try { $here = Split-Path -Parent $PSCommandPath } catch { $here = '' } }
+    $helper = ''
+    if ($here) { $helper = Join-Path $here 'find-existing-dsh-auto.ps1' }
+    if (-not $helper -or -not (Test-Path -LiteralPath $helper)) {
+        return [pscustomobject]@{ ok = $false; entry = ''; node = ''; command = ''; version = '';
+                                  error = ('缺 find-existing-dsh-auto.ps1（脚本目录 {0}）' -f $here) }
+    }
+    $probeArgs = @{ ExtraDir = @($ExtraDir) }
+    if ($NodeExe) { $probeArgs['NodeExe'] = $NodeExe }
+    $out = @()
+    try { $out = & $helper @probeArgs 2>&1 } catch {
+        return [pscustomobject]@{ ok = $false; entry = ''; node = ''; command = ''; version = '';
+                                  error = $_.Exception.Message }
+    }
+    $line = @($out | ForEach-Object { "$_" } | Where-Object { $_.Trim().StartsWith('{') } |
+              Select-Object -Last 1)
+    if (-not $line) {
+        return [pscustomobject]@{ ok = $false; entry = ''; node = ''; command = ''; version = '';
+                                  error = '自动探测脚本没有返回结果' }
+    }
+    try { return ($line | ConvertFrom-Json) } catch {
+        return [pscustomobject]@{ ok = $false; entry = ''; node = ''; command = ''; version = '';
+                                  error = ('自动探测结果解析失败：{0}' -f $_.Exception.Message) }
+    }
+}
+
 function Ask-ExistingDsh {
     # 只在 -AskDsh 且真有交互控制台时进来；无人值守/agent 默认不走这里。
     $interactive = $true
@@ -430,11 +459,27 @@ function Ask-ExistingDsh {
     }
     Write-Host ''
     Write-Host '    这台机器上已经有 DSH 标准版吗？' -ForegroundColor White
-    Say '  有就选 y，然后填它的安装目录（那一层里应有 node_modules\@deepseek-ai\dsh\lib\bin.js）。'
+    Say '  有就选 y：我会先自动探测常见安装位置；探测不到再让你填目录。'
     Say '  直接回车 = 按新装处理（和现在一样，从 npm 装到 ECHO 的 dsh\app）。'
     $ans = ''
     try { $ans = Read-Host '    已有 DSH？(y/N)' } catch { }
     if (('{0}' -f $ans).Trim() -notmatch '^(y|yes|是)$') { return $null }
+
+    # 先自动探测常见位置（2026-10-27 用户要求）：找到就给用户确认，
+    # 不再一上来就让人手填路径。探测不到才进入手动输入。
+    $auto = Resolve-AutoDsh -ExtraDir @($script:Root)
+    if ($auto.ok) {
+        Ok ('自动探测到已有 DSH：{0}' -f $auto.entry)
+        if ($auto.version) { Say ('  DSH 版本：{0}' -f $auto.version) }
+        Say ('  启动命令：{0}' -f $auto.command)
+        $use = ''
+        try { $use = Read-Host '    用这个已有 DSH 吗？(Y/n)' } catch { }
+        if (('{0}' -f $use).Trim() -notmatch '^(n|no|否)$') { return $auto }
+        Say '  好，手动指定另一个目录。'
+    } else {
+        Warn ('没有在常见位置自动找到已有 DSH：{0}' -f $auto.error)
+        Say '  也可以直接回车，改为按"新装 DSH"继续。'
+    }
 
     for ($attempt = 1; $attempt -le 3; $attempt++) {
         $raw = ''

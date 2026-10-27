@@ -1235,7 +1235,8 @@ scopes 还得重发）。当晚的绕法：用 `pairing.pair()` 里**逐字同�
 ## 2026-10-27：安装器支持"已有 DSH"（先问，再让用户指定目录探测）
 
 - **用户口径**：交付包安装到 DSH 那一步时先问"是否已经有 DSH"；选新装=按现有方式装，
-  选已有=让用户方便地指定一个目录并**探测**，把该目录的 DSH 直接拿来用；要处理 Windows 路径转义。
+  选已有=**先自动探测常见位置**，找到让用户确认，找不到再让用户指定目录并探测；
+  要处理 Windows 路径转义。
 - **入口链路**：`装我.cmd` 只在**全新安装**时加 `-AskDsh` → `install-all.ps1` 透传
   `-DshDir` / `-AskDsh` → `echo-install-components.ps1::Prepare-Agent`。
   升级分支不传 `-AskDsh`（升级仍只问"要不要升级 DSH"，外部目录只用于全新安装）。
@@ -1244,6 +1245,10 @@ scopes 还得重发）。当晚的绕法：用 `pairing.pair()` 里**逐字同�
   老 `harness\dsh` / `resources\app.asar\dsh`；会找
   `<层>\node_modules\@deepseek-ai\dsh\lib\bin.js`。引号、尾反斜杠、空格、`&`、括号、`%VAR%`、`~`
   都由脚本归一化（`-LiteralPath`，不拼命令行）。
+- **自动探测**：`find-existing-dsh-auto.ps1` 只查常见位置（调用方安装根、`D:\ECHO`/`C:\ECHO`、
+  用户目录 `ECHO`、`D:\dsh`/`C:\dsh`/`D:\DSH`、全局 npm、DSH Desktop 安装根），
+  每个候选都委托给 `find-existing-dsh.ps1`；不做全盘扫描。`Ask-ExistingDsh` 先给自动结果并确认，
+  找不到才进入手填（3 次，失败可改回新装）。
 - **使用已有 DSH 时**：组件跳过 npm/`harness-install-local.ps1`，把
   `"<node.exe>" "<...>\@deepseek-ai\dsh\lib\bin.js" web` 写进 `harnessCommand`
   （新装本地入口仍默认不写，除非 `-PinHarnessCommand`）。路径用双引号包住、反斜杠不额外转义；
@@ -1251,7 +1256,7 @@ scopes 还得重发）。当晚的绕法：用 `pairing.pair()` 里**逐字同�
 - **交互**：`-AskDsh` 且控制台可交互时才问；选"有"最多 3 次目录，失败可改回新装；
   `-DshDir` 显式给了就不再问，探测失败直接报错（不静默改成新装）。无人值守/agent 不传
   `-AskDsh` 时行为完全不变。
-- **判据**：`tests/test_install_existing_dsh.py`（9 条：带空格/`&`/括号、Explorer 带引号+尾反斜杠、
-  `%VAR%`、直接 bin.js、ECHO 3.0 布局、缺失路径，以及安装器/kit 的参数接线）；
+- **判据**：`tests/test_install_existing_dsh.py`（10 条：带空格/`&`/括号、Explorer 带引号+尾反斜杠、
+  `%VAR%`、直接 bin.js、ECHO 3.0 布局、缺失路径、自动探测 ExtraDir，以及安装器/kit 的参数接线）；
   另跑 `tests.test_install_entry`、`tests.test_script_encoding`、`tests.test_build_kit`。改 `.ps1`
   后如丢了 UTF-8 BOM 要补回（`edit` 工具会抹 BOM，WinPS 5.1 会按 ANSI 解析）。

@@ -283,8 +283,10 @@ bash "$kit/echo-install/scripts/echo-install-components.sh" \
 **自检并登记**。**幂等**：已经装好的会跳过，重跑安全。
 
 > **Windows 安装会先问一句"这台机器上已经有 DSH 吗"**（2026-10-27，双击 kit 默认带
-> `-AskDsh`）。选"没有/回车"= 按原来的方式装；选"有"= 输入一个目录，安装器在下面这些
-> 形状里探测 `@deepseek-ai/dsh/lib/bin.js`，找到就**只写 `harnessCommand`，不再下 npm 包**：
+> `-AskDsh`）。选"没有/回车"= 按原来的方式装；选"有"= **先自动探测常见位置**
+> （ECHO 自己的 `dsh\app`、`D:\ECHO`/`C:\ECHO`、全局 npm、DSH Desktop 安装目录等），
+> 找到就显示路径并问"用这个吗"；找不到才让用户输入目录。探测到 
+> `@deepseek-ai/dsh/lib/bin.js` 就**只写 `harnessCommand`，不再下 npm 包**：
 >
 > ```text
 > <目录>\node_modules\@deepseek-ai\dsh\lib\bin.js

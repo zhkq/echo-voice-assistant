@@ -25,6 +25,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 HELPER = ROOT / ".dsh" / "skills" / "echo-install" / "scripts" / "find-existing-dsh.ps1"
+AUTO = ROOT / ".dsh" / "skills" / "echo-install" / "scripts" / "find-existing-dsh-auto.ps1"
 INSTALL_ALL = ROOT / "scripts" / "install-all.ps1"
 COMPONENTS = ROOT / ".dsh" / "skills" / "echo-install" / "scripts" / "echo-install-components.ps1"
 KIT_CMD = ROOT / "delivery" / "kit-install.cmd"
@@ -138,6 +139,22 @@ class ExistingDshProbeTests(unittest.TestCase):
         self.assertFalse(got["ok"])
         self.assertTrue(got["error"])
 
+    def test_auto_probe_checks_the_echo_root_we_pass(self):
+        base = self.tmp / "auto candidate"
+        tree = _fake_dsh_tree(base)
+        proc = subprocess.run(
+            [self.ps, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(AUTO),
+             "-ExtraDir", str(base), "-NodeExe", str(tree["node"])],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        lines = [ln.strip() for ln in proc.stdout.splitlines() if ln.strip().startswith("{")]
+        self.assertTrue(lines, proc.stderr)
+        got = json.loads(lines[-1])
+        self.assertTrue(got["ok"], got)
+        self.assertEqual(Path(got["entry"]), tree["entry"].resolve())
+        self.assertTrue(got.get("auto"))
+        self._assert_roundtrip(got, tree["node"].resolve(), tree["entry"].resolve())
+
 
 class ExistingDshWiringTests(unittest.TestCase):
     def test_install_all_exposes_and_forwards_the_new_options(self):
@@ -153,8 +170,11 @@ class ExistingDshWiringTests(unittest.TestCase):
     def test_components_probe_and_pin_the_external_entry(self):
         text = COMPONENTS.read_text(encoding="utf-8-sig")
         self.assertIn("find-existing-dsh.ps1", text)
+        self.assertIn("find-existing-dsh-auto.ps1", text)
         self.assertIn("function Ask-ExistingDsh", text)
         self.assertIn("Resolve-ExistingDsh", text)
+        self.assertIn("Resolve-AutoDsh", text)
+        self.assertIn("自动探测到已有 DSH", text)
         self.assertIn("$script:ExistingDsh = $true", text)
         # 已有外部目录时必须写 harnessCommand，不能只靠 ECHO 自己找本地入口
         self.assertIn("$script:ExistingDsh", text)
