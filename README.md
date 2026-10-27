@@ -1,6 +1,6 @@
 # ECHO — Windows 语音助手 + 会议纪要
 
-> **当前稳定版本：v2.1.9**（tag [`v2.1.9`](../../releases/tag/v2.1.9)）
+> **当前稳定版本：v3.0.0**（tag [`v3.0.0`](../../releases/tag/v3.0.0)）
 > · `main` 分支始终是稳定线，可放心 clone
 > · 安装不再需要 clone：从 [Releases](../../releases) 下载对应平台的安装包（见下）
 > · 版本规划见 [docs/REFACTOR-PLAN.md](docs/REFACTOR-PLAN.md)

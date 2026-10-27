@@ -142,8 +142,13 @@ class InstallerWiringTests(unittest.TestCase):
     def test_it_probes_and_records_the_install_mode(self):
         self.assertIn("function Invoke-InstallModeProbe", self.ps)
         self.assertIn("install-mode.json", self.ps, "要写 <数据根>\\install-mode.json")
-        self.assertIn("$null = Invoke-InstallModeProbe", self.ps,
-                      "**装之前**就要探测（事后分不出全新还是升级）")
+        # 调用形式可以变（v2.1.8 起要拿返回值算 `IsUpgrade`），但**必须在安装前探测**。
+        # 这条断言原来写死 `$null = ...`，于是升级逻辑一改成 `$installMode = ...` 就假红。
+        self.assertRegex(
+            self.ps,
+            r"\$(?:null|installMode)\s*=\s*Invoke-InstallModeProbe",
+            "**装之前**就要探测（事后分不出全新还是升级）",
+        )
         # 两种模式都要判，且升级必须由"已有内容"推出来
         self.assertIn("'upgrade'", self.ps)
         self.assertIn("'fresh'", self.ps)
