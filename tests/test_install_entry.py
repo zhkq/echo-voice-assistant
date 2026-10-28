@@ -144,6 +144,26 @@ class ExtractedPackSourceTests(unittest.TestCase):
         self.assertIn("来源就是安装目录，无需复制", text)
 
 
+class LowDiskGuardTests(unittest.TestCase):
+    """磁盘建议值不能把非交互安装挡死（2026-10-28 同事升级事故）。
+
+    现场：D: 只剩 8.7GB（建议 >=12GB），install-all 传 `-Silent` 调 install.ps1；
+    `Ask-YesNo '继续使用此盘？' $false` 在 Silent 下取默认 N → 直接 exit 1。
+    升级只覆盖代码（-SkipRuntime），8.7GB 完全够用；12GB 只是全量安装的建议值。
+    """
+
+    def test_silent_install_warns_but_keeps_going_on_low_disk(self):
+        text = _read(INSTALL_PS1)
+        block = re.search(r"\$need = 12GB(.*?)Info \(\"安装目录", text, re.S)
+        self.assertIsNotNone(block, "install.ps1 的磁盘检查块不见了")
+        body = block.group(1)
+        self.assertIn("$script:Silent -or $script:DryRun", body,
+                      "Silent/DryRun 必须走“只警告继续”的分支，不能再按默认 N 退出")
+        self.assertIn("非交互安装", body)
+        # 交互模式仍然要问（默认 N）；这条防止把安全提示也一起删掉
+        self.assertIn("elseif (-not (Ask-YesNo '继续使用此盘？' $false))", body)
+
+
 class RuntimeFallbackTests(unittest.TestCase):
     """运行时准备这条路必须"能降级、且不假装成功"。"""
 

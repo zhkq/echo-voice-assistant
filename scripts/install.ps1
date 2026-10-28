@@ -345,7 +345,15 @@ function Step03-Dest {
         $need = 12GB
         if ($d.Free -lt $need) {
             Warn ("盘 {0}: 剩余 {1:N1}GB（建议 >=12GB）" -f $driveLetter, ($d.Free / 1GB))
-            if (-not (Ask-YesNo '继续使用此盘？' $false)) { exit 1 }
+            # 12GB 只是“全量安装”的建议值，不是硬门槛（硬门槛是上面的 4GB）。
+            # 升级只覆盖代码、-SkipRuntime 连运行时都不碰；-Silent 下按默认 N 直接退
+            # 会把“D: 8.7GB 可用”这种完全够用的升级挡死（2026-10-28 同事安装事故）。
+            # 所以：非交互（-Silent/-DryRun）只警告并继续；只有交互模式才问。
+            if ($script:Silent -or $script:DryRun) {
+                Info '（非交互安装：空间低于建议值，继续；12GB 只是全量安装的建议值）'
+            } elseif (-not (Ask-YesNo '继续使用此盘？' $false)) {
+                exit 1
+            }
         } else {
             Ok ("盘 {0}: 剩余 {1:N1}GB" -f $driveLetter, ($d.Free / 1GB))
         }
