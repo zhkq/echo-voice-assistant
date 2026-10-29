@@ -6,6 +6,7 @@
 """
 import os
 import subprocess
+import tempfile
 import threading
 import time
 
@@ -130,7 +131,80 @@ def _sidebar_pipe_write(command):
         return False
 
 
+#: 正常停止时，先发 quit；边条如果 3 秒还没退（旧版本不认 quit / 管道没接上 /
+#: 屏幕上那个是升级前遗留的进程），再由一个**脱离 ECHO 的**清理进程按“本棵树的
+#: sidebar\ 路径”强制结束它。3 秒比边条自己的 2 秒收尾多 1 秒，正常路径不会被误杀。
+SIDEBAR_FORCE_CLOSE_GRACE_MS = 3000
+
+
+def _sidebar_force_close_script(grace_ms: int = SIDEBAR_FORCE_CLOSE_GRACE_MS) -> str:
+    """生成“延迟 N 毫秒后只结束本棵树边条”的 PowerShell 脚本（纯函数，可测）。
+
+    为什么按**可执行文件路径**而不是 `taskkill /IM echo-sidebar.exe`：一台机器上可能
+    同时存在别的 ECHO 树（dev/稳定版/旧安装），不能因为一棵树关机就杀掉别人的边条。
+    路径判据与 install-all 的 Stop-EchoForUpgrade 同一口径：`<BASE_DIR>\sidebar\`。
+    """
+    root = (os.path.abspath(os.path.join(BASE_DIR, "sidebar")) + os.sep)
+    root_ps = root.replace("'", "''")
+    return """$root = '%s'
+Start-Sleep -Milliseconds %d
+$rootLower = $root.ToLowerInvariant()
+Get-CimInstance Win32_Process -Filter "Name='echo-sidebar.exe'" -ErrorAction SilentlyContinue |
+  Where-Object {
+    $exe = [string]$_.ExecutablePath
+    $cmd = [string]$_.CommandLine
+    ($exe -and $exe.ToLowerInvariant().StartsWith($rootLower)) -or
+    ($cmd -and $cmd.ToLowerInvariant().Contains($rootLower))
+  } |
+  ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+$self = $MyInvocation.MyCommand.Path
+if ($self) { Remove-Item -LiteralPath $self -Force -ErrorAction SilentlyContinue }
+""" % (root_ps, int(grace_ms))
+
+
+def _powershell_exe() -> str:
+    """系统 PowerShell 的绝对路径；找不到就回退 PATH 里的 powershell.exe。"""
+    root = (os.environ.get("SystemRoot") or os.environ.get("windir") or r"C:\Windows")
+    p = os.path.join(root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
+    return p if os.path.isfile(p) else "powershell.exe"
+
+
+def schedule_sidebar_force_close(grace_ms: int = SIDEBAR_FORCE_CLOSE_GRACE_MS) -> bool:
+    """脱离 ECHO 起一个延迟清理进程；失败只返回 False，绝不影响停服务。
+
+    为什么必须**脱离**：ECHO 马上要 `os._exit()`，清理要等 3 秒；如果留在 ECHO 进程里，
+    它跟着 ECHO 一起死，等于没做。脚本落成临时 `.ps1` 再 `-File` 起 PowerShell（不用
+    `-EncodedCommand`：本机实测那条路会触发 WinError 786）；输出全部丢弃，用户看不到黑窗。
+    脚本跑完会把自己删掉，不在 %TEMP% 留垃圾。
+    """
+    if echo_platform.current() != "win32":
+        return False
+    path = ""
+    try:
+        script = _sidebar_force_close_script(grace_ms)
+        fd, path = tempfile.mkstemp(prefix="echo-sidebar-cleanup-", suffix=".ps1")
+        with os.fdopen(fd, "w", encoding="utf-8-sig", newline="") as fh:
+            fh.write(script)
+        flags = (subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS |
+                 subprocess.CREATE_NEW_PROCESS_GROUP)
+        subprocess.Popen(
+            [_powershell_exe(), "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+             "-WindowStyle", "Hidden", "-File", path],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            close_fds=True, creationflags=flags)
+        print("[hotkey] 已安排边条兜底清理（3 秒后只结束本棵树的边条）")
+        return True
+    except Exception as e:                                  # noqa: BLE001 —— 停止路径的最后一步
+        if path:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        print(f"[hotkey] 安排边条兜底清理失败（忽略）: {e}")
+        return False
+
 def quit_sidebar():
+
     """请边条退出（ECHO **正常停止**时调用；返回通知到没通知到）。
 
     实现在 `manager.echo_stop_self()` 里：那是"真的停 ECHO"的唯一出口

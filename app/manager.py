@@ -107,6 +107,10 @@ def echo_stop_self():
     try:
         from app import runtime as _runtime
         _runtime.quit_sidebar()
+        # 兜底：旧边条不认 quit / 管道没接上 / 屏幕上是升级前遗留的进程时，
+        # 3 秒后由脱离 ECHO 的清理进程按本棵树路径强制结束它。正常边条 2 秒就关了，
+        # 这里跑过去时已经没有进程可杀；只匹配 <BASE_DIR>\sidebar\，不误杀别的树。
+        _runtime.schedule_sidebar_force_close()
     except Exception as e:  # noqa: BLE001 —— 停止动作的最后一步，任何异常都不许挡住退出
         print(f"[service] 通知边条退出失败（忽略，继续停服务）: {e}")
     try:

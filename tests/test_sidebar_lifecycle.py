@@ -27,6 +27,7 @@ DETACHED_PROCESS 起它（这样 ECHO 重启/被杀时它能活下来），所�
 """
 import os
 import re
+import subprocess
 import sys
 import unittest
 from unittest.mock import patch
@@ -315,15 +316,21 @@ class StopPathNotifiesSidebarTests(unittest.TestCase):
     def setUp(self):
         self.writes = []
         self.exited = []
+        self.scheduled = []
 
     def _run_stop(self, writer=None):
-        """调**真的** `manager.echo_stop_self()`，只把两个副作用换成替身。
+        """调**真的** `manager.echo_stop_self()`，只把三个副作用换成替身。
 
-        换掉的是 `runtime._sidebar_pipe_write`（绝不碰真管道）和 `os._exit`
-        （绝不真把测试进程退掉）—— 别的都是生产代码。
+        换掉的是 `runtime._sidebar_pipe_write`（绝不碰真管道）、
+        `runtime.schedule_sidebar_force_close`（绝不在测试里起 PowerShell）
+        和 `os._exit`（绝不真把测试进程退掉）—— 别的都是生产代码。
         """
         def _record(command):
             self.writes.append(command)
+            return True
+
+        def _record_schedule(*_a, **_k):
+            self.scheduled.append(True)
             return True
 
         real_exit = os._exit
@@ -332,6 +339,8 @@ class StopPathNotifiesSidebarTests(unittest.TestCase):
             self.exited.append(code)
 
         with patch.object(runtime_mod, "_sidebar_pipe_write", side_effect=writer or _record), \
+                patch.object(runtime_mod, "schedule_sidebar_force_close",
+                             side_effect=_record_schedule), \
                 patch.object(os, "_exit", side_effect=_fake_exit):
             manager_mod.echo_stop_self()
         self.assertIs(os._exit, real_exit, "os._exit 必须被还原（不然下一次真调用会写坏）")
@@ -340,6 +349,20 @@ class StopPathNotifiesSidebarTests(unittest.TestCase):
         self._run_stop()
         self.assertEqual(self.writes, ["quit"], "正常停止必须发且只发一条 quit")
         self.assertEqual(self.exited, [0], "发了通知之后仍要真的退出 ECHO")
+        self.assertEqual(self.scheduled, [True], "quit 之后必须安排兜底清理（旧边条不认 quit 时用）")
+
+    def test_the_fallback_script_only_matches_this_trees_sidebar(self):
+        """兜底只按 `<BASE_DIR>\\sidebar\\` 路径匹配，绝不杀别的树的边条。"""
+        script = runtime_mod._sidebar_force_close_script(10)
+        self.assertIn("Start-Sleep -Milliseconds 10", script)
+        self.assertIn("echo-sidebar.exe", script)
+        self.assertIn("ExecutablePath", script)
+        self.assertIn("CommandLine", script)
+        self.assertIn("StartsWith($rootLower)", script)
+        self.assertIn("Stop-Process", script)
+        self.assertNotIn("taskkill /IM", script,
+                         "不许按进程名一刀切（一台机器可能有别的 ECHO 树）")
+        self.assertIn(runtime_mod.BASE_DIR.replace("/", "\\"), script)
 
     def test_the_quit_goes_out_before_the_process_exits(self):
         """顺序：先通知、后退出（反了就永远发不出去）。"""
@@ -354,10 +377,35 @@ class StopPathNotifiesSidebarTests(unittest.TestCase):
             order.append("exit")
 
         with patch.object(runtime_mod, "_sidebar_pipe_write", side_effect=_writer), \
+                patch.object(runtime_mod, "schedule_sidebar_force_close",
+                             side_effect=lambda *a, **k: order.append("schedule")), \
                 patch.object(os, "_exit", side_effect=_fake_exit):
             manager_mod.echo_stop_self()
-        self.assertEqual(order, ["quit", "exit"])
+        self.assertEqual(order, ["quit", "schedule", "exit"])
         self.assertIs(os._exit, real_exit, "os._exit 必须还原（否则后面的真调用会被替身吃掉）")
+
+    @unittest.skipUnless(sys.platform == "win32", "PowerShell 兜底只在 Windows 上有")
+    def test_the_fallback_spawns_a_detached_powershell(self):
+        """兜底必须真的**脱离** ECHO 起 PowerShell，且不弹窗、不占管道。"""
+        with patch.object(runtime_mod.subprocess, "Popen") as popen:
+            self.assertTrue(runtime_mod.schedule_sidebar_force_close(10))
+        self.assertTrue(popen.called, "schedule_sidebar_force_close 没起进程")
+        args, kwargs = popen.call_args
+        cmd = args[0]
+        self.assertIn("powershell.exe", cmd[0])
+        self.assertIn("-File", cmd)
+        script_path = cmd[cmd.index("-File") + 1]
+        self.assertTrue(script_path.endswith(".ps1"), "兜底脚本必须落成 .ps1 再 -File 起")
+        self.assertTrue(os.path.isfile(script_path), "脚本文件应当已写入")
+        try:
+            os.remove(script_path)
+        except OSError:
+            pass
+        self.assertEqual(subprocess.DEVNULL, kwargs.get("stdout"))
+        self.assertEqual(subprocess.DEVNULL, kwargs.get("stderr"))
+        self.assertTrue(kwargs.get("close_fds"))
+        self.assertTrue(kwargs.get("creationflags", 0) & subprocess.DETACHED_PROCESS,
+                        "清理进程必须脱离 ECHO，否则 ECHO os._exit 会把它一起带走")
 
     def test_a_sidebar_that_is_not_there_never_fails_the_stop(self):
         """边条没开/管道连不上 → 停止**不许**失败，也不许抛（最坏只是少关一个窗口）。"""
