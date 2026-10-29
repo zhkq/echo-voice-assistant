@@ -148,17 +148,20 @@ function confirmDialog(message, { okText = "确定", cancelText = "取消", dang
    所以这一节的规矩：**每一次点击都要留下看得见的话**（正在… / 已取消 / 失败原话 /
    以服务端状态为准的最终结论）。开与停走**同一份逻辑** —— 只修一处就是"另一处还是没反应"。 */
 
-/** 会议那一块**右侧那一列**：时间在上、状态行在下（2026-10-19 用户口径）。
+/** 会议那一块**右侧那一列**：状态句在上、操作反馈行在下（2026-10-19 用户口径）。
  *
  *  用户原话："pc 端开始录音按钮下面有一行状态，这个挪到按钮右侧跟录音时间上下并列"。
- *  **为什么是同一列、不是拆成两列**：这两行讲的是**同一场录音** —— 上面是"这场录到哪了"
- *  （`正在录音：<folder>`），下面是"服务端确认它真的在录"（`ⓘ 已确认：服务端在录音`）。
- *  状态行跟着"这场录音"的信息走，眼睛不用在按钮上下方来回跳；也不占按钮那一行的宽度。
+ *  **为什么是同一列、不是拆成两列**：这几行讲的是**同一场录音** —— 上面是"这场录到哪了"
+ *  （`录音中 · <开始时间>` / 手机那场 / 上次出错），下面是"服务端确认它真的在录"
+ *  （`ⓘ 已确认：服务端在录音`）。状态行跟着"这场录音"的信息走，眼睛不用在按钮上下方来回跳。
  *
  *  `web/index.html` / `web/app.css` 不在这次改动的允许清单里，所以这一列（以及它的竖排
  *  样式）都由 JS 建 —— 与确认框、反馈行的做法一致。
- *  **只对"按钮旁边就有这场录音的时间"那一块生效**：会议列表标题栏那颗按钮旁边没有
+ *  **只对"按钮旁边就有这场录音的状态"那一块生效**：会议列表标题栏那颗按钮旁边没有
  *  `#meetingInfo`，那里仍按原来的位置（标题行下面）贴，不硬塞进一个空列。
+ *
+ *  ⚠️ 2026-10-29（用户："旁边展示的内容太臃肿了，需要精简，**确保不占新行**"）：
+ *  这一列不再允许被 `flex-wrap` 挤到按钮下方（见函数内 `flex: 1 1 0` 那段注释）。
  */
 function meetingSideColumn(anchor) {
   const info = document.getElementById("meetingInfo");
@@ -170,23 +173,37 @@ function meetingSideColumn(anchor) {
   col = document.createElement("div");
   col.id = "meetingSideCol";
   col.className = "meeting-side-col";
-  // 竖排：时间在上、状态行在**下**（同一列）。宽屏时它就是按钮右边那一列；窄屏放不下时，
-  // 靠 `.card-body.row` 既有的 `flex-wrap: wrap` **整列**落到按钮下方，而不是把这一列
-  // 压成碎片。`min-width:0` 让它能收缩（文字自己换行），`max-width:100%` 防止溢出去。
+  // 竖排：状态句在上、操作反馈行在**下**（同一列）。宽屏时它就是按钮右边那一列。
+  //
+  // 2026-10-29 用户："开始录音按钮旁边展示的内容太臃肿了，需要精简，**确保不占新行**"。
+  // 那之前这里靠 `.card-body.row` 的 `flex-wrap: wrap` 在窄屏"整列落到按钮下方" ——
+  // 结果就是：手机那场那句长文案一来，整列掉到按钮下面、占掉了新的一行。
+  // 现在反过来钉住：`flex: 1 1 0` 把这一列的**假想宽度压成 0**（flex 换行是照假想宽度
+  // 判定的，`auto` 时它等于文字最大宽度 → 长一点就换行），剩余宽度它自己吃掉；
+  // 里面的文字再用**单行省略号**兜底（完整内容在 `title` 里，鼠标悬停看得到）。
+  // `min-width:0` / `max-width:100%`：能收缩、不横向溢出。
   col.style.display = "flex";
   col.style.flexDirection = "column";
   col.style.alignItems = "flex-start";
+  col.style.flex = "1 1 0";        // ← "不占新行"的判据就在这一行（不是"文案写得够短"）
   col.style.minWidth = "0";
   col.style.maxWidth = "100%";
   anchor.insertAdjacentElement("afterend", col);   // 列固定在**按钮右侧**
-  col.appendChild(info);                           // 把「正在录音：<folder>」挪进去（不复制、不改文案）
+  col.appendChild(info);                           // 把「录音中 · <开始时间>」挪进去（不复制、不改文案）
+  // 这一句是**一行**的状态话：放不下就省略号，完整内容在 `title`（见 `refreshDashboard()`）。
+  // 单行是硬约束：`pre-wrap` / 允许换行都会把按钮那一行撑高，又变回"旁边一大坨"。
+  info.style.whiteSpace = "nowrap";
+  info.style.overflow = "hidden";
+  info.style.textOverflow = "ellipsis";
+  info.style.maxWidth = "100%";
+  info.style.minWidth = "0";
   return col;
 }
 
 /** 会议操作的**常驻反馈行**：点完还看得见（toast 会飘走）。
  *
- *  **放在哪里（2026-10-19 用户口径）**：不再压在按钮下方单独占一行，而是进「正在录音：
- *  <folder>」**所在的那一列**、排在它下面 —— 两行上下并列，见 `meetingSideColumn()`。
+ *  **放在哪里（2026-10-19 用户口径）**：不再压在按钮下方单独占一行，而是进「录音中 ·
+ *  <开始时间>」**所在的那一列**、排在它下面 —— 两行上下并列，见 `meetingSideColumn()`。
  *
  *  为什么自己建节点：`web/index.html` 与 `web/app.css` 不在这次改动的允许清单里 ——
  *  确认框本来就是这个方式（JS 动态建），这里保持一致。
@@ -1313,11 +1330,31 @@ async function refreshDashboard() {
     mb.textContent = pcRecording ? "录音中" : (phoneMic ? "手机录音中" : "空闲");
     mb.className = "badge " + (meeting.active ? "active" : "idle");
     mb.title = phoneMic ? PHONE_MIC_BUTTON_TITLE : "";
-    $("#meetingInfo").textContent = pcRecording
-      ? `正在录音：${meeting.folder}`
-      : (phoneMic
-        ? `手机正在录音（不是这台电脑）：${meeting.folder || ""} · 传完才开始转写`
-        : (meeting.error ? `上次错误：${meeting.error}` : "未在录音"));
+    // 会议状态那一句（按钮右侧）：**只说一件事、一行说得完**。
+    // 2026-10-29 用户："开始录音按钮旁边展示的内容太臃肿了，需要精简，**确保不占新行**"。
+    // 所以可见文案一律压到一句短语；**完整信息全部进 `title`**（鼠标悬停看得到）：
+    //   · 电脑在录  → 「录音中 · HH:MM 开始」（这是 2026-10-19 用户要的"录音时间"；
+    //                 完整文件夹名在下面的会议列表里，也在这里的 title 里）
+    //   · 手机那场  → 「手机在录 · 传完才转写」（"不是这台电脑"由徽章的「手机录音中」+ title 说清）
+    //   · 上次出错  → 「上次出错」（错误原话在 title 里，不在这里铺开）
+    //   · 空闲      → 「未在录音」
+    // **不换行不靠"文字够短"**：`meetingSideColumn()` 用 `flex: 1 1 0` + 单行省略号兜底，
+    // 以后文案再长也只会省略，不会把整列挤到按钮下面去。
+    const infoEl = $("#meetingInfo");
+    if (pcRecording) {
+      const at = fmtClock(meeting.startedAt);
+      infoEl.textContent = at ? `录音中 · ${at} 开始` : "录音中";
+      infoEl.title = `正在录音：${meeting.folder || ""}`;
+    } else if (phoneMic) {
+      infoEl.textContent = "手机在录 · 传完才转写";
+      infoEl.title = `手机正在录音（不是这台电脑）：${meeting.folder || ""} · 传完才开始转写`;
+    } else if (meeting.error) {
+      infoEl.textContent = "上次出错";
+      infoEl.title = `上次错误：${meeting.error}`;
+    } else {
+      infoEl.textContent = "未在录音";
+      infoEl.title = "";
+    }
     // **正在开/停的时候不许改写按钮文案**：5 秒一次的状态轮询会把「正在停止…」抹回
     // 「停止录音」，用户又变成"看不出点没点上"—— 那正是这次要修的体验。
     if (!_meetingActionPending) {
@@ -1376,6 +1413,17 @@ function fmtHM(sec) {
   const t = Math.max(0, Math.round(sec || 0));
   const h = Math.floor(t / 3600), m = Math.floor((t % 3600) / 60);
   return h > 0 ? `${h}:${String(m).padStart(2, "0")}` : String(m);
+}
+
+/** 一个时刻的 `HH:MM`（仪表盘按钮右侧那句只留到分钟：`录音中 · 14:00 开始`）。
+ *
+ *  为什么只要"时:分"：2026-10-29 用户要求那一列精简、且**不占新行** —— 日期/秒/文件夹名
+ *  都在 `title` 与下面的会议列表里，这里只要"这场是从几点开始的"。
+ *  解析不了（老服务端没 `startedAt`）返回空串，调用方退回不带时间的短文案，别显示 `Invalid Date`。 */
+function fmtClock(iso) {
+  const d = new Date(String(iso || ""));
+  if (isNaN(d.getTime())) return "";
+  return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
 }
 
 /* ---------------- 在线时长 + 当前状态（顶栏已取消，改放启动页与折叠条） ----------------
@@ -8028,8 +8076,8 @@ function initHistoryTab() {
 }
 initHistoryTab();
 applyCollapsedCards();      // 应用上次的卡片折叠状态（设置页与各页签的可折叠卡片）
-// 仪表盘「会议录音」：把「正在录音：<folder>」挪进按钮右侧那一列（**首屏就这么排**，
-// 不用等用户点一次录音才成形）。窄屏时整列随 `.card-body.row` 的 `flex-wrap` 落到下方。
+// 仪表盘「会议录音」：把「录音中 · <开始时间>」挪进按钮右侧那一列（**首屏就这么排**，
+// 不用等用户点一次录音才成形）。**整列永远在按钮同一行**（`flex: 1 1 0`，2026-10-29）。
 meetingSideColumn($("#btnMeeting"));
 
 /* ---------------- 自动刷新：间隔取自设置 panelAutoRefresh ----------------

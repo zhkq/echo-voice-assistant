@@ -18,6 +18,8 @@
      * `phone + active` → 徽章"手机录音中"、说明"手机正在录音（不是这台电脑）"、
        **不显示**麦克风电平、电脑那颗「开始录音」**置灰**并在 `title` 里说清"只有一条录音槽，
        等手机结束/传完才能开新的一场"（服务端那条拒绝仍然在，是双保险）；
+       *2026-10-29 起*：按钮旁**可见**的那句精简成「手机在录 · 传完才转写」（用户："太臃肿了，
+       需要精简，确保不占新行"），完整说明仍在 `title` 里 —— 判据没变，只是不再铺在界面上；
      * `pc + active` → 与以前**逐字相同**：按钮「停止录音」+ 危险色。
 """
 import os
@@ -117,7 +119,12 @@ class PanelDoesNotPretendTheComputerIsRecordingTests(unittest.TestCase):
         self.assertIn("const phoneMic = isPhoneMicMeeting(meeting);", dash)
         self.assertIn("const pcRecording = !!(meeting.active && !phoneMic);", dash)
         self.assertIn('"手机录音中"', dash, "徽章要分开说：手机在录，不是这台电脑")
-        self.assertIn("手机正在录音（不是这台电脑）", dash, "#meetingInfo 那句要说清")
+        # 2026-10-29：按钮旁那句**精简成一句短语**（用户："太臃肿了…确保不占新行"）；
+        # 完整说明（"不是这台电脑" / 文件夹名 / 传完才转写）进 `title`，悬停可见。
+        self.assertIn('infoEl.textContent = "手机在录 · 传完才转写"', dash,
+                      "按钮旁那句要精简（2026-10-29 用户要求），不能是原来那串长话")
+        self.assertIn("手机正在录音（不是这台电脑）", dash,
+                      "精简的是**可见文字**；完整原因仍要在 title 里说清")
         # `active` 不许再单独决定"录音中"（那正是这次的面板状态错）
         self.assertNotIn('mb.textContent = meeting.active ? "录音中" : "空闲";', dash)
 

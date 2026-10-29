@@ -22,9 +22,24 @@
   2. 它**不再是按钮的兄弟/下方**（不是 `.card-body` 的直接子节点，也不在按钮那一行里）；
   3. 宽屏结构就是「按钮 | 右侧一列（时间 + 确认行）」：列是按钮的**后一个兄弟**，
      列内顺序是 时间 → 确认行（上→下）；
-  4. 窄屏能整列落到按钮下方（靠 `.card-body.row` 既有的 `flex-wrap: wrap`，不用新 CSS）。
+  4. **这一列永远不换行**（2026-10-29 用户口径，见下）。
 
-**不钉**：状态文案与显示条件（那两样一律不改，字面断言它原样还在）。
+## 2026-10-29 追加（这次**推翻了**上面第 4 条的旧口径）
+
+用户原话："**仪表盘页面开始录音按钮旁边展示的内容太臃肿了，需要精简，确保不占新行**"。
+
+旧版第 4 条写的是"窄屏**整列**落到按钮下方"（靠 `.card-body.row` 的 `flex-wrap: wrap`）——
+实际用起来正好是用户抱怨的样子：手机那场那句长文案一来，整列就掉到按钮下面、**占了新的一行**。
+现在反过来钉住两件事：
+
+  * **可见文案只留一句短语**（`refreshDashboard()`）：电脑在录 = `录音中 · HH:MM 开始`、
+    手机那场 = `手机在录 · 传完才转写`、出错 = `上次出错`、空闲 = `未在录音`；
+    完整信息（文件夹名 / "不是这台电脑" / 错误原话）一律进 `title`（悬停可见）。
+  * **列本身不许换行**：`meetingSideColumn()` 给列 `flex: 1 1 0`（假想宽度 0 → `flex-wrap`
+    永远不会把它挤到下一行），里面的文字 `nowrap + ellipsis`。这样以后文案再长也只省略，
+    不会"把按钮那一行撑成两行"。
+
+**不钉**：状态行的显示条件（`meetingNote()` 那套，一律不改）。
 
 ## 为什么"真跑 JS"而不是查字符串
 
@@ -262,6 +277,10 @@ function snap() {
     colPrevId: col && col.previousElementSibling ? col.previousElementSibling.id : null,
     colDisplay: col ? col.style.display : "",
     colDirection: col ? col.style.flexDirection : "",
+    colFlex: col ? col.style.flex : "",
+    infoWhiteSpace: info.style.whiteSpace,
+    infoOverflow: info.style.overflow,
+    infoTextOverflow: info.style.textOverflow,
     noteCount: countById(document.body, "meetingActionNote"),
     colCount: countById(document.body, "meetingSideCol"),
   };
@@ -379,6 +398,26 @@ class MeetingPanelLayoutTests(_NodeCase):
         self.assertEqual(["btnMeeting", "meetingSideCol"], out["cardBodyKids"])
         self.assertEqual(["meetingInfo"], out["colKids"], "时间应当被挪进这一列（只挪一次）")
 
+    def test_the_column_can_never_be_pushed_to_a_new_line(self):
+        """2026-10-29 用户："**确保不占新行**" —— 列的假想宽度必须是 0（`flex: 1 1 0`）。
+
+        只把文案写短是"碰巧放得下"；`flex-wrap` 是照**假想宽度**决定换行的，`auto` 时它
+        等于文字最大宽度 —— 长一点整列就掉到按钮下方（2026-10-29 真机现场就是这样）。
+        所以这里钉的是**样式**：`flex: 1 1 0`（假想宽度 0 → 永不换行）+ 文字单行省略。
+        """
+        out = self._run(
+            'info.textContent = "手机在录 · 传完才转写";\n'
+            'meetingSideColumn(btnMeeting);\n'
+            'RESULT = snap();\n')
+        self.assertEqual("1 1 0", out["colFlex"],
+                         "那一列没拿到 `flex: 1 1 0`：flex-wrap 会把它挤到按钮下面（占新行）")
+        self.assertEqual("nowrap", out["infoWhiteSpace"],
+                         "状态句必须单行：允许换行就会把按钮那一行撑高")
+        self.assertEqual("hidden", out["infoOverflow"],
+                         "没有 overflow:hidden 时省略号不生效，长文案照样撑宽")
+        self.assertEqual("ellipsis", out["infoTextOverflow"],
+                         "放不下要用省略号（完整内容在 title 里）")
+
 
 class MeetingListButtonTests(_NodeCase):
     """会议列表标题栏那颗按钮旁边没有「这场录音的时间」→ 状态行仍贴标题行下面（不改旧行为）。"""
@@ -392,11 +431,11 @@ class MeetingListButtonTests(_NodeCase):
                         "会议列表那颗按钮的状态行不在标题行下面：%r" % out)
         self.assertFalse(out["sameParent"], "列表那颗按钮旁边没有时间，不该硬塞进同一列")
         self.assertTrue(out["infoInCardBody"],
-                        "仪表盘那句「正在录音：<folder>」被列表那条挪走了")
+                        "仪表盘那句「录音中 · <开始时间>」被列表那条挪走了")
 
 
 class MeetingPanelSourceTests(unittest.TestCase):
-    """源码一级：判据只有一处、文案一字不改、窄屏能整列换行（不用新 CSS）。"""
+    """源码一级：判据只有一处、文案精简、列不换行（2026-10-29 口径）。"""
 
     @classmethod
     def setUpClass(cls):
@@ -425,10 +464,31 @@ class MeetingPanelSourceTests(unittest.TestCase):
                       "那一列要固定在按钮右侧")
         self.assertIn("col.appendChild(info)", side, "时间要挪进这一列（不是复制一份）")
         self.assertIn("flexDirection = \"column\"", side, "这一列必须竖排")
-        row_css_at = self.css.index(".card-body.row {")
-        row_css = self.css[row_css_at:self.css.index("}", row_css_at)]
-        self.assertIn("flex-wrap: wrap", row_css,
-                      "窄屏要能整列落到按钮下方（靠既有 flex-wrap，不新增 CSS）")
+
+    def test_the_column_is_pinned_to_the_buttons_line(self):
+        """2026-10-29："不占新行" 的判据只能在 `meetingSideColumn()` 里（别散到别处）。"""
+        side = _js_function(self.js, SIDE_SIG)
+        self.assertIn('col.style.flex = "1 1 0"', side,
+                      "列必须 flex-basis 0（假想宽度 0）—— 否则 flex-wrap 会把它挤到下一行")
+        self.assertIn('info.style.whiteSpace = "nowrap"', side, "状态句必须单行")
+        self.assertIn('info.style.textOverflow = "ellipsis"', side,
+                      "放不下要省略号（完整内容在 title 里，别把按钮行撑高）")
+
+    def test_the_visible_line_is_one_short_phrase_and_the_detail_is_in_the_title(self):
+        """2026-10-29：按钮旁那句**精简成一句短语**，完整信息进 `title`（悬停可见）。"""
+        dash = _js_function(self.js, "async function refreshDashboard(")
+        # 手机那场：可见 = 一句短语；"不是这台电脑"的完整说明在 title
+        self.assertIn('infoEl.textContent = "手机在录 · 传完才转写"', dash,
+                      "手机那场那句太长了（用户 2026-10-29：太臃肿、不许占新行）")
+        self.assertIn("手机正在录音（不是这台电脑）", dash,
+                      "精简的是可见文字，完整原因仍要在 title 里说清")
+        # 电脑在录：可见 = 开始时间（2026-10-19 要的"录音时间"），文件夹名进 title
+        self.assertIn("录音中 · ${at} 开始", dash,
+                      "电脑在录那句要精简成「录音中 · HH:MM 开始」（别把文件夹名摆出来）")
+        self.assertIn("infoEl.title = `正在录音：", dash)
+        # 出错：可见只留短标记，原话在 title
+        self.assertIn('infoEl.textContent = "上次出错"', dash)
+        self.assertIn("infoEl.title = `上次错误：", dash)
 
     def test_index_html_is_still_the_static_skeleton(self):
         """这次的改动只在 JS 里：静态骨架仍是「按钮 + 时间」两样，行/列都靠 JS 建。"""
