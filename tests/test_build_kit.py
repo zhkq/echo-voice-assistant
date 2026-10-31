@@ -675,7 +675,7 @@ class BundleRidesAlongInTheKit(unittest.TestCase):
             zf.writestr("SHA256SUMS.txt", "")
         return main
 
-    def _bundle(self, tmp: Path, *, with_models=True, with_runtime=True) -> Path:
+    def _bundle(self, tmp: Path, *, with_models=False, with_runtime=True) -> Path:
         b = tmp / "bundle-src"
         (b / "wheels").mkdir(parents=True)
         # 载荷清单：`build_offline_pack.py --bundle` 会写它，`verify_bundle()` 也认它
@@ -683,16 +683,8 @@ class BundleRidesAlongInTheKit(unittest.TestCase):
         for name in _bundle_wheel_names():
             (b / "wheels" / name).write_text("w", encoding="utf-8")
         if with_models:
-            m = b / "models" / "sherpa-onnx-streaming"
-            m.mkdir(parents=True)
-            for name in ("encoder.onnx", "decoder.onnx", "joiner.onnx", "tokens.txt"):
-                (m / name).write_text("x", encoding="utf-8")
-            # 2026-10-08：默认档还要 `sensevoice-onnx`（指令转写的默认引擎）。
-            # 校验器要求它是**对的** —— 缺了会在出包时响亮报错，所以这里也要造出来。
-            sv = b / "models" / "sensevoice-onnx"
-            sv.mkdir(parents=True)
-            for name in ("model.int8.onnx", "tokens.txt", "silero_vad.onnx"):
-                (sv / name).write_text("x", encoding="utf-8")
+            # 历史参数：2026-10-31 起客户端不再装本地模型，默认不带 models\\。
+            (b / "models").mkdir(parents=True)
         if with_runtime:
             (b / "runtime").mkdir(parents=True)
             (b / "runtime" / "python-3.11.9-embed-amd64.zip").write_text("z", encoding="utf-8")
@@ -709,8 +701,8 @@ class BundleRidesAlongInTheKit(unittest.TestCase):
                 win, self._main_zip(root), "20260930-9999", dist,
                 bundle_from=self._bundle(root))
             self.assertTrue((kit_dir / "bundle" / "wheels" / "fastapi-0.115.0-py3-none-any.whl").is_file())
-            self.assertTrue((kit_dir / "bundle" / "models" / "sherpa-onnx-streaming"
-                             / "tokens.txt").is_file())
+            # 2026-10-31：客户端无本地模型 —— 只带 wheels/runtime。
+            self.assertFalse((kit_dir / "bundle" / "models").exists())
             self.assertIn("bundle/", (kit_dir / "BUILD-INFO.txt").read_text(encoding="utf-8"))
             with zipfile.ZipFile(zip_path) as zf:
                 names = zf.namelist()
@@ -730,7 +722,7 @@ class BundleRidesAlongInTheKit(unittest.TestCase):
             self.assertIn("wheels", str(ctx.exception))
 
     def test_the_kit_verify_reuses_the_bundle_contract(self):
-        """缺模型/缺 runtime 的 bundle 要在**组包后**就报出来（别等同事装到一半）。"""
+        """缺 runtime 的 bundle 要在**组包后**就报出来；没有 models 是正常的。"""
         with tempfile.TemporaryDirectory(prefix="echobundlekit-") as tmp:
             root = Path(tmp)
             dist = root / "dist"
@@ -740,7 +732,7 @@ class BundleRidesAlongInTheKit(unittest.TestCase):
                 win, self._main_zip(root), "20260930-9999", dist,
                 bundle_from=self._bundle(root, with_models=False, with_runtime=False))
             problems = build_kit.bundle_problems(kit_dir)
-            self.assertTrue(any("sherpa-onnx-streaming" in p for p in problems), problems)
+            self.assertFalse(any("sherpa" in p or "models" in p for p in problems), problems)
             self.assertTrue(any("get-pip.py" in p for p in problems), problems)
 
     def test_a_good_bundle_has_no_problems(self):

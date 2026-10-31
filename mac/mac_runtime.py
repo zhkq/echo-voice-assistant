@@ -1,14 +1,16 @@
 # -*- coding: utf-8 -*-
 """mac_runtime.py — app.runtime 的 macOS 实现
 
-对外接口与 Windows 版保持一致（start_hotkey/stop_hotkey/start_wake/stop_wake/
+对外接口与 Windows 版保持一致（start_hotkey/stop_hotkey/
 restart_echo/toggle_sidebar/autostart_sidebar/open_panel_window/start_all/stop_all），因此
 app.boot / app.api / app.main 无需任何改动。
 
 差异：
   * 原生 AppKit / WKWebView 右缘边条，未构建时退回浏览器
   * 重启走 mac/restart_mac.sh（不再是 powershell）
-  * 唤醒沿用跨平台的 app.audio.wake.WakeListener
+
+2026-10-31 用户决定彻底取消语音唤醒：这里不再有唤醒监听器
+（`app/audio/wake.py` 已删除）。「按一下说话」的热键/媒体键保留。
 """
 import os
 import re
@@ -18,7 +20,6 @@ import threading
 import time
 
 import app.assistant as assistant
-from app.audio.wake import WakeListener
 from app.config import settings
 from app.hotkey import HotkeyListener
 from app import paths, ports, services
@@ -26,7 +27,6 @@ from app import paths, ports, services
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 _hotkey = None
-_wake = None
 _lock = threading.Lock()
 _panel_last_open = 0.0
 
@@ -212,41 +212,10 @@ def stop_hotkey():
         return True, "热键监听已停止"
 
 
-def _wake_cb():
-    assistant.capture("wake")
-
-
-def start_wake():
-    global _wake
-    with _lock:
-        if _wake is not None and _wake.is_alive():
-            return True, "唤醒监听已在运行"
-        _wake = WakeListener(settings.get, on_wake=_wake_cb)
-        _wake.start()
-        services.report_wake("online", "sherpa KWS")
-        return True, "唤醒监听已启动"
-
-
-def stop_wake():
-    global _wake
-    with _lock:
-        if _wake is not None:
-            _wake.shutdown()
-            _wake = None
-        services.report_wake("offline", "已停止")
-        return True, "唤醒监听已停止"
-
-
 def start_all():
-    """按配置启动监听器（唤醒词需启用才启动）。"""
-    results = [start_hotkey()]
-    if settings.get("wakeEnabled", False):
-        results.append(start_wake())
-    else:
-        services.report_wake("disabled", "未启用")
-    return results
+    """启动监听器。**只有热键/媒体键** —— 语音唤醒已取消（2026-10-31）。"""
+    return [start_hotkey()]
 
 
 def stop_all():
     stop_hotkey()
-    stop_wake()

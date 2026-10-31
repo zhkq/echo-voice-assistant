@@ -3,7 +3,7 @@
 
 所有配置以"键值 + 面板元数据"的形式入库，面板据此动态渲染表单：
   grp        分组（见下方 DEFAULTS 的分节注释：panel/command/paths/voice/beep/speech/
-             wake/meeting/worklog/router + 卡片承载的 agent/provider/model）
+             meeting/worklog/router + 卡片承载的 agent/provider/model）
   value_type str|int|float|bool|json|list  → 决定输入控件
   options    JSON 候选值列表 → 下拉/多选
   hidden     True = 由面板的自定义 UI 承载（智能体表格 / 能力 provider 卡片），
@@ -421,11 +421,13 @@ DEFAULTS = {
     "sendEnvContext":  dict(value=True, grp="voice", sub="command", label="发送环境上下文",
                             description="命令前附加当前时间与所在地，让 DSH 对'今天/明天/本地'有概念",
                             value_type="bool"),
-    # device / sttModel / wakeEngine / meetingSttModel / meetingDiarize / voiceprint*
+    # device / sttModel / meetingSttModel / meetingDiarize / voiceprint*
     # 都归 grp="model"：它们正常由面板顶部「模型」页签承载（带就绪状态与获取入口），
     # 这里的元数据是给"页签加载失败时回退显示"用的（见 web/app.js 的 MODEL_KEYS）。
-    # 2026-09-29：其中 `meetingSttModel` 已经废弃（不再下发、写入被拒），
+    # 2026-10-29：其中 `meetingSttModel` 已经废弃（不再下发、写入被拒），
     # grp 只剩"老库行的兼容标记"这一层意思。
+    # 2026-10-31：`sttModel`/`device` 也只剩兼容读取 —— 客户端不再跑本地 STT，
+    # 指令/回顾/会议全走能力后端 Qwen3-ASR。
     "device":          dict(value="auto", grp="model", label="计算设备",
                             description="auto=cuda 优先，失败回退 CPU。"
                                         "**只影响客户端自己跑的引擎**（whisper / sensevoice / "
@@ -462,8 +464,9 @@ DEFAULTS = {
     "triggerKeys":     dict(value=["vol_up"], grp="voice", sub="record", label="媒体键触发",
                             description="耳机/键盘媒体键作为说话快捷键（vol_up/play_pause/next/prev）",
                             value_type="list", options=["vol_up", "vol_down", "play_pause", "next", "prev"]),
-    "wakeHotkey":      dict(value="Ctrl+Alt+C", grp="voice", sub="record", label="唤醒热键",
-                            description="全局热键开始录音说话", value_type="str"),
+    "wakeHotkey":      dict(value="Ctrl+Alt+C", grp="voice", sub="record", label="说话热键",
+                            description="全局热键开始录音说话（唤醒词已取消，这是免看屏幕的主要入口）",
+                            value_type="str"),
     "fallbackHotkey":  dict(value="Ctrl+Alt+V", grp="voice", sub="record", label="回退热键",
                             description="媒体键失效时使用的备用热键", value_type="str"),
     # 面板热键由 ECHO 服务自己 RegisterHotKey 注册（纯 ctypes），**不依赖 DSH 插件**：
@@ -603,28 +606,6 @@ DEFAULTS = {
                              grp="voice", sub="speech", label="极简回复要求文案",
                              description="拼在命令末尾；{chars} 会替换成上面的字数上限",
                              value_type="str"),
-    # ---------- 唤醒词 ----------
-    "wakeEnabled":     dict(value=False, grp="wake", label="启用语音唤醒",
-                            description="说唤醒词免按键唤起（唤醒词见下方配置）", value_type="bool"),
-    "wakePaused":      dict(value=True, grp="wake", label="唤醒暂停（勿扰）",
-                            description="来电/会议期间临时关闭唤醒", value_type="bool"),
-    "wakeEngine":      dict(value="sherpa", grp="model", label="唤醒方式",
-                            description="sherpa=流式识别出文字再匹配唤醒词（推荐，模型缺失时自动回退 KWS）；"
-                                        "kws=关键词 spotting（只认唤醒词本身，更省 CPU）",
-                            value_type="str", options=["sherpa", "kws"]),
-    "wakeKeywords":    dict(value=["回声回声"], grp="wake", label="唤醒词",
-                            description="支持多个，逗号分隔", value_type="list"),
-    "wakeAliases":     dict(value=[], grp="wake", label="唤醒词别名（误听容错）",
-                            description="流式识别常见误听写法，逗号分隔（如「对你有」是「嘿尼欧」的识别偏差，说唤醒词时会命中）", value_type="list"),
-    "wakeThreshold":   dict(value=0.5, grp="wake", label="唤醒灵敏度阈值",
-                            description="越高越不易误触发", value_type="float"),
-    "wakeCooldownSec": dict(value=3, grp="wake", label="触发冷却秒",
-                            description="两次唤醒的最小间隔", value_type="float"),
-    "wakeConfirmX":    dict(value=2, grp="wake", label="确认帧数",
-                            description="近 N 帧中至少 X 帧命中才触发（防噪声尖峰）", value_type="int"),
-    "wakeConfirmN":    dict(value=3, grp="wake", label="确认窗口", description="见上", value_type="int"),
-    "wakeSilenceFloor": dict(value=60, grp="wake", label="静音门控",
-                             description="低于此音量不送入唤醒模型（省电防误触发）", value_type="int"),
     # ---------- 会议 ----------
     # 2026-09-26（新分工）：会议转写默认 qwen3asr —— 它给**原生句级时间轴**（档位 exact），
     # 而 SenseVoice/sherpa 都得借时间骨架或按字数摊。
@@ -750,18 +731,14 @@ DEFAULTS = {
     "dailyReviewMaxRecordSec": dict(value=120, grp="review", label="单次口述上限（秒）",
                                     description="一段口述最长录多久；到点强制收轮交给 DSH",
                                     value_type="int"),
-    "dailyReviewSttBackend": dict(value="local", grp="review", label="回顾转写走谁",
-                                  description="回顾每一轮口述用哪个引擎转成文字。"
-                                              "**本机 = 与语音指令同一个引擎**"
-                                              "（2026-10-08 起的默认 = int8 ONNX 版 SenseVoice："
-                                              "中文叠字少、且不依赖后端可用性）；"
-                                              "能力后端 = 与**会议转写同一个引擎**"
-                                              "（在 GPU 那台算；后端不可用时自动回落本机）。",
-                                  options=[{"value": "local",
-                                            "label": "本机（与语音指令同一个引擎）"},
-                                           {"value": "echo-server",
-                                            "label": "能力后端（与会议同一个引擎）"}],
-                                  value_type="str"),
+    "dailyReviewSttBackend": dict(value="echo-server", grp="review", label="回顾转写走谁",
+                                  description="已弃用：2026-10-31 起回顾转写**恒为能力后端**"
+                                              "（Qwen3-ASR，与会议同一个引擎）。客户端已不再装"
+                                              "本地 STT 模型，旧的「本机」选项已移除；这一项只做"
+                                              "老库的兼容读取，改了不会有任何效果。",
+                                  options=[{"value": "echo-server",
+                                            "label": "能力后端（Qwen3-ASR，与会议同一个引擎）"}],
+                                  value_type="str", deprecated=True),
     "dailyReviewSilenceMs": dict(value=1400, grp="review", label="静音收轮（毫秒）",
                                  description="说完后静音多久算这一段讲完。太短会把思考停顿切断，"
                                              "太长会让你以为没听见",

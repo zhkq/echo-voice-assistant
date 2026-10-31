@@ -133,7 +133,15 @@ if ($DryRun) {
     }
     Start-Sleep -Seconds 1
     if (Test-Path -LiteralPath $vbsPath) {
-        & wscript.exe $vbsPath
+        # This is a REFRESH, not the logon launch: tell the new supervisor not
+        # to apply bootDefault. wscript inherits the env at spawn time, so it
+        # is safe to restore ours right after starting it.
+        $oldNoBoot = $env:ECHO_SWITCH_NO_BOOT
+        $env:ECHO_SWITCH_NO_BOOT = '1'
+        try { & wscript.exe $vbsPath } finally {
+            if ($null -eq $oldNoBoot) { Remove-Item Env:ECHO_SWITCH_NO_BOOT -ErrorAction SilentlyContinue }
+            else { $env:ECHO_SWITCH_NO_BOOT = $oldNoBoot }
+        }
         Ok 'new supervisor started'
     }
     Start-Sleep -Seconds 3

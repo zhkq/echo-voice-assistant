@@ -162,7 +162,8 @@ class VoiceCommandEndpointTests(_ApiCase):
             calls["text"], calls["source"] = text, source
             return True, "已发送"
 
-        with patch("app.audio.stt.transcribe", lambda *a, **k: "明天天气怎么样"), \
+        with patch("app.assistant._transcribe_command",
+                   lambda *a, **k: ("明天天气怎么样", "backend=echo-server", "ok")), \
                 patch("app.assistant.send_text", _send_text):
             r = self._post(_wav_bytes())
         self.assertEqual(r.status_code, 200, r.text)
@@ -181,9 +182,19 @@ class VoiceCommandEndpointTests(_ApiCase):
 
     def test_no_text_recognised_is_422(self):
         """判据 6：识别不出就 422（不是"成功但空"）。"""
-        with patch("app.audio.stt.transcribe", lambda *a, **k: "   "):
+        with patch("app.assistant._transcribe_command",
+                   lambda *a, **k: ("   ", "backend return empty", "empty")):
             r = self._post(_wav_bytes())
         self.assertEqual(r.status_code, 422, r.text)
+
+    def test_backend_busy_is_409_and_says_so(self):
+        """2026-10-31：指令/回顾/会议转写全走后端且串行 —— 忙要回 409 + 人话。"""
+        with patch("app.assistant._transcribe_command",
+                   lambda *a, **k: ("", "能力后端忙（code=client_busy）：上一件事还没跑完",
+                                    "busy")):
+            r = self._post(_wav_bytes())
+        self.assertEqual(409, r.status_code, r.text)
+        self.assertIn("忙", r.json()["detail"])
 
     def test_empty_body_is_422(self):
         r = self._post(b"")

@@ -1,22 +1,14 @@
 # -*- coding: utf-8 -*-
-"""交付档位（能力路由 §1.1/§1.2、施工顺序 step -1）：**默认档真的不含 torch 吗？**
+"""交付档位（2026-10-31 口径）：**客户端默认档不装任何本地 STT 模型/引擎**。
 
-这一组用例回答的是"**办公本装不上**"那件事有没有被真正解决。它不测某个函数返回什么，
-而是把**交付时的承诺**变成会红的东西：
+用户拍板：指令 / 回顾 / 会议转写统一走能力后端（echo-server + Qwen3-ASR），
+语音唤醒取消；客户端安装包从 ~430 MB 缩到 ~58 MB 量级。
 
-1. **默认档的依赖清单里没有 torch 系**（铁律 L1）。这条是整个瘦身的定义 ——
-   §1.3 列的"装不上 / 启动分钟级 / WinError 127 / 诡异崩溃"五类问题**全部**来自 torch 系，
-   所以"不含 torch"不是优化，是把故障面整体搬走。
-2. **默认档必须有 sherpa-onnx**（铁律 L3：唤醒与命令转写必须有本机后端）。
-   这条盯着一次真实事故（2026-09-23）：模型文件齐全、面板报"已就绪"，但 runtime-core 里
-   没装这个包 —— 每次语音指令在转写处抛 `ModuleNotFoundError`，面板一声不响。
-   根因就是"准备运行时的时候没装它"，所以它必须是**默认档的硬要求**，不是可选组件。
-3. **档位表与实际清单不许漂**：`profiles.json` 说的 requirements / 组件，必须与盘上的
-   文件、与 `components/offline-pack.json` 对得上；**每个组件正好属于一个档**（没有孤儿）。
-4. **体积是可加的**：声明的大小必须等于"组件之和 + 额外项"，否则那个数字迟早变成口号。
-
-**不断言"真机装完 600 MB"** —— 那要一台干净机器实测，本机做不了（步骤见 §1.2）。
-这里钉的是**可加的数字与依赖清单**：能把口径钉住，就已经能挡住"悄悄把 torch 加回来"。
+这组用例把交付承诺变成会红的东西：
+1. 默认档组件只剩 `runtime-core`，依赖清单里没有任何本地 STT 引擎/模型下载客户端；
+2. 组件清单/档位表/离线包规格里不再有 stt-* / wake-* / diarize-* 本地模型组件；
+3. 体积口径可加：runtime-core + DSH（extraMb）≈ 342 MB，落在缩包后的预算内；
+4. 安装脚本用的仍是默认档的 requirements-core.txt。
 """
 import json
 import os
@@ -30,6 +22,9 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PROFILES = os.path.join(ROOT, "components", "profiles.json")
 OFFLINE_PACK = os.path.join(ROOT, "components", "offline-pack.json")
 
+#: 客户端默认档**不许**出现的本地 STT/唤醒/分离组件前缀。
+LOCAL_MODEL_PREFIXES = ("stt-", "wake-", "diarize-")
+
 
 def _load(path):
     with open(path, encoding="utf-8") as fh:
@@ -37,7 +32,6 @@ def _load(path):
 
 
 def _package_names(text: str):
-    """依赖清单里的**包名**（去掉注释、版本约束、extras）。"""
     out = set()
     for raw in str(text or "").splitlines():
         line = raw.split("#", 1)[0].strip()
@@ -56,7 +50,7 @@ class ProfileTableTests(unittest.TestCase):
         cls.profiles = {p["id"]: p for p in cls.doc["profiles"]}
         cls.pack = {c["id"]: c for c in _load(OFFLINE_PACK)}
 
-    def test_the_two_profiles_exist(self):
+    def test_the_two_profiles_still_exist(self):
         self.assertEqual(sorted(self.profiles), ["default", "offline"])
 
     def test_every_profile_has_the_fields_the_installer_needs(self):
@@ -64,25 +58,27 @@ class ProfileTableTests(unittest.TestCase):
             with self.subTest(profile=pid):
                 for key in ("label", "summary", "requirements", "components", "accept"):
                     self.assertIn(key, p, "%s 缺 %s" % (pid, key))
-                self.assertTrue(os.path.isfile(os.path.join(ROOT, p["requirements"])),
-                                "%s 指的依赖清单不存在：%s" % (pid, p["requirements"]))
-                self.assertTrue(p["accept"],
-                                "%s 没有验收条目 —— 那这一档就只是一句口号" % pid)
+                self.assertTrue(os.path.isfile(os.path.join(ROOT, p["requirements"])))
+                self.assertTrue(p["accept"])
+
+    def test_no_local_model_component_anywhere(self):
+        for pid, p in self.profiles.items():
+            with self.subTest(profile=pid):
+                bad = [c for c in p["components"] if c.startswith(LOCAL_MODEL_PREFIXES)]
+                self.assertEqual(bad, [], "%s 里还有本地模型组件：%s" % (pid, bad))
+
+    def test_offline_pack_spec_has_no_local_models(self):
+        bad = [cid for cid in self.pack if cid.startswith(LOCAL_MODEL_PREFIXES)]
+        self.assertEqual(bad, [], "offline-pack.json 里还有本地模型组件：%s" % bad)
 
     def test_no_component_belongs_to_two_profiles(self):
         seen = {}
         for pid, p in self.profiles.items():
             for cid in p["components"]:
-                self.assertNotIn(cid, seen,
-                                 "%s 同时属于 %s 和 %s" % (cid, seen.get(cid), pid))
+                self.assertNotIn(cid, seen)
                 seen[cid] = pid
 
     def test_every_offline_component_belongs_to_a_profile(self):
-        """**没有孤儿**：`offline-pack.json` 里声明的组件必须有人认领。
-
-        不然会出现"打包脚本会打它、但没人说它属于哪一档"的情况 —— 那时它是进默认档
-        （把办公本撑胖）还是根本不装，全靠读代码猜。
-        """
         orphans = sorted(set(self.pack) - {c for p in self.profiles.values()
                                            for c in p["components"]})
         self.assertEqual(orphans, [], "这些组件不属于任何档：%s" % orphans)
@@ -94,8 +90,6 @@ class ProfileTableTests(unittest.TestCase):
 
 
 class DefaultProfileTests(unittest.TestCase):
-    """**默认档的判据**（这一档的定义就在这里）。"""
-
     @classmethod
     def setUpClass(cls):
         cls.profiles = {p["id"]: p for p in _load(PROFILES)["profiles"]}
@@ -105,95 +99,47 @@ class DefaultProfileTests(unittest.TestCase):
             cls.req_text = fh.read()
         cls.names = _package_names(cls.req_text)
 
+    def test_the_default_profile_only_installs_the_runtime(self):
+        self.assertEqual(self.default["components"], ["runtime-core"])
+
+    def test_the_default_profile_has_no_local_stt_or_download_client(self):
+        banned = {"sherpa-onnx", "modelscope", "pypinyin", "funasr", "faster-whisper",
+                  "pyannote.audio", "torch", "onnxruntime"}
+        hits = sorted(banned & self.names)
+        self.assertEqual(hits, [], "默认档依赖里还有本地 STT/模型下载依赖：%s" % hits)
+
     def test_the_default_profile_has_no_torch_family(self):
-        """**铁律 L1**：默认档不含 torch（也不含 CUDA、不含编译步骤）。"""
         hits = sorted(n for n in self.default["forbid"] if n in self.names)
-        self.assertEqual(hits, [],
-                         "默认档的依赖清单里出现了 torch 系（%s）—— 那一档的全部意义就没了"
-                         % hits)
+        self.assertEqual(hits, [])
 
-    def test_the_default_profile_has_no_torch_carrying_component(self):
-        """**只查依赖清单是不够的**：torch 还能从组件那条路溜回来。
-
-        把 `stt-sensevoice`（funasr + torch，896 MB）挪进默认档，`requirements-core.txt`
-        一个字都不用改 —— 而那条"不含 torch"的护栏照样绿。这条堵的就是它。
-        （这是写完上一版用例、自己回头看时发现的漏洞，不是猜的。）
-        """
+    def test_the_default_profile_has_no_local_model_component(self):
         hits = sorted(c for c in self.default.get("forbidComponents", [])
                       if c in self.default["components"])
-        self.assertEqual(hits, [],
-                         "默认档里出现了这些组件（%s）—— 它们会把 torch 或几百 MB "
-                         "一起带回来" % hits)
+        self.assertEqual(hits, [])
 
-    def test_every_forbidden_component_is_actually_claimed_by_another_profile(self):
-        """被禁的组件总得有人要 —— 否则它就成了"谁都不装"的死件。"""
-        claimed = {c for pid, p in self.profiles.items()
-                   if pid != "default" for c in p["components"]}
-        orphans = sorted(set(self.default.get("forbidComponents", [])) - claimed)
-        self.assertEqual(orphans, [], "这些组件被默认档禁了，却没有别的档认领：%s" % orphans)
-
-    def test_the_default_profile_keeps_the_command_chain_local(self):
-        """**铁律 L3**：唤醒与命令转写必须有本机后端。
-
-        盯着那次真实事故（2026-09-23）：模型齐、面板说就绪，而 runtime-core 没装
-        `sherpa-onnx` —— 语音指令一声不响地全废。所以它是**硬要求**。
-        """
+    def test_required_deps_are_declared(self):
         missing = sorted(n for n in self.default["require"] if n not in self.names)
-        self.assertEqual(missing, [], "默认档缺了这些（指令链路会废）：%s" % missing)
+        self.assertEqual(missing, [], "默认档缺了这些：%s" % missing)
 
-    def test_the_offline_profile_is_the_one_that_may_pull_torch(self):
-        """反过来也要成立：torch 系进的是**增强档**，而且它得明说这件事。
-
-        不成立的话，"默认档不含 torch"可能只是"哪儿都没有 torch"——
-        那这个档位划分就没有意义了。
-        """
-        with open(os.path.join(ROOT, self.profiles["offline"]["requirements"]),
-                  encoding="utf-8") as fh:
-            offline = _package_names(fh.read())
-        self.assertTrue(offline & {"funasr", "faster-whisper"},
-                        "增强档的清单里也没有 torch 系？那两档就没区别了")
-
-    def test_the_default_size_adds_up_and_fits_the_budget(self):
-        """声明的大小 = 组件之和 + 额外项；而且要落在 §1.1 的预算里。
-
-        这条防的是"数字变成口号"：改了组件、忘了改合计，用例会红。
-
-        **2026-10-08 预算从 700 提到 950**：默认档加了 `stt-sensevoice-onnx`
-        （int8 ONNX 版 SenseVoice，230 MB）—— 用户明确要求把指令转写的默认引擎换成它
-        （中文叠字实测 73 vs 流式 852）。它**不带 torch**（复用已有的 sherpa_onnx），
-        所以 L1 铁律没被破坏，涨的只是体积。原来那个 ≈606 MB 的预算是按
-        「runtime-core + stt-sherpa + wake-kws」算的，现在：
-          * `wake-kws` 移到了 offline 档（唤醒默认关闭，启用时再下）；
-          * 加了 230 MB 的默认转写引擎。
-        上限留 950 而不是正好 796：给"再进一个 100~150 MB 的 torch-free 组件"留余量，
-        但**仍然拦得住** 896 MB 的 funasr 版 SenseVoice 这类会破坏 L1 的东西。
-        """
+    def test_the_default_size_is_within_the_slim_budget(self):
+        """缩包后的口径：runtime-core ≈120 MB + DSH(extraMb 222) ≈ 342 MB。"""
         comp = sum(int(self.pack[c]["pack"].get("approx_mb") or 0)
                    for c in self.default["components"])
         total = comp + int(self.default.get("extraMb") or 0)
-        self.assertLessEqual(total, 950,
-                             "默认档声明 %d MB，超了 §1.1 的预算" % total)
-        self.assertGreaterEqual(total, 500,
-                                "默认档只有 %d MB？比 §1.1 说的少太多，八成是漏了组件"
-                                % total)
+        self.assertLessEqual(total, 500, "默认档声明 %d MB，超了缩包后的预算" % total)
+        self.assertGreaterEqual(total, 250, "默认档只有 %d MB？八成是漏了运行时" % total)
 
     def test_the_declared_size_has_exactly_one_source(self):
-        """**合计不重复存**：它由组件之和算出。
-
-        存一份 `approxMb` 再存一份组件清单 = 同一份事实算两遍，迟早出现
-        "改了组件、数字还是老的"。所以这里断言的是**没有**那个字段 ——
-        要显示合计的地方（面板/文档）自己算，或者引这一条。
-        """
         for pid, p in self.profiles.items():
-            with self.subTest(profile=pid):
-                self.assertNotIn("approxMb", p,
-                                 "%s 里又存了一份合计 —— 那是第二个真相，删掉它"
-                                 % pid)
+            self.assertNotIn("approxMb", p, "%s 里又存了一份合计" % pid)
+
+    def test_offline_profile_is_deprecated_and_empty(self):
+        offline = self.profiles["offline"]
+        self.assertEqual(offline["components"], [])
+        self.assertIn("废弃", offline["summary"])
 
 
 class InstallerUsesTheDefaultProfileTests(unittest.TestCase):
-    """安装脚本的默认路径**就是**默认档 —— 两份东西不许各说各的。"""
-
     @classmethod
     def setUpClass(cls):
         with open(os.path.join(ROOT, "scripts", "install.ps1"), encoding="utf-8") as fh:
@@ -201,27 +147,17 @@ class InstallerUsesTheDefaultProfileTests(unittest.TestCase):
         cls.default = {p["id"]: p for p in _load(PROFILES)["profiles"]}["default"]
 
     def test_the_installer_installs_the_default_profiles_requirements(self):
-        self.assertIn(self.default["requirements"], self.install,
-                      "安装脚本没在用默认档指的依赖清单（%s）"
-                      % self.default["requirements"])
+        self.assertIn(self.default["requirements"], self.install)
 
     def test_the_installer_does_not_install_the_heavy_list_by_default(self):
-        """`requirements.txt` 是**增强档**的清单：安装脚本默认不许拿它当基础依赖。"""
         self.assertNotIn("requirements.txt", self.install.replace(
-            "requirements-core.txt", ""),
-            "安装脚本里出现了 requirements.txt（那是增强档的清单）")
+            "requirements-core.txt", ""))
 
     def test_the_multi_platform_packer_packs_the_profile_table(self):
-        """档位表要**进包**：它放在 `components/` 里，而主包会打这个目录。
-
-        不检查的话，把表挪到 `delivery/`（那目录刻意不进包）以后，
-        新机器上的安装器就看不到它了 —— 而本机测试照样全绿。
-        """
         self.assertTrue(os.path.isfile(os.path.join(ROOT, "components", "profiles.json")))
         with open(os.path.join(ROOT, "scripts", "build-package.ps1"), encoding="utf-8") as fh:
             packer = fh.read()
-        self.assertIn("'components'", packer,
-                      "打包脚本不再打 components\\ —— 档位表进不了包")
+        self.assertIn("'components'", packer)
 
 
 if __name__ == "__main__":

@@ -10,10 +10,10 @@
   2. 往返：`/api/settings` 读得出、PUT 写进去、再读还是新值（隐藏项走 settings.get）；
   3. 分组合法：grp 必须在面板的分组表里；可见项**不许**落在「智能体」组
      （那一组由智能体表格整块渲染，普通项进去会被吞掉、在界面上彻底看不见）；
-  4. 选项不是幻觉：`wakeEngine` / `ttsEngine` 的候选项必须有实现；
+  4. 选项不是幻觉：`ttsEngine` / 转写引擎的候选项必须有实现；
   5. 弃用项：不出现在 /api/settings、写入被拒收、老值按迁移规则搬到新开关上。
 
-DB 重定向到临时目录，不碰真实 data/；PUT 的联动（重启唤醒、热重载路由）在测试里哑掉。
+DB 重定向到临时目录，不碰真实 data/；PUT 的联动（重挂热键、热重载路由）在测试里哑掉。
 """
 import importlib.util
 import json
@@ -261,7 +261,7 @@ class GroupingTests(unittest.TestCase):
     def test_model_tab_keys_share_the_model_group(self):
         """「能力」页签承载的那些项要能被整块回退显示。
 
-        * 模型/引擎选择（sttModel 等 9 项）归 `model` 组 —— 页签挂了就在设置页整块出现；
+        * 模型/引擎选择（`voiceprint*` 等）归 `model` 组 —— 页签挂了就在设置页整块出现；
         * `ttsEngine` 是例外：它是"朗读"的行为开关，分组仍属「语音命令 → 朗读与反馈」
           （回退时显示在原地、不搬家），只是编辑入口由能力页签接管。
         """
@@ -313,7 +313,7 @@ def _probe_value(meta, current):
 
 @contextmanager
 def _quiet_side_effects():
-    """PUT /api/settings 的联动在测试里哑掉：重启唤醒监听、热重载路由进程、写
+    """PUT /api/settings 的联动在测试里哑掉：重挂热键监听、热重载路由进程、写
     dsh-failover/config.json 都与「设置能不能读回来」无关，真做会污染仓库与进程。
 
     **`_agent` 也必须哑掉**（2026-09-22 补）：这条路上的智能体联动会走到真实的
@@ -322,9 +322,9 @@ def _quiet_side_effects():
     也就是会把开发机上正在跑的标准版 harness 杀掉（AGENTS.md 记过同类事故）。
     改成整体替身：这条用例只关心"设置读得回来"。
 
-    **`_stt` 同理**（2026-09-23 补）：这轮 PUT 里有 `sttModel`/`meetingSttModel`，
-    联动会去 `boot.start_component("stt-cmd")` —— 那是**真加载模型**（funasr/whisper，
-    几 GB、几十秒），测试会被拖死甚至把显存占满。设置能不能读回来与它无关。
+    **转写引擎不再联动**（2026-10-31）：客户端不再跑本地 STT（指令/回顾/会议全走能力后端），
+    `settings_effects._stt` 已删除；`sttModel`/`meetingSttModel` 只剩老库兼容，PUT 里带着它们
+    也不会加载模型 —— 所以这里不再需要给它们打桩。
 
     **`GET /api/settings` 那条读路**（`agents.list_agents()` 探活）不在这里哑 ——
     它由本模块的 `setUpModule` 整段处理，见 `_no_agent_probe`。理由：这个
@@ -335,12 +335,9 @@ def _quiet_side_effects():
     后端）—— 测试既不该碰生产，也会被它拖慢。与 `_agent` 是同一条纪律：
     凡是走 `PUT /api/settings` 的测试，都要检查新加的联动。
     """
-    with patch("app.runtime.stop_wake"), patch("app.runtime.start_wake"), \
-            patch("app.router_admin.apply_settings", lambda updated: (True, "")), \
+    with patch("app.router_admin.apply_settings", lambda updated: (True, "")), \
             patch("app.settings_effects._agent",
                   lambda *a, **kw: {"scope": "agent", "ok": True, "detail": ""}), \
-            patch("app.settings_effects._stt",
-                  lambda *a, **kw: {"scope": "stt", "ok": True, "detail": ""}), \
             patch("app.settings_effects._hotkey",
                   lambda *a, **kw: {"scope": "hotkey", "ok": True, "detail": ""}), \
             patch("app.settings_effects._relay",
@@ -645,36 +642,6 @@ class RetiredLocalValueTests(unittest.TestCase):
 class OptionAndPanelWiringTests(unittest.TestCase):
     """选项必须有实现；面板自己的设置项要真的接上（2026-09-19 修掉的两个漏接线）。"""
 
-    def test_wake_engine_options_are_implemented(self):
-        from app.audio import wake
-        opts = set(DEFAULTS["wakeEngine"]["options"])
-        self.assertEqual(opts, set(wake.ENGINE_LABELS),
-                         "面板能选的唤醒方式必须都有实现（不许再出现 openwakeword 这种幽灵项）")
-        self.assertEqual(wake.engine_label(DEFAULTS["wakeEngine"]["value"]),
-                         wake.ENGINE_LABELS[DEFAULTS["wakeEngine"]["value"]])
-        self.assertEqual(wake.engine_label("openwakeword"), wake.ENGINE_LABELS["sherpa"],
-                         "历史配置里的未知值要按默认实现算，不能让唤醒起不来")
-
-    def test_wake_engine_selects_a_real_implementation(self):
-        """后端必须真的读 wakeEngine（它曾经只有面板读）。"""
-        from app.audio.wake import WakeListener
-
-        class _Settings(object):
-            def __init__(self, value):
-                self.value = value
-
-            def settings_get(self, key, default=None):
-                return {"wakeEngine": self.value}.get(key, default)
-
-        for value, want in (("kws", "kws"), ("sherpa", "stream"), ("stream", "stream"),
-                            ("openwakeword", "stream")):
-            with self.subTest(wakeEngine=value):
-                listener = WakeListener.__new__(WakeListener)
-                listener.settings_get = _Settings(value).settings_get
-                with patch.object(WakeListener, "_make_kws_detector", lambda self: "kws"), \
-                        patch.object(WakeListener, "_make_stream_detector", lambda self: "stream"):
-                    self.assertEqual(WakeListener._make_detector(listener), want)
-
     def test_tts_engine_options_are_implemented(self):
         from app.audio import tts
         opts = set(DEFAULTS["ttsEngine"]["options"])
@@ -699,8 +666,9 @@ class OptionAndPanelWiringTests(unittest.TestCase):
         self.assertNotIn("data-tts-engine", js, "能力卡里不许再有第二个 TTS 开关")
         self.assertRegex(js, r'sSub\("语音合成", renderSettingRows\(settingRows\(\["ttsEngine"\]\)\)\)',
                            "朗读的开关在「AI组件 → 语音合成」里（2026-10-02 按用户层级搬的）")
-        self.assertRegex(js, r'settingRows\(\["sttModel", "wakeEngine"\]\)',
-                         "「能力选择」留转写 / 唤醒引擎")
+        self.assertNotIn('settingRows(["sttModel"', js,
+                         "本地转写引擎（sttModel）已退役，面板不该再有它的编辑行")
+        self.assertNotIn("wakeEngine", js, "语音唤醒已取消，面板不该再有唤醒引擎下拉")
         self.assertNotIn("providerTts", js, "弃用项不该被面板引用")
 
     def test_capability_page_covers_every_capability_kind(self):

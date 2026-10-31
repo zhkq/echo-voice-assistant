@@ -321,7 +321,7 @@ if ($Profile -eq 'component' -or $Profile -eq 'offline') {
         $ids = @($Component)
     } else {
         $ids = @($Components)
-        if ($ids.Count -eq 0) { $ids = @('runtime-core', 'stt-sherpa', 'stt-whisper-base', 'wake-kws') }
+        if ($ids.Count -eq 0) { $ids = @('runtime-core') }   # 2026-10-31: client installs no local STT models
     }
     foreach ($id in $ids) {
         if (-not $decls.ContainsKey($id)) { Die ("unknown component id: {0}" -f $id) }

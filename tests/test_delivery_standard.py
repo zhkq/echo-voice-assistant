@@ -8,11 +8,11 @@
 而当时**没有任何东西拦着**：`build_delivery.py` 用一张假的 0 MB kit 都能组出交付层。
 
 标准：
-  ① kit 里必须有 `<顶层>/bundle/wheels/` 与 `<顶层>/bundle/models/sherpa-onnx-streaming/`；
+  ① kit 里必须有 `<顶层>/bundle/wheels/`（2026-10-31 起客户端无本地模型，不要求 models/）；
   ② 没有就**拒绝出层**（除非显式 `--allow-no-bundle`，只给排障）；
   ③ `--scenario full-local` 时，后端离线包还必须**自带权重**（否则那不叫"零下载"）；
   ④ `--no-offline`（2026-10-16 加）：**这一层**不带后端离线包 —— 纯客户端那档
-     （先配对别人的 GPU）本来是 ≈432 MB，而 `dist/` 里躺着 3.1 GB 的离线包时默认会一起带上，
+     （先配对别人的 GPU）本来是 ≈58 MB，而 `dist/` 里躺着 3.1 GB 的离线包时默认会一起带上，
      整层变成 ≈3.4 GB，只能靠"手工把离线包移出 dist"绕过（手工活，必漂）。
      开关**只管这一层放不放文件**（默认行为一字不变），`清单.txt` 要如实写"这一层不含离线包"；
      它与 `--scenario full-local`（语义 = 零下载）**矛盾 → 明确报错**，不许静默忽略其中一个。
@@ -97,16 +97,15 @@ class BundleGuardTests(unittest.TestCase):
         self.addCleanup(__import__("shutil").rmtree, self.tmp, ignore_errors=True)
 
     def test_bare_kit_is_called_out(self):
-        """裸 kit：两条载荷都该报缺 —— 这正是那天的回退形状。"""
+        """裸 kit：缺 wheels 就该报缺 —— 这正是那天的回退形状。"""
         missing = bd.bundle_problems(bd.Path(_fake_kit(self.tmp, with_bundle=False)))
-        self.assertIn("bundle/wheels", missing)
-        self.assertIn("bundle/models/sherpa-onnx-streaming", missing)
+        self.assertEqual(["bundle/wheels"], missing)
 
-    def test_wheels_without_the_model_is_still_incomplete(self):
-        """只带了 wheel 没带模型 → 还是不合格（语音指令那条路会联网下模型）。"""
+    def test_wheels_without_models_is_enough_now(self):
+        """2026-10-31：客户端不装本地模型 —— 只有 wheels 也算合格。"""
         missing = bd.bundle_problems(bd.Path(_fake_kit(self.tmp, with_bundle=True,
                                                        with_models=False)))
-        self.assertEqual(["bundle/models/sherpa-onnx-streaming"], missing)
+        self.assertEqual([], missing)
 
     def test_a_proper_bundle_kit_passes(self):
         self.assertEqual([], bd.bundle_problems(bd.Path(_fake_kit(self.tmp, with_bundle=True))))
@@ -213,7 +212,7 @@ class WordingTests(unittest.TestCase):
 
 
 class NoOfflineSwitchTests(unittest.TestCase):
-    """`--no-offline`：**纯客户端那一层**（≈432 MB）不许被 3.1 GB 的离线包拖成 ≈3.4 GB。
+    """`--no-offline`：**纯客户端那一层**（≈58 MB）不许被 3.1 GB 的离线包拖成 ≈3.4 GB。
 
     背景（AGENTS.md「交付层的标准」里写明的已知缺口）：`dist/` 里有离线包时，`--scenario client`
     **总会**把它一起带上，要出纯客户端层只能手工先把离线包移出 `dist` —— 手工活，必漂。
@@ -360,7 +359,7 @@ class NoOfflineSwitchTests(unittest.TestCase):
                 bd.main(["--help"])
         text = " ".join(buf.getvalue().split())          # 折行 → 单空格
         self.assertEqual(0, cm.exception.code)
-        for phrase in ("--no-offline", "3.4 GB", "432 MB", "零下载", "full-local"):
+        for phrase in ("--no-offline", "3.4 GB", "58 MB", "零下载", "full-local"):
             self.assertIn(phrase, text, "帮助里缺 %s：%s" % (phrase, text))
 
     def test_cli_and_library_agree_on_the_switch_name(self):

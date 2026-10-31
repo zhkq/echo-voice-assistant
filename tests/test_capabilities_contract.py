@@ -969,9 +969,12 @@ class VocabularyTests(unittest.TestCase):
             "unsupported", "vector-mismatch", "open-failed", "error"))
 
     def test_slot_vocabulary_matches_the_design(self):
-        """槽清单与设计 §4.2 **逐字对齐**（加一个都要改文档）。"""
+        """槽清单与设计 §4.2 **逐字对齐**（加一个都要改文档）。
+
+        2026-10-31：`wake` 槽从词汇表删除（语音唤醒彻底取消，不再有能力层的唤醒槽）。
+        """
         self.assertEqual(SLOTS, (
-            "wake", "asr.text", "asr.timestamps", "asr.streaming",
+            "asr.text", "asr.timestamps", "asr.streaming",
             "diarize.turns", "diarize.embeddings", "diarize.turn_embeddings",
             "speaker.embed", "tts"))
 

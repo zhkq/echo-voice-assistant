@@ -177,16 +177,19 @@ class NoLocalMeetingEngineTests(_IsolatedState):
         self.assertEqual(set(LOCAL_SLOTS), {"asr.text"})
         self.assertEqual(set(LocalCapabilityClient().provides), {"asr.text"})
 
-    def test_the_command_engine_is_still_what_the_dispatch_table_watches(self):
-        """`stt-cmd` 是**留下**的那一条（铁律 L3）—— 换引擎仍要重载它。
+    def test_the_command_engine_is_no_longer_local(self):
+        """2026-10-31：客户端不再跑本地 STT —— `stt-cmd` 组件与 `_STT_KEYS` 联动都已删除。
 
-        本步（2026-09-29）删掉了会议那一档，所以这里钉的是"留下的那条没被顺手删掉"：
-        `sttModel` → `stt-cmd` 的映射必须还在（它由 `app/boot.py` 的
-        `stt-cmd` 组件承载）。
+        指令/回顾/会议全走能力后端 Qwen3-ASR；这条钉"本地那条链路是真的删了"，
+        而不是只把 UI 藏起来（改 `sttModel` 不会再触发任何重载）。
         """
-        from app import settings_effects
-        self.assertIn("sttModel", settings_effects._STT_KEYS)
-        self.assertEqual(settings_effects._STT_KEYS["sttModel"], ("stt-cmd", True))
+        from app import boot, settings_effects
+        self.assertFalse(hasattr(settings_effects, "_STT_KEYS"),
+                         "_STT_KEYS 应随本地转写引擎一起删除")
+        self.assertFalse(hasattr(settings_effects, "_stt"),
+                         "_stt 联动应随本地转写引擎一起删除")
+        boot.setup()
+        self.assertNotIn("stt-cmd", [c["id"] for c in boot.snapshot()["components"]])
 
 
 class RetiredMeetingSttModelTests(_IsolatedState):

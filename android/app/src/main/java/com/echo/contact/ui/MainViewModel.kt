@@ -51,7 +51,7 @@ import java.io.File
 import java.io.IOException
 
 /** 一条指令从"点发送"到"看到结果"的可见阶段。 */
-enum class SubmitPhase { Idle, Sending, Accepted, Running, Done, Failed }
+enum class SubmitPhase { Idle, Sending, Accepted, Running, Done, Busy, Failed }
 
 /** 朗读用哪一边合成。 */
 enum class TtsEngine { System, Echo }
@@ -1036,9 +1036,12 @@ class MainViewModel(app: Application) : BaseViewModel(app) {
                 )
                 val stt = long.transcribe(part)
                 if (!stt.isSuccessful) {
-                    // 422 = 没识别出文本 / 音频太短；502 = 转写失败
-                    _reviewSubmittingNote.value = parseError(stt)
+                    // 409/503 = 能力后端忙（本人上一件事还在跑）—— 说清楚，别当成"没听清"；
+                    // 422 = 没识别出文本 / 音频太短；502 = 转写失败。
+                    val msg = parseError(stt)
+                    _reviewSubmittingNote.value = msg
                     _reviewSubmitting.value = false
+                    if (isBusyCode(stt.code())) speak(msg)
                     return@launch
                 }
                 val text = stt.body()?.text.orEmpty().trim()
@@ -1487,7 +1490,12 @@ class MainViewModel(app: Application) : BaseViewModel(app) {
                 val resp = long.dailyReviewTurn(wav.toRequestBody("audio/wav".toMediaType()))
                 val b = resp.body()
                 when {
-                    !resp.isSuccessful -> _reviewRoundNote.value = parseError(resp)
+                    !resp.isSuccessful -> {
+                        val msg = parseError(resp)
+                        _reviewRoundNote.value = msg
+                        // 409/503 = 能力后端忙（与指令/会议串行），念出来；其余是失败。
+                        if (isBusyCode(resp.code())) speak(msg)
+                    }
                     b == null -> _reviewRoundNote.value = "服务端没给结果：这一轮没有记进回顾"
                     b.text.isBlank() -> {
                         // 没听清 / 引擎坏了：**不落一轮**（服务端也没落），只把原因说出来。
@@ -2002,9 +2010,15 @@ class MainViewModel(app: Application) : BaseViewModel(app) {
                     val msg = if (resp.isSuccessful) {
                         b?.message ?: "ECHO 没能处理这段语音"
                     } else {
-                        parseError(resp)   // 422=形状不对/没识别出文本，502=转写失败
+                        parseError(resp)   // 409/503=忙（后端已翻成人话），422=没听出字，502=转写失败
                     }
-                    fail(round, msg)
+                    // 2026-10-31：指令/回顾/会议转写全走后端且**同一个人的请求串行** ——
+                    // 409/503 是"忙"，不是失败；语音这条路要念出来（用户看不见卡片）。
+                    if (!resp.isSuccessful && isBusyCode(resp.code())) {
+                        busy(round, msg, speakIt = true)
+                    } else {
+                        fail(round, msg)
+                    }
                     return@launch
                 }
                 // 电脑"受理了"但没听出字：**不发、不认领**，就地让用户再说一次。
@@ -2086,6 +2100,23 @@ class MainViewModel(app: Application) : BaseViewModel(app) {
         writeRound(roundId) {
             it.copy(phase = SubmitPhase.Failed, message = msg, error = msg, reply = "", speak = "")
         }
+    }
+
+    /**
+     * 某一轮遇到「忙」（后端 409/503）：**不是失败**，是"先等上一件跑完"。
+     *
+     * 与 [fail] 分开的理由（用户 2026-10-31 口径："本人已有请求在运行报忙碌就行"）：
+     *   * 界面要说"忙，稍后再试"而不是"未完成"（后者看起来像 ECHO 坏了）；
+     *   * 语音那条要**念出来**（用户看不见卡片）；文字那条不念。
+     * `error` 留空：指令并没有失败，只是没受理。
+     */
+    private fun busy(roundId: Long, msg: String, speakIt: Boolean = false) {
+        val text = msg.takeIf { it.isNotBlank() }
+            ?: "我这边正忙着上一件事，等它完了再说一次。"
+        writeRound(roundId) {
+            it.copy(phase = SubmitPhase.Busy, message = text, error = "", reply = "", speak = "")
+        }
+        if (speakIt) speak(text)
     }
 
     /**

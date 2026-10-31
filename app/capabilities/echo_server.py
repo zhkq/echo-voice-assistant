@@ -36,6 +36,7 @@ from app.capabilities.base import (
     SKIP_REASONS,
     SOURCE_LAN,
     SOURCE_LOCAL,
+    SOURCE_WAN,
     SLOTS,
     AsrResult,
     CapabilityClient,
@@ -550,12 +551,13 @@ class EchoServerClient(CapabilityClient):
     # ---------------------------------------------------------------- 调用
 
     def transcribe(self, wav, *, lang="auto", want_timestamps=False,
-                   variant="long", **kw) -> AsrResult:
+                   variant="long", timeout=None, **kw) -> AsrResult:
         q = "?variant=%s%s" % ("short" if variant == "short" else "long",
                                "&timestamps=1" if want_timestamps else "")
         if lang and lang != "auto":
             q += "&lang=%s" % urllib.parse.quote(str(lang))
-        body = self._post_audio("/v1/asr" + q, wav, slot="asr.text")
+        body = self._post_audio("/v1/asr" + q, wav, slot="asr.text",
+                                timeout=timeout)
         return AsrResult.from_server(body, self.backend_id)
 
     def diarize(self, wav, *, max_speakers=None, **kw) -> DiarizeResult:
@@ -603,12 +605,16 @@ class EchoServerClient(CapabilityClient):
 
     # ---------------------------------------------------------------- HTTP
 
-    def _post_audio(self, path: str, wav: str, *, slot: str) -> Dict[str, Any]:
+    def _post_audio(self, path: str, wav: str, *, slot: str,
+                    timeout: Optional[float] = None) -> Dict[str, Any]:
         """把音频**原样**（raw body）传上去 —— 与服务端 §5.4 的约定一致。
 
         不用 multipart：那会让服务端把大文件交给框架 spool 到磁盘，
         而且那个文件**由框架创建、它的清理看不到它**（服务端 §5.4 的理由）。
         我们自己读文件、自己发 octet-stream，服务端那边一路是"边收边算"。
+
+        `timeout`：交互入口（语音指令）传一个短超时（如 45s），别让一句短命令
+        等满默认的 900s；None 保持与会议/回顾一致的长超时。
         """
         import os
         if not os.path.isfile(wav):
@@ -618,7 +624,7 @@ class EchoServerClient(CapabilityClient):
             data = fh.read()
         status, body = self._request("POST", path, data=data,
                                      content_type="audio/wav",
-                                     timeout=self.timeout_infer, slot=slot)
+                                     timeout=timeout or self.timeout_infer, slot=slot)
         if status != 200 or not isinstance(body, dict):
             raise error_from_server(body, status, self.backend_id, slot)
         return body
@@ -776,3 +782,30 @@ def client_from_settings() -> Optional[EchoServerClient]:
     if not url:
         return None
     return EchoServerClient(url)
+
+
+def privacy_blocked(client: Optional["EchoServerClient"] = None) -> str:
+    """「允许音频去哪」挡住这个后端时返回人话原因；空串 = 放行。
+
+    2026-10-31：指令/回顾也全走后端了，必须与会议同一条 privacy 口径 ——
+    `capabilityPrivacy` 的 `none` 只允许本机回环后端，`lan` 再加内网后端，
+    `wan` 全放行。以前回顾那条路**根本没查**这一项（只有会议查），全后端后
+    不补上就等于把"不出机"语义绕过去了。
+    """
+    c = client if client is not None else client_from_settings()
+    if c is None:
+        return ""
+    try:
+        from app.config import settings
+        privacy = str(settings.get("capabilityPrivacy", "lan") or "lan").strip().lower()
+    except Exception:
+        privacy = "lan"
+    allowed = {SOURCE_LOCAL}
+    if privacy in ("lan", "wan"):
+        allowed.add(SOURCE_LAN)
+    if privacy == "wan":
+        allowed.add(SOURCE_WAN)
+    if c.source in allowed:
+        return ""
+    return ("被「允许音频去哪」挡住了（当前=%s，后端=%s）：把它改成「内网」"
+            "或换成本机回环后端" % (privacy, c.source))

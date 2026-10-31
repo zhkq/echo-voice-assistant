@@ -1,6 +1,10 @@
 # -*- coding: utf-8 -*-
 # ECHO 直接依赖（重建 venv 用；torch/CUDA 等重依赖与安装顺序见 docs/DEPLOY.md）
 # 安装方式见 scripts/setup.ps1
+#
+# 2026-10-31：客户端默认档不再做本地转写（指令/回顾/会议全走能力后端 Qwen3-ASR），
+# 所以 sherpa-onnx / funasr / faster-whisper / pyannote.audio 已从客户端依赖里移除。
+# 这份清单只保留"服务 + 面板 + 音频 IO + 在线朗读"。
 fastapi>=0.115
 uvicorn[standard]>=0.30
 pydantic>=2.7
@@ -9,11 +13,7 @@ httpx>=0.27
 PyYAML>=6.0
 ruamel.yaml>=0.18
 soxr>=0.3
-faster-whisper>=1.1
-funasr>=1.2
-sherpa-onnx>=1.10
 sounddevice>=0.5
 soundfile>=0.12
 numpy>=1.26
 edge-tts>=7.0
-pyannote.audio>=4.0

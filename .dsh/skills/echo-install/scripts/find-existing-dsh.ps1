@@ -103,6 +103,7 @@ try {
 
     $item = Get-Item -LiteralPath $p -Force
     $entry = ''
+    $isCli = $false
 
     if ($item.PSIsContainer) {
         # The same tree can be handed to us in several shapes:
@@ -126,6 +127,10 @@ try {
         foreach ($r in $roots) {
             $candidates.Add((Join-Path $r '@deepseek-ai\dsh\lib\bin.js'))
             $candidates.Add((Join-Path $r 'node_modules\@deepseek-ai\dsh\lib\bin.js'))
+            # Official DeepSeek Harness desktop (2026-10-31): the app ships a
+            # headless CLI shim instead of a plain node + bin.js pair.
+            $candidates.Add((Join-Path $r 'resources\runtime\cli\bin\dsh.cmd'))
+            $candidates.Add((Join-Path $r 'cli\bin\dsh.cmd'))
         }
         # Inputs that point straight at a package-parent layer.
         $candidates.Add((Join-Path $p 'lib\bin.js'))
@@ -133,10 +138,12 @@ try {
         $candidates.Add((Join-Path $p '@deepseek-ai\dsh\lib\bin.js'))
         $candidates.Add((Join-Path $p 'node_modules\@deepseek-ai\dsh\lib\bin.js'))
         $candidates.Add((Join-Path $p 'resources\app.asar\dsh\lib\bin.js'))
+        $candidates.Add((Join-Path $p 'resources\runtime\cli\bin\dsh.cmd'))
 
         foreach ($c in $candidates) {
             if (Test-Path -LiteralPath $c -PathType Leaf) {
                 $entry = (Resolve-Path -LiteralPath $c).Path
+                $isCli = ($entry -like '*.cmd' -or $entry -like '*.exe')
                 break
             }
         }
@@ -144,13 +151,31 @@ try {
         $leaf = [System.IO.Path]::GetFileName($p)
         if ($leaf -ieq 'bin.js') {
             $entry = (Resolve-Path -LiteralPath $p).Path
+        } elseif ($leaf -ieq 'dsh.cmd' -or $leaf -ieq 'dsh.exe') {
+            # Direct CLI shim (official desktop: ...\resources\runtime\cli\bin\dsh.cmd).
+            $entry = (Resolve-Path -LiteralPath $p).Path
+            $isCli = $true
         } else {
-            throw ('not a directory and not a bin.js file: ' + $p)
+            throw ('not a directory, not a bin.js, and not a dsh CLI: ' + $p)
         }
     }
 
     if (-not $entry) {
-        throw 'no @deepseek-ai/dsh/lib/bin.js found under this path'
+        throw 'no @deepseek-ai/dsh/lib/bin.js or dsh.cmd found under this path'
+    }
+
+    if ($isCli) {
+        $result.ok = $true
+        $result.entry = $entry
+        $result.node = ''
+        $result.command = (Quote-WinArg $entry) + ' web'
+        try {
+            $ver = @(& $entry --version 2>&1 | ForEach-Object { "$_".Trim() } |
+                     Where-Object { $_ -match '^\d+\.\d+' } | Select-Object -Last 1)
+            if ($ver.Count -gt 0) { $result.version = [string]$ver[-1] }
+        } catch { }
+        $result | ConvertTo-Json -Compress
+        exit 0
     }
 
     $node = Resolve-NodePath $NodeExe

@@ -27,7 +27,7 @@ kit 长这样（同事视角）::
       ├─ 装我.cmd          **双击这个**：只问"装到哪个目录"，然后交给下面那个脚本
       ├─ echo-core/        主程序（主包 zip 里叫 ECHO/，组 kit 时改成 echo-core/）
       ├─ echo-install/     安装技能（交给 AI 助手那条路继续可用）
-      ├─ bundle/           可选：离线载荷（wheels + models + runtime 兜底）
+      ├─ bundle/           可选：离线载荷（wheels + runtime 兜底；客户端无本地模型）
       ├─ 先读我.md / BUILD-INFO.txt / SHA256SUMS.txt
       └─ ECHO-kit-<stamp>.zip 同名 zip（条目带顶层前缀，解开是一个文件夹）
 
@@ -581,6 +581,9 @@ def _preview(items: list[str], limit: int = 6) -> str:
 def bundle_problems(kit: Path) -> list[str]:
     """kit 里带了 `bundle\\` 时，用**离线包自己的判据**再验一遍（一处真相）。
 
+    2026-10-31：客户端不再装本地 STT 模型，bundle 里没有 `models\\` 是**正常**的，
+    所以这里显式 `want_models=False`（只验 wheels/runtime，不要求任何模型）。
+
     为什么复用 `build_offline_pack.verify_bundle()` 而不是在这儿再写一份：那份判据就是
     `install-all.ps1 -Offline` 的三个消费点（wheels 目录在不在、模型三件套齐不齐、
     `runtime\\python-3.11.9-embed-amd64.zip` + `get-pip.py` 在不在）。抄一份 = 两处真相。
@@ -593,7 +596,8 @@ def bundle_problems(kit: Path) -> list[str]:
         module = importlib.util.module_from_spec(spec)
         sys.modules[spec.name] = module
         spec.loader.exec_module(module)
-        return ["bundle\\" + p for p in module.verify_bundle(str(kit / "bundle"))]
+        return ["bundle\\" + p for p in module.verify_bundle(
+            str(kit / "bundle"), want_models=False)]
     except Exception as exc:                                       # pragma: no cover - 兜底
         return [f"bundle\\ 验不了：{exc}"]
 
@@ -802,7 +806,7 @@ def assemble_kit(plat: dict, main_zip: Path, stamp: str, dist: Path,
     if cmd_name:
         block.insert(3, f"  {cmd_name}       双击这个（只问安装位置；有 bundle\\ 就自动离线装）")
     if (kit_dir / "bundle").is_dir():
-        block.append("  bundle/         offline payload (wheels + models + runtime fallback)")
+        block.append("  bundle/         offline payload (wheels + runtime fallback; no local models)")
     build_info = kit_dir / "BUILD-INFO.txt"
     if not build_info.is_file():
         raise BuildError(f"主包里没有 BUILD-INFO.txt：{main_zip.name}")

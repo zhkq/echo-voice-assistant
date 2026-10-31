@@ -22,7 +22,6 @@ from app import __version__ as _ECHO_VERSION
 from app.config import settings
 from app import assistant, manager, meeting, netguard, phone_pair, ports, relay as relay_mod, relay_web, runtime, services, worklog
 from app.audio import recorder
-from app.audio import stt as stt_mod
 from app.audio import tts as tts_mod
 from app.pathutil import safe_under as _safe_under
 
@@ -668,11 +667,13 @@ def api_status(_auth=Depends(optional_auth)):
     agent_info["detail"] = (mine or {}).get("detail") or ""
     agent_info["online"] = agent_info["status"] == "online"
     st = meeting.meeting_status()
-    # 转写引擎加载状态（detail 展示）
-    stt_st = stt_mod.engine_status()
-    loaded_desc = ", ".join(f"{e.get('engine')}" for e in stt_st["loaded"]) or "未加载"
-    services.report_stt("online" if stt_st["loaded"] else "ready",
-                        f"{loaded_desc} · {stt_st['device']}")
+    # 转写引擎状态：2026-10-31 起客户端已无本地引擎，只报能力后端配没配。
+    from app.capabilities import echo_server as _echo_mod
+    _backend_ready = bool(_echo_mod.configured())
+    stt_st = {"loaded": ([{"engine": "echo-server"}] if _backend_ready else []),
+              "device": "backend", "cuda": False, "backend": _backend_ready}
+    services.report_stt("online" if _backend_ready else "ready",
+                        "能力后端 Qwen3-ASR" if _backend_ready else "未配对能力后端")
     # 经中继打开 DSH 标准版网页的**只读**入口（2026-10-18 用户拍板）。
     # 地址只在"真的能打开"时非空（中继已连 + 有 publicUrl + DSH 标准版在跑）；
     # 否则如实为空并给出原因 —— 消费者（安卓首页的「安排」入口）**不要自己拼地址**。
@@ -798,7 +799,7 @@ def get_settings(_auth=Depends(optional_auth)):
 @router.put("/settings")
 def put_settings(body: SettingsIn, _auth=Depends(optional_auth)):
     updated = settings.update(body.values)
-    # 配置变更后的联动：wake / router / 智能体-harness。
+    # 配置变更后的联动：router / 智能体-harness（唤醒已移除）。
     # **抽到 app/settings_effects.py**：这段原来只长在这里，于是不走这个 HTTP 接口的写入
     # 都享受不到它 —— 向导执行相就是调 `settings.update()` 的，实测"在向导里选了标准版"
     # 从来没把 harness 拉起来（2026-09-20）。
@@ -991,10 +992,19 @@ async def assistant_voice_command(request: Request,
                 status_code=422,
                 detail="音频解码失败（%s）：请把 wav 字节**直接当 body** 发"
                        "（Content-Type: audio/wav），不要用 multipart/form-data" % type(exc).__name__)
-        text = await run_in_threadpool(
-            stt_mod.transcribe, tmp_wav,
-            engine or str(settings.get("sttModel", "sensevoice") or "sensevoice"),
-            "small", lang or str(settings.get("sttLanguage", "zh") or "zh"), "auto")
+        text, note, status = await run_in_threadpool(
+            assistant.transcribe_voice, tmp_wav,
+            source="mobile", variant="short", lang=(lang or None))
+        if status == assistant.ASR_BUSY:
+            raise HTTPException(status_code=409,
+                                detail=assistant.asr_failure_hint(note)
+                                or "我这边正忙着上一件事，等它完了再说一次。")
+        if not text:
+            if status == assistant.ASR_ERROR:
+                raise HTTPException(status_code=502,
+                                    detail=assistant.asr_failure_hint(note))
+            raise HTTPException(status_code=422,
+                                detail="未能识别出文本（音频过短或无语音）")
     except HTTPException:
         raise
     except Exception as exc:
@@ -1061,6 +1071,9 @@ def post_dsh_workspaces_ensure(_auth=Depends(optional_auth)):
 
 @router.post("/assistant/capture")
 def post_capture(body: CaptureIn, _auth=Depends(optional_auth)):
+    why = assistant.voice_blocked_reason()
+    if why:
+        return {"ok": False, "message": why}
     ok = assistant.capture(body.source)
     return {"ok": ok, "message": "已开始录音命令流" if ok else "已有命令流进行中"}
 
@@ -1239,13 +1252,13 @@ async def post_daily_review_turn(request: Request, _auth=Depends(optional_auth))
                 detail="音频解码失败（%s）：请把 wav 字节**直接当 body** 发"
                        "（Content-Type: audio/wav），不要用 multipart/form-data"
                        % type(exc).__name__)
-        # 回顾那条路有自己的转写偏好（默认与会议同一个能力后端，失败回落本机）：
-        # 这里必须复用 `assistant._transcribe_command`，不能另写一套 stt 调用 ——
-        # 否则"设置说的是后端、代码走的是本机"又会漂一次。
+        # 回顾那条路：一律走能力后端 Qwen3-ASR（客户端已无本地 STT）。
+        # 复用 `assistant.transcribe_voice`：它同时负责「会议/指令/回顾互斥」和
+        # 「409/503 报忙」——不在这里另写一套 stt 调用。
         try:
             text, note, status = await run_in_threadpool(
-                assistant_mod._transcribe_command, tmp_wav, settings,
-                prefer=assistant_mod.review_stt_prefer(settings))
+                assistant_mod.transcribe_voice, tmp_wav,
+                source="mobile", variant="long", lang=None)
         except Exception as exc:
             # 转写实现自己抛了（不该发生，但发生了也得说人话）：这是"引擎问题"，
             # 不是"你没说话" —— 手机上显示成后者会让人反复重说。
@@ -1261,8 +1274,12 @@ async def post_daily_review_turn(request: Request, _auth=Depends(optional_auth))
 
     text = (text or "").strip()
     if not text:
-        # 没听到内容 / 转写引擎坏了：两种话不一样（后者会被误当成"你没说话"）。
-        engine_failed = status == getattr(assistant_mod, "ASR_ERROR", "error")
+        # 没听到内容 / 转写引擎坏了 / 正忙：三种话不一样（说成"你没说话"会让人反复重说）。
+        status_norm = str(status or "")
+        engine_failed = status_norm in (
+            getattr(assistant_mod, "ASR_ERROR", "error"),
+            getattr(assistant_mod, "ASR_BUSY", "busy"),
+        )
         spoken = (assistant_mod.asr_failure_hint(note) if engine_failed
                   else "这一轮我没听清，接着说。")
         return {"ok": False, "text": "", "session_id": "", "workspace": "",
@@ -1729,75 +1746,104 @@ async def _save_upload_wav(file: UploadFile):
     return tmp_wav
 
 
+def _backend_asr(wav, *, lang="zh", variant="long", want_timestamps=False,
+                 timeout=None):
+    """上传音频 → 能力后端转写（2026-10-31 起客户端已没有本地 STT）。
+
+    端点（面板「试转写」/老手机）统一走这里：只认 echo-server 的 Qwen3-ASR。
+    失败按类别回 HTTP：忙 → 409，后端不可用 → 503，其余 → 502。
+    """
+    from app.capabilities import echo_server as echo_mod
+    from app.capabilities.base import CapabilityError
+    if not echo_mod.configured():
+        raise HTTPException(
+            status_code=503,
+            detail="能力后端没配对：客户端已不再装本地转写引擎，请先配对能力后端")
+    client = echo_mod.client_from_settings()
+    if client is None:
+        raise HTTPException(status_code=503, detail="拿不到能力后端客户端")
+    blocked = echo_mod.privacy_blocked(client)
+    if blocked:
+        raise HTTPException(status_code=403, detail=blocked)
+    try:
+        return client.transcribe(wav, lang=lang or "auto", variant=variant,
+                                 want_timestamps=want_timestamps,
+                                 timeout=timeout)
+    except CapabilityError as e:
+        busy = e.code in ("client_busy", "server_busy") or e.reason == "busy"
+        # 给手机/面板的是**人话**（不是 code/detail 那串排障信息）。
+        hint = assistant.asr_failure_hint(str(e))
+        raise HTTPException(status_code=409 if busy else 502, detail=hint) from None
+    except Exception as e:                                     # noqa: BLE001
+        raise HTTPException(status_code=502,
+                            detail="能力后端转写失败：%s: %s" % (type(e).__name__, e)) from None
+
+
 @router.get("/stt/status")
 def stt_status(_auth=Depends(optional_auth)):
-    """转写引擎加载状态（已加载引擎 / 设备）。"""
-    st = stt_mod.engine_status()
-    return {"loaded": st["loaded"], "device": st["device"], "cuda": st["cuda"]}
+    """转写引擎状态 —— 客户端已无本地引擎，这里只报能力后端配没配。"""
+    from app.capabilities import echo_server as echo_mod
+    configured = bool(echo_mod.configured())
+    return {"loaded": [{"engine": "echo-server"}] if configured else [],
+            "device": "backend", "cuda": False, "backend": configured}
 
 
 @router.post("/stt/transcribe")
 async def stt_transcribe(file: UploadFile = File(...),
-                         engine: str = Form("sensevoice"),
-                         model: str = Form("small"),
+                         engine: str = Form(""),
+                         model: str = Form(""),
                          lang: str = Form("zh"),
                          device: str = Form("auto"),
                          _auth=Depends(optional_auth)):
     """上传音频（wav/mp3/flac…）→ 转写文本。
 
-    engine: sensevoice|qwen3asr|sherpa|tiny/base/small/medium/large
+    2026-10-31 起**只走能力后端 Qwen3-ASR**；`engine`/`model`/`device` 参数
+    仅为兼容老客户端保留（不再生效）。
     """
     from starlette.concurrency import run_in_threadpool
     wav = await _save_upload_wav(file)
     try:
-        db.add_log("debug", "api", f"stt.transcribe wav={wav} exists={os.path.isfile(wav)} engine={engine}")
-        text = await run_in_threadpool(stt_mod.transcribe, wav, engine, model, lang, device)
-        db.add_log("debug", "api", f"stt.transcribe result len={len(text)}")
+        res = await run_in_threadpool(_backend_asr, wav, lang=lang, variant="long")
     finally:
         try:
             os.remove(wav)
         except Exception:
             pass
+    text = (res.text or "").strip()
     if not text:
         raise HTTPException(status_code=422, detail="未能识别出文本（音频过短或无语音）")
-    return {"text": text, "engine": engine, "model": model}
+    return {"text": text, "engine": "echo-server",
+            "model": str(getattr(res.provenance, "model_version", "") or ""),
+            "timestamps": res.timestamps}
 
 
 @router.post("/stt/sentences")
 async def stt_sentences(file: UploadFile = File(...),
-                        engine: str = Form("qwen3asr"),
-                        model: str = Form("0.6B"),
+                        engine: str = Form(""),
+                        model: str = Form(""),
                         lang: str = Form("zh"),
                         device: str = Form("auto"),
                         _auth=Depends(optional_auth)):
-    """上传音频 → 带时间戳的句子列表（qwen3asr 用 ForcedAligner 原生句子）。
+    """上传音频 → 带时间戳的句子列表（由能力后端 Qwen3-ASR 的强制对齐器给）。
 
     返回: {"text": 全文, "sentences": [{"start": 秒, "end": 秒, "text": ...}]}
     """
     from starlette.concurrency import run_in_threadpool
     wav = await _save_upload_wav(file)
     try:
-        if engine == "qwen3asr":
-            def _q():
-                m = stt_mod._get_qwen3asr(device, f"Qwen/Qwen3-ASR-{model}",
-                                          forced_aligner="Qwen/Qwen3-ForcedAligner-0.6B")
-                return stt_mod._qwen3asr_sentences(m, wav, stt_mod._LANG_MAP.get(lang.lower(), None))
-            try:
-                text, sents = await run_in_threadpool(_q)
-            except Exception as e:
-                import traceback
-                db.add_log("error", "api", f"qwen3asr sentences 失败: {e}\n{traceback.format_exc()[:500]}")
-                raise HTTPException(status_code=500, detail=f"转写引擎错误: {e}")
-            return {"text": text,
-                    "sentences": [{"start": round(s, 2), "end": round(e, 2), "text": t}
-                                  for s, e, t in sents]}
-        text = await run_in_threadpool(stt_mod.transcribe, wav, engine, model, lang, device)
-        return {"text": text, "sentences": [{"start": 0, "end": 0, "text": text}]}
+        res = await run_in_threadpool(_backend_asr, wav, lang=lang,
+                                      variant="long", want_timestamps=True)
     finally:
         try:
             os.remove(wav)
         except Exception:
             pass
+    text = (res.text or "").strip()
+    sents = [{"start": round(float(a), 2), "end": round(float(b), 2), "text": str(t)}
+             for a, b, t in (res.sentences or ())]
+    if not sents and text:
+        sents = [{"start": 0, "end": 0, "text": text}]
+    return {"text": text, "sentences": sents, "timestamps": res.timestamps}
 
 
 # ---------------------------------------------------------------- 会议
@@ -2788,7 +2834,7 @@ class WizardChoicesIn(BaseModel):
 class InstallReportIn(BaseModel):
     """技能装完登记的内容（结构由技能决定，服务端只做**宽松**校验）。
 
-    典型字段：``engines``（列表）、``wake`` / ``diarize``（布尔）、``agent``（名字）、
+    典型字段：``engines``（列表）、``diarize``（布尔）、``agent``（名字）、
     ``models``（列表）、``dirs``（三处路径）、``versions``（python/echo 版本）、``notes``。
     服务端不强制 schema：技能可能先于 ECHO 升级，多写字段不该被拒。
     """
@@ -3357,18 +3403,6 @@ def control_hotkey_stop(_auth=Depends(optional_auth)):
     return {"ok": ok, "message": msg}
 
 
-@router.post("/control/wake/start")
-def control_wake_start(_auth=Depends(optional_auth)):
-    ok, msg = runtime.start_wake()
-    return {"ok": ok, "message": msg}
-
-
-@router.post("/control/wake/stop")
-def control_wake_stop(_auth=Depends(optional_auth)):
-    ok, msg = runtime.stop_wake()
-    return {"ok": ok, "message": msg}
-
-
 @router.post("/control/echo/stop")
 def control_echo_stop(_auth=Depends(optional_auth)):
     """关闭 ECHO 服务（面板 仪表盘 → 操作区 的「关闭 ECHO」）。
@@ -3397,9 +3431,8 @@ def control_echo_stop(_auth=Depends(optional_auth)):
 
 @router.post("/control/stt/unload")
 def control_stt_unload(_auth=Depends(optional_auth)):
-    """卸载全部转写引擎（释放显存）。"""
-    stt_mod.reset_engines()
-    return {"ok": True, "message": "转写引擎已卸载，显存已释放"}
+    """本机转写引擎已退役（2026-10-31）：转写全在能力后端，客户端没有可卸载的引擎。"""
+    return {"ok": True, "message": "本机转写引擎已退役，转写全在能力后端"}
 
 
 @router.post("/control/tts/test")

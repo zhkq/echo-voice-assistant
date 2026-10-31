@@ -354,21 +354,31 @@ function Test-VenvLauncherStub($proc) {
 # rather than processes.
 function Get-EchoInstanceProcs([string]$root, $procs) {
     $r = $root.TrimEnd('\').ToLower()
+    # 3.0 layout: the code root may be `<install>\echo-core`, while the router /
+    # harness / data live one level UP in the DATA root (`<install>\dsh\...`).
+    # Matching only the code root missed BOTH of those for the stable tree -
+    # switching to dev then left D:\ECHO's harness on 43199 (dev boot correctly
+    # refused it, but the old process stayed and nobody could use dev's own dsh).
+    $dr = (Get-EchoDataRoot $root).TrimEnd('\').ToLower()
     $hit = @()
     foreach ($p in $procs) {
         if (-not $p.CommandLine) { continue }
         $cl = $p.CommandLine.ToLower()
         $nm = if ($p.Name) { $p.Name.ToLower() } else { '' }
+        $inCode = ($cl -like "*$r\*")
+        $inData = ($dr -ne $r) -and ($cl -like "*$dr\*")
         $kind = ''
         # Match on process TYPE as well as path: a diagnostic shell whose command
         # TEXT merely mentions these paths must not be counted - and must not be
         # KILLED (a diagnostic script that also grepped for startup.ps1 killed
         # itself here on 2026-09-18). Real watchdogs are started with -File, and
         # `-Command` is how an interactive/diagnostic shell arrives.
-        if ($nm -match '^python' -and $cl -like "*$r\dsh-failover\proxy.py*" -and
+        if ($nm -match '^python' -and
+            (($cl -like "*$r\dsh-failover\proxy.py*") -or
+             (($dr -ne $r) -and ($cl -like "*$dr\dsh-failover\proxy.py*"))) -and
             $p.ProcessId -ne $PID) {
             $kind = 'router'
-        } elseif ($nm -match '^node' -and $cl -like "*$r\*" -and
+        } elseif ($nm -match '^node' -and ($inCode -or $inData) -and
                   $cl -like '*@deepseek-ai\dsh\lib\bin.js*') {
             # 2026-10-10: the STANDALONE HARNESS (node) must follow its tree like every
             # other process here. Both trees use port 43199, and ECHO's

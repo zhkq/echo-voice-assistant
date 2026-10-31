@@ -97,33 +97,34 @@ class RegistrationAndSnapshotTests(_BootStateTestCase):
         self.assertEqual(s, {"total": 6, "ready": 3, "failed": 1, "running": 1, "pending": 1})
 
     def test_setup_registers_the_documented_components(self):
-        """组件清单：**没有** `stt-meeting` / `diarize`，**但 `stt-cmd` 仍在**（2026-09-29）。
+        """组件清单：**没有** `stt-meeting` / `diarize` / `stt-cmd` / `wake`。
 
-        客户端进程内不再承担会议转写与说话人分离，那两个组件随之删掉；
-        而**语音指令**那条链路（`stt-cmd`，铁律 L3）必须留着 —— 这条用例同时钉两件事：
-        "删干净了"与"没把该留的删掉"。
+        客户端进程内不再承担会议转写与说话人分离（2026-09-29）；
+        2026-10-31 起本地指令转写引擎（`stt-cmd`）与语音唤醒（`wake`）也删除 ——
+        指令/回顾/会议全走能力后端 Qwen3-ASR。这条同时钉"删干净了"与"没把该留的删掉"：
+        热键 / 会议 / TTS / 智能体等组件必须还在。
         """
         boot.setup()
         snap = boot.snapshot()
         ids = [c["id"] for c in snap["components"]]
         self.assertEqual(ids,
-                         ["server", "dsh", "failover", "harness", "stt-cmd",
-                          "tts", "wake", "hotkey", "meeting"])
+                         ["server", "dsh", "failover", "harness",
+                          "tts", "hotkey", "meeting"])
         self.assertNotIn("stt-meeting", ids, "会议转写引擎组件已删（客户端不做会议转写了）")
         self.assertNotIn("diarize", ids, "说话人分离组件已删（它只走能力后端）")
-        self.assertIn("stt-cmd", ids, "语音指令引擎是铁律 L3，必须留着")
+        self.assertNotIn("stt-cmd", ids, "本地命令转写引擎已删（指令也走能力后端了）")
+        self.assertNotIn("wake", ids, "语音唤醒已取消（2026-10-31），不再有唤醒组件")
         by_id = {c["id"]: c for c in snap["components"]}
         self.assertEqual(by_id["server"]["status"], "online", "面板服务阶段 0 就已就绪")
         self.assertFalse(by_id["server"]["can_start"])
-        self.assertEqual(by_id["stt-cmd"]["kind"], "stt")
-        for cid in ("hotkey", "wake", "stt-cmd", "harness"):
+        for cid in ("hotkey", "harness"):
             self.assertTrue(by_id[cid]["can_stop"], "%s 应可手动停止" % cid)
         self.assertTrue(by_id["harness"]["can_start"], "独立 harness 可手动拉起")
 
     def test_setup_twice_does_not_duplicate(self):
         boot.setup()
         boot.setup()
-        self.assertEqual(boot.snapshot()["summary"]["total"], 9)
+        self.assertEqual(boot.snapshot()["summary"]["total"], 7)
 
 
 class ReportTests(_BootStateTestCase):
@@ -307,18 +308,16 @@ class ManualStartStopTests(_BootStateTestCase):
 class BootOrchestrationTests(_BootStateTestCase):
     def test_run_boot_settles_everything_and_marks_done(self):
         """全量编排：所有登记的组件都拉起后 phase=done（用"内置"组件避免加载模型）。"""
-        for cid in ("failover", "dsh", "tts", "hotkey", "meeting",
-                    "stt-cmd", "wake"):
+        for cid in ("failover", "dsh", "tts", "hotkey", "meeting"):
             boot.register(cid, cid, "", start_fn=None)
         boot._run_boot()
         self.assertEqual(boot._PHASE, "done")
         snap = boot.snapshot()
         self.assertEqual(snap["summary"]["running"], 0)
-        self.assertEqual(snap["summary"]["ready"], 7)
+        self.assertEqual(snap["summary"]["ready"], 5)
 
     def test_start_all_async_returns_immediately(self):
-        for cid in ("failover", "dsh", "tts", "hotkey", "meeting",
-                    "stt-cmd", "wake"):
+        for cid in ("failover", "dsh", "tts", "hotkey", "meeting"):
             boot.register(cid, cid, "", start_fn=None)
         t0 = time.time()
         boot.start_all_async()

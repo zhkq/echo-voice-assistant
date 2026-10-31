@@ -357,6 +357,7 @@ fun TalkScreen(vm: MainViewModel) {
 private fun SubmitCard(submit: SubmitState, onSpeak: (String) -> Unit) {
     val accent = when (submit.phase) {
         SubmitPhase.Failed -> EchoPalette.Red
+        SubmitPhase.Busy -> EchoPalette.Yellow
         SubmitPhase.Done -> EchoPalette.Green
         SubmitPhase.Idle -> EchoPalette.Muted
         else -> EchoPalette.Purple
@@ -494,5 +495,6 @@ internal fun phaseLabel(phase: SubmitPhase): String = when (phase) {
     SubmitPhase.Accepted -> "已受理"
     SubmitPhase.Running -> "执行中"
     SubmitPhase.Done -> "已完成"
+    SubmitPhase.Busy -> "忙（稍后再试）"
     SubmitPhase.Failed -> "未完成"
 }

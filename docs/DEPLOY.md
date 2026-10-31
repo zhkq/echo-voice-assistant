@@ -18,9 +18,10 @@
 2. **解压**，把得到的整个文件夹交给你的 AI 助手（Claude Code / Cursor / DSH……都可以）；
 3. 跟它说：**「按 echo-install 这个技能给我装 ECHO」**。
 
-助手会问你装到哪、要哪种转写、要不要唤醒词，然后自己把**运行时（CPython）、依赖、模型、
-系统前置（缺 VC++ 运行库时）**都处理好——运行时来自 python.org、依赖来自 PyPI、
-模型来自 ModelScope / hf-mirror 镜像，**不需要 git，也不需要 GitHub**。
+助手会问你装到哪、**能力后端怎么来（配对别人的 / 本机自己跑 / 先跳过）**，然后自己把
+**运行时（CPython）、依赖、系统前置**都处理好——运行时来自 python.org、依赖来自 PyPI，
+**不需要 git，也不需要 GitHub**。**客户端不再下载任何本地转写/分离/唤醒模型**（2026-10-31 起
+指令/回顾/会议转写全走能力后端 Qwen3-ASR）。
 
 想手工装也行（不进 AI 助手）：
 
@@ -28,15 +29,18 @@
 # ① 主程序 + 运行时
 powershell -NoProfile -ExecutionPolicy Bypass -File "<资料夹>\ECHO\scripts\install.ps1" `
     -DestDir 'D:\ECHO' -Silent
-# ② 引擎 / 模型 / 设置（按你的选择）
+# ② 设置 / 自检（不再选引擎/模型）
 powershell -NoProfile -ExecutionPolicy Bypass -File "<资料夹>\echo-install\scripts\echo-install-components.ps1" `
-    -DestDir 'D:\ECHO' -Engines sensevoice -Agent harness
+    -DestDir 'D:\ECHO' -Agent harness
 ```
+
+> 2026-10-31：Windows 的 `-Agent harness` 现在优先用官方桌面端自带的 dsh CLI，
+> 没装会下载官方最新安装包（约 277 MB）并静默安装；不想这样用 `-HarnessSource npm`。
 
 包里的 `先读我.md` 是给用户看的三句话说明；`echo-install/SKILL.md` 是给助手看的完整步骤。
 
 > **这条路的两个前提**：① 装的位置**路径尽量纯英文**（个别原生依赖读不了非 ASCII 路径）；
-> ② 首次要联网（拉依赖与模型，约 7 GB；Windows + NVIDIA 显卡更多）。
+> ② 首次要联网拉运行依赖（不再拉模型，约 100–300 MB）；**语音转写还需要一台能力后端**。
 
 ### 路线 B：从源码（本节以下内容）
 
@@ -100,26 +104,18 @@ powershell -File scripts\start.ps1 -Background   # 后台启动（无窗口）
 - 前台看日志：`powershell -File scripts\start.ps1`（Ctrl+C 结束）
 - 日志文件：`data\logs\echo-server.log`、`data\logs\echo-server.log.err`
 
-## 3. 模型
+## 3. 模型（客户端已退役）与能力后端
 
-仓库不含模型。面板 → **设置 → 模型** 会列出每一项的**体积 / 落地路径 / 是否就绪 / 获取方式**：
+**2026-10-31 起客户端不再安装/下载任何本地模型**：指令、回顾、会议转写都交给能力后端
+（`echo-server` + Qwen3-ASR），说话人分离也由后端做。面板「模型」页为空是正常的。
 
-| 模型 | 体积 | 怎么拿 |
-|---|---|---|
-| SenseVoice（默认转写引擎） | ~896 MB | 面板点「下载」（ModelScope 缓存）；不点也行，首次转写会自动下 |
-| Whisper 各档（tiny…large-v3） | 75 MB – 2.9 GB | 面板点「下载」（HF 镜像 `hf-mirror.com`） |
-| Qwen3-ASR 0.6B + 强制对齐 | ~3.6 GB | 面板点「下载」，或 `powershell -File scripts\install-qwen3asr.ps1`（同时装依赖） |
-| sherpa-onnx 流式 zipformer | ~189 MB | 面板点「下载」 |
-| 说话人分离（pyannote） | ~31 MB | **自行获取**：上游是 HF gated 模型（需同意条款），拿到后按面板给的路径放好 |
-| 唤醒词 KWS | ~39 MB | **自行获取**：从 sherpa-onnx 的 KWS 模型放成面板给的四个文件名 |
+需要准备的是**能力后端那台机器**：
 
-> ⚠️ **Whisper 系列（`tiny`…`large-v3`）的中文输出可能带繁体字**：它的中文训练语料以繁体为主，
-> 和"语言设成 zh"无关。ECHO 已用简体提示词诱导，并且**命令 / 会议 / 对外 API 三条路径参数一致**
-> （2026-09-15 issue #2：会议路径此前漏了提示词）。仍遇到繁体就把引擎换成 `sensevoice`（默认）
-> 或 `qwen3asr`。
+* 推荐用本仓库的 `server/` + `delivery/backend-*` 容器包部署（模型卷自己放 Qwen3-ASR 权重）；
+* 或选一台已有 ECHO 能力后端的 GPU 机器，装完客户端后**配对**（管理员发一次性配对串）；
+* 客户端配对入口：面板 →「能力 → 能力后端」。
 
-内网环境连不上外网时：把另一台机器上已经就绪的 `models/` 目录（或 ModelScope 缓存
-`~/.cache/modelscope/models`）按同样的相对路径拷过来即可。
+> 内网环境拿不到模型时，在**后端**那台的模型卷里放好对应权重即可（客户端不需要）。
 
 ## 4. 接上一个智能体（可选，用来"执行指令/写纪要"）
 
@@ -220,7 +216,9 @@ ECHO 的 API（默认 8970，权威值见 `data\echo-port.txt`）与模型路由
 
 | 功能 | 执行位置 | 数据去向 |
 |---|---|---|
-| 命令/会议转写、唤醒词、说话人分离 | 本机（SenseVoice / Whisper / Qwen3-ASR / sherpa-onnx / KWS / pyannote） | 不出网 |
+| 指令/回顾/会议转写、说话人分离与声纹嵌入 | **能力后端**（`echo-server` + Qwen3-ASR + pyannote） | 音频发到后端那台（本机回环或内网；**不出公网**，除非显式选网络服务商） |
+| 声纹库与比对 | **本机** `data/echo.db`（模板不出网） | 不出网 |
+| 语音唤醒 | **已取消**（2026-10-31）；入口改为热键/媒体键/面板/手机 | — |
 | 录音、转写、纪要文件与数据库 | 本机 `data/` | 不出网 |
 | **会议转写交给"ECHO 能力后端"**（会议转写方案 2） | 本机发起，**推理在那台 GPU 机器上** | **整段/整场会议音频发到那台机器**（内网地址 = 单位内网） |
 | **会议转写交给在线服务**（方案 3，千问AI平台 `qwen-audio-3.1-asr-flash-filetrans`） | 本机发起，推理在**千问AI平台** | **整场会议音频上传到公网**（官方临时存储，48 小时后自动清理）；这一档**只回说话人编号、不回声纹**，也**不允许从方案 2 自动降级过来** —— 换到它必须由人显式点 |
@@ -228,7 +226,7 @@ ECHO 的 API（默认 8970，权威值见 `data\echo-port.txt`）与模型路由
 | **指令执行** | 同上 | **指令文本与上下文发往该服务** |
 | **语音播报** | 默认 `ttsEngine=auto`：先试 **edge-tts（微软在线，需访问 speech.platform.bing.com）**，失败才降级 Windows SAPI | **播报文本发往微软**；设成 `sapi` 即全离线（音色略差） |
 | 纪要归档（委派给你的技能） | 本机（DSH 会话 + 你的技能） | 由你的技能决定，例如写本地笔记库 = 不出网 |
-| 模型下载 | 本机（ModelScope / hf-mirror 镜像） | 只下载权重，不上传数据 |
+| 模型下载 | **客户端已退役**；模型都在能力后端那台 | — |
 
 **要"全程不出网"的四步**：
 

@@ -13,7 +13,8 @@ ShellExecute/creationflags）搬进 `app/platform/<os>/` 接缝。搬之前必�
   3. `HotkeyListener`：注册哪些配置键、注册失败怎么处理、低级钩子里媒体键命中后
      `on_trigger` + 拦截（`consumeMediaKey`）的先后与返回值；
   4. `runtime._hotkey_cb` 的分派矩阵 + 边条的启动参数/跳过原因 + 打开面板的去抖；
-  5. `runtime.start/stop_hotkey|wake` 的幂等与状态上报。
+  5. `runtime.start/stop_hotkey` 的幂等与状态上报。
+     （2026-10-31 起语音唤醒取消：`start_wake/stop_wake` 与 `_wake` 已从 runtime 删除。）
 
 ⚠️ P3 搬迁后：Windows 实现在 ``app/platform/win32/hotkey.py``，``app/hotkey.py`` 变成
 **门面**（按平台转发）。本文件里带 ``skip_without_hotkey`` 的用例针对 Windows 实现
@@ -655,14 +656,13 @@ class PanelWindowTests(unittest.TestCase):
 
 
 class ListenerLifecycleTests(unittest.TestCase):
-    """`start_hotkey/stop_hotkey/start_wake/stop_wake`：幂等 + 状态上报。"""
+    """`start_hotkey/stop_hotkey`：幂等 + 状态上报。"""
 
     def setUp(self):
         self._log = patch.object(db, "add_log", lambda *a, **k: None)
         self._log.start()
         self.addCleanup(self._log.stop)
         runtime._hotkey = None
-        runtime._wake = None
         # **要么停线程、要么置空句柄**（2026-09-29 修的真泄漏）：原来只 `setattr(...None)`，
         # 谁真起了监听器（`start_all()` 会真起 `HotkeyListener`）就等于把句柄丢了 ——
         # 线程一直活着到整轮测试结束，还占着全局热键（后面的用例会看到
@@ -670,15 +670,14 @@ class ListenerLifecycleTests(unittest.TestCase):
         self.addCleanup(self._stop_listeners)
 
     def _stop_listeners(self):
-        """把这两个位置上的监听器**真的停掉**（`start_all()` 起的是真线程）。"""
-        for attr in ("_hotkey", "_wake"):
-            listener = getattr(runtime, attr, None)
-            try:
-                if listener is not None and hasattr(listener, "shutdown"):
-                    listener.shutdown()
-            except Exception:                                     # noqa: BLE001
-                pass
-            setattr(runtime, attr, None)
+        """把监听器**真的停掉**（`start_all()` 起的是真线程）。"""
+        listener = getattr(runtime, "_hotkey", None)
+        try:
+            if listener is not None and hasattr(listener, "shutdown"):
+                listener.shutdown()
+        except Exception:                                     # noqa: BLE001
+            pass
+        runtime._hotkey = None
 
     class _FakeListener:
         def __init__(self, *a, **kw):
@@ -719,31 +718,14 @@ class ListenerLifecycleTests(unittest.TestCase):
         self.assertTrue(listener.shutdown_called)
         self.assertIsNone(runtime._hotkey)
 
-    def test_wake_is_gated_by_config(self):
-        # `start_all()` 会连**热键监听**一起起 —— 两个都得打桩，否则真起一个
-        # `HotkeyListener` 线程（win32 消息循环，句柄一丢就活到整轮测试结束）。
-        with patch.object(runtime, "WakeListener", self._FakeListener), \
-                patch.object(runtime, "HotkeyListener", self._FakeListener), \
-                patch.object(runtime.services, "report_wake"), \
+    def test_start_all_only_starts_the_hotkey_listener(self):
+        """语音唤醒取消后，`start_all()` 只起热键监听（且 runtime 上不再有 `_wake`）。"""
+        with patch.object(runtime, "HotkeyListener", self._FakeListener), \
                 patch.object(runtime.services, "report_hotkey"):
-            with _patch_settings_get({"wakeEnabled": False}):
-                results = runtime.start_all()
-            self.assertEqual(len(results), 1, "未启用唤醒时只启动热键")
-            self.assertIsNone(runtime._wake)
-
-            with _patch_settings_get({"wakeEnabled": True}):
-                results = runtime.start_all()
-            self.assertEqual(len(results), 2)
-            self.assertIsNotNone(runtime._wake)
-
-    def test_wake_disabled_reports_disabled_state(self):
-        with patch.object(runtime, "WakeListener", self._FakeListener), \
-                patch.object(runtime, "HotkeyListener", self._FakeListener), \
-                patch.object(runtime.services, "report_wake") as report, \
-                patch.object(runtime.services, "report_hotkey"):
-            with _patch_settings_get({"wakeEnabled": False}):
-                runtime.start_all()
-        self.assertIn(("disabled", "未启用"), [c.args for c in report.call_args_list])
+            results = runtime.start_all()
+        self.assertEqual(len(results), 1)
+        self.assertIsNotNone(runtime._hotkey)
+        self.assertFalse(hasattr(runtime, "_wake"), "唤醒监听器已删除，不该还有 _wake 句柄")
 
 
 if __name__ == "__main__":

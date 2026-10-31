@@ -1,8 +1,11 @@
 # -*- coding: utf-8 -*-
-"""runtime.py — ECHO 运行时组件生命周期（热键/唤醒监听器）
+"""runtime.py — ECHO 运行时组件生命周期（热键/媒体键监听器）
 
 启动时按配置拉起；配置变更后 restart_* 可热重载。
 监听器回调统一进 assistant.capture(source)。
+
+2026-10-31 用户决定彻底取消语音唤醒：本模块不再有唤醒监听器
+（`app/audio/wake.py` 已删除）。「按一下说话」的入口（热键/媒体键/面板/手机）保留。
 """
 import os
 import subprocess
@@ -11,14 +14,12 @@ import threading
 import time
 
 import app.assistant as assistant
-from app.audio.wake import WakeListener, engine_label as wake_engine_label
 from app.config import settings
 from app.hotkey import HotkeyListener
 from app import paths, ports, services
 from app import platform as echo_platform
 
 _hotkey = None
-_wake = None
 _lock = threading.Lock()
 _panel_last_open = 0.0
 # 安装根由路径层给（含 ECHO_ROOT 覆盖）。
@@ -423,41 +424,10 @@ def stop_hotkey():
         return True, "热键监听已停止"
 
 
-def _wake_cb():
-    assistant.capture("wake")
-
-
-def start_wake():
-    global _wake
-    with _lock:
-        if _wake is not None and _wake.is_alive():
-            return True, "唤醒监听已在运行"
-        _wake = WakeListener(settings.get, on_wake=_wake_cb)
-        _wake.start()
-        services.report_wake("online", wake_engine_label())
-        return True, "唤醒监听已启动"
-
-
-def stop_wake():
-    global _wake
-    with _lock:
-        if _wake is not None:
-            _wake.shutdown()
-            _wake = None
-        services.report_wake("offline", "已停止")
-        return True, "唤醒监听已停止"
-
-
 def start_all():
-    """按配置启动监听器（唤醒词需启用才启动）。"""
-    results = [start_hotkey()]
-    if settings.get("wakeEnabled", False):
-        results.append(start_wake())
-    else:
-        services.report_wake("disabled", "未启用")
-    return results
+    """启动监听器。**只有热键/媒体键** —— 语音唤醒已取消（2026-10-31）。"""
+    return [start_hotkey()]
 
 
 def stop_all():
     stop_hotkey()
-    stop_wake()

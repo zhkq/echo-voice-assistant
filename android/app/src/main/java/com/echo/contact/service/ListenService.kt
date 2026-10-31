@@ -434,6 +434,12 @@ class ListenService : Service() {
             val heard = when (val first = flow.submit(wav)) {
                 is ListenFlow.Outcome.Heard -> first
                 is ListenFlow.Outcome.Failed -> return note("刚才那句没发出去：${first.message}")
+                // 忙（409/503）：**念出来**再继续听 —— 车里看不见通知，静默等于"没反应"。
+                is ListenFlow.Outcome.Busy -> {
+                    note(first.message)
+                    speak(engine, api, first.message)
+                    return
+                }
                 // 上传这一步不该回 Reply / Silent（那两个只从 awaitReply 来）；写出来是为了穷尽分支
                 is ListenFlow.Outcome.Reply, is ListenFlow.Outcome.Silent ->
                     return note("这次没拿到结果")
@@ -456,6 +462,7 @@ class ListenService : Service() {
                 // 在车里听起来一模一样（电脑发起的任务 / 回复是空的）。
                 is ListenFlow.Outcome.Silent -> note(result.why)
                 is ListenFlow.Outcome.Failed -> note(result.message)
+                is ListenFlow.Outcome.Busy -> note(result.message)
                 is ListenFlow.Outcome.Heard -> note("这次没拿到结果")
             }
         } catch (e: Exception) {

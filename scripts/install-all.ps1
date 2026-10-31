@@ -16,15 +16,16 @@
 #
 # 用法
 # ----
-#   # 在线快路（默认 minimal：只要 sherpa，装完立刻能语音指令/转写）
+#   # 在线快路（默认档：runtime-core + 依赖；客户端无本地 STT，转写走能力后端）
 #   powershell -NoProfile -ExecutionPolicy Bypass -File <kit>\echo-core\scripts\install-all.ps1 -Yes
 #
 #   # 离线包（bundle\wheels + bundle\models 随包，全程不联网）
 #   powershell -NoProfile -ExecutionPolicy Bypass -File <kit>\echo-core\scripts\install-all.ps1 `
 #       -Offline -Yes -Agent none
 #
-#   # 办公本档（sherpa + 唤醒词），智能体走标准版 harness
-#   ... -Profile main -Agent harness -Root D:\ECHO
+#   # 2026-10-31 起只有一个客户端档：runtime-core + 依赖（无本地 STT 模型），
+#   # 指令/回顾/会议转写全部走能力后端（Qwen3-ASR）。
+#   ... -Agent harness -Root D:\ECHO
 #
 # 同事那一份 kit 根上还有个 **双击入口**（`装我.cmd`，由 build_kit.py 从
 # delivery\kit-install.cmd 放进去）：它只问一句"装到哪个目录"，然后调本脚本
@@ -32,25 +33,31 @@
 #
 # 参数
 # ----
-#   -Profile minimal|main    minimal=只要 sherpa（最小实例）；main 再加唤醒词 KWS
-#                            （对应 components\profiles.json 的默认档）
+#   -Profile minimal|main    **已废弃**：客户端只剩一个默认档（没有本地 STT 引擎/模型），
+#                            两个取值行为相同；保留参数只为兼容老脚本。
 #   -Root <安装根>           数据/模型/运行时都在它下面，代码进 <根>\echo-core。
 #                            默认 D:\ECHO（没有 D 盘就 C:\ECHO）
 #   -Agent none|harness|dsh  智能体。**离线默认 none**：离线包里不带 DSH/harness
 #                            （@deepseek-ai/dsh 是私有 npm 包，许可上不随包分发）
+#   -HarnessSource auto|desktop|npm
+#                            harness 从哪来（默认 auto）：
+#                            auto=先用已装的官方 DeepSeek Harness 桌面端，没有就联网
+#                            下载官方安装包静默安装，再失败才回退本地 npm；
+#                            desktop=没有就下载官方桌面端；npm=只走旧的 node/npm 本地安装。
+#   -DesktopInstallDir <目录> 官方桌面端安装目录（留空=官方默认位置）
 #   -DshDir <目录>           已有 DSH 的安装目录（含 node_modules\@deepseek-ai\dsh\lib\bin.js
 #                            的那一层）。给了就不装 npm 包，只探测 + 写 harnessCommand。
 #   -AskDsh                 允许交互问"已有 DSH 吗"；用户选有则循环输入目录并探测。
 #                            kit 的全新安装会传；无人值守/agent 默认不传（行为不变）。
 #   -Offline                 离线模式：依赖只从 bundle\wheels 装（pip 带
-#                            --no-index --find-links），模型直接用 bundle\models 里的
+#                            --no-index --find-links）；客户端没有模型，bundle\models 可以不存在
 #   -Yes                     无人值守：不提问、全默认
 #   -KitRoot <目录>          资料夹根（里面有 echo-core\（老 kit 是 ECHO\）、echo-install\、
 #                            bundle\）；默认按本脚本位置推（<kit>\echo-core\scripts\install-all.ps1）
 #   -BundleDir <目录>        离线载荷目录（默认 <KitRoot>\bundle）
-#   -Engines <列表>          覆盖档位的引擎，例如 -Engines sherpa,whisper-base
-#   -Wake / -NoWake          唤醒词 KWS（main 档默认开；离线包里没有 KWS 模型时自动跳过）
-#   -Diarize                 说话人分离（重依赖 + 权重不随包，必然要联网）
+#   -Engines <列表>          已废弃：客户端不再装本地 STT 引擎（传了也只警告、不生效）
+#   -Wake / -NoWake          已废弃：语音唤醒取消（传了也只警告、不生效）
+#   -Diarize                 已废弃：说话人分离在能力后端做（传了也只警告、不生效）
 #   -PipIndex <url>          在线模式换国内 pip 镜像
 #   -NotesDir <目录>         笔记库（填了会开纪要归档）
 #   -NoShortcuts             不建桌面快捷方式与开机自启（测试机常用）
@@ -68,6 +75,8 @@ param(
     [ValidateSet('minimal', 'main')][string]$Profile = 'minimal',
     [Alias('DestDir')][string]$Root = '',
     [ValidateSet('none', 'harness', 'dsh')][string]$Agent = '',
+    [ValidateSet('auto', 'desktop', 'npm')][string]$HarnessSource = 'auto',
+    [string]$DesktopInstallDir = '',
     [string]$DshDir = '',
     [switch]$AskDsh,
     [switch]$Offline,
@@ -548,7 +557,7 @@ function Install-CoreDepsOffline([string]$Py) {
 function Copy-BundleModels {
     Step '准备模型（离线：直接用包里的）'
     $src = Join-Path $script:Bundle 'models'
-    if (-not (Test-Path $src)) { Warn '离线载荷里没有 models\ —— 模型要在面板里自己下（需要网络）'; EndStep '模型'; return }
+    if (-not (Test-Path $src)) { Info '客户端不装本地模型（转写全部走能力后端）——bundle 里没有 models\ 是正常的'; EndStep '模型'; return }
     $dst = Join-Path $script:TargetRoot 'models'
     New-Item -ItemType Directory -Force -Path $dst | Out-Null
     $items = @(Get-ChildItem $src -Force)
@@ -681,7 +690,7 @@ function Start-EchoOwnService {
 
 # ---------------------------------------------------------------- 组件（技能脚本，唯一实现）
 function Invoke-ComponentsScript {
-    param([string[]]$EngineList, [bool]$WantWake,
+    param([string[]]$EngineList,
           # 升级专用：不改任何设置、不碰依赖/模型；DSH 升级只在用户同意时传 UpgradeDsh
           [switch]$KeepSettings, [switch]$SkipPip, [switch]$SkipModels, [switch]$UpgradeDsh)
     Step '装组件（依赖 / 模型 / 设置 / 自检，调技能里的同一个脚本）'
@@ -694,9 +703,8 @@ function Invoke-ComponentsScript {
     #   * `-Command "& 脚本"` 里被调脚本的 `exit N` **不会**变成宿主进程的退出码（实测恒为 1）；
     #   * `& 脚本` 在当前进程里：脚本的 `exit N` 只结束那个脚本、调用方继续，`$LASTEXITCODE`
     #     就是 N（实测 5.1 与 7 都是这样）—— 数组参数也照常按数组传。
-    $argv = @{ DestDir = $script:TargetRoot; Engines = $EngineList; Agent = $Agent }
-    if ($WantWake) { $argv['Wake'] = $true }
-    if ($Diarize) { $argv['Diarize'] = $true }
+    # 2026-10-31：客户端不再装本地 STT 引擎/唤醒/分离 —— 只传空 Engines。
+    $argv = @{ DestDir = $script:TargetRoot; Engines = @(); Agent = $Agent }
     if ($NotesDir) { $argv['NotesDir'] = $NotesDir }
     if ($PipIndex -and -not $Offline) { $argv['PipIndex'] = $PipIndex }
     if ($KeepSettings) { $argv['KeepSettings'] = $true }
@@ -705,12 +713,12 @@ function Invoke-ComponentsScript {
     if ($UpgradeDsh) { $argv['UpgradeDsh'] = $true }
     if ($DshDir) { $argv['DshDir'] = $DshDir }
     if ($AskDsh) { $argv['AskDsh'] = $true }
-    $shown = ($EngineList -join ',')
-    Info ("& {0} -DestDir {1} -Engines {2} -Agent {3}{4}{5}" -f `
-          $comp, $script:TargetRoot, $shown, $Agent,
-          $(if ($WantWake) { ' -Wake' } else { '' }), $(if ($Diarize) { ' -Diarize' } else { '' }))
-    Log 'EXEC' ("& {0} -DestDir {1} -Engines {2} -Agent {3} -Wake={4} -Diarize={5}" -f `
-                $comp, $script:TargetRoot, $shown, $Agent, $WantWake, $Diarize)
+    if ($HarnessSource) { $argv['HarnessSource'] = $HarnessSource }
+    if ($DesktopInstallDir) { $argv['DesktopInstallDir'] = $DesktopInstallDir }
+    if ($Offline) { $argv['Offline'] = $true }
+    Info ("& {0} -DestDir {1} -Agent {2}" -f $comp, $script:TargetRoot, $Agent)
+    Log 'EXEC' ("& {0} -DestDir {1} -Agent {2} (no local STT engines)" -f `
+                $comp, $script:TargetRoot, $Agent)
     $code = 1
     try {
         & $comp @argv
@@ -758,14 +766,7 @@ function Show-Result {
         $comp = @($status.components | Where-Object { $_.name -in @('stt', 'harness', 'dsh') })
         foreach ($c in $comp) { Info ("{0,-8} {1}" -f $c.name, $c.status) }
         try {
-            $m = Invoke-WebRequest -Uri ("http://127.0.0.1:{0}/api/models" -f $port) -UseBasicParsing -TimeoutSec 5
-            $mb = if ($m.RawContentStream) { $m.RawContentStream.ToArray() } else { @() }
-            $models = ([System.Text.Encoding]::UTF8.GetString($mb) | ConvertFrom-Json)
-            foreach ($k in @('sherpa', 'kws', 'whisper-base')) {
-                $it = $null
-                if ($models.items -and $models.items.PSObject.Properties.Name -contains $k) { $it = $models.items.$k }
-                if ($it) { Info ("模型 {0,-12} ready={1}" -f $k, $it.ready) }
-            }
+            # 2026-10-31：客户端不再装本地模型 —— /api/models 的 items 为空是正常的。
         } catch { }
     } else {
         Warn ("服务没起来（或 -SkipStart）—— 面板地址（起来后）: {0}" -f $url)
@@ -1444,10 +1445,15 @@ Log 'BEGIN' ("install-all.ps1 Profile={0} Offline={1} Agent={2} Yes={3}" -f $Pro
 
 # 参数归一：Agent 离线默认 none（离线包里不带、也不许带 DSH —— 私有 npm 包不能分发）
 if (-not $Agent) { $Agent = if ($Offline) { 'none' } else { 'harness' } }
-# 引擎 / 唤醒词（档位）
-if ($Engines.Count -eq 0) { $Engines = @('sherpa') }
-$engineList = @($Engines | Where-Object { $_ } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
-$wantWake = (($Profile -eq 'main') -or $Wake) -and -not $NoWake
+# 2026-10-31 用户拍板：客户端默认档不装任何本地 STT 模型/引擎，语音唤醒取消。
+# -Engines / -Wake / -NoWake / -Diarize / -Profile 两个档位都只为兼容老脚本保留，
+# 传了也不生效（明确警告，不静默）。
+$engineList = @()
+$wantWake = $false
+if (@($Engines).Count -gt 0 -or $Wake -or $NoWake.IsPresent -or $Diarize) {
+    Warn '客户端已不再安装本地 STT 引擎/唤醒/分离组件（2026-10-31 起转写全走能力后端）——这些参数已忽略'
+}
+if ($Diarize) { Warn '会议说话人分离由能力后端完成：不需要在客户端装 pyannote' }
 # 步号只为让人看得懂进度：离线那条路多三步（运行时/核心依赖/模型），后端那一步两边都有；
 # 2026-10-11 又多了两步：安装模式探测（开头）+ 装随包技能（服务起来之后）。
 $script:TotalSteps = if ($Offline) { 11 } else { 8 }
@@ -1466,7 +1472,7 @@ if ($script:IsUpgrade) {
     Backup-UpgradeDatabase
     # 升级不装/不换模型，也不装依赖（引擎列表清空 → 组件脚本不会去写 sttModel）。
     $engineList = @()
-    $wantWake = $false
+    $wantWake = $false   # historical: client has no wake/KWS any more
     # 升级只问"要不要升 DSH"，不再问"已有 DSH 目录"（外部目录只用于全新安装）。
     $DshDir = ''
     $AskDsh = $false
@@ -1488,26 +1494,8 @@ if ($Offline -and -not $script:IsUpgrade) {
     $rcPy = Build-OfflineRuntime
     Install-CoreDepsOffline $rcPy
     Copy-BundleModels
-    # 离线不许"顺手去下模型"：包里没有模型的引擎直接摘掉并说清楚
-    $modelFor = @{
-        'sherpa' = 'sherpa-onnx-streaming'; 'whisper-tiny' = 'faster-whisper\tiny'
-        'whisper-base' = 'faster-whisper\base'; 'whisper-small' = 'faster-whisper\small'
-        'whisper-medium' = 'faster-whisper\medium'; 'whisper-large-v3' = 'faster-whisper\large-v3'
-        'sensevoice' = 'sensevoice'; 'qwen3asr' = 'qwen3asr'
-    }
-    $kept = @()
-    foreach ($e in $engineList) {
-        $rel = $modelFor[$e]
-        if ($rel -and (Test-Path (Join-Path (Join-Path $script:Bundle 'models') $rel))) { $kept += $e }
-        else { Warn ("离线包里没有 {0} 的模型 —— 这一档跳过（要它就联网装：去掉 -Offline）" -f $e) }
-    }
-    if ($kept.Count -eq 0) { $kept = @('sherpa') }   # 兜底：sherpa 是必装档
-    $engineList = $kept
-    if ($wantWake -and -not (Test-Path (Join-Path $script:Bundle 'models\wakeword'))) {
-        Warn '离线包里没有唤醒词模型（bundle\models\wakeword）—— 唤醒词跳过'
-        $wantWake = $false
-    }
-    if ($Diarize) { Warn '-Diarize 的权重不随包分发（pyannote）—— 离线装不了，这一步会失败' }
+    # 2026-10-31：客户端不装任何本地 STT 模型 —— bundle 里没有 models\ 是正常的，
+    # 不再按引擎过滤模型、也不再检查唤醒词 KWS 权重。
 }
 
 Install-TreeAndShortcuts
@@ -1537,10 +1525,10 @@ if ($Offline -and -not $script:IsUpgrade) {
 if ($script:IsUpgrade) {
     # 升级：**不写任何设置、不装依赖、不碰模型**，只跑自检（组件脚本里的 -KeepSettings）。
     # 引擎列表为空 → 组件脚本不会去写 sttModel / meetingSttModel，也不会下模型。
-    $compExit = Invoke-ComponentsScript -EngineList @() -WantWake $false `
+    $compExit = Invoke-ComponentsScript -EngineList @() `
                     -KeepSettings -SkipPip -SkipModels -UpgradeDsh:$upgradeDsh
 } else {
-    $compExit = Invoke-ComponentsScript -EngineList $engineList -WantWake $wantWake
+    $compExit = Invoke-ComponentsScript -EngineList @()
 }
 # 「后端怎么来」排在组件之后、收尾之前：此刻服务已经起来了（`$env:ECHO_PORT` 钉死），
 # 配对与「起本机后端」都能立刻生效；结果再由 `Show-Result` 一起打进摘要。

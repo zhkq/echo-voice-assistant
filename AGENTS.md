@@ -1,5 +1,73 @@
 # AGENTS.md — 给 AI/协作者的长期约定与踩坑记录
 
+## 2026-10-31 最新架构（**取代本文后面所有关于"语音唤醒 / 本机转写"的旧口径**）
+
+用户这一晚拍板并已落地：
+
+- **语音唤醒彻底取消**：`app/audio/wake.py` 已删；`wakeEnabled/wakePaused/wakeEngine/wakeKeywords/
+  wakeAliases/wakeThreshold/wakeCooldownSec/wakeConfirmX/wakeConfirmN/wakeSilenceFloor` 已从
+  `config.DEFAULTS` 删除；`POST /api/control/wake/*` 已删；`wake` 能力槽、KWS 模型、`wake-kws`
+  组件都已删除。**`wakeHotkey` / `fallbackHotkey` 保留**——那是「按一下说话」的说话热键，不是唤醒词。
+  「不必按键、常听即指令」这条入口没有了；热键/媒体键/面板 🎤/手机「按住说话」仍在。
+- **指令、回顾、会议转写全部走能力后端（Qwen3-ASR），客户端不再有本地 STT**：
+  * 唯一路径 `assistant._transcribe_via_backend()`（`_transcribe_command()` 调它）；
+    指令 `variant=short`（45s 超时），回顾 `variant=long`（300s）。**不回落本地**——
+    客户端已没有本地引擎/模型可回落。
+  * 手机 `POST /api/assistant/voice-command`、`POST /api/daily-review/turn`、面板「试转写」
+    `/api/stt/transcribe`、`/api/stt/sentences` 都走能力后端；`/api/stt/status` 只报后端配没配。
+  * **privacy 门对所有路径生效**：`echo_server.privacy_blocked()`；`capabilityPrivacy=none`
+    只放行回环后端。以前回顾那条路没查这一项，全后端后补上了。
+- **声纹库与比对留在客户端**：后端 `/v1/diarize` 返回 turns + speakers 嵌入 + vectorSpaceId，
+  客户端存 `speaker_embeddings`/`voiceprints` 并做余弦匹配。后端**不存**声纹库、不判断"这是谁"。
+- **同一人的请求串行**：后端 `per_client_concurrent=1` 保持；会议/指令/回顾不能同时进行。
+  本人已有请求在跑 → 能力后端回 `409 client_busy`，客户端翻成 `ASR_BUSY` 说"我这边正忙着"；
+  **409 不要重试**（重试永远成功不了），`503 server_busy` 才按 `Retry-After` 退避。
+  客户端互斥实现：`meeting.voice_busy_reason()`（会议录音/收段/转写中）、`assistant.capture()`
+  与 `start_review()` 前置拒绝、`meeting.start_meeting*()` 拒绝回顾进行中、
+  `meeting._wait_voice_idle()` 在会议转写前等一句指令过去。
+  **安卓侧（2026-10-31 已改，APK 见 `dist/ECHO-android-app-debug-20261031-0148.apk`）**：
+  409/503 统一按「忙，稍后再试」——指令卡新 `SubmitPhase.Busy`（黄色"忙（稍后再试）"、语音会念、
+  不挡住下一条）；常驻听写 `ListenFlow.Outcome.Busy` 与 422/502/网络失败分开并 TTS 念；
+  回顾 turn 用服务端 `spoken`；旧一次性口述 `/api/stt/transcribe` 409/503 也念。判据
+  `ListenFlowTest`、`SendRoundTest`、`tests/test_tts_audio_api.py`、`tests/test_daily_review_turn.py`。
+- **客户端默认档不再装任何本地 STT 模型/引擎**：`requirements-core.txt` 删 sherpa-onnx /
+  modelscope / pypinyin；`components/offline-pack.json` 默认只有 `runtime-core`；
+  `components/profiles.json` 默认档 `components=["runtime-core"]`；`app/components.py` 只剩
+  runtime-core 必装；`modelinfo.CATALOG=[]`、`ENGINE_SPECS={}`（公开函数保留，返回空/给原因）。
+  **预期 Windows kit 从 430 MB 降到约 54–58 MB**（无 `bundle/models`、wheel 去 STT 栈），
+  装完磁盘的 439.87 MB 模型归零。交付标准 `BUNDLE_REQUIRED_ENTRIES=("bundle/wheels",)`。
+- **后端 Qwen3 常驻**（zysk 那台，`ssh 24` = 10.100.0.24，RTX 2080 Ti 22 GB）：
+  `/home/zysk/echo/backend/server.yaml` 的 `asr-long` 已设 `resident: true`（启动预热、不参与 LRU），
+  实机验证 `/v1/capabilities` 的 `models[].resident=true`、`state=ready`、`loadMs≈8.9s`。
+  改完必须 `docker compose up -d --force-recreate backend`（配置是挂进容器的）。
+- **Windows 智能体安装不再强制 Node/npm（2026-10-31，用户要求）**：
+  * 官方 DeepSeek Harness 桌面端安装包自带 Node + dsh，安装后
+    `resources\runtime\cli\bin\dsh.cmd` 就是无头 CLI（`ELECTRON_RUN_AS_NODE`）；实测
+    `dsh.cmd --version` = 0.2.1-rc.5，`dsh.cmd web --port N --no-open` 会打印 `?token=...`，
+    ECHO 的 `harness_proc.command()` 把它当自定义 `harnessCommand` 用即可（已实测 `Popen` 能跑 .cmd）。
+  * 安装器顺序：**已装官方桌面端 → 直接写 `harnessCommand` 跳过 npm**；没装 → 从
+    `https://download.deepseek.com/desktop/dsh-latest-windows-x64.exe` 下载最新版（约 277 MB），
+    验 Authenticode 签名后 `/S` 静默安装；都失败才回退本地 npm（`-HarnessSource npm` 可强制）。
+    **安装包不进 ECHO 交付包** —— 所以升级只要重跑安装/下载即可（用户明确要求）。
+  * 相关脚本：`harness-install-desktop.ps1`（新）、`find-existing-dsh.ps1`（认 `dsh.cmd`）、
+    `find-existing-dsh-auto.ps1`（加官方路径）、`echo-install-components.ps1`（`Resolve-OfficialDesktop`
+    + `-HarnessSource auto|desktop|npm` + `-Offline`）、`install-all.ps1` 转发同名参数。
+    kit 的 `装我.cmd` 文案已同步。
+  * 注意：官方桌面端**正在运行**时 NSIS 安装器会拒绝覆盖（实测 exit 2）；脚本此时继续用现有
+    CLI 并提示先退出。离线安装不下载，只认已装官方桌面端（否则回退 npm）。
+  * 用的仍是 ECHO 自己的 `harnessHome`，**不碰**官方桌面端的 `~/.dsh`。
+- **别再复活**：本地 STT 引擎/模型、唤醒词/KWS、`stt-cmd` 启动预热、「后端失败回落本机」、
+  `providerAsr` 优先级（指令路径已移除；`app/providers/local.py` 与 `app/audio/stt.py` 是留下的
+  历史代码，默认档不装依赖、运行时不使用）。`sttModel`/`device`/`dailyReviewSttBackend` 现在
+  只是**兼容读取的死设置**，面板不再提供入口，不要拿它们做路由判断。
+
+**判据**：`tests/test_asr_provider.py`（只走 backend、无本地回落、busy 是独立状态）、
+`tests/test_daily_review_turn.py`、`tests/test_tts_audio_api.py`、`tests/test_review_turn_tag.py`、
+`tests/test_default_profile.py`（默认档只有 runtime-core、无模型）、
+`tests/test_components*.py`、`tests/test_build_offline_pack.py` / `test_delivery_standard.py`。
+（`tests/test_wake_match.py`、`test_stt_sensevoice_onnx.py`、`test_stt_whisper_cache.py`、
+`test_pyannote_install.py` 已随功能退役删除。）
+
 ## 必读：已知坑（务必牢记）
 
 ### **ECHO 不直接连 LLM：所有推理只发配置的智能体**（2026-10-22 用户定调，硬约束）
@@ -271,6 +339,14 @@
   `echo-instance-lib.ps1` + 启动 vbs 装到 `%USERPROFILE%\.echo-switch\`，并把开机自启动指过去。
   这样删掉/搬走 dev 树，稳定版照样开机自启。**别再用 `switch-instance.ps1 -InstallAutostart`**
   —— 它会把自启动指回仓库（这正是被替换掉的那个耦合）。
+- **切换时停 harness 必须认 data root，不能只认代码根**（2026-10-31 真机 bug）：
+  3.0 布局的代码根是 `D:\ECHO\echo-core`，而 harness 在上一级 `D:\ECHO\dsh\app`；
+  旧 `Get-EchoInstanceProcs` 只拿代码根匹配命令行 → 切到 dev 时 **stable 的 harness
+  永远被漏掉**，继续占着 43199。dev 启动时已经如实报「另一棵树的 harness」并拒绝，
+  但旧进程没人收，最后 dev 又复用了 stable 的 DSH_HOME（会话/工作区 id 全对不上）。
+  修法：`Get-EchoInstanceProcs` 同时按 `Get-EchoDataRoot($root)` 匹配 router/harness；
+  留了判据 `tests/test_echo_switch_harness.py`。改完 `.echo-switch` 那份要跑
+  `scripts/install-switcher.ps1` 刷新（它复制的是 lib 副本，不刷新就还是旧的）。
 - 现状以 `scripts\switch-instance.ps1 -Status` 与 `GET /api/status` 为准，不要凭记忆。
 
 ### 设置缓存**不许"先挂空 dict、再逐键填"**（2026-09-29 全量门禁逮住的并发 bug，会表现成"改了设置不生效"）

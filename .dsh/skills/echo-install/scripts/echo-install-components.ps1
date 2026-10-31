@@ -3,57 +3,53 @@
 #
 # 谁在用它：`.dsh/skills/echo-install`（安装专用技能）。技能先跟用户确认"要哪些组件"，
 # 再把选择翻译成本脚本的参数。**不用 git、不用 GitHub**：依赖走 PyPI，模型走
-# ModelScope / hf-mirror（ECHO 内置 `HF_ENDPOINT=https://hf-mirror.com`）。
+# 客户端不再下载本地 STT 模型（2026-10-31：转写全部走能力后端）。
 #
 # 前提：`install.ps1` 已经把主包解开、`runtime-core` 就绪（本脚本自己会检查，缺了就报错）。
 #
 # 用法：
 #   powershell -NoProfile -ExecutionPolicy Bypass -File echo-install-components.ps1 `
-#       -DestDir D:\ECHO -Engines sherpa,whisper-base -Wake
+#       -DestDir D:\ECHO            # 2026-10-31 起客户端只装 runtime-core，无本地 STT
 #
-# 参数：
+# 参数（2026-10-31 起客户端不再装本地 STT 引擎/唤醒/模型）：
 #   -DestDir <目录>        ECHO 安装目录（必填）
-#   -Engines <列表>        转写引擎，逗号分隔。可选：
-#                          sherpa(189MB,免 torch) / whisper-tiny(75) / whisper-base(141)
-#                          / whisper-small(464) / whisper-medium(1500) / whisper-large-v3(2950)
-#                          / sensevoice(896,需 torch) / qwen3asr(3.6GB,需独显)
-#   -Wake                  装唤醒词 KWS（40 MB，默认不装：要常开麦克风）
-#   -Diarize               装说话人分离（pyannote，需 HF 授权，重依赖）
-#   -AccelCuda             装 CUDA 版 torch（需 N 卡）
+#   -Engines <列表>        **已废弃**：传了只警告、不生效
+#   -Wake / -Diarize / -AccelCuda   **已废弃**：唤醒取消、分离与 torch 都在能力后端
 #   -Agent <名>            智能体后端：harness(默认,= DSH 标准版) / dsh / none
+#   -HarnessSource <来源>  harness 从哪来：auto(默认,先用已装的官方桌面端/已有 DSH，没有再下载) /
+#                          desktop(没有就下载官方桌面端) / npm(保持旧的本地 npm 安装)
+#   -DesktopInstallDir     官方桌面端安装目录（留空=官方默认的 %LOCALAPPDATA%\Programs\DeepSeek Harness）
+#   -Offline               离线安装：不联网下载官方桌面端（已装的仍可用）
 #   -DshVersion <版本>     标准版本地安装的版本。**默认空 = 装 npm 上的 latest**
-#                          （2026-10-08 修：原来这里默认 `0.1.5-rc.2`，而且下面会把它
-#                          **显式传给** harness-install-local.ps1 —— 于是 helper 里
-#                          "查 dist-tags.latest" 那段永远不生效：仓库、新包、旧包
-#                          跑出来都是 0.1.5-rc.2。真正修好必须两处一起改。）
-#                          显式传值 = 指定版本（升级/降级入口）。npm 装不下来时会从
-#                          npx 缓存里找**同版本**那份复制（见 harness-install-local.ps1）
-#   -PinHarnessCommand     把本地入口的绝对路径写进设置 harnessCommand（默认**不写**：
-#                          ECHO 自己会优先本地入口，node 换版本不用改配置）
-#   -DshDir <目录>         已有 DSH 的安装目录（含 node_modules\@deepseek-ai\dsh\lib\bin.js
-#                          的那一层，也接受直接指到 bin.js / 包目录 / ECHO 安装根）。
-#                          给了就**不装 npm 包**，只探测 + 写 harnessCommand。
-#   -AskDsh                允许问一句"已有 DSH 吗"；用户选"有"时循环让输入目录并探测。
-#                          只在交互控制台生效；无人值守/agent 路径默认不传（行为不变）。
+#   -PinHarnessCommand     把本地入口的绝对路径写进设置 harnessCommand（默认**不写**）
+#   -DshDir <目录>         已有 DSH 的安装目录（给了就不装 npm 包，只探测+写 harnessCommand）
+#   -AskDsh                允许问一句"已有 DSH 吗"（只在交互控制台生效）
 #   -ModelsDir / -MeetingsDir / -NotesDir   三处位置（留空=默认；-NotesDir 填了会开归档）
-#   -PipIndex <url>        国内 pip 镜像，例如 https://pypi.tuna.tsinghua.edu.cn/simple
-#   -TorchIndex <url>      -AccelCuda 时 torch 走哪个索引（默认官方 cu128；PyPI 上的是 CPU 版）
-#   -SkipPip               只下模型、不装 pip 依赖
-#   -KeepSettings          升级模式：**不写任何设置**（引擎选择 / 智能体 / 路径都保持原样）
-#   -SkipModels            升级模式：不下载、不替换已有模型权重
+#   -PipIndex <url>        国内 pip 镜像（核心依赖由 runtime-core 提供，这里一般用不到）
+#   -SkipPip               只装设置/智能体、不装 pip 依赖
+#   -KeepSettings          升级模式：**不写任何设置**（智能体 / 路径都保持原样）
+#   -SkipModels            升级模式：历史兼容（客户端已没有模型可跳过）
 #   -UpgradeDsh            升级模式：用户同意了才升级 DSH 标准版（走 helper 的 -Upgrade）
-#   -WaitSeconds <秒>      等模型下载的上限（默认 1800）
+#   -WaitSeconds <秒>      历史兼容参数（客户端不再下载模型）
+#
 #
 # 编码：含中文，所以**必须 UTF-8 带 BOM**（WinPS 5.1 对无 BOM 的 .ps1 按 ANSI 读，
 #       中文会乱码甚至静默解析失败）—— 见 tests/test_script_encoding.py。
 # =====================================================================
 param(
     [Parameter(Mandatory = $true)][string]$DestDir,
-    [string[]]$Engines = @('sherpa'),
+    [string[]]$Engines = @(),
     [switch]$Wake,
     [switch]$Diarize,
     [switch]$AccelCuda,
     [string]$Agent = 'harness',
+    # 2026-10-31：官方 DeepSeek Harness 桌面端自带 Node + dsh CLI，可以完全跳过 npm/Node。
+    # auto   = 先用已装的官方桌面端（或已有 DSH），都没有再联网下载官方桌面端；
+    # desktop= 没有就下载官方桌面端（仍失败才回退 npm）；
+    # npm    = 保持 2026-10-31 之前的行为（本地 npm 永久安装）。
+    [string]$HarnessSource = 'auto',
+    [string]$DesktopInstallDir = '',
+    [switch]$Offline,
     [string]$DshVersion = '',
     [switch]$PinHarnessCommand,
     [string]$DshDir = '',
@@ -112,37 +108,10 @@ function Warn([string]$m) { Write-Host "  [warn] $m" -ForegroundColor Yellow; Lo
 function Err([string]$m)  { Write-Host "  [fail] $m" -ForegroundColor Red; LogLine "[fail] $m" }
 function Step([string]$m) { Write-Host ''; Write-Host "== $m" -ForegroundColor Cyan; LogLine "== $m" }
 
-# 引擎 → (pip 依赖 / 要下的 model_id / 写进 sttModel 的值)
-# 依据：app/audio/stt.py 的 _parse_choice()（sttModel 取值 = sherpa|sensevoice|qwen3asr|whisper 档名）
-#       与 app/components.py 的清单（model_id / 体积 / 来源）。
-$ENGINE_MAP = @{
-    # ⚠️ 每个 STT 档都必须带**模型下载客户端**（modelscope 或 huggingface-hub 之一）：
-    # `app/modelinfo._snapshot()` 是"先 ModelScope、失败再 HF"，一个都没有就必然下不到模型。
-    # sherpa 档原来只装 sherpa-onnx —— 而默认档恰好是第一个"只有 sherpa"的档位
-    # （whisper-* 顺带带 hf-hub、sensevoice/qwen3asr 顺带带 modelscope），于是全新机器
-    # 默认档必然卡在"模型下不下来"（同事 2026-09-25 实测报告 §4.1 B）。
-    # 这条由 tests/test_install_entry.py 的 DownloadClientTests 守着，别再漏。
-    'sherpa'           = @{ pip = @('sherpa-onnx', 'modelscope');         model = 'sherpa';           stt = 'sherpa';   module = 'sherpa_onnx' }
-    # 2026-10-08：指令转写的**默认**引擎。pip 只要 sherpa-onnx（**不要 torch/funasr**）——
-    # 这正是它的意义：复用已必装的 sherpa_onnx，客户端零新增依赖，模型只有 228 MB 的 int8 ONNX。
-    'sensevoice-onnx'  = @{ pip = @('sherpa-onnx', 'modelscope');         model = 'sensevoice-onnx';  stt = 'sensevoice-onnx'; module = 'sherpa_onnx' }
-    'whisper-tiny'     = @{ pip = @('faster-whisper', 'huggingface-hub'); model = 'whisper-tiny';     stt = 'tiny';     module = 'faster_whisper' }
-    'whisper-base'     = @{ pip = @('faster-whisper', 'huggingface-hub'); model = 'whisper-base';     stt = 'base';     module = 'faster_whisper' }
-    'whisper-small'    = @{ pip = @('faster-whisper', 'huggingface-hub'); model = 'whisper-small';    stt = 'small';    module = 'faster_whisper' }
-    'whisper-medium'   = @{ pip = @('faster-whisper', 'huggingface-hub'); model = 'whisper-medium';   stt = 'medium';   module = 'faster_whisper' }
-    'whisper-large-v3' = @{ pip = @('faster-whisper', 'huggingface-hub'); model = 'whisper-large-v3'; stt = 'large-v3'; module = 'faster_whisper' }
-    # 会议转写（app/meeting.py）对文本优先引擎要先拿 whisper-small 当时间戳骨架：
-    #   * sensevoice 自己**没有时间戳** -> 骨架是必需的（skeleton = $true）
-    #   * qwen3asr 有 ForcedAligner 原生时间戳，whisper 只是回退 -> 不硬性要求
-    'sensevoice'       = @{ pip = @('funasr', 'modelscope', 'torch');     model = 'sensevoice';       stt = 'sensevoice'; module = 'funasr';    skeleton = $true }
-    # qwen3asr 的正解是 scripts/install-qwen3asr.ps1（qwen-asr==0.0.6 + transformers==4.57.6
-    # + accelerate==1.12.0，见 app/audio/stt.py 的 _get_qwen3asr 文档）。
-    # **transformers 必须钉在 4.57.6**：装成 5.x 时 qwen-asr 0.0.6 直接 import 不了；
-    # module 也必须是 qwen_asr —— 原来写 'transformers' 会让自检在引擎根本跑不起来时
-    # 照样判"已就绪"（2026-09-23 实测：新装的 2.0 会议转写报
-    # `RuntimeError: qwen-asr package is required for Qwen3-ASR`，而组件自检全绿）。
-    'qwen3asr'         = @{ pip = @('qwen-asr==0.0.6', 'transformers==4.57.6', 'accelerate==1.12.0', 'modelscope', 'torch'); model = 'qwen3asr'; stt = 'qwen3asr'; module = 'qwen_asr' }
-}
+# 2026-10-31 用户拍板：客户端默认档不装任何本地 STT 模型/引擎，语音唤醒取消。
+# 指令 / 回顾 / 会议转写统一走能力后端（echo-server + Qwen3-ASR）。
+# 保留 `$ENGINE_MAP` 这个名字（空表）只为让历史调用方/测试能读到"没有本地引擎"。
+$ENGINE_MAP = @{}
 
 # ---------------------------------------------------------------- 运行时 / 端口 / API
 
@@ -225,85 +194,14 @@ function Install-PipDeps([string[]]$Packages) {
     else { Warn ("pip 返回 $code —— 依赖可能没装全；模型仍会尝试下载") }
 }
 
-# ---------------------------------------------------------------- 模型
-
-function Get-ModelState([string]$Id) {
-    try {
-        $models = Invoke-Api -Path '/api/models'
-        foreach ($it in $models.items) { if ($it.id -eq $Id) { return $it } }
-    } catch { }
-    return $null
-}
-
-function Get-JobState($job) {
-    # 归一化下载状态。**别自己比对字面量**：worker 失败时写的是 "failed"，而这里原来判断
-    # 的是 "error" —— 于是"下载失败"被显示成"排队中"、等待逻辑一直傻等到超时
-    # （2026-09-21 同事实测：qwen3asr 下载失败，面板一直显示"正在准备中/排队中"）。
-    $s = ""
-    if ($job) { $s = ("$($job.status)").Trim().ToLower() }
-    switch ($s) {
-        'done'    { return 'done' }
-        'failed'  { return 'failed' }
-        'error'   { return 'failed' }
-        'fail'    { return 'failed' }
-        'running' { return 'running' }
-        default   { return 'queued' }
-    }
-}
-
-function Wait-Model([string]$Id) {
-    $deadline = (Get-Date).AddSeconds($WaitSeconds)
-    while ((Get-Date) -lt $deadline) {
-        try {
-            # `/api/models` 的形状是 `{active: [...], items: {<id>: {...}}}` —— **任务在 items 里**。
-            # 同事实测报告 §4.2 C：这里原来读 `$jobs.$Id`（少一层 items），于是 `$job` 恒为 null
-            # → 状态归一成 `queued` → 一直空等到 `-WaitSeconds`（默认 1800 秒）超时；
-            # 症状是"脚本卡住了"，其实是白等半小时。`Get-ModelState` 读的就是 items，两边一致。
-            $jobs = (Invoke-Api -Path '/api/models').items
-            $job = $null
-            if ($jobs -and $jobs.PSObject.Properties.Name -contains $Id) { $job = $jobs.$Id }
-            $state = Get-JobState $job
-            if ($state -eq 'done') { return $true }
-            if ($state -eq 'failed') {
-                $why = "$($job.message)"; if (-not $why) { $why = "$($job.error)" }
-                Warn ("{0} 下载失败：{1}" -f $Id, $why)
-                return $false
-            }
-        } catch { }
-        Start-Sleep -Seconds 5
-    }
-    Warn ("等 {0} 超时（{1}s）—— 下载在服务里继续跑，稍后在面板看进度" -f $Id, $WaitSeconds)
-    return $false
-}
-
-function Install-Model([string]$Id, [string]$Label) {
-    $st = Get-ModelState $Id
-    if ($st -and $st.ready -eq $true) { Ok ("{0} 已经装好，跳过" -f $Label); return $true }
-    Step ("下载模型：{0}" -f $Label)
-    try { $r = Invoke-Api -Path '/api/models/download' -Method Post -Body @{ id = $Id } -TimeoutSec 30 }
-    catch { Err ("触发下载失败：{0}" -f $_.Exception.Message); return $false }
-    if (-not $r.ok) { Warn ("接口说：{0}" -f $r.message); return $false }
-    Say '下载中（走 ModelScope / hf-mirror 镜像）…'
-    return (Wait-Model $Id)
-}
-
-function Test-EngineModule([string]$Name) {
-    # 依赖到底装没装：**以 import 为准**。"pip 返回 0"不算数 —— 2026-09-21 踩过：
-    # uv 建的 venv 没有 pip，依赖一个都没装，安装器却打印了"安装完成"。
-    if (-not $Name) { return $true }
-    $prev = $ErrorActionPreference
-    $ErrorActionPreference = 'Continue'
-    try {
-        & $rcPy -c "import $Name" 2>&1 | Out-Null
-        return ($LASTEXITCODE -eq 0)
-    } catch { return $false }
-    finally { $ErrorActionPreference = $prev }
-}
+# ---------------------------------------------------------------- 模型（已取消）
+# 客户端不再下载/安装任何本地 STT 模型；这里不再有 Get-ModelState / Wait-Model /
+# Install-Model 这些函数（2026-10-31）。
 
 # ---------------------------------------------------------------- VC++ 运行库（原生扩展的前置）
 
 function Test-VCRuntime {
-    # Windows 上 torch / ctranslate2（faster-whisper）/ sherpa-onnx / onnxruntime 这些**原生扩展**
+    # Windows 上 numpy / soundfile 等**原生扩展**
     # 都要 Microsoft Visual C++ 2015-2022 运行库（x64）。干净镜像上常常没有，而报错只说
     # "DLL load failed while importing …: 找不到指定的模块" —— 2026-09-21 同事就卡在这一句上。
     # 官方检测点：注册表 14.0\VC\Runtimes\x64 的 Installed=1（14.0 = 2015 起合并的那一版）。
@@ -449,6 +347,25 @@ function Resolve-AutoDsh {
     }
 }
 
+function Resolve-OfficialDesktop {
+    # 2026-10-31：官方 DeepSeek Harness 桌面端自带无头 CLI（不需要系统 Node）。
+    # 直接探这两个确定位置，**不要**走 find-existing-dsh-auto 的"任意已有 DSH"列表 ——
+    # 那会把另一棵 ECHO 的本地 harness 认成"官方桌面端"。
+    $cands = @(
+        (Join-Path $env:LOCALAPPDATA 'Programs\DeepSeek Harness\resources\runtime\cli\bin\dsh.cmd'),
+        (Join-Path $env:ProgramFiles 'DeepSeek Harness\resources\runtime\cli\bin\dsh.cmd')
+    )
+    if (${env:ProgramFiles(x86)}) {
+        $cands += (Join-Path ${env:ProgramFiles(x86)} 'DeepSeek Harness\resources\runtime\cli\bin\dsh.cmd')
+    }
+    foreach ($c in $cands) {
+        if ($c -and (Test-Path -LiteralPath $c -PathType Leaf)) {
+            return Resolve-ExistingDsh $c
+        }
+    }
+    return $null
+}
+
 function Ask-ExistingDsh {
     # 只在 -AskDsh 且真有交互控制台时进来；无人值守/agent 默认不走这里。
     $interactive = $true
@@ -538,10 +455,70 @@ function Prepare-Agent {
     if ($probe -and $probe.ok) {
         $script:ExistingDsh = $true
         $script:HarnessCommand = [string]$probe.command
-        Ok ('使用已有 DSH：{0}' -f $probe.entry)
+        if ($probe.entry -match '(?i)dsh\.cmd$') {
+            Ok ('使用官方 DeepSeek Harness 桌面端自带的 dsh：{0}' -f $probe.entry)
+        } else {
+            Ok ('使用已有 DSH：{0}' -f $probe.entry)
+        }
         if ($probe.version) { Say ('  DSH 版本：{0}' -f $probe.version) }
         Say ('  启动命令：{0}' -f $script:HarnessCommand)
         return $true
+    }
+
+    # 2026-10-31：没有显式给目录时，先找"已经装好的官方桌面端"。
+    # 官方安装包自带 node + dsh，`resources\runtime\cli\bin\dsh.cmd` 就是无头 CLI；
+    # 用它等于跳过 Node/npm（用户要求：不把安装包塞进交付包，装的时候从官方地址下最新版）。
+    if (-not $probe -and $HarnessSource -ne 'npm') {
+        $official = Resolve-OfficialDesktop
+        if ($official -and $official.ok) { $probe = $official }
+    }
+    if ($probe -and $probe.ok) {
+        $script:ExistingDsh = $true
+        $script:HarnessCommand = [string]$probe.command
+        if ($probe.entry -match '(?i)dsh\.cmd$') {
+            Ok ('使用官方 DeepSeek Harness 桌面端自带的 dsh：{0}' -f $probe.entry)
+        } else {
+            Ok ('自动找到已有 DSH：{0}' -f $probe.entry)
+        }
+        if ($probe.version) { Say ('  DSH 版本：{0}' -f $probe.version) }
+        Say ('  启动命令：{0}' -f $script:HarnessCommand)
+        return $true
+    }
+
+    # 没有已装的官方桌面端：联网下载官方安装包并静默安装（从官方地址拿 latest，
+    # 所以 ECHO 的交付包里不需要放这个 277MB 的 exe，升级也只需重跑这一步）。
+    if ($HarnessSource -ne 'npm' -and -not $Offline -and -not $KeepSettings) {
+        $here = $PSScriptRoot
+        if (-not $here) { try { $here = Split-Path -Parent $PSCommandPath } catch { $here = '' } }
+        $desktopHelper = ''
+        if ($here) { $desktopHelper = Join-Path $here 'harness-install-desktop.ps1' }
+        if ($desktopHelper -and (Test-Path -LiteralPath $desktopHelper)) {
+            Step '下载并安装官方 DeepSeek Harness（自带 Node/dsh，跳过 npm）'
+            Say '  从 download.deepseek.com 下载最新版（约 277 MB），然后静默安装。'
+            $dargs = @('-LogFile', $script:InstallLog)
+            if ($DesktopInstallDir) { $dargs += @('-InstallDir', $DesktopInstallDir) }
+            if ($UpgradeDsh) { $dargs += '-Upgrade' }
+            $dout = @()
+            try { $dout = & $desktopHelper @dargs 2>&1 } catch {
+                Warn ('下载/安装官方桌面端失败：{0}' -f $_.Exception.Message)
+            }
+            $dline = @($dout | ForEach-Object { "$_" } | Where-Object { $_ -like 'HARNESS_COMMAND=*' } |
+                       Select-Object -Last 1)
+            if ($dline.Count -gt 0) {
+                $script:ExistingDsh = $true
+                $script:HarnessCommand = ([string]$dline[-1]).Substring('HARNESS_COMMAND='.Length)
+                $vline = @($dout | ForEach-Object { "$_" } | Where-Object { $_ -like 'DSH_VERSION=*' } |
+                           Select-Object -Last 1)
+                Ok '官方 DeepSeek Harness 已就绪（自带 dsh CLI）'
+                if ($vline.Count -gt 0) { Say ('  DSH 版本：{0}' -f ([string]$vline[-1]).Substring('DSH_VERSION='.Length)) }
+                Say ('  启动命令：{0}' -f $script:HarnessCommand)
+                return $true
+            }
+            Warn '官方桌面端没装成 —— 回退到本地 npm 安装'
+            if ($HarnessSource -eq 'desktop') { return $false }
+        } else {
+            Warn ('缺 harness-install-desktop.ps1（脚本目录 {0}）—— 回退到本地 npm 安装' -f $here)
+        }
     }
 
     Step '准备智能体（标准版 harness：本地永久安装）'
@@ -653,51 +630,20 @@ $rcPy = Get-RuntimePython
 if (-not $rcPy) { Err '找不到 runtime-core\python.exe —— 先跑 install.ps1'; exit 1 }
 Ok ("运行时：{0}" -f $rcPy)
 
-# 1) 依赖 + 模型
+# 1) 依赖 + 模型：**客户端已不再装本地 STT 引擎/模型**（2026-10-31）。
+#    核心依赖由 runtime-core（requirements-core.txt / bundle\wheels）提供，这里不追加任何引擎包。
 $pips = @()
 $models = @()
-$needSkeleton = $false
-foreach ($e in $Engines) {
-    if (-not $ENGINE_MAP.ContainsKey($e)) { Warn ("不认识这个引擎，跳过：{0}" -f $e); continue }
-    $m = $ENGINE_MAP[$e]
-    $pips += $m.pip
-    $models += , @($m.model, $e)
-    if ($m.skeleton) { $needSkeleton = $true }
-}
-# 会议时间戳骨架：缺了**不会报错**，只会安静地出一场空纪要（2026-09-23 实测）。
-if ($needSkeleton) {
-    $pips += 'faster-whisper'
-    if (-not ($models | Where-Object { $_[0] -eq 'whisper-small' })) {
-        $models += , @('whisper-small', '会议时间戳骨架 whisper-small')
-    }
-}
-if ($Wake) { $pips += 'sherpa-onnx'; $models += , @('kws', '唤醒词 KWS') }
-if ($Diarize) {
-    # 与 scripts/install_pyannote.py 的装法**逐字对齐**（那里是唯一的正解来源）。
-    # 关键：pyannote 4.x 的说话人嵌入走 speechbrain，只装 pyannote.audio 时分离要到
-    # **运行时**才报 "No module named 'speechbrain'"，而分离失败又会连累整场转写
-    # （见 app/meeting.py 的 _ensure_speaker_column；2026-09-23 实测）。
-    $pips += @('pyannote.audio>=4.0,<5', 'speechbrain>=1.0,<2', 'huggingface-hub>=0.34,<2', 'torch')
-    $models += , @('pyannote', '说话人分离（pyannote 三件套）')
-    Warn '说话人分离的权重走 ModelScope 同名镜像（官方在 HF 上要求先同意条款）—— 请自行确认合规'
-}
-if ($AccelCuda) { Warn 'CUDA 版 torch 体积大（约 2.5 GB），且要求 N 卡与匹配的驱动' }
-
-# 升级模式：**已有模型权重一个字节都不碰**（用户 2026-10-23 口径）。
-if ($SkipModels) {
-    Step '升级模式：不动已有模型权重'
-    Say '已有模型保持原样（不下载、不替换、不删）'
-    $models = @()
-    $needSkeleton = $false
+if (@($Engines).Count -gt 0 -or $Wake -or $Diarize -or $AccelCuda) {
+    Warn '客户端已不再安装本地 STT 引擎/唤醒/分离/CUDA 组件（转写全部走能力后端）——这些参数已忽略'
 }
 
-# VC++ 运行库先解决：torch / ctranslate2 / sherpa-onnx / onnxruntime 都依赖它，
-# 缺了会在**装完引擎之后**才以 "DLL load failed" 的形式炸（2026-09-21 同事卡在这）。
+# VC++ 运行库先解决：numpy/soundfile 等原生扩展仍需要它。
 Step '检查 VC++ 运行库（原生扩展的前置）'
 if (Test-VCRuntime) {
     Ok 'VC++ 2015-2022 运行库已就绪'
 } else {
-    Warn '缺 Microsoft Visual C++ 2015-2022 运行库（x64）—— 转写引擎的原生扩展都要它'
+    Warn '缺 Microsoft Visual C++ 2015-2022 运行库（x64）—— 音频 IO 的原生扩展需要它'
     if (Install-VCRuntime) {
         Ok 'VC++ 运行库已安装'
     } else {
@@ -707,44 +653,15 @@ if (Test-VCRuntime) {
     }
 }
 
-Install-PipDeps $pips
-
-# CUDA 版 torch 必须从 PyTorch 官方索引装：**PyPI 上的 Windows torch 是 CPU 版**。
-# 2026-09-23 实测：pip 从 PyPI 拿到 torch-2.14.0（wheel 仅 124 MB），
-# torch.cuda.is_available()=False —— 用户以为装了 GPU，其实一直在跑 CPU，
-# 而 -AccelCuda 原来只是往列表里加了个 'torch'，等于什么都没做。
-# 选 cu128：它是覆盖 50 系（sm_120）的第一个稳定档，且 torch\lib 自带 CUDA 12 的
-# cublas64_12.dll —— faster-whisper 的 ctranslate2 正需要它（换成 cu130 后只剩 _13，
-# whisper 时间戳骨架会以 "Library cublas64_12.dll is not found" 失败）。
-if ($AccelCuda) {
-    $torchIndex = if ($TorchIndex) { $TorchIndex } else { 'https://download.pytorch.org/whl/cu128' }
-    Warn ("CUDA 版 torch：从官方索引重装（{0}）" -f $torchIndex)
-    Install-PipDeps @('torch', 'torchaudio') -PipIndex $torchIndex
-}
 $null = Prepare-Agent          # 先把 npm 包预热好，免得写入设置后 ECHO 拉起时干等
 Ensure-Service
 
-# 依赖没装上的引擎**不要白下模型**：装了也跑不起来，还会在自检里变成一条含糊的失败
-$skipModel = @{}
-foreach ($pair in $models) {
-    if (-not $ENGINE_MAP.ContainsKey($pair[1])) { continue }
-    $mod = $ENGINE_MAP[$pair[1]].module
-    if ($mod -and -not (Test-EngineModule $mod)) {
-        Warn ("跳过 {0} 的模型下载：依赖 {1} 没装上（先解决依赖）" -f $pair[1], $mod)
-        $skipModel[$pair[0]] = $true
-    }
-}
-
-$modelOk = @{}
-foreach ($pair in $models) {
-    if ($skipModel.ContainsKey($pair[0])) { $modelOk[$pair[0]] = $false; continue }
-    $modelOk[$pair[0]] = Install-Model $pair[0] $pair[1]
-}
+# 2026-10-31：客户端不装本地模型 —— 没有"跳过缺依赖引擎的模型下载"这一段。
 
 # 2) 写设置（与面板同一套键）
 if ($KeepSettings) {
     Step '写入设置（升级模式：一个设置项都不改）'
-    Say 'sttModel / meetingSttModel / 智能体 / 路径 / 唤醒词：全部保持原样'
+    Say '智能体 / 路径：全部保持原样（客户端已无本地 STT 引擎/模型）'
 } else {
 Step '写入设置'
 $values = @{}
@@ -753,19 +670,8 @@ $values = @{}
 # `a,b` 当成**一个字符串**（-File 不做数组解析）→ `$ENGINE_MAP['a,b']` 是 $null →
 # `$first.stt` 也是 $null → **把用户原有的 sttModel / meetingSttModel 覆盖成 null**，
 # 而且引擎依赖（funasr/transformers）也被静默跳过。宁可不动设置，也不能写空值。
-$knownEngines = @($Engines | Where-Object { $ENGINE_MAP.ContainsKey($_) })
-if ($Engines.Count -gt 0 -and $knownEngines.Count -eq 0) {
-    Warn ("没有可识别的引擎（{0}）—— 跳过 sttModel / meetingSttModel，现有设置保持不动。" -f ($Engines -join ', '))
-    Warn "  提示：用 -File 调用时不要用逗号分隔多个引擎（会被当成一个名字），改用 & 脚本.ps1 -Engines a,b"
-}
-if ($knownEngines.Count -gt 0) {
-    $first = $ENGINE_MAP[$knownEngines[0]]
-    $values['sttModel'] = $first.stt
-    # 会议通常要更准：选里有 whisper 档就用它
-    $whisper = $knownEngines | Where-Object { $_ -like 'whisper-*' } | Select-Object -First 1
-    $values['meetingSttModel'] = if ($whisper) { $ENGINE_MAP[$whisper].stt } else { $first.stt }
-}
-if ($Wake) { $values['wakeEnabled'] = $true }
+# 2026-10-31：客户端不再使用本地转写引擎 —— 不写 sttModel / meetingSttModel / wakeEnabled。
+# 老库里残留的值不影响任何决策（Lead 已把设置项与调用方改成全后端口径）。
 if ($ModelsDir) { $values['modelsDir'] = $ModelsDir }
 if ($MeetingsDir) { $values['meetingsDir'] = $MeetingsDir }
 if ($NotesDir) { $values['worklogVaultRoot'] = $NotesDir; $values['worklogEnabled'] = $true }
@@ -809,65 +715,7 @@ try {
         Say ("{0,-9} {1}" -f $c.name, $c.status)
     }
 } catch { Warn ("取 /api/status 失败：{0}" -f $_.Exception.Message) }
-foreach ($e in $Engines) {
-    if (-not $ENGINE_MAP.ContainsKey($e)) { continue }
-    $mod = $ENGINE_MAP[$e].module
-    $imp = Get-ImportFailure $mod
-    if ($imp.ok) {
-        Ok ("{0,-18} import {1} 通过" -f $e, $mod)
-    } elseif (Test-DllLoadFailure $imp.text) {
-        # 包在、但原生 DLL 加载不了 —— 几乎都是缺 VC++ 运行库。给可操作的一句话，别丢原始堆栈。
-        Err ("{0,-18} 缺系统 DLL（多半是 VC++ 运行库）：import {1} 失败" -f $e, $mod)
-        Say '      装这个后重跑本脚本： https://aka.ms/vs/17/release/vc_redist.x64.exe'
-        $failed += $e
-    } else {
-        Err ("{0,-18} 依赖缺失：import {1} 失败" -f $e, $mod)
-        $firstLine = ($imp.text -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -Last 1)
-        if ($firstLine) { Say ("      {0}" -f $firstLine.Trim()) }
-        $failed += $e
-    }
-}
-# 会议骨架也要查：sensevoice 没有时间戳，faster-whisper 装不上时会议不会报错，
-# 只会写一场"（未检测到有效语音）"的空纪要 —— 必须在自检里挑明。
-if ($needSkeleton) {
-    $impSk = Get-ImportFailure 'faster_whisper'
-    if ($impSk.ok) {
-        Ok ("{0,-18} import {1} 通过" -f '会议骨架', 'faster_whisper')
-    } elseif (Test-DllLoadFailure $impSk.text) {
-        Err ("{0,-18} 缺系统 DLL（多半是 VC++ 运行库）：import {1} 失败" -f '会议骨架', 'faster_whisper')
-        Say '      装这个后重跑本脚本： https://aka.ms/vs/17/release/vc_redist.x64.exe'
-        $failed += '会议时间戳骨架（faster-whisper）'
-    } else {
-        Err ("{0,-18} 依赖缺失：import {1} 失败（会议会出一场空纪要）" -f '会议骨架', 'faster_whisper')
-        $firstLine = ($impSk.text -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -Last 1)
-        if ($firstLine) { Say ("      {0}" -f $firstLine.Trim()) }
-        $failed += '会议时间戳骨架（faster-whisper）'
-    }
-}
-foreach ($pair in $models) {
-    $st2 = Get-ModelState $pair[0]
-    if ($st2 -and $st2.ready -eq $true) { Ok ("{0,-18} 模型就绪" -f $pair[1]) }
-    else { Err ("{0,-18} 模型还没好" -f $pair[1]); $failed += ("%s 模型" -f $pair[1]) }
-}
-# -AccelCuda 的成色要**实测**：装完看 cuda.is_available()，别信"pip 返回 0"。
-# 这是"以为有 GPU 其实在跑 CPU"的唯一可靠判据（2026-09-23 实测踩到）。
-if ($AccelCuda) {
-    $cudaState = ''
-    $prev = $ErrorActionPreference
-    $ErrorActionPreference = 'Continue'
-    try {
-        $cudaState = (& $rcPy -c "import torch;print('GPU' if torch.cuda.is_available() else 'CPU')" 2>&1 | Out-String)
-    } catch { $cudaState = "$($_.Exception.Message)" }
-    finally { $ErrorActionPreference = $prev }
-    if ($cudaState -match 'GPU') {
-        Ok 'torch 已启用 GPU（cuda.is_available() = True）'
-    } else {
-        Err 'torch 装了但 cuda.is_available() = False —— 仍在跑 CPU'
-        Say '      多半是装到了 PyPI 的 CPU 版；用官方索引重装：'
-        Say ('      "{0}" -m pip install --force-reinstall torch torchaudio --index-url https://download.pytorch.org/whl/cu128' -f $rcPy)
-        $failed += 'CUDA（torch 未启用 GPU）'
-    }
-}
+# 2026-10-31：客户端没有本地 STT 引擎/骨架/模型可自检 —— 转写链路由能力后端负责。
 $agentOk = Wait-Harness
 if (-not $agentOk) { $failed += '智能体（harness）' }
 
@@ -906,12 +754,12 @@ $report = @{
     installer = 'echo-install skill'
     platform  = 'win32'
     destDir   = $script:Root
-    engines   = @($Engines)
-    wake      = [bool]$Wake
-    diarize   = [bool]$Diarize
-    accelCuda = [bool]$AccelCuda
+    engines   = @()
+    wake      = $false
+    diarize   = $false
+    accelCuda = $false
     agent     = $Agent
-    models    = @($models | ForEach-Object { $_[0] })
+    models    = @()
     dirs      = @{ modelsDir = $ModelsDir; meetingsDir = $MeetingsDir; notesDir = $NotesDir }
     pip       = ($pips -join ' ')
 }

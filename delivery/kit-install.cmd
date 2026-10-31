@@ -33,8 +33,11 @@ REM  any of the two, the installer just says where to put it later.
 REM
 REM  * bundle\ present  -> the Python runtime, the dependencies and the
 REM    model all come out of the kit: nothing is downloaded for them.
-REM    The DSH standard edition (the agent) still comes from npm, which
-REM    is the one download that is allowed.
+REM    The DSH agent: ECHO first looks for an already installed official
+REM    DeepSeek Harness desktop (its bundled dsh CLI needs no Node/npm).
+REM    If absent, it downloads the official Windows installer (latest,
+REM    ~277 MB) and installs it silently. Only if that fails does it fall
+REM    back to the old node/npm install.
 REM  * no bundle\       -> runtime, dependencies and model come from the
 REM    internet (python.org / PyPI mirrors / ModelScope).
 REM
@@ -137,8 +140,9 @@ if exist "%KIT%bundle\wheels" (
   set "ARGS=%ARGS% -Offline"
   echo.
   echo   bundle\ found - installing offline: the runtime, the dependencies
-  echo   and the model come from this kit. The only thing fetched from the
-  echo   network is the DSH standard edition.
+  echo   and the model come from this kit. The agent needs an already
+  echo   installed official DeepSeek Harness desktop; otherwise ECHO falls
+  echo   back to npm (which needs a network connection).
 ) else (
   echo.
   echo   no bundle\ here - runtime, dependencies and model come from the
@@ -147,6 +151,8 @@ if exist "%KIT%bundle\wheels" (
 echo.
 echo   Folder : %ROOT%
 echo   This takes a few minutes; the panel address is printed at the end.
+echo   The agent: an already installed DeepSeek Harness desktop is reused;
+echo   otherwise its official Windows installer (~277 MB) is downloaded.
 echo   At the end it also asks how the BACKEND (GPU transcription) is
 echo   reached: paste a pairing string, or run it on this machine.
 echo.

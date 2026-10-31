@@ -77,6 +77,20 @@ class ListenFlowTest {
     }
 
     @Test
+    fun `409 与 503 是忙不是坏`(): Unit = runBlocking {
+        // 2026-10-31：指令全走能力后端且同一人的请求串行 —— 409 client_busy 会真实出现。
+        json("""{"detail":"我这边正忙着上一件事，等它完了再说一次。"}""", code = 409)
+        var out = flow().submit(wav)
+        assertTrue("409 必须单独判为 Busy：$out", out is ListenFlow.Outcome.Busy)
+        assertTrue((out as ListenFlow.Outcome.Busy).message.contains("忙"))
+
+        json("""{"detail":"能力后端这会儿不可用：检查配对/网络。"}""", code = 503)
+        out = flow().submit(wav)
+        assertTrue("503 也是稍后再试，不是失败：$out", out is ListenFlow.Outcome.Busy)
+        assertTrue((out as ListenFlow.Outcome.Busy).message.contains("后端"))
+    }
+
+    @Test
     fun `连不上说的是连不上`(): Unit = runBlocking {
         server.shutdown()
         val out = flow().submit(wav)

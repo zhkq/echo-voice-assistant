@@ -63,6 +63,12 @@ Add-Cand (Join-Path $env:ProgramFiles 'DeepSeek Harness')
 Add-Cand (Join-Path $env:LOCALAPPDATA 'Programs\DeepSeek Harness')
 Add-Cand (Join-Path $env:LOCALAPPDATA 'Programs\DeepSeek Harness\resources\app.asar\dsh')
 
+# Official DeepSeek Harness desktop (2026-10-31): ships a headless dsh CLI at
+# resources\runtime\cli\bin\dsh.cmd. Prefer the shim directly: it needs no
+# system Node.js and is what `Prepare-Agent` writes into harnessCommand.
+Add-Cand (Join-Path $env:LOCALAPPDATA 'Programs\DeepSeek Harness\resources\runtime\cli\bin\dsh.cmd')
+Add-Cand (Join-Path $env:ProgramFiles 'DeepSeek Harness\resources\runtime\cli\bin\dsh.cmd')
+
 # Global npm roots (node.exe may be bundled, so also the nodejs dir).
 Add-Cand (Join-Path $env:APPDATA 'npm\node_modules\@deepseek-ai\dsh')
 Add-Cand (Join-Path $env:LOCALAPPDATA 'npm\node_modules\@deepseek-ai\dsh')

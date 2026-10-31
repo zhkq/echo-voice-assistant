@@ -52,7 +52,8 @@ def _open_input(device_id=-1, blocksize=0):
     默认输入用 device=None 交给 PortAudio 选，**不要**用 sd.default.device
     的下标硬取：该 pair 是 (输入, 输出)，早期代码误取 [1]（输出设备）当输入，
     还会把真正的默认输入排除掉，于是去开虚拟/接力设备（Oray、iPhone 麦克风），
-    在 macOS 上可能把 CoreAudio HAL 卡死。见 app/audio/wake.py 同样结论。
+    在 macOS 上可能把 CoreAudio HAL 卡死。原唤醒监听（`app/audio/wake.py`，已于
+    2026-10-31 随语音唤醒一起删除）当年也得出了同样结论。
 
     兜底遍历会跳过虚拟/映射/回环设备（见 _VIRTUAL_HINTS）：issue #15 就是被这类设备
     卡死的；显式指定与系统默认两条路径不跳过（尊重用户/系统的选择）。

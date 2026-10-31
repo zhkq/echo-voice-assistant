@@ -76,7 +76,7 @@ REASON_PRIORITY: Tuple[str, ...] = (
 
 #: 默认优先级（`auto` 时用）。顺序 = 质量与可控性的折中：
 #:   ECHO 后端（可控、有向量空间） → 本机（只剩指令链路会走到） → 网络服务商（不可控）
-#: 注意 `wake` 与**指令**链路不走这张表（L3 把它钉在本机）。
+#: 注意**指令**链路不走这张表（L3 由 `_order_for` 单独把它钉在本机）。
 #:
 #: ⚠️ **会议链路的槽里没有本机**（`docs/能力路由-三后端与轻客户端.md` §5.1，
 #: 2026-09-23 的决定；2026-09-29 进一步把"本机"从 `local.py` 的声明里删掉）：
@@ -92,7 +92,6 @@ DEFAULT_ORDER: Dict[str, Tuple[str, ...]] = {
     "asr.text": (BACKEND_ECHO_SERVER, BACKEND_ASR_PROVIDER),
     "asr.timestamps": (BACKEND_ECHO_SERVER,),
     "asr.streaming": (BACKEND_LOCAL,),          # 流式是"边说边出"，只有本机做得到
-    "wake": (BACKEND_LOCAL,),                   # 铁律 L3
     # 说话人这一家子：ECHO 后端**唯一**（§5.1「diarize.* / speaker.embed：ECHO 后端（唯一）」）。
     # `diarize.turn_embeddings` 本来就只有它 —— 那条是从一开始就没打算兜底的。
     "diarize.turns": (BACKEND_ECHO_SERVER,),

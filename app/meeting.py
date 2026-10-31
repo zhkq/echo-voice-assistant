@@ -241,6 +241,49 @@ def transcribe_is_orphan(meeting_name):
     return _db_says_transcribing(name)
 
 
+def transcribing_any():
+    """本进程里此刻是否有**任何一场**会议在转写（语音指令/回顾据此报忙碌）。
+
+    会议转写是后台线程（`_live_transcribes`），用户看不到"转写中"也不该在这时
+    再插一段语音指令 —— 那会撞后端每客户端 1 路的 409（2026-10-31 口径）。
+    """
+    with _retranscribing["lock"]:
+        return bool(_live_transcribes)
+
+
+def voice_busy_reason():
+    """此刻不能开语音指令/回顾的原因；空串 = 可以。
+
+    用户口径（2026-10-31）：**会议、指令、回顾不能同时进行**，本人已有请求在跑
+    就报忙碌。判据 = 会议在录音/收段（`_state["active"]`）或任何一场会议在转写。
+    只读、无副作用（助手/面板/API 都调它）。
+    """
+    try:
+        if _state["active"]:
+            return "会议录音进行中，先等它结束。"
+    except Exception:
+        pass
+    if transcribing_any():
+        return "会议正在转写，等它完了再说。"
+    return ""
+
+
+def _wait_voice_idle(timeout=20.0):
+    """会议开始往后端发请求前，等**正在收音/转写的那一句指令**先过去。
+
+    为什么值得等：能力后端每客户端硬性 1 路 —— 指令 409 `client_busy` 会让
+    这场会议被误判成"转写失败"，而这只是一两秒的事。超过 `timeout` 就不再等
+    （指令可能卡住；会议自己失败会如实报原因，比无限阻塞好）。
+    """
+    try:
+        from app import assistant as _assistant
+        deadline = time.time() + max(0.0, float(timeout))
+        while _assistant.voice_api_busy() and time.time() < deadline:
+            time.sleep(0.1)
+    except Exception:
+        pass
+
+
 # ---------------------------------------------------------------- 音频压缩
 # 历史会议的音频段（`01.wav`…）**无损**压成 FLAC（`01.flac`，省约一半磁盘）。
 # 详见 `app/audio/audiofile.py` 的模块注释，以及本文件 `compress_meetings()`。
@@ -970,6 +1013,13 @@ def start_meeting_phone(origin=ORIGIN_PC):
     别把"这条路通常是手机用的"当成判据。
     """
     with _state_lock:
+        # 2026-10-31：回顾在跑时不许开会议（会议、指令、回顾三者互斥）。
+        try:
+            from app import assistant as _assistant_guard2
+            if _assistant_guard2.review_running():
+                return False, "回顾正在进行中，先结束回顾再开始会议"
+        except Exception:
+            pass
         if _state["active"]:
             return False, "会议录音已在进行中"
         folder, meta = _new_meeting_folder_and_meta(settings, origin=origin)
@@ -1776,6 +1826,14 @@ def start_meeting(origin=ORIGIN_PC):
     判据由 api 层按"谁调的接口"（带中继标记 = 手机）算好传进来，这里**不猜**。
     """
     with _state_lock:
+        # 2026-10-31：会议、指令、回顾三者互斥 —— 回顾（占着麦、长期 busy）在跑时
+        # 不许再开一场会议；语音指令那条路由 `assistant.capture` 自己报忙碌。
+        try:
+            from app import assistant as _assistant_guard
+            if _assistant_guard.review_running():
+                return False, "回顾正在进行中，先结束回顾再开始会议"
+        except Exception:
+            pass
         # **仅上传 ≠ 在录音**（2026-10-20 真机）：占着 `_state` 的若是手机那场"已录完、
         # 只剩收段"的补传（盘上 `meta["uploading"]` 为真、没有 `end`，见
         # `_uploading_meeting_for` / `_active_is_upload_only`），它**不该挡住**电脑开一场
@@ -2382,6 +2440,8 @@ def _transcribe_meeting(folder):
     with _retranscribing["lock"]:
         _live_transcribes.add(name)
     try:
+        # 先让正在收音/转写的一句指令过去（后端每客户端 1 路，见 `_wait_voice_idle`）。
+        _wait_voice_idle()
         status = _transcribe_impl(folder)
         if mid:
             _clear_progress(mid)

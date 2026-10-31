@@ -341,6 +341,20 @@ id, ts, source, text, status, session_id, reply, brief, duration_ms, error, meta
 只有语音那条路 `/assistant/voice-command` 才回 `commandId`（阶段4 用得上）。
 所以现在发完是直接刷新 `GET /api/commands` 列表来观察落库与执行状态。
 
+### 忙碌（409/503）的手机侧口径（2026-10-31）
+
+客户端不再有本地转写，指令/回顾/会议转写全走能力后端，而且**同一个人的请求串行**：
+
+- 服务端回 **409 `client_busy`**（自己上一条还没跑完）或 **503 `server_busy`/`model_loading`**
+  （后端忙/还在加载）时，手机**不重试、不静默**，统一按「忙，稍后再试」处理；
+- 指令页（`MainViewModel`）：`SubmitPhase.Busy` 显示 **“忙（稍后再试）”**（黄色，不是“未完成”），
+  语音触发的会**念出来**；等它过去后可以直接再发一条；
+- 常驻听写（`ListenFlow`）：`Outcome.Busy` 与 422/502/网络失败分开；通知 + **TTS 念出来**，
+  然后继续听下一句；
+- 回顾一轮（`/api/daily-review/turn`）是 `200 + ok=false`，直接念服务端给的 `spoken`；
+  旧「一次性口述」走 `/api/stt/transcribe`，409/503 也会念。
+- 判据：`ListenFlowTest`（409/503 → Busy、422/502 仍是 Failed）、`SendRoundTest`（Busy 文案/不再挡住发送）。
+
 ---
 
 ## 6. 验证到什么程度

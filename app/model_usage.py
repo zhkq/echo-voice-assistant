@@ -1,85 +1,39 @@
 # -*- coding: utf-8 -*-
-"""model_usage.py — 本地模型的「用没用过」账本 + 「在用」判据（清理功能的地基）。
+"""model_usage.py — 本地模型「用没用过」账本（**客户端已无本地模型**）
 
-为什么要单独一个模块（2026-09-26）
-==================================
+## 2026-10-31 用户拍板
 
-用户要求"近期没再使用的模型就清掉"，但库里 `last_used_at` **只存在于**
-`api_keys` / `dsh_sessions` / `meeting_sessions`，模型一个都没有 —— 于是当时的判据
-只能退化成"看文件修改时间"，那不是判据，是猜：拷进来一次 mtime 就是新的，
-系统迁移/杀毒软件扫一遍也可能把它改掉。清理要动手删 GB 级的东西，**不许靠猜**。
+客户端默认档不再装任何本地 STT 模型/引擎，指令/回顾/会议转写统一走能力后端。
+所以这里只剩**兼容层**：
 
-所以这里做两件事：
+* `known_ids()` / `in_use_ids()` 返回空（清理页据此不再给出任何建议）；
+* `note_used()` / `note_engine_used()` / `pin()` / `forget()` 保留签名与落库行为，
+  由历史引擎路径或测试调用；没有本地模型时不会有人调到它们；
+* `usage_map()` / `usage_of()` 仍可读库（老账本行不影响任何决策）。
 
-1. **记**：`note_used()` —— 模型真的被加载/调用时写一行（次数 +1、上次使用时间更新）。
-   落点 `data/echo.db` 的 `model_usage` 表（schema v7，见 `app/db.py`），**不出网**。
-   记录粒度 = `/api/models` 的 item id（`whisper-small` / `qwen3asr` / `sensevoice` /
-   `sherpa` / `pyannote` / `kws`），与面板上那一行一一对应。
-2. **说**：`in_use_ids()` —— "现在谁在用"。判据只有两处来源：**当前配置选中的引擎**
-   与**本进程真的加载了的引擎**。清理建议必须拿它做保护（`app/model_cleanup.py`）。
-
-纪律
-----
-
-* **绝不影响主链路**：所有写入都吞异常（账本写不进去也不该让一次转写失败）；
-* **只在真的用时写**：列清单、探就绪、量占用都**不算**使用 —— 否则"刚下载没用的模型"
-  会立刻被记成"刚用过"，清理建议就永远空转；
-* `ENABLED` 是给测试的闸：`tests/__init__.py` 会把它关掉（用例会往"碰巧配着的那个库"
-  里写真实使用记录，那是污染用户数据）。要验证账本的用例自己再打开它。
+清理/统计的真实口径在能力后端那侧（`server/engines.py` 的模型清单），不在客户端。
 """
 from __future__ import annotations
 
 from typing import Dict, List, Optional
 
-#: 账本总闸。测试包在导入时关掉（见模块文档最后一条），生产路径不动它。
+#: 账本总闸。测试包在导入时关掉（见 `tests/__init__.py`），生产路径不动它。
 ENABLED = True
-
-#: 设置里的引擎值 → `/api/models` 的 item id（非 whisper 引擎是 1:1）。
-#: 2026-10-27 补上 `sensevoice-onnx`：出厂默认 `sttModel` 就是它，但这里漏了映射，
-#: 于是账本永远记 0 次、`in_use_ids()` 也不算它在用 —— 清理建议可能把**正在用的默认模型**
-#: 列为可删（用户实际转写用的就是它）。
-ENGINE_MODEL_IDS = {"sensevoice": "sensevoice", "sensevoice-onnx": "sensevoice-onnx",
-                    "sherpa": "sherpa", "qwen3asr": "qwen3asr"}
-
-#: 与 `app/modelinfo.py` 的 whisper 档位（CATALOG 里逐档生成）同一份口径。
-WHISPER_TIERS = ("tiny", "base", "small", "medium", "large", "large-v3")
-
-
-def model_id_for_engine(engine_name: str, model_name: str = "") -> str:
-    """引擎名 + 模型名 → item id（认不出来返回空串，调用方据此不记）。
-
-    两个入口都要它：`stt.transcribe_ex()` 拿到的是 (engine, model) 对，
-    而设置里存的是**单个值**（`sttModel`），由 `engine_model_id()` 折算 —— 两个函数
-    共用同一张表，所以不会出现"设置说 whisper-small、账本记成 whisper"。
-    """
-    eng = str(engine_name or "").strip().lower()
-    if eng in ENGINE_MODEL_IDS:
-        return ENGINE_MODEL_IDS[eng]
-    name = str(model_name or "").strip()
-    if name == "large":                      # stt.MODEL_ALIASES 的同一条折算
-        name = "large-v3"
-    if name in WHISPER_TIERS:
-        return "whisper-" + name
-    return ""
-
-
-def engine_model_id(value) -> str:
-    """设置值（`sttModel` / `meetingSttModel`）→ item id。"""
-    v = str(value or "").strip().lower()
-    if v in ENGINE_MODEL_IDS:
-        return ENGINE_MODEL_IDS[v]
-    if v.startswith("qwen/") or v in ("0.6b", "1.7b"):
-        return "qwen3asr"
-    if v == "large":                         # stt.MODEL_ALIASES 的同一条折算
-        v = "large-v3"
-    if v in WHISPER_TIERS:
-        return "whisper-" + v
-    return ""
 
 
 def _db():
     from app import db
     return db
+
+
+def model_id_for_engine(engine_name: str, model_name: str = "") -> str:
+    """客户端已无本地模型 → 认不出任何引擎（返回空串，调用方据此不记）。"""
+    return ""
+
+
+def engine_model_id(value) -> str:
+    """设置值 → 模型 id：客户端已无本地模型 → 空串。"""
+    return ""
 
 
 def note_used(model_id: str, when: Optional[str] = None) -> bool:
@@ -97,7 +51,7 @@ def note_used(model_id: str, when: Optional[str] = None) -> bool:
 
 def note_engine_used(engine_name: str, model_name: str = "",
                      when: Optional[str] = None) -> bool:
-    """按 (engine, model) 记一次使用（`stt` / `capabilities.local` 那条路用它）。"""
+    """按 (engine, model) 记一次使用；客户端已无本地引擎 → 永远不记。"""
     return note_used(model_id_for_engine(engine_name, model_name), when=when)
 
 
@@ -119,14 +73,13 @@ def usage_map() -> Dict[str, Dict]:
 
 
 def usage_of(model_id: str) -> Dict:
-    """单个模型的使用情况（没有记录 = 空白的四个字段，**不是 None**：
-    面板上"从未用过"与"读不出来"要用同一形状渲染，但值本身是事实）。"""
+    """单个模型的使用情况（没有记录 = 空白的四个字段，**不是 None**）。"""
     blank = {"lastUsedAt": "", "useCount": 0, "pinned": False, "pinnedAt": ""}
     return usage_map().get(str(model_id or "").strip(), blank)
 
 
 def pin(model_id: str, pinned: bool = True) -> bool:
-    """打/摘「保留」钉子（永久不列入清理建议）。"""
+    """打/摘「保留」钉子（历史兼容；客户端已无本地模型可保护）。"""
     mid = str(model_id or "").strip()
     if not mid:
         return False
@@ -137,7 +90,7 @@ def pin(model_id: str, pinned: bool = True) -> bool:
 
 
 def forget(model_id: str) -> bool:
-    """删掉一个模型后清它的账本行（免得留一行指向已经不存在的模型）。"""
+    """删掉一个模型后清它的账本行（历史兼容）。"""
     try:
         _db().clear_model_usage(str(model_id or "").strip())
         return True
@@ -146,67 +99,10 @@ def forget(model_id: str) -> bool:
 
 
 def known_ids() -> List[str]:
-    """出厂清单里的全部 item id（懒导入 modelinfo，避免模块级循环依赖）。"""
-    try:
-        from app import modelinfo
-        return [str(e.get("id")) for e in modelinfo.CATALOG]
-    except Exception:
-        return []
-
-
-#: 「在用」判据里，设置键 → 说明（面板要把原因原样说给用户听，不许只说"在用"）。
-_SETTING_ENGINE_KEYS = (
-    ("sttModel", "命令转写引擎（设置 sttModel）"),
-    ("meetingSttModel", "会议转写引擎（设置 meetingSttModel）"),
-)
+    """出厂清单里的全部 item id：客户端已无本地模型 → 空列表。"""
+    return []
 
 
 def in_use_ids() -> Dict[str, List[str]]:
-    """"现在谁在用" → ``{model_id: [原因, …]}``。
-
-    **两个来源，缺一不可**：
-
-    1. 当前配置选中的（`sttModel` / `meetingSttModel` / `wakeEngine` / 两个能力通道）——
-       选中的引擎即使此刻没加载，也绝不能删（删了下次一定跑不起来）；
-    2. 本进程已经加载的（`stt.engine_status()`）—— 正在用的不许拔电源。
-
-    保守取向：`capabilityDiarizeBackend=auto` 时**本机也可能被选中**，所以照样保护 pyannote。
-    宁可少给一条清理建议，也不要删掉一个还会被用到的模型。
-    """
-    out: Dict[str, List[str]] = {}
-
-    def add(mid: str, why: str) -> None:
-        mid = str(mid or "").strip()
-        if mid:
-            out.setdefault(mid, []).append(why)
-
-    try:
-        from app.config import settings
-        for key, why in _SETTING_ENGINE_KEYS:
-            add(engine_model_id(settings.get(key)), why)
-        wake = str(settings.get("wakeEngine") or "")
-        try:
-            wake_on = bool(settings.get("wakeEnabled"))
-        except Exception:
-            wake_on = False
-        if wake_on:
-            if wake == "kws":
-                add("kws", "唤醒词引擎（wakeEngine=kws）")
-            elif wake == "sherpa":
-                add("sherpa", "唤醒词引擎（wakeEngine=sherpa）")
-        for key, why in (("capabilityDiarizeBackend", "说话人分离"),
-                         ("capabilityEmbedBackend", "声纹嵌入")):
-            value = str(settings.get(key) or "auto")
-            if value in ("auto", "local"):
-                add("pyannote", "%s 可能走本机（%s=%s）" % (why, key, value))
-    except Exception:
-        pass
-
-    try:
-        from app.audio import stt
-        for row in ((stt.engine_status() or {}).get("loaded") or []):
-            mid = model_id_for_engine(row.get("engine"), row.get("model"))
-            add(mid, "本进程已加载：%s" % (row.get("key") or row.get("engine") or ""))
-    except Exception:
-        pass
-    return out
+    """"现在谁在用"：客户端已无本地模型 → 空（清理页不会给任何建议）。"""
+    return {}

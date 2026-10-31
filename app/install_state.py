@@ -26,29 +26,13 @@ REPORT_FILE = "install-report.json"
 #: 报告格式版本；将来改结构时靠它迁移
 REPORT_SCHEMA = "echo-install-report/1"
 
-#: 引擎 → （pip 模块名 / 模型 id / 写进 sttModel 的值 / 给人看的名字）
-#: 这是**权威表**：`echo-install-components.ps1`、`echo-install-components.sh` 各有一份镜像，
-#: 由 `tests/test_install_entry.py` 断言三者一致（含与 app/audio/stt.py 的合法性对齐）。
-ENGINE_SPECS = {
-    # 2026-10-08：`sensevoice-onnx` 是**语音指令的默认引擎**。它的 `module` 填
-    # `sherpa_onnx` 而不是 funasr —— 这正是它的全部意义：**不需要 torch/funasr**，
-    # 复用已必装的 sherpa_onnx（唤醒也要它）。别改回 funasr，否则客户端要多装 2.9 GB。
-    "sensevoice-onnx":  {"module": "sherpa_onnx",     "model": "sensevoice-onnx",  "stt": "sensevoice-onnx", "label": "SenseVoice ONNX（默认）"},
-    "sherpa":           {"module": "sherpa_onnx",     "model": "sherpa",           "stt": "sherpa",   "label": "sherpa-onnx 流式转写"},
-    "whisper-tiny":     {"module": "faster_whisper",  "model": "whisper-tiny",     "stt": "tiny",     "label": "Whisper tiny"},
-    "whisper-base":     {"module": "faster_whisper",  "model": "whisper-base",     "stt": "base",     "label": "Whisper base"},
-    "whisper-small":    {"module": "faster_whisper",  "model": "whisper-small",    "stt": "small",    "label": "Whisper small"},
-    "whisper-medium":   {"module": "faster_whisper",  "model": "whisper-medium",   "stt": "medium",   "label": "Whisper medium"},
-    "whisper-large-v3": {"module": "faster_whisper",  "model": "whisper-large-v3", "stt": "large-v3", "label": "Whisper large-v3"},
-    "sensevoice":       {"module": "funasr",          "model": "sensevoice",       "stt": "sensevoice", "label": "SenseVoice 中文短句"},
-    # module 必须是 qwen_asr（真正的引擎包），不能写 transformers：装了 transformers 5.x
-    # 而没装 qwen-asr 时，写 transformers 会让这里判"已就绪"，而会议转写会报
-    # "qwen-asr package is required for Qwen3-ASR"（2026-09-23 实测，发布版 2.0.0 就有）。
-    "qwen3asr":         {"module": "qwen_asr",        "model": "qwen3asr",         "stt": "qwen3asr", "label": "Qwen3-ASR 方言/口音"},
-}
-
-#: sttModel 的值 → 引擎名（把"用户选的设置"翻回"要装什么"）
-STT_TO_ENGINE = {spec["stt"]: name for name, spec in ENGINE_SPECS.items()}
+#: 引擎表：**客户端已不再安装本地 STT 引擎**（2026-10-31 用户拍板）。
+#:
+#: 指令 / 回顾 / 会议转写统一走能力后端（echo-server + Qwen3-ASR）。
+#: 保留 `ENGINE_SPECS` / `STT_TO_ENGINE` 两个名字，只是为了让历史调用方拿到空表，
+#: 不再有"本机引擎缺依赖/缺模型"这回事。
+ENGINE_SPECS = {}
+STT_TO_ENGINE = {}
 
 
 def _data_root() -> str:
@@ -307,45 +291,16 @@ def _model_ready(model_id: str):
 
 
 def engine_spec(model_id: str) -> dict:
-    """按**模型 id** 反查引擎规格（返回副本，取不到给空 dict）。
-
-    为什么需要它：`app/components.py` 的 stt 组件只写 `model_id`（判"装没装"问
-    `modelinfo`），可"模型下好了"**不等于能用** —— 引擎的 pip 包是另一件事。
-    两张表要能对起来（`ENGINE_SPECS` 就是那张权威表），所以从这里反查，不在
-    components 里再抄一份。
-    """
-    mid = str(model_id or "")
-    for spec in ENGINE_SPECS.values():
-        if spec.get("model") == mid:
-            return dict(spec)
+    """按模型 id 反查引擎规格：客户端已无本地引擎 → 恒为 {}（保留签名）。"""
     return {}
 
 
 def engine_problem(choice: str) -> str:
-    """这个 ``sttModel`` / ``meetingSttModel`` 取值**现在能不能真用**。
+    """"这个 sttModel 取值现在能不能真用" —— **客户端已不再使用本地转写引擎**。
 
-    返回 ``""`` = 可用；否则一句给人看的原因（缺 pip 包 / 缺模型）。
-
-    为什么要有它（2026-09-23 实测事故）：`missing()` 只按**安装报告里登记过的引擎**
-    说话，而用户在面板上把 `sttModel` 改成没装过的引擎时那份报告不会变 —— 于是
-    "选了 sherpa、但稳定版 runtime-core 里没有 sherpa_onnx"一路无人提醒，
-    直到说第一句命令时才静默转写出空串（面板不报、DSH 也看不到请求）。
+    2026-10-31 起指令/回顾/会议统一走能力后端（Qwen3-ASR），设置里残留的
+    `sttModel` 老值不再参与任何决策，所以这里**恒返回空串**（不拦设置保存）。
     """
-    spec = ENGINE_SPECS.get(STT_TO_ENGINE.get(str(choice or "").strip(), "")) or {}
-    if not spec:
-        # 认不出的取值交给 stt.resolve_engine 的既有回退（它有告警），这里不表态
-        return ""
-    mod = str(spec.get("module") or "")
-    model = str(spec.get("model") or "")
-    try:
-        if mod and not _module_ok(mod):
-            return ("缺 Python 依赖 %s —— 转写时会直接报错；"
-                    "面板「能力」页对应组件那一行的「下载命令」可复制安装" % mod)
-        if model and _model_ready(model) is False:
-            return "模型文件还没就位（%s）—— 面板「能力」页那一行可直接下载" % model
-    except Exception as exc:
-        # 诊断函数不许把调用方（保存设置）带崩：说不清就说说不清
-        return "无法判断这个引擎能不能用（%s: %s）" % (type(exc).__name__, exc)
     return ""
 
 
@@ -377,16 +332,14 @@ def _dsh_online() -> bool:
 
 
 def _wanted_from_settings() -> dict:
-    """没有报告时，从**设置**推"用户想要什么"（老安装/向导安装走这条路）。"""
+    """没有报告时，从**设置**推"用户想要什么"。
+
+    2026-10-31 起客户端不再装本地 STT 模型/引擎、也不再做唤醒/本地分离 ——
+    engines/wake/diarize 恒为空；只有 agent 仍需从设置读。
+    """
     out = {"engines": [], "wake": False, "diarize": False, "agent": ""}
     try:
         from app.config import settings
-        for key in ("sttModel", "meetingSttModel"):
-            v = str(settings.get(key, "") or "").strip()
-            eng = STT_TO_ENGINE.get(v)
-            if eng and eng not in out["engines"]:
-                out["engines"].append(eng)
-        out["wake"] = bool(settings.get("wakeEnabled", False))
         out["agent"] = str(settings.get("agentBackend", "") or "").strip()
     except Exception:
         pass
@@ -397,10 +350,11 @@ def wanted(report: dict = None) -> dict:
     """这次要的是什么：优先用技能登记的报告，没有就退回设置。"""
     report = report if report is not None else load_report()
     if report:
+        # 老报告里的 engines/wake/diarize 是历史字段：客户端已不收这些组件，一律忽略。
         return {
-            "engines": [e for e in (report.get("engines") or []) if e in ENGINE_SPECS],
-            "wake": bool(report.get("wake")),
-            "diarize": bool(report.get("diarize")),
+            "engines": [],
+            "wake": False,
+            "diarize": False,
             "agent": str(report.get("agent") or ""),
         }
     return _wanted_from_settings()
@@ -443,52 +397,9 @@ def missing(report: dict = None) -> list:
     want = wanted(report)
     out = []
 
-    for engine in want["engines"]:
-        spec = ENGINE_SPECS.get(engine) or {}
-        if not _module_ok(spec.get("module", "")):
-            cmd = _install_command_for(spec)
-            fix = "第一步 · 先装依赖：把这条命令复制到终端执行 —— %s" % (
-                cmd or ("pip install %s" % spec.get("module", "?")))
-            fix += "；第二步 · 再回来点下载：依赖装好后，回到「设置 → 模型」再点一次「下载」"
-            if _is_windows():
-                # Windows 上"包在、导不进来"最常见的原因是缺 VC++ 运行库（原生扩展都要它）——
-                # 面板顺手把这句话给出来，用户不用去猜 "DLL load failed" 是什么意思。
-                fix += "；若报 DLL load failed，先装 Microsoft Visual C++ 2015-2022 运行库（x64）" \
-                       "：https://aka.ms/vs/17/release/vc_redist.x64.exe"
-            out.append({
-                "feature": spec.get("label") or engine,
-                "reason": "缺 Python 依赖（%s）—— 转写时会直接报错" % spec.get("module", "?"),
-                "fix": fix,
-                "nextStep": "先装依赖，再回来点一次「下载」",
-                "action": "install",
-                "installCommand": cmd,
-            })
-            continue
-        if _model_ready(spec.get("model", "")) is False:
-            out.append({
-                "feature": spec.get("label") or engine,
-                "reason": "模型文件还没下载（依赖已就绪）",
-                "fix": "依赖已经装好了 —— 回到「设置 → 模型」，**再点一次「下载」**把模型文件拉下来"
-                       "（或让助手跑 echo-install 技能）",
-                "nextStep": "再点一次「下载」",
-                "action": "download",
-                "modelId": spec.get("model") or engine,
-            })
-
-    if want["wake"] and _model_ready("kws") is False:
-        out.append({"feature": "唤醒词（喊一声就开始）",
-                    "reason": "KWS 权重还没就位", "fix": "面板 → 能力 → 下载唤醒词"})
-
-    if want["diarize"]:
-        try:
-            from app import modelinfo
-            if modelinfo.ready_pyannote() is False:
-                out.append({"feature": "说话人分离（会议里区分谁在说）",
-                            "reason": "三件套模型还没下载（官方在 HF 上 gated，ModelScope 有同名镜像）",
-                            "fix": "面板 → 组件 → 直接点下载（走 ModelScope）；或让助手跑 echo-install 技能"})
-        except Exception:
-            pass
-
+    # 客户端不再装本地 STT/唤醒/分离模型（2026-10-31）：
+    # 没有"缺引擎依赖 / 缺模型 / 缺 KWS / 缺 pyannote"这几类缺失项了。
+    # 剩下只有执行智能体是否在线（它仍在本机/局域网）。
     # 2026-10-04（用户实测指出）：这一项**必须看当前设置**，不能只看装机报告。
     # 报告是装机那一刻写下的（例如 agent=harness）；用户在面板里把执行智能体改成
     # DSH Desktop 之后报告不会变 —— 于是这里照旧去查 harness，永远报
@@ -543,10 +454,7 @@ def state(path: str = "") -> dict:
         # 「手动向导」按钮 —— **升级安装的入口只留在「设置」里**（用户口径）。
         "installMode": install_mode(),
         "firstRunDone": first_run_done(),
-        "engines": [{"id": e, "label": (ENGINE_SPECS.get(e) or {}).get("label", e),
-                     "moduleOk": _module_ok((ENGINE_SPECS.get(e) or {}).get("module", "")),
-                     "modelReady": _model_ready((ENGINE_SPECS.get(e) or {}).get("model", ""))}
-                    for e in engines],
+        "engines": [],   # 客户端已不再安装本地 STT 引擎（2026-10-31）
         "missing": miss,
         "ready": not miss,
         "summary": ("这台机器已经装好" if not miss

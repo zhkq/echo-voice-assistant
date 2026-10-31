@@ -118,27 +118,6 @@ class MeetingStateTests(unittest.TestCase):
         self.transcribe.assert_not_called()
 
 
-class WakeOwnershipTests(unittest.TestCase):
-    def test_wake_releases_microphone_before_command_callback(self):
-        from app.audio.wake import WakeListener
-        cfg = {"wakePaused": False, "wakeSilenceFloor": 0}
-        listener = WakeListener(lambda key, default=None: cfg.get(key, default))
-        detector = MagicMock()
-        detector.hit.return_value = True
-        callback = MagicMock()
-
-        def on_wake():
-            with mic.input_stream():
-                callback()
-            listener.shutdown()
-
-        listener.on_wake = on_wake
-        with patch.object(listener, "_make_detector", return_value=detector), \
-                patch.object(mic, "_new_stream", return_value=Stream()):
-            listener._run_impl()
-        callback.assert_called_once()
-
-
 class OwnershipTests(unittest.TestCase):
     def test_quarantine_refuses_device_open(self):
         with patch.object(mic, "_quarantined", True), \

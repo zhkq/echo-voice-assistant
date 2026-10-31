@@ -1,9 +1,12 @@
 package com.echo.contact.service
 
 import com.echo.contact.data.EchoApi
+import com.echo.contact.data.dto.ApiErrorResponse
+import com.google.gson.Gson
 import kotlinx.coroutines.delay
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.toRequestBody
+import retrofit2.Response
 
 /**
  * 「一段语音发出去之后，结果从哪来」——**纯编排，不碰 Android API**，
@@ -11,6 +14,8 @@ import okhttp3.RequestBody.Companion.toRequestBody
  *
  * 为什么值得单独抽：常驻听写没有界面，用户在**车里**只听到"它有没有回话"。
  * 这一段的每个分支都对应一句必须说对的话：
+ *   * 后端 **409/503（自己上一条还没跑完 / 后端忙）** 是"忙"，不是"没听清"也不是"坏了"——
+ *     2026-10-31 起转写全在后端，指令与会议/回顾互斥，这条会经常出现；
  *   * 后端 422（没识别出文字）≠ 502（转写失败）≠ 连不上 —— 三种原因、三种处理；
  *   * 智能体的回答是**异步**落到 `commands` 表的，要轮询；**念哪一段由 `SpeakPlan` 一处判**
  *     （电脑给的 `speakText` 优先，老电脑只念开头摘要，电脑发起的任务一个字都不念）——
@@ -44,6 +49,24 @@ class ListenFlow(
 
         /** 没成：一句可以直接显示/念的人话。 */
         data class Failed(val message: String) : Outcome
+
+        /**
+         * **忙，不是坏**：能力后端回 409（自己上一条还没跑完）或 503（后端忙/模型加载）。
+         *
+         * 为什么要单独一档：用户 2026-10-31 的口径是「本人已有请求在运行就报忙碌」——
+         * 报成"没听清"会让车里反复重说，报成"坏了"会让人去查网络/后端，两种都是指错方向。
+         * 调用方应当**念出来**（常驻听写没有界面），并继续听下一句。
+         */
+        data class Busy(val message: String) : Outcome
+    }
+
+    /** 从 FastAPI 的 `{"detail": "..."}` 里取人话；取不到返回空串。 */
+    private fun errorDetail(resp: Response<*>): String {
+        val raw = runCatching { resp.errorBody()?.string().orEmpty() }.getOrDefault("")
+        if (raw.isBlank()) return ""
+        return runCatching {
+            Gson().fromJson(raw, ApiErrorResponse::class.java)?.detail.orEmpty()
+        }.getOrDefault("")
     }
 
     /** 上传一段 wav（裸 body，`Content-Type: audio/wav`）。 */
@@ -54,12 +77,25 @@ class ListenFlow(
             return Outcome.Failed("连不上 ECHO：${e.message ?: e.javaClass.simpleName}")
         }
         val body = resp.body()
+        val code = resp.code()
+        val detail = body?.message?.takeIf { it.isNotBlank() } ?: errorDetail(resp)
+        // 409 = 自己上一条还没跑完（会议/回顾/上一条指令占着后端）；503 = 后端忙/模型加载中。
+        // 两者都是"稍后再来"，必须与 422/502/网络 分开说。
+        if (code == 409 || code == 503) {
+            return Outcome.Busy(
+                detail.takeIf { it.isNotBlank() }
+                    ?: "我这边正忙着上一件事，等它完了再说一次。"
+            )
+        }
         if (!resp.isSuccessful || body?.ok != true) {
-            val why = body?.message?.takeIf { it.isNotBlank() } ?: when (resp.code()) {
+            val why = when (code) {
+                // 422 一律说"没听清"（后端那句 detail 在手机上读起来像"失败了"）；
+                // 502 用后端的人话（可能是"后端不可用/转写失败"），没有就退回固定文案。
                 422 -> "没听清这一段（后端没识别出文字）"
-                502 -> "后端转写失败了"
-                401, 403 -> "令牌不对了，去面板重新配对一次"
-                else -> "HTTP ${resp.code()}"
+                502 -> detail.takeIf { it.isNotBlank() } ?: "后端转写失败了"
+                401, 403 -> detail.takeIf { it.isNotBlank() }
+                    ?: "令牌不对了，去面板重新配对一次"
+                else -> detail.takeIf { it.isNotBlank() } ?: "HTTP $code"
             }
             return Outcome.Failed(why)
         }

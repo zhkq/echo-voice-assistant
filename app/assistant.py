@@ -2,14 +2,16 @@
 """assistant.py — ECHO 命令流水线
 
 链路（沿用早期实现验证过的逻辑，已去掉 PowerShell 依赖）：
-  触发（热键/媒体键/唤醒/面板/API/skill）
+  触发（热键/媒体键/面板/API/skill）
     → 提示音开始 → 录音（静音自动停） → 提示音停录
-    → 本地转写 → 剥离唤醒前缀 → 会议意图分类（开始/结束录音）
+    → 能力后端转写（Qwen3-ASR；客户端已无本地 STT） → 剥离口癖前缀
+    → 会议意图分类（开始/结束录音）
     → 语音复述确认 → 发送到目标 DSH 会话（面板「命令目标」选中的工作区/会话；
       没选就是 ECHO 默认命令会话，queue 模式）
     → 轮询会话历史等最终回复 → 生成语音简报朗读 → 写命令历史
 
-并发控制：同一时刻只允许一个命令流（busy 标志）。
+并发控制：同一时刻只允许一个命令流（busy 标志）；2026-10-31 起还要与
+会议录音/转写互斥（会议进行中触发指令/回顾 → 直接报忙碌）。
 """
 import os
 import re
@@ -102,7 +104,8 @@ def capture_level():
     """收音阶段的实时电平；非收音阶段恒为 0。"""
     return float(_capture_level["value"]) if _busy_owner.get("phase") == "listening" else 0.0
 
-# 唤醒前缀（语音转写后剥离）。基础别名 + 用户配置的唤醒词（含"X帮我"变体）。
+# 唤醒前缀/口癖前缀（语音转写后剥离）。2026-10-31 取消唤醒后不再读
+# `wakeKeywords`（那个键已删）；这里只留历史口癖，避免用户说"帮我…"时多带上这两个字。
 _PREFIX_BASE = ["小尼小尼", "小尼帮我", "小尼", "尼欧尼欧", "尼欧帮我", "尼欧", "帮我"]
 
 
@@ -110,17 +113,6 @@ def _prefix_re():
     entries = []   # (字符长度, 正则片段)，按长度降序保证长前缀优先匹配
     for p in _PREFIX_BASE:
         entries.append((len(p), re.escape(p)))
-    for kw in settings.get("wakeKeywords", []) or []:
-        core = re.sub(r"[，,、\s]+", "", str(kw).strip())
-        if not core:
-            continue
-        for variant in (core, core + "帮我"):
-            if len(variant) == 1:
-                pat = re.escape(variant)
-            else:
-                # 允许唤醒词各字之间夹杂标点/空格（"嘿，尼欧" 与 "嘿尼欧" 都命中）
-                pat = r"[，,、\s]*".join(re.escape(ch) for ch in variant)
-            entries.append((len(variant), pat))
     seen = set()
     pats = []
     for _ln, pat in sorted(entries, key=lambda x: -x[0]):
@@ -403,8 +395,63 @@ def _release_busy():
         _capture_level["value"] = 0.0
 
 
+def transcribe_voice(wav, *, source="mobile", variant="short", lang=None):
+    """给**面板/手机一步到位**入口用的转写：独占 busy + 会议互斥 + 只走能力后端。
+
+    返回 `(text, note, status)`，与 `_transcribe_command` 同一个形状。
+    会议录音/转写进行中、或已有命令流在跑时，直接回 `ASR_BUSY` —— 上层据此
+    回 409/忙碌话术（用户 2026-10-31 口径：本人已有请求在运行就报忙碌）。
+    """
+    why = voice_blocked_reason()
+    if why:
+        return "", why, ASR_BUSY
+    if not _set_busy(source):
+        return "", "已有命令流进行中，请稍候", ASR_BUSY
+    try:
+        return _transcribe_command(wav, settings, variant=variant, lang=lang)
+    finally:
+        _release_busy()
+
+
+def voice_blocked_reason():
+    """此刻不能开新的语音任务的原因（空串 = 可以）。
+
+    用户口径（2026-10-31）：**会议、指令、回顾不能同时进行**，本人已有请求在跑
+    就报忙碌。会议那侧的原因由 `meeting.voice_busy_reason()` 统一给。
+    """
+    try:
+        from app import meeting
+        return str(meeting.voice_busy_reason() or "")
+    except Exception:
+        return ""
+
+
+def voice_api_busy():
+    """此刻是否**正在占用能力后端的语音通道**（收音/转写）。
+
+    会议转写在启动前用它等一等：用户可能刚说完一句指令（≤30 秒），
+    为避免撞后端「每客户端 1 路」的 409，等这一小段过去比自己失败好。
+    `running`（等 DSH 回复）**不算** —— 那一段不占后端语音通道。
+    """
+    return bool(_capture_active.is_set()
+                or _busy_owner.get("phase") in ("listening", "transcribing"))
+
+
 def capture(source="hotkey"):
-    """热键/媒体键/唤醒触发的完整录音命令流（后台线程执行，立即返回）。"""
+    """热键/媒体键/面板触发的完整录音命令流（后台线程执行，立即返回）。"""
+    why = voice_blocked_reason()
+    if why:
+        db.add_log("info", "assistant", f"语音指令被拒（{why}）")
+        try:
+            tts_mod.play_beep("err")
+        except Exception:
+            pass
+        try:
+            if settings.get("notifyOnSend", True):
+                notify("ECHO", why)
+        except Exception:
+            pass
+        return False
     if not _set_busy(source):
         print("[assistant] 已有命令流进行中，忽略本次触发")
         tts_mod.play_beep("err")
@@ -415,149 +462,113 @@ def capture(source="hotkey"):
 
 #: `_transcribe_command()` 的第三个返回值 —— 决定调用方怎么跟人说话
 ASR_OK = "ok"          # 拿到文本
-ASR_EMPTY = "empty"    # 引擎正常，但这段没听到内容（该提示"再说一次"）
-ASR_ERROR = "error"    # 引擎/依赖/模型出问题（该提示"引擎没装/报错"，**不能**说"没听清"）
+ASR_EMPTY = "empty"    # 后端正常，但这段没听到内容（该提示"再说一次"）
+ASR_ERROR = "error"    # 能力后端/配对/网络出问题（该提示"后端不可用"，**不能**说"没听清"）
+ASR_BUSY = "busy"      # 自己上一条还没跑完（能力后端 409 client_busy）——报"忙"就行
+
+#: 指令是短音频：等后端最多 45 秒（后端推理上限 900，但交互不能干等）
+COMMAND_BACKEND_TIMEOUT_S = 45.0
+#: 回顾一轮最长 120 秒音频，给足推理时间
+REVIEW_BACKEND_TIMEOUT_S = 300.0
 
 
-def _transcribe_via_backend(wav, cfg, lang="auto"):
-    """用**能力后端**转写（与会议转写同一个引擎）—— 回顾那条路用它。
+def _transcribe_via_backend(wav, cfg, lang="auto", *, variant="long", timeout=None):
+    """用**能力后端**转写 —— 2026-10-31 起这是**唯一**的转写路径。
 
-    返回与本地引擎同样的形状 `{"text","status","detail"}`（`status` 取 `stt_mod.TRANSCRIBE_*`），
-    这样 `_transcribe_command` 的上层判断一行都不用改。
+    客户端不再有本地 STT（sherpa / SenseVoice / whisper 都已退役），所以这里
+    失败就是失败：**不回落本地、不静默降级**。
 
-    **为什么值得单独走这条**（用户 2026-10-07 的要求）：回顾每轮是**成段的自述**，
-    而本地 sherpa 是给短口令调的小流式模型 —— 实测同一段话出来是
-    "今天天的美丽每日回回国回顾我今天今天主要的工作就是…"（重复、错字），
-    交给 DSH 整理的原文质量直接受影响。会议那条路用的后端 Qwen3-ASR 明显更准。
-
-    **失败一律回落本机**（不抛）：后端没起来 / 没配对 / 显存不够时，回顾仍然要能用 ——
-    用户可能正是"为了省显存没开后端"才用它，那时报错等于把功能关掉。
+    返回 `{"text","status","detail"}`。能力后端回 409/503 时 `status=ASR_BUSY`
+    （自己上一条还没跑完），调用方据此说"我忙着"——而不是"没听清"或"引擎坏了"。
     """
     try:
         from app.capabilities import echo_server as _echo_backend
     except Exception as e:                                     # pragma: no cover - 导入护栏
-        return {"text": "", "status": stt_mod.TRANSCRIBE_ERROR,
-                "detail": "后端客户端导入失败：%s" % e}
+        return {"text": "", "status": ASR_ERROR,
+                "detail": "能力后端客户端导入失败：%s" % e}
     try:
         if not _echo_backend.configured():
-            return {"text": "", "status": stt_mod.TRANSCRIBE_ERROR,
+            return {"text": "", "status": ASR_ERROR,
                     "detail": "能力后端没配对、也没在设置里填地址"}
         client = _echo_backend.client_from_settings()
         if client is None:
-            return {"text": "", "status": stt_mod.TRANSCRIBE_ERROR,
+            return {"text": "", "status": ASR_ERROR,
                     "detail": "拿不到能力后端客户端"}
-        res = client.transcribe(wav, lang=lang, variant="long")
+        blocked = _echo_backend.privacy_blocked(client)
+        if blocked:
+            return {"text": "", "status": ASR_ERROR, "detail": blocked}
+        res = client.transcribe(wav, lang=lang, variant=variant, timeout=timeout)
         text = " ".join((getattr(res, "text", "") or "").split())
         if not text:
-            return {"text": "", "status": stt_mod.TRANSCRIBE_EMPTY,
-                    "detail": "后端返回空文本"}
-        return {"text": text, "status": stt_mod.TRANSCRIBE_OK,
-                "detail": "backend=%s" % getattr(res, "backend_id", "echo-server")}
-    except Exception as e:
-        # 回落由调用方做；这里如实说"后端没成"，不假装成功
-        return {"text": "", "status": stt_mod.TRANSCRIBE_ERROR,
+            return {"text": "", "status": ASR_EMPTY, "detail": "后端返回空文本"}
+        return {"text": text, "status": ASR_OK,
+                "detail": "backend=%s variant=%s" % (
+                    getattr(res, "backend_id", "echo-server"), variant)}
+    except Exception as e:                                     # noqa: BLE001
+        from app.capabilities.base import CapabilityError
+        if isinstance(e, CapabilityError):
+            busy = e.code in ("client_busy", "server_busy") or e.reason == "busy"
+            detail = "能力后端%s（code=%s）：%s" % (
+                "忙" if busy else "转写失败", e.code or e.reason, e.detail or str(e))
+            return {"text": "", "status": ASR_BUSY if busy else ASR_ERROR,
+                    "detail": detail}
+        return {"text": "", "status": ASR_ERROR,
                 "detail": "能力后端转写失败：%s: %s" % (type(e).__name__, e)}
 
 
 def review_stt_prefer(cfg=None):
-    """回顾转写走哪条路 —— 由设置 `dailyReviewSttBackend` 决定（默认走能力后端）。
+    """回顾转写走哪条路 —— 2026-10-31 起**恒为能力后端**。
 
-    单独抽出来是为了**一处判据、可测**：面板/日志/`_review_worker` 都问它，
-    免得"设置说的是 A、代码走的是 B"这种漂移（今天已经在别处踩过一次）。
+    设置项 `dailyReviewSttBackend` 只做兼容读取（新装机默认值已改成
+    `echo-server`；老库里的 `local` 也不再生效）—— 客户端已经没有本机 STT，
+    选「本机」没有意义。保留函数是为了不改面板/API/用例的调用点。
     """
-    cfg = cfg or settings
-    try:
-        val = str(cfg.get("dailyReviewSttBackend", "echo-server") or "").strip()
-    except Exception:
-        return "backend"
-    # 只有显式选「本机」才不走后端；空值/未知值都按默认（后端）处理 ——
-    # 默认值的语义是"跟会议同一个引擎"，而设置项写错时不该悄悄退回低质量那条路。
-    return "local" if val == "local" else "backend"
+    return "backend"
 
 
-def _transcribe_command(wav, cfg, prefer=""):
-    """命令转写：显式配了 `providerAsr` 就走 provider（P5），否则走本地引擎。
+def _transcribe_command(wav, cfg, prefer="", *, variant="short", lang=None):
+    """命令/回顾转写：**一律走能力后端**（唯一转写路径）。
 
-    `prefer="backend"` 时**先试能力后端**（与会议同一个引擎），失败回落本机 ——
-    只有每日回顾用它（设置项 `dailyReviewSttBackend`），语音指令那条路保持原样
-    （要的是低延迟，不该等后端）。参数名不叫 `engine`：下面 `engine` 是
-    `sttModel` 的值，同名会把这次偏好悄悄覆盖掉。
+    2026-10-31 用户口径：指令、回顾、会议转写都交给能力后端的 Qwen3-ASR；
+    客户端不再装本地 STT 模型。所以这里不再有 providerAsr 优先、本地引擎、
+    「后端失败回落本机」这三条旧分支。
 
-    返回 ``(text, note, status)``：`note` 说明"走了谁 / 为什么没有文本"，供日志；
-    `status` ∈ ``ok/empty/error``。
-
-    为什么要分 status（2026-09-23 事故）：稳定版 runtime-core 里没装 `sherpa_onnx`，
-    命令转写每次都抛 ModuleNotFoundError 返回空串，而写进日志的只有一句
-    「转写为空（engine=sherpa）」—— 读起来像"没听清"，面板不报、用户以为录音坏了，
-    真正的根因（缺 pip 包）一个字都没露。判据与会议转写**共用** `transcribe_ex()`
-    （它就是为了把"这段没人说话"和"引擎挂了"分开才加的，见 §19 发现③）。
+    返回 ``(text, note, status)``：`status` ∈ ``ok/empty/error/busy``。
+    `variant`：指令用 `short`（几秒音频），回顾用 `long`（成段自述）。
+    `prefer` 只为兼容旧调用点保留，值不再影响路由。
     """
-    from app import providers as providers_mod
-    provider, why = providers_mod.asr_if_configured()
-    if provider is not None:
-        try:
-            out = provider.transcribe(wav, lang=cfg.get("sttLanguage", "zh"))
-            text = " ".join((out.get("text") or "").split())
-            note = "provider=%s" % why
-            if out.get("reason"):
-                note += " reason=%s" % out["reason"]
-            return text, note, ASR_OK if text else ASR_EMPTY
-        except Exception as e:
-            return "", "provider=%s 失败：%s" % (why, e), ASR_ERROR
-    # 回顾那条路：**先用能力后端**（与会议同一个引擎）。失败**回落本机**，并把
-    # "后端为什么不成"写进 note —— 否则日志里只剩"engine=sherpa"，
-    # 看不出"本来想走后端但没走成"（那正是排障时要问的第一件事）。
-    backend_note = ""
-    if prefer == "backend":
-        be = _transcribe_via_backend(wav, cfg, lang=cfg.get("sttLanguage", "zh"))
-        be_text = " ".join((be.get("text") or "").split())
-        if be.get("status") == stt_mod.TRANSCRIBE_OK and be_text:
-            return be_text, str(be.get("detail") or "能力后端"), ASR_OK
-        backend_note = "后端没成（%s），回落本机；" % (be.get("detail") or be.get("status"))
-        db.add_log("warn", "assistant",
-                   "回顾转写走后端没成功，已回落本机：%s" % (be.get("detail") or be.get("status")))
-    engine = cfg.get("sttModel", "sensevoice-onnx")
-    # ⚠️ 这里以前是**手工 if/elif**，只认 sensevoice / sherpa，其余一律落到 whisper ——
-    # 于是 2026-10-08 把默认值改成 `sensevoice-onnx` 之后，**语音指令会被当成 whisper**
-    # （而 whisper 权重早就删了）→ 每次转写都失败，且报的是"engine=whisper"这种误导信息。
-    # 现在改成调**唯一权威**的映射函数 `stt.resolve_engine()`：新加引擎只需要在
-    # `stt.py` 里加一个分支，这里不会再漏。
-    stt_engine, stt_model = stt_mod.resolve_engine(engine)
-    try:
-        res = stt_mod.transcribe_ex(wav, engine=stt_engine, model=stt_model,
-                                    lang=cfg.get("sttLanguage", "zh"),
-                                    device=cfg.get("device", "auto"))
-    except Exception as e:                     # transcribe_ex() 自己不抛，这里只是护栏
-        return "", backend_note + "engine=%s 失败：%s" % (stt_engine, e), ASR_ERROR
-    text = " ".join((res.get("text") or "").split())
-    note = backend_note + "engine=%s status=%s" % (stt_engine, res.get("status"))
-    if res.get("detail"):
-        note += " detail=%s" % res["detail"]
-    if res.get("status") != stt_mod.TRANSCRIBE_OK or not text:
-        return text, note, ASR_ERROR if res.get("status") == stt_mod.TRANSCRIBE_ERROR else ASR_EMPTY
-    return text, note, ASR_OK
+    lang = (lang or (cfg.get("sttLanguage", "zh") if cfg is not None else "zh")) or "zh"
+    timeout = (REVIEW_BACKEND_TIMEOUT_S if variant == "long"
+               else COMMAND_BACKEND_TIMEOUT_S)
+    res = _transcribe_via_backend(wav, cfg, lang=lang,
+                                  variant=variant, timeout=timeout)
+    return (res.get("text") or "", res.get("detail") or "",
+            res.get("status") or ASR_ERROR)
 
 
-#: 引擎的 pip 模块名 → 包名（`pip install` 用包名，报错里出现的是模块名）
+#: 旧的本地引擎模块名 → 包名映射（保留给排障提示；2026-10-31 起客户端不再用本地引擎）
 _ASR_MODULE_PKGS = (("sherpa_onnx", "sherpa-onnx"), ("faster_whisper", "faster-whisper"),
                     ("funasr", "funasr"), ("qwen_asr", "qwen-asr"), ("ctranslate2", "ctranslate2"))
 
 
 def asr_failure_hint(note):
-    """把转写失败的原因翻成**一句用户能照着做的话**（桌面通知里用）。
+    """把转写失败的原因翻成**一句用户能照着做的话**（桌面/手机通知里用）。
 
-    `note` 是给日志的原始串（可能含 `ModuleNotFoundError: No module named 'sherpa_onnx'`）；
-    对用户直接抛这句等于没说 —— 要告诉他缺什么、去哪儿装。
+    2026-10-31 起转写只走能力后端，所以最常见的两种失败是：
+      * 忙碌（409 `client_busy`：自己上一条还没跑完 / 503 `server_busy`）；
+      * 后端不可用（没配对、连不上、模型没就绪）。
+    把话说到"该等一等"还是"去看后端配对"，别再说成"没听清"。
     """
     low = str(note or "").lower()
-    for mod, pkg in _ASR_MODULE_PKGS:
-        if mod in low:
-            return "转写引擎没装（缺 %s）：面板「能力」页那行有可复制的安装命令" % pkg
+    if any(k in low for k in ("client_busy", "server_busy", "能力后端忙", "忙")):
+        return "我这边正忙着上一件事，等它完了再说一次。"
+    if any(k in low for k in ("没配对", "absent", "unauthorized", "forbidden",
+                              "连不上", "offline", "model_failed", "model_loading",
+                              "没在设置里填地址")):
+        return "能力后端这会儿不可用：检查配对/网络，或回面板看一眼后端状态。"
     if "文件不存在" in low or "no such file" in low:
         return "录音文件没生成，请再说一次"
-    if "out of memory" in low or "显存" in low:
-        return "转写引擎显存不足：可换成 CPU 或更小的模型（设置 → 模型）"
-    return "转写引擎报错，命令没发出去：%s" % str(note or "")[:120]
+    return "转写失败，命令没发出去：%s" % str(note or "")[:120]
 
 
 def _capture_worker(source):
@@ -608,9 +619,13 @@ def _capture_worker(source):
         text, note, status = _transcribe_command(wav, cfg)
         if not text:
             tts_mod.play_beep("err")
-            if status == ASR_ERROR:
-                # 引擎/依赖/模型的问题：**必须说出原因**。说成"没听清"会把用户
-                # 引到麦克风上去查，而真凶是没装的 pip 包（2026-09-23 事故）。
+            if status == ASR_BUSY:
+                db.add_log("warn", "assistant", f"命令转写遇忙（{note}）")
+                if cfg.get("notifyOnSend", True):
+                    notify("ECHO", asr_failure_hint(note))
+            elif status == ASR_ERROR:
+                # 后端/配对/网络的问题：**必须说出原因**。说成"没听清"会把用户
+                # 引到麦克风上去查，而真凶可能是后端没配对/连不上。
                 db.add_log("error", "assistant", f"命令转写失败（{note}）")
                 if cfg.get("notifyOnSend", True):
                     notify("ECHO", asr_failure_hint(note))
@@ -692,19 +707,28 @@ def wants_review_start(text) -> bool:
         return False
 
 
-def start_review(source="wake") -> bool:
+def start_review(source="manual") -> bool:
     """进入每日回顾模式（后台线程，立即返回）。
 
-    与 `capture()` 一样是"触发即返回"；重复触発只提示不重入。
+    与 `capture()` 一样是"触发即返回"；重复触发只提示不重入。
+    2026-10-31 起**会议录音/转写进行中拒绝开回顾**（会议、指令、回顾三者互斥）。
     """
     from app import daily_review
     ok, why = daily_review.ready()
     if not ok:
         # 没配好就**当场说出来**：用户已经在车里等着说话了，
-        # 沉默是最差的结果（他会以为坏了，然后反复喊唤醒词）。
+        # 沉默是最差的结果（他会以为坏了）。
         db.add_log("warn", "assistant", f"每日回顾不可用：{why}")
         try:
             providers_mod.speak_text("回顾还没配好，你回面板看一眼设置。", timeout=15)
+        except Exception:
+            pass
+        return False
+    busy_why = voice_blocked_reason()
+    if busy_why:
+        db.add_log("info", "assistant", f"回顾被拒（{busy_why}）")
+        try:
+            providers_mod.speak_text(busy_why, timeout=15)
         except Exception:
             pass
         return False
@@ -810,6 +834,12 @@ def _review_worker(source):
             _review_speak("扫完了，开始今天的回顾，你讲。")
 
         while not _review_stop.is_set():
+            # 会议、指令、回顾三者互斥（用户 2026-10-31）：会议开始了就收尾。
+            round_busy = voice_blocked_reason()
+            if round_busy:
+                db.add_log("info", "assistant", f"回顾结束（{round_busy}）")
+                _review_speak("会议还在进行，回顾就先到这儿。")
+                break
             turns += 1
             wav = os.path.join(
                 CAPTURES_DIR,
@@ -845,10 +875,14 @@ def _review_worker(source):
                     _review_speak("这一轮我没听清，接着说，或者说结束回顾。")
                 continue
 
-            # 回顾这轮：默认走**能力后端**（与会议同一个引擎）—— 成段自述用短口令那个
-            # 小流式模型效果差（实测有明显重复/错字，直接拖累 DSH 整理出的原文）。
-            text, note, status = _transcribe_command(wav, cfg, prefer=review_stt_prefer(cfg))
+            # 回顾这轮：一律走能力后端（与会议同一个引擎 Qwen3-ASR），`variant=long`
+            # 对应成段自述。客户端已经没有本地 STT，不存在"回落本机"。
+            text, note, status = _transcribe_command(wav, cfg, variant="long")
             if not text:
+                if status == ASR_BUSY:
+                    db.add_log("warn", "assistant", f"回顾转写遇忙（{note}）")
+                    _review_speak("我这会儿忙着，回顾先停，回头再试。")
+                    break
                 if status == ASR_ERROR:
                     db.add_log("error", "assistant", f"回顾转写失败（{note}）")
                     _review_speak(asr_failure_hint(note))

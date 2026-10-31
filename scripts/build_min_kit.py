@@ -18,7 +18,7 @@
       ├─ echo-install\\…                      安装技能（保留：agent 那条路继续可用）
       ├─ bundle\\wheels\\…                    离线 wheel（pip --no-index --find-links）
       ├─ bundle\\runtime\\…                   兜底 CPython 3.11 嵌入包 + get-pip.py
-      ├─ bundle\\models\\sherpa-onnx-streaming\\…  流式模型（从本机 models\\ 直接复制）
+      ├─ （客户端无本地模型：2026-10-31 起 bundle 只有 wheels + runtime）
       ├─ 装我.cmd / install-offline.ps1 / 先读我.md
       └─ BUILD-INFO.txt / SHA256SUMS.txt（主包元数据，随主包解出来）
 
@@ -42,7 +42,7 @@
     python scripts/build_min_kit.py                  # 出主包 + 组离线最小包 + 自检
     python scripts/build_min_kit.py --reuse-main     # 复用 dist 里已有的主包（快）
     python scripts/build_min_kit.py --stamp 20260925-2200
-    python scripts/build_min_kit.py --engines sherpa,whisper-base
+    python scripts/build_min_kit.py          # 客户端无本地 STT 引擎（--engines 已废弃）
     python scripts/build_min_kit.py --no-runtime     # 不打 python.org 嵌入包（小一点，但裸机装不了）
     python scripts/build_min_kit.py --no-models      # 不打模型（只出 wheel 包）
     python scripts/build_min_kit.py --wheels-from-env  # 用本机已装环境的版本号下 wheel
@@ -87,10 +87,8 @@ EMBED_URL = "https://www.python.org/ftp/python/3.11.9/" + EMBED_NAME
 GETPIP_URL = "https://bootstrap.pypa.io/get-pip.py"
 #: 目标运行时是包里的嵌入包（3.11），wheel 必须是 cp311 —— 用别的解释器下会拿到错版本
 TARGET_PY = (3, 11)
-#: 模型下载客户端（modelscope）：**打进 wheel** 而不是"离线时跳过" —— 见 README/报告的说明。
-#: 它同时是 requirements-core.txt 的一行、也是 sherpa 档 ENGINE_MAP 的一项，
-#: 所以这里不额外硬编码包名，只把它们从两个权威来源里取出来。
-#: 只有这几个是为了"离线把 pip 装上"（嵌入包不带 pip / ensurepip）。
+#: 只把"离线把 pip 装上"必需的这几件打进 wheel（嵌入包不带 pip / ensurepip）。
+#: 2026-10-31 起客户端不再装本地 STT 模型/引擎，所以没有 modelscope 之类的下载客户端了。
 BOOTSTRAP_WHEELS = ("pip", "setuptools", "wheel", "packaging")
 #: 最小档的定义：这些**不许**出现在包里（有 tests/test_default_profile.py 守着同一份事实）
 NEVER_IN_MIN = ("torch", "torchvision", "torchaudio", "funasr", "pyannote.audio",
@@ -133,18 +131,16 @@ _PS1_ENGINE_RE = re.compile(
 
 
 def engine_pip_map() -> dict[str, list[str]]:
-    """从技能里的组件安装器解析 $ENGINE_MAP 的 pip 依赖（**唯一实现**在那儿）。
+    """历史引擎表解析（客户端已无本地 STT 引擎 → 允许为空表）。
 
-    为什么不在这里手抄一份包名表：引擎→依赖的映射有权威出处（技能脚本 + app/install_state.py），
-    手抄一份就是第三个真相。格式变了这里会**响亮地失败**（解析不出来就报错），不会静默漏包。
+    2026-10-31 起 `echo-install-components.ps1` 不再装本地 STT 模型/引擎，
+    所以这里解析不到任何 `$ENGINE_MAP` 是**正常状态**；只有调用方显式点名某个
+    引擎而表里没有时才算错。
     """
     text = COMPONENTS_PS1.read_text(encoding="utf-8")
     out: dict[str, list[str]] = {}
     for engine, pip_part in _PS1_ENGINE_RE.findall(text):
         out[engine] = re.findall(r"'([^']+)'", pip_part)
-    if not out:
-        raise BuildError("从 echo-install-components.ps1 里一条 $ENGINE_MAP 都没解析出来 —— "
-                         "引擎表格式变了？")
     return out
 
 
@@ -167,20 +163,13 @@ def spec_list(engines: list[str], from_env: bool) -> tuple[list[str], list[str]]
     why: list[str] = []
     for line in requirements_core_names():
         specs.append(line)
-    why.append(f"requirements-core.txt（{len(specs)} 行：面板/服务骨架 + sherpa-onnx + modelscope）")
+    why.append(f"requirements-core.txt（{len(specs)} 行：面板/服务骨架 + 音频 IO；客户端无本地 STT）")
     for e in engines:
         if e not in table:
-            raise BuildError(f"不认识的引擎：{e}（可选：{', '.join(sorted(table))}）")
+            raise BuildError(f"客户端已无本地 STT 引擎，不能点名 {e!r}（可选：{', '.join(sorted(table)) or '无'}）")
         before = len(specs)
         specs += [p for p in table[e] if p not in specs]
         why.append(f"ENGINE_MAP['{e}'] 的 pip 依赖（+{len(specs) - before}：{' '.join(table[e])}）")
-    # 任务书点名要覆盖的三件（sherpa 档的转写依赖）；requirements-core 里已有 soundfile /
-    # sherpa-onnx / modelscope，onnxruntime 是 sherpa-onnx 在部分平台上的运行期依赖，
-    # 显式带上（面板的组件清单也把它列在 stt 行）。
-    for extra in ("onnxruntime",):
-        if not any(s.split("=")[0].split(">")[0].split("[")[0].strip().lower() == extra for s in specs):
-            specs.append(extra)
-            why.append(f"显式带上 {extra}（sherpa 档的运行期依赖）")
     for b in BOOTSTRAP_WHEELS:
         if not any(s.split("=")[0].split(">")[0].split("[")[0].strip().lower() == b for s in specs):
             specs.append(b)
@@ -240,7 +229,7 @@ def pick_python(override: str) -> list[str]:
     """挑一个**能下 cp311 wheel** 的 pip 解释器。
 
     目标运行时是包里的 CPython 3.11（python.org 嵌入包）：用 3.12/3.13 的 pip 下 wheel 会
-    拿到 cp312/cp313 的二进制轮子（numpy / onnxruntime / sherpa-onnx 都是二进制的），
+    拿到 cp312/cp313 的二进制轮子（numpy / soundfile 等是二进制的），
     装到目标机上就是"下得到、import 不了"。所以这里**必须**是 3.11。
     """
     cands: list[list[str]] = []
@@ -357,19 +346,10 @@ def stage_kit(args, build_kit) -> tuple[Path, dict]:
     stats["spec_why"] = why
     stats["pip_python"] = " ".join(py)
 
-    # ④ 离线载荷：模型（本机已有，直接复制 —— 不重新下载）
+    # ④ 离线载荷：模型 —— **客户端已不装任何本地模型**（2026-10-31），
+    #    bundle/models 不再生成（transcription 全走能力后端）。
     models_staged = []
-    for mid, rel in (("sherpa", "sherpa-onnx-streaming"),):
-        src = MODELS_DIR / rel
-        if not src.is_dir():
-            if args.allow_missing_models:
-                print(f"  [model] 缺 {src} —— 跳过（--allow-missing-models）")
-                continue
-            raise BuildError(f"本机没有模型 {src}（离线最小包必须有它）。"
-                             f"用 --allow-missing-models 跳过，或先在面板里下好这个模型。")
-        copy_model(src, kit_dir / "bundle" / "models" / rel)
-        models_staged.append(rel)
-    stats["models"] = [(rel, _tree_mb(kit_dir / "bundle" / "models" / rel)) for rel in models_staged]
+    stats["models"] = []
 
     # ⑤ 离线载荷：运行时兜底（python.org 嵌入包 + get-pip.py）
     runtime_files = []
@@ -405,15 +385,11 @@ def stage_kit(args, build_kit) -> tuple[Path, dict]:
     lines = ["# bundle 清单（build_min_kit.py 生成）",
              f"generated : {time.strftime('%Y-%m-%d %H:%M:%S')}",
              f"pip python: {stats['pip_python']}",
-             f"engines   : {', '.join(args.engines)}",
+             "models    : 0（客户端不装本地 STT 模型；转写全部走能力后端）",
              ""]
     lines.append(f"[wheels] {len(wheels)} 个，合计 {stats['wheels_mb']:.1f} MB")
     for name, size in sorted(stats["wheels"], key=lambda x: -x[1]):
         lines.append(f"  {size / (1 << 20):8.2f} MB  {name}")
-    lines.append("")
-    lines.append(f"[models] 合计 {sum(s for _n, s in stats['models']):.1f} MB")
-    for rel, mb in stats["models"]:
-        lines.append(f"  {mb:8.2f} MB  {rel}")
     lines.append("")
     lines.append(f"[runtime] 合计 {sum(s for _n, s in stats['runtime']) / (1 << 20):.1f} MB")
     for n, s in stats["runtime"]:
@@ -464,22 +440,11 @@ def verify_kit(kit_dir: Path, build_kit, args) -> list[str]:
         for never in NEVER_IN_MIN:
             if norm.startswith(never.replace(".", "-") + "-"):
                 problems.append(f"最小档不许带 {never}：{w.name}")
-    for need in ("fastapi", "uvicorn", "sherpa-onnx", "modelscope", "soundfile"):
-        # wheel 文件名里 `_` 与 `-` 混用（sherpa_onnx-1.13.8-…whl）—— 两边都归一化再比。
+    for need in ("fastapi", "uvicorn", "numpy", "sounddevice", "soundfile"):
+        # wheel 文件名里 `_` 与 `-` 混用 —— 两边都归一化再比。
         norm = need.replace("_", "-").lower()
         if not any(w.name.lower().replace("_", "-").startswith(norm) for w in wheels):
             problems.append(f"bundle/wheels 里缺 {need}")
-    if not args.allow_missing_models:
-        d = kit_dir / "bundle" / "models" / "sherpa-onnx-streaming"
-        if not d.is_dir():
-            problems.append("bundle/models 里没有流式模型 sherpa-onnx-streaming")
-        else:
-            names = [p.name for p in d.iterdir()]
-            for pre, suf in (("encoder", ".onnx"), ("decoder", ".onnx"), ("joiner", ".onnx")):
-                if not any(n.startswith(pre) and n.endswith(suf) for n in names):
-                    problems.append(f"模型目录缺 {pre}*{suf}")
-            if "tokens.txt" not in names:
-                problems.append("模型目录缺 tokens.txt")
     if not args.no_runtime:
         rt = kit_dir / "bundle" / "runtime"
         for name in (EMBED_NAME, "get-pip.py"):
@@ -513,7 +478,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--stamp", default="", help="时间戳（默认 now，形如 20260925-2200）")
     ap.add_argument("--dist", default="", help="输出目录（默认 <repo>/dist）")
     ap.add_argument("--reuse-main", action="store_true", help="复用 dist 里已有的主包，不重出")
-    ap.add_argument("--engines", default="sherpa", help="把哪些引擎的 pip 依赖打进 wheel（默认 sherpa）")
+    ap.add_argument("--engines", default="", help="已废弃：客户端不再装本地 STT 引擎（留空即可）")
     ap.add_argument("--python", default="", help="下 wheel 用的 Python 3.11 解释器（默认自动找）")
     ap.add_argument("--wheels-from-env", action="store_true",
                     help="用本机已装环境的版本号钉住 wheel（更贴近实测过的组合）")

@@ -15,15 +15,18 @@
 #   * `-File install.ps1` propagates the script's `exit N` as the process
 #     exit code, which is what this wrapper needs to report success/failure.
 #
-# Offline means: pip gets `--no-index --find-links bundle\wheels`, the STT
-# model is copied out of bundle\models, and no agent (DSH/harness) is
-# installed - @deepseek-ai/dsh is a private npm package and must not be
-# redistributed with the kit.
+# Offline means: pip gets `--no-index --find-links bundle\wheels`, and no
+# agent (DSH/harness) is installed - @deepseek-ai/dsh is a private npm
+# package and must not be redistributed with the kit.
+#
+# 2026-10-31: client no longer installs any local STT model/engine and the
+# wake word feature is removed. bundle\models may be absent; -Wake/-Diarize
+# are accepted for backward compatibility but ignored.
 #
 # Usage (also reachable by double clicking the .cmd launcher next to this file):
 #     powershell -NoProfile -ExecutionPolicy Bypass -File .\install-offline.ps1
 #     powershell -NoProfile -ExecutionPolicy Bypass -File .\install-offline.ps1 `
-#         -Root D:\ECHO -Profile main -Wake
+#         -Root D:\ECHO
 #
 # Encoding: ASCII only on purpose (no BOM needed, safe in every code page).
 # =====================================================================
@@ -59,8 +62,8 @@ if (-not (Test-Path (Join-Path $here 'bundle\wheels'))) {
 # sense for the offline kit, and the kit never ships an agent.
 $argList = @('-Offline', '-Yes', '-Agent', 'none', '-Profile', $Profile)
 if ($Root) { $argList += @('-Root', $Root) }
-if ($Wake) { $argList += '-Wake' }
-if ($Diarize) { $argList += '-Diarize' }
+if ($Wake) { Write-Host '  [warn] -Wake is deprecated (wake word feature removed); ignored.' -ForegroundColor Yellow }
+if ($Diarize) { Write-Host '  [warn] -Diarize is deprecated (diarization runs on the backend); ignored.' -ForegroundColor Yellow }
 if ($NotesDir) { $argList += @('-NotesDir', $NotesDir) }
 if ($NoShortcuts) { $argList += '-NoShortcuts' }
 if ($SkipStart) { $argList += '-SkipStart' }

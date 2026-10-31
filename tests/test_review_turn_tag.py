@@ -220,7 +220,8 @@ class _Base(unittest.TestCase):
             params["context"] = context
         if request_id is not None:
             params["requestId"] = request_id
-        with mock.patch.object(stt_mod, "transcribe", lambda *a, **k: hear):
+        with mock.patch("app.assistant._transcribe_command",
+                        lambda *a, **k: (hear, "backend=echo-server", "ok")):
             return self.client.post("/api/assistant/voice-command", params=params,
                                     content=_wav_bytes(),
                                     headers={"Content-Type": "audio/wav"})

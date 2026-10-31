@@ -139,6 +139,20 @@ class ExistingDshProbeTests(unittest.TestCase):
         self.assertFalse(got["ok"])
         self.assertTrue(got["error"])
 
+    def test_official_desktop_cli_shim_is_accepted_without_node(self):
+        """2026-10-31：官方桌面端自带 dsh.cmd（无头 CLI），不该再要求系统 node。"""
+        base = self.tmp / "DeepSeek Harness"
+        cli = base / "resources" / "runtime" / "cli" / "bin" / "dsh.cmd"
+        cli.parent.mkdir(parents=True, exist_ok=True)
+        cli.write_text("@echo 9.9.9\r\n", encoding="ascii")
+        got = self._run(str(cli))          # 故意不给 -NodeExe
+        self.assertTrue(got["ok"], got)
+        self.assertEqual(got["node"], "")
+        self.assertEqual(Path(got["entry"]), cli.resolve())
+        parts = [p.strip('"') for p in shlex.split(got["command"], posix=False)]
+        self.assertEqual(parts, [str(cli.resolve()), "web"])
+        self.assertEqual(got["version"], "9.9.9")
+
     def test_auto_probe_checks_the_echo_root_we_pass(self):
         base = self.tmp / "auto candidate"
         tree = _fake_dsh_tree(base)
@@ -181,6 +195,21 @@ class ExistingDshWiringTests(unittest.TestCase):
         self.assertIn("$values['harnessCommand']", text)
         # 原有 -PinHarnessCommand 契约仍要保留
         self.assertIn("and $PinHarnessCommand", text)
+
+    def test_components_can_use_or_download_official_desktop(self):
+        """2026-10-31：官方桌面端优先，下载失败才回退 npm。"""
+        text = COMPONENTS.read_text(encoding="utf-8-sig")
+        self.assertIn("Resolve-OfficialDesktop", text)
+        self.assertIn("harness-install-desktop.ps1", text)
+        self.assertIn("[string]$HarnessSource = 'auto'", text)
+        self.assertIn("[switch]$Offline", text)
+        self.assertIn("$script:HarnessCommand", text)
+
+    def test_install_all_forwards_harness_source_and_offline(self):
+        text = INSTALL_ALL.read_text(encoding="utf-8-sig")
+        self.assertIn("[ValidateSet('auto', 'desktop', 'npm')][string]$HarnessSource", text)
+        self.assertIn("$argv['HarnessSource'] = $HarnessSource", text)
+        self.assertIn("$argv['Offline'] = $true", text)
 
     def test_kit_passes_ask_dsh_only_for_fresh_installs(self):
         cmd = KIT_CMD.read_text(encoding="ascii")

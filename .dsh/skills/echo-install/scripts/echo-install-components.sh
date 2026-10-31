@@ -4,29 +4,24 @@
 #
 # 谁在用它：`.dsh/skills/echo-install`（安装专用技能）。技能先跟用户确认「要哪些组件」，
 # 再把选择翻译成本脚本的参数。**不用 git、不用 GitHub**：依赖走 PyPI，模型走
-# ModelScope / hf-mirror（ECHO 内置 HF_ENDPOINT=https://hf-mirror.com）。
+# 客户端不再下载本地 STT 模型（2026-10-31：转写全部走能力后端）。
 #
 # 前提：先跑过 `bash mac/setup_mac.sh`（它建 venv、装 mac/requirements-mac.txt）。
 #       本脚本自己会检查，缺了就报错并告诉你跑哪一条。
 #
 # 用法：
-#   bash echo-install-components.sh --dest "$HOME/ECHO" --engines sherpa,whisper-base --wake
-#   bash echo-install-components.sh --dest "$HOME/ECHO" --engines sherpa --skip-pip
+#   bash echo-install-components.sh --dest "$HOME/ECHO"
+#   （2026-10-31 起客户端只装 runtime-core，不再有本地 STT 引擎/模型/唤醒）
 #
-# 参数（与 Windows 版 echo-install-components.ps1 一一对应，便于技能两边共用一套说法）：
+# 参数（2026-10-31 起客户端不再装本地 STT 引擎/唤醒/模型）：
 #   --dest <目录>          ECHO 安装目录（必填；里面要有 app/ 和 mac/）
-#   --engines <列表>       转写引擎，逗号分隔。可选：
-#                          sherpa(189MB,免 torch) / whisper-tiny(75) / whisper-base(141)
-#                          / whisper-small(464) / whisper-medium(1500) / whisper-large-v3(2950)
-#                          / sensevoice(896,需 torch) / qwen3asr(3.6GB)
-#   --wake                 装唤醒词 KWS（40 MB，默认不装：要常开麦克风）
-#   --diarize              装说话人分离（pyannote，需 HF 授权，重依赖）
-#   --accel-cuda           mac 上无意义（没有 CUDA），会明确忽略并提示
+#   --engines <列表>       **已废弃**：传了只警告、不生效
+#   --wake / --diarize / --accel-cuda   **已废弃**：唤醒取消、分离与 torch 都在能力后端
 #   --agent <名>           智能体后端：harness(默认,= DSH 标准版) / dsh / none
-#   --models-dir / --meetings-dir / --notes-dir   三处位置（留空=默认；--notes-dir 填了会开归档）
-#   --pip-index <url>      国内 pip 镜像，例如 https://pypi.tuna.tsinghua.edu.cn/simple
-#   --skip-pip             只下模型 / 只写设置，不装 pip 依赖
-#   --wait-seconds <秒>    等模型下载的上限（默认 1800）
+#   --models-dir / --meetings-dir / --notes-dir   三处位置（留空=默认）
+#   --pip-index <url>      国内 pip 镜像（核心依赖由 setup_mac.sh 的 venv 提供）
+#   --skip-pip             只写设置/智能体，不装 pip 依赖
+#   --wait-seconds <秒>    历史兼容参数（客户端不再下载模型）
 #   --help                 看这段说明
 #
 # 为什么单独有一份 .sh 而不是复用 .ps1：mac 上没有 Windows 那套语义
@@ -40,7 +35,7 @@
 set -u
 
 DEST=""
-ENGINES="sherpa"
+ENGINES=""
 WAKE=0
 DIARIZE=0
 ACCEL_CUDA=0
@@ -88,12 +83,10 @@ usage() {
     --dest <目录>        ECHO 安装目录（里面要有 app/ 和 mac/，且已跑过 mac/setup_mac.sh）
 
   选项：
-    --engines <列表>     转写引擎，逗号分隔，默认 sherpa。可选：
-                         sherpa / whisper-tiny / whisper-base / whisper-small /
-                         whisper-medium / whisper-large-v3 / sensevoice / qwen3asr
-    --wake               装唤醒词 KWS（40 MB）
-    --diarize            装说话人分离（pyannote，需 HF 授权）
-    --accel-cuda         mac 上无意义，会忽略并提示
+    --engines <列表>      已废弃：客户端不再装本地 STT 引擎（传了不生效）
+    --wake                已废弃：语音唤醒取消
+    --diarize             已废弃：说话人分离在能力后端做
+    --accel-cuda          已废弃：客户端不跑本地 torch 模型
     --agent <名>         harness（默认，标准版）/ dsh / none
     --dsh-version <版本> 标准版本地安装的版本（默认 0.1.5-rc.2）。npm 装不下来时会
                          从 npx 缓存里找**同版本**那份复制
@@ -171,86 +164,9 @@ case "$WAIT_SECONDS" in
   ''|*[!0-9]*) err "--wait-seconds 要是整数秒：$WAIT_SECONDS"; exit 2 ;;
 esac
 
-# ---------------------------------------------------------------- 引擎映射
-# 依据：app/audio/stt.py 的 resolve_engine() + WHISPER_MODELS（sttModel 取值 =
-#       sherpa|sensevoice|qwen3asr|whisper 档名），以及 app/components.py 的 model_id。
-# 改这里之前先看 tests/test_install_entry.py —— 它会把这个表与 Windows 版、与 app 对齐核对。
-
-engine_known() {
-  case "$1" in
-    sherpa|sensevoice-onnx|whisper-tiny|whisper-base|whisper-small|whisper-medium|whisper-large-v3|sensevoice|qwen3asr)
-      return 0 ;;
-    *) return 1 ;;
-  esac
-}
-
-engine_pip() {
-  case "$1" in
-    # 每个 STT 档都必须带**模型下载客户端**（modelscope 或 huggingface-hub 之一）：
-    # app/modelinfo._snapshot() 是"先 ModelScope、失败再 HF"，一个都没有就必然下不到模型。
-    # sherpa 原来只装 sherpa-onnx，而默认档恰是第一个"只有 sherpa"的档位
-    # （whisper-* 顺带带 hf-hub、sensevoice/qwen3asr 顺带带 modelscope）。
-    # 与 Windows 侧逐字对应，由 tests/test_install_entry.py 的 DownloadClientTests 守着。
-    sherpa)   echo "sherpa-onnx modelscope" ;;
-    # 2026-10-08：指令转写的**默认**引擎。只要 sherpa-onnx（**不要 torch/funasr**）。
-    sensevoice-onnx) echo "sherpa-onnx modelscope" ;;
-    whisper-tiny|whisper-base|whisper-small|whisper-medium|whisper-large-v3)
-              echo "faster-whisper huggingface-hub" ;;
-    sensevoice) echo "funasr modelscope torch" ;;
-    # 与 scripts/install-qwen3asr.ps1 的依赖**逐字一致**：qwen-asr 0.0.6 只兼容
-    # transformers 4.57.6，装成 5.x 会 import 不了（2026-09-23 实测）。
-    qwen3asr)   echo "qwen-asr==0.0.6 transformers==4.57.6 accelerate==1.12.0 modelscope torch" ;;
-    *) echo "" ;;
-  esac
-}
-
-engine_model() {
-  case "$1" in
-    sherpa)     echo "sherpa" ;;
-    sensevoice-onnx) echo "sensevoice-onnx" ;;
-    whisper-*)  echo "$1" ;;
-    sensevoice) echo "sensevoice" ;;
-    qwen3asr)   echo "qwen3asr" ;;
-    *) echo "" ;;
-  esac
-}
-
-engine_stt() {
-  case "$1" in
-    sherpa)           echo "sherpa" ;;
-    sensevoice-onnx)  echo "sensevoice-onnx" ;;
-    whisper-tiny)     echo "tiny" ;;
-    whisper-base)     echo "base" ;;
-    whisper-small)    echo "small" ;;
-    whisper-medium)   echo "medium" ;;
-    whisper-large-v3) echo "large-v3" ;;
-    sensevoice)       echo "sensevoice" ;;
-    qwen3asr)         echo "qwen3asr" ;;
-    *) echo "" ;;
-  esac
-}
-
-# 装完拿什么验证「真装上了」：import 这个模块名（有 python.exe / pip 说成功都不算数 ——
-# Windows 版就栽在「依赖一个没装、却打印安装完成」上，2026-09-21）
-engine_module() {
-  case "$1" in
-    sherpa)     echo "sherpa_onnx" ;;
-    # 2026-10-08：指令转写的默认引擎。module 填 **sherpa_onnx**（不是 funasr）——
-    # 那条"不需要 torch"的取舍就落在这里，改错了会让客户端多装 2.9 GB。
-    sensevoice-onnx) echo "sherpa_onnx" ;;
-    whisper-*)  echo "faster_whisper" ;;
-    sensevoice) echo "funasr" ;;
-    qwen3asr)   echo "qwen_asr" ;;
-    *) echo "" ;;
-  esac
-}
-
-model_label() {
-  case "$1" in
-    kws) echo "唤醒词 KWS" ;;
-    *)   echo "$1" ;;
-  esac
-}
+# 2026-10-31 用户拍板：客户端默认档不装任何本地 STT 模型/引擎，语音唤醒取消。
+# 指令 / 回顾 / 会议转写统一走能力后端（echo-server + Qwen3-ASR）。
+# 所以这里不再有 ENGINE_MAP / engine_* 映射函数（历史安装器才需要它们）。
 
 # ---------------------------------------------------------------- 运行时 / 数据根 / 端口
 
@@ -393,67 +309,9 @@ install_pip_deps() {
 }
 
 # 依赖是不是真装上了：以 import 为准（python.exe 存在、pip 说成功都不算）
-verify_engines() {
-  [ "$SKIP_PIP" -eq 1 ] && return 0
-  step "验收：这些引擎真的能用吗（逐个 import）"
-  local bad=""
-  for one in $ENGINE_LIST; do
-    local mod
-    mod="$(engine_module "$one")"
-    [ -n "$mod" ] || continue
-    if "$PY" -c "import $mod" >/dev/null 2>&1; then
-      ok "$one（import $mod 通过）"
-    else
-      err "$one 还不能用：import $mod 失败"
-      bad="$bad $one"
-    fi
-  done
-  if [ "$WAKE" -eq 1 ]; then
-    if "$PY" -c "import sherpa_onnx" >/dev/null 2>&1; then ok "唤醒词 KWS（import sherpa_onnx 通过）"
-    else err "唤醒词 KWS 还不能用：import sherpa_onnx 失败"; bad="$bad kws"; fi
-  fi
-  if [ -n "$bad" ]; then
-    err "这些还没装好：$bad"
-    say "补救：加 --pip-index https://pypi.tuna.tsinghua.edu.cn/simple 重跑本脚本（装好的会跳过）"
-    return 1
-  fi
-  return 0
-}
+# 2026-10-31：客户端没有本地 STT 引擎可验证 —— 转写链路由能力后端负责。
 
-# ---------------------------------------------------------------- 模型
-
-model_ready() { api GET /api/models "" 20 | json_query model_ready "$1"; }
-
-wait_model() {
-  local id="$1" waited=0
-  while [ "$waited" -lt "$WAIT_SECONDS" ]; do
-    local st
-    st="$(api GET /api/models "" 20 | json_query job_state "$id")"
-    if [ "$st" = "done" ]; then return 0; fi
-    if [ "$st" = "failed" ]; then
-      warn "$id 下载失败：$(api GET /api/models "" 20 | json_query job_error "$id")"
-      return 1
-    fi
-    sleep 5
-    waited=$((waited + 5))
-  done
-  warn "等 $id 超时（${WAIT_SECONDS}s）—— 下载在服务里继续跑，稍后在面板看进度"
-  return 1
-}
-
-install_model() {
-  local id="$1"
-  if [ "$(model_ready "$id")" = "1" ]; then ok "$(model_label "$id") 已经装好，跳过"; return 0; fi
-  step "下载模型：$(model_label "$id")"
-  local r
-  r="$(api POST /api/models/download "{\"id\": \"$id\"}" 30)"
-  if ! printf '%s' "$r" | grep -q '"ok"[[:space:]]*:[[:space:]]*true'; then
-    warn "触发下载失败：$r"
-    return 1
-  fi
-  say "下载中（走 ModelScope / hf-mirror 镜像）…"
-  wait_model "$id"
-}
+# 2026-10-31：客户端不再下载/安装任何本地模型。
 
 # ---------------------------------------------------------------- 设置
 
@@ -500,48 +358,9 @@ MODEL_IDS=""
 ENGINE_LIST=""
 FIRST_STT=""
 WHISPER_STT=""
-OLD_IFS="$IFS"
-IFS=','
-for one in $ENGINES; do
-  IFS="$OLD_IFS"
-  one="$(printf '%s' "$one" | tr -d '[:space:]')"
-  if [ -n "$one" ]; then
-    if engine_known "$one"; then
-      PIPS="$PIPS $(engine_pip "$one")"
-      MODEL_IDS="$MODEL_IDS $(engine_model "$one")"
-      ENGINE_LIST="$ENGINE_LIST $one"
-      [ -n "$FIRST_STT" ] || FIRST_STT="$(engine_stt "$one")"
-      case "$one" in
-        whisper-*) [ -n "$WHISPER_STT" ] || WHISPER_STT="$(engine_stt "$one")" ;;
-      esac
-    else
-      warn "不认识这个引擎，跳过：$one"
-    fi
-  fi
-  IFS=','
-done
-IFS="$OLD_IFS"
-
-if [ "$WAKE" -eq 1 ]; then
-  PIPS="$PIPS sherpa-onnx"
-  MODEL_IDS="$MODEL_IDS kws"
+if [ -n "$ENGINES" ] || [ "$WAKE" -eq 1 ] || [ "$DIARIZE" -eq 1 ] || [ "$ACCEL_CUDA" -eq 1 ]; then
+  warn "客户端已不再安装本地 STT 引擎/唤醒/分离/CUDA 组件（转写全部走能力后端）——这些参数已忽略"
 fi
-if [ "$DIARIZE" -eq 1 ]; then
-  # 与 scripts/install_pyannote.py 的装法**逐字对齐**：pyannote 4.x 的说话人嵌入走
-  # speechbrain，漏装它分离要到运行时才报 "No module named 'speechbrain'"
-  # （2026-09-23 实测，Windows 侧同样问题）。
-  PIPS="$PIPS pyannote.audio>=4.0,<5 speechbrain>=1.0,<2 huggingface-hub>=0.34,<2 torch"
-  MODEL_IDS="$MODEL_IDS pyannote"
-  warn "说话人分离的权重走 ModelScope 同名镜像（官方在 HF 上要求先同意条款）—— 请自行确认合规"
-fi
-if [ "$ACCEL_CUDA" -eq 1 ]; then
-  warn "mac 上没有 CUDA —— 忽略 --accel-cuda（Apple 芯片走 MPS，装普通版 torch 即可）"
-fi
-
-PIPS="${PIPS# }"
-MODEL_IDS="${MODEL_IDS# }"
-install_pip_deps "$PIPS"
-ENGINE_LIST="${ENGINE_LIST# }"
 
 # 智能体（标准版 harness）：**本地永久安装 + 绝对路径直连**（2026-09-22 改）。
 # 为什么不用 npx：同一台机器实测 `npx -y @deepseek-ai/dsh web` 冷启动要 **2 分 10 秒**，
@@ -629,42 +448,15 @@ wait_harness() {   # 写完设置后 ECHO 会自动拉起；这里等它 online
   return 1
 }
 
-pip_ok=0
-verify_engines && pip_ok=1
 agent_ok=0
 prepare_agent && agent_ok=1
 
 ensure_service
 
-# 依赖没装上的引擎**不要白下模型**：装了也跑不起来，还会在自检里变成一条含糊的失败
-SKIP_IDS=""
-for id in $MODEL_IDS; do
-  one=""
-  for e in $ENGINE_LIST; do
-    if [ "$(engine_model "$e")" = "$id" ]; then one="$e"; break; fi
-  done
-  if [ -n "$one" ]; then
-    mod="$(engine_module "$one")"
-    if [ -n "$mod" ] && ! "$PY" -c "import $mod" >/dev/null 2>&1; then
-      warn "跳过 $id 的模型下载：依赖 $mod 没装上（先解决依赖）"
-      SKIP_IDS="$SKIP_IDS $id"
-    fi
-  fi
-done
-
-for id in $MODEL_IDS; do
-  case " $SKIP_IDS " in *" $id "*) continue ;; esac
-  install_model "$id" || true
-done
+# 2026-10-31：客户端没有本地模型可下/可跳过。
 
 SETTINGS=()
-if [ -n "$FIRST_STT" ]; then
-  SETTINGS+=("sttModel=$FIRST_STT")
-  # 会议通常要更准：选里有 whisper 档就用它
-  if [ -n "$WHISPER_STT" ]; then SETTINGS+=("meetingSttModel=$WHISPER_STT")
-  else SETTINGS+=("meetingSttModel=$FIRST_STT"); fi
-fi
-if [ "$WAKE" -eq 1 ]; then SETTINGS+=("wakeEnabled=true"); fi
+# 2026-10-31：客户端不再使用本地转写引擎 —— 不写 sttModel/meetingSttModel/wakeEnabled。
 if [ -n "$MODELS_DIR" ]; then SETTINGS+=("modelsDir=$MODELS_DIR"); fi
 if [ -n "$MEETINGS_DIR" ]; then SETTINGS+=("meetingsDir=$MEETINGS_DIR"); fi
 if [ -n "$NOTES_DIR" ]; then SETTINGS+=("worklogVaultRoot=$NOTES_DIR" "worklogEnabled=true"); fi
@@ -690,11 +482,6 @@ if [ "${#SETTINGS[@]}" -gt 0 ]; then write_settings "${SETTINGS[@]}" || true; el
 step "自检"
 api GET /api/status "" 20 | json_query components "$AGENT" || warn "取 /api/status 失败"
 FAILED=""
-if [ "$pip_ok" -eq 0 ]; then FAILED="$FAILED 引擎依赖"; fi
-for id in $MODEL_IDS; do
-  if [ "$(model_ready "$id")" = "1" ]; then ok "$(printf '%-14s' "$id") 模型就绪"
-  else err "$(printf '%-14s' "$id") 模型还没好"; FAILED="$FAILED $id"; fi
-done
 wait_harness || FAILED="$FAILED 智能体"
 
 # 两个默认分组（「会议空间」/「指令空间」）：装好就该在 DSH 侧栏看到，而不是等开完
@@ -730,9 +517,8 @@ fi
 step "登记安装"
 REPORT=$(cat <<JSON
 {"installer":"echo-install skill","platform":"macos","destDir":"$DEST",
- "engines":"$ENGINE_LIST","wake":$([ "$WAKE" -eq 1 ] && echo true || echo false),
- "diarize":$([ "$DIARIZE" -eq 1 ] && echo true || echo false),
- "agent":"$AGENT","models":"$MODEL_IDS","notes":"pip: $PIPS"}
+ "engines":"","wake":false,"diarize":false,
+ "agent":"$AGENT","models":"","notes":"客户端无本地 STT（转写走能力后端）"}
 JSON
 )
 r="$(api POST /api/install/report "{\"report\": $REPORT}" 30)"

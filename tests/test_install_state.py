@@ -1,766 +1,95 @@
 # -*- coding: utf-8 -*-
-"""安装状态（技能优先）与下载状态词的守卫。
+"""install_state（2026-10-31 口径）：客户端不再有本地 STT 引擎/模型。
 
-背景（2026-09-21 实测反馈）
---------------------------
-同事在一台新机器上跑安装技能，反馈三件事，其中两件在这里钉住：
-
-1. **技能装完，进 ECHO 还是进向导页** —— 面板的首装判据只有 `installed-components.json`，
-   而那个文件只有向导末页才写。技能现在会 `POST /api/install/report`，`install_state.declared()`
-   也认它，面板就不再提示"没装完"、也不再自动进向导。
-2. **选 qwen3asr 一直显示"正在准备中 / 排队中"** —— 根因是状态词表不一致：
-   `modelinfo._download_worker` 失败写 `"failed"`，而 `wizard.execution_state` 判断 `"error"`，
-   于是**失败被当成"还没开始"**。这里用真实的 `jobs()` 形状把它钉死。
+这里钉住仍然有效的部分：
+* 安装报告/安装模式/首次启用标记的读写；
+* `wanted()` / `missing()` 不再报"缺本地引擎/模型/唤醒/分离"，只剩智能体；
+* 客户端引擎表为空（历史设置值不再参与判断）。
 """
-import json
 import os
-import re
 import shutil
-import sys
 import tempfile
 import unittest
 from unittest.mock import patch
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from app import install_state, wizard                      # noqa: E402
-
-
-class DownloadStateVocabularyTests(unittest.TestCase):
-    """失败必须显示"没成 + 原因"，不能显示"排队中"。"""
-
-    def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="echo-installstate-")
-        self.addCleanup(__import__("shutil").rmtree, self.tmp, ignore_errors=True)
-        self.plan_file = os.path.join(self.tmp, "plan.json")
-        wizard.save_plan({
-            "state": "running",
-            "built": {"downloads": [
-                {"component": "stt-qwen3asr", "modelId": "qwen3asr", "label": "Qwen3-ASR", "approxMb": 3600},
-                {"component": "stt-sherpa", "modelId": "sherpa", "label": "sherpa", "approxMb": 189},
-            ]},
-            "execution": {"skipped": [], "failed": []},
-        }, self.plan_file)
-
-    def _state_with(self, jobs):
-        with patch("app.modelinfo.jobs", lambda: {"active": None, "items": jobs}):
-            return wizard.execution_state(self.plan_file)
-
-    def test_failed_job_is_reported_as_failed_with_reason(self):
-        """**这就是同事看到的那个 bug**：worker 写 "failed"，向导原来只认 "error"。"""
-        st = self._state_with({
-            "qwen3asr": {"status": "failed", "message": "ImportError: No module named 'modelscope'"},
-        })
-        row = [r for r in st["items"] if r["modelId"] == "qwen3asr"][0]
-        self.assertEqual("error", row["state"], "失败必须显示成失败")
-        self.assertEqual("没成", row["text"])
-        self.assertIn("modelscope", row["message"], "要把原因带出来，别只说'没成'")
-
-    def test_legacy_error_spelling_still_works(self):
-        st = self._state_with({"qwen3asr": {"status": "error", "error": "boom"}})
-        row = [r for r in st["items"] if r["modelId"] == "qwen3asr"][0]
-        self.assertEqual("error", row["state"])
-
-    def test_unknown_status_is_queued_and_done_is_done(self):
-        st = self._state_with({"sherpa": {"status": "done"}})
-        rows = {r["modelId"]: r for r in st["items"]}
-        self.assertEqual("done", rows["sherpa"]["state"])
-        self.assertEqual("queued", rows["qwen3asr"]["state"], "没见过的状态保守显示为排队中")
-        self.assertEqual(1, st["finished"])
-
-    def test_modelinfo_job_state_normalises(self):
-        from app import modelinfo
-        self.assertEqual("failed", modelinfo.job_state({"status": "failed"}))
-        self.assertEqual("failed", modelinfo.job_state({"status": "error"}))
-        self.assertEqual("running", modelinfo.job_state({"status": "running"}))
-        self.assertEqual("done", modelinfo.job_state({"status": "done"}))
-        self.assertEqual("queued", modelinfo.job_state({}))
-        self.assertEqual("queued", modelinfo.job_state(None))
+from app import install_state
 
 
 class InstallReportTests(unittest.TestCase):
-    """技能登记 → declared() 为真 → 面板不再当"没装完"。"""
-
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="echo-installreport-")
-        self.addCleanup(__import__("shutil").rmtree, self.tmp, ignore_errors=True)
-        self.path = os.path.join(self.tmp, "install-report.json")
-
-    def test_no_report_no_wizard_file_means_not_declared(self):
-        with patch.object(wizard, "installed_path", lambda: os.path.join(self.tmp, "nope.json")):
-            self.assertFalse(install_state.declared(self.path))
-
-    def test_wizard_file_alone_counts_as_declared(self):
-        legacy = os.path.join(self.tmp, "installed-components.json")
-        with open(legacy, "w", encoding="utf-8") as fh:
-            fh.write("{}")
-        with patch.object(wizard, "installed_path", lambda: legacy):
-            self.assertTrue(install_state.declared(self.path),
-                            "老安装（向导装的）不能被当成首装")
+        self.tmp = tempfile.mkdtemp(prefix="echo-install-state-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.report = os.path.join(self.tmp, "install-report.json")
+        self.mode = os.path.join(self.tmp, "install-mode.json")
+        self.first = os.path.join(self.tmp, "first-run.json")
 
     def test_report_roundtrip_and_declared(self):
-        saved = install_state.save_report({"engines": ["sherpa"], "agent": "harness"}, self.path)
-        self.assertEqual(install_state.REPORT_SCHEMA, saved["schema"])
-        self.assertTrue(saved.get("savedAt"))
-        with patch.object(wizard, "installed_path", lambda: os.path.join(self.tmp, "nope.json")):
-            self.assertTrue(install_state.declared(self.path))
-            back = install_state.load_report(self.path)
-        self.assertEqual(["sherpa"], back["engines"])
+        with patch.object(install_state, "_wizard_file_exists", lambda: False):
+            self.assertFalse(install_state.declared(self.report))
+        saved = install_state.save_report({"agent": "harness", "engines": ["stt-sherpa"]},
+                                          path=self.report)
+        self.assertEqual(saved["schema"], install_state.REPORT_SCHEMA)
+        self.assertTrue(install_state.declared(self.report))
+        self.assertEqual(install_state.load_report(self.report)["agent"], "harness")
 
-    def test_broken_report_file_does_not_raise(self):
-        with open(self.path, "w", encoding="utf-8") as fh:
-            fh.write("{ not json")
-        self.assertEqual({}, install_state.load_report(self.path))
+    def test_broken_report_does_not_raise(self):
+        with open(self.report, "w", encoding="utf-8") as fh:
+            fh.write("{not json")
+        self.assertEqual(install_state.load_report(self.report), {})
 
-    def test_wanted_falls_back_to_settings_when_no_report(self):
-        """没有报告时（老安装）从设置推"用户想要什么"。"""
-        report = {}
-        self.assertEqual({}, report)
-        with patch("app.config.settings.get", side_effect=lambda k, d=None: {
-                "sttModel": "base", "meetingSttModel": "sherpa",
-                "wakeEnabled": True, "agentBackend": "harness"}.get(k, d)):
-            want = install_state.wanted(report)
-        self.assertIn("whisper-base", want["engines"])
-        self.assertIn("sherpa", want["engines"])
-        self.assertTrue(want["wake"])
-        self.assertEqual("harness", want["agent"])
-
-    def test_missing_calls_out_a_missing_module(self):
-        report = {"engines": ["qwen3asr"], "agent": "none"}
-        # 依赖探测注入成"没有"，模型探测注入成"就绪" → 必须报"缺依赖"
-        with patch.object(install_state, "_module_ok", lambda name: False), \
-                patch.object(install_state, "_model_ready", lambda mid: True):
-            miss = install_state.missing(report)
-        self.assertTrue(miss)
-        # 报的必须是**真正的引擎包** qwen_asr：写 transformers 时，装了 transformers 5.x
-        # 而没装 qwen-asr 也会判"就绪"，用户拿到的是一句莫名其妙的运行时错
-        # （2026-09-23 实测：RuntimeError: qwen-asr package is required for Qwen3-ASR）。
-        self.assertIn("qwen_asr", miss[0]["reason"])
-
-    def test_missing_is_empty_when_everything_checks_out(self):
-        report = {"engines": ["sherpa"], "agent": "none"}
-        with patch.object(install_state, "_module_ok", lambda name: True), \
-                patch.object(install_state, "_node_ok", lambda: True), \
-                patch.object(install_state, "_harness_online", lambda: True), \
-                patch.object(install_state, "_dsh_online", lambda: True), \
-                patch.object(install_state, "_model_ready", lambda mid: True):
-            self.assertEqual([], install_state.missing(report))
-
-    def test_desktop_choice_is_judged_by_the_desktop_not_the_harness(self):
-        """选了 DSH Desktop 时，在线与否要看**桌面版**（2026-09-23 迁移实测撞到）。
-
-        `_harness_online()` 在 `harness_proc.requested()` 为假（= agentBackend 不是 harness）
-        时**必然返回 False**，而原来 dsh 分支也去问它 —— 于是选了 Desktop 的机器永远被告知
-        "harness 没在运行、还没装完"。与同事报过的「拿另一个适配器的状态判断」是同一个病。
-        """
-        report = {"engines": [], "agent": "dsh"}
-        # 显式钉住设置（2026-10-04）：这一段现在以 `agentBackend` 为准，
-        # 不打桩就会跟着**开发机上当前的选择**跑（本机切到 dsh 时这条才碰巧过）。
-        with patch("app.config.settings.get", side_effect=lambda k, d=None: {
-                "agentBackend": "dsh"}.get(k, d)):
-            # Desktop 在线 + harness 必然"不在线"：不该报任何缺失
-            with patch.object(install_state, "_dsh_online", lambda: True), \
-                    patch.object(install_state, "_harness_online", lambda: False), \
-                    patch.object(install_state, "_node_ok", lambda: False):
-                self.assertEqual([], install_state.missing(report),
-                                 "选了 Desktop 却拿 harness 的状态报缺失")
-            # Desktop 不在线：要把原因说成桌面版，别再提 harness
-            with patch.object(install_state, "_dsh_online", lambda: False):
-                miss = install_state.missing(report)
-        self.assertTrue(miss)
-        self.assertIn("DSH Desktop 没在运行", miss[0]["reason"])
-        self.assertNotIn("harness 没在运行", miss[0]["reason"])
-
-    def test_harness_choice_still_checks_node_and_harness(self):
-        report = {"engines": [], "agent": "harness"}
-        with patch("app.config.settings.get", side_effect=lambda k, d=None: {
-                "agentBackend": "harness"}.get(k, d)):
-            with patch.object(install_state, "_dsh_online", lambda: True), \
-                    patch.object(install_state, "_node_ok", lambda: False):
-                miss = install_state.missing(report)
-        self.assertTrue(miss)
-        self.assertIn("Node.js", miss[0]["reason"])
-
-    def test_the_live_setting_beats_a_stale_install_report(self):
-        """**报告是旧的、设置是新的**时以设置为准（2026-10-04 用户实测撞到）。
-
-        现场：装机报告写着 `agent=harness`（装机那一刻的选择），用户在面板里把执行智能体
-        改成 DSH Desktop → harness 被主动停掉（这是**对的行为**），可这段检查仍旧照报告去问
-        harness → 横幅永远说"harness 没在运行、还没装完"。
-        用户原话："我改成 dsh desktop 你停掉标准版，这个是合理的，报错是因为你还在查标准版？
-        如果是这样，你就要把这段检查目标改成跟设置一样，或者跟仪表盘最下方的探测方式一致。"
-        —— 仪表盘底部那个 Agent 卡片看的就是 `agentBackend`，所以这里也以它为准。
-        """
-        report = {"engines": [], "agent": "harness"}          # 旧报告
-        with patch("app.config.settings.get", side_effect=lambda k, d=None: {
-                "agentBackend": "dsh"}.get(k, d)):
-            with patch.object(install_state, "_dsh_online", lambda: True), \
-                    patch.object(install_state, "_harness_online", lambda: False), \
-                    patch.object(install_state, "_node_ok", lambda: False):
-                self.assertEqual([], install_state.missing(report),
-                                 "报告说 harness、设置说 dsh —— 该按设置(dsh)判，别去查 harness")
-            with patch.object(install_state, "_dsh_online", lambda: False):
-                miss = install_state.missing(report)
-        self.assertTrue(miss)
-        self.assertIn("DSH Desktop 没在运行", miss[0]["reason"])
-        self.assertNotIn("harness", miss[0]["reason"])
-
-    def test_state_exposes_engine_detail(self):
-        report = {"engines": ["sherpa"], "agent": "none"}
-        with patch.object(install_state, "load_report", lambda path="": report), \
-                patch.object(install_state, "declared", lambda path="": True), \
-                patch.object(install_state, "_module_ok", lambda name: True), \
-                patch.object(install_state, "_node_ok", lambda: True), \
-                patch.object(install_state, "_harness_online", lambda: True), \
-                patch.object(install_state, "_dsh_online", lambda: True), \
-                patch.object(install_state, "_model_ready", lambda mid: mid == "sherpa"):
-            st = install_state.state()
-        self.assertTrue(st["declared"])
-        self.assertTrue(st["ready"])
-        self.assertEqual("sherpa", st["engines"][0]["id"])
-        self.assertTrue(st["engines"][0]["modelReady"])
-
-    def test_engine_specs_match_the_app_engine_choices(self):
-        """权威表里的 stt 值必须是 app 认得的（与安装器镜像由另一个测试盯）。"""
-        from app.audio import stt as stt_mod
-        for engine, spec in install_state.ENGINE_SPECS.items():
-            got_engine, _model = stt_mod.resolve_engine(spec["stt"])
-            if engine.startswith("whisper-"):
-                self.assertEqual("whisper", got_engine, engine)
-                self.assertIn(spec["stt"], stt_mod.WHISPER_MODELS, engine)
-            elif engine == "sherpa":
-                self.assertEqual("sherpa", got_engine)
-            elif engine == "sensevoice-onnx":
-                # 2026-10-08：指令转写的默认引擎。它的 pip 模块是 **sherpa_onnx**
-                # （不是 funasr）—— 那条"不需要 torch"的取舍就体现在这里。
-                self.assertEqual("sensevoice-onnx", got_engine)
-                self.assertEqual("sherpa_onnx", spec["module"],
-                                 "sensevoice-onnx 必须复用 sherpa_onnx，"
-                                 "别改成 funasr（会把 torch 拖进客户端）")
-            elif engine == "sensevoice":
-                self.assertEqual("sensevoice", got_engine)
-            elif engine == "qwen3asr":
-                self.assertEqual("qwen3asr", got_engine)
-            else:
-                self.fail("测试没覆盖这个引擎：%s" % engine)
+    def test_install_mode_and_first_run(self):
+        self.assertEqual(install_state.install_mode(self.mode), "")
+        install_state.save_install_mode("fresh", path=self.mode)
+        self.assertEqual(install_state.install_mode(self.mode), "fresh")
+        self.assertFalse(install_state.first_run_done(self.first))
+        install_state.mark_first_run_done(mode="fresh", path=self.first)
+        self.assertTrue(install_state.first_run_done(self.first))
 
     def test_report_never_stores_secret_values(self):
-        """报告是明文，可能被拷来拷去 —— 结构里不许出现"值"的设置键。"""
-        src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                                "app", "install_state.py"), encoding="utf-8").read()
-        for risky in ("api_key", "apiKey", "token", "secret", "password"):
-            self.assertNotIn(risky, src.lower(), "安装状态里不该出现任何密钥字段")
-        # 报告里只记"装了什么"，不记设置值 —— 顺便确认 json 是唯一的持久化方式
-        self.assertIn("install-report.json", src)
-
-
-class ComponentsScriptReadsTheApiRightTests(unittest.TestCase):
-    """组件安装脚本读 ECHO 接口的两处细节 —— 都是同事 2026-09-25 实测报告里的坑。
-
-    * **C**：`Wait-Model` 原来读 `/api/models` 的 `jobs.<id>`，而真实形状是
-      `jobs.items.<id>`（`modelinfo.jobs()` 返回 `{active, items}`）→ `$job` 恒 null →
-      状态归一成 `queued` → **空等到 1800 秒超时**。症状是"脚本卡住了"，没人会想到是读错了路径。
-    * **G**：`Invoke-Api` 原来用 `Invoke-RestMethod` 直接吃 JSON，而 Windows PowerShell 5.1
-      在响应头没有 charset 时按 ISO-8859-1 解 —— FastAPI 回的 `application/json` 正好不带
-      charset，于是 `install-*.log` 里的中文全成了 `ç¬ç«` 这种乱码，排障时误导人。
-    """
-
-    @classmethod
-    def setUpClass(cls):
-        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        cls.path = os.path.join(root, ".dsh", "skills", "echo-install", "scripts",
-                                "echo-install-components.ps1")
-        with open(cls.path, encoding="utf-8-sig") as fh:
-            cls.text = fh.read()
-
-    def _fn(self, name):
-        body = self.text[self.text.index("function %s" % name):]
-        return body[:body.index("\n}") + 2]
-
-    def test_wait_model_reads_jobs_items(self):
-        body = self._fn("Wait-Model")
-        self.assertIn("/api/models", body, "这段该是查下载任务的")
-        self.assertIn(").items", body,
-                      "必须读 jobs.items.<id> —— 读 jobs.<id> 会永远拿到 $null（报告 §4.2 C）")
-
-    def test_invoke_api_decodes_utf8_itself(self):
-        body = self._fn("Invoke-Api")
-        self.assertIn("UTF8.GetString", body,
-                      "PS 5.1 会把不带 charset 的 JSON 按 Latin-1 解 → 中文乱码（报告 §4.4 G）")
-        # 只断言"没有**调用**它"：函数里那句解释性注释本来就会提到这个名字
-        # （第一版用 assertNotIn("Invoke-RestMethod") 被自己的注释抓了 —— 与 `fp=` 那次同类）。
-        self.assertNotIn("Invoke-RestMethod @", body,
-                         "别再用 Invoke-RestMethod —— 它没有能救编码的开关")
-
-    def test_it_matches_the_real_api_shape(self):
-        """顺带钉住"真实形状"这一侧：`modelinfo.jobs()` 必须仍然是 `{active, items}`。
-
-        两边各改一半（脚本改成 items、接口又改回别的形状）时，这条会红。
-        """
-        from app import modelinfo
-        shape = modelinfo.jobs()
-        self.assertIn("items", shape)
-        self.assertIn("active", shape)
-
-
-class PyannoteSourceTests(unittest.TestCase):
-    """说话人分离的权重：**改成从 ModelScope 自动装**（2026-09-21）。
-
-    背景：HF 上 pyannote 三个仓库是 gated（要同意条款 + Token），以前只能让用户自己去
-    HF 同意再拉 —— 同事选了"说话人分离"就卡在这一步。实测 ModelScope 上**同名仓库匿名可下**
-    （segmentation-3.0 / wespeaker-voxceleb-resnet34-LM / speaker-diarization-community-1，
-    含 plda/plda.npz 与 plda/xvec_transform.npz），于是能和别的引擎一样一键下载。
-
-    这里钉三件事：① 下载闸门不再拒绝；② 落盘目录与 `app/audio/diarize.py` 期望的一致；
-    ③ 权重**仍然不随交付包分发**（never_ship 不动）—— 那是"再分发"与"用户机器上下载"的分界。
-    """
-
-    def setUp(self):
-        from app import modelinfo
-        self.modelinfo = modelinfo
-
-    def test_download_gate_no_longer_refuses_pyannote(self):
-        entry = self.modelinfo._by_id("pyannote")
-        self.assertIsNotNone(entry, "目录里得有 pyannote")
-        self.assertIsNot(entry.get("downloadable"), False,
-                         "downloadable=False 会让面板和技能都下不了它")
-
-    def test_assets_land_where_diarize_looks(self):
-        import re
-        src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                                "app", "audio", "diarize.py"), encoding="utf-8").read()
-        folders = {folder for _repo, folder, _files in self.modelinfo.PYANNOTE_ASSETS}
-        for folder in folders:
-            self.assertIn('"%s"' % folder, src,
-                          f"diarize.py 里找不到 {folder} —— 下载下来也用不上")
-        # plda 要落在 <folder>/plda/ 下（diarize 的 plda_dir 多拼了一层）
-        plda_files = [f for _r, folder, files in self.modelinfo.PYANNOTE_ASSETS
-                      if folder == "pyannote-plda-local" for f in files]
-        self.assertTrue(any(f.startswith("plda/") for f in plda_files),
-                        "plda 的两个文件必须在 plda/ 子目录里")
-
-    def test_weights_are_still_never_shipped(self):
-        from app import components
-        entry = [i for i in components.load_manifests() if i["id"] == "diarize-pyannote"][0]
-        self.assertTrue(entry.get("never_ship"),
-                        "权重仍不许随交付包分发 —— 只是允许在用户机器上下载")
-        self.assertEqual("modelscope", entry.get("source"))
-
-    def test_skill_installers_wire_diarize_to_the_download(self):
-        """技能里 --diarize 必须真的**触发下载**，不能只打一句提示。"""
-        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        ps1 = open(os.path.join(root, ".dsh", "skills", "echo-install", "scripts",
-                                "echo-install-components.ps1"), encoding="utf-8").read()
-        sh = open(os.path.join(root, ".dsh", "skills", "echo-install", "scripts",
-                               "echo-install-components.sh"), encoding="utf-8").read()
-        self.assertIn("@('pyannote',", ps1, "Windows 技能要把 pyannote 加进待下载清单")
-        self.assertIn("pyannote", sh, "mac 技能同理")
-
-
-class VCRuntimeGuidanceTests(unittest.TestCase):
-    """Windows 上"包在、导不进来"要指向 VC++ 运行库（2026-09-21 同事实测卡在这）。"""
-
-    def test_skill_preflights_and_installs_vc_runtime(self):
-        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        ps1 = open(os.path.join(root, ".dsh", "skills", "echo-install", "scripts",
-                                "echo-install-components.ps1"), encoding="utf-8").read()
-        # 官方检测点（注册表 14.0\VC\Runtimes\x64 的 Installed=1）
-        self.assertIn("VC\\Runtimes\\x64", ps1, "要用官方注册表检测点判断装没装")
-        self.assertIn("aka.ms/vs/17/release/vc_redist.x64.exe", ps1, "要给官方下载地址")
-        self.assertIn("function Install-VCRuntime", ps1, "要能自己把它装上")
-        # 失败要区分"缺包"和"缺 DLL"
-        self.assertIn("DLL load failed", ps1)
-        self.assertIn("function Test-DllLoadFailure", ps1)
-
-    def test_skill_docs_mention_vc_runtime(self):
-        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        md = open(os.path.join(root, ".dsh", "skills", "echo-install", "SKILL.md"),
-                  encoding="utf-8").read()
-        self.assertIn("vc_redist.x64.exe", md, "技能文档的失败表要写这一条")
-        self.assertIn("DLL load failed", md)
-
-    def test_missing_hint_mentions_vc_runtime_on_windows(self):
-        report = {"engines": ["sherpa"], "agent": "none"}
-        with patch.object(install_state, "_module_ok", lambda name: False), \
-                patch.object(install_state, "_model_ready", lambda mid: True), \
-                patch.object(install_state, "_is_windows", lambda: True):
-            miss = install_state.missing(report)
-        self.assertIn("Visual C++", miss[0]["fix"], "Windows 上要顺手提示 VC++ 运行库")
-
-    def test_windows_detection_goes_through_the_platform_seam(self):
-        """app/ 里不许直接写 os.name 分支（audit-paths 会拦，2026-09-21 实测）。"""
-        src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                                "app", "install_state.py"), encoding="utf-8").read()
-        self.assertNotIn('os.name == "nt"', src, "要走 platform.current()，别自己判 os.name")
-        self.assertIn("platform as echo_platform", src)
-
-
-class EngineProblemTests(unittest.TestCase):
-    """`engine_problem()` —— "这个 sttModel 取值现在能不能真用"（2026-09-23 事故）。
-
-    事故：用户在面板上把命令转写引擎改成 sherpa，而稳定版 runtime-core 里没有
-    `sherpa_onnx`。安装报告里登记的是另一个引擎，所以 `missing()` 一句话都不说；
-    设置热生效也绕过了校验 —— 直到说第一句命令才静默转写出空串。
-    """
-
-    def test_missing_module_is_reported(self):
-        with patch("app.install_state._module_ok", lambda name: name != "sherpa_onnx"), \
-                patch("app.install_state._model_ready", lambda mid: True):
-            problem = install_state.engine_problem("sherpa")
-        self.assertIn("sherpa_onnx", problem, "要说清缺哪个模块")
-        self.assertIn("能力", problem, "还要告诉用户去哪儿装")
-
-    def test_missing_model_is_reported(self):
-        with patch("app.install_state._module_ok", lambda name: True), \
-                patch("app.install_state._model_ready", lambda mid: False):
-            problem = install_state.engine_problem("sherpa")
-        self.assertIn("模型", problem)
-
-    def test_ready_engine_has_no_problem(self):
-        with patch("app.install_state._module_ok", lambda name: True), \
-                patch("app.install_state._model_ready", lambda mid: True):
-            self.assertEqual(install_state.engine_problem("sherpa"), "")
-            self.assertEqual(install_state.engine_problem("sensevoice"), "")
-
-    def test_unknown_choice_is_not_judged(self):
-        """认不出的值交给 stt.resolve_engine 的既有回退（它自己有告警），这里不表态。"""
-        self.assertEqual(install_state.engine_problem("不存在的引擎"), "")
-        self.assertEqual(install_state.engine_problem(""), "")
-
-    def test_engine_spec_maps_model_id_back_to_the_engine(self):
-        self.assertEqual(install_state.engine_spec("sherpa")["module"], "sherpa_onnx")
-        self.assertEqual(install_state.engine_spec("whisper-base")["stt"], "base")
-        self.assertEqual(install_state.engine_spec("kws"), {}, "KWS 不是转写引擎")
-
-    def test_problem_never_raises_on_a_broken_probe(self):
-        with patch("app.install_state._module_ok", side_effect=RuntimeError("boom")):
-            try:
-                install_state.engine_problem("sherpa")
-            except Exception as exc:                       # pragma: no cover - 失败即测试失败
-                self.fail("校验不能把调用方（保存设置）带崩：%s" % exc)
-
-
-class InterpreterHelperTests(unittest.TestCase):
-    """解释器助手（`app/interpreter.py`）—— 「复制命令」开箱即用的那一层。
-
-    同事 2026-09-25 在一台干净装机上实测：面板「设置 → 模型」的「复制命令」给的是
-    **裸 `python`**，而那台机器是 python.org 的嵌入包（`python` 不在 PATH 上）—— 粘进
-    PowerShell 直接"不是内部或外部命令"，他自己补了绝对路径才跑起来。同一个面板上的
-    「复制安装命令」早就用了 `sys.executable`：根因是"算解释器"被抄了两份、只改了一份。
-    """
-
-    def test_pythonw_is_swapped_for_python(self):
-        """ECHO 服务跑在 `pythonw.exe` 下（无控制台）：拿它跑 `-c` / pip 会"什么都不显示"。"""
-        from app import interpreter
-
-        tmp = tempfile.mkdtemp(prefix="echo-interp-")
-        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
-        open(os.path.join(tmp, "python.exe"), "wb").close()
-        with patch.object(sys, "executable", os.path.join(tmp, "pythonw.exe")):
-            self.assertEqual(os.path.join(tmp, "python.exe"), interpreter.python_executable())
-        # 同目录没有 python.exe 时保持原样（不假装换过）
-        empty = tempfile.mkdtemp(prefix="echo-interp-")
-        self.addCleanup(shutil.rmtree, empty, ignore_errors=True)
-        with patch.object(sys, "executable", os.path.join(empty, "pythonw.exe")):
-            self.assertEqual(os.path.join(empty, "pythonw.exe"), interpreter.python_executable())
-
-    def test_path_with_spaces_is_quoted(self):
-        """路径含空格也要能跑：解释器路径必须加引号，且 PowerShell 里要 `&` 调用。"""
-        from app import interpreter
-
-        spaced = os.path.join(tempfile.gettempdir(), "echo space", "python.exe")
-        with patch.object(sys, "executable", spaced):
-            self.assertEqual(spaced, interpreter.python_executable())
-            cmd = interpreter.python_command("-c", "print('hi')")
-            pip_cmd = interpreter.pip_install_command("funasr")
-        self.assertIn('"%s"' % spaced, cmd, "含空格的解释器路径必须加引号：%s" % cmd)
-        self.assertIn("-c", cmd)
-        self.assertIn('"%s"' % spaced, pip_cmd)
-        self.assertIn("-m pip install funasr", pip_cmd)
-        if os.name == "nt":
-            # PowerShell：`&` 是调用运算符（路径带引号时必须用它，否则只是一个字符串表达式）
-            self.assertTrue(cmd.startswith('& "'), cmd)
-            self.assertIn('"print(\'hi\')"', cmd, "参数含括号/空格时也要加引号：%s" % cmd)
-        else:
-            import shlex
-            self.assertEqual([spaced, "-c", "print('hi')"], shlex.split(cmd),
-                             "POSIX 上必须仍是**能跑的一行命令**（不能带 PowerShell 的 &）：%s" % cmd)
-
-    def test_no_interpreter_means_no_command(self):
-        """算不出解释器时返回空串 —— 不许硬编一个 `python` 糊弄过去（那正是这个 bug）。"""
-        from app import interpreter
-
-        with patch.object(sys, "executable", ""):
-            self.assertEqual("", interpreter.python_command("-c", "print(1)"))
-            self.assertEqual("", interpreter.pip_install_command("funasr"))
-
-
-#: 「裸解释器」：不是路径、前面也没有 `-m ` 的 python / pip 调用。
-#: 负向后顾 `(?<![\w./\\:-])` 用来放过 `C:\…\python.exe` 这种**绝对路径**。
-_BARE_INTERPRETER_RE = re.compile(r"(?<![\w./\\:-])(?<!-m )(python[0-9.]*|pip[0-9.]*)(?=\s|$)")
-
-
-class CatalogCommandsArePasteAndRunTests(unittest.TestCase):
-    """**catalog 全量扫描**：每条 `cmd` 都得是"粘进终端就能跑"的。
-
-    为什么扫全量而不是挑一条测（同事踩的就是漏改）：`iic/SenseVoiceSmall` 与
-    `faster_whisper` 那两条写的是裸 `python`，别的条目（qwen3asr 的平台脚本、pyannote 的
-    hf 脚本）本来就是好的 —— 只测一条会漏掉下一次"新加的档位又写回裸 python"。
-    """
-
-    def _entries_with_cmd(self):
-        from app import modelinfo
-        return [(e["id"], str(e.get("cmd") or "")) for e in modelinfo.CATALOG if e.get("cmd")]
-
-    def test_every_cmd_has_a_label_when_it_has_one_at_all(self):
-        """`cmd_label` 只允许"有命令且有标签"或"两者都没有"，不许出现空标签。"""
-        from app import modelinfo
-        bad = []
-        for e in modelinfo.CATALOG:
-            label = e.get("cmd_label")
-            if label is None:
-                continue
-            if not str(label).strip():
-                bad.append(e["id"])
-            if not e.get("cmd"):
-                bad.append("%s: 有标签没命令" % e["id"])
-        self.assertEqual(bad, [], "cmd_label 与 cmd 对不上：%s" % bad)
-
-    def test_no_entry_calls_a_bare_interpreter(self):
-        bad = []
-        for mid, cmd in self._entries_with_cmd():
-            if re.match(r"\s*(python|pip)", cmd, re.I):
-                bad.append("%s: 裸解释器开头 -> %s" % (mid, cmd[:60]))
-                continue
-            for hit in _BARE_INTERPRETER_RE.finditer(cmd):
-                bad.append("%s: 命令里出现裸 %r" % (mid, hit.group(0)))
-        self.assertEqual(bad, [], "这些命令在一台干净装机上跑不了：%s" % bad)
-
-    def test_every_cmd_is_either_absolute_or_a_platform_script(self):
-        """每条命令都得有一个"为什么它开箱即用"的理由（否则就是漏改）。"""
-        from app import interpreter, modelinfo, paths
-        from app import platform as echo_platform
-
-        py = interpreter.python_executable()
-        hf = echo_platform.hf_executable(paths.echo_root())
-        self.assertTrue(py and os.path.isabs(py), "算不出本机解释器的绝对路径")
-        bad, checked = [], 0
-        for mid, cmd in self._entries_with_cmd():
-            checked += 1
-            ok = (py in cmd                                        # ① 本机解释器全路径
-                  or cmd == echo_platform.model_install_command(mid)   # ② 平台一键安装脚本
-                  or (hf and hf in cmd))                           # ③ venv 里的 hf 下载脚本
-            if not ok:
-                bad.append("%s -> %s" % (mid, cmd[:80]))
-        self.assertGreaterEqual(checked, 8, "catalog 里带 cmd 的条目变少了？扫到的：%s" % checked)
-        self.assertEqual(bad, [], "这些命令既没带本机解释器、也不是平台脚本：%s" % bad)
-
-    def test_python_commands_appear_in_the_scan_and_carry_the_interpreter(self):
-        """正向断言：真的是 python 命令的那些条目，必须带**本机**解释器（含 basename）。"""
-        from app import interpreter
-
-        py = interpreter.python_executable()
-        checked = []
-        for mid, cmd in self._entries_with_cmd():
-            if "-c " not in cmd and "-m pip" not in cmd:
-                continue                       # 平台脚本 / hf 脚本：不该硬塞解释器
-            checked.append(mid)
-            with self.subTest(entry=mid):
-                self.assertIn(py, cmd)
-                self.assertIn(os.path.basename(py), cmd)
-        self.assertIn("sensevoice", checked, "扫到的是空的 —— 扫描规则失效了？")
-        self.assertTrue(any(m.startswith("whisper-") for m in checked), checked)
-
-
-class MissingDependencyGuidanceTests(unittest.TestCase):
-    """「下载」因缺依赖被拒时，要把**怎么修**直接摆出来（同事 2026-09-25 实测）。
-
-    当时面板只报一句"缺依赖"：用户不知道该装什么，更不知道装完还要**回来再点一次下载**。
-    所以响应里三件都要有 —— 原因 / 那条安装命令 / 下一步。
-    """
-
-    def setUp(self):
-        from app import paths
-        self._get = paths._settings_get
-        self.tmp = tempfile.mkdtemp(prefix="echo-depguide-")
-        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
-        paths._settings_get = lambda name: self.tmp if name == "modelsDir" else ""
-        self.addCleanup(setattr, paths, "_settings_get", self._get)
-
-    def test_download_refusal_carries_reason_command_and_next_step(self):
-        from app import interpreter, modelinfo
-        with patch.object(modelinfo, "_pkg_available", lambda name: False):
-            ok, msg = modelinfo.start_download("sensevoice")
-        self.assertFalse(ok)
-        self.assertIn("funasr", msg, "要说清缺哪个包")
-        self.assertIn("-m pip install funasr", msg, "要给出那条安装命令")
-        self.assertIn(interpreter.python_executable(), msg, "命令要带本机解释器全路径")
-        self.assertIn("再点一次", msg, "要讲清第二步：装完再回来点一次下载")
-
-    def test_refusal_is_a_refusal_not_a_started_job(self):
-        """拒绝必须是**拒**：不能一边报缺依赖、一边把后台任务挂上（用户会以为在下）。"""
-        from app import modelinfo
-        with patch.object(modelinfo, "_pkg_available", lambda name: False):
-            modelinfo.start_download("sensevoice")
-        self.assertIsNone(modelinfo.jobs()["active"])
-
-    def test_dependency_problem_shape(self):
-        from app import modelinfo
-        with patch.object(modelinfo, "_pkg_available", lambda name: False):
-            prob = modelinfo.dependency_problem("sensevoice")
-        self.assertEqual("funasr", prob["module"])
-        self.assertIn("funasr", prob["reason"])
-        self.assertIn("-m pip install funasr", prob["installCommand"])
-        self.assertIn("再点一次", prob["nextStep"])
-        self.assertIn(prob["reason"], prob["message"])
-        # 不是转写引擎的条目（KWS / pyannote）不该被当成"缺依赖"
-        with patch.object(modelinfo, "_pkg_available", lambda name: False):
-            self.assertEqual({}, modelinfo.dependency_problem("kws"))
-            self.assertEqual({}, modelinfo.dependency_problem("pyannote"))
-
-    def test_api_returns_the_structured_fields(self):
-        """面板要能**直接拿字段**，不用去正则解析那句话。"""
-        from fastapi import FastAPI
-        from fastapi.testclient import TestClient
-
-        from app import modelinfo
-        from app.api import router
-
-        app = FastAPI()
-        app.include_router(router)
-        client = TestClient(app)
-        # ⚠️ **用例隔离**（2026-10-10）：开发机的真实设置里 `apiAuthEnabled=true`
-        # （配对手机时切 `lan` 档被强制打开）。裸 TestClient 不带令牌 → 一律 401，
-        # 这条用例就会为**机器状态**变红（与 `tests/test_api_paths.py` 同一类问题）。
-        # 在**内存里**遮住这一项，不写库（写库会动用户真实设置）。
-        from app.config import settings as _settings
-        _real_get = _settings.get
-
-        def _get(key, *a, **kw):
-            return False if key == "apiAuthEnabled" else _real_get(key, *a, **kw)
-
-        with patch.object(_settings, "get", side_effect=_get), \
-                patch.object(modelinfo, "_pkg_available", lambda name: False):
-            r = client.post("/api/models/download", json={"id": "sensevoice"})
-        self.assertEqual(200, r.status_code, r.text)
-        data = r.json()
-        self.assertFalse(data["ok"])
-        self.assertIn("funasr", data["reason"])
-        self.assertIn("-m pip install funasr", data["installCommand"])
-        self.assertIn("再点一次", data["nextStep"])
-        self.assertIn("再点一次", data["detail"], "detail 是给面板直接显示的那整段")
-        self.assertEqual("install", data["nextAction"])
-
-    def test_download_failure_message_also_says_what_to_do(self):
-        """后台线程真失败了也要带"怎么办"（缺 modelscope 这类下载客户端时）。"""
-        from app import modelinfo
-        with patch.object(modelinfo, "_pkg_available", lambda name: True):
-            hint = modelinfo._failure_hint(
-                "sensevoice", "RuntimeError: No module named 'modelscope'")
-        self.assertIn("modelscope", hint)
-        self.assertIn("-m pip install funasr", hint)
-        self.assertIn("再点一次", hint)
-        # 认不出的失败不加戏
-        with patch.object(modelinfo, "_pkg_available", lambda name: True):
-            self.assertEqual("", modelinfo._failure_hint("sensevoice", "HTTP 500"))
-
-
-class ModelNotDownloadedNextStepTests(unittest.TestCase):
-    """依赖就绪、只差模型文件时，要明说"再点一次下载"（同事 2026-09-25 实测）。
-
-    他的实际顺序：点下载 → 报缺依赖 → 复制安装命令装依赖 → 面板如实变成"模型文件还没
-    下载" → **他以为卡死了**（其实只差再点一次「下载」，界面一个字都没说）。
-    """
-
-    def setUp(self):
-        from app import paths
-        self._get = paths._settings_get
-        self.tmp = tempfile.mkdtemp(prefix="echo-nextstep-")
-        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
-        paths._settings_get = lambda name: self.tmp if name == "modelsDir" else ""
-        self.addCleanup(setattr, paths, "_settings_get", self._get)
-
-    def test_install_state_says_deps_are_ready_and_what_to_click(self):
-        report = {"engines": ["sensevoice"], "agent": "none"}
-        with patch.object(install_state, "_module_ok", lambda name: True), \
-                patch.object(install_state, "_model_ready", lambda mid: False):
-            miss = install_state.missing(report)
-        self.assertTrue(miss)
-        self.assertIn("依赖已就绪", miss[0]["reason"], "这一档必须是「依赖已就绪」那类")
-        self.assertNotIn("缺 Python 依赖", miss[0]["reason"])
-        self.assertEqual("download", miss[0]["action"])
-        self.assertEqual("sensevoice", miss[0]["modelId"])
-        self.assertIn("再点一次", miss[0]["nextStep"])
-        self.assertIn("下载", miss[0]["fix"])
-
-    def test_install_state_missing_dep_points_at_the_install_command(self):
-        report = {"engines": ["sensevoice"], "agent": "none"}
-        with patch.object(install_state, "_module_ok", lambda name: False), \
-                patch.object(install_state, "_model_ready", lambda mid: True):
-            miss = install_state.missing(report)
-        self.assertIn("funasr", miss[0]["reason"])
-        self.assertIn("-m pip install funasr", miss[0]["fix"], "缺依赖要直接给出安装命令")
-        self.assertIn("再点一次", miss[0]["fix"], "还要讲清第二步")
-        self.assertEqual("install", miss[0]["action"])
-        self.assertIn("-m pip install funasr", miss[0]["installCommand"])
-
-    def test_components_reason_and_next_step_for_both_kinds(self):
-        from app import components
-        item = {"id": "stt-sensevoice", "model_id": "sensevoice", "pkg": "funasr"}
-        # ① 缺依赖
-        with patch("app.components._module_ok", lambda name: False):
-            kind, reason = components.not_ready_reason(item)
-            nxt = components.not_ready_next_step(item, kind)
-        self.assertEqual("python", kind)
-        self.assertIn("funasr", reason)
-        self.assertIn("-m pip install funasr", reason)
-        self.assertIn("下载", nxt)
-        # ② 依赖齐、只差模型
-        with patch("app.components._module_ok", lambda name: True), \
-                patch("app.modelinfo.ready", lambda mid: False):
-            kind, reason = components.not_ready_reason(item)
-            nxt = components.not_ready_next_step(item, kind)
-        self.assertEqual("model", kind)
-        self.assertIn("依赖已就绪", reason)
-        self.assertNotIn("缺 Python 依赖", reason)
-        self.assertIn("再点一次", nxt)
-
-    def test_catalog_row_exposes_the_next_step(self):
-        """「能力」页签那一行也要带下一步（面板不必自己去拼文案）。"""
-        from app import components
-        with patch("app.modelinfo.ready", lambda mid: False), \
-                patch("app.components._module_ok", lambda name: True):
-            row = {i["id"]: i for i in components.catalog(include_blocked=True)["items"]}["stt-sensevoice"]
-        self.assertIs(row["ready"], False)
-        self.assertEqual("model", row["readyKind"])
-        self.assertIn("再点一次", row["readyNextStep"])
-
-    def test_inventory_tells_the_panel_the_next_step(self):
-        """`/api/models` 的条目要带「下一步点什么」；缺依赖时还要带那条命令。"""
-        from app import modelinfo
-
-        with patch.object(modelinfo, "_ready_whisper", lambda name: False), \
-                patch.object(modelinfo, "_pkg_available", lambda name: True):
-            row = {i["id"]: i for i in modelinfo.inventory()}["whisper-small"]
-        self.assertIs(row["ready"], False)
-        self.assertIs(row["dependencyReady"], True)
-        self.assertIn("再点一次", row["nextStep"])
-
-        with patch.object(modelinfo, "_ready_whisper", lambda name: False), \
-                patch.object(modelinfo, "_pkg_available", lambda name: False):
-            row = {i["id"]: i for i in modelinfo.inventory()}["whisper-small"]
-        self.assertIs(row["dependencyReady"], False)
-        self.assertIn("-m pip install faster-whisper", row["installCommand"])
-        self.assertIn("再点一次", row["nextStep"])
-
-    def test_ready_rows_are_left_alone(self):
-        """老装机（依赖齐、模型已下）**行为不许变**：不加任何"下一步"字段。"""
-        from app import modelinfo
-        with patch.object(modelinfo, "_ready_whisper", lambda name: True):
-            row = {i["id"]: i for i in modelinfo.inventory()}["whisper-small"]
-        self.assertIs(row["ready"], True)
-        self.assertNotIn("nextStep", row)
-        self.assertNotIn("installCommand", row)
+        install_state.save_report({"agent": "harness"}, path=self.report)
+        with open(self.report, encoding="utf-8") as fh:
+            self.assertNotIn("jwt", fh.read().lower())
+
+
+class NoLocalEnginesTests(unittest.TestCase):
+    def test_engine_tables_are_empty(self):
+        self.assertEqual(install_state.ENGINE_SPECS, {})
+        self.assertEqual(install_state.STT_TO_ENGINE, {})
+
+    def test_engine_spec_is_empty(self):
+        for mid in ("sensevoice-onnx", "sherpa", "qwen3asr", "kws"):
+            self.assertEqual(install_state.engine_spec(mid), {}, mid)
+
+    def test_engine_problem_never_blocks_settings(self):
+        for choice in ("sensevoice-onnx", "sherpa", "qwen3asr", ""):
+            self.assertEqual(install_state.engine_problem(choice), "")
+
+    def test_wanted_ignores_legacy_report_fields(self):
+        report = {"engines": ["stt-sherpa"], "wake": True, "diarize": True,
+                  "agent": "harness"}
+        want = install_state.wanted(report)
+        self.assertEqual(want["engines"], [])
+        self.assertFalse(want["wake"])
+        self.assertFalse(want["diarize"])
+        self.assertEqual(want["agent"], "harness")
+
+    def test_missing_has_no_local_model_items(self):
+        with patch.object(install_state, "_node_ok", lambda: True), \
+                patch.object(install_state, "_harness_online", lambda: True), \
+                patch("app.config.settings.get",
+                      lambda k, d=None: "harness" if k == "agentBackend" else d):
+            miss = install_state.missing({"agent": "harness"})
+        self.assertEqual(miss, [])
+
+    def test_state_exposes_empty_engine_list(self):
+        with patch.object(install_state, "_node_ok", lambda: True), \
+                patch.object(install_state, "_harness_online", lambda: True), \
+                patch("app.config.settings.get",
+                      lambda k, d=None: "harness" if k == "agentBackend" else d):
+            st = install_state.state()
+        self.assertEqual(st["engines"], [])
+        self.assertEqual(st["wanted"]["engines"], [])
+        self.assertTrue(st["ready"])
 
 
 if __name__ == "__main__":

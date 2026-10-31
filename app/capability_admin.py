@@ -30,7 +30,6 @@ SLOT_LABELS: Dict[str, str] = {
     "diarize.turn_embeddings": "逐句嵌入",
     "speaker.embed": "声纹嵌入",
     "tts": "语音合成",
-    "wake": "唤醒词",
 }
 
 BACKEND_LABELS: Dict[str, str] = {

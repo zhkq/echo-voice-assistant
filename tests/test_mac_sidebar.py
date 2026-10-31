@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, patch
 class MacSidebarTests(unittest.TestCase):
     def setUp(self):
         deps = {name: MagicMock() for name in (
-            "app.assistant", "app.audio.wake", "app.config", "app.hotkey", "app.services",
+            "app.assistant", "app.config", "app.hotkey", "app.services",
         )}
         path = Path(__file__).resolve().parents[1] / "mac" / "mac_runtime.py"
         spec = importlib.util.spec_from_file_location("sidebar_runtime_test", path)

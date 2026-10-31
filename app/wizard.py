@@ -642,7 +642,7 @@ def _meeting_route_rows(choices: dict) -> tuple:
         if not key:
             return rows, [{"feature": "会议转写走在线服务",
                            "reason": "选了在线，但**还没填密钥** —— 没密钥这一路在 ECHO 里不存在",
-                           "fix": "回到向导第 9 步填上服务方给你的密钥"
+                           "fix": "回到向导第 8 步填上服务方给你的密钥"
                                   "（或者在「能力」页签的在线转写卡里填）"}]
         return rows, [{"feature": "会议里按名字认出联系人",
                        "reason": "在线转写只回「说话人 1/2/3」、**不回声纹** —— "
@@ -668,7 +668,7 @@ def _meeting_route_rows(choices: dict) -> tuple:
         return rows, []
     return [], [{"feature": "开会时的录音变成文字",
                  "reason": "还没选会议转写走哪条路（本机后端 / 同事给你的后端 / 在线）",
-                 "fix": "回到向导第 9 步"}]
+                 "fix": "回到向导第 8 步"}]
 
 
 def _setting_updates(choices: dict) -> list:
@@ -779,8 +779,7 @@ def build_plan(choices: dict) -> dict:
         manifests = {}
 
     wanted = [("engines", cid) for cid in (choices.get("engines") or [])]
-    if choices.get("wake"):
-        wanted.append(("engines", "wake-kws"))
+    # 语音唤醒已于 2026-10-31 取消：不再有 `wake` 选择、也不再下载 wake-kws。
     if choices.get("diarize"):
         wanted.append(("engines", "diarize-pyannote"))
     if choices.get("accel"):
@@ -814,14 +813,14 @@ def build_plan(choices: dict) -> dict:
         missing.append({"feature": "自动写会议纪要",
                         "reason": "纪要、总结与归档都由**配置的智能体**完成；"
                                   "ECHO 不直连任何 LLM，没有智能体就没有推理能力",
-                        "fix": "回到向导第 8 步准备智能体"})
+                        "fix": "回到向导第 7 步准备智能体"})
     if not str(choices.get("agent", "") or "").strip():
         missing.append({"feature": "让 ECHO 帮你动手（整理笔记、操作文件）",
-                        "reason": "还没选智能体后端", "fix": "回到向导第 8 步"})
+                        "reason": "还没选智能体后端", "fix": "回到向导第 7 步"})
     if choices.get("asrOnline"):
         missing.append({"feature": "断网时也能转写",
                         "reason": "你选了在线转写 —— 网断了就转不了",
-                        "fix": "向导第 10 步装一个小号兜底"})
+                        "fix": "向导第 9 步装一个小号兜底"})
     # 会议转写走哪条路（2026-09-28）：没选 / 选了还没实现的在线档 / 许可与它冲突，
     # 三种都要在末页说出来 —— 否则用户会以为"录完就会自动出文字"。
     missing += _meeting_route_rows(choices)[1]

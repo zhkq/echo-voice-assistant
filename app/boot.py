@@ -27,9 +27,7 @@ _ORDER = []
 _SERVICE_REPORTERS = {
     "server": services.report_server,
     "dsh": services.report_dsh,
-    "stt-cmd": services.report_stt,
     "tts": services.report_tts,
-    "wake": services.report_wake,
     "hotkey": services.report_hotkey,
     "meeting": services.report_meeting,
 }
@@ -284,9 +282,9 @@ def _run_boot():
     _spawn(["failover", "dsh", "tts", "hotkey", "meeting"])
     # 阶段 1b：独立 harness（选了它才真拉起来；没选就是一行 disabled，不等它）
     _spawn(["harness"])
-    # 阶段 2：重组件（模型加载）并行 —— **只剩命令转写**：会议转写与说话人分离
-    # 2026-09-29 起不再有本机引擎（它们只走能力后端，后端那侧自己管自己的模型）。
-    _spawn(["stt-cmd", "wake"])
+    # 阶段 2：重组件（模型加载）—— 2026-10-31 起**客户端不再有本地模型**：
+    # 会议转写与说话人分离只走能力后端（2026-09-29），指令/回顾也改走能力后端 Qwen3-ASR，
+    # 本地命令转写引擎（`stt-cmd`）与语音唤醒（`wake`）都已删除，这一阶段没有组件要拉。
     # 等所有非按需组件 settle
     while True:
         with _LOCK:
@@ -564,38 +562,6 @@ def _start_failover(report):
     _refresh_failover_detail(note="启动时", emit=report)
 
 
-def _stt_engine_and_model(setting_key):
-    from app.config import settings
-    from app.audio import stt
-    choice = settings.get(setting_key, "sensevoice")
-    eng, model = stt.resolve_engine(choice)
-    return stt, eng, model
-
-
-def _start_stt_cmd(report):
-    from app.config import settings
-    stt, eng, model = _stt_engine_and_model("sttModel")
-    key = stt.engine_key(eng, model)
-    old = _BOOT_STT_KEYS.get("stt-cmd")
-    if old and old != key:
-        stt.unload_key(old)
-    if stt.key_loaded(key):
-        _BOOT_STT_KEYS["stt-cmd"] = key
-        report(status="online", detail=f"{eng} · {stt.device_label()}", progress=1.0)
-        return
-    report(detail=f"加载 {model if eng == 'whisper' else eng} …", substep="模型加载", progress=0.1)
-    key = stt.load_engine(eng, model, settings.get("device", "auto"))
-    _BOOT_STT_KEYS["stt-cmd"] = key
-    report(status="online", detail=f"{eng} · {stt.device_label()}", substep="", progress=1.0)
-
-
-def _stop_stt_cmd():
-    from app.audio import stt
-    key = _BOOT_STT_KEYS.pop("stt-cmd", None)
-    if key:
-        stt.unload_key(key)
-
-
 def _start_tts(report):
     from app.config import settings
     from app.audio import tts
@@ -607,25 +573,6 @@ def _start_tts(report):
     # 每次朗读其实都在跑本机离线引擎）。
     detail = tts.engine_label(eng)
     report(status="online", detail=detail, progress=1.0)
-
-
-def _start_wake(report):
-    from app.config import settings
-    from app.audio.wake import engine_label
-    from app import runtime
-    if not settings.get("wakeEnabled", False):
-        report(status="disabled", detail="未启用", progress=0.0)
-        return
-    ok, msg = runtime.start_wake()
-    if ok:
-        report(status="online", detail=engine_label(), progress=1.0)
-    else:
-        report(status="failed", detail=msg, error=msg)
-
-
-def _stop_wake():
-    from app import runtime
-    runtime.stop_wake()
 
 
 def _start_hotkey(report):
@@ -663,8 +610,10 @@ def _start_meeting(report):
 # 而不是把本机 pyannote 接回来（那会在一场会里混两套不可比的嵌入 —— 认错人且不报错）。
 
 
-# 已加载 STT 引擎 key（只有 `stt-cmd`：命令转写引擎），供卸载与状态判断
-_BOOT_STT_KEYS = {}
+# 说明（**不是**一个空函数）：本机转写引擎曾是一个常驻组件（`stt-cmd`，启动时预热
+# `sttModel` 选的引擎），2026-10-31 起客户端不再跑本地 STT（指令/回顾/会议全走能力后端
+# Qwen3-ASR）—— 它连同 `_BOOT_STT_KEYS` 一起删掉。谁要是看见"本机转写引擎"又出现在启动页，
+# 正确的动作是去查能力后端，而不是把本地引擎接回来。
 
 
 def setup():
@@ -677,12 +626,8 @@ def setup():
              can_start=True, can_stop=False)
     register("harness", "标准版 harness", "🧩", start_fn=_start_harness,
              stop_fn=_stop_harness, can_start=True, can_stop=True)
-    register("stt-cmd", "命令转写引擎（常驻）", "🎤", start_fn=_start_stt_cmd,
-             stop_fn=_stop_stt_cmd, can_start=True, can_stop=True, kind="stt")
     register("tts", "语音合成", "🔊", start_fn=_start_tts, can_start=True,
              can_stop=False)
-    register("wake", "语音唤醒", "🗣️", start_fn=_start_wake, stop_fn=_stop_wake,
-             can_start=True, can_stop=True)
     register("hotkey", "热键/媒体键", "⌨️", start_fn=_start_hotkey,
              stop_fn=_stop_hotkey, can_start=True, can_stop=True)
     register("meeting", "会议录音", "📼", start_fn=_start_meeting, can_start=False)

@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
 """services.py — ECHO 组件状态注册表
 
-面板 /api/status 的统一数据源：各组件（server/dsh/stt/tts/wake/hotkey/
+面板 /api/status 的统一数据源：各组件（server/dsh/stt/tts/hotkey/
 meeting/diarize）上报 status/detail，内存实时 + DB 持久化（重启后可查）。
 
+2026-10-31 起语音唤醒取消：`wake` 组件与 `report_wake` 一并删除（不是隐藏）。
 status 取值约定：online|offline|active|idle|error|disabled|unknown
 """
 import os
@@ -12,7 +13,7 @@ import time
 import app.db as db
 from app import platform as echo_platform
 
-COMPONENT_ORDER = ["server", "dsh", "harness", "stt", "tts", "wake", "hotkey", "meeting", "diarize"]
+COMPONENT_ORDER = ["server", "dsh", "harness", "stt", "tts", "hotkey", "meeting", "diarize"]
 
 
 def _set(name, status, detail="", pid=0):
@@ -39,10 +40,6 @@ def report_stt(status, detail=""):
 
 def report_tts(status, detail=""):
     _set("tts", status, detail)
-
-
-def report_wake(status, detail=""):
-    _set("wake", status, detail)
 
 
 def report_hotkey(status, detail=""):

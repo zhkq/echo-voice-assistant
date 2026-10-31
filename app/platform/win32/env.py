@@ -15,11 +15,10 @@ NAME = "win32"
 #: 系统数据根：与 1.x 一致，就在安装目录下（老用户升级后 data 不用搬）
 PLATFORM_DEFAULTS = {
     "dataDir": "{ECHO}/data",
-    #: 模型的一键安装命令（面板直接贴给用户跑）。macOS/Linux 上没有对应脚本 → 不提供，
-    #: 调用方回落成 pip 说明。
-    "modelInstallCommands": {
-        "qwen3asr": "powershell -ExecutionPolicy Bypass -File scripts\\install-qwen3asr.ps1",
-    },
+    #: 模型的一键安装命令（面板直接贴给用户跑）。2026-10-31 起客户端不再装任何
+    #: 本地 STT 模型/引擎（转写全走能力后端），所以这里**故意为空**；旧版
+    #: `scripts\install-qwen3asr.ps1` 已移入 `_obsolete-scripts-20261031\`。
+    "modelInstallCommands": {},
     # ---- 配置项的默认值与候选项（D11）----
     # Windows 是基准平台：这里声明的值与 config.DEFAULTS 一致（显式写出来是为了
     # 三个平台一眼可比，而不是靠"Windows 没声明所以用基准"来推断）。

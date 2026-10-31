@@ -109,7 +109,7 @@ if ($Quiet) {
 }
 
 Invoke-Step 'compileall app server mac scripts' $py @('-m', 'compileall', '-q', 'app', 'server', 'mac', 'scripts')
-Invoke-Step 'import smoke (entry modules)' $py @('-c', "import app.main, app.api, app.db, app.pathutil, app.modelinfo, app.llm_router, app.audio.tts, app.audio.wake, app.netguard; print('import smoke OK')")
+Invoke-Step 'import smoke (entry modules)' $py @('-c', "import app.main, app.api, app.db, app.pathutil, app.modelinfo, app.llm_router, app.audio.tts, app.netguard; print('import smoke OK')")
 Invoke-Step 'platform contract tests' $py @('-m', 'unittest', '-q', 'tests.test_platform_contract')
 if (-not $Quick) {
     # NOTE (2026-10-11): an attempt to make this step hermetic by pointing ECHO_DATA at a

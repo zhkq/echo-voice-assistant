@@ -332,24 +332,19 @@ class FoldingTests(unittest.TestCase):
         cls.js = _read("web", "app.js")
         cls.html = _read("web", "index.html")
 
-    def test_whisper_tiers_are_folded_by_default(self):
-        """whisper 三档（权重在本机但已退役）**默认折叠**，点开才见（用户点名的要求）。"""
-        # 折叠区那个 helper：默认 closed（只有显式传 open 才展开）
-        self.assertIn("function foldGroup(", self.js)
-        fold = self.js[self.js.index("function foldGroup("):]
-        fold = fold[:fold.index("\n}\n")]
-        self.assertIn('data-collapse-default="${o.open ? "open" : "closed"}"', fold,
-                      "折叠区默认必须是收起")
-        # 「其余本地引擎」= 没被任何设置选中的那些（whisper 三档就在里面）
-        m = re.search(r'foldGroup\("cap-engines-rest",(.*?)\(\{', self.js, re.S)
-        self.assertIsNotNone(m, "转写卡里应当把'其余本地引擎'折起来")
-        self.assertNotIn("open: true", m.group(1))
-        # 分堆的判据：**配置为要用的**（sttModel / meetingSttModel 折出来的 id）之外都进折叠区
-        asr = self.js[self.js.index("function capAsrLocal()"):]
-        asr = asr[:asr.index("\n}\n")]
-        self.assertIn("const used = comps.filter", asr)
-        self.assertIn("const rest = comps.filter", asr)
-        self.assertIn('foldGroup("cap-engines-rest"', asr)
+    def test_local_stt_engine_picker_is_gone(self):
+        """2026-10-31：客户端不再跑本地 STT（指令/回顾/会议全走能力后端）。
+
+        所以「本地引擎 / 其余本地引擎」那块 UI 与它依赖的两张手写映射表都该删干净：
+        留着只会让人以为"本机还能选引擎"，而实际没有本机引擎可装。
+        """
+        for gone in ("capAsrLocal", "engineModelId", "_ENGINE_MODEL_ID",
+                     "renderCmdEngineStatus", 'settingRows(["sttModel"',
+                     "_sttCache"):
+            with self.subTest(gone=gone):
+                self.assertNotIn(gone, self.js, "%s 是本地 STT 的残留，应当已删除" % gone)
+        # 本机引擎卡的头（旧实现里的标题）也不该再出现
+        self.assertNotIn("其余本地引擎", self.js)
 
     def test_other_heavy_areas_are_closed_by_default(self):
         """其余几处"内容太多"的地方也默认收起：启动日志 / 运行环境 / 已配对后端 / 清理。"""
@@ -432,9 +427,11 @@ class OneEntityOnePlaceTests(unittest.TestCase):
             with self.subTest(key=key):
                 self.assertIn('"%s"' % key, common,
                               "常用行应该是：指令采集 / 会议采集 / 默认播放")
-        for key in ("device", "inputDeviceId", "commandOutputDeviceId", "meetingOutputDeviceId"):
+        for key in ("inputDeviceId", "commandOutputDeviceId", "meetingOutputDeviceId"):
             with self.subTest(key=key):
                 self.assertIn('"%s"' % key, adv, "%s 应该在高级里" % key)
+        # 2026-10-31：`device`（计算设备）随本地 STT 一起退役，设备卡不该再有它。
+        self.assertNotIn('"device"', adv, "计算设备已退役，设备卡不该再有它")
         self.assertEqual(len(re.findall(r'"[A-Za-z]+"', common)), 3,
                          "常用**只有**这三行（用户口径）：%s" % common)
 
@@ -509,8 +506,9 @@ class OneEntityOnePlaceTests(unittest.TestCase):
         self.assertEqual(len(re.findall(r'\{ id: "', setgrp)), 6,
                          "设置应当是 6 张卡（通用/AI组件/快捷键/设备/声纹库/手机·手表）")
         biz = block[block.index("business: ["):]
-        self.assertEqual(len(re.findall(r'\{ id: "', biz)), 6,
-                         "业务配置应当是 6 张卡（会议转写/语音指令/唤醒/朗读与反馈/队列/每日回顾）")
+        self.assertEqual(len(re.findall(r'\{ id: "', biz)), 5,
+                         "业务配置应当是 5 张卡（会议转写/语音指令/朗读与反馈/队列/每日回顾；"
+                         "「唤醒」卡已随语音唤醒取消）")
         for card_id, where in (("ai", setgrp), ("dev", setgrp), ("phone", setgrp), ("review", biz)):
             with self.subTest(card=card_id):
                 self.assertIn('{ id: "%s"' % card_id, where, "卡片缺失：%s" % card_id)
@@ -547,6 +545,10 @@ class OneEntityOnePlaceTests(unittest.TestCase):
                 continue          # 不下发的键由各自的渲染路径承载（不在设置卡片里）
             if key not in placed:
                 stray.append(key)
+        self.assertNotIn('"sttModel"', block, "本地转写引擎已退役，SET_CARDS 不该再有它")
+        self.assertNotIn('"device"', block, "计算设备已退役，SET_CARDS 不该再有它")
+        self.assertNotIn('"dailyReviewSttBackend"', block,
+                         "回顾转写恒为能力后端，SET_CARDS 不该再有它的下拉")
         self.assertEqual(sorted(stray), [],
                          "这些可见设置项没有落点，会在界面上掉进「未归类」卡：%s" % sorted(stray))
 

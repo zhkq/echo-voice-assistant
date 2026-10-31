@@ -32,16 +32,10 @@ if ($LASTEXITCODE -ne 0) {
     Write-Host '[2/4] Web 依赖已就位'
 }
 
-# 3. 模型
-$need = @('models\faster-whisper\small\model.bin', 'models\sensevoice', 'models\sherpa-onnx-streaming',
-          'models\wakeword\kws-zh-en-3m\tokens.txt', 'models\pyannote\pyannote-segmentation-3.0-local')
-$missing = @($need | Where-Object { -not (Test-Path (Join-Path $root $_)) })
-if ($missing.Count -gt 0) {
-    Write-Host "[!] 模型缺失（面板 → 设置 → 模型 里一键下载）:" -ForegroundColor Yellow
-    $missing | ForEach-Object { Write-Host "    $_" -ForegroundColor Yellow }
-} else {
-    Write-Host '[3/4] 本地模型齐全（faster-whisper/SenseVoice/sherpa/KWS/pyannote）'
-}
+# 3. Local models: the client installs NONE (2026-10-31).
+#    Commands / daily review / meeting transcription all go to the capability backend
+#    (echo-server + Qwen3-ASR); models/ being empty is the expected state.
+Write-Host '[3/4] Local models: not needed on the client (transcription is backend-side)'
 
 # 4. 建库 + 种子配置
 Write-Host '[4/4] 初始化数据库...'

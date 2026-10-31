@@ -40,7 +40,6 @@ from typing import Any, Dict, Iterable, Optional, Sequence, Tuple
 #: 服务端通过 `capabilities.slots`（`slot` + `supports` 的并集）来回答"我这个能不能满足你"。
 #: 这条边界是本文件最容易被搞错的地方 —— 服务端报 `asr.long` 不代表客户端要认识它。
 SLOTS: Tuple[str, ...] = (
-    "wake",
     "asr.text",
     "asr.timestamps",
     "asr.streaming",
@@ -73,8 +72,10 @@ VECTOR_SLOTS: Tuple[str, ...] = (
 #: 恰恰是"会认错人"的那种，宁可拒绝也不要用它。
 SAME_SOURCE_SLOTS: Tuple[str, ...] = ("diarize.turns",) + VECTOR_SLOTS
 
-#: 唤醒与指令转写属于**本机**（铁律 L3）：后端挂了不该让"说句话"这件事不可用。
-LOCAL_ONLY_SLOTS: Tuple[str, ...] = ("wake",)
+#: 只能由本机提供的槽。2026-10-31 语音唤醒取消后**这里是空的** ——
+#: `wake` 槽已从词汇表删除；指令/回顾/会议转写全走能力后端（Qwen3-ASR），
+#: 客户端不再有本机 STT 能力后端（`app/capabilities/local.py` 只保留历史实现）。
+LOCAL_ONLY_SLOTS: Tuple[str, ...] = ()
 
 # ---------------------------------------------------------------- 后端
 

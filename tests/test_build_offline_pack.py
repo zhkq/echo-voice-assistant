@@ -35,9 +35,10 @@ class SpecTests(unittest.TestCase):
     def test_it_reads_the_declared_components(self):
         spec = packer.load_spec()
         self.assertIn("runtime-core", spec)
-        self.assertIn("stt-sherpa", spec)
         self.assertEqual(spec["runtime-core"]["pack"]["kind"], "runtime")
-        self.assertEqual(spec["stt-sherpa"]["pack"]["kind"], "files")
+        # 2026-10-31：客户端不装任何本地 STT 模型/引擎（转写全走能力后端）。
+        bad = [cid for cid in spec if cid.startswith(("stt-", "wake-", "diarize-"))]
+        self.assertEqual(bad, [], "离线包规格里还有本地模型组件：%s" % bad)
 
     def test_runtime_config_comes_from_requirements_core(self):
         """规格里 runtime-core 的依赖清单必须指向 `requirements-core.txt`（唯一权威）。"""
@@ -215,13 +216,11 @@ class BundleLayoutTests(_BundleCase):
         self.assertEqual(code, 0)
         b = os.path.join(out, "ECHO-bundle-test", "bundle")
         self.assertTrue(os.path.isdir(os.path.join(b, "wheels")))
-        self.assertTrue(os.path.isfile(
-            os.path.join(b, "models", "sherpa-onnx-streaming", "tokens.txt")))
         self.assertTrue(os.path.isfile(os.path.join(b, "runtime", packer.EMBED_NAME)))
         self.assertTrue(os.path.isfile(os.path.join(b, "runtime", "get-pip.py")))
         self.assertTrue(os.path.isfile(os.path.join(b, "BUNDLE-INFO.txt")))
-        # 唤醒词：本机没有 → 跳过而不是失败
-        self.assertFalse(os.path.exists(os.path.join(b, "models", "wakeword")))
+        # 2026-10-31：客户端没有本地模型 —— bundle\models 不存在是**正常**的。
+        self.assertFalse(os.path.exists(os.path.join(b, "models")))
 
     def test_the_zip_carries_a_top_level_folder(self):
         out = os.path.join(self.tmp, "out")
@@ -261,21 +260,22 @@ class BundleLayoutTests(_BundleCase):
         self.assertFalse(os.path.exists(stale))
         self.assertTrue(os.path.isfile(os.path.join(self.kit, "先读我.md")))
 
-    def test_wheels_come_from_requirements_core_and_the_engine_map(self):
-        """wheel 清单不是手抄的：requirements-core 的行 + 技能脚本里的 ENGINE_MAP。"""
+    def test_wheels_come_from_requirements_core_only(self):
+        """wheel 清单 = requirements-core 的行 + 离线装 pip 的 bootstrap（无本地 STT）。"""
         packer.main(["--bundle", "--out", os.path.join(self.tmp, "out")])
-        self.assertIn("sherpa-onnx>=1.10", self.wheel_specs)
-        self.assertTrue(any(s.startswith("modelscope") for s in self.wheel_specs), self.wheel_specs)
+        self.assertIn("numpy>=1.26", self.wheel_specs)
+        self.assertIn("sounddevice>=0.5", self.wheel_specs)
+        self.assertFalse(any("sherpa" in s.lower() for s in self.wheel_specs), self.wheel_specs)
+        self.assertFalse(any("modelscope" in s.lower() for s in self.wheel_specs), self.wheel_specs)
         for bootstrap in ("pip", "setuptools", "wheel", "packaging"):
             self.assertIn(bootstrap, self.wheel_specs, "离线装 pip 要这几个：%s" % bootstrap)
 
 
 class BundleGuardTests(_BundleCase):
-    def test_a_missing_sherpa_model_is_a_loud_failure(self):
-        shutil.rmtree(os.path.join(self.repo, "models", "sherpa-onnx-streaming"))
-        with self.assertRaises(packer.PackError) as ctx:
-            packer.main(["--bundle", "--out", os.path.join(self.tmp, "out")])
-        self.assertIn("sherpa-onnx-streaming", str(ctx.exception))
+    def test_a_bundle_without_models_is_ok(self):
+        """2026-10-31：客户端没有本地模型 —— bundle 里没有 models\\ 不算错。"""
+        code = packer.main(["--bundle", "--out", os.path.join(self.tmp, "out")])
+        self.assertEqual(code, 0)
 
     def test_a_thin_wheelhouse_is_caught_before_shipping(self):
         """wheelhouse 缺包 → 自检就说清楚（不能留到同事那边"装到一半失败"）。"""
@@ -284,9 +284,9 @@ class BundleGuardTests(_BundleCase):
         with open(os.path.join(b, "wheels", "fastapi-0.1-py3-none-any.whl"), "w") as fh:
             fh.write("x")
         problems = packer.verify_bundle(b)
-        self.assertTrue(any("sherpa-onnx" in p for p in problems), problems)
+        self.assertTrue(any("uvicorn" in p for p in problems), problems)
         self.assertTrue(any("pip" in p for p in problems), problems)
-        self.assertTrue(any("sherpa-onnx-streaming" in p for p in problems), problems)
+        self.assertFalse(any("sherpa" in p or "models" in p for p in problems), problems)
 
     def test_a_failing_offline_resolve_is_a_failure(self):
         with mock.patch.object(packer, "offline_resolve_check",

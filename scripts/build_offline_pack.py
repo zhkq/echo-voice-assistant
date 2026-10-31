@@ -22,25 +22,25 @@ uv → py -3.11 → python.org 嵌入包）、再 pip 装依赖、再下模型�
 
 `install.ps1` 的 `-ComponentDir` 认的那一套。产出两样：
 
-1. **解开的目录** `<out>/<pkg>/…`（`runtime-core/`、`models/sherpa-onnx-streaming/`）——
+1. **解开的目录** `<out>/<pkg>/…`（默认档只有 `runtime-core/`；客户端没有本地模型）——
    `install.ps1` 的最后一条兜底就是"给我一个含 `runtime-core\\` 的目录"，**这条路不依赖 zip 内部约定**，
    所以它是最稳的交付形态：`-ComponentDir <out>/<pkg>` 即可。
 2. **zip** `<out>/ECHO-离线组件合集-<stamp>.zip`（带顶层目录前缀）——给"要拷到别的机器"的场景。
 
-### B. `bundle\\` 载荷（新方言，`--bundle`）
+### B. `bundle\` 载荷（新方言，`--bundle`）
 
 `scripts/install-all.ps1` 走的那一套（它把 `<KitRoot>\bundle` 自动探测出来，见该脚本
-`Resolve-KitLayout` 的离线载荷段）。契约**逐行**照 install-all 的三个消费点写：
+`Resolve-KitLayout` 的离线载荷段）。2026-10-31 用户拍板「客户端默认档不装任何本地
+STT 模型/引擎」之后，契约只剩两件（**没有 `models\`**）：
 
     <kit>\bundle\
       wheels\                              必需（-Offline 硬检查这个目录在不在）
                                            → pip install --no-index --find-links bundle\wheels -r requirements-core.txt
-      models\sherpa-onnx-streaming\        模型，原样复制到 <安装根>\models\（唤醒主路 + 指令兜底）
-      models\sensevoice-onnx\              指令转写的**默认**引擎（int8 ONNX，约 230 MB）
-      models\wakeword\                     唤醒词 —— **默认不打**（wakeEnabled 出厂就是关的；
-                                           启用唤醒时在面板里下；见 DEFAULT_BUNDLE_COMPONENTS）
       runtime\python-3.11.9-embed-amd64.zip  第④级兜底建运行时（tar 解压，名字必须一字不差）
       runtime\get-pip.py                     配套：python get-pip.py --no-index --find-links wheels
+
+模型 0 个：指令/回顾/会议转写统一走能力后端（echo-server + Qwen3-ASR），客户端不装
+任何本地 STT 模型。`models\` 若存在也不要求、不校验（只给历史调试用）。
 
 **为什么需要它**：kit 里带了 `bundle\\`，同事机器上 `install-all.ps1` 就自动走离线 ——
 装的时候**一个字节都不下载**（Python 运行时/依赖/模型全在包里）。这条正是"同事拿到一个包、
@@ -56,7 +56,7 @@ uv → py -3.11 → python.org 嵌入包）、再 pip 装依赖、再下模型�
   "装得上、起得快"的地基。
 
 用法：
-    python scripts/build_offline_pack.py                     # 默认 runtime-core + stt-sherpa（组件合集）
+    python scripts/build_offline_pack.py                     # 默认只出 runtime-core（客户端无本地模型）
     python scripts/build_offline_pack.py --components runtime-core
     python scripts/build_offline_pack.py --python-from <uv 的 CPython 目录>
 
@@ -85,25 +85,30 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SPEC_PATH = os.path.join(ROOT, "components", "offline-pack.json")
 REQUIREMENTS = "requirements-core.txt"          # 规格里 runtime-core 用的那份
 DEFAULT_INDEX = "https://pypi.tuna.tsinghua.edu.cn/simple"
-#: kit 的 `manifest.json.requiredComponents` 就是这两个 —— 默认打它俩，装完即自足。
-#: 2026-10-08：指令转写的默认引擎改成 `stt-sensevoice-onnx`，所以它也得进默认档
-#: （否则新装机上默认引擎没有模型，`transcribe_ex` 会回落到 sherpa —— 能跑但叠字多）。
-DEFAULT_COMPONENTS = ("runtime-core", "stt-sherpa", "stt-sensevoice-onnx")
+#: 2026-10-31 用户拍板：客户端默认档不装任何本地 STT 模型/引擎，
+#: 指令/回顾/会议转写统一走能力后端（Qwen3-ASR）。默认档只剩 runtime-core。
+DEFAULT_COMPONENTS = ("runtime-core",)
+#:
+#: **体积口径（2026-10-31，默认档客户端 kit ≈58 MB）**：
+#:   echo-core ≈9.7 MB（代码/面板/docs）+ echo-install ≈0.1
+#:   + bundle/wheels ≈29 MB（numpy 12.5、面板栈 ~7、音频 IO ~2.2、pip 引导 ~2.8 等）
+#:   + bundle/runtime ≈13 MB（python.org 嵌入包 + get-pip）
+#:   + **models 0 MB**（旧默认档是 430 MB：bundle/models 337.5 MB + STT 相关 wheel ~38 MB）。
+#: 这个数来自 dist/ECHO-kit-20261027-2245.zip 的实测构成（见 task-2 报告）。
 PACKAGE_PREFIX = "ECHO-离线组件合集"
 #: 装完必须能 import 的这些（少一个都说明这份运行时不能用）
+#: 2026-10-31：sherpa_onnx / modelscope 已从客户端依赖里删除。
 IMPORT_CHECK = ("fastapi, uvicorn, pydantic, yaml, numpy, sounddevice, soundfile, soxr,"
-                " sherpa_onnx, modelscope, httpx")
+                " httpx")
 
 # ---- bundle 方言（契约见模块头 B）------------------------------------------------
 #: bundle 的包名前缀（`--into` 之外，产出 `<out>/ECHO-bundle-<stamp>/bundle/…`）。
 BUNDLE_PREFIX = "ECHO-bundle"
-#: 默认打进 bundle 的组件 id。
-#: **`wake-kws` 故意不在默认档**（2026-10-08 用户定）：语音唤醒 `wakeEnabled` 默认就是
-#: **关**的，而这份唤醒模型 39.7 MB —— 关着的功能不该占离线包的体积。
-#: 启用唤醒时在面板「设置 → 模型」里下载它（目录条目 `kws`）。
-DEFAULT_BUNDLE_COMPONENTS = ("runtime-core", "stt-sherpa", "stt-sensevoice-onnx")
-#: 模型类组件里"缺了就跳过"的（**`stt-sherpa` 与 `stt-sensevoice-onnx` 都是必需的**：
-#: 前者是唤醒主路 + 指令兜底，后者是默认转写引擎；两个都缺就没法转了）。
+#: 默认打进 bundle 的组件 id：**只剩 runtime-core**。
+#: 2026-10-31 用户拍板：客户端不装任何本地 STT 模型/引擎（唤醒也取消），
+#: 所以 bundle 里没有 `models\` —— 只有 wheels + runtime 兜底。
+DEFAULT_BUNDLE_COMPONENTS = ("runtime-core",)
+#: 模型类组件（历史变量名保留；现在一个都没有）。
 OPTIONAL_MODEL_COMPONENTS = ()
 #: 嵌入包与 get-pip 的**名字必须与 install-all.ps1 里写的一字不差**（它按名字找）：
 #: `$zip = Join-Path $script:Bundle 'runtime\python-3.11.9-embed-amd64.zip'`。
@@ -111,18 +116,10 @@ EMBED_NAME = "python-3.11.9-embed-amd64.zip"
 EMBED_URL = "https://www.python.org/ftp/python/3.11.9/" + EMBED_NAME
 GETPIP_URL = "https://bootstrap.pypa.io/get-pip.py"
 #: bundle 自检要求"必须在"的 wheel（少一个，目标机上那一步就一定失败）：
-#: 前五个是默认档跑起来要的，最后四个是**离线把 pip 装上**要的（嵌入包不带 pip/ensurepip）。
-#:
-#: 2026-10-08 补 `pypinyin`：它是**唤醒的拼音容错层**要用的（`wake.py::_pinyin`），
-#: 而它**从来没进过任何依赖清单** —— 结果客户机上导入失败被 `except` 静默吞掉，
-#: 表现为"开发机能唤醒、客户机唤不醒"。光把它写进 `requirements-core.txt` 只盖住
-#: "在线装/薄包"那条路，**离线装是从这个 wheelhouse 拿包**的，所以必须在这里也钉住：
-#: 少了它，出包时**当场失败**，而不是等用户在客户机上发现唤不醒。
-BUNDLE_REQUIRED_WHEELS = ("fastapi", "uvicorn", "sherpa-onnx", "modelscope", "soundfile",
-                          "pypinyin",
+#: 前几项是默认档跑起来要的，最后四个是**离线把 pip 装上**要的（嵌入包不带 pip/ensurepip）。
+#: 2026-10-31：sherpa-onnx / modelscope / pypinyin 已从客户端依赖里删除。
+BUNDLE_REQUIRED_WHEELS = ("fastapi", "uvicorn", "numpy", "sounddevice", "soundfile",
                           "pip", "setuptools", "wheel", "packaging")
-#: 模型目录里必须有的三件 onnx + 词表（判据与 build_min_kit.verify_kit 一致）。
-MODEL_REQUIRED_FILES = (("encoder", ".onnx"), ("decoder", ".onnx"), ("joiner", ".onnx"))
 
 
 
@@ -271,12 +268,12 @@ def pick_python(override: str) -> List[str]:
 
 
 def bundle_specs(from_env: bool) -> Tuple[List[str], List[str]]:
-    """bundle 要下的 wheel 清单：**默认档（sherpa）那一路**。
+    """bundle 要下的 wheel 清单：**默认档（runtime-core）那一路**。
 
-    引擎→依赖的映射从技能脚本 `echo-install-components.ps1` 的 `$ENGINE_MAP` 解析出来
-    （`min_kit.spec_list`），所以"引擎依赖变了但 bundle 没跟上"这件事不会静默发生。
+    2026-10-31 起客户端没有本地 STT 引擎 —— 只按 requirements-core.txt 下核心依赖，
+    不再解析/追加任何 `$ENGINE_MAP` 的引擎 pip 包。
     """
-    return helpers().spec_list(["sherpa"], from_env)
+    return helpers().spec_list([], from_env)
 
 
 def pinned_specs(specs: List[str], py: List[str]) -> List[str]:
@@ -298,8 +295,9 @@ def fetch(url: str, dest) -> None:
 def bundle_model_items(spec: Dict[str, dict], wanted: Iterable[str]) -> List[Tuple[str, str, str]]:
     """从规格里算出要拷哪些模型目录 → `[(组件 id, 仓库内相对路径, 包内相对路径)]`。
 
-    ⚠️ 目标机的 `install-all.ps1` 是**按 `bundle\\models\\<名字>` 找模型**的
-    （`sherpa-onnx-streaming` / `wakeword`）——所以 `to` 必须原样摆过去，不能改名。
+    2026-10-31 起默认档没有模型组件，这个函数返回空表（保留给历史规格/调试）。
+    如果哪天又要把模型摆进 `bundle\\models\\`，仍按 `install-all.ps1` 的
+    `bundle\\models\\<名字>` 约定原样摆放，不改名。
     """
     out: List[Tuple[str, str, str]] = []
     for cid in wanted:
@@ -408,8 +406,7 @@ def build_bundle(bundle_dir: str, spec: Dict[str, dict], wanted: Iterable[str], 
              "",
              "契约（scripts/install-all.ps1 的三个消费点，改名就装不上）：",
              "  wheels\\                             pip install --no-index --find-links bundle\\wheels",
-             "  models\\sherpa-onnx-streaming\\       复制到 <安装根>\\models\\",
-             "  models\\wakeword\\                    -Wake 才要；没有就自动跳过",
+             "  （没有 models\\：客户端不装本地 STT 模型；转写全部走能力后端）",
              "  runtime\\%s  第④级兜底建运行时" % EMBED_NAME,
              "  runtime\\get-pip.py                   配套（--no-index --find-links wheels）",
              ""]
@@ -433,7 +430,7 @@ def build_bundle(bundle_dir: str, spec: Dict[str, dict], wanted: Iterable[str], 
     return info
 
 
-def verify_bundle(bundle_dir: str, *, want_models: bool = True,
+def verify_bundle(bundle_dir: str, *, want_models: bool = False,
                   want_runtime: bool = True) -> List[str]:
     """bundle 的结构自检（**不抛**，返回问题清单）——判据与目标机那几个消费点一一对应。"""
     problems: List[str] = []
@@ -448,34 +445,11 @@ def verify_bundle(bundle_dir: str, *, want_models: bool = True,
         if not any(fn.startswith(norm) for fn in names):
             problems.append("bundle\\wheels 里缺 %s" % need)
     if want_models:
-        # 2026-10-08：默认档现在有**两个**转写模型，判据各不相同 ——
-        #   * sherpa 流式：encoder*/decoder*/joiner* 三个 onnx + tokens.txt（唤醒主路 + 指令兜底）
-        #   * sensevoice-onnx：model*.onnx + tokens.txt + silero_vad.onnx（指令默认引擎）
-        # 少任一份都要在**出包时**就报出来：等装到同事机器上才发现"默认引擎没模型"，
-        # 表现是识别质量悄悄退回流式的叠字，最难查。
-        d = os.path.join(bundle_dir, "models", "sherpa-onnx-streaming")
-        if not os.path.isdir(d):
-            problems.append("bundle\\models 里没有 sherpa-onnx-streaming"
-                            "（语音唤醒的主路 + 指令转写兜底都靠它）")
-        else:
-            have = os.listdir(d)
-            for pre, suf in MODEL_REQUIRED_FILES:
-                if not any(fn.startswith(pre) and fn.endswith(suf) for fn in have):
-                    problems.append("模型目录缺 %s*%s" % (pre, suf))
-            if "tokens.txt" not in have:
-                problems.append("模型目录缺 tokens.txt")
-        d2 = os.path.join(bundle_dir, "models", "sensevoice-onnx")
-        if not os.path.isdir(d2):
-            problems.append("bundle\\models 里没有 sensevoice-onnx"
-                            "（默认转写引擎，缺了会静默回落到流式 sherpa）")
-        else:
-            have2 = os.listdir(d2)
-            if not any(fn.startswith("model") and fn.endswith(".onnx") for fn in have2):
-                problems.append("sensevoice-onnx 目录缺 model*.onnx")
-            for need in ("tokens.txt", "silero_vad.onnx"):
-                if need not in have2:
-                    # VAD 缺了不致命（退回整段识别），但长音频会退化成几个字 —— 要报
-                    problems.append("sensevoice-onnx 目录缺 %s" % need)
+        # 2026-10-31：客户端默认档**没有本地模型**。这个参数只为历史调试保留：
+        # 真的带了 models 目录时只做"目录非空"的弱校验，不再要求任何具体模型。
+        d = os.path.join(bundle_dir, "models")
+        if os.path.isdir(d) and not os.listdir(d):
+            problems.append("bundle\\models 是空目录（客户端默认档不应出现 models）")
     if want_runtime:
         rt = os.path.join(bundle_dir, "runtime")
         for name in (EMBED_NAME, "get-pip.py"):
@@ -523,7 +497,7 @@ def run_bundle(args, spec: Dict[str, dict]) -> int:
     total = _size_mb(bundle_dir)
     log("  合计 %.1f MB（用时 %.0f 秒）" % (total, time.time() - t0))
 
-    problems = verify_bundle(bundle_dir, want_models=not args.no_models,
+    problems = verify_bundle(bundle_dir, want_models=False,
                              want_runtime=not args.no_runtime)
     if problems:
         raise PackError("bundle 自检没过（这个包别发）：\n  - " + "\n  - ".join(problems))
@@ -564,7 +538,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                     help="--bundle 专用：直接写进 <dir>\\bundle（不套顶层目录、不打 zip）")
     ap.add_argument("--wheels-from-env", action="store_true",
                     help="--bundle 专用：wheel 按本机已装版本钉住")
-    ap.add_argument("--no-models", action="store_true", help="--bundle 专用：不打模型")
+    ap.add_argument("--no-models", action="store_true",
+                    help="--bundle 专用：兼容参数（2026-10-31 起默认档本来就没有模型）")
     ap.add_argument("--no-runtime", action="store_true",
                     help="--bundle 专用：不打嵌入包与 get-pip.py")
     ap.add_argument("--no-resolve-check", action="store_true",

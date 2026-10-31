@@ -25,13 +25,13 @@ from app.api import router                                         # noqa: E402
 
 
 class ManifestTests(unittest.TestCase):
-    def test_builtin_covers_known_models_and_engines(self):
+    def test_builtin_covers_runtime_and_agents_only(self):
         ids = {i["id"] for i in components.load_manifests()}
-        for want in ("runtime-core", "agent-dsh", "accel-cuda", "stt-sensevoice",
-                     "stt-sherpa", "stt-whisper-small", "wake-kws", "diarize-pyannote"):
+        for want in ("runtime-core", "agent-dsh", "agent-harness", "accel-cuda"):
             self.assertIn(want, ids, "内置清单缺少 %s" % want)
-        # 1.x 面板里能看到的 whisper 档位，至少要覆盖常用两档
-        self.assertIn("stt-whisper-large-v3", ids)
+        # 2026-10-31：客户端不装任何本地 STT/唤醒/分离模型。
+        bad = sorted(i for i in ids if i.startswith(("stt-", "wake-", "diarize-")))
+        self.assertEqual(bad, [], "客户端组件清单里还有本地模型组件：%s" % bad)
 
     def test_every_item_has_the_fields_the_panel_needs(self):
         for i in components.load_manifests():
@@ -49,19 +49,20 @@ class ManifestTests(unittest.TestCase):
     def test_required_set(self):
         items = {i["id"]: i for i in components.load_manifests()}
         self.assertTrue(items["runtime-core"]["required"])
-        self.assertFalse(items["diarize-pyannote"]["required"])
+        required = [i["id"] for i in items.values() if i.get("required")]
+        self.assertEqual(required, ["runtime-core"])
 
     def test_directory_manifest_overrides_and_appends(self):
         tmp = tempfile.mkdtemp(prefix="echo-comp-")
         os.makedirs(components.components_dir(tmp), exist_ok=True)
         with open(os.path.join(components.components_dir(tmp), "extra.json"), "w", encoding="utf-8") as fh:
-            json.dump([{"id": "stt-sensevoice", "name": "改过的名字", "size_mb": 1},
-                       {"id": "custom-thing", "kind": "stt", "name": "自建组件",
+            json.dump([{"id": "runtime-core", "name": "改过的名字", "size_mb": 1},
+                       {"id": "custom-thing", "kind": "runtime", "name": "自建组件",
                         "platforms": ["win32"], "detect": {}}], fh)
         items = {i["id"]: i for i in components.load_manifests(root=tmp)}
-        self.assertEqual(items["stt-sensevoice"]["name"], "改过的名字")
-        self.assertEqual(items["stt-sensevoice"]["size_mb"], 1)
-        self.assertEqual(items["stt-sensevoice"]["kind"], "stt", "未覆盖的字段应保留内置值")
+        self.assertEqual(items["runtime-core"]["name"], "改过的名字")
+        self.assertEqual(items["runtime-core"]["size_mb"], 1)
+        self.assertEqual(items["runtime-core"]["kind"], "runtime", "未覆盖的字段应保留内置值")
         self.assertIn("custom-thing", items)
 
 
@@ -158,77 +159,6 @@ class InstallCommandTests(unittest.TestCase):
                 self.assertIs(components._detect({"detect": {"setting": "dshBaseUrl"}}), False)
         finally:
             srv.shutdown()
-
-
-class SttEngineDependencyTests(unittest.TestCase):
-    """stt 组件的「就绪」必须把 **pip 依赖** 算进去（2026-09-23 事故）。
-
-    事故经过：稳定版 `models/sherpa-onnx-streaming` 齐全、面板把 `stt-sherpa`
-    报成「已就绪」，而 runtime-core 里没有 `sherpa_onnx` —— 每次语音指令都在转写处
-    抛 ModuleNotFoundError，面板一声不响，DSH 什么都没收到。
-    根因之一就是这个判据：模型类组件只问 `modelinfo`（模型文件在不在），
-    而"模型下好了"与"引擎能用"是两件事。
-    """
-
-    def _cat(self):
-        return {i["id"]: i for i in components.catalog(include_blocked=True)["items"]}
-
-    def test_model_present_but_module_missing_is_not_ready(self):
-        from unittest.mock import patch
-        item = {"id": "stt-sherpa", "model_id": "sherpa", "pkg": "sherpa-onnx"}
-        with patch("app.modelinfo.ready", lambda mid: True), \
-                patch("app.components._module_ok", lambda name: name != "sherpa_onnx"):
-            self.assertIs(components._detect(item), False,
-                          "模型在、pip 包不在 → 不能用，不能报就绪")
-
-    def test_ready_requires_both(self):
-        from unittest.mock import patch
-        item = {"id": "stt-sherpa", "model_id": "sherpa", "pkg": "sherpa-onnx"}
-        with patch("app.modelinfo.ready", lambda mid: True), \
-                patch("app.components._module_ok", lambda name: True):
-            self.assertIs(components._detect(item), True)
-        with patch("app.modelinfo.ready", lambda mid: False), \
-                patch("app.components._module_ok", lambda name: True):
-            self.assertIs(components._detect(item), False, "模型不在 → 仍然不算就绪")
-
-    def test_catalog_says_what_is_missing(self):
-        """「没就绪」要说清缺什么：只说"未安装"会把用户引去重新下载模型。"""
-        from unittest.mock import patch
-        with patch("app.modelinfo.ready", lambda mid: True), \
-                patch("app.components._module_ok", lambda name: name != "sherpa_onnx"):
-            row = self._cat()["stt-sherpa"]
-        self.assertIs(row["ready"], False)
-        self.assertEqual(row["readyKind"], "python")
-        self.assertIn("sherpa_onnx", row["readyReason"])
-
-    def test_missing_model_is_labelled_as_model(self):
-        from unittest.mock import patch
-        with patch("app.modelinfo.ready", lambda mid: False), \
-                patch("app.components._module_ok", lambda name: True):
-            row = self._cat()["stt-sherpa"]
-        self.assertEqual(row["readyKind"], "model")
-        self.assertIn("模型", row["readyReason"])
-
-    def test_every_stt_engine_declares_its_pip_package(self):
-        """引擎 → pip 包不能只活在安装技能里：面板要能给出可复制的安装命令。
-
-        `pkg`（拼 pip 命令用）与 `install_state.ENGINE_SPECS[module]`（判 import 用）
-        是配套的两件事，**包名不等于模块名**（sherpa_onnx → 包是 sherpa-onnx）。
-        """
-        from app import install_state
-        # 期望值在测试里独立写一份（就是"钉住契约"的意思，不从被测代码里推）
-        want_pkg = {"sherpa_onnx": "sherpa-onnx", "faster_whisper": "faster-whisper",
-                    "funasr": "funasr", "qwen_asr": "qwen-asr"}
-        items = {i["id"]: i for i in components.load_manifests()}
-        for cid, item in items.items():
-            if item.get("kind") != "stt" or not item.get("model_id"):
-                continue
-            spec = install_state.engine_spec(item["model_id"])
-            self.assertTrue(spec, "%s 的 model_id=%s 在 ENGINE_SPECS 里找不到" % (cid, item["model_id"]))
-            self.assertTrue(item.get("pkg"), "%s 没有声明 pip 包（面板就没法给安装命令）" % cid)
-            self.assertEqual(item["pkg"], want_pkg.get(spec["module"]),
-                             "%s 的 pkg 与引擎模块 %s 对不上" % (cid, spec["module"]))
-            self.assertIn(item["pkg"], components._install_command(item))
 
 
 class StandaloneHarnessComponentTests(unittest.TestCase):

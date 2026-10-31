@@ -16,7 +16,7 @@
     dist/ECHO-delivery-<stamp>.zip     ← 上面那个资料夹的 zip（`--no-zip` 可跳过）
 
 **离线包是个开关（`--no-offline`，2026-10-16 加）**：`dist/` 里躺着后端离线包（3.1 GB）时，
-默认**带**它 —— 那一层 ≈3.4 GB；但"纯客户端"那档（先配对别人的 GPU）本应只有 ≈432 MB。
+默认**带**它 —— 那一层 ≈3.4 GB；但"纯客户端"那档（先配对别人的 GPU）本应只有 ≈58 MB。
 所以给了 `--no-offline`：**只影响这一层放不放离线包**，`清单.txt` 会如实写"这一层不含离线包"。
 两个场景里只有 `client` 能配它：`full-local` 的语义是"**零下载**"（必须带离线包 + 权重），
 两个一起给就是自相矛盾 —— **报错**，不静默忽略其中一个。
@@ -163,11 +163,16 @@ def zip_has_entry(zip_path: Path, entry: str) -> bool:
 
 # ---------------------------------------------------------------- 交付标准（2026-10-05 固化）
 
-#: 客户端包**必须**带的载荷（"免下载"的凭据）：`bundle/wheels` 给 pip `--no-index`；
-#: `bundle/models/sherpa-onnx-streaming` 是语音指令那条路的流式模型（189 MB）。
+#: 客户端包**必须**带的载荷（"免下载"的凭据）：`bundle/wheels` 给 pip `--no-index`。
+#: 2026-10-31 用户拍板：客户端不再装任何本地 STT 模型/引擎（转写全走能力后端），
+#: 所以 `bundle/models` 完全不要求、也**不应该**出现在纯客户端包里（模型 0 MB）。
 #: 为什么要判它：2026-10-05 那次就是 kit 从 285 MB 掉成 7 MB（没带载荷）**没人拦**，
 #: 同事装的时候变成全量联网下载。
-BUNDLE_REQUIRED_ENTRIES = ("bundle/wheels", "bundle/models/sherpa-onnx-streaming")
+#:
+#: **纯客户端层体积口径（2026-10-31）≈58 MB**：
+#:   echo-core ≈9.7 + wheels ≈29 + runtime ≈13 + 安装技能 ≈0.1；
+#:   旧默认档 ≈432 MB 的 bundle/models（337.5）+ STT wheel（~38）已全部消失。
+BUNDLE_REQUIRED_ENTRIES = ("bundle/wheels",)
 
 #: 交付场景（用户 2026-10-05 定）：`client` = 客户端包 + 后端薄包（先配对别人的 GPU）；
 #: `full-local` = 再加后端离线包，且它**必须自带权重** —— 否则"那台机器零下载"就是空话。
@@ -187,7 +192,8 @@ APK_DEST_PREFIX = "ECHO-android-"
 
 #: 标准配方（帮助文本与报错里共用同一份，别抄第二遍）
 STANDARD_HOWTO = (
-    "标准做法（2026-10-05 定）：客户端包要自带载荷，否则同事装的时候要联网下运行时/依赖/模型。\n"
+    "标准做法（2026-10-05 定；2026-10-31 起客户端无本地模型）：客户端包要自带载荷，\n"
+    "否则同事装的时候要联网下运行时/依赖（客户端不再需要模型）。\n"
     "     出法：\n"
     "       python scripts\\build_offline_pack.py --bundle --out dist\\_bundle\n"
     "       python scripts\\build_kit.py --platforms win "
@@ -336,7 +342,7 @@ def assemble(stamp: str, dist: Path, kit_zip: Path | None = None,
     同一个交付目录里可以并存好几版，同事拿到哪一个一眼能看出是哪天的。
 
     ``no_offline``：**这一层**不放后端离线包（纯客户端那档：`dist/` 里躺着 3.1 GB 的离线包时，
-    默认会一起带上 → 整层 ≈3.4 GB，而"先配对别人的 GPU"那档本来只要 ≈432 MB）。
+    默认会一起带上 → 整层 ≈3.4 GB，而"先配对别人的 GPU"那档本来只要 ≈58 MB）。
     它**只管这一层放不放文件**，别的行为一字不变；`清单.txt` 会如实写"这一层不含离线包"
     （否则清单就成了"说有、目录里没有"的假话）。与 `full-local` **互斥**（见下面的报错）。
     """
@@ -348,7 +354,7 @@ def assemble(stamp: str, dist: Path, kit_zip: Path | None = None,
             "--no-offline 与 --scenario full-local **互相矛盾**：full-local 的语义是"
             "「那台机器零下载」（必须带后端离线包 + 权重），\n"
             "     而 --no-offline 要求这一层**不带**离线包 —— 两个要求不可能同时满足。\n"
-            "     二选一：纯客户端那档就 --scenario client --no-offline（≈432 MB）；\n"
+            "     二选一：纯客户端那档就 --scenario client --no-offline（≈58 MB）；\n"
             "     要零下载就别给 --no-offline（≈3.4 GB，再带权重就是 full-local ≈8 GB）。")
     kit = kit_zip or default_kit_zip(dist)
     if kit is None or not kit.is_file():
@@ -466,7 +472,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--no-offline", action="store_true",
                     help="这一层**不带**后端离线包 —— 纯客户端那档用（先配对别人的 GPU）。"
                          "为什么要有它：dist 里有离线包（3.1 GB）时默认会一起带上，"
-                         "整层就从 ≈432 MB 变成 ≈3.4 GB，而「纯客户端」根本用不到那 3 GB；"
+                         "整层就从 ≈58 MB 变成 ≈3.4 GB，而「纯客户端」根本用不到那 3 GB；"
                          "以前只能手工把离线包移出 dist（手工活，必漂）。"
                          "它只管这一层放不放文件，别的行为一字不变，"
                          "清单.txt 会如实写「这一层不含离线包」。"

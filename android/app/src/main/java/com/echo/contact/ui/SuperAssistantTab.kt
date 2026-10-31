@@ -470,6 +470,7 @@ private fun CommandCardBody(
     val accent = when {
         submit.blocked.isNotBlank() -> EchoPalette.Red
         submit.phase == SubmitPhase.Failed -> EchoPalette.Red
+        submit.phase == SubmitPhase.Busy -> EchoPalette.Yellow
         submit.phase == SubmitPhase.Done -> EchoPalette.Green
         submit.phase != SubmitPhase.Idle -> EchoPalette.Purple
         recording -> EchoPalette.Red

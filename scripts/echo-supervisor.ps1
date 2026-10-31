@@ -64,6 +64,11 @@ $script:LogPath = Join-Path $env:USERPROFILE '.echo-supervisor.log'
 $script:LogMaxBytes = 2MB
 $script:WarnedOthers = @{}
 $script:FirstPass = $true
+# install-switcher.ps1 sets this marker while it refreshes the supervisor.
+# Without it the freshly spawned loop thinks "this is the logon launch" and
+# snaps `current` back to `bootDefault`, silently contradicting the instance
+# that is actually running (seen 2026-10-31: dev running, current=stable).
+if ($env:ECHO_SWITCH_NO_BOOT -eq '1') { $script:FirstPass = $false }
 
 # --- log --------------------------------------------------------------------
 # Important events (start/stop/errors/self-heal/switch/instance start) always

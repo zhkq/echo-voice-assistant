@@ -227,151 +227,6 @@ class SkillPointsAtTheRealEntryTests(unittest.TestCase):
         self.assertIn(r"$skill\scripts\echo-install-components.ps1", self.text)
 
 
-class EngineTableAlignmentTests(unittest.TestCase):
-    """两个安装器（Windows .ps1 / macOS .sh）的引擎表必须彼此一致，且被 app 认。
-
-    为什么值得钉：这一表把「用户选的能力」翻译成三样东西 —— pip 依赖、模型 id、写进
-    `sttModel` 的值。三样各自都有权威出处（`app/components.py` 的 `model_id`、
-    `app/audio/stt.py` 的 `resolve_engine`/`WHISPER_MODELS`）。表一旦漂了，症状是
-    「装完了但转写报错」或者「下了一个 app 不认识的模型 id」，而且两边平台各错各的。
-    """
-
-    @classmethod
-    def setUpClass(cls):
-        sys.path.insert(0, ROOT)
-        from app.audio import stt as stt_mod
-        cls.stt = stt_mod
-        cls.ps1 = _parse_ps1_engine_map()
-        cls.sh_pip = _parse_bash_case_map(SH, "engine_pip")
-        cls.sh_model = _parse_bash_case_map(SH, "engine_model")
-        cls.sh_stt = _parse_bash_case_map(SH, "engine_stt")
-        cls.sh_module = _parse_bash_case_map(SH, "engine_module")
-
-    def test_both_installers_cover_the_same_engines(self):
-        self.assertEqual(sorted(self.ps1), sorted(self.sh_stt),
-                         "两个安装器认识的引擎集合不一致")
-
-    def test_pip_deps_agree(self):
-        for engine, info in self.ps1.items():
-            self.assertEqual(sorted(info["pip"]),
-                             sorted(_lookup_case_arm(self.sh_pip, engine).split()),
-                             f"{engine} 的 pip 依赖两边不一致")
-
-    def test_model_ids_agree(self):
-        for engine, info in self.ps1.items():
-            # mac 那边 whisper 档写成 echo "$1"（就是引擎名本身），等价于 ps1 的 model
-            got = _lookup_case_arm(self.sh_model, engine)
-            if got == "$1":
-                got = engine
-            self.assertEqual(info["model"], got, f"{engine} 的模型 id 两边不一致")
-
-    def test_stt_values_agree(self):
-        for engine, info in self.ps1.items():
-            self.assertEqual(info["stt"], _lookup_case_arm(self.sh_stt, engine),
-                             f"{engine} 写进 sttModel 的值两边不一致")
-
-    def test_python_authority_table_agrees_with_both_installers(self):
-        """**权威表在 `app/install_state.py`**，两个安装器是它的镜像 —— 三者必须逐项一致。
-
-        为什么把权威放在 python 侧：安装状态/自检/面板横幅都由 ECHO 自己算（`install_state.py`），
-        技能脚本在"还没装好 ECHO"时就得知道引擎→依赖的映射，所以只能各留一份镜像。
-        镜像与权威漂了，症状是"技能装的东西 app 不认"，或者"面板说还缺、其实已经装了"。
-        """
-        sys.path.insert(0, ROOT)
-        from app import install_state
-        specs = install_state.ENGINE_SPECS
-        self.assertEqual(sorted(specs), sorted(self.ps1),
-                         "app/install_state.py 与安装器认识的引擎集合不一致")
-        for engine, spec in specs.items():
-            self.assertEqual(spec["model"], self.ps1[engine]["model"], f"{engine} 模型 id")
-            self.assertEqual(spec["stt"], self.ps1[engine]["stt"], f"{engine} sttModel 值")
-            self.assertEqual(spec["module"], self.ps1[engine]["module"], f"{engine} pip 模块名")
-            self.assertEqual(spec["module"], _lookup_case_arm(self.sh_module, engine),
-                             f"{engine} 的 bash 镜像与权威表不一致")
-
-    def test_model_ids_exist_in_the_component_catalog(self):
-        known = _component_model_ids()
-        for engine, info in self.ps1.items():
-            self.assertIn(info["model"], known,
-                          f"{engine} 用的模型 id 不在 app/components.py 里：{info['model']}")
-
-    def test_stt_values_are_accepted_by_the_app(self):
-        """装出来的设置，app 必须认得 —— 不认的话会静默回落，用户看到「选了却不生效」。"""
-        for engine, info in self.ps1.items():
-            value = info["stt"]
-            got_engine, got_model = self.stt.resolve_engine(value)
-            if engine.startswith("whisper-"):
-                self.assertEqual("whisper", got_engine, f"{engine} 应解析成 whisper")
-                self.assertIn(value, self.stt.WHISPER_MODELS,
-                              f"{value} 不是合法的 whisper 档名")
-            elif engine == "sherpa":
-                self.assertEqual(("sherpa", ""), (got_engine, got_model))
-            elif engine == "sensevoice-onnx":
-                # 2026-10-08：指令转写的**默认**引擎（int8 ONNX 版 SenseVoice）。
-                # 它**不**走 funasr/torch —— 那条取舍是本方案体积优势的全部来源。
-                self.assertEqual(("sensevoice-onnx", ""), (got_engine, got_model))
-                self.assertEqual("sherpa_onnx", info["module"],
-                                 f"{engine} 的 module 必须是 sherpa_onnx，"
-                                 "改成 funasr 会把 torch 拖进客户端")
-            elif engine == "sensevoice":
-                self.assertEqual("sensevoice", got_engine)
-            elif engine == "qwen3asr":
-                self.assertEqual("qwen3asr", got_engine)
-            else:
-                self.fail(f"测试没覆盖这个引擎的分类：{engine}")
-
-
-class DownloadClientTests(unittest.TestCase):
-    """每个 STT 引擎档都必须带**模型下载客户端**（同事实测报告 §4.1 B，2026-09-25）。
-
-    为什么值得单独钉一条：`app/modelinfo._snapshot()` 的下载路径是
-    「**先 ModelScope、失败再 HF**」—— 两条路各需要一个客户端模块，**一个都没有就必然
-    下不到模型**。而这个洞一直是被盖住的：whisper-* 档顺带装了 `huggingface-hub`、
-    sensevoice/qwen3asr 顺带装了 `modelscope`，于是 3.0 的**默认档（只有 sherpa）**
-    一装就卡在"模型下不下来"，安装脚本空等到 1800 秒超时，报的是两句 ImportError。
-
-    钉两层：
-      * 引擎表（两个平台都要）—— 安装器装依赖时就该把客户端带上；
-      * 默认档的依赖清单 —— 模型以后还能从面板补下，运行期也得有客户端。
-    """
-
-    CLIENTS = ("modelscope", "huggingface-hub")
-
-    def _has_client(self, pips):
-        return [c for c in self.CLIENTS
-                if any(p.split("==")[0].split(">")[0].strip() == c for p in pips)]
-
-    def test_windows_engine_map_carries_a_download_client(self):
-        for engine, row in _parse_ps1_engine_map().items():
-            with self.subTest(engine=engine):
-                self.assertTrue(self._has_client(row["pip"]),
-                                "%s 档没带下载客户端（modelscope / huggingface-hub）：%s"
-                                % (engine, row["pip"]))
-
-    def test_macos_engine_map_carries_a_download_client(self):
-        for engine, value in _parse_bash_case_map(SH, "engine_pip").items():
-            with self.subTest(engine=engine):
-                self.assertTrue(self._has_client(value.split()),
-                                "%s 档没带下载客户端（mac 侧）：%s" % (engine, value))
-
-    def test_the_two_platforms_pick_the_same_client_for_sherpa(self):
-        """**两个平台不许各挑一个**：挑不同的客户端会让"Windows 能用、mac 下不动"这种事
-        只在一边复现，而两边的日志长得一样。"""
-        ps1 = _parse_ps1_engine_map()["sherpa"]["pip"]
-        sh = _parse_bash_case_map(SH, "engine_pip")["sherpa"].split()
-        self.assertEqual(self._has_client(ps1), self._has_client(sh),
-                         "sherpa 档在两平台上带的客户端不一致：win=%s mac=%s" % (ps1, sh))
-
-    def test_the_default_profile_requirements_carry_one_too(self):
-        """默认档的依赖清单里也要有 —— 它是**运行时**依赖，不只是安装期依赖。"""
-        with open(os.path.join(ROOT, "requirements-core.txt"), encoding="utf-8") as fh:
-            names = [ln.split(">")[0].split("=")[0].strip().lower()
-                     for ln in fh if ln.strip() and not ln.strip().startswith("#")]
-        self.assertTrue([c for c in self.CLIENTS if c in names],
-                        "requirements-core.txt 里没有下载客户端（modelscope / huggingface-hub）：%s"
-                        % names)
-
-
 class MacInstallBaseLayoutTests(unittest.TestCase):
     """mac 侧的脚本也要认安装根布局（同一条判据，三处一起守）。
 
@@ -756,69 +611,6 @@ class HarnessTreeSmokeTest(unittest.TestCase):
         for path, tag in ((HarnessLocalInstallTests.PS1_HELPER, "ps1"),
                           (HarnessLocalInstallTests.SH_HELPER, "sh")):
             self.assertIn("装残", _read(path), "%s 助手没说清残树要重装" % tag)
-
-
-class OfflineBundleStaysOfflineTests(unittest.TestCase):
-    """`bundle\\` 那条路（`install-all.ps1 -Offline`）：**装的时候一个字节都不下载**。
-
-    用户 2026-09-30 的目标：同事拿到一个包 → 双击 → 只问安装位置 → 装完给面板地址，
-    而**装的时候不下载 Python 运行时 / 依赖 / 模型**（DSH 标准版是例外，它按许可走联网 npm）。
-
-    这一组钉的就是那三个"不下载"分别靠什么成立 —— 它们**全都是既有行为**，所以这里
-    只有验证、没有改动（第 677-683 行把 PIP_NO_INDEX/PIP_FIND_LINKS 钉进环境；
-    `Install-Model` 先看 `/api/models` 的 `ready`；离线时包里没有模型的引擎会被摘掉）：
-
-      1. 依赖：pip 的环境变量被钉死 → 引擎依赖也走本地 wheelhouse（不联网）；
-      2. 模型：**已经在**的模型（离线包里复制过去的那份）走"已装好，跳过"，不会再去下载；
-      3. 包里没有模型的引擎：**摘掉并说清**，不是硬失败（否则一个可选模型就能让整场安装失败）。
-    """
-
-    def setUp(self):
-        self.all_text = _read(INSTALL_ALL)
-        self.comp_text = _read(PS1_COMPONENTS)
-
-    def test_install_all_pins_pip_to_the_local_wheelhouse(self):
-        self.assertIn("$env:PIP_NO_INDEX = '1'", self.all_text)
-        self.assertIn("$env:PIP_FIND_LINKS = (Join-Path $script:Bundle 'wheels')", self.all_text)
-
-    def test_the_component_script_checks_ready_before_asking_for_a_download(self):
-        """`Install-Model` 必须**先看 `/api/models` 的 ready**，再谈下载。
-
-        这是"离线时模型已存在就不再联网下载"的唯一判据：模型是离线包里复制到
-        `<安装根>\\models\\` 的，ECHO 那份状态本来就是 ready —— 只要这里先看 ready，
-        整条离线安装就不会碰网络。
-        """
-        body = re.search(r"function Install-Model.*?\n\}", self.comp_text, re.S)
-        self.assertIsNotNone(body, "找不到 Install-Model（组件脚本改结构了？）")
-        text = body.group(0)
-        self.assertIn("$st.ready -eq $true", text)
-        self.assertIn("跳过", text)
-        self.assertLess(text.index("$st.ready -eq $true"), text.index("/api/models/download"),
-                        "先问下载、后看 ready —— 离线时会白下一次模型")
-
-    def test_an_engine_whose_model_is_missing_is_dropped_not_fatal(self):
-        """离线包里没有模型的引擎 → 摘掉 + 一句人话；**不许 exit 1**。"""
-        body = re.search(r"\$rcPy = Build-OfflineRuntime(.*?)\n\}", self.all_text, re.S)
-        self.assertIsNotNone(body, "找不到 install-all.ps1 的离线载荷那一段")
-        text = body.group(1)
-        self.assertIn("离线包里没有", text)
-        self.assertIn("$kept", text)
-        self.assertNotIn("exit 1", text)
-
-    def test_the_wakeword_model_is_optional_in_the_bundle(self):
-        """没有 `bundle\\models\\wakeword` 时唤醒词自动跳过（而不是失败）。"""
-        self.assertIn("$wantWake = $false", self.all_text)
-        self.assertIn("models\\wakeword", self.all_text)
-
-    def test_explicit_agent_harness_still_wins_over_the_offline_default(self):
-        """离线默认 `-Agent none`，但**显式给 harness 时要照做**。
-
-        为什么这条要紧：同事那个双击的 .bat 会同时传 `-Offline -Agent harness` ——
-        载荷不下载（wheels/模型/运行时全在包里），而 DSH 标准版仍按许可走联网 npm。
-        如果哪天"离线就强制 none"被写死，双击装出来的机器就没有智能体。
-        """
-        self.assertIn("if (-not $Agent) { $Agent = if ($Offline) { 'none' } else { 'harness' } }",
-                      self.all_text)
 
 
 class BackendChoiceTests(unittest.TestCase):
@@ -1216,11 +1008,9 @@ class UpgradeModeTests(unittest.TestCase):
         self.assertIn("Ask-UpgradeDsh", self.text)
         self.assertIn("$UpgradeDsh", self.comp)
         self.assertIn("-Upgrade", self.comp)  # 传给 harness-install-local
-        # 设置写入必须包在"非 KeepSettings"那一支里
-        i_settings = self.comp.index("# 2) 写设置")
-        i_else = self.comp.index("} else {", i_settings)
-        i_stt = self.comp.index("$values['sttModel']")
-        self.assertGreater(i_stt, i_else, "KeepSettings 时不能走到写 sttModel 的那一支")
+        # 2026-10-31：客户端已不再写 sttModel（没有本地 STT 引擎）；KeepSettings 仍要生效。
+        self.assertIn("if ($KeepSettings)", self.comp)
+        self.assertNotIn("$values['sttModel']", self.comp)
 
     def test_the_launcher_recognises_an_existing_install(self):
         cmd = _read(os.path.join(ROOT, "delivery", "kit-install.cmd"), encoding="ascii")

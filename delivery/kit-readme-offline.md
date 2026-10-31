@@ -5,7 +5,7 @@
 ## 三句话
 
 1. 把整个文件夹复制到目标机器（U 盘 / 内网共享都行）。
-2. **双击 `装我.cmd`** —— 它会自己装好运行时、依赖、模型，最后打印**面板地址**。
+2. **双击 `装我.cmd`** —— 它会自己装好运行时、依赖，最后打印**面板地址**。
 3. 打开那个地址就是 ECHO 面板；说一句话试试，或开始一场会议录音。
 
 ## 包里有什么
@@ -17,7 +17,7 @@
 | `ECHO\` | ECHO 主程序（已解开，约 10 MB）—— 里面的 `ECHO\scripts\install-all.ps1` 是快路入口 |
 | `echo-install\` | 安装技能：**想交给 AI 助手装也行**（见下），与 `装我.cmd` 效果一样 |
 | `bundle\wheels\` | 离线 Python 依赖（pip 用 `--no-index --find-links` 从这里装，**不联网**） |
-| `bundle\models\sherpa-onnx-streaming\` | 流式转写模型（189 MB，随包） |
+| `bundle\models\` | **已不再有**：客户端不装本地转写模型（2026-10-31 起全走能力后端） |
 | `bundle\runtime\` | 兜底的 CPython 3.11 嵌入包 + get-pip.py（目标机没有 Python / uv 时用它） |
 | `BUILD-INFO.txt` / `SHA256SUMS.txt` | 包的身份与主程序各文件的校验值 |
 
@@ -29,8 +29,8 @@
 powershell -NoProfile -ExecutionPolicy Bypass -File .\install-offline.ps1 -Root D:\ECHO
 ```
 
-* 默认装到 `D:\ECHO`（没有 D 盘就 `C:\ECHO`）；装 `minimal` 档：**sherpa 流式转写**（语音指令 + 会议转写都能用）。
-* 想要唤醒词/更多档位：`-Profile main`（唤醒词模型的权重不在本包里，那一步需要网络）。
+* 默认装到 `D:\ECHO`（没有 D 盘就 `C:\ECHO`）：只装运行时 + 核心依赖 + 面板。
+* **客户端不装本地转写模型**；要转写就配对能力后端（Qwen3-ASR）。
 * 装完**不需要联网、不需要 agent**。
 
 **原路（把技能交给 AI 助手）**：把整个文件夹交给你的助手，说「按 echo-install 这个技能给我装 ECHO」。
@@ -41,8 +41,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\install-offline.ps1 -Root 
 * 想要**会议纪要 / 语音指令的智能体**（DSH 标准版）：本包**不含** DSH ——
   `@deepseek-ai/dsh` 是私有 npm 包，许可上不能随包分发。需要时按 `echo-install` 技能的
   第 5 节联网装（或直接用已装的 DSH 桌面版）。
-* 想要**唤醒词 / whisper 档 / SenseVoice / 说话人分离**：这些模型不随包，
-  在面板 →「能力」里按需下载（走 ModelScope / hf-mirror 镜像）。
+* **客户端没有本地模型可下**（2026-10-31 起全走能力后端）——模型都装在后端那台。
 
 ## 遇到问题
 

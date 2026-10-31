@@ -272,213 +272,106 @@ class TranscribeImplWiringTests(unittest.TestCase):
 
 
 class CommandTranscribeTests(unittest.TestCase):
-    """命令口述转写也走 provider（P5）：判据与会议转写**同一份**（providers.asr_if_configured）。
-
-    2026-09-23 事故后这里多钉一件事：`_transcribe_command()` 的第三个返回值
-    （ok/empty/error）必须把"引擎挂了"与"这段没人说话"分开 —— 稳定版没装 sherpa_onnx 时
-    命令转写每次都抛 ModuleNotFoundError，可日志里只有一句「转写为空（engine=sherpa）」，
-    于是被读成"没听清"，真正的根因一个字都没露。
-    """
+    """2026-10-31：命令/回顾转写只走能力后端（客户端已无本地 STT）。"""
 
     def setUp(self):
-        self.logs = []
         from app import assistant
         self.assistant = assistant
+        self.logs = []
         p = patch.object(assistant.db, "add_log",
                          lambda level, source, msg: self.logs.append((level, msg)))
         p.start()
         self.addCleanup(p.stop)
 
-    def test_uses_provider_when_configured(self):
-        fake = _FakeAsr(text="打开浏览器")
-        with patch("app.providers.asr_if_configured", lambda: (fake, "openai-asr")), \
-                patch.object(self.assistant.stt_mod, "transcribe_ex",
-                             side_effect=AssertionError("配了 provider 就不该调本地引擎")):
-            text, note, status = self.assistant._transcribe_command("a.wav", {"sttLanguage": "zh"})
-        self.assertEqual(text, "打开浏览器")
-        self.assertEqual(status, self.assistant.ASR_OK)
-        self.assertIn("provider=openai-asr", note)
-        self.assertEqual(fake.calls[0][1], "zh")
+    @staticmethod
+    def _ok(text):
+        return {"text": text, "status": "ok",
+                "detail": "backend=echo-server variant=short"}
 
-    def test_provider_error_returns_note_not_exception(self):
-        fake = _FakeAsr(error=RuntimeError("openai-asr: HTTP 401 密钥无效"))
-        with patch("app.providers.asr_if_configured", lambda: (fake, "openai-asr")):
-            text, note, status = self.assistant._transcribe_command("a.wav", {})
-        self.assertEqual(text, "")
-        self.assertEqual(status, self.assistant.ASR_ERROR)
-        self.assertIn("401", note, "失败原因要能带到日志里")
-
-    def test_provider_empty_result_keeps_the_reason(self):
-        fake = _FakeAsr(text="", reason="empty-or-unknown")
-        with patch("app.providers.asr_if_configured", lambda: (fake, "openai-asr")):
-            text, note, status = self.assistant._transcribe_command("a.wav", {})
-        self.assertEqual(text, "")
-        self.assertEqual(status, self.assistant.ASR_EMPTY, "provider 没报错就是 empty，不能算 error")
-        self.assertIn("reason=empty-or-unknown", note)
-
-    def test_local_path_used_when_not_configured(self):
+    def test_command_goes_to_backend_with_short_variant(self):
         seen = {}
 
-        def fake_transcribe(wav, engine, model, lang, device):
-            seen.update(engine=engine, model=model, lang=lang, device=device)
-            return {"text": "  你好   世界 ", "status": stt.TRANSCRIBE_OK, "detail": ""}
+        def fake(wav, cfg, lang="auto", *, variant="long", timeout=None):
+            seen.update(lang=lang, variant=variant, timeout=timeout)
+            return self._ok("打开浏览器")
 
-        with patch("app.providers.asr_if_configured", lambda: (None, "未配置 providerAsr（用本地引擎）")), \
-                patch.object(self.assistant.stt_mod, "transcribe_ex", fake_transcribe):
+        with patch.object(self.assistant, "_transcribe_via_backend", fake), \
+                patch.object(self.assistant.stt_mod, "transcribe_ex",
+                             side_effect=AssertionError("不该再有本地转写")):
             text, note, status = self.assistant._transcribe_command(
-                "a.wav", {"sttModel": "sensevoice", "device": "cuda", "sttLanguage": "zh"})
-        self.assertEqual(text, "你好 世界", "空白要归一化（老行为）")
+                "a.wav", {"sttLanguage": "zh"})
+        self.assertEqual(text, "打开浏览器")
         self.assertEqual(status, self.assistant.ASR_OK)
-        self.assertEqual(seen["engine"], "sensevoice")
-        self.assertEqual(seen["device"], "cuda")
-        self.assertIn("engine=sensevoice", note)
+        self.assertEqual(seen["variant"], "short")
+        self.assertIn("backend=echo-server", note)
 
-    def test_local_engine_failure_is_also_reported(self):
-        """本地引擎抛异常 → error（且原因进 note）—— 不许再被当成"没人说话"。"""
-        with patch("app.providers.asr_if_configured", lambda: (None, "未配置")), \
+    def test_review_goes_to_backend_with_long_variant(self):
+        seen = {}
+
+        def fake(wav, cfg, lang="auto", *, variant="long", timeout=None):
+            seen.update(variant=variant, timeout=timeout)
+            return {"text": "一段口述", "status": "ok", "detail": "backend"}
+
+        with patch.object(self.assistant, "_transcribe_via_backend", fake):
+            text, _note, status = self.assistant._transcribe_command(
+                "a.wav", {}, variant="long")
+        self.assertEqual(text, "一段口述")
+        self.assertEqual(seen["variant"], "long")
+        self.assertEqual(status, self.assistant.ASR_OK)
+
+    def test_backend_busy_is_its_own_status(self):
+        def fake(wav, cfg, lang="auto", *, variant="long", timeout=None):
+            return {"text": "", "status": self.assistant.ASR_BUSY,
+                    "detail": "能力后端忙（code=client_busy）：上一条还没跑完"}
+
+        with patch.object(self.assistant, "_transcribe_via_backend", fake):
+            text, note, status = self.assistant._transcribe_command("a.wav", {})
+        self.assertEqual(text, "")
+        self.assertEqual(status, self.assistant.ASR_BUSY)
+        self.assertIn("client_busy", note)
+        self.assertIn("忙", self.assistant.asr_failure_hint(note))
+
+    def test_no_local_fallback_when_backend_fails(self):
+        with patch.object(self.assistant, "_transcribe_via_backend",
+                          lambda *a, **kw: {"text": "",
+                                            "status": self.assistant.ASR_ERROR,
+                                            "detail": "能力后端没配对"}), \
                 patch.object(self.assistant.stt_mod, "transcribe_ex",
-                             side_effect=RuntimeError("CUDA out of memory")):
-            text, note, status = self.assistant._transcribe_command("a.wav", {"sttModel": "whisper"})
+                             side_effect=AssertionError("客户端已无本地 STT")):
+            text, note, status = self.assistant._transcribe_command("a.wav", {})
         self.assertEqual(text, "")
         self.assertEqual(status, self.assistant.ASR_ERROR)
-        self.assertIn("CUDA out of memory", note)
+        self.assertIn("没配对", note)
 
-    def test_missing_dependency_is_error_not_empty(self):
-        """复现 2026-09-23 事故：引擎报"没有这个模块"必须是 error，并把原因带出来。"""
-        def boom(wav, engine, model, lang, device):
-            return {"text": "", "status": stt.TRANSCRIBE_ERROR,
-                    "detail": "sherpa: No module named 'sherpa_onnx'"}
-
-        with patch("app.providers.asr_if_configured", lambda: (None, "未配置")), \
-                patch.object(self.assistant.stt_mod, "transcribe_ex", boom):
-            text, note, status = self.assistant._transcribe_command("a.wav", {"sttModel": "sherpa"})
-        self.assertEqual(text, "")
-        self.assertEqual(status, self.assistant.ASR_ERROR)
-        self.assertIn("status=error", note)
-        self.assertIn("sherpa_onnx", note)
-        hint = self.assistant.asr_failure_hint(note)
-        self.assertIn("sherpa-onnx", hint, "给用户的话要说出缺哪个包（模块名对用户没用）")
-        self.assertIn("能力", hint, "还要告诉他在面板哪儿装")
-
-    def test_silence_is_empty_not_error(self):
-        """引擎正常但没内容 → empty：这时才该说"没听清"。"""
-        with patch("app.providers.asr_if_configured", lambda: (None, "未配置")), \
-                patch.object(self.assistant.stt_mod, "transcribe_ex",
-                             lambda *a, **kw: {"text": "", "status": stt.TRANSCRIBE_EMPTY,
-                                               "detail": "whisper 返回空结果"}):
-            text, note, status = self.assistant._transcribe_command("a.wav", {"sttModel": "whisper"})
-        self.assertEqual(text, "")
-        self.assertEqual(status, self.assistant.ASR_EMPTY)
-        self.assertIn("status=empty", note)
+    def test_unavailable_hint_tells_user_to_check_backend(self):
+        hint = self.assistant.asr_failure_hint("能力后端没配对、也没在设置里填地址")
+        self.assertIn("后端", hint)
 
 
 class ReviewUsesTheMeetingEngineTests(unittest.TestCase):
-    """每日回顾的转写**走能力后端**（与会议同一个引擎）—— 2026-10-07 用户要求。
+    """2026-10-31：回顾恒走能力后端；本机选项/回落已删除。"""
 
-    为什么必须改：回顾每轮是**成段自述**，而本机 sherpa 是给短口令调的小流式模型。
-    同一段真实录音（10:26:44 那轮）两个引擎的实测对比：
-
-        能力后端：测试一下今天的每日回顾。我今天主要的工作就是，把每日回顾界面功能
-                  完善了一下，同时呢，又修复了一个后端启动时的bug。
-        sherpa  ：小测试试一下今天天的美丽每日回回国回顾我今天今天主要的工作就是把
-                  阿美美美如日回馈回回回回顾葵顾裤哦哦界面界面功能完完善上了一下…
-
-    后者有明显重复/错字，直接拖累 DSH 整理出的原文。**这条对比就是本用例存在的理由。**
-    """
-
-    def setUp(self):
+    def test_every_value_maps_to_backend(self):
         from app import assistant
-        self.assistant = assistant
-        self.logs = []
-        p = patch.object(assistant.db, "add_log",
-                         lambda level, source, msg: self.logs.append((level, msg)))
-        p.start()
-        self.addCleanup(p.stop)
+        for v in ("local", "echo-server", "", None, "whatever"):
+            with self.subTest(v=v):
+                self.assertEqual(
+                    assistant.review_stt_prefer({"dailyReviewSttBackend": v}),
+                    "backend")
 
-    # ---- 路由选择 ----
-
-    def test_default_is_the_backend(self):
-        self.assertEqual(self.assistant.review_stt_prefer({"dailyReviewSttBackend": "echo-server"}),
-                         "backend")
-
-    def test_explicit_local_is_respected(self):
-        self.assertEqual(self.assistant.review_stt_prefer({"dailyReviewSttBackend": "local"}),
-                         "local")
-
-    def test_unknown_values_fall_back_to_the_backend(self):
-        """空值/写错的值都按"后端"处理。
-
-        为什么未知值走**后端**而不是本机（2026-10-08 默认值改成 `local` 时复核过）：
-        这一支只处理"值本身没法解读"，而"设为空"最可能是用户把设置清掉了 ——
-        那时**保持与历史一致的保守行为**（后端 = 与会议同引擎）比按本机跑更安全；
-        真正的默认值来自 `config.py` / 库里的 `local`，不经过这一支。
-        """
-        for bad in ("", "whatever", None):
-            with self.subTest(v=bad):
-                self.assertEqual(self.assistant.review_stt_prefer({"dailyReviewSttBackend": bad}),
-                                 "backend")
-
-    # ---- 真的调用 ----
-
-    def _backend_ok(self, text):
-        return patch.object(self.assistant, "_transcribe_via_backend",
-                            lambda wav, cfg, lang="auto": {"text": text,
-                                                           "status": stt.TRANSCRIBE_OK,
-                                                           "detail": "backend=echo-server"})
-
-    def test_backend_text_is_used_and_the_local_engine_is_not_called(self):
-        with patch("app.providers.asr_if_configured", lambda: (None, "未配置")), \
-                self._backend_ok("测试一下今天的每日回顾"), \
-                patch.object(self.assistant.stt_mod, "transcribe_ex",
-                             side_effect=AssertionError("后端成了就不该再跑本机引擎")):
-            text, note, status = self.assistant._transcribe_command(
-                "a.wav", {"sttModel": "sherpa"}, prefer="backend")
-        self.assertEqual(text, "测试一下今天的每日回顾")
-        self.assertEqual(status, self.assistant.ASR_OK)
-        self.assertIn("backend=echo-server", note)
-        self.assertNotIn("sherpa", note, "note 不该谎报成走了本机引擎")
-
-    def test_backend_failure_falls_back_to_local_and_says_so(self):
-        """后端没成**必须回落本机**（后端没起来时回顾仍要能用），
-        而且要把"本来想走后端"写进 note —— 否则日志里只剩 engine=sherpa，
-        看不出"该走后端却没走成"（那正是排障第一问）。"""
-        def boom(wav, cfg, lang="auto"):
-            return {"text": "", "status": stt.TRANSCRIBE_ERROR,
-                    "detail": "能力后端没配对、也没在设置里填地址"}
-
-        with patch("app.providers.asr_if_configured", lambda: (None, "未配置")), \
-                patch.object(self.assistant, "_transcribe_via_backend", boom), \
-                patch.object(self.assistant.stt_mod, "transcribe_ex",
-                             lambda *a, **kw: {"text": "本机转出来的", "status": stt.TRANSCRIBE_OK,
-                                               "detail": ""}):
-            text, note, status = self.assistant._transcribe_command(
-                "a.wav", {"sttModel": "sherpa"}, prefer="backend")
-        self.assertEqual(text, "本机转出来的", "回落要真的给出文本")
-        self.assertEqual(status, self.assistant.ASR_OK)
-        self.assertIn("回落本机", note)
-        self.assertIn("engine=sherpa", note)
-        self.assertTrue(any(lvl == "warn" for lvl, _ in self.logs), "回落要留一条 warn 日志")
-
-    def test_local_prefer_never_touches_the_backend(self):
-        with patch("app.providers.asr_if_configured", lambda: (None, "未配置")), \
-                patch.object(self.assistant, "_transcribe_via_backend",
-                             side_effect=AssertionError("选了本机就不该问后端")), \
-                patch.object(self.assistant.stt_mod, "transcribe_ex",
-                             lambda *a, **kw: {"text": "本机的", "status": stt.TRANSCRIBE_OK,
-                                               "detail": ""}):
-            text, _note, status = self.assistant._transcribe_command(
-                "a.wav", {"sttModel": "sherpa"}, prefer="local")
-        self.assertEqual(text, "本机的")
-        self.assertEqual(status, self.assistant.ASR_OK)
-
-    def test_the_review_worker_asks_the_routing_helper(self):
-        """接线判据：`_review_worker` 必须把偏好传下去（忘了传 = 这个功能等于没做）。"""
+    def test_review_worker_passes_long_variant(self):
         import io
-        import os
         src = io.open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                                    "app", "assistant.py"), encoding="utf-8").read()
-        self.assertIn("prefer=review_stt_prefer(cfg)", src,
-                      "回顾那一步没把转写偏好传下去")
+        self.assertIn('_transcribe_command(wav, cfg, variant="long")', src,
+                      "回顾那一步没有用 long 档")
+        self.assertIn("def _transcribe_command", src)
+        body = src.split("def _transcribe_command", 1)[1].split("\ndef ", 1)[0]
+        self.assertNotIn("transcribe_ex", body, "命令转写里不许再调本地引擎")
+
+    def test_default_setting_is_echo_server(self):
+        from app.config import DEFAULTS
+        self.assertEqual(DEFAULTS["dailyReviewSttBackend"]["value"], "echo-server")
 
 
 if __name__ == "__main__":

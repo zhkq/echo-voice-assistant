@@ -42,4 +42,12 @@ open class BaseViewModel(app: Application) : AndroidViewModel(app) {
     /** 从 HttpException 里提取人话错误。 */
     protected fun parseHttp(e: HttpException): String =
         humanMessage(errorBodySafe(e.response()?.errorBody()), e.code())
+
+    /**
+     * 这个状态码是不是「忙，不是坏」——2026-10-31 起指令/回顾/会议转写全走能力后端，
+     * 同一个人的请求是串行的，所以 **409 `client_busy`**（自己上一条还没跑完）
+     * 与 **503 `server_busy`/`model_loading`**（后端忙/还在加载）会真实出现：
+     * 它们该显示"稍后再试"，不是"失败"。
+     */
+    protected fun isBusyCode(code: Int): Boolean = code == 409 || code == 503
 }

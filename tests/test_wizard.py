@@ -193,7 +193,6 @@ _FIXTURE_COMPONENTS = [
      "size_mb": 189, "how": "面板下载"},
     {"id": "stt-whisper-base", "name": "Whisper base", "model_id": "whisper-base",
      "size_mb": 141, "how": "面板下载"},
-    {"id": "wake-kws", "name": "唤醒词 KWS", "model_id": "kws", "size_mb": 40, "how": ""},
     {"id": "diarize-pyannote", "name": "说话人分离（pyannote）", "model_id": "pyannote",
      "size_mb": 32, "never_ship": True, "how": "需要 HF 授权"},
     {"id": "accel-cuda", "name": "CUDA 加速", "size_mb": 2500,
@@ -215,7 +214,7 @@ class _PlanTestCase(_WizardTestCase):
         self._orig_ready = modelinfo.ready
         components.load_manifests = lambda root=None: [dict(x) for x in _FIXTURE_COMPONENTS]
         modelinfo.ready = lambda mid: (mid == "sherpa")
-        # 写配置后的联动在测试里哑掉：真做会去起/停独立 harness（npx）与唤醒监听，
+        # 写配置后的联动在测试里哑掉：真做会去起/停独立 harness（npx），
         # 既慢又动本机进程。要验它的测试自己把它换成记录器（见 EffectsTests）。
         wizard.apply_settings_effects = lambda updated, **kw: []
 
@@ -236,9 +235,10 @@ class BuildPlanTests(_PlanTestCase):
         self.assertEqual(plan["readyMb"], 189)
         self.assertIn("1 项已经装好", plan["summary"]["alreadyReady"])
 
-    def test_wake_and_diarize_join_the_plan(self):
-        plan = wizard.build_plan({"wake": True, "diarize": True})
-        self.assertEqual([d["component"] for d in plan["downloads"]], ["wake-kws"])
+    def test_diarize_joins_the_plan(self):
+        """2026-10-31：唤醒词已取消，向导不再有 wake-kws 这一环；只剩分离等可选组件。"""
+        plan = wizard.build_plan({"diarize": True})
+        self.assertEqual(plan["downloads"], [])
         diarize = [m for m in plan["manual"] if m["component"] == "diarize-pyannote"][0]
         self.assertIn("许可证", diarize["reason"],
                       "gated 的模型文件要说清「不能随包分发」，而不是假装能装")
@@ -326,7 +326,7 @@ class ExecutePlanTests(_PlanTestCase):
         self.assertEqual([r["component"] for r in result["skipped"]], ["stt-sherpa"])
 
     def test_one_failure_does_not_stop_the_others(self):
-        plan = wizard.build_plan({"engines": ["stt-whisper-base", "wake-kws"]})
+        plan = wizard.build_plan({"engines": ["stt-whisper-base", "stt-sherpa"]})
         result = wizard.execute_plan(
             plan, plan_file=self._plan_file(),
             settings_update=lambda values: list(values),
@@ -335,7 +335,7 @@ class ExecutePlanTests(_PlanTestCase):
             ready=lambda mid: False)
         self.assertFalse(result["ok"])
         self.assertEqual([r["modelId"] for r in result["failed"]], ["whisper-base"])
-        self.assertEqual([r["modelId"] for r in result["downloads"]], ["kws"],
+        self.assertEqual([r["modelId"] for r in result["downloads"]], ["sherpa"],
                          "前一项失败不能挡住后面的项")
 
     def test_a_raising_download_is_recorded_not_propagated(self):

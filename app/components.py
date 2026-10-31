@@ -30,16 +30,12 @@ from typing import Dict, List, Optional, Tuple
 #: 组件类别
 KINDS = ("runtime", "accel", "stt", "diarize", "wake", "tts", "agent")
 
-#: 必装组件（首装就装这些；其余由向导逐项问，见 D23）
+#: 必装组件（首装就装这些）。
 #:
-#: 2026-09-23：`stt-sherpa` 从"可选"提升为**必装** —— 这是对 D23 的一处**有意反转**。
-#: 理由：指令转写是 ECHO 的核心交互链路，**不允许依赖服务端可用性**（3.0 铁律 L3）；
-#: 而 2026-09-23 的事故证明"靠向导逐项问"是问不住的 ——
-#: 稳定版模型文件齐全、面板报"已就绪"，可 runtime-core 里没装 sherpa_onnx，
-#: 于是每次语音指令都静默转写出空串（用户根本不知道该去装什么）。
-#: **注意范围**：这里提升的是**流式引擎 + 指令用模型**（约 216 MB）；
-#: 会议转写模型（sensevoice / whisper / qwen3asr）**仍然全部可选**。
-REQUIRED_IDS = ("runtime-core", "stt-sherpa")
+#: 2026-10-31 用户拍板：客户端默认档**不做任何本地转写** —— 指令/回顾/会议统一走
+#: 能力后端（echo-server + Qwen3-ASR），语音唤醒取消。所以必装只剩运行时核心；
+#: 任何 stt-* / wake-* / diarize-* 组件都已从清单里删除（也不许再加回来）。
+REQUIRED_IDS = ("runtime-core",)
 
 
 # ---------------------------------------------------------------- 内置清单
@@ -66,12 +62,11 @@ def _builtin() -> List[dict]:
     """
     return [
         dict(id="runtime-core", kind="runtime", name="运行时核心", required=True, optional=False,
-             purpose="Python 运行时依赖（服务 + 面板 + **语音指令转写引擎 sherpa-onnx**）",
-             size_mb=130, platforms=["win32", "macos", "linux"], min_os={},
-             # 就绪判据必须与 requirements-core.txt **一致**。
-             # 2026-09-23 之前这里查的是 faster_whisper / funasr / sherpa_onnx，
-             # 而那份清单一个都没有 —— 于是这条判定一直在问它不装的包。
-             detect={"python": "sherpa_onnx"},
+             purpose="Python 运行时依赖（服务 + 面板 + 音频 IO）；**不含任何本地 STT 引擎**",
+             size_mb=120, platforms=["win32", "macos", "linux"], min_os={},
+             # 就绪判据必须与 requirements-core.txt **一致**。2026-10-31 起那份清单
+             # 只装服务骨架与音频 IO（sherpa-onnx/modelscope/pypinyin 已删）。
+             detect={"python": "fastapi"},
              source="pypi", requirements=True,
              how="装 ECHO 的依赖清单（命令已带上本机解释器路径，粘到终端即可）"),
         # 2026-09-19 更正：这条原来写的是「pip install deepseek-harness-sdk（265 MB）」，源自
@@ -104,83 +99,11 @@ def _builtin() -> List[dict]:
                  "`{echoBase}/dsh/app`**（新布局；老装机仍在 `<安装目录>/harness/dsh`，"
                  "冷启动约 10 秒），命令记在设置的 harnessCommand 里。"
                  "右边这条是没装成时的兜底（走 npx，首次要多等 1-2 分钟）"),
-        dict(id="accel-cuda", kind="accel", name="CUDA 加速", optional=True, required=False,
-             purpose="让转写/说话人分离跑在 N 卡上（3 倍以上速度）",
+        dict(id="accel-cuda", kind="accel", name="CUDA 加速（客户端不再需要）", optional=True, required=False,
+             purpose="已退役：客户端不跑本地转写/分离模型；CUDA 只在那台能力后端上需要",
              size_mb=2500, platforms=["win32", "linux"], min_os={},   # mac 上不出现
              detect={"python": "torch", "exe": None},
-             source="pypi", how="按显卡驱动安装 torch 的 CUDA 版（面板不代装）；无 N 卡不要装"),
-        dict(id="stt-sensevoice-onnx", kind="stt", name="SenseVoice ONNX（默认引擎）",
-             optional=False, required=True,
-             purpose="**语音指令的默认转写引擎**：int8 ONNX 版 SenseVoice，"
-                     "**不需要 torch/funasr**，复用已必装的 sherpa-onnx 运行时。"
-                     "2026-10-08 实测：叠字 73（流式 sherpa 是 852）、整段 16.9 秒"
-                     "（比 sherpa 还快，因为带 Silero VAD 只识别有人在说话的段）。"
-                     "**取代原来的「流式做转写」** —— 但 sherpa 那份流式模型**仍要留**，"
-                     "语音唤醒的主路就用它（SenseVoice 是离线整段模型，替不了边说边判）",
-             size_mb=230, platforms=["win32", "macos", "linux"], min_os={},
-             model_id="sensevoice-onnx", pkg="sherpa-onnx", source="hf-mirror",
-             ref="csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17",
-             how="面板下载或自行拷贝到 models/sensevoice-onnx，要三份文件："
-                 "model.int8.onnx（228 MB）+ tokens.txt + silero_vad.onnx（1.7 MB，"
-                 "长音频切段用；缺了退回整段识别，10 分钟音频会只出几个字）"),
-        dict(id="stt-sensevoice", kind="stt", name="SenseVoice 中文短命令", optional=True, required=False,
-             purpose="语音命令与会议转写的默认引擎（自带标点）",
-             size_mb=896, platforms=["win32", "macos", "linux"], min_os={},
-             model_id="sensevoice", pkg="funasr", source="modelscope", ref="iic/SenseVoiceSmall",
-             how="面板下载或自行拷贝到 models/sensevoice；需 funasr + torch"),
-        dict(id="stt-sherpa", kind="stt", name="sherpa-onnx 流式转写", optional=False, required=True,
-             purpose="**语音唤醒的主路（必装）+ 指令转写的兜底**：免 torch 的轻量流式转写。"
-                     "指令那条已改由 sensevoice-onnx 承担（中文叠字少得多），"
-                     "但唤醒必须用它 —— `wake.py` 的默认实现是「流式转写再匹配唤醒词」，"
-                     "KWS 对自然语音（'嘿尼欧'）识别不了。",
-             size_mb=189, platforms=["win32", "macos", "linux"], min_os={},
-             model_id="sherpa", pkg="sherpa-onnx", source="modelscope",
-             how="面板下载或自行拷贝到 models/sherpa-onnx-streaming；"
-                 "**还要装 pip 包 sherpa-onnx**（模型和引擎是两件事，"
-                 "2026-09-23 实测：只下模型时语音指令会静默转写出空串）。"
-                 "运行时（runtime-core）已含这个 pip 包，正常装完即有"),
-        dict(id="stt-whisper-tiny", kind="stt", name="Whisper tiny", optional=True, required=False,
-             purpose="最小最快的档位（精度最低，适合纯英文短句）",
-             size_mb=75, platforms=["win32", "macos", "linux"], min_os={},
-             model_id="whisper-tiny", pkg="faster-whisper",
-             source="hf-mirror", how="面板下载或从源机拷贝 models/faster-whisper/tiny"),
-        dict(id="stt-whisper-base", kind="stt", name="Whisper base", optional=True, required=False,
-             purpose="免 torch 的推荐组合之一（D1：sherpa-onnx + whisper-base）",
-             size_mb=141, platforms=["win32", "macos", "linux"], min_os={},
-             model_id="whisper-base", pkg="faster-whisper",
-             source="hf-mirror", how="面板下载或从源机拷贝 models/faster-whisper/base"),
-        dict(id="stt-whisper-small", kind="stt", name="Whisper small", optional=True, required=False,
-             purpose="多语种转写（推荐组合之一，D1）",
-             size_mb=464, platforms=["win32", "macos", "linux"], min_os={},
-             model_id="whisper-small", pkg="faster-whisper",
-             source="hf-mirror", how="面板下载或从源机拷贝 models/faster-whisper/small"),
-        dict(id="stt-whisper-medium", kind="stt", name="Whisper medium", optional=True, required=False,
-             purpose="介于 small 与 large-v3 之间的档位（内存换精度）",
-             size_mb=1500, platforms=["win32", "macos", "linux"], min_os={},
-             model_id="whisper-medium", pkg="faster-whisper",
-             source="hf-mirror", how="面板下载或从源机拷贝 models/faster-whisper/medium"),
-        dict(id="stt-whisper-large-v3", kind="stt", name="Whisper large-v3", optional=True, required=False,
-             purpose="精度优先的转写档位（显存/内存占用大）",
-             size_mb=2950, platforms=["win32", "macos", "linux"], min_os={},
-             model_id="whisper-large-v3", pkg="faster-whisper",
-             source="hf-mirror", how="面板下载（约 3 GB）；建议配合 accel-cuda"),
-        dict(id="stt-qwen3asr", kind="stt", name="Qwen3-ASR 0.6B + 强制对齐", optional=True, required=False,
-             purpose="方言/口音更强的转写，并给出逐句时间对齐",
-             size_mb=3600, platforms=["win32", "macos", "linux"], min_os={},
-             model_id="qwen3asr", pkg="qwen-asr", source="modelscope", ref="Qwen/Qwen3-ASR-0.6B",
-             how="scripts/install-qwen3asr.ps1（首次自动从 ModelScope 下载）；需 qwen-asr + transformers"),
-        dict(id="wake-kws", kind="wake", name="唤醒词 KWS", optional=True, required=False,
-             purpose="离线关键词唤醒（默认不装：需常开麦克风，有隐私成本）",
-             size_mb=40, platforms=["win32", "macos", "linux"], min_os={},
-             model_id="kws", source="modelscope",
-             how="自行获取 sherpa-onnx KWS 权重，按面板给的四个文件名放好"),
-        dict(id="diarize-pyannote", kind="diarize", name="说话人分离（pyannote）", optional=True, required=False,
-             purpose="会议里区分不同说话人（三件套；HF 上是 gated，ModelScope 上有同名开放镜像）",
-             size_mb=32, platforms=["win32", "macos", "linux"], min_os={},
-             model_id="pyannote",
-             source="modelscope", never_ship=True,        # 权重仍不随包分发（只在你机器上下载）
-             how="点下载即可（ModelScope 同名仓库，匿名可下）。请自行确认 pyannote 的使用条款 ——"
-                 "官方在 HF 上要求先同意条件，走镜像等于跳过那一步。"),
+             source="pypi", how="客户端默认档不需要它；不要为 ECHO 客户端装 torch"),
     ]
 
 

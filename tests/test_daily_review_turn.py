@@ -138,7 +138,7 @@ class TurnGoesThroughReviewTests(_ApiBase):
 
     def test_engine_failure_is_not_reported_as_i_did_not_hear_you(self):
         self._patch_client(_FakeClient())
-        note = "engine=sensevoice status=error detail=ModuleNotFoundError: No module named 'sherpa_onnx'"
+        note = "能力后端没配对、也没在设置里填地址"
         with mock.patch.object(assistant, "_transcribe_command",
                                lambda *a, **k: ("", note, assistant.ASR_ERROR)), \
              mock.patch.object(api_mod, "_audio_to_wav16k", _write_wav):
@@ -147,8 +147,24 @@ class TurnGoesThroughReviewTests(_ApiBase):
                 headers={"Content-Type": "audio/wav"}).json()
 
         self.assertFalse(body["ok"])
-        self.assertIn("转写引擎没装", body["spoken"],
-                      "引擎坏了说成'没听清'会让人反复重说：%s" % body["spoken"])
+        self.assertIn("后端", body["spoken"],
+                      "后端不可用说成'没听清'会让人反复重说：%s" % body["spoken"])
+        self.assertNotIn("我没听清", body["spoken"])
+        self.assertEqual([], self._rows())
+
+    def test_busy_is_reported_as_busy_not_as_i_did_not_hear_you(self):
+        """2026-10-31：后端忙（自己上一条还没跑完）要念"忙"，不能说成"没听清"。"""
+        self._patch_client(_FakeClient())
+        note = "能力后端忙（code=client_busy）：上一件事还没跑完"
+        with mock.patch.object(assistant, "_transcribe_command",
+                               lambda *a, **k: ("", note, assistant.ASR_BUSY)), \
+             mock.patch.object(api_mod, "_audio_to_wav16k", _write_wav):
+            body = self.client.post(
+                "/api/daily-review/turn", content=b"RIFF....",
+                headers={"Content-Type": "audio/wav"}).json()
+
+        self.assertFalse(body["ok"])
+        self.assertIn("忙", body["spoken"], body["spoken"])
         self.assertNotIn("我没听清", body["spoken"])
         self.assertEqual([], self._rows())
 

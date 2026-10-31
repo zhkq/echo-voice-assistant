@@ -4,7 +4,6 @@ import unittest
 
 from app.netguard import is_loopback_host, is_loopback_origin
 from app.pathutil import safe_under
-from app.audio.wake import _syl_match
 
 
 class PathSafetyTests(unittest.TestCase):
@@ -70,14 +69,6 @@ class LoopbackGuardTests(unittest.TestCase):
         self.assertTrue(is_loopback_origin("https://[::1]"))
         self.assertFalse(is_loopback_origin("null"))
         self.assertFalse(is_loopback_origin("https://example.com"))
-
-
-class WakeMatchingTests(unittest.TestCase):
-    def test_single_insert_or_delete_is_tolerated(self):
-        self.assertTrue(_syl_match("yuan", "yun"))
-        self.assertTrue(_syl_match("abc", "axbc"))
-        self.assertTrue(_syl_match("axbc", "abc"))
-        self.assertFalse(_syl_match("abc", "axybc"))
 
 
 if __name__ == "__main__":

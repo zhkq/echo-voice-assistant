@@ -106,10 +106,16 @@ class SendRoundTest {
             SubmitPhase.Sending,
             SubmitPhase.Accepted,
             SubmitPhase.Running,
+            SubmitPhase.Busy,
             SubmitPhase.Failed,
         )) {
             assertFalse("$phase 阶段不许显示回复", showsReply(phase))
         }
+
+        // 2026-10-31：忙碌是独立阶段 —— 界面必须说"忙（稍后再试）"，不能说"未完成"。
+        assertTrue("忙要单独的文案", phaseLabel(SubmitPhase.Busy).contains("忙"))
+        assertFalse("忙不是失败", phaseLabel(SubmitPhase.Busy) == phaseLabel(SubmitPhase.Failed))
+        assertTrue("忙完还能再发（不是失败态拦住）", sendGate("说完了", SubmitPhase.Busy, paired = true) is SendGate.Go)
 
         // 最坏情况：有人用 copy 把上一轮的 reply 留在失败态里 —— 界面按 showsReply 把关，仍然不显示
         val leaked = failedRound(3, "打开客厅的灯", "超时").copy(reply = "前一天的答复")

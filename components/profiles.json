@@ -1,45 +1,47 @@
 {
   "schema": 1,
-  "note": "交付档位（能力路由 §1.1/§11 step -1）。**这里是一份事实的唯一来源**：两个档各装什么、多大、不许出现什么。默认档的判据是铁律 L1（不含 torch / CUDA / 编译步骤），验收数字是 §1.2 那张表。校验它的用例是 tests/test_default_profile.py —— 改了这里、没改依赖清单，用例会红。",
+  "note": "交付档位（能力路由 §1.1/§11 step -1）。**这里是一份事实的唯一来源**：各档装什么、多大、不许出现什么。2026-10-31 用户拍板：客户端默认档**不做任何本地转写** —— 指令/回顾/会议转写统一走能力后端（echo-server + Qwen3-ASR），语音唤醒取消。默认档判据仍是铁律 L1（不含 torch / CUDA / 编译步骤），验收数字见 tests/test_default_profile.py。",
   "profiles": [
     {
       "id": "default",
-      "label": "默认档（办公本）",
-      "summary": "服务起得来、面板打得开、语音指令能转写；会议转写交给 GPU 后端（本机不做兜底）",
+      "label": "默认档（办公本 / 纯客户端）",
+      "summary": "服务起得来、面板打得开、音频能进能出；指令/回顾/会议转写全部交给能力后端（Qwen3-ASR），客户端不装任何本地 STT 模型或引擎",
       "requirements": "requirements-core.txt",
-      "components": ["runtime-core", "stt-sherpa", "stt-sensevoice-onnx"],
+      "components": ["runtime-core"],
       "extraMb": 222,
       "extraLabel": "DSH（标准版 harness 本地入口，实测 223 MB / 55 秒）",
-      "require": ["fastapi", "uvicorn", "numpy", "sounddevice", "sherpa-onnx", "modelscope"],
-      "requireWhy": "2026-09-25 同事实测报告 §4.1 B：sherpa 是默认档唯一的 STT 引擎，而模型下载走 app/modelinfo 的「先 ModelScope、失败再 HF」——**一个下载客户端都没有就必然下不到模型**（whisper-* 档顺带装了 huggingface-hub、sensevoice/qwen3asr 顺带装了 modelscope，所以这个洞一直被盖着）。modelscope 装完约 23 MB，不拖 torch（L1 安全）。",
+      "require": ["fastapi", "uvicorn", "numpy", "sounddevice", "soundfile", "soxr", "httpx"],
+      "requireWhy": "客户端只保留服务骨架与音频 IO：录音/播放（sounddevice、soundfile、soxr）与面板（fastapi/uvicorn）。**不再需要任何 STT 引擎或模型下载客户端** —— 转写在能力后端那台 GPU 上做。",
       "forbid": ["torch", "torchaudio", "torchvision", "funasr", "pyannote.audio",
                  "speechbrain", "transformers", "faster-whisper", "ctranslate2",
-                 "onnxruntime-gpu"],
-      "forbidComponents": ["stt-sensevoice", "stt-whisper-small", "stt-whisper-medium",
-                           "stt-whisper-large-v3"],
-      "forbidComponentsWhy": "只查依赖清单是不够的：**torch 还能从组件那条路溜回来** —— 把 stt-sensevoice（funasr+torch，896 MB）挪进默认档，依赖清单一个字都不用改。whisper small 以上也不是因为带 torch，而是体积（464 MB 起）不该进办公本的默认档；办公本要本机转写就加 stt-whisper-base（141 MB，torch-free）。",
+                 "sherpa-onnx", "onnxruntime", "onnxruntime-gpu", "modelscope", "pypinyin"],
+      "forbidComponents": ["stt-sensevoice", "stt-sensevoice-onnx", "stt-sherpa",
+                           "stt-whisper-tiny", "stt-whisper-base", "stt-whisper-small",
+                           "stt-whisper-medium", "stt-whisper-large-v3", "stt-qwen3asr",
+                           "wake-kws", "diarize-pyannote"],
+      "forbidComponentsWhy": "这些组件会把本地 STT/唤醒/分离模型（或 torch 系依赖）重新带回客户端。2026-10-31 起它们一律不装；整条转写链路由能力后端（Qwen3-ASR）承担。",
       "accept": [
-        "装完 `import torch` 失败（这是这一档的定义，不是副作用）",
-        "冷启动到能听命令 < 10 秒（不加载 torch/funasr）",
+        "装完 `import torch` 失败（默认档定义，不是副作用）",
+        "装完 `import sherpa_onnx` 失败（客户端不再装本地 STT 引擎）",
+        "冷启动到面板可用 < 10 秒",
         "默认常驻内存 < 500 MB",
-        "语音指令链路可用：唤醒 + 命令转写都在本机（铁律 L3）"
+        "指令/回顾/会议转写均走能力后端（echo-server + Qwen3-ASR）；客户端不装本地 STT 模型",
+        "客户端安装包无 bundle/models（模型 0 MB）"
       ]
     },
     {
       "id": "offline",
-      "label": "离线增强档",
-      "summary": "本机也能转写 / 说话人分离 / 声纹：模型 + torch 系依赖，**按需选装**（不是一档全装）",
-      "requirements": "requirements.txt",
-      "components": ["stt-whisper-base", "stt-whisper-small", "stt-whisper-medium",
-                     "stt-whisper-large-v3", "stt-sensevoice", "wake-kws"],
+      "label": "离线增强档（已废弃）",
+      "summary": "已废弃：2026-10-31 起客户端不再装本地 STT/分离/唤醒模型；离线能力统一由能力后端（可在本机起一个 echo-server）提供",
+      "requirements": "requirements-core.txt",
+      "components": [],
       "extraMb": 0,
       "extraLabel": "",
       "require": [],
       "forbid": [],
       "forbidComponents": [],
       "accept": [
-        "办公本建议只加 stt-whisper-base（141 MB，torch-free）",
-        "torch 系（SenseVoice / pyannote / Qwen3-ASR）装之前先看 §1.3 那五类故障"
+        "这一档只作历史兼容存在；不要往客户端默认档加回任何本地 STT 模型"
       ]
     }
   ]
