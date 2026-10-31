@@ -142,7 +142,7 @@ if exist "%KIT%bundle\wheels" (
   echo   bundle\ found - installing offline: the runtime, the dependencies
   echo   and the model come from this kit. The agent needs an already
   echo   installed official DeepSeek Harness desktop; otherwise ECHO falls
-  echo   back to npm (which needs a network connection).
+  echo   back to npm ^(which needs a network connection^).
 ) else (
   echo.
   echo   no bundle\ here - runtime, dependencies and model come from the
