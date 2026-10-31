@@ -92,20 +92,19 @@ def echo_write_pid():
     _write_pid(ECHO_PID_FILE, os.getpid())
 
 
-def echo_stop_self():
+def echo_stop_self(keep_backend: bool = False):
     """停止当前 ECHO 服务（面板「关机」/ `POST /api/control/echo/stop` 的定时器都走这里）。
 
-    **退出前先请边条退出**：边条（`echo-sidebar.exe`）是被 DETACHED_PROCESS 起来的
-    **独立进程**，`os._exit()` 带不走它 —— 2026-10-21 真机 bug 的形状就是
-    "8970 已停、服务确实关了、边条还挂在屏幕上"。这里用边条**已有的**命名管道发一条
-    `quit`（`app/runtime.py:quit_sidebar`），不新造协议。
-
-    通知是**尽力而为**：边条没开、管道正忙、连 import 出问题都只记日志，
-    **绝不让"停 ECHO"失败**（停服务不能因为一个窗口关不掉而失败）。
-    服务被强杀 / 崩溃时这里根本跑不到 —— 那条路由边条侧的心跳兜底（`sidebar/Heartbeat.cs`）。
+    **退出前先安排完整停止**：`scripts/stop.ps1` 会先停 watchdog / switch supervisor，
+    再停 ECHO、边条和（默认）本机后端 —— 否则 watchdog 几秒后又把 ECHO 拉起来。
+    升级路径会传 ``keep_backend=True``（后端配对/配置不能因为升级被停掉）。
     """
     try:
         from app import runtime as _runtime
+        # 2026-10-31：**先安排完整停止**（watchdog/supervisor + ECHO + 边条 + 后端
+        # 全由 scripts/stop.ps1 负责）。原来只 os._exit 自己，watchdog 几秒后把
+        # ECHO 又拉起来，用户看到的是"关完又自动打开"。
+        _runtime.schedule_full_stop(keep_backend=keep_backend)
         _runtime.quit_sidebar()
         # 兜底：旧边条不认 quit / 管道没接上 / 屏幕上是升级前遗留的进程时，
         # 3 秒后由脱离 ECHO 的清理进程按本棵树路径强制结束它。正常边条 2 秒就关了，

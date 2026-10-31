@@ -1,15 +1,41 @@
-﻿# install-desktop-shortcut.ps1 — 在桌面创建"ECHO 个人助理"快捷方式（双击一键启动）
-# 可重复运行（覆盖更新）；卸载时加 -Remove
-param([switch]$Remove)
+﻿# install-desktop-shortcut.ps1 — 在桌面创建 ECHO 的启动/停止入口（可重复运行）
+#   * ECHO 个人助理.lnk     一键启动（后台）+ 自动拉起 DSH + 打开面板
+#   * 启动 ECHO.cmd         安装包同步提供的显式启动脚本
+#   * 停止 ECHO.cmd         安装包同步提供的显式停止脚本（会停 watchdog/supervisor）
+# 卸载时加 -Remove；-StartStopOnly 只补启动/停止脚本，不碰已有快捷方式（升级用）
+param([switch]$Remove, [string]$DesktopDir = '', [switch]$StartStopOnly)
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
-$desktop = [Environment]::GetFolderPath('Desktop')
+$desktop = if ($DesktopDir) { $DesktopDir } else { [Environment]::GetFolderPath('Desktop') }
 $lnkPath = Join-Path $desktop 'ECHO 个人助理.lnk'
+$startCmd = Join-Path $desktop '启动 ECHO.cmd'
+$stopCmd = Join-Path $desktop '停止 ECHO.cmd'
 $target = Join-Path $root 'scripts\launch-desktop.ps1'
 
 if ($Remove) {
-    if (Test-Path $lnkPath) { Remove-Item $lnkPath -Force; Write-Host '已移除桌面快捷方式' }
-    else { Write-Host '桌面快捷方式不存在' }
+    foreach ($p in @($lnkPath, $startCmd, $stopCmd)) {
+        if (Test-Path $p) { Remove-Item $p -Force; Write-Host "已移除桌面入口: $p" }
+    }
+    exit 0
+}
+
+# Desktop 上两个**真正的 .cmd 脚本**（不是快捷方式）：用户要求安装包同步提供
+# 启动/停止脚本。脚本内容在安装时写入绝对路径，双击即可执行；路径用引号包住。
+function Write-DesktopCmd([string]$path, [string]$scriptName, [string[]]$extra, [switch]$PauseAtEnd) {
+    $psArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$root\scripts\$scriptName`"") + $extra
+    $line = 'powershell ' + ($psArgs -join ' ')
+    $body = "@echo off`r`n" + $line + "`r`n"
+    if ($PauseAtEnd) { $body += "echo.`r`npause`r`n" }
+    [System.IO.File]::WriteAllText($path, $body, [System.Text.Encoding]::ASCII)
+    Write-Host "已创建桌面脚本: $path"
+}
+
+Write-DesktopCmd $startCmd 'start.ps1' @('-Background')
+Write-DesktopCmd $stopCmd 'stop.ps1' @() -PauseAtEnd
+
+# 升级模式：核心代码更新了，但用户的桌面快捷方式/开机自启属于他自己的环境，
+# 不覆盖；只补两个启停脚本（2026-10-31 用户要求安装包在桌面提供它们）。
+if ($StartStopOnly) {
     exit 0
 }
 

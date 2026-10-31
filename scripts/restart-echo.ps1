@@ -123,7 +123,7 @@ function Invoke-Step([string]$file, [string[]]$extra, [int]$timeoutSeconds) {
 # The rail (echo-sidebar.exe) is meant to SURVIVE a restart - it retries the page while ECHO
 # boots, and app/runtime.py deliberately launches it detached for exactly that reason. So do
 # not ask it to exit here; only a real stop (stop.ps1 without -KeepSidebar) does that.
-Write-Log ("stop step: " + (Invoke-Step $stop @('-Quiet', '-KeepSidebar') 60))
+Write-Log ("stop step: " + (Invoke-Step $stop @('-Quiet', '-KeepSidebar', '-KeepSupervisor') 60))
 
 # Wait until nothing listens on the port, otherwise the new instance refuses to start
 # (ECHO has an anti-duplicate guard on the port).

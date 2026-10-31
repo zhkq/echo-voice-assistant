@@ -204,8 +204,41 @@ def schedule_sidebar_force_close(grace_ms: int = SIDEBAR_FORCE_CLOSE_GRACE_MS) -
         print(f"[hotkey] 安排边条兜底清理失败（忽略）: {e}")
         return False
 
-def quit_sidebar():
 
+def schedule_full_stop(keep_backend: bool = False) -> bool:
+    """安排一次**完整停止**（watchdog + supervisor + ECHO + 边条 + 本机后端）。
+
+    为什么要单独一个函数（2026-10-31 用户实测）：面板/边条的 ⏻ 原来只
+    `os._exit()` 自己，`stop.ps1` 默认也不停守护进程，于是 watchdog 几秒后把 ECHO
+    又拉起来 —— 用户看到"关完又自动打开"。现在把唯一的停止定义交给
+    `scripts/stop.ps1`（它先停 supervisor/watchdog，再停 ECHO），并且**脱离** ECHO
+    启动：ECHO 马上要退出，留在本进程里的清理会跟着死。
+    """
+    if echo_platform.current() != "win32":
+        return False
+    script = os.path.join(BASE_DIR, "scripts", "stop.ps1")
+    if not os.path.isfile(script):
+        return False
+    try:
+        # 2026-10-31 实测：PowerShell 是控制台程序，用 DETACHED_PROCESS 会触发
+        # WinError 786（管理员策略拦截）—— 和 restart_echo 的教训一致。走平台接缝：
+        # CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP，不脱离控制台也能在 ECHO 死后继续跑。
+        flags = echo_platform.detach_console_kwargs()
+        args = echo_platform.console_shell_argv(script) + ["-Quiet"]
+        if keep_backend:
+            args.append("-KeepBackend")
+        subprocess.Popen(
+            args, cwd=BASE_DIR,
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            close_fds=True, **flags)
+        print("[service] 已安排完整停止（先停 watchdog/supervisor，再停 ECHO）")
+        return True
+    except Exception as e:                                  # noqa: BLE001 —— 停止路径的最后一步
+        print(f"[service] 安排完整停止失败（继续直接退出）: {e}")
+        return False
+
+
+def quit_sidebar():
     """请边条退出（ECHO **正常停止**时调用；返回通知到没通知到）。
 
     实现在 `manager.echo_stop_self()` 里：那是"真的停 ECHO"的唯一出口

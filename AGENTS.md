@@ -56,6 +56,17 @@
   * 注意：官方桌面端**正在运行**时 NSIS 安装器会拒绝覆盖（实测 exit 2）；脚本此时继续用现有
     CLI 并提示先退出。离线安装不下载，只认已装官方桌面端（否则回退 npm）。
   * 用的仍是 ECHO 自己的 `harnessHome`，**不碰**官方桌面端的 `~/.dsh`。
+- **升级后的失效配置与关闭语义（2026-10-31 真机）**：
+  * 旧库里的 `wake*` 已不是 `DEFAULTS` 项；全部登记进 `REMOVED_SETTINGS`，`seed_defaults()`
+    在启动时清理（`wakeHotkey` 是说话热键，**保留**）。`Settings.all()` 另加兜底：
+    任何不在 `DEFAULTS` 的未知库行一律不返回，防止以后再删键忘登记时掉进「未归类」。
+  * Windows 安装/升级会在桌面生成 **`启动 ECHO.cmd` / `停止 ECHO.cmd`**（`install-desktop-shortcut.ps1`；
+    升级只补这两个，不覆盖用户的快捷方式/开机自启）。
+  * 关闭 ECHO（面板/边条 ⏻ / `POST /api/control/echo/stop`）现在由 `manager.echo_stop_self()`
+    脱离启动 `scripts/stop.ps1`：**先停 per-install watchdog 和 switch supervisor，再停 ECHO/边条/后端**，
+    否则 watchdog 几秒后又拉起（用户实测）。`restart-echo.ps1` 传 `-KeepSupervisor` 保留守护；
+    升级路径传 `keepBackend=true` 保留本机后端。判据：`tests/test_install_desktop_stop.py`、
+    `tests/test_sidebar_lifecycle.py`、`tests/test_removed_settings.py`。
 - **别再复活**：本地 STT 引擎/模型、唤醒词/KWS、`stt-cmd` 启动预热、「后端失败回落本机」、
   `providerAsr` 优先级（指令路径已移除；`app/providers/local.py` 与 `app/audio/stt.py` 是留下的
   历史代码，默认档不装依赖、运行时不使用）。`sttModel`/`device`/`dailyReviewSttBackend` 现在

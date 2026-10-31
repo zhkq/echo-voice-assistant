@@ -43,10 +43,15 @@ class RemovedSettingsTests(unittest.TestCase):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def test_they_are_listed_as_removed(self):
-        """名单本身就是契约：这四条是随 2026-10-22 的 LLM 收敛一起下线的。"""
+        """名单本身就是契约：providerLlm* 随 LLM 收敛下线，wake* 随语音唤醒下线。"""
         self.assertEqual(
             set(REMOVED_SETTINGS),
-            {"providerLlm", "providerLlmBaseUrl", "providerLlmApiKey", "providerLlmModel"})
+            {
+                "providerLlm", "providerLlmBaseUrl", "providerLlmApiKey", "providerLlmModel",
+                "wakeAliases", "wakeConfirmN", "wakeConfirmX", "wakeCooldownSec",
+                "wakeEnabled", "wakeEngine", "wakeKeywords", "wakePaused",
+                "wakeSilenceFloor", "wakeThreshold",
+            })
 
     def test_startup_deletes_the_rows(self):
         settings.seed_defaults()
@@ -58,6 +63,13 @@ class RemovedSettingsTests(unittest.TestCase):
         keys = {r["key"] for r in settings.all()}
         self.assertFalse(keys & set(REMOVED_SETTINGS),
                          "all() 还在返回已下线项：%s" % sorted(keys & set(REMOVED_SETTINGS)))
+
+    def test_unknown_key_is_never_served_to_the_panel(self):
+        """兜底：未来再删键、甚至忘了登记 REMOVED_SETTINGS，也不能掉进「未归类」。"""
+        db.set_setting("someRetiredKeyFromTheFuture", "x", grp="", label="旧项", description="")
+        settings._drop_cache()
+        keys = {r["key"] for r in settings.all()}
+        self.assertNotIn("someRetiredKeyFromTheFuture", keys)
 
     def test_a_normal_setting_is_not_touched(self):
         settings.seed_defaults()

@@ -1167,6 +1167,18 @@ REMOVED_SETTINGS = (
     "providerLlmBaseUrl",   # 三项是配置在线 LLM 的输入，随 providerLlm 一起下线
     "providerLlmApiKey",
     "providerLlmModel",
+    # 2026-10-31：语音唤醒/本地 KWS 彻底取消。旧库里的这些行不再有代码引用，
+    # 留着只会掉进面板「未归类」；启动时清掉（wakeHotkey 仍保留，它是「说话热键」）。
+    "wakeAliases",
+    "wakeConfirmN",
+    "wakeConfirmX",
+    "wakeCooldownSec",
+    "wakeEnabled",
+    "wakeEngine",
+    "wakeKeywords",
+    "wakePaused",
+    "wakeSilenceFloor",
+    "wakeThreshold",
 )
 
 
@@ -1387,7 +1399,13 @@ class Settings:
         rows = db.all_settings()
         out = []
         for r in rows:
-            meta = DEFAULTS.get(r["key"], {})
+            meta = DEFAULTS.get(r["key"])
+            # 兜底（2026-10-31）：库里的键若已经不在 DEFAULTS（旧版本删除、或未来
+            # 某次下线忘了登记 REMOVED_SETTINGS），**绝不**原样返回给面板 ——
+            # 面板的「未归类」兜底会把它当可编辑设置显示出来。启动清理会删掉
+            # REMOVED_SETTINGS 里的行；这里再挡一层，保证任何未知键都不会冒出来。
+            if not meta:
+                continue
             if meta.get("deprecated"):
                 continue
             if meta.get("hidden") and not include_hidden:

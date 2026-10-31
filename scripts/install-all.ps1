@@ -1267,7 +1267,8 @@ function Stop-EchoForUpgrade {
         }
         try {
             $r = Invoke-RestMethod -Uri ("http://127.0.0.1:{0}/api/control/echo/stop" -f $port) `
-                                   -Method Post -TimeoutSec 10
+                                   -Method Post -ContentType 'application/json' `
+                                   -Body '{"keepBackend":true}' -TimeoutSec 10
             if (-not $r.ok) {
                 # 这条路径自己也会拦"在录音/有命令"；把服务端原话带出来，别自己编原因。
                 Err ("ECHO 拒绝停止：{0}" -f $r.message)
@@ -1499,6 +1500,21 @@ if ($Offline -and -not $script:IsUpgrade) {
 }
 
 Install-TreeAndShortcuts
+
+# 2026-10-31：无论全新安装还是升级，都在桌面补“启动 ECHO.cmd / 停止 ECHO.cmd”。
+# 升级路径故意不覆盖用户的快捷方式/开机自启（那些属于他的环境），所以单独调
+# -StartStopOnly —— 只补这两个显式脚本。`-NoShortcuts` 仍然完全跳过。
+if (-not $NoShortcuts) {
+    $lnkHelper = Join-Path $script:CoreDir 'scripts\install-desktop-shortcut.ps1'
+    if (Test-Path -LiteralPath $lnkHelper) {
+        try {
+            Info '补桌面启动/停止脚本（启动 ECHO.cmd / 停止 ECHO.cmd）'
+            $null = & powershell -NoProfile -ExecutionPolicy Bypass -File $lnkHelper -StartStopOnly 2>&1
+        } catch {
+            Warn ("桌面启动/停止脚本创建失败（不影响安装）：{0}" -f $_.Exception.Message)
+        }
+    }
+}
 
 # **先起我们自己的实例、把端口钉死**，再让组件脚本干活 —— 否则它会连到别人的 ECHO
 # （端口推断顺序见 Start-EchoOwnService 的说明）。

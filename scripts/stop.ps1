@@ -22,6 +22,10 @@ param(
     # Restart path only: a restart starts ECHO again and the rail is meant to survive it
     # (the rail page retries while ECHO boots), so restart-echo.ps1 passes this switch.
     [switch]$KeepSidebar,
+    # Restart/upgrade path only: keep the watchdog/supervisor that would bring ECHO
+    # back. A USER stop must NOT pass this (2026-10-31: close button left the
+    # supervisor alive, so ECHO was restarted right after "shutdown").
+    [switch]$KeepSupervisor,
     # Upgrade path: replace the program code only. The local capability backend is NOT
     # part of the code tree and its pairing/settings must survive untouched, so leave it
     # running (user 2026-10-23: "backend ... configuration must not be touched").
@@ -65,6 +69,85 @@ function Test-EchoPid([int]$ProcessId) {
 }
 
 $stopped = @()
+
+# ---- 0) watchdogs / switch supervisor (MUST die before ECHO) ----
+# A user "close" used to kill only ECHO. The watchdog then saw the active instance
+# down and started it again a few seconds later - the reported "closing it just
+# reopens" behaviour (2026-10-31). Kill the loops FIRST, while ECHO is still up, so
+# there is no window in which a loop can restart it.
+#
+# Two kinds exist:
+#   * per-install watchdog: <code root>\scripts\startup.ps1
+#   * global switch supervisor: <USERPROFILE>\.echo-switch\echo-supervisor.ps1
+# The switch supervisor is shared by both trees: stop it only when the registry says
+# THIS tree is the current one (otherwise stopping an inactive tree would kill the
+# watchdog keeping the other tree alive).
+function Get-CompareBase([string]$p) {
+    $x = ([string]$p).Trim().TrimEnd('\')
+    if (-not $x) { return '' }
+    if ((Split-Path $x -Leaf) -ieq 'echo-core') { $x = Split-Path $x -Parent }
+    return $x.ToLowerInvariant()
+}
+
+function Stop-EchoSupervisors {
+    $hit = @()
+    try {
+        $procs = Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction Stop
+    } catch {
+        Write-Step "WARNING: could not look for supervisors ($($_.Exception.Message))"
+        return $hit
+    }
+    $rootLower = $root.ToLowerInvariant()
+    foreach ($p in $procs) {
+        $cl = [string]$p.CommandLine
+        if (-not $cl) { continue }
+        $clLower = $cl.ToLowerInvariant()
+        if ($clLower.Contains($rootLower + '\scripts\startup.ps1')) {
+            Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
+            $hit += [int]$p.ProcessId
+            Write-Step "stopped per-install watchdog (pid $($p.ProcessId))"
+        }
+    }
+
+    # Global switch supervisor: only if this tree is the registry's current one.
+    $stopSwitch = $true
+    $cfgPath = Join-Path $env:USERPROFILE '.echo-instances.json'
+    if (Test-Path -LiteralPath $cfgPath) {
+        try {
+            $cfg = Get-Content -LiteralPath $cfgPath -Raw -Encoding UTF8 | ConvertFrom-Json
+            $cur = [string]$cfg.current
+            $curRoot = ''
+            if ($cur -and $cfg.instances -and $cfg.instances.PSObject.Properties[$cur]) {
+                $curRoot = [string]$cfg.instances.PSObject.Properties[$cur].Value.root
+            }
+            if ($curRoot) {
+                $stopSwitch = ((Get-CompareBase $curRoot) -eq (Get-CompareBase $base))
+            }
+        } catch {
+            $stopSwitch = $true
+        }
+    }
+    if ($stopSwitch) {
+        foreach ($p in $procs) {
+            $cl = ([string]$p.CommandLine).ToLowerInvariant()
+            if ($cl.Contains('\.echo-switch\echo-supervisor.ps1')) {
+                Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
+                $hit += [int]$p.ProcessId
+                Write-Step "stopped switch supervisor (pid $($p.ProcessId))"
+            }
+        }
+    } else {
+        Write-Step "keeping the switch supervisor (this tree is not the current instance)"
+    }
+    return $hit
+}
+
+if (-not $KeepSupervisor) {
+    $stopped += @(Stop-EchoSupervisors)
+} else {
+    Write-Step 'keeping supervisors (-KeepSupervisor)'
+}
+
 
 # ---- 1) pid file ----
 $pidFile = Join-Path $base 'data\echo.pid'

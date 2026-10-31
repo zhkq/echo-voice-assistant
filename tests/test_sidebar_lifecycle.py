@@ -317,11 +317,13 @@ class StopPathNotifiesSidebarTests(unittest.TestCase):
         self.writes = []
         self.exited = []
         self.scheduled = []
+        self.full_stops = []
 
     def _run_stop(self, writer=None):
-        """调**真的** `manager.echo_stop_self()`，只把三个副作用换成替身。
+        """调**真的** `manager.echo_stop_self()`，只把副作用换成替身。
 
-        换掉的是 `runtime._sidebar_pipe_write`（绝不碰真管道）、
+        换掉的是 `runtime.schedule_full_stop`（绝不在测试里起真 stop.ps1）、
+        `runtime._sidebar_pipe_write`（绝不碰真管道）、
         `runtime.schedule_sidebar_force_close`（绝不在测试里起 PowerShell）
         和 `os._exit`（绝不真把测试进程退掉）—— 别的都是生产代码。
         """
@@ -333,12 +335,18 @@ class StopPathNotifiesSidebarTests(unittest.TestCase):
             self.scheduled.append(True)
             return True
 
+        def _record_full(*_a, **kwargs):
+            self.full_stops.append(kwargs.get("keep_backend"))
+            return True
+
         real_exit = os._exit
 
         def _fake_exit(code):
             self.exited.append(code)
 
         with patch.object(runtime_mod, "_sidebar_pipe_write", side_effect=writer or _record), \
+                patch.object(runtime_mod, "schedule_full_stop",
+                             side_effect=_record_full), \
                 patch.object(runtime_mod, "schedule_sidebar_force_close",
                              side_effect=_record_schedule), \
                 patch.object(os, "_exit", side_effect=_fake_exit):
@@ -349,6 +357,7 @@ class StopPathNotifiesSidebarTests(unittest.TestCase):
         self._run_stop()
         self.assertEqual(self.writes, ["quit"], "正常停止必须发且只发一条 quit")
         self.assertEqual(self.exited, [0], "发了通知之后仍要真的退出 ECHO")
+        self.assertEqual(self.full_stops, [False], "必须先安排完整停止（watchdog/supervisor）")
         self.assertEqual(self.scheduled, [True], "quit 之后必须安排兜底清理（旧边条不认 quit 时用）")
 
     def test_the_fallback_script_only_matches_this_trees_sidebar(self):
@@ -377,11 +386,13 @@ class StopPathNotifiesSidebarTests(unittest.TestCase):
             order.append("exit")
 
         with patch.object(runtime_mod, "_sidebar_pipe_write", side_effect=_writer), \
+                patch.object(runtime_mod, "schedule_full_stop",
+                             side_effect=lambda *a, **k: order.append("full_stop")), \
                 patch.object(runtime_mod, "schedule_sidebar_force_close",
                              side_effect=lambda *a, **k: order.append("schedule")), \
                 patch.object(os, "_exit", side_effect=_fake_exit):
             manager_mod.echo_stop_self()
-        self.assertEqual(order, ["quit", "schedule", "exit"])
+        self.assertEqual(order, ["full_stop", "quit", "schedule", "exit"])
         self.assertIs(os._exit, real_exit, "os._exit 必须还原（否则后面的真调用会被替身吃掉）")
 
     @unittest.skipUnless(sys.platform == "win32", "PowerShell 兜底只在 Windows 上有")
@@ -420,7 +431,9 @@ class StopPathNotifiesSidebarTests(unittest.TestCase):
         def _explode(*_a, **_k):
             raise RuntimeError("boom")
 
-        with patch.object(runtime_mod, "quit_sidebar", side_effect=_explode), \
+        with patch.object(runtime_mod, "schedule_full_stop",
+                          side_effect=lambda *a, **k: True), \
+                patch.object(runtime_mod, "quit_sidebar", side_effect=_explode), \
                 patch.object(os, "_exit", side_effect=lambda code: self.exited.append(code)):
             manager_mod.echo_stop_self()
         self.assertEqual(self.exited, [0])
@@ -434,10 +447,13 @@ class StopPathNotifiesSidebarTests(unittest.TestCase):
         self.assertIn("threading.Timer", endpoint)
 
         manager = _read(MANAGER_PY)
-        body = manager[manager.index("def echo_stop_self():"):]
+        body = manager[manager.index("def echo_stop_self("):]
         body = body[:body.index("\ndef ", 1)]
         self.assertIn("quit_sidebar", body, "停服务的唯一出口没有通知边条")
-        # 用 rindex：docstring 里也会**提到**这两个名字，比的是真正的调用位置。
+        self.assertIn("schedule_full_stop", body, "停服务没有安排 watchdog/supervisor 的完整停止")
+        # 用 rindex：docstring 里也会**提到**这些名字，比的是真正的调用位置。
+        self.assertLess(body.rindex("schedule_full_stop"), body.rindex("os._exit"),
+                        "完整停止必须在 os._exit 之前，否则根本来不及")
         self.assertLess(body.rindex("quit_sidebar"), body.rindex("os._exit"),
                         "通知边条必须在 os._exit 之前，否则根本发不出去")
         self.assertIn("try:", body, "通知边条那一步必须被 try 包住（失败不许挡停服务）")
