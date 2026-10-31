@@ -1266,6 +1266,47 @@ function Stop-EchoForUpgrade {
             Warn ("读不到 /api/status（{0}）—— 继续尝试正常停止" -f $_.Exception.Message)
         }
         try {
+            # 2026-10-31：升级是从**旧代码**启动的。旧版关闭 API 只退 ECHO，不会停
+            # watchdog/switch supervisor；若不先收掉它们，升级还没覆盖代码就会被拉回来。
+            # 这里直接按本棵树的路径收 watchdog，并按 registry 的 current 决定是否收
+            # 全局 switch supervisor（另一棵树是 current 时不动它）。
+            $rootLower = $script:CoreDir.TrimEnd('\').ToLower()
+            $stopSwitch = $true
+            $cfgPath = Join-Path $env:USERPROFILE '.echo-instances.json'
+            if (Test-Path -LiteralPath $cfgPath) {
+                try {
+                    $cfg = Get-Content -LiteralPath $cfgPath -Raw -Encoding UTF8 | ConvertFrom-Json
+                    $cur = [string]$cfg.current
+                    $curRoot = ''
+                    if ($cur -and $cfg.instances -and $cfg.instances.PSObject.Properties[$cur]) {
+                        $curRoot = [string]$cfg.instances.PSObject.Properties[$cur].Value.root
+                    }
+                    if ($curRoot) {
+                        $curBase = $curRoot.TrimEnd('\')
+                        if ((Split-Path $curBase -Leaf) -ieq 'echo-core') { $curBase = Split-Path $curBase -Parent }
+                        $targetBase = $script:TargetRoot.TrimEnd('\')
+                        if ((Split-Path $targetBase -Leaf) -ieq 'echo-core') { $targetBase = Split-Path $targetBase -Parent }
+                        $stopSwitch = ($curBase.ToLowerInvariant() -eq $targetBase.ToLowerInvariant())
+                    }
+                } catch { $stopSwitch = $true }
+            }
+            $supProcs = @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue)
+            foreach ($sp in $supProcs) {
+                $cl = [string]$sp.CommandLine
+                if (-not $cl) { continue }
+                $clLower = $cl.ToLowerInvariant()
+                if ($clLower.Contains($rootLower + '\scripts\startup.ps1')) {
+                    Stop-Process -Id $sp.ProcessId -Force -ErrorAction SilentlyContinue
+                    Info ("已停本棵树的 watchdog（pid {0}）" -f $sp.ProcessId)
+                } elseif ($stopSwitch -and $clLower.Contains('\.echo-switch\echo-supervisor.ps1')) {
+                    Stop-Process -Id $sp.ProcessId -Force -ErrorAction SilentlyContinue
+                    Info ("已停 switch supervisor（pid {0}）" -f $sp.ProcessId)
+                }
+            }
+        } catch {
+            Warn ("升级前停 watchdog/supervisor 失败（继续尝试正常停止 ECHO）：{0}" -f $_.Exception.Message)
+        }
+        try {
             $r = Invoke-RestMethod -Uri ("http://127.0.0.1:{0}/api/control/echo/stop" -f $port) `
                                    -Method Post -ContentType 'application/json' `
                                    -Body '{"keepBackend":true}' -TimeoutSec 10
