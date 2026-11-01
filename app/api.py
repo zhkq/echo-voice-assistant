@@ -3656,7 +3656,15 @@ def _pair_ticket(request: Request) -> dict:
     qr_png = ""
     try:
         import qrcode
-        qr = qrcode.QRCode(box_size=6, border=2)
+        # 这块屏幕是 ECHO 自己的清洁显示器，不需要 M/Q 级纠错；
+        # L 级把 ticket（~674 字符）从 101×101 降到 89×89 模块，
+        # 再配合 box_size=10 + 面板 520px，扫码颗粒明显更粗。
+        qr = qrcode.QRCode(
+            version=None,
+            error_correction=qrcode.constants.ERROR_CORRECT_L,
+            box_size=10,
+            border=4,
+        )
         qr.add_data(ticket["ticket"])
         qr.make(fit=True)
         buf = io.BytesIO()
