@@ -108,9 +108,15 @@ class PairViewModel(app: Application) : BaseViewModel(app) {
                 val devicePub = E2E.publicToStorage(deviceKey.public)
                 val deviceId = body.get("deviceId")?.asString ?: E2E.deviceId(devicePub)
                 val tts = body.getAsJsonObject("tts")
+                // 手机只能经 relay 时，ticket 里的 relay 才是可达入口；服务端返回的
+                // baseUrl 可能是局域网地址（claim 从别的路径进来时尤其如此），
+                // 不能拿它覆盖 ticket.relay，否则配对成功后状态请求必然连不上。
+                val storedBase = ticket.relay.ifBlank {
+                    body.get("baseUrl")?.asString ?: base
+                }
                 PairStore.saveE2E(
                     getApplication(),
-                    (body.get("baseUrl")?.asString ?: base).trim().trimEnd('/'),
+                    storedBase.trim().trimEnd('/'),
                     token,
                     body.get("name")?.asString ?: name.trim().ifBlank { "mobile" },
                     echoPublicKey = echoPub,

@@ -1603,7 +1603,11 @@ class MainViewModel(app: Application) : BaseViewModel(app) {
                 _connected.value = false
                 _statusError.value = "能连上，但令牌无效或缺失（HTTP 401）：请重新配对一次"
             } else {
-                noteStatusFailure("后端返回 HTTP ${resp.code()}")
+                val detail = parseError(resp)
+                noteStatusFailure(
+                    "后端返回 HTTP ${resp.code()}" +
+                        if (detail.isNotBlank() && detail != "HTTP ${resp.code()}") "：$detail" else ""
+                )
             }
         } catch (e: Exception) {
             noteStatusFailure("读取状态出错：${e.message}")

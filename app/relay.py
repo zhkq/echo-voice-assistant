@@ -328,6 +328,17 @@ def _local_base() -> str:
     return "http://127.0.0.1:%d" % port
 
 
+def _b64_any(text) -> bytes:
+    """解 Base64：同时接受标准/URL-safe、带/不带 padding。
+
+    手机新版本内层 body 用标准 Base64；旧版本/某些路径可能是 URL-safe 无 padding。
+    relay 不能因为一个 `-`/`_` 或长度不是 4 的倍数就把整条 E2E 请求判死。
+    """
+    value = str(text or "")
+    value += "=" * (-len(value) % 4)
+    return base64.b64decode(value, altchars=b"-_", validate=False)
+
+
 def _execute_e2e(call: dict) -> dict:
     """方案 B：解密手机 E2E 信封 → 本机 API → 加密响应。
 
@@ -338,7 +349,7 @@ def _execute_e2e(call: dict) -> dict:
     """
     out = {"id": str(call.get("id") or ""), "status": 502, "headers": {}, "body": ""}
     try:
-        raw = base64.b64decode(str(call.get("body") or ""))
+        raw = _b64_any(call.get("body"))
         envelope = json.loads(raw.decode("utf-8"))
         inner, device_id = e2e.open_envelope(envelope)
         mode = str(inner.get("method") or "GET").upper()
@@ -347,7 +358,7 @@ def _execute_e2e(call: dict) -> dict:
             raise ValueError("E2E 内层路径不允许")
         query = str(inner.get("query") or "")
         headers = inner.get("headers") or {}
-        body = base64.b64decode(str(inner.get("body") or "")) if inner.get("body") else b""
+        body = _b64_any(inner.get("body")) if inner.get("body") else b""
         url = _local_base() + "/" + path
         if query:
             url += "?" + query

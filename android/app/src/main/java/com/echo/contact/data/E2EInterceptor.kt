@@ -21,8 +21,11 @@ import java.util.Base64
  */
 class E2EInterceptor(private val context: () -> Context?) : Interceptor {
 
-    private val b64 = Base64.getUrlEncoder().withoutPadding()
-    private val b64d = Base64.getUrlDecoder()
+    // 外层 envelope 的 iv/ciphertext 由 E2E.sealEnvelope 生成，是 URL-safe；
+    // 内层 `body` 要交给 ECHO relay 的 Python base64.b64decode，必须用
+    // **标准 Base64（带 padding）**，否则语音命令这种非空 body 会 Incorrect padding。
+    private val b64Inner = Base64.getEncoder()
+    private val b64InnerDec = Base64.getDecoder()
 
     override fun intercept(chain: Interceptor.Chain): Response {
         val ctx = context() ?: return chain.proceed(chain.request())
@@ -61,7 +64,7 @@ class E2EInterceptor(private val context: () -> Context?) : Interceptor {
             addProperty("path", innerPath)
             addProperty("query", req.url.encodedQuery.orEmpty())
             add("headers", headers)
-            addProperty("body", if (bodyBytes.isEmpty()) "" else b64.encodeToString(bodyBytes))
+            addProperty("body", if (bodyBytes.isEmpty()) "" else b64Inner.encodeToString(bodyBytes))
         }
         val envelope = E2E.sealEnvelope(key, inner, deviceId)
         val outerUrl = baseUrl.newBuilder().addPathSegments("api/e2e").build()
@@ -72,20 +75,41 @@ class E2EInterceptor(private val context: () -> Context?) : Interceptor {
             .removeHeader("Authorization")
             .build()
         val resp = chain.proceed(outer)
-        if (!resp.isSuccessful) return resp
+        if (!resp.isSuccessful) {
+            // 外层非 2xx（relay 400/502/404…）：把原始 body 转成可见错误，
+            // 不能直接把已被读过的响应交回 Retrofit（会变成 IOException: closed）。
+            val raw = resp.body?.bytes()
+            val text = raw?.toString(Charsets.UTF_8).orEmpty().take(800)
+            android.util.Log.e("EchoE2E", "outer HTTP ${resp.code}: $text")
+            return resp.newBuilder()
+                .code(resp.code)
+                .body(errorBody("E2E 外层 HTTP ${resp.code}：$text"))
+                .build()
+        }
         return try {
             val raw = resp.body?.bytes() ?: ByteArray(0)
             val env = JsonParser.parseString(String(raw, StandardCharsets.UTF_8)).asJsonObject
             val result = E2E.openEnvelope(key, env)
             val status = result.get("status")?.asInt ?: 502
             val ctype = result.get("contentType")?.asString.orEmpty()
-            val payload = b64d.decode(result.get("body")?.asString.orEmpty())
+            val payload = b64InnerDec.decode(result.get("body")?.asString.orEmpty())
             resp.newBuilder()
                 .code(status)
                 .body(payload.toResponseBody(ctype.toMediaTypeOrNull()))
                 .build()
         } catch (e: Exception) {
-            resp
+            // 这里最常见的是 AEADBadTagException（会话键不一致）或外层不是 E2E 信封。
+            // 返回人话 + 502，让 UI 能显示真正原因，而不是 "closed"。
+            val msg = "E2E 解密失败：${e.javaClass.simpleName}: ${e.message}"
+            android.util.Log.e("EchoE2E", msg, e)
+            resp.newBuilder()
+                .code(502)
+                .body(errorBody(msg))
+                .build()
         }
     }
+
+    private fun errorBody(text: String): okhttp3.ResponseBody =
+        JsonObject().apply { addProperty("detail", text) }
+            .toString().toResponseBody("application/json".toMediaTypeOrNull())
 }
