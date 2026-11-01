@@ -4546,7 +4546,20 @@ async function loadPhoneCard() {
   try {
     keys = await api("/api/keys");
   } catch (err) { /* 设备列表读不到不影响配对码 */ }
-  if (st) { _phoneState = st; _phoneError = ""; }
+  if (st) {
+    // 设置页会周期性 refresh，而 `/api/pair/phone` 只返回 pending（不含 qrPng）。
+    // 如果这里直接覆盖，刚生成、还没扫的二维码会在下一次刷新时消失。
+    // 只有 pending 仍是同一张码且未过期，才把上一份 ticket/qrPng 接回来。
+    const old = _phoneState || {};
+    const oldPending = old.pending || {};
+    if (old.qrPng && oldPending.code && st.pending && st.pending.code === oldPending.code
+        && (st.pending.secondsLeft || 0) > 0) {
+      st.qrPng = old.qrPng;
+      st.ticket = old.ticket || "";
+    }
+    _phoneState = st;
+    _phoneError = "";
+  }
   if (keys) _phoneKeys = keys.items || [];
   renderPhoneCard();
   _phoneTick();
