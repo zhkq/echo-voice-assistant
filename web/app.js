@@ -4470,7 +4470,7 @@ function phoneCardInner() {
   const pend = st.pending || {};
   const qr = st.qrPng ? `<div style="margin:10px 0;text-align:center">
       <img alt="ECHO 配对二维码" src="data:image/png;base64,${st.qrPng}"
-           style="width:min(220px,80%);image-rendering:pixelated;background:#fff;padding:8px;border-radius:8px">
+           style="width:min(300px,90%);image-rendering:pixelated;background:#fff;padding:8px;border-radius:8px">
       <div class="muted" style="font-size:12px">手机扫描二维码（含 ECHO 公钥；不经过后端）</div>
     </div>` : "";
   out.push(`${qr}<div class="phone-pair">

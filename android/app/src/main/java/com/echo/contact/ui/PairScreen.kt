@@ -122,8 +122,10 @@ fun PairScreen(onPaired: () -> Unit) {
                 onClick = {
                     scanLauncher.launch(
                         ScanOptions()
-                            .setPrompt("扫描 ECHO 面板上的配对二维码")
+                            .setDesiredBarcodeFormats(ScanOptions.QR_CODE)
+                            .setPrompt("把 ECHO 二维码放进取景框，保持 10~20cm")
                             .setBeepEnabled(false)
+                            .setBarcodeImageEnabled(false)
                             .setOrientationLocked(false)
                     )
                 },

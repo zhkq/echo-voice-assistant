@@ -131,32 +131,46 @@ object E2E {
 
     fun parseTicket(input: String): Ticket {
         var ticket = input.trim()
+        if (ticket.startsWith("echo://pair")) {
+            throw IllegalArgumentException("这是旧版 ECHO 配对码；请用新版面板「生成配对码」里的二维码")
+        }
+        if (ticket.startsWith("http://") || ticket.startsWith("https://")) {
+            throw IllegalArgumentException("扫到的是网址，不是 ECHO 配对二维码；请对准面板上的二维码")
+        }
         if (ticket.startsWith("echo-pair://")) {
             val query = ticket.substringAfter('?', "")
             val value = query.split('&').firstOrNull { it.startsWith("ticket=") }
                 ?.substringAfter("ticket=") ?: throw IllegalArgumentException("配对链接里没有 ticket")
             ticket = java.net.URLDecoder.decode(value, "UTF-8")
         }
-        val payload = JsonParser.parseString(String(unb64u(ticket), StandardCharsets.UTF_8)).asJsonObject
-        require(payload.get("v")?.asInt == 2) { "配对 ticket 版本不支持" }
-        val sig = payload.remove("sig")?.asString ?: throw IllegalArgumentException("ticket 没有签名")
-        val pub = publicFromRaw(unb64u(payload.get("pub").asString))
-        val check = Signature.getInstance("SHA256withECDSA")
-        check.initVerify(pub)
-        check.update(canonical(payload).toByteArray(StandardCharsets.UTF_8))
-        require(check.verify(unb64u(sig))) { "ticket 签名不对" }
-        require(payload.get("exp").asLong > System.currentTimeMillis() / 1000) { "ticket 已过期" }
-        val backend = payload.getAsJsonObject("backend")
-        return Ticket(
-            host = payload.get("host")?.asString.orEmpty(),
-            relay = payload.get("relay")?.asString.orEmpty(),
-            echoPublicKey = payload.get("pub").asString,
-            nonce = payload.get("nonce").asString,
-            code = payload.get("code").asString,
-            expiresAt = payload.get("exp").asLong,
-            backendBaseUrl = backend?.get("baseUrl")?.asString.orEmpty(),
-            backendTlsPin = backend?.get("tlsPin")?.asString.orEmpty(),
-        )
+        try {
+            val payload = JsonParser.parseString(String(unb64u(ticket), StandardCharsets.UTF_8)).asJsonObject
+            require(payload.get("v")?.asInt == 2) { "配对 ticket 版本不支持" }
+            val sig = payload.remove("sig")?.asString ?: throw IllegalArgumentException("ticket 没有签名")
+            val pub = publicFromRaw(unb64u(payload.get("pub").asString))
+            val check = Signature.getInstance("SHA256withECDSA")
+            check.initVerify(pub)
+            check.update(canonical(payload).toByteArray(StandardCharsets.UTF_8))
+            require(check.verify(unb64u(sig))) { "ticket 签名不对" }
+            require(payload.get("exp").asLong > System.currentTimeMillis() / 1000) { "ticket 已过期" }
+            val backend = payload.getAsJsonObject("backend")
+            return Ticket(
+                host = payload.get("host")?.asString.orEmpty(),
+                relay = payload.get("relay")?.asString.orEmpty(),
+                echoPublicKey = payload.get("pub").asString,
+                nonce = payload.get("nonce").asString,
+                code = payload.get("code").asString,
+                expiresAt = payload.get("exp").asLong,
+                backendBaseUrl = backend?.get("baseUrl")?.asString.orEmpty(),
+                backendTlsPin = backend?.get("tlsPin")?.asString.orEmpty(),
+            )
+        } catch (e: IllegalArgumentException) {
+            throw e
+        } catch (e: Exception) {
+            // 扫到别的二维码、或二维码只扫到一半时，不要把 Gson 的
+            // "MalformedJsonException ... line 1 column 6" 直接甩给用户。
+            throw IllegalArgumentException("二维码不是完整的 ECHO 配对 ticket，请重新生成并对准二维码重扫", e)
+        }
     }
 
     /** 与 Python `sort_keys=True, separators=(",", ":")` 对齐的 canonical JSON。 */
