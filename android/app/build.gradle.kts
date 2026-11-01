@@ -80,6 +80,9 @@ dependencies {
     // Coil for QR/user avatar (optional; light)
     implementation("io.coil-kt:coil-compose:2.6.0")
 
+    // QR 扫描（方案 B：ECHO 屏幕二维码是 ECHO 公钥的信任根）
+    implementation("com.journeyapps:zxing-android-embedded:4.3.0")
+
     debugImplementation("androidx.compose.ui:ui-tooling")
 
     // JVM 单测：钉住「后端 JSON ↔ DTO」的字段契约（不需要设备）

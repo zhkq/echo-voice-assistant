@@ -509,6 +509,31 @@ class EchoServerContractTests(_Contract, unittest.TestCase):
                 self.assertEqual(ctx.exception.retryable, retryable)
                 self.assertEqual(ctx.exception.retry_after, 5)
 
+    def test_tts_binary_response_returns_mime_and_bytes(self):
+        """TTS 的 200 是音频字节，不是 JSON —— 客户端必须走 raw response。"""
+        c = self.make_client()
+        headers = {"Content-Type": "audio/mpeg"}
+        with patch.object(type(c), "_request",
+                          return_value=(200, b"ID3\x04binary", headers)) as req:
+            mime, data = c.tts("你好", voice="zh-CN-XiaoxiaoNeural", rate="+0%")
+        self.assertEqual("audio/mpeg", mime)
+        self.assertEqual(b"ID3\x04binary", data)
+        args, kwargs = req.call_args
+        self.assertEqual("/v1/tts", args[1])
+        self.assertTrue(kwargs.get("raw_response"))
+        self.assertEqual("tts", kwargs.get("slot"))
+
+    def test_tts_rate_limit_is_reported_with_retry_after(self):
+        c = self.make_client()
+        body = {"code": "rate_limited", "message": "too fast", "retryAfter": 1}
+        with patch.object(type(c), "_request",
+                          return_value=(429, json.dumps(body).encode(), {})):
+            with self.assertRaises(CapabilityError) as ctx:
+                c.tts("你好")
+        self.assertEqual(429, ctx.exception.status)
+        self.assertEqual("rate_limited", ctx.exception.code)
+        self.assertEqual(1, ctx.exception.retry_after)
+
     def test_unreachable_server_is_offline_not_error(self):
         """连不上 → `offline`（可重试/可跳过），**不是**含糊的 `error`。"""
         from app.capabilities.echo_server import EchoServerClient

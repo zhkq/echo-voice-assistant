@@ -28,6 +28,13 @@ object ApiClient {
 
     @Volatile private var tokenProvider: (() -> String?) = { null }
 
+    /** 方案 B 的 E2E 拦截器需要读加密存储里的设备密钥。 */
+    @Volatile private var appContext: android.content.Context? = null
+
+    fun attachContext(context: android.content.Context) {
+        appContext = context.applicationContext
+    }
+
     private val cache = ConcurrentHashMap<String, EchoApi>()
 
     /** 默认读超时（秒）。绝大多数接口秒回，用它就够。 */
@@ -167,6 +174,8 @@ object ApiClient {
                 }
                 chain.proceed(req)
             }
+            // 认证头加完之后再封 E2E；配对请求由拦截器自己跳过。
+            .addInterceptor(E2EInterceptor { appContext })
             .addInterceptor(logging)
             .build()
 

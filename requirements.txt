@@ -16,4 +16,6 @@ soxr>=0.3
 sounddevice>=0.5
 soundfile>=0.12
 numpy>=1.26
-edge-tts>=7.0
+edge-tts>=7.3.1
+cryptography>=42
+qrcode[pil]>=7.4

@@ -248,6 +248,13 @@ def speak(text, engine="auto", timeout=60):
     text = speech_text.normalize(text)
     # 提示音与朗读串起来：停录提示音/发送提示音还没播完时，先等它（否则两个音叠着响）
     wait_beep_done()
+    if engine == "echo-server":
+        got = _backend_tts_bytes(text, timeout)
+        if got and _play_backend_bytes(got[0], got[1]):
+            return True
+        # 后端 TTS 失败：语音链路不能没声音。明确走本机离线，而不是再打一次本地 edge
+        # （那边也会 403；用户要的是“还能听见”）。
+        return _speak_offline(text)
     offline = _offline_engine_ids()
     if engine in offline or (engine == "auto" and _edge_broken):
         return _speak_offline(text)
@@ -300,6 +307,45 @@ def _edge_bytes(text, timeout=30):
             pass
 
 
+def _backend_tts_bytes(text, timeout=30):
+    """走能力后端的 `/v1/tts`（edge-tts 只在后端一份）。
+
+    返回 `(mime, bytes)`；没配后端、privacy 不允许、网络/上游失败都返回 None，
+    由调用方按自己的回退策略处理。**不抛**——朗读收尾不该把主流程带崩。
+    """
+    try:
+        from app.capabilities.echo_server import client_from_settings, privacy_blocked
+        client = client_from_settings()
+        if client is None:
+            return None
+        if privacy_blocked(client):
+            return None
+        return client.tts(text, timeout=min(float(timeout or 30), 30.0))
+    except Exception as e:                                  # noqa: BLE001 —— 朗读失败不致命
+        try:
+            print("[tts] 能力后端合成失败：%s" % e)
+        except Exception:
+            pass
+        return None
+
+
+def _play_backend_bytes(mime, data):
+    """把后端返回的音频字节落临时文件并播放。返回 False = 没播成。"""
+    suffix = ".mp3" if "mpeg" in str(mime or "").lower() else ".wav"
+    fd, path = tempfile.mkstemp(prefix="echo-tts-backend-", suffix=suffix)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+        return bool(_play_media_file(path))
+    except Exception:
+        return False
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
 def synthesize(text, engine="auto", timeout=60):
     """**只合成、不播放** → ``(mime, bytes)``。
 
@@ -319,6 +365,11 @@ def synthesize(text, engine="auto", timeout=60):
     # 同 `speak`：手机/手表拿走的音频也要念成"…到…"（手机自己会先归一化一次，
     # 这里是幂等的第二道 —— 谁先谁后都不该出现"8 到 到 19"）。
     text = speech_text.normalize(text)
+    if engine == "echo-server":
+        got = _backend_tts_bytes(text, timeout)
+        if got:
+            return got
+        raise TtsError("能力后端 TTS 不可用：检查后端地址/配对/tts scope")
     offline = _offline_engine_ids()
     use_offline = (engine in offline
                    or (engine == "auto" and _edge_broken)

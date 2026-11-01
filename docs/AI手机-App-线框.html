@@ -1,0 +1,687 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ECHO 手机 App · 5 页线框（v1.0）</title>
+<style>
+  :root{
+    --ink:#1f2329; --muted:#6b7280; --faint:#9ca3af;
+    --line:#e5e7eb; --bg:#eef1f6; --card:#ffffff; --soft:#f6f8fb;
+    --primary:#2563eb; --primary-soft:#e8f0ff;
+    --green:#16a34a; --green-soft:#e8f7ee;
+    --red:#ef4444; --red-soft:#fdecec;
+    --purple:#7c3aed; --purple-soft:#f1eafe;
+    --amber:#d97706; --amber-soft:#fdf3e3;
+    --blue:#0ea5e9; --blue-soft:#e6f6fe;
+    --radius:16px;
+    --shadow:0 14px 40px rgba(17,24,39,.10);
+    --font:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0}
+  body{
+    font-family:var(--font); color:var(--ink);
+    background:
+      radial-gradient(1200px 600px at 10% -10%, #dfe9ff 0%, transparent 55%),
+      radial-gradient(900px 500px at 100% 0%, #f3e8ff 0%, transparent 50%),
+      var(--bg);
+    padding:34px 22px 60px;
+  }
+  header{max-width:1320px;margin:0 auto 30px}
+  header .kicker{font-size:12px;letter-spacing:.14em;color:var(--primary);font-weight:700;text-transform:uppercase}
+  header h1{font-size:28px;line-height:1.2;margin:8px 0 8px;letter-spacing:-.01em}
+  header p{margin:0;color:var(--muted);font-size:13px;line-height:1.7;max-width:900px}
+  header .meta{display:flex;gap:8px;flex-wrap:wrap;margin-top:14px}
+  .pill{font-size:11px;padding:5px 10px;border-radius:999px;background:#fff;border:1px solid var(--line);color:var(--muted)}
+  .pill b{color:var(--ink)}
+  .grid{
+    max-width:1320px;margin:0 auto;
+    display:grid;grid-template-columns:repeat(auto-fit, 380px);
+    gap:30px 26px;justify-content:center;align-items:start;
+  }
+  .frame{width:380px}
+  .phone{
+    width:360px;height:740px;margin:0 auto;background:var(--soft);
+    border:7px solid #1b1f24;border-radius:36px;overflow:hidden;position:relative;
+    box-shadow:var(--shadow);display:flex;flex-direction:column;
+  }
+  .phone:before{
+    content:"";position:absolute;top:7px;left:50%;transform:translateX(-50%);
+    width:92px;height:18px;background:#1b1f24;border-radius:0 0 14px 14px;z-index:9;
+  }
+  .sysbar{
+    height:30px;flex:0 0 30px;display:flex;align-items:flex-end;justify-content:space-between;
+    padding:0 16px 4px;font-size:10px;color:var(--muted);font-weight:600;letter-spacing:.02em;
+  }
+  .sysbar .right{display:flex;gap:4px;align-items:center}
+  .sysbar .bat{width:18px;height:8px;border:1px solid var(--faint);border-radius:2px;position:relative}
+  .sysbar .bat:after{content:"";position:absolute;inset:1px;right:5px;background:var(--green);border-radius:1px}
+  .appbar{
+    height:40px;flex:0 0 40px;display:flex;align-items:center;justify-content:space-between;
+    padding:0 14px;gap:8px;
+  }
+  .conn{display:flex;align-items:center;gap:6px;font-size:11px;color:var(--muted);min-width:0}
+  .conn b{color:var(--ink);font-weight:650;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .dot{width:7px;height:7px;border-radius:50%;background:var(--faint);flex:0 0 auto}
+  .dot.ok{background:var(--green)} .dot.warn{background:var(--amber)} .dot.bad{background:var(--red)}
+  .dot.rec{background:var(--red)} .dot.rev{background:var(--purple)} .dot.info{background:var(--blue)}
+  .pulse{box-shadow:0 0 0 0 rgba(239,68,68,.45);animation:pulse 1.4s infinite}
+  @keyframes pulse{70%{box-shadow:0 0 0 7px rgba(239,68,68,0)}100%{box-shadow:0 0 0 0 rgba(239,68,68,0)}}
+  .activity{display:flex;align-items:center;gap:5px;font-size:10px;color:var(--red);font-weight:650;white-space:nowrap}
+  .activity.rev{color:var(--purple)} .activity.info{color:var(--blue)}
+  .body{flex:1;min-height:0;padding:2px 12px 6px;display:flex;flex-direction:column;gap:8px;overflow:hidden}
+  .card{
+    background:var(--card);border:1px solid var(--line);border-radius:14px;padding:10px 11px;
+    box-shadow:0 1px 0 rgba(17,24,39,.02);
+  }
+  .card.flat{box-shadow:none}
+  .card-h{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:2px}
+  .card-title{font-size:12px;font-weight:700;letter-spacing:.01em}
+  .card-sub{font-size:10px;color:var(--muted);line-height:1.45;margin-top:2px}
+  .tiny{font-size:9.5px;color:var(--faint)}
+  .muted{color:var(--muted)}
+  .btn{
+    display:inline-flex;align-items:center;justify-content:center;gap:5px;
+    height:30px;padding:0 11px;border-radius:9px;border:1px solid transparent;
+    font-size:11px;font-weight:650;white-space:nowrap;cursor:default;
+  }
+  .btn-primary{background:var(--primary);color:#fff}
+  .btn-ghost{background:#fff;border-color:var(--line);color:var(--ink)}
+  .btn-soft{background:var(--primary-soft);color:var(--primary);border-color:#d7e5ff}
+  .btn-danger{background:var(--red);color:#fff}
+  .btn-block{width:100%}
+  .btn-sm{height:26px;padding:0 9px;font-size:10px;border-radius:8px}
+  .input{
+    height:34px;border:1px solid var(--line);background:#fbfcfe;border-radius:9px;
+    display:flex;align-items:center;padding:0 10px;color:var(--faint);font-size:11px;
+    flex:1;min-width:0;
+  }
+  .row{display:flex;align-items:center;gap:7px}
+  .between{display:flex;align-items:center;justify-content:space-between;gap:8px}
+  .grow{flex:1;min-width:0}
+  .ellipsis{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .chips{display:flex;gap:5px;flex-wrap:nowrap;overflow:hidden}
+  .chip{font-size:9.5px;padding:4px 8px;border-radius:999px;background:#fff;border:1px solid var(--line);color:var(--muted);white-space:nowrap}
+  .chip.on{background:var(--ink);border-color:var(--ink);color:#fff;font-weight:650}
+  .tag{font-size:9px;padding:2px 6px;border-radius:999px;white-space:nowrap;font-weight:650}
+  .tag.ok{background:var(--green-soft);color:var(--green)}
+  .tag.warn{background:var(--amber-soft);color:var(--amber)}
+  .tag.bad{background:var(--red-soft);color:var(--red)}
+  .tag.info{background:var(--blue-soft);color:#0369a1}
+  .tag.rev{background:var(--purple-soft);color:var(--purple)}
+  .tag.gray{background:#f1f3f5;color:var(--muted)}
+  .divider{height:1px;background:var(--line);margin:6px 0}
+  .pagehead{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:0 2px 2px}
+  .pagehead h2{font-size:16px;margin:0;letter-spacing:-.01em}
+  .pagehead .actions{display:flex;gap:6px;align-items:center}
+  .iconbtn{width:28px;height:28px;border:1px solid var(--line);background:#fff;border-radius:9px;display:flex;align-items:center;justify-content:center;color:var(--muted)}
+  .ico{width:14px;height:14px;display:block}
+  .group-label{font-size:10px;color:var(--faint);font-weight:700;letter-spacing:.06em;margin:2px 2px 0}
+  .list-item{display:flex;gap:8px;padding:7px 0;border-bottom:1px solid #f0f2f5}
+  .list-item:last-child{border-bottom:0;padding-bottom:0}
+  .li-main{flex:1;min-width:0}
+  .li-title{font-size:11px;font-weight:600;line-height:1.35;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .li-sub{font-size:9.5px;color:var(--muted);line-height:1.4;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .li-meta{font-size:9px;color:var(--faint);text-align:right;white-space:nowrap}
+  .day{font-size:9.5px;color:var(--faint);font-weight:700;margin:2px 0 -2px;letter-spacing:.04em}
+  .duo{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+  .duo .card{padding:9px 9px 10px;min-height:112px;display:flex;flex-direction:column}
+  .duo .card-title{font-size:11px}
+  .duo .card-sub{font-size:9.5px;min-height:27px}
+  .duo .btn{margin-top:auto}
+  .wave{display:flex;align-items:flex-end;gap:3px;height:26px;margin:7px 0 8px}
+  .wave i{display:block;width:4px;border-radius:2px;background:var(--red);opacity:.85}
+  .rec-card{border-color:#fecaca;background:linear-gradient(180deg,#fff 0%,#fff7f7 100%)}
+  .rec-head{color:var(--red)}
+  .rec-timer{font-size:18px;font-weight:750;letter-spacing:.02em;color:var(--ink)}
+  .small-note{font-size:9px;color:var(--faint);line-height:1.45}
+  .tabbar{
+    flex:0 0 58px;height:58px;background:#fff;border-top:1px solid var(--line);
+    display:grid;grid-template-columns:repeat(5,1fr);align-items:center;padding:0 6px 4px;
+  }
+  .tab{display:flex;flex-direction:column;align-items:center;gap:3px;color:var(--faint);font-size:9.5px;font-weight:600}
+  .tab .ico{width:18px;height:18px}
+  .tab.active{color:var(--primary)}
+  .tab.active .ico{stroke-width:2.2}
+  .tab.active:after{content:"";width:4px;height:4px;border-radius:50%;background:var(--primary);margin-top:1px}
+  .phone.compact .body{gap:5px}
+  .phone.compact .card{padding:8px 10px}
+  .phone.compact .kv{padding:5px 0;font-size:10px}
+  .phone.compact .group-label{margin-top:0}
+  .phone.compact .card-sub{font-size:9.5px}
+  .caption{font-size:11px;line-height:1.6;color:var(--muted);padding:10px 8px 0;text-align:center}
+  .caption b{color:var(--ink);display:block;font-size:12px;margin-bottom:2px}
+  .seg{display:flex;background:#f1f3f5;border-radius:10px;padding:3px;gap:2px}
+  .seg span{flex:1;text-align:center;font-size:9.5px;padding:5px 0;border-radius:7px;color:var(--muted)}
+  .seg span.on{background:#fff;color:var(--ink);font-weight:700;box-shadow:0 1px 3px rgba(0,0,0,.08)}
+  .meta-row{display:flex;gap:6px;align-items:center;font-size:9.5px;color:var(--muted);flex-wrap:wrap}
+  .kv{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:7px 0;border-bottom:1px solid #f0f2f5;font-size:10.5px}
+  .kv:last-child{border-bottom:0}
+  .kv .k{color:var(--muted)}
+  .kv .v{color:var(--ink);font-weight:600;text-align:right}
+  .toggle{width:34px;height:20px;border-radius:999px;background:var(--green);position:relative;flex:0 0 auto}
+  .toggle:after{content:"";position:absolute;width:16px;height:16px;border-radius:50%;background:#fff;top:2px;right:2px;box-shadow:0 1px 2px rgba(0,0,0,.2)}
+  .codeboxes{display:flex;gap:6px;justify-content:center;margin:10px 0 4px}
+  .codebox{width:34px;height:42px;border:1px solid var(--line);border-radius:9px;background:#fff;display:flex;align-items:center;justify-content:center;font-size:18px;font-weight:750}
+  .codebox.filled{border-color:#bfdbfe;background:var(--primary-soft);color:var(--primary)}
+  .note{font-size:9.5px;color:var(--faint);line-height:1.55}
+  .banner{border-radius:10px;padding:7px 9px;font-size:9.5px;line-height:1.45}
+  .banner.warn{background:var(--amber-soft);color:#92400e}
+  .banner.info{background:var(--blue-soft);color:#075985}
+  .legend{max-width:1320px;margin:34px auto 0;background:#fff;border:1px solid var(--line);border-radius:16px;padding:18px 20px;box-shadow:0 6px 20px rgba(17,24,39,.05)}
+  .legend h3{margin:0 0 10px;font-size:14px}
+  .legend .cols{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:10px 24px}
+  .legend p{margin:0;font-size:11px;line-height:1.6;color:var(--muted)}
+  .legend b{color:var(--ink)}
+  .sw{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:5px;vertical-align:1px}
+  @media (max-width:820px){
+    body{padding:22px 12px 40px}
+    .grid{grid-template-columns:1fr}
+    .frame{width:100%;display:flex;flex-direction:column;align-items:center}
+    .phone{transform:scale(.92);transform-origin:top center;margin-bottom:-56px}
+    header h1{font-size:22px}
+  }
+  @media print{
+    body{background:#fff;padding:0}
+    header{margin-bottom:12px}
+    .grid{gap:12px;grid-template-columns:repeat(3,1fr);max-width:none}
+    .frame{width:auto}
+    .phone{width:320px;height:660px;transform:scale(.9);transform-origin:top left;box-shadow:none;margin-bottom:-60px}
+    .caption{font-size:9px}
+    .legend{break-before:page}
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="kicker">ECHO · Phone Contact</div>
+  <h1>ECHO 手机 App · 5 页线框</h1>
+  <p>与《AI手机-ECHO-App-设计.md》v1.0 配套。仅表达信息层级、主操作与状态，不绑定具体平台的视觉规范；实际开发按平台设计系统落地。</p>
+  <div class="meta">
+    <span class="pill">5 页：<b>首页 / 指令 / 会议 / 回顾 / 设置</b></span>
+    <span class="pill">首页：<b>状态 bar + 三主控</b></span>
+    <span class="pill">MCP：<b>App 内 localhost</b></span>
+    <span class="pill">录音：<b>手机麦克风</b></span>
+  </div>
+</header>
+
+<main class="grid">
+
+  <!-- 1. 首页 空闲 -->
+  <section class="frame">
+    <div class="phone">
+      <div class="sysbar"><span>9:41</span><span class="right">5G <span class="bat"></span></span></div>
+      <div class="appbar">
+        <div class="conn"><span class="dot ok"></span><b>已连接 · 局域网</b></div>
+        <div class="tiny">08:42</div>
+      </div>
+      <div class="body">
+        <div class="card">
+          <div class="card-h"><span class="card-title">指令</span><span class="tiny">上一轮 · 已完成</span></div>
+          <div class="row" style="margin-top:6px">
+            <div class="input">让 ECHO 做点什么…</div>
+            <button class="btn btn-primary btn-sm">发送</button>
+          </div>
+          <div class="row" style="margin-top:7px">
+            <button class="btn btn-ghost btn-sm" style="gap:4px">
+              <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg>
+              按住说话
+            </button>
+            <span class="tiny grow ellipsis">整理今天的会议…</span>
+          </div>
+        </div>
+
+        <div class="duo">
+          <div class="card">
+            <div class="card-title">会议</div>
+            <div class="card-sub">用这台手机录音，<br>ECHO 负责转写与纪要</div>
+            <button class="btn btn-primary btn-sm btn-block">开始录音</button>
+          </div>
+          <div class="card">
+            <div class="card-title">回顾</div>
+            <div class="card-sub">今天还没回顾<br>口述今天的进展</div>
+            <button class="btn btn-ghost btn-sm btn-block">开始回顾</button>
+          </div>
+        </div>
+
+        <div class="group-label">最近动态</div>
+        <div class="card flat" style="padding:8px 10px">
+          <div class="list-item">
+            <span class="dot ok" style="margin-top:4px"></span>
+            <div class="li-main"><div class="li-title">指令完成：整理今天的会议</div><div class="li-sub">摘要：已登记 3 个会议、2 份文件…</div></div>
+            <div class="li-meta">09:12</div>
+          </div>
+          <div class="list-item">
+            <span class="dot info" style="margin-top:4px"></span>
+            <div class="li-main"><div class="li-title">会议「周会」转写完成</div><div class="li-sub">32 分钟 · 手机麦克风 · 纪要已生成</div></div>
+            <div class="li-meta">昨天</div>
+          </div>
+        </div>
+      </div>
+      <nav class="tabbar">
+        <div class="tab active"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M3 10.5 12 3l9 7.5V21a1 1 0 0 1-1 1h-5v-7H9v7H4a1 1 0 0 1-1-1z"/></svg>首页</div>
+        <div class="tab"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M21 11.5a8.5 8.5 0 0 1-8.5 8.5H7l-4 3v-5.5A8.5 8.5 0 1 1 21 11.5z"/></svg>指令</div>
+        <div class="tab"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg>会议</div>
+        <div class="tab"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="5" width="16" height="14" rx="2"/><path d="M8 9h8M8 13h5"/></svg>回顾</div>
+        <div class="tab"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9 7 7M17 17l2.1 2.1M19.1 4.9 17 7M7 17l-2.1 2.1"/></svg>设置</div>
+      </nav>
+    </div>
+    <p class="caption"><b>1 · 首页（空闲）</b>状态 bar 只说“连接 / 录音 / 回顾 / 补传”；三块主控一屏放下，不滚动。</p>
+  </section>
+
+  <!-- 2. 首页 录音中 -->
+  <section class="frame">
+    <div class="phone">
+      <div class="sysbar"><span>9:41</span><span class="right">5G <span class="bat"></span></span></div>
+      <div class="appbar">
+        <div class="conn"><span class="dot ok"></span><b>已连接 · 局域网</b></div>
+        <div class="activity"><span class="dot rec pulse"></span>录音中 00:12</div>
+      </div>
+      <div class="body">
+        <div class="card rec-card">
+          <div class="between">
+            <div class="row" style="gap:6px"><span class="dot rec pulse"></span><span class="card-title rec-head">会议 · 录音中</span></div>
+            <div class="rec-timer">00:12</div>
+          </div>
+          <div class="wave">
+            <i style="height:8px"></i><i style="height:16px"></i><i style="height:11px"></i><i style="height:22px"></i><i style="height:14px"></i><i style="height:25px"></i><i style="height:18px"></i><i style="height:10px"></i><i style="height:20px"></i><i style="height:13px"></i><i style="height:7px"></i><i style="height:15px"></i>
+          </div>
+          <div class="between">
+            <div class="tiny">手机麦克风 · 已上传 2 段</div>
+            <div class="row">
+              <button class="btn btn-ghost btn-sm">暂停</button>
+              <button class="btn btn-danger btn-sm">结束</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="card" style="opacity:.72">
+          <div class="card-h"><span class="card-title">指令</span><span class="tiny">忙</span></div>
+          <div class="input" style="margin-top:6px">ECHO 正忙（会议录音中）</div>
+          <div class="tiny" style="margin-top:6px">录音结束、或让 ECHO 空下来再发</div>
+        </div>
+
+        <div class="card">
+          <div class="card-h"><span class="card-title">回顾</span><span class="tag gray">未开始</span></div>
+          <div class="card-sub">今天还没回顾；会议结束后再开始也可以。</div>
+        </div>
+
+        <div class="banner warn">离线也会继续录：音频先存在手机，联网后自动补传。</div>
+      </div>
+      <nav class="tabbar">
+        <div class="tab active"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M3 10.5 12 3l9 7.5V21a1 1 0 0 1-1 1h-5v-7H9v7H4a1 1 0 0 1-1-1z"/></svg>首页</div>
+        <div class="tab"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M21 11.5a8.5 8.5 0 0 1-8.5 8.5H7l-4 3v-5.5A8.5 8.5 0 1 1 21 11.5z"/></svg>指令</div>
+        <div class="tab"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg>会议</div>
+        <div class="tab"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="5" width="16" height="14" rx="2"/><path d="M8 9h8M8 13h5"/></svg>回顾</div>
+        <div class="tab"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9 7 7M17 17l2.1 2.1M19.1 4.9 17 7M7 17l-2.1 2.1"/></svg>设置</div>
+      </nav>
+    </div>
+    <p class="caption"><b>1 · 首页（录音中）</b>会议卡整行展开：计时、电平、暂停/结束、已传段数；指令区禁用并说明原因。</p>
+  </section>
+
+  <!-- 3. 指令历史 -->
+  <section class="frame">
+    <div class="phone">
+      <div class="sysbar"><span>9:41</span><span class="right">5G <span class="bat"></span></span></div>
+      <div class="appbar">
+        <div class="pagehead" style="width:100%">
+          <h2>指令</h2>
+          <div class="actions">
+            <span class="iconbtn"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg></span>
+            <button class="btn btn-soft btn-sm">＋ 新指令</button>
+          </div>
+        </div>
+      </div>
+      <div class="body">
+        <div class="chips">
+          <span class="chip on">全部</span><span class="chip">语音</span><span class="chip">文字</span><span class="chip">失败</span>
+        </div>
+
+        <div class="day">今天</div>
+        <div class="card flat" style="padding:2px 10px">
+          <div class="list-item">
+            <span class="dot ok" style="margin-top:5px"></span>
+            <div class="li-main">
+              <div class="li-title">让 ECHO 整理今天的会议…</div>
+              <div class="li-sub">摘要：已登记 3 个会议、2 份文件…</div>
+            </div>
+            <div class="li-meta"><span class="tag ok">已完成</span><br>09:12</div>
+          </div>
+          <div class="list-item">
+            <span class="dot bad" style="margin-top:5px"></span>
+            <div class="li-main">
+              <div class="li-title">帮我查一下昨天的回顾…</div>
+              <div class="li-sub">失败：ECHO 正忙（回顾中）</div>
+            </div>
+            <div class="li-meta"><span class="tag bad">失败</span><br>08:40</div>
+          </div>
+        </div>
+
+        <div class="day">昨天</div>
+        <div class="card flat" style="padding:2px 10px">
+          <div class="list-item">
+            <span class="dot ok" style="margin-top:5px"></span>
+            <div class="li-main">
+              <div class="li-title">把周会纪要发我…</div>
+              <div class="li-sub">已生成 1 份纪要；已读给你听</div>
+            </div>
+            <div class="li-meta"><span class="tag ok">已完成</span><br>18:20</div>
+          </div>
+          <div class="list-item">
+            <span class="dot info" style="margin-top:5px"></span>
+            <div class="li-main">
+              <div class="li-title">明天下午三点提醒我…</div>
+              <div class="li-sub">语音指令 · 已提交</div>
+            </div>
+            <div class="li-meta"><span class="tag info">进行中</span><br>17:02</div>
+          </div>
+        </div>
+
+        <div class="banner info">离线时显示缓存；联网后自动刷新，不把“读不到”画成“没有”。</div>
+      </div>
+      <nav class="tabbar">
+        <div class="tab"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M3 10.5 12 3l9 7.5V21a1 1 0 0 1-1 1h-5v-7H9v7H4a1 1 0 0 1-1-1z"/></svg>首页</div>
+        <div class="tab active"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M21 11.5a8.5 8.5 0 0 1-8.5 8.5H7l-4 3v-5.5A8.5 8.5 0 1 1 21 11.5z"/></svg>指令</div>
+        <div class="tab"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg>会议</div>
+        <div class="tab"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="5" width="16" height="14" rx="2"/><path d="M8 9h8M8 13h5"/></svg>回顾</div>
+        <div class="tab"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9 7 7M17 17l2.1 2.1M19.1 4.9 17 7M7 17l-2.1 2.1"/></svg>设置</div>
+      </nav>
+    </div>
+    <p class="caption"><b>2 · 指令（历史）</b>按天分组；状态点 + 文本 + 摘要 + 状态标签。失败与空态必须分开显示。</p>
+  </section>
+
+  <!-- 4. 会议历史 -->
+  <section class="frame">
+    <div class="phone">
+      <div class="sysbar"><span>9:41</span><span class="right">5G <span class="bat"></span></span></div>
+      <div class="appbar">
+        <div class="pagehead" style="width:100%">
+          <h2>会议</h2>
+          <button class="btn btn-soft btn-sm">＋ 开始录音</button>
+        </div>
+      </div>
+      <div class="body">
+        <div class="chips">
+          <span class="chip on">全部</span><span class="chip">录音中</span><span class="chip">转写中</span><span class="chip">已完成</span><span class="chip">失败</span>
+        </div>
+
+        <div class="card">
+          <div class="between">
+            <div class="card-title">周会</div>
+            <span class="tag ok">已完成</span>
+          </div>
+          <div class="meta-row" style="margin-top:3px">10-21 14:00 · 32 分钟 · 手机麦克风</div>
+          <div class="card-sub" style="margin-top:5px">纪要：本周重点推进 A 项目，确认交付时间…</div>
+        </div>
+
+        <div class="card">
+          <div class="between">
+            <div class="card-title">客户沟通</div>
+            <span class="tag warn">转写中 62%</span>
+          </div>
+          <div class="meta-row" style="margin-top:3px">10-21 10:30 · 18 分钟 · 手机麦克风</div>
+          <div style="height:4px;background:#f1f3f5;border-radius:999px;margin-top:8px"><div style="width:62%;height:4px;background:var(--amber);border-radius:999px"></div></div>
+        </div>
+
+        <div class="card">
+          <div class="between">
+            <div class="card-title">临时讨论</div>
+            <span class="tag info">补传中 3/5</span>
+          </div>
+          <div class="meta-row" style="margin-top:3px">10-20 16:10 · 12 分钟 · 手机麦克风</div>
+          <div class="card-sub" style="margin-top:5px">离线录的，联网后自动补传；补完才会转写。</div>
+        </div>
+
+        <div class="banner warn">录音中再点“开始录音”会被幂等拦截，不会新建第二场。</div>
+      </div>
+      <nav class="tabbar">
+        <div class="tab"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M3 10.5 12 3l9 7.5V21a1 1 0 0 1-1 1h-5v-7H9v7H4a1 1 0 0 1-1-1z"/></svg>首页</div>
+        <div class="tab"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M21 11.5a8.5 8.5 0 0 1-8.5 8.5H7l-4 3v-5.5A8.5 8.5 0 1 1 21 11.5z"/></svg>指令</div>
+        <div class="tab active"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg>会议</div>
+        <div class="tab"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="5" width="16" height="14" rx="2"/><path d="M8 9h8M8 13h5"/></svg>回顾</div>
+        <div class="tab"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9 7 7M17 17l2.1 2.1M19.1 4.9 17 7M7 17l-2.1 2.1"/></svg>设置</div>
+      </nav>
+    </div>
+    <p class="caption"><b>3 · 会议（历史）</b>状态标签覆盖“录音中/转写中/已完成/失败/补传中”；补传与转写分开说。</p>
+  </section>
+
+  <!-- 5. 回顾历史 -->
+  <section class="frame">
+    <div class="phone">
+      <div class="sysbar"><span>9:41</span><span class="right">5G <span class="bat"></span></span></div>
+      <div class="appbar">
+        <div class="pagehead" style="width:100%">
+          <h2>回顾</h2>
+          <button class="btn btn-soft btn-sm">＋ 开始回顾</button>
+        </div>
+      </div>
+      <div class="body">
+        <div class="card">
+          <div class="between">
+            <div class="card-title">10-22 周三</div>
+            <span class="tag ok">3 轮 · 21:40</span>
+          </div>
+          <div class="card-sub" style="margin-top:5px">播报：今天登记了 2 个会议、3 份文件；明天先推进 A 项目的交付确认。</div>
+          <div class="row" style="margin-top:8px">
+            <button class="btn btn-ghost btn-sm">播放播报</button>
+            <span class="tiny">已登记工作日志</span>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="between">
+            <div class="card-title">10-21 周二</div>
+            <span class="tag gray">5 轮 · 22:10</span>
+          </div>
+          <div class="card-sub" style="margin-top:5px">播报：今天…</div>
+          <div class="row" style="margin-top:8px">
+            <button class="btn btn-ghost btn-sm">播放播报</button>
+            <span class="tag warn">1 轮未登记</span>
+          </div>
+        </div>
+
+        <div class="card" style="border-style:dashed;background:#fbfcfe">
+          <div class="card-title">今天还没回顾？</div>
+          <div class="card-sub">点右上角「开始回顾」，用手机一轮轮口述；不会打开电脑的麦克风。</div>
+        </div>
+      </div>
+      <nav class="tabbar">
+        <div class="tab"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M3 10.5 12 3l9 7.5V21a1 1 0 0 1-1 1h-5v-7H9v7H4a1 1 0 0 1-1-1z"/></svg>首页</div>
+        <div class="tab"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M21 11.5a8.5 8.5 0 0 1-8.5 8.5H7l-4 3v-5.5A8.5 8.5 0 1 1 21 11.5z"/></svg>指令</div>
+        <div class="tab"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg>会议</div>
+        <div class="tab active"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="5" width="16" height="14" rx="2"/><path d="M8 9h8M8 13h5"/></svg>回顾</div>
+        <div class="tab"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9 7 7M17 17l2.1 2.1M19.1 4.9 17 7M7 17l-2.1 2.1"/></svg>设置</div>
+      </nav>
+    </div>
+    <p class="caption"><b>4 · 回顾（历史）</b>按天一条；播报可直接播放；“已登记/未登记”三态如实显示。</p>
+  </section>
+
+  <!-- 6. 设置 -->
+  <section class="frame">
+    <div class="phone compact">
+      <div class="sysbar"><span>9:41</span><span class="right">5G <span class="bat"></span></span></div>
+      <div class="appbar"><div class="pagehead" style="width:100%"><h2>设置</h2></div></div>
+      <div class="body" style="gap:6px">
+        <div class="group-label">配对与连接</div>
+        <div class="card flat" style="padding:4px 10px">
+          <div class="kv"><span class="k">ECHO</span><span class="v"><span class="dot ok" style="display:inline-block;margin-right:4px"></span>已连接 · dev-box</span></div>
+          <div class="kv"><span class="k">地址</span><span class="v">192.168.1.170:8970</span></div>
+          <div class="kv"><span class="k">模式</span><span class="v">局域网 · v2.1.7</span></div>
+          <div class="kv"><span class="k"></span><span class="v"><button class="btn btn-ghost btn-sm">重新配对</button></span></div>
+        </div>
+
+        <div class="group-label">录音</div>
+        <div class="card flat" style="padding:4px 10px">
+          <div class="kv"><span class="k">输入设备</span><span class="v">系统麦克风</span></div>
+          <div class="kv"><span class="k">离线保留</span><span class="v">7 天</span></div>
+        </div>
+
+        <div class="group-label">语音</div>
+        <div class="card flat" style="padding:4px 10px">
+          <div class="kv"><span class="k">语音引擎</span><span class="v">ECHO（失败回落系统）</span></div>
+          <div class="kv"><span class="k">只念摘要</span><span class="v">开</span></div>
+        </div>
+
+        <div class="group-label">通知与权限</div>
+        <div class="card flat" style="padding:4px 10px">
+          <div class="kv"><span class="k">麦克风</span><span class="v">已授权</span></div>
+          <div class="kv"><span class="k">通知</span><span class="v" style="color:var(--amber)">2 项待处理</span></div>
+        </div>
+
+        <div class="group-label">智能体接入（MCP）</div>
+        <div class="card" style="border-color:#bbf7d0;background:linear-gradient(180deg,#fff,#f7fef9)">
+          <div class="between">
+            <div class="row"><span class="dot ok"></span><span class="card-title">运行中</span></div>
+            <span class="tag ok">MCP</span>
+          </div>
+          <div class="card-sub" style="margin-top:4px">127.0.0.1:18790/mcp · 仅本机</div>
+          <div class="tiny" style="margin-top:4px">13 个工具 · 最近调用 10:21 ✓</div>
+        </div>
+
+        <div class="group-label">关于</div>
+        <div class="card flat" style="padding:4px 10px">
+          <div class="kv"><span class="k">App 版本</span><span class="v">1.0.0</span></div>
+        </div>
+      </div>
+      <nav class="tabbar">
+        <div class="tab"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M3 10.5 12 3l9 7.5V21a1 1 0 0 1-1 1h-5v-7H9v7H4a1 1 0 0 1-1-1z"/></svg>首页</div>
+        <div class="tab"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M21 11.5a8.5 8.5 0 0 1-8.5 8.5H7l-4 3v-5.5A8.5 8.5 0 1 1 21 11.5z"/></svg>指令</div>
+        <div class="tab"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg>会议</div>
+        <div class="tab"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="5" width="16" height="14" rx="2"/><path d="M8 9h8M8 13h5"/></svg>回顾</div>
+        <div class="tab active"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9 7 7M17 17l2.1 2.1M19.1 4.9 17 7M7 17l-2.1 2.1"/></svg>设置</div>
+      </nav>
+    </div>
+    <p class="caption"><b>5 · 设置</b>配对/连接、录音、语音、权限、MCP、关于；MCP 只放这一处，首页不堆配置。</p>
+  </section>
+
+  <!-- 7. 会议详情 -->
+  <section class="frame">
+    <div class="phone">
+      <div class="sysbar"><span>9:41</span><span class="right">5G <span class="bat"></span></span></div>
+      <div class="appbar">
+        <div class="row" style="gap:8px"><span class="iconbtn">←</span><div class="card-title">周会</div></div>
+        <span class="tag ok">已完成</span>
+      </div>
+      <div class="body">
+        <div class="meta-row">10-21 14:00 · 32:10 · 手机麦克风</div>
+        <div class="seg"><span class="on">纪要</span><span>议题</span><span>逐字稿</span><span>音频</span></div>
+        <div class="card" style="padding:10px 11px">
+          <div class="card-title" style="font-size:11px">本周重点</div>
+          <div class="card-sub" style="margin-top:4px;line-height:1.6">本周重点推进 A 项目，确认交付时间；客户侧下周三前给反馈。</div>
+          <div class="divider"></div>
+          <div class="card-title" style="font-size:11px">待办</div>
+          <div class="card-sub" style="margin-top:4px;line-height:1.6">① 交付计划对齐（负责人：我）<br>② 客户反馈收集（周五前）<br>③ 下周例会改到周四</div>
+        </div>
+        <div class="card flat" style="padding:8px 10px">
+          <div class="between"><span class="tiny">说话人</span><span class="tiny">3 人</span></div>
+          <div class="row" style="margin-top:6px;flex-wrap:wrap">
+            <span class="tag gray">我</span><span class="tag gray">张工</span><span class="tag gray">李工</span>
+          </div>
+        </div>
+        <div class="banner info">逐字稿很长：分页加载；点时间戳可跳到对应音频段。</div>
+      </div>
+      <nav class="tabbar">
+        <div class="tab"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M3 10.5 12 3l9 7.5V21a1 1 0 0 1-1 1h-5v-7H9v7H4a1 1 0 0 1-1-1z"/></svg>首页</div>
+        <div class="tab"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M21 11.5a8.5 8.5 0 0 1-8.5 8.5H7l-4 3v-5.5A8.5 8.5 0 1 1 21 11.5z"/></svg>指令</div>
+        <div class="tab active"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg>会议</div>
+        <div class="tab"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="5" width="16" height="14" rx="2"/><path d="M8 9h8M8 13h5"/></svg>回顾</div>
+        <div class="tab"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9 7 7M17 17l2.1 2.1M19.1 4.9 17 7M7 17l-2.1 2.1"/></svg>设置</div>
+      </nav>
+    </div>
+    <p class="caption"><b>子页 · 会议详情</b>四个分段：纪要 / 议题 / 逐字稿 / 音频；逐字稿分页，音频按段播放。</p>
+  </section>
+
+  <!-- 8. 配对 -->
+  <section class="frame">
+    <div class="phone compact">
+      <div class="sysbar"><span>9:41</span><span class="right">5G <span class="bat"></span></span></div>
+      <div class="appbar">
+        <div class="row" style="gap:8px"><span class="iconbtn">←</span><div class="card-title">配对 ECHO</div></div>
+        <span class="tag gray">未配对</span>
+      </div>
+      <div class="body">
+        <div class="card">
+          <div class="card-title">在电脑上生成配对码</div>
+          <div class="card-sub" style="margin-top:4px">ECHO 面板 → 设置 → 手机 → 生成配对码（5 分钟内有效）。</div>
+          <div class="codeboxes">
+            <div class="codebox filled">4</div><div class="codebox filled">8</div><div class="codebox filled">2</div><div class="codebox filled">9</div><div class="codebox filled">1</div><div class="codebox filled">3</div>
+          </div>
+          <div class="row" style="margin-top:8px">
+            <div class="input" style="font-size:9.5px">http://192.168.1.170:8970</div>
+            <button class="btn btn-ghost btn-sm">扫码</button>
+          </div>
+          <button class="btn btn-primary btn-block" style="margin-top:10px">连接</button>
+        </div>
+        <div class="banner info">手机与电脑不在同一网络时，填面板给出的“中继地址”（https://…/v1/relay/…）。</div>
+        <div class="note">配对码一次性、5 分钟、错 20 次锁 5 分钟；App 不会自动重试错误码。</div>
+      </div>
+      <nav class="tabbar">
+        <div class="tab"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M3 10.5 12 3l9 7.5V21a1 1 0 0 1-1 1h-5v-7H9v7H4a1 1 0 0 1-1-1z"/></svg>首页</div>
+        <div class="tab"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M21 11.5a8.5 8.5 0 0 1-8.5 8.5H7l-4 3v-5.5A8.5 8.5 0 1 1 21 11.5z"/></svg>指令</div>
+        <div class="tab"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg>会议</div>
+        <div class="tab"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="5" width="16" height="14" rx="2"/><path d="M8 9h8M8 13h5"/></svg>回顾</div>
+        <div class="tab"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9 7 7M17 17l2.1 2.1M19.1 4.9 17 7M7 17l-2.1 2.1"/></svg>设置</div>
+      </nav>
+    </div>
+    <p class="caption"><b>子页 · 配对</b>6 位码 + 服务器地址；中继模式填 https 地址。错误就地显示，不静默。</p>
+  </section>
+
+  <!-- 9. MCP -->
+  <section class="frame">
+    <div class="phone compact">
+      <div class="sysbar"><span>9:41</span><span class="right">5G <span class="bat"></span></span></div>
+      <div class="appbar">
+        <div class="row" style="gap:8px"><span class="iconbtn">←</span><div class="card-title">智能体接入（MCP）</div></div>
+        <span class="toggle"></span>
+      </div>
+      <div class="body">
+        <div class="card">
+          <div class="between"><span class="card-sub">状态</span><span class="tag ok">运行中 · 127.0.0.1:18790</span></div>
+          <div class="kv"><span class="k">接入地址</span><span class="v" style="font-family:ui-monospace,monospace;font-size:9px">http://127.0.0.1:18790/mcp</span></div>
+          <div class="kv"><span class="k">令牌</span><span class="v">•••••••• <button class="btn btn-ghost btn-sm">复制</button></span></div>
+          <button class="btn btn-primary btn-block" style="margin-top:8px">复制智能体配置</button>
+        </div>
+
+        <div class="group-label">允许的操作</div>
+        <div class="card flat" style="padding:6px 10px">
+          <div class="kv"><span class="k">开始 / 结束录音</span><span class="v"><span class="tag ok">允许</span></span></div>
+          <div class="kv"><span class="k">发指令</span><span class="v"><span class="tag ok">允许</span></span></div>
+          <div class="kv"><span class="k">开始 / 结束回顾</span><span class="v"><span class="tag ok">允许</span></span></div>
+          <div class="kv"><span class="k">朗读</span><span class="v"><span class="tag ok">允许</span></span></div>
+        </div>
+
+        <div class="group-label">最近调用</div>
+        <div class="card flat" style="padding:4px 10px">
+          <div class="kv"><span class="k">10:21 echo_meeting_start</span><span class="v">✓ 32ms</span></div>
+          <div class="kv"><span class="k">10:22 echo_command_send</span><span class="v">✓ 18ms</span></div>
+        </div>
+
+        <div class="banner warn">只在本机回环开放；轮换令牌会让旧配置立刻失效。</div>
+      </div>
+      <nav class="tabbar">
+        <div class="tab"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M3 10.5 12 3l9 7.5V21a1 1 0 0 1-1 1h-5v-7H9v7H4a1 1 0 0 1-1-1z"/></svg>首页</div>
+        <div class="tab"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M21 11.5a8.5 8.5 0 0 1-8.5 8.5H7l-4 3v-5.5A8.5 8.5 0 1 1 21 11.5z"/></svg>指令</div>
+        <div class="tab"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg>会议</div>
+        <div class="tab"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="5" width="16" height="14" rx="2"/><path d="M8 9h8M8 13h5"/></svg>回顾</div>
+        <div class="tab active"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9 7 7M17 17l2.1 2.1M19.1 4.9 17 7M7 17l-2.1 2.1"/></svg>设置</div>
+      </nav>
+    </div>
+    <p class="caption"><b>子页 · MCP</b>开关、端点、令牌、允许的操作、最近调用。令牌只在本机；Agent 不接触 ECHO Token。</p>
+  </section>
+
+</main>
+
+<section class="legend">
+  <h3>阅读提示</h3>
+  <div class="cols">
+    <p><b>状态色：</b><span class="sw" style="background:var(--green)"></span>已连接 / 完成　<span class="sw" style="background:var(--amber)"></span>离线 / 暂停 / 转写中　<span class="sw" style="background:var(--red)"></span>录音 / 失败　<span class="sw" style="background:var(--purple)"></span>回顾　<span class="sw" style="background:var(--blue)"></span>补传 / 进行中</p>
+    <p><b>首页原则：</b>一屏不滚动；三块主控；状态 bar 只回答“能不能用”和“现在在做什么”。录音/回顾进行中时，对应卡片整行展开，另一块收起。</p>
+    <p><b>历史页原则：</b>列表 + 详情；空态、加载、失败、离线四态都要有文案；失败绝不画成空态。删除/改设置等管理动作不放在 App。</p>
+    <p><b>MCP：</b>App 承载，不是 ECHO；只绑 127.0.0.1；令牌鉴权；13 个工具；Agent 只见 MCP Token，不见 ECHO Token。</p>
+  </div>
+</section>
+
+</body>
+</html>

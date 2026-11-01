@@ -37,6 +37,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import jwt
 
 from server import errors
+from server import delegation
 from server.store import Store
 
 #: 配对码用的字母表：**去掉 0/O/1/I/L** —— 这个码要人工从管理面念给同事，
@@ -421,6 +422,30 @@ class Auth:
         if not cid:
             raise errors.unauthorized("令牌里没有客户端标识")
 
+        # 2026-10-31：方案 B 的“手机委托 token”。它不是 clients 表里的行；
+        # 父客户端（ECHO）用 /v1/delegate 让它签发，这里验证父客户端仍有效、
+        # 父 token_version 未轮换、scope 只含 tts。设备公钥绑定在 cnf.jkt；
+        # /v1/tts 还会再验 DPoP proof。
+        if claims.get("delegated"):
+            if delegation.is_revoked(cid):
+                raise errors.unauthorized("委托 token 已被撤销")
+            parent_id = str(claims.get("act") or "")
+            parent = self.cache.get(parent_id) if parent_id else None
+            if parent is None:
+                raise errors.unauthorized("委托方客户端不认识或已被删除")
+            if int(parent.get("token_version") or 1) != int(claims.get("ver") or 0):
+                raise errors.unauthorized("令牌已失效（委托方凭据被撤销或轮换）")
+            if int(parent.get("disabled") or 0):
+                raise errors.forbidden("委托方客户端已被禁用")
+            delegated_scope = str(claims.get("scopes") or "")
+            if need_scope and delegated_scope.split() and need_scope not in delegated_scope.split():
+                raise errors.forbidden("这个委托令牌没有 %s 权限" % need_scope)
+            self._touch(parent_id)
+            return {"client_id": cid, "scopes": delegated_scope,
+                    "token_version": int(claims.get("ver") or 1), "disabled": 0,
+                    "delegated": True, "parent": parent_id,
+                    "cnf": dict(claims.get("cnf") or {}), "claims": claims}
+
         row = self.cache.get(cid)
         if row is None:
             raise errors.unauthorized("客户端不认识或已被删除")
@@ -614,6 +639,34 @@ class Auth:
                                  grace_hours=grace_hours)
         self.cache.forget(client_id)
         return secret
+
+    def issue_delegated(self, parent: Dict[str, Any], subject: str, jkt: str,
+                        *, scope: str = "tts", ttl_s: int = 3600) -> Tuple[str, int]:
+        """ECHO 作为委托方，为手机签发 `sub=phone:*` 的 TTS token。
+
+        关键约束：
+          * `act` 是 ECHO 的 client_id；手机 token 不能反过来再委托；
+          * `ver` 是 ECHO 的 token_version —— ECHO 被撤销/轮换后手机 token 立刻失效；
+          * `cnf.jkt` 绑定手机设备公钥，`/v1/tts` 要 DPoP proof；
+          * scope 只能是我们明确给的（目前只允许 tts）。
+        """
+        ttl = max(60, min(int(ttl_s or 3600), 86400))
+        now = int(time.time())
+        sub = "phone:" + str(subject or "").strip()
+        if sub == "phone:":
+            raise errors.bad_request("subject 不能为空")
+        claims = {
+            "sub": sub,
+            "act": str(parent.get("client_id") or ""),
+            "scopes": str(scope or "tts"),
+            "delegated": True,
+            "cnf": {"jkt": str(jkt or "")},
+            "ver": int(parent.get("token_version") or 1),
+            "iat": now,
+            "exp": now + ttl,
+            "jti": secrets.token_hex(8),
+        }
+        return jwt.encode(claims, self.key, algorithm=JWT_ALG), ttl
 
     # ---- 换令牌（§7.5 ②）---------------------------------------------------
 

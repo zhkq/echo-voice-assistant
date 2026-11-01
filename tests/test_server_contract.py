@@ -33,6 +33,7 @@ from fastapi.testclient import TestClient                        # noqa: E402
 from server import auth as auth_mod                              # noqa: E402
 from server import engines, errors, main as server_main, tmp     # noqa: E402
 from server import limits as limits_mod                          # noqa: E402
+from server import tts as tts_mod                                # noqa: E402
 from server import ops as ops_mod                                # noqa: E402
 from server import routes as routes_mod                          # noqa: E402
 from server import settings as settings_mod                      # noqa: E402
@@ -247,6 +248,7 @@ class NoBusinessCouplingTests(unittest.TestCase):
             ("POST", "/v1/pair"), ("POST", "/v1/token"),
             # 能力（**都不是**写端点：收音频、出结果、不留存）
             ("POST", "/v1/asr"), ("POST", "/v1/diarize"), ("POST", "/v1/speaker/embed"),
+            ("POST", "/v1/tts"), ("POST", "/v1/delegate"), ("POST", "/v1/delegate/revoke"),
         }
         got = set()
         for r in routes_mod.router.routes:
@@ -2195,9 +2197,13 @@ class AuthScopeTests(unittest.TestCase):
         """端点到 scope 是一张**表**，不是散落各处的字符串 —— 表要覆盖所有能力端点。"""
         capability_posts = {p for (m, p) in
                             [("POST", "/v1/asr"), ("POST", "/v1/diarize"),
-                             ("POST", "/v1/speaker/embed")]}
+                             ("POST", "/v1/speaker/embed"), ("POST", "/v1/tts"),
+                             ("POST", "/v1/delegate"), ("POST", "/v1/delegate/revoke")]}
         self.assertEqual(set(routes_mod.ENDPOINT_SCOPES), capability_posts)
         self.assertEqual(routes_mod.ENDPOINT_SCOPES["/v1/diarize"], "diarize")
+        self.assertEqual(routes_mod.ENDPOINT_SCOPES["/v1/tts"], "tts")
+        self.assertEqual(routes_mod.ENDPOINT_SCOPES["/v1/delegate"], "tts")
+        self.assertEqual(routes_mod.ENDPOINT_SCOPES["/v1/delegate/revoke"], "tts")
 
     def test_endpoints_actually_pass_their_scope(self):
         """接了表还不够 —— 端点得**真的把 scope 传下去**（否则表是摆设）。"""
@@ -4087,6 +4093,65 @@ class PublishedSchemeForRemoteTests(unittest.TestCase):
                 host = url.split("host=", 1)[1].split("&", 1)[0]
                 self.assertEqual(pairing.normalize_base_url(host),
                                  "https://echoserver.zhkq.online:8900")
+
+
+class TtsChannelTests(_AppCase):
+    """TTS 独立通道：不占 GPU、按 client 1 QPS、手机/ECHO 各自计数。"""
+
+    def _fake_synth(self, data=b"ID3\x04\x00\x00"):
+        calls = []
+
+        async def fake(text, *, voice="", rate="", timeout=15.0):
+            calls.append((text, voice, rate))
+            return data
+
+        return fake, calls
+
+    def test_returns_mp3_without_touching_the_gpu_admission(self):
+        fake, calls = self._fake_synth()
+        with patch.object(routes_mod.tts_mod, "synthesize", fake), \
+                patch.object(self.app.state.echo.admission, "hold",
+                             side_effect=AssertionError("TTS 不许占 ASR 通道")):
+            r = self.client.post("/v1/tts", json={"text": "你好"})
+        self.assertEqual(200, r.status_code, r.text)
+        self.assertEqual("audio/mpeg", r.headers.get("content-type"))
+        self.assertEqual("edge-tts", r.headers.get("x-echo-tts-engine"))
+        self.assertEqual(b"ID3\x04\x00\x00", r.content)
+        self.assertEqual([("你好", tts_mod.DEFAULT_VOICE, tts_mod.DEFAULT_RATE)], calls)
+
+    def test_a_client_can_only_send_one_request_per_second(self):
+        fake, _ = self._fake_synth()
+        with patch.object(routes_mod.tts_mod, "synthesize", fake):
+            first = self.client.post("/v1/tts", json={"text": "第一句"})
+            second = self.client.post("/v1/tts", json={"text": "第二句"})
+        self.assertEqual(200, first.status_code, first.text)
+        self.assertEqual(429, second.status_code, second.text)
+        self.assertEqual("rate_limited", second.json().get("code"))
+        self.assertEqual("1", second.headers.get("retry-after"))
+
+    def test_empty_text_is_422_and_does_not_call_edge(self):
+        called = []
+
+        async def fake(*_a, **_k):
+            called.append(True)
+            return b"x"
+
+        with patch.object(routes_mod.tts_mod, "synthesize", fake):
+            r = self.client.post("/v1/tts", json={"text": "   "})
+        self.assertEqual(422, r.status_code, r.text)
+        self.assertEqual([], called)
+
+    def test_the_limiter_counts_clients_separately(self):
+        now = [100.0]
+        limiter = tts_mod.TtsRateLimiter(per_second=1.0, clock=lambda: now[0])
+        limiter.check("phone")                 # 手机第一次
+        limiter.check("echo-pc")               # ECHO 第一次：独立计数，放行
+        with self.assertRaises(errors.EchoError) as ctx:
+            limiter.check("phone")
+        self.assertEqual(429, ctx.exception.status)
+        self.assertEqual("rate_limited", ctx.exception.code)
+        now[0] += 1.0
+        limiter.check("phone")                 # 过了一秒，手机恢复
 
 
 if __name__ == "__main__":

@@ -13,6 +13,7 @@ import com.echo.contact.audio.SpeechInput
 import com.echo.contact.audio.SystemTts
 import com.echo.contact.audio.TtsRoute
 import com.echo.contact.data.ApiClient
+import com.echo.contact.data.BackendTts
 import com.echo.contact.data.MeetingAudioFetcher
 import com.echo.contact.data.PairStore
 import com.echo.contact.data.dto.CommandItem
@@ -527,6 +528,18 @@ class MainViewModel(app: Application) : BaseViewModel(app) {
         _speaking.value = true
         viewModelScope.launch {
             try {
+                // 方案 B：手机直连能力后端，token 是 ECHO 委托的 phone 身份；
+                // 这条不占 ECHO 的 1 QPS。失败再回退 ECHO 的 /api/tts。
+                val backend = BackendTts.synthesize(getApplication(), content)
+                if (backend != null) {
+                    val file = withContext(Dispatchers.IO) {
+                        echoPlayer.cache(backend.bytes, backend.mime)
+                    }
+                    echoPlayer.play(file) { _speaking.value = false }
+                    _ttsRoute.value = echoPlayer.lastRoute
+                    _speakNote.value = "ECHO 后端"
+                    return@launch
+                }
                 val resp = api().tts(TtsRequest(text = content))
                 if (!resp.isSuccessful) {
                     // 409=朗读被关、422=空文本、502=合成失败：后端都给了 detail，原样显示

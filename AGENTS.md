@@ -67,6 +67,13 @@
     否则 watchdog 几秒后又拉起（用户实测）。`restart-echo.ps1` 传 `-KeepSupervisor` 保留守护；
     升级路径传 `keepBackend=true` 保留本机后端。判据：`tests/test_install_desktop_stop.py`、
     `tests/test_sidebar_lifecycle.py`、`tests/test_removed_settings.py`。
+- **能力后端 TTS 通道（2026-10-31 用户拍板）**：手机 App 与 ECHO 都走能力后端
+  `POST /v1/tts`（edge-tts 只在后端升级一次）；**不占 ASR 的 GPU/Admission/额度**，
+  按认证 `client_id` **1 QPS**（手机/ECHO 不同 client，各自计数；鉴权关闭时都是
+  `anonymous`，要分开就必须开后端鉴权）。ECHO 选 `ttsEngine=echo-server` 走这条；
+  客户端 `EchoServerClient.tts()` 返回 `(mime, bytes)`。`edge-tts` 必须 >=7.3.1
+  （7.2.8 实测被微软 403）。判据：`tests/test_server_contract.py::TtsChannelTests`、
+  `tests/test_capabilities_contract.py` 的 TTS binary/429 用例。
 - **别再复活**：本地 STT 引擎/模型、唤醒词/KWS、`stt-cmd` 启动预热、「后端失败回落本机」、
   `providerAsr` 优先级（指令路径已移除；`app/providers/local.py` 与 `app/audio/stt.py` 是留下的
   历史代码，默认档不装依赖、运行时不使用）。`sttModel`/`device`/`dailyReviewSttBackend` 现在

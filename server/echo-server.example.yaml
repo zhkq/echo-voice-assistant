@@ -86,6 +86,18 @@ limits:
   # 注意：用量计数在**进程内**，所以多实例部署时各算一份（设计 §7.2 写明的取舍）。
   daily_audio_minutes: 0
 
+# ---------------------------------------------------------------- TTS（edge-tts）
+# 2026-10-31：手机 App 与 ECHO PC 都调这个通道，edge-tts 只在后端升级一次。
+# **不占 ASR 的 GPU 通道**；按认证 client 1 QPS（手机和 ECHO 各自不同 client）。
+tts:
+  enabled: true
+  voice: "zh-CN-XiaoxiaoNeural"
+  rate: "+0%"
+  # 每个 client 每秒最多 1 次；0 = 关闭 TTS 限速（运维保险，不建议生产用）
+  per_second: 1.0
+  max_chars: 2000
+  timeout_s: 15.0
+
 calls:
   # 调用元数据（设计 §7.3：只有 ts/client_id/endpoint/model_id/audio_seconds/
   # queue_wait_ms/duration_ms/status/error_code/request_id —— **没有内容**）。

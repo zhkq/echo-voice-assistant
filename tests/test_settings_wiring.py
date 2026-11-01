@@ -645,7 +645,7 @@ class OptionAndPanelWiringTests(unittest.TestCase):
     def test_tts_engine_options_are_implemented(self):
         from app.audio import tts
         opts = set(DEFAULTS["ttsEngine"]["options"])
-        known = {"auto", "edge-tts", "off"} | tts._offline_engine_ids()
+        known = {"auto", "edge-tts", "echo-server", "off"} | tts._offline_engine_ids()
         self.assertTrue(opts <= known,
                         "ttsEngine 候选项里有没实现的：%s" % sorted(opts - known))
 

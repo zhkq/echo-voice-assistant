@@ -6,6 +6,8 @@
 而**本机回环**的请求仍然不必带令牌 —— 否则本地面板自己就瞎了（面板是静态页，没有令牌可带，
 于是连"生成配对码"都点不动）。判据见 `optional_auth()`。
 """
+import base64
+import io
 import json
 import os
 import re
@@ -20,7 +22,7 @@ from starlette.background import BackgroundTask
 import app.db as db
 from app import __version__ as _ECHO_VERSION
 from app.config import settings
-from app import assistant, manager, meeting, netguard, phone_pair, ports, relay as relay_mod, relay_web, runtime, services, worklog
+from app import assistant, e2e, manager, meeting, netguard, phone_pair, ports, relay as relay_mod, relay_web, runtime, services, worklog
 from app.audio import recorder
 from app.audio import tts as tts_mod
 from app.pathutil import safe_under as _safe_under
@@ -350,6 +352,17 @@ class PhoneClaimIn(BaseModel):
     （默认 `mobile`，与 `KeyCreateIn.name` 同一个默认值）。
     """
     code: str = ""
+    name: str = "mobile"
+
+
+class PhoneClaimV2In(BaseModel):
+    """方案 B：手机用二维码里的 ECHO 公钥加密 claim，relay 只看到密文。"""
+    v: int = 2
+    nonce: str = ""
+    ephPub: str = ""
+    iv: str = ""
+    ciphertext: str = ""
+    # 兼容/排障：不信任这两个，真正的设备公钥在密文里，签名也要验。
     name: str = "mobile"
 
 
@@ -3591,6 +3604,7 @@ def _pair_state() -> dict:
         "addresses": netguard.local_addresses(),
         "baseUrl": _phone_base_url(),
         "pending": phone_pair.pending(),
+        "devices": e2e.list_devices(),
         "lockedSeconds": phone_pair.locked_for(),
         "apiAuthEnabled": bool(settings.get("apiAuthEnabled", False)),
         "relayEnabled": bool(settings.get("relayEnabled", False)),
@@ -3607,6 +3621,82 @@ def _pair_state() -> dict:
 def phone_pair_state(_auth=Depends(optional_auth)):
     """面板用：现在能不能配对、该显示哪个码与哪个地址。**只读，不改任何状态。**"""
     return _pair_state()
+
+
+def _pair_ticket(request: Request) -> dict:
+    """生成方案 B 的 QR ticket（含 ECHO 公钥/relay 地址/后端 TLS 指纹/6 位码）。"""
+    base = _phone_base_url(request)
+    relay_url = ""
+    try:
+        relay_url = relay_mod.public_url()
+    except Exception:
+        relay_url = ""
+    target = relay_url or base
+    if not target:
+        raise HTTPException(status_code=409, detail="没有可用的配对地址：中继未连上，本机也没有私有地址")
+    host_id = ""
+    try:
+        host_id = str(relay_mod.STATE.get("hostId") or "")
+    except Exception:
+        host_id = ""
+
+    backend = {}
+    try:
+        from app.capabilities import credentials
+        creds = credentials.load()
+        if creds is not None:
+            backend = {"baseUrl": str(creds.base_url or ""),
+                       "tlsPin": str(creds.cert_fingerprint or "")}
+    except Exception:
+        backend = {}
+
+    issued = phone_pair.issue()
+    ticket = e2e.new_ticket(code=issued["code"], relay_url=target,
+                            host_id=host_id or "local", backend=backend)
+    qr_png = ""
+    try:
+        import qrcode
+        qr = qrcode.QRCode(box_size=6, border=2)
+        qr.add_data(ticket["ticket"])
+        qr.make(fit=True)
+        buf = io.BytesIO()
+        qr.make_image(fill_color="black", back_color="white").save(buf, format="PNG")
+        qr_png = base64.b64encode(buf.getvalue()).decode("ascii")
+    except Exception:
+        # 没装 qrcode 也要把 ticket 给出去（手机可手输长票/排障），但不假装有图。
+        qr_png = ""
+    return {
+        "ok": True,
+        "version": e2e.TICKET_VERSION,
+        "ticket": ticket["ticket"],
+        "payload": ticket["payload"],
+        "qrPng": qr_png,
+        "qrPngMime": "image/png" if qr_png else "",
+        "code": issued["code"],
+        "expiresAt": issued["expiresAt"],
+        "ttlSeconds": issued["ttlSeconds"],
+        "target": target,
+        "baseUrl": base,
+        "relayUrl": relay_url,
+        "hostId": host_id,
+        "backend": backend,
+    }
+
+
+@router.post("/pair/phone/ticket")
+def phone_pair_ticket(request: Request, _auth=Depends(optional_auth)):
+    """方案 B：生成二维码 ticket（只在 ECHO 本机面板调用）。
+
+    二维码里的 ECHO 公钥是信任根；手机不通过后端拿公钥。**后端 relay 只能看到
+    手机后续发来的密文**。
+    """
+    if not _is_loopback_call(request):
+        raise HTTPException(status_code=403,
+                            detail="配对二维码只能在 ECHO 这台机器上生成（本机面板）")
+    if not netguard.lan_mode_enabled():
+        raise HTTPException(status_code=409,
+                            detail="「允许局域网访问」还没开，手机连不上这台机器")
+    return _pair_ticket(request)
 
 
 @router.post("/pair/phone")
@@ -3638,6 +3728,86 @@ def phone_pair_issue(request: Request, _auth=Depends(optional_auth)):
             "addresses": netguard.local_addresses(),
             "pairString": "echo://phone?host=%s&code=%s" % (base.split("://", 1)[-1],
                                                             issued["code"])}
+
+
+@router.post("/pair/phone/claim/v2")
+def phone_pair_claim_v2(body: PhoneClaimV2In, request: Request):
+    """方案 B：加密 claim → ECHO 解出配对码/设备公钥 → 加密返回手机 token。
+
+    relay 看到的是 `{nonce, ephPub, iv, ciphertext}`，看不到配对码、设备名或返回的
+    token。响应同样用 ECDH 派生密钥加密，只有手机能解。
+    """
+    try:
+        data, response_key = e2e.decrypt_claim(body.model_dump())
+    except Exception as exc:
+        # 不把内部细节（nonce、曲线错误）原样暴露给未认证调用方。
+        raise HTTPException(status_code=403, detail="配对请求无效或已过期，请重新扫码") from exc
+
+    code = str(data.get("code") or "")
+    name = str(data.get("deviceName") or body.name or "mobile").strip() or "mobile"
+    device_pub = str(data.get("devicePublicKey") or "")
+    ok, why = phone_pair.claim(code)
+    if not ok:
+        raise HTTPException(status_code=403, detail=why)
+    row = db.add_api_key_row(name, scopes=["device"])
+    try:
+        e2e.remember_device(e2e.device_id_for(device_pub), device_pub, name)
+    except Exception:
+        pass
+    payload = {
+        "ok": True,
+        "token": row.get("token", ""),
+        "keyId": row.get("id"),
+        "name": row.get("name", name),
+        "baseUrl": _phone_base_url(request),
+        "echoPublicKey": e2e.identity_public(),
+        "deviceId": e2e.device_id_for(device_pub),
+        "note": "令牌只出现这一次；请手机存进安全存储",
+    }
+    # ECHO 已和后端配对，直接替手机申请一个 tts 委托 token；
+    # 后端 token 不经过手机→后端的配对。失败不影响 ECHO 手机配对本身。
+    try:
+        device_id = e2e.device_id_for(device_pub)
+        from app.capabilities.echo_server import client_from_settings
+        client = client_from_settings()
+        if client is not None:
+            delegated = client.delegate_tts(device_pub, subject=device_id)
+            payload["tts"] = {
+                "baseUrl": str(getattr(client, "base_url", "") or ""),
+                "token": delegated.get("token", ""),
+                "expiresIn": delegated.get("expiresIn"),
+                "jkt": delegated.get("jkt", ""),
+            }
+            try:
+                from app.capabilities import credentials
+                creds = credentials.load()
+                if creds is not None:
+                    payload["tts"]["tlsPin"] = str(creds.cert_fingerprint or "")
+            except Exception:
+                pass
+    except Exception:
+        # 后端没配对/离线/没有 tts scope：手机仍可用 ECHO token 走现有路径。
+        payload["tts"] = None
+    return e2e.encrypt_response(response_key, payload)
+
+
+@router.delete("/pair/phone/device/{device_id}")
+def phone_pair_revoke_device(device_id: str, _auth=Depends(optional_auth)):
+    """撤销方案 B 设备身份：删除 ECHO 侧设备公钥记录，并让后端撤销其 TTS token。
+
+    之后再拿这台设备的旧 E2E 信封会解不开（`get_device` 查不到）；手机 token 的
+    撤销仍走 `DELETE /api/keys/{id}`。三步一起做才是完整撤销。
+    """
+    ok = e2e.forget_device(device_id)
+    revoked_tts = False
+    try:
+        from app.capabilities.echo_server import client_from_settings
+        client = client_from_settings()
+        if client is not None:
+            revoked_tts = bool(client.revoke_tts(device_id))
+    except Exception:
+        revoked_tts = False
+    return {"ok": bool(ok), "deviceId": device_id, "ttsRevoked": revoked_tts}
 
 
 @router.post("/pair/phone/claim")

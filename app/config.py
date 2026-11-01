@@ -583,11 +583,12 @@ DEFAULTS = {
     # 历史上有第二个开关 providerTts（能力 provider 卡片上的 TTS 下拉），两者重复且会互相打架
     # （配了 providerTts 时 ttsEngine=off 关不掉朗读）→ 2026-09-19 弃用 providerTts。
     "ttsEngine":       dict(value="auto", grp="voice", sub="speech", label="语音合成引擎",
-                            description="朗读与提示语用哪个实现，四选一："
+                            description="朗读与提示语用哪个实现，五选一："
                                         "auto=优先 edge-tts（★微软在线，文本会发往 speech.platform.bing.com），"
-                                        "不可用时降级本机离线合成；edge-tts=只走在线；"
+                                        "不可用时降级本机离线合成；edge-tts=PC 本地直连在线；"
+                                        "echo-server=走能力后端的 edge-tts（手机/ECHO 共用，后端统一升级）；"
                                         "离线引擎（Windows SAPI / macOS say）=全离线、音色略差；off=关闭朗读",
-                            value_type="str", options=["auto", "edge-tts", "sapi", "off"]),
+                            value_type="str", options=["auto", "edge-tts", "echo-server", "sapi", "off"]),
     "voiceConfirm":    dict(value=True, grp="voice", sub="speech", label="语音复述确认",
                             description="发送前朗读一遍识别到的命令", value_type="bool"),
     "voiceBrief":      dict(value=True, grp="voice", sub="speech", label="语音简报",

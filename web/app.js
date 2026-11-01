@@ -2063,7 +2063,7 @@ const SET_UNITS = {
    （老库里的值由 `config.RETIRED_VALUE_FALLBACKS` 折成 sherpa）。
    2026-09-29：`meetingSttModel` 那一行也删了（键已废弃、面板不再有它的下拉）。 */
 const SET_OPT_LABELS = {
-  ttsEngine: { auto: "自动", "edge-tts": "在线", sapi: "本机离线", say: "本机离线",
+  ttsEngine: { auto: "自动", "edge-tts": "在线", "echo-server": "能力后端", sapi: "本机离线", say: "本机离线",
     espeak: "本机离线", off: "关闭" },
   panelOpenMode: { sidebar: "边条", app: "独立应用", browser: "浏览器" },
   capabilityPrivacy: { none: "不出机", lan: "内网", wan: "出网" },
@@ -2299,6 +2299,7 @@ function capTtsCurrentName() {
   const engine = String((settingByKey("ttsEngine") || {}).value || "auto");
   if (engine === "off") return "已关闭朗读";
   if (engine === "edge-tts") return "edge-tts（微软在线）";
+  if (engine === "echo-server") return "能力后端（edge-tts）";
   if (engine === "auto") return "自动（优先 edge-tts）";
   return "本机离线合成（" + engine + "）";
 }
@@ -4465,9 +4466,14 @@ function phoneCardInner() {
     out.push(`<div class="snote warn"><span>🌐</span><span>经中继打开标准版网页的入口现在没有：
       ${esc(st.dshWebReason || "DSH 标准版没有在运行")}</span></div>`);
   }
-  // ② 配对码
+  // ② 配对码 / 方案 B 二维码
   const pend = st.pending || {};
-  out.push(`<div class="phone-pair">
+  const qr = st.qrPng ? `<div style="margin:10px 0;text-align:center">
+      <img alt="ECHO 配对二维码" src="data:image/png;base64,${st.qrPng}"
+           style="width:min(220px,80%);image-rendering:pixelated;background:#fff;padding:8px;border-radius:8px">
+      <div class="muted" style="font-size:12px">手机扫描二维码（含 ECHO 公钥；不经过后端）</div>
+    </div>` : "";
+  out.push(`${qr}<div class="phone-pair">
       <div class="phone-code" id="phoneCode">${esc(pend.code || "‒‒‒‒‒‒")}</div>
       <div class="phone-pair-side">
         <div class="muted" id="phoneCodeMeta" style="font-size:12px">${
@@ -4475,7 +4481,7 @@ function phoneCardInner() {
         <button class="btn" data-phone-issue="1"${st.bindMode === "lan" ? "" : " disabled"}>生成配对码</button>
       </div>
     </div>
-    <div class="muted" style="font-size:12px">在设备上输入这 6 位数字兑换（手表不扫码也能用）。
+    <div class="muted" style="font-size:12px">手机扫码，或在设备上输入这 6 位数字兑换。
       码<b>只能用一次</b>，5 分钟内有效；错了太多次会暂时锁住。</div>`);
   // ③ 已配设备
   const keys = _phoneKeys || [];
@@ -4490,6 +4496,19 @@ function phoneCardInner() {
         <span class="spacer"></span>
         <button class="btn mini" data-phone-revoke="${esc(k.id)}">撤销</button>
       </div>`).join(""));
+  }
+  // ③b 方案 B 的 E2E 设备身份（公钥记录；和上面的 API key 是两件事）
+  const devs = st.devices || [];
+  if (devs.length) {
+    out.push(`<div class="ssub-h" style="margin-top:10px"><span>E2E 设备身份（${devs.length}）</span></div>`);
+    out.push(devs.map((d) => `<div class="phone-dev">
+        <span class="phone-dev-name">${esc(d.name || "未命名")}</span>
+        <span class="muted">${d.pairedAt ? "配对于 " + esc(new Date(d.pairedAt * 1000).toLocaleString()) : ""}</span>
+        <span class="spacer"></span>
+        <button class="btn mini" data-phone-device-revoke="${esc(d.id)}">撤销身份</button>
+      </div>`).join(""));
+    out.push(`<div class="muted" style="font-size:12px">撤销身份会删除 ECHO 侧设备公钥；
+      手机 token 的撤销仍在上面「已配设备」里单独做。</div>`);
   }
   return out.join("");
 }
@@ -4536,13 +4555,22 @@ async function loadPhoneCard() {
 async function doPhoneIssue(btn) {
   if (btn) btn.disabled = true;
   try {
-    const r = await post("/api/pair/phone", {});
+    let r;
+    try {
+      r = await post("/api/pair/phone/ticket", {});
+    } catch (e) {
+      // 先按方案 B 生成二维码；老服务端没有 ticket 端点时退回 6 位码。
+      r = await post("/api/pair/phone", {});
+      r.ok = true;
+    }
     _phoneState = Object.assign({}, _phoneState || {}, {
       baseUrl: r.baseUrl || (_phoneState || {}).baseUrl || "",
       pending: { code: r.code, secondsLeft: r.ttlSeconds, expiresAt: r.expiresAt },
+      ticket: r.ticket || "",
+      qrPng: r.qrPng || "",
     });
     _phoneError = "";
-    toast("配对码已生成，5 分钟内有效");
+    toast(r.qrPng ? "配对二维码已生成，5 分钟内有效" : "配对码已生成，5 分钟内有效");
   } catch (err) {
     toast(_errText(err));
   }
@@ -4561,12 +4589,26 @@ async function doPhoneRevoke(id) {
   await loadPhoneCard();
 }
 
+async function doPhoneDeviceRevoke(id) {
+  if (!window.confirm("撤销这台设备的 E2E 身份？撤销后它的加密请求会解不开，需要重新扫码配对。")) return;
+  try {
+    const r = await api("/api/pair/phone/device/" + encodeURIComponent(id), { method: "DELETE" });
+    toast(r && r.ttsRevoked ? "已撤销 E2E 设备身份和后端 TTS token"
+                            : "已撤销 E2E 设备身份（后端 TTS token 未确认撤销）");
+  } catch (err) {
+    toast("撤销失败：" + _errText(err));
+  }
+  await loadPhoneCard();
+}
+
 /* 三个按钮的委托（重绘后不用重绑；与设置区其它按钮同一套做法）。 */
 document.addEventListener("click", async (e) => {
   const issue = e.target.closest("[data-phone-issue]");
   if (issue) { await doPhoneIssue(issue); return; }
   const revoke = e.target.closest("[data-phone-revoke]");
   if (revoke) { await doPhoneRevoke(revoke.dataset.phoneRevoke); return; }
+  const deviceRevoke = e.target.closest("[data-phone-device-revoke]");
+  if (deviceRevoke) { await doPhoneDeviceRevoke(deviceRevoke.dataset.phoneDeviceRevoke); return; }
   const refresh = e.target.closest("[data-phone-refresh]");
   if (refresh) { await loadPhoneCard(); return; }
 });

@@ -159,6 +159,10 @@ SERVER_CODE_TO_REASON: Dict[str, str] = {
     "gpu_oom": "error",
     "inference_timeout": "error",
     "auth_misconfigured": "error",
+    # 2026-10-31 TTS 通道
+    "tts_text_invalid": "error",     # 文本/voice/rate 不合法，改请求再来
+    "tts_failed": "error",           # edge 上游失败，可换/退避
+    "tts_unavailable": "offline",    # 后端关 TTS / 没装 edge-tts
 }
 
 #: 服务端错误码 → **能不能重试**。与 `SERVER_CODE_TO_REASON` 是两个问题，别合并。
@@ -183,6 +187,10 @@ SERVER_CODE_RETRY: Dict[str, bool] = {
     "unsupported_media": False,
     "inference_timeout": False,
     "auth_misconfigured": False,  # 服务端自己的问题，客户端报给运营
+    # 2026-10-31 TTS 通道
+    "tts_text_invalid": False,    # 改文本/voice/rate，不是重试
+    "tts_failed": True,           # edge 上游抖动，退避可再试
+    "tts_unavailable": False,     # 后端关闭/没装依赖，重试无用
 }
 
 

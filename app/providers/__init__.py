@@ -147,7 +147,7 @@ def tts_engine():
 
 
 #: ttsEngine 取值 -> 对应 provider id；`off` = 关闭朗读（不选任何实现）
-_TTS_ENGINE_TO_PROVIDER = {"edge-tts": "edge-tts", "off": ""}
+_TTS_ENGINE_TO_PROVIDER = {"edge-tts": "edge-tts", "echo-server": "capability-tts", "off": ""}
 
 
 def _tts_active_id():

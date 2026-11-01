@@ -91,6 +91,26 @@ class LocalTtsProvider(TtsProvider):
             return False
 
 
+class CapabilityTtsProvider(TtsProvider):
+    """能力后端 TTS（edge-tts 在后端一份；文本经后端发往微软）。"""
+
+    id = "capability-tts"
+
+    def ready(self):
+        try:
+            from app.capabilities.echo_server import client_from_settings
+            return client_from_settings() is not None
+        except Exception:
+            return None
+
+    def speak(self, text, timeout=60, **kw):
+        try:
+            from app.audio import tts
+            return bool(tts.speak(text, "echo-server", timeout))
+        except Exception:
+            return False
+
+
 class EdgeTtsProvider(TtsProvider):
     """在线朗读（微软 edge-tts）：音质好，但**被朗读的文本会出网**。"""
 
@@ -143,3 +163,11 @@ def register_builtin():
         purpose="音质更自然的中文朗读；断网时自动回退离线朗读",
         details={"setting": "ttsEngine", "engine": "edge-tts"}),
         EdgeTtsProvider)
+    P.register(P.ProviderSpec(
+        id=CapabilityTtsProvider.id, kind="tts", name="能力后端（edge-tts）",
+        source="online", egress=True,
+        egress_note="文本先发到配置的能力后端，再由后端发往微软 edge-tts；"
+                    "后端统一升级 edge-tts，手机/ECHO 不各自装一份",
+        purpose="手机和 ECHO 共用同一条 TTS 通道；后端不可用时回退本机离线朗读",
+        details={"setting": "ttsEngine", "engine": "echo-server"}),
+        CapabilityTtsProvider)

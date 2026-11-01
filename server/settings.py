@@ -101,6 +101,18 @@ DEFAULTS: Dict[str, Any] = {
         # 否则就是设计 §7.2 里那句"没有执行者的话"。
         "daily_audio_minutes": 0,
     },
+    "tts": {
+        # 2026-10-31：能力后端新增 edge-tts 通道。手机和 ECHO 都直接调它，
+        # edge-tts 只在这里升级一次（不再依赖客户端各自装的版本）。
+        "enabled": True,
+        "voice": "zh-CN-XiaoxiaoNeural",
+        "rate": "+0%",
+        # **每个认证 client 1 QPS**（手机和 ECHO 是不同 client，各自计数）。
+        # 0 = 关闭 TTS 限速（运维保险；默认 1，按用户口径）。
+        "per_second": 1.0,
+        "max_chars": 2000,
+        "timeout_s": 15.0,
+    },
     "calls": {
         # 调用元数据（设计 §7.3）的异步写入参数。
         # `flush_interval_s` 是"最多憋多久"：请求路径上只做 put_nowait，后台线程攒批写。

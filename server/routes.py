@@ -24,9 +24,11 @@ from typing import Optional
 
 from fastapi import APIRouter, Request
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 
 from server import __version__, audio as audio_mod, calls as calls_mod, errors, quota, tmp
+from server import tts as tts_mod, dpop
+from server import delegation
 from server.pool import EnginePool
 
 router = APIRouter(prefix="/v1")
@@ -180,6 +182,11 @@ class State:
         # 每日音频分钟数（设计 §7.2）。**进程内计数**：每请求查库会把库变成瓶颈，
         # 而配额判断正好在每个请求的最前面。代价（多实例各算一份）写在 quota.py 开头。
         self.quota = quota.open_ledger(cfg, limit_for=self._quota_limit_for)
+        # TTS 的独立限速：**按 client_id 1 QPS**，与上面的 GPU Admission 完全无关。
+        # 手机和 ECHO 用不同 client，因此各自独立计数；鉴权关闭时都是 anonymous，
+        # 会共用同一条计数（要分开就必须开鉴权，见 tts.py 的说明）。
+        self.tts_limiter = tts_mod.TtsRateLimiter(
+            per_second=float(cfg.get("tts.per_second", 1.0) or 0.0))
 
     def _quota_limit_for(self, client_id: str) -> float:
         """这个客户端的专属上限（分钟）；0/取不到 = 用全局默认。
@@ -260,6 +267,9 @@ ENDPOINT_SCOPES = {
     "/v1/asr": "asr",
     "/v1/diarize": "diarize",
     "/v1/speaker/embed": "embed",
+    "/v1/tts": "tts",
+    "/v1/delegate": "tts",
+    "/v1/delegate/revoke": "tts",
 }
 
 
@@ -517,6 +527,133 @@ def _finish_asr(engine, wav: str, lang: str, timestamps: bool, model_id: str,
         "audioSeconds": round(seconds, 2),
         "durationMs": int((time.time() - t0) * 1000),
     }
+
+
+@router.post("/delegate")
+async def delegate(request: Request):
+    """ECHO 为手机签发**绑定设备公钥**的 TTS token。
+
+    手机不需要单独配能力后端：ECHO 已和后端配对，由 ECHO 作委托方。
+    这里只接受**普通客户端 token**（ECHO），不接受手机自己的 delegated token
+    （否则一台手机可以无限转委托）。手机 token 只含 tts scope，且必须配合
+    设备私钥签的 DPoP proof 才能调 `/v1/tts`。
+    """
+    st = _st(request)
+    who = client_of(request, need_scope="tts")
+    if who.get("delegated"):
+        raise errors.forbidden("委托 token 不能再次委托")
+    if st.auth is None:
+        raise errors.forbidden("后端未启用鉴权，不能签发委托 token")
+    try:
+        body = await request.json()
+    except Exception:
+        raise errors.bad_request("请求体必须是 JSON") from None
+    if not isinstance(body, dict):
+        raise errors.bad_request("请求体必须是 JSON 对象")
+    try:
+        device_b64, jkt = dpop.validate_device_public_key(
+            str(body.get("devicePublicKey") or ""))
+    except Exception as exc:
+        raise errors.bad_request("devicePublicKey 不是有效的 P-256 公钥：%s" % exc) from None
+    subject = str(body.get("subject") or jkt[:24]).strip() or jkt[:24]
+    ttl = int(body.get("ttlSeconds") or 3600)
+    token, expires_in = st.auth.issue_delegated(
+        who, subject, jkt, scope="tts", ttl_s=ttl)
+    return {
+        "ok": True,
+        "token": token,
+        "expiresIn": expires_in,
+        "subject": subject,
+        "scope": "tts",
+        "devicePublicKey": device_b64,
+        "jkt": jkt,
+    }
+
+
+@router.post("/delegate/revoke")
+async def delegate_revoke(request: Request):
+    """撤销某台手机的委托 TTS token（ECHO 调用；按 subject/deviceId）。"""
+    who = client_of(request, need_scope="tts")
+    if who.get("delegated"):
+        raise errors.forbidden("委托 token 不能撤销委托")
+    try:
+        body = await request.json()
+    except Exception:
+        raise errors.bad_request("请求体必须是 JSON") from None
+    subject = str((body or {}).get("subject") or "").strip()
+    if not subject:
+        raise errors.bad_request("缺少 subject（deviceId）")
+    delegation.revoke(subject)
+    return {"ok": True, "subject": subject}
+
+
+@router.post("/tts")
+async def tts(request: Request):
+    """文本 → MP3（edge-tts），**不占 GPU / ASR 通道**。
+
+    这是 2026-10-31 用户明确要求的新通道：手机和 ECHO 都直接调后端，
+    edge-tts 只在后端升级一次；每个认证 client 1 QPS，手机/ECHO 分开计数。
+
+    刻意**不调用** `st.admission` / `st.quota` / `st.pool`：TTS 是网络 IO，
+    让它去挤 ASR 的两级闸门，会造出“念一句话把转写通道占掉一半”的怪状态。
+    限速只在这个端点自己的 `tts_limiter` 里，返回 429 + `Retry-After: 1`。
+    """
+    st = _st(request)
+    if not bool(st.cfg.get("tts.enabled", True)):
+        raise errors.tts_unavailable("后端配置关闭了 tts.enabled")
+
+    # 先认证（也把 client_id 定下来）。401/403 在读 body 之前发生。
+    who = client_of(request, need_scope="tts")
+    cid = str(who.get("client_id") or "anonymous")
+    if who.get("delegated"):
+        # 手机 token：必须证明自己持有 cnf.jkt 对应的设备私钥。
+        raw_auth = str(request.headers.get("authorization") or "")
+        token = raw_auth[7:].strip() if raw_auth.lower().startswith("bearer ") else ""
+        dpop.verify(request, token, dict(who.get("cnf") or {}))
+    note_call(request, clientId=cid)
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise errors.tts_text_invalid("请求体必须是 JSON：{\"text\": \"...\"}") from None
+    if not isinstance(body, dict):
+        raise errors.tts_text_invalid("请求体必须是 JSON 对象")
+
+    max_chars = int(st.cfg.get("tts.max_chars", tts_mod.DEFAULT_MAX_CHARS) or
+                    tts_mod.DEFAULT_MAX_CHARS)
+    try:
+        text = tts_mod.validate_text(body.get("text", ""), max_chars=max_chars)
+        voice = tts_mod.validate_voice(
+            body.get("voice") or str(st.cfg.get("tts.voice", tts_mod.DEFAULT_VOICE) or ""))
+        rate = tts_mod.validate_rate(
+            body.get("rate") or str(st.cfg.get("tts.rate", tts_mod.DEFAULT_RATE) or ""))
+    except tts_mod.TtsInputError as exc:
+        raise errors.tts_text_invalid(str(exc)) from None
+
+    # **1 QPS，按 client_id 单独算**。手机/ECHO 的 client 不同，因此互不影响。
+    st.tts_limiter.check(cid)
+
+    timeout = float(st.cfg.get("tts.timeout_s", tts_mod.DEFAULT_TIMEOUT_S) or
+                    tts_mod.DEFAULT_TIMEOUT_S)
+    try:
+        data = await tts_mod.synthesize(text, voice=voice, rate=rate, timeout=timeout)
+    except tts_mod.TtsInputError as exc:
+        raise errors.tts_text_invalid(str(exc)) from None
+    except tts_mod.TtsUnavailable as exc:
+        raise errors.tts_unavailable(str(exc)) from None
+    except tts_mod.TtsError as exc:
+        raise errors.tts_failed(str(exc)) from None
+
+    return Response(
+        content=data,
+        media_type="audio/mpeg",
+        headers={
+            "Cache-Control": "no-store",
+            "X-Echo-Tts-Engine": "edge-tts",
+            "X-Echo-Tts-Voice": voice,
+            "X-Echo-Tts-Rate": rate,
+        },
+    )
 
 
 @router.post("/asr")

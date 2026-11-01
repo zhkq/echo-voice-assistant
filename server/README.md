@@ -42,7 +42,7 @@ python scripts/smoke-echo-backend.py --skip-inference      # 只跑查询与拒�
 - **查询**：`/v1/health`（含临时目录统计与并发快照）、`/v1/ready`、`/v1/capabilities`
   （槽、`limits`、`vectorSpaceId` 只有一个 —— 铁律 L5）
 - **能力**：`/v1/asr`（冷/热两次，看真实延迟）、`timestamps` 只报 `exact|none`、
-  `/v1/diarize`、`/v1/speaker/embed`
+  `/v1/diarize`、`/v1/speaker/embed`、`/v1/tts`（edge-tts；不占 GPU，按 client 1 QPS）
 - **拒绝路径**：空 body→400、错 Content-Type→415、声报超限→413、
   不存在的模型→404、`mode=turns`→400
 - **并发闸门**：同一身份两路 → 恰好一路 `409 client_busy`
