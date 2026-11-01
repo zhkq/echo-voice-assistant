@@ -42,6 +42,20 @@ class E2ETest {
     }
 
     @Test
+    fun sessionKeyMatchesPythonFixture() {
+        // 与 Python app/e2e.py 相同的 P-256/HKDF 参数；任何一侧改字段/盐都会红。
+        val priv =
+            "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgw7X5OkYRaX8TgAgxlZQBO7rYU1K8GjwyHwanntHliS-hRANCAAQny2Ej1mfYHITo1D8HqMQz0cmKrm1S-ynwIvXwRJ8l_-KNjFendiW7LXPUP9Oz4lFA5xUtDc8GFffJhwkJADKn"
+        val echoPub =
+            "BLrAvAE4Ha3Xc60u3xVgGRCT7oj0TY2f1Uc81pwvx5zg2qkL9yNhM1uYzaEHJGLN3a0ixwSvrTBSBgG9T5-ytf8"
+        val key = E2E.sessionKey(E2E.privateFromStorage(priv), echoPub, "rs7eqlE8o10N8-ZCdI5TJsLggePAd6yZ")
+        assertEquals(
+            "07c9a4fc1411a6bfb40a6941f31beeb4ff525f725fce02860f56d70d40a3cdc4",
+            key.joinToString("") { "%02x".format(it) },
+        )
+    }
+
+    @Test
     fun dpopProofHasJoseShape() {
         val key = E2E.newKeyPair()
         val proof = E2E.dpopProof(key, "access-token", "/v1/tts")
