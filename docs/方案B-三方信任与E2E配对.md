@@ -250,9 +250,10 @@ environment:
 这验证了**二维码 ticket → 设备密钥加密 claim → ECHO 解密 → 加密返回 token → token 可用**，
 不只停留在单测。
 
-⚠️ **本机 dev/稳定版 ECHO 还没换新代码**：当前 8970 运行的是 `D:\ECHO` 稳定版（旧 app）。
-新 app 代码在 `C:\echo-dev`，需要按用户指令走 `deploy-stable.ps1` 或 dev 启动流程后才会加载
-`/api/pair/phone/ticket`；在这之前手机端扫码入口在真实 ECHO 上仍是 404。
+⚠️ **稳定版已部署**（2026-11-01 12:03，`deploy-stable.ps1 -Restart`）：
+- 稳定版 runtime 补装 `qrcode 8.2 + Pillow 13`；
+- 8970 重启后 3 秒恢复；
+- 真实 ticket/claim/relay/E2E/TTS 已实测，见 §11。
 
 回滚远端：
 ```bash
@@ -260,3 +261,22 @@ cd /home/zysk/echo/backend
 cp compose.yaml.bak-schemeB-<时间> compose.yaml
 docker compose up -d --force-recreate backend
 ```
+
+## 11. 稳定版真实链路实测（2026-11-01 12:05）
+
+稳定版 `D:\ECHO` 部署新 app 后，用 Python 模拟手机走真实链路：
+
+- `POST /api/pair/phone/ticket` → 200（真实 relay 地址 + QR PNG + 后端 TLS pin）；
+- 经真实 relay `POST /api/pair/phone/claim/v2` → **200**；
+- 手机侧解密响应，拿到 `token`、`deviceId`、`tts` 委托 token；
+- 经真实 relay `POST /api/e2e`（E2E 信封，含 id/ts/手机 token）→ **200**，
+  解出的内层 `GET /api/status` 为 200；
+- 用委托 token + DPoP 直连远端 `/v1/tts` → **200 audio/mpeg 19584 B**；
+- ECHO 自身 `ttsEngine=echo-server` 后 `POST /api/tts` → **200 audio/mpeg 16704 B**；
+- 测试设备/API key 已撤销，`DELETE /api/pair/phone/device/{id}` 返回
+  `ttsRevoked=true`，设备身份列表回到 0。
+
+这说明：
+- 配对、常规 API E2E、后端委托、DPoP、ECHO 自身 TTS 都已在真实 8970 + 远端后端上跑通；
+- 唯一未做的是**真实 Android 手机安装 APK 并扫码**（没有可用设备/模拟器）。
+
