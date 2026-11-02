@@ -1423,6 +1423,13 @@ body.on-history { height: 100vh; overflow-y: hidden; }
 .snote { display: flex; gap: 6px; border-radius: 6px; padding: 6px 7px; font-size: 11px;
   margin-top: 6px; border: 1px solid var(--border); color: var(--muted); line-height: 1.55;
   min-width: 0; overflow-wrap: anywhere; }
+/* 2026-11-02（用户："这个展示很占地，只保留状态，提示隐起来悬浮展示"）：
+   会议录音的"已确认 / 进行中"提示收成一枚可悬停的小图标（完整话在 title 里）。
+   不占一行、不带底色边框 —— 状态行仍然是「未在录音 / 录音中 · HH:MM 开始」。 */
+.snote.snote-inline { display: inline-flex; align-items: center; gap: 0; margin: 2px 0 0;
+  padding: 0; border: 0; background: none; color: var(--muted); font-size: 12px;
+  line-height: 1; cursor: help; }
+.snote.snote-inline:hover { color: #cfe2ff; }
 .snote.info { background: rgba(79,140,255,.08); border-color: #2a4a78; color: #cfe2ff; }
 .snote.warn { background: rgba(230,184,76,.08); border-color: #5d4a24; color: #f0dcae; }
 .snote.err { background: rgba(239,91,91,.08); border-color: #5a2f34; color: #f0a0a0; }

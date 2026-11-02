@@ -207,7 +207,13 @@ function meetingSideColumn(anchor) {
  *
  *  为什么自己建节点：`web/index.html` 与 `web/app.css` 不在这次改动的允许清单里 ——
  *  确认框本来就是这个方式（JS 动态建），这里保持一致。
- *  `kind`：`info`（进行中/已确认）· `warn`（取消，仍在录音）· `err`（失败 / 状态没变）。 */
+ *  `kind`：`info`（进行中/已确认）· `warn`（取消，仍在录音）· `err`（失败 / 状态没变）。
+ *
+ *  ⚠️ 2026-11-02（用户："这个展示很占地，只保留状态，提示隐起来悬浮展示"）：
+ *  `info` 那类（"已确认：服务端已停止录音（正在转写）"等）**不再铺一整块**，
+ *  只留一枚可悬停的小图标 `ⓘ`（完整话在 `title`，点一下用 toast 再念一遍）；
+ *  `warn` / `err` 仍然整块显示 —— 那两类是"需要你动手"的话，藏起来会耽误事。
+ */
 function meetingNote(msg, kind = "info", btn = null) {
   const anchor = btn || $("#btnMeeting") || $("#btnMeetingFromList");
   // 落点：仪表盘 = 按钮右侧那一列（时间下面）；会议列表 = 标题行之后
@@ -233,10 +239,28 @@ function meetingNote(msg, kind = "info", btn = null) {
     document.body.appendChild(note);
   }
   const icon = kind === "info" ? "ⓘ" : "⚠";
-  note.className = "snote " + (kind === "err" ? "err" : kind === "warn" ? "warn" : "info");
-  note.style.fontSize = "12.5px";        // `.snote` 默认 11px：这是要人看清的话，放大一档
-  note.style.whiteSpace = "pre-wrap";
-  note.innerHTML = `<span>${icon}</span><span>${esc(msg)}</span>`;
+  // 2026-11-02（用户："这个展示很占地，只保留状态，提示隐起来悬浮展示"）：
+  //   info  → 收成一枚小图标：不占一行、完整话进 title（悬停可见），点一下 toast 再念一遍；
+  //   warn/err → 仍整块显示（要人动手的话不能藏）。
+  const compact = (kind !== "err" && kind !== "warn");
+  note.className = "snote " + (kind === "err" ? "err" : kind === "warn" ? "warn" : "info")
+                   + (compact ? " snote-inline" : "");
+  // 同一个节点在两种形态间复用：先把上一次留下的内联样式清干净（否则图标会带着整块的底色/边框）
+  for (const k of ["display", "alignItems", "padding", "margin", "border", "background",
+                   "fontSize", "lineHeight", "color", "cursor", "whiteSpace"]) {
+    note.style[k] = "";
+  }
+  if (compact) {
+    note.innerHTML = `<span aria-hidden="true">${icon}</span>`;
+    note.title = msg;                 // ← 悬停看完整提示（用户要的"隐起来悬浮展示"）
+    note.onclick = () => { try { toast(msg, 7000); } catch (_) {} };  // 触屏没有 hover：点一下也能看
+  } else {
+    note.style.fontSize = "12.5px";   // `.snote` 默认 11px：这是要人看清的话，放大一档
+    note.style.whiteSpace = "pre-wrap";
+    note.innerHTML = `<span>${icon}</span><span>${esc(msg)}</span>`;
+    note.title = "";
+    note.onclick = null;
+  }
   note.classList.remove("hidden");
   return note;
 }
