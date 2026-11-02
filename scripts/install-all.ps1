@@ -626,6 +626,100 @@ function Test-EchoApi([int]$Port, [string]$Path = '/api/status', [int]$TimeoutSe
     } catch { return $false }
 }
 
+# ---------------------------------------------------------------- 升级：基础依赖对账
+# 2026-11-02 同事升级事故（本机复现）：11-01 的包给启动链加了**新的硬依赖**
+# `cryptography`（app/main.py → app/api.py → app/e2e.py 顶层 import），而升级路径
+# 按设计**不装依赖**（组件那步 -SkipPip；install.ps1 见 runtime-core 已存在也直接
+# return）。旧装机的 runtime-core 里没有这个包 → `python -m app.main` 启动瞬间
+# ModuleNotFoundError → 端口永不监听 → 安装器空等 90 秒后只报一句"本实例没起来"。
+# 所以升级时**必须对一次账**：缺什么补什么（幂等；齐全时只花一次 import 探测的时间）。
+$script:CoreImportNames = @(
+    'fastapi', 'uvicorn', 'pydantic', 'httpx', 'yaml', 'multipart',
+    'numpy', 'sounddevice', 'soundfile', 'soxr', 'cryptography'
+)
+
+function Get-EchoUpgradePython {
+    foreach ($p in @(
+        (Join-Path $script:TargetRoot 'runtime-core\Scripts\python.exe'),
+        (Join-Path $script:TargetRoot 'runtime-core\python.exe'),
+        (Join-Path $script:TargetRoot 'venv\Scripts\python.exe'))) {
+        if (Test-Path -LiteralPath $p) { return $p }
+    }
+    return ''
+}
+
+# 返回逗号分隔的缺失模块名；探测本身失败返回 '__probe_error__'
+function Get-MissingCoreModules([string]$Py) {
+    $modsLiteral = '[' + (($script:CoreImportNames | ForEach-Object { "'{0}'" -f $_ }) -join ', ') + ']'
+    $probe = "import importlib.util`nmods = $modsLiteral`nmissing = []`nfor m in mods:`n    try:`n        if importlib.util.find_spec(m) is None:`n            missing.append(m)`n    except Exception:`n        missing.append(m)`nprint(','.join(missing))`n"
+    $tmp = Join-Path $env:TEMP ('echo-dep-probe-' + [guid]::NewGuid().ToString('N') + '.py')
+    try {
+        Set-Content -LiteralPath $tmp -Value $probe -Encoding ASCII
+        $r = Invoke-Native $Py @($tmp)
+        if ($r.code -ne 0) {
+            Warn ('依赖探测失败（退出码 {0}）：{1}' -f $r.code, $r.out)
+            return '__probe_error__'
+        }
+        return $r.out.Trim()
+    } finally {
+        Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Sync-CoreDeps {
+    $py = Get-EchoUpgradePython
+    if (-not $py) { Warn '升级：没找到运行时 python（runtime-core / venv）—— 跳过依赖对账'; return }
+    $req = Join-Path $script:CoreDir 'requirements-core.txt'
+    if (-not (Test-Path -LiteralPath $req)) {
+        Warn ('升级：主程序里没有 requirements-core.txt（{0}）—— 跳过依赖对账' -f $req)
+        return
+    }
+    $missing = Get-MissingCoreModules $py
+    if ($missing -eq '__probe_error__') { return }
+    if (-not $missing) {
+        Ok '升级：基础依赖齐全（含新加的 cryptography）'
+        Log 'DEPS' '基础依赖齐全'
+        return
+    }
+    Warn ('升级：运行时缺基础依赖 [{0}] —— 补装 requirements-core.txt' -f $missing)
+    Log 'DEPS' ('缺依赖：' + $missing)
+    $pipArgs = @('-m', 'pip', 'install', '-r', $req)
+    if ($Offline) {
+        $wheels = ''
+        if ($script:Bundle) { $wheels = Join-Path $script:Bundle 'wheels' }
+        if ($wheels -and (Test-Path -LiteralPath $wheels)) {
+            $pipArgs += @('--no-index', '--find-links', $wheels)
+            Info ('离线补装：--no-index --find-links {0}' -f $wheels)
+        } else {
+            Warn ('离线模式但没找到 wheels：{0}' -f $wheels)
+        }
+    } elseif ($PipIndex) {
+        $pipArgs += @('-i', $PipIndex)
+    }
+    $r = Invoke-Native $py $pipArgs
+    if ($r.out) {
+        $tail = @($r.out -split "`r?`n" | Where-Object { $_.Trim() })
+        $tail = @($tail | Select-Object -Last 12)
+        foreach ($line in $tail) { Write-Host ('      ' + $line) -ForegroundColor DarkGray }
+    }
+    if ($r.code -ne 0) {
+        Err ('基础依赖补装失败（pip 返回 {0}）—— 服务会起不来。' -f $r.code)
+        Err ('  手动补："{0}" -m pip install -r "{1}" -i https://pypi.tuna.tsinghua.edu.cn/simple' -f $py, $req)
+        Err '  离线补：把交付包的 bundle\wheels 指给它：--no-index --find-links <kit>\bundle\wheels'
+        Log 'DEPS' ('补装失败，pip 退出码 ' + $r.code)
+        return
+    }
+    $still = Get-MissingCoreModules $py
+    if ($still -eq '__probe_error__') { return }
+    if ($still) {
+        Err ('补装后仍缺 [{0}] —— 服务会起不来，请按上面的手动命令处理' -f $still)
+        Log 'DEPS' ('补装后仍缺：' + $still)
+    } else {
+        Ok '升级：基础依赖已补齐'
+        Log 'DEPS' '基础依赖已补齐'
+    }
+}
+
 function Start-EchoOwnService {
     # 把**我们自己的**实例拉起来，并把端口钉死给后面的组件脚本。
     #
@@ -637,6 +731,8 @@ function Start-EchoOwnService {
     # 这里改成：只认我们自己的端口文件；服务没起来就自己拉起来；然后把 $env:ECHO_PORT
     # **覆盖**成我们的端口，让组件脚本没有别的选择。
     Step '启动 ECHO 服务（只用我们自己的实例与端口）'
+    # 升级：先对一次"基础依赖账"——新增的硬依赖不补上，服务一定起不来（2026-11-02 事故）
+    if ($script:IsUpgrade) { Sync-CoreDeps }
     $portFile = Join-Path $script:TargetRoot 'data\echo-port.txt'
     $port = 0
     if (Test-Path $portFile) {
@@ -664,6 +760,8 @@ function Start-EchoOwnService {
         }
         for ($i = 0; $i -lt 45; $i++) {
             Start-Sleep -Seconds 2
+            # 每 10 秒报一次进度：原来这里 90 秒一句话都不打，界面上像死机（2026-11-02 反馈）
+            if ((($i + 1) % 5) -eq 0) { Info ("等待服务… {0}/90 秒" -f (($i + 1) * 2)) }
             if (Test-Path $portFile) {
                 try { $port = [int]((Get-Content $portFile -Raw).Trim()) } catch { $port = 0 }
                 if ($port -gt 0 -and (Test-EchoApi $port)) { break }
@@ -672,9 +770,31 @@ function Start-EchoOwnService {
     }
     if ($port -le 0 -or -not (Test-EchoApi $port)) {
         # 到这里说明我们的实例没起来。**不能**让组件脚本自己去猜端口 ——
-        # 猜错就是"设置写进了别人的 ECHO"。如实停下，把下一步写清楚。
+        # 猜错就是"设置写进了别人的 ECHO"。如实停下，并把**真正的原因**摊开：
+        # 2026-11-02 同事升级事故里，这里只给了"看日志"的路径，截图里就像卡死；
+        # 真正的原因是 pythonw 启动即崩（缺 cryptography），日志尾部写得明明白白。
         Err '本实例没起来（端口文件没出现或没响应）—— 停在这里，避免把设置写进别的 ECHO 实例'
-        Err ("  看日志：{0}\data\logs\echo-server.log" -f $script:TargetRoot)
+        foreach ($logName in @('echo-server.log.err', 'echo-server.log')) {
+            $f = Join-Path $script:TargetRoot ('data\logs\' + $logName)
+            if (Test-Path -LiteralPath $f) {
+                $tail = @(Get-Content -LiteralPath $f -Tail 20 -ErrorAction SilentlyContinue)
+                if ($tail.Count -gt 0) {
+                    Err ("  {0} 最后 {1} 行：" -f $logName, $tail.Count)
+                    foreach ($line in $tail) { Write-Host ('      ' + $line) -ForegroundColor DarkRed }
+                }
+            }
+        }
+        try {
+            $coreLower = $script:CoreDir.TrimEnd('\').ToLowerInvariant()
+            $alive = @(Get-CimInstance Win32_Process -Filter "Name='pythonw.exe'" -ErrorAction SilentlyContinue |
+                       Where-Object { $_.CommandLine -and $_.CommandLine.ToLowerInvariant().Contains($coreLower) })
+            if ($alive.Count -gt 0) {
+                Err ("  pythonw 还活着 {0} 个（可能被单实例锁/端口挡住）：pid {1}" -f $alive.Count, (($alive | ForEach-Object { $_.ProcessId }) -join ','))
+            } else {
+                Err '  没有 pythonw 进程：服务进程启动即退出（看上面的 .err 尾部）'
+            }
+        } catch { }
+        Err ("  看日志：{0}\data\logs\echo-server.log / .err" -f $script:TargetRoot)
         Err ("  手动起来：powershell -NoProfile -ExecutionPolicy Bypass -File `"{0}\scripts\start.ps1`"" -f $script:CoreDir)
         Err '  起来之后重跑本命令即可（已装好的会跳过）'
         EndStep '服务'

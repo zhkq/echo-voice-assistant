@@ -1000,6 +1000,21 @@ class UpgradeModeTests(unittest.TestCase):
         self.assertIn("保持现有配置", block)
         self.assertNotIn("Invoke-BackendStep", block)
 
+    def test_it_reconciles_core_deps_before_starting_the_service(self):
+        """2026-11-02 同事升级事故：11-01 的包给启动链加了硬依赖 `cryptography`，
+        而升级路径按设计不装依赖（组件 -SkipPip；install.ps1 见 runtime 已存在直接 return）
+        → `python -m app.main` 启动即 ModuleNotFoundError → 安装器空等 90 秒后只报
+        "本实例没起来"。所以升级**必须**在拉服务之前对一次基础依赖账，并且失败时
+        把服务日志尾部摊开（不许再只有一句"本实例没起来"）。"""
+        self.assertIn("function Sync-CoreDeps", self.text)
+        i_fn = self.text.index("function Start-EchoOwnService")
+        i_call = self.text.index("Sync-CoreDeps", i_fn)
+        i_start = self.text.index("后台启动：", i_fn)
+        self.assertLess(i_call, i_start, "依赖对账必须在拉起服务之前")
+        self.assertIn("requirements-core.txt", self.text)
+        self.assertIn("echo-server.log.err", self.text, "失败分支要打印服务日志尾部")
+        self.assertIn("cryptography", self.text, "探针要覆盖新加的硬依赖")
+
     def test_it_backs_up_the_database_before_overwriting(self):
         self.assertIn(".bak-before-upgrade-", self.text)
         self.assertIn("Backup-UpgradeDatabase", self.text)

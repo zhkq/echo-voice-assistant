@@ -56,6 +56,12 @@ DELIVERY = build_kit.DELIVERY
 PKG_PREFIX = "ECHO-delivery"
 README_TEMPLATE = DELIVERY / "kit-readme-win.md"
 FORWARD = "装我.cmd"
+#: 交付层里那份**运维脚本**（备份/清理/还原、启停、状态体检）的源目录与落点。
+#: 2026-11-02 用户要求："维护脚本也都加进去"。脚本主文件在 `delivery/maintenance/`，
+#: 出包时整目录复制到交付层的 `ECHO-运维/`（同事双击里面的 .cmd 就能用；不参与安装）。
+MAINTENANCE_SRC = DELIVERY / "maintenance"
+MAINTENANCE_DIR = "ECHO-运维"
+MAINTENANCE_ENTRY = "先读我.md"
 
 #: 后端两个 zip 的**文件名模式**：与 `app/backend_fetch.py` 的两组 glob 同源（见 `consumer_globs()`，
 #: 不从那儿 import 是因为出包脚本不该依赖 app 的运行时环境；对不上时自检会说清）。
@@ -272,6 +278,8 @@ def write_manifest(dest: Path, kit: Path, thin: Path | None, offline: Path | Non
                      "那层 ≈3.4 GB），或把 ECHO-backend-offline-*.zip 放进这一层")
     lines += [
         "先读我.md                     就是这份说明的展开版",
+        "%-28s 维护脚本：备份/清理/还原、启停、状态体检（双击里面的 .cmd）"
+        % (MAINTENANCE_DIR + "\\"),
         "",
         "安装最后会问一句「后端（会议转写那台 GPU 机器）怎么来」：",
         "  1) 用别人给的后端 → 贴配对串（echo://pair?host=…&code=…）",
@@ -280,6 +288,7 @@ def write_manifest(dest: Path, kit: Path, thin: Path | None, offline: Path | Non
         "",
         "装完面板地址会在窗口里打印出来（默认 http://127.0.0.1:8970/）。",
         "装的过程中窗口一直开着；出错也不会一闪而过，把那段输出发回来即可。",
+        "升级遇到「服务没起来」时：先跑 ECHO-运维\\7-状态ECHO.cmd 体检（能直接看出缺什么）。",
         "",
     ]
     (dest / "清单.txt").write_text("\n".join(lines), encoding="utf-8")
@@ -377,6 +386,16 @@ def assemble(stamp: str, dist: Path, kit_zip: Path | None = None,
     launcher = DELIVERY / build_kit.KIT_CMD_TEMPLATE
     if not launcher.is_file():
         raise DeliveryError("交付模板不在：%s" % launcher)
+    # 维护脚本（2026-11-02 用户要求「维护脚本也都加进去」）：源目录不在或少了入口文件，
+    # 就在这里响亮地失败 —— 否则同事拿到的是一层"说好了有运维工具、其实没有"的包。
+    if not MAINTENANCE_SRC.is_dir():
+        raise DeliveryError(
+            "维护脚本源目录不在：%s\n     它应当在仓库 `delivery/maintenance/`（备份/清理/还原/启停/状态）。"
+            % MAINTENANCE_SRC)
+    if not (MAINTENANCE_SRC / MAINTENANCE_ENTRY).is_file():
+        raise DeliveryError("维护脚本里缺 %s：%s" % (MAINTENANCE_ENTRY, MAINTENANCE_SRC))
+    if not any(MAINTENANCE_SRC.glob("*.cmd")):
+        raise DeliveryError("维护脚本里没有任何 .cmd 双击入口：%s" % MAINTENANCE_SRC)
     if not zip_has_entry(kit, "install-all.ps1"):
         raise DeliveryError("这个 kit zip 里没有 install-all.ps1：%s（包不完整？）" % kit.name)
     if not zip_has_entry(kit, FORWARD):
@@ -444,6 +463,8 @@ def assemble(stamp: str, dist: Path, kit_zip: Path | None = None,
             shutil.copy2(apk, apk_dest)
         if README_TEMPLATE.is_file():
             shutil.copy2(README_TEMPLATE, dest / build_kit.KIT_README)
+        # 维护脚本整目录带进去（不做安装的一部分；同事双击 .cmd 用）
+        shutil.copytree(MAINTENANCE_SRC, dest / MAINTENANCE_DIR)
         write_manifest(dest, kit, thin, offline, apk_dest, no_offline=no_offline)
         out_zip = parent / ("%s-%s.zip" % (PKG_PREFIX, stamp)) if make_the_zip else None
         if out_zip is not None:

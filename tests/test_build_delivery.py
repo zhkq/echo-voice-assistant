@@ -124,6 +124,19 @@ class AssemblyTests(_Case):
         dest, _ = self.assemble(make_the_zip=False)
         self.assertTrue((dest / "ECHO-backend-portable-clean-room.zip").is_file())
 
+    def test_the_maintenance_scripts_are_included(self):
+        """2026-11-02 用户要求「维护脚本也都加进去」：整目录进交付层，清单里也要写。"""
+        self.write_kit_zip()
+        dest, _ = self.assemble(make_the_zip=False)
+        m = dest / build_delivery.MAINTENANCE_DIR
+        self.assertTrue(m.is_dir(), "维护脚本目录没进交付层：%s" % m)
+        self.assertTrue((m / build_delivery.MAINTENANCE_ENTRY).is_file(),
+                        "维护脚本说明（先读我.md）没带上")
+        self.assertTrue(any(p.suffix == ".cmd" for p in m.iterdir()), "缺双击入口 .cmd")
+        self.assertTrue((m / "py").is_dir(), "py 辅助脚本没带上（备份/还原要用）")
+        text = (dest / "清单.txt").read_text(encoding="utf-8")
+        self.assertIn(build_delivery.MAINTENANCE_DIR, text, "清单里没写维护脚本")
+
 
 class LoudFailureTests(_Case):
     def test_a_missing_kit_zip_says_what_to_run(self):
