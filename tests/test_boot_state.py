@@ -501,17 +501,26 @@ class AgentRowRefreshTests(_BootStateTestCase):
         self.assertEqual(boot._COMPONENTS["dsh"]["status"], "online")
         self.assertIn("无头 dsh", boot._COMPONENTS["dsh"]["detail"])
 
-    def test_gui_without_browser_access_is_reported_with_the_fix(self):
-        """GUI 在、普通浏览器访问没开 → 报失败并说明怎么修（不是无声无息地双写）。"""
+    def test_gui_without_api_is_reported_as_coexisting_when_headless_runs(self):
+        """GUI 在、但没有对外接口（当前官方版）→ 无头在跑就算在线（两进程共用家目录）。"""
         self._row()
         with patch("app.manager.dsh_ready", return_value=False), \
                 patch("app.harness_proc.desktop_gui_running", lambda: True), \
-                patch("app.harness_proc.yield_to_desktop",
-                      lambda: {"yielded": True, "detail": "已让出"}):
+                patch("app.harness_proc.online", return_value=True):
             boot.refresh_agent_rows()
         comp = boot._COMPONENTS["dsh"]
-        self.assertEqual(comp["status"], "failed")
-        self.assertIn("普通浏览器访问", comp["detail"])
+        self.assertEqual(comp["status"], "online")
+        self.assertIn("与桌面版", comp["detail"])
+
+    def test_gui_without_api_and_headless_down_offers_start(self):
+        self._row()
+        with patch("app.manager.dsh_ready", return_value=False), \
+                patch("app.harness_proc.desktop_gui_running", lambda: True), \
+                patch("app.harness_proc.online", return_value=False):
+            boot.refresh_agent_rows()
+        comp = boot._COMPONENTS["dsh"]
+        self.assertEqual(comp["status"], "idle")
+        self.assertIn("启动", comp["detail"])
 
     def test_neither_running_reports_idle_with_a_way_out(self):
         self._row()

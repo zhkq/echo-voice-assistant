@@ -264,7 +264,41 @@ function Send-SidebarQuit([string]$root) {
 
 if (-not $KeepSidebar) { Send-SidebarQuit $root }
 
+# ---- 4) ECHO-owned headless dsh (2026-11-03 one-DSH) ----
+# The single DSH engine runs as a detached DeepSeek Harness CLI process
+# ("dsh web --port 43199 --no-open"). Killing ECHO does NOT take it down (it is a
+# separate process tree, exactly like the sidebar), so it must be reaped here --
+# otherwise it keeps holding DSH_HOME / port 43199 after ECHO is gone.
+# Ownership: only the pid recorded by ECHO in <data>\logs\harness.pid AND whose
+# command line is the headless dsh. A user-started engine is left alone.
+$script:dshStopped = $false
+function Stop-OwnedDsh([string]$base) {
+    $pidFile = Join-Path $base 'data\logs\harness.pid'
+    if (-not (Test-Path -LiteralPath $pidFile)) { return }
+    $raw = ''
+    try { $raw = (Get-Content -LiteralPath $pidFile -Raw -ErrorAction Stop).Trim() } catch { return }
+    $dshPid = 0
+    if (-not [int]::TryParse($raw, [ref]$dshPid)) { return }
+    $p = $null
+    try { $p = Get-CimInstance Win32_Process -Filter "ProcessId=$dshPid" -ErrorAction Stop } catch { return }
+    if (-not $p) { return }
+    $cmd = [string]$p.CommandLine
+    if (($cmd -notmatch 'web\s+--port') -or ($cmd -notmatch 'dsh')) { return }
+    $exe = [string]$p.ExecutablePath
+    if (($exe -notlike '*DeepSeek Harness*') -and ($cmd -notlike '*DeepSeek Harness*')) { return }
+    try {
+        & taskkill.exe /PID $dshPid /T /F 2>$null | Out-Null
+        $script:dshStopped = $true
+        Write-Step "stopped ECHO-owned headless dsh (pid $dshPid)"
+    } catch {
+        Write-Step "WARNING: could not stop headless dsh (pid $dshPid): $($_.Exception.Message)"
+    }
+    try { Remove-Item -LiteralPath $pidFile -Force -ErrorAction SilentlyContinue } catch { }
+}
+Stop-OwnedDsh $base
+
 if ($stopped.Count -eq 0) {
+    if ($script:dshStopped) { exit 0 }
     Write-Step 'ECHO was not running (or could not be identified)'
     exit 1
 }

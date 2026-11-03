@@ -470,17 +470,35 @@ class HarnessProcTests(unittest.TestCase):
         self.assertFalse(out["yielded"])
         stop.assert_not_called()
 
-    def test_ensure_running_refuses_to_spawn_when_the_gui_is_up_but_not_open(self):
-        """GUI 开着但 43120 不监听（没开普通浏览器访问）→ **不另起无头**，否则双写家目录。"""
+    def test_yield_allows_coexistence_when_the_desktop_has_no_api(self):
+        """GUI 在、但没有对外接口（当前官方版）→ **不让出**，与无头 dsh 共用家目录。"""
         with patch.object(harness_proc, "desktop_mode", lambda timeout=0.8: False), \
                 patch.object(harness_proc, "desktop_gui_running", lambda: True), \
+                patch.object(harness_proc, "stop") as stop:
+            out = harness_proc.yield_to_desktop()
+        self.assertFalse(out["yielded"])
+        self.assertIn("共用", out["detail"])
+        stop.assert_not_called()
+
+    def test_ensure_running_runs_alongside_the_gui_without_api(self):
+        """GUI 开着但 43120 不监听（当前官方版无对外接口）→ **仍起无头**，两者共用家目录。
+
+        用户 2026-11-03 拍板：官方桌面版没有外部接口，而他要"先开桌面版、再开 ECHO、
+        两个同时用"，所以 ECHO 起无头与桌面版并存（风险如实记日志）。
+        """
+        with patch.object(harness_proc, "desktop_mode", lambda timeout=0.8: False), \
+                patch.object(harness_proc, "desktop_gui_running", lambda: True), \
+                patch.object(harness_proc, "online", lambda timeout=1.0: False), \
+                patch.object(harness_proc, "port_conflict", lambda: None), \
+                patch.object(harness_proc, "foreign_owner", lambda: {}), \
                 patch.object(harness_proc, "migrate_legacy_home",
                              lambda: {"ok": True, "skipped": ["测试隔离"]}), \
+                patch.object(harness_proc, "ensure_node_on_path", lambda: None), \
                 patch("subprocess.Popen") as popen:
-            ok, msg = harness_proc.ensure_running()
-        self.assertFalse(ok)
-        self.assertIn("普通浏览器访问", msg)
-        popen.assert_not_called()
+            ok, msg = harness_proc.ensure_running(timeout=0)
+        popen.assert_called_once()
+        self.assertNotIn("普通浏览器访问", msg, "不应再要求桌面版开那个开关（它根本没有）")
+        self.assertIn("共用家目录", msg, "要说清是与桌面版共存（两进程、一套数据）")
 
     def test_online_true_for_any_http_response(self):
         srv = ThreadingHTTPServer(("127.0.0.1", 0), _HarnessStub)

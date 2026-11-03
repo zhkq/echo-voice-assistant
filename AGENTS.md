@@ -13,9 +13,13 @@
   模型注册**只有一份** —— 打开桌面版能看到 ECHO 建的「会议空间 / 指令空间 / 每日回顾」。
   旧家目录（3.0 `<根>\dsh\home`、老装机 `<DATA>\harness`）由
   `harness_proc.migrate_legacy_home()` **只补缺**地并进来（有标记文件、旧目录不删）。
-- **单实例仲裁**：`harness_proc.desktop_mode()`（探测 43120，任何 HTTP 响应都算）——
-  桌面版开着就**直接用它**（签名 Cookie），**绝不再起第二个进程**（两个进程写同一个
-  `~/.dsh` 会写坏会话/storages）；没开才由 ECHO 起无头 dsh（token/Cookie）。
+- **桌面版与无头 dsh 共享 `~/.dsh`（2026-11-03 用户拍板，Windows 实机验证）**：
+  `harness_proc.desktop_mode()`（探测 43120）为真 → 直接用桌面版（签名 Cookie）；
+  为假（**当前官方桌面版 0.2.1-rc.5 就是这种情况：没有对外 HTTP 接口、asar 里也没有
+  "普通浏览器访问"开关**）→ ECHO **照样起无头 dsh**，与桌面版**两个进程共用同一个家目录**。
+  用户要的就是"先开桌面版、再开 ECHO、两个同时用"；风险（官方未承诺两进程并发写
+  storages/工作区）**如实记日志**（`db.add_log("warn","dsh",…)`），不装作没风险。
+  `yield_to_desktop()` 只在"桌面版真的有对外接口"时才停掉无头（让出）；没有接口时**不让出**。
 - **一个产品**：`app/agents/harness_agent.py::HarnessAgent` 现在 `name = "dsh"`、
   显示名「DSH（DeepSeek Harness）」，内部按 desktop/headless 选接入；`DshAgent` 不再
   单独注册（只作父类 + 桌面版探针，`dsh.get_desktop_client()` 直接实例化）。
@@ -28,15 +32,17 @@
 - **退役**：`agentHarnessEnabled`（废弃）、`harnessToken`（废弃）、`harnessHome`（废弃）、
   `harness-install-local.*` 与 `-AskDsh/-DshDir/-HarnessSource/-PinHarnessCommand`（安装器
   保留参数只为兼容旧命令行、只告警）；`tests/test_install_existing_dsh.py` 随功能删除。
-  **别再复活"两套 dsh"**：不要给两边各建一套家目录，也不要在桌面版开着时再 spawn 无头进程。
+  **别再复活"两套 dsh"**：不要给两边各建一套家目录；也不要重新引入 npm/Node 那条安装路。
+  桌面版有对外接口时仍应"直接用它、不另起无头"（`yield_to_desktop()`）；没有接口时才允许共存。
 - **判据**：`tests/test_harness_agent.py`（单一注册、`available()` 两种模式、`requested()` 与
   `desktop_mode`）、`tests/test_boot_state.py`（只有 dsh 一行、autoStart 三态）、
   `tests/test_install_base_layout.py`（dsh_home 不在安装根、旧位置进 `legacy_dsh_homes()`）、
   `tests/test_dsh_home_coupling.py`（不许新增写死的家目录字面量）、`tests/test_status_freshness.py`。
 - **真机冒烟（本机沙箱，`ECHO_DSH_HOME` + `ECHO_DATA` 指临时目录）已过**：桌面端 CLI 能拉起
   无头 dsh、`session/list` 能通、家目录里自动生成 `.credentials.yaml`、`stop()` 能收干净。
-- ⚠️ **还没验证**：桌面版 GUI 与无头进程**交替**使用同一个 `~/.dsh` 后，桌面版读取无头写入的
-  会话是否完全正常（同版本应该可以，但要真机试）；以及真 Mac 上的官方桌面版（dmg）流程。
+- ⚠️ **还没验证**：桌面版与无头 dsh **同时开着**时，两边读写同一个 `~/.dsh`（会话/storages）
+  是否完全正常 —— 已按用户要求**允许共存**，但官方未承诺并发安全，需要真机各写一轮再确认；
+  以及真 Mac 上的官方桌面版（dmg）流程。
 
 ## 2026-10-31 最新架构（**取代本文后面所有关于"语音唤醒 / 本机转写"的旧口径**）
 

@@ -52,6 +52,14 @@ class StatusFreshnessTests(unittest.TestCase):
         self.assertEqual(by_name["dsh"]["status"], "offline")
         self.assertFalse(r.json()["dsh"]["online"])
 
+    def test_gui_without_api_counts_as_online_when_headless_runs(self):
+        """GUI 在、但没有对外接口（当前官方版）→ 无头在跑就算在线（两进程共用家目录）。"""
+        r = self._status(desktop_ok=False, headless_ok=True, gui_running=True)
+        self.assertEqual(200, r.status_code, r.text)
+        by_name = {c["name"]: c for c in r.json()["components"]}
+        self.assertEqual(by_name["dsh"]["status"], "online")
+        self.assertIn("与桌面版", by_name["dsh"]["detail"])
+
     def test_this_hot_path_never_probes_other_agents(self):
         """codebuddy 那种"探一次就起一个进程"的适配器**绝不能**在这个接口里被探。"""
         with patch("app.agents.list_agents") as probe:

@@ -828,12 +828,10 @@ def ensure_running(timeout=None):
         pass
     if desktop_mode():
         return True, "DSH 桌面版已在运行（%s），ECHO 直接使用它" % desktop_url()
-    if desktop_gui_running():
-        return False, ("检测到 DSH 桌面版正在运行，但它没开「普通浏览器访问」（%s 不监听）—— "
-                       "ECHO 连不上它。请在桌面版「设置 → 常规」里打开「普通浏览器访问」；"
-                       "或者先关掉桌面版，让 ECHO 起无头 dsh。"
-                       "同一时刻只允许一个进程使用同一个 DSH 家目录，所以这次不另起无头进程。"
-                       % desktop_url())
+    # 2026-11-03 用户拍板：官方桌面版**没有**对外接口（43120 不监听），而用户要"先开桌面版、
+    # 再开 ECHO、两个同时用"。于是唯一形态 = ECHO 起无头 dsh，**与桌面版共用同一个 ~/.dsh**。
+    # 风险如实记日志（官方未承诺两进程并发写；实测共存无报错，但仍有风险）。
+    coexist = desktop_gui_running()
     # 先把 node 目录补进**本进程** PATH —— `shutil.which` 读的是它，而不是下面给子进程的 env。
     # 桌面快捷方式启动时 PATH 里常常没有托管式 node（2026-09-22 同事反馈 B1）。
     ensure_node_on_path()
@@ -853,7 +851,8 @@ def ensure_running(timeout=None):
                     "%s 上跑的是**另一棵树**的 harness（pid %s，入口 %s）—— 本棵树要用自己那份。"
                     "先把它停掉（或让切换器切一次，它会把 harness 一起带过来）再重试。"
                     % (base_url(), foe.get("pid"), foe.get("entry") or "?"))
-            return True, "独立 harness 已在运行（%s）" % base_url()
+            return True, "独立 harness 已在运行（%s）%s" % (
+                base_url(), "；与桌面版共用家目录" if coexist else "")
         now = time.monotonic()
         if now - _last_launch < LAUNCH_COOLDOWN:
             return True, "独立 harness 刚拉起过，等待就绪（冷却 %.0fs）" % (
@@ -871,8 +870,16 @@ def ensure_running(timeout=None):
         except Exception:
             pass
         env = dict(os.environ)
-        env["DSH_HOME"] = dsh_home                      # 独立家目录：不碰 Desktop 的家
+        env["DSH_HOME"] = dsh_home                      # 共用家目录（一套 DSH）
         full = argv + ["--port", str(port()), "--no-open"]
+        if coexist:
+            try:
+                from app import db
+                db.add_log("warn", "dsh",
+                           "桌面版也在运行：ECHO 以无头进程与它共用同一个 DSH 家目录"
+                           "（两进程并存；这是当前唯一能同时使用桌面版的形态）")
+            except Exception:
+                pass
         flags = {}
         try:
             from app import platform as echo_platform
@@ -908,9 +915,11 @@ def ensure_running(timeout=None):
             return False, ("独立 harness 启动后立即退出（code=%s）——命令或环境有问题，"
                            "详见 data/logs/harness.log" % proc.returncode)
         if online():
-            return True, "独立 harness 已启动（%s）" % base_url()
+            return True, "独立 harness 已启动（%s）%s" % (
+                base_url(), "；与桌面版共用家目录（两进程并存）" if coexist else "")
         time.sleep(0.5)
-    return True, "独立 harness 启动中（%s，首次要装插件，可能要一会儿）" % base_url()
+    return True, "独立 harness 启动中（%s，首次要装插件，可能要一会儿）%s" % (
+        base_url(), "；与桌面版共用家目录" if coexist else "")
 
 
 def _kill_tree(pid):
@@ -995,33 +1004,32 @@ def stop(reason=""):
 
 
 def yield_to_desktop() -> dict:
-    """桌面版启动了 → 停掉 **ECHO 自己起的** 无头 dsh，把同一个 DSH 家目录让给它。
+    """桌面版**可被外部访问**（43120 在听）→ 停掉 ECHO 自己起的无头 dsh，直接用它。
 
-    2026-11-03 一套 DSH 的硬约束：同一时刻只允许一个进程写 `~/.dsh`。
-    桌面版 GUI 由用户启动，ECHO 无法"阻止"它起来 —— 所以必须在发现它之后**主动退出**：
-    先探 43120 / GUI 进程，再只停「ECHO 起的那个」（pid 文件/本进程 Popen 为凭；手起的不动）。
+    2026-11-03 一套 DSH：只有"桌面版能被 ECHO 用"时才需要让出。当前官方桌面版
+    **没有对外接口**（43120 不监听、asar 里也没有"普通浏览器访问"开关）——
+    这种情况下让出等于让 ECHO 没有引擎，所以**不动无头 dsh**，两者共用 `~/.dsh` 并存
+    （用户拍板；风险见 `ensure_running()` 的日志与文档）。
 
-    ⚠️ 即使桌面版**没开**「普通浏览器访问」（43120 不在听），只要 GUI 进程在，也要让出 ——
-    否则两个进程同时写同一个家目录（2026-11-03 真机就是这样：GUI 开着、43120 空着）。
-
-    返回 ``{yielded: bool, detail: str}``；幂等、不抛异常。没有可让的东西时
-    ``yielded=False`` 且说明原因（面板/日志可以照实显示）。
+    仍然只停「ECHO 起的那个」（pid 文件/本进程 Popen 为凭；用户手起的不动）。
+    返回 ``{yielded: bool, detail: str}``；幂等、不抛异常。
     """
     out = {"yielded": False, "detail": ""}
     try:
-        if not (desktop_mode() or desktop_gui_running()):
-            out["detail"] = "桌面版没在运行，无需要让"
+        if not desktop_mode():
+            out["detail"] = ("桌面版没有对外接口（%s 不监听）—— 允许与无头 dsh 共用同一个"
+                             " DSH 家目录，不让出" % desktop_url())
             return out
         if not (started_by_echo() or _load_pid()):
             out["detail"] = "桌面版在运行；本机没有 ECHO 起的无头 dsh（无需处理）"
             return out
-        ok, msg = stop(reason="桌面版已启动，让出同一个 DSH 家目录（一套 DSH）")
+        ok, msg = stop(reason="桌面版已提供外部接口，让出同一个 DSH 家目录（一套 DSH）")
         out["yielded"] = bool(ok)
         out["detail"] = msg
         try:
             from app import db
             db.add_log("info", "dsh",
-                       "桌面版已启动，已停掉 ECHO 起的无头 dsh（一套 DSH，避免两个进程写同一家目录）")
+                       "桌面版已提供外部接口，已停掉 ECHO 起的无头 dsh（避免两个进程同时直接写）")
         except Exception:
             pass
     except Exception as exc:

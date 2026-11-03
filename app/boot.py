@@ -383,16 +383,17 @@ def refresh_agent_rows():
                    progress=1.0)
             return
         if harness_proc.desktop_gui_running():
-            # 桌面版 GUI 在、但 43120 不在听 = 没开「普通浏览器访问」。
-            # 必须让出（否则两个进程写同一家目录），并如实说清怎么修。
-            try:
-                harness_proc.yield_to_desktop()
-            except Exception:
-                pass
-            msg = ("桌面版在运行，但没开「普通浏览器访问」（%s 不监听）—— "
-                   "在桌面版「设置 → 常规」打开它；或先关掉桌面版，让 ECHO 起无头 dsh"
-                   % harness_proc.desktop_url())
-            report("dsh", status="failed", detail=msg, error=msg)
+            # 桌面版 GUI 在、但 43120 不在听（当前官方版没有对外接口）：两者共用同一个
+            # `~/.dsh` 并存 —— 用户拍板接受这个形态；无头没起就提示点启动，不再"拒绝"。
+            if harness_proc.online(timeout=0.8):
+                report("dsh", status="online",
+                       detail="无头 dsh 在跑（与桌面版共用同一个 DSH 家目录）",
+                       progress=1.0)
+            else:
+                report("dsh", status="idle",
+                       detail=("未运行（桌面版在跑但无对外接口）；面板点「启动」可起无头 dsh —— "
+                               "两者共用同一个 DSH 家目录，两进程并存"),
+                       progress=0.0)
             return
         if harness_proc.online(timeout=0.8):
             report("dsh", status="online",

@@ -641,14 +641,13 @@ def api_status(_auth=Depends(optional_auth)):
     try:
         from app import harness_proc as _hp
         if dsh_ok:
-            # 桌面版起来了 → 让出同一个家目录（面板高频轮询，停过一次之后这步是空转）。
+            # 桌面版有对外接口 → 让出同一个家目录（高频轮询，停过一次之后这步是空转）。
             _hp.yield_to_desktop()
         elif _hp.desktop_gui_running():
-            # GUI 在、但 43120 不在听 = 没开「普通浏览器访问」：让出（避免双写）并说清怎么修。
-            _hp.yield_to_desktop()
-            dsh_detail = ("桌面版在运行但没开「普通浏览器访问」（%s 不监听）—— "
-                          "在桌面版 设置→常规 打开它，或关掉桌面版让 ECHO 起无头 dsh"
-                          % _hp.desktop_url())
+            # GUI 在、但没有对外接口（当前官方版）：允许共存，无头在跑就算在线。
+            dsh_ok = _hp.online(timeout=0.6)
+            dsh_detail = ("无头 dsh 在跑（与桌面版共用同一个 DSH 家目录）" if dsh_ok else
+                          "未运行（桌面版在跑但无对外接口）；面板点「启动」可起无头 dsh")
         else:
             dsh_ok = _hp.online(timeout=0.6)
             dsh_detail = "API 可访问" if dsh_ok else "未运行"
@@ -882,8 +881,8 @@ def post_harness_browser(_auth=Depends(optional_auth)):
     if not harness_proc.online():
         if harness_proc.desktop_gui_running():
             return {"ok": False,
-                    "message": "桌面版在运行，但没开「普通浏览器访问」（%s 不监听）—— "
-                               "在桌面版「设置 → 常规」打开它，或关掉桌面版让 ECHO 起无头 dsh"
+                    "message": "桌面版在运行，但它没有对外接口（%s 不监听）—— "
+                               "ECHO 用无头 dsh 与它共存；面板上点「启动」即可（共用同一个家目录）"
                                % harness_proc.desktop_url()}
         return {"ok": False,
                 "message": "DSH 没在运行：面板上点「启动」（或打开桌面版，ECHO 会自动改用它）"}
