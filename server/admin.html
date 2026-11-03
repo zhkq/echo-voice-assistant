@@ -110,6 +110,7 @@
       <button data-tab="clients">客户端 / 发授权</button>
       <button data-tab="calls">调用</button>
       <button data-tab="perf">性能</button>
+      <button data-tab="billing">收费 / 账号</button>
       <button data-tab="inventory">存了什么</button>
     </div>
     <div id="view"></div>
@@ -285,6 +286,7 @@ async function render() {
     else if (tab === "clients") { v.innerHTML = await viewClients(); bindClients(); }
     else if (tab === "calls") v.innerHTML = await viewCalls();
     else if (tab === "perf") { v.innerHTML = await viewPerf(); bindPerf(); }
+    else if (tab === "billing") { v.innerHTML = await viewBilling(); bindBilling(); }
     else { v.innerHTML = await viewInventory(); bindPassword(); }
   } catch (e) {
     v.innerHTML = `<div class="card"><h2>读不到</h2><div class="muted">${esc(e.message)}</div></div>`;
@@ -1007,6 +1009,199 @@ async function refreshPerf() {
     const stat = $("#perfStat");
     if (stat) stat.textContent = "取点失败：" + e.message;
   }
+}
+
+
+/* ---------------------------------------------------------------- 收费 / 账号（2026-11-03）
+   后端接口在 `server/admin.py` 的 `/admin/api/billing/*` 与 `/admin/api/account/*`；
+   判断/落库在 `server/billing.py`。这里只负责画表与把写动作发出去。 */
+
+const money = (cents) => "¥" + (Number(cents || 0) / 100).toFixed(2);
+const statusBadge = (s) => {
+  const ok = s === "paid" || s === "active";
+  const bad = s === "refunded" || s === "frozen" || s === "closed";
+  return `<span class="badge ${ok ? "" : (bad ? "off" : "warn")}">${esc(s || "—")}</span>`;
+};
+
+async function viewBilling() {
+  const d = await api("/admin/api/billing/overview");
+  const [orders, ents, users, invites] = await Promise.all([
+    api("/admin/api/billing/orders?limit=100"),
+    api("/admin/api/billing/entitlements"),
+    api("/admin/api/account/users"),
+    api("/admin/api/account/invites"),
+  ]);
+  const planRows = d.plans.map((p) => [
+    p.code, p.name, money(p.priceCents), p.days + " 天",
+    p.dailyAudioMinutes + " 分钟", p.ttsChars, p.qps + " QPS",
+    p.maxDevices + " 台", p.maxConcurrent, p.active ? "上架" : "下架",
+    raw(`<button data-plan-edit="${esc(p.code)}">改</button>
+         <button data-plan-del="${esc(p.code)}">删</button>`),
+  ]);
+  const orderRows = orders.orders.map((o) => [
+    o.orderId.slice(0, 14) + "…", o.userId, o.planCode, money(o.amountCents),
+    statusBadge(o.status), ts(o.createdAt), ts(o.paidAt),
+    o.status === "paid"
+      ? raw(`<button data-refund="${esc(o.orderId)}">退款</button>`)
+      : "",
+  ]);
+  const entRows = ents.entitlements.map((e) => [
+    e.userId, e.plan_code || e.planCode || "", statusBadge(e.status),
+    ts(e.paid_until || e.paidUntil), e.daily_audio_minutes ?? e.dailyMinutes,
+    e.tts_chars ?? e.ttsChars, e.qps, e.max_devices ?? e.maxDevices,
+    raw(`<button data-ent-extend="${esc(e.userId)}">+30 天</button>
+         <button data-ent-freeze="${esc(e.userId)}">冻结</button>
+         <button data-ent-internal="${esc(e.userId)}">设 internal</button>`),
+  ]);
+  const userRows = users.users.map((u) => [
+    u.userId, u.name, u.employeeNo, (u.devices || []).length,
+    statusBadge(u.status),
+    raw(`<button data-reset-devices="${esc(u.userId)}">重置设备</button>`),
+  ]);
+  const inviteRows = invites.invites.map((i) => [
+    i.code, i.max_uses, i.used, ts(i.expires_at), i.created_by, i.note,
+    raw(`<button data-invite-del="${esc(i.code)}">作废</button>`),
+  ]);
+  return `<div class="card"><h2>收费概览</h2>
+    <div class="kv">
+      <div><b>${d.enabled ? "已启用" : "未启用"}</b><span>收费开关（billing.enabled）</span></div>
+      <div><b>${esc(d.provider)}</b><span>支付网关（configured=${d.gatewayConfigured ? "是" : "否"}）</span></div>
+      <div><b>${money(d.revenueCentsToday)}</b><span>最近 24 小时收入</span></div>
+      <div><b>${money(d.revenueCentsTotal)}</b><span>累计收入（已支付）</span></div>
+      <div><b>${d.expiringIn7Days}</b><span>7 天内到期</span></div>
+      <div><b>${d.users}</b><span>账号</span></div>
+    </div>
+    <div class="muted">订单状态：${esc(JSON.stringify(d.byStatus || {}))}。
+      Mock 网关下 <code>/v1/billing/mock/pay/&lt;orderId&gt;</code> 可以模拟付款；生产切 alipay 后该端点不存在。</div>
+  </div>
+  <div class="card"><h2>套餐</h2>${table(
+    ["code", "名字", "价格", "天数", "每日 ASR", "TTS 字符", "QPS", "设备", "并发", "状态", "操作"],
+    planRows)}
+    <div class="muted" style="margin-top:8px">改价/下架只影响**以后**的订单；已卖出的订单金额与权益不变。
+      新增/修改：<code>POST /admin/api/billing/plans</code>（页面下方表单）。</div>
+    <div class="row" style="margin-top:8px">
+      <input id="plCode" placeholder="code（monthly）">
+      <input id="plName" placeholder="名字">
+      <input id="plPrice" placeholder="价格（分）" value="1000">
+      <input id="plDays" placeholder="天数" value="30">
+      <input id="plMin" placeholder="每日分钟" value="120">
+      <input id="plTts" placeholder="TTS 字符" value="50000">
+      <input id="plQps" placeholder="QPS" value="1">
+      <input id="plDev" placeholder="设备数" value="3">
+      <input id="plConc" placeholder="并发" value="1">
+      <button id="plSave">保存套餐</button>
+    </div>
+  </div>
+  <div class="card"><h2>订单（最近 100 单）</h2>${table(
+    ["订单", "账号", "套餐", "金额", "状态", "创建", "支付", "操作"], orderRows)}</div>
+  <div class="card"><h2>权益</h2>${table(
+    ["账号", "套餐", "状态", "到期", "每日分钟", "TTS 字符", "QPS", "设备", "操作"],
+    entRows)}</div>
+  <div class="card"><h2>账号</h2>${table(
+    ["账号", "姓名", "工号", "设备数", "状态", "操作"], userRows)}
+    <div class="muted" style="margin-top:8px">「重置设备」会解绑这个人所有设备，旧客户端立即失效（找回兜底）。</div>
+  </div>
+  <div class="card"><h2>邀请码</h2>${table(
+    ["code", "名额", "已用", "到期", "谁发的", "备注", "操作"], inviteRows)}
+    <div class="row" style="margin-top:8px">
+      <input id="ivCode" placeholder="code（留空随机）">
+      <input id="ivUses" placeholder="名额" value="1">
+      <input id="ivNote" placeholder="备注">
+      <button id="ivNew">生成邀请码</button>
+    </div>
+  </div>`;
+}
+
+function bindBilling() {
+  document.querySelectorAll("[data-plan-del]").forEach((b) => {
+    b.onclick = async () => {
+      if (!confirm("删掉套餐 " + b.dataset.planDel + "？已卖出的订单不受影响。")) return;
+      try { await wdelete("/admin/api/billing/plans/" + encodeURIComponent(b.dataset.planDel),
+                          { confirm: b.dataset.planDel }); alert("已删除"); await render(); }
+      catch (e) { alert("删除失败：" + e.message); }
+    };
+  });
+  document.querySelectorAll("[data-plan-edit]").forEach((b) => {
+    b.onclick = () => { $("#plCode").value = b.dataset.planEdit; $("#plName").focus(); };
+  });
+  const save = $("#plSave");
+  if (save) save.onclick = async () => {
+    const body = {
+      code: $("#plCode").value.trim(), name: $("#plName").value.trim(),
+      priceCents: Number($("#plPrice").value || 0), days: Number($("#plDays").value || 0),
+      dailyAudioMinutes: Number($("#plMin").value || 0),
+      ttsChars: Number($("#plTts").value || 0), qps: Number($("#plQps").value || 1),
+      maxDevices: Number($("#plDev").value || 3), maxConcurrent: Number($("#plConc").value || 1),
+      active: true,
+    };
+    if (!body.code) return alert("要填 code");
+    try { await wpost("/admin/api/billing/plans", body); alert("已保存"); await render(); }
+    catch (e) { alert("保存失败：" + e.message); }
+  };
+  document.querySelectorAll("[data-refund]").forEach((b) => {
+    b.onclick = async () => {
+      if (!confirm("退款订单 " + b.dataset.refund + "？权益会立即失效。")) return;
+      try { await wpost("/admin/api/billing/orders/" + encodeURIComponent(b.dataset.refund) + "/refund",
+                        { confirm: b.dataset.refund }); alert("已退款"); await render(); }
+      catch (e) { alert("退款失败：" + e.message); }
+    };
+  });
+  const entAct = (attr, action, extra) => document.querySelectorAll("[" + attr + "]").forEach((b) => {
+    b.onclick = async () => {
+      const uid = b.getAttribute(attr);
+      try { await wpost("/admin/api/billing/entitlements/" + encodeURIComponent(uid) + "/adjust",
+                        Object.assign({ action: action }, extra || {})); await render(); }
+      catch (e) { alert("调整失败：" + e.message); }
+    };
+  });
+  document.querySelectorAll("[data-ent-extend]").forEach((b) => {
+    b.onclick = async () => {
+      try { await wpost("/admin/api/billing/entitlements/" + encodeURIComponent(b.dataset.entExtend) + "/adjust",
+                        { action: "extend", days: 30 }); await render(); }
+      catch (e) { alert("调整失败：" + e.message); }
+    };
+  });
+  document.querySelectorAll("[data-ent-freeze]").forEach((b) => {
+    b.onclick = async () => {
+      try { await wpost("/admin/api/billing/entitlements/" + encodeURIComponent(b.dataset.entFreeze) + "/adjust",
+                        { action: "freeze" }); await render(); }
+      catch (e) { alert("调整失败：" + e.message); }
+    };
+  });
+  document.querySelectorAll("[data-ent-internal]").forEach((b) => {
+    b.onclick = async () => {
+      try { await wpost("/admin/api/billing/entitlements/" + encodeURIComponent(b.dataset.entInternal) + "/adjust",
+                        { action: "internal" }); await render(); }
+      catch (e) { alert("调整失败：" + e.message); }
+    };
+  });
+  document.querySelectorAll("[data-reset-devices]").forEach((b) => {
+    b.onclick = async () => {
+      const uid = b.dataset.resetDevices;
+      if (!confirm("解绑 " + uid + " 的所有设备？旧客户端会立即失效。")) return;
+      try { await wpost("/admin/api/account/users/" + encodeURIComponent(uid) + "/reset-devices",
+                        { confirm: uid }); alert("已解绑"); await render(); }
+      catch (e) { alert("解绑失败：" + e.message); }
+    };
+  });
+  document.querySelectorAll("[data-invite-del]").forEach((b) => {
+    b.onclick = async () => {
+      const code = b.dataset.inviteDel;
+      if (!confirm("作废邀请码 " + code + "？")) return;
+      try { await wdelete("/admin/api/account/invites/" + encodeURIComponent(code),
+                          { confirm: code }); await render(); }
+      catch (e) { alert("作废失败：" + e.message); }
+    };
+  });
+  const iv = $("#ivNew");
+  if (iv) iv.onclick = async () => {
+    try {
+      await wpost("/admin/api/account/invites", {
+        code: $("#ivCode").value.trim(), maxUses: Number($("#ivUses").value || 1),
+        note: $("#ivNote").value.trim() });
+      alert("已生成（明文只在这一行里，记下来）"); await render();
+    } catch (e) { alert("生成失败：" + e.message); }
+  };
 }
 
 function table(head, rows) {
