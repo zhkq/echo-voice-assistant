@@ -61,6 +61,15 @@ from app.capabilities.assemble import (                                  # noqa:
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
+from app import paths as _paths_mod                              # noqa: E402
+_REAL_SETTINGS_GET = getattr(_paths_mod, "_settings_get")
+
+
+def tearDownModule():
+    """与 `test_server_contract.py` 同一个理由：`create_app()` 装的
+    `app.paths._settings_get` 是进程内全局 seam，在模块边界换回真实实现。"""
+    _paths_mod._settings_get = _REAL_SETTINGS_GET
+
 from app.capabilities import credentials as cred_mod                     # noqa: E402
 from app.capabilities import echo_server as echo_server_mod              # noqa: E402
 

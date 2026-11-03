@@ -279,3 +279,143 @@ nvidia-container-toolkit / compose v2）、模型卷按容器布局摆好并校�
 | 第一次请求特别慢 | 模型是按需加载的，第一次付加载时间。`/v1/health` 里能看状态 |
 | 有 GPU 但报 `model_failed` | 服务端**刻意不回退 CPU**（会把所有客户端一起拖慢）。查驱动 / `--gpus all` / spec 的 `device` |
 | 大 body 出错时 body 是空的 | **这是 bug，不是设计** —— 已修（`audio.drain`）。若再见到，说明有新的早退路径漏了抽干 |
+
+## 八、收费 / 自动配对（2026-11-03）
+
+设计见 **`docs/后端收费-交付给服务器dsh/01-后端收费与自动配对-设计.md`**（v0.9，权威），
+任务拆解见同目录 `00-交接说明与开发任务书.md`。**出厂关着**：不配就是原来那样，
+老客户端继续走 `clients.daily_audio_minutes` 的免费额度（两条路并存）。
+
+### 8.1 开了之后是什么样
+
+```
+未登录 ──注册（邀请码+姓名+工号）──▶ userToken ──下单（只传 planCode）──▶ {orderId, payUrl}
+   │                                                                    │
+   └── 打开 payUrl 付款 ──▶ 异步通知（验签/幂等/金额校验）──▶ paid ──▶ 发配对码
+                                                                      │
+本机 POST /api/capability/pair（客户端那条路不变）◀── echo://pair?… ──┘
+   │
+   └── /v1/pair 兑换 ──▶ client_id+secret + user_devices 绑定 + 权益挂到 user
+```
+
+* **权益归人**：`entitlements.user_id` 是主键；换机/重装用 `POST /v1/account/devices/code`
+  发一次性绑定码，不重复收费（默认 3 台）。
+* **续费不发码**：已经绑过设备的账号再付款，只延长 `paid_until`（从 `max(now, paid_until)`
+  起 +30 天；试用不叠加，从支付时刻起算）。
+* **到期/退款立即停能力**：ASR/分离/嵌入回 **402**（`entitlement_expired` /
+  `entitlement_missing` / `entitlement_inactive`），配对与本地数据保留，续费即恢复。
+* **按账号的闸门**：1 QPS（`429 rate_limited` + `Retry-After: 1`）、并发 1
+  （第二台设备 `409 client_busy`，detail 写明"另一台设备"）、日额度按 user 累计
+  （换台设备不能重刷）。
+
+### 8.2 配置（`echo-server.example.yaml` 末尾有完整段）
+
+```yaml
+billing:
+  enabled: true
+  timezone: "Asia/Shanghai"     # 每日 0 点按这个时区恢复
+  # 额度/价格**不在代码里**：在 plans 表（出厂 seed：monthly / trial / internal）
+payment:
+  provider: mock                # disabled | mock | alipay
+alipay:
+  app_id: "<...>"               # 真实网关才需要
+  private_key_path: "/run/secrets/alipay_app_private.pem"   # 只放服务端
+  public_key_path: "/run/secrets/alipay_public.pem"
+  notify_url: "https://echoserver.zhkq.online:8900/v1/billing/alipay/notify"
+invite: { required: true }
+trial: { enabled: true, days: 7 }
+```
+
+环境变量同名映射：`ECHO_BILLING_ENABLED`、`ECHO_PAYMENT_PROVIDER`、`ECHO_ALIPAY_APP_ID`、
+`ECHO_ALIPAY_PRIVATE_KEY_PATH`、`ECHO_ALIPAY_PUBLIC_KEY_PATH`、`ECHO_ALIPAY_GATEWAY`、
+`ECHO_ALIPAY_SANDBOX`、`ECHO_PAYMENT_NOTIFY_URL`、`ECHO_TRIAL_ENABLED`、`ECHO_INVITE_REQUIRED`。
+
+### 8.3 用 Mock 跑通全链路（无 UI 也能验收）
+
+```bash
+# 1) 起服务（临时数据目录，别碰真实 state 卷）
+export ECHO_BILLING_ENABLED=1 ECHO_PAYMENT_PROVIDER=mock
+export ECHO_AUTH_ENABLED=1 ECHO_AUTH_MODE=jwt ECHO_JWT_SECRET=$(openssl rand -hex 32)
+python -m server.main --config /tmp/echo-billing.yaml   # billing.enabled=true
+
+# 2) 管理面发邀请码（浏览器 127.0.0.1:8901/admin/ → 「收费 / 账号」页签），
+#    或用命令行直接开库（安全边界 = 能读库文件）：
+python - <<'PY'
+from server import settings, auth
+cfg = settings.load("/tmp/echo-billing.yaml")
+store = auth.open_store(cfg)
+store.put_invite("TEAM2026", max_uses=50, note="内部推广")
+PY
+
+# 3) 注册 → 下单 → 模拟付款 → 拿 pairUrl
+curl -s -X POST localhost:8900/v1/account/register \
+  -H 'Content-Type: application/json' \
+  -d '{"inviteCode":"TEAM2026","name":"张三","employeeNo":"E001"}'
+#   → {"userId":"usr-...","userToken":"...","expiresAt":...}
+
+curl -s -X POST localhost:8900/v1/billing/orders \
+  -H "Authorization: Bearer $UT" -H 'Content-Type: application/json' \
+  -d '{"planCode":"monthly"}'                       # → {orderId, amountCents:1000, payUrl}
+curl -s -X POST localhost:8900/v1/billing/mock/pay/$ORDER_ID \
+  -H 'Content-Type: application/json' -d '{}'        # → {"mock":true,"status":"paid",...}
+curl -s localhost:8900/v1/billing/orders/$ORDER_ID -H "Authorization: Bearer $UT"
+#   → {"status":"paid","pairUrl":"echo://pair?host=...&code=..."}
+```
+
+把 `pairUrl` 喂给客户端平时那条 `/api/capability/pair` 即可（配对协议**没变**）。
+
+**Mock 的两个端点（只在 `payment.provider=mock` 时注册）**：
+
+| 端点 | 用途 |
+|---|---|
+| `POST /v1/billing/mock/pay/{orderId}` | 模拟成功付款（走与真回调完全相同的验签/幂等/金额校验） |
+| `POST /v1/billing/mock/notify` | 可编程回调：可造**金额不对**（`amountCents` 与订单不符）或失败状态（`status=closed`） |
+
+`provider=alipay` 时这两条路径**根本不存在**（404，不是"存在但拒绝"）。
+
+### 8.4 切真实支付宝
+
+1. 开放平台建应用、签约 Vibe Pay 网页收款，拿到 `APP_ID`、应用私钥（自己生成、只放服务端）、
+   支付宝公钥；
+2. `payment.provider: alipay` + `alipay.*` 配齐，**重启后端**；
+3. 回调地址 `https://<公网域名>:8900/v1/billing/alipay/notify` 必须**公网可达、证书有效**
+   （支付宝不认自签）；内网联调先用 `payment.provider=mock`；
+4. 本轮 `AlipayGateway` 只实现**下单签名 + 回调验签**（RSA2）；`query()` / `refund()`
+   明确抛 `payment_unconfigured`（"尚未接入"），**不假装成功**——上线前要补沙箱联调。
+
+### 8.5 错误码（客户端逐条映射，**不许合并**）
+
+| 场景 | 状态 | code |
+|---|---|---|
+| 没开通 | 402 | `entitlement_missing` |
+| 已到期 | 402 | `entitlement_expired` |
+| 冻结 / 已退款 | 402 | `entitlement_inactive` |
+| 当日额度用完（ASR 分钟 / TTS 字符） | 429 | `quota_exceeded`（保留现有语义） |
+| 1 QPS 超速 | 429 | `rate_limited` + `Retry-After: 1` |
+| 同一账号另一台设备在转写 | 409 | `client_busy` |
+| 支付未配置 / 真实网关未接入 | 503 | `payment_unconfigured` |
+| 收费功能没开 | 404 | `billing_disabled` |
+| 邀请码无效/过期/用完 | 403 | `invite_invalid` |
+| 工号已注册 | 409 | `employee_no_taken` |
+| 设备数满 | 403 | `device_limit_reached` |
+| 订单状态不允许 | 409 | `order_state_conflict` |
+| 套餐 / 订单 / 账号不存在 | 404 | `plan_not_found` / `order_not_found` / `user_not_found` |
+
+### 8.6 数据与边界（评审结论）
+
+新增的十张表全部进 `server/store.py` 的 `TABLE_WHITELIST`：`plans`、`users`、
+`user_devices`、`invites`、`authorized_open_ids`、`scan_sessions`、`orders`、
+`order_events`、`alipay_notify`、`entitlements`。它们属于"**关于谁、买了什么、
+还有多少**"的管理数据，**不存请求内容**（音频/文本/嵌入），列名黑名单逐列核对。
+`authorized_open_ids` / `scan_sessions` 是 Phase 4 白名单/扫码会话，**只建表、逻辑没做**。
+
+### 8.7 已知缺口（如实写在这里）
+
+* **本仓库当前没有 `/v1/tts` 端点**（客户端 TTS 一直走自己的 providers，设计文档
+  假设的那个端点在本仓库不存在）。所以 TTS 的**字符账本**（`quota.CharLedger`）、
+  权益字段（`entitlements.tts_chars`）与"超额 429"判定已经就位并有单测，但**还没有
+  请求路径会调用它**；等 `/v1/tts` 落地时，在端点里接上 `State.tts_ledger.check/add`
+  与 `BillingService.user_slot`（TTS 不占并发槽）即可。
+* `AlipayGateway.query()` / `refund()` 未接入（见 8.4）。
+* 多实例部署时 1 QPS / 日额度是**进程内**计数（与既有 `quota.py` 同一个取舍），
+  不是全局精确值。

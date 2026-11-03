@@ -159,6 +159,22 @@ SERVER_CODE_TO_REASON: Dict[str, str] = {
     "gpu_oom": "error",
     "inference_timeout": "error",
     "auth_misconfigured": "error",
+    # 收费（2026-11-03）：服务端新增的错误码。**这张表是跨进程契约的一部分** ——
+    # 服务端加了码而这里没跟上，客户端会把它当含糊的 `error`。本轮只补翻译，
+    # 不做「我的」页（M2 在另一棵树）。
+    "entitlement_missing": "blocked",     # 没开通：去开通
+    "entitlement_expired": "blocked",     # 已到期：去续费
+    "entitlement_inactive": "blocked",    # 冻结 / 已退款
+    "billing_disabled": "unsupported",    # 这台后端没开收费
+    "payment_unconfigured": "error",      # 服务端支付没配好
+    "invite_invalid": "blocked",
+    "employee_no_taken": "error",
+    "device_limit_reached": "blocked",
+    "device_revoked": "blocked",
+    "plan_not_found": "error",
+    "order_not_found": "error",
+    "order_state_conflict": "error",
+    "user_not_found": "error",
 }
 
 #: 服务端错误码 → **能不能重试**。与 `SERVER_CODE_TO_REASON` 是两个问题，别合并。
@@ -183,6 +199,20 @@ SERVER_CODE_RETRY: Dict[str, bool] = {
     "unsupported_media": False,
     "inference_timeout": False,
     "auth_misconfigured": False,  # 服务端自己的问题，客户端报给运营
+    # 收费（2026-11-03）：这些**都不是**"等一下再试"能解决的。
+    "entitlement_missing": False,
+    "entitlement_expired": False,
+    "entitlement_inactive": False,
+    "billing_disabled": False,
+    "payment_unconfigured": False,
+    "invite_invalid": False,
+    "employee_no_taken": False,
+    "device_limit_reached": False,       # 先解绑旧设备
+    "device_revoked": False,
+    "plan_not_found": False,
+    "order_not_found": False,
+    "order_state_conflict": False,
+    "user_not_found": False,
 }
 
 

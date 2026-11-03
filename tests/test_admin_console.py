@@ -91,6 +91,16 @@ WRITE_ENDPOINTS = {
     # 知道 —— 每次靠人手改串。它与运行参数同一套闸门 + 审计
     # （action = `advertised-host-set`），值存在 state 卷（重启还在）。
     "/admin/api/advertised-host",
+    # 收费 / 账号（2026-11-03，设计 §4.2 管理面段）。**全部走 `as_write`**：
+    # 会话 + 同站 Origin + X-ECHO-Admin + CSRF + 审计（退款 / 改权益 / 重置设备
+    # 还要求 `confirm`）。读端点在下面 `login()` 即可的那一批里。
+    "/admin/api/billing/plans",
+    "/admin/api/billing/plans/{code}",
+    "/admin/api/billing/orders/{order_id}/refund",
+    "/admin/api/billing/entitlements/{user_id}/adjust",
+    "/admin/api/account/invites",
+    "/admin/api/account/invites/{code}",
+    "/admin/api/account/users/{user_id}/reset-devices",
 }
 
 
@@ -270,7 +280,11 @@ class _AdminCase(unittest.TestCase):
             for method in sorted(methods):
                 if method in ("get", "head", "options"):
                     continue
-                real = path.replace("{client_id}", "cli-nope").replace("{code_id}", "deadbeef")
+                real = (path.replace("{client_id}", "cli-nope")
+                            .replace("{code_id}", "deadbeef")
+                            .replace("{order_id}", "ord-nope")
+                            .replace("{user_id}", "usr-nope")
+                            .replace("{code}", "NOPE"))
                 out.append((method.upper(), path, real))
         return out
 
@@ -490,6 +504,16 @@ class IsolationTests(_AdminCase):
                 cap_writes.add(path)
         self.assertTrue(cap_writes <= {"/v1/asr", "/v1/diarize", "/v1/speaker/embed",
                                        "/v1/pair", "/v1/token",
+                                       # 收费（2026-11-03）：账号与订单的写端点。
+                                       # 它们只写管理数据，鉴权各自在端点里判
+                                       # （账号端点凭邀请码/userToken，支付回调凭验签）。
+                                       "/v1/account/register", "/v1/account/login",
+                                       "/v1/account/devices/code",
+                                       "/v1/account/devices/unbind",
+                                       "/v1/account/logout",
+                                       "/v1/billing/orders",
+                                       "/v1/billing/orders/{order_id}/cancel",
+                                       "/v1/billing/alipay/notify",
                                        # 中继（2026-10-15）：**不是能力槽**，是"借这台服务器
                                        # 把手机的请求转交给某台主机"的那条路。三条都要凭据
                                        # （主机侧按 client_id 认主机，手机侧放行 /health 与 api/*、
