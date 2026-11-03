@@ -1139,6 +1139,16 @@ class DshInstallLogicTests(unittest.TestCase):
         self.assertIn("Find-CliUnderRoot $target", self.desktop)
         self.assertIn("custom install dir did not produce a usable CLI", self.desktop)
 
+    def test_missing_engine_in_offline_or_upgrade_mode_tries_online_install(self):
+        """清掉所有 dsh 后重装：升级/离线模式只认已装会直接卡死；引擎刚需，
+        应探测下载地址并尝试联网补装官方桌面端（断开网则快速失败给手装指引）。"""
+        code = "\n".join(ln for ln in self.comp.splitlines()
+                         if not ln.lstrip().startswith("#"))
+        self.assertIn("Test-OfficialDownloadReachable", code)
+        self.assertIn("$dargs.ContainsKey('NoDownload')", code)
+        self.assertIn("desktop(retry)", code)
+        self.assertIn("已尝试联网补装", code)
+
 
 if __name__ == "__main__":
     unittest.main()

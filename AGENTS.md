@@ -50,6 +50,9 @@
     区分（含 `dsh-desktop-host\lib\cli.js`/`web --port` = 无头），否则升级会被无头引擎挡下/误判；
     `--version` 探测要有硬超时（20s），坏 CLI 不能挂死安装器；装自定义目录时只认**目标根下**的 CLI
     （`Find-CliUnderRoot`），不许拿 `%LOCALAPPDATA%` 旧安装冒充成功。
+  * **清空 dsh 后重装**：升级/离线模式默认 `-NoDownload`（只认已装），用户清掉官方桌面端后会直接
+    "没就绪"、装完 ECHO 没引擎。`Prepare-Agent` 现在会先探下载地址（8s），通则**联网补装官方桌面端**
+    （离线包本来不含它），不通则快速失败给手装链接 —— 别再把"离线"理解成"连官方桌面端都不许装"。
   * 判据：`tests/test_install_entry.py::DshInstallLogicTests`（6 条，含 BOM/解析与文本契约）。
 - **判据**：`tests/test_harness_agent.py`（单一注册、`available()` 两种模式、`requested()` 与
   `desktop_mode`）、`tests/test_boot_state.py`（只有 dsh 一行、autoStart 三态）、
