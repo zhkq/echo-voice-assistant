@@ -58,8 +58,31 @@ from typing import Any, Dict, List, Optional
 #: `server_advertised` 是 2026-09-30 加的（用户实测的 bug：容器里发出的配对串带的是
 #: Docker 网桥地址 `172.18.0.2`，同事连不上）—— 与 `server_limits` 同一个第三类：
 #: "这台后端**对外**是谁"，一行一个字符串，没有任何业务概念。
+#:
+#: **2026-11-03 的收费功能评审（设计 `docs/后端收费-交付给服务器dsh/01-后端收费与自动配对-设计.md` §4.1）**：
+#: 收费必然要在服务端存"关于**人**与**钱**的管理数据"，这与"服务端不存业务数据"
+#: 不冲突 —— 它仍然不存**请求内容**（音频、转写文本、嵌入）。新增的十张表全部
+#: 属于同一类："谁、买了什么、还有多少、什么时候到期"。逐张的理由：
+#:
+#: | 表 | 为什么可以落在这里 |
+#: |---|---|
+#: | `plans` | 套餐模板（价格 / 天数 / 额度），**不含任何人的数据** |
+#: | `users` | 账号：工号（唯一）、姓名、支付身份；管理数据 |
+#: | `user_devices` | 账号 ↔ 设备绑定；撤销/换机/设备上限的依据 |
+#: | `invites` | 邀请码（谁能注册）；防外传的管理数据 |
+#: | `orders` / `order_events` | 订单与状态流水（金额、状态、时间）；对账必需 |
+#: | `alipay_notify` | 支付回调原文与去重（`trade_no` 唯一）；对账/排障必需，**不含请求内容** |
+#: | `entitlements` | 权益（到期时间 / 额度 / 状态）；就是"还有多少" |
+#: | `authorized_open_ids` / `scan_sessions` | 设计 §3.5.9 的 Phase 4 白名单/扫码会话，**先建表、逻辑不做** |
+#:
+#: 这十张表都**没有**"内容"列（音频/文本/嵌入/说话人），由
+#: `tests/test_server_contract.py::AuthSchemaTests` 的列名黑名单逐列核对。
 TABLE_WHITELIST = ("clients", "pairing_codes", "calls", "admin_users", "admin_audit",
-                   "server_limits", "server_advertised")
+                   "server_limits", "server_advertised",
+                   # 收费（2026-11-03，设计 §4.1）—— 见上面那段逐张的理由。
+                   "plans", "users", "user_devices", "invites",
+                   "authorized_open_ids", "scan_sessions",
+                   "orders", "order_events", "alipay_notify", "entitlements")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS clients (
@@ -154,6 +177,131 @@ CREATE TABLE IF NOT EXISTS server_advertised (
     updated_at REAL NOT NULL DEFAULT 0,
     updated_by TEXT NOT NULL DEFAULT ''
 );
+
+-- ================================================================ 收费（2026-11-03）
+-- 设计：`docs/后端收费-交付给服务器dsh/01-后端收费与自动配对-设计.md` §4.1。十张表都只存**管理数据**
+-- （谁、买了什么、到什么时候、还有多少、调用计数），不存请求内容。
+-- 列名刻意避开 §8.5 的"内容/业务概念"黑名单（那份黑名单在护栏用例里）。
+
+-- 套餐模板。**价格与额度只在这里**（代码里不写死）；管理面可改价/下架。
+CREATE TABLE IF NOT EXISTS plans (
+    code                TEXT PRIMARY KEY,
+    name                TEXT NOT NULL DEFAULT '',
+    price_cents         INTEGER NOT NULL DEFAULT 0,
+    days                INTEGER NOT NULL DEFAULT 30,
+    daily_audio_minutes REAL NOT NULL DEFAULT 0,
+    tts_chars           INTEGER NOT NULL DEFAULT 0,
+    qps                 INTEGER NOT NULL DEFAULT 1,
+    max_devices         INTEGER NOT NULL DEFAULT 3,
+    max_concurrent      INTEGER NOT NULL DEFAULT 1,
+    active              INTEGER NOT NULL DEFAULT 1,
+    sort                INTEGER NOT NULL DEFAULT 0
+);
+-- 账号（人）。`employee_no` 唯一（空串不参与唯一：支付即注册那条路可以没有工号）。
+-- `token_version` 是 logout/重置设备的撤销机制：userToken 里带 `ver`，比对不上即失效。
+CREATE TABLE IF NOT EXISTS users (
+    user_id       TEXT PRIMARY KEY,
+    name          TEXT NOT NULL DEFAULT '',
+    employee_no   TEXT NOT NULL DEFAULT '',
+    phone         TEXT NOT NULL DEFAULT '',
+    alipay_open_id TEXT NOT NULL DEFAULT '',
+    status        TEXT NOT NULL DEFAULT 'active',
+    token_version INTEGER NOT NULL DEFAULT 1,
+    created_at    REAL NOT NULL,
+    updated_at    REAL NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_users_employee_no
+    ON users(employee_no) WHERE employee_no <> '';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_users_alipay_open_id
+    ON users(alipay_open_id) WHERE alipay_open_id <> '';
+-- 人 ↔ 设备。`client_id` 唯一：一台设备只属于一个人（换人要走解绑/迁移）。
+CREATE TABLE IF NOT EXISTS user_devices (
+    user_id     TEXT NOT NULL,
+    client_id   TEXT NOT NULL,
+    device_name TEXT NOT NULL DEFAULT '',
+    bound_at    REAL NOT NULL DEFAULT 0,
+    last_seen   REAL NOT NULL DEFAULT 0,
+    status      TEXT NOT NULL DEFAULT 'active'
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_user_devices_client ON user_devices(client_id);
+CREATE INDEX IF NOT EXISTS idx_user_devices_user ON user_devices(user_id, status);
+-- 邀请码（谁能注册）。`used` 在同一个事务里 +1，`max_uses` 到了就拒。
+CREATE TABLE IF NOT EXISTS invites (
+    code       TEXT PRIMARY KEY,
+    max_uses   INTEGER NOT NULL DEFAULT 1,
+    used       INTEGER NOT NULL DEFAULT 0,
+    expires_at REAL NOT NULL DEFAULT 0,
+    created_by TEXT NOT NULL DEFAULT '',
+    note       TEXT NOT NULL DEFAULT ''
+);
+-- 白名单（设计 §3.5.9，Phase 4：**先建表、逻辑不做**）。
+CREATE TABLE IF NOT EXISTS authorized_open_ids (
+    open_id    TEXT PRIMARY KEY,
+    user_id    TEXT NOT NULL DEFAULT '',
+    source     TEXT NOT NULL DEFAULT 'admin',
+    status     TEXT NOT NULL DEFAULT 'active',
+    note       TEXT NOT NULL DEFAULT '',
+    created_at REAL NOT NULL DEFAULT 0
+);
+-- 扫码授权会话（设计 §3.5.9，Phase 4：**先建表、逻辑不做**）。
+CREATE TABLE IF NOT EXISTS scan_sessions (
+    id         TEXT PRIMARY KEY,
+    state      TEXT NOT NULL DEFAULT '',
+    status     TEXT NOT NULL DEFAULT 'pending',
+    open_id    TEXT NOT NULL DEFAULT '',
+    created_at REAL NOT NULL DEFAULT 0,
+    expires_at REAL NOT NULL DEFAULT 0
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_scan_sessions_state ON scan_sessions(state);
+-- 订单。`status` 只许前进：created → paying → paid → (refunded|closed)；
+-- `expires_at` 是未支付订单的关闭时刻；`meta` 只放 JSON 元数据（payUrl 之类）。
+CREATE TABLE IF NOT EXISTS orders (
+    order_id        TEXT PRIMARY KEY,
+    plan_code       TEXT NOT NULL DEFAULT '',
+    amount_cents    INTEGER NOT NULL DEFAULT 0,
+    status          TEXT NOT NULL DEFAULT 'created',
+    user_id         TEXT NOT NULL DEFAULT '',
+    client_id       TEXT NOT NULL DEFAULT '',
+    pairing_code_id TEXT NOT NULL DEFAULT '',
+    alipay_trade_no TEXT NOT NULL DEFAULT '',
+    created_at      REAL NOT NULL DEFAULT 0,
+    paid_at         REAL NOT NULL DEFAULT 0,
+    expires_at      REAL NOT NULL DEFAULT 0,
+    meta            TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_orders_user ON orders(user_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status, created_at);
+-- 订单流水（审计/对账）。`payload` 只放 JSON 元数据。
+CREATE TABLE IF NOT EXISTS order_events (
+    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id TEXT NOT NULL DEFAULT '',
+    type     TEXT NOT NULL DEFAULT '',
+    payload  TEXT NOT NULL DEFAULT '',
+    at       REAL NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_order_events_order ON order_events(order_id, at);
+-- 支付回调原文 + 幂等。`trade_no` 是主键 —— 同一笔回调重复到达只会有第一行生效。
+CREATE TABLE IF NOT EXISTS alipay_notify (
+    trade_no TEXT PRIMARY KEY,
+    order_id TEXT NOT NULL DEFAULT '',
+    raw      TEXT NOT NULL DEFAULT '',
+    verified INTEGER NOT NULL DEFAULT 0,
+    at       REAL NOT NULL DEFAULT 0
+);
+-- 权益归**人**（`user_id` 主键）。到期/退款时把 `status` 改掉即失效。
+CREATE TABLE IF NOT EXISTS entitlements (
+    user_id             TEXT PRIMARY KEY,
+    plan_code           TEXT NOT NULL DEFAULT '',
+    paid_until          REAL NOT NULL DEFAULT 0,
+    daily_audio_minutes REAL NOT NULL DEFAULT 0,
+    tts_chars           INTEGER NOT NULL DEFAULT 0,
+    qps                 INTEGER NOT NULL DEFAULT 1,
+    max_devices         INTEGER NOT NULL DEFAULT 3,
+    max_concurrent      INTEGER NOT NULL DEFAULT 1,
+    status              TEXT NOT NULL DEFAULT 'active',
+    order_id            TEXT NOT NULL DEFAULT '',
+    updated_at          REAL NOT NULL DEFAULT 0
+);
 """
 
 #: `CREATE TABLE IF NOT EXISTS` 对**已经存在**的表不会补列 ——
@@ -179,6 +327,11 @@ _ADDED_COLUMNS = {
     "pairing_codes": (
         ("name", "TEXT NOT NULL DEFAULT ''"),
         ("scopes", "TEXT NOT NULL DEFAULT ''"),
+        # 收费（2026-11-03）：这张码属于哪个 user、是哪一类码。
+        # `purchase` = 支付成功发的配对码；`device-bind` = 换机/重装的一次性绑定码。
+        # 空 = 老语义（管理员发码 / 本机自动配对），兑换后不绑 user。
+        ("user_id", "TEXT NOT NULL DEFAULT ''"),
+        ("kind", "TEXT NOT NULL DEFAULT ''"),
     ),
 }
 
@@ -632,7 +785,8 @@ class Store:
     # ---------------------------------------------------------------- 配对码
 
     def put_pairing_code(self, code_hash: str, ttl_s: float, created_by: str = "",
-                         name: str = "", scopes: str = "", client_id: str = "") -> None:
+                         name: str = "", scopes: str = "", client_id: str = "",
+                         user_id: str = "", kind: str = "") -> None:
         """存一张待用的配对码。
 
         `name` / `scopes` 是**这张码将要创建的那个客户端**的身份 ——
@@ -645,16 +799,33 @@ class Store:
         非空 = 兑换时**复用那个身份、只轮换 secret**（给已知机器换凭据的语义）。
         这一列在建表时就有，但一直恒为空，于是"同一台机器每重新配对一次就多一个
         client_id"（dev 实测 12 行全叫「本机客户端」）——「一台机器一个身份」的根治点在这。
+
+        `user_id` / `kind`（2026-11-03，收费）：这张码绑定的账号与用途。
+        `kind=purchase` 是支付成功后发给新用户的码；`kind=device-bind` 是换机码
+        （两者都复用这张表，**不新造第二套码**）。空 = 老语义（不绑账号）。
         """
         now = time.time()
         with self._lock:
             self._db.execute(
                 "INSERT INTO pairing_codes "
-                "(code_hash, created_at, expires_at, created_by, name, scopes, client_id) "
-                "VALUES (?,?,?,?,?,?,?)",
+                "(code_hash, created_at, expires_at, created_by, name, scopes, client_id,"
+                " user_id, kind) "
+                "VALUES (?,?,?,?,?,?,?,?,?)",
                 (code_hash, now, now + float(ttl_s), created_by, str(name or ""),
-                 str(scopes or ""), str(client_id or "")))
+                 str(scopes or ""), str(client_id or ""), str(user_id or ""),
+                 str(kind or "")))
             self._db.commit()
+
+    def peek_pairing_code(self, code_hash: str) -> Optional[Dict[str, Any]]:
+        """**只读**取一张码（不删）。给"兑换前的准入预检"用（设备上限/权益）。
+
+        兑换本身仍然只能走 `take_pairing_code()`（原子取+删）；这里的读结果
+        只是**预检**，权威判定在兑换那一刻。读不到 = 码不存在/已用/已被清。
+        """
+        with self._lock:
+            row = self._db.execute("SELECT * FROM pairing_codes WHERE code_hash=?",
+                                   (str(code_hash or ""),)).fetchone()
+        return dict(row) if row else None
 
     def take_pairing_code(self, code_hash: str) -> Optional[Dict[str, Any]]:
         """**取出并删除**（设计 §8.5："用掉即删"）。
@@ -709,3 +880,412 @@ class Store:
             cur = self._db.execute("DELETE FROM pairing_codes WHERE expires_at < ?", (now,))
             self._db.commit()
             return int(cur.rowcount or 0)
+
+    # ================================================================ 收费（2026-11-03）
+    #
+    # 这一段的每个方法都只读写**管理数据**（套餐 / 账号 / 绑定 / 订单 / 权益），
+    # 不碰任何请求内容。读写都走同一把 `_lock`，与其它表同一个口径。
+
+    # ---------------------------------------------------------------- 套餐
+
+    def plans(self, *, active_only: bool = False) -> List[Dict[str, Any]]:
+        with self._lock:
+            sql = "SELECT * FROM plans"
+            if active_only:
+                sql += " WHERE active=1"
+            sql += " ORDER BY sort, code"
+            rows = self._db.execute(sql).fetchall()
+        return [dict(r) for r in rows]
+
+    def plan(self, code: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self._db.execute("SELECT * FROM plans WHERE code=?",
+                                   (str(code or ""),)).fetchone()
+        return dict(row) if row else None
+
+    def seed_plans(self, rows: List[Dict[str, Any]]) -> int:
+        """**只补缺**（`INSERT OR IGNORE`）：已经存在的套餐不覆盖。
+
+        为什么不是 upsert：管理面改过价/下架过的套餐，不能每次重启又被种子覆盖回去
+        —— 那会让"我在管理面改的价"看起来像没生效。返回补了几行。
+        """
+        cols = ("code", "name", "price_cents", "days", "daily_audio_minutes",
+                "tts_chars", "qps", "max_devices", "max_concurrent", "active", "sort")
+        added = 0
+        with self._lock:
+            for row in rows or []:
+                if not row.get("code"):
+                    continue
+                values = tuple(row.get(c, 0) for c in cols)
+                cur = self._db.execute(
+                    "INSERT OR IGNORE INTO plans (%s) VALUES (%s)"
+                    % (", ".join(cols), ", ".join("?" * len(cols))), values)
+                added += int(cur.rowcount or 0)
+            self._db.commit()
+        return added
+
+    def upsert_plan(self, row: Dict[str, Any]) -> None:
+        """建/改一个套餐（值由 `billing.parse_plan()` 校验过，这里不重复校验）。"""
+        cols = ("code", "name", "price_cents", "days", "daily_audio_minutes",
+                "tts_chars", "qps", "max_devices", "max_concurrent", "active", "sort")
+        values = tuple(row.get(c, 0) for c in cols)
+        with self._lock:
+            self._db.execute(
+                "INSERT INTO plans (%s) VALUES (%s) ON CONFLICT(code) DO UPDATE SET %s"
+                % (", ".join(cols), ", ".join("?" * len(cols)),
+                   ", ".join("%s=excluded.%s" % (c, c) for c in cols if c != "code")),
+                values)
+            self._db.commit()
+
+    def delete_plan(self, code: str) -> bool:
+        """**硬删**一个套餐（内部/测试用；管理面走 `set_plan_active(False)` 下架）。
+
+        已有订单不受影响：订单里存的是当时的 `amount_cents` 与 plan_code，
+        权益里也复制了额度 —— 删模板不会改变已卖出去的东西。但**未支付的订单**
+        在支付回调时还要读 plan 才能算天数，所以管理面只下架、不硬删。
+        """
+        with self._lock:
+            cur = self._db.execute("DELETE FROM plans WHERE code=?", (str(code or ""),))
+            self._db.commit()
+            return bool(cur.rowcount)
+
+    def set_plan_active(self, code: str, active: bool) -> bool:
+        """上架 / 下架（管理面的「删」）。下架后不能再下单，但已支付的订单
+        仍然能读到这个 plan 算天数/额度。"""
+        with self._lock:
+            cur = self._db.execute("UPDATE plans SET active=? WHERE code=?",
+                                   (1 if active else 0, str(code or "")))
+            self._db.commit()
+            return bool(cur.rowcount)
+
+    # ---------------------------------------------------------------- 账号
+
+    def create_user(self, user_id: str, *, name: str = "", employee_no: str = "",
+                    phone: str = "", alipay_open_id: str = "",
+                    status: str = "active") -> Dict[str, Any]:
+        """建一个账号。`employee_no`/`alipay_open_id` 撞唯一索引时抛 `ValueError`。
+
+        调用方（`account.register()`）会先查重，但唯一索引才是并发下的权威 ——
+        两个请求同时用同一个工号注册时，先提交的那个赢，另一个必须拿到
+        `employee_no_taken` 而不是两行。
+        """
+        now = time.time()
+        try:
+            with self._lock:
+                self._db.execute(
+                    "INSERT INTO users (user_id, name, employee_no, phone, alipay_open_id,"
+                    " status, token_version, created_at, updated_at)"
+                    " VALUES (?,?,?,?,?,?,1,?,?)",
+                    (str(user_id), str(name or ""), str(employee_no or ""),
+                     str(phone or ""), str(alipay_open_id or ""), str(status or "active"),
+                     now, now))
+                self._db.commit()
+        except sqlite3.IntegrityError as exc:
+            raise ValueError(str(exc))
+        return self.user(user_id) or {}
+
+    def user(self, user_id: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self._db.execute("SELECT * FROM users WHERE user_id=?",
+                                   (str(user_id or ""),)).fetchone()
+        return dict(row) if row else None
+
+    def user_by_employee_no(self, employee_no: str) -> Optional[Dict[str, Any]]:
+        if not str(employee_no or "").strip():
+            return None
+        with self._lock:
+            row = self._db.execute("SELECT * FROM users WHERE employee_no=?",
+                                   (str(employee_no).strip(),)).fetchone()
+        return dict(row) if row else None
+
+    def user_by_alipay_open_id(self, open_id: str) -> Optional[Dict[str, Any]]:
+        if not str(open_id or "").strip():
+            return None
+        with self._lock:
+            row = self._db.execute("SELECT * FROM users WHERE alipay_open_id=?",
+                                   (str(open_id).strip(),)).fetchone()
+        return dict(row) if row else None
+
+    def users(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            rows = self._db.execute("SELECT * FROM users ORDER BY created_at").fetchall()
+        return [dict(r) for r in rows]
+
+    def update_user(self, user_id: str, **fields) -> bool:
+        allowed = {"name", "phone", "alipay_open_id", "status"}
+        sets = [(k, v) for k, v in fields.items() if k in allowed]
+        if not sets:
+            return False
+        with self._lock:
+            cur = self._db.execute(
+                "UPDATE users SET %s, updated_at=? WHERE user_id=?"
+                % ", ".join("%s=?" % k for k, _ in sets),
+                tuple(v for _, v in sets) + (time.time(), str(user_id)))
+            self._db.commit()
+            return bool(cur.rowcount)
+
+    def bump_user_token_version(self, user_id: str) -> int:
+        """撤销这个账号已发出的 userToken（logout / 重置设备）。返回新版本号。"""
+        with self._lock:
+            self._db.execute(
+                "UPDATE users SET token_version=token_version+1, updated_at=?"
+                " WHERE user_id=?", (time.time(), str(user_id)))
+            self._db.commit()
+            row = self._db.execute("SELECT token_version FROM users WHERE user_id=?",
+                                   (str(user_id),)).fetchone()
+        return int(row["token_version"]) if row else 0
+
+    def delete_user(self, user_id: str) -> bool:
+        """删一个刚建出来、但注册后半步失败的账号（邀请码被抢光的回滚路径）。
+
+        **只给注册的回滚用**：正常删账号会让订单/权益变成孤儿，管理面没有这个动作。
+        """
+        with self._lock:
+            cur = self._db.execute("DELETE FROM users WHERE user_id=?", (str(user_id),))
+            self._db.commit()
+            return bool(cur.rowcount)
+
+    # ---------------------------------------------------------------- 设备绑定
+
+    def upsert_device(self, user_id: str, client_id: str, device_name: str = "") -> None:
+        now = time.time()
+        with self._lock:
+            self._db.execute(
+                "INSERT INTO user_devices (user_id, client_id, device_name, bound_at,"
+                " last_seen, status) VALUES (?,?,?,?,?,'active')"
+                " ON CONFLICT(client_id) DO UPDATE SET user_id=excluded.user_id,"
+                " device_name=excluded.device_name, status='active', last_seen=excluded.last_seen",
+                (str(user_id), str(client_id), str(device_name or ""), now, now))
+            self._db.commit()
+
+    def devices(self, user_id: str, *, include_revoked: bool = False) -> List[Dict[str, Any]]:
+        with self._lock:
+            sql = "SELECT * FROM user_devices WHERE user_id=?"
+            if not include_revoked:
+                sql += " AND status='active'"
+            sql += " ORDER BY bound_at"
+            rows = self._db.execute(sql, (str(user_id),)).fetchall()
+        return [dict(r) for r in rows]
+
+    def device_for_client(self, client_id: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self._db.execute("SELECT * FROM user_devices WHERE client_id=?",
+                                   (str(client_id or ""),)).fetchone()
+        return dict(row) if row else None
+
+    def count_devices(self, user_id: str) -> int:
+        with self._lock:
+            row = self._db.execute(
+                "SELECT COUNT(*) AS n FROM user_devices WHERE user_id=? AND status='active'",
+                (str(user_id),)).fetchone()
+        return int(row["n"] if row else 0)
+
+    def revoke_device(self, user_id: str, client_id: str) -> bool:
+        with self._lock:
+            cur = self._db.execute(
+                "UPDATE user_devices SET status='revoked' WHERE user_id=? AND client_id=?"
+                " AND status='active'", (str(user_id), str(client_id)))
+            self._db.commit()
+            return bool(cur.rowcount)
+
+    # ---------------------------------------------------------------- 邀请码
+
+    def put_invite(self, code: str, *, max_uses: int = 1, expires_at: float = 0,
+                   created_by: str = "", note: str = "") -> None:
+        with self._lock:
+            self._db.execute(
+                "INSERT INTO invites (code, max_uses, used, expires_at, created_by, note)"
+                " VALUES (?,?,0,?,?,?) ON CONFLICT(code) DO UPDATE SET"
+                " max_uses=excluded.max_uses, expires_at=excluded.expires_at,"
+                " created_by=excluded.created_by, note=excluded.note",
+                (str(code or "").upper(), max(1, int(max_uses or 1)),
+                 float(expires_at or 0), str(created_by or ""), str(note or "")))
+            self._db.commit()
+
+    def invite(self, code: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self._db.execute("SELECT * FROM invites WHERE code=?",
+                                   (str(code or "").upper(),)).fetchone()
+        return dict(row) if row else None
+
+    def invites(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            rows = self._db.execute("SELECT * FROM invites ORDER BY code").fetchall()
+        return [dict(r) for r in rows]
+
+    def consume_invite(self, code: str, now: Optional[float] = None) -> bool:
+        """原子地消费一次邀请码。返回"消费成功吗"（不存在/过期/用满 → False）。
+
+        **判定与 +1 在同一个 `BEGIN IMMEDIATE` 里**：否则两个人同时用最后
+        一次名额都能成功。
+        """
+        now = time.time() if now is None else float(now)
+        normalized = str(code or "").upper()
+        with self._lock:
+            try:
+                self._db.execute("BEGIN IMMEDIATE")
+                row = self._db.execute("SELECT * FROM invites WHERE code=?",
+                                       (normalized,)).fetchone()
+                if row is None:
+                    self._db.rollback()
+                    return False
+                if float(row["expires_at"] or 0) and float(row["expires_at"]) < now:
+                    self._db.rollback()
+                    return False
+                if int(row["used"] or 0) >= int(row["max_uses"] or 0):
+                    self._db.rollback()
+                    return False
+                self._db.execute("UPDATE invites SET used=used+1 WHERE code=?",
+                                 (normalized,))
+                self._db.commit()
+                return True
+            except Exception:
+                self._db.rollback()
+                raise
+
+    def delete_invite(self, code: str) -> bool:
+        with self._lock:
+            cur = self._db.execute("DELETE FROM invites WHERE code=?",
+                                   (str(code or "").upper(),))
+            self._db.commit()
+            return bool(cur.rowcount)
+
+    # ---------------------------------------------------------------- 订单
+
+    def create_order(self, row: Dict[str, Any]) -> None:
+        cols = ("order_id", "plan_code", "amount_cents", "status", "user_id",
+                "client_id", "pairing_code_id", "alipay_trade_no", "created_at",
+                "paid_at", "expires_at", "meta")
+        values = tuple(row.get(c, 0) for c in cols)
+        with self._lock:
+            self._db.execute(
+                "INSERT INTO orders (%s) VALUES (%s)"
+                % (", ".join(cols), ", ".join("?" * len(cols))), values)
+            self._db.commit()
+
+    def order(self, order_id: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self._db.execute("SELECT * FROM orders WHERE order_id=?",
+                                   (str(order_id or ""),)).fetchone()
+        return dict(row) if row else None
+
+    def update_order(self, order_id: str, **fields) -> bool:
+        allowed = {"status", "pairing_code_id", "alipay_trade_no", "paid_at",
+                   "expires_at", "client_id", "meta"}
+        sets = [(k, v) for k, v in fields.items() if k in allowed]
+        if not sets:
+            return False
+        with self._lock:
+            cur = self._db.execute(
+                "UPDATE orders SET %s WHERE order_id=?"
+                % ", ".join("%s=?" % k for k, _ in sets),
+                tuple(v for _, v in sets) + (str(order_id),))
+            self._db.commit()
+            return bool(cur.rowcount)
+
+    def orders(self, *, status: str = "", user_id: str = "", limit: int = 200
+               ) -> List[Dict[str, Any]]:
+        limit = max(1, min(1000, int(limit or 200)))
+        sql = "SELECT * FROM orders"
+        where, args = [], []
+        if status:
+            where.append("status=?")
+            args.append(str(status))
+        if user_id:
+            where.append("user_id=?")
+            args.append(str(user_id))
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY created_at DESC LIMIT ?"
+        args.append(limit)
+        with self._lock:
+            rows = self._db.execute(sql, tuple(args)).fetchall()
+        return [dict(r) for r in rows]
+
+    def orders_created_since(self, since_ts: float, user_id: str = "") -> int:
+        with self._lock:
+            if user_id:
+                row = self._db.execute(
+                    "SELECT COUNT(*) AS n FROM orders WHERE created_at>=? AND user_id=?",
+                    (float(since_ts), str(user_id))).fetchone()
+            else:
+                row = self._db.execute(
+                    "SELECT COUNT(*) AS n FROM orders WHERE created_at>=?",
+                    (float(since_ts),)).fetchone()
+        return int(row["n"] if row else 0)
+
+    def insert_order_event(self, order_id: str, event_type: str,
+                           payload: str = "") -> None:
+        with self._lock:
+            self._db.execute(
+                "INSERT INTO order_events (order_id, type, payload, at) VALUES (?,?,?,?)",
+                (str(order_id), str(event_type), str(payload or ""), time.time()))
+            self._db.commit()
+
+    def order_events(self, order_id: str) -> List[Dict[str, Any]]:
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT * FROM order_events WHERE order_id=? ORDER BY id",
+                (str(order_id),)).fetchall()
+        return [dict(r) for r in rows]
+
+    def record_notify(self, trade_no: str, order_id: str, raw: str = "",
+                      verified: bool = False) -> bool:
+        """记一条支付回调。**返回 False = 这笔回调之前已经记过**（幂等）。
+
+        `trade_no` 是主键：重复/并发的同一笔通知只有第一条能写进去，
+        调用方据此决定"跳过重复处理"。
+        """
+        try:
+            with self._lock:
+                self._db.execute(
+                    "INSERT INTO alipay_notify (trade_no, order_id, raw, verified, at)"
+                    " VALUES (?,?,?,?,?)",
+                    (str(trade_no), str(order_id), str(raw or ""),
+                     1 if verified else 0, time.time()))
+                self._db.commit()
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
+    def notify_record(self, trade_no: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self._db.execute("SELECT * FROM alipay_notify WHERE trade_no=?",
+                                   (str(trade_no),)).fetchone()
+        return dict(row) if row else None
+
+    # ---------------------------------------------------------------- 权益
+
+    def entitlement(self, user_id: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self._db.execute("SELECT * FROM entitlements WHERE user_id=?",
+                                   (str(user_id or ""),)).fetchone()
+        return dict(row) if row else None
+
+    def entitlements(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT * FROM entitlements ORDER BY updated_at DESC").fetchall()
+        return [dict(r) for r in rows]
+
+    def upsert_entitlement(self, row: Dict[str, Any]) -> None:
+        cols = ("user_id", "plan_code", "paid_until", "daily_audio_minutes",
+                "tts_chars", "qps", "max_devices", "max_concurrent", "status",
+                "order_id", "updated_at")
+        values = tuple(row.get(c, 0) for c in cols)
+        with self._lock:
+            self._db.execute(
+                "INSERT INTO entitlements (%s) VALUES (%s)"
+                " ON CONFLICT(user_id) DO UPDATE SET %s"
+                % (", ".join(cols), ", ".join("?" * len(cols)),
+                   ", ".join("%s=excluded.%s" % (c, c) for c in cols if c != "user_id")),
+                values)
+            self._db.commit()
+
+    def set_entitlement_status(self, user_id: str, status: str) -> bool:
+        with self._lock:
+            cur = self._db.execute(
+                "UPDATE entitlements SET status=?, updated_at=? WHERE user_id=?",
+                (str(status or ""), time.time(), str(user_id)))
+            self._db.commit()
+            return bool(cur.rowcount)

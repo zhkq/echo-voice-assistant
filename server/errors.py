@@ -10,6 +10,7 @@
 """
 from __future__ import annotations
 
+import time
 from typing import Optional
 
 
@@ -54,10 +55,15 @@ def forbidden(detail: str = "") -> EchoError:
     return EchoError(403, "forbidden", "该凭据没有这项能力的权限", detail=detail)
 
 
-def client_busy() -> EchoError:
-    """该客户端自己已有请求在跑。**重试永远不会成功** —— 客户端该等自己那条回来。"""
+def client_busy(detail: str = "") -> EchoError:
+    """该客户端自己已有请求在跑。**重试永远不会成功** —— 客户端该等自己那条回来。
+
+    `detail` 用来区分"这台设备自己"与"同一个账号的另一台设备"（收费后按 user 的
+    并发闸门，见 `docs/后端收费-交付给服务器dsh/01-后端收费与自动配对-设计.md` §4.4）：code/status 仍然相同。
+    """
     return EchoError(409, "client_busy",
-                     "你已有一个请求正在处理，请等它结束", detail="每客户端同时只允许 1 个")
+                     "你已有一个请求正在处理，请等它结束",
+                     detail=detail or "每客户端同时只允许 1 个")
 
 
 def payload_too_large(limit: int) -> EchoError:
@@ -123,3 +129,88 @@ def gpu_oom(detail: str = "") -> EchoError:
 def inference_timeout(seconds: float) -> EchoError:
     return EchoError(504, "inference_timeout", "处理超时",
                      detail="超过 %.0f 秒" % float(seconds))
+
+
+# ---------------------------------------------------------------- 收费（2026-11-03）
+#
+# 同样"名字即契约"：客户端按 code 决定"去开通 / 去续费 / 等一会 / 先解绑"，
+# 所以下面每个分支都必须有自己的 code，**不许合并成一个 402**。
+
+def entitlement_missing() -> EchoError:
+    """没开通（从来没有过权益）。客户端该给的按钮是「去开通」。"""
+    return EchoError(402, "entitlement_missing", "这个账号还没有开通套餐",
+                     detail="购买套餐后再用这台后端")
+
+
+def entitlement_expired(paid_until: float = 0) -> EchoError:
+    """套餐到期。**配对与数据都保留**，续费即恢复（设计 §4.4 的到期策略）。
+
+    与 `entitlement_missing` 分开：客户端对"去续费"与"去开通"给的是不同的按钮。
+    """
+    return EchoError(402, "entitlement_expired", "套餐已到期，续费后恢复",
+                     detail=("有效期至 %s" % time.strftime("%Y-%m-%d", time.localtime(paid_until))
+                             if paid_until else "已过期"))
+
+
+def entitlement_inactive(status: str = "") -> EchoError:
+    """权益被冻结 / 已退款（管理面动作）。**立即失效**（设计 §4.4）。"""
+    return EchoError(402, "entitlement_inactive", "套餐已停用，请联系管理员",
+                     detail=str(status or "inactive"))
+
+
+def billing_disabled() -> EchoError:
+    """这台后端没开收费功能。客户端按"没有购买入口"静默降级（设计 §5.3）。
+
+    404 而不是 403/503：旧客户端根本不该看到这个功能；新客户端按 404 隐藏入口。
+    """
+    return EchoError(404, "billing_disabled", "这台后端没有开通收费功能")
+
+
+def plan_not_found(code: str = "") -> EchoError:
+    return EchoError(404, "plan_not_found", "没有这个套餐", detail=str(code or ""))
+
+
+def order_not_found(order_id: str = "") -> EchoError:
+    return EchoError(404, "order_not_found", "没有这个订单", detail=str(order_id or ""))
+
+
+def user_not_found(user_id: str = "") -> EchoError:
+    return EchoError(404, "user_not_found", "没有这个账号", detail=str(user_id or ""))
+
+
+def order_state_conflict(status: str = "", wanted: str = "") -> EchoError:
+    """订单状态机只许前进（设计 §4.6）。当前状态不允许这个动作。"""
+    return EchoError(409, "order_state_conflict", "订单当前状态不允许这个操作",
+                     detail="当前 %s，需要 %s" % (status or "?", wanted or "?"))
+
+
+def invite_invalid(reason: str = "") -> EchoError:
+    """邀请码不存在 / 过期 / 次数用满。**统一一个 code**：别让人拿它枚举码。"""
+    return EchoError(403, "invite_invalid", "邀请码无效或已用完",
+                     detail=str(reason or ""))
+
+
+def employee_no_taken() -> EchoError:
+    return EchoError(409, "employee_no_taken", "这个工号已经注册过")
+
+
+def device_limit_reached(limit: int) -> EchoError:
+    """设备数到上限（设计 §3.5.10）。客户端该引导"先解绑旧设备"。"""
+    return EchoError(403, "device_limit_reached",
+                     "设备数已满（上限 %d 台），请先解绑旧设备" % int(limit),
+                     detail="管理面 / 面板都可以解绑")
+
+
+def device_revoked() -> EchoError:
+    """这台设备已被解绑（换机/找回）。**403 而不是 401**：认得出它，但不许用。"""
+    return EchoError(403, "device_revoked", "这台设备已被解绑，请重新绑定")
+
+
+def payment_unconfigured() -> EchoError:
+    """支付没配好（或本轮只有 Mock、真实网关未接入）。
+
+    **503 而不是启动失败**（任务书 §5.2）：没配支付时服务必须能起来，
+    只是下单接口明确说"支付未配置"；**绝不静默降级成 Mock**。
+    """
+    return EchoError(503, "payment_unconfigured", "支付未配置",
+                     detail="请配置 payment.provider 与对应网关参数")
