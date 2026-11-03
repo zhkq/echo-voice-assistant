@@ -23,13 +23,16 @@ from fastapi.responses import JSONResponse
 from server.jsonx import SafeJSONResponse
 
 from server import __version__, engines
+from server import account as account_mod
 from server import admin as admin_mod
 from server import advertised as advertised_mod
 from server import auth as auth_mod
+from server import billing as billing_mod
 from server import calls as calls_mod
 from server import errors as E
 from server import limits as limits_mod
 from server import ops as ops_mod
+from server import payment as payment_mod
 from server import relay as relay_mod
 from server import routes as routes_mod
 from server import settings as settings_mod
@@ -139,6 +142,28 @@ def create_app(cfg=None) -> FastAPI:
                         "IP**（如 ECHO_ADVERTISED_HOST=10.100.0.24）；"
                         "后端只服务本机时不需要它（走本机自配对文件，地址是 127.0.0.1）。")
         auth_obj = auth_mod.Auth(cfg, store)
+        # 收费（2026-11-03）：套餐/订单/权益 + 账号/设备。**默认关**；
+        # 关着时这些服务仍然造出来（`enabled=False`），但所有闸门直接放行 ——
+        # 老部署的行为一个字节都不变。
+        billing_svc = billing_mod.BillingService(cfg, store, auth_obj)
+        if billing_svc.enabled:
+            try:
+                added = billing_svc.seed()
+                if added:
+                    log.info("收费：补了 %d 个出厂套餐（已存在的套餐不会被覆盖）", added)
+            except Exception as e:                             # pragma: no cover - 兜底
+                log.warning("收费：套餐种子写入失败（不影响启动）：%s", e)
+            if not bool(cfg.get("auth.enabled", False)):
+                log.warning("收费开着，但 auth.enabled=false —— 能力请求没有客户端身份，"
+                            "无法映射到账号；请同时打开配对鉴权（设计 §3.5.5）。")
+            if billing_svc.provider == "mock":
+                log.warning("收费：支付网关是 **Mock** —— /v1/billing/mock/* 已注册，"
+                            "任何人都能模拟付款。生产必须切 payment.provider=alipay。")
+            elif billing_svc.provider == "alipay" and not getattr(
+                    billing_svc.gateway, "configured", False):
+                log.warning("收费：payment.provider=alipay 但 app_id/私钥/公钥没配全 —— "
+                            "下单会明确回 503 payment_unconfigured（不会降级成 Mock）。")
+        account_svc = account_mod.AccountService(cfg, store, auth_obj, billing_svc)
         # 跨进程撤销的发现机制（设计 §7.5 ④）。**命令行 `--revoke` 是另一个进程**，
         # 没有它的话，跑着的服务会继续接受已撤销的 JWT 直到缓存自己过期。
         auth_obj.watcher.start()
@@ -153,7 +178,8 @@ def create_app(cfg=None) -> FastAPI:
         )
         call_log.start()
         app.state.echo = routes_mod.State(cfg, pool, sweeper, auth=auth_obj,
-                                         call_log=call_log)
+                                         call_log=call_log, billing_svc=billing_svc,
+                                         account=account_svc)
         # 管理面（设计 §8.4）：**独立端口上的控制台**（2026-09-25 起带写端点，
         # 全部要求管理员会话 + 同站 Origin + 非简单请求标志头，见 `server/admin.py`）。
         # 等 state 造好再起 —— 它读的就是那份状态（池 / 配额账本 / metrics / 调用记录），
@@ -317,6 +343,15 @@ def create_app(cfg=None) -> FastAPI:
     )
 
     app.include_router(routes_mod.router)
+    # 收费的账号 / 订单路由（2026-11-03）。**幂等**：billing 关着时端点回
+    # 404 `billing_disabled`，旧客户端按"没有购买入口"静默降级（设计 §5.3）。
+    app.include_router(account_mod.router)
+    app.include_router(billing_mod.router)
+    # Mock 支付端点**只在显式 provider=mock 时存在**（任务书 T4 的判据）：
+    # alipay/disabled 下这些路径根本没有注册，不是"存在但拒绝"。
+    if (bool(cfg.get("billing.enabled", False))
+            and str(cfg.get("payment.provider", "disabled") or "").lower() == "mock"):
+        app.include_router(payment_mod.mock_router)
     # 中继（relay）：手机与主机互相连不通时，借这台服务器中转（见 server/relay.py）。
     # 中枢是**进程级内存态** —— 与部署形态（单进程，见 Dockerfile 的 CMD）一致；
     # 将来改多 worker 必须换成外部登记，否则会出现"手机连 A、主机挂 B"的随机 503。

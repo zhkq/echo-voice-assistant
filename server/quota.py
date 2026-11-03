@@ -38,8 +38,10 @@ def _seconds_until_tomorrow(now: Optional[datetime.datetime] = None) -> int:
     于是它在 0 点前后打转。
     """
     now = now or datetime.datetime.now()
+    # **保留 tzinfo**：收费那本账用的是 `Asia/Shanghai` 的 aware datetime
+    # （`zone_clock`）；拼一个 naive 的明天会变成 "aware - naive" → TypeError。
     tomorrow = datetime.datetime.combine(now.date() + datetime.timedelta(days=1),
-                                         datetime.time.min)
+                                         datetime.time.min, tzinfo=now.tzinfo)
     return max(1, int((tomorrow - now).total_seconds()))
 
 
@@ -161,3 +163,102 @@ def open_ledger(cfg, limit_for=None) -> QuotaLedger:
     """按配置造一个账本。`limits.daily_audio_minutes` 缺省 0 = 不限。"""
     return QuotaLedger(default_minutes=float(cfg.get("limits.daily_audio_minutes", 0) or 0),
                        limit_for=limit_for)
+
+
+# ---------------------------------------------------------------- 按账号的日额度（2026-11-03）
+
+def zone_clock(name: str):
+    """按 IANA 时区取"此刻"的时钟（设计 §5.4：每日 0 点按 `Asia/Shanghai`）。
+
+    取不到那个时区就退回本机本地时间 —— **不猜一个错的偏移**（UTC 会让 0 点偏 8 小时）。
+    """
+    try:
+        from zoneinfo import ZoneInfo
+        zone = ZoneInfo(str(name or "Asia/Shanghai"))
+    except Exception:                                           # pragma: no cover - 兜底
+        return datetime.datetime.now
+
+    def _now():
+        return datetime.datetime.now(zone)
+    return _now
+
+
+class CharLedger:
+    """按账号记"今天用了多少**字符**"（TTS 日额度，设计 §4.4）。
+
+    **本仓库当前没有 `/v1/tts` 端点**（客户端 TTS 不走能力后端），所以这个账本
+    目前只在测试与将来的端点上使用；接上时在端点里调 `check()` / `add()` 即可。
+    语义与 `QuotaLedger` 完全一致：`limit <= 0` = 不限；跨自然日清零；
+    超了 `429 quota_exceeded`（与 ASR 日额度同一个 code，客户端处理一致）。
+
+    **为什么 TTS 超额选 429 而不是 402**（任务书 §5.2 要求"按设计选一种并写清"）：
+    402 留给"没开通/已到期"（要换按钮：去开通/去续费），429 是"今天的量用完了"
+    （明天恢复）。TTS 字符用满属于后者，客户端该显示"今天额度用完了"，
+    而不是"去开通"。
+    """
+
+    def __init__(self, limit_for=None, clock=None):
+        self._limit_for = limit_for
+        self._clock = clock or datetime.datetime.now
+        self._lock = threading.Lock()
+        self._day = self._today()
+        self._used: Dict[str, int] = {}
+
+    def _today(self) -> str:
+        return self._clock().date().isoformat()
+
+    def _rollover_locked(self) -> None:
+        today = self._today()
+        if today != self._day:
+            self._day = today
+            self._used = {}
+
+    def _limit_locked(self, account_id: str) -> int:
+        if self._limit_for is None:
+            return 0
+        try:
+            return max(0, int(self._limit_for(account_id) or 0))
+        except Exception:
+            return 0
+
+    def check(self, account_id: str, *, add_chars: int = 0) -> None:
+        """额度用完就 429。`add_chars > 0` 时按"加上这次之后是否超"预判。"""
+        aid = str(account_id or "")
+        with self._lock:
+            self._rollover_locked()
+            limit = self._limit_locked(aid)
+            if limit <= 0:
+                return
+            used = self._used.get(aid, 0)
+            add = max(0, int(add_chars))
+            # 没有"这次要加多少"时按"已经用完"判（与 `QuotaLedger.check` 的 >= 一致）；
+            # 给了待加字符时按"加上之后会不会超"预判。
+            if (used + add > limit) if add else (used >= limit):
+                raise errors.quota_exceeded(_seconds_until_tomorrow(self._clock()))
+
+    def add(self, account_id: str, chars: int) -> None:
+        try:
+            value = int(chars)
+        except (TypeError, ValueError):
+            return
+        if value <= 0:
+            return
+        aid = str(account_id or "")
+        with self._lock:
+            self._rollover_locked()
+            self._used[aid] = self._used.get(aid, 0) + value
+
+    def remaining(self, account_id: str) -> Optional[int]:
+        """今天还剩多少字符；不限 → `None`。"""
+        aid = str(account_id or "")
+        with self._lock:
+            self._rollover_locked()
+            limit = self._limit_locked(aid)
+            if limit <= 0:
+                return None
+            return max(0, limit - self._used.get(aid, 0))
+
+    def snapshot(self) -> Dict[str, Any]:
+        with self._lock:
+            self._rollover_locked()
+            return {"day": self._day, "accounts": dict(self._used)}
