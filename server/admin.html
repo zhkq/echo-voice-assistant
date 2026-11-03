@@ -435,8 +435,10 @@ async function viewClients() {
     <div class="muted" style="margin-top:8px">
       危险动作（<b>撤销 / 轮换 secret / 作废配对码</b>）会先弹确认，请求里还带
       <code>confirm</code> —— 前端弹窗挡手滑，后端那个字段挡"直接构造一个请求"。<br>
-      <b>撤销</b>是 <code>token_version + 1</code>，<b>立刻</b>生效（管理面与能力面同进程、
-      共用同一个鉴权缓存）；<b>禁用</b>只是 403，凭据没失效，随时能再启用。</div></div>`;
+      <b>撤销</b>是 <code>token_version + 1</code> + 盖撤销标记：旧令牌<b>立刻</b>失效，
+      而且它<b>不许再用 secret 换新令牌</b>（管理面与能力面同进程、共用同一个鉴权缓存，
+      当场生效）；被撤销的机器要恢复只能<b>重新配对</b>。<b>禁用</b>只是 403，
+      凭据没失效，随时能再启用。</div></div>`;
 }
 
 function bindClients() {

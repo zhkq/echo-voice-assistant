@@ -188,23 +188,21 @@ def node_report() -> dict:
 
 
 def agent_report() -> dict:
-    """两个智能体后端各自的状态：桌面客户端（只能检测）与标准版（能一键准备）。"""
+    """DSH 引擎现状（**一套 DSH**：桌面版在跑、或 ECHO 起的无头 dsh 在跑，都算在线）。
+
+    2026-11-03 真机：这里原来固定用 `DshAgent`（只认桌面版 43120），于是"官方桌面端没开、
+    ECHO 自己起了无头 dsh"的机器在向导里被报成「DSH Desktop 没在运行」，用户以为没装好。
+    现在直接问注册表里的 `dsh` 适配器（`HarnessAgent.available()` 自己按 desktop/headless 判断）。
+    保留 `harness` 这个键只为兼容面板旧渲染（值镜像 dsh）。
+    """
     dsh = {"online": False, "detail": ""}
     try:
-        from app.agents.dsh_agent import DshAgent
-        ok, detail = DshAgent().available()
+        from app.agents import get_agent
+        ok, detail = get_agent("dsh").available(probe=True)
         dsh = {"online": bool(ok), "detail": str(detail)}
     except Exception as exc:
         dsh = {"online": False, "detail": "探测失败：%s" % exc}
-    harness = {"online": False, "detail": "", "command": ""}
-    try:
-        from app import harness_proc
-        state, detail = harness_proc.status()
-        harness = {"online": state == "online", "detail": str(detail),
-                   "command": harness_proc.command()}
-    except Exception as exc:
-        harness = {"online": False, "detail": "探测失败：%s" % exc, "command": ""}
-    return {"dsh": dsh, "harness": harness}
+    return {"dsh": dsh, "harness": dict(dsh)}
 
 
 def recommend(env: dict) -> dict:
@@ -235,8 +233,8 @@ def recommend(env: dict) -> dict:
                         if vram else "没检测到独立显卡：这一步用不上"),
         "agent": "agent-harness",
         "agentReady": agent_ready,
-        "agentReason": ("标准版可以一键准备" if node.get("ok")
-                        else "标准版需要先装 Node.js；也可以改用已装好的桌面客户端"),
+        "agentReason": ("DSH 已就绪（桌面版或无头 dsh 在跑）" if agent_ready
+                        else "DSH 没在运行：面板「启动页」点启动；官方桌面端没装就重跑安装器"),
     }
 
 
@@ -572,6 +570,10 @@ def _agent_backend_rows(choice: str) -> list:
     if not cid:
         return []
     want = cid[len("agent-"):] if cid.startswith("agent-") else cid
+    # 2026-11-03 一套 DSH：`harness` 已退役，向导里的「标准版」选项统一落到 `dsh`
+    # （注册表里只有 dsh/codebuddy；写 harness 会被 active_name 静默降级，等于没生效）。
+    if want == "harness":
+        want = "dsh"
     try:
         from app import agents as agents_mod
         known = list(agents_mod.names())

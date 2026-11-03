@@ -530,15 +530,20 @@ def _require_client(auth, client_id: str) -> Dict[str, Any]:
 
 
 def revoke_client(cfg, auth, client_id: str) -> Dict[str, Any]:
-    """撤销 = `token_version + 1`。**这是撤销能立即生效的全部机制**（设计 §7.5 ④）。
+    """撤销一个客户端：**旧令牌作废，而且不许再用 secret 换新令牌**（设计 §7.5 ④）。
 
-    `auth.cache.revoke()` **先落库、再让本地缓存失效**：
-    管理面与能力面在同一个进程里（共用同一个 `Auth`），所以这条路**当场**生效；
-    命令行是另一个进程，它改的库由 `RevocationWatcher` 在
-    `auth.revoke_poll_s`（默认 5 秒）内发现 —— 两者都如实回报，不混成一句"立即"。
+    2026-11-03 修：这里原来只 `auth.cache.revoke()`（版本 +1）。已签发的令牌确实
+    下一个请求就 401 —— 但客户端手里有 secret，401 之后会自动换一个新的回来
+    （`app/capabilities/echo_server.py::_request` 的 `_force_renew`）。**真机表现
+    就是"撤销了，客户端还能继续转写"**：`cli-619e43` 撤销后一小时仍在调用。
+
+    现在改走 `Auth.revoke()`：版本 +1 **并且**盖 `revoked_at`（`/v1/token` 与认证
+    都拒它）。延迟不变：管理面与能力面同进程 → 当场生效；命令行是另一个进程，
+    它改的库由 `RevocationWatcher` 在 `auth.revoke_poll_s`（默认 5 秒）内发现 ——
+    两者都如实回报，不混成一句"立即"。
     """
     _require_client(auth, client_id)
-    version = auth.cache.revoke(client_id)
+    version = auth.revoke(client_id)
     if not version:
         raise errors.EchoError(404, "client_not_found", "没有这个客户端", detail=str(client_id))
     return {"ok": True, "clientId": str(client_id), "tokenVersion": int(version),
@@ -551,13 +556,19 @@ def set_client_disabled(cfg, auth, client_id: str, disabled: bool) -> Dict[str, 
     **`disabled` 与 `token_version` 是两回事**：禁用只是把那一位置 1（客户端收到
     403「认识你但不许用」），启用把它置回 0 之后**它手上那个令牌仍然有效**
     （版本号没变、scopes 没变），不需要重新换令牌。
+
+    ⚠️ 但"已撤销"的那一位不归这里管（2026-11-03）：撤销过的客户端就算 `disabled=0`，
+    `/v1/token` 与认证仍会拒它（要**重新配对**）。所以 `tokenStillValid` 必须把
+    `revoked_at` 一起算进去 —— 不然"启用成功"会骗人。
     """
     _require_client(auth, client_id)
     auth.set_disabled(client_id, bool(disabled))
     row = auth.store.client(client_id) or {}
+    revoked = float(row.get("revoked_at") or 0) > 0
     return {"ok": True, "clientId": str(client_id), "disabled": bool(disabled),
+            "revoked": revoked,
             "tokenVersion": int(row.get("token_version") or 0),
-            "tokenStillValid": not bool(disabled)}
+            "tokenStillValid": (not bool(disabled)) and not revoked}
 
 
 def set_client_scopes(cfg, auth, client_id: str, scopes: str) -> Dict[str, Any]:

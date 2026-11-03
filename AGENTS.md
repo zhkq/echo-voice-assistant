@@ -1,5 +1,35 @@
 # AGENTS.md — 给 AI/协作者的长期约定与踩坑记录
 
+## 2026-11-03 **撤销客户端 ≠ 只让旧令牌失效**（真机：撤销了还能转写）
+
+用户原话：*"cli-619e43 这个授权我已经撤销了，但是客户端还是能转写"* —— 是真的。
+
+- **根因**：`token_version + 1` 只杀死**已经发出去**的 JWT；客户端手里还有 **secret**，
+  而 `/v1/token`（`Auth.token_for`）当时**不看 `revoked_at`**。客户端
+  `app/capabilities/echo_server.py::_request` 的 401 分支（`_force_renew`）会拿那个仍然
+  有效的 secret **立刻换一个新令牌**回来 —— "撤销"对真实客户端等于没做。
+  真机证据：`cli-619e43` 在 `13:41:41Z` 被撤（`revoked_at`/`token_version=2`），
+  `clients.last_seen` 仍是 `14:50:53Z`（撤销后一小时还在转写）；现网用旧 secret 打
+  `/v1/token` 仍回 **200 + 新令牌**。
+- **修法（两半都要，缺一不可）**：① `Auth.token_for()` 与 `Auth.authenticate()` 先看
+  `revoked_at`，已撤销一律 401（`unauthenticated`/`unauthorized`，文案"这个客户端已被撤销，
+  需要重新配对"）；② `Auth.redeem()` 复用 client_id 时 `store.revive(cid)` ——
+  重新配对 = 重新授权，否则新 secret 兑出来"配上了却用不了"（`/v1/token` 拒它、列表也不显示）。
+  入口统一：`ops.revoke_client()` → `Auth.revoke()`；命令行 / 管理面共用。
+- **语义边界（别做过头）**：撤销**不销毁** secret（`Store.revive()` 保留"误标一次能回退"，
+  行也留着——那是管理员的账）。要彻底废凭据用 `--rotate-secret`（无宽限期）。两者别混。
+- **已经撤销过的老行**：因为判据是现读的 `revoked_at`，改完**部署即生效**，不用逐条 rotate。
+- **客户端会"重试续命"这条要记住**：服务端任何"凭据级"的切断（撤销/禁用/轮换）都要问一句
+  "它能不能自己再换一个令牌回来？" —— 能，就等于没切。
+- **判据**：`tests/test_server_contract.py::AuthTokenTests`
+  `test_revoke_forbids_reissuing_a_token_with_the_old_secret`、
+  `test_repairing_a_revoked_client_clears_the_revoked_mark`、
+  `test_revive_restores_the_old_credential`；冲突面 `test_admin_console.py`（`tokenVersion`
+  2/3/4、写端点白名单）。文档：`docs/ECHO能力后端-服务端设计.md` §7.5 ④ 的"第二批事故"。
+- **顺带修掉一条已红的门禁**：`test_admin_console.IsolationTests.test_every_write_endpoint_is_registered`
+  的能力面白名单漏了方案 B 的 `/v1/delegate`、`/v1/delegate/revoke`、`/v1/tts`
+  （a70620de 加端点时没补）—— HEAD 上本来就在红，已补登记。
+
 ## 2026-11-03 一套 DSH（**取代本文所有"桌面版 + 标准版 harness 两套"的旧口径**）
 
 用户原话：**"我不能接受用户用两套 dsh"**。定案并已落地（Windows 先行；mac 的官方桌面版

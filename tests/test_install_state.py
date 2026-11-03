@@ -74,16 +74,27 @@ class NoLocalEnginesTests(unittest.TestCase):
         self.assertEqual(want["agent"], "harness")
 
     def test_missing_has_no_local_model_items(self):
-        with patch.object(install_state, "_node_ok", lambda: True), \
-                patch.object(install_state, "_harness_online", lambda: True), \
+        with patch.object(install_state, "_dsh_online", lambda: True), \
                 patch("app.config.settings.get",
                       lambda k, d=None: "harness" if k == "agentBackend" else d):
             miss = install_state.missing({"agent": "harness"})
         self.assertEqual(miss, [])
 
+    def test_a_headless_dsh_counts_as_online(self):
+        """一套 DSH：官方桌面端没开、ECHO 自己起的无头 dsh 在线，也算"智能体就绪"。
+
+        2026-11-03 真机：这里只看桌面版（43120），于是无头 dsh 在线的机器一直挂横幅
+        「DSH Desktop 没在运行（你选的是桌面版）」、向导也不收尾。
+        """
+        with patch("app.manager.dsh_ready", return_value=False), \
+                patch("app.harness_proc.online", return_value=True), \
+                patch("app.config.settings.get",
+                      lambda k, d=None: "dsh" if k == "agentBackend" else d):
+            self.assertTrue(install_state._dsh_online())
+            self.assertEqual(install_state.missing({"agent": "dsh"}), [])
+
     def test_state_exposes_empty_engine_list(self):
-        with patch.object(install_state, "_node_ok", lambda: True), \
-                patch.object(install_state, "_harness_online", lambda: True), \
+        with patch.object(install_state, "_dsh_online", lambda: True), \
                 patch("app.config.settings.get",
                       lambda k, d=None: "harness" if k == "agentBackend" else d):
             st = install_state.state()

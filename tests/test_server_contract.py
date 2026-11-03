@@ -2076,15 +2076,65 @@ class AuthTokenTests(unittest.TestCase):
         self.assertEqual(ctx.exception.status, 401)
         self.assertIn("撤销", str(ctx.exception.detail) or str(ctx.exception))
 
-    def test_token_signed_before_revoke_is_still_refused_after_reissue(self):
-        """撤销后再换的新令牌版本号已经变了，旧令牌**永远**回不来。"""
+    def test_revoke_forbids_reissuing_a_token_with_the_old_secret(self):
+        """**撤销之后，不许再用同一份 secret 换新令牌**（2026-11-03 真机）。
+
+        原来只做 `token_version + 1`：旧令牌废了，但客户端手里还有 secret，
+        `/v1/token` 也不看撤销标记 —— 于是它在 401 之后自己换一个新的回来
+        （`app/capabilities/echo_server.py::_request` 的 `_force_renew`），
+        "撤销"在真实客户端上等于没做。
+
+        真机证据：`cli-619e43` 在 13:41:41Z 被撤销，`last_seen` 仍是 14:50:53Z ——
+        撤销后一小时还在转写。
+
+        判据三侧：① 旧令牌 401；② `token_for(旧 secret)` 也是 401（不是"再给一个"）；
+        ③ 走的是运维真实入口 `ops.revoke_client`（CLI 与管理面共用它）。
+        """
         old = self._bearer()
-        self.auth.cache.revoke(self.client_id)
-        fresh = self._bearer()
-        self.assertNotEqual(old, fresh)
-        self.auth.authenticate(fresh)
-        with self.assertRaises(errors.EchoError):
+        ver = ops_mod.revoke_client(self.cfg, self.auth, self.client_id)["tokenVersion"]
+        self.assertEqual(ver, 2)
+        with self.assertRaises(errors.EchoError) as ctx:
             self.auth.authenticate(old)
+        self.assertEqual(ctx.exception.status, 401)
+
+        with self.assertRaises(errors.EchoError) as ctx:
+            self.auth.token_for(self.basic)          # 旧 secret 换新令牌
+        self.assertEqual(ctx.exception.status, 401)
+        self.assertIn("撤销", str(ctx.exception.detail) or str(ctx.exception))
+
+    def test_revive_restores_the_old_credential(self):
+        """撤销**不销毁** secret（`Store.revive()` 的语义）：误标一次要能回退。
+
+        这与上一条不矛盾：撤销时不再接受它，但凭据本身还在；`revive()` 把它收回之后，
+        同一份 secret 又能换令牌了 —— 所以"误标"是可逆的，别把 `revoked_at` 做成判决。
+        """
+        self.auth.revoke(self.client_id)
+        self.store.revive(self.client_id)
+        out = self.auth.token_for(self.basic)
+        self.assertEqual(out["clientId"], self.client_id)
+        self.auth.authenticate("Bearer " + out["accessToken"])
+
+    def test_repairing_a_revoked_client_clears_the_revoked_mark(self):
+        """重新配对 = **重新授权**：新 secret 能用，且它要回到客户端列表里。
+
+        2026-11-03：`Auth.redeem()` 复用 client_id 时只 `rotate_secret()`，
+        没清 `revoked_at` —— 一张新码兑出来的客户端会"配上了却用不了"
+        （`/v1/token` 拒它、管理面列表也看不到它）。
+        """
+        self.auth.revoke(self.client_id)
+        code = self.auth.create_pairing_code("ops", client_id=self.client_id)
+        paired = self.auth.redeem(code, "再次配对")
+        self.assertEqual(paired["clientId"], self.client_id)
+
+        row = self.store.client(self.client_id)
+        self.assertEqual(float(row.get("revoked_at") or 0), 0, "重新配对没有收回撤销标记")
+        self.assertIn(self.client_id, [r["client_id"] for r in self.store.clients()])
+        # **新 secret** 能换令牌；**旧 secret** 不行（复用身份不等于沿用旧凭据）
+        basic2 = "Basic " + base64.b64encode(
+            ("%s:%s" % (self.client_id, paired["secret"])).encode()).decode()
+        self.assertEqual(self.auth.token_for(basic2)["clientId"], self.client_id)
+        with self.assertRaises(errors.EchoError):
+            self.auth.token_for(self.basic)
 
     def test_disabled_client_gets_403_not_401(self):
         """禁用是"我认识你，但不许用" —— 403。与 401（不知道你是谁）语义不同。"""
@@ -2744,6 +2794,34 @@ class AdminCliTests(unittest.TestCase):
         store = auth_mod.open_store(cfg)
         self.assertEqual(store.client(out["clientId"])["token_version"], 2)
         store.close()
+
+    def test_enable_on_a_revoked_client_says_repair_is_needed(self):
+        """启用**不能**把"已撤销"抹掉（2026-11-03）：撤销是凭据级切断，只有重新配对能恢复。
+
+        命令行那句"它手上的凭据仍然有效"在撤销场景下是假话 —— 实测 `cli-619e43`
+        `--enable` 之后 `/v1/token` 仍是 401。文案必须分开，而且这里顺手钉住那个 401
+        （不是只有文案改对了）。
+        """
+        cfg = settings_mod.load(self.cfg_path)
+        store = auth_mod.open_store(cfg)
+        a = auth_mod.Auth(cfg, store)
+        out = a.redeem(a.create_pairing_code(), "撤销后启用")
+        store.close()
+        self._run("--revoke", out["clientId"])
+        self._run("--disable", out["clientId"])
+        rc, text = self._run("--enable", out["clientId"])
+        self.assertEqual(rc, 0)
+        self.assertIn("重新配对", text)
+
+        cfg = settings_mod.load(self.cfg_path)
+        store = auth_mod.open_store(cfg)
+        a = auth_mod.Auth(cfg, store)
+        basic = "Basic " + base64.b64encode(
+            ("%s:%s" % (out["clientId"], out["secret"])).encode()).decode()
+        with self.assertRaises(errors.EchoError) as ctx:
+            a.token_for(basic)                       # 启用了也换不到令牌
+        store.close()
+        self.assertEqual(ctx.exception.status, 401)
 
     # ---- 2026-09-24 补齐的管理动作 ----------------------------------------
 

@@ -760,8 +760,10 @@ def create_admin_app(cfg, state, *, perf=None) -> FastAPI:
 
     @api.post("/clients/{client_id}/revoke")
     async def revoke_client(request: Request, client_id: str):
-        """撤销（**危险动作**：要带 `confirm`）：`token_version + 1`，令牌立刻失效。
+        """撤销（**危险动作**：要带 `confirm`）：`token_version + 1` 且盖 `revoked_at`。
 
+        **不只是"让旧令牌失效"**：撤销过的客户端也不许再用 secret 换新令牌，
+        否则客户端 401 之后会自己续一个（2026-11-03 真机：撤销后仍能转写）。
         管理面与能力面在**同一个进程**、共用同一个 `Auth` 缓存，
         所以这里改完**当场**生效（不是"最多 5 秒"，那是命令行/多实例那条路）。
         """

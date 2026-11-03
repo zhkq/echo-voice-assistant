@@ -268,17 +268,16 @@ class BuildPlanTests(_PlanTestCase):
         self.assertIn("providerAsr", [c["key"] for c in plan["config"]])
 
     def test_agent_choice_writes_the_backend_name_not_the_component_id(self):
-        """选「标准版」要写**注册表里的名字** + 它自己的启用开关（与面板那套一致）。
+        """一套 DSH（2026-11-03）：向导里的「标准版」选项也统一落到 `dsh`。
 
-        2026-09-20 实测踩到两处：向导原来把**组件 id** 当名字写（`agent-harness`），
-        `agents.active_name()` 不认这个名字 → 静默降级回 dsh，用户的选择等于没生效；
-        而且漏了 `agentHarnessEnabled`，`harness_proc.requested()` 恒假 → harness 永不拉起。
+        旧故事（别复活）：向导曾把组件 id 当名字写（`agent-harness`），active_name 不认 →
+        静默降级；又漏了启用开关 → harness 永不拉起。现在注册表只有 dsh/codebuddy，
+        `harness` 已退役，所以两种写法都必须归一成 `dsh`，且不再写 `agentHarnessEnabled`。
         """
         cfg = {c["key"]: c["value"]
                for c in wizard.build_plan({"agent": "agent-harness"})["config"]}
-        self.assertEqual(cfg["agentBackend"], "harness")
-        self.assertIs(cfg["agentHarnessEnabled"], True)
-        # 没有 config_key 的产品（dsh）不需要额外开关
+        self.assertEqual(cfg["agentBackend"], "dsh")
+        self.assertNotIn("agentHarnessEnabled", cfg)
         cfg2 = {c["key"]: c["value"] for c in wizard.build_plan({"agent": "dsh"})["config"]}
         self.assertEqual(cfg2["agentBackend"], "dsh")
         self.assertNotIn("agentHarnessEnabled", cfg2)
@@ -379,7 +378,7 @@ class ExecutePlanTests(_PlanTestCase):
                                      settings_update=lambda values: list(values),
                                      start_download=lambda mid: (True, "ok"),
                                      ready=lambda mid: True)
-        self.assertEqual(calls, [["agentBackend", "agentHarnessEnabled"]])
+        self.assertEqual(calls, [["agentBackend"]])
         self.assertFalse(result["ok"], "联动失败要登记进结果（末页据此回答「还不能做什么」）")
         self.assertTrue(any("agent" in str(f.get("component") or "") for f in result["failed"]))
 

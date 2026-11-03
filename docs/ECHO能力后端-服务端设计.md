@@ -1238,6 +1238,24 @@ POST /v1/token
 > 代价是"改了却没动 `updated_at`"的写入发现不了 —— 所以 `store.py` 里
 > **每一处改 `clients` 的地方都显式写了 `updated_at`**。
 
+> **第二批事故（2026-11-03）：撤销只让"已签发的令牌"失效，挡不住客户端自己续命。**
+> `token_version + 1` 只杀死**已经发出去**的 JWT；客户端手里还有 **secret**，
+> 而 `/v1/token` 当时不看撤销标记 —— 于是客户端（`app/capabilities/echo_server.py`
+> 的 401 分支 `_force_renew`）用还有效的 secret 立刻换一个新令牌回来。
+> 真机证据：`cli-619e43` 在 `13:41:41Z` 被撤销，`clients.last_seen` 仍是 `14:50:53Z`，
+> 撤销后一小时还在转写。
+>
+> 修法（两半都要）：
+> 1. `Auth.token_for()` / `Auth.authenticate()` 先看 `revoked_at` → 已撤销一律 401
+>    （**不只是**比对 `token_version`）；
+> 2. `Auth.redeem()` 复用 client_id 时清掉 `revoked_at` —— 重新配对 = 重新授权，
+>    否则新 secret 兑出来却"配上了用不了"。
+>
+> 语义边界：撤销**不销毁** secret（`Store.revive()` 保留"误标可回退"），
+> 要彻底废掉凭据用 `--rotate-secret`。契约由
+> `AuthTokenTests.test_revoke_forbids_reissuing_a_token_with_the_old_secret`、
+> `..._test_repairing_a_revoked_client_clears_the_revoked_mark` 钉住。
+
 #### ⑤ 轮换，而不是重新配对
 
 secret 泄漏或例行轮换时，**不要让用户再跑一趟输配对码**：
@@ -2041,6 +2059,9 @@ test_the_admin_value_wins_over_the_environment_variable` 与
 | 改过载荷（例如把 `ver` 改大）签名就对不上 | ✅ | `AuthTokenTests.test_tampered_payload_is_refused` |
 | 过期令牌被拒；60 秒时钟偏差被容忍 | ✅ | `AuthTokenTests.test_expired_token_is_refused` / `test_clock_skew_is_tolerated` |
 | **撤销在下一个请求就生效**（同进程） | ✅ | `AuthTokenTests.test_revoke_takes_effect_on_the_very_next_request` |
+| **撤销后不许再用 secret 换新令牌**（否则客户端 401 后自己续命，2026-11-03 真机） | ✅ | `AuthTokenTests.test_revoke_forbids_reissuing_a_token_with_the_old_secret` |
+| 重新配对 = 重新授权：收回撤销标记、新 secret 能用 | ✅ | `AuthTokenTests.test_repairing_a_revoked_client_clears_the_revoked_mark` |
+| `revive()` 可回退误标，且**不销毁** secret | ✅ | `AuthTokenTests.test_revive_restores_the_old_credential` |
 | **另一个进程的撤销 ≤ 轮询间隔被发现** | ✅ | `AuthTokenTests.test_revoke_from_another_process_is_eventually_noticed` |
 | 轮询探针能发现**禁用**（不只是撤销） | ✅ | `AuthTokenTests.test_watcher_notices_disable_too_not_just_revoke` |
 | 没变化就不刷缓存（幂等） | ✅ | `AuthTokenTests.test_watcher_only_refreshes_when_something_actually_changed` |

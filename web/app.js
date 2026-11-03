@@ -1906,7 +1906,7 @@ const SET_CARDS = {
     { id: "ai", title: "AI 组件",
       hint: "用哪个能力：谁来执行、转写用本机还是在线、朗读用在线还是本机。",
       common: () => renderAiCardCommon(),
-      covers: ["agentBackend", "harnessHome", "dshBaseUrl", "agentCustomPath",
+      covers: ["agentBackend", "dshAutoStart", "dshHome", "harnessHome", "dshBaseUrl", "agentCustomPath",
                "harnessCommand", "harnessPort", "harnessToken",
                "agentCodebuddyEnabled", "agentHarnessEnabled",
                "capabilityMeetingAsrBackend", "capabilityDiarizeBackend",
@@ -7271,27 +7271,25 @@ function wizRenderLlm(host) {
 /* ---------------- S7 智能体后端（默认标准 DSH） ---------------- */
 function wizRenderAgent(host) {
   const agents = (_wizEnv && _wizEnv.agents) || {};
-  const node = (_wizEnv && _wizEnv.node) || {};
   const std = agents.harness || {}, desk = agents.dsh || {};
+  // 2026-11-03 一套 DSH：不再有"标准版 harness / 需要 Node.js"这一档。
+  // 桌面版在跑、或 ECHO 自己起的无头 dsh 在跑，都算"已经就绪"。
+  const online = !!(desk.online || std.online);
+  const detail = String(desk.detail || std.detail || "");
   host.innerHTML = wizCard("让 ECHO 能动手",
     "上面几步让 ECHO 能「听懂」和「写字」，这一步让它能<b>动手</b>：把纪要存进你的笔记库、按你的话去整理文件。",
     "不能帮你操作电脑、整理笔记 —— 转写和纪要不受影响。",
-    wizOption("__std__", _wizChoices.agent === "agent-harness",
-        { label: "DSH 标准版（推荐）", sizeMb: 0, name: "wizagent",
-          note: node.ok ? "点一下我来准备，需要联网，大约几分钟；以后归我管"
-                        : "需要先装 Node.js（我会给你入口）" })
-    + wizOption("dsh", _wizChoices.agent === "dsh",
-        { label: "我已经装了 DSH 桌面客户端", sizeMb: 0, name: "wizagent",
-          note: desk.online ? "检测到它正在运行 ✓" : "我会自动找到它并检查" })
+    wizOption("__std__", _wizChoices.agent === "agent-harness" || !_wizChoices.agent,
+        { label: "DSH（官方 DeepSeek Harness 桌面端自带）", sizeMb: 0, name: "wizagent",
+          note: online ? "已经在跑 ✓" : "点一下准备：会安装/启动官方桌面端（没装则联网下载，约 289 MB）" })
     + wizOption("__none__", !_wizChoices.agent,
         { label: "先不用", sizeMb: 0, name: "wizagent", note: "以后想加：面板 → 能力 → 随时补" })
-    + (std.online ? `<div class="muted">标准版已经在运行 ✓</div>` : "")
-    + (desk.detail ? `<div class="muted">桌面客户端：${esc(desk.detail)}</div>` : "")
+    + `<div class="muted">DSH 状态：${online ? "在线 ✓" : "没在运行"}${detail ? "（" + esc(detail) + "）" : ""}</div>`
     + `<div><button class="btn" id="wizProbeAgents">检测一下</button></div>`);
   wizWhy(host);
   wizBindPicks(host, (el) => {
     const v = el.dataset.wizpick;
-    _wizChoices.agent = v === "__none__" ? "" : (v === "__std__" ? "agent-harness" : v);
+    _wizChoices.agent = v === "__none__" ? "" : "agent-harness";
   });
   const probe = $("#wizProbeAgents", host);
   if (probe) probe.addEventListener("click", async () => {
