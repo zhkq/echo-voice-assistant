@@ -416,8 +416,8 @@ class BillingService:
             self.user_quota.check(str(user_id))
 
     def check_tts_quota(self, user_id: str, chars: int = 0) -> None:
-        """TTS 日字符额度。**当前仓库没有 `/v1/tts` 端点**（见 README 的说明），
-        所以这里只提供判定；将来端点接上时在请求里调它/`State.tts_ledger` 即可。"""
+        """TTS 日字符额度。`/v1/tts`（edge-tts 通道）在读 body 后按
+        `len(text)` 预判，合成成功才记账（见 `server/routes.py::tts`）。"""
         if self.tts_ledger is not None:
             self.tts_ledger.check(str(user_id), add_chars=int(chars or 0))
 

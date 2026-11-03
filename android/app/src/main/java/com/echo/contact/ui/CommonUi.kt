@@ -30,6 +30,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import com.echo.contact.data.dto.CommandItem
+import com.echo.contact.service.SpeakPlan
 import com.echo.contact.ui.theme.EchoPalette
 import kotlinx.coroutines.delay
 
@@ -254,13 +255,18 @@ internal fun CommandRow(
                         overflow = TextOverflow.Ellipsis,
                         modifier = Modifier.weight(1f),
                     )
+                    // 历史行只念结论：SpeakPlan 优先 speakText，其次 brief/首段摘要；
+                    // 详情仍留在上面的 reply 里给眼睛看。电脑发起的指令不念。
+                    val spoken = SpeakPlan.decide(item)
                     onSpeak?.let { speak ->
-                        IconButton(onClick = { speak(reply) }) {
-                            Icon(
-                                Icons.Default.VolumeUp,
-                                contentDescription = "朗读",
-                                modifier = Modifier.size(18.dp),
-                            )
+                        spoken?.let { text ->
+                            IconButton(onClick = { speak(text) }) {
+                                Icon(
+                                    Icons.Default.VolumeUp,
+                                    contentDescription = "朗读",
+                                    modifier = Modifier.size(18.dp),
+                                )
+                            }
                         }
                     }
                 }

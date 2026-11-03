@@ -161,7 +161,7 @@ class ConfigConsumesTheDeclarations(unittest.TestCase):
             self.assertEqual(self._stored("sttModel"), "base")
             self.assertEqual(self._stored("meetingSttModel"), "small")
             self.assertEqual(self._row("ttsEngine")["options"],
-                             ["auto", "edge-tts", "say", "off"],
+                             ["auto", "edge-tts", "echo-server", "say", "off"],
                              "面板下拉的候选项也要跟着平台走")
             settings._cache = None
             self.assertEqual(settings.get("device"), "cpu")

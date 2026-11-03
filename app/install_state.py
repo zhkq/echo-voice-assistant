@@ -323,10 +323,18 @@ def _harness_online() -> bool:
 
 
 def _dsh_online() -> bool:
-    """选中的是 DSH Desktop 时，问**它自己**在不在（默认 43120）。"""
+    """一套 DSH 是否在线：桌面版（43120）**或** ECHO 起的无头 dsh（43199）任一在跑。
+
+    2026-11-03 真机：这里原来只问 `manager.dsh_ready()`（桌面版），于是"官方桌面端没开、
+    ECHO 自己起了无头 dsh 并在线"的机器被 `/api/install/state` 判成"还有 1 项没就绪"，
+    面板一直挂横幅「DSH Desktop 没在运行（你选的是桌面版）」、向导也不收尾。
+    """
     try:
+        from app import harness_proc
         from app import manager
-        return bool(manager.dsh_ready())
+        if manager.dsh_ready():
+            return True
+        return bool(harness_proc.online(timeout=1.0))
     except Exception:
         return False
 
@@ -414,30 +422,16 @@ def missing(report: dict = None) -> list:
     except Exception:
         pass
     if agent_now in ("harness", "dsh"):
-        # **按选中的那个适配器**判断在不在线。
-        # 原来对 harness 与 dsh 都去问标准版 harness —— 而 `_harness_online()` 在
-        # `harness_proc.requested()` 为假（= agentBackend 不是 harness）时**必然返回 False**，
-        # 于是选了 DSH Desktop 的机器永远被告知"harness 没在运行、还没装完"
-        # （2026-09-23 迁移实测撞到：Desktop 正在跑、面板仍列这一条）。
-        # 与同事报过的「拿另一个适配器的状态判断」是同一个病。
-        if agent_now == "dsh":
-            if not _dsh_online():
-                out.append({"feature": "智能体（会议纪要 / 归档 / 语音指令）",
-                            "reason": "DSH Desktop 没在运行（你选的是桌面版）",
-                            "fix": "启动 DSH Desktop（它是宿主应用，ECHO 只连不拉）；"
-                                   "或在 设置 → 智能体 里改用「标准版 harness」（只要本机有 Node.js）"})
-        elif not _node_ok():
+        # 一套 DSH（2026-11-03）：`harness` 只是旧值，判断与 `dsh` 完全一样 ——
+        # 桌面版在跑（43120）或 ECHO 起的无头 dsh 在跑（43199）都算在线。
+        # 2026-11-03 真机：只问桌面版会把"无头 dsh 在线"误判成"没在运行"。
+        if not _dsh_online():
             out.append({"feature": "智能体（会议纪要 / 归档 / 语音指令）",
-                        "reason": "没找到 Node.js（harness 靠 npx 起）",
-                        "fix": "装 Node.js 后重跑 echo-install 技能（它会把标准版永久装到 "
-                               "`{echoBase}/dsh/app`（老装机在 `<安装目录>/harness/dsh`）"
-                               "并写好启动命令）"})
-        elif not _harness_online():
-            out.append({"feature": "智能体（会议纪要 / 归档 / 语音指令）",
-                        "reason": "harness 没在运行（已选但没起来）",
-                        "fix": "面板 → 服务 → 启动 harness；安装技能会把它永久装到 "
-                               "`{echoBase}/dsh/app`（老装机在 `<安装目录>/harness/dsh`，"
-                               "冷启动约 10 秒），起不来就看 data/logs/harness.log"})
+                        "reason": "DSH 引擎没在跑（桌面版和无头 dsh 都不在线）",
+                        "fix": "在面板「启动页」点 DSH 的「启动」——ECHO 会起无头 dsh；"
+                               "或打开官方 DeepSeek Harness 桌面端（ECHO 会自动改用它）。"
+                               "官方桌面端没装的话，重跑安装器并让它联网装（约 289 MB），"
+                               "或把 dsh-latest-windows-x64.exe 放到 装我.cmd 旁边后重跑。"})
     return out
 
 

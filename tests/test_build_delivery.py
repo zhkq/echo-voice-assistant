@@ -12,12 +12,14 @@
   ④ 缺件要**响亮失败且不留半个资料夹**（半份交付比没有更贵：同事会照着它装）。
 """
 import fnmatch
+import io
 import os
 import shutil
 import sys
 import tempfile
 import unittest
 import zipfile
+from contextlib import redirect_stdout
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -59,6 +61,23 @@ class _Case(unittest.TestCase):
             zf.writestr("%s/runtime/python.exe" % top, "")
             if deps:
                 zf.writestr("%s/runtime/Lib/site-packages/fastapi/__init__.py" % top, "")
+        return p
+
+    def write_mac_kit_zip(self, name="ECHO-kit-macos-20261102-1513.zip", *,
+                          setup_mac=True, components=True, launcher=False):
+        """macOS kit 夹具：`echo-core/mac/setup_mac.sh` + `echo-install/scripts/*.sh`。"""
+        p = self.dist / name
+        top = name[:-4]
+        with zipfile.ZipFile(p, "w") as zf:
+            zf.writestr("%s/echo-core/manifest.json" % top,
+                        '{"platform":"macos-universal"}')
+            if setup_mac:
+                zf.writestr("%s/echo-core/mac/setup_mac.sh" % top, "#!/usr/bin/env bash\n")
+            if components:
+                zf.writestr("%s/echo-install/scripts/echo-install-components.sh" % top,
+                            "#!/usr/bin/env bash\n")
+            if launcher:
+                zf.writestr("%s/%s" % (top, build_kit.KIT_CMD), "@echo off\n")
         return p
 
     def assemble(self, **kw):
@@ -123,6 +142,19 @@ class AssemblyTests(_Case):
             zf.writestr("ECHO-backend-portable-clean-room/server/requirements.txt", "fastapi\n")
         dest, _ = self.assemble(make_the_zip=False)
         self.assertTrue((dest / "ECHO-backend-portable-clean-room.zip").is_file())
+
+    def test_the_maintenance_scripts_are_included(self):
+        """2026-11-02 用户要求「维护脚本也都加进去」：整目录进交付层，清单里也要写。"""
+        self.write_kit_zip()
+        dest, _ = self.assemble(make_the_zip=False)
+        m = dest / build_delivery.MAINTENANCE_DIR
+        self.assertTrue(m.is_dir(), "维护脚本目录没进交付层：%s" % m)
+        self.assertTrue((m / build_delivery.MAINTENANCE_ENTRY).is_file(),
+                        "维护脚本说明（先读我.md）没带上")
+        self.assertTrue(any(p.suffix == ".cmd" for p in m.iterdir()), "缺双击入口 .cmd")
+        self.assertTrue((m / "py").is_dir(), "py 辅助脚本没带上（备份/还原要用）")
+        text = (dest / "清单.txt").read_text(encoding="utf-8")
+        self.assertIn(build_delivery.MAINTENANCE_DIR, text, "清单里没写维护脚本")
 
 
 class LoudFailureTests(_Case):
@@ -276,6 +308,97 @@ class DeliveryFolderLayoutTests(_Case):
         self.assertIn("ECHO-kit-*.zip", text, "脚本要自己找客户端包")
         self.assertIn("tar -xf", text, "自己解开（不用同事右键解压）")
         self.assertIn("install-all.ps1", text, "解完之后接着走安装")
+
+
+class MacDeliveryTests(_Case):
+    """macOS 交付层（`build_delivery --platform macos`，2026-11-02 加）。
+
+    为什么必须单独一组：Windows 层的自检把「kit 里有没有 `装我.cmd`」当合格判据，
+    直接复用到 mac 会永远出不了层；反过来**拿 Windows kit 出 mac 层**必须响亮失败
+    （否则同事拿到一个在他机器上跑不了的包，还会照着它装）。
+    """
+
+    def mac_assemble(self, **kw):
+        kw.setdefault("stamp", "20261102-1513")
+        stamp = kw.pop("stamp")
+        return build_delivery.assemble_macos(stamp, self.dist, **kw)
+
+    def test_it_gathers_the_kit_and_both_documents(self):
+        kit = self.write_mac_kit_zip()
+        dest, out_zip = self.mac_assemble(make_the_zip=False)
+        names = sorted(p.name for p in dest.iterdir())
+        self.assertIn(kit.name, names)
+        self.assertIn(build_kit.KIT_README, names, "先读我.md 要从 mac 模板拷过来")
+        self.assertIn("安装文档.md", names, "mac 层必须带详细安装文档")
+        self.assertIn("清单.txt", names)
+        self.assertIsNone(out_zip, "make_the_zip=False 时不该套外层 zip")
+        self.assertNotIn(build_kit.KIT_CMD, names,
+                         "mac 层**不该**有 装我.cmd：那边没有双击式安装器")
+
+    def test_the_layer_name_says_macos(self):
+        """层名要能被一眼认出来 —— Windows 层叫 ECHO-delivery-<stamp>，两层不能撞名。"""
+        self.write_mac_kit_zip()
+        out = self.tmp / "ECHO-delivery"
+        dest, out_zip = self.mac_assemble(out_dir=out, make_the_zip=True)
+        self.assertEqual(dest.parent, out.resolve())
+        self.assertEqual(dest.name, "ECHO-delivery-macos-20261102-1513")
+        self.assertIsNotNone(out_zip)
+        self.assertEqual(out_zip.parent, out.resolve())
+        with zipfile.ZipFile(out_zip) as zf:
+            self.assertTrue(all(n.startswith(dest.name + "/") for n in zf.namelist()),
+                            "外层 zip 必须带顶层目录（不然解出来散成一堆）")
+
+    def test_the_manifest_carries_the_sha256_and_the_backend_warning(self):
+        kit = self.write_mac_kit_zip()
+        dest, _ = self.mac_assemble(make_the_zip=False)
+        text = (dest / "清单.txt").read_text(encoding="utf-8")
+        self.assertIn(build_delivery.sha256_file(kit), text,
+                      "清单里要有客户端包的 SHA256（同事能自己核对）")
+        self.assertIn("能力后端", text, "mac 层必须写清「转写走后端」这条硬前提")
+        self.assertIn("echo-install 这个技能", text, "三句话那条路要写出来")
+        self.assertIn("setup_mac.sh", text, "手工那条路要写出来")
+
+    def test_a_windows_kit_is_refused(self):
+        """拿 Windows kit 出 mac 层：必须炸，而且要指到正确的出包命令。"""
+        win_kit = self.write_kit_zip()              # 里面是 装我.cmd + install-all.ps1
+        with self.assertRaises(build_delivery.DeliveryError) as cm:
+            self.mac_assemble(kit_zip=win_kit, make_the_zip=False)
+        self.assertIn("Windows", str(cm.exception))
+        self.assertIn("build_kit.py --platforms macos", str(cm.exception))
+
+    def test_a_kit_without_the_mac_setup_script_is_refused(self):
+        self.write_mac_kit_zip(setup_mac=False)
+        with self.assertRaises(build_delivery.DeliveryError) as cm:
+            self.mac_assemble(make_the_zip=False)
+        self.assertIn("setup_mac.sh", str(cm.exception))
+
+    def test_a_missing_kit_says_what_to_run(self):
+        with self.assertRaises(build_delivery.DeliveryError) as cm:
+            self.mac_assemble(make_the_zip=False)
+        self.assertIn("build_kit.py --platforms macos", str(cm.exception))
+
+    def test_a_failed_run_leaves_no_half_layer(self):
+        self.write_mac_kit_zip(setup_mac=False)    # 触发自检失败
+        out = self.tmp / "ECHO-delivery"
+        out.mkdir()
+        keep = out / "别人的东西.zip"
+        keep.write_bytes(b"x")
+        with self.assertRaises(build_delivery.DeliveryError):
+            self.mac_assemble(out_dir=out)
+        self.assertTrue(keep.is_file(), "用户的交付目录里别的东西一个都不许动")
+        self.assertEqual(sorted(p.name for p in out.iterdir()), ["别人的东西.zip"],
+                         "失败时那一层要收干净")
+
+    def test_windows_only_flags_are_refused_instead_of_ignored(self):
+        """`--platform macos --no-apk` 这类组合是矛盾的：静默忽略会让人以为"带上了"。"""
+        self.write_mac_kit_zip()
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = build_delivery.main(["--platform", "macos", "--dist", str(self.dist),
+                                        "--no-apk", "--stamp", "20261102-1513"])
+        self.assertNotEqual(code, build_kit.EXIT_OK)
+        self.assertIn("--no-apk", buf.getvalue())
+        self.assertFalse((self.dist / "ECHO-delivery-macos-20261102-1513").exists())
 
 
 if __name__ == "__main__":

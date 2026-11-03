@@ -321,55 +321,94 @@ def snapshot():
 # ---------------------------------------------------------------- 组件启动函数
 
 def _start_dsh(report):
-    from app import manager
-    # 两个智能体是**二选一**：没选桌面版就别去启动它，更别把"没启动"记成失败。
-    want = selected_agent()
-    if want and want != "dsh":
-        report(status="skipped", detail=_agent_choice_detail(want), progress=0.0)
+    """**一套 DSH** 的启动：桌面版在跑就用它；没开就由 ECHO 起无头 dsh（共用 ~/.dsh）。
+
+    2026-11-03 用户拍板：不能接受用户用两套 dsh。所以这里不再"看选中哪个智能体"——
+    只有一个产品，`dshAutoStart` 控制是否随 ECHO 启动（默认开）。
+    """
+    from app import harness_proc, manager
+    try:
+        from app.config import settings as _s
+        auto = bool(_s.get("dshAutoStart", True))
+    except Exception:
+        auto = True
+    if not auto:
+        report(status="skipped",
+               detail="已按设置不随 ECHO 启动（面板上点「启动」即可）", progress=0.0)
         return
-    report(detail="探测中…", progress=0.1)
+    report(detail="探测 DSH…", progress=0.1)
+    # 桌面版开着 → 直接用（manager.dsh_ready 走 43120）；没开 → 起无头 dsh（token）。
     if manager.dsh_ready():
-        report(status="online", detail="已运行 · API 可访问", progress=1.0)
+        report(status="online", detail="桌面版在跑 · API 可访问（%s）"
+               % harness_proc.desktop_url(), progress=1.0)
         return
-    ok, msg = manager.dsh_start()
+    ok, msg = harness_proc.ensure_running()
     if not ok:
         report(status="failed", detail=msg, error=msg)
         return
+    # DSH 就绪后补一次 ECHO AUTO 注册 + 建默认分组（桌面版/无头都走这一步）。
+    try:
+        _register_router_after_agent_start()
+    except Exception:
+        pass
     report(status="online", detail=msg, progress=1.0)
+
+
+def refresh_agent_rows():
+    """按**当前选择**重算启动页上那两个智能体行（幂等，**不拉起/不停止任何进程**）。
+
+    2026-11-03 真机事故（Windows 同事）：装机顺序是「服务先起 → 再写设置」，于是启动页
+    留着装之前的「DSH 引擎 失败」—— 那次 boot 用的是出厂默认 `dsh`、桌面版没在跑；
+    而客人选的其实是标准版 harness（它已经 online）。用户看到"失败 + 重试"，以为
+    **dsh 拉不起来**，其实按设计：没选桌面版就根本不该启动它、这一行该是「未使用」。
+    切换智能体时是同一个毛病（切到桌面版后那一行还挂着"未使用（你选的是标准版）"）。
+
+    只改**报告**：进程由 boot 的起始函数与 `harness_proc` 自己管，这里不重复那套判据。
+    boot 还没跑过（组件未登记）时直接返回 —— 那时启动页本来就会重算一遍。
+    """
+    with _LOCK:
+        known = "dsh" in _COMPONENTS
+    if not known:
+        return
+    try:
+        from app import harness_proc, manager
+        if manager.dsh_ready():
+            # 桌面版已经起来 → 让出同一个 DSH 家目录（停掉 ECHO 起的无头 dsh）。
+            try:
+                harness_proc.yield_to_desktop()
+            except Exception:
+                pass
+            report("dsh", status="online",
+                   detail="桌面版在跑 · API 可访问（%s）" % harness_proc.desktop_url(),
+                   progress=1.0)
+            return
+        if harness_proc.desktop_gui_running():
+            # 桌面版 GUI 在、但 43120 不在听（当前官方版没有对外接口）：两者共用同一个
+            # `~/.dsh` 并存 —— 用户拍板接受这个形态；无头没起就提示点启动，不再"拒绝"。
+            if harness_proc.online(timeout=0.8):
+                report("dsh", status="online",
+                       detail="无头 dsh 在跑（与桌面版共用同一个 DSH 家目录）",
+                       progress=1.0)
+            else:
+                report("dsh", status="idle",
+                       detail=("未运行（桌面版在跑但无对外接口）；面板点「启动」可起无头 dsh —— "
+                               "两者共用同一个 DSH 家目录，两进程并存"),
+                       progress=0.0)
+            return
+        if harness_proc.online(timeout=0.8):
+            report("dsh", status="online",
+                   detail="无头 dsh 在跑（%s）" % harness_proc.base_url(), progress=1.0)
+            return
+        report("dsh", status="idle",
+               detail="未运行（面板可启动；打开桌面版后 ECHO 会自动改用它）", progress=0.0)
+    except Exception as exc:
+        report("dsh", status="failed",
+               detail="探测失败：%s: %s" % (type(exc).__name__, exc))
 
 
 def _start_harness(report):
-    """独立 DeepSeek Harness（npm @deepseek-ai/dsh）：选了它才随 ECHO 启动。
-
-    2026-09-19 加：用户要求"在智能体那里增加一个新的 agent 类型，然后随着 echo 一起启动"。
-    实测它与 DSH Desktop 的 /api 接口面完全一致，只是鉴权换成"token → Cookie"，
-    家目录独立（默认 {DATA}/harness），端口默认 43199（与 Desktop 的 43120 并存）。
-    """
-    from app import harness_proc
-    if not harness_proc.requested():
-        # 自愈：上次是我们起的、这次没被选中 → 顺手收掉（否则切回 DSH 后 node 一直挂着）
-        if harness_proc._load_pid() or harness_proc.started_by_echo():
-            ok, msg = harness_proc.stop(reason="启动自愈：当前没选中它，收掉上次 ECHO 起的实例")
-            report(status="skipped" if ok else "failed",
-                   detail="未使用，已收尾：%s" % msg if ok else msg)
-            return
-        harness_proc.sync_status()
-        # skipped（不是 disabled）：这不是"坏了也没启用"，而是"你选了另一个"，不该计入失败
-        report(status="skipped", detail=_agent_choice_detail(selected_agent()),
-               progress=0.0)
-        return
-    report(detail="拉起独立 harness…", progress=0.2)
-    ok, msg = harness_proc.ensure_running()
-    # 无论成功/失败/接手都要把状态行写实，别让它停在"启动中"
-    harness_proc.sync_status()
-    if not ok:
-        report(status="failed", detail=msg, error=msg)
-        return
-    # 标准版的家目录是**它启动时**才建出来的，而"注册 ECHO AUTO"那一步（_start_failover）
-    # 跑在阶段 1、可能早于这里 —— 所以智能体就绪后补一次注册（幂等），
-    # 否则只装标准版的机器第一次启动时 DSH 里选不到 ECHO AUTO。
-    _register_router_after_agent_start()
-    report(status="online", detail=msg, progress=1.0)
+    """**已退役**（2026-11-03 一套 DSH）。保留空壳只为兼容旧调用方，不要再接逻辑。"""
+    report(status="skipped", detail="已退役：ECHO 现在只有一套 DSH", progress=0.0)
 
 
 #: 智能体就绪后"再复核几次 ECHO AUTO 注册"的后台线程开关。
@@ -444,8 +483,9 @@ def _router_recheck_loop():
 
 
 def _stop_harness():
+    """**已退役**（2026-11-03 一套 DSH）：无头 dsh 由 `_start_dsh`/控制接口管理。"""
     from app import harness_proc
-    harness_proc.stop(reason="面板/接口手动停止")
+    return harness_proc.stop(reason="面板/接口手动停止")
 
 
 def _agent_dsh_available():
@@ -620,12 +660,10 @@ def setup():
     """注册全部组件（main.py 阶段 0 调用）。"""
     register("server", "面板服务", "🖥️", start_fn=None, can_start=False,
              status="online")
-    register("dsh", "DSH 执行引擎", "⚙️", start_fn=_start_dsh, can_start=True,
-             can_stop=False)
+    register("dsh", "DSH（唯一一套）", "⚙️", start_fn=_start_dsh,
+             stop_fn=_stop_harness, can_start=True, can_stop=True)
     register("failover", "模型路由（ECHO AUTO）", "🛰️", start_fn=_start_failover,
              can_start=True, can_stop=False)
-    register("harness", "标准版 harness", "🧩", start_fn=_start_harness,
-             stop_fn=_stop_harness, can_start=True, can_stop=True)
     register("tts", "语音合成", "🔊", start_fn=_start_tts, can_start=True,
              can_stop=False)
     register("hotkey", "热键/媒体键", "⌨️", start_fn=_start_hotkey,

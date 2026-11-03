@@ -122,6 +122,21 @@ def model_failed(detail: str = "") -> EchoError:
     return EchoError(503, "model_failed", "模型不可用", detail=detail)
 
 
+def tts_text_invalid(detail: str = "") -> EchoError:
+    """TTS 文本/voice/rate 不合法（空文本、超长、格式错）—— 422。"""
+    return EchoError(422, "tts_text_invalid", "TTS 文本不合法", detail=detail)
+
+
+def tts_failed(detail: str = "") -> EchoError:
+    """edge-tts 合成失败（上游网络/限流/空音频）—— 502。"""
+    return EchoError(502, "tts_failed", "语音合成失败", detail=detail)
+
+
+def tts_unavailable(detail: str = "") -> EchoError:
+    """后端明确关闭 TTS，或没装 edge-tts —— 503。"""
+    return EchoError(503, "tts_unavailable", "语音合成不可用", detail=detail)
+
+
 def gpu_oom(detail: str = "") -> EchoError:
     return EchoError(503, "gpu_oom", "显存不足", detail=detail)
 

@@ -82,6 +82,11 @@ class EnsureRunningRefusesForeignTests(unittest.TestCase):
         with patch.object(harness_proc, "online", lambda timeout=1.0: True), \
                 patch.object(harness_proc, "port_conflict", lambda: None), \
                 patch.object(harness_proc, "foreign_owner", lambda: foe), \
+                patch.object(harness_proc, "desktop_mode",
+                             lambda timeout=0.8: False), \
+                patch.object(harness_proc, "desktop_gui_running", lambda: False), \
+                patch.object(harness_proc, "migrate_legacy_home",
+                             lambda: {"ok": True, "skipped": ["测试隔离"]}), \
                 patch.object(harness_proc, "ensure_node_on_path", lambda: None):
             return harness_proc.ensure_running()
 

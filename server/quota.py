@@ -186,9 +186,9 @@ def zone_clock(name: str):
 class CharLedger:
     """按账号记"今天用了多少**字符**"（TTS 日额度，设计 §4.4）。
 
-    **本仓库当前没有 `/v1/tts` 端点**（客户端 TTS 不走能力后端），所以这个账本
-    目前只在测试与将来的端点上使用；接上时在端点里调 `check()` / `add()` 即可。
-    语义与 `QuotaLedger` 完全一致：`limit <= 0` = 不限；跨自然日清零；
+    用在 `/v1/tts`（2026-10-31 的 edge-tts 通道）上：解析出文本后先
+    `check(add_chars=len(text))` 预判，合成成功再 `add()`。语义与 `QuotaLedger`
+    完全一致：`limit <= 0` = 不限；跨自然日清零；
     超了 `429 quota_exceeded`（与 ASR 日额度同一个 code，客户端处理一致）。
 
     **为什么 TTS 超额选 429 而不是 402**（任务书 §5.2 要求"按设计选一种并写清"）：

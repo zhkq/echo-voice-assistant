@@ -528,3 +528,70 @@ class AdminBillingTests(_BillingCase):
         self.assertEqual(r.status_code, 200, r.text)
         self.assertEqual(self.store.count_devices(uid), 0)
         self.assertEqual(self.asr(headers).status_code, 403)
+
+
+class TtsBillingTests(_BillingCase):
+    """`/v1/tts` 的收费口径（2026-10-31 的 edge-tts 通道 + 2026-11-03 收费）。
+
+    不用真的 edge-tts：patch 掉 `routes.tts_mod.synthesize`，只看闸门与记账。
+    """
+
+    def _patch_synth(self):
+        from unittest.mock import AsyncMock
+        p = patch("server.routes.tts_mod.synthesize",
+                  new=AsyncMock(return_value=b"fake-mp3"))
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _enable_tts(self, cfg):
+        cfg.raw.setdefault("tts", {})["enabled"] = True
+
+    def test_tts_chars_are_metered_and_the_daily_cap_is_enforced(self):
+        token, headers, _oid = self.create_paid_client()
+        uid = self.store.user_by_employee_no("E001")["user_id"]
+        row = dict(self.store.entitlement(uid))
+        row["tts_chars"] = 10
+        row["qps"] = 1000
+        self.store.upsert_entitlement(row)
+        self.svc.forget_entitlement(uid)
+        self._patch_synth()
+        first = self.client.post("/v1/tts", json={"text": "123456"}, headers=headers)
+        self.assertEqual(first.status_code, 200, first.text)
+        self.assertEqual(self.store.entitlement(uid)["tts_chars"], 10)
+        self.assertEqual(self.state.tts_ledger.remaining(uid), 4)
+        time.sleep(0.02)
+        second = self.client.post("/v1/tts", json={"text": "123456"}, headers=headers)
+        self.assertEqual(second.status_code, 429, second.text)
+        self.assertEqual(second.json()["code"], "quota_exceeded")
+        self.assertEqual(self.state.tts_ledger.remaining(uid), 4)
+
+    def test_tts_uses_the_user_level_one_qps(self):
+        _token, headers, _oid = self.create_paid_client()
+        self._patch_synth()
+        first = self.client.post("/v1/tts", json={"text": "hi"}, headers=headers)
+        self.assertEqual(first.status_code, 200, first.text)
+        second = self.client.post("/v1/tts", json={"text": "hi"}, headers=headers)
+        self.assertEqual(second.status_code, 429, second.text)
+        self.assertEqual(second.json()["code"], "rate_limited")
+        self.assertEqual(second.headers.get("Retry-After"), "1")
+
+    def test_tts_does_not_consume_the_asr_minute_quota(self):
+        _token, headers, _oid = self.create_paid_client()
+        uid = self.store.user_by_employee_no("E001")["user_id"]
+        self._patch_synth()
+        before = self.state.user_quota.used_minutes(uid)
+        r = self.client.post("/v1/tts", json={"text": "hello"}, headers=headers)
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(self.state.user_quota.used_minutes(uid), before)
+
+    def test_an_expired_account_gets_402_before_spending_tts(self):
+        token, headers, _oid = self.create_paid_client()
+        uid = self.store.user_by_employee_no("E001")["user_id"]
+        row = dict(self.store.entitlement(uid))
+        row["paid_until"] = time.time() - 86400
+        self.store.upsert_entitlement(row)
+        self.svc.forget_entitlement(uid)
+        self._patch_synth()
+        r = self.client.post("/v1/tts", json={"text": "hi"}, headers=headers)
+        self.assertEqual(r.status_code, 402)
+        self.assertEqual(r.json()["code"], "entitlement_expired")

@@ -53,10 +53,12 @@ ALLOWED_PREFIX = "api/"
 ALLOWED_EXACT = ("health",)
 
 #: 首次配对时手机还没有令牌 —— 这条**不需要** Authorization（配对码本身就是凭据）。
-NO_TOKEN_REQUIRED_PREFIX = "api/pair/"
+#: `api/e2e` 也不需要：外层是手机↔ECHO 的密文信封，真正的手机 token 在密文里，
+#: ECHO 解密后才鉴权；后端只做盲转发。
+NO_TOKEN_REQUIRED_PREFIXES = ("api/pair/", "api/e2e")
 
-#: 单次请求体上限（16 kHz 单声道 5 分钟 ≈ 9.6 MB；再大就该分片了）。
-MAX_BODY_BYTES = 24 * 1024 * 1024
+#: 单次请求体上限（E2E 信封会把 18 MB 音频 base64 成约 24 MB，再留 JSON/头部余量）。
+MAX_BODY_BYTES = 40 * 1024 * 1024
 
 #: 主机执行一次调用的上限。手机那条 `daily-review/submit` 实测要 120~180 秒，
 #: 所以这里必须比客户端那侧（330 s）更宽 —— **让后端先放弃，而不是客户端先放弃**。
@@ -119,7 +121,7 @@ def _needs_token(path: str) -> bool:
     p = (path or "").lstrip("/")
     if p in ALLOWED_EXACT:
         return False
-    return not p.startswith(NO_TOKEN_REQUIRED_PREFIX)
+    return not any(p.startswith(prefix) for prefix in NO_TOKEN_REQUIRED_PREFIXES)
 
 
 # ---------------------------------------------------------------- 速率限制

@@ -15,6 +15,16 @@
       清单.txt                         ← 里面有什么、每个 zip 干什么用、后端那两个问题怎么答
     dist/ECHO-delivery-<stamp>.zip     ← 上面那个资料夹的 zip（`--no-zip` 可跳过）
 
+`--platform macos` 出**同一套交付形态的 macOS 层**（2026-11-02 加，用户要求"Mac 用户怎么装"）：
+
+    <交付目录>/ECHO-delivery-macos-<stamp>/
+      ECHO-kit-macos-<stamp>.zip      ← macOS 客户端主包（解开 = echo-core/ + echo-install/）
+      先读我.md                        ← 三句话说明（与 kit 里那份同一模板）
+      安装文档.md                      ← 详细步骤：手工命令 / 系统授权 / 能力后端 / 常见问题
+      清单.txt                         ← 这层有什么 + 客户端包的 SHA256
+    macOS 层**没有** `装我.cmd`（mac 侧没有双击式安装器：装法是 `mac/setup_mac.sh` 那几条命令），
+    也**不含**后端包 / 手机 APK / Windows 运维脚本 —— 那些都是 Windows/Linux 侧的东西。
+
 **离线包是个开关（`--no-offline`，2026-10-16 加）**：`dist/` 里躺着后端离线包（3.1 GB）时，
 默认**带**它 —— 那一层 ≈3.4 GB；但"纯客户端"那档（先配对别人的 GPU）本应只有 ≈58 MB。
 所以给了 `--no-offline`：**只影响这一层放不放离线包**，`清单.txt` 会如实写"这一层不含离线包"。
@@ -39,6 +49,7 @@ from __future__ import annotations
 
 import argparse
 import fnmatch
+import hashlib
 import re
 import shutil
 import sys
@@ -56,6 +67,30 @@ DELIVERY = build_kit.DELIVERY
 PKG_PREFIX = "ECHO-delivery"
 README_TEMPLATE = DELIVERY / "kit-readme-win.md"
 FORWARD = "装我.cmd"
+#: 交付层里那份**运维脚本**（备份/清理/还原、启停、状态体检）的源目录与落点。
+#: 2026-11-02 用户要求："维护脚本也都加进去"。脚本主文件在 `delivery/maintenance/`，
+#: 出包时整目录复制到交付层的 `ECHO-运维/`（同事双击里面的 .cmd 就能用；不参与安装）。
+MAINTENANCE_SRC = DELIVERY / "maintenance"
+MAINTENANCE_DIR = "ECHO-运维"
+MAINTENANCE_ENTRY = "先读我.md"
+
+#: **macOS 交付层**（`--platform macos`）。与 Windows 层的差别都是**形态**差别：
+#:   * 没有 `装我.cmd` —— mac 侧没有双击式安装器，装法就是 `mac/setup_mac.sh` 那几条命令
+#:     （或把整个资料夹交给 AI 助手按 echo-install 技能装）。**不伪造一个**假的入口：
+#:     放个 .sh 在 Finder 里双击只会被文本编辑器打开，比没有更误导；
+#:   * 不含后端包 / 手机 APK / 运维脚本 —— 后端是那台 GPU 机器的事，APK 与 .cmd 运维脚本
+#:     是 Windows 侧的交付物；
+#:   * 说明多一份 `安装文档.md`（手工命令 / 系统授权 / 能力后端 / 常见问题），
+#:     `先读我.md` 仍是三句话版。
+MAC_PKG_PREFIX = "ECHO-delivery-macos"
+MAC_README_TEMPLATE = DELIVERY / "kit-readme-mac.md"
+MAC_INSTALL_DOC = DELIVERY / "kit-install-mac.md"
+MAC_INSTALL_DOC_NAME = "安装文档.md"
+
+#: mac kit 里**必须有**的条目（按**文件名**判，不看目录：`zip_has_entry` 就是按尾名比的）。
+#: Windows kit 里没有 `setup_mac.sh`，mac kit 里没有 `装我.cmd` —— 两条合起来就是
+#: "这是不是 mac 包"的判据：拿错包时在**发出去之前**就炸。
+MAC_KIT_REQUIRED = ("setup_mac.sh", "echo-install-components.sh")
 
 #: 后端两个 zip 的**文件名模式**：与 `app/backend_fetch.py` 的两组 glob 同源（见 `consumer_globs()`，
 #: 不从那儿 import 是因为出包脚本不该依赖 app 的运行时环境；对不上时自检会说清）。
@@ -272,6 +307,8 @@ def write_manifest(dest: Path, kit: Path, thin: Path | None, offline: Path | Non
                      "那层 ≈3.4 GB），或把 ECHO-backend-offline-*.zip 放进这一层")
     lines += [
         "先读我.md                     就是这份说明的展开版",
+        "%-28s 维护脚本：备份/清理/还原、启停、状态体检（双击里面的 .cmd）"
+        % (MAINTENANCE_DIR + "\\"),
         "",
         "安装最后会问一句「后端（会议转写那台 GPU 机器）怎么来」：",
         "  1) 用别人给的后端 → 贴配对串（echo://pair?host=…&code=…）",
@@ -280,6 +317,7 @@ def write_manifest(dest: Path, kit: Path, thin: Path | None, offline: Path | Non
         "",
         "装完面板地址会在窗口里打印出来（默认 http://127.0.0.1:8970/）。",
         "装的过程中窗口一直开着；出错也不会一闪而过，把那段输出发回来即可。",
+        "升级遇到「服务没起来」时：先跑 ECHO-运维\\7-状态ECHO.cmd 体检（能直接看出缺什么）。",
         "",
     ]
     (dest / "清单.txt").write_text("\n".join(lines), encoding="utf-8")
@@ -377,6 +415,16 @@ def assemble(stamp: str, dist: Path, kit_zip: Path | None = None,
     launcher = DELIVERY / build_kit.KIT_CMD_TEMPLATE
     if not launcher.is_file():
         raise DeliveryError("交付模板不在：%s" % launcher)
+    # 维护脚本（2026-11-02 用户要求「维护脚本也都加进去」）：源目录不在或少了入口文件，
+    # 就在这里响亮地失败 —— 否则同事拿到的是一层"说好了有运维工具、其实没有"的包。
+    if not MAINTENANCE_SRC.is_dir():
+        raise DeliveryError(
+            "维护脚本源目录不在：%s\n     它应当在仓库 `delivery/maintenance/`（备份/清理/还原/启停/状态）。"
+            % MAINTENANCE_SRC)
+    if not (MAINTENANCE_SRC / MAINTENANCE_ENTRY).is_file():
+        raise DeliveryError("维护脚本里缺 %s：%s" % (MAINTENANCE_ENTRY, MAINTENANCE_SRC))
+    if not any(MAINTENANCE_SRC.glob("*.cmd")):
+        raise DeliveryError("维护脚本里没有任何 .cmd 双击入口：%s" % MAINTENANCE_SRC)
     if not zip_has_entry(kit, "install-all.ps1"):
         raise DeliveryError("这个 kit zip 里没有 install-all.ps1：%s（包不完整？）" % kit.name)
     if not zip_has_entry(kit, FORWARD):
@@ -444,6 +492,8 @@ def assemble(stamp: str, dist: Path, kit_zip: Path | None = None,
             shutil.copy2(apk, apk_dest)
         if README_TEMPLATE.is_file():
             shutil.copy2(README_TEMPLATE, dest / build_kit.KIT_README)
+        # 维护脚本整目录带进去（不做安装的一部分；同事双击 .cmd 用）
+        shutil.copytree(MAINTENANCE_SRC, dest / MAINTENANCE_DIR)
         write_manifest(dest, kit, thin, offline, apk_dest, no_offline=no_offline)
         out_zip = parent / ("%s-%s.zip" % (PKG_PREFIX, stamp)) if make_the_zip else None
         if out_zip is not None:
@@ -454,11 +504,132 @@ def assemble(stamp: str, dist: Path, kit_zip: Path | None = None,
     return dest, out_zip
 
 
+# --------------------------------------------------------------- macOS 交付层
+
+def default_mac_kit_zip(dist: Path) -> Path | None:
+    """macOS 客户端主包的默认来源：**先走 `kit_zip_for`**（它不会把 win 与 mac 搞混），
+    挑不到时再按名字兜一层（目录被删、只剩 zip 的情况下也还能出层）。"""
+    zip_path = build_kit.kit_zip_for(dist, build_kit.PLATFORMS[1])
+    if zip_path is not None:
+        return zip_path
+    hits = [p for p in dist.glob("ECHO-kit-macos-*.zip")
+            if p.is_file() and re.fullmatch(r"ECHO-kit-macos-\d{8}-\d{4}\.zip", p.name)]
+    return sorted(hits, key=lambda p: p.name)[-1] if hits else None
+
+
+def sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def write_mac_manifest(dest: Path, kit: Path) -> None:
+    """mac 层的 `清单.txt`：同事**唯一**的"这层里有什么"凭据。
+
+    Windows 层的清单靠 `装我.cmd` 兜底（双击就装），mac 层没有那个入口，所以这里必须把
+    「三句话 / 手工四条命令 / 后端是硬前提」直接写进去 —— 否则同事拿到一个 zip 不知道下一步。
+    """
+    lines = [
+        "这份资料夹里有什么（macOS 客户端）",
+        "=" * 44,
+        "",
+        "%-30s 客户端主包：解开是 echo-core/（主程序）+ echo-install/（安装技能）+ 先读我.md"
+        % kit.name,
+        "先读我.md                     三句话说明（走 AI 助手那条路的主角）",
+        "安装文档.md                   详细步骤：手工命令、系统授权、能力后端、常见问题",
+        "清单.txt                      本文件",
+        "",
+        "三句话：",
+        "  1) 双击解开上面那个 zip，把解出来的整个文件夹交给你的 AI 助手。",
+        "  2) 对它说：「按 echo-install 这个技能给我装 ECHO」。",
+        "  3) 它会问你装到哪（推荐 ~/ECHO）、能力后端怎么来、笔记库放哪 —— 不确定就用推荐。",
+        "",
+        "手工那条路（细节见 安装文档.md）：",
+        "  mv echo-core ~/ECHO",
+        "  bash ~/ECHO/echo-core/mac/setup_mac.sh",
+        "  bash ~/ECHO/echo-core/mac/start_mac.sh",
+        "  bash echo-install/scripts/echo-install-components.sh --dest \"$HOME/ECHO\" --agent harness",
+        "",
+        "能力后端是硬前提：指令 / 回顾 / 会议转写全部走能力后端（Qwen3-ASR），",
+        "客户端不再装任何本地转写模型。没配对后端时这些功能会明确报「不可用」——",
+        "面板「能力 → 配对后端」随时能补，不用重装。",
+        "",
+        "面板地址：默认 http://127.0.0.1:8970（真实端口在数据根下的 echo-port.txt；",
+        "3.0 布局的数据根是 ~/ECHO/data）。",
+        "",
+        "这一层不含：Windows 的 装我.cmd、后端 GPU 包、手机 APK、Windows 运维脚本 ——",
+        "它们都是 Windows 侧的东西；后端在那台 GPU 机器上单独部署。",
+        "",
+        "校验值（SHA256）：",
+        "  %s  %s" % (sha256_file(kit), kit.name),
+        "",
+    ]
+    (dest / "清单.txt").write_text("\n".join(lines), encoding="utf-8")
+
+
+def assemble_macos(stamp: str, dist: Path, kit_zip: Path | None = None,
+                   make_the_zip: bool = True, out_dir: Path | None = None
+                   ) -> tuple[Path, Path | None]:
+    """组出一层 **macOS** 交付资料夹（+ 可选外层 zip）→ ``(dir, zip 或 None)``。
+
+    与 :func:`assemble` 共用同一套"交付形态"（交付目录 + 一层日期），但内容按平台裁剪：
+    只放客户端 kit + `先读我.md` + `安装文档.md` + `清单.txt`。
+
+    自检都放在写盘之前：拿错包（Windows kit / 缺 mac 脚本）、缺模板，都在**发出去之前**炸；
+    写盘中途失败则**收干净**，不留半个资料夹（半份交付比没有更贵：同事会照着它装）。
+    """
+    kit = kit_zip or default_mac_kit_zip(dist)
+    if kit is None or not kit.is_file():
+        raise DeliveryError(
+            "没有 macOS 客户端主包（ECHO-kit-macos-*.zip）。先跑："
+            "python scripts\\build_kit.py --platforms macos")
+    if zip_has_entry(kit, FORWARD):
+        raise DeliveryError(
+            "这个 kit 里含 `%s` —— 它是 **Windows** 包，不能拿来出 macOS 交付层。\n"
+            "     出 mac 的包：python scripts\\build_kit.py --platforms macos" % FORWARD)
+    for entry in MAC_KIT_REQUIRED:
+        if not zip_has_entry(kit, entry):
+            raise DeliveryError(
+                "这个 kit 不像 macOS 包（缺 `%s`）：%s\n"
+                "     重出：python scripts\\build_kit.py --platforms macos"
+                % (entry, kit.name))
+    for tpl in (MAC_README_TEMPLATE, MAC_INSTALL_DOC):
+        if not tpl.is_file():
+            raise DeliveryError("缺少交付模板：%s" % tpl)
+
+    parent = out_dir if out_dir is not None else dist
+    parent.mkdir(parents=True, exist_ok=True)
+    dest = parent / ("%s-%s" % (MAC_PKG_PREFIX, stamp))
+    if dest.exists():
+        shutil.rmtree(dest)
+    dest.mkdir(parents=True)
+    try:
+        shutil.copy2(kit, dest / kit.name)
+        shutil.copy2(MAC_README_TEMPLATE, dest / build_kit.KIT_README)
+        shutil.copy2(MAC_INSTALL_DOC, dest / MAC_INSTALL_DOC_NAME)
+        write_mac_manifest(dest, kit)
+        out_zip = parent / ("%s-%s.zip" % (MAC_PKG_PREFIX, stamp)) if make_the_zip else None
+        if out_zip is not None:
+            build_kit.make_zip(dest, out_zip, dest.name)
+    except Exception:
+        shutil.rmtree(dest, ignore_errors=True)
+        raise
+    return dest, out_zip
+
+
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description="组一份交付资料夹（一个脚本 + 1~3 个 zip + 手机触点 APK）")
+    ap = argparse.ArgumentParser(description="组一份交付资料夹（Windows：脚本 + 1~3 个 zip + APK；"
+                                             "macOS：客户端 zip + 说明 + 安装文档）")
     ap.add_argument("--dist", default=str(DIST))
     ap.add_argument("--stamp", default="")
-    ap.add_argument("--kit", default="", help="客户端 kit zip（默认取 dist 里最新的 Windows 那份）")
+    ap.add_argument("--platform", choices=("win", "macos"), default="win",
+                    help="交付哪个平台。win（默认）= 装我.cmd + 客户端包 + 后端薄包/离线包 + APK；"
+                         "macos = 只放 macOS 客户端 kit + 先读我.md + 安装文档.md"
+                         "（mac 侧没有双击式安装器，装法是 .sh 那几条命令）")
+    ap.add_argument("--kit", default="", help="客户端 kit zip（默认取 dist 里最新那份；"
+                                             "--platform macos 时取 ECHO-kit-macos-*.zip）")
     ap.add_argument("--backend", default="", help="后端薄包 zip（默认取 dist 里最新的）")
     ap.add_argument("--backend-offline", default="", help="后端离线包 zip（默认取 dist 里最新的）")
     ap.add_argument("--no-zip", action="store_true", help="只出资料夹，不再套一层 zip")
@@ -485,7 +656,8 @@ def main(argv: list[str] | None = None) -> int:
                     help="交付层里不放手机触点 APK")
     ap.add_argument("--out", default="", metavar="DIR",
                     help="把交付那一层建在 DIR 下（用户的交付目录，如 D:\\ECHO-delivery）："
-                         "得到 DIR\\ECHO-delivery-<日期>-<时分>\\装我.cmd + 客户端包 + 后端薄包。"
+                         "Windows 得到 DIR\\ECHO-delivery-<日期>-<时分>\\装我.cmd + 客户端包 + 后端薄包；"
+                         "macOS 得到 DIR\\ECHO-delivery-macos-<日期>-<时分>\\客户端包 + 先读我.md + 安装文档.md。"
                          "**那层日期是刻意加的**，同一个目录里能并存好几版、一眼看出是哪天的；"
                          "不给就建在 --dist 下（本地归档）")
     args = ap.parse_args(argv)
@@ -494,20 +666,45 @@ def main(argv: list[str] | None = None) -> int:
     stamp = args.stamp or time.strftime("%Y%m%d-%H%M")
     dist = Path(args.dist).resolve()
     dist.mkdir(parents=True, exist_ok=True)
+    if args.platform == "macos":
+        # 这些参数是 Windows 层的语义（后端包 / APK / 载荷放行）—— 与 mac 层**互相矛盾**，
+        # 明确报错而不是静默忽略：静默忽略的结果是"以为带上了、其实没有"。
+        clashing = [name for name, on in (
+            ("--backend", bool(args.backend)),
+            ("--backend-offline", bool(args.backend_offline)),
+            ("--apk", bool(args.apk)),
+            ("--no-apk", bool(args.no_apk)),
+            ("--no-offline", bool(args.no_offline)),
+            ("--allow-no-bundle", bool(args.allow_no_bundle)),
+            ("--allow-downloads", bool(args.allow_downloads)),
+            ("--scenario full-local", args.scenario != "client"),
+        ) if on]
+        if clashing:
+            print("[x] --platform macos 的交付层只放 macOS 客户端包 + 说明；这几项是 Windows 层的语义："
+                  "%s\n     去掉它们再跑（mac 层不含后端包/APK/载荷，后端在那台 GPU 机器上单独部署）。"
+                  % "、".join(clashing))
+            return build_kit.EXIT_ERROR
     try:
-        dest, out_zip = assemble(
-            stamp, dist,
-            scenario=args.scenario,
-            allow_no_bundle=bool(args.allow_no_bundle),
-            allow_downloads=bool(args.allow_downloads),
-            no_offline=bool(args.no_offline),
-            kit_zip=Path(args.kit).resolve() if args.kit else None,
-            backend_zip=Path(args.backend).resolve() if args.backend else None,
-            offline_zip=Path(args.backend_offline).resolve() if args.backend_offline else None,
-            apk_zip=Path(args.apk).resolve() if args.apk else None,
-            no_apk=bool(args.no_apk),
-            make_the_zip=not args.no_zip,
-            out_dir=Path(args.out) if args.out else None)
+        if args.platform == "macos":
+            dest, out_zip = assemble_macos(
+                stamp, dist,
+                kit_zip=Path(args.kit).resolve() if args.kit else None,
+                make_the_zip=not args.no_zip,
+                out_dir=Path(args.out) if args.out else None)
+        else:
+            dest, out_zip = assemble(
+                stamp, dist,
+                scenario=args.scenario,
+                allow_no_bundle=bool(args.allow_no_bundle),
+                allow_downloads=bool(args.allow_downloads),
+                no_offline=bool(args.no_offline),
+                kit_zip=Path(args.kit).resolve() if args.kit else None,
+                backend_zip=Path(args.backend).resolve() if args.backend else None,
+                offline_zip=Path(args.backend_offline).resolve() if args.backend_offline else None,
+                apk_zip=Path(args.apk).resolve() if args.apk else None,
+                no_apk=bool(args.no_apk),
+                make_the_zip=not args.no_zip,
+                out_dir=Path(args.out) if args.out else None)
     except DeliveryError as e:
         print("[x] %s" % e)
         return build_kit.EXIT_ERROR
@@ -520,7 +717,11 @@ def main(argv: list[str] | None = None) -> int:
             print("       %-34s %8.1f MB" % (p.name, p.stat().st_size / (1 << 20)))
     if out_zip:
         print("[ok] 打包：%s（%.1f MB）" % (out_zip, out_zip.stat().st_size / (1 << 20)))
-    print("     交给同事：把这一层（或那个 zip）给他，让他双击 %s。" % FORWARD)
+    if args.platform == "macos":
+        print("     交给 Mac 同事：把这一层（或那个 zip）发给他，让他先看 先读我.md（三句话），"
+              "手工步骤见 安装文档.md。")
+    else:
+        print("     交给同事：把这一层（或那个 zip）给他，让他双击 %s。" % FORWARD)
     return build_kit.EXIT_OK
 
 

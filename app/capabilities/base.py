@@ -159,6 +159,10 @@ SERVER_CODE_TO_REASON: Dict[str, str] = {
     "gpu_oom": "error",
     "inference_timeout": "error",
     "auth_misconfigured": "error",
+    # 2026-10-31 TTS 通道
+    "tts_text_invalid": "error",     # 文本/voice/rate 不合法，改请求再来
+    "tts_failed": "error",           # edge 上游失败，可换/退避
+    "tts_unavailable": "offline",    # 后端关 TTS / 没装 edge-tts
     # 收费（2026-11-03）：服务端新增的错误码。**这张表是跨进程契约的一部分** ——
     # 服务端加了码而这里没跟上，客户端会把它当含糊的 `error`。本轮只补翻译，
     # 不做「我的」页（M2 在另一棵树）。
@@ -199,6 +203,10 @@ SERVER_CODE_RETRY: Dict[str, bool] = {
     "unsupported_media": False,
     "inference_timeout": False,
     "auth_misconfigured": False,  # 服务端自己的问题，客户端报给运营
+    # 2026-10-31 TTS 通道
+    "tts_text_invalid": False,    # 改文本/voice/rate，不是重试
+    "tts_failed": True,           # edge 上游抖动，退避可再试
+    "tts_unavailable": False,     # 后端关闭/没装依赖，重试无用
     # 收费（2026-11-03）：这些**都不是**"等一下再试"能解决的。
     "entitlement_missing": False,
     "entitlement_expired": False,

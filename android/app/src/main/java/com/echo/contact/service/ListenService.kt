@@ -29,6 +29,7 @@ import com.echo.contact.audio.SystemTts
 import com.echo.contact.audio.VoiceSegmenter
 import com.echo.contact.audio.WavWriter
 import com.echo.contact.data.ApiClient
+import com.echo.contact.data.BackendTts
 import com.echo.contact.data.EchoApi
 import com.echo.contact.data.PairStore
 import kotlinx.coroutines.CoroutineScope
@@ -490,6 +491,10 @@ class ListenService : Service() {
         // 于是用户选了"ECHO 念"对开车听写根本不生效（2026-10-15 发现的窟窿）。
         // ECHO 念：`POST /api/tts` 拿字节再播；**失败如实回落手机念**并把原因写出来 ——
         // 静默回落 = "设置了没生效"，那是最难查的一类。
+        // 方案 B：手机直连能力后端（phone 身份、DPoP），不占 ECHO 的 TTS 1 QPS。
+        val backendAudio = BackendTts.synthesize(this, spoken)
+        if (backendAudio != null && playEchoBytes(backendAudio.bytes)) return
+
         if (SpeakPrefs.load(this) == SpeakPrefs.ENGINE_ECHO) {
             val bytes = runCatching {
                 val resp = api.tts(com.echo.contact.data.dto.TtsRequest(text = spoken))

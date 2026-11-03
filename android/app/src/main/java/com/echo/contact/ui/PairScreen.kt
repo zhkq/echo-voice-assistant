@@ -1,5 +1,6 @@
 package com.echo.contact.ui
 
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -32,6 +33,8 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.echo.contact.data.ApiClient
+import com.journeyapps.barcodescanner.ScanContract
+import com.journeyapps.barcodescanner.ScanOptions
 
 /**
  * 配对页：填后端地址 + 一次性配对码（码由后端面板/网页在回环上生成），
@@ -49,6 +52,10 @@ fun PairScreen(onPaired: () -> Unit) {
     var baseUrlTouched by remember { mutableStateOf(false) }
     var code by remember { mutableStateOf("") }
     var name by remember { mutableStateOf("mobile") }
+    val scanLauncher = rememberLauncherForActivityResult(ScanContract()) { result ->
+        val contents = result.contents
+        if (!contents.isNullOrBlank()) vm.claimV2(contents, baseUrl, name)
+    }
 
     // 上次配对用过的地址：加载完再回填，且不覆盖用户已经改过的输入。
     LaunchedEffect(lastBaseUrl) {
@@ -111,6 +118,23 @@ fun PairScreen(onPaired: () -> Unit) {
                 modifier = Modifier.fillMaxWidth(),
             )
             Spacer(Modifier.height(12.dp))
+            OutlinedButton(
+                onClick = {
+                    scanLauncher.launch(
+                        ScanOptions()
+                            .setDesiredBarcodeFormats(ScanOptions.QR_CODE)
+                            .setPrompt("把 ECHO 二维码放进取景框，保持 10~20cm")
+                            .setBeepEnabled(false)
+                            .setBarcodeImageEnabled(false)
+                            .setOrientationLocked(false)
+                    )
+                },
+                enabled = !submitting,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text("扫码配对（方案 B · 端到端）")
+            }
+            Spacer(Modifier.height(8.dp))
             OutlinedTextField(
                 value = code,
                 onValueChange = { raw -> code = raw.filter { it.isDigit() }.take(6) },

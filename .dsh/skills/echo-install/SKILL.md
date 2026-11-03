@@ -37,20 +37,20 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "<kit>\echo-core\scripts\ins
 它一次走完：**就位主程序 → 建运行时 → 装核心依赖 → 装组件 → 打印面板地址**。
 其中"装组件"这一步**仍然调本技能里的
 `echo-install-components.ps1`**（引擎/模型/设置/自检只有这一份实现，两边共用）。
-参数：`-Profile minimal|main`、`-Root <安装根>`、`-Agent none|harness|dsh`、`-Yes`、`-Offline`。
-Windows 多几个（2026-10-31）：`-AskDsh`（交互问"已有 DSH 吗"）、`-DshDir <目录>`
-（直接指定已有 DSH 的安装目录）、`-HarnessSource auto|desktop|npm`（默认 auto：先用已装的
-官方桌面端，没有就下载官方 Windows 安装包装上，再失败才回退 npm）、`-DesktopInstallDir <目录>`
-（官方桌面端装到哪；留空=官方默认位置）。
+参数：`-Profile minimal|main`、`-Root <安装根>`、`-Agent none|dsh`、`-Yes`、`-Offline`。
+Windows 多一个（2026-11-03）：`-DesktopInstallDir <目录>`（官方桌面端装到哪；留空=官方默认位置）。
+旧的 `-HarnessSource` / `-DshDir` / `-AskDsh` / `-DshVersion` / `-PinHarnessCommand` 已退役，
+只保留参数以免旧命令行报错（传了只警告、不生效）。
 
 * **离线包不需要联网、也不需要 agent**：依赖来自包里的 `bundle\wheels`（pip 带
   `--no-index --find-links`），运行时兜底是 `bundle\runtime\python-3.11.9-embed-amd64.zip`
   （目标机没有 Python / uv 时用它）。**包里不再带任何转写模型** —— 2026-10-31 起客户端
   已不做本地转写（指令/回顾/会议都交给能力后端 Qwen3-ASR）。
-* 离线包里 **`-Agent` 默认 `none`** —— 包**不含 DSH/harness**（`@deepseek-ai/dsh` 是私有
-  npm 包，许可上不能随包分发）。要会议纪要 / 归档 / 语音指令的智能体时：**先装官方
-  DeepSeek Harness 桌面端**（或让管理员预装），安装器会自动找到它自带的 `dsh.cmd`；
-  没有官方桌面端时才走联网 npm。
+* 离线包里 **`-Agent` 默认 `none`** —— 包**不含 DSH**（官方桌面端安装包约 277 MB，不随
+  ECHO 交付包分发）。要会议纪要 / 归档 / 语音指令的智能体时：**先装官方 DeepSeek Harness
+  桌面端**（或让管理员预装），安装器会自动找到它自带的
+  `resources\runtime\cli\bin\dsh.cmd`；离线安装不联网，没有官方桌面端就明确报"需要先装
+  官方桌面端"，不会假装装好了。
 * **装完客户端只差一件事：配对能力后端**（第 3 步）。客户端默认档不再装
   sherpa/SenseVoice/whisper/唤醒词/分离模型；这些活全在后端那台 GPU 机器上做。
 
@@ -90,21 +90,24 @@ DSH 的 `workspace/create` **只收目录**、分组名由目录名派生，所�
 （`meetingWorkspaceTitle` / `commandWorkspaceTitle`）。不建也不影响功能 ——
 ECHO 建会话时还会再建一次，只是那时才出现在侧栏。
 
-**智能体（会议纪要 / 归档 / 语音指令靠它）**：**默认就用标准版**（`agentBackend=harness`），
-**不用问用户**。Windows 2026-10-31 起不再要求 Node.js：
+**智能体（会议纪要 / 归档 / 语音指令靠它）—— 只有一套 DSH**：官方 **DeepSeek Harness 桌面端**
+自带的那个无头 `dsh`（`%LOCALAPPDATA%\Programs\DeepSeek Harness\resources\runtime\cli\bin\dsh.cmd`）。
+**不需要 Node.js，也不需要 npm**；标准版 harness（npm 安装 + 独立家目录）已彻底退役。
 
-1. 先找已安装的官方 **DeepSeek Harness 桌面端**（`%LOCALAPPDATA%\Programs\DeepSeek Harness\
-   resources\runtime\cli\bin\dsh.cmd`）；找到就把它写进 `harnessCommand`，直接用它自带的
-   无头 `dsh web`（已实测 0.2.1-rc.5，token/会话接口与 npm harness 一致）。
+1. 安装器先看官方桌面端装没装；**已装就直接用**（它正在运行也不覆盖，继续用现有 CLI）。
 2. 没装就**从官方地址下载最新 Windows 安装包**（`https://download.deepseek.com/desktop/
-   dsh-latest-windows-x64.exe`，约 277 MB），校验签名后静默安装；安装包**不进 ECHO 交付包**，
-   所以每次安装/升级拿到的都是官方最新版。
-3. 下载/安装失败才回退到第 5 节的本地 npm 安装（需要 Node.js）。
-4. 显式 `-HarnessSource npm` 可强制旧行为；`-Offline` 时不下载（只认已装官方桌面端）。
+   dsh-latest-windows-x64.exe`，约 277 MB），校验 Authenticode 签名后 `/S` 静默安装；
+   安装包**不进 ECHO 交付包**，所以每次安装/升级拿到的都是官方最新版。
+3. 桌面端正在运行时，NSIS 安装器会拒绝覆盖（exit 2）——脚本会提示先退出，并**继续用现有 CLI**。
+4. `-Offline` / 升级模式不下载：只认已装官方桌面端，没有就**明确报错**（不假装装好了）。
 
-> 官方桌面端正在运行时，安装程序会拒绝覆盖（脚本会提示先退出，并继续用现有 CLI）。
-> 只复用它的 `dsh.cmd`，**不碰**它的 `~/.dsh` 家目录；ECHO 仍用自己独立的 `harnessHome`。
-> 安装位置默认官方位置；要装到 ECHO 目录下用 `-DesktopInstallDir <目录>`。
+> DSH 的家目录固定是 `%USERPROFILE%\.dsh`（官方桌面端自己的那份），ECHO **不另建**，也不写
+> `harnessCommand` / `harnessHome` / `harnessPort` / `harnessToken` / `agentHarnessEnabled`。
+> 设置里只写 `agentBackend=dsh` 和 `dshAutoStart=true` —— 后者控制"ECHO 启动时自动拉起 DSH"，
+> 默认开。ECHO 用 `POST /api/control/dsh/start` 拉起它（桌面端已在跑就用它，否则起无头 dsh），
+> 然后轮询 `/api/status` 的 `components` 里 `dsh` 到 `online`（上限约 180 秒，超时如实说"还在起"）。
+> 面板里的「打开 DSH 界面」可以跳到它。
+> 安装位置默认官方位置；要装到别处用 `-DesktopInstallDir <目录>`。
 
 ## 2. 先探测，再动手（30 秒）
 
@@ -128,9 +131,12 @@ foreach ($u in 'https://pypi.org/simple/','https://www.python.org/','https://www
   "$u -> " + (curl.exe -s -o NUL -w "%{http_code}" -L --connect-timeout 6 -m 15 $u)
 }
 
-# 智能体要用 Node。边条（右缘浮动条）才要 .NET Desktop Runtime；
-# 没装时 ECHO 会**自动改用浏览器面板**（不会弹「You must install .NET」）
-foreach ($c in 'node','npx') { $p = Get-Command $c -ErrorAction SilentlyContinue; "$c -> $(if($p){$p.Source}else{'没有'})" }
+# 智能体只有一套：官方 DeepSeek Harness 桌面端自带的 dsh —— **不需要 Node.js / npm**。
+# 这里只探一下官方桌面端在不在（没有的话第 3 步会下载安装）。
+$dshCli = Join-Path $env:LOCALAPPDATA 'Programs\DeepSeek Harness\resources\runtime\cli\bin\dsh.cmd'
+"DSH 桌面端 -> " + $(if (Test-Path $dshCli) { $dshCli } else { '没有（第 3 步会下载官方安装包装上）' })
+# 边条（右缘浮动条）才要 .NET Desktop Runtime；没装时 ECHO 会**自动改用浏览器面板**
+# （不会弹「You must install .NET」）。
 dotnet --list-runtimes 2>$null | Select-String 'WindowsDesktop.App'
 
 # VC++ 2015-2022 运行库：torch / ctranslate2 / sherpa-onnx / onnxruntime 这些**原生扩展**都要它。
@@ -164,7 +170,7 @@ for u in https://pypi.org/simple/ https://www.modelscope.cn https://hf-mirror.co
 done
 ```
 
-把结论告诉用户（尤其："哪条路能用""要不要装 Node"），再往下走。
+把结论告诉用户（尤其："哪条路能用""智能体要不要 Node"—— Windows 不需要，macOS 仍需要），再往下走。
 
 ## 3. 装（都可重跑）
 
@@ -211,7 +217,7 @@ Expand-Archive -Path "$kit\ECHO-main-win-x64-*.zip" -DestinationPath $kit -Force
 $skill = 'C:\资料目录\echo-install'      # 你手上的技能目录（里面是 scripts\）
 powershell -NoProfile -ExecutionPolicy Bypass -File "$skill\scripts\echo-install-components.ps1" `
     -DestDir 'D:\ECHO' `
-    -Agent harness `                    # 默认标准版
+    -Agent dsh `                        # 唯一一套 DSH（默认；不带也是它）
     -NotesDir 'D:\我的笔记库'            # ← 用户给了笔记库才加
 ```
 
@@ -283,31 +289,17 @@ bash "$kit/echo-install/scripts/echo-install-components.sh" \
 > 脚本自带 `--help`。
 
 两边这个脚本都做四件事：装核心 **pip 依赖** → **准备智能体** → 起服务 → 写设置 → **自检并登记**。
-2026-10-31 起 **Windows 的智能体默认用官方 DeepSeek Harness 桌面端自带的 dsh CLI**（已装就直接用，
-没装就从官方地址下载最新安装包静默安装；都不成才回退本地 npm）—— 不再强制 Node.js；
-**macOS 仍走本地 npm**（`<安装目录>/harness/dsh`，冷启动约 10 秒；装不上回退 npx）。
+2026-11-03 起 **Windows 只有一套 DSH = 官方 DeepSeek Harness 桌面端自带的 dsh**（已装直接用，
+没装就从官方地址下载最新安装包静默安装；**无需 Node.js / npm**；不写任何 `harness*` 设置）。
+**macOS 这轮不改**：仍走本地 npm（`<安装目录>/harness/dsh`，冷启动约 10 秒；装不上回退 npx）。
 **不再下载任何转写/分离/唤醒模型**（客户端不做本地转写；那些都在能力后端）。**幂等**：已经装好的
 会跳过，重跑安全。
 
-> **Windows 安装会先问一句"这台机器上已经有 DSH 吗"**（2026-10-27，双击 kit 默认带
-> `-AskDsh`）。选"没有/回车"= 继续：先找**官方桌面端**，没有就**下载官方最新 Windows 安装包**
-> 并静默安装（约 277 MB，**不放进 ECHO 交付包**；因此升级时重跑即拿最新版）；想强制走旧 npm
-> 用 `-HarnessSource npm`。选"有"= **先自动探测常见位置**
-> （ECHO 自己的 `dsh\app`、`D:\ECHO`/`C:\ECHO`、全局 npm、**官方 DeepSeek Harness 桌面端**等），
-> 找到就显示路径并问"用这个吗"；找不到才让用户输入目录。探测到入口就**只写 `harnessCommand`，
-> 不再下 npm 包**：
->
-> ```text
-> <目录>\node_modules\@deepseek-ai\dsh\lib\bin.js
-> <目录>\dsh\app\node_modules\@deepseek-ai\dsh\lib\bin.js      （ECHO 3.0）
-> <目录>\harness\dsh\node_modules\@deepseek-ai\dsh\lib\bin.js  （老 ECHO）
-> <目录>\lib\bin.js                                            （直接指到 dsh 包）
-> <目录>\resources\runtime\cli\bin\dsh.cmd                     （官方桌面端，自带 Node；无需系统 node）
-> ```
->
-> 引号、尾部反斜杠、空格、`&`、括号、`%USERPROFILE%` 都会被安全处理；探测失败重试 3 次后
-> 可以改回新装。只复用程序入口，不碰已有 DSH 的家目录配置。无人值守/agent 路径**不传**
-> `-AskDsh` 时行为完全不变；要显式指定用 `-DshDir "<目录>"`。
+> **Windows 安装不再问"这台机器上已经有 DSH 吗"**（2026-11-03）：只有官方桌面端这一套程序
+> 来源 —— 装了就复用，没装就下载安装（约 277 MB，**不放进 ECHO 交付包**，因此升级时重跑即拿
+> 官方最新版）。旧的 `-DshDir` / `-AskDsh` / `-HarnessSource` / `-DshVersion` /
+> `-PinHarnessCommand` 参数已退役（传了只警告、不生效）。桌面端正在运行时安装器不会覆盖，
+> 会继续用现有 CLI。
 
 > 每一步的输出也会落到 **`<安装目录>/data/logs/install-<时间戳>.log`**（独立于终端）——
 > 终端被关掉、或被 agent 收走输出时，排障看这份日志就够（A6）。
@@ -315,7 +307,7 @@ bash "$kit/echo-install/scripts/echo-install-components.sh" \
 > **给 agent：如果你的执行环境会中途回收后台进程** —— 有同事的沙箱约 2 分钟杀一次，
 > 而且**连脚本派生出来的 ECHO 服务也一起带走**，组件脚本因此断过两次（断在 pip 中途、
 > 断在 pip 安装中途时）。**断在中途就直接重跑同一条组件命令**，脚本是幂等的：
-> 已装好的会跳过（依赖秒过、标准版走"已装好"快路径），重跑即续上。
+> 已装好的会跳过（依赖秒过、官方面板/DSH 已就绪也直接复用），重跑即续上。
 > 断点看 **`<安装目录>/data/logs/install-<最新时间戳>.log`** 的最后几行。
 > 真人双击安装不受影响（不会有人两分钟杀一次进程）。
 >
@@ -325,93 +317,17 @@ bash "$kit/echo-install/scripts/echo-install-components.sh" \
 > 就说明装好了，别重装。（新版 `install.ps1` 已不会因此把安装判成失败；旧包里会打印
 > 「安装中断」+ 退出码 1，见到时按这条判断。）
 
-> **为什么改成永久安装（2026-09-22）**：同一台机器实测 `npx -y @deepseek-ai/dsh web` 冷启动
-> **2 分 10 秒**，直连本地 `lib/bin.js` 只要 **9 秒** —— npx 每次都要重新解析安装。
-> 装完还会做一次**完整性自检**：`lib/bin.js` 存在且非空、任何 `node-pty` 都带 `package.json`
-> 与 `lib/index.js` —— 同事踩过"目录在、文件被截断"导致 dsh 直接加载失败。
+> **别再装"标准版 harness"**（2026-11-03 起退役）：不再有 `<安装目录>\harness\dsh`、不再有独立
+> `DSH_HOME`、不再要求系统 Node.js，也不再写 `harnessCommand` / `harnessHome` / `harnessPort` /
+> `harnessToken` / `agentHarnessEnabled`。DSH 的家目录固定是 `%USERPROFILE%\.dsh`（官方桌面端
+> 自己的那份）。程序来源只有一个：官方桌面端自带的 `resources\runtime\cli\bin\dsh.cmd`。
 >
-> **设置里写不写 `harnessCommand`：默认不写**（2026-09-22 晚改）。设置停在出厂值时，ECHO 自己会
-> 优先用本地入口（`harness_proc.command()`：出厂值 + 本地入口存在 → 直连），node 也由它探测
-> （`node_dirs()` 与技能里的 `Resolve-NodeDir` 是同一批目录）。好处是 **node 换版本不用改配置** ——
-> 写死绝对路径时那条路径一失效 harness 就起不来，而 `harnessCommand` 是**隐藏设置**（不在设置页，
-> 只在「智能体」那行的展开区可见），用户很难自己找到。要显式钉死（例如 node 位置很怪、想让面板
-> 一眼看到实际命令）：加 `-PinHarnessCommand` / `--pin-harness-command`。
-> 手动改它注意：`PUT /api/settings` 的 body 要包一层 `{"values": {"harnessCommand": "…"}}`。
-
-> **装本地入口的三条路（脚本 `harness-install-local.ps1` / `.sh`）**：
-> ① 已经装好 → 直接用；② `npm install @deepseek-ai/dsh@<版本>`；③ **从 npx 缓存复制**同版本那份整树。
-> ③ 存在的原因：`0.1.5-rc.2` 的依赖图**出过** registry 事故 —— 有子包被写成
-> `^0.1.5-rc.3`，而那个子包的 rc.3 当时还没发布，`npm` 报
-> `ETARGET No matching version found for …documentpreview@^0.1.5-rc.3`。
-> **2026-09-22 晚同事复测：rc.3 已发布，npm 这条路现在是通的**（584 包，约 2 分钟）。
-> 但这类事故会复发，而 npx 慢是必然的，所以 ③ 保留。
-> 缓存里没有时脚本会**先让 npx 把缓存填上再复制**（全新机器的 `_npx` 缓存是空的 ——
-> 同事这次就是这种情况）；填不上才回退 npx。版本不一致会**明确告警**（仍可用）。
-> 单独修装坏的标准版：直接跑 `harness-install-local.ps1 -DestDir <安装目录>`（Windows）或
-> `bash harness-install-local.sh --dest <安装目录>`（macOS），加 `-FromCache` / `--from-cache`
-> 可跳过 npm 走缓存复制（离线也能装）。
->
-> **2026-10-13 修：② 这条路以前会失败在 koffi 上（同事新机器实测）**。三处改动：
-> 1. **给 npm 的子进程前置 PATH**（`node.exe` 所在目录）—— npm 的生命周期脚本由
->    `cmd.exe`/子 shell 执行，而打包版 node（WorkBuddy）不在 PATH 里，koffi 的 install
->    脚本 `node ./cnoke.cjs …` 直接 9009（`'node' 不是内部或外部命令`）→ 原生模块装不上
->    → 整个 npm install 失败。**这一处以前只有"填 npx 缓存"那条路修过，npm 这处漏了。**
-> 2. **装包默认走镜像**（`--registry=https://registry.npmmirror.com`，可用 `-Registry` /
->    `--registry` 覆盖）：koffi 在有预构建包时**不需要编译器**，镜像上预构建齐全且不超时；
->    取版本时官方与镜像各查一次、**谁新用谁**（镜像同步有延迟，官方更新时不被拖住）。
-> 3. **加原生模块闸门**（`node-addon-check.js`，与脚本同目录）：真 `require` 一次
->    `koffi` / `node-pty`。为什么必须在 CLI 冒烟之外单加一步 —— `node bin.js --version`
->    走不到 koffi，而 koffi 是 `dsh-fs` / `dsh-subprocess-local` /
->    `dsh-session-persistence-jsonl` / `dsh-sandbox-windows-acl` 的原生依赖，**跑 pwsh 和
->    子进程的必经之路**；它坏了旧脚本照样打印"已就绪"。现在自检不过就 **exit 1**，
->    不再静默降级。旧技能里没有这个文件时**跳过**（老机器不受影响）。
-> 4. 顺带把 ③ 的**版本闸门**收紧：缓存里没有目标版本时**不再静默拿别的版本顶上**，
->    而是明确报错并给三条出路（重跑 npm / 加 `-FromCache` 授权版本不同 / 先填缓存）。
-
-> **版本与升级（2026-10-08 用户要求：装最新版、别写死旧版本、要给升级方法）**
->
-> 脚本**默认自动取 npm 上的 `dist-tags.latest`** —— 不再写死版本号
-> （原状是 `0.1.5-rc.2` 写死，而当时 latest 已经是 `0.2.0-rc.2`，新装机器永远拿旧版）。
-> 查不到 registry（断网 / 源没配）时退回一个内置兜底版本并**明确告警**，不让安装整个失败。
->
-> ⚠️ **"默认取 latest"要说两处都改才算修好（2026-10-08 真机事故）**：
-> `harness-install-local.*`（助手）里那段查 latest 的代码**当时其实是对的**，
-> 但**装机器** `echo-install-components.*` 里 `$DshVersion` / `DSH_VERSION` 的默认值
-> 还是写死的 `0.1.5-rc.2`，而且它**显式传下去**（`& $helper … -Version $script:DshVersion`）
-> —— 直接盖掉助手的默认。于是**仓库、新包、旧包跑出来全是 `0.1.5-rc.2`**，
-> 只看助手那段会误判为"已经修好了"（我上一轮就这么误判了一次）。
-> **判据**：装机器两个平台的默认值都必须是**空**（`tests/test_install_entry.py`
-> `test_the_installer_does_not_override_the_auto_resolved_version` 钉住），
-> 真机跑一次看到 `npm 上的最新版（latest）：<版本>` 才算数。
-> 空值传下去是安全的：助手用 `if (-not $Version)` / `if [ -z "$VERSION" ]` 判，
-> 空串与"没传"走同一条路。
->
-> **升级标准版**（三件事都一样：删整树 → 重装 → 过完整性自检 + 冒烟测试）：
->
-> ```powershell
-> # Windows：升到最新
-> powershell -File .dsh\skills\echo-install\scripts\harness-install-local.ps1 `
->     -DestDir D:\ECHO -Upgrade
-> # 升/降到指定版本
-> powershell -File ...\harness-install-local.ps1 -DestDir D:\ECHO -Upgrade -Version 0.2.0-rc.2
-> ```
-> ```bash
-> # macOS
-> bash .dsh/skills/echo-install/scripts/harness-install-local.sh --dest ~/ECHO --upgrade
-> bash .../harness-install-local.sh --dest ~/ECHO --upgrade --version 0.2.0-rc.2
-> ```
->
-> ⚠️ **为什么升级必须有 `-Upgrade` / `--upgrade` 这个开关**：脚本开头有"已装好就直接用"的
-> 快路径（那是为了冷启动快），**不加开关时它会把升级静默吃掉** —— 用户跑升级、脚本回一句
-> "标准版已经在本机（跳过下载）"，看日志像是成功了，实际还是旧版。所以现在：
->
-> | 情况 | 不加 `-Upgrade` | 加 `-Upgrade` |
-> |---|---|---|
-> | 已装版本 == 目标版本 | 跳过（真无事可做） | 跳过 |
-> | 已装版本 != 目标版本 | **提示**有新版 + 给出升级命令，**不擅自覆盖** | 删整树重装（升级） |
->
-> 升级前建议先停掉标准版 harness（`POST /api/agent/stop` 或面板上的停），
-> 否则 Windows 上 `node_modules` 可能被占用、删不掉（脚本会如实报"清不掉…先停掉再重跑"）。
+> **升级 DSH**：官方桌面端自带自动更新。要让安装器重新下载 / 静默安装最新版，先退出桌面端，
+> 再给组件脚本加 `-UpgradeDsh`（双击安装会在升级时问一句"要不要顺便升级 DSH"）。
+> 只换程序文件，**智能体配置一个字不改**；桌面端在跑时安装器不会覆盖，会继续用现有 CLI。
+> 面板里的「打开 DSH 界面」可以跳到它；`dshAutoStart`（默认开）控制"ECHO 启动时自动拉起 DSH"。
+> **macOS 这轮不改**：仍用 `harness-install-local.sh --upgrade`（升级标准版，见脚本 `--help`）；
+> Windows 不再走这条，只升级官方桌面端。
 
 
 三个要点（都是 2026-09-21 实测踩出来的）：
@@ -445,7 +361,8 @@ curl -s "http://127.0.0.1:$port/api/models" | ./venv/bin/python -m json.tool | h
 然后**用三句话说清**（别只说"装好了"）：
 
 - **能干什么**：录音转文字（能力后端 Qwen3-ASR）、会议录音 + 文字稿、面板地址（Windows 还有 `Ctrl+Shift+E`）
-- **还不能干什么**：没配对能力后端就没有任何语音转写；**会议纪要**还需要一个智能体
+- **还不能干什么**：没配对能力后端就没有任何语音转写；**会议纪要**还需要官方 DeepSeek Harness
+  桌面端（它自带的 dsh 由 ECHO 拉起；`dshAutoStart` 默认开）
 - **以后怎么补**：面板 → 能力（配对后端 / 选智能体），随时补，不用重装
 
 ## 5. 常见失败
@@ -463,11 +380,9 @@ curl -s "http://127.0.0.1:$port/api/models" | ./venv/bin/python -m json.tool | h
 | **macOS**：浮动条没出现 | 需要 Apple Command Line Tools（`xcode-select --install`）后跑 `bash mac/build_sidebar.sh`；**没有也能用**：浏览器打开面板即可 |
 | **macOS**：`brew` 找不到 | 先装 Homebrew（https://brew.sh），再重跑 `mac/setup_mac.sh` |
 | **macOS**：客户端不再装 `funasr`/`torch` | 本地转写已退役；mac 客户端只装服务/面板/音频 IO（安装包 ~58 MB 量级） |
-| 智能体没起来（纪要/归档/指令不能用） | 需要 **Node.js**：装 Node 后重跑第 3 步的组件脚本（`-Agent harness` / `--agent harness`）—— 脚本会把标准版**永久装到 `<安装目录>/harness/dsh`** 并写好 `harnessCommand`，ECHO 直接拉起（冷启动约 10 秒）；或改用已装的 DSH 桌面版。**注意**：node 装在托管目录（如 WorkBuddy）里、不在系统 PATH 时，ECHO 自己会探测（2026-09-22 起）；若 `harnessCommand` 里是 `npx …`（回退路径），第一次启动仍要等 1-2 分钟 |
-| npm 报 `SAFE_DELETE_BULK_CONFIRM_REQUIRED` | 宿主（WorkBuddy 等）的安全删除 shim 拦了批量删除。装 dsh 时带 `CODEBUDDY_SAFE_DELETE_ENABLED=0`；**别中途 kill npx/npm**，否则包会装残（`node-pty` 缺 `index.js`） |
-| npm 装 dsh 报 `ETARGET / No matching version found for …documentpreview@^0.1.5-rc.3` | 这是 **registry 侧的依赖图事故**（不是你的机器问题）：`0.1.5-rc.2` 有个子包依赖 `^0.1.5-rc.3`，而那个 rc.3 当时没发布。**2026-09-22 晚复测已恢复**（rc.3 已发布），先直接重跑一次多半就好了。仍不行时脚本会自动改走 **npx 缓存复制**（缓存空会先让 npx 填上，再复制）；也可直接 `harness-install-local.ps1 -DestDir <安装目录> -FromCache`（macOS：`bash harness-install-local.sh --dest <安装目录> --from-cache`）。日志里会写明用了哪份缓存树、版本是否一致 |
-| npm 装 dsh 报 **`npm error path …\node_modules\koffi` + `command … cmd.exe /d /s /c node ./cnoke.cjs …` + `'node' 不是内部或外部命令`**（乱码显示成「锟斤拷」也是它） | **koffi 的原生模块装不上**：npm 的 install 脚本交给 `cmd.exe` 跑，而打包版 node（WorkBuddy 的 `…\.workbuddy\binaries\node\versions\<v>\node.exe`）**不在 PATH 里**，`node` 这个裸命令名解析不到（9009）。2026-10-13 已修：脚本会**给 npm 的子进程前置 `node.exe` 所在目录**，并默认走镜像让 koffi 直接吃预构建二进制。**见到旧日志时怎么处理**：直接重跑组件脚本即可（新版会走对）；确认装对了看有没有 `[ok] 原生模块自检通过：koffi@…（预构建：有）` —— 没有这行就说明这份技能是旧的。手工验证：`node <技能目录>\scripts\node-addon-check.js <安装根>\harness\dsh`（Windows；macOS 把斜杠换回去），或在安装目录里 `node -e "require('koffi')"` |
-| 改设置报 `422 … ["body","values"] Field required` | `PUT /api/settings` 的 body 必须包一层：`{"values": {"harnessCommand": "…"}}`；`agentBackend` 写 `harness`（不是组件名 `agent-harness`）并同时开 `agentHarnessEnabled` |
+| 智能体没起来（纪要/归档/指令不能用） | 只有一套 DSH：官方 **DeepSeek Harness 桌面端自带的 dsh**。先看 `GET /api/status` 的 `components` 里 `dsh` 的状态与 detail；`POST /api/control/dsh/start` 会拉起它（桌面端已在跑就用它，否则起无头 dsh），等 `online` 上限约 180 秒，超时就是"还在起"。没有官方桌面端时重跑第 3 步的组件脚本（`-Agent dsh`）—— 它会下载并静默安装官方桌面端。**不需要 Node.js / npm**；装好 ECHO 会随启动自动拉起 DSH（`dshAutoStart`），面板「打开 DSH 界面」可跳到它 |
+| 装官方桌面端时报「已有程序在运行」/ NSIS exit 2 | 桌面端正在运行，安装器拒绝覆盖。先退出 DeepSeek Harness（托盘也退），再重跑；不想退出也行 —— 脚本会**继续用现有 CLI**，只是不升级程序文件 |
+| 改设置报 `422 … ["body","values"] Field required` | `PUT /api/settings` 的 body 必须包一层：`{"values": {"agentBackend": "dsh"}}`；`agentBackend` 写 **`dsh`**（不是组件名 `agent-dsh`，也不是已退役的 `harness`）。要控制"随 ECHO 启动"另外写 `dshAutoStart`（默认 true）；`harnessCommand` / `agentHarnessEnabled` 已退役，别写 |
 | `pip` 慢 / 超时 | Windows 加 `-PipIndex https://pypi.tuna.tsinghua.edu.cn/simple`；mac 加 `--pip-index https://pypi.tuna.tsinghua.edu.cn/simple`，重跑（已装好的会跳过） |
 | 客户端模型下载 | **已退役**：客户端不再下载任何转写/分离/唤醒模型；模型都在能力后端。面板「模型」页为空是正常的 |
 | **说话人分离**不可用 | 现在由**能力后端**做（pyannote + wespeaker）；客户端不装分离模型。先查后端 `/v1/capabilities` 是否有 `diarize.turns`，以及配对 scopes 是否含 `diarize` |
@@ -485,7 +400,8 @@ curl -s "http://127.0.0.1:$port/api/models" | ./venv/bin/python -m json.tool | h
 - **不要**让用户去 `git clone`（公司网多半连不上 GitHub）—— 代码只用资料夹里的
   `echo-core/`（更早的包里叫 `ECHO/`）。
 - **不要**替用户装 CUDA/torch：体积大、和驱动绑定，让他们按需自己决定（mac 上更是没有 CUDA）。
-- **不要**把 `agentBackend` 写成组件 id（`agent-harness`）—— 那是**组件名**，设置里要用的名字是
-  **`harness`**（并同时打开 `agentHarnessEnabled`）。写错了选择会**静默失效**（2026-09-20 踩过）。
+- **不要**把 `agentBackend` 写成组件 id（`agent-dsh`）—— 那是**组件名**，设置里要用的名字是
+  **`dsh`**（`dshAutoStart` 控制是否随 ECHO 启动）。写错了选择会**静默失效**（2026-09-20 踩过）。
+  也不要再写 `harness` / `agentHarnessEnabled` / `harnessCommand`：标准版 harness 已退役。
 - **不要**在没跑 `import` 复核前说"装好了"：`pip` 返回 0 或 `python.exe` 存在都不等于引擎能用
   （2026-09-21 踩过：uv 建的 venv 没有 pip，依赖一个都没装，安装器却打印了"安装完成"）。

@@ -207,7 +207,13 @@ function meetingSideColumn(anchor) {
  *
  *  为什么自己建节点：`web/index.html` 与 `web/app.css` 不在这次改动的允许清单里 ——
  *  确认框本来就是这个方式（JS 动态建），这里保持一致。
- *  `kind`：`info`（进行中/已确认）· `warn`（取消，仍在录音）· `err`（失败 / 状态没变）。 */
+ *  `kind`：`info`（进行中/已确认）· `warn`（取消，仍在录音）· `err`（失败 / 状态没变）。
+ *
+ *  ⚠️ 2026-11-02（用户："这个展示很占地，只保留状态，提示隐起来悬浮展示"）：
+ *  `info` 那类（"已确认：服务端已停止录音（正在转写）"等）**不再铺一整块**，
+ *  只留一枚可悬停的小图标 `ⓘ`（完整话在 `title`，点一下用 toast 再念一遍）；
+ *  `warn` / `err` 仍然整块显示 —— 那两类是"需要你动手"的话，藏起来会耽误事。
+ */
 function meetingNote(msg, kind = "info", btn = null) {
   const anchor = btn || $("#btnMeeting") || $("#btnMeetingFromList");
   // 落点：仪表盘 = 按钮右侧那一列（时间下面）；会议列表 = 标题行之后
@@ -233,10 +239,28 @@ function meetingNote(msg, kind = "info", btn = null) {
     document.body.appendChild(note);
   }
   const icon = kind === "info" ? "ⓘ" : "⚠";
-  note.className = "snote " + (kind === "err" ? "err" : kind === "warn" ? "warn" : "info");
-  note.style.fontSize = "12.5px";        // `.snote` 默认 11px：这是要人看清的话，放大一档
-  note.style.whiteSpace = "pre-wrap";
-  note.innerHTML = `<span>${icon}</span><span>${esc(msg)}</span>`;
+  // 2026-11-02（用户："这个展示很占地，只保留状态，提示隐起来悬浮展示"）：
+  //   info  → 收成一枚小图标：不占一行、完整话进 title（悬停可见），点一下 toast 再念一遍；
+  //   warn/err → 仍整块显示（要人动手的话不能藏）。
+  const compact = (kind !== "err" && kind !== "warn");
+  note.className = "snote " + (kind === "err" ? "err" : kind === "warn" ? "warn" : "info")
+                   + (compact ? " snote-inline" : "");
+  // 同一个节点在两种形态间复用：先把上一次留下的内联样式清干净（否则图标会带着整块的底色/边框）
+  for (const k of ["display", "alignItems", "padding", "margin", "border", "background",
+                   "fontSize", "lineHeight", "color", "cursor", "whiteSpace"]) {
+    note.style[k] = "";
+  }
+  if (compact) {
+    note.innerHTML = `<span aria-hidden="true">${icon}</span>`;
+    note.title = msg;                 // ← 悬停看完整提示（用户要的"隐起来悬浮展示"）
+    note.onclick = () => { try { toast(msg, 7000); } catch (_) {} };  // 触屏没有 hover：点一下也能看
+  } else {
+    note.style.fontSize = "12.5px";   // `.snote` 默认 11px：这是要人看清的话，放大一档
+    note.style.whiteSpace = "pre-wrap";
+    note.innerHTML = `<span>${icon}</span><span>${esc(msg)}</span>`;
+    note.title = "";
+    note.onclick = null;
+  }
   note.classList.remove("hidden");
   return note;
 }
@@ -1882,7 +1906,7 @@ const SET_CARDS = {
     { id: "ai", title: "AI 组件",
       hint: "用哪个能力：谁来执行、转写用本机还是在线、朗读用在线还是本机。",
       common: () => renderAiCardCommon(),
-      covers: ["agentBackend", "harnessHome", "dshBaseUrl", "agentCustomPath",
+      covers: ["agentBackend", "dshAutoStart", "dshHome", "harnessHome", "dshBaseUrl", "agentCustomPath",
                "harnessCommand", "harnessPort", "harnessToken",
                "agentCodebuddyEnabled", "agentHarnessEnabled",
                "capabilityMeetingAsrBackend", "capabilityDiarizeBackend",
@@ -2063,7 +2087,7 @@ const SET_UNITS = {
    （老库里的值由 `config.RETIRED_VALUE_FALLBACKS` 折成 sherpa）。
    2026-09-29：`meetingSttModel` 那一行也删了（键已废弃、面板不再有它的下拉）。 */
 const SET_OPT_LABELS = {
-  ttsEngine: { auto: "自动", "edge-tts": "在线", sapi: "本机离线", say: "本机离线",
+  ttsEngine: { auto: "自动", "edge-tts": "在线", "echo-server": "能力后端", sapi: "本机离线", say: "本机离线",
     espeak: "本机离线", off: "关闭" },
   panelOpenMode: { sidebar: "边条", app: "独立应用", browser: "浏览器" },
   capabilityPrivacy: { none: "不出机", lan: "内网", wan: "出网" },
@@ -2299,6 +2323,7 @@ function capTtsCurrentName() {
   const engine = String((settingByKey("ttsEngine") || {}).value || "auto");
   if (engine === "off") return "已关闭朗读";
   if (engine === "edge-tts") return "edge-tts（微软在线）";
+  if (engine === "echo-server") return "能力后端（edge-tts）";
   if (engine === "auto") return "自动（优先 edge-tts）";
   return "本机离线合成（" + engine + "）";
 }
@@ -3657,8 +3682,6 @@ const SET_META_PATCH = [
                + "（产品自己的开关在高级里，会自动一起打开）。" },
   { key: "agentCodebuddyEnabled", grp: "agent", label: "启用 CodeBuddy Code", value_type: "bool",
     description: "腾讯 CodeBuddy Code（WorkBuddy 内置同一引擎）的启用开关。" },
-  { key: "agentHarnessEnabled", grp: "agent", label: "启用标准版 harness", value_type: "bool",
-    description: "独立 DeepSeek Harness 的启用开关（不装 DSH Desktop 也能用）。" },
 ];
 
 /** 把一批设置行并进 `_settingsCache`：**已有的键不覆盖**（可见行优先），缺的补上。
@@ -4465,9 +4488,14 @@ function phoneCardInner() {
     out.push(`<div class="snote warn"><span>🌐</span><span>经中继打开标准版网页的入口现在没有：
       ${esc(st.dshWebReason || "DSH 标准版没有在运行")}</span></div>`);
   }
-  // ② 配对码
+  // ② 配对码 / 方案 B 二维码
   const pend = st.pending || {};
-  out.push(`<div class="phone-pair">
+  const qr = st.qrPng ? `<div style="margin:10px 0;text-align:center">
+      <img alt="ECHO 配对二维码" src="data:image/png;base64,${st.qrPng}"
+           style="width:min(520px,95%);image-rendering:pixelated;background:#fff;padding:8px;border-radius:8px">
+      <div class="muted" style="font-size:12px">手机扫描二维码（含 ECHO 公钥；不经过后端）</div>
+    </div>` : "";
+  out.push(`${qr}<div class="phone-pair">
       <div class="phone-code" id="phoneCode">${esc(pend.code || "‒‒‒‒‒‒")}</div>
       <div class="phone-pair-side">
         <div class="muted" id="phoneCodeMeta" style="font-size:12px">${
@@ -4475,7 +4503,7 @@ function phoneCardInner() {
         <button class="btn" data-phone-issue="1"${st.bindMode === "lan" ? "" : " disabled"}>生成配对码</button>
       </div>
     </div>
-    <div class="muted" style="font-size:12px">在设备上输入这 6 位数字兑换（手表不扫码也能用）。
+    <div class="muted" style="font-size:12px">手机扫码，或在设备上输入这 6 位数字兑换。
       码<b>只能用一次</b>，5 分钟内有效；错了太多次会暂时锁住。</div>`);
   // ③ 已配设备
   const keys = _phoneKeys || [];
@@ -4490,6 +4518,19 @@ function phoneCardInner() {
         <span class="spacer"></span>
         <button class="btn mini" data-phone-revoke="${esc(k.id)}">撤销</button>
       </div>`).join(""));
+  }
+  // ③b 方案 B 的 E2E 设备身份（公钥记录；和上面的 API key 是两件事）
+  const devs = st.devices || [];
+  if (devs.length) {
+    out.push(`<div class="ssub-h" style="margin-top:10px"><span>E2E 设备身份（${devs.length}）</span></div>`);
+    out.push(devs.map((d) => `<div class="phone-dev">
+        <span class="phone-dev-name">${esc(d.name || "未命名")}</span>
+        <span class="muted">${d.pairedAt ? "配对于 " + esc(new Date(d.pairedAt * 1000).toLocaleString()) : ""}</span>
+        <span class="spacer"></span>
+        <button class="btn mini" data-phone-device-revoke="${esc(d.id)}">撤销身份</button>
+      </div>`).join(""));
+    out.push(`<div class="muted" style="font-size:12px">撤销身份会删除 ECHO 侧设备公钥；
+      手机 token 的撤销仍在上面「已配设备」里单独做。</div>`);
   }
   return out.join("");
 }
@@ -4527,7 +4568,20 @@ async function loadPhoneCard() {
   try {
     keys = await api("/api/keys");
   } catch (err) { /* 设备列表读不到不影响配对码 */ }
-  if (st) { _phoneState = st; _phoneError = ""; }
+  if (st) {
+    // 设置页会周期性 refresh，而 `/api/pair/phone` 只返回 pending（不含 qrPng）。
+    // 如果这里直接覆盖，刚生成、还没扫的二维码会在下一次刷新时消失。
+    // 只有 pending 仍是同一张码且未过期，才把上一份 ticket/qrPng 接回来。
+    const old = _phoneState || {};
+    const oldPending = old.pending || {};
+    if (old.qrPng && oldPending.code && st.pending && st.pending.code === oldPending.code
+        && (st.pending.secondsLeft || 0) > 0) {
+      st.qrPng = old.qrPng;
+      st.ticket = old.ticket || "";
+    }
+    _phoneState = st;
+    _phoneError = "";
+  }
   if (keys) _phoneKeys = keys.items || [];
   renderPhoneCard();
   _phoneTick();
@@ -4536,13 +4590,22 @@ async function loadPhoneCard() {
 async function doPhoneIssue(btn) {
   if (btn) btn.disabled = true;
   try {
-    const r = await post("/api/pair/phone", {});
+    let r;
+    try {
+      r = await post("/api/pair/phone/ticket", {});
+    } catch (e) {
+      // 先按方案 B 生成二维码；老服务端没有 ticket 端点时退回 6 位码。
+      r = await post("/api/pair/phone", {});
+      r.ok = true;
+    }
     _phoneState = Object.assign({}, _phoneState || {}, {
       baseUrl: r.baseUrl || (_phoneState || {}).baseUrl || "",
       pending: { code: r.code, secondsLeft: r.ttlSeconds, expiresAt: r.expiresAt },
+      ticket: r.ticket || "",
+      qrPng: r.qrPng || "",
     });
     _phoneError = "";
-    toast("配对码已生成，5 分钟内有效");
+    toast(r.qrPng ? "配对二维码已生成，5 分钟内有效" : "配对码已生成，5 分钟内有效");
   } catch (err) {
     toast(_errText(err));
   }
@@ -4561,12 +4624,26 @@ async function doPhoneRevoke(id) {
   await loadPhoneCard();
 }
 
+async function doPhoneDeviceRevoke(id) {
+  if (!window.confirm("撤销这台设备的 E2E 身份？撤销后它的加密请求会解不开，需要重新扫码配对。")) return;
+  try {
+    const r = await api("/api/pair/phone/device/" + encodeURIComponent(id), { method: "DELETE" });
+    toast(r && r.ttsRevoked ? "已撤销 E2E 设备身份和后端 TTS token"
+                            : "已撤销 E2E 设备身份（后端 TTS token 未确认撤销）");
+  } catch (err) {
+    toast("撤销失败：" + _errText(err));
+  }
+  await loadPhoneCard();
+}
+
 /* 三个按钮的委托（重绘后不用重绑；与设置区其它按钮同一套做法）。 */
 document.addEventListener("click", async (e) => {
   const issue = e.target.closest("[data-phone-issue]");
   if (issue) { await doPhoneIssue(issue); return; }
   const revoke = e.target.closest("[data-phone-revoke]");
   if (revoke) { await doPhoneRevoke(revoke.dataset.phoneRevoke); return; }
+  const deviceRevoke = e.target.closest("[data-phone-device-revoke]");
+  if (deviceRevoke) { await doPhoneDeviceRevoke(deviceRevoke.dataset.phoneDeviceRevoke); return; }
   const refresh = e.target.closest("[data-phone-refresh]");
   if (refresh) { await loadPhoneCard(); return; }
 });
@@ -4943,7 +5020,8 @@ document.addEventListener("click", (e) => {
       // 是"凭据不下发"的代价，所以 title 里必须写明，不能让人以为点了没反应。
       return {
         post: "/api/harness/browser",
-        title: "在这台跑 ECHO 的电脑上打开标准版 harness 界面（从别的机器/手机看面板时，那个窗口不在这块屏上）",
+        title: "在这台跑 ECHO 的电脑上打开 DSH 界面（桌面版在跑就打开桌面版；" +
+               "从别的机器/手机看面板时，那个窗口不在这块屏上）",
       };
     }
     return { href: "?view=agent", title: "去「智能体」页看它是哪个、怎么切" };
@@ -7193,27 +7271,25 @@ function wizRenderLlm(host) {
 /* ---------------- S7 智能体后端（默认标准 DSH） ---------------- */
 function wizRenderAgent(host) {
   const agents = (_wizEnv && _wizEnv.agents) || {};
-  const node = (_wizEnv && _wizEnv.node) || {};
   const std = agents.harness || {}, desk = agents.dsh || {};
+  // 2026-11-03 一套 DSH：不再有"标准版 harness / 需要 Node.js"这一档。
+  // 桌面版在跑、或 ECHO 自己起的无头 dsh 在跑，都算"已经就绪"。
+  const online = !!(desk.online || std.online);
+  const detail = String(desk.detail || std.detail || "");
   host.innerHTML = wizCard("让 ECHO 能动手",
     "上面几步让 ECHO 能「听懂」和「写字」，这一步让它能<b>动手</b>：把纪要存进你的笔记库、按你的话去整理文件。",
     "不能帮你操作电脑、整理笔记 —— 转写和纪要不受影响。",
-    wizOption("__std__", _wizChoices.agent === "agent-harness",
-        { label: "DSH 标准版（推荐）", sizeMb: 0, name: "wizagent",
-          note: node.ok ? "点一下我来准备，需要联网，大约几分钟；以后归我管"
-                        : "需要先装 Node.js（我会给你入口）" })
-    + wizOption("dsh", _wizChoices.agent === "dsh",
-        { label: "我已经装了 DSH 桌面客户端", sizeMb: 0, name: "wizagent",
-          note: desk.online ? "检测到它正在运行 ✓" : "我会自动找到它并检查" })
+    wizOption("__std__", _wizChoices.agent === "agent-harness" || !_wizChoices.agent,
+        { label: "DSH（官方 DeepSeek Harness 桌面端自带）", sizeMb: 0, name: "wizagent",
+          note: online ? "已经在跑 ✓" : "点一下准备：会安装/启动官方桌面端（没装则联网下载，约 289 MB）" })
     + wizOption("__none__", !_wizChoices.agent,
         { label: "先不用", sizeMb: 0, name: "wizagent", note: "以后想加：面板 → 能力 → 随时补" })
-    + (std.online ? `<div class="muted">标准版已经在运行 ✓</div>` : "")
-    + (desk.detail ? `<div class="muted">桌面客户端：${esc(desk.detail)}</div>` : "")
+    + `<div class="muted">DSH 状态：${online ? "在线 ✓" : "没在运行"}${detail ? "（" + esc(detail) + "）" : ""}</div>`
     + `<div><button class="btn" id="wizProbeAgents">检测一下</button></div>`);
   wizWhy(host);
   wizBindPicks(host, (el) => {
     const v = el.dataset.wizpick;
-    _wizChoices.agent = v === "__none__" ? "" : (v === "__std__" ? "agent-harness" : v);
+    _wizChoices.agent = v === "__none__" ? "" : "agent-harness";
   });
   const probe = $("#wizProbeAgents", host);
   if (probe) probe.addEventListener("click", async () => {

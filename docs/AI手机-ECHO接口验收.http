@@ -1,0 +1,270 @@
+# ECHO 手机接口验收 · REST Client 请求集
+#
+# 用法：VS Code 安装 REST Client 扩展，打开本文件，逐段点 Send。
+# 变量按你的环境改；不要把真实 token 提交到 git。
+#
+# 先决条件：
+#   - ECHO 已启动（默认 8970，实际端口见 data/echo-port.txt）
+#   - 局域网：serverBindMode=lan；中继：relayEnabled=true
+#   - 准备 ./sample.wav（16 kHz 单声道 PCM16，1–5 秒）
+#
+# 约定：
+#   - {{host}} 是 ECHO 本机回环，只用于「发配对码」这种只能本机做的动作
+#   - {{lan}} 是设备可达地址（局域网 IP 或中继 base）
+#   - 中继 base 形如 https://<后端>/v1/relay/<hostId>，不带结尾斜杠
+
+@host = http://127.0.0.1:8970
+@lan = http://192.168.1.170:8970
+@token = PASTE_TOKEN_HERE
+@code = 482913
+@clientId = phone-20261022100000-a1b2
+@startedAt = 2026-10-22T10:00:00
+@commandId = 123
+@meetingId = 42
+@date = 2026-10-22
+
+###
+# 0. 探活（无令牌）
+GET {{lan}}/health
+
+###
+# 1. 发配对码（必须从 ECHO 本机回环调；设备不要调这条）
+POST {{host}}/api/pair/phone
+
+###
+# 2. 用配对码换令牌（设备侧；唯一不带令牌的业务接口）
+POST {{lan}}/api/pair/phone/claim
+Content-Type: application/json
+
+{
+  "code": "{{code}}",
+  "name": "smoke-test"
+}
+
+###
+# 3. 状态
+GET {{lan}}/api/status
+Authorization: Bearer {{token}}
+
+###
+# 4. 发一条文字指令（别发危险动作）
+POST {{lan}}/api/assistant/command
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "text": "请只回复一句：收到",
+  "source": "mobile"
+}
+
+###
+# 5. 取一条指令结果
+GET {{lan}}/api/commands/{{commandId}}
+Authorization: Bearer {{token}}
+
+###
+# 6. 指令历史（分页）
+GET {{lan}}/api/commands?limit=30&offset=0
+Authorization: Bearer {{token}}
+
+###
+# 7. 开始一场手机麦会议（同一 clientId 重复调应 duplicate=true）
+POST {{lan}}/api/meeting/start?source=phone&clientId={{clientId}}&startedAt={{startedAt}}
+Authorization: Bearer {{token}}
+
+###
+# 8. 传第 1 段（裸 wav；不是 multipart）
+POST {{lan}}/api/meeting/segment?clientId={{clientId}}&seq=1&source=phone
+Authorization: Bearer {{token}}
+Content-Type: audio/wav
+
+< ./sample.wav
+
+###
+# 9. 重传同一段（应 duplicate=true、段数不增）
+POST {{lan}}/api/meeting/segment?clientId={{clientId}}&seq=1&source=phone
+Authorization: Bearer {{token}}
+Content-Type: audio/wav
+
+< ./sample.wav
+
+###
+# 10. 当前会议状态
+GET {{lan}}/api/meeting/status
+Authorization: Bearer {{token}}
+
+###
+# 11. 暂停 / 恢复（P1；手机本地写零，联网时调这两条）
+POST {{lan}}/api/meeting/pause
+Authorization: Bearer {{token}}
+
+###
+POST {{lan}}/api/meeting/resume
+Authorization: Bearer {{token}}
+
+###
+# 12. 补报暂停区间（离线恢复后；相对开始时间的秒数）
+POST {{lan}}/api/meeting/pauses
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "clientId": "{{clientId}}",
+  "pauses": [
+    { "from": 12.5, "to": 65.0 }
+  ]
+}
+
+###
+# 13. 结束录音（带 clientId 防误停）
+POST {{lan}}/api/meeting/stop?clientId={{clientId}}
+Authorization: Bearer {{token}}
+
+###
+# 14. 会议列表
+GET {{lan}}/api/meetings?limit=20&offset=0
+Authorization: Bearer {{token}}
+
+###
+# 15. 会议详情（lines/speakers/segment_count）
+GET {{lan}}/api/meetings/{{meetingId}}
+Authorization: Bearer {{token}}
+
+###
+# 16. 纪要（JSON 信封：exists/content/summaryState）
+GET {{lan}}/api/meetings/{{meetingId}}/file?kind=summary
+Authorization: Bearer {{token}}
+
+###
+# 17. 议题
+GET {{lan}}/api/meetings/{{meetingId}}/file?kind=topics
+Authorization: Bearer {{token}}
+
+###
+# 18. 逐字稿
+GET {{lan}}/api/meetings/{{meetingId}}/file?kind=transcript
+Authorization: Bearer {{token}}
+
+###
+# 19. 音频段（二进制；REST Client 会显示乱码，用浏览器/播放器验证）
+GET {{lan}}/api/meetings/{{meetingId}}/audio?seg=1
+Authorization: Bearer {{token}}
+
+###
+# 20. 转写进度（键可能是会议 id，也可能是会议 name）
+GET {{lan}}/api/transcribe/status
+Authorization: Bearer {{token}}
+
+###
+# 21. 回顾状态
+GET {{lan}}/api/daily-review
+Authorization: Bearer {{token}}
+
+###
+# 22. 建/取回今天的回顾会话（不碰麦克风）
+POST {{lan}}/api/daily-review/start
+Authorization: Bearer {{token}}
+
+###
+# 23. 回顾一轮（裸 wav；可能 2–3 分钟）
+POST {{lan}}/api/daily-review/turn
+Authorization: Bearer {{token}}
+Content-Type: audio/wav
+
+< ./sample.wav
+
+###
+# 24. 回顾文字兜底（同样阻塞）
+POST {{lan}}/api/daily-review/submit
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "text": "今天上午开了周会，下午处理了客户反馈。",
+  "force_new": false
+}
+
+###
+# 25. 结束回顾
+POST {{lan}}/api/daily-review/stop
+Authorization: Bearer {{token}}
+
+###
+# 26. 回顾历史
+GET {{lan}}/api/daily-review/history?limit=60
+Authorization: Bearer {{token}}
+
+###
+# 27. 某天回顾详情
+GET {{lan}}/api/daily-review/history/{{date}}
+Authorization: Bearer {{token}}
+
+###
+# 28. TTS（回音频字节；REST Client 显示乱码，用播放器验证）
+POST {{lan}}/api/tts
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "text": "已开始录音",
+  "engine": ""
+}
+
+###
+# 29. 事件游标（since<0 只给游标）
+GET {{lan}}/api/events/feed?since=-1&wait=0&limit=50
+Authorization: Bearer {{token}}
+
+###
+# 30. 事件增量（since 换成上一次的 cursor）
+GET {{lan}}/api/events/feed?since=0&wait=10&limit=50
+Authorization: Bearer {{token}}
+
+##
+# ============================ 负例 ============================
+##
+
+###
+# N1. 不带令牌（局域网应 401）
+GET {{lan}}/api/status
+
+###
+# N2. 改设置（网络应 403）
+PUT {{lan}}/api/settings
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{ "values": { "apiAuthEnabled": false } }
+
+###
+# N3. 删会议（网络应 403）
+DELETE {{lan}}/api/meetings/{{meetingId}}
+Authorization: Bearer {{token}}
+
+###
+# N4. 停服（网络应 403）
+POST {{lan}}/api/control/echo/stop
+Authorization: Bearer {{token}}
+
+###
+# N5. 坏配对码（应 403，且不要自动重试）
+POST {{lan}}/api/pair/phone/claim
+Content-Type: application/json
+
+{ "code": "000000", "name": "bad-code" }
+
+###
+# N6. 段号不对/没有会（应 409 或 business ok=false）
+POST {{lan}}/api/meeting/segment?clientId=not-mine&seq=1&source=phone
+Authorization: Bearer {{token}}
+Content-Type: audio/wav
+
+< ./sample.wav
+
+###
+# N7. 语音指令传非音频（应 422；这条接口只收裸 body，不是 multipart）
+POST {{lan}}/api/assistant/voice-command
+Authorization: Bearer {{token}}
+Content-Type: audio/wav
+
+this is not a wav file

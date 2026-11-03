@@ -253,6 +253,7 @@ function snap() {
   return {
     noteFound: !!note,
     noteHtml: note ? note.innerHTML : "",
+    noteTitle: note ? (note.title || "") : "",
     noteText: note ? note.innerHTML.replace(/<[^>]*>/g, "") : "",
     noteCls: note ? note.className : "",
     noteParentId: note && note.parentElement ? note.parentElement.id : null,
@@ -329,7 +330,12 @@ class MeetingPanelLayoutTests(_NodeCase):
             'meetingNote("%s", "info", btnMeeting);\n'
             'RESULT = snap();\n' % CONFIRM_TEXT)
         self.assertTrue(out["noteFound"], "找不到确认行元素 #meetingActionNote")
-        self.assertIn(CONFIRM_TEXT, out["noteHtml"], "确认行的文案被改动了：%s" % out["noteHtml"])
+        # 2026-11-02（用户："只保留状态，提示隐起来悬浮展示"）：info 提示收成小图标，
+        # 完整话进 title（悬停可见），不再铺一整块。
+        self.assertNotIn(CONFIRM_TEXT, out["noteHtml"],
+                         "info 提示应当收成小图标，不该再把整段话铺出来：%s" % out["noteHtml"])
+        self.assertIn(CONFIRM_TEXT, out["noteTitle"],
+                      "完整提示必须进 title（悬停才看得到）")
         # ① 同一容器：不是拆成两列
         self.assertTrue(out["sameParent"],
                         "确认行与录音时间不在同一个容器里（拆成两列了？）：%r" % out)
@@ -386,7 +392,41 @@ class MeetingPanelLayoutTests(_NodeCase):
         self.assertEqual(1, out["colCount"], "右侧那一列被建了 %d 个" % out["colCount"])
         self.assertEqual(["meetingInfo", "meetingActionNote"], out["colKids"])
         self.assertEqual("meetingActionNote", out["infoNextId"])
-        self.assertIn(CONFIRM_TEXT, out["noteHtml"])
+        self.assertIn(CONFIRM_TEXT, out["noteTitle"])
+        self.assertNotIn(CONFIRM_TEXT, out["noteHtml"])
+
+    def test_the_info_hint_is_a_hover_icon_while_warn_and_err_stay_visible(self):
+        """2026-11-02 用户："这个展示很占地，只保留状态，提示隐起来悬浮展示"。
+
+        info（已确认/进行中）→ 收成 `ⓘ` + title；warn（已取消）/ err（失败）× 仍整块可见。
+        同一个节点复用，所以从警告切回 info 时**必须把内联样式清干净**（否则图标会带底色边框）。
+        """
+        info_out = self._run(
+            'meetingNote("%s", "info", btnMeeting);\n'
+            'RESULT = snap();\n' % CONFIRM_TEXT)
+        self.assertIn("snote-inline", info_out["noteCls"], "info 提示没有收成悬浮图标")
+        self.assertNotIn(CONFIRM_TEXT, info_out["noteHtml"], "info 提示仍然铺出了整段话")
+        self.assertIn(CONFIRM_TEXT, info_out["noteTitle"], "完整提示必须进 title")
+
+        warn_out = self._run(
+            'meetingNote("已取消，仍在录音", "warn", btnMeeting);\n'
+            'RESULT = snap();\n')
+        self.assertNotIn("snote-inline", warn_out["noteCls"], "warn 提示不该被藏起来")
+        self.assertIn("已取消", warn_out["noteHtml"], "warn 提示要看得见（要人动手）")
+
+        err_out = self._run(
+            'meetingNote("服务端状态还没变", "err", btnMeeting);\n'
+            'RESULT = snap();\n')
+        self.assertNotIn("snote-inline", err_out["noteCls"], "err 提示不该被藏起来")
+        self.assertIn("服务端状态还没变", err_out["noteHtml"])
+
+        # 同一个节点：先 warn（整块）再 info（图标）→ 不能再带整块留下的内联样式
+        back = self._run(
+            'meetingNote("已取消，仍在录音", "warn", btnMeeting);\n'
+            'meetingNote("%s", "info", btnMeeting);\n'
+            'RESULT = snap();\n' % CONFIRM_TEXT)
+        self.assertIn("snote-inline", back["noteCls"])
+        self.assertNotIn(CONFIRM_TEXT, back["noteHtml"])
 
     def test_building_the_column_twice_keeps_exactly_one_column(self):
         """`meetingSideColumn()` 是幂等的（首屏调用 + 每次 `meetingNote` 都会走到它）。"""
@@ -496,6 +536,18 @@ class MeetingPanelSourceTests(unittest.TestCase):
         self.assertNotIn("meetingSideCol", self.html)
         self.assertEqual(1, self.html.count('id="meetingInfo"'))
         self.assertEqual(1, self.html.count('id="btnMeeting"'))
+
+    def test_the_confirm_hint_is_collapsed_and_hoverable(self):
+        """2026-11-02（用户）："这个展示很占地，只保留状态，提示隐起来悬浮展示"。
+
+        info 收成小图标 + `title`（悬停看完整话），warn/err 不藏；样式落在 CSS 一处。
+        """
+        note = _js_function(self.js, NOTE_SIG)
+        self.assertIn('note.title = msg', note, "提示要靠 title 悬停展示")
+        self.assertIn("snote-inline", note, "info 提示要收成紧凑图标")
+        self.assertIn('kind !== "err" && kind !== "warn"', note,
+                      "只有 info 收起来；warn/err 是「要人动手」的话，不能藏")
+        self.assertIn(".snote.snote-inline", self.css, "紧凑图标的样式没落在 app.css")
 
 
 if __name__ == "__main__":

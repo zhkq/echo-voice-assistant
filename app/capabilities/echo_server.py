@@ -574,6 +574,57 @@ class EchoServerClient(CapabilityClient):
 
     # ---------------------------------------------------------------- 凭据
 
+    def tts(self, text: str, *, voice: str = "", rate: str = "",
+            timeout: float = 30.0) -> tuple:
+        """让能力后端用 edge-tts 合成一句话 → `(mime, bytes)`。
+
+        与 `transcribe()/diarize()` 不同，TTS 的 200 响应是**原始音频字节**，
+        不是 JSON —— 所以走 `_request(..., raw_response=True)`，不能用
+        `_maybe_json()` 把 MP3 当解析失败丢掉。
+
+        每个 client 1 QPS 是**后端**的事；这里只管发一次请求并把 429/401/502
+        如实翻成 `CapabilityError`，客户端按 `retryAfter` 退避。
+        """
+        payload = json.dumps({"text": text, "voice": voice, "rate": rate},
+                             ensure_ascii=False).encode("utf-8")
+        status, raw, headers = self._request(
+            "POST", "/v1/tts", data=payload, content_type="application/json",
+            timeout=timeout, slot="tts", raw_response=True)
+        if status != 200:
+            raise error_from_server(_maybe_json(raw), status,
+                                    self.backend_id, "tts")
+        mime = str(headers.get("Content-Type") or "audio/mpeg").split(";", 1)[0].strip()
+        return mime, raw
+
+    def delegate_tts(self, device_public_key: str, *, subject: str = "",
+                     ttl_s: int = 3600, timeout: float = 15.0) -> Dict[str, Any]:
+        """请后端给手机签一个 TTS 委托 token（ECHO 作为委托方）。
+
+        只有 ECHO 的后端 client 能调；手机不直接调这个端点。
+        """
+        payload = json.dumps({
+            "devicePublicKey": device_public_key,
+            "subject": subject,
+            "ttlSeconds": int(ttl_s),
+        }, ensure_ascii=False).encode("utf-8")
+        status, body = self._request(
+            "POST", "/v1/delegate", data=payload,
+            content_type="application/json", timeout=timeout, slot="tts")
+        if status != 200 or not isinstance(body, dict):
+            raise error_from_server(body, status, self.backend_id, "tts")
+        return body
+
+    def revoke_tts(self, subject: str, *, timeout: float = 10.0) -> bool:
+        """让后端撤销某台手机（deviceId）的委托 TTS token。失败返回 False。"""
+        payload = json.dumps({"subject": str(subject or "")}).encode("utf-8")
+        try:
+            status, body = self._request(
+                "POST", "/v1/delegate/revoke", data=payload,
+                content_type="application/json", timeout=timeout, slot="tts")
+            return status == 200 and bool((body or {}).get("ok"))
+        except Exception:
+            return False
+
     def _renewable(self) -> bool:
         """这一路是"本机配对得来的凭据"吗 —— 只有它才谈得上续期。"""
         if self._token:
@@ -646,8 +697,13 @@ class EchoServerClient(CapabilityClient):
 
     def _request(self, method: str, path: str, *, data: Optional[bytes] = None,
                  content_type: str = "", timeout: float = 30.0,
-                 slot: str = "", retry_auth: bool = True) -> tuple:
-        """发一个请求。**失败一律抛 `CapabilityError`**（带分类），不返回空。"""
+                 slot: str = "", retry_auth: bool = True,
+                 raw_response: bool = False) -> tuple:
+        """发一个请求。**失败一律抛 `CapabilityError`**（带分类），不返回空。
+
+        `raw_response=True` 时成功返回 `(status, raw_bytes, headers)`，用于
+        TTS 这类二进制响应；默认仍返回 `(status, parsed_json_or_None)`。
+        """
         if not self.base_url:
             raise CapabilityError("absent", "没配 ECHO 后端地址",
                                   backend_id=self.backend_id, slot=slot)
@@ -664,6 +720,8 @@ class EchoServerClient(CapabilityClient):
         try:
             with urllib.request.urlopen(req, timeout=timeout, context=context) as resp:
                 raw = resp.read()
+                if raw_response:
+                    return resp.status, raw, resp.headers
                 return resp.status, _maybe_json(raw)
         except urllib.error.HTTPError as e:
             raw = b""
@@ -685,7 +743,8 @@ class EchoServerClient(CapabilityClient):
                 # 无限重试只会把一次失败变成一个转不出来的循环。
                 self._force_renew(slot=slot)
                 return self._request(method, path, data=data, content_type=content_type,
-                                     timeout=timeout, slot=slot, retry_auth=False)
+                                     timeout=timeout, slot=slot, retry_auth=False,
+                                     raw_response=raw_response)
             if isinstance(payload, dict) and payload.get("code"):
                 raise error_from_server(payload, e.code, self.backend_id, slot) from None
             raise CapabilityError(

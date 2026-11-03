@@ -50,16 +50,57 @@ class LocalEntryTests(unittest.TestCase):
             with patch.object(hp.paths, "echo_root", lambda: tmp):
                 self.assertEqual(hp.local_entry(), "")
 
+    def test_the_mac_installers_layout_is_found_too(self):
+        """3.0 布局 + 技能把本体装在 `<根>/harness/dsh`（macOS 那份 .sh 的旧落点）也要认。
+
+        不认的后果不是"报错"而是**静默变慢**：装好的入口找不到 → 退回 npx 冷启动 1-2 分钟。
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            base = os.path.join(tmp, "ECHO")
+            code = os.path.join(base, "echo-core")
+            os.makedirs(code)
+            installed = _make_tree(base, self.REL)          # <根>/harness/dsh/...
+            with patch.object(hp.paths, "echo_root", lambda: code), \
+                 patch.object(hp.paths, "echo_base", lambda: base), \
+                 patch.object(hp.paths, "dsh_root",
+                              lambda: os.path.join(base, "dsh", "app")):
+                self.assertEqual(hp.local_entry(), installed)
+
+    def test_the_new_layout_wins_when_both_exist(self):
+        """`<根>/dsh/app` 与 `<根>/harness/dsh` 都在时，先用新布局那份（升级上来的机器）。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            base = os.path.join(tmp, "ECHO")
+            code = os.path.join(base, "echo-core")
+            os.makedirs(code)
+            want = _make_tree(base, hp.LOCAL_ENTRY_REL_BASE)   # <根>/dsh/app/...
+            _make_tree(base, self.REL)                          # <根>/harness/dsh/...
+            with patch.object(hp.paths, "echo_root", lambda: code), \
+                 patch.object(hp.paths, "echo_base", lambda: base), \
+                 patch.object(hp.paths, "dsh_root",
+                              lambda: os.path.join(base, "dsh", "app")):
+                self.assertEqual(hp.local_entry(), want)
+
 
 class CommandSelectionTests(unittest.TestCase):
     REL = hp.LOCAL_ENTRY_REL
 
-    def _cmd(self, setting_value, root, node="/usr/bin/node"):
+    def _cmd(self, setting_value, root, node="/usr/bin/node", desktop_cli=""):
         with patch.object(hp.paths, "echo_root", lambda: root), \
              patch.object(hp.shutil, "which", lambda n: node if n == "node" else None), \
              patch.object(hp, "find_node_dir", lambda: ""), \
+             patch.object(hp, "find_desktop_cli", lambda: desktop_cli), \
              patch.object(hp.settings, "get", lambda k, d=None: setting_value if k == "harnessCommand" else d):
             return hp.command()
+
+    def test_the_official_desktop_cli_wins(self):
+        """2026-11-03 一套 DSH：程序来源是官方桌面端自带的 dsh（升级跟着桌面端）。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            entry = _make_tree(tmp, self.REL)          # 本地那份也在，但桌面端优先
+            got = self._cmd(hp.DEFAULT_COMMAND, tmp,
+                            desktop_cli=r"C:\App\resources\runtime\cli\bin\dsh.cmd")
+            self.assertIn("dsh.cmd", got)
+            self.assertIn("web", got)
+            self.assertNotIn(entry, got)
 
     def test_default_npx_switches_to_local_when_installed(self):
         with tempfile.TemporaryDirectory() as tmp:

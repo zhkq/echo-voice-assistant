@@ -42,7 +42,7 @@ python scripts/smoke-echo-backend.py --skip-inference      # 只跑查询与拒�
 - **查询**：`/v1/health`（含临时目录统计与并发快照）、`/v1/ready`、`/v1/capabilities`
   （槽、`limits`、`vectorSpaceId` 只有一个 —— 铁律 L5）
 - **能力**：`/v1/asr`（冷/热两次，看真实延迟）、`timestamps` 只报 `exact|none`、
-  `/v1/diarize`、`/v1/speaker/embed`
+  `/v1/diarize`、`/v1/speaker/embed`、`/v1/tts`（edge-tts；不占 GPU，按 client 1 QPS）
 - **拒绝路径**：空 body→400、错 Content-Type→415、声报超限→413、
   不存在的模型→404、`mode=turns`→400
 - **并发闸门**：同一身份两路 → 恰好一路 `409 client_busy`
@@ -409,13 +409,22 @@ curl -s localhost:8900/v1/billing/orders/$ORDER_ID -H "Authorization: Bearer $UT
 还有多少**"的管理数据，**不存请求内容**（音频/文本/嵌入），列名黑名单逐列核对。
 `authorized_open_ids` / `scan_sessions` 是 Phase 4 白名单/扫码会话，**只建表、逻辑没做**。
 
-### 8.7 已知缺口（如实写在这里）
+### 8.7 TTS 通道的收费口径
 
-* **本仓库当前没有 `/v1/tts` 端点**（客户端 TTS 一直走自己的 providers，设计文档
-  假设的那个端点在本仓库不存在）。所以 TTS 的**字符账本**（`quota.CharLedger`）、
-  权益字段（`entitlements.tts_chars`）与"超额 429"判定已经就位并有单测，但**还没有
-  请求路径会调用它**；等 `/v1/tts` 落地时，在端点里接上 `State.tts_ledger.check/add`
-  与 `BillingService.user_slot`（TTS 不占并发槽）即可。
+`/v1/tts`（2026-10-31 加的 edge-tts 通道）已经接上收费闸门：
+
+* 权益（`entitlements.tts_chars`）+ 按 **user** 的 1 QPS 在**读 body 之前**判；
+* 文本解析后用 `check_tts_quota(uid, len(text))` **预判**这次会不会超（不够直接 429，
+  不去白跑上游）；合成成功才把字符记进当天账本；
+* **不占** `Admission` / 并发槽（TTS 是网络 IO），也**不**挤 ASR 的日额度；
+* 手机委托 token（`sub=phone:*`）按**父客户端（ECHO）**的账号计费/限速，
+  不能因为换个 sub 就绕开额度。
+
+上游原有的"每 client 1 QPS"（`tts.tts_limiter`）继续保留；绑定账号的请求再叠一层
+按 user 的 1 QPS。`tts.enabled=false` 仍由上游返回 `503 tts_unavailable`。
+
+### 8.8 已知缺口（如实写在这里）
+
 * `AlipayGateway.query()` / `refund()` 未接入（见 8.4）。
 * 多实例部署时 1 QPS / 日额度是**进程内**计数（与既有 `quota.py` 同一个取舍），
   不是全局精确值。

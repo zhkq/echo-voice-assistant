@@ -43,6 +43,7 @@ import urllib.error
 import urllib.request
 
 from app.config import settings
+from app import e2e
 
 #: 转发请求带的标记 —— `app/api.py::_is_loopback_call` 认它（**两边必须一致**）。
 RELAY_MARKER_HEADER = "X-Echo-Relay"
@@ -327,6 +328,78 @@ def _local_base() -> str:
     return "http://127.0.0.1:%d" % port
 
 
+def _b64_any(text) -> bytes:
+    """解 Base64：同时接受标准/URL-safe、带/不带 padding。
+
+    手机新版本内层 body 用标准 Base64；旧版本/某些路径可能是 URL-safe 无 padding。
+    relay 不能因为一个 `-`/`_` 或长度不是 4 的倍数就把整条 E2E 请求判死。
+    """
+    value = str(text or "")
+    value += "=" * (-len(value) % 4)
+    return base64.b64decode(value, altchars=b"-_", validate=False)
+
+
+def _execute_e2e(call: dict) -> dict:
+    """方案 B：解密手机 E2E 信封 → 本机 API → 加密响应。
+
+    外层 `call["body"]` 是后端 relay 转来的 base64 密文；解出来是
+    `{method,path,query,headers,body}`。内层 headers 只取 Authorization /
+    Content-Type，避免 E2E 变成任意头注入。本机请求带 `X-Echo-Relay`，
+    ECHO 的 `_is_loopback_call` 会因此**不再把回环当免检**，仍按手机 token 鉴权。
+    """
+    out = {"id": str(call.get("id") or ""), "status": 502, "headers": {}, "body": ""}
+    try:
+        raw = _b64_any(call.get("body"))
+        envelope = json.loads(raw.decode("utf-8"))
+        inner, device_id = e2e.open_envelope(envelope)
+        mode = str(inner.get("method") or "GET").upper()
+        path = str(inner.get("path") or "").lstrip("/")
+        if not path_allowed(path) or path in ("api/e2e", "api/e2e/"):
+            raise ValueError("E2E 内层路径不允许")
+        query = str(inner.get("query") or "")
+        headers = inner.get("headers") or {}
+        body = _b64_any(inner.get("body")) if inner.get("body") else b""
+        url = _local_base() + "/" + path
+        if query:
+            url += "?" + query
+        req = urllib.request.Request(url, data=body if body else None, method=mode)
+        auth = str(headers.get("authorization") or "")
+        ctype = str(headers.get("content-type") or "")
+        if auth:
+            req.add_header("Authorization", auth)
+        if ctype:
+            req.add_header("Content-Type", ctype)
+        req.add_header(RELAY_MARKER_HEADER, RELAY_MARKER_VALUE)
+        try:
+            with urllib.request.urlopen(req, timeout=LOCAL_CALL_TIMEOUT_S) as resp:
+                payload = resp.read()
+                status = int(resp.status)
+                rctype = resp.headers.get("Content-Type") or ""
+        except urllib.error.HTTPError as e:
+            payload = e.read()
+            status = int(e.code)
+            rctype = e.headers.get("Content-Type") or "" if e.headers else ""
+        inner_result = {
+            "status": status,
+            "contentType": rctype,
+            "body": base64.b64encode(payload or b"").decode("ascii"),
+        }
+        sealed = e2e.seal_envelope(device_id, inner_result)
+        out["status"] = 200
+        out["headers"] = {"content-type": "application/json"}
+        out["body"] = base64.b64encode(
+            json.dumps(sealed, ensure_ascii=False).encode("utf-8")).decode("ascii")
+        out.pop("error", None)
+        return out
+    except Exception as exc:                                      # noqa: BLE001
+        out["error"] = "E2E 请求解不开或设备已撤销：%s" % exc
+        out["status"] = 400
+        out["headers"] = {"content-type": "application/json"}
+        out["body"] = base64.b64encode(json.dumps(
+            {"ok": False, "error": str(exc)}).encode("utf-8")).decode("ascii")
+        return out
+
+
 def _execute(call: dict) -> dict:
     """在本机执行一条中继调用，返回给后端的 result 体。**不抛异常。**"""
     call_id = str(call.get("id") or "")
@@ -335,6 +408,8 @@ def _execute(call: dict) -> dict:
     if not path_allowed(path):
         out["error"] = "路径不在中继白名单里（只放行 /health 与 /api/*）"
         return out
+    if path.lstrip("/") in ("api/e2e", "api/e2e/"):
+        return _execute_e2e(call)
     query = str(call.get("query") or "")
     url = _local_base() + "/" + path.lstrip("/")
     if query:

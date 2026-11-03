@@ -1,5 +1,6 @@
 package com.echo.contact.data
 
+import com.google.gson.JsonObject
 import com.echo.contact.data.dto.CommandItem
 import com.echo.contact.data.dto.CommandListResponse
 import com.echo.contact.data.dto.CommandRequest
@@ -54,6 +55,10 @@ interface EchoApi {
     /** 用一次性配对码换令牌。这是**唯一**不带令牌的接口。 */
     @POST("api/pair/phone/claim")
     suspend fun pairClaim(@Body body: PairClaimRequest): Response<PairClaimResponse>
+
+    /** 方案 B：加密配对 claim（relay 只看到 nonce/ephPub/iv/ciphertext）。 */
+    @POST("api/pair/phone/claim/v2")
+    suspend fun pairClaimV2(@Body body: JsonObject): Response<JsonObject>
 
     /** 发一条文字指令给智能体。 */
     @POST("api/assistant/command")

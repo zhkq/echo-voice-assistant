@@ -3,8 +3,11 @@ package com.echo.contact.ui
 import android.app.Application
 import androidx.lifecycle.viewModelScope
 import com.echo.contact.data.ApiClient
+import com.echo.contact.data.E2E
 import com.echo.contact.data.PairStore
 import com.echo.contact.data.dto.PairClaimRequest
+import com.google.gson.JsonObject
+import com.google.gson.JsonParser
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -72,6 +75,66 @@ class PairViewModel(app: Application) : BaseViewModel(app) {
                 _connectionMessage.value = "无法连接：${e.message}"
             }
             _checking.value = false
+        }
+    }
+
+    /** 方案 B：扫 ECHO 二维码，用 ECHO 公钥加密 claim；relay 只看到密文。 */
+    fun claimV2(ticketText: String, fallbackBaseUrl: String, name: String) {
+        val rawTicket = ticketText.trim()
+        if (rawTicket.isBlank()) {
+            _state.value = PairUiState.Error("二维码内容为空")
+            return
+        }
+        _state.value = PairUiState.Submitting
+        viewModelScope.launch {
+            try {
+                val ticket = withContext(Dispatchers.Default) { E2E.parseTicket(rawTicket) }
+                val base = (ticket.relay.ifBlank { fallbackBaseUrl }).trim().trimEnd('/')
+                if (base.isBlank()) throw IllegalArgumentException("二维码里没有中继地址")
+                val deviceKey = withContext(Dispatchers.Default) { E2E.newKeyPair() }
+                val claim = withContext(Dispatchers.Default) {
+                    E2E.buildClaim(ticket, name.trim().ifBlank { "mobile" }, deviceKey)
+                }
+                val resp = ApiClient.create(base).pairClaimV2(claim)
+                val envelope = resp.body()
+                if (!resp.isSuccessful || envelope == null) {
+                    _state.value = PairUiState.Error(parseError(resp))
+                    return@launch
+                }
+                val body = withContext(Dispatchers.Default) { E2E.decryptResponse(envelope) }
+                val token = body.get("token")?.asString.orEmpty()
+                if (token.isBlank()) throw IllegalStateException("后端没有返回手机 token")
+                val echoPub = body.get("echoPublicKey")?.asString ?: ticket.echoPublicKey
+                val devicePub = E2E.publicToStorage(deviceKey.public)
+                val deviceId = body.get("deviceId")?.asString ?: E2E.deviceId(devicePub)
+                val tts = body.getAsJsonObject("tts")
+                // 手机只能经 relay 时，ticket 里的 relay 才是可达入口；服务端返回的
+                // baseUrl 可能是局域网地址（claim 从别的路径进来时尤其如此），
+                // 不能拿它覆盖 ticket.relay，否则配对成功后状态请求必然连不上。
+                val storedBase = ticket.relay.ifBlank {
+                    body.get("baseUrl")?.asString ?: base
+                }
+                PairStore.saveE2E(
+                    getApplication(),
+                    storedBase.trim().trimEnd('/'),
+                    token,
+                    body.get("name")?.asString ?: name.trim().ifBlank { "mobile" },
+                    echoPublicKey = echoPub,
+                    deviceId = deviceId,
+                    devicePrivateKey = E2E.privateToStorage(deviceKey.private),
+                    devicePublicKey = devicePub,
+                    ttsUrl = tts?.get("baseUrl")?.asString.orEmpty(),
+                    ttsToken = tts?.get("token")?.asString.orEmpty(),
+                    ttsTlsPin = tts?.get("tlsPin")?.asString.orEmpty(),
+                )
+                _state.value = PairUiState.Success
+            } catch (e: HttpException) {
+                _state.value = PairUiState.Error(parseHttp(e))
+            } catch (e: IOException) {
+                _state.value = PairUiState.Error("无法连接：${e.message}")
+            } catch (e: Exception) {
+                _state.value = PairUiState.Error("扫码配对失败：${e.message}")
+            }
         }
     }
 

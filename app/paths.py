@@ -162,14 +162,65 @@ def dsh_root() -> str:
 
 
 def dsh_home_root() -> str:
-    """**DSH_HOME**（skills / 会话 / settings.yaml / storages）：``{echoBase}/dsh/home``。
+    """**DSH_HOME**：**官方桌面端的家目录**（`~/.dsh`），桌面版与无头 dsh 共用这一份。
 
-    为什么与本体并排、而不是塞进 `aide/`：DSH 会把自己的会话存储当工作区内容，
-    放进工作区等于让 agent 读到自己的存档（设计 §2.2 的 A/B 两案，选了 A）。
-    老布局：``{DATA}/harness``。
+    2026-11-03 用户拍板（"不能接受用户用两套 dsh"）：ECHO 只保留**一套** DSH ——
+    桌面版开着就用桌面版（43120），没开就由 ECHO 起无头 dsh（token）；两者共用同一个
+    `DSH_HOME`，于是会话 / 技能 / 工作区 / AGENTS.md 只有一份，打开桌面版就能看到
+    ECHO 建的「会议空间 / 指令空间 / 每日回顾」。
+
+    以前这里是 ``{echoBase}/dsh/home``（ECHO 自己一份）——那样桌面版与 ECHO 各有一套
+    会话，正是用户不能接受的那个状态。
+
+    覆盖顺序：环境变量 ``ECHO_DSH_HOME``（测试/多实例） → 隐藏设置 ``dshHome`` →
+    ``~/.dsh``。
     """
+    override = os.environ.get("ECHO_DSH_HOME")
+    if override:
+        return os.path.normpath(os.path.abspath(os.path.expanduser(override)))
+    spec = str(_settings_get("dshHome") or "").strip()
+    if spec:
+        return os.path.normpath(_expand_light(spec))
+    return os.path.normpath(os.path.expanduser("~/.dsh"))
+
+
+def _expand_light(spec: str) -> str:
+    """展开 ``~`` / ``{ECHO}`` / ``{ECHO_BASE}`` / ``{DATA}``（**不含** dshHome 自身，防递归）。"""
+    try:
+        base = echo_base() or echo_root()
+    except Exception:
+        base = ""
+    out = str(spec)
+    for key, value in (("~", os.path.expanduser("~")), ("{ECHO_BASE}", base or ""),
+                       ("{ECHO}", echo_root()), ("{DATA}", data_root())):
+        out = out.replace(key, value)
+    return os.path.expanduser(out)
+
+
+def legacy_dsh_homes() -> list:
+    """**旧布局**里 ECHO 自己那份 DSH 家目录（迁移用：内容并进 :func:`dsh_home_root`）。
+
+    两代落点都在里：3.0 ``{echoBase}/dsh/home``、2.x ``{DATA}/harness``。只读；
+    实际搬由 `app/harness_proc.migrate_legacy_home()` 做（幂等、只补缺）。
+    """
+    out, seen = [], set()
+
+    def add(p):
+        p = os.path.normpath(p) if p else ""
+        if p and os.path.normcase(p) not in seen:
+            seen.add(os.path.normcase(p))
+            out.append(p)
+
     d = base_dir("dsh")
-    return os.path.join(d, "home") if d else os.path.join(data_root(), "harness")
+    if d:
+        add(os.path.join(d, "home"))
+    try:
+        add(os.path.join(data_root(), "harness"))
+    except Exception:
+        pass
+    add(os.path.join(echo_root(), "data", "harness"))
+    target = os.path.normcase(dsh_home_root())
+    return [p for p in out if os.path.normcase(p) != target]
 
 
 def meetings_root() -> str:

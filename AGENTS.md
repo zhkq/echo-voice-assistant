@@ -1,5 +1,99 @@
 # AGENTS.md — 给 AI/协作者的长期约定与踩坑记录
 
+## 2026-11-03 **撤销客户端 ≠ 只让旧令牌失效**（真机：撤销了还能转写）
+
+用户原话：*"cli-619e43 这个授权我已经撤销了，但是客户端还是能转写"* —— 是真的。
+
+- **根因**：`token_version + 1` 只杀死**已经发出去**的 JWT；客户端手里还有 **secret**，
+  而 `/v1/token`（`Auth.token_for`）当时**不看 `revoked_at`**。客户端
+  `app/capabilities/echo_server.py::_request` 的 401 分支（`_force_renew`）会拿那个仍然
+  有效的 secret **立刻换一个新令牌**回来 —— "撤销"对真实客户端等于没做。
+  真机证据：`cli-619e43` 在 `13:41:41Z` 被撤（`revoked_at`/`token_version=2`），
+  `clients.last_seen` 仍是 `14:50:53Z`（撤销后一小时还在转写）；现网用旧 secret 打
+  `/v1/token` 仍回 **200 + 新令牌**。
+- **修法（两半都要，缺一不可）**：① `Auth.token_for()` 与 `Auth.authenticate()` 先看
+  `revoked_at`，已撤销一律 401（`unauthenticated`/`unauthorized`，文案"这个客户端已被撤销，
+  需要重新配对"）；② `Auth.redeem()` 复用 client_id 时 `store.revive(cid)` ——
+  重新配对 = 重新授权，否则新 secret 兑出来"配上了却用不了"（`/v1/token` 拒它、列表也不显示）。
+  入口统一：`ops.revoke_client()` → `Auth.revoke()`；命令行 / 管理面共用。
+- **语义边界（别做过头）**：撤销**不销毁** secret（`Store.revive()` 保留"误标一次能回退"，
+  行也留着——那是管理员的账）。要彻底废凭据用 `--rotate-secret`（无宽限期）。两者别混。
+- **已经撤销过的老行**：因为判据是现读的 `revoked_at`，改完**部署即生效**，不用逐条 rotate。
+- **客户端会"重试续命"这条要记住**：服务端任何"凭据级"的切断（撤销/禁用/轮换）都要问一句
+  "它能不能自己再换一个令牌回来？" —— 能，就等于没切。
+- **判据**：`tests/test_server_contract.py::AuthTokenTests`
+  `test_revoke_forbids_reissuing_a_token_with_the_old_secret`、
+  `test_repairing_a_revoked_client_clears_the_revoked_mark`、
+  `test_revive_restores_the_old_credential`；冲突面 `test_admin_console.py`（`tokenVersion`
+  2/3/4、写端点白名单）。文档：`docs/ECHO能力后端-服务端设计.md` §7.5 ④ 的"第二批事故"。
+- **顺带修掉一条已红的门禁**：`test_admin_console.IsolationTests.test_every_write_endpoint_is_registered`
+  的能力面白名单漏了方案 B 的 `/v1/delegate`、`/v1/delegate/revoke`、`/v1/tts`
+  （a70620de 加端点时没补）—— HEAD 上本来就在红，已补登记。
+
+## 2026-11-03 一套 DSH（**取代本文所有"桌面版 + 标准版 harness 两套"的旧口径**）
+
+用户原话：**"我不能接受用户用两套 dsh"**。定案并已落地（Windows 先行；mac 的官方桌面版
+安装流程待真机验证后切）：
+
+- **只有一套 DSH**：程序来自**官方 DeepSeek Harness 桌面端自带的 `dsh.cmd`**
+  （`<桌面端>\resources\runtime\cli\bin\dsh.cmd`），ECHO 以无头方式拉起
+  （`dsh web --port 43199 --no-open`）。**不再有 npm 安装、不再需要 Node**。
+- **`DSH_HOME` 与桌面版共用**（`~/.dsh`）：`paths.dsh_home_root()` 返回官方桌面端家目录
+  （`ECHO_DSH_HOME` / 隐藏设置 `dshHome` 可覆盖）。于是会话 / 技能 / 工作区 / AGENTS.md /
+  模型注册**只有一份** —— 打开桌面版能看到 ECHO 建的「会议空间 / 指令空间 / 每日回顾」。
+  旧家目录（3.0 `<根>\dsh\home`、老装机 `<DATA>\harness`）由
+  `harness_proc.migrate_legacy_home()` **只补缺**地并进来（有标记文件、旧目录不删）。
+- **桌面版与无头 dsh 共享 `~/.dsh`（2026-11-03 用户拍板，Windows 实机验证）**：
+  `harness_proc.desktop_mode()`（探测 43120）为真 → 直接用桌面版（签名 Cookie）；
+  为假（**当前官方桌面版 0.2.1-rc.5 就是这种情况：没有对外 HTTP 接口、asar 里也没有
+  "普通浏览器访问"开关**）→ ECHO **照样起无头 dsh**，与桌面版**两个进程共用同一个家目录**。
+  用户要的就是"先开桌面版、再开 ECHO、两个同时用"；风险（官方未承诺两进程并发写
+  storages/工作区）**如实记日志**（`db.add_log("warn","dsh",…)`），不装作没风险。
+  `yield_to_desktop()` 只在"桌面版真的有对外接口"时才停掉无头（让出）；没有接口时**不让出**。
+- **一个产品**：`app/agents/harness_agent.py::HarnessAgent` 现在 `name = "dsh"`、
+  显示名「DSH（DeepSeek Harness）」，内部按 desktop/headless 选接入；`DshAgent` 不再
+  单独注册（只作父类 + 桌面版探针，`dsh.get_desktop_client()` 直接实例化）。
+  `agentBackend` 的旧值 `harness` 在 `agents.selected_name()` / `active_name()` 里归一成 `dsh`。
+- **启动页只剩一行 `dsh`**（label「DSH（唯一一套）」，可启动/停止/重试）；`harness` 组件行已删。
+  `_start_dsh` 读 `dshAutoStart`（**默认开**）：开=桌面版没开就拉起无头；关=标 `skipped`。
+  `settings_effects._agent()` 在设置变化后调 `boot.refresh_agent_rows()` 重算那一行。
+- **跳转**：`POST /api/harness/browser` 现在两种情况都支持 —— 桌面版在跑就铸签名 Cookie 打开
+  43120；没开就打开无头 dsh 的 Web 界面（token→Cookie）。面板上的小图标即它。
+- **退役**：`agentHarnessEnabled`（废弃）、`harnessToken`（废弃）、`harnessHome`（废弃）、
+  `harness-install-local.*` 与 `-AskDsh/-DshDir/-HarnessSource/-PinHarnessCommand`（安装器
+  保留参数只为兼容旧命令行、只告警）；`tests/test_install_existing_dsh.py` 随功能删除。
+  **别再复活"两套 dsh"**：不要给两边各建一套家目录；也不要重新引入 npm/Node 那条安装路。
+  桌面版有对外接口时仍应"直接用它、不另起无头"（`yield_to_desktop()`）；没有接口时才允许共存。
+- **安装器的"判断 DSH 是否已装 / 执行安装"三个 P0（2026-11-03 真机，必须守住）**：
+  * **判据要看真东西**：`<安装根>\dsh\app` 这个空目录（install.ps1 曾自己创建、老标准版卸载后
+    也可能剩）**不算已装**；install.ps1 已不再建 `dsh\app` / `dsh\home`。`install-all.ps1::Ask-UpgradeDsh`
+    只认官方桌面端自己的 `dsh.cmd` 或 `~/.dsh` 里真实存在的 settings / 凭据 / sessions。
+  * **判断与动作必须一致**：升级路径里"不升级 DSH"**不许**再把 `$Agent` 设成 `'none'`
+    （那会让组件根本不检查 dsh，装完 ECHO 没有引擎）；一律 `$Agent='dsh'`，不升级=只认已装、
+    缺了如实报错。`harness-install-desktop.ps1::Find-OfficialCli` 还要求 CLI 位于**装好的桌面端根**
+    （能找到 `DeepSeek Harness.exe`），且 CLI 真能 `--version`，否则按未安装重装。
+  * **splat 只能用哈希表**：`$dargs = @{ LogFile = ... }; & $helper @dargs`。
+    用数组 `@('-LogFile', $x)` 是**按位置**绑定，会把参数错位（真机表现为 helper 一条命令都没执行）。
+    另外 `$args` 是 PowerShell 自动变量，**不许**当普通数组赋值（`harness-install-desktop.ps1` 里
+    已改名 `$installerArgs`）。
+  * **其它同轮加固**：GUI 与 ECHO 无头 dsh 是**同一个 exe 名**，判断"桌面版在运行"必须按命令行
+    区分（含 `dsh-desktop-host\lib\cli.js`/`web --port` = 无头），否则升级会被无头引擎挡下/误判；
+    `--version` 探测要有硬超时（20s），坏 CLI 不能挂死安装器；装自定义目录时只认**目标根下**的 CLI
+    （`Find-CliUnderRoot`），不许拿 `%LOCALAPPDATA%` 旧安装冒充成功。
+  * **清空 dsh 后重装**：升级/离线模式默认 `-NoDownload`（只认已装），用户清掉官方桌面端后会直接
+    "没就绪"、装完 ECHO 没引擎。`Prepare-Agent` 现在会先探下载地址（8s），通则**联网补装官方桌面端**
+    （离线包本来不含它），不通则快速失败给手装链接 —— 别再把"离线"理解成"连官方桌面端都不许装"。
+  * 判据：`tests/test_install_entry.py::DshInstallLogicTests`（6 条，含 BOM/解析与文本契约）。
+- **判据**：`tests/test_harness_agent.py`（单一注册、`available()` 两种模式、`requested()` 与
+  `desktop_mode`）、`tests/test_boot_state.py`（只有 dsh 一行、autoStart 三态）、
+  `tests/test_install_base_layout.py`（dsh_home 不在安装根、旧位置进 `legacy_dsh_homes()`）、
+  `tests/test_dsh_home_coupling.py`（不许新增写死的家目录字面量）、`tests/test_status_freshness.py`。
+- **真机冒烟（本机沙箱，`ECHO_DSH_HOME` + `ECHO_DATA` 指临时目录）已过**：桌面端 CLI 能拉起
+  无头 dsh、`session/list` 能通、家目录里自动生成 `.credentials.yaml`、`stop()` 能收干净。
+- ⚠️ **还没验证**：桌面版与无头 dsh **同时开着**时，两边读写同一个 `~/.dsh`（会话/storages）
+  是否完全正常 —— 已按用户要求**允许共存**，但官方未承诺并发安全，需要真机各写一轮再确认；
+  以及真 Mac 上的官方桌面版（dmg）流程。
+
 ## 2026-10-31 最新架构（**取代本文后面所有关于"语音唤醒 / 本机转写"的旧口径**）
 
 用户这一晚拍板并已落地：
@@ -67,6 +161,13 @@
     否则 watchdog 几秒后又拉起（用户实测）。`restart-echo.ps1` 传 `-KeepSupervisor` 保留守护；
     升级路径传 `keepBackend=true` 保留本机后端。判据：`tests/test_install_desktop_stop.py`、
     `tests/test_sidebar_lifecycle.py`、`tests/test_removed_settings.py`。
+- **能力后端 TTS 通道（2026-10-31 用户拍板）**：手机 App 与 ECHO 都走能力后端
+  `POST /v1/tts`（edge-tts 只在后端升级一次）；**不占 ASR 的 GPU/Admission/额度**，
+  按认证 `client_id` **1 QPS**（手机/ECHO 不同 client，各自计数；鉴权关闭时都是
+  `anonymous`，要分开就必须开后端鉴权）。ECHO 选 `ttsEngine=echo-server` 走这条；
+  客户端 `EchoServerClient.tts()` 返回 `(mime, bytes)`。`edge-tts` 必须 >=7.3.1
+  （7.2.8 实测被微软 403）。判据：`tests/test_server_contract.py::TtsChannelTests`、
+  `tests/test_capabilities_contract.py` 的 TTS binary/429 用例。
 - **别再复活**：本地 STT 引擎/模型、唤醒词/KWS、`stt-cmd` 启动预热、「后端失败回落本机」、
   `providerAsr` 优先级（指令路径已移除；`app/providers/local.py` 与 `app/audio/stt.py` 是留下的
   历史代码，默认档不装依赖、运行时不使用）。`sttModel`/`device`/`dailyReviewSttBackend` 现在

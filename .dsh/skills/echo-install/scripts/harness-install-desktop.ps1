@@ -29,7 +29,11 @@ param(
     # Do not try to install into a custom dir first (use official default).
     [switch]$DefaultLocation,
     [int]$TimeoutSec = 900,
-    [string]$LogFile = ''
+    [string]$LogFile = '',
+    # Optional already-downloaded official installer .exe (side-load for offline
+    # / intranet machines). Empty = search next to this script and up to the
+    # delivery folder, then fall back to downloading.
+    [string]$InstallerPath = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -72,27 +76,51 @@ function Find-OfficialCli([string]$preferDir = '') {
     $cmd = Get-Command dsh -ErrorAction SilentlyContinue
     if ($cmd -and $cmd.Source) { $cands.Add([string]$cmd.Source) }
     foreach ($c in $cands) {
-        if ($c -and (Test-Path -LiteralPath $c -PathType Leaf)) {
-            return (Resolve-Path -LiteralPath $c).Path
-        }
+        if (-not $c) { continue }
+        if (-not (Test-Path -LiteralPath $c -PathType Leaf)) { continue }
+        $full = (Resolve-Path -LiteralPath $c).Path
+        # 2026-11-03 real-machine: "file exists" is too loose -- a leftover dsh.cmd
+        # (or an unrelated product's dsh) was treated as "installed". The official
+        # CLI must sit inside an installed desktop root (tree contains
+        # DeepSeek Harness.exe). No root => not an official install, skip it.
+        if (-not (Get-InstallRoot $full)) { continue }
+        return $full
     }
     return ''
 }
 
 function Get-DshVersion([string]$cmd) {
+    # 2026-11-03: run --version with a HARD timeout. A broken CLI can hang, and a
+    # hung `& $cmd` would hang the whole installer. Start-Process + WaitForExit is
+    # the only reliable timeout for a .cmd shim in PowerShell 5.1.
+    $verDir = Join-Path $env:TEMP ('echo-dsh-version-' + $PID)
+    $outFile = Join-Path $verDir 'out.txt'
+    $old = $env:DSH_HOME
+    $env:DSH_HOME = $verDir
     try {
-        $old = $env:DSH_HOME
-        $env:DSH_HOME = Join-Path $env:TEMP ('echo-dsh-version-' + $PID)
-        try {
-            $out = @(& $cmd --version 2>&1)
-        } finally {
-            if ($null -eq $old) { Remove-Item Env:DSH_HOME -ErrorAction SilentlyContinue }
-            else { $env:DSH_HOME = $old }
+        New-Item -ItemType Directory -Force -Path $verDir | Out-Null
+        $p = Start-Process -FilePath $cmd -ArgumentList '--version' -NoNewWindow -PassThru `
+            -RedirectStandardOutput $outFile -RedirectStandardError ($outFile + '.err') -ErrorAction Stop
+        if (-not $p.WaitForExit(20000)) {
+            try { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue } catch { }
+            return ''
         }
+        $out = @()
+        if (Test-Path -LiteralPath $outFile) { $out = @(Get-Content -LiteralPath $outFile -ErrorAction SilentlyContinue) }
         $line = @($out | ForEach-Object { "$_".Trim() } | Where-Object { $_ -match '^\d+\.\d+' } |
                   Select-Object -Last 1)
         if ($line.Count -gt 0) { return [string]$line[-1] }
-    } catch { }
+    } catch {
+        # Fallback: no timeout possible here, but still better than failing outright.
+        try { $out = @(& $cmd --version 2>&1) } catch { $out = @() }
+        $line = @($out | ForEach-Object { "$_".Trim() } | Where-Object { $_ -match '^\d+\.\d+' } |
+                  Select-Object -Last 1)
+        if ($line.Count -gt 0) { return [string]$line[-1] }
+    } finally {
+        if ($null -eq $old) { Remove-Item Env:DSH_HOME -ErrorAction SilentlyContinue }
+        else { $env:DSH_HOME = $old }
+        Remove-Item -LiteralPath $verDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
     return ''
 }
 
@@ -115,21 +143,122 @@ function Emit([string]$cmd, [string]$version, [string]$dir) {
     if ($dir) { Write-Output ('DSH_INSTALL_DIR=' + $dir) }
 }
 
-function Is-Running {
+function Find-CliUnderRoot([string]$root) {
+    # Only accept a CLI that is installed under $root: a custom-dir install must
+    # not "succeed" by silently reusing an older install elsewhere.
+    if (-not $root) { return '' }
+    if (-not (Test-Path -LiteralPath $root)) { return '' }
+    $want = (Resolve-Path -LiteralPath $root).Path.TrimEnd('\')
+    foreach ($c in @((Join-Path $root 'resources\runtime\cli\bin\dsh.cmd'),
+                     (Join-Path $root 'dsh.cmd'))) {
+        if (-not (Test-Path -LiteralPath $c -PathType Leaf)) { continue }
+        $full = (Resolve-Path -LiteralPath $c).Path
+        $found = Get-InstallRoot $full
+        if (-not $found) { continue }
+        if ($found.TrimEnd('\') -ieq $want) { return $full }
+    }
+    return ''
+}
+
+function Get-RunningKinds {
+    # The GUI and ECHO's headless dsh share the same exe name
+    # (DeepSeek Harness.exe). Matching by process name alone would mistake the
+    # ECHO engine for the GUI. Split them by command line: the headless CLI has
+    # dsh-desktop-host\lib\cli.js (and web --port).
+    $kinds = @{ Gui = $false; Headless = $false }
     try {
-        $p = @(Get-Process -Name 'DeepSeek Harness' -ErrorAction SilentlyContinue)
-        return ($p.Count -gt 0)
+        $procs = @(Get-CimInstance Win32_Process -Filter "Name = 'DeepSeek Harness.exe'" -ErrorAction SilentlyContinue)
+        foreach ($p in $procs) {
+            $cmd = [string]$p.CommandLine
+            if ($cmd -match 'dsh-desktop-host\\lib\\cli\.js' -or $cmd -match 'web --port') {
+                $kinds.Headless = $true
+            } else {
+                $kinds.Gui = $true
+            }
+        }
+    } catch { }
+    return $kinds
+}
+
+function Find-LocalInstaller {
+    # Side-load: an already downloaded official installer placed next to this
+    # script or anywhere up to the delivery folder (offline / intranet machines).
+    # Match the official naming so we do not pick up some random .exe.
+    $cands = New-Object System.Collections.Generic.List[string]
+    if ($InstallerPath) { $cands.Add($InstallerPath) }
+    if ($env:ECHO_DSH_INSTALLER) { $cands.Add([string]$env:ECHO_DSH_INSTALLER) }
+    $dirs = New-Object System.Collections.Generic.List[string]
+    $d = $PSScriptRoot
+    for ($i = 0; $i -lt 6 -and $d; $i++) {
+        $dirs.Add($d)
+        $d = Split-Path -Parent $d
+    }
+    foreach ($dir in $dirs) {
+        if (-not $dir -or -not (Test-Path -LiteralPath $dir)) { continue }
+        foreach ($pat in @('dsh-latest-windows-x64.exe', 'dsh-*windows*.exe', 'deepseek*harness*.exe')) {
+            foreach ($f in @(Get-ChildItem -LiteralPath $dir -Filter $pat -File -ErrorAction SilentlyContinue)) {
+                $cands.Add($f.FullName)
+            }
+        }
+    }
+    foreach ($c in $cands) {
+        if (-not $c) { continue }
+        if (-not (Test-Path -LiteralPath $c -PathType Leaf)) { continue }
+        $len = (Get-Item -LiteralPath $c).Length
+        if ($len -ge $MIN_BYTES) { return (Resolve-Path -LiteralPath $c).Path }
+    }
+    return ''
+}
+
+function Invoke-Curl {
+    # Run curl via Start-Process (NOT "& curl ... 2>&1"): in PowerShell 5.1 the
+    # first stderr line of a native command becomes a TERMINATING error while
+    # $ErrorActionPreference='Stop', and curl writes its progress meter to
+    # stderr -> download aborted at attempt 1 (2026-11-03 real-machine).
+    param([string]$CurlExe, [string[]]$CurlArgs)
+    $out = Join-Path $env:TEMP ('echo-curl-out-' + $PID + '.txt')
+    $err = Join-Path $env:TEMP ('echo-curl-err-' + $PID + '.txt')
+    try {
+        $p = Start-Process -FilePath $CurlExe -ArgumentList $CurlArgs -NoNewWindow -Wait `
+            -PassThru -RedirectStandardOutput $out -RedirectStandardError $err -ErrorAction Stop
+        return $p.ExitCode
+    } catch {
+        return -1
+    } finally {
+        Remove-Item -LiteralPath $out, $err -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Test-DownloadReachable {
+    # 6-second reachability probe. Offline machines must fail FAST instead of
+    # letting curl retry for minutes. Any HTTP response counts as reachable.
+    $curl = (Get-Command curl.exe -ErrorAction SilentlyContinue)
+    if ($curl -and $curl.Source) {
+        $code = Invoke-Curl -CurlExe $curl.Source -CurlArgs @('-s', '-o', 'NUL', '-I', '-L', '--max-time', '6', $URL)
+        if ($code -eq 0) { return $true }
+        # Some CDNs dislike HEAD; try a 1-byte range GET.
+        $code = Invoke-Curl -CurlExe $curl.Source -CurlArgs @('-s', '-o', 'NUL', '-L', '--max-time', '6', '-r', '0-0', $URL)
+        if ($code -eq 0) { return $true }
+        return $false
+    }
+    try {
+        $r = Invoke-WebRequest -Uri $URL -Method Head -UseBasicParsing -TimeoutSec 8
+        return ($r.StatusCode -ge 200)
     } catch { return $false }
 }
 
 function Download-Installer {
+    if (-not (Test-DownloadReachable)) {
+        throw 'cannot reach download.deepseek.com (no network / proxy blocks it)'
+    }
     $tmp = Join-Path $env:TEMP ('echo-dsh-desktop-' + $PID + '.exe')
     $curl = (Get-Command curl.exe -ErrorAction SilentlyContinue)
     if ($curl -and $curl.Source) {
         for ($i = 1; $i -le 12; $i++) {
             Say ('downloading official DeepSeek Harness (attempt ' + $i + '/12)...')
-            & $curl.Source -L --fail --retry 3 --retry-delay 2 --retry-all-errors `
-                -C - -o $tmp $URL 2>&1 | Out-Null
+            $null = Invoke-Curl -CurlExe $curl.Source -CurlArgs @(
+                '-L', '--fail', '--retry', '3', '--retry-delay', '2',
+                '--retry-all-errors', '-C', '-', '-o', $tmp, $URL)
             $len = 0
             if (Test-Path -LiteralPath $tmp) { $len = (Get-Item -LiteralPath $tmp).Length }
             if ($len -ge $MIN_BYTES) { return $tmp }
@@ -148,34 +277,66 @@ function Download-Installer {
 $existing = Find-OfficialCli $InstallDir
 if ($existing -and -not $Upgrade) {
     $v = Get-DshVersion $existing
-    Ok ('using installed DeepSeek Harness CLI: ' + $existing)
-    if ($v) { Say ('  version: ' + $v) }
-    Emit $existing $v (Get-InstallRoot $existing)
-    LogLine ('reuse ' + $existing + ' version=' + $v)
-    exit 0
+    if (-not $v) {
+        # File exists but cannot run (broken copy / half-deleted / permissions):
+        # treat it as NOT installed and reinstall, instead of failing later with
+        # a misleading "already installed" error.
+        Warn ('found a dsh CLI that cannot run; treating as NOT installed: ' + $existing)
+        $existing = ''
+    } else {
+        Ok ('using installed DeepSeek Harness CLI: ' + $existing)
+        Say ('  version: ' + $v)
+        Emit $existing $v (Get-InstallRoot $existing)
+        LogLine ('reuse ' + $existing + ' version=' + $v)
+        exit 0
+    }
 }
 if ($NoDownload) {
     if ($existing) { $v = Get-DshVersion $existing; Emit $existing $v ''; exit 0 }
     throw 'DeepSeek Harness desktop is not installed, and -NoDownload was given'
 }
 
-if (Is-Running) {
-    if ($existing) {
-        Warn 'DeepSeek Harness is running; not reinstalling. Close it first if you want to upgrade.'
-        $v = Get-DshVersion $existing
-        Emit $existing $v (Get-InstallRoot $existing)
-        exit 0
+$running = Get-RunningKinds
+if ($running.Gui -or $running.Headless) {
+    if ($Upgrade) {
+        if ($running.Headless) {
+            throw 'ECHO headless dsh (same exe) is running. Stop ECHO first (panel shutdown or scripts\stop.ps1), then re-run this installer to upgrade.'
+        }
+        throw 'DeepSeek Harness is running. Close it (tray -> exit), then run this installer again to upgrade.'
     }
-    throw 'DeepSeek Harness is running. Close it, then run this installer again.'
+    if ($running.Gui) {
+        throw 'DeepSeek Harness is running. Close it, then run this installer again.'
+    }
+    throw 'ECHO headless dsh (same exe) is running. Stop ECHO first (panel shutdown or scripts\stop.ps1), then re-run this installer.'
 }
 
-$tmp = Download-Installer
+$tmp = Find-LocalInstaller
+$downloaded = $false
+if ($tmp) {
+    Say ('using side-loaded official installer: ' + $tmp)
+    LogLine ('side-load ' + $tmp)
+} else {
+    Say 'no side-loaded installer found (put dsh-latest-windows-x64.exe next to the install launcher); trying network...'
+    LogLine 'side-load: not found'
+    $tmp = Download-Installer
+    $downloaded = $true
+}
 Say 'verifying code signature...'
 $sig = Get-AuthenticodeSignature -LiteralPath $tmp
 if ($sig.Status -ne 'Valid') {
-    throw ('installer signature is not valid: ' + $sig.Status + ' ' + $sig.StatusMessage)
+    # Offline machines may not fetch the CRL/OCSP (revocation unreachable) while
+    # the signature itself is intact -> do not block a side-loaded install for
+    # that; anything else (NotSigned / HashMismatch / UnknownError) is fatal.
+    $msg = [string]$sig.StatusMessage
+    if ($sig.Status -eq 'UnknownError' -and $msg -match '(?i)revoc|crl|ocsp|timeout|offline') {
+        Warn ('signature revocation could not be checked (offline?): ' + $msg)
+        Warn 'signature itself looks intact; continuing'
+    } else {
+        throw ('installer signature is not valid: ' + $sig.Status + ' ' + $msg)
+    }
+} else {
+    Ok 'signature valid'
 }
-Ok 'signature valid'
 
 $targets = New-Object System.Collections.Generic.List[string]
 if ($InstallDir -and -not $DefaultLocation) { $targets.Add($InstallDir) }
@@ -183,7 +344,10 @@ $targets.Add((Join-Path $env:LOCALAPPDATA 'Programs\DeepSeek Harness'))
 
 $installed = ''
 foreach ($target in $targets) {
-    $args = @('/S')
+    # NEVER name this $args: that is a PowerShell automatic variable (parameter
+    # list of the current script/function). Using it as a plain array caused the
+    # install command to not run at all (2026-11-03 real-machine).
+    $installerArgs = @('/S')
     $defaultDir = Join-Path $env:LOCALAPPDATA 'Programs\DeepSeek Harness'
     $isDefaultDir = (-not $InstallDir) -or $DefaultLocation -or ($target -ieq $defaultDir)
     if (-not $isDefaultDir) {
@@ -193,13 +357,13 @@ foreach ($target in $targets) {
             Warn ('install dir has spaces, using official default instead: ' + $target)
             $target = $defaultDir
         } else {
-            $args += ('/D=' + $target)
+            $installerArgs += ('/D=' + $target)
         }
     }
     Say ('running official installer (silent) -> ' + $target)
     $p = $null
     try {
-        $p = Start-Process -FilePath $tmp -ArgumentList $args -Wait -PassThru
+        $p = Start-Process -FilePath $tmp -ArgumentList $installerArgs -Wait -PassThru
         $code = $p.ExitCode
     } catch {
         $code = -1
@@ -208,17 +372,23 @@ foreach ($target in $targets) {
     LogLine ('installer target=' + $target + ' exit=' + $code)
     if ($code -ne 0) { Warn ('installer exit code ' + $code) }
     # NSIS can return before the last files are flushed; poll briefly.
+    # Use Find-CliUnderRoot (NOT Find-OfficialCli): a custom -InstallDir must be
+    # verified to actually contain the new copy, otherwise a leftover install in
+    # %LOCALAPPDATA% would make a failed custom install look successful.
     $cli = ''
     for ($i = 0; $i -lt 30; $i++) {
-        $cli = Find-OfficialCli $target
+        $cli = Find-CliUnderRoot $target
         if ($cli) { break }
         Start-Sleep -Seconds 1
     }
     if ($cli) { $installed = $cli; break }
     if (-not $InstallDir -or $DefaultLocation) { break }
 }
-
 if (-not $installed) {
+    if ($InstallDir -and -not $DefaultLocation) {
+        Warn ('custom install dir did not produce a usable CLI: ' + $InstallDir)
+        Warn 'falling back to any already-installed copy (if one exists)'
+    }
     $installed = Find-OfficialCli ''
 }
 if (-not $installed) {
@@ -234,5 +404,5 @@ Ok ('DeepSeek Harness ready: ' + $installed)
 Say ('  version: ' + $version)
 LogLine ('installed ' + $installed + ' version=' + $version)
 Emit $installed $version $dir
-Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+if ($downloaded) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
 exit 0

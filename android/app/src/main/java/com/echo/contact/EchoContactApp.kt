@@ -9,6 +9,7 @@ class EchoContactApp : Application() {
 
     override fun onCreate() {
         super.onCreate()
+        ApiClient.attachContext(this)
         ApiClient.attachTokenProvider { PairStore.token(this) }
     }
 }

@@ -39,13 +39,27 @@ def dsh_ready():
 
 
 def dsh_start():
-    """DSH Desktop 由用户/自启管理，此处只探测并给出提示。返回 (ok, message)。"""
+    """**一套 DSH** 的启动入口：桌面版在跑就直接用它，否则由 ECHO 起无头 dsh。
+
+    2026-11-03 用户拍板：只保留一套 DSH。桌面版 GUI **不由 ECHO 启动/关闭**
+    （那是用户自己的窗口），但它没开时 ECHO 会把同一份程序（桌面端自带的 dsh）
+    以无头方式拉起来，家目录同样是 `~/.dsh`。返回 ``(ok, message)``。
+    """
     if dsh_ready():
-        return True, "DSH Desktop 已在运行"
-    return False, ("DSH Desktop 未运行或未开放本机访问。请启动 DSH Desktop"
-                   "（设置 → 常规：普通浏览器访问=开启，或确认 ~/.dsh/settings.yaml"
-                   " 的 dsh-desktop.mode=compatibility 且 openBrowser=true），"
-                   "然后重试")
+        return True, "DSH 桌面版已在运行（%s）" % _desktop_url()
+    try:
+        from app import harness_proc
+        return harness_proc.ensure_running()
+    except Exception as exc:
+        return False, "启动 DSH 失败：%s: %s" % (type(exc).__name__, exc)
+
+
+def _desktop_url():
+    try:
+        from app import harness_proc
+        return harness_proc.desktop_url()
+    except Exception:
+        return "http://127.0.0.1:43120"
 
 
 def agent_ready():
@@ -79,13 +93,19 @@ def agent_ready():
 
 
 def dsh_stop():
-    """桌面版不由 ECHO 停止；仅清理失效的旧 pid 文件。返回 (ok, message)。"""
+    """停止 **ECHO 自己拉起的** 无头 dsh（桌面版 GUI 不归 ECHO 停）。返回 (ok, message)。"""
+    ok, msg = True, ""
+    try:
+        from app import harness_proc
+        ok, msg = harness_proc.stop(reason="面板/接口手动停止 DSH")
+    except Exception as exc:
+        ok, msg = False, "停止 DSH 失败：%s: %s" % (type(exc).__name__, exc)
     try:
         if os.path.isfile(DSH_PID_FILE):
             os.remove(DSH_PID_FILE)
     except OSError:
         pass
-    return True, "DSH Desktop 由桌面客户端托管，ECHO 不参与启停（旧 pid 已清理）"
+    return ok, msg or "DSH 已停止"
 
 
 def echo_write_pid():

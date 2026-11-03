@@ -6,6 +6,8 @@
 而**本机回环**的请求仍然不必带令牌 —— 否则本地面板自己就瞎了（面板是静态页，没有令牌可带，
 于是连"生成配对码"都点不动）。判据见 `optional_auth()`。
 """
+import base64
+import io
 import json
 import os
 import re
@@ -20,7 +22,7 @@ from starlette.background import BackgroundTask
 import app.db as db
 from app import __version__ as _ECHO_VERSION
 from app.config import settings
-from app import assistant, manager, meeting, netguard, phone_pair, ports, relay as relay_mod, relay_web, runtime, services, worklog
+from app import assistant, e2e, manager, meeting, netguard, phone_pair, ports, relay as relay_mod, relay_web, runtime, services, worklog
 from app.audio import recorder
 from app.audio import tts as tts_mod
 from app.pathutil import safe_under as _safe_under
@@ -353,6 +355,17 @@ class PhoneClaimIn(BaseModel):
     name: str = "mobile"
 
 
+class PhoneClaimV2In(BaseModel):
+    """方案 B：手机用二维码里的 ECHO 公钥加密 claim，relay 只看到密文。"""
+    v: int = 2
+    nonce: str = ""
+    ephPub: str = ""
+    iv: str = ""
+    ciphertext: str = ""
+    # 兼容/排障：不信任这两个，真正的设备公钥在密文里，签名也要验。
+    name: str = "mobile"
+
+
 class PairBackendIn(BaseModel):
     """配对一台 ECHO 能力后端。
 
@@ -622,31 +635,26 @@ def api_capability_backend_compose_write(_auth=Depends(optional_auth)):
 def api_status(_auth=Depends(optional_auth)):
     from app import agents
     selected = agents.selected_name()
+    # 2026-11-03 一套 DSH：只有一行状态，顺手校准一次（桌面版 43120 或 ECHO 起的无头 dsh）。
     dsh_ok = manager.dsh_ready()
-    if selected and selected != "dsh":
-        # 用户选的是**别的**智能体：不要拿桌面版的探活结果去覆盖组件状态。
-        # 那会把 boot 写好的「未使用」又改回 offline，于是 /api/status 与 /api/boot/status
-        # 对同一件事两种说法（2026-09-22 同事反馈 3.4）；折叠条也从这里取状态。
-        services.report_dsh("skipped",
-                            "未使用（你选的是 %s）" % agents.meta(selected)["displayName"])
-    else:
-        services.report_dsh("online" if dsh_ok else "offline",
-                            "API 可访问" if dsh_ok else "未运行")
+    dsh_detail = "API 可访问" if dsh_ok else "未运行"
+    try:
+        from app import harness_proc as _hp
+        if dsh_ok:
+            # 桌面版有对外接口 → 让出同一个家目录（高频轮询，停过一次之后这步是空转）。
+            _hp.yield_to_desktop()
+        elif _hp.desktop_gui_running():
+            # GUI 在、但没有对外接口（当前官方版）：允许共存，无头在跑就算在线。
+            dsh_ok = _hp.online(timeout=0.6)
+            dsh_detail = ("无头 dsh 在跑（与桌面版共用同一个 DSH 家目录）" if dsh_ok else
+                          "未运行（桌面版在跑但无对外接口）；面板点「启动」可起无头 dsh")
+        else:
+            dsh_ok = _hp.online(timeout=0.6)
+            dsh_detail = "API 可访问" if dsh_ok else "未运行"
+    except Exception:
+        pass
+    services.report_dsh("online" if dsh_ok else "offline", dsh_detail)
     components = services.snapshot()
-    # 2026-10-11（用户实测的"状态格陈旧 online 谎报"）：**harness 的状态行要在读取时校准一次**。
-    # 上面那两行的设计是"状态取自组件表、不在这里探活"（对，高频轮询 + codebuddy 那种
-    # 探一次就起一个进程的适配器不能被拖进来），但 harness 的探活只是**一次 HTTP 探测**
-    # （`online()`，1 秒超时、不起进程）。不校准的后果是：**别人把 harness 停了**
-    # （切换器切树 / 手工杀 / 它自己崩了）之后没有任何人重写那一行，于是 43199 明明空着，
-    # 面板与折叠条还一直显示"运行中" —— 用户实测撞到过。
-    # ⚠️ 只有 harness 走这条（dsh 的探活已经在上面 `report_dsh` 里做过；codebuddy 绝不能碰）。
-    if selected == "harness":
-        try:
-            from app import harness_proc
-            harness_proc.sync_status()
-            components = services.snapshot()
-        except Exception:
-            pass                       # 校准失败就用旧值，绝不因为一句话的状态把接口弄挂
     # 2026-10-15（用户实测的"语音合成写着自动、其实是离线"）：**tts 那一行也要在读时校准**。
     # 同一个形状、同一个理由：那句 detail 由 `auto` 到底走在线还是离线决定，而 boot 只在
     # 启动时写一次 —— 之后在线链路断了（edge-tts 被服务端 403）面板还一直写"在线 · edge-tts"。
@@ -681,9 +689,9 @@ def api_status(_auth=Depends(optional_auth)):
     web = relay_mod.web_entry()
     return {
         "components": components,
-        # 顶层 dsh = DSH **桌面版**适配器。skipped 表示"用户选了别的智能体、这个没在用"，
-        # 让消费者能区分"它没选"与"它坏了"（折叠条曾把前者显示成红灯 DSH×）。
-        "dsh": {"online": dsh_ok, "skipped": bool(selected and selected != "dsh")},
+        # 顶层 dsh = **唯一那套 DSH**（桌面版或 ECHO 起的无头 dsh）。一套 DSH 没有"没选它"
+        # 这回事，skipped 恒为 False（保留字段让旧面板/折叠条照常工作）。
+        "dsh": {"online": dsh_ok, "skipped": False},
         "agent": agent_info,
         "stt": stt_st,
         "meeting": st,
@@ -835,27 +843,49 @@ def get_agents(probe: bool = False, _auth=Depends(optional_auth)):
 
 @router.post("/harness/browser")
 def post_harness_browser(_auth=Depends(optional_auth)):
-    """在浏览器里打开独立 harness 的 Web 界面（仪表盘「超级助理」名字后那个小图标）。
+    """在浏览器里打开 **DSH 的 Web 界面**（仪表盘「超级助理」名字后那个小图标）。
 
-    **登录一律走签名 Cookie，先写 Cookie 再开页面**（2026-10-07 用户实测后定的）：
+    2026-11-03 一套 DSH：先看桌面版在不在 ——
+      * 桌面版在跑 → 用 `~/.dsh` 里的签名密钥铸 Cookie，打开 43120（与桌面版同一套）；
+      * 桌面版没开 → 打开 ECHO 起的无头 dsh（43199，token 换 Cookie）。
 
-    为什么不再用 `?token=…`：token **跟着那个进程**，ECHO 每重启一次 harness 就换一枚。
-    旧 token 打开的页面**能加载、但鉴权不过** —— 侧栏没有「工作区」、没有会话列表，
-    而且**没有任何提示**，用户只能看到一片空白（连查两轮才定位到这条）。
-    签名 Cookie 的密钥在**文件**里（`<家目录>/.credentials.yaml`），**不随重启失效**，
-    所以一次点开长期可用。
-
-    仍由**服务端**打开、而不是把凭据下发给页面：Cookie 是密钥，经接口下发等于把它
-    写进前端内存与浏览器历史。响应里只回地址，不回凭据。
+    **登录一律先写 Cookie 再开页面**（2026-10-07 用户实测后定的）：`?token=…` 跟着进程走，
+    ECHO 每重启一次就换一枚，旧 token 打开的页面**能加载但鉴权不过**（空白、无提示）；
+    Cookie 的密钥在文件里（`<家目录>/.credentials.yaml`），不随重启失效。
+    仍由**服务端**打开、别把凭据下发给页面（Cookie 是密钥，经接口下发等于写进前端内存与历史）。
     """
     from app import harness_proc
-    if not harness_proc.online():
-        if not harness_proc.requested():
+    # ---- ① 桌面版在跑：打开桌面版界面（签名 Cookie，43120）
+    if harness_proc.desktop_mode():
+        url = harness_proc.desktop_url() + "/"
+        try:
+            from app.agents.dsh_agent import _load_browser_secret, _make_cookie
+            secret = _load_browser_secret(os.path.join(harness_proc.home(), ".credentials.yaml"))
+            cookie = _make_cookie(url.rstrip("/"), secret_b64=secret) if secret else ""
+        except Exception:
+            cookie = ""
+        if cookie:
+            from app import browser_open
+            ok, detail = browser_open.open_with_cookie(url, cookie)
+            if ok:
+                return {"ok": True, "url": url,
+                        "message": "已打开 DSH 桌面版界面 %s（已自动登录）" % url}
             return {"ok": False,
-                    "message": "标准版 harness 没在运行：在 设置 → 智能体 里选中"
-                               "「标准版 harness」，ECHO 会自动拉起它"}
-        return {"ok": False, "message": "独立 harness 没在监听 %s（看 data/logs/harness.log）"
-                                        % harness_proc.base_url()}
+                    "message": "打不开桌面版界面：%s（%s）——也可直接在桌面版窗口里操作"
+                               % (detail or "Cookie 注入失败", url)}
+        return {"ok": False,
+                "message": "桌面版在跑，但读不到它的登录密钥（%s）："
+                           "去桌面版里登录一次/打开「普通浏览器访问」，或直接用它自己的窗口"
+                           % os.path.join(harness_proc.home(), ".credentials.yaml")}
+    # ---- ② 桌面版没开：打开 ECHO 起的无头 dsh
+    if not harness_proc.online():
+        if harness_proc.desktop_gui_running():
+            return {"ok": False,
+                    "message": "桌面版在运行，但它没有对外接口（%s 不监听）—— "
+                               "ECHO 用无头 dsh 与它共存；面板上点「启动」即可（共用同一个家目录）"
+                               % harness_proc.desktop_url()}
+        return {"ok": False,
+                "message": "DSH 没在运行：面板上点「启动」（或打开桌面版，ECHO 会自动改用它）"}
     url = harness_proc.base_url() + "/"
 
     # ① 正路：密钥铸 Cookie → 独立 profile 的 Edge 注入 Cookie 后打开
@@ -3371,13 +3401,33 @@ def voiceprint_audition(vid: int, _auth=Depends(optional_auth)):
 # ---------------------------------------------------------------- 控制
 @router.post("/control/dsh/start")
 def control_dsh_start(_auth=Depends(optional_auth)):
-    ok, msg = manager.dsh_start()
+    """启动/重试**唯一那套 DSH**（面板启动页「启动/重试」与安装器都调它）。
+
+    桌面版在跑 → 直接用它；没开 → ECHO 起无头 dsh（共用 ~/.dsh）。
+    """
+    from app import boot, harness_proc
+    if manager.dsh_ready():
+        msg = "DSH 桌面版已在运行（%s），ECHO 直接使用它" % harness_proc.desktop_url()
+        services.report_dsh("online", msg)
+        return {"ok": True, "message": msg}
+    ok, msg = harness_proc.ensure_running()
+    try:
+        boot.refresh_agent_rows()
+    except Exception:
+        pass
     return {"ok": ok, "message": msg}
 
 
 @router.post("/control/dsh/stop")
 def control_dsh_stop(_auth=Depends(optional_auth)):
-    ok, msg = manager.dsh_stop()
+    """停止 **ECHO 自己拉起的** 无头 dsh（桌面版不归 ECHO 停）。"""
+    from app import harness_proc
+    ok, msg = harness_proc.stop(reason="面板/接口手动停止")
+    try:
+        from app import boot
+        boot.refresh_agent_rows()
+    except Exception:
+        pass
     return {"ok": ok, "message": msg}
 
 
@@ -3591,6 +3641,7 @@ def _pair_state() -> dict:
         "addresses": netguard.local_addresses(),
         "baseUrl": _phone_base_url(),
         "pending": phone_pair.pending(),
+        "devices": e2e.list_devices(),
         "lockedSeconds": phone_pair.locked_for(),
         "apiAuthEnabled": bool(settings.get("apiAuthEnabled", False)),
         "relayEnabled": bool(settings.get("relayEnabled", False)),
@@ -3607,6 +3658,90 @@ def _pair_state() -> dict:
 def phone_pair_state(_auth=Depends(optional_auth)):
     """面板用：现在能不能配对、该显示哪个码与哪个地址。**只读，不改任何状态。**"""
     return _pair_state()
+
+
+def _pair_ticket(request: Request) -> dict:
+    """生成方案 B 的 QR ticket（含 ECHO 公钥/relay 地址/后端 TLS 指纹/6 位码）。"""
+    base = _phone_base_url(request)
+    relay_url = ""
+    try:
+        relay_url = relay_mod.public_url()
+    except Exception:
+        relay_url = ""
+    target = relay_url or base
+    if not target:
+        raise HTTPException(status_code=409, detail="没有可用的配对地址：中继未连上，本机也没有私有地址")
+    host_id = ""
+    try:
+        host_id = str(relay_mod.STATE.get("hostId") or "")
+    except Exception:
+        host_id = ""
+
+    backend = {}
+    try:
+        from app.capabilities import credentials
+        creds = credentials.load()
+        if creds is not None:
+            backend = {"baseUrl": str(creds.base_url or ""),
+                       "tlsPin": str(creds.cert_fingerprint or "")}
+    except Exception:
+        backend = {}
+
+    issued = phone_pair.issue()
+    ticket = e2e.new_ticket(code=issued["code"], relay_url=target,
+                            host_id=host_id or "local", backend=backend)
+    qr_png = ""
+    try:
+        import qrcode
+        # 这块屏幕是 ECHO 自己的清洁显示器，不需要 M/Q 级纠错；
+        # L 级把 ticket（~674 字符）从 101×101 降到 89×89 模块，
+        # 再配合 box_size=10 + 面板 520px，扫码颗粒明显更粗。
+        qr = qrcode.QRCode(
+            version=None,
+            error_correction=qrcode.constants.ERROR_CORRECT_L,
+            box_size=10,
+            border=4,
+        )
+        qr.add_data(ticket["ticket"])
+        qr.make(fit=True)
+        buf = io.BytesIO()
+        qr.make_image(fill_color="black", back_color="white").save(buf, format="PNG")
+        qr_png = base64.b64encode(buf.getvalue()).decode("ascii")
+    except Exception:
+        # 没装 qrcode 也要把 ticket 给出去（手机可手输长票/排障），但不假装有图。
+        qr_png = ""
+    return {
+        "ok": True,
+        "version": e2e.TICKET_VERSION,
+        "ticket": ticket["ticket"],
+        "payload": ticket["payload"],
+        "qrPng": qr_png,
+        "qrPngMime": "image/png" if qr_png else "",
+        "code": issued["code"],
+        "expiresAt": issued["expiresAt"],
+        "ttlSeconds": issued["ttlSeconds"],
+        "target": target,
+        "baseUrl": base,
+        "relayUrl": relay_url,
+        "hostId": host_id,
+        "backend": backend,
+    }
+
+
+@router.post("/pair/phone/ticket")
+def phone_pair_ticket(request: Request, _auth=Depends(optional_auth)):
+    """方案 B：生成二维码 ticket（只在 ECHO 本机面板调用）。
+
+    二维码里的 ECHO 公钥是信任根；手机不通过后端拿公钥。**后端 relay 只能看到
+    手机后续发来的密文**。
+    """
+    if not _is_loopback_call(request):
+        raise HTTPException(status_code=403,
+                            detail="配对二维码只能在 ECHO 这台机器上生成（本机面板）")
+    if not netguard.lan_mode_enabled():
+        raise HTTPException(status_code=409,
+                            detail="「允许局域网访问」还没开，手机连不上这台机器")
+    return _pair_ticket(request)
 
 
 @router.post("/pair/phone")
@@ -3638,6 +3773,86 @@ def phone_pair_issue(request: Request, _auth=Depends(optional_auth)):
             "addresses": netguard.local_addresses(),
             "pairString": "echo://phone?host=%s&code=%s" % (base.split("://", 1)[-1],
                                                             issued["code"])}
+
+
+@router.post("/pair/phone/claim/v2")
+def phone_pair_claim_v2(body: PhoneClaimV2In, request: Request):
+    """方案 B：加密 claim → ECHO 解出配对码/设备公钥 → 加密返回手机 token。
+
+    relay 看到的是 `{nonce, ephPub, iv, ciphertext}`，看不到配对码、设备名或返回的
+    token。响应同样用 ECDH 派生密钥加密，只有手机能解。
+    """
+    try:
+        data, response_key = e2e.decrypt_claim(body.model_dump())
+    except Exception as exc:
+        # 不把内部细节（nonce、曲线错误）原样暴露给未认证调用方。
+        raise HTTPException(status_code=403, detail="配对请求无效或已过期，请重新扫码") from exc
+
+    code = str(data.get("code") or "")
+    name = str(data.get("deviceName") or body.name or "mobile").strip() or "mobile"
+    device_pub = str(data.get("devicePublicKey") or "")
+    ok, why = phone_pair.claim(code)
+    if not ok:
+        raise HTTPException(status_code=403, detail=why)
+    row = db.add_api_key_row(name, scopes=["device"])
+    try:
+        e2e.remember_device(e2e.device_id_for(device_pub), device_pub, name)
+    except Exception:
+        pass
+    payload = {
+        "ok": True,
+        "token": row.get("token", ""),
+        "keyId": row.get("id"),
+        "name": row.get("name", name),
+        "baseUrl": _phone_base_url(request),
+        "echoPublicKey": e2e.identity_public(),
+        "deviceId": e2e.device_id_for(device_pub),
+        "note": "令牌只出现这一次；请手机存进安全存储",
+    }
+    # ECHO 已和后端配对，直接替手机申请一个 tts 委托 token；
+    # 后端 token 不经过手机→后端的配对。失败不影响 ECHO 手机配对本身。
+    try:
+        device_id = e2e.device_id_for(device_pub)
+        from app.capabilities.echo_server import client_from_settings
+        client = client_from_settings()
+        if client is not None:
+            delegated = client.delegate_tts(device_pub, subject=device_id)
+            payload["tts"] = {
+                "baseUrl": str(getattr(client, "base_url", "") or ""),
+                "token": delegated.get("token", ""),
+                "expiresIn": delegated.get("expiresIn"),
+                "jkt": delegated.get("jkt", ""),
+            }
+            try:
+                from app.capabilities import credentials
+                creds = credentials.load()
+                if creds is not None:
+                    payload["tts"]["tlsPin"] = str(creds.cert_fingerprint or "")
+            except Exception:
+                pass
+    except Exception:
+        # 后端没配对/离线/没有 tts scope：手机仍可用 ECHO token 走现有路径。
+        payload["tts"] = None
+    return e2e.encrypt_response(response_key, payload)
+
+
+@router.delete("/pair/phone/device/{device_id}")
+def phone_pair_revoke_device(device_id: str, _auth=Depends(optional_auth)):
+    """撤销方案 B 设备身份：删除 ECHO 侧设备公钥记录，并让后端撤销其 TTS token。
+
+    之后再拿这台设备的旧 E2E 信封会解不开（`get_device` 查不到）；手机 token 的
+    撤销仍走 `DELETE /api/keys/{id}`。三步一起做才是完整撤销。
+    """
+    ok = e2e.forget_device(device_id)
+    revoked_tts = False
+    try:
+        from app.capabilities.echo_server import client_from_settings
+        client = client_from_settings()
+        if client is not None:
+            revoked_tts = bool(client.revoke_tts(device_id))
+    except Exception:
+        revoked_tts = False
+    return {"ok": bool(ok), "deviceId": device_id, "ttsRevoked": revoked_tts}
 
 
 @router.post("/pair/phone/claim")

@@ -388,13 +388,15 @@ function Resolve-CoreDir {
     $script:CoreDir = Join-Path $script:TargetDir 'echo-core'
     Info ("3.0 安装根布局：代码放 {0}" -f $script:CoreDir)
     if ($script:DryRun) { return }
-    # 六个兄弟目录先建出来：让"我的东西放哪了"一眼可见，也免得后面某一步漏建。
+    # 兄弟目录先建出来：让"我的东西放哪了"一眼可见，也免得后面某一步漏建。
     # 都不是"必须存在"（首次录音/首次下模型时才真正用到），建空的没有副作用。
-    foreach ($d in @('data', 'models', 'meeting', 'aide',
-                     'dsh\app', 'dsh\home')) {
+    # 2026-11-03 一套 DSH：**不再建 dsh\app / dsh\home**（那是已退役的标准版布局；
+    # 现在的 DSH 程序来自官方桌面端、家目录就是 %USERPROFILE%\.dsh）。留着空目录
+    # 会让"是否已装 DSH"的判据误判（真机踩过：全新机器被当成"已装"）。
+    foreach ($d in @('data', 'models', 'meeting', 'aide')) {
         New-Item -ItemType Directory -Force -Path (Join-Path $script:TargetDir $d) | Out-Null
     }
-    Ok '已建兄弟目录：data / models / meeting / aide / dsh\app / dsh\home'
+    Ok '已建兄弟目录：data / models / meeting / aide（DSH 用官方桌面端 + 共用 ~/.dsh，不再建 dsh\app）'
 }
 
 function Set-PackageKind {
@@ -443,8 +445,23 @@ function Copy-ExtractedTree {
         New-Item -ItemType Directory -Path $dst -Force | Out-Null
     }
     Info ("不解压，直接复制已解开的包到 {0}（约 10 MB，比解压快得多）" -f $dst)
-    foreach ($item in @(Get-ChildItem $src -Force)) {
-        Copy-Item -LiteralPath $item.FullName -Destination $dst -Recurse -Force
+    # 2026-11-03 真机：从**微信/企业微信的缓存目录**里双击安装时，源路径能到 300+ 字符，
+    # `Copy-Item` 在 >260 字符时报「未能找到路径“…”的一部分」——看着像包缺文件，
+    # 其实是 MAX_PATH。robocopy 原生支持长路径，改用它；没有 robocopy 才退回 Copy-Item。
+    $robocopy = Get-Command robocopy.exe -ErrorAction SilentlyContinue
+    if ($robocopy) {
+        & $robocopy.Source $src $dst /E /COPY:DAT /R:1 /W:1 /NFL /NDL /NJH /NJS /NP | Out-Null
+        $rc = $LASTEXITCODE
+        # robocopy: 0=无变化、1=有复制、2/3=有额外项、4/5/6/7=含失败但仍部分完成；
+        # >=8 才是真失败（我们把它当"复制失败"报出来）。
+        if ($rc -ge 8) {
+            Err ("复制已解开的包失败（robocopy exit={0}）：{1} -> {2}" -f $rc, $src, $dst)
+            exit 1
+        }
+    } else {
+        foreach ($item in @(Get-ChildItem $src -Force)) {
+            Copy-Item -LiteralPath $item.FullName -Destination $dst -Recurse -Force
+        }
     }
     Set-PackageKind -Dir $dst -Verb '复制完成'
 }

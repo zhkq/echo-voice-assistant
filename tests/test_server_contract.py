@@ -35,6 +35,7 @@ from server import auth as auth_mod                              # noqa: E402
 from server import billing as billing_mod                        # noqa: E402
 from server import engines, errors, main as server_main, tmp     # noqa: E402
 from server import limits as limits_mod                          # noqa: E402
+from server import tts as tts_mod                                # noqa: E402
 from server import ops as ops_mod                                # noqa: E402
 from server import routes as routes_mod                          # noqa: E402
 from server import settings as settings_mod                      # noqa: E402
@@ -298,6 +299,7 @@ class NoBusinessCouplingTests(unittest.TestCase):
             ("POST", "/v1/billing/orders/{order_id}/cancel"),
             ("GET", "/v1/billing/entitlement"),
             ("POST", "/v1/billing/alipay/notify"),
+            ("POST", "/v1/tts"), ("POST", "/v1/delegate"), ("POST", "/v1/delegate/revoke"),
         }
         got = set()
         for router in (routes_mod.router, account_mod.router, billing_mod.router):
@@ -2148,15 +2150,65 @@ class AuthTokenTests(unittest.TestCase):
         self.assertEqual(ctx.exception.status, 401)
         self.assertIn("撤销", str(ctx.exception.detail) or str(ctx.exception))
 
-    def test_token_signed_before_revoke_is_still_refused_after_reissue(self):
-        """撤销后再换的新令牌版本号已经变了，旧令牌**永远**回不来。"""
+    def test_revoke_forbids_reissuing_a_token_with_the_old_secret(self):
+        """**撤销之后，不许再用同一份 secret 换新令牌**（2026-11-03 真机）。
+
+        原来只做 `token_version + 1`：旧令牌废了，但客户端手里还有 secret，
+        `/v1/token` 也不看撤销标记 —— 于是它在 401 之后自己换一个新的回来
+        （`app/capabilities/echo_server.py::_request` 的 `_force_renew`），
+        "撤销"在真实客户端上等于没做。
+
+        真机证据：`cli-619e43` 在 13:41:41Z 被撤销，`last_seen` 仍是 14:50:53Z ——
+        撤销后一小时还在转写。
+
+        判据三侧：① 旧令牌 401；② `token_for(旧 secret)` 也是 401（不是"再给一个"）；
+        ③ 走的是运维真实入口 `ops.revoke_client`（CLI 与管理面共用它）。
+        """
         old = self._bearer()
-        self.auth.cache.revoke(self.client_id)
-        fresh = self._bearer()
-        self.assertNotEqual(old, fresh)
-        self.auth.authenticate(fresh)
-        with self.assertRaises(errors.EchoError):
+        ver = ops_mod.revoke_client(self.cfg, self.auth, self.client_id)["tokenVersion"]
+        self.assertEqual(ver, 2)
+        with self.assertRaises(errors.EchoError) as ctx:
             self.auth.authenticate(old)
+        self.assertEqual(ctx.exception.status, 401)
+
+        with self.assertRaises(errors.EchoError) as ctx:
+            self.auth.token_for(self.basic)          # 旧 secret 换新令牌
+        self.assertEqual(ctx.exception.status, 401)
+        self.assertIn("撤销", str(ctx.exception.detail) or str(ctx.exception))
+
+    def test_revive_restores_the_old_credential(self):
+        """撤销**不销毁** secret（`Store.revive()` 的语义）：误标一次要能回退。
+
+        这与上一条不矛盾：撤销时不再接受它，但凭据本身还在；`revive()` 把它收回之后，
+        同一份 secret 又能换令牌了 —— 所以"误标"是可逆的，别把 `revoked_at` 做成判决。
+        """
+        self.auth.revoke(self.client_id)
+        self.store.revive(self.client_id)
+        out = self.auth.token_for(self.basic)
+        self.assertEqual(out["clientId"], self.client_id)
+        self.auth.authenticate("Bearer " + out["accessToken"])
+
+    def test_repairing_a_revoked_client_clears_the_revoked_mark(self):
+        """重新配对 = **重新授权**：新 secret 能用，且它要回到客户端列表里。
+
+        2026-11-03：`Auth.redeem()` 复用 client_id 时只 `rotate_secret()`，
+        没清 `revoked_at` —— 一张新码兑出来的客户端会"配上了却用不了"
+        （`/v1/token` 拒它、管理面列表也看不到它）。
+        """
+        self.auth.revoke(self.client_id)
+        code = self.auth.create_pairing_code("ops", client_id=self.client_id)
+        paired = self.auth.redeem(code, "再次配对")
+        self.assertEqual(paired["clientId"], self.client_id)
+
+        row = self.store.client(self.client_id)
+        self.assertEqual(float(row.get("revoked_at") or 0), 0, "重新配对没有收回撤销标记")
+        self.assertIn(self.client_id, [r["client_id"] for r in self.store.clients()])
+        # **新 secret** 能换令牌；**旧 secret** 不行（复用身份不等于沿用旧凭据）
+        basic2 = "Basic " + base64.b64encode(
+            ("%s:%s" % (self.client_id, paired["secret"])).encode()).decode()
+        self.assertEqual(self.auth.token_for(basic2)["clientId"], self.client_id)
+        with self.assertRaises(errors.EchoError):
+            self.auth.token_for(self.basic)
 
     def test_disabled_client_gets_403_not_401(self):
         """禁用是"我认识你，但不许用" —— 403。与 401（不知道你是谁）语义不同。"""
@@ -2269,9 +2321,13 @@ class AuthScopeTests(unittest.TestCase):
         """端点到 scope 是一张**表**，不是散落各处的字符串 —— 表要覆盖所有能力端点。"""
         capability_posts = {p for (m, p) in
                             [("POST", "/v1/asr"), ("POST", "/v1/diarize"),
-                             ("POST", "/v1/speaker/embed")]}
+                             ("POST", "/v1/speaker/embed"), ("POST", "/v1/tts"),
+                             ("POST", "/v1/delegate"), ("POST", "/v1/delegate/revoke")]}
         self.assertEqual(set(routes_mod.ENDPOINT_SCOPES), capability_posts)
         self.assertEqual(routes_mod.ENDPOINT_SCOPES["/v1/diarize"], "diarize")
+        self.assertEqual(routes_mod.ENDPOINT_SCOPES["/v1/tts"], "tts")
+        self.assertEqual(routes_mod.ENDPOINT_SCOPES["/v1/delegate"], "tts")
+        self.assertEqual(routes_mod.ENDPOINT_SCOPES["/v1/delegate/revoke"], "tts")
 
     def test_endpoints_actually_pass_their_scope(self):
         """接了表还不够 —— 端点得**真的把 scope 传下去**（否则表是摆设）。"""
@@ -2812,6 +2868,34 @@ class AdminCliTests(unittest.TestCase):
         store = auth_mod.open_store(cfg)
         self.assertEqual(store.client(out["clientId"])["token_version"], 2)
         store.close()
+
+    def test_enable_on_a_revoked_client_says_repair_is_needed(self):
+        """启用**不能**把"已撤销"抹掉（2026-11-03）：撤销是凭据级切断，只有重新配对能恢复。
+
+        命令行那句"它手上的凭据仍然有效"在撤销场景下是假话 —— 实测 `cli-619e43`
+        `--enable` 之后 `/v1/token` 仍是 401。文案必须分开，而且这里顺手钉住那个 401
+        （不是只有文案改对了）。
+        """
+        cfg = settings_mod.load(self.cfg_path)
+        store = auth_mod.open_store(cfg)
+        a = auth_mod.Auth(cfg, store)
+        out = a.redeem(a.create_pairing_code(), "撤销后启用")
+        store.close()
+        self._run("--revoke", out["clientId"])
+        self._run("--disable", out["clientId"])
+        rc, text = self._run("--enable", out["clientId"])
+        self.assertEqual(rc, 0)
+        self.assertIn("重新配对", text)
+
+        cfg = settings_mod.load(self.cfg_path)
+        store = auth_mod.open_store(cfg)
+        a = auth_mod.Auth(cfg, store)
+        basic = "Basic " + base64.b64encode(
+            ("%s:%s" % (out["clientId"], out["secret"])).encode()).decode()
+        with self.assertRaises(errors.EchoError) as ctx:
+            a.token_for(basic)                       # 启用了也换不到令牌
+        store.close()
+        self.assertEqual(ctx.exception.status, 401)
 
     # ---- 2026-09-24 补齐的管理动作 ----------------------------------------
 
@@ -4161,6 +4245,65 @@ class PublishedSchemeForRemoteTests(unittest.TestCase):
                 host = url.split("host=", 1)[1].split("&", 1)[0]
                 self.assertEqual(pairing.normalize_base_url(host),
                                  "https://echoserver.zhkq.online:8900")
+
+
+class TtsChannelTests(_AppCase):
+    """TTS 独立通道：不占 GPU、按 client 1 QPS、手机/ECHO 各自计数。"""
+
+    def _fake_synth(self, data=b"ID3\x04\x00\x00"):
+        calls = []
+
+        async def fake(text, *, voice="", rate="", timeout=15.0):
+            calls.append((text, voice, rate))
+            return data
+
+        return fake, calls
+
+    def test_returns_mp3_without_touching_the_gpu_admission(self):
+        fake, calls = self._fake_synth()
+        with patch.object(routes_mod.tts_mod, "synthesize", fake), \
+                patch.object(self.app.state.echo.admission, "hold",
+                             side_effect=AssertionError("TTS 不许占 ASR 通道")):
+            r = self.client.post("/v1/tts", json={"text": "你好"})
+        self.assertEqual(200, r.status_code, r.text)
+        self.assertEqual("audio/mpeg", r.headers.get("content-type"))
+        self.assertEqual("edge-tts", r.headers.get("x-echo-tts-engine"))
+        self.assertEqual(b"ID3\x04\x00\x00", r.content)
+        self.assertEqual([("你好", tts_mod.DEFAULT_VOICE, tts_mod.DEFAULT_RATE)], calls)
+
+    def test_a_client_can_only_send_one_request_per_second(self):
+        fake, _ = self._fake_synth()
+        with patch.object(routes_mod.tts_mod, "synthesize", fake):
+            first = self.client.post("/v1/tts", json={"text": "第一句"})
+            second = self.client.post("/v1/tts", json={"text": "第二句"})
+        self.assertEqual(200, first.status_code, first.text)
+        self.assertEqual(429, second.status_code, second.text)
+        self.assertEqual("rate_limited", second.json().get("code"))
+        self.assertEqual("1", second.headers.get("retry-after"))
+
+    def test_empty_text_is_422_and_does_not_call_edge(self):
+        called = []
+
+        async def fake(*_a, **_k):
+            called.append(True)
+            return b"x"
+
+        with patch.object(routes_mod.tts_mod, "synthesize", fake):
+            r = self.client.post("/v1/tts", json={"text": "   "})
+        self.assertEqual(422, r.status_code, r.text)
+        self.assertEqual([], called)
+
+    def test_the_limiter_counts_clients_separately(self):
+        now = [100.0]
+        limiter = tts_mod.TtsRateLimiter(per_second=1.0, clock=lambda: now[0])
+        limiter.check("phone")                 # 手机第一次
+        limiter.check("echo-pc")               # ECHO 第一次：独立计数，放行
+        with self.assertRaises(errors.EchoError) as ctx:
+            limiter.check("phone")
+        self.assertEqual(429, ctx.exception.status)
+        self.assertEqual("rate_limited", ctx.exception.code)
+        now[0] += 1.0
+        limiter.check("phone")                 # 过了一秒，手机恢复
 
 
 if __name__ == "__main__":

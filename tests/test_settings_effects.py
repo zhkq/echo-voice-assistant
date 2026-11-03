@@ -64,63 +64,74 @@ class DispatchTests(unittest.TestCase):
 
 
 class AgentTests(unittest.TestCase):
-    """独立 harness 随选随起 / 随走随停。"""
+    """一套 DSH（2026-11-03）：`dshAutoStart` 决定起/停，桌面版不归 ECHO 杀。"""
 
-    def test_launches_harness_with_the_given_timeout(self):
+    def test_launches_the_engine_with_the_given_timeout(self):
         """向导传的短超时必须原样传下去（它跑在 HTTP 请求线程里，不能卡 60s）。"""
         with patch("app.agents.reset"), \
-                patch("app.harness_proc.requested", lambda: True), \
-                patch("app.llm_router.sync", lambda: (True, "已注册到 标准版 harness")), \
+                patch("app.config.settings.get",
+                      lambda k, d=None: True if k == "dshAutoStart" else d), \
+                patch("app.llm_router.sync", lambda: (True, "已注册到 DSH")), \
                 patch("app.harness_proc.ensure_running") as run:
-            run.return_value = (True, "独立 harness 启动中")
-            out = settings_effects.apply(["agentBackend"], harness_timeout=4.0)
+            run.return_value = (True, "DSH 启动中")
+            out = settings_effects.apply(["dshAutoStart"], harness_timeout=4.0)
         run.assert_called_once_with(timeout=4.0)
         self.assertTrue(out[0]["ok"])
-        self.assertIn("harness", out[0]["detail"])
+        self.assertIn("DSH", out[0]["detail"])
 
-    def test_stops_harness_when_not_requested(self):
+    def test_stops_the_echo_owned_engine_when_auto_start_is_turned_off(self):
         with patch("app.agents.reset"), \
-                patch("app.harness_proc.requested", lambda: False), \
-                patch("app.llm_router.sync", lambda: (True, "已注册到 DSH 桌面版")), \
+                patch("app.config.settings.get",
+                      lambda k, d=None: False if k == "dshAutoStart" else d), \
+                patch("app.harness_proc.started_by_echo", lambda: True), \
+                patch("app.llm_router.sync", lambda: (True, "已注册")), \
                 patch("app.harness_proc.stop") as stop:
-            settings_effects.apply(["agentBackend"])
+            stop.return_value = (True, "已停止无头 dsh")
+            settings_effects.apply(["dshAutoStart"])
         stop.assert_called_once()
 
     def test_launch_failure_is_reported(self):
         with patch("app.agents.reset"), \
-                patch("app.harness_proc.requested", lambda: True), \
-                patch("app.llm_router.sync", lambda: (True, "已注册到 标准版 harness")), \
+                patch("app.config.settings.get",
+                      lambda k, d=None: True if k == "dshAutoStart" else d), \
+                patch("app.llm_router.sync", lambda: (True, "已注册")), \
                 patch("app.harness_proc.ensure_running",
-                      lambda **kw: (False, "找不到 npx：需要本机有 Node.js")):
-            out = settings_effects.apply(["agentBackend"])
+                      lambda **kw: (False, "找不到桌面端的 dsh：请重装官方桌面端")):
+            out = settings_effects.apply(["dshAutoStart"])
         self.assertFalse(out[0]["ok"])
-        self.assertIn("npx", out[0]["detail"])
+        self.assertIn("桌面端", out[0]["detail"])
 
-    def test_registers_echo_auto_after_the_agent_moves(self):
-        """动完智能体要补一次 ECHO AUTO 注册（标准版的家目录是选中它之后才存在的）。
-
-        不补这一次，只装标准版的机器要等到下次重启才能在 DSH 里选到 ECHO AUTO
-        —— 同事不一定两个都装（2026-09-22）。
-        """
+    def test_registers_echo_auto_after_the_engine_moves(self):
+        """动了 DSH 就补一次 ECHO AUTO 注册（新的 ~/.dsh 家目录要立刻在 DSH 里可用）。"""
         with patch("app.agents.reset"), \
-                patch("app.harness_proc.requested", lambda: True), \
+                patch("app.config.settings.get",
+                      lambda k, d=None: True if k == "dshAutoStart" else
+                      (True if k == "routerAutoRegister" else d)), \
                 patch("app.harness_proc.ensure_running", lambda **kw: (True, "已在运行")), \
                 patch("app.llm_router.sync") as sync:
-            sync.return_value = (True, "已注册到 标准版 harness")
-            out = settings_effects.apply(["agentBackend"])
+            sync.return_value = (True, "已注册到 DSH")
+            out = settings_effects.apply(["dshAutoStart"])
         sync.assert_called_once()
         self.assertIn("已注册到", out[0]["detail"])
 
     def test_registration_follows_the_auto_register_switch(self):
         """关掉「启动时注册到 DSH」就别写 —— 与 boot 那道闸用同一个开关。"""
         with patch("app.agents.reset"), \
-                patch("app.harness_proc.requested", lambda: False), \
-                patch("app.harness_proc.stop"), \
+                patch("app.harness_proc.ensure_running", lambda **kw: (True, "已在运行")), \
                 patch("app.config.settings.get",
                       lambda k, d=None: False if k == "routerAutoRegister" else d), \
                 patch("app.llm_router.sync") as sync:
-            settings_effects.apply(["agentBackend"])
+            settings_effects.apply(["dshAutoStart"])
         sync.assert_not_called()
+
+    def test_the_boot_page_row_is_recomputed_after_the_change(self):
+        """装完 / 改设置后，启动页那行要按当前实际状态重算（2026-11-03 真机）。"""
+        with patch("app.agents.reset"), \
+                patch("app.harness_proc.ensure_running", lambda **kw: (True, "已在运行")), \
+                patch("app.llm_router.sync", lambda: (True, "已注册到 DSH")), \
+                patch("app.boot.refresh_agent_rows") as refresh:
+            settings_effects.apply(["dshAutoStart"])
+        refresh.assert_called_once()
 
 
 

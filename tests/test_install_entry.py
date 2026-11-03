@@ -311,12 +311,11 @@ class MacScriptPortabilityTests(unittest.TestCase):
 
 
 class HarnessLocalInstallTests(unittest.TestCase):
-    """标准版本地永久安装的"三条路"契约（2026-09-22 晚补）。
+    """标准版本地永久安装助手的历史契约（2026-09-22 补）。
 
-    为什么值得钉：这条路径坏掉时**表面看不出来** —— 只是"冷启动慢两分钟"，
-    而慢的原因在日志里只表现为 npm 的一串 ETARGET。要保证的最低限度：
-    两个平台的安装器都走**同一个**助手脚本、助手真的实现了"从 npx 缓存复制"那条路、
-    失败时给的是**可执行的**下一步，且技能文档写清了这条坑。
+    2026-11-03 起 **Windows 不再走这条路**（只保留官方桌面端自带的 dsh）；
+    macOS 这轮不改，仍在使用 `.sh` 助手。助手脚本本身与它"从 npx 缓存复制"的
+    三条路仍被下面的用例钉着（macOS 还在用），但**装机器不许再把它接回 Windows**。
     """
 
     PS1_HELPER = os.path.join(ROOT, ".dsh", "skills", "echo-install", "scripts",
@@ -324,9 +323,18 @@ class HarnessLocalInstallTests(unittest.TestCase):
     SH_HELPER = os.path.join(ROOT, ".dsh", "skills", "echo-install", "scripts",
                              "harness-install-local.sh")
 
-    def test_both_platforms_delegate_to_the_helper(self):
-        self.assertIn("harness-install-local.ps1", _read(PS1_COMPONENTS),
-                      "Windows 组件安装器没走本地安装助手（又各自实现一遍了？）")
+    def test_windows_uses_the_official_desktop_and_mac_keeps_the_local_helper(self):
+        """2026-11-03：Windows 只有一套 DSH（官方桌面端自带的 dsh）。
+
+        标准版 harness 的「npm 本地永久安装」已彻底退役 —— 组件安装器**不许**再调
+        `harness-install-local.ps1`，改为复用 `harness-install-desktop.ps1` 保证官方桌面端
+        已安装。macOS 这轮不改，仍走本地安装助手（`.sh`）。
+        """
+        win = _read(PS1_COMPONENTS)
+        self.assertNotIn("harness-install-local.ps1", win,
+                         "Windows 组件安装器还在调标准版本地安装助手（已退役）")
+        self.assertIn("harness-install-desktop.ps1", win,
+                      "Windows 组件安装器没有复用「确保官方桌面端已安装」的助手")
         self.assertIn("harness-install-local.sh", _read(SH),
                       "mac 组件安装器没走本地安装助手")
 
@@ -371,69 +379,70 @@ class HarnessLocalInstallTests(unittest.TestCase):
         # 升级真的要能落地：删整树重装（npm 只按版本号判"已装"，不修残树）
         self.assertIn("删整树重装", ps1)
 
-    def test_the_installer_does_not_override_the_auto_resolved_version(self):
-        """**装机器不许把版本写死**（2026-10-08 真机事故，用户报"测试机还是装的 0.1.5-rc.2"）。
+    def test_mac_installer_does_not_override_the_auto_resolved_version(self):
+        """**mac 装机器不许把版本写死**（2026-10-08 真机事故）。
 
-        事故形状：helper（`harness-install-local`）里"查 dist-tags.latest"那段**明明是对的**，
-        但**装机器**（`echo-install-components`）里 `$DshVersion` 默认还是 `0.1.5-rc.2`，
-        而且它**显式传下去**：
-
-            & $helper -DestDir ... -Version $script:DshVersion      # 空/旧值都盖掉 helper 的默认
-
-        于是**仓库、新包、旧包跑出来全是 0.1.5-rc.2** —— 只改 helper 的默认值
-        （上一条用例钉的那个）**根本不够**。判据必须落在**调用链的两端**：
-          ① 装机器那一侧的默认值也必须是**空**；
-          ② 传给 helper 的值只能来自这个默认/用户显式指定。
-
-        真机验收：`-Version ''` → 打印 `npm 上的最新版（latest）：0.2.0-rc.2`、
-        实际装上 `0.2.0-rc.2`（改前是 `0.1.5-rc.2`）。
+        mac 这轮不改，仍走本地 npm 安装助手：`DSH_VERSION` 默认必须为空，
+        让助手自己去查 `dist-tags.latest`；否则会盖掉助手的默认，新装机器永远拿旧版。
         """
-        ps1 = _read(PS1_COMPONENTS)
         sh = _read(SH)
-        # ① 默认值必须为空（留空 = 让 helper 去查 latest）
-        self.assertRegex(ps1, r"\$DshVersion\s*=\s*''",
-                         "Windows 装机器把 -DshVersion 默认写死了（会盖掉自动取 latest）")
         self.assertRegex(sh, r'DSH_VERSION\s*=\s*""',
                          "mac 装机器把 DSH_VERSION 默认写死了（会盖掉自动取 latest）")
-        # ② 默认值里不该再出现那个旧版本（注释里提到历史可以，参数默认不行）
-        self.assertNotRegex(ps1, r"\$DshVersion\s*=\s*'0\.",
-                            "Windows 装机器的默认值又变成具体版本了")
         self.assertNotRegex(sh, r'DSH_VERSION\s*=\s*"0\.',
                             "mac 装机器的默认值又变成具体版本了")
-        # ③ 两个平台都确实把版本传给了 helper（否则"指定版本"这个入口没了）
-        self.assertIn("-Version", ps1)
-        self.assertIn("harness-install-local", ps1)
         self.assertIn("--version", sh)
         self.assertIn("harness-install-local", sh)
 
+    def test_windows_installer_no_longer_pins_a_dsh_version(self):
+        """2026-11-03：Windows 的 DSH 只有官方桌面端这一套，版本随桌面端升级。
+
+        安装器不再把任何 DSH 版本传给本地安装助手（那个助手在 Windows 侧已退役）；
+        `-DshVersion` 只作为**退役参数**保留（旧命令行不因未知参数直接失败）。
+        """
+        ps1 = _read(PS1_COMPONENTS)
+        self.assertNotIn("harness-install-local", ps1,
+                         "Windows 还在走标准版本地安装（已退役）")
+        self.assertIn("[string]$DshVersion", ps1,
+                      "退役参数要保留，否则旧命令行/旧 install-all 会报未知参数")
+        self.assertIn("已退役", ps1)
+
     def test_version_and_cache_only_are_overridable(self):
-        """registry 哪天又坏在别的版本上时，要能一行参数换版本 / 离线只走缓存。"""
-        self.assertIn("DshVersion", _read(PS1_COMPONENTS), "Windows 侧缺 -DshVersion")
+        """macOS 侧仍能一行参数换版本 / 离线只走缓存；Windows 侧这些入口已退役。"""
         self.assertIn("--dsh-version", _read(SH), "mac 侧缺 --dsh-version")
         self.assertIn("FromCache", _read(self.PS1_HELPER))
         self.assertIn("--from-cache", _read(self.SH_HELPER))
+        self.assertIn("已退役", _read(PS1_COMPONENTS),
+                      "Windows 侧退役的参数要明确说'已退役'，不能静默忽略")
 
-    def test_pinning_the_absolute_path_is_opt_in(self):
-        """默认**不写** harnessCommand（交给 ECHO 自动解析），要钉死得显式加开关。
+    def test_windows_no_longer_writes_harness_command(self):
+        """2026-11-03：不再写 `harnessCommand` / `harnessHome` 等 harness* 设置。
 
-        为什么默认不写（2026-09-22 晚定）：写死 node 绝对路径后，node 一升级
-        （WorkBuddy / nvm 换版本目录）那条路径就失效、harness 起不来，而
-        `harnessCommand` 是隐藏设置，用户很难自己找到并改回来。
-        ECHO 的 `command()` 本来就会在"出厂值 + 本地入口存在"时直连本地入口，
-        node 也由 `node_dirs()` 探测（与技能里的 Resolve-NodeDir 同一批目录）。
+        DSH 的家目录固定是 `%USERPROFILE%\\.dsh`，程序入口固定是官方桌面端自带的
+        `dsh.cmd`，ECHO 自己知道去哪找 —— 安装器只写 `agentBackend=dsh` 与
+        `dshAutoStart=true`。mac 这轮不改，仍可选择钉死绝对路径。
         """
         ps1 = _read(PS1_COMPONENTS)
+        code = "\n".join(ln for ln in ps1.splitlines()
+                         if not ln.lstrip().startswith("#"))
+        self.assertNotIn("$values['harnessCommand']", code, "又在写 harnessCommand 了")
+        self.assertNotIn("$values['harnessHome']", code, "又在写 harnessHome 了")
+        self.assertNotIn("$values['agentHarnessEnabled']", code, "又在写 agentHarnessEnabled 了")
+        self.assertIn("$values['dshAutoStart']", code, "没有写 dshAutoStart")
+        self.assertIn("agentBackend'] = 'dsh'", code, "agentBackend 没固定写 dsh")
         sh = _read(SH)
-        self.assertIn("[switch]$PinHarnessCommand", ps1, "Windows 侧没有钉死开关")
-        self.assertIn("and $PinHarnessCommand", ps1, "Windows 侧默认没走'不写'那条（开关没参与判断）")
         self.assertIn("--pin-harness-command", sh, "mac 侧没有钉死开关")
         self.assertIn('[ "$PIN_HARNESS_COMMAND" -eq 1 ]', sh, "mac 侧默认没走'不写'那条")
-        self.assertIn("--pin-harness-command", _read(SKILL_MD), "技能没写清默认不写 / 怎么钉死")
 
-    def test_skill_documents_the_registry_trap(self):
+    def test_skill_documents_the_windows_dsh_retirement(self):
+        """Windows 的标准版 harness / npm 那条路已退役，技能里不许再教它。"""
         text = _read(SKILL_MD)
-        self.assertIn("ETARGET", text, "技能没写清 npm 装不下来这条及其绕法")
-        self.assertIn("harness-install-local", text, "技能没告诉排障的人可以单独跑助手")
+        for retired in ("ETARGET", "koffi", "本地永久安装",
+                        "SAFE_DELETE_BULK_CONFIRM_REQUIRED"):
+            self.assertNotIn(retired, text,
+                             f"技能里还留着已退役的 Windows npm 内容：{retired}")
+        self.assertIn("只有一套 DSH", text, "技能没写清「只有一套 DSH」")
+        self.assertIn("dshAutoStart", text, "技能没写清 dshAutoStart")
+        self.assertIn("不需要 Node.js", text, "技能没写清不需要 Node.js")
 
 
 class InstallReportsTheRightHarnessState(unittest.TestCase):
@@ -445,12 +454,12 @@ class InstallReportsTheRightHarnessState(unittest.TestCase):
     offline，于是这个判断**恒为假**。两个平台的组件脚本犯了同一个错。
     """
 
-    def test_ps1_judges_the_harness_component(self):
+    def test_ps1_judges_the_dsh_component(self):
         code = "\n".join(ln for ln in _read(PS1_COMPONENTS).splitlines()
                          if not ln.lstrip().startswith("#"))
         self.assertNotIn("$st.dsh.online", code,
-                         "又拿顶层 dsh 判 harness 了 —— 选标准版时恒为假，会把成功报成失败")
-        self.assertIn("components", code, "要从 components 里取 harness 的状态")
+                         "又拿顶层 dsh 判智能体了 —— 组件状态要从 components 里取")
+        self.assertIn("components", code, "要从 components 里取 dsh 的状态")
 
     def test_sh_judges_the_harness_component(self):
         code = _strip_bash_comments(_read(SH))
@@ -458,17 +467,24 @@ class InstallReportsTheRightHarnessState(unittest.TestCase):
                          "mac 侧还留着读顶层 dsh 的判据 —— 与 Windows 是同一个 bug")
         self.assertIn("harness_state", code, "mac 侧没有取 harness 组件状态的判据")
 
-    def test_wait_is_tiered_by_install_kind(self):
-        """本地永久安装实测约 11 秒就起；150 秒是照 npx 时代定的，失败时白等两分半。"""
+    def test_windows_waits_for_the_dsh_component_with_a_cap(self):
+        """2026-11-03：Windows 只有一套 DSH —— 拉起后等 `/api/status` 的 components 里
+        `dsh == online`，上限 180 秒；超时如实说"还在起"，不许无限等、也不许假装成功。
+
+        mac 这轮不改，仍按安装方式分档（本地入口 45 秒 / npx 150 秒）。
+        """
         ps1 = _read(PS1_COMPONENTS)
-        self.assertIn("$local = [bool]$script:HarnessCommand", ps1, "Windows 侧没有按安装方式分档")
-        self.assertIn("$Seconds = 45", ps1)
+        self.assertIn("$Seconds = 180", ps1, "Windows 等 DSH 的上限应为 180 秒")
+        self.assertIn("AddSeconds($Seconds)", ps1, "等待要用有上限的截止时间")
+        self.assertIn("还在起", ps1, "超时要如实说'还在起'")
+        self.assertIn("name -eq 'dsh'", ps1, "要从 components 里取 dsh 的状态")
+        self.assertIn("/api/control/dsh/start", ps1, "没有调用开始 DSH 的接口")
         sh = _read(SH)
         self.assertIn("limit=45", sh, "mac 侧没有按安装方式分档")
         self.assertIn("limit=150", sh)
 
     def test_selfcheck_marks_the_unselected_agent_as_skipped(self):
-        """自检输出里 `dsh offline` 与 `harness online` 并排打印，人/agent 都容易读成「坏了」。"""
+        """自检输出里把"没选的智能体"印成 offline 会被读成「坏了」——标 skipped 并写清。"""
         self.assertIn("skipped", _read(PS1_COMPONENTS), "Windows 自检没标出未选中的智能体")
         self.assertIn("skipped", _read(SH), "mac 自检没标出未选中的智能体")
 
@@ -1000,6 +1016,21 @@ class UpgradeModeTests(unittest.TestCase):
         self.assertIn("保持现有配置", block)
         self.assertNotIn("Invoke-BackendStep", block)
 
+    def test_it_reconciles_core_deps_before_starting_the_service(self):
+        """2026-11-02 同事升级事故：11-01 的包给启动链加了硬依赖 `cryptography`，
+        而升级路径按设计不装依赖（组件 -SkipPip；install.ps1 见 runtime 已存在直接 return）
+        → `python -m app.main` 启动即 ModuleNotFoundError → 安装器空等 90 秒后只报
+        "本实例没起来"。所以升级**必须**在拉服务之前对一次基础依赖账，并且失败时
+        把服务日志尾部摊开（不许再只有一句"本实例没起来"）。"""
+        self.assertIn("function Sync-CoreDeps", self.text)
+        i_fn = self.text.index("function Start-EchoOwnService")
+        i_call = self.text.index("Sync-CoreDeps", i_fn)
+        i_start = self.text.index("后台启动：", i_fn)
+        self.assertLess(i_call, i_start, "依赖对账必须在拉起服务之前")
+        self.assertIn("requirements-core.txt", self.text)
+        self.assertIn("echo-server.log.err", self.text, "失败分支要打印服务日志尾部")
+        self.assertIn("cryptography", self.text, "探针要覆盖新加的硬依赖")
+
     def test_it_backs_up_the_database_before_overwriting(self):
         self.assertIn(".bak-before-upgrade-", self.text)
         self.assertIn("Backup-UpgradeDatabase", self.text)
@@ -1007,7 +1038,7 @@ class UpgradeModeTests(unittest.TestCase):
     def test_dsh_is_optional_and_only_the_program_is_updated(self):
         self.assertIn("Ask-UpgradeDsh", self.text)
         self.assertIn("$UpgradeDsh", self.comp)
-        self.assertIn("-Upgrade", self.comp)  # 传给 harness-install-local
+        self.assertIn("-Upgrade", self.comp)  # 传给 harness-install-desktop（重新下载官方桌面端）
         # 2026-10-31：客户端已不再写 sttModel（没有本地 STT 引擎）；KeepSettings 仍要生效。
         self.assertIn("if ($KeepSettings)", self.comp)
         self.assertNotIn("$values['sttModel']", self.comp)
@@ -1024,6 +1055,107 @@ class UpgradeModeTests(unittest.TestCase):
         self.assertIn("不会动", text)
         self.assertIn("模型权重", text)
         self.assertIn("智能体配置", text)
+
+
+class DshInstallLogicTests(unittest.TestCase):
+    """2026-11-03 真机三个安装阻断的回归（用户逐条指出）。
+
+    1. "是否已装 DSH"的判据太粗暴：`<安装根>\\dsh\\app` 空目录（install.ps1 自己
+       会建、老标准版卸载后也可能剩）被当成"已装 DSH"。
+    2. 判断与动作不一致：升级路径里"不升级 DSH"会把 Agent 设成 none → 组件那一步
+       根本不检查 dsh，装完 ECHO 没有引擎。
+    3. 数组 splat 把命名参数按位置绑定 → helper 一条命令都没执行：
+       `$dargs = @('-LogFile', $x); & $helper @dargs` 是错的，必须哈希表。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.install = _read(INSTALL_PS1)
+        cls.all = _read(INSTALL_ALL)
+        cls.comp = _read(PS1_COMPONENTS)
+        cls.desktop = _read(os.path.join(
+            ROOT, ".dsh", "skills", "echo-install", "scripts",
+            "harness-install-desktop.ps1"))
+        cls.skill = _read(SKILL_MD)
+
+    def test_install_ps1_stops_creating_the_retired_dsh_dirs(self):
+        """install.ps1 不许再建 dsh\\app / dsh\\home —— 空目录是误判的源头。"""
+        self.assertNotIn("'dsh\\app', 'dsh\\home'", self.install)
+        self.assertIn("foreach ($d in @('data', 'models', 'meeting', 'aide'))",
+                      self.install)
+
+    def test_upgrade_detection_ignores_empty_install_dirs(self):
+        """升级时"已装 DSH"必须看真东西（官方 CLI / 官方家目录），不看空目录。"""
+        self.assertNotIn("Join-Path $script:TargetRoot 'dsh\\app'", self.all)
+        self.assertIn("$officialCli", self.all)
+        self.assertIn("resources\\runtime\\cli\\bin\\dsh.cmd", self.all)
+        self.assertIn("$dshHome", self.all)
+
+    def test_upgrade_never_silently_skips_the_dsh_check(self):
+        """不升级 DSH 也必须按 Agent=dsh 跑校验；以前设 none 就完全不管了。"""
+        anchor = self.all.index("if ($script:IsUpgrade) {", self.all.index("$installMode = Invoke-InstallModeProbe"))
+        block = self.all[anchor:anchor + 2000]
+        self.assertIn("$Agent = 'dsh'", block)
+        self.assertNotIn("$Agent = 'none'", block)
+        self.assertNotIn("$Agent = 'harness'", block)
+
+    def test_components_helper_uses_a_hashtable_splat(self):
+        """数组 splat = 位置绑定 → helper 的 -LogFile 落到 -InstallDir 上直接失败。"""
+        # 注释里会解释"以前用错成什么样"，所以只扫代码行。
+        code = "\n".join(ln for ln in self.comp.splitlines()
+                         if not ln.lstrip().startswith("#"))
+        self.assertIn("$dargs = @{ LogFile =", code)
+        self.assertNotIn("$dargs = @(", code)
+        self.assertIn("& $desktopHelper @dargs", code)
+
+    def test_desktop_installer_does_not_shadow_the_args_automatic(self):
+        """`$args` 是 PowerShell 自动变量；当普通数组用会踩坑（真机安装命令没执行）。"""
+        self.assertIsNone(re.search(r"(?m)^\s*\$args\s*=", self.desktop),
+                          "不要把自动变量 $args 当普通数组赋值")
+        self.assertIn("$installerArgs = @('/S')", self.desktop)
+        self.assertIn("-ArgumentList $installerArgs", self.desktop)
+
+    def test_desktop_detection_requires_an_installed_desktop_root(self):
+        """只看 dsh.cmd 文件在不在太粗暴：必须是已装桌面端（有 DeepSeek Harness.exe）。"""
+        self.assertIn("Get-InstallRoot $full", self.desktop)
+        self.assertIn("treating as NOT installed", self.desktop)
+
+    def test_running_check_distinguishes_gui_from_echo_headless_dsh(self):
+        """GUI 与 ECHO 的无头 dsh 同名 exe；只按进程名会把引擎当成桌面版在运行。"""
+        self.assertIn("Get-RunningKinds", self.desktop)
+        self.assertIn("dsh-desktop-host", self.desktop)
+        self.assertIn("web --port", self.desktop)
+        self.assertNotIn("Get-Process -Name 'DeepSeek Harness'", self.desktop)
+        # 升级时要明确要求先停 ECHO（无头引擎占着程序文件）
+        self.assertIn("Stop ECHO first", self.desktop)
+
+    def test_version_probe_has_a_hard_timeout(self):
+        """坏掉的 CLI 可能挂住；`& $cmd --version` 没有超时会把安装器一起挂死。"""
+        self.assertIn("WaitForExit(20000)", self.desktop)
+        self.assertIn("Start-Process -FilePath $cmd -ArgumentList '--version'", self.desktop)
+
+    def test_custom_install_dir_is_verified_under_that_dir(self):
+        """装自定义目录失败时，不能拿 %LOCALAPPDATA% 里的旧安装冒充成功。"""
+        self.assertIn("Find-CliUnderRoot $target", self.desktop)
+        self.assertIn("custom install dir did not produce a usable CLI", self.desktop)
+
+    def test_missing_engine_in_offline_or_upgrade_mode_tries_to_self_heal(self):
+        """清掉所有 dsh 后重装：升级/离线模式只认已装会直接卡死；引擎刚需，
+        应先用旁路安装包、否则联网补装（断网由 helper 6 秒探测快速失败）。"""
+        code = "\n".join(ln for ln in self.comp.splitlines()
+                         if not ln.lstrip().startswith("#"))
+        self.assertIn("$dargs.ContainsKey('NoDownload')", code)
+        self.assertIn("desktop(retry)", code)
+        self.assertIn("旁路安装", code)
+        # helper 侧：旁路安装包 + 快速探测，避免离线机器白等
+        self.assertIn("function Find-LocalInstaller", self.desktop)
+        self.assertIn("ECHO_DSH_INSTALLER", self.desktop)
+        self.assertIn("function Test-DownloadReachable", self.desktop)
+        self.assertIn("cannot reach download.deepseek.com", self.desktop)
+        self.assertIn("side-loaded official installer", self.desktop)
+        # PS 5.1: `& curl ... 2>&1` + EAP=Stop 会把 curl 进度条当终止错误 -> 下载中断。
+        self.assertIn("function Invoke-Curl", self.desktop)
+        self.assertIn("-RedirectStandardError", self.desktop)
 
 
 if __name__ == "__main__":

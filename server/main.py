@@ -636,6 +636,10 @@ def _admin_cli(cfg, args, password: str = _PASSWORD_NOT_READ) -> int:
             print("已撤销 %s（token_version → %s）。"
                   "服务端最迟 %s 秒后发现（跨进程靠轮询，见设计 §7.5 ④）。"
                   % (args.revoke, out["tokenVersion"], out["revokePollSeconds"]))
+            # 2026-11-03：这句话必须说全。只说"令牌失效"会让人以为撤干净了，
+            # 而真实客户端会拿手里的 secret 再换一个新令牌（见 `ops.revoke_client`）。
+            print("旧令牌与「用 secret 换新令牌」都已被拒 —— 这台机器要恢复使用，"
+                  "必须**重新配对**（旧的 secret 没被销毁，只是不再被接受）。")
             return 0
         if args.disable or args.enable:
             cid = args.disable or args.enable
@@ -647,7 +651,15 @@ def _admin_cli(cfg, args, password: str = _PASSWORD_NOT_READ) -> int:
                 # 注意：`disabled` 与 `token_version` 是两回事 ——
                 # 启用只是把那一位置回 0，**它手上那个令牌仍然是有效的**
                 # （版本号没变、scopes 没变），不需要重新换。别写成"要重新换令牌"。
-                print("已启用 %s。它手上的凭据仍然有效，可以直接继续用。" % cid)
+                #
+                # 但"已撤销"是**另一道门**（2026-11-03）：撤销过的客户端就算启用了，
+                # `/v1/token` 与认证仍会拒它。这里要如实说，别让人以为启用就等于恢复。
+                row = a.store.client(cid) or {}
+                if float(row.get("revoked_at") or 0) > 0:
+                    print("已启用 %s。但它处于**已撤销**状态：旧令牌和「用 secret 换新令牌」"
+                          "都仍会被拒 —— 要恢复使用必须**重新配对**（发一张新授权）。" % cid)
+                else:
+                    print("已启用 %s。它手上的凭据仍然有效，可以直接继续用。" % cid)
             return 0
         if args.set_scopes:
             out = ops_mod.set_client_scopes(cfg, a, args.set_scopes, scopes)
@@ -863,7 +875,8 @@ def main(argv=None) -> int:
     ap.add_argument("--list-codes", action="store_true", help="列出待用的配对码与剩余时间")
     ap.add_argument("--show-client", default="", metavar="CLIENT_ID", help="看一个客户端的详情")
     ap.add_argument("--revoke", default="", metavar="CLIENT_ID",
-                    help="撤销一个客户端（token_version +1，立即生效）")
+                    help="撤销一个客户端（旧令牌作废，且不许再用 secret 换新令牌；"
+                         "要恢复得重新配对）")
     ap.add_argument("--disable", default="", metavar="CLIENT_ID",
                     help="禁用一个客户端（它收到 403，凭据仍然有效）")
     ap.add_argument("--enable", default="", metavar="CLIENT_ID", help="重新启用")

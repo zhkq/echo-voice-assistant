@@ -763,8 +763,10 @@ def create_admin_app(cfg, state, *, perf=None) -> FastAPI:
 
     @api.post("/clients/{client_id}/revoke")
     async def revoke_client(request: Request, client_id: str):
-        """撤销（**危险动作**：要带 `confirm`）：`token_version + 1`，令牌立刻失效。
+        """撤销（**危险动作**：要带 `confirm`）：`token_version + 1` 且盖 `revoked_at`。
 
+        **不只是"让旧令牌失效"**：撤销过的客户端也不许再用 secret 换新令牌，
+        否则客户端 401 之后会自己续一个（2026-11-03 真机：撤销后仍能转写）。
         管理面与能力面在**同一个进程**、共用同一个 `Auth` 缓存，
         所以这里改完**当场**生效（不是"最多 5 秒"，那是命令行/多实例那条路）。
         """
@@ -1118,8 +1120,10 @@ def create_admin_app(cfg, state, *, perf=None) -> FastAPI:
         svc = billing_svc()
         out = []
         for row in svc.store.entitlements():
-            block = svc.entitlement_summary(str(row.get("user_id") or ""))
+            uid = str(row.get("user_id") or "")
+            block = svc.entitlement_summary(uid)
             block.update(row)          # 原始行（snake_case）也带上，排障用
+            block["userId"] = uid      # 页面按 camelCase 读（与其它列表一致）
             block["expiringSoon"] = bool(block.get("expiringSoon"))
             out.append(block)
         return {"entitlements": out}

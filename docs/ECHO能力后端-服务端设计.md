@@ -528,7 +528,7 @@ class TempWorkspace:
 | POST | `/v1/asr` | 音频 → 文本（`?variant=short\|long`、`?timestamps=1`） | ✅ | Bearer + `asr` |
 | POST | `/v1/diarize` | 音频 → turns + 嵌入（`?mode=segment\|turns`，v1 只做 `segment`） | ✅ | Bearer + `diarize` |
 | POST | `/v1/speaker/embed` | 音频 → 嵌入 | ✅ | Bearer + `embed` |
-| POST | `/v1/tts` | 文本 → 音频（可选能力） | ⏳ | Bearer + `tts` |
+| POST | `/v1/tts` | 文本 → MP3（edge-tts；**不占 GPU**，按 client 1 QPS） | ✅ 2026-10-31 | Bearer + `tts` |
 
 **除了换凭据那两条，没有任何写端点。** `/v1/pair` 与 `/v1/token` 写的是 §8.5 白名单里的
 `clients` / `pairing_codes` 两张**管理**表，一个字节的内容都不碰 —— 它们在护栏测试的
@@ -866,6 +866,12 @@ class TempWorkspace:
 > 所以 `tts` 这个槽**留在词汇表里**（将来接内网 TTS 服务或第三方 TTS 后端时它就位），
 > 但 v1/v2 都不实现服务端端点。要改这个决定，先答一个问题：
 > **"哪台客户端没有可用音色？"** —— 答不上来就不做。
+>
+> **2026-10-31 用户决定改做 `/v1/tts`**：手机 App 与 ECHO 都直接调能力后端，
+> edge-tts 只在后端升级一次；该端点**不占 ASR 的 GPU/Admission/额度**，
+> 按认证 `client_id` **1 QPS**（手机和 ECHO 各自独立计数，429 + `Retry-After`）。
+> 这推翻了上面"v1/v2 不做"的历史结论；判据见
+> `tests/test_server_contract.py::TtsChannelTests`。
 
 ---
 
@@ -1231,6 +1237,24 @@ POST /v1/token
 > 而它们改的列不一样。`updated_at` 是它们的共同痕迹。
 > 代价是"改了却没动 `updated_at`"的写入发现不了 —— 所以 `store.py` 里
 > **每一处改 `clients` 的地方都显式写了 `updated_at`**。
+
+> **第二批事故（2026-11-03）：撤销只让"已签发的令牌"失效，挡不住客户端自己续命。**
+> `token_version + 1` 只杀死**已经发出去**的 JWT；客户端手里还有 **secret**，
+> 而 `/v1/token` 当时不看撤销标记 —— 于是客户端（`app/capabilities/echo_server.py`
+> 的 401 分支 `_force_renew`）用还有效的 secret 立刻换一个新令牌回来。
+> 真机证据：`cli-619e43` 在 `13:41:41Z` 被撤销，`clients.last_seen` 仍是 `14:50:53Z`，
+> 撤销后一小时还在转写。
+>
+> 修法（两半都要）：
+> 1. `Auth.token_for()` / `Auth.authenticate()` 先看 `revoked_at` → 已撤销一律 401
+>    （**不只是**比对 `token_version`）；
+> 2. `Auth.redeem()` 复用 client_id 时清掉 `revoked_at` —— 重新配对 = 重新授权，
+>    否则新 secret 兑出来却"配上了用不了"。
+>
+> 语义边界：撤销**不销毁** secret（`Store.revive()` 保留"误标可回退"），
+> 要彻底废掉凭据用 `--rotate-secret`。契约由
+> `AuthTokenTests.test_revoke_forbids_reissuing_a_token_with_the_old_secret`、
+> `..._test_repairing_a_revoked_client_clears_the_revoked_mark` 钉住。
 
 #### ⑤ 轮换，而不是重新配对
 
@@ -2035,6 +2059,9 @@ test_the_admin_value_wins_over_the_environment_variable` 与
 | 改过载荷（例如把 `ver` 改大）签名就对不上 | ✅ | `AuthTokenTests.test_tampered_payload_is_refused` |
 | 过期令牌被拒；60 秒时钟偏差被容忍 | ✅ | `AuthTokenTests.test_expired_token_is_refused` / `test_clock_skew_is_tolerated` |
 | **撤销在下一个请求就生效**（同进程） | ✅ | `AuthTokenTests.test_revoke_takes_effect_on_the_very_next_request` |
+| **撤销后不许再用 secret 换新令牌**（否则客户端 401 后自己续命，2026-11-03 真机） | ✅ | `AuthTokenTests.test_revoke_forbids_reissuing_a_token_with_the_old_secret` |
+| 重新配对 = 重新授权：收回撤销标记、新 secret 能用 | ✅ | `AuthTokenTests.test_repairing_a_revoked_client_clears_the_revoked_mark` |
+| `revive()` 可回退误标，且**不销毁** secret | ✅ | `AuthTokenTests.test_revive_restores_the_old_credential` |
 | **另一个进程的撤销 ≤ 轮询间隔被发现** | ✅ | `AuthTokenTests.test_revoke_from_another_process_is_eventually_noticed` |
 | 轮询探针能发现**禁用**（不只是撤销） | ✅ | `AuthTokenTests.test_watcher_notices_disable_too_not_just_revoke` |
 | 没变化就不刷缓存（幂等） | ✅ | `AuthTokenTests.test_watcher_only_refreshes_when_something_actually_changed` |

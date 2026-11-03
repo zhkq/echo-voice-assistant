@@ -37,6 +37,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import jwt
 
 from server import errors
+from server import delegation
 from server.store import Store
 
 #: 配对码用的字母表：**去掉 0/O/1/I/L** —— 这个码要人工从管理面念给同事，
@@ -427,9 +428,38 @@ class Auth:
         if not cid:
             raise errors.unauthorized("令牌里没有客户端标识")
 
+        # 2026-10-31：方案 B 的“手机委托 token”。它不是 clients 表里的行；
+        # 父客户端（ECHO）用 /v1/delegate 让它签发，这里验证父客户端仍有效、
+        # 父 token_version 未轮换、scope 只含 tts。设备公钥绑定在 cnf.jkt；
+        # /v1/tts 还会再验 DPoP proof。
+        if claims.get("delegated"):
+            if delegation.is_revoked(cid):
+                raise errors.unauthorized("委托 token 已被撤销")
+            parent_id = str(claims.get("act") or "")
+            parent = self.cache.get(parent_id) if parent_id else None
+            if parent is None:
+                raise errors.unauthorized("委托方客户端不认识或已被删除")
+            if int(parent.get("token_version") or 1) != int(claims.get("ver") or 0):
+                raise errors.unauthorized("令牌已失效（委托方凭据被撤销或轮换）")
+            if int(parent.get("disabled") or 0):
+                raise errors.forbidden("委托方客户端已被禁用")
+            delegated_scope = str(claims.get("scopes") or "")
+            if need_scope and delegated_scope.split() and need_scope not in delegated_scope.split():
+                raise errors.forbidden("这个委托令牌没有 %s 权限" % need_scope)
+            self._touch(parent_id)
+            return {"client_id": cid, "scopes": delegated_scope,
+                    "token_version": int(claims.get("ver") or 1), "disabled": 0,
+                    "delegated": True, "parent": parent_id,
+                    "cnf": dict(claims.get("cnf") or {}), "claims": claims}
+
         row = self.cache.get(cid)
         if row is None:
             raise errors.unauthorized("客户端不认识或已被删除")
+        # ②.5 撤销标记：**撤销过就一律不认**，不靠"版本号刚好对不上"。
+        # 版本比对（下一条）只能让**已经签发**的令牌失效；撤销要是同时漏了"换令牌"
+        # 那一关，客户端就能一直续命（见 `Auth.revoke` 的说明）。
+        if int(row.get("revoked_at") or 0) > 0:
+            raise errors.unauthorized("这个客户端已被撤销，需要重新配对")
         # ③ 版本号：不等 = 已撤销。**这一步才是撤销能立即生效的地方。**
         if int(row.get("token_version") or 1) != int(claims.get("ver") or 0):
             raise errors.unauthorized("令牌已失效（客户端凭据被撤销或轮换）")
@@ -563,6 +593,10 @@ class Auth:
         if reuse and self.store.client(reuse) is not None:
             cid = reuse
             self.store.rotate_secret(cid, hash_secret(secret, cid))
+            # **重新配对 = 重新授权**：把"已撤销"收回去（2026-11-03）。
+            # 不收回来的话，新换来的 secret 虽然写进库了，但这一行仍带 `revoked_at`：
+            # `token_for` 会拒它、管理面列表也看不到它 —— 一张新码兑出来的客户端"配上了却用不了"。
+            self.store.revive(cid)
         else:
             self.store.upsert_client(cid, name, hash_secret(secret, cid), scopes=scopes)
         fetched = self.store.client(cid)
@@ -616,6 +650,33 @@ class Auth:
                                    "没有这个客户端", detail=client_id)
         self.cache.set_disabled(client_id, disabled)
 
+    def revoke(self, client_id: str) -> int:
+        """撤销一个客户端：**已签发的令牌作废，而且不许再用 secret 换新令牌**。
+
+        ## 为什么是两件事，不是一件（2026-11-03 真机）
+
+        原来只做 `token_version + 1`。已经发出去的令牌确实下一个请求就 401 ——
+        但客户端手里**还有 secret**，而 `/v1/token` 当时不看撤销标记。于是
+        `app/capabilities/echo_server.py::_request` 的 401 分支（`_force_renew`）
+        用一个仍然有效的 secret 立刻换回一个新令牌，"撤销"在真实客户端上等于没做。
+
+        真机证据：`cli-619e43` 在 2026-11-03T13:41:41Z 被撤销，
+        `clients.last_seen` 仍是 14:50:53Z —— 撤销后一小时还在用它转写。
+
+        所以撤销 = ① 版本 +1（旧令牌死）② 盖 `revoked_at`（换令牌 / 认证都被拒，
+        见 `token_for` 与 `authenticate`）。**刻意不销毁 secret**：撤销是"停止授权"，
+        不是"永久销毁凭据"，`Store.revive()` 预留了"误标一次能回退"；
+        真要连 secret 一起废掉是 `rotate_secret()` 的事，两者别混。
+        """
+        if self.store.client(client_id) is None:
+            raise errors.EchoError(404, "client_not_found",
+                                   "没有这个客户端", detail=client_id)
+        ver = self.cache.revoke(client_id)
+        if not ver:
+            raise errors.EchoError(404, "client_not_found",
+                                   "没有这个客户端", detail=client_id)
+        return ver
+
     def rotate_secret(self, client_id: str, grace_hours: float = 0.0) -> str:
         """换 secret，返回**新的明文 secret**（只在这一刻出现）。
 
@@ -636,6 +697,34 @@ class Auth:
         self.cache.forget(client_id)
         return secret
 
+    def issue_delegated(self, parent: Dict[str, Any], subject: str, jkt: str,
+                        *, scope: str = "tts", ttl_s: int = 3600) -> Tuple[str, int]:
+        """ECHO 作为委托方，为手机签发 `sub=phone:*` 的 TTS token。
+
+        关键约束：
+          * `act` 是 ECHO 的 client_id；手机 token 不能反过来再委托；
+          * `ver` 是 ECHO 的 token_version —— ECHO 被撤销/轮换后手机 token 立刻失效；
+          * `cnf.jkt` 绑定手机设备公钥，`/v1/tts` 要 DPoP proof；
+          * scope 只能是我们明确给的（目前只允许 tts）。
+        """
+        ttl = max(60, min(int(ttl_s or 3600), 86400))
+        now = int(time.time())
+        sub = "phone:" + str(subject or "").strip()
+        if sub == "phone:":
+            raise errors.bad_request("subject 不能为空")
+        claims = {
+            "sub": sub,
+            "act": str(parent.get("client_id") or ""),
+            "scopes": str(scope or "tts"),
+            "delegated": True,
+            "cnf": {"jkt": str(jkt or "")},
+            "ver": int(parent.get("token_version") or 1),
+            "iat": now,
+            "exp": now + ttl,
+            "jti": secrets.token_hex(8),
+        }
+        return jwt.encode(claims, self.key, algorithm=JWT_ALG), ttl
+
     # ---- 换令牌（§7.5 ②）---------------------------------------------------
 
     def token_for(self, authorization: str) -> Dict[str, Any]:
@@ -651,6 +740,11 @@ class Auth:
         if row is None:
             # 静态令牌模式下没有 clients 行，但换令牌这件事本来就属于 jwt 模式
             raise errors.unauthorized("客户端不认识")
+        # 撤销过的客户端**不许再换令牌**（2026-11-03）。只把已签发的令牌作废是不够的：
+        # 客户端手里有 secret，401 之后会自动换一个新的回来（`_force_renew`），
+        # 于是"撤销"在真实客户端上几乎无效 —— 见 `Auth.revoke` 的真机记录。
+        if int(row.get("revoked_at") or 0) > 0:
+            raise errors.unauthorized("这个客户端已被撤销，需要重新配对")
         if int(row.get("disabled") or 0):
             raise errors.forbidden("这个客户端已被禁用")
         given = hash_secret(secret, cid)

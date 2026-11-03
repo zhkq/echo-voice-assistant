@@ -30,18 +30,24 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 class HarnessAgent(DshAgent):
-    name = "harness"
-    # 面板/文档统一叫「标准版 harness」：与「DSH Desktop 桌面版」区分开（同事 2026-09-21 反馈）。
-    # **这一行不能删**：本类继承 DshAgent，删掉就会继承父类的 "DSH Desktop"，
-    # 面板上标准版与桌面版两行长得一模一样（2026-09-22 真踩过，见 tests/test_harness_agent.py）。
-    display_name = "标准版 harness（DeepSeek Harness）"
-    short_name = "标准版"        # 折叠条只有 48 逻辑宽，全称会被省略号切掉
-    vendor = "DeepSeek（npm @deepseek-ai/dsh）"
-    description = ("独立 harness 的 web 服务（随 ECHO 启动，默认 127.0.0.1:43199）——"
-                   "不装 DSH Desktop 也能用；/api 接口与 Desktop 完全一致")
-    config_key = "agentHarnessEnabled"
-    #: 它自己的配置项（面板在展开区里编辑）；token 是 secret，不会经接口回显
-    settings_keys = ("harnessCommand", "harnessHome", "harnessPort", "harnessToken")
+    """**ECHO 唯一的 DSH 智能体**（一套 DSH）。
+
+    2026-11-03 之前这里叫「标准版 harness」、与「DSH 桌面版」并列两套；用户拍板
+    "不能接受用户用两套 dsh"。现在只有一个产品：
+      * 桌面版（官方 DeepSeek Harness GUI）开着 → 直接用它的 43120（签名 Cookie）；
+      * 没开 → ECHO 起无头 dsh（token），**家目录同样是 `~/.dsh`**。
+
+    所以"会话/技能/工作区"只有一份，打开桌面版就能看到 ECHO 建的会议/指令/回顾空间。
+    """
+    name = "dsh"
+    display_name = "DSH（DeepSeek Harness）"
+    short_name = "DSH"
+    vendor = "DeepSeek Harness"
+    description = ("本机唯一的 DSH：桌面版开着就用桌面版，没开由 ECHO 起无头 dsh；"
+                   "两者共用同一个 DSH 家目录，会话在工作区里可见")
+    config_key = ""          # 恒启用：一套 DSH 没有"启用开关"
+    #: 面板展开区里的配置项（dshAutoStart = 是否随 ECHO 启动）
+    settings_keys = ("dshBaseUrl", "dshAutoStart", "harnessPort", "harnessCommand")
     capabilities = ("workspace", "session", "cancel", "history")
     web_ui = True          # 它有 Web 界面 → 仪表盘上给一个"用浏览器打开它"的小图标
 
@@ -49,11 +55,34 @@ class HarnessAgent(DshAgent):
         super().__init__(base_url or harness_proc.base_url())
         self._login_ts = 0.0
 
-    # ------------------------------------------------------------- 鉴权
+    # ------------------------------------------------------------- 一套 DSH 的两种接入
+    #
+    # desktop=True：桌面版在跑 → 用 43120 + 签名 Cookie（父类 DshAgent 那套）
+    # desktop=False：起/用无头 dsh → 用 43199 + token 换 Cookie（下面 _login 那套）
+
+    def _sync_endpoint(self) -> bool:
+        """按"谁在跑"同步 base_url，返回是否桌面版模式。
+
+        发现桌面版起来时**顺手让出**同一个 DSH 家目录（停掉 ECHO 起的无头 dsh）——
+        两个进程同时写 `~/.dsh` 会把会话/storages 写坏。只停 ECHO 自己起的那个。
+        """
+        desktop = harness_proc.desktop_mode()
+        if desktop:
+            try:
+                harness_proc.yield_to_desktop()
+            except Exception:
+                pass
+        want = harness_proc.desktop_url() if desktop else harness_proc.base_url()
+        if want != self.base_url:
+            self.base_url = want
+            self._cookie = None
+            self._cookie_ts = 0.0
+        return desktop
 
     def _credentials_path(self):
-        """独立 harness 自己的凭据文件（与桌面版同构）。"""
+        """凭据文件：与桌面版**同一份**（一套 DSH，共用同一个家目录）。"""
         return os.path.join(harness_proc.home(), ".credentials.yaml")
+
 
     def _workspace_registry_path(self):
         """独立 harness **自己家目录**里的工作区注册表。
@@ -130,25 +159,27 @@ class HarnessAgent(DshAgent):
         raise DshError("harness 登录失败：响应里没有 %s Cookie（token 被拒？）" % COOKIE_PREFIX)
 
     def _cookie_header(self):
-        """**不再铸造 HMAC Cookie**，改为 token 换 Cookie；5 分钟主动重登一次。"""
+        """Cookie 从哪来取决于**谁在跑**：
+
+        * 桌面版在跑 → 用 `~/.dsh` 里的签名密钥自铸（父类 DshAgent 那套）；
+        * 无头 dsh → token 换 Cookie（下面 `_login`），5 分钟主动重登一次。
+        """
+        if self._sync_endpoint():
+            return DshAgent._cookie_header(self)
         if not self._cookie or time.time() - self._cookie_ts > 300:
             self._cookie = self._login()
             self._cookie_ts = time.time()
         return self._cookie
 
     def rpc(self, method, args=None, timeout=15):
-        """401/403 时重登一次再试（cookie 过期不该让一次命令白跑）；
-        **连不上时把 harness 拉起来再试一次**。
+        """一套 DSH 的两种接入：
 
-        为什么要自己拉（2026-10-10 用户实测两次 500）：`harness_proc.ensure_running()`
-        只有 **boot** 与 **"应用智能体设置"** 两处调用 —— 回顾/助手/会议/归档**谁都不管
-        harness 在不在跑**。于是切树之后（旧那份已停、新的没起）点「开始回顾」，
-        拿到的就是 `<urlopen error [WinError 10061] 目标计算机积极拒绝>` → 500。
-
-        只对**连接层失败**兜底：HTTP 4xx/5xx 与 RPC 业务错误照旧原样抛（那些不是"没起来"），
-        所以 harness 正常时这条路径没有任何额外开销。
+        * 桌面版在跑 → 直接走父类（43120 + 签名 Cookie），**不起第二个进程**；
+        * 否则走无头 dsh：401/403 重登一次，连接层失败时把无头 dsh 拉起来再试。
         """
         try:
+            if self._sync_endpoint():
+                return DshAgent.rpc(self, method, args, timeout=timeout)  # 桌面版：签名 Cookie
             return super().rpc(method, args, timeout=timeout)
         except DshError as e:
             msg = str(e)
@@ -179,21 +210,26 @@ class HarnessAgent(DshAgent):
     # ------------------------------------------------------------- 可用性
 
     def available(self, probe=False):
-        """探活 + 给出"怎么把它跑起来"的可操作原因。"""
+        """探活 + 给出"怎么把它跑起来"的可操作原因（一套 DSH 的两种接入分别说清）。"""
+        if self._sync_endpoint():
+            ok, why = DshAgent.available(self, probe=probe)
+            return ok, ("桌面版在跑：" + why) if ok else (
+                "DSH 桌面版开着但 ECHO 用不了它：" + why)
+        # 探活**不走 rpc**：rpc 在"连不上"时会自动拉起引擎，那是业务路径的行为；
+        # 探活（面板「检测」/启动页）只回答"在不在"，不许有副作用。
+        if harness_proc.online(timeout=1.0 if not probe else 6.0):
+            return True, "API 可访问（%s，无头 dsh）" % self.base_url
         try:
-            self.rpc("session/list", {"_request": {}}, timeout=3 if not probe else 6)
-            return True, "API 可访问（%s）" % self.base_url
-        except DshError as e:
-            if not harness_proc.online(timeout=1.0):
-                if not harness_proc.requested():
-                    return False, ("标准版 harness 没在运行：在面板把它选为当前智能体"
-                                   "（或打开「启用标准版 harness」），ECHO 会自动拉起"
-                                   "（需要本机 Node；安装技能会把它永久装到 "
-                                   "`{echoBase}/dsh/app`，老装机在 `<安装目录>/harness/dsh`）")
-                return False, ("标准版 harness 没在监听 %s：看 data/logs/harness.log —— "
-                               "本地件装好后仍起不来，多半是 node 不在 PATH 或上次装残了"
-                               "（重跑 echo-install 技能会补齐）" % self.base_url)
-            return False, "连不上独立 harness：%s" % e
+            from app.config import settings as _s
+            auto = bool(_s.get("dshAutoStart", True))
+        except Exception:
+            auto = True
+        if not auto:
+            return False, ("DSH 没在跑：设置里关掉了「随 ECHO 启动」，"
+                           "面板上点「启动」即可（桌面版打开后 ECHO 会自动改用它）")
+        return False, ("DSH 没在监听 %s：ECHO 没能把它拉起来 —— 看 data/logs/harness.log；"
+                       "启动程序来自官方桌面端自带的 dsh，"
+                       "缺它就重装官方 DeepSeek Harness 桌面端" % self.base_url)
 
 
 def build():

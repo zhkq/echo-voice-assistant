@@ -90,7 +90,13 @@ class NewLayoutRootsTests(_BaseCase):
         self.assertEqual(paths.models_root(), os.path.join(base, "models"))
         self.assertEqual(paths.meetings_root(), os.path.join(base, "meeting"))
         self.assertEqual(paths.dsh_root(), os.path.join(base, "dsh", "app"))
-        self.assertEqual(paths.dsh_home_root(), os.path.join(base, "dsh", "home"))
+        # 2026-11-03 一套 DSH：DSH_HOME 不再在安装根下，而是**官方桌面端的家目录**
+        # （桌面版与无头 dsh 共用一份，会话/技能只有一套）。旧位置登记在 legacy_dsh_homes()。
+        self.assertNotEqual(os.path.normcase(paths.dsh_home_root()),
+                            os.path.normcase(os.path.join(base, "dsh", "home")))
+        self.assertIn(os.path.join(base, "dsh", "home"),
+                      [os.path.normpath(p) for p in paths.legacy_dsh_homes()],
+                      "旧布局的 DSH 家目录要出现在迁移来源里")
         self.assertEqual(paths.command_root(), os.path.join(base, "aide"))
         self.assertEqual(paths.base_dir("core"), os.path.join(base, "echo-core"))
 
@@ -109,8 +115,9 @@ class NewLayoutRootsTests(_BaseCase):
                          "兜底 cwd 又跑回 echo-core 里了")
 
     def test_every_root_is_under_the_base(self):
+        # DSH 家目录**不在**安装根下（一套 DSH 共用官方桌面端的家目录），单独排除。
         for fn in (paths.data_root, paths.models_root, paths.meetings_root,
-                   paths.dsh_root, paths.dsh_home_root, paths.command_root):
+                   paths.dsh_root, paths.command_root):
             with self.subTest(fn=fn.__name__):
                 self.assertTrue(os.path.normcase(fn()).startswith(os.path.normcase(self.tmp)),
                                 "%s 跑到安装根外面去了" % fn.__name__)
@@ -197,7 +204,9 @@ class LegacyLayoutTests(unittest.TestCase):
             self.assertEqual(paths.meetings_root(), os.path.join(r"D:\ECHO\data", "meetings"))
             self.assertEqual(paths.models_root(), r"D:\ECHO\models")
             self.assertEqual(paths.dsh_root(), os.path.join(r"D:\ECHO", "harness", "dsh"))
-            self.assertEqual(paths.dsh_home_root(), os.path.join(r"D:\ECHO\data", "harness"))
+            # 2026-11-03 一套 DSH：家目录是官方桌面端的（不在安装根下）；老位置只作为迁移来源。
+            self.assertIn(os.path.join(r"D:\ECHO\data", "harness"),
+                          [os.path.normpath(p) for p in paths.legacy_dsh_homes()])
             self.assertEqual(paths.command_root(),
                              os.path.join(r"D:\ECHO", "data", "command"))
 

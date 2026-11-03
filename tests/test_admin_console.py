@@ -514,6 +514,10 @@ class IsolationTests(_AdminCase):
                                        "/v1/billing/orders",
                                        "/v1/billing/orders/{order_id}/cancel",
                                        "/v1/billing/alipay/notify",
+                                       # 方案B（2026-10-31）：手机 TTS 委托与撤销。它们不是能力槽，
+                                       # 是"ECHO 给手机签一个只管 tts 的短期令牌"（`/v1/delegate`
+                                       # 的撤销还按设备主体），同样要凭据，登记在这里不是敞开。
+                                       "/v1/delegate", "/v1/delegate/revoke", "/v1/tts",
                                        # 中继（2026-10-15）：**不是能力槽**，是"借这台服务器
                                        # 把手机的请求转交给某台主机"的那条路。三条都要凭据
                                        # （主机侧按 client_id 认主机，手机侧放行 /health 与 api/*、

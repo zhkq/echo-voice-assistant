@@ -49,6 +49,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.echo.contact.service.ListenService
 import com.echo.contact.service.ListenState
+import com.echo.contact.service.SpeakPlan
 import com.echo.contact.ui.theme.EchoPalette
 
 /**
@@ -411,7 +412,12 @@ private fun SubmitCard(submit: SubmitState, onSpeak: (String) -> Unit) {
                             modifier = Modifier.padding(10.dp),
                         )
                     }
-                    IconButton(onClick = { onSpeak(submit.reply) }) {
+                    IconButton(onClick = {
+                        // 手动朗读也走"只念结论"：优先服务端给的 speakText；
+                        // 老服务端没有它时，只从整篇 reply 取首段摘要，绝不整篇念。
+                        val text = submit.speak.ifBlank { SpeakPlan.summaryOf(submit.reply) }
+                        if (text.isNotBlank()) onSpeak(text)
+                    }) {
                         Icon(Icons.Default.VolumeUp, contentDescription = "朗读")
                     }
                 }

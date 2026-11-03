@@ -107,9 +107,9 @@ class RegistrationAndSnapshotTests(_BootStateTestCase):
         boot.setup()
         snap = boot.snapshot()
         ids = [c["id"] for c in snap["components"]]
+        # 2026-11-03 一套 DSH：`harness` 那一行已随"标准版退役"删除，只剩唯一一行 dsh。
         self.assertEqual(ids,
-                         ["server", "dsh", "failover", "harness",
-                          "tts", "hotkey", "meeting"])
+                         ["server", "dsh", "failover", "tts", "hotkey", "meeting"])
         self.assertNotIn("stt-meeting", ids, "会议转写引擎组件已删（客户端不做会议转写了）")
         self.assertNotIn("diarize", ids, "说话人分离组件已删（它只走能力后端）")
         self.assertNotIn("stt-cmd", ids, "本地命令转写引擎已删（指令也走能力后端了）")
@@ -117,14 +117,14 @@ class RegistrationAndSnapshotTests(_BootStateTestCase):
         by_id = {c["id"]: c for c in snap["components"]}
         self.assertEqual(by_id["server"]["status"], "online", "面板服务阶段 0 就已就绪")
         self.assertFalse(by_id["server"]["can_start"])
-        for cid in ("hotkey", "harness"):
+        for cid in ("hotkey", "dsh"):
             self.assertTrue(by_id[cid]["can_stop"], "%s 应可手动停止" % cid)
-        self.assertTrue(by_id["harness"]["can_start"], "独立 harness 可手动拉起")
+        self.assertTrue(by_id["dsh"]["can_start"], "DSH 可手动拉起")
 
     def test_setup_twice_does_not_duplicate(self):
         boot.setup()
         boot.setup()
-        self.assertEqual(boot.snapshot()["summary"]["total"], 7)
+        self.assertEqual(boot.snapshot()["summary"]["total"], 6)
 
 
 class ReportTests(_BootStateTestCase):
@@ -328,80 +328,65 @@ class BootOrchestrationTests(_BootStateTestCase):
         self.assertEqual(boot._PHASE, "done")
 
 
-class SkippedAgentTests(_BootStateTestCase):
-    """「你选了另一个智能体」不该被报成失败（2026-09-22 同事反馈）。
+class DshRowTests(_BootStateTestCase):
+    """一套 DSH（2026-11-03）：启动页只有一行 DSH，按"桌面版在不在/无头起没起"报状态。"""
 
-    症状：装了标准版 harness，启动页却写「就绪 10/11 · 失败 1」，把「DSH 执行引擎」
-    渲染成红色，还教用户去启动一个**他没选**的组件（"请启动 DSH Desktop…"）。
-    根因：`_start_dsh` 不看 `agentBackend`，无条件去起桌面版，起不来就报 failed ——
-    而两个智能体是**二选一**，没选它的机器上它本来就该是"未使用"。
+    def _register(self):
+        boot.register("dsh", "DSH（唯一一套）", "⚙️", start_fn=boot._start_dsh,
+                      can_start=True, can_stop=True)
+        self._auto = patch("app.config.settings.get",
+                           lambda k, d=None: True if k == "dshAutoStart" else d)
+        self._auto.start()
+        self.addCleanup(self._auto.stop)
 
-    这是同一类误导的第二次出现（上一轮是"dsh offline 是不是坏了"，换了个页面又来）。
-    """
-
-    def _register_agents(self):
-        """两个智能体都要登记 —— detail 里的名字取自组件显示名，只登记一个会回退成内部 id。"""
-        boot.register("dsh", "DSH 执行引擎", "⚙️", start_fn=boot._start_dsh)
-        boot.register("harness", "标准版 harness", "🧩", start_fn=boot._start_harness)
-
-    def test_unselected_desktop_is_skipped_not_failed(self):
-        self._register_agents()
-        with patch.object(boot, "selected_agent", return_value="harness"):
+    def test_uses_the_desktop_when_it_is_running(self):
+        self._register()
+        with patch("app.manager.dsh_ready", return_value=True), \
+                patch("app.harness_proc.ensure_running") as run:
             boot._run_start("dsh")
         comp = boot._COMPONENTS["dsh"]
-        self.assertEqual(comp["status"], "skipped", "没选它就不该去启动、更不该报失败")
-        self.assertEqual(comp["error"], "", "skipped 不是错误")
-        self.assertIn("标准版", comp["detail"], "要说清你选的是哪一个，别让人去猜")
+        self.assertEqual(comp["status"], "online")
+        self.assertIn("桌面版", comp["detail"])
+        run.assert_not_called()            # 桌面版在跑：绝不再起第二个进程
 
-    def test_selected_desktop_still_starts(self):
-        """选中桌面版时行为一个字都不变 —— 别把正常启动路径也 skip 掉。"""
-        self._register_agents()
-        with patch.object(boot, "selected_agent", return_value="dsh"), \
-             patch("app.manager.dsh_ready", return_value=True):
+    def test_starts_the_headless_engine_when_the_desktop_is_not_running(self):
+        self._register()
+        with patch("app.manager.dsh_ready", return_value=False), \
+                patch("app.harness_proc.ensure_running", return_value=(True, "无头 dsh 已启动")):
             boot._run_start("dsh")
-        self.assertEqual(boot._COMPONENTS["dsh"]["status"], "online")
+        comp = boot._COMPONENTS["dsh"]
+        self.assertEqual(comp["status"], "online")
+        self.assertIn("无头 dsh", comp["detail"])
 
-    def test_unselected_harness_is_skipped(self):
-        self._register_agents()
-        with patch.object(boot, "selected_agent", return_value="dsh"), \
-             patch("app.harness_proc.requested", return_value=False), \
-             patch("app.harness_proc._load_pid", return_value=None), \
-             patch("app.harness_proc.started_by_echo", return_value=False), \
-             patch("app.harness_proc.sync_status"):
-            boot._run_start("harness")
-        comp = boot._COMPONENTS["harness"]
-        self.assertEqual(comp["status"], "skipped")
-        self.assertIn("DSH", comp["detail"])
+    def test_auto_start_off_marks_it_skipped_not_failed(self):
+        self._register()
+        with patch("app.config.settings.get",
+                   lambda k, d=None: False if k == "dshAutoStart" else d), \
+                patch("app.harness_proc.ensure_running") as run:
+            boot._run_start("dsh")
+        comp = boot._COMPONENTS["dsh"]
+        self.assertEqual(comp["status"], "skipped", "关掉随启动不该被记成失败")
+        self.assertEqual(comp["error"], "")
+        run.assert_not_called()
+
+    def test_failure_is_reported_with_the_reason(self):
+        self._register()
+        with patch("app.manager.dsh_ready", return_value=False), \
+                patch("app.harness_proc.ensure_running",
+                      return_value=(False, "找不到官方桌面端的 dsh")):
+            boot._run_start("dsh")
+        comp = boot._COMPONENTS["dsh"]
+        self.assertEqual(comp["status"], "failed")
+        self.assertIn("桌面端", comp["error"])
 
     def test_skipped_counts_as_ready_and_never_as_failed(self):
-        """统计口径：skipped 是"不用它"，不是"它坏了" —— 否则选标准版的机器永远显示失败 1。"""
+        """统计口径：skipped 是"按设置不启"，不是"它坏了"。"""
         boot.register("a", "A", "", status="online")
-        boot.register("dsh", "DSH 执行引擎", "", status="skipped")
+        boot.register("dsh", "DSH", "", status="skipped")
         s = boot.snapshot()["summary"]
         self.assertEqual(s["failed"], 0)
         self.assertEqual(s["ready"], 2)
         self.assertEqual(s["pending"], 0)
-
-    def test_only_the_two_agents_are_ever_skipped(self):
-        """skipped 只用于"二选一的智能体"，别扩散成"所有没启用的组件"。
-
-        组件清单里**没有** `diarize`（2026-09-29 起会议分离只走能力后端），所以这里
-        顺便钉一件事：谁要是把"本机分离"接回启动页，这条会红。
-        """
-        boot.setup()
-        with patch.object(boot, "selected_agent", return_value="harness"), \
-             patch("app.manager.dsh_ready", return_value=False), \
-             patch("app.manager.dsh_start", return_value=(False, "没开")), \
-             patch("app.harness_proc.requested", return_value=False), \
-             patch("app.harness_proc._load_pid", return_value=None), \
-             patch("app.harness_proc.started_by_echo", return_value=False), \
-             patch("app.harness_proc.sync_status"):
-            boot._run_start("dsh")
-            boot._run_start("harness")
-        by_id = {c["id"]: c["status"] for c in boot.snapshot()["components"]}
-        self.assertEqual(by_id["dsh"], "skipped")
-        self.assertEqual(by_id["harness"], "skipped")
-        self.assertNotIn("diarize", by_id, "说话人分离不再是本机组件（只走能力后端）")
 
 
 class FailoverDetailRefreshTests(_BootStateTestCase):
@@ -485,6 +470,73 @@ class PanelRendersSkippedTests(unittest.TestCase):
         self.assertIn('status === "skipped"', js, "bootBadgeCls 不认识 skipped")
         # 「未使用」不能被染成错误色：bootBadgeCls 里 skipped 必须排在 failed 之后返回 idle
         self.assertIn('if (status === "skipped") return "idle"', js)
+
+
+class AgentRowRefreshTests(_BootStateTestCase):
+    """改完设置后，启动页那行 DSH 要按**实际状态**重算（2026-11-03 真机）。
+
+    现场：Windows 装机顺序是「服务先起 → 再写设置」，启动页会留着装之前的旧结论；
+    用户看到"失败 + 重试"，以为是 DSH 拉不起来。现在只有一行，重算只认实际状态。
+    """
+
+    def _row(self):
+        boot.register("dsh", "DSH（唯一一套）", "⚙️", start_fn=lambda report: None,
+                      can_start=True, can_stop=True)
+
+    def test_desktop_running_reports_online(self):
+        self._row()
+        boot.report("dsh", status="failed", detail="旧的失败结论")
+        with patch("app.manager.dsh_ready", return_value=True), \
+                patch("app.harness_proc.yield_to_desktop", lambda: {"yielded": False}):
+            boot.refresh_agent_rows()
+        self.assertEqual(boot._COMPONENTS["dsh"]["status"], "online")
+        self.assertIn("桌面版", boot._COMPONENTS["dsh"]["detail"])
+
+    def test_headless_running_reports_online(self):
+        self._row()
+        with patch("app.manager.dsh_ready", return_value=False), \
+                patch("app.harness_proc.desktop_gui_running", lambda: False), \
+                patch("app.harness_proc.online", return_value=True):
+            boot.refresh_agent_rows()
+        self.assertEqual(boot._COMPONENTS["dsh"]["status"], "online")
+        self.assertIn("无头 dsh", boot._COMPONENTS["dsh"]["detail"])
+
+    def test_gui_without_api_is_reported_as_coexisting_when_headless_runs(self):
+        """GUI 在、但没有对外接口（当前官方版）→ 无头在跑就算在线（两进程共用家目录）。"""
+        self._row()
+        with patch("app.manager.dsh_ready", return_value=False), \
+                patch("app.harness_proc.desktop_gui_running", lambda: True), \
+                patch("app.harness_proc.online", return_value=True):
+            boot.refresh_agent_rows()
+        comp = boot._COMPONENTS["dsh"]
+        self.assertEqual(comp["status"], "online")
+        self.assertIn("与桌面版", comp["detail"])
+
+    def test_gui_without_api_and_headless_down_offers_start(self):
+        self._row()
+        with patch("app.manager.dsh_ready", return_value=False), \
+                patch("app.harness_proc.desktop_gui_running", lambda: True), \
+                patch("app.harness_proc.online", return_value=False):
+            boot.refresh_agent_rows()
+        comp = boot._COMPONENTS["dsh"]
+        self.assertEqual(comp["status"], "idle")
+        self.assertIn("启动", comp["detail"])
+
+    def test_neither_running_reports_idle_with_a_way_out(self):
+        self._row()
+        with patch("app.manager.dsh_ready", return_value=False), \
+                patch("app.harness_proc.desktop_gui_running", lambda: False), \
+                patch("app.harness_proc.online", return_value=False):
+            boot.refresh_agent_rows()
+        comp = boot._COMPONENTS["dsh"]
+        self.assertEqual(comp["status"], "idle")
+        self.assertIn("启动", comp["detail"])
+
+    def test_nothing_happens_before_boot_registers_components(self):
+        """boot 还没跑过（组件未登记）→ 安静返回；那时启动页本来会重算一遍。"""
+        with patch("app.manager.dsh_ready") as ready:
+            boot.refresh_agent_rows()
+        ready.assert_not_called()
 
 
 if __name__ == "__main__":
