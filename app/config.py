@@ -829,12 +829,22 @@ DEFAULTS = {
     #     （2026-09-19 从「面板与服务」挪上来：摊在那儿用户不知道它跟谁有关）。
     # 这些都 hidden=True：不进 /api/settings 的 settings 列表，只走 agents 字段与本行内联。
     "dshBaseUrl":      dict(value="http://127.0.0.1:43120", grp="agent", label="DSH 服务地址",
-                            description="DSH Desktop 2.x 的 Web 服务地址（GUI 与 API 同端口，默认 43120）",
+                            description="官方 DSH 桌面版的 Web 服务地址（GUI 与 API 同端口，默认 43120）；"
+                                        "桌面版没开时 ECHO 自己起无头 dsh（端口见「DSH 端口」）",
+                            value_type="str", hidden=True),
+    "dshAutoStart":    dict(value=True, grp="agent", label="随 ECHO 启动 DSH",
+                            description="开着：ECHO 启动时若桌面版没开，就把无头 dsh 拉起来"
+                                        "（两者共用同一个 DSH 家目录，会话/技能只有一份）；"
+                                        "关掉：需要时在面板点「启动」",
+                            value_type="bool", hidden=True),
+    "dshHome":         dict(value="", grp="agent", label="DSH 家目录",
+                            description="留空 = 官方桌面端的家目录（两者共用，界面里看到的是同一套会话）。"
+                                        "一般不用改：改了就与桌面版各看各的会话",
                             value_type="str", hidden=True),
     "agentBackend": dict(value="dsh", grp="agent", label="执行智能体",
                          description="ECHO 把命令与会议纪要交给哪个智能体执行；"
                                      "在面板的智能体表格里切换。默认 DSH",
-                         value_type="str", options=["dsh", "codebuddy", "harness"], hidden=True),
+                         value_type="str", options=["dsh", "codebuddy"], hidden=True),
     "agentCodebuddyEnabled": dict(value=True, grp="agent", label="启用 CodeBuddy Code",
                                   description="腾讯 CodeBuddy Code（WorkBuddy 内置同一引擎）",
                                   value_type="bool", agent_key="codebuddy", hidden=True),
@@ -842,35 +852,28 @@ DEFAULTS = {
                             description="可执行文件路径；留空 = 自动探测"
                                         "（PATH → WorkBuddy 内置目录）。仅在自动探测失败时需要填",
                             value_type="str", hidden=True),
-    # ---- 独立 DeepSeek Harness（npm @deepseek-ai/dsh）：随 ECHO 一起启动的那个 agent ----
-    # 与 DSH Desktop 只差两点：**谁提供 web 服务**（npm 包 vs 桌面客户端）、**鉴权**
-    # （启动时打印的 token → Cookie vs 逆向签名 Cookie）；/api 接口面完全相同（2026-09-19 实测）。
-    # 详见 app/harness_proc.py 与 docs/独立harness接入.md。
-    "agentHarnessEnabled": dict(value=False, grp="agent", label="启用标准版 harness（DeepSeek Harness）",
-                                description="本项与「执行智能体」都指向它时，ECHO 才把独立 harness "
-                                            "作为子进程拉起（切走即停）；需要本机 Node / npx",
-                                value_type="bool", hidden=True),
-    "harnessHome": dict(value="", grp="agent", label="harness 数据目录（DSH_HOME）",
-                        description="独立 harness 的家目录；"
-                                    "留空 = 新布局 `{echoBase}/dsh/home`／老装机 `{DATA}/harness`。"
-                                    "刻意与 Desktop 的家目录分开（各用各的），"
-                                    "两边的会话与设置互不干扰",
-                        value_type="str", hidden=True),
-    "harnessPort": dict(value=43199, grp="agent", label="harness 端口",
-                        description="独立 harness 的监听端口（默认 43199，刻意避开 Desktop 的 43120，"
-                                    "两者可同时运行）",
+    # ---- DSH 引擎内部项（2026-11-03 一套 DSH：桌面版 + 无头共用 ~/.dsh）----
+    # `agentHarnessEnabled` 已退役（一套 DSH 没有"启用标准版"这回事）；保留默认值只为老库兼容，
+    # 面板不再渲染，`harness_proc.requested()` 也不再读它。
+    "agentHarnessEnabled": dict(value=False, grp="agent", label="启用标准版 harness（已退役）",
+                                description="已退役：2026-11-03 起 ECHO 只有一套 DSH（桌面版/无头，"
+                                            "共用同一个 DSH 家目录），本项不再生效",
+                                value_type="bool", hidden=True, deprecated=True),
+    "harnessHome": dict(value="", grp="agent", label="DSH 家目录（已退役）",
+                        description="已退役：一套 DSH 共用桌面端的家目录（见「DSH 家目录」dshHome）",
+                        value_type="str", hidden=True, deprecated=True),
+    "harnessPort": dict(value=43199, grp="agent", label="DSH 无头端口",
+                        description="桌面版没开时，ECHO 自己起的无头 dsh 监听这个端口"
+                                    "（默认 43199，避开桌面版的 43120）",
                         value_type="int", hidden=True),
-    "harnessCommand": dict(value="npx -y @deepseek-ai/dsh web", grp="agent", label="harness 启动命令",
-                           description="拉起独立 harness 的命令（--port / --no-open 由 ECHO 追加）。"
-                                       "安装技能会把它指向本地入口（新布局 `{echoBase}/dsh/app`、"
-                                       "老装机 `<安装目录>/harness/dsh`；冷启动约 10 秒）；"
-                                       "装不起来就把这里改回 npx -y @deepseek-ai/dsh web 兜底",
+    "harnessCommand": dict(value="npx -y @deepseek-ai/dsh web", grp="agent", label="DSH 启动命令",
+                           description="拉起无头 dsh 的命令（--port / --no-open 由 ECHO 追加）。"
+                                       "留空/出厂值 = 自动用官方桌面端自带的 dsh CLI；"
+                                       "装了 Node 的机器也可写回 npx 兜底",
                            value_type="str", hidden=True),
-    "harnessToken": dict(value="", grp="agent", label="harness 访问 token",
-                         description="只有当你自己启动了 harness（终端里跑 npx @deepseek-ai/dsh web）"
-                                     "才需要填它打印出来的 token；ECHO 自己拉起时会自动获取。"
-                                     "留空 = 不改动已配置的值",
-                         value_type="str", hidden=True, secret=True),
+    "harnessToken": dict(value="", grp="agent", label="DSH 访问 token（已退役）",
+                         description="已退役：token 由 ECHO 自动获取；本项不再使用",
+                         value_type="str", hidden=True, deprecated=True),
     # ---------- 能力 provider（P5：ASR / TTS 各选一个）----------
     # 留空 = 用该 kind 的默认实现（本地转写引擎 / 本平台离线朗读）。
     # 可选项是**运行时**注册出来的（见 GET /api/providers），所以这里不写死 options。

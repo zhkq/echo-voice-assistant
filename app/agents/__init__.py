@@ -125,7 +125,9 @@ def product_options():
 
 def active_name():
     """当前应使用的智能体名（含降级）。"""
-    want = (settings.get("agentBackend", DEFAULT_AGENT) or DEFAULT_AGENT).strip()
+    # 2026-11-03 一套 DSH：统一走 selected_name()（它会把旧值 "harness" 归一成 "dsh"）。
+    # 不归一的话 "harness" 不在 names() 里，会掉进下面的降级环 → 可能被 CodeBuddy 抢走。
+    want = selected_name()
     if want in names() and is_enabled(want):
         return want
     # 降级：按登记顺序取第一个「已启用且可用」的
@@ -159,7 +161,11 @@ def selected_name():
         want = str(settings.get("agentBackend", DEFAULT_AGENT) or DEFAULT_AGENT).strip()
     except Exception:
         want = DEFAULT_AGENT
-    return want or DEFAULT_AGENT
+    # 2026-11-03 一套 DSH：旧库里的 "harness"（退役的"标准版"）统一归一成 "dsh"。
+    # 不归一的话面板会把一个不存在的产品当成"当前选中"，看起来像配置坏了。
+    if want in ("", "harness"):
+        want = DEFAULT_AGENT
+    return want
 
 
 def meta(name):

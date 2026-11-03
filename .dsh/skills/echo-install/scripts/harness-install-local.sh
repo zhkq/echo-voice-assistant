@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # =====================================================================
-# harness-install-local.sh - 把 DSH 标准版装到 <安装目录>/harness/dsh（本地永久入口）
+# harness-install-local.sh - 把 DSH 标准版装到安装根下的本地永久入口
+#   3.0 布局（代码在 <根>/echo-core）：<根>/dsh/app
+#   老式扁平安装（代码就在 <根>）：    <根>/harness/dsh
+# 判据与 app/paths.py:echo_base() 同一条 —— 与 Windows 的 .ps1 逐条对齐。
 #
 # 谁在用它：`echo-install-components.sh` 的 prepare_agent；也可以单独跑（修装坏的标准版）。
 # 与 Windows 的 harness-install-local.ps1 **一一对应**（两条路都要同样行为）。
@@ -48,7 +51,8 @@ REGISTRY=""
 usage() {
   cat <<'EOF'
 用法：harness-install-local.sh --dest <ECHO 安装目录> [选项]
-  --dest <目录>        必填。ECHO 安装目录（标准版装到 <目录>/harness/dsh）
+  --dest <目录>        必填。ECHO 安装目录（标准版装到 <根>/dsh/app 或 <根>/harness/dsh，
+                     按布局自动判：代码在 <根>/echo-core 时用前者）
   --version <版本>     @deepseek-ai/dsh 版本；**默认自动取 npm 上的 latest**
   --upgrade            已装好也强制重装（= 升级入口；配合 --version 升/降到指定版本）
   --from-cache         跳过 npm，直接从 npx 缓存复制（离线 / registry 坏掉时用）
@@ -96,6 +100,20 @@ say()  { echo "  $*"; _log "  $*"; }
 ok()   { echo "  [ok]   $*"; _log "[ok]   $*"; }
 warn() { echo "  [warn] $*"; _log "[warn] $*"; }
 err()  { echo "  [fail] $*" >&2; _log "[fail] $*"; }
+
+#: 标准版**本体**的落点（两种布局，判据与 app/paths.py:echo_base() 同一条）。
+#  3.0 布局：代码在 <根>/echo-core → DSH 本体在 <根>/dsh/app（与它并排的是 dsh/home）；
+#  老式扁平安装：代码就在 <根> → <根>/harness/dsh（**老装机不搬**）。
+#  2026-11-02 修：这里以前写死 <根>/harness/dsh，3.0 布局下装完 ECHO 找不到
+#  （harness_proc 只认 <根>/dsh/app 与 <代码根>/harness/dsh），于是又退回 npx、
+#  冷启动 1-2 分钟。现在与 Windows 的 harness-install-local.ps1 一致。
+harness_target() {
+  if [ -f "$DEST/echo-core/app/main.py" ]; then
+    printf '%s' "$DEST/dsh/app"
+  else
+    printf '%s' "$DEST/harness/dsh"
+  fi
+}
 
 #: 查不到 npm registry 时的兜底版本（只是兜底，不是"我们要装的版本"）。
 #  全新机器上 npm 可能还没配好源 / 断网，这时不能因为"查不到最新版"就整个失败。
@@ -245,7 +263,7 @@ if [ -z "$NODE" ]; then
 fi
 ok "node: $NODE"
 
-TARGET="$DEST/harness/dsh"
+TARGET="$(harness_target)"
 ENTRY="$TARGET/node_modules/@deepseek-ai/dsh/lib/bin.js"
 
 if [ -s "$ENTRY" ] && [ -z "$(tree_broken "$TARGET")" ]; then

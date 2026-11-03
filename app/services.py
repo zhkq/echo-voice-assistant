@@ -13,7 +13,7 @@ import time
 import app.db as db
 from app import platform as echo_platform
 
-COMPONENT_ORDER = ["server", "dsh", "harness", "stt", "tts", "hotkey", "meeting", "diarize"]
+COMPONENT_ORDER = ["server", "dsh", "stt", "tts", "hotkey", "meeting", "diarize"]
 
 
 def _set(name, status, detail="", pid=0):
@@ -30,8 +30,12 @@ def report_dsh(status, detail=""):
 
 
 def report_harness(status, detail=""):
-    """独立 DeepSeek Harness（@deepseek-ai/dsh，随 ECHO 启动的那个）的状态。"""
-    _set("harness", status, detail)
+    """**兼容名**（2026-11-03 一套 DSH）：无头 dsh 的上报一律落到唯一的 `dsh` 行。
+
+    以前它是独立组件行（"标准版 harness"）；现在只有一套 DSH，两行并一行。
+    保留函数名只为不改 `harness_proc` 里的全部调用点。
+    """
+    _set("dsh", status, detail)
 
 
 def report_stt(status, detail=""):

@@ -741,11 +741,15 @@ class DshAgent(AgentAdapter):
 
 
 def build():
-    """适配器工厂：注册表按需调用。"""
+    """适配器工厂（**内部使用**：桌面版探测/一套 DSH 的桌面接入）。
+
+    2026-11-03 一套 DSH：注册表里只有一个产品（`agents/harness_agent.py` 的
+    `HarnessAgent`，名字 `dsh`，桌面版/无头两种接入由它自己选）。本类不再单独登记，
+    否则面板上会出现两行"DSH"；这里只作为它的父类 + 桌面版探针用。
+    """
     return DshAgent()
 
 
-# 导入期登记到注册表（懒加载由 agents._autoload 触发）
-from app.agents import register as _register          # noqa: E402
+# 刻意**不** register：一套 DSH 只有一个产品（见上面 build() 的说明）。
+# 旧代码里 `app.dsh.get_desktop_client()` 直接实例化本类即可。
 
-_register(DshAgent, build)

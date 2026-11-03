@@ -3682,8 +3682,6 @@ const SET_META_PATCH = [
                + "（产品自己的开关在高级里，会自动一起打开）。" },
   { key: "agentCodebuddyEnabled", grp: "agent", label: "启用 CodeBuddy Code", value_type: "bool",
     description: "腾讯 CodeBuddy Code（WorkBuddy 内置同一引擎）的启用开关。" },
-  { key: "agentHarnessEnabled", grp: "agent", label: "启用标准版 harness", value_type: "bool",
-    description: "独立 DeepSeek Harness 的启用开关（不装 DSH Desktop 也能用）。" },
 ];
 
 /** 把一批设置行并进 `_settingsCache`：**已有的键不覆盖**（可见行优先），缺的补上。
@@ -5022,7 +5020,8 @@ document.addEventListener("click", (e) => {
       // 是"凭据不下发"的代价，所以 title 里必须写明，不能让人以为点了没反应。
       return {
         post: "/api/harness/browser",
-        title: "在这台跑 ECHO 的电脑上打开标准版 harness 界面（从别的机器/手机看面板时，那个窗口不在这块屏上）",
+        title: "在这台跑 ECHO 的电脑上打开 DSH 界面（桌面版在跑就打开桌面版；"
+               "从别的机器/手机看面板时，那个窗口不在这块屏上）",
       };
     }
     return { href: "?view=agent", title: "去「智能体」页看它是哪个、怎么切" };

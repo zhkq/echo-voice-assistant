@@ -443,8 +443,23 @@ function Copy-ExtractedTree {
         New-Item -ItemType Directory -Path $dst -Force | Out-Null
     }
     Info ("不解压，直接复制已解开的包到 {0}（约 10 MB，比解压快得多）" -f $dst)
-    foreach ($item in @(Get-ChildItem $src -Force)) {
-        Copy-Item -LiteralPath $item.FullName -Destination $dst -Recurse -Force
+    # 2026-11-03 真机：从**微信/企业微信的缓存目录**里双击安装时，源路径能到 300+ 字符，
+    # `Copy-Item` 在 >260 字符时报「未能找到路径“…”的一部分」——看着像包缺文件，
+    # 其实是 MAX_PATH。robocopy 原生支持长路径，改用它；没有 robocopy 才退回 Copy-Item。
+    $robocopy = Get-Command robocopy.exe -ErrorAction SilentlyContinue
+    if ($robocopy) {
+        & $robocopy.Source $src $dst /E /COPY:DAT /R:1 /W:1 /NFL /NDL /NJH /NJS /NP | Out-Null
+        $rc = $LASTEXITCODE
+        # robocopy: 0=无变化、1=有复制、2/3=有额外项、4/5/6/7=含失败但仍部分完成；
+        # >=8 才是真失败（我们把它当"复制失败"报出来）。
+        if ($rc -ge 8) {
+            Err ("复制已解开的包失败（robocopy exit={0}）：{1} -> {2}" -f $rc, $src, $dst)
+            exit 1
+        }
+    } else {
+        foreach ($item in @(Get-ChildItem $src -Force)) {
+            Copy-Item -LiteralPath $item.FullName -Destination $dst -Recurse -Force
+        }
     }
     Set-PackageKind -Dir $dst -Verb '复制完成'
 }

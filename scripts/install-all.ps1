@@ -23,13 +23,13 @@
 #   powershell -NoProfile -ExecutionPolicy Bypass -File <kit>\echo-core\scripts\install-all.ps1 `
 #       -Offline -Yes -Agent none
 #
-#   # 2026-10-31 起只有一个客户端档：runtime-core + 依赖（无本地 STT 模型），
-#   # 指令/回顾/会议转写全部走能力后端（Qwen3-ASR）。
-#   ... -Agent harness -Root D:\ECHO
+#   # 2026-11-03 起只有**一套 DSH**（官方桌面端自带的 dsh；ECHO 负责拉起）：
+#   # 没有"标准版 harness"，也不再需要 Node/npm。
+#   ... -Agent dsh -Root D:\ECHO
 #
 # 同事那一份 kit 根上还有个 **双击入口**（`装我.cmd`，由 build_kit.py 从
 # delivery\kit-install.cmd 放进去）：它只问一句"装到哪个目录"，然后调本脚本
-# （`-Profile minimal -Agent harness -Yes`，发现同目录有 bundle\ 就自动加 -Offline）。
+# （`-Profile minimal -Agent dsh -Yes`，发现同目录有 bundle\ 就自动加 -Offline）。
 #
 # 参数
 # ----
@@ -37,18 +37,12 @@
 #                            两个取值行为相同；保留参数只为兼容老脚本。
 #   -Root <安装根>           数据/模型/运行时都在它下面，代码进 <根>\echo-core。
 #                            默认 D:\ECHO（没有 D 盘就 C:\ECHO）
-#   -Agent none|harness|dsh  智能体。**离线默认 none**：离线包里不带 DSH/harness
-#                            （@deepseek-ai/dsh 是私有 npm 包，许可上不随包分发）
-#   -HarnessSource auto|desktop|npm
-#                            harness 从哪来（默认 auto）：
-#                            auto=先用已装的官方 DeepSeek Harness 桌面端，没有就联网
-#                            下载官方安装包静默安装，再失败才回退本地 npm；
-#                            desktop=没有就下载官方桌面端；npm=只走旧的 node/npm 本地安装。
+#   -Agent none|harness|dsh  智能体。默认 dsh（一套 DSH）。`harness` 已退役：
+#                            传它会打印警告并按 dsh 处理（保留只为兼容老命令行）。
+#   -HarnessSource ...       已退役（保留只为兼容；官方桌面端永远用最高优先级）。
 #   -DesktopInstallDir <目录> 官方桌面端安装目录（留空=官方默认位置）
-#   -DshDir <目录>           已有 DSH 的安装目录（含 node_modules\@deepseek-ai\dsh\lib\bin.js
-#                            的那一层）。给了就不装 npm 包，只探测 + 写 harnessCommand。
-#   -AskDsh                 允许交互问"已有 DSH 吗"；用户选有则循环输入目录并探测。
-#                            kit 的全新安装会传；无人值守/agent 默认不传（行为不变）。
+#   -DshDir <目录>           已退役（一套 DSH 不再探测"已有 DSH 目录"）
+#   -AskDsh                 已退役（保留只为兼容老命令行）
 #   -Offline                 离线模式：依赖只从 bundle\wheels 装（pip 带
 #                            --no-index --find-links）；客户端没有模型，bundle\models 可以不存在
 #   -Yes                     无人值守：不提问、全默认
@@ -74,7 +68,9 @@
 param(
     [ValidateSet('minimal', 'main')][string]$Profile = 'minimal',
     [Alias('DestDir')][string]$Root = '',
-    [ValidateSet('none', 'harness', 'dsh')][string]$Agent = '',
+    # 2026-11-03 一套 DSH：智能体只有 dsh（官方桌面端自带的那份 dsh，ECHO 负责拉起）。
+    # `harness` 仅为兼容旧命令行保留：装配脚本会警告并当成 dsh 处理。
+    [ValidateSet('none', 'harness', 'dsh')][string]$Agent = 'dsh',
     [ValidateSet('auto', 'desktop', 'npm')][string]$HarnessSource = 'auto',
     [string]$DesktopInstallDir = '',
     [string]$DshDir = '',

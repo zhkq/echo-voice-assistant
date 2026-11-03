@@ -635,31 +635,27 @@ def api_capability_backend_compose_write(_auth=Depends(optional_auth)):
 def api_status(_auth=Depends(optional_auth)):
     from app import agents
     selected = agents.selected_name()
+    # 2026-11-03 一套 DSH：只有一行状态，顺手校准一次（桌面版 43120 或 ECHO 起的无头 dsh）。
     dsh_ok = manager.dsh_ready()
-    if selected and selected != "dsh":
-        # 用户选的是**别的**智能体：不要拿桌面版的探活结果去覆盖组件状态。
-        # 那会把 boot 写好的「未使用」又改回 offline，于是 /api/status 与 /api/boot/status
-        # 对同一件事两种说法（2026-09-22 同事反馈 3.4）；折叠条也从这里取状态。
-        services.report_dsh("skipped",
-                            "未使用（你选的是 %s）" % agents.meta(selected)["displayName"])
-    else:
-        services.report_dsh("online" if dsh_ok else "offline",
-                            "API 可访问" if dsh_ok else "未运行")
+    dsh_detail = "API 可访问" if dsh_ok else "未运行"
+    try:
+        from app import harness_proc as _hp
+        if dsh_ok:
+            # 桌面版起来了 → 让出同一个家目录（面板高频轮询，停过一次之后这步是空转）。
+            _hp.yield_to_desktop()
+        elif _hp.desktop_gui_running():
+            # GUI 在、但 43120 不在听 = 没开「普通浏览器访问」：让出（避免双写）并说清怎么修。
+            _hp.yield_to_desktop()
+            dsh_detail = ("桌面版在运行但没开「普通浏览器访问」（%s 不监听）—— "
+                          "在桌面版 设置→常规 打开它，或关掉桌面版让 ECHO 起无头 dsh"
+                          % _hp.desktop_url())
+        else:
+            dsh_ok = _hp.online(timeout=0.6)
+            dsh_detail = "API 可访问" if dsh_ok else "未运行"
+    except Exception:
+        pass
+    services.report_dsh("online" if dsh_ok else "offline", dsh_detail)
     components = services.snapshot()
-    # 2026-10-11（用户实测的"状态格陈旧 online 谎报"）：**harness 的状态行要在读取时校准一次**。
-    # 上面那两行的设计是"状态取自组件表、不在这里探活"（对，高频轮询 + codebuddy 那种
-    # 探一次就起一个进程的适配器不能被拖进来），但 harness 的探活只是**一次 HTTP 探测**
-    # （`online()`，1 秒超时、不起进程）。不校准的后果是：**别人把 harness 停了**
-    # （切换器切树 / 手工杀 / 它自己崩了）之后没有任何人重写那一行，于是 43199 明明空着，
-    # 面板与折叠条还一直显示"运行中" —— 用户实测撞到过。
-    # ⚠️ 只有 harness 走这条（dsh 的探活已经在上面 `report_dsh` 里做过；codebuddy 绝不能碰）。
-    if selected == "harness":
-        try:
-            from app import harness_proc
-            harness_proc.sync_status()
-            components = services.snapshot()
-        except Exception:
-            pass                       # 校准失败就用旧值，绝不因为一句话的状态把接口弄挂
     # 2026-10-15（用户实测的"语音合成写着自动、其实是离线"）：**tts 那一行也要在读时校准**。
     # 同一个形状、同一个理由：那句 detail 由 `auto` 到底走在线还是离线决定，而 boot 只在
     # 启动时写一次 —— 之后在线链路断了（edge-tts 被服务端 403）面板还一直写"在线 · edge-tts"。
@@ -694,9 +690,9 @@ def api_status(_auth=Depends(optional_auth)):
     web = relay_mod.web_entry()
     return {
         "components": components,
-        # 顶层 dsh = DSH **桌面版**适配器。skipped 表示"用户选了别的智能体、这个没在用"，
-        # 让消费者能区分"它没选"与"它坏了"（折叠条曾把前者显示成红灯 DSH×）。
-        "dsh": {"online": dsh_ok, "skipped": bool(selected and selected != "dsh")},
+        # 顶层 dsh = **唯一那套 DSH**（桌面版或 ECHO 起的无头 dsh）。一套 DSH 没有"没选它"
+        # 这回事，skipped 恒为 False（保留字段让旧面板/折叠条照常工作）。
+        "dsh": {"online": dsh_ok, "skipped": False},
         "agent": agent_info,
         "stt": stt_st,
         "meeting": st,
@@ -848,27 +844,49 @@ def get_agents(probe: bool = False, _auth=Depends(optional_auth)):
 
 @router.post("/harness/browser")
 def post_harness_browser(_auth=Depends(optional_auth)):
-    """在浏览器里打开独立 harness 的 Web 界面（仪表盘「超级助理」名字后那个小图标）。
+    """在浏览器里打开 **DSH 的 Web 界面**（仪表盘「超级助理」名字后那个小图标）。
 
-    **登录一律走签名 Cookie，先写 Cookie 再开页面**（2026-10-07 用户实测后定的）：
+    2026-11-03 一套 DSH：先看桌面版在不在 ——
+      * 桌面版在跑 → 用 `~/.dsh` 里的签名密钥铸 Cookie，打开 43120（与桌面版同一套）；
+      * 桌面版没开 → 打开 ECHO 起的无头 dsh（43199，token 换 Cookie）。
 
-    为什么不再用 `?token=…`：token **跟着那个进程**，ECHO 每重启一次 harness 就换一枚。
-    旧 token 打开的页面**能加载、但鉴权不过** —— 侧栏没有「工作区」、没有会话列表，
-    而且**没有任何提示**，用户只能看到一片空白（连查两轮才定位到这条）。
-    签名 Cookie 的密钥在**文件**里（`<家目录>/.credentials.yaml`），**不随重启失效**，
-    所以一次点开长期可用。
-
-    仍由**服务端**打开、而不是把凭据下发给页面：Cookie 是密钥，经接口下发等于把它
-    写进前端内存与浏览器历史。响应里只回地址，不回凭据。
+    **登录一律先写 Cookie 再开页面**（2026-10-07 用户实测后定的）：`?token=…` 跟着进程走，
+    ECHO 每重启一次就换一枚，旧 token 打开的页面**能加载但鉴权不过**（空白、无提示）；
+    Cookie 的密钥在文件里（`<家目录>/.credentials.yaml`），不随重启失效。
+    仍由**服务端**打开、别把凭据下发给页面（Cookie 是密钥，经接口下发等于写进前端内存与历史）。
     """
     from app import harness_proc
-    if not harness_proc.online():
-        if not harness_proc.requested():
+    # ---- ① 桌面版在跑：打开桌面版界面（签名 Cookie，43120）
+    if harness_proc.desktop_mode():
+        url = harness_proc.desktop_url() + "/"
+        try:
+            from app.agents.dsh_agent import _load_browser_secret, _make_cookie
+            secret = _load_browser_secret(os.path.join(harness_proc.home(), ".credentials.yaml"))
+            cookie = _make_cookie(url.rstrip("/"), secret_b64=secret) if secret else ""
+        except Exception:
+            cookie = ""
+        if cookie:
+            from app import browser_open
+            ok, detail = browser_open.open_with_cookie(url, cookie)
+            if ok:
+                return {"ok": True, "url": url,
+                        "message": "已打开 DSH 桌面版界面 %s（已自动登录）" % url}
             return {"ok": False,
-                    "message": "标准版 harness 没在运行：在 设置 → 智能体 里选中"
-                               "「标准版 harness」，ECHO 会自动拉起它"}
-        return {"ok": False, "message": "独立 harness 没在监听 %s（看 data/logs/harness.log）"
-                                        % harness_proc.base_url()}
+                    "message": "打不开桌面版界面：%s（%s）——也可直接在桌面版窗口里操作"
+                               % (detail or "Cookie 注入失败", url)}
+        return {"ok": False,
+                "message": "桌面版在跑，但读不到它的登录密钥（%s）："
+                           "去桌面版里登录一次/打开「普通浏览器访问」，或直接用它自己的窗口"
+                           % os.path.join(harness_proc.home(), ".credentials.yaml")}
+    # ---- ② 桌面版没开：打开 ECHO 起的无头 dsh
+    if not harness_proc.online():
+        if harness_proc.desktop_gui_running():
+            return {"ok": False,
+                    "message": "桌面版在运行，但没开「普通浏览器访问」（%s 不监听）—— "
+                               "在桌面版「设置 → 常规」打开它，或关掉桌面版让 ECHO 起无头 dsh"
+                               % harness_proc.desktop_url()}
+        return {"ok": False,
+                "message": "DSH 没在运行：面板上点「启动」（或打开桌面版，ECHO 会自动改用它）"}
     url = harness_proc.base_url() + "/"
 
     # ① 正路：密钥铸 Cookie → 独立 profile 的 Edge 注入 Cookie 后打开
@@ -3384,13 +3402,33 @@ def voiceprint_audition(vid: int, _auth=Depends(optional_auth)):
 # ---------------------------------------------------------------- 控制
 @router.post("/control/dsh/start")
 def control_dsh_start(_auth=Depends(optional_auth)):
-    ok, msg = manager.dsh_start()
+    """启动/重试**唯一那套 DSH**（面板启动页「启动/重试」与安装器都调它）。
+
+    桌面版在跑 → 直接用它；没开 → ECHO 起无头 dsh（共用 ~/.dsh）。
+    """
+    from app import boot, harness_proc
+    if manager.dsh_ready():
+        msg = "DSH 桌面版已在运行（%s），ECHO 直接使用它" % harness_proc.desktop_url()
+        services.report_dsh("online", msg)
+        return {"ok": True, "message": msg}
+    ok, msg = harness_proc.ensure_running()
+    try:
+        boot.refresh_agent_rows()
+    except Exception:
+        pass
     return {"ok": ok, "message": msg}
 
 
 @router.post("/control/dsh/stop")
 def control_dsh_stop(_auth=Depends(optional_auth)):
-    ok, msg = manager.dsh_stop()
+    """停止 **ECHO 自己拉起的** 无头 dsh（桌面版不归 ECHO 停）。"""
+    from app import harness_proc
+    ok, msg = harness_proc.stop(reason="面板/接口手动停止")
+    try:
+        from app import boot
+        boot.refresh_agent_rows()
+    except Exception:
+        pass
     return {"ok": ok, "message": msg}
 
 

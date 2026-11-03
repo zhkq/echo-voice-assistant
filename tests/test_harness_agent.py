@@ -298,18 +298,22 @@ class HarnessAuthTests(_Base):
 
     def test_available_explains_when_not_running(self):
         with patch.object(harness_proc, "online", lambda timeout=1.0: False), \
-                patch.object(harness_proc, "requested", lambda: False):
+                patch.object(harness_proc, "desktop_mode", lambda timeout=0.8: False), \
+                patch("app.config.settings.get",
+                      lambda k, d=None: True if k == "dshAutoStart" else d):
             ok, why = self._dead_agent().available()
         self.assertFalse(ok)
-        self.assertIn("没在运行", why)
-        self.assertIn("选为当前智能体", why, "要给出可操作的做法")
+        self.assertIn("没在监听", why)
+        self.assertIn("harness.log", why, "要指向日志")
 
-    def test_available_explains_after_being_requested(self):
+    def test_available_explains_when_auto_start_is_off(self):
         with patch.object(harness_proc, "online", lambda timeout=1.0: False), \
-                patch.object(harness_proc, "requested", lambda: True):
+                patch.object(harness_proc, "desktop_mode", lambda timeout=0.8: False), \
+                patch("app.config.settings.get",
+                      lambda k, d=None: False if k == "dshAutoStart" else d):
             ok, why = self._dead_agent().available()
         self.assertFalse(ok)
-        self.assertIn("harness.log", why, "要指向日志，并提示 npx 全路径这个常见坑")
+        self.assertIn("关掉了", why, "要说清是设置关的、面板点启动即可")
 
 
 class HarnessAgentRegistryTests(unittest.TestCase):
@@ -331,42 +335,34 @@ class HarnessAgentRegistryTests(unittest.TestCase):
         db.DATA_DIR, db.DB_FILE = cls._old
         shutil.rmtree(cls.tmp, ignore_errors=True)
 
-    def test_harness_is_registered_and_listed(self):
+    def test_the_single_dsh_is_registered_and_listed(self):
         from app import agents
-        self.assertIn("harness", agents.names())
+        self.assertIn("dsh", agents.names())
+        self.assertNotIn("harness", agents.names(), "标准版 harness 已退役（2026-11-03）")
         got = {a["name"]: a for a in agents.list_agents()}
-        h = got["harness"]
+        h = got["dsh"]
         self.assertTrue(h["displayName"])
-        # **展示名必须与桌面版不同**：本适配器继承 DshAgent，漏写 display_name 就会继承父类的
-        # "DSH Desktop"，面板上两行一模一样（2026-09-22 用户看着截图报的就是这个）。
-        self.assertNotEqual(h["displayName"], got["dsh"]["displayName"],
-                            "标准版 harness 不能与 DSH Desktop 同名（漏写就继承父类）")
-        self.assertIn("标准版", h["displayName"])
+        self.assertIn("DSH", h["displayName"])
         from app.agents.dsh_agent import DshAgent
         from app.agents.harness_agent import HarnessAgent
         self.assertEqual(HarnessAgent.display_name, h["displayName"])
         self.assertNotEqual(HarnessAgent.display_name, DshAgent.display_name,
                             "必须在子类里显式覆盖 display_name")
-        self.assertFalse(h["enabled"], "默认不启用（选了才随 ECHO 启动）")
+        self.assertTrue(h["enabled"], "一套 DSH 恒启用（没有启用开关）")
         keys = {s["key"] for s in h["settings"]}
-        self.assertIn("harnessCommand", keys)
+        self.assertIn("dshAutoStart", keys)
         self.assertIn("harnessPort", keys)
-        # 密钥行要下发（面板得有那一栏让用户填），但只报"配没配"，值永不出接口
-        token_row = [s for s in h["settings"] if s["key"] == "harnessToken"]
-        self.assertEqual(len(token_row), 1, "token 行应在，供面板渲染密码框")
-        self.assertTrue(token_row[0].get("secret"))
-        self.assertEqual(token_row[0].get("value"), "")
-        self.assertIn("hasValue", token_row[0])
 
     def test_config_keys_are_agent_group_and_hidden(self):
-        for key in ("agentHarnessEnabled", "harnessHome", "harnessPort",
-                    "harnessCommand", "harnessToken"):
+        for key in ("dshAutoStart", "dshHome", "harnessPort", "harnessCommand"):
             with self.subTest(key=key):
                 meta = DEFAULTS[key]
                 self.assertEqual(meta["grp"], "agent")
                 self.assertTrue(meta.get("hidden"))
-        self.assertTrue(DEFAULTS["harnessToken"].get("secret"))
-        self.assertIn("harness", DEFAULTS["agentBackend"]["options"])
+        self.assertTrue(DEFAULTS["harnessToken"].get("deprecated"),
+                        "退役的 token 项要标 deprecated（面板不再渲染）")
+        self.assertNotIn("harness", DEFAULTS["agentBackend"]["options"])
+        self.assertIn("dsh", DEFAULTS["agentBackend"]["options"])
 
     def test_find_workspace_reads_its_own_home_registry(self):
         """harness 的 `find_workspace` 必须读**自己家目录**的 workspace.json。
@@ -425,23 +421,66 @@ class HarnessProcTests(unittest.TestCase):
         harness_proc.set_token("")
         harness_proc._proc, harness_proc._proc_pid = None, 0
         harness_proc._last_launch = 0.0
+        # 2026-11-03 一套 DSH：`ensure_running()` 会先探桌面版、再迁移旧家目录。
+        # 两条都必须打桩 —— 否则测试会读真实 43120、并把真实旧家目录搬进 `~/.dsh`。
+        self._desktop = patch.object(harness_proc, "desktop_mode", lambda timeout=0.8: False)
+        self._desktop.start()
+        self.addCleanup(self._desktop.stop)
+        self._gui = patch.object(harness_proc, "desktop_gui_running", lambda: False)
+        self._gui.start()
+        self.addCleanup(self._gui.stop)
+        self._migrate = patch.object(
+            harness_proc, "migrate_legacy_home",
+            lambda: {"ok": True, "skipped": ["测试隔离：不碰真实家目录"]})
+        self._migrate.start()
+        self.addCleanup(self._migrate.stop)
 
-    def test_requested_needs_both_selection_and_switch(self):
-        """判定是"与"：切走就停（否则 node 会一直挂着 —— 实测踩过）。"""
+    def test_requested_when_the_desktop_is_not_running(self):
+        """一套 DSH：只有"当前智能体是 DSH、且桌面版没在跑"时才由 ECHO 起无头。"""
         def fake(**kw):
             return lambda k, d=None: kw.get(k, d)
-        # 选中 + 开关开 → 起
-        with patch("app.config.settings.get",
-                   fake(agentBackend="harness", agentHarnessEnabled=True)):
+
+        with patch("app.config.settings.get", fake(agentBackend="dsh")), \
+                patch.object(harness_proc, "desktop_mode", lambda timeout=0.8: False):
             self.assertTrue(harness_proc.requested())
-        # 切走（开关还开着）→ 停
-        with patch("app.config.settings.get",
-                   fake(agentBackend="dsh", agentHarnessEnabled=True)):
+        # 桌面版在跑 → 直接用桌面版，不另起无头进程
+        with patch("app.config.settings.get", fake(agentBackend="dsh")), \
+                patch.object(harness_proc, "desktop_mode", lambda timeout=0.8: True):
             self.assertFalse(harness_proc.requested())
-        # 选中但被关掉 → 停
-        with patch("app.config.settings.get",
-                   fake(agentBackend="harness", agentHarnessEnabled=False)):
+        # 用户选了别的智能体（CodeBuddy）→ 也不起
+        with patch("app.config.settings.get", fake(agentBackend="codebuddy")), \
+                patch.object(harness_proc, "desktop_mode", lambda timeout=0.8: False):
             self.assertFalse(harness_proc.requested())
+
+    def test_yield_to_desktop_stops_only_our_engine(self):
+        """桌面版起来时，ECHO 必须**让出**同一个 DSH 家目录（停掉自己起的无头 dsh）。"""
+        with patch.object(harness_proc, "desktop_mode", lambda timeout=0.8: True), \
+                patch.object(harness_proc, "started_by_echo", lambda: True), \
+                patch.object(harness_proc, "stop",
+                             lambda **kw: (True, "已让出同一个家目录")):
+            out = harness_proc.yield_to_desktop()
+        self.assertTrue(out["yielded"], out)
+        self.assertIn("让出", out["detail"])
+
+    def test_yield_does_nothing_without_a_desktop(self):
+        with patch.object(harness_proc, "desktop_mode", lambda timeout=0.8: False), \
+                patch.object(harness_proc, "desktop_gui_running", lambda: False), \
+                patch.object(harness_proc, "stop") as stop:
+            out = harness_proc.yield_to_desktop()
+        self.assertFalse(out["yielded"])
+        stop.assert_not_called()
+
+    def test_ensure_running_refuses_to_spawn_when_the_gui_is_up_but_not_open(self):
+        """GUI 开着但 43120 不监听（没开普通浏览器访问）→ **不另起无头**，否则双写家目录。"""
+        with patch.object(harness_proc, "desktop_mode", lambda timeout=0.8: False), \
+                patch.object(harness_proc, "desktop_gui_running", lambda: True), \
+                patch.object(harness_proc, "migrate_legacy_home",
+                             lambda: {"ok": True, "skipped": ["测试隔离"]}), \
+                patch("subprocess.Popen") as popen:
+            ok, msg = harness_proc.ensure_running()
+        self.assertFalse(ok)
+        self.assertIn("普通浏览器访问", msg)
+        popen.assert_not_called()
 
     def test_online_true_for_any_http_response(self):
         srv = ThreadingHTTPServer(("127.0.0.1", 0), _HarnessStub)
@@ -547,15 +586,13 @@ class HarnessProcTests(unittest.TestCase):
         self.assertIn("4242", msgs[-1])
 
     def test_every_stop_call_site_gives_a_reason(self):
-        """四处停止点都要带原因 —— 漏一处，下次还是查不出来。"""
+        """每个停止点都要带原因 —— 漏一处，下次还是查不出来。"""
         import inspect
 
         from app import boot, settings_effects
         for mod, fname in ((boot, "_stop_harness"), (settings_effects, "_agent")):
             src = inspect.getsource(getattr(mod, fname))
             self.assertIn("stop(reason=", src, "%s.%s 里的停止没写原因" % (mod.__name__, fname))
-        boot_src = inspect.getsource(boot._start_harness)
-        self.assertIn("stop(reason=", boot_src, "启动自愈的停止没写原因")
         token_src = inspect.getsource(harness_proc.ensure_token)
         self.assertIn("stop(reason=", token_src, "换 token 的重启没写原因")
 
@@ -702,61 +739,90 @@ class HarnessProcTests(unittest.TestCase):
 
     def test_status_detail_speaks_plainly(self):
         with patch.object(harness_proc, "online", lambda timeout=1.0: False), \
-                patch.object(harness_proc, "requested", lambda: False):
+                patch.object(harness_proc, "desktop_mode", lambda timeout=0.8: False), \
+                patch("app.config.settings.get",
+                      lambda k, d=None: False if k == "dshAutoStart" else d):
             status, detail = harness_proc.status_detail()
-        self.assertEqual(status, "disabled")
-        self.assertIn("未启用", detail)
+        self.assertIn(status, ("disabled", "offline"))
+        self.assertTrue(detail)
 
-    def test_home_is_separate_from_desktop(self):
-        """独立 harness 的 DSH_HOME 不能是 Desktop 的 ~/.dsh（否则两边抢同一份会话）。"""
+    def test_home_is_the_shared_desktop_home(self):
+        """一套 DSH：无头 dsh 与桌面版**共用** `~/.dsh`（所以会话/技能只有一份）。
+
+        2026-11-03 用户拍板：`DSH_HOME` 指向官方桌面端家目录；不再有 ECHO 私有的一份。
+        """
         h = harness_proc.home()
         self.assertTrue(h)
-        self.assertNotIn(os.path.join(".dsh", ""), h + os.sep)
+        self.assertEqual(os.path.normcase(h),
+                         os.path.normcase(os.path.join(os.path.expanduser("~"), ".dsh")))
+
+
+class DesktopGuiDetectionTests(unittest.TestCase):
+    """桌面版 **GUI** 与 ECHO 起的无头 CLI 是同一个 exe 名 —— 必须靠命令行区分。
+
+    2026-11-03 真机：GUI 开着、普通浏览器访问没开 → 43120 不监听。只靠端口会判成
+    "桌面版没开"，于是 ECHO 再起无头 → 两个进程写同一个 `~/.dsh`。
+    """
+
+    def test_a_gui_without_browser_access_is_still_detected(self):
+        with patch("app.platform.pids_of", lambda name: [4321]), \
+                patch("app.platform.process_command_line",
+                      lambda pid: '"C:\\...\\DeepSeek Harness.exe"'), \
+                patch.object(harness_proc, "_load_pid", lambda: 0):
+            self.assertTrue(harness_proc.desktop_gui_running())
+
+    def test_our_own_headless_cli_is_not_the_gui(self):
+        with patch("app.platform.pids_of", lambda name: [4321]), \
+                patch("app.platform.process_command_line",
+                      lambda pid: '...app.asar\\dsh\\node_modules\\...\\cli.js web --port 43199 --no-open'), \
+                patch.object(harness_proc, "_load_pid", lambda: 0):
+            self.assertFalse(harness_proc.desktop_gui_running())
+
+    def test_no_process_is_not_a_gui(self):
+        with patch("app.platform.pids_of", lambda name: []):
+            self.assertFalse(harness_proc.desktop_gui_running())
 
 
 class HarnessBootTests(unittest.TestCase):
-    """随 ECHO 启动：boot 里有这个组件；没选中时不拉起。"""
+    """一套 DSH 的启动页：只有一行 dsh（2026-11-03）。"""
 
-    def test_boot_registers_the_harness_component(self):
+    def test_boot_registers_the_single_dsh_component(self):
         from app import boot
         boot.setup()
         ids = [c["id"] for c in boot.snapshot()["components"]]
-        self.assertIn("harness", ids)
-        c = [x for x in boot.snapshot()["components"] if x["id"] == "harness"][0]
+        self.assertIn("dsh", ids)
+        self.assertNotIn("harness", ids, "标准版 harness 行已退役")
+        c = [x for x in boot.snapshot()["components"] if x["id"] == "dsh"][0]
         self.assertTrue(c["can_start"])
         self.assertTrue(c["can_stop"], "ECHO 自己起的进程要能停")
 
-    def test_start_step_skips_when_not_requested(self):
+    def test_start_step_skips_when_auto_start_is_off(self):
         from app import boot
         seen = {}
-        with patch.object(harness_proc, "requested", lambda: False), \
-                patch.object(harness_proc, "_load_pid", lambda: 0), \
-                patch.object(harness_proc, "started_by_echo", lambda: False):
-            boot._start_harness(lambda **kw: seen.update(kw))
-        # skipped 而不是 disabled：两个智能体是二选一，没选它算"未使用"，
-        # 不该计入启动页的"失败"（2026-09-22 同事反馈：选了标准版却报 DSH 执行引擎失败）
+        with patch("app.config.settings.get",
+                   lambda k, d=None: False if k == "dshAutoStart" else d):
+            boot._start_dsh(lambda **kw: seen.update(kw))
         self.assertEqual(seen.get("status"), "skipped")
 
-    def test_start_step_cleans_up_a_leftover_when_not_requested(self):
-        """没选中但上次是我们起的 → 启动时收尾（自愈，免得 node 一直挂着）。"""
+    def test_start_step_uses_the_desktop_when_it_is_running(self):
         from app import boot
         seen = {}
-        with patch.object(harness_proc, "requested", lambda: False), \
-                patch.object(harness_proc, "_load_pid", lambda: 4242), \
-                patch.object(harness_proc, "stop", lambda **kw: (True, "已停止独立 harness")):
-            boot._start_harness(lambda **kw: seen.update(kw))
-        self.assertEqual(seen.get("status"), "skipped")
-        self.assertIn("收尾", seen.get("detail", ""))
+        with patch("app.config.settings.get",
+                   lambda k, d=None: True if k == "dshAutoStart" else d), \
+                patch("app.manager.dsh_ready", return_value=True):
+            boot._start_dsh(lambda **kw: seen.update(kw))
+        self.assertEqual(seen.get("status"), "online")
+        self.assertIn("桌面版", seen.get("detail", ""))
 
-    def test_start_step_launches_when_requested(self):
+    def test_start_step_launches_the_headless_engine_when_needed(self):
         from app import boot
         seen = {}
-        with patch.object(harness_proc, "requested", lambda: True), \
+        with patch("app.config.settings.get",
+                   lambda k, d=None: True if k == "dshAutoStart" else d), \
+                patch("app.manager.dsh_ready", return_value=False), \
                 patch.object(harness_proc, "ensure_running", lambda: (True, "已启动(测试)")), \
                 patch.object(boot, "_register_router_after_agent_start"):
-            # 那条"注册 ECHO AUTO"的路会真的写 DSH 配置文件，这里换成替身 ——
-            # 本用例只关心 `_start_harness` 报了什么状态。
-            boot._start_harness(lambda **kw: seen.update(kw))
+            boot._start_dsh(lambda **kw: seen.update(kw))
         self.assertEqual(seen.get("status"), "online")
         self.assertIn("测试", seen.get("detail", ""))
 
@@ -788,16 +854,15 @@ class ClientFollowsSelectionTests(unittest.TestCase):
         db.DATA_DIR, db.DB_FILE = self._old
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def test_get_client_follows_the_selected_agent(self):
+    def test_get_client_returns_the_single_dsh(self):
+        """2026-11-03 一套 DSH：`get_client()` 恒返回唯一那个 DSH（旧值 harness 归一成 dsh）。"""
         from app.agents import dsh_agent as _dsh_mod
         from app.agents import harness_agent as _harness_mod
         from app.dsh import get_client, get_desktop_client
 
         def fake_get(key, default=None):
             if key == "agentBackend":
-                return "harness"
-            if key == "agentHarnessEnabled":
-                return True
+                return "harness"          # 旧库里的退役值
             return default
 
         from app import agents
@@ -807,9 +872,8 @@ class ClientFollowsSelectionTests(unittest.TestCase):
                 patch.object(_dsh_mod.DshAgent, "available",
                              lambda self, probe=False: (True, "")):
             agents.reset()
-            self.assertEqual(get_client().name, "harness",
-                             "选了独立 harness，命令就该发给它")
-        # 桌面版进程管理仍要指名 DSH（与用户选谁无关）
+            self.assertEqual(get_client().name, "dsh")
+        # 桌面版探测仍指名同一个适配器（内部用它拿 43120）
         self.assertEqual(get_desktop_client().name, "dsh")
 
     def test_session_is_invalidated_when_backend_changes(self):
@@ -826,24 +890,24 @@ class ClientFollowsSelectionTests(unittest.TestCase):
         self.assertEqual(row["agent"], "harness")
         self.assertEqual(row["session_id"], "session-x")
 
-    def test_ensure_session_creates_a_new_one_for_the_new_backend(self):
-        """端到端语义：库里是 Desktop 的会话 → 切到 harness 后要**新建**一个。"""
+    def test_ensure_session_creates_a_new_one_when_the_owner_changed(self):
+        """端到端语义：库里是**旧后端**的会话 → 换成唯一 DSH 后要**新建**一个。"""
         from app.agents.harness_agent import HarnessAgent
-        db.upsert_session("command", "session-desktop", "命令会话", agent="dsh")
+        db.upsert_session("command", "session-legacy", "命令会话", agent="legacy-harness")
         a = HarnessAgent()
         created = {"n": 0}
 
         def fake_new(self, ws):
             created["n"] += 1
-            return "session-harness"
+            return "session-dsh"
 
         with patch.object(HarnessAgent, "_new_default_session", fake_new):
             sid = a.ensure_command_session("测试一下")
-        self.assertEqual(sid, "session-harness")
-        self.assertEqual(created["n"], 1, "必须新建，而不是沿用 Desktop 的会话")
+        self.assertEqual(sid, "session-dsh")
+        self.assertEqual(created["n"], 1, "必须新建，而不是沿用旧后端的会话")
         row = dict(db.get_session("command"))
-        self.assertEqual(row["agent"], "harness")
-        self.assertEqual(row["session_id"], "session-harness")
+        self.assertEqual(row["agent"], "dsh")
+        self.assertEqual(row["session_id"], "session-dsh")
 
     # ---------------------------------------------------------------- 空闲轮换
     # 2026-10-08 用户定：单位的 DeepSeek 上下文有限，**换话题的时间阈值缩到 15 分钟**
@@ -878,7 +942,7 @@ class ClientFollowsSelectionTests(unittest.TestCase):
         所以这里把 `session_cwd` 打桩成**目标工作区**，把那条判据隔离掉。
         """
         import datetime as _dt
-        db.upsert_session("command", "session-idle", "命令会话", agent="harness")
+        db.upsert_session("command", "session-idle", "命令会话", agent="dsh")
         when = (_dt.datetime.now() - _dt.timedelta(minutes=minutes)
                 ).strftime("%Y-%m-%d %H:%M:%S")
         db._exec("UPDATE dsh_sessions SET last_used_at=? WHERE kind='command'", (when,))
@@ -1101,12 +1165,12 @@ class HarnessBrowserOpenTests(unittest.TestCase):
     def test_offline_tells_you_what_to_do_without_opening(self):
         opened = []
         with patch.object(harness_proc, "online", lambda timeout=1.0: False), \
-                patch.object(harness_proc, "requested", lambda: False), \
+                patch.object(harness_proc, "desktop_mode", lambda timeout=0.8: False), \
                 patch("app.platform.shell_open", lambda url, params="": opened.append(url)):
             body = self.client.post("/api/harness/browser").json()
         self.assertFalse(body["ok"])
         self.assertEqual(opened, [], "没在跑就不该弹浏览器")
-        self.assertIn("设置 → 智能体", body["message"])
+        self.assertIn("启动", body["message"])
 
     def test_shell_failure_is_reported(self):
         with patch.object(harness_proc, "online", lambda timeout=1.0: True), \

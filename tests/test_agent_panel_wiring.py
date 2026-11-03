@@ -43,12 +43,11 @@ class DisplayNameTests(unittest.TestCase):
         names = [a["displayName"] for a in agents.list_agents()]
         self.assertEqual(len(names), len(set(names)), "面板上出现同名行：%s" % names)
 
-    def test_dsh_and_harness_are_told_apart(self):
+    def test_there_is_exactly_one_dsh_product(self):
         from app import agents
         got = {a["name"]: a["displayName"] for a in agents.list_agents()}
-        self.assertEqual(got["dsh"], "DSH Desktop")
-        self.assertIn("标准版", got["harness"])
-        self.assertIn("DeepSeek Harness", got["harness"])
+        self.assertEqual(got["dsh"], "DSH（DeepSeek Harness）")
+        self.assertNotIn("harness", got, "标准版 harness 已退役（2026-11-03 一套 DSH）")
 
 
 class PanelWordingTests(unittest.TestCase):
@@ -90,17 +89,13 @@ class ShortNameTests(unittest.TestCase):
         self.assertEqual(got["name"], "no-such-agent")
         self.assertIn("shortName", got)
 
-    def test_selected_name_is_the_raw_setting_not_the_fallback(self):
-        """`selected_name()` 回答"用户选的是哪个"，不做可用性降级探测。
-
-        这正是折叠条与安装脚本需要的口径 —— 拿**另一个**适配器的状态去报失败，
-        就是 2026-09-22 那两次"红灯/假失败"的根。
-        """
+    def test_retired_harness_value_is_normalized_to_dsh(self):
+        """旧库里的 `agentBackend=harness` 归一成 `dsh`（一套 DSH，不出现"幽灵产品"）。"""
         from unittest.mock import patch
         from app import agents
         from app.config import settings
         with patch.object(settings, "get", lambda k, d=None: "harness" if k == "agentBackend" else d):
-            self.assertEqual(agents.selected_name(), "harness")
+            self.assertEqual(agents.selected_name(), "dsh")
 
 
 class CurrentAgentIsWhatTheRailShows(unittest.TestCase):
@@ -117,16 +112,12 @@ class CurrentAgentIsWhatTheRailShows(unittest.TestCase):
         self.assertNotIn("st.dsh && st.dsh.online", rail,
                          "折叠条又在直接看顶层 dsh 了 —— 选标准版时会恒红")
 
-    def test_status_exposes_the_selected_agent(self):
+    def test_status_exposes_the_single_engine_and_no_skipped_row(self):
         api = _read("app", "api.py")
         self.assertIn('"agent": agent_info', api, "/api/status 没有透出当前智能体")
-        self.assertIn('"skipped": bool(selected and selected != "dsh")', api,
-                      "顶层 dsh 没有区分「没选它」与「它坏了」")
-
-    def test_status_does_not_clobber_skipped_with_offline(self):
-        """`/api/status` 曾被后来的探活覆写回 offline，两个接口口径打架（同事反馈 3.4）。"""
-        api = _read("app", "api.py")
-        self.assertIn('services.report_dsh("skipped"', api)
+        # 2026-11-03 一套 DSH：顶层 dsh 恒为 on/off，不再有"没选它"这个状态。
+        self.assertIn('"dsh": {"online": dsh_ok, "skipped": False}', api)
+        self.assertNotIn('selected != "dsh"', api)
 
 
 if __name__ == "__main__":

@@ -129,13 +129,10 @@ if defined EXISTING (
   echo     note    : it stops ECHO briefly; refuse if a meeting is recording.
 )
 
-REM Upgrades are interactive (they ask about DSH); fresh installs keep -Yes.
-set "ARGS=-Profile minimal -Agent harness -Root "%ROOT%" -BackendDir "%HERE%""
+REM Upgrades are interactive (they ask about upgrading DSH); fresh installs keep -Yes.
+REM 2026-11-03: one DSH only (the official desktop's dsh; ECHO starts it). No harness anymore.
+set "ARGS=-Profile minimal -Agent dsh -Root "%ROOT%" -BackendDir "%HERE%""
 if not defined EXISTING set "ARGS=%ARGS% -Yes"
-REM Fresh install: ask whether an existing DSH is already on this machine
-REM (install-all.ps1 -AskDsh does the probing). Upgrades already ask about
-REM upgrading DSH, so they deliberately do not pass this.
-if not defined EXISTING set "ARGS=%ARGS% -AskDsh"
 if exist "%KIT%bundle\wheels" (
   set "ARGS=%ARGS% -Offline"
   echo.

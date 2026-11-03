@@ -31,12 +31,21 @@ DshClient = DshAgent
 
 
 def get_client():
-    """取**当前选中的**智能体适配器（单例，由注册表缓存）。"""
+    """取**唯一的 DSH** 适配器（注册表缓存；桌面版/无头由它自己按谁在跑决定）。"""
     from app.agents import active_agent
     return active_agent()
 
 
+_edition = None
+
+
 def get_desktop_client():
-    """指名要 DSH **Desktop** 适配器（进程管理/桌面版专属探测用，不随配置变）。"""
-    from app.agents import get_agent
-    return get_agent("dsh")
+    """指名要 **DSH 桌面版接入**（进程探测/跳转用；不随配置变）。
+
+    2026-11-03 一套 DSH：注册表里只有 `HarnessAgent`（名字 `dsh`，含桌面版接入），
+    本函数返回父类 `DshAgent` 的单例实例，专门回答"桌面版 GUI 在不在"这类问题。
+    """
+    global _edition
+    if _edition is None:
+        _edition = DshAgent()
+    return _edition

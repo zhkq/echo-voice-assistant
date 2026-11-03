@@ -38,9 +38,12 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\install-offline.ps1 -Root 
 
 ## 什么时候还需要联网
 
-* 想要**会议纪要 / 语音指令的智能体**（DSH 标准版）：本包**不含** DSH ——
-  `@deepseek-ai/dsh` 是私有 npm 包，许可上不能随包分发。需要时按 `echo-install` 技能的
-  第 5 节联网装（或直接用已装的 DSH 桌面版）。
+* 想要**会议纪要 / 语音指令的智能体**：本包**不含**官方 DeepSeek Harness 桌面端 ——
+  它约 277 MB，不随 ECHO 交付包分发。需要时先装官方 DeepSeek Harness 桌面端
+  （或让管理员预装），安装器会自动找到它自带的 `resources\runtime\cli\bin\dsh.cmd`。
+  **不需要 Node.js / npm**，也不要再装"标准版 harness"（已退役）。装好后 ECHO 会随启动
+  自动拉起 DSH（设置 `dshAutoStart`，默认开），面板里的**「打开 DSH 界面」**可以跳到它；
+  无头运行不需要登录（第一次打开桌面界面时可能弹一次桌面端登录，按需登录即可）。
 * **客户端没有本地模型可下**（2026-10-31 起全走能力后端）——模型都装在后端那台。
 
 ## 遇到问题

@@ -66,7 +66,9 @@ def apply(updated, *, harness_timeout=None) -> list:
     if any(k.startswith("router") for k in keys):
         out.append(_router(updated))
 
-    if any(k.startswith("agent") or k.startswith("harness") for k in keys):
+    # 2026-11-03 一套 DSH：`dsh*`（dshAutoStart / dshBaseUrl / dshHome）也要走智能体联动。
+    if any(k.startswith("agent") or k.startswith("harness") or k.startswith("dsh")
+           for k in keys):
         out.append(_agent(harness_timeout))
 
     # 转写引擎（`sttModel`/`meetingSttModel`）：2026-10-31 起客户端不再跑本地 STT，
@@ -174,9 +176,10 @@ def _router(updated) -> dict:
 
 
 def _agent(harness_timeout=None) -> dict:
-    """智能体相关项：清实例缓存；独立 harness **随选随起 / 随走随停**。
+    """智能体相关项：清实例缓存；**一套 DSH** 随 `dshAutoStart` 起/停。
 
-    只停 ECHO 自己拉起的那一个（用户手起的实例不动）—— 判据在 `harness_proc.stop()` 里。
+    2026-11-03 一套 DSH：没有"切换智能体"了。改 `dshAutoStart` 就按新值启动或停掉
+    ECHO 自己起的无头 dsh（桌面版不归 ECHO 管，永远不动它）。
     """
     notes, ok = [], True
     try:
@@ -187,21 +190,34 @@ def _agent(harness_timeout=None) -> dict:
         notes.append("清智能体缓存失败：%s" % exc)
     try:
         from app import harness_proc
-        if harness_proc.requested():
-            # 不给超时时**不传这个 kwarg**：现成的测试替身里有 `lambda: (True, "...")`
-            # 这种零参形式，多传一个关键字会把它们打崩。
+        try:
+            from app.config import settings as _s
+            auto = bool(_s.get("dshAutoStart", True))
+        except Exception:
+            auto = True
+        if auto:
             if harness_timeout is None:
                 hok, msg = harness_proc.ensure_running()
             else:
                 hok, msg = harness_proc.ensure_running(timeout=harness_timeout)
             notes.append(str(msg))
             ok = ok and bool(hok)
+        elif harness_proc.started_by_echo() or harness_proc._load_pid():
+            hok, msg = harness_proc.stop(reason="设置里关掉了「随 ECHO 启动 DSH」")
+            notes.append(str(msg))
+            ok = ok and bool(hok)
         else:
-            harness_proc.stop(reason="设置里切走了智能体（agentBackend 不再是 harness）")
-            notes.append("未选中独立 harness，已停掉 ECHO 自己拉起的那个")
+            notes.append("桌面版/手工启动的 dsh 不归 ECHO 管，未动")
     except Exception as exc:
         ok = False
-        notes.append("harness 联动失败：%s" % exc)
+        notes.append("DSH 联动失败：%s" % exc)
+    # 动了智能体就把**启动页**那行按当前实际状态重算（2026-11-03 真机事故：
+    # 装机顺序「服务先起 → 再写设置」，启动页会留着装之前的旧结论）。
+    try:
+        from app import boot as _boot
+        _boot.refresh_agent_rows()
+    except Exception:
+        pass
     # 智能体动了就复核一次 ECHO AUTO 注册：标准版的家目录是"选中它"之后才存在的，
     # 不补这一次，只装标准版的机器要等到下次重启才在 DSH 里选得到 ECHO AUTO。
     # 注册失败只写进 detail（不把设置保存判成失败）：路由本身与智能体都不受影响。

@@ -70,17 +70,118 @@ def base_url():
     return "http://127.0.0.1:%d" % port()
 
 
-def home():
-    """harness 自己的 DSH_HOME（独立于 Desktop 那边，避免两边抢同一份会话/设置）。
+#: 官方 DeepSeek Harness 桌面端（GUI）的本地 web 服务。2026-11-03 起 ECHO 只保留**一套**
+#: DSH：桌面版开着就用它（签名 Cookie），没开才由 ECHO 起无头 dsh（token）。两者共用
+#: 同一个 DSH_HOME（`~/.dsh`），所以会话/技能/工作区只有一份。
+DSH_DESKTOP_URL = "http://127.0.0.1:43120"
 
-    注意：这里刻意**不**去读 Desktop 的家目录常量 —— 本模块只认 `harnessHome` 配置
-    （留空 = `paths.dsh_home_root()`：新布局 `{echoBase}/dsh/home`，老布局 `{DATA}/harness`）。
-    上面那句"独立"就是这个意思：谁也别改谁。
+
+def desktop_url() -> str:
+    """桌面版 web 服务地址（`dshBaseUrl` 设置，缺省 43120）。"""
+    try:
+        return str(settings.get("dshBaseUrl", DSH_DESKTOP_URL) or DSH_DESKTOP_URL).rstrip("/")
+    except Exception:
+        return DSH_DESKTOP_URL
+
+
+def desktop_mode(timeout=0.8) -> bool:
+    """桌面版（GUI）的 web 服务在不在听 —— **任何 HTTP 响应都算**（含 401）。
+
+    为什么要它：一套 DSH 的原则是"同一时刻只有一个进程写这个 DSH 家目录"。桌面版开着时
+    ECHO 直接接它，**不许**再起一个无头 dsh（两个进程写同一个家目录会写坏会话/storages）。
     """
-    raw = str(settings.get("harnessHome", "") or "").strip()
-    from app.config import expand_path
-    if raw:
-        return expand_path(raw)
+    try:
+        urllib.request.urlopen(desktop_url() + "/", timeout=timeout).close()
+        return True
+    except urllib.error.HTTPError:
+        return True
+    except Exception:
+        return False
+
+
+def desktop_gui_running() -> bool:
+    """官方桌面端的 **GUI 进程**在不在（与 ECHO 拉起的无头 CLI 区分开）。
+
+    2026-11-03 真机：桌面版 GUI 开着、但「普通浏览器访问」没开时 **43120 不监听** ——
+    只靠 `desktop_mode()` 会判成"桌面版没开"，于是 ECHO 又起一个无头 dsh，
+    **两个进程同时写同一个 `~/.dsh`**（正是用户不能接受的那种状态）。
+    所以这里按进程判：同名进程里，命令行带 `web --port` 的是无头 CLI，其余算 GUI。
+    判不出命令行（权限不够）时按 GUI 处理 —— 宁可提示"请开普通浏览器访问"，也不要双写。
+    """
+    try:
+        from app import platform as echo_platform
+    except Exception:
+        return False
+    ours = set()
+    try:
+        if _proc_pid:
+            ours.add(int(_proc_pid))
+        if _load_pid():
+            ours.add(int(_load_pid()))
+    except Exception:
+        pass
+    names = ("DeepSeek Harness.exe", "DeepSeek Harness")
+    for name in names:
+        try:
+            pids = echo_platform.pids_of(name) or []
+        except Exception:
+            pids = []
+        for raw in pids:
+            try:
+                pid = int(raw)
+            except Exception:
+                continue
+            if pid in ours:
+                continue
+            try:
+                cmd = str(echo_platform.process_command_line(pid) or "")
+            except Exception:
+                cmd = ""
+            low = cmd.lower()
+            if "web" in low and "--port" in low:
+                continue                      # 无头 CLI（别人的也是 CLI，不是 GUI）
+            if not cmd:
+                return True                   # 判不出命令行：保守按 GUI（避免双写）
+            return True
+    return False
+
+
+def _desktop_cli_candidates() -> list:
+    """官方桌面端 `dsh.cmd` 的候选路径（与安装技能的 harness-install-desktop.ps1 同一批位置）。
+
+    桌面端是**唯一程序来源**（升级跟着它走）；这里只是运行时探测，不做安装。
+    """
+    rel = os.path.join("resources", "runtime", "cli", "bin", "dsh.cmd")
+    out = []
+    local = os.environ.get("LOCALAPPDATA")
+    if local:
+        out.append(os.path.join(local, "Programs", "DeepSeek Harness", rel))
+    for env in ("ProgramFiles", "ProgramFiles(x86)"):
+        base = os.environ.get(env)
+        if base:
+            out.append(os.path.join(base, "DeepSeek Harness", rel))
+    out.append(os.path.join(os.path.expanduser("~"), ".deepseek", "harness", rel))
+    return out
+
+
+def find_desktop_cli() -> str:
+    """找到官方桌面端自带的 `dsh.cmd`（找不到返回空串）。"""
+    for p in _desktop_cli_candidates():
+        try:
+            if os.path.isfile(p) and os.path.getsize(p) > 0:
+                return p
+        except OSError:
+            continue
+    return ""
+
+
+def home():
+    """**DSH_HOME**（会话/技能/设置/凭据）：与桌面版**共用** `~/.dsh`。
+
+    2026-11-03 用户拍板一套 DSH：桌面版与 ECHO 拉起的无头 dsh 用同一个家目录，
+    这样打开桌面版就能看到 ECHO 的会议/指令/回顾会话。走 `paths.dsh_home_root()`：
+    环境变量 ``ECHO_DSH_HOME`` / 隐藏设置 ``dshHome`` 可覆盖（测试与多实例用）。
+    """
     return paths.dsh_home_root()
 
 
@@ -94,12 +195,23 @@ LOCAL_ENTRY_REL_BASE = os.path.join("dsh", "app", "node_modules",
 
 
 def local_entry_paths():
-    """本地入口**可能**在哪（按可能性排序：新布局 → 老布局）。安装与排障用它。"""
+    """本地入口**可能**在哪（按可能性排序：新布局 → 安装技能的落点 → 老布局）。
+
+    第二项是**安装技能在 3.0 布局下**的实际落点。Windows 的 `harness-install-local.ps1`
+    会跟着布局走（`<根>\\dsh\\app`），但 macOS 那份 `.sh` 一度写死 `<根>/harness/dsh` ——
+    于是一个**装好了**的入口 ECHO 找不到，又退回 npx（冷启动 1-2 分钟）。
+    这里把两种落点都认下来：已经装在 `<根>/harness/dsh` 的机器不用重装。
+    """
     first = os.path.join(paths.dsh_root(), "node_modules", "@deepseek-ai", "dsh",
                          "lib", "bin.js")
-    legacy = os.path.join(paths.echo_root(), LOCAL_ENTRY_REL)
     out = [first]
-    if os.path.normcase(legacy) != os.path.normcase(first):
+    base = paths.echo_base()
+    if base:
+        installed = os.path.join(base, LOCAL_ENTRY_REL)
+        if os.path.normcase(installed) != os.path.normcase(first):
+            out.append(installed)
+    legacy = os.path.join(paths.echo_root(), LOCAL_ENTRY_REL)
+    if os.path.normcase(legacy) not in {os.path.normcase(p) for p in out}:
         out.append(legacy)
     return out
 
@@ -142,29 +254,32 @@ def is_default_command(raw) -> bool:
 
 def command():
     raw = str(settings.get("harnessCommand", DEFAULT_COMMAND) or DEFAULT_COMMAND).strip()
-    # 装了本地件、但设置还停在出厂 npx 时自动改走本地入口（老设置/升级上来的机器都受益）。
-    # 只在"用户没改过"时生效 —— 用户自己写的命令一个字都不动。
-    if is_default_command(raw):
-        entry = local_entry()
-        if entry:
-            node = _node_exe()
-            if node:
-                return '"%s" "%s" web' % (node, entry)
+    # 用户自己写过命令就一个字都不动。
+    if not is_default_command(raw):
+        return raw
+    # ① 官方桌面端自带的 dsh CLI（唯一推荐来源：升级跟着桌面端，不用 npm/Node）
+    cli = find_desktop_cli()
+    if cli:
+        return '"%s" web' % cli
+    # ② 老机器上本地永久安装那份（`<根>/dsh/app` 或 `<install>/harness/dsh`）
+    entry = local_entry()
+    if entry:
+        node = _node_exe()
+        if node:
+            return '"%s" "%s" web' % (node, entry)
     return raw
 
 
 def requested():
-    """是否**应该**由 ECHO 把 harness 跑起来：既选中了它、又没被关掉。
+    """ECHO 是否**应该**把无头 dsh 跑起来。
 
-    判定用"与"而不是"或"（2026-09-19 实测踩过）：面板"选中智能体"会把
-    `agentHarnessEnabled` 一起打开，切走时只改 `agentBackend`。若用"或"，切回 DSH 后
-    node 进程会一直挂着（实测：切到 dsh 后 43199 仍在监听），启动页看着像没生效。
-    进程跟着**选择**走，和模型路由那种"常驻服务"不是一回事。
+    2026-11-03 一套 DSH：只有"当前智能体是 DSH、且没有桌面版在跑"时才由 ECHO 起。
+    桌面版开着 = 直接用桌面版，不起第二个进程（两个进程写同一个 `~/.dsh` 会写坏数据）。
     """
     try:
-        if str(settings.get("agentBackend", "") or "").strip() != "harness":
+        if str(settings.get("agentBackend", "") or "").strip() not in ("harness", "dsh"):
             return False
-        return bool(settings.get("agentHarnessEnabled", False))
+        return not desktop_mode()
     except Exception:
         return False
 
@@ -619,18 +734,106 @@ def forget_token():
             pass
 
 
+def _migration_mark_path():
+    return os.path.join(paths.data_root(), "logs", "dsh-home-migrated.txt")
+
+
+def _copy_missing_tree(src, dst):
+    """把 src 下**目标不存在**的文件补进 dst（目录照建，已存在的文件一律不动）。"""
+    for root, _dirs, files in os.walk(src):
+        rel = os.path.relpath(root, src)
+        target = dst if rel == "." else os.path.join(dst, rel)
+        try:
+            os.makedirs(target, exist_ok=True)
+        except Exception:
+            continue
+        for name in files:
+            s = os.path.join(root, name)
+            d = os.path.join(target, name)
+            if os.path.exists(d):
+                continue
+            try:
+                shutil.copy2(s, d)
+            except Exception:
+                pass
+
+
+def migrate_legacy_home() -> dict:
+    """把**旧布局**里 ECHO 自己那份 DSH 家目录的内容并进共用家目录 `~/.dsh`（只补缺）。
+
+    2026-11-03 一套 DSH：以前 ECHO 的会话/技能/AGENTS.md 在 `{echoBase}/dsh/home`
+    （2.x 老装机是 `{DATA}/harness`）。换到共用 `~/.dsh` 后不搬的话，用户在桌面版里
+    看不到历史会议/指令会话。规则：
+
+      * **只补缺、不覆盖** —— 桌面版用户自己的技能/设置/AGENTS.md 一个字都不动；
+      * 幂等：成功后落标记（`{DATA}/logs/dsh-home-migrated.txt`），不重复搬；
+      * 旧目录**保留不删**（用户数据，出问题能回退）。
+
+    返回 ``{ok, target, sources, copied, skipped, marker}``；不抛异常。
+    """
+    out = {"ok": True, "target": home(), "sources": [], "copied": [], "skipped": [],
+           "marker": _migration_mark_path()}
+    try:
+        target = home()
+        if os.path.isfile(out["marker"]):
+            out["skipped"].append("已迁移过（有标记文件）")
+            return out
+        sources = [p for p in paths.legacy_dsh_homes() if os.path.isdir(p)]
+        out["sources"] = sources
+        if not sources:
+            out["skipped"].append("没有旧家目录，无需迁移")
+            return out
+        os.makedirs(target, exist_ok=True)
+        for src in sources:
+            for sub in ("sessions", "storages", "skills", "profiles"):
+                s = os.path.join(src, sub)
+                if os.path.isdir(s):
+                    _copy_missing_tree(s, os.path.join(target, sub))
+                    out["copied"].append(os.path.join(src, sub))
+            for name in ("AGENTS.md", ".credentials.yaml", "settings.yaml"):
+                s = os.path.join(src, name)
+                d = os.path.join(target, name)
+                if os.path.isfile(s) and not os.path.exists(d):
+                    try:
+                        shutil.copy2(s, d)
+                        out["copied"].append(s)
+                    except Exception:
+                        pass
+        os.makedirs(os.path.dirname(out["marker"]), exist_ok=True)
+        with open(out["marker"], "w", encoding="utf-8") as fh:
+            fh.write("migrated %s\n" % time.strftime("%Y-%m-%d %H:%M:%S"))
+            fh.write("target=%s\n" % target)
+            for src in sources:
+                fh.write("source=%s\n" % src)
+    except Exception as exc:
+        out["ok"] = False
+        out["error"] = "%s: %s" % (type(exc).__name__, exc)
+    return out
+
+
 def ensure_running(timeout=None):
-    """确保 harness 在跑。幂等。返回 ``(ok, detail)``。
+    """确保**一套** DSH 在跑。幂等。返回 ``(ok, detail)``。
 
-    ``timeout``：等它就绪的上限（秒），``None`` 用 ``READY_TIMEOUT``（60s，首次 npx 装插件
-    确实要那么久）。向导执行相传一个小值（见 `settings_effects.WIZARD_HARNESS_TIMEOUT`）——
-    它是在 HTTP 请求线程里跑的，不能让"开始准备"卡满一分钟；拉起本身照旧发生，只是不在这里等。
+    2026-11-03 一套 DSH：先问桌面版在不在（43120）。在 → 直接用它，**不另起进程**
+    （两个进程写同一个 `~/.dsh` 会写坏会话/storages）；不在 → 起无头 dsh（token），
+    家目录同样是 `~/.dsh`。
 
-    并发安全：boot 的启动步骤与「切换智能体」的联动可能几乎同时调进来，
-    所以"探活 → 决定是否 Popen"这段必须**串行**（否则会拉起两个实例 ——
-    实测过：43199 与 43206 两个 node 同时在跑）。
+    ``timeout``：等它就绪的上限（秒），``None`` 用 ``READY_TIMEOUT``（60s）。
+    并发安全：boot 与设置联动可能几乎同时调进来，"探活 → 决定是否 Popen"这段必须串行。
     """
     global _proc, _proc_pid, _last_launch
+    try:
+        migrate_legacy_home()          # 旧家目录内容并进来（只补缺，幂等）
+    except Exception:
+        pass
+    if desktop_mode():
+        return True, "DSH 桌面版已在运行（%s），ECHO 直接使用它" % desktop_url()
+    if desktop_gui_running():
+        return False, ("检测到 DSH 桌面版正在运行，但它没开「普通浏览器访问」（%s 不监听）—— "
+                       "ECHO 连不上它。请在桌面版「设置 → 常规」里打开「普通浏览器访问」；"
+                       "或者先关掉桌面版，让 ECHO 起无头 dsh。"
+                       "同一时刻只允许一个进程使用同一个 DSH 家目录，所以这次不另起无头进程。"
+                       % desktop_url())
     # 先把 node 目录补进**本进程** PATH —— `shutil.which` 读的是它，而不是下面给子进程的 env。
     # 桌面快捷方式启动时 PATH 里常常没有托管式 node（2026-09-22 同事反馈 B1）。
     ensure_node_on_path()
@@ -789,6 +992,41 @@ def stop(reason=""):
             pass
     return (not still), ("已停止独立 harness" if not still else
                          "停止失败：%s 仍在监听（可能需要手动结束该进程）" % base_url())
+
+
+def yield_to_desktop() -> dict:
+    """桌面版启动了 → 停掉 **ECHO 自己起的** 无头 dsh，把同一个 DSH 家目录让给它。
+
+    2026-11-03 一套 DSH 的硬约束：同一时刻只允许一个进程写 `~/.dsh`。
+    桌面版 GUI 由用户启动，ECHO 无法"阻止"它起来 —— 所以必须在发现它之后**主动退出**：
+    先探 43120 / GUI 进程，再只停「ECHO 起的那个」（pid 文件/本进程 Popen 为凭；手起的不动）。
+
+    ⚠️ 即使桌面版**没开**「普通浏览器访问」（43120 不在听），只要 GUI 进程在，也要让出 ——
+    否则两个进程同时写同一个家目录（2026-11-03 真机就是这样：GUI 开着、43120 空着）。
+
+    返回 ``{yielded: bool, detail: str}``；幂等、不抛异常。没有可让的东西时
+    ``yielded=False`` 且说明原因（面板/日志可以照实显示）。
+    """
+    out = {"yielded": False, "detail": ""}
+    try:
+        if not (desktop_mode() or desktop_gui_running()):
+            out["detail"] = "桌面版没在运行，无需要让"
+            return out
+        if not (started_by_echo() or _load_pid()):
+            out["detail"] = "桌面版在运行；本机没有 ECHO 起的无头 dsh（无需处理）"
+            return out
+        ok, msg = stop(reason="桌面版已启动，让出同一个 DSH 家目录（一套 DSH）")
+        out["yielded"] = bool(ok)
+        out["detail"] = msg
+        try:
+            from app import db
+            db.add_log("info", "dsh",
+                       "桌面版已启动，已停掉 ECHO 起的无头 dsh（一套 DSH，避免两个进程写同一家目录）")
+        except Exception:
+            pass
+    except Exception as exc:
+        out["detail"] = "%s: %s" % (type(exc).__name__, exc)
+    return out
 
 
 def ensure_token(timeout=45.0):
