@@ -29,7 +29,11 @@ param(
     # Do not try to install into a custom dir first (use official default).
     [switch]$DefaultLocation,
     [int]$TimeoutSec = 900,
-    [string]$LogFile = ''
+    [string]$LogFile = '',
+    # Optional already-downloaded official installer .exe (side-load for offline
+    # / intranet machines). Empty = search next to this script and up to the
+    # delivery folder, then fall back to downloading.
+    [string]$InstallerPath = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -176,7 +180,58 @@ function Get-RunningKinds {
     return $kinds
 }
 
+function Find-LocalInstaller {
+    # Side-load: an already downloaded official installer placed next to this
+    # script or anywhere up to the delivery folder (offline / intranet machines).
+    # Match the official naming so we do not pick up some random .exe.
+    $cands = New-Object System.Collections.Generic.List[string]
+    if ($InstallerPath) { $cands.Add($InstallerPath) }
+    if ($env:ECHO_DSH_INSTALLER) { $cands.Add([string]$env:ECHO_DSH_INSTALLER) }
+    $dirs = New-Object System.Collections.Generic.List[string]
+    $d = $PSScriptRoot
+    for ($i = 0; $i -lt 6 -and $d; $i++) {
+        $dirs.Add($d)
+        $d = Split-Path -Parent $d
+    }
+    foreach ($dir in $dirs) {
+        if (-not $dir -or -not (Test-Path -LiteralPath $dir)) { continue }
+        foreach ($pat in @('dsh-latest-windows-x64.exe', 'dsh-*windows*.exe', 'deepseek*harness*.exe')) {
+            foreach ($f in @(Get-ChildItem -LiteralPath $dir -Filter $pat -File -ErrorAction SilentlyContinue)) {
+                $cands.Add($f.FullName)
+            }
+        }
+    }
+    foreach ($c in $cands) {
+        if (-not $c) { continue }
+        if (-not (Test-Path -LiteralPath $c -PathType Leaf)) { continue }
+        $len = (Get-Item -LiteralPath $c).Length
+        if ($len -ge $MIN_BYTES) { return (Resolve-Path -LiteralPath $c).Path }
+    }
+    return ''
+}
+
+function Test-DownloadReachable {
+    # 6-second reachability probe. Offline machines must fail FAST instead of
+    # letting curl retry for minutes. Any HTTP response counts as reachable.
+    $curl = (Get-Command curl.exe -ErrorAction SilentlyContinue)
+    if ($curl -and $curl.Source) {
+        & $curl.Source -s -o NUL -I -L --max-time 6 $URL 2>&1 | Out-Null
+        if ($LASTEXITCODE -eq 0) { return $true }
+        # Some CDNs dislike HEAD; try a 1-byte range GET.
+        & $curl.Source -s -o NUL -L --max-time 6 -r 0-0 $URL 2>&1 | Out-Null
+        if ($LASTEXITCODE -eq 0) { return $true }
+        return $false
+    }
+    try {
+        $r = Invoke-WebRequest -Uri $URL -Method Head -UseBasicParsing -TimeoutSec 8
+        return ($r.StatusCode -ge 200)
+    } catch { return $false }
+}
+
 function Download-Installer {
+    if (-not (Test-DownloadReachable)) {
+        throw 'cannot reach download.deepseek.com (no network / proxy blocks it)'
+    }
     $tmp = Join-Path $env:TEMP ('echo-dsh-desktop-' + $PID + '.exe')
     $curl = (Get-Command curl.exe -ErrorAction SilentlyContinue)
     if ($curl -and $curl.Source) {
@@ -235,13 +290,31 @@ if ($running.Gui -or $running.Headless) {
     throw 'ECHO headless dsh (same exe) is running. Stop ECHO first (panel shutdown or scripts\stop.ps1), then re-run this installer.'
 }
 
-$tmp = Download-Installer
+$tmp = Find-LocalInstaller
+$downloaded = $false
+if ($tmp) {
+    Say ('using side-loaded official installer: ' + $tmp)
+    LogLine ('side-load ' + $tmp)
+} else {
+    $tmp = Download-Installer
+    $downloaded = $true
+}
 Say 'verifying code signature...'
 $sig = Get-AuthenticodeSignature -LiteralPath $tmp
 if ($sig.Status -ne 'Valid') {
-    throw ('installer signature is not valid: ' + $sig.Status + ' ' + $sig.StatusMessage)
+    # Offline machines may not fetch the CRL/OCSP (revocation unreachable) while
+    # the signature itself is intact -> do not block a side-loaded install for
+    # that; anything else (NotSigned / HashMismatch / UnknownError) is fatal.
+    $msg = [string]$sig.StatusMessage
+    if ($sig.Status -eq 'UnknownError' -and $msg -match '(?i)revoc|crl|ocsp|timeout|offline') {
+        Warn ('signature revocation could not be checked (offline?): ' + $msg)
+        Warn 'signature itself looks intact; continuing'
+    } else {
+        throw ('installer signature is not valid: ' + $sig.Status + ' ' + $msg)
+    }
+} else {
+    Ok 'signature valid'
 }
-Ok 'signature valid'
 
 $targets = New-Object System.Collections.Generic.List[string]
 if ($InstallDir -and -not $DefaultLocation) { $targets.Add($InstallDir) }
@@ -309,5 +382,5 @@ Ok ('DeepSeek Harness ready: ' + $installed)
 Say ('  version: ' + $version)
 LogLine ('installed ' + $installed + ' version=' + $version)
 Emit $installed $version $dir
-Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+if ($downloaded) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
 exit 0

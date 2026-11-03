@@ -1139,15 +1139,20 @@ class DshInstallLogicTests(unittest.TestCase):
         self.assertIn("Find-CliUnderRoot $target", self.desktop)
         self.assertIn("custom install dir did not produce a usable CLI", self.desktop)
 
-    def test_missing_engine_in_offline_or_upgrade_mode_tries_online_install(self):
+    def test_missing_engine_in_offline_or_upgrade_mode_tries_to_self_heal(self):
         """清掉所有 dsh 后重装：升级/离线模式只认已装会直接卡死；引擎刚需，
-        应探测下载地址并尝试联网补装官方桌面端（断开网则快速失败给手装指引）。"""
+        应先用旁路安装包、否则联网补装（断网由 helper 6 秒探测快速失败）。"""
         code = "\n".join(ln for ln in self.comp.splitlines()
                          if not ln.lstrip().startswith("#"))
-        self.assertIn("Test-OfficialDownloadReachable", code)
         self.assertIn("$dargs.ContainsKey('NoDownload')", code)
         self.assertIn("desktop(retry)", code)
-        self.assertIn("已尝试联网补装", code)
+        self.assertIn("旁路安装", code)
+        # helper 侧：旁路安装包 + 快速探测，避免离线机器白等
+        self.assertIn("function Find-LocalInstaller", self.desktop)
+        self.assertIn("ECHO_DSH_INSTALLER", self.desktop)
+        self.assertIn("function Test-DownloadReachable", self.desktop)
+        self.assertIn("cannot reach download.deepseek.com", self.desktop)
+        self.assertIn("side-loaded official installer", self.desktop)
 
 
 if __name__ == "__main__":

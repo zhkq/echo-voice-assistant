@@ -285,20 +285,6 @@ function Warn-RetiredArgs {
     if ($AskDsh) { Warn '-AskDsh 已退役（不再安装标准版 harness）—— 已忽略' }
 }
 
-function Test-OfficialDownloadReachable {
-    # 快速探测官方桌面端下载地址（8 秒），避免真正断网的机器白等 900 秒。
-    # 返回 $true = 能拿到任何 HTTP 响应（不校验内容）；curl 不在时就交给 helper 去试。
-    $u = 'https://download.deepseek.com/desktop/dsh-latest-windows-x64.exe'
-    $curl = Get-Command curl.exe -ErrorAction SilentlyContinue
-    if (-not $curl -or -not $curl.Source) { return $true }
-    try {
-        & $curl.Source -s -o NUL -I -L --max-time 8 $u 2>&1 | Out-Null
-        return ($LASTEXITCODE -eq 0)
-    } catch {
-        return $false
-    }
-}
-
 function Prepare-Agent {
     # 返回 $true = 已能确定 dsh 程序来源（或用户明确不要智能体）。
     if ($script:AgentChoice -eq 'none') {
@@ -345,36 +331,27 @@ function Prepare-Agent {
     if ($cmdLine.Count -eq 0 -and $dargs.ContainsKey('NoDownload')) {
         # 2026-11-03 真机 P0：升级/离线模式"只认已装"在**用户清掉所有 dsh 后重装**时
         # 直接卡死：官方桌面端没装 → 拿不到程序入口 → 装完 ECHO 没有引擎。
-        # 引擎是刚需，而离线包本来就不含官方桌面端 —— 先探一下下载地址通不通，
-        # 通就允许联网补装（真正断网的机器会快速失败并给出手装指引）。
+        # 引擎是刚需；helper 自己会先找**旁路安装包**（side-load，放装我.cmd 旁边），
+        # 再按 6 秒探测决定是否联网下载 —— 断网会快速失败，不会白等 900 秒。
         Warn '离线/升级模式没找到官方桌面端（dsh）'
-        if (Test-OfficialDownloadReachable) {
-            Say '  正在尝试联网安装官方桌面端（约 289 MB；离线包不含它）…'
-            $retry = @{ LogFile = $script:InstallLog }
-            if ($DesktopInstallDir) { $retry['InstallDir'] = $DesktopInstallDir }
-            if ($UpgradeDsh) { $retry['Upgrade'] = $true }
-            try {
-                $dout = & $desktopHelper @retry 2>&1
-            } catch {
-                Warn ('联网安装官方桌面端失败：{0}' -f $_.Exception.Message)
-            }
-            foreach ($line in @($dout)) { LogLine ("  desktop(retry): {0}" -f "$line") }
-            $cmdLine = @($dout | ForEach-Object { "$_" } | Where-Object { $_ -like 'HARNESS_COMMAND=*' } |
-                         Select-Object -Last 1)
-        } else {
-            Warn '  本机连不上 download.deepseek.com —— 无法自动补装官方桌面端'
+        Say '  正在尝试补装官方桌面端（优先用旁路安装包；没有则联网，约 289 MB）…'
+        $retry = @{ LogFile = $script:InstallLog }
+        if ($DesktopInstallDir) { $retry['InstallDir'] = $DesktopInstallDir }
+        if ($UpgradeDsh) { $retry['Upgrade'] = $true }
+        try {
+            $dout = & $desktopHelper @retry 2>&1
+        } catch {
+            Warn ('补装官方桌面端失败：{0}' -f $_.Exception.Message)
         }
+        foreach ($line in @($dout)) { LogLine ("  desktop(retry): {0}" -f "$line") }
+        $cmdLine = @($dout | ForEach-Object { "$_" } | Where-Object { $_ -like 'HARNESS_COMMAND=*' } |
+                     Select-Object -Last 1)
     }
     if ($cmdLine.Count -eq 0) {
         Err '官方 DeepSeek Harness 桌面端没就绪（拿到它的程序入口失败）'
-        if ($Offline -or ($KeepSettings -and -not $UpgradeDsh)) {
-            Say '  离线/升级模式不下载：已尝试联网补装（见上面的 desktop 输出）；仍失败就手动装官方桌面端：'
-            Say '  https://download.deepseek.com/desktop/dsh-latest-windows-x64.exe'
-            Say '  装好后重跑本脚本（已装会直接复用）。'
-        } else {
-            Say '  联网安装失败时：手动装官方桌面端 https://download.deepseek.com/desktop/dsh-latest-windows-x64.exe'
-            Say '  装好后重跑本脚本（已装会直接复用）。'
-        }
+        Say '  旁路安装：把官方安装包 dsh-latest-windows-x64.exe 放到 装我.cmd 旁边再重跑（离线可用）；'
+        Say '  或在能上网的机器下载后拷过来：https://download.deepseek.com/desktop/dsh-latest-windows-x64.exe'
+        Say '  安装好官方桌面端后再重跑本脚本（已装会直接复用）。'
         return $false
     }
     $cmd = ([string]$cmdLine[-1]).Substring('HARNESS_COMMAND='.Length)
