@@ -417,6 +417,12 @@ class Auth:
 
         claims = decode_token(token, self.key,
                               leeway_s=int(self.cfg.get("auth.clock_skew_s", 60)))
+        # **userToken 与 client JWT 是两个域**（2026-11-03，收费）：userToken 的
+        # `typ` 是 `user`，**绝不能**拿它来调能力端点。反过来由
+        # `server/account.py::UserAuth` 拒绝没有 `typ=user` 的令牌。两边各钉一次，
+        # 不靠"sub 前缀不同"这种间接理由。
+        if str(claims.get("typ") or "") == "user":
+            raise errors.unauthorized("这是账号令牌，不能用来调用能力端点")
         cid = str(claims.get("sub") or "")
         if not cid:
             raise errors.unauthorized("令牌里没有客户端标识")
@@ -481,7 +487,8 @@ class Auth:
 
     def create_pairing_code(self, created_by: str = "", name: str = "",
                             scopes: str = "", ttl_s: Optional[float] = None,
-                            client_id: str = "") -> str:
+                            client_id: str = "", user_id: str = "",
+                            kind: str = "", code: str = "") -> str:
         """生成一次性配对码，**明文只在这里返回这一次**。
 
         `name` / `scopes` 是**这张码将要创建的那个客户端**的身份（设计 §7.4 的
@@ -497,12 +504,26 @@ class Auth:
         身份、只轮换 secret，而不是新建一个。本机自动配对走的就是这条路（它当然知道
         自己是哪个 client_id）。空 = 照旧新建（给陌生机器发码）。
         """
-        code = new_pairing_code()
+        # 收费那条路会传一个**可重算**的码（由订单 id + 服务端密钥派生）：
+        # 这样"同一订单重复轮询返回同一张码"不必把明文存进库（设计 §5.3 的
+        # "配对码只存哈希"继续成立）。其它调用方不传，照旧随机生成。
+        code = str(code or "") or new_pairing_code()
         ttl = float(self.cfg.get("auth.pairing_ttl_s", 900)) if ttl_s is None else float(ttl_s)
         self.store.put_pairing_code(hash_pairing_code(code), ttl,
                                     created_by=created_by, name=name, scopes=scopes,
-                                    client_id=client_id)
+                                    client_id=client_id, user_id=user_id, kind=kind)
         return code
+
+    def lookup_pairing_code(self, code: str) -> Optional[Dict[str, Any]]:
+        """**只读**看一张配对码（不消费）。给兑换前的准入预检用。
+
+        与 `redeem()` 用的是**同一个归一化 + 同一个哈希**，所以"预检说能兑、
+        兑换却说不存在"不会来自两处算法不一致。权威判定始终在 `redeem()`。
+        """
+        normalized = "".join(str(code or "").split()).upper()
+        if not normalized:
+            return None
+        return self.store.peek_pairing_code(hash_pairing_code(normalized))
 
     def redeem(self, code: str, client_name: str = "") -> Dict[str, Any]:
         """客户端调用：拿配对码换 `client_id` + `secret`（**secret 只出现这一次**）。"""
