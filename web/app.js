@@ -5020,7 +5020,7 @@ document.addEventListener("click", (e) => {
       // 是"凭据不下发"的代价，所以 title 里必须写明，不能让人以为点了没反应。
       return {
         post: "/api/harness/browser",
-        title: "在这台跑 ECHO 的电脑上打开 DSH 界面（桌面版在跑就打开桌面版；"
+        title: "在这台跑 ECHO 的电脑上打开 DSH 界面（桌面版在跑就打开桌面版；" +
                "从别的机器/手机看面板时，那个窗口不在这块屏上）",
       };
     }
