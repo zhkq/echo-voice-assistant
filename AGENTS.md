@@ -46,6 +46,10 @@
     用数组 `@('-LogFile', $x)` 是**按位置**绑定，会把参数错位（真机表现为 helper 一条命令都没执行）。
     另外 `$args` 是 PowerShell 自动变量，**不许**当普通数组赋值（`harness-install-desktop.ps1` 里
     已改名 `$installerArgs`）。
+  * **其它同轮加固**：GUI 与 ECHO 无头 dsh 是**同一个 exe 名**，判断"桌面版在运行"必须按命令行
+    区分（含 `dsh-desktop-host\lib\cli.js`/`web --port` = 无头），否则升级会被无头引擎挡下/误判；
+    `--version` 探测要有硬超时（20s），坏 CLI 不能挂死安装器；装自定义目录时只认**目标根下**的 CLI
+    （`Find-CliUnderRoot`），不许拿 `%LOCALAPPDATA%` 旧安装冒充成功。
   * 判据：`tests/test_install_entry.py::DshInstallLogicTests`（6 条，含 BOM/解析与文本契约）。
 - **判据**：`tests/test_harness_agent.py`（单一注册、`available()` 两种模式、`requested()` 与
   `desktop_mode`）、`tests/test_boot_state.py`（只有 dsh 一行、autoStart 三态）、

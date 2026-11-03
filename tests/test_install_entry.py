@@ -1120,6 +1120,25 @@ class DshInstallLogicTests(unittest.TestCase):
         self.assertIn("Get-InstallRoot $full", self.desktop)
         self.assertIn("treating as NOT installed", self.desktop)
 
+    def test_running_check_distinguishes_gui_from_echo_headless_dsh(self):
+        """GUI 与 ECHO 的无头 dsh 同名 exe；只按进程名会把引擎当成桌面版在运行。"""
+        self.assertIn("Get-RunningKinds", self.desktop)
+        self.assertIn("dsh-desktop-host", self.desktop)
+        self.assertIn("web --port", self.desktop)
+        self.assertNotIn("Get-Process -Name 'DeepSeek Harness'", self.desktop)
+        # 升级时要明确要求先停 ECHO（无头引擎占着程序文件）
+        self.assertIn("Stop ECHO first", self.desktop)
+
+    def test_version_probe_has_a_hard_timeout(self):
+        """坏掉的 CLI 可能挂住；`& $cmd --version` 没有超时会把安装器一起挂死。"""
+        self.assertIn("WaitForExit(20000)", self.desktop)
+        self.assertIn("Start-Process -FilePath $cmd -ArgumentList '--version'", self.desktop)
+
+    def test_custom_install_dir_is_verified_under_that_dir(self):
+        """装自定义目录失败时，不能拿 %LOCALAPPDATA% 里的旧安装冒充成功。"""
+        self.assertIn("Find-CliUnderRoot $target", self.desktop)
+        self.assertIn("custom install dir did not produce a usable CLI", self.desktop)
+
 
 if __name__ == "__main__":
     unittest.main()
