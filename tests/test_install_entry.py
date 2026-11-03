@@ -1057,5 +1057,69 @@ class UpgradeModeTests(unittest.TestCase):
         self.assertIn("智能体配置", text)
 
 
+class DshInstallLogicTests(unittest.TestCase):
+    """2026-11-03 真机三个安装阻断的回归（用户逐条指出）。
+
+    1. "是否已装 DSH"的判据太粗暴：`<安装根>\\dsh\\app` 空目录（install.ps1 自己
+       会建、老标准版卸载后也可能剩）被当成"已装 DSH"。
+    2. 判断与动作不一致：升级路径里"不升级 DSH"会把 Agent 设成 none → 组件那一步
+       根本不检查 dsh，装完 ECHO 没有引擎。
+    3. 数组 splat 把命名参数按位置绑定 → helper 一条命令都没执行：
+       `$dargs = @('-LogFile', $x); & $helper @dargs` 是错的，必须哈希表。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.install = _read(INSTALL_PS1)
+        cls.all = _read(INSTALL_ALL)
+        cls.comp = _read(PS1_COMPONENTS)
+        cls.desktop = _read(os.path.join(
+            ROOT, ".dsh", "skills", "echo-install", "scripts",
+            "harness-install-desktop.ps1"))
+        cls.skill = _read(SKILL_MD)
+
+    def test_install_ps1_stops_creating_the_retired_dsh_dirs(self):
+        """install.ps1 不许再建 dsh\\app / dsh\\home —— 空目录是误判的源头。"""
+        self.assertNotIn("'dsh\\app', 'dsh\\home'", self.install)
+        self.assertIn("foreach ($d in @('data', 'models', 'meeting', 'aide'))",
+                      self.install)
+
+    def test_upgrade_detection_ignores_empty_install_dirs(self):
+        """升级时"已装 DSH"必须看真东西（官方 CLI / 官方家目录），不看空目录。"""
+        self.assertNotIn("Join-Path $script:TargetRoot 'dsh\\app'", self.all)
+        self.assertIn("$officialCli", self.all)
+        self.assertIn("resources\\runtime\\cli\\bin\\dsh.cmd", self.all)
+        self.assertIn("$dshHome", self.all)
+
+    def test_upgrade_never_silently_skips_the_dsh_check(self):
+        """不升级 DSH 也必须按 Agent=dsh 跑校验；以前设 none 就完全不管了。"""
+        anchor = self.all.index("if ($script:IsUpgrade) {", self.all.index("$installMode = Invoke-InstallModeProbe"))
+        block = self.all[anchor:anchor + 2000]
+        self.assertIn("$Agent = 'dsh'", block)
+        self.assertNotIn("$Agent = 'none'", block)
+        self.assertNotIn("$Agent = 'harness'", block)
+
+    def test_components_helper_uses_a_hashtable_splat(self):
+        """数组 splat = 位置绑定 → helper 的 -LogFile 落到 -InstallDir 上直接失败。"""
+        # 注释里会解释"以前用错成什么样"，所以只扫代码行。
+        code = "\n".join(ln for ln in self.comp.splitlines()
+                         if not ln.lstrip().startswith("#"))
+        self.assertIn("$dargs = @{ LogFile =", code)
+        self.assertNotIn("$dargs = @(", code)
+        self.assertIn("& $desktopHelper @dargs", code)
+
+    def test_desktop_installer_does_not_shadow_the_args_automatic(self):
+        """`$args` 是 PowerShell 自动变量；当普通数组用会踩坑（真机安装命令没执行）。"""
+        self.assertIsNone(re.search(r"(?m)^\s*\$args\s*=", self.desktop),
+                          "不要把自动变量 $args 当普通数组赋值")
+        self.assertIn("$installerArgs = @('/S')", self.desktop)
+        self.assertIn("-ArgumentList $installerArgs", self.desktop)
+
+    def test_desktop_detection_requires_an_installed_desktop_root(self):
+        """只看 dsh.cmd 文件在不在太粗暴：必须是已装桌面端（有 DeepSeek Harness.exe）。"""
+        self.assertIn("Get-InstallRoot $full", self.desktop)
+        self.assertIn("treating as NOT installed", self.desktop)
+
+
 if __name__ == "__main__":
     unittest.main()

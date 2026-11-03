@@ -388,13 +388,15 @@ function Resolve-CoreDir {
     $script:CoreDir = Join-Path $script:TargetDir 'echo-core'
     Info ("3.0 安装根布局：代码放 {0}" -f $script:CoreDir)
     if ($script:DryRun) { return }
-    # 六个兄弟目录先建出来：让"我的东西放哪了"一眼可见，也免得后面某一步漏建。
+    # 兄弟目录先建出来：让"我的东西放哪了"一眼可见，也免得后面某一步漏建。
     # 都不是"必须存在"（首次录音/首次下模型时才真正用到），建空的没有副作用。
-    foreach ($d in @('data', 'models', 'meeting', 'aide',
-                     'dsh\app', 'dsh\home')) {
+    # 2026-11-03 一套 DSH：**不再建 dsh\app / dsh\home**（那是已退役的标准版布局；
+    # 现在的 DSH 程序来自官方桌面端、家目录就是 %USERPROFILE%\.dsh）。留着空目录
+    # 会让"是否已装 DSH"的判据误判（真机踩过：全新机器被当成"已装"）。
+    foreach ($d in @('data', 'models', 'meeting', 'aide')) {
         New-Item -ItemType Directory -Force -Path (Join-Path $script:TargetDir $d) | Out-Null
     }
-    Ok '已建兄弟目录：data / models / meeting / aide / dsh\app / dsh\home'
+    Ok '已建兄弟目录：data / models / meeting / aide（DSH 用官方桌面端 + 共用 ~/.dsh，不再建 dsh\app）'
 }
 
 function Set-PackageKind {

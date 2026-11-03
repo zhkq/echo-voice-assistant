@@ -72,9 +72,14 @@ function Find-OfficialCli([string]$preferDir = '') {
     $cmd = Get-Command dsh -ErrorAction SilentlyContinue
     if ($cmd -and $cmd.Source) { $cands.Add([string]$cmd.Source) }
     foreach ($c in $cands) {
-        if ($c -and (Test-Path -LiteralPath $c -PathType Leaf)) {
-            return (Resolve-Path -LiteralPath $c).Path
-        }
+        if (-not $c) { continue }
+        if (-not (Test-Path -LiteralPath $c -PathType Leaf)) { continue }
+        $full = (Resolve-Path -LiteralPath $c).Path
+        # 2026-11-03 真机：只看"文件在"太粗暴 —— 残留的 dsh.cmd / 别的产品的
+        # dsh 也会被当成"已安装"。官方桌面端的 CLI 必须位于一个**装好的桌面端根**
+        # （同目录树里有 DeepSeek Harness.exe）。找不到根 = 不是官方安装，跳过。
+        if (-not (Get-InstallRoot $full)) { continue }
+        return $full
     }
     return ''
 }
@@ -148,11 +153,18 @@ function Download-Installer {
 $existing = Find-OfficialCli $InstallDir
 if ($existing -and -not $Upgrade) {
     $v = Get-DshVersion $existing
-    Ok ('using installed DeepSeek Harness CLI: ' + $existing)
-    if ($v) { Say ('  version: ' + $v) }
-    Emit $existing $v (Get-InstallRoot $existing)
-    LogLine ('reuse ' + $existing + ' version=' + $v)
-    exit 0
+    if (-not $v) {
+        # 文件在、但跑不起来（残包/被删了一半/权限）→ 按"没装"处理，往下走重装，
+        # 而不是后面才抛一句让人以为"已装好"的错。
+        Warn ('found a dsh CLI that cannot run; treating as NOT installed: ' + $existing)
+        $existing = ''
+    } else {
+        Ok ('using installed DeepSeek Harness CLI: ' + $existing)
+        Say ('  version: ' + $v)
+        Emit $existing $v (Get-InstallRoot $existing)
+        LogLine ('reuse ' + $existing + ' version=' + $v)
+        exit 0
+    }
 }
 if ($NoDownload) {
     if ($existing) { $v = Get-DshVersion $existing; Emit $existing $v ''; exit 0 }
@@ -183,7 +195,9 @@ $targets.Add((Join-Path $env:LOCALAPPDATA 'Programs\DeepSeek Harness'))
 
 $installed = ''
 foreach ($target in $targets) {
-    $args = @('/S')
+    # ⚠️ 别用 `$args` 这个变量名：它是 PowerShell 的自动变量（当前脚本/函数的参数表），
+    # 赋值/当数组用会踩坑（2026-11-03 真机：安装命令没执行）。用独立名字。
+    $installerArgs = @('/S')
     $defaultDir = Join-Path $env:LOCALAPPDATA 'Programs\DeepSeek Harness'
     $isDefaultDir = (-not $InstallDir) -or $DefaultLocation -or ($target -ieq $defaultDir)
     if (-not $isDefaultDir) {
@@ -193,13 +207,13 @@ foreach ($target in $targets) {
             Warn ('install dir has spaces, using official default instead: ' + $target)
             $target = $defaultDir
         } else {
-            $args += ('/D=' + $target)
+            $installerArgs += ('/D=' + $target)
         }
     }
     Say ('running official installer (silent) -> ' + $target)
     $p = $null
     try {
-        $p = Start-Process -FilePath $tmp -ArgumentList $args -Wait -PassThru
+        $p = Start-Process -FilePath $tmp -ArgumentList $installerArgs -Wait -PassThru
         $code = $p.ExitCode
     } catch {
         $code = -1

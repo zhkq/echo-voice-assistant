@@ -1503,21 +1503,27 @@ function Backup-UpgradeDatabase {
 
 function Ask-UpgradeDsh {
     # 只有"已装过 DSH"才值得问；默认**不升级**（回车 = 不）。
-    $hasDsh = (Test-Path (Join-Path $script:TargetRoot 'dsh\app')) -or
-              (Test-Path (Join-Path $script:TargetRoot 'dsh\home\settings.yaml')) -or
-              (Test-Path (Join-Path $script:TargetRoot 'data\harness'))
+    # 2026-11-03 真机 P0：判据原来只看 <安装根>\dsh\app 这个**空目录**（install.ps1
+    # 会先建出来，老标准版卸载后也可能剩着）→ 全新机器被误判成"已装 DSH"。
+    # 现在只认**真东西**：官方桌面端自带的 dsh CLI，或官方家目录里真存在的内容。
+    $officialCli = Join-Path $env:LOCALAPPDATA 'Programs\DeepSeek Harness\resources\runtime\cli\bin\dsh.cmd'
+    $dshHome = Join-Path $env:USERPROFILE '.dsh'
+    $hasDsh = (Test-Path -LiteralPath $officialCli) -or
+              (Test-Path -LiteralPath (Join-Path $dshHome 'settings.yaml')) -or
+              (Test-Path -LiteralPath (Join-Path $dshHome '.credentials.yaml')) -or
+              (@(Get-ChildItem -LiteralPath (Join-Path $dshHome 'sessions') -Directory -ErrorAction SilentlyContinue).Count -gt 0)
     if (-not $hasDsh) { return $false }
     $interactive = $true
     try { if ([Console]::IsInputRedirected) { $interactive = $false } } catch { $interactive = $false }
     if (-not $interactive -or $Yes) {
-        Info '非交互/无人值守：不升级 DSH（要它请加 -Agent harness 或手动跑安装技能）'
+        Info '非交互/无人值守：不升级官方桌面端（需要时手动跑安装技能 / 重新跑安装器）'
         return $false
     }
     Write-Host ''
-    Write-Host '    检测到已安装 DSH 标准版（智能体）。' -ForegroundColor White
-    Info '升级只会替换 DSH 的程序文件；智能体相关的配置（选哪个智能体 / harness 命令等）一个字不改。'
+    Write-Host '    检测到已安装官方 DeepSeek Harness 桌面端（自带 dsh 引擎）。' -ForegroundColor White
+    Info '升级只会替换桌面端程序文件；ECHO 的设置与智能体配置一个字不改。'
     $ans = ''
-    try { $ans = Read-Host '    要顺便升级 DSH 标准版（harness）吗？(y/N)' } catch { }
+    try { $ans = Read-Host '    要顺便重新下载/升级官方桌面端吗？(y/N)' } catch { }
     return (('{0}' -f $ans).Trim() -match '^(y|yes|是)$')
 }
 
@@ -1631,17 +1637,20 @@ if ($script:IsUpgrade) {
     # 升级不装/不换模型，也不装依赖（引擎列表清空 → 组件脚本不会去写 sttModel）。
     $engineList = @()
     $wantWake = $false   # historical: client has no wake/KWS any more
-    # 升级只问"要不要升 DSH"，不再问"已有 DSH 目录"（外部目录只用于全新安装）。
+    # 升级只问"要不要升官方桌面端"，不再问"已有 DSH 目录"（外部目录只用于全新安装）。
     $DshDir = ''
     $AskDsh = $false
     $upgradeDsh = $false
+    # 2026-11-03 真机 P0：以前这里"不升级"就把 $Agent 设成 'none'，于是组件那一步
+    # **根本不检查 dsh** —— 用户明明没有可用引擎，装完 ECHO 却只说"引擎失败"。
+    # 现在无论升不升级都按 dsh 校验：升级=重新下载；不升级=只认已装、缺了如实报错。
     if (Ask-UpgradeDsh) {
-        $Agent = 'harness'
+        $Agent = 'dsh'
         $upgradeDsh = $true
-        Info 'DSH 标准版：本次会升级（只换程序文件，不改任何智能体配置）'
+        Info '官方 DeepSeek Harness 桌面端：本次会重新下载/升级（只换程序，不改配置）'
     } else {
-        $Agent = 'none'
-        Info 'DSH 标准版：保持现状（不升级、不检查、不改配置）'
+        $Agent = 'dsh'
+        Info '官方 DeepSeek Harness 桌面端：只校验现有安装（不下载、不升级；缺了会如实报错）'
     }
 }
 

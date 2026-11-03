@@ -305,12 +305,17 @@ function Prepare-Agent {
 
     # 离线 / 升级模式默认**只认已装**，绝不联网下载；只有用户显式同意升级 DSH
     # （-UpgradeDsh）时才重新下载。桌面端正在运行时 helper 不覆盖，继续用现有 CLI。
-    $dargs = @('-LogFile', $script:InstallLog)
-    if ($DesktopInstallDir) { $dargs += @('-InstallDir', $DesktopInstallDir) }
+    #
+    # ⚠️ 2026-11-03 真机 P0：这里原来写的是**数组 splat**（`$dargs = @('-LogFile', $x)`，
+    # `& $helper @dargs`）。数组 splat 是**按位置**绑定参数，`-LogFile` 会落进
+    # `-InstallDir` 这个 string 参数、日志路径再撞到 `-Upgrade` 开关 → 整个 helper
+    # 根本没执行，安装器只报"官方桌面端没就绪"。**必须用哈希表 splat**（按名字绑定）。
+    $dargs = @{ LogFile = $script:InstallLog }
+    if ($DesktopInstallDir) { $dargs['InstallDir'] = $DesktopInstallDir }
     if ($UpgradeDsh -and -not $Offline) {
-        $dargs += '-Upgrade'
+        $dargs['Upgrade'] = $true
     } elseif ($Offline -or $KeepSettings) {
-        $dargs += '-NoDownload'
+        $dargs['NoDownload'] = $true
     }
 
     $dout = @()

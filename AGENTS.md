@@ -34,6 +34,19 @@
   保留参数只为兼容旧命令行、只告警）；`tests/test_install_existing_dsh.py` 随功能删除。
   **别再复活"两套 dsh"**：不要给两边各建一套家目录；也不要重新引入 npm/Node 那条安装路。
   桌面版有对外接口时仍应"直接用它、不另起无头"（`yield_to_desktop()`）；没有接口时才允许共存。
+- **安装器的"判断 DSH 是否已装 / 执行安装"三个 P0（2026-11-03 真机，必须守住）**：
+  * **判据要看真东西**：`<安装根>\dsh\app` 这个空目录（install.ps1 曾自己创建、老标准版卸载后
+    也可能剩）**不算已装**；install.ps1 已不再建 `dsh\app` / `dsh\home`。`install-all.ps1::Ask-UpgradeDsh`
+    只认官方桌面端自己的 `dsh.cmd` 或 `~/.dsh` 里真实存在的 settings / 凭据 / sessions。
+  * **判断与动作必须一致**：升级路径里"不升级 DSH"**不许**再把 `$Agent` 设成 `'none'`
+    （那会让组件根本不检查 dsh，装完 ECHO 没有引擎）；一律 `$Agent='dsh'`，不升级=只认已装、
+    缺了如实报错。`harness-install-desktop.ps1::Find-OfficialCli` 还要求 CLI 位于**装好的桌面端根**
+    （能找到 `DeepSeek Harness.exe`），且 CLI 真能 `--version`，否则按未安装重装。
+  * **splat 只能用哈希表**：`$dargs = @{ LogFile = ... }; & $helper @dargs`。
+    用数组 `@('-LogFile', $x)` 是**按位置**绑定，会把参数错位（真机表现为 helper 一条命令都没执行）。
+    另外 `$args` 是 PowerShell 自动变量，**不许**当普通数组赋值（`harness-install-desktop.ps1` 里
+    已改名 `$installerArgs`）。
+  * 判据：`tests/test_install_entry.py::DshInstallLogicTests`（6 条，含 BOM/解析与文本契约）。
 - **判据**：`tests/test_harness_agent.py`（单一注册、`available()` 两种模式、`requested()` 与
   `desktop_mode`）、`tests/test_boot_state.py`（只有 dsh 一行、autoStart 三态）、
   `tests/test_install_base_layout.py`（dsh_home 不在安装根、旧位置进 `legacy_dsh_homes()`）、
