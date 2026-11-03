@@ -210,16 +210,35 @@ function Find-LocalInstaller {
     return ''
 }
 
+function Invoke-Curl {
+    # Run curl via Start-Process (NOT "& curl ... 2>&1"): in PowerShell 5.1 the
+    # first stderr line of a native command becomes a TERMINATING error while
+    # $ErrorActionPreference='Stop', and curl writes its progress meter to
+    # stderr -> download aborted at attempt 1 (2026-11-03 real-machine).
+    param([string]$CurlExe, [string[]]$CurlArgs)
+    $out = Join-Path $env:TEMP ('echo-curl-out-' + $PID + '.txt')
+    $err = Join-Path $env:TEMP ('echo-curl-err-' + $PID + '.txt')
+    try {
+        $p = Start-Process -FilePath $CurlExe -ArgumentList $CurlArgs -NoNewWindow -Wait `
+            -PassThru -RedirectStandardOutput $out -RedirectStandardError $err -ErrorAction Stop
+        return $p.ExitCode
+    } catch {
+        return -1
+    } finally {
+        Remove-Item -LiteralPath $out, $err -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Test-DownloadReachable {
     # 6-second reachability probe. Offline machines must fail FAST instead of
     # letting curl retry for minutes. Any HTTP response counts as reachable.
     $curl = (Get-Command curl.exe -ErrorAction SilentlyContinue)
     if ($curl -and $curl.Source) {
-        & $curl.Source -s -o NUL -I -L --max-time 6 $URL 2>&1 | Out-Null
-        if ($LASTEXITCODE -eq 0) { return $true }
+        $code = Invoke-Curl -CurlExe $curl.Source -CurlArgs @('-s', '-o', 'NUL', '-I', '-L', '--max-time', '6', $URL)
+        if ($code -eq 0) { return $true }
         # Some CDNs dislike HEAD; try a 1-byte range GET.
-        & $curl.Source -s -o NUL -L --max-time 6 -r 0-0 $URL 2>&1 | Out-Null
-        if ($LASTEXITCODE -eq 0) { return $true }
+        $code = Invoke-Curl -CurlExe $curl.Source -CurlArgs @('-s', '-o', 'NUL', '-L', '--max-time', '6', '-r', '0-0', $URL)
+        if ($code -eq 0) { return $true }
         return $false
     }
     try {
@@ -237,8 +256,9 @@ function Download-Installer {
     if ($curl -and $curl.Source) {
         for ($i = 1; $i -le 12; $i++) {
             Say ('downloading official DeepSeek Harness (attempt ' + $i + '/12)...')
-            & $curl.Source -L --fail --retry 3 --retry-delay 2 --retry-all-errors `
-                -C - -o $tmp $URL 2>&1 | Out-Null
+            $null = Invoke-Curl -CurlExe $curl.Source -CurlArgs @(
+                '-L', '--fail', '--retry', '3', '--retry-delay', '2',
+                '--retry-all-errors', '-C', '-', '-o', $tmp, $URL)
             $len = 0
             if (Test-Path -LiteralPath $tmp) { $len = (Get-Item -LiteralPath $tmp).Length }
             if ($len -ge $MIN_BYTES) { return $tmp }
@@ -296,6 +316,8 @@ if ($tmp) {
     Say ('using side-loaded official installer: ' + $tmp)
     LogLine ('side-load ' + $tmp)
 } else {
+    Say 'no side-loaded installer found (put dsh-latest-windows-x64.exe next to the install launcher); trying network...'
+    LogLine 'side-load: not found'
     $tmp = Download-Installer
     $downloaded = $true
 }

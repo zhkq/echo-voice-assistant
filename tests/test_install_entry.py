@@ -1153,6 +1153,9 @@ class DshInstallLogicTests(unittest.TestCase):
         self.assertIn("function Test-DownloadReachable", self.desktop)
         self.assertIn("cannot reach download.deepseek.com", self.desktop)
         self.assertIn("side-loaded official installer", self.desktop)
+        # PS 5.1: `& curl ... 2>&1` + EAP=Stop 会把 curl 进度条当终止错误 -> 下载中断。
+        self.assertIn("function Invoke-Curl", self.desktop)
+        self.assertIn("-RedirectStandardError", self.desktop)
 
 
 if __name__ == "__main__":
