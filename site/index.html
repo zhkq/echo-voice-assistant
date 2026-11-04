@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ECHO 语音助手 · 说完就办，会议自动成稿</title>
+  <meta name="description" content="ECHO 语音助手：语音指令、会议录音转写、说话人分离、语音合成与能力后端套餐。按一下说话，剩下的交给它。">
+  <meta name="theme-color" content="#f6f8fc">
+  <link rel="icon" type="image/png" href="/assets/echo-logo.png">
+  <link rel="stylesheet" href="/assets/site.css">
+</head>
+<body data-page="home">
+  <a class="skip-link" href="#main">跳到正文</a>
+
+  <header class="site-header">
+    <div class="wrap header-inner">
+      <a class="brand" href="/" aria-label="ECHO 语音助手首页">
+        <img src="/assets/echo-logo.png" alt="" width="34" height="34">
+        <span class="brand-sub">语音助手</span>
+      </a>
+      <nav class="nav" aria-label="主导航">
+        <a href="#features">功能</a>
+        <a class="nav-pricing" href="/pricing">套餐</a>
+        <a class="nav-hide-sm" href="#how">使用流程</a>
+      </nav>
+      <button type="button" class="btn btn-ghost btn-sm header-cta" data-console>进入控制台</button>
+    </div>
+  </header>
+
+  <main id="main">
+    <section class="hero">
+      <div class="wrap hero-grid">
+        <div>
+          <span class="eyebrow"><span class="dot"></span>ECHO · 个人语音助手</span>
+          <h1>说完就办，<br><span class="accent">会议自动成稿。</span></h1>
+          <p class="hero-lead">
+            ECHO 把语音指令、会议录音转写、说话人分离与语音合成放在一个桌面助手里。
+            按一下说话，转写、整理、回读顺着来。
+          </p>
+          <div class="hero-actions">
+            <a class="btn btn-primary btn-lg" href="/pricing">查看套餐<span aria-hidden="true">→</span></a>
+            <a class="btn btn-ghost btn-lg" href="#features">了解能力</a>
+          </div>
+          <p class="hero-note"><strong>内测阶段</strong> · 桌面客户端使用 · 能力后端按套餐计量</p>
+        </div>
+
+        <div class="hero-visual" aria-label="产品界面示意">
+          <div class="glow" aria-hidden="true"></div>
+          <div class="voice-card">
+            <div class="card-top">
+              <span class="status-dot" aria-hidden="true"></span>
+              ECHO · 语音指令
+              <span class="spacer"></span>
+              <span class="tag tag-muted">示例</span>
+            </div>
+            <div class="voice-row">
+              <span class="mic-orb" aria-hidden="true">
+                <svg><use href="/assets/icons.svg#icon-mic"></use></svg>
+              </span>
+              <div class="wave" aria-hidden="true">
+                <span></span><span></span><span></span><span></span>
+                <span></span><span></span><span></span>
+              </div>
+            </div>
+            <p class="voice-quote">“把今天的会议录下来，整理成纪要。”</p>
+            <div class="voice-status">
+              <span class="status-dot" aria-hidden="true"></span>
+              已开始录音 · 正在转写
+            </div>
+          </div>
+          <div class="voice-card transcript">
+            <div class="card-top">
+              会议转写
+              <span class="spacer"></span>
+              <span class="tag">界面示意</span>
+            </div>
+            <div class="transcript-line">
+              <span class="who">说话人 1</span>
+              <p>这版先把转写和纪要跑通，支付下周再接。</p>
+            </div>
+            <div class="transcript-line">
+              <span class="who">说话人 2</span>
+              <p>好，额度按自然日恢复，别按滚动 24 小时。</p>
+            </div>
+            <div class="transcript-line">
+              <span class="who">纪要</span>
+              <p>已生成 · 2 个待办 · 1 个决定</p>
+            </div>
+          </div>
+          <span class="float-badge">说话人分离已开启</span>
+        </div>
+      </div>
+    </section>
+
+    <section class="section section-alt" id="features">
+      <div class="wrap">
+        <div class="section-head">
+          <p class="kicker">Capabilities</p>
+          <h2>一条语音之后，常用的事都接上了。</h2>
+          <p>不追求“什么都能做”，只把每天真正会用的几件事做顺：说、录、分、写、念。</p>
+        </div>
+        <div class="feature-grid">
+          <article class="feature">
+            <span class="feature-icon"><svg><use href="/assets/icons.svg#icon-mic"></use></svg></span>
+            <h3>语音指令</h3>
+            <p>按一下说话，转写后交给已配置的智能体执行，结果直接回读。</p>
+          </article>
+          <article class="feature">
+            <span class="feature-icon"><svg><use href="/assets/icons.svg#icon-file"></use></svg></span>
+            <h3>会议录音转写</h3>
+            <p>整场会议送能力后端 Qwen3-ASR，长音频也能跑完，不占本机算力。</p>
+          </article>
+          <article class="feature">
+            <span class="feature-icon"><svg><use href="/assets/icons.svg#icon-users"></use></svg></span>
+            <h3>说话人分离</h3>
+            <p>按说话人切开时间线，谁在什么时候说了什么，一眼能对上。</p>
+          </article>
+          <article class="feature">
+            <span class="feature-icon"><svg><use href="/assets/icons.svg#icon-volume"></use></svg></span>
+            <h3>语音合成</h3>
+            <p>结论、提醒用自然语音念出来，开车或走动时也能听。</p>
+          </article>
+          <article class="feature">
+            <span class="feature-icon"><svg><use href="/assets/icons.svg#icon-server"></use></svg></span>
+            <h3>能力后端套餐</h3>
+            <p>转写分钟、TTS 字符、设备数与并发按套餐统一计量，多设备共用一份权益。</p>
+          </article>
+          <article class="feature">
+            <span class="feature-icon"><svg><use href="/assets/icons.svg#icon-shield"></use></svg></span>
+            <h3>隐私边界</h3>
+            <p>音频出机前先过许可；“不出机”只放行本机后端，音频去哪由你决定。</p>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="how">
+      <div class="wrap">
+        <div class="section-head">
+          <p class="kicker">How it works</p>
+          <h2>三步，回到手边。</h2>
+          <p>不需要记命令，也不用把会议音频倒来倒去。</p>
+        </div>
+        <div class="steps">
+          <article class="step">
+            <h3>按一下说话</h3>
+            <p>热键、媒体键、面板麦克风，或手机“按住说话”。说完再松手。</p>
+          </article>
+          <article class="step">
+            <h3>智能体执行</h3>
+            <p>ECHO 不直连模型：指令交给当前选中的智能体，能力后端只负责转写与合成。</p>
+          </article>
+          <article class="step">
+            <h3>结果回到手边</h3>
+            <p>回读、归档、生成纪要；会议记录与转写留在你自己的目录里。</p>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="wrap">
+        <div class="privacy">
+          <div>
+            <h2>音频去哪，<br>始终由你决定。</h2>
+            <p>ECHO 把“能不能出机”做成一条明确许可，而不是藏在设置里的默认值。</p>
+          </div>
+          <div class="privacy-list">
+            <div class="privacy-item">
+              <svg aria-hidden="true"><use href="/assets/icons.svg#icon-lock"></use></svg>
+              <span>选择“不出机”时，只有回环地址上的本机后端可用。</span>
+            </div>
+            <div class="privacy-item">
+              <svg aria-hidden="true"><use href="/assets/icons.svg#icon-users"></use></svg>
+              <span>声纹库与比对留在客户端；后端不保存声纹库，也不判断“这是谁”。</span>
+            </div>
+            <div class="privacy-item">
+              <svg aria-hidden="true"><use href="/assets/icons.svg#icon-shield"></use></svg>
+              <span>会议录音、转写与纪要落在本机数据目录，按你的保存策略处理。</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="wrap">
+        <div class="cta">
+          <div>
+            <h2>月卡 ¥10 / 30 天</h2>
+            <p>每日 120 分钟转写、5 万字符语音合成，3 台设备共用。</p>
+          </div>
+          <a class="btn btn-lg" href="/pricing">查看套餐详情<span aria-hidden="true">→</span></a>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <div class="wrap">
+      <div class="footer-grid">
+        <div>
+          <div class="footer-brand">
+            <img src="/assets/echo-logo.png" alt="" width="36" height="36">
+            语音助手
+          </div>
+          <p class="footer-about">按一下说话，会议自动成稿。语音指令、会议转写、说话人分离与语音合成，装在一个桌面助手里。</p>
+        </div>
+        <div>
+          <p class="footer-title">产品</p>
+          <div class="footer-links">
+            <a href="#features">功能</a>
+            <a href="#how">使用流程</a>
+            <a href="/pricing">套餐与价格</a>
+            <a href="/pay?plan=monthly">支付示例</a>
+          </div>
+        </div>
+        <div>
+          <p class="footer-title">站点</p>
+          <div class="footer-meta">
+            <span>域名：echoserver.zhkq.online</span>
+            <span>联系：<a href="https://github.com/zhkq">GitHub @zhkq</a></span>
+            <span>内测阶段 · 签约材料预览版</span>
+          </div>
+        </div>
+      </div>
+      <div class="footer-bottom">
+        <span>© 2026 ECHO · echoserver.zhkq.online</span>
+        <span>正式上线以最终域名、备案与收银台接入为准。</span>
+      </div>
+    </div>
+  </footer>
+
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+  <script src="/assets/site.js"></script>
+</body>
+</html>

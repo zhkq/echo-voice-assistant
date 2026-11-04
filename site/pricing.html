@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>套餐与价格 · ECHO 语音助手</title>
+  <meta name="description" content="ECHO 能力后端套餐：月卡 ¥10 / 30 天，每日 ASR 120 分钟、TTS 5 万字符、1 QPS、3 台设备、并发 1。">
+  <meta name="theme-color" content="#f6f8fc">
+  <link rel="icon" type="image/png" href="/assets/echo-logo.png">
+  <link rel="stylesheet" href="/assets/site.css">
+</head>
+<body data-page="pricing">
+  <a class="skip-link" href="#main">跳到正文</a>
+
+  <header class="site-header">
+    <div class="wrap header-inner">
+      <a class="brand" href="/" aria-label="ECHO 语音助手首页">
+        <img src="/assets/echo-logo.png" alt="" width="34" height="34">
+        <span class="brand-sub">语音助手</span>
+      </a>
+      <nav class="nav" aria-label="主导航">
+        <a class="nav-hide-sm" href="/#features">功能</a>
+        <a class="nav-pricing" href="/pricing" aria-current="page">套餐</a>
+        <a class="nav-hide-sm" href="/#how">使用流程</a>
+      </nav>
+      <button type="button" class="btn btn-ghost btn-sm header-cta" data-console>进入控制台</button>
+    </div>
+  </header>
+
+  <main id="main">
+    <section class="wrap page-hero">
+      <div class="crumbs"><a href="/">首页</a><span aria-hidden="true">/</span><span>套餐与价格</span></div>
+      <h1>一个套餐，<br>覆盖转写、合成与设备。</h1>
+      <p class="lead">能力后端按月提供转写、语音合成与设备额度。价格与额度以服务端套餐为准，页面只负责展示。</p>
+    </section>
+
+    <section class="wrap" aria-labelledby="plans-title">
+      <h2 id="plans-title" class="visually-hidden">套餐列表</h2>
+      <div class="pricing-grid" id="planCards" aria-busy="true">
+        <p class="plan-sub">正在加载套餐…</p>
+      </div>
+      <noscript>
+        <p class="load-error">需要启用 JavaScript 才能查看套餐与下单。套餐关键信息：月卡 ¥10 / 30 天，每日 ASR 120 分钟、TTS 5 万字符、1 QPS、3 台设备、并发 1。</p>
+      </noscript>
+
+      <div class="fineprint">
+        <h3>购买说明</h3>
+        <ul>
+          <li>额度按 <strong>Asia/Shanghai</strong> 自然日恢复；当天未用完的转写分钟与 TTS 字符不结转。</li>
+          <li>权益归人，3 台设备共用同一份额度；续费从当前到期日叠加，换机不会重复收费。</li>
+          <li>支付由支付宝 Vibe Pay 提供。本页不直接收款，下单后进入支付页确认金额。</li>
+          <li>支付结果以服务端异步通知与交易查询为准，支付页不会把“等待支付”当作成功。</li>
+        </ul>
+        <p class="plan-hint" style="text-align:left;margin-top:14px;">当前为签约材料预览版：页面与套餐已就绪，在线收款将在接入支付宝真实收银台后开放。</p>
+      </div>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <div class="wrap">
+      <div class="footer-grid">
+        <div>
+          <div class="footer-brand">
+            <img src="/assets/echo-logo.png" alt="" width="36" height="36">
+            语音助手
+          </div>
+          <p class="footer-about">按一下说话，会议自动成稿。语音指令、会议转写、说话人分离与语音合成，装在一个桌面助手里。</p>
+        </div>
+        <div>
+          <p class="footer-title">产品</p>
+          <div class="footer-links">
+            <a href="/#features">功能</a>
+            <a href="/#how">使用流程</a>
+            <a href="/pricing">套餐与价格</a>
+            <a href="/pay?plan=monthly">支付示例</a>
+          </div>
+        </div>
+        <div>
+          <p class="footer-title">站点</p>
+          <div class="footer-meta">
+            <span>域名：echoserver.zhkq.online</span>
+            <span>联系：<a href="https://github.com/zhkq">GitHub @zhkq</a></span>
+            <span>内测阶段 · 签约材料预览版</span>
+          </div>
+        </div>
+      </div>
+      <div class="footer-bottom">
+        <span>© 2026 ECHO · echoserver.zhkq.online</span>
+        <span>正式上线以最终域名、备案与收银台接入为准。</span>
+      </div>
+    </div>
+  </footer>
+
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+  <script src="/assets/site.js"></script>
+</body>
+</html>

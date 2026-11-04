@@ -1,0 +1,37 @@
+{
+  "source": "server/billing.py DEFAULT_PLANS（PR #6 分支，2026-11-04 对齐）",
+  "note": "本文件是静态站唯一套餐来源；Phase 3 可改为同源 GET /v1/billing/plans。金额单位是分。",
+  "currency": "CNY",
+  "timezone": "Asia/Shanghai",
+  "updated": "2026-11-04",
+  "plans": [
+    {
+      "code": "monthly",
+      "name": "月卡",
+      "priceCents": 1000,
+      "days": 30,
+      "dailyAudioMinutes": 120,
+      "ttsChars": 50000,
+      "qps": 1,
+      "maxDevices": 3,
+      "maxConcurrent": 1,
+      "active": true,
+      "purchasable": true,
+      "badge": "推荐"
+    },
+    {
+      "code": "trial",
+      "name": "7 天试用",
+      "priceCents": 0,
+      "days": 7,
+      "dailyAudioMinutes": 120,
+      "ttsChars": 50000,
+      "qps": 1,
+      "maxDevices": 3,
+      "maxConcurrent": 1,
+      "active": true,
+      "purchasable": false,
+      "badge": "邀请制"
+    }
+  ]
+}
