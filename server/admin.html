@@ -1073,7 +1073,7 @@ async function viewBilling() {
       <div><b>${d.enabled ? "已启用" : "未启用"}</b><span>收费开关（billing.enabled）</span></div>
       <div><b>${d.effectiveGating ? "生效" : "未生效"}</b><span>计费闸门${d.effectiveGating ? "" : "（auth.enabled=false，请求会走免费老路）"}</span></div>
       <div><b>${esc(d.provider)}</b><span>支付网关（configured=${d.gatewayConfigured ? "是" : "否"}）</span></div>
-      <div><b>${money(d.revenueCentsToday)}</b><span>最近 24 小时收入</span></div>
+      <div><b>${money(d.revenueCentsToday)}</b><span>今日收入（billing.timezone 自然日）</span></div>
       <div><b>${money(d.revenueCentsTotal)}</b><span>累计收入（已支付）</span></div>
       <div><b>${d.expiringIn7Days}</b><span>7 天内到期</span></div>
       <div><b>${d.users}</b><span>账号</span></div>
