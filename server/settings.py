@@ -210,9 +210,11 @@ DEFAULTS: Dict[str, Any] = {
         # disabled | mock | alipay。**默认 disabled**：没配支付时服务能起来，
         # 下单接口明确回 503 `payment_unconfigured`，绝不静默降级成 Mock。
         "provider": "disabled",
-        # Mock 网关的 HMAC 密钥（只在 provider=mock 时有意义）。
-        # 出厂值只用于本地联调；生产不会启用 mock，改它也不影响真实网关。
-        "mock_secret": "echo-mock-payment-not-for-production",
+        # Mock 网关的 HMAC 密钥（只在 provider=mock 时有意义）。**空 = 启动时随机**；
+        # 不要把仓库里的默认值当生产密钥（生产根本不该启用 mock）。
+        "mock_secret": "",
+        # Mock 端点默认只允许本机/测试来源；隔离环境才显式放开成远程。
+        "mock_allow_remote": False,
         # 支付回调地址（真实网关要把这个地址配到开放平台）。
         "notify_url": "",
     },
@@ -224,6 +226,10 @@ DEFAULTS: Dict[str, Any] = {
         "public_key_path": "",
         "gateway": "https://openapi.alipay.com/gateway.do",
         "sandbox": False,
+        # sandbox=true 且 gateway 仍是生产地址时自动用它。
+        "sandbox_gateway": "https://openapi-sandbox.dl.alipaydev.com/gateway.do",
+        # 可选：回调里的 seller_id 校验（支付宝商户 PID）。空 = 不校验。
+        "seller_id": "",
         "notify_url": "",
     },
 }

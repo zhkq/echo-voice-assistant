@@ -95,9 +95,9 @@ class _AccountCase(unittest.TestCase):
                                    "employeeNo": employee_no})
         return r
 
-    def login(self, employee_no="E001"):
+    def login(self, employee_no="E001", code="INVITE-1"):
         return self.client.post("/v1/account/login",
-                                json={"employeeNo": employee_no})
+                                json={"employeeNo": employee_no, "inviteCode": code})
 
     def headers(self, token):
         return {"Authorization": "Bearer " + token}
@@ -134,6 +134,15 @@ class RegisterLoginTests(_AccountCase):
         # 注册即送 7 天试用（设计 §4.5）
         self.assertTrue(body["trial"])
 
+    def test_a_name_with_html_metacharacters_is_refused(self):
+        self.invite()
+        r = self.client.post("/v1/account/register",
+                             json={"inviteCode": "INVITE-1",
+                                   "name": '<span><img src=x onerror=alert(1)>',
+                                   "employeeNo": "E001"})
+        self.assertEqual(r.status_code, 400, r.text)
+        self.assertIn("HTML", r.json()["detail"])
+
     def test_wrong_expired_and_used_up_invites_are_refused(self):
         r = self.client.post("/v1/account/register",
                              json={"inviteCode": "NOPE", "name": "张三",
@@ -167,6 +176,7 @@ class RegisterLoginTests(_AccountCase):
         self.assertEqual(r.json()["user"]["employeeNo"], "E001")
 
     def test_login_with_an_unknown_employee_number_is_401(self):
+        self.invite()
         r = self.login("NOPE")
         self.assertEqual(r.status_code, 401)
         self.assertEqual(r.json()["code"], "unauthorized")

@@ -32,7 +32,7 @@ import jwt
 from fastapi import APIRouter, Request
 
 from server import errors, ops
-from server.auth import JWT_ALG, decode_token
+from server.auth import JWT_ALG, PairThrottle, decode_token
 
 router = APIRouter(prefix="/v1/account")
 
@@ -43,6 +43,21 @@ DEFAULT_USER_TOKEN_TTL_S = 30 * 24 * 3600
 #: 表格里都要好复制；姓名才是中文）。
 _EMPLOYEE_CHARS = set("abcdefghijklmnopqrstuvwxyz"
                       "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-.")
+
+#: 姓名/备注这类**会出网**的自由文本：限长 + 拒绝 HTML 元字符/控制字符。
+#: 管理面的表格已经只允许 `raw()` 显式插入，但输入侧再收一道，避免"某天有人
+#: 又加了一个不过 esc 的渲染点"时直接变成存储型 XSS。
+_TEXT_MAX = 64
+
+
+def clean_text(raw: Any, what: str = "文本", max_len: int = _TEXT_MAX) -> str:
+    value = str(raw or "").strip()
+    if len(value) > int(max_len):
+        raise errors.bad_request("%s 太长（上限 %d 字）" % (what, int(max_len)))
+    for ch in value:
+        if ch in '<>&"\'`' or ord(ch) < 32:
+            raise errors.bad_request("%s 不能包含 HTML 元字符或控制字符" % what)
+    return value
 
 
 def new_user_id() -> str:
@@ -83,6 +98,10 @@ class AccountService:
         self.store = store
         self.auth = auth
         self.billing = billing
+        # 登录是**免凭据**入口（工号 + 邀请码），必须和 /v1/pair 一样有失败退避。
+        self.login_throttle = PairThrottle(
+            max_failures=int(cfg.get("auth.pair_max_failures", 5)),
+            window_s=float(cfg.get("auth.pair_window_s", 300)))
 
     # ---------------------------------------------------------------- 令牌
 
@@ -160,7 +179,7 @@ class AccountService:
         # 否则会留下一个"注册成功但拿不到令牌"的账号，用户只能找管理员删。
         _ = self.key
         payload = payload or {}
-        name = str(payload.get("name") or "").strip()
+        name = clean_text(payload.get("name"), "姓名", 64)
         employee_no = str(payload.get("employeeNo") or payload.get("employee_no") or "").strip()
         phone = str(payload.get("phone") or "").strip()
         invite_code = str(payload.get("inviteCode") or payload.get("invite_code") or "").strip()
@@ -203,25 +222,36 @@ class AccountService:
         return {"userId": user_id, "user": _public_user(user), "devices": [],
                 "trial": bool(trial is not None), **issued}
 
-    def login(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+    def login(self, payload: Dict[str, Any], source: str = "") -> Dict[str, Any]:
         _ = self.key
         payload = payload or {}
-        employee_no = str(payload.get("employeeNo") or payload.get("employee_no") or "").strip()
-        if not employee_no:
-            raise errors.bad_request("要填工号")
-        user = self.store.user_by_employee_no(employee_no)
-        if user is None:
-            # 不区分"没这个工号"与"邀请码不对"：那等于送一个枚举工号的接口。
-            raise errors.unauthorized("工号或邀请码不对")
-        # 设计 §4.2 的 login 是 `{employeeNo, inviteCode?}` —— 邀请码**可选**。
-        # 给了就校验（不消耗名额）；没给也允许（账号已经在注册时过了邀请码那道门）。
-        # ⚠️ 这意味着"知道工号就能登录"：内部 10 元月卡的定位下可接受，
-        # 对外部署必须换成手机号验证码/企业微信（设计 §3.5.11）。
-        invite_code = str(payload.get("inviteCode") or payload.get("invite_code") or "")
-        if invite_code:
-            self._valid_login_invite(invite_code)
-        if str(user.get("status") or "active") != "active":
-            raise errors.forbidden("这个账号已停用")
+        # 与 `/v1/pair` 同形的失败退避：同一来源连续错到阈值就 429（5 分钟窗口）。
+        self.login_throttle.check(str(source or "unknown"))
+        try:
+            employee_no = str(payload.get("employeeNo")
+                              or payload.get("employee_no") or "").strip()
+            if not employee_no:
+                raise errors.bad_request("要填工号")
+            user = self.store.user_by_employee_no(employee_no)
+            if user is None:
+                # 不区分"没这个工号"与"邀请码不对"：那等于送一个枚举工号的接口。
+                raise errors.unauthorized("工号或邀请码不对")
+            # `invite.required=true` 时**登录也强制**邀请码（不是只有注册）。
+            # 邀请码不消耗次数；只验存在且未过期。客户端/协议不变。
+            invite_code = str(payload.get("inviteCode") or payload.get("invite_code") or "")
+            if bool(self.cfg.get("invite.required", True)):
+                if not invite_code:
+                    raise errors.invite_invalid("登录需要邀请码")
+                self._valid_login_invite(invite_code)
+            elif invite_code:
+                self._valid_login_invite(invite_code)
+            if str(user.get("status") or "active") != "active":
+                raise errors.forbidden("这个账号已停用")
+        except errors.EchoError as exc:
+            if exc.status in (400, 401, 403):
+                self.login_throttle.failed(str(source or "unknown"))
+            raise
+        self.login_throttle.succeeded(str(source or "unknown"))
         issued = self.issue_token(user)
         return {"userId": str(user["user_id"]), "user": _public_user(user),
                 "devices": [device_view(d) for d in
@@ -309,6 +339,15 @@ def _user(request: Request) -> Dict[str, Any]:
     return _svc(request).authenticate(request.headers.get("authorization") or "")
 
 
+def _source_of(request: Request) -> str:
+    """限速来源：优先 X-Forwarded-For 第一段，否则 request.client.host。"""
+    fwd = str(request.headers.get("x-forwarded-for") or "").split(",")[0].strip()
+    if fwd:
+        return fwd
+    client = getattr(request, "client", None)
+    return str(getattr(client, "host", "") or "unknown")
+
+
 async def _body(request: Request) -> Dict[str, Any]:
     try:
         payload = await request.json()
@@ -326,7 +365,7 @@ async def register(request: Request):
 @router.post("/login")
 async def login(request: Request):
     """工号 (+ 邀请码) → `{userToken, expiresAt, ...}`。**免客户端凭据**。"""
-    return _svc(request).login(await _body(request))
+    return _svc(request).login(await _body(request), _source_of(request))
 
 
 @router.get("/me")

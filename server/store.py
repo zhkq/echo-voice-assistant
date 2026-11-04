@@ -41,6 +41,7 @@
 """
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import threading
@@ -990,6 +991,10 @@ class Store:
                      now, now))
                 self._db.commit()
         except sqlite3.IntegrityError as exc:
+            # **必须回滚**：`INSERT` 撞唯一索引后事务仍是打开的；不回滚的话，
+            # 下一个 `take_pairing_code` / `consume_invite` 的 `BEGIN IMMEDIATE`
+            # 会报 "cannot start a transaction within a transaction"（HTTP 500）。
+            self._db.rollback()
             raise ValueError(str(exc))
         return self.user(user_id) or {}
 
@@ -1255,6 +1260,9 @@ class Store:
                 self._db.commit()
             return True
         except sqlite3.IntegrityError:
+            # 重复回调是支付宝重投的**常态**；同样必须回滚，否则下一次
+            # `/v1/pair`（BEGIN IMMEDIATE）会 500。
+            self._db.rollback()
             return False
 
     def notify_record(self, trade_no: str) -> Optional[Dict[str, Any]]:
@@ -1298,3 +1306,258 @@ class Store:
                 (str(status or ""), time.time(), str(user_id)))
             self._db.commit()
             return bool(cur.rowcount)
+
+    # ---------------------------------------------------------------- 收费事务
+    #
+    # 支付成功要同时改 4 处：`alipay_notify`（幂等）、`orders`（状态）、
+    # `entitlements`（权益）、`order_events`（审计）。**必须同事务**：任何一步失败
+    # 都不能留下"订单已 paid、权益没到账"的半成品（那会让重复回调永远返回
+    # duplicate，权益再也补不上）。下面两个方法在**持 `_lock`** 时用
+    # `BEGIN IMMEDIATE` 完成；`entitlement_fn` 是纯函数（Holding the lock 时不能再
+    # 调本类的其它方法，会死锁）。
+
+    _ENT_COLS = ("user_id", "plan_code", "paid_until", "daily_audio_minutes",
+                 "tts_chars", "qps", "max_devices", "max_concurrent", "status",
+                 "order_id", "updated_at")
+
+    def _upsert_entitlement_locked(self, row: Dict[str, Any]) -> None:
+        cols = self._ENT_COLS
+        values = tuple(row.get(c, 0) for c in cols)
+        self._db.execute(
+            "INSERT INTO entitlements (%s) VALUES (%s)"
+            " ON CONFLICT(user_id) DO UPDATE SET %s"
+            % (", ".join(cols), ", ".join("?" * len(cols)),
+               ", ".join("%s=excluded.%s" % (c, c) for c in cols if c != "user_id")),
+            values)
+
+    def _event_locked(self, order_id: str, event_type: str, payload: str = "") -> None:
+        self._db.execute(
+            "INSERT INTO order_events (order_id, type, payload, at) VALUES (?,?,?,?)",
+            (str(order_id), str(event_type), str(payload or ""), time.time()))
+
+    @staticmethod
+    def _meta_load(text: Any) -> Dict[str, Any]:
+        try:
+            got = json.loads(str(text or "") or "{}")
+        except (TypeError, ValueError):
+            return {}
+        return got if isinstance(got, dict) else {}
+
+    def settle_paid_order(self, order_id: str, trade_no: str, notify_raw: str,
+                          verified: bool, now: float, plan: Dict[str, Any],
+                          entitlement_fn) -> Dict[str, Any]:
+        """**原子**落一笔已验签的成功支付。
+
+        `entitlement_fn(existing_row, plan)` 是纯函数（不能在锁内再调 Store）；
+        它返回新的权益行。失败时整个事务回滚 —— 订单仍是 `paying`，回调可重试，
+        **不会**出现"paid 但没权益"。
+
+        返回 `{"ok": True, "order":…, "entitlement":…}` / `{"duplicate": True, …}`
+        / `{"conflict": status, …}` / `{"retry": True, …}`（另一个线程刚抢到状态）。
+        """
+        with self._lock:
+            try:
+                self._db.execute("BEGIN IMMEDIATE")
+                row = self._db.execute("SELECT * FROM orders WHERE order_id=?",
+                                       (str(order_id),)).fetchone()
+                if row is None:
+                    self._db.rollback()
+                    return {"ok": False, "not_found": True}
+                order = dict(row)
+                current = str(order.get("status") or "")
+                if current == "paid":
+                    self._db.rollback()
+                    return {"ok": False, "duplicate": True, "order": order}
+                if current not in ("created", "paying"):
+                    self._db.rollback()
+                    return {"ok": False, "conflict": current, "order": order}
+                try:
+                    self._db.execute(
+                        "INSERT INTO alipay_notify (trade_no, order_id, raw, verified, at)"
+                        " VALUES (?,?,?,?,?)",
+                        (str(trade_no), str(order_id), str(notify_raw or ""),
+                         1 if verified else 0, float(now)))
+                except sqlite3.IntegrityError:
+                    self._db.rollback()
+                    return {"ok": False, "duplicate": True, "order": order}
+                ent_row = self._db.execute(
+                    "SELECT * FROM entitlements WHERE user_id=?",
+                    (str(order.get("user_id") or ""),)).fetchone()
+                existing = dict(ent_row) if ent_row else None
+                entitlement = entitlement_fn(existing, plan)
+                meta = self._meta_load(order.get("meta"))
+                meta["tradeNo"] = str(trade_no)
+                meta["fulfilled"] = True
+                cur = self._db.execute(
+                    "UPDATE orders SET status='paid', paid_at=?, alipay_trade_no=?,"
+                    " meta=? WHERE order_id=? AND status IN ('created','paying')",
+                    (float(now), str(trade_no), json.dumps(meta, ensure_ascii=False,
+                                                            sort_keys=True),
+                     str(order_id)))
+                if int(cur.rowcount or 0) != 1:
+                    self._db.rollback()
+                    # **不能在持锁时调 self.order()**（_lock 不可重入）。返回旧行，
+                    # 调用方重读即可。
+                    return {"ok": False, "retry": True, "order": order}
+                if entitlement:
+                    self._upsert_entitlement_locked(entitlement)
+                self._event_locked(order_id, "paid",
+                                   json.dumps({"tradeNo": str(trade_no)},
+                                              ensure_ascii=False))
+                if entitlement:
+                    self._event_locked(order_id, "entitlement",
+                                       json.dumps({"plan": entitlement.get("plan_code"),
+                                                   "paidUntil": entitlement.get("paid_until")},
+                                                  ensure_ascii=False))
+                self._db.commit()
+                # 不回头调 self.order()（持锁会死锁）：用已读行 + 本次写入的结果。
+                updated = dict(order)
+                updated["status"] = "paid"
+                updated["paid_at"] = float(now)
+                updated["alipay_trade_no"] = str(trade_no)
+                updated["meta"] = json.dumps(meta, ensure_ascii=False, sort_keys=True)
+                return {"ok": True, "order": updated, "entitlement": entitlement}
+            except Exception:
+                self._db.rollback()
+                raise
+
+    def repair_paid_order(self, order_id: str, now: float, plan: Dict[str, Any],
+                          entitlement_fn) -> Dict[str, Any]:
+        """重复回调的自愈：订单已 `paid` 但 `meta.fulfilled` 不是真 → 补权益。
+
+        老版本/中途失败才会出现这种行；正常路径由 `settle_paid_order` 一次写完。
+        """
+        with self._lock:
+            try:
+                self._db.execute("BEGIN IMMEDIATE")
+                row = self._db.execute("SELECT * FROM orders WHERE order_id=?",
+                                       (str(order_id),)).fetchone()
+                if row is None:
+                    self._db.rollback()
+                    return {"ok": False, "not_found": True}
+                order = dict(row)
+                if str(order.get("status") or "") != "paid":
+                    self._db.rollback()
+                    return {"ok": False, "not_paid": True, "order": order}
+                meta = self._meta_load(order.get("meta"))
+                ent_row = self._db.execute(
+                    "SELECT * FROM entitlements WHERE user_id=?",
+                    (str(order.get("user_id") or ""),)).fetchone()
+                # 已 fulfilled **且**权益行还在 → 真的不用补；权益行丢了则继续补。
+                if bool(meta.get("fulfilled")) and ent_row is not None:
+                    self._db.rollback()
+                    return {"ok": True, "already": True, "order": order}
+                entitlement = entitlement_fn(dict(ent_row) if ent_row else None, plan)
+                meta["fulfilled"] = True
+                self._db.execute(
+                    "UPDATE orders SET meta=? WHERE order_id=?",
+                    (json.dumps(meta, ensure_ascii=False, sort_keys=True),
+                     str(order_id)))
+                if entitlement:
+                    self._upsert_entitlement_locked(entitlement)
+                    self._event_locked(order_id, "entitlement-repair",
+                                       json.dumps({"plan": entitlement.get("plan_code"),
+                                                   "paidUntil": entitlement.get("paid_until")},
+                                                  ensure_ascii=False))
+                self._db.commit()
+                # 不回头调 self.order()（持锁会死锁）：用已读行 + 本次写入的结果。
+                updated = dict(order)
+                updated["meta"] = json.dumps(meta, ensure_ascii=False, sort_keys=True)
+                return {"ok": True, "order": updated, "entitlement": entitlement}
+            except Exception:
+                self._db.rollback()
+                raise
+
+    def install_pair_code(self, order_id: str, expected_code_id: str,
+                          code_row: Dict[str, Any], meta_extra: Dict[str, Any],
+                          now: Optional[float] = None) -> Dict[str, Any]:
+        """给订单安装一张新配对码；**CAS** 保证并发轮询只装一张。
+
+        `expected_code_id` 是调用方读到的当前值：如果事务里已经变了，说明另一个
+        线程刚装好，返回 `raced=True` 让调用方重读。旧码在这里删除（旧码本来就
+        已过期/失效），新码与订单的 `pairing_code_id` 同事务写入。
+        """
+        now = time.time() if now is None else float(now)
+        expected = str(expected_code_id or "")
+        with self._lock:
+            try:
+                self._db.execute("BEGIN IMMEDIATE")
+                row = self._db.execute("SELECT * FROM orders WHERE order_id=?",
+                                       (str(order_id),)).fetchone()
+                if row is None:
+                    self._db.rollback()
+                    return {"ok": False, "not_found": True}
+                order = dict(row)
+                current = str(order.get("pairing_code_id") or "")
+                if current != expected:
+                    self._db.rollback()
+                    return {"ok": False, "raced": True, "order": order}
+                if expected:
+                    old = self._db.execute(
+                        "SELECT expires_at FROM pairing_codes WHERE code_hash=?",
+                        (expected,)).fetchone()
+                    if old is not None and float(old["expires_at"] or 0) >= now:
+                        self._db.rollback()
+                        return {"ok": False, "valid": True, "order": order}
+                if expected:
+                    self._db.execute("DELETE FROM pairing_codes WHERE code_hash=?",
+                                     (expected,))
+                self._db.execute(
+                    "INSERT INTO pairing_codes (code_hash, created_at, expires_at,"
+                    " created_by, name, scopes, client_id, user_id, kind)"
+                    " VALUES (?,?,?,?,?,?,?,?,?)",
+                    (str(code_row.get("code_hash") or ""), now,
+                     now + float(code_row.get("ttl_s") or 0),
+                     str(code_row.get("created_by") or ""),
+                     str(code_row.get("name") or ""),
+                     str(code_row.get("scopes") or ""),
+                     str(code_row.get("client_id") or ""),
+                     str(code_row.get("user_id") or ""),
+                     str(code_row.get("kind") or "")))
+                meta = self._meta_load(order.get("meta"))
+                meta.update(meta_extra or {})
+                cur = self._db.execute(
+                    "UPDATE orders SET pairing_code_id=?, meta=?"
+                    " WHERE order_id=? AND pairing_code_id=?",
+                    (str(code_row.get("code_hash") or ""),
+                     json.dumps(meta, ensure_ascii=False, sort_keys=True),
+                     str(order_id), expected))
+                if int(cur.rowcount or 0) != 1:
+                    self._db.rollback()
+                    return {"ok": False, "raced": True, "order": order}
+                self._event_locked(order_id, "pair-code",
+                                   json.dumps({"codeId": str(code_row.get("code_hash") or "")},
+                                              ensure_ascii=False))
+                self._db.commit()
+                updated = dict(order)
+                updated["pairing_code_id"] = str(code_row.get("code_hash") or "")
+                updated["meta"] = json.dumps(meta, ensure_ascii=False, sort_keys=True)
+                return {"ok": True, "order": updated}
+            except Exception:
+                self._db.rollback()
+                raise
+
+    def close_expired_orders(self, now: Optional[float] = None,
+                             grace_s: float = 0.0) -> List[str]:
+        """把过了 `expires_at` 的未支付订单关掉（`billing.order_ttl_s` 的执行者）。"""
+        now = time.time() if now is None else float(now)
+        cutoff = now - max(0.0, float(grace_s or 0.0))
+        closed: List[str] = []
+        with self._lock:
+            try:
+                self._db.execute("BEGIN IMMEDIATE")
+                rows = self._db.execute(
+                    "SELECT order_id FROM orders WHERE status IN ('created','paying')"
+                    " AND expires_at > 0 AND expires_at < ?", (cutoff,)).fetchall()
+                for r in rows:
+                    oid = str(r["order_id"])
+                    self._db.execute(
+                        "UPDATE orders SET status='closed' WHERE order_id=?"
+                        " AND status IN ('created','paying')", (oid,))
+                    self._event_locked(oid, "expired", "")
+                    closed.append(oid)
+                self._db.commit()
+            except Exception:
+                self._db.rollback()
+                raise
+        return closed

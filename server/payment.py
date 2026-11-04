@@ -48,6 +48,14 @@ from server import errors
 #: 支付宝交易状态里表示"已收到钱"的那两个（设计 §4.6 的白名单）。
 PAID_TRADE_STATUSES = ("TRADE_SUCCESS", "TRADE_FINISHED")
 
+#: 支付宝生产/沙箱网关（`alipay.sandbox=true` 且没显式改 gateway 时自动切）。
+ALIPAY_PROD_GATEWAY = "https://openapi.alipay.com/gateway.do"
+ALIPAY_SANDBOX_GATEWAY = "https://openapi-sandbox.dl.alipaydev.com/gateway.do"
+
+#: Mock 端点允许的本机/测试来源。TestClient 的 `client.host` 是 `testclient`；
+#: 真实服务是回环地址。远程来源默认拒绝，除非显式 `payment.mock_allow_remote`。
+_LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost", "testclient", "testserver"}
+
 
 def _canonical(form: Dict[str, Any]) -> str:
     """待签名串：按 key 字典序，`k=v` 用 `&` 连接，**排除 sign / sign_type**。"""
@@ -116,7 +124,10 @@ class MockGateway:
     configured = True
 
     def __init__(self, secret: str = ""):
-        self.secret = str(secret or "echo-mock-payment-not-for-production")
+        # **没配就随机生成**（每次启动不同），不把仓库里的默认值当生产密钥。
+        # Mock 的签名只在同一进程内 build_form → verify_notify，所以随机完全够用。
+        self.secret = str(secret or secrets.token_hex(16))
+        self.generated_secret = not bool(secret)
 
     def _sign(self, form: Dict[str, Any]) -> str:
         return hmac.new(self.secret.encode("utf-8"),
@@ -174,10 +185,15 @@ class AlipayGateway:
 
     def __init__(self, cfg):
         self.app_id = str(cfg.get("alipay.app_id", "") or "")
+        self.seller_id = str(cfg.get("alipay.seller_id", "") or "")
         self.private_key_path = str(cfg.get("alipay.private_key_path", "") or "")
         self.public_key_path = str(cfg.get("alipay.public_key_path", "") or "")
-        self.gateway = str(cfg.get("alipay.gateway", "") or
-                           "https://openapi.alipay.com/gateway.do")
+        self.sandbox = bool(cfg.get("alipay.sandbox", False))
+        configured = str(cfg.get("alipay.gateway", "") or "")
+        if self.sandbox and configured in ("", ALIPAY_PROD_GATEWAY):
+            configured = str(cfg.get("alipay.sandbox_gateway", "") or
+                             ALIPAY_SANDBOX_GATEWAY)
+        self.gateway = configured or ALIPAY_PROD_GATEWAY
         self.notify_url = str(cfg.get("payment.notify_url", "")
                               or cfg.get("alipay.notify_url", "") or "")
 
@@ -258,8 +274,11 @@ class AlipayGateway:
         sign = str(got.pop("sign", "") or "")
         if not sign or not self._verify(got, sign):
             raise errors.bad_request("支付宝回调验签失败")
-        if str(got.get("app_id") or "") and str(got.get("app_id")) != self.app_id:
-            raise errors.bad_request("支付宝回调 app_id 不匹配")
+        # **app_id 必须存在且相等**（不是"有才比"）：缺了就是来源不明。
+        if str(got.get("app_id") or "") != self.app_id:
+            raise errors.bad_request("支付宝回调 app_id 缺失或不匹配")
+        if self.seller_id and str(got.get("seller_id") or "") != self.seller_id:
+            raise errors.bad_request("支付宝回调 seller_id 不匹配")
         return _normalize(got, verified=True)
 
     def query(self, order: Dict[str, Any]) -> Dict[str, Any]:
@@ -297,12 +316,28 @@ def _svc(request: Request):
     return svc
 
 
+def _check_mock_source(request: Request) -> None:
+    """Mock 端点默认只允许本机/测试来源（生产用 alipay，不会注册这些路由）。
+
+    这是防"provider 误配成 mock 后公网谁都能模拟付款"的第二道闸；显式
+    `payment.mock_allow_remote=true` 可放开（只建议在隔离环境）。
+    """
+    cfg = request.app.state.echo.cfg
+    if bool(cfg.get("payment.mock_allow_remote", False)):
+        return
+    client = getattr(request, "client", None)
+    host = str(getattr(client, "host", "") or "")
+    if host not in _LOOPBACK_HOSTS:
+        raise errors.forbidden("Mock 支付端点只允许本机/测试来源")
+
+
 @mock_router.post("/pay/{order_id}")
 async def mock_pay(request: Request, order_id: str):
     """**模拟付款**：构造一张同形 notify → 走与真回调完全相同的校验/入账路径。
 
     响应里 `"mock": true`。这个端点只存在于 `payment.provider=mock`。
     """
+    _check_mock_source(request)
     svc = _svc(request)
     if not svc.enabled or not isinstance(svc.gateway, MockGateway):
         raise errors.payment_unconfigured()
@@ -329,6 +364,7 @@ async def mock_notify(request: Request):
     `amountCents` 不传就用订单金额；传了别的值 → 服务端会按"金额不一致"拒掉
     （这正是要测的负向路径，不是后门）。
     """
+    _check_mock_source(request)
     svc = _svc(request)
     if not svc.enabled or not isinstance(svc.gateway, MockGateway):
         raise errors.payment_unconfigured()

@@ -29,6 +29,7 @@
 """
 from __future__ import annotations
 
+import datetime
 import hashlib
 import hmac
 import json
@@ -67,6 +68,21 @@ PLAN_COLUMNS = ("code", "name", "price_cents", "days", "daily_audio_minutes",
 
 #: 允许的订单状态（**名字即契约**：客户端与对账脚本都按它判）。
 ORDER_STATES = ("created", "paying", "paid", "refunded", "closed")
+
+
+def day_start(cfg, ts: Optional[float] = None) -> float:
+    """`billing.timezone` 的**自然日 0 点**（epoch 秒）。"""
+    now_ts = time.time() if ts is None else float(ts)
+    try:
+        from zoneinfo import ZoneInfo
+        zone = ZoneInfo(str(cfg.get("billing.timezone", "Asia/Shanghai")
+                            or "Asia/Shanghai"))
+        dt = datetime.datetime.fromtimestamp(now_ts, zone)
+        return dt.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+    except Exception:                                           # pragma: no cover - 兜底
+        import datetime as _dt
+        dt = _dt.datetime.fromtimestamp(now_ts)
+        return dt.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
 
 
 def new_order_id() -> str:
@@ -115,8 +131,10 @@ def parse_plan(payload: Dict[str, Any]) -> Dict[str, Any]:
     code = str(payload.get("code") or "").strip().lower()
     if not code or not all(c.isalnum() or c in "-_" for c in code):
         raise errors.bad_request("套餐 code 只能包含字母/数字/下划线/短横线")
-    out: Dict[str, Any] = {"code": code,
-                           "name": str(payload.get("name") or code).strip()}
+    name = str(payload.get("name") or code).strip()
+    if not name or len(name) > 64 or any(ord(ch) < 32 for ch in name):
+        raise errors.bad_request("套餐名字不能为空、不能超过 64 字或含控制字符")
+    out: Dict[str, Any] = {"code": code, "name": name}
 
     def _int(field: str, default: int, lo: int, hi: int) -> int:
         raw = payload.get(field, default)
@@ -148,6 +166,23 @@ def parse_plan(payload: Dict[str, Any]) -> Dict[str, Any]:
     out["active"] = 1 if payload.get("active", True) else 0
     out["sort"] = _int("sort", 50, 0, 100000)
     return out
+
+
+def merge_plan_payload(payload: Dict[str, Any],
+                       existing: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """把 PUT/POST 的**部分字段**合并到现有套餐，再走 `parse_plan` 校验。
+
+    不合并的话，`PUT {"priceCents": 2800}` 会把天数/额度/设备数全部重置成出厂
+    默认值 —— 对 `trial` / `internal` 尤其危险（点一下「改 → 保存」就变成月卡）。
+    """
+    payload = dict(payload or {})
+    if not existing:
+        return parse_plan(payload)
+    base = plan_view(existing)
+    base["sort"] = int(existing.get("sort") or 0)
+    base.update(payload)
+    base["code"] = str(payload.get("code") or existing.get("code") or "")
+    return parse_plan(base)
 
 
 class BillingService:
@@ -189,6 +224,15 @@ class BillingService:
     @property
     def provider(self) -> str:
         return str(self.cfg.get("payment.provider", "disabled") or "disabled").lower()
+
+    @property
+    def effective_gating(self) -> bool:
+        """收费闸门**是否真的会生效**：光开 billing 不够，还必须开客户端鉴权。
+
+        不开鉴权时所有请求都是 `anonymous`，无法映射到 user → 全部走免费老路。
+        管理面 overview 会把这个值显示成"计费闸门未生效"，不要让它静默空转。
+        """
+        return bool(self.enabled and self.cfg.get("auth.enabled", False))
 
     # ---------------------------------------------------------------- 套餐
 
@@ -239,11 +283,21 @@ class BillingService:
             raise errors.entitlement_expired(paid_until)
         return row
 
+    #: 配置键与数据库列名不一致的那两个（历史名字）：`billing.daily_tts_chars`
+    #: 才是配置里的键，权益列叫 `tts_chars`。不映射的话 TTS 兜底配置永远不生效。
+    _CFG_KEYS = {
+        "daily_audio_minutes": "billing.daily_audio_minutes",
+        "tts_chars": "billing.daily_tts_chars",
+        "qps": "billing.qps",
+        "max_devices": "billing.max_devices",
+        "max_concurrent": "billing.max_concurrent",
+    }
+
     def _limits(self, ent: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         def pick(key: str, default):
             if ent and ent.get(key) not in (None, ""):
                 return ent.get(key)
-            return self.cfg.get("billing.%s" % key, default)
+            return self.cfg.get(self._CFG_KEYS.get(key, "billing.%s" % key), default)
 
         return {
             "daily_audio_minutes": float(pick("daily_audio_minutes", 120.0) or 0.0),
@@ -361,8 +415,12 @@ class BillingService:
         if not uid:
             return None
         user = self.store.user(uid)
-        if user is None or str(user.get("status") or "active") != "active":
-            return None
+        # **fail-closed**：绑定行还在、但账号被停用/删除时**不要**回落免费老路。
+        # 那会让"停用账号"看起来生效了（管理面显示停用），实际这台设备继续免费用。
+        if user is None:
+            raise errors.forbidden("绑定的账号不存在，请联系管理员")
+        if str(user.get("status") or "active") != "active":
+            raise errors.forbidden("绑定的账号已停用，请联系管理员")
         return user
 
     def forget_device(self, client_id: str) -> None:
@@ -436,8 +494,8 @@ class BillingService:
 
     # ---------------------------------------------------------------- 订单
 
-    def _order_pay_view(self, order: Dict[str, Any], *, create: bool = False
-                        ) -> Dict[str, Any]:
+    def _order_pay_view(self, order: Dict[str, Any], *, create: bool = False,
+                        with_pair_url: bool = True) -> Dict[str, Any]:
         meta = _unjson(order.get("meta"))
         view = {
             "orderId": str(order.get("order_id") or ""),
@@ -452,12 +510,15 @@ class BillingService:
         }
         if create:
             view["mock"] = bool(meta.get("mock"))
-        if view["status"] == "paid":
+        # **管理面列表必须只读**：`pairUrl` 可能触发补发码（写库 + 审计），
+        # 不能因为管理员刷新一下订单列表就写。客户端轮询路径才带 `pairUrl`。
+        if view["status"] == "paid" and with_pair_url:
             view["pairUrl"] = self._pair_url_locked(order)
         return view
 
-    def order_view(self, order: Dict[str, Any]) -> Dict[str, Any]:
-        return self._order_pay_view(order)
+    def order_view(self, order: Dict[str, Any], *,
+                   with_pair_url: bool = True) -> Dict[str, Any]:
+        return self._order_pay_view(order, with_pair_url=with_pair_url)
 
     def create_order(self, user_id: str, plan_code: str, *, client_id: str = ""
                      ) -> Dict[str, Any]:
@@ -470,6 +531,11 @@ class BillingService:
             # **先判支付配置，再落订单**：未配置时不要留一堆永远 `closed` 的孤儿订单。
             raise errors.payment_unconfigured()
         now = time.time()
+        # `billing.order_ttl_s` 的执行者：先关掉过期的未支付订单。
+        try:
+            self.store.close_expired_orders(now)
+        except Exception:                                       # pragma: no cover - 兜底
+            pass
         hourly = int(self.cfg.get("billing.order_rate_per_hour", 10) or 10)
         if hourly > 0 and self.store.orders_created_since(now - 3600, user_id) >= hourly:
             raise errors.rate_limited(3600, "同一账号一小时内建单太多")
@@ -525,94 +591,23 @@ class BillingService:
 
     # ---------------------------------------------------------------- 支付回调
 
-    def apply_notify(self, norm: Dict[str, Any]) -> Dict[str, Any]:
-        """已验签/已归一化的支付结果 → 订单 + 权益。**幂等**。
-
-        `norm` 至少含 `tradeNo` / `outTradeNo` / `amountCents` / `status`。
-        Mock 与真实支付宝都走这一条（`payment` 只负责验签与字段归一）。
-        """
-        trade_no = str(norm.get("tradeNo") or "")
-        order_id = str(norm.get("outTradeNo") or "")
-        if not trade_no or not order_id:
-            raise errors.bad_request("支付回调缺 tradeNo / outTradeNo")
-        order = self.store.order(order_id)
-        if order is None:
-            raise errors.order_not_found(order_id)
-        amount = int(norm.get("amountCents") or 0)
-        if amount != int(order.get("amount_cents") or 0):
-            raise errors.bad_request("支付金额与订单金额不一致")
-        status = str(norm.get("status") or "")
-        first = self.store.record_notify(trade_no, order_id,
-                                         raw=json.dumps(norm, ensure_ascii=False),
-                                         verified=bool(norm.get("verified", True)))
-        if status != "paid":
-            # 非成功状态只留痕（关闭/失败），不改权益。
-            self.store.insert_order_event(order_id, "notify-" + (status or "unknown"), "")
-            return {"ok": True, "orderId": order_id, "status": "ignored",
-                    "duplicate": not first}
-        current = str(order.get("status") or "")
-        if current == "paid":
-            # 同一笔重复通知 → 幂等成功；另一笔 trade_no 打到已支付订单 → 拒绝。
-            if str(order.get("alipay_trade_no") or "") == trade_no:
-                return {"ok": True, "orderId": order_id, "status": "paid",
-                        "duplicate": True}
-            raise errors.order_state_conflict(current, "未支付订单")
-        if current == "refunded":
-            raise errors.order_state_conflict(current, "未支付订单")
-        if current not in ("created", "paying"):
-            raise errors.order_state_conflict(current, "created/paying")
-
-        now = time.time()
-        meta = _unjson(order.get("meta"))
-        meta["tradeNo"] = trade_no
-        if norm.get("buyerId"):
-            meta["buyerId"] = str(norm["buyerId"])
-        self.store.update_order(order_id, status="paid", paid_at=now,
-                                alipay_trade_no=trade_no, meta=_json(meta))
-        self.store.insert_order_event(order_id, "paid", _json({"tradeNo": trade_no}))
-        # 支付身份回填（设计 §3.5.11：支付只做"把 payment identity 绑到当前 user"）。
-        # **只在该 user 还没有 identity 时填**，绝不去抢别人的 open_id。
-        buyer = str(norm.get("buyerId") or "")
-        if buyer and str(order.get("user_id") or ""):
-            user = self.store.user(str(order["user_id"]))
-            if user is not None and not str(user.get("alipay_open_id") or ""):
-                try:
-                    self.store.update_user(str(order["user_id"]), alipay_open_id=buyer)
-                except Exception:                               # pragma: no cover - 兜底
-                    pass
-        order = self.store.order(order_id) or order
-        self.extend_entitlement(order, now=now)
-        # 第一次支付且还没有设备 → 发配对码；已有设备 = 续费，不发码（设计 §4.5）。
-        if self.store.count_devices(str(order.get("user_id") or "")) == 0:
-            self.issue_purchase_code(order)
-        return {"ok": True, "orderId": order_id, "status": "paid", "duplicate": False}
-
-    def extend_entitlement(self, order: Dict[str, Any], *, now: Optional[float] = None
-                           ) -> Dict[str, Any]:
-        """把这次支付的天数加到权益上（提前续费从 `max(now, paid_until)` 起算）。
-
-        **internal 不被覆盖**：内部账号不过期、不收费，买了月卡也不该被降级。
-        """
-        now = time.time() if now is None else float(now)
+    def _entitlement_row(self, existing: Optional[Dict[str, Any]],
+                         plan: Dict[str, Any], order: Dict[str, Any],
+                         now: float) -> Dict[str, Any]:
+        """纯函数：由"现有权益 + 这次套餐"算新权益行（不碰 DB，事务内可安全调用）。"""
         uid = str(order.get("user_id") or "")
-        plan = self.store.plan(str(order.get("plan_code") or ""))
-        if plan is None:
-            raise errors.plan_not_found(str(order.get("plan_code") or ""))
-        existing = self.entitlement(uid)
         if (existing is not None
                 and str(existing.get("plan_code") or "") == "internal"
                 and str(existing.get("status") or "") == "active"):
-            return existing
+            return dict(existing)          # internal 不被付费套餐降级
         base = now
         # **试用不叠加**：设计 §4.5「试用到期后…续费买月卡即从当天起算」。
-        # 试用期内就买也按"从这次支付起算"（否则新用户第一单会变成 37 天，
-        # 与任务书 §7 第 5 条"paid_until = 支付时刻 + 30 天"对不上）。
         if (existing is not None and str(existing.get("status") or "") == "active"
                 and str(existing.get("plan_code") or "") != "trial"
                 and float(existing.get("paid_until") or 0) > now):
             base = float(existing["paid_until"])
         days = int(plan.get("days") or 0)
-        row = {
+        return {
             "user_id": uid,
             "plan_code": str(plan.get("code") or ""),
             "paid_until": (base + days * 86400.0) if days > 0 else 0.0,
@@ -625,11 +620,186 @@ class BillingService:
             "order_id": str(order.get("order_id") or ""),
             "updated_at": now,
         }
+
+    def _record_buyer(self, order: Dict[str, Any], norm: Dict[str, Any]) -> None:
+        """支付身份回填（设计 §3.5.11）。只在该 user 还没有 identity 时填。"""
+        buyer = str(norm.get("buyerId") or "")
+        uid = str(order.get("user_id") or "")
+        if not buyer or not uid:
+            return
+        user = self.store.user(uid)
+        if user is not None and not str(user.get("alipay_open_id") or ""):
+            try:
+                self.store.update_user(uid, alipay_open_id=buyer)
+            except Exception:                                   # pragma: no cover - 兜底
+                pass
+
+    def _duplicate_paid(self, order: Dict[str, Any], trade_no: str,
+                        norm: Dict[str, Any], now: float) -> Dict[str, Any]:
+        """已 `paid` 订单的重复回调：**自愈**没落完的权益/配对码，再返回 duplicate。"""
+        if str(order.get("alipay_trade_no") or "") != str(trade_no):
+            raise errors.order_state_conflict(str(order.get("status") or ""),
+                                              "未支付订单")
+        meta = _unjson(order.get("meta"))
+        uid = str(order.get("user_id") or "")
+        entitlement = self.store.entitlement(uid)
+        # 本单是否已经落过权益：新代码看 `meta.fulfilled`；老数据没有这个标记，
+        # 用 `entitlements.order_id == 本单` 或"后面还有已支付订单"推断（后者说明
+        # 这笔已经叠进后续的 paid_until，不能重复加）。
+        needs_repair = (not bool(meta.get("fulfilled"))) or entitlement is None
+        if needs_repair and entitlement is not None:
+            if str(entitlement.get("order_id") or "") == str(order.get("order_id") or ""):
+                needs_repair = False
+            else:
+                paid_at = float(order.get("paid_at") or order.get("created_at") or 0)
+                newer = [o for o in self.store.orders(user_id=uid, limit=1000)
+                         if str(o.get("status") or "") == "paid"
+                         and float(o.get("paid_at") or 0) > paid_at]
+                if newer:
+                    needs_repair = False
+        if needs_repair:
+            plan = self.store.plan(str(order.get("plan_code") or ""))
+            if plan is None:
+                raise errors.plan_not_found(str(order.get("plan_code") or ""))
+            out = self.store.repair_paid_order(
+                str(order.get("order_id") or ""), now, plan,
+                lambda existing, plan: self._entitlement_row(existing, plan, order, now))
+            order = out.get("order") or order
+            self.forget_entitlement(str(order.get("user_id") or ""))
+        self._record_buyer(order, norm)
+        # 码是**尽力而为**的：发码失败不影响已经落好的权益；重复回调会再试。
+        if self.store.count_devices(str(order.get("user_id") or "")) == 0:
+            self._ensure_pair_code(order)
+        return {"ok": True, "orderId": str(order.get("order_id") or ""),
+                "status": "paid", "duplicate": True}
+
+    def apply_notify(self, norm: Dict[str, Any]) -> Dict[str, Any]:
+        """已验签/已归一化的支付结果 → 订单 + 权益。**幂等、原子、可自愈**。
+
+        成功路径：`alipay_notify`（唯一键）+ 订单状态 + 权益 + 事件在**同一事务**；
+        任何一步失败都回滚，订单保持 `paying`，支付宝重投可以再来一次。
+        发码在事务之外（失败不影响权益；重复回调会补发）。
+        """
+        trade_no = str(norm.get("tradeNo") or "")
+        order_id = str(norm.get("outTradeNo") or "")
+        if not trade_no or not order_id:
+            raise errors.bad_request("支付回调缺 tradeNo / outTradeNo")
+        order = self.store.order(order_id)
+        if order is None:
+            raise errors.order_not_found(order_id)
+        amount = int(norm.get("amountCents") or 0)
+        if amount != int(order.get("amount_cents") or 0):
+            raise errors.bad_request("支付金额与订单金额不一致")
+        status = str(norm.get("status") or "")
+        raw = json.dumps(norm, ensure_ascii=False)
+        verified = bool(norm.get("verified", True))
+        if status != "paid":
+            # 非成功状态只留痕（关闭/失败），不改权益。
+            first = self.store.record_notify(trade_no, order_id, raw=raw,
+                                             verified=verified)
+            self.store.insert_order_event(order_id, "notify-" + (status or "unknown"), "")
+            return {"ok": True, "orderId": order_id, "status": "ignored",
+                    "duplicate": not first}
+
+        now = time.time()
+        current = str(order.get("status") or "")
+        if current == "paid":
+            return self._duplicate_paid(order, trade_no, norm, now)
+        if current not in ("created", "paying"):
+            raise errors.order_state_conflict(current, "created/paying")
+        plan = self.store.plan(str(order.get("plan_code") or ""))
+        if plan is None:
+            # 在事务**之前**失败：不回滚出"paid 没权益"，订单保持 paying，可重试。
+            raise errors.plan_not_found(str(order.get("plan_code") or ""))
+        out = self.store.settle_paid_order(
+            order_id, trade_no, raw, verified, now, plan,
+            lambda existing, plan: self._entitlement_row(existing, plan, order, now))
+        if out.get("duplicate"):
+            fresh = self.store.order(order_id) or out.get("order") or order
+            return self._duplicate_paid(fresh, trade_no, norm, now)
+        if out.get("retry"):
+            fresh = self.store.order(order_id) or out.get("order") or order
+            if str(fresh.get("status") or "") == "paid":
+                return self._duplicate_paid(fresh, trade_no, norm, now)
+            raise errors.order_state_conflict(str(fresh.get("status") or ""),
+                                              "created/paying")
+        if not out.get("ok"):
+            raise errors.order_state_conflict(str(out.get("conflict") or ""),
+                                              "created/paying")
+        order = out.get("order") or self.store.order(order_id) or order
+        self.forget_entitlement(str(order.get("user_id") or ""))
+        self._record_buyer(order, norm)
+        # 第一次支付且还没有设备 → 发配对码；已有设备 = 续费，不发码（设计 §4.5）。
+        if self.store.count_devices(str(order.get("user_id") or "")) == 0:
+            self._ensure_pair_code(order)
+        return {"ok": True, "orderId": order_id, "status": "paid", "duplicate": False}
+
+    def extend_entitlement(self, order: Dict[str, Any], *, now: Optional[float] = None
+                           ) -> Dict[str, Any]:
+        """把这次支付的天数加到权益上（公开入口；内部支付路径走事务版）。"""
+        now = time.time() if now is None else float(now)
+        plan = self.store.plan(str(order.get("plan_code") or ""))
+        if plan is None:
+            raise errors.plan_not_found(str(order.get("plan_code") or ""))
+        row = self._entitlement_row(self.entitlement(str(order.get("user_id") or "")),
+                                    plan, order, now)
+        self.store.upsert_entitlement(row)
+        self.forget_entitlement(str(order.get("user_id") or ""))
+        self.store.insert_order_event(str(order.get("order_id") or ""), "entitlement",
+                                      _json({"plan": row.get("plan_code"),
+                                             "paidUntil": row.get("paid_until")}))
+        return row
+
+    def recompute_entitlement(self, user_id: str, *, now: Optional[float] = None
+                              ) -> Optional[Dict[str, Any]]:
+        """按**未退款的已支付订单**重算权益（退款后不能让剩余天数一起失效）。
+
+        叠加重算规则与支付路径一致：按 `paid_at` 顺序，每笔从
+        `max(支付时刻, 当前 paid_until)` 起加套餐天数。没有剩余订单 → 状态 refunded。
+        """
+        uid = str(user_id or "")
+        now = time.time() if now is None else float(now)
+        existing = self.store.entitlement(uid)
+        if (existing is not None
+                and str(existing.get("plan_code") or "") == "internal"
+                and str(existing.get("status") or "") == "active"):
+            return existing
+        paid = [o for o in self.store.orders(user_id=uid, limit=1000)
+                if str(o.get("status") or "") == "paid"]
+        paid.sort(key=lambda o: float(o.get("paid_at") or o.get("created_at") or 0))
+        paid_until = 0.0
+        last_plan = None
+        last_order = ""
+        for order in paid:
+            plan = self.store.plan(str(order.get("plan_code") or ""))
+            if plan is None:
+                continue
+            base = max(float(order.get("paid_at") or order.get("created_at") or 0),
+                       paid_until)
+            days = int(plan.get("days") or 0)
+            paid_until = (base + days * 86400.0) if days > 0 else 0.0
+            last_plan = plan
+            last_order = str(order.get("order_id") or "")
+        if last_plan is None:
+            # 没有可重算的套餐：退款后直接失效（保留额度字段供人工处理）。
+            self.store.set_entitlement_status(uid, "refunded")
+            self.forget_entitlement(uid)
+            return self.store.entitlement(uid)
+        row = {
+            "user_id": uid,
+            "plan_code": str(last_plan.get("code") or ""),
+            "paid_until": paid_until,
+            "daily_audio_minutes": float(last_plan.get("daily_audio_minutes") or 0),
+            "tts_chars": int(last_plan.get("tts_chars") or 0),
+            "qps": int(last_plan.get("qps") or 1),
+            "max_devices": int(last_plan.get("max_devices") or 3),
+            "max_concurrent": int(last_plan.get("max_concurrent") or 1),
+            "status": "active",
+            "order_id": last_order,
+            "updated_at": now,
+        }
         self.store.upsert_entitlement(row)
         self.forget_entitlement(uid)
-        self.store.insert_order_event(str(order.get("order_id") or ""), "entitlement",
-                                      _json({"plan": row["plan_code"],
-                                             "paidUntil": row["paid_until"]}))
         return row
 
     # ---------------------------------------------------------------- 发码 / 配对
@@ -648,53 +818,36 @@ class BillingService:
         return "".join(CODE_ALPHABET[b % len(CODE_ALPHABET)]
                        for b in digest[:8])
 
-    def issue_purchase_code(self, order: Dict[str, Any]) -> Optional[str]:
-        """给这张订单发一张配对码（**同一订单只发一张；重发时旧码作废**）。
-
-        返回 `echo://pair?...`。库里**只有哈希**（`pairing_codes.code_hash`）与
-        一个随机 `nonce`；码本身由 `_derive_pair_code()` 现算，所以重复轮询能拿到
-        同一张，而 DB 里没有明文。
-        """
+    def _prepare_pair_code(self, order: Dict[str, Any]) -> Dict[str, Any]:
+        """纯计算一张新配对码（不写库）。返回 code / hash / nonce / url。"""
         order_id = str(order.get("order_id") or "")
         user_id = str(order.get("user_id") or "")
-        old = str(order.get("pairing_code_id") or "")
-        if old:
-            self.store.delete_pairing_code(old)
         plan = self.store.plan(str(order.get("plan_code") or ""))
         name = str((plan or {}).get("name") or "ECHO 后端")
         ttl = float(self.cfg.get("billing.pair_code_ttl_s", 900) or 900)
         nonce = secrets.token_hex(8)
         code = self._derive_pair_code(order_id, nonce)
-        self.auth.create_pairing_code(
-            created_by="order:" + order_id, name=name,
-            scopes=str(self.cfg.get("billing.client_scopes", "") or ""),
-            ttl_s=ttl, user_id=user_id, kind="purchase", code=code)
         code_id = hash_pairing_code(code)
-        meta = _unjson(order.get("meta"))
-        meta.pop("pairCode", None)                 # 旧版本可能留下的明文，清掉
-        meta.pop("pairUrl", None)
-        meta["pairNonce"] = nonce
-        self.store.update_order(order_id, pairing_code_id=str(code_id or ""),
-                                meta=_json(meta))
-        self.store.insert_order_event(order_id, "pair-code", _json({"codeId": code_id}))
-        return self._pair_url_of(order_id, nonce, code)
+        code_row = {
+            "code_hash": code_id, "ttl_s": ttl,
+            "created_by": "order:" + order_id, "name": name,
+            "scopes": str(self.cfg.get("billing.client_scopes", "") or ""),
+            "client_id": "", "user_id": user_id, "kind": "purchase",
+        }
+        return {"code": code, "code_id": code_id, "nonce": nonce,
+                "code_row": code_row,
+                "url": self._pair_url_of(order_id, nonce, code)}
 
     def _pair_url_of(self, order_id: str, nonce: str, code: str) -> str:
         ttl = float(self.cfg.get("billing.pair_code_ttl_s", 900) or 900)
         built = ops.pairing_string(self.cfg, code, ttl_s=ttl)
         return str(built.get("url") or "")
 
-    def _pair_url_locked(self, order: Dict[str, Any]) -> str:
-        """已支付订单的 `pairUrl`（**只读路径**）。
-
-        * 已经有活跃设备 → 没有 `pairUrl`（续费不发码）；
-        * 码还在 → 用 nonce 重算出当初那张（订单轮询重复拿到同一张）；
-        * 码过期/没了且仍无设备 → 重新发一张（旧码本来就已失效）。
-        """
+    def _pair_url_current(self, order: Dict[str, Any]) -> str:
+        """**只读**：当前订单若有一张仍然有效的码，算出它的 URL；否则空串。"""
         if str(order.get("status") or "") != "paid":
             return ""
-        user_id = str(order.get("user_id") or "")
-        if self.store.count_devices(user_id) > 0:
+        if self.store.count_devices(str(order.get("user_id") or "")) > 0:
             return ""
         order_id = str(order.get("order_id") or "")
         meta = _unjson(order.get("meta"))
@@ -705,12 +858,55 @@ class BillingService:
             code = self._derive_pair_code(order_id, nonce)
             if hash_pairing_code(code) == code_id:
                 return self._pair_url_of(order_id, nonce, code)
-        # 码过期（或已被清掉）且仍没有设备 → 重发一张；旧码本来就用不了了。
-        fresh = self.issue_purchase_code(order)
-        return str(fresh or "")
+        return ""
 
-    def refund_order(self, order_id: str) -> Dict[str, Any]:
-        """退款：调网关退款 + 订单变 `refunded` + **权益立即失效**（设计 §4.4）。"""
+    def _ensure_pair_code(self, order: Dict[str, Any]) -> str:
+        """确保订单有一张可用码；**CAS** 保证并发轮询只装一张。失败返回空串。"""
+        order_id = str(order.get("order_id") or "")
+        for _ in range(3):
+            current = self.store.order(order_id) or order
+            # 续费/已有设备：**不发码**（`_pair_url_current` 也会返回空，但这里先退出
+            # 才不会误进"补发"分支然后写库）。
+            if self.store.count_devices(str(current.get("user_id") or "")) > 0:
+                return ""
+            url = self._pair_url_current(current)
+            if url:
+                return url
+            try:
+                prepared = self._prepare_pair_code(current)
+            except Exception as exc:                            # 发码失败不影响权益
+                try:
+                    self.store.insert_order_event(
+                        order_id, "pair-code-failed",
+                        _json({"reason": type(exc).__name__}))
+                except Exception:
+                    pass
+                return ""
+            out = self.store.install_pair_code(
+                order_id, str(current.get("pairing_code_id") or ""),
+                prepared["code_row"], {"pairNonce": prepared["nonce"]})
+            if out.get("ok"):
+                return str(prepared["url"])
+            if out.get("valid"):
+                return self._pair_url_current(out.get("order") or current)
+            if out.get("raced"):
+                continue
+            return ""
+        return ""
+
+    def issue_purchase_code(self, order: Dict[str, Any]) -> Optional[str]:
+        """兼容入口：确保订单有一张配对码（幂等 + CAS）。"""
+        return self._ensure_pair_code(order) or None
+
+    def _pair_url_locked(self, order: Dict[str, Any]) -> str:
+        """已支付订单的 `pairUrl`（客户端轮询路径；必要时补发，CAS 不会出两张）。"""
+        return self._ensure_pair_code(order)
+
+    def refund_order(self, order_id: str, reason: str = "") -> Dict[str, Any]:
+        """退款：调网关退款 + 订单变 `refunded` + **按剩余订单重算权益**。
+
+        多笔叠加时退其中一笔不能再把剩余天数一起停掉；只剩退款单时才失效。
+        """
         order = self.store.order(str(order_id or ""))
         if order is None:
             raise errors.order_not_found(order_id)
@@ -718,10 +914,14 @@ class BillingService:
             raise errors.order_state_conflict(str(order.get("status") or ""), "paid")
         out = self.gateway.refund(order)
         self.store.update_order(order_id, status="refunded")
-        self.store.set_entitlement_status(str(order.get("user_id") or ""), "refunded")
-        self.forget_entitlement(str(order.get("user_id") or ""))
-        self.store.insert_order_event(order_id, "refunded", _json({"gateway": out}))
-        return {"ok": True, "orderId": order_id, "status": "refunded"}
+        uid = str(order.get("user_id") or "")
+        self.recompute_entitlement(uid)
+        self.forget_entitlement(uid)
+        self.store.insert_order_event(
+            order_id, "refunded",
+            _json({"gateway": out, "reason": str(reason or "")}))
+        return {"ok": True, "orderId": order_id, "status": "refunded",
+                "entitlement": self.entitlement(uid)}
 
     def precheck_pair(self, row: Optional[Dict[str, Any]]) -> None:
         """`/v1/pair` 兑换前的准入预检（设备上限 / 权益）。"""
@@ -856,11 +1056,12 @@ class BillingService:
     def overview(self) -> Dict[str, Any]:
         """管理面「收费」页签的概览（收入 / 订单 / 快到期）。**只报数字**。"""
         now = time.time()
-        day_start = now - 24 * 3600
+        # 设计 §5.4：统计口径是 `billing.timezone` 的**自然日**，不是滚动 24h。
+        day_start_ts = day_start(self.cfg, now)
         orders = self.store.orders(limit=1000)
         paid = [o for o in orders if str(o.get("status") or "") == "paid"]
         revenue_today = sum(int(o.get("amount_cents") or 0) for o in paid
-                            if float(o.get("paid_at") or 0) >= day_start)
+                            if float(o.get("paid_at") or 0) >= day_start_ts)
         counts: Dict[str, int] = {}
         for o in orders:
             key = str(o.get("status") or "")

@@ -317,12 +317,16 @@ billing:
   # 额度/价格**不在代码里**：在 plans 表（出厂 seed：monthly / trial / internal）
 payment:
   provider: mock                # disabled | mock | alipay
+  mock_secret: ""               # 空 = 启动时随机；生产不该启用 mock
+  mock_allow_remote: false      # Mock 端点默认只允许本机/测试来源
 alipay:
-  app_id: "<...>"               # 真实网关才需要
+  app_id: "<...>"               # 真实网关才需要；回调 app_id 必须存在且相等
   private_key_path: "/run/secrets/alipay_app_private.pem"   # 只放服务端
   public_key_path: "/run/secrets/alipay_public.pem"
+  sandbox: false                # true 且 gateway 未改时自动用 sandbox_gateway
+  seller_id: ""                 # 可选：回调 seller_id 校验
   notify_url: "https://echoserver.zhkq.online:8900/v1/billing/alipay/notify"
-invite: { required: true }
+invite: { required: true }      # 注册**和登录**都要邀请码
 trial: { enabled: true, days: 7 }
 ```
 
@@ -372,12 +376,15 @@ curl -s localhost:8900/v1/billing/orders/$ORDER_ID -H "Authorization: Bearer $UT
 | `POST /v1/billing/mock/notify` | 可编程回调：可造**金额不对**（`amountCents` 与订单不符）或失败状态（`status=closed`） |
 
 `provider=alipay` 时这两条路径**根本不存在**（404，不是"存在但拒绝"）。
+Mock 端点默认只接受**回环/测试来源**（`payment.mock_allow_remote=false`）；`mock_secret`
+空时每次启动随机生成 —— 不要把仓库里的默认值当生产密钥。
 
 ### 8.4 切真实支付宝
 
 1. 开放平台建应用、签约 Vibe Pay 网页收款，拿到 `APP_ID`、应用私钥（自己生成、只放服务端）、
    支付宝公钥；
-2. `payment.provider: alipay` + `alipay.*` 配齐，**重启后端**；
+2. `payment.provider: alipay` + `alipay.*` 配齐（`app_id` 必须存在；可选 `seller_id`；
+   `sandbox=true` 且 gateway 仍是生产地址时自动切 `sandbox_gateway`），**重启后端**；
 3. 回调地址 `https://<公网域名>:8900/v1/billing/alipay/notify` 必须**公网可达、证书有效**
    （支付宝不认自签）；内网联调先用 `payment.provider=mock`；
 4. 本轮 `AlipayGateway` 只实现**下单签名 + 回调验签**（RSA2）；`query()` / `refund()`
@@ -423,8 +430,24 @@ curl -s localhost:8900/v1/billing/orders/$ORDER_ID -H "Authorization: Bearer $UT
 上游原有的"每 client 1 QPS"（`tts.tts_limiter`）继续保留；绑定账号的请求再叠一层
 按 user 的 1 QPS。`tts.enabled=false` 仍由上游返回 `503 tts_unavailable`。
 
-### 8.8 已知缺口（如实写在这里）
+### 8.8 计费闸门生效条件
+
+`billing.enabled=true` **不够**：还必须 `auth.enabled=true`。鉴权关着时所有请求都是
+`anonymous`，无法映射到账号 → 全部走免费老路。服务端启动会打 **ERROR** 日志，
+管理面 overview 返回 `effectiveGating=false` 并在「收费 / 账号」页显示"未生效"。
+生产部署请同时打开配对鉴权。
+
+### 8.9 已知限制（如实写在这里）
 
 * `AlipayGateway.query()` / `refund()` 未接入（见 8.4）。
 * 多实例部署时 1 QPS / 日额度是**进程内**计数（与既有 `quota.py` 同一个取舍），
   不是全局精确值。
+* **登录没有密码**：`invite.required=true` 时注册和登录都要求邀请码，并有按来源 IP
+  的失败退避；但知道工号 + 一张有效邀请码仍可登录（内部 10 元月卡定位）。对外部署
+  需要手机号验证码/企业微信（设计 §3.5.11），**本轮不改客户端/协议**。
+* **只对通过 purchase / device-bind 码新配对的设备生效**：开启收费前已经配好的
+  存量客户端没有 `user_devices` 绑定，继续走免费老路；是否补"管理面 attach"待用户定。
+* 订单 `expires_at` 现在是**惰性关闭**（下一次 `create_order` 时执行）；到期后才到账的
+  支付会按订单状态拒绝，需要人工核对/退款。
+* 退款按**剩余未退款订单**重算 `paid_until`；套餐模板被硬删除的历史订单无法重算，
+  会跳过（管理面默认只下架、不硬删）。

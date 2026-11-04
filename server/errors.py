@@ -14,6 +14,17 @@ import time
 from typing import Optional
 
 
+def _local_date(ts: float) -> str:
+    """按 `Asia/Shanghai` 自然日显示（与收费的日额度口径一致）；取不到时退回本机本地。"""
+    try:
+        import datetime
+        from zoneinfo import ZoneInfo
+        return datetime.datetime.fromtimestamp(
+            float(ts), ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d")
+    except Exception:                                           # pragma: no cover - 兜底
+        return time.strftime("%Y-%m-%d", time.localtime(float(ts)))
+
+
 class EchoError(Exception):
     """带 HTTP 状态 + 稳定 code + 可选 Retry-After 的错误。
 
@@ -163,7 +174,7 @@ def entitlement_expired(paid_until: float = 0) -> EchoError:
     与 `entitlement_missing` 分开：客户端对"去续费"与"去开通"给的是不同的按钮。
     """
     return EchoError(402, "entitlement_expired", "套餐已到期，续费后恢复",
-                     detail=("有效期至 %s" % time.strftime("%Y-%m-%d", time.localtime(paid_until))
+                     detail=("有效期至 %s" % _local_date(paid_until)
                              if paid_until else "已过期"))
 
 

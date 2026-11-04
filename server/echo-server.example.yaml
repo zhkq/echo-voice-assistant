@@ -254,7 +254,8 @@ payment:
   # disabled | mock | alipay。**默认 disabled**：没配支付时服务能起来，
   # 下单接口明确回 503 payment_unconfigured，绝不静默降级成 Mock。
   provider: disabled
-  mock_secret: "echo-mock-payment-not-for-production"
+  mock_secret: ""                # 空 = 启动时随机；生产不该启用 mock
+  mock_allow_remote: false       # Mock 端点默认只允许本机/测试来源
   notify_url: ""
 
 alipay:
@@ -267,4 +268,6 @@ alipay:
   public_key_path: ""
   gateway: "https://openapi.alipay.com/gateway.do"
   sandbox: false
+  sandbox_gateway: "https://openapi-sandbox.dl.alipaydev.com/gateway.do"
+  seller_id: ""                  # 可选：回调 seller_id 校验
   notify_url: ""

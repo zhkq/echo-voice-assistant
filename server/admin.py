@@ -1015,6 +1015,7 @@ def create_admin_app(cfg, state, *, perf=None) -> FastAPI:
         out["enabled"] = svc.enabled
         out["provider"] = svc.provider
         out["gatewayConfigured"] = bool(getattr(svc.gateway, "configured", False))
+        out["effectiveGating"] = svc.effective_gating
         out["plans"] = [billing_mod.plan_view(p) for p in svc.plans(active_only=False)]
         return out
 
@@ -1032,6 +1033,7 @@ def create_admin_app(cfg, state, *, perf=None) -> FastAPI:
         out["enabled"] = svc.enabled
         out["provider"] = svc.provider
         out["gatewayConfigured"] = bool(getattr(svc.gateway, "configured", False))
+        out["effectiveGating"] = svc.effective_gating
         return out
 
     @api.get("/billing/plans")
@@ -1046,9 +1048,21 @@ def create_admin_app(cfg, state, *, perf=None) -> FastAPI:
         payload = await body_of(request)
 
         def fn(who):
-            row = billing_mod.parse_plan(payload)
+            code = str(payload.get("code") or "")
+            before = store_of().plan(code) if code else None
+            row = billing_mod.merge_plan_payload(payload, before)
             store_of().upsert_plan(row)
-            return {"ok": True, "plan": billing_mod.plan_view(store_of().plan(row["code"]) or row)}
+            after = store_of().plan(row["code"]) or row
+            # 变更前后差异单独留一条审计（admin_audit 只有四列，不另加列）
+            try:
+                store_of().audit(str(who.get("username") or ""),
+                                 "billing-plan-set.diff",
+                                 json.dumps({"before": billing_mod.plan_view(before) if before else None,
+                                             "after": billing_mod.plan_view(after)},
+                                            ensure_ascii=False, sort_keys=True))
+            except Exception:                               # pragma: no cover - 兜底
+                pass
+            return {"ok": True, "plan": billing_mod.plan_view(after)}
 
         return as_write(request, "billing-plan-set",
                         str(payload.get("code") or ""), fn)
@@ -1061,9 +1075,21 @@ def create_admin_app(cfg, state, *, perf=None) -> FastAPI:
         payload["code"] = code
 
         def fn(who):
-            row = billing_mod.parse_plan(payload)
+            before = store_of().plan(code)
+            if before is None:
+                raise errors.plan_not_found(code)
+            row = billing_mod.merge_plan_payload(payload, before)
             store_of().upsert_plan(row)
-            return {"ok": True, "plan": billing_mod.plan_view(store_of().plan(row["code"]) or row)}
+            after = store_of().plan(code) or row
+            try:
+                store_of().audit(str(who.get("username") or ""),
+                                 "billing-plan-set.diff",
+                                 json.dumps({"before": billing_mod.plan_view(before),
+                                             "after": billing_mod.plan_view(after)},
+                                            ensure_ascii=False, sort_keys=True))
+            except Exception:                               # pragma: no cover - 兜底
+                pass
+            return {"ok": True, "plan": billing_mod.plan_view(after)}
 
         return as_write(request, "billing-plan-set", code, fn)
 
@@ -1087,7 +1113,8 @@ def create_admin_app(cfg, state, *, perf=None) -> FastAPI:
         rows = svc.store.orders(status=status, user_id=userId, limit=limit)
         out = []
         for row in rows:
-            view = svc.order_view(row)
+            # 管理面列表**只读**（pairUrl 可能触发补发码/写库）
+            view = svc.order_view(row, with_pair_url=False)
             view["userId"] = str(row.get("user_id") or "")
             view["tradeNo"] = str(row.get("alipay_trade_no") or "")
             out.append(view)
@@ -1100,7 +1127,7 @@ def create_admin_app(cfg, state, *, perf=None) -> FastAPI:
         row = svc.store.order(order_id)
         if row is None:
             raise errors.order_not_found(order_id)
-        view = svc.order_view(row)
+        view = svc.order_view(row, with_pair_url=False)
         view["userId"] = str(row.get("user_id") or "")
         view["tradeNo"] = str(row.get("alipay_trade_no") or "")
         view["events"] = svc.store.order_events(order_id)
@@ -1111,7 +1138,8 @@ def create_admin_app(cfg, state, *, perf=None) -> FastAPI:
         """退款（**危险动作**：要带 `confirm`）。退款成功 → 权益立即失效。"""
         payload = await body_of(request)
         return as_write(request, "billing-refund", order_id,
-                        lambda who: billing_svc().refund_order(order_id),
+                        lambda who: billing_svc().refund_order(
+                            order_id, reason=str(payload.get("reason") or "").strip()),
                         confirm=payload)
 
     @api.get("/billing/entitlements")
@@ -1122,7 +1150,10 @@ def create_admin_app(cfg, state, *, perf=None) -> FastAPI:
         for row in svc.store.entitlements():
             uid = str(row.get("user_id") or "")
             block = svc.entitlement_summary(uid)
+            computed_status = str(block.get("status") or "")
             block.update(row)          # 原始行（snake_case）也带上，排障用
+            # 原始行的 `status=active` 不能覆盖"已到期"计算结果（否则管理面显示绿色）。
+            block["status"] = computed_status
             block["userId"] = uid      # 页面按 camelCase 读（与其它列表一致）
             block["expiringSoon"] = bool(block.get("expiringSoon"))
             out.append(block)
@@ -1135,7 +1166,8 @@ def create_admin_app(cfg, state, *, perf=None) -> FastAPI:
         return as_write(request, "billing-entitlement-adjust", user_id,
                         lambda who: {"ok": True,
                                      "entitlement": billing_svc().adjust_entitlement(
-                                         user_id, payload)})
+                                         user_id, payload)},
+                        confirm=payload)
 
     @api.get("/account/users")
     def account_users(request: Request, q: str = ""):
@@ -1211,10 +1243,10 @@ def create_admin_app(cfg, state, *, perf=None) -> FastAPI:
                 raise errors.bad_request("maxUses 要在 1 ~ 1000 之间")
             expires_at = float(payload.get("expiresAt",
                                            payload.get("expires_at", 0)) or 0)
+            note = account_mod.clean_text(payload.get("note"), "备注", 200)
             billing_svc().store.put_invite(
                 code, max_uses=max_uses, expires_at=expires_at,
-                created_by=str(who.get("username") or ""),
-                note=str(payload.get("note") or ""))
+                created_by=str(who.get("username") or ""), note=note)
             return {"ok": True, "code": code,
                     "invite": billing_svc().store.invite(code)}
 

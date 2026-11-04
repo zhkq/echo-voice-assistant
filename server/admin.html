@@ -204,7 +204,7 @@ const left = (sec) => {
   // 后端只把「还能用」的码放进这张表（未用过、未过期），而且 remainingSeconds 最少报 1 ——
   // 所以这里的"已过期"分支只是**防身**（万一某张码在响应与渲染之间到期），
   // 正常路径上不会出现"徽章写着已过期、行却列在待用表里"。不到 1 分钟如实报秒。
-  if (sec <= 0) return '<span class="badge off">已过期</span>';
+  if (sec <= 0) return raw('<span class="badge off">已过期</span>');
   if (sec < 60) return sec + " 秒";
   return sec < 3600 ? Math.ceil(sec / 60) + " 分钟"
                     : (sec < 86400 ? (sec / 3600).toFixed(1) + " 小时" : (sec / 86400).toFixed(1) + " 天");
@@ -394,7 +394,7 @@ function issueForm() {
 function pendingCodes(d) {
   const rows = (d.codes || []).map((c) => [
     c.name || "(未命名)", c.scopes || "(不限)", c.createdBy || "—",
-    c.expired ? '<span class="badge off">已过期</span>' : left(c.remainingSeconds),
+    c.expired ? raw('<span class="badge off">已过期</span>') : left(c.remainingSeconds),
     ts(c.expiresAt),
     raw(`<button class="danger" data-code="${esc(c.id)}">作废</button>`),
   ]);
@@ -424,7 +424,7 @@ async function viewClients() {
   try { adv = await api("/admin/api/advertised-host"); } catch (e) { adv = { error: e.message }; }
   const rows = d.clients.map((c) => [
     c.clientId, c.name || "—",
-    c.disabled ? '<span class="badge off">已禁用</span>' : '<span class="badge on">正常</span>',
+    c.disabled ? raw('<span class="badge off">已禁用</span>') : raw('<span class="badge on">正常</span>'),
     c.scopes || "(不限)", "v" + c.tokenVersion, ago(c.lastSeen), c.calls, c.errors,
     c.audioMinutes + " min",
     c.dailyAudioMinutes ? c.dailyAudioMinutes + " min/天" : "全局默认",
@@ -653,7 +653,7 @@ function accountsCard(acc) {
   return `<div class="card" id="pwCard"><h2>管理员账号（增删仍只在命令行）</h2>${table(
     ["账号", "状态", "建号", "最后登录"],
     acc.admins.map((a) => [a.username + (a.username === acc.self ? "（你）" : ""),
-      a.disabled ? '<span class="badge off">已禁用</span>' : '<span class="badge on">正常</span>',
+      a.disabled ? raw('<span class="badge off">已禁用</span>') : raw('<span class="badge on">正常</span>'),
       ts(a.createdAt), ts(a.lastLogin)]))}
     <div class="muted" style="margin-top:6px">${esc(acc.note || "")}</div>
     <div class="muted" style="margin-top:6px">${esc(acc.selfServiceNote || "")}</div>
@@ -1022,11 +1022,15 @@ const money = (cents) => "¥" + (Number(cents || 0) / 100).toFixed(2);
 const statusBadge = (s) => {
   const ok = s === "paid" || s === "active";
   const bad = s === "refunded" || s === "frozen" || s === "closed";
-  return `<span class="badge ${ok ? "" : (bad ? "off" : "warn")}">${esc(s || "—")}</span>`;
+  // 唯一允许的 HTML：标签本身；值必须 esc()。table() 只认 raw()，其它字符串一律转义。
+  return raw(`<span class="badge ${ok ? "" : (bad ? "off" : "warn")}">${esc(s || "—")}</span>`);
 };
+
+let BILLING_PLANS = {};
 
 async function viewBilling() {
   const d = await api("/admin/api/billing/overview");
+  BILLING_PLANS = Object.fromEntries((d.plans || []).map((p) => [p.code, p]));
   const [orders, ents, users, invites] = await Promise.all([
     api("/admin/api/billing/orders?limit=100"),
     api("/admin/api/billing/entitlements"),
@@ -1067,6 +1071,7 @@ async function viewBilling() {
   return `<div class="card"><h2>收费概览</h2>
     <div class="kv">
       <div><b>${d.enabled ? "已启用" : "未启用"}</b><span>收费开关（billing.enabled）</span></div>
+      <div><b>${d.effectiveGating ? "生效" : "未生效"}</b><span>计费闸门${d.effectiveGating ? "" : "（auth.enabled=false，请求会走免费老路）"}</span></div>
       <div><b>${esc(d.provider)}</b><span>支付网关（configured=${d.gatewayConfigured ? "是" : "否"}）</span></div>
       <div><b>${money(d.revenueCentsToday)}</b><span>最近 24 小时收入</span></div>
       <div><b>${money(d.revenueCentsTotal)}</b><span>累计收入（已支付）</span></div>
@@ -1091,6 +1096,7 @@ async function viewBilling() {
       <input id="plQps" placeholder="QPS" value="1">
       <input id="plDev" placeholder="设备数" value="3">
       <input id="plConc" placeholder="并发" value="1">
+      <label class="muted"><input type="checkbox" id="plActive" checked> 上架</label>
       <button id="plSave">保存套餐</button>
     </div>
   </div>
@@ -1124,7 +1130,20 @@ function bindBilling() {
     };
   });
   document.querySelectorAll("[data-plan-edit]").forEach((b) => {
-    b.onclick = () => { $("#plCode").value = b.dataset.planEdit; $("#plName").focus(); };
+    b.onclick = () => {
+      const p = BILLING_PLANS[b.dataset.planEdit] || {};
+      $("#plCode").value = p.code || b.dataset.planEdit;
+      $("#plName").value = p.name || "";
+      $("#plPrice").value = p.priceCents ?? 0;
+      $("#plDays").value = p.days ?? 0;
+      $("#plMin").value = p.dailyAudioMinutes ?? 0;
+      $("#plTts").value = p.ttsChars ?? 0;
+      $("#plQps").value = p.qps ?? 1;
+      $("#plDev").value = p.maxDevices ?? 3;
+      $("#plConc").value = p.maxConcurrent ?? 1;
+      $("#plActive").checked = p.active !== false;
+      $("#plName").focus();
+    };
   });
   const save = $("#plSave");
   if (save) save.onclick = async () => {
@@ -1134,7 +1153,7 @@ function bindBilling() {
       dailyAudioMinutes: Number($("#plMin").value || 0),
       ttsChars: Number($("#plTts").value || 0), qps: Number($("#plQps").value || 1),
       maxDevices: Number($("#plDev").value || 3), maxConcurrent: Number($("#plConc").value || 1),
-      active: true,
+      active: !!($("#plActive") && $("#plActive").checked),
     };
     if (!body.code) return alert("要填 code");
     try { await wpost("/admin/api/billing/plans", body); alert("已保存"); await render(); }
@@ -1142,38 +1161,30 @@ function bindBilling() {
   };
   document.querySelectorAll("[data-refund]").forEach((b) => {
     b.onclick = async () => {
-      if (!confirm("退款订单 " + b.dataset.refund + "？权益会立即失效。")) return;
+      if (!confirm("退款订单 " + b.dataset.refund + "？会按剩余未退款订单重算权益；只剩这一单时立即失效。")) return;
       try { await wpost("/admin/api/billing/orders/" + encodeURIComponent(b.dataset.refund) + "/refund",
                         { confirm: b.dataset.refund }); alert("已退款"); await render(); }
       catch (e) { alert("退款失败：" + e.message); }
     };
   });
-  const entAct = (attr, action, extra) => document.querySelectorAll("[" + attr + "]").forEach((b) => {
-    b.onclick = async () => {
-      const uid = b.getAttribute(attr);
-      try { await wpost("/admin/api/billing/entitlements/" + encodeURIComponent(uid) + "/adjust",
-                        Object.assign({ action: action }, extra || {})); await render(); }
-      catch (e) { alert("调整失败：" + e.message); }
-    };
-  });
   document.querySelectorAll("[data-ent-extend]").forEach((b) => {
     b.onclick = async () => {
       try { await wpost("/admin/api/billing/entitlements/" + encodeURIComponent(b.dataset.entExtend) + "/adjust",
-                        { action: "extend", days: 30 }); await render(); }
+                        { action: "extend", days: 30, confirm: b.dataset.entExtend }); await render(); }
       catch (e) { alert("调整失败：" + e.message); }
     };
   });
   document.querySelectorAll("[data-ent-freeze]").forEach((b) => {
     b.onclick = async () => {
       try { await wpost("/admin/api/billing/entitlements/" + encodeURIComponent(b.dataset.entFreeze) + "/adjust",
-                        { action: "freeze" }); await render(); }
+                        { action: "freeze", confirm: b.dataset.entFreeze }); await render(); }
       catch (e) { alert("调整失败：" + e.message); }
     };
   });
   document.querySelectorAll("[data-ent-internal]").forEach((b) => {
     b.onclick = async () => {
       try { await wpost("/admin/api/billing/entitlements/" + encodeURIComponent(b.dataset.entInternal) + "/adjust",
-                        { action: "internal" }); await render(); }
+                        { action: "internal", confirm: b.dataset.entInternal }); await render(); }
       catch (e) { alert("调整失败：" + e.message); }
     };
   });
@@ -1210,8 +1221,7 @@ function table(head, rows) {
   if (!rows.length) return `<div class="muted">（没有数据）</div>`;
   return `<table><thead><tr>${head.map((h) => `<th>${esc(h)}</th>`).join("")}</tr></thead>
     <tbody>${rows.map((r) => `<tr>${r.map((c) =>
-      `<td>${(c && typeof c === "object" && c.__raw) ? c.__raw
-             : (typeof c === "string" && c.startsWith("<span") ? c : esc(c))}</td>`).join("")}</tr>`).join("")}
+      `<td>${(c && typeof c === "object" && c.__raw) ? c.__raw : esc(c)}</td>`).join("")}</tr>`).join("")}
     </tbody></table>`;
 }
 

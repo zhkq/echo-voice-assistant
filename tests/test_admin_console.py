@@ -2678,3 +2678,75 @@ class AdvertisedHostHttpsTests(_AdminCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BillingConsoleReviewTests(_AdminCase):
+    """review P1.3 / P2.11：表格转义、9 条读端点 401、4 个 confirm 端点。"""
+
+    READS = (
+        "/admin/api/billing/overview",
+        "/admin/api/billing/summary",
+        "/admin/api/billing/plans",
+        "/admin/api/billing/orders",
+        "/admin/api/billing/orders/ord-nope",
+        "/admin/api/billing/entitlements",
+        "/admin/api/account/users",
+        "/admin/api/account/users/usr-nope",
+        "/admin/api/account/invites",
+    )
+
+    def test_billing_read_endpoints_refuse_without_login(self):
+        for path in self.READS:
+            with self.subTest(path=path):
+                r = self.ac.get(path)
+                self.assertEqual(r.status_code, 401, r.text)
+                self.assertEqual(r.json()["code"], "unauthorized")
+
+    def test_billing_confirm_endpoints_require_confirm_and_audit_failure(self):
+        self.login()
+        calls = (
+            ("post", "/admin/api/billing/orders/ord-nope/refund", {"reason": "x"}),
+            ("post", "/admin/api/billing/entitlements/usr-nope/adjust",
+             {"action": "extend", "days": 30}),
+            ("post", "/admin/api/account/users/usr-nope/reset-devices", {}),
+            ("delete", "/admin/api/account/invites/NOPE", {}),
+        )
+        for method, path, body in calls:
+            with self.subTest(path=path):
+                if method == "post":
+                    r = self.wpost(path, body)
+                else:
+                    r = self.wdelete(path, body)
+                self.assertEqual(r.status_code, 400, r.text)
+                self.assertIn("confirm", r.json()["detail"])
+        actions = {a for _who, a, _t in self.audit_rows()}
+        for want in ("billing-refund.failed", "billing-entitlement-adjust.failed",
+                     "billing-reset-devices.failed", "billing-invite-delete.failed"):
+            self.assertIn(want, actions)
+
+    def test_the_table_helper_never_inserts_a_plain_string_as_html(self):
+        path = os.path.join(os.path.dirname(admin_mod.__file__), "admin.html")
+        with open(path, encoding="utf-8") as fh:
+            src = fh.read()
+        self.assertNotIn('startsWith("<span")', src,
+                         "table() 又给普通字符串开了 HTML 旁路")
+        self.assertIn("? c.__raw : esc(c)", src,
+                      "table() 必须只对显式 raw() 放行、其余一律 esc")
+        self.assertIn("return raw(`<span", src,
+                      "statusBadge 必须显式 raw() 并先 esc 值")
+
+    def test_expired_entitlement_is_not_shown_as_active(self):
+        store = self.state.auth.store
+        store.create_user("usr-expired-admin", name="到期", employee_no="E-EXP")
+        store.upsert_entitlement({
+            "user_id": "usr-expired-admin", "plan_code": "monthly",
+            "paid_until": time.time() - 86400, "daily_audio_minutes": 120,
+            "tts_chars": 50000, "qps": 1, "max_devices": 3, "max_concurrent": 1,
+            "status": "active", "order_id": "", "updated_at": time.time(),
+        })
+        self.login()
+        r = self.ac.get("/admin/api/billing/entitlements")
+        self.assertEqual(r.status_code, 200, r.text)
+        row = [e for e in r.json()["entitlements"]
+               if e.get("userId") == "usr-expired-admin"][0]
+        self.assertEqual(row["status"], "expired", "原始 status=active 覆盖了计算状态")

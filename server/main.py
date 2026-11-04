@@ -154,8 +154,9 @@ def create_app(cfg=None) -> FastAPI:
             except Exception as e:                             # pragma: no cover - 兜底
                 log.warning("收费：套餐种子写入失败（不影响启动）：%s", e)
             if not bool(cfg.get("auth.enabled", False)):
-                log.warning("收费开着，但 auth.enabled=false —— 能力请求没有客户端身份，"
-                            "无法映射到账号；请同时打开配对鉴权（设计 §3.5.5）。")
+                log.error("收费开着，但 auth.enabled=false —— 能力请求没有客户端身份，"
+                          "收费闸门**不会生效**（全部走免费老路）；请同时打开配对鉴权"
+                          "（设计 §3.5.5）。管理面 overview 会显示 effectiveGating=false。")
             if billing_svc.provider == "mock":
                 log.warning("收费：支付网关是 **Mock** —— /v1/billing/mock/* 已注册，"
                             "任何人都能模拟付款。生产必须切 payment.provider=alipay。")
