@@ -1,0 +1,83 @@
+{
+  "capturedAt": "2026-11-04T15:33:38+0800",
+  "branch": "agent/vibepay-site-d5d1df7112e1",
+  "baseCommit": "1b55158a3ab676c4997d03911b5f4dd2d06d2def",
+  "baseUrl": "http://127.0.0.1:33129",
+  "browser": "chromium 156.0.8078.79",
+  "desktopViewport": {
+    "width": 1440,
+    "height": 900
+  },
+  "mobileViewport": {
+    "width": 375,
+    "height": 812
+  },
+  "tableViewport": {
+    "width": 768,
+    "height": 1024
+  },
+  "theme": "light",
+  "notes": [
+    "截图由 scripts/capture-vibepay-evidence.py 生成，页面实际渲染，不是拼图或 mockup。",
+    "本地/预览截图不含浏览器地址栏；支付宝要求的带地址栏截图需在公网 HTTPS 就绪后对最终域名补采。",
+    "支付页停留在“等待支付”的沙箱示例状态，不是支付成功页。"
+  ],
+  "files": [
+    {
+      "page": "home",
+      "url": "http://127.0.0.1:33129/",
+      "title": "ECHO 语音助手 · 说完就办，会议自动成稿",
+      "viewport": {
+        "width": 1440,
+        "height": 900
+      },
+      "file": "after-home.png",
+      "sha256": "658444645ae0d1c5f45f6b2e6aac3cb8cdf681db988836b7fb8bbcf1ba7fac3e"
+    },
+    {
+      "page": "pricing",
+      "url": "http://127.0.0.1:33129/pricing",
+      "title": "套餐与价格 · ECHO 语音助手",
+      "viewport": {
+        "width": 1440,
+        "height": 900
+      },
+      "file": "after-pricing.png",
+      "sha256": "4321dcaf5dabcd1fcc5112cdc4ec3bb51cc42326f7706fb6ce1794ba730d5bc0"
+    },
+    {
+      "page": "pay",
+      "url": "http://127.0.0.1:33129/pay?plan=monthly",
+      "title": "确认订单并支付 · ECHO 语音助手",
+      "viewport": {
+        "width": 1440,
+        "height": 900
+      },
+      "file": "after-pay.png",
+      "sha256": "7a6cee4d9b1fc11b43641bb731ee0126c85bdb40de1c272cd78adfd1876fc8ca"
+    },
+    {
+      "page": "pricing-mobile",
+      "url": "http://127.0.0.1:33129/pricing",
+      "title": "套餐与价格 · ECHO 语音助手",
+      "viewport": {
+        "width": 375,
+        "height": 812
+      },
+      "file": "after-pricing-mobile.png",
+      "sha256": "2dcaad229c69ec4f8df92cc5e159bf9c94f59c70cae7fefb9ae77712657a9adc"
+    },
+    {
+      "page": "before-no-site",
+      "url": "http://127.0.0.1:39977/",
+      "title": "Error response",
+      "viewport": {
+        "width": 1440,
+        "height": 900
+      },
+      "file": "before-no-site.png",
+      "sha256": "5514fda84c0f07a42486dc558384b4f1a71f0f50c1e2cfe59fa78d2cea6878b1",
+      "note": "base revision 没有该站点；这是空目录服务的真实 404 页面，不是仿造的旧 UI。"
+    }
+  ]
+}

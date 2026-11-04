@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>确认订单并支付 · ECHO 语音助手</title>
+  <meta name="description" content="ECHO 能力后端月卡订单确认与支付宝付款页（沙箱示例，等待支付）。">
+  <meta name="theme-color" content="#f6f8fc">
+  <link rel="icon" type="image/png" href="/assets/echo-logo.png">
+  <link rel="stylesheet" href="/assets/site.css">
+</head>
+<body data-page="pay">
+  <a class="skip-link" href="#main">跳到正文</a>
+
+  <header class="site-header">
+    <div class="wrap header-inner">
+      <a class="brand" href="/" aria-label="ECHO 语音助手首页">
+        <img src="/assets/echo-logo.png" alt="" width="34" height="34">
+        <span class="brand-sub">语音助手</span>
+      </a>
+      <nav class="nav" aria-label="主导航">
+        <a class="nav-hide-sm" href="/#features">功能</a>
+        <a class="nav-pricing" href="/pricing">套餐</a>
+        <a class="nav-hide-sm" href="/#how">使用流程</a>
+      </nav>
+      <button type="button" class="btn btn-ghost btn-sm header-cta" data-console>进入控制台</button>
+    </div>
+  </header>
+
+  <main id="main">
+    <section class="wrap page-hero">
+      <div class="crumbs"><a href="/">首页</a><span aria-hidden="true">/</span><a href="/pricing">套餐</a><span aria-hidden="true">/</span><span>确认订单</span></div>
+      <h1>确认订单并支付</h1>
+      <p class="lead">核对套餐与金额，使用支付宝扫码付款。支付完成后返回本页刷新，订单状态以服务端通知为准。</p>
+    </section>
+
+    <section class="wrap" style="padding-bottom:76px;">
+      <div class="notice" role="note">
+        <svg aria-hidden="true"><use href="/assets/icons.svg#icon-alert"></use></svg>
+        <div><strong>沙箱示例 · 不会产生真实扣款。</strong> 本页用于签约材料与页面联调，尚未接入支付宝真实收银台；页面停在“等待支付”，不会自动跳转，也不会判定支付成功。</div>
+      </div>
+
+      <p class="load-error" id="planWarning" hidden></p>
+
+      <div class="pay-layout" id="payLayout" aria-busy="true">
+        <div class="panel">
+          <div class="panel-title">订单摘要<span class="tag tag-muted">示例订单</span></div>
+          <div class="order-rows">
+            <div class="order-row"><span>商品</span><span>ECHO 能力后端 · <span id="orderPlan">月卡</span></span></div>
+            <div class="order-row"><span>有效期</span><span id="orderDays">30 天（支付成功后起算）</span></div>
+            <div class="order-row"><span>数量</span><span>1</span></div>
+            <div class="order-row"><span>订单号</span><span id="orderId">ord-demo-monthly</span></div>
+          </div>
+          <div class="order-total">
+            <span>应付金额</span>
+            <span class="money" id="orderPrice">¥10.00</span>
+          </div>
+          <p class="order-id">示例订单号仅用于页面展示，不是真实交易号；真实订单号由服务端生成。</p>
+        </div>
+
+        <div class="panel">
+          <div class="panel-title">支付宝付款<span class="tag">等待支付</span></div>
+          <div class="pay-method">
+            <span class="alipay-mark" aria-hidden="true">支</span>
+            <span class="pay-method-text"><strong>支付宝</strong><span>扫码支付 · 支持手机支付宝扫码</span></span>
+            <span class="pay-check" aria-label="已选择支付宝">
+              <svg aria-hidden="true"><use href="/assets/icons.svg#icon-check"></use></svg>
+            </span>
+          </div>
+
+          <div class="qr-wrap">
+            <div class="qr-box">
+              <img id="payQr" src="/assets/qr-placeholder.svg" alt="沙箱二维码占位，不可支付" width="162" height="162">
+              <span class="qr-badge">沙箱示例</span>
+            </div>
+            <div class="qr-caption">
+              <strong>请使用支付宝扫码支付</strong>
+              <span class="amount" id="payAmount">¥10.00</span>
+              <span>沙箱占位二维码，不能完成真实付款。接入真实收银台后会替换为支付宝返回的 payUrl / qrCode。</span>
+            </div>
+          </div>
+
+          <div class="pay-status" role="status">
+            <span class="pulse" aria-hidden="true"></span>
+            等待支付 · 页面不会自动跳转
+          </div>
+
+          <div class="pay-actions">
+            <button type="button" class="btn btn-primary btn-block" disabled>打开支付宝收银台（尚未接入）</button>
+            <button type="button" class="btn btn-ghost btn-block" id="refreshOrder">刷新订单状态</button>
+          </div>
+          <p class="pay-note">支付完成后请返回本页刷新；订单状态以服务端异步通知与交易查询为准。本页不做支付结果判定。</p>
+          <p class="side-note">为什么是沙箱？本页用于签约材料与页面联调。Phase 3 接入真实支付宝收银台后，这里会展示支付宝返回的支付二维码或跳转按钮。</p>
+          <p class="side-note" style="border-top:0;padding-top:0;"><a href="/pricing">← 返回套餐页</a></p>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <div class="wrap">
+      <div class="footer-grid">
+        <div>
+          <div class="footer-brand">
+            <img src="/assets/echo-logo.png" alt="" width="36" height="36">
+            语音助手
+          </div>
+          <p class="footer-about">按一下说话，会议自动成稿。语音指令、会议转写、说话人分离与语音合成，装在一个桌面助手里。</p>
+        </div>
+        <div>
+          <p class="footer-title">产品</p>
+          <div class="footer-links">
+            <a href="/#features">功能</a>
+            <a href="/#how">使用流程</a>
+            <a href="/pricing">套餐与价格</a>
+            <a href="/pay?plan=monthly">支付示例</a>
+          </div>
+        </div>
+        <div>
+          <p class="footer-title">站点</p>
+          <div class="footer-meta">
+            <span>域名：echoserver.zhkq.online</span>
+            <span>联系：<a href="https://github.com/zhkq">GitHub @zhkq</a></span>
+            <span>内测阶段 · 签约材料预览版</span>
+          </div>
+        </div>
+      </div>
+      <div class="footer-bottom">
+        <span>© 2026 ECHO · echoserver.zhkq.online</span>
+        <span>正式上线以最终域名、备案与收银台接入为准。</span>
+      </div>
+    </div>
+  </footer>
+
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+  <script src="/assets/site.js"></script>
+</body>
+</html>
