@@ -34,6 +34,18 @@ from app import backend_admin, backend_env, backend_pid, backend_proc, backend_r
 from app.api import router as api_router                        # noqa: E402
 from app.capabilities import credentials as cred                # noqa: E402
 from app.config import settings                                 # noqa: E402
+from app import paths as _paths_mod                             # noqa: E402
+
+#: 模块导入时（unittest 收集阶段，进程里还没有测试装过 seam）保存**真实实现**。
+_REAL_SETTINGS_GET = getattr(_paths_mod, "_settings_get")
+
+
+def setUpModule():
+    """本文件测的是**客户端**的 backend 目录/端口。如果同一进程里前面的测试
+    起过真 app，`create_app()` 会装 `app.paths._settings_get`（进程内全局）——
+    于是 `paths.backend_root()` 读的是服务端配置，这里就会像"客户端设置没生效"。
+    模块边界把它换回真实实现（测试卫生，不在生产代码里做）。"""
+    _paths_mod._settings_get = _REAL_SETTINGS_GET
 
 
 def _app():

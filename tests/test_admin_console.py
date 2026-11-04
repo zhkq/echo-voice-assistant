@@ -91,6 +91,16 @@ WRITE_ENDPOINTS = {
     # 知道 —— 每次靠人手改串。它与运行参数同一套闸门 + 审计
     # （action = `advertised-host-set`），值存在 state 卷（重启还在）。
     "/admin/api/advertised-host",
+    # 收费 / 账号（2026-11-03，设计 §4.2 管理面段）。**全部走 `as_write`**：
+    # 会话 + 同站 Origin + X-ECHO-Admin + CSRF + 审计（退款 / 改权益 / 重置设备
+    # 还要求 `confirm`）。读端点在下面 `login()` 即可的那一批里。
+    "/admin/api/billing/plans",
+    "/admin/api/billing/plans/{code}",
+    "/admin/api/billing/orders/{order_id}/refund",
+    "/admin/api/billing/entitlements/{user_id}/adjust",
+    "/admin/api/account/invites",
+    "/admin/api/account/invites/{code}",
+    "/admin/api/account/users/{user_id}/reset-devices",
 }
 
 
@@ -270,7 +280,11 @@ class _AdminCase(unittest.TestCase):
             for method in sorted(methods):
                 if method in ("get", "head", "options"):
                     continue
-                real = path.replace("{client_id}", "cli-nope").replace("{code_id}", "deadbeef")
+                real = (path.replace("{client_id}", "cli-nope")
+                            .replace("{code_id}", "deadbeef")
+                            .replace("{order_id}", "ord-nope")
+                            .replace("{user_id}", "usr-nope")
+                            .replace("{code}", "NOPE"))
                 out.append((method.upper(), path, real))
         return out
 
@@ -490,6 +504,16 @@ class IsolationTests(_AdminCase):
                 cap_writes.add(path)
         self.assertTrue(cap_writes <= {"/v1/asr", "/v1/diarize", "/v1/speaker/embed",
                                        "/v1/pair", "/v1/token",
+                                       # 收费（2026-11-03）：账号与订单的写端点。
+                                       # 它们只写管理数据，鉴权各自在端点里判
+                                       # （账号端点凭邀请码/userToken，支付回调凭验签）。
+                                       "/v1/account/register", "/v1/account/login",
+                                       "/v1/account/devices/code",
+                                       "/v1/account/devices/unbind",
+                                       "/v1/account/logout",
+                                       "/v1/billing/orders",
+                                       "/v1/billing/orders/{order_id}/cancel",
+                                       "/v1/billing/alipay/notify",
                                        # 方案B（2026-10-31）：手机 TTS 委托与撤销。它们不是能力槽，
                                        # 是"ECHO 给手机签一个只管 tts 的短期令牌"（`/v1/delegate`
                                        # 的撤销还按设备主体），同样要凭据，登记在这里不是敞开。
@@ -2654,3 +2678,87 @@ class AdvertisedHostHttpsTests(_AdminCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BillingConsoleReviewTests(_AdminCase):
+    """review P1.3 / P2.11：表格转义、10 条读端点 401、4 个 confirm 端点。"""
+
+    READS = (
+        "/admin/api/billing/overview",
+        "/admin/api/billing/summary",
+        "/admin/api/billing/plans",
+        "/admin/api/billing/orders",
+        "/admin/api/billing/orders/ord-nope",
+        "/admin/api/billing/notifies",
+        "/admin/api/billing/entitlements",
+        "/admin/api/account/users",
+        "/admin/api/account/users/usr-nope",
+        "/admin/api/account/invites",
+    )
+
+    def test_billing_read_endpoints_refuse_without_login(self):
+        for path in self.READS:
+            with self.subTest(path=path):
+                r = self.ac.get(path)
+                self.assertEqual(r.status_code, 401, r.text)
+                self.assertEqual(r.json()["code"], "unauthorized")
+
+    def test_billing_confirm_endpoints_require_confirm_and_audit_failure(self):
+        self.login()
+        calls = (
+            ("post", "/admin/api/billing/orders/ord-nope/refund", {"reason": "x"}),
+            ("post", "/admin/api/billing/entitlements/usr-nope/adjust",
+             {"action": "extend", "days": 30}),
+            ("post", "/admin/api/account/users/usr-nope/reset-devices", {}),
+            ("delete", "/admin/api/account/invites/NOPE", {}),
+        )
+        for method, path, body in calls:
+            with self.subTest(path=path):
+                if method == "post":
+                    r = self.wpost(path, body)
+                else:
+                    r = self.wdelete(path, body)
+                self.assertEqual(r.status_code, 400, r.text)
+                self.assertIn("confirm", r.json()["detail"])
+        actions = {a for _who, a, _t in self.audit_rows()}
+        for want in ("billing-refund.failed", "billing-entitlement-adjust.failed",
+                     "billing-reset-devices.failed", "billing-invite-delete.failed"):
+            self.assertIn(want, actions)
+
+    def test_a_conflict_notify_is_visible_for_reconciliation(self):
+        store = self.state.auth.store
+        store.record_notify("T-CONFLICT", "ord-closed", raw='{"status":"paid"}',
+                            status="conflict", overwrite=True)
+        self.login()
+        r = self.ac.get("/admin/api/billing/notifies")
+        self.assertEqual(r.status_code, 200, r.text)
+        row = [n for n in r.json()["notifies"] if n["tradeNo"] == "T-CONFLICT"][0]
+        self.assertEqual(row["status"], "conflict")
+        self.assertEqual(row["orderId"], "ord-closed")
+
+    def test_the_table_helper_never_inserts_a_plain_string_as_html(self):
+        path = os.path.join(os.path.dirname(admin_mod.__file__), "admin.html")
+        with open(path, encoding="utf-8") as fh:
+            src = fh.read()
+        self.assertNotIn('startsWith("<span")', src,
+                         "table() 又给普通字符串开了 HTML 旁路")
+        self.assertIn("? c.__raw : esc(c)", src,
+                      "table() 必须只对显式 raw() 放行、其余一律 esc")
+        self.assertIn("return raw(`<span", src,
+                      "statusBadge 必须显式 raw() 并先 esc 值")
+
+    def test_expired_entitlement_is_not_shown_as_active(self):
+        store = self.state.auth.store
+        store.create_user("usr-expired-admin", name="到期", employee_no="E-EXP")
+        store.upsert_entitlement({
+            "user_id": "usr-expired-admin", "plan_code": "monthly",
+            "paid_until": time.time() - 86400, "daily_audio_minutes": 120,
+            "tts_chars": 50000, "qps": 1, "max_devices": 3, "max_concurrent": 1,
+            "status": "active", "order_id": "", "updated_at": time.time(),
+        })
+        self.login()
+        r = self.ac.get("/admin/api/billing/entitlements")
+        self.assertEqual(r.status_code, 200, r.text)
+        row = [e for e in r.json()["entitlements"]
+               if e.get("userId") == "usr-expired-admin"][0]
+        self.assertEqual(row["status"], "expired", "原始 status=active 覆盖了计算状态")

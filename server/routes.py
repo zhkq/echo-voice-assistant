@@ -158,13 +158,17 @@ class State:
     """进程内共享状态。由 `main.create_app` 在 lifespan 里装好。"""
 
     def __init__(self, cfg, pool: EnginePool, sweeper: Optional[tmp.Sweeper] = None,
-                 auth=None, call_log=None):
+                 auth=None, call_log=None, billing_svc=None, account=None):
         self.cfg = cfg
         self.pool = pool
         self.sweeper = sweeper
         self.started = time.time()
         # 鉴权对象由 main 装（它要拿 store/config）。None → `client_of` 按"没鉴权"放行。
         self.auth = auth
+        # 收费（2026-11-03）：由 main 装。None / `enabled=False` 时**所有收费闸门
+        # 直接放行** —— 老客户端与"没开收费"的部署行为一个字节都不变。
+        self.billing_svc = billing_svc
+        self.account = account
         # 调用元数据的异步记录 + 进程内 metrics（设计 §7.3 / §8.4）。
         # 由 main 装（它才拿得到 store）。None 时下面的 `note_call` 是空操作 ——
         # 这样单测里只想要一个 State 时不必造一个库。
@@ -182,11 +186,67 @@ class State:
         # 每日音频分钟数（设计 §7.2）。**进程内计数**：每请求查库会把库变成瓶颈，
         # 而配额判断正好在每个请求的最前面。代价（多实例各算一份）写在 quota.py 开头。
         self.quota = quota.open_ledger(cfg, limit_for=self._quota_limit_for)
+        # 收费启用时，**按账号**再记一本日账（ASR 分钟）与一本 TTS 字符账。
+        # 时钟按 `billing.timezone`（设计 §5.4：每日 0 点按 Asia/Shanghai）。
+        _clock = quota.zone_clock(str(cfg.get("billing.timezone", "Asia/Shanghai") or
+                                      "Asia/Shanghai"))
+        self.user_quota = quota.QuotaLedger(default_minutes=0.0,
+                                            limit_for=self._user_quota_limit,
+                                            clock=_clock)
+        self.tts_ledger = quota.CharLedger(limit_for=self._tts_limit, clock=_clock)
+        if self.billing_svc is not None and hasattr(self.billing_svc, "attach_ledgers"):
+            self.billing_svc.attach_ledgers(self.user_quota, self.tts_ledger)
         # TTS 的独立限速：**按 client_id 1 QPS**，与上面的 GPU Admission 完全无关。
         # 手机和 ECHO 用不同 client，因此各自独立计数；鉴权关闭时都是 anonymous，
         # 会共用同一条计数（要分开就必须开鉴权，见 tts.py 的说明）。
+        # 收费启用时**再叠一层按 user 的 1 QPS / 字符额度**（`check_capability`）。
         self.tts_limiter = tts_mod.TtsRateLimiter(
             per_second=float(cfg.get("tts.per_second", 1.0) or 0.0))
+
+    def _user_quota_limit(self, user_id: str) -> float:
+        """这个账号的每日 ASR 分钟上限（收费启用时读 `entitlements`）。"""
+        if self.billing_svc is None or not self.billing_svc.enabled:
+            return 0.0
+        try:
+            return float(self.billing_svc.limits(str(user_id))["daily_audio_minutes"])
+        except Exception:
+            return 0.0
+
+    def _tts_limit(self, user_id: str) -> int:
+        if self.billing_svc is None or not self.billing_svc.enabled:
+            return 0
+        try:
+            return int(self.billing_svc.limits(str(user_id))["tts_chars"])
+        except Exception:
+            return 0
+
+    def check_capability(self, client_id: str, kind: str = "audio") -> Optional[dict]:
+        """收费闸门（鉴权之后、读 body 之前）。返回账号上下文或 None（老路）。
+
+        * `kind=audio`：ASR / 分离 / 嵌入 —— 权益 + 1 QPS + **日额度** + 并发预检；
+        * `kind=tts`：不占 GPU，只受 1 QPS 与 TTS 字符日额度（设计 §4.4）。
+        """
+        svc = self.billing_svc
+        if svc is None or not svc.enabled:
+            return None
+        ctx = svc.check_access(client_id, kind=kind)
+        if ctx is None:
+            return None
+        uid = str(ctx["user_id"])
+        limits = ctx["limits"]
+        if kind == "audio":
+            # 先做一次**不占槽**的并发预检，满了就别收音频（权威判定在 user_slot）。
+            svc.concurrency.check(uid, int(limits["max_concurrent"]))
+        return ctx
+
+    def quota_remaining(self, client_id: str, user_id: Optional[str] = None):
+        """今天还剩几分钟。账号请求读 user 账；老路读 client 账。"""
+        if user_id:
+            return self.user_quota.remaining_minutes(str(user_id))
+        return self.quota.remaining_minutes(client_id)
+
+    def tts_remaining(self, user_id: str):
+        return self.tts_ledger.remaining(str(user_id))
 
     def _quota_limit_for(self, client_id: str) -> float:
         """这个客户端的专属上限（分钟）；0/取不到 = 用全局默认。
@@ -206,33 +266,52 @@ class State:
             return 0.0
 
     @contextmanager
-    def billing(self, client_id: str, seconds: float):
+    def billing(self, client_id: str, seconds: float, user_id: Optional[str] = None):
         """占通道 + 记这一笔配额。**顺序是有意的：先占通道，再记账。**
 
         被 `409 client_busy` / `503 server_busy` 顶回去的请求**不计费** ——
         我们没为它烧 GPU。反过来，通道拿到了、模型要开跑了，即使推理随后失败也计费：
         那段 GPU 时间是真的花了。
+
+        收费启用且这台设备绑了账号时，记到 **user 账**上（换台设备不能重刷额度）。
         """
         with self.admission.hold(client_id):
-            self.quota.add(client_id, seconds)
+            if user_id:
+                self.user_quota.add(str(user_id), seconds)
+            else:
+                self.quota.add(client_id, seconds)
             yield
 
     # ---------------------------------------------------------------- 调用记账
 
     @contextmanager
-    def timed_billing(self, client_id: str, seconds: float, request=None):
+    def timed_billing(self, client_id: str, seconds: float, request=None,
+                      user_id: Optional[str] = None):
         """`billing` + 顺手量出**排队等了多久**（设计 §7.3 的 `queue_wait_ms`）。
 
         为什么量这个：客户端看到的"很慢"有两种完全不同的成因 —— 排队等通道，
         还是模型真的慢。没有这两个数就只能猜，而它们的解法相反
         （前者要加通道/错峰，后者要换模型）。
+
+        收费的 **user 级并发槽**也在这里拿：它与设备级通道槽同时持有到推理结束
+        （TTS 不走这里 —— 它不占 GPU）。
         """
         t_wait = time.time()
-        with self.billing(client_id, seconds):
-            waited = int((time.time() - t_wait) * 1000)
-            if request is not None:
-                note_call(request, queueWaitMs=waited)
-            yield
+        slot = (self.billing_svc.user_slot(str(user_id))
+                if (user_id and self.billing_svc is not None
+                    and self.billing_svc.enabled) else _null_slot())
+        with slot:
+            with self.billing(client_id, seconds, user_id=user_id):
+                waited = int((time.time() - t_wait) * 1000)
+                if request is not None:
+                    note_call(request, queueWaitMs=waited)
+                yield
+
+
+@contextmanager
+def _null_slot():
+    """无操作上下文（收费没启用 / 老客户端时用）。"""
+    yield
 
 
 def note_call(request, **fields) -> None:
@@ -312,13 +391,27 @@ def pair(request: Request, payload: Optional[dict] = None):
     source = _source_of(request)
     auth.throttle.check(source)
     body = payload or {}
+    code = str(body.get("code") or "")
+    client_name = str(body.get("clientName") or "")
+    # 收费（2026-11-03）：**兑换前的准入预检**。码本身可能绑着一个账号
+    # （支付成功发的 purchase 码 / 换机的 device-bind 码）—— 设备上限与权益
+    # 在把码消费掉**之前**判，失败了码还在（用户可以解绑后重试，不必重新付款）。
+    pair_row = None
+    if st.billing_svc is not None:
+        pair_row = auth.lookup_pairing_code(code)
+        if pair_row and pair_row.get("user_id"):
+            st.billing_svc.precheck_pair(pair_row)
     try:
-        out = auth.redeem(str(body.get("code") or ""),
-                          client_name=str(body.get("clientName") or ""))
+        out = auth.redeem(code, client_name=client_name)
     except errors.EchoError:
         auth.throttle.failed(source)
         raise
     auth.throttle.succeeded(source)
+    if st.billing_svc is not None and pair_row and pair_row.get("user_id"):
+        # 兑换成功后把设备记到账号名下。万一并发下超出设备上限，`after_pair`
+        # 会把刚建出来的客户端禁用并回滚绑定，再抛 403。
+        st.billing_svc.after_pair(pair_row, str(out.get("clientId") or ""),
+                                  device_name=client_name)
     return out
 
 
@@ -364,6 +457,20 @@ def capabilities(request: Request):
     st = _st(request)
     cfg = st.cfg
     models = st.pool.status()
+    # 收费摘要（设计 §4.4 末两条）：**只有带着有效客户端令牌时才附**。
+    # `/v1/capabilities` 本身免凭据（健康检查/选后端要用），所以没有令牌时
+    # 该字段是 `None` —— 不能因为"没登录"就把这个端点变成 401。
+    entitlement = None
+    if st.billing_svc is not None and st.billing_svc.enabled:
+        try:
+            who = client_of(request)
+            user = st.billing_svc.user_for_client(str(who.get("client_id") or ""))
+            if user is not None:
+                uid = str(user["user_id"])
+                entitlement = st.billing_svc.entitlement_summary(
+                    uid, devices=st.billing_svc.store.count_devices(uid))
+        except errors.EchoError:
+            entitlement = None
     # 槽 → 模型 id。**从池里取，不在这里重新汇总** —— 池的 `_by_slot` 同时是
     # `pick_for_slot` 用的那一份，所以"宣告的"与"路由得到的"在构造上就是同一个东西。
     # （曾经这里按 `[slot] + supports` 自己算，而池只按 `slot` 建索引，
@@ -391,6 +498,8 @@ def capabilities(request: Request):
         "slots": slots,
         "models": models,
         "vram": st.pool.vram(),
+        # 收费未启用时为 None（设计 §4.4：billing 没开就不出现/为 null）。
+        "entitlement": entitlement,
     }
 
 
@@ -611,6 +720,12 @@ async def tts(request: Request):
         token = raw_auth[7:].strip() if raw_auth.lower().startswith("bearer ") else ""
         dpop.verify(request, token, dict(who.get("cnf") or {}))
     note_call(request, clientId=cid)
+    # 收费（2026-11-03）：权益 + 按 **user** 的 1 QPS。TTS 不占 GPU/并发槽，
+    # 但仍要限（上游 edge-tts 有成本、也怕脚本刷）。老客户端（未绑账号）返回 None。
+    # **手机委托 token 记到父客户端（ECHO）的账号上**：权益归人，不能因为换了个
+    # `phone:*` 的 sub 就绕开日字符额度/1 QPS。`who["parent"]` 是委托方的 client_id。
+    billing_cid = str(who.get("parent") or cid)
+    access = st.check_capability(billing_cid, "tts")
 
     try:
         body = await request.json()
@@ -630,6 +745,10 @@ async def tts(request: Request):
     except tts_mod.TtsInputError as exc:
         raise errors.tts_text_invalid(str(exc)) from None
 
+    # 收费：先按"这次要加的字符"预判（不够就 429，不白跑上游），合成成功后再记账。
+    if access:
+        st.billing_svc.check_tts_quota(str(access["user_id"]), len(text))
+
     # **1 QPS，按 client_id 单独算**。手机/ECHO 的 client 不同，因此互不影响。
     st.tts_limiter.check(cid)
 
@@ -643,6 +762,10 @@ async def tts(request: Request):
         raise errors.tts_unavailable(str(exc)) from None
     except tts_mod.TtsError as exc:
         raise errors.tts_failed(str(exc)) from None
+
+    if access:
+        # 成功才计费（上游成本真的发生了）；失败的请求只消耗了 QPS，不扣字符。
+        st.tts_ledger.add(str(access["user_id"]), len(text))
 
     return Response(
         content=data,
@@ -681,6 +804,7 @@ async def asr(request: Request, variant: str = "long", timestamps: int = 0,
     try:
         cid = client_id_of(request, need_scope="asr")
         note_call(request, clientId=cid)
+        access = st.check_capability(cid, "audio")   # 收费闸门（权益/1 QPS/日额度）
         st.quota.check(cid)                    # 今天的额度用完了？**也在读 body 之前**
         model_id = st.pool.pick_for_slot(slot, model)
         spec = st.pool.spec(model_id)
@@ -702,13 +826,14 @@ async def asr(request: Request, variant: str = "long", timestamps: int = 0,
         def _infer():
             t0 = time.time()
             note_call(request, audioSeconds=seconds)
-            with st.timed_billing(cid, seconds, request):
+            with st.timed_billing(cid, seconds, request,
+                                  user_id=(access or {}).get("user_id")):
                 with st.pool.acquire(model_id) as engine:
                     return _finish_asr(engine, wav, lang, want_ts, model_id, spec,
                                        seconds, t0)
 
         out = await run_in_threadpool(_infer)
-    remaining = st.quota.remaining_minutes(cid)
+    remaining = st.quota_remaining(cid, (access or {}).get("user_id"))
     if remaining is not None:
         # 让客户端能提前提示"今天快用完了" —— 它自己算不出来（额度在服务端那本账上）。
         # **不限时不给这个字段**：给 -1 或一个大数，界面都会当成"有额度"去显示。
@@ -734,6 +859,7 @@ async def diarize(request: Request, mode: str = "segment", maxSpeakers: int = 0,
         note_call(request, clientId=cid)
         if str(mode) != "segment":
             raise errors.bad_request("mode=%r 尚未实现（v1 只支持 segment）" % mode)
+        access = st.check_capability(cid, "audio")
         st.quota.check(cid)
         model_id = st.pool.pick_for_slot("diarize.turns", model)
         spec = st.pool.spec(model_id)
@@ -752,7 +878,8 @@ async def diarize(request: Request, mode: str = "segment", maxSpeakers: int = 0,
         def _infer():
             t0 = time.time()
             note_call(request, audioSeconds=seconds)
-            with st.timed_billing(cid, seconds, request):
+            with st.timed_billing(cid, seconds, request,
+                                  user_id=(access or {}).get("user_id")):
                 with st.pool.acquire(model_id) as engine:
                     return engine.analyze(wav, max_speakers=int(maxSpeakers) or None), t0
 
@@ -772,7 +899,7 @@ async def diarize(request: Request, mode: str = "segment", maxSpeakers: int = 0,
         "audioSeconds": round(seconds, 2),
         "durationMs": int((time.time() - t0) * 1000),
     }
-    remaining = st.quota.remaining_minutes(cid)
+    remaining = st.quota_remaining(cid, (access or {}).get("user_id"))
     if remaining is not None:
         out["quotaRemainingMinutes"] = round(remaining, 1)
     return out
@@ -790,6 +917,7 @@ async def speaker_embed(request: Request, count: int = 1, model: str = ""):
     try:
         cid = client_id_of(request, need_scope="embed")
         note_call(request, clientId=cid)
+        access = st.check_capability(cid, "audio")
         st.quota.check(cid)
         model_id = st.pool.pick_for_slot("speaker.embed", model)
         spec = st.pool.spec(model_id)
@@ -808,7 +936,8 @@ async def speaker_embed(request: Request, count: int = 1, model: str = ""):
         def _infer():
             t0 = time.time()
             note_call(request, audioSeconds=seconds)
-            with st.timed_billing(cid, seconds, request):
+            with st.timed_billing(cid, seconds, request,
+                                  user_id=(access or {}).get("user_id")):
                 with st.pool.acquire(model_id) as engine:
                     return engine.embed(wav), t0
 
@@ -822,7 +951,7 @@ async def speaker_embed(request: Request, count: int = 1, model: str = ""):
         "audioSeconds": round(seconds, 2),
         "durationMs": int((time.time() - t0) * 1000),
     }
-    remaining = st.quota.remaining_minutes(cid)
+    remaining = st.quota_remaining(cid, (access or {}).get("user_id"))
     if remaining is not None:
         out["quotaRemainingMinutes"] = round(remaining, 1)
     return out

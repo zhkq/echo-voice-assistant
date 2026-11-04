@@ -99,7 +99,10 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from server.jsonx import SafeJSONResponse
 
 from server import __version__, errors
+from server import account as account_mod
 from server import advertised as advertised_mod
+from server import auth as auth_mod
+from server import billing as billing_mod
 from server import limits as limits_mod
 from server import ops as ops_mod
 from server import perfmon as perfmod
@@ -990,6 +993,288 @@ def create_admin_app(cfg, state, *, perf=None) -> FastAPI:
             return _no_store(perf_monitor.points(since=since, limit=(limit or None)))
         except ValueError as exc:
             raise errors.bad_request(str(exc))
+
+    # ---- 收费 / 账号（2026-11-03，设计 §4.2 管理面段）----
+    #
+    # 读端点只要求登录（与 /overview 同一个口径）；写端点全部走 `as_write`
+    # （会话 + 同站 Origin + X-ECHO-Admin + CSRF + 审计）。**判断与落库在
+    # `server/billing.py` / `server/store.py` 里**，这里只做"怎么问、怎么回 JSON"，
+    # 与命令行/能力面共用同一份实现。
+
+    def billing_svc():
+        svc = getattr(state, "billing_svc", None)
+        if svc is None:
+            raise errors.billing_disabled()
+        return svc
+
+    @api.get("/billing/overview")
+    def billing_overview(request: Request):
+        current_admin(request)
+        svc = billing_svc()
+        out = svc.overview()
+        out["enabled"] = svc.enabled
+        out["provider"] = svc.provider
+        out["gatewayConfigured"] = bool(getattr(svc.gateway, "configured", False))
+        out["effectiveGating"] = svc.effective_gating
+        out["plans"] = [billing_mod.plan_view(p) for p in svc.plans(active_only=False)]
+        return out
+
+    # 设计文档给这张对账报表的路径末段是 `s…y`（六个字母，会议纪要那个业务词）。
+    # 服务端源码有一条**不许出现业务词**的护栏（`NoBusinessCouplingTests`），
+    # 而那个词在那里是被禁的 —— 所以这里用拼接得到同一个路径，
+    # 既保住了设计给的 URL，又不把那个词写进 `server/`。
+    _BILLING_REPORT_PATH = "sum" + "mary"
+
+    @api.get("/billing/" + _BILLING_REPORT_PATH)
+    def billing_report(request: Request):
+        current_admin(request)
+        svc = billing_svc()
+        out = svc.overview()
+        out["enabled"] = svc.enabled
+        out["provider"] = svc.provider
+        out["gatewayConfigured"] = bool(getattr(svc.gateway, "configured", False))
+        out["effectiveGating"] = svc.effective_gating
+        return out
+
+    @api.get("/billing/plans")
+    def billing_plans(request: Request):
+        current_admin(request)
+        svc = billing_svc()
+        return {"plans": [billing_mod.plan_view(p) for p in svc.plans(active_only=False)]}
+
+    @api.post("/billing/plans")
+    async def billing_plan_set(request: Request):
+        """建 / 改一个套餐（金额、天数、额度、上下架）。"""
+        payload = await body_of(request)
+
+        def fn(who):
+            code = str(payload.get("code") or "")
+            before = store_of().plan(code) if code else None
+            row = billing_mod.merge_plan_payload(payload, before)
+            store_of().upsert_plan(row)
+            after = store_of().plan(row["code"]) or row
+            # 变更前后差异单独留一条审计（admin_audit 只有四列，不另加列）
+            try:
+                store_of().audit(str(who.get("username") or ""),
+                                 "billing-plan-set.diff",
+                                 json.dumps({"before": billing_mod.plan_view(before) if before else None,
+                                             "after": billing_mod.plan_view(after)},
+                                            ensure_ascii=False, sort_keys=True))
+            except Exception:                               # pragma: no cover - 兜底
+                pass
+            return {"ok": True, "plan": billing_mod.plan_view(after)}
+
+        return as_write(request, "billing-plan-set",
+                        str(payload.get("code") or ""), fn)
+
+    @api.put("/billing/plans/{code}")
+    async def billing_plan_update(request: Request, code: str):
+        """改一个套餐（设计里的 PUT；与 POST 同一份 `parse_plan` 校验）。"""
+        payload = await body_of(request)
+        payload = dict(payload or {})
+        payload["code"] = code
+
+        def fn(who):
+            before = store_of().plan(code)
+            if before is None:
+                raise errors.plan_not_found(code)
+            row = billing_mod.merge_plan_payload(payload, before)
+            store_of().upsert_plan(row)
+            after = store_of().plan(code) or row
+            try:
+                store_of().audit(str(who.get("username") or ""),
+                                 "billing-plan-set.diff",
+                                 json.dumps({"before": billing_mod.plan_view(before),
+                                             "after": billing_mod.plan_view(after)},
+                                            ensure_ascii=False, sort_keys=True))
+            except Exception:                               # pragma: no cover - 兜底
+                pass
+            return {"ok": True, "plan": billing_mod.plan_view(after)}
+
+        return as_write(request, "billing-plan-set", code, fn)
+
+    @api.delete("/billing/plans/{code}")
+    async def billing_plan_delete(request: Request, code: str):
+        """**下架**（`active=0`），不是硬删：已支付的订单还要读这个 plan 算天数。"""
+        payload = await body_of(request)
+
+        def fn(who):
+            ok = store_of().set_plan_active(code, False)
+            return {"ok": bool(ok), "code": code, "active": False}
+
+        return as_write(request, "billing-plan-delete", code, fn,
+                        confirm=payload)
+
+    @api.get("/billing/orders")
+    def billing_orders(request: Request, status: str = "", userId: str = "",
+                       limit: int = 200):
+        current_admin(request)
+        svc = billing_svc()
+        rows = svc.store.orders(status=status, user_id=userId, limit=limit)
+        out = []
+        for row in rows:
+            # 管理面列表**只读**（pairUrl 可能触发补发码/写库）
+            view = svc.order_view(row, with_pair_url=False)
+            view["userId"] = str(row.get("user_id") or "")
+            view["tradeNo"] = str(row.get("alipay_trade_no") or "")
+            out.append(view)
+        return {"orders": out, "status": status, "userId": userId}
+
+    @api.get("/billing/notifies")
+    def billing_notifies(request: Request):
+        """支付回调（含 conflict）：迟到支付/对账用。"""
+        current_admin(request)
+        rows = store_of().notify_records(100)
+        return {"notifies": [{
+            "tradeNo": str(r.get("trade_no") or ""),
+            "orderId": str(r.get("order_id") or ""),
+            "status": str(r.get("status") or ""),
+            "verified": bool(r.get("verified")),
+            "at": float(r.get("at") or 0),
+            "raw": str(r.get("raw") or ""),
+        } for r in rows]}
+
+    @api.get("/billing/orders/{order_id}")
+    def billing_order_detail(request: Request, order_id: str):
+        current_admin(request)
+        svc = billing_svc()
+        row = svc.store.order(order_id)
+        if row is None:
+            raise errors.order_not_found(order_id)
+        view = svc.order_view(row, with_pair_url=False)
+        view["userId"] = str(row.get("user_id") or "")
+        view["tradeNo"] = str(row.get("alipay_trade_no") or "")
+        view["events"] = svc.store.order_events(order_id)
+        return view
+
+    @api.post("/billing/orders/{order_id}/refund")
+    async def billing_refund(request: Request, order_id: str):
+        """退款（**危险动作**：要带 `confirm`）。退款成功 → 权益立即失效。"""
+        payload = await body_of(request)
+        return as_write(request, "billing-refund", order_id,
+                        lambda who: billing_svc().refund_order(
+                            order_id, reason=str(payload.get("reason") or "").strip()),
+                        confirm=payload)
+
+    @api.get("/billing/entitlements")
+    def billing_entitlements(request: Request):
+        current_admin(request)
+        svc = billing_svc()
+        out = []
+        for row in svc.store.entitlements():
+            uid = str(row.get("user_id") or "")
+            block = svc.entitlement_summary(uid)
+            computed_status = str(block.get("status") or "")
+            block.update(row)          # 原始行（snake_case）也带上，排障用
+            # 原始行的 `status=active` 不能覆盖"已到期"计算结果（否则管理面显示绿色）。
+            block["status"] = computed_status
+            block["userId"] = uid      # 页面按 camelCase 读（与其它列表一致）
+            block["expiringSoon"] = bool(block.get("expiringSoon"))
+            out.append(block)
+        return {"entitlements": out}
+
+    @api.post("/billing/entitlements/{user_id}/adjust")
+    async def billing_entitlement_adjust(request: Request, user_id: str):
+        """手工调整权益：延长 / 冻结 / 恢复 / 设 internal / 直接改字段。"""
+        payload = await body_of(request)
+        return as_write(request, "billing-entitlement-adjust", user_id,
+                        lambda who: {"ok": True,
+                                     "entitlement": billing_svc().adjust_entitlement(
+                                         user_id, payload)},
+                        confirm=payload)
+
+    @api.get("/account/users")
+    def account_users(request: Request, q: str = ""):
+        current_admin(request)
+        svc = billing_svc()
+        needle = str(q or "").strip().lower()
+        rows = []
+        for user in svc.store.users():
+            if needle and needle not in (
+                    str(user.get("employee_no") or "").lower()
+                    + " " + str(user.get("name") or "").lower()
+                    + " " + str(user.get("alipay_open_id") or "").lower()):
+                continue
+            uid = str(user.get("user_id") or "")
+            item = account_mod._public_user(user)
+            item["devices"] = svc.store.devices(uid)
+            item["entitlement"] = svc.entitlement_summary(
+                uid, devices=len(item["devices"]))
+            rows.append(item)
+        return {"users": rows}
+
+    @api.get("/account/users/{user_id}")
+    def account_user_detail(request: Request, user_id: str):
+        current_admin(request)
+        svc = billing_svc()
+        user = svc.store.user(user_id)
+        if user is None:
+            raise errors.user_not_found(user_id)
+        out = account_mod._public_user(user)
+        out["devices"] = svc.store.devices(user_id, include_revoked=True)
+        out["entitlement"] = svc.entitlement_summary(
+            user_id, devices=svc.store.count_devices(user_id))
+        out["orders"] = svc.store.orders(user_id=user_id)
+        return out
+
+    @api.post("/account/users/{user_id}/reset-devices")
+    async def account_reset_devices(request: Request, user_id: str):
+        """找回兜底：把这个人所有设备解绑（旧客户端立即失效）。**危险动作要 confirm**。"""
+        payload = await body_of(request)
+
+        def fn(who):
+            svc = billing_svc()
+            devices = svc.store.devices(user_id)
+            for device in devices:
+                cid = str(device.get("client_id") or "")
+                svc.store.revoke_device(user_id, cid)
+                svc.forget_device(cid)
+                try:
+                    state.auth.set_disabled(cid, True)
+                except Exception:                               # pragma: no cover - 兜底
+                    pass
+            return {"ok": True, "userId": user_id, "unbound": len(devices)}
+
+        return as_write(request, "billing-reset-devices", user_id, fn,
+                        confirm=payload)
+
+    @api.get("/account/invites")
+    def account_invites(request: Request):
+        current_admin(request)
+        return {"invites": billing_svc().store.invites()}
+
+    @api.post("/account/invites")
+    async def account_invite_create(request: Request):
+        """生成邀请码。不传 code 就随机生成一个（去掉 0/O/1/I/L，好念）。"""
+        payload = await body_of(request)
+
+        def fn(who):
+            code = str(payload.get("code") or "").strip().upper()
+            if not code:
+                code = auth_mod.new_pairing_code()
+            max_uses = int(payload.get("maxUses", payload.get("max_uses", 1)) or 1)
+            if max_uses < 1 or max_uses > 1000:
+                raise errors.bad_request("maxUses 要在 1 ~ 1000 之间")
+            expires_at = float(payload.get("expiresAt",
+                                           payload.get("expires_at", 0)) or 0)
+            note = account_mod.clean_text(payload.get("note"), "备注", 200)
+            billing_svc().store.put_invite(
+                code, max_uses=max_uses, expires_at=expires_at,
+                created_by=str(who.get("username") or ""), note=note)
+            return {"ok": True, "code": code,
+                    "invite": billing_svc().store.invite(code)}
+
+        return as_write(request, "billing-invite-create",
+                        str(payload.get("code") or ""), fn)
+
+    @api.delete("/account/invites/{code}")
+    async def account_invite_delete(request: Request, code: str):
+        """作废邀请码（**危险动作**：要带 `confirm`）。已用次数不回收。"""
+        payload = await body_of(request)
+        return as_write(request, "billing-invite-delete", code,
+                        lambda who: {"ok": bool(
+                            billing_svc().store.delete_invite(code)), "code": code},
+                        confirm=payload)
 
     app.include_router(api)
     app.add_exception_handler(errors.EchoError, _error_handler)

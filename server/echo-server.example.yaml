@@ -222,3 +222,52 @@ auth:
   #   python -m server.main --rotate-secret cli-07a3f2  # 换 secret，旧的立刻全失效
   # 把配对串给同事，他在客户端面板里粘一次即可。
   # 这些命令**直接开库、不打 HTTP** —— 安全边界就是"能读到这个库文件"。
+
+# ================================================================ 收费（2026-11-03）
+# 设计：`docs/后端收费-交付给服务器dsh/01-后端收费与自动配对-设计.md`。**出厂关**：不配就是现在这样，
+# 老客户端照旧走免费额度（两条路并存）。开了之后能力端点会按账号的权益放行。
+# 环境变量：ECHO_BILLING_ENABLED=1 / ECHO_PAYMENT_PROVIDER=mock|alipay ...
+billing:
+  enabled: false                 # 总开关；关着时收费端点回 404 billing_disabled
+  user_token_ttl_s: 2592000      # 账号令牌 30 天
+  order_ttl_s: 900               # 未支付订单 15 分钟后关闭
+  pair_code_ttl_s: 900           # 支付成功后那张配对码 15 分钟
+  device_bind_ttl_s: 600         # 换机/重装的一次性绑定码 10 分钟
+  order_rate_per_hour: 10        # 同一账号每小时最多建几单
+  client_scopes: "asr diarize embed tts"   # 收费客户端配对后的能力
+  # 额度兜底（真正生效的值在 plans / entitlements 里；代码不写死价格）
+  daily_audio_minutes: 120
+  daily_tts_chars: 50000
+  qps: 1
+  max_devices: 3
+  max_concurrent: 1
+  timezone: "Asia/Shanghai"      # 每日 0 点按这个时区恢复额度
+
+trial:
+  enabled: true                  # 注册送 7 天试用（管理面可关）
+  days: 7
+
+invite:
+  required: true                 # 注册/登录要邀请码（内部同事专用）
+
+payment:
+  # disabled | mock | alipay。**默认 disabled**：没配支付时服务能起来，
+  # 下单接口明确回 503 payment_unconfigured，绝不静默降级成 Mock。
+  provider: disabled
+  mock_secret: ""                # 空 = 启动时随机；生产不该启用 mock
+  mock_allow_remote: false       # Mock 端点默认只允许本机/测试来源
+  notify_url: ""
+
+alipay:
+  # 真实支付宝（网页收款）。**只留骨架**；订单/权益那条链路已经与 Mock 共用。
+  # 私钥只放服务端文件（挂载），绝不进仓库、日志、测试夹具。
+  # 环境变量：ECHO_ALIPAY_APP_ID / ECHO_ALIPAY_PRIVATE_KEY_PATH /
+  #           ECHO_ALIPAY_PUBLIC_KEY_PATH / ECHO_ALIPAY_GATEWAY / ECHO_ALIPAY_SANDBOX
+  app_id: ""
+  private_key_path: ""
+  public_key_path: ""
+  gateway: "https://openapi.alipay.com/gateway.do"
+  sandbox: false
+  sandbox_gateway: "https://openapi-sandbox.dl.alipaydev.com/gateway.do"
+  seller_id: ""                  # 可选：回调 seller_id 校验
+  notify_url: ""

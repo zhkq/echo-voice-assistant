@@ -169,6 +169,69 @@ DEFAULTS: Dict[str, Any] = {
         "default_scopes": "",           # 空 = 新配对客户端没有额外限制
         "db": "",                       # 空 = {tmp.root}/echo-server-auth.db
     },
+    # ---------------------------------------------------------------- 收费（2026-11-03）
+    # 设计：`docs/后端收费-交付给服务器dsh/01-后端收费与自动配对-设计.md`。**出厂关**：不配就是现在这样，
+    # 老客户端照旧走免费额度（设计 §5.0.0 的"两条路并存"）。
+    "billing": {
+        "enabled": False,
+        # 账号令牌（userToken）有效期。30 天、可刷新（设计 §3.5.4）。
+        "user_token_ttl_s": 30 * 24 * 3600,
+        # 未支付订单多久自动关闭（秒）。
+        "order_ttl_s": 900,
+        # 支付成功后发的那张配对码的有效期（秒）。
+        "pair_code_ttl_s": 900,
+        # 换机 / 重装的设备绑定码有效期（秒）。设计定的是 10 分钟。
+        "device_bind_ttl_s": 600,
+        # 同一账号每小时最多建几单（设计 §4.6 的"下单防刷"）。
+        "order_rate_per_hour": 10,
+        # 新配对客户端拿到的 scopes（空 = 不限）。收费客户端按套餐走，
+        # 但能力端点仍按 scopes 判，所以给全能力。
+        "client_scopes": "asr diarize embed tts",
+        # 额度**兜底默认值**。真正生效的值在 `plans` / `entitlements` 里；
+        # 这里只用于"套餐没写"的极端情况（例如手工调整时只改了一项）。
+        "daily_audio_minutes": 120,
+        "daily_tts_chars": 50000,
+        "qps": 1,
+        "max_devices": 3,
+        "max_concurrent": 1,
+        # 时间口径："每日 0 点恢复"按这个时区（设计 §5.4）。
+        "timezone": "Asia/Shanghai",
+    },
+    # 7 天一次性试用（默认送、后台可关）。设计 §4.5。
+    "trial": {
+        "enabled": True,
+        "days": 7,
+    },
+    # 邀请码门槛（内部同事专用）。`required=false` 时注册不填邀请码。
+    "invite": {
+        "required": True,
+    },
+    "payment": {
+        # disabled | mock | alipay。**默认 disabled**：没配支付时服务能起来，
+        # 下单接口明确回 503 `payment_unconfigured`，绝不静默降级成 Mock。
+        "provider": "disabled",
+        # Mock 网关的 HMAC 密钥（只在 provider=mock 时有意义）。**空 = 启动时随机**；
+        # 不要把仓库里的默认值当生产密钥（生产根本不该启用 mock）。
+        "mock_secret": "",
+        # Mock 端点默认只允许本机/测试来源；隔离环境才显式放开成远程。
+        "mock_allow_remote": False,
+        # 支付回调地址（真实网关要把这个地址配到开放平台）。
+        "notify_url": "",
+    },
+    "alipay": {
+        # 设计 §6 / §8：只留骨架与配置项。**私钥只放服务端**（路径指向挂载文件），
+        # 绝不进仓库、日志、测试夹具。
+        "app_id": "",
+        "private_key_path": "",
+        "public_key_path": "",
+        "gateway": "https://openapi.alipay.com/gateway.do",
+        "sandbox": False,
+        # sandbox=true 且 gateway 仍是生产地址时自动用它。
+        "sandbox_gateway": "https://openapi-sandbox.dl.alipaydev.com/gateway.do",
+        # 可选：回调里的 seller_id 校验（支付宝商户 PID）。空 = 不校验。
+        "seller_id": "",
+        "notify_url": "",
+    },
 }
 
 
@@ -284,6 +347,36 @@ def _env_overrides() -> dict:
     local_pair = _env_bool("ECHO_LOCAL_PAIR")
     if local_pair is not None:
         out.setdefault("server", {})["local_pair"] = local_pair
+    # ---------------------------------------------------------------- 收费（2026-11-03）
+    # 容器里改这几项最方便；示例配置里出现的变量名必须真的被读
+    # （`tests/test_server_contract.py::EnvOverrideTests` 逐名核对）。
+    billing = _env_bool("ECHO_BILLING_ENABLED")
+    if billing is not None:
+        out.setdefault("billing", {})["enabled"] = billing
+    if os.environ.get("ECHO_PAYMENT_PROVIDER"):
+        out.setdefault("payment", {})["provider"] = \
+            str(os.environ["ECHO_PAYMENT_PROVIDER"]).strip().lower()
+    if os.environ.get("ECHO_ALIPAY_APP_ID"):
+        out.setdefault("alipay", {})["app_id"] = os.environ["ECHO_ALIPAY_APP_ID"]
+    if os.environ.get("ECHO_ALIPAY_PRIVATE_KEY_PATH"):
+        out.setdefault("alipay", {})["private_key_path"] = \
+            os.environ["ECHO_ALIPAY_PRIVATE_KEY_PATH"]
+    if os.environ.get("ECHO_ALIPAY_PUBLIC_KEY_PATH"):
+        out.setdefault("alipay", {})["public_key_path"] = \
+            os.environ["ECHO_ALIPAY_PUBLIC_KEY_PATH"]
+    if os.environ.get("ECHO_ALIPAY_GATEWAY"):
+        out.setdefault("alipay", {})["gateway"] = os.environ["ECHO_ALIPAY_GATEWAY"]
+    alipay_sandbox = _env_bool("ECHO_ALIPAY_SANDBOX")
+    if alipay_sandbox is not None:
+        out.setdefault("alipay", {})["sandbox"] = alipay_sandbox
+    if os.environ.get("ECHO_PAYMENT_NOTIFY_URL"):
+        out.setdefault("payment", {})["notify_url"] = os.environ["ECHO_PAYMENT_NOTIFY_URL"]
+    trial = _env_bool("ECHO_TRIAL_ENABLED")
+    if trial is not None:
+        out.setdefault("trial", {})["enabled"] = trial
+    invite = _env_bool("ECHO_INVITE_REQUIRED")
+    if invite is not None:
+        out.setdefault("invite", {})["required"] = invite
     return out
 
 

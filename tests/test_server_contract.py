@@ -30,7 +30,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import jwt                                                     # noqa: E402
 from fastapi.testclient import TestClient                        # noqa: E402
 
+from server import account as account_mod                        # noqa: E402
 from server import auth as auth_mod                              # noqa: E402
+from server import billing as billing_mod                        # noqa: E402
 from server import engines, errors, main as server_main, tmp     # noqa: E402
 from server import limits as limits_mod                          # noqa: E402
 from server import tts as tts_mod                                # noqa: E402
@@ -41,6 +43,17 @@ from server import store as store_mod                            # noqa: E402
 from server.pool import EnginePool, ModelSpec                    # noqa: E402
 
 SERVER_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "server")
+
+from app import paths as _paths_mod                              # noqa: E402
+_REAL_SETTINGS_GET = getattr(_paths_mod, "_settings_get")
+
+
+def tearDownModule():
+    """本文件里有很多"当场 create_app"的用例；`create_app()` 会装
+    `app.paths._settings_get` 这个进程内全局 seam。逐个改太容易漏，所以在**模块边界**
+    换回真实实现 —— 否则会连累排在后面的 `test_config_compat` / `test_backend_admin`。
+    （`PathsSeamTests` 的注释里记着 2026-09-24 那次事故。）"""
+    _paths_mod._settings_get = _REAL_SETTINGS_GET
 
 
 # ---------------------------------------------------------------- 假引擎
@@ -149,8 +162,19 @@ class AdminUrlIsAdvertisedTests(unittest.TestCase):
         cfg.raw["server"]["admin_listen"] = "127.0.0.1:8901"
         cfg.raw["auth"]["enabled"] = True
         cfg.raw["auth"]["tokens"] = [{"client_id": "c1", "token": "t1"}]
-        with TestClient(server_main.create_app(cfg)) as client:
-            resp = client.get("/v1/health")
+        from app import paths
+        before = getattr(paths, "_settings_get", None)
+        try:
+            with TestClient(server_main.create_app(cfg)) as client:
+                resp = client.get("/v1/health")
+        finally:
+            if before is None:
+                try:
+                    delattr(paths, "_settings_get")
+                except AttributeError:
+                    pass
+            else:
+                paths._settings_get = before
         self.assertEqual(resp.status_code, 200, "健康探针免凭据是设计的一部分")
         self.assertEqual(resp.json().get("adminUrl"), "http://127.0.0.1:8901/admin/")
 
@@ -162,6 +186,10 @@ class _AppCase(unittest.TestCase):
 
     def setUp(self):
         _LOAD_COUNTS.clear()
+        # `create_app()` 会装 `app.paths._settings_get` 这个进程内全局 seam；
+        # 每个用例跑完还原，否则会连累后面的文件（`PathsSeamTests` 的那条老教训）。
+        from app import paths
+        self._paths_seam = getattr(paths, "_settings_get", None)
         self.tmpdir = tempfile.mkdtemp(prefix="echo-srv-test-")
         self.cfg = _cfg(self.tmpdir)
         loaders = self.loaders or (lambda device="cuda": {"fake": _fake_loader})
@@ -178,6 +206,14 @@ class _AppCase(unittest.TestCase):
             self.client.__exit__(None, None, None)
         except Exception:
             pass
+        from app import paths
+        if self._paths_seam is None:
+            try:
+                delattr(paths, "_settings_get")
+            except AttributeError:
+                pass
+        else:
+            paths._settings_get = self._paths_seam
 
 
 def _wav_bytes(seconds=0.2, sr=16000):
@@ -248,13 +284,29 @@ class NoBusinessCouplingTests(unittest.TestCase):
             ("POST", "/v1/pair"), ("POST", "/v1/token"),
             # 能力（**都不是**写端点：收音频、出结果、不留存）
             ("POST", "/v1/asr"), ("POST", "/v1/diarize"), ("POST", "/v1/speaker/embed"),
+            # 收费（2026-11-03，设计 §4.2）：**这些是收费功能定义的新端点，
+            # 不是业务内容端点**。它们只写"谁/买了什么/还有多少"这类管理数据，
+            # 不写音频/文本/嵌入。Mock 支付端点不在这里 —— 它由
+            # `payment.mock_router` 按 `payment.provider=mock` 条件注册，
+            # 下面 `MockGatewayRoutesAreConditionalTests` 单独钉。
+            ("POST", "/v1/account/register"), ("POST", "/v1/account/login"),
+            ("GET", "/v1/account/me"),
+            ("POST", "/v1/account/devices/code"),
+            ("POST", "/v1/account/devices/unbind"),
+            ("POST", "/v1/account/logout"),
+            ("GET", "/v1/billing/plans"), ("POST", "/v1/billing/orders"),
+            ("GET", "/v1/billing/orders/{order_id}"),
+            ("POST", "/v1/billing/orders/{order_id}/cancel"),
+            ("GET", "/v1/billing/entitlement"),
+            ("POST", "/v1/billing/alipay/notify"),
             ("POST", "/v1/tts"), ("POST", "/v1/delegate"), ("POST", "/v1/delegate/revoke"),
         }
         got = set()
-        for r in routes_mod.router.routes:
-            methods = set(getattr(r, "methods", ()) or ())
-            for m in methods - {"HEAD", "OPTIONS"}:
-                got.add((m, str(getattr(r, "path", ""))))
+        for router in (routes_mod.router, account_mod.router, billing_mod.router):
+            for r in router.routes:
+                methods = set(getattr(r, "methods", ()) or ())
+                for m in methods - {"HEAD", "OPTIONS"}:
+                    got.add((m, str(getattr(r, "path", ""))))
         self.assertEqual(got, allowed,
                          "路由表与设计的白名单不一致（多出来的很可能是写端点）")
 
@@ -1204,6 +1256,23 @@ class EventLoopNotBlockedTests(unittest.TestCase):
     进同一个事件循环。判据是**墙钟**：并行时 ≈ `d`，串行时 ≈ `2d`。
     """
 
+    def setUp(self):
+        # `create_app()` 会装 `app.paths._settings_get`；这个类不走 `_AppCase`，
+        # 所以自己还原（否则会连累后面的 `test_backend_admin`）。
+        from app import paths
+        self._paths_seam = getattr(paths, "_settings_get", None)
+        self.addCleanup(self._restore_paths_seam)
+
+    def _restore_paths_seam(self):
+        from app import paths
+        if self._paths_seam is None:
+            try:
+                delattr(paths, "_settings_get")
+            except AttributeError:
+                pass
+        else:
+            paths._settings_get = self._paths_seam
+
     def _app_with_slow_engine(self, delay: float):
         """假引擎 + 人为延迟。延迟放在 `transcribe` 里 —— 也就是真正会阻塞的那一段。"""
         class _SlowEngine:
@@ -1595,7 +1664,12 @@ class AuthSchemaTests(unittest.TestCase):
         # 加表要走评审 —— 这条断言就是那道门：白名单变了，这里必须跟着改一次。
         self.assertEqual(tuple(store_mod.TABLE_WHITELIST),
                          ("clients", "pairing_codes", "calls", "admin_users", "admin_audit",
-                          "server_limits", "server_advertised"))
+                          "server_limits", "server_advertised",
+                          # 收费（2026-11-03，设计 §4.1）—— 见 `store.py` 那段逐张的
+                          # 评审理由。没有一张存请求内容，列名黑名单逐列核对。
+                          "plans", "users", "user_devices", "invites",
+                          "authorized_open_ids", "scan_sessions",
+                          "orders", "order_events", "alipay_notify", "entitlements"))
 
 
 class AuthPairingTests(unittest.TestCase):

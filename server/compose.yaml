@@ -87,6 +87,12 @@ services:
       # 出厂总通道 6。**管理面里改过之后，管理面那份优先**（见文件头的说明与
       # `server/limits.py`）：本行只决定"空 state 卷首启"时的起点。
       ECHO_MAX_CONCURRENT: "6"
+      # 收费（2026-11-03）：**默认关**。开了之后能力端点按账号权益放行；
+      # 支付先跑 Mock（生产切 alipay，并把 alipay.* 配进 server.yaml）。
+      ECHO_BILLING_ENABLED: "${ECHO_BILLING_ENABLED:-false}"
+      ECHO_PAYMENT_PROVIDER: "${ECHO_PAYMENT_PROVIDER:-disabled}"
+      ECHO_TRIAL_ENABLED: "${ECHO_TRIAL_ENABLED:-true}"
+      ECHO_INVITE_REQUIRED: "${ECHO_INVITE_REQUIRED:-true}"
       # ⚠️ **SenseVoice 还依赖一个"按模型名"加载的 VAD 模型**（`app/audio/stt.py:_get_sensevoice`
       #    传的 `vad_model="fsmn-vad"`），funasr 会去 ModelScope 现拉它（约 1.7 MB）。
       #    而根文件系统是 `read_only: true`：默认落点 `~/.modelscope` / `~/.cache/modelscope`
