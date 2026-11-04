@@ -162,25 +162,26 @@ class AccountService:
     # ---------------------------------------------------------------- 注册 / 登录
 
     def _login_invite(self, user: Dict[str, Any], code: str) -> None:
-        """登录邀请码：只验"这张码存在且属于这个 user"，**不因过期拒绝**。
+        """登录邀请码：已注册用户只比对 `users.invite_code`，**不查 invite 行**。
 
-        邀请码的 `expires_at` 是"注册名额有效期"，不是账号寿命。注册时把用过的码
-        写进 `users.invite_code`；登录只要拿同一张码即可。老账号（升级前建、没有
-        这个字段）第一次登录时绑定手里的码，之后同样只认这一张。
+        邀请码的 `expires_at` / 管理面「作废」只影响**注册名额**，不是账号寿命：
+        注册时把用过的码写进 `users.invite_code`；之后登录只要拿同一张码即可，
+        即使 invite 行已过期或已被删除也放行。只有升级前建的老账号（字段为空）
+        才需要在首次登录时拿一张**仍存在**的邀请码绑定。
         """
         code = str(code or "").strip()
         if not code:
             raise errors.invite_invalid("登录需要邀请码")
-        invite = self.store.invite(code)
-        if invite is None:
-            raise errors.invite_invalid("没有这张邀请码")
         uid = str(user.get("user_id") or "")
         stored = str(user.get("invite_code") or "").strip()
         if stored:
+            # **不查 self.store.invite(code)**：删除/过期不能锁已注册用户。
             if code.upper() != stored.upper():
                 raise errors.invite_invalid("这张邀请码不属于该账号")
             return
-        # 老账号：绑定这次用的码；不因过期拒绝。
+        # 老账号升级窗口：必须绑定一张此刻仍存在的码（之后只认这一张）。
+        if self.store.invite(code) is None:
+            raise errors.invite_invalid("没有这张邀请码")
         try:
             self.store.update_user(uid, invite_code=code)
         except Exception:                                       # pragma: no cover - 兜底

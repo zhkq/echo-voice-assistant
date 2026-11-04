@@ -326,7 +326,7 @@ alipay:
   sandbox: false                # true 且 gateway 未改时自动用 sandbox_gateway
   seller_id: ""                 # 可选：回调 seller_id 校验
   notify_url: "https://echoserver.zhkq.online:8900/v1/billing/alipay/notify"
-invite: { required: true }      # 注册和登录都要邀请码；登录只验“同一张”，过期不锁号
+invite: { required: true }      # 注册/登录都要邀请码；登录只验“同一张”，过期/作废不锁号
 trial: { enabled: true, days: 7 }
 ```
 
@@ -443,9 +443,12 @@ Mock 端点默认只接受**回环/测试来源**（`payment.mock_allow_remote=f
 * 多实例部署时 1 QPS / 日额度是**进程内**计数（与既有 `quota.py` 同一个取舍），
   不是全局精确值。
 * **登录没有密码**：`invite.required=true` 时注册和登录都要求邀请码（注册时把码写进
-  `users.invite_code`，登录只认同一张，**邀请码过期不锁已注册账号**），并有按来源 IP
-  的失败退避；但知道工号 + 那张注册码仍可登录（内部 10 元月卡定位）。对外部署
-  需要手机号验证码/企业微信（设计 §3.5.11），**本轮不改客户端/协议**。
+  `users.invite_code`，登录只认同一张，**邀请码过期/管理面作废都不影响已注册账号登录，
+  只影响注册名额**），并有按来源 IP 的失败退避；但知道工号 + 那张注册码仍可登录
+  （内部 10 元月卡定位）。对外部署需要手机号验证码/企业微信（设计 §3.5.11），
+  **本轮不改客户端/协议**。
+* 升级前建、`invite_code` 为空的老账号，首次登录可绑定任意一张**仍存在**的邀请码
+  （一次性升级窗口）；绑定后只认这一张。
 * **只对通过 purchase / device-bind 码新配对的设备生效**：开启收费前已经配好的
   存量客户端没有 `user_devices` 绑定，继续走免费老路；是否补"管理面 attach"待用户定。
 * 订单 `expires_at` 现在是**惰性关闭**（下一次 `create_order` 时执行）；支付宝下单已带

@@ -1263,7 +1263,8 @@ class Store:
 
         `trade_no` 是主键：重复/并发的同一笔通知只有第一条能写进去。
         `status` 用于区分 paid / closed / conflict；`overwrite=True` 时把已有行
-        更新成最新状态（迟到支付冲突、非成功→成功升级时用）。
+        更新成最新状态（迟到支付冲突、非成功→成功升级时用）。**目前 overwrite
+        不校验 `order_id` 一致**，调用方只应对同一订单使用（README 8.9 记为已知限制）。
         """
         try:
             with self._lock:

@@ -183,6 +183,17 @@ class RegisterLoginTests(_AccountCase):
         r = self.login("E001")
         self.assertEqual(r.status_code, 200, r.text)
 
+    def test_login_survives_invite_revocation(self):
+        self.invite()
+        self.register()
+        # 管理面「作废」= 删 invite 行；已注册用户不能被锁在门外。
+        self.assertTrue(self.store.delete_invite("INVITE-1"))
+        r = self.login("E001")
+        self.assertEqual(r.status_code, 200, r.text)
+        r = self.login("E001", code="OTHER")
+        self.assertEqual(r.status_code, 403)
+        self.assertEqual(r.json()["code"], "invite_invalid")
+
     def test_login_refuses_a_different_invite(self):
         self.invite()
         self.register()
