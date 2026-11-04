@@ -2681,7 +2681,7 @@ if __name__ == "__main__":
 
 
 class BillingConsoleReviewTests(_AdminCase):
-    """review P1.3 / P2.11：表格转义、9 条读端点 401、4 个 confirm 端点。"""
+    """review P1.3 / P2.11：表格转义、10 条读端点 401、4 个 confirm 端点。"""
 
     READS = (
         "/admin/api/billing/overview",
@@ -2689,6 +2689,7 @@ class BillingConsoleReviewTests(_AdminCase):
         "/admin/api/billing/plans",
         "/admin/api/billing/orders",
         "/admin/api/billing/orders/ord-nope",
+        "/admin/api/billing/notifies",
         "/admin/api/billing/entitlements",
         "/admin/api/account/users",
         "/admin/api/account/users/usr-nope",
@@ -2723,6 +2724,17 @@ class BillingConsoleReviewTests(_AdminCase):
         for want in ("billing-refund.failed", "billing-entitlement-adjust.failed",
                      "billing-reset-devices.failed", "billing-invite-delete.failed"):
             self.assertIn(want, actions)
+
+    def test_a_conflict_notify_is_visible_for_reconciliation(self):
+        store = self.state.auth.store
+        store.record_notify("T-CONFLICT", "ord-closed", raw='{"status":"paid"}',
+                            status="conflict", overwrite=True)
+        self.login()
+        r = self.ac.get("/admin/api/billing/notifies")
+        self.assertEqual(r.status_code, 200, r.text)
+        row = [n for n in r.json()["notifies"] if n["tradeNo"] == "T-CONFLICT"][0]
+        self.assertEqual(row["status"], "conflict")
+        self.assertEqual(row["orderId"], "ord-closed")
 
     def test_the_table_helper_never_inserts_a_plain_string_as_html(self):
         path = os.path.join(os.path.dirname(admin_mod.__file__), "admin.html")

@@ -161,18 +161,30 @@ class AccountService:
 
     # ---------------------------------------------------------------- 注册 / 登录
 
-    def _valid_login_invite(self, code: str) -> None:
-        """登录时只验"这张邀请码存在且没过期"，**不消耗次数**。
+    def _login_invite(self, user: Dict[str, Any], code: str) -> None:
+        """登录邀请码：只验"这张码存在且属于这个 user"，**不因过期拒绝**。
 
-        注册时已经消耗过名额；登录再消耗的话，一次性邀请码的用户第二次就登不进来。
-        `invite.required=false` 时不看这一项。
+        邀请码的 `expires_at` 是"注册名额有效期"，不是账号寿命。注册时把用过的码
+        写进 `users.invite_code`；登录只要拿同一张码即可。老账号（升级前建、没有
+        这个字段）第一次登录时绑定手里的码，之后同样只认这一张。
         """
+        code = str(code or "").strip()
+        if not code:
+            raise errors.invite_invalid("登录需要邀请码")
         invite = self.store.invite(code)
         if invite is None:
             raise errors.invite_invalid("没有这张邀请码")
-        expires_at = float(invite.get("expires_at") or 0)
-        if expires_at and expires_at < time.time():
-            raise errors.invite_invalid("邀请码已过期")
+        uid = str(user.get("user_id") or "")
+        stored = str(user.get("invite_code") or "").strip()
+        if stored:
+            if code.upper() != stored.upper():
+                raise errors.invite_invalid("这张邀请码不属于该账号")
+            return
+        # 老账号：绑定这次用的码；不因过期拒绝。
+        try:
+            self.store.update_user(uid, invite_code=code)
+        except Exception:                                       # pragma: no cover - 兜底
+            pass
 
     def register(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         # 先确认 token 签得出来（没配 jwt_secret 就 503），**再**建账号 ——
@@ -203,8 +215,9 @@ class AccountService:
             raise errors.employee_no_taken()
         user_id = new_user_id()
         try:
-            user = self.store.create_user(user_id, name=name, employee_no=employee_no,
-                                          phone=phone)
+            user = self.store.create_user(
+                user_id, name=name, employee_no=employee_no, phone=phone,
+                invite_code=(invite_code if invite_required else ""))
         except ValueError:
             raise errors.employee_no_taken()
         if invite_required and not self.store.consume_invite(invite_code):
@@ -236,15 +249,10 @@ class AccountService:
             if user is None:
                 # 不区分"没这个工号"与"邀请码不对"：那等于送一个枚举工号的接口。
                 raise errors.unauthorized("工号或邀请码不对")
-            # `invite.required=true` 时**登录也强制**邀请码（不是只有注册）。
-            # 邀请码不消耗次数；只验存在且未过期。客户端/协议不变。
+            # `invite.required=true` 时登录要同一张注册码（不因过期拒绝）。
             invite_code = str(payload.get("inviteCode") or payload.get("invite_code") or "")
             if bool(self.cfg.get("invite.required", True)):
-                if not invite_code:
-                    raise errors.invite_invalid("登录需要邀请码")
-                self._valid_login_invite(invite_code)
-            elif invite_code:
-                self._valid_login_invite(invite_code)
+                self._login_invite(user, invite_code)
             if str(user.get("status") or "active") != "active":
                 raise errors.forbidden("这个账号已停用")
         except errors.EchoError as exc:

@@ -204,6 +204,9 @@ CREATE TABLE IF NOT EXISTS users (
     user_id       TEXT PRIMARY KEY,
     name          TEXT NOT NULL DEFAULT '',
     employee_no   TEXT NOT NULL DEFAULT '',
+    -- 注册时用的邀请码。登录只校验"这张码存在且属于该 user"，**不因过期拒绝**
+    -- （邀请码的 expires_at 只是注册名额的有效期，不是账号寿命）。
+    invite_code   TEXT NOT NULL DEFAULT '',
     phone         TEXT NOT NULL DEFAULT '',
     alipay_open_id TEXT NOT NULL DEFAULT '',
     status        TEXT NOT NULL DEFAULT 'active',
@@ -287,7 +290,9 @@ CREATE TABLE IF NOT EXISTS alipay_notify (
     order_id TEXT NOT NULL DEFAULT '',
     raw      TEXT NOT NULL DEFAULT '',
     verified INTEGER NOT NULL DEFAULT 0,
-    at       REAL NOT NULL DEFAULT 0
+    at       REAL NOT NULL DEFAULT 0,
+    -- paid / closed / pending / conflict …；冲突也要留痕（迟到支付对账用）。
+    status   TEXT NOT NULL DEFAULT ''
 );
 -- 权益归**人**（`user_id` 主键）。到期/退款时把 `status` 改掉即失效。
 CREATE TABLE IF NOT EXISTS entitlements (
@@ -324,6 +329,14 @@ _ADDED_COLUMNS = {
         # （用户实测 dev 12 行全叫"本机客户端"），而那一页的语义是"成功配对的客户端"。
         # 有了这一列，列表默认只显示**未撤销**的，历史仍可查（`include_revoked`）。
         ("revoked_at", "REAL NOT NULL DEFAULT 0"),
+    ),
+    "users": (
+        # 注册邀请码（登录时只验"属于该 user"；过期不等于账号失效）。
+        ("invite_code", "TEXT NOT NULL DEFAULT ''"),
+    ),
+    "alipay_notify": (
+        # 回调状态（paid/closed/conflict…），迟到支付/冲突对账用。
+        ("status", "TEXT NOT NULL DEFAULT ''"),
     ),
     "pairing_codes": (
         ("name", "TEXT NOT NULL DEFAULT ''"),
@@ -972,7 +985,7 @@ class Store:
 
     def create_user(self, user_id: str, *, name: str = "", employee_no: str = "",
                     phone: str = "", alipay_open_id: str = "",
-                    status: str = "active") -> Dict[str, Any]:
+                    invite_code: str = "", status: str = "active") -> Dict[str, Any]:
         """建一个账号。`employee_no`/`alipay_open_id` 撞唯一索引时抛 `ValueError`。
 
         调用方（`account.register()`）会先查重，但唯一索引才是并发下的权威 ——
@@ -983,12 +996,12 @@ class Store:
         try:
             with self._lock:
                 self._db.execute(
-                    "INSERT INTO users (user_id, name, employee_no, phone, alipay_open_id,"
-                    " status, token_version, created_at, updated_at)"
-                    " VALUES (?,?,?,?,?,?,1,?,?)",
+                    "INSERT INTO users (user_id, name, employee_no, invite_code, phone,"
+                    " alipay_open_id, status, token_version, created_at, updated_at)"
+                    " VALUES (?,?,?,?,?,?,?,1,?,?)",
                     (str(user_id), str(name or ""), str(employee_no or ""),
-                     str(phone or ""), str(alipay_open_id or ""), str(status or "active"),
-                     now, now))
+                     str(invite_code or ""), str(phone or ""), str(alipay_open_id or ""),
+                     str(status or "active"), now, now))
                 self._db.commit()
         except sqlite3.IntegrityError as exc:
             # **必须回滚**：`INSERT` 撞唯一索引后事务仍是打开的；不回滚的话，
@@ -1026,7 +1039,7 @@ class Store:
         return [dict(r) for r in rows]
 
     def update_user(self, user_id: str, **fields) -> bool:
-        allowed = {"name", "phone", "alipay_open_id", "status"}
+        allowed = {"name", "phone", "alipay_open_id", "invite_code", "status"}
         sets = [(k, v) for k, v in fields.items() if k in allowed]
         if not sets:
             return False
@@ -1244,32 +1257,51 @@ class Store:
         return [dict(r) for r in rows]
 
     def record_notify(self, trade_no: str, order_id: str, raw: str = "",
-                      verified: bool = False) -> bool:
+                      verified: bool = False, status: str = "",
+                      overwrite: bool = False) -> bool:
         """记一条支付回调。**返回 False = 这笔回调之前已经记过**（幂等）。
 
-        `trade_no` 是主键：重复/并发的同一笔通知只有第一条能写进去，
-        调用方据此决定"跳过重复处理"。
+        `trade_no` 是主键：重复/并发的同一笔通知只有第一条能写进去。
+        `status` 用于区分 paid / closed / conflict；`overwrite=True` 时把已有行
+        更新成最新状态（迟到支付冲突、非成功→成功升级时用）。
         """
         try:
             with self._lock:
                 self._db.execute(
-                    "INSERT INTO alipay_notify (trade_no, order_id, raw, verified, at)"
-                    " VALUES (?,?,?,?,?)",
+                    "INSERT INTO alipay_notify (trade_no, order_id, raw, verified, at,"
+                    " status) VALUES (?,?,?,?,?,?)",
                     (str(trade_no), str(order_id), str(raw or ""),
-                     1 if verified else 0, time.time()))
+                     1 if verified else 0, time.time(), str(status or "")))
                 self._db.commit()
             return True
         except sqlite3.IntegrityError:
             # 重复回调是支付宝重投的**常态**；同样必须回滚，否则下一次
             # `/v1/pair`（BEGIN IMMEDIATE）会 500。
             self._db.rollback()
-            return False
+            if not overwrite:
+                return False
+            with self._lock:
+                self._db.execute(
+                    "UPDATE alipay_notify SET order_id=?, raw=?, verified=?, at=?,"
+                    " status=? WHERE trade_no=?",
+                    (str(order_id), str(raw or ""), 1 if verified else 0,
+                     time.time(), str(status or ""), str(trade_no)))
+                self._db.commit()
+            return True
 
     def notify_record(self, trade_no: str) -> Optional[Dict[str, Any]]:
         with self._lock:
             row = self._db.execute("SELECT * FROM alipay_notify WHERE trade_no=?",
                                    (str(trade_no),)).fetchone()
         return dict(row) if row else None
+
+    def notify_records(self, limit: int = 100) -> List[Dict[str, Any]]:
+        """最近的支付回调（管理面对账用；含 conflict 行）。"""
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT * FROM alipay_notify ORDER BY at DESC LIMIT ?",
+                (max(1, min(1000, int(limit or 100))),)).fetchall()
+        return [dict(r) for r in rows]
 
     # ---------------------------------------------------------------- 权益
 
@@ -1373,13 +1405,27 @@ class Store:
                     return {"ok": False, "conflict": current, "order": order}
                 try:
                     self._db.execute(
-                        "INSERT INTO alipay_notify (trade_no, order_id, raw, verified, at)"
-                        " VALUES (?,?,?,?,?)",
+                        "INSERT INTO alipay_notify (trade_no, order_id, raw, verified,"
+                        " at, status) VALUES (?,?,?,?,?,?)",
                         (str(trade_no), str(order_id), str(notify_raw or ""),
-                         1 if verified else 0, float(now)))
+                         1 if verified else 0, float(now), "paid"))
                 except sqlite3.IntegrityError:
-                    self._db.rollback()
-                    return {"ok": False, "duplicate": True, "order": order}
+                    # 同一 trade_no 之前可能只记过**非成功**通知（closed/pending）：
+                    # 订单还没 paid 且这条记录属于同一订单 → **升级为成功并继续结算**；
+                    # 只有订单已 paid（或记录属于别的订单）才算真 duplicate。
+                    prev = self._db.execute(
+                        "SELECT order_id FROM alipay_notify WHERE trade_no=?",
+                        (str(trade_no),)).fetchone()
+                    if (str(order.get("status") or "") == "paid"
+                            or prev is None
+                            or str(prev["order_id"] or "") != str(order_id)):
+                        self._db.rollback()
+                        return {"ok": False, "duplicate": True, "order": order}
+                    self._db.execute(
+                        "UPDATE alipay_notify SET raw=?, verified=?, at=?, status='paid'"
+                        " WHERE trade_no=?",
+                        (str(notify_raw or ""), 1 if verified else 0, float(now),
+                         str(trade_no)))
                 ent_row = self._db.execute(
                     "SELECT * FROM entitlements WHERE user_id=?",
                     (str(order.get("user_id") or ""),)).fetchone()

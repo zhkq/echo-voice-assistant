@@ -175,6 +175,33 @@ class RegisterLoginTests(_AccountCase):
         self.assertTrue(r.json()["userToken"])
         self.assertEqual(r.json()["user"]["employeeNo"], "E001")
 
+    def test_login_accepts_the_same_invite_after_it_expired(self):
+        self.invite()
+        self.register()
+        # 邀请码的 expires_at 只是注册名额有效期；过期不锁已注册用户。
+        self.store.put_invite("INVITE-1", max_uses=10, expires_at=time.time() - 1)
+        r = self.login("E001")
+        self.assertEqual(r.status_code, 200, r.text)
+
+    def test_login_refuses_a_different_invite(self):
+        self.invite()
+        self.register()
+        self.invite("OTHER")
+        r = self.login("E001", code="OTHER")
+        self.assertEqual(r.status_code, 403)
+        self.assertEqual(r.json()["code"], "invite_invalid")
+
+    def test_login_is_throttled_after_five_failures(self):
+        self.invite()
+        self.register()
+        for _ in range(5):
+            r = self.login("E001", code="WRONG")
+            self.assertEqual(r.status_code, 403, r.text)
+        r = self.login("E001")
+        self.assertEqual(r.status_code, 429, r.text)
+        self.assertEqual(r.json()["code"], "rate_limited")
+        self.assertIn("Retry-After", r.headers)
+
     def test_login_with_an_unknown_employee_number_is_401(self):
         self.invite()
         r = self.login("NOPE")

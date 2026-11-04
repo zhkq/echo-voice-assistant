@@ -245,11 +245,21 @@ class AlipayGateway:
     def create_pay(self, order: Dict[str, Any]) -> Dict[str, Any]:
         if not self.configured:
             raise errors.payment_unconfigured()
+        # 支付宝侧也按订单的 `expires_at` 超时，避免用户在订单关闭后从收银台付款；
+        # 真正的兜底仍是回调冲突留痕 + 人工对账（README 8.9）。
+        minutes = 15
+        try:
+            left = float(order.get("expires_at") or 0) - time.time()
+            if left > 0:
+                minutes = max(1, int(left / 60) + (1 if left % 60 else 0))
+        except (TypeError, ValueError):
+            pass
         biz = {
             "out_trade_no": str(order.get("order_id") or ""),
             "total_amount": "%.2f" % (int(order.get("amount_cents") or 0) / 100.0),
             "subject": "ECHO 后端套餐",
             "product_code": "FAST_INSTANT_TRADE_PAY",
+            "timeout_express": "%dm" % minutes,
         }
         params = {
             "app_id": self.app_id,

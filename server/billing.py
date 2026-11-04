@@ -696,7 +696,7 @@ class BillingService:
         if status != "paid":
             # 非成功状态只留痕（关闭/失败），不改权益。
             first = self.store.record_notify(trade_no, order_id, raw=raw,
-                                             verified=verified)
+                                             verified=verified, status=status)
             self.store.insert_order_event(order_id, "notify-" + (status or "unknown"), "")
             return {"ok": True, "orderId": order_id, "status": "ignored",
                     "duplicate": not first}
@@ -706,6 +706,10 @@ class BillingService:
         if current == "paid":
             return self._duplicate_paid(order, trade_no, norm, now)
         if current not in ("created", "paying"):
+            # **迟到支付也要留痕**：订单已 closed/refunded 时回调不能入账，但必须让
+            # 管理面看得到"钱可能收了、单已关"；否则只能靠支付宝后台人工对账。
+            self.store.record_notify(trade_no, order_id, raw=raw, verified=verified,
+                                     status="conflict", overwrite=True)
             raise errors.order_state_conflict(current, "created/paying")
         plan = self.store.plan(str(order.get("plan_code") or ""))
         if plan is None:

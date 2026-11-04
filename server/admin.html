@@ -1031,11 +1031,12 @@ let BILLING_PLANS = {};
 async function viewBilling() {
   const d = await api("/admin/api/billing/overview");
   BILLING_PLANS = Object.fromEntries((d.plans || []).map((p) => [p.code, p]));
-  const [orders, ents, users, invites] = await Promise.all([
+  const [orders, ents, users, invites, notifies] = await Promise.all([
     api("/admin/api/billing/orders?limit=100"),
     api("/admin/api/billing/entitlements"),
     api("/admin/api/account/users"),
     api("/admin/api/account/invites"),
+    api("/admin/api/billing/notifies"),
   ]);
   const planRows = d.plans.map((p) => [
     p.code, p.name, money(p.priceCents), p.days + " 天",
@@ -1050,6 +1051,10 @@ async function viewBilling() {
     o.status === "paid"
       ? raw(`<button data-refund="${esc(o.orderId)}">退款</button>`)
       : "",
+  ]);
+  const notifyRows = (notifies.notifies || []).map((n) => [
+    n.tradeNo, n.orderId, n.status || "—", n.verified ? "是" : "否", ts(n.at),
+    String(n.raw || "").slice(0, 100),
   ]);
   const entRows = ents.entitlements.map((e) => [
     e.userId, e.plan_code || e.planCode || "", statusBadge(e.status),
@@ -1102,6 +1107,11 @@ async function viewBilling() {
   </div>
   <div class="card"><h2>订单（最近 100 单）</h2>${table(
     ["订单", "账号", "套餐", "金额", "状态", "创建", "支付", "操作"], orderRows)}</div>
+  <div class="card"><h2>支付回调（最近 100 条）</h2>${table(
+    ["tradeNo", "订单", "状态", "验签", "时间", "原文（截断）"], notifyRows)}
+    <div class="muted" style="margin-top:8px">conflict = 订单已关闭/已退款后才到达的成功支付，
+      需人工核对；closed/pending 是非成功通知。</div>
+  </div>
   <div class="card"><h2>权益</h2>${table(
     ["账号", "套餐", "状态", "到期", "每日分钟", "TTS 字符", "QPS", "设备", "操作"],
     entRows)}</div>

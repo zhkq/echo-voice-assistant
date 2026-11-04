@@ -666,6 +666,38 @@ class PaymentAtomicityTests(_BillingCase):
         self.assertIsNotNone(ent, "重复回调没有自愈缺失的权益")
         self.assertEqual(ent["status"], "active")
 
+    def test_a_non_success_notify_does_not_block_a_later_success(self):
+        token = self._register_no_trial()
+        order_id = self.client.post("/v1/billing/orders", json={"planCode": "monthly"},
+                                    headers=self.uh(token)).json()["orderId"]
+        # 先到一条 TRADE_CLOSED，同一 trade_no 落了一行非成功通知。
+        r = self.client.post("/v1/billing/mock/notify",
+                             json={"outTradeNo": order_id, "tradeNo": "T-EDGE",
+                                   "status": "closed"})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["status"], "ignored")
+        # 后来同一 trade_no 的成功通知必须能结算，而不是被唯一键永久挡住。
+        r = self.client.post("/v1/billing/mock/notify",
+                             json={"outTradeNo": order_id, "tradeNo": "T-EDGE"})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(self.store.order(order_id)["status"], "paid")
+        self.assertIsNotNone(self.store.entitlement(
+            self.store.user_by_employee_no("E001")["user_id"]))
+        self.assertEqual(self.store.notify_record("T-EDGE")["status"], "paid")
+
+    def test_a_late_payment_on_a_closed_order_is_recorded_for_reconciliation(self):
+        token = self._register_no_trial()
+        order_id = self.client.post("/v1/billing/orders", json={"planCode": "monthly"},
+                                    headers=self.uh(token)).json()["orderId"]
+        self.store.update_order(order_id, status="closed")
+        r = self.client.post("/v1/billing/mock/notify",
+                             json={"outTradeNo": order_id, "tradeNo": "T-LATE"})
+        self.assertEqual(r.status_code, 409, r.text)
+        rec = self.store.notify_record("T-LATE")
+        self.assertIsNotNone(rec, "迟到支付没有留下 alipay_notify 记录")
+        self.assertEqual(rec["status"], "conflict")
+        self.assertEqual(self.store.order(order_id)["status"], "closed")
+
     def test_two_threads_with_the_same_trade_extend_only_once(self):
         token = self._register_no_trial()
         order_id = self.client.post("/v1/billing/orders", json={"planCode": "monthly"},

@@ -1120,6 +1120,20 @@ def create_admin_app(cfg, state, *, perf=None) -> FastAPI:
             out.append(view)
         return {"orders": out, "status": status, "userId": userId}
 
+    @api.get("/billing/notifies")
+    def billing_notifies(request: Request):
+        """支付回调（含 conflict）：迟到支付/对账用。"""
+        current_admin(request)
+        rows = store_of().notify_records(100)
+        return {"notifies": [{
+            "tradeNo": str(r.get("trade_no") or ""),
+            "orderId": str(r.get("order_id") or ""),
+            "status": str(r.get("status") or ""),
+            "verified": bool(r.get("verified")),
+            "at": float(r.get("at") or 0),
+            "raw": str(r.get("raw") or ""),
+        } for r in rows]}
+
     @api.get("/billing/orders/{order_id}")
     def billing_order_detail(request: Request, order_id: str):
         current_admin(request)
