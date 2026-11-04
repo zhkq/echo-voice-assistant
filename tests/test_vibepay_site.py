@@ -11,6 +11,7 @@
 import json
 import os
 import py_compile
+import re
 import unittest
 from html.parser import HTMLParser
 
@@ -154,6 +155,42 @@ class PageTests(unittest.TestCase):
         for width in ("720px", "980px"):
             self.assertIn("@media (max-width: %s)" % width, css)
 
+    def test_mobile_page_hero_does_not_zero_horizontal_padding(self):
+        """375 宽下 /pricing、/pay 的标题不能贴屏边。
+
+        2026-11-04 复核：`.page-hero { padding: 40px 0 28px }` 会把 `.wrap` 的
+        左右 18px 覆盖成 0，h1.left 变成 0（首页正常 18）。这里钉住 720px 媒体查询里
+        `.page-hero` 的左右内边距不能是 0；真正的 375 宽实测在截图脚本里。
+        """
+        css = _read_site("assets/site.css")
+        media = re.search(r"@media \(max-width: 720px\)\s*\{(.*?)\n\}", css, re.S)
+        self.assertIsNotNone(media, "CSS 里找不到 720px 媒体查询")
+        block = media.group(1)
+        wrap = re.search(r"\.wrap\s*\{([^}]*)\}", block)
+        self.assertIsNotNone(wrap, "720px 媒体查询里没有 .wrap 规则")
+        self.assertIn("padding: 0 18px", wrap.group(1),
+                      "移动端 .wrap 的左右内边距必须保留")
+        hero = re.search(r"\.page-hero\s*\{([^}]*)\}", block)
+        self.assertIsNotNone(hero, "720px 媒体查询里没有 .page-hero 规则")
+        body = hero.group(1)
+        for raw in re.findall(r"padding\s*:\s*([^;]+);", body):
+            parts = raw.split()
+            if len(parts) == 1:
+                horizontal = [parts[0]]
+            elif len(parts) == 2:
+                horizontal = [parts[1]]
+            elif len(parts) == 3:
+                horizontal = [parts[1]]
+            else:
+                horizontal = [parts[1], parts[3]]
+            for value in horizontal:
+                self.assertNotIn(value, ("0", "0px", "0.0px"),
+                                 "720px 下 .page-hero 的左右 padding 被清零：%r" % raw)
+        for prop in ("padding-left", "padding-right"):
+            for value in re.findall(prop + r"\s*:\s*([^;]+);", body):
+                self.assertNotIn(value.strip(), ("0", "0px", "0.0px"),
+                                 "720px 下 .page-hero 的 %s 被清零" % prop)
+
     def test_each_page_has_the_shared_nav_footer_and_toast(self):
         for name in PAGES:
             html = _read_site(name)
@@ -193,7 +230,7 @@ class EvidenceTests(unittest.TestCase):
         text = _read("docs", "vibepay-evidence", "README.md")
         for needle in ("Before", "After", "1440", "375", "768",
                        "APP 名称", "最终域名", "沙箱", "先中文", "已拍板",
-                       "带地址栏", "未完成"):
+                       "带地址栏", "未完成", "提交前必须做", "payUrl", "去掉预览标注"):
             self.assertIn(needle, text, needle)
 
     def test_capture_script_compiles(self):

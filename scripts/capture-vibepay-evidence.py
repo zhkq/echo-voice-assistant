@@ -191,6 +191,36 @@ def _assert_no_horizontal_overflow(page, label: str) -> None:
         )
 
 
+def _assert_page_left_margin(page, label: str, minimum: float = 17.0) -> None:
+    """375 宽下标题不能贴屏边：`h1.left` 至少要有 .wrap 的 18px 内边距。
+
+    2026-11-04 真机复核：`@media (max-width: 720px)` 里 `.page-hero { padding: 40px 0 28px }`
+    把 `.wrap` 的左右 18px 覆盖成 0，`/pricing`、`/pay` 的 h1.left = 0（首页正常 18）。
+    横向溢出检查查不出这种“贴边”，所以单独断言。
+    """
+    metrics = page.evaluate(
+        """() => {
+            const h1 = document.querySelector('main h1') || document.querySelector('h1');
+            const hero = document.querySelector('.page-hero');
+            return {
+                h1Left: h1 ? h1.getBoundingClientRect().left : null,
+                heroPadLeft: hero ? parseFloat(getComputedStyle(hero).paddingLeft) : null,
+            };
+        }"""
+    )
+    if metrics["h1Left"] is None:
+        raise RuntimeError("%s 找不到 h1，无法检查左边距" % label)
+    if metrics["h1Left"] < minimum:
+        raise RuntimeError(
+            "%s 的 h1 左边距 %.1fpx < %.0fpx（移动端标题贴边）"
+            % (label, metrics["h1Left"], minimum)
+        )
+    if metrics["heroPadLeft"] is not None and metrics["heroPadLeft"] <= 0:
+        raise RuntimeError(
+            "%s 的 .page-hero 横向内边距为 0（右/左被 padding 简写覆盖）" % label
+        )
+
+
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as fh:
@@ -310,6 +340,7 @@ def capture(args) -> int:
             mobile_page.goto(base_url + "/pricing", wait_until="load")
             _wait_ready(mobile_page)
             _assert_no_horizontal_overflow(mobile_page, "pricing-mobile")
+            _assert_page_left_margin(mobile_page, "pricing-mobile")
             mobile_target = out_dir / "after-pricing-mobile.png"
             mobile_page.screenshot(path=str(mobile_target), full_page=True, animations="disabled")
             files.append({
@@ -326,6 +357,7 @@ def capture(args) -> int:
                 check.goto(base_url + spec["path"], wait_until="load")
                 _wait_ready(check)
                 _assert_no_horizontal_overflow(check, spec["name"] + "-mobile-check")
+                _assert_page_left_margin(check, spec["name"] + "-mobile-check")
                 check.close()
             mobile.close()
 

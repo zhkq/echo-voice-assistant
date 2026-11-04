@@ -434,7 +434,8 @@ ul { margin: 0; padding: 0; list-style: none; }
   .privacy { padding: 28px 22px; border-radius: 20px; }
   .cta { flex-direction: column; align-items: flex-start; padding: 28px 24px; }
   .cta .btn { width: 100%; }
-  .page-hero { padding: 40px 0 28px; }
+  /* 只改上下：左右必须继续用 .wrap 的 18px，否则 375 宽下 h1 会贴屏边。 */
+  .page-hero { padding-top: 40px; padding-bottom: 28px; }
   .plan, .panel { padding: 22px; }
   .qr-wrap { flex-direction: column; align-items: flex-start; }
   .footer-grid { grid-template-columns: 1fr; gap: 28px; }
