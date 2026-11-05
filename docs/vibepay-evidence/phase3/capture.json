@@ -1,11 +1,13 @@
 {
-  "capturedAt": "2026-11-06T00:41:09+0800",
-  "baseUrl": "http://127.0.0.1:45507",
+  "capturedAt": "2026-11-06T00:47:23+0800",
+  "baseUrl": "http://127.0.0.1:40449",
   "browser": "chromium 156.0.8078.79",
   "baseline": {
     "ref": "origin/integration/billing-vibepay",
     "commit": "e3b4b62b3adfbc78947d85ce42ae8540b5182150",
     "files": [
+      "before-home.png",
+      "before-download.png",
       "before-pricing.png",
       "before-pay.png",
       "before-account-404.png"
@@ -20,8 +22,32 @@
   ],
   "files": [
     {
+      "page": "after-home",
+      "url": "http://127.0.0.1:40449/",
+      "title": "ECHO 语音助手 · 说完就办，会议自动成稿",
+      "viewport": {
+        "width": 1440,
+        "height": 900
+      },
+      "file": "after-home.png",
+      "sha256": "ba4dc5af00ce79d466d8c4b847ffac2cb6159571d16843197fbddfd8b4fe5537",
+      "note": "After：首页（导航新增「我的」与登录 / 我的账户入口）。"
+    },
+    {
+      "page": "after-download",
+      "url": "http://127.0.0.1:40449/download",
+      "title": "下载 · ECHO 语音助手",
+      "viewport": {
+        "width": 1440,
+        "height": 900
+      },
+      "file": "after-download.png",
+      "sha256": "dbee16f744cc5b6b05f3a5c3fcf6b70a31e82121fec69d274a45673572eaf89a",
+      "note": "After：下载页（导航/页脚新增账号入口）。"
+    },
+    {
       "page": "after-pricing",
-      "url": "http://127.0.0.1:45507/pricing",
+      "url": "http://127.0.0.1:40449/pricing",
       "title": "套餐与价格 · ECHO 语音助手",
       "viewport": {
         "width": 1440,
@@ -33,67 +59,67 @@
     },
     {
       "page": "after-account",
-      "url": "http://127.0.0.1:45507/account",
+      "url": "http://127.0.0.1:40449/account",
       "title": "登录与我的账户 · ECHO 语音助手",
       "viewport": {
         "width": 1440,
         "height": 900
       },
       "file": "after-account.png",
-      "sha256": "a0e0eda9488f2f373c1364760a303b38f25eac8961e46d4810d649c44566480d",
+      "sha256": "ce04af31086b43432b9624bc90af73ea3cf9aa398f5baf4f22098a974aa4d64f",
       "note": "After：登录后的账户页（权益 + 最近订单，数据来自 mock API）。"
     },
     {
       "page": "after-pay",
-      "url": "http://127.0.0.1:45507/pay?order=ord-demo-paying",
+      "url": "http://127.0.0.1:40449/pay?order=ord-demo-paying",
       "title": "确认订单并支付 · ECHO 语音助手",
       "viewport": {
         "width": 1440,
         "height": 900
       },
       "file": "after-pay.png",
-      "sha256": "594f733b1cc235a28667e0b06563b5066269b982360d28c6b0619f94381ea46b",
+      "sha256": "3d714174f510269d5d8bf7765b151f442c691e22e0f94aa3ebc5832a020ce7fe",
       "note": "After：真实订单驱动的支付页（等待支付，服务端 payUrl，测试环境标注）。"
     },
     {
       "page": "after-paid",
-      "url": "http://127.0.0.1:45507/pay?order=ord-demo-paid",
+      "url": "http://127.0.0.1:40449/pay?order=ord-demo-paid",
       "title": "确认订单并支付 · ECHO 语音助手",
       "viewport": {
         "width": 1440,
         "height": 900
       },
       "file": "after-paid.png",
-      "sha256": "2741ae282d2df1798803610b7c33b05164a35399e773827fcd6c0bd4abd3ce68",
+      "sha256": "0f4b60a83ee392a989c5102515b546818dc5cb91edddfc6f68f8d4214d6eceec",
       "note": "After：支付成功状态（权益来自 /v1/billing/entitlement）。"
     },
     {
       "page": "after-closed",
-      "url": "http://127.0.0.1:45507/pay?order=ord-demo-closed",
+      "url": "http://127.0.0.1:40449/pay?order=ord-demo-closed",
       "title": "确认订单并支付 · ECHO 语音助手",
       "viewport": {
         "width": 1440,
         "height": 900
       },
       "file": "after-closed.png",
-      "sha256": "30aeb4546f6ca079e2fd5750a441f7d6733b3925d67b23fadd1a25d0c616a8e2",
+      "sha256": "c16e48a0efb8dbafddea257eaa6100455661069f8dc806e8449ff4e37fe9ad77",
       "note": "After：订单关闭状态（失败/取消共用这一页）。"
     },
     {
       "page": "after-timeout",
-      "url": "http://127.0.0.1:45507/pay?order=ord-demo-timeout",
+      "url": "http://127.0.0.1:40449/pay?order=ord-demo-timeout",
       "title": "确认订单并支付 · ECHO 语音助手",
       "viewport": {
         "width": 1440,
         "height": 900
       },
       "file": "after-timeout.png",
-      "sha256": "46d136f0069fb40320d72eb8171ca7fc2715cfc26d684fb9c81ac1ee97f4cab4",
+      "sha256": "8716f3e25c1bb22b9693bad809f679333f0d3c6a7c1c85921dc056d8d1efbb57",
       "note": "After：支付超时状态（已过 expiresAt）。"
     },
     {
       "page": "after-login",
-      "url": "http://127.0.0.1:45507/account",
+      "url": "http://127.0.0.1:40449/account",
       "title": "登录与我的账户 · ECHO 语音助手",
       "viewport": {
         "width": 1440,
@@ -105,31 +131,55 @@
     },
     {
       "page": "after-account-mobile",
-      "url": "http://127.0.0.1:45507/account",
+      "url": "http://127.0.0.1:40449/account",
       "title": "登录与我的账户 · ECHO 语音助手",
       "viewport": {
         "width": 375,
         "height": 812
       },
       "file": "after-account-mobile.png",
-      "sha256": "4df50cc81616717d798d53c20a847007c481c158b2e64fc35f81363a955b6a9e",
+      "sha256": "b78b76b039b312992aaaeb7ac4f648901a6ecfc4324e572af1fe71cad74f168d",
       "note": ""
     },
     {
       "page": "after-pay-mobile",
-      "url": "http://127.0.0.1:45507/pay?order=ord-demo-paying",
+      "url": "http://127.0.0.1:40449/pay?order=ord-demo-paying",
       "title": "确认订单并支付 · ECHO 语音助手",
       "viewport": {
         "width": 375,
         "height": 812
       },
       "file": "after-pay-mobile.png",
-      "sha256": "07ec4e0b5f0600832ec3a1a490a691f3857a7505f0e1cdfa4d492733abbd2b21",
+      "sha256": "9b7395c2842e4fb44410f1c6a4648416a4d9739025495750558e8849a9fd018c",
       "note": ""
     },
     {
+      "page": "before-home",
+      "url": "http://127.0.0.1:36839/",
+      "title": "ECHO 语音助手 · 说完就办，会议自动成稿",
+      "viewport": {
+        "width": 1440,
+        "height": 900
+      },
+      "file": "before-home.png",
+      "sha256": "509db0c5cccfb004c2625202ab049e91c0410485bf032f8d88a807f9179b08c7",
+      "note": "基线 origin/integration/billing-vibepay：首页（导航还没有「我的」/「我的账户」入口）。"
+    },
+    {
+      "page": "before-download",
+      "url": "http://127.0.0.1:36839/download",
+      "title": "下载 · ECHO 语音助手",
+      "viewport": {
+        "width": 1440,
+        "height": 900
+      },
+      "file": "before-download.png",
+      "sha256": "9e1d657443fe6646eab19aac53be9c4a57e8b5ae138390a2b04007e4970fdc34",
+      "note": "基线 origin/integration/billing-vibepay：下载页（导航/页脚还没有账号入口）。"
+    },
+    {
       "page": "before-pricing",
-      "url": "http://127.0.0.1:46215/pricing",
+      "url": "http://127.0.0.1:36839/pricing",
       "title": "套餐与价格 · ECHO 语音助手",
       "viewport": {
         "width": 1440,
@@ -141,7 +191,7 @@
     },
     {
       "page": "before-pay",
-      "url": "http://127.0.0.1:46215/pay?plan=monthly",
+      "url": "http://127.0.0.1:36839/pay?plan=monthly",
       "title": "确认订单并支付 · ECHO 语音助手",
       "viewport": {
         "width": 1440,
@@ -153,7 +203,7 @@
     },
     {
       "page": "before-account-404",
-      "url": "http://127.0.0.1:46215/account",
+      "url": "http://127.0.0.1:36839/account",
       "title": "Error response",
       "viewport": {
         "width": 1440,

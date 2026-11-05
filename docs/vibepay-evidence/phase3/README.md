@@ -9,6 +9,8 @@
 - 基线：`origin/integration/billing-vibepay`（Phase 3 Lead WIP 之前的站点）
 - 视口：1440×900，浅色，中文
 - 页面：
+  - `before-home.png`：首页（导航还没有账号入口）
+  - `before-download.png`：下载页（导航/页脚还没有账号入口）
   - `before-pricing.png`：套餐页，购买入口还是 `/pay?plan=monthly`，页面含「预览版」字样
   - `before-pay.png`：支付页，静态示例订单 + 二维码占位，收银台按钮是 disabled
   - `before-account-404.png`：基线没有 `/account`，真实 404
@@ -18,6 +20,8 @@
 - After：本分支 + `scripts/capture-phase3-evidence.py` 的 mock API
 - 视口：1440×900（另有 375×812 移动端）；浅色，中文
 - 页面：
+  - `after-home.png`：首页（导航新增「我的」/ 登录入口）
+  - `after-download.png`：下载页（导航/页脚新增账号入口）
   - `after-pricing.png`：套餐来自 `GET /v1/billing/plans`；「立即购买」要求登录
   - `after-login.png`：`/account` 登录 / 注册
   - `after-account.png`：登录后的权益 + 最近订单

@@ -435,7 +435,8 @@ class Phase3EvidenceTests(unittest.TestCase):
 
     def test_before_and_after_files_exist(self):
         expected = (
-            "before-pricing.png", "before-pay.png", "before-account-404.png",
+            "before-home.png", "before-download.png", "before-pricing.png", "before-pay.png",
+            "before-account-404.png", "after-home.png", "after-download.png",
             "after-pricing.png", "after-account.png", "after-login.png",
             "after-pay.png", "after-paid.png", "after-closed.png", "after-timeout.png",
             "after-account-mobile.png", "after-pay-mobile.png",
@@ -459,7 +460,9 @@ class Phase3EvidenceTests(unittest.TestCase):
         pages = {item["page"] for item in data["files"]}
         self.assertTrue({
             "before-pricing", "before-pay", "before-account-404",
-            "after-pricing", "after-account", "after-pay", "after-paid", "after-closed", "after-timeout",
+            "before-home", "before-download", "before-pricing", "before-pay",
+            "before-account-404", "after-home", "after-download", "after-pricing",
+            "after-account", "after-pay", "after-paid", "after-closed", "after-timeout",
         } <= pages)
 
     def test_phase3_readme_states_the_evidence_limits(self):

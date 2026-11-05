@@ -376,6 +376,12 @@ def _capture_baseline(context, ref: str, out_dir: Path, files: list) -> dict:
         host, port = server.server_address[:2]
         base = "http://%s:%s" % (host, port)
         specs = (
+            {"name": "before-home", "path": "/", "file": "before-home.png",
+             "viewport": DESKTOP,
+             "note": "基线 %s：首页（导航还没有「我的」/「我的账户」入口）。" % ref},
+            {"name": "before-download", "path": "/download", "file": "before-download.png",
+             "viewport": DESKTOP,
+             "note": "基线 %s：下载页（导航/页脚还没有账号入口）。" % ref},
             {"name": "before-pricing", "path": "/pricing", "file": "before-pricing.png",
              "viewport": DESKTOP, "wait_for": ("#planCards",),
              "note": "基线 %s：套餐页（静态套餐数据，购买入口指向 /pay?plan=monthly）。" % ref},
@@ -443,6 +449,12 @@ def capture(args) -> int:
                 reduced_motion="reduce")
 
             specs = (
+                {"name": "after-home", "path": "/", "file": "after-home.png",
+                 "viewport": DESKTOP,
+                 "note": "After：首页（导航新增「我的」与登录 / 我的账户入口）。"},
+                {"name": "after-download", "path": "/download", "file": "after-download.png",
+                 "viewport": DESKTOP,
+                 "note": "After：下载页（导航/页脚新增账号入口）。"},
                 {"name": "after-pricing", "path": "/pricing", "file": "after-pricing.png",
                  "viewport": DESKTOP, "wait_for": ("#planCards .plan",),
                  "note": "After：套餐从 GET /v1/billing/plans 读取；购买入口要求登录。"},
