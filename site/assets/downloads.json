@@ -1,0 +1,27 @@
+{
+  "product": "ECHO 语音助手",
+  "version": "0.9.0-beta",
+  "date": "2026-11-04",
+  "files": [
+    {
+      "platform": "Windows",
+      "name": "ECHO-Windows-0.9.0-beta.zip",
+      "size": 74895328,
+      "sha256": "CC6B5AE5850EAB786C1C98248DC76BAEBFB3E5BD4FB67B84218B5EF2B71FFAE8"
+    },
+    {
+      "platform": "macOS",
+      "name": "ECHO-macOS-0.9.0-beta.zip",
+      "size": 8784030,
+      "sha256": "76BCD9690E9AAF1AB8FBB5147C62A4DB512605A725D1C4D95EB1BC1F11DD2B51"
+    },
+    {
+      "platform": "Android",
+      "name": "ECHO-Android-0.9.0-beta-debug.apk",
+      "size": 22346187,
+      "sha256": "5ADD81EBE1B86CD5D46968E36AFBB25C5FC2B61A38133C9BA7975202B7CE0C15",
+      "versionName": "1.2",
+      "versionCode": 3
+    }
+  ]
+}

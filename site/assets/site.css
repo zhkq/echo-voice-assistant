@@ -394,6 +394,71 @@ ul { margin: 0; padding: 0; list-style: none; }
 .pay-note { margin-top: 14px; color: var(--muted-2); font-size: 12.5px; line-height: 1.7; }
 .side-note { margin-top: 18px; padding-top: 18px; border-top: 1px dashed var(--line); color: var(--muted); font-size: 13px; line-height: 1.7; }
 
+/* ---------- 下载页 ---------- */
+.nav a[aria-current="page"] { color: var(--ink); background: #fff; }
+.download-section { padding: 6px 0 30px; }
+.download-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px; }
+.dl-card {
+  display: flex; flex-direction: column;
+  background: var(--card); border: 1px solid var(--line); border-radius: 24px;
+  padding: 28px; box-shadow: var(--shadow-sm);
+}
+.dl-head { display: flex; align-items: flex-start; gap: 14px; }
+.dl-icon {
+  flex: 0 0 auto; width: 52px; height: 52px; border-radius: 15px;
+  display: grid; place-items: center; color: var(--brand-ink);
+  background: linear-gradient(135deg, var(--brand-soft), #e8fbf9);
+}
+.dl-icon svg { width: 26px; height: 26px; }
+.dl-title h3 { font-size: 19px; letter-spacing: -.3px; }
+.dl-title p { margin-top: 6px; color: var(--muted); font-size: 13.5px; line-height: 1.65; }
+.dl-head .tag { margin-left: auto; flex: 0 0 auto; }
+.dl-meta {
+  margin: 20px 0 0; padding: 14px 0;
+  border-top: 1px solid var(--line); border-bottom: 1px solid var(--line);
+  display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px;
+}
+.dl-meta div { display: grid; gap: 3px; }
+.dl-meta dt { color: var(--muted-2); font-size: 12px; }
+.dl-meta dd { margin: 0; color: var(--ink-2); font-size: 14px; font-weight: 700; }
+.dl-card .btn { margin-top: 20px; }
+.dl-hint { margin-top: 10px; color: var(--muted-2); font-size: 12px; line-height: 1.65; word-break: break-all; }
+.dl-hint code, .install-steps code, .sha-help code {
+  padding: 1px 5px; border-radius: 5px; background: #eef3fb; color: var(--brand-ink);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .92em;
+}
+.dl-alt { margin-top: 14px; color: var(--muted); font-size: 13px; }
+.dl-alt a { color: var(--brand-ink); font-weight: 700; text-decoration: underline; text-underline-offset: 3px; }
+.sha-box { margin-top: 16px; padding: 0 14px; border: 1px dashed #cfd9e9; border-radius: 12px; background: #fbfdff; }
+.sha-box summary { padding: 12px 0; color: var(--ink-2); font-size: 13.5px; font-weight: 700; cursor: pointer; }
+.sha-box[open] summary { border-bottom: 1px solid var(--line); }
+.sha-label { margin-top: 12px; color: var(--muted); font-size: 12.5px; }
+.sha-value {
+  display: block; margin: 8px 0 10px; padding: 10px 12px;
+  border-radius: 8px; background: #f1f5f9; color: var(--ink-2);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11.5px; line-height: 1.7; word-break: break-all;
+}
+.sha-help { padding-bottom: 12px; color: var(--muted); font-size: 12px; line-height: 1.7; word-break: break-word; }
+.dl-card-android { grid-column: 1 / -1; }
+.dl-card-android .dl-head { flex: 1 1 auto; }
+.dl-card-android .btn { max-width: 420px; }
+.install-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px; margin-top: 32px; }
+.install-card { background: var(--card); border: 1px solid var(--line); border-radius: var(--radius); padding: 26px; box-shadow: var(--shadow-sm); }
+.install-card h3 { font-size: 18px; letter-spacing: -.2px; }
+.install-steps {
+  margin-top: 14px; padding-left: 1.3em;
+  display: grid; gap: 10px; color: var(--muted); font-size: 14px; line-height: 1.75;
+}
+.install-steps li::marker { color: var(--brand); font-weight: 800; }
+.req-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 18px; margin-top: 32px; }
+.req-card { padding: 24px; border-radius: var(--radius); background: var(--bg); border: 1px solid var(--line); }
+.req-card h3 { font-size: 16.5px; }
+.req-card ul { margin-top: 12px; display: grid; gap: 8px; }
+.req-card li { position: relative; padding-left: 16px; color: var(--muted); font-size: 14px; line-height: 1.7; }
+.req-card li::before { content: ""; position: absolute; left: 2px; top: 9px; width: 5px; height: 5px; border-radius: 50%; background: #b7c5da; }
+.req-note { margin-top: 20px; color: var(--muted); font-size: 13.5px; line-height: 1.75; }
+
 /* ---------- 轻提示 ---------- */
 .toast {
   position: fixed; left: 50%; bottom: 28px; transform: translate(-50%, 16px);
@@ -412,6 +477,8 @@ ul { margin: 0; padding: 0; list-style: none; }
   .feature-grid, .steps { grid-template-columns: repeat(2, 1fr); }
   .pricing-grid, .pay-layout { grid-template-columns: 1fr; }
   .privacy { grid-template-columns: 1fr; gap: 26px; padding: 36px; }
+  .download-grid, .install-grid { grid-template-columns: 1fr; }
+  .req-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .footer-grid { grid-template-columns: 1.2fr 1fr; }
   .footer-grid > :last-child { grid-column: 1 / -1; }
 }
@@ -437,6 +504,10 @@ ul { margin: 0; padding: 0; list-style: none; }
   /* 只改上下：左右必须继续用 .wrap 的 18px，否则 375 宽下 h1 会贴屏边。 */
   .page-hero { padding-top: 40px; padding-bottom: 28px; }
   .plan, .panel { padding: 22px; }
+  .dl-card, .install-card { padding: 22px; }
+  .dl-meta { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .dl-card-android .btn { max-width: none; width: 100%; }
+  .req-grid { grid-template-columns: 1fr; }
   .qr-wrap { flex-direction: column; align-items: flex-start; }
   .footer-grid { grid-template-columns: 1fr; gap: 28px; }
   .footer-grid > :last-child { grid-column: auto; }
@@ -448,6 +519,8 @@ ul { margin: 0; padding: 0; list-style: none; }
   .transcript { padding: 14px; }
   .float-badge { display: none; }
   .plan-price .amount { font-size: 48px; }
+  .dl-meta { grid-template-columns: 1fr; }
+  .sha-box { padding: 0 12px; }
 }
 
 @media (prefers-reduced-motion: reduce) {

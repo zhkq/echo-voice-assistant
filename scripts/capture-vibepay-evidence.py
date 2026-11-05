@@ -1,24 +1,27 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""采集 Vibe Pay 签约用站点（首页 / 商品页 / 支付页）的截图证据。
+"""采集 Vibe Pay 签约用站点（首页 / 商品页 / 支付页 / 下载页）的截图证据。
 
 用法（在仓库根目录）：
 
-    # 起一个带“干净 URL”的本地预览（/、/pricing、/pay）
+    # 起一个带“干净 URL”的本地预览（/、/pricing、/pay、/download）
     python scripts/capture-vibepay-evidence.py --serve --port 8090
 
-    # 用本地预览采集 After 截图 + Before（基线：还没有站点时的 404）
+    # 用本地预览采集 After 截图 + Before（基线站点：下载页加入之前的那一版）
     python scripts/capture-vibepay-evidence.py
 
     # 站点已部署到公网后，直接对真实 HTTPS 地址采集（不伪造地址栏）
     python scripts/capture-vibepay-evidence.py --base-url https://echoserver.zhkq.online
 
 产物落在 docs/vibepay-evidence/：after-home.png、after-pricing.png、after-pay.png、
-after-pricing-mobile.png、before-no-site.png、capture.json。
+after-download.png、after-pricing-mobile.png、after-download-mobile.png、
+before-home.png、before-download-404.png、before-no-site.png、capture.json。
 
 说明：
   * 截图用系统 Google Chrome（Playwright 驱动），视口 1440×900，浅色，中文；
-    移动端用 375×812 验证无横向溢出。
+    移动端用 375×812 验证无横向溢出，并额外截下载页。
+  * Before 用 `--baseline-ref`（默认 origin/integration/billing-vibepay）从 git 取出
+    基线站点实际渲染：首页（导航/页脚没有“下载”）+ /download 的真实 404。
   * 本脚本只截“页面内容”。支付宝要求的“带地址栏”截图必须等公网 HTTPS 就绪后，
     用真实浏览器窗口对最终域名补采；脚本不会伪造地址栏，也不把本地 127.0.0.1
     当作公网证据。
@@ -28,12 +31,14 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import io
 import json
 import mimetypes
 import os
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import threading
 import time
@@ -44,6 +49,7 @@ from urllib.parse import unquote, urlsplit
 ROOT = Path(__file__).resolve().parent.parent
 SITE_DIR = ROOT / "site"
 OUT_DIR = ROOT / "docs" / "vibepay-evidence"
+DEFAULT_BASELINE_REF = "origin/integration/billing-vibepay"
 DESKTOP = {"width": 1440, "height": 900}
 MOBILE = {"width": 375, "height": 812}
 TABLET = {"width": 768, "height": 1024}
@@ -73,6 +79,35 @@ PAGES = (
         "file": "after-pay.png",
         "stay": "/pay",
     },
+    {
+        "name": "download",
+        "path": "/download",
+        "title": "下载",
+        "must": (
+            "Windows 10 / 11 x64",
+            "macOS（Intel / Apple Silicon 通用）",
+            "Android",
+            "内测版 0.9.0-beta",
+            "0.9.0-beta",
+            "74.9 MB",
+            "8.8 MB",
+            "22.3 MB",
+            "2026-11-04",
+            "装我.cmd",
+            "SHA-256 校验值",
+            "内测阶段",
+        ),
+        "html_must": (
+            "/downloads/ECHO-Windows-0.9.0-beta.zip",
+            "/downloads/ECHO-macOS-0.9.0-beta.zip",
+            "/downloads/ECHO-Android-0.9.0-beta-debug.apk",
+            "CC6B5AE5850EAB786C1C98248DC76BAEBFB3E5BD4FB67B84218B5EF2B71FFAE8",
+            "76BCD9690E9AAF1AB8FBB5147C62A4DB512605A725D1C4D95EB1BC1F11DD2B51",
+            "5ADD81EBE1B86CD5D46968E36AFBB25C5FC2B61A38133C9BA7975202B7CE0C15",
+            "github.com/zhkq/echo-voice-assistant/releases/download/v3.0.1/",
+        ),
+        "file": "after-download.png",
+    },
 )
 
 for suffix, mime in (
@@ -87,7 +122,7 @@ for suffix, mime in (
 
 
 class SiteHandler(SimpleHTTPRequestHandler):
-    """把 /、/pricing、/pay 映射到 site/ 下的静态文件，不列目录、不缓存。"""
+    """把 /、/pricing、/pay、/download 映射到 site/ 下的静态文件，不列目录、不缓存。"""
 
     root = SITE_DIR
 
@@ -100,6 +135,8 @@ class SiteHandler(SimpleHTTPRequestHandler):
             rel = "pricing.html"
         elif clean in ("/pay", "/pay/"):
             rel = "pay.html"
+        elif clean in ("/download", "/download/"):
+            rel = "download.html"
         else:
             rel = clean.lstrip("/")
         target = (Path(self.root) / rel).resolve()
@@ -221,6 +258,21 @@ def _assert_page_left_margin(page, label: str, minimum: float = 17.0) -> None:
         )
 
 
+def _assert_shared_entries(page, label: str) -> None:
+    """每个页面都必须有导航栏和页脚「下载」入口（issue #9 验收项）。"""
+    counts = page.evaluate(
+        """() => ({
+            nav: document.querySelectorAll('.nav a[href="/download"]').length,
+            footer: document.querySelectorAll('.footer-links a[href="/download"]').length,
+        })"""
+    )
+    if counts["nav"] != 1 or counts["footer"] != 1:
+        raise RuntimeError(
+            "%s 的下载入口数量不对：导航 %s 个、页脚 %s 个（各应为 1 个）"
+            % (label, counts["nav"], counts["footer"])
+        )
+
+
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as fh:
@@ -238,18 +290,95 @@ def _git(*args: str) -> str:
         return "unknown"
 
 
-def _base_commit() -> str:
-    for ref in ("origin/main", "main"):
-        got = _git("merge-base", "HEAD", ref)
-        if got != "unknown":
-            return got
-    return "unknown"
+def _base_commit(ref: str = "origin/main") -> str:
+    got = _git("merge-base", "HEAD", ref)
+    if got != "unknown":
+        return got
+    return _git("rev-parse", ref)
+
+
+def _capture_previous_site(context, ref: str, out_dir: Path) -> list:
+    """基线：`ref` 里还没有下载页，但站点本身在。
+
+    从 git 取出 `ref` 的 `site/` 实际渲染，截图首页（导航/页脚都没有「下载」）
+    和 `/download` 的真实 404 —— 不用别的页面冒充 Before。
+    """
+    tmp = Path(tempfile.mkdtemp(prefix="echo-vibepay-before-"))
+    server = None
+    try:
+        try:
+            blob = subprocess.check_output(
+                ["git", "archive", ref, "site"], cwd=str(ROOT), stderr=subprocess.PIPE
+            )
+        except subprocess.CalledProcessError as exc:
+            detail = exc.stderr.decode("utf-8", "replace").strip() or str(exc)
+            raise RuntimeError("无法从 %s 取基线站点：%s" % (ref, detail)) from exc
+        with tarfile.open(fileobj=io.BytesIO(blob)) as tar:
+            try:
+                tar.extractall(tmp, filter="data")
+            except TypeError:  # Python < 3.12 没有 filter 参数
+                tar.extractall(tmp)
+
+        root = tmp / "site"
+        if not (root / "index.html").is_file():
+            raise RuntimeError("%s 里没有 site/index.html，不能作为基线" % ref)
+        server = start_server(root)
+        host, port = server.server_address[:2]
+        base = "http://%s:%s" % (host, port)
+        files = []
+
+        page = context.new_page()
+        page.goto(base + "/", wait_until="load")
+        _wait_ready(page)
+        _assert_no_horizontal_overflow(page, "before-home")
+        nav_count = page.evaluate('() => document.querySelectorAll(".nav a[href=\\"/download\\"]").length')
+        if nav_count:
+            raise RuntimeError("基线 %s 的首页已经有下载入口，选择的上游不对" % ref)
+        target = out_dir / "before-home.png"
+        page.screenshot(path=str(target), full_page=True, animations="disabled")
+        files.append({
+            "page": "before-home",
+            "url": base + "/",
+            "title": page.title(),
+            "viewport": DESKTOP,
+            "file": target.name,
+            "sha256": _sha256(target),
+            "note": "基线 %s：下载页加入之前的首页，导航/页脚还没有「下载」入口。" % ref,
+        })
+        print("已采集 before-home    %s" % target)
+        page.close()
+
+        page = context.new_page()
+        response = page.goto(base + "/download", wait_until="load")
+        status = response.status if response is not None else None
+        if status != 404:
+            raise RuntimeError("基线 %s 的 /download 应当是 404，实际 %s" % (ref, status))
+        target = out_dir / "before-download-404.png"
+        page.screenshot(path=str(target), full_page=True, animations="disabled")
+        files.append({
+            "page": "before-download-404",
+            "url": base + "/download",
+            "title": page.title(),
+            "status": status,
+            "viewport": DESKTOP,
+            "file": target.name,
+            "sha256": _sha256(target),
+            "note": "基线 %s 没有下载页；这是真实请求 /download 的 404 响应。" % ref,
+        })
+        print("已采集 before-download %s" % target)
+        page.close()
+        return files
+    finally:
+        if server is not None:
+            server.shutdown()
+            server.server_close()
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def _capture_baseline(context, base_url: str, out_dir: Path) -> dict:
-    """基线：本 PR 之前仓库里没有这个站点，访问 / 就是一个普通 404。
+    """更早的基线：本 PR 之前仓库里没有这个站点，访问 / 就是一个普通 404。
 
-    用同一条本地静态服务（空目录）渲染这个状态，避免用别的页面冒充 Before。
+    保留给 issue #7 的证据；下载页的 Before 用 `_capture_previous_site`。
     """
     empty = Path(tempfile.mkdtemp(prefix="echo-vibepay-empty-"))
     server = start_server(empty)
@@ -310,11 +439,14 @@ def capture(args) -> int:
                 _wait_ready(page)
                 body = page.inner_text("body")
                 missing = [needle for needle in spec["must"] if needle not in body]
+                html = page.content()
+                missing += [needle for needle in spec.get("html_must", ()) if needle not in html]
                 if missing:
-                    raise RuntimeError("%s 缺少必要文案：%s" % (spec["name"], "、".join(missing)))
+                    raise RuntimeError("%s 缺少必要文案或链接：%s" % (spec["name"], "、".join(missing)))
                 if spec.get("stay") and spec["stay"] not in page.url:
                     raise RuntimeError("%s 发生了跳转：%s" % (spec["name"], page.url))
                 _assert_no_horizontal_overflow(page, spec["name"])
+                _assert_shared_entries(page, spec["name"])
                 target = out_dir / spec["file"]
                 page.screenshot(path=str(target), full_page=True, animations="disabled")
                 files.append({
@@ -352,6 +484,26 @@ def capture(args) -> int:
                 "sha256": _sha256(mobile_target),
             })
             print("已采集 mobile   %s" % mobile_target)
+
+            download_page = mobile.new_page()
+            download_page.goto(base_url + "/download", wait_until="load")
+            _wait_ready(download_page)
+            _assert_no_horizontal_overflow(download_page, "download-mobile")
+            _assert_page_left_margin(download_page, "download-mobile")
+            _assert_shared_entries(download_page, "download-mobile")
+            download_target = out_dir / "after-download-mobile.png"
+            download_page.screenshot(path=str(download_target), full_page=True, animations="disabled")
+            files.append({
+                "page": "download-mobile",
+                "url": base_url + "/download",
+                "title": download_page.title(),
+                "viewport": MOBILE,
+                "file": download_target.name,
+                "sha256": _sha256(download_target),
+            })
+            print("已采集 mobile   %s" % download_target)
+            download_page.close()
+
             for spec in PAGES:
                 check = mobile.new_page()
                 check.goto(base_url + spec["path"], wait_until="load")
@@ -379,17 +531,24 @@ def capture(args) -> int:
 
             baseline = {"skipped": "外部 --base-url 模式不伪造 Before 截图"}
             if not args.base_url:
-                baseline = _capture_baseline(context, base_url, out_dir)
+                baseline_files = _capture_previous_site(context, args.baseline_ref, out_dir)
+                files.extend(baseline_files)
+                baseline = {
+                    "ref": args.baseline_ref,
+                    "commit": _base_commit(args.baseline_ref),
+                    "files": [item["file"] for item in baseline_files],
+                }
+                before = _capture_baseline(context, base_url, out_dir)
                 files.append({
                     "page": "before-no-site",
-                    "url": baseline["url"],
-                    "title": baseline["title"],
+                    "url": before["url"],
+                    "title": before["title"],
                     "viewport": DESKTOP,
-                    "file": baseline["file"],
-                    "sha256": _sha256(out_dir / baseline["file"]),
-                    "note": "base revision 没有该站点；这是空目录服务的真实 404 页面，不是仿造的旧 UI。",
+                    "file": before["file"],
+                    "sha256": _sha256(out_dir / before["file"]),
+                    "note": "更早的基线（站点加入之前）：空目录服务的真实 404 页面，不是仿造的旧 UI。",
                 })
-                print("已采集 before    %s" % (out_dir / baseline["file"]))
+                print("已采集 before    %s" % (out_dir / before["file"]))
             context.close()
             browser.close()
     finally:
@@ -400,7 +559,8 @@ def capture(args) -> int:
     manifest = {
         "capturedAt": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "branch": _git("rev-parse", "--abbrev-ref", "HEAD"),
-        "baseCommit": _base_commit(),
+        "baseCommit": _base_commit(args.baseline_ref),
+        "baselineRef": args.baseline_ref,
         "baseUrl": base_url,
         "browser": browser_name,
         "desktopViewport": DESKTOP,
@@ -411,6 +571,8 @@ def capture(args) -> int:
             "截图由 scripts/capture-vibepay-evidence.py 生成，页面实际渲染，不是拼图或 mockup。",
             "本地/预览截图不含浏览器地址栏；支付宝要求的带地址栏截图需在公网 HTTPS 就绪后对最终域名补采。",
             "支付页停留在“等待支付”的沙箱示例状态，不是支付成功页。",
+            "下载页的 Before 是 baselineRef 里的真实站点：首页导航/页脚还没有「下载」入口，/download 是真实 404。",
+            "下载页的 Windows/macOS/Android 链接指向站内 /downloads/，镜像文件按页面标注的 SHA-256 放置；GitHub Release 是备用入口。",
         ],
         "files": files,
     }
@@ -422,7 +584,7 @@ def capture(args) -> int:
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
-        description="采集 Vibe Pay 签约站点的首页 / 商品页 / 支付页截图。"
+        description="采集 Vibe Pay 签约站点的首页 / 商品页 / 支付页 / 下载页截图。"
     )
     parser.add_argument("--serve", action="store_true", help="只起本地预览服务（不发截图）")
     parser.add_argument("--base-url", default="", help="已部署站点的根地址；省略则自动起本地服务")
@@ -430,6 +592,11 @@ def main(argv=None) -> int:
     parser.add_argument("--host", default="127.0.0.1", help="本地预览监听地址")
     parser.add_argument("--port", type=int, default=0, help="本地预览端口（0 = 自动）")
     parser.add_argument("--chrome", default="", help="Chrome/Edge 可执行文件路径（默认自动探测）")
+    parser.add_argument(
+        "--baseline-ref",
+        default=DEFAULT_BASELINE_REF,
+        help="Before 截图用的 git ref（默认 %s）" % DEFAULT_BASELINE_REF,
+    )
     args = parser.parse_args(argv)
     if args.serve:
         return serve(args)
