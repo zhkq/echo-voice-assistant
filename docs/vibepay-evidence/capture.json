@@ -1,8 +1,9 @@
 {
-  "capturedAt": "2026-11-04T16:05:37+0800",
-  "branch": "agent/vibepay-site-d5d1df7112e1",
-  "baseCommit": "1b55158a3ab676c4997d03911b5f4dd2d06d2def",
-  "baseUrl": "http://127.0.0.1:41791",
+  "capturedAt": "2026-11-05T21:56:27+0800",
+  "branch": "agent/download-page-8a9058788ad4",
+  "baseCommit": "747d64cac869062b3dc55d1391115410978abdf3",
+  "baselineRef": "origin/integration/billing-vibepay",
+  "baseUrl": "http://127.0.0.1:39535",
   "browser": "chromium 156.0.8078.79",
   "desktopViewport": {
     "width": 1440,
@@ -20,56 +21,105 @@
   "notes": [
     "截图由 scripts/capture-vibepay-evidence.py 生成，页面实际渲染，不是拼图或 mockup。",
     "本地/预览截图不含浏览器地址栏；支付宝要求的带地址栏截图需在公网 HTTPS 就绪后对最终域名补采。",
-    "支付页停留在“等待支付”的沙箱示例状态，不是支付成功页。"
+    "支付页停留在“等待支付”的沙箱示例状态，不是支付成功页。",
+    "下载页的 Before 是 baselineRef 里的真实站点：首页导航/页脚还没有「下载」入口，/download 是真实 404。",
+    "下载页的 Windows/macOS/Android 链接指向站内 /downloads/，镜像文件按页面标注的 SHA-256 放置；GitHub Release 是备用入口。"
   ],
   "files": [
     {
       "page": "home",
-      "url": "http://127.0.0.1:41791/",
+      "url": "http://127.0.0.1:39535/",
       "title": "ECHO 语音助手 · 说完就办，会议自动成稿",
       "viewport": {
         "width": 1440,
         "height": 900
       },
       "file": "after-home.png",
-      "sha256": "658444645ae0d1c5f45f6b2e6aac3cb8cdf681db988836b7fb8bbcf1ba7fac3e"
+      "sha256": "509db0c5cccfb004c2625202ab049e91c0410485bf032f8d88a807f9179b08c7"
     },
     {
       "page": "pricing",
-      "url": "http://127.0.0.1:41791/pricing",
+      "url": "http://127.0.0.1:39535/pricing",
       "title": "套餐与价格 · ECHO 语音助手",
       "viewport": {
         "width": 1440,
         "height": 900
       },
       "file": "after-pricing.png",
-      "sha256": "4321dcaf5dabcd1fcc5112cdc4ec3bb51cc42326f7706fb6ce1794ba730d5bc0"
+      "sha256": "e2ed51af9c569cc880a7b1444ebb1cd8f571058cabba2d8ab05b7b812d378fd1"
     },
     {
       "page": "pay",
-      "url": "http://127.0.0.1:41791/pay?plan=monthly",
+      "url": "http://127.0.0.1:39535/pay?plan=monthly",
       "title": "确认订单并支付 · ECHO 语音助手",
       "viewport": {
         "width": 1440,
         "height": 900
       },
       "file": "after-pay.png",
-      "sha256": "7a6cee4d9b1fc11b43641bb731ee0126c85bdb40de1c272cd78adfd1876fc8ca"
+      "sha256": "499866d2348f7fb27adf55b20fc25b1afc758d02a09de37dea71c41c125f35ff"
+    },
+    {
+      "page": "download",
+      "url": "http://127.0.0.1:39535/download",
+      "title": "下载 · ECHO 语音助手",
+      "viewport": {
+        "width": 1440,
+        "height": 900
+      },
+      "file": "after-download.png",
+      "sha256": "9e1d657443fe6646eab19aac53be9c4a57e8b5ae138390a2b04007e4970fdc34"
     },
     {
       "page": "pricing-mobile",
-      "url": "http://127.0.0.1:41791/pricing",
+      "url": "http://127.0.0.1:39535/pricing",
       "title": "套餐与价格 · ECHO 语音助手",
       "viewport": {
         "width": 375,
         "height": 812
       },
       "file": "after-pricing-mobile.png",
-      "sha256": "51db064bb5db6956a97512160030329b2fe143be7e7baa33c4aaa9ba234308a1"
+      "sha256": "19ce9c353240e05e7614041099da721d886859148f64303153b7e755f403db8b"
+    },
+    {
+      "page": "download-mobile",
+      "url": "http://127.0.0.1:39535/download",
+      "title": "下载 · ECHO 语音助手",
+      "viewport": {
+        "width": 375,
+        "height": 812
+      },
+      "file": "after-download-mobile.png",
+      "sha256": "526df13c772825edbe3f8ca8e9d53c9576f4d414d4cddfa75617f706abe13948"
+    },
+    {
+      "page": "before-home",
+      "url": "http://127.0.0.1:40461/",
+      "title": "ECHO 语音助手 · 说完就办，会议自动成稿",
+      "viewport": {
+        "width": 1440,
+        "height": 900
+      },
+      "file": "before-home.png",
+      "sha256": "658444645ae0d1c5f45f6b2e6aac3cb8cdf681db988836b7fb8bbcf1ba7fac3e",
+      "note": "基线 origin/integration/billing-vibepay：下载页加入之前的首页，导航/页脚还没有「下载」入口。"
+    },
+    {
+      "page": "before-download-404",
+      "url": "http://127.0.0.1:40461/download",
+      "title": "Error response",
+      "status": 404,
+      "viewport": {
+        "width": 1440,
+        "height": 900
+      },
+      "file": "before-download-404.png",
+      "sha256": "5514fda84c0f07a42486dc558384b4f1a71f0f50c1e2cfe59fa78d2cea6878b1",
+      "note": "基线 origin/integration/billing-vibepay 没有下载页；这是真实请求 /download 的 404 响应。"
     },
     {
       "page": "before-no-site",
-      "url": "http://127.0.0.1:35781/",
+      "url": "http://127.0.0.1:44121/",
       "title": "Error response",
       "viewport": {
         "width": 1440,
@@ -77,7 +127,7 @@
       },
       "file": "before-no-site.png",
       "sha256": "5514fda84c0f07a42486dc558384b4f1a71f0f50c1e2cfe59fa78d2cea6878b1",
-      "note": "base revision 没有该站点；这是空目录服务的真实 404 页面，不是仿造的旧 UI。"
+      "note": "更早的基线（站点加入之前）：空目录服务的真实 404 页面，不是仿造的旧 UI。"
     }
   ]
 }
