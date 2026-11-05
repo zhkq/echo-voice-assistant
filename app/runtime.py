@@ -163,13 +163,6 @@ if ($self) { Remove-Item -LiteralPath $self -Force -ErrorAction SilentlyContinue
 """ % (root_ps, int(grace_ms))
 
 
-def _powershell_exe() -> str:
-    """系统 PowerShell 的绝对路径；找不到就回退 PATH 里的 powershell.exe。"""
-    root = (os.environ.get("SystemRoot") or os.environ.get("windir") or r"C:\Windows")
-    p = os.path.join(root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
-    return p if os.path.isfile(p) else "powershell.exe"
-
-
 def schedule_sidebar_force_close(grace_ms: int = SIDEBAR_FORCE_CLOSE_GRACE_MS) -> bool:
     """脱离 ECHO 起一个延迟清理进程；失败只返回 False，绝不影响停服务。
 
@@ -186,13 +179,16 @@ def schedule_sidebar_force_close(grace_ms: int = SIDEBAR_FORCE_CLOSE_GRACE_MS) -
         fd, path = tempfile.mkstemp(prefix="echo-sidebar-cleanup-", suffix=".ps1")
         with os.fdopen(fd, "w", encoding="utf-8-sig", newline="") as fh:
             fh.write(script)
-        flags = (subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS |
-                 subprocess.CREATE_NEW_PROCESS_GROUP)
+        # shell 的绝对路径与"完全脱离 + 不留黑窗"的 flags 都是平台差异，走接缝
+        # （2026-11-05：原来这里写死 r"C:\Windows" / SystemRoot / windir /
+        #  CREATE_NO_WINDOW|DETACHED_PROCESS|CREATE_NEW_PROCESS_GROUP，被
+        #  tests/test_path_seam.py 的四条规则拦下）。
         subprocess.Popen(
-            [_powershell_exe(), "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+            [echo_platform.console_executable(),
+             "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
              "-WindowStyle", "Hidden", "-File", path],
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            close_fds=True, creationflags=flags)
+            close_fds=True, **echo_platform.hidden_detached_kwargs())
         print("[hotkey] 已安排边条兜底清理（3 秒后只结束本棵树的边条）")
         return True
     except Exception as e:                                  # noqa: BLE001 —— 停止路径的最后一步

@@ -180,6 +180,43 @@ def console_shell_argv(script: str):
     return list(fn(script)) if callable(fn) else []
 
 
+def console_executable() -> str:
+    """系统控制台 shell 的**可执行文件绝对路径**（Windows=PowerShell 全路径 / POSIX=/bin/sh）。
+
+    与 `console_shell_argv()` 的分工：那个给的是"跑某个脚本文件的完整 argv"，
+    这个是"只要那个 shell 本身"——调用方还要自己补一段平台无关的开关（如 `-File <路径>`）。
+    名字刻意不含平台专有词：业务代码写 `echo_platform.console_executable()`，
+    而 `scripts/audit-paths.py` 的 WINDOWS_SHELL 规则是按子串扫的，含专有词的调用点
+    本身就会被判违规（2026-11-05 搬迁时实测踩到）。
+    """
+    fn = _platform_fn("console_executable")
+    return str(fn()) if callable(fn) else ""
+
+
+def hidden_detached_kwargs() -> dict:
+    """**完全脱离**父进程、不留黑窗的子进程 kwargs（父进程即将 `os._exit()` 时用）。
+
+    与 `detach_console_kwargs()` 的区别：它多一层"脱离"，用于"ECHO 死了它还得继续跑"
+    的兜底脚本。控制台 helper 的自我重启**不要**用它（Windows 上 PowerShell 会静默退出）。
+    """
+    fn = _platform_fn("hidden_detached_kwargs")
+    return dict(fn()) if callable(fn) else {}
+
+
+def desktop_dsh_cli_candidates() -> list:
+    """官方 DeepSeek Harness 桌面端自带的 `dsh.cmd` 候选路径（调用方判存在）。
+
+    没有官方桌面端的平台返回空表 —— 调用方会退回"本地永久安装"或 npx，不许静默失败。
+    """
+    fn = _platform_fn("desktop_dsh_cli_candidates")
+    if not callable(fn):
+        return []
+    try:
+        return [str(p) for p in (fn() or []) if p]
+    except Exception:
+        return []
+
+
 def process_running(image_name: str) -> bool:
     """按名字查进程（边条是否已在运行）。查不到 = False，永不抛。"""
     fn = _platform_fn("process_running")

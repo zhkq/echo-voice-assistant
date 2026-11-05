@@ -271,3 +271,22 @@ def unprotect_secret(blob: bytes) -> bytes:
 
 def restrict_file(path: str) -> None:
     return _posix.restrict_file(path)
+
+
+# ---------------------------------------------------------------- 控制台可执行文件 / 深度脱离 / 桌面端 CLI
+# 契约与 Windows 一致（守卫测试断言三平台同名同义）。macOS 上没有官方桌面端 CLI 的
+# 已知安装落点，候选表返回空 —— 调用方会退回本地永久安装或 npx。
+
+def console_executable() -> str:
+    """系统控制台 shell 的绝对路径（POSIX = ``/bin/sh``）。"""
+    return "/bin/sh"
+
+
+def hidden_detached_kwargs() -> dict:
+    """完全脱离父进程：POSIX 上就是新会话（``setsid``，与 ``detach_kwargs`` 同义）。"""
+    return _posix.detach_kwargs()
+
+
+def desktop_dsh_cli_candidates() -> list:
+    """macOS 没有已验证的官方桌面端 CLI 落点，返回空表（调用方自行回落）。"""
+    return []

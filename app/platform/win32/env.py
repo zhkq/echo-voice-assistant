@@ -888,3 +888,54 @@ def inline_shell_argv(script: str) -> list:
     """
     return ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
             "-STA", "-Command", str(script or "")]
+
+
+# ------------------------------------------------------------------ 控制台可执行文件 / 深度脱离 / 桌面端 CLI
+#
+# 这一组是 2026-11-05 从业务代码搬进来的（tests/test_path_seam.py 的四条规则：
+# DRIVE_LITERAL / PLATFORM_TOKEN / WINDOWS_API / WINDOWS_SHELL）。搬迁时**行为逐字保持**。
+
+def console_executable() -> str:
+    """系统控制台 shell 的绝对路径（Windows = PowerShell 的绝对路径）。
+
+    用于"在一个脱离的子进程里跑一段 .ps1"：PATH 里找不到 shell 时也要能起得来。
+    函数名刻意**不含** Windows 专有词 —— 调用方（``app/runtime.py``）写的是中性的
+    ``echo_platform.console_executable()``，不是平台分支。
+    """
+    root = (os.environ.get("SystemRoot") or os.environ.get("windir") or r"C:\Windows")
+    p = os.path.join(root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
+    return p if os.path.isfile(p) else "powershell.exe"
+
+
+def hidden_detached_kwargs() -> dict:
+    """**完全脱离**父进程、且不留黑窗的子进程 flags（边条兜底清理脚本用）。
+
+    与 `detach_console_kwargs()` 的差别只有一个 ``DETACHED_PROCESS``：那个脚本要在
+    ECHO ``os._exit()`` 之后继续跑，只"独立进程组"还不够。
+    反过来，控制台 helper 的自我重启**不能**带它（PowerShell 会静默退出，见
+    ``app/runtime.py::restart_echo`` 的注释），所以两者必须是两个原语。
+    """
+    import subprocess
+    flags = (no_window_creationflags()
+             | getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+             | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200))
+    return {"creationflags": flags}
+
+
+def desktop_dsh_cli_candidates() -> list:
+    """官方 DeepSeek Harness 桌面端自带的 `dsh.cmd` 候选路径（调用方判存在）。
+
+    桌面端是 ECHO 的**唯一 DSH 程序来源**（升级跟着它走）；这里只做运行时探测，
+    不做安装（安装由 `.dsh/skills/echo-install` 负责）。
+    """
+    rel = os.path.join("resources", "runtime", "cli", "bin", "dsh.cmd")
+    out = []
+    local = os.environ.get("LOCALAPPDATA")
+    if local:
+        out.append(os.path.join(local, "Programs", "DeepSeek Harness", rel))
+    for env in ("ProgramFiles", "ProgramFiles(x86)"):
+        base = os.environ.get(env)
+        if base:
+            out.append(os.path.join(base, "DeepSeek Harness", rel))
+    out.append(os.path.join(os.path.expanduser("~"), ".deepseek", "harness", rel))
+    return out

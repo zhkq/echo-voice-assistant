@@ -294,3 +294,22 @@ def unprotect_secret(blob: bytes) -> bytes:
 
 def restrict_file(path: str) -> None:
     return _posix.restrict_file(path)
+
+
+# ---------------------------------------------------------------- 控制台可执行文件 / 深度脱离 / 桌面端 CLI
+# 契约与 Windows 一致（守卫测试断言三平台同名同义）。Linux 不是当前交付目标，
+# 但接缝必须齐 —— 否则"在 Windows 上写好的调用"到这里就是 AttributeError。
+
+def console_executable() -> str:
+    """系统控制台 shell 的绝对路径（POSIX = ``/bin/sh``）。"""
+    return "/bin/sh"
+
+
+def hidden_detached_kwargs() -> dict:
+    """完全脱离父进程：POSIX 上就是新会话（``setsid``，与 ``detach_kwargs`` 同义）。"""
+    return _posix.detach_kwargs()
+
+
+def desktop_dsh_cli_candidates() -> list:
+    """Linux 没有官方桌面端 CLI 的已知落点，返回空表（调用方自行回落）。"""
+    return []

@@ -131,6 +131,10 @@ class EveryPlatformImplementsThePrimitives(unittest.TestCase):
                   # P3 剩余搬迁新增的运行时原语（子进程 / 进程查询 / 打开窗口 /
                   # 提示音 / 离线 TTS / 通知 / 边条候选）
                   "detach_gui_kwargs", "detach_console_kwargs", "console_shell_argv",
+                  # 2026-11-05 从业务代码搬进来的三个（path_seam 四条规则清零）：
+                  # `app/runtime.py` 的边条兜底清理要 shell 绝对路径 + 完全脱离的 flags，
+                  # `app/harness_proc.py` 的桌面端 CLI 候选要 %LOCALAPPDATA%/%ProgramFiles%。
+                  "console_executable", "hidden_detached_kwargs", "desktop_dsh_cli_candidates",
                   "process_running", "shell_open", "play_wav_async",
                   # 进程归属判据（「起本机后端」批 1a/1b）：探活必须"只看不动" ——
                   # Windows 上 os.kill(pid, 0) 是"发 Ctrl+C"，绝不能由业务代码自己写。

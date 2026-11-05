@@ -150,18 +150,14 @@ def _desktop_cli_candidates() -> list:
     """官方桌面端 `dsh.cmd` 的候选路径（与安装技能的 harness-install-desktop.ps1 同一批位置）。
 
     桌面端是**唯一程序来源**（升级跟着它走）；这里只是运行时探测，不做安装。
+    具体候选（`%LOCALAPPDATA%` / `%ProgramFiles%` 这类平台取值）住在
+    ``app/platform/<os>/env.py`` —— 平台差异按 D12 只能在那儿
+    （`tests/test_path_seam.py` 的 PLATFORM_TOKEN 规则会拦在业务代码里写）。
     """
-    rel = os.path.join("resources", "runtime", "cli", "bin", "dsh.cmd")
-    out = []
-    local = os.environ.get("LOCALAPPDATA")
-    if local:
-        out.append(os.path.join(local, "Programs", "DeepSeek Harness", rel))
-    for env in ("ProgramFiles", "ProgramFiles(x86)"):
-        base = os.environ.get(env)
-        if base:
-            out.append(os.path.join(base, "DeepSeek Harness", rel))
-    out.append(os.path.join(os.path.expanduser("~"), ".deepseek", "harness", rel))
-    return out
+    try:
+        return list(platform.desktop_dsh_cli_candidates())
+    except Exception:
+        return []
 
 
 def find_desktop_cli() -> str:
