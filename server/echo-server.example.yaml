@@ -259,15 +259,18 @@ payment:
   notify_url: ""
 
 alipay:
-  # 真实支付宝（网页收款）。**只留骨架**；订单/权益那条链路已经与 Mock 共用。
+  # 真实支付宝（网页收款 + 主动查询 + 退款）。
   # 私钥只放服务端文件（挂载），绝不进仓库、日志、测试夹具。
   # 环境变量：ECHO_ALIPAY_APP_ID / ECHO_ALIPAY_PRIVATE_KEY_PATH /
-  #           ECHO_ALIPAY_PUBLIC_KEY_PATH / ECHO_ALIPAY_GATEWAY / ECHO_ALIPAY_SANDBOX
+  #           ECHO_ALIPAY_PUBLIC_KEY_PATH / ECHO_ALIPAY_GATEWAY /
+  #           ECHO_ALIPAY_SANDBOX / ECHO_ALIPAY_RETURN_URL
   app_id: ""
-  private_key_path: ""
-  public_key_path: ""
+  private_key_path: ""           # 应用私钥（RSA2），只读文件路径
+  public_key_path: ""            # 支付宝公钥，只读文件路径
   gateway: "https://openapi.alipay.com/gateway.do"
-  sandbox: false
+  sandbox: false                 # true = 用沙箱网关（沙箱 app_id 另配）
   sandbox_gateway: "https://openapi-sandbox.dl.alipaydev.com/gateway.do"
   seller_id: ""                  # 可选：回调 seller_id 校验
-  notify_url: ""
+  notify_url: ""                 # 异步通知；公网部署后填 HTTPS 地址
+  return_url: ""                 # 支付完成回跳站点（如 https://…/pay），服务端自动追加 ?order=
+  timeout_s: 20                  # query / refund 的 HTTP 超时

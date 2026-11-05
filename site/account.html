@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>登录与我的账户 · ECHO 语音助手</title>
+  <meta name="description" content="ECHO 语音助手账号：用邀请码与工号登录，查看套餐权益、到期时间与最近订单。">
+  <meta name="theme-color" content="#f6f8fc">
+  <link rel="icon" type="image/png" href="/assets/echo-logo.png">
+  <link rel="stylesheet" href="/assets/site.css">
+</head>
+<body data-page="account">
+  <a class="skip-link" href="#main">跳到正文</a>
+
+  <header class="site-header">
+    <div class="wrap header-inner">
+      <a class="brand" href="/" aria-label="ECHO 语音助手首页">
+        <img src="/assets/echo-logo.png" alt="" width="34" height="34">
+        <span class="brand-sub">语音助手</span>
+      </a>
+      <nav class="nav" aria-label="主导航">
+        <a class="nav-hide-sm" href="/#features">功能</a>
+        <a class="nav-pricing" href="/pricing">套餐</a>
+        <a class="nav-download" href="/download">下载</a>
+        <a class="nav-hide-sm" href="/#how">使用流程</a>
+        <a class="nav-account" href="/account" aria-current="page">我的</a>
+      </nav>
+      <a class="btn btn-ghost btn-sm header-cta" href="/account" data-account-cta>登录 / 注册</a>
+    </div>
+  </header>
+
+  <main id="main">
+    <noscript><p class="wrap load-error">需要启用 JavaScript 才能登录与查看订单。</p></noscript>
+    <section class="wrap page-hero">
+      <div class="crumbs"><a href="/">首页</a><span aria-hidden="true">/</span><span id="accountCrumb">我的账户</span></div>
+      <h1 id="accountTitle">登录 / 注册</h1>
+      <p class="lead" id="accountLead">用邀请码与工号登录，查看套餐权益、到期时间和最近订单。</p>
+    </section>
+
+    <section class="wrap account-section" aria-live="polite">
+      <p class="account-loading" id="accountLoading">正在加载账号信息…</p>
+
+      <div class="account-layout" id="accountLayout" hidden>
+        <div class="account-main">
+          <!-- 未登录：登录 / 注册 -->
+          <div class="panel" id="authView" hidden>
+            <div class="auth-tabs" role="tablist" aria-label="登录或注册">
+              <button type="button" class="auth-tab is-active" id="tabLogin" data-auth-tab="login"
+                      role="tab" aria-selected="true" aria-controls="authForm">登录</button>
+              <button type="button" class="auth-tab" id="tabRegister" data-auth-tab="register"
+                      role="tab" aria-selected="false" aria-controls="authForm">注册</button>
+            </div>
+            <p class="auth-note" id="authNote">已有账号？填写工号与邀请码登录。</p>
+            <form id="authForm" novalidate>
+              <div class="field-row" id="fieldNameRow" hidden>
+                <label for="authName">姓名</label>
+                <input class="input" id="authName" name="name" type="text" maxlength="64"
+                       autocomplete="name" placeholder="例如：张三">
+              </div>
+              <div class="field-row">
+                <label for="authEmployeeNo">工号 / 账号</label>
+                <input class="input" id="authEmployeeNo" name="employeeNo" type="text"
+                       maxlength="64" autocomplete="username" placeholder="例如：E001" required>
+              </div>
+              <div class="field-row">
+                <label for="authInviteCode">邀请码</label>
+                <input class="input" id="authInviteCode" name="inviteCode" type="text"
+                       maxlength="64" autocomplete="one-time-code" placeholder="管理员发放的邀请码">
+              </div>
+              <div class="field-row" id="fieldPhoneRow" hidden>
+                <label for="authPhone">手机号（选填）</label>
+                <input class="input" id="authPhone" name="phone" type="tel" maxlength="32"
+                       autocomplete="tel" placeholder="用于联系，不用于登录">
+              </div>
+              <p class="form-error" id="authError" hidden></p>
+              <button class="btn btn-primary btn-block" id="authSubmit" type="submit">登录</button>
+            </form>
+            <p class="auth-hint">邀请码由管理员发放；一个邀请码可注册的名额有限。登录状态只保存在本机浏览器。</p>
+          </div>
+
+          <!-- 已登录：账户与权益 -->
+          <div id="dashboardView" hidden>
+            <div class="panel account-profile">
+              <div class="account-avatar" id="profileAvatar" aria-hidden="true">E</div>
+              <div class="account-profile-text">
+                <div class="account-name" id="profileName">ECHO 用户</div>
+                <div class="account-meta" id="profileMeta">工号：—</div>
+              </div>
+              <span class="status-pill" id="profileStatus">已登录</span>
+              <button class="btn btn-ghost btn-sm" id="logoutBtn" type="button">退出登录</button>
+            </div>
+
+            <div class="panel account-entitlement">
+              <div class="panel-title">当前权益
+                <span class="tag" id="entitlementStatus">—</span>
+              </div>
+              <div class="entitlement-plan" id="entitlementPlan">尚未开通套餐</div>
+              <div class="entitlement-grid">
+                <div class="entitlement-item">
+                  <span class="entitlement-label">到期时间</span>
+                  <strong id="entitlementExpiry">—</strong>
+                </div>
+                <div class="entitlement-item">
+                  <span class="entitlement-label">今日剩余转写</span>
+                  <strong id="entitlementMinutes">—</strong>
+                </div>
+                <div class="entitlement-item">
+                  <span class="entitlement-label">今日剩余 TTS</span>
+                  <strong id="entitlementTts">—</strong>
+                </div>
+                <div class="entitlement-item">
+                  <span class="entitlement-label">速率 / 并发</span>
+                  <strong id="entitlementQps">—</strong>
+                </div>
+                <div class="entitlement-item">
+                  <span class="entitlement-label">设备</span>
+                  <strong id="entitlementDevices">—</strong>
+                </div>
+              </div>
+              <div class="account-actions" id="entitlementActions">
+                <a class="btn btn-primary" href="/pricing">购买 / 续费</a>
+                <a class="btn btn-ghost" href="/download">下载客户端</a>
+              </div>
+              <p class="pay-note">额度按 Asia/Shanghai 自然日恢复；权益归人，多台设备共用同一份额度。</p>
+            </div>
+
+            <div class="panel account-orders">
+              <div class="panel-title">最近订单
+                <button class="btn btn-ghost btn-sm panel-action" id="refreshAccount" type="button">刷新</button>
+              </div>
+              <div class="order-list" id="ordersList" aria-busy="true">
+                <p class="account-loading">正在加载订单…</p>
+              </div>
+              <p class="empty-state" id="ordersEmpty" hidden>还没有订单。去套餐页选一个套餐开始使用。</p>
+              <div class="account-actions">
+                <a class="btn btn-primary" href="/pricing">去购买</a>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <aside class="account-aside">
+          <div class="panel aside-card">
+            <h2>账号能做什么</h2>
+            <ul class="aside-list">
+              <li><strong>下单与续费</strong><span>支付宝收银台付款，订单状态以服务端为准。</span></li>
+              <li><strong>查看权益</strong><span>到期时间、每日转写分钟、TTS 字符与设备额度。</span></li>
+              <li><strong>换机不重复收费</strong><span>权益归人，设备只是登录端；多台设备共用一份额度。</span></li>
+            </ul>
+          </div>
+          <div class="panel aside-card aside-help">
+            <h2>登录遇到问题？</h2>
+            <p>忘记工号或邀请码、需要解绑旧设备，请联系管理员处理。</p>
+            <a class="btn btn-ghost btn-block" href="/pricing">先看看套餐</a>
+          </div>
+        </aside>
+      </div>
+
+      <p class="load-error" id="accountError" hidden></p>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <div class="wrap">
+      <div class="footer-grid">
+        <div>
+          <div class="footer-brand">
+            <img src="/assets/echo-logo.png" alt="" width="36" height="36">
+            语音助手
+          </div>
+          <p class="footer-about">按一下说话，会议自动成稿。语音指令、会议转写、说话人分离与语音合成，装在一个桌面助手里。</p>
+        </div>
+        <div>
+          <p class="footer-title">产品</p>
+          <div class="footer-links">
+            <a href="/#features">功能</a>
+            <a href="/#how">使用流程</a>
+            <a href="/pricing">套餐与价格</a>
+            <a href="/download">下载客户端</a>
+            <a href="/account">我的账户</a>
+          </div>
+        </div>
+        <div>
+          <p class="footer-title">站点</p>
+          <div class="footer-meta">
+            <span>域名：echoserver.zhkq.online</span>
+            <span>联系：<a href="https://github.com/zhkq">GitHub @zhkq</a></span>
+            <span>官方站点</span>
+          </div>
+        </div>
+      </div>
+      <div class="footer-bottom">
+        <span>© 2026 ECHO · echoserver.zhkq.online</span>
+        <span>支付由支付宝提供 · 订单与权益以服务端记录为准</span>
+      </div>
+    </div>
+  </footer>
+
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+  <script src="/assets/site.js"></script>
+</body>
+</html>

@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>确认订单并支付 · ECHO 语音助手</title>
-  <meta name="description" content="ECHO 能力后端月卡订单确认与支付宝付款页。">
+  <meta name="description" content="ECHO 能力后端套餐订单确认与支付宝付款页。订单号、套餐与金额以服务端记录为准。">
   <meta name="theme-color" content="#f6f8fc">
   <link rel="icon" type="image/png" href="/assets/echo-logo.png">
   <link rel="stylesheet" href="/assets/site.css">
@@ -23,71 +23,92 @@
         <a class="nav-pricing" href="/pricing">套餐</a>
         <a class="nav-download" href="/download">下载</a>
         <a class="nav-hide-sm" href="/#how">使用流程</a>
+        <a class="nav-account" href="/account">我的</a>
       </nav>
-      <button type="button" class="btn btn-ghost btn-sm header-cta" data-console>进入控制台</button>
+      <a class="btn btn-ghost btn-sm header-cta" href="/account" data-account-cta>登录 / 注册</a>
     </div>
   </header>
 
   <main id="main">
+    <noscript><p class="wrap load-error">需要启用 JavaScript 才能读取订单与支付状态。</p></noscript>
     <section class="wrap page-hero">
       <div class="crumbs"><a href="/">首页</a><span aria-hidden="true">/</span><a href="/pricing">套餐</a><span aria-hidden="true">/</span><span>确认订单</span></div>
       <h1>确认订单并支付</h1>
-      <p class="lead">核对套餐与金额，使用支付宝扫码付款。支付完成后返回本页刷新，订单状态以服务端通知为准。</p>
+      <p class="lead">订单号、套餐与金额都来自服务端。付款完成后返回本页，订单状态会自动更新。</p>
     </section>
 
-    <section class="wrap" style="padding-bottom:76px;">
-      <p class="load-error" id="planWarning" hidden></p>
+    <section class="wrap pay-section">
+      <div class="notice test-notice" id="testNotice" role="note" hidden>
+        <svg aria-hidden="true"><use href="/assets/icons.svg#icon-alert"></use></svg>
+        <div><strong>测试环境。</strong> 当前后端使用支付宝测试网关，不会产生真实扣款；页面标注会随后端切到生产配置自动消失。</div>
+      </div>
 
-      <div class="pay-layout" id="payLayout" aria-busy="true">
+      <p class="account-loading" id="payLoading">正在读取订单…</p>
+      <p class="load-error" id="payError" hidden></p>
+
+      <div class="pay-layout" id="payLayout" hidden>
         <div class="panel">
-          <div class="panel-title">订单摘要</div>
+          <div class="panel-title">订单摘要<span class="tag tag-muted" id="orderStatusTag">—</span></div>
           <div class="order-rows">
-            <div class="order-row"><span>商品</span><span>ECHO 能力后端 · <span id="orderPlan">月卡</span></span></div>
-            <div class="order-row"><span>有效期</span><span id="orderDays">30 天（支付成功后起算）</span></div>
+            <div class="order-row"><span>商品</span><span>ECHO 能力后端 · <span id="orderPlan">—</span></span></div>
+            <div class="order-row"><span>有效期</span><span id="orderDays">—</span></div>
             <div class="order-row"><span>数量</span><span>1</span></div>
-            <div class="order-row"><span>订单号</span><span id="orderId">ECHO-20261105-0001</span></div>
+            <div class="order-row"><span>订单号</span><span id="orderId">—</span></div>
+            <div class="order-row"><span>下单时间</span><span id="orderCreated">—</span></div>
           </div>
           <div class="order-total">
             <span>应付金额</span>
-            <span class="money" id="orderPrice">¥10.00</span>
+            <span class="money" id="orderPrice">—</span>
           </div>
-          <p class="order-id">支付时请核对订单号、套餐与金额；订单状态以服务端记录为准。</p>
+          <p class="order-id" id="orderHint">订单状态以服务端记录为准。</p>
         </div>
 
-        <div class="panel">
-          <div class="panel-title">支付宝付款<span class="tag">等待支付</span></div>
-          <div class="pay-method">
-            <span class="alipay-mark" aria-hidden="true">支</span>
-            <span class="pay-method-text"><strong>支付宝</strong><span>扫码支付 · 支持手机支付宝扫码</span></span>
-            <span class="pay-check" aria-label="已选择支付宝">
-              <svg aria-hidden="true"><use href="/assets/icons.svg#icon-check"></use></svg>
-            </span>
-          </div>
+        <div class="panel" id="paymentPanel">
+          <div class="panel-title">支付宝付款<span class="tag" id="payStatusTag">等待支付</span></div>
 
-          <div class="qr-wrap">
-            <div class="qr-box">
-              <img id="payQr" src="/assets/alipay-sandbox-qr.png" alt="支付宝付款二维码" width="162" height="162">
+          <div id="payWaiting">
+            <div class="pay-method">
+              <span class="alipay-mark" aria-hidden="true">支</span>
+              <span class="pay-method-text"><strong>支付宝</strong><span>在支付宝收银台完成付款</span></span>
+              <span class="pay-check" aria-label="已选择支付宝">
+                <svg aria-hidden="true"><use href="/assets/icons.svg#icon-check"></use></svg>
+              </span>
             </div>
-            <div class="qr-caption">
-              <strong>请使用支付宝扫码支付</strong>
-              <span class="amount" id="payAmount">¥10.00</span>
-              <span>支付成功后请返回本页刷新，订单与权益以服务端记录为准。</span>
+
+            <div class="cashier-box">
+              <p id="cashierHelp">点击下方按钮打开支付宝收银台；支付完成后回到本页即可看到结果。</p>
+              <a class="btn btn-primary btn-block" id="openCashier" href="#" target="_blank" rel="noopener">前往支付宝收银台</a>
+              <button class="btn btn-ghost btn-block" id="copyPayUrl" type="button">复制支付链接</button>
+              <p class="load-error" id="cashierMissing" hidden>这个订单没有可用的收银台链接，请重新下单或联系管理员。</p>
             </div>
+
+            <div class="pay-status" role="status">
+              <span class="pulse" aria-hidden="true"></span>
+              <span id="payStatusText">等待支付 · 支付成功后自动更新</span>
+            </div>
+
+            <div class="pay-actions">
+              <button type="button" class="btn btn-ghost btn-block" id="refreshOrder">刷新订单状态</button>
+              <button type="button" class="btn btn-ghost btn-block" id="cancelOrder">取消订单</button>
+            </div>
+            <p class="pay-note">请核对订单号、套餐与金额。页面不会把“等待支付”当作成功；支付结果以服务端查询与支付宝通知为准。</p>
           </div>
 
-          <div class="pay-status" role="status">
-            <span class="pulse" aria-hidden="true"></span>
-            等待支付 · 支付成功后自动更新
+          <div id="payResult" hidden>
+            <div class="result-card" id="resultCard">
+              <div class="result-icon" id="resultIcon" aria-hidden="true">
+                <svg><use href="/assets/icons.svg#icon-check"></use></svg>
+              </div>
+              <h2 class="result-title" id="resultTitle">支付成功</h2>
+              <p class="result-message" id="resultMessage">权益已开通。</p>
+            </div>
+            <div class="result-rows" id="resultRows"></div>
+            <div class="pay-actions" id="resultActions"></div>
           </div>
-
-          <div class="pay-actions">
-            <a class="btn btn-primary btn-block" href="https://openapi-sandbox.dl.alipaydev.com/gateway.do?app_id=9021000171628513&amp;method=alipay.trade.page.pay&amp;format=JSON&amp;charset=utf-8&amp;sign_type=RSA2&amp;timestamp=2026-11-06+00%3A19%3A04&amp;version=1.0&amp;biz_content=%7B%22out_trade_no%22%3A%22ECHO-SANDBOX-DEMO-20261105-0001%22%2C%22total_amount%22%3A%2210.00%22%2C%22subject%22%3A%22ECHO+%E5%90%8E%E7%AB%AF%E5%A5%97%E9%A4%90%22%2C%22product_code%22%3A%22FAST_INSTANT_TRADE_PAY%22%2C%22timeout_express%22%3A%2210080m%22%7D&amp;sign=ldaw%2BnZDlsHUzQDpk4DyCFQIbRXle5Q7D8EN1wn9TvIrP9SgDb6AFbK42MWLYdHczGf4Wm0FCaDYAYeNrrAeCvZT%2B6SAoXHMV2bi3OW9%2FzMtBbhHrpm%2Bp1yU6rjj%2FPYoCr4KD2NnZwMIcs1ks5w0JnT5PP34VwXlTCVXWThb6CLq4KvOTOUMjWJRicA%2B8WYG6zZQ60b0Hf2v7z7CMHqoiLlsSzws4llQk0Wjl1qbQs3cB%2BAWYe61PJj2BfyjC5CvwYNm0Osx7ryO%2BXpOqfA4awqY1xZclgA5TfOx1J1tp0%2BAtkZKN4yzOjcXCrXISgOfH40xO%2BEZshpO%2F6aV6Jb5qg%3D%3D" target="_blank" rel="noopener">前往支付宝收银台</a>
-            <button type="button" class="btn btn-ghost btn-block" id="refreshOrder">刷新订单状态</button>
-          </div>
-          <p class="pay-note">支付完成后请返回本页刷新；订单状态以服务端异步通知与交易查询为准。</p>
-          <p class="side-note" style="border-top:0;padding-top:0;"><a href="/pricing">← 返回套餐页</a></p>
         </div>
       </div>
+
+      <p class="side-note"><a href="/pricing">← 返回套餐页</a> · <a href="/account">查看我的权益与订单</a></p>
     </section>
   </main>
 
@@ -108,7 +129,7 @@
             <a href="/#how">使用流程</a>
             <a href="/pricing">套餐与价格</a>
             <a href="/download">下载客户端</a>
-            <a href="/pay?plan=monthly">在线支付</a>
+            <a href="/account">我的账户</a>
           </div>
         </div>
         <div>

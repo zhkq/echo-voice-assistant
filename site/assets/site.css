@@ -469,6 +469,91 @@ ul { margin: 0; padding: 0; list-style: none; }
 }
 .toast.show { opacity: 1; transform: translate(-50%, 0); }
 .load-error { margin-top: 20px; padding: 14px 16px; border-radius: 12px; background: #fef2f2; color: #b91c1c; font-size: 13.5px; }
+.tag-ok { background: #e8f8ef; color: #0f7a43; }
+.tag-warn { background: #fff7ed; color: #9a3412; }
+
+/* ---------- 账户 / 登录 ---------- */
+.account-section { padding-bottom: 76px; }
+.account-loading { padding: 10px 0; color: var(--muted); font-size: 14px; }
+.account-layout { display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(0, .6fr); gap: 20px; align-items: start; }
+.account-main { display: grid; gap: 18px; min-width: 0; }
+.account-aside { display: grid; gap: 18px; }
+.aside-card { padding: 24px; }
+.aside-card h2 { font-size: 17px; }
+.aside-card p { margin-top: 10px; color: var(--muted); font-size: 13.5px; line-height: 1.75; }
+.aside-card .btn { margin-top: 16px; }
+.aside-list { margin-top: 14px; display: grid; gap: 14px; }
+.aside-list li { display: grid; gap: 3px; font-size: 13.5px; line-height: 1.6; }
+.aside-list strong { color: var(--ink-2); }
+.aside-list span { color: var(--muted); }
+.auth-tabs { display: flex; gap: 5px; padding: 4px; border-radius: 12px; background: #eef3fb; }
+.auth-tab {
+  flex: 1; min-height: 40px; border: 0; border-radius: 9px; background: transparent;
+  color: var(--muted); font-size: 14px; font-weight: 700; cursor: pointer;
+}
+.auth-tab.is-active { color: var(--brand-ink); background: #fff; box-shadow: var(--shadow-sm); }
+.auth-note { margin-top: 16px; color: var(--muted); font-size: 13.5px; line-height: 1.7; }
+.field-row { display: grid; gap: 6px; margin-top: 14px; }
+.field-row label { color: var(--ink-2); font-size: 13px; font-weight: 700; }
+.input {
+  width: 100%; min-height: 46px; padding: 0 13px; border: 1px solid var(--line);
+  border-radius: 10px; background: #fff; color: var(--ink); font-size: 14.5px;
+  font-family: inherit; outline: none; transition: border-color .15s, box-shadow .15s;
+}
+.input:focus { border-color: #93b4f5; box-shadow: 0 0 0 3px rgba(37, 99, 235, .12); }
+.form-error { margin-top: 14px; padding: 10px 12px; border-radius: 10px; background: #fef2f2; color: #b91c1c; font-size: 13px; line-height: 1.6; }
+#authSubmit { margin-top: 20px; }
+.auth-hint { margin-top: 14px; color: var(--muted-2); font-size: 12.5px; line-height: 1.7; }
+.account-profile { display: flex; align-items: center; gap: 14px; }
+.account-avatar {
+  flex: 0 0 auto; width: 50px; height: 50px; border-radius: 15px;
+  display: grid; place-items: center; color: #fff; font-size: 20px; font-weight: 800;
+  background: linear-gradient(135deg, var(--brand), var(--brand-2));
+}
+.account-profile-text { min-width: 0; }
+.account-name { font-size: 18px; font-weight: 800; }
+.account-meta { margin-top: 3px; color: var(--muted); font-size: 13px; word-break: break-all; }
+.status-pill {
+  margin-left: auto; flex: 0 0 auto; padding: 4px 10px; border-radius: 999px;
+  background: #e8f8ef; color: #0f7a43; font-size: 12px; font-weight: 800;
+}
+.account-profile .btn { flex: 0 0 auto; }
+.entitlement-plan { margin-top: 14px; font-size: 20px; font-weight: 800; letter-spacing: -.3px; }
+.entitlement-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin-top: 16px; }
+.entitlement-item { display: grid; gap: 4px; padding: 12px 14px; border: 1px solid var(--line); border-radius: 12px; background: var(--bg); }
+.entitlement-label { color: var(--muted-2); font-size: 12px; }
+.entitlement-item strong { color: var(--ink-2); font-size: 15px; }
+.account-actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 18px; }
+.panel-title .panel-action { margin-left: auto; }
+.order-list { margin-top: 16px; display: grid; gap: 10px; }
+.order-item { display: flex; justify-content: space-between; gap: 14px; padding: 14px; border: 1px solid var(--line); border-radius: 12px; }
+.order-item-main { min-width: 0; }
+.order-item-title { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; font-weight: 700; }
+.order-item-meta { margin-top: 5px; color: var(--muted-2); font-size: 12px; line-height: 1.6; word-break: break-all; }
+.order-item-side { display: grid; flex: 0 0 auto; justify-items: end; align-content: start; gap: 6px; white-space: nowrap; }
+.order-item-side strong { font-size: 15px; }
+.order-link { color: var(--brand-ink); font-size: 13px; font-weight: 700; }
+.empty-state { margin-top: 16px; padding: 18px; border: 1px dashed #cfd9e9; border-radius: 12px; color: var(--muted); font-size: 13.5px; text-align: center; }
+.pricing-payment-note { margin-top: 18px; text-align: left; }
+
+/* ---------- 支付结果 / 收银台 ---------- */
+.pay-section { padding-bottom: 76px; }
+.test-notice { background: #eff6ff; border-color: #bfdbfe; color: #1e40af; }
+.cashier-box { margin-top: 20px; display: grid; gap: 10px; padding: 16px; border: 1px dashed #cfd9e9; border-radius: 14px; background: #fbfdff; }
+.cashier-box p { color: var(--muted); font-size: 13.5px; line-height: 1.7; }
+.cashier-box .btn { width: 100%; }
+.result-card { margin-top: 18px; padding: 22px; border: 1px solid var(--line); border-radius: 16px; background: var(--bg); text-align: center; }
+.result-icon { width: 54px; height: 54px; margin: 0 auto; border-radius: 50%; display: grid; place-items: center; background: #eef3fb; color: var(--brand-ink); }
+.result-icon svg { width: 26px; height: 26px; }
+.result-ok .result-icon, .result-paid .result-icon { background: #e8f8ef; color: var(--ok); }
+.result-closed .result-icon, .result-timeout .result-icon, .result-error .result-icon { background: #fff7ed; color: var(--warn); }
+.result-refunded .result-icon { background: #eef3fb; color: var(--muted); }
+.result-title { margin-top: 12px; font-size: 22px; letter-spacing: -.4px; }
+.result-message { margin-top: 8px; color: var(--muted); font-size: 13.5px; line-height: 1.75; }
+.result-rows { margin-top: 16px; display: grid; gap: 10px; }
+.result-rows .order-row { padding-bottom: 10px; border-bottom: 1px dashed var(--line); }
+.result-rows .order-row:last-child { padding-bottom: 0; border-bottom: 0; }
+#resultActions { margin-top: 18px; }
 
 /* ---------- 响应式 ---------- */
 @media (max-width: 980px) {
@@ -476,6 +561,8 @@ ul { margin: 0; padding: 0; list-style: none; }
   .hero-visual { max-width: 620px; }
   .feature-grid, .steps { grid-template-columns: repeat(2, 1fr); }
   .pricing-grid, .pay-layout { grid-template-columns: 1fr; }
+  .account-layout { grid-template-columns: 1fr; }
+  .account-aside { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .privacy { grid-template-columns: 1fr; gap: 26px; padding: 36px; }
   .download-grid, .install-grid { grid-template-columns: 1fr; }
   .req-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -504,6 +591,13 @@ ul { margin: 0; padding: 0; list-style: none; }
   /* 只改上下：左右必须继续用 .wrap 的 18px，否则 375 宽下 h1 会贴屏边。 */
   .page-hero { padding-top: 40px; padding-bottom: 28px; }
   .plan, .panel { padding: 22px; }
+  .account-aside { grid-template-columns: 1fr; }
+  .entitlement-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .account-profile { flex-wrap: wrap; }
+  .account-profile .btn { margin-left: 0; }
+  .status-pill { margin-left: 0; }
+  .order-item { flex-direction: column; }
+  .order-item-side { justify-items: start; grid-auto-flow: column; align-items: center; gap: 10px; }
   .dl-card, .install-card { padding: 22px; }
   .dl-meta { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .dl-card-android .btn { max-width: none; width: 100%; }

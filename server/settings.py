@@ -231,6 +231,11 @@ DEFAULTS: Dict[str, Any] = {
         # 可选：回调里的 seller_id 校验（支付宝商户 PID）。空 = 不校验。
         "seller_id": "",
         "notify_url": "",
+        # 支付完成后回跳的站点页面（例如 https://echoserver.zhkq.online/pay）。
+        # 下单时服务端自动追加 `?order=<orderId>`；空 = 不回跳。
+        "return_url": "",
+        # 同步接口（query / refund）的 HTTP 超时秒数。
+        "timeout_s": 20,
     },
 }
 
@@ -371,6 +376,9 @@ def _env_overrides() -> dict:
         out.setdefault("alipay", {})["sandbox"] = alipay_sandbox
     if os.environ.get("ECHO_PAYMENT_NOTIFY_URL"):
         out.setdefault("payment", {})["notify_url"] = os.environ["ECHO_PAYMENT_NOTIFY_URL"]
+    if os.environ.get("ECHO_ALIPAY_RETURN_URL"):
+        out.setdefault("alipay", {})["return_url"] = \
+            os.environ["ECHO_ALIPAY_RETURN_URL"]
     trial = _env_bool("ECHO_TRIAL_ENABLED")
     if trial is not None:
         out.setdefault("trial", {})["enabled"] = trial

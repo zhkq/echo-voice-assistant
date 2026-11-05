@@ -240,3 +240,14 @@ def payment_unconfigured() -> EchoError:
     """
     return EchoError(503, "payment_unconfigured", "支付未配置",
                      detail="请配置 payment.provider 与对应网关参数")
+
+
+def payment_gateway_error(detail: str = "") -> EchoError:
+    """支付网关**上游**失败（网络超时、支付宝返回业务错误、响应验签失败）。
+
+    **502 而不是 400/503**：这不是客户端把请求写错了，也不是"支付没配置"；
+    它是"我们跟支付宝之间这次没成"。客户端可以稍后重试，订单状态不受影响
+    （没补记成功就保持原状，下一轮查询/回调还能再来）。
+    """
+    return EchoError(502, "payment_gateway_error", "支付网关暂时不可用",
+                     detail=detail)

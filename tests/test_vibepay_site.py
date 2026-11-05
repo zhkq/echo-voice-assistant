@@ -20,7 +20,7 @@ from html.parser import HTMLParser
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SITE = os.path.join(ROOT, "site")
 EVIDENCE = os.path.join(ROOT, "docs", "vibepay-evidence")
-PAGES = ("index.html", "pricing.html", "pay.html", "download.html")
+PAGES = ("index.html", "pricing.html", "account.html", "pay.html", "download.html")
 # 页面只会引用这些站内前缀；出现 http(s) 字体/图片/脚本就是外链回归。
 LOCAL_PREFIXES = ("/assets/", "#")
 
@@ -128,30 +128,72 @@ class PageTests(unittest.TestCase):
     def test_pricing_has_buy_entry_and_the_required_quota_copy(self):
         html = _read_site("pricing.html")
         self.assertIn("套餐与价格", html)
-        self.assertIn("/pay?plan=monthly", html)
+        self.assertIn('id="planCards"', html)
         js = _read_site("assets/site.js")
         self.assertIn("立即购买", js)
-        self.assertIn("/pay?plan=", js)
+        self.assertIn("/v1/billing/plans", js)
+        self.assertIn("/v1/billing/orders", js)
+        self.assertIn('"/pay?order="', js)
+        self.assertNotIn("/pay?plan=", js + html)
         for text in ("每日 ASR", "TTS", "QPS", "台设备", "并发", "自然日恢复"):
             self.assertIn(text, js, text)
 
-    def test_pay_page_is_waiting_not_a_success_page(self):
+    def test_account_page_has_login_register_and_dashboard_sections(self):
+        html = _read_site("account.html")
+        for text in ("登录 / 注册", "邀请码", "工号 / 账号", "注册", "退出登录",
+                     "当前权益", "最近订单", "购买 / 续费"):
+            self.assertIn(text, html, text)
+        for element in ('id="authForm"', 'id="dashboardView"', 'id="ordersList"',
+                        'id="entitlementStatus"', 'data-account-cta'):
+            self.assertIn(element, html, element)
+        js = _read_site("assets/site.js")
+        for path in ("/v1/account/login", "/v1/account/register", "/v1/account/me",
+                     "/v1/account/logout", "/v1/billing/orders"):
+            self.assertIn(path, js, path)
+
+    def test_pay_page_is_order_driven_with_real_cashier_link(self):
+        """支付页必须从订单读金额/订单号，并用服务端 payUrl 打开收银台。
+
+        Phase 3 的硬约束：不能再用静态二维码占位图，也不能把某个固定沙箱订单的
+        signed URL 写进 HTML。真实收银台链接只来自 `GET /orders/{id}` 的响应。
+        """
         html = _read_site("pay.html")
         for text in ("支付宝", "等待支付", "刷新订单状态", "前往支付宝收银台",
-                     "openapi-sandbox.dl.alipaydev.com"):
+                     "订单号", "应付金额", "取消订单", "测试环境"):
             self.assertIn(text, html, text)
-        for forbidden in ("沙箱", "不会产生真实扣款", "尚未接入", "预览版", "示例订单"):
+        for forbidden in ("预览版", "尚未接入", "示例订单", "qr-placeholder",
+                          "alipay-sandbox-qr", "openapi-sandbox.dl.alipaydev.com"):
             self.assertNotIn(forbidden, html, forbidden)
+        self.assertNotIn('id="payQr"', html, "支付页不再使用二维码图片；收银台由真实 payUrl 打开")
+        self.assertIn('id="payWaiting"', html)
+        self.assertIn('id="payResult"', html)
+        self.assertIn('id="testNotice"', html)
         self.assertNotIn('http-equiv="refresh"', html)
-        self.assertNotIn('disabled>打开支付宝收银台', html)
         js = _read_site("assets/site.js")
+        for text in ("/v1/billing/orders/", "/sync", "payUrl", "visibilitychange",
+                     "订单已关闭", "订单已退款", "支付成功", "sandbox"):
+            self.assertIn(text, js, text)
         for redirect_api in ("location.href", "location.replace", "window.open("):
             self.assertNotIn(redirect_api, js, "支付页不许自动跳转")
 
+    def test_no_static_qr_asset_is_shipped(self):
+        self.assertFalse(os.path.exists(os.path.join(SITE, "assets", "qr-placeholder.svg")))
+        self.assertFalse(os.path.exists(os.path.join(SITE, "assets", "alipay-sandbox-qr.png")))
+        for name in PAGES:
+            html = _read_site(name)
+            self.assertNotIn("qr-placeholder", html, name)
+            self.assertNotIn("alipay-sandbox-qr", html, name)
+
     def test_public_pages_are_not_marked_as_preview_or_sandbox(self):
-        html = _read_site("index.html") + _read_site("pricing.html") + _read_site("pay.html")
+        """正式页面（首页/套餐/下载）不出现预览/沙箱/未接入；支付页只保留
+        由服务端 `sandbox` 字段驱动的"测试环境"标注（切生产自动消失）。"""
+        html = _read_site("index.html") + _read_site("pricing.html") + _read_site("download.html")
         for forbidden in ("预览版", "沙箱", "尚未接入", "签约材料预览", "支付示例"):
             self.assertNotIn(forbidden, html, forbidden)
+        pay_html = _read_site("pay.html")
+        self.assertNotIn("沙箱", pay_html)
+        self.assertNotIn("尚未接入", pay_html)
+        self.assertIn("测试环境", pay_html)
 
     def test_pay_page_does_not_claim_launch_or_production(self):
         html = _read_site("pay.html") + _read_site("pricing.html") + _read_site("index.html")
@@ -384,6 +426,63 @@ class EvidenceTests(unittest.TestCase):
             os.path.join(ROOT, "scripts", "capture-vibepay-evidence.py"),
             doraise=True,
         )
+
+
+class Phase3EvidenceTests(unittest.TestCase):
+    """Phase 3 的 Before/After 证据与 mock 边界（issue #11）。"""
+
+    PHASE3 = os.path.join(EVIDENCE, "phase3")
+
+    def test_before_and_after_files_exist(self):
+        expected = (
+            "before-pricing.png", "before-pay.png", "before-account-404.png",
+            "after-pricing.png", "after-account.png", "after-login.png",
+            "after-pay.png", "after-paid.png", "after-closed.png", "after-timeout.png",
+            "after-account-mobile.png", "after-pay-mobile.png",
+            "e2e-account.png", "e2e-paid.png", "e2e-closed.png",
+        )
+        for name in expected:
+            path = os.path.join(self.PHASE3, name)
+            self.assertTrue(os.path.isfile(path), name)
+            self.assertGreater(os.path.getsize(path), 5000, name)
+
+    def test_manifest_records_baseline_mock_and_real_sandbox_boundary(self):
+        data = json.loads(_read("docs", "vibepay-evidence", "phase3", "capture.json"))
+        self.assertEqual(data["mode"], "mock backend")
+        self.assertTrue(data["baseUrl"].startswith("http://127.0.0.1:"))
+        self.assertIn("ref", data["baseline"])
+        joined = " ".join(data["notes"])
+        self.assertIn("mock", joined)
+        self.assertIn("Lead", joined)
+        self.assertIn("2026-11-05", joined)
+        self.assertIn("不冒充", joined)
+        pages = {item["page"] for item in data["files"]}
+        self.assertTrue({
+            "before-pricing", "before-pay", "before-account-404",
+            "after-pricing", "after-account", "after-pay", "after-paid", "after-closed", "after-timeout",
+        } <= pages)
+
+    def test_phase3_readme_states_the_evidence_limits(self):
+        text = _read("docs", "vibepay-evidence", "phase3", "README.md")
+        for needle in ("Before", "After", "1440", "375", "mock", "Lead",
+                       "2026-11-05", "生产", "app_id", "e2e"):
+            self.assertIn(needle, text, needle)
+
+    def test_e2e_manifest_ran_against_the_real_backend(self):
+        data = json.loads(_read("docs", "vibepay-evidence", "phase3", "e2e.json"))
+        self.assertTrue(data["ok"])
+        self.assertIn("server.main", data["backend"])
+        self.assertIn("payment.provider=mock", data["backend"])
+        joined = " ".join(data["notes"])
+        self.assertIn("Mock", joined)
+        self.assertIn("Lead", joined)
+        steps = {item["step"] for item in data["steps"]}
+        self.assertTrue({"register", "create_order", "paid", "account_after_paid",
+                         "login_gate", "logout_login", "cancel"} <= steps)
+
+    def test_phase3_capture_scripts_compile(self):
+        for name in ("capture-phase3-evidence.py", "e2e-vibepay-mock.py"):
+            py_compile.compile(os.path.join(ROOT, "scripts", name), doraise=True)
 
 
 if __name__ == "__main__":

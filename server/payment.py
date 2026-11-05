@@ -26,9 +26,13 @@ Mock 与真实支付宝**都产出同形的 notify**，所以 T3/T5 那条链路
 
 ## 真实支付宝的边界
 
-本轮只留骨架：`create_pay` / `verify_notify` 按支付宝网页收款的 RSA2 规则实现，
-`query` / `refund` 明确报"尚未接入"（`payment_unconfigured`）。私钥只从
-**服务端文件路径**读，不进仓库、不进日志。
+`create_pay` / `verify_notify` / `query` / `refund` 都按支付宝网页收款的 RSA2 规则
+实现。**请求签名包含 `sign_type`，异步通知验签排除 `sign_type`**（2026-11-05 沙箱
+实测口径）；同步响应（query/refund）用支付宝公钥校验响应节点的原始 JSON 串。
+私钥只从**服务端文件路径**读，不进仓库、不进日志。
+
+`return_url` 由服务端配置成站点支付页，下单时自动带上 `?order=<orderId>`，
+支付宝回跳后支付页据此查询/补记订单。`notify_url` 只从配置读，公网部署后填。
 """
 from __future__ import annotations
 
@@ -180,11 +184,11 @@ class MockGateway:
 
 
 class AlipayGateway:
-    """真实支付宝（网页收款 `alipay.trade.page.pay`）**骨架**。
+    """真实支付宝（网页收款 `alipay.trade.page.pay` + query/refund）。
 
-    只实现两条能离线验证的：下单 URL 的 RSA2 签名、异步通知的 RSA2 验签。
-    查询/退款**尚未接入**（要沙箱联调；本轮只跑 Mock）—— 明确报
-    `payment_unconfigured`，不假装成功。
+    * `create_pay`：生成带 RSA2 签名的收银台 URL（可选 `return_url` / `notify_url`）；
+    * `verify_notify`：异步通知验签（排除 `sign_type`，与支付宝 SDK 口径一致）；
+    * `query` / `refund`：同步接口，**验签响应**并把结果归一化成与回调同形的 dict。
     """
 
     name = "alipay"
@@ -202,6 +206,15 @@ class AlipayGateway:
         self.gateway = configured or ALIPAY_PROD_GATEWAY
         self.notify_url = str(cfg.get("payment.notify_url", "")
                               or cfg.get("alipay.notify_url", "") or "")
+        #: 支付完成后回跳的站点页面（例如 `https://…/pay`）。下单时自动追加
+        #: `?order=<orderId>`，支付页据此刷新订单；空 = 不回跳（支付宝收银台
+        #: 只显示"返回商家"的默认页）。
+        self.return_url = str(cfg.get("alipay.return_url", "")
+                              or cfg.get("payment.return_url", "") or "")
+        try:
+            self.timeout_s = max(3.0, float(cfg.get("alipay.timeout_s", 20) or 20))
+        except (TypeError, ValueError):
+            self.timeout_s = 20.0
 
     @property
     def configured(self) -> bool:
@@ -259,6 +272,86 @@ class AlipayGateway:
         except Exception:
             return False
 
+    def _request(self, method: str, biz: Dict[str, Any]) -> Dict[str, Any]:
+        """调一个支付宝同步接口（query / refund），并**验签响应节点**。
+
+        请求：表单 POST 到 `self.gateway`，RSA2 签名（与 `create_pay` 同一口径）；
+        响应：支付宝返回 `{"<method>_response":{…},"sign":"…"}`，签名对象是
+        响应节点的**原始 JSON 子串**（不能只拿 dict 重新序列化，键序/转义会变）。
+        """
+        if not self.configured:
+            raise errors.payment_unconfigured()
+        params = {
+            "app_id": self.app_id,
+            "method": method,
+            "format": "JSON",
+            "charset": "utf-8",
+            "sign_type": "RSA2",
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "version": "1.0",
+            "biz_content": json.dumps(biz, ensure_ascii=False,
+                                      separators=(",", ":")),
+        }
+        params["sign"] = self._sign(params)
+        body = urlencode(params).encode("utf-8")
+        request = UrlRequest(self.gateway, data=body, headers={
+            "Content-Type": "application/x-www-form-urlencoded; charset=utf-8",
+            "Accept": "application/json",
+        })
+        try:
+            with urlopen(request, timeout=self.timeout_s) as resp:
+                raw = resp.read()
+                charset = (resp.headers.get_content_charset() or "").lower()
+        except Exception as exc:                                # 网络 / HTTP 层
+            raise errors.payment_gateway_error("支付宝网关请求失败：%s" % exc)
+
+        # 支付宝同步响应可能是 UTF-8 或 GBK（`charset` 由请求带过去，但
+        # 网关偶尔不声明 Content-Type 的 charset）；按顺序试，失败才报错。
+        text = ""
+        used_charset = ""
+        for encoding in ([charset] if charset else []) + ["utf-8", "gbk"]:
+            if not encoding:
+                continue
+            try:
+                text = raw.decode(encoding)
+                used_charset = encoding
+                break
+            except (LookupError, UnicodeDecodeError):
+                continue
+        if not text:
+            raise errors.payment_gateway_error("支付宝同步响应无法解码")
+
+        try:
+            outer = json.loads(text)
+        except Exception:
+            raise errors.payment_gateway_error("支付宝同步响应不是合法 JSON")
+        if not isinstance(outer, dict):
+            raise errors.payment_gateway_error("支付宝同步响应结构异常")
+        key = '"%s_response"' % method.replace(".", "_")
+        idx = text.find(key)
+        if idx < 0:
+            raise errors.payment_gateway_error("支付宝同步响应缺少 %s" % key)
+        colon = text.find(":", idx + len(key))
+        start = text.find("{", max(colon, idx + len(key)))
+        if start < 0:
+            raise errors.payment_gateway_error("支付宝同步响应结构异常")
+        try:
+            node, end = json.JSONDecoder().raw_decode(text[start:])
+        except Exception:
+            raise errors.payment_gateway_error("支付宝同步响应结构异常")
+        if not isinstance(node, dict):
+            raise errors.payment_gateway_error("支付宝同步响应结构异常")
+        raw_node = text[start:start + end].encode(used_charset, "replace")
+        sign = str(outer.get("sign") or "")
+        if not sign or not self._verify_raw(raw_node, sign):
+            raise errors.payment_gateway_error("支付宝同步响应验签失败")
+        return node
+
+    @staticmethod
+    def _node_error(node: Dict[str, Any]) -> str:
+        return str(node.get("sub_msg") or node.get("msg")
+                   or node.get("sub_code") or node.get("code") or "未知错误")
+
     # ---- 网关接口 --------------------------------------------------------
 
     def create_pay(self, order: Dict[str, Any]) -> Dict[str, Any]:
@@ -292,6 +385,13 @@ class AlipayGateway:
         }
         if self.notify_url:
             params["notify_url"] = self.notify_url
+        if self.return_url:
+            # 回跳地址里带订单号，支付页才能只凭 URL 找回订单（支付宝也会再追加
+            # 它自己的参数；已有 `?` 时用 `&`）。
+            sep = "&" if "?" in self.return_url else "?"
+            params["return_url"] = "%s%s%s" % (
+                self.return_url, sep,
+                urlencode({"order": str(order.get("order_id") or "")}))
         params["sign"] = self._sign(params)
         return {"payUrl": "%s?%s" % (self.gateway, urlencode(params)),
                 "mock": False}
@@ -311,71 +411,66 @@ class AlipayGateway:
         return _normalize(got, verified=True)
 
     def query(self, order: Dict[str, Any]) -> Dict[str, Any]:
-        """主动查询（`alipay.trade.query`）。用于本地联调/回调丢失时的兜底。"""
-        if not self.configured:
-            raise errors.payment_unconfigured()
-        biz = {"out_trade_no": str(order.get("order_id") or "")}
-        params = {
-            "app_id": self.app_id,
-            "method": "alipay.trade.query",
-            "format": "JSON",
-            "charset": "utf-8",
-            "sign_type": "RSA2",
-            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "version": "1.0",
-            "biz_content": json.dumps(biz, ensure_ascii=False, separators=(",", ":")),
-        }
-        params["sign"] = self._sign(params)
-        body = urlencode(params).encode("utf-8")
-        try:
-            with urlopen(UrlRequest(self.gateway, data=body), timeout=20) as resp:
-                raw = resp.read()
-                charset = resp.headers.get_content_charset() or "utf-8"
-        except Exception as exc:  # 网络/HTTP 层
-            raise errors.bad_request("支付宝查询失败：%s" % exc)
-        try:
-            text = raw.decode(charset)
-        except (LookupError, UnicodeDecodeError):
-            charset = "gbk" if charset.lower() == "gbk" else "utf-8"
-            text = raw.decode(charset, "replace")
-        try:
-            outer = json.loads(text)
-        except Exception:
-            raise errors.bad_request("支付宝查询响应不是合法 JSON")
-        key = '"alipay_trade_query_response"'
-        idx = text.find(key)
-        if idx < 0:
-            raise errors.bad_request("支付宝查询响应缺少 alipay_trade_query_response")
-        colon = text.find(":", idx + len(key))
-        start = text.find("{", colon)
-        if start < 0:
-            raise errors.bad_request("支付宝查询响应结构异常")
-        try:
-            node, _end = json.JSONDecoder().raw_decode(text[start:])
-        except Exception:
-            raise errors.bad_request("支付宝查询响应结构异常")
-        raw_node = text[start:start + _end].encode(charset, "replace")
-        sign = str(outer.get("sign") or "")
-        if not sign or not self._verify_raw(raw_node, sign):
-            raise errors.bad_request("支付宝查询响应验签失败")
-        if str(node.get("code") or "") not in ("10000", ""):
-            # 交易不存在/未创建：按未支付处理，不伪造成功。
-            return {"status": "pending", "tradeNo": "",
-                    "outTradeNo": str(order.get("order_id") or ""),
-                    "amountCents": 0, "verified": True,
-                    "rawStatus": str(node.get("sub_code") or node.get("msg") or "")}
+        """主动查询（`alipay.trade.query`）。用于本地联调/回调丢失时的兜底。
+
+        返回与异步通知同形的归一化结果（`status/paid/tradeNo/amountCents/…`）；
+        **只把"交易不存在"当作未支付**，其余网关业务错误一律 502 —— 把系统错误
+        当成 pending 会让支付页永远等下去，也掩盖了密钥/验签配置问题。
+        """
+        order_id = str(order.get("order_id") or "")
+        node = self._request("alipay.trade.query", {"out_trade_no": order_id})
+        code = str(node.get("code") or "")
+        if code != "10000":
+            if str(node.get("sub_code") or "") == "ACQ.TRADE_NOT_EXIST":
+                return {"status": "pending", "tradeNo": "",
+                        "outTradeNo": order_id, "amountCents": 0,
+                        "verified": True, "rawStatus": "TRADE_NOT_EXIST"}
+            raise errors.payment_gateway_error(
+                "支付宝查询失败：%s" % self._node_error(node))
+        got_order = str(node.get("out_trade_no") or "")
+        if got_order and got_order != order_id:
+            raise errors.payment_gateway_error(
+                "支付宝查询返回的订单号不匹配：%s" % got_order)
         trade_status = str(node.get("trade_status") or "").upper()
-        norm = _normalize({
-            "trade_no": node.get("trade_no"),
-            "out_trade_no": node.get("out_trade_no"),
-            "total_amount": node.get("total_amount"),
-            "trade_status": trade_status,
-            "buyer_open_id": node.get("buyer_open_id") or node.get("buyer_user_id"),
-        }, verified=True)
-        return norm
+        try:
+            return _normalize({
+                "trade_no": node.get("trade_no"),
+                "out_trade_no": order_id,
+                "total_amount": node.get("total_amount"),
+                "trade_status": trade_status,
+                "buyer_open_id": (node.get("buyer_open_id")
+                                  or node.get("buyer_user_id")),
+            }, verified=True)
+        except errors.EchoError as exc:
+            raise errors.payment_gateway_error(
+                "支付宝查询响应字段不合法：%s" % (exc.detail or exc.message))
 
     def refund(self, order: Dict[str, Any]) -> Dict[str, Any]:
-        raise errors.payment_unconfigured()
+        """全额退款（`alipay.trade.refund`），幂等键固定为这张订单。
+
+        `out_request_no` 是支付宝的退款幂等键；同一订单重复调用不会重复退钱。
+        `fund_change="N"` 表示这笔退款之前已经成功过（重试），仍按成功处理。
+        """
+        order_id = str(order.get("order_id") or "")
+        node = self._request("alipay.trade.refund", {
+            "out_trade_no": order_id,
+            "refund_amount": "%.2f" % (int(order.get("amount_cents") or 0) / 100.0),
+            "out_request_no": ("refund-" + order_id)[:64],
+            "refund_reason": "ECHO 后端套餐退款",
+        })
+        if str(node.get("code") or "") != "10000":
+            raise errors.payment_gateway_error(
+                "支付宝退款失败：%s" % self._node_error(node))
+        got_order = str(node.get("out_trade_no") or "")
+        if got_order and got_order != order_id:
+            raise errors.payment_gateway_error(
+                "支付宝退款返回的订单号不匹配：%s" % got_order)
+        return {"ok": True,
+                "tradeNo": str(node.get("trade_no") or
+                               order.get("alipay_trade_no") or ""),
+                "refundFee": str(node.get("refund_fee") or ""),
+                "fundChange": str(node.get("fund_change") or ""),
+                "mock": False}
 
 
 def build_gateway(cfg) -> Any:

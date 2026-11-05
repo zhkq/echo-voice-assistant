@@ -295,8 +295,12 @@ class NoBusinessCouplingTests(unittest.TestCase):
             ("POST", "/v1/account/devices/unbind"),
             ("POST", "/v1/account/logout"),
             ("GET", "/v1/billing/plans"), ("POST", "/v1/billing/orders"),
+            # Phase 3：官网「我的」页读当前用户的最近订单；支付页主动查询并补记。
+            # 两者都只动**自己的**订单/支付记录，不写音频/文本/嵌入。
+            ("GET", "/v1/billing/orders"),
             ("GET", "/v1/billing/orders/{order_id}"),
             ("POST", "/v1/billing/orders/{order_id}/cancel"),
+            ("POST", "/v1/billing/orders/{order_id}/sync"),
             ("GET", "/v1/billing/entitlement"),
             ("POST", "/v1/billing/alipay/notify"),
             ("POST", "/v1/tts"), ("POST", "/v1/delegate"), ("POST", "/v1/delegate/revoke"),
