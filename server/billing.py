@@ -589,6 +589,25 @@ class BillingService:
         self.store.insert_order_event(order["order_id"], "cancelled", "")
         return {"ok": True, "orderId": order["order_id"], "status": "closed"}
 
+    def sync_order(self, order_id: str, user_id: str) -> Dict[str, Any]:
+        """本地联调/回调丢失兜底：主动向支付宝查询并补记支付结果。
+
+        只对 `created|paying` 的订单查询；终态订单直接回存库视图，不重复入账。
+        """
+        order = self.order_for_user(order_id, user_id)
+        status = str(order.get("status") or "")
+        if status in ("paid", "refunded", "closed"):
+            return self.order_view(order)
+        if not getattr(self.gateway, "configured", False):
+            raise errors.payment_unconfigured()
+        norm = self.gateway.query(order)
+        if str(norm.get("status") or "") == "paid":
+            norm = dict(norm)
+            norm["verified"] = True
+            self.apply_notify(norm)
+            order = self.store.order(str(order.get("order_id") or "")) or order
+        return self.order_view(order)
+
     # ---------------------------------------------------------------- 支付回调
 
     def _entitlement_row(self, existing: Optional[Dict[str, Any]],
@@ -1154,6 +1173,14 @@ def cancel_order(request: Request, order_id: str):
     svc = _billing(request)
     user = _user(request)
     return svc.cancel_order(order_id, str(user["user_id"]))
+
+
+@router.post("/orders/{order_id}/sync")
+def sync_order(request: Request, order_id: str):
+    """主动查询支付宝并同步订单状态（本地联调、回调丢失兜底）。"""
+    svc = _billing(request)
+    user = _user(request)
+    return svc.sync_order(order_id, str(user["user_id"]))
 
 
 @router.get("/entitlement")

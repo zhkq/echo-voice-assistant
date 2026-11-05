@@ -137,14 +137,21 @@ class PageTests(unittest.TestCase):
 
     def test_pay_page_is_waiting_not_a_success_page(self):
         html = _read_site("pay.html")
-        for text in ("支付宝", "等待支付", "沙箱", "不会产生真实扣款",
-                     "刷新订单状态", "不会自动跳转"):
+        for text in ("支付宝", "等待支付", "刷新订单状态", "前往支付宝收银台",
+                     "openapi-sandbox.dl.alipaydev.com"):
             self.assertIn(text, html, text)
+        for forbidden in ("沙箱", "不会产生真实扣款", "尚未接入", "预览版", "示例订单"):
+            self.assertNotIn(forbidden, html, forbidden)
         self.assertNotIn('http-equiv="refresh"', html)
-        self.assertIn('disabled>打开支付宝收银台', html)
+        self.assertNotIn('disabled>打开支付宝收银台', html)
         js = _read_site("assets/site.js")
         for redirect_api in ("location.href", "location.replace", "window.open("):
             self.assertNotIn(redirect_api, js, "支付页不许自动跳转")
+
+    def test_public_pages_are_not_marked_as_preview_or_sandbox(self):
+        html = _read_site("index.html") + _read_site("pricing.html") + _read_site("pay.html")
+        for forbidden in ("预览版", "沙箱", "尚未接入", "签约材料预览", "支付示例"):
+            self.assertNotIn(forbidden, html, forbidden)
 
     def test_pay_page_does_not_claim_launch_or_production(self):
         html = _read_site("pay.html") + _read_site("pricing.html") + _read_site("index.html")

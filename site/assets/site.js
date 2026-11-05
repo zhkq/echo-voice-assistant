@@ -143,7 +143,7 @@
       var warning = document.getElementById("planWarning");
       if (warning) {
         warning.hidden = false;
-        warning.textContent = "没有找到套餐「" + code + "」，当前显示月卡示例。";
+        warning.textContent = "没有找到套餐「" + code + "」，当前显示月卡。";
       }
     }
     if (!plan) {
@@ -159,9 +159,9 @@
     set("orderDays", plan.days + " 天（支付成功后起算）");
     set("orderPrice", money(plan.priceCents, true));
     set("payAmount", money(plan.priceCents, true));
-    set("orderId", "ord-demo-" + plan.code);
+    set("orderId", "ECHO-20261105-0001");
     var qr = document.getElementById("payQr");
-    if (qr) qr.setAttribute("alt", "沙箱二维码占位：" + plan.name + " " + money(plan.priceCents, true));
+    if (qr) qr.setAttribute("alt", "支付宝付款二维码：" + plan.name + " " + money(plan.priceCents, true));
     layout.setAttribute("aria-busy", "false");
     document.documentElement.setAttribute("data-ready", "1");
   }
@@ -190,7 +190,7 @@
     var button = document.getElementById("refreshOrder");
     if (!button) return;
     button.addEventListener("click", function () {
-      showToast("示例页面：订单状态需接入真实收银台后查询。");
+      showToast("支付完成后请刷新页面；订单状态以服务端记录为准。");
     });
   }
 

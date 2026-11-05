@@ -40,6 +40,7 @@ import secrets
 import time
 from typing import Any, Dict, Optional
 from urllib.parse import urlencode
+from urllib.request import Request as UrlRequest, urlopen
 
 from fastapi import APIRouter, Request
 
@@ -57,10 +58,15 @@ ALIPAY_SANDBOX_GATEWAY = "https://openapi-sandbox.dl.alipaydev.com/gateway.do"
 _LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost", "testclient", "testserver"}
 
 
-def _canonical(form: Dict[str, Any]) -> str:
-    """待签名串：按 key 字典序，`k=v` 用 `&` 连接，**排除 sign / sign_type**。"""
+def _canonical(form: Dict[str, Any], *, include_sign_type: bool = False) -> str:
+    """待签名串：按 key 字典序，`k=v` 用 `&` 连接。
+
+    * 请求签名（下单/查询）：只排除 `sign`，**包含 sign_type**（支付宝 RSA2 实测）。
+    * 异步通知验签：排除 `sign` 和 `sign_type`（支付宝官方 SDK 口径）。
+    """
+    excluded = {"sign"} if include_sign_type else {"sign", "sign_type"}
     items = [(str(k), str(v)) for k, v in (form or {}).items()
-             if k not in ("sign", "sign_type") and v is not None and str(v) != ""]
+             if k not in excluded and v is not None and str(v) != ""]
     return "&".join("%s=%s" % (k, v) for k, v in sorted(items))
 
 
@@ -131,7 +137,7 @@ class MockGateway:
 
     def _sign(self, form: Dict[str, Any]) -> str:
         return hmac.new(self.secret.encode("utf-8"),
-                        _canonical(form).encode("utf-8"),
+                        _canonical(form, include_sign_type=True).encode("utf-8"),
                         hashlib.sha256).hexdigest()
 
     def build_form(self, order: Dict[str, Any], trade_no: str = "",
@@ -226,7 +232,8 @@ class AlipayGateway:
         from cryptography.hazmat.primitives import hashes
         from cryptography.hazmat.primitives.asymmetric import padding
         signature = self._private_key().sign(
-            _canonical(form).encode("utf-8"), padding.PKCS1v15(), hashes.SHA256())
+            _canonical(form, include_sign_type=True).encode("utf-8"),
+            padding.PKCS1v15(), hashes.SHA256())
         return base64.b64encode(signature).decode("ascii")
 
     def _verify(self, form: Dict[str, Any], sign: str) -> bool:
@@ -235,6 +242,18 @@ class AlipayGateway:
         try:
             self._public_key().verify(
                 base64.b64decode(sign), _canonical(form).encode("utf-8"),
+                padding.PKCS1v15(), hashes.SHA256())
+            return True
+        except Exception:
+            return False
+
+    def _verify_raw(self, data: bytes, sign: str) -> bool:
+        """校验支付宝同步响应：签名对象是响应节点的**原始 JSON 子串**。"""
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.asymmetric import padding
+        try:
+            self._public_key().verify(
+                base64.b64decode(sign), data,
                 padding.PKCS1v15(), hashes.SHA256())
             return True
         except Exception:
@@ -292,9 +311,68 @@ class AlipayGateway:
         return _normalize(got, verified=True)
 
     def query(self, order: Dict[str, Any]) -> Dict[str, Any]:
-        # 主动查询是上线前的硬要求（设计 §7 第 3 条），但本轮没有沙箱环境；
-        # 不假装成功 —— 让调用方明确知道"这条路还没接"。
-        raise errors.payment_unconfigured()
+        """主动查询（`alipay.trade.query`）。用于本地联调/回调丢失时的兜底。"""
+        if not self.configured:
+            raise errors.payment_unconfigured()
+        biz = {"out_trade_no": str(order.get("order_id") or "")}
+        params = {
+            "app_id": self.app_id,
+            "method": "alipay.trade.query",
+            "format": "JSON",
+            "charset": "utf-8",
+            "sign_type": "RSA2",
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "version": "1.0",
+            "biz_content": json.dumps(biz, ensure_ascii=False, separators=(",", ":")),
+        }
+        params["sign"] = self._sign(params)
+        body = urlencode(params).encode("utf-8")
+        try:
+            with urlopen(UrlRequest(self.gateway, data=body), timeout=20) as resp:
+                raw = resp.read()
+                charset = resp.headers.get_content_charset() or "utf-8"
+        except Exception as exc:  # 网络/HTTP 层
+            raise errors.bad_request("支付宝查询失败：%s" % exc)
+        try:
+            text = raw.decode(charset)
+        except (LookupError, UnicodeDecodeError):
+            charset = "gbk" if charset.lower() == "gbk" else "utf-8"
+            text = raw.decode(charset, "replace")
+        try:
+            outer = json.loads(text)
+        except Exception:
+            raise errors.bad_request("支付宝查询响应不是合法 JSON")
+        key = '"alipay_trade_query_response"'
+        idx = text.find(key)
+        if idx < 0:
+            raise errors.bad_request("支付宝查询响应缺少 alipay_trade_query_response")
+        colon = text.find(":", idx + len(key))
+        start = text.find("{", colon)
+        if start < 0:
+            raise errors.bad_request("支付宝查询响应结构异常")
+        try:
+            node, _end = json.JSONDecoder().raw_decode(text[start:])
+        except Exception:
+            raise errors.bad_request("支付宝查询响应结构异常")
+        raw_node = text[start:start + _end].encode(charset, "replace")
+        sign = str(outer.get("sign") or "")
+        if not sign or not self._verify_raw(raw_node, sign):
+            raise errors.bad_request("支付宝查询响应验签失败")
+        if str(node.get("code") or "") not in ("10000", ""):
+            # 交易不存在/未创建：按未支付处理，不伪造成功。
+            return {"status": "pending", "tradeNo": "",
+                    "outTradeNo": str(order.get("order_id") or ""),
+                    "amountCents": 0, "verified": True,
+                    "rawStatus": str(node.get("sub_code") or node.get("msg") or "")}
+        trade_status = str(node.get("trade_status") or "").upper()
+        norm = _normalize({
+            "trade_no": node.get("trade_no"),
+            "out_trade_no": node.get("out_trade_no"),
+            "total_amount": node.get("total_amount"),
+            "trade_status": trade_status,
+            "buyer_open_id": node.get("buyer_open_id") or node.get("buyer_user_id"),
+        }, verified=True)
+        return norm
 
     def refund(self, order: Dict[str, Any]) -> Dict[str, Any]:
         raise errors.payment_unconfigured()
