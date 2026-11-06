@@ -93,6 +93,17 @@ services:
       ECHO_PAYMENT_PROVIDER: "${ECHO_PAYMENT_PROVIDER:-disabled}"
       ECHO_TRIAL_ENABLED: "${ECHO_TRIAL_ENABLED:-true}"
       ECHO_INVITE_REQUIRED: "${ECHO_INVITE_REQUIRED:-true}"
+      # 邮箱账号（2026-11-06，issue #15）：默认关；生产配好 SMTP/域名后再开。
+      # 密码**只**从环境变量或只读挂载文件读（不要写进这里/仓库/数据库）。
+      ECHO_EMAIL_ENABLED: "${ECHO_EMAIL_ENABLED:-false}"
+      ECHO_EMAIL_PROVIDER: "${ECHO_EMAIL_PROVIDER:-dev}"
+      ECHO_EMAIL_FROM: "${ECHO_EMAIL_FROM:-}"
+      ECHO_SMTP_HOST: "${ECHO_SMTP_HOST:-}"
+      ECHO_SMTP_PORT: "${ECHO_SMTP_PORT:-465}"
+      ECHO_SMTP_MODE: "${ECHO_SMTP_MODE:-ssl}"
+      ECHO_SMTP_USERNAME: "${ECHO_SMTP_USERNAME:-}"
+      ECHO_SMTP_PASSWORD: "${ECHO_SMTP_PASSWORD:-}"
+      ECHO_SMTP_PASSWORD_FILE: "${ECHO_SMTP_PASSWORD_FILE:-}"
       # ⚠️ **SenseVoice 还依赖一个"按模型名"加载的 VAD 模型**（`app/audio/stt.py:_get_sensevoice`
       #    传的 `vad_model="fsmn-vad"`），funasr 会去 ModelScope 现拉它（约 1.7 MB）。
       #    而根文件系统是 `read_only: true`：默认落点 `~/.modelscope` / `~/.cache/modelscope`
