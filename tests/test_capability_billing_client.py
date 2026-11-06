@@ -37,7 +37,10 @@ class ServerContractForTheFutureClientTests(_BillingCase):
         headers = {"Authorization": "Bearer " + token}
         created = self.client.post("/v1/billing/orders", json={"planCode": "monthly"},
                                    headers=headers).json()
-        for key in ("orderId", "amountCents", "payUrl", "expiresAt", "status"):
+        for key in ("orderId", "amountCents", "payUrl", "expiresAt", "status",
+                    "currentPaidUntil", "projectedPaidUntil", "renewalDays",
+                    "renewalBasis", "renewalRule", "planChangeRule", "refundRule",
+                    "autoRenew"):
             self.assertIn(key, created)
         self.assertEqual(created["status"], "paying")
         self.client.post("/v1/billing/mock/pay/" + created["orderId"], json={})
@@ -51,7 +54,8 @@ class ServerContractForTheFutureClientTests(_BillingCase):
         body = self.client.get("/v1/billing/entitlement",
                                headers={"Authorization": "Bearer " + token}).json()
         for key in ("status", "plan", "paidUntil", "dailyMinutes", "ttsCharsLeft",
-                    "qps", "maxDevices", "maxConcurrent", "devices", "expiringSoon"):
+                    "qps", "maxDevices", "maxConcurrent", "devices", "expiringSoon",
+                    "renewalRule", "planChangeRule", "refundRule", "autoRenew"):
             self.assertIn(key, body)
 
 

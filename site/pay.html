@@ -51,7 +51,9 @@
           <div class="panel-title">订单摘要<span class="tag tag-muted" id="orderStatusTag">—</span></div>
           <div class="order-rows">
             <div class="order-row"><span>商品</span><span>ECHO 能力后端 · <span id="orderPlan">—</span></span></div>
-            <div class="order-row"><span>有效期</span><span id="orderDays">—</span></div>
+            <div class="order-row"><span id="orderCurrentLabel">当前到期</span><span id="orderCurrentUntil">—</span></div>
+            <div class="order-row"><span>本次续费</span><span id="orderDays">—</span></div>
+            <div class="order-row"><span id="orderProjectedLabel">支付后预计到期</span><span id="orderProjectedUntil">—</span></div>
             <div class="order-row"><span>数量</span><span>1</span></div>
             <div class="order-row"><span>订单号</span><span id="orderId">—</span></div>
             <div class="order-row"><span>下单时间</span><span id="orderCreated">—</span></div>
@@ -60,7 +62,8 @@
             <span>应付金额</span>
             <span class="money" id="orderPrice">—</span>
           </div>
-          <p class="order-id" id="orderHint">订单状态以服务端记录为准。</p>
+          <p class="pay-note renewal-rule" id="renewalRule">续费规则加载中…</p>
+          <p class="order-id" id="orderHint">订单状态以服务端记录为准；到期时间由服务端计算。</p>
         </div>
 
         <div class="panel" id="paymentPanel">

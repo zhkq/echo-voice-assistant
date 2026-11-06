@@ -383,9 +383,11 @@ class EntitlementGateTests(_BillingCase):
         self.svc.adjust_entitlement(uid, {"action": "internal"})
         self.assertEqual(self.store.entitlement(uid)["plan_code"], "internal")
         self.assertEqual(self.store.entitlement(uid)["paid_until"], 0.0)
-        order_id = self.client.post("/v1/billing/orders", json={"planCode": "monthly"},
-                                    headers=self.uh(token)).json()["orderId"]
-        self.client.post("/v1/billing/mock/pay/" + order_id, json={})
+        # internal 不降级、也不该收钱：下单在落库之前就被拒。
+        r = self.client.post("/v1/billing/orders", json={"planCode": "monthly"},
+                             headers=self.uh(token))
+        self.assertEqual(r.status_code, 409, r.text)
+        self.assertEqual(r.json()["code"], "plan_change_unsupported")
         self.assertEqual(self.store.entitlement(uid)["plan_code"], "internal")
         self.assertEqual(self.asr(headers).status_code, 200)
 
@@ -783,6 +785,200 @@ class RefundRecomputeTests(_BillingCase):
         blob = json.dumps(events, ensure_ascii=False)
         self.assertIn("用户申请", blob)
         self.assertIn("refunded", blob)
+
+
+class RenewalRuleTests(_BillingCase):
+    """issue #13：期内/过期/多笔/退款/换套餐/预计到期的唯一口径。"""
+
+    def add_plan(self, code="yearly", days=365, price_cents=12000):
+        self.store.upsert_plan({
+            "code": code, "name": "年卡", "price_cents": price_cents, "days": days,
+            "daily_audio_minutes": 120, "tts_chars": 50000, "qps": 1,
+            "max_devices": 3, "max_concurrent": 1, "active": 1, "sort": 30,
+        })
+
+    def uid(self, employee_no="E001"):
+        return self.store.user_by_employee_no(employee_no)["user_id"]
+
+    def test_early_renewal_projection_matches_the_actual_expiry(self):
+        token, _headers, _first = self.create_paid_client()
+        uid = self.uid()
+        before = self.store.entitlement(uid)["paid_until"]
+        created = self.client.post("/v1/billing/orders", json={"planCode": "monthly"},
+                                   headers=self.uh(token)).json()
+        self.assertEqual(created["renewalDays"], 30)
+        self.assertEqual(created["renewalBasis"], "paid_until")
+        self.assertAlmostEqual(created["currentPaidUntil"], before, delta=5)
+        self.assertAlmostEqual(created["projectedPaidUntil"], before + 30 * 86400,
+                               delta=5)
+        self.assertIn("期内续费", created["renewalRule"])
+        self.client.post("/v1/billing/mock/pay/" + created["orderId"], json={})
+        actual = self.store.entitlement(uid)["paid_until"]
+        self.assertAlmostEqual(actual, created["projectedPaidUntil"], delta=5,
+                               msg="预览与入账必须是同一套口径")
+        detail = self.client.get("/v1/billing/orders/" + created["orderId"],
+                                 headers=self.uh(token)).json()
+        self.assertEqual(detail["status"], "paid")
+        self.assertAlmostEqual(detail["projectedPaidUntil"], actual, delta=5,
+                               msg="已支付订单的预计到期要等于实际 paid_until")
+        self.assertAlmostEqual(detail["currentPaidUntil"], before, delta=5)
+
+    def test_expired_renewal_starts_from_payment_time(self):
+        token, _headers, _first = self.create_paid_client()
+        uid = self.uid()
+        row = dict(self.store.entitlement(uid))
+        row["paid_until"] = time.time() - 3 * 86400
+        self.store.upsert_entitlement(row)
+        self.svc.forget_entitlement(uid)
+        created = self.client.post("/v1/billing/orders", json={"planCode": "monthly"},
+                                   headers=self.uh(token)).json()
+        self.assertEqual(created["renewalBasis"], "payment_time")
+        self.assertAlmostEqual(created["projectedPaidUntil"], time.time() + 30 * 86400,
+                               delta=120)
+        self.client.post("/v1/billing/mock/pay/" + created["orderId"], json={})
+        actual = self.store.entitlement(uid)["paid_until"]
+        self.assertAlmostEqual(actual, time.time() + 30 * 86400, delta=120)
+
+    def test_three_consecutive_orders_stack_in_payment_order(self):
+        token, _headers, _first = self.create_paid_client()
+        uid = self.uid()
+        first = self.store.entitlement(uid)["paid_until"]
+        for _ in range(2):
+            order_id = self.client.post(
+                "/v1/billing/orders", json={"planCode": "monthly"},
+                headers=self.uh(token)).json()["orderId"]
+            self.assertEqual(self.client.post(
+                "/v1/billing/mock/pay/" + order_id, json={}).status_code, 200)
+        self.assertAlmostEqual(self.store.entitlement(uid)["paid_until"],
+                               first + 60 * 86400, delta=10)
+
+    def test_refunding_the_second_order_keeps_the_first_term(self):
+        token, _headers, first_order = self.create_paid_client()
+        uid = self.uid()
+        first_paid_until = self.store.entitlement(uid)["paid_until"]
+        second = self.client.post("/v1/billing/orders", json={"planCode": "monthly"},
+                                  headers=self.uh(token)).json()["orderId"]
+        self.client.post("/v1/billing/mock/pay/" + second, json={})
+        self.assertEqual(self.store.entitlement(uid)["paid_until"],
+                         first_paid_until + 30 * 86400)
+        out = self.svc.refund_order(second, reason="退第二笔")
+        self.assertEqual(out["status"], "refunded")
+        ent = self.store.entitlement(uid)
+        self.assertEqual(ent["status"], "active")
+        self.assertAlmostEqual(ent["paid_until"], first_paid_until, delta=5)
+        self.assertEqual(self.store.order(first_order)["status"], "paid")
+
+    def test_refunding_both_orders_zeroes_the_expiry_and_blocks_access(self):
+        token, headers, first_order = self.create_paid_client()
+        uid = self.uid()
+        second = self.client.post("/v1/billing/orders", json={"planCode": "monthly"},
+                                  headers=self.uh(token)).json()["orderId"]
+        self.client.post("/v1/billing/mock/pay/" + second, json={})
+        self.svc.refund_order(first_order)
+        self.svc.refund_order(second)
+        ent = self.store.entitlement(uid)
+        self.assertEqual(ent["status"], "refunded")
+        self.assertEqual(ent["paid_until"], 0.0, "只剩退款单时不能再显示未来到期日")
+        self.assertEqual(self.asr(headers).status_code, 402)
+
+    def test_refund_then_renew_starts_from_the_new_payment(self):
+        token, _headers, order_id = self.create_paid_client()
+        uid = self.uid()
+        self.svc.refund_order(order_id)
+        before = time.time()
+        created = self.client.post("/v1/billing/orders", json={"planCode": "monthly"},
+                                   headers=self.uh(token)).json()
+        self.assertEqual(created["renewalBasis"], "payment_time")
+        self.assertGreaterEqual(created["projectedPaidUntil"], before + 30 * 86400 - 5)
+        self.client.post("/v1/billing/mock/pay/" + created["orderId"], json={})
+        ent = self.store.entitlement(uid)
+        self.assertEqual(ent["status"], "active")
+        self.assertAlmostEqual(ent["paid_until"], time.time() + 30 * 86400, delta=120)
+
+    def test_trial_does_not_stack_into_the_first_paid_month(self):
+        user = self.register()
+        token = user["userToken"]
+        uid = self.uid()
+        trial_until = self.store.entitlement(uid)["paid_until"]
+        self.assertEqual(self.store.entitlement(uid)["plan_code"], "trial")
+        created = self.client.post("/v1/billing/orders", json={"planCode": "monthly"},
+                                   headers=self.uh(token)).json()
+        self.assertEqual(created["renewalBasis"], "payment_time")
+        self.assertAlmostEqual(created["projectedPaidUntil"], time.time() + 30 * 86400,
+                               delta=120)
+        self.assertLess(created["projectedPaidUntil"], trial_until + 30 * 86400)
+        self.client.post("/v1/billing/mock/pay/" + created["orderId"], json={})
+        ent = self.store.entitlement(uid)
+        self.assertEqual(ent["plan_code"], "monthly")
+        self.assertAlmostEqual(ent["paid_until"], time.time() + 30 * 86400, delta=120)
+
+    def test_changing_plan_while_active_is_rejected_before_an_order_exists(self):
+        token, _headers, _first = self.create_paid_client()
+        self.add_plan("yearly")
+        before = len(self.store.orders(user_id=self.uid(), limit=1000))
+        r = self.client.post("/v1/billing/orders", json={"planCode": "yearly"},
+                             headers=self.uh(token))
+        self.assertEqual(r.status_code, 409, r.text)
+        self.assertEqual(r.json()["code"], "plan_change_unsupported")
+        self.assertIn("暂不支持升级/降级", r.json()["message"])
+        self.assertEqual(len(self.store.orders(user_id=self.uid(), limit=1000)), before,
+                         "被拒的换套餐不能留下 closed 孤儿订单")
+        # 同套餐续费仍然允许。
+        same = self.client.post("/v1/billing/orders", json={"planCode": "monthly"},
+                                headers=self.uh(token))
+        self.assertEqual(same.status_code, 200, same.text)
+
+    def test_an_expired_account_may_buy_a_different_plan(self):
+        token, _headers, _first = self.create_paid_client()
+        uid = self.uid()
+        row = dict(self.store.entitlement(uid))
+        row["paid_until"] = time.time() - 86400
+        self.store.upsert_entitlement(row)
+        self.svc.forget_entitlement(uid)
+        self.add_plan("yearly")
+        r = self.client.post("/v1/billing/orders", json={"planCode": "yearly"},
+                             headers=self.uh(token))
+        self.assertEqual(r.status_code, 200, r.text)
+        self.client.post("/v1/billing/mock/pay/" + r.json()["orderId"], json={})
+        ent = self.store.entitlement(uid)
+        self.assertEqual(ent["plan_code"], "yearly")
+        self.assertAlmostEqual(ent["paid_until"], time.time() + 365 * 86400, delta=120)
+
+    def test_internal_accounts_cannot_be_downgraded_by_a_purchase(self):
+        token = self.register()["userToken"]
+        uid = self.uid()
+        self.svc.adjust_entitlement(uid, {"action": "internal"})
+        r = self.client.post("/v1/billing/orders", json={"planCode": "monthly"},
+                             headers=self.uh(token))
+        self.assertEqual(r.status_code, 409, r.text)
+        self.assertEqual(r.json()["code"], "plan_change_unsupported")
+        self.assertIn("内部账号", r.json()["message"])
+        self.assertEqual(self.store.entitlement(uid)["plan_code"], "internal")
+
+    def test_order_list_keeps_refunded_and_closed_rows(self):
+        token, _headers, paid_order = self.create_paid_client()
+        closed = self.client.post("/v1/billing/orders", json={"planCode": "monthly"},
+                                  headers=self.uh(token)).json()["orderId"]
+        self.client.post("/v1/billing/orders/%s/cancel" % closed,
+                         headers=self.uh(token))
+        refunded = self.client.post("/v1/billing/orders", json={"planCode": "monthly"},
+                                    headers=self.uh(token)).json()["orderId"]
+        self.client.post("/v1/billing/mock/pay/" + refunded, json={})
+        self.svc.refund_order(refunded)
+        rows = self.client.get("/v1/billing/orders", headers=self.uh(token)).json()["orders"]
+        statuses = {row["orderId"]: row["status"] for row in rows}
+        self.assertEqual(statuses[paid_order], "paid")
+        self.assertEqual(statuses[closed], "closed")
+        self.assertEqual(statuses[refunded], "refunded")
+
+    def test_entitlement_summary_carries_the_rules(self):
+        token = self.register()["userToken"]
+        body = self.client.get("/v1/billing/entitlement", headers=self.uh(token)).json()
+        self.assertTrue(body["renewalRule"])
+        self.assertTrue(body["planChangeRule"])
+        self.assertTrue(body["refundRule"])
+        self.assertFalse(body["autoRenew"])
+        self.assertEqual(body["renewalDays"], 7)      # 试用套餐天数来自 plans 表
 
 
 class BillingHardeningTests(_BillingCase):

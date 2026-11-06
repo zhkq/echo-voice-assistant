@@ -69,6 +69,22 @@ PLAN_COLUMNS = ("code", "name", "price_cents", "days", "daily_audio_minutes",
 #: 允许的订单状态（**名字即契约**：客户端与对账脚本都按它判）。
 ORDER_STATES = ("created", "paying", "paid", "refunded", "closed")
 
+#: 续费/退款/换套餐的**唯一口径**（2026-11-06，issue #13）。
+#: 文案由服务端下发，页面不自己拼——这样页面、管理面、文档不会各说一套。
+RENEWAL_RULE = ("期内续费从当前到期日顺延；过期或退款后从支付成功时间起算；"
+                "试用不叠加；退款按剩余已支付订单重算。")
+PLAN_CHANGE_RULE = ("暂不支持升级/降级：有有效付费权益时只能续费同一套餐；"
+                    "等当前套餐到期后，或联系管理员处理。")
+REFUND_RULE = "退款按剩余已支付订单重算到期时间；已消费的额度不退。"
+#: 自动扣款本轮不做；以后若做，必须是显式勾选 + 可取消 + 到期前提醒。
+AUTO_RENEW_ENABLED = False
+
+#: `renewalBasis` 的取值（客户端只做展示，不参与计算）。
+RENEWAL_BASIS_PAID_UNTIL = "paid_until"
+RENEWAL_BASIS_PAYMENT_TIME = "payment_time"
+RENEWAL_BASIS_NEVER = "never_expires"
+RENEWAL_BASIS_NOT_APPLICABLE = "not_applicable"
+
 
 def day_start(cfg, ts: Optional[float] = None) -> float:
     """`billing.timezone` 的**自然日 0 点**（epoch 秒）。"""
@@ -209,6 +225,11 @@ class BillingService:
         #: 管理面调整/退款会主动失效（否则"已退款还能用"最多滞后 5 秒）。
         self._ent_cache: Dict[str, tuple] = {}
         self._ent_ttl_s = 5.0
+        #: `user_id → (paid 订单重放结果, 取到的时刻)`。订单详情/列表要按订单
+        #: 展示“这笔订单带来的到期时间”，重放一次比每行都查一遍便宜。
+        #: 支付/退款/管理面调整都会 `forget_entitlement()`，一并失效。
+        self._replay_cache: Dict[str, tuple] = {}
+        self._replay_ttl_s = 5.0
         #: 日额度账本由 `routes.State` 造好之后挂上来（它们要用同一个时钟）。
         #: 计时/记账在 `State.billing()/timed_billing()`，这里只做"用完没有"的判定。
         self.user_quota = None
@@ -264,7 +285,9 @@ class BillingService:
         return row
 
     def forget_entitlement(self, user_id: str) -> None:
-        self._ent_cache.pop(str(user_id or ""), None)
+        uid = str(user_id or "")
+        self._ent_cache.pop(uid, None)
+        self._replay_cache.pop(uid, None)
 
     def require_entitlement(self, user_id: str, now: Optional[float] = None
                             ) -> Dict[str, Any]:
@@ -355,12 +378,18 @@ class BillingService:
         """`/v1/capabilities` 与「我的」页读的那份权益摘要（设计 §4.4 末两条）。"""
         now = time.time()
         row = self.entitlement(user_id)
+        rules = {
+            "renewalRule": RENEWAL_RULE,
+            "planChangeRule": PLAN_CHANGE_RULE,
+            "refundRule": REFUND_RULE,
+            "autoRenew": AUTO_RENEW_ENABLED,
+        }
         if row is None:
             return {"status": "none", "plan": "", "planName": "", "paidUntil": 0,
                     "dailyMinutes": 0.0, "dailyMinutesLeft": 0.0,
                     "ttsCharsLeft": 0, "qps": 0,
                     "maxDevices": 0, "maxConcurrent": 0, "devices": int(devices),
-                    "expiringSoon": False}
+                    "expiringSoon": False, "renewalDays": 0, **rules}
         limits = self._limits(row)
         paid_until = float(row.get("paid_until") or 0)
         status = str(row.get("status") or "")
@@ -392,6 +421,8 @@ class BillingService:
             "devices": int(devices),
             # 到期前 7 天内为 True（7 / 3 / 1 天那几档都在里面；设计 §4.4）。
             "expiringSoon": bool(left_days is not None and 0 < left_days <= 7.0),
+            "renewalDays": int(plan_row.get("days") or 0),
+            **rules,
         }
 
     # ---------------------------------------------------------------- 设备映射
@@ -497,6 +528,132 @@ class BillingService:
         with self.concurrency.hold(str(user_id), limit):
             yield
 
+    # ---------------------------------------------------------------- 续费计算
+
+    def _renewal_base(self, existing: Optional[Dict[str, Any]],
+                      plan: Dict[str, Any], now: float):
+        """这次支付从哪一刻起算，以及原因为何（预览与入账共用这一处）。"""
+        days = int(plan.get("days") or 0)
+        if days <= 0:
+            return now, RENEWAL_BASIS_NEVER
+        if (existing is not None
+                and str(existing.get("status") or "") == "active"
+                and str(existing.get("plan_code") or "") != "trial"
+                and float(existing.get("paid_until") or 0) > now):
+            return float(existing["paid_until"]), RENEWAL_BASIS_PAID_UNTIL
+        # 无权益 / 已过期 / 退款后 / 试用中：都从**支付成功时间**起算。
+        return now, RENEWAL_BASIS_PAYMENT_TIME
+
+    def _renewal_projection(self, existing: Optional[Dict[str, Any]],
+                            plan: Dict[str, Any],
+                            now: Optional[float] = None) -> Dict[str, Any]:
+        """纯函数：`{current, projected, basis}`（不碰 DB，也不改时间）。
+
+        支付页的“支付后预计到期”必须与真正入账的 `paid_until` 用同一套口径；
+        两边都调这里，测试再钉一次“预览 == 实际”。
+        """
+        now = time.time() if now is None else float(now)
+        current = float((existing or {}).get("paid_until") or 0)
+        days = int(plan.get("days") or 0)
+        if (existing is not None
+                and str(existing.get("status") or "") == "active"
+                and str(existing.get("plan_code") or "") == "internal"):
+            return {"current": 0.0, "projected": 0.0,
+                    "basis": RENEWAL_BASIS_NEVER}
+        base, basis = self._renewal_base(existing, plan, now)
+        projected = (base + days * 86400.0) if days > 0 else 0.0
+        return {"current": current, "projected": projected, "basis": basis}
+
+    def _paid_replay(self, user_id: str) -> Dict[str, Any]:
+        """按支付时间重放所有 `paid` 订单；退款重算与订单详情共用。
+
+        返回 `{paidUntil, lastPlan, lastOrder, perOrder}`，`perOrder[order_id]`
+        是**这笔订单带来**的 `{current, projected, basis}`。没有剩余订单时
+        `paidUntil=0`、`lastPlan=None`。
+        """
+        uid = str(user_id or "")
+        now = time.time()
+        hit = self._replay_cache.get(uid)
+        if hit is not None and (now - hit[1]) < self._replay_ttl_s:
+            return hit[0]
+        rows = [o for o in self.store.orders(user_id=uid, limit=1000)
+                if str(o.get("status") or "") == "paid"]
+        rows.sort(key=lambda o: (float(o.get("paid_at") or o.get("created_at") or 0),
+                                 str(o.get("order_id") or "")))
+        paid_until = 0.0
+        last_plan = None
+        last_order = ""
+        per_order: Dict[str, Dict[str, Any]] = {}
+        for order in rows:
+            plan = self.store.plan(str(order.get("plan_code") or ""))
+            if plan is None:
+                continue
+            at = float(order.get("paid_at") or order.get("created_at") or 0)
+            days = int(plan.get("days") or 0)
+            before = paid_until
+            if days <= 0:
+                after = 0.0
+                basis = RENEWAL_BASIS_NEVER
+            else:
+                after = max(at, before) + days * 86400.0
+                basis = (RENEWAL_BASIS_PAID_UNTIL if before > at
+                         else RENEWAL_BASIS_PAYMENT_TIME)
+            per_order[str(order.get("order_id") or "")] = {
+                "current": before, "projected": after, "basis": basis}
+            paid_until = after
+            last_plan = plan
+            last_order = str(order.get("order_id") or "")
+        out = {"paidUntil": paid_until, "lastPlan": last_plan,
+               "lastOrder": last_order, "perOrder": per_order}
+        self._replay_cache[uid] = (out, now)
+        return out
+
+    def _order_renewal_view(self, order: Dict[str, Any],
+                            now: Optional[float] = None) -> Dict[str, Any]:
+        """订单详情里的“当前到期 / 这笔订单之后预计到期 / 起算依据”。"""
+        now = time.time() if now is None else float(now)
+        status = str(order.get("status") or "")
+        uid = str(order.get("user_id") or "")
+        plan = self.store.plan(str(order.get("plan_code") or "")) or {}
+        current = self.entitlement(uid) or {}
+        if status == "paid":
+            hit = self._paid_replay(uid)["perOrder"].get(
+                str(order.get("order_id") or ""))
+            if hit is not None:
+                return hit
+            # 套餐被删了/老数据：回落到当前权益，不给一个编出来的日期。
+            paid_until = float(current.get("paid_until") or 0)
+            return {"current": paid_until, "projected": paid_until,
+                    "basis": (RENEWAL_BASIS_NEVER if paid_until <= 0
+                              else RENEWAL_BASIS_PAID_UNTIL)}
+        if status in ("refunded", "closed"):
+            return {"current": float(current.get("paid_until") or 0),
+                    "projected": 0.0, "basis": RENEWAL_BASIS_NOT_APPLICABLE}
+        return self._renewal_projection(current, plan, now)
+
+    def _check_plan_change(self, user_id: str, plan: Dict[str, Any],
+                           now: float) -> None:
+        """有有效付费权益时只允许同套餐续费；换套餐明确 409，不做 proration。"""
+        existing = self.entitlement(user_id)
+        if existing is None or str(existing.get("status") or "") != "active":
+            return
+        code = str(existing.get("plan_code") or "")
+        if code == "internal":
+            raise errors.plan_change_unsupported(
+                "内部账号不参与付费套餐",
+                message="当前是内部账号，无需购买套餐")
+        if code == "trial":
+            return                      # 试用不是付费权益，买月卡不算“换套餐”
+        if float(existing.get("paid_until") or 0) <= now:
+            return                      # 已经过期：按新购处理，允许换任意套餐
+        wanted = str(plan.get("code") or "")
+        if code == wanted:
+            return
+        current_name = str((self.store.plan(code) or {}).get("name") or code or "当前套餐")
+        raise errors.plan_change_unsupported(
+            "当前套餐是「%s」，暂不支持升级/降级；请等它到期后再换，或联系管理员"
+            % current_name)
+
     # ---------------------------------------------------------------- 订单
 
     def _order_pay_view(self, order: Dict[str, Any], *, create: bool = False,
@@ -520,7 +677,19 @@ class BillingService:
             # 切生产（`alipay.sandbox=false`）后标注自动消失，页面文案不用改。
             "sandbox": bool(self.provider == "alipay"
                             and getattr(self.gateway, "sandbox", False)),
+            # 支付前就能看见“这次付完什么时候到期”。预览与入账共用同一套口径。
+            "renewalDays": int(plan.get("days") or 0),
+            "renewalRule": RENEWAL_RULE,
+            "planChangeRule": PLAN_CHANGE_RULE,
+            "refundRule": REFUND_RULE,
+            "autoRenew": AUTO_RENEW_ENABLED,
         }
+        renewal = self._order_renewal_view(order)
+        view.update({
+            "currentPaidUntil": float(renewal.get("current") or 0.0),
+            "projectedPaidUntil": float(renewal.get("projected") or 0.0),
+            "renewalBasis": str(renewal.get("basis") or ""),
+        })
         if create:
             view["mock"] = bool(meta.get("mock"))
         # **管理面列表必须只读**：`pairUrl` 可能触发补发码（写库 + 审计），
@@ -540,6 +709,8 @@ class BillingService:
         plan = self.plan(plan_code)
         if int(plan.get("price_cents") or 0) <= 0:
             raise errors.bad_request("这个套餐不需要下单（试用由系统赠送）")
+        # **换套餐在落单之前拒绝**：不做 proration，也不留一个永远 closed 的孤儿订单。
+        self._check_plan_change(str(user_id), plan, time.time())
         if not getattr(self.gateway, "configured", False):
             # **先判支付配置，再落订单**：未配置时不要留一堆永远 `closed` 的孤儿订单。
             raise errors.payment_unconfigured()
@@ -659,12 +830,8 @@ class BillingService:
                 and str(existing.get("plan_code") or "") == "internal"
                 and str(existing.get("status") or "") == "active"):
             return dict(existing)          # internal 不被付费套餐降级
-        base = now
-        # **试用不叠加**：设计 §4.5「试用到期后…续费买月卡即从当天起算」。
-        if (existing is not None and str(existing.get("status") or "") == "active"
-                and str(existing.get("plan_code") or "") != "trial"
-                and float(existing.get("paid_until") or 0) > now):
-            base = float(existing["paid_until"])
+        # **试用不叠加**；期内从 paid_until 顺延，其余从支付时间起算。
+        base, _basis = self._renewal_base(existing, plan, now)
         days = int(plan.get("days") or 0)
         return {
             "user_id": uid,
@@ -827,25 +994,19 @@ class BillingService:
                 and str(existing.get("plan_code") or "") == "internal"
                 and str(existing.get("status") or "") == "active"):
             return existing
-        paid = [o for o in self.store.orders(user_id=uid, limit=1000)
-                if str(o.get("status") or "") == "paid"]
-        paid.sort(key=lambda o: float(o.get("paid_at") or o.get("created_at") or 0))
-        paid_until = 0.0
-        last_plan = None
-        last_order = ""
-        for order in paid:
-            plan = self.store.plan(str(order.get("plan_code") or ""))
-            if plan is None:
-                continue
-            base = max(float(order.get("paid_at") or order.get("created_at") or 0),
-                       paid_until)
-            days = int(plan.get("days") or 0)
-            paid_until = (base + days * 86400.0) if days > 0 else 0.0
-            last_plan = plan
-            last_order = str(order.get("order_id") or "")
+        replay = self._paid_replay(uid)
+        paid_until = float(replay.get("paidUntil") or 0)
+        last_plan = replay.get("lastPlan")
+        last_order = str(replay.get("lastOrder") or "")
         if last_plan is None:
-            # 没有可重算的套餐：退款后直接失效（保留额度字段供人工处理）。
-            self.store.set_entitlement_status(uid, "refunded")
+            # 没有剩余 paid 订单：状态退回 refunded，且**到期时间清零**。
+            # 不保留一个“已退款但到期日在未来”的行，那会让权益卡自相矛盾。
+            if existing is not None:
+                row = dict(existing)
+                row["paid_until"] = 0.0
+                row["status"] = "refunded"
+                row["updated_at"] = now
+                self.store.upsert_entitlement(row)
             self.forget_entitlement(uid)
             return self.store.entitlement(uid)
         row = {
@@ -978,6 +1139,8 @@ class BillingService:
         out = self.gateway.refund(order)
         self.store.update_order(order_id, status="refunded")
         uid = str(order.get("user_id") or "")
+        # 先清重放缓存再重算：否则 5 秒缓存里还可能留着“这单仍是 paid”的旧结果。
+        self.forget_entitlement(uid)
         self.recompute_entitlement(uid)
         self.forget_entitlement(uid)
         self.store.insert_order_event(
