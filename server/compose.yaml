@@ -93,15 +93,17 @@ services:
       ECHO_PAYMENT_PROVIDER: "${ECHO_PAYMENT_PROVIDER:-disabled}"
       ECHO_TRIAL_ENABLED: "${ECHO_TRIAL_ENABLED:-true}"
       ECHO_INVITE_REQUIRED: "${ECHO_INVITE_REQUIRED:-true}"
-      # 邮箱账号（2026-11-06，issue #15）：默认关；生产配好 SMTP/域名后再开。
-      # 密码**只**从环境变量或只读挂载文件读（不要写进这里/仓库/数据库）。
-      ECHO_EMAIL_ENABLED: "${ECHO_EMAIL_ENABLED:-false}"
-      ECHO_EMAIL_PROVIDER: "${ECHO_EMAIL_PROVIDER:-dev}"
-      ECHO_EMAIL_FROM: "${ECHO_EMAIL_FROM:-}"
-      ECHO_SMTP_HOST: "${ECHO_SMTP_HOST:-}"
+      # 邮箱账号（2026-11-06，issue #15）：官方发件/管理联系邮箱 nbz_echo@163.com。
+      # 默认启用官方 163 发信；没给授权码时发码/注册/重置明确 503，不会静默发信。
+      # 本地联调可显式 ECHO_EMAIL_PROVIDER=dev（验证码看日志）或 ECHO_EMAIL_ENABLED=0。
+      # 授权码只从环境变量/只读文件读；密码不写进这里/仓库/DB。
+      ECHO_EMAIL_ENABLED: "${ECHO_EMAIL_ENABLED:-true}"
+      ECHO_EMAIL_PROVIDER: "${ECHO_EMAIL_PROVIDER:-smtp}"
+      ECHO_EMAIL_FROM: "${ECHO_EMAIL_FROM:-nbz_echo@163.com}"
+      ECHO_SMTP_HOST: "${ECHO_SMTP_HOST:-smtp.163.com}"
       ECHO_SMTP_PORT: "${ECHO_SMTP_PORT:-465}"
       ECHO_SMTP_MODE: "${ECHO_SMTP_MODE:-ssl}"
-      ECHO_SMTP_USERNAME: "${ECHO_SMTP_USERNAME:-}"
+      ECHO_SMTP_USERNAME: "${ECHO_SMTP_USERNAME:-nbz_echo@163.com}"
       ECHO_SMTP_PASSWORD: "${ECHO_SMTP_PASSWORD:-}"
       ECHO_SMTP_PASSWORD_FILE: "${ECHO_SMTP_PASSWORD_FILE:-}"
       # ⚠️ **SenseVoice 还依赖一个"按模型名"加载的 VAD 模型**（`app/audio/stt.py:_get_sensevoice`
