@@ -1,7 +1,7 @@
 # 管理面重设计 · 设计稿（issue #16）
 
-> 目标分支 `integration/billing-vibepay`。设计已确认；`server/admin.html` / `server/admin.py`
-> 正在按本说明实现（见实现 PR）。静态稿仍保留，用于对照设计意图。
+> 目标分支 `integration/billing-vibepay`。设计已确认并实现（PR #18，base 已含 #15/PR #17
+> @ `829d585`）。静态稿仍保留，用于对照设计意图；实机截图见 `evidence/`。
 
 - [设计说明（信息架构 / 页面 / 后端改动 / 测试与证据）](./01-设计说明.md)
 - [静态设计稿（可直接用浏览器打开，hash 切页）](./mockup.html)
