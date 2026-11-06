@@ -156,6 +156,11 @@ class CatalogTests(_BillingCase):
         self.assertEqual(monthly["maxConcurrent"], 1)
         self.assertIn("trial", plans)
         self.assertIn("internal", plans)
+        # 官网按 `purchasable` 决定是否显示「立即购买」：付费套餐可下单，
+        # 试用/内部账号是邀请制（否则页面会出现一个点了就被 400 的按钮）。
+        self.assertTrue(monthly["purchasable"])
+        self.assertFalse(plans["trial"]["purchasable"])
+        self.assertFalse(plans["internal"]["purchasable"])
 
     def test_plans_are_not_exposed_when_billing_is_off(self):
         self.cfg.raw["billing"]["enabled"] = False
@@ -871,3 +876,117 @@ class PaymentUnitHardeningTests(unittest.TestCase):
         gw = payment_mod.AlipayGateway(cfg)
         self.assertEqual(gw.gateway, payment_mod.ALIPAY_SANDBOX_GATEWAY)
         self.assertIsInstance(gw.seller_id, str)
+
+
+class Phase3OrderFlowTests(_BillingCase):
+    """Phase 3：官网支付页用到的订单列表 / 主动 sync / 支付模式信息。"""
+
+    def _order(self, token, plan="monthly"):
+        r = self.client.post("/v1/billing/orders", json={"planCode": plan},
+                             headers=self.uh(token))
+        self.assertEqual(r.status_code, 200, r.text)
+        return r.json()
+
+    def test_plans_expose_payment_mode_without_secrets(self):
+        r = self.client.get("/v1/billing/plans")
+        self.assertEqual(r.status_code, 200, r.text)
+        data = r.json()
+        payment = data["payment"]
+        self.assertEqual(payment["provider"], "mock")
+        self.assertTrue(payment["configured"])
+        self.assertFalse(payment["sandbox"])
+        self.assertIn("serverTime", data)
+        self.assertNotIn(self.tmp, json.dumps(data), "套餐接口不能泄漏密钥/路径")
+
+    def test_order_view_carries_plan_name_days_amount_and_sandbox(self):
+        token = self.register()["userToken"]
+        order = self._order(token)
+        self.assertEqual(order["planName"], "月卡")
+        self.assertEqual(order["days"], 30)
+        self.assertEqual(order["amountCents"], 1000)
+        self.assertFalse(order["sandbox"])
+        self.assertTrue(order["payUrl"].startswith("mock://pay/"))
+        self.assertEqual(order["status"], "paying")
+
+    def test_sync_returns_the_current_order_for_a_paying_order(self):
+        token = self.register()["userToken"]
+        order = self._order(token)
+        r = self.client.post("/v1/billing/orders/%s/sync" % order["orderId"],
+                             headers=self.uh(token))
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertEqual(body["orderId"], order["orderId"])
+        self.assertEqual(body["status"], "paying")
+        self.assertEqual(body["amountCents"], 1000)
+
+    def test_sync_after_mock_payment_returns_paid(self):
+        token = self.register()["userToken"]
+        order = self._order(token)
+        r = self.client.post("/v1/billing/mock/pay/" + order["orderId"], json={})
+        self.assertEqual(r.status_code, 200, r.text)
+        r = self.client.post("/v1/billing/orders/%s/sync" % order["orderId"],
+                             headers=self.uh(token))
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["status"], "paid")
+
+    def test_sync_marks_a_paid_query_result_and_grants_entitlement(self):
+        token = self.register()["userToken"]
+        order = self._order(token)
+        fake = {
+            "status": "paid", "tradeNo": "mock-sync-trade",
+            "outTradeNo": order["orderId"], "amountCents": 1000,
+            "verified": True, "buyerId": "",
+        }
+        with patch.object(self.svc.gateway, "query", return_value=fake):
+            r = self.client.post("/v1/billing/orders/%s/sync" % order["orderId"],
+                                 headers=self.uh(token))
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["status"], "paid")
+        uid = self.store.user_by_employee_no("E001")["user_id"]
+        ent = self.store.entitlement(uid)
+        self.assertIsNotNone(ent)
+        self.assertEqual(ent["status"], "active")
+        self.assertGreater(float(ent["paid_until"]), time.time())
+
+    def test_sync_closes_an_order_when_alipay_says_trade_closed(self):
+        token = self.register()["userToken"]
+        order = self._order(token)
+        fake = {"status": "closed", "tradeNo": "mock-closed-trade",
+                "outTradeNo": order["orderId"], "amountCents": 1000,
+                "verified": True, "rawStatus": "TRADE_CLOSED"}
+        with patch.object(self.svc.gateway, "query", return_value=fake):
+            r = self.client.post("/v1/billing/orders/%s/sync" % order["orderId"],
+                                 headers=self.uh(token))
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["status"], "closed")
+        self.assertEqual(self.store.order(order["orderId"])["status"], "closed")
+
+    def test_sync_is_scoped_to_the_order_owner(self):
+        token = self.register("E001")["userToken"]
+        other = self.register("E002")["userToken"]
+        order = self._order(token)
+        r = self.client.post("/v1/billing/orders/%s/sync" % order["orderId"],
+                             headers=self.uh(other))
+        self.assertEqual(r.status_code, 404)
+        self.assertEqual(r.json()["code"], "order_not_found")
+
+    def test_orders_list_is_scoped_to_the_current_user_and_read_only(self):
+        token = self.register("E001")["userToken"]
+        other = self.register("E002")["userToken"]
+        first = self._order(token)
+        second = self._order(token)
+        third = self._order(other)
+        r = self.client.get("/v1/billing/orders", headers=self.uh(token))
+        self.assertEqual(r.status_code, 200, r.text)
+        rows = r.json()["orders"]
+        self.assertEqual({row["orderId"] for row in rows},
+                         {first["orderId"], second["orderId"]})
+        for row in rows:
+            self.assertNotIn("pairUrl", row, "列表是只读的，不能触发补发码")
+        r = self.client.get("/v1/billing/orders", headers=self.uh(other))
+        self.assertEqual([row["orderId"] for row in r.json()["orders"]],
+                         [third["orderId"]])
+
+    def test_orders_list_requires_a_user_token(self):
+        r = self.client.get("/v1/billing/orders")
+        self.assertEqual(r.status_code, 401)

@@ -1,24 +1,55 @@
-/* ECHO 签约用站点：套餐与订单渲染。
+/* ECHO 官网：账号、套餐下单、支付宝收银台与订单/权益。
  *
- * 套餐唯一来源是 assets/plans.json（与能力后端 server/billing.py 的 DEFAULT_PLANS 对齐）。
- * Phase 3 接入真实收银台时，把 PLANS_URL 改成同源 "/v1/billing/plans" 即可；
- * 返回结构里的 camelCase 字段与 plans.json 保持一致。
- *
- * 支付页只展示“等待支付”状态，不做支付结果判定，也不会自动跳转。
+ * 设计约束：
+ *  - 纯静态站点，无构建链；所有页面只引用站内资源。
+ *  - 金额、套餐名、订单号、订单状态、权益全部来自能力后端 `/v1/billing/*`；
+ *    页面不写死金额，也不使用静态二维码。
+ *  - 登录令牌存 localStorage（退出登录清除）；接口 401 时清掉并回登录页。
+ *  - 支付页用真实订单的 payUrl 跳转支付宝收银台，并轮询/主动 sync 订单状态；
+ *    不做自动跳转，不把“等待支付”当成功。
  */
 (function () {
   "use strict";
 
-  var PLANS_URL = "/assets/plans.json";
-  var page = document.body.getAttribute("data-page") || "";
+  var TOKEN_KEY = "echo.userToken";
+  var USER_KEY = "echo.user";
+  var PROFILE_KEY = "echo.userProfile";
+  var API_BASE = "";
+  var PLAN_NAMES = { monthly: "月卡", trial: "7 天试用", internal: "内部账号" };
   var plansCache = null;
+  var pollingTimer = null;
+  var pollingStartedAt = 0;
+  var currentOrder = null;
+  var syncInFlight = false;
+
+  var page = document.body.getAttribute("data-page") || "";
+  var metaApi = document.querySelector('meta[name="echo-api-base"]');
+  if (metaApi && metaApi.getAttribute("content")) {
+    API_BASE = String(metaApi.getAttribute("content")).replace(/\/+$/, "");
+  }
+
+  // ---------------------------------------------------------------- 基础工具
+
+  function $(id) {
+    return document.getElementById(id);
+  }
+
+  function qsa(selector, root) {
+    return Array.prototype.slice.call((root || document).querySelectorAll(selector));
+  }
 
   function esc(value) {
     return String(value == null ? "" : value)
       .replace(/&/g, "&amp;")
       .replace(/</g, "&lt;")
       .replace(/>/g, "&gt;")
-      .replace(/"/g, "&quot;");
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
+  }
+
+  function setText(id, text) {
+    var node = $(id);
+    if (node) node.textContent = String(text == null ? "" : text);
   }
 
   function money(cents, forceCents) {
@@ -39,31 +70,191 @@
     return String(n);
   }
 
-  function fail(message) {
-    var box = document.getElementById("planCards") || document.getElementById("payLayout");
-    if (box) {
-      box.innerHTML = '<p class="load-error">' + esc(message) + "</p>";
+  function formatDate(seconds) {
+    var ts = Number(seconds) || 0;
+    if (!ts) return "—";
+    try {
+      return new Intl.DateTimeFormat("zh-CN", {
+        timeZone: "Asia/Shanghai", year: "numeric", month: "2-digit", day: "2-digit"
+      }).format(new Date(ts * 1000));
+    } catch (err) {
+      return new Date(ts * 1000).toLocaleDateString();
     }
+  }
+
+  function formatDateTime(seconds) {
+    var ts = Number(seconds) || 0;
+    if (!ts) return "—";
+    try {
+      return new Intl.DateTimeFormat("zh-CN", {
+        timeZone: "Asia/Shanghai", year: "numeric", month: "2-digit", day: "2-digit",
+        hour: "2-digit", minute: "2-digit", hour12: false
+      }).format(new Date(ts * 1000));
+    } catch (err) {
+      return new Date(ts * 1000).toLocaleString();
+    }
+  }
+
+  function planName(code) {
+    return PLAN_NAMES[String(code || "")] || String(code || "套餐");
+  }
+
+  function showToast(message) {
+    var toast = $("toast");
+    if (!toast) return;
+    toast.textContent = String(message || "");
+    toast.classList.add("show");
+    window.clearTimeout(showToast._timer);
+    showToast._timer = window.setTimeout(function () {
+      toast.classList.remove("show");
+    }, 3600);
+  }
+
+  function markReady() {
+    document.documentElement.setAttribute("data-ready", "1");
+  }
+
+  function markError() {
     document.documentElement.setAttribute("data-ready", "error");
   }
 
+  function currentUrl() {
+    return window.location.pathname + window.location.search;
+  }
+
+  // ---------------------------------------------------------------- 令牌
+
+  function loadToken() {
+    try {
+      return window.localStorage.getItem(TOKEN_KEY) || "";
+    } catch (err) {
+      return "";
+    }
+  }
+
+  function loadUser() {
+    try {
+      var raw = window.localStorage.getItem(USER_KEY);
+      return raw ? JSON.parse(raw) : null;
+    } catch (err) {
+      return null;
+    }
+  }
+
+  function saveSession(data) {
+    try {
+      if (data && data.userToken) window.localStorage.setItem(TOKEN_KEY, data.userToken);
+      var user = (data && data.user) || (data && data.userId ? {
+        userId: data.userId, name: (data.user && data.user.name) || "",
+        employeeNo: (data.user && data.user.employeeNo) || ""
+      } : null);
+      if (user) window.localStorage.setItem(USER_KEY, JSON.stringify(user));
+      if (data && data.user) window.localStorage.setItem(PROFILE_KEY, JSON.stringify(data.user));
+    } catch (err) { /* 隐私模式写不了就只保留内存态 —— 页面照常工作 */ }
+  }
+
+  function clearSession() {
+    try {
+      window.localStorage.removeItem(TOKEN_KEY);
+      window.localStorage.removeItem(USER_KEY);
+      window.localStorage.removeItem(PROFILE_KEY);
+    } catch (err) { /* ignore */ }
+  }
+
+  function safeNext(raw) {
+    var value = String(raw || "");
+    if (!value || value.charAt(0) !== "/" || value.charAt(1) === "/") return "";
+    // 反斜杠会被浏览器当成 `/`（`/\\evil.com` → `//evil.com`）：登录回跳只允许站内路径。
+    if (value.indexOf("\\") >= 0 || value.indexOf("\n") >= 0 ||
+        value.indexOf("\r") >= 0) return "";
+    return value;
+  }
+
+  function redirectToLogin(next) {
+    var target = safeNext(next || currentUrl()) || "/account";
+    window.location.assign("/account?next=" + encodeURIComponent(target));
+  }
+
+  function updateAccountCta() {
+    var signedIn = !!loadToken();
+    qsa("[data-account-cta]").forEach(function (node) {
+      node.textContent = signedIn ? "我的账户" : "登录 / 注册";
+    });
+  }
+
+  // ---------------------------------------------------------------- API
+
+  function api(path, options) {
+    var opts = options || {};
+    var headers = { Accept: "application/json" };
+    var token = loadToken();
+    if (token && opts.auth !== false) headers.Authorization = "Bearer " + token;
+    var init = { method: opts.method || "GET", headers: headers, cache: "no-store" };
+    if (opts.body !== undefined) {
+      headers["Content-Type"] = "application/json";
+      init.body = JSON.stringify(opts.body);
+    }
+    return fetch(API_BASE + path, init).then(function (resp) {
+      return resp.text().then(function (text) {
+        var data = null;
+        if (text) {
+          try { data = JSON.parse(text); } catch (err) { data = null; }
+        }
+        if (!resp.ok) {
+          var error = new Error(
+            (data && (data.detail || data.message)) || ("请求失败（HTTP " + resp.status + "）"));
+          error.status = resp.status;
+          error.code = (data && data.code) || "";
+          error.detail = (data && data.detail) || "";
+          throw error;
+        }
+        return data == null ? {} : data;
+      });
+    });
+  }
+
+  function explainError(err) {
+    if (!err) return "未知错误";
+    if (err.code === "payment_unconfigured") return "在线支付暂时不可用，请稍后再试。";
+    if (err.code === "payment_gateway_error") return "支付网关暂时不可用，请稍后刷新重试。";
+    if (err.code === "order_not_found") return "订单不存在，或不属于当前登录账号。";
+    if (err.code === "order_state_conflict") return "订单状态已变化，请刷新页面。";
+    if (err.status === 401) return "登录已失效，请重新登录。";
+    return err.message || err.detail || "请求失败，请稍后重试。";
+  }
+
+  // ---------------------------------------------------------------- 套餐
+
   function loadPlans() {
     if (plansCache) return Promise.resolve(plansCache);
-    return fetch(PLANS_URL, { cache: "no-store" })
-      .then(function (resp) {
-        if (!resp.ok) throw new Error("HTTP " + resp.status);
-        return resp.json();
-      })
+    return api("/v1/billing/plans", { auth: false })
       .then(function (data) {
-        if (!data || !Array.isArray(data.plans)) throw new Error("plans 字段缺失");
+        if (!data || !Array.isArray(data.plans)) throw new Error("套餐数据不完整");
         plansCache = data;
         return data;
+      })
+      .catch(function (err) {
+        // 静态预览（没有后端）时回退到站内 plans.json 仅供展示；
+        // 下单仍会打真实接口，失败时给明确提示。
+        return fetch("/assets/plans.json", { cache: "no-store" })
+          .then(function (resp) {
+            if (!resp.ok) throw err;
+            return resp.json();
+          })
+          .then(function (data) {
+            if (!data || !Array.isArray(data.plans)) throw err;
+            data.fallback = true;
+            data.payment = { provider: "", configured: false, sandbox: false };
+            plansCache = data;
+            return data;
+          });
       });
   }
 
   function planOf(data, code) {
-    for (var i = 0; i < data.plans.length; i += 1) {
-      if (data.plans[i].code === code) return data.plans[i];
+    var list = (data && data.plans) || [];
+    for (var i = 0; i < list.length; i += 1) {
+      if (list[i].code === code) return list[i];
     }
     return null;
   }
@@ -84,17 +275,25 @@
     }).join("");
   }
 
+  function planAction(plan) {
+    if (!plan.purchasable) {
+      return '<div class="plan-note">试用为邀请制开通，请联系管理员开启，不在本页直接下单。</div>';
+    }
+    return '<div class="plan-action">' +
+      '<button type="button" class="btn btn-primary btn-lg btn-block" data-buy="' +
+      esc(plan.code) + '">立即购买</button></div>' +
+      '<p class="plan-hint">登录后下单；支付由支付宝提供，金额以收银台为准。</p>';
+  }
+
   function renderPricing(data) {
-    var mount = document.getElementById("planCards");
+    var mount = $("planCards");
     if (!mount) return;
     var monthly = planOf(data, "monthly");
     var trial = planOf(data, "trial");
     if (!monthly) {
-      fail("套餐数据不完整：缺少 monthly。");
-      return;
+      throw new Error("套餐数据不完整：缺少 monthly。");
     }
-    var html = "";
-    html += '<article class="plan plan-main">' +
+    var html = '<article class="plan plan-main">' +
       '<div class="plan-head"><h2>' + esc(monthly.name) + "</h2>" +
       (monthly.badge ? '<span class="badge-inline">' + esc(monthly.badge) + "</span>" : "") +
       "</div>" +
@@ -103,10 +302,7 @@
       '<span class="per">/ ' + esc(monthly.days) + " 天</span></div>" +
       '<p class="plan-sub">适合日常会议与语音指令的重度使用。</p>' +
       '<ul class="plan-list">' + listItems(monthly) + "</ul>" +
-      '<div class="plan-action">' +
-      '<a class="btn btn-primary btn-lg btn-block" href="/pay?plan=' + encodeURIComponent(monthly.code) + '">立即购买</a>' +
-      "</div>" +
-      '<p class="plan-hint">支付由支付宝 Vibe Pay 提供，金额以收银台为准。</p>' +
+      planAction(monthly) +
       "</article>";
 
     if (trial) {
@@ -119,94 +315,726 @@
         '<span class="per">/ ' + esc(trial.days) + " 天</span></div>" +
         '<p class="plan-sub">先用完整额度体验，再决定是否续费。</p>' +
         '<ul class="plan-list">' + listItems(trial) + "</ul>" +
-        '<div class="plan-note">试用为邀请制开通，请联系管理员开启，不在本页直接下单。</div>' +
+        planAction(trial) +
         "</article>";
     }
 
+    var payment = data.payment || {};
+    if (payment.provider && payment.configured === false) {
+      html += '<p class="plan-hint pricing-payment-note">在线支付暂时不可用，请稍后再试或联系管理员。</p>';
+    }
     mount.innerHTML = html;
     mount.setAttribute("aria-busy", "false");
     document.documentElement.setAttribute("data-ready", "1");
   }
 
-  function renderOrder(data) {
-    var layout = document.getElementById("payLayout");
-    if (!layout) return;
-    var code = "";
-    try {
-      code = new URLSearchParams(window.location.search).get("plan") || "monthly";
-    } catch (err) {
-      code = "monthly";
-    }
-    var plan = planOf(data, code);
-    if (!plan) {
-      plan = planOf(data, "monthly");
-      var warning = document.getElementById("planWarning");
-      if (warning) {
-        warning.hidden = false;
-        warning.textContent = "没有找到套餐「" + code + "」，当前显示月卡示例。";
-      }
-    }
-    if (!plan) {
-      fail("套餐数据不完整：缺少 monthly。");
+  function buyPlan(code, button) {
+    if (!loadToken()) {
+      redirectToLogin(currentUrl());
       return;
     }
-
-    function set(id, text) {
-      var node = document.getElementById(id);
-      if (node) node.textContent = text;
+    var original = button ? button.textContent : "";
+    if (button) {
+      button.disabled = true;
+      button.textContent = "正在创建订单…";
     }
-    set("orderPlan", plan.name);
-    set("orderDays", plan.days + " 天（支付成功后起算）");
-    set("orderPrice", money(plan.priceCents, true));
-    set("payAmount", money(plan.priceCents, true));
-    set("orderId", "ord-demo-" + plan.code);
-    var qr = document.getElementById("payQr");
-    if (qr) qr.setAttribute("alt", "沙箱二维码占位：" + plan.name + " " + money(plan.priceCents, true));
-    layout.setAttribute("aria-busy", "false");
-    document.documentElement.setAttribute("data-ready", "1");
+    api("/v1/billing/orders", { method: "POST", body: { planCode: code } })
+      .then(function (order) {
+        if (!order || !order.orderId) throw new Error("下单响应缺少订单号");
+        window.location.assign("/pay?order=" + encodeURIComponent(order.orderId));
+      })
+      .catch(function (err) {
+        if (err.status === 401) {
+          clearSession();
+          redirectToLogin(currentUrl());
+          return;
+        }
+        showToast(explainError(err));
+        if (button) {
+          button.disabled = false;
+          button.textContent = original;
+        }
+      });
   }
 
-  function showToast(message) {
-    var toast = document.getElementById("toast");
-    if (!toast) return;
-    toast.textContent = message;
-    toast.classList.add("show");
-    window.clearTimeout(showToast._timer);
-    showToast._timer = window.setTimeout(function () {
-      toast.classList.remove("show");
-    }, 3200);
-  }
-
-  function initConsoleButtons() {
-    var buttons = document.querySelectorAll("[data-console]");
-    for (var i = 0; i < buttons.length; i += 1) {
-      buttons[i].addEventListener("click", function () {
-        showToast("内测阶段：请在 ECHO 桌面客户端中进入控制台。");
+  function initPricing() {
+    var mount = $("planCards");
+    loadPlans().then(renderPricing).catch(function (err) {
+      if (mount) {
+        mount.innerHTML = '<p class="load-error">套餐加载失败：' + esc(explainError(err)) +
+          ' <button type="button" class="btn btn-ghost btn-sm" id="retryPlans">重试</button></p>';
+        var retry = $("retryPlans");
+        if (retry) retry.addEventListener("click", function () { window.location.reload(); });
+      }
+      markError();
+    });
+    if (mount) {
+      mount.addEventListener("click", function (event) {
+        var button = event.target.closest ? event.target.closest("[data-buy]") : null;
+        if (!button) return;
+        buyPlan(button.getAttribute("data-buy"), button);
       });
     }
   }
 
-  function initRefresh() {
-    var button = document.getElementById("refreshOrder");
-    if (!button) return;
-    button.addEventListener("click", function () {
-      showToast("示例页面：订单状态需接入真实收银台后查询。");
+  // ---------------------------------------------------------------- 支付页
+
+  function parseOrderId() {
+    var params;
+    try {
+      params = new URLSearchParams(window.location.search);
+    } catch (err) {
+      return "";
+    }
+    return String(params.get("order") || params.get("out_trade_no") || "").trim();
+  }
+
+  function stopPolling() {
+    if (pollingTimer) {
+      window.clearInterval(pollingTimer);
+      pollingTimer = null;
+    }
+  }
+
+  function startPolling(orderId) {
+    if (pollingTimer) return;
+    pollingStartedAt = Date.now();
+    pollingTimer = window.setInterval(function () {
+      if (Date.now() - pollingStartedAt > 5 * 60 * 1000) {
+        stopPolling();
+        setText("payStatusText", "支付结果暂未确认，可稍后点“刷新订单状态”。");
+        return;
+      }
+      if (syncInFlight) return;
+      api("/v1/billing/orders/" + encodeURIComponent(orderId))
+        .then(handleOrderData)
+        .catch(function (err) {
+          if (err.status === 401) {
+            clearSession();
+            redirectToLogin(currentUrl());
+          }
+        });
+    }, 3000);
+  }
+
+  function setStatusTag(text, kind) {
+    var tag = $("payStatusTag");
+    var orderTag = $("orderStatusTag");
+    if (tag) {
+      tag.textContent = text;
+      tag.className = "tag" + (kind ? " tag-" + kind : "");
+    }
+    if (orderTag) {
+      orderTag.textContent = text;
+      orderTag.className = "tag tag-muted" + (kind ? " tag-" + kind : "");
+    }
+  }
+
+  function statusText(status) {
+    switch (String(status || "")) {
+      case "created": return "待支付";
+      case "paying": return "等待支付";
+      case "paid": return "已支付";
+      case "refunded": return "已退款";
+      case "closed": return "已关闭";
+      default: return "未知状态";
+    }
+  }
+
+  function safePayUrl(url) {
+    var value = String(url || "");
+    return /^(https?:\/\/|mock:\/\/)/i.test(value) ? value : "";
+  }
+
+  function renderWaiting(order) {
+    var waiting = $("payWaiting");
+    var result = $("payResult");
+    if (waiting) waiting.hidden = false;
+    if (result) result.hidden = true;
+    var payUrl = safePayUrl(order.payUrl);
+    var open = $("openCashier");
+    var copy = $("copyPayUrl");
+    var missing = $("cashierMissing");
+    if (open) {
+      open.hidden = !payUrl;
+      open.setAttribute("href", payUrl || "#");
+      open.setAttribute("aria-disabled", payUrl ? "false" : "true");
+    }
+    if (copy) copy.hidden = !payUrl;
+    if (missing) missing.hidden = !!payUrl;
+    var expired = Number(order.expiresAt || 0) * 1000 > 0 &&
+      Date.now() > Number(order.expiresAt) * 1000;
+    setText("payStatusText", expired
+      ? "订单已超过支付时限，请刷新或重新下单。"
+      : (order.payUrl ? "等待支付 · 支付成功后自动更新" : "等待支付 · 暂无收银台链接"));
+    setStatusTag(expired ? "已超时" : statusText(order.status), expired ? "warn" : "");
+    if (expired) stopPolling();
+  }
+
+  function resultRows(rows) {
+    return rows.map(function (row) {
+      return '<div class="order-row"><span>' + esc(row[0]) + "</span><span>" +
+        esc(row[1]) + "</span></div>";
+    }).join("");
+  }
+
+  function button(label, className, attrs) {
+    return '<button type="button" class="' + className + '" ' + (attrs || "") + ">" +
+      esc(label) + "</button>";
+  }
+
+  function renderResult(order, kind, entitlement) {
+    var waiting = $("payWaiting");
+    var result = $("payResult");
+    if (waiting) waiting.hidden = true;
+    if (result) result.hidden = false;
+    var card = $("resultCard");
+    var icon = $("resultIcon");
+    var title = $("resultTitle");
+    var message = $("resultMessage");
+    var rows = $("resultRows");
+    var actions = $("resultActions");
+    if (card) card.className = "result-card result-" + kind;
+    var iconId = kind === "paid" ? "icon-check"
+      : (kind === "closed" || kind === "timeout" || kind === "error"
+        ? "icon-alert" : "icon-shield");
+    if (icon) icon.innerHTML = '<svg><use href="/assets/icons.svg#' + iconId + '"></use></svg>';
+    if (title) title.textContent = kind === "paid" ? "支付成功"
+      : (kind === "refunded" ? "订单已退款"
+        : (kind === "closed" ? "订单已关闭"
+          : (kind === "timeout" ? "订单已超时" : "订单读取失败")));
+    if (message) {
+      message.textContent = kind === "paid"
+        ? "权益已开通，可在“我的账户”查看到期时间与剩余额度。"
+        : (kind === "refunded"
+          ? "退款已处理，权益按剩余未退款订单重新计算。"
+          : (kind === "closed"
+            ? "这笔订单没有完成支付，已关闭。可以重新选择套餐下单。"
+            : (kind === "timeout"
+              ? "这笔订单已超过支付时限，不会再入账。请重新下单。"
+              : "暂时无法读取订单，请稍后重试。")));
+    }
+    var orderRows = [
+      ["订单号", order && order.orderId ? order.orderId : "—"],
+      ["套餐", planName(order && order.planCode)],
+      ["金额", money(order && order.amountCents, true)]
+    ];
+    if (kind === "paid") {
+      orderRows.push(["支付时间", formatDateTime(order.paidAt)]);
+      if (entitlement) {
+        orderRows.push(["到期时间", entitlement.paidUntil > 0
+          ? formatDate(entitlement.paidUntil) : "长期有效"]);
+        orderRows.push(["今日剩余转写", (entitlement.dailyMinutesLeft || 0) + " / " +
+          (entitlement.dailyMinutes || 0) + " 分钟"]);
+        orderRows.push(["今日剩余 TTS", Number(entitlement.ttsCharsLeft || 0).toLocaleString() +
+          " 字符"]);
+      }
+    }
+    if (rows) rows.innerHTML = resultRows(orderRows).replace(
+      /class="order-row"/g, 'class="order-row result-row"');
+    if (actions) {
+      if (kind === "paid") {
+        actions.innerHTML = '<a class="btn btn-primary btn-block" href="/account">查看我的权益</a>' +
+          '<a class="btn btn-ghost btn-block" href="/pricing">续费</a>';
+      } else if (kind === "refunded") {
+        actions.innerHTML = '<a class="btn btn-primary btn-block" href="/account">查看我的权益</a>' +
+          '<a class="btn btn-ghost btn-block" href="/pricing">再次购买</a>';
+      } else if (kind === "closed") {
+        actions.innerHTML = '<a class="btn btn-primary btn-block" href="/pricing">重新购买</a>' +
+          '<a class="btn btn-ghost btn-block" href="/account">返回我的账户</a>';
+      } else if (kind === "timeout") {
+        actions.innerHTML = '<a class="btn btn-primary btn-block" href="/pricing">重新购买</a>' +
+          '<button type="button" class="btn btn-ghost btn-block" id="retryTimeout">刷新订单状态</button>';
+        var retryTimeout = $("retryTimeout");
+        if (retryTimeout) {
+          retryTimeout.addEventListener("click", function () {
+            syncOrder(order && order.orderId);
+          });
+        }
+      } else {
+        actions.innerHTML = '<button type="button" class="btn btn-primary btn-block" id="retryOrder">重试</button>' +
+          '<a class="btn btn-ghost btn-block" href="/pricing">返回套餐页</a>';
+        var retry = $("retryOrder");
+        if (retry) retry.addEventListener("click", function () { window.location.reload(); });
+      }
+    }
+    if (kind === "paid" || kind === "refunded" || kind === "closed" ||
+        kind === "timeout") stopPolling();
+  }
+
+  function handleOrderData(order) {
+    if (!order || !order.orderId) throw new Error("订单数据不完整");
+    currentOrder = order;
+    var layout = $("payLayout");
+    if (layout) layout.hidden = false;
+    var loading = $("payLoading");
+    if (loading) loading.hidden = true;
+    var error = $("payError");
+    if (error) error.hidden = true;
+
+    setText("orderPlan", planName(order.planCode));
+    setText("orderDays", Number(order.days || 0) > 0
+      ? order.days + " 天（支付成功后起算）" : "长期有效");
+    setText("orderId", order.orderId);
+    setText("orderCreated", formatDateTime(order.createdAt));
+    setText("orderPrice", money(order.amountCents, true));
+
+    var notice = $("testNotice");
+    if (notice) notice.hidden = !order.sandbox;
+
+    var status = String(order.status || "");
+    if (status === "paid") {
+      setStatusTag(statusText(status), "ok");
+      renderResult(order, "paid", null);
+      markReady();
+      api("/v1/billing/entitlement").then(function (ent) {
+        if (ent) renderResult(order, "paid", ent);
+      }).catch(function () { /* 权益读取失败不影响"已支付"这个事实 */ });
+      return;
+    }
+    if (status === "refunded") {
+      setStatusTag(statusText(status), "muted");
+      renderResult(order, "refunded");
+      markReady();
+      return;
+    }
+    if (status === "closed") {
+      setStatusTag(statusText(status), "warn");
+      renderResult(order, "closed");
+      markReady();
+      return;
+    }
+    var expiresAt = Number(order.expiresAt || 0) * 1000;
+    if ((status === "created" || status === "paying") &&
+        expiresAt > 0 && Date.now() > expiresAt) {
+      setStatusTag("已超时", "warn");
+      renderResult(order, "timeout");
+      markReady();
+      return;
+    }
+    renderWaiting(order);
+    startPolling(order.orderId);
+    markReady();
+  }
+
+  function syncOrder(orderId) {
+    if (!orderId || syncInFlight) return Promise.resolve();
+    syncInFlight = true;
+    var button = $("refreshOrder");
+    var original = button ? button.textContent : "";
+    if (button) {
+      button.disabled = true;
+      button.textContent = "正在查询…";
+    }
+    return api("/v1/billing/orders/" + encodeURIComponent(orderId) + "/sync",
+      { method: "POST", body: {} })
+      .then(handleOrderData)
+      .catch(function (err) {
+        if (err.status === 401) {
+          clearSession();
+          redirectToLogin(currentUrl());
+          return;
+        }
+        showToast(explainError(err));
+      })
+      .then(function () {
+        syncInFlight = false;
+        if (button) {
+          button.disabled = false;
+          button.textContent = original;
+        }
+      });
+  }
+
+  function showPayError(err) {
+    var loading = $("payLoading");
+    if (loading) loading.hidden = true;
+    var box = $("payError");
+    if (box) {
+      box.hidden = false;
+      box.innerHTML = esc(explainError(err)) +
+        ' <a href="/pricing">返回套餐页重新下单</a>';
+    }
+    markError();
+  }
+
+  function initPay() {
+    var orderId = parseOrderId();
+    if (!orderId) {
+      showPayError({ message: "链接里没有订单号，请从套餐页购买。" });
+      return;
+    }
+    if (!loadToken()) {
+      redirectToLogin(currentUrl());
+      return;
+    }
+    api("/v1/billing/orders/" + encodeURIComponent(orderId))
+      .then(function (order) {
+        handleOrderData(order);
+        if (order && (order.status === "created" || order.status === "paying")) {
+          syncOrder(orderId);
+        }
+      })
+      .catch(showPayError);
+
+    var refresh = $("refreshOrder");
+    if (refresh) refresh.addEventListener("click", function () { syncOrder(orderId); });
+    var cancel = $("cancelOrder");
+    if (cancel) {
+      cancel.addEventListener("click", function () {
+        if (!window.confirm("取消这笔订单？取消后需要重新下单。")) return;
+        api("/v1/billing/orders/" + encodeURIComponent(orderId) + "/cancel",
+          { method: "POST", body: {} })
+          .then(function () { return api("/v1/billing/orders/" + encodeURIComponent(orderId)); })
+          .then(handleOrderData)
+          .catch(function (err) { showToast(explainError(err)); });
+      });
+    }
+    var copy = $("copyPayUrl");
+    if (copy) {
+      copy.addEventListener("click", function () {
+        var payUrl = safePayUrl(currentOrder && currentOrder.payUrl);
+        if (!payUrl) return;
+        copyText(payUrl);
+      });
+    }
+    document.addEventListener("visibilitychange", function () {
+      if (document.visibilityState === "visible" && currentOrder &&
+          (currentOrder.status === "created" || currentOrder.status === "paying")) {
+        syncOrder(currentOrder.orderId);
+      }
+    });
+    window.addEventListener("pageshow", function () {
+      if (currentOrder &&
+          (currentOrder.status === "created" || currentOrder.status === "paying")) {
+        syncOrder(currentOrder.orderId);
+      }
     });
   }
 
-  function boot() {
-    initConsoleButtons();
-    initRefresh();
-    if (page !== "pricing" && page !== "pay") {
-      document.documentElement.setAttribute("data-ready", "1");
+  function copyText(text) {
+    function fallback() {
+      var area = document.createElement("textarea");
+      area.value = text;
+      area.setAttribute("readonly", "");
+      area.style.position = "fixed";
+      area.style.opacity = "0";
+      document.body.appendChild(area);
+      area.select();
+      try { document.execCommand("copy"); } catch (err) { /* ignore */ }
+      document.body.removeChild(area);
+      showToast("支付链接已复制");
+    }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(function () {
+        showToast("支付链接已复制");
+      }).catch(fallback);
+    } else {
+      fallback();
+    }
+  }
+
+  // ---------------------------------------------------------------- 账户页
+
+  var authMode = "login";
+
+  function setAuthMode(mode) {
+    authMode = mode === "register" ? "register" : "login";
+    qsa("[data-auth-tab]").forEach(function (tab) {
+      var active = tab.getAttribute("data-auth-tab") === authMode;
+      tab.classList.toggle("is-active", active);
+      tab.setAttribute("aria-selected", active ? "true" : "false");
+    });
+    var nameRow = $("fieldNameRow");
+    var phoneRow = $("fieldPhoneRow");
+    if (nameRow) nameRow.hidden = authMode !== "register";
+    if (phoneRow) phoneRow.hidden = authMode !== "register";
+    var submit = $("authSubmit");
+    if (submit) {
+      submit.disabled = false;
+      submit.textContent = authMode === "register" ? "注册并登录" : "登录";
+    }
+    var note = $("authNote");
+    if (note) {
+      note.textContent = authMode === "register"
+        ? "首次使用：填写邀请码、姓名与工号，注册后自动登录。"
+        : "已有账号？填写工号与邀请码登录。";
+    }
+    showAuthError("");
+  }
+
+  function showAuthError(message) {
+    var box = $("authError");
+    if (!box) return;
+    box.hidden = !message;
+    box.textContent = message || "";
+  }
+
+  function showAuth() {
+    var auth = $("authView");
+    var dash = $("dashboardView");
+    var loading = $("accountLoading");
+    if (loading) loading.hidden = true;
+    if (auth) auth.hidden = false;
+    if (dash) dash.hidden = true;
+    var layout = $("accountLayout");
+    if (layout) layout.hidden = false;
+    setText("accountTitle", "登录 / 注册");
+    setText("accountLead", "用邀请码与工号登录，查看套餐权益、到期时间和最近订单。");
+    setText("accountCrumb", "登录 / 注册");
+    var form = $("authForm");
+    if (form) form.reset();
+    setAuthMode("login");
+    markReady();
+  }
+
+  function showDashboard() {
+    var auth = $("authView");
+    var dash = $("dashboardView");
+    var loading = $("accountLoading");
+    if (loading) loading.hidden = true;
+    if (auth) auth.hidden = true;
+    if (dash) dash.hidden = false;
+    var layout = $("accountLayout");
+    if (layout) layout.hidden = false;
+    setText("accountTitle", "我的账户");
+    setText("accountLead", "查看当前权益、到期时间与最近订单。");
+    setText("accountCrumb", "我的账户");
+    markReady();
+  }
+
+  function entitlementStatusLabel(status) {
+    switch (String(status || "none")) {
+      case "active": return "有效";
+      case "expired": return "已到期";
+      case "refunded": return "已退款";
+      case "frozen": return "已冻结";
+      case "inactive": return "已停用";
+      default: return "未开通";
+    }
+  }
+
+  function statusClass(status) {
+    switch (String(status || "")) {
+      case "active": case "paid": return "ok";
+      case "expired": case "closed": case "frozen": return "warn";
+      case "refunded": case "inactive": return "muted";
+      default: return "muted";
+    }
+  }
+
+  function renderMe(me) {
+    var user = (me && me.user) || {};
+    var ent = (me && me.entitlement) || {};
+    var name = user.name || (loadUser() && loadUser().name) || "ECHO 用户";
+    var employeeNo = user.employeeNo || "";
+    setText("profileName", name);
+    setText("profileMeta", employeeNo ? "工号：" + employeeNo : "已登录");
+    var avatar = $("profileAvatar");
+    if (avatar) avatar.textContent = String(name).slice(0, 1) || "E";
+    var status = String(ent.status || "none");
+    setText("entitlementStatus", entitlementStatusLabel(status));
+    var entTag = $("entitlementStatus");
+    if (entTag) entTag.className = "tag tag-" + statusClass(status);
+    setText("entitlementPlan", status === "none"
+      ? "尚未开通套餐"
+      : ((ent.planName || planName(ent.plan)) + (status === "active" ? " · 使用中" : "")));
+    setText("entitlementExpiry", Number(ent.paidUntil || 0) > 0
+      ? formatDate(ent.paidUntil) : (status === "active" ? "长期有效" : "—"));
+    setText("entitlementMinutes", (ent.dailyMinutesLeft == null ? 0 : ent.dailyMinutesLeft) +
+      " / " + (ent.dailyMinutes == null ? 0 : ent.dailyMinutes) + " 分钟");
+    setText("entitlementTts", Number(ent.ttsCharsLeft || 0).toLocaleString() + " 字符");
+    setText("entitlementQps", (ent.qps || 0) + " QPS · 并发 " + (ent.maxConcurrent || 0));
+    setText("entitlementDevices", (ent.devices || 0) + " / " + (ent.maxDevices || 0) + " 台");
+
+    var actions = $("entitlementActions");
+    if (actions) {
+      var primary = status === "none" || status === "expired" || status === "refunded" ||
+        status === "frozen" || status === "inactive";
+      actions.innerHTML = primary
+        ? '<a class="btn btn-primary" href="/pricing">购买 / 续费</a>' +
+          '<a class="btn btn-ghost" href="/download">下载客户端</a>'
+        : '<a class="btn btn-primary" href="/pricing">续费</a>' +
+          '<a class="btn btn-ghost" href="/download">下载客户端</a>';
+    }
+  }
+
+  function orderStatusLabel(status) {
+    return statusText(status);
+  }
+
+  function renderOrders(orders) {
+    var list = $("ordersList");
+    var empty = $("ordersEmpty");
+    if (!list) return;
+    var rows = Array.isArray(orders) ? orders : [];
+    if (!rows.length) {
+      list.innerHTML = "";
+      list.setAttribute("aria-busy", "false");
+      if (empty) empty.hidden = false;
       return;
     }
-    loadPlans().then(function (data) {
-      if (page === "pricing") renderPricing(data);
-      if (page === "pay") renderOrder(data);
-    }).catch(function (err) {
-      fail("套餐数据加载失败（" + (err && err.message ? err.message : "未知错误") + "），请刷新页面。");
+    if (empty) empty.hidden = true;
+    list.innerHTML = rows.map(function (order) {
+      var status = String(order.status || "");
+      var tagClass = statusClass(status);
+      var action = "";
+      if (status === "paying" || status === "created") {
+        action = '<a class="order-link" href="/pay?order=' +
+          encodeURIComponent(order.orderId) + '">继续支付</a>';
+      } else if (status === "paid" || status === "refunded") {
+        action = '<a class="order-link" href="/pay?order=' +
+          encodeURIComponent(order.orderId) + '">查看</a>';
+      } else if (status === "closed") {
+        action = '<a class="order-link" href="/pricing">重新购买</a>';
+      }
+      return '<article class="order-item">' +
+        '<div class="order-item-main">' +
+        '<div class="order-item-title">' + esc(planName(order.planCode)) +
+        '<span class="tag tag-' + tagClass + '">' + esc(orderStatusLabel(status)) + "</span></div>" +
+        '<div class="order-item-meta">' + esc(formatDateTime(order.createdAt)) +
+        " · " + esc(order.orderId) + "</div></div>" +
+        '<div class="order-item-side"><strong>' + esc(money(order.amountCents, true)) +
+        "</strong>" + action + "</div>" +
+        "</article>";
+    }).join("");
+    list.setAttribute("aria-busy", "false");
+  }
+
+  function loadAccountData() {
+    return Promise.all([
+      api("/v1/account/me"),
+      api("/v1/billing/orders").catch(function (err) {
+        if (err.status === 401) throw err;
+        return { orders: [] };
+      })
+    ]).then(function (results) {
+      var me = results[0];
+      renderMe(me);
+      renderOrders(results[1] && results[1].orders);
+      showDashboard();
     });
+  }
+
+  function initAccount() {
+    var next = "";
+    try {
+      next = safeNext(new URLSearchParams(window.location.search).get("next"));
+    } catch (err) { next = ""; }
+
+    qsa("[data-auth-tab]").forEach(function (tab) {
+      tab.addEventListener("click", function () {
+        setAuthMode(tab.getAttribute("data-auth-tab"));
+      });
+    });
+
+    var form = $("authForm");
+    if (form) {
+      form.addEventListener("submit", function (event) {
+        event.preventDefault();
+        var employeeNo = ($("authEmployeeNo") && $("authEmployeeNo").value || "").trim();
+        var inviteCode = ($("authInviteCode") && $("authInviteCode").value || "").trim();
+        var name = ($("authName") && $("authName").value || "").trim();
+        var phone = ($("authPhone") && $("authPhone").value || "").trim();
+        if (!employeeNo) {
+          showAuthError("请填写工号 / 账号。");
+          return;
+        }
+        if (authMode === "register" && !name) {
+          showAuthError("注册需要填写姓名。");
+          return;
+        }
+        var submit = $("authSubmit");
+        var original = submit ? submit.textContent : "";
+        if (submit) {
+          submit.disabled = true;
+          submit.textContent = authMode === "register" ? "正在注册…" : "正在登录…";
+        }
+        showAuthError("");
+        var body = authMode === "register"
+          ? { inviteCode: inviteCode, name: name, employeeNo: employeeNo, phone: phone }
+          : { employeeNo: employeeNo, inviteCode: inviteCode };
+        var path = authMode === "register" ? "/v1/account/register" : "/v1/account/login";
+        api(path, { method: "POST", body: body, auth: false })
+          .then(function (data) {
+            saveSession(data);
+            updateAccountCta();
+            if (next) {
+              window.location.assign(next);
+              return null;
+            }
+            return loadAccountData();
+          })
+          .catch(function (err) {
+            showAuthError(explainError(err));
+            if (submit) {
+              submit.disabled = false;
+              submit.textContent = original;
+            }
+          });
+      });
+    }
+
+    var logout = $("logoutBtn");
+    if (logout) {
+      logout.addEventListener("click", function () {
+        api("/v1/account/logout", { method: "POST", body: {} })
+          .catch(function () { /* 令牌已经失效也照常清本地 */ })
+          .then(function () {
+            clearSession();
+            updateAccountCta();
+            showAuth();
+            showToast("已退出登录");
+          });
+      });
+    }
+
+    var refresh = $("refreshAccount");
+    if (refresh) {
+      refresh.addEventListener("click", function () {
+        refresh.disabled = true;
+        loadAccountData().catch(function (err) {
+          showToast(explainError(err));
+        }).then(function () { refresh.disabled = false; });
+      });
+    }
+
+    if (!loadToken()) {
+      showAuth();
+      return;
+    }
+    loadAccountData().catch(function (err) {
+      if (err.status === 401) {
+        clearSession();
+        updateAccountCta();
+        showAuth();
+        showToast("登录已失效，请重新登录。");
+        return;
+      }
+      var loading = $("accountLoading");
+      if (loading) loading.hidden = true;
+      var box = $("accountError");
+      if (box) {
+        box.hidden = false;
+        box.textContent = explainError(err);
+      }
+      markError();
+    });
+  }
+
+  // ---------------------------------------------------------------- 启动
+
+  function boot() {
+    updateAccountCta();
+    if (page === "pricing") {
+      initPricing();
+    } else if (page === "pay") {
+      initPay();
+    } else if (page === "account") {
+      initAccount();
+    } else {
+      markReady();
+    }
   }
 
   if (document.readyState === "loading") {

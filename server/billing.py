@@ -118,6 +118,9 @@ def plan_view(row: Dict[str, Any]) -> Dict[str, Any]:
         "maxDevices": int(row.get("max_devices") or 3),
         "maxConcurrent": int(row.get("max_concurrent") or 1),
         "active": bool(row.get("active")),
+        # 官网据此决定是否显示「立即购买」：试用/内部账号是邀请制，不下单。
+        "purchasable": bool(row.get("active")
+                            and int(row.get("price_cents") or 0) > 0),
     }
 
 
@@ -353,7 +356,7 @@ class BillingService:
         now = time.time()
         row = self.entitlement(user_id)
         if row is None:
-            return {"status": "none", "plan": "", "paidUntil": 0,
+            return {"status": "none", "plan": "", "planName": "", "paidUntil": 0,
                     "dailyMinutes": 0.0, "dailyMinutesLeft": 0.0,
                     "ttsCharsLeft": 0, "qps": 0,
                     "maxDevices": 0, "maxConcurrent": 0, "devices": int(devices),
@@ -374,9 +377,11 @@ class BillingService:
             rem = self.tts_ledger.remaining(uid)
             if rem is not None:
                 tts_left = rem
+        plan_row = self.store.plan(str(row.get("plan_code") or "")) or {}
         return {
             "status": status,
             "plan": str(row.get("plan_code") or ""),
+            "planName": str(plan_row.get("name") or ""),
             "paidUntil": paid_until,
             "dailyMinutes": limits["daily_audio_minutes"],
             "dailyMinutesLeft": round(daily_left, 2),
@@ -497,9 +502,13 @@ class BillingService:
     def _order_pay_view(self, order: Dict[str, Any], *, create: bool = False,
                         with_pair_url: bool = True) -> Dict[str, Any]:
         meta = _unjson(order.get("meta"))
+        plan = self.store.plan(str(order.get("plan_code") or "")) or {}
         view = {
             "orderId": str(order.get("order_id") or ""),
             "planCode": str(order.get("plan_code") or ""),
+            # 支付页只读服务端：套餐名与天数也由这里给，不在前端写死。
+            "planName": str(plan.get("name") or ""),
+            "days": int(plan.get("days") or 0),
             "amountCents": int(order.get("amount_cents") or 0),
             "status": str(order.get("status") or ""),
             "createdAt": float(order.get("created_at") or 0),
@@ -507,6 +516,10 @@ class BillingService:
             "paidAt": float(order.get("paid_at") or 0),
             "payUrl": str(meta.get("payUrl") or ""),
             "qrCode": str(meta.get("qrCode") or ""),
+            # 只在支付宝沙箱下为 True；支付页据此显示"测试环境"标注。
+            # 切生产（`alipay.sandbox=false`）后标注自动消失，页面文案不用改。
+            "sandbox": bool(self.provider == "alipay"
+                            and getattr(self.gateway, "sandbox", False)),
         }
         if create:
             view["mock"] = bool(meta.get("mock"))
@@ -580,6 +593,15 @@ class BillingService:
             raise errors.order_not_found(order_id)
         return order
 
+    def orders_for_user(self, user_id: str, *, limit: int = 20
+                        ) -> List[Dict[str, Any]]:
+        """当前用户的最近订单（「我的」页列表）。
+
+        **不带 pairUrl**：列表是只读展示，不能因为刷新一下列表就补发码/写库。
+        """
+        rows = self.store.orders(user_id=str(user_id or ""), limit=limit)
+        return [self._order_pay_view(row, with_pair_url=False) for row in rows]
+
     def cancel_order(self, order_id: str, user_id: str) -> Dict[str, Any]:
         order = self.order_for_user(order_id, user_id)
         status = str(order.get("status") or "")
@@ -588,6 +610,43 @@ class BillingService:
         self.store.update_order(order["order_id"], status="closed")
         self.store.insert_order_event(order["order_id"], "cancelled", "")
         return {"ok": True, "orderId": order["order_id"], "status": "closed"}
+
+    def sync_order(self, order_id: str, user_id: str) -> Dict[str, Any]:
+        """本地联调/回调丢失兜底：主动向支付宝查询并补记支付结果。
+
+        只对 `created|paying` 的订单查询；终态订单直接回存库视图，不重复入账。
+        `TRADE_CLOSED` 是唯一会把订单变 `closed` 的查询结果；`paid` 走与异步通知
+        完全相同的 `apply_notify()`（幂等、金额校验、权益/发码都在那里）。
+        """
+        order = self.order_for_user(order_id, user_id)
+        status = str(order.get("status") or "")
+        if status in ("paid", "refunded", "closed"):
+            return self.order_view(order)
+        if not getattr(self.gateway, "configured", False):
+            raise errors.payment_unconfigured()
+        norm = self.gateway.query(order)
+        got_order = str(norm.get("outTradeNo") or "")
+        if got_order and got_order != str(order.get("order_id") or ""):
+            # 查询是按 out_trade_no 发起的，回来却是别的单：宁可不入账。
+            raise errors.payment_gateway_error("支付宝查询返回的订单号不匹配")
+        result = str(norm.get("status") or "")
+        if result == "paid":
+            norm = dict(norm)
+            norm["verified"] = True
+            self.apply_notify(norm)
+            order = self.store.order(str(order.get("order_id") or "")) or order
+        elif result == "closed":
+            # 查询结果可能比回调慢：期间已经支付/退款的订单**不许**被改成 closed。
+            fresh = self.store.order(str(order.get("order_id") or "")) or order
+            if str(fresh.get("status") or "") in ("created", "paying"):
+                self.store.update_order(str(order.get("order_id") or ""),
+                                        status="closed")
+                self.store.insert_order_event(
+                    str(order.get("order_id") or ""), "sync-closed",
+                    _json({"rawStatus": str(norm.get("rawStatus") or "")}))
+                fresh = self.store.order(str(order.get("order_id") or "")) or fresh
+            order = fresh
+        return self.order_view(order)
 
     # ---------------------------------------------------------------- 支付回调
 
@@ -1118,7 +1177,15 @@ def list_plans(request: Request):
     plans = [plan_view(p) for p in svc.plans(active_only=True)]
     trial = {"enabled": bool(svc.cfg.get("trial.enabled", True)),
              "days": int(svc.cfg.get("trial.days", 7) or 7)}
-    return {"plans": plans, "trial": trial}
+    # 站点据此显示"测试环境"标注 / 支付是否可用；**不含任何密钥或路径**。
+    payment = {
+        "provider": svc.provider,
+        "configured": bool(getattr(svc.gateway, "configured", False)),
+        "sandbox": bool(svc.provider == "alipay"
+                        and getattr(svc.gateway, "sandbox", False)),
+    }
+    return {"plans": plans, "trial": trial, "payment": payment,
+            "serverTime": time.time()}
 
 
 @router.post("/orders")
@@ -1140,6 +1207,16 @@ async def create_order(request: Request):
     return svc.create_order(str(user["user_id"]), plan_code)
 
 
+@router.get("/orders")
+def list_orders(request: Request, limit: int = 20):
+    """当前账号的最近订单（「我的」页只读列表；不含 pairUrl）。"""
+    svc = _billing(request)
+    if not svc.enabled:
+        raise errors.billing_disabled()
+    user = _user(request)
+    return {"orders": svc.orders_for_user(str(user["user_id"]), limit=limit)}
+
+
 @router.get("/orders/{order_id}")
 def get_order(request: Request, order_id: str):
     """订单状态 +（**仅 paid 后**）`pairUrl`。只有下单的那个人能看。"""
@@ -1154,6 +1231,14 @@ def cancel_order(request: Request, order_id: str):
     svc = _billing(request)
     user = _user(request)
     return svc.cancel_order(order_id, str(user["user_id"]))
+
+
+@router.post("/orders/{order_id}/sync")
+def sync_order(request: Request, order_id: str):
+    """主动查询支付宝并同步订单状态（本地联调、回调丢失兜底）。"""
+    svc = _billing(request)
+    user = _user(request)
+    return svc.sync_order(order_id, str(user["user_id"]))
 
 
 @router.get("/entitlement")

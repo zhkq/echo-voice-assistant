@@ -28,6 +28,13 @@ logs/
 
 # ---- 容灾代理：真实配置与运行时 ----
 dsh-failover/config.json
+
+# ---- 支付凭据：只在本机/服务端挂载，绝不入库 ----
+# `.alipay-sandbox.json` 是本机沙箱联调用的三件套；应用私钥/支付宝公钥由
+# `alipay.private_key_path` / `alipay.public_key_path` 指向服务端文件，不要把
+# PEM 复制进仓库。`data/` 已在上面整体忽略（`data/backend-dev/` 在其中）。
+.alipay-sandbox.json
+*.pem
 dsh-failover/logs/
 dsh-failover/__pycache__/
 # ECHO 写给路由进程的"去哪儿找凭据"清单：含本机绝对路径，不入库（注册时自动生成）

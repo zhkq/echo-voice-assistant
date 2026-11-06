@@ -1,0 +1,58 @@
+{
+  "ok": true,
+  "baseUrl": "http://127.0.0.1:38511",
+  "backend": "real server.main with payment.provider=mock",
+  "screenshots": [
+    "e2e-account.png",
+    "e2e-paid.png",
+    "e2e-closed.png"
+  ],
+  "steps": [
+    {
+      "step": "backend_started",
+      "port": 18903,
+      "models": {
+        "asr-long": "absent",
+        "diarize": "absent",
+        "speaker-embed": "absent"
+      }
+    },
+    {
+      "step": "register",
+      "entitlement": [
+        "张",
+        "张三",
+        "工号：E2E001",
+        "已登录"
+      ]
+    },
+    {
+      "step": "create_order",
+      "orderId": "ord-mGifJq9iF25TNYGZ9bbbI7_T"
+    },
+    {
+      "step": "paid",
+      "orderId": "ord-mGifJq9iF25TNYGZ9bbbI7_T",
+      "payStatus": "已支付"
+    },
+    {
+      "step": "account_after_paid",
+      "plan": "月卡 · 使用中"
+    },
+    {
+      "step": "login_gate"
+    },
+    {
+      "step": "logout_login"
+    },
+    {
+      "step": "cancel",
+      "orderId": "ord-QSj2OsK6N1fTcW--YIlhUMHt"
+    }
+  ],
+  "capturedAt": "2026-11-06T00:46:03+0800",
+  "notes": [
+    "支付是 Mock 端点，不是真实支付宝扣款。",
+    "真实支付宝沙箱 10.00 元由 Lead 于 2026-11-05 实测；本脚本不冒充。"
+  ]
+}

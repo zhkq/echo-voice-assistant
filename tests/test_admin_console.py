@@ -513,6 +513,9 @@ class IsolationTests(_AdminCase):
                                        "/v1/account/logout",
                                        "/v1/billing/orders",
                                        "/v1/billing/orders/{order_id}/cancel",
+                                       # Phase 3（2026-11-06）：主动查询支付宝并补记支付结果
+                                       # （鉴权同上：userToken；它只改自己的订单）。
+                                       "/v1/billing/orders/{order_id}/sync",
                                        "/v1/billing/alipay/notify",
                                        # 方案B（2026-10-31）：手机 TTS 委托与撤销。它们不是能力槽，
                                        # 是"ECHO 给手机签一个只管 tts 的短期令牌"（`/v1/delegate`
