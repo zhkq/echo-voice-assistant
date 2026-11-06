@@ -71,6 +71,30 @@ class BuildSenderTests(unittest.TestCase):
         self.assertIn("密码", error)
 
 
+class OfficialSenderConfigTests(unittest.TestCase):
+    """官方发件邮箱口径（2026-11-06）：nbz_echo@163.com / smtp.163.com。"""
+
+    def test_example_config_prefills_the_official_sender_without_a_secret(self):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        path = os.path.join(root, "server", "echo-server.example.yaml")
+        with patch.dict(os.environ, {}, clear=True):
+            cfg = settings.load(path)
+        self.assertEqual(cfg.get("account.email.provider"), "smtp")
+        self.assertEqual(cfg.get("account.email.from"), "nbz_echo@163.com")
+        self.assertEqual(cfg.get("account.email.from_name"), "ECHO")
+        smtp = cfg.get("account.email.smtp") or {}
+        self.assertEqual(smtp.get("host"), "smtp.163.com")
+        self.assertEqual(smtp.get("port"), 465)
+        self.assertEqual(smtp.get("mode"), "ssl")
+        self.assertEqual(smtp.get("username"), "nbz_echo@163.com")
+        # 授权码只能来自 env/secret 文件；示例配置里不许出现真实密码。
+        self.assertNotIn("password", smtp)
+        self.assertEqual(smtp.get("password_env"), "ECHO_SMTP_PASSWORD")
+        self.assertEqual(smtp.get("password_file"), "")
+        # 官方生产模板默认启用；没有授权码时发送端会明确 503，不会静默发信。
+        self.assertTrue(cfg.get("account.email.enabled"))
+
+
 class DevSenderTests(unittest.TestCase):
     def test_dev_writes_the_code_to_the_log(self):
         sender = emailer.DevEmailSender()

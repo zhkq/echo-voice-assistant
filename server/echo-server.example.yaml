@@ -252,17 +252,19 @@ invite:
 
 # ================================================================ 邮箱账号（2026-11-06，issue #15）
 # 邮箱即账号：注册 = email + 邮件验证码 + 密码 + 邀请码；登录 = email + 密码。
-# **出厂关**：不配时后端照常启动，邮箱注册/发码/重置回 503；已注册邮箱账号仍可登录。
-# 凭据只从环境变量或只读文件读，**不要**把密码写进本文件/仓库/数据库：
-#   ECHO_EMAIL_ENABLED=1 ECHO_EMAIL_PROVIDER=dev      # 本地联调，验证码看日志
-#   ECHO_EMAIL_ENABLED=1 ECHO_EMAIL_PROVIDER=smtp ECHO_EMAIL_FROM=no-reply@example.com
-#   ECHO_SMTP_HOST=smtp.example.com ECHO_SMTP_PORT=465 ECHO_SMTP_MODE=ssl
-#   ECHO_SMTP_USERNAME=... ECHO_SMTP_PASSWORD=...     # 或 ECHO_SMTP_PASSWORD_FILE=/run/secrets/smtp
+# **官方后台管理邮箱（2026-11-06 确认）**：`nbz_echo@163.com`（显示名 ECHO）。
+# 验证码邮件与后续订单/支付/系统告警统一用它发；它同时是对外管理联系邮箱。
+# **生产启用**：enabled=true + provider=smtp，并设置 `ECHO_SMTP_PASSWORD`
+# 或 `ECHO_SMTP_PASSWORD_FILE`（163 授权码）。**没设授权码时邮箱注册/发码/重置会明确
+# 503 email_unconfigured，不会静默发信**；本地联调可改 provider=dev（验证码看日志）。
+# 授权码/密码**只**从环境变量或只读 secret 文件读 —— 绝不能写进本文件/仓库/数据库。
+# 163 个人邮箱有日发信量/反垃圾限制；用户量上来后换事务邮件服务或企业邮箱，
+# 发件地址/管理联系仍可保留 nbz_echo@163.com。
 account:
   email:
-    enabled: false
-    provider: dev                # dev | smtp（api 预留，本轮未实现）
-    from: ""                     # 发信地址，例如 no-reply@echoserver.zhkq.online
+    enabled: true                # 官方生产配置；本地联调可改 false（邮箱登录仍可用）
+    provider: smtp               # 生产 smtp；本地联调 dev；api 预留，本轮未实现
+    from: "nbz_echo@163.com"     # 官方发件地址 / 对外管理联系邮箱
     from_name: "ECHO"
     code_ttl_s: 600              # 10 分钟
     resend_cooldown_s: 60        # 60 秒冷却
@@ -272,10 +274,10 @@ account:
     send_timeout_s: 10
     send_retries: 1              # 只对连接/超时/断开重试
     smtp:
-      host: ""
+      host: "smtp.163.com"
       port: 465
       mode: ssl                  # ssl | starttls | plain（plain 只允许本机）
-      username: ""
+      username: "nbz_echo@163.com"
       password_env: "ECHO_SMTP_PASSWORD"
       password_file: ""          # 也可用只读挂载文件；优先于环境变量
 

@@ -337,13 +337,18 @@ invite: { required: true }      # 邮箱注册要邀请码（用 TEAM2026 这类
 trial: { enabled: true, days: 7 }
 account:
   email:
-    enabled: false              # 出厂关；开了才允许发码/注册/重置。邮箱+密码登录不受它影响
-    provider: dev               # dev（验证码写日志）| smtp（生产）
-    from: ""
+    enabled: true               # 官方生产配置；本地联调可改 false，邮箱登录不受它影响
+    provider: smtp              # 生产 smtp；本地联调 dev（验证码看日志）
+    from: "nbz_echo@163.com"    # 官方发件地址 / 对外管理联系邮箱（2026-11-06 确认）
     from_name: "ECHO"
-    smtp: { host: "", port: 465, mode: ssl, username: "",
+    smtp: { host: "smtp.163.com", port: 465, mode: ssl,
+            username: "nbz_echo@163.com",
             password_env: "ECHO_SMTP_PASSWORD", password_file: "" }
 ```
+
+> 示例配置与 `compose.yaml` 默认已启用官方 163 发信；**没有设置授权码时**发码/注册/重置
+> 会明确 503 `email_unconfigured`，不会静默发信；已注册邮箱账号的登录不受影响。
+> 本地联调把 `provider` 改成 `dev`（验证码看日志）即可。
 
 环境变量同名映射：`ECHO_BILLING_ENABLED`、`ECHO_PAYMENT_PROVIDER`、`ECHO_ALIPAY_APP_ID`、
 `ECHO_ALIPAY_PRIVATE_KEY_PATH`、`ECHO_ALIPAY_PUBLIC_KEY_PATH`、`ECHO_ALIPAY_GATEWAY`、
@@ -355,10 +360,27 @@ account:
 > 部署提醒：发码的每 IP 限流取 `X-Forwarded-For` 第一段（与现有配对退避同口径）。
 > 反向代理必须**覆盖/清洗**这个头；否则客户端可以伪造来源绕过每 IP 限额。
 
-生产发信还需要（这些**不在代码里**）：发信域名；SPF / DKIM / DMARC 三个 DNS 记录；
-`from` 地址；SMTP 服务商的 host/port/TLS 模式/账号与密码（env 或只读挂载文件）；
-服务商的发信额度与退信策略。本地/CI 用 `provider=dev`（验证码写日志）或测试注入的
-fake sender，**不发真实邮件**。
+**生产发信口径（2026-11-06 确认）**：官方后台管理邮箱 `nbz_echo@163.com`（显示名
+ECHO），验证码/订单/支付/系统告警统一用它发；它同时作为对外管理联系邮箱。部署时：
+
+```bash
+ECHO_EMAIL_ENABLED=1
+ECHO_EMAIL_PROVIDER=smtp
+ECHO_EMAIL_FROM=nbz_echo@163.com
+ECHO_SMTP_HOST=smtp.163.com
+ECHO_SMTP_PORT=465
+ECHO_SMTP_MODE=ssl
+ECHO_SMTP_USERNAME=nbz_echo@163.com
+# 163 授权码只走 secret，二选一（不要写进 YAML/仓库/数据库）：
+ECHO_SMTP_PASSWORD=...
+# 或 ECHO_SMTP_PASSWORD_FILE=/run/secrets/echo_smtp_password
+```
+
+发件域名是 `163.com`，SPF/DKIM/DMARC 由网易邮箱侧负责，部署侧不需要自建这三条记录；
+但 163 个人邮箱有日发信量/反垃圾限制，用户量上来后建议换事务邮件服务或企业邮箱
+（发件地址/管理联系仍可保留 `nbz_echo@163.com`）。本地/CI 用 `provider=dev`
+（验证码写日志）或测试注入的 fake sender，**不发真实邮件**；真实收发由部署方用上面的
+secret 验证。
 
 ### 8.3 用 Mock 跑通全链路（无 UI 也能验收）
 
