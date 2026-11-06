@@ -1,0 +1,50 @@
+{
+  "issue": 15,
+  "capturedAt": "2026-11-06T23:53:50+0800",
+  "baseline": {
+    "ref": "16d61a3",
+    "source": "git archive 16d61a3 site",
+    "description": "目标分支基线：邀请码 + 工号登录/注册"
+  },
+  "after": {
+    "source": "working tree site/",
+    "backend": "真实 server.main（临时 auth.db、account.email.provider=dev、billing mock、invite.required=true）",
+    "description": "邮箱 + 邮件验证码 + 密码 + 通用邀请码；忘记密码用邮件验证码"
+  },
+  "scenario": "登录 → 注册（真实发码/注册）→ 登出 → 忘记密码 → 重置 → 新密码登录",
+  "viewports": {
+    "desktop": {
+      "width": 1440,
+      "height": 900
+    },
+    "mobile": {
+      "width": 375,
+      "height": 812
+    }
+  },
+  "theme": "light",
+  "locale": "zh-CN",
+  "testData": {
+    "email": "evidence@example.com",
+    "invite": "TEAM2026"
+  },
+  "artifacts": {
+    "before-login.png": "before-login.png",
+    "before-register.png": "before-register.png",
+    "before-login-mobile.png": "before-login-mobile.png",
+    "before-register-mobile.png": "before-register-mobile.png",
+    "after-login.png": "after-login.png",
+    "after-register.png": "after-register.png",
+    "after-account.png": "after-account.png",
+    "after-reset.png": "after-reset.png",
+    "after-reset-success.png": "after-reset-success.png",
+    "after-login-mobile.png": "after-login-mobile.png",
+    "after-register-mobile.png": "after-register-mobile.png"
+  },
+  "notes": [
+    "Before/After 都是实际页面截图；Before 由 git archive 取基线分支 site/ 渲染，不是 mockup。",
+    "After 用真实后端；验证码从临时后端日志读取（dev provider），没有发真实邮件。",
+    "没有真实支付；注册赠送试用由 billing mock 提供，仅用于展示已登录后的账户页。",
+    "未提交任何真实邮箱/凭据；测试邮箱是 example.com 保留域。"
+  ]
+}

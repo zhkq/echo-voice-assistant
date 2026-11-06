@@ -140,17 +140,25 @@ class PageTests(unittest.TestCase):
 
     def test_account_page_has_login_register_and_dashboard_sections(self):
         html = _read_site("account.html")
-        for text in ("登录 / 注册", "邀请码", "工号 / 账号", "注册", "退出登录",
-                     "当前权益", "最近订单", "购买 / 续费"):
+        for text in ("登录 / 注册", "邮箱", "邮箱验证码", "邀请码", "忘记密码",
+                     "注册", "退出登录", "当前权益", "最近订单", "购买 / 续费"):
             self.assertIn(text, html, text)
-        for element in ('id="authForm"', 'id="dashboardView"', 'id="ordersList"',
+        # 老工号入口已退役：页面不再出现工号登录/注册字段。
+        for gone in ("authEmployeeNo", "工号 / 账号", "authName", "authPhone"):
+            self.assertNotIn(gone, html, gone)
+        for element in ('id="authForm"', 'id="authEmail"', 'id="authCode"',
+                        'id="sendCodeBtn"', 'id="forgotPassword"', 'id="authInviteCode"',
+                        'id="dashboardView"', 'id="ordersList"',
                         'id="entitlementStatus"', 'id="entitlementRule"',
                         'id="entitlementPolicy"', 'data-account-cta'):
             self.assertIn(element, html, element)
         js = _read_site("assets/site.js")
-        for path in ("/v1/account/login", "/v1/account/register", "/v1/account/me",
-                     "/v1/account/logout", "/v1/billing/orders"):
+        for path in ("/v1/account/login", "/v1/account/register",
+                     "/v1/account/email/send-code", "/v1/account/password/reset",
+                     "/v1/account/me", "/v1/account/logout", "/v1/billing/orders"):
             self.assertIn(path, js, path)
+        self.assertIn("sendAuthCode", js)
+        self.assertIn("startCodeCountdown", js)
 
     def test_pay_page_is_order_driven_with_real_cashier_link(self):
         """支付页必须从订单读金额/订单号，并用服务端 payUrl 打开收银台。
@@ -550,6 +558,49 @@ class RenewalEvidenceTests(unittest.TestCase):
     def test_capture_script_compiles(self):
         py_compile.compile(
             os.path.join(ROOT, "scripts", "capture-renewal-evidence.py"),
+            doraise=True,
+        )
+
+
+class AccountEmailEvidenceTests(unittest.TestCase):
+    """issue #15 的邮箱化 Before/After 证据（桌面 + 移动，登录 + 注册）。"""
+
+    DIR = os.path.join(ROOT, "docs", "account-email-evidence")
+
+    def test_before_and_after_files_exist(self):
+        expected = (
+            "before-login.png", "after-login.png",
+            "before-register.png", "after-register.png",
+            "before-login-mobile.png", "after-login-mobile.png",
+            "before-register-mobile.png", "after-register-mobile.png",
+            "after-reset.png", "after-account.png",
+        )
+        for name in expected:
+            path = os.path.join(self.DIR, name)
+            self.assertTrue(os.path.isfile(path), name)
+            self.assertGreater(os.path.getsize(path), 5000, name)
+
+    def test_manifest_records_the_baseline_and_real_backend(self):
+        data = json.loads(_read("docs", "account-email-evidence", "capture.json"))
+        self.assertEqual(data["baseline"]["ref"], "16d61a3")
+        self.assertIn("server.main", data["after"]["backend"])
+        self.assertEqual(data["viewports"]["desktop"]["width"], 1440)
+        self.assertEqual(data["viewports"]["mobile"]["width"], 375)
+        self.assertEqual(data["theme"], "light")
+        self.assertEqual(data["testData"]["email"], "evidence@example.com")
+        joined = " ".join(data["notes"])
+        self.assertIn("没有发真实邮件", joined)
+        self.assertIn("不是 mockup", joined)
+
+    def test_readme_states_the_evidence_limits(self):
+        text = _read("docs", "account-email-evidence", "README.md")
+        for needle in ("Before", "After", "16d61a3", "1440", "375",
+                       "dev", "真实邮件", "mockup"):
+            self.assertIn(needle, text, needle)
+
+    def test_capture_script_compiles(self):
+        py_compile.compile(
+            os.path.join(ROOT, "scripts", "capture-account-email-evidence.py"),
             doraise=True,
         )
 

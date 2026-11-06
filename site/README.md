@@ -12,7 +12,7 @@
 |---|---|
 | `index.html` | 首页 `/`：产品名/logo、功能点、隐私边界、套餐与下载入口 |
 | `pricing.html` | 套餐页 `/pricing`：从 `GET /v1/billing/plans` 读套餐；「立即购买」先校验登录，再 `POST /v1/billing/orders` |
-| `account.html` | 登录 / 注册与我的账户 `/account`：邀请码 + 工号登录、权益、最近订单、退出登录 |
+| `account.html` | 登录 / 注册与我的账户 `/account`：邮箱注册（邮件验证码 + 密码 + 邀请码）、邮箱登录、忘记密码、权益、最近订单、退出登录 |
 | `pay.html` | 支付页 `/pay?order=<订单号>`：订单摘要、真实 `payUrl`、轮询 + 主动 sync、成功/关闭/超时/退款/错误状态 |
 | `download.html` | 下载页 `/download`：Windows / macOS / Android 安装包、版本/大小/构建日期与 SHA-256 |
 | `assets/plans.json` | 静态预览时的套餐回退数据；线上以 `/v1/billing/plans` 为准 |
@@ -28,9 +28,12 @@
 
 ## 页面流程
 
-1. **注册 / 登录**：`POST /v1/account/register`（邀请码 + 姓名 + 工号）或
-   `POST /v1/account/login`（工号 + 邀请码）。`userToken` 存在浏览器 `localStorage`；退出登录调
-   `POST /v1/account/logout` 并清本地状态。令牌失效（401）时清掉并回登录页。
+1. **注册 / 登录 / 忘记密码**：注册先调 `POST /v1/account/email/send-code`
+   （`purpose=register`）收邮件验证码，再调 `POST /v1/account/register`（邮箱 + 验证码 +
+   密码 + 邀请码）；登录调 `POST /v1/account/login`（邮箱 + 密码）；忘记密码先发
+   `purpose=reset` 的码，再调 `POST /v1/account/password/reset`。
+   `userToken` 存在浏览器 `localStorage`；退出登录调 `POST /v1/account/logout` 并清本地状态。
+   令牌失效（401）时清掉并回登录页。邮箱账号没有「工号 + 邀请码」入口。
 2. **选套餐 → 下单**：`/pricing` 先 `GET /v1/billing/plans`；点「立即购买」时若未登录先跳
    `/account?next=…`，已登录则 `POST /v1/billing/orders {planCode}`，成功后跳到
    `/pay?order=<orderId>`。

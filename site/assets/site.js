@@ -211,6 +211,7 @@
           error.status = resp.status;
           error.code = (data && data.code) || "";
           error.detail = (data && data.detail) || "";
+          error.retryAfter = (data && data.retryAfter) || 0;
           throw error;
         }
         return data == null ? {} : data;
@@ -226,6 +227,24 @@
     if (err.code === "order_state_conflict") return "订单状态已变化，请刷新页面。";
     if (err.code === "plan_change_unsupported") {
       return err.detail || err.message || "暂不支持升级/降级；请等当前套餐到期后再换。";
+    }
+    if (err.code === "invalid_email") return "请输入正确的邮箱地址。";
+    if (err.code === "password_weak") {
+      return err.detail || "密码至少 8 位，且同时包含字母和数字。";
+    }
+    if (err.code === "verification_code_invalid") return "验证码不正确，请重新输入。";
+    if (err.code === "verification_code_expired") return "验证码已过期，请重新获取。";
+    if (err.code === "verification_code_attempts_exceeded") {
+      return "验证码错误次数过多，请重新获取。";
+    }
+    if (err.code === "email_taken") return "这个邮箱已注册，请直接登录或重置密码。";
+    if (err.code === "invite_invalid") return "邀请码无效或已用完，请向管理员确认。";
+    if (err.code === "email_disabled") return "邮箱注册暂时未开放。";
+    if (err.code === "email_unconfigured") return "邮件服务暂时不可用，请稍后再试。";
+    if (err.code === "email_send_failed") return "验证码邮件发送失败，请稍后再试。";
+    if (err.code === "rate_limited") {
+      var wait = Number(err.retryAfter || 0);
+      return wait > 0 ? "操作过于频繁，请 " + wait + " 秒后再试。" : "操作过于频繁，请稍后再试。";
     }
     if (err.status === 401) return "登录已失效，请重新登录。";
     return err.message || err.detail || "请求失败，请稍后重试。";
@@ -754,29 +773,97 @@
   // ---------------------------------------------------------------- 账户页
 
   var authMode = "login";
+  var codeTimer = null;
+  var codeDeadline = 0;
+
+  function isValidEmail(value) {
+    var text = String(value || "").trim();
+    return /^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]{1,64}@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$/.test(text);
+  }
+
+  function stopCodeCountdown() {
+    if (codeTimer) {
+      window.clearInterval(codeTimer);
+      codeTimer = null;
+    }
+    codeDeadline = 0;
+    var button = $("sendCodeBtn");
+    if (button) {
+      button.disabled = false;
+      button.textContent = "发送验证码";
+    }
+  }
+
+  function startCodeCountdown(seconds) {
+    var total = Math.max(1, Math.floor(Number(seconds) || 60));
+    stopCodeCountdown();
+    codeDeadline = Date.now() + total * 1000;
+    var button = $("sendCodeBtn");
+    if (!button) return;
+    function tick() {
+      var left = Math.ceil((codeDeadline - Date.now()) / 1000);
+      if (left <= 0) {
+        stopCodeCountdown();
+        return;
+      }
+      button.disabled = true;
+      button.textContent = "重新发送 (" + left + "s)";
+    }
+    tick();
+    codeTimer = window.setInterval(tick, 1000);
+  }
+
+  function authErrorText(err) {
+    if (!err) return "未知错误";
+    if (err.code === "unauthorized" || err.status === 401) return "邮箱或密码不对。";
+    return explainError(err);
+  }
 
   function setAuthMode(mode) {
-    authMode = mode === "register" ? "register" : "login";
+    authMode = mode === "register" ? "register" : (mode === "reset" ? "reset" : "login");
+    var isLogin = authMode === "login";
+    var isRegister = authMode === "register";
+    var isReset = authMode === "reset";
     qsa("[data-auth-tab]").forEach(function (tab) {
       var active = tab.getAttribute("data-auth-tab") === authMode;
       tab.classList.toggle("is-active", active);
       tab.setAttribute("aria-selected", active ? "true" : "false");
     });
-    var nameRow = $("fieldNameRow");
-    var phoneRow = $("fieldPhoneRow");
-    if (nameRow) nameRow.hidden = authMode !== "register";
-    if (phoneRow) phoneRow.hidden = authMode !== "register";
+    var tabs = $("authTabs");
+    if (tabs) tabs.hidden = isReset;
+    var codeRow = $("authCodeRow");
+    if (codeRow) codeRow.hidden = isLogin;
+    var password2Row = $("authPassword2Row");
+    if (password2Row) password2Row.hidden = isLogin;
+    var inviteRow = $("authInviteRow");
+    if (inviteRow) inviteRow.hidden = !isRegister;
+    var forgot = $("authForgot");
+    if (forgot) forgot.hidden = !isLogin;
+    var back = $("authBack");
+    if (back) back.hidden = !isReset;
+    var hint = $("authPasswordHint");
+    if (hint) hint.hidden = isLogin;
+    var passwordLabel = $("authPasswordLabel");
+    if (passwordLabel) passwordLabel.textContent = isLogin ? "密码" : (isReset ? "新密码" : "设置密码");
+    var password = $("authPassword");
+    if (password) {
+      password.autocomplete = isLogin ? "current-password" : "new-password";
+      password.placeholder = isLogin ? "登录密码" : "至少 8 位，含字母和数字";
+    }
     var submit = $("authSubmit");
     if (submit) {
       submit.disabled = false;
-      submit.textContent = authMode === "register" ? "注册并登录" : "登录";
+      submit.textContent = isLogin ? "登录" : (isRegister ? "注册并登录" : "重置密码");
     }
     var note = $("authNote");
     if (note) {
-      note.textContent = authMode === "register"
-        ? "首次使用：填写邀请码、姓名与工号，注册后自动登录。"
-        : "已有账号？填写工号与邀请码登录。";
+      note.textContent = isLogin
+        ? "已有账号？用邮箱和密码登录。"
+        : (isRegister
+          ? "首次使用：邮箱注册，验证码会发到你的邮箱。"
+          : "输入邮箱收到的验证码，设置新密码。");
     }
+    stopCodeCountdown();
     showAuthError("");
   }
 
@@ -797,7 +884,7 @@
     var layout = $("accountLayout");
     if (layout) layout.hidden = false;
     setText("accountTitle", "登录 / 注册");
-    setText("accountLead", "用邀请码与工号登录，查看套餐权益、到期时间和最近订单。");
+    setText("accountLead", "用邮箱注册/登录，查看套餐权益、到期时间和最近订单。");
     setText("accountCrumb", "登录 / 注册");
     var form = $("authForm");
     if (form) form.reset();
@@ -843,10 +930,14 @@
   function renderMe(me) {
     var user = (me && me.user) || {};
     var ent = (me && me.entitlement) || {};
-    var name = user.name || (loadUser() && loadUser().name) || "ECHO 用户";
+    var email = user.email || "";
+    var name = user.name || (loadUser() && loadUser().name) || "";
+    if (!name && email) name = email.split("@")[0];
+    if (!name) name = "ECHO 用户";
     var employeeNo = user.employeeNo || "";
     setText("profileName", name);
-    setText("profileMeta", employeeNo ? "工号：" + employeeNo : "已登录");
+    setText("profileMeta", email ? "邮箱：" + email
+      : (employeeNo ? "工号：" + employeeNo : "已登录"));
     var avatar = $("profileAvatar");
     if (avatar) avatar.textContent = String(name).slice(0, 1) || "E";
     var status = String(ent.status || "none");
@@ -939,6 +1030,40 @@
     });
   }
 
+  function sendAuthCode() {
+    var email = ($("authEmail") && $("authEmail").value || "").trim();
+    if (!isValidEmail(email)) {
+      showAuthError("请输入正确的邮箱地址。");
+      return;
+    }
+    if (authMode === "login") return;
+    var purpose = authMode === "reset" ? "reset" : "register";
+    var button = $("sendCodeBtn");
+    if (button) {
+      button.disabled = true;
+      button.textContent = "发送中…";
+    }
+    showAuthError("");
+    api("/v1/account/email/send-code",
+        { method: "POST", body: { email: email, purpose: purpose }, auth: false })
+      .then(function (data) {
+        startCodeCountdown((data && data.cooldownSeconds) || 60);
+        showToast("验证码已发送，请查看邮箱。");
+        var code = $("authCode");
+        if (code) code.focus();
+      })
+      .catch(function (err) {
+        var wait = Number((err && err.retryAfter) || 0);
+        if (wait > 0) {
+          startCodeCountdown(wait);
+        } else if (button) {
+          button.disabled = false;
+          button.textContent = "发送验证码";
+        }
+        showAuthError(authErrorText(err));
+      });
+  }
+
   function initAccount() {
     var next = "";
     try {
@@ -950,36 +1075,96 @@
         setAuthMode(tab.getAttribute("data-auth-tab"));
       });
     });
+    var forgot = $("forgotPassword");
+    if (forgot) {
+      forgot.addEventListener("click", function (event) {
+        event.preventDefault();
+        setAuthMode("reset");
+      });
+    }
+    var back = $("backToLogin");
+    if (back) {
+      back.addEventListener("click", function (event) {
+        event.preventDefault();
+        setAuthMode("login");
+      });
+    }
+    var sendCode = $("sendCodeBtn");
+    if (sendCode) {
+      sendCode.addEventListener("click", sendAuthCode);
+    }
 
     var form = $("authForm");
     if (form) {
       form.addEventListener("submit", function (event) {
         event.preventDefault();
-        var employeeNo = ($("authEmployeeNo") && $("authEmployeeNo").value || "").trim();
+        var mode = authMode;
+        var email = ($("authEmail") && $("authEmail").value || "").trim();
+        var password = ($("authPassword") && $("authPassword").value || "");
+        var password2 = ($("authPassword2") && $("authPassword2").value || "");
+        var code = ($("authCode") && $("authCode").value || "").trim();
         var inviteCode = ($("authInviteCode") && $("authInviteCode").value || "").trim();
-        var name = ($("authName") && $("authName").value || "").trim();
-        var phone = ($("authPhone") && $("authPhone").value || "").trim();
-        if (!employeeNo) {
-          showAuthError("请填写工号 / 账号。");
+        if (!isValidEmail(email)) {
+          showAuthError("请输入正确的邮箱地址。");
           return;
         }
-        if (authMode === "register" && !name) {
-          showAuthError("注册需要填写姓名。");
+        if (mode !== "login") {
+          if (!/^\d{6}$/.test(code)) {
+            showAuthError("请输入 6 位邮箱验证码。");
+            return;
+          }
+          if (mode === "register" && !inviteCode) {
+            showAuthError("内测期注册需要邀请码，请填写管理员发放的通用邀请码。");
+            return;
+          }
+        }
+        if (!password) {
+          showAuthError("请填写密码。");
           return;
+        }
+        if (mode !== "login") {
+          if (password.length < 8 || !/[A-Za-z]/.test(password) || !/\d/.test(password)) {
+            showAuthError("密码至少 8 位，且同时包含字母和数字。");
+            return;
+          }
+          if (password !== password2) {
+            showAuthError("两次输入的密码不一致。");
+            return;
+          }
+        }
+        var path = "/v1/account/login";
+        var body = { email: email, password: password };
+        if (mode === "register") {
+          path = "/v1/account/register";
+          body = { email: email, code: code, password: password, inviteCode: inviteCode };
+        } else if (mode === "reset") {
+          path = "/v1/account/password/reset";
+          body = { email: email, code: code, newPassword: password };
         }
         var submit = $("authSubmit");
         var original = submit ? submit.textContent : "";
         if (submit) {
           submit.disabled = true;
-          submit.textContent = authMode === "register" ? "正在注册…" : "正在登录…";
+          submit.textContent = mode === "login" ? "正在登录…"
+            : (mode === "register" ? "正在注册…" : "正在重置…");
         }
         showAuthError("");
-        var body = authMode === "register"
-          ? { inviteCode: inviteCode, name: name, employeeNo: employeeNo, phone: phone }
-          : { employeeNo: employeeNo, inviteCode: inviteCode };
-        var path = authMode === "register" ? "/v1/account/register" : "/v1/account/login";
         api(path, { method: "POST", body: body, auth: false })
           .then(function (data) {
+            if (mode === "reset") {
+              var keep = email;
+              showToast("密码已重置，请用新密码登录。");
+              setAuthMode("login");
+              var emailInput = $("authEmail");
+              if (emailInput) emailInput.value = keep;
+              var pw = $("authPassword");
+              if (pw) pw.value = "";
+              var pw2 = $("authPassword2");
+              if (pw2) pw2.value = "";
+              var codeInput = $("authCode");
+              if (codeInput) codeInput.value = "";
+              return null;
+            }
             saveSession(data);
             updateAccountCta();
             if (next) {
@@ -989,7 +1174,7 @@
             return loadAccountData();
           })
           .catch(function (err) {
-            showAuthError(explainError(err));
+            showAuthError(authErrorText(err));
             if (submit) {
               submit.disabled = false;
               submit.textContent = original;
