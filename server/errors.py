@@ -210,6 +210,17 @@ def order_state_conflict(status: str = "", wanted: str = "") -> EchoError:
                      detail="当前 %s，需要 %s" % (status or "?", wanted or "?"))
 
 
+def plan_change_unsupported(detail: str = "", message: str = "") -> EchoError:
+    """有有效付费权益时购买不同套餐。
+
+    第一版**不做 proration**（补差价/按比例折算），所以必须明确拒绝，不能静默
+    按新套餐覆盖或悄悄叠加 —— 两种都会让用户以为“升级了”。
+    """
+    return EchoError(409, "plan_change_unsupported",
+                     str(message or "暂不支持升级/降级；请等当前套餐到期后再换，或联系管理员"),
+                     detail=str(detail or ""))
+
+
 def invite_invalid(reason: str = "") -> EchoError:
     """邀请码不存在 / 过期 / 次数用满。**统一一个 code**：别让人拿它枚举码。"""
     return EchoError(403, "invite_invalid", "邀请码无效或已用完",

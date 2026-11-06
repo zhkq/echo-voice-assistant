@@ -171,11 +171,13 @@ SERVER_CODE_TO_REASON: Dict[str, str] = {
     "entitlement_inactive": "blocked",    # 冻结 / 已退款
     "billing_disabled": "unsupported",    # 这台后端没开收费
     "payment_unconfigured": "error",      # 服务端支付没配好
+    "payment_gateway_error": "error",     # 支付网关暂时不可用（502）
     "invite_invalid": "blocked",
     "employee_no_taken": "error",
     "device_limit_reached": "blocked",
     "device_revoked": "blocked",
     "plan_not_found": "error",
+    "plan_change_unsupported": "blocked",  # 换套餐：等当前到期或找管理员
     "order_not_found": "error",
     "order_state_conflict": "error",
     "user_not_found": "error",
@@ -213,11 +215,13 @@ SERVER_CODE_RETRY: Dict[str, bool] = {
     "entitlement_inactive": False,
     "billing_disabled": False,
     "payment_unconfigured": False,
+    "payment_gateway_error": True,        # 上游抖动，退避后可再试
     "invite_invalid": False,
     "employee_no_taken": False,
     "device_limit_reached": False,       # 先解绑旧设备
     "device_revoked": False,
     "plan_not_found": False,
+    "plan_change_unsupported": False,    # 不是重试能解决的，先等到期/找管理员
     "order_not_found": False,
     "order_state_conflict": False,
     "user_not_found": False,

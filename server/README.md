@@ -300,10 +300,17 @@ nvidia-container-toolkit / compose v2）、模型卷按容器布局摆好并校�
 
 * **权益归人**：`entitlements.user_id` 是主键；换机/重装用 `POST /v1/account/devices/code`
   发一次性绑定码，不重复收费（默认 3 台）。
-* **续费不发码**：已经绑过设备的账号再付款，只延长 `paid_until`（从 `max(now, paid_until)`
-  起 +30 天；试用不叠加，从支付时刻起算）。
+* **续费不发码**：已经绑过设备的账号再付款，只延长 `paid_until`。期内从当前
+  `paid_until` 顺延；过期或退款后从**支付成功时间**起算；试用不叠加。
+* **换套餐只支持同套餐**：有有效付费权益时买不同套餐 → `409 plan_change_unsupported`
+  （不做 proration）；过期/退款/试用状态下可以按新购买任意上架套餐；内部账号不许下单。
+* **退款按订单重算**：订单标 `refunded` 后，按剩余 `paid` 订单按支付时间重放；
+  只剩退款单时 `status=refunded`、`paid_until=0`，不是简单减 30 天。
 * **到期/退款立即停能力**：ASR/分离/嵌入回 **402**（`entitlement_expired` /
   `entitlement_missing` / `entitlement_inactive`），配对与本地数据保留，续费即恢复。
+* **支付前可见预计到期**：下单/订单详情返回 `projectedPaidUntil / currentPaidUntil /
+  renewalDays / renewalBasis / renewalRule`；预览与入账共用同一个纯函数。
+* **不做自动扣款**：`autoRenew` 当前恒为 `false`；以后要做必须显式勾选 + 可取消 + 到期提醒。
 * **按账号的闸门**：1 QPS（`429 rate_limited` + `Retry-After: 1`）、并发 1
   （第二台设备 `409 client_busy`，detail 写明"另一台设备"）、日额度按 user 累计
   （换台设备不能重刷）。
@@ -406,6 +413,7 @@ Mock 端点默认只接受**回环/测试来源**（`payment.mock_allow_remote=f
 | 工号已注册 | 409 | `employee_no_taken` |
 | 设备数满 | 403 | `device_limit_reached` |
 | 订单状态不允许 | 409 | `order_state_conflict` |
+| 有有效付费权益时买不同套餐（不做 proration） | 409 | `plan_change_unsupported` |
 | 套餐 / 订单 / 账号不存在 | 404 | `plan_not_found` / `order_not_found` / `user_not_found` |
 
 ### 8.6 数据与边界（评审结论）
