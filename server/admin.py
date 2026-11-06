@@ -1626,6 +1626,7 @@ def _public_user_view(user: Dict[str, Any]) -> Dict[str, Any]:
     """管理面用的账号视图（`account_mod._public_user` + 邮箱/openId/邀请码）。"""
     out = account_mod._public_user(user)
     out["email"] = str(user.get("email") or "")
+    out["emailVerified"] = bool(float(user.get("email_verified_at") or 0) > 0)
     out["alipayOpenId"] = str(user.get("alipay_open_id") or "")
     out["inviteCode"] = str(user.get("invite_code") or "")
     return out

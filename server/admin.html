@@ -1115,6 +1115,7 @@ async function openUserDrawer(userId) {
           <div><div class="k">邮箱</div><div class="v">${esc(u.email || "—（等 issue #15 的 users.email）")}</div></div>
           <div><div class="k">用户 ID</div><div class="v mono">${esc(u.userId)}</div></div>
           <div><div class="k">手机号</div><div class="v">${esc(u.phone || "—")}</div></div>
+          <div><div class="k">邮箱验证</div><div class="v">${u.email ? (u.emailVerified ? badgeHtml("active", "已验证") : badgeHtml("muted", "未验证")) : "—"}</div></div>
           <div><div class="k">注册时间</div><div class="v">${dateOnly(u.createdAt)}</div></div>
           <div class="wide"><div class="k">支付宝 openId</div><div class="v mono">${u.alipayOpenId ? esc(u.alipayOpenId) : "—"}</div></div>
           <div class="wide"><div class="k">注册邀请码</div><div class="v"><code class="mono">${esc(u.inviteCode || "—")}</code> <span class="muted small">（仅记录来源，作废不影响登录）</span></div></div>
