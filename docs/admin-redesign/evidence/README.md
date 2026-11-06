@@ -6,14 +6,14 @@
 
 | 项 | 值 |
 |---|---|
-| Baseline | `integration/billing-vibepay` @ `16d61a3`（旧深色管理面） |
+| Baseline | `integration/billing-vibepay` @ `829d585`（#17 合并后、本 PR 之前的旧深色管理面） |
 | After | 本 ticket 分支（新浅色管理面），实现 commit 见 PR |
 | 视口 | 1280×900、768×1024、375×812；deviceScaleFactor 1 |
 | 浏览器 | 系统 Google Chrome headless（Playwright 驱动） |
 | 数据 | 临时 SQLite（`/tmp/echo-admin-evidence-*`）+ 假引擎 + `payment.provider=mock`；**不是真实库** |
 | 管理员 | 临时账号 `ops`，口令仅用于本地采集 |
 | 页面 | `http://127.0.0.1:18901/admin/`（temp ports 18900/18901，避免占用真实后端 8900/8901） |
-| 邮箱 | 采集脚本在临时库补 `users.email` 并写入示例邮箱（模拟 issue #15 落地后的字段）；真实 `email` 列由 #15 提供 |
+| 邮箱 | #17 合并后 `users.email` / `email_verified_at` 是真实 schema；演示数据里的邮箱与验证状态由采集脚本写入临时库 |
 
 Before 与 After 使用**同一份演示数据、同一组视口、同一浏览器**；仓库当前状态里没有真实用户/订单，
 截图中所有姓名、邮箱、订单号、tradeNo、设备名都是示例假数据。
@@ -24,7 +24,7 @@ Before 与 After 使用**同一份演示数据、同一组视口、同一浏览�
 |---|---|
 | `before-login-1280.png` | baseline 登录页（深色） |
 | `before-overview-1280.png` | baseline 概览（只有并发/调用，无运营数据） |
-| `before-billing-1280.png` | baseline「收费 / 账号」一页塞 7 张卡（套餐/订单/回调/权益/账号/邀请码） |
+| `before-billing-1280.png` | baseline「收费 / 账号」一页塞 7 张卡（套餐/订单/回调/权益/账号/邀请码；账号表已有邮箱列） |
 | `before-overview-768.png` | baseline 768 宽 |
 | `before-overview-375.png` | baseline 375 宽 |
 | `after-login-1280.png` | 新登录页（与官网一致的浅色/蓝主色） |
