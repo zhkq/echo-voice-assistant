@@ -718,22 +718,22 @@ const badge = (status, text) => {
 const NOW = Math.floor(Date.now() / 1000);
 const DAY = 86400;
 const ORDERS = [
-  { id: "ord-20261106-a1b2c3", user: "张三", userId: "usr-3f9a21", emp: "E001", plan: "月卡", days: 30, amount: 1000, status: "paid", created: NOW - 3600 * 9, paid: NOW - 3600 * 9 + 21, trade: "2026110622001412345678901234", notify: "verified", conflict: false },
-  { id: "ord-20261106-9d8e7f", user: "李四", userId: "usr-7c2d10", emp: "E002", plan: "月卡", days: 30, amount: 1000, status: "created", created: NOW - 3600 * 7, paid: 0, trade: "", notify: "", conflict: false },
-  { id: "ord-20261105-45ab6c", user: "王五", userId: "usr-1a2b3c", emp: "E003", plan: "月卡", days: 30, amount: 1000, status: "refunded", created: NOW - DAY - 3600 * 3, paid: NOW - DAY - 3600 * 3 + 47, trade: "2026110522001498765432109876", notify: "verified", conflict: false },
-  { id: "ord-20261105-77de88", user: "赵六", userId: "usr-9f8e7d", emp: "E004", plan: "月卡", days: 30, amount: 1000, status: "paid", created: NOW - DAY - 3600 * 6, paid: NOW - DAY - 3600 * 6 + 15, trade: "2026110522001411112222333344", notify: "verified", conflict: true },
-  { id: "ord-20261104-cc12aa", user: "孙七", userId: "usr-4b5c6d", emp: "E005", plan: "7 天试用", days: 7, amount: 0, status: "closed", created: NOW - 2 * DAY, paid: 0, trade: "", notify: "closed", conflict: false },
-  { id: "ord-20261104-aa33bb", user: "周八", userId: "usr-8a9b0c", emp: "E006", plan: "月卡", days: 30, amount: 1000, status: "paying", created: NOW - 2 * DAY - 300, paid: 0, trade: "", notify: "", conflict: false },
-  { id: "ord-20261103-ee44ff", user: "吴九", userId: "usr-2c3d4e", emp: "E007", plan: "月卡", days: 30, amount: 1000, status: "paid", created: NOW - 3 * DAY, paid: NOW - 3 * DAY + 32, trade: "2026110322001455556666777788", notify: "verified", conflict: false },
-  { id: "ord-20261102-1234ab", user: "郑十", userId: "usr-5e6f7a", emp: "E008", plan: "月卡", days: 30, amount: 1000, status: "refunded", created: NOW - 4 * DAY, paid: NOW - 4 * DAY + 12, trade: "2026110222001499998888777766", notify: "verified", conflict: false },
+  { id: "ord-20261106-a1b2c3", user: "张三", userId: "usr-3f9a21", email: "zhangsan@example.com", plan: "月卡", days: 30, amount: 1000, status: "paid", created: NOW - 3600 * 9, paid: NOW - 3600 * 9 + 21, trade: "2026110622001412345678901234", notify: "verified", conflict: false },
+  { id: "ord-20261106-9d8e7f", user: "李四", userId: "usr-7c2d10", email: "lisi@example.com", plan: "月卡", days: 30, amount: 1000, status: "created", created: NOW - 3600 * 7, paid: 0, trade: "", notify: "", conflict: false },
+  { id: "ord-20261105-45ab6c", user: "王五", userId: "usr-1a2b3c", email: "wangwu@example.com", plan: "月卡", days: 30, amount: 1000, status: "refunded", created: NOW - DAY - 3600 * 3, paid: NOW - DAY - 3600 * 3 + 47, trade: "2026110522001498765432109876", notify: "verified", conflict: false },
+  { id: "ord-20261105-77de88", user: "赵六", userId: "usr-9f8e7d", email: "zhaoliu@example.com", plan: "月卡", days: 30, amount: 1000, status: "paid", created: NOW - DAY - 3600 * 6, paid: NOW - DAY - 3600 * 6 + 15, trade: "2026110522001411112222333344", notify: "verified", conflict: true },
+  { id: "ord-20261104-cc12aa", user: "孙七", userId: "usr-4b5c6d", email: "sunqi@example.com", plan: "7 天试用", days: 7, amount: 0, status: "closed", created: NOW - 2 * DAY, paid: 0, trade: "", notify: "closed", conflict: false },
+  { id: "ord-20261104-aa33bb", user: "周八", userId: "usr-8a9b0c", email: "zhouba@example.com", plan: "月卡", days: 30, amount: 1000, status: "paying", created: NOW - 2 * DAY - 300, paid: 0, trade: "", notify: "", conflict: false },
+  { id: "ord-20261103-ee44ff", user: "吴九", userId: "usr-2c3d4e", email: "wujiu@example.com", plan: "月卡", days: 30, amount: 1000, status: "paid", created: NOW - 3 * DAY, paid: NOW - 3 * DAY + 32, trade: "2026110322001455556666777788", notify: "verified", conflict: false },
+  { id: "ord-20261102-1234ab", user: "郑十", userId: "usr-5e6f7a", email: "zhengshi@example.com", plan: "月卡", days: 30, amount: 1000, status: "refunded", created: NOW - 4 * DAY, paid: NOW - 4 * DAY + 12, trade: "2026110222001499998888777766", notify: "verified", conflict: false },
 ];
 const USERS = [
-  { id: "usr-3f9a21", name: "张三", emp: "E001", phone: "138****2210", openId: "2088******9012", status: "active", plan: "月卡", entStatus: "active", until: NOW + 30 * DAY, days: 30, devices: 2, maxDevices: 3, daily: 120, tts: 50000, qps: 1, created: NOW - 96 * DAY, invite: "TEAM2026", tone: "t1" },
-  { id: "usr-7c2d10", name: "李四", emp: "E002", phone: "139****7742", openId: "2088******3344", status: "active", plan: "月卡", entStatus: "expiring", until: NOW + 6 * DAY, days: 6, devices: 1, maxDevices: 3, daily: 120, tts: 50000, qps: 1, created: NOW - 71 * DAY, invite: "TEAM2026", tone: "t2" },
-  { id: "usr-1a2b3c", name: "王五", emp: "E003", phone: "—", openId: "", status: "active", plan: "无", entStatus: "expired", until: 0, days: 0, devices: 3, maxDevices: 3, daily: 0, tts: 0, qps: 0, created: NOW - 40 * DAY, invite: "SPRING", tone: "t3" },
-  { id: "usr-9f8e7d", name: "赵六", emp: "E004", phone: "—", openId: "", status: "active", plan: "内部账号", entStatus: "active", until: 0, days: 0, devices: 1, maxDevices: 3, daily: 9999, tts: 5000000, qps: 1, created: NOW - 30 * DAY, invite: "TEAM2026", tone: "t4" },
-  { id: "usr-4b5c6d", name: "孙七", emp: "E005", phone: "—", openId: "", status: "disabled", plan: "月卡", entStatus: "frozen", until: NOW + 18 * DAY, days: 18, devices: 0, maxDevices: 3, daily: 120, tts: 50000, qps: 1, created: NOW - 28 * DAY, invite: "TEAM2026", tone: "t1" },
-  { id: "usr-8a9b0c", name: "周八", emp: "E006", phone: "—", openId: "", status: "active", plan: "7 天试用", entStatus: "active", until: NOW + 3 * DAY, days: 3, devices: 3, maxDevices: 3, daily: 120, tts: 50000, qps: 1, created: NOW - 6 * DAY, invite: "SPRING", tone: "t2" },
+  { id: "usr-3f9a21", name: "张三", email: "zhangsan@example.com", phone: "138****2210", openId: "2088******9012", status: "active", plan: "月卡", entStatus: "active", until: NOW + 30 * DAY, days: 30, devices: 2, maxDevices: 3, daily: 120, tts: 50000, qps: 1, created: NOW - 96 * DAY, invite: "TEAM2026", tone: "t1" },
+  { id: "usr-7c2d10", name: "李四", email: "lisi@example.com", phone: "139****7742", openId: "2088******3344", status: "active", plan: "月卡", entStatus: "expiring", until: NOW + 6 * DAY, days: 6, devices: 1, maxDevices: 3, daily: 120, tts: 50000, qps: 1, created: NOW - 71 * DAY, invite: "TEAM2026", tone: "t2" },
+  { id: "usr-1a2b3c", name: "王五", email: "wangwu@example.com", phone: "—", openId: "", status: "active", plan: "无", entStatus: "expired", until: 0, days: 0, devices: 3, maxDevices: 3, daily: 0, tts: 0, qps: 0, created: NOW - 40 * DAY, invite: "SPRING", tone: "t3" },
+  { id: "usr-9f8e7d", name: "赵六", email: "zhaoliu@example.com", phone: "—", openId: "", status: "active", plan: "内部账号", entStatus: "active", until: 0, days: 0, devices: 1, maxDevices: 3, daily: 9999, tts: 5000000, qps: 1, created: NOW - 30 * DAY, invite: "TEAM2026", tone: "t4" },
+  { id: "usr-4b5c6d", name: "孙七", email: "sunqi@example.com", phone: "—", openId: "", status: "disabled", plan: "月卡", entStatus: "frozen", until: NOW + 18 * DAY, days: 18, devices: 0, maxDevices: 3, daily: 120, tts: 50000, qps: 1, created: NOW - 28 * DAY, invite: "TEAM2026", tone: "t1" },
+  { id: "usr-8a9b0c", name: "周八", email: "zhouba@example.com", phone: "—", openId: "", status: "active", plan: "7 天试用", entStatus: "active", until: NOW + 3 * DAY, days: 3, devices: 3, maxDevices: 3, daily: 120, tts: 50000, qps: 1, created: NOW - 6 * DAY, invite: "SPRING", tone: "t2" },
 ];
 const NOTIFIES = [
   { trade: "2026110622001412345678901234", order: "ord-20261106-a1b2c3", status: "paid", verified: true, at: NOW - 3600 * 9 + 21, raw: '{"out_trade_no":"ord-20261106-a1b2c3","trade_no":"2026110622001412345678901234","trade_status":"TRADE_SUCCESS","total_amount":"10.00"}' },
@@ -742,7 +742,7 @@ const NOTIFIES = [
   { trade: "2026110422001400000000000000", order: "ord-20261104-cc12aa", status: "closed", verified: false, at: NOW - 2 * DAY, raw: '{"out_trade_no":"ord-20261104-cc12aa","trade_status":"TRADE_CLOSED","sign":"***"}' },
 ];
 const ENTITLEMENTS = USERS.filter((u) => u.plan !== "无").map((u) => ({
-  userId: u.id, name: u.name, emp: u.emp, plan: u.plan, status: u.entStatus,
+  userId: u.id, name: u.name, email: u.email, plan: u.plan, status: u.entStatus,
   until: u.until, daily: u.daily, tts: u.tts, qps: u.qps, maxDevices: u.maxDevices, devices: u.devices,
 }));
 const PLANS = [
@@ -857,7 +857,7 @@ function pageOverview() {
               ${ORDERS.slice(0, 5).map((o) => `
                 <tr class="row-link" onclick="openOrder('${o.id}')">
                   <td data-label="订单"><span class="order-id">${esc(o.id.slice(0, 16))}…</span></td>
-                  <td data-label="用户">${esc(o.user)} <span class="muted">/${esc(o.emp)}</span></td>
+                  <td data-label="用户">${esc(o.user)} <span class="muted">/${esc(o.email)}</span></td>
                   <td data-label="套餐">${esc(o.plan)}</td>
                   <td data-label="金额" class="right">${money(o.amount)}</td>
                   <td data-label="状态">${badge(o.status)}</td>
@@ -874,7 +874,7 @@ function pageOverview() {
           ${USERS.slice(0, 4).map((u) => `
             <div class="mini-row row-link" onclick="openUser('${u.id}')">
               <span class="avatar-sm ${u.tone}">${esc(u.name.slice(0, 1))}</span>
-              <div class="mini-main"><div class="mini-title">${esc(u.name)} <span class="muted small">· ${esc(u.emp)}</span></div><div class="mini-meta">${esc(u.id)} · 使用邀请码 ${esc(u.invite)}</div></div>
+              <div class="mini-main"><div class="mini-title">${esc(u.name)} <span class="muted small">· ${esc(u.email)}</span></div><div class="mini-meta">${esc(u.id)} · 使用邀请码 ${esc(u.invite)}</div></div>
               <div class="mini-side"><b>${esc(u.plan)}</b><span>${ago(u.created)}</span></div>
             </div>`).join("")}
         </div>
@@ -887,7 +887,7 @@ function pageOverview() {
         <div class="mini-list">
           ${ENTITLEMENTS.filter((e) => e.status === "expiring" || (e.until > 0 && e.until - NOW < 7 * DAY)).map((e) => `
             <div class="mini-row row-link" onclick="openUser('${e.userId}')">
-              <div class="mini-main"><div class="mini-title">${esc(e.name)} <span class="muted small">· ${esc(e.emp)}</span></div><div class="mini-meta">${esc(e.plan)}</div></div>
+              <div class="mini-main"><div class="mini-title">${esc(e.name)} <span class="muted small">· ${esc(e.email)}</span></div><div class="mini-meta">${esc(e.plan)}</div></div>
               <div class="mini-side"><b>${dateOnly(e.until)}</b><span>${Math.max(0, Math.ceil((e.until - NOW) / DAY))} 天后</span></div>
             </div>`).join("")}
         </div>
@@ -929,7 +929,7 @@ function pageOrders() {
 
   <div class="card panel" style="margin-bottom:14px">
     <div class="filters">
-      <div class="search"><label class="field"><span class="small muted">搜索</span><span style="position:relative;display:block">${icon("search")}<input class="input" placeholder="订单号 / 用户 ID / 工号 / 支付宝 tradeNo" value=""></span></label></div>
+      <div class="search"><label class="field"><span class="small muted">搜索</span><span style="position:relative;display:block">${icon("search")}<input class="input" placeholder="订单号 / 邮箱 / 用户 ID / 支付宝 tradeNo" value=""></span></label></div>
       <div class="field"><label>状态</label><select class="select"><option>全部状态</option><option>待支付</option><option>支付中</option><option>已支付</option><option>已退款</option><option>已关闭</option></select></div>
       <div class="field"><label>时间范围</label><select class="select"><option>最近 7 天</option><option>今天</option><option>最近 30 天</option><option>自定义…</option></select></div>
       <div class="acts"><button class="btn btn-primary" onclick="toast('筛选（设计稿）')">${icon("search")}查询</button><button class="btn btn-ghost" onclick="toast('已重置（设计稿）')">重置</button></div>
@@ -946,7 +946,7 @@ function pageOrders() {
           ${ORDERS.map((o) => `
             <tr class="row-link" onclick="openOrder('${o.id}')">
               <td data-label="订单号"><span class="order-id">${esc(o.id)}<button class="copy-btn" title="复制订单号" onclick="event.stopPropagation();copyText('${o.id}')">${icon("copy")}</button></span>${o.conflict ? ' <span class="badge danger">回调冲突</span>' : ""}</td>
-              <td data-label="用户"><b>${esc(o.user)}</b> <span class="muted small">${esc(o.emp)}</span></td>
+              <td data-label="用户"><b>${esc(o.user)}</b> <span class="muted small">${esc(o.email)}</span></td>
               <td data-label="套餐">${esc(o.plan)} <span class="muted small">${o.days ? o.days + " 天" : ""}</span></td>
               <td data-label="金额" class="right"><b>${money(o.amount)}</b></td>
               <td data-label="状态">${badge(o.status)}</td>
@@ -1001,7 +1001,7 @@ function orderDrawer(id) {
       <div class="section-title">用户</div>
       <div class="order-mini row-link" onclick="closeDrawer();openUser('${o.userId}')">
         <span class="avatar-sm">${esc(o.user.slice(0, 1))}</span>
-        <div class="main"><b>${esc(o.user)} · ${esc(o.emp)}</b><span class="mono">${esc(o.userId)}</span></div>
+        <div class="main"><b>${esc(o.user)} · ${esc(o.email)}</b><span class="mono">${esc(o.userId)}</span></div>
         <div class="side"><b class="small" style="color:var(--brand-ink)">查看用户 →</b></div>
       </div>
     </div>
@@ -1044,7 +1044,7 @@ function refundModal(id) {
     <p class="modal-sub">退款会调用支付宝退款，并把订单改为「已退款」；随后按该用户剩余已支付订单重算权益。只剩这一单时权益立即失效。已消费额度不退。</p>
     <div class="modal-box">
       <div class="row"><span>订单号</span><b class="mono">${esc(o.id)}</b></div>
-      <div class="row"><span>用户</span><b>${esc(o.user)} · ${esc(o.emp)}</b></div>
+      <div class="row"><span>用户</span><b>${esc(o.user)} · ${esc(o.email)}</b></div>
       <div class="row"><span>金额</span><b>${money(o.amount)}</b></div>
       <div class="row"><span>支付时间</span><b>${ts(o.paid)}</b></div>
     </div>
@@ -1059,30 +1059,30 @@ function refundModal(id) {
 function pageUsers() {
   return `
   <div class="page-head">
-    <div><h1>用户 / 账号</h1><div class="lead">按用户 ID、工号、姓名、手机号或支付宝 openId 搜索；详情里聚合权益、设备、订单与邀请码。</div></div>
+    <div><h1>用户 / 账号</h1><div class="lead">按邮箱、用户 ID、姓名、手机号或支付宝 openId 搜索；详情里聚合权益、设备、订单与邀请码。</div></div>
     <div class="acts"><button class="btn btn-ghost" onclick="go('invites')">${icon("ticket")}发邀请码</button><button class="btn btn-primary" onclick="toast('已刷新（设计稿）')">${icon("refresh")}刷新</button></div>
   </div>
 
   <div class="card panel" style="margin-bottom:14px">
     <div class="filters">
-      <div class="search"><label class="field"><span class="small muted">搜索</span><span style="position:relative;display:block">${icon("search")}<input class="input" placeholder="用户 ID / 工号 / 姓名 / 手机号 / 支付宝 openId"></span></label></div>
+      <div class="search"><label class="field"><span class="small muted">搜索</span><span style="position:relative;display:block">${icon("search")}<input class="input" placeholder="邮箱 / 用户 ID / 姓名 / 手机号 / 支付宝 openId"></span></label></div>
       <div class="field"><label>账号状态</label><select class="select"><option>全部</option><option>正常</option><option>已停用</option></select></div>
       <div class="field"><label>权益状态</label><select class="select"><option>全部</option><option>有效</option><option>即将到期</option><option>已到期</option><option>已冻结</option></select></div>
       <div class="acts"><button class="btn btn-primary" onclick="toast('搜索（设计稿）')">${icon("search")}搜索</button><button class="btn btn-ghost" onclick="toast('已重置（设计稿）')">重置</button></div>
     </div>
-    <div class="filter-note">当前 <code class="mono">users</code> 表没有 email 字段：第一版先覆盖工号 / 姓名 / 手机号 / userId / 支付宝 openId；邮箱搜索要等账号体系加字段后接入（见设计说明“待确认”）。</div>
+    <div class="filter-note">账号就是邮箱（issue #15 的 <code class="mono">users.email</code>）；不再按工号搜索，也不在界面展示工号。</div>
   </div>
 
   <div class="card panel">
     <div class="panel-head"><h2>用户列表</h2><span class="spacer"></span><span class="sub">共 86 个账号</span></div>
     <div class="table-wrap">
       <table class="table table-cards">
-        <thead><tr><th>用户</th><th>工号</th><th>账号</th><th>权益</th><th>到期</th><th>设备</th><th>注册</th><th class="right">操作</th></tr></thead>
+        <thead><tr><th>用户</th><th>邮箱</th><th>账号</th><th>权益</th><th>到期</th><th>设备</th><th>注册</th><th class="right">操作</th></tr></thead>
         <tbody>
           ${USERS.map((u) => `
             <tr class="row-link" onclick="openUser('${u.id}')">
               <td data-label="用户"><div style="display:flex;align-items:center;gap:8px"><span class="avatar-sm ${u.tone}">${esc(u.name.slice(0, 1))}</span><div><b>${esc(u.name)}</b><div class="muted small mono">${esc(u.id)}</div></div></div></td>
-              <td data-label="工号">${esc(u.emp)}</td>
+              <td data-label="邮箱">${esc(u.email)}</td>
               <td data-label="账号">${badge(u.status)}</td>
               <td data-label="权益">${u.plan === "无" ? '<span class="muted">无</span>' : `${esc(u.plan)} ${badge(u.entStatus)}`}</td>
               <td data-label="到期" class="nowrap">${u.until ? dateOnly(u.until) : "—"}</td>
@@ -1105,7 +1105,7 @@ function userDrawer(id) {
   <div class="drawer-head">
     <span class="avatar-sm ${u.tone}" style="width:40px;height:40px;font-size:15px;border-radius:11px">${esc(u.name.slice(0, 1))}</span>
     <div>
-      <h2>${esc(u.name)} <span class="muted" style="font-size:13px;font-weight:600">· ${esc(u.emp)}</span></h2>
+      <h2>${esc(u.name)} <span class="muted" style="font-size:13px;font-weight:600">· ${esc(u.email)}</span></h2>
       <div class="sub mono">${esc(u.id)}</div>
     </div>
     <div class="close">${badge(u.status, u.status === "active" ? "正常" : "已停用")}<button class="btn btn-ghost btn-icon" style="margin-left:8px" onclick="closeDrawer()" aria-label="关闭">${icon("x")}</button></div>
@@ -1113,6 +1113,7 @@ function userDrawer(id) {
   <div class="drawer-body">
     <div class="section">
       <div class="kv">
+        <div class="wide"><div class="k">邮箱</div><div class="v">${esc(u.email)}</div></div>
         <div><div class="k">手机号</div><div class="v">${esc(u.phone)}</div></div>
         <div><div class="k">注册时间</div><div class="v">${dateOnly(u.created)}</div></div>
         <div class="wide"><div class="k">支付宝 openId</div><div class="v mono">${u.openId ? esc(u.openId) : "—"}</div></div>
@@ -1169,7 +1170,7 @@ function freezeModal(id) {
   return `
     <h3>冻结 ${esc(u.name)} 的账号？</h3>
     <p class="modal-sub">冻结会立即生效：该账号不能再登录、下单，已绑定的设备在能力请求上也会收到 403（<code class="mono">user_for_client</code> 对停用账号 fail-closed）。恢复账号后设备可继续使用，不需要重新配对。</p>
-    <div class="modal-box"><div class="row"><span>用户</span><b>${esc(u.name)} · ${esc(u.emp)}</b></div><div class="row"><span>绑定设备</span><b>${u.devices} 台</b></div></div>
+    <div class="modal-box"><div class="row"><span>用户</span><b>${esc(u.name)} · ${esc(u.email)}</b></div><div class="row"><span>绑定设备</span><b>${u.devices} 台</b></div></div>
     <div class="modal-acts"><button class="btn btn-ghost" onclick="closeModal()">取消</button><button class="btn btn-danger" onclick="closeModal();toast('已冻结账号（设计稿）')">${icon("ban")}确认冻结</button></div>`;
 }
 
@@ -1179,7 +1180,7 @@ function pageEntitlements() {
   <div class="page-head"><div><h1>权益</h1><div class="lead">按到期与状态筛选；调整权益会写审计，退款与延长是两条独立动作。</div></div><div class="acts"><button class="btn btn-primary" onclick="toast('已刷新（设计稿）')">${icon("refresh")}刷新</button></div></div>
   <div class="card panel" style="margin-bottom:14px">
     <div class="filters">
-      <div class="search"><label class="field"><span class="small muted">搜索</span><span style="position:relative;display:block">${icon("search")}<input class="input" placeholder="用户 ID / 工号 / 姓名"></span></label></div>
+      <div class="search"><label class="field"><span class="small muted">搜索</span><span style="position:relative;display:block">${icon("search")}<input class="input" placeholder="邮箱 / 用户 ID / 姓名"></span></label></div>
       <div class="field"><label>状态</label><select class="select"><option>全部</option><option>有效</option><option>已冻结</option><option>已到期</option><option>已退款</option></select></div>
       <div class="field"><label>到期范围</label><select class="select"><option>全部</option><option>7 天内到期</option><option>30 天内到期</option><option>已过期</option></select></div>
       <div class="acts"><button class="btn btn-primary" onclick="toast('筛选（设计稿）')">${icon("search")}筛选</button><button class="btn btn-ghost" onclick="toast('已重置（设计稿）')">重置</button></div>
@@ -1191,7 +1192,7 @@ function pageEntitlements() {
       <thead><tr><th>用户</th><th>套餐</th><th>状态</th><th>到期</th><th>每日音频</th><th>TTS</th><th>设备</th><th class="right">操作</th></tr></thead>
       <tbody>${ENTITLEMENTS.map((e) => `
         <tr>
-          <td data-label="用户"><b>${esc(e.name)}</b> <span class="muted small">${esc(e.emp)}</span><div class="muted small mono">${esc(e.userId)}</div></td>
+          <td data-label="用户"><b>${esc(e.name)}</b> <span class="muted small">${esc(e.email)}</span><div class="muted small mono">${esc(e.userId)}</div></td>
           <td data-label="套餐">${esc(e.plan)}</td>
           <td data-label="状态">${badge(e.status, e.status === "expiring" ? "即将到期" : e.status === "active" ? "有效" : e.status === "frozen" ? "已冻结" : "已到期")}</td>
           <td data-label="到期" class="nowrap">${e.until ? dateOnly(e.until) : "—"}</td>

@@ -5,121 +5,543 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>ECHO 能力后端 · 管理面</title>
 <style>
-  :root { --bg:#0f1115; --card:#171a21; --card2:#1e222b; --text:#e6e8ec;
-          --muted:#9aa3b2; --border:#2a2f3a; --green:#3fb950; --red:#f85149;
-          --yellow:#d29922; --accent:#388bfd; }
-  * { box-sizing:border-box; min-width:0; }
-  body { margin:0; background:var(--bg); color:var(--text);
-         font:14px/1.6 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif; }
-  header { display:flex; align-items:center; gap:12px; flex-wrap:wrap;
-           padding:10px 16px; border-bottom:1px solid var(--border); }
-  header .t { font-weight:600; }
-  header .sub { color:var(--muted); font-size:12px; }
-  header .spacer { flex:1; }
-  button { background:var(--card2); color:var(--text); border:1px solid var(--border);
-           border-radius:6px; padding:6px 12px; cursor:pointer; font-size:13px; }
-  button:hover { border-color:var(--accent); }
-  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
-  button.danger { color:var(--red); border-color:#5a2a2a; }
-  button.danger:hover { border-color:var(--red); }
-  main { padding:12px 16px 40px; max-width:1200px; margin:0 auto; }
-  .tabs { display:flex; gap:6px; flex-wrap:wrap; margin-bottom:12px; }
-  .tabs button.active { background:var(--accent); border-color:var(--accent); color:#fff; }
-  .card { background:var(--card); border:1px solid var(--border); border-radius:10px;
-          padding:12px 14px; margin-bottom:12px; min-width:0; }
-  .card h2 { margin:0 0 8px; font-size:14px; font-weight:600; }
-  .card.once { border-color:var(--yellow); }
-  .kv { display:flex; gap:18px; flex-wrap:wrap; }
-  .kv div { min-width:0; }
-  .kv b { display:block; font-size:18px; }
-  .kv span { color:var(--muted); font-size:12px; }
-  table { width:100%; border-collapse:collapse; font-size:13px; }
-  th,td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--border); }
-  th { color:var(--muted); font-weight:500; }
-  code { background:var(--bg); border:1px solid var(--border); border-radius:4px;
-         padding:1px 5px; font-size:12px; }
-  .muted { color:var(--muted); }
-  .badge { padding:1px 8px; border-radius:10px; font-size:12px;
-           border:1px solid var(--border); }
-  .on { color:var(--green); border-color:var(--green); }
-  .off { color:var(--red); border-color:var(--red); }
-  .idle { color:var(--yellow); border-color:var(--yellow); }
-  #login { max-width:340px; margin:12vh auto; }
-  #login input { width:100%; margin:6px 0; padding:8px 10px; border-radius:6px;
-                 border:1px solid var(--border); background:var(--card2); color:var(--text); }
-  #err { color:var(--red); font-size:13px; min-height:20px; }
-  .hidden { display:none !important; }
-  .form { display:flex; gap:10px; flex-wrap:wrap; align-items:flex-end; margin-top:8px; }
-  .form label { display:flex; flex-direction:column; gap:4px; font-size:12px; color:var(--muted); }
-  .form input, .form select { padding:6px 8px; border-radius:6px; min-width:170px;
-                              border:1px solid var(--border); background:var(--card2);
-                              color:var(--text); font-size:13px; }
-  .acts { display:flex; gap:6px; flex-wrap:wrap; }
-  .acts button { padding:3px 8px; font-size:12px; }
-  .secret { font-family:ui-monospace,Consolas,monospace; font-size:13px; word-break:break-all;
-            background:var(--bg); border:1px solid var(--yellow); border-radius:6px;
-            padding:8px 10px; margin-top:8px; user-select:all; }
-  .errtxt { color:var(--red); font-size:12px; min-height:16px; margin-top:6px; }
-  /* 性能页签：**4 张图，一行 2 个、共 2 行**（窄屏落成 1 列，免得图变成一条线） */
-  .charts { display:grid; grid-template-columns:repeat(2, minmax(0, 1fr)); gap:12px; }
-  @media (max-width:820px) { .charts { grid-template-columns:minmax(0, 1fr); } }
-  .chart { margin-bottom:0; }
-  .chart h2 { display:flex; justify-content:space-between; align-items:baseline; gap:8px; }
-  .chart h2 .now { color:var(--muted); font-size:12px; font-weight:400; text-align:right; }
-  .chart svg { display:block; width:100%; height:auto; }
-  .legend { display:flex; gap:12px; flex-wrap:wrap; color:var(--muted); font-size:12px;
-            margin-top:4px; }
-  .swatch { display:inline-block; width:10px; height:10px; border-radius:2px;
-            margin-right:4px; vertical-align:middle; }
-  .perfbar { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
-  .perfbar .stat { color:var(--muted); font-size:12px; }
+  /* 视觉 token 与官网 site/assets/site.css 同一套（浅色、蓝主色、卡片）。
+     管理面仍是单文件：不引外部 CDN / 框架 / 字体 / 图标 sprite。 */
+  :root {
+    --ink:#0b1220; --ink-2:#1e293b; --muted:#5b6b84; --muted-2:#7c8ca6;
+    --line:#e3e9f3; --bg:#f6f8fc; --card:#fff;
+    --brand:#2563eb; --brand-2:#0ea5a4; --brand-ink:#1d4ed8; --brand-soft:#eaf1ff;
+    --ok:#0f9d58; --ok-soft:#e8f8ef; --warn:#b45309; --warn-soft:#fff7ed;
+    --danger:#dc2626; --danger-soft:#fef2f2; --info-soft:#eff6ff;
+    --shadow:0 16px 50px rgba(15,23,42,.09); --shadow-sm:0 6px 22px rgba(15,23,42,.06);
+    --radius:18px; --radius-sm:12px;
+    --font:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB",
+           "Microsoft YaHei","Noto Sans CJK SC",sans-serif;
+    --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box;min-width:0}
+  body{margin:0;color:var(--ink);background:var(--bg);font-family:var(--font);
+       font-size:14.5px;line-height:1.6;-webkit-font-smoothing:antialiased}
+  a{color:inherit;text-decoration:none}
+  button,input,select,textarea{font-family:inherit;font-size:inherit}
+  h1,h2,h3,p{margin:0}
+  ul{margin:0;padding:0;list-style:none}
+  .hidden{display:none!important}
+  .ico{width:18px;height:18px;flex:0 0 auto;fill:none;stroke:currentColor;stroke-width:1.8;
+       stroke-linecap:round;stroke-linejoin:round}
+  .mono{font-family:var(--mono);font-size:.92em}
+  .nowrap{white-space:nowrap}
+  .muted{color:var(--muted)}
+  .small{font-size:12.5px}
+
+  /* 侧栏 */
+  .shell{display:grid;grid-template-columns:244px minmax(0,1fr);min-height:100vh}
+  .sidebar{position:sticky;top:0;height:100vh;overflow-y:auto;background:var(--card);
+           border-right:1px solid var(--line);padding:18px 12px 16px;display:flex;
+           flex-direction:column;gap:4px}
+  .brand{display:flex;align-items:center;gap:10px;padding:4px 10px 16px}
+  .brand-mark{width:34px;height:34px;border-radius:10px;display:grid;place-items:center;
+              color:#fff;background:linear-gradient(135deg,var(--brand),#3b82f6 60%,var(--brand-2));
+              box-shadow:0 8px 20px rgba(37,99,235,.25)}
+  .brand-mark .ico{width:19px;height:19px;stroke-width:2}
+  .brand-text{display:grid;line-height:1.25}
+  .brand-text strong{font-size:14.5px;letter-spacing:.2px}
+  .brand-text span{color:var(--muted-2);font-size:11px;letter-spacing:.5px}
+  .nav-label{padding:14px 12px 6px;color:var(--muted-2);font-size:11px;font-weight:800;
+             letter-spacing:1.2px;text-transform:uppercase}
+  .nav-item{display:flex;align-items:center;gap:10px;min-height:38px;padding:0 12px;
+            border-radius:10px;color:var(--muted);font-size:13.5px;font-weight:600;
+            cursor:pointer;border:1px solid transparent;transition:background .14s,color .14s}
+  .nav-item:hover{background:#f3f7fe;color:var(--ink-2)}
+  .nav-item.is-active{color:var(--brand-ink);background:var(--brand-soft);
+                      border-color:#d9e6ff;font-weight:700}
+  .nav-item .ico{width:17px;height:17px}
+  .nav-item .count{margin-left:auto;min-width:20px;height:19px;padding:0 6px;border-radius:6px;
+                   background:#eef3fb;color:var(--muted);font-size:11px;font-weight:800;
+                   display:grid;place-items:center}
+  .sidebar-foot{margin-top:auto;padding:14px 12px 2px;border-top:1px solid var(--line)}
+  .sidebar-foot .row{display:flex;align-items:center;gap:8px}
+  .env-dot{width:8px;height:8px;border-radius:50%;background:var(--ok);
+           box-shadow:0 0 0 4px rgba(15,157,88,.12);flex:0 0 auto}
+  .sidebar-foot small{display:block;color:var(--muted-2);font-size:11.5px;line-height:1.5}
+
+  /* 顶栏 / 内容 */
+  .main{min-width:0}
+  .topbar{position:sticky;top:0;z-index:20;display:flex;align-items:center;gap:12px;
+          min-height:60px;padding:0 28px;background:rgba(246,248,252,.9);
+          backdrop-filter:saturate(180%) blur(14px);border-bottom:1px solid var(--line)}
+  .crumb{display:flex;align-items:center;gap:7px;color:var(--muted-2);font-size:12.5px}
+  .crumb b{color:var(--ink-2);font-weight:700}
+  .topbar .spacer{flex:1}
+  .env-pill{display:inline-flex;align-items:center;gap:7px;height:30px;padding:0 11px;
+            border:1px solid var(--line);border-radius:999px;background:#fff;
+            color:var(--muted);font-size:12px;font-weight:700;white-space:nowrap}
+  .env-pill .dot{width:7px;height:7px;border-radius:50%;background:var(--ok)}
+  .avatar{width:30px;height:30px;border-radius:9px;display:grid;place-items:center;color:#fff;
+          font-size:12px;font-weight:800;background:linear-gradient(135deg,var(--brand),var(--brand-2))}
+  .who{display:grid;line-height:1.25}
+  .who b{font-size:12.5px}
+  .who span{color:var(--muted-2);font-size:11px}
+  .menu-btn{display:none}
+  #view{padding:24px 28px 60px;max-width:1320px}
+
+  /* 通用控件 */
+  .btn{display:inline-flex;align-items:center;justify-content:center;gap:7px;min-height:36px;
+       padding:0 14px;border-radius:10px;cursor:pointer;border:1px solid transparent;
+       font-size:13px;font-weight:700;white-space:nowrap;
+       transition:box-shadow .14s,border-color .14s,transform .14s}
+  .btn:active{transform:translateY(1px)}
+  .btn .ico{width:15px;height:15px}
+  .btn-primary{color:#fff;background:linear-gradient(135deg,var(--brand) 0%,#3b82f6 60%,var(--brand-2) 130%);
+               box-shadow:0 8px 18px rgba(37,99,235,.22)}
+  .btn-primary:hover{box-shadow:0 11px 24px rgba(37,99,235,.3)}
+  .btn-ghost{color:var(--ink-2);background:#fff;border-color:var(--line)}
+  .btn-ghost:hover{border-color:#c7d4ea;box-shadow:var(--shadow-sm)}
+  .btn-subtle{color:var(--muted);background:#f3f7fe;border-color:transparent}
+  .btn-subtle:hover{color:var(--brand-ink);background:var(--brand-soft)}
+  .btn-danger{color:var(--danger);background:#fff;border-color:#f3c7c7}
+  .btn-danger:hover{background:var(--danger-soft);border-color:#eda3a3}
+  .btn-sm{min-height:30px;padding:0 10px;font-size:12px;border-radius:8px}
+  .btn-icon{width:34px;padding:0}
+  .btn[disabled]{opacity:.45;cursor:not-allowed}
+  button.primary{color:#fff;border-color:var(--brand);background:var(--brand);border-radius:8px;
+                 padding:7px 13px;font-size:13px;font-weight:700;cursor:pointer}
+  button.danger{color:var(--danger);background:#fff;border:1px solid #f3c7c7;border-radius:8px;
+                padding:7px 13px;font-size:13px;cursor:pointer}
+  button:not(.primary):not(.danger){cursor:pointer}
+  .input,.select{width:100%;min-height:38px;padding:0 11px;border:1px solid var(--line);
+                 border-radius:10px;background:#fff;color:var(--ink);outline:none;
+                 transition:border-color .14s,box-shadow .14s}
+  .input::placeholder{color:#a7b4c8}
+  .input:focus,.select:focus{border-color:#93b4f5;box-shadow:0 0 0 3px rgba(37,99,235,.1)}
+  .select{appearance:none;padding-right:30px;
+          background-image:linear-gradient(45deg,transparent 50%,#7c8ca6 50%),
+                           linear-gradient(135deg,#7c8ca6 50%,transparent 50%);
+          background-position:calc(100% - 15px) 16px,calc(100% - 10px) 16px;
+          background-size:5px 5px,5px 5px;background-repeat:no-repeat}
+  .field{display:grid;gap:6px}
+  .field>label{color:var(--ink-2);font-size:12px;font-weight:700}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);
+        box-shadow:var(--shadow-sm);min-width:0;padding:18px 20px;margin-bottom:14px}
+  .card h2{font-size:15px;font-weight:800;letter-spacing:-.1px;margin:0 0 12px;display:flex;
+           align-items:center;gap:10px;justify-content:space-between}
+  .card.once{border-color:#fcd34d;background:#fffdf7}
+  .panel-head{display:flex;align-items:center;gap:10px;margin-bottom:12px}
+  .panel-head h2{font-size:15px;font-weight:800;margin:0}
+  .panel-head .spacer{flex:1}
+  .panel-head .sub{color:var(--muted-2);font-size:12px;font-weight:500}
+  .page-head{display:flex;align-items:flex-end;gap:18px;margin-bottom:18px;flex-wrap:wrap}
+  .page-head h1{font-size:25px;line-height:1.2;letter-spacing:-.6px;font-weight:850}
+  .page-head .lead{margin-top:5px;color:var(--muted);font-size:13px}
+  .page-head .acts{margin-left:auto;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+  .grid{display:grid;gap:14px}
+  .grid-4{grid-template-columns:repeat(4,minmax(0,1fr))}
+  .grid-3{grid-template-columns:repeat(3,minmax(0,1fr))}
+  .grid-2{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .grid-7-3{grid-template-columns:minmax(0,1.65fr) minmax(0,1fr)}
+  .stack{display:grid;gap:14px;align-content:start}
+  .stack>.card{align-self:start}
+
+  .kpi{padding:16px 18px;display:grid;gap:8px}
+  .kpi-top{display:flex;align-items:center;gap:9px;color:var(--muted);font-size:12.5px;font-weight:600}
+  .kpi-icon{width:28px;height:28px;border-radius:9px;display:grid;place-items:center;
+            color:var(--brand-ink);background:var(--brand-soft)}
+  .kpi-icon .ico{width:15px;height:15px}
+  .kpi-icon.ok{color:var(--ok);background:var(--ok-soft)}
+  .kpi-icon.warn{color:var(--warn);background:var(--warn-soft)}
+  .kpi-icon.danger{color:var(--danger);background:var(--danger-soft)}
+  .kpi-value{font-size:27px;line-height:1.05;font-weight:850;letter-spacing:-1px}
+  .kpi-value small{font-size:13px;font-weight:700;color:var(--muted);letter-spacing:0}
+  .kpi-foot{color:var(--muted-2);font-size:11.5px;display:flex;gap:6px;align-items:center}
+  .alert-strip{display:flex;align-items:center;gap:12px;padding:12px 16px;border:1px solid #fed7aa;
+               background:var(--warn-soft);border-radius:var(--radius-sm);color:#8a4b08;font-size:13px}
+  .alert-strip .ico{width:17px;height:17px;flex:0 0 auto}
+  .alert-strip b{font-weight:800}
+  .alert-strip .spacer{flex:1}
+  .filters{display:grid;grid-template-columns:minmax(220px,1.5fr) repeat(3,minmax(130px,.7fr));
+           gap:10px;align-items:end}
+  .filters .search{position:relative}
+  .filters .search .ico{position:absolute;left:11px;top:50%;transform:translateY(-50%);width:16px;height:16px;
+                        color:var(--muted-2);pointer-events:none;z-index:2}
+  .filters .search .input{padding-left:34px}
+  .filters .acts{display:flex;gap:8px}
+  .filter-note{margin-top:10px;color:var(--muted-2);font-size:12px}
+
+  .table-wrap{overflow-x:auto}
+  .table{width:100%;border-collapse:collapse;font-size:13px}
+  .table th,.table td{padding:11px 10px;text-align:left;border-bottom:1px solid var(--line);vertical-align:middle}
+  .table th{color:var(--muted-2);font-size:11.5px;font-weight:800;letter-spacing:.3px;white-space:nowrap}
+  .table tbody tr{transition:background .12s}
+  .table tbody tr:hover{background:#f9fbff}
+  .table tbody tr:last-child td{border-bottom:0}
+  .table td.right,.table th.right{text-align:right}
+  .table td.nowrap{white-space:nowrap}
+  .table .order-id{display:inline-flex;align-items:center;gap:6px;font-family:var(--mono);
+                   font-size:12px;white-space:nowrap}
+  .copy-btn{width:22px;height:22px;padding:0;display:inline-grid;place-items:center;
+            border:1px solid transparent;border-radius:6px;background:transparent;
+            color:var(--muted-2);cursor:pointer}
+  .copy-btn:hover{color:var(--brand-ink);background:var(--brand-soft);border-color:#d9e6ff}
+  .copy-btn .ico{width:13px;height:13px}
+  .row-link{cursor:pointer}
+  .row-link:focus-visible{outline:2px solid #93b4f5;outline-offset:-2px}
+
+  .badge{display:inline-flex;align-items:center;gap:5px;height:22px;padding:0 8px;border-radius:7px;
+         font-size:11.5px;font-weight:800;white-space:nowrap;background:#f1f5f9;color:var(--muted)}
+  .badge .dot{width:6px;height:6px;border-radius:50%;background:currentColor}
+  .badge.ok,.badge.on{background:var(--ok-soft);color:#0f7a43}
+  .badge.info{background:var(--info-soft);color:var(--brand-ink)}
+  .badge.warn,.badge.idle{background:var(--warn-soft);color:#9a3412}
+  .badge.danger,.badge.off{background:var(--danger-soft);color:#b91c1c}
+  .badge.muted{background:#f1f5f9;color:var(--muted)}
+  .pager{display:flex;align-items:center;gap:10px;padding:12px 4px 0;color:var(--muted);font-size:12px;flex-wrap:wrap}
+  .pager .spacer{flex:1}
+  .pager .pages{display:flex;gap:4px}
+  .pager .page{min-width:28px;height:28px;padding:0 8px;display:grid;place-items:center;
+               border:1px solid var(--line);border-radius:8px;background:#fff;color:var(--muted);
+               font-size:12px;font-weight:700;cursor:pointer}
+  .pager .page.is-active{background:var(--brand-soft);border-color:#cfe0ff;color:var(--brand-ink)}
+  .pager .page[disabled]{opacity:.4;cursor:not-allowed}
+  .empty{padding:34px 18px;text-align:center;color:var(--muted)}
+  .empty .ico{width:30px;height:30px;margin:0 auto 8px;color:#b7c5da}
+  .empty b{display:block;color:var(--ink-2);font-size:14px;margin-bottom:3px}
+  .errtxt{color:var(--danger);font-size:12px;min-height:16px;margin-top:6px}
+  .load-error{padding:12px 14px;border-radius:10px;background:var(--danger-soft);
+              color:#b91c1c;font-size:12.5px}
+  .skeleton{height:14px;border-radius:6px;background:linear-gradient(90deg,#eef3fb,#f7faff,#eef3fb);
+            background-size:200% 100%;animation:sk 1.4s infinite}
+  @keyframes sk{0%{background-position:200% 0}100%{background-position:-200% 0}}
+  .mini-list{display:grid;gap:2px}
+  .mini-row{display:flex;align-items:center;gap:10px;padding:9px 2px;border-bottom:1px solid var(--line)}
+  .mini-row:last-child{border-bottom:0}
+  .mini-main{min-width:0;flex:1}
+  .mini-title{font-size:12.5px;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .mini-meta{color:var(--muted-2);font-size:11px;margin-top:1px}
+  .mini-side{text-align:right;flex:0 0 auto}
+  .mini-side b{font-size:12.5px}
+  .mini-side span{display:block;color:var(--muted-2);font-size:11px}
+  .avatar-sm{width:30px;height:30px;border-radius:9px;display:grid;place-items:center;flex:0 0 auto;
+             color:#fff;font-size:12px;font-weight:800;background:linear-gradient(135deg,#60a5fa,#2563eb)}
+  .avatar-sm.t2{background:linear-gradient(135deg,#34d399,#0d9488)}
+  .avatar-sm.t3{background:linear-gradient(135deg,#fbbf24,#d97706)}
+  .avatar-sm.t4{background:linear-gradient(135deg,#c084fc,#7c3aed)}
+
+  .backdrop{position:fixed;inset:0;z-index:40;background:rgba(11,18,32,.32);opacity:0;
+            pointer-events:none;transition:opacity .18s}
+  .backdrop.open{opacity:1;pointer-events:auto}
+  .drawer{position:fixed;top:0;right:0;bottom:0;z-index:41;width:min(560px,100vw);background:var(--card);
+          box-shadow:-24px 0 60px rgba(15,23,42,.16);transform:translateX(102%);
+          transition:transform .2s ease;display:flex;flex-direction:column}
+  .drawer.open{transform:none}
+  .drawer-head{padding:18px 20px 14px;border-bottom:1px solid var(--line);display:flex;
+               align-items:flex-start;gap:12px}
+  .drawer-head h2{font-size:17px;font-weight:850;line-height:1.3;word-break:break-all}
+  .drawer-head .sub{margin-top:4px;color:var(--muted-2);font-size:12px}
+  .drawer-head .close{margin-left:auto;flex:0 0 auto;display:flex;align-items:center;gap:8px}
+  .drawer-body{padding:16px 20px 22px;overflow-y:auto;flex:1}
+  .drawer-foot{padding:13px 20px;border-top:1px solid var(--line);background:#fbfdff;
+               display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap}
+  .drawer-foot .left{margin-right:auto}
+  .section{margin-bottom:18px}
+  .section:last-child{margin-bottom:0}
+  .section-title{color:var(--muted-2);font-size:11.5px;font-weight:800;letter-spacing:.8px;
+                 text-transform:uppercase;margin-bottom:9px}
+  .kv{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px 16px}
+  .kv .k,.kv span{color:var(--muted-2);font-size:11.5px}
+  .kv .v{margin-top:1px;font-size:13px;font-weight:650;word-break:break-all}
+  .kv .wide{grid-column:1/-1}
+  .kv b{display:block;font-size:15px}
+  .amount-hero{display:flex;align-items:baseline;gap:8px;margin:2px 0 10px}
+  .amount-hero b{font-size:30px;font-weight:850;letter-spacing:-1px}
+  .amount-hero span{color:var(--muted);font-size:12.5px}
+  .ent-card{padding:13px 14px;border:1px solid var(--line);border-radius:12px;background:#fbfdff}
+  .ent-head{display:flex;align-items:center;gap:8px}
+  .ent-head b{font-size:14px}
+  .ent-head .badge{margin-left:auto}
+  .ent-metrics{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin-top:10px}
+  .ent-metrics div{padding:8px 9px;border-radius:9px;background:#fff;border:1px solid var(--line)}
+  .ent-metrics span{display:block;color:var(--muted-2);font-size:10.5px}
+  .ent-metrics strong{font-size:12.5px}
+  .device-row{display:flex;align-items:center;gap:10px;padding:10px 12px;border:1px solid var(--line);
+              border-radius:10px}
+  .device-row+.device-row{margin-top:7px}
+  .device-icon{width:30px;height:30px;border-radius:8px;display:grid;place-items:center;
+               background:#f3f7fe;color:var(--brand-ink);flex:0 0 auto}
+  .device-main{min-width:0;flex:1}
+  .device-main b{display:block;font-size:12.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .device-main span{color:var(--muted-2);font-size:11px}
+  .timeline{position:relative;padding-left:20px}
+  .timeline::before{content:"";position:absolute;left:5px;top:5px;bottom:5px;width:1px;background:var(--line)}
+  .tl-item{position:relative;padding:0 0 13px}
+  .tl-item:last-child{padding-bottom:0}
+  .tl-item::before{content:"";position:absolute;left:-19px;top:4px;width:9px;height:9px;border-radius:50%;
+                   background:#fff;border:2px solid #b7c5da}
+  .tl-item.ok::before{border-color:var(--ok)}
+  .tl-item.warn::before{border-color:#f59e0b}
+  .tl-title{font-size:12.5px;font-weight:700}
+  .tl-meta{color:var(--muted-2);font-size:11px;margin-top:1px}
+  .order-mini{display:flex;align-items:center;gap:10px;padding:9px 11px;border:1px solid var(--line);
+              border-radius:10px}
+  .order-mini+.order-mini{margin-top:7px}
+  .order-mini .main{min-width:0;flex:1}
+  .order-mini .main b{display:block;font-size:12px}
+  .order-mini .main span{display:block;color:var(--muted-2);font-size:10.5px}
+  .order-mini .side{text-align:right}
+  .order-mini .side b{display:block;font-size:12px}
+
+  .modal-backdrop{position:fixed;inset:0;z-index:60;display:grid;place-items:center;
+                  background:rgba(11,18,32,.38);padding:20px;opacity:0;pointer-events:none;
+                  transition:opacity .16s}
+  .modal-backdrop.open{opacity:1;pointer-events:auto}
+  .modal{width:min(460px,100%);background:#fff;border-radius:16px;box-shadow:var(--shadow);
+         padding:22px;transform:translateY(8px);transition:transform .16s;max-height:90vh;overflow:auto}
+  .modal-backdrop.open .modal{transform:none}
+  .modal h3{font-size:17px;font-weight:850}
+  .modal .modal-sub{margin-top:6px;color:var(--muted);font-size:12.5px;line-height:1.7}
+  .modal .modal-box{margin-top:14px;padding:11px 13px;border:1px solid var(--line);border-radius:10px;
+                    background:#fbfdff;font-size:12.5px}
+  .modal .modal-box .row{display:flex;justify-content:space-between;gap:12px;padding:3px 0}
+  .modal .modal-box .row span{color:var(--muted)}
+  .modal .modal-acts{margin-top:18px;display:flex;gap:8px;justify-content:flex-end}
+  .modal textarea{width:100%;min-height:66px;margin-top:12px;padding:9px 11px;resize:vertical;
+                  border:1px solid var(--line);border-radius:10px;outline:none}
+  .modal textarea:focus{border-color:#93b4f5;box-shadow:0 0 0 3px rgba(37,99,235,.1)}
+  .toast{position:fixed;left:50%;bottom:26px;transform:translate(-50%,14px);z-index:80;
+         background:var(--ink);color:#fff;font-size:12.5px;padding:10px 16px;border-radius:10px;
+         box-shadow:var(--shadow);opacity:0;pointer-events:none;transition:opacity .18s,transform .18s}
+  .toast.show{opacity:1;transform:translate(-50%,0)}
+
+  /* 登录 */
+  #login{min-height:100vh;display:grid;grid-template-columns:1.06fr .94fr;
+         background:radial-gradient(46% 60% at 16% 18%,rgba(37,99,235,.14),transparent 70%),
+                    radial-gradient(40% 52% at 84% 8%,rgba(14,165,164,.13),transparent 70%),var(--bg)}
+  .login-brand{display:flex;flex-direction:column;justify-content:center;padding:56px clamp(36px,7vw,96px)}
+  .login-brand .brand{padding:0 0 30px}
+  .login-brand h1{font-size:clamp(30px,3.4vw,44px);line-height:1.18;letter-spacing:-1.2px;font-weight:850}
+  .login-brand h1 .accent{background:linear-gradient(100deg,var(--brand),var(--brand-2));
+                          -webkit-background-clip:text;background-clip:text;color:transparent}
+  .login-brand .lead{margin-top:16px;max-width:480px;color:var(--muted);font-size:15px;line-height:1.85}
+  .login-points{margin-top:30px;display:grid;gap:11px;max-width:470px}
+  .login-point{display:flex;gap:10px;align-items:flex-start;padding:12px 14px;border:1px solid var(--line);
+               border-radius:12px;background:rgba(255,255,255,.72)}
+  .login-point .ico{width:17px;height:17px;color:var(--brand-ink);margin-top:2px}
+  .login-point b{display:block;font-size:12.5px}
+  .login-point span{color:var(--muted);font-size:11.5px}
+  .login-side{display:flex;align-items:center;justify-content:center;padding:40px 28px}
+  .login-card{width:min(390px,100%);padding:30px;margin:0}
+  .login-card h2{font-size:20px;font-weight:850;letter-spacing:-.4px;display:block;margin-bottom:6px}
+  .login-card .sub{color:var(--muted);font-size:12.5px}
+  .login-card form{margin-top:22px;display:grid;gap:14px}
+  .login-card .btn{width:100%;min-height:42px;margin-top:4px}
+  .login-card .hint{margin-top:14px;color:var(--muted-2);font-size:11.5px;line-height:1.7;text-align:center}
+  #err{color:var(--danger);font-size:12px;min-height:18px}
+
+  /* 遗留组件的浅色样式（客户端 / 性能 / 存储等旧页继续复用） */
+  .form{display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;margin-top:8px}
+  .form label{display:flex;flex-direction:column;gap:4px;font-size:12px;color:var(--muted)}
+  .form input,.form select{padding:6px 8px;border-radius:8px;min-width:150px;border:1px solid var(--line);
+                           background:#fff;color:var(--ink);font-size:13px}
+  .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+  .acts{display:flex;gap:6px;flex-wrap:wrap}
+  .acts button{padding:3px 8px;font-size:12px}
+  .secret{font-family:var(--mono);font-size:13px;word-break:break-all;background:#fbfdff;
+          border:1px solid #fcd34d;border-radius:8px;padding:8px 10px;margin-top:8px;user-select:all}
+  code{background:#f1f5f9;border:1px solid var(--line);border-radius:5px;padding:1px 5px;
+       font-size:.92em;font-family:var(--mono)}
+  .charts{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}
+  @media(max-width:820px){.charts{grid-template-columns:minmax(0,1fr)}}
+  .chart{margin-bottom:0}
+  .chart h2{display:flex;justify-content:space-between;align-items:baseline;gap:8px}
+  .chart h2 .now{color:var(--muted-2);font-size:12px;font-weight:400;text-align:right}
+  .chart svg{display:block;width:100%;height:auto}
+  .legend{display:flex;gap:12px;flex-wrap:wrap;color:var(--muted);font-size:12px;margin-top:4px}
+  .swatch{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:4px;vertical-align:middle}
+  .perfbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+  .perfbar .stat{color:var(--muted);font-size:12px}
+  .tabs{display:none}
+
+  @media(max-width:1180px){
+    .grid-4{grid-template-columns:repeat(2,minmax(0,1fr))}
+    .grid-7-3{grid-template-columns:1fr}
+    .filters{grid-template-columns:minmax(200px,1.6fr) repeat(3,minmax(120px,.8fr))}
+  }
+  @media(max-width:980px){
+    .shell{grid-template-columns:1fr}
+    .sidebar{position:fixed;inset:0 auto 0 0;z-index:50;width:264px;height:100vh;
+             transform:translateX(-102%);transition:transform .2s;box-shadow:var(--shadow)}
+    .sidebar.open{transform:none}
+    .menu-btn{display:inline-grid}
+    .topbar{padding:0 16px}
+    #view{padding:20px 16px 50px}
+    .grid-3{grid-template-columns:repeat(2,minmax(0,1fr))}
+    .grid-2{grid-template-columns:repeat(2,minmax(0,1fr))}
+    .who{display:none}
+    #login{grid-template-columns:1fr}
+    .login-brand{display:none}
+    .login-side{min-height:100vh}
+  }
+  @media(max-width:780px){
+    .grid-4,.grid-3,.grid-2{grid-template-columns:repeat(2,minmax(0,1fr))}
+    .filters{grid-template-columns:1fr 1fr}
+    .filters .search{grid-column:1/-1}
+    .filters .acts{grid-column:1/-1}
+    .filters .acts .btn{flex:1}
+    .page-head h1{font-size:22px}
+    .page-head .acts{width:100%;margin-left:0}
+    .page-head .acts .btn{flex:1}
+    .topbar .hide-sm{display:none}
+    .pager{flex-wrap:wrap}
+    .drawer{width:100%}
+    .kv{grid-template-columns:1fr}
+    .ent-metrics{grid-template-columns:1fr 1fr}
+    .alert-strip{align-items:flex-start;flex-wrap:wrap}
+    .alert-strip .spacer{display:none}
+    .login-card{padding:24px}
+  }
+  @media(max-width:700px){
+    .table thead{display:none}
+    .table,.table tbody,.table tr,.table td{display:block;width:100%}
+    .table tbody tr{border:1px solid var(--line);border-radius:12px;padding:10px 12px;
+                    margin-bottom:9px;background:#fff}
+    .table tbody tr:hover{background:#fff}
+    .table td{border:0;padding:3px 0;display:flex;justify-content:flex-end;align-items:baseline;
+              gap:6px;flex-wrap:wrap;text-align:right}
+    .table td::before{content:attr(data-label);color:var(--muted-2);font-size:11.5px;
+                      font-weight:650;text-align:left;flex:0 0 auto;margin-right:auto}
+    .table td:empty{display:none}
+    .table td.right{text-align:right}
+    .table td .order-id{justify-content:flex-end}
+    .grid-4,.grid-3,.grid-2{grid-template-columns:1fr}
+  }
+  @media(max-width:480px){
+    #view{padding:16px 12px 44px}
+    .topbar{padding:0 12px}
+    .filters{grid-template-columns:1fr}
+    .ent-metrics{grid-template-columns:1fr}
+    .kpi-value{font-size:24px}
+    .drawer-body,.drawer-head,.drawer-foot{padding-left:14px;padding-right:14px}
+    .modal{padding:18px}
+  }
+  @media(prefers-reduced-motion:reduce){
+    *,*::before,*::after{animation:none!important;transition:none!important}
+    html{scroll-behavior:auto}
+  }
 </style>
 </head>
 <body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <symbol id="i-wave" viewBox="0 0 24 24"><path d="M4 10v4M8 7v10M12 4v16M16 7v10M20 10v4"/></symbol>
+  <symbol id="i-grid" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></symbol>
+  <symbol id="i-receipt" viewBox="0 0 24 24"><path d="M5 3h14v18l-3-2-2 2-2-2-2 2-2-2-3 2V3z"/><path d="M8 7h8M8 11h8M8 15h5"/></symbol>
+  <symbol id="i-users" viewBox="0 0 24 24"><circle cx="9" cy="8" r="3.2"/><path d="M3.5 20c.5-3.4 2.7-5.2 5.5-5.2s5 1.8 5.5 5.2"/><circle cx="17" cy="9" r="2.6"/><path d="M16 14.6c2.4.1 4 1.7 4.5 4.4"/></symbol>
+  <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 3l7 3v5.5c0 4.4-3 7.7-7 9.5-4-1.8-7-5.1-7-9.5V6l7-3z"/><path d="M9 12l2 2 4-4"/></symbol>
+  <symbol id="i-package" viewBox="0 0 24 24"><path d="M12 3l8 4.2v9.6L12 21l-8-4.2V7.2L12 3z"/><path d="M4.2 7.3L12 11.6l7.8-4.3M12 11.6V21"/></symbol>
+  <symbol id="i-ticket" viewBox="0 0 24 24"><path d="M3 9a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2 2 2 0 0 0 0 4 2 2 0 0 1-2 2H5a2 2 0 0 1-2-2 2 2 0 0 0 0-4z"/><path d="M14 7v10" stroke-dasharray="2 3"/></symbol>
+  <symbol id="i-webhook" viewBox="0 0 24 24"><path d="M9 8.5A4 4 0 1 1 15.2 11M7 15.5l2.5-4.3M17.5 15.5l-2.6-4.3M9.5 20h5"/><circle cx="6.5" cy="18" r="2.5"/><circle cx="17.5" cy="18" r="2.5"/></symbol>
+  <symbol id="i-activity" viewBox="0 0 24 24"><path d="M3 12h4l2.5-7 5 14 2.5-7h4"/></symbol>
+  <symbol id="i-cpu" viewBox="0 0 24 24"><rect x="7" y="7" width="10" height="10" rx="2"/><path d="M10 3v3M14 3v3M10 18v3M14 18v3M3 10h3M3 14h3M18 10h3M18 14h3"/></symbol>
+  <symbol id="i-server" viewBox="0 0 24 24"><rect x="4" y="3" width="16" height="7" rx="2"/><rect x="4" y="14" width="16" height="7" rx="2"/><path d="M8 6.5h.01M8 17.5h.01"/></symbol>
+  <symbol id="i-device" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></symbol>
+  <symbol id="i-chart" viewBox="0 0 24 24"><path d="M4 20V10M10 20V4M16 20v-7M22 20V7"/></symbol>
+  <symbol id="i-db" viewBox="0 0 24 24"><ellipse cx="12" cy="5" rx="7" ry="3"/><path d="M5 5v14c0 1.7 3.1 3 7 3s7-1.3 7-3V5"/><path d="M5 12c0 1.7 3.1 3 7 3s7-1.3 7-3"/></symbol>
+  <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.8 2.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6v.2h-4v-.2a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L4.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9A1.7 1.7 0 0 0 3 14H2.8v-4H3a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9L4.2 7 7 4.2l.1.1A1.7 1.7 0 0 0 9 4.6a1.7 1.7 0 0 0 1-1.6v-.2h4V3a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.2v4H21a1.7 1.7 0 0 0-1.6 1z"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4"/></symbol>
+  <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 11a8 8 0 1 0-2.3 5.7"/><path d="M20 4v7h-7"/></symbol>
+  <symbol id="i-menu" viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h16"/></symbol>
+  <symbol id="i-x" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></symbol>
+  <symbol id="i-copy" viewBox="0 0 24 24"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></symbol>
+  <symbol id="i-external" viewBox="0 0 24 24"><path d="M14 4h6v6M20 4l-9 9"/><path d="M19 14v5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h5"/></symbol>
+  <symbol id="i-alert" viewBox="0 0 24 24"><path d="M12 3l9.5 17h-19L12 3z"/><path d="M12 9v5M12 17.5h.01"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><path d="M4 12.5l5 5L20 6.5"/></symbol>
+  <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3.5 2"/></symbol>
+  <symbol id="i-card" viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3 10h18M7 15h4"/></symbol>
+  <symbol id="i-undo" viewBox="0 0 24 24"><path d="M9 7L4 12l5 5"/><path d="M4 12h9a7 7 0 0 1 7 7v1"/></symbol>
+  <symbol id="i-snow" viewBox="0 0 24 24"><path d="M12 2v20M3.5 7l17 10M20.5 7l-17 10"/><path d="M9.5 4.5L12 7l2.5-2.5M9.5 19.5L12 17l2.5 2.5"/></symbol>
+  <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+  <symbol id="i-user" viewBox="0 0 24 24"><circle cx="12" cy="8" r="4"/><path d="M4 21c.7-4.2 3.6-6.5 8-6.5s7.3 2.3 8 6.5"/></symbol>
+  <symbol id="i-edit" viewBox="0 0 24 24"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></symbol>
+  <symbol id="i-ban" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M5.5 5.5l13 13"/></symbol>
+  <symbol id="i-play" viewBox="0 0 24 24"><path d="M7 4l13 8-13 8V4z"/></symbol>
+  <symbol id="i-phone" viewBox="0 0 24 24"><rect x="6" y="2" width="12" height="20" rx="3"/><path d="M10 18h4"/></symbol>
+  <symbol id="i-chevron" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></symbol>
+</defs></svg>
+
+<!-- 登录 -->
 <div id="login">
-  <div class="card">
-    <h2>ECHO 能力后端 · 管理面</h2>
-    <div class="muted" style="font-size:12px">
-      模型、客户端、调用与「存了什么」，以及<b>发授权 / 禁用 / 撤销 / 改权限与配额 / 轮换 secret /
-      运行参数（并发·队列，改完立刻生效）</b>。
-      写动作要登录，且只在<b>本站页面</b>里能发（跨站请求一律 403）。
+  <div class="login-brand">
+    <div class="brand">
+      <div class="brand-mark"><svg class="ico"><use href="#i-wave"/></svg></div>
+      <div class="brand-text"><strong>ECHO 管理面</strong><span>CAPABILITY ADMIN</span></div>
     </div>
-    <input id="u" placeholder="管理员用户名" autocomplete="username">
-    <input id="p" type="password" placeholder="口令" autocomplete="current-password">
-    <div style="display:flex;gap:8px;align-items:center">
-      <button class="primary" id="btnLogin">登录</button>
-      <span id="err"></span>
+    <h1>把订单、账号与运行状态<br><span class="accent">放进同一张运营台</span>。</h1>
+    <p class="lead">与官网同一套视觉与交互。登录后按「运营 / 运行 / 系统」三组导航，查单、退款、看权益、处理回调不再挤在一个页签里。</p>
+    <div class="login-points">
+      <div class="login-point"><svg class="ico"><use href="#i-receipt"/></svg><div><b>订单与用户优先</b><span>按订单号、邮箱、状态、时间筛选；详情抽屉里直接退款与主动查询。</span></div></div>
+      <div class="login-point"><svg class="ico"><use href="#i-shield"/></svg><div><b>安全边界不变</b><span>仅回环 / SSH 隧道可访问；CSRF、Origin、X-ECHO-Admin 校验照旧。</span></div></div>
+      <div class="login-point"><svg class="ico"><use href="#i-activity"/></svg><div><b>现有运维能力保留</b><span>模型、客户端/发授权、调用、性能、存储继续在原处，只重新分组。</span></div></div>
+    </div>
+  </div>
+  <div class="login-side">
+    <div class="card login-card">
+      <h2>登录管理面</h2>
+      <div class="sub">仅限管理员。写操作仍需要同站来源与 CSRF 令牌。</div>
+      <form id="loginForm">
+        <div class="field"><label for="u">管理员用户名</label><input class="input" id="u" autocomplete="username"></div>
+        <div class="field"><label for="p">口令</label><input class="input" id="p" type="password" autocomplete="current-password"></div>
+        <div id="err"></div>
+        <button class="btn btn-primary" type="submit" id="btnLogin">登录</button>
+      </form>
+      <p class="hint">登录失败 5 次会锁 5 分钟；账号与口令不会被记进浏览器存储。</p>
     </div>
   </div>
 </div>
 
-<div id="app" class="hidden">
-  <header>
-    <span class="t">ECHO 能力后端</span>
-    <span class="sub" id="hdr"></span>
-    <span class="spacer"></span>
-    <span class="sub" id="who"></span>
-    <button id="btnPwd">修改口令</button>
-    <button id="btnReload">刷新</button>
-    <button id="btnLogout">登出</button>
-  </header>
-  <main>
-    <div class="tabs">
-      <button data-tab="overview" class="active">概览</button>
-      <button data-tab="models">模型</button>
-      <button data-tab="clients">客户端 / 发授权</button>
-      <button data-tab="calls">调用</button>
-      <button data-tab="perf">性能</button>
-      <button data-tab="billing">收费 / 账号</button>
-      <button data-tab="inventory">存了什么</button>
+<!-- 主界面 -->
+<div id="app" class="shell hidden">
+  <aside class="sidebar" id="sidebar">
+    <div class="brand">
+      <div class="brand-mark"><svg class="ico"><use href="#i-wave"/></svg></div>
+      <div class="brand-text"><strong>ECHO 管理面</strong><span>CAPABILITY ADMIN</span></div>
     </div>
-    <div id="view"></div>
-  </main>
+    <div class="nav-label">运营</div>
+    <a class="nav-item" data-tab="overview" href="#overview"><svg class="ico"><use href="#i-grid"/></svg>概览</a>
+    <a class="nav-item" data-tab="orders" href="#orders"><svg class="ico"><use href="#i-receipt"/></svg>订单</a>
+    <a class="nav-item" data-tab="users" href="#users"><svg class="ico"><use href="#i-users"/></svg>用户 / 账号</a>
+    <a class="nav-item" data-tab="entitlements" href="#entitlements"><svg class="ico"><use href="#i-shield"/></svg>权益</a>
+    <a class="nav-item" data-tab="plans" href="#plans"><svg class="ico"><use href="#i-package"/></svg>套餐</a>
+    <a class="nav-item" data-tab="invites" href="#invites"><svg class="ico"><use href="#i-ticket"/></svg>邀请码</a>
+    <a class="nav-item" data-tab="notifies" href="#notifies"><svg class="ico"><use href="#i-webhook"/></svg>支付回调</a>
+    <div class="nav-label">运行</div>
+    <a class="nav-item" data-tab="models" href="#models"><svg class="ico"><use href="#i-cpu"/></svg>模型</a>
+    <a class="nav-item" data-tab="clients" href="#clients"><svg class="ico"><use href="#i-device"/></svg>客户端 / 发授权</a>
+    <a class="nav-item" data-tab="calls" href="#calls"><svg class="ico"><use href="#i-activity"/></svg>调用</a>
+    <a class="nav-item" data-tab="perf" href="#perf"><svg class="ico"><use href="#i-chart"/></svg>性能</a>
+    <a class="nav-item" data-tab="inventory" href="#inventory"><svg class="ico"><use href="#i-db"/></svg>存储</a>
+    <div class="nav-label">系统</div>
+    <a class="nav-item" data-tab="audit" href="#audit"><svg class="ico"><use href="#i-edit"/></svg>操作审计</a>
+    <a class="nav-item" data-tab="system" href="#system"><svg class="ico"><use href="#i-settings"/></svg>系统状态</a>
+    <div class="sidebar-foot">
+      <div class="row"><span class="env-dot"></span><b class="small">后端运行中</b></div>
+      <small id="hdr">—</small>
+    </div>
+  </aside>
+  <div class="main">
+    <header class="topbar">
+      <button class="btn btn-ghost btn-icon menu-btn" id="btnMenu" onclick="toggleNav()" aria-label="打开导航"><svg class="ico"><use href="#i-menu"/></svg></button>
+      <div class="crumb hide-sm">管理面 <span>/</span> <b id="crumb">概览</b></div>
+      <div class="spacer"></div>
+      <span class="env-pill" id="envPill"><span class="dot"></span><span id="envText">管理面</span></span>
+      <span class="who"><b id="who">—</b><span>管理员</span></span>
+      <button class="btn btn-ghost btn-sm" id="btnReload"><svg class="ico"><use href="#i-refresh"/></svg><span class="hide-sm">刷新</span></button>
+      <button class="btn btn-ghost btn-sm" id="btnPwd">修改口令</button>
+      <button class="btn btn-ghost btn-sm" id="btnLogout">登出</button>
+    </header>
+    <main id="view"></main>
+  </div>
 </div>
 
-<!-- 「性能」页签的 4 张图（**一行 2 个、共 2 行**，见 .charts 那个 grid）。
-     放在 <template> 里是为了：① 静态 HTML 里就**真的有 4 个 svg 元素**（用例直接数得出来）；
-     ② 切页签时不重复解析一遍这段标记，克隆进去就行。 -->
+<!-- 性能页的 4 张图（**一行 2 个、共 2 行**；静态 HTML 里就有 4 个 svg） -->
 <template id="perfChartsTpl">
   <div class="charts">
     <div class="card chart">
@@ -145,16 +567,20 @@
   </div>
 </template>
 
+<div class="backdrop" id="backdrop" onclick="closeDrawer()"></div>
+<aside class="drawer" id="drawer" aria-label="详情"></aside>
+<div class="modal-backdrop" id="modal-backdrop"><div class="modal" id="modal" role="dialog" aria-modal="true"></div></div>
+<div class="toast" id="toast"></div>
+
 <script>
+"use strict";
 const $ = (s) => document.querySelector(s);
+const $$ = (s) => Array.from(document.querySelectorAll(s));
 let CSRF = "";
-/* 「只显示这一次」的东西（新 secret / 新配对串）只活在这个变量里：
-   刷新页面 = 变量没了 = 不再回显。后端也不会再给（库里只有哈希）。 */
 let ONCE = null;
-/* 改口令的策略（位数上下限）。**由 `/admin/api/admins` 带下来**（那就是权威那份，
-   见 `server/admin.py` 的 `MIN_PASSWORD_LEN`）；这里的初值只是"还没读到"时的兜底，
-   页面拿它做**提前提示**，真正的判定在服务端。 */
 let PWD = { minLength: 8, maxLength: 200 };
+let BILLING_PLANS = {};
+let BILLING_RULES = null;
 
 async function api(path, opts = {}) {
   const res = await fetch(path, { credentials: "same-origin", ...opts });
@@ -167,9 +593,6 @@ async function api(path, opts = {}) {
   if (res.status === 401 && !$("#app").classList.contains("hidden")) showLogin();
   throw new Error(msg);
 }
-
-/* 写请求：必须带**非简单请求标志头**与 CSRF 令牌（Origin 由浏览器自己带）。
-   这两个头不是"再多验一次身份"，而是让浏览器必须先发预检 —— 跨站表单发不出自定义头。 */
 function whdrs() {
   return { "Content-Type": "application/json", "X-ECHO-Admin": "1", "X-CSRF-Token": CSRF };
 }
@@ -179,40 +602,96 @@ async function wpost(path, body) {
 async function wdelete(path, body) {
   return api(path, { method: "DELETE", headers: whdrs(), body: JSON.stringify(body || {}) });
 }
-
-function esc(s) {
-  return String(s == null ? "" : s).replace(/[&<>"']/g,
-    (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
-}
-/* 表格里要放按钮时用它包一下（**调用方负责转义里面的值**）。 */
+const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g,
+  (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const raw = (html) => ({ __raw: html });
+const icon = (name) => `<svg class="ico"><use href="#i-${name}"/></svg>`;
+const money = (cents) => "¥" + (Number(cents || 0) / 100).toFixed(2);
 const hm = (sec) => {
   sec = Number(sec || 0);
   const d = Math.floor(sec / 86400), h = Math.floor((sec % 86400) / 3600),
         m = Math.floor((sec % 3600) / 60);
   return (d ? d + "d " : "") + h + "h " + m + "m";
 };
-const ago = (ts) => {
-  ts = Number(ts || 0);
-  if (!ts) return "—";
-  const s = Math.max(0, Math.floor(Date.now() / 1000 - ts));
-  return s < 60 ? s + " 秒前" : (s < 3600 ? Math.floor(s / 60) + " 分钟前" : hm(s) + " 前");
-};
 const ts = (v) => (Number(v || 0) ? new Date(Number(v) * 1000).toLocaleString() : "—");
+const dateOnly = (v) => (Number(v || 0) ? ts(v).slice(0, 10) : "—");
+const ago = (v) => {
+  if (!Number(v || 0)) return "—";
+  const s = Math.max(0, Math.floor(Date.now() / 1000 - Number(v)));
+  return s < 60 ? s + " 秒前" : (s < 3600 ? Math.floor(s / 60) + " 分钟前"
+    : (s < 86400 ? Math.floor(s / 3600) + " 小时前" : Math.floor(s / 86400) + " 天前"));
+};
 const left = (sec) => {
   sec = Number(sec || 0);
-  // 后端只把「还能用」的码放进这张表（未用过、未过期），而且 remainingSeconds 最少报 1 ——
-  // 所以这里的"已过期"分支只是**防身**（万一某张码在响应与渲染之间到期），
-  // 正常路径上不会出现"徽章写着已过期、行却列在待用表里"。不到 1 分钟如实报秒。
   if (sec <= 0) return raw('<span class="badge off">已过期</span>');
   if (sec < 60) return sec + " 秒";
   return sec < 3600 ? Math.ceil(sec / 60) + " 分钟"
-                    : (sec < 86400 ? (sec / 3600).toFixed(1) + " 小时" : (sec / 86400).toFixed(1) + " 天");
+    : (sec < 86400 ? (sec / 3600).toFixed(1) + " 小时" : (sec / 86400).toFixed(1) + " 天");
 };
 const mb = (n) => (Number(n || 0) / 1024).toFixed(1) + " GB";
 
+const STATUS_TEXT = {
+  created: "待支付", paying: "支付中", paid: "已支付", refunded: "已退款",
+  closed: "已关闭", active: "有效", expired: "已到期", frozen: "已冻结",
+  disabled: "已停用", conflict: "冲突", none: "无权益",
+};
+const STATUS_CLS = {
+  created: "muted", paying: "info", paid: "ok", refunded: "warn", closed: "muted",
+  active: "ok", expired: "muted", frozen: "info", disabled: "danger",
+  conflict: "danger", none: "muted",
+};
+function badge(status, text) {
+  const s = String(status || "");
+  const cls = STATUS_CLS[s] || "muted";
+  const label = text || STATUS_TEXT[s] || s || "—";
+  const dot = (s === "paid" || s === "active" || s === "paying" || s === "created");
+  return raw(`<span class="badge ${cls}">${dot ? '<span class="dot"></span>' : ""}${esc(label)}</span>`);
+}
+const badgeHtml = (status, text) => badge(status, text).__raw;
+function table(head, rows, rowAction) {
+  if (!rows.length) return `<div class="empty">${icon("receipt")}<b>没有数据</b>调整筛选条件再试。</div>`;
+  return `<div class="table-wrap"><table class="table"><thead><tr>${head.map((h) =>
+    `<th>${esc(h)}</th>`).join("")}</tr></thead><tbody>${rows.map((r) => {
+    const rid = r && r.__id ? ` class="row-link" onclick="${rowAction}('${esc(r.__id)}')"` : "";
+    return `<tr${rid}>${r.map((c, i) => `<td data-label="${esc(head[i] || "")}">${(c && c.__raw) ? c.__raw : esc(c)}</td>`).join("")}</tr>`;
+  }).join("")}</tbody></table></div>`;
+}
+function qs(obj) {
+  const p = new URLSearchParams();
+  Object.entries(obj || {}).forEach(([k, v]) => {
+    if (v !== "" && v !== null && v !== undefined && v !== 0) p.set(k, String(v));
+  });
+  const s = p.toString();
+  return s ? "?" + s : "";
+}
+function rangeSince(range) {
+  if (!range || range === "all") return 0;
+  const now = Math.floor(Date.now() / 1000);
+  if (range === "today") {
+    const d = new Date(); d.setHours(0, 0, 0, 0);
+    return Math.floor(d.getTime() / 1000);
+  }
+  return now - (Number(range) || 7) * 86400;
+}
+function pager(total, limit, offset, kind) {
+  const pages = Math.max(1, Math.ceil(Number(total || 0) / limit));
+  const cur = Math.floor(offset / limit) + 1;
+  const from = Math.max(1, cur - 2), to = Math.min(pages, cur + 2);
+  let nums = "";
+  for (let i = from; i <= to; i++) {
+    nums += `<button class="page ${i === cur ? "is-active" : ""}" onclick="setOffset('${kind}',${(i - 1) * limit})">${i}</button>`;
+  }
+  return `<div class="pager"><span>共 ${Number(total || 0)} 条</span><span class="spacer"></span>
+    <span>每页 ${limit} 条</span><div class="pages">
+    <button class="page" ${cur <= 1 ? "disabled" : ""} onclick="setOffset('${kind}',${Math.max(0, (cur - 2) * limit)})">上一页</button>
+    ${nums}
+    <button class="page" ${cur >= pages ? "disabled" : ""} onclick="setOffset('${kind}',${Math.min((pages - 1) * limit, cur * limit)})">下一页</button>
+    </div></div>`;
+}
+
+/* ---------------------------------------------------------------- 登录 / 启动 */
 function showLogin() {
-  stopPerfPoll();          // 掉线了就别再轮询（后端"有人在看"的判定也随之过期）
+  stopPerfPoll();
   $("#login").classList.remove("hidden");
   $("#app").classList.add("hidden");
 }
@@ -220,8 +699,7 @@ function showApp() {
   $("#login").classList.add("hidden");
   $("#app").classList.remove("hidden");
 }
-
-$("#btnLogin").onclick = async () => {
+async function doLogin() {
   $("#err").textContent = "";
   try {
     const r = await api("/admin/api/login", {
@@ -231,95 +709,786 @@ $("#btnLogin").onclick = async () => {
     });
     CSRF = r.csrf || "";
     showApp();
+    if (!location.hash || location.hash === "#login") location.hash = "#overview";
     await boot();
   } catch (e) { $("#err").textContent = e.message; }
-};
-$("#p").addEventListener("keydown", (e) => { if (e.key === "Enter") $("#btnLogin").click(); });
-
+}
+$("#loginForm").addEventListener("submit", (e) => { e.preventDefault(); doLogin(); });
+$("#p").addEventListener("keydown", (e) => { if (e.key === "Enter") doLogin(); });
 $("#btnLogout").onclick = async () => {
-  try {
-    await wpost("/admin/api/logout");
-  } catch (e) { /* 会话可能已经过期，照样回登录页 */ }
-  CSRF = "";
-  ONCE = null;
-  showLogin();
+  try { await wpost("/admin/api/logout"); } catch (e) { /* 会话可能已过期 */ }
+  CSRF = ""; ONCE = null; showLogin();
 };
 $("#btnReload").onclick = () => render();
-
-function activateTab(name) {
-  document.querySelectorAll(".tabs button").forEach((x) =>
-    x.classList.toggle("active", x.dataset.tab === name));
-  return render();
-}
-document.querySelectorAll(".tabs button").forEach((b) => {
-  b.onclick = () => activateTab(b.dataset.tab);
-});
-
-/* 右上角的「修改口令」= 跳到「存了什么」里那张账号卡（表单**只有一份**，
-   不存在两处各改一次、口径漂开的可能）。跳过去之后滚到它、并把光标放进
-   「当前口令」那一格 —— 这个入口的全部价值就是"不用找"。 */
 $("#btnPwd").onclick = async () => {
-  await activateTab("inventory");
-  const box = $("#pwCard");
-  if (box && box.scrollIntoView) box.scrollIntoView({ block: "center" });
-  const first = $("#pwCur");
-  if (first) first.focus();
+  activateTab("inventory");
+  setTimeout(() => {
+    const box = $("#pwCard");
+    if (box && box.scrollIntoView) box.scrollIntoView({ block: "center" });
+    const first = $("#pwCur");
+    if (first) first.focus();
+  }, 120);
 };
-
 async function boot() {
   try {
     const me = await api("/admin/api/me");
     CSRF = me.csrf || CSRF;
-    $("#who").textContent = "管理员：" + me.username + " · 会话 " + me.sessions + " 个";
+    $("#who").textContent = me.username || "管理员";
     showApp();
     await render();
   } catch (e) { showLogin(); }
 }
+$("#btnMenu").onclick = () => $("#sidebar").classList.toggle("open");
+
+/* ---------------------------------------------------------------- 路由 */
+const TABS = {
+  overview: { title: "概览", crumb: "概览" },
+  orders: { title: "订单", crumb: "订单" },
+  users: { title: "用户 / 账号", crumb: "用户 / 账号" },
+  entitlements: { title: "权益", crumb: "权益" },
+  plans: { title: "套餐", crumb: "套餐" },
+  invites: { title: "邀请码", crumb: "邀请码" },
+  notifies: { title: "支付回调", crumb: "支付回调" },
+  models: { title: "模型", crumb: "模型" },
+  clients: { title: "客户端 / 发授权", crumb: "客户端 / 发授权" },
+  calls: { title: "调用", crumb: "调用" },
+  perf: { title: "性能", crumb: "性能" },
+  inventory: { title: "存储", crumb: "存储" },
+  audit: { title: "操作审计", crumb: "操作审计" },
+  system: { title: "系统状态", crumb: "系统状态" },
+};
+function currentTab() {
+  const t = (location.hash || "#overview").slice(1).split("?")[0];
+  return TABS[t] ? t : "overview";
+}
+function activateTab(name) {
+  if (location.hash === "#" + name) { render(); return; }
+  location.hash = "#" + name;
+}
+function setActive(name) {
+  $$(".nav-item").forEach((a) => a.classList.toggle("is-active", a.dataset.tab === name));
+  const t = TABS[name] || TABS.overview;
+  if ($("#crumb")) $("#crumb").textContent = t.crumb;
+  document.title = t.title + " · ECHO 管理面";
+}
+window.addEventListener("hashchange", () => { render(); });
+window.addEventListener("pagehide", stopPerfPoll);
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) { stopPerfPoll(); return; }
+  if (currentTab() === "perf" && !$("#app").classList.contains("hidden")) render();
+});
 
 async function render() {
-  const tab = (document.querySelector(".tabs button.active") || {}).dataset?.tab || "overview";
+  const tab = currentTab();
+  setActive(tab);
+  $("#sidebar").classList.remove("open");
+  stopPerfPoll();
   const v = $("#view");
-  stopPerfPoll();          // 切走「性能」页签就不再取点（后端最多再采 viewerTtl 秒）
   try {
     if (tab === "overview") v.innerHTML = await viewOverview();
+    else if (tab === "orders") { v.innerHTML = await viewOrders(); bindOrders(); }
+    else if (tab === "users") { v.innerHTML = await viewUsers(); bindUsers(); }
+    else if (tab === "entitlements") { v.innerHTML = await viewEntitlements(); bindEntitlements(); }
+    else if (tab === "plans") { v.innerHTML = await viewPlans(); bindPlans(); }
+    else if (tab === "invites") { v.innerHTML = await viewInvites(); bindInvites(); }
+    else if (tab === "notifies") { v.innerHTML = await viewNotifies(); bindNotifies(); }
+    else if (tab === "audit") { v.innerHTML = await viewAudit(); bindAudit(); }
+    else if (tab === "system") v.innerHTML = await viewSystem();
     else if (tab === "models") v.innerHTML = await viewModels();
     else if (tab === "clients") { v.innerHTML = await viewClients(); bindClients(); }
     else if (tab === "calls") v.innerHTML = await viewCalls();
     else if (tab === "perf") { v.innerHTML = await viewPerf(); bindPerf(); }
-    else if (tab === "billing") { v.innerHTML = await viewBilling(); bindBilling(); }
     else { v.innerHTML = await viewInventory(); bindPassword(); }
+    window.scrollTo(0, 0);
   } catch (e) {
-    v.innerHTML = `<div class="card"><h2>读不到</h2><div class="muted">${esc(e.message)}</div></div>`;
+    v.innerHTML = `<div class="card"><h2>读不到</h2><div class="load-error">${esc(e.message)}</div></div>`;
   }
 }
 
+/* ---------------------------------------------------------------- 概览 */
 async function viewOverview() {
-  const d = await api("/admin/api/overview");
-  $("#hdr").textContent = `${d.server.id} · v${d.server.version} · 运行 ${hm(d.server.uptimeSeconds)}`
-    + (d.server.tls ? " · https" : " · http");
-  const m = d.metrics, q = d.quota;
-  const used = Object.values(q.clients || {}).reduce((a, b) => a + Number(b || 0), 0);
-  const okRate = m.totalCalls ? (100 * (m.totalCalls - m.totalErrors) / m.totalCalls).toFixed(1) : "—";
-  const errs = Object.entries(m.errorCodes || {}).map(([k, n]) => `${k}×${n}`).join("、") || "无";
-  return `<div class="card"><h2>概览</h2>
-    <div class="kv">
-      <div><b>${d.busy.active} / ${d.busy.maxConcurrent}</b><span>当前并发（每客户端上限 ${d.busy.perClientConcurrent}）</span></div>
-      <div><b>${m.totalCalls}</b><span>累计调用（本次进程）</span></div>
-      <div><b>${okRate}%</b><span>成功率</span></div>
-      <div><b>${used.toFixed(1)} 分钟</b><span>今日音频（各客户端合计）</span></div>
-      <div><b>${d.sessions}</b><span>管理面在线会话</span></div>
-      <div><b>${Object.keys(q.clients || {}).length}</b><span>今日用过的客户端</span></div>
-    </div>
-    <div style="margin-top:8px" class="muted">错误码：${esc(errs)}</div>
-    <div class="muted">显存：${esc(JSON.stringify(d.vram))} · 调用记录队列：排队 ${d.calls.queued ?? 0}
-      · 丢弃 ${d.calls.dropped ?? 0}（丢弃是"审计写不进去"，不是请求失败）</div>
+  const d = await api("/admin/api/dashboard");
+  const b = d.billing || {};
+  $("#hdr").textContent = `${d.server.version} · 运行 ${hm(d.server.uptimeSeconds)}`;
+  $("#envText").textContent = b.provider
+    ? `${b.provider}${b.sandbox ? " · sandbox" : ""}`
+    : "管理面";
+  const alertCount = Number(d.conflicts || 0) + Number(d.unverifiedNotifies || 0);
+  const alert = alertCount > 0
+    ? `<div class="alert-strip" style="margin-bottom:14px">${icon("alert")}
+        <div><b>${alertCount} 条支付回调需要人工核对</b>
+        <span class="muted">：${Number(d.conflicts || 0)} 条 conflict，${Number(d.unverifiedNotifies || 0)} 条验签失败。</span></div>
+        <span class="spacer"></span><button class="btn btn-ghost btn-sm" onclick="activateTab('notifies')">去处理</button></div>`
+    : "";
+  const orderRows = (d.recentOrders || []).map((o) => Object.assign([
+    raw(`<span class="order-id">${esc(o.orderId)}<button class="copy-btn" title="复制订单号" onclick="event.stopPropagation();copyText('${esc(o.orderId)}')">${icon("copy")}</button></span>`),
+    raw(`<b>${esc(o.userName || o.userId)}</b><div class="muted small">${esc(o.userEmail || o.userId)}</div>`),
+    money(o.amountCents),
+    badge(o.status),
+  ], { __id: o.orderId }));
+  const userRows = (d.recentUsers || []).map((u) => `
+    <div class="mini-row row-link" onclick="openUserDrawer('${esc(u.userId)}')">
+      <span class="avatar-sm">${esc((u.name || u.email || "?").slice(0, 1))}</span>
+      <div class="mini-main"><div class="mini-title">${esc(u.name || u.email || u.userId)}</div>
+      <div class="mini-meta">${esc(u.email || u.userId)}</div></div>
+      <div class="mini-side"><b>${u.entitlement ? esc(u.entitlement.planName || "—") : "—"}</b><span>${ago(u.createdAt)}</span></div>
+    </div>`).join("");
+  const expRows = (d.expiring || []).map((e) => `
+    <div class="mini-row row-link" onclick="openUserDrawer('${esc(e.userId)}')">
+      <div class="mini-main"><div class="mini-title">${esc(e.name || e.email || e.userId)}</div>
+      <div class="mini-meta">${esc(e.email || e.userId)} · ${esc(e.planName || "—")}</div></div>
+      <div class="mini-side"><b>${dateOnly(e.paidUntil)}</b><span>${e.daysLeft} 天后</span></div>
+    </div>`).join("");
+  return `
+  <div class="page-head"><div><h1>概览</h1><div class="lead">今天的收入、待处理异常与最近动态。金额按 billing.timezone 自然日统计。</div></div>
+    <div class="acts"><button class="btn btn-ghost" onclick="activateTab('orders')">${icon("receipt")}查看全部订单</button>
+    <button class="btn btn-primary" onclick="render()">${icon("refresh")}刷新数据</button></div></div>
+  <div class="grid grid-4" style="margin-bottom:14px">
+    <div class="card kpi"><div class="kpi-top"><span class="kpi-icon ok">${icon("card")}</span>今日收入</div>
+      <div class="kpi-value">${money(d.revenueCentsToday)}</div>
+      <div class="kpi-foot">累计 ${money(d.revenueCentsTotal)}</div></div>
+    <div class="card kpi"><div class="kpi-top"><span class="kpi-icon">${icon("receipt")}</span>今日新增订单</div>
+      <div class="kpi-value">${d.ordersToday} <small>笔</small></div>
+      <div class="kpi-foot">今日支付 ${d.ordersPaidToday} 笔</div></div>
+    <div class="card kpi"><div class="kpi-top"><span class="kpi-icon">${icon("users")}</span>活跃用户 24h</div>
+      <div class="kpi-value">${d.activeUsers24h} <small>/ ${d.usersTotal}</small></div>
+      <div class="kpi-foot">有效权益 ${d.entitlementsActive}</div></div>
+    <div class="card kpi"><div class="kpi-top"><span class="kpi-icon warn">${icon("clock")}</span>7 天内到期</div>
+      <div class="kpi-value">${d.expiringIn7Days} <small>人</small></div>
+      <div class="kpi-foot"><a href="#entitlements" style="color:var(--brand-ink);font-weight:700">去权益页处理 →</a></div></div>
   </div>
-  <div class="card"><h2>各端点</h2>${table(
-    ["端点", "调用", "失败", "音频分钟", "最近耗时", "最慢"],
-    Object.entries(m.endpoints || {}).map(([k, r]) => [k, r.calls, r.errors,
-      (Number(r.audioSeconds || 0) / 60).toFixed(2), r.lastMs + " ms", r.maxMs + " ms"]))}</div>`;
+  ${alert}
+  <div class="grid grid-7-3">
+    <div class="stack">
+      <div class="card"><h2>最近订单 <span class="sub">最近 5 笔</span>
+        <button class="btn btn-subtle btn-sm" onclick="activateTab('orders')">全部</button></h2>
+        ${table(["订单", "用户", "金额", "状态"], orderRows, "openOrderDrawer")}</div>
+      <div class="card"><h2>最近注册 <button class="btn btn-subtle btn-sm" onclick="activateTab('users')">全部用户</button></h2>
+        <div class="mini-list">${userRows || '<div class="empty">还没有注册用户</div>'}</div></div>
+    </div>
+    <div class="stack">
+      <div class="card"><h2>即将到期 <span class="sub">7 天内</span></h2>
+        <div class="mini-list">${expRows || '<div class="empty">7 天内没有到期</div>'}</div></div>
+      <div class="card"><h2>系统状态 <button class="btn btn-subtle btn-sm" onclick="activateTab('system')">详情</button></h2>
+        <div class="kv">
+          <div><div class="k">支付网关</div><div class="v">${esc(b.provider || "—")}${b.sandbox ? " · sandbox" : ""}</div></div>
+          <div><div class="k">计费闸门</div><div class="v">${b.effectiveGating ? "生效" : "未生效"}</div></div>
+          <div><div class="k">后端版本</div><div class="v">${esc(d.server.version)}</div></div>
+          <div><div class="k">运行时长</div><div class="v">${hm(d.server.uptimeSeconds)}</div></div>
+        </div></div>
+      <div class="card"><h2>快捷入口</h2>
+        <div class="grid grid-2">
+          <button class="btn btn-ghost" onclick="activateTab('orders')">${icon("receipt")}查订单</button>
+          <button class="btn btn-ghost" onclick="activateTab('users')">${icon("users")}查用户</button>
+          <button class="btn btn-ghost" onclick="activateTab('invites')">${icon("ticket")}发邀请码</button>
+          <button class="btn btn-ghost" onclick="activateTab('clients')">${icon("device")}发授权</button>
+        </div></div>
+    </div>
+  </div>`;
 }
 
+/* ---------------------------------------------------------------- 订单 */
+const Q = {
+  orders: { q: "", status: "", range: "7", offset: 0 },
+  users: { q: "", status: "", ent: "", offset: 0 },
+  ents: { q: "", status: "", days: 0, offset: 0 },
+  notifies: { q: "", status: "", verified: "", offset: 0 },
+  audit: { q: "", result: "", offset: 0 },
+};
+function setOffset(kind, offset) {
+  if (Q[kind]) Q[kind].offset = Math.max(0, Number(offset || 0));
+  render();
+}
+async function viewOrders() {
+  const d = await api("/admin/api/billing/orders" + qs({
+    q: Q.orders.q, status: Q.orders.status, since: rangeSince(Q.orders.range),
+    limit: 20, offset: Q.orders.offset,
+  }));
+  const rows = (d.orders || []).map((o) => Object.assign([
+    raw(`<span class="order-id">${esc(o.orderId)}<button class="copy-btn" title="复制订单号" onclick="event.stopPropagation();copyText('${esc(o.orderId)}')">${icon("copy")}</button></span>`),
+    raw(`<b>${esc(o.userName || o.userId)}</b><div class="muted small">${esc(o.userEmail || o.userId)}</div>`),
+    raw(`${esc(o.planName || o.planCode || "—")} <span class="muted small">${o.days || 0} 天</span>`),
+    raw(`<b>${money(o.amountCents)}</b>`),
+    badge(o.status),
+    ts(o.createdAt),
+    o.paidAt ? ts(o.paidAt) : "—",
+    raw(`<button class="btn btn-subtle btn-sm" onclick="event.stopPropagation();openOrderDrawer('${esc(o.orderId)}')">详情</button>
+      ${o.status === "paid" ? `<button class="btn btn-danger btn-sm" onclick="event.stopPropagation();openRefund('${esc(o.orderId)}')">退款</button>` : ""}`),
+  ], { __id: o.orderId }));
+  return `<div class="page-head"><div><h1>订单</h1><div class="lead">按订单号、邮箱、用户 ID、状态与时间筛选；点行打开详情，退款前二次确认。</div></div>
+    <div class="acts"><button class="btn btn-primary" onclick="render()">${icon("refresh")}刷新</button></div></div>
+  <div class="card" style="margin-bottom:14px"><div class="filters">
+    <div class="search"><label class="field"><span class="small muted">搜索</span><span style="position:relative;display:block">${icon("search")}<input class="input" id="ordQ" placeholder="订单号 / 邮箱 / 用户 ID / tradeNo" value="${esc(Q.orders.q)}"></span></label></div>
+    <div class="field"><label>状态</label><select class="select" id="ordStatus">
+      ${["", "created", "paying", "paid", "refunded", "closed"].map((s) =>
+        `<option value="${s}" ${Q.orders.status === s ? "selected" : ""}>${s ? STATUS_TEXT[s] : "全部状态"}</option>`).join("")}
+    </select></div>
+    <div class="field"><label>时间范围</label><select class="select" id="ordRange">
+      ${[["today", "今天"], ["7", "最近 7 天"], ["30", "最近 30 天"], ["all", "全部"]].map(([v, t]) =>
+        `<option value="${v}" ${Q.orders.range === v ? "selected" : ""}>${t}</option>`).join("")}
+    </select></div>
+    <div class="acts"><button class="btn btn-primary" id="ordSearch">${icon("search")}查询</button>
+      <button class="btn btn-ghost" id="ordReset">重置</button></div>
+  </div>
+  <div class="filter-note">共 ${d.total} 笔订单。列表默认按创建时间倒序；导出与对账报表不在本次第一版范围内。</div></div>
+  <div class="card"><h2>订单列表 <span class="sub">第 ${Math.floor(Q.orders.offset / 20) + 1} 页</span></h2>
+    ${table(["订单号", "用户", "套餐", "金额", "状态", "创建时间", "支付时间", "操作"], rows, "openOrderDrawer")}
+    ${pager(d.total, 20, Q.orders.offset, "orders")}</div>`;
+}
+function bindOrders() {
+  const run = () => {
+    Q.orders.q = $("#ordQ").value.trim();
+    Q.orders.status = $("#ordStatus").value;
+    Q.orders.range = $("#ordRange").value;
+    Q.orders.offset = 0;
+    render();
+  };
+  const btn = $("#ordSearch");
+  if (btn) btn.onclick = run;
+  const reset = $("#ordReset");
+  if (reset) reset.onclick = () => {
+    Q.orders = { q: "", status: "", range: "7", offset: 0 }; render();
+  };
+  const q = $("#ordQ");
+  if (q) q.addEventListener("keydown", (e) => { if (e.key === "Enter") run(); });
+}
+async function openOrderDrawer(orderId) {
+  openDrawer(`<div class="drawer-body"><div class="skeleton" style="width:60%"></div></div>`);
+  try {
+    const o = await api("/admin/api/billing/orders/" + encodeURIComponent(orderId));
+    const ev = (o.events || []).map((e) => {
+      let payload = {};
+      try { payload = JSON.parse(e.payload || "{}"); } catch (err) { payload = {}; }
+      const label = {
+        created: "订单创建", paying: "发起支付", paid: "支付成功", refunded: "已退款",
+        closed: "订单关闭", "sync-closed": "主动查询后关闭",
+        "entitlement-adjust": "权益调整", paired: "设备配对",
+      }[e.type] || e.type;
+      const cls = e.type === "refunded" || e.type === "sync-closed" ? "warn"
+        : (e.type === "paid" || e.type === "created" ? "ok" : "");
+      const extra = payload.reason ? ` · ${esc(payload.reason)}` : "";
+      return `<div class="tl-item ${cls}"><div class="tl-title">${esc(label)}</div>
+        <div class="tl-meta">${ts(e.at)}${extra}</div></div>`;
+    }).join("");
+    const notifies = (o.notifies || []).map((n) => `
+      <div class="order-mini"><div class="main"><b class="mono">${esc(n.tradeNo)}</b>
+      <span>${ts(n.at)} · ${n.verified ? "验签通过" : "验签失败"}</span></div>
+      <div class="side">${badgeHtml(n.status === "conflict" ? "conflict" : (n.status === "paid" ? "paid" : "muted"), n.status || "—")}</div></div>`).join("");
+    const canRefund = o.status === "paid";
+    const canSync = o.status === "created" || o.status === "paying";
+    openDrawer(`
+      <div class="drawer-head"><div><h2>${esc(o.orderId)}</h2>
+        <div class="sub">创建于 ${ts(o.createdAt)} · ${esc(o.planName || o.planCode)} · ${o.days || 0} 天</div></div>
+        <div class="close">${badgeHtml(o.status)}<button class="btn btn-ghost btn-icon" onclick="closeDrawer()" aria-label="关闭">${icon("x")}</button></div></div>
+      <div class="drawer-body">
+        <div class="section"><div class="amount-hero"><b>${money(o.amountCents)}</b><span>${esc(o.planName || o.planCode)} · ${o.days || 0} 天</span></div>
+          <div class="kv">
+            <div><div class="k">订单状态</div><div class="v">${badgeHtml(o.status)}</div></div>
+            <div><div class="k">支付时间</div><div class="v">${ts(o.paidAt)}</div></div>
+            <div><div class="k">创建时间</div><div class="v">${ts(o.createdAt)}</div></div>
+            <div><div class="k">订单关闭时间</div><div class="v">${o.expiresAt && !o.paidAt ? ts(o.expiresAt) : "—"}</div></div>
+            <div class="wide"><div class="k">支付宝 tradeNo</div><div class="v mono">${o.tradeNo ? esc(o.tradeNo) + ` <button class="copy-btn" onclick="copyText('${esc(o.tradeNo)}')">${icon("copy")}</button>` : "—"}</div></div>
+          </div></div>
+        <div class="section"><div class="section-title">用户</div>
+          <div class="order-mini row-link" onclick="closeDrawer();openUserDrawer('${esc(o.userId)}')">
+            <span class="avatar-sm">${esc((o.userName || o.userId || "?").slice(0, 1))}</span>
+            <div class="main"><b>${esc(o.userName || o.userId)}</b><span>${esc(o.userEmail || o.userId)}</span></div>
+            <div class="side"><b class="small" style="color:var(--brand-ink)">查看用户 →</b></div></div></div>
+        <div class="section"><div class="section-title">权益影响</div>
+          <div class="ent-card"><div class="ent-head"><b>${esc(o.planName || o.planCode)}</b>
+            ${badgeHtml(o.status === "paid" ? "active" : (o.status === "refunded" ? "refunded" : "created"), o.status === "paid" ? "有效" : (o.status === "refunded" ? "已退回" : "未生效"))}
+            <span class="muted small" style="margin-left:auto">按剩余已支付订单重算</span></div>
+            <div class="ent-metrics">
+              <div><span>当前到期</span><strong>${dateOnly(o.currentPaidUntil)}</strong></div>
+              <div><span>预计到期</span><strong>${dateOnly(o.projectedPaidUntil)}</strong></div>
+              <div><span>续费规则</span><strong>期内顺延</strong></div>
+            </div></div></div>
+        <div class="section"><div class="section-title">支付回调</div>${notifies || '<div class="empty">还没有回调记录</div>'}</div>
+        <div class="section"><div class="section-title">订单流水</div><div class="timeline">${ev || '<div class="empty">没有流水</div>'}</div></div>
+      </div>
+      <div class="drawer-foot"><span class="left muted small">写操作会记录管理员与对象</span>
+        ${canSync ? `<button class="btn btn-ghost" onclick="syncOrder('${esc(o.orderId)}')">${icon("refresh")}主动查询 sync</button>` : ""}
+        ${canRefund ? `<button class="btn btn-danger" onclick="openRefund('${esc(o.orderId)}')">${icon("undo")}退款</button>` : ""}
+      </div>`);
+  } catch (e) { openDrawer(`<div class="drawer-body"><div class="load-error">${esc(e.message)}</div></div>`); }
+}
+async function syncOrder(orderId) {
+  try {
+    const r = await wpost(`/admin/api/billing/orders/${encodeURIComponent(orderId)}/sync`);
+    toast(r.changed ? "已向支付宝查询并更新订单" : "订单已是终态，没有重复入账");
+    await openOrderDrawer(orderId);
+  } catch (e) { alert("查询失败：" + e.message); }
+}
+function openRefund(orderId) {
+  openModal(`<h3>确认退款这笔订单？</h3>
+    <p class="modal-sub">退款会调用支付宝退款，并把订单改为「已退款」；随后按该用户剩余已支付订单重算权益。只剩这一单时权益立即失效。已消费额度不退。</p>
+    <div class="modal-box"><div class="row"><span>订单号</span><b class="mono">${esc(orderId)}</b></div></div>
+    <textarea id="refundReason" placeholder="退款原因（选填，会写进订单流水与审计）"></textarea>
+    <div class="modal-acts"><button class="btn btn-ghost" onclick="closeModal()">取消</button>
+      <button class="btn btn-danger" onclick="doRefund('${esc(orderId)}')">${icon("undo")}确认退款</button></div>`);
+}
+async function doRefund(orderId) {
+  const reason = ($("#refundReason") || {}).value || "";
+  try {
+    await wpost(`/admin/api/billing/orders/${encodeURIComponent(orderId)}/refund`,
+      { confirm: orderId, reason: reason.trim() });
+    closeModal(); closeDrawer(); toast("已退款 " + orderId); await render();
+  } catch (e) { alert("退款失败：" + e.message); }
+}
+
+/* ---------------------------------------------------------------- 用户 */
+async function viewUsers() {
+  const d = await api("/admin/api/account/users" + qs({
+    q: Q.users.q, status: Q.users.status, entitlementStatus: Q.users.ent,
+    limit: 20, offset: Q.users.offset,
+  }));
+  const rows = (d.users || []).map((u) => Object.assign([
+    raw(`<div style="display:flex;align-items:center;gap:8px"><span class="avatar-sm">${esc((u.name || u.email || "?").slice(0, 1))}</span>
+      <div><b>${esc(u.name || u.email || u.userId)}</b><div class="muted small">${esc(u.email || u.userId)}</div></div></div>`),
+    u.status === "active" ? badge("active", "正常") : badge("disabled", "已停用"),
+    raw(u.entitlement && u.entitlement.status !== "none"
+      ? `${esc(u.entitlement.planName || u.entitlement.plan || "—")} ${badgeHtml(u.entitlementStatus || u.entitlement.status)}`
+      : '<span class="muted">无</span>'),
+    u.entitlement && u.entitlement.paidUntil ? dateOnly(u.entitlement.paidUntil) : "—",
+    `${(u.devices || []).filter((x) => x.status === "active").length} / ${((u.entitlement || {}).maxDevices || 0)} 台`,
+    dateOnly(u.createdAt),
+    raw(`<button class="btn btn-subtle btn-sm" onclick="event.stopPropagation();openUserDrawer('${esc(u.userId)}')">详情</button>`),
+  ], { __id: u.userId }));
+  return `<div class="page-head"><div><h1>用户 / 账号</h1><div class="lead">按邮箱、用户 ID、姓名、手机号或支付宝 openId 搜索；详情聚合权益、设备、订单与邀请码。</div></div>
+    <div class="acts"><button class="btn btn-ghost" onclick="activateTab('invites')">${icon("ticket")}发邀请码</button>
+      <button class="btn btn-primary" onclick="render()">${icon("refresh")}刷新</button></div></div>
+  <div class="card" style="margin-bottom:14px"><div class="filters">
+    <div class="search"><label class="field"><span class="small muted">搜索</span><span style="position:relative;display:block">${icon("search")}<input class="input" id="usrQ" placeholder="邮箱 / 用户 ID / 姓名 / 手机号 / 支付宝 openId" value="${esc(Q.users.q)}"></span></label></div>
+    <div class="field"><label>账号状态</label><select class="select" id="usrStatus">
+      <option value="">全部</option><option value="active" ${Q.users.status === "active" ? "selected" : ""}>正常</option><option value="disabled" ${Q.users.status === "disabled" ? "selected" : ""}>已停用</option>
+    </select></div>
+    <div class="field"><label>权益状态</label><select class="select" id="usrEnt">
+      ${[["", "全部"], ["active", "有效"], ["expiring", "即将到期"], ["expired", "已到期"], ["frozen", "已冻结"], ["none", "无权益"]].map(([v, t]) =>
+        `<option value="${v}" ${Q.users.ent === v ? "selected" : ""}>${t}</option>`).join("")}
+    </select></div>
+    <div class="acts"><button class="btn btn-primary" id="usrSearch">${icon("search")}搜索</button>
+      <button class="btn btn-ghost" id="usrReset">重置</button></div>
+  </div>
+  <div class="filter-note">邮箱来自 <code class="mono">users.email</code>（issue #15 落地后生效）；不再按工号搜索。</div></div>
+  <div class="card"><h2>用户列表 <span class="sub">共 ${d.total} 个账号</span></h2>
+    ${table(["用户", "账号", "权益", "到期", "设备", "注册", "操作"], rows, "openUserDrawer")}
+    ${pager(d.total, 20, Q.users.offset, "users")}</div>`;
+}
+function bindUsers() {
+  const run = () => {
+    Q.users.q = $("#usrQ").value.trim();
+    Q.users.status = $("#usrStatus").value;
+    Q.users.ent = $("#usrEnt").value;
+    Q.users.offset = 0;
+    render();
+  };
+  const btn = $("#usrSearch");
+  if (btn) btn.onclick = run;
+  const reset = $("#usrReset");
+  if (reset) reset.onclick = () => { Q.users = { q: "", status: "", ent: "", offset: 0 }; render(); };
+  const q = $("#usrQ");
+  if (q) q.addEventListener("keydown", (e) => { if (e.key === "Enter") run(); });
+}
+async function openUserDrawer(userId) {
+  openDrawer(`<div class="drawer-body"><div class="skeleton" style="width:60%"></div></div>`);
+  try {
+    const u = await api("/admin/api/account/users/" + encodeURIComponent(userId));
+    const ent = u.entitlement || {};
+    const devices = (u.devices || []).map((d) => `
+      <div class="device-row"><span class="device-icon">${icon("device")}</span>
+        <div class="device-main"><b>${esc(d.deviceName || d.clientId)}</b>
+        <span class="mono">${esc(d.clientId)} · ${d.status === "active" ? "最后活跃 " + ago(d.lastSeen) : "已解绑"}</span></div>
+        ${d.status === "active" ? `<button class="btn btn-ghost btn-sm" onclick="revokeDevice('${esc(u.userId)}','${esc(d.clientId)}')">解绑</button>` : badgeHtml("disabled", "已解绑")}</div>`).join("");
+    const orders = (u.orders || []).map((o) => `
+      <div class="order-mini row-link" onclick="closeDrawer();openOrderDrawer('${esc(o.orderId)}')">
+        <span class="device-icon">${icon("receipt")}</span>
+        <div class="main"><b>${esc(o.planName || o.planCode)} · ${money(o.amountCents)}</b>
+        <span>${ts(o.createdAt)} · ${esc(o.orderId)}</span></div>
+        <div class="side">${badgeHtml(o.status)}</div></div>`).join("");
+    openDrawer(`
+      <div class="drawer-head"><span class="avatar-sm" style="width:40px;height:40px;font-size:15px;border-radius:11px">${esc((u.name || u.email || "?").slice(0, 1))}</span>
+        <div><h2>${esc(u.name || u.email || u.userId)}</h2><div class="sub mono">${esc(u.email || u.userId)}</div></div>
+        <div class="close">${u.status === "active" ? badgeHtml("active", "正常") : badgeHtml("disabled", "已停用")}
+          <button class="btn btn-ghost btn-icon" onclick="closeDrawer()" aria-label="关闭">${icon("x")}</button></div></div>
+      <div class="drawer-body">
+        <div class="section"><div class="kv">
+          <div><div class="k">邮箱</div><div class="v">${esc(u.email || "—（等 issue #15 的 users.email）")}</div></div>
+          <div><div class="k">用户 ID</div><div class="v mono">${esc(u.userId)}</div></div>
+          <div><div class="k">手机号</div><div class="v">${esc(u.phone || "—")}</div></div>
+          <div><div class="k">注册时间</div><div class="v">${dateOnly(u.createdAt)}</div></div>
+          <div class="wide"><div class="k">支付宝 openId</div><div class="v mono">${u.alipayOpenId ? esc(u.alipayOpenId) : "—"}</div></div>
+          <div class="wide"><div class="k">注册邀请码</div><div class="v"><code class="mono">${esc(u.inviteCode || "—")}</code> <span class="muted small">（仅记录来源，作废不影响登录）</span></div></div>
+        </div></div>
+        <div class="section"><div class="section-title">当前权益</div>
+          <div class="ent-card"><div class="ent-head"><b>${esc(ent.planName || ent.plan || "无权益")}</b>
+            ${badgeHtml(ent.status || "none")}<span class="muted small" style="margin-left:auto">${ent.paidUntil ? "到期 " + dateOnly(ent.paidUntil) : "不适用"}</span></div>
+            <div class="ent-metrics">
+              <div><span>每日音频</span><strong>${Number(ent.dailyMinutes || 0)} 分钟</strong></div>
+              <div><span>TTS 字符</span><strong>${Number(ent.ttsCharsLeft || 0).toLocaleString()}</strong></div>
+              <div><span>QPS / 并发</span><strong>${Number(ent.qps || 0)} / ${Number(ent.maxConcurrent || 0)}</strong></div>
+            </div></div>
+          <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">
+            <button class="btn btn-primary btn-sm" onclick="openAdjustEnt('${esc(u.userId)}')">${icon("edit")}调整权益</button>
+            <button class="btn btn-ghost btn-sm" onclick="adjustEnt('${esc(u.userId)}','extend',30)">${icon("plus")}+30 天</button>
+            <button class="btn btn-ghost btn-sm" onclick="adjustEnt('${esc(u.userId)}','${ent.status === "frozen" ? "activate" : "freeze"}')">${icon("snow")}${ent.status === "frozen" ? "恢复" : "冻结"}</button>
+          </div></div>
+        <div class="section"><div class="section-title">设备（${(u.devices || []).filter((d) => d.status === "active").length} / ${ent.maxDevices || 0}）</div>
+          ${devices || '<div class="empty">' + icon("device") + '<b>没有绑定设备</b>解绑后用户需要重新配对。</div>'}
+          <button class="btn btn-danger btn-sm" style="margin-top:9px" onclick="resetDevices('${esc(u.userId)}')">${icon("undo")}全部解绑（找回兜底）</button></div>
+        <div class="section"><div class="section-title">最近订单</div>${orders || '<div class="empty">没有订单</div>'}</div>
+      </div>
+      <div class="drawer-foot"><span class="left muted small">冻结账号会立即中断该账号的设备调用</span>
+        ${u.status === "active"
+          ? `<button class="btn btn-danger" onclick="openFreeze('${esc(u.userId)}','${esc(u.name || u.email || u.userId)}')">${icon("ban")}冻结账号</button>`
+          : `<button class="btn btn-primary" onclick="doUserStatus('${esc(u.userId)}','active')">${icon("check")}恢复账号</button>`}
+      </div>`);
+  } catch (e) { openDrawer(`<div class="drawer-body"><div class="load-error">${esc(e.message)}</div></div>`); }
+}
+function openFreeze(userId, name) {
+  openModal(`<h3>冻结 ${esc(name)} 的账号？</h3>
+    <p class="modal-sub">冻结会立即生效：该账号不能再登录、下单，已绑定的设备在能力请求上也会收到 403。恢复账号后设备可继续使用，不需要重新配对。</p>
+    <div class="modal-box"><div class="row"><span>用户</span><b class="mono">${esc(userId)}</b></div></div>
+    <div class="modal-acts"><button class="btn btn-ghost" onclick="closeModal()">取消</button>
+      <button class="btn btn-danger" onclick="closeModal();doUserStatus('${esc(userId)}','disabled')">${icon("ban")}确认冻结</button></div>`);
+}
+async function doUserStatus(userId, status) {
+  try {
+    await wpost(`/admin/api/account/users/${encodeURIComponent(userId)}/status`,
+      { status: status, confirm: userId });
+    toast(status === "disabled" ? "已冻结账号" : "已恢复账号");
+    await openUserDrawer(userId);
+  } catch (e) { alert("操作失败：" + e.message); }
+}
+async function revokeDevice(userId, clientId) {
+  if (!confirm("解绑这台设备？\n\n旧客户端会立即失效，需要重新配对。")) return;
+  try {
+    await wpost(`/admin/api/account/users/${encodeURIComponent(userId)}/devices/${encodeURIComponent(clientId)}/revoke`,
+      { confirm: clientId });
+    toast("已解绑设备"); await openUserDrawer(userId);
+  } catch (e) { alert("解绑失败：" + e.message); }
+}
+async function resetDevices(userId) {
+  if (!confirm("解绑这个人的所有设备？旧客户端会立即失效。")) return;
+  try {
+    await wpost(`/admin/api/account/users/${encodeURIComponent(userId)}/reset-devices`,
+      { confirm: userId });
+    toast("已全部解绑"); await openUserDrawer(userId);
+  } catch (e) { alert("解绑失败：" + e.message); }
+}
+function openAdjustEnt(userId) {
+  openModal(`<h3>调整权益</h3><p class="modal-sub">动的是权限，不是钱；退款请走订单页。所有调整都记审计。</p>
+    <div class="field" style="margin-top:14px"><label>操作</label><select class="select" id="entAction">
+      <option value="extend">延长天数</option><option value="freeze">冻结</option>
+      <option value="activate">恢复</option><option value="internal">设为 internal</option></select></div>
+    <div class="field" style="margin-top:10px" id="entDaysRow"><label>延长天数</label><input class="input" id="entDays" type="number" value="30"></div>
+    <div class="modal-acts"><button class="btn btn-ghost" onclick="closeModal()">取消</button>
+      <button class="btn btn-primary" onclick="submitAdjustEnt('${esc(userId)}')">保存</button></div>`);
+  const sel = $("#entAction");
+  if (sel) sel.onchange = () => {
+    const row = $("#entDaysRow"); if (row) row.style.display = sel.value === "extend" ? "" : "none";
+  };
+}
+async function submitAdjustEnt(userId) {
+  const action = $("#entAction").value;
+  const days = Number(($("#entDays") || {}).value || 30);
+  await adjustEnt(userId, action, days);
+  closeModal();
+}
+async function adjustEnt(userId, action, days) {
+  try {
+    const body = { action: action, confirm: userId };
+    if (action === "extend") body.days = Number(days || 30);
+    await wpost(`/admin/api/billing/entitlements/${encodeURIComponent(userId)}/adjust`, body);
+    toast("权益已更新"); await openUserDrawer(userId);
+  } catch (e) { alert("调整失败：" + e.message); }
+}
+
+/* ---------------------------------------------------------------- 权益 */
+async function viewEntitlements() {
+  const d = await api("/admin/api/billing/entitlements" + qs({
+    q: Q.ents.q, status: Q.ents.status, expiringWithinDays: Q.ents.days,
+    limit: 20, offset: Q.ents.offset,
+  }));
+  const rows = (d.entitlements || []).map((e) => [
+    raw(`<b>${esc(e.name || e.email || e.userId)}</b><div class="muted small">${esc(e.email || e.userId)}</div>`),
+    esc(e.planName || e.plan || "—"),
+    badge(e.expiringSoon ? "warn" : e.status, e.expiringSoon ? "即将到期" : undefined),
+    e.paidUntil ? dateOnly(e.paidUntil) : "—",
+    `${Number(e.dailyMinutes || 0)} 分钟`,
+    Number(e.ttsCharsLeft || 0).toLocaleString(),
+    `${Number(e.devices || 0)} / ${Number(e.maxDevices || 0)}`,
+    raw(`<button class="btn btn-subtle btn-sm" onclick="adjustEnt('${esc(e.userId)}','extend',30)">+30 天</button>
+      <button class="btn btn-ghost btn-sm" onclick="adjustEnt('${esc(e.userId)}','${e.status === "frozen" ? "activate" : "freeze"}')">${e.status === "frozen" ? "恢复" : "冻结"}</button>`),
+  ]);
+  return `<div class="page-head"><div><h1>权益</h1><div class="lead">按到期与状态筛选；调整权益会写审计，退款与延长是两条独立动作。</div></div>
+    <div class="acts"><button class="btn btn-primary" onclick="render()">${icon("refresh")}刷新</button></div></div>
+  <div class="card" style="margin-bottom:14px"><div class="filters">
+    <div class="search"><label class="field"><span class="small muted">搜索</span><span style="position:relative;display:block">${icon("search")}<input class="input" id="entQ" placeholder="邮箱 / 用户 ID / 姓名" value="${esc(Q.ents.q)}"></span></label></div>
+    <div class="field"><label>状态</label><select class="select" id="entStatus">
+      ${[["", "全部"], ["active", "有效"], ["expiring", "即将到期"], ["frozen", "已冻结"], ["expired", "已到期"], ["refunded", "已退款"]].map(([v, t]) =>
+        `<option value="${v}" ${Q.ents.status === v ? "selected" : ""}>${t}</option>`).join("")}
+    </select></div>
+    <div class="field"><label>到期范围</label><select class="select" id="entDays">
+      ${[["0", "全部"], ["7", "7 天内"], ["30", "30 天内"]].map(([v, t]) =>
+        `<option value="${v}" ${String(Q.ents.days) === v ? "selected" : ""}>${t}</option>`).join("")}
+    </select></div>
+    <div class="acts"><button class="btn btn-primary" id="entSearch">${icon("search")}筛选</button>
+      <button class="btn btn-ghost" id="entReset">重置</button></div>
+  </div></div>
+  <div class="card"><h2>权益列表 <span class="sub">共 ${d.total} 条</span></h2>
+    ${table(["用户", "套餐", "状态", "到期", "每日音频", "TTS", "设备", "操作"], rows)}
+    ${pager(d.total, 20, Q.ents.offset, "ents")}</div>`;
+}
+function bindEntitlements() {
+  const run = () => {
+    Q.ents.q = $("#entQ").value.trim(); Q.ents.status = $("#entStatus").value;
+    Q.ents.days = Number($("#entDays").value || 0); Q.ents.offset = 0; render();
+  };
+  const btn = $("#entSearch"); if (btn) btn.onclick = run;
+  const reset = $("#entReset");
+  if (reset) reset.onclick = () => { Q.ents = { q: "", status: "", days: 0, offset: 0 }; render(); };
+}
+
+/* ---------------------------------------------------------------- 套餐 */
+async function viewPlans() {
+  const d = await api("/admin/api/billing/plans");
+  BILLING_PLANS = Object.fromEntries((d.plans || []).map((p) => [p.code, p]));
+  BILLING_RULES = d.rules || BILLING_RULES;
+  const cards = (d.plans || []).map((p) => `
+    <div class="card"><h2>${esc(p.name)} <span class="sub">${p.active ? "上架" : "下架"}</span></h2>
+      <div class="amount-hero"><b>${money(p.priceCents)}</b><span>/ ${p.days || "—"} 天</span></div>
+      <div class="kv" style="grid-template-columns:1fr 1fr">
+        <div><div class="k">每日音频</div><div class="v">${p.dailyAudioMinutes} 分钟</div></div>
+        <div><div class="k">TTS 字符</div><div class="v">${Number(p.ttsChars || 0).toLocaleString()}</div></div>
+        <div><div class="k">设备 / 并发</div><div class="v">${p.maxDevices} 台 / ${p.maxConcurrent}</div></div>
+        <div><div class="k">QPS</div><div class="v">${p.qps}</div></div>
+      </div>
+      <div style="display:flex;gap:8px;margin-top:14px">
+        <button class="btn btn-ghost btn-sm" onclick="openPlanModal('${esc(p.code)}')">${icon("edit")}编辑</button>
+        <button class="btn btn-ghost btn-sm" onclick="togglePlan('${esc(p.code)}',${p.active ? "false" : "true"})">${p.active ? "下架" : "上架"}</button>
+      </div></div>`).join("");
+  const r = BILLING_RULES || {};
+  return `<div class="page-head"><div><h1>套餐</h1><div class="lead">改价 / 上下架只影响以后的订单；已卖出的订单金额与权益不变。</div></div>
+    <div class="acts"><button class="btn btn-primary" onclick="openPlanModal('')">${icon("plus")}新建套餐</button></div></div>
+  <div class="grid grid-3">${cards || '<div class="empty">还没有套餐</div>'}</div>
+  <div class="card" style="margin-top:14px"><h2>续费与退款规则（只读，官网同源）</h2>
+    <div class="kv"><div class="wide"><div class="k">续费</div><div class="v" style="font-weight:500">${esc(r.renewalRule || "—")}</div></div>
+      <div class="wide"><div class="k">换套餐</div><div class="v" style="font-weight:500">${esc(r.planChangeRule || "—")}</div></div>
+      <div class="wide"><div class="k">退款</div><div class="v" style="font-weight:500">${esc(r.refundRule || "—")}</div></div></div></div>`;
+}
+function bindPlans() {}
+function openPlanModal(code) {
+  const p = code ? (BILLING_PLANS[code] || {}) : {};
+  if (code && !p.code) {
+    api("/admin/api/billing/plans").then((d) => {
+      BILLING_PLANS = Object.fromEntries((d.plans || []).map((x) => [x.code, x]));
+      openPlanModal(code);
+    });
+    return;
+  }
+  openModal(`<h3>${code ? "编辑套餐" : "新建套餐"}</h3>
+    <div class="grid grid-2" style="margin-top:14px">
+      <div class="field"><label>code</label><input class="input" id="plCode" value="${esc(p.code || "")}" ${code ? "readonly" : ""}></div>
+      <div class="field"><label>名字</label><input class="input" id="plName" value="${esc(p.name || "")}"></div>
+      <div class="field"><label>价格（分）</label><input class="input" id="plPrice" type="number" value="${Number(p.priceCents || 0)}"></div>
+      <div class="field"><label>天数</label><input class="input" id="plDays" type="number" value="${Number(p.days || 0)}"></div>
+      <div class="field"><label>每日音频分钟</label><input class="input" id="plMin" type="number" value="${Number(p.dailyAudioMinutes || 120)}"></div>
+      <div class="field"><label>TTS 字符</label><input class="input" id="plTts" type="number" value="${Number(p.ttsChars || 50000)}"></div>
+      <div class="field"><label>QPS</label><input class="input" id="plQps" type="number" value="${Number(p.qps || 1)}"></div>
+      <div class="field"><label>设备数</label><input class="input" id="plDev" type="number" value="${Number(p.maxDevices || 3)}"></div>
+      <div class="field"><label>每账号并发</label><input class="input" id="plConc" type="number" value="${Number(p.maxConcurrent || 1)}"></div>
+      <div class="field"><label>上架</label><select class="select" id="plActive"><option value="1" ${p.active !== false ? "selected" : ""}>上架</option><option value="0" ${p.active === false ? "selected" : ""}>下架</option></select></div>
+    </div>
+    <div class="modal-acts"><button class="btn btn-ghost" onclick="closeModal()">取消</button>
+      <button class="btn btn-primary" onclick="savePlan(${code ? "true" : "false"})">保存</button></div>`);
+}
+async function savePlan(isEdit) {
+  const body = {
+    code: $("#plCode").value.trim(), name: $("#plName").value.trim(),
+    priceCents: Number($("#plPrice").value || 0), days: Number($("#plDays").value || 0),
+    dailyAudioMinutes: Number($("#plMin").value || 0), ttsChars: Number($("#plTts").value || 0),
+    qps: Number($("#plQps").value || 1), maxDevices: Number($("#plDev").value || 3),
+    maxConcurrent: Number($("#plConc").value || 1), active: $("#plActive").value === "1",
+  };
+  if (!body.code) return alert("要填 code");
+  try {
+    if (isEdit) await api("/admin/api/billing/plans/" + encodeURIComponent(body.code), {
+      method: "PUT", headers: whdrs(), body: JSON.stringify(body),
+    });
+    else await wpost("/admin/api/billing/plans", body);
+    closeModal(); toast("套餐已保存"); await render();
+  } catch (e) { alert("保存失败：" + e.message); }
+}
+async function togglePlan(code, active) {
+  try {
+    await wpost("/admin/api/billing/plans", { code: code, active: active });
+    toast(active ? "已上架" : "已下架"); await render();
+  } catch (e) { alert("操作失败：" + e.message); }
+}
+
+/* ---------------------------------------------------------------- 邀请码 */
+async function viewInvites() {
+  const d = await api("/admin/api/account/invites");
+  const rows = (d.invites || []).map((i) => [
+    raw(`<span class="mono" style="font-weight:700">${esc(i.code)}</span> <button class="copy-btn" onclick="copyText('${esc(i.code)}')">${icon("copy")}</button>`),
+    i.max_uses, `${i.used} / ${i.max_uses}`,
+    i.expires_at ? dateOnly(i.expires_at) : "长期",
+    esc(i.created_by || "—"), esc(i.note || "—"),
+    raw(`<button class="btn btn-danger btn-sm" onclick="voidInvite('${esc(i.code)}')">作废</button>`),
+  ]);
+  return `<div class="page-head"><div><h1>邀请码</h1><div class="lead">生成、作废与使用情况。邀请码只决定注册名额；已注册用户登录不因作废失效。</div></div></div>
+  <div class="grid grid-7-3">
+    <div class="card"><h2>邀请码列表 <span class="sub">共 ${(d.invites || []).length} 张</span></h2>
+      ${table(["code", "名额", "已用", "到期", "谁发的", "备注", "操作"], rows)}</div>
+    <div class="card" style="align-self:start"><h2>生成邀请码</h2>
+      <div class="stack">
+        <div class="field"><label>code（留空随机生成）</label><input class="input" id="ivCode" placeholder="例如 TEAM2026"></div>
+        <div class="field"><label>名额</label><input class="input" id="ivUses" type="number" value="1"></div>
+        <div class="field"><label>到期时间（unix 秒，可选）</label><input class="input" id="ivExpires" type="number" placeholder="留空 = 长期"></div>
+        <div class="field"><label>备注</label><input class="input" id="ivNote" placeholder="给谁用 / 活动名"></div>
+        <button class="btn btn-primary" id="ivNew">${icon("plus")}生成邀请码</button>
+        <p class="muted small" style="line-height:1.7">生成后明文只在提交结果里显示一次；已用名额不作废、不回收。</p>
+      </div></div>
+  </div>`;
+}
+function bindInvites() {
+  const btn = $("#ivNew"); if (!btn) return;
+  btn.onclick = async () => {
+    try {
+      const r = await wpost("/admin/api/account/invites", {
+        code: $("#ivCode").value.trim(), maxUses: Number($("#ivUses").value || 1),
+        expiresAt: Number($("#ivExpires").value || 0), note: $("#ivNote").value.trim(),
+      });
+      toast("已生成：" + r.code + "（明文只显示这一次）");
+      await render();
+    } catch (e) { alert("生成失败：" + e.message); }
+  };
+}
+async function voidInvite(code) {
+  if (!confirm("作废邀请码 " + code + "？\n\n已用名额不回收；已注册用户登录不受影响。")) return;
+  try {
+    await wdelete("/admin/api/account/invites/" + encodeURIComponent(code), { confirm: code });
+    toast("已作废"); await render();
+  } catch (e) { alert("作废失败：" + e.message); }
+}
+
+/* ---------------------------------------------------------------- 支付回调 */
+async function viewNotifies() {
+  const d = await api("/admin/api/billing/notifies" + qs({
+    q: Q.notifies.q, status: Q.notifies.status, verified: Q.notifies.verified,
+    limit: 20, offset: Q.notifies.offset,
+  }));
+  const rows = (d.notifies || []).map((n) => [
+    raw(`<span class="mono nowrap" title="${esc(n.tradeNo)}">${esc(String(n.tradeNo).slice(0, 20))}${String(n.tradeNo).length > 20 ? "…" : ""}</span> <button class="copy-btn" onclick="copyText('${esc(n.tradeNo)}')">${icon("copy")}</button>`),
+    raw(`<span class="mono nowrap">${esc(n.orderId)}</span>`),
+    badge(n.status === "conflict" ? "conflict" : (n.status === "paid" ? "paid" : "muted"), n.status),
+    n.verified ? raw('<span class="badge ok">验签通过</span>') : raw('<span class="badge danger">验签失败</span>'),
+    ts(n.at),
+    raw(`<button class="btn btn-subtle btn-sm" onclick="openNotifyDetail('${esc(n.tradeNo)}')">展开原文</button>`),
+  ]);
+  return `<div class="page-head"><div><h1>支付回调</h1><div class="lead">验签状态、conflict 与原文截断；按订单或时间筛选，用于迟到支付对账。</div></div>
+    <div class="acts"><button class="btn btn-ghost" onclick="render()">${icon("refresh")}刷新</button></div></div>
+  <div class="card" style="margin-bottom:14px"><div class="filters">
+    <div class="search"><label class="field"><span class="small muted">搜索</span><span style="position:relative;display:block">${icon("search")}<input class="input" id="ntfQ" placeholder="订单号 / 支付宝 tradeNo" value="${esc(Q.notifies.q)}"></span></label></div>
+    <div class="field"><label>状态</label><select class="select" id="ntfStatus">
+      ${[["", "全部"], ["paid", "paid"], ["closed", "closed"], ["pending", "pending"], ["conflict", "conflict"]].map(([v, t]) =>
+        `<option value="${v}" ${Q.notifies.status === v ? "selected" : ""}>${t}</option>`).join("")}
+    </select></div>
+    <div class="field"><label>验签</label><select class="select" id="ntfVerified">
+      <option value="">全部</option><option value="1" ${Q.notifies.verified === "1" ? "selected" : ""}>通过</option><option value="0" ${Q.notifies.verified === "0" ? "selected" : ""}>失败</option>
+    </select></div>
+    <div class="acts"><button class="btn btn-primary" id="ntfSearch">${icon("search")}筛选</button>
+      <button class="btn btn-ghost" id="ntfReset">重置</button></div>
+  </div></div>
+  <div class="card"><h2>回调记录 <span class="sub">共 ${d.total} 条</span></h2>
+    ${table(["tradeNo", "订单", "状态", "验签", "时间", "原文"], rows)}
+    ${pager(d.total, 20, Q.notifies.offset, "notifies")}
+    <div class="filter-note">conflict = 订单已关闭/已退款后才到达的成功支付；closed/pending 是非成功通知。原文只读、不包含签名密钥。</div></div>`;
+}
+function bindNotifies() {
+  const run = () => {
+    Q.notifies.q = $("#ntfQ").value.trim(); Q.notifies.status = $("#ntfStatus").value;
+    Q.notifies.verified = $("#ntfVerified").value; Q.notifies.offset = 0; render();
+  };
+  const btn = $("#ntfSearch"); if (btn) btn.onclick = run;
+  const reset = $("#ntfReset");
+  if (reset) reset.onclick = () => { Q.notifies = { q: "", status: "", verified: "", offset: 0 }; render(); };
+}
+async function openNotifyDetail(tradeNo) {
+  try {
+    const n = await api("/admin/api/billing/notifies/" + encodeURIComponent(tradeNo));
+    let pretty = n.raw || "";
+    try { pretty = JSON.stringify(JSON.parse(n.raw || "{}"), null, 2); } catch (e) { /* 原文照显 */ }
+    openModal(`<h3>支付回调原文</h3><p class="modal-sub">只读展示；签名与密钥不会出现在页面里。tradeNo：<span class="mono">${esc(n.tradeNo)}</span></p>
+      <pre class="mono" style="margin-top:12px;max-height:340px;overflow:auto;white-space:pre-wrap;line-height:1.65;background:#f1f5f9;border-radius:10px;padding:12px">${esc(pretty)}</pre>
+      <div class="modal-acts"><button class="btn btn-ghost" onclick="closeModal()">关闭</button>
+        <button class="btn btn-primary" onclick="copyText('${esc(n.tradeNo)}')">${icon("copy")}复制 tradeNo</button></div>`);
+  } catch (e) { alert("读不到原文：" + e.message); }
+}
+
+/* ---------------------------------------------------------------- 操作审计 */
+async function viewAudit() {
+  const d = await api("/admin/api/audit" + qs({ q: Q.audit.q, result: Q.audit.result, limit: 50, offset: Q.audit.offset }));
+  const rows = (d.rows || []).map((a) => [
+    ts(a.ts), esc(a.admin || "—"), raw(`<code class="mono">${esc(a.action)}</code>`),
+    raw(`<span class="mono">${esc(a.target || "—")}</span>`),
+    String(a.action || "").endsWith(".failed")
+      ? raw('<span class="badge danger">失败</span>') : raw('<span class="badge ok">成功</span>'),
+  ]);
+  return `<div class="page-head"><div><h1>操作审计</h1><div class="lead">谁在什么时候对哪个对象做了什么；失败动作也留痕（动作名带 .failed）。</div></div></div>
+  <div class="card" style="margin-bottom:14px"><div class="filters">
+    <div class="search"><label class="field"><span class="small muted">搜索</span><span style="position:relative;display:block">${icon("search")}<input class="input" id="audQ" placeholder="管理员 / 动作 / 对象 ID" value="${esc(Q.audit.q)}"></span></label></div>
+    <div class="field"><label>结果</label><select class="select" id="audResult">
+      <option value="">全部</option><option value="failed" ${Q.audit.result === "failed" ? "selected" : ""}>失败</option><option value="ok" ${Q.audit.result === "ok" ? "selected" : ""}>成功</option>
+    </select></div>
+    <div class="acts"><button class="btn btn-primary" id="audSearch">${icon("search")}筛选</button>
+      <button class="btn btn-ghost" id="audReset">重置</button></div>
+  </div></div>
+  <div class="card"><h2>管理动作 <span class="sub">共 ${d.total} 条</span></h2>
+    ${table(["时间", "管理员", "动作", "对象", "结果"], rows)}
+    ${pager(d.total, 50, Q.audit.offset, "audit")}</div>`;
+}
+function bindAudit() {
+  const run = () => { Q.audit.q = $("#audQ").value.trim(); Q.audit.result = $("#audResult").value; Q.audit.offset = 0; render(); };
+  const btn = $("#audSearch"); if (btn) btn.onclick = run;
+  const reset = $("#audReset");
+  if (reset) reset.onclick = () => { Q.audit = { q: "", result: "", offset: 0 }; render(); };
+}
+
+/* ---------------------------------------------------------------- 系统状态 */
+async function viewSystem() {
+  const d = await api("/admin/api/system");
+  const b = d.billing || {};
+  return `<div class="page-head"><div><h1>系统状态</h1><div class="lead">只读展示支付配置、网关模式、notify_url 与版本；任何密钥都不出现在页面上。</div></div></div>
+  <div class="grid grid-2">
+    <div class="card"><h2>支付与版本</h2>
+      <div class="kv">
+        <div><div class="k">支付网关</div><div class="v">${esc(b.provider || "—")} ${b.gatewayConfigured ? badgeHtml("active", "已配置") : badgeHtml("muted", "未配置")}</div></div>
+        <div><div class="k">网关模式</div><div class="v">${b.sandbox ? "sandbox（测试环境）" : "prod"}</div></div>
+        <div class="wide"><div class="k">notify_url</div><div class="v mono">${b.notifyUrl ? esc(b.notifyUrl) : "未配置"}</div></div>
+        <div><div class="k">计费闸门</div><div class="v">${b.effectiveGating ? "生效" : "未生效"}</div></div>
+        <div><div class="k">后端版本</div><div class="v">${esc(d.server.version)} · 运行 ${hm(d.server.uptimeSeconds)}</div></div>
+        <div class="wide"><div class="k">对外公布地址</div><div class="v mono">${esc((d.advertised || {}).url || "—")}</div></div>
+      </div>
+      <p class="muted small" style="margin-top:12px">页面不读也不显示 app_id / 私钥 / 公钥 / 签名串。修改这些配置仍走后端配置文件或命令行。</p></div>
+    <div class="stack">
+      <div class="card"><h2>管理员会话</h2><div class="kv">
+        <div><div class="k">在线会话</div><div class="v">${d.sessions} 个</div></div>
+        <div><div class="k">监听</div><div class="v mono">${esc(d.server.listen || "—")}</div></div>
+        <div><div class="k">TLS</div><div class="v">${d.server.tls ? "是" : "否（回环 http）"}</div></div>
+        <div><div class="k">目录</div><div class="v mono">${esc(d.stateRoot || "—")}</div></div>
+      </div></div>
+      <div class="card"><h2>安全边界</h2><ul class="small muted" style="display:grid;gap:8px;line-height:1.7">
+        <li>· 管理面只监听回环 / SSH 隧道，不公网暴露。</li>
+        <li>· 写请求要求同站 Origin + <code class="mono">X-ECHO-Admin</code> + CSRF 双提交 + 审计。</li>
+        <li>· 页面内所有用户数据 / 订单号 / 回调原文都经 HTML 转义。</li>
+        <li>· 管理面与能力面仍是两个应用、两套路径与身份。</li>
+      </ul></div>
+    </div>
+  </div>`;
+}
+
+/* ---------------------------------------------------------------- 模型 */
 async function viewModels() {
   const d = await api("/admin/api/models");
   return `<div class="card"><h2>模型</h2>${table(
@@ -327,84 +1496,57 @@ async function viewModels() {
     d.models.map((x) => [x.id, x.slot || "—", x.state, x.resident ? "是" : "否",
       mb(x.estVramMb), x.maxConcurrency, x.vectorSpaceId || "—"]))}
     <div class="muted" style="margin-top:8px">显存：${esc(JSON.stringify(d.vram))}。
-      加载/卸载是能力面自己的状态机（按需 + LRU），模型加载/卸载不在这里（那是能力面自己的状态机）；发授权与客户端管理在「客户端」页签。</div></div>`;
+      加载/卸载是能力面自己的状态机（按需 + LRU）；发授权与客户端管理在「客户端」页签。</div></div>`;
 }
 
-/* ---------------------------------------------------------------- 客户端 / 发授权 */
-
+/* ---------------------------------------------------------------- 客户端 / 发授权（沿用旧实现） */
 function onceCard() {
   if (!ONCE) return "";
-  return `<div class="card once">
-    <h2>${esc(ONCE.title)}</h2>
-    <div class="muted">⚠️ <b>只显示这一次</b>：刷新页面后不再出现，后端也不会再给
-      （库里只有哈希）。现在复制走。</div>
+  return `<div class="card once"><h2>${esc(ONCE.title)}</h2>
+    <div class="muted">⚠️ <b>只显示这一次</b>：刷新页面后不再出现，后端也不会再给（库里只有哈希）。现在复制走。</div>
     <div class="secret" id="onceVal">${esc(ONCE.value)}</div>
     <div style="display:flex;gap:8px;margin-top:8px">
-      <button class="primary" id="btnCopy">复制</button>
-      <button id="btnOnceClose">我已复制，关掉</button>
-    </div>
-    ${ONCE.extra ? `<div class="muted" style="margin-top:6px">${esc(ONCE.extra)}</div>` : ""}
-  </div>`;
+      <button class="primary" id="btnCopy">复制</button><button id="btnOnceClose">我已复制，关掉</button></div>
+    ${ONCE.extra ? `<div class="muted" style="margin-top:6px">${esc(ONCE.extra)}</div>` : ""}</div>`;
 }
-
 function bindOnce() {
-  const copy = $("#btnCopy");
-  if (!copy) return;
+  const copy = $("#btnCopy"); if (!copy) return;
   copy.onclick = async () => {
     const text = ONCE ? ONCE.value : "";
-    try {
-      await navigator.clipboard.writeText(text);
-      copy.textContent = "已复制 ✓";
-    } catch (e) {
-      // 回退：把文本选中，让人自己 Ctrl+C（老浏览器 / 非安全上下文里 clipboard 可能不可用）
-      const el = $("#onceVal");
-      const r = document.createRange();
-      r.selectNodeContents(el);
-      const sel = window.getSelection();
-      sel.removeAllRanges();
-      sel.addRange(r);
-      copy.textContent = "已选中，请按 Ctrl+C";
+    try { await navigator.clipboard.writeText(text); copy.textContent = "已复制 ✓"; }
+    catch (e) {
+      const el = $("#onceVal"); const r = document.createRange();
+      r.selectNodeContents(el); const sel = window.getSelection();
+      sel.removeAllRanges(); sel.addRange(r); copy.textContent = "已选中，请按 Ctrl+C";
     }
   };
   const close = $("#btnOnceClose");
   if (close) close.onclick = () => { ONCE = null; render(); };
 }
-
 function issueForm() {
   const ttls = [["900", "15 分钟"], ["3600", "1 小时"], ["86400", "1 天"], ["604800", "7 天"]];
   return `<div class="card"><h2>发授权（给新客户端一张配对码）</h2>
-    <div class="muted">生成一串 <code>echo://pair?host=…&amp;code=…</code>，粘给同事在客户端面板里
-      <b>用一次</b>。名字与 scopes <b>跟着码走</b>（对端自报的盖不过它）。</div>
+    <div class="muted">生成一串 <code>echo://pair?host=…&amp;code=…</code>，粘给同事在客户端面板里 <b>用一次</b>。名字与 scopes <b>跟着码走</b>。</div>
     <div class="form">
       <label>客户端名字<input id="pcName" placeholder="张三的办公本"></label>
       <label>scopes<input id="pcScopes" placeholder="asr diarize（逗号或空格；空 = 不限）"></label>
-      <label>有效期<select id="pcTtl">${ttls.map(([v, t]) =>
-        `<option value="${v}">${t}</option>`).join("")}</select></label>
+      <label>有效期<select id="pcTtl">${ttls.map(([v, t]) => `<option value="${v}">${t}</option>`).join("")}</select></label>
       <label>备注（谁发的）<input id="pcNote" placeholder="ops"></label>
-      <label>这一张公布的地址（留空 = 用下面那一项）<input id="pcHost"
-        placeholder="只给这一张用：127.0.0.1 或 10.100.0.24"></label>
+      <label>这一张公布的地址（留空 = 用下面那一项）<input id="pcHost" placeholder="只给这一张用：127.0.0.1 或 10.100.0.24"></label>
       <button class="primary" id="btnIssue">生成配对码</button>
     </div>
-    <div class="muted" style="margin-top:6px">串里的 host <b>手改就能用</b>（就是一段文本，
-      没有签名/校验）—— 本机用 <code>127.0.0.1</code>、同事用局域网 IP，
-      同一台后端两边都服务时**发码时各写各的**（上面那个格子）。</div>
     <div class="errtxt" id="issueErr"></div></div>`;
 }
-
 function pendingCodes(d) {
   const rows = (d.codes || []).map((c) => [
     c.name || "(未命名)", c.scopes || "(不限)", c.createdBy || "—",
     c.expired ? raw('<span class="badge off">已过期</span>') : left(c.remainingSeconds),
-    ts(c.expiresAt),
-    raw(`<button class="danger" data-code="${esc(c.id)}">作废</button>`),
+    ts(c.expiresAt), raw(`<button class="danger" data-code="${esc(c.id)}">作废</button>`),
   ]);
-  // 标题写"能用的"：这张表里**只有能用的码**（后端已经把用过 / 过期的排除掉了），
-  // 免得再出现"标题说待用、行里写着已过期"那种自相矛盾。
   return `<div class="card"><h2>待用的配对码（能用的 ${(d.codes || []).length} 张）</h2>
     ${table(["名字", "scopes", "谁发的", "剩余", "到期时间", "操作"], rows)}
     <div class="muted" style="margin-top:6px">${esc(d.note)}</div></div>`;
 }
-
 function clientActions(c) {
   const id = esc(c.clientId);
   return `<div class="acts">
@@ -412,187 +1554,122 @@ function clientActions(c) {
     <button class="danger" data-act="revoke" data-id="${id}">撤销</button>
     <button data-act="scopes" data-id="${id}" data-scopes="${esc(c.scopes)}">改 scopes</button>
     <button data-act="quota" data-id="${id}" data-quota="${Number(c.dailyAudioMinutes || 0)}">改配额</button>
-    <button class="danger" data-act="rotate" data-id="${id}">轮换 secret</button>
-  </div>`;
+    <button class="danger" data-act="rotate" data-id="${id}">轮换 secret</button></div>`;
 }
-
 async function viewClients() {
   const d = await api("/admin/api/clients");
   const codes = await api("/admin/api/pairing-codes");
-  // 「对外公布地址」读不到不该把这一页整个搞没（它是同一页的**另一个**接口）。
   let adv = null;
   try { adv = await api("/admin/api/advertised-host"); } catch (e) { adv = { error: e.message }; }
   const rows = d.clients.map((c) => [
     c.clientId, c.name || "—",
     c.disabled ? raw('<span class="badge off">已禁用</span>') : raw('<span class="badge on">正常</span>'),
     c.scopes || "(不限)", "v" + c.tokenVersion, ago(c.lastSeen), c.calls, c.errors,
-    c.audioMinutes + " min",
-    c.dailyAudioMinutes ? c.dailyAudioMinutes + " min/天" : "全局默认",
+    c.audioMinutes + " min", c.dailyAudioMinutes ? c.dailyAudioMinutes + " min/天" : "全局默认",
     raw(clientActions(c)),
   ]);
   return onceCard() + issueForm() + advertisedCard(adv) + pendingCodes(codes)
     + `<div class="card"><h2>客户端（最近 24 小时：${d.totals.calls} 次调用，失败 ${d.totals.errors}）</h2>
-    ${table(["客户端", "名字", "状态", "scopes", "版本", "最后活跃", "今日调用", "失败",
-             "今日音频", "日配额", "操作"], rows)}
-    <div class="muted" style="margin-top:8px">
-      危险动作（<b>撤销 / 轮换 secret / 作废配对码</b>）会先弹确认，请求里还带
-      <code>confirm</code> —— 前端弹窗挡手滑，后端那个字段挡"直接构造一个请求"。<br>
-      <b>撤销</b>是 <code>token_version + 1</code> + 盖撤销标记：旧令牌<b>立刻</b>失效，
-      而且它<b>不许再用 secret 换新令牌</b>（管理面与能力面同进程、共用同一个鉴权缓存，
-      当场生效）；被撤销的机器要恢复只能<b>重新配对</b>。<b>禁用</b>只是 403，
-      凭据没失效，随时能再启用。</div></div>`;
+    ${table(["客户端", "名字", "状态", "scopes", "版本", "最后活跃", "今日调用", "失败", "今日音频", "日配额", "操作"], rows)}
+    <div class="muted" style="margin-top:8px">危险动作（<b>撤销 / 轮换 secret / 作废配对码</b>）会先弹确认，请求里还带 <code>confirm</code>。<b>撤销</b>后旧令牌立刻失效且不许再用 secret 换新令牌；<b>禁用</b>只是 403，凭据没失效。</div></div>`;
 }
-
 function bindClients() {
   bindOnce();
   const issue = $("#btnIssue");
-  if (issue) {
-    issue.onclick = async () => {
-      $("#issueErr").textContent = "";
-      try {
-        const r = await wpost("/admin/api/pairing-codes", {
-          name: $("#pcName").value, scopes: $("#pcScopes").value,
-          ttlSeconds: Number($("#pcTtl").value), note: $("#pcNote").value,
-          // 「只给这一张用」的地址覆盖（空串 = 用「对外公布地址」那一项）。
-          advertisedHost: $("#pcHost") ? $("#pcHost").value : "",
-        });
-        const pc = r.pairingCode;
-        ONCE = {
-          title: "新的配对串（" + (pc.name || "未命名客户端") + "）",
-          value: pc.url,
-          extra: "有效 " + Math.round(pc.ttlSeconds / 60) + " 分钟；scopes=" + (pc.scopes || "不限")
-                 + "；由 " + (pc.createdBy || "—") + " 发",
-        };
-        await render();
-      } catch (e) { $("#issueErr").textContent = e.message; }
-    };
-  }
+  if (issue) issue.onclick = async () => {
+    $("#issueErr").textContent = "";
+    try {
+      const r = await wpost("/admin/api/pairing-codes", {
+        name: $("#pcName").value, scopes: $("#pcScopes").value,
+        ttlSeconds: Number($("#pcTtl").value), note: $("#pcNote").value,
+        advertisedHost: $("#pcHost") ? $("#pcHost").value : "",
+      });
+      const pc = r.pairingCode;
+      ONCE = { title: "新的配对串（" + (pc.name || "未命名客户端") + "）", value: pc.url,
+        extra: "有效 " + Math.round(pc.ttlSeconds / 60) + " 分钟；scopes=" + (pc.scopes || "不限") + "；由 " + (pc.createdBy || "—") + " 发" };
+      await render();
+    } catch (e) { $("#issueErr").textContent = e.message; }
+  };
   bindAdvertised();
-  document.querySelectorAll("[data-act]").forEach((b) => { b.onclick = () => clientAction(b); });
-  document.querySelectorAll("[data-code]").forEach((b) => { b.onclick = () => dropCode(b); });
+  $$("[data-act]").forEach((b) => { b.onclick = () => clientAction(b); });
+  $$("[data-code]").forEach((b) => { b.onclick = () => dropCode(b); });
 }
-
-/* ---------------------------------------------------------------- 对外公布地址（配对串里的 host）
-
-   需求（2026-09-30 用户实测）：容器里发出来的配对串带的是 **Docker 网桥地址**
-   （`echo://pair?host=http://172.18.0.2:8900&code=…`），同事连不上，每次都靠人手改串。
-   根治办法就是这一项 —— 放在「客户端 / 发授权」页签里，**紧挨着发码那张卡**：
-   填它的人要回答的问题正是"这张码给谁用"。
-
-   页面只负责"怎么问、怎么显示"：归一化规则、来源判定（管理面 / 环境变量 / 配置文件 /
-   自动探测）与三句话的形态说明全部由后端给（`server/advertised.py` 的 `view()`），
-   页面**一个字都不另抄**。 */
-
-let ADV_SAVED = "";             // 「已保存并生效」这句只在**下一次渲染**里出现一次
-
+let ADV_SAVED = "";
 function advertisedCard(d) {
   if (!d || d.error) {
-    return `<div class="card"><h2>对外公布地址（配对串里的 host）</h2>
-      <div class="errtxt">读不到：${esc((d && d.error) || "未知错误")}</div></div>`;
+    return `<div class="card"><h2>对外公布地址（配对串里的 host）</h2><div class="errtxt">读不到：${esc((d && d.error) || "未知错误")}</div></div>`;
   }
-  const srcs = {
-    admin: '<span class="badge on">管理面配置</span>',
-    env: '<span class="badge idle">环境变量</span>',
-    config: '<span class="badge idle">配置文件</span>',
-    auto: '<span class="badge">本机探测</span>',
-  };
-  const envs = Object.entries(d.envValues || {})
-    .filter(([, v]) => v).map(([k, v]) => k + "=" + v).join("、") || "—";
+  const srcs = { admin: '<span class="badge on">管理面配置</span>',
+    env: '<span class="badge idle">环境变量</span>', config: '<span class="badge idle">配置文件</span>',
+    auto: '<span class="badge">本机探测</span>' };
+  const envs = Object.entries(d.envValues || {}).filter(([, v]) => v).map(([k, v]) => k + "=" + v).join("、") || "—";
   const notes = (d.notes || []).map((n) => `<div class="muted">⚠️ ${esc(n)}</div>`).join("");
   const saved = ADV_SAVED ? ` <span class="badge on">${esc(ADV_SAVED)}</span>` : "";
   ADV_SAVED = "";
-  const changed = d.updatedAt
-    ? `<div class="muted">上次改：${esc(ts(d.updatedAt))}${d.updatedBy ? " · 由 " + esc(d.updatedBy) : ""}</div>`
-    : "";
+  const changed = d.updatedAt ? `<div class="muted">上次改：${esc(ts(d.updatedAt))}${d.updatedBy ? " · 由 " + esc(d.updatedBy) : ""}</div>` : "";
   return `<div class="card"><h2>对外公布地址（配对串里的 host）${saved}</h2>
     ${table(["这一项", "此刻发码会用的地址", "来源", "环境变量"],
-            [["advertised_host", d.url || "（读不出来）", raw(srcs[d.source] || esc(d.source || "?")),
-              envs]])}
+      [["advertised_host", d.url || "（读不出来）", raw(srcs[d.source] || esc(d.source || "?")), envs]])}
     <div class="muted">${esc(d.formNote || "")}</div>
-    <div class="form">
-      <label>地址<input id="advValue" value="${esc(d.value || "")}"
-        placeholder="10.100.0.24 或 10.100.0.24:8900（IPv6 带方括号）"></label>
+    <div class="form"><label>地址<input id="advValue" value="${esc(d.value || "")}" placeholder="10.100.0.24 或 10.100.0.24:8900"></label>
       <button class="primary" id="btnAdvSave">保存并生效</button>
       <button id="btnAdvLocal">填 127.0.0.1（本机用）</button>
-      <button id="btnAdvClear">清空（回到自动探测）</button>
-    </div>
+      <button id="btnAdvClear">清空（回到自动探测）</button></div>
     <div class="errtxt" id="advErr"></div>
-    <div class="muted" style="margin-top:6px">保存后<b>立刻生效</b>（不用重启），
-      并写进 state 卷的库 —— 重启后还在。${esc(d.accepts || "")}</div>
+    <div class="muted" style="margin-top:6px">保存后<b>立刻生效</b>（不用重启），并写进 state 卷的库。${esc(d.accepts || "")}</div>
     ${notes}${changed}</div>`;
 }
-
 function bindAdvertised() {
-  const save = $("#btnAdvSave");
-  if (!save) return;
+  const save = $("#btnAdvSave"); if (!save) return;
   const err = () => $("#advErr");
   const put = async (value) => {
     if (err()) err().textContent = "";
-    try {
-      // 原样把输入框的字符串发过去，让后端给出**明确的中文原因**
-      await wpost("/admin/api/advertised-host", { value });
-      ADV_SAVED = "已保存并生效";
-      await render();
-    } catch (e) { if (err()) err().textContent = "保存失败：" + e.message; }
+    try { await wpost("/admin/api/advertised-host", { value }); ADV_SAVED = "已保存并生效"; await render(); }
+    catch (e) { if (err()) err().textContent = "保存失败：" + e.message; }
   };
   save.onclick = () => put($("#advValue").value);
-  const local = $("#btnAdvLocal");
-  if (local) local.onclick = () => put("127.0.0.1");
+  const local = $("#btnAdvLocal"); if (local) local.onclick = () => put("127.0.0.1");
   const clear = $("#btnAdvClear");
-  if (clear) {
-    clear.onclick = () => {
-      if (confirm("清空这一项？\n\n之后发码回到**自动探测** —— 容器里探测到的是 Docker "
-                  + "网桥地址，同事连不上。")) put("");
-    };
-  }
+  if (clear) clear.onclick = () => {
+    if (confirm("清空这一项？\n\n之后发码回到自动探测。")) put("");
+  };
 }
-
 async function clientAction(btn) {
   const id = btn.dataset.id, act = btn.dataset.act;
   try {
     if (act === "disable" || act === "enable") {
-      const q = act === "disable"
-        ? "禁用 " + id + "？\n\n它会收到 403（认识它但不许用）；凭据没有失效，随时能重新启用。"
-        : "启用 " + id + "？\n\n它手上那个令牌直接就能用，不需要重新配对。";
+      const q = act === "disable" ? "禁用 " + id + "？它会收到 403；凭据没失效，随时能启用。"
+        : "启用 " + id + "？它手上那个令牌直接就能用。";
       if (!confirm(q)) return;
       await wpost(`/admin/api/clients/${id}/${act}`);
     } else if (act === "revoke") {
-      if (!confirm("撤销 " + id + "？\n\n它手上的令牌**立刻全部失效**，那台机器必须重新配对"
-                   + "（重新发一张配对码）。")) return;
+      if (!confirm("撤销 " + id + "？它手上的令牌立刻全部失效，那台机器必须重新配对。")) return;
       await wpost(`/admin/api/clients/${id}/revoke`, { confirm: id });
     } else if (act === "scopes") {
       const v = prompt("新的 scopes（逗号或空格分隔；留空 = 不限）：", btn.dataset.scopes || "");
       if (v === null) return;
       await wpost(`/admin/api/clients/${id}/scopes`, { scopes: v });
     } else if (act === "quota") {
-      const v = prompt("每日音频分钟数上限（0 = 用全局默认；**不清零今天的已用量**）：",
-                       btn.dataset.quota || "0");
+      const v = prompt("每日音频分钟数上限（0 = 用全局默认）：", btn.dataset.quota || "0");
       if (v === null) return;
       await wpost(`/admin/api/clients/${id}/quota`, { dailyAudioMinutes: Number(v) });
     } else if (act === "rotate") {
-      if (!confirm("轮换 " + id + " 的 secret？\n\n"
-                   + "① 新的明文**只显示这一次**（关掉就再也看不到）；\n"
-                   + "② 它原来那些令牌立刻全失效。")) return;
+      if (!confirm("轮换 " + id + " 的 secret？新明文只显示这一次，旧令牌立刻失效。")) return;
       const r = await wpost(`/admin/api/clients/${id}/rotate-secret`, { confirm: id });
-      ONCE = {
-        title: "新的 secret（" + id + "）",
-        value: r.secret,
-        extra: "带外交给那台机器：旧 secret 与旧令牌已经立刻失效。",
-      };
+      ONCE = { title: "新的 secret（" + id + "）", value: r.secret,
+        extra: "带外交给那台机器：旧 secret 与旧令牌已经立刻失效。" };
     }
     await render();
   } catch (e) { alert("失败：" + e.message); }
 }
-
 async function dropCode(btn) {
   const id = btn.dataset.code;
-  if (!confirm("作废这张配对码？\n\n它还没被用过；作废之后那个码就兑不了了。")) return;
-  try {
-    await wdelete("/admin/api/pairing-codes/" + encodeURIComponent(id), { confirm: id });
-    await render();
-  } catch (e) { alert("失败：" + e.message); }
+  if (!confirm("作废这张配对码？作废之后那个码就兑不了了。")) return;
+  try { await wdelete("/admin/api/pairing-codes/" + encodeURIComponent(id), { confirm: id }); await render(); }
+  catch (e) { alert("失败：" + e.message); }
 }
 
+/* ---------------------------------------------------------------- 调用 */
 async function viewCalls() {
   const d = await api("/admin/api/calls");
   const groups = (d.aggregate && d.aggregate.groups) || [];
@@ -609,81 +1686,49 @@ async function viewCalls() {
   <div class="muted" style="margin-top:8px">这张表里**只有元数据** —— 没有音频、文本、嵌入、说话人数。</div></div>`;
 }
 
+/* ---------------------------------------------------------------- 存储 */
 async function viewInventory() {
   const d = await api("/admin/api/inventory");
   const acc = await api("/admin/api/admins");
-  /* 策略从后端带下来（页面不另抄一份位数），只在内存里，不落任何存储。 */
   PWD = acc.passwordPolicy || PWD;
   const rows = Object.entries(d.tables).map(([t, cols]) =>
     [t, cols.length, cols.join(", "), d.whitelist.includes(t) ? "在白名单" : "**不在白名单**"]);
-  return `<div class="card"><h2>存了什么</h2>
-    <div>${esc(d.statement)}</div>
-    <div class="muted" style="margin-top:6px">下面这张表读的是<b>活着的库</b>，不是文档：
-      表名与列名都是当场从数据库读出来的。${esc(d.contentCheck)}</div>
-  </div>
+  return `<div class="card"><h2>存了什么</h2><div>${esc(d.statement)}</div>
+    <div class="muted" style="margin-top:6px">下面这张表读的是<b>活着的库</b>，不是文档：表名与列名都是当场从数据库读出来的。${esc(d.contentCheck)}</div></div>
   <div class="card"><h2>表与列（实际状态）</h2>${table(["表", "列数", "列", "白名单"], rows)}
-    <div class="muted" style="margin-top:8px">两个目录：临时 <code>${esc(d.tmpRoot || "(默认)")}</code>
-      （可以被清理器删、可以挂 tmpfs）；耐久 <code>${esc(d.stateRoot || "(默认)")}</code>。
-      <b>两种相反的保留策略，故意分开</b>。</div></div>
+    <div class="muted" style="margin-top:8px">两个目录：临时 <code>${esc(d.tmpRoot || "(默认)")}</code>（可清理、可挂 tmpfs）；耐久 <code>${esc(d.stateRoot || "(默认)")}</code>。<b>两种相反的保留策略，故意分开</b>。</div></div>
   ${accountsCard(acc)}
-  <div class="card"><h2>最近的管理动作</h2>${table(
-    ["时间", "管理员", "动作", "对象"],
-    d.recentAudit.map((a) => [new Date(Number(a.ts) * 1000).toLocaleString(), a.admin,
-      a.action, a.target || "—"]))}
-    <div class="muted" style="margin-top:6px">写动作**含失败**都在这里（失败的动作名带
-      <code>.failed</code>，"被闸门挡回来"的记成 <code>write-guard</code>）。<br>
-      <b>配对码被客户端兑走</b>也记在这里（动作名 <code>pair-redeem</code>）：那几行的
-      "管理员"一列写成 <code>pair:&lt;发放者&gt;</code> —— 因为那不是谁在面板上点的，
-      而是对端拿码换走了凭据。"待用的配对码"那张表里查不到的码，答案在这里。</div></div>`;
+  <div class="card"><h2>最近的管理动作</h2>${table(["时间", "管理员", "动作", "对象"],
+    d.recentAudit.map((a) => [new Date(Number(a.ts) * 1000).toLocaleString(), a.admin, a.action, a.target || "—"]))}
+    <div class="muted" style="margin-top:6px">写动作**含失败**都在这里（失败的动作名带 <code>.failed</code>）。<b>配对码被客户端兑走</b>也记在这里（<code>pair-redeem</code>），"管理员"一列写成 <code>pair:&lt;发放者&gt;</code>。</div></div>`;
 }
 
-/* ---------------------------------------------------------------- 管理员账号 + 改口令
-
-   立场（与 `server/admin.py` 开头那段是同一件事，别改一边忘了另一边）：
-   **新增 / 删除 / 禁用管理员、改别人的口令，一律只在命令行** —— 那是"谁能进门"的事，
-   而面板本身就在这扇门里（一次会话劫持就能顺手把自己加成管理员）。
-   面板只开**一条**口子：**改自己的口令**，而且必须先给出**当前口令**
-   （攻击者拿到会话也改不掉口令，因为他不知道当前口令）。
-
-   两句说明文案由 `/admin/api/admins` 给（`note` / `selfServiceNote`），页面只负责显示：
-   写成两处必然漂开，而这种"页面上的承诺"漂开是最贵的一种 bug。 */
 function accountsCard(acc) {
   const P = acc.passwordPolicy || PWD;
   const min = Number(P.minLength || 8), max = Number(P.maxLength || 200);
   return `<div class="card" id="pwCard"><h2>管理员账号（增删仍只在命令行）</h2>${table(
-    ["账号", "状态", "建号", "最后登录"],
-    acc.admins.map((a) => [a.username + (a.username === acc.self ? "（你）" : ""),
+    ["账号", "状态", "建号", "最后登录"], acc.admins.map((a) => [
+      a.username + (a.username === acc.self ? "（你）" : ""),
       a.disabled ? raw('<span class="badge off">已禁用</span>') : raw('<span class="badge on">正常</span>'),
       ts(a.createdAt), ts(a.lastLogin)]))}
     <div class="muted" style="margin-top:6px">${esc(acc.note || "")}</div>
     <div class="muted" style="margin-top:6px">${esc(acc.selfServiceNote || "")}</div>
     <h2 style="margin-top:14px">修改我的口令</h2>
-    <div class="muted">只改<b>当前登录的这一个账号</b>${acc.self ? "（" + esc(acc.self) + "）" : ""}，
-      并且要先填<b>当前口令</b>。新口令至少 <b>${min}</b> 位（最多 ${max} 位）；
-      改成功之后<b>其它已登录的会话立刻失效</b>，当前这个会话保留。
-      口令只在这条请求的请求体里，**不写进浏览器存储、也不进 URL**。</div>
-    <div class="form">
-      <label>当前口令<input id="pwCur" type="password" autocomplete="current-password"></label>
+    <div class="muted">只改<b>当前登录的这一个账号</b>，并且要先填<b>当前口令</b>。新口令至少 <b>${min}</b> 位（最多 ${max} 位）；改成功之后<b>其它已登录的会话立刻失效</b>，当前这个会话保留。口令只在这条请求的请求体里，**不写进浏览器存储、也不进 URL**。</div>
+    <div class="form"><label>当前口令<input id="pwCur" type="password" autocomplete="current-password"></label>
       <label>新口令<input id="pwNew" type="password" autocomplete="new-password"></label>
       <label>确认新口令<input id="pwNew2" type="password" autocomplete="new-password"></label>
-      <button class="primary" id="btnPwSave">修改口令</button>
-    </div>
-    <div class="errtxt" id="pwErr"></div>
-    <div style="color:var(--green);font-size:13px;min-height:16px" id="pwOk"></div></div>`;
+      <button class="primary" id="btnPwSave">修改口令</button></div>
+    <div class="errtxt" id="pwErr"></div><div style="color:var(--ok);font-size:13px;min-height:16px" id="pwOk"></div></div>`;
 }
-
 function bindPassword() {
-  const btn = $("#btnPwSave");
-  if (!btn) return;
+  const btn = $("#btnPwSave"); if (!btn) return;
   const err = $("#pwErr"), ok = $("#pwOk");
   const fail = (m) => { if (err) err.textContent = m; };
   btn.onclick = async () => {
-    if (err) err.textContent = "";
-    if (ok) ok.textContent = "";
+    if (err) err.textContent = ""; if (ok) ok.textContent = "";
     const cur = $("#pwCur").value, next = $("#pwNew").value, again = $("#pwNew2").value;
     const min = Number(PWD.minLength || 8);
-    /* **客户端先把明显不合格的挡掉**（两次不一致就不发请求）——
-       但这不是保证：服务端那份（`server/admin.py` 的策略 + 当前口令校验）才算数。 */
     if (!cur) return fail("请先填当前口令");
     if (next.length < min) return fail("新口令至少 " + min + " 位");
     if (next !== again) return fail("两次输入的新口令不一致");
@@ -692,96 +1737,61 @@ function bindPassword() {
       const r = await wpost("/admin/api/password", { current: cur, new: next });
       ["#pwCur", "#pwNew", "#pwNew2"].forEach((s) => { const el = $(s); if (el) el.value = ""; });
       const revoked = Number(r.sessionsRevoked || 0);
-      if (ok) ok.textContent = "已修改口令。" + (revoked ? "另外 " + revoked + " 个登录会话已失效，" : "")
-        + "当前这个会话保留。新增 / 删除管理员仍然只能在命令行做。";
-    } catch (e) {
-      /* 失败原因（中文）由后端给：口令太短、当前口令不对、被闸门挡回来…… */
-      fail("修改失败：" + e.message);
-    }
+      if (ok) ok.textContent = "已修改口令。" + (revoked ? "另外 " + revoked + " 个登录会话已失效，" : "") + "当前这个会话保留。新增 / 删除管理员仍然只能在命令行做。";
+    } catch (e) { fail("修改失败：" + e.message); }
   };
   ["#pwCur", "#pwNew", "#pwNew2"].forEach((s) => {
-    const el = $(s);
-    if (el) el.addEventListener("keydown", (e) => { if (e.key === "Enter") btn.click(); });
+    const el = $(s); if (el) el.addEventListener("keydown", (e) => { if (e.key === "Enter") btn.click(); });
   });
 }
 
 /* ---------------------------------------------------------------- 性能（4 张图，2×2） */
-
-/* 点只在**这个数组**里攒；服务端的环形窗口是权威（见 mergePoints）。
-   前端也不落盘：没有 localStorage / sessionStorage / IndexedDB —— 刷新即清零。
-   刷新机制是**增量轮询**：1.5 秒一次 `?since=<nextSince>`，只取新点；
-   （SSE 没必要：这里的数据本来就是"每秒一个点"，轮询的延迟上限就是一个间隔，
-   而 SSE 要额外处理断线重连与代理缓冲，换不来什么。）*/
 const PERF = { points: [], since: "", timer: null, state: null };
-
 const PERF_POLL_MS = 1500;
 const CHART_W = 360, CHART_H = 150;
 const CHART_PAD = { l: 38, r: 18, t: 10, b: 18 };
-
 const pct = (v) => (v == null || v === "" ? "—" : Number(v).toFixed(1) + "%");
 const mbText = (v) => (v == null || v === "" ? "—" : Math.round(Number(v)) + " MB");
 const deg = (v) => (v == null || v === "" ? "—" : Math.round(Number(v)) + "°C");
 const watt = (v) => (v == null || v === "" ? "—" : Number(v).toFixed(0) + " W");
 const axisNum = (v) => String(v >= 1000 ? Math.round(v) : Math.round(v * 10) / 10);
-
 function niceMax(v) {
-  v = Number(v || 0);
-  if (!(v > 0)) return 1;
-  const p = Math.pow(10, Math.floor(Math.log10(v)));
-  return Math.ceil(v / p) * p;
+  v = Number(v || 0); if (!(v > 0)) return 1;
+  const p = Math.pow(10, Math.floor(Math.log10(v))); return Math.ceil(v / p) * p;
 }
-
-const maxOf = (vals) => {
-  const nums = vals.filter((v) => v != null && isFinite(v));
-  return nums.length ? Math.max.apply(null, nums) : 0;
-};
-
-/* 每张图的规格：系列、Y 轴上界、右上角那行小字。
-   `leftMax` 给固定上限（GPU/CPU/内存 0~100）；`leftMaxKey` 按点里那个字段取
-   （显存 = 卡的总显存）。都不给就按数据自适应。 */
+const maxOf = (vals) => { const nums = vals.filter((v) => v != null && isFinite(v)); return nums.length ? Math.max.apply(null, nums) : 0; };
 const PERF_CHARTS = [
-  { svg: "#chart-gpu", legend: "#legend-gpu", head: "#now-gpu", leftMax: 100,
-    rightMaxKey: "maxConcurrent",
-    series: [{ key: "gpuPercent", color: "#3fb950", name: "GPU 利用率 (%)" },
-             { key: "active", color: "#d29922", name: "在途请求数（右轴）", axis: "r", dash: "4 2" }],
+  { svg: "#chart-gpu", legend: "#legend-gpu", head: "#now-gpu", leftMax: 100, rightMaxKey: "maxConcurrent",
+    series: [{ key: "gpuPercent", color: "#0f9d58", name: "GPU 利用率 (%)" },
+             { key: "active", color: "#b45309", name: "在途请求数（右轴）", axis: "r", dash: "4 2" }],
     readout: (p) => `${pct(p.gpuPercent)} · 温度 ${deg(p.gpuTempC)} · 功耗 ${watt(p.gpuPowerW)}` },
   { svg: "#chart-vram", legend: "#legend-vram", head: "#now-vram", leftMaxKey: "gpuMemTotalMb",
-    series: [{ key: "gpuMemUsedMb", color: "#388bfd", name: "显卡已用 (MB)" },
-             { key: "vramUsedMb", color: "#d29922", name: "后端自报 (MB)", dash: "4 2" }],
-    readout: (p) => `${mbText(p.gpuMemUsedMb)} / ${mbText(p.gpuMemTotalMb)}`
-                    + ` · 后端自报 ${mbText(p.vramUsedMb)}` },
+    series: [{ key: "gpuMemUsedMb", color: "#2563eb", name: "显卡已用 (MB)" },
+             { key: "vramUsedMb", color: "#b45309", name: "后端自报 (MB)", dash: "4 2" }],
+    readout: (p) => `${mbText(p.gpuMemUsedMb)} / ${mbText(p.gpuMemTotalMb)} · 后端自报 ${mbText(p.vramUsedMb)}` },
   { svg: "#chart-cpu", legend: "#legend-cpu", head: "#now-cpu", leftMax: 100,
-    series: [{ key: "cpuPercent", color: "#388bfd", name: "CPU (%)" }],
-    readout: (p) => pct(p.cpuPercent) },
+    series: [{ key: "cpuPercent", color: "#2563eb", name: "CPU (%)" }], readout: (p) => pct(p.cpuPercent) },
   { svg: "#chart-ram", legend: "#legend-ram", head: "#now-ram", leftMax: 100,
-    series: [{ key: "memPercent", color: "#3fb950", name: "内存 (%)" }],
+    series: [{ key: "memPercent", color: "#0f9d58", name: "内存 (%)" }],
     readout: (p) => `${pct(p.memPercent)} · ${mbText(p.memUsedMb)} / ${mbText(p.memTotalMb)}` },
 ];
-
 function linePath(vals, seqs, g, max) {
-  const n = vals.length;
-  const step = n > 1 ? g.w / (n - 1) : 0;
+  const n = vals.length; const step = n > 1 ? g.w / (n - 1) : 0;
   let d = "", open = false;
   for (let i = 0; i < n; i++) {
     const v = vals[i];
     if (v == null || !isFinite(v)) { open = false; continue; }
-    // 序号跳号 = 中间有点滚出了环形窗口：**断开**，不要把两个时刻连成一条假线
     if (open && i > 0 && Number(seqs[i]) - Number(seqs[i - 1]) > 1) open = false;
     const x = g.x0 + step * i;
     const y = g.y0 + g.h - g.h * Math.min(1, Math.max(0, v / (max || 1)));
-    d += (open ? "L" : "M") + x.toFixed(1) + " " + y.toFixed(1) + " ";
-    open = true;
+    d += (open ? "L" : "M") + x.toFixed(1) + " " + y.toFixed(1) + " "; open = true;
   }
   return d.trim();
 }
-
 const clockOf = (p) => (p && p.t ? new Date(Number(p.t) * 1000).toLocaleTimeString() : "");
-
 function drawChart(spec) {
-  const svg = $(spec.svg);
-  if (!svg) return;
-  const pts = PERF.points;
-  const seqs = pts.map((p) => p.seq);
+  const svg = $(spec.svg); if (!svg) return;
+  const pts = PERF.points; const seqs = pts.map((p) => p.seq);
   const g = { x0: CHART_PAD.l, y0: CHART_PAD.t,
               w: CHART_W - CHART_PAD.l - CHART_PAD.r, h: CHART_H - CHART_PAD.t - CHART_PAD.b };
   const series = spec.series.map((s) => Object.assign({}, s, {
@@ -794,457 +1804,164 @@ function drawChart(spec) {
     const totals = pts.map((p) => Number(p[spec.leftMaxKey] || 0)).filter((v) => v > 0);
     leftMax = totals.length ? Math.max.apply(null, totals) : 0;
   }
-  if (!(leftMax > 0)) {
-    leftMax = niceMax(Math.max.apply(null, series.map((s) => maxOf(s.vals)).concat([0])));
-  }
+  if (!(leftMax > 0)) leftMax = niceMax(Math.max.apply(null, series.map((s) => maxOf(s.vals)).concat([0])));
   let rightMax = 1;
   if (right.length) {
     rightMax = spec.rightMaxKey
       ? Math.max(1, Math.max.apply(null, pts.map((p) => Number(p[spec.rightMaxKey] || 0)).concat([0])))
       : niceMax(Math.max.apply(null, right.map((s) => maxOf(s.vals)).concat([1])));
   }
-  const out = [];
-  const yb = g.y0 + g.h;
-  [0, 0.5, 1].forEach((f) => {                       // 横向网格：0 / 50% / 100%
+  const out = []; const yb = g.y0 + g.h;
+  [0, 0.5, 1].forEach((f) => {
     const y = yb - g.h * f;
-    out.push(`<line x1="${g.x0}" y1="${y.toFixed(1)}" x2="${(g.x0 + g.w).toFixed(1)}" y2="${y.toFixed(1)}" stroke="#2a2f3a" stroke-width="1"/>`);
-    if (f !== 0.5) {
-      out.push(`<text x="${g.x0 - 3}" y="${(y + 2.5).toFixed(1)}" fill="#9aa3b2" font-size="7.5" text-anchor="end">${esc(axisNum(leftMax * f))}</text>`);
-    }
+    out.push(`<line x1="${g.x0}" y1="${y.toFixed(1)}" x2="${(g.x0 + g.w).toFixed(1)}" y2="${y.toFixed(1)}" stroke="#e3e9f3" stroke-width="1"/>`);
+    if (f !== 0.5) out.push(`<text x="${g.x0 - 3}" y="${(y + 2.5).toFixed(1)}" fill="#7c8ca6" font-size="7.5" text-anchor="end">${esc(axisNum(leftMax * f))}</text>`);
   });
-  out.push(`<line x1="${g.x0}" y1="${g.y0}" x2="${g.x0}" y2="${yb}" stroke="#2a2f3a" stroke-width="1"/>`);
-  out.push(`<line x1="${g.x0}" y1="${yb}" x2="${(g.x0 + g.w).toFixed(1)}" y2="${yb}" stroke="#2a2f3a" stroke-width="1"/>`);
-  if (right.length) {                                // 右轴（在途请求数）：只有 0 与上限两个刻度
-    out.push(`<text x="${(g.x0 + g.w + 3).toFixed(1)}" y="${(g.y0 + 6).toFixed(1)}" fill="#d29922" font-size="7.5">${esc(axisNum(rightMax))}</text>`);
-    out.push(`<text x="${(g.x0 + g.w + 3).toFixed(1)}" y="${(yb + 2.5).toFixed(1)}" fill="#d29922" font-size="7.5">0</text>`);
+  out.push(`<line x1="${g.x0}" y1="${g.y0}" x2="${g.x0}" y2="${yb}" stroke="#e3e9f3" stroke-width="1"/>`);
+  out.push(`<line x1="${g.x0}" y1="${yb}" x2="${(g.x0 + g.w).toFixed(1)}" y2="${yb}" stroke="#e3e9f3" stroke-width="1"/>`);
+  if (right.length) {
+    out.push(`<text x="${(g.x0 + g.w + 3).toFixed(1)}" y="${(g.y0 + 6).toFixed(1)}" fill="#b45309" font-size="7.5">${esc(axisNum(rightMax))}</text>`);
+    out.push(`<text x="${(g.x0 + g.w + 3).toFixed(1)}" y="${(yb + 2.5).toFixed(1)}" fill="#b45309" font-size="7.5">0</text>`);
   }
   const tl = clockOf(pts[0]), tr = clockOf(pts[pts.length - 1]);
-  if (tl) out.push(`<text x="${g.x0}" y="${CHART_H - 5}" fill="#9aa3b2" font-size="7.5">${esc(tl)}</text>`);
-  if (tr && pts.length > 1) {
-    out.push(`<text x="${(g.x0 + g.w).toFixed(1)}" y="${CHART_H - 5}" fill="#9aa3b2" font-size="7.5" text-anchor="end">${esc(tr)}</text>`);
-  }
+  if (tl) out.push(`<text x="${g.x0}" y="${CHART_H - 5}" fill="#7c8ca6" font-size="7.5">${esc(tl)}</text>`);
+  if (tr && pts.length > 1) out.push(`<text x="${(g.x0 + g.w).toFixed(1)}" y="${CHART_H - 5}" fill="#7c8ca6" font-size="7.5" text-anchor="end">${esc(tr)}</text>`);
   series.forEach((s) => {
     const d = linePath(s.vals, seqs, g, s.axis === "r" ? rightMax : leftMax);
-    if (d) {
-      out.push(`<path d="${d}" fill="none" stroke="${s.color}" stroke-width="1.4" stroke-linejoin="round"${s.dash ? ` stroke-dasharray="${s.dash}"` : ""}/>`);
-    }
+    if (d) out.push(`<path d="${d}" fill="none" stroke="${s.color}" stroke-width="1.4" stroke-linejoin="round"${s.dash ? ` stroke-dasharray="${s.dash}"` : ""}/>`);
   });
   svg.innerHTML = out.join("");
   const legend = $(spec.legend);
-  if (legend) {
-    legend.innerHTML = series.map((s) => {          // 最小值 / 最大值标注（需求点名要的）
-      const nums = s.vals.filter((v) => v != null && isFinite(v));
-      const mm = nums.length
-        ? `最小 ${axisNum(Math.min.apply(null, nums))} / 最大 ${axisNum(Math.max.apply(null, nums))}`
-        : "还没有数据";
-      return `<span><i class="swatch" style="background:${s.color}"></i>${esc(s.name)}：${esc(mm)}</span>`;
-    }).join("");
-  }
+  if (legend) legend.innerHTML = series.map((s) => {
+    const nums = s.vals.filter((v) => v != null && isFinite(v));
+    const mm = nums.length ? `最小 ${axisNum(Math.min.apply(null, nums))} / 最大 ${axisNum(Math.max.apply(null, nums))}` : "还没有数据";
+    return `<span><i class="swatch" style="background:${s.color}"></i>${esc(s.name)}：${esc(mm)}</span>`;
+  }).join("");
   const head = $(spec.head);
   if (head) head.textContent = spec.readout(pts.length ? pts[pts.length - 1] : {});
 }
-
 const drawAllCharts = () => PERF_CHARTS.forEach(drawChart);
-
-function stopPerfPoll() {
-  if (PERF.timer) { clearInterval(PERF.timer); PERF.timer = null; }
-}
+function stopPerfPoll() { if (PERF.timer) { clearInterval(PERF.timer); PERF.timer = null; } }
 
 async function viewPerf() {
   const tpl = document.getElementById("perfChartsTpl");
-  // 「运行参数」读不到不该把 4 张图一起搞没（它是这一页的**另一个**接口）。
   let lim = null;
   try { lim = await api("/admin/api/limits"); } catch (e) { lim = { error: e.message }; }
-  return `<div class="card">
-    <h2>性能记录</h2>
-    <div class="perfbar">
-      <button class="primary" id="btnPerfStart">开始记录</button>
+  return `<div class="card"><h2>性能记录</h2>
+    <div class="perfbar"><button class="primary" id="btnPerfStart">开始记录</button>
       <button class="danger" id="btnPerfStop">停止记录</button>
-      <span class="badge idle" id="perfBadge">读状态…</span>
-      <span class="stat" id="perfStat"></span>
-    </div>
-    <div class="muted" style="margin-top:6px" id="perfNote"></div>
-  </div>${limitsCard(lim)}${tpl ? tpl.innerHTML : ""}`;
+      <span class="badge idle" id="perfBadge">读状态…</span><span class="stat" id="perfStat"></span></div>
+    <div class="muted" style="margin-top:6px" id="perfNote"></div></div>${limitsCard(lim)}${tpl ? tpl.innerHTML : ""}`;
 }
-
-/* ---------------------------------------------------------------- 运行参数（并发 / 队列）
-
-   需求（2026-09-29）：总通道出厂 6，而且**管理员在页面上就能改** —— 不用改环境变量、
-   不用重启。放在「性能」页签里、**就在 4 张图上方**：并发上限本来就是一个性能参数，
-   调它要看的就是旁边「在途请求数」与 GPU 利用率那两张图；而字段只有三个，
-   不值得再开一个页签（页签已经 6 个了）。
-
-   页面只负责"怎么问、怎么显示"：来源判定（管理面 / 环境变量 / 默认）与
-   "谁盖了谁"的提示全部由后端 `/admin/api/limits` 给（`server/limits.py`）。 */
-let LIMITS_SAVED = "";          // 「已保存并生效」这句只在**下一次渲染**里出现一次
-
+let LIMITS_SAVED = "";
 function limitsCard(d) {
-  if (!d || d.error) {
-    return `<div class="card"><h2>运行参数</h2>
-      <div class="errtxt">读不到：${esc((d && d.error) || "未知错误")}</div></div>`;
-  }
+  if (!d || d.error) return `<div class="card"><h2>运行参数</h2><div class="errtxt">读不到：${esc((d && d.error) || "未知错误")}</div></div>`;
   const L = d.limits || {}, S = d.source || {}, R = d.ranges || {}, LB = d.labels || {};
   const EN = d.envValues || {}, ENN = d.envNames || {};
-  const srcBadge = (src) => src === "admin"
-    ? '<span class="badge on">管理面配置</span>'
-    : (src === "env" ? '<span class="badge idle">环境变量</span>'
-                     : '<span class="badge">出厂默认</span>');
-  const rows = Object.keys(LB).map((api) => [
-    LB[api], Number(L[api]), raw(srcBadge(S[api])),
-    EN[api] == null ? "—" : ENN[api] + "=" + EN[api],
-  ]);
+  const srcBadge = (src) => src === "admin" ? '<span class="badge on">管理面配置</span>'
+    : (src === "env" ? '<span class="badge idle">环境变量</span>' : '<span class="badge">出厂默认</span>');
+  const rows = Object.keys(LB).map((api) => [LB[api], Number(L[api]), raw(srcBadge(S[api])),
+    EN[api] == null ? "—" : ENN[api] + "=" + EN[api]]);
   const inputs = Object.keys(LB).map((api) => {
     const r = R[api] || [1, 64];
-    return `<label>${esc(LB[api])}（${r[0]}~${r[1]}）
-      <input id="lim-${esc(api)}" type="number" step="1" min="${r[0]}" max="${r[1]}"
-             value="${Number(L[api])}"></label>`;
+    return `<label>${esc(LB[api])}（${r[0]}~${r[1]}）<input id="lim-${esc(api)}" type="number" step="1" min="${r[0]}" max="${r[1]}" value="${Number(L[api])}"></label>`;
   }).join("");
   const notes = (d.notes || []).map((n) => `<div class="muted">⚠️ ${esc(n)}</div>`).join("");
-  const saved = LIMITS_SAVED ? ` <span class="badge on">${esc(LIMITS_SAVED)}</span>` : "";
-  LIMITS_SAVED = "";
-  const changed = d.updatedAt
-    ? `<div class="muted">上次改：${esc(ts(d.updatedAt))}${d.updatedBy ? " · 由 " + esc(d.updatedBy) : ""}</div>`
-    : "";
-  return `<div class="card"><h2>运行参数${saved}</h2>
-    <div class="muted">${esc(d.priorityNote || "")}</div>
+  const saved = LIMITS_SAVED ? ` <span class="badge on">${esc(LIMITS_SAVED)}</span>` : ""; LIMITS_SAVED = "";
+  const changed = d.updatedAt ? `<div class="muted">上次改：${esc(ts(d.updatedAt))}${d.updatedBy ? " · 由 " + esc(d.updatedBy) : ""}</div>` : "";
+  return `<div class="card"><h2>运行参数${saved}</h2><div class="muted">${esc(d.priorityNote || "")}</div>
     ${table(["参数", "当前生效值", "来源", "环境变量"], rows)}
-    <div class="form">${inputs}
-      <button class="primary" id="btnLimits">保存并生效</button></div>
+    <div class="form">${inputs}<button class="primary" id="btnLimits">保存并生效</button></div>
     <div class="errtxt" id="limitsErr"></div>
-    <div class="muted" style="margin-top:6px">保存后<b>立刻生效</b>（不用重启容器），
-      并写进 state 卷的库 —— 重启后还在。每客户端并发不能大于总并发。<br>
-      ${esc(d.queueNote || "")}</div>
+    <div class="muted" style="margin-top:6px">保存后<b>立刻生效</b>（不用重启容器），并写进 state 卷的库 —— 重启后还在。每客户端并发不能大于总并发。<br>${esc(d.queueNote || "")}</div>
     ${notes}${changed}</div>`;
 }
-
 function bindLimits() {
-  const btn = $("#btnLimits");
-  if (!btn) return;
+  const btn = $("#btnLimits"); if (!btn) return;
   btn.onclick = async () => {
-    const err = $("#limitsErr");
-    if (err) err.textContent = "";
+    const err = $("#limitsErr"); if (err) err.textContent = "";
     try {
-      // 原样把输入框的字符串发过去，让后端给出**明确的中文原因**
-      // （空/非数 → "总并发要是整数…"，越界 → "总并发要在 1 ~ 64 之间…"）。
       await wpost("/admin/api/limits", {
         maxConcurrent: $("#lim-maxConcurrent").value,
         perClientConcurrent: $("#lim-perClientConcurrent").value,
         queueMax: $("#lim-queueMax").value,
       });
-      LIMITS_SAVED = "已保存并生效";
-      await render();          // 就地刷新：生效值与来源重新读一遍
+      LIMITS_SAVED = "已保存并生效"; await render();
     } catch (e) { if (err) err.textContent = "保存失败：" + e.message; }
   };
 }
-
 function bindPerf() {
-  stopPerfPoll();
-  bindLimits();              // 「运行参数」那张卡的保存按钮（与图在同一页签）
-  PERF.points = [];          // 进页签 = 重新按服务端的窗口对齐（服务端是权威）
-  PERF.since = "";
+  stopPerfPoll(); bindLimits();
+  PERF.points = []; PERF.since = "";
   const start = $("#btnPerfStart"), stop = $("#btnPerfStop");
-  if (start) {
-    start.onclick = async () => {
-      try { PERF.state = await wpost("/admin/api/perf/start"); }
-      catch (e) { alert("开始记录失败：" + e.message); }
-      PERF.points = []; PERF.since = "";
-      await refreshPerf();
-    };
-  }
-  if (stop) {
-    stop.onclick = async () => {
-      try { PERF.state = await wpost("/admin/api/perf/stop"); }
-      catch (e) { alert("停止记录失败：" + e.message); }
-      await refreshPerf();
-    };
-  }
-  refreshPerf();
-  PERF.timer = setInterval(refreshPerf, PERF_POLL_MS);
+  if (start) start.onclick = async () => {
+    try { PERF.state = await wpost("/admin/api/perf/start"); } catch (e) { alert("开始记录失败：" + e.message); }
+    PERF.points = []; PERF.since = ""; await refreshPerf();
+  };
+  if (stop) stop.onclick = async () => {
+    try { PERF.state = await wpost("/admin/api/perf/stop"); } catch (e) { alert("停止记录失败：" + e.message); }
+    await refreshPerf();
+  };
+  refreshPerf(); PERF.timer = setInterval(refreshPerf, PERF_POLL_MS);
 }
-
-/* 增量合并：`since` = 上一批的 `nextSince`，所以每次只回新点（不是全量重拉）。
-   服务端的环形窗口是权威 —— 已经滚出窗口的点，本地也丢掉。 */
 function mergePoints(d) {
   const cap = Number(d.capacity || 900);
   const from = Number(d.firstSeq || 0);
   if (from > 0) PERF.points = PERF.points.filter((p) => Number(p.seq) >= from);
   let last = PERF.points.length ? Number(PERF.points[PERF.points.length - 1].seq) : 0;
-  (d.series || []).forEach((p) => {
-    if (Number(p.seq) > last) { PERF.points.push(p); last = Number(p.seq); }
-  });
+  (d.series || []).forEach((p) => { if (Number(p.seq) > last) { PERF.points.push(p); last = Number(p.seq); } });
   if (PERF.points.length > cap) PERF.points = PERF.points.slice(-cap);
   if (d.nextSince != null) PERF.since = d.nextSince;
 }
-
 async function refreshPerf() {
-  if (!$("#chart-gpu")) { stopPerfPoll(); return; }   // 已经切走了
+  if (!$("#chart-gpu")) { stopPerfPoll(); return; }
   try {
     const q = PERF.since === "" ? "" : "?since=" + encodeURIComponent(PERF.since);
     const d = await api("/admin/api/perf/points" + q);
-    PERF.state = d;
-    mergePoints(d);
-    drawAllCharts();
-    const badge = $("#perfBadge");
-    if (badge) {
-      badge.className = "badge " + (d.recording ? "on" : "off");
-      badge.textContent = d.recording ? "记录中" : "已停止";
-    }
+    PERF.state = d; mergePoints(d); drawAllCharts();
+    const badgeEl = $("#perfBadge");
+    if (badgeEl) { badgeEl.className = "badge " + (d.recording ? "on" : "off"); badgeEl.textContent = d.recording ? "记录中" : "已停止"; }
     const stat = $("#perfStat");
     if (stat) {
       const last = PERF.points.length ? PERF.points[PERF.points.length - 1] : {};
-      const models = (last.modelsTotal == null ? "" :
-        ` · 模型 ${Number(last.modelsReady || 0)}/${Number(last.modelsTotal)} 就绪`);
-      stat.textContent = `已采 ${d.samples} 点 · 采样间隔 ${d.intervalSeconds}s`
-        + ` · 窗口 ${Math.round(d.windowSeconds)}s（${d.capacity} 点）`
-        + (d.dropped ? ` · 已滚出 ${d.dropped} 点` : "")
-        + models
-        + (d.sampling ? " · 正在采样" : " · 未采样（没人在看）");
+      const models = (last.modelsTotal == null ? "" : ` · 模型 ${Number(last.modelsReady || 0)}/${Number(last.modelsTotal)} 就绪`);
+      stat.textContent = `已采 ${d.samples} 点 · 采样间隔 ${d.intervalSeconds}s · 窗口 ${Math.round(d.windowSeconds)}s（${d.capacity} 点）`
+        + (d.dropped ? ` · 已滚出 ${d.dropped} 点` : "") + models + (d.sampling ? " · 正在采样" : " · 未采样（没人在看）");
     }
     const note = $("#perfNote");
-    if (note) {
-      note.textContent = "数据只在后端进程的内存里：不落盘，重启即清空。"
-        + `关掉或切走这个页面后 ${Math.round(d.viewerTtlSeconds)} 秒内没人取点，采样自动停`
-        + "（「记录中」这个状态留着，回来接着采）。"
-        + (d.samplerError ? ` ⚠️ 采集报错：${d.samplerError}` : "");
-    }
-  } catch (e) {
-    const stat = $("#perfStat");
-    if (stat) stat.textContent = "取点失败：" + e.message;
-  }
+    if (note) note.textContent = "数据只在后端进程的内存里：不落盘，重启即清空。"
+      + `关掉或切走这个页面后 ${Math.round(d.viewerTtlSeconds)} 秒内没人取点，采样自动停（「记录中」这个状态留着，回来接着采）。`
+      + (d.samplerError ? ` ⚠️ 采集报错：${d.samplerError}` : "");
+  } catch (e) { const stat = $("#perfStat"); if (stat) stat.textContent = "取点失败：" + e.message; }
 }
 
-
-/* ---------------------------------------------------------------- 收费 / 账号（2026-11-03）
-   后端接口在 `server/admin.py` 的 `/admin/api/billing/*` 与 `/admin/api/account/*`；
-   判断/落库在 `server/billing.py`。这里只负责画表与把写动作发出去。 */
-
-const money = (cents) => "¥" + (Number(cents || 0) / 100).toFixed(2);
-const statusBadge = (s) => {
-  const ok = s === "paid" || s === "active";
-  const bad = s === "refunded" || s === "frozen" || s === "closed";
-  // 唯一允许的 HTML：标签本身；值必须 esc()。table() 只认 raw()，其它字符串一律转义。
-  return raw(`<span class="badge ${ok ? "" : (bad ? "off" : "warn")}">${esc(s || "—")}</span>`);
-};
-
-let BILLING_PLANS = {};
-
-async function viewBilling() {
-  const d = await api("/admin/api/billing/overview");
-  BILLING_PLANS = Object.fromEntries((d.plans || []).map((p) => [p.code, p]));
-  const [orders, ents, users, invites, notifies] = await Promise.all([
-    api("/admin/api/billing/orders?limit=100"),
-    api("/admin/api/billing/entitlements"),
-    api("/admin/api/account/users"),
-    api("/admin/api/account/invites"),
-    api("/admin/api/billing/notifies"),
-  ]);
-  const planRows = d.plans.map((p) => [
-    p.code, p.name, money(p.priceCents), p.days + " 天",
-    p.dailyAudioMinutes + " 分钟", p.ttsChars, p.qps + " QPS",
-    p.maxDevices + " 台", p.maxConcurrent, p.active ? "上架" : "下架",
-    raw(`<button data-plan-edit="${esc(p.code)}">改</button>
-         <button data-plan-del="${esc(p.code)}">删</button>`),
-  ]);
-  const orderRows = orders.orders.map((o) => [
-    o.orderId.slice(0, 14) + "…", o.userId, o.planCode, money(o.amountCents),
-    statusBadge(o.status), ts(o.createdAt), ts(o.paidAt),
-    o.status === "paid"
-      ? raw(`<button data-refund="${esc(o.orderId)}">退款</button>`)
-      : "",
-  ]);
-  const notifyRows = (notifies.notifies || []).map((n) => [
-    n.tradeNo, n.orderId, n.status || "—", n.verified ? "是" : "否", ts(n.at),
-    String(n.raw || "").slice(0, 100),
-  ]);
-  const entRows = ents.entitlements.map((e) => [
-    e.userId, e.plan_code || e.planCode || "", statusBadge(e.status),
-    ts(e.paid_until || e.paidUntil), e.daily_audio_minutes ?? e.dailyMinutes,
-    e.tts_chars ?? e.ttsChars, e.qps, e.max_devices ?? e.maxDevices,
-    raw(`<button data-ent-extend="${esc(e.userId)}">+30 天</button>
-         <button data-ent-freeze="${esc(e.userId)}">冻结</button>
-         <button data-ent-internal="${esc(e.userId)}">设 internal</button>`),
-  ]);
-  const userRows = users.users.map((u) => [
-    u.userId, u.email || "（无邮箱）", u.emailVerified ? "已验证" : "未验证",
-    (u.devices || []).length, statusBadge(u.status),
-    raw(`<button data-reset-devices="${esc(u.userId)}">重置设备</button>`),
-  ]);
-  const inviteRows = invites.invites.map((i) => [
-    i.code, i.max_uses, i.used, ts(i.expires_at), i.created_by, i.note,
-    raw(`<button data-invite-del="${esc(i.code)}">作废</button>`),
-  ]);
-  return `<div class="card"><h2>收费概览</h2>
-    <div class="kv">
-      <div><b>${d.enabled ? "已启用" : "未启用"}</b><span>收费开关（billing.enabled）</span></div>
-      <div><b>${d.effectiveGating ? "生效" : "未生效"}</b><span>计费闸门${d.effectiveGating ? "" : "（auth.enabled=false，请求会走免费老路）"}</span></div>
-      <div><b>${esc(d.provider)}</b><span>支付网关（configured=${d.gatewayConfigured ? "是" : "否"}）</span></div>
-      <div><b>${money(d.revenueCentsToday)}</b><span>今日收入（billing.timezone 自然日）</span></div>
-      <div><b>${money(d.revenueCentsTotal)}</b><span>累计收入（已支付）</span></div>
-      <div><b>${d.expiringIn7Days}</b><span>7 天内到期</span></div>
-      <div><b>${d.users}</b><span>账号</span></div>
-    </div>
-    <div class="muted">订单状态：${esc(JSON.stringify(d.byStatus || {}))}。
-      Mock 网关下 <code>/v1/billing/mock/pay/&lt;orderId&gt;</code> 可以模拟付款；生产切 alipay 后该端点不存在。</div>
-  </div>
-  <div class="card"><h2>套餐</h2>${table(
-    ["code", "名字", "价格", "天数", "每日 ASR", "TTS 字符", "QPS", "设备", "并发", "状态", "操作"],
-    planRows)}
-    <div class="muted" style="margin-top:8px">改价/下架只影响以后的订单；已卖出的订单金额与权益不变。
-      新增/修改：<code>POST /admin/api/billing/plans</code>（页面下方表单）。</div>
-    <div class="row" style="margin-top:8px">
-      <input id="plCode" placeholder="code（monthly）">
-      <input id="plName" placeholder="名字">
-      <input id="plPrice" placeholder="价格（分）" value="1000">
-      <input id="plDays" placeholder="天数" value="30">
-      <input id="plMin" placeholder="每日分钟" value="120">
-      <input id="plTts" placeholder="TTS 字符" value="50000">
-      <input id="plQps" placeholder="QPS" value="1">
-      <input id="plDev" placeholder="设备数" value="3">
-      <input id="plConc" placeholder="并发" value="1">
-      <label class="muted"><input type="checkbox" id="plActive" checked> 上架</label>
-      <button id="plSave">保存套餐</button>
-    </div>
-  </div>
-  <div class="card"><h2>订单（最近 100 单）</h2>${table(
-    ["订单", "账号", "套餐", "金额", "状态", "创建", "支付", "操作"], orderRows)}</div>
-  <div class="card"><h2>支付回调（最近 100 条）</h2>${table(
-    ["tradeNo", "订单", "状态", "验签", "时间", "原文（截断）"], notifyRows)}
-    <div class="muted" style="margin-top:8px">conflict = 订单已关闭/已退款后才到达的成功支付，
-      需人工核对；closed/pending 是非成功通知。</div>
-  </div>
-  <div class="card"><h2>权益</h2>${table(
-    ["账号", "套餐", "状态", "到期", "每日分钟", "TTS 字符", "QPS", "设备", "操作"],
-    entRows)}</div>
-  <div class="card"><h2>账号</h2>${table(
-    ["账号", "邮箱", "邮箱验证", "设备数", "状态", "操作"], userRows)}
-    <div class="muted" style="margin-top:8px">「重置设备」会解绑这个人所有设备，旧客户端立即失效（找回兜底）。</div>
-  </div>
-  <div class="card"><h2>邀请码</h2>${table(
-    ["code", "名额", "已用", "到期", "谁发的", "备注", "操作"], inviteRows)}
-    <div class="row" style="margin-top:8px">
-      <input id="ivCode" placeholder="code（留空随机）">
-      <input id="ivUses" placeholder="名额" value="1">
-      <input id="ivNote" placeholder="备注">
-      <button id="ivNew">生成邀请码</button>
-    </div>
-  </div>`;
+/* ---------------------------------------------------------------- 抽屉 / 弹窗 / toast */
+function openDrawer(html) {
+  $("#drawer").innerHTML = html;
+  $("#drawer").classList.add("open");
+  $("#backdrop").classList.add("open");
 }
-
-function bindBilling() {
-  document.querySelectorAll("[data-plan-del]").forEach((b) => {
-    b.onclick = async () => {
-      if (!confirm("删掉套餐 " + b.dataset.planDel + "？已卖出的订单不受影响。")) return;
-      try { await wdelete("/admin/api/billing/plans/" + encodeURIComponent(b.dataset.planDel),
-                          { confirm: b.dataset.planDel }); alert("已删除"); await render(); }
-      catch (e) { alert("删除失败：" + e.message); }
-    };
-  });
-  document.querySelectorAll("[data-plan-edit]").forEach((b) => {
-    b.onclick = () => {
-      const p = BILLING_PLANS[b.dataset.planEdit] || {};
-      $("#plCode").value = p.code || b.dataset.planEdit;
-      $("#plName").value = p.name || "";
-      $("#plPrice").value = p.priceCents ?? 0;
-      $("#plDays").value = p.days ?? 0;
-      $("#plMin").value = p.dailyAudioMinutes ?? 0;
-      $("#plTts").value = p.ttsChars ?? 0;
-      $("#plQps").value = p.qps ?? 1;
-      $("#plDev").value = p.maxDevices ?? 3;
-      $("#plConc").value = p.maxConcurrent ?? 1;
-      $("#plActive").checked = p.active !== false;
-      $("#plName").focus();
-    };
-  });
-  const save = $("#plSave");
-  if (save) save.onclick = async () => {
-    const body = {
-      code: $("#plCode").value.trim(), name: $("#plName").value.trim(),
-      priceCents: Number($("#plPrice").value || 0), days: Number($("#plDays").value || 0),
-      dailyAudioMinutes: Number($("#plMin").value || 0),
-      ttsChars: Number($("#plTts").value || 0), qps: Number($("#plQps").value || 1),
-      maxDevices: Number($("#plDev").value || 3), maxConcurrent: Number($("#plConc").value || 1),
-      active: !!($("#plActive") && $("#plActive").checked),
-    };
-    if (!body.code) return alert("要填 code");
-    try { await wpost("/admin/api/billing/plans", body); alert("已保存"); await render(); }
-    catch (e) { alert("保存失败：" + e.message); }
-  };
-  document.querySelectorAll("[data-refund]").forEach((b) => {
-    b.onclick = async () => {
-      if (!confirm("退款订单 " + b.dataset.refund + "？会按剩余未退款订单重算权益；只剩这一单时立即失效。")) return;
-      try { await wpost("/admin/api/billing/orders/" + encodeURIComponent(b.dataset.refund) + "/refund",
-                        { confirm: b.dataset.refund }); alert("已退款"); await render(); }
-      catch (e) { alert("退款失败：" + e.message); }
-    };
-  });
-  document.querySelectorAll("[data-ent-extend]").forEach((b) => {
-    b.onclick = async () => {
-      try { await wpost("/admin/api/billing/entitlements/" + encodeURIComponent(b.dataset.entExtend) + "/adjust",
-                        { action: "extend", days: 30, confirm: b.dataset.entExtend }); await render(); }
-      catch (e) { alert("调整失败：" + e.message); }
-    };
-  });
-  document.querySelectorAll("[data-ent-freeze]").forEach((b) => {
-    b.onclick = async () => {
-      try { await wpost("/admin/api/billing/entitlements/" + encodeURIComponent(b.dataset.entFreeze) + "/adjust",
-                        { action: "freeze", confirm: b.dataset.entFreeze }); await render(); }
-      catch (e) { alert("调整失败：" + e.message); }
-    };
-  });
-  document.querySelectorAll("[data-ent-internal]").forEach((b) => {
-    b.onclick = async () => {
-      try { await wpost("/admin/api/billing/entitlements/" + encodeURIComponent(b.dataset.entInternal) + "/adjust",
-                        { action: "internal", confirm: b.dataset.entInternal }); await render(); }
-      catch (e) { alert("调整失败：" + e.message); }
-    };
-  });
-  document.querySelectorAll("[data-reset-devices]").forEach((b) => {
-    b.onclick = async () => {
-      const uid = b.dataset.resetDevices;
-      if (!confirm("解绑 " + uid + " 的所有设备？旧客户端会立即失效。")) return;
-      try { await wpost("/admin/api/account/users/" + encodeURIComponent(uid) + "/reset-devices",
-                        { confirm: uid }); alert("已解绑"); await render(); }
-      catch (e) { alert("解绑失败：" + e.message); }
-    };
-  });
-  document.querySelectorAll("[data-invite-del]").forEach((b) => {
-    b.onclick = async () => {
-      const code = b.dataset.inviteDel;
-      if (!confirm("作废邀请码 " + code + "？")) return;
-      try { await wdelete("/admin/api/account/invites/" + encodeURIComponent(code),
-                          { confirm: code }); await render(); }
-      catch (e) { alert("作废失败：" + e.message); }
-    };
-  });
-  const iv = $("#ivNew");
-  if (iv) iv.onclick = async () => {
-    try {
-      await wpost("/admin/api/account/invites", {
-        code: $("#ivCode").value.trim(), maxUses: Number($("#ivUses").value || 1),
-        note: $("#ivNote").value.trim() });
-      alert("已生成（明文只在这一行里，记下来）"); await render();
-    } catch (e) { alert("生成失败：" + e.message); }
-  };
+function closeDrawer() {
+  $("#drawer").classList.remove("open");
+  $("#backdrop").classList.remove("open");
 }
-
-function table(head, rows) {
-  if (!rows.length) return `<div class="muted">（没有数据）</div>`;
-  return `<table><thead><tr>${head.map((h) => `<th>${esc(h)}</th>`).join("")}</tr></thead>
-    <tbody>${rows.map((r) => `<tr>${r.map((c) =>
-      `<td>${(c && typeof c === "object" && c.__raw) ? c.__raw : esc(c)}</td>`).join("")}</tr>`).join("")}
-    </tbody></table>`;
+function openModal(html) {
+  $("#modal").innerHTML = html;
+  $("#modal-backdrop").classList.add("open");
 }
+function closeModal() { $("#modal-backdrop").classList.remove("open"); }
+function toast(text) {
+  const el = $("#toast"); el.textContent = text; el.classList.add("show");
+  clearTimeout(toast._t); toast._t = setTimeout(() => el.classList.remove("show"), 2200);
+}
+async function copyText(text) {
+  try { await navigator.clipboard.writeText(text); toast("已复制：" + text); }
+  catch (e) { toast("复制失败，请手动选择文本"); }
+}
+$("#modal-backdrop").addEventListener("click", (e) => { if (e.target === $("#modal-backdrop")) closeModal(); });
+window.addEventListener("keydown", (e) => { if (e.key === "Escape") { closeModal(); closeDrawer(); } });
 
-/* 页面被关掉 / 切走 / 进 bfcache：**立刻停掉轮询**。后端不需要收一个"关闭"请求 ——
-   轮询一停，`viewerTtlSeconds` 一到采集线程自己就退了（而且那种关闭请求还得带
-   `X-ECHO-Admin` + CSRF 头，`sendBeacon` 根本发不出来）。切回来时重画一次。 */
-window.addEventListener("pagehide", stopPerfPoll);
-document.addEventListener("visibilitychange", () => {
-  if (document.hidden) { stopPerfPoll(); return; }
-  const tab = (document.querySelector(".tabs button.active") || {}).dataset?.tab;
-  if (tab === "perf" && !$("#app").classList.contains("hidden")) render();
-});
-
+/* 启动：没登录过就先显示登录页；`/admin/api/me` 失败会回登录页。 */
 boot();
 </script>
 </body>

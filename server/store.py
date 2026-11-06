@@ -48,6 +48,33 @@ import threading
 import time
 from typing import Any, Dict, List, Optional
 
+
+def _like(text: Any) -> str:
+    """把用户输入变成 `LIKE` 模式，转义 `%` / `_` / 反斜杠。
+
+    管理面的搜索框是内部工具，但“输入 `%` 就把全表捞出来”仍然不是想要的行为。
+    调用方的 SQL 必须写 `ESCAPE '\'`。
+    """
+    raw = str(text or "").strip()
+    raw = raw.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return "%" + raw + "%"
+
+
+def _page_limit(value: Any, default: int = 20, cap: int = 200) -> int:
+    try:
+        n = int(value) if value is not None else default
+    except (TypeError, ValueError):
+        n = default
+    return max(1, min(cap, n or default))
+
+
+def _page_offset(value: Any) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
 #: 设计 §8.5 的表白名单（**唯一**一份）。`CREATE TABLE` 只允许出现在这里。
 #: `calls` 是 2026-09-24 按设计加进来的（审计元数据，设计 §7.3 逐字定义了那十列）。
 #: `admin_users` / `admin_audit` 是同一天做管理面时加的（设计 §8.4 那五个页签要一个
@@ -783,6 +810,49 @@ class Store:
                                     (limit,)).fetchall()
         return [dict(r) for r in rows]
 
+    def audit_records(self, *, q: str = "", action: str = "", admin: str = "",
+                      result: str = "", since: float = 0, until: float = 0,
+                      limit: int = 50, offset: int = 0
+                      ) -> "tuple[List[Dict[str, Any]], int]":
+        """管理动作审计的筛选 + 分页（管理面「操作审计」页）。
+
+        `result` 不是表里的列：**失败动作名带 `.failed` 后缀**（`as_write` 的约定），
+        所以这里按后缀过滤，不新增列、不迁移老数据。
+        """
+        where, args = [], []
+        if q:
+            like = _like(q)
+            where.append("(admin LIKE ? ESCAPE '\\' OR action LIKE ? ESCAPE '\\'"
+                         " OR target LIKE ? ESCAPE '\\')")
+            args.extend([like, like, like])
+        if action:
+            where.append("action LIKE ? ESCAPE '\\'")
+            args.append(_like(action))
+        if admin:
+            where.append("admin LIKE ? ESCAPE '\\'")
+            args.append(_like(admin))
+        result = str(result or "").strip().lower()
+        if result == "failed":
+            where.append("action LIKE '%.failed'")
+        elif result in ("ok", "success", "succeeded"):
+            where.append("action NOT LIKE '%.failed'")
+        if since:
+            where.append("ts >= ?")
+            args.append(float(since))
+        if until:
+            where.append("ts < ?")
+            args.append(float(until))
+        clause = (" WHERE " + " AND ".join(where)) if where else ""
+        with self._lock:
+            total = int(self._db.execute(
+                "SELECT COUNT(*) AS n FROM admin_audit" + clause,
+                tuple(args)).fetchone()["n"])
+            rows = self._db.execute(
+                "SELECT * FROM admin_audit" + clause +
+                " ORDER BY ts DESC, rowid DESC LIMIT ? OFFSET ?",
+                tuple(args) + (_page_limit(limit, 50, 500), _page_offset(offset))).fetchall()
+        return [dict(r) for r in rows], total
+
     # ---------------------------------------------------------------- 运行参数（§8.5）
 
     def limit_overrides(self) -> List[Dict[str, Any]]:
@@ -1354,6 +1424,20 @@ class Store:
                 (str(user_id),)).fetchone()
         return int(row["n"] if row else 0)
 
+    def active_users_since(self, since_ts: float) -> int:
+        """近 24h 有活跃设备的**用户数**（概览 KPI）。
+
+        用 `clients.last_seen`（认证路径按 `auth.touch_interval_s` 节流更新），
+        **不是** `user_devices.last_seen` —— 后者只在绑定/重新配对时写一次。
+        """
+        with self._lock:
+            row = self._db.execute(
+                "SELECT COUNT(DISTINCT d.user_id) AS n"
+                " FROM user_devices d JOIN clients c ON c.client_id=d.client_id"
+                " WHERE d.status='active' AND c.last_seen>=?",
+                (float(since_ts),)).fetchone()
+        return int(row["n"] if row else 0)
+
     def revoke_device(self, user_id: str, client_id: str) -> bool:
         with self._lock:
             cur = self._db.execute(
@@ -1488,6 +1572,51 @@ class Store:
                     (float(since_ts),)).fetchone()
         return int(row["n"] if row else 0)
 
+    def search_orders(self, *, q: str = "", status: str = "", user_id: str = "",
+                      user_ids: Optional[List[str]] = None, since: float = 0,
+                      until: float = 0, limit: int = 20, offset: int = 0
+                      ) -> "tuple[List[Dict[str, Any]], int]":
+        """管理面订单搜索/筛选/分页。
+
+        `q` 命中订单号 / 支付宝 tradeNo / userId；姓名 / 邮箱不是订单表的列，
+        由调用方先查出 user_id 再通过 `user_ids` 带进来（这样不会在 SQL 里
+        假设 `users.email` 一定存在 —— issue #15 落地前后都能跑）。
+        """
+        where, args = [], []
+        if status:
+            where.append("status=?")
+            args.append(str(status))
+        if user_id:
+            where.append("user_id=?")
+            args.append(str(user_id))
+        if q:
+            like = _like(q)
+            cond = ["order_id LIKE ? ESCAPE '\\'",
+                    "alipay_trade_no LIKE ? ESCAPE '\\'",
+                    "user_id LIKE ? ESCAPE '\\'"]
+            args.extend([like, like, like])
+            if user_ids:
+                cond.append("user_id IN (%s)" % ",".join("?" * len(user_ids)))
+                args.extend([str(x) for x in user_ids])
+            where.append("(" + " OR ".join(cond) + ")")
+        if since:
+            where.append("created_at>=?")
+            args.append(float(since))
+        if until:
+            where.append("created_at<?")
+            args.append(float(until))
+        clause = (" WHERE " + " AND ".join(where)) if where else ""
+        with self._lock:
+            total = int(self._db.execute(
+                "SELECT COUNT(*) AS n FROM orders" + clause,
+                tuple(args)).fetchone()["n"])
+            rows = self._db.execute(
+                "SELECT * FROM orders" + clause +
+                " ORDER BY created_at DESC, order_id DESC LIMIT ? OFFSET ?",
+                tuple(args) + (_page_limit(limit),
+                               _page_offset(offset))).fetchall()
+        return [dict(r) for r in rows], total
+
     def insert_order_event(self, order_id: str, event_type: str,
                            payload: str = "") -> None:
         with self._lock:
@@ -1550,6 +1679,50 @@ class Store:
                 "SELECT * FROM alipay_notify ORDER BY at DESC LIMIT ?",
                 (max(1, min(1000, int(limit or 100))),)).fetchall()
         return [dict(r) for r in rows]
+
+    def notifies_for_order(self, order_id: str, limit: int = 10
+                           ) -> List[Dict[str, Any]]:
+        """某一笔订单的支付回调（订单详情用，含 conflict）。"""
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT * FROM alipay_notify WHERE order_id=? ORDER BY at DESC LIMIT ?",
+                (str(order_id), max(1, min(50, int(limit or 10))))).fetchall()
+        return [dict(r) for r in rows]
+
+    def search_notifies(self, *, q: str = "", status: str = "",
+                        verified: Optional[bool] = None, since: float = 0,
+                        until: float = 0, limit: int = 20, offset: int = 0
+                        ) -> "tuple[List[Dict[str, Any]], int]":
+        """管理面支付回调的筛选 + 分页（列表里的原文由调用方截断）。"""
+        where, args = [], []
+        if q:
+            like = _like(q)
+            where.append("(trade_no LIKE ? ESCAPE '\\'"
+                         " OR order_id LIKE ? ESCAPE '\\')")
+            args.extend([like, like])
+        if status:
+            where.append("status=?")
+            args.append(str(status))
+        if verified is not None:
+            where.append("verified=?")
+            args.append(1 if verified else 0)
+        if since:
+            where.append("at>=?")
+            args.append(float(since))
+        if until:
+            where.append("at<?")
+            args.append(float(until))
+        clause = (" WHERE " + " AND ".join(where)) if where else ""
+        with self._lock:
+            total = int(self._db.execute(
+                "SELECT COUNT(*) AS n FROM alipay_notify" + clause,
+                tuple(args)).fetchone()["n"])
+            rows = self._db.execute(
+                "SELECT * FROM alipay_notify" + clause +
+                " ORDER BY at DESC LIMIT ? OFFSET ?",
+                tuple(args) + (_page_limit(limit),
+                               _page_offset(offset))).fetchall()
+        return [dict(r) for r in rows], total
 
     # ---------------------------------------------------------------- 权益
 

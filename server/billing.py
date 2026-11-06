@@ -782,17 +782,21 @@ class BillingService:
         self.store.insert_order_event(order["order_id"], "cancelled", "")
         return {"ok": True, "orderId": order["order_id"], "status": "closed"}
 
-    def sync_order(self, order_id: str, user_id: str) -> Dict[str, Any]:
+    def sync_order(self, order_id: str, user_id: str, *,
+                   with_pair_url: bool = True) -> Dict[str, Any]:
         """本地联调/回调丢失兜底：主动向支付宝查询并补记支付结果。
 
         只对 `created|paying` 的订单查询；终态订单直接回存库视图，不重复入账。
         `TRADE_CLOSED` 是唯一会把订单变 `closed` 的查询结果；`paid` 走与异步通知
         完全相同的 `apply_notify()`（幂等、金额校验、权益/发码都在那里）。
+
+        `with_pair_url=False` 给管理面用：列表/详情刷新**不能**因为读一下
+        就补发配对码（写库 + 审计）。用户侧那条路保持默认 True。
         """
         order = self.order_for_user(order_id, user_id)
         status = str(order.get("status") or "")
         if status in ("paid", "refunded", "closed"):
-            return self.order_view(order)
+            return self.order_view(order, with_pair_url=with_pair_url)
         if not getattr(self.gateway, "configured", False):
             raise errors.payment_unconfigured()
         norm = self.gateway.query(order)
@@ -817,7 +821,7 @@ class BillingService:
                     _json({"rawStatus": str(norm.get("rawStatus") or "")}))
                 fresh = self.store.order(str(order.get("order_id") or "")) or fresh
             order = fresh
-        return self.order_view(order)
+        return self.order_view(order, with_pair_url=with_pair_url)
 
     # ---------------------------------------------------------------- 支付回调
 
