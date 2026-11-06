@@ -1,0 +1,35 @@
+{
+  "source": "docs/admin-redesign/mockup.html",
+  "note": "静态设计稿截图；不是生产页面，不含真实数据。",
+  "viewport": {
+    "desktop": [
+      1280,
+      900
+    ],
+    "tablet": [
+      768,
+      1024
+    ],
+    "mobile": [
+      375,
+      812
+    ]
+  },
+  "files": [
+    "login-1280.png",
+    "overview-1280.png",
+    "orders-1280.png",
+    "order-detail-1280.png",
+    "refund-confirm-1280.png",
+    "users-1280.png",
+    "user-detail-1280.png",
+    "notifies-1280.png",
+    "audit-1280.png",
+    "overview-768.png",
+    "orders-768.png",
+    "login-375.png",
+    "overview-375.png",
+    "orders-375.png",
+    "user-detail-375.png"
+  ]
+}
