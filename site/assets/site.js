@@ -312,38 +312,45 @@
       '<p class="plan-hint">登录后下单；支付由支付宝提供，金额以收银台为准。</p>';
   }
 
+  function planCard(plan, main) {
+    var cls = main ? "plan plan-main" : "plan";
+    var sub = plan.purchasable
+      ? "按月订阅，覆盖转写、语音合成与设备额度。"
+      : "先用完整额度体验，再决定是否续费。";
+    return '<article class="' + cls + '">' +
+      '<div class="plan-head"><h2>' + esc(plan.name) + "</h2>" +
+      (plan.badge ? '<span class="badge-inline">' + esc(plan.badge) + "</span>" : "") +
+      "</div>" +
+      '<div class="plan-price"><span class="currency">¥</span>' +
+      '<span class="amount">' + esc(amountText(plan.priceCents)) + "</span>" +
+      '<span class="per">/ ' + esc(plan.days) + " 天</span></div>" +
+      '<p class="plan-sub">' + sub + "</p>" +
+      '<ul class="plan-list">' + listItems(plan) + "</ul>" +
+      planAction(plan) +
+      "</article>";
+  }
+
   function renderPricing(data) {
     var mount = $("planCards");
     if (!mount) return;
-    var monthly = planOf(data, "monthly");
-    var trial = planOf(data, "trial");
-    if (!monthly) {
-      throw new Error("套餐数据不完整：缺少 monthly。");
+    var list = (data && data.plans) || [];
+    var paid = [];
+    var trial = null;
+    for (var i = 0; i < list.length; i += 1) {
+      var p = list[i];
+      if (p && p.code === "internal") continue;
+      if (p && p.purchasable && Number(p.priceCents) > 0) paid.push(p);
+      if (p && p.code === "trial") trial = p;
     }
-    var html = '<article class="plan plan-main">' +
-      '<div class="plan-head"><h2>' + esc(monthly.name) + "</h2>" +
-      (monthly.badge ? '<span class="badge-inline">' + esc(monthly.badge) + "</span>" : "") +
-      "</div>" +
-      '<div class="plan-price"><span class="currency">¥</span>' +
-      '<span class="amount">' + esc(amountText(monthly.priceCents)) + "</span>" +
-      '<span class="per">/ ' + esc(monthly.days) + " 天</span></div>" +
-      '<p class="plan-sub">适合日常会议与语音指令的重度使用。</p>' +
-      '<ul class="plan-list">' + listItems(monthly) + "</ul>" +
-      planAction(monthly) +
-      "</article>";
-
-    if (trial) {
-      html += '<article class="plan">' +
-        '<div class="plan-head"><h2>' + esc(trial.name) + "</h2>" +
-        (trial.badge ? '<span class="badge-inline">' + esc(trial.badge) + "</span>" : "") +
-        "</div>" +
-        '<div class="plan-price"><span class="currency">¥</span>' +
-        '<span class="amount">' + esc(amountText(trial.priceCents)) + "</span>" +
-        '<span class="per">/ ' + esc(trial.days) + " 天</span></div>" +
-        '<p class="plan-sub">先用完整额度体验，再决定是否续费。</p>' +
-        '<ul class="plan-list">' + listItems(trial) + "</ul>" +
-        planAction(trial) +
-        "</article>";
+    paid.sort(function (a, b) { return Number(a.priceCents) - Number(b.priceCents); });
+    var ordered = paid.slice();
+    if (trial) ordered.push(trial);
+    if (!paid.length) {
+      throw new Error("套餐数据不完整：没有可购买的付费套餐。");
+    }
+    var html = "";
+    for (var j = 0; j < ordered.length; j += 1) {
+      html += planCard(ordered[j], j === 0);
     }
 
     var payment = data.payment || {};
