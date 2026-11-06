@@ -95,8 +95,13 @@
     }
   }
 
-  function planName(code) {
-    return PLAN_NAMES[String(code || "")] || String(code || "套餐");
+  function planName(code, serverName) {
+    return String(serverName || "") || PLAN_NAMES[String(code || "")] ||
+      String(code || "套餐");
+  }
+
+  function formatExpiry(seconds) {
+    return Number(seconds) > 0 ? formatDate(seconds) : "长期有效";
   }
 
   function showToast(message) {
@@ -219,6 +224,9 @@
     if (err.code === "payment_gateway_error") return "支付网关暂时不可用，请稍后刷新重试。";
     if (err.code === "order_not_found") return "订单不存在，或不属于当前登录账号。";
     if (err.code === "order_state_conflict") return "订单状态已变化，请刷新页面。";
+    if (err.code === "plan_change_unsupported") {
+      return err.detail || err.message || "暂不支持升级/降级；请等当前套餐到期后再换。";
+    }
     if (err.status === 401) return "登录已失效，请重新登录。";
     return err.message || err.detail || "请求失败，请稍后重试。";
   }
@@ -516,7 +524,7 @@
     }
     var orderRows = [
       ["订单号", order && order.orderId ? order.orderId : "—"],
-      ["套餐", planName(order && order.planCode)],
+      ["套餐", planName(order && order.planCode, order && order.planName)],
       ["金额", money(order && order.amountCents, true)]
     ];
     if (kind === "paid") {
@@ -572,9 +580,18 @@
     var error = $("payError");
     if (error) error.hidden = true;
 
-    setText("orderPlan", planName(order.planCode));
-    setText("orderDays", Number(order.days || 0) > 0
-      ? order.days + " 天（支付成功后起算）" : "长期有效");
+    setText("orderPlan", planName(order.planCode, order.planName));
+    var paid = String(order.status || "") === "paid";
+    setText("orderCurrentLabel", paid ? "支付前到期" : "当前到期");
+    setText("orderProjectedLabel", paid ? "本次支付后到期" : "支付后预计到期");
+    setText("orderCurrentUntil", Number(order.currentPaidUntil || 0) > 0
+      ? formatDate(order.currentPaidUntil)
+      : (order.renewalBasis === "never_expires" ? "长期有效" : "尚未开通"));
+    setText("orderDays", Number(order.renewalDays || order.days || 0) > 0
+      ? (order.renewalDays || order.days) + " 天" : "长期有效");
+    setText("orderProjectedUntil", order.renewalBasis === "not_applicable"
+      ? "—" : formatExpiry(order.projectedPaidUntil));
+    setText("renewalRule", order.renewalRule || "续费规则以服务端为准。");
     setText("orderId", order.orderId);
     setText("orderCreated", formatDateTime(order.createdAt));
     setText("orderPrice", money(order.amountCents, true));
@@ -838,7 +855,13 @@
     if (entTag) entTag.className = "tag tag-" + statusClass(status);
     setText("entitlementPlan", status === "none"
       ? "尚未开通套餐"
-      : ((ent.planName || planName(ent.plan)) + (status === "active" ? " · 使用中" : "")));
+      : (planName(ent.plan, ent.planName) + (status === "active" ? " · 使用中" : "")));
+    setText("entitlementRule", ent.renewalRule || "");
+    setText("entitlementPolicy", [
+      ent.planChangeRule || "",
+      ent.refundRule || "",
+      ent.autoRenew ? "自动续费已开启。" : "手动续费，不会自动扣款。"
+    ].filter(Boolean).join(" "));
     setText("entitlementExpiry", Number(ent.paidUntil || 0) > 0
       ? formatDate(ent.paidUntil) : (status === "active" ? "长期有效" : "—"));
     setText("entitlementMinutes", (ent.dailyMinutesLeft == null ? 0 : ent.dailyMinutesLeft) +
@@ -890,7 +913,7 @@
       }
       return '<article class="order-item">' +
         '<div class="order-item-main">' +
-        '<div class="order-item-title">' + esc(planName(order.planCode)) +
+        '<div class="order-item-title">' + esc(planName(order.planCode, order.planName)) +
         '<span class="tag tag-' + tagClass + '">' + esc(orderStatusLabel(status)) + "</span></div>" +
         '<div class="order-item-meta">' + esc(formatDateTime(order.createdAt)) +
         " · " + esc(order.orderId) + "</div></div>" +

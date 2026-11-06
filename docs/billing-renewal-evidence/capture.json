@@ -1,0 +1,115 @@
+{
+  "capturedAt": "2026-11-06T16:01:20+0800",
+  "baseline": {
+    "ref": "2d07bc3",
+    "commit": "2d07bc33b7ecb359b701ea31e9dc04e8c674c0af"
+  },
+  "browser": "chromium 156.0.8078.79",
+  "mode": "mock backend",
+  "notes": [
+    "Before 与 After 使用同一份 mock 订单/权益数据、同一视口、浅色、中文。",
+    "After 的订单/权益是 mock 数据，不是真实扣款；真实支付宝沙箱付款不在本证据内。",
+    "Before=2d07bc3 是 ticket 分支基线（PR #12 的账号页/支付页），不是 main。"
+  ],
+  "files": [
+    {
+      "page": "before-pay",
+      "url": "http://127.0.0.1:34395/pay?order=ord-demo-paying",
+      "viewport": {
+        "width": 1440,
+        "height": 900
+      },
+      "file": "before-pay.png",
+      "sha256": "8a2bb38424d22e73ba7ddbb6cbd3f91f952b78934bc58faa29de1024b47a35ed",
+      "note": "基线 2d07bc3：支付页只有订单摘要，没有当前到期/预计到期。"
+    },
+    {
+      "page": "after-pay",
+      "url": "http://127.0.0.1:36527/pay?order=ord-demo-paying",
+      "viewport": {
+        "width": 1440,
+        "height": 900
+      },
+      "file": "after-pay.png",
+      "sha256": "4ca9861a1ab03083817ecb561839b7c3a784c30b12adaf5d9d55514ce2b6ded3",
+      "note": "本分支：支付前展示当前到期、本次续费天数、支付后预计到期与服务端规则句。"
+    },
+    {
+      "page": "before-account",
+      "url": "http://127.0.0.1:34395/account",
+      "viewport": {
+        "width": 1440,
+        "height": 900
+      },
+      "file": "before-account.png",
+      "sha256": "ffde859a4ff9bb5496992b8a0769885f03b6bb1f32c57612694485ea2bfe9f30",
+      "note": "基线 2d07bc3：账户权益卡没有续费规则说明。"
+    },
+    {
+      "page": "after-account",
+      "url": "http://127.0.0.1:36527/account",
+      "viewport": {
+        "width": 1440,
+        "height": 900
+      },
+      "file": "after-account.png",
+      "sha256": "0a00cdfced4275b1733fd8d50f09e35044ff36b93b533a226d8ab6ed94de3106",
+      "note": "本分支：权益卡显示服务端下发的 renewalRule / planChangeRule / refundRule。"
+    },
+    {
+      "page": "after-refunded-order",
+      "url": "http://127.0.0.1:36527/pay?order=ord-demo-refunded",
+      "viewport": {
+        "width": 1440,
+        "height": 900
+      },
+      "file": "after-refunded-order.png",
+      "sha256": "ebd53be07448755a5ce06d792d8997e4bc1d1b19e56602b21b365d65812190f4",
+      "note": "本分支：已退款订单不再显示“预计到期”；退款按剩余订单重算。"
+    },
+    {
+      "page": "before-pay-mobile",
+      "url": "http://127.0.0.1:34395/pay?order=ord-demo-paying",
+      "viewport": {
+        "width": 375,
+        "height": 812
+      },
+      "file": "before-pay-mobile.png",
+      "sha256": "9f43ff6d2d829344a03b0946b8d1037a02bdd98de0d976832132ceefa8130ffe",
+      "note": "基线 2d07bc3 移动端支付页。"
+    },
+    {
+      "page": "after-pay-mobile",
+      "url": "http://127.0.0.1:36527/pay?order=ord-demo-paying",
+      "viewport": {
+        "width": 375,
+        "height": 812
+      },
+      "file": "after-pay-mobile.png",
+      "sha256": "50de0d4e5de5c1cbf46803751883eb332bbef4b4e7c3939306f96f947171ce08",
+      "note": "本分支移动端：当前到期 / 本次续费 / 支付后预计到期。"
+    },
+    {
+      "page": "before-account-mobile",
+      "url": "http://127.0.0.1:34395/account",
+      "viewport": {
+        "width": 375,
+        "height": 812
+      },
+      "file": "before-account-mobile.png",
+      "sha256": "440808dbbe7db843f3eebc2460ca890a0e43452bb2e16241bff6cf2306a18fa3",
+      "note": "基线 2d07bc3 移动端权益卡。"
+    },
+    {
+      "page": "after-account-mobile",
+      "url": "http://127.0.0.1:36527/account",
+      "viewport": {
+        "width": 375,
+        "height": 812
+      },
+      "file": "after-account-mobile.png",
+      "sha256": "31439420c2f1a20604ed559b177d0d1145d174bf055d8e0a11aeb048aee68526",
+      "note": "本分支移动端：权益卡规则说明。"
+    }
+  ]
+}

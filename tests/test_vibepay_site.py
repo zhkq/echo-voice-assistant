@@ -144,7 +144,8 @@ class PageTests(unittest.TestCase):
                      "当前权益", "最近订单", "购买 / 续费"):
             self.assertIn(text, html, text)
         for element in ('id="authForm"', 'id="dashboardView"', 'id="ordersList"',
-                        'id="entitlementStatus"', 'data-account-cta'):
+                        'id="entitlementStatus"', 'id="entitlementRule"',
+                        'id="entitlementPolicy"', 'data-account-cta'):
             self.assertIn(element, html, element)
         js = _read_site("assets/site.js")
         for path in ("/v1/account/login", "/v1/account/register", "/v1/account/me",
@@ -169,12 +170,33 @@ class PageTests(unittest.TestCase):
         self.assertIn('id="payResult"', html)
         self.assertIn('id="testNotice"', html)
         self.assertNotIn('http-equiv="refresh"', html)
+        # issue #13：支付前展示“当前到期 / 本次续费 / 支付后预计到期”。
+        for text in ("当前到期", "本次续费", "支付后预计到期"):
+            self.assertIn(text, html, text)
+        for element in ('id="orderCurrentUntil"', 'id="orderProjectedUntil"',
+                        'id="renewalRule"'):
+            self.assertIn(element, html, element)
         js = _read_site("assets/site.js")
         for text in ("/v1/billing/orders/", "/sync", "payUrl", "visibilitychange",
-                     "订单已关闭", "订单已退款", "支付成功", "sandbox"):
+                     "订单已关闭", "订单已退款", "支付成功", "sandbox",
+                     "projectedPaidUntil", "currentPaidUntil", "renewalRule"):
             self.assertIn(text, js, text)
+        self.assertNotIn("支付成功后起算", js + html,
+                         "起算口径必须由服务端 renewalRule/renewalBasis 给出")
         for redirect_api in ("location.href", "location.replace", "window.open("):
             self.assertNotIn(redirect_api, js, "支付页不许自动跳转")
+
+    def test_renewal_rule_is_server_driven_on_the_account_page(self):
+        html = _read_site("account.html")
+        self.assertIn('id="entitlementRule"', html)
+        self.assertIn('id="entitlementPolicy"', html)
+        js = _read_site("assets/site.js")
+        for text in ("entitlementRule", "entitlementPolicy", "renewalRule",
+                     "planChangeRule", "refundRule", "autoRenew"):
+            self.assertIn(text, js, text)
+        # 订单列表不能只渲染 paid：三种终态都要有文案。
+        for text in ("已退款", "已关闭", "等待支付", "已支付"):
+            self.assertIn(text, js, text)
 
     def test_no_static_qr_asset_is_shipped(self):
         self.assertFalse(os.path.exists(os.path.join(SITE, "assets", "qr-placeholder.svg")))
@@ -486,6 +508,50 @@ class Phase3EvidenceTests(unittest.TestCase):
     def test_phase3_capture_scripts_compile(self):
         for name in ("capture-phase3-evidence.py", "e2e-vibepay-mock.py"):
             py_compile.compile(os.path.join(ROOT, "scripts", name), doraise=True)
+
+
+class RenewalEvidenceTests(unittest.TestCase):
+    """issue #13 的 Before/After 证据（续费规则 / 预计到期）。"""
+
+    DIR = os.path.join(ROOT, "docs", "billing-renewal-evidence")
+
+    def test_before_and_after_files_exist(self):
+        expected = (
+            "before-pay.png", "after-pay.png",
+            "before-account.png", "after-account.png",
+            "before-pay-mobile.png", "after-pay-mobile.png",
+            "before-account-mobile.png", "after-account-mobile.png",
+            "after-refunded-order.png",
+        )
+        for name in expected:
+            path = os.path.join(self.DIR, name)
+            self.assertTrue(os.path.isfile(path), name)
+            self.assertGreater(os.path.getsize(path), 5000, name)
+
+    def test_manifest_records_baseline_and_mock_boundary(self):
+        data = json.loads(_read("docs", "billing-renewal-evidence", "capture.json"))
+        self.assertEqual(data["mode"], "mock backend")
+        self.assertEqual(data["baseline"]["ref"], "2d07bc3")
+        joined = " ".join(data["notes"])
+        self.assertIn("mock", joined)
+        self.assertIn("真实扣款", joined)
+        pages = {item["page"] for item in data["files"]}
+        self.assertTrue({
+            "before-pay", "after-pay", "before-account", "after-account",
+            "before-pay-mobile", "after-pay-mobile", "after-refunded-order",
+        } <= pages)
+
+    def test_readme_states_the_evidence_limits(self):
+        text = _read("docs", "billing-renewal-evidence", "README.md")
+        for needle in ("Before", "After", "1440", "375", "mock", "2d07bc3",
+                       "真实扣款", "限制"):
+            self.assertIn(needle, text, needle)
+
+    def test_capture_script_compiles(self):
+        py_compile.compile(
+            os.path.join(ROOT, "scripts", "capture-renewal-evidence.py"),
+            doraise=True,
+        )
 
 
 if __name__ == "__main__":

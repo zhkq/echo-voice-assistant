@@ -34,14 +34,18 @@
 2. **选套餐 → 下单**：`/pricing` 先 `GET /v1/billing/plans`；点「立即购买」时若未登录先跳
    `/account?next=…`，已登录则 `POST /v1/billing/orders {planCode}`，成功后跳到
    `/pay?order=<orderId>`。
-3. **支付**：`/pay` 用 `GET /v1/billing/orders/{id}` 读订单摘要（套餐名/天数/金额/订单号/状态都来自服务端），
-   用服务端返回的 `payUrl` 打开支付宝收银台，**不使用静态二维码/假二维码**。页面每 3 秒轮询订单，
-   从支付宝回跳（`return_url` 自动带 `?order=`）或点「刷新订单状态」时调
-   `POST /v1/billing/orders/{id}/sync` 主动查询并补记支付。
+3. **支付**：`/pay` 用 `GET /v1/billing/orders/{id}` 读订单摘要（套餐名/天数/金额/订单号/状态/
+   当前到期/支付后预计到期都来自服务端），用服务端返回的 `payUrl` 打开支付宝收银台，
+   **不使用静态二维码/假二维码**。页面每 3 秒轮询订单，从支付宝回跳（`return_url` 自动带
+   `?order=`）或点「刷新订单状态」时调 `POST /v1/billing/orders/{id}/sync` 主动查询并补记支付。
+   预计到期与起算口径来自 `projectedPaidUntil / currentPaidUntil / renewalBasis / renewalRule`，
+   页面**不自己写“支付成功后起算”**。
 4. **结果**：`paid` → 成功页 + 权益摘要；`closed`/超时 → 重新购买；`refunded` → 已退款；
    读不到/网络失败 → 明确错误与重试。支付页不会把「等待支付」当成功。
 5. **我的账户**：`GET /v1/account/me` + `GET /v1/billing/orders` 展示当前权益（到期时间、今日剩余
-   转写分钟、TTS 字符、QPS/并发、设备数）和最近订单；续费入口回 `/pricing`。
+   转写分钟、TTS 字符、QPS/并发、设备数）和最近订单；权益卡显示服务端下发的
+   `renewalRule / planChangeRule / refundRule`，续费入口回 `/pricing`。订单列表显示全部状态
+   （待支付/已支付/已退款/已关闭），不只显示 paid。
 
 ### 测试环境标注
 
@@ -166,6 +170,8 @@ server {
 ## 不做的部分
 
 - 不做第三方登录、短信验证码、扫码授权登录。
-- 不做自动续费、优惠券、部分退款；退款是管理面全额退款 + 权益重算。
+- 不做自动续费、优惠券、部分退款；退款是管理面全额退款 + 按剩余 `paid` 订单重算权益。
+- 第一版不做升级/降级 proration：有有效付费权益时只能续费同一套餐，换套餐返回
+  `409 plan_change_unsupported`；过期/退款/试用状态下可重新购买任意上架套餐。
 - 不做域名备案；公网 HTTPS 与支付宝签约状态由发布流程确认。
 - 不在本分支合并 `main`；目标分支是 `integration/billing-vibepay`。
