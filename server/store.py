@@ -1265,6 +1265,15 @@ class Store:
                 (str(email or "").strip(), str(purpose or "").strip())).fetchone()
         return dict(row) if row else None
 
+    def email_code_latest_any(self, email: str, purpose: str) -> Optional[Dict[str, Any]]:
+        """最近一条（含已消费/已作废）——只用于 60 秒重发冷却。"""
+        with self._lock:
+            row = self._db.execute(
+                "SELECT * FROM email_codes WHERE email=? AND purpose=?"
+                " ORDER BY created_at DESC, id DESC LIMIT 1",
+                (str(email or "").strip(), str(purpose or "").strip())).fetchone()
+        return dict(row) if row else None
+
     def email_code_attempt(self, code_id: int, *, max_attempts: int = 5,
                            now: Optional[float] = None) -> int:
         """记一次错误尝试；到上限顺带作废。返回累计错误次数。"""

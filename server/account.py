@@ -244,7 +244,7 @@ class AccountService:
         except Exception:
             pass
         cooldown = max(0.0, float(self.cfg.get("account.email.resend_cooldown_s", 60) or 0))
-        latest = self.store.email_code_latest(email, purpose)
+        latest = self.store.email_code_latest_any(email, purpose)
         if latest is not None:
             elapsed = now - float(latest.get("created_at") or 0)
             if elapsed < cooldown:
