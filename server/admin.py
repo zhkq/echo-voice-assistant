@@ -84,8 +84,6 @@
 """
 from __future__ import annotations
 
-import base64
-import hashlib
 import hmac
 import json
 import os
@@ -105,6 +103,7 @@ from server import auth as auth_mod
 from server import billing as billing_mod
 from server import limits as limits_mod
 from server import ops as ops_mod
+from server import passwords
 from server import perfmon as perfmod
 
 #: 写请求必须带的**非简单请求标志头**（值随便，非空即可）。
@@ -132,13 +131,6 @@ _LOOPBACK_NAMES = ("127.0.0.1", "localhost", "[::1]")
 #: （`Host` 头里的 IPv6 按 RFC 要带方括号，别处偶尔会漏，认了不损失什么）。
 _LOOPBACK_ALIASES = _LOOPBACK_NAMES + ("::1",)
 
-#: 口令哈希的参数（scrypt）。**这些都是"让人算不快"的参数**：
-#: n=2^14 时一次验证约几十毫秒，暴力破解的代价因此抬高。
-_SCRYPT_N = 2 ** 14
-_SCRYPT_R = 8
-_SCRYPT_P = 1
-_SCRYPT_DKLEN = 32
-
 #: 会话有效期（秒）。8 小时 = 一个工作日，过了要重新登。
 SESSION_TTL_S = 8 * 3600
 
@@ -155,39 +147,10 @@ MAX_PASSWORD_LEN = 200
 
 # ---------------------------------------------------------------- 口令
 
-def hash_password(password: str, *, salt: str = "") -> str:
-    """`scrypt$<salt_b64>$<hash_b64>`。格式自带参数前缀，将来换算法能平滑迁移。"""
-    raw_salt = base64.b64decode(salt) if salt else os.urandom(16)
-    dk = hashlib.scrypt(str(password).encode("utf-8"), salt=raw_salt,
-                        n=_SCRYPT_N, r=_SCRYPT_R, p=_SCRYPT_P, dklen=_SCRYPT_DKLEN)
-    return "scrypt$%s$%s" % (base64.b64encode(raw_salt).decode(),
-                             base64.b64encode(dk).decode())
-
-
-def verify_password(password: str, stored: str) -> bool:
-    """**常数时间比较**，且认不出的格式一律 False（不猜）。"""
-    text = str(stored or "")
-    if not text.startswith("scrypt$"):
-        return False
-    parts = text.split("$")
-    if len(parts) != 3:
-        return False
-    try:
-        raw_salt = base64.b64decode(parts[1])
-        want = base64.b64decode(parts[2])
-    except Exception:
-        return False
-    # **空盐 / 空哈希要当场否掉**：`scrypt(dklen=0)` 会抛 `ValueError`，
-    # 而"库里的哈希被改坏了"这条路径只该得到 `False`（进不去），不该是一段 traceback
-    # —— 那会把"登录失败"变成"服务端 500"。实测被 `test_a_garbage_stored_value_...` 抓到。
-    if not raw_salt or not want:
-        return False
-    try:
-        dk = hashlib.scrypt(str(password).encode("utf-8"), salt=raw_salt,
-                            n=_SCRYPT_N, r=_SCRYPT_R, p=_SCRYPT_P, dklen=len(want))
-    except (ValueError, MemoryError):
-        return False
-    return hmac.compare_digest(dk, want)
+#: 哈希实现与 `server/account.py`（邮箱账号）共用；这里保留同名 re-export，
+#: 现有调用方与测试（`admin.hash_password` / `admin.verify_password`）不变。
+hash_password = passwords.hash_password
+verify_password = passwords.verify_password
 
 
 def new_password() -> str:
@@ -1191,7 +1154,8 @@ def create_admin_app(cfg, state, *, perf=None) -> FastAPI:
         rows = []
         for user in svc.store.users():
             if needle and needle not in (
-                    str(user.get("employee_no") or "").lower()
+                    str(user.get("email") or "").lower()
+                    + " " + str(user.get("employee_no") or "").lower()
                     + " " + str(user.get("name") or "").lower()
                     + " " + str(user.get("alipay_open_id") or "").lower()):
                 continue

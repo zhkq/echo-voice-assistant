@@ -508,6 +508,8 @@ class IsolationTests(_AdminCase):
                                        # 它们只写管理数据，鉴权各自在端点里判
                                        # （账号端点凭邀请码/userToken，支付回调凭验签）。
                                        "/v1/account/register", "/v1/account/login",
+                                       "/v1/account/email/send-code",
+                                       "/v1/account/password/reset",
                                        "/v1/account/devices/code",
                                        "/v1/account/devices/unbind",
                                        "/v1/account/logout",

@@ -28,6 +28,8 @@
 }
 
 * { box-sizing: border-box; }
+/* `hidden` 属性必须压得住组件的 display（例如 .field-row{display:grid}）。 */
+[hidden] { display: none !important; }
 html { scroll-behavior: smooth; }
 body {
   margin: 0;
@@ -499,6 +501,11 @@ ul { margin: 0; padding: 0; list-style: none; }
 .auth-note { margin-top: 16px; color: var(--muted); font-size: 13.5px; line-height: 1.7; }
 .field-row { display: grid; gap: 6px; margin-top: 14px; }
 .field-row label { color: var(--ink-2); font-size: 13px; font-weight: 700; }
+.code-row { display: flex; gap: 8px; align-items: stretch; }
+.code-row .input { flex: 1 1 auto; min-width: 0; }
+.code-row .btn { flex: 0 0 auto; min-height: 46px; white-space: nowrap; }
+.auth-hint a { color: var(--brand-ink); font-weight: 700; text-decoration: none; }
+.auth-hint a:hover { text-decoration: underline; }
 .input {
   width: 100%; min-height: 46px; padding: 0 13px; border: 1px solid var(--line);
   border-radius: 10px; background: #fff; color: var(--ink); font-size: 14.5px;

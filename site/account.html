@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>登录与我的账户 · ECHO 语音助手</title>
-  <meta name="description" content="ECHO 语音助手账号：用邀请码与工号登录，查看套餐权益、到期时间与最近订单。">
+  <meta name="description" content="ECHO 语音助手账号：用邮箱注册/登录，查看套餐权益、到期时间与最近订单。">
   <meta name="theme-color" content="#f6f8fc">
   <link rel="icon" type="image/png" href="/assets/echo-logo.png">
   <link rel="stylesheet" href="/assets/site.css">
@@ -34,7 +34,7 @@
     <section class="wrap page-hero">
       <div class="crumbs"><a href="/">首页</a><span aria-hidden="true">/</span><span id="accountCrumb">我的账户</span></div>
       <h1 id="accountTitle">登录 / 注册</h1>
-      <p class="lead" id="accountLead">用邀请码与工号登录，查看套餐权益、到期时间和最近订单。</p>
+      <p class="lead" id="accountLead">用邮箱注册/登录，查看套餐权益、到期时间和最近订单。</p>
     </section>
 
     <section class="wrap account-section" aria-live="polite">
@@ -42,40 +42,53 @@
 
       <div class="account-layout" id="accountLayout" hidden>
         <div class="account-main">
-          <!-- 未登录：登录 / 注册 -->
+          <!-- 未登录：登录 / 注册 / 忘记密码（邮箱即账号） -->
           <div class="panel" id="authView" hidden>
-            <div class="auth-tabs" role="tablist" aria-label="登录或注册">
+            <div class="auth-tabs" id="authTabs" role="tablist" aria-label="登录或注册">
               <button type="button" class="auth-tab is-active" id="tabLogin" data-auth-tab="login"
                       role="tab" aria-selected="true" aria-controls="authForm">登录</button>
               <button type="button" class="auth-tab" id="tabRegister" data-auth-tab="register"
                       role="tab" aria-selected="false" aria-controls="authForm">注册</button>
             </div>
-            <p class="auth-note" id="authNote">已有账号？填写工号与邀请码登录。</p>
+            <p class="auth-note" id="authNote">已有账号？用邮箱和密码登录。</p>
             <form id="authForm" novalidate>
-              <div class="field-row" id="fieldNameRow" hidden>
-                <label for="authName">姓名</label>
-                <input class="input" id="authName" name="name" type="text" maxlength="64"
-                       autocomplete="name" placeholder="例如：张三">
-              </div>
               <div class="field-row">
-                <label for="authEmployeeNo">工号 / 账号</label>
-                <input class="input" id="authEmployeeNo" name="employeeNo" type="text"
-                       maxlength="64" autocomplete="username" placeholder="例如：E001" required>
+                <label for="authEmail">邮箱</label>
+                <input class="input" id="authEmail" name="email" type="email" maxlength="254"
+                       autocomplete="username" placeholder="you@example.com" required>
               </div>
-              <div class="field-row">
+              <div class="field-row" id="authCodeRow" hidden>
+                <label for="authCode">邮箱验证码</label>
+                <div class="code-row">
+                  <input class="input" id="authCode" name="code" type="text" inputmode="numeric"
+                         maxlength="6" autocomplete="one-time-code" placeholder="6 位数字">
+                  <button class="btn btn-ghost btn-sm" id="sendCodeBtn" type="button">发送验证码</button>
+                </div>
+                <p class="auth-hint">验证码 10 分钟内有效，发送后 60 秒可重发。</p>
+              </div>
+              <div class="field-row" id="authPasswordRow">
+                <label for="authPassword" id="authPasswordLabel">密码</label>
+                <input class="input" id="authPassword" name="password" type="password"
+                       maxlength="200" autocomplete="current-password" placeholder="至少 8 位，含字母和数字">
+                <p class="auth-hint" id="authPasswordHint" hidden>至少 8 位，且同时包含字母和数字。</p>
+              </div>
+              <div class="field-row" id="authPassword2Row" hidden>
+                <label for="authPassword2">确认密码</label>
+                <input class="input" id="authPassword2" name="password2" type="password"
+                       maxlength="200" autocomplete="new-password" placeholder="再输入一次">
+              </div>
+              <div class="field-row" id="authInviteRow" hidden>
                 <label for="authInviteCode">邀请码</label>
                 <input class="input" id="authInviteCode" name="inviteCode" type="text"
-                       maxlength="64" autocomplete="one-time-code" placeholder="管理员发放的邀请码">
-              </div>
-              <div class="field-row" id="fieldPhoneRow" hidden>
-                <label for="authPhone">手机号（选填）</label>
-                <input class="input" id="authPhone" name="phone" type="tel" maxlength="32"
-                       autocomplete="tel" placeholder="用于联系，不用于登录">
+                       maxlength="64" autocomplete="off" placeholder="内测期必填，例如 TEAM2026">
+                <p class="auth-hint">当前为内测期，注册必须填写通用邀请码；不需要一人一码。</p>
               </div>
               <p class="form-error" id="authError" hidden></p>
               <button class="btn btn-primary btn-block" id="authSubmit" type="submit">登录</button>
             </form>
-            <p class="auth-hint">邀请码由管理员发放；一个邀请码可注册的名额有限。登录状态只保存在本机浏览器。</p>
+            <p class="auth-hint" id="authForgot"><a href="#reset" id="forgotPassword">忘记密码？用邮箱验证码重置</a></p>
+            <p class="auth-hint" id="authBack" hidden><a href="#login" id="backToLogin">← 返回登录</a></p>
+            <p class="auth-hint">邀请码由管理员发放；登录状态只保存在本机浏览器。</p>
           </div>
 
           <!-- 已登录：账户与权益 -->
@@ -84,7 +97,7 @@
               <div class="account-avatar" id="profileAvatar" aria-hidden="true">E</div>
               <div class="account-profile-text">
                 <div class="account-name" id="profileName">ECHO 用户</div>
-                <div class="account-meta" id="profileMeta">工号：—</div>
+                <div class="account-meta" id="profileMeta">邮箱：—</div>
               </div>
               <span class="status-pill" id="profileStatus">已登录</span>
               <button class="btn btn-ghost btn-sm" id="logoutBtn" type="button">退出登录</button>
@@ -148,11 +161,12 @@
               <li><strong>下单与续费</strong><span>支付宝收银台付款，订单状态以服务端为准。</span></li>
               <li><strong>查看权益</strong><span>到期时间、每日转写分钟、TTS 字符与设备额度。</span></li>
               <li><strong>换机不重复收费</strong><span>权益归人，设备只是登录端；多台设备共用一份额度。</span></li>
+              <li><strong>邮箱即账号</strong><span>注册时验证邮箱，之后用邮箱 + 密码登录；忘记密码用邮件验证码重置。</span></li>
             </ul>
           </div>
           <div class="panel aside-card aside-help">
             <h2>登录遇到问题？</h2>
-            <p>忘记工号或邀请码、需要解绑旧设备，请联系管理员处理。</p>
+            <p>忘记密码可在本页用邮箱验证码重置；需要解绑旧设备或邀请码有问题，请联系管理员。</p>
             <a class="btn btn-ghost btn-block" href="/pricing">先看看套餐</a>
           </div>
         </aside>

@@ -248,7 +248,36 @@ trial:
   days: 7
 
 invite:
-  required: true                 # 注册/登录要邀请码（内部同事专用）
+  required: true                 # 邮箱注册要邀请码（通用码即可，如 TEAM2026；次数在管理面/库里调）
+
+# ================================================================ 邮箱账号（2026-11-06，issue #15）
+# 邮箱即账号：注册 = email + 邮件验证码 + 密码 + 邀请码；登录 = email + 密码。
+# **出厂关**：不配时后端照常启动，邮箱注册/发码/重置回 503；已注册邮箱账号仍可登录。
+# 凭据只从环境变量或只读文件读，**不要**把密码写进本文件/仓库/数据库：
+#   ECHO_EMAIL_ENABLED=1 ECHO_EMAIL_PROVIDER=dev      # 本地联调，验证码看日志
+#   ECHO_EMAIL_ENABLED=1 ECHO_EMAIL_PROVIDER=smtp ECHO_EMAIL_FROM=no-reply@example.com
+#   ECHO_SMTP_HOST=smtp.example.com ECHO_SMTP_PORT=465 ECHO_SMTP_MODE=ssl
+#   ECHO_SMTP_USERNAME=... ECHO_SMTP_PASSWORD=...     # 或 ECHO_SMTP_PASSWORD_FILE=/run/secrets/smtp
+account:
+  email:
+    enabled: false
+    provider: dev                # dev | smtp（api 预留，本轮未实现）
+    from: ""                     # 发信地址，例如 no-reply@echoserver.zhkq.online
+    from_name: "ECHO"
+    code_ttl_s: 600              # 10 分钟
+    resend_cooldown_s: 60        # 60 秒冷却
+    max_per_email_hour: 5
+    max_per_ip_hour: 20
+    max_attempts: 5              # 错 5 次作废
+    send_timeout_s: 10
+    send_retries: 1              # 只对连接/超时/断开重试
+    smtp:
+      host: ""
+      port: 465
+      mode: ssl                  # ssl | starttls | plain（plain 只允许本机）
+      username: ""
+      password_env: "ECHO_SMTP_PASSWORD"
+      password_file: ""          # 也可用只读挂载文件；优先于环境变量
 
 payment:
   # disabled | mock | alipay。**默认 disabled**：没配支付时服务能起来，

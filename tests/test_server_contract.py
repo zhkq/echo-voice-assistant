@@ -290,6 +290,8 @@ class NoBusinessCouplingTests(unittest.TestCase):
             # `payment.mock_router` 按 `payment.provider=mock` 条件注册，
             # 下面 `MockGatewayRoutesAreConditionalTests` 单独钉。
             ("POST", "/v1/account/register"), ("POST", "/v1/account/login"),
+            ("POST", "/v1/account/email/send-code"),
+            ("POST", "/v1/account/password/reset"),
             ("GET", "/v1/account/me"),
             ("POST", "/v1/account/devices/code"),
             ("POST", "/v1/account/devices/unbind"),
@@ -1673,7 +1675,9 @@ class AuthSchemaTests(unittest.TestCase):
                           # 评审理由。没有一张存请求内容，列名黑名单逐列核对。
                           "plans", "users", "user_devices", "invites",
                           "authorized_open_ids", "scan_sessions",
-                          "orders", "order_events", "alipay_notify", "entitlements"))
+                          "orders", "order_events", "alipay_notify", "entitlements",
+                          # 邮箱账号（2026-11-06，issue #15）：邮箱验证码只存哈希。
+                          "email_codes"))
 
 
 class AuthPairingTests(unittest.TestCase):

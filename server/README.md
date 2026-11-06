@@ -289,7 +289,7 @@ nvidia-container-toolkit / compose v2）、模型卷按容器布局摆好并校�
 ### 8.1 开了之后是什么样
 
 ```
-未登录 ──注册（邀请码+姓名+工号）──▶ userToken ──下单（只传 planCode）──▶ {orderId, payUrl}
+未登录 ──注册（邮箱+邮件验证码+密码+邀请码）──▶ userToken ──下单（只传 planCode）──▶ {orderId, payUrl}
    │                                                                    │
    └── 打开 payUrl 付款 ──▶ 异步通知（验签/幂等/金额校验）──▶ paid ──▶ 发配对码
                                                                       │
@@ -333,13 +333,32 @@ alipay:
   sandbox: false                # true 且 gateway 未改时自动用 sandbox_gateway
   seller_id: ""                 # 可选：回调 seller_id 校验
   notify_url: "https://echoserver.zhkq.online:8900/v1/billing/alipay/notify"
-invite: { required: true }      # 注册/登录都要邀请码；登录只验“同一张”，过期/作废不锁号
+invite: { required: true }      # 邮箱注册要邀请码（用 TEAM2026 这类通用码即可；次数可调）
 trial: { enabled: true, days: 7 }
+account:
+  email:
+    enabled: false              # 出厂关；开了才允许发码/注册/重置。邮箱+密码登录不受它影响
+    provider: dev               # dev（验证码写日志）| smtp（生产）
+    from: ""
+    from_name: "ECHO"
+    smtp: { host: "", port: 465, mode: ssl, username: "",
+            password_env: "ECHO_SMTP_PASSWORD", password_file: "" }
 ```
 
 环境变量同名映射：`ECHO_BILLING_ENABLED`、`ECHO_PAYMENT_PROVIDER`、`ECHO_ALIPAY_APP_ID`、
 `ECHO_ALIPAY_PRIVATE_KEY_PATH`、`ECHO_ALIPAY_PUBLIC_KEY_PATH`、`ECHO_ALIPAY_GATEWAY`、
 `ECHO_ALIPAY_SANDBOX`、`ECHO_PAYMENT_NOTIFY_URL`、`ECHO_TRIAL_ENABLED`、`ECHO_INVITE_REQUIRED`。
+邮箱账号：`ECHO_EMAIL_ENABLED`、`ECHO_EMAIL_PROVIDER`、`ECHO_EMAIL_FROM`、`ECHO_SMTP_HOST`、
+`ECHO_SMTP_PORT`、`ECHO_SMTP_MODE`、`ECHO_SMTP_USERNAME`、`ECHO_SMTP_PASSWORD`、
+`ECHO_SMTP_PASSWORD_FILE`（密码只从环境变量/只读文件读，不入库）。
+
+> 部署提醒：发码的每 IP 限流取 `X-Forwarded-For` 第一段（与现有配对退避同口径）。
+> 反向代理必须**覆盖/清洗**这个头；否则客户端可以伪造来源绕过每 IP 限额。
+
+生产发信还需要（这些**不在代码里**）：发信域名；SPF / DKIM / DMARC 三个 DNS 记录；
+`from` 地址；SMTP 服务商的 host/port/TLS 模式/账号与密码（env 或只读挂载文件）；
+服务商的发信额度与退信策略。本地/CI 用 `provider=dev`（验证码写日志）或测试注入的
+fake sender，**不发真实邮件**。
 
 ### 8.3 用 Mock 跑通全链路（无 UI 也能验收）
 
@@ -358,10 +377,16 @@ store = auth.open_store(cfg)
 store.put_invite("TEAM2026", max_uses=50, note="内部推广")
 PY
 
-# 3) 注册 → 下单 → 模拟付款 → 拿 pairUrl
+# 3) 邮箱注册 → 下单 → 模拟付款 → 拿 pairUrl
+#    本地用 dev provider：验证码看服务端日志（搜索 [account.email][dev]）
+export ECHO_EMAIL_ENABLED=1 ECHO_EMAIL_PROVIDER=dev
+curl -s -X POST localhost:8900/v1/account/email/send-code \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"user@example.com","purpose":"register"}'
+#   日志里取 6 位码后：
 curl -s -X POST localhost:8900/v1/account/register \
   -H 'Content-Type: application/json' \
-  -d '{"inviteCode":"TEAM2026","name":"张三","employeeNo":"E001"}'
+  -d '{"email":"user@example.com","code":"123456","password":"Passw0rd","inviteCode":"TEAM2026"}'
 #   → {"userId":"usr-...","userToken":"...","expiresAt":...}
 
 curl -s -X POST localhost:8900/v1/billing/orders \
@@ -410,7 +435,10 @@ Mock 端点默认只接受**回环/测试来源**（`payment.mock_allow_remote=f
 | 支付未配置 / 真实网关未接入 | 503 | `payment_unconfigured` |
 | 收费功能没开 | 404 | `billing_disabled` |
 | 邀请码无效/过期/用完 | 403 | `invite_invalid` |
-| 工号已注册 | 409 | `employee_no_taken` |
+| 邮箱已注册（有效验证码之后） | 409 | `email_taken` |
+| 邮箱验证码错误/过期/错满 | 400 | `verification_code_invalid` / `_expired` / `_attempts_exceeded` |
+| 密码不合规（<8 位或缺少字母+数字） | 400 | `password_weak` |
+| 邮件功能未启用/未配置/发送失败 | 503/503/502 | `email_disabled` / `email_unconfigured` / `email_send_failed` |
 | 设备数满 | 403 | `device_limit_reached` |
 | 订单状态不允许 | 409 | `order_state_conflict` |
 | 有有效付费权益时买不同套餐（不做 proration） | 409 | `plan_change_unsupported` |
@@ -418,9 +446,10 @@ Mock 端点默认只接受**回环/测试来源**（`payment.mock_allow_remote=f
 
 ### 8.6 数据与边界（评审结论）
 
-新增的十张表全部进 `server/store.py` 的 `TABLE_WHITELIST`：`plans`、`users`、
+新增的表全部进 `server/store.py` 的 `TABLE_WHITELIST`：`plans`、`users`、
 `user_devices`、`invites`、`authorized_open_ids`、`scan_sessions`、`orders`、
-`order_events`、`alipay_notify`、`entitlements`。它们属于"**关于谁、买了什么、
+`order_events`、`alipay_notify`、`entitlements`，以及 2026-11-06 邮箱账号的
+`email_codes`（邮箱、用途、验证码哈希、TTL、尝试次数、发送时间、IP；**只存哈希**）。它们属于"**关于谁、买了什么、
 还有多少**"的管理数据，**不存请求内容**（音频/文本/嵌入），列名黑名单逐列核对。
 `authorized_open_ids` / `scan_sessions` 是 Phase 4 白名单/扫码会话，**只建表、逻辑没做**。
 
@@ -450,13 +479,12 @@ Mock 端点默认只接受**回环/测试来源**（`payment.mock_allow_remote=f
 * `AlipayGateway.query()` / `refund()` 未接入（见 8.4）。
 * 多实例部署时 1 QPS / 日额度是**进程内**计数（与既有 `quota.py` 同一个取舍），
   不是全局精确值。
-* **登录没有密码**：`invite.required=true` 时注册和登录都要求邀请码（注册时把码写进
-  `users.invite_code`，登录只认同一张，**邀请码过期/管理面作废都不影响已注册账号登录，
-  只影响注册名额**），并有按来源 IP 的失败退避；但知道工号 + 那张注册码仍可登录
-  （内部 10 元月卡定位）。对外部署需要手机号验证码/企业微信（设计 §3.5.11），
-  **本轮不改客户端/协议**。
-* 升级前建、`invite_code` 为空的老账号，首次登录可绑定任意一张**仍存在**的邀请码
-  （一次性升级窗口）；绑定后只认这一张。
+* **邮箱即账号（2026-11-06）**：注册需要邮箱验证码 + 密码 + 邀请码，登录只认
+  邮箱 + 密码；邀请码只是注册门禁（`invite.required=true`，可用 TEAM2026 这类通用码，
+  次数上限可调），不再作为登录凭证。注册/登录/重置均有失败退避；验证码只存 scrypt
+  哈希、10 分钟有效、一次性、错 5 次作废、60 秒冷却、按邮箱/IP 小时限额。
+* **老工号账号已退役**：不再有「工号 + 邀请码」注册/登录路径；`employee_no` 只作为
+  可留空的历史列保留，站点不再展示工号入口。旧测试账号可直接删除/重建。
 * **只对通过 purchase / device-bind 码新配对的设备生效**：开启收费前已经配好的
   存量客户端没有 `user_devices` 绑定，继续走免费老路；是否补"管理面 attach"待用户定。
 * 订单 `expires_at` 现在是**惰性关闭**（下一次 `create_order` 时执行）；支付宝下单已带

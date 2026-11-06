@@ -83,7 +83,10 @@ TABLE_WHITELIST = ("clients", "pairing_codes", "calls", "admin_users", "admin_au
                    # 收费（2026-11-03，设计 §4.1）—— 见上面那段逐张的理由。
                    "plans", "users", "user_devices", "invites",
                    "authorized_open_ids", "scan_sessions",
-                   "orders", "order_events", "alipay_notify", "entitlements")
+                   "orders", "order_events", "alipay_notify", "entitlements",
+                   # 邮箱验证码（2026-11-06，issue #15）：邮箱、用途、码哈希、TTL、
+                   # 尝试次数、发送时间、IP。**只存验证码哈希**，不存明文/邮件内容。
+                   "email_codes")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS clients (
@@ -203,10 +206,18 @@ CREATE TABLE IF NOT EXISTS plans (
 CREATE TABLE IF NOT EXISTS users (
     user_id       TEXT PRIMARY KEY,
     name          TEXT NOT NULL DEFAULT '',
+    -- 历史列：邮箱账号体系下不再作为登录字段，新账号留空。
     employee_no   TEXT NOT NULL DEFAULT '',
-    -- 注册时用的邀请码。登录只校验"这张码存在且属于该 user"，**不因过期拒绝**
-    -- （邀请码的 expires_at 只是注册名额的有效期，不是账号寿命）。
+    -- 注册时用的邀请码（审计/未来渠道标记用；邮箱账号登录不再校验它）。
     invite_code   TEXT NOT NULL DEFAULT '',
+    -- 邮箱即账号（2026-11-06，issue #15）。`email` 存归一化后的小写值；
+    -- 空串 = 升级前的历史账号。唯一性由 `_migrate_locked()` 里的部分索引保证。
+    email         TEXT NOT NULL DEFAULT '',
+    email_verified_at REAL NOT NULL DEFAULT 0,
+    -- scrypt 哈希（格式同 admin_users.password_hash）。空串 = 没有密码的账号。
+    password_hash TEXT NOT NULL DEFAULT '',
+    -- 最近一次成功登录；仅审计/管理面用，不进公开视图。
+    last_login    REAL NOT NULL DEFAULT 0,
     phone         TEXT NOT NULL DEFAULT '',
     alipay_open_id TEXT NOT NULL DEFAULT '',
     status        TEXT NOT NULL DEFAULT 'active',
@@ -218,6 +229,24 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_users_employee_no
     ON users(employee_no) WHERE employee_no <> '';
 CREATE UNIQUE INDEX IF NOT EXISTS idx_users_alipay_open_id
     ON users(alipay_open_id) WHERE alipay_open_id <> '';
+-- 邮箱验证码（issue #15）。**只存哈希**：6 位码的 scrypt 结果，绝不存明文。
+-- `purpose` = register|reset；同一邮箱+用途同时只有一条有效码（新码发出时把旧的作废）。
+-- `consumed_at <> 0` = 已用过/已作废；`attempts` 到上限也作废。行只保留 24 小时供排障。
+CREATE TABLE IF NOT EXISTS email_codes (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    email       TEXT NOT NULL DEFAULT '',
+    purpose     TEXT NOT NULL DEFAULT '',
+    code_hash   TEXT NOT NULL DEFAULT '',
+    expires_at  REAL NOT NULL DEFAULT 0,
+    attempts    INTEGER NOT NULL DEFAULT 0,
+    created_at  REAL NOT NULL DEFAULT 0,
+    ip          TEXT NOT NULL DEFAULT '',
+    consumed_at REAL NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_email_codes_email
+    ON email_codes(email, purpose, created_at);
+CREATE INDEX IF NOT EXISTS idx_email_codes_ip
+    ON email_codes(ip, created_at);
 -- 人 ↔ 设备。`client_id` 唯一：一台设备只属于一个人（换人要走解绑/迁移）。
 CREATE TABLE IF NOT EXISTS user_devices (
     user_id     TEXT NOT NULL,
@@ -331,8 +360,13 @@ _ADDED_COLUMNS = {
         ("revoked_at", "REAL NOT NULL DEFAULT 0"),
     ),
     "users": (
-        # 注册邀请码（登录时只验"属于该 user"；过期不等于账号失效）。
+        # 注册邀请码（审计/渠道标记；邮箱账号登录不再校验它）。
         ("invite_code", "TEXT NOT NULL DEFAULT ''"),
+        # 邮箱即账号（2026-11-06，issue #15）。老库靠这一段补列。
+        ("email", "TEXT NOT NULL DEFAULT ''"),
+        ("email_verified_at", "REAL NOT NULL DEFAULT 0"),
+        ("password_hash", "TEXT NOT NULL DEFAULT ''"),
+        ("last_login", "REAL NOT NULL DEFAULT 0"),
     ),
     "alipay_notify": (
         # 回调状态（paid/closed/conflict…），迟到支付/冲突对账用。
@@ -381,6 +415,10 @@ class Store:
                 if name not in have:
                     self._db.execute('ALTER TABLE "%s" ADD COLUMN %s %s'
                                      % (table, name, decl))
+        # 邮箱唯一索引**必须放在补列之后**：老库在 `executescript(SCHEMA)` 时还没有
+        # `email` 列，索引写在 SCHEMA 里会让老库启动直接失败。
+        self._db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email"
+                         " ON users(email) WHERE email <> ''")
 
     # ---------------------------------------------------------------- 自检
 
@@ -985,23 +1023,27 @@ class Store:
 
     def create_user(self, user_id: str, *, name: str = "", employee_no: str = "",
                     phone: str = "", alipay_open_id: str = "",
-                    invite_code: str = "", status: str = "active") -> Dict[str, Any]:
-        """建一个账号。`employee_no`/`alipay_open_id` 撞唯一索引时抛 `ValueError`。
+                    invite_code: str = "", status: str = "active",
+                    email: str = "", email_verified_at: float = 0,
+                    password_hash: str = "", last_login: float = 0) -> Dict[str, Any]:
+        """建一个账号。`employee_no`/`email`/`alipay_open_id` 撞唯一索引时抛 `ValueError`。
 
-        调用方（`account.register()`）会先查重，但唯一索引才是并发下的权威 ——
-        两个请求同时用同一个工号注册时，先提交的那个赢，另一个必须拿到
-        `employee_no_taken` 而不是两行。
+        调用方会先查重，但唯一索引才是并发下的权威 —— 两个请求同时用同一个
+        邮箱注册时，先提交的那个赢，另一个必须拿到 `email_taken` 而不是两行。
         """
         now = time.time()
         try:
             with self._lock:
                 self._db.execute(
-                    "INSERT INTO users (user_id, name, employee_no, invite_code, phone,"
-                    " alipay_open_id, status, token_version, created_at, updated_at)"
-                    " VALUES (?,?,?,?,?,?,?,1,?,?)",
+                    "INSERT INTO users (user_id, name, employee_no, invite_code, email,"
+                    " email_verified_at, password_hash, last_login, phone, alipay_open_id,"
+                    " status, token_version, created_at, updated_at)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,1,?,?)",
                     (str(user_id), str(name or ""), str(employee_no or ""),
-                     str(invite_code or ""), str(phone or ""), str(alipay_open_id or ""),
-                     str(status or "active"), now, now))
+                     str(invite_code or ""), str(email or ""),
+                     float(email_verified_at or 0), str(password_hash or ""),
+                     float(last_login or 0), str(phone or ""),
+                     str(alipay_open_id or ""), str(status or "active"), now, now))
                 self._db.commit()
         except sqlite3.IntegrityError as exc:
             # **必须回滚**：`INSERT` 撞唯一索引后事务仍是打开的；不回滚的话，
@@ -1015,6 +1057,15 @@ class Store:
         with self._lock:
             row = self._db.execute("SELECT * FROM users WHERE user_id=?",
                                    (str(user_id or ""),)).fetchone()
+        return dict(row) if row else None
+
+    def user_by_email(self, email: str) -> Optional[Dict[str, Any]]:
+        """按**已归一化**邮箱查账号（调用方负责 `strip().lower()`）。"""
+        if not str(email or "").strip():
+            return None
+        with self._lock:
+            row = self._db.execute("SELECT * FROM users WHERE email=?",
+                                   (str(email).strip(),)).fetchone()
         return dict(row) if row else None
 
     def user_by_employee_no(self, employee_no: str) -> Optional[Dict[str, Any]]:
@@ -1071,6 +1122,202 @@ class Store:
             cur = self._db.execute("DELETE FROM users WHERE user_id=?", (str(user_id),))
             self._db.commit()
             return bool(cur.rowcount)
+
+    def set_user_password(self, user_id: str, password_hash: str,
+                          *, bump_token_version: bool = True) -> bool:
+        """写密码哈希（管理面兜底/未来改密用）。密码重置走事务版 `reset_user_password`。"""
+        with self._lock:
+            if bump_token_version:
+                cur = self._db.execute(
+                    "UPDATE users SET password_hash=?,"
+                    " token_version=token_version+1, updated_at=? WHERE user_id=?",
+                    (str(password_hash or ""), time.time(), str(user_id)))
+            else:
+                cur = self._db.execute(
+                    "UPDATE users SET password_hash=?, updated_at=? WHERE user_id=?",
+                    (str(password_hash or ""), time.time(), str(user_id)))
+            self._db.commit()
+            return bool(cur.rowcount)
+
+    def touch_user_login(self, user_id: str) -> None:
+        with self._lock:
+            self._db.execute("UPDATE users SET last_login=? WHERE user_id=?",
+                             (time.time(), str(user_id)))
+            self._db.commit()
+
+    def create_email_account(self, user_id: str, *, email: str, password_hash: str,
+                             name: str = "", invite_code: str = "",
+                             invite_required: bool = True,
+                             code_id: int = 0, max_attempts: int = 5,
+                             now: Optional[float] = None) -> str:
+        """邮箱注册的原子落库：插 user + 消费 invite + 消费 code 同一个事务。
+
+        返回 `"ok" | "email_taken" | "invite_invalid" | "code_invalid"`。
+        **任何一步不满足就整体回滚**，不会留下半成品账号、也不会白扣邀请码。
+        验证码哈希本身已在服务层比对通过，这里只做"仍然有效且未被用掉"的原子消费。
+        """
+        now = time.time() if now is None else float(now)
+        text_email = str(email or "").strip()
+        text_invite = str(invite_code or "").strip().upper()
+        with self._lock:
+            try:
+                self._db.execute("BEGIN IMMEDIATE")
+                if self._db.execute("SELECT user_id FROM users WHERE email=?",
+                                    (text_email,)).fetchone() is not None:
+                    self._db.rollback()
+                    return "email_taken"
+                if invite_required:
+                    cur = self._db.execute(
+                        "UPDATE invites SET used=used+1 WHERE code=?"
+                        " AND (expires_at=0 OR expires_at>?) AND used<max_uses",
+                        (text_invite, now))
+                    if cur.rowcount != 1:
+                        self._db.rollback()
+                        return "invite_invalid"
+                cur = self._db.execute(
+                    "UPDATE email_codes SET consumed_at=? WHERE id=? AND consumed_at=0"
+                    " AND expires_at>? AND attempts<?",
+                    (now, int(code_id or 0), now, max(1, int(max_attempts or 1))))
+                if cur.rowcount != 1:
+                    self._db.rollback()
+                    return "code_invalid"
+                self._db.execute(
+                    "INSERT INTO users (user_id, name, employee_no, invite_code, email,"
+                    " email_verified_at, password_hash, last_login, phone, alipay_open_id,"
+                    " status, token_version, created_at, updated_at)"
+                    " VALUES (?,?,?,?,?,?,?,0,'', '', 'active',1,?,?)",
+                    (str(user_id), str(name or ""), "",
+                     (text_invite if invite_required else ""),
+                     text_email, now, str(password_hash or ""), now, now))
+                self._db.commit()
+                return "ok"
+            except sqlite3.IntegrityError:
+                self._db.rollback()
+                return "email_taken"
+            except Exception:
+                self._db.rollback()
+                raise
+
+    def reset_user_password(self, user_id: str, password_hash: str, *,
+                            code_id: int, max_attempts: int = 5,
+                            now: Optional[float] = None) -> int:
+        """重置密码的原子落库：消费 code + 改 hash + token_version+1。
+
+        返回**新的 token_version**（>0 成功，0 = 码已被用掉/过期/账号停用）。
+        """
+        now = time.time() if now is None else float(now)
+        with self._lock:
+            try:
+                self._db.execute("BEGIN IMMEDIATE")
+                cur = self._db.execute(
+                    "UPDATE email_codes SET consumed_at=? WHERE id=? AND consumed_at=0"
+                    " AND expires_at>? AND attempts<?",
+                    (now, int(code_id or 0), now, max(1, int(max_attempts or 1))))
+                if cur.rowcount != 1:
+                    self._db.rollback()
+                    return 0
+                cur = self._db.execute(
+                    "UPDATE users SET password_hash=?, token_version=token_version+1,"
+                    " updated_at=? WHERE user_id=? AND status='active'",
+                    (str(password_hash or ""), now, str(user_id)))
+                if cur.rowcount != 1:
+                    self._db.rollback()
+                    return 0
+                row = self._db.execute("SELECT token_version FROM users WHERE user_id=?",
+                                       (str(user_id),)).fetchone()
+                self._db.commit()
+                return int(row["token_version"]) if row else 0
+            except Exception:
+                self._db.rollback()
+                raise
+
+    # ---------------------------------------------------------------- 邮箱验证码
+
+    def email_code_create(self, *, email: str, purpose: str, code_hash: str,
+                          expires_at: float, ip: str = "",
+                          now: Optional[float] = None) -> int:
+        """发新码：**同一个事务里**作废同邮箱同用途的旧码，再插新行。返回新行 id。"""
+        now = time.time() if now is None else float(now)
+        text_email = str(email or "").strip()
+        text_purpose = str(purpose or "").strip()
+        with self._lock:
+            try:
+                self._db.execute("BEGIN IMMEDIATE")
+                self._db.execute(
+                    "UPDATE email_codes SET consumed_at=? WHERE email=? AND purpose=?"
+                    " AND consumed_at=0", (now, text_email, text_purpose))
+                cur = self._db.execute(
+                    "INSERT INTO email_codes (email, purpose, code_hash, expires_at,"
+                    " attempts, created_at, ip, consumed_at) VALUES (?,?,?,?,0,?,?,0)",
+                    (text_email, text_purpose, str(code_hash or ""),
+                     float(expires_at or 0), now, str(ip or "")))
+                self._db.commit()
+                return int(cur.lastrowid or 0)
+            except Exception:
+                self._db.rollback()
+                raise
+
+    def email_code_latest(self, email: str, purpose: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self._db.execute(
+                "SELECT * FROM email_codes WHERE email=? AND purpose=?"
+                " AND consumed_at=0 ORDER BY created_at DESC, id DESC LIMIT 1",
+                (str(email or "").strip(), str(purpose or "").strip())).fetchone()
+        return dict(row) if row else None
+
+    def email_code_latest_any(self, email: str, purpose: str) -> Optional[Dict[str, Any]]:
+        """最近一条（含已消费/已作废）——只用于 60 秒重发冷却。"""
+        with self._lock:
+            row = self._db.execute(
+                "SELECT * FROM email_codes WHERE email=? AND purpose=?"
+                " ORDER BY created_at DESC, id DESC LIMIT 1",
+                (str(email or "").strip(), str(purpose or "").strip())).fetchone()
+        return dict(row) if row else None
+
+    def email_code_attempt(self, code_id: int, *, max_attempts: int = 5,
+                           now: Optional[float] = None) -> int:
+        """记一次错误尝试；到上限顺带作废。返回累计错误次数。"""
+        now = time.time() if now is None else float(now)
+        limit = max(1, int(max_attempts or 1))
+        with self._lock:
+            self._db.execute(
+                "UPDATE email_codes SET attempts=attempts+1,"
+                " consumed_at=CASE WHEN attempts+1>=? THEN ? ELSE consumed_at END"
+                " WHERE id=? AND consumed_at=0", (limit, now, int(code_id or 0)))
+            self._db.commit()
+            row = self._db.execute("SELECT attempts FROM email_codes WHERE id=?",
+                                   (int(code_id or 0),)).fetchone()
+        return int(row["attempts"]) if row else 0
+
+    def email_code_invalidate(self, code_id: int) -> bool:
+        with self._lock:
+            cur = self._db.execute(
+                "UPDATE email_codes SET consumed_at=? WHERE id=? AND consumed_at=0",
+                (time.time(), int(code_id or 0)))
+            self._db.commit()
+            return bool(cur.rowcount)
+
+    def email_code_count(self, *, email: str = "", ip: str = "", since: float) -> int:
+        """某邮箱/某 IP 在窗口内发过多少条码（含已用掉的，防止刷发信）。"""
+        clauses, args = ["created_at>=?"], [float(since)]
+        if email:
+            clauses.append("email=?")
+            args.append(str(email).strip())
+        if ip:
+            clauses.append("ip=?")
+            args.append(str(ip))
+        with self._lock:
+            row = self._db.execute(
+                "SELECT COUNT(*) AS n FROM email_codes WHERE " + " AND ".join(clauses),
+                tuple(args)).fetchone()
+        return int(row["n"] if row else 0)
+
+    def prune_email_codes(self, before: float) -> int:
+        with self._lock:
+            cur = self._db.execute("DELETE FROM email_codes WHERE created_at<?",
+                                   (float(before),))
+            self._db.commit()
+            return int(cur.rowcount or 0)
 
     # ---------------------------------------------------------------- 设备绑定
 

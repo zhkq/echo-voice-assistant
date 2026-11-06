@@ -25,6 +25,7 @@ from server import payment as payment_mod                        # noqa: E402
 from server import quota as quota_mod                            # noqa: E402
 from server import ratelimit                                     # noqa: E402
 from server import settings as settings_mod                      # noqa: E402
+from tests.account_test_helpers import put_email_code            # noqa: E402
 from tests.test_server_contract import _cfg, _fake_loader, _wav_bytes  # noqa: E402
 
 
@@ -38,6 +39,8 @@ def _billing_cfg(tmp, **over):
     cfg.raw["auth"]["clock_skew_s"] = 0
     cfg.raw["billing"]["timezone"] = "Asia/Shanghai"
     cfg.raw["server"]["state_root"] = os.path.join(tmp, "state")
+    cfg.raw["account"]["email"]["enabled"] = True
+    cfg.raw["account"]["email"]["provider"] = "dev"
     for key, value in over.items():
         cfg.raw[key] = value
     return cfg
@@ -87,16 +90,24 @@ class _BillingCase(unittest.TestCase):
     def uh(self, token):
         return {"Authorization": "Bearer " + token}
 
-    def register(self, employee_no="E001"):
+    def register(self, label="E001"):
+        """用邮箱验证码注册一个测试账号（label 只用来生成唯一邮箱）。"""
+        email = "%s@example.com" % str(label).lower()
+        put_email_code(self.store, email, "register", "123456")
         r = self.client.post("/v1/account/register",
-                             json={"inviteCode": "INVITE-1", "name": "张三",
-                                   "employeeNo": employee_no})
+                             json={"email": email, "code": "123456",
+                                   "password": "Passw0rd", "inviteCode": "INVITE-1"})
         self.assertEqual(r.status_code, 200, r.text)
         return r.json()
 
-    def create_paid_client(self, employee_no="E001", plan="monthly"):
+    def uid(self, label="E001"):
+        user = self.store.user_by_email("%s@example.com" % str(label).lower())
+        self.assertIsNotNone(user, "测试账号不存在：%s" % label)
+        return user["user_id"]
+
+    def create_paid_client(self, label="E001", plan="monthly"):
         """注册 → 下单 → Mock 付款 → 兑换配对码 → (userToken, clientHeaders, orderId)。"""
-        user = self.register(employee_no)
+        user = self.register(label)
         token = user["userToken"]
         r = self.client.post("/v1/billing/orders", json={"planCode": plan},
                              headers=self.uh(token))
@@ -254,12 +265,12 @@ class MockPaymentTests(_BillingCase):
         self.assertEqual(first.status_code, 200, first.text)
         self.assertFalse(first.json()["duplicate"])
         paid_until = self.store.entitlement(
-            self.store.user_by_employee_no("E001")["user_id"])["paid_until"]
+            self.uid())["paid_until"]
         second = self.client.post("/v1/billing/mock/notify", json=payload)
         self.assertEqual(second.status_code, 200, second.text)
         self.assertTrue(second.json()["duplicate"])
         again = self.store.entitlement(
-            self.store.user_by_employee_no("E001")["user_id"])["paid_until"]
+            self.uid())["paid_until"]
         self.assertEqual(paid_until, again, "重复回调不该再延一次")
 
     def test_a_tampered_amount_is_refused(self):
@@ -274,7 +285,7 @@ class MockPaymentTests(_BillingCase):
 
     def test_renewal_stacks_from_paid_until(self):
         token, _headers, _oid = self.create_paid_client()
-        uid = self.store.user_by_employee_no("E001")["user_id"]
+        uid = self.uid()
         first = self.store.entitlement(uid)["paid_until"]
         r = self.client.post("/v1/billing/orders", json={"planCode": "monthly"},
                              headers=self.uh(token))
@@ -296,14 +307,14 @@ class MockPaymentTests(_BillingCase):
         self.assertEqual(r.status_code, 200, r.text)
         self.assertEqual(self.store.order(order_id)["status"], "paying")
         self.assertEqual(
-            self.store.entitlement(self.store.user_by_employee_no("E001")["user_id"])
+            self.store.entitlement(self.uid())
             ["plan_code"], "trial")
 
 
 class EntitlementGateTests(_BillingCase):
     def test_an_expired_entitlement_returns_402_and_renewal_restores_it(self):
         token, headers, _oid = self.create_paid_client()
-        uid = self.store.user_by_employee_no("E001")["user_id"]
+        uid = self.uid()
         row = dict(self.store.entitlement(uid))
         row["paid_until"] = time.time() - 86400
         self.store.upsert_entitlement(row)
@@ -334,7 +345,7 @@ class EntitlementGateTests(_BillingCase):
 
     def test_the_daily_quota_is_counted_per_account(self):
         token, headers, _oid = self.create_paid_client()
-        uid = self.store.user_by_employee_no("E001")["user_id"]
+        uid = self.uid()
         row = dict(self.store.entitlement(uid))
         row["daily_audio_minutes"] = 0.01          # 0.6 秒
         row["qps"] = 1000                          # 这一条测日额度，别让 1 QPS 先挡
@@ -358,7 +369,7 @@ class EntitlementGateTests(_BillingCase):
 
     def test_a_second_device_hits_the_account_level_concurrency_gate(self):
         token, headers, _oid = self.create_paid_client()
-        uid = self.store.user_by_employee_no("E001")["user_id"]
+        uid = self.uid()
         with self.svc.concurrency.hold(uid, 1):
             r = self.asr(headers)
         self.assertEqual(r.status_code, 409, r.text)
@@ -374,12 +385,12 @@ class EntitlementGateTests(_BillingCase):
         r = self.asr(headers)
         self.assertEqual(r.status_code, 402)
         status = self.store.entitlement(
-            self.store.user_by_employee_no("E001")["user_id"])["status"]
+            self.uid())["status"]
         self.assertEqual(status, "refunded")
 
     def test_internal_is_never_downgraded_by_a_purchase(self):
         token, headers, _oid = self.create_paid_client()
-        uid = self.store.user_by_employee_no("E001")["user_id"]
+        uid = self.uid()
         self.svc.adjust_entitlement(uid, {"action": "internal"})
         self.assertEqual(self.store.entitlement(uid)["plan_code"], "internal")
         self.assertEqual(self.store.entitlement(uid)["paid_until"], 0.0)
@@ -460,9 +471,12 @@ class AlipayModeTests(unittest.TestCase):
                 with TestClient(app) as client:
                     store = app.state.echo.auth.store
                     store.put_invite("INV", max_uses=5)
+                    put_email_code(store, "e001@example.com", "register", "123456")
                     user = client.post("/v1/account/register",
-                                       json={"inviteCode": "INV", "name": "张三",
-                                             "employeeNo": "E001"}).json()
+                                       json={"email": "e001@example.com",
+                                             "code": "123456",
+                                             "password": "Passw0rd",
+                                             "inviteCode": "INV"}).json()
                     # Mock 支付端点**不存在**（不是"存在但拒绝"）
                     r = client.post("/v1/billing/mock/pay/ord-x", json={})
                     self.assertEqual(r.status_code, 404)
@@ -516,7 +530,7 @@ class AdminBillingTests(_BillingCase):
 
     def test_the_admin_can_extend_and_freeze_an_entitlement(self):
         _token, cap_headers, _oid = self.create_paid_client()
-        uid = self.store.user_by_employee_no("E001")["user_id"]
+        uid = self.uid()
         before = self.store.entitlement(uid)["paid_until"]
         ac = self.admin_app()
         r = ac.post("/admin/api/billing/entitlements/%s/adjust" % uid,
@@ -533,7 +547,7 @@ class AdminBillingTests(_BillingCase):
 
     def test_the_admin_can_reset_all_devices(self):
         _token, headers, _oid = self.create_paid_client()
-        uid = self.store.user_by_employee_no("E001")["user_id"]
+        uid = self.uid()
         ac = self.admin_app()
         r = ac.post("/admin/api/account/users/%s/reset-devices" % uid,
                     json={"confirm": uid}, headers=self.wh())
@@ -560,7 +574,7 @@ class TtsBillingTests(_BillingCase):
 
     def test_tts_chars_are_metered_and_the_daily_cap_is_enforced(self):
         token, headers, _oid = self.create_paid_client()
-        uid = self.store.user_by_employee_no("E001")["user_id"]
+        uid = self.uid()
         row = dict(self.store.entitlement(uid))
         row["tts_chars"] = 10
         row["qps"] = 1000
@@ -589,7 +603,7 @@ class TtsBillingTests(_BillingCase):
 
     def test_tts_does_not_consume_the_asr_minute_quota(self):
         _token, headers, _oid = self.create_paid_client()
-        uid = self.store.user_by_employee_no("E001")["user_id"]
+        uid = self.uid()
         self._patch_synth()
         before = self.state.user_quota.used_minutes(uid)
         r = self.client.post("/v1/tts", json={"text": "hello"}, headers=headers)
@@ -598,7 +612,7 @@ class TtsBillingTests(_BillingCase):
 
     def test_an_expired_account_gets_402_before_spending_tts(self):
         token, headers, _oid = self.create_paid_client()
-        uid = self.store.user_by_employee_no("E001")["user_id"]
+        uid = self.uid()
         row = dict(self.store.entitlement(uid))
         row["paid_until"] = time.time() - 86400
         self.store.upsert_entitlement(row)
@@ -645,14 +659,14 @@ class PaymentAtomicityTests(_BillingCase):
         self.assertEqual(r.status_code, 404, r.text)
         self.assertEqual(self.store.order(order_id)["status"], "paying")
         self.assertIsNone(self.store.entitlement(
-            self.store.user_by_employee_no("E001")["user_id"]))
+            self.uid()))
         # 恢复套餐后重投同一笔 → 正常入账（不会"永远 duplicate"）。
         self.svc.seed()
         r = self.client.post("/v1/billing/mock/pay/" + order_id, json={})
         self.assertEqual(r.status_code, 200, r.text)
         self.assertEqual(self.store.order(order_id)["status"], "paid")
         self.assertIsNotNone(self.store.entitlement(
-            self.store.user_by_employee_no("E001")["user_id"]))
+            self.uid()))
         self.assertIn("fulfilled", json.loads(self.store.order(order_id)["meta"]))
 
     def test_duplicate_callback_repairs_a_missing_entitlement(self):
@@ -663,7 +677,7 @@ class PaymentAtomicityTests(_BillingCase):
         self.store.update_order(order_id, status="paid", paid_at=now,
                                 alipay_trade_no="trade-repair", meta="{}")
         self.store.record_notify("trade-repair", order_id)
-        uid = self.store.user_by_employee_no("E001")["user_id"]
+        uid = self.uid()
         self.assertIsNone(self.store.entitlement(uid))
         r = self.client.post("/v1/billing/mock/notify",
                              json={"outTradeNo": order_id, "tradeNo": "trade-repair"})
@@ -689,7 +703,7 @@ class PaymentAtomicityTests(_BillingCase):
         self.assertEqual(r.status_code, 200, r.text)
         self.assertEqual(self.store.order(order_id)["status"], "paid")
         self.assertIsNotNone(self.store.entitlement(
-            self.store.user_by_employee_no("E001")["user_id"]))
+            self.uid()))
         self.assertEqual(self.store.notify_record("T-EDGE")["status"], "paid")
 
     def test_a_late_payment_on_a_closed_order_is_recorded_for_reconciliation(self):
@@ -729,7 +743,7 @@ class PaymentAtomicityTests(_BillingCase):
             t.join(timeout=10)
         self.assertEqual(errors_seen, [])
         self.assertEqual(len(results), 2)
-        uid = self.store.user_by_employee_no("E001")["user_id"]
+        uid = self.uid()
         ent = self.store.entitlement(uid)
         self.assertIsNotNone(ent)
         self.assertAlmostEqual(ent["paid_until"], time.time() + 30 * 86400, delta=120)
@@ -770,7 +784,7 @@ class RefundRecomputeTests(_BillingCase):
                                   headers=self.uh(token)).json()["orderId"]
         self.assertEqual(self.client.post("/v1/billing/mock/pay/" + second,
                                           json={}).status_code, 200)
-        uid = self.store.user_by_employee_no("E001")["user_id"]
+        uid = self.uid()
         self.assertEqual(self.svc.refund_order(first)["status"], "refunded")
         ent = self.store.entitlement(uid)
         self.assertEqual(ent["status"], "active")
@@ -797,8 +811,10 @@ class RenewalRuleTests(_BillingCase):
             "max_devices": 3, "max_concurrent": 1, "active": 1, "sort": 30,
         })
 
-    def uid(self, employee_no="E001"):
-        return self.store.user_by_employee_no(employee_no)["user_id"]
+    def uid(self, label="E001"):
+        user = self.store.user_by_email("%s@example.com" % str(label).lower())
+        self.assertIsNotNone(user, "测试账号不存在：%s" % label)
+        return user["user_id"]
 
     def test_early_renewal_projection_matches_the_actual_expiry(self):
         token, _headers, _first = self.create_paid_client()
@@ -984,7 +1000,7 @@ class RenewalRuleTests(_BillingCase):
 class BillingHardeningTests(_BillingCase):
     def test_a_disabled_user_does_not_fall_back_to_the_legacy_free_path(self):
         _token, headers, _oid = self.create_paid_client()
-        uid = self.store.user_by_employee_no("E001")["user_id"]
+        uid = self.uid()
         self.store.update_user(uid, status="disabled")
         r = self.asr(headers)
         self.assertEqual(r.status_code, 403, r.text)
@@ -1138,7 +1154,7 @@ class Phase3OrderFlowTests(_BillingCase):
                                  headers=self.uh(token))
         self.assertEqual(r.status_code, 200, r.text)
         self.assertEqual(r.json()["status"], "paid")
-        uid = self.store.user_by_employee_no("E001")["user_id"]
+        uid = self.uid()
         ent = self.store.entitlement(uid)
         self.assertIsNotNone(ent)
         self.assertEqual(ent["status"], "active")

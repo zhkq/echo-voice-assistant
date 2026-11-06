@@ -206,6 +206,34 @@ DEFAULTS: Dict[str, Any] = {
     "invite": {
         "required": True,
     },
+    # ---------------------------------------------------------------- 邮箱账号（2026-11-06，issue #15）
+    # 邮箱即账号：注册需要邀请码 + 邮箱验证码 + 密码，登录用邮箱+密码。
+    # **出厂关**：没配 SMTP 时服务照常启动，邮箱注册/发码/重置明确回 503；
+    # 已经注册的邮箱账号仍可登录（`enabled` 只管发信相关流程）。
+    "account": {
+        "email": {
+            "enabled": False,
+            "provider": "dev",           # dev | smtp（api 预留，本轮未实现）
+            "from": "",
+            "from_name": "ECHO",
+            "code_ttl_s": 600,           # 验证码 10 分钟
+            "resend_cooldown_s": 60,     # 60 秒重发冷却
+            "max_per_email_hour": 5,
+            "max_per_ip_hour": 20,
+            "max_attempts": 5,           # 错 5 次作废
+            "send_timeout_s": 10,
+            "send_retries": 1,           # 只对连接/超时/断开重试
+            "smtp": {
+                "host": "",
+                "port": 465,
+                "mode": "ssl",           # ssl | starttls | plain（plain 只允许本机）
+                "username": "",
+                # **凭据只从环境变量/文件读**：这里只存"变量名"，不存密码本身。
+                "password_env": "ECHO_SMTP_PASSWORD",
+                "password_file": "",
+            },
+        },
+    },
     "payment": {
         # disabled | mock | alipay。**默认 disabled**：没配支付时服务能起来，
         # 下单接口明确回 503 `payment_unconfigured`，绝不静默降级成 Mock。
@@ -385,7 +413,70 @@ def _env_overrides() -> dict:
     invite = _env_bool("ECHO_INVITE_REQUIRED")
     if invite is not None:
         out.setdefault("invite", {})["required"] = invite
+    # ---------------------------------------------------------------- 邮箱账号（2026-11-06）
+    email_enabled = _env_bool("ECHO_EMAIL_ENABLED")
+    if email_enabled is not None:
+        out.setdefault("account", {}).setdefault("email", {})["enabled"] = email_enabled
+    if os.environ.get("ECHO_EMAIL_PROVIDER"):
+        out.setdefault("account", {}).setdefault("email", {})["provider"] = \
+            str(os.environ["ECHO_EMAIL_PROVIDER"]).strip().lower()
+    if os.environ.get("ECHO_EMAIL_FROM"):
+        out.setdefault("account", {}).setdefault("email", {})["from"] = \
+            os.environ["ECHO_EMAIL_FROM"]
+    if os.environ.get("ECHO_SMTP_HOST"):
+        out.setdefault("account", {}).setdefault("email", {}).setdefault(
+            "smtp", {})["host"] = os.environ["ECHO_SMTP_HOST"]
+    if os.environ.get("ECHO_SMTP_PORT"):
+        try:
+            out.setdefault("account", {}).setdefault("email", {}).setdefault(
+                "smtp", {})["port"] = int(os.environ["ECHO_SMTP_PORT"])
+        except (TypeError, ValueError):
+            pass
+    if os.environ.get("ECHO_SMTP_MODE"):
+        out.setdefault("account", {}).setdefault("email", {}).setdefault(
+            "smtp", {})["mode"] = str(os.environ["ECHO_SMTP_MODE"]).strip().lower()
+    if os.environ.get("ECHO_SMTP_USERNAME"):
+        out.setdefault("account", {}).setdefault("email", {}).setdefault(
+            "smtp", {})["username"] = os.environ["ECHO_SMTP_USERNAME"]
+    # **只读文件路径**：密码本身绝不进 cfg.raw（由 `smtp_password()` 按需读）。
+    if os.environ.get("ECHO_SMTP_PASSWORD_FILE"):
+        out.setdefault("account", {}).setdefault("email", {}).setdefault(
+            "smtp", {})["password_file"] = os.environ["ECHO_SMTP_PASSWORD_FILE"]
     return out
+
+
+#: SMTP 口令的默认环境变量名（也可以由 `account.email.smtp.password_env` 改成别的名字）。
+DEFAULT_SMTP_PASSWORD_ENV = "ECHO_SMTP_PASSWORD"
+DEFAULT_SMTP_PASSWORD_FILE_ENV = "ECHO_SMTP_PASSWORD_FILE"
+
+
+def smtp_password(cfg) -> str:
+    """**按需**读取 SMTP 密码：文件路径优先，其次环境变量。
+
+    刻意不放进 `cfg.raw`：配置对象会被日志/排障打印，而 secret 一旦进去就很难收回。
+    `password_file`（配置或 `ECHO_SMTP_PASSWORD_FILE`）读不到时返回空串，
+    由 `EmailSender` 报 `email_unconfigured`，不静默用空密码去连。
+    """
+    path = ""
+    try:
+        path = str(cfg.get("account.email.smtp.password_file", "") or "").strip()
+    except Exception:
+        path = ""
+    if not path:
+        path = str(os.environ.get(DEFAULT_SMTP_PASSWORD_FILE_ENV, "") or "").strip()
+    if path:
+        try:
+            with open(path, encoding="utf-8") as fh:
+                return fh.read().strip()
+        except OSError:
+            return ""
+    env_name = ""
+    try:
+        env_name = str(cfg.get("account.email.smtp.password_env", "") or "").strip()
+    except Exception:
+        env_name = ""
+    env_name = env_name or DEFAULT_SMTP_PASSWORD_ENV
+    return str(os.environ.get(env_name, "") or "")
 
 
 @dataclass
