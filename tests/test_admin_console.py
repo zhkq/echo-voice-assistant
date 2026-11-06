@@ -97,10 +97,16 @@ WRITE_ENDPOINTS = {
     "/admin/api/billing/plans",
     "/admin/api/billing/plans/{code}",
     "/admin/api/billing/orders/{order_id}/refund",
+    # 2026-11-06 管理面重设计：主动查询 + 账号冻结/恢复 + 单设备解绑。
+    # 三条都走 `as_write`（会话 + 同站 Origin + X-ECHO-Admin + CSRF + 审计）；
+    # 冻结/解绑还要求 `confirm`（值 = 目标 id）。
+    "/admin/api/billing/orders/{order_id}/sync",
     "/admin/api/billing/entitlements/{user_id}/adjust",
     "/admin/api/account/invites",
     "/admin/api/account/invites/{code}",
     "/admin/api/account/users/{user_id}/reset-devices",
+    "/admin/api/account/users/{user_id}/status",
+    "/admin/api/account/users/{user_id}/devices/{client_id}/revoke",
 }
 
 
@@ -1960,7 +1966,9 @@ class PerfPageTests(_AdminCase):
         for cid in ("chart-gpu", "chart-vram", "chart-cpu", "chart-ram"):
             with self.subTest(chart=cid):
                 self.assertIn('id="%s"' % cid, html)
-        self.assertEqual(html.count("<svg"), 4, "性能页签要正好 4 张折线图")
+        # 页面里还有一份内联图标 sprite（也是 `<svg>`），所以按图表的 id 数，
+        # 比数 `<svg>` 更精确：这里要的仍然是"正好 4 张折线图"。
+        self.assertEqual(html.count('id="chart-'), 4, "性能页签要正好 4 张折线图")
 
     def test_the_four_charts_are_a_two_column_grid(self):
         compact = self._html().replace(" ", "")
@@ -2695,10 +2703,15 @@ class BillingConsoleReviewTests(_AdminCase):
         "/admin/api/billing/orders",
         "/admin/api/billing/orders/ord-nope",
         "/admin/api/billing/notifies",
+        "/admin/api/billing/notifies/T-NOPE",
         "/admin/api/billing/entitlements",
         "/admin/api/account/users",
         "/admin/api/account/users/usr-nope",
         "/admin/api/account/invites",
+        # 2026-11-06 管理面重设计新增的只读端点。
+        "/admin/api/dashboard",
+        "/admin/api/audit",
+        "/admin/api/system",
     )
 
     def test_billing_read_endpoints_refuse_without_login(self):
@@ -2716,6 +2729,9 @@ class BillingConsoleReviewTests(_AdminCase):
              {"action": "extend", "days": 30}),
             ("post", "/admin/api/account/users/usr-nope/reset-devices", {}),
             ("delete", "/admin/api/account/invites/NOPE", {}),
+            # 管理面重设计新增的两个危险动作。
+            ("post", "/admin/api/account/users/usr-nope/status", {"status": "disabled"}),
+            ("post", "/admin/api/account/users/usr-nope/devices/cli-nope/revoke", {}),
         )
         for method, path, body in calls:
             with self.subTest(path=path):
@@ -2727,7 +2743,8 @@ class BillingConsoleReviewTests(_AdminCase):
                 self.assertIn("confirm", r.json()["detail"])
         actions = {a for _who, a, _t in self.audit_rows()}
         for want in ("billing-refund.failed", "billing-entitlement-adjust.failed",
-                     "billing-reset-devices.failed", "billing-invite-delete.failed"):
+                     "billing-reset-devices.failed", "billing-invite-delete.failed",
+                     "account-user-status.failed", "account-device-revoke.failed"):
             self.assertIn(want, actions)
 
     def test_a_conflict_notify_is_visible_for_reconciliation(self):

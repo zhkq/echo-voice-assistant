@@ -90,7 +90,7 @@ import os
 import re
 import secrets
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -443,6 +443,147 @@ def create_admin_app(cfg, state, *, perf=None) -> FastAPI:
             "metrics": snap,
             "calls": (state.call_log.stats() if state.call_log is not None else {}),
             "sessions": sessions.count(),
+        }
+
+    @api.get("/dashboard")
+    def dashboard(request: Request):
+        """「概览」聚合：收入/订单/用户/到期/支付异常/最近动态。
+
+        全部是**读**；金额/订单的自然日口径在服务端算（`billing.day_start`），
+        页面不自己划日界。
+        """
+        current_admin(request)
+        svc = billing_svc()
+        store = store_of()
+        now = time.time()
+        day_start_ts = billing_mod.day_start(cfg, now)
+        ov = svc.overview()
+        users = store.users()
+        user_map = {str(u.get("user_id") or ""): u for u in users}
+        orders = store.orders(limit=1000)
+        paid_today = [o for o in orders
+                      if str(o.get("status") or "") == "paid"
+                      and float(o.get("paid_at") or 0) >= day_start_ts]
+        created_today = [o for o in orders
+                         if float(o.get("created_at") or 0) >= day_start_ts]
+        notifies = store.notify_records(500)
+        conflicts = [n for n in notifies
+                     if str(n.get("status") or "") == "conflict"]
+        unverified = [n for n in notifies if not bool(n.get("verified"))]
+        ents = []
+        active_ent = 0
+        for row in store.entitlements():
+            uid = str(row.get("user_id") or "")
+            block = svc.entitlement_summary(uid)
+            if str(block.get("status") or "") in ("active", "frozen"):
+                if str(block.get("status") or "") == "active":
+                    active_ent += 1
+            until = float(block.get("paidUntil") or 0)
+            if 0 < until - now <= 7 * 86400:
+                user = user_map.get(uid) or {}
+                ents.append({
+                    "userId": uid, "name": str(user.get("name") or ""),
+                    "email": str(user.get("email") or ""),
+                    "planName": str(block.get("planName") or ""),
+                    "paidUntil": until,
+                    "daysLeft": max(0, int((until - now) // 86400)),
+                })
+        ents.sort(key=lambda x: x["paidUntil"])
+
+        def order_brief(o):
+            view = svc.order_view(o, with_pair_url=False)
+            user = user_map.get(str(o.get("user_id") or "")) or {}
+            view["userId"] = str(o.get("user_id") or "")
+            view["tradeNo"] = str(o.get("alipay_trade_no") or "")
+            view["userName"] = str(user.get("name") or "")
+            view["userEmail"] = str(user.get("email") or "")
+            return view
+
+        recent_orders = [order_brief(o) for o in orders[:5]]
+        recent_users = []
+        for user in users[-5:][::-1]:
+            item = _public_user_view(user)
+            item["entitlement"] = svc.entitlement_summary(str(user.get("user_id") or ""))
+            recent_users.append(item)
+        gateway = svc.gateway
+        return {
+            "revenueCentsToday": int(ov.get("revenueCentsToday") or 0),
+            "revenueCentsTotal": int(ov.get("revenueCentsTotal") or 0),
+            "ordersToday": len(created_today),
+            "ordersPaidToday": len(paid_today),
+            "ordersTotal": int(ov.get("orders") or 0),
+            "byStatus": ov.get("byStatus") or {},
+            "usersTotal": len(users),
+            "usersActive": sum(1 for u in users
+                               if str(u.get("status") or "") == "active"),
+            "activeUsers24h": store.active_users_since(now - 86400),
+            "entitlementsActive": active_ent,
+            "expiringIn7Days": len(ents),
+            "conflicts": len(conflicts),
+            "unverifiedNotifies": len(unverified),
+            "recentOrders": recent_orders,
+            "recentUsers": recent_users,
+            "expiring": ents[:5],
+            "billing": {
+                "enabled": bool(svc.enabled),
+                "provider": str(svc.provider),
+                "gatewayConfigured": bool(getattr(gateway, "configured", False)),
+                "sandbox": bool(getattr(gateway, "sandbox", False)),
+                "notifyUrl": str(getattr(gateway, "notify_url", "") or ""),
+                "effectiveGating": bool(svc.effective_gating),
+            },
+            "server": {
+                "version": __version__,
+                "uptimeSeconds": int(now - state.started),
+            },
+            "generatedAt": now,
+        }
+
+    @api.get("/audit")
+    def audit_log(request: Request, q: str = "", action: str = "",
+                  admin: str = "", result: str = "", since: float = 0,
+                  until: float = 0, limit: int = 100, offset: int = 0):
+        """管理动作审计：筛选 + 分页（失败动作名带 `.failed`）。"""
+        current_admin(request)
+        rows, total = store_of().audit_records(
+            q=q, action=action, admin=admin, result=result,
+            since=_ts_param(since), until=_ts_param(until),
+            limit=limit, offset=offset)
+        return {"rows": rows, "total": total, "q": q, "action": action,
+                "admin": admin, "result": result, "since": _ts_param(since),
+                "until": _ts_param(until), "limit": _page_int(limit, 100, 500),
+                "offset": _page_offset(offset)}
+
+    @api.get("/system")
+    def system_status(request: Request):
+        """只读系统状态：**白名单字段，绝不返回任何密钥/凭据**。"""
+        current_admin(request)
+        svc = billing_svc()
+        gateway = svc.gateway
+        try:
+            adv = advertised_mod.view(cfg, store_of(), scheme_hint=request.url.scheme)
+        except Exception:                                       # pragma: no cover - 兜底
+            adv = {"error": "读不到对外公布地址"}
+        return {
+            "server": {
+                "id": str(cfg.get("server.id", "")),
+                "version": __version__,
+                "uptimeSeconds": int(time.time() - state.started),
+                "listen": str(cfg.get("server.listen", "")),
+                "tls": bool(str(cfg.get("server.tls.certfile", "") or "")),
+            },
+            "billing": {
+                "enabled": bool(svc.enabled),
+                "provider": str(svc.provider),
+                "gatewayConfigured": bool(getattr(gateway, "configured", False)),
+                "sandbox": bool(getattr(gateway, "sandbox", False)),
+                "notifyUrl": str(getattr(gateway, "notify_url", "") or ""),
+                "effectiveGating": bool(svc.effective_gating),
+            },
+            "advertised": adv,
+            "sessions": sessions.count(),
+            "stateRoot": str(getattr(cfg, "state_root", "") or ""),
+            "tmpRoot": str(cfg.get("tmp.root", "") or ""),
         }
 
     @api.get("/models")
@@ -1003,7 +1144,13 @@ def create_admin_app(cfg, state, *, perf=None) -> FastAPI:
     def billing_plans(request: Request):
         current_admin(request)
         svc = billing_svc()
-        return {"plans": [billing_mod.plan_view(p) for p in svc.plans(active_only=False)]}
+        return {"plans": [billing_mod.plan_view(p) for p in svc.plans(active_only=False)],
+                "rules": {
+                    "renewalRule": billing_mod.RENEWAL_RULE,
+                    "planChangeRule": billing_mod.PLAN_CHANGE_RULE,
+                    "refundRule": billing_mod.REFUND_RULE,
+                    "autoRenew": billing_mod.AUTO_RENEW_ENABLED,
+                }}
 
     @api.post("/billing/plans")
     async def billing_plan_set(request: Request):
@@ -1069,33 +1216,65 @@ def create_admin_app(cfg, state, *, perf=None) -> FastAPI:
                         confirm=payload)
 
     @api.get("/billing/orders")
-    def billing_orders(request: Request, status: str = "", userId: str = "",
-                       limit: int = 200):
+    def billing_orders(request: Request, q: str = "", status: str = "",
+                       userId: str = "", since: float = 0, until: float = 0,
+                       limit: int = 200, offset: int = 0):
+        """订单搜索/筛选/分页。
+
+        `q` 命中订单号 / 支付宝 tradeNo / userId；姓名 / 邮箱由 `users` 先查
+        user_id 再带进来（不在 SQL 里假设 `users.email` 一定存在）。
+        """
         current_admin(request)
         svc = billing_svc()
-        rows = svc.store.orders(status=status, user_id=userId, limit=limit)
+        user_ids = _matching_user_ids(svc.store, q) if q else []
+        rows, total = svc.store.search_orders(
+            q=q, status=status, user_id=userId, user_ids=user_ids,
+            since=_ts_param(since), until=_ts_param(until),
+            limit=limit, offset=offset)
+        users = {str(u.get("user_id") or ""): u for u in svc.store.users()}
         out = []
         for row in rows:
             # 管理面列表**只读**（pairUrl 可能触发补发码/写库）
             view = svc.order_view(row, with_pair_url=False)
-            view["userId"] = str(row.get("user_id") or "")
+            uid = str(row.get("user_id") or "")
+            user = users.get(uid) or {}
+            view["userId"] = uid
             view["tradeNo"] = str(row.get("alipay_trade_no") or "")
+            view["userName"] = str(user.get("name") or "")
+            view["userEmail"] = str(user.get("email") or "")
             out.append(view)
-        return {"orders": out, "status": status, "userId": userId}
+        return {"orders": out, "total": total, "q": q, "status": status,
+                "userId": userId, "since": _ts_param(since),
+                "until": _ts_param(until), "limit": _page_int(limit, 200, 200),
+                "offset": _page_offset(offset)}
 
     @api.get("/billing/notifies")
-    def billing_notifies(request: Request):
-        """支付回调（含 conflict）：迟到支付/对账用。"""
+    def billing_notifies(request: Request, q: str = "", status: str = "",
+                         verified: Optional[bool] = None, since: float = 0,
+                         until: float = 0, limit: int = 200, offset: int = 0):
+        """支付回调（含 conflict）：迟到支付/对账用。
+
+        列表里的 `raw` 截断到 300 字；完整原文走 `/billing/notifies/{trade_no}`。
+        """
         current_admin(request)
-        rows = store_of().notify_records(100)
-        return {"notifies": [{
-            "tradeNo": str(r.get("trade_no") or ""),
-            "orderId": str(r.get("order_id") or ""),
-            "status": str(r.get("status") or ""),
-            "verified": bool(r.get("verified")),
-            "at": float(r.get("at") or 0),
-            "raw": str(r.get("raw") or ""),
-        } for r in rows]}
+        rows, total = store_of().search_notifies(
+            q=q, status=status, verified=verified,
+            since=_ts_param(since), until=_ts_param(until),
+            limit=limit, offset=offset)
+        return {"notifies": [_notify_view(r, raw_limit=300) for r in rows],
+                "total": total, "q": q, "status": status,
+                "verified": verified, "since": _ts_param(since),
+                "until": _ts_param(until), "limit": _page_int(limit, 200, 200),
+                "offset": _page_offset(offset)}
+
+    @api.get("/billing/notifies/{trade_no}")
+    def billing_notify_detail(request: Request, trade_no: str):
+        """一条支付回调的完整原文（只读；管理面对账用）。"""
+        current_admin(request)
+        row = store_of().notify_record(trade_no)
+        if row is None:
+            raise errors.bad_request("没有这条支付回调")
+        return _notify_view(row)
 
     @api.get("/billing/orders/{order_id}")
     def billing_order_detail(request: Request, order_id: str):
@@ -1105,9 +1284,15 @@ def create_admin_app(cfg, state, *, perf=None) -> FastAPI:
         if row is None:
             raise errors.order_not_found(order_id)
         view = svc.order_view(row, with_pair_url=False)
-        view["userId"] = str(row.get("user_id") or "")
+        uid = str(row.get("user_id") or "")
+        user = svc.store.user(uid) or {}
+        view["userId"] = uid
+        view["userName"] = str(user.get("name") or "")
+        view["userEmail"] = str(user.get("email") or "")
         view["tradeNo"] = str(row.get("alipay_trade_no") or "")
         view["events"] = svc.store.order_events(order_id)
+        view["notifies"] = [_notify_view(r, raw_limit=300)
+                            for r in svc.store.notifies_for_order(order_id)]
         return view
 
     @api.post("/billing/orders/{order_id}/refund")
@@ -1119,13 +1304,56 @@ def create_admin_app(cfg, state, *, perf=None) -> FastAPI:
                             order_id, reason=str(payload.get("reason") or "").strip()),
                         confirm=payload)
 
+    @api.post("/billing/orders/{order_id}/sync")
+    async def billing_order_sync(request: Request, order_id: str):
+        """管理员主动向支付宝查询一笔订单（回调丢失/迟到时的兜底）。
+
+        只对 `created/paying` 发查询；终态订单直接回库视图、不重复入账。
+        与用户侧 `/v1/billing/orders/{id}/sync` 共用同一段 `sync_order()`。
+        """
+        await body_of(request)
+        def fn(who):
+            svc = billing_svc()
+            row = svc.store.order(order_id)
+            if row is None:
+                raise errors.order_not_found(order_id)
+            before = str(row.get("status") or "")
+            if before in ("paid", "refunded", "closed"):
+                view = svc.order_view(row, with_pair_url=False)
+                changed = False
+            else:
+                svc.sync_order(order_id, str(row.get("user_id") or ""),
+                               with_pair_url=False)
+                changed = True
+            fresh = svc.store.order(order_id) or row
+            view = svc.order_view(fresh, with_pair_url=False)
+            uid = str(fresh.get("user_id") or "")
+            user = svc.store.user(uid) or {}
+            view["userId"] = uid
+            view["userName"] = str(user.get("name") or "")
+            view["userEmail"] = str(user.get("email") or "")
+            view["tradeNo"] = str(fresh.get("alipay_trade_no") or "")
+            view["events"] = svc.store.order_events(order_id)
+            view["notifies"] = [_notify_view(r, raw_limit=300)
+                                for r in svc.store.notifies_for_order(order_id)]
+            return {"ok": True, "changed": changed, "order": view}
+        return as_write(request, "billing-order-sync", order_id, fn)
+
     @api.get("/billing/entitlements")
-    def billing_entitlements(request: Request):
+    def billing_entitlements(request: Request, q: str = "", status: str = "",
+                             expiringWithinDays: int = 0, limit: int = 200,
+                             offset: int = 0):
+        """权益列表：按用户/状态/到期范围筛选 + 分页。"""
         current_admin(request)
         svc = billing_svc()
+        users = {str(u.get("user_id") or ""): u for u in svc.store.users()}
+        now = time.time()
         out = []
         for row in svc.store.entitlements():
             uid = str(row.get("user_id") or "")
+            user = users.get(uid) or {}
+            if q and str(q).strip().lower() not in _user_haystack(user):
+                continue
             block = svc.entitlement_summary(uid)
             computed_status = str(block.get("status") or "")
             block.update(row)          # 原始行（snake_case）也带上，排障用
@@ -1133,8 +1361,31 @@ def create_admin_app(cfg, state, *, perf=None) -> FastAPI:
             block["status"] = computed_status
             block["userId"] = uid      # 页面按 camelCase 读（与其它列表一致）
             block["expiringSoon"] = bool(block.get("expiringSoon"))
+            block["name"] = str(user.get("name") or "")
+            block["email"] = str(user.get("email") or "")
+            block["userStatus"] = str(user.get("status") or "")
+            wanted = str(status or "").strip().lower()
+            if wanted:
+                if wanted == "expiring":
+                    if not block["expiringSoon"]:
+                        continue
+                elif computed_status != wanted:
+                    continue
+            try:
+                days = int(expiringWithinDays or 0)
+            except (TypeError, ValueError):
+                days = 0
+            if days > 0:
+                paid_until = float(block.get("paidUntil") or 0)
+                if not (now < paid_until <= now + days * 86400):
+                    continue
             out.append(block)
-        return {"entitlements": out}
+        total = len(out)
+        page = out[_page_offset(offset):_page_offset(offset) + _page_int(limit, 200, 200)]
+        return {"entitlements": page, "total": total, "q": q,
+                "status": status, "expiringWithinDays": int(expiringWithinDays or 0),
+                "limit": _page_int(limit, 200, 200),
+                "offset": _page_offset(offset)}
 
     @api.post("/billing/entitlements/{user_id}/adjust")
     async def billing_entitlement_adjust(request: Request, user_id: str):
@@ -1147,25 +1398,44 @@ def create_admin_app(cfg, state, *, perf=None) -> FastAPI:
                         confirm=payload)
 
     @api.get("/account/users")
-    def account_users(request: Request, q: str = ""):
+    def account_users(request: Request, q: str = "", status: str = "",
+                      entitlementStatus: str = "", limit: int = 200,
+                      offset: int = 0):
+        """用户列表：邮箱 / userId / 姓名 / 手机号 / 支付宝 openId 搜索 + 筛选 + 分页。
+
+        `email` 来自 `users.email`（issue #15 落地后才有；老库缺失时按空串处理）。
+        """
         current_admin(request)
         svc = billing_svc()
         needle = str(q or "").strip().lower()
+        ent_filter = str(entitlementStatus or "").strip().lower()
         rows = []
         for user in svc.store.users():
-            if needle and needle not in (
-                    str(user.get("email") or "").lower()
-                    + " " + str(user.get("employee_no") or "").lower()
-                    + " " + str(user.get("name") or "").lower()
-                    + " " + str(user.get("alipay_open_id") or "").lower()):
+            if needle and needle not in _user_haystack(user):
                 continue
             uid = str(user.get("user_id") or "")
-            item = account_mod._public_user(user)
-            item["devices"] = svc.store.devices(uid)
-            item["entitlement"] = svc.entitlement_summary(
-                uid, devices=len(item["devices"]))
+            devices = svc.store.devices(uid)
+            ent = svc.entitlement_summary(uid, devices=len(devices))
+            ent_status = str(ent.get("status") or "none")
+            if str(status or "").strip() and str(user.get("status") or "") != str(status):
+                continue
+            if ent_filter:
+                if ent_filter == "expiring":
+                    if not ent.get("expiringSoon"):
+                        continue
+                elif ent_status != ent_filter:
+                    continue
+            item = _public_user_view(user)
+            item["devices"] = [account_mod.device_view(d) for d in devices]
+            item["entitlement"] = ent
+            item["entitlementStatus"] = "expiring" if ent.get("expiringSoon") else ent_status
             rows.append(item)
-        return {"users": rows}
+        total = len(rows)
+        page = rows[_page_offset(offset):_page_offset(offset) + _page_int(limit, 200, 200)]
+        return {"users": page, "total": total, "q": q, "status": status,
+                "entitlementStatus": entitlementStatus,
+                "limit": _page_int(limit, 200, 200),
+                "offset": _page_offset(offset)}
 
     @api.get("/account/users/{user_id}")
     def account_user_detail(request: Request, user_id: str):
@@ -1174,12 +1444,73 @@ def create_admin_app(cfg, state, *, perf=None) -> FastAPI:
         user = svc.store.user(user_id)
         if user is None:
             raise errors.user_not_found(user_id)
-        out = account_mod._public_user(user)
-        out["devices"] = svc.store.devices(user_id, include_revoked=True)
+        out = _public_user_view(user)
+        out["devices"] = [account_mod.device_view(d)
+                          for d in svc.store.devices(user_id, include_revoked=True)]
         out["entitlement"] = svc.entitlement_summary(
             user_id, devices=svc.store.count_devices(user_id))
-        out["orders"] = svc.store.orders(user_id=user_id)
+        orders = []
+        for row in svc.store.orders(user_id=user_id, limit=50):
+            view = svc.order_view(row, with_pair_url=False)
+            view["userId"] = str(row.get("user_id") or "")
+            view["tradeNo"] = str(row.get("alipay_trade_no") or "")
+            orders.append(view)
+        out["orders"] = orders
+        invite_code = str(user.get("invite_code") or "")
+        out["invite"] = svc.store.invite(invite_code) if invite_code else None
         return out
+
+    @api.post("/account/users/{user_id}/status")
+    async def account_user_status(request: Request, user_id: str):
+        """冻结 / 恢复账号。
+
+        冻结 = `users.status=disabled` + 撤销已发出的 userToken；已绑定设备在能力
+        请求上由 `BillingService.user_for_client()` 的 fail-closed 立即 403。
+        恢复后设备继续可用（绑定行不动，不需要重新配对）。
+        """
+        payload = await body_of(request)
+        wanted = str(payload.get("status") or "").strip().lower()
+        if wanted not in ("active", "disabled"):
+            raise errors.bad_request("status 只能是 active / disabled")
+
+        def fn(who):
+            store = store_of()
+            user = store.user(user_id)
+            if user is None:
+                raise errors.user_not_found(user_id)
+            store.update_user(user_id, status=wanted)
+            if wanted == "disabled":
+                store.bump_user_token_version(user_id)
+            return {"ok": True, "userId": user_id, "status": wanted}
+
+        return as_write(request, "account-user-status", user_id, fn,
+                        confirm=payload)
+
+    @api.post("/account/users/{user_id}/devices/{client_id}/revoke")
+    async def account_device_revoke(request: Request, user_id: str,
+                                    client_id: str):
+        """单设备解绑（找回兜底的最小版本；全部解绑仍是 reset-devices）。"""
+        payload = await body_of(request)
+
+        def fn(who):
+            svc = billing_svc()
+            row = svc.store.device_for_client(client_id)
+            if row is None or str(row.get("user_id") or "") != str(user_id):
+                raise errors.bad_request("这个设备不属于该用户")
+            if str(row.get("status") or "") != "active":
+                raise errors.bad_request("这台设备已经解绑")
+            if not svc.store.revoke_device(user_id, client_id):
+                raise errors.bad_request("这台设备已经解绑")
+            svc.forget_device(client_id)
+            if state.auth is not None:
+                try:
+                    state.auth.set_disabled(client_id, True)
+                except Exception:                               # pragma: no cover - 兜底
+                    pass
+            return {"ok": True, "userId": user_id, "clientId": client_id}
+
+        return as_write(request, "account-device-revoke", client_id, fn,
+                        confirm=payload)
 
     @api.post("/account/users/{user_id}/reset-devices")
     async def account_reset_devices(request: Request, user_id: str):
@@ -1249,6 +1580,70 @@ def create_admin_app(cfg, state, *, perf=None) -> FastAPI:
         return HTMLResponse(_page())
 
     return app
+
+
+def _page_int(value: Any, default: int = 20, cap: int = 200) -> int:
+    try:
+        n = int(value) if value is not None else default
+    except (TypeError, ValueError):
+        n = default
+    return max(1, min(cap, n or default))
+
+
+def _page_offset(value: Any) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _ts_param(value: Any) -> float:
+    try:
+        return max(0.0, float(value or 0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _user_haystack(user: Dict[str, Any]) -> str:
+    """用户搜索命中的字段：邮箱 / userId / 姓名 / 手机号 / 支付宝 openId。
+
+    **不含工号**：2026-11-06 用户确认「账号就是邮箱，不保留工号账号路径」。
+    老库里的 `employee_no` 列可能还在（issue #15 清账号后为空），但管理面不再拿它搜索。
+    """
+    return " ".join(str(user.get(k) or "") for k in
+                    ("email", "user_id", "name", "phone", "alipay_open_id")).lower()
+
+
+def _matching_user_ids(store: Any, needle: str) -> List[str]:
+    if store is None or not str(needle or "").strip():
+        return []
+    needle = str(needle).strip().lower()
+    return [str(u.get("user_id") or "") for u in store.users()
+            if needle in _user_haystack(u)]
+
+
+def _public_user_view(user: Dict[str, Any]) -> Dict[str, Any]:
+    """管理面用的账号视图（`account_mod._public_user` + 邮箱/openId/邀请码）。"""
+    out = account_mod._public_user(user)
+    out["email"] = str(user.get("email") or "")
+    out["emailVerified"] = bool(float(user.get("email_verified_at") or 0) > 0)
+    out["alipayOpenId"] = str(user.get("alipay_open_id") or "")
+    out["inviteCode"] = str(user.get("invite_code") or "")
+    return out
+
+
+def _notify_view(row: Dict[str, Any], *, raw_limit: int = 0) -> Dict[str, Any]:
+    raw = str(row.get("raw") or "")
+    if raw_limit and len(raw) > raw_limit:
+        raw = raw[:raw_limit] + "…"
+    return {
+        "tradeNo": str(row.get("trade_no") or ""),
+        "orderId": str(row.get("order_id") or ""),
+        "status": str(row.get("status") or ""),
+        "verified": bool(row.get("verified")),
+        "at": float(row.get("at") or 0),
+        "raw": raw,
+    }
 
 
 def _error_handler(_request: Request, exc):
