@@ -228,7 +228,62 @@ def invite_invalid(reason: str = "") -> EchoError:
 
 
 def employee_no_taken() -> EchoError:
+    """历史错误码（工号账号体系已退役）；保留定义是为了旧的错误映射不炸。"""
     return EchoError(409, "employee_no_taken", "这个工号已经注册过")
+
+
+# ---------------------------------------------------------------- 邮箱账号（2026-11-06，issue #15）
+
+def invalid_email(detail: str = "") -> EchoError:
+    return EchoError(400, "invalid_email", "邮箱格式不合法", detail=detail)
+
+
+def invalid_purpose(detail: str = "") -> EchoError:
+    return EchoError(400, "invalid_purpose", "验证码用途不合法", detail=detail)
+
+
+def password_weak(reason: str = "") -> EchoError:
+    """口令不合规（与管理员口令策略分开：邮箱账号要求字母+数字）。"""
+    return EchoError(400, "password_weak", "密码不符合要求",
+                     detail=str(reason or "至少 8 位，且同时包含字母和数字"))
+
+
+def verification_code_invalid(detail: str = "") -> EchoError:
+    return EchoError(400, "verification_code_invalid", "验证码不正确",
+                     detail=str(detail or ""))
+
+
+def verification_code_expired(detail: str = "") -> EchoError:
+    return EchoError(400, "verification_code_expired", "验证码已过期",
+                     detail=str(detail or ""))
+
+
+def verification_code_attempts_exceeded(detail: str = "") -> EchoError:
+    return EchoError(400, "verification_code_attempts_exceeded",
+                     "验证码错误次数过多，请重新获取",
+                     detail=str(detail or ""))
+
+
+def email_taken() -> EchoError:
+    """邮箱已注册。**只在验证码验证通过之后**才返回：不给人拿它枚举邮箱。"""
+    return EchoError(409, "email_taken", "这个邮箱已经注册过",
+                     detail="请直接登录或重置密码")
+
+
+def email_send_failed(detail: str = "") -> EchoError:
+    """邮件上游失败（SMTP 超时/认证失败等）。**不落账号、不留下有效码。**"""
+    return EchoError(502, "email_send_failed", "验证码邮件发送失败",
+                     detail=str(detail or ""))
+
+
+def email_disabled() -> EchoError:
+    return EchoError(503, "email_disabled", "邮箱注册/登录功能未启用")
+
+
+def email_unconfigured(detail: str = "") -> EchoError:
+    """邮箱功能开着但 provider/from/凭据没配好；**不静默回退 dev**。"""
+    return EchoError(503, "email_unconfigured", "邮箱发送未配置",
+                     detail=str(detail or ""))
 
 
 def device_limit_reached(limit: int) -> EchoError:

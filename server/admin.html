@@ -1065,8 +1065,8 @@ async function viewBilling() {
          <button data-ent-internal="${esc(e.userId)}">设 internal</button>`),
   ]);
   const userRows = users.users.map((u) => [
-    u.userId, u.name, u.employeeNo, (u.devices || []).length,
-    statusBadge(u.status),
+    u.userId, u.email || "（无邮箱）", u.emailVerified ? "已验证" : "未验证",
+    (u.devices || []).length, statusBadge(u.status),
     raw(`<button data-reset-devices="${esc(u.userId)}">重置设备</button>`),
   ]);
   const inviteRows = invites.invites.map((i) => [
@@ -1116,7 +1116,7 @@ async function viewBilling() {
     ["账号", "套餐", "状态", "到期", "每日分钟", "TTS 字符", "QPS", "设备", "操作"],
     entRows)}</div>
   <div class="card"><h2>账号</h2>${table(
-    ["账号", "姓名", "工号", "设备数", "状态", "操作"], userRows)}
+    ["账号", "邮箱", "邮箱验证", "设备数", "状态", "操作"], userRows)}
     <div class="muted" style="margin-top:8px">「重置设备」会解绑这个人所有设备，旧客户端立即失效（找回兜底）。</div>
   </div>
   <div class="card"><h2>邀请码</h2>${table(

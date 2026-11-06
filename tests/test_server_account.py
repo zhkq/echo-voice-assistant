@@ -1,24 +1,14 @@
 # -*- coding: utf-8 -*-
 """账号 / 邀请码 / 设备绑定（设计 §3.5、§4.2；任务书 T2）。
 
-判据（任务书 §4 T2）：
-
-* 邀请码错 / 过期 / 超次 → 403 `invite_invalid`
-* 工号重复 → 409 `employee_no_taken`
-* userToken 过期 → 401
-* 设备上限 3 台；绑第 4 台 → 403
-* 设备绑定码一次性、10 分钟
-
-另外两条**域隔离**（设计 §3.5.5 的关键）：
-
-* client JWT 不能调 `/v1/billing/*`
-* userToken 不能调 `/v1/asr`
+邮箱账号体系（2026-11-06，issue #15）：注册 = 邮箱 + 验证码 + 密码 + 邀请码；
+登录 = 邮箱 + 密码。这个文件保留**设备绑定 / 令牌域隔离**的用例；邮箱注册、
+验证码、找回密码的完整矩阵在 `tests/test_server_account_email.py`。
 """
 import base64
 import os
 import sys
 import tempfile
-import time
 import unittest
 from unittest.mock import patch
 
@@ -26,9 +16,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from fastapi.testclient import TestClient                        # noqa: E402
 
-from server import auth as auth_mod                              # noqa: E402
 from server import engines, main as server_main                  # noqa: E402
-from server import routes as routes_mod                          # noqa: E402
+from tests.account_test_helpers import put_email_code            # noqa: E402
 from tests.test_server_contract import _cfg, _fake_loader        # noqa: E402
 
 
@@ -41,6 +30,8 @@ def _billing_cfg(tmp, **over):
     cfg.raw["auth"]["jwt_secret"] = "0123456789abcdef0123456789abcdef"
     cfg.raw["auth"]["clock_skew_s"] = 0
     cfg.raw["server"]["state_root"] = os.path.join(tmp, "state")
+    cfg.raw["account"]["email"]["enabled"] = True
+    cfg.raw["account"]["email"]["provider"] = "dev"
     for key, value in over.items():
         cfg.raw[key] = value
     return cfg
@@ -89,15 +80,18 @@ class _AccountCase(unittest.TestCase):
         self.store.put_invite(code, max_uses=max_uses, expires_at=expires_at)
         return code
 
-    def register(self, employee_no="E001", name="张三", code="INVITE-1"):
-        r = self.client.post("/v1/account/register",
-                             json={"inviteCode": code, "name": name,
-                                   "employeeNo": employee_no})
-        return r
+    def register(self, email="user@example.com", code="123456",
+                 password="Passw0rd", invite_code="INVITE-1", seed=True):
+        if seed:
+            put_email_code(self.store, email, "register", code)
+        return self.client.post("/v1/account/register",
+                                json={"email": email, "code": code,
+                                      "password": password,
+                                      "inviteCode": invite_code})
 
-    def login(self, employee_no="E001", code="INVITE-1"):
+    def login(self, email="user@example.com", password="Passw0rd"):
         return self.client.post("/v1/account/login",
-                                json={"employeeNo": employee_no, "inviteCode": code})
+                                json={"email": email, "password": password})
 
     def headers(self, token):
         return {"Authorization": "Bearer " + token}
@@ -120,130 +114,6 @@ class _AccountCase(unittest.TestCase):
         self.assertEqual(r.status_code, 200, r.text)
         body = r.json()
         return body, self.pair(body["bindCode"], name)
-
-
-class RegisterLoginTests(_AccountCase):
-    def test_register_with_a_valid_invite_returns_a_user_token(self):
-        self.invite()
-        r = self.register()
-        self.assertEqual(r.status_code, 200, r.text)
-        body = r.json()
-        self.assertTrue(body["userId"].startswith("usr-"))
-        self.assertTrue(body["userToken"])
-        self.assertGreater(body["expiresAt"], time.time())
-        # 注册即送 7 天试用（设计 §4.5）
-        self.assertTrue(body["trial"])
-
-    def test_a_name_with_html_metacharacters_is_refused(self):
-        self.invite()
-        r = self.client.post("/v1/account/register",
-                             json={"inviteCode": "INVITE-1",
-                                   "name": '<span><img src=x onerror=alert(1)>',
-                                   "employeeNo": "E001"})
-        self.assertEqual(r.status_code, 400, r.text)
-        self.assertIn("HTML", r.json()["detail"])
-
-    def test_wrong_expired_and_used_up_invites_are_refused(self):
-        r = self.client.post("/v1/account/register",
-                             json={"inviteCode": "NOPE", "name": "张三",
-                                   "employeeNo": "E001"})
-        self.assertEqual(r.status_code, 403)
-        self.assertEqual(r.json()["code"], "invite_invalid")
-
-        self.store.put_invite("OLD", max_uses=1, expires_at=time.time() - 10)
-        r = self.register(employee_no="E002", code="OLD")
-        self.assertEqual(r.status_code, 403)
-
-        self.store.put_invite("ONE", max_uses=1)
-        self.assertEqual(self.register(employee_no="E003", code="ONE").status_code, 200)
-        r = self.register(employee_no="E004", code="ONE")
-        self.assertEqual(r.status_code, 403)
-        self.assertEqual(r.json()["code"], "invite_invalid")
-
-    def test_an_employee_number_can_only_register_once(self):
-        self.invite()
-        self.assertEqual(self.register(employee_no="E001").status_code, 200)
-        r = self.register(employee_no="E001", name="李四")
-        self.assertEqual(r.status_code, 409)
-        self.assertEqual(r.json()["code"], "employee_no_taken")
-
-    def test_login_returns_a_token_and_the_account(self):
-        self.invite()
-        self.register()
-        r = self.login("E001")
-        self.assertEqual(r.status_code, 200, r.text)
-        self.assertTrue(r.json()["userToken"])
-        self.assertEqual(r.json()["user"]["employeeNo"], "E001")
-
-    def test_login_accepts_the_same_invite_after_it_expired(self):
-        self.invite()
-        self.register()
-        # 邀请码的 expires_at 只是注册名额有效期；过期不锁已注册用户。
-        self.store.put_invite("INVITE-1", max_uses=10, expires_at=time.time() - 1)
-        r = self.login("E001")
-        self.assertEqual(r.status_code, 200, r.text)
-
-    def test_login_survives_invite_revocation(self):
-        self.invite()
-        self.register()
-        # 管理面「作废」= 删 invite 行；已注册用户不能被锁在门外。
-        self.assertTrue(self.store.delete_invite("INVITE-1"))
-        r = self.login("E001")
-        self.assertEqual(r.status_code, 200, r.text)
-        r = self.login("E001", code="OTHER")
-        self.assertEqual(r.status_code, 403)
-        self.assertEqual(r.json()["code"], "invite_invalid")
-
-    def test_login_refuses_a_different_invite(self):
-        self.invite()
-        self.register()
-        self.invite("OTHER")
-        r = self.login("E001", code="OTHER")
-        self.assertEqual(r.status_code, 403)
-        self.assertEqual(r.json()["code"], "invite_invalid")
-
-    def test_login_is_throttled_after_five_failures(self):
-        self.invite()
-        self.register()
-        for _ in range(5):
-            r = self.login("E001", code="WRONG")
-            self.assertEqual(r.status_code, 403, r.text)
-        r = self.login("E001")
-        self.assertEqual(r.status_code, 429, r.text)
-        self.assertEqual(r.json()["code"], "rate_limited")
-        self.assertIn("Retry-After", r.headers)
-
-    def test_login_with_an_unknown_employee_number_is_401(self):
-        self.invite()
-        r = self.login("NOPE")
-        self.assertEqual(r.status_code, 401)
-        self.assertEqual(r.json()["code"], "unauthorized")
-
-    def test_an_expired_user_token_is_refused(self):
-        self.invite()
-        self.register()
-        self.cfg.raw["billing"]["user_token_ttl_s"] = -120
-        token = self.login("E001").json()["userToken"]
-        r = self.client.get("/v1/account/me", headers=self.headers(token))
-        self.assertEqual(r.status_code, 401)
-
-    def test_logout_revokes_the_token(self):
-        self.invite()
-        token = self.register().json()["userToken"]
-        r = self.client.post("/v1/account/logout", headers=self.headers(token))
-        self.assertEqual(r.status_code, 200, r.text)
-        r = self.client.get("/v1/account/me", headers=self.headers(token))
-        self.assertEqual(r.status_code, 401)
-
-    def test_me_reports_identity_entitlement_and_devices(self):
-        self.invite()
-        body = self.register().json()
-        r = self.client.get("/v1/account/me", headers=self.headers(body["userToken"]))
-        self.assertEqual(r.status_code, 200, r.text)
-        me = r.json()
-        self.assertEqual(me["employeeNo"], "E001")
-        self.assertEqual(me["entitlement"]["plan"], "trial")
-        self.assertEqual(me["devices"], [])
 
 
 class TokenDomainTests(_AccountCase):
