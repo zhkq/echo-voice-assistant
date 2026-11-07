@@ -279,6 +279,11 @@ def check_gate(c: Client, data: bytes, slow_path="/v1/diarize"):
     那就变成一条永远绿的空转用例（这个坑在服务端的单测里踩过一次）。
     """
     print("\n== 并发闸门（每客户端 1 路）")
+    # 配套授权（2026-11-07，issue #20）：diarize 必须跟随**同一次 ASR**。
+    # 先对同一段音频补一次 ASR，否则两路都会先撞 `403 companion_not_allowed`，
+    # 测不到并发闸门。收费后端按 user 1 QPS，等一秒再发，别让 429 干扰判据。
+    time.sleep(1.1)
+    c.json("POST", "/v1/asr", body=data, ctype="audio/wav")
     out = []
     lock = threading.Lock()
 

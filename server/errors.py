@@ -66,6 +66,20 @@ def forbidden(detail: str = "") -> EchoError:
     return EchoError(403, "forbidden", "该凭据没有这项能力的权限", detail=detail)
 
 
+def companion_not_allowed(detail: str = "") -> EchoError:
+    """分离/声纹必须随同**同一次 ASR**（2026-11-07，issue #20）。
+
+    服务端按"同一账号（或同一客户端）+ 同一段归一化音频"的摘要发一张短时配套授权；
+    没有 ASR / 音频不一致 / 授权过期 / 本次配套次数用完，都在这里拒。
+
+    **403 而不是 429/409**：这不是"现在忙"或"额度用完"，而是"这条调用缺少前置条件"，
+    客户端应提示"请先做 ASR / 本次 ASR 已用完配套次数"，而不是退避重试。
+    `detail` 必须说清是哪一种 —— 客户端会原样展示它。
+    """
+    return EchoError(403, "companion_not_allowed",
+                     "分离/声纹必须随同一次 ASR 使用", detail=detail)
+
+
 def client_busy(detail: str = "") -> EchoError:
     """该客户端自己已有请求在跑。**重试永远不会成功** —— 客户端该等自己那条回来。
 

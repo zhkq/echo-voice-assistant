@@ -196,6 +196,15 @@ DEFAULTS: Dict[str, Any] = {
         "max_concurrent": 1,
         # 时间口径："每日 0 点恢复"按这个时区（设计 §5.4）。
         "timezone": "Asia/Shanghai",
+        # 分离/声纹的**配套授权**（2026-11-07，issue #20）。ASR 成功时按"同一账号
+        # （或同一客户端）+ 同一段归一化音频"发授权；diarize/embed 只认它，且
+        # **不扣每日音频分钟**。这是一张短时授权，不是额度：
+        #   * `companion_ttl_s`：多久内有效（秒）。会议/探针都是 ASR 后立刻调用，
+        #     默认 1 小时，足够覆盖一次长会/重试；过期就得重新 ASR。
+        #   * `companion_per_asr`：一次 ASR 允许几次**每种**配套调用
+        #     （1 = 1 次 diarize + 1 次 embed）。设 0 等于"一律不允许"。
+        "companion_ttl_s": 3600,
+        "companion_per_asr": 1,
     },
     # 7 天一次性试用（默认送、后台可关）。设计 §4.5。
     "trial": {

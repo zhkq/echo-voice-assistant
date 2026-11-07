@@ -17,6 +17,8 @@
 
 L4（说话人分离）**是可选的、而且"做不了"不算失败**：老卡（sm_<7.5）本来就没有这一档，
 如实说"这块卡做不了分离"即可（实施方案 §2 / §4）。
+2026-11-07 起 L4 必须跟随**同一次 ASR**（服务端配套授权，issue #20）：`probe()` 正常路径
+复用 L3 那次 ASR；单独调用 `probe_diarize()` 时会先补一次极短 ASR（同一段音频）。
 
 顺序与开销
 ----------
@@ -302,7 +304,7 @@ def probe(base_url: str, token: str = "", *, timeout_l3: float = L3_TIMEOUT_S,
                                                   if l3.get("textEmpty") else "有文本"))})
     if diarize:
         out["l4"] = probe_diarize(base_url, token=token or _token_for(base_url),
-                                  timeout=timeout_l3,
+                                  timeout=timeout_l3, asr_done=True,
                                   wav_path=str(l3.get("selfTestWav") or ""))
         # L4 失败**不算整体失败**（老卡本来就没有这一档），只在 headline 里如实带一句
         if not out["l4"]["ok"]:
@@ -311,12 +313,40 @@ def probe(base_url: str, token: str = "", *, timeout_l3: float = L3_TIMEOUT_S,
 
 
 def probe_diarize(base_url: str, token: str = "", timeout: float = L3_TIMEOUT_S,
-                  wav_path: str = "") -> Dict[str, Any]:
-    """**L4**：`POST /v1/diarize`（可选档）。**"这块卡做不了分离"不算失败**，如实说即可。"""
+                  wav_path: str = "", asr_done: bool = False) -> Dict[str, Any]:
+    """**L4**：`POST /v1/diarize`（可选档）。**"这块卡做不了分离"不算失败**，如实说即可。
+
+    ## 必须跟随同一次 ASR（2026-11-07，issue #20）
+
+    `diarize` 是 ASR 的配套能力：服务端只接受"同一段音频刚做过 ASR"的请求，
+    否则回 `403 companion_not_allowed`。所以这个探针**不能单独裸调**：
+
+      * `probe()` 的正常路径已经跑过 L3（`/v1/asr`，用的就是同一段
+        `selfTestWav`），此时传 `asr_done=True` —— 服务端那次 ASR 已经发了配套授权，
+        这里直接打 `/v1/diarize` 即可，**不重复花一次 ASR**；
+      * 直接调用本函数（`asr_done=False`）时，先自动补一次**极短 ASR**
+        （没有 `wav_path` 就现场生成 1 秒自测音），拿到授权后再 diarize。
+
+    单独调用时那次 ASR 会像任何 ASR 一样计入当日额度；正常探针路径不会多花这一次。
+    """
     if not token:
         return {"ok": False, "status": 0, "detail": "没有令牌（没配对）"}
     if not wav_path or not os.path.isfile(wav_path):
-        return {"ok": False, "status": 0, "detail": "没有自测音频（L3 没跑到）"}
+        if asr_done:
+            return {"ok": False, "status": 0, "detail": "没有自测音频（L3 没跑到）"}
+        try:
+            tmpdir = tempfile.mkdtemp(prefix="echo-backend-diarize-")
+            wav_path = make_selftest_wav(os.path.join(tmpdir, "selftest.wav"))
+        except Exception as e:
+            return {"ok": False, "status": 0, "detail": "自测音频生成失败：%s" % e}
+    if not asr_done:
+        # 先做一次极短 ASR：服务端按"同一段音频"发配套授权，随后的 diarize 才被允许。
+        pre = probe_asr(base_url, token=token, timeout=timeout, wav_path=wav_path)
+        if not pre.get("ok"):
+            return {"ok": False, "status": int(pre.get("status") or 0),
+                    "detail": "前置 ASR 没成功，拿不到配套授权：%s"
+                              % (pre.get("detail") or "未知原因")}
+        wav_path = str(pre.get("selfTestWav") or wav_path)
     try:
         with open(wav_path, "rb") as fh:
             audio = fh.read()

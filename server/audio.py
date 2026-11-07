@@ -153,3 +153,19 @@ def to_wav16k(src: str, dst: str, ctype: str, cfg) -> float:
 
     sf.write(dst, mono, SAMPLE_RATE, subtype="PCM_16")
     return seconds
+
+
+def digest_wav16k(path: str) -> str:
+    """归一化 16k mono WAV 的 SHA-256（十六进制）。
+
+    分离/声纹的配套授权按它绑定"同一次 ASR"（issue #20）：ASR 与 diarize/embed
+    都把同一段上传规整成同样的 `PCM_16` 文件（`to_wav16k` 不写时间戳/元数据），
+    所以同一个文件内容 → 同一个摘要；而原始上传的容器/头部差异不会误伤。
+    """
+    import hashlib
+
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()

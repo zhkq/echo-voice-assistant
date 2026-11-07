@@ -113,7 +113,11 @@ TABLE_WHITELIST = ("clients", "pairing_codes", "calls", "admin_users", "admin_au
                    "orders", "order_events", "alipay_notify", "entitlements",
                    # 邮箱验证码（2026-11-06，issue #15）：邮箱、用途、码哈希、TTL、
                    # 尝试次数、发送时间、IP。**只存验证码哈希**，不存明文/邮件内容。
-                   "email_codes")
+                   "email_codes",
+                   # 分离/声纹的配套授权（2026-11-07，issue #20）：一次成功 ASR
+                   # 只允许同音频的 diarize/embed 各若干次。**只存音频摘要与计数**，
+                   # 不存音频/文本/嵌入；到期即删。见 `put_companion_grant`。
+                   "companion_grants")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS clients (
@@ -364,6 +368,24 @@ CREATE TABLE IF NOT EXISTS entitlements (
     order_id            TEXT NOT NULL DEFAULT '',
     updated_at          REAL NOT NULL DEFAULT 0
 );
+-- 分离/声纹的**配套授权**（2026-11-07，issue #20）。
+-- 一次成功 ASR 只允许"同一段音频"的 diarize/embed 各 `companion_per_asr` 次；
+-- 这两件事是 ASR 的配套能力，不占每日音频分钟，但不能脱离 ASR 单独调用。
+-- **只存归一化 16k mono WAV 的 SHA-256 摘要与计数**，不存音频/文本/嵌入；
+-- `expires_at` 到了即失效（写授权时顺手清理）。
+-- 归属二选一：绑定账号 → `user_id`（同一账号多设备共用）；未绑定 → `client_id`。
+-- 两者同时为空的行不会被写入（见 `put_companion_grant`）。
+CREATE TABLE IF NOT EXISTS companion_grants (
+    user_id            TEXT NOT NULL DEFAULT '',
+    client_id          TEXT NOT NULL DEFAULT '',
+    audio_hash         TEXT NOT NULL,       -- 归一化 16k mono WAV 的 SHA-256
+    created_at         REAL NOT NULL DEFAULT 0,
+    expires_at         REAL NOT NULL DEFAULT 0,
+    remaining_diarize  INTEGER NOT NULL DEFAULT 0,
+    remaining_embed    INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (user_id, client_id, audio_hash)
+);
+CREATE INDEX IF NOT EXISTS idx_companion_expires ON companion_grants(expires_at);
 """
 
 #: `CREATE TABLE IF NOT EXISTS` 对**已经存在**的表不会补列 ——
@@ -2028,3 +2050,148 @@ class Store:
                 self._db.rollback()
                 raise
         return closed
+
+    # ---------------------------------------------------------------- 配套授权
+
+    #: 配套调用种类 → 对应的计数列。**白名单**（不把外部字符串拼进 SQL）。
+    COMPANION_COLUMNS = {"diarize": "remaining_diarize",
+                         "embed": "remaining_embed"}
+
+    @staticmethod
+    def _companion_key(user_id: str, client_id: str):
+        """授权归属归一化：绑定账号 → `(user_id, "")`；未绑定 → `("", client_id)`。
+
+        同一个账号的多台设备共用一份授权（user 优先），未绑定账号的老客户端按
+        client_id 隔离（issue #20 的评审结论：A 客户 ASR 不能解锁 B 客户）。
+        """
+        uid = str(user_id or "")
+        return (uid, "" if uid else str(client_id or ""))
+
+    def put_companion_grant(self, user_id: str, client_id: str, digest: str,
+                            per_asr: int = 1, ttl_s: float = 3600.0,
+                            now: Optional[float] = None) -> int:
+        """记录一次成功 ASR 的配套授权（一个归属 + 一段音频一行）。返回写入行数。
+
+        `digest` 是**归一化 16k mono WAV** 的 SHA-256（`server/audio.py` 算），
+        不是原始上传字节 —— 见 issue #20 的设计决策。同一段音频再次 ASR 会
+        **刷新**两个计数器与 `expires_at`（覆盖旧的、未用完的授权）。
+        """
+        uid, cid = self._companion_key(user_id, client_id)
+        if not (uid or cid) or not digest:
+            return 0
+        now = time.time() if now is None else float(now)
+        expires = now + max(0.0, float(ttl_s or 0.0))
+        per = max(0, int(per_asr or 0))
+        with self._lock:
+            # 顺手清掉过期行：这张表只在 ASR/配套调用时被碰，不值得再起一个定时器。
+            self._db.execute("DELETE FROM companion_grants WHERE expires_at <= ?", (now,))
+            self._db.execute(
+                "INSERT INTO companion_grants"
+                " (user_id, client_id, audio_hash, created_at, expires_at,"
+                "  remaining_diarize, remaining_embed)"
+                " VALUES (?,?,?,?,?,?,?)"
+                " ON CONFLICT(user_id, client_id, audio_hash) DO UPDATE SET"
+                " created_at=excluded.created_at, expires_at=excluded.expires_at,"
+                " remaining_diarize=excluded.remaining_diarize,"
+                " remaining_embed=excluded.remaining_embed",
+                (uid, cid, str(digest), now, expires, per, per))
+            self._db.commit()
+        return 1
+
+    def has_companion_grant(self, user_id: str, client_id: str,
+                            now: Optional[float] = None) -> bool:
+        """这个归属有没有**任何**未过期的配套授权（读音频前的轻预检）。"""
+        uid, cid = self._companion_key(user_id, client_id)
+        if not (uid or cid):
+            return False
+        now = time.time() if now is None else float(now)
+        with self._lock:
+            row = self._db.execute(
+                "SELECT 1 FROM companion_grants"
+                " WHERE user_id=? AND client_id=? AND expires_at>? LIMIT 1",
+                (uid, cid, now)).fetchone()
+        return row is not None
+
+    def companion_status(self, user_id: str, client_id: str, kind: str,
+                         digest: str, now: Optional[float] = None) -> str:
+        """只读判定：`ok` / `missing` / `expired` / `exhausted`（**不扣次数**）。
+
+        读音频前先查一次摘要与剩余次数，让"音频不一致 / 已用完"在**占通道和记账
+        之前**就被拒 —— 否则未绑定账号的老路会先扣旧 client 分钟、再回 403。
+        真正的扣减仍是 `claim_companion_grant` 的原子 UPDATE。
+        """
+        col = self.COMPANION_COLUMNS.get(str(kind or ""))
+        uid, cid = self._companion_key(user_id, client_id)
+        if not col or not (uid or cid):
+            return "missing"
+        now = time.time() if now is None else float(now)
+        with self._lock:
+            row = self._db.execute(
+                "SELECT remaining_diarize, remaining_embed, expires_at"
+                " FROM companion_grants"
+                " WHERE user_id=? AND client_id=? AND audio_hash=?",
+                (uid, cid, str(digest))).fetchone()
+        if row is None:
+            return "missing"
+        if float(row["expires_at"] or 0.0) <= now:
+            return "expired"
+        if int(row[col] or 0) <= 0:
+            return "exhausted"
+        return "ok"
+
+    def claim_companion_grant(self, user_id: str, client_id: str, kind: str,
+                              digest: str, now: Optional[float] = None) -> str:
+        """原子扣一次配套次数。返回 `ok` / `missing` / `expired` / `exhausted`。
+
+        **一条 UPDATE 就是扣减**（对应计数 >0 且 `expires_at > now`），不存在
+        "先查再扣"的并发窗口；调用方按返回值给不同的 403 文案。
+        """
+        col = self.COMPANION_COLUMNS.get(str(kind or ""))
+        uid, cid = self._companion_key(user_id, client_id)
+        if not col or not (uid or cid):
+            return "missing"
+        now = time.time() if now is None else float(now)
+        with self._lock:
+            row = self._db.execute(
+                "SELECT remaining_diarize, remaining_embed, expires_at"
+                " FROM companion_grants"
+                " WHERE user_id=? AND client_id=? AND audio_hash=?",
+                (uid, cid, str(digest))).fetchone()
+            if row is None:
+                return "missing"
+            if float(row["expires_at"] or 0.0) <= now:
+                return "expired"
+            if int(row[col] or 0) <= 0:
+                return "exhausted"
+            cur = self._db.execute(
+                "UPDATE companion_grants SET %s = %s - 1"
+                " WHERE user_id=? AND client_id=? AND audio_hash=?"
+                " AND %s>0 AND expires_at>?"
+                % (col, col, col),
+                (uid, cid, str(digest), now))
+            self._db.commit()
+            return "ok" if int(cur.rowcount or 0) == 1 else "exhausted"
+
+    def refund_companion_grant(self, user_id: str, client_id: str, kind: str,
+                               digest: str, per_asr: int = 1,
+                               now: Optional[float] = None) -> bool:
+        """推理 5xx / 超时 / 进程异常时退回一次配套次数（issue #20 的失败策略）。
+
+        退回**不复活过期行**也无所谓：行还在就 +1；已经被 ASR 的清理删掉就无可退。
+        上限是 `per_asr`，避免异常路径重复退回到一次 ASR 之外。
+        """
+        col = self.COMPANION_COLUMNS.get(str(kind or ""))
+        uid, cid = self._companion_key(user_id, client_id)
+        if not col or not (uid or cid):
+            return False
+        now = time.time() if now is None else float(now)
+        per = max(0, int(per_asr or 0))
+        with self._lock:
+            cur = self._db.execute(
+                "UPDATE companion_grants SET %s ="
+                " CASE WHEN %s < ? THEN %s + 1 ELSE %s END"
+                " WHERE user_id=? AND client_id=? AND audio_hash=?"
+                % (col, col, col, col),
+                (per, uid, cid, str(digest)))
+            self._db.commit()
+            return bool(int(cur.rowcount or 0) == 1)

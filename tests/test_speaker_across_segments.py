@@ -183,8 +183,8 @@ class _MeetingCase(unittest.TestCase):
 
     # ---- 跑转写 -----------------------------------------------------------
 
-    def _run(self, backend):
-        """配一个假后端 + 把路由换成"只有它"，然后**同步**跑完整场转写。"""
+    def _run(self, backend, extra_clients=(), settings_overrides=None):
+        """配假后端 + 把路由换成它们，然后**同步**跑完整场转写。"""
         url = "http://gpu-test:8900"
         settings.update({"capabilityEchoServerUrl": url})
         settings._cache = None
@@ -198,7 +198,15 @@ class _MeetingCase(unittest.TestCase):
         p = patch.object(meeting.settings, "get", fake_get)
         p.start()
         self.addCleanup(p.stop)
-        router = CapabilityRouter([backend], settings_get=lambda k, d=None: d)
+
+        overrides = dict(settings_overrides or {})
+
+        def sg(key, default=None):
+            if key in overrides:
+                return overrides[key]
+            return default
+
+        router = CapabilityRouter([backend, *extra_clients], settings_get=sg)
         p = patch("app.capabilities.build_default_router", lambda **kw: router)
         p.start()
         self.addCleanup(p.stop)
@@ -463,6 +471,41 @@ class NoEmbeddingBackendTests(_MeetingCase):
 
 
 # ---------------------------------------------------------------- ⑤ 三处一致
+
+class CompanionRoutingGuardTests(_MeetingCase):
+    """ASR 与分离不在同一个后端时，客户端不再去撞 `companion_not_allowed`。
+
+    配套授权由**同一次 ASR 所在的 ECHO 后端**发出（issue #20）。ASR 被路由到
+    `asr-provider`、分离只走 ECHO 后端时，后端根本没看到这次 ASR —— 这时应：
+      * 不去调 diarize（那一调必被 403）；
+      * 在 meta 里留下**真实原因**（不是含糊的"分离失败"）；
+      * 转写文字照常保留（跳过的只是分离）。
+    """
+
+    def test_provider_asr_with_backend_diarize_is_skipped_with_a_clear_reason(self):
+        echo = _SegmentBackend({
+            "01.wav": ("S0", _one_hot(0)),
+            "02.wav": ("S1", _one_hot(1)),
+            "03.wav": ("S0", _one_hot(0)),
+        })
+        provider = _NoEmbeddingBackend(
+            {"01.wav": "0", "02.wav": "1", "03.wav": "0"},
+            backend_id=BACKEND_ASR_PROVIDER)
+        self._run(echo, extra_clients=(provider,),
+                  settings_overrides={"capabilityMeetingAsrBackend":
+                                      BACKEND_ASR_PROVIDER})
+
+        self.assertEqual(echo.diarize_calls, [],
+                         "ASR 走 provider 时不该再把 diarize 发给 ECHO 后端")
+        meta = meeting.meeting_meta(self.name)
+        self.assertFalse(meta["diarize"]["executed"], meta.get("diarize"))
+        self.assertEqual(meta["diarize"]["reason"], "unsupported")
+        self.assertIn("asr-provider", meta["diarize"]["detail"])
+        self.assertIn("echo-server", meta["diarize"]["detail"])
+        self.assertIn("同一个后端", meta["diarize"]["detail"])
+        # 转写文字仍然在：跳过的只有分离，不能连文字一起丢。
+        self.assertTrue(db.get_lines(self.mid), "转写文字不该因为跳过分离而丢失")
+
 
 class OneLabelSetEverywhereTests(_MeetingCase):
     """`lines` / `speakers` / `transcript.md` 是同一套；`meta` 记的是这一场的事实。"""

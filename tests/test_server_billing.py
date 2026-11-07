@@ -25,8 +25,10 @@ from server import payment as payment_mod                        # noqa: E402
 from server import quota as quota_mod                            # noqa: E402
 from server import ratelimit                                     # noqa: E402
 from server import settings as settings_mod                      # noqa: E402
+from server import store as store_mod                            # noqa: E402
 from tests.account_test_helpers import put_email_code            # noqa: E402
-from tests.test_server_contract import _cfg, _fake_loader, _wav_bytes  # noqa: E402
+from tests.test_server_contract import (_FakeEngine, _cfg, _fake_loader,
+                                        _wav_bytes)               # noqa: E402
 
 
 def _billing_cfg(tmp, **over):
@@ -105,15 +107,21 @@ class _BillingCase(unittest.TestCase):
         self.assertIsNotNone(user, "测试账号不存在：%s" % label)
         return user["user_id"]
 
-    def create_paid_client(self, label="E001", plan="monthly"):
-        """注册 → 下单 → Mock 付款 → 兑换配对码 → (userToken, clientHeaders, orderId)。"""
+    def create_paid_client(self, label="E001", plan="monthly", buyer_id=""):
+        """注册 → 下单 → Mock 付款 → 兑换配对码 → (userToken, clientHeaders, orderId)。
+
+        `buyer_id` 只在"同一个用例里要造**第二个**付费账号"时用：Mock 网关默认给
+        同一个 `mock-buyer`，而 `users.alipay_open_id` 有唯一索引 —— 两个账号都用
+        默认值会撞唯一约束（那是一次**已有的**事务/回滚问题，不属于本用例要测的东西）。
+        """
         user = self.register(label)
         token = user["userToken"]
         r = self.client.post("/v1/billing/orders", json={"planCode": plan},
                              headers=self.uh(token))
         self.assertEqual(r.status_code, 200, r.text)
         order_id = r.json()["orderId"]
-        r = self.client.post("/v1/billing/mock/pay/" + order_id, json={})
+        payload = {"buyerId": buyer_id} if buyer_id else {}
+        r = self.client.post("/v1/billing/mock/pay/" + order_id, json=payload)
         self.assertEqual(r.status_code, 200, r.text)
         order = self.client.get("/v1/billing/orders/" + order_id,
                                 headers=self.uh(token)).json()
@@ -1113,7 +1121,7 @@ class Phase3OrderFlowTests(_BillingCase):
     def test_order_view_carries_plan_name_days_amount_and_sandbox(self):
         token = self.register()["userToken"]
         order = self._order(token)
-        self.assertEqual(order["planName"], "月卡")
+        self.assertEqual(order["planName"], "基础版：Basic")
         self.assertEqual(order["days"], 30)
         self.assertEqual(order["amountCents"], 1000)
         self.assertFalse(order["sandbox"])
@@ -1202,3 +1210,363 @@ class Phase3OrderFlowTests(_BillingCase):
     def test_orders_list_requires_a_user_token(self):
         r = self.client.get("/v1/billing/orders")
         self.assertEqual(r.status_code, 401)
+
+
+class CompanionGrantTests(_BillingCase):
+    """分离/声纹必须跟随同一次 ASR，且不扣每日音频分钟（2026-11-07，issue #20）。
+
+    覆盖验收里的 7 条边界：
+      1. 没做 ASR 直接 diarize/embed → 拒绝；
+      2. 短 ASR + 长音频 diarize → 摘要不匹配，拒绝；
+      3. 同一次 ASR 后重复 diarize/embed → 超过配套次数，拒绝；
+      4. 换账号调用 → 归属不匹配，拒绝；
+      5. 授权过期 → 拒绝；
+      6. 正常 ASR → diarize/embed 成功，且当日 ASR 分钟数**不变**；
+      7. TTS 字符额度不受影响；并发/设备检查仍然生效；用户 1 QPS 只作用于
+         ASR/TTS，companion 跳过（否则 ASR→diarize 紧邻会被 429 误杀）。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self._token, self.headers, self._order = self.create_paid_client()
+        self.account_id = self.uid()
+        self._fast_qps()
+        self.audio = _wav_bytes(seconds=0.2)
+        self.long_audio = _wav_bytes(seconds=0.4)
+
+    # ---- helpers ---------------------------------------------------------
+
+    def _fast_qps(self):
+        """把账号 QPS 拉到 1000，免得 1 QPS 干扰"配套次数"用例。
+
+        专门测 QPS 的那条会再把它改回 1。
+        """
+        row = dict(self.store.entitlement(self.account_id))
+        row["qps"] = 1000
+        self.store.upsert_entitlement(row)
+        self.svc.forget_entitlement(self.account_id)
+
+    def _asr(self, data=None, headers=None):
+        r = self.client.post("/v1/asr",
+                             content=self.audio if data is None else data,
+                             headers=headers or self.headers)
+        self.assertEqual(r.status_code, 200, r.text)
+        time.sleep(0.02)                    # 令牌桶按 1000/s 补
+        return r
+
+    def _post(self, path, data=None, headers=None):
+        r = self.client.post(path, content=self.audio if data is None else data,
+                             headers=headers or self.headers)
+        time.sleep(0.02)
+        return r
+
+    def _unbound_headers(self, name):
+        """造一个**没有绑定账号**的客户端（老路），返回它的能力请求头。"""
+        code = self.state.auth.create_pairing_code("test")
+        paired = self.state.auth.redeem(code, name)
+        raw = base64.b64encode(("%s:%s" % (paired["clientId"],
+                                           paired["secret"])).encode()).decode()
+        r = self.client.post("/v1/token",
+                             headers={"Authorization": "Basic " + raw})
+        self.assertEqual(r.status_code, 200, r.text)
+        return {"Authorization": "Bearer " + r.json()["accessToken"],
+                "Content-Type": "audio/wav"}
+
+    # ---- 1. 没有 ASR -----------------------------------------------------
+
+    def test_diarize_without_asr_is_refused(self):
+        r = self._post("/v1/diarize")
+        self.assertEqual(r.status_code, 403, r.text)
+        self.assertEqual(r.json()["code"], "companion_not_allowed")
+        self.assertIn("ASR", r.json().get("detail", ""))
+
+    def test_embed_without_asr_is_refused(self):
+        r = self._post("/v1/speaker/embed")
+        self.assertEqual(r.status_code, 403, r.text)
+        self.assertEqual(r.json()["code"], "companion_not_allowed")
+
+    # ---- 6. 正常 ASR → 配套成功且不扣分钟 ---------------------------------
+
+    def test_asr_then_diarize_is_allowed_and_does_not_charge_minutes(self):
+        self._asr()
+        before = self.state.user_quota.used_minutes(self.account_id)
+        tts_before = self.state.tts_ledger.remaining(self.account_id)
+        r = self._post("/v1/diarize")
+        self.assertEqual(r.status_code, 200, r.text)
+        # 200 本身已经证明 ASR 与 diarize 对同一段上传算出了同一个摘要 ——
+        # 两边各自走 `to_wav16k()`，这里传的是同一份 bytes。
+        # **分离不增加每日分钟**：ASR 那 0.2 秒已经记过，diarize 一分不加。
+        self.assertEqual(self.state.user_quota.used_minutes(self.account_id), before)
+        # **TTS 字符额度不受影响**。
+        self.assertEqual(self.state.tts_ledger.remaining(self.account_id), tts_before)
+        self.assertIn("quotaRemainingMinutes", r.json())
+
+    def test_the_hash_is_the_same_after_asr_and_diarize_normalization(self):
+        """必须证明 hash 口径可行（issue #20 决策 2），不能凭感觉选。
+
+        同一次上传原样交给 ASR、再原样交给 diarize/embed，两边都会走
+        `server/audio.py::to_wav16k()`；本用例把同一段 bytes 再规整一次，
+        算出的 SHA-256 必须**等于 ASR 记下的那条**。这样"ASR 成功 → diarize 200"
+        就不再是碰巧，而是同一个摘要。
+        """
+        from server import audio as audio_mod
+
+        self._asr()
+        uid = self.account_id
+        # 服务端在 ASR 时把摘要写进了 companion_grants；把它算出来做对照。
+        src = os.path.join(self.tmp, "companion-src.wav")
+        with open(src, "wb") as fh:
+            fh.write(self.audio)
+        norm = os.path.join(self.tmp, "companion-16k.wav")
+        audio_mod.to_wav16k(src, norm, "audio/wav", self.cfg)
+        digest = audio_mod.digest_wav16k(norm)
+        # 先证明"有授权"不等于"随便什么摘要都放行"。
+        self.assertEqual(self.store.claim_companion_grant(
+            uid, "", "diarize", "0" * 64), "missing")
+        # 再证明 ASR 记下的摘要 == diarize 端规整出的摘要。
+        self.assertEqual(self.store.claim_companion_grant(
+            uid, "", "diarize", digest), "ok")
+
+    def test_one_asr_allows_one_diarize_and_one_embed(self):
+        self._asr()
+        first = self._post("/v1/diarize")
+        self.assertEqual(first.status_code, 200, first.text)
+        embed = self._post("/v1/speaker/embed")
+        self.assertEqual(embed.status_code, 200, embed.text)
+        # 两种各 1 次；再来一次 diarize 就超了。
+        again = self._post("/v1/diarize")
+        self.assertEqual(again.status_code, 403, again.text)
+        self.assertEqual(again.json()["code"], "companion_not_allowed")
+        self.assertIn("用完", again.json().get("detail", ""))
+
+    # ---- 2/3/4/5. 不匹配、超次数、换账号、过期 ----------------------------
+
+    def test_a_different_audio_is_refused(self):
+        self._asr(self.audio)
+        r = self._post("/v1/diarize", self.long_audio)
+        self.assertEqual(r.status_code, 403, r.text)
+        self.assertEqual(r.json()["code"], "companion_not_allowed")
+        self.assertIn("不一致", r.json().get("detail", ""))
+
+    def test_repeating_diarize_beyond_the_allowance_is_refused(self):
+        self._asr()
+        self.assertEqual(self._post("/v1/diarize").status_code, 200)
+        r = self._post("/v1/diarize")
+        self.assertEqual(r.status_code, 403, r.text)
+        self.assertEqual(r.json()["code"], "companion_not_allowed")
+
+    def test_another_account_cannot_use_the_grant(self):
+        _other_token, other_headers, _order = self.create_paid_client(
+            "E002", buyer_id="mock-buyer-e002")
+        self._asr()
+        r = self._post("/v1/diarize", headers=other_headers)
+        self.assertEqual(r.status_code, 403, r.text)
+        self.assertEqual(r.json()["code"], "companion_not_allowed")
+
+    def test_an_expired_grant_is_refused(self):
+        self.cfg.raw["billing"]["companion_ttl_s"] = 0.01
+        self._asr()
+        time.sleep(0.05)
+        r = self._post("/v1/diarize")
+        self.assertEqual(r.status_code, 403, r.text)
+        self.assertEqual(r.json()["code"], "companion_not_allowed")
+        self.assertIn("过期", r.json().get("detail", ""))
+
+    # ---- 7. QPS / 并发 --------------------------------------------------
+
+    def test_companion_is_not_blocked_by_the_asr_qps(self):
+        """qps=1 时 ASR 后**立刻** diarize 仍应 200（评审阻塞点）。
+
+        ASR 刚吃掉唯一一个令牌；companion 不再吃同一个 1 QPS 桶。否则短音频或
+        健康探针的 ASR→diarize 合法配套会被 429 误杀，会议这一段就没有说话人。
+        ASR 自身的 1 QPS 限制由 `test_one_qps_is_enforced_per_account` 钉住。
+        """
+        row = dict(self.store.entitlement(self.account_id))
+        row["qps"] = 1
+        self.store.upsert_entitlement(row)
+        self.svc.forget_entitlement(self.account_id)
+        self._asr()
+        r = self._post("/v1/diarize")
+        self.assertEqual(r.status_code, 200, r.text)
+
+    def test_companion_is_rejected_when_the_single_slot_is_already_held(self):
+        """满载：1 个并发槽已被占，diarize 必须 409（与 ASR 同一条 user 闸门）。
+
+        另一个线程同时发 diarize 的时序不稳定（TestClient 会把同一客户端串行化）；
+        这里把槽先占住，直接钉住"满载时 companion 也要过这道闸"。
+        """
+        self._asr()
+        with self.svc.concurrency.hold(self.account_id, 1):
+            r = self._post("/v1/diarize")
+        self.assertEqual(r.status_code, 409, r.text)
+        self.assertEqual(r.json()["code"], "client_busy")
+
+    # ---- 失败策略 / 原子性 / 持久化 / 未绑定账号隔离（评审结论 5、7）-------
+
+    def test_a_failed_asr_does_not_issue_a_companion_grant(self):
+        with patch.object(_FakeEngine, "transcribe",
+                          side_effect=errors.model_failed("boom")):
+            r = self.client.post("/v1/asr", content=self.audio,
+                                 headers=self.headers)
+        self.assertEqual(r.status_code, 503, r.text)
+        r = self._post("/v1/diarize")
+        self.assertEqual(r.status_code, 403, r.text)
+        self.assertEqual(r.json()["code"], "companion_not_allowed")
+
+    def test_a_5xx_inference_refunds_the_companion_slot(self):
+        self._asr()
+        with patch.object(_FakeEngine, "analyze",
+                          side_effect=errors.model_failed("boom")):
+            r = self._post("/v1/diarize")
+        self.assertEqual(r.status_code, 503, r.text)
+        # 退回后同一份授权还能再用一次（会议不会因为一次引擎 500 永远没有说话人）。
+        r = self._post("/v1/diarize")
+        self.assertEqual(r.status_code, 200, r.text)
+
+    def test_a_4xx_inference_does_not_refund(self):
+        self._asr()
+        with patch.object(_FakeEngine, "analyze",
+                          side_effect=errors.bad_request("bad")):
+            r = self._post("/v1/diarize")
+        self.assertEqual(r.status_code, 400, r.text)
+        # 4xx 是客户端错误，不退；同一份授权已经用掉。
+        r = self._post("/v1/diarize")
+        self.assertEqual(r.status_code, 403, r.text)
+        self.assertEqual(r.json()["code"], "companion_not_allowed")
+
+    def test_unbound_clients_are_isolated_by_client_id(self):
+        a = self._unbound_headers("A 客户")
+        b = self._unbound_headers("B 客户")
+        r = self.client.post("/v1/asr", content=self.audio, headers=a)
+        self.assertEqual(r.status_code, 200, r.text)
+        time.sleep(0.02)
+        # B 不能用 A 的 ASR 授权。
+        r = self.client.post("/v1/diarize", content=self.audio, headers=b)
+        self.assertEqual(r.status_code, 403, r.text)
+        self.assertEqual(r.json()["code"], "companion_not_allowed")
+        # A 自己可以。
+        r = self.client.post("/v1/diarize", content=self.audio, headers=a)
+        self.assertEqual(r.status_code, 200, r.text)
+
+    def test_two_concurrent_claims_only_one_wins(self):
+        store = store_mod.Store(":memory:")
+        self.addCleanup(store.close)
+        store.put_companion_grant("u-1", "", "hash-1", per_asr=1, ttl_s=3600)
+        barrier = threading.Barrier(2)
+        out = []
+
+        def go():
+            barrier.wait()
+            out.append(store.claim_companion_grant(
+                "u-1", "", "diarize", "hash-1"))
+
+        threads = [threading.Thread(target=go) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(10)
+        self.assertEqual(sorted(out), ["exhausted", "ok"],
+                         "原子 UPDATE 必须保证 remaining=1 只被扣一次：%s" % out)
+
+    def test_a_grant_survives_a_store_restart(self):
+        path = os.path.join(self.tmp, "companion-restart.db")
+        first = store_mod.Store(path)
+        first.put_companion_grant("u-1", "", "hash-1", per_asr=1, ttl_s=3600)
+        first.close()
+        second = store_mod.Store(path)
+        self.addCleanup(second.close)
+        self.assertTrue(second.has_companion_grant("u-1", ""))
+        self.assertEqual(second.claim_companion_grant(
+            "u-1", "", "embed", "hash-1"), "ok")
+
+
+class _PlainAppCase(unittest.TestCase):
+    """没有 billing 闸门的 app 夹具（auth 开/关两种都由子类改 cfg）。"""
+
+    def setUp(self):
+        from app import paths
+        self._paths_seam = getattr(paths, "_settings_get", None)
+        self.addCleanup(self._restore_paths_seam)
+        self.tmp = tempfile.mkdtemp(prefix="echo-plain-app-")
+        self.cfg = _cfg(self.tmp)
+        # 服务端自己的 state 也落临时目录（别碰开发机上真实的那份）。
+        self.cfg.raw["server"]["state_root"] = os.path.join(self.tmp, "state")
+        self._configure(self.cfg)
+        p = patch.object(engines, "build_loaders",
+                         lambda device="cuda": {"fake": _fake_loader})
+        p.start()
+        self.addCleanup(p.stop)
+        self.app = server_main.create_app(self.cfg)
+        self.client = TestClient(self.app)
+        self.client.__enter__()
+        self.addCleanup(lambda: self.client.__exit__(None, None, None))
+        self.state = self.app.state.echo
+        self.store = self.state.auth.store
+
+    def _configure(self, cfg):
+        raise NotImplementedError
+
+    def _restore_paths_seam(self):
+        from app import paths
+        if self._paths_seam is None:
+            try:
+                delattr(paths, "_settings_get")
+            except AttributeError:
+                pass
+        else:
+            paths._settings_get = self._paths_seam
+
+
+class LegacyClientQuotaTests(_PlainAppCase):
+    """auth 关时，diarize 不再被旧 client 日额度拦（评审结论 2/7）。"""
+
+    def _configure(self, cfg):
+        cfg.raw["auth"]["enabled"] = False
+        # 0.01 分钟 = 0.6 秒：下面一次 1 秒 ASR 会把它用超，旧逻辑下 diarize 会 429。
+        cfg.raw["limits"]["daily_audio_minutes"] = 0.01
+
+    def test_diarize_is_not_blocked_by_the_legacy_client_quota(self):
+        headers = {"Content-Type": "audio/wav"}
+        r = self.client.post("/v1/asr", content=_wav_bytes(seconds=1.0),
+                             headers=headers)
+        self.assertEqual(r.status_code, 200, r.text)
+        r = self.client.post("/v1/diarize", content=_wav_bytes(seconds=1.0),
+                             headers=headers)
+        self.assertEqual(r.status_code, 200,
+                         "auth 关时 diarize 不该再被旧 client 日额度拦：%s" % r.text)
+
+
+class CompanionWithoutBillingTests(_PlainAppCase):
+    """有鉴权、未开收费也按账号做配套校验（评审结论 4）。"""
+
+    def _configure(self, cfg):
+        cfg.raw["auth"]["enabled"] = True
+        cfg.raw["auth"]["mode"] = "jwt"
+        cfg.raw["auth"]["jwt_secret"] = "0123456789abcdef0123456789abcdef"
+        cfg.raw["auth"]["clock_skew_s"] = 0
+        cfg.raw["billing"]["enabled"] = False
+
+    def setUp(self):
+        super().setUp()
+        user = self.store.create_user("usr-companion", name="测试",
+                                      employee_no="E-COMPANION")
+        code = self.state.auth.create_pairing_code("test")
+        paired = self.state.auth.redeem(code, "绑定机")
+        self.store.upsert_device(user["user_id"], paired["clientId"], "绑定机")
+        raw = base64.b64encode(("%s:%s" % (paired["clientId"],
+                                           paired["secret"])).encode()).decode()
+        r = self.client.post("/v1/token",
+                             headers={"Authorization": "Basic " + raw})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.headers = {"Authorization": "Bearer " + r.json()["accessToken"],
+                        "Content-Type": "audio/wav"}
+
+    def test_bound_account_is_enforced_even_with_billing_off(self):
+        audio = _wav_bytes(seconds=0.2)
+        r = self.client.post("/v1/diarize", content=audio, headers=self.headers)
+        self.assertEqual(r.status_code, 403, r.text)
+        self.assertEqual(r.json()["code"], "companion_not_allowed")
+        r = self.client.post("/v1/asr", content=audio, headers=self.headers)
+        self.assertEqual(r.status_code, 200, r.text)
+        r = self.client.post("/v1/diarize", content=audio, headers=self.headers)
+        self.assertEqual(r.status_code, 200, r.text)
