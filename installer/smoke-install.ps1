@@ -210,12 +210,20 @@ try {
     }
     exit 1
 } finally {
+    # Always salvage ECHO's own logs before cleaning up: on a failed/cancelled start or
+    # stop, launcher.log / echo-server.log are the only evidence of why.
+    $salvage = Join-Path $WorkDir 'data-logs'
+    New-Item -ItemType Directory -Force -Path $salvage | Out-Null
+    $liveLogs = Join-Path $dataRoot 'logs'
+    if (Test-Path -LiteralPath $liveLogs) {
+        Copy-Item -Path (Join-Path $liveLogs '*') -Destination $salvage -Recurse -Force -ErrorAction SilentlyContinue
+    }
     if ($KeepArtifacts) {
         Write-Host ('  artifacts kept: ' + $WorkDir)
     } else {
         Remove-Item -LiteralPath $WorkDir -Recurse -Force -ErrorAction SilentlyContinue
     }
-    if ($createdState) {
+    if ($createdState -and -not $KeepArtifacts) {
         # Only remove what this smoke created; a pre-existing install is never touched.
         Remove-Item -LiteralPath (Join-Path $env:LOCALAPPDATA 'ECHO') -Recurse -Force -ErrorAction SilentlyContinue
     }

@@ -81,6 +81,17 @@ jobs:
           $setup = (Get-ChildItem dist/ECHO-Setup-*.exe | Sort-Object LastWriteTime | Select-Object -Last 1).FullName
           & "$env:GITHUB_WORKSPACE\installer\smoke-install.ps1" -Setup $setup -WorkDir dist/smoke -KeepArtifacts
 
+      - name: Collect ECHO logs
+        if: always()
+        shell: powershell
+        run: |
+          $dst = Join-Path $env:GITHUB_WORKSPACE 'dist/smoke/data-logs'
+          New-Item -ItemType Directory -Force -Path $dst | Out-Null
+          $src = Join-Path $env:LOCALAPPDATA 'ECHO\logs'
+          if (Test-Path -LiteralPath $src) {
+            Copy-Item -Path (Join-Path $src '*') -Destination $dst -Recurse -Force -ErrorAction SilentlyContinue
+          }
+
       - name: Upload installer and smoke logs
         if: always()
         uses: actions/upload-artifact@v4
