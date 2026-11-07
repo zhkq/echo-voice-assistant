@@ -309,6 +309,18 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
 
     version = (args.version or read_version()).strip()
+    if os.name == "nt":
+        # build-package.ps1 is Windows PowerShell 5.1 code (Get-FileHash etc.).  When this
+        # script is launched from PowerShell 7 (the GitHub runner default), the child 5.1
+        # process inherits a PS7 PSModulePath and loses Microsoft.PowerShell.Utility.
+        system_root = os.environ.get("SystemRoot", r"C:\Windows")
+        win_ps = os.path.join(system_root, "System32", "WindowsPowerShell", "v1.0", "Modules")
+        parts = [
+            os.path.join(os.environ.get("USERPROFILE", ""), "Documents", "WindowsPowerShell", "Modules"),
+            os.path.join(os.environ.get("ProgramFiles", ""), "WindowsPowerShell", "Modules"),
+            win_ps,
+        ]
+        os.environ["PSModulePath"] = ";".join(p for p in parts if p)
     out_dir = Path(args.out).resolve()
     stage = Path(args.stage).resolve()
     say(f"ECHO installer {version}")

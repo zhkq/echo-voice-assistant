@@ -70,6 +70,22 @@ $root = Split-Path $PSScriptRoot -Parent
 if (-not $OutDir) { $OutDir = Join-Path $root 'dist' }
 
 function Say([string]$m)  { Write-Host "  $m" }
+
+function Get-Sha256([string]$Path) {
+    # 不依赖 Get-FileHash：GitHub runner 从 PowerShell 7 的步骤里拉起 5.1 子进程时，
+    # 继承过去的 PSModulePath 可能让 Microsoft.PowerShell.Utility 载不进来（2026-11-07
+    # CI 实测：Get-FileHash 找不到）。.NET 的 SHA256 在两种 PowerShell 里都在。
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    $stream = $null
+    try {
+        $stream = [System.IO.File]::OpenRead($Path)
+        $hash = $sha.ComputeHash($stream)
+        return (($hash | ForEach-Object { $_.ToString('x2') }) -join '')
+    } finally {
+        if ($stream) { $stream.Dispose() }
+        $sha.Dispose()
+    }
+}
 function Ok([string]$m)   { Write-Host "  [ok]   $m" -ForegroundColor Green }
 function Warn([string]$m) { Write-Host "  [warn] $m" -ForegroundColor Yellow }
 function Die([string]$m)  { Write-Host "  [fail] $m" -ForegroundColor Red; Unlock-Pack; exit 1 }
@@ -363,7 +379,7 @@ if ($Profile -eq 'component' -or $Profile -eq 'offline') {
     $sums = New-Object System.Collections.Generic.List[string]
     foreach ($f in ($stageFiles | Sort-Object FullName)) {
         $rel = $f.FullName.Substring($stage.Length + 1).Replace('\', '/')
-        $h = (Get-FileHash -LiteralPath $f.FullName -Algorithm SHA256).Hash.ToLower()
+        $h = (Get-Sha256 $f.FullName)
         $sums.Add("$h  $rel")
     }
     $packManifest = [ordered]@{
@@ -402,7 +418,7 @@ if ($Profile -eq 'component' -or $Profile -eq 'offline') {
     } finally { $zip.Dispose() }
     if (Test-Path -LiteralPath $zipPath) { Remove-Item -LiteralPath $zipPath -Force }
     Move-Item -LiteralPath $zipTmp -Destination $zipPath -Force
-    $zipHash = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLower()
+    $zipHash = (Get-Sha256 $zipPath)
     [System.IO.File]::WriteAllText("$zipPath.sha256", "$zipHash  $(Split-Path $zipPath -Leaf)`n",
         (New-Object System.Text.UTF8Encoding($false)))
     Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue
@@ -626,7 +642,7 @@ $info = @(
 
 $sums = New-Object System.Collections.Generic.List[string]
 foreach ($f in ($files | Sort-Object Rel)) {
-    $h = (Get-FileHash -LiteralPath (Join-Path $stage (Get-StagedRel $f.Rel).Replace('/', '\')) -Algorithm SHA256).Hash.ToLower()
+    $h = (Get-Sha256 (Join-Path $stage (Get-StagedRel $f.Rel).Replace('/', '\')))
     $sums.Add("$h  $($f.Rel)")
 }
 [System.IO.File]::WriteAllLines((Join-Path $stage 'SHA256SUMS.txt'), $sums, (New-Object System.Text.UTF8Encoding($false)))
@@ -726,7 +742,7 @@ if ($viol.Count -gt 0) {
 }
 Ok "zip re-checked: $($entries.Count) entries, no forbidden paths"
 
-$zipHash = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLower()
+$zipHash = (Get-Sha256 $zipPath)
 [System.IO.File]::WriteAllText("$zipPath.sha256", "$zipHash  $zipName`n", (New-Object System.Text.UTF8Encoding($false)))
 Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue
 

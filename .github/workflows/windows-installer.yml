@@ -68,19 +68,18 @@ jobs:
           "ISCC=$iscc" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Build installer
-        shell: pwsh
+        shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
           python scripts/build_installer.py --iscc $env:ISCC --out dist
           if (-not (Test-Path dist/ECHO-Setup-*.exe)) { throw "no ECHO-Setup built" }
 
       - name: Silent install / start / stop / uninstall / upgrade smoke
-        shell: pwsh
+        shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
           $setup = (Get-ChildItem dist/ECHO-Setup-*.exe | Sort-Object LastWriteTime | Select-Object -Last 1).FullName
-          powershell -NoProfile -ExecutionPolicy Bypass -File installer/smoke-install.ps1 `
-            -Setup $setup -WorkDir dist/smoke -KeepArtifacts
+          & "$env:GITHUB_WORKSPACE\installer\smoke-install.ps1" -Setup $setup -WorkDir dist/smoke -KeepArtifacts
 
       - name: Upload installer and smoke logs
         if: always()
