@@ -66,6 +66,11 @@ _NETWORK_DENIED = (
     ("POST", re.compile(r"^/api/meetings/clean-short$"), "不允许从手机/手表批量删会议"),
     ("PUT", re.compile(r"^/api/settings$"), "不允许从手机/手表改设置"),
     ("POST", re.compile(r"^/api/settings/reset$"), "不允许从手机/手表重置设置"),
+    # 账号与设备绑定（issue #23）：账号会话/凭据只该在本机进程里产生；
+    # 手机/手表即使拿着 API 令牌，也不该改这台电脑登录的是谁、绑的是哪台设备。
+    ("POST", re.compile(r"^/api/account/(login|register|email/code|password/reset|"
+                        r"logout|devices/bind|devices/unbind)$"),
+     "不允许从手机/手表操作本机账号与设备绑定"),
 )
 
 

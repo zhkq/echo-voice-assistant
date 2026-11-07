@@ -279,6 +279,16 @@ class BindTests(_AccountAdminCase):
             self.assertIn(needle, caught.exception.message, code)
         self.assertIsNone(cred.load())
 
+    def test_404_is_reported_as_an_old_server_not_a_network_error(self):
+        self.fake.bind_status = 404
+        self.fake.bind_code = "not_found"
+        self.login()
+        with self.assertRaises(account_admin.AccountError) as caught:
+            account_admin.bind_device()
+        self.assertEqual(caught.exception.status, 404)
+        self.assertIn("版本较旧", caught.exception.message)
+        self.assertIn("手动配对", caught.exception.message)
+
     def test_unbind_own_device_clears_local_credentials(self):
         cred.save(BackendCredentials(base_url="http://gpu-01:8900",
                                      client_id="cli-old", secret="old-secret"))

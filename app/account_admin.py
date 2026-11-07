@@ -103,6 +103,11 @@ def _translate(err: pairing.PairingError) -> AccountError:
                             retry_after=wait or None)
     if code == "billing_disabled":
         return AccountError("该服务端未开通账号计费", code=code, status=404)
+    if status == 404:
+        # 旧服务端没有 `/v1/account/devices/bind`（或路径被反代挡了）：
+        # **明确说"版本较旧，请手动配对"**，而不是把 404 说成"账号服务请求失败"。
+        return AccountError("服务端还不支持登录自动绑定（版本较旧），请手动配对",
+                            code=code or "not_found", status=404)
     if code == "auth_misconfigured":
         return AccountError("服务端鉴权配置不完整，请联系管理员", code=code, status=503)
     return AccountError(detail or "账号服务请求失败", code=code, status=status or 400)

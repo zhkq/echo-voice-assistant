@@ -400,7 +400,15 @@ class NetworkDenyListTests(_ApiBase):
               ("DELETE", "/api/meetings/9"),
               ("POST", "/api/meetings/clean-short"),
               ("PUT", "/api/settings"),
-              ("POST", "/api/settings/reset"))
+              ("POST", "/api/settings/reset"),
+              # issue #23：账号会话与设备绑定只该在本机进程里发生
+              ("POST", "/api/account/login"),
+              ("POST", "/api/account/register"),
+              ("POST", "/api/account/email/code"),
+              ("POST", "/api/account/password/reset"),
+              ("POST", "/api/account/logout"),
+              ("POST", "/api/account/devices/bind"),
+              ("POST", "/api/account/devices/unbind"))
 
     @classmethod
     def setUpClass(cls):
