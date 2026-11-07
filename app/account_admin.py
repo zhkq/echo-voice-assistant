@@ -362,10 +362,13 @@ def bind_device(force: bool = False, *, client_name: str = "",
                 "pair": _pair_view(existing), "deviceId": device_id()}
 
     host = _hostname()
+    # 只取一次：如果 `{DATA}` 不可写，第二次生成会是一个**不同的** id，
+    # 而服务端已经按第一次的 id 绑好了（响应里报错的那个值会骗人）。
+    did = device_id()
     try:
         creds = pairing.bind_with_account(
             str(session["serverUrl"]), str(session["userToken"]),
-            device_id=device_id(),
+            device_id=did,
             client_name=str(client_name or host or "我的 ECHO"),
             device_name=str(device_name or host),
             platform=str(platform_name or platform.current()),
@@ -374,7 +377,7 @@ def bind_device(force: bool = False, *, client_name: str = "",
     except pairing.PairingError as exc:
         raise _translate(exc) from None
     return {"ok": True, "skipped": False, "pair": _pair_view(creds),
-            "deviceId": device_id()}
+            "deviceId": did}
 
 
 def unbind_device(client_id: str) -> Dict[str, Any]:
