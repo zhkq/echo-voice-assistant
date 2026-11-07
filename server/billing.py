@@ -54,7 +54,7 @@ router = APIRouter(prefix="/v1/billing")
 #: 出厂套餐（任务书 T3 / 设计 §0、§4.5、§6）。**管理面可改价/下架**；
 #: 这里只是"第一次启动时补缺"（`Store.seed_plans` 是 `INSERT OR IGNORE`）。
 DEFAULT_PLANS = (
-    {"code": "monthly", "name": "月卡", "price_cents": 1000, "days": 30,
+    {"code": "monthly", "name": "基础版：Basic", "price_cents": 1000, "days": 30,
      "daily_audio_minutes": 120.0, "tts_chars": 50000, "qps": 1,
      "max_devices": 3, "max_concurrent": 1, "active": 1, "sort": 10},
     {"code": "trial", "name": "7 天试用", "price_cents": 0, "days": 7,
