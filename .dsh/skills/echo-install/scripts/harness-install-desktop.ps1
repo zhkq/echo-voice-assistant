@@ -30,6 +30,9 @@ param(
     [switch]$DefaultLocation,
     [int]$TimeoutSec = 900,
     [string]$LogFile = '',
+    # Optional UTF-8 file for the resulting command/version. ECHO's first-run
+    # wizard uses this instead of parsing PowerShell stdout (Chinese paths).
+    [string]$CommandFile = '',
     # Optional already-downloaded official installer .exe (side-load for offline
     # / intranet machines). Empty = search next to this script and up to the
     # delivery folder, then fall back to downloading.
@@ -141,6 +144,15 @@ function Emit([string]$cmd, [string]$version, [string]$dir) {
     Write-Output ('HARNESS_COMMAND=' + (Get-Offset $cmd))
     if ($version) { Write-Output ('DSH_VERSION=' + $version) }
     if ($dir) { Write-Output ('DSH_INSTALL_DIR=' + $dir) }
+    if ($CommandFile) {
+        try {
+            $cdir = Split-Path -Parent $CommandFile
+            if ($cdir) { New-Item -ItemType Directory -Force -Path $cdir | Out-Null }
+            $utf8 = New-Object System.Text.UTF8Encoding($false)
+            [System.IO.File]::WriteAllText($CommandFile, (Get-Offset $cmd), $utf8)
+            if ($version) { [System.IO.File]::WriteAllText($CommandFile + '.version', $version, $utf8) }
+        } catch { }
+    }
 }
 
 function Find-CliUnderRoot([string]$root) {

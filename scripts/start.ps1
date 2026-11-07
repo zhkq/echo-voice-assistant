@@ -39,6 +39,13 @@ $base = $roots.Base
 $py = Join-Path $base 'runtime-core\python.exe'
 if (-not (Test-Path $py)) { $py = Join-Path $base 'runtime-core\Scripts\python.exe' }
 if (-not (Test-Path $py)) { $py = Join-Path $base 'venv\Scripts\python.exe' }
+# Installer layout: ECHO_BASE points at the persistent state root while the runtime sits
+# next to echo-core in the program directory. Check that sibling location too.
+$appRoot = $root
+if ((Split-Path $root -Leaf) -ieq 'echo-core') { $appRoot = Split-Path $root -Parent }
+if (-not (Test-Path $py)) { $py = Join-Path $appRoot 'runtime-core\python.exe' }
+if (-not (Test-Path $py)) { $py = Join-Path $appRoot 'runtime-core\Scripts\python.exe' }
+if (-not (Test-Path $py)) { $py = Join-Path $appRoot 'venv\Scripts\python.exe' }
 if (-not (Test-Path $py)) { $py = Join-Path $root 'runtime-core\python.exe' }
 if (-not (Test-Path $py)) { $py = Join-Path $root 'runtime-core\Scripts\python.exe' }
 if (-not (Test-Path $py)) { $py = Join-Path $root 'venv\Scripts\python.exe' }

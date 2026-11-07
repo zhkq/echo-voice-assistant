@@ -101,3 +101,7 @@ _obsolete-scripts-*/
 # 它只服务 android/ 那个 App 的本地构建（android/ 本身要不要入库另说，见提交说明）。
 .tools/
 
+
+# .NET build output (launcher/ECHO.Launcher*/bin|obj)
+launcher/**/bin/
+launcher/**/obj/

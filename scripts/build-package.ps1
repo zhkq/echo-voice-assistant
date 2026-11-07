@@ -46,7 +46,7 @@
 # ASCII-ONLY on purpose (see echo-instance-lib.ps1).
 # =====================================================================
 param(
-    [ValidateSet('public', 'main', 'internal', 'component', 'offline')][string]$Profile = 'public',
+    [ValidateSet('public', 'main', 'installer', 'internal', 'component', 'offline')][string]$Profile = 'public',
     [string]$OutDir = '',
     [string]$Version = '',
     [string]$Component = '',
@@ -70,6 +70,34 @@ $root = Split-Path $PSScriptRoot -Parent
 if (-not $OutDir) { $OutDir = Join-Path $root 'dist' }
 
 function Say([string]$m)  { Write-Host "  $m" }
+
+function Get-Sha256([string]$Path) {
+    # 不依赖 Get-FileHash：GitHub runner 从 PowerShell 7 的步骤里拉起 5.1 子进程时，
+    # 继承过去的 PSModulePath 可能让 Microsoft.PowerShell.Utility 载不进来（2026-11-07
+    # CI 实测：Get-FileHash 找不到）。.NET 的 SHA256 在两种 PowerShell 里都在。
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    $stream = $null
+    try {
+        $stream = [System.IO.File]::OpenRead($Path)
+        $hash = $sha.ComputeHash($stream)
+        return (($hash | ForEach-Object { $_.ToString('x2') }) -join '')
+    } finally {
+        if ($stream) { $stream.Dispose() }
+        $sha.Dispose()
+    }
+}
+
+function Get-RelFromStage([string]$full) {
+    # $env:TEMP can be the 8.3 short form (RUNNER~1) while Get-ChildItem returns the long
+    # form, so `$full.Substring($stage.Length + 1)` cuts into the stage GUID and produces
+    # entries like "40/ECHO/...".  Locate the unique stage leaf instead.
+    $leaf = Split-Path -Leaf $stage
+    $idx = $full.IndexOf($leaf, [System.StringComparison]::OrdinalIgnoreCase)
+    if ($idx -ge 0) {
+        return $full.Substring($idx + $leaf.Length).TrimStart('\', '/').Replace('\', '/')
+    }
+    return $full.Substring($stage.Length + 1).Replace('\', '/')
+}
 function Ok([string]$m)   { Write-Host "  [ok]   $m" -ForegroundColor Green }
 function Warn([string]$m) { Write-Host "  [warn] $m" -ForegroundColor Yellow }
 function Die([string]$m)  { Write-Host "  [fail] $m" -ForegroundColor Red; Unlock-Pack; exit 1 }
@@ -355,15 +383,15 @@ if ($Profile -eq 'component' -or $Profile -eq 'offline') {
         Say 'largest contributors:'
         $stageFiles | Sort-Object Length -Descending | Select-Object -First 8 | ForEach-Object {
             Say ("    {0,10} MB  {1}" -f [Math]::Round($_.Length / 1MB, 1),
-                 $_.FullName.Substring($stage.Length + 1))
+                 (Get-RelFromStage $_.FullName))
         }
         Die ("offline bundle is {0} MB unpacked - over the 700 MB budget" -f [Math]::Round($packBytes / 1MB, 2))
     }
     if ($Profile -eq 'offline') { Ok ("offline bundle size gate: {0} MB <= 700 MB" -f [Math]::Round($packBytes / 1MB, 2)) }
     $sums = New-Object System.Collections.Generic.List[string]
     foreach ($f in ($stageFiles | Sort-Object FullName)) {
-        $rel = $f.FullName.Substring($stage.Length + 1).Replace('\', '/')
-        $h = (Get-FileHash -LiteralPath $f.FullName -Algorithm SHA256).Hash.ToLower()
+        $rel = Get-RelFromStage $f.FullName
+        $h = (Get-Sha256 $f.FullName)
         $sums.Add("$h  $rel")
     }
     $packManifest = [ordered]@{
@@ -395,14 +423,14 @@ if ($Profile -eq 'component' -or $Profile -eq 'offline') {
     $zip = [System.IO.Compression.ZipFile]::Open($zipTmp, [System.IO.Compression.ZipArchiveMode]::Create)
     try {
         foreach ($f in (Get-ChildItem $stage -Recurse -File -Force | Sort-Object FullName)) {
-            $rel = $f.FullName.Substring($stage.Length + 1).Replace('\', '/')
+            $rel = Get-RelFromStage $f.FullName
             [void][System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
                 $zip, $f.FullName, $rel, [System.IO.Compression.CompressionLevel]::Optimal)
         }
     } finally { $zip.Dispose() }
     if (Test-Path -LiteralPath $zipPath) { Remove-Item -LiteralPath $zipPath -Force }
     Move-Item -LiteralPath $zipTmp -Destination $zipPath -Force
-    $zipHash = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLower()
+    $zipHash = (Get-Sha256 $zipPath)
     [System.IO.File]::WriteAllText("$zipPath.sha256", "$zipHash  $(Split-Path $zipPath -Leaf)`n",
         (New-Object System.Text.UTF8Encoding($false)))
     Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue
@@ -418,7 +446,7 @@ if ($Profile -eq 'component' -or $Profile -eq 'offline') {
 
 # ---------------------------------------------------------------- whitelist
 $dirs = @('app', 'web', 'mac', 'scripts', 'plugin', 'docs', 'assets', 'dsh-failover', '.dsh', 'sidebar')
-if ($Profile -eq 'main') {
+if ($Profile -eq 'main' -or $Profile -eq 'installer') {
     # components\*.json = the offline component declarations the panel also reads.
     if (Test-Path (Join-Path $root 'components')) { $dirs += @('components') }
     else { Say 'components\ not present yet - manifest.json will declare none' }
@@ -494,7 +522,17 @@ foreach ($d in $dirs) {
     if (-not (Test-Path $full)) { Warn "missing dir, skipped: $d"; continue }
     Get-ChildItem $full -Recurse -File -Force -ErrorAction SilentlyContinue | ForEach-Object {
         $rel = $_.FullName.Substring($root.Length + 1).Replace('\', '/')
-        if (-not (Test-ForbiddenPath $rel)) { $files.Add([pscustomobject]@{ Rel = $rel; Full = $_.FullName; Len = $_.Length }) }
+        if (-not (Test-ForbiddenPath $rel)) {
+            # The installer is a product package, not an evidence archive: integration
+            # branches accumulate multi-MB screenshots/zips under docs/.  Keep the
+            # markdown documentation, skip the binaries (and the D22 size gate would
+            # otherwise fail on evidence files that never ship to users).
+            if ($Profile -eq 'installer' -and $rel -like 'docs/*') {
+                $ext = [System.IO.Path]::GetExtension($rel).ToLower()
+                if (@('.md', '.txt') -notcontains $ext) { return }
+            }
+            $files.Add([pscustomobject]@{ Rel = $rel; Full = $_.FullName; Len = $_.Length })
+        }
     }
 }
 foreach ($f in $rootFiles) {
@@ -546,7 +584,7 @@ Ok 'no forbidden files or content'
 # The main package has exactly one job: be small enough to hand over by mail/IM and to
 # upgrade in seconds. If it grows past the budget, fail here instead of quietly shipping
 # a package that defeats the whole split (REFACTOR-PLAN D22: 10-20 MB, main = code only).
-if ($Profile -eq 'main') {
+if ($Profile -eq 'main' -or $Profile -eq 'installer') {
     if ($totalBytes -gt 20MB) {
         Say 'largest contributors:'
         $files | Sort-Object Len -Descending | Select-Object -First 10 | ForEach-Object {
@@ -616,7 +654,7 @@ $info = @(
 
 $sums = New-Object System.Collections.Generic.List[string]
 foreach ($f in ($files | Sort-Object Rel)) {
-    $h = (Get-FileHash -LiteralPath (Join-Path $stage (Get-StagedRel $f.Rel).Replace('/', '\')) -Algorithm SHA256).Hash.ToLower()
+    $h = (Get-Sha256 (Join-Path $stage (Get-StagedRel $f.Rel).Replace('/', '\')))
     $sums.Add("$h  $($f.Rel)")
 }
 [System.IO.File]::WriteAllLines((Join-Path $stage 'SHA256SUMS.txt'), $sums, (New-Object System.Text.UTF8Encoding($false)))
@@ -694,7 +732,7 @@ Add-Type -AssemblyName System.IO.Compression        # ZipArchiveMode / ZipArchiv
 $zip = [System.IO.Compression.ZipFile]::Open($zipTmp, [System.IO.Compression.ZipArchiveMode]::Create)
 try {
     foreach ($f in (Get-ChildItem $stage -Recurse -File -Force | Sort-Object FullName)) {
-        $rel = $f.FullName.Substring($stage.Length + 1).Replace('\', '/')
+        $rel = Get-RelFromStage $f.FullName
         [void][System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
             $zip, $f.FullName, $rel, [System.IO.Compression.CompressionLevel]::Optimal)
     }
@@ -716,7 +754,7 @@ if ($viol.Count -gt 0) {
 }
 Ok "zip re-checked: $($entries.Count) entries, no forbidden paths"
 
-$zipHash = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLower()
+$zipHash = (Get-Sha256 $zipPath)
 [System.IO.File]::WriteAllText("$zipPath.sha256", "$zipHash  $zipName`n", (New-Object System.Text.UTF8Encoding($false)))
 Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue
 

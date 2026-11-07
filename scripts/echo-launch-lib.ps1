@@ -41,10 +41,19 @@ function Get-EchoRoots {
     # "echo-core" IS the marker. No config file is read here (install.ps1 must work before any
     # settings database exists), and a tree that is not named echo-core keeps the old behaviour
     # byte for byte.
+    # The installer uses a SEPARATE state root: code and runtime live under
+    # %LOCALAPPDATA%\Programs\ECHO, while data/models/... live under %LOCALAPPDATA%\ECHO.
+    # The launcher passes that state root as ECHO_BASE; honour it here so stop.ps1 and
+    # restart-echo.ps1 look for the pid/log/port files where app\paths.py does.
     param([Parameter(Mandatory = $true)][string]$Start)
     $code = $Start
     $base = $Start
-    if ((Split-Path $Start -Leaf) -ieq 'echo-core') { $base = Split-Path $Start -Parent }
+    $override = [string]$env:ECHO_BASE
+    if ($override) {
+        try { $base = [System.IO.Path]::GetFullPath($override) } catch { $base = $override }
+    } elseif ((Split-Path $Start -Leaf) -ieq 'echo-core') {
+        $base = Split-Path $Start -Parent
+    }
     return @{ Code = $code; Base = $base; IsNewLayout = ($base -ne $code) }
 }
 
