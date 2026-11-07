@@ -312,6 +312,32 @@ def device_revoked() -> EchoError:
     return EchoError(403, "device_revoked", "这台设备已被解绑，请重新绑定")
 
 
+def device_bound_to_other_account() -> EchoError:
+    """同一个 `deviceId` 已经 active 在**另一个账号**下（issue #23）。
+
+    409 而不是 403：这不是"你没权限"，而是"这条资源现在归别人"；
+    客户端要引导用户先在原账号解绑，或联系管理员。
+    """
+    return EchoError(409, "device_bound_to_other_account",
+                     "这台设备已绑定到另一个账号，请先在原账号解绑")
+
+
+def client_not_yours() -> EchoError:
+    """`existingClientId` 在服务端存在，但属于另一个账号（issue #23 的认领路径）。"""
+    return EchoError(409, "client_not_yours",
+                     "这条设备凭据属于另一个账号，不能认领")
+
+
+def device_mismatch() -> EchoError:
+    """`existingClientId` 对应的是**另一台设备**（已有非空 deviceId 且与请求不一致）。
+
+    换账号/重装必须先在原账号解绑；认领只允许"同一台设备"或"还没有 deviceId 的历史行"，
+    否则就是拿另一台设备的身份顶替（issue #23 的确认第 2 条）。
+    """
+    return EchoError(409, "device_mismatch",
+                     "这条设备凭据对应的不是这台设备，请先解绑旧设备再重新绑定")
+
+
 def payment_unconfigured() -> EchoError:
     """支付没配好（或本轮只有 Mock、真实网关未接入）。
 

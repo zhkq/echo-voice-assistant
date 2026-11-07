@@ -300,6 +300,11 @@ nvidia-container-toolkit / compose v2）、模型卷按容器布局摆好并校�
 
 * **权益归人**：`entitlements.user_id` 是主键；换机/重装用 `POST /v1/account/devices/code`
   发一次性绑定码，不重复收费（默认 3 台）。
+* **登录即绑**（2026-11-07，issue #23）：`POST /v1/account/devices/bind` 带 `userToken`
+  直接换 `clientId + clientSecret + accessToken`，不再需要配对码。判据是客户端稳定生成的
+  `deviceId`：同账号重复绑定复用同一 `clientId`、只轮换 secret、不重复占设备数；
+  同一 `deviceId` 全局只能 active 在一个账号下（`409 device_bound_to_other_account`）。
+  旧 `/v1/account/devices/code` + `/v1/pair` 原样保留（旧客户端/人工兜底）。
 * **续费不发码**：已经绑过设备的账号再付款，只延长 `paid_until`。期内从当前
   `paid_until` 顺延；过期或退款后从**支付成功时间**起算；试用不叠加。
 * **换套餐只支持同套餐**：有有效付费权益时买不同套餐 → `409 plan_change_unsupported`
@@ -468,6 +473,8 @@ Mock 端点默认只接受**回环/测试来源**（`payment.mock_allow_remote=f
 | 密码不合规（<8 位或缺少字母+数字） | 400 | `password_weak` |
 | 邮件功能未启用/未配置/发送失败 | 503/503/502 | `email_disabled` / `email_unconfigured` / `email_send_failed` |
 | 设备数满 | 403 | `device_limit_reached` |
+| 同一 deviceId 已绑定另一个账号 | 409 | `device_bound_to_other_account` |
+| `existingClientId` 属于另一个账号 | 409 | `client_not_yours` |
 | 订单状态不允许 | 409 | `order_state_conflict` |
 | 有有效付费权益时买不同套餐（不做 proration） | 409 | `plan_change_unsupported` |
 | 套餐 / 订单 / 账号不存在 | 404 | `plan_not_found` / `order_not_found` / `user_not_found` |

@@ -233,6 +233,9 @@ billing:
   order_ttl_s: 900               # 未支付订单 15 分钟后关闭
   pair_code_ttl_s: 900           # 支付成功后那张配对码 15 分钟
   device_bind_ttl_s: 600         # 换机/重装的一次性绑定码 10 分钟
+  # 登录态直接绑定（issue #23）的限流：按账号每分钟最多几次 / 突发几次。
+  device_bind_rate_per_min: 6
+  device_bind_burst: 5
   order_rate_per_hour: 10        # 同一账号每小时最多建几单
   client_scopes: "asr diarize embed tts"   # 收费客户端配对后的能力
   # 额度兜底（真正生效的值在 plans / entitlements 里；代码不写死价格）

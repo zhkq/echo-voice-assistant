@@ -17,12 +17,22 @@ client JWT 的 claims 是 `{sub: client_id, scopes, ver}`；userToken 是
 
 `kind=device-bind`、TTL 10 分钟、一次性（设计 §4.1 末段）。**不新造第二套码**：
 兑换仍然走 `/v1/pair`，兑换后由 `BillingService.after_pair()` 记 `user_devices`。
+
+## 登录态直接绑定（2026-11-07，issue #23）
+
+`POST /v1/account/devices/bind`：带 `userToken` 直接换 `clientId + secret + accessToken`，
+不再需要配对码。判据是客户端稳定生成的 `deviceId`：同一账号重复绑定复用同一个
+`clientId`、只轮换 secret、不重复占设备数；同一台设备全局只能 active 在一个账号下。
+旧的 `/v1/account/devices/code` + `/v1/pair` **原样保留**（旧客户端 / 人工兜底）。
 """
 from __future__ import annotations
 
+import json
 import math
 import re
 import secrets
+import sqlite3
+import threading
 import time
 from typing import Any, Dict, Optional
 
@@ -32,8 +42,9 @@ from starlette.concurrency import run_in_threadpool
 
 from server import emailer as emailer_mod
 from server import errors, ops
-from server.auth import JWT_ALG, PairThrottle, decode_token
+from server.auth import JWT_ALG, PairThrottle, decode_token, issue_token
 from server.passwords import hash_password, verify_password
+from server.ratelimit import TokenBucket
 
 router = APIRouter(prefix="/v1/account")
 
@@ -53,6 +64,42 @@ _DUMMY_PASSWORD_HASH = hash_password("echo-dummy-password-for-timing")
 #: 邮箱账号的密码长度上限。scrypt 对超长输入照样要算，别让人拿几 MB 的"密码"烧 CPU。
 MAX_PASSWORD_LEN = 200
 MIN_PASSWORD_LEN = 8
+
+#: 客户端稳定设备 id（issue #23）。32 hex 是客户端生成器的形状；这里放宽到 12–64，
+#: 允许测试/第三方用 `dev-...` 这类可读值，但仍只收 URL 安全字符。
+_DEVICE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{12,64}$")
+#: 平台标识（windows/macos/linux/…）只用于展示；空串合法。
+_PLATFORM_RE = re.compile(r"^[a-z0-9._-]{0,32}$")
+#: `existingClientId` 认领：只收客户端 id 的字符集，长度上限与现有一致。
+_CLIENT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def _device_id(payload: Dict[str, Any]) -> str:
+    text = str(payload.get("deviceId") or payload.get("device_id") or "").strip()
+    if not text:
+        raise errors.bad_request("缺少 deviceId（客户端稳定设备标识）")
+    if not _DEVICE_ID_RE.match(text):
+        raise errors.bad_request("deviceId 只能是 12–64 位字母/数字/下划线/连字符")
+    return text
+
+
+def _platform(payload: Dict[str, Any]) -> str:
+    text = str(payload.get("platform") or "").strip().lower()
+    if not text:
+        return ""
+    if not _PLATFORM_RE.match(text):
+        raise errors.bad_request("platform 只能是小写字母/数字/点/下划线/连字符（最多 32）")
+    return text
+
+
+def _existing_client_id(payload: Dict[str, Any]) -> str:
+    text = str(payload.get("existingClientId")
+               or payload.get("existing_client_id") or "").strip()
+    if not text:
+        return ""
+    if not _CLIENT_ID_RE.match(text):
+        raise errors.bad_request("existingClientId 格式不对")
+    return text
 
 
 def normalize_email(raw: Any) -> str:
@@ -103,12 +150,19 @@ def _bearer(authorization: str) -> str:
 
 
 def device_view(row: Dict[str, Any]) -> Dict[str, Any]:
-    """一台设备 → 面板要的 camelCase 视图（**不含任何凭据**）。"""
+    """一台设备 → 面板要的 camelCase 视图（**不含任何凭据**）。
+
+    `lastSeen` 取 `user_devices.last_seen` 与 `clients.last_seen` 的较大值：
+    后者由认证路径按间隔更新，才是账户页「最近活跃」该读的那个；
+    前者只在绑定/重绑时写一次（历史数据里可能一直是绑定那一刻）。
+    """
     return {
         "clientId": str(row.get("client_id") or ""),
         "deviceName": str(row.get("device_name") or ""),
+        "platform": str(row.get("platform") or ""),
         "boundAt": float(row.get("bound_at") or 0),
-        "lastSeen": float(row.get("last_seen") or 0),
+        "lastSeen": max(float(row.get("last_seen") or 0),
+                        float(row.get("client_last_seen") or 0)),
         "status": str(row.get("status") or ""),
     }
 
@@ -137,6 +191,21 @@ class AccountService:
         self.login_throttle = PairThrottle(
             max_failures=int(cfg.get("auth.pair_max_failures", 5)),
             window_s=float(cfg.get("auth.pair_window_s", 300)))
+        # 登录态绑定（issue #23）的限流：按 user_id 的令牌桶。
+        # 与能力面的 1 QPS 完全分开 —— 绑设备是低频管理动作，不该占推理的桶；
+        # 默认每分钟 6 次、突发 5 次（3 台设备 + 少量重试足够）。
+        try:
+            per_min = max(1, int(cfg.get("billing.device_bind_rate_per_min", 6) or 6))
+        except (TypeError, ValueError):
+            per_min = 6
+        try:
+            burst = max(1, int(cfg.get("billing.device_bind_burst", 5) or 5))
+        except (TypeError, ValueError):
+            burst = 5
+        self.bind_bucket = TokenBucket(rate=per_min / 60.0, burst=burst)
+        # 把"查重 + 建行 + 数数"串起来：v1 是单进程，一把进程内锁就够；
+        # 多实例要改成 DB 事务（设计 §3.2 已如实记为限制）。
+        self._bind_lock = threading.Lock()
         if email_sender is None:
             self.email_sender, self.email_error = emailer_mod.build_sender(cfg)
         else:
@@ -461,6 +530,137 @@ class AccountService:
                 "deviceLimit": (self.billing.device_limit(str(user["user_id"]))
                                 if self.billing is not None else 0)}
 
+    def _bind_ready(self) -> None:
+        """bind 的启动条件：收费开着、鉴权用 jwt。
+
+        这两条不满足时**明确报**，不能让客户端拿到一份永远用不了的凭据。
+        """
+        if self.billing is None or not bool(getattr(self.billing, "enabled", False)):
+            raise errors.billing_disabled()
+        if not bool(getattr(self.auth, "enabled", False)) or \
+                str(getattr(self.auth, "mode", "") or "").lower() != "jwt":
+            raise errors.auth_misconfigured(
+                "登录自动绑定需要 auth.enabled=true 且 auth.mode=jwt")
+
+    def bind_device(self, user: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str, Any]:
+        """登录态直接绑定设备（issue #23）：userToken → clientId + secret + accessToken。
+
+        顺序是有意的：**账号 active（authenticate 已判）→ 有效权益 → 设备上限 →
+        幂等/认领 → 建/轮换凭据 → 落 device 行 → 并发兜底 → 发短期令牌**。
+        权益/上限在创建凭据**之前**判：失败了不留半条客户端行，也不占名额。
+        """
+        self._bind_ready()
+        payload = payload or {}
+        uid = str(user["user_id"])
+        device_id = _device_id(payload)
+        client_name = clean_text(
+            payload.get("clientName") or payload.get("client_name") or "我的设备",
+            "设备名", 64) or "我的设备"
+        device_name = clean_text(
+            payload.get("deviceName") or payload.get("device_name") or "",
+            "主机名", 64)
+        platform = _platform(payload)
+        existing = _existing_client_id(payload)
+
+        # 1) 限流先做（按账号的独立桶，不是能力面的 1 QPS）：无权益的账号也不该
+        #    拿这个端点免费刷库。
+        self.bind_bucket.check("user:" + uid, detail="绑定设备太频繁，请稍后再试")
+        # 2) 权益闸门：有效试用也算；无权益 402，**不能先绑再买**（issue 确认第 4 条）。
+        self.billing.require_entitlement(uid)
+        limit = int(self.billing.device_limit(uid))
+        scopes = str(self.cfg.get("billing.client_scopes", "") or "")
+
+        with self._bind_lock:
+            # 3) 同一 deviceId 的幂等 / 跨账号冲突。
+            row = self.store.device_by_device_id(device_id)
+            if row is not None and str(row.get("user_id") or "") != uid:
+                raise errors.device_bound_to_other_account()
+            cid = str((row or {}).get("client_id") or "")
+            rebound = bool(row)
+            if cid and self.store.client(cid) is None:
+                # 绑定行还在、客户端行没了（被删/换了库）：收掉旧行，按新设备走。
+                self.store.revoke_device(uid, cid)
+                cid = ""
+                rebound = False
+
+            # 4) 认领旧配对凭据（只在"有 user_devices 行且属于当前账号"时认；
+            #    没有绑定行的 client 不认领 —— 归属不明确时不能拿别人的身份）。
+            #    **同一台设备**才认：已有非空 deviceId 且与本次不同 → 409，
+            #    不能拿另一台设备的身份顶替（以及不能借认领把设备静默转给另一个账号）。
+            if not cid and existing:
+                dev = self.store.device_for_client(existing)
+                if dev is not None and str(dev.get("user_id") or "") != uid:
+                    raise errors.client_not_yours()
+                if (dev is not None and str(dev.get("user_id") or "") == uid
+                        and self.store.client(existing) is not None):
+                    old_device = str(dev.get("device_id") or "")
+                    if old_device and old_device != device_id:
+                        raise errors.device_mismatch()
+                    cid = existing
+                    rebound = True
+
+            # 5) 新设备先看名额。
+            if not cid and self.store.count_devices(uid) >= limit:
+                raise errors.device_limit_reached(limit)
+
+            # 6) 建新客户端，或对已有的重新授权（轮换 secret + token_version +1）。
+            if cid:
+                secret, client_row = self.auth.reauthorize_client(
+                    cid, name=client_name, scopes=scopes)
+            else:
+                cid, secret, client_row = self.auth.create_client(client_name, scopes)
+
+            # 7) 落账号 ↔ 设备行。唯一索引兜底并发下"另一账号刚抢到同一 deviceId"。
+            try:
+                self.store.upsert_device(uid, cid, device_name=device_name,
+                                         device_id=device_id, platform=platform)
+            except sqlite3.IntegrityError:
+                raise errors.device_bound_to_other_account() from None
+
+            # 8) 并发兜底：建完再数一次；超了就撤销刚建的这台（与 after_pair 同语义）。
+            if self.store.count_devices(uid) > limit:
+                self.store.revoke_device(uid, cid)
+                try:
+                    self.auth.set_disabled(cid, True)
+                except errors.EchoError:
+                    pass
+                self.billing.forget_device(cid)
+                raise errors.device_limit_reached(limit)
+
+            # 9) 签发短期令牌。`client_row` 必须是**轮换之后**的行（ver 已 +1）。
+            client_row = self.store.client(cid) or client_row or {}
+            if not client_row:
+                raise errors.EchoError(500, "internal_error",
+                                       "绑定后客户端行不见了，请重试")
+            ttl = int(self.cfg.get("auth.token_ttl_s", 3600))
+            token, expires_in = issue_token(client_row, self.auth.key, ttl)
+            device = self.store.device_for_client(cid) or {}
+            devices = self.store.count_devices(uid)
+
+        # 审计：只记"谁/哪台客户端/哪个 deviceId"，不记 secret。
+        try:
+            self.store.insert_order_event(
+                "", "device-rebound" if rebound else "device-bound",
+                json.dumps({"userId": uid, "clientId": cid,
+                            "deviceId": device_id, "platform": platform},
+                           ensure_ascii=False))
+        except Exception:                                       # pragma: no cover - 兜底
+            pass
+
+        return {
+            "clientId": cid,
+            "clientSecret": secret,
+            "accessToken": token,
+            "expiresIn": int(expires_in),
+            "scopes": str(client_row.get("scopes") or "").split(),
+            "serverName": str(self.cfg.get("server.id", "") or ""),
+            "protocol": 1,
+            "rebound": bool(rebound),
+            "device": device_view(device),
+            "devices": int(devices),
+            "deviceLimit": int(limit),
+        }
+
     def unbind(self, user: Dict[str, Any], client_id: str) -> Dict[str, Any]:
         """解绑一台设备：设备行置 `revoked`，客户端**立即失效**（401/403，复用老路径）。"""
         cid = str(client_id or "").strip()
@@ -563,6 +763,18 @@ async def device_code(request: Request):
     payload = await _body(request)
     return _svc(request).create_device_code(
         user, str(payload.get("clientName") or payload.get("name") or ""))
+
+
+@router.post("/devices/bind")
+async def device_bind(request: Request):
+    """登录后直接绑定设备（issue #23）：`userToken` → 设备凭据 + 短期令牌。
+
+    **不做成 GET**：它会签发一份凭据（写 `clients` / `user_devices`），
+    与 `/v1/pair` 同类；放在 POST 才符合"写动作"的语义。
+    """
+    user = _user(request)
+    payload = await _body(request)
+    return await run_in_threadpool(_svc(request).bind_device, user, payload)
 
 
 @router.post("/devices/unbind")

@@ -206,6 +206,20 @@ class PageTests(unittest.TestCase):
         for text in ("已退款", "已关闭", "等待支付", "已支付"):
             self.assertIn(text, js, text)
 
+    def test_account_page_has_device_management(self):
+        """issue #23：账户页要能看设备列表并解绑（登录即绑的排障/换机入口）。"""
+        html = _read_site("account.html")
+        for element in ('id="devicesList"', 'id="devicesEmpty"', 'id="deviceCount"',
+                        'id="refreshDevices"'):
+            self.assertIn(element, html, element)
+        for text in ("我的设备", "客户端登录账号后会自动绑定", "解绑"):
+            self.assertIn(text, html, text)
+        js = _read_site("assets/site.js")
+        for text in ("renderDevices", "data-unbind-client",
+                     "/v1/account/devices/unbind", "device_limit_reached",
+                     "device_bound_to_other_account", "platformLabel"):
+            self.assertIn(text, js, text)
+
     def test_no_static_qr_asset_is_shipped(self):
         self.assertFalse(os.path.exists(os.path.join(SITE, "assets", "qr-placeholder.svg")))
         self.assertFalse(os.path.exists(os.path.join(SITE, "assets", "alipay-sandbox-qr.png")))
@@ -601,6 +615,47 @@ class AccountEmailEvidenceTests(unittest.TestCase):
     def test_capture_script_compiles(self):
         py_compile.compile(
             os.path.join(ROOT, "scripts", "capture-account-email-evidence.py"),
+            doraise=True,
+        )
+
+
+class AccountDeviceEvidenceTests(unittest.TestCase):
+    """issue #23 的账户页设备列表 Before/After 证据（桌面 + 移动）。"""
+
+    DIR = os.path.join(ROOT, "docs", "account-device-evidence")
+
+    def test_before_and_after_files_exist(self):
+        expected = (
+            "before-account-devices.png", "after-account-devices.png",
+            "before-account-devices-mobile.png",
+            "after-account-devices-mobile.png",
+        )
+        for name in expected:
+            path = os.path.join(self.DIR, name)
+            self.assertTrue(os.path.isfile(path), name)
+            self.assertGreater(os.path.getsize(path), 5000, name)
+
+    def test_manifest_records_the_baseline_and_mock_data(self):
+        data = json.loads(_read("docs", "account-device-evidence", "capture.json"))
+        self.assertEqual(data["baseline"]["ref"], "c09884b")
+        self.assertEqual(data["mode"], "mock backend")
+        pages = {item["page"] for item in data["files"]}
+        self.assertTrue({"before-account-devices", "after-account-devices",
+                         "before-account-devices-mobile",
+                         "after-account-devices-mobile"} <= pages)
+        joined = " ".join(data["notes"])
+        self.assertIn("mock", joined)
+        self.assertIn("不是真实账号", joined)
+
+    def test_readme_states_the_evidence_limits(self):
+        text = _read("docs", "account-device-evidence", "README.md")
+        for needle in ("Before", "After", "c09884b", "1440", "375",
+                       "mock", "不是真实账号"):
+            self.assertIn(needle, text, needle)
+
+    def test_capture_script_compiles(self):
+        py_compile.compile(
+            os.path.join(ROOT, "scripts", "capture-account-device-evidence.py"),
             doraise=True,
         )
 

@@ -622,6 +622,49 @@ class Auth:
                 "serverName": str(self.cfg.get("server.id", "")),
                 "protocol": 1}
 
+    # ---- 登录即绑（2026-11-07，issue #23）---------------------------------
+
+    def create_client(self, name: str, scopes: str) -> Tuple[str, str, Dict[str, Any]]:
+        """新建一个客户端身份，返回 `(client_id, secret, row)`。
+
+        `secret` **只在这个返回值里出现一次**（与 `redeem()` 同一个边界）：
+        落库的是 `hash_secret(secret, client_id)`。`/v1/account/devices/bind`
+        用它替掉"先发配对码、客户端再兑"的两步。
+        """
+        cid = new_client_id()
+        secret = new_secret()
+        self.store.upsert_client(cid, str(name or "未命名设备"),
+                                 hash_secret(secret, cid), str(scopes or ""))
+        row = self.store.client(cid) or {}
+        if row:
+            self.cache.put(row)
+        return cid, secret, row
+
+    def reauthorize_client(self, client_id: str, name: str = "",
+                           scopes: str = "") -> Tuple[str, Dict[str, Any]]:
+        """给一个**已有**客户端重新授权：轮换 secret + 清撤销/禁用标记。
+
+        用途是登录态重复绑定同一台设备（`deviceId` 幂等）：必须换掉旧 secret，
+        否则客户端丢了 `backend.json` 也拿不回一份能用的凭据；同时
+        `token_version + 1` 让之前发出去的令牌立刻失效（与 `rotate_secret` 同语义）。
+
+        如果这个客户端曾被解绑（`disabled=1`）或撤销（`revoked_at>0`），
+        这里一并恢复 —— "重新绑定 = 重新授权"（与 `Auth.redeem()` 的 `revive()` 同一口径）。
+        """
+        secret = self.rotate_secret(client_id)
+        self.store.revive(client_id)
+        self.store.set_disabled(client_id, False)
+        existing = self.store.client(client_id) or {}
+        self.store.upsert_client(
+            client_id,
+            str(name or existing.get("name") or "未命名设备"),
+            hash_secret(secret, client_id),
+            str(scopes if scopes else (existing.get("scopes") or "")))
+        row = self.store.client(client_id) or {}
+        if row:
+            self.cache.put(row)
+        return secret, row
+
     # ---- 管理动作（命令行 / 将来的管理面都走这几个）--------------------------
 
     def set_scopes(self, client_id: str, scopes: str) -> None:

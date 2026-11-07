@@ -430,6 +430,13 @@ _ADDED_COLUMNS = {
         ("user_id", "TEXT NOT NULL DEFAULT ''"),
         ("kind", "TEXT NOT NULL DEFAULT ''"),
     ),
+    "user_devices": (
+        # 客户端生成的稳定设备 id（2026-11-07，issue #23）：登录态直接绑定/重复绑定
+        # 的判据。历史行是空串，**不参与**下面的唯一索引，也不匹配任何 bind。
+        ("device_id", "TEXT NOT NULL DEFAULT ''"),
+        # 设备平台（windows/macos/linux/...），只用于账户页展示/排障。
+        ("platform", "TEXT NOT NULL DEFAULT ''"),
+    ),
 }
 
 
@@ -468,6 +475,11 @@ class Store:
         # `email` 列，索引写在 SCHEMA 里会让老库启动直接失败。
         self._db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email"
                          " ON users(email) WHERE email <> ''")
+        # 同一台设备同一时刻只能 active 在一个账号下（issue #23）。也必须放在补列之后：
+        # 老库在 `executescript(SCHEMA)` 时还没有 `device_id` 列。
+        self._db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_user_devices_device"
+            " ON user_devices(device_id) WHERE device_id <> '' AND status = 'active'")
 
     # ---------------------------------------------------------------- 自检
 
@@ -1413,23 +1425,39 @@ class Store:
 
     # ---------------------------------------------------------------- 设备绑定
 
-    def upsert_device(self, user_id: str, client_id: str, device_name: str = "") -> None:
+    def upsert_device(self, user_id: str, client_id: str, device_name: str = "",
+                      *, device_id: str = "", platform: str = "") -> None:
+        """记一条"账号 ↔ 设备"绑定。`ON CONFLICT(client_id)` 时**保留首次绑定时间**。
+
+        `device_id`/`platform`（2026-11-07，issue #23）由登录态直接绑定的那条路写；
+        旧的配对码路径不传，保持空串。
+        """
         now = time.time()
         with self._lock:
             self._db.execute(
-                "INSERT INTO user_devices (user_id, client_id, device_name, bound_at,"
-                " last_seen, status) VALUES (?,?,?,?,?,'active')"
+                "INSERT INTO user_devices (user_id, client_id, device_id, device_name,"
+                " platform, bound_at, last_seen, status) VALUES (?,?,?,?,?,?,?,'active')"
                 " ON CONFLICT(client_id) DO UPDATE SET user_id=excluded.user_id,"
-                " device_name=excluded.device_name, status='active', last_seen=excluded.last_seen",
-                (str(user_id), str(client_id), str(device_name or ""), now, now))
+                " device_id=CASE WHEN excluded.device_id <> '' THEN excluded.device_id"
+                "   ELSE user_devices.device_id END,"
+                " device_name=excluded.device_name,"
+                " platform=CASE WHEN excluded.platform <> '' THEN excluded.platform"
+                "   ELSE user_devices.platform END,"
+                " status='active', last_seen=excluded.last_seen",
+                (str(user_id), str(client_id), str(device_id or ""),
+                 str(device_name or ""), str(platform or ""), now, now))
             self._db.commit()
 
     def devices(self, user_id: str, *, include_revoked: bool = False) -> List[Dict[str, Any]]:
+        """账号的设备列表。`client_last_seen` 来自 `clients.last_seen`（认证路径写的），
+        `user_devices.last_seen` 只在绑定/重绑时写一次 —— 账户页要的是前者。"""
         with self._lock:
-            sql = "SELECT * FROM user_devices WHERE user_id=?"
+            sql = ("SELECT d.*, COALESCE(c.last_seen, 0) AS client_last_seen"
+                   " FROM user_devices d LEFT JOIN clients c ON c.client_id=d.client_id"
+                   " WHERE d.user_id=?")
             if not include_revoked:
-                sql += " AND status='active'"
-            sql += " ORDER BY bound_at"
+                sql += " AND d.status='active'"
+            sql += " ORDER BY d.bound_at"
             rows = self._db.execute(sql, (str(user_id),)).fetchall()
         return [dict(r) for r in rows]
 
@@ -1437,6 +1465,20 @@ class Store:
         with self._lock:
             row = self._db.execute("SELECT * FROM user_devices WHERE client_id=?",
                                    (str(client_id or ""),)).fetchone()
+        return dict(row) if row else None
+
+    def device_by_device_id(self, device_id: str) -> Optional[Dict[str, Any]]:
+        """按客户端稳定设备 id 找**当前 active** 的绑定行（bind 幂等的判据）。
+
+        历史行的 `device_id` 是空串，**不匹配**任何值 —— 空串永远返回 None。
+        """
+        text = str(device_id or "").strip()
+        if not text:
+            return None
+        with self._lock:
+            row = self._db.execute(
+                "SELECT * FROM user_devices WHERE device_id=? AND status='active' LIMIT 1",
+                (text,)).fetchone()
         return dict(row) if row else None
 
     def count_devices(self, user_id: str) -> int:
