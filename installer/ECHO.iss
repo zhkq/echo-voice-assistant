@@ -1,4 +1,4 @@
-; ============================================================================
+﻿; ============================================================================
 ; ECHO.iss - single-file, current-user ECHO installer (phase 1, unsigned)
 ;
 ; Layout:
@@ -164,8 +164,8 @@ begin
   Json := '{"mode":"' + Mode + '","note":"inno-installer","at":"' +
           GetDateTimeString('yyyy-mm-dd hh:nn:ss', '-', ':') + '"}';
   if not SaveStringToFile(DataRoot + '\install-mode.json', Json, False) then
-    MsgBox('无法写入 ' + DataRoot + '\install-mode.json。' + #13#10 +
-           'ECHO 仍会安装，但首次启动可能不会自动进入向导。', mbError, MB_OK);
+    SuppressibleMsgBox('无法写入 ' + DataRoot + '\install-mode.json。' + #13#10 +
+           'ECHO 仍会安装，但首次启动可能不会自动进入向导。', mbError, MB_OK, IDOK);
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
@@ -183,16 +183,16 @@ begin
     if not StopEcho(Code) then
     begin
       if Code = 2 then
-        MsgBox('ECHO 正在录音或正在处理指令，不能卸载。请先结束会议/等待指令完成。', mbError, MB_OK)
+        SuppressibleMsgBox('ECHO 正在录音或正在处理指令，不能卸载。请先结束会议/等待指令完成。', mbError, MB_OK, IDOK)
       else
-        MsgBox('无法停止正在运行的 ECHO（退出码 ' + IntToStr(Code) + '）。' + #13#10 +
-               '请先在任务管理器结束 ECHO/pythonw 后重新卸载。', mbError, MB_OK);
+        SuppressibleMsgBox('无法停止正在运行的 ECHO（退出码 ' + IntToStr(Code) + '）。' + #13#10 +
+               '请先在任务管理器结束 ECHO/pythonw 后重新卸载。', mbError, MB_OK, IDOK);
       Abort;
     end;
   end;
 
   if CurUninstallStep = usPostUninstall then
-    MsgBox('ECHO 的程序文件已删除。' + #13#10 + #13#10 +
+    SuppressibleMsgBox('ECHO 的程序文件已删除。' + #13#10 + #13#10 +
            '你的数据仍保留在：' + #13#10 + DataRoot + #13#10 + #13#10 +
-           '会议、模型、后端配对与设置都不会被卸载程序删除。', mbInformation, MB_OK);
+           '会议、模型、后端配对与设置都不会被卸载程序删除。', mbInformation, MB_OK, IDOK);
 end;
