@@ -223,7 +223,9 @@ class State:
     def check_capability(self, client_id: str, kind: str = "audio") -> Optional[dict]:
         """收费闸门（鉴权之后、读 body 之前）。返回账号上下文或 None（老路）。
 
-        * `kind=audio`：ASR / 分离 / 嵌入 —— 权益 + 1 QPS + **日额度** + 并发预检；
+        * `kind=audio`：ASR —— 权益 + 1 QPS + **日额度** + 并发预检；
+        * `kind=companion`：分离/声纹 —— 权益 + 1 QPS + 并发预检，**跳过日额度**
+          （2026-11-07，issue #20：配套能力不占每日音频分钟）；
         * `kind=tts`：不占 GPU，只受 1 QPS 与 TTS 字符日额度（设计 §4.4）。
         """
         svc = self.billing_svc
@@ -234,10 +236,29 @@ class State:
             return None
         uid = str(ctx["user_id"])
         limits = ctx["limits"]
-        if kind == "audio":
+        if kind in ("audio", "companion"):
             # 先做一次**不占槽**的并发预检，满了就别收音频（权威判定在 user_slot）。
             svc.concurrency.check(uid, int(limits["max_concurrent"]))
         return ctx
+
+    @property
+    def companion_required(self) -> bool:
+        """分离/声纹是否必须跟随同一次 ASR（见 `BillingService.companion_required`）。"""
+        return bool(self.billing_svc is not None
+                    and self.billing_svc.companion_required)
+
+    def companion_user_id(self, client_id: str) -> str:
+        """独立解析 `client_id → user_id`，**不经过 `billing.enabled`**。
+
+        评审结论 4：有鉴权、未开收费的自建部署也必须能按账号绑定做配套校验。
+        未绑定账号返回空串（由调用方改用 `client_id` 作为授权归属）。
+        设备已撤销/账号停用仍抛 403（与收费路径同一判据）。
+        """
+        svc = self.billing_svc
+        if svc is None or not svc.companion_required:
+            return ""
+        user = svc.user_for_client(client_id)
+        return str((user or {}).get("user_id") or "")
 
     def quota_remaining(self, client_id: str, user_id: Optional[str] = None):
         """今天还剩几分钟。账号请求读 user 账；老路读 client 账。"""
@@ -266,7 +287,8 @@ class State:
             return 0.0
 
     @contextmanager
-    def billing(self, client_id: str, seconds: float, user_id: Optional[str] = None):
+    def billing(self, client_id: str, seconds: float, user_id: Optional[str] = None,
+                charge: bool = True):
         """占通道 + 记这一笔配额。**顺序是有意的：先占通道，再记账。**
 
         被 `409 client_busy` / `503 server_busy` 顶回去的请求**不计费** ——
@@ -274,19 +296,23 @@ class State:
         那段 GPU 时间是真的花了。
 
         收费启用且这台设备绑了账号时，记到 **user 账**上（换台设备不能重刷额度）。
+
+        `charge=False`：只占通道、**不记账**（分离/声纹的配套调用，issue #20）。
+        它们仍占 GPU、仍受并发闸门约束，但不算进每日音频分钟。
         """
         with self.admission.hold(client_id):
-            if user_id:
-                self.user_quota.add(str(user_id), seconds)
-            else:
-                self.quota.add(client_id, seconds)
+            if charge:
+                if user_id:
+                    self.user_quota.add(str(user_id), seconds)
+                else:
+                    self.quota.add(client_id, seconds)
             yield
 
     # ---------------------------------------------------------------- 调用记账
 
     @contextmanager
     def timed_billing(self, client_id: str, seconds: float, request=None,
-                      user_id: Optional[str] = None):
+                      user_id: Optional[str] = None, charge: bool = True):
         """`billing` + 顺手量出**排队等了多久**（设计 §7.3 的 `queue_wait_ms`）。
 
         为什么量这个：客户端看到的"很慢"有两种完全不同的成因 —— 排队等通道，
@@ -301,7 +327,7 @@ class State:
                 if (user_id and self.billing_svc is not None
                     and self.billing_svc.enabled) else _null_slot())
         with slot:
-            with self.billing(client_id, seconds, user_id=user_id):
+            with self.billing(client_id, seconds, user_id=user_id, charge=charge):
                 waited = int((time.time() - t_wait) * 1000)
                 if request is not None:
                     note_call(request, queueWaitMs=waited)
@@ -805,6 +831,7 @@ async def asr(request: Request, variant: str = "long", timestamps: int = 0,
         cid = client_id_of(request, need_scope="asr")
         note_call(request, clientId=cid)
         access = st.check_capability(cid, "audio")   # 收费闸门（权益/1 QPS/日额度）
+        uid = str((access or {}).get("user_id") or "") or st.companion_user_id(cid)
         st.quota.check(cid)                    # 今天的额度用完了？**也在读 body 之前**
         model_id = st.pool.pick_for_slot(slot, model)
         spec = st.pool.spec(model_id)
@@ -820,8 +847,17 @@ async def asr(request: Request, variant: str = "long", timestamps: int = 0,
     with tmp.TempWorkspace(cfg.tmp_root) as ws:
         src, ctype = await audio_mod.receive(request, ws, cfg)
         wav = ws.path("seg.wav")
-        # 解码 / 重采样也是 CPU 活：同样要下线程池（见 `_infer` 上方的说明）
-        seconds = await run_in_threadpool(audio_mod.to_wav16k, src, wav, ctype, cfg)
+
+        def _normalize_and_digest():
+            # 解码 / 重采样也是 CPU 活：同样要下线程池（见 `_infer` 上方的说明）。
+            seconds = audio_mod.to_wav16k(src, wav, ctype, cfg)
+            # 配套授权绑定的是**归一化后的音频**（issue #20）：同一个 wav 文件在
+            # ASR 与 diarize/embed 两边会规整成同样的 PCM_16，摘要才可比。
+            digest = (audio_mod.digest_wav16k(wav)
+                      if st.companion_required else "")
+            return seconds, digest
+
+        seconds, digest = await run_in_threadpool(_normalize_and_digest)
 
         def _infer():
             t0 = time.time()
@@ -833,6 +869,11 @@ async def asr(request: Request, variant: str = "long", timestamps: int = 0,
                                        seconds, t0)
 
         out = await run_in_threadpool(_infer)
+        if digest:
+            # **成功之后**才发：失败的 ASR 不该给配套能力开绿灯。写失败只记日志，
+            # 不能把一次已经完成的转写变成 500（见 `record_companion`）。
+            # 授权按 **user_id**（绑定账号）或 **client_id**（未绑定）绑。
+            st.billing_svc.record_companion(uid, cid, digest)
     remaining = st.quota_remaining(cid, (access or {}).get("user_id"))
     if remaining is not None:
         # 让客户端能提前提示"今天快用完了" —— 它自己算不出来（额度在服务端那本账上）。
@@ -859,12 +900,23 @@ async def diarize(request: Request, mode: str = "segment", maxSpeakers: int = 0,
         note_call(request, clientId=cid)
         if str(mode) != "segment":
             raise errors.bad_request("mode=%r 尚未实现（v1 只支持 segment）" % mode)
-        access = st.check_capability(cid, "audio")
-        st.quota.check(cid)
+        # 分离/声纹是 ASR 的配套能力：保留权益/QPS/设备/并发，**跳过日额度**
+        # （它们不算每日音频分钟，issue #20）。
+        access = st.check_capability(cid, "companion")
+        # 账号解析**独立于 billing.enabled**（评审结论 4）：绑定账号 → user_id；
+        # 未绑定 → client_id（评审结论 7：A 客户 ASR 不能解锁 B 客户）。
+        uid = str((access or {}).get("user_id") or "") or st.companion_user_id(cid)
         model_id = st.pool.pick_for_slot("diarize.turns", model)
         spec = st.pool.spec(model_id)
         note_call(request, modelId=model_id)
         st.admission.precheck(cid)             # 先判忙，再读 body
+        # 未绑定账号（老客户端）：**保留旧 client 日额度路径**（查 + 记）。
+        # 已绑定账号：不再查旧 client 额度（改由配套授权兜，且不扣分钟）。
+        if st.companion_required and not uid:
+            st.quota.check(cid)
+        # 没有**任何**未过期配套授权时，一个字节都不收：避免无授权的大上传先被解码。
+        if st.companion_required:
+            st.billing_svc.require_companion_hint(uid, cid)
         audio_mod.check_declared_size(request, cfg)
     except errors.EchoError as e:
         if e.code == "payload_too_large":
@@ -874,14 +926,38 @@ async def diarize(request: Request, mode: str = "segment", maxSpeakers: int = 0,
         src, ctype = await audio_mod.receive(request, ws, cfg)
         wav = ws.path("seg.wav")
         seconds = await run_in_threadpool(audio_mod.to_wav16k, src, wav, ctype, cfg)
+        digest = (audio_mod.digest_wav16k(wav) if st.companion_required else "")
+        # 只读校验放在**占通道/记账之前**：摘要不一致或次数用完时，未绑定账号
+        # 不会先被扣掉旧 client 分钟再收到 403。
+        if st.companion_required:
+            st.billing_svc.check_companion(uid, cid, "diarize", digest)
+        # 只有"鉴权开着 + 未绑定账号"才走旧 client 计费；其余都不扣分钟。
+        charge = bool(st.companion_required and not uid)
 
         def _infer():
             t0 = time.time()
             note_call(request, audioSeconds=seconds)
-            with st.timed_billing(cid, seconds, request,
-                                  user_id=(access or {}).get("user_id")):
-                with st.pool.acquire(model_id) as engine:
-                    return engine.analyze(wav, max_speakers=int(maxSpeakers) or None), t0
+            with st.timed_billing(cid, seconds, request, user_id=uid or None,
+                                  charge=charge):
+                # 占通道后再原子扣一次（被 409/503 顶回去的请求不消费授权）。
+                claimed = False
+                if st.companion_required:
+                    st.billing_svc.claim_companion(uid, cid, "diarize", digest)
+                    claimed = True
+                try:
+                    with st.pool.acquire(model_id) as engine:
+                        return engine.analyze(wav,
+                                              max_speakers=int(maxSpeakers) or None), t0
+                except errors.EchoError as e:
+                    # 推理 5xx / 超时 → 退回次数；4xx 客户端错误不退（评审结论 5）。
+                    if claimed and int(getattr(e, "status", 0) or 0) >= 500:
+                        st.billing_svc.refund_companion(uid, cid, "diarize", digest)
+                    raise
+                except Exception:
+                    # 进程异常（非 HTTP 错误）同样属于"服务端没跑成"，退回。
+                    if claimed:
+                        st.billing_svc.refund_companion(uid, cid, "diarize", digest)
+                    raise
 
         (turns, embs, labels), t0 = await run_in_threadpool(_infer)
     speakers = {}
@@ -917,12 +993,17 @@ async def speaker_embed(request: Request, count: int = 1, model: str = ""):
     try:
         cid = client_id_of(request, need_scope="embed")
         note_call(request, clientId=cid)
-        access = st.check_capability(cid, "audio")
-        st.quota.check(cid)
+        # 声纹同样是 ASR 的配套能力：保留权益/QPS/设备/并发，跳过日额度。
+        access = st.check_capability(cid, "companion")
+        uid = str((access or {}).get("user_id") or "") or st.companion_user_id(cid)
         model_id = st.pool.pick_for_slot("speaker.embed", model)
         spec = st.pool.spec(model_id)
         note_call(request, modelId=model_id)
         st.admission.precheck(cid)             # 先判忙，再读 body
+        if st.companion_required and not uid:
+            st.quota.check(cid)                # 未绑定账号：保留旧 client 路径
+        if st.companion_required:
+            st.billing_svc.require_companion_hint(uid, cid)
         audio_mod.check_declared_size(request, cfg)
     except errors.EchoError as e:
         if e.code == "payload_too_large":
@@ -932,14 +1013,31 @@ async def speaker_embed(request: Request, count: int = 1, model: str = ""):
         src, ctype = await audio_mod.receive(request, ws, cfg)
         wav = ws.path("seg.wav")
         seconds = await run_in_threadpool(audio_mod.to_wav16k, src, wav, ctype, cfg)
+        digest = (audio_mod.digest_wav16k(wav) if st.companion_required else "")
+        if st.companion_required:
+            st.billing_svc.check_companion(uid, cid, "embed", digest)
+        charge = bool(st.companion_required and not uid)
 
         def _infer():
             t0 = time.time()
             note_call(request, audioSeconds=seconds)
-            with st.timed_billing(cid, seconds, request,
-                                  user_id=(access or {}).get("user_id")):
-                with st.pool.acquire(model_id) as engine:
-                    return engine.embed(wav), t0
+            with st.timed_billing(cid, seconds, request, user_id=uid or None,
+                                  charge=charge):
+                claimed = False
+                if st.companion_required:
+                    st.billing_svc.claim_companion(uid, cid, "embed", digest)
+                    claimed = True
+                try:
+                    with st.pool.acquire(model_id) as engine:
+                        return engine.embed(wav), t0
+                except errors.EchoError as e:
+                    if claimed and int(getattr(e, "status", 0) or 0) >= 500:
+                        st.billing_svc.refund_companion(uid, cid, "embed", digest)
+                    raise
+                except Exception:
+                    if claimed:
+                        st.billing_svc.refund_companion(uid, cid, "embed", digest)
+                    raise
 
         (vecs, _labels), t0 = await run_in_threadpool(_infer)
     want = max(1, int(count or 1))

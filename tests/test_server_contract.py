@@ -1677,7 +1677,10 @@ class AuthSchemaTests(unittest.TestCase):
                           "authorized_open_ids", "scan_sessions",
                           "orders", "order_events", "alipay_notify", "entitlements",
                           # 邮箱账号（2026-11-06，issue #15）：邮箱验证码只存哈希。
-                          "email_codes"))
+                          "email_codes",
+                          # 分离/声纹配套授权（2026-11-07，issue #20）：只存归一化
+                          # 音频的 SHA-256 与计数，不存音频/文本/嵌入。
+                          "companion_grants"))
 
 
 class AuthPairingTests(unittest.TestCase):

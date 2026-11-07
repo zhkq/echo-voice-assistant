@@ -33,6 +33,7 @@ import datetime
 import hashlib
 import hmac
 import json
+import logging
 import secrets
 import threading
 import time
@@ -45,6 +46,8 @@ from fastapi.responses import PlainTextResponse
 from server import errors, ops, payment as payment_mod
 from server import ratelimit
 from server.auth import (CODE_ALPHABET, hash_pairing_code, pairing_code_expired)
+
+log = logging.getLogger("echo.server")
 
 router = APIRouter(prefix="/v1/billing")
 
@@ -257,6 +260,18 @@ class BillingService:
         管理面 overview 会把这个值显示成"计费闸门未生效"，不要让它静默空转。
         """
         return bool(self.enabled and self.cfg.get("auth.enabled", False))
+
+    @property
+    def companion_required(self) -> bool:
+        """分离/声纹是否必须跟随**同一次 ASR**（2026-11-07，issue #20）。
+
+        **只看鉴权**（`auth.enabled`），**不依赖 `billing.enabled`** —— 否则
+        "有鉴权、未开收费"的自建部署会变成完全不校验（评审结论 4）。
+        归属由独立的 `client_id → user_id` 解析决定（见 `State.companion_user_id`）：
+        绑定账号按 user 共享，未绑定按 client 隔离。
+        匿名自托管（auth 关）保持老行为，直接调 diarize 的脚本/冒烟不会被打断。
+        """
+        return bool(self.cfg.get("auth.enabled", False))
 
     # ---------------------------------------------------------------- 套餐
 
@@ -474,6 +489,8 @@ class BillingService:
 
         **顺序是有意的**（任务书 T5）：鉴权 → user → 1 QPS → 准入/并发 → 计费。
         这里只做到"日额度检查"；并发槽由 `user_slot()` 在推理期间持有。
+        `kind="companion"`（分离/声纹）**跳过日额度**：它们不占每日音频分钟，
+        但仍保留权益、1 QPS 与设备检查（2026-11-07，issue #20）。
         """
         if not self.enabled:
             return None
@@ -527,6 +544,118 @@ class BillingService:
         limit = int(self.limits(str(user_id))["max_concurrent"])
         with self.concurrency.hold(str(user_id), limit):
             yield
+
+    # ---------------------------------------------------------------- 配套授权
+
+    @staticmethod
+    def _companion_owner(user_id: str, client_id: str):
+        """授权归属：账号优先，未绑定才用 client（与 `Store._companion_key` 同一口径）。"""
+        uid = str(user_id or "")
+        return (uid, "" if uid else str(client_id or ""))
+
+    def record_companion(self, user_id: str, client_id: str, digest: str,
+                         now: Optional[float] = None) -> int:
+        """ASR 成功后发配套授权。返回写入行数；失败**不抛**（不能拖垮已成功的 ASR）。
+
+        写失败时配套调用会因找不到授权而被拒（fail-closed），这比"ASR 返回 500"
+        更安全；日志里留一条 error 供排障。
+        """
+        if not self.companion_required or not digest:
+            return 0
+        uid, cid = self._companion_owner(user_id, client_id)
+        if not (uid or cid):
+            return 0
+        per = int(self.cfg.get("billing.companion_per_asr", 1) or 0)
+        ttl = float(self.cfg.get("billing.companion_ttl_s", 3600) or 0.0)
+        try:
+            return self.store.put_companion_grant(
+                uid, cid, digest, per_asr=per, ttl_s=ttl, now=now)
+        except Exception:                                       # pragma: no cover - 兜底
+            log.exception("配套授权写库失败（user_id=%s client_id=%s）；"
+                          "后面的 diarize/embed 会被拒", uid, cid)
+            return 0
+
+    def require_companion_hint(self, user_id: str, client_id: str,
+                               now: Optional[float] = None) -> None:
+        """读音频前的轻预检：这个归属**有没有任何**未过期的配套授权。
+
+        只回答"要不要先把 body 收下来解码"；具体是不是这段音频、还剩几次，
+        由 `claim_companion` 在占通道后原子判定。
+        """
+        if not self.companion_required:
+            return
+        uid, cid = self._companion_owner(user_id, client_id)
+        if not (uid or cid):
+            return
+        if not self.store.has_companion_grant(uid, cid, now=now):
+            raise errors.companion_not_allowed(
+                "这段音频没有可用的 ASR 配套授权：请先对同一段音频做一次 ASR"
+                "（或授权已过期）")
+
+    @staticmethod
+    def _raise_companion_verdict(verdict: str) -> None:
+        """把 `ok` / `missing` / `expired` / `exhausted` 翻成 403 的具体文案。"""
+        if verdict == "ok":
+            return
+        if verdict == "exhausted":
+            raise errors.companion_not_allowed(
+                "本次 ASR 的配套次数已用完：再对同一段音频做一次 ASR 才能继续")
+        if verdict == "expired":
+            raise errors.companion_not_allowed(
+                "ASR 配套授权已过期：请重新对同一段音频做一次 ASR")
+        raise errors.companion_not_allowed(
+            "音频与最近一次 ASR 不一致：分离/声纹只认同一次 ASR 的那段音频")
+
+    def check_companion(self, user_id: str, client_id: str, kind: str,
+                        digest: str, now: Optional[float] = None) -> None:
+        """读音频后的**只读**判定：摘要/次数不匹配先拒，**不扣次数、不记账**。
+
+        这样"音频不一致 / 已用完"会在占通道与旧 client 记账之前被拒；真正扣减仍是
+        `claim_companion` 在通道里的原子 UPDATE（防并发）。
+        """
+        if not self.companion_required:
+            return
+        uid, cid = self._companion_owner(user_id, client_id)
+        if not (uid or cid):
+            return
+        self._raise_companion_verdict(
+            self.store.companion_status(uid, cid, kind, digest, now=now))
+
+    def claim_companion(self, user_id: str, client_id: str, kind: str,
+                        digest: str, now: Optional[float] = None) -> None:
+        """原子扣一次配套次数；不匹配/过期/用完 → 403 `companion_not_allowed`。
+
+        必须在**拿到推理通道之后**调用：被 409/503 顶回去的请求不消费授权
+        （与 `State.billing()` 的"先占通道，再记账"同一个顺序）。
+        """
+        if not self.companion_required:
+            return
+        uid, cid = self._companion_owner(user_id, client_id)
+        if not (uid or cid):
+            return
+        self._raise_companion_verdict(self.store.claim_companion_grant(
+            uid, cid, kind, digest, now=now))
+
+    def refund_companion(self, user_id: str, client_id: str, kind: str,
+                         digest: str, now: Optional[float] = None) -> bool:
+        """推理 5xx / 超时 / 进程异常 → 把刚扣掉的配套次数退回。
+
+        4xx 客户端错误**不退**（请求本身不合法，重试也不该成功）；这里只管
+        "服务端自己没跑成"的那一档。失败只记日志 —— 退不回比把响应吞掉更好。
+        """
+        if not self.companion_required:
+            return False
+        uid, cid = self._companion_owner(user_id, client_id)
+        if not (uid or cid) or not digest:
+            return False
+        per = int(self.cfg.get("billing.companion_per_asr", 1) or 0)
+        try:
+            return self.store.refund_companion_grant(
+                uid, cid, kind, digest, per_asr=per, now=now)
+        except Exception:                                       # pragma: no cover - 兜底
+            log.exception("配套授权退回失败（user_id=%s client_id=%s kind=%s）",
+                          uid, cid, kind)
+            return False
 
     # ---------------------------------------------------------------- 续费计算
 

@@ -181,6 +181,9 @@ SERVER_CODE_TO_REASON: Dict[str, str] = {
     "order_not_found": "error",
     "order_state_conflict": "error",
     "user_not_found": "error",
+    # 分离/声纹配套授权（2026-11-07，issue #20）：缺 ASR / 音频不匹配 / 授权过期 /
+    # 本次配套次数用完。`detail` 会带上具体是哪一种，客户端原样展示，**不是**退避重试。
+    "companion_not_allowed": "blocked",
 }
 
 #: 服务端错误码 → **能不能重试**。与 `SERVER_CODE_TO_REASON` 是两个问题，别合并。
@@ -225,6 +228,14 @@ SERVER_CODE_RETRY: Dict[str, bool] = {
     "order_not_found": False,
     "order_state_conflict": False,
     "user_not_found": False,
+    # 分离/声纹配套授权：不是"等一下再试"能解决的 —— 先补同音频 ASR 或等下一次 ASR。
+    "companion_not_allowed": False,
+}
+
+#: 服务端没给 `detail` 时的兜底人话（客户端要能说清"下一步做什么"）。
+SERVER_CODE_HINTS: Dict[str, str] = {
+    "companion_not_allowed": ("请先对同一段音频做一次 ASR；"
+                              "若本次 ASR 的配套次数已用完，再对同一段音频做一次 ASR"),
 }
 
 
@@ -281,6 +292,8 @@ def error_from_server(payload: Any, status: int, backend_id: str = "",
     code = str(body.get("code") or "").strip()
     reason = SERVER_CODE_TO_REASON.get(code, "error")
     detail = str(body.get("detail") or body.get("message") or "").strip()
+    if not detail:
+        detail = SERVER_CODE_HINTS.get(code, "")
     if not code:
         # 没有 code：多半是网关/反代回的 HTML，不是我们的服务端
         reason = "offline" if status in (0, 502, 503, 504) else "error"

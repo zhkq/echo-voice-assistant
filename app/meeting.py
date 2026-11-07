@@ -3053,6 +3053,43 @@ def _labels_from_turns(turns):
     return out
 
 
+def _diarize_backend_of(cap_session):
+    """这一场计划把 `diarize.turns` 交给哪个后端（规划失败一律当"不知道"）。"""
+    if cap_session is None:
+        return ""
+    try:
+        return str(cap_session.plan().backend_for("diarize.turns") or "")
+    except Exception:
+        return ""
+
+
+def _companion_skip_reason(asr_provider, asr_backend, diarize_backend):
+    """这一段"分离/声纹做不了"的客户端原因（issue #20）。
+
+    服务端只给**同一次 ASR** 发配套授权；如果这一段的 ASR 与分离落在**不同后端**，
+    分离后端根本没见过这次 ASR，再去调 diarize 一定被 `companion_not_allowed` 拒绝。
+    最常见的就是"ASR 走 provider / 在线转写，分离只走 ECHO 后端"：
+    与其把它记成"分离失败"，不如在客户端就跳过并说清真正原因
+    （用户能据此把会议转写切回 ECHO 后端）。
+
+    `asr_provider` 非空 = 显式 `providerAsr` 那条路（文字由外部服务出，后端没见过）；
+    其余情况按两个槽**实际计划的后端**判：同一个后端（正常 ECHO 会议，
+    或测试里同时提供两槽的替身）就放行，不同就跳过。
+
+    返回空串 = 这一段可以正常调 diarize。
+    """
+    if asr_provider is not None:
+        return ("本场转写走在线服务（providerAsr），没有经过 ECHO 后端；"
+                "分离/声纹必须跟随同一次 ECHO 后端 ASR。"
+                "把会议转写设为 ECHO 后端即可做说话人分离。")
+    asr_backend = str(asr_backend or "")
+    dia_backend = str(diarize_backend or "")
+    if not asr_backend or not dia_backend or asr_backend == dia_backend:
+        return ""
+    return ("本段转写走 %s、分离走 %s，不是同一个后端；分离/声纹必须跟随"
+            "同一次 ASR 所在的同一个后端。" % (asr_backend, dia_backend))
+
+
 def _capability_diarize_segment(cap, seg_path, state=None):
     """一段音频走能力层的 `diarize.turns` → `(turns, embs, labels, plan_dict)`。
 
@@ -3466,6 +3503,11 @@ def _transcribe_impl(folder):
             _set_progress(meeting_id, phase="转写中", seg_index=i, seg_total=seg_total,
                           percent=percent, detail=f"第 {i}/{seg_total} 段")
             seg_rows = []
+            #: 这一段 ASR 实际落在哪个后端。分离/声纹的配套授权只由 **ECHO 后端**的
+            #: ASR 发出（issue #20）：ASR 走 provider 时后端看不到这次 ASR，
+            #: 再调 diarize 只会得到 `companion_not_allowed`。所以下面要按它决定
+            #: "这一段还做不做分离"，而不是把一次注定被拒的调用伪装成"分离失败"。
+            seg_asr_backend = (BACKEND_ASR_PROVIDER if asr_provider is not None else "")
             #: 这一段的说话人标签是不是**只在段内有效**（见下面"没嵌入"那条分支）。
             #: 每段重置；只有"多段 + 没有嵌入 + 不是整场聚类的 provider"才为真。
             local_only = False
@@ -3497,6 +3539,9 @@ def _transcribe_impl(folder):
                     seg_rows, plan_dict, got = _capability_segment_rows(
                         cap_session, seg_path, cfg, seg_idx, seg_min, cap_kinds)
                     asr_plan = plan_dict          # 最近一次调用的计划（跳过的项也在这里）
+                    seg_asr_backend = str(
+                        ((plan_dict or {}).get("picks") or {})
+                        .get("asr.text", {}).get("backendId", "") or "")
                     if not seg_rows:
                         # 空结果**显式留痕**（与线上那条路同一个纪律）：
                         # 区分"这段没人说话"与"后端出了问题"
@@ -3523,8 +3568,21 @@ def _transcribe_impl(folder):
             # 走不到这里就等于"没人能干这一槽"，而那在进循环之前已经按失败收口了。
 
             if diarize:
-                _set_progress(meeting_id, phase="说话人分离", seg_index=i, seg_total=seg_total,
-                              percent=percent, detail=f"第 {i}/{seg_total} 段 · 分离说话人")
+                # 分离/声纹的配套授权只跟随**同一次 ECHO 后端 ASR**（issue #20）。
+                # ASR 走 provider / 在线转写时，这一段不做分离 —— 调用也一定被拒，
+                # 只会把真正的原因（"ASR 没经过后端"）盖成一句含糊的"分离失败"。
+                companion_skip = _companion_skip_reason(
+                    asr_provider, seg_asr_backend, _diarize_backend_of(cap_session))
+                if companion_skip:
+                    # reason 用 `unsupported`（"这个组合做不了"），不用 `blocked`：
+                    # 后者在面板上专门指"被「允许音频去哪」挡住"，会把人引去改隐私设置。
+                    _note_diarize_missing(da_state, "unsupported", companion_skip)
+                    db.add_log("warn", "meeting",
+                               f"{meeting_name} 第{i}段未做分离：{companion_skip}")
+                else:
+                    _set_progress(meeting_id, phase="说话人分离", seg_index=i,
+                                  seg_total=seg_total, percent=percent,
+                                  detail=f"第 {i}/{seg_total} 段 · 分离说话人")
                 try:
                     # 3.0（step 4）：分离问能力路由的 `diarize.turns` 槽。
                     #
@@ -3537,7 +3595,9 @@ def _transcribe_impl(folder):
                     #     而后果是**认错人且不报错**。也**绝不补一列空说话人**。
                     turns_raw = embs = labels = None
                     dia_plan = None
-                    if cap_session is not None:
+                    if companion_skip:
+                        pass
+                    elif cap_session is not None:
                         turns_raw, embs, labels, dia_plan = _capability_diarize_segment(
                             cap_session, seg_path, da_state)
                         if dia_plan:

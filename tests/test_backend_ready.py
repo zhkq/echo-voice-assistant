@@ -38,11 +38,17 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
-        # 读掉请求体（POST 音频），免得客户端写不进去
+        # 读掉请求体（POST 音频），免得客户端写不进去；顺手留下 (path, body) 供用例
+        # 断言"L4 之前真的先发过同音频的 /v1/asr"（issue #20 的配套授权）。
+        body = b""
         try:
             length = int(self.headers.get("Content-Length") or 0)
             if length:
-                self.rfile.read(length)
+                body = self.rfile.read(length)
+        except Exception:
+            body = b""
+        try:
+            self.server.calls.append((path, body))
         except Exception:
             pass
         self.wfile.write(data)
@@ -55,6 +61,8 @@ class _StubServer:
     def __init__(self, routes):
         self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
         self.httpd.routes = dict(routes)
+        self.calls = []
+        self.httpd.calls = self.calls
         self.port = self.httpd.server_address[1]
         self.url = "http://127.0.0.1:%d" % self.port
         self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
@@ -236,6 +244,44 @@ class ReadyProbeTests(_ReadyCase):
                 out = backend_ready.probe(url, token="t", wait_health=0)
                 self.assertIn("ok", out)
                 self.assertFalse(out["ok"])
+
+
+class CompanionProbeTests(_ReadyCase):
+    """L4 分离必须跟随同一次 ASR（2026-11-07，issue #20）。
+
+    服务端只给"同一段音频刚做过 ASR"的 diarize 发配套授权；探针不能裸调，
+    也不能为了 L4 再白花一次 ASR —— 正常路径复用 L3 那次，单独调用时先补一次。
+    """
+
+    def _routes(self):
+        return {
+            "/v1/health": (200, _HEALTH),
+            "/v1/ready": (200, _READY_OK),
+            "/v1/asr": (200, _ASR_OK),
+            "/v1/diarize": (200, {"turns": [], "speakers": {}, "dim": 0}),
+        }
+
+    def test_probe_sends_asr_before_diarize_with_the_same_audio(self):
+        out, s = self.probe(self._routes(), diarize=True)
+        self.assertTrue(out["l4"]["ok"], out)
+        calls = [(path, body) for path, body in s.calls
+                 if path in ("/v1/asr", "/v1/diarize")]
+        self.assertEqual([path for path, _ in calls[:2]],
+                         ["/v1/asr", "/v1/diarize"])
+        self.assertEqual(calls[0][1], calls[1][1],
+                         "L4 必须原样复用 L3 发过的那段音频，否则摘要对不上")
+        self.assertEqual(len([1 for path, _ in s.calls if path == "/v1/asr"]), 1,
+                         "正常探针路径只该有 L3 那一次 ASR")
+
+    def test_standalone_probe_diarize_makes_its_own_short_asr_first(self):
+        s = self.stub(self._routes())
+        out = backend_ready.probe_diarize(s.url, token="t", wav_path="")
+        self.assertTrue(out["ok"], out)
+        paths = [path for path, _ in s.calls]
+        self.assertEqual(paths[:2], ["/v1/asr", "/v1/diarize"])
+        self.assertTrue(s.calls[0][1], "前置 ASR 要发真实音频，不能空 body")
+        self.assertEqual(s.calls[0][1], s.calls[1][1],
+                         "前置 ASR 与 diarize 必须是同一段音频")
 
 
 class SelfTestAudioTests(_ReadyCase):

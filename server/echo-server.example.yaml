@@ -242,6 +242,10 @@ billing:
   max_devices: 3
   max_concurrent: 1
   timezone: "Asia/Shanghai"      # 每日 0 点按这个时区恢复额度
+  # 分离/声纹是 ASR 的配套能力（issue #20）：不扣每日音频分钟，但必须跟随同一次 ASR。
+  # 授权 TTL（秒）与"一次 ASR 允许几次每种配套调用"（1 = 1 diarize + 1 embed）。
+  companion_ttl_s: 3600
+  companion_per_asr: 1
 
 trial:
   enabled: true                  # 注册送 7 天试用（管理面可关）

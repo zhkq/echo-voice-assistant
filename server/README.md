@@ -314,6 +314,11 @@ nvidia-container-toolkit / compose v2）、模型卷按容器布局摆好并校�
 * **按账号的闸门**：1 QPS（`429 rate_limited` + `Retry-After: 1`）、并发 1
   （第二台设备 `409 client_busy`，detail 写明"另一台设备"）、日额度按 user 累计
   （换台设备不能重刷）。
+* **分离/声纹是 ASR 的配套能力**（2026-11-07，issue #20）：**不扣每日音频分钟**，
+  但必须跟随**同一次 ASR**（同一账号/客户端 + 同一段归一化 16k WAV，默认 TTL 1 小时；
+  一次 ASR 给 1 次 diarize + 1 次 embed）。没有 ASR / 音频不一致 / 授权过期 /
+  本次配套次数用完 → `403 companion_not_allowed`（`detail` 说明是哪一种）。
+  权益、QPS、设备、并发、admission 仍照常检查。
 
 ### 8.2 配置（`echo-server.example.yaml` 末尾有完整段）
 
@@ -465,13 +470,16 @@ Mock 端点默认只接受**回环/测试来源**（`payment.mock_allow_remote=f
 | 订单状态不允许 | 409 | `order_state_conflict` |
 | 有有效付费权益时买不同套餐（不做 proration） | 409 | `plan_change_unsupported` |
 | 套餐 / 订单 / 账号不存在 | 404 | `plan_not_found` / `order_not_found` / `user_not_found` |
+| 分离/声纹没跟随同一次 ASR（无 ASR / 音频不一致 / 过期 / 次数用完） | 403 | `companion_not_allowed`（`detail` 区分是哪一种） |
 
 ### 8.6 数据与边界（评审结论）
 
 新增的表全部进 `server/store.py` 的 `TABLE_WHITELIST`：`plans`、`users`、
 `user_devices`、`invites`、`authorized_open_ids`、`scan_sessions`、`orders`、
 `order_events`、`alipay_notify`、`entitlements`，以及 2026-11-06 邮箱账号的
-`email_codes`（邮箱、用途、验证码哈希、TTL、尝试次数、发送时间、IP；**只存哈希**）。它们属于"**关于谁、买了什么、
+`email_codes`（邮箱、用途、验证码哈希、TTL、尝试次数、发送时间、IP；**只存哈希**）、
+2026-11-07 分离/声纹配套授权的 `companion_grants`（归一化音频的 SHA-256 与计数，
+TTL 到期即删）。它们属于"**关于谁、买了什么、
 还有多少**"的管理数据，**不存请求内容**（音频/文本/嵌入），列名黑名单逐列核对。
 `authorized_open_ids` / `scan_sessions` 是 Phase 4 白名单/扫码会话，**只建表、逻辑没做**。
 
