@@ -66,7 +66,7 @@ class PlansTests(unittest.TestCase):
     def test_monthly_matches_the_server_plan_seed(self):
         """月卡必须与 server/billing.py DEFAULT_PLANS 的月卡一致（issue #7 验收项）。"""
         plan = self.plans["monthly"]
-        self.assertEqual(plan["name"], "月卡")
+        self.assertEqual(plan["name"], "基础版：Basic")
         self.assertEqual(plan["priceCents"], 1000)
         self.assertEqual(plan["days"], 30)
         self.assertEqual(plan["dailyAudioMinutes"], 120)
