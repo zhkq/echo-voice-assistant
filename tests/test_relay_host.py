@@ -373,6 +373,8 @@ class _BoundBackend(BaseHTTPRequestHandler):
 
     calls = []
     polls = 0
+    call = {}
+    results = []
 
     def do_POST(self):                                            # noqa: N802
         length = int(self.headers.get("Content-Length") or 0)
@@ -409,8 +411,13 @@ class _BoundBackend(BaseHTTPRequestHandler):
                               "scopes": ["asr"], "clientId": "cli-bound"})
         elif path == "/v1/relay/host/poll":
             _BoundBackend.polls += 1
-            self._reply(200, {"ok": True, "hostId": "cli-bound", "calls": [],
+            calls = ([_BoundBackend.call]
+                     if _BoundBackend.polls == 1 and _BoundBackend.call else [])
+            self._reply(200, {"ok": True, "hostId": "cli-bound", "calls": calls,
                               "timeoutSec": 600})
+        elif path == "/v1/relay/host/result":
+            _BoundBackend.results.append(body)
+            self._reply(200, {"ok": True, "accepted": True})
         else:
             self._reply(404, {"code": "not_found"})
 
@@ -438,6 +445,16 @@ class RelayAfterAutoBindTests(unittest.TestCase):
         self.addCleanup(p.stop)
         _BoundBackend.calls = []
         _BoundBackend.polls = 0
+        _BoundBackend.results = []
+        _BoundBackend.call = {"id": "c1", "method": "GET", "path": "api/status",
+                              "query": "", "headers": {}, "body": ""}
+        _LocalEcho.seen = []
+        self.local = _serve(_LocalEcho)
+        self._orig_local = relay_mod._local_base
+        relay_mod._local_base = (
+            lambda: "http://127.0.0.1:%d" % self.local.server_address[1])
+        self.addCleanup(lambda: setattr(relay_mod, "_local_base", self._orig_local))
+        self.addCleanup(lambda: _stop(self.local))
         self.srv = _serve(_BoundBackend)
         self.base = "http://127.0.0.1:%d" % self.srv.server_address[1]
 
@@ -473,12 +490,17 @@ class RelayAfterAutoBindTests(unittest.TestCase):
         self.assertTrue(auth.startswith("Bearer "))
         self.assertTrue(relay_mod.ready()[0])
 
-        # 2) 真的把中继 worker 跑起来：它会 poll，后端回 hostId=cli-bound。
+        # 2) 真的把中继 worker 跑起来：它会 poll、执行一条手机调用、把结果交回后端。
         self.assertTrue(relay_mod.ensure_running())
         deadline = time.time() + 8.0
-        while time.time() < deadline and not relay_mod.STATE.get("hostId"):
+        while time.time() < deadline and not (
+                relay_mod.STATE.get("hostId") and _BoundBackend.results):
             time.sleep(0.05)
         self.assertEqual(relay_mod.STATE.get("hostId"), "cli-bound")
+        self.assertTrue(_BoundBackend.results, "主机该把中继结果交回后端")
+        self.assertEqual("c1", _BoundBackend.results[0].get("id"))
+        self.assertEqual("/api/status", _LocalEcho.seen[-1]["path"],
+                         "手机经中继的调用应在本机 ECHO 上执行")
         poll = [c for c in _BoundBackend.calls
                 if c["path"] == "/v1/relay/host/poll"][-1]
         self.assertTrue(poll["auth"].startswith("Bearer "))
