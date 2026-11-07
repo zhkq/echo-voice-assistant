@@ -145,18 +145,36 @@ def find_iscc(explicit: str = "") -> str:
         "找不到 ISCC.exe。安装 Inno Setup 6 或传 --iscc <path>；CI 会下载固定版本。")
 
 
+def _powershell() -> str:
+    return shutil.which("powershell") or shutil.which("pwsh") or "powershell"
+
+
+def build_code_package(dist: Path) -> Path:
+    """Build the code-only installer payload.
+
+    We use a dedicated ``-Profile installer`` instead of ``main``: integration branches
+    carry multi-MB evidence screenshots under docs/ that are not product content.  The
+    profile keeps the same whitelist/forbidden-content checks and the 20 MB budget, but
+    keeps only markdown/text from docs/.
+    """
+    say("building installer code package (profile=installer) ...")
+    run([_powershell(), "-NoProfile", "-ExecutionPolicy", "Bypass",
+         "-File", str(SCRIPTS / "build-package.ps1"),
+         "-Profile", "installer", "-OutDir", str(dist)])
+    package = newest("ECHO-installer-win-*.zip", dist)
+    if package is None:
+        raise BuildError(f"build-package.ps1 说成功了，但在 {dist} 里找不到 ECHO-installer-win-*.zip")
+    return package
+
+
 def stage_main(stage: Path, main_zip: Path | None, dry_run: bool) -> Path | None:
     if main_zip is None:
         if dry_run:
-            say("would build main package (build-package.ps1 -Profile main)")
+            say("would build installer code package (build-package.ps1 -Profile installer)")
             return None
-        kit = load_build_kit()
-        plat = kit.PLATFORMS[0]          # Windows first in build_kit.PLATFORMS
-        say(f"building main package ({plat['label']}) ...")
-        built = kit.build_main_packages([plat], DIST)
-        main_zip = built.get(plat["key"]) or kit.newest_main_package(DIST, plat)
+        main_zip = build_code_package(DIST)
     if main_zip is None or not Path(main_zip).is_file():
-        raise BuildError("没有主程序包（build-package.ps1 -Profile main）")
+        raise BuildError("没有安装器代码包（build-package.ps1 -Profile installer）")
     if dry_run:
         say(f"would extract main package: {main_zip}")
         return Path(main_zip)

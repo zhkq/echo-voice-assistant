@@ -31,7 +31,7 @@
 python -m pip install uv
 uv python install 3.11.15
 
-# 2) 一条命令：主包 + runtime-core + sidebar + 启动器 + ISCC
+# 2) 一条命令：代码包（profile=installer）+ runtime-core + sidebar + 启动器 + ISCC
 python scripts/build_installer.py --out dist
 # 已有 ISCC 不在默认位置时：
 # python scripts/build_installer.py --iscc "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"

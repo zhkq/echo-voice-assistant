@@ -46,7 +46,7 @@
 # ASCII-ONLY on purpose (see echo-instance-lib.ps1).
 # =====================================================================
 param(
-    [ValidateSet('public', 'main', 'internal', 'component', 'offline')][string]$Profile = 'public',
+    [ValidateSet('public', 'main', 'installer', 'internal', 'component', 'offline')][string]$Profile = 'public',
     [string]$OutDir = '',
     [string]$Version = '',
     [string]$Component = '',
@@ -418,7 +418,7 @@ if ($Profile -eq 'component' -or $Profile -eq 'offline') {
 
 # ---------------------------------------------------------------- whitelist
 $dirs = @('app', 'web', 'mac', 'scripts', 'plugin', 'docs', 'assets', 'dsh-failover', '.dsh', 'sidebar')
-if ($Profile -eq 'main') {
+if ($Profile -eq 'main' -or $Profile -eq 'installer') {
     # components\*.json = the offline component declarations the panel also reads.
     if (Test-Path (Join-Path $root 'components')) { $dirs += @('components') }
     else { Say 'components\ not present yet - manifest.json will declare none' }
@@ -494,7 +494,17 @@ foreach ($d in $dirs) {
     if (-not (Test-Path $full)) { Warn "missing dir, skipped: $d"; continue }
     Get-ChildItem $full -Recurse -File -Force -ErrorAction SilentlyContinue | ForEach-Object {
         $rel = $_.FullName.Substring($root.Length + 1).Replace('\', '/')
-        if (-not (Test-ForbiddenPath $rel)) { $files.Add([pscustomobject]@{ Rel = $rel; Full = $_.FullName; Len = $_.Length }) }
+        if (-not (Test-ForbiddenPath $rel)) {
+            # The installer is a product package, not an evidence archive: integration
+            # branches accumulate multi-MB screenshots/zips under docs/.  Keep the
+            # markdown documentation, skip the binaries (and the D22 size gate would
+            # otherwise fail on evidence files that never ship to users).
+            if ($Profile -eq 'installer' -and $rel -like 'docs/*') {
+                $ext = [System.IO.Path]::GetExtension($rel).ToLower()
+                if (@('.md', '.txt') -notcontains $ext) { return }
+            }
+            $files.Add([pscustomobject]@{ Rel = $rel; Full = $_.FullName; Len = $_.Length })
+        }
     }
 }
 foreach ($f in $rootFiles) {
@@ -546,7 +556,7 @@ Ok 'no forbidden files or content'
 # The main package has exactly one job: be small enough to hand over by mail/IM and to
 # upgrade in seconds. If it grows past the budget, fail here instead of quietly shipping
 # a package that defeats the whole split (REFACTOR-PLAN D22: 10-20 MB, main = code only).
-if ($Profile -eq 'main') {
+if ($Profile -eq 'main' -or $Profile -eq 'installer') {
     if ($totalBytes -gt 20MB) {
         Say 'largest contributors:'
         $files | Sort-Object Len -Descending | Select-Object -First 10 | ForEach-Object {
