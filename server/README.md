@@ -318,7 +318,8 @@ nvidia-container-toolkit / compose v2）、模型卷按容器布局摆好并校�
   但必须跟随**同一次 ASR**（同一账号/客户端 + 同一段归一化 16k WAV，默认 TTL 1 小时；
   一次 ASR 给 1 次 diarize + 1 次 embed）。没有 ASR / 音频不一致 / 授权过期 /
   本次配套次数用完 → `403 companion_not_allowed`（`detail` 说明是哪一种）。
-  权益、QPS、设备、并发、admission 仍照常检查。
+  权益、设备、并发、admission 仍保留；**用户 1 QPS 只作用于 ASR/TTS**，
+  companion 跳过（ASR→diarize 紧挨着发生，同一个令牌桶会把合法配套误杀成 429）。
 
 ### 8.2 配置（`echo-server.example.yaml` 末尾有完整段）
 

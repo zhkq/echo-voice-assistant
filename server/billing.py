@@ -489,8 +489,12 @@ class BillingService:
 
         **顺序是有意的**（任务书 T5）：鉴权 → user → 1 QPS → 准入/并发 → 计费。
         这里只做到"日额度检查"；并发槽由 `user_slot()` 在推理期间持有。
-        `kind="companion"`（分离/声纹）**跳过日额度**：它们不占每日音频分钟，
-        但仍保留权益、1 QPS 与设备检查（2026-11-07，issue #20）。
+
+        `kind="companion"`（分离/声纹）**跳过日额度，也跳过用户 1 QPS**：
+        它们不占每日音频分钟；而且 ASR → diarize 是**紧挨着**发生的合法配套调用，
+        ASR 刚吃掉唯一一个令牌，再让 companion 吃同一个桶会把正常流程误杀成 429
+        （2026-11-07 评审阻塞点）。防滥用已由"每次 ASR 1+1"、ASR 自身的 1 QPS、
+        并发与设备/权益闸门兜住。权益、设备与并发检查仍保留。
         """
         if not self.enabled:
             return None
@@ -500,17 +504,18 @@ class BillingService:
         uid = str(user["user_id"])
         ent = self.require_entitlement(uid)
         limits = self._limits(ent)
-        try:
-            self.qps.check(uid, rate=float(limits["qps"]))
-        except errors.EchoError:
-            # 顺序仍是 1 QPS 先判（任务书 T5），但如果今天的额度**已经用完**，
-            # "今天别再试"比"慢一点"更准确 —— 换那个错误告诉客户端，
-            # 否则客户端会等一秒再撞一次同样的墙。
-            if kind == "audio":
-                self.check_audio_quota(uid)
-            elif kind == "tts":
-                self.check_tts_quota(uid, 0)
-            raise
+        if kind != "companion":
+            try:
+                self.qps.check(uid, rate=float(limits["qps"]))
+            except errors.EchoError:
+                # 顺序仍是 1 QPS 先判（任务书 T5），但如果今天的额度**已经用完**，
+                # "今天别再试"比"慢一点"更准确 —— 换那个错误告诉客户端，
+                # 否则客户端会等一秒再撞一次同样的墙。
+                if kind == "audio":
+                    self.check_audio_quota(uid)
+                elif kind == "tts":
+                    self.check_tts_quota(uid, 0)
+                raise
         if kind == "audio":
             self.check_audio_quota(uid)
         elif kind == "tts":

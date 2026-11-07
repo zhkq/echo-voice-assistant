@@ -1121,7 +1121,7 @@ class Phase3OrderFlowTests(_BillingCase):
     def test_order_view_carries_plan_name_days_amount_and_sandbox(self):
         token = self.register()["userToken"]
         order = self._order(token)
-        self.assertEqual(order["planName"], "月卡")
+        self.assertEqual(order["planName"], "基础版：Basic")
         self.assertEqual(order["days"], 30)
         self.assertEqual(order["amountCents"], 1000)
         self.assertFalse(order["sandbox"])
@@ -1222,7 +1222,8 @@ class CompanionGrantTests(_BillingCase):
       4. 换账号调用 → 归属不匹配，拒绝；
       5. 授权过期 → 拒绝；
       6. 正常 ASR → diarize/embed 成功，且当日 ASR 分钟数**不变**；
-      7. TTS 字符额度不受影响；QPS / 并发 / 设备检查仍然生效。
+      7. TTS 字符额度不受影响；并发/设备检查仍然生效；用户 1 QPS 只作用于
+         ASR/TTS，companion 跳过（否则 ASR→diarize 紧邻会被 429 误杀）。
     """
 
     def setUp(self):
@@ -1371,17 +1372,22 @@ class CompanionGrantTests(_BillingCase):
         self.assertEqual(r.json()["code"], "companion_not_allowed")
         self.assertIn("过期", r.json().get("detail", ""))
 
-    # ---- 7. QPS / 并发仍生效 --------------------------------------------
+    # ---- 7. QPS / 并发 --------------------------------------------------
 
-    def test_companion_still_obeys_the_account_qps(self):
+    def test_companion_is_not_blocked_by_the_asr_qps(self):
+        """qps=1 时 ASR 后**立刻** diarize 仍应 200（评审阻塞点）。
+
+        ASR 刚吃掉唯一一个令牌；companion 不再吃同一个 1 QPS 桶。否则短音频或
+        健康探针的 ASR→diarize 合法配套会被 429 误杀，会议这一段就没有说话人。
+        ASR 自身的 1 QPS 限制由 `test_one_qps_is_enforced_per_account` 钉住。
+        """
         row = dict(self.store.entitlement(self.account_id))
         row["qps"] = 1
         self.store.upsert_entitlement(row)
         self.svc.forget_entitlement(self.account_id)
         self._asr()
         r = self._post("/v1/diarize")
-        self.assertEqual(r.status_code, 429, r.text)
-        self.assertEqual(r.json()["code"], "rate_limited")
+        self.assertEqual(r.status_code, 200, r.text)
 
     def test_companion_is_rejected_when_the_single_slot_is_already_held(self):
         """满载：1 个并发槽已被占，diarize 必须 409（与 ASR 同一条 user 闸门）。
