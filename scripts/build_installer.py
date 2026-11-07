@@ -179,7 +179,22 @@ def stage_main(stage: Path, main_zip: Path | None, dry_run: bool) -> Path | None
         say(f"would extract main package: {main_zip}")
         return Path(main_zip)
     kit = load_build_kit()
-    code = kit.extract_main_package(Path(main_zip), stage)
+    try:
+        code = kit.extract_main_package(Path(main_zip), stage)
+    except Exception as exc:                       # noqa: BLE001 —— 带上 zip 结构再报错
+        try:
+            with zipfile.ZipFile(main_zip) as zf:
+                names = zf.namelist()
+                sample = names[:15]
+                mains = [n for n in names if n.endswith("app/main.py")][:5]
+                manifests = [n for n in names if n.endswith("manifest.json")][:5]
+        except Exception:
+            sample, mains, manifests = [], [], []
+        raise BuildError(
+            f"解不开安装器代码包：{exc}\n"
+            f"  zip sample: {sample}\n"
+            f"  app/main.py entries: {mains}\n"
+            f"  manifest.json entries: {manifests}") from exc
     if not (code / "app" / "main.py").is_file():
         raise BuildError(f"主程序包解出来没有 app/main.py：{main_zip}")
     if code.name != "echo-core":
