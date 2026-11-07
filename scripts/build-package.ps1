@@ -86,6 +86,18 @@ function Get-Sha256([string]$Path) {
         $sha.Dispose()
     }
 }
+
+function Get-RelFromStage([string]$full) {
+    # $env:TEMP can be the 8.3 short form (RUNNER~1) while Get-ChildItem returns the long
+    # form, so `$full.Substring($stage.Length + 1)` cuts into the stage GUID and produces
+    # entries like "40/ECHO/...".  Locate the unique stage leaf instead.
+    $leaf = Split-Path -Leaf $stage
+    $idx = $full.IndexOf($leaf, [System.StringComparison]::OrdinalIgnoreCase)
+    if ($idx -ge 0) {
+        return $full.Substring($idx + $leaf.Length).TrimStart('\', '/').Replace('\', '/')
+    }
+    return $full.Substring($stage.Length + 1).Replace('\', '/')
+}
 function Ok([string]$m)   { Write-Host "  [ok]   $m" -ForegroundColor Green }
 function Warn([string]$m) { Write-Host "  [warn] $m" -ForegroundColor Yellow }
 function Die([string]$m)  { Write-Host "  [fail] $m" -ForegroundColor Red; Unlock-Pack; exit 1 }
@@ -371,14 +383,14 @@ if ($Profile -eq 'component' -or $Profile -eq 'offline') {
         Say 'largest contributors:'
         $stageFiles | Sort-Object Length -Descending | Select-Object -First 8 | ForEach-Object {
             Say ("    {0,10} MB  {1}" -f [Math]::Round($_.Length / 1MB, 1),
-                 $_.FullName.Substring($stage.Length + 1))
+                 Get-RelFromStage $_.FullName)
         }
         Die ("offline bundle is {0} MB unpacked - over the 700 MB budget" -f [Math]::Round($packBytes / 1MB, 2))
     }
     if ($Profile -eq 'offline') { Ok ("offline bundle size gate: {0} MB <= 700 MB" -f [Math]::Round($packBytes / 1MB, 2)) }
     $sums = New-Object System.Collections.Generic.List[string]
     foreach ($f in ($stageFiles | Sort-Object FullName)) {
-        $rel = $f.FullName.Substring($stage.Length + 1).Replace('\', '/')
+        $rel = Get-RelFromStage $f.FullName
         $h = (Get-Sha256 $f.FullName)
         $sums.Add("$h  $rel")
     }
@@ -411,7 +423,7 @@ if ($Profile -eq 'component' -or $Profile -eq 'offline') {
     $zip = [System.IO.Compression.ZipFile]::Open($zipTmp, [System.IO.Compression.ZipArchiveMode]::Create)
     try {
         foreach ($f in (Get-ChildItem $stage -Recurse -File -Force | Sort-Object FullName)) {
-            $rel = $f.FullName.Substring($stage.Length + 1).Replace('\', '/')
+            $rel = Get-RelFromStage $f.FullName
             [void][System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
                 $zip, $f.FullName, $rel, [System.IO.Compression.CompressionLevel]::Optimal)
         }
@@ -720,7 +732,7 @@ Add-Type -AssemblyName System.IO.Compression        # ZipArchiveMode / ZipArchiv
 $zip = [System.IO.Compression.ZipFile]::Open($zipTmp, [System.IO.Compression.ZipArchiveMode]::Create)
 try {
     foreach ($f in (Get-ChildItem $stage -Recurse -File -Force | Sort-Object FullName)) {
-        $rel = $f.FullName.Substring($stage.Length + 1).Replace('\', '/')
+        $rel = Get-RelFromStage $f.FullName
         [void][System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
             $zip, $f.FullName, $rel, [System.IO.Compression.CompressionLevel]::Optimal)
     }
