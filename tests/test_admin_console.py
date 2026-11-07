@@ -516,6 +516,9 @@ class IsolationTests(_AdminCase):
                                        "/v1/account/register", "/v1/account/login",
                                        "/v1/account/email/send-code",
                                        "/v1/account/password/reset",
+                                       # 登录即绑（issue #23）：凭 userToken，只写
+                                       # clients/user_devices 管理数据，与 /v1/pair 同类。
+                                       "/v1/account/devices/bind",
                                        "/v1/account/devices/code",
                                        "/v1/account/devices/unbind",
                                        "/v1/account/logout",
