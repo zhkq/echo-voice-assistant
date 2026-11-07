@@ -49,6 +49,9 @@
    转写分钟、TTS 字符、QPS/并发、设备数）和最近订单；权益卡显示服务端下发的
    `renewalRule / planChangeRule / refundRule`，续费入口回 `/pricing`。订单列表显示全部状态
    （待支付/已支付/已退款/已关闭），不只显示 paid。
+   **我的设备**（issue #23）：同一份 `me.devices` 渲染设备名/平台/绑定时间/最近活跃，
+   并提供解绑（`POST /v1/account/devices/unbind`）；设备由客户端登录后自动绑定，
+   账户页不再展示配对码。Before/After 截图见 `docs/account-device-evidence/`。
 
 ### 测试环境标注
 

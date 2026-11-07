@@ -182,6 +182,10 @@ DEFAULTS: Dict[str, Any] = {
         "pair_code_ttl_s": 900,
         # 换机 / 重装的设备绑定码有效期（秒）。设计定的是 10 分钟。
         "device_bind_ttl_s": 600,
+        # 登录态直接绑定（issue #23）的限流：按账号每分钟最多几次 / 突发几次。
+        # 3 台设备 + 少量重试在突发里；它是独立桶，不占能力面的 1 QPS。
+        "device_bind_rate_per_min": 6,
+        "device_bind_burst": 5,
         # 同一账号每小时最多建几单（设计 §4.6 的"下单防刷"）。
         "order_rate_per_hour": 10,
         # 新配对客户端拿到的 scopes（空 = 不限）。收费客户端按套餐走，

@@ -16,7 +16,7 @@ import time
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Request, Response, UploadFile
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
 from starlette.background import BackgroundTask
 
 import app.db as db
@@ -66,6 +66,11 @@ _NETWORK_DENIED = (
     ("POST", re.compile(r"^/api/meetings/clean-short$"), "不允许从手机/手表批量删会议"),
     ("PUT", re.compile(r"^/api/settings$"), "不允许从手机/手表改设置"),
     ("POST", re.compile(r"^/api/settings/reset$"), "不允许从手机/手表重置设置"),
+    # 账号与设备绑定（issue #23）：账号会话/凭据只该在本机进程里产生；
+    # 手机/手表即使拿着 API 令牌，也不该改这台电脑登录的是谁、绑的是哪台设备。
+    ("POST", re.compile(r"^/api/account/(login|register|email/code|password/reset|"
+                        r"logout|devices/bind|devices/unbind)$"),
+     "不允许从手机/手表操作本机账号与设备绑定"),
 )
 
 
@@ -385,6 +390,57 @@ class PairLocalIn(BaseModel):
     path: str = ""
 
 
+# ---------------------------------------------------------------- 账号（登录即绑，issue #23）
+#
+# 这些端点是**本机面板/向导**的入口：密码与 userToken 只在客户端进程里，
+# 浏览器不直接打远端（免 CORS，TLS 证书固定也只在进程里）。
+# 字段名同时接受 camelCase 与服务端风格的 snake_case（面板 JS 用前者）。
+
+class AccountLoginIn(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+    email: str = ""
+    password: str = ""
+    server_url: str = Field(default="", alias="serverUrl")
+
+
+class AccountRegisterIn(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+    email: str = ""
+    code: str = ""
+    password: str = ""
+    invite_code: str = Field(default="", alias="inviteCode")
+    name: str = ""
+    server_url: str = Field(default="", alias="serverUrl")
+
+
+class AccountEmailCodeIn(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+    email: str = ""
+    purpose: str = "register"
+    server_url: str = Field(default="", alias="serverUrl")
+
+
+class AccountPasswordResetIn(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+    email: str = ""
+    code: str = ""
+    new_password: str = Field(default="", alias="newPassword")
+    server_url: str = Field(default="", alias="serverUrl")
+
+
+class AccountBindIn(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+    force: bool = False
+    client_name: str = Field(default="", alias="clientName")
+    device_name: str = Field(default="", alias="deviceName")
+    platform: str = ""
+
+
+class AccountUnbindIn(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+    client_id: str = Field(default="", alias="clientId")
+
+
 class BackendStartIn(BaseModel):
     """「起本机后端」（批 1d）点下去时的选项。
 
@@ -457,6 +513,115 @@ def api_capability_pair_local(body: Optional[PairLocalIn] = None,
         raise HTTPException(status_code=400, detail=message)
     return {"ok": True, "message": message, "pair": capability_admin.pair_view(),
             "local": capability_admin.local_pair_view()}
+
+
+# ---------------------------------------------------------------- 账号与登录即绑（issue #23）
+
+def _account_http(exc) -> HTTPException:
+    """把 `account_admin.AccountError` 翻成 HTTPException（状态与 code 由客户端决定）。
+
+    保留 401/402/403/409/429：面板据此区分"去登录 / 去续费 / 去解绑 / 稍后再试"。
+    """
+    status = int(getattr(exc, "status", 0) or 400)
+    if status < 400 or status > 599:
+        status = 400
+    return HTTPException(status_code=status,
+                         detail=str(getattr(exc, "message", str(exc))))
+
+
+@router.get("/account/session")
+def api_account_session(_auth=Depends(optional_auth)):
+    """本机账号会话（**不含 userToken**）：向导据此判断"要不要显示登录"。"""
+    from app import account_admin
+    return account_admin.session_view()
+
+
+@router.post("/account/login")
+def api_account_login(body: AccountLoginIn, _auth=Depends(optional_auth)):
+    """邮箱 + 密码登录；会话落本机 `{DATA}/account.json`（DPAPI/0600）。"""
+    from app import account_admin
+    try:
+        return account_admin.login(body.email, body.password, body.server_url)
+    except account_admin.AccountError as exc:
+        raise _account_http(exc) from None
+
+
+@router.post("/account/register")
+def api_account_register(body: AccountRegisterIn, _auth=Depends(optional_auth)):
+    """邮箱注册（验证码 + 密码 + 邀请码）；成功后直接落登录态。"""
+    from app import account_admin
+    try:
+        return account_admin.register(body.email, body.code, body.password,
+                                      body.invite_code, body.name, body.server_url)
+    except account_admin.AccountError as exc:
+        raise _account_http(exc) from None
+
+
+@router.post("/account/email/code")
+def api_account_email_code(body: AccountEmailCodeIn, _auth=Depends(optional_auth)):
+    """发注册/重置验证码。"""
+    from app import account_admin
+    try:
+        return account_admin.send_code(body.email, body.purpose, body.server_url)
+    except account_admin.AccountError as exc:
+        raise _account_http(exc) from None
+
+
+@router.post("/account/password/reset")
+def api_account_password_reset(body: AccountPasswordResetIn,
+                               _auth=Depends(optional_auth)):
+    """用邮箱验证码重置密码（服务端会让旧 userToken 全部失效）。"""
+    from app import account_admin
+    try:
+        return account_admin.reset_password(body.email, body.code,
+                                            body.new_password, body.server_url)
+    except account_admin.AccountError as exc:
+        raise _account_http(exc) from None
+
+
+@router.post("/account/logout")
+def api_account_logout(_auth=Depends(optional_auth)):
+    """退出登录：尽力撤销服务端 userToken，并清本机会话。"""
+    from app import account_admin
+    return account_admin.logout()
+
+
+@router.get("/account/me")
+def api_account_me(_auth=Depends(optional_auth)):
+    """账号信息 + 权益 + 设备列表（面板「我的」页用）。"""
+    from app import account_admin
+    try:
+        return account_admin.me()
+    except account_admin.AccountError as exc:
+        raise _account_http(exc) from None
+
+
+@router.post("/account/devices/bind")
+def api_account_bind(body: Optional[AccountBindIn] = None,
+                     _auth=Depends(optional_auth)):
+    """登录态绑定本机设备：**已有 backend.json 时默认跳过**，不重复占名额。
+
+    这是"登录即用"的关键一步；成功只写 `{DATA}/backend.json`，
+    **不自动改能力路由/隐私设置**（由向导/面板在用户确认后写）。
+    """
+    from app import account_admin
+    payload = body or AccountBindIn()
+    try:
+        return account_admin.bind_device(
+            bool(payload.force), client_name=payload.client_name,
+            device_name=payload.device_name, platform_name=payload.platform)
+    except account_admin.AccountError as exc:
+        raise _account_http(exc) from None
+
+
+@router.post("/account/devices/unbind")
+def api_account_unbind(body: AccountUnbindIn, _auth=Depends(optional_auth)):
+    """解绑设备；解绑本机时同时删掉本机 `backend.json`。"""
+    from app import account_admin
+    try:
+        return account_admin.unbind_device(body.client_id)
+    except account_admin.AccountError as exc:
+        raise _account_http(exc) from None
 
 
 class SetAddressIn(BaseModel):

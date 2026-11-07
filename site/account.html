@@ -139,6 +139,18 @@
               <p class="pay-note">额度按 Asia/Shanghai 自然日恢复；权益归人，多台设备共用同一份额度。</p>
             </div>
 
+            <div class="panel account-devices">
+              <div class="panel-title">我的设备
+                <span class="tag" id="deviceCount">—</span>
+                <button class="btn btn-ghost btn-sm panel-action" id="refreshDevices" type="button">刷新</button>
+              </div>
+              <p class="account-device-note">客户端登录账号后会自动绑定，不需要配对码。同一台设备同一时刻只能绑定一个账号；换机/重装请先在这里解绑旧设备。</p>
+              <div class="device-list" id="devicesList" aria-busy="true">
+                <p class="account-loading">正在加载设备…</p>
+              </div>
+              <p class="empty-state" id="devicesEmpty" hidden>还没有绑定设备。登录客户端后会自动出现在这里。</p>
+            </div>
+
             <div class="panel account-orders">
               <div class="panel-title">最近订单
                 <button class="btn btn-ghost btn-sm panel-action" id="refreshAccount" type="button">刷新</button>

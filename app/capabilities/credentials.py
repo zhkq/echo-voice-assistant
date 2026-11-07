@@ -59,8 +59,12 @@ def credentials_path() -> str:
 
 # ---------------------------------------------------------------- 加密信封
 
-def _seal(plaintext: str) -> Dict[str, str]:
-    """secret → 落盘用的信封。平台决定是 DPAPI 密文还是明文 + 0600。"""
+def seal_text(plaintext: str) -> Dict[str, str]:
+    """一段明文 → 落盘用的信封。平台决定是 DPAPI 密文还是明文 + 0600。
+
+    2026-11-07（issue #23）：从私有 `_seal` 提成公开函数 —— `backend.json` 的 secret
+    与 `account.json` 的 userToken 必须走**同一套**边界，不能各抄一份信封代码。
+    """
     from app import platform
     raw = plaintext.encode("utf-8")
     blob = platform.protect_secret(raw)
@@ -72,8 +76,8 @@ def _seal(plaintext: str) -> Dict[str, str]:
     return {"enc": kind, "value": base64.b64encode(blob).decode("ascii")}
 
 
-def _open(envelope: Any) -> str:
-    """解信封。**认不出/解不开都返回空串**，由 `load()` 统一当"没配对"。"""
+def unseal_text(envelope: Any) -> str:
+    """解信封。**认不出/解不开都返回空串**，由调用方统一当"没有凭据"。"""
     from app import platform
     if not isinstance(envelope, dict):
         return ""
@@ -95,6 +99,57 @@ def _open(envelope: Any) -> str:
         except Exception:
             return ""
     return ""
+
+
+#: 兼容旧名字（历史调用与用例里还写着 `_seal` / `_open`）。
+_seal = seal_text
+_open = unseal_text
+
+
+def data_path(name: str) -> str:
+    """`{DATA}/<name>` —— 与 `backend.json` 同级（account.json / device-id 都放这儿）。"""
+    return os.path.join(os.path.dirname(credentials_path()), str(name))
+
+
+def write_sealed_json(name: str, payload: Dict[str, Any]) -> str:
+    """把整个 JSON 当一个秘密落盘（`account.json` 用）。
+
+    与 `backend.json` 不同：账号会话里的每个字段（userToken/email/serverUrl）都当作
+    一个整体加密，读的人不会看到"哪些字段是明文"。信封/权限/原子替换与 `save()`
+    共用同一套原语，不另写一份。
+    """
+    path = data_path(name)
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    envelope = seal_text(raw)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(envelope, fh, ensure_ascii=False, indent=2)
+    _restrict(tmp)
+    os.replace(tmp, path)
+    _restrict(path)
+    return path
+
+
+def read_sealed_json(name: str) -> Optional[Dict[str, Any]]:
+    """读 `write_sealed_json()` 写的文件。没有/坏了一律返回 None（不抛）。"""
+    path = data_path(name)
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as fh:
+            envelope = json.load(fh)
+    except Exception:
+        return None
+    raw = unseal_text(envelope)
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
+
 
 
 # ---------------------------------------------------------------- 数据

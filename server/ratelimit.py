@@ -52,10 +52,15 @@ class TokenBucket:
             self._state[key] = (tokens - 1.0, now)
             return True
 
-    def check(self, key: str, rate: Optional[float] = None) -> None:
-        """拿一个令牌；拿不到就 `429 rate_limited`（`Retry-After: 1`）。"""
+    def check(self, key: str, rate: Optional[float] = None,
+              detail: str = "同一账号每秒只允许 1 个请求") -> None:
+        """拿一个令牌；拿不到就 `429 rate_limited`（`Retry-After: 1`）。
+
+        `detail` 可覆盖默认文案：绑定接口（issue #23）的桶是"每分钟几次"，
+        照抄"每秒 1 个请求"会让人误以为自己的能力调用被限速了。
+        """
         if not self._take(str(key or ""), max(0.001, float(rate or self.rate))):
-            raise errors.rate_limited(1, "同一账号每秒只允许 1 个请求")
+            raise errors.rate_limited(1, detail)
 
     def reset(self) -> None:
         with self._lock:

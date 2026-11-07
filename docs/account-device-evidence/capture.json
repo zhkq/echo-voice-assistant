@@ -1,0 +1,60 @@
+{
+  "capturedAt": "2026-11-07T21:27:01+0800",
+  "baseline": {
+    "ref": "c09884b",
+    "commit": "c09884b3a2a8d6ce7ba38bbf347e54ae425ee34a"
+  },
+  "browser": "chromium 156.0.8078.79",
+  "mode": "mock backend",
+  "notes": [
+    "Before 与 After 使用同一份 mock 账号/权益/设备数据、同一视口、浅色、中文。",
+    "设备是 mock 数据（cli-demo-1 / cli-demo-2），不是真实账号，也不含凭据。",
+    "Before=c09884b 是 ticket 分支基线（integration/billing-vibepay），不是 main。"
+  ],
+  "files": [
+    {
+      "page": "before-account-devices",
+      "url": "http://127.0.0.1:44459/account",
+      "viewport": {
+        "width": 1440,
+        "height": 900
+      },
+      "file": "before-account-devices.png",
+      "sha256": "22e7bba284c9152d37aac2bc761e447aa37f501db2c2631a72fda94534c1a78a",
+      "note": "基线 c09884b：账户页只有权益/订单，没有设备列表。"
+    },
+    {
+      "page": "after-account-devices",
+      "url": "http://127.0.0.1:39521/account",
+      "viewport": {
+        "width": 1440,
+        "height": 900
+      },
+      "file": "after-account-devices.png",
+      "sha256": "dfb3cefa7a463c342ed3a515aff949b44722248eec4ab6163c7f011934c62ece",
+      "note": "本分支：账户页新增「我的设备」列表（名称/平台/绑定/最近活跃）与解绑。"
+    },
+    {
+      "page": "before-account-devices-mobile",
+      "url": "http://127.0.0.1:44459/account",
+      "viewport": {
+        "width": 375,
+        "height": 812
+      },
+      "file": "before-account-devices-mobile.png",
+      "sha256": "2b948313cf907369cb7999fc6abf93410629ea7e975e48fbe8d6049e1f85b08c",
+      "note": "基线 c09884b 移动端账户页（无设备列表）。"
+    },
+    {
+      "page": "after-account-devices-mobile",
+      "url": "http://127.0.0.1:39521/account",
+      "viewport": {
+        "width": 375,
+        "height": 812
+      },
+      "file": "after-account-devices-mobile.png",
+      "sha256": "17fb644d8162f30f16c11547a3196b59d8a522898ab8c734e7a21b78239251d9",
+      "note": "本分支移动端：设备列表与解绑按钮。"
+    }
+  ]
+}

@@ -14,15 +14,23 @@
 import base64
 import json
 import os
+import shutil
 import sys
+import tempfile
 import threading
 import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlsplit
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app import relay as relay_mod                                 # noqa: E402
+from app import account_admin                                      # noqa: E402
+from app.capabilities import credentials as cred                   # noqa: E402
+from app.capabilities import echo_server as echo_mod               # noqa: E402
+from app.capabilities.credentials import BackendCredentials        # noqa: E402
+from unittest.mock import patch                                    # noqa: E402
 
 
 # ---------------------------------------------------------------- 纯判据
@@ -354,6 +362,159 @@ class PairingThroughRelayTests(unittest.TestCase):
         with mock.patch.object(netguard, "preferred_address", lambda: "192.168.1.5"), \
              mock.patch.object(ports, "active_port", lambda *a, **k: 8970):
             self.assertEqual("http://192.168.1.5:8970", api_mod._phone_base_url(self._req(False)))
+
+
+class _BoundBackend(BaseHTTPRequestHandler):
+    """假装后端：账号登录 → 登录态绑定 → 换令牌 → relay host poll。
+
+    它把 hostId 固定成"认证过的 clientId"（与服务端 `/v1/relay/host/poll` 的真实语义一致），
+    所以"绑完还能 poll"这条用例不是看客户端自报，而是看后端按新凭据认出来的是谁。
+    """
+
+    calls = []
+    polls = 0
+    call = {}
+    results = []
+
+    def do_POST(self):                                            # noqa: N802
+        length = int(self.headers.get("Content-Length") or 0)
+        raw = self.rfile.read(length) if length else b"{}"
+        try:
+            body = json.loads(raw.decode("utf-8") or "{}")
+        except Exception:
+            body = {}
+        path = urlsplit(self.path).path
+        auth = self.headers.get("Authorization") or ""
+        _BoundBackend.calls.append({"path": path, "auth": auth, "body": body})
+        if path == "/v1/account/login":
+            self._reply(200, {"userId": "usr-1", "user": {"email": "u@example.com"},
+                              "userToken": "user-token", "expiresAt": 4102444800,
+                              "devices": []})
+        elif path == "/v1/account/devices/bind":
+            if auth != "Bearer user-token":
+                self._reply(401, {"code": "unauthorized"})
+                return
+            self._reply(200, {"clientId": "cli-bound", "clientSecret": "secret-bound",
+                              "accessToken": "access-bound", "expiresIn": 3600,
+                              "scopes": ["asr"], "device": {}, "devices": 1,
+                              "deviceLimit": 3, "rebound": False})
+        elif path == "/v1/token":
+            want = {
+                "Basic " + base64.b64encode(b"cli-bound:secret-bound").decode(): "access-bound",
+                "Basic " + base64.b64encode(b"cli-old:old-secret").decode(): "access-old",
+            }
+            token = want.get(auth)
+            if not token:
+                self._reply(401, {"code": "unauthorized"})
+                return
+            self._reply(200, {"accessToken": token, "expiresIn": 3600,
+                              "scopes": ["asr"], "clientId": "cli-bound"})
+        elif path == "/v1/relay/host/poll":
+            _BoundBackend.polls += 1
+            calls = ([_BoundBackend.call]
+                     if _BoundBackend.polls == 1 and _BoundBackend.call else [])
+            self._reply(200, {"ok": True, "hostId": "cli-bound", "calls": calls,
+                              "timeoutSec": 600})
+        elif path == "/v1/relay/host/result":
+            _BoundBackend.results.append(body)
+            self._reply(200, {"ok": True, "accepted": True})
+        else:
+            self._reply(404, {"code": "not_found"})
+
+    def _reply(self, status, payload):
+        raw = json.dumps(payload).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def log_message(self, *a):
+        pass
+
+
+class RelayAfterAutoBindTests(unittest.TestCase):
+    """issue #23 的硬要求：登录自动绑定后，中继 host 仍能 poll，旧凭据也能读。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="echo-relay-bind-")
+        self.addCleanup(lambda: shutil.rmtree(self.tmp, ignore_errors=True))
+        p = patch.object(cred, "credentials_path",
+                         lambda: os.path.join(self.tmp, "backend.json"))
+        p.start()
+        self.addCleanup(p.stop)
+        _BoundBackend.calls = []
+        _BoundBackend.polls = 0
+        _BoundBackend.results = []
+        _BoundBackend.call = {"id": "c1", "method": "GET", "path": "api/status",
+                              "query": "", "headers": {}, "body": ""}
+        _LocalEcho.seen = []
+        self.local = _serve(_LocalEcho)
+        self._orig_local = relay_mod._local_base
+        relay_mod._local_base = (
+            lambda: "http://127.0.0.1:%d" % self.local.server_address[1])
+        self.addCleanup(lambda: setattr(relay_mod, "_local_base", self._orig_local))
+        self.addCleanup(lambda: _stop(self.local))
+        self.srv = _serve(_BoundBackend)
+        self.base = "http://127.0.0.1:%d" % self.srv.server_address[1]
+
+        # 不让真实设置里的后端地址/手填令牌盖掉刚绑的凭据。
+        self._orig_setting = echo_mod._setting
+        echo_mod._setting = lambda key, default=None: ""
+        self.addCleanup(lambda: setattr(echo_mod, "_setting", self._orig_setting))
+
+        self._orig_get = relay_mod.settings.get
+
+        def fake_get(key, default=None):
+            if key in ("relayEnabled", "apiAuthEnabled"):
+                return True
+            return self._orig_get(key, default)
+
+        relay_mod.settings.get = fake_get
+        self.addCleanup(lambda: setattr(relay_mod.settings, "get", self._orig_get))
+        relay_mod.STATE.update({"running": False, "connected": False, "hostId": "",
+                                "publicUrl": "", "lastError": ""})
+        self.addCleanup(relay_mod.stop)
+        self.addCleanup(lambda: _stop(self.srv))
+
+    def test_bind_then_relay_host_polls_with_the_new_credentials(self):
+        account_admin.login("u@example.com", "Passw0rd", self.base)
+        account_admin.bind_device()
+        saved = cred.load()
+        self.assertEqual(saved.client_id, "cli-bound")
+        self.assertEqual(saved.secret, "secret-bound")
+
+        # 1) 中继复用的公共入口拿到的是新凭据（hostId 由服务端按 client_id 认）。
+        base, auth = echo_mod.backend_endpoint(slot="relay")
+        self.assertEqual(base, self.base)
+        self.assertTrue(auth.startswith("Bearer "))
+        self.assertTrue(relay_mod.ready()[0])
+
+        # 2) 真的把中继 worker 跑起来：它会 poll、执行一条手机调用、把结果交回后端。
+        self.assertTrue(relay_mod.ensure_running())
+        deadline = time.time() + 8.0
+        while time.time() < deadline and not (
+                relay_mod.STATE.get("hostId") and _BoundBackend.results):
+            time.sleep(0.05)
+        self.assertEqual(relay_mod.STATE.get("hostId"), "cli-bound")
+        self.assertTrue(_BoundBackend.results, "主机该把中继结果交回后端")
+        self.assertEqual("c1", _BoundBackend.results[0].get("id"))
+        self.assertEqual("/api/status", _LocalEcho.seen[-1]["path"],
+                         "手机经中继的调用应在本机 ECHO 上执行")
+        poll = [c for c in _BoundBackend.calls
+                if c["path"] == "/v1/relay/host/poll"][-1]
+        self.assertTrue(poll["auth"].startswith("Bearer "))
+        self.assertTrue(relay_mod.STATE.get("publicUrl").endswith("/v1/relay/cli-bound/"))
+        relay_mod.stop()
+
+    def test_an_old_pairing_credential_still_resolves_for_relay(self):
+        """升级前用 `/v1/pair` 配好的 backend.json 形状不变，中继仍能读。"""
+        cred.save(BackendCredentials(base_url=self.base, client_id="cli-old",
+                                     secret="old-secret", server_name="old"))
+        base, auth = echo_mod.backend_endpoint(slot="relay")
+        self.assertEqual(base, self.base)
+        self.assertEqual(auth, "Bearer access-old")
+        self.assertTrue(relay_mod.ready()[0])
 
 
 if __name__ == "__main__":

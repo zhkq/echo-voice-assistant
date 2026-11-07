@@ -544,6 +544,13 @@ ul { margin: 0; padding: 0; list-style: none; }
 .order-item-side { display: grid; flex: 0 0 auto; justify-items: end; align-content: start; gap: 6px; white-space: nowrap; }
 .order-item-side strong { font-size: 15px; }
 .order-link { color: var(--brand-ink); font-size: 13px; font-weight: 700; }
+.account-device-note { margin-top: 10px; color: var(--muted-2); font-size: 12.5px; line-height: 1.7; }
+.device-list { margin-top: 16px; display: grid; gap: 10px; }
+.device-item { display: flex; justify-content: space-between; gap: 14px; padding: 14px; border: 1px solid var(--line); border-radius: 12px; }
+.device-item-main { min-width: 0; }
+.device-item-title { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; font-weight: 700; }
+.device-item-meta { margin-top: 5px; color: var(--muted-2); font-size: 12px; line-height: 1.6; word-break: break-all; }
+.device-item-side { display: flex; flex: 0 0 auto; align-items: flex-start; }
 .empty-state { margin-top: 16px; padding: 18px; border: 1px dashed #cfd9e9; border-radius: 12px; color: var(--muted); font-size: 13.5px; text-align: center; }
 .pricing-payment-note { margin-top: 18px; text-align: left; }
 
@@ -609,6 +616,8 @@ ul { margin: 0; padding: 0; list-style: none; }
   .status-pill { margin-left: 0; }
   .order-item { flex-direction: column; }
   .order-item-side { justify-items: start; grid-auto-flow: column; align-items: center; gap: 10px; }
+  .device-item { flex-direction: column; }
+  .device-item-side { justify-content: flex-end; }
   .dl-card, .install-card { padding: 22px; }
   .dl-meta { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .dl-card-android .btn { max-width: none; width: 100%; }

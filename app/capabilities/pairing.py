@@ -277,19 +277,23 @@ def _scheme_for_bare_address(text: str, *, raw: str, scheme_hint: str = "") -> s
 
 # ---------------------------------------------------------------- HTTP
 
-def _post_json(url: str, payload: Optional[dict], *, headers: Optional[dict] = None,
-               timeout: float = PAIR_TIMEOUT_S,
-               context: Optional[ssl.SSLContext] = None) -> Dict[str, Any]:
-    """POST 一个 JSON（或空体），回 JSON 字典。**失败一律抛 `PairingError`。**
+def request_json(method: str, url: str, payload: Optional[dict] = None, *,
+                 headers: Optional[dict] = None,
+                 timeout: float = PAIR_TIMEOUT_S,
+                 context: Optional[ssl.SSLContext] = None) -> Dict[str, Any]:
+    """发一个 JSON 请求，回 JSON 字典。**失败一律抛 `PairingError`。**
 
     `context` 是固定的证书上下文（https 时必须给，见 `pinned_context`）。
+    2026-11-07（issue #23）：从 `_post_json` 提成通用函数 —— 账号登录/查询/解绑
+    要 GET/POST，不能为每种方法再抄一份 TLS/错误模型。
     """
     data = None
     hdrs = dict(headers or {})
     if payload is not None:
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         hdrs["Content-Type"] = "application/json"
-    req = urllib.request.Request(url, data=data, method="POST", headers=hdrs)
+    req = urllib.request.Request(url, data=data, method=str(method or "POST").upper(),
+                                 headers=hdrs)
     try:
         with urllib.request.urlopen(req, timeout=timeout, context=context) as resp:
             raw = resp.read()
@@ -312,6 +316,14 @@ def _post_json(url: str, payload: Optional[dict], *, headers: Optional[dict] = N
         raise
     except Exception as e:                                  # pragma: no cover - 兜底
         raise PairingError("请求 %s 失败：%s" % (url, e), code="offline") from None
+
+
+def _post_json(url: str, payload: Optional[dict], *, headers: Optional[dict] = None,
+               timeout: float = PAIR_TIMEOUT_S,
+               context: Optional[ssl.SSLContext] = None) -> Dict[str, Any]:
+    """POST 一个 JSON（或空体）。保留旧名字给配对路径/用例用。"""
+    return request_json("POST", url, payload, headers=headers, timeout=timeout,
+                        context=context)
 
 
 def _json_or_empty(raw: bytes) -> Dict[str, Any]:
@@ -434,7 +446,88 @@ def pair(base_url: str, code: str, client_name: str = "", *,
     return creds
 
 
-# ---------------------------------------------------------------- 只改地址时补证书固定
+def bind_with_account(base_url: str, user_token: str, *, device_id: str,
+                      client_name: str = "", device_name: str = "",
+                      platform: str = "", existing_client_id: str = "",
+                      cert_fingerprint: str = "",
+                      timeout: float = PAIR_TIMEOUT_S,
+                      save: bool = True) -> BackendCredentials:
+    """登录态直接绑定设备（issue #23）：`userToken` → 设备凭据，落 `backend.json`。
+
+    与 `pair()` **同一套** TLS 固定 / HTTP / 错误模型，区别只有两处：
+
+    * 请求带 `Authorization: Bearer <userToken>`（这是账号令牌，**不落盘**）；
+    * 端点换成 `/v1/account/devices/bind`，响应字段是 `clientSecret`（旧 `/v1/pair`
+      继续用 `secret`）。
+
+    `device_id` 是客户端稳定设备标识（幂等的判据）；`existing_client_id` 只在
+    "把已有配对凭据认领到账号下"时传，服务端校验归属后才复用，否则按新设备处理。
+
+    **成功之前不写盘** —— 半路失败留一个坏文件，下次启动会表现成"配过了但连不上"。
+    """
+    url = normalize_base_url(base_url)
+    if not url:
+        raise PairingError("还没填账号服务地址", code="bad_request")
+    token = str(user_token or "").strip()
+    if not token:
+        raise PairingError("登录已失效，请重新登录", code="unauthorized")
+    device = str(device_id or "").strip()
+    if not device:
+        raise PairingError("缺少设备标识", code="bad_request")
+    # HTTP 头只能放 latin-1；带中文/全角空格的 userToken 会得到一句"连不上"的误诊。
+    bad = [ch for ch in token if not (0x20 < ord(ch) < 0x7f)]
+    if bad:
+        raise PairingError("登录凭据里有不能放进 HTTP 头的字符（多半是复制时带进了空格/换行）",
+                           code="bad_request")
+
+    cert_pem = ""
+    context = None
+    fp = ""
+    if is_https(url):
+        cert_pem, fp = pin_certificate(url, timeout=timeout,
+                                       cert_fingerprint=cert_fingerprint)
+        context = pinned_context(cert_pem)
+
+    payload: Dict[str, Any] = {"deviceId": device}
+    if client_name:
+        payload["clientName"] = str(client_name)
+    if device_name:
+        payload["deviceName"] = str(device_name)
+    if platform:
+        payload["platform"] = str(platform)
+    if existing_client_id:
+        payload["existingClientId"] = str(existing_client_id)
+
+    body = request_json(
+        "POST", url + API_PREFIX + "/account/devices/bind", payload,
+        headers={"Authorization": "Bearer " + token},
+        timeout=timeout, context=context)
+    client_id = str(body.get("clientId") or "")
+    secret = str(body.get("clientSecret") or body.get("secret") or "")
+    if not client_id or not secret:
+        raise PairingError(
+            "服务端没给出 clientId/clientSecret —— 协议对不上（服务端是不是还没升级？）",
+            code="bad_response")
+
+    expires_in = int(body.get("expiresIn") or 0)
+    creds = BackendCredentials(
+        base_url=url,
+        client_id=client_id,
+        secret=secret,
+        server_name=str(body.get("serverName") or ""),
+        cert_fingerprint=fp or normalize_fingerprint(cert_fingerprint),
+        cert_pem=cert_pem,
+        paired_at=time.time(),
+    )
+    # bind 顺带发了一个短期令牌：装进内存对象，省掉紧跟着的 /v1/token。
+    # **不落盘**（credentials.save 会剔除 access_token/token_expires_at）。
+    access = str(body.get("accessToken") or "")
+    if access:
+        creds.access_token = access
+        creds.token_expires_at = time.time() + max(0, expires_in)
+    if save:
+        cred.save(creds)
+    return creds
 #
 # 背景（2026-10-16 真机，缺口 1）：公网入口从 `http://echoserver.zhkq.online:8900` 换成
 # `https://echoserver.zhkq.online:8900` 之后，用产品自己的 `POST /api/capability/address`

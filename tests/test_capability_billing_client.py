@@ -1,18 +1,13 @@
 # -*- coding: utf-8 -*-
-"""客户端收费闭环（M2）**本轮不做** —— 这里只钉"将来接的时候不用改服务端"的契约。
+"""客户端收费/账号闭环的**服务端契约**（M2；issue #23 起客户端入口已存在）。
 
-任务书 T8 的原话：`tests/test_capability_billing_client.py`（**客户端不上**，这个可以
-留空/跳过或只写契约级）。
-
-所以这个文件做三件事：
+这个文件做两件事：
 
 1. **契约级**：服务端返回的字段名/形状就是「我的」页要读的那些（`plans` / `orders` /
    `entitlement`），用真实的 app 打一遍；
-2. **边界**：客户端 `app/`、`web/` 本轮一个字节没改；将来接的时候复用
-   `app/capabilities/echo_server.py::EchoServerClient._request`（现有的 TLS pin/重试/
-   错误分型），**不另写一套 HTTP 客户端**；
-3. **跳过**：M2 的入口（`app/account_admin.py`、`/api/account/*`）不存在时明确 skip，
-   而不是假装通过。
+2. **复用边界**：客户端账号入口（`app/account_admin.py`）只复用现有能力客户端的
+   TLS pin / HTTP / 错误模型（`pairing.request_json`），**不另写一套 HTTP 客户端**。
+   客户端登录/绑定的行为用例在 `tests/test_account_admin.py`。
 """
 import os
 import sys
@@ -65,8 +60,14 @@ class ClientIsUntouchedTests(unittest.TestCase):
         from app.capabilities.echo_server import EchoServerClient
         self.assertTrue(callable(getattr(EchoServerClient, "_request", None)))
 
-    def test_the_m2_entry_points_are_not_part_of_this_ticket(self):
-        import importlib.util
-        if importlib.util.find_spec("app.account_admin") is None:
-            self.skipTest("M2 的客户端入口（app/account_admin.py）本轮不做")
-        self.fail("客户端入口出现了 —— 本 ticket 的范围是服务端；请确认这是另一个 ticket")
+    def test_the_client_account_entry_exists_now(self):
+        """issue #23 起客户端账号入口就在 `app/account_admin.py`（M2 的客户端侧）。
+
+        它复用现有能力客户端的 TLS pin / 错误模型（`pairing.request_json`），
+        不另写一套 HTTP 客户端。
+        """
+        from app import account_admin
+        self.assertTrue(callable(getattr(account_admin, "login", None)))
+        self.assertTrue(callable(getattr(account_admin, "bind_device", None)))
+        self.assertTrue(callable(getattr(account_admin, "me", None)))
+        self.assertTrue(callable(getattr(account_admin, "unbind_device", None)))

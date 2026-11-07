@@ -293,6 +293,7 @@ class NoBusinessCouplingTests(unittest.TestCase):
             ("POST", "/v1/account/email/send-code"),
             ("POST", "/v1/account/password/reset"),
             ("GET", "/v1/account/me"),
+            ("POST", "/v1/account/devices/bind"),
             ("POST", "/v1/account/devices/code"),
             ("POST", "/v1/account/devices/unbind"),
             ("POST", "/v1/account/logout"),

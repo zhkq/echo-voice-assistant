@@ -95,6 +95,16 @@
     }
   }
 
+  function platformLabel(value) {
+    var key = String(value || "").toLowerCase();
+    if (key === "win32" || key === "windows") return "Windows";
+    if (key === "darwin" || key === "macos") return "macOS";
+    if (key === "linux") return "Linux";
+    if (key === "android") return "Android";
+    if (key === "ios") return "iOS";
+    return key ? String(value) : "未知平台";
+  }
+
   function planName(code, serverName) {
     return String(serverName || "") || PLAN_NAMES[String(code || "")] ||
       String(code || "套餐");
@@ -242,6 +252,13 @@
     if (err.code === "email_disabled") return "邮箱注册暂时未开放。";
     if (err.code === "email_unconfigured") return "邮件服务暂时不可用，请稍后再试。";
     if (err.code === "email_send_failed") return "验证码邮件发送失败，请稍后再试。";
+    if (err.code === "device_not_found") return "没有这台设备，可能已经解绑。";
+    if (err.code === "device_limit_reached") {
+      return err.detail || err.message || "设备数已满，请先解绑一台旧设备。";
+    }
+    if (err.code === "device_bound_to_other_account") {
+      return "这台设备已绑定到另一个账号，请先在原账号解绑。";
+    }
     if (err.code === "rate_limited") {
       var wait = Number(err.retryAfter || 0);
       return wait > 0 ? "操作过于频繁，请 " + wait + " 秒后再试。" : "操作过于频繁，请稍后再试。";
@@ -984,6 +1001,43 @@
     return statusText(status);
   }
 
+  function renderDevices(devices) {
+    var list = $("devicesList");
+    var empty = $("devicesEmpty");
+    if (!list) return;
+    var rows = Array.isArray(devices) ? devices : [];
+    setText("deviceCount", rows.length + " 台");
+    if (!rows.length) {
+      list.innerHTML = "";
+      list.setAttribute("aria-busy", "false");
+      if (empty) empty.hidden = false;
+      return;
+    }
+    if (empty) empty.hidden = true;
+    list.innerHTML = rows.map(function (device) {
+      var status = String(device.status || "active");
+      var active = status === "active";
+      var meta = [
+        platformLabel(device.platform),
+        "绑定 " + formatDateTime(device.boundAt),
+        Number(device.lastSeen || 0) > 0
+          ? "最近活跃 " + formatDateTime(device.lastSeen) : "尚未活跃"
+      ].join(" · ");
+      return '<article class="device-item">' +
+        '<div class="device-item-main">' +
+        '<div class="device-item-title">' + esc(device.deviceName || device.clientId) +
+        '<span class="tag tag-' + statusClass(active ? "active" : status) + '">' +
+        esc(active ? "使用中" : "已解绑") + "</span></div>" +
+        '<div class="device-item-meta">' + esc(meta) + " · " + esc(device.clientId) +
+        "</div></div>" +
+        '<div class="device-item-side">' +
+        (active ? '<button class="btn btn-ghost btn-sm" type="button" data-unbind-client="' +
+          esc(device.clientId) + '">解绑</button>' : "") +
+        "</div></article>";
+    }).join("");
+    list.setAttribute("aria-busy", "false");
+  }
+
   function renderOrders(orders) {
     var list = $("ordersList");
     var empty = $("ordersEmpty");
@@ -1032,6 +1086,7 @@
     ]).then(function (results) {
       var me = results[0];
       renderMe(me);
+      renderDevices(me && me.devices);
       renderOrders(results[1] && results[1].orders);
       showDashboard();
     });
@@ -1211,6 +1266,39 @@
         loadAccountData().catch(function (err) {
           showToast(explainError(err));
         }).then(function () { refresh.disabled = false; });
+      });
+    }
+
+    var devicesList = $("devicesList");
+    if (devicesList) {
+      devicesList.addEventListener("click", function (event) {
+        var btn = event.target && event.target.closest
+          ? event.target.closest("[data-unbind-client]") : null;
+        if (!btn) return;
+        var clientId = btn.getAttribute("data-unbind-client") || "";
+        if (!clientId) return;
+        if (!window.confirm("解绑这台设备？解绑后它会立即失效，需要重新登录绑定。")) return;
+        btn.disabled = true;
+        api("/v1/account/devices/unbind",
+            { method: "POST", body: { clientId: clientId } })
+          .then(function () {
+            showToast("已解绑这台设备");
+            return loadAccountData();
+          })
+          .catch(function (err) {
+            btn.disabled = false;
+            showToast(explainError(err));
+          });
+      });
+    }
+
+    var refreshDevices = $("refreshDevices");
+    if (refreshDevices) {
+      refreshDevices.addEventListener("click", function () {
+        refreshDevices.disabled = true;
+        loadAccountData().catch(function (err) {
+          showToast(explainError(err));
+        }).then(function () { refreshDevices.disabled = false; });
       });
     }
 
