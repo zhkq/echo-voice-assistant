@@ -383,7 +383,7 @@ if ($Profile -eq 'component' -or $Profile -eq 'offline') {
         Say 'largest contributors:'
         $stageFiles | Sort-Object Length -Descending | Select-Object -First 8 | ForEach-Object {
             Say ("    {0,10} MB  {1}" -f [Math]::Round($_.Length / 1MB, 1),
-                 Get-RelFromStage $_.FullName)
+                 (Get-RelFromStage $_.FullName))
         }
         Die ("offline bundle is {0} MB unpacked - over the 700 MB budget" -f [Math]::Round($packBytes / 1MB, 2))
     }
