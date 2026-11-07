@@ -32,7 +32,8 @@ $root = Split-Path $scripts -Parent
 # 所以按同一条规则内联算一次 —— 判据与 app\paths.py:echo_base() 一致。
 # 同事实测报告 §4.2 E：漏改这里会让 restart.log 落进 echo-core\data\、端口文件读不到。
 $installBase = $root
-if ((Split-Path $root -Leaf) -ieq 'echo-core') { $installBase = Split-Path $root -Parent }
+if ($env:ECHO_BASE) { $installBase = [System.IO.Path]::GetFullPath([string]$env:ECHO_BASE) }
+elseif ((Split-Path $root -Leaf) -ieq 'echo-core') { $installBase = Split-Path $root -Parent }
 $logDir = Join-Path $installBase 'data\logs'
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
 $log = Join-Path $logDir 'restart.log'

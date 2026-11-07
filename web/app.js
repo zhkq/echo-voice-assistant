@@ -7603,15 +7603,16 @@ try {
   }
 } catch (e) { /* 忽略 */ }
 
-/* ---------------- 首次启用向导 S1/S2/S3（2026-10-11 用户口径）----------------
-   第一次用 ECHO 要走三步：**配模型 → 指笔记库 → 初始化技能**。
+/* ---------------- 首次启用向导 S0/S1/S2/S3（2026-10-11 用户口径）----------------
+   第一次用 ECHO 走四步：**装 DSH → 配模型 → 指笔记库 → 初始化技能**。
    升级安装**不进**这里（服务端 `onboarding().shouldOnboard` 为假），入口只在设置里。
 
    为什么不加第 5 个顶层页签：`_VIEWS` 只有 dashboard/settings/business/history 四个，
    加一个会动导航与一批固定用例。这里与 `gotoWizard()` **同形**：切到「设置」、
    展开这张卡、滚过去；卡片本身在运行时建（`renderInstallNotice()` 是同一先例）。
 
-   三步各自去问服务端要判据，**不在前端自己算**：
+   每一步各自去问服务端要判据，**不在前端自己算**：
+     S0 装 DSH   → GET /api/wizard/dsh + POST /api/wizard/dsh/install（轮询 state）
      S1 配模型   → POST /api/wizard/test-agent（真让智能体答一句话）
      S2 指笔记库 → POST /api/dialog/pick-folder（原生选择器）+ /api/dialog/check-vault
      S3 初始化技能 → POST /api/skills/setup（只补缺、绝不覆盖用户已有的）
@@ -7620,9 +7621,14 @@ try {
 let _onboardStep = 0;
 let _onboardMinimized = false;   // 用户点「去设置智能体」临时最小化
 let _onboardNeeded = false;      // 服务端说"该走向导"（完成前为 true：覆盖层一直挡着）
-const _onboard = { modelOk: false, reply: "", note: "", vault: "", vaultIsVault: false, skills: null };
+const _onboard = {
+  modelOk: false, reply: "", note: "", vault: "", vaultIsVault: false, skills: null,
+  // 2026-11-03 一套 DSH：首启先确认官方 dsh 可用；没有就下载官方桌面端静默安装。
+  dsh: null, dshJob: null, dshBusy: false, dshError: "", dshLoaded: false,
+};
 
 const ONBOARD_STEPS = [
+  { id: "dsh", name: "装好 DSH", draw: onboardRenderDsh },
   { id: "model", name: "配好模型", draw: onboardRenderModel },
   { id: "vault", name: "指笔记库", draw: onboardRenderVault },
   { id: "skills", name: "初始化技能", draw: onboardRenderSkills },
@@ -7648,10 +7654,10 @@ function onboardCard() {
     ov.style.cssText = "position:fixed;inset:0;z-index:9999;background:rgba(20,22,26,.72);"
       + "display:none;align-items:flex-start;justify-content:center;overflow:auto;padding:24px 12px";
     ov.innerHTML = '<div class="card" id="onboardCard" style="max-width:820px;width:100%">'
-      + '<div class="card-title">首次启用向导<span class="sbadge">3 步</span></div>'
+      + '<div class="card-title">首次启用向导<span class="sbadge">4 步</span></div>'
       + '<div class="card-body">'
-      + '<div class="snote info"><span>ⓘ</span><span>第一次用 ECHO 按这三步走一遍：'
-      + '<b>配模型</b> → <b>指笔记库</b> → <b>初始化技能</b>。'
+      + '<div class="snote info"><span>ⓘ</span><span>第一次用 ECHO 按这四步走一遍：'
+      + '<b>装 DSH</b> → <b>配模型</b> → <b>指笔记库</b> → <b>初始化技能</b>。'
       + '走完之前不能正式使用（每一步都可以跳过）。</span></div>'
       + '<div id="onboardPanel"></div></div></div>';
     document.body.appendChild(ov);
@@ -7730,6 +7736,9 @@ function gotoOnboard(step) {
   if (typeof step === "number") _onboardStep = Math.max(0, Math.min(ONBOARD_STEPS.length - 1, step));
   renderOnboard();
   onboardShow();
+  if (ONBOARD_STEPS[_onboardStep].id === "dsh" && !_onboard.dshLoaded && !_onboard.dshBusy) {
+    onboardRefreshDsh();
+  }
   if (card && card.scrollIntoView) card.scrollIntoView({ behavior: "smooth", block: "start" });
 }
 
@@ -7763,14 +7772,155 @@ function renderOnboard() {
   if ($("#onboardSkip")) $("#onboardSkip").addEventListener("click", () => {
     if (_onboardStep < ONBOARD_STEPS.length - 1) gotoOnboard(_onboardStep + 1); else onboardFinish();
   });
+  if ($("#onboardDetectDsh")) $("#onboardDetectDsh").addEventListener("click", onboardDetectDsh);
+  if ($("#onboardInstallDsh")) $("#onboardInstallDsh").addEventListener("click", onboardInstallDsh);
+  if ($("#onboardNextDsh")) $("#onboardNextDsh").addEventListener("click", () => gotoOnboard(1));
   if ($("#onboardGoAgent")) $("#onboardGoAgent").addEventListener("click", onboardMinimize);
   if ($("#onboardTestAgent")) $("#onboardTestAgent").addEventListener("click", onboardTestAgent);
-  if ($("#onboardNextModel")) $("#onboardNextModel").addEventListener("click", () => gotoOnboard(1));
+  if ($("#onboardNextModel")) $("#onboardNextModel").addEventListener("click", () => gotoOnboard(2));
   if ($("#onboardPick")) $("#onboardPick").addEventListener("click", onboardPickFolder);
   if ($("#onboardVault")) $("#onboardVault").addEventListener("input", (e) => { _onboard.vault = e.target.value.trim(); });
   if ($("#onboardNextVault")) $("#onboardNextVault").addEventListener("click", onboardSaveVault);
   if ($("#onboardInstallSkills")) $("#onboardInstallSkills").addEventListener("click", onboardInstallSkills);
   if ($("#onboardFinish")) $("#onboardFinish").addEventListener("click", onboardFinish);
+}
+
+/* ---- S0：装好 DSH（2026-11-03 一套 DSH；安装器不打包它）----
+   判据只有服务端给的 `installed/ready`：`installed` 必须真的跑通 `dsh.cmd --version`
+   （目录存在不算），`ready` 必须 `/api/status` 里 DSH 在线。安装失败时本步骤保持警告，
+   并给出官方手动下载地址；**不会**悄悄回退 npm/Node 那条已退役的路。 */
+function onboardRenderDsh() {
+  const st = _onboard.dsh;
+  const job = (_onboard.dshJob && _onboard.dshJob.state)
+    ? _onboard.dshJob
+    : (st && st.job ? st.job : null);
+  const busy = !!_onboard.dshBusy || !!(job && job.state === "running");
+  const installed = !!(st && st.installed);
+  const ready = !!(st && st.ready);
+  const supported = !st || st.supported !== false;
+
+  let chip = "";
+  if (_onboard.dshError) {
+    chip = '<div class="snote warn"><span>⚠</span><span>' + esc(_onboard.dshError) + '</span></div>';
+  } else if (busy) {
+    const phase = (job && (job.message || job.phase)) || "正在安装 DSH…";
+    chip = '<div class="snote info"><span>⏳</span><span>' + esc(phase) + '</span></div>';
+  } else if (installed && ready) {
+    chip = '<div class="snote info"><span>✅</span><span>DSH 已安装并在线'
+      + (st && st.version ? '（' + esc(st.version) + '）' : '') + '</span></div>';
+  } else if (installed) {
+    chip = '<div class="snote warn"><span>⚠</span><span>DSH 程序已安装，但服务没有在线 —— '
+      + '可以点“重试启动/修复”，或看下面这个日志。</span></div>';
+  } else if (st) {
+    chip = '<div class="snote warn"><span>⚠</span><span>还没有检测到官方 DeepSeek Harness。'
+      + '点“下载并安装 DSH”会从官方地址下载并静默安装（约 277 MB）；失败可以重试。</span></div>';
+  }
+
+  let detail = "";
+  const rawDetail = (job && job.detail) || (st && st.detail) || "";
+  if (rawDetail) {
+    const text = String(rawDetail).slice(-1200);
+    detail = '<div class="snote warn"><span>日志</span><span style="white-space:pre-wrap">'
+      + esc(text) + '</span></div>';
+  }
+
+  const manualUrl = (st && st.manualUrl)
+    || "https://download.deepseek.com/desktop/dsh-latest-windows-x64.exe";
+  const next = '<button class="btn" id="onboardNextDsh">下一步</button>';
+  const detect = '<button class="btn ghost" id="onboardDetectDsh"'
+    + (busy ? ' disabled' : '') + '>重新检测</button>';
+  const install = !installed
+    ? '<button class="btn" id="onboardInstallDsh"' + (busy || !supported ? ' disabled' : '')
+      + '>下载并安装 DSH（约 277 MB）</button>'
+    : '<button class="btn" id="onboardInstallDsh"' + (busy || !supported ? ' disabled' : '')
+      + '>重试启动/修复</button>';
+
+  return '<div class="snote info"><span>ⓘ</span><span>ECHO 只用<b>一套</b> DSH：官方 '
+    + 'DeepSeek Harness 桌面端自带的 <code>dsh.cmd</code>。安装器不打包它（约 277 MB），'
+    + '所以这一步才下载；已经装过会直接复用，不重复下载。装好后 DSH 家目录是 '
+    + '<code>%USERPROFILE%\.dsh</code>，桌面版与 ECHO 共用同一份会话/技能。</span></div>'
+    + '<div class="srow"><div class="lbl"><span class="lt">当前状态</span></div>'
+    + '<div class="sctl">' + esc((st && st.message) || "正在读取…") + '</div></div>'
+    + chip + detail
+    + '<div class="srow"><div class="lbl"></div><div class="sctl">' + detect + install
+    + '<a class="btn ghost" href="' + esc(manualUrl) + '" target="_blank" rel="noreferrer">手动下载</a>'
+    + next + '</div></div>';
+}
+
+async function onboardRefreshDsh() {
+  if (_onboard.dshBusy) return;
+  _onboard.dshBusy = true;
+  _onboard.dshLoaded = true;
+  renderOnboard();
+  try {
+    _onboard.dsh = await api("/api/wizard/dsh");
+    if (_onboard.dsh && _onboard.dsh.job) _onboard.dshJob = _onboard.dsh.job;
+    _onboard.dshError = "";
+  } catch (e) {
+    _onboard.dshError = "读不到 DSH 状态：" + (e && e.message ? e.message : e);
+  } finally {
+    _onboard.dshBusy = false;
+    renderOnboard();
+  }
+}
+
+async function onboardDetectDsh() {
+  if (_onboard.dshBusy) return;
+  _onboard.dshBusy = true;
+  _onboard.dshError = "";
+  renderOnboard();
+  try {
+    const st = await post("/api/wizard/dsh/detect", {});
+    _onboard.dsh = st;
+    if (st && st.job) _onboard.dshJob = st.job;
+    if (!st || !st.ok) _onboard.dshError = (st && st.error) || "没检测到可用的 DSH";
+  } catch (e) {
+    _onboard.dshError = "检测 DSH 失败：" + (e && e.message ? e.message : e);
+  } finally {
+    _onboard.dshBusy = false;
+    _onboard.dshLoaded = true;
+    renderOnboard();
+  }
+}
+
+async function onboardInstallDsh() {
+  if (_onboard.dshBusy) return;
+  _onboard.dshBusy = true;
+  _onboard.dshError = "";
+  _onboard.dshJob = { state: "running", phase: "starting", message: "正在准备安装…" };
+  renderOnboard();
+  try {
+    const r = await post("/api/wizard/dsh/install", {});
+    if (r && r.error) {
+      _onboard.dshError = r.error;
+      return;
+    }
+    if (r && r.job) _onboard.dshJob = r.job;
+    let finished = false;
+    for (let i = 0; i < 900; i++) {          // 30 min at 2 s; the server is bounded to 30 min
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+      let st;
+      try { st = await api("/api/wizard/dsh/state"); } catch (e) { continue; }
+      _onboard.dshJob = st;
+      renderOnboard();
+      if (st && (st.state === "done" || st.state === "failed")) { finished = true; break; }
+    }
+    if (!finished) _onboard.dshError = "安装超过 30 分钟还没结束 —— 可以稍后在设置里重试。";
+  } catch (e) {
+    _onboard.dshError = "安装 DSH 失败：" + (e && e.message ? e.message : e);
+  } finally {
+    _onboard.dshBusy = false;
+    try {
+      const st = await api("/api/wizard/dsh");
+      _onboard.dsh = st;
+      if (st && st.job) _onboard.dshJob = st.job;
+      if (st && st.job && st.job.state === "failed") {
+        _onboard.dshError = st.job.error || "DSH 没有装成";
+      }
+    } catch (e) { /* 保留已显示的错误 */ }
+    _onboard.dshLoaded = true;
+    renderOnboard();
+  }
 }
 
 /* ---- S1：配模型（判据 = 真的让智能体答一句话）---- */
@@ -7871,7 +8021,7 @@ async function onboardSaveVault() {
     await api("/api/settings", { method: "PUT",
       body: JSON.stringify({ values: { worklogVaultRoot: path, dailyReviewVaultRoot: path } }) });
     _onboard.note = "";
-    gotoOnboard(2);
+    gotoOnboard(3);
     return;
   } catch (e) {
     _onboard.note = "保存失败：" + ((e && e.message) || e) + "（路径：" + (_onboard.vault || "") + "）";

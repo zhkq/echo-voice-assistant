@@ -2907,6 +2907,38 @@ def api_wizard_state(_auth=Depends(optional_auth)):
     return wizard.execution_state()
 
 
+@router.get("/wizard/dsh")
+def api_wizard_dsh(_auth=Depends(optional_auth)):
+    """首次向导的 DSH 状态：只探测，不下载。
+
+    2026-11-03 一套 DSH：程序来源只有官方 DeepSeek Harness 桌面端自带的 ``dsh.cmd``；
+    这个接口同时回答"装没装 / 服务在不在线 / 当前智能体设置"。安装动作走
+    ``POST /wizard/dsh/install``（后台任务，向导轮询 ``/wizard/dsh/state``）。
+    """
+    from app import dsh_setup
+    return dsh_setup.status()
+
+
+@router.post("/wizard/dsh/detect")
+def api_wizard_dsh_detect(_auth=Depends(optional_auth)):
+    """真跑一次 ``harness-install-desktop.ps1 -NoDownload``（会执行 --version）。"""
+    from app import dsh_setup
+    return dsh_setup.detect()
+
+
+@router.get("/wizard/dsh/state")
+def api_wizard_dsh_state(_auth=Depends(optional_auth)):
+    from app import dsh_setup
+    return dsh_setup.state()
+
+
+@router.post("/wizard/dsh/install")
+def api_wizard_dsh_install(_auth=Depends(optional_auth)):
+    """后台下载并静默安装官方 DeepSeek Harness；失败会如实落在 job 状态里。"""
+    from app import dsh_setup
+    return dsh_setup.start_install()
+
+
 @router.get("/wizard/first-run")
 def api_wizard_first_run(_auth=Depends(optional_auth)):
     """**首次启用向导**该不该自动弹（面板启动时就问它）。

@@ -1,0 +1,96 @@
+name: Windows installer
+
+# Phase-1 installer build + silent smoke test.  This job is intentionally separate from
+# ci.yml: it needs the full Windows toolchain (NativeAOT, Inno Setup) and a ~120 MB
+# runtime-core build, so it runs only for installer-related changes and by hand.
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "installer/**"
+      - "launcher/**"
+      - "scripts/build_installer.py"
+      - "sidebar/**"
+      - "app/dsh_setup.py"
+      - "app/api.py"
+      - "app/paths.py"
+      - "web/app.js"
+      - "scripts/start.ps1"
+      - "scripts/stop.ps1"
+      - "scripts/restart-echo.ps1"
+      - "scripts/echo-launch-lib.ps1"
+      - ".dsh/skills/echo-install/scripts/harness-install-desktop.ps1"
+      - ".github/workflows/windows-installer.yml"
+
+concurrency:
+  group: windows-installer-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-smoke:
+    runs-on: windows-latest
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Install uv (runtime-core base)
+        run: |
+          python -m pip install --upgrade pip uv
+          uv python install 3.11.15
+
+      - name: Launcher unit tests
+        run: dotnet test launcher/ECHO.Launcher.Tests/ECHO.Launcher.Tests.csproj -c Release --nologo
+
+      - name: Install Inno Setup 6.7.4 (pinned)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $url = "https://github.com/jrsoftware/issrc/releases/download/is-6_7_4/innosetup-6.7.4.exe"
+          $exe = Join-Path $env:RUNNER_TEMP "innosetup-6.7.4.exe"
+          Invoke-WebRequest -Uri $url -OutFile $exe -UseBasicParsing
+          $hash = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToLower()
+          if ($hash -ne "a549929319f9120716677c685535ca4671e4b937b5fdc87e2585f32d8eb30e8c") {
+            throw "Inno Setup hash mismatch: $hash"
+          }
+          Start-Process -FilePath $exe `
+            -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/SP-' -Wait
+          $iscc = Join-Path ${env:ProgramFiles(x86)} "Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path -LiteralPath $iscc)) { throw "ISCC.exe not found" }
+          "ISCC=$iscc" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          python scripts/build_installer.py --iscc $env:ISCC --out dist
+          if (-not (Test-Path dist/ECHO-Setup-*.exe)) { throw "no ECHO-Setup built" }
+
+      - name: Silent install / start / stop / uninstall / upgrade smoke
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $setup = (Get-ChildItem dist/ECHO-Setup-*.exe | Sort-Object LastWriteTime | Select-Object -Last 1).FullName
+          powershell -NoProfile -ExecutionPolicy Bypass -File installer/smoke-install.ps1 `
+            -Setup $setup -WorkDir dist/smoke -KeepArtifacts
+
+      - name: Upload installer and smoke logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ECHO-Setup-windows
+          path: |
+            dist/ECHO-Setup-*.exe
+            dist/ECHO-Setup-*.sha256
+            dist/installer-build-info.json
+            dist/smoke/**
+          if-no-files-found: warn
+          retention-days: 14

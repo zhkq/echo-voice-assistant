@@ -114,6 +114,26 @@ class NewLayoutRootsTests(_BaseCase):
         self.assertFalse(os.path.normcase(echo_workspace()).startswith(code + os.sep),
                          "兜底 cwd 又跑回 echo-core 里了")
 
+    def test_the_installer_can_keep_code_outside_the_state_root(self):
+        """安装器的布局：程序在 `Programs\\ECHO`，数据根在 `%LOCALAPPDATA%\\ECHO`。
+
+        启动器用 `ECHO_BASE` 指数据根、代码仍从 `__file__` 推导到
+        `Programs\\ECHO\\echo-core`。两个根**不是父子关系**时，数据类兄弟目录仍然
+        全部落在数据根，代码目录一个都不该被当成数据根。
+        """
+        import shutil
+        code = tempfile.mkdtemp(prefix="echo-code-")
+        self.addCleanup(lambda: shutil.rmtree(code, ignore_errors=True))
+        with patch.dict(os.environ, {"ECHO_BASE": self.tmp}, clear=False), \
+                patch.object(paths, "echo_root", lambda: code):
+            self.assertEqual(paths.echo_base(), self.tmp)
+            self.assertEqual(paths.echo_root(), code)
+            self.assertEqual(paths.data_root(), os.path.join(self.tmp, "data"))
+            self.assertEqual(paths.models_root(), os.path.join(self.tmp, "models"))
+            self.assertEqual(paths.meetings_root(), os.path.join(self.tmp, "meeting"))
+            self.assertEqual(paths.command_root(), os.path.join(self.tmp, "aide"))
+            self.assertEqual(paths.backend_root(), os.path.join(self.tmp, "backend"))
+
     def test_every_root_is_under_the_base(self):
         # DSH 家目录**不在**安装根下（一套 DSH 共用官方桌面端的家目录），单独排除。
         for fn in (paths.data_root, paths.models_root, paths.meetings_root,
